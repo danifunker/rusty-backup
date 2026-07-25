@@ -20,6 +20,7 @@ use std::path::{Component, Path};
 
 use anyhow::{anyhow, bail, Context, Result};
 
+use crate::fs::attrs::AttrOverrides;
 use crate::fs::entry::FileEntry;
 use crate::fs::filesystem::{EditableFilesystem, FilesystemError};
 
@@ -37,8 +38,12 @@ pub enum ImportConflict {
 /// Knobs for [`import_tar`].
 pub struct TarImportOptions {
     pub conflict: ImportConflict,
-    /// Best-effort: apply each entry's Unix mode via `set_permissions`
-    /// (silently ignored on filesystems that don't support it).
+    /// Apply each entry's archived Unix mode and ownership (uid/gid).
+    /// Filesystems that don't store them ignore the values.
+    ///
+    /// When off, entries inherit uid/gid from the directory they land in
+    /// and take the filesystem's default mode — the precedence in
+    /// [`crate::fs::attrs`], not a blanket `root:root 0644`.
     pub apply_permissions: bool,
     /// Skip macOS AppleDouble sidecars (`._*`) — resource-fork/metadata cruft
     /// a Mac adds to archives. On by default; almost never wanted inside a
@@ -221,24 +226,45 @@ fn import_tar_inner<R: Read>(
         }
 
         let etype = entry.header().entry_type();
-        let mode = entry.header().mode().ok().map(|m| m & 0o7777);
+        // What the archive says this entry's mode and ownership should be.
+        // Empty when `apply_permissions` is off, in which case the shared
+        // resolver falls back to the replaced entry / parent directory —
+        // the same precedence `rb-cli put` uses.
+        let overrides = archived_overrides(entry.header(), opts.apply_permissions);
 
         if etype.is_dir() {
-            ensure_dir(efs, &mut dir_cache, &comps, &mut stats)?;
+            // A directory can already exist here either because the image
+            // had it or because an earlier entry auto-created it as an
+            // implicit parent. Either way its own archive entry is the
+            // authority on its mode, so stamp it after the fact.
+            let existed = dir_cache.contains_key(&comps.join("/"));
+            let dir = ensure_dir(efs, &mut dir_cache, &comps, &mut stats, &overrides)?;
+            if existed {
+                apply_attrs_after_create(efs, &dir, &overrides, &mut stats)?;
+            } else if !overrides.is_empty() {
+                stats.perms_applied += 1;
+            }
             progress(&stats);
             continue;
         }
 
         let (parent_comps, leaf) = comps.split_at(comps.len() - 1);
         let name = &leaf[0];
-        let parent = ensure_dir(efs, &mut dir_cache, parent_comps, &mut stats)?;
+        let parent = ensure_dir(
+            efs,
+            &mut dir_cache,
+            parent_comps,
+            &mut stats,
+            &AttrOverrides::default(),
+        )?;
 
         // Conflict handling. Seed this directory's existing-names set once
         // (from the on-disk listing — empty for a directory we just created),
         // then consult/update it per entry so the check is O(1).
         let parent_key = parent.path.clone();
-        // Populated only when this entry overwrites an existing one.
+        // Both populated only when this entry overwrites an existing one.
         let mut inherited_xattrs = Vec::new();
+        let mut replaced: Option<FileEntry> = None;
         if !dir_children.contains_key(&parent_key) {
             let existing: HashSet<String> = efs
                 .list_directory(&parent)
@@ -268,6 +294,10 @@ fn import_tar_inner<R: Read>(
                             efs.as_filesystem_mut(),
                             Some(&existing),
                         );
+                        // Kept for the same reason: with `--no-permissions`
+                        // the replacement inherits the displaced file's mode
+                        // and ownership rather than dropping to a default.
+                        replaced = Some(existing.clone());
                         efs.delete_entry(&parent, &existing)
                             .map_err(|e| anyhow!("overwrite delete {}: {e}", raw_path.display()))?;
                     }
@@ -287,7 +317,18 @@ fn import_tar_inner<R: Read>(
                 .flatten()
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            match efs.create_symlink(&parent, name, &target, &Default::default()) {
+            // A symlink's own mode is nearly always 0777 and rarely load-
+            // bearing, but its ownership is — and the drivers OR in their
+            // own S_IFLNK, so bare permission bits are what they want here.
+            let attrs =
+                crate::fs::attrs::resolve_attrs(&overrides, None, Some(&parent), None, 0o777);
+            let link_opts = crate::fs::filesystem::CreateFileOptions {
+                mode: Some(attrs.mode & 0o7777),
+                uid: Some(attrs.uid),
+                gid: Some(attrs.gid),
+                ..Default::default()
+            };
+            match efs.create_symlink(&parent, name, &target, &link_opts) {
                 Ok(_) => {
                     stats.symlinks += 1;
                     dir_children
@@ -304,12 +345,26 @@ fn import_tar_inner<R: Read>(
 
         if etype.is_file() {
             let size = entry.size();
+            // Mode and ownership go in through `create_file`, not a chmod
+            // afterwards: every driver that stores them honours these
+            // fields, while `set_permissions` is implemented by only two,
+            // so the old post-create chmod silently dropped the archive's
+            // mode on EFS, UFS, Minix and the rest.
+            let attrs = crate::fs::attrs::resolve_attrs(
+                &overrides,
+                replaced.as_ref(),
+                Some(&parent),
+                None,
+                0o644,
+            );
             let create_opts = crate::fs::filesystem::CreateFileOptions {
+                mode: Some(attrs.file_mode()),
+                uid: Some(attrs.uid),
+                gid: Some(attrs.gid),
                 xattrs: inherited_xattrs,
                 ..Default::default()
             };
-            let new_entry = efs
-                .create_file(&parent, name, &mut entry, size, &create_opts)
+            efs.create_file(&parent, name, &mut entry, size, &create_opts)
                 .map_err(|e| anyhow!("create_file {}: {e}", raw_path.display()))?;
             dir_children
                 .get_mut(&parent_key)
@@ -317,16 +372,8 @@ fn import_tar_inner<R: Read>(
                 .insert(name.clone());
             stats.files += 1;
             stats.total_bytes += size;
-            if opts.apply_permissions {
-                if let Some(m) = mode {
-                    match efs.set_permissions(&new_entry, m) {
-                        Ok(()) => stats.perms_applied += 1,
-                        Err(ref e) if is_unsupported(e) => {}
-                        Err(e) => {
-                            return Err(anyhow!("set_permissions {}: {e}", raw_path.display()))
-                        }
-                    }
-                }
+            if !overrides.is_empty() {
+                stats.perms_applied += 1;
             }
             progress(&stats);
             continue;
@@ -479,17 +526,73 @@ fn safe_components(p: &Path) -> Option<Vec<String>> {
     Some(out)
 }
 
+/// The mode / ownership an archived entry asks for, or nothing when the
+/// caller turned that off (`--no-permissions`), in which case the shared
+/// resolver falls back to the replaced entry then the parent directory.
+///
+/// `tar_export` writes all three fields on every header it emits, so
+/// reading only `mode` here — and only for files — is what made a
+/// `tar` -> `untar` round-trip lose ownership outright and directory
+/// modes with it.
+fn archived_overrides(header: &tar::Header, apply: bool) -> crate::fs::attrs::AttrOverrides {
+    if !apply {
+        return crate::fs::attrs::AttrOverrides::default();
+    }
+    crate::fs::attrs::AttrOverrides {
+        mode: header.mode().ok().map(|m| m & 0o7777),
+        uid: header.uid().ok().map(|v| v as u32),
+        gid: header.gid().ok().map(|v| v as u32),
+    }
+}
+
+/// Stamp mode / ownership onto an entry that already existed, so it can't
+/// be set at creation time. Only the filesystems implementing these two
+/// hooks can honour it; others report `Unsupported` and are left alone.
+fn apply_attrs_after_create(
+    efs: &mut dyn EditableFilesystem,
+    entry: &FileEntry,
+    overrides: &AttrOverrides,
+    stats: &mut TarImportStats,
+) -> Result<()> {
+    let mut applied = false;
+    if let Some(m) = overrides.mode {
+        match efs.set_permissions(entry, m) {
+            Ok(()) => applied = true,
+            Err(ref e) if is_unsupported(e) => {}
+            Err(e) => return Err(anyhow!("set_permissions {}: {e}", entry.path)),
+        }
+    }
+    if let (Some(u), Some(g)) = (overrides.uid, overrides.gid) {
+        match efs.set_owner(entry, u, g) {
+            Ok(()) => applied = true,
+            Err(ref e) if is_unsupported(e) => {}
+            Err(e) => return Err(anyhow!("set_owner {}: {e}", entry.path)),
+        }
+    }
+    if applied {
+        stats.perms_applied += 1;
+    }
+    Ok(())
+}
+
 /// Ensure every directory named by `comps` exists under the import root,
 /// creating missing ones (mkdir -p). Returns the deepest directory's entry.
+///
+/// `leaf_overrides` applies to the LAST component only — that is the one
+/// the archive has an entry for. Intermediate components are implicit
+/// parents the archive never described, so they take the resolver's
+/// inherit-from-parent default.
 fn ensure_dir(
     efs: &mut dyn EditableFilesystem,
     cache: &mut HashMap<String, FileEntry>,
     comps: &[String],
     stats: &mut TarImportStats,
+    leaf_overrides: &AttrOverrides,
 ) -> Result<FileEntry> {
     let mut key = String::new();
     let mut parent = cache.get("").expect("root cached").clone();
-    for comp in comps {
+    let last = comps.len().saturating_sub(1);
+    for (i, comp) in comps.iter().enumerate() {
         let next_key = if key.is_empty() {
             comp.clone()
         } else {
@@ -504,8 +607,20 @@ fn ensure_dir(
             Some(e) if e.is_directory() => e,
             Some(_) => bail!("path component {comp:?} exists but is not a directory"),
             None => {
+                let overrides = if i == last {
+                    *leaf_overrides
+                } else {
+                    AttrOverrides::default()
+                };
+                let attrs = crate::fs::attrs::resolve_dir_attrs(&overrides, None, Some(&parent));
+                let dir_opts = crate::fs::filesystem::CreateDirectoryOptions {
+                    mode: Some(attrs.dir_mode()),
+                    uid: Some(attrs.uid),
+                    gid: Some(attrs.gid),
+                    ..Default::default()
+                };
                 let e = efs
-                    .create_directory(&parent, comp, &Default::default())
+                    .create_directory(&parent, comp, &dir_opts)
                     .map_err(|err| anyhow!("create_directory {comp:?}: {err}"))?;
                 stats.dirs_created += 1;
                 e
@@ -803,5 +918,186 @@ mod tests {
         let stats = import_tar_from_path(&mut *efs, &root, &tgz, &opts, &|_| {}).unwrap();
         assert_eq!(stats.skipped_existing, 1, "stats: {stats:?}");
         assert_eq!(stats.files, 0);
+    }
+
+    /// Build a tar in memory carrying explicit modes and ownership on a
+    /// file, an executable, and a directory.
+    fn tar_with_permissions() -> Vec<u8> {
+        let mut b = tar::Builder::new(Vec::new());
+
+        let mut dh = tar::Header::new_gnu();
+        dh.set_entry_type(tar::EntryType::Directory);
+        dh.set_size(0);
+        dh.set_mode(0o700);
+        dh.set_uid(1000);
+        dh.set_gid(100);
+        dh.set_cksum();
+        b.append_data(&mut dh, "private/", std::io::empty())
+            .unwrap();
+
+        let mut fh = tar::Header::new_gnu();
+        fh.set_entry_type(tar::EntryType::Regular);
+        fh.set_size(6);
+        fh.set_mode(0o600);
+        fh.set_uid(1000);
+        fh.set_gid(100);
+        fh.set_cksum();
+        b.append_data(&mut fh, "private/key.txt", &b"secret"[..])
+            .unwrap();
+
+        let mut xh = tar::Header::new_gnu();
+        xh.set_entry_type(tar::EntryType::Regular);
+        xh.set_size(3);
+        xh.set_mode(0o755);
+        xh.set_uid(1000);
+        xh.set_gid(100);
+        xh.set_cksum();
+        b.append_data(&mut xh, "run.sh", &b"#!\n"[..]).unwrap();
+
+        b.into_inner().unwrap()
+    }
+
+    /// An import has to carry the archive's mode AND ownership onto files
+    /// AND directories.
+    ///
+    /// It used to read only `mode`, apply it only to files, and only via
+    /// `set_permissions` — a hook just two drivers implement — so on every
+    /// other Unix filesystem an executable came back 0644, a 0600 secret
+    /// came back world-readable, directory modes were dropped everywhere,
+    /// and uid/gid were never read from the header at all. `tar_export`
+    /// writes all three fields, so a `tar` -> `untar` round-trip lost them.
+    #[test]
+    fn import_applies_archived_mode_and_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("ext.img");
+        std::fs::write(
+            &img,
+            crate::fs::ext_format::create_blank_ext2(16 * 1024 * 1024, "PERMS").unwrap(),
+        )
+        .unwrap();
+        let archive = dir.path().join("perms.tar");
+        std::fs::write(&archive, tar_with_permissions()).unwrap();
+
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&img)
+            .unwrap();
+        let mut efs = crate::fs::open_editable_filesystem(f, 0, 0, None).unwrap();
+        let root = efs.root().unwrap();
+        import_tar_from_path(
+            &mut *efs,
+            &root,
+            &archive,
+            &TarImportOptions::default(),
+            &|_| {},
+        )
+        .unwrap();
+        efs.sync_metadata().unwrap();
+
+        let find =
+            |efs: &mut dyn EditableFilesystem, parent: &FileEntry, name: &str| -> FileEntry {
+                efs.list_directory(parent)
+                    .unwrap()
+                    .into_iter()
+                    .find(|e| e.name == name)
+                    .unwrap_or_else(|| panic!("{name} missing after import"))
+            };
+
+        let root = efs.root().unwrap();
+        let private = find(&mut *efs, &root, "private");
+        assert_eq!(
+            private.mode.map(|m| m & 0o7777),
+            Some(0o700),
+            "directory mode came from the driver default, not the archive"
+        );
+        assert_eq!((private.uid, private.gid), (Some(1000), Some(100)));
+
+        let run = find(&mut *efs, &root, "run.sh");
+        assert_eq!(
+            run.mode.map(|m| m & 0o7777),
+            Some(0o755),
+            "executable bit did not survive the import"
+        );
+        assert_eq!((run.uid, run.gid), (Some(1000), Some(100)));
+
+        let key = find(&mut *efs, &private, "key.txt");
+        assert_eq!(
+            key.mode.map(|m| m & 0o7777),
+            Some(0o600),
+            "a 0600 file must not come back more permissive than the archive"
+        );
+        assert_eq!((key.uid, key.gid), (Some(1000), Some(100)));
+    }
+
+    /// `--no-permissions` means "ignore what the archive says", not "fall
+    /// back to root:root 0644": new entries inherit ownership from the
+    /// directory they land in, the same rule `rb-cli put` follows.
+    #[test]
+    fn no_permissions_inherits_from_the_parent_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("ext.img");
+        std::fs::write(
+            &img,
+            crate::fs::ext_format::create_blank_ext2(16 * 1024 * 1024, "PERMS").unwrap(),
+        )
+        .unwrap();
+        let archive = dir.path().join("perms.tar");
+        std::fs::write(&archive, tar_with_permissions()).unwrap();
+
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&img)
+            .unwrap();
+        let mut efs = crate::fs::open_editable_filesystem(f, 0, 0, None).unwrap();
+        let root = efs.root().unwrap();
+        // Import into a directory with a distinctive owner to inherit.
+        // (Built through `create_directory` rather than `set_owner`, which
+        // only SquashFS implements today.)
+        efs.create_directory(
+            &root,
+            "dest",
+            &crate::fs::filesystem::CreateDirectoryOptions {
+                mode: Some(0o40755),
+                uid: Some(42),
+                gid: Some(43),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // Re-read it the way a caller would, so it carries its owner.
+        let dest = efs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "dest")
+            .unwrap();
+        assert_eq!((dest.uid, dest.gid), (Some(42), Some(43)));
+
+        let opts = TarImportOptions {
+            apply_permissions: false,
+            ..Default::default()
+        };
+        let stats = import_tar_from_path(&mut *efs, &dest, &archive, &opts, &|_| {}).unwrap();
+        assert_eq!(stats.perms_applied, 0, "nothing archived should be applied");
+        efs.sync_metadata().unwrap();
+
+        let run = efs
+            .list_directory(&dest)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "run.sh")
+            .expect("run.sh missing");
+        assert_ne!(
+            run.mode.map(|m| m & 0o7777),
+            Some(0o755),
+            "the archive's mode should have been ignored"
+        );
+        assert_eq!(
+            (run.uid, run.gid),
+            (Some(42), Some(43)),
+            "ownership should come from the parent directory"
+        );
     }
 }

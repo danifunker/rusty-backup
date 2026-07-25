@@ -2327,6 +2327,22 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Uf
         Ok(())
     }
 
+    fn set_permissions(&mut self, entry: &FileEntry, mode: u32) -> Result<(), FilesystemError> {
+        let inum = entry.location as u32;
+        let mut ino = self.read_inode(inum)?;
+        ino.mode = super::unix_common::inode::with_permission_bits(ino.mode, mode);
+        self.write_inode(inum, &ino)
+    }
+
+    fn set_owner(&mut self, entry: &FileEntry, uid: u32, gid: u32) -> Result<(), FilesystemError> {
+        // UFS1 and UFS2 both carry 32-bit ids.
+        let inum = entry.location as u32;
+        let mut ino = self.read_inode(inum)?;
+        ino.uid = uid;
+        ino.gid = gid;
+        self.write_inode(inum, &ino)
+    }
+
     fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
         // Every primitive write flushes synchronously — bitmaps, cs
         // counters, inodes, and frag data all land at the moment they're

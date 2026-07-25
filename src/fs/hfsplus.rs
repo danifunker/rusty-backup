@@ -419,6 +419,59 @@ const CATALOG_FOLDER_THREAD: i16 = 3;
 #[allow(dead_code)]
 const CATALOG_FILE_THREAD: i16 = 4;
 
+/// `HFSPlusBSDInfo` — the POSIX block every catalog file and folder record
+/// carries at record offset 32.
+///
+/// This is how OS X does Unix permissions on HFS+: `ownerID` / `groupID` /
+/// `fileMode` are the real uid, gid and mode (type bits included), and the
+/// kernel honours them whenever the volume is mounted with ownership
+/// enabled. A volume that has never been touched by OS X — one formatted by
+/// Classic Mac OS, or by a tool that leaves the block zeroed — carries
+/// `fileMode == 0`, which means "no POSIX info recorded" rather than
+/// "mode 0000". [`Self::is_set`] is that distinction; surfacing a zero mode
+/// as `Some(0)` would render every file as `----------`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct HfsPlusBsdInfo {
+    pub(crate) owner_id: u32,
+    pub(crate) group_id: u32,
+    pub(crate) file_mode: u16,
+}
+
+impl HfsPlusBsdInfo {
+    /// Record-body offset of the `HFSPlusBSDInfo` block.
+    pub(crate) const OFFSET: usize = 32;
+
+    /// Parse from a catalog record body. Short records read as unset.
+    fn parse(rec: &[u8]) -> Self {
+        if rec.len() < Self::OFFSET + 16 {
+            return Self::default();
+        }
+        Self {
+            owner_id: BigEndian::read_u32(&rec[Self::OFFSET..Self::OFFSET + 4]),
+            group_id: BigEndian::read_u32(&rec[Self::OFFSET + 4..Self::OFFSET + 8]),
+            // adminFlags @+8 and ownerFlags @+9 sit between; fileMode is
+            // a u16 at +10 and `special` a u32 at +12.
+            file_mode: BigEndian::read_u16(&rec[Self::OFFSET + 10..Self::OFFSET + 12]),
+        }
+    }
+
+    /// Whether this record actually carries POSIX info.
+    fn is_set(&self) -> bool {
+        self.file_mode != 0
+    }
+
+    /// Stamp `mode`, `uid` and `gid` onto a `FileEntry`, but only when the
+    /// record has POSIX info to report.
+    fn apply_to(&self, fe: &mut FileEntry) {
+        if !self.is_set() {
+            return;
+        }
+        fe.mode = Some(self.file_mode as u32);
+        fe.uid = Some(self.owner_id);
+        fe.gid = Some(self.group_id);
+    }
+}
+
 /// A parsed HFS+ catalog entry.
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)] // catalog entries are short-lived per-record buffers; boxing adds heap churn
@@ -426,6 +479,7 @@ enum CatalogEntry {
     Folder {
         folder_id: u32,
         name: String,
+        bsd: HfsPlusBsdInfo,
     },
     File {
         file_id: u32,
@@ -451,6 +505,7 @@ enum CatalogEntry {
         /// `.HFS+ Private Directory Data\r` directory and replaces the
         /// stub when surfaced through `list_directory`.
         dir_link_inode_num: Option<u32>,
+        bsd: HfsPlusBsdInfo,
     },
 }
 
@@ -1417,7 +1472,11 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
                             continue;
                         }
                         let folder_id = BigEndian::read_u32(&rec[8..12]);
-                        results.push(CatalogEntry::Folder { folder_id, name });
+                        results.push(CatalogEntry::Folder {
+                            folder_id,
+                            name,
+                            bsd: HfsPlusBsdInfo::parse(rec),
+                        });
                     }
                     CATALOG_FILE => {
                         if rec.len() < 248 {
@@ -1462,6 +1521,7 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
                             finder_flags,
                             link_inode_num,
                             dir_link_inode_num,
+                            bsd: HfsPlusBsdInfo::parse(rec),
                         });
                     }
                     _ => {}
@@ -1485,7 +1545,9 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
         let mut map: HashMap<u32, u32> = HashMap::new();
         let private_name = hfsplus_private_dir_name();
         let private_cnid = self.list_children(2)?.into_iter().find_map(|c| match c {
-            CatalogEntry::Folder { folder_id, name } if name == private_name => Some(folder_id),
+            CatalogEntry::Folder {
+                folder_id, name, ..
+            } if name == private_name => Some(folder_id),
             _ => None,
         });
         if let Some(cnid) = private_cnid {
@@ -1520,7 +1582,9 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
     fn find_private_dir_cnid(&self) -> Result<Option<u32>, FilesystemError> {
         let private_name = hfsplus_private_dir_name();
         Ok(self.list_children(2)?.into_iter().find_map(|c| match c {
-            CatalogEntry::Folder { folder_id, name } if name == private_name => Some(folder_id),
+            CatalogEntry::Folder {
+                folder_id, name, ..
+            } if name == private_name => Some(folder_id),
             _ => None,
         }))
     }
@@ -1530,7 +1594,9 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
     fn find_dir_private_dir_cnid(&self) -> Result<Option<u32>, FilesystemError> {
         let dir_private_name = hfsplus_dir_private_dir_name();
         Ok(self.list_children(2)?.into_iter().find_map(|c| match c {
-            CatalogEntry::Folder { folder_id, name } if name == dir_private_name => Some(folder_id),
+            CatalogEntry::Folder {
+                folder_id, name, ..
+            } if name == dir_private_name => Some(folder_id),
             _ => None,
         }))
     }
@@ -1545,7 +1611,10 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
         let mut map: HashMap<u32, u32> = HashMap::new();
         if let Some(cnid) = self.find_dir_private_dir_cnid()? {
             for child in self.list_children(cnid)? {
-                if let CatalogEntry::Folder { folder_id, name } = child {
+                if let CatalogEntry::Folder {
+                    folder_id, name, ..
+                } = child
+                {
                     if let Some(rest) = name.strip_prefix("dir_") {
                         if let Ok(inode_num) = rest.parse::<u32>() {
                             map.insert(inode_num, folder_id);
@@ -3010,13 +3079,19 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
         let mut entries = Vec::new();
         for child in children {
             match child {
-                CatalogEntry::Folder { folder_id, name } => {
+                CatalogEntry::Folder {
+                    folder_id,
+                    name,
+                    bsd,
+                } => {
                     let path = if entry.path == "/" {
                         format!("/{name}")
                     } else {
                         format!("{}/{name}", entry.path)
                     };
-                    entries.push(FileEntry::new_directory(name, path, folder_id as u64));
+                    let mut fe = FileEntry::new_directory(name, path, folder_id as u64);
+                    bsd.apply_to(&mut fe);
+                    entries.push(fe);
                 }
                 CatalogEntry::File {
                     file_id,
@@ -3030,6 +3105,7 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
                     finder_flags,
                     link_inode_num,
                     dir_link_inode_num,
+                    bsd,
                 } => {
                     let path = if entry.path == "/" {
                         format!("/{name}")
@@ -3044,6 +3120,7 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
                         let mut fe = FileEntry::new_directory(name, path, file_id as u64);
                         fe.type_code = Some(type_code);
                         fe.creator_code = Some(creator_code);
+                        bsd.apply_to(&mut fe);
                         if let Some(target_cnid) = self.resolve_dir_hardlink_inode(num)? {
                             fe.link_target_cnid = Some(target_cnid as u64);
                         }
@@ -3070,6 +3147,7 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
                     fe.type_code = Some(type_code);
                     fe.creator_code = Some(creator_code);
                     fe.finder_flags = Some(finder_flags);
+                    bsd.apply_to(&mut fe);
                     if display_rsrc > 0 {
                         fe.resource_fork_size = Some(display_rsrc);
                     }
@@ -4107,6 +4185,40 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsPlusFilesystem<R> 
         result
     }
 
+    fn set_permissions(&mut self, entry: &FileEntry, mode: u32) -> Result<(), FilesystemError> {
+        let frec = self.record_body_offset(entry.location as u32)?;
+        let base = Self::bsd_type_bits(&self.catalog_data, frec, entry.is_directory());
+        let new = super::unix_common::inode::with_permission_bits(base, mode) as u16;
+        let at = frec + HfsPlusBsdInfo::OFFSET + 10;
+        BigEndian::write_u16(&mut self.catalog_data[at..at + 2], new);
+        Ok(())
+    }
+
+    fn set_owner(&mut self, entry: &FileEntry, uid: u32, gid: u32) -> Result<(), FilesystemError> {
+        // HFSPlusBSDInfo carries 32-bit ownerID / groupID.
+        let frec = self.record_body_offset(entry.location as u32)?;
+        let at = frec + HfsPlusBsdInfo::OFFSET;
+        BigEndian::write_u32(&mut self.catalog_data[at..at + 4], uid);
+        BigEndian::write_u32(&mut self.catalog_data[at + 4..at + 8], gid);
+        // An ownership change on a record with no POSIX info yet would be
+        // invisible to OS X, which reads ownership only where `fileMode`
+        // says the block is populated. Give it the type bits so the file
+        // gets a real mode instead of a half-filled one.
+        let mode_at = frec + HfsPlusBsdInfo::OFFSET + 10;
+        if BigEndian::read_u16(&self.catalog_data[mode_at..mode_at + 2]) == 0 {
+            let default_mode = if entry.is_directory() {
+                0o040_755
+            } else {
+                0o100_644
+            };
+            BigEndian::write_u16(
+                &mut self.catalog_data[mode_at..mode_at + 2],
+                default_mode as u16,
+            );
+        }
+        Ok(())
+    }
+
     fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
         self.do_sync_metadata()
     }
@@ -4222,12 +4334,13 @@ impl<R: Read + Write + Seek + Send> HfsPlusFilesystem<R> {
     ///
     /// Mostly used by the clone replay path; tests cover the round-trip
     /// in `clone_round_trip_*`.
-    pub(crate) fn set_record_metadata(
-        &mut self,
-        cnid: u32,
-        meta: &RecordMetadata,
-    ) -> Result<(), FilesystemError> {
-        // Resolve the catalog record body via the thread record.
+    /// Byte offset of catalog record `cnid`'s **body** (past the key) inside
+    /// `catalog_data`, resolved through the record's thread entry.
+    ///
+    /// Shared by every in-place record patch — the metadata replay below and
+    /// the POSIX-permission setters — so the thread-lookup / key-skip /
+    /// even-alignment dance lives in one place.
+    pub(crate) fn record_body_offset(&mut self, cnid: u32) -> Result<usize, FilesystemError> {
         let (_, _, t_offset) = self.find_catalog_record_by_cnid(cnid).ok_or_else(|| {
             FilesystemError::NotFound(format!("thread record for CNID {cnid} not found"))
         })?;
@@ -4262,6 +4375,35 @@ impl<R: Read + Write + Seek + Send> HfsPlusFilesystem<R> {
                 "catalog record for CNID {cnid} truncated"
             )));
         }
+        Ok(frec)
+    }
+
+    /// The `S_IFMT` bits to build a new `fileMode` on, for a record at
+    /// `frec`.
+    ///
+    /// Normally the record's existing `fileMode` supplies them. A volume
+    /// that has never carried POSIX info has `fileMode == 0` and therefore
+    /// no type bits — writing bare permission bits there would leave a
+    /// typeless mode that OS X reads as neither file nor directory, so the
+    /// type comes from the catalog record's own kind instead.
+    fn bsd_type_bits(catalog: &[u8], frec: usize, is_dir: bool) -> u32 {
+        let at = frec + HfsPlusBsdInfo::OFFSET + 10;
+        let cur = BigEndian::read_u16(&catalog[at..at + 2]) as u32;
+        if cur & 0o170_000 != 0 {
+            cur
+        } else if is_dir {
+            0o040_000
+        } else {
+            0o100_000
+        }
+    }
+
+    pub(crate) fn set_record_metadata(
+        &mut self,
+        cnid: u32,
+        meta: &RecordMetadata,
+    ) -> Result<(), FilesystemError> {
+        let frec = self.record_body_offset(cnid)?;
 
         BigEndian::write_u32(
             &mut self.catalog_data[frec + 12..frec + 16],
@@ -4521,9 +4663,9 @@ impl<R: Read + Write + Seek + Send> HfsPlusFilesystem<R> {
                 .list_children(dir_private_cnid)?
                 .into_iter()
                 .find_map(|c| match c {
-                    CatalogEntry::Folder { folder_id, name: n } if n == inode_name => {
-                        Some(folder_id)
-                    }
+                    CatalogEntry::Folder {
+                        folder_id, name: n, ..
+                    } if n == inode_name => Some(folder_id),
                     _ => None,
                 })
                 .ok_or_else(|| {

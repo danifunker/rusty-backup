@@ -1802,6 +1802,22 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Ef
         Err(FilesystemError::NotFound(entry.name.clone()))
     }
 
+    fn set_permissions(&mut self, entry: &FileEntry, mode: u32) -> Result<(), FilesystemError> {
+        let mut ino = self.read_inode(entry.location as u32)?;
+        ino.mode = super::unix_common::inode::with_permission_bits(ino.mode as u32, mode) as u16;
+        self.write_inode(&ino)
+    }
+
+    fn set_owner(&mut self, entry: &FileEntry, uid: u32, gid: u32) -> Result<(), FilesystemError> {
+        // IRIX EFS inodes carry 16-bit ids.
+        super::unix_common::inode::check_id_width(uid, 16, "uid")?;
+        super::unix_common::inode::check_id_width(gid, 16, "gid")?;
+        let mut ino = self.read_inode(entry.location as u32)?;
+        ino.uid = uid as u16;
+        ino.gid = gid as u16;
+        self.write_inode(&ino)
+    }
+
     fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
         self.do_sync_metadata()
     }

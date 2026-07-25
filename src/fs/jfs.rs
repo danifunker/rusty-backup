@@ -2454,6 +2454,30 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Jf
         crate::fs::jfs_fsck::repair_jfs(self)
     }
 
+    fn set_permissions(&mut self, entry: &FileEntry, mode: u32) -> Result<(), FilesystemError> {
+        let fino = entry.location as u32;
+        let dinode = self.read_fileset_inode_global(fino)?;
+        // `di_mode`'s high half carries JFS's own flags; only the low
+        // 16 bits are the POSIX mode, so rebuild in place rather than
+        // overwriting the word.
+        let mut raw = dinode.raw.clone();
+        let cur = read_u32(&raw, DI_OFF_MODE);
+        let posix = super::unix_common::inode::with_permission_bits(cur & 0xFFFF, mode);
+        let new = (cur & 0xFFFF_0000) | (posix & 0xFFFF);
+        raw[DI_OFF_MODE..DI_OFF_MODE + 4].copy_from_slice(&new.to_le_bytes());
+        self.write_dinode(fino, &raw)
+    }
+
+    fn set_owner(&mut self, entry: &FileEntry, uid: u32, gid: u32) -> Result<(), FilesystemError> {
+        // JFS carries 32-bit ids.
+        let fino = entry.location as u32;
+        let dinode = self.read_fileset_inode_global(fino)?;
+        let mut raw = dinode.raw.clone();
+        raw[DI_OFF_UID..DI_OFF_UID + 4].copy_from_slice(&uid.to_le_bytes());
+        raw[DI_OFF_GID..DI_OFF_GID + 4].copy_from_slice(&gid.to_le_bytes());
+        self.write_dinode(fino, &raw)
+    }
+
     fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
         self.flush_writes()
     }

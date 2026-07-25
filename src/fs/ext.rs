@@ -2374,6 +2374,49 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExtFilesystem<R> {
         Ok(())
     }
 
+    fn set_owner(&mut self, entry: &FileEntry, uid: u32, gid: u32) -> Result<(), FilesystemError> {
+        let inode_num = entry.location as u32;
+
+        // ext splits each id into a low half in the classic 128-byte
+        // inode and a high half in the extension beyond it. On a
+        // 128-byte inode there is nowhere to put the top half, so an id
+        // past 16 bits is refused rather than silently truncated — the
+        // read path applies the same `buf.len()` bounds.
+        let uid_hi_fits = self.inode_size >= 0x7A;
+        let gid_hi_fits = self.inode_size >= 0x7C;
+        if !uid_hi_fits {
+            super::unix_common::inode::check_id_width(uid, 16, "uid")?;
+        }
+        if !gid_hi_fits {
+            super::unix_common::inode::check_id_width(gid, 16, "gid")?;
+        }
+
+        let group = (inode_num - 1) / self.inodes_per_group;
+        let index = (inode_num - 1) % self.inodes_per_group;
+        let gd = &self.group_descriptors[group as usize];
+        let base = self.partition_offset
+            + gd.inode_table * self.block_size
+            + index as u64 * self.inode_size as u64;
+
+        // i_uid_lo (0x02) / i_gid_lo (0x18)
+        self.reader.seek(SeekFrom::Start(base + 0x02))?;
+        self.reader.write_all(&(uid as u16).to_le_bytes())?;
+        self.reader.seek(SeekFrom::Start(base + 0x18))?;
+        self.reader.write_all(&(gid as u16).to_le_bytes())?;
+        // i_uid_hi (0x78) / i_gid_hi (0x7A)
+        if uid_hi_fits {
+            self.reader.seek(SeekFrom::Start(base + 0x78))?;
+            self.reader.write_all(&((uid >> 16) as u16).to_le_bytes())?;
+        }
+        if gid_hi_fits {
+            self.reader.seek(SeekFrom::Start(base + 0x7A))?;
+            self.reader.write_all(&((gid >> 16) as u16).to_le_bytes())?;
+        }
+        self.reseal_inode_csum(inode_num)?;
+
+        Ok(())
+    }
+
     fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
         self.write_superblock()?;
         // Group descriptors are written immediately when modified,

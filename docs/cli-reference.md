@@ -473,6 +473,34 @@ Usage: chmeta [OPTIONS] <IMAGE> <PATH>
 - `--type` — New 4-character type code
 - `--creator` — New 4-character creator code (HFS / HFS+ only)
 
+### `chmod`
+
+Change POSIX permission bits on an entry inside an image. Works on every filesystem that stores a Unix mode — ext, EFS, UFS, Minix, JFS, XFS, SquashFS, and HFS+ (its `HFSPlusBSDInfo`, which is how OS X carries permissions)
+
+```
+Usage: chmod <IMAGE> <PATH> <MODE>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image reference (`path` or `path@N` for the 1-based partition index)
+- `<PATH>` — Absolute path of the entry inside the filesystem
+- `<MODE>` — New permission bits in octal, with or without a leading `0` (`755`, `0644`, `4755` for setuid). The file-type bits are kept
+
+### `chown`
+
+Change the owning uid / gid on an entry inside an image. Same filesystem support as `chmod`
+
+```
+Usage: chown <IMAGE> <PATH> <OWNER>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image reference (`path` or `path@N` for the 1-based partition index)
+- `<PATH>` — Absolute path of the entry inside the filesystem
+- `<OWNER>` — New owner as `UID`, `UID:GID`, or `:GID` to change the group alone
+
 ### `completions`
 
 Emit a shell-completion script to stdout
@@ -1798,7 +1826,7 @@ Usage: untar [OPTIONS] <IMAGE> <ARCHIVE> [DEST]
 
 - `--force` — Overwrite entries that already exist at the destination. Mutually exclusive with `--skip-existing`
 - `--skip-existing` — Skip entries that already exist at the destination. Mutually exclusive with `--force`
-- `--no-permissions` — Do not apply archived Unix permission bits (mode) to imported files
+- `--no-permissions` — Ignore the archive's Unix mode and ownership. Imported entries then inherit uid/gid from the directory they land in and take the filesystem's default mode, the same rule `put` follows
 - `--include-appledouble` — Import macOS AppleDouble sidecars (`._*`) too. By default they are skipped as Mac metadata cruft
 - `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zxplus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
 - `--carve-full` — Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga "NDOS" disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem

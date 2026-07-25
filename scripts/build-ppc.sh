@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# build-ppc.sh -- transpile the rusty-backup engine (rb-cli-vintage) to C via
+# build-ppc.sh -- transpile the rusty-backup engine (rb-cli-ppc) to C via
 # mrustc, toward a native PowerPC Mac OS X 10.4/10.5 `rb-cli`.
 #
 # This is the *modern-Mac half* of a two-machine pipeline (see
@@ -22,15 +22,20 @@
 # Usage:
 #   scripts/build-ppc.sh            # run every stage in order (host path)
 #   scripts/build-ppc.sh <stage>    # run a single stage
-#   stages: mrustc overrides hostlibs vendor host  ppclibs ppc
+#   stages: mrustc overrides hostlibs vendor hostc host  ppclibs ppc
+#     (hostc = emit the engine's C on this Mac, no PPC libc needed; the
+#      fastest unblocked test that the whole engine transpiles)
 #
 set -euo pipefail
 
 # ---- config -----------------------------------------------------------------
 MRUSTC_DIR="${MRUSTC_DIR:-$HOME/repos/mrustc}"
 RB_DIR="${RB_DIR:-$HOME/repos/rusty-backup}"
-VINTAGE_DIR="$RB_DIR/rb-cli-vintage"
-VENDOR_DIR="$VINTAGE_DIR/vendor"
+# rb-cli-ppc is the mrustc/PowerPC manifest (sibling of rb-cli-vintage). It
+# reuses ../src but carries the dep deviations mrustc's C backend forces, so
+# rb-cli-vintage stays pristine. See rb-cli-ppc/Cargo.toml for the deviations.
+CRATE_DIR="$RB_DIR/rb-cli-ppc"
+VENDOR_DIR="$CRATE_DIR/vendor"
 
 RUSTC_VERSION="${RUSTC_VERSION:-1.74.0}"   # rustc source mrustc bootstraps from
 export MRUSTC_TARGET_VER="${MRUSTC_TARGET_VER:-1.74}"  # language mode for mrustc
@@ -41,6 +46,7 @@ PPC_TARGET="powerpc-apple-darwin"
 HOST_LIBS="$MRUSTC_DIR/output-${RUSTC_VERSION}"
 PPC_LIBS="$MRUSTC_DIR/output-${RUSTC_VERSION}-${PPC_TARGET}"
 HOST_OUT="$MRUSTC_DIR/output-rb-host"
+HOSTC_OUT="$MRUSTC_DIR/output-rb-hostc"
 PPC_OUT="$MRUSTC_DIR/output-rb-ppc"
 JOBS="$(sysctl -n hw.ncpu 2>/dev/null || echo 4)"
 
@@ -109,10 +115,10 @@ stage_hostlibs() {
   note "host libstd ready."
 }
 
-# ---- stage 4: vendor rb-cli-vintage's dependency sources --------------------
+# ---- stage 4: vendor rb-cli-ppc's dependency sources ------------------------
 stage_vendor() {
-  banner "4. cargo vendor rb-cli-vintage deps -> $VENDOR_DIR"
-  cd "$VINTAGE_DIR"
+  banner "4. cargo vendor rb-cli-ppc deps -> $VENDOR_DIR"
+  cd "$CRATE_DIR"
   cargo vendor --locked vendor >/dev/null
   note "vendored $(ls vendor | wc -l | tr -d ' ') crates."
 }
@@ -123,7 +129,7 @@ stage_host() {
   cd "$MRUSTC_DIR"
   mkdir -p "$HOST_OUT"
   MRUSTC_TARGET_VER="$MRUSTC_TARGET_VER" \
-    bin/minicargo "$VINTAGE_DIR" \
+    bin/minicargo "$CRATE_DIR" \
       --vendor-dir "$VENDOR_DIR" \
       -L "$HOST_LIBS" \
       --output-dir "$HOST_OUT" \
@@ -135,6 +141,30 @@ stage_host() {
   else
     die "HOST rb-cli not produced -- this is where per-crate mrustc lowering errors surface"
   fi
+}
+
+# ---- stage 5b: emit the engine's C on the HOST (no PPC libc needed) ---------
+# The host analog of `ppc`: transpile the whole engine to C against the working
+# host libstd, codegen DEFERRED -- so you get every crate's .c plus a
+# <crate>-codegen.sh, WITHOUT needing the final link to succeed. This is the
+# fastest unblocked way to (a) prove mrustc digests the entire engine and
+# (b) read the emitted C, months before the PPC libc is sorted.
+stage_hostc() {
+  banner "5b. emit host C for the whole engine (deferred codegen) -> $HOSTC_OUT"
+  cd "$MRUSTC_DIR"
+  [ -e "$HOST_LIBS/libstd.rlib" ] || die "run 'hostlibs' first (need $HOST_LIBS)"
+  [ -d "$VENDOR_DIR" ] || die "run 'vendor' first"
+  mkdir -p "$HOSTC_OUT"
+  MRUSTC_TARGET_VER="$MRUSTC_TARGET_VER" MINICARGO_DEFER_CODEGEN=1 \
+    bin/minicargo "$CRATE_DIR" \
+      --vendor-dir "$VENDOR_DIR" \
+      -L "$HOST_LIBS" \
+      --output-dir "$HOSTC_OUT" \
+      --no-default-features --features "$FEATURES" \
+      -j "$JOBS"
+  note "emitted $(ls "$HOSTC_OUT"/*.c 2>/dev/null | wc -l | tr -d ' ') .c files in $HOSTC_OUT"
+  note "engine C:  $HOSTC_OUT/librusty_backup-*.c"
+  note "binary C:  $HOSTC_OUT/rb-cli.c   (+ per-crate <name>-codegen.sh)"
 }
 
 # ---- stage 6: PPC libs (BLOCKED: no powerpc-apple-darwin libc yet) ----------
@@ -158,7 +188,7 @@ stage_ppc() {
   cd "$MRUSTC_DIR"
   mkdir -p "$PPC_OUT"
   MRUSTC_TARGET_VER="$MRUSTC_TARGET_VER" MINICARGO_DEFER_CODEGEN=1 \
-    bin/minicargo "$VINTAGE_DIR" \
+    bin/minicargo "$CRATE_DIR" \
       --vendor-dir "$VENDOR_DIR" \
       -L "$PPC_LIBS" \
       --output-dir "$PPC_OUT" \
@@ -175,6 +205,7 @@ main() {
     overrides) stage_overrides ;;
     hostlibs)  stage_hostlibs ;;
     vendor)    stage_vendor ;;
+    hostc)     stage_hostc ;;
     host)      stage_host ;;
     ppclibs)   stage_ppclibs ;;
     ppc)       stage_ppc ;;
@@ -186,7 +217,7 @@ main() {
       stage_host
       banner "HOST path complete. PPC half is blocked on libc (stage 6); see the doc."
       ;;
-    *) die "unknown stage '$stage' (mrustc|overrides|hostlibs|vendor|host|ppclibs|ppc|all)" ;;
+    *) die "unknown stage '$stage' (mrustc|overrides|hostlibs|vendor|hostc|host|ppclibs|ppc|all)" ;;
   esac
 }
 main "$@"

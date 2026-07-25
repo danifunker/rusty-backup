@@ -31,7 +31,7 @@ proof the whole engine transpiles before we involve PowerPC at all.
 
 ## What transpiles vs. what stays hand-written C
 
-- **Transpiles:** the whole `rb-cli-vintage` engine — every filesystem driver,
+- **Transpiles:** the whole `rb-cli-ppc` engine — every filesystem driver,
   partition tables, backup/restore, and the ratatui TUI. (Not FAT-only.)
 - **Stays out:** `chd` (libchdman is C++), the egui GUI, and the `os/` platform
   layer (device enumeration via objc2 targets modern macOS, not Tiger — that's

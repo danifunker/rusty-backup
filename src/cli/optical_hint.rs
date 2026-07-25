@@ -30,7 +30,7 @@ pub fn with_optical_hint(err: anyhow::Error, path: &Path) -> anyhow::Error {
 fn optical_redirect_hint(path: &Path) -> Option<String> {
     #[cfg(feature = "optical")]
     {
-        if let Ok(info) = opticaldiscs::detect::DiscImageInfo::open(path) {
+        if let Ok(info) = crate::optical::open_disc_image(path) {
             let mut msg = format!(
                 "This looks like an optical disc image ({}). The generic ls/get/du \
                  verbs only handle block-device (hard-disk / floppy) images; use the \
@@ -76,7 +76,7 @@ fn optical_redirect_hint(path: &Path) -> Option<String> {
 pub fn is_browsable_optical(path: &Path) -> bool {
     #[cfg(feature = "optical")]
     {
-        opticaldiscs::detect::DiscImageInfo::open(path)
+        crate::optical::open_disc_image(path)
             .map(|i| i.filesystem != opticaldiscs::formats::FilesystemType::Unknown)
             .unwrap_or(false)
     }

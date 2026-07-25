@@ -365,6 +365,31 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for XfsFilesystem<R> {
         Ok(report)
     }
 
+    fn set_permissions(&mut self, entry: &FileEntry, mode: u32) -> Result<(), FilesystemError> {
+        // di_mode is a big-endian u16 at offset 2 of the dinode core.
+        // `write_inode_region` re-stamps the v5 CRC for us.
+        let sb = self.superblock().clone();
+        let (_core, mut buf) = self.read_inode_buf(entry.location)?;
+        let cur = byteorder::BigEndian::read_u16(&buf[2..4]) as u32;
+        let new = crate::fs::unix_common::inode::with_permission_bits(cur, mode) as u16;
+        byteorder::BigEndian::write_u16(&mut buf[2..4], new);
+        self.write_inode_region(&sb, entry.location, &buf)?;
+        self.reader.flush()?;
+        Ok(())
+    }
+
+    fn set_owner(&mut self, entry: &FileEntry, uid: u32, gid: u32) -> Result<(), FilesystemError> {
+        // di_uid / di_gid are big-endian u32s at offsets 8 and 12 — XFS
+        // has carried 32-bit ids since v1, so no width check is needed.
+        let sb = self.superblock().clone();
+        let (_core, mut buf) = self.read_inode_buf(entry.location)?;
+        byteorder::BigEndian::write_u32(&mut buf[8..12], uid);
+        byteorder::BigEndian::write_u32(&mut buf[12..16], gid);
+        self.write_inode_region(&sb, entry.location, &buf)?;
+        self.reader.flush()?;
+        Ok(())
+    }
+
     fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
         // Repair writes through to the device immediately; just flush.
         self.reader.flush()?;

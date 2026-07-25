@@ -12,6 +12,58 @@ pub mod source;
 
 pub use convert::ConvertProgress;
 pub use rip::{run_rip, OpticalTarget, RipConfig, RipFormat, RipProgress};
+
+/// Open `path` as a disc image — the guarded replacement for calling
+/// [`opticaldiscs::detect::DiscImageInfo::open`] directly.
+///
+/// **Always use this.** `DiscImageInfo::open` sniffs every container it
+/// knows, and its CHD branch ends in MAME's `cdrom_file(chd_file*)`
+/// constructor, which **throws** when the CHD carries no CD metadata — i.e.
+/// every ordinary hard-disk CHD. A C++ exception cannot unwind through
+/// Rust frames, so the process does not get an error back: it calls
+/// `std::terminate` and aborts. Opening a hard-disk CHD anywhere near an
+/// optical probe therefore killed the app outright.
+///
+/// The CHD's own info record answers "is this a CD?" without constructing a
+/// `cdrom_file`, so ask that first and refuse anything else with a normal
+/// error. Non-CHD paths are passed straight through.
+///
+/// The durable fix belongs upstream — the C shim should `catch(...)` and
+/// return null rather than letting an exception reach the FFI boundary —
+/// but this keeps a hard-disk CHD from aborting the process in the
+/// meantime, and remains correct afterwards.
+/// Returns the crate's own error type, so callers keep the distinction
+/// between a hard I/O failure and "this isn't a disc image" — the refusal
+/// arrives as `UnsupportedFormat`, which is what a hard-disk CHD is from
+/// the optical layer's point of view.
+pub fn open_disc_image(
+    path: &std::path::Path,
+) -> Result<opticaldiscs::detect::DiscImageInfo, opticaldiscs::OpticaldiscsError> {
+    if crate::model::source_reader::is_chd_path(path) && !chd_is_cd_safe(path) {
+        return Err(opticaldiscs::OpticaldiscsError::UnsupportedFormat(format!(
+            "{} is a CHD with no CD metadata (a hard-disk CHD), not an optical disc image",
+            path.display()
+        )));
+    }
+    opticaldiscs::detect::DiscImageInfo::open(path)
+}
+
+/// Whether a CHD declares itself a CD, via the info record only.
+///
+/// Without the `chd` feature there is no way to ask, so the answer is "no"
+/// — refusing to probe is the safe direction when the alternative is an
+/// abort.
+fn chd_is_cd_safe(path: &std::path::Path) -> bool {
+    #[cfg(feature = "chd")]
+    {
+        crate::rbformats::chd::chd_is_cd(path).unwrap_or(false)
+    }
+    #[cfg(not(feature = "chd"))]
+    {
+        let _ = path;
+        false
+    }
+}
 #[cfg(feature = "remote")]
 pub use source::RemoteCdReader;
 pub use source::{LocalCdReader, OpticalSource};

@@ -1,0 +1,136 @@
+# rb-cli-ppc — the mrustc / PowerPC manifest. A THIRD self-contained top-level
+# package (sibling of rb-cli-vintage) that reuses the shared engine under ../src
+# but carries the dependency deviations mrustc's C backend forces. Keeping them
+# here means rb-cli-vintage/Cargo.toml stays pristine for the real
+# x86_64-10.7 / Win7 vintage builds, and rusty-backup's main Cargo.toml is never
+# touched.
+#
+# This package is built with mrustc, NOT cargo — see scripts/build-ppc.sh and
+# docs/build-ppc-mrustc.md. It resolves with its own lockfile
+# (rb-cli-ppc/Cargo.lock) and its own vendored sources (rb-cli-ppc/vendor,
+# gitignored). Everything not listed under DEVIATIONS mirrors rb-cli-vintage
+# exactly; when the two drift for any reason other than an mrustc limitation,
+# that is a bug.
+#
+# DEVIATIONS FROM rb-cli-vintage (each entry is a crate mrustc cannot lower):
+#   - zip: feature `deflate` -> `deflate-flate2`.
+#       `deflate` = [deflate-zopfli, deflate-flate2]; deflate-zopfli pulls the
+#       `zopfli` crate, which pulls `bumpalo`, and mrustc asserts out
+#       transpiling bumpalo (`Bump::shrink`, hir_typeck/expr_cs.cpp:1665,
+#       "Failure to infer"). `deflate-flate2` keeps identical DEFLATE support
+#       through flate2 (already a dependency); only zopfli's slower/smaller
+#       encoder is dropped — no archive-format change.
+#
+# The empty [workspace] table makes this its own workspace root, so it resolves
+# independently and is not pulled into the parent package's build.
+[workspace]
+
+[package]
+name = "rb-cli-ppc"
+version = "0.1.0"
+edition = "2021"
+# See rb-cli-vintage: drives the MSRV-aware resolver toward <=1.73 crate
+# versions. mrustc bootstraps rustc 1.74, one minor above, so the same pins hold.
+rust-version = "1.73"
+license = "AGPL-3.0"
+build = "../build.rs"
+
+# Reuse the shared engine as a library, exactly like rb-cli-vintage.
+[lib]
+name = "rusty_backup"
+path = "../src/lib.rs"
+
+[[bin]]
+name = "rb-cli"
+path = "../src/bin/rb_cli.rs"
+
+[features]
+default = []
+native-zstd = ["dep:zstd"]
+remote = []
+tui = ["dep:ratatui", "ratatui-legacy"]
+ratatui-legacy = []
+rust173-polyfill = []
+windows-legacy = []
+
+[dependencies]
+# --- TUI (pinned to the last 1.73-buildable line) ---
+ratatui = { version = "0.29", default-features = false, features = ["crossterm"], optional = true }
+
+# --- zstd backend (C, from source) ---
+zstd = { version = "0.13", optional = true }
+
+# --- always-on engine deps (mirror of rb-cli-vintage) ---
+anyhow = "1"
+thiserror = "2"
+clap = { version = ">=4.4, <4.5", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+byteorder = "1"
+encoding_rs = "0.8"
+log = "0.4"
+env_logger = "0.11"
+sha2 = "0.10"
+md-5 = "0.10"
+sha1 = "0.10"
+crc32c = "0.6"
+crc32fast = "1"
+chrono = "0.4"
+tempfile = ">=3, <3.13"
+dirs = "6"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+lz4_flex = ">=0.10, <0.11"
+tar = "0.4"
+bzip2 = "=0.5.2"
+# DEVIATION (see header): deflate-flate2, NOT `deflate` — `deflate` pulls
+# zopfli -> bumpalo, which mrustc cannot transpile.
+zip = { version = "=2.4.2", default-features = false, features = ["deflate-flate2", "aes-crypto"] }
+base64 = "0.22"
+serde_yml = "=0.0.12"
+csv = "1"
+clap_complete = ">=4.4, <4.5"
+globset = ">=0.4, <0.4.17"
+rustyline = { version = ">=12, <15", features = ["with-file-history"] }
+crossterm = "0.28"
+shell-words = "1.1.1"
+lzma-rs = "0.3.0"
+lzfse_rust = "0.2.1"
+
+# --- Transitive pins (mirror of rb-cli-vintage) ---
+indexmap = "=2.5.0"
+hashbrown = "=0.14.5"
+zeroize = "=1.8.1"
+home = "=0.5.9"
+zeroize_derive = "=1.4.2"
+jobserver = "=0.1.31"
+crc = "=3.3.0"
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.31", features = ["fs", "mount", "user"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-io-kit = { version = "0.3", default-features = false, features = ["libc", "pwr_mgt"] }
+objc2-disk-arbitration = { version = "0.3", default-features = false, features = ["DASession", "DADisk", "DADissenter", "libc"] }
+objc2-core-foundation = { version = "0.3", features = ["CFString", "CFDictionary", "CFNumber", "CFRunLoop", "CFURL"] }
+objc2-foundation = { version = "0.3", features = ["NSBundle", "NSString"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+self-replace = "1"
+winreg = "0.56"
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Ioctl",
+    "Win32_System_IO",
+    "Win32_Storage_FileSystem",
+    "Win32_Security",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Registry",
+    "Win32_System_Power",
+] }
+
+[build-dependencies]
+winres = "0.1"

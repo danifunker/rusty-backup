@@ -145,6 +145,16 @@ pub enum Command {
     /// ProDOS file.
     Chmeta(verbs::chmeta::ChmetaArgs),
 
+    /// Change POSIX permission bits on an entry inside an image. Works on
+    /// every filesystem that stores a Unix mode — ext, EFS, UFS, Minix,
+    /// JFS, XFS, SquashFS, and HFS+ (its `HFSPlusBSDInfo`, which is how
+    /// OS X carries permissions).
+    Chmod(verbs::chmod::ChmodArgs),
+
+    /// Change the owning uid / gid on an entry inside an image. Same
+    /// filesystem support as `chmod`.
+    Chown(verbs::chmod::ChownArgs),
+
     /// SquashFS edits with an explicit size budget (`plan` / `put` / `rm`).
     /// The format has no in-place write, so committing rebuilds the whole
     /// image and its final size can only be bounded, never predicted.
@@ -461,6 +471,8 @@ pub fn dispatch(command: Command) -> Result<()> {
         Command::Shrink(args) => verbs::shrink::run(args),
         Command::Bless { cmd } => verbs::bless::run(cmd),
         Command::Chmeta(args) => verbs::chmeta::run(args),
+        Command::Chmod(args) => verbs::chmod::run_chmod(args),
+        Command::Chown(args) => verbs::chmod::run_chown(args),
         Command::Squashfs { cmd } => verbs::squashfs::run(cmd),
         Command::Xattr { cmd } => verbs::xattr::run(cmd),
         Command::Setrsrc(args) => verbs::setrsrc::run(args),
