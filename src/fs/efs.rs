@@ -4291,13 +4291,24 @@ mod tests {
     fn adding_files_to_a_real_irix_volume_leaves_existing_inodes_intact() {
         use super::super::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
         let img = load_fixture();
+        let img_len = img.len();
         let mut fs = EfsFilesystem::open(Cursor::new(img), 0).expect("open EFS");
         let regions = EfsDataRegions::from_sb(&fs.sb);
-        // The fixture is the first 4 MB of a 3.8 GB volume, so the
-        // volume's own `lastialloc` hint (325229) points at an inode
-        // table past the end of the file. Start the scan low so the
-        // whole exercise stays inside the bytes we have.
+
+        // The fixture is only the first 4 MB of a 3.8 GB volume, so two
+        // superblock fields point past the end of the bytes we have.
+        // Both get retargeted inside the window; neither is what this
+        // test is about, and leaving them alone breaks it in ways that
+        // say nothing about the allocator:
+        //
+        //  * `lastialloc` (325229) would start the inode scan in a
+        //    cylinder group we don't have, giving a short read.
+        //  * `replsb` (7486289) is where sync writes the replica
+        //    superblock — 3.57 GiB in, which on a 32-bit target is past
+        //    `isize::MAX` and panics the backing Vec with "capacity
+        //    overflow" rather than anything to do with EFS.
         fs.sb.lastialloc = 2;
+        fs.sb.replsb = (img_len / EFS_BLOCKSIZE as usize) as u32 - 1;
 
         // Snapshot the inodes living in the blocks first-fit used to
         // hand out (block 1984 onward holds inums 616..).
@@ -4370,6 +4381,14 @@ mod tests {
 
         // And the files read back correctly through a fresh open.
         let bytes = fs.reader.into_inner();
+        // Nothing above may write past the fixture. Checking this here
+        // keeps a future out-of-bounds write an assertion rather than a
+        // multi-gigabyte allocation that only fails on 32-bit targets.
+        assert_eq!(
+            bytes.len(),
+            img_len,
+            "the edit grew the image, so something wrote outside the fixture"
+        );
         let mut fs2 = EfsFilesystem::open(Cursor::new(bytes), 0).expect("reopen");
         let kids = fs2.list_directory(&parent).expect("list");
         for (entry, payload) in &created {
