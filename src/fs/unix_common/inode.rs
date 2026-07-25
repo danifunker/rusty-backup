@@ -172,6 +172,43 @@ pub fn unix_entry_from_inode(
     }
 }
 
+/// Check that a POSIX id fits the width its on-disk inode field has,
+/// refusing rather than truncating.
+///
+/// The narrow fields are real: EFS and Minix V2/V3 store 16-bit uid and
+/// gid, and Minix V1 stores gid in a single byte. A silently wrapped id
+/// is far worse than a rejected one — uid 65536 on a 16-bit field
+/// becomes 0, which is root. `what` names the field for the error
+/// ("uid" / "gid").
+pub fn check_id_width(
+    value: u32,
+    bits: u32,
+    what: &str,
+) -> Result<u32, crate::fs::filesystem::FilesystemError> {
+    let max = if bits >= 32 {
+        u32::MAX
+    } else {
+        (1u32 << bits) - 1
+    };
+    if value > max {
+        return Err(crate::fs::filesystem::FilesystemError::InvalidData(
+            format!(
+                "{what} {value} does not fit this filesystem's {bits}-bit {what} field (max {max})"
+            ),
+        ));
+    }
+    Ok(value)
+}
+
+/// Replace the permission bits of `mode`, keeping its file-type bits.
+///
+/// Every `set_permissions` implementation needs this: the caller passes
+/// `0o7777` permission bits, and writing them straight into the inode
+/// would clear `S_IFREG` / `S_IFDIR` and leave a typeless inode behind.
+pub fn with_permission_bits(current_mode: u32, new_perms: u32) -> u32 {
+    (current_mode & S_IFMT) | (new_perms & 0o7777)
+}
+
 /// Extract major and minor device numbers from a raw Linux device number.
 ///
 /// Linux encodes devices as: `major = (dev >> 8) & 0xFFF`, `minor = (dev & 0xFF) | ((dev >> 12) & 0xFFF00)`.

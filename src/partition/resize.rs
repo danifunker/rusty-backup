@@ -629,8 +629,11 @@ mod tests {
         .fs_size;
 
         // Grow: a shrink has its own conservative floor and cylinder-group
-        // rules, which are efs_resize's business, not this path's.
-        const NEW_SIZE: u64 = 12 * 1024 * 1024;
+        // rules, which are efs_resize's business, not this path's. The
+        // target has to buy at least one whole cylinder group — an 8 MiB
+        // EFS is a single group, so 24 MiB (three) is the smallest step
+        // that visibly moves `fs_size`.
+        const NEW_SIZE: u64 = 24 * 1024 * 1024;
         let mut cur = Cursor::new(img);
         let mut log = |_: &str| {};
         patch_filesystem_size(&mut cur, 0, NEW_SIZE, &mut log).expect("patch");

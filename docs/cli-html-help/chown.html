@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli chown</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <span>chown</span></nav>
+<h1><code>rb-cli chown</code></h1>
+<p>Change the owning uid / gid on an entry inside an image. Same filesystem support as `chmod`</p>
+<h2>Usage</h2>
+<pre><code>Usage: chown &lt;IMAGE&gt; &lt;PATH&gt; &lt;OWNER&gt;</code></pre>
+<h2>Arguments</h2>
+<dl class="args">
+<dt><code>&lt;IMAGE&gt;</code></dt>
+<dd>Image reference (`path` or `path@N` for the 1-based partition index)</dd>
+<dt><code>&lt;PATH&gt;</code></dt>
+<dd>Absolute path of the entry inside the filesystem</dd>
+<dt><code>&lt;OWNER&gt;</code></dt>
+<dd>New owner as `UID`, `UID:GID`, or `:GID` to change the group alone</dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_docs</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>

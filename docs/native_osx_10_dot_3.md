@@ -1,7 +1,55 @@
 # Native rb-cli for Mac OS X 10.3 / 10.4 / 10.5 (PowerPC)
 
-Status: **PLAN ONLY — not started.** A design to revisit later. Scope is
-deliberately limited to `rb-cli`; the GUI is a separate question (see the end).
+Status: **IN PROGRESS.** The mrustc toolchain is up and the engine has been
+pushed through it far enough to map the real obstacles. Scope is deliberately
+limited to `rb-cli`; the GUI is a separate question (see the end). See
+[`build-ppc-mrustc.md`](build-ppc-mrustc.md) for the runnable build.
+
+## Where this stands (2026-07-25)
+
+**Toolchain proven.** mrustc builds and runs (both an arm Mac and an x86_64
+Linux box, `m900`). It transpiles Rust to C99; `powerpc-apple-darwin` is a
+built-in target. The x86_64-linux host is mrustc's best-supported target and is
+our current proxy while the PPC libc is unbuilt.
+
+**Two mrustc source fixes landed.** (1) TOML parser: nested arrays / inline
+tables / full escape set — **merged upstream** (thepowersgang/mrustc). (2) A
+`CallPath` typecheck revisit — partial; see below.
+
+**The engine transpiles far but hits a *diverse long tail* of mrustc gaps.**
+Across ~45 of 240 crates we hit ~6 distinct issues plus target-specific noise:
+- `bumpalo` (const-generic infer) — dropped via a zip feature deviation.
+- `constant_time_eq` (aarch64 `asm!`) — a *host* artifact; x86_64 handles it.
+- `crc` (const-generic `Digest::new`) — worked around with a turbofish patch;
+  mrustc genuinely can't infer const-generic impl params from context.
+- `jiff-core` (const-generic) — dropped by pinning env_logger to 0.10.
+- `libyml` (macro-expansion gap) — YAML output; needs a feature-gate.
+- `libc` 0.2.189 (`linux::can` path-res) — a *host* artifact (Linux-only code).
+
+**The load-bearing finding: the pain splits by layer.** The **portable engine**
+(fs drivers, partition, backup/restore, formats) is tractable with per-crate
+workarounds. The **platform layer** (`os/`, `libc`, `nix`, `objc2`) is where
+most of the pain lives, it is *target-specific* (nix + libc-linux on the x64
+host; objc2 on ppc-darwin), and per §5 it is **hand-C in the PPC shell anyway**.
+So the right scope-down is to transpile the portable engine and **exclude
+`os/`** (which drops libc/nix from the graph) — this is exactly §5's
+architecture, and it is **not** FAT-only (every filesystem stays). The first PPC
+`rb-cli` operates on disk-image files; raw-device I/O is the later hand-C shell.
+
+**The libc port (for the real PPC target) is fully sourceable.** A real PowerPC
+Mac (Power Mac G5, Leopard 10.5.8) on the LAN carries the **MacOSX10.4u SDK**
+(plus 10.3.9 / 10.2.8) and **native `gcc-4.0.1` / `gcc-4.2.1`** (`powerpc-apple-
+darwin9`). That means the reliable method is available: compile `sizeof` /
+`offsetof` / `alignof` probes **on real PPC** against the 10.4u SDK to generate a
+byte-correct `libc` `powerpc-apple-darwin` arch file (big-endian layout is where
+you otherwise get silently-wrong offsets). No off-the-shelf Rust libc port
+exists to lift (the `libc` crate postdates PPC Macs; rust-ppc-tiger has none),
+so it must be *created* — but the ground truth is on hand.
+
+**Revised direction:** (B-then-C) trim `rb-cli-ppc` to the portable engine
+(exclude `os/`, drop the mrustc-hostile utility deps), get *that* transpiling on
+the x64 host, then build the `powerpc-apple-darwin` libc from the G5's 10.4u SDK
+to move onto real hardware and add the platform layer back as hand-C.
 
 > **§3 was materially corrected on 2026-07-23** against the mrustc source. Two
 > claims that shaped this plan — that PPC needs the rustc 1.54 baseline, and that

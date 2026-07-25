@@ -47,7 +47,9 @@ pub struct UntarArgs {
     #[arg(long = "skip-existing", conflicts_with = "force")]
     pub skip_existing: bool,
 
-    /// Do not apply archived Unix permission bits (mode) to imported files.
+    /// Ignore the archive's Unix mode and ownership. Imported entries
+    /// then inherit uid/gid from the directory they land in and take the
+    /// filesystem's default mode, the same rule `put` follows.
     #[arg(long = "no-permissions")]
     pub no_permissions: bool,
 

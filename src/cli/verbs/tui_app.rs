@@ -197,15 +197,43 @@ struct FsckReportView {
     scroll: usize,
 }
 
-/// The HFS/HFS+ metadata editor: edit a file's Type, Creator, and modified date.
+/// The entry metadata editor: a file's HFS/HFS+ Type, Creator and modified
+/// date, plus the POSIX mode and owner on filesystems that carry them. A
+/// blank field is left untouched, which is also how a volume without that
+/// kind of metadata presents.
 struct MetaEdit {
     entry_name: String,
     type_code: String,
     creator: String,
     modified: String,
-    /// Focused field: 0 = type, 1 = creator, 2 = modified.
+    /// Octal permission bits, or empty when the filesystem has none.
+    mode: String,
+    /// `uid:gid`, or empty when the filesystem has no ownership.
+    owner: String,
+    /// Focused field: see [`MetaEdit::FIELDS`].
     field: usize,
     error: Option<String>,
+}
+
+impl MetaEdit {
+    /// Field order in the editor, matching the render order.
+    const FIELDS: usize = 5;
+    const F_TYPE: usize = 0;
+    const F_CREATOR: usize = 1;
+    const F_MODIFIED: usize = 2;
+    const F_MODE: usize = 3;
+    const F_OWNER: usize = 4;
+
+    /// The text buffer for the focused field.
+    fn focused_mut(&mut self) -> &mut String {
+        match self.field {
+            Self::F_CREATOR => &mut self.creator,
+            Self::F_MODIFIED => &mut self.modified,
+            Self::F_MODE => &mut self.mode,
+            Self::F_OWNER => &mut self.owner,
+            _ => &mut self.type_code,
+        }
+    }
 }
 
 /// Seconds between the Mac (1904) and Unix (1970) epochs.
@@ -3478,24 +3506,17 @@ impl App {
                 KeyCode::Enter => self.apply_metadata(),
                 _ => {
                     if let Some(m) = self.explorer.as_mut().and_then(|e| e.metadata.as_mut()) {
+                        let n = MetaEdit::FIELDS;
                         match code {
-                            KeyCode::Tab | KeyCode::Down => m.field = (m.field + 1) % 3,
-                            KeyCode::BackTab | KeyCode::Up => m.field = (m.field + 2) % 3,
+                            KeyCode::Tab | KeyCode::Down => m.field = (m.field + 1) % n,
+                            KeyCode::BackTab | KeyCode::Up => m.field = (m.field + n - 1) % n,
                             KeyCode::Backspace => {
                                 m.error = None;
-                                match m.field {
-                                    0 => m.type_code.pop(),
-                                    1 => m.creator.pop(),
-                                    _ => m.modified.pop(),
-                                };
+                                m.focused_mut().pop();
                             }
                             KeyCode::Char(c) if !c.is_control() => {
                                 m.error = None;
-                                match m.field {
-                                    0 => m.type_code.push(c),
-                                    1 => m.creator.push(c),
-                                    _ => m.modified.push(c),
-                                }
+                                m.focused_mut().push(c);
                             }
                             _ => {}
                         }
@@ -3679,14 +3700,19 @@ impl App {
                 }
                 return;
             }
-            // Edit metadata (HFS/HFS+ type/creator + modified date).
+            // Edit metadata: HFS/HFS+ type/creator + modified date, and the
+            // POSIX mode / owner on any filesystem that carries them. A
+            // directory qualifies too — its permissions are as real as a
+            // file's, even though it has no type code.
             KeyCode::Char('m') => {
                 if let Some(ex) = self.explorer.as_mut() {
+                    let editable = |e: &crate::fs::entry::FileEntry| {
+                        (matches!(e.entry_type, EntryType::File)
+                            && (e.type_code.is_some() || e.mac_dates.is_some()))
+                            || e.mode.is_some()
+                    };
                     match ex.selected_entry() {
-                        Some(e)
-                            if matches!(e.entry_type, EntryType::File)
-                                && (e.type_code.is_some() || e.mac_dates.is_some()) =>
-                        {
+                        Some(e) if editable(e) => {
                             ex.metadata = Some(MetaEdit {
                                 entry_name: e.name.clone(),
                                 type_code: code_to_string(e.type_code),
@@ -3695,13 +3721,24 @@ impl App {
                                     .mac_dates
                                     .map(|d| format_mac_date(d.1))
                                     .unwrap_or_default(),
+                                mode: e
+                                    .mode
+                                    .map(|m| format!("{:o}", m & 0o7777))
+                                    .unwrap_or_default(),
+                                owner: match (e.uid, e.gid) {
+                                    (Some(u), Some(g)) => format!("{u}:{g}"),
+                                    _ => String::new(),
+                                },
                                 field: 0,
                                 error: None,
                             });
                             ex.status = None;
                         }
                         _ => {
-                            ex.status = Some("Metadata editing is for HFS/HFS+ files.".to_string())
+                            ex.status = Some(
+                                "Metadata editing needs an HFS/HFS+ file or POSIX metadata."
+                                    .to_string(),
+                            )
                         }
                     }
                 }
@@ -3964,6 +4001,39 @@ impl App {
             m.creator.clone(),
             m.modified.clone(),
         );
+        // POSIX fields: blank means "leave alone" (and is what a filesystem
+        // without them always shows).
+        let mode_str = m.mode.trim().to_string();
+        let owner_str = m.owner.trim().to_string();
+        let new_mode = if mode_str.is_empty() {
+            None
+        } else {
+            match u32::from_str_radix(&mode_str, 8) {
+                Ok(v) if v <= 0o7777 => Some(v),
+                _ => {
+                    if let Some(m) = self.explorer.as_mut().and_then(|e| e.metadata.as_mut()) {
+                        m.error = Some("Bad mode — octal, 1-4 digits, <= 7777".to_string());
+                    }
+                    return;
+                }
+            }
+        };
+        let new_owner = if owner_str.is_empty() {
+            None
+        } else {
+            match owner_str
+                .split_once(':')
+                .and_then(|(u, g)| Some((u.trim().parse().ok()?, g.trim().parse().ok()?)))
+            {
+                Some(pair) => Some(pair),
+                None => {
+                    if let Some(m) = self.explorer.as_mut().and_then(|e| e.metadata.as_mut()) {
+                        m.error = Some("Bad owner — want uid:gid, e.g. 0:0".to_string());
+                    }
+                    return;
+                }
+            }
+        };
         let modify_mac = if modstr.trim().is_empty() {
             None
         } else {
@@ -3977,7 +4047,14 @@ impl App {
                 }
             }
         };
-        match apply_metadata_edit(&image_path, selector, &cur_dir, &name, &ty, &cr, modify_mac) {
+        let values = MetaEditValues {
+            type_code: ty,
+            creator: cr,
+            modify_mac,
+            mode: new_mode,
+            owner: new_owner,
+        };
+        match apply_metadata_edit(&image_path, selector, &cur_dir, &name, &values) {
             Ok(()) => {
                 if let Some(ex) = self.explorer.as_mut() {
                     ex.metadata = None;
@@ -6888,9 +6965,11 @@ impl App {
             let mut ml = vec![
                 Line::styled(format!("  {}", m.entry_name), self.palette.dim()),
                 Line::raw(""),
-                field(0, "Type:", &m.type_code),
-                field(1, "Creator:", &m.creator),
-                field(2, "Modified:", &m.modified),
+                field(MetaEdit::F_TYPE, "Type:", &m.type_code),
+                field(MetaEdit::F_CREATOR, "Creator:", &m.creator),
+                field(MetaEdit::F_MODIFIED, "Modified:", &m.modified),
+                field(MetaEdit::F_MODE, "Mode:", &m.mode),
+                field(MetaEdit::F_OWNER, "Owner:", &m.owner),
             ];
             if let Some(e) = &m.error {
                 ml.push(Line::styled(format!("  {e}"), self.palette.warn()));
@@ -9679,18 +9758,35 @@ impl Explorer {
 /// Import a host file into `cur_dir` of the given partition: open it read-write
 /// (the shared `resolve` + `open_editable_filesystem` + `create_file` path the
 /// `put` verb uses), write the file, and commit. Returns the created name.
-/// Open the partition read-write and set the file's Type/Creator and (when
-/// given) modified date, then commit. Errors (e.g. a non-HFS filesystem) bubble
-/// up to the editor's status line.
+/// The metadata-editor form, parsed. `None` means "leave this alone", which
+/// is what a blank field means and what a filesystem lacking that kind of
+/// metadata always presents.
+struct MetaEditValues {
+    type_code: String,
+    creator: String,
+    modify_mac: Option<u32>,
+    mode: Option<u32>,
+    owner: Option<(u32, u32)>,
+}
+
+/// Open the partition read-write, apply whichever of the editor's fields were
+/// filled in — HFS Type/Creator, modified date, POSIX mode, POSIX owner —
+/// then commit. Errors bubble up to the editor's status line.
 fn apply_metadata_edit(
     image_path: &str,
     selector: Option<u32>,
     cur_dir: &str,
     name: &str,
-    type_code: &str,
-    creator: &str,
-    modify_mac: Option<u32>,
+    values: &MetaEditValues,
 ) -> anyhow::Result<()> {
+    let MetaEditValues {
+        type_code,
+        creator,
+        modify_mac,
+        mode: new_mode,
+        owner: new_owner,
+    } = values;
+    let (modify_mac, new_mode, new_owner) = (*modify_mac, *new_mode, *new_owner);
     use crate::cli::resolve::resolve_partition_rw_forced;
     let dst = if cur_dir == "/" {
         format!("/{name}")
@@ -9703,8 +9799,21 @@ fn apply_metadata_edit(
         .open_editable(file)
         .map_err(|e| anyhow::anyhow!("opening filesystem for write: {e}"))?;
     let entry = crate::cli::verbs::ls::resolve_path(fs.as_filesystem_mut(), &dst)?;
-    fs.set_type_creator(&entry, type_code, creator)
-        .map_err(|e| anyhow::anyhow!("set type/creator: {e}"))?;
+    // Type/creator only where the filesystem has them: on a POSIX-only
+    // volume the editor shows blank codes and this would otherwise fail the
+    // whole apply, taking the mode/owner edit down with it.
+    if entry.type_code.is_some() || entry.creator_code.is_some() {
+        fs.set_type_creator(&entry, type_code, creator)
+            .map_err(|e| anyhow::anyhow!("set type/creator: {e}"))?;
+    }
+    if let Some(mode) = new_mode {
+        fs.set_permissions(&entry, mode)
+            .map_err(|e| anyhow::anyhow!("set permissions: {e}"))?;
+    }
+    if let Some((uid, gid)) = new_owner {
+        fs.set_owner(&entry, uid, gid)
+            .map_err(|e| anyhow::anyhow!("set owner: {e}"))?;
+    }
     if let Some(modify) = modify_mac {
         let (create, _, backup) = entry.mac_dates.unwrap_or((modify, modify, modify));
         fs.set_dates(&entry, create, modify, backup)
@@ -10187,4 +10296,67 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     Layout::horizontal([Constraint::Length(width)])
         .flex(Flex::Center)
         .split(vertical[0])[0]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The TUI explorer's metadata editor has to reach POSIX mode and owner,
+    /// not just HFS type/creator — and it has to work on a filesystem that
+    /// has no type codes at all, where the type/creator half of the form is
+    /// blank. Before, `set_type_creator` ran unconditionally and its
+    /// `Unsupported` took the whole apply down with it.
+    #[test]
+    fn metadata_edit_applies_posix_fields_on_a_posix_only_volume() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let img = dir.path().join("ext.img");
+        std::fs::write(
+            &img,
+            crate::fs::ext_format::create_blank_ext2(16 * 1024 * 1024, "TUI").expect("format"),
+        )
+        .expect("write image");
+
+        // Seed one file through the normal editable path.
+        {
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&img)
+                .expect("open");
+            let mut fs = crate::fs::open_editable_filesystem(f, 0, 0, None).expect("open fs");
+            let root = fs.root().expect("root");
+            let mut data: &[u8] = b"hi";
+            fs.create_file(&root, "hi.txt", &mut data, 2, &Default::default())
+                .expect("create");
+            fs.sync_metadata().expect("sync");
+        }
+
+        apply_metadata_edit(
+            img.to_str().expect("utf8 path"),
+            None,
+            "/",
+            "hi.txt",
+            &MetaEditValues {
+                type_code: String::new(), // ext has no type code
+                creator: String::new(),   // nor a creator
+                modify_mac: None,         // nor Mac dates
+                mode: Some(0o750),
+                owner: Some((4242, 4243)),
+            },
+        )
+        .expect("apply the POSIX half of the metadata edit");
+
+        let f = std::fs::File::open(&img).expect("reopen");
+        let mut fs = crate::fs::open_filesystem(f, 0, 0, None).expect("open fs");
+        let root = fs.root().expect("root");
+        let entry = fs
+            .list_directory(&root)
+            .expect("list")
+            .into_iter()
+            .find(|e| e.name == "hi.txt")
+            .expect("hi.txt");
+        assert_eq!(entry.mode.map(|m| m & 0o7777), Some(0o750));
+        assert_eq!((entry.uid, entry.gid), (Some(4242), Some(4243)));
+    }
 }

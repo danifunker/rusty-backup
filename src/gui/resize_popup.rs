@@ -26,6 +26,39 @@ struct ResizeEntry {
     choice: rusty_backup::model::size_mode::SizeMode,
 }
 
+/// The size the user asked for, in bytes, or `None` when the field cannot
+/// be read as a number.
+///
+/// **One parser for the preview and the apply.** They used to have their
+/// own: the preview read the field as `f64` and sector-aligned it, while
+/// `start_resize` read it as `u64` and `continue`d past anything that
+/// failed. Since the field is seeded — and re-stamped by the Original /
+/// Minimum radios — with two decimals, every entry whose size is not a
+/// whole number of MiB was silently dropped from the apply's
+/// `desired_sizes`. The plan then contained no changes, `apply_resize`
+/// wrote nothing, and the run reported success: the preview showed the
+/// resize and Apply did nothing.
+///
+/// That is every SGI / EFS partition, whose sizes are cylinder-rounded
+/// (197.90 MiB, 91.34 MiB), which is why this survived on FAT volumes sized
+/// to a clean 100 MiB.
+fn parsed_new_size(entry: &ResizeEntry) -> Option<u64> {
+    let text = entry.new_size_text.trim();
+    // A field still showing the original's formatted size means "no
+    // change" — the "{:.2}" round-trip otherwise shifts the size by up to
+    // ~5 KiB on a partition whose byte count isn't a clean MiB multiple.
+    let orig_text = format!("{:.2}", entry.original_size as f64 / (1024.0 * 1024.0));
+    if text == orig_text {
+        return Some(entry.original_size);
+    }
+    let mib: f64 = text.parse().ok()?;
+    if !mib.is_finite() || mib < 0.0 {
+        return None;
+    }
+    let bytes = (mib * 1024.0 * 1024.0) as u64;
+    Some((bytes / 512) * 512)
+}
+
 /// Preview row for showing planned changes.
 struct PreviewRow {
     index: usize,
@@ -34,6 +67,20 @@ struct PreviewRow {
     new_start: String,
     new_size: String,
     action: String,
+}
+
+/// What the dialog needs to know about the thing it is resizing, as opposed
+/// to the partitions inside it.
+pub struct ContainerInfo {
+    /// Current capacity in bytes — an image file's length or a device's
+    /// size. **Not** the end of the last partition: an image with slack at
+    /// the end has room the dialog should be able to hand out.
+    pub size_bytes: u64,
+    /// A physical device: fixed size, and gated behind the risk checkbox.
+    pub is_device: bool,
+    /// Can be enlarged in place. A plain image file can; a device cannot,
+    /// and neither can a compressed container like a CHD.
+    pub can_grow: bool,
 }
 
 /// Self-contained resize popup window.
@@ -49,8 +96,19 @@ pub struct ResizePopup {
     resize_rate: super::progress::RateTracker,
     /// Alignment in sectors (0 = no alignment).
     alignment_sectors: u64,
-    /// Total disk size in bytes.
+    /// The container's capacity in bytes — an image file's length or a
+    /// device's size, and the bound the new layout must fit inside.
+    ///
+    /// **Not** the end of the last partition, which is what this used to be:
+    /// an image with slack at the end reported itself full, so a partition
+    /// could not be grown into space that already existed, and enlarging the
+    /// file beforehand did not help either because reopening recomputed the
+    /// same bound from the same partition table.
     disk_size_bytes: u64,
+    /// Whether the container could be enlarged (by "Expand Image..." on the
+    /// Inspect tab — this dialog only lays out what already exists). Drives
+    /// the hint pointing there.
+    can_grow_container: bool,
     /// Whether the source is a physical device.
     is_device: bool,
     /// Whether the user has acknowledged the device risk warning.
@@ -71,10 +129,14 @@ impl ResizePopup {
         partition_table: PartitionTable,
         partition_min_sizes: &HashMap<usize, u64>,
         alignment_sectors: u64,
-        disk_size_bytes: u64,
-        is_device: bool,
+        container: ContainerInfo,
         source_path: std::path::PathBuf,
     ) -> Self {
+        let ContainerInfo {
+            size_bytes: disk_size_bytes,
+            is_device,
+            can_grow: can_grow_container,
+        } = container;
         let entries = partitions
             .iter()
             .filter(|p| !p.is_logical)
@@ -109,6 +171,7 @@ impl ResizePopup {
             resize_rate: super::progress::RateTracker::default(),
             alignment_sectors,
             disk_size_bytes,
+            can_grow_container,
             is_device,
             device_warning_accepted: false,
             partition_table,
@@ -151,22 +214,12 @@ impl ResizePopup {
         self.resize_status.is_some()
     }
 
-    /// Parse `new_size_text` for the entry, falling back to `original_size`
-    /// on a malformed value or when the text still matches the original-
-    /// formatted MiB string (avoids the precision-drift bug where validate
-    /// reports the same MiB number as a smaller byte size).
+    /// The entry's planned size for *display* (the live layout bar), falling
+    /// back to `original_size` on a malformed value — a half-typed number
+    /// shouldn't make the bar jump. Shares [`parsed_new_size`] so the bar
+    /// can't disagree with the preview and the apply.
     fn planned_size_bytes(&self, entry: &ResizeEntry) -> u64 {
-        let orig_text = format!("{:.2}", entry.original_size as f64 / (1024.0 * 1024.0));
-        if entry.new_size_text.trim() == orig_text {
-            return entry.original_size;
-        }
-        match entry.new_size_text.trim().parse::<f64>() {
-            Ok(v) if v > 0.0 => {
-                let bytes = (v * 1024.0 * 1024.0) as u64;
-                (bytes / 512) * 512
-            }
-            _ => entry.original_size,
-        }
+        parsed_new_size(entry).unwrap_or(entry.original_size)
     }
 
     /// Render the Current vs After PartitionBar pair using the working
@@ -278,6 +331,29 @@ impl ResizePopup {
                     });
                     ui.add_space(4.0);
                 }
+
+                // The disk's capacity, and where to get more of it. Growing
+                // the container is "Expand Image..." on the Inspect tab —
+                // it handles raw, VHD and CHD, so this dialog does not
+                // duplicate it with a lesser version.
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Disk size: {}",
+                            partition::format_size(self.disk_size_bytes)
+                        ))
+                        .weak(),
+                    );
+                    if self.can_grow_container {
+                        ui.label(
+                            egui::RichText::new(
+                                "- to make more room, close this and use \"Expand Image...\"",
+                            )
+                            .weak(),
+                        );
+                    }
+                });
+                ui.add_space(4.0);
 
                 // Before / After disk layout visualization. "Current" reads
                 // sizes from `partitions`; "After" applies the working
@@ -483,29 +559,15 @@ impl ResizePopup {
             if entry.is_extended_container {
                 continue;
             }
-            // Skip the diff entirely when the displayed text still matches
-            // the original-formatted size — same pattern as the partition
-            // editor. The "{:.2}" round-trip otherwise shifts the size by
-            // up to ~5 KiB for partitions whose byte count isn't a clean
-            // MiB multiple, which is enough to push the user's
-            // "click verify with no changes" workflow below the original
-            // size.
-            let orig_size_text = format!("{:.2}", entry.original_size as f64 / (1024.0 * 1024.0));
-            let new_bytes = if entry.new_size_text.trim() == orig_size_text {
-                entry.original_size
-            } else {
-                let new_mib: f64 = match entry.new_size_text.trim().parse() {
-                    Ok(v) => v,
-                    Err(_) => {
-                        self.plan_error = Some(format!(
-                            "Invalid size for partition {}: '{}'",
-                            entry.index, entry.new_size_text
-                        ));
-                        return;
-                    }
-                };
-                let bytes = (new_mib * 1024.0 * 1024.0) as u64;
-                (bytes / 512) * 512
+            let new_bytes = match parsed_new_size(entry) {
+                Some(b) => b,
+                None => {
+                    self.plan_error = Some(format!(
+                        "Invalid size for partition {}: '{}'",
+                        entry.index, entry.new_size_text
+                    ));
+                    return;
+                }
             };
 
             // Validate against minimum
@@ -568,20 +630,33 @@ impl ResizePopup {
 
     /// Start the background resize thread.
     fn start_resize(&mut self, log: &mut LogPanel) {
-        // Re-compute the plan to get the actual PartitionResizePlan structs
+        // Re-compute the plan to get the actual PartitionResizePlan structs.
+        // Parses through the same helper the preview uses — see
+        // `parsed_new_size` for why they must not diverge.
         let mut desired_sizes = Vec::new();
         for entry in &self.entries {
             if entry.is_extended_container {
                 continue;
             }
-            let new_mib: u64 = match entry.new_size_text.trim().parse() {
-                Ok(v) => v,
-                Err(_) => continue,
+            let new_bytes = match parsed_new_size(entry) {
+                Some(b) => b,
+                None => {
+                    log.error(format!(
+                        "Invalid size for partition {}: '{}' — nothing was written.",
+                        entry.index, entry.new_size_text
+                    ));
+                    return;
+                }
             };
-            let new_bytes = new_mib * 1024 * 1024;
             if new_bytes != entry.original_size {
                 desired_sizes.push((entry.index, new_bytes));
             }
+        }
+        // Refuse rather than "succeed" having written nothing — the old code
+        // reached `apply_resize` with an empty plan and reported success.
+        if desired_sizes.is_empty() {
+            log.error("No size changes to apply.".to_string());
+            return;
         }
 
         let plans = match compute_resize_plan(
@@ -702,5 +777,59 @@ impl ResizePopup {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusty_backup::model::size_mode::SizeMode;
+
+    fn entry(original_size: u64, text: &str) -> ResizeEntry {
+        ResizeEntry {
+            index: 0,
+            type_name: "SGI EFS".into(),
+            original_size,
+            minimum_size: 512,
+            is_extended_container: false,
+            new_size_text: text.into(),
+            choice: SizeMode::Custom,
+        }
+    }
+
+    /// The size the popup seeds and re-stamps has two decimals, and the
+    /// apply path used to parse it as `u64` — so every partition whose size
+    /// is not a whole number of MiB was dropped, the plan came out empty,
+    /// and the resize "succeeded" without writing anything. An SGI/EFS
+    /// partition is cylinder-rounded, so that was all of them.
+    #[test]
+    fn a_fractional_mib_size_is_parsed_not_dropped() {
+        // 100 MiB shrink target typed against a 197.90 MiB EFS partition.
+        let e = entry(207_470_592, "91.34");
+        let got = parsed_new_size(&e).expect("a two-decimal size must parse");
+        assert_eq!(got, (((91.34 * 1024.0 * 1024.0) as u64) / 512) * 512);
+        assert_ne!(got, e.original_size, "must register as a change");
+    }
+
+    /// The Original / Minimum radios stamp `{:.2}`; picking Original must
+    /// read back as exactly the original size, not a value ~5 KiB off that
+    /// the plan would treat as a shrink.
+    #[test]
+    fn the_original_stamp_round_trips_to_the_exact_original_size() {
+        let original = 207_470_592u64;
+        let stamped = format!("{:.2}", original as f64 / (1024.0 * 1024.0));
+        assert_eq!(parsed_new_size(&entry(original, &stamped)), Some(original));
+    }
+
+    #[test]
+    fn sizes_are_sector_aligned_and_junk_is_rejected() {
+        // 1.0009765625 MiB = 1 MiB + 1 KiB; already sector-aligned.
+        assert_eq!(
+            parsed_new_size(&entry(999, "1.0009765625")),
+            Some(1_049_600)
+        );
+        assert_eq!(parsed_new_size(&entry(999, "")), None);
+        assert_eq!(parsed_new_size(&entry(999, "big")), None);
+        assert_eq!(parsed_new_size(&entry(999, "-5")), None);
     }
 }

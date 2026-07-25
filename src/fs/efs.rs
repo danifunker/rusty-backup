@@ -37,6 +37,15 @@ const EFS_MAXPATHLEN: usize = 1024;
 /// Public alias of the 12-extent hard cap. Used by the fsck verifier
 /// and any other cross-module callers.
 pub const EFS_DIRECTEXTENTS_MAX: usize = EFS_DIRECTEXTENTS;
+/// Extent records packed into one indirect index block (8 bytes each).
+const EFS_EXTENTS_PER_BLOCK: usize = (EFS_BLOCKSIZE as usize) / 8;
+/// Most data extents one inode can describe. The indirect index could
+/// address far more (12 slots * 255 blocks * 64 records), so the 16-bit
+/// `numextents` field is what actually binds.
+const EFS_MAX_EXTENTS: usize = u16::MAX as usize;
+/// Largest file EFS can describe: `di_size` is 32 bits and IRIX treats
+/// it as signed, so 2 GiB - 1.
+const EFS_MAX_FILE_SIZE: u64 = i32::MAX as u64;
 /// On-disk size of the EFS superblock, per IRIX `struct efs_super` (with
 /// the implicit 2-byte natural-alignment pad between `fs_dirty` and
 /// `fs_time`). 92 bytes; the surrounding 512-byte sector is zero-padded.
@@ -228,6 +237,16 @@ impl EfsExtent {
             offset: w1 & 0x00FF_FFFF,
         }
     }
+
+    /// Serialize into the 8-byte on-disk form. Used both for the twelve
+    /// slots inside an inode and for the records packed into indirect
+    /// index blocks, which share the layout.
+    fn write_into(&self, buf: &mut [u8; 8]) {
+        let w0 = ((self.magic as u32) << 24) | (self.bn & 0x00FF_FFFF);
+        let w1 = ((self.length as u32) << 24) | (self.offset & 0x00FF_FFFF);
+        BigEndian::write_u32(&mut buf[0..4], w0);
+        BigEndian::write_u32(&mut buf[4..8], w1);
+    }
 }
 
 /// Parsed EFS on-disk inode (128 bytes).
@@ -333,10 +352,8 @@ impl EfsInode {
         buf[31] = 0; // pad — IRIX leaves it zero
         for (i, ext) in self.extents.iter().enumerate() {
             let off = 32 + i * 8;
-            let w0 = ((ext.magic as u32) << 24) | (ext.bn & 0x00FF_FFFF);
-            let w1 = ((ext.length as u32) << 24) | (ext.offset & 0x00FF_FFFF);
-            BigEndian::write_u32(&mut buf[off..off + 4], w0);
-            BigEndian::write_u32(&mut buf[off + 4..off + 8], w1);
+            let slot: &mut [u8; 8] = (&mut buf[off..off + 8]).try_into().unwrap();
+            ext.write_into(slot);
         }
     }
 
@@ -1020,9 +1037,14 @@ impl<R: Read + Write + Seek> EfsFilesystem<R> {
     /// bitmap, populate `inode.extents` / `numextents`, then stream
     /// `data` into the allocated blocks. The strategy starts with one
     /// large contiguous extent and falls back to progressively smaller
-    /// chunks, accumulating up to 12 extents before failing with
-    /// `DiskFull`. On failure every partially-allocated extent is
-    /// freed in the bitmap.
+    /// chunks. On failure every partially-allocated extent is freed in
+    /// the bitmap.
+    ///
+    /// Past twelve extents the inode switches to **indirect** mode (see
+    /// [`Self::install_indirect_extents`]) rather than failing. An
+    /// extent's `ex_length` is a single byte, so one extent covers at
+    /// most 255 blocks — which capped direct-mode files at 12 * 255 *
+    /// 512 = 1,566,720 bytes no matter how empty the volume was.
     pub(crate) fn write_file_data(
         &mut self,
         bm: &mut [u8],
@@ -1041,6 +1063,13 @@ impl<R: Read + Write + Seek> EfsFilesystem<R> {
             offset: 0,
         }; EFS_DIRECTEXTENTS];
         inode.numextents = 0;
+        // `di_size` is 32 bits; the cast alone would silently truncate.
+        if data_len > EFS_MAX_FILE_SIZE {
+            return Err(FilesystemError::InvalidData(format!(
+                "EFS write_file_data: {data_len}-byte file exceeds EFS's {} MiB file-size limit",
+                EFS_MAX_FILE_SIZE / (1024 * 1024) + 1
+            )));
+        }
         inode.size = data_len as u32;
 
         if data_len == 0 {
@@ -1052,15 +1081,14 @@ impl<R: Read + Write + Seek> EfsFilesystem<R> {
         let mut logical_offset = 0u32;
         let mut remaining = needed_blocks;
         while remaining > 0 {
-            if allocated.len() >= EFS_DIRECTEXTENTS {
+            if allocated.len() >= EFS_MAX_EXTENTS {
                 // Roll back partial allocations.
                 for ext in &allocated {
                     Self::free_extent_in_bitmap(bm, ext);
                 }
                 return Err(FilesystemError::DiskFull(format!(
-                    "EFS write_file_data: required more than {} extents \
-                     (volume too fragmented for {data_len}-byte file)",
-                    EFS_DIRECTEXTENTS
+                    "EFS write_file_data: required more than {EFS_MAX_EXTENTS} extents \
+                     (volume too fragmented for {data_len}-byte file)"
                 )));
             }
             // Try the largest possible run first; halve on failure
@@ -1088,11 +1116,19 @@ impl<R: Read + Write + Seek> EfsFilesystem<R> {
             allocated.push(ext);
         }
 
-        // Record extents on the inode.
-        for (i, ext) in allocated.iter().enumerate() {
-            inode.extents[i] = *ext;
+        // Record extents on the inode: inline while they fit, otherwise
+        // through an indirect index.
+        if allocated.len() <= EFS_DIRECTEXTENTS {
+            for (i, ext) in allocated.iter().enumerate() {
+                inode.extents[i] = *ext;
+            }
+            inode.numextents = allocated.len() as u16;
+        } else if let Err(e) = self.install_indirect_extents(bm, inode, &allocated) {
+            for ext in &allocated {
+                Self::free_extent_in_bitmap(bm, ext);
+            }
+            return Err(e);
         }
-        inode.numextents = allocated.len() as u16;
 
         // Stream payload into the allocated blocks.
         let mut written: u64 = 0;
@@ -1114,15 +1150,126 @@ impl<R: Read + Write + Seek> EfsFilesystem<R> {
         Ok(())
     }
 
-    /// Free every block referenced by `inode`'s extents and zero the
-    /// extent records. Bitmap is updated in `bm`; caller flushes.
-    pub(crate) fn free_inode_data(&self, bm: &mut [u8], inode: &mut EfsInode) {
-        for i in 0..inode.numextents as usize {
-            let ext = inode.extents[i];
+    /// Move `data_extents` off the inode and into indirect index blocks,
+    /// producing exactly the layout [`resolve_data_extents`] reads (and
+    /// Linux's `fs/efs/inode.c::efs_map_block` expects):
+    ///
+    /// * the inode's first `direxts` slots describe runs of index blocks,
+    /// * each index block packs up to 64 8-byte extent records,
+    /// * `extents[0].offset` carries `direxts` — that field, not a flag,
+    ///   is how a reader learns the indirect shape,
+    /// * `numextents` keeps counting DATA extents, so it exceeds 12.
+    ///
+    /// Index blocks are read back in inode-slot order then block order,
+    /// so the records are packed in that same order. On failure the
+    /// index blocks allocated so far are freed; the caller owns freeing
+    /// the data extents.
+    fn install_indirect_extents(
+        &mut self,
+        bm: &mut [u8],
+        inode: &mut EfsInode,
+        data_extents: &[EfsExtent],
+    ) -> Result<(), FilesystemError> {
+        let index_blocks = data_extents.len().div_ceil(EFS_EXTENTS_PER_BLOCK) as u32;
+
+        // Allocate the index blocks the same way data blocks are
+        // allocated — largest run first, halving on failure — but into
+        // at most the twelve inode slots.
+        let mut index_exts: Vec<EfsExtent> = Vec::new();
+        let mut remaining = index_blocks;
+        let mut logical_offset = 0u32;
+        while remaining > 0 {
+            if index_exts.len() >= EFS_DIRECTEXTENTS {
+                for ext in &index_exts {
+                    Self::free_extent_in_bitmap(bm, ext);
+                }
+                return Err(FilesystemError::DiskFull(format!(
+                    "EFS write_file_data: the {index_blocks} indirect index blocks for this file \
+                     need more than {EFS_DIRECTEXTENTS} extents to describe \
+                     (volume too fragmented)"
+                )));
+            }
+            let mut chunk = remaining.min(u8::MAX as u32);
+            let ext = loop {
+                match Self::alloc_contiguous_in_bitmap(bm, chunk, 0) {
+                    Ok(mut e) => {
+                        e.offset = logical_offset;
+                        break e;
+                    }
+                    Err(FilesystemError::DiskFull(_)) if chunk > 1 => {
+                        chunk /= 2;
+                    }
+                    Err(e) => {
+                        for ext in &index_exts {
+                            Self::free_extent_in_bitmap(bm, ext);
+                        }
+                        return Err(e);
+                    }
+                }
+            };
+            logical_offset += ext.length as u32;
+            remaining -= ext.length as u32;
+            index_exts.push(ext);
+        }
+
+        // Pack the records. Trailing slots in the last block stay zero;
+        // the read path stops after `numextents` records, so it never
+        // looks at them.
+        let mut records = data_extents.iter();
+        let mut block = [0u8; EFS_BLOCKSIZE as usize];
+        for ind in &index_exts {
+            for i in 0..ind.length as u32 {
+                block.fill(0);
+                for slot in 0..EFS_EXTENTS_PER_BLOCK {
+                    let Some(ext) = records.next() else { break };
+                    let off = slot * 8;
+                    let raw: &mut [u8; 8] = (&mut block[off..off + 8]).try_into().unwrap();
+                    ext.write_into(raw);
+                }
+                self.write_block(ind.bn + i, &block)?;
+            }
+        }
+
+        inode.extents = [EfsExtent {
+            magic: 0,
+            bn: 0,
+            length: 0,
+            offset: 0,
+        }; EFS_DIRECTEXTENTS];
+        for (i, ext) in index_exts.iter().enumerate() {
+            inode.extents[i] = *ext;
+            // Only slot 0's `offset` is meaningful in indirect mode; the
+            // rest are left zero rather than carrying a logical block
+            // offset a reader might mistake for a data offset.
+            inode.extents[i].offset = 0;
+        }
+        inode.extents[0].offset = index_exts.len() as u32;
+        inode.numextents = data_extents.len() as u16;
+        Ok(())
+    }
+
+    /// Free every block referenced by `inode` — its data extents plus,
+    /// in indirect mode, the index blocks holding the extent records —
+    /// and zero the extent records. Bitmap is updated in `bm`; caller
+    /// flushes.
+    ///
+    /// This has to resolve through [`resolve_owned_extents`] rather than
+    /// walk `extents[0..numextents]`: in indirect mode `numextents`
+    /// counts DATA extents and exceeds the twelve-slot inline array, so
+    /// indexing it directly would run off the end of the array (and
+    /// would free the index blocks' addresses as if they were data).
+    pub(crate) fn free_inode_data(
+        &mut self,
+        bm: &mut [u8],
+        inode: &mut EfsInode,
+    ) -> Result<(), FilesystemError> {
+        let pofs = self.partition_offset_value();
+        let (data, indirect) = resolve_owned_extents(self.raw_reader_mut(), pofs, inode)?;
+        for ext in data.iter().chain(indirect.iter()) {
             if ext.length == 0 {
                 continue;
             }
-            Self::free_extent_in_bitmap(bm, &ext);
+            Self::free_extent_in_bitmap(bm, ext);
         }
         inode.extents = [EfsExtent {
             magic: 0,
@@ -1132,6 +1279,7 @@ impl<R: Read + Write + Seek> EfsFilesystem<R> {
         }; EFS_DIRECTEXTENTS];
         inode.numextents = 0;
         inode.size = 0;
+        Ok(())
     }
 
     /// Look up `name` in `dir_inum`. Returns the child inum if found.
@@ -1166,6 +1314,18 @@ impl<R: Read + Write + Seek> EfsFilesystem<R> {
     /// Send up the dispatch chain.
     pub(crate) fn do_sync_metadata(&mut self) -> Result<(), FilesystemError> {
         if let Some(bm) = self.staged_bitmap.take() {
+            // The bitmap is the truth about free space; `sb.tfree` is a
+            // cache of it that IRIX shows in `df`. Recompute it here
+            // rather than adjusting it at each allocation site — the
+            // allocation paths never touched it at all, so a volume that
+            // had files written to it still reported itself empty, and a
+            // wrong count is exactly what makes IRIX's `fsck -t efs`
+            // "fix" the volume on first mount.
+            let free = Self::count_free_blocks_in(&bm, self.sb.fs_size);
+            if free != self.sb.tfree {
+                self.sb.tfree = free;
+                self.sb_dirty = true;
+            }
             self.write_bitmap(&bm)?;
             self.staged_bitmap = Some(bm);
         }
@@ -1174,6 +1334,23 @@ impl<R: Read + Write + Seek> EfsFilesystem<R> {
             self.sb_dirty = false;
         }
         Ok(())
+    }
+
+    /// Count the blocks below `fs_size` the bitmap marks free (set bit
+    /// = free). Bits past the bitmap's coverage are not counted.
+    pub(crate) fn count_free_blocks_in(bm: &[u8], fs_size: u32) -> u32 {
+        let mut free = 0u32;
+        for blk in 0..fs_size {
+            let by = (blk / 8) as usize;
+            if by >= bm.len() {
+                break;
+            }
+            let bb = 7 - (blk % 8);
+            if bm[by] & (1u8 << bb) != 0 {
+                free += 1;
+            }
+        }
+        free
     }
 
     /// Write the primary superblock (sector 1) AND the replica
@@ -1522,7 +1699,7 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Ef
             }
 
             // Free the inode's data blocks.
-            self.free_inode_data(&mut bm, &mut target);
+            self.free_inode_data(&mut bm, &mut target)?;
 
             // If the target was a directory, free its own dirblocks
             // too (free_inode_data already covered them via the
@@ -1623,6 +1800,22 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Ef
         }
 
         Err(FilesystemError::NotFound(entry.name.clone()))
+    }
+
+    fn set_permissions(&mut self, entry: &FileEntry, mode: u32) -> Result<(), FilesystemError> {
+        let mut ino = self.read_inode(entry.location as u32)?;
+        ino.mode = super::unix_common::inode::with_permission_bits(ino.mode as u32, mode) as u16;
+        self.write_inode(&ino)
+    }
+
+    fn set_owner(&mut self, entry: &FileEntry, uid: u32, gid: u32) -> Result<(), FilesystemError> {
+        // IRIX EFS inodes carry 16-bit ids.
+        super::unix_common::inode::check_id_width(uid, 16, "uid")?;
+        super::unix_common::inode::check_id_width(gid, 16, "gid")?;
+        let mut ino = self.read_inode(entry.location as u32)?;
+        ino.uid = uid as u16;
+        ino.gid = gid as u16;
+        self.write_inode(&ino)
     }
 
     fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
@@ -2158,17 +2351,25 @@ impl<R: Read + Seek + Send> Filesystem for EfsFilesystem<R> {
     }
 
     fn used_size(&self) -> u64 {
-        // No allocation summary parsed yet; report total for now.
+        // `tfree` counts free data blocks; everything else is file data
+        // or metadata (inode tables, bitmap, superblock pair), all of
+        // which read as "used" here. This reported the whole volume as
+        // used — and so "Free: 0 B" — until the sync path started
+        // keeping `tfree` in step with the bitmap.
         self.total_size()
+            .saturating_sub(self.sb.tfree as u64 * EFS_BLOCKSIZE)
     }
 
     fn last_data_byte(&mut self) -> Result<u64, FilesystemError> {
-        // Conservative floor: 1 + highest block claimed by any in-use
-        // inode. Multiplied to bytes for the caller. This drives the
-        // shrink-to-minimum picker in the GUI and the restore-flow
-        // resize plan.
-        let floor_blocks = super::efs_resize::compute_conservative_floor(self)?;
-        Ok(floor_blocks as u64 * EFS_BLOCKSIZE)
+        // The smallest volume a shrink can actually produce: the
+        // conservative floor (1 + highest block claimed by any in-use
+        // inode) rounded up to a whole cylinder group, plus the
+        // replica's block. This drives the shrink-to-minimum picker in
+        // the GUI and the restore-flow resize plan, and the raw floor
+        // would hand them a size the shrink has to refuse — EFS gives
+        // space back a cylinder group at a time.
+        let min_blocks = super::efs_resize::minimum_shrink_blocks(self)?;
+        Ok(min_blocks as u64 * EFS_BLOCKSIZE)
     }
 
     fn validate_name(&self, name: &str) -> Result<(), FilesystemError> {
@@ -2908,6 +3109,137 @@ mod tests {
             )
             .expect_err("must refuse");
         assert!(err.to_string().contains("path limit"), "got: {err}");
+    }
+
+    /// Write a file too big for the twelve inline extents and read it
+    /// back. An extent's `ex_length` is one byte, so 12 * 255 * 512 =
+    /// 1,566,720 bytes was the hard ceiling on a new file — on a blank
+    /// volume, with the error blaming fragmentation. Anything past that
+    /// now goes through an indirect index.
+    #[test]
+    fn large_file_round_trips_through_indirect_extents() {
+        use super::super::filesystem::{CreateFileOptions, EditableFilesystem};
+
+        // 2 MiB = 4096 blocks = 17 extents at the 255-block cap.
+        let payload: Vec<u8> = (0..2 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+        let img = create_blank_efs(8 * 1024 * 1024, "BIG").expect("format");
+        let mut fs = EfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let root = fs.root().expect("root");
+        let entry = fs
+            .create_file(
+                &root,
+                "big.bin",
+                &mut Cursor::new(payload.clone()),
+                payload.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .expect("create a file past the direct-extent ceiling");
+        EditableFilesystem::sync_metadata(&mut fs).expect("sync");
+
+        // The inode must actually be in indirect mode, not just happen
+        // to have found a few huge runs.
+        let ino = fs.read_inode(entry.location as u32).expect("inode");
+        assert!(
+            ino.numextents as usize > EFS_DIRECTEXTENTS,
+            "expected indirect mode, got {} extents",
+            ino.numextents
+        );
+        let direxts = ino.extents[0].offset as usize;
+        assert!(
+            (1..=EFS_DIRECTEXTENTS).contains(&direxts),
+            "extents[0].offset must carry a sane direxts, got {direxts}"
+        );
+
+        // Reopen through the read path and compare byte for byte.
+        let img = fs.reader_into_inner().into_inner();
+        let mut fs = EfsFilesystem::open(Cursor::new(img), 0).expect("reopen");
+        let root = fs.root().expect("root");
+        let entries = fs.list_directory(&root).expect("list");
+        let big = entries.iter().find(|e| e.name == "big.bin").expect("entry");
+        assert_eq!(big.size, payload.len() as u64);
+        let read_back = fs.read_file(big, usize::MAX).expect("read");
+        assert_eq!(
+            read_back, payload,
+            "indirect-extent file did not round-trip"
+        );
+        let report = fs.fsck().expect("EFS has an fsck").expect("run");
+        assert!(
+            report.errors.is_empty(),
+            "fsck must stay clean after an indirect-mode write: {:?}",
+            report.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    /// Deleting an indirect-mode file has to free the index blocks as
+    /// well as the data. It also used to index `extents[0..numextents]`
+    /// on a 12-element array, which panics once `numextents` exceeds 12.
+    #[test]
+    fn deleting_an_indirect_file_frees_index_blocks_and_data() {
+        use super::super::filesystem::{CreateFileOptions, EditableFilesystem};
+
+        let payload = vec![0x5Au8; 2 * 1024 * 1024];
+        let img = create_blank_efs(8 * 1024 * 1024, "BIG").expect("format");
+        let mut fs = EfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let root = fs.root().expect("root");
+        let free_before = fs.sb_clone().tfree;
+
+        let entry = fs
+            .create_file(
+                &root,
+                "big.bin",
+                &mut Cursor::new(payload.clone()),
+                payload.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .expect("create");
+        EditableFilesystem::sync_metadata(&mut fs).expect("sync");
+        assert!(fs.sb_clone().tfree < free_before, "space must be consumed");
+
+        fs.delete_entry(&root, &entry).expect("delete");
+        EditableFilesystem::sync_metadata(&mut fs).expect("sync after delete");
+        assert_eq!(
+            fs.sb_clone().tfree,
+            free_before,
+            "every block — data AND index — must come back"
+        );
+
+        // Writing the same payload again must fit and verify, which it
+        // cannot if the delete leaked blocks or double-freed live ones.
+        let root = fs.root().expect("root");
+        let again = fs
+            .create_file(
+                &root,
+                "again.bin",
+                &mut Cursor::new(payload.clone()),
+                payload.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .expect("re-create after delete");
+        EditableFilesystem::sync_metadata(&mut fs).expect("sync");
+        assert_eq!(fs.read_file(&again, usize::MAX).expect("read"), payload);
+    }
+
+    /// `di_size` is 32 bits, so an oversized file used to be truncated
+    /// silently by the `as u32` cast.
+    #[test]
+    fn oversized_file_is_refused_rather_than_truncated() {
+        let img = create_blank_efs(8 * 1024 * 1024, "BIG").expect("format");
+        let mut fs = EfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let mut bm = fs.read_bitmap().expect("bitmap");
+        let mut ino = EfsInode::empty(3);
+        let err = fs
+            .write_file_data(
+                &mut bm,
+                &mut ino,
+                &mut std::io::empty(),
+                3 * 1024 * 1024 * 1024,
+            )
+            .expect_err("must refuse a file past the 2 GiB limit");
+        assert!(
+            err.to_string().contains("file-size limit"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(ino.size, 0, "no truncated size may be left on the inode");
     }
 
     /// `create_directory`; this covers `create_blank_efs`'s root.

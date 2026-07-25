@@ -1661,6 +1661,28 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for MinixFilesystem<R> {
         Ok(())
     }
 
+    fn set_permissions(&mut self, entry: &FileEntry, mode: u32) -> Result<(), FilesystemError> {
+        let mut ino = self.read_inode(entry.location as u32)?;
+        ino.mode = super::unix_common::inode::with_permission_bits(ino.mode as u32, mode) as u16;
+        self.write_inode(&ino)
+    }
+
+    fn set_owner(&mut self, entry: &FileEntry, uid: u32, gid: u32) -> Result<(), FilesystemError> {
+        // V1 packs gid into a single byte; V2/V3 widen it to 16 bits.
+        // uid is 16-bit on every version.
+        super::unix_common::inode::check_id_width(uid, 16, "uid")?;
+        let gid_bits = if self.sb.version == MinixVersion::V1 {
+            8
+        } else {
+            16
+        };
+        super::unix_common::inode::check_id_width(gid, gid_bits, "gid")?;
+        let mut ino = self.read_inode(entry.location as u32)?;
+        ino.uid = uid as u16;
+        ino.gid = gid as u16;
+        self.write_inode(&ino)
+    }
+
     fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
         self.reader.flush()?;
         Ok(())

@@ -2115,6 +2115,15 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                // JFS is already editable through the 0x83 arm below; a bare
+                // JFS image is the same filesystem, so it opens here too.
+                // Its edit surface is metadata-only (`set_permissions` /
+                // `set_owner` / `repair`) — create/delete still report
+                // Unsupported, which is the caller's cue.
+                "jfs" => Ok(Box::new(jfs::JfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 _ => Err(FilesystemError::Unsupported(format!(
                     "editing not yet supported for filesystem type '{fs_type}'"
                 ))),

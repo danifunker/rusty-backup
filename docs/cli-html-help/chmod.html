@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli chmod</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <span>chmod</span></nav>
+<h1><code>rb-cli chmod</code></h1>
+<p>Change POSIX permission bits on an entry inside an image. Works on every filesystem that stores a Unix mode — ext, EFS, UFS, Minix, JFS, XFS, SquashFS, and HFS+ (its `HFSPlusBSDInfo`, which is how OS X carries permissions)</p>
+<h2>Usage</h2>
+<pre><code>Usage: chmod &lt;IMAGE&gt; &lt;PATH&gt; &lt;MODE&gt;</code></pre>
+<h2>Arguments</h2>
+<dl class="args">
+<dt><code>&lt;IMAGE&gt;</code></dt>
+<dd>Image reference (`path` or `path@N` for the 1-based partition index)</dd>
+<dt><code>&lt;PATH&gt;</code></dt>
+<dd>Absolute path of the entry inside the filesystem</dd>
+<dt><code>&lt;MODE&gt;</code></dt>
+<dd>New permission bits in octal, with or without a leading `0` (`755`, `0644`, `4755` for setuid). The file-type bits are kept</dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_docs</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>

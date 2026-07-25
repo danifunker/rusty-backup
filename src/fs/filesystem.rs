@@ -459,18 +459,31 @@ pub trait EditableFilesystem: Filesystem {
         ))
     }
 
-    /// Set Unix permission bits on an entry. Override on Unix-style
-    /// filesystems (ext); other filesystems return `Unsupported` so callers
-    /// don't silently lose mode information.
+    /// Set Unix permission bits on an entry. `mode` carries permission bits
+    /// only — implementations keep the inode's file-type bits (see
+    /// [`crate::fs::unix_common::inode::with_permission_bits`]).
+    ///
+    /// Implemented by ext, EFS, UFS, Minix, JFS, XFS and SquashFS; anything
+    /// else returns `Unsupported` so callers don't silently lose mode
+    /// information.
     fn set_permissions(&mut self, _entry: &FileEntry, _mode: u32) -> Result<(), FilesystemError> {
         Err(FilesystemError::Unsupported(
             "set_permissions not supported for this filesystem".into(),
         ))
     }
 
-    /// Set the owning uid and gid on an entry. Override on every Unix filesystem
-    /// (they all carry these inode fields); others return `Unsupported` so the
-    /// UI can gate the control.
+    /// Set the owning uid and gid on an entry.
+    ///
+    /// Implemented by ext, EFS, UFS, Minix, JFS, XFS and SquashFS; others
+    /// return `Unsupported` so the UI can gate the control. Note the GUI
+    /// shows its Owner field whenever an entry carries a `mode`, which is a
+    /// read-side signal — that is how this went unimplemented on five Unix
+    /// filesystems whose editor fields rendered and then failed on apply.
+    ///
+    /// Filesystems with narrow id fields (EFS and Minix hold 16 bits, Minix
+    /// V1's gid is 8) reject an id that doesn't fit rather than truncating
+    /// it: a wrapped uid lands on 0, which is root. See
+    /// [`crate::fs::unix_common::inode::check_id_width`].
     fn set_owner(
         &mut self,
         _entry: &FileEntry,

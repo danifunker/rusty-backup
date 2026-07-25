@@ -148,9 +148,7 @@ pub struct BootReplaceArgs {
 }
 
 fn run_boot_extract(args: BootExtractArgs) -> Result<()> {
-    use opticaldiscs::detect::DiscImageInfo;
-
-    let info = DiscImageInfo::open(&args.source)
+    let info = crate::optical::open_disc_image(&args.source)
         .with_context(|| format!("opening {}", args.source.display()))?;
     let catalog = info.el_torito.as_ref().ok_or_else(|| {
         anyhow::anyhow!("{}: not an El Torito bootable disc", args.source.display())
@@ -641,8 +639,6 @@ pub struct BrowseArgs {
 }
 
 fn run_browse_verb(args: BrowseArgs) -> Result<()> {
-    use opticaldiscs::detect::DiscImageInfo;
-
     require_non_flat(args.format, "optical browse")?;
     if args.hash.is_some() && !args.format.is_structured() {
         bail!(
@@ -650,7 +646,7 @@ fn run_browse_verb(args: BrowseArgs) -> Result<()> {
         );
     }
 
-    let info = DiscImageInfo::open(&args.source)
+    let info = crate::optical::open_disc_image(&args.source)
         .with_context(|| format!("opening {}", args.source.display()))?;
     let (mut fs, opened_fs) = open_selected_filesystem(&info, args.filesystem)?;
     let root = fs
@@ -946,8 +942,6 @@ pub struct OpticalDuArgs {
 }
 
 fn run_du_verb(args: OpticalDuArgs) -> Result<()> {
-    use opticaldiscs::detect::DiscImageInfo;
-
     let format = if args.json {
         OutputFormat::Json
     } else {
@@ -955,7 +949,7 @@ fn run_du_verb(args: OpticalDuArgs) -> Result<()> {
     };
     require_non_flat(format, "optical du")?;
 
-    let info = DiscImageInfo::open(&args.source)
+    let info = crate::optical::open_disc_image(&args.source)
         .with_context(|| format!("opening {}", args.source.display()))?;
     let (inner, opened_fs) = open_selected_filesystem(&info, args.filesystem)?;
 
@@ -1079,8 +1073,6 @@ struct InfoPayload {
 }
 
 fn run_info_verb(args: InfoArgs) -> Result<()> {
-    use opticaldiscs::detect::DiscImageInfo;
-
     require_non_flat(args.format, "optical info")?;
     let image = args.source.display().to_string();
     let size_bytes = std::fs::metadata(&args.source)
@@ -1090,7 +1082,7 @@ fn run_info_verb(args: InfoArgs) -> Result<()> {
     // Opening detects container + filesystem. A hard I/O failure is an error;
     // an unrecognized/unsupported disc is DATA (exit 0 + a warning), because
     // this verb exists precisely to survive discs strict parsers reject.
-    let info = match DiscImageInfo::open(&args.source) {
+    let info = match crate::optical::open_disc_image(&args.source) {
         Ok(i) => i,
         Err(opticaldiscs::OpticaldiscsError::Io(e)) => {
             bail!("reading {}: {e}", args.source.display());
@@ -1649,11 +1641,9 @@ pub enum CliCaseCollisionMode {
 }
 
 fn run_extract_verb(args: ExtractArgs) -> Result<()> {
-    use opticaldiscs::detect::DiscImageInfo;
-
     std::fs::create_dir_all(&args.to).with_context(|| format!("creating {}", args.to.display()))?;
 
-    let info = DiscImageInfo::open(&args.source)
+    let info = crate::optical::open_disc_image(&args.source)
         .with_context(|| format!("opening {}", args.source.display()))?;
     let (mut fs, _opened_fs) = open_selected_filesystem(&info, args.filesystem)?;
     let root = fs

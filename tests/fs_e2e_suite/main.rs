@@ -20,3 +20,4 @@ mod hfsplus_journal_e2e;
 mod macplus_mfs_e2e;
 mod os9_lib;
 mod pcw_e2e;
+mod unix_owner_perms;

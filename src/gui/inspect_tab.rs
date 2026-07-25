@@ -1383,13 +1383,41 @@ impl InspectTab {
 
         let is_device = self.selected_device_idx.is_some();
 
-        // Determine disk size
-        let disk_size = self
+        // The disk's real capacity, NOT the end of the last partition.
+        //
+        // This used to be `max(partition end)`, which made the resize dialog
+        // refuse to use space that already existed: an image with slack at
+        // the end (after a shrink, say) reported itself full, and growing a
+        // partition into it was impossible. Worse, growing the FILE first
+        // didn't help either, because reopening recomputed the same bound
+        // from the same partition table.
+        let partition_end = self
             .partitions
             .iter()
             .map(|p| p.byte_offset() + p.size_bytes)
             .max()
             .unwrap_or(0);
+        let disk_size = if is_device {
+            self.selected_device_idx
+                .and_then(|idx| ctx.devices.get(idx))
+                .map(|d| d.size_bytes)
+                .unwrap_or(partition_end)
+        } else {
+            std::fs::metadata(&path)
+                .map(|m| m.len())
+                .unwrap_or(partition_end)
+        }
+        // A partition table describing more than the container holds is the
+        // corrupt case, not a licence to write past the end; keep the larger
+        // of the two only so we never *shrink* the bound below what already
+        // exists on disk.
+        .max(partition_end);
+
+        // Growing the container is only meaningful for a plain image file we
+        // can extend in place. A device has a fixed size, and a CHD (or any
+        // other compressed container) is not a byte-addressable disk that
+        // `set_len` can enlarge.
+        let can_grow_container = !is_device && self.chd_image_path.is_none();
 
         let alignment_sectors = self
             .alignment
@@ -1402,8 +1430,11 @@ impl InspectTab {
             table,
             &self.partition_min_sizes,
             alignment_sectors,
-            disk_size,
-            is_device,
+            super::resize_popup::ContainerInfo {
+                size_bytes: disk_size,
+                is_device,
+                can_grow: can_grow_container,
+            },
             path,
         )));
     }

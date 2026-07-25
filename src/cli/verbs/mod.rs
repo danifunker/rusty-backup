@@ -15,6 +15,7 @@ pub mod bless;
 pub mod bless_pick;
 pub mod cbk;
 pub mod chmeta;
+pub mod chmod;
 pub mod completions;
 pub mod config;
 pub mod convert;

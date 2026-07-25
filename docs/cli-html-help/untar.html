@@ -26,7 +26,7 @@
 <dt><code>--skip-existing</code></dt>
 <dd>Skip entries that already exist at the destination. Mutually exclusive with `--force`</dd>
 <dt><code>--no-permissions</code></dt>
-<dd>Do not apply archived Unix permission bits (mode) to imported files</dd>
+<dd>Ignore the archive's Unix mode and ownership. Imported entries then inherit uid/gid from the directory they land in and take the filesystem's default mode, the same rule `put` follows</dd>
 <dt><code>--include-appledouble</code></dt>
 <dd>Import macOS AppleDouble sidecars (`._*`) too. By default they are skipped as Mac metadata cruft</dd>
 <dt><code>--fs-type</code></dt>

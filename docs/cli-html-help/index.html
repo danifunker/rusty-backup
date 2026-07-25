@@ -33,6 +33,8 @@
 <li><a href="bless.html"><code>bless</code></a><span class="desc">Inspect or set the bootable System Folder on an HFS / HFS+ volume (`set` / `show` / `pick`)</span></li>
 <li><a href="cbk.html"><code>cbk</code></a><span class="desc">Pack a backup folder into a single `.cbk` container, or unpack one (`cbk pack` / `cbk unpack`). `restore` also reads a `.cbk` directly</span></li>
 <li><a href="chmeta.html"><code>chmeta</code></a><span class="desc">Change the type and/or creator code on an existing HFS / HFS+ / ProDOS file</span></li>
+<li><a href="chmod.html"><code>chmod</code></a><span class="desc">Change POSIX permission bits on an entry inside an image. Works on every filesystem that stores a Unix mode — ext, EFS, UFS, Minix, JFS, XFS, SquashFS, and HFS+ (its `HFSPlusBSDInfo`, which is how OS X carries permissions)</span></li>
+<li><a href="chown.html"><code>chown</code></a><span class="desc">Change the owning uid / gid on an entry inside an image. Same filesystem support as `chmod`</span></li>
 <li><a href="completions.html"><code>completions</code></a><span class="desc">Emit a shell-completion script to stdout</span></li>
 <li><a href="config.html"><code>config</code></a><span class="desc">Manage the rbcli.conf config file</span></li>
 <li><a href="convert.html"><code>convert</code></a><span class="desc">Re-encode one or more disk images into a chosen output format</span></li>
@@ -50,7 +52,7 @@
 <li><a href="ls.html"><code>ls</code></a><span class="desc">List a directory inside a filesystem</span></li>
 <li><a href="mac-scsi-bless.html"><code>mac-scsi-bless</code></a><span class="desc">Install an Apple SCSI driver + Driver Descriptor Record into an APM disk so a classic-Mac ROM (e.g. Quadra 800) registers it over SCSI. Operates in place; partition data is never moved. (This registers the driver so the ROM can read the disk — it does not change HFS boot-block behavior.)</span></li>
 <li><a href="make-bootable.html"><code>make-bootable</code></a><span class="desc">Auto-detect what a Mac disk needs to boot and apply only the missing pieces: SCSI driver + DDR (full APM disks), boot blocks (copied from a `--boot-from` donor), and a blessed System Folder. Idempotent; a flat HFV is kept flat. Works on flat HFVs and full APM disks alike</span></li>
-<li><a href="menu.html"><code>menu</code></a><span class="desc">Interactive backup/restore menu (the appliance UI): pick a disk, then Inspect / Backup / Restore. Needs an interactive terminal</span></li>
+<li><a href="menu.html"><code>menu</code></a><span class="desc">Open the interactive terminal UI on its Backup screen. Needs an interactive terminal</span></li>
 <li><a href="mkdir.html"><code>mkdir</code></a><span class="desc">Create a directory inside a filesystem</span></li>
 <li><a href="new.html"><code>new</code></a><span class="desc">Create a blank image, grouped by media class: `new floppy &lt;fs&gt;`, `new volume &lt;fs&gt;` (bare superfloppy), or `new hd {x68k|sgi-efs}` (partition-table-wrapped, bootable). CD-ROM images are under `optical new`; multi-partition images go through `batch`</span></li>
 <li><a href="optical.html"><code>optical</code></a><span class="desc">Optical-media verbs (drives / rip / convert / browse / extract)</span></li>

@@ -38,6 +38,25 @@ use opticaldiscs::formats::DiscFormat;
 /// with no per-sector overhead, so a file's byte offset is `lba * SECTOR`.
 const ISO_SECTOR: u64 = 2048;
 
+/// Does `path` open with an ISO 9660 primary volume descriptor?
+///
+/// Reads five bytes: the PVD sits at sector 16 of a 2048-byte-sector image,
+/// so its `CD001` standard identifier is at byte 0x8001. Deliberately a
+/// content check rather than an extension check — a live CD saved as
+/// `.img` is still an ISO — and deliberately cheap, because it runs for
+/// every path the source router looks at.
+fn looks_like_iso9660(path: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    if f.seek(SeekFrom::Start(0x8001)).is_err() {
+        return false;
+    }
+    let mut magic = [0u8; 5];
+    f.read_exact(&mut magic).is_ok() && &magic == b"CD001"
+}
+
 /// Where a SquashFS lives inside an ISO, and how large its extent is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IsoSquashfs {
@@ -58,6 +77,16 @@ pub struct IsoSquashfs {
 /// `None` when the image is not a plain ISO, holds no SquashFS, or cannot be
 /// read.
 pub fn find_squashfs(path: &Path) -> Option<IsoSquashfs> {
+    // Confirm this is an ISO 9660 image *before* handing the path to
+    // opticaldiscs. `DiscImageInfo::open` sniffs every container it knows,
+    // and its CHD probe reaches MAME's `cdrom_file` constructor, which
+    // THROWS for a CHD carrying no CD metadata — an ordinary hard-disk CHD.
+    // A C++ exception cannot unwind into Rust, so the process aborts rather
+    // than returning an error. Since this function only ever succeeds on a
+    // plain ISO (the `DiscFormat` check below), the gate costs no coverage.
+    if !looks_like_iso9660(path) {
+        return None;
+    }
     let info = DiscImageInfo::open(path).ok()?;
     // Only a plain ISO has file offset == lba * 2048; see the module docs.
     if info.format != DiscFormat::Iso {
@@ -233,5 +262,60 @@ mod tests {
             .unwrap();
         assert!(find_squashfs(&path).is_none());
         assert!(!is_squashfs_bearing_iso(&path));
+    }
+
+    /// A hard-disk CHD must never reach opticaldiscs' container sniffer.
+    ///
+    /// `is_container_path` calls `find_squashfs` for **every** path the
+    /// source router sees, and `DiscImageInfo::open` probes a CHD as a CD.
+    /// MAME's `cdrom_file` constructor throws for a CHD with no CD metadata,
+    /// and a C++ exception cannot unwind into Rust — the process aborts.
+    /// Opening any hard-disk CHD (an SGI EFS disk, say) killed the app.
+    ///
+    /// If this regresses the whole test binary dies rather than failing an
+    /// assertion, which is exactly as loud as the bug deserves.
+    #[test]
+    #[cfg(feature = "chd")]
+    fn a_hard_disk_chd_is_never_probed_as_a_disc_image() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // A real hard-disk CHD (no CD metadata) built the way `convert` does.
+        let data = vec![0x5Au8; 512 * 1024];
+        let base = tmp.path().join("hd");
+        crate::rbformats::chd::compress_chd(
+            &mut std::io::Cursor::new(&data),
+            &base,
+            data.len() as u64,
+            None,
+            None,
+            &mut |_| {},
+            &|| false,
+            &mut |_| {},
+        )
+        .expect("build a hard-disk CHD");
+        let chd = base.with_extension("chd");
+        assert!(!looks_like_iso9660(&chd), "a CHD is not an ISO");
+        assert_eq!(find_squashfs(&chd), None);
+        assert!(!is_squashfs_bearing_iso(&chd));
+        // And the shared guard refuses it rather than letting C++ throw.
+        assert!(crate::optical::open_disc_image(&chd).is_err());
+    }
+
+    /// The ISO gate is a content check, so a live CD saved under another
+    /// extension still gets looked inside.
+    #[test]
+    fn the_iso_gate_reads_content_not_the_extension() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let named_img = tmp.path().join("livecd.img");
+        let mut iso = vec![0u8; 0x8006];
+        iso[0x8001..0x8006].copy_from_slice(b"CD001");
+        std::fs::write(&named_img, &iso).unwrap();
+        assert!(looks_like_iso9660(&named_img));
+
+        let not_iso = tmp.path().join("random.iso");
+        std::fs::write(&not_iso, vec![0u8; 0x9000]).unwrap();
+        assert!(
+            !looks_like_iso9660(&not_iso),
+            "extension alone must not pass"
+        );
     }
 }
