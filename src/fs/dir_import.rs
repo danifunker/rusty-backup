@@ -49,6 +49,20 @@ pub struct DirImportOptions {
     /// not extension, so an oddly-named archive is still found and a `.gz`
     /// disk image is not mistaken for one.
     pub expand_archives: bool,
+
+    /// With [`Self::expand_archives`]: unpack each archive's contents into the
+    /// directory that held the archive, rather than into a per-archive
+    /// subdirectory. Every archive alongside each other then shares one root.
+    ///
+    /// This is what an IRIX `inst` distribution wants: `.tardist` files carry
+    /// flat product images (`tgc_bash`, `tgc_bash.idb`, `tgc_bash.sw`, ...),
+    /// and `inst` is pointed at ONE directory holding all of them. A
+    /// subdirectory per archive would mean re-pointing `inst` 55 times.
+    ///
+    /// Overlapping entries are expected here rather than exceptional —
+    /// SGI freeware tardists all ship the same shared `fw_common*` product —
+    /// so callers generally want a non-fatal conflict policy alongside this.
+    pub flatten_archives: bool,
 }
 
 /// Directory name for an expanded archive: the file name with its archive
@@ -283,10 +297,12 @@ fn import_dir_inner(
     Ok(sink.stats)
 }
 
-/// Unpack one archive into a directory named after it. Returns `false` when
-/// the archive should be copied in verbatim after all (its directory name is
-/// unusable on this filesystem), so the caller falls back to a plain copy
-/// rather than silently dropping the file.
+/// Unpack one archive: into a directory named after it, or — with
+/// `flatten_archives` — straight into the directory that held it, so sibling
+/// archives share one root. Returns `false` when the archive should be copied
+/// in verbatim after all (its directory name is unusable on this filesystem),
+/// so the caller falls back to a plain copy rather than silently dropping the
+/// file.
 ///
 /// Bulk mode stays with the enclosing [`import_dir`] — see
 /// [`crate::fs::tar_import::import_tar_into`] for why this can't just call
@@ -302,9 +318,17 @@ fn expand_archive(
         Some(n) => n.clone(),
         None => return Ok(false),
     };
+    // Flattened: drop the archive's own name, landing its contents in the
+    // directory that held it (the destination root for a top-level archive).
+    // Otherwise: replace the archive's name with the stripped-extension form
+    // and unpack under that.
     let mut comps = e.comps.clone();
     let last = comps.len() - 1;
-    comps[last] = expanded_dir_name(&file_name);
+    if opts.flatten_archives {
+        comps.truncate(last);
+    } else {
+        comps[last] = expanded_dir_name(&file_name);
+    }
 
     let dir = match sink.ensure_dir_at(efs, &comps)? {
         Some(d) => d,
@@ -374,7 +398,9 @@ pub fn preflight_dir(
                     // Count what the archive becomes, not the archive.
                     let (f, d, b) = crate::fs::tar_import::measure_tar_expanded(&e.host)?;
                     pf.files += f;
-                    pf.dirs += d + 1; // + the directory it unpacks into
+                    // Plus the directory it unpacks into, unless flattened —
+                    // then it shares the one that already exists.
+                    pf.dirs += d + u64::from(!opts.flatten_archives);
                     pf.total_bytes += b;
                 } else {
                     pf.files += 1;
@@ -395,7 +421,11 @@ pub fn preflight_dir(
 /// That distinction is the whole point for sizing: a tree of `.tar.gz` can
 /// easily triple on the way in, and a disc sized off the compressed total
 /// would run out partway through the copy.
-pub fn measure_dir(root: &Path, expand_archives: bool) -> Result<(u64, u64, u64)> {
+/// `flatten` matches [`DirImportOptions::flatten_archives`]: it drops the
+/// per-archive directory from the count. It does not try to predict how many
+/// entries several archives share once merged, so a flattened estimate errs
+/// high — the safe direction for sizing.
+pub fn measure_dir(root: &Path, expand_archives: bool, flatten: bool) -> Result<(u64, u64, u64)> {
     let mut files = 0u64;
     let mut dirs = 0u64;
     let mut bytes = 0u64;
@@ -406,7 +436,7 @@ pub fn measure_dir(root: &Path, expand_archives: bool) -> Result<(u64, u64, u64)
                 if expand_archives && crate::fs::tar_import::looks_like_tar_archive(&e.host) {
                     let (f, d, b) = crate::fs::tar_import::measure_tar_expanded(&e.host)?;
                     files += f;
-                    dirs += d + 1;
+                    dirs += d + u64::from(!flatten);
                     bytes += b;
                 } else {
                     files += 1;
@@ -652,6 +682,124 @@ mod tests {
         assert_eq!(fs.read_file(one, usize::MAX).unwrap(), b"one");
     }
 
+    /// Flattening drops the per-archive wrapper directory so sibling archives
+    /// share one root — the shape IRIX `inst` wants from a `.tardist` set.
+    #[test]
+    fn flatten_merges_every_archive_into_one_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_tgz(
+            &tmp.path().join("pkg-a.tardist"),
+            &[("a_prod", b"A"), ("a_prod.sw", b"A")],
+        );
+        write_tgz(
+            &tmp.path().join("pkg-b.tardist"),
+            &[("b_prod", b"B"), ("b_prod.sw", b"B")],
+        );
+
+        let img = blank_fat();
+        let mut fs =
+            crate::fs::fat::FatFilesystem::open(std::io::Cursor::new(img), 0).expect("open");
+        let root = Filesystem::root(&mut fs).expect("root");
+        let opts = DirImportOptions {
+            expand_archives: true,
+            flatten_archives: true,
+            ..Default::default()
+        };
+        let stats = import_dir(&mut fs, &root, tmp.path(), &opts, &|_| {}).expect("import");
+        assert_eq!(stats.archives_expanded, 2);
+        assert_eq!(stats.files, 4);
+        // No wrapper directories at all — every product image sits at the root.
+        assert_eq!(
+            stats.dirs_created, 0,
+            "flatten should create no wrapper dirs"
+        );
+
+        let mut names: Vec<String> = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name.to_ascii_lowercase())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["a_prod", "a_prod.sw", "b_prod", "b_prod.sw"]);
+    }
+
+    /// The case a real IRIX freeware set hits: several tardists ship the same
+    /// shared `fw_common*` product. Flattening must merge them rather than
+    /// abort, or the flag is unusable on exactly the trees it exists for.
+    #[test]
+    fn flatten_tolerates_the_shared_product_archives_have_in_common() {
+        let tmp = tempfile::tempdir().unwrap();
+        for pkg in ["fw_one", "fw_two", "fw_three"] {
+            write_tgz(
+                &tmp.path().join(format!("{pkg}.tardist")),
+                &[
+                    (pkg, b"unique"),
+                    // Every freeware tardist carries this same product.
+                    ("fw_common", b"shared"),
+                    ("fw_common.idb", b"shared"),
+                ],
+            );
+        }
+
+        let img = blank_fat();
+        let mut fs =
+            crate::fs::fat::FatFilesystem::open(std::io::Cursor::new(img), 0).expect("open");
+        let root = Filesystem::root(&mut fs).expect("root");
+        let opts = DirImportOptions {
+            // What the CLI builds for --flatten-folders: Skip, not Error.
+            shared: ImportOptions {
+                conflict: ImportConflict::Skip,
+                ..Default::default()
+            },
+            expand_archives: true,
+            flatten_archives: true,
+        };
+        let stats = import_dir(&mut fs, &root, tmp.path(), &opts, &|_| {})
+            .expect("a shared product across archives must not abort the import");
+
+        // 3 unique products + fw_common + fw_common.idb written once each.
+        assert_eq!(stats.files, 5);
+        assert_eq!(stats.skipped_existing, 4, "the 2nd/3rd copies are skipped");
+
+        let mut names: Vec<String> = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name.to_ascii_lowercase())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["fw_common", "fw_common.idb", "fw_one", "fw_three", "fw_two"]
+        );
+    }
+
+    /// Without flattening the same set stays segregated per archive, so the
+    /// shared product is duplicated rather than merged and nothing collides.
+    #[test]
+    fn without_flatten_each_archive_keeps_its_own_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        for pkg in ["fw_one", "fw_two"] {
+            write_tgz(
+                &tmp.path().join(format!("{pkg}.tardist")),
+                &[(pkg, b"unique"), ("fw_common", b"shared")],
+            );
+        }
+        let img = blank_fat();
+        let mut fs =
+            crate::fs::fat::FatFilesystem::open(std::io::Cursor::new(img), 0).expect("open");
+        let root = Filesystem::root(&mut fs).expect("root");
+        let opts = DirImportOptions {
+            expand_archives: true,
+            ..Default::default()
+        };
+        let stats = import_dir(&mut fs, &root, tmp.path(), &opts, &|_| {}).expect("import");
+        assert_eq!(stats.dirs_created, 2, "one wrapper dir per archive");
+        assert_eq!(stats.files, 4, "fw_common lands once per archive");
+        assert_eq!(stats.skipped_existing, 0);
+    }
+
     /// Sizing has to key off what an archive *becomes*, not its compressed
     /// size, or `--size auto` under-provisions and the copy dies partway in.
     #[test]
@@ -663,8 +811,8 @@ mod tests {
             &[("blob", &vec![0u8; 200_000])],
         );
 
-        let (_, _, packed) = measure_dir(tmp.path(), false).unwrap();
-        let (_, _, expanded) = measure_dir(tmp.path(), true).unwrap();
+        let (_, _, packed) = measure_dir(tmp.path(), false, false).unwrap();
+        let (_, _, expanded) = measure_dir(tmp.path(), true, false).unwrap();
         assert!(
             expanded > packed * 4,
             "expanded ({expanded}) should dwarf the compressed size ({packed})"
@@ -688,7 +836,7 @@ mod tests {
     fn measure_and_projection_leave_room_for_metadata() {
         let tmp = tempfile::tempdir().unwrap();
         tree(tmp.path());
-        let (files, dirs, bytes) = measure_dir(tmp.path(), false).unwrap();
+        let (files, dirs, bytes) = measure_dir(tmp.path(), false, false).unwrap();
         assert_eq!(files, 3);
         assert_eq!(dirs, 2);
         assert_eq!(bytes, 5010);

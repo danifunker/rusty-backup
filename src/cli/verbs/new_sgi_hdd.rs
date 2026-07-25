@@ -52,6 +52,18 @@ pub struct NewSgiHddArgs {
     #[arg(long = "expand-archives", requires = "from_dir")]
     pub expand_archives: bool,
 
+    /// With `--expand-archives`: unpack each archive into the volume root
+    /// rather than a subdirectory named after it, so every archive shares one
+    /// root — the shape IRIX `inst` wants. Overlapping entries are then
+    /// expected, so this skips entries that already exist unless `--force`.
+    #[arg(long = "flatten-folders", requires = "expand_archives")]
+    pub flatten_folders: bool,
+
+    /// With `--from-dir`: overwrite entries that already exist rather than
+    /// skipping them.
+    #[arg(long, requires = "from_dir")]
+    pub force: bool,
+
     /// With `--from-dir`: ignore the host's Unix mode and ownership.
     #[arg(long = "no-permissions", requires = "from_dir")]
     pub no_permissions: bool,
@@ -104,8 +116,9 @@ pub fn run(args: NewSgiHddArgs) -> Result<()> {
         let Some(dir) = &args.from_dir else {
             anyhow::bail!("--size auto needs --from-dir to measure; pass an explicit size instead");
         };
-        let (files, dirs, bytes) = crate::fs::dir_import::measure_dir(dir, args.expand_archives)
-            .with_context(|| format!("measuring {}", dir.display()))?;
+        let (files, dirs, bytes) =
+            crate::fs::dir_import::measure_dir(dir, args.expand_archives, args.flatten_folders)
+                .with_context(|| format!("measuring {}", dir.display()))?;
         let projected = crate::fs::dir_import::projected_volume_bytes(files, dirs, bytes, 512);
         log_stderr(format!(
             "size auto: {files} file(s), {dirs} dir(s), {} MiB of content{} -> {} MiB disk",
@@ -201,12 +214,14 @@ fn populate(args: &NewSgiHddArgs, dir: &std::path::Path) -> Result<()> {
 
     let opts = DirImportOptions {
         shared: super::import::shared_options(
-            false,
+            args.force,
             false,
             args.no_permissions,
             args.include_appledouble,
+            args.flatten_folders,
         ),
         expand_archives: args.expand_archives,
+        flatten_archives: args.flatten_folders,
     };
     let stats = import_dir(&mut *fs, &dest, dir, &opts, &super::import::progress_cb)
         .map_err(|e| anyhow::anyhow!("importing {}: {e}", dir.display()))?;

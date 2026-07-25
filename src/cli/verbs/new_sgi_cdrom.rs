@@ -53,6 +53,22 @@ pub struct NewSgiCdromArgs {
     #[arg(long = "expand-archives", requires = "from_dir")]
     pub expand_archives: bool,
 
+    /// With `--expand-archives`: unpack each archive into the volume root
+    /// rather than a subdirectory named after it, so every archive shares one
+    /// root. This is the shape IRIX `inst` wants — point it at one directory
+    /// holding every `.tardist`'s product images instead of re-pointing it per
+    /// archive. Overlapping entries are then expected (SGI freeware tardists
+    /// all ship the same `fw_common*` product), so this skips entries that
+    /// already exist unless `--force` is given.
+    #[arg(long = "flatten-folders", requires = "expand_archives")]
+    pub flatten_folders: bool,
+
+    /// With `--from-dir`: overwrite entries that already exist rather than
+    /// skipping them. Only meaningful alongside `--flatten-folders`, where
+    /// archives can legitimately carry the same entry.
+    #[arg(long, requires = "from_dir")]
+    pub force: bool,
+
     /// With `--from-dir`: ignore the host's Unix mode and ownership.
     #[arg(long = "no-permissions", requires = "from_dir")]
     pub no_permissions: bool,
@@ -138,8 +154,9 @@ fn resolve_disc_size(args: &NewSgiCdromArgs) -> Result<u64> {
     let Some(dir) = &args.from_dir else {
         anyhow::bail!("--size auto needs --from-dir to measure; pass an explicit size instead");
     };
-    let (files, dirs, bytes) = crate::fs::dir_import::measure_dir(dir, args.expand_archives)
-        .with_context(|| format!("measuring {}", dir.display()))?;
+    let (files, dirs, bytes) =
+        crate::fs::dir_import::measure_dir(dir, args.expand_archives, args.flatten_folders)
+            .with_context(|| format!("measuring {}", dir.display()))?;
     // EFS allocates in 512-byte blocks.
     let projected = crate::fs::dir_import::projected_volume_bytes(files, dirs, bytes, 512);
     log_stderr(format!(
@@ -174,12 +191,14 @@ fn populate(args: &NewSgiCdromArgs, dir: &std::path::Path) -> Result<()> {
 
     let opts = DirImportOptions {
         shared: super::import::shared_options(
-            false,
+            args.force,
             false,
             args.no_permissions,
             args.include_appledouble,
+            args.flatten_folders,
         ),
         expand_archives: args.expand_archives,
+        flatten_archives: args.flatten_folders,
     };
     let stats = import_dir(&mut *fs, &dest, dir, &opts, &super::import::progress_cb)
         .map_err(|e| anyhow::anyhow!("importing {}: {e}", dir.display()))?;

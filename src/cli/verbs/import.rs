@@ -48,6 +48,19 @@ pub struct ImportArgs {
     #[arg(long = "expand-archives")]
     pub expand_archives: bool,
 
+    /// With `--expand-archives`: unpack each archive into the directory that
+    /// held it rather than into a subdirectory named after it, so every
+    /// archive shares one root.
+    ///
+    /// This is the shape an IRIX `inst` distribution wants — `.tardist` files
+    /// carry flat product images and `inst` is pointed at a single directory
+    /// holding all of them. Because archives are then expected to overlap
+    /// (SGI freeware tardists all ship the same `fw_common*` product), this
+    /// defaults to skipping entries that already exist; pass `--force` to
+    /// overwrite instead.
+    #[arg(long = "flatten-folders", requires = "expand_archives")]
+    pub flatten_folders: bool,
+
     /// Overwrite entries that already exist at the destination. Mutually
     /// exclusive with `--skip-existing`.
     #[arg(long, conflicts_with = "skip_existing")]
@@ -74,16 +87,25 @@ pub struct ImportArgs {
 }
 
 /// Build the shared import options from the conflict/permission flags.
+///
+/// `flatten` shifts the default conflict policy from Error to Skip. Merging
+/// several archives into one root makes overlap the norm rather than a
+/// mistake — the four SGI freeware tardists in a typical set all carry the
+/// same `fw_common*` product — so erroring out would make the flag unusable
+/// on exactly the trees it exists for. An explicit `--force` still wins, and
+/// the summary reports how many entries were skipped.
 pub(crate) fn shared_options(
     force: bool,
     skip_existing: bool,
     no_permissions: bool,
     include_appledouble: bool,
+    flatten: bool,
 ) -> ImportOptions {
     ImportOptions {
         conflict: match (force, skip_existing) {
             (true, _) => ImportConflict::Overwrite,
             (_, true) => ImportConflict::Skip,
+            _ if flatten => ImportConflict::Skip,
             _ => ImportConflict::Error,
         },
         apply_permissions: !no_permissions,
@@ -131,8 +153,10 @@ pub fn run(args: ImportArgs) -> Result<()> {
             args.skip_existing,
             args.no_permissions,
             args.include_appledouble,
+            args.flatten_folders,
         ),
         expand_archives: args.expand_archives,
+        flatten_archives: args.flatten_folders,
     };
 
     let stats = import_dir(&mut *fs, &dest, &args.dir, &opts, &progress_cb)

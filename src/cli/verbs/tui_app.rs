@@ -4701,6 +4701,8 @@ impl App {
                                 // separate `import` step.
                                 from_dir: None,
                                 expand_archives: false,
+                                flatten_folders: false,
+                                force: false,
                                 no_permissions: false,
                                 include_appledouble: false,
                             })

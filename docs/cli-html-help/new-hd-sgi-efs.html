@@ -23,6 +23,10 @@
 <dd>Populate the root filesystem from this host directory after formatting. The directory's *contents* land at the volume root</dd>
 <dt><code>--expand-archives</code></dt>
 <dd>With `--from-dir`: unpack tar archives found in the tree into a directory named after each, instead of copying them in verbatim. Detected by content, so IRIX `.tardist` files count</dd>
+<dt><code>--flatten-folders</code></dt>
+<dd>With `--expand-archives`: unpack each archive into the volume root rather than a subdirectory named after it, so every archive shares one root — the shape IRIX `inst` wants. Overlapping entries are then expected, so this skips entries that already exist unless `--force`</dd>
+<dt><code>--force</code></dt>
+<dd>With `--from-dir`: overwrite entries that already exist rather than skipping them</dd>
 <dt><code>--no-permissions</code></dt>
 <dd>With `--from-dir`: ignore the host's Unix mode and ownership</dd>
 <dt><code>--include-appledouble</code></dt>

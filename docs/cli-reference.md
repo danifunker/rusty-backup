@@ -787,6 +787,7 @@ Usage: import [OPTIONS] <IMAGE> <DIR> [DEST]
 **Options**
 
 - `--expand-archives` — Unpack tar archives found in the tree into a directory named after each, instead of copying them in verbatim. Detected by content (the `ustar` magic), so IRIX `.tardist` and oddly-named archives are found and a gzipped disk image is not mistaken for one
+- `--flatten-folders` — With `--expand-archives`: unpack each archive into the directory that held it rather than into a subdirectory named after it, so every archive shares one root
 - `--force` — Overwrite entries that already exist at the destination. Mutually exclusive with `--skip-existing`
 - `--skip-existing` — Skip entries that already exist at the destination. Mutually exclusive with `--force`
 - `--no-permissions` — Ignore the host's Unix mode and ownership. Imported entries then inherit uid/gid from the directory they land in and take the filesystem's default mode, the same rule `put` follows
@@ -988,6 +989,8 @@ Usage: sgi-efs [OPTIONS] <IMAGE>
 - `--size` — Disk size (plain bytes or `K`/`KiB`/`M`/`MiB`/`G`/`GiB` suffixes, e.g. `50M`), or `auto` to size it to `--from-dir` plus filesystem overhead and headroom. Rounded up to a whole cylinder. Defaults to 50M
 - `--from-dir` — Populate the root filesystem from this host directory after formatting. The directory's *contents* land at the volume root
 - `--expand-archives` — With `--from-dir`: unpack tar archives found in the tree into a directory named after each, instead of copying them in verbatim. Detected by content, so IRIX `.tardist` files count
+- `--flatten-folders` — With `--expand-archives`: unpack each archive into the volume root rather than a subdirectory named after it, so every archive shares one root — the shape IRIX `inst` wants. Overlapping entries are then expected, so this skips entries that already exist unless `--force`
+- `--force` — With `--from-dir`: overwrite entries that already exist rather than skipping them
 - `--no-permissions` — With `--from-dir`: ignore the host's Unix mode and ownership
 - `--include-appledouble` — With `--from-dir`: import macOS AppleDouble sidecars (`._*`) too
 - `--name` — EFS volume label (up to 6 bytes; longer is truncated). Defaults to `rusty`
@@ -1225,6 +1228,8 @@ Usage: sgi-efs [OPTIONS] <IMAGE>
 - `--size` — Disc size (plain bytes or `K`/`M`/`G` suffixes, e.g. `600M`), or `auto` to size it to `--from-dir` plus filesystem overhead and headroom. Rounded up to a whole 32-sector CD cylinder. Defaults to 600M (a CD-R); keep an explicit size at or below your target media (~650-700 MiB for a CD), and use `auto` for an image you intend to mount rather than burn
 - `--from-dir` — Populate the disc from this host directory after formatting it. The directory's *contents* land at the volume root
 - `--expand-archives` — With `--from-dir`: unpack tar archives found in the tree into a directory named after each, instead of copying them in verbatim. Detected by content, so IRIX `.tardist` files count
+- `--flatten-folders` — With `--expand-archives`: unpack each archive into the volume root rather than a subdirectory named after it, so every archive shares one root. This is the shape IRIX `inst` wants — point it at one directory holding every `.tardist`'s product images instead of re-pointing it per archive. Overlapping entries are then expected (SGI freeware tardists all ship the same `fw_common*` product), so this skips entries that already exist unless `--force` is given
+- `--force` — With `--from-dir`: overwrite entries that already exist rather than skipping them. Only meaningful alongside `--flatten-folders`, where archives can legitimately carry the same entry
 - `--no-permissions` — With `--from-dir`: ignore the host's Unix mode and ownership
 - `--include-appledouble` — With `--from-dir`: import macOS AppleDouble sidecars (`._*`) too
 - `--name` — EFS volume label (up to 6 bytes; longer is truncated). Defaults to `rusty`

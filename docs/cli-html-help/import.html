@@ -23,6 +23,8 @@
 <dl class="args">
 <dt><code>--expand-archives</code></dt>
 <dd>Unpack tar archives found in the tree into a directory named after each, instead of copying them in verbatim. Detected by content (the `ustar` magic), so IRIX `.tardist` and oddly-named archives are found and a gzipped disk image is not mistaken for one</dd>
+<dt><code>--flatten-folders</code></dt>
+<dd>With `--expand-archives`: unpack each archive into the directory that held it rather than into a subdirectory named after it, so every archive shares one root</dd>
 <dt><code>--force</code></dt>
 <dd>Overwrite entries that already exist at the destination. Mutually exclusive with `--skip-existing`</dd>
 <dt><code>--skip-existing</code></dt>

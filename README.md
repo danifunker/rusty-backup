@@ -63,6 +63,8 @@ rb-cli new hd x68k c.hdf --size 32M --variant scsi --system-disk human68k.dim \
 rb-cli new hd sgi-efs irix.img --size 50M                     # IRIX SGI dvh + EFS root HDD
 rb-cli optical new sgi-efs irix.iso --size 600M                  # IRIX EFS CD-ROM (slot-7 SYSV, mount -t efs)
 rb-cli optical new sgi-efs irix.iso --size auto --from-dir ./sgi-stuff  # format + fill in one step
+rb-cli optical new sgi-efs irix.iso --size auto --from-dir ./sgi-stuff \
+       --expand-archives --flatten-folders   # unpack every .tardist into one inst-ready root
 rb-cli put irix.img@1 ./bstoolbox /bstoolbox               # populate its EFS root partition
 rb-cli mac-scsi-bless mac.hda                              # install Apple SCSI driver + DDR
 rb-cli mac-scsi-bless mac.hda --driver-from donor.hda      # use a donor disk's driver verbatim
