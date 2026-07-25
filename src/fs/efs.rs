@@ -1000,38 +1000,119 @@ impl<R: Read + Write + Seek> EfsFilesystem<R> {
             }
         }
 
-        // Every existing dirblock is full. Allocate one more.
-        if dir_inode.numextents as usize >= EFS_DIRECTEXTENTS {
-            return Err(FilesystemError::DiskFull(format!(
-                "EFS dir_insert: directory inum {} already has {} extents (max {}); \
-                 directory cannot grow further on this volume",
-                dir_inode.inum, dir_inode.numextents, EFS_DIRECTEXTENTS
-            )));
-        }
-        let new_ext =
-            Self::alloc_contiguous_in_bitmap(bm, &EfsDataRegions::from_sb(&self.sb), 1, 0)?;
-        // Initialize the new block with just our single entry.
-        let init =
-            serialize_dir_block(&[new_entry]).expect("single entry always fits in 512 bytes");
-        self.write_block(new_ext.bn, &init)?;
-        // Append to the inode's extent list. `offset` is the next
-        // logical block in the directory's address space.
+        // Every existing dirblock is full, so the directory needs one more.
+        //
+        // Prefer *extending the last extent* over consuming an extent slot:
+        // an extent addresses up to 255 blocks, so a directory that grows
+        // contiguously fits ~3000 dirblocks in its twelve slots. Appending a
+        // fresh one-block extent every time instead capped every directory at
+        // 12 blocks — about 200 entries — which is far below what real IRIX
+        // directories hold and what `mkfs_efs` lays out (contiguous runs).
+        let regions = EfsDataRegions::from_sb(&self.sb);
         let next_logical_offset = extents
             .iter()
             .map(|e| e.offset + e.length as u32)
             .max()
             .unwrap_or(0);
-        let extent = EfsExtent {
-            magic: 0,
-            bn: new_ext.bn,
-            length: 1,
-            offset: next_logical_offset,
+
+        // The last extent in disk order is the only one we can extend without
+        // renumbering logical offsets.
+        let tail_slot = (0..dir_inode.numextents as usize)
+            .filter(|i| dir_inode.extents[*i].length > 0)
+            .max_by_key(|i| dir_inode.extents[*i].offset);
+        let grown = match tail_slot {
+            Some(slot) if dir_inode.extents[slot].length < u8::MAX => {
+                let tail = dir_inode.extents[slot];
+                let follow = tail.bn + tail.length as u32;
+                if Self::take_block_in_bitmap(bm, &regions, follow) {
+                    dir_inode.extents[slot].length += 1;
+                    Some(follow)
+                } else {
+                    None
+                }
+            }
+            _ => None,
         };
-        let slot = dir_inode.numextents as usize;
-        dir_inode.extents[slot] = extent;
-        dir_inode.numextents += 1;
-        dir_inode.size = dir_inode.size.saturating_add(EFS_BLOCKSIZE as u32);
+
+        let (bn, added_blocks) = match grown {
+            Some(bn) => (bn, 1),
+            None => {
+                // Not contiguous (or the tail extent is full) — spend a slot on
+                // a fresh extent. Grab a RUN rather than a single block: the
+                // allocator interleaves file data with directory growth, so
+                // the block right after a directory is usually taken by the
+                // time the directory needs it, and one-block-per-slot burns
+                // through all twelve slots after ~200 entries. The run is
+                // sized to the directory's current length (capped at an
+                // extent's 255-block reach), so small directories stay small
+                // while a large one grows geometrically.
+                if dir_inode.numextents as usize >= EFS_DIRECTEXTENTS {
+                    return Err(FilesystemError::DiskFull(format!(
+                        "EFS dir_insert: directory inum {} already has {} extents (max {}) and \
+                         none can be extended contiguously; directory cannot grow further on \
+                         this volume",
+                        dir_inode.inum, dir_inode.numextents, EFS_DIRECTEXTENTS
+                    )));
+                }
+                let current_blocks: u32 = extents.iter().map(|e| e.length as u32).sum();
+                let mut want = current_blocks.clamp(1, 64);
+                let new_ext = loop {
+                    match Self::alloc_contiguous_in_bitmap(bm, &regions, want, 0) {
+                        Ok(e) => break e,
+                        Err(FilesystemError::DiskFull(_)) if want > 1 => want /= 2,
+                        Err(e) => return Err(e),
+                    }
+                };
+                let slot = dir_inode.numextents as usize;
+                dir_inode.extents[slot] = EfsExtent {
+                    magic: 0,
+                    bn: new_ext.bn,
+                    length: new_ext.length,
+                    offset: next_logical_offset,
+                };
+                dir_inode.numextents += 1;
+                (new_ext.bn, new_ext.length as u32)
+            }
+        };
+
+        // Initialize the new block with just our single entry.
+        let init =
+            serialize_dir_block(&[new_entry]).expect("single entry always fits in 512 bytes");
+        self.write_block(bn, &init)?;
+        // Every other block in the run has to carry a valid EMPTY dirblock
+        // header, not stay zeroed: a reader walking the directory stops dead
+        // at a block whose magic isn't 0xBEEF (Linux `efs_readdir` logs
+        // "invalid directory block" and breaks), which would truncate the
+        // listing at the first unwritten block. A recycled block could also
+        // hold stale entries.
+        let empty = serialize_dir_block(&[]).expect("an empty dirblock always fits");
+        for i in 1..added_blocks {
+            self.write_block(bn + i, &empty)?;
+        }
+        dir_inode.size = dir_inode
+            .size
+            .saturating_add(added_blocks * EFS_BLOCKSIZE as u32);
         Ok(())
+    }
+
+    /// Claim exactly block `bn` if it is free and allocatable. Returns false
+    /// when it is already in use or isn't a cylinder-group data block, so the
+    /// caller can fall back. Used to grow an extent in place rather than
+    /// spending one of the twelve inode slots.
+    pub(crate) fn take_block_in_bitmap(bm: &mut [u8], regions: &EfsDataRegions, bn: u32) -> bool {
+        if !regions.contains(bn) {
+            return false;
+        }
+        let by = (bn / 8) as usize;
+        if by >= bm.len() {
+            return false;
+        }
+        let bb = 7 - (bn % 8);
+        if bm[by] & (1u8 << bb) == 0 {
+            return false; // already in use (set bit = free)
+        }
+        bm[by] &= !(1u8 << bb);
+        true
     }
 
     /// Remove the dirent named `name` from `dir_inum`. Returns the
@@ -4194,6 +4275,15 @@ mod tests {
         // Fill the first dirblock with as many small entries as fit.
         // Each entry: 5 + 3 = 8 bytes dirent + 1 slot byte = 9 bytes;
         // 4 header bytes + 9 * N <= 512 → N <= 56.
+        let dir_blocks = |ino: &EfsInode| -> u32 {
+            ino.extents
+                .iter()
+                .take(ino.numextents as usize)
+                .map(|e| e.length as u32)
+                .sum()
+        };
+        assert_eq!(dir_blocks(&root), 1, "root starts as a single dirblock");
+
         let mut inserted = 0usize;
         for i in 0..200u32 {
             let name = format!("f{i:03}").into_bytes();
@@ -4201,32 +4291,42 @@ mod tests {
                 Ok(()) => inserted += 1,
                 Err(_) => break,
             }
-            // Stop once we've forced a second extent.
-            if root.numextents > 1 {
-                inserted += 1;
-                continue;
-            }
         }
+        // Growth is measured in BLOCKS, not extents: a directory whose next
+        // block is contiguous extends its tail extent in place rather than
+        // spending one of the twelve inode slots. Asserting on `numextents`
+        // here would be asserting on the old one-block-per-slot behaviour
+        // that capped every directory at ~200 entries.
         assert!(
-            root.numextents >= 2,
-            "expected dir growth: only {} entries inserted, numextents={}",
+            dir_blocks(&root) >= 2,
+            "expected dir growth: only {} entries inserted, {} block(s)",
             inserted,
-            root.numextents
+            dir_blocks(&root)
+        );
+        assert!(
+            inserted > 56,
+            "growth should have carried past the first block's capacity, got {inserted}"
         );
         // The bitmap must reflect the new dirblock allocation.
         fs.write_bitmap(&bm).expect("flush bitmap");
         fs.write_inode(&root).expect("write inode");
 
-        // Re-open and verify a few entries land.
+        // Re-open and verify entries from both the first and a later block.
         let reopened_img = fs.reader.into_inner();
         let mut fs2 = EfsFilesystem::open(Cursor::new(reopened_img), 0).expect("reopen");
         let root2 = fs2.read_inode(2).expect("root2");
-        assert!(root2.numextents >= 2);
+        assert!(dir_blocks(&root2) >= 2);
         let found = fs2
             .dir_find(&root2, b"f005")
             .expect("find")
             .expect("present");
         assert_eq!(found, 105);
+        let last = format!("f{:03}", inserted - 1).into_bytes();
+        assert_eq!(
+            fs2.dir_find(&root2, &last).expect("find last"),
+            Some(100 + inserted as u32 - 1),
+            "an entry in a grown-into block must still be findable"
+        );
     }
 
     #[test]
@@ -4398,6 +4498,68 @@ mod tests {
                 .unwrap_or_else(|| panic!("{} missing after reopen", entry.name));
             assert_eq!(&fs2.read_file(found, usize::MAX).expect("read"), payload);
         }
+    }
+
+    /// A directory used to cap out at twelve 512-byte dirblocks — about 200
+    /// entries — because every growth spent a whole extent slot on a single
+    /// block. Real IRIX directories hold far more, and importing a source
+    /// tree (gcc's `adainclude` has ~1080 files in one directory) died
+    /// partway through with a bogus "disk full".
+    ///
+    /// Growth now takes a contiguous run sized to the directory, so the
+    /// twelve slots reach thousands of entries.
+    #[test]
+    fn a_directory_grows_well_past_twelve_blocks() {
+        use super::super::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+        let img = create_blank_efs(16 * 1024 * 1024, "BIGDIR").expect("format");
+        let mut fs = EfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let root = Filesystem::root(&mut fs).expect("root");
+
+        // Comfortably past the old ~200-entry ceiling.
+        const N: usize = 800;
+        for i in 0..N {
+            let name = format!("file{i:04}.txt");
+            let payload = format!("contents of {i}");
+            let mut cur = Cursor::new(payload.into_bytes());
+            let len = cur.get_ref().len() as u64;
+            fs.create_file(&root, &name, &mut cur, len, &CreateFileOptions::default())
+                .unwrap_or_else(|e| panic!("create_file {name} (entry {i}): {e}"));
+        }
+        EditableFilesystem::sync_metadata(&mut fs).expect("sync");
+
+        // Everything must list back through a fresh open — a dirblock left
+        // without the 0xBEEF magic would truncate the listing here (and stop
+        // IRIX's readdir dead at the same point).
+        let bytes = fs.reader.into_inner();
+        let mut fs2 = EfsFilesystem::open(Cursor::new(bytes), 0).expect("reopen");
+        let root2 = fs2.root().expect("root");
+        let kids = fs2.list_directory(&root2).expect("list");
+        assert_eq!(kids.len(), N, "directory listing came back short");
+
+        // Spot-check content at both ends of the growth curve.
+        for i in [0usize, N / 2, N - 1] {
+            let name = format!("file{i:04}.txt");
+            let e = kids
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("{name} missing"));
+            assert_eq!(
+                fs2.read_file(e, usize::MAX).expect("read"),
+                format!("contents of {i}").into_bytes()
+            );
+        }
+
+        // And the volume is still structurally sound.
+        let report = crate::fs::efs_fsck::fsck_efs(&mut fs2).expect("fsck");
+        assert!(
+            report.errors.is_empty(),
+            "fsck errors after growing a directory: {:?}",
+            report
+                .errors
+                .iter()
+                .map(|e| (&e.code, &e.message))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
