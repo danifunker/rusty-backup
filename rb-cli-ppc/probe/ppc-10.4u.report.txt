@@ -1,0 +1,132 @@
+== 78 structs match the PowerPC ABI exactly
+== 6 structs differ only in field naming (layout agrees)
+== 10 structs MISMATCH
+
+dirent:
+  size/align: rust=1048/8  C=264/4
+  field d_ino                    rust=@0(8)  C=@0(4)
+  field d_reclen                 rust=@16(2)  C=@4(2)
+  field d_namlen                 rust=@18(2)  C=@7(1)
+  field d_type                   rust=@20(1)  C=@6(1)
+  field d_name                   rust=@21(1024)  C=@8(256)
+  field d_seekoff                no such name in C
+
+ipc_perm:
+  size/align: rust=24/4  C=16/4
+  field uid                      rust=@0(4)  C=@4(2)
+  field gid                      rust=@4(4)  C=@6(2)
+  field cuid                     rust=@8(4)  C=@0(2)
+  field cgid                     rust=@12(4)  C=@2(2)
+  field mode                     rust=@16(2)  C=@8(2)
+  field _seq                     no such name in C
+  field _key                     no such name in C
+
+malloc_zone_t:
+  size/align: rust=72/4  C=56/4
+  field __private                no such name in C
+
+passwd:
+  size/align: rust=44/4  C=40/4
+  field pw_fields                no such name in C
+
+rt_metrics:
+  field rmx_filler               rust=@44(12)  C=@40(16)
+  field rmx_state                no such name in C
+
+semid_ds:
+  size/align: rust=64/4  C=56/4
+  field sem_perm                 rust=@0(24)  C=@0(16)
+  field sem_base                 rust=@24(4)  C=@16(4)
+  field sem_nsems                rust=@28(2)  C=@20(2)
+  field sem_otime                rust=@32(4)  C=@24(4)
+  field sem_pad1                 rust=@36(4)  C=@28(4)
+  field sem_ctime                rust=@40(4)  C=@32(4)
+  field sem_pad2                 rust=@44(4)  C=@36(4)
+  field sem_pad3                 rust=@48(16)  C=@40(16)
+
+shmid_ds:
+  size/align: rust=56/4  C=48/4
+  field shm_perm                 rust=@0(24)  C=@0(16)
+  field shm_segsz                rust=@24(4)  C=@16(4)
+  field shm_lpid                 rust=@28(4)  C=@20(4)
+  field shm_cpid                 rust=@32(4)  C=@24(4)
+  field shm_nattch               rust=@36(2)  C=@28(2)
+  field shm_atime                rust=@40(4)  C=@32(4)
+  field shm_dtime                rust=@44(4)  C=@36(4)
+  field shm_ctime                rust=@48(4)  C=@40(4)
+  field shm_internal             rust=@52(4)  C=@44(4)
+
+stat:
+  size/align: rust=108/4  C=96/4
+  field st_mode                  rust=@4(2)  C=@8(2)
+  field st_nlink                 rust=@6(2)  C=@10(2)
+  field st_ino                   rust=@8(8)  C=@4(4)
+  field st_uid                   rust=@16(4)  C=@12(4)
+  field st_gid                   rust=@20(4)  C=@16(4)
+  field st_rdev                  rust=@24(4)  C=@20(4)
+  field st_atime                 rust=@28(4)  C=@24(4)
+  field st_mtime                 rust=@36(4)  C=@32(4)
+  field st_ctime                 rust=@44(4)  C=@40(4)
+  field st_size                  rust=@60(8)  C=@48(8)
+  field st_blocks                rust=@68(8)  C=@56(8)
+  field st_blksize               rust=@76(4)  C=@64(4)
+  field st_flags                 rust=@80(4)  C=@68(4)
+  field st_gen                   rust=@84(4)  C=@72(4)
+  field st_lspare                rust=@88(4)  C=@76(4)
+  field st_qspare                rust=@92(16)  C=@80(16)
+  field st_atime_nsec            no such name in C
+  field st_mtime_nsec            no such name in C
+  field st_ctime_nsec            no such name in C
+  field st_birthtime             no such name in C
+  field st_birthtime_nsec        no such name in C
+
+statfs:
+  size/align: rust=2168/4  C=272/4
+  field f_bsize                  rust=@0(4)  C=@4(4)
+  field f_iosize                 rust=@4(4)  C=@8(4)
+  field f_blocks                 rust=@8(8)  C=@12(4)
+  field f_bfree                  rust=@16(8)  C=@16(4)
+  field f_bavail                 rust=@24(8)  C=@20(4)
+  field f_files                  rust=@32(8)  C=@24(4)
+  field f_ffree                  rust=@40(8)  C=@28(4)
+  field f_fsid                   rust=@48(8)  C=@32(8)
+  field f_owner                  rust=@56(4)  C=@40(4)
+  field f_type                   rust=@60(4)  C=@46(2)
+  field f_flags                  rust=@64(4)  C=@48(4)
+  field f_fstypename             rust=@72(16)  C=@60(15)
+  field f_mntonname              rust=@88(1024)  C=@75(90)
+  field f_mntfromname            rust=@1112(1024)  C=@165(90)
+  field f_fssubtype              no such name in C
+  field f_flags_ext              no such name in C
+  field f_reserved               no such name in C
+
+vm_statistics:
+  size/align: rust=60/4  C=56/4
+  field speculative_count        no such name in C
+
+== name-only differences (sizes, alignments and offsets all agree):
+fsid_t:
+  field __fsid_val               no such name in C
+glob_t:
+  field __unused1                no such name in C
+  field __unused2                no such name in C
+  field __unused3                no such name in C
+  field __unused4                no such name in C
+  field __unused5                no such name in C
+  field __unused6                no such name in C
+  field __unused7                no such name in C
+  field __unused8                no such name in C
+regex_t:
+  field __re_magic               no such name in C
+  field __re_nsub                no such name in C
+  field __re_endp                no such name in C
+  field __re_g                   no such name in C
+sched_param:
+  field __opaque                 no such name in C
+sigevent:
+  field __unused1                no such name in C
+siginfo_t:
+  field _pad                     no such name in C
+
+== 12 structs whose Rust types could not be resolved (unions/fn-ptrs; check by hand):
+   fd_set, in6_pktinfo, ipv6_mreq, processor_cpu_load_info, pthread_cond_t, pthread_condattr_t, pthread_mutex_t, pthread_rwlock_t, pthread_rwlockattr_t, sockaddr_in6, termios, vol_capabilities_attr_t

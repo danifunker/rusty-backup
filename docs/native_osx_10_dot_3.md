@@ -38,16 +38,27 @@ by accident (the `$UNIX2003` / `$INODE64` overrides are gated on
 `target_arch = "x86"`, and 10.4 has none of those symbols). What is wrong is
 struct *layout*: libc's `apple` module describes modern macOS.
 
-**That wrongness is now measured, not guessed.**
+**How wrong is now measured, not guessed.**
 [`scripts/ppc-libc-probe.py`](../scripts/ppc-libc-probe.py) compiles
-`sizeof`/`alignof`/`offsetof` probes on the real G5 against the real
-`MacOSX10.4u.sdk`, and
+`sizeof`/`alignof`/`offsetof` probes on the real G5 against the real SDKs, and
 [`scripts/ppc-libc-compare.py`](../scripts/ppc-libc-compare.py) diffs the result
-against libc's Rust declarations. Ground truth is checked in under
-`rb-cli-ppc/probe/`. Against 10.4: **71 structs match exactly, 23 do not** -
-including `stat` (96 bytes on 10.4 vs libc's 112, with a 4-byte `st_ino` and no
-birthtime), `statfs` (272 vs 2168) and `dirent` (264 vs 1048). Writing the arch
-file is now mechanical.
+against libc's Rust declarations. Ground truth for 10.4u and 10.5 is checked in
+under `rb-cli-ppc/probe/`.
+
+On **10.5, 86 structs match exactly, 6 differ only in field naming, and 8 are
+genuinely wrong** - `statfs`, `passwd`, `ipc_perm`, `semid_ds`, `shmid_ds`,
+`rt_metrics`, `malloc_zone_t`, `vnode_info`. `stat` and `dirent` are *correct*,
+confirmed end to end: a PowerPC binary reports `/etc/hosts` at 236 bytes with the
+right mode/ino/uid/gid/nlink/mtime/blocks/dev and counts `/usr/lib` at 390
+entries, both matching `stat -f` on the machine.
+
+**Tiger is the real gap, and it is a symbol problem before a layout one.** 10.4's
+libSystem exports **zero** `$INODE64` symbols, so a binary linked as today's is
+cannot even launch there - the dynamic linker fails on `_stat$INODE64` before
+`main`. A `powerpc-apple-darwin` arch file has to bind the plain symbols and
+declare 10.4's legacy structs (`stat` 96 bytes with a 4-byte `st_ino`, `statfs`
+272, `dirent` 264 - all measured). `_Unwind_GetIPInfo` is likewise absent from
+`libgcc_s.10.4`.
 
 **One design wart is open.** Darwin/PowerPC's "power" alignment ABI (a struct's
 alignment follows its first member) disagrees with Rust's `repr(C)` rule. mrustc
@@ -59,11 +70,13 @@ program inside `std::rt::init`. The stdlib is currently built with
 disagrees. See "The alignment problem" in the build doc for why the obvious fix
 (restrict the rule to `repr(C)`) does not work.
 
-**Revised direction:** write the `powerpc-apple-darwin` libc arch file from the
-captured probe data (`stat` / `statfs` / `dirent` first), then push the engine
-itself through (`scripts/build-ppc.sh ppc`) - the stdlib was the hard part and it
-is done. The `os/` platform layer stays out and remains hand-C, as section 5
-describes.
+**Revised direction:** push the engine itself through
+(`scripts/build-ppc.sh ppc`) against the working 10.5 stdlib - that is now the
+shortest path to a running `rb-cli`, since the stdlib was the hard part and it is
+done. Tiger support is a separate, well-scoped follow-up: a
+`powerpc-apple-darwin` arch file binding the plain (non-`$INODE64`) symbols with
+10.4's legacy struct layouts, all of which are measured. The `os/` platform layer
+stays out and remains hand-C, as section 5 describes.
 
 > **Sections 3, 5, 9 and 10 predate the working build.** Section 3's "the gap
 > that actually matters: libstd for `powerpc-apple-darwin`" is answered: it

@@ -250,42 +250,69 @@ with 32-bit pointers but 8-byte-aligned `u64`.
 The old plan assumed a `powerpc-apple-darwin` `libc` arch file had to be written
 from scratch. It does not: libc's `unix/bsd/apple/b32` module is arch-agnostic,
 and libc **compiles for this target unchanged**. `target_arch = "powerpc"` also
-happens to pick the right symbol variants, because the `$UNIX2003` / `$INODE64`
-`link_name` overrides are gated on `target_arch = "x86"` and so do not apply -
-and 10.4 has none of those symbols.
+happens to dodge the `$UNIX2003` `link_name` overrides, which are gated on
+`target_arch = "x86"`.
 
-What is *not* right is several struct definitions, which describe modern macOS.
-This is the dangerous class: it compiles cleanly and is wrong at runtime, because
-mrustc's asserts only check mrustc's layout against gcc's layout of *mrustc's own
-declaration* - not against the SDK's real struct.
+What still needs checking is struct *layout*, and that is the dangerous class:
+it compiles cleanly and is wrong at runtime. mrustc's `sizeof_assert` /
+`alignof_assert` typedefs only compare mrustc's layout against gcc's layout of
+*mrustc's own declaration* - never against the SDK's real struct.
 
-`scripts/ppc-libc-probe.py` captures ground truth by compiling `sizeof` /
-`alignof` / `offsetof` probes on the real machine against a real SDK;
+So measure it. `scripts/ppc-libc-probe.py` compiles `sizeof` / `alignof` /
+`offsetof` probes on the real machine against a real SDK;
 `scripts/ppc-libc-compare.py` diffs that against what libc's Rust declarations
-would lay out. Results are checked in under `rb-cli-ppc/probe/`. Against the
-10.4u SDK: **71 structs match exactly, 23 do not.** The important ones:
+lay out, modelling the same power-alignment rule mrustc uses. Results are checked
+in under `rb-cli-ppc/probe/` (`.tsv` = raw measurements, `.report.txt` = the
+diff).
 
-| struct | libc says | 10.4 really is |
-|---|---|---|
-| `stat` | 112 bytes, `st_ino: u64`, `st_*time_nsec`, `st_birthtime` | **96 bytes**, `st_ino` 4 bytes at offset 4, no nsec, no birthtime |
-| `statfs` | 2168 bytes, 8-byte counters, 1024-char paths | **272 bytes**, 4-byte counters, 90-char paths |
-| `dirent` | 1048 bytes, `d_ino: u64`, `d_seekoff` | **264 bytes**, `d_ino` 4 bytes, no `d_seekoff`, `d_name[256]` |
-| `rusage`, `ipc_perm`, `passwd`, `group`, `sigevent`, `siginfo_t`, ... | modern layout | see `rb-cli-ppc/probe/ppc-10.4u.report.txt` |
+Two configuration details matter, and getting either wrong produces a page of
+false findings:
 
-So `fs::metadata`, `read_dir` and anything statfs-shaped will return garbage
-until an arch file lands. That arch file is now a *mechanical* job with the
-ground truth in hand, which is the point of the probes.
+- **Probe with `-D_DARWIN_USE_64_BIT_INODE`** (the script's default). libc binds
+  `stat$INODE64`, `fstat$INODE64`, `opendir$INODE64`, `readdir$INODE64` (see
+  libc's `src/unix/mod.rs`), so the 64-bit-inode layout is the one its struct
+  definitions must match. Probing without it measures the legacy struct and
+  reports `stat`, `statfs` and `dirent` as broken when they are not.
+- **Model the power-alignment rule on the Rust side too**, as the compare script
+  does - otherwise every struct with a non-leading 8-byte field looks wrong.
 
-Two further findings from the same probes, both worth knowing:
+### Result
 
-- Tiger has no `<spawn.h>`, `<copyfile.h>` or `<libproc.h>` (all 10.5).
-- 10.4's libSystem has **no** `$INODE64` symbols and no `daemon$1050`; its
-  `$UNIX2003` set is 62 symbols vs Leopard's 173. `ppc` and `i386` are identical
-  in this respect on both SDKs, so nothing here is PowerPC-specific.
+| | exact | name-only | real mismatch |
+|---|---|---|---|
+| **10.5** | 86 | 6 | 8 |
+| **10.4u** | 78 | 6 | 10 |
 
-Note the probe runner can only exercise arches the machine can execute, so `i386`
+"Name-only" means sizes, alignments and every offset agree and libc merely calls
+a field something the header does not (`st_atime_nsec` for `st_atimespec.tv_nsec`).
+
+On **10.5 `stat` and `dirent` are correct**, and this is confirmed end-to-end -
+a PowerPC binary reports `/etc/hosts` as 236 bytes with the right mode, ino, uid,
+gid, nlink, mtime, blocks and dev, and counts `/usr/lib` at 390 entries, both
+matching `stat -f` on the machine. The eight real 10.5 mismatches are `statfs`,
+`passwd`, `ipc_perm`, `semid_ds`, `shmid_ds`, `rt_metrics`, `malloc_zone_t`,
+`vnode_info` - SysV IPC, routing and malloc-zone internals, none of which the
+engine's file paths touch. `passwd` is the one worth fixing early (`home_dir`).
+
+**10.4 is a different story, and the blocker there is not layout.** Tiger's
+libSystem exports **zero** `$INODE64` symbols, so a binary linked the way this
+one is cannot even launch on 10.4 - the dynamic linker fails on `_stat$INODE64`
+before `main`. Fixing that means a genuine PowerPC/10.4 arch file that binds the
+plain symbols *and* declares the legacy structs: `stat` is 96 bytes there with a
+4-byte `st_ino` at offset 4 and no birthtime (vs 108), `statfs` 272 (vs 2168) and
+`dirent` 264 (vs 1048). All three are measured and checked in.
+
+Other 10.4-only findings from the same probes:
+
+- No `<spawn.h>`, `<copyfile.h>` or `<libproc.h>` - all 10.5 additions.
+- No `daemon$1050`, which libc's `cfg_attr(not(target_arch = "aarch64"))` would
+  otherwise bind.
+- 62 `$UNIX2003` symbols vs Leopard's 173. `ppc` and `i386` are identical here on
+  both SDKs, so none of this is PowerPC-specific.
+
+The probe runner can only exercise arches the machine can execute, so `i386`
 probes cannot be captured on a PowerPC Mac; the useful axis is 10.4u vs 10.5,
-both of which are checked in.
+and both are checked in.
 
 ## Where this stands
 
@@ -297,23 +324,27 @@ Done:
    turbofish patch on the vendored source; the general mrustc fix (inferring
    const-generic impl params from the result type) is deep and unfinished.
 4. ~~libcore won't build for `powerpc-apple-darwin`~~ - fixed (fixes 3-4).
-5. ~~no `powerpc-apple-darwin` libc~~ - it turned out libc *compiles* for this
-   target unchanged; the work is correcting struct layouts, and the ground truth
-   is captured. See "The libc situation".
+5. ~~no `powerpc-apple-darwin` libc~~ - libc *compiles* for this target
+   unchanged, and on 10.5 its `stat`/`dirent` are correct (verified end to end).
+   See "The libc situation".
 6. ~~libstd won't build~~ - fixed (fixes 5-8).
 7. ~~nothing links~~ - fixed (the wrapper's link line + `ppc-compat.c`).
 
 Open, in rough priority order:
 
-1. **A `powerpc-apple-darwin` libc arch file.** Mechanical now: 23 structs, with
-   measured offsets in `rb-cli-ppc/probe/`. `stat` / `statfs` / `dirent` first -
-   they gate `fs::metadata` and `read_dir`.
+1. **Tiger (10.4) support** is the big one, and it is a *symbol* problem before
+   it is a layout problem: 10.4 has no `$INODE64` symbols, so today's binaries
+   cannot launch there. That needs a `powerpc-apple-darwin` arch file binding the
+   plain symbols and declaring 10.4's legacy `stat` / `statfs` / `dirent`, all of
+   which are measured in `rb-cli-ppc/probe/`. `_Unwind_GetIPInfo` is also absent
+   from `libgcc_s.10.4`, so 10.4 needs gcc10's unwinder or `panic=abort`.
+   Everything so far is built and run on 10.5.
 2. **The alignment workaround.** `MINICARGO_NO_DEBUG_ASSERTIONS=1` is a
    workaround; see "The alignment problem" for what a real fix costs.
-3. **Tiger (10.4) vs Leopard (10.5).** Everything so far is built and run on
-   10.5. `_Unwind_GetIPInfo` is absent from `libgcc_s.10.4`, so a 10.4 binary
-   needs gcc10's own unwinder or `panic=abort`. The 10.4 struct layouts are
-   already measured.
+3. **Eight libc structs are wrong even on 10.5** - `statfs`, `passwd`,
+   `ipc_perm`, `semid_ds`, `shmid_ds`, `rt_metrics`, `malloc_zone_t`,
+   `vnode_info`. None are on the engine's file paths; `passwd` (`home_dir`) is
+   the one worth doing first.
 4. **The engine itself** (`scripts/build-ppc.sh ppc`) - the stdlib is the hard
    part and it is done, but the 244-crate graph has its own long tail (see the
    deviations above).

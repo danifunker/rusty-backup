@@ -1,0 +1,86 @@
+== 86 structs match the PowerPC ABI exactly
+== 6 structs differ only in field naming (layout agrees)
+== 8 structs MISMATCH
+
+ipc_perm:
+  size/align: rust=24/4  C=16/4
+  field uid                      rust=@0(4)  C=@4(2)
+  field gid                      rust=@4(4)  C=@6(2)
+  field cuid                     rust=@8(4)  C=@0(2)
+  field cgid                     rust=@12(4)  C=@2(2)
+  field mode                     rust=@16(2)  C=@8(2)
+  field _seq                     no such name in C
+  field _key                     no such name in C
+
+malloc_zone_t:
+  size/align: rust=72/4  C=56/4
+  field __private                no such name in C
+
+passwd:
+  size/align: rust=44/4  C=40/4
+  field pw_fields                no such name in C
+
+rt_metrics:
+  field rmx_filler               rust=@44(12)  C=@40(16)
+  field rmx_state                no such name in C
+
+semid_ds:
+  size/align: rust=64/4  C=56/4
+  field sem_perm                 rust=@0(24)  C=@0(16)
+  field sem_base                 rust=@24(4)  C=@16(4)
+  field sem_nsems                rust=@28(2)  C=@20(2)
+  field sem_otime                rust=@32(4)  C=@24(4)
+  field sem_pad1                 rust=@36(4)  C=@28(4)
+  field sem_ctime                rust=@40(4)  C=@32(4)
+  field sem_pad2                 rust=@44(4)  C=@36(4)
+  field sem_pad3                 rust=@48(16)  C=@40(16)
+
+shmid_ds:
+  size/align: rust=56/4  C=48/4
+  field shm_perm                 rust=@0(24)  C=@0(16)
+  field shm_segsz                rust=@24(4)  C=@16(4)
+  field shm_lpid                 rust=@28(4)  C=@20(4)
+  field shm_cpid                 rust=@32(4)  C=@24(4)
+  field shm_nattch               rust=@36(2)  C=@28(2)
+  field shm_atime                rust=@40(4)  C=@32(4)
+  field shm_dtime                rust=@44(4)  C=@36(4)
+  field shm_ctime                rust=@48(4)  C=@40(4)
+  field shm_internal             rust=@52(4)  C=@44(4)
+
+statfs:
+  field f_reserved               rust=@2140(28)  C=@2136(32)
+  field f_flags_ext              no such name in C
+
+vnode_info:
+  field vi_pad                   rust=@140(4)  C=@148(4)
+  field vi_fsid                  rust=@144(8)  C=@140(8)
+
+== name-only differences (sizes, alignments and offsets all agree):
+fsid_t:
+  field __fsid_val               no such name in C
+glob_t:
+  field __unused1                no such name in C
+  field __unused2                no such name in C
+  field __unused3                no such name in C
+  field __unused4                no such name in C
+  field __unused5                no such name in C
+  field __unused6                no such name in C
+  field __unused7                no such name in C
+  field __unused8                no such name in C
+regex_t:
+  field __re_magic               no such name in C
+  field __re_nsub                no such name in C
+  field __re_endp                no such name in C
+  field __re_g                   no such name in C
+sigevent:
+  field __unused1                no such name in C
+siginfo_t:
+  field _pad                     no such name in C
+stat:
+  field st_atime_nsec            no such name in C
+  field st_mtime_nsec            no such name in C
+  field st_ctime_nsec            no such name in C
+  field st_birthtime_nsec        no such name in C
+
+== 17 structs whose Rust types could not be resolved (unions/fn-ptrs; check by hand):
+   fd_set, in6_pktinfo, ipv6_mreq, proc_bsdinfo, proc_taskallinfo, proc_threadinfo, proc_vnodepathinfo, processor_cpu_load_info, pthread_cond_t, pthread_condattr_t, pthread_mutex_t, pthread_rwlock_t, pthread_rwlockattr_t, sockaddr_in6, termios, vnode_info_path, vol_capabilities_attr_t

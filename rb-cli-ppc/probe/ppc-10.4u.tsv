@@ -1,4 +1,4 @@
-# arch=ppc sdk=/Developer/SDKs/MacOSX10.4u.sdk cc=/usr/bin/gcc-4.0
+# arch=ppc sdk=/Developer/SDKs/MacOSX10.4u.sdk cc=/usr/bin/gcc-4.0 inode64=True
 S	group	struct group	16	4
 F	group	gr_name	0	4
 F	group	gr_passwd	4	4
@@ -12,7 +12,6 @@ F	timeval	tv_sec	0	4
 F	timeval	tv_usec	4	4
 S	timespec	struct timespec	8	4
 F	timespec	tv_sec	0	4
-F	timespec	tv_nsec	4	4
 F	timespec	tv_nsec	4	4
 S	rlimit	struct rlimit	16	8
 F	rlimit	rlim_cur	0	8
@@ -36,7 +35,6 @@ F	rusage	ru_nvcsw	64	4
 F	rusage	ru_nivcsw	68	4
 S	ipv6_mreq	struct ipv6_mreq	20	4
 F	ipv6_mreq	ipv6mr_multiaddr	0	16
-F	ipv6_mreq	ipv6mr_interface	16	4
 F	ipv6_mreq	ipv6mr_interface	16	4
 S	hostent	struct hostent	20	4
 F	hostent	h_name	0	4
@@ -143,14 +141,9 @@ F	sockaddr_un	sun_family	1	1
 F	sockaddr_un	sun_path	2	104
 S	utsname	struct utsname	1280	1
 F	utsname	sysname	0	256
-F	utsname	sysname	0	256
-F	utsname	nodename	256	256
 F	utsname	nodename	256	256
 F	utsname	release	512	256
-F	utsname	release	512	256
 F	utsname	version	768	256
-F	utsname	version	768	256
-F	utsname	machine	1024	256
 F	utsname	machine	1024	256
 S	ip_mreq	struct ip_mreq	8	4
 F	ip_mreq	imr_multiaddr	0	4
@@ -648,7 +641,6 @@ F	if_data64	ifi_iqdrops	96	8
 F	if_data64	ifi_noproto	104	8
 F	if_data64	ifi_recvtiming	112	4
 F	if_data64	ifi_xmittiming	116	4
-F	if_data64	ifi_lastchange	120	8
 F	if_data64	ifi_lastchange	120	8
 S	if_msghdr2	struct if_msghdr2	160	4
 F	if_msghdr2	ifm_msglen	0	2

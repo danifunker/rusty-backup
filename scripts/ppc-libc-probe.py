@@ -422,6 +422,15 @@ def main():
     ap.add_argument("--sdk", default="/Developer/SDKs/MacOSX10.4u.sdk")
     ap.add_argument("--arch", default="ppc")
     ap.add_argument("--cc", default="/usr/bin/gcc-4.0", help="probes need no C11")
+    ap.add_argument(
+        "--legacy-inode",
+        action="store_true",
+        help="probe the pre-$INODE64 struct layouts instead. Off by default: "
+        "libc binds stat$INODE64 / readdir$INODE64 / opendir$INODE64 (see "
+        "libc's src/unix/mod.rs), so the 64-bit-inode layout is the one its "
+        "struct definitions have to match. 10.4's headers predate the macro "
+        "and ignore it, which is exactly the mismatch worth seeing.",
+    )
     ap.add_argument("--out", required=True)
     ap.add_argument("--remote-dir", default="/tmp/libc-probe")
     ap.add_argument("--max-rounds", type=int, default=25)
@@ -442,13 +451,15 @@ def main():
     remote(args.host, "mkdir -p %s" % shlex.quote(args.remote_dir))
 
     # No -fmax-errors: it postdates gcc-4.0, and gcc reports every error anyway.
+    inode = "" if args.legacy_inode else "-D_DARWIN_USE_64_BIT_INODE "
     compile_cmd = (
-        "%s -arch %s -isysroot %s -mmacosx-version-min=10.4 "
+        "%s -arch %s -isysroot %s -mmacosx-version-min=10.4 %s"
         "-Wno-deprecated-declarations -o %s %s"
         % (
             shlex.quote(args.cc),
             shlex.quote(args.arch),
             shlex.quote(args.sdk),
+            inode,
             shlex.quote(remote_bin),
             shlex.quote(remote_c),
         )
@@ -498,7 +509,8 @@ def main():
         sys.exit("probe binary failed: %s" % r.stderr)
 
     with open(args.out, "w") as fh:
-        fh.write("# arch=%s sdk=%s cc=%s\n" % (args.arch, args.sdk, args.cc))
+        fh.write("# arch=%s sdk=%s cc=%s inode64=%s\n"
+                 % (args.arch, args.sdk, args.cc, not args.legacy_inode))
         fh.write(r.stdout)
     sys.stderr.write("wrote %s (%d lines)\n" % (args.out, r.stdout.count("\n")))
 

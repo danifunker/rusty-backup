@@ -1,4 +1,4 @@
-# arch=ppc sdk=/Developer/SDKs/MacOSX10.5.sdk cc=/usr/bin/gcc-4.0
+# arch=ppc sdk=/Developer/SDKs/MacOSX10.5.sdk cc=/usr/bin/gcc-4.0 inode64=True
 S	group	struct group	16	4
 F	group	gr_name	0	4
 F	group	gr_passwd	4	4
@@ -12,7 +12,6 @@ F	timeval	tv_sec	0	4
 F	timeval	tv_usec	4	4
 S	timespec	struct timespec	8	4
 F	timespec	tv_sec	0	4
-F	timespec	tv_nsec	4	4
 F	timespec	tv_nsec	4	4
 S	rlimit	struct rlimit	16	8
 F	rlimit	rlim_cur	0	8
@@ -36,7 +35,6 @@ F	rusage	ru_nvcsw	64	4
 F	rusage	ru_nivcsw	68	4
 S	ipv6_mreq	struct ipv6_mreq	20	4
 F	ipv6_mreq	ipv6mr_multiaddr	0	16
-F	ipv6_mreq	ipv6mr_interface	16	4
 F	ipv6_mreq	ipv6mr_interface	16	4
 S	hostent	struct hostent	20	4
 F	hostent	h_name	0	4
@@ -143,14 +141,9 @@ F	sockaddr_un	sun_family	1	1
 F	sockaddr_un	sun_path	2	104
 S	utsname	struct utsname	1280	1
 F	utsname	sysname	0	256
-F	utsname	sysname	0	256
-F	utsname	nodename	256	256
 F	utsname	nodename	256	256
 F	utsname	release	512	256
-F	utsname	release	512	256
 F	utsname	version	768	256
-F	utsname	version	768	256
-F	utsname	machine	1024	256
 F	utsname	machine	1024	256
 S	ip_mreq	struct ip_mreq	8	4
 F	ip_mreq	imr_multiaddr	0	4
@@ -180,24 +173,25 @@ S	mach_timebase_info	struct mach_timebase_info	8	4
 F	mach_timebase_info	numer	0	4
 F	mach_timebase_info	denom	4	4
 S	mach_timebase_info	mach_timebase_info	1	4
-S	stat	struct stat	96	4
+S	stat	struct stat	108	4
 F	stat	st_dev	0	4
-F	stat	st_mode	8	2
-F	stat	st_nlink	10	2
-F	stat	st_ino	4	4
-F	stat	st_uid	12	4
-F	stat	st_gid	16	4
-F	stat	st_rdev	20	4
-F	stat	st_atime	24	4
-F	stat	st_mtime	32	4
-F	stat	st_ctime	40	4
-F	stat	st_size	48	8
-F	stat	st_blocks	56	8
-F	stat	st_blksize	64	4
-F	stat	st_flags	68	4
-F	stat	st_gen	72	4
-F	stat	st_lspare	76	4
-F	stat	st_qspare	80	16
+F	stat	st_mode	4	2
+F	stat	st_nlink	6	2
+F	stat	st_ino	8	8
+F	stat	st_uid	16	4
+F	stat	st_gid	20	4
+F	stat	st_rdev	24	4
+F	stat	st_atime	28	4
+F	stat	st_mtime	36	4
+F	stat	st_ctime	44	4
+F	stat	st_birthtime	52	4
+F	stat	st_size	60	8
+F	stat	st_blocks	68	8
+F	stat	st_blksize	76	4
+F	stat	st_flags	80	4
+F	stat	st_gen	84	4
+F	stat	st_lspare	88	4
+F	stat	st_qspare	92	16
 S	stat	stat	1	4
 S	pthread_mutexattr_t	pthread_mutexattr_t	12	4
 F	pthread_mutexattr_t	__sig	0	4
@@ -656,28 +650,31 @@ F	proc_threadinfo	pth_curpri	36	4
 F	proc_threadinfo	pth_priority	40	4
 F	proc_threadinfo	pth_maxpriority	44	4
 F	proc_threadinfo	pth_name	48	256
-S	statfs	struct statfs	272	4
-F	statfs	f_bsize	4	4
-F	statfs	f_iosize	8	4
-F	statfs	f_blocks	12	4
-F	statfs	f_bfree	16	4
-F	statfs	f_bavail	20	4
-F	statfs	f_files	24	4
-F	statfs	f_ffree	28	4
-F	statfs	f_fsid	32	8
-F	statfs	f_owner	40	4
-F	statfs	f_type	46	2
-F	statfs	f_flags	48	4
-F	statfs	f_fstypename	60	15
-F	statfs	f_mntonname	75	90
-F	statfs	f_mntfromname	165	90
+S	statfs	struct statfs	2168	4
+F	statfs	f_bsize	0	4
+F	statfs	f_iosize	4	4
+F	statfs	f_blocks	8	8
+F	statfs	f_bfree	16	8
+F	statfs	f_bavail	24	8
+F	statfs	f_files	32	8
+F	statfs	f_ffree	40	8
+F	statfs	f_fsid	48	8
+F	statfs	f_owner	56	4
+F	statfs	f_type	60	4
+F	statfs	f_flags	64	4
+F	statfs	f_fssubtype	68	4
+F	statfs	f_fstypename	72	16
+F	statfs	f_mntonname	88	1024
+F	statfs	f_mntfromname	1112	1024
+F	statfs	f_reserved	2136	32
 S	statfs	statfs	1	4
-S	dirent	struct dirent	264	4
-F	dirent	d_ino	0	4
-F	dirent	d_reclen	4	2
-F	dirent	d_namlen	7	1
-F	dirent	d_type	6	1
-F	dirent	d_name	8	256
+S	dirent	struct dirent	1048	8
+F	dirent	d_ino	0	8
+F	dirent	d_seekoff	8	8
+F	dirent	d_reclen	16	2
+F	dirent	d_namlen	18	2
+F	dirent	d_type	20	1
+F	dirent	d_name	21	1024
 S	pthread_rwlock_t	pthread_rwlock_t	128	4
 F	pthread_rwlock_t	__sig	0	4
 F	pthread_rwlock_t	__opaque	4	124
@@ -751,7 +748,6 @@ F	if_data64	ifi_iqdrops	96	8
 F	if_data64	ifi_noproto	104	8
 F	if_data64	ifi_recvtiming	112	4
 F	if_data64	ifi_xmittiming	116	4
-F	if_data64	ifi_lastchange	120	8
 F	if_data64	ifi_lastchange	120	8
 S	if_msghdr2	struct if_msghdr2	160	4
 F	if_msghdr2	ifm_msglen	0	2

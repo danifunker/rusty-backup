@@ -6,18 +6,21 @@ reports, per struct, every place the Rust definition would lay memory out
 differently from the C ABI the machine actually uses. That list is the worklist
 for a `powerpc-apple-darwin` arch file.
 
-Two distinct classes of mismatch show up here, and they need different fixes:
+Two things have to be modelled correctly or this reports mostly noise, and both
+are handled here:
 
-  * **Wrong field list.** libc's `apple` module describes modern macOS. Against
-    the 10.4 SDK, `struct stat` is the pre-`$INODE64` one (32-bit `ino_t`, no
-    `st_birthtime`), so the Rust definition is simply a different struct. The
-    fix is a PowerPC/10.4 definition.
+  * **The "power" alignment ABI.** Darwin/PowerPC gives a struct the alignment of
+    its *first* member, so an 8-byte member that is not first is only 4-aligned.
+    mrustc models this (`make_type_repr_struct__inner` in src/trans/target.cpp)
+    and must, since it delegates layout to the C compiler - so `struct_layout`
+    here mirrors it. Using plain max-member `repr(C)` alignment instead flags
+    every struct with a non-leading 8-byte field, `stat` and `statfs` included,
+    as broken when they are fine.
 
-  * **Right fields, wrong offsets.** Darwin/PowerPC uses the "power" alignment
-    ABI: a struct's alignment follows its *first* member, so an 8-byte member
-    that is not first is only 4-aligned. Rust's `repr(C)` uses the max-member
-    rule, so any struct with a non-leading `i64`/`u64`/`f64` can disagree. The
-    fix is explicit padding, or a `#[repr(packed)]`-plus-padding rewrite.
+  * **Naming vs layout.** libc invents names the headers do not have - it
+    flattens `st_atimespec` into `st_atime` + `st_atime_nsec`, and splits
+    reserved tails its own way. Those are reported separately from real
+    size/offset disagreements.
 
 Usage:
     scripts/ppc-libc-compare.py --libc <vendored libc> --probe rb-cli-ppc/probe/ppc-10.4u.tsv
@@ -104,18 +107,31 @@ class Layout:
         return None
 
     def struct_layout(self, name, depth=0):
-        """repr(C): field order preserved, each at its own alignment, size rounded up."""
+        """Lay out a `repr(C)` struct the way mrustc does for this target.
+
+        Field order is preserved, and the Darwin/PowerPC "power" alignment rule
+        applies: the first member keeps its natural alignment, later members with
+        natural alignment between 4 and 8 are capped to 4. This mirrors
+        `make_type_repr_struct__inner` in mrustc's src/trans/target.cpp - modelling
+        plain max-member alignment here instead reports `stat`, `statfs` and every
+        other struct with a non-leading 8-byte field as broken when it is fine.
+        """
         if name in self.cache:
             return self.cache[name]
         if depth > 16 or name not in self.structs:
             return None
         offset, align, out = 0, 1, []
+        is_first = True
         for fname, ftype in self.structs[name]:
             sa = self.size_align(ftype, depth + 1)
             if sa is None:
                 self.cache[name] = None
                 return None
             fsize, falign = sa
+            if fsize > 0:
+                if not is_first and 4 <= falign <= 8:
+                    falign = 4
+                is_first = False
             offset = (offset + falign - 1) // falign * falign
             out.append((fname, offset, fsize))
             offset += fsize
@@ -184,7 +200,7 @@ def main():
     lay = Layout(types, structs)
     c_sizes, c_fields = load_probe(args.probe)
 
-    absent, unresolved, mismatched, ok = [], [], [], []
+    absent, unresolved, mismatched, name_only, ok = [], [], [], [], []
 
     for name, fields, _rel in structs:
         if name not in c_sizes:
@@ -196,7 +212,7 @@ def main():
             continue
         rsize, ralign, roff = rust
         csize, calign = c_sizes[name]
-        problems = []
+        problems, naming = [], []
         if (rsize, ralign) != (csize, calign):
             problems.append(
                 "  size/align: rust=%d/%d  C=%d/%d" % (rsize, ralign, csize, calign)
@@ -204,7 +220,11 @@ def main():
         for fname, off, fsize in roff:
             key = (name, fname)
             if key not in c_fields:
-                problems.append("  field %-24s absent in C" % fname)
+                # A name libc invents rather than a layout error: it flattens
+                # `st_atimespec` into `st_atime` + `st_atime_nsec`, and splits
+                # reserved tails its own way. Only a size/align or offset
+                # disagreement is evidence of a real layout problem.
+                naming.append("  field %-24s no such name in C" % fname)
                 continue
             coff, csz = c_fields[key]
             if off != coff or fsize != csz:
@@ -212,16 +232,27 @@ def main():
                     "  field %-24s rust=@%d(%d)  C=@%d(%d)" % (fname, off, fsize, coff, csz)
                 )
         if problems:
-            mismatched.append((name, problems))
+            mismatched.append((name, problems + naming))
+        elif naming:
+            name_only.append((name, naming))
         else:
             ok.append(name)
 
     print("== %d structs match the PowerPC ABI exactly" % len(ok))
+    print("== %d structs differ only in field naming (layout agrees)" % len(name_only))
     print("== %d structs MISMATCH\n" % len(mismatched))
     for name, problems in sorted(mismatched):
         print("%s:" % name)
         for p in problems:
             print(p)
+        print()
+
+    if name_only:
+        print("== name-only differences (sizes, alignments and offsets all agree):")
+        for nm, probs in sorted(name_only):
+            print("%s:" % nm)
+            for pr in probs:
+                print(pr)
         print()
 
     if unresolved:
