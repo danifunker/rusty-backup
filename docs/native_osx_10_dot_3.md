@@ -73,17 +73,21 @@ program inside `std::rt::init`. The stdlib is currently built with
 disagrees. See "The alignment problem" in the build doc for why the obvious fix
 (restrict the rule to `repr(C)`) does not work.
 
-**The engine build now runs, and stops where this plan predicted.**
-`scripts/build-ppc.sh ppc` resolves all 434 crates and compiles **93** of them to
-PowerPC objects before hitting exactly two things, both of which need *engine*
-changes rather than mrustc ones:
+**The engine build now runs, and stops where this plan predicted.** It hit exactly
+the two things this plan named, both needing *engine* changes rather than mrustc
+ones. One is done:
 
 - ~~`libyml` - the known `TOK_RWORD_AS` macro-expansion gap~~ **done**: YAML output
-  now sits behind a default-on `yaml` feature that this build leaves off, so
-  `serde_yml`/`libyml` leave the dependency graph.
+  sits behind a default-on `yaml` feature that this build leaves off, so
+  `serde_yml`/`libyml` leave the dependency graph. Verified: `libyml` no longer
+  appears in the build at all and the graph shrank from 434 crates to 428.
 - `libc` 0.2.189 **built for the host** - `new::linux::can::j1939`. Linux-only
-  code, in the graph only because `os/` depends on `libc`/`nix`. Still open; this
-  is the `os/` half of the platform-split scope-down described below.
+  code, in the graph only because `os/` depends on `libc`/`nix`. **Still open**,
+  and now the single remaining known blocker; it is the `os/` half of the
+  platform-split scope-down described below.
+
+`scripts/build-ppc.sh ppc` currently compiles **92 of 428** crates to PowerPC
+objects before that stop.
 
 **Revised direction:** finish the engine transpile behind that scope-down
 (section 8, phase 2), then link and smoke-test `rb-cli` on 10.5. Tiger is a
@@ -337,7 +341,7 @@ that exercises `println!`, `BTreeMap`, iterators, `AtomicU64`, threads,
 `fs::metadata` and `read_dir`, with the filesystem results checked field-by-field
 against `stat -f` on the machine. Cost: eight fixes (see "Where this stands").
 
-**Phase 2 - finish the engine transpile.** *(next)* Currently 93 of 434 crates.
+**Phase 2 - finish the engine transpile.** *(next)* Currently 92 of 428 crates.
 YAML is done (section 6); the remaining gate is excluding `os/`, so
 `libc`/`nix`/`objc2-*` leave the graph. Then re-run `scripts/build-ppc.sh ppc`. Expect a further tail of per-crate mrustc gaps; the
 ones already met were each a small, local workaround. Deliverable: every crate in

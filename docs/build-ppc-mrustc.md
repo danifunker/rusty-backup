@@ -169,7 +169,7 @@ Stages, in order:
 | `hostc`    | emit the engine's C on this machine (deferred codegen) | ok |
 | `host`     | transpile+build a native `rb-cli` | to validate |
 | `ppclibs`  | **PowerPC libcore/alloc/std/panic_unwind/test/libc** | **ok** |
-| `ppc`      | PowerPC `rb-cli` | 93 of 434 crates; see below |
+| `ppc`      | PowerPC `rb-cli` | 92 of 428 crates; one blocker left, see below |
 | `probe`    | capture libc ground truth from the 10.4u / 10.5 SDKs | ok |
 
 Building the PowerPC stdlib by hand, if you want to skip the driver:
@@ -348,17 +348,18 @@ Open, in rough priority order:
    `ipc_perm`, `semid_ds`, `shmid_ds`, `rt_metrics`, `malloc_zone_t`,
    `vnode_info`. None are on the engine's file paths; `passwd` (`home_dir`) is
    the one worth doing first.
-4. **The engine itself** (`scripts/build-ppc.sh ppc`). It now resolves all 434
-   crates and gets **93** of them transpiled and compiled to PowerPC objects
-   before stopping on exactly the two items this plan already predicted, both of
-   which need engine-side changes rather than mrustc ones:
+4. **The engine itself** (`scripts/build-ppc.sh ppc`). It resolves 428 crates and
+   gets **92** of them transpiled and compiled to PowerPC objects before stopping
+   on one remaining blocker:
 
-   - ~~`libyml` - `scanner.rs:1937: Unused tokens at the end of macro expansion -
-     TOK_RWORD_AS`~~ **fixed**: the engine now gates YAML behind a default-on
-     `yaml` feature, which this build leaves off.
    - `libc` 0.2.189 **for the host** - `src/new/mod.rs:182: Cannot find component
      1 of crate::new::linux::can::j1939`. Linux-only code, pulled in only because
      the `os/` platform layer depends on `libc`/`nix`. This is the host-proxy
      artifact the platform split exists to remove: excluding `os/` drops both
      from the graph, and `os/` is hand-C on PowerPC anyway.
+
+   The other blocker, ~~`libyml`'s `TOK_RWORD_AS` macro-expansion gap~~, is
+   **fixed**: YAML now sits behind a default-on `yaml` feature that this build
+   leaves off. Verified - `libyml` no longer appears anywhere in the build, and
+   the graph shrank from 434 crates to 428.
 5. **C++ deps stay off forever** (`chd` = libchdman). Already excluded.
