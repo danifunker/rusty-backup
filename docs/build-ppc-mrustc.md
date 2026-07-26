@@ -204,8 +204,11 @@ around a specific mrustc gap (all documented at their site):
   in all 5 width files (mrustc can't infer the const-generic impl params).
 - **env_logger** `0.11` -> `=0.10.2` — drops `jiff` (0.11's timestamp backend;
   const-generic gap). Same logging via humantime.
-- **YAML** (`serde_yml` -> `libyml`) — an mrustc macro-expansion gap
-  (`TOK_RWORD_AS`); to be dropped via an engine feature-gate.
+- **YAML** (`serde_yml` -> `libyml`) - an mrustc macro-expansion gap
+  (`TOK_RWORD_AS` at `scanner.rs:1937`). **Done:** the engine gates YAML output
+  behind a `yaml` feature, on by default everywhere else, and this build leaves it
+  off. `serde_yml`/`libyml` leave the dependency graph entirely, `--format yaml`
+  is hidden from `--help` and rejected, and JSON carries the identical schema.
 
 ## The alignment problem (the one real design wart)
 
@@ -350,9 +353,9 @@ Open, in rough priority order:
    before stopping on exactly the two items this plan already predicted, both of
    which need engine-side changes rather than mrustc ones:
 
-   - `libyml` - `scanner.rs:1937: Unused tokens at the end of macro expansion -
-     TOK_RWORD_AS`. The known mrustc macro-expansion gap; the fix is to
-     feature-gate YAML output out of the engine.
+   - ~~`libyml` - `scanner.rs:1937: Unused tokens at the end of macro expansion -
+     TOK_RWORD_AS`~~ **fixed**: the engine now gates YAML behind a default-on
+     `yaml` feature, which this build leaves off.
    - `libc` 0.2.189 **for the host** - `src/new/mod.rs:182: Cannot find component
      1 of crate::new::linux::can::j1939`. Linux-only code, pulled in only because
      the `os/` platform layer depends on `libc`/`nix`. This is the host-proxy

@@ -19,6 +19,15 @@ Usage: rb-cli [OPTIONS] [COMMAND]
 - `--log-file` — Mirror full trace-level log output to PATH regardless of `--log-level`. Useful on Windows cmd where redirection is awkward
 - `--config` — Path to a config file. Overrides the platform default location. See `rb-cli config path` for what that location is
 
+**A note on `--format yaml`.** The read-only verbs below list `yaml` alongside
+`json` wherever structured output is supported. YAML sits behind the `yaml` build
+feature, which is **on by default** - every released desktop and vintage build has
+it. It is off in exactly one configuration, the PowerPC/mrustc build
+(`rb-cli-ppc`, see [build-ppc-mrustc.md](build-ppc-mrustc.md)), because
+`serde_yml`'s backend cannot be transpiled. Where it is off, `yaml` is absent from
+`--format`'s accepted values and from `--help`; JSON carries the identical schema,
+so a script that must run anywhere should prefer `--format json`.
+
 ## Path grammar (in-image paths)
 
 Verbs that take a path *inside* an image (`ls`, `get`, `get-binhex`, `put`,

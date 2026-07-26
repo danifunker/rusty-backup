@@ -1604,7 +1604,7 @@ jobs:
           cargo +1.73.0 build --release --bin rb-cli \
             --manifest-path rb-cli-vintage/Cargo.toml \
             --target x86_64-apple-darwin \
-            --no-default-features --features native-zstd,remote,tui,rust173-polyfill \
+            --no-default-features --features native-zstd,remote,tui,rust173-polyfill,yaml \
             --ignore-rust-version --locked
 
       - name: Verify 10.7 floor + no post-10.7 symbols
@@ -1705,7 +1705,7 @@ jobs:
           cargo +1.73.0 build --release --bin rb-cli \
             --manifest-path rb-cli-vintage/Cargo.toml \
             --target ${{ matrix.target }} \
-            --no-default-features --features native-zstd,remote,tui,rust173-polyfill,windows-legacy \
+            --no-default-features --features native-zstd,remote,tui,rust173-polyfill,windows-legacy,yaml \
             --ignore-rust-version --locked
 
       - name: Report PE imports (Win7 sanity — no UCRT/WinRT hard deps expected)

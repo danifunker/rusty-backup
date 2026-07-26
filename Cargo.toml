@@ -73,7 +73,7 @@ required-features = ["mock_gui"]
 # The desktop release ships every feature on. The slim rb-cli-mini build is
 # `cargo build --bin rb-cli --no-default-features` (optionally `--features chd`
 # / `--features optical` if you want one of those without the GUI).
-default = ["gui", "chd", "optical", "audio", "native-zlib", "native-zstd", "seekable-zstd", "remote", "tui", "crypto"]
+default = ["gui", "chd", "optical", "audio", "native-zlib", "native-zstd", "seekable-zstd", "remote", "tui", "crypto", "yaml"]
 # Block-cipher decryption for encrypted inputs: APFS FileVault, encrypted DMG,
 # and the AES-CBC WinImage IMZ variant. Pulls the `aes` / `cbc` / `des` crates
 # (RustCrypto, edition 2024). ON BY DEFAULT — the desktop ships it. It's split
@@ -81,6 +81,13 @@ default = ["gui", "chd", "optical", "audio", "native-zlib", "native-zstd", "seek
 # it: those edition-2024 crates need rustc >= 1.85, and unencrypted APFS / IMZ /
 # DMG browse keeps working without it (encrypted inputs bail with a clear error).
 crypto = ["dep:aes", "dep:cbc", "dep:des"]
+# `--format yaml` for the read-only verbs. ON BY DEFAULT — the desktop and the
+# vintage builds ship it. Split out only so the PowerPC mrustc build can drop it:
+# serde_yml's backend (`libyml`) hits an mrustc macro-expansion gap
+# (`TOK_RWORD_AS`) and cannot be transpiled. With this off, `--format yaml` is
+# hidden from `--help` and rejected; JSON carries the same schema. See
+# docs/build-ppc-mrustc.md.
+yaml = ["dep:serde_yml"]
 # Pull in eframe / egui / rfd plus the update-checker's reqwest client. Also
 # pulls in `remote` (dep-free) so Commander Mode's remote pane is always present
 # in a GUI build.
@@ -239,7 +246,7 @@ tar = "0.4"
 bzip2 = "0.6"
 zip = { version = "8", default-features = false, features = ["deflate", "aes-crypto"] }
 base64 = "0.22"
-serde_yml = "0.0.13"
+serde_yml = { version = "0.0.13", optional = true }
 csv = "1"
 clap_complete = "4"
 clap_mangen = "0.3"

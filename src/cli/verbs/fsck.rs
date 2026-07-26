@@ -512,6 +512,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "yaml")]
     fn yaml_envelope_renders_top_level_status_and_result() {
         let r = sample_result();
         let env = Envelope::ok(FsckPayload {

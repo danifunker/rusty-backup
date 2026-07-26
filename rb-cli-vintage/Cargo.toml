@@ -63,6 +63,10 @@ ratatui-legacy = []
 # Std-API polyfills for Rust 1.73 (is_multiple_of etc.). Always on for the
 # vintage build — the whole engine (fs drivers) needs it, not just the TUI.
 rust173-polyfill = []
+# `--format yaml`. Enabled by the vintage build commands (see
+# .github/workflows/release.yml) so behaviour matches the desktop; it is a
+# feature only so the PowerPC mrustc build can drop it. See rb-cli-ppc.
+yaml = ["dep:serde_yml"]
 # `windows` crate 0.58 API shim (Windows 7/8 build only). Passed on the Windows
 # vintage build command; harmless (unused) on the macOS 10.7 build.
 windows-legacy = []
@@ -102,7 +106,7 @@ tar = "0.4"
 bzip2 = "=0.5.2"
 zip = { version = "=2.4.2", default-features = false, features = ["deflate", "aes-crypto"] }
 base64 = "0.22"
-serde_yml = "=0.0.12"
+serde_yml = { version = "=0.0.12", optional = true }
 csv = "1"
 clap_complete = ">=4.4, <4.5"
 globset = ">=0.4, <0.4.17"

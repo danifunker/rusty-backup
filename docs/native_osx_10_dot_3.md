@@ -78,12 +78,12 @@ disagrees. See "The alignment problem" in the build doc for why the obvious fix
 PowerPC objects before hitting exactly two things, both of which need *engine*
 changes rather than mrustc ones:
 
-- `libyml` - the known `TOK_RWORD_AS` macro-expansion gap. Feature-gate YAML out.
+- ~~`libyml` - the known `TOK_RWORD_AS` macro-expansion gap~~ **done**: YAML output
+  now sits behind a default-on `yaml` feature that this build leaves off, so
+  `serde_yml`/`libyml` leave the dependency graph.
 - `libc` 0.2.189 **built for the host** - `new::linux::can::j1939`. Linux-only
-  code, in the graph only because `os/` depends on `libc`/`nix`.
-
-Both are the platform-split scope-down described below: exclude `os/` and YAML
-from the PowerPC configuration and they disappear together.
+  code, in the graph only because `os/` depends on `libc`/`nix`. Still open; this
+  is the `os/` half of the platform-split scope-down described below.
 
 **Revised direction:** finish the engine transpile behind that scope-down
 (section 8, phase 2), then link and smoke-test `rb-cli` on 10.5. Tiger is a
@@ -211,7 +211,7 @@ and they transpile like any other crate.
 | `src/os/` (device enumeration, raw disk IO, elevation) | `objc2-*` targets modern macOS frameworks; `nix` is Linux-only. This is the platform layer, and it is hand-C on PowerPC (section 5). Excluding it also drops `libc`/`nix` from the graph, which removes a current build blocker. |
 | `chd` / `libchdman-rs` | C++. mrustc cannot help, at all, ever. |
 | The egui GUI | eframe/wgpu will not transpile and would not run on 10.3-10.5 GPUs anyway (section 12). |
-| YAML output (`serde_yml` -> `libyml`) | An mrustc macro-expansion gap (`TOK_RWORD_AS`). Feature-gate it out; JSON covers the same ground. |
+| YAML output (`serde_yml` -> `libyml`) | An mrustc macro-expansion gap (`TOK_RWORD_AS`). Gated out via the default-on `yaml` feature, which `rb-cli-ppc` leaves off; JSON carries the identical schema. |
 
 The first PowerPC `rb-cli` therefore operates on **disk-image files**.
 Raw-device IO arrives with the hand-C platform shell, not before.
@@ -286,13 +286,19 @@ The remaining work is not in the engine's logic at all. It is:
    build's blocker: mrustc aborts on libc 0.2.189's Linux-only
    `new::linux::can::j1939` while building libc **for the host**, and it is only
    there because `os/` wants it.
-2. **A feature gate that excludes YAML output**, for the `libyml` macro gap.
+2. ~~**A feature gate that excludes YAML output**, for the `libyml` macro gap.~~
+   **Done.** `yaml` is a default-on feature; `rb-cli-ppc` leaves it off, which
+   drops `serde_yml`/`libyml` from the graph, hides `yaml` from `--format`, and
+   leaves JSON carrying the identical schema. The `Yaml` enum variant stays (so
+   the verbs' `Json | Yaml` match arms are untouched) and is marked
+   `#[value(skip)]` when the feature is off.
 3. **The hand-C platform shell**, later, once there is a working image-only
    `rb-cli` to attach it to.
 
 Items 1 and 2 are the only changes that touch `src/`, and both are additive
 feature gates rather than rewrites - consistent with keeping the shared engine
-single-sourced.
+single-sourced. Item 2 landed as four lines of `#[cfg]` in two files plus the
+manifests, which is the shape to aim for with item 1.
 
 ## 7. Build pipeline
 
@@ -332,9 +338,8 @@ that exercises `println!`, `BTreeMap`, iterators, `AtomicU64`, threads,
 against `stat -f` on the machine. Cost: eight fixes (see "Where this stands").
 
 **Phase 2 - finish the engine transpile.** *(next)* Currently 93 of 434 crates.
-Add the two feature gates from section 6 (exclude `os/`, exclude YAML) so
-`libc`/`nix`/`objc2-*` and `libyml` leave the graph, then re-run
-`scripts/build-ppc.sh ppc`. Expect a further tail of per-crate mrustc gaps; the
+YAML is done (section 6); the remaining gate is excluding `os/`, so
+`libc`/`nix`/`objc2-*` leave the graph. Then re-run `scripts/build-ppc.sh ppc`. Expect a further tail of per-crate mrustc gaps; the
 ones already met were each a small, local workaround. Deliverable: every crate in
 the PowerPC configuration transpiles and compiles.
 

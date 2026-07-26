@@ -28,10 +28,13 @@
 #       host-proxy artifact only: the os/ platform layer (which pulls libc+nix)
 #       is hand-C in the PPC shell, so the *engine* transpile shouldn't include
 #       it at all. See the platform-split decision in docs/build-ppc-mrustc.md.
+#   - serde_yml: optional, and this build leaves it OFF. Its backend `libyml`
+#       hits an mrustc macro-expansion gap ("Unused tokens at the end of macro
+#       expansion - TOK_RWORD_AS", scanner.rs:1937). The engine gates YAML
+#       output behind a `yaml` feature that is on by default everywhere else, so
+#       `--format yaml` simply disappears here; JSON carries the same schema.
 # Also crc's `Digest::new` is turbofished by scripts/build-ppc.sh's
-# patch_crc_vendor (const-generic mrustc can't infer); and YAML output
-# (serde_yml -> libyml, an mrustc macro-expansion gap) is dropped via the
-# `no-yaml`/feature trim in the engine.
+# patch_crc_vendor (const-generic mrustc can't infer).
 #
 # The empty [workspace] table makes this its own workspace root, so it resolves
 # independently and is not pulled into the parent package's build.
@@ -64,6 +67,9 @@ tui = ["dep:ratatui", "ratatui-legacy"]
 ratatui-legacy = []
 rust173-polyfill = []
 windows-legacy = []
+# Declared so the shared source's `#[cfg(feature = "yaml")]` resolves, but
+# deliberately NOT in this build's feature list — see the serde_yml note below.
+yaml = ["dep:serde_yml"]
 
 [dependencies]
 # --- TUI (pinned to the last 1.73-buildable line) ---
@@ -98,7 +104,10 @@ bzip2 = "=0.5.2"
 # zopfli -> bumpalo, which mrustc cannot transpile.
 zip = { version = "=2.4.2", default-features = false, features = ["deflate-flate2", "aes-crypto"] }
 base64 = "0.22"
-serde_yml = "=0.0.12"
+# DEVIATION (see header): optional and left OFF for this target. serde_yml's
+# backend `libyml` hits an mrustc macro-expansion gap (`TOK_RWORD_AS`) in
+# scanner.rs, so `--format yaml` is dropped here; JSON carries the same schema.
+serde_yml = { version = "=0.0.12", optional = true }
 csv = "1"
 clap_complete = ">=4.4, <4.5"
 globset = ">=0.4, <0.4.17"
