@@ -63,36 +63,48 @@ declare 10.4's legacy structs (`stat` 96 bytes with a 4-byte `st_ino`, `statfs`
 272, `dirent` 264 - all measured). `_Unwind_GetIPInfo` is likewise absent from
 `libgcc_s.10.4`.
 
-**One design wart is open.** Darwin/PowerPC's "power" alignment ABI (a struct's
-alignment follows its first member) disagrees with Rust's `repr(C)` rule. mrustc
-models the PowerPC rule and must, because it delegates layout to the C compiler -
-but that puts `std::thread::Inner`'s `ThreadId` at an offset its own `align_of`
-rejects, and `ptr::write`'s `assert_unsafe_precondition!` then aborts every
-program inside `std::rt::init`. The stdlib is currently built with
-`MINICARGO_NO_DEBUG_ASSERTIONS=1`; the generated C is correct, only the assertion
-disagrees. See "The alignment problem" in the build doc for why the obvious fix
-(restrict the rule to `repr(C)`) does not work.
+**The alignment model is now measured rather than inferred.** Darwin/PowerPC's
+"power" alignment ABI (a struct's alignment follows its first member; later
+members are capped to 4) disagrees with Rust's `repr(C)` rule, and mrustc has to
+model it because it delegates layout to the C compiler. Getting that model right
+turned out to hinge on a detail the summary hides: gcc applies the cap to
+*natural* alignment only, skipping any member whose alignment was requested
+explicitly, and that exemption propagates outward through arrays and enclosing
+aggregates. mrustc creates such alignment itself, too, by pinning every union's
+alignment with an attribute. Three mrustc bugs came out of that, all fixed and
+all verified against gcc 10.5 on the G5 with
+[`scripts/ppc-layout-probe.py`](../scripts/ppc-layout-probe.py), which reads
+gcc's real `sizeof`/`__alignof__` out of its own diagnostics rather than guessing.
+See "The alignment problem" in the build doc.
 
-**The engine build now runs, and stops where this plan predicted.** It hit exactly
-the two things this plan named, both needing *engine* changes rather than mrustc
-ones. One is done:
+**One wart is still open.** The power rule applies to Rust's own types, where a
+field can land at an offset its own `align_of` rejects -
+`std::thread::Inner`'s `ThreadId` is the case, and `ptr::write`'s
+`assert_unsafe_precondition!` then aborts every program inside `std::rt::init`.
+The stdlib is built with `MINICARGO_NO_DEBUG_ASSERTIONS=1`; the generated C is
+correct, only the assertion disagrees. Restricting the rule to `repr(C)` was
+tried and fails differently.
+
+**The engine build runs, and the blockers have changed character.** Both things
+this plan predicted needed *engine* changes, and both are done:
 
 - ~~`libyml` - the known `TOK_RWORD_AS` macro-expansion gap~~ **done**: YAML output
   sits behind a default-on `yaml` feature that this build leaves off, so
   `serde_yml`/`libyml` leave the dependency graph. Verified: `libyml` no longer
-  appears in the build at all and the graph shrank from 434 crates to 428.
-- `libc` 0.2.189 **built for the host** - `new::linux::can::j1939`. Linux-only
-  code, in the graph only because `os/` depends on `libc`/`nix`. **Still open**,
-  and now the single remaining known blocker; it is the `os/` half of the
-  platform-split scope-down described below.
+  appears in the build at all.
+- ~~`libc` 0.2.189 built for the host - `new::linux::can::j1939`~~ **done**: a
+  manifest pin drops the `nix 0.31` dependency whose `libc >= 0.2.186` requirement
+  dragged in a post-`src/new/` libc. The build uses 0.2.155, which predates it.
 
-`scripts/build-ppc.sh ppc` currently compiles **92 of 428** crates to PowerPC
-objects before that stop.
+Everything hit since has been an **mrustc** bug rather than an engine or
+dependency problem - six of them so far, listed under phase 2 - and each has been
+small and local. That is the shape this plan expected for the tail, but the tail's
+length is still unknown.
 
-**Revised direction:** finish the engine transpile behind that scope-down
-(section 8, phase 2), then link and smoke-test `rb-cli` on 10.5. Tiger is a
-separate, well-scoped follow-up (phase 5). The `os/` platform layer stays out and
-remains hand-C, as section 5 describes.
+**Revised direction:** finish the engine transpile (section 8, phase 2), then link
+and smoke-test `rb-cli` on 10.5. Tiger is a separate, well-scoped follow-up
+(phase 5). The `os/` platform layer stays out and remains hand-C, as section 5
+describes.
 
 > **Sections 1-12 were rewritten on 2026-07-25** against the working build. The
 > `no_std` carve-out, the FAT-only filesystem scope and the hand-C ABI boundary
@@ -355,29 +367,37 @@ that exercises `println!`, `BTreeMap`, iterators, `AtomicU64`, threads,
 `fs::metadata` and `read_dir`, with the filesystem results checked field-by-field
 against `stat -f` on the machine. Cost: eight fixes (see "Where this stands").
 
-**Phase 2 - finish the engine transpile.** *(in progress)* **106 of 404 crates.**
-Both scope-downs from section 6 have landed - YAML is feature-gated out and
-`os-stub` replaces the macOS platform leaf - and the host-`libc` blocker is fixed
-by a manifest pin. What now blocks is not a dependency but **mrustc's model of
-the PowerPC "power" alignment ABI for nested aggregates**:
+**Phase 2 - finish the engine transpile.** *(in progress)* Both scope-downs from
+section 6 have landed - YAML is feature-gated out and `os-stub` replaces the macOS
+platform leaf - and the host-`libc` blocker is fixed by a manifest pin. The
+blockers met since are all mrustc bugs, each small and local, and each fixed on
+`rb-cli-vintage-build`:
 
-- Fixed and verified: `libc`'s `tcp_connection_info` (all-scalar `repr(C)`). mrustc
-  computed align 8 where gcc derives 4, and emitted no forcing attribute because
-  it compared against *natural* field alignments. It now models what the C
-  compiler will derive.
-- Open: `lzfse_rust`'s `FseCore` / `LzfseDecoder` / `LzfseRingDecoder`. mrustc says
-  `Decoder` is align 8 and `FseCore` - which embeds it at offset 808 - is align 4;
-  gcc disagrees about the enclosing struct. Direct probes on the G5 show gcc
-  capping both interior scalars *and* interior aggregates to 4, which is what
-  mrustc models, so the disagreement is not yet explained.
+- **The alignment model** (three bugs). The "power" ABI's member-alignment cap
+  applies to *natural* alignment only; gcc exempts anything explicitly aligned, and
+  that exemption propagates outward - including from the alignment attributes
+  mrustc itself puts on unions. Separately, a niche enum took its size and
+  alignment from variant layouts computed before the tag was added. Between them
+  these accounted for `lzfse_rust`'s `FseCore` / `LzfseDecoder` /
+  `LzfseRingDecoder`, `Result<u64, Error>` and `BTreeMap`'s `LeafNode`.
 
-  Getting this right needs a proper harness rather than reasoning: compile the
-  *emitted* C against the PowerPC libcore so a probe can link, and have it print
-  gcc's `sizeof`/`__alignof__` for the exact structs whose assertions fail. The
-  guesswork loop is not converging. Note the assertions themselves are the system
-  working - a layout disagreement is a compile error here, not silent corruption. Expect a further tail of per-crate mrustc gaps; the
-ones already met were each a small, local workaround. Deliverable: every crate in
-the PowerPC configuration transpiles and compiles.
+  The previous revision of this plan said the guesswork loop was not converging and
+  that a proper harness was needed. That harness is
+  [`scripts/ppc-layout-probe.py`](../scripts/ppc-layout-probe.py): it never links,
+  it reads gcc's real `sizeof`/`__alignof__` out of its own diagnostics, and it
+  settled the question in one run. Every rule above is measured, not inferred - and
+  one of them (an `aligned(2)` member permanently exempting its enclosing struct
+  from a 4-byte cap) is counter-intuitive enough that guessing would have got it
+  wrong.
+- **Two parser bugs**, both reached through `bitflags` 2.13 and neither
+  PowerPC-specific: an interpolated associated `const` in an `impl` hit a `TODO`,
+  and attributes written in front of an interpolated item were dropped, so a
+  `#[cfg]` that should have removed an item did nothing.
+- **One target-description bug**: every `*-apple-darwin` target declared
+  `target_env = "gnu"`, cfg'ing glibc-only code *in* on a platform with no glibc.
+
+Expect a further tail. Deliverable: every crate in the PowerPC configuration
+transpiles and compiles.
 
 **Phase 3 - link and smoke-test on 10.5.** Get `rb-cli` linked, then exercise it
 against disk images on the G5: `inspect`, `backup`, `restore`, a browse-view
@@ -434,7 +454,7 @@ maintain.
   `repr(C)` was tried and fails differently. A real fix means mrustc emitting
   explicit padding plus forced alignment for `repr(Rust)` types instead of
   delegating - a much larger change. See "The alignment problem" in the build doc.
-- **The per-crate mrustc tail.** 93 of 434 crates so far. Each gap met to date
+- **The per-crate mrustc tail.** 154 of 404 crates so far. Each gap met to date
   has been small and local (a turbofish, a feature swap, a dependency pin), but
   the tail length is genuinely unknown until phase 2 runs to completion.
 - **`zstd-sys` is unproven.** It compiles real C for the target and has not been

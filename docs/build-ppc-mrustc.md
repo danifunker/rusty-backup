@@ -11,13 +11,21 @@ compiler), [`../scripts/ppc-libc-probe.py`](../scripts/ppc-libc-probe.py) and
 [`../scripts/ppc-libc-compare.py`](../scripts/ppc-libc-compare.py) (libc ground
 truth).
 
-Status (2026-07-25): **the full Rust standard library - core, alloc, std,
+Status (2026-07-26): **the full Rust standard library - core, alloc, std,
 panic_unwind, test, libc - builds for `powerpc-apple-darwin` and links into a
-running PowerPC Mach-O binary.** Getting there took five mrustc fixes and two
-rustc-source patches, all listed below. The remaining work is *correctness*, not
-*buildability*: several `libc` struct definitions describe modern macOS and are
-wrong for 10.4/10.5, which is a silent-at-compile-time, wrong-at-runtime class of
-bug. See "The libc situation" below.
+running PowerPC Mach-O binary**, and the engine build is grinding through the
+dependency graph behind it. Getting here took fifteen mrustc fixes and two
+rustc-source patches, all listed below.
+
+Two classes of remaining work, and they are different in kind:
+
+- **Buildability** - a per-crate tail of mrustc gaps. Each has been small and
+  local, and they fail loudly.
+- **Correctness** - several `libc` struct definitions describe modern macOS and
+  are wrong for 10.4/10.5. That is the silent-at-compile-time,
+  wrong-at-runtime class, and the only defence is measurement. See "The libc
+  situation" below, and "The alignment problem" for the same lesson applied to
+  the layout model.
 
 ## The two-machine model
 
@@ -134,6 +142,39 @@ All committed on `rb-cli-vintage-build`; each is a candidate upstream PR.
    `powerpc-apple-darwin` is by definition 10.4/10.5, so it falls through to the
    generic pthread parker.
 
+**Layout model** (see "The alignment problem" for the measurements behind these):
+
+9. **`src/trans/codegen_c.cpp`** - `has_manual_align` compared against the largest
+   *natural* field alignment, so it emitted no forcing attribute for a struct the
+   C compiler would derive lower. (`libc`'s `tcp_connection_info`.)
+10. **`src/trans/{target,codegen_c}.cpp`** - the member-alignment cap was applied
+    unconditionally. It must skip members whose alignment is explicitly requested,
+    as gcc's does, and that exemption propagates outward - including from the
+    alignment attributes mrustc itself puts on unions. (`lzfse_rust`'s `FseCore`,
+    `BTreeMap`'s `LeafNode`.)
+11. **`src/trans/target.cpp`** - a niche enum took its size and alignment from
+    per-variant layouts computed before the tag field was added, over-stating both.
+    (`Result<u64, Error>`.)
+
+**Parser** (both reached through `bitflags` 2.13, so neither is PowerPC-specific):
+
+12. **`src/parse/root.cpp`** - `Parse_Impl_Item` handled an interpolated *function*
+    only; an associated `const` arrives as `AST::Item::Static` and hit a `TODO`.
+13. **`src/parse/root.cpp`** - attributes written in front of an interpolated item
+    were dropped rather than transferred onto it, so a `#[cfg]` that should have
+    removed the item did nothing.
+
+**Target description:**
+
+14. **`src/trans/target.cpp`** - every `*-apple-darwin` target declared
+    `target_env = "gnu"`. rustc leaves it empty on Apple platforms, and it matters:
+    `#[cfg(target_env = "gnu")]` was selecting glibc-specific code on a system with
+    no glibc. `nix` picked its Linux `SigevThreadId` match arm that way and then
+    failed on `libc::SIGEV_THREAD_ID`. Fixed for all five macOS targets. Note this
+    is a **cfg** change, so it invalidates the PowerPC stdlib - see the traps above.
+    (mrustc declares `"gnu"` for the BSD targets too, which is wrong for the same
+    reason; left alone here as it is untested and out of scope.)
+
 ### Plus: a macOS/PowerPC build-script override set
 
 mrustc ships `script-overrides/stable-1.74.0-{linux,windows}` but not `-macos`.
@@ -169,8 +210,37 @@ Stages, in order:
 | `hostc`    | emit the engine's C on this machine (deferred codegen) | ok |
 | `host`     | transpile+build a native `rb-cli` | to validate |
 | `ppclibs`  | **PowerPC libcore/alloc/std/panic_unwind/test/libc** | **ok** |
-| `ppc`      | PowerPC `rb-cli` | 92 of 428 crates; one blocker left, see below |
+| `ppc`      | PowerPC `rb-cli` | 154 of 404 crates; see "Where this stands" |
 | `probe`    | capture libc ground truth from the 10.4u / 10.5 SDKs | ok |
+
+### Traps in the build loop
+
+Four that have each cost real time:
+
+- **A layout change invalidates the PowerPC stdlib.** `minicargo`'s own rebuild
+  check *does* compare against the compiler binary's timestamp
+  (`outfile_needs_rebuild`, `tools/minicargo/build.cpp`), so the `ppc` stage
+  rebuilds itself after `make`. `minicargo.mk`'s `LIBS` target does not, so the
+  **stdlib** silently stays as it was. That happened: the stdlib in
+  `output-1.74.0-powerpc-apple-darwin` predated both alignment fixes, and the
+  engine was being compiled against a newer layout model than the libs it links
+  with. **After touching `src/trans/target.cpp` or `src/trans/codegen_c.cpp`,
+  `rm -rf` the PowerPC lib output directory and re-run `ppclibs` before `ppc`.**
+- **A killed build leaves a 0-byte `build_<crate>.txt` that minicargo trusts.**
+  The build-script runner's stdout is captured by shell redirection, which
+  truncates the file *before* the process starts. If that run then dies, the empty
+  file survives, looks up to date, and the crate is compiled with **no** cfgs at
+  all. For `libc` that silently drops `libc_core_cvoid`, so `libc::c_void` becomes
+  a distinct type from `core::ffi::c_void` and the failure lands two crates later
+  in `getrandom` with no hint of where it came from. If a crate fails
+  inexplicably, check `output-rb-ppc/host/build_<crate>.txt` for zero length.
+- **mrustc reports itself as `rustc 1.29.100` unless `MRUSTC_TARGET_VER` is set.**
+  Build scripts version-gate on that. `libc`'s emits 6 cfgs at 1.29 and 14 at
+  1.74 - among the missing eight is `libc_core_cvoid` again. This is the same
+  trap as the previous bullet with a different cause and the identical symptom.
+- **Don't `tail` the build log.** Redirect to a file and grep it. A run reported
+  as three failing assertions actually had four; the fourth was below a `tail -30`
+  cutoff and cost a session's worth of wrong hypotheses.
 
 Building the PowerPC stdlib by hand, if you want to skip the driver:
 
@@ -204,6 +274,12 @@ around a specific mrustc gap (all documented at their site):
   in all 5 width files (mrustc can't infer the const-generic impl params).
 - **env_logger** `0.11` -> `=0.10.2` — drops `jiff` (0.11's timestamp backend;
   const-generic gap). Same logging via humantime.
+- **chrono** — `patch_chrono_vendor` in build-ppc.sh turbofishes
+  `DateTime::<Utc>::UNIX_EPOCH` at its two use sites. Nothing in
+  `DateTime::UNIX_EPOCH.naive_utc()` pins `Tz`; rustc resolves it because only
+  `impl DateTime<Utc>` declares that associated const, but mrustc cannot infer an
+  impl's type parameter from which impl happens to carry the const. Same class of
+  gap as the crc turbofish.
 - **YAML** (`serde_yml` -> `libyml`) - an mrustc macro-expansion gap
   (`TOK_RWORD_AS` at `scanner.rs:1937`). **Done:** the engine gates YAML output
   behind a `yaml` feature, on by default everywhere else, and this build leaves it
@@ -247,6 +323,125 @@ delegating layout to the C compiler for `repr(Rust)` types - emitting explicit
 padding members plus a forced `__attribute__((aligned))` - which is a much larger
 change. 32-bit PowerPC is the only arch where this arises: it is the sole target
 with 32-bit pointers but 8-byte-aligned `u64`.
+
+### What the cap actually applies to
+
+"Members after the first are capped to 4" is the summary, not the rule. The rule
+gcc implements is in `stor-layout.c:place_field`:
+
+```c
+#ifdef ADJUST_FIELD_ALIGN
+  if (! DECL_USER_ALIGN (field))
+    desired_align = ADJUST_FIELD_ALIGN (field, TREE_TYPE (field), desired_align);
+#endif
+```
+
+`ADJUST_FIELD_ALIGN` is where the Darwin/PowerPC cap lives, and it is skipped for
+any member whose alignment was **asked for explicitly**. So the cap applies to
+*natural* alignment only. gcc tracks "explicit" as `TYPE_USER_ALIGN`, propagates
+it from an array's element type to the array, and ORs it into a struct from
+**every** member - unconditionally, whether or not that member's alignment is what
+set the struct's.
+
+Three consequences, all **measured on the G5** (see the probe below), all of which
+mrustc now models:
+
+| | gcc |
+|---|---|
+| `struct { u16; struct{u64;u32;}; }` - interior aggregate, natural align 8 | 20/**4** - capped |
+| `struct { u16; struct{...} __attribute__((aligned(8))); }` | 16/**8** - exempt |
+| ...through an array wrapper and one more struct, two levels down | 48/**8** - still exempt |
+
+The last one is the shape mrustc emits, and it is why `lzfse_rust`'s `FseCore`
+failed: it embeds a `repr(align(8))` `VEntry` array 808 bytes in, so gcc gives the
+whole struct align 8 where mrustc said 4.
+
+The counter-intuitive one is that unconditional OR. These two differ only in that
+one has a member carrying `aligned(2)` - far *below* the 4-byte cap, and not what
+gives either struct its alignment:
+
+```c
+struct att2        { uint16_t x; } __attribute__((__aligned__(2)));
+struct contaminated { uint64_t lead; struct att2 tag; };   /* 16/8 */
+struct clean        { uint64_t lead; uint16_t   tag; };   /* 16/8 */
+```
+
+Standalone they are identical, 16/8. Interior, `contaminated` comes out **24/8**
+and `clean` **20/4** - the `aligned(2)` member has permanently exempted its whole
+enclosing struct from the cap. mrustc reproduces this (`TypeRepr::user_align` is
+set by *any* user-aligned member, not only one that raises the alignment).
+
+**mrustc creates user-alignment itself, and has to account for it.** `codegen_c`
+pins every union's alignment with an explicit attribute rather than letting the C
+compiler derive it - without that, `MaybeUninit<u128>` comes out 1-aligned because
+its first variant is the unit type. That attribute is user-alignment as far as gcc
+is concerned, so it exempts the union *and every aggregate containing it* from the
+cap. `BTreeMap`'s `LeafNode<String, Metric>` is the case: it holds a
+`[MaybeUninit<Metric>; 11]` 140 bytes in, and gcc makes the whole node **320/8**
+where mrustc's model said 316/4. So `TypeRepr::user_align` is set for every union,
+not only for types the *Rust* source marked `repr(align)`.
+
+Note what does **not** work as an escape: `__attribute__((aligned(4)))` on the
+enclosing struct does not pull it back down. Measured - `{u16; u16; struct{union
+aligned(8) [2];};}` is 24/8 with or without an `aligned(4)` on the outer struct,
+and a plain `{u64; u32;}` marked `aligned(4)` is still 16/8. gcc's "aligned can
+only increase" holds here; the alignment has to come out of the model correctly.
+
+Two mrustc bugs came out of this, both fixed on `rb-cli-vintage-build`:
+
+1. **`make_type_repr_struct__inner` capped user-aligned members.** Now exempt, and
+   `TypeRepr::user_align` propagates outward through struct, union, enum and array
+   exactly as gcc's `TYPE_USER_ALIGN` does - seeded both by Rust's `repr(align(N))`
+   and by mrustc's own union pinning. `codegen_c.cpp`'s decision about whether to
+   emit a forcing `__attribute__((aligned))` uses the same test.
+2. **`make_type_repr_enum`'s niche path over-stated size and alignment.** It takes
+   `max_align` from per-variant layouts built *before* the tag field is added, so a
+   payload that will not be first in the final layout was laid out as though it
+   were, and escaped the cap. `Result<u64, Error>` came out 16/8 where the emitted
+   C - a union of the final variant structs, both 12/4 - is 12/4. It now takes the
+   answer from the final variant layouts, guarded on the capping ABI so no other
+   target moves.
+
+### Measuring it: `scripts/ppc-layout-probe.py`
+
+The `sizeof_assert` / `alignof_assert` typedefs only ever say *that* mrustc and gcc
+disagree, never *what gcc computed*. For a nested aggregate that is not enough to
+work from, and guessing here produces a subtle miscompile rather than a loud
+failure.
+
+[`scripts/ppc-layout-probe.py`](../scripts/ppc-layout-probe.py) gets gcc's real
+numbers. Appending a `main()` that prints `sizeof` does not work - the emitted
+translation unit refers to libcore symbols and will not link - so it never links at
+all. Each probe is a deliberately ill-typed initialiser whose diagnostic carries
+the number:
+
+```c
+#line 1 "PROBE|size|FseCore"
+char (*p)[sizeof(struct s_..._FseCore0g)] = 1;
+/* warning: initialization of 'char (*)[7976]' from 'int' ... */
+```
+
+A `#line` directive tags each probe, `-fsyntax-only` skips codegen, and a 5 MB
+translation unit answers in seconds. Every struct in the file with an assertion is
+probed and diffed against what mrustc claimed:
+
+```sh
+PPC_HOST=admin@192.168.99.116 \
+  scripts/ppc-layout-probe.py ~/repos/mrustc/output-rb-ppc/liblzfse_rust-0_2_1.rlib.c
+
+struct                          mrustc      gcc         verdict
+...fse8fse_core7FseCore0g       7976/4      7976/8      ALIGN MISMATCH
+667 struct(s) probed, 4 mismatch(es).
+```
+
+`--synthetic` skips the input file and compiles the hand-written ABI cases in the
+table above instead, which is the quickest way to re-derive the rule on new
+hardware or a new gcc.
+
+A note on reading build output: **do not `tail` it.** The run that found this had
+been reported as three failing assertions; it was four, and the fourth (the
+`Result<u64, Error>` enum) was simply below the `tail -30` cutoff. Redirect to a
+file and grep.
 
 ## The libc situation
 
@@ -317,6 +512,20 @@ The probe runner can only exercise arches the machine can execute, so `i386`
 probes cannot be captured on a PowerPC Mac; the useful axis is 10.4u vs 10.5,
 and both are checked in.
 
+### Caveat: `repr(C)` structs that contain a union
+
+Pinning union alignment (see "The alignment problem") makes a union
+user-aligned in the emitted C, which exempts any struct containing it from the
+member-alignment cap. For a `repr(C)` struct that is *also* declared by a system
+header, that is a real hazard: mrustc and gcc will agree with each other and
+both disagree with the SDK. It is bounded, though - `libc`'s Apple module
+declares only four unions (`__c_anonymous_ifk_data`, `__c_anonymous_ifr_ifru`,
+`__c_anonymous_ifc_ifcu`, `semun`), reaching `ifreq`, `ifconf`, `ifkpi` and the
+SysV IPC structs. None are on the engine's file paths, and none are in the
+verified probe set - `ppc-libc-compare.py` already lists 17 structs it cannot
+resolve because of unions and function pointers, and these are among them.
+Worth revisiting if raw-socket or IPC code ever crosses.
+
 ## Where this stands
 
 Done:
@@ -343,23 +552,40 @@ Open, in rough priority order:
    from `libgcc_s.10.4`, so 10.4 needs gcc10's unwinder or `panic=abort`.
    Everything so far is built and run on 10.5.
 2. **The alignment workaround.** `MINICARGO_NO_DEBUG_ASSERTIONS=1` is a
-   workaround; see "The alignment problem" for what a real fix costs.
+   workaround for the power rule applying to Rust's own types; see "The alignment
+   problem" for what a real fix costs. (The *model* bugs described there are
+   fixed - this is the separate, remaining wart.)
 3. **Eight libc structs are wrong even on 10.5** - `statfs`, `passwd`,
    `ipc_perm`, `semid_ds`, `shmid_ds`, `rt_metrics`, `malloc_zone_t`,
    `vnode_info`. None are on the engine's file paths; `passwd` (`home_dir`) is
    the one worth doing first.
-4. **The engine itself** (`scripts/build-ppc.sh ppc`). It resolves 428 crates and
-   gets **92** of them transpiled and compiled to PowerPC objects before stopping
-   on one remaining blocker:
+4. **The engine itself** (`scripts/build-ppc.sh ppc`), which resolves **404
+   crates**. Cleared since the last revision:
 
-   - `libc` 0.2.189 **for the host** - `src/new/mod.rs:182: Cannot find component
-     1 of crate::new::linux::can::j1939`. Linux-only code, pulled in only because
-     the `os/` platform layer depends on `libc`/`nix`. This is the host-proxy
-     artifact the platform split exists to remove: excluding `os/` drops both
-     from the graph, and `os/` is hand-C on PowerPC anyway.
+   - ~~`libyml`'s `TOK_RWORD_AS` macro-expansion gap~~ - YAML sits behind a
+     default-on `yaml` feature that this build leaves off. `libyml` no longer
+     appears in the build at all.
+   - ~~host `libc` 0.2.189's `new::linux::can::j1939`~~ - a manifest pin drops the
+     `nix 0.31` dependency that dragged in a post-`src/new/` libc, so the build
+     uses 0.2.155.
+   - ~~`lzfse_rust`'s `FseCore` / `LzfseDecoder` / `LzfseRingDecoder` alignof
+     assertions~~ and ~~`Result<u64, Error>`'s sizeof assertion~~ - two mrustc
+     layout-model bugs; see "The alignment problem".
+   - ~~`bitflags` 2.13 aborting mrustc through `nix`'s `libc_bitflags!`~~ - two
+     parser bugs in `Parse_Impl_Item`'s interpolated-item path: an associated
+     `const` arrives as `AST::Item::Static` and hit a `TODO`, and attributes
+     written in front of an interpolated item were dropped, so the `#[cfg]` that
+     should have removed a Linux-only flag constant did nothing.
+   - ~~`nix` reaching for `libc::SIGEV_THREAD_ID`~~ - `target_env` was `"gnu"` on
+     every Apple target, so glibc-only code was cfg'd *in*.
 
-   The other blocker, ~~`libyml`'s `TOK_RWORD_AS` macro-expansion gap~~, is
-   **fixed**: YAML now sits behind a default-on `yaml` feature that this build
-   leaves off. Verified - `libyml` no longer appears anywhere in the build, and
-   the graph shrank from 434 crates to 428.
+   Each gap met so far has been small and local. The tail past this point is
+   genuinely unknown until the build runs to completion.
 5. **C++ deps stay off forever** (`chd` = libchdman). Already excluded.
+6. **Enum and union alignment is unasserted.** mrustc emits an `alignof_assert`
+   for every struct but only a `sizeof_assert` for enums and unions (in `libtest`:
+   2,027 struct alignment assertions, 0 for its 691 enums and 81 unions). On a
+   target where the alignment rules are this subtle that is a real hole in the
+   safety net - an enum whose alignment mrustc gets wrong is caught only through
+   the size it rounds up to, or through an enclosing struct. Emitting the missing
+   assertions is a small codegen change and the obvious next hardening step.

@@ -167,11 +167,30 @@ patch_crc_vendor() {
   note "applied vendored-source workarounds (crc turbofish)."
 }
 
+patch_chrono_vendor() {
+  # chrono 0.4: `NaiveDateTime::UNIX_EPOCH` is defined as
+  # `DateTime::UNIX_EPOCH.naive_utc()`. Nothing in that expression pins
+  # `DateTime`'s `Tz`; rustc resolves it because only one inherent impl
+  # (`impl DateTime<Utc>`) declares a `UNIX_EPOCH`, but mrustc can't infer an
+  # impl's type parameter from which impl happens to carry the associated const.
+  # Same class of gap as the crc turbofish above, same shape of fix. `Utc` is
+  # already in scope in that module.
+  # Two sites: `NaiveDateTime::UNIX_EPOCH` and `impl Default for NaiveDateTime`.
+  # Skip doc comments and the `#[deprecated(note = ...)]` string, which mention
+  # the path without using it. Idempotent - the rewritten form no longer matches.
+  local f="$VENDOR_DIR/chrono/src/naive/datetime/mod.rs"
+  [ -f "$f" ] || return 0
+  sed -e '/^[[:space:]]*\/\/\//!{' -e '/#\[deprecated/!s/DateTime::UNIX_EPOCH/DateTime::<Utc>::UNIX_EPOCH/g' -e '}' \
+    "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+  note "applied vendored-source workarounds (chrono UNIX_EPOCH turbofish)."
+}
+
 # ---- stage 5: transpile+compile the engine for the HOST (native proof) ------
 stage_host() {
   banner "5. transpile+build rb-cli for the HOST (native $HOST_ARCH proof)"
   cd "$MRUSTC_DIR"
   patch_crc_vendor
+  patch_chrono_vendor
   mkdir -p "$HOST_OUT"
   MRUSTC_TARGET_VER="$MRUSTC_TARGET_VER" \
     bin/minicargo "$CRATE_DIR" \
@@ -200,6 +219,7 @@ stage_hostc() {
   [ -e "$HOST_LIBS/libstd.rlib" ] || die "run 'hostlibs' first (need $HOST_LIBS)"
   [ -d "$VENDOR_DIR" ] || die "run 'vendor' first"
   patch_crc_vendor
+  patch_chrono_vendor
   mkdir -p "$HOSTC_OUT"
   MRUSTC_TARGET_VER="$MRUSTC_TARGET_VER" MINICARGO_DEFER_CODEGEN=1 \
     bin/minicargo "$CRATE_DIR" \
@@ -263,6 +283,7 @@ stage_ppc() {
   [ -e "$PPC_LIBS/libstd.rlib.o" ] || die "PPC libstd missing -- run 'ppclibs' first"
   cd "$MRUSTC_DIR"
   patch_crc_vendor
+  patch_chrono_vendor
   mkdir -p "$PPC_OUT"
   MRUSTC_TARGET_VER="$MRUSTC_TARGET_VER" MINICARGO_DEFER_CODEGEN=1 \
     bin/minicargo "$CRATE_DIR" \
