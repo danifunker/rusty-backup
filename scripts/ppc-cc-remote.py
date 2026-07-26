@@ -147,15 +147,19 @@ def main():
     if output is None:
         die("no -o in command line: %s" % " ".join(args))
 
-    # Every path mrustc passes is relative to its cwd, so mirroring that tree
-    # under REMOTE_ROOT lets the arguments cross over verbatim.
-    for path in inputs + [output]:
-        if os.path.isabs(path):
-            die("absolute path in command line (not mirrorable): %s" % path)
-        if path.startswith(".." + os.sep):
+    # Mirror every path under REMOTE_ROOT. minicargo passes paths relative to
+    # mrustc's cwd for a stdlib build but absolute ones when driven with an
+    # absolute --output-dir, so both have to work; an absolute path keeps its
+    # shape minus the leading slash, which is also what `rsync -R` produces.
+    def mirrored(path):
+        rel = path.lstrip("/") if os.path.isabs(path) else path
+        if rel.startswith(".." + os.sep):
             die("path escapes the build root (not mirrorable): %s" % path)
+        return rel
 
-    remote_dirs = sorted({os.path.dirname(p) for p in inputs + [output] if os.path.dirname(p)})
+    remap = {p: mirrored(p) for p in inputs + [output]}
+
+    remote_dirs = sorted({os.path.dirname(p) for p in remap.values() if os.path.dirname(p)})
     mkdir = "mkdir -p %s" % " ".join(
         shlex.quote("%s/%s" % (REMOTE_ROOT, d)) for d in remote_dirs
     ) if remote_dirs else "true"
@@ -168,7 +172,7 @@ def main():
         if rc != 0:
             die("failed to upload inputs")
 
-    remote_args = list(args)
+    remote_args = [remap.get(a, a) for a in args]
     is_link = "-c" not in remote_args
     if SDK:
         remote_args = ["-isysroot", SDK] + remote_args
@@ -193,7 +197,7 @@ def main():
     out_dir = os.path.dirname(output)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
-    rc = run(["rsync", "-q", "%s:%s/%s" % (HOST, REMOTE_ROOT, output), output])
+    rc = run(["rsync", "-q", "%s:%s/%s" % (HOST, REMOTE_ROOT, remap[output]), output])
     if rc != 0:
         die("failed to retrieve %s" % output)
     return 0
