@@ -14,7 +14,7 @@ truth).
 Status (2026-07-26): **the full Rust standard library - core, alloc, std,
 panic_unwind, test, libc - builds for `powerpc-apple-darwin` and links into a
 running PowerPC Mach-O binary**, and the engine build is grinding through the
-dependency graph behind it. Getting here took fifteen mrustc fixes and two
+dependency graph behind it. Getting here took sixteen mrustc fixes and two
 rustc-source patches, all listed below.
 
 Two classes of remaining work, and they are different in kind:
@@ -164,9 +164,28 @@ All committed on `rb-cli-vintage-build`; each is a candidate upstream PR.
     were dropped rather than transferred onto it, so a `#[cfg]` that should have
     removed the item did nothing.
 
+**Build orchestration (minicargo):**
+
+14. **`tools/minicargo/manifest.cpp`** - cargo creates the implicit
+    `foo = ["dep:foo"]` feature for an optional dependency only when `[features]`
+    does not name `dep:foo` itself; minicargo created it unconditionally. `rustix`
+    has an optional `alloc` dependency (really `rustc-std-workspace-alloc`,
+    referenced only as `dep:alloc` from `rustc-dep-of-std`) *and* a plain
+    `alloc = []` feature, so merging the two made enabling the ordinary feature
+    pull in the std-workspace shim. The guard already existed in the source but was
+    commented out, and written as a global switch rather than cargo's
+    per-dependency rule; this implements the per-dependency form.
+
+15. **`tools/minicargo/build.cpp`** - under `MINICARGO_DEFER_CODEGEN` a dependency
+    has to be repointed at the deferred codegen job. The guard doing that read
+    `if( d[d.size()-1] != ')' )`, meaning "not already suffixed" - but a host
+    crate's job name ends in `(host)`, so host dependencies kept pointing at the
+    transpile job and could be linked against before their object file existed.
+    Presented as an intermittent race; see the traps above.
+
 **Target description:**
 
-14. **`src/trans/target.cpp`** - every `*-apple-darwin` target declared
+16. **`src/trans/target.cpp`** - every `*-apple-darwin` target declared
     `target_env = "gnu"`. rustc leaves it empty on Apple platforms, and it matters:
     `#[cfg(target_env = "gnu")]` was selecting glibc-specific code on a system with
     no glibc. `nix` picked its Linux `SigevThreadId` match arm that way and then
@@ -210,12 +229,12 @@ Stages, in order:
 | `hostc`    | emit the engine's C on this machine (deferred codegen) | ok |
 | `host`     | transpile+build a native `rb-cli` | to validate |
 | `ppclibs`  | **PowerPC libcore/alloc/std/panic_unwind/test/libc** | **ok** |
-| `ppc`      | PowerPC `rb-cli` | 154 of 404 crates; see "Where this stands" |
+| `ppc`      | PowerPC `rb-cli` | 188 of 404 crates; see "Where this stands" |
 | `probe`    | capture libc ground truth from the 10.4u / 10.5 SDKs | ok |
 
 ### Traps in the build loop
 
-Four that have each cost real time:
+Six that have each cost real time:
 
 - **A layout change invalidates the PowerPC stdlib.** `minicargo`'s own rebuild
   check *does* compare against the compiler binary's timestamp
@@ -241,6 +260,31 @@ Four that have each cost real time:
 - **Don't `tail` the build log.** Redirect to a file and grep it. A run reported
   as three failing assertions actually had four; the fourth was below a `tail -30`
   cutoff and cost a session's worth of wrong hypotheses.
+- **An "intermittent race" around host binaries was a real ordering bug** - fixed,
+  but worth knowing because it wore three different disguises before it was
+  diagnosed: `Unable to run process ... Permission denied` on a build-script
+  runner, `Unable to open crate '<x>' at path .../lib<x>-plugin` for a plugin
+  whose `.c` had been emitted, and finally `ld: cannot find ...rlib.o` with two
+  named host crates, which gave it away. Under `MINICARGO_DEFER_CODEGEN` a
+  dependency has to be repointed at the codegen job; the guard doing that skipped
+  any name already ending in `)`, and a host crate's job name ends in `(host)`.
+  See fix 15 below. If something like this reappears, running the emitted
+  `<output>-codegen.sh` by hand tells you immediately whether the step itself is
+  broken or merely mis-sequenced.
+- **An aborted build leaves `.rlib` files with no `.o`, and minicargo trusts
+  them.** Same family as the 0-byte `build_<crate>.txt` above: the transpile job
+  completed, the deferred codegen job never ran, and on the next run the `.rlib`
+  looks up to date so no codegen job is scheduled - the link then fails on a
+  missing `.rlib.o` for a crate the log never even mentions. (`build.cpp` has a
+  standing `TODO: Codegen should re-run if the output file from it is missing`.)
+  To find them:
+
+  ```sh
+  cd output-rb-ppc && for d in . host; do for f in $d/*.rlib; do
+      [ -e "$f.o" ] || echo "stale: $f"; done; done
+  ```
+
+  Delete what it lists and re-run.
 
 Building the PowerPC stdlib by hand, if you want to skip the driver:
 
@@ -280,6 +324,13 @@ around a specific mrustc gap (all documented at their site):
   `impl DateTime<Utc>` declares that associated const, but mrustc cannot infer an
   impl's type parameter from which impl happens to carry the const. Same class of
   gap as the crc turbofish.
+- **rustversion** — `patch_rustversion_vendor` makes it identify the compiler from
+  the last line of `rustc --version` that actually starts with `rustc `, rather
+  than the last line full stop. Real rustc prints one line; mrustc prints four,
+  with the version banner first and informational lines after. Fixing this in
+  mrustc is not obviously safe - `libc`'s build script parses from the *start* of
+  the same output and mrustc's own comments note that `autoconfig` looks for the
+  `release:` line, so neither reordering nor trimming is free.
 - **YAML** (`serde_yml` -> `libyml`) - an mrustc macro-expansion gap
   (`TOK_RWORD_AS` at `scanner.rs:1937`). **Done:** the engine gates YAML output
   behind a `yaml` feature, on by default everywhere else, and this build leaves it
@@ -579,8 +630,14 @@ Open, in rough priority order:
    - ~~`nix` reaching for `libc::SIGEV_THREAD_ID`~~ - `target_env` was `"gnu"` on
      every Apple target, so glibc-only code was cfg'd *in*.
 
-   Each gap met so far has been small and local. The tail past this point is
-   genuinely unknown until the build runs to completion.
+   **Currently stops at 188 of 404** on the first gap that is *not* small and
+   local: the `cc` crate's `parallel/command_runner.rs` uses `async fn`, and mrustc
+   reports `Cannot find an impl of core::future::Future for async[...]`. `cc` is a
+   build-dependency only (it compiles the C for `bzip2-sys` and `zstd-sys`), so the
+   options are to pin it below the version that added the async runner - which
+   means re-vendoring - or to drop `native-zstd`, which section 3 of the plan
+   already flags as the escape hatch if `zstd-sys` fights. Fixing async in mrustc
+   is a different order of work from anything above.
 5. **C++ deps stay off forever** (`chd` = libchdman). Already excluded.
 6. **Enum and union alignment is unasserted.** mrustc emits an `alignof_assert`
    for every struct but only a `sizeof_assert` for enums and unions (in `libtest`:

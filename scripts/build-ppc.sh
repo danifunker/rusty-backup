@@ -185,12 +185,50 @@ patch_chrono_vendor() {
   note "applied vendored-source workarounds (chrono UNIX_EPOCH turbofish)."
 }
 
+patch_rustversion_vendor() {
+  # rustversion identifies the compiler from the *last* line of `rustc --version`,
+  # which is right for real rustc (one line, possibly preceded by warnings) but
+  # wrong for mrustc, which prints four lines with the `rustc <ver>` one first and
+  # informational lines after it. Pick the last line that actually starts with
+  # `rustc ` instead - identical behaviour on real rustc, and it keeps working if
+  # mrustc's trailing lines change.
+  #
+  # Fixing this in mrustc instead is not obviously safe: the line order is load
+  # bearing in both directions. libc's build.rs parses from the *start* of the
+  # output, and mrustc's own comments note that `autoconfig` looks for the
+  # `release:` line, so neither reordering nor trimming is free.
+  local f="$VENDOR_DIR/rustversion/build/rustc.rs"
+  [ -f "$f" ] || return 0
+  python3 - "$f" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+old = "    let last_line = string.lines().last().unwrap_or(string);"
+new = ("    // rb-cli-ppc: mrustc prints informational lines *after* the `rustc <ver>`\n"
+       "    // line, so take the last line that actually looks like a version banner.\n"
+       "    let last_line = string\n"
+       "        .lines()\n"
+       "        .filter(|l| l.trim_start().starts_with(\"rustc \"))\n"
+       "        .last()\n"
+       "        .or_else(|| string.lines().last())\n"
+       "        .unwrap_or(string);")
+if new.splitlines()[0] in s:
+    sys.exit(0)          # already patched
+if old not in s:
+    sys.stderr.write("rustversion: expected line not found; skipping patch\n")
+    sys.exit(0)
+open(p, "w").write(s.replace(old, new, 1))
+PY
+  note "applied vendored-source workarounds (rustversion --version parsing)."
+}
+
 # ---- stage 5: transpile+compile the engine for the HOST (native proof) ------
 stage_host() {
   banner "5. transpile+build rb-cli for the HOST (native $HOST_ARCH proof)"
   cd "$MRUSTC_DIR"
   patch_crc_vendor
   patch_chrono_vendor
+  patch_rustversion_vendor
   mkdir -p "$HOST_OUT"
   MRUSTC_TARGET_VER="$MRUSTC_TARGET_VER" \
     bin/minicargo "$CRATE_DIR" \
@@ -220,6 +258,7 @@ stage_hostc() {
   [ -d "$VENDOR_DIR" ] || die "run 'vendor' first"
   patch_crc_vendor
   patch_chrono_vendor
+  patch_rustversion_vendor
   mkdir -p "$HOSTC_OUT"
   MRUSTC_TARGET_VER="$MRUSTC_TARGET_VER" MINICARGO_DEFER_CODEGEN=1 \
     bin/minicargo "$CRATE_DIR" \
@@ -284,6 +323,7 @@ stage_ppc() {
   cd "$MRUSTC_DIR"
   patch_crc_vendor
   patch_chrono_vendor
+  patch_rustversion_vendor
   mkdir -p "$PPC_OUT"
   MRUSTC_TARGET_VER="$MRUSTC_TARGET_VER" MINICARGO_DEFER_CODEGEN=1 \
     bin/minicargo "$CRATE_DIR" \

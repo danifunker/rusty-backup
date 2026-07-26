@@ -454,7 +454,7 @@ maintain.
   `repr(C)` was tried and fails differently. A real fix means mrustc emitting
   explicit padding plus forced alignment for `repr(Rust)` types instead of
   delegating - a much larger change. See "The alignment problem" in the build doc.
-- **The per-crate mrustc tail.** 154 of 404 crates so far. Each gap met to date
+- **The per-crate mrustc tail.** 188 of 404 crates so far. Each gap met to date
   has been small and local (a turbofish, a feature swap, a dependency pin), but
   the tail length is genuinely unknown until phase 2 runs to completion.
 - **`zstd-sys` is unproven.** It compiles real C for the target and has not been
