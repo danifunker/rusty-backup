@@ -26,6 +26,7 @@ pub mod floppy;
 pub mod fsck;
 pub mod get;
 pub mod grow;
+pub mod import;
 pub mod inspect;
 pub mod locate;
 pub mod ls;

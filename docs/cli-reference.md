@@ -770,6 +770,31 @@ Usage: grow --add <ADD> <IMAGE>
 
 - `--add` — Bytes of zero-padding to add at the end (e.g. `512M`, `2G`)
 
+### `import`
+
+Copy a host directory tree INTO a filesystem in an image — the bulk counterpart to `put`, with no tarball needed. `--expand-archives` unpacks tar archives found in the tree instead of copying them in whole
+
+```
+Usage: import [OPTIONS] <IMAGE> <DIR> [DEST]
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image reference (`path` or `path@N` for the 1-based partition index)
+- `<DIR>` — Host directory whose contents are copied in. The directory itself is not created inside the image — its *contents* land under DEST
+- `<DEST>` — Destination directory inside the filesystem. Defaults to the root
+
+**Options**
+
+- `--expand-archives` — Unpack tar archives found in the tree into a directory named after each, instead of copying them in verbatim. Detected by content (the `ustar` magic), so IRIX `.tardist` and oddly-named archives are found and a gzipped disk image is not mistaken for one
+- `--flatten-folders` — With `--expand-archives`: unpack each archive into the directory that held it rather than into a subdirectory named after it, so every archive shares one root
+- `--force` — Overwrite entries that already exist at the destination. Mutually exclusive with `--skip-existing`
+- `--skip-existing` — Skip entries that already exist at the destination. Mutually exclusive with `--force`
+- `--no-permissions` — Ignore the host's Unix mode and ownership. Imported entries then inherit uid/gid from the directory they land in and take the filesystem's default mode, the same rule `put` follows
+- `--include-appledouble` — Import macOS AppleDouble sidecars (`._*`) too. By default they are skipped as Mac metadata cruft
+- `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zxplus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
+- `--carve-full` — Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga "NDOS" disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem
+
 ### `inspect`
 
 Whole-disk aggregate read-only view (partition table + per-partition summary + CHD metadata when applicable)
@@ -961,7 +986,13 @@ Usage: sgi-efs [OPTIONS] <IMAGE>
 
 **Options**
 
-- `--size` — Disk size (plain bytes or `K`/`KiB`/`M`/`MiB`/`G`/`GiB` suffixes, e.g. `50M`). Rounded up to a whole cylinder. Defaults to 50M
+- `--size` — Disk size (plain bytes or `K`/`KiB`/`M`/`MiB`/`G`/`GiB` suffixes, e.g. `50M`), or `auto` to size it to `--from-dir` plus filesystem overhead and headroom. Rounded up to a whole cylinder. Defaults to 50M
+- `--from-dir` — Populate the root filesystem from this host directory after formatting. The directory's *contents* land at the volume root
+- `--expand-archives` — With `--from-dir`: unpack tar archives found in the tree into a directory named after each, instead of copying them in verbatim. Detected by content, so IRIX `.tardist` files count
+- `--flatten-folders` — With `--expand-archives`: unpack each archive into the volume root rather than a subdirectory named after it, so every archive shares one root — the shape IRIX `inst` wants. Overlapping entries are then expected, so this skips entries that already exist unless `--force`
+- `--force` — With `--from-dir`: overwrite entries that already exist rather than skipping them
+- `--no-permissions` — With `--from-dir`: ignore the host's Unix mode and ownership
+- `--include-appledouble` — With `--from-dir`: import macOS AppleDouble sidecars (`._*`) too
 - `--name` — EFS volume label (up to 6 bytes; longer is truncated). Defaults to `rusty`
 - `--fs` — Root filesystem to format. Only `efs` is supported today
 - `--heads` — Heads (tracks per cylinder). Must match the geometry the target drive reports over SCSI: IRIX `fx` rejects the volume header if its geometry disagrees with the drive, which stops the disk from mounting. The IRIS emulator and typical SGI SCSI HDDs report 16 heads; change this only for a drive you know reports otherwise
@@ -1194,7 +1225,13 @@ Usage: sgi-efs [OPTIONS] <IMAGE>
 
 **Options**
 
-- `--size` — Disc size (plain bytes or `K`/`M`/`G` suffixes, e.g. `600M`). Rounded up to a whole 32-sector CD cylinder. Defaults to 600M (a CD-R). Keep it at or below your target media (~650-700 MiB for a CD)
+- `--size` — Disc size (plain bytes or `K`/`M`/`G` suffixes, e.g. `600M`), or `auto` to size it to `--from-dir` plus filesystem overhead and headroom. Rounded up to a whole 32-sector CD cylinder. Defaults to 600M (a CD-R); keep an explicit size at or below your target media (~650-700 MiB for a CD), and use `auto` for an image you intend to mount rather than burn
+- `--from-dir` — Populate the disc from this host directory after formatting it. The directory's *contents* land at the volume root
+- `--expand-archives` — With `--from-dir`: unpack tar archives found in the tree into a directory named after each, instead of copying them in verbatim. Detected by content, so IRIX `.tardist` files count
+- `--flatten-folders` — With `--expand-archives`: unpack each archive into the volume root rather than a subdirectory named after it, so every archive shares one root. This is the shape IRIX `inst` wants — point it at one directory holding every `.tardist`'s product images instead of re-pointing it per archive. Overlapping entries are then expected (SGI freeware tardists all ship the same `fw_common*` product), so this skips entries that already exist unless `--force` is given
+- `--force` — With `--from-dir`: overwrite entries that already exist rather than skipping them. Only meaningful alongside `--flatten-folders`, where archives can legitimately carry the same entry
+- `--no-permissions` — With `--from-dir`: ignore the host's Unix mode and ownership
+- `--include-appledouble` — With `--from-dir`: import macOS AppleDouble sidecars (`._*`) too
 - `--name` — EFS volume label (up to 6 bytes; longer is truncated). Defaults to `rusty`
 - `--inodes` — Approximate total inode count for the EFS filesystem. Mutually exclusive with `--bytes-per-inode`. Default density is ~1 inode/4 KiB; real IRIX CDs are sparser (~32 KiB/inode), so pass a larger `--bytes-per-inode` (or fewer `--inodes`) if you only have a handful of large files
 - `--bytes-per-inode` — EFS inode density, in bytes per inode (smaller = more inodes). Floored at one inode per 512-byte block. Mutually exclusive with `--inodes`

@@ -18,7 +18,19 @@
 <h2>Options</h2>
 <dl class="args">
 <dt><code>--size</code></dt>
-<dd>Disc size (plain bytes or `K`/`M`/`G` suffixes, e.g. `600M`). Rounded up to a whole 32-sector CD cylinder. Defaults to 600M (a CD-R). Keep it at or below your target media (~650-700 MiB for a CD)</dd>
+<dd>Disc size (plain bytes or `K`/`M`/`G` suffixes, e.g. `600M`), or `auto` to size it to `--from-dir` plus filesystem overhead and headroom. Rounded up to a whole 32-sector CD cylinder. Defaults to 600M (a CD-R); keep an explicit size at or below your target media (~650-700 MiB for a CD), and use `auto` for an image you intend to mount rather than burn</dd>
+<dt><code>--from-dir</code></dt>
+<dd>Populate the disc from this host directory after formatting it. The directory's *contents* land at the volume root</dd>
+<dt><code>--expand-archives</code></dt>
+<dd>With `--from-dir`: unpack tar archives found in the tree into a directory named after each, instead of copying them in verbatim. Detected by content, so IRIX `.tardist` files count</dd>
+<dt><code>--flatten-folders</code></dt>
+<dd>With `--expand-archives`: unpack each archive into the volume root rather than a subdirectory named after it, so every archive shares one root. This is the shape IRIX `inst` wants — point it at one directory holding every `.tardist`'s product images instead of re-pointing it per archive. Overlapping entries are then expected (SGI freeware tardists all ship the same `fw_common*` product), so this skips entries that already exist unless `--force` is given</dd>
+<dt><code>--force</code></dt>
+<dd>With `--from-dir`: overwrite entries that already exist rather than skipping them. Only meaningful alongside `--flatten-folders`, where archives can legitimately carry the same entry</dd>
+<dt><code>--no-permissions</code></dt>
+<dd>With `--from-dir`: ignore the host's Unix mode and ownership</dd>
+<dt><code>--include-appledouble</code></dt>
+<dd>With `--from-dir`: import macOS AppleDouble sidecars (`._*`) too</dd>
 <dt><code>--name</code></dt>
 <dd>EFS volume label (up to 6 bytes; longer is truncated). Defaults to `rusty`</dd>
 <dt><code>--inodes</code></dt>

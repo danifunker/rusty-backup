@@ -13,58 +13,28 @@
 //! `EditableFilesystem` mutation, callers MUST call `sync_metadata()` (and,
 //! for a container, `commit`) after import returns.
 
-use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::{Component, Path};
+use std::path::Path;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result};
 
-use crate::fs::attrs::AttrOverrides;
 use crate::fs::entry::FileEntry;
-use crate::fs::filesystem::{EditableFilesystem, FilesystemError};
+use crate::fs::filesystem::EditableFilesystem;
+use crate::fs::import_sink::{
+    is_appledouble, safe_components, ImportItem, ImportOptions, Importer,
+};
 
-/// What to do when an entry's destination name already exists in the image.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ImportConflict {
-    /// Abort the import (default).
-    Error,
-    /// Delete the existing entry and write the archived one.
-    Overwrite,
-    /// Leave the existing entry; skip the archived one.
-    Skip,
-}
+// The conflict policy, the options bag, the stats tally and the preflight
+// projection are all shared with `dir_import` — a tar stream and a host
+// directory walk differ only in where entries come from. Re-exported here so
+// the long-standing `tar_import::` paths keep working.
+pub use crate::fs::import_sink::{
+    ImportConflict, ImportPreflight as TarImportPreflight, ImportStats as TarImportStats,
+};
 
-/// Knobs for [`import_tar`].
-pub struct TarImportOptions {
-    pub conflict: ImportConflict,
-    /// Apply each entry's archived Unix mode and ownership (uid/gid).
-    /// Filesystems that don't store them ignore the values.
-    ///
-    /// When off, entries inherit uid/gid from the directory they land in
-    /// and take the filesystem's default mode — the precedence in
-    /// [`crate::fs::attrs`], not a blanket `root:root 0644`.
-    pub apply_permissions: bool,
-    /// Skip macOS AppleDouble sidecars (`._*`) — resource-fork/metadata cruft
-    /// a Mac adds to archives. On by default; almost never wanted inside a
-    /// disk image.
-    pub skip_appledouble: bool,
-}
-
-impl Default for TarImportOptions {
-    fn default() -> Self {
-        Self {
-            conflict: ImportConflict::Error,
-            apply_permissions: true,
-            skip_appledouble: true,
-        }
-    }
-}
-
-/// True when `name` is a macOS AppleDouble sidecar (`._something`).
-fn is_appledouble(name: &str) -> bool {
-    name.starts_with("._")
-}
+/// Knobs for [`import_tar`]. Alias of the shared [`ImportOptions`].
+pub type TarImportOptions = ImportOptions;
 
 /// Cheap content sniff: does `path` look like a tar archive — plain, gzip-, or
 /// zstd-compressed? Only a small prefix is (de)compressed to check for the tar
@@ -109,31 +79,6 @@ fn read_prefix(mut r: impl Read, n: usize) -> Vec<u8> {
     }
     buf.truncate(filled);
     buf
-}
-
-/// Tally of what the import produced.
-#[derive(Default, Debug, Clone)]
-pub struct TarImportStats {
-    pub files: u64,
-    pub dirs_created: u64,
-    pub symlinks: u64,
-    /// Symlinks the target filesystem can't store (skipped).
-    pub symlinks_skipped: u64,
-    pub skipped_existing: u64,
-    pub overwritten: u64,
-    pub perms_applied: u64,
-    /// macOS AppleDouble (`._*`) sidecars skipped.
-    pub appledouble_skipped: u64,
-    /// Entries whose name the target filesystem can't store (e.g. a
-    /// trailing-dot name on FAT).
-    pub invalid_names_skipped: u64,
-    /// Entries we don't represent (hardlinks, devices, fifos, …).
-    pub other_skipped: u64,
-    pub total_bytes: u64,
-}
-
-fn is_unsupported(e: &FilesystemError) -> bool {
-    matches!(e, FilesystemError::Unsupported(_))
 }
 
 /// Import from a host archive path, auto-detecting gzip / zstd / plain tar
@@ -183,6 +128,89 @@ pub fn import_tar<R: Read>(
     result
 }
 
+/// [`import_tar`] without the bulk-mode bracketing, for callers already inside
+/// one — `dir_import` expanding an archive it found mid-walk.
+///
+/// Bulk mode is a plain flag, not a counter (see `HfsFilesystem::begin_bulk`),
+/// so a nested `import_tar` would clear it on the way out and leave the rest of
+/// the enclosing import running unbracketed. The caller owns it instead.
+pub fn import_tar_into<R: Read>(
+    efs: &mut dyn EditableFilesystem,
+    dest: &FileEntry,
+    archive: R,
+    opts: &TarImportOptions,
+    progress: &dyn Fn(&TarImportStats),
+) -> Result<TarImportStats> {
+    import_tar_inner(efs, dest, archive, opts, progress)
+}
+
+/// [`import_tar_from_path`] without the bulk-mode bracketing. See
+/// [`import_tar_into`].
+pub fn import_tar_from_path_into(
+    efs: &mut dyn EditableFilesystem,
+    dest: &FileEntry,
+    path: &Path,
+    opts: &TarImportOptions,
+    progress: &dyn Fn(&TarImportStats),
+) -> Result<TarImportStats> {
+    let mut file =
+        File::open(path).with_context(|| format!("opening archive {}", path.display()))?;
+    let mut magic = [0u8; 4];
+    let n = file.read(&mut magic).unwrap_or(0);
+    file.seek(SeekFrom::Start(0)).context("rewind archive")?;
+
+    if n >= 2 && magic[0] == 0x1f && magic[1] == 0x8b {
+        import_tar_into(
+            efs,
+            dest,
+            flate2::read::GzDecoder::new(file),
+            opts,
+            progress,
+        )
+    } else if n >= 4 && magic == [0x28, 0xb5, 0x2f, 0xfd] {
+        let dec = crate::rbformats::zstd_compat::decoder(file).context("init zstd decoder")?;
+        import_tar_into(efs, dest, dec, opts, progress)
+    } else {
+        import_tar_into(efs, dest, file, opts, progress)
+    }
+}
+
+/// Total (files, dirs, content bytes) an archive would expand to, read from
+/// its headers without extracting. Feeds `--size auto`, where the archive's
+/// own compressed size is a badly wrong estimate of what it costs in the image.
+pub fn measure_tar_expanded(path: &Path) -> Result<(u64, u64, u64)> {
+    fn tally<R: Read>(archive: R) -> Result<(u64, u64, u64)> {
+        let mut files = 0u64;
+        let mut dirs = 0u64;
+        let mut bytes = 0u64;
+        let mut ar = tar::Archive::new(archive);
+        for entry in ar.entries().context("reading tar entries")? {
+            let entry = entry.context("reading tar entry")?;
+            let etype = entry.header().entry_type();
+            if etype.is_dir() {
+                dirs += 1;
+            } else if etype.is_file() {
+                files += 1;
+                bytes += entry.size();
+            }
+        }
+        Ok((files, dirs, bytes))
+    }
+
+    let mut file =
+        File::open(path).with_context(|| format!("opening archive {}", path.display()))?;
+    let mut magic = [0u8; 4];
+    let n = file.read(&mut magic).unwrap_or(0);
+    file.seek(SeekFrom::Start(0)).context("rewind archive")?;
+    if n >= 2 && magic[0] == 0x1f && magic[1] == 0x8b {
+        tally(flate2::read::GzDecoder::new(file))
+    } else if n >= 4 && magic == [0x28, 0xb5, 0x2f, 0xfd] {
+        tally(crate::rbformats::zstd_compat::decoder(file).context("init zstd decoder")?)
+    } else {
+        tally(file)
+    }
+}
+
 fn import_tar_inner<R: Read>(
     efs: &mut dyn EditableFilesystem,
     dest: &FileEntry,
@@ -190,16 +218,8 @@ fn import_tar_inner<R: Read>(
     opts: &TarImportOptions,
     progress: &dyn Fn(&TarImportStats),
 ) -> Result<TarImportStats> {
-    let mut stats = TarImportStats::default();
+    let mut sink = Importer::new(dest);
     let mut ar = tar::Archive::new(archive);
-    // archive-relative dir path -> the image FileEntry for that dir.
-    let mut dir_cache: HashMap<String, FileEntry> = HashMap::new();
-    dir_cache.insert(String::new(), dest.clone());
-    // image dir path -> set of child names known to exist, so the per-entry
-    // conflict check is O(1) instead of listing the (growing) directory every
-    // time — otherwise a large single-directory import is O(n^2). Seeded lazily
-    // from the on-disk listing the first time we touch a directory.
-    let mut dir_children: HashMap<String, HashSet<String>> = HashMap::new();
 
     for entry in ar.entries().context("reading tar entries")? {
         let mut entry = entry.context("reading tar entry")?;
@@ -209,22 +229,7 @@ fn import_tar_inner<R: Read>(
             // Skip empty paths and anything with `..` / absolute roots.
             _ => continue,
         };
-        // Drop macOS AppleDouble sidecars (`._*`) first — they're Mac
-        // resource-fork/metadata cruft, almost never wanted in the image.
-        if opts.skip_appledouble && comps.last().map(|c| is_appledouble(c)).unwrap_or(false) {
-            stats.appledouble_skipped += 1;
-            progress(&stats);
-            continue;
-        }
-
-        // Skip (don't abort on) any path component the target filesystem
-        // can't store — e.g. a trailing-dot name on FAT.
-        if comps.iter().any(|c| efs.validate_name(c).is_err()) {
-            stats.invalid_names_skipped += 1;
-            progress(&stats);
-            continue;
-        }
-
+        let display = raw_path.display().to_string();
         let etype = entry.header().entry_type();
         // What the archive says this entry's mode and ownership should be.
         // Empty when `apply_permissions` is off, in which case the shared
@@ -232,214 +237,54 @@ fn import_tar_inner<R: Read>(
         // the same precedence `rb-cli put` uses.
         let overrides = archived_overrides(entry.header(), opts.apply_permissions);
 
+        // Classify, then let the shared sink do the writing. Everything past
+        // this point — traversal guarding, mkdir -p, conflict policy, attr
+        // inheritance — is identical for a host-directory import, so it lives
+        // in `import_sink` rather than here.
         if etype.is_dir() {
-            // A directory can already exist here either because the image
-            // had it or because an earlier entry auto-created it as an
-            // implicit parent. Either way its own archive entry is the
-            // authority on its mode, so stamp it after the fact.
-            let existed = dir_cache.contains_key(&comps.join("/"));
-            let dir = ensure_dir(efs, &mut dir_cache, &comps, &mut stats, &overrides)?;
-            if existed {
-                apply_attrs_after_create(efs, &dir, &overrides, &mut stats)?;
-            } else if !overrides.is_empty() {
-                stats.perms_applied += 1;
-            }
-            progress(&stats);
-            continue;
-        }
-
-        let (parent_comps, leaf) = comps.split_at(comps.len() - 1);
-        let name = &leaf[0];
-        let parent = ensure_dir(
-            efs,
-            &mut dir_cache,
-            parent_comps,
-            &mut stats,
-            &AttrOverrides::default(),
-        )?;
-
-        // Conflict handling. Seed this directory's existing-names set once
-        // (from the on-disk listing — empty for a directory we just created),
-        // then consult/update it per entry so the check is O(1).
-        let parent_key = parent.path.clone();
-        // Both populated only when this entry overwrites an existing one.
-        let mut inherited_xattrs = Vec::new();
-        let mut replaced: Option<FileEntry> = None;
-        if !dir_children.contains_key(&parent_key) {
-            let existing: HashSet<String> = efs
-                .list_directory(&parent)
-                .map_err(|e| anyhow!("list_directory {}: {e}", parent.path))?
-                .into_iter()
-                .map(|c| c.name)
-                .collect();
-            dir_children.insert(parent_key.clone(), existing);
-        }
-        if dir_children[&parent_key].contains(name) {
-            match opts.conflict {
-                ImportConflict::Error => bail!(
-                    "{} already exists in the image (pass --force or --skip-existing)",
-                    raw_path.display()
-                ),
-                ImportConflict::Skip => {
-                    stats.skipped_existing += 1;
-                    progress(&stats);
-                    continue;
-                }
-                ImportConflict::Overwrite => {
-                    if let Some(existing) = find_child(efs, &parent, name)? {
-                        // Before the delete: a replacement inherits the
-                        // extended attributes of what it displaces, the same
-                        // way it inherits mode and ownership.
-                        inherited_xattrs = crate::fs::attrs::inherited_xattrs(
-                            efs.as_filesystem_mut(),
-                            Some(&existing),
-                        );
-                        // Kept for the same reason: with `--no-permissions`
-                        // the replacement inherits the displaced file's mode
-                        // and ownership rather than dropping to a default.
-                        replaced = Some(existing.clone());
-                        efs.delete_entry(&parent, &existing)
-                            .map_err(|e| anyhow!("overwrite delete {}: {e}", raw_path.display()))?;
-                    }
-                    dir_children
-                        .get_mut(&parent_key)
-                        .expect("seeded above")
-                        .remove(name);
-                    stats.overwritten += 1;
-                }
-            }
-        }
-
-        if etype.is_symlink() {
+            sink.push(efs, &comps, ImportItem::Dir, &overrides, opts, &display)?;
+        } else if etype.is_symlink() {
             let target = entry
                 .link_name()
                 .ok()
                 .flatten()
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            // A symlink's own mode is nearly always 0777 and rarely load-
-            // bearing, but its ownership is — and the drivers OR in their
-            // own S_IFLNK, so bare permission bits are what they want here.
-            let attrs =
-                crate::fs::attrs::resolve_attrs(&overrides, None, Some(&parent), None, 0o777);
-            let link_opts = crate::fs::filesystem::CreateFileOptions {
-                mode: Some(attrs.mode & 0o7777),
-                uid: Some(attrs.uid),
-                gid: Some(attrs.gid),
-                ..Default::default()
-            };
-            match efs.create_symlink(&parent, name, &target, &link_opts) {
-                Ok(_) => {
-                    stats.symlinks += 1;
-                    dir_children
-                        .get_mut(&parent_key)
-                        .expect("seeded above")
-                        .insert(name.clone());
-                }
-                Err(ref e) if is_unsupported(e) => stats.symlinks_skipped += 1,
-                Err(e) => return Err(anyhow!("create_symlink {}: {e}", raw_path.display())),
-            }
-            progress(&stats);
-            continue;
-        }
-
-        if etype.is_file() {
-            let size = entry.size();
-            // Mode and ownership go in through `create_file`, not a chmod
-            // afterwards: every driver that stores them honours these
-            // fields, while `set_permissions` is implemented by only two,
-            // so the old post-create chmod silently dropped the archive's
-            // mode on EFS, UFS, Minix and the rest.
-            let attrs = crate::fs::attrs::resolve_attrs(
+            sink.push(
+                efs,
+                &comps,
+                ImportItem::Symlink { target },
                 &overrides,
-                replaced.as_ref(),
-                Some(&parent),
-                None,
-                0o644,
-            );
-            let create_opts = crate::fs::filesystem::CreateFileOptions {
-                mode: Some(attrs.file_mode()),
-                uid: Some(attrs.uid),
-                gid: Some(attrs.gid),
-                xattrs: inherited_xattrs,
-                ..Default::default()
-            };
-            efs.create_file(&parent, name, &mut entry, size, &create_opts)
-                .map_err(|e| anyhow!("create_file {}: {e}", raw_path.display()))?;
-            dir_children
-                .get_mut(&parent_key)
-                .expect("seeded above")
-                .insert(name.clone());
-            stats.files += 1;
-            stats.total_bytes += size;
-            if !overrides.is_empty() {
-                stats.perms_applied += 1;
-            }
-            progress(&stats);
-            continue;
+                opts,
+                &display,
+            )?;
+        } else if etype.is_file() {
+            let size = entry.size();
+            sink.push(
+                efs,
+                &comps,
+                ImportItem::File {
+                    size,
+                    data: &mut entry,
+                },
+                &overrides,
+                opts,
+                &display,
+            )?;
+        } else {
+            // Hardlinks, char/block devices, fifos, sockets.
+            sink.push(
+                efs,
+                &comps,
+                ImportItem::Unsupported,
+                &overrides,
+                opts,
+                &display,
+            )?;
         }
-
-        // Hardlinks, char/block devices, fifos, sockets — not representable.
-        stats.other_skipped += 1;
-        progress(&stats);
+        progress(&sink.stats);
     }
-    Ok(stats)
-}
-
-/// Read-only scan of an archive against a target filesystem, computing what
-/// *would* be skipped or dropped — without writing anything. The GUI uses
-/// this to warn (and prompt) before a potentially-lossy import; the CLI
-/// skips the prompt and just imports.
-#[derive(Default, Debug, Clone)]
-pub struct TarImportPreflight {
-    pub files: u64,
-    pub dirs: u64,
-    pub symlinks: u64,
-    /// AppleDouble (`._*`) entries that will be skipped.
-    pub appledouble: u64,
-    /// Entries whose name the target filesystem can't store (will be skipped).
-    pub invalid_names: u64,
-    /// Symlinks that will be DROPPED because the target FS can't store them.
-    pub symlinks_dropped: u64,
-    /// Hardlinks / devices / fifos that aren't representable (skipped).
-    pub other_unsupported: u64,
-}
-
-impl TarImportPreflight {
-    /// True when the import will skip or drop something the user might care
-    /// about — i.e. the GUI should confirm before proceeding.
-    pub fn has_warnings(&self) -> bool {
-        self.symlinks_dropped > 0 || self.invalid_names > 0 || self.other_unsupported > 0
-    }
-
-    /// Human-readable warning lines (ASCII only). Empty when lossless.
-    pub fn warnings(&self) -> Vec<String> {
-        let mut w = Vec::new();
-        if self.symlinks_dropped > 0 {
-            w.push(format!(
-                // Deliberately about the *driver*, not the format: several
-                // filesystems we can read symlinks from we cannot yet write
-                // them to, and claiming the format can't hold them sends the
-                // user looking for a problem that isn't there.
-                "{} symlink(s) will be DROPPED - writing symbolic links is not \
-                 supported for this filesystem.",
-                self.symlinks_dropped
-            ));
-        }
-        if self.invalid_names > 0 {
-            w.push(format!(
-                "{} entr(ies) have names this filesystem can't store and will be skipped.",
-                self.invalid_names
-            ));
-        }
-        if self.other_unsupported > 0 {
-            w.push(format!(
-                "{} entr(ies) (hardlinks / devices) aren't representable and will be skipped.",
-                self.other_unsupported
-            ));
-        }
-        w
-    }
+    Ok(sink.stats)
 }
 
 /// Preflight an archive on the host against `efs`, auto-detecting compression.
@@ -511,21 +356,6 @@ pub fn preflight_tar<R: Read>(
     Ok(pf)
 }
 
-/// Return the `Normal` path components as strings, or `None` if the path is
-/// absolute or contains a `..` component (tar path-traversal guard).
-fn safe_components(p: &Path) -> Option<Vec<String>> {
-    let mut out = Vec::new();
-    for c in p.components() {
-        match c {
-            Component::Normal(s) => out.push(s.to_string_lossy().into_owned()),
-            Component::CurDir => {}
-            // RootDir, ParentDir, Prefix -> reject (escape attempt).
-            _ => return None,
-        }
-    }
-    Some(out)
-}
-
 /// The mode / ownership an archived entry asks for, or nothing when the
 /// caller turned that off (`--no-permissions`), in which case the shared
 /// resolver falls back to the replaced entry then the parent directory.
@@ -543,105 +373,6 @@ fn archived_overrides(header: &tar::Header, apply: bool) -> crate::fs::attrs::At
         uid: header.uid().ok().map(|v| v as u32),
         gid: header.gid().ok().map(|v| v as u32),
     }
-}
-
-/// Stamp mode / ownership onto an entry that already existed, so it can't
-/// be set at creation time. Only the filesystems implementing these two
-/// hooks can honour it; others report `Unsupported` and are left alone.
-fn apply_attrs_after_create(
-    efs: &mut dyn EditableFilesystem,
-    entry: &FileEntry,
-    overrides: &AttrOverrides,
-    stats: &mut TarImportStats,
-) -> Result<()> {
-    let mut applied = false;
-    if let Some(m) = overrides.mode {
-        match efs.set_permissions(entry, m) {
-            Ok(()) => applied = true,
-            Err(ref e) if is_unsupported(e) => {}
-            Err(e) => return Err(anyhow!("set_permissions {}: {e}", entry.path)),
-        }
-    }
-    if let (Some(u), Some(g)) = (overrides.uid, overrides.gid) {
-        match efs.set_owner(entry, u, g) {
-            Ok(()) => applied = true,
-            Err(ref e) if is_unsupported(e) => {}
-            Err(e) => return Err(anyhow!("set_owner {}: {e}", entry.path)),
-        }
-    }
-    if applied {
-        stats.perms_applied += 1;
-    }
-    Ok(())
-}
-
-/// Ensure every directory named by `comps` exists under the import root,
-/// creating missing ones (mkdir -p). Returns the deepest directory's entry.
-///
-/// `leaf_overrides` applies to the LAST component only — that is the one
-/// the archive has an entry for. Intermediate components are implicit
-/// parents the archive never described, so they take the resolver's
-/// inherit-from-parent default.
-fn ensure_dir(
-    efs: &mut dyn EditableFilesystem,
-    cache: &mut HashMap<String, FileEntry>,
-    comps: &[String],
-    stats: &mut TarImportStats,
-    leaf_overrides: &AttrOverrides,
-) -> Result<FileEntry> {
-    let mut key = String::new();
-    let mut parent = cache.get("").expect("root cached").clone();
-    let last = comps.len().saturating_sub(1);
-    for (i, comp) in comps.iter().enumerate() {
-        let next_key = if key.is_empty() {
-            comp.clone()
-        } else {
-            format!("{key}/{comp}")
-        };
-        if let Some(e) = cache.get(&next_key) {
-            parent = e.clone();
-            key = next_key;
-            continue;
-        }
-        let entry = match find_child(efs, &parent, comp)? {
-            Some(e) if e.is_directory() => e,
-            Some(_) => bail!("path component {comp:?} exists but is not a directory"),
-            None => {
-                let overrides = if i == last {
-                    *leaf_overrides
-                } else {
-                    AttrOverrides::default()
-                };
-                let attrs = crate::fs::attrs::resolve_dir_attrs(&overrides, None, Some(&parent));
-                let dir_opts = crate::fs::filesystem::CreateDirectoryOptions {
-                    mode: Some(attrs.dir_mode()),
-                    uid: Some(attrs.uid),
-                    gid: Some(attrs.gid),
-                    ..Default::default()
-                };
-                let e = efs
-                    .create_directory(&parent, comp, &dir_opts)
-                    .map_err(|err| anyhow!("create_directory {comp:?}: {err}"))?;
-                stats.dirs_created += 1;
-                e
-            }
-        };
-        cache.insert(next_key.clone(), entry.clone());
-        parent = entry;
-        key = next_key;
-    }
-    Ok(parent)
-}
-
-fn find_child(
-    efs: &mut dyn EditableFilesystem,
-    parent: &FileEntry,
-    name: &str,
-) -> Result<Option<FileEntry>> {
-    let children = efs
-        .list_directory(parent)
-        .map_err(|e| anyhow!("list_directory {}: {e}", parent.path))?;
-    Ok(children.into_iter().find(|c| c.name == name))
 }
 
 #[cfg(test)]

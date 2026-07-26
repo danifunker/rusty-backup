@@ -4696,6 +4696,15 @@ impl App {
                                     crate::partition::sgi_hdd_builder::DEFAULT_SECTORS_PER_TRACK,
                                 inodes: None,
                                 bytes_per_inode: None,
+                                // The TUI's "new disk" flow formats only; it
+                                // has no folder picker, so populating stays a
+                                // separate `import` step.
+                                from_dir: None,
+                                expand_archives: false,
+                                flatten_folders: false,
+                                force: false,
+                                no_permissions: false,
+                                include_appledouble: false,
                             })
                         }
                     },

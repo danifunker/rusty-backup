@@ -48,6 +48,7 @@ rb-cli du  disk.dsk "/System Folder" --json   # recursive both-fork (data+resour
 rb-cli cp  floppy.adf / harddisk.hda@1 /Floppies/d01/ -r   # consolidate an image onto a HD
 rb-cli tar irix.img@1 / irix.tar.gz   # archive a case-sensitive volume (keeps case + symlinks)
 rb-cli untar disk.hda src.tar.gz /   # import an archive's contents INTO an image (skips ._* + unstorable names)
+rb-cli import disk.hda ./stuff /     # copy a whole host folder in; --expand-archives unpacks tarballs it finds
 rb-cli get backup.zip /unix ./unix --inside disk.img   # extract from a RAW disk inside a .zip
 rb-cli fsck disk.dsk --checkonly
 rb-cli inspect disk.hda
@@ -61,6 +62,9 @@ rb-cli new hd x68k c.hdf --size 32M --variant scsi --system-disk human68k.dim \
                           --builtin-boot-sector            # zero manual steps, no donor needed
 rb-cli new hd sgi-efs irix.img --size 50M                     # IRIX SGI dvh + EFS root HDD
 rb-cli optical new sgi-efs irix.iso --size 600M                  # IRIX EFS CD-ROM (slot-7 SYSV, mount -t efs)
+rb-cli optical new sgi-efs irix.iso --size auto --from-dir ./sgi-stuff  # format + fill in one step
+rb-cli optical new sgi-efs irix.iso --size auto --from-dir ./sgi-stuff \
+       --expand-archives --flatten-folders   # unpack every .tardist into one inst-ready root
 rb-cli put irix.img@1 ./bstoolbox /bstoolbox               # populate its EFS root partition
 rb-cli mac-scsi-bless mac.hda                              # install Apple SCSI driver + DDR
 rb-cli mac-scsi-bless mac.hda --driver-from donor.hda      # use a donor disk's driver verbatim

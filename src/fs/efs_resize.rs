@@ -432,19 +432,23 @@ fn relocate_bitmap<R: Read + Write + Seek>(
         old_bmsize_sectors
     ));
 
+    // Confine the search to cylinder-group data areas. The bitmap's own
+    // blocks are marked in-use so the allocator skips them anyway, but
+    // the inode tables are NOT bitmap-tracked on a real IRIX volume —
+    // parking the relocated bitmap on top of one would eat live inodes.
+    let regions = super::efs::EfsDataRegions::from_sb(sb);
     let bm = fs.staged_bitmap_mut()?;
 
-    // The bitmap's own blocks are already marked in-use, so the
-    // allocator naturally skips them. Find a contiguous run.
-    let new_ext = EfsFilesystem::<R>::alloc_contiguous_in_bitmap(bm, new_bmsize_sectors, 0)
-        .map_err(|e| match e {
-            FilesystemError::DiskFull(_) => FilesystemError::Unsupported(format!(
-                "EFS grow: bitmap relocation needs {new_bmsize_sectors} contiguous free \
+    let new_ext =
+        EfsFilesystem::<R>::alloc_contiguous_in_bitmap(bm, &regions, new_bmsize_sectors, 0)
+            .map_err(|e| match e {
+                FilesystemError::DiskFull(_) => FilesystemError::Unsupported(format!(
+                    "EFS grow: bitmap relocation needs {new_bmsize_sectors} contiguous free \
              sectors in the current volume; none found. The volume may be too fragmented; \
              consider shrinking first or running fsck repair."
-            )),
-            other => other,
-        })?;
+                )),
+                other => other,
+            })?;
     let new_bmblock = new_ext.bn;
     log(&format!(
         "EFS grow: new bitmap at block {new_bmblock} ({} sectors)",

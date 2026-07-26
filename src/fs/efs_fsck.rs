@@ -10,8 +10,10 @@
 //!   2. Replica superblock matches the primary in the resize-relevant
 //!      fields (fs_size, firstcg, cgfsize, cgisize, ncg, bmsize).
 //!   3. Inode table: every `mode != 0` inode parses cleanly, has
-//!      numextents <= 12, no extent has a non-zero `magic` byte, and
-//!      every extent's [bn, bn+length) lies inside [0, fs_size).
+//!      numextents <= 12, no extent has a non-zero `magic` byte, every
+//!      extent's [bn, bn+length) lies inside [0, fs_size), and every
+//!      block it covers is a cylinder-group *data* block rather than
+//!      filesystem metadata (`ExtentInMetadata`).
 //!   4. Bitmap shadow: count set bits, compare against the sum of all
 //!      in-use inodes' allocated extents. Flag double-allocations.
 //!   5. Connectivity: BFS from root inum 2; any mode!=0 inode outside
@@ -21,15 +23,18 @@
 //!
 //! Repairable codes (handled by `repair_efs`): Replica*Mismatch,
 //! BitmapMissingAllocation, OrphanInode. Unrepairable codes
-//! (geometry damage, ExtentPastVolume, DoubleAllocation, TooManyExtents,
-//! BitmapTooSmall, InodeReadFailed) are surfaced for diagnosis only.
+//! (geometry damage, ExtentPastVolume, ExtentInMetadata,
+//! DoubleAllocation, TooManyExtents, BitmapTooSmall, InodeReadFailed)
+//! are surfaced for diagnosis only — `ExtentInMetadata` in particular
+//! means file content has already overwritten inodes, which no bitmap
+//! edit can undo.
 
 use std::collections::HashSet;
 use std::io::{Read, Seek};
 
 use super::efs::{
-    parse_dir_block, resolve_owned_extents, EfsExtent, EfsFilesystem, EfsSuperblock, EFS_BLOCKSIZE,
-    EFS_DIRECTEXTENTS_MAX,
+    parse_dir_block, resolve_owned_extents, EfsDataRegions, EfsExtent, EfsFilesystem,
+    EfsSuperblock, EFS_BLOCKSIZE, EFS_DIRECTEXTENTS_MAX,
 };
 use super::filesystem::FilesystemError;
 use super::fsck::{FsckIssue, FsckResult, FsckStats, OrphanedEntry};
@@ -131,6 +136,24 @@ fn walk_extent(
         );
         return;
     }
+    // An extent may only point at cylinder-group DATA blocks. Anything
+    // else — the reserved head, the bitmap, or a cylinder group's inode
+    // table — means file content is sitting on top of filesystem
+    // metadata. The inode tables are the dangerous case: IRIX does not
+    // track them in the free bitmap, so an allocator that trusts the
+    // bitmap alone will hand them out and overwrite live inodes.
+    let regions = EfsDataRegions::from_sb(sb);
+    if let Some(bad) = (ext.bn..end).find(|blk| !regions.contains(*blk)) {
+        b.err(
+            "ExtentInMetadata",
+            format!(
+                "inode {inum} {label} extent {idx}: [{}..{}) covers block {bad}, which is not a \
+                 cylinder-group data block (file content is overwriting filesystem metadata)",
+                ext.bn, end
+            ),
+        );
+    }
+
     for blk in ext.bn..end {
         if !allocated.insert(blk) {
             b.err(
@@ -462,6 +485,48 @@ mod tests {
                 .iter()
                 .map(|e| (&e.code, &e.message))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    /// An extent pointing into a cylinder group's inode table means
+    /// file content is sitting on top of live inodes — the shape a
+    /// bitmap-only allocator produced on real IRIX volumes, where the
+    /// inode-table bits read as free. fsck has to name it, and it is
+    /// not repairable: the overwritten inodes are already gone.
+    #[test]
+    fn fsck_flags_an_extent_that_covers_the_inode_table() {
+        let img = build_clean_volume();
+        let mut fs = EfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        // Give the volume a live root directory, but point it at block
+        // 19 — CG 0's second inode-table block — the way the old
+        // allocator would have.
+        let mut root = fs.read_inode_readonly(2).expect("root inode");
+        root.mode = 0o040755;
+        root.nlink = 2;
+        root.size = 512;
+        root.numextents = 1;
+        root.extents[0] = EfsExtent {
+            magic: 0,
+            bn: 19,
+            length: 1,
+            offset: 0,
+        };
+        fs.write_inode(&root).expect("write inode");
+
+        let result = fsck_efs(&mut fs).expect("fsck");
+        let hit = result
+            .errors
+            .iter()
+            .find(|e| e.code == "ExtentInMetadata")
+            .expect("expected ExtentInMetadata");
+        assert!(
+            hit.message.contains("block 19"),
+            "message should name the offending block, got: {}",
+            hit.message
+        );
+        assert!(
+            !hit.repairable,
+            "overwriting inodes is not something repair can undo"
         );
     }
 

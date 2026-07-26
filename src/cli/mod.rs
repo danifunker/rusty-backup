@@ -116,6 +116,12 @@ pub enum Command {
     /// supports them.
     Untar(verbs::untar::UntarArgs),
 
+    /// Copy a host directory tree INTO a filesystem in an image — the bulk
+    /// counterpart to `put`, with no tarball needed. `--expand-archives`
+    /// unpacks tar archives found in the tree instead of copying them in
+    /// whole.
+    Import(verbs::import::ImportArgs),
+
     /// Copy files / directory trees between two disk images without
     /// staging through the host. SRC may be a glob; DST follows `cp`
     /// semantics (into an existing directory, or rename to a target).
@@ -464,6 +470,7 @@ pub fn dispatch(command: Command) -> Result<()> {
         Command::Get(args) => verbs::get::run(args),
         Command::Tar(args) => verbs::tar::run(args),
         Command::Untar(args) => verbs::untar::run(args),
+        Command::Import(args) => verbs::import::run(args),
         Command::Cp(args) => verbs::cp::run(args),
         Command::Rm(args) => verbs::rm::run(args),
         Command::Mkdir(args) => verbs::mkdir::run(args),
