@@ -5,29 +5,52 @@ Practical build notes for transpiling the rusty-backup engine to C with
 a PowerPC Mac (Tiger 10.4 / Leopard 10.5). This is the *how*; the *why* and the
 scope decisions live in [`native_osx_10_dot_3.md`](native_osx_10_dot_3.md).
 
-Companion script: [`../scripts/build-ppc.sh`](../scripts/build-ppc.sh).
+Companion scripts: [`../scripts/build-ppc.sh`](../scripts/build-ppc.sh) (driver),
+[`../scripts/ppc-cc-remote.py`](../scripts/ppc-cc-remote.py) (the remote C
+compiler), [`../scripts/ppc-libc-probe.py`](../scripts/ppc-libc-probe.py) and
+[`../scripts/ppc-libc-compare.py`](../scripts/ppc-libc-compare.py) (libc ground
+truth).
 
-Status (2026-07-24): **host libstd + full dependency-graph resolution work; the
-host transpile of the engine is the next thing to validate; the PPC half is
-blocked on a `powerpc-apple-darwin` libc.** See "Known blockers" at the bottom.
+Status (2026-07-25): **the full Rust standard library - core, alloc, std,
+panic_unwind, test, libc - builds for `powerpc-apple-darwin` and links into a
+running PowerPC Mach-O binary.** Getting there took five mrustc fixes and two
+rustc-source patches, all listed below. The remaining work is *correctness*, not
+*buildability*: several `libc` struct definitions describe modern macOS and are
+wrong for 10.4/10.5, which is a silent-at-compile-time, wrong-at-runtime class of
+bug. See "The libc situation" below.
 
 ## The two-machine model
 
-mrustc is a *transpiler* — Rust in, C99 out. It never emits a PowerPC binary.
+mrustc is a *transpiler* - Rust in, C99 out. It never emits a PowerPC binary.
 A PowerPC-Darwin C compiler does that, and there's no sane cross-gcc for it on
-modern macOS, so the C is compiled *on the G4*.
+a modern host, so the C is compiled *on the Mac*.
 
 ```
-   Modern Mac (fast)                         G4 / PowerPC Tiger
+   This machine (fast)                       PowerPC Mac (over ssh)
    ----------------------------------        --------------------------------
-   Rust  --mrustc-->  C99  (+ record         C99  --gcc-mp-10-->  PowerPC
-          the compile command, don't run)          Mach-O binary, runs here
+   Rust  --mrustc-->  C99            --->    C99  --gcc10-->  PowerPC Mach-O
 ```
 
-The dividing line is the `.c` files. Rust and mrustc never run on the G4; gcc
-and the finished binary never run on the Mac. The one deliberate exception:
-the **host** path builds a native this-Mac `rb-cli` straight through mrustc as
-proof the whole engine transpiles before we involve PowerPC at all.
+You do **not** run this in two manual halves.
+[`scripts/ppc-cc-remote.py`](../scripts/ppc-cc-remote.py) *is* the C compiler as
+far as mrustc is concerned: point `CC_powerpc_apple_darwin` at it and every
+codegen step ships its `.c` over ssh, runs gcc there, and copies the `.o` back.
+minicargo's dependency graph, parallelism and incremental rebuilds keep working
+across the two machines. mrustc passes its arguments in a response file
+(`cc @cmdfile`); the wrapper handles that form.
+
+The wrapper also owns the platform's link line, which is not obvious:
+
+| flag | why |
+|---|---|
+| `-latomic` | 32-bit PowerPC has no lock-free 8-byte atomic; the `__atomic_*_8` calls mrustc emits for `AtomicU64` live in libatomic |
+| `-lMacportsLegacySupport` | `pthread_setname_np` is 10.6+ |
+| `-lgcc_s.1` | `_Unwind_GetIPInfo`, used by std's DWARF personality routine |
+| `rb-cli-ppc/shim/ppc-compat.o` | `lgammaf_r`, which Leopard's libm lacks (it has `lgamma_r` and `lgammaf`, just not the float reentrant form) |
+
+`_Unwind_GetIPInfo` is in Leopard's `libgcc_s.1` but **not** in
+`libgcc_s.10.4`, so a binary that must run on Tiger needs gcc10's own unwinder
+or `panic=abort`. That is an open item.
 
 ## What transpiles vs. what stays hand-written C
 
@@ -39,88 +62,136 @@ proof the whole engine transpiles before we involve PowerPC at all.
 
 ## Prerequisites
 
-### Modern Mac
-- An mrustc clone **with the two parser patches** (see below), on branch
-  `rb-cli-vintage-build` (fork: `github.com/danifunker/mrustc`).
+### This machine (the transpile host)
+- An mrustc clone **with the fixes below**, on branch `rb-cli-vintage-build`
+  (fork: `github.com/danifunker/mrustc`).
 - The rustc **1.74.0** source: `make RUSTCSRC RUSTC_VERSION=1.74.0` in the
-  mrustc dir (downloads `rustc-1.74.0-src/`).
+  mrustc dir (downloads `rustc-1.74.0-src/` and applies
+  `rustc-1.74.0-src.patch`, which carries the two stdlib fixes below).
 - A modern `cargo` (for `cargo vendor` only).
+- ssh key auth to the PowerPC Mac, and `rsync`.
 
-### G4 (PowerPC Tiger/Leopard)
-- MacPorts **gcc10** (`gcc-mp-10`) — needed for mrustc's C11 `<stdatomic.h>`;
-  stock Xcode-2 gcc-4.0 will not do.
-- MacPorts **legacy-support** — backfills `clock_gettime` etc. that Tiger's
-  libSystem lacks (usually pulled in as a gcc10 dependency already).
+### The PowerPC Mac
+Verified on a dual-G5 (PowerPC 970, 4 GB) running Leopard 10.5.8:
+- **gcc 10.5.0** at `/opt/local/libexec/gcc10-bootstrap/bin/gcc`
+  (`powerpc-apple-darwin9`) - required for mrustc's C11 `<stdatomic.h>`; stock
+  Xcode gcc-4.0/4.2 lack it. It also supplies `libatomic` and emulated TLS.
+- **MacportsLegacySupport** at `/opt/local/lib` - backfills `pthread_setname_np`,
+  `clock_gettime` and friends.
+- `/Developer/SDKs/MacOSX10.4u.sdk` (and 10.3.9 / 10.5) for the libc probes.
 
-## The two required mrustc patches
+For scale: libcore's 29.7 MB of emitted C compiles on the G5 in ~104 seconds, so
+a full stdlib build is minutes, not hours.
 
-minicargo's minimal TOML/manifest parser can't read rusty-backup's real
-`Cargo.toml` set. Both fixes are committed on `rb-cli-vintage-build`:
+## mrustc fixes this needed
 
-1. **`tools/common/toml.{cpp,h}`** — the TOML parser only accepted string array
+All committed on `rb-cli-vintage-build`; each is a candidate upstream PR.
+
+**Manifest parsing** (pre-existing, needed to read rusty-backup's Cargo.toml set):
+
+1. **`tools/common/toml.{cpp,h}`** - the TOML parser only accepted string array
    elements and three escape sequences. It aborted on the parent `Cargo.toml`'s
    `[package.metadata.deb/rpm/aur]` sections (array-of-array / array-of-inline-
-   table `assets`) and on multi-line-string line-continuations. Added nested
-   `[...]`/`{...}` skipping, integer/bool array elements, and the full escape
-   set. (minicargo parses the *parent* manifest, not just `rb-cli-vintage`'s —
-   fixing the parser leaves both Cargo.tomls untouched.)
-2. **`tools/minicargo/manifest.cpp`** — accept `crate-type = ["lib"]` (cargo's
+   table `assets`) and on multi-line-string line-continuations. **Merged
+   upstream.**
+2. **`tools/minicargo/manifest.cpp`** - accept `crate-type = ["lib"]` (cargo's
    alias for the default rlib; `serde_yml` declares it).
 
-Both are candidate upstream PRs.
+**PowerPC support** (this round):
 
-### Plus: a macOS build-script override set
+3. **`src/parse/lex.cpp`** - an unrecognised integer-literal suffix was a hard
+   error. rustc's lexer accepts an arbitrary identifier there and only rejects it
+   when the literal is *evaluated*, so a suffixed literal that only appears in a
+   `macro_rules!` matcher is legal. `core_arch`'s PowerPC intrinsics select
+   `impl_vec_trait!` arms with bare `2b` / `3b` / `4b` tokens, which made libcore
+   unbuildable for **every** `powerpc*` target. Now the suffix is emitted as a
+   following ident token; matcher and invocation split identically, so macro
+   matching is unaffected.
+4. **`src/hir_conv/constant_evaluation.cpp`** - added the `arith_offset` and
+   `ptr_guaranteed_cmp` intrinsics. Both are reached through 32-bit-only paths in
+   `core::slice::ascii`, so this affects any 32-bit target, not just PowerPC.
+5. **`src/trans/target.cpp`** - `ARCH_POWERPC` declared no 64-bit atomic, which
+   cfg's `AtomicU64` out of libcore; libstd's `sys::unix::time` uses it
+   unconditionally on macOS, so libstd could not build. 32-bit PowerPC has no
+   lock-free 8-byte atomic instruction, but it does not need one: `_Atomic
+   uint64_t` lowers to `__atomic_*_8` calls that libatomic implements with a
+   lock. Also added `-l atomic` to the target's linker options.
+6. **`tools/minicargo/build.cpp`** - `debug_assertions` was unconditional; added
+   `MINICARGO_NO_DEBUG_ASSERTIONS`. Required here, for the reason in "The
+   alignment problem" below.
 
-mrustc ships `script-overrides/stable-1.74.0-{linux,windows}` but **not
-`-macos`**. `build-ppc.sh` (stage `overrides`) creates it, derived from the
-linux set — only `build_libc.txt` (first cfg `freebsd11` -> `darwin`) and the
-`STD_ENV_ARCH` in `build_std.txt` differ.
+**rustc-source patches** (in `rustc-1.74.0-src.patch`):
+
+7. **`library/std/src/sys/unix/fs.rs`** - `macos_weak` is compiled for every
+   non-aarch64 macOS target but only defines the `fdopendir` weak symbol for x86
+   and x86_64. On any other 32-bit macOS target neither arm is emitted, so the
+   name resolves to the enclosing function and `.get()` has no applicable method.
+   10.4 has no `$INODE64` variants at all, so the plain symbol is the correct one
+   there; on Tiger the weak lookup returns `None` and `remove_dir_all` falls back
+   to its non-`openat` path, which is the intent of the module.
+8. **`library/std/src/sys/unix/thread_parking/mod.rs`** - std's Darwin thread
+   parker is built on libdispatch (`dispatch_semaphore_*`), which is 10.6+.
+   `powerpc-apple-darwin` is by definition 10.4/10.5, so it falls through to the
+   generic pthread parker.
+
+### Plus: a macOS/PowerPC build-script override set
+
+mrustc ships `script-overrides/stable-1.74.0-{linux,windows}` but not `-macos`.
+`build-ppc.sh` creates both `-macos` and `-macos-powerpc`; they differ only in
+`STD_ENV_ARCH`. The `-powerpc` variant matters because minicargo.mk picks
+`OVERRIDE_SUFFIX` from the **host** OS, so a cross build from Linux would
+otherwise use the linux set (whose `build_libc.txt` declares `freebsd11`).
 
 ### And: `MRUSTC_TARGET_VER`
 
 Every mrustc/minicargo invocation must run with `MRUSTC_TARGET_VER=1.74`
 exported, or it silently parses in **1.29 mode**. The Makefile does *not* set it
-for the `LIBS` target — the script does.
+for the `LIBS` target - the script does.
 
 ## Running it
 
 ```sh
-# defaults: MRUSTC_DIR=~/repos/mrustc  RB_DIR=~/repos/rusty-backup
-scripts/build-ppc.sh            # runs the host path end to end
-scripts/build-ppc.sh hostlibs   # or one stage at a time
+export PPC_HOST=admin@192.168.99.116        # the PowerPC Mac
+scripts/build-ppc.sh                        # the host path, end to end
+scripts/build-ppc.sh ppclibs                # PowerPC stdlib
+scripts/build-ppc.sh ppc                    # PowerPC rb-cli
+scripts/build-ppc.sh probe                  # libc ground truth from the SDKs
 ```
 
 Stages, in order:
 
-| stage | what | cost | status |
-|------|------|------|--------|
-| `mrustc`   | build mrustc + minicargo (verifies the patches) | mins | ok |
-| `overrides`| create the macOS 1.74 override set | instant | ok |
-| `hostlibs` | transpile+compile host libcore/alloc/std | ~mins, heavy | **ok** (33 MB libstd.c -> .o) |
-| `vendor`   | `cargo vendor` the 240+ deps | mins | ok |
-| `host`     | transpile+build a native `rb-cli` | heavy | **next to validate** |
-| `ppclibs`  | build PowerPC libstd | — | **blocked (libc)** |
-| `ppc`      | emit PPC C (deferred codegen) | — | after `ppclibs` |
+| stage | what | status |
+|------|------|--------|
+| `mrustc`   | build mrustc + minicargo (verifies the patches) | ok |
+| `overrides`| create the macOS 1.74 override sets | ok |
+| `hostlibs` | transpile+compile host libcore/alloc/std | ok |
+| `vendor`   | `cargo vendor` the 240+ deps | ok |
+| `hostc`    | emit the engine's C on this machine (deferred codegen) | ok |
+| `host`     | transpile+build a native `rb-cli` | to validate |
+| `ppclibs`  | **PowerPC libcore/alloc/std/panic_unwind/test/libc** | **ok** |
+| `ppc`      | PowerPC `rb-cli` | next |
+| `probe`    | capture libc ground truth from the 10.4u / 10.5 SDKs | ok |
 
-The `host` stage is the real test: it feeds all 244 crates (your engine
-included) through mrustc for the first time. Per-crate lowering errors, if any,
-surface here.
-
-## The G4 half (once `ppc` emits C)
-
-`stage_ppc` writes C + records the compile command *without running a compiler*
-(`MINICARGO_DEFER_CODEGEN=1`). Ship it over and compile natively:
+Building the PowerPC stdlib by hand, if you want to skip the driver:
 
 ```sh
-scp -r ~/repos/mrustc/output-rb-ppc  you@g4.local:~/rb-ppc
-# on the G4:
-cd ~/rb-ppc
-gcc-mp-10 *.c -o rb-cli \
-    -I/opt/local/include/LegacySupport -L/opt/local/lib -lMacportsLegacySupport
-./rb-cli --help
+cd ~/repos/mrustc
+PPC_HOST=admin@g5.local \
+PPC_SHIM=~/repos/rusty-backup/rb-cli-ppc/shim/ppc-compat.c \
+CC_powerpc_apple_darwin=~/repos/rusty-backup/scripts/ppc-cc-remote.py \
+MRUSTC_TARGET_VER=1.74 MINICARGO_DEFER_CODEGEN=1 MINICARGO_NO_DEBUG_ASSERTIONS=1 \
+make -f minicargo.mk LIBS RUSTC_VERSION=1.74.0 \
+     MRUSTC_TARGET=powerpc-apple-darwin \
+     OVERRIDE_SUFFIX=-macos-powerpc PARLEVEL=3
 ```
-Finalize the exact `-I/-L/-l` flags from the compile command mrustc recorded
-(swap its compiler for `gcc-mp-10`, add legacy-support).
+
+and then a hello-world against it:
+
+```sh
+bin/mrustc hello.rs -o output-1.74.0-powerpc-apple-darwin/hello \
+    --target powerpc-apple-darwin -L output-1.74.0-powerpc-apple-darwin -O
+ssh $PPC_HOST './ppc-xbuild/output-1.74.0-powerpc-apple-darwin/hello'
+```
 
 ## rb-cli-ppc deviations (mrustc workarounds)
 
@@ -136,40 +207,114 @@ around a specific mrustc gap (all documented at their site):
 - **YAML** (`serde_yml` -> `libyml`) — an mrustc macro-expansion gap
   (`TOK_RWORD_AS`); to be dropped via an engine feature-gate.
 
-## Known blockers (in order)
+## The alignment problem (the one real design wart)
 
-1. ~~minicargo can't parse the manifest~~ — fixed (the two patches).
-2. ~~no macOS 1.74 override set~~ — fixed (stage `overrides`).
-3. ~~mrustc const-generic `CallPath` abort~~ (crc) — worked around (turbofish).
-   The general mrustc fix (inferring const-generic impl params from the result
-   type in `visit_call_populate_cache`) is deep and unfinished.
-4. **The engine's diverse long tail** — the whole-engine transpile hits ~6
-   distinct mrustc gaps + target-specific noise (see `native_osx_10_dot_3.md` §
-   "Where this stands"). The scope-down is to transpile the **portable engine**
-   and **exclude `os/`** — which drops `libc`/`nix`/`objc2` (the platform layer,
-   hand-C on PPC anyway) and most of the pain. NOT FAT-only; all filesystems.
-5. **`powerpc-apple-darwin` libc** (for the real target) — no arch file exists
-   (the `libc` crate postdates PPC Macs; rust-ppc-tiger has none — it's a
-   separate hand-C-runtime approach, not liftable). It must be **created**, and
-   the ground truth is on hand: build it from the **MacOSX10.4u SDK** on a real
-   PowerPC Mac (see below).
-6. **C++ deps** stay off forever (`chd` = libchdman). Already excluded.
+Darwin/PowerPC uses the **"power" alignment ABI**: a struct's alignment follows
+its *first* member, so an 8-byte member that is not first is only 4-aligned.
+Rust's `repr(C)` uses the max-member rule. mrustc already models the PowerPC rule
+(`src/trans/target.cpp`), and it has to: mrustc emits every struct as a plain C
+struct and lets the C compiler lay it out, so mrustc's model must match gcc's or
+the `sizeof_assert` / `alignof_assert` typedefs it emits fail to compile. That is
+also a useful safety net - a layout disagreement is a compile error, not silent
+corruption.
 
-## Building the `powerpc-apple-darwin` libc arch file
+The cost is that the rule applies to Rust's own types too, and there a field can
+land at an offset that does not satisfy `align_of::<FieldTy>()`.
+`std::thread::Inner` is the concrete casualty: mrustc puts its `ThreadId` (a
+`NonZeroU64`, align 8) at offset 84, and `ptr::write`'s
+`assert_unsafe_precondition!` then aborts **every** program inside `std::rt::init`,
+before `main`:
 
-A real PowerPC Mac (Power Mac G5, Leopard 10.5.8) provides everything:
+```
+thread panicked while processing panic. aborting.
+#8  ZRIG2cD8std..thread6Thread0g3new0g
+#21 ZRG2cD8std0_0_02rt4init0g
+  "unsafe precondition(s) violated: ptr::write requires that the pointer
+   argument is aligned and non-null"
+```
 
-- **`MacOSX10.4u.sdk`** under `/Developer/SDKs/` (universal, includes PPC) — the
-  authoritative C definitions for the Tiger target. Also 10.3.9 / 10.2.8 SDKs
-  and the running system's `/usr/include`.
-- **Native `gcc-4.0.1` / `gcc-4.2.1`** (`powerpc-apple-darwin9`, `arch: ppc`) —
-  enough to compile probe programs (no C11 needed for probes).
+The generated C is still *correct* - gcc knows the member's real alignment and
+emits matching accesses - so the current answer is to build the PowerPC stdlib
+with `MINICARGO_NO_DEBUG_ASSERTIONS=1`, which compiles those checks out.
 
-Method (don't eyeball the headers — big-endian struct alignment is where you get
-silently-wrong field offsets): compile small C probes on real PPC that emit
-`sizeof` / `offsetof` / `alignof` and constant values for every type the Rust
-`libc` unix layer needs, then generate the `apple`/`powerpc` arch file to match.
-`bindgen` against the 10.4u SDK is a faster first draft but finicky with old
-SDKs + a ppc target, so probe-and-validate on hardware is the trustworthy finish.
-(For compiling mrustc's *emitted* C on this box you still need MacPorts gcc for
-C11 `<stdatomic.h>` — the stock 4.0/4.2 lack it. The probes don't.)
+That is a workaround, not a fix. Restricting the PowerPC rule to `repr(C)` was
+tried and does not work: gcc then disagrees with mrustc about Rust types and
+libcore fails its own `alignof_assert`. A real fix means making mrustc stop
+delegating layout to the C compiler for `repr(Rust)` types - emitting explicit
+padding members plus a forced `__attribute__((aligned))` - which is a much larger
+change. 32-bit PowerPC is the only arch where this arises: it is the sole target
+with 32-bit pointers but 8-byte-aligned `u64`.
+
+## The libc situation
+
+The old plan assumed a `powerpc-apple-darwin` `libc` arch file had to be written
+from scratch. It does not: libc's `unix/bsd/apple/b32` module is arch-agnostic,
+and libc **compiles for this target unchanged**. `target_arch = "powerpc"` also
+happens to pick the right symbol variants, because the `$UNIX2003` / `$INODE64`
+`link_name` overrides are gated on `target_arch = "x86"` and so do not apply -
+and 10.4 has none of those symbols.
+
+What is *not* right is several struct definitions, which describe modern macOS.
+This is the dangerous class: it compiles cleanly and is wrong at runtime, because
+mrustc's asserts only check mrustc's layout against gcc's layout of *mrustc's own
+declaration* - not against the SDK's real struct.
+
+`scripts/ppc-libc-probe.py` captures ground truth by compiling `sizeof` /
+`alignof` / `offsetof` probes on the real machine against a real SDK;
+`scripts/ppc-libc-compare.py` diffs that against what libc's Rust declarations
+would lay out. Results are checked in under `rb-cli-ppc/probe/`. Against the
+10.4u SDK: **71 structs match exactly, 23 do not.** The important ones:
+
+| struct | libc says | 10.4 really is |
+|---|---|---|
+| `stat` | 112 bytes, `st_ino: u64`, `st_*time_nsec`, `st_birthtime` | **96 bytes**, `st_ino` 4 bytes at offset 4, no nsec, no birthtime |
+| `statfs` | 2168 bytes, 8-byte counters, 1024-char paths | **272 bytes**, 4-byte counters, 90-char paths |
+| `dirent` | 1048 bytes, `d_ino: u64`, `d_seekoff` | **264 bytes**, `d_ino` 4 bytes, no `d_seekoff`, `d_name[256]` |
+| `rusage`, `ipc_perm`, `passwd`, `group`, `sigevent`, `siginfo_t`, ... | modern layout | see `rb-cli-ppc/probe/ppc-10.4u.report.txt` |
+
+So `fs::metadata`, `read_dir` and anything statfs-shaped will return garbage
+until an arch file lands. That arch file is now a *mechanical* job with the
+ground truth in hand, which is the point of the probes.
+
+Two further findings from the same probes, both worth knowing:
+
+- Tiger has no `<spawn.h>`, `<copyfile.h>` or `<libproc.h>` (all 10.5).
+- 10.4's libSystem has **no** `$INODE64` symbols and no `daemon$1050`; its
+  `$UNIX2003` set is 62 symbols vs Leopard's 173. `ppc` and `i386` are identical
+  in this respect on both SDKs, so nothing here is PowerPC-specific.
+
+Note the probe runner can only exercise arches the machine can execute, so `i386`
+probes cannot be captured on a PowerPC Mac; the useful axis is 10.4u vs 10.5,
+both of which are checked in.
+
+## Where this stands
+
+Done:
+
+1. ~~minicargo can't parse the manifest~~ - fixed (fixes 1-2).
+2. ~~no macOS 1.74 override set~~ - fixed (`build-ppc.sh`).
+3. ~~mrustc const-generic `CallPath` abort~~ (crc) - worked around with a
+   turbofish patch on the vendored source; the general mrustc fix (inferring
+   const-generic impl params from the result type) is deep and unfinished.
+4. ~~libcore won't build for `powerpc-apple-darwin`~~ - fixed (fixes 3-4).
+5. ~~no `powerpc-apple-darwin` libc~~ - it turned out libc *compiles* for this
+   target unchanged; the work is correcting struct layouts, and the ground truth
+   is captured. See "The libc situation".
+6. ~~libstd won't build~~ - fixed (fixes 5-8).
+7. ~~nothing links~~ - fixed (the wrapper's link line + `ppc-compat.c`).
+
+Open, in rough priority order:
+
+1. **A `powerpc-apple-darwin` libc arch file.** Mechanical now: 23 structs, with
+   measured offsets in `rb-cli-ppc/probe/`. `stat` / `statfs` / `dirent` first -
+   they gate `fs::metadata` and `read_dir`.
+2. **The alignment workaround.** `MINICARGO_NO_DEBUG_ASSERTIONS=1` is a
+   workaround; see "The alignment problem" for what a real fix costs.
+3. **Tiger (10.4) vs Leopard (10.5).** Everything so far is built and run on
+   10.5. `_Unwind_GetIPInfo` is absent from `libgcc_s.10.4`, so a 10.4 binary
+   needs gcc10's own unwinder or `panic=abort`. The 10.4 struct layouts are
+   already measured.
+4. **The engine itself** (`scripts/build-ppc.sh ppc`) - the stdlib is the hard
+   part and it is done, but the 244-crate graph has its own long tail (see the
+   deviations above).
+5. **C++ deps stay off forever** (`chd` = libchdman). Already excluded.

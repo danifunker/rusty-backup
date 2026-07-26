@@ -7,55 +7,69 @@ limited to `rb-cli`; the GUI is a separate question (see the end). See
 
 ## Where this stands (2026-07-25)
 
-**Toolchain proven.** mrustc builds and runs (both an arm Mac and an x86_64
-Linux box, `m900`). It transpiles Rust to C99; `powerpc-apple-darwin` is a
-built-in target. The x86_64-linux host is mrustc's best-supported target and is
-our current proxy while the PPC libc is unbuilt.
+**The Rust standard library builds and runs on PowerPC.** `core`, `alloc`, `std`,
+`panic_unwind`, `panic_abort`, `test`, `libc`, `hashbrown`, `compiler_builtins`
+and `std_detect` all transpile for `powerpc-apple-darwin`, compile to PowerPC
+Mach-O, and link into a binary that executes on a Power Mac G5 under Leopard
+10.5.8. This was the top risk in section 3 and section 10, and it is retired.
 
-**Two mrustc source fixes landed.** (1) TOML parser: nested arrays / inline
-tables / full escape set — **merged upstream** (thepowersgang/mrustc). (2) A
-`CallPath` typecheck revisit — partial; see below.
+**The two-machine pipeline is automatic.** There is no usable
+`powerpc-apple-darwin` cross-gcc, so
+[`scripts/ppc-cc-remote.py`](../scripts/ppc-cc-remote.py) *is* the C compiler as
+far as mrustc is concerned: it ships each emitted `.c` to the Mac over ssh, runs
+MacPorts gcc 10.5.0 there, and copies the `.o` back. minicargo's dependency
+graph, parallelism and incremental rebuilds keep working across both machines.
+libcore's 29.7 MB of C compiles on the G5 in ~104 seconds.
 
-**The engine transpiles far but hits a *diverse long tail* of mrustc gaps.**
-Across ~45 of 240 crates we hit ~6 distinct issues plus target-specific noise:
-- `bumpalo` (const-generic infer) — dropped via a zip feature deviation.
-- `constant_time_eq` (aarch64 `asm!`) — a *host* artifact; x86_64 handles it.
-- `crc` (const-generic `Digest::new`) — worked around with a turbofish patch;
-  mrustc genuinely can't infer const-generic impl params from context.
-- `jiff-core` (const-generic) — dropped by pinning env_logger to 0.10.
-- `libyml` (macro-expansion gap) — YAML output; needs a feature-gate.
-- `libc` 0.2.189 (`linux::can` path-res) — a *host* artifact (Linux-only code).
+**Eight fixes were needed**, all recorded in
+[`build-ppc-mrustc.md`](build-ppc-mrustc.md): three mrustc compiler fixes (an
+over-strict integer-literal-suffix lexer that made libcore unbuildable for every
+`powerpc*` target; two missing const-eval intrinsics reached only on 32-bit
+targets), one target-descriptor fix (declaring 64-bit atomics, which libatomic
+provides), one minicargo knob, and two rustc-stdlib patches (macOS-only code that
+assumed x86 or assumed libdispatch). Several are not PowerPC-specific and are
+candidate upstream PRs.
 
-**The load-bearing finding: the pain splits by layer.** The **portable engine**
-(fs drivers, partition, backup/restore, formats) is tractable with per-crate
-workarounds. The **platform layer** (`os/`, `libc`, `nix`, `objc2`) is where
-most of the pain lives, it is *target-specific* (nix + libc-linux on the x64
-host; objc2 on ppc-darwin), and per §5 it is **hand-C in the PPC shell anyway**.
-So the right scope-down is to transpile the portable engine and **exclude
-`os/`** (which drops libc/nix from the graph) — this is exactly §5's
-architecture, and it is **not** FAT-only (every filesystem stays). The first PPC
-`rb-cli` operates on disk-image files; raw-device I/O is the later hand-C shell.
+**The libc premise was wrong, in a good way.** This plan said a
+`powerpc-apple-darwin` libc arch file "must be created". In fact `libc`'s
+`unix/bsd/apple/b32` module is arch-agnostic and **compiles for this target
+unchanged**, and `target_arch = "powerpc"` even selects the right symbol variants
+by accident (the `$UNIX2003` / `$INODE64` overrides are gated on
+`target_arch = "x86"`, and 10.4 has none of those symbols). What is wrong is
+struct *layout*: libc's `apple` module describes modern macOS.
 
-**The libc port (for the real PPC target) is fully sourceable.** A real PowerPC
-Mac (Power Mac G5, Leopard 10.5.8) on the LAN carries the **MacOSX10.4u SDK**
-(plus 10.3.9 / 10.2.8) and **native `gcc-4.0.1` / `gcc-4.2.1`** (`powerpc-apple-
-darwin9`). That means the reliable method is available: compile `sizeof` /
-`offsetof` / `alignof` probes **on real PPC** against the 10.4u SDK to generate a
-byte-correct `libc` `powerpc-apple-darwin` arch file (big-endian layout is where
-you otherwise get silently-wrong offsets). No off-the-shelf Rust libc port
-exists to lift (the `libc` crate postdates PPC Macs; rust-ppc-tiger has none),
-so it must be *created* — but the ground truth is on hand.
+**That wrongness is now measured, not guessed.**
+[`scripts/ppc-libc-probe.py`](../scripts/ppc-libc-probe.py) compiles
+`sizeof`/`alignof`/`offsetof` probes on the real G5 against the real
+`MacOSX10.4u.sdk`, and
+[`scripts/ppc-libc-compare.py`](../scripts/ppc-libc-compare.py) diffs the result
+against libc's Rust declarations. Ground truth is checked in under
+`rb-cli-ppc/probe/`. Against 10.4: **71 structs match exactly, 23 do not** -
+including `stat` (96 bytes on 10.4 vs libc's 112, with a 4-byte `st_ino` and no
+birthtime), `statfs` (272 vs 2168) and `dirent` (264 vs 1048). Writing the arch
+file is now mechanical.
 
-**Revised direction:** (B-then-C) trim `rb-cli-ppc` to the portable engine
-(exclude `os/`, drop the mrustc-hostile utility deps), get *that* transpiling on
-the x64 host, then build the `powerpc-apple-darwin` libc from the G5's 10.4u SDK
-to move onto real hardware and add the platform layer back as hand-C.
+**One design wart is open.** Darwin/PowerPC's "power" alignment ABI (a struct's
+alignment follows its first member) disagrees with Rust's `repr(C)` rule. mrustc
+models the PowerPC rule and must, because it delegates layout to the C compiler -
+but that puts `std::thread::Inner`'s `ThreadId` at an offset its own `align_of`
+rejects, and `ptr::write`'s `assert_unsafe_precondition!` then aborts every
+program inside `std::rt::init`. The stdlib is currently built with
+`MINICARGO_NO_DEBUG_ASSERTIONS=1`; the generated C is correct, only the assertion
+disagrees. See "The alignment problem" in the build doc for why the obvious fix
+(restrict the rule to `repr(C)`) does not work.
 
-> **§3 was materially corrected on 2026-07-23** against the mrustc source. Two
-> claims that shaped this plan — that PPC needs the rustc 1.54 baseline, and that
-> proc macros are a hard stop — turned out to be wrong. The single-`no_std`-core
-> architecture in §5 was a consequence of those claims, so **read §3 before
-> treating §5 as settled.**
+**Revised direction:** write the `powerpc-apple-darwin` libc arch file from the
+captured probe data (`stat` / `statfs` / `dirent` first), then push the engine
+itself through (`scripts/build-ppc.sh ppc`) - the stdlib was the hard part and it
+is done. The `os/` platform layer stays out and remains hand-C, as section 5
+describes.
+
+> **Sections 3, 5, 9 and 10 predate the working build.** Section 3's "the gap
+> that actually matters: libstd for `powerpc-apple-darwin`" is answered: it
+> works. Section 5's `no_std` carve-out is therefore **not needed** - the whole
+> engine can target real `std`, which is the "categorically better deal" section
+> 9 anticipated. Read this section before treating any of those as current.
 
 ## 1. Goal
 

@@ -3,28 +3,28 @@
 # build-ppc.sh -- transpile the rusty-backup engine (rb-cli-ppc) to C via
 # mrustc, toward a native PowerPC Mac OS X 10.4/10.5 `rb-cli`.
 #
-# This is the *modern-Mac half* of a two-machine pipeline (see
-# docs/build-ppc-mrustc.md):
+# This is the driver for a two-machine pipeline (see docs/build-ppc-mrustc.md):
 #
-#     Modern Mac (this script)          G4 / PowerPC Tiger
-#     -----------------------           ------------------
-#     Rust --mrustc--> C99       --->   C99 --gcc-mp-10--> PowerPC Mach-O
+#     This machine (fast)               PowerPC Mac (over ssh)
+#     -------------------               ----------------------
+#     Rust --mrustc--> C99       --->   C99 --gcc10--> PowerPC Mach-O
 #
-# Nothing here compiles a PowerPC binary; it produces C. The G4 compiles it.
-# The one exception is the HOST stage, which builds a native (this-Mac) rb-cli
-# straight through mrustc as an end-to-end proof that the whole engine
-# transpiles. Get HOST green before touching PPC.
+# Nothing here compiles a PowerPC binary directly; mrustc produces C and
+# scripts/ppc-cc-remote.py stands in as the C compiler, shipping each
+# translation unit to the Mac and bringing the .o back. So minicargo's
+# dependency graph and parallelism keep working across the two machines.
 #
-# Reverse-engineered interactively 2026-07-24. Stages 1-4 + host-libs are
-# validated; the host transpile and the whole PPC half are works in progress
-# (the PPC half is blocked on a powerpc-apple-darwin libc -- see the doc).
+# The HOST stages build a native this-machine rb-cli straight through mrustc as
+# an end-to-end proof that the whole engine transpiles. Get HOST green before
+# spending time on PowerPC.
 #
 # Usage:
 #   scripts/build-ppc.sh            # run every stage in order (host path)
 #   scripts/build-ppc.sh <stage>    # run a single stage
-#   stages: mrustc overrides hostlibs vendor hostc host  ppclibs ppc
-#     (hostc = emit the engine's C on this Mac, no PPC libc needed; the
-#      fastest unblocked test that the whole engine transpiles)
+#   stages: mrustc overrides hostlibs vendor hostc host  ppclibs ppc probe
+#     (hostc = emit the engine's C on this machine, no PowerPC needed; the
+#      fastest test that the whole engine transpiles)
+#     (ppclibs/ppc/probe need PPC_HOST=<ssh dest of a PowerPC Mac>)
 #
 set -euo pipefail
 
@@ -42,6 +42,21 @@ export MRUSTC_TARGET_VER="${MRUSTC_TARGET_VER:-1.74}"  # language mode for mrust
 FEATURES="${FEATURES:-native-zstd,remote,tui,rust173-polyfill}"
 HOST_ARCH="${HOST_ARCH:-aarch64}"          # aarch64 (Apple Silicon) or x86_64
 PPC_TARGET="powerpc-apple-darwin"
+
+# The PowerPC Mac that compiles the emitted C. Nothing here cross-compiles:
+# there is no usable powerpc-apple-darwin cross-gcc, so scripts/ppc-cc-remote.py
+# stands in as the C compiler and ships each translation unit over ssh. Set
+# PPC_HOST to an ssh destination with key auth already working.
+export PPC_HOST="${PPC_HOST:-}"
+PPC_CC_WRAPPER="$RB_DIR/scripts/ppc-cc-remote.py"
+# mrustc picks its C compiler from CC_<triple with - replaced by _>.
+export CC_powerpc_apple_darwin="$PPC_CC_WRAPPER"
+# The G5 has 2 cores; the transpile is local and parallel, the compiles are not.
+PPC_JOBS="${PPC_JOBS:-3}"
+# OVERRIDE_SUFFIX is chosen from the *host* OS by minicargo.mk, so a cross build
+# from Linux would pick -linux (whose build_libc.txt says freebsd11). Name the
+# macOS/PowerPC set explicitly; it differs from -macos only in STD_ENV_ARCH.
+PPC_OVERRIDE_SUFFIX="-macos-powerpc"
 
 HOST_LIBS="$MRUSTC_DIR/output-${RUSTC_VERSION}"
 PPC_LIBS="$MRUSTC_DIR/output-${RUSTC_VERSION}-${PPC_TARGET}"
@@ -190,24 +205,54 @@ stage_hostc() {
   note "binary C:  $HOSTC_OUT/rb-cli.c   (+ per-crate <name>-codegen.sh)"
 }
 
-# ---- stage 6: PPC libs (BLOCKED: no powerpc-apple-darwin libc yet) ----------
+# ---- stage 6: build the PowerPC standard library ----------------------------
+# Transpiles core/alloc/std/panic_unwind/test for powerpc-apple-darwin and
+# compiles each emitted .c on the G5 via the remote-cc wrapper. The vendored
+# libc needs no source changes to *compile* for this target - b32 is
+# arch-agnostic and mrustc's own layout asserts pass - but several of its struct
+# definitions describe modern macOS and are wrong for 10.4/10.5 at *runtime*.
+# See docs/build-ppc-mrustc.md and scripts/ppc-libc-probe.py.
 stage_ppclibs() {
-  banner "6. build PPC libstd -> $PPC_LIBS   [EXPERIMENTAL / EXPECTED TO FAIL]"
-  note "Blocked on a powerpc-apple-darwin libc: the vendored libc crate has no"
-  note "PowerPC-Apple arch definitions (apple/b32 is x86-only). Until that is"
-  note "ported (or lifted from github.com/Scottcjn/rust-ppc-tiger), libstd for"
-  note "$PPC_TARGET cannot build. Running anyway so the failure is on record:"
+  banner "6. build PPC libstd -> $PPC_LIBS"
+  [ -n "$PPC_HOST" ] || die "PPC_HOST is not set (e.g. PPC_HOST=admin@g5.local)"
+  [ -x "$PPC_CC_WRAPPER" ] || die "missing $PPC_CC_WRAPPER"
   cd "$MRUSTC_DIR"
-  MRUSTC_TARGET_VER="$MRUSTC_TARGET_VER" \
-    make -f minicargo.mk LIBS RUSTC_VERSION="$RUSTC_VERSION" MRUSTC_TARGET="$PPC_TARGET" || \
-    note "PPC libstd failed as expected (see the libc gap above)."
+  stage_ppc_overrides
+  MRUSTC_TARGET_VER="$MRUSTC_TARGET_VER" MINICARGO_DEFER_CODEGEN=1 \
+    make -f minicargo.mk LIBS \
+      RUSTC_VERSION="$RUSTC_VERSION" \
+      MRUSTC_TARGET="$PPC_TARGET" \
+      OVERRIDE_SUFFIX="$PPC_OVERRIDE_SUFFIX" \
+      PARLEVEL="$PPC_JOBS"
+  ls "$PPC_LIBS"/libstd.rlib.o >/dev/null 2>&1 || die "PPC libstd not produced"
+  note "PPC libstd ready ($(ls "$PPC_LIBS"/*.o | wc -l | tr -d ' ') PowerPC objects)."
 }
 
-# ---- stage 7: transpile the engine to C for PPC (codegen deferred) ----------
-# Emits C only -- no compile here. Ship $PPC_OUT to the G4 and run gcc-mp-10.
+# The macOS/PowerPC build-script override set (mrustc ships -linux/-windows).
+stage_ppc_overrides() {
+  local dir="$MRUSTC_DIR/script-overrides/stable-${RUSTC_VERSION}${PPC_OVERRIDE_SUFFIX}"
+  [ -f "$dir/build_std.txt" ] && return 0
+  mkdir -p "$dir"
+  printf '#cargo:compiler-rt=\ncargo:rustc-cfg=feature="unstable"\n' > "$dir/build_compiler_builtins.txt"
+  {
+    echo "cargo:rustc-cfg=darwin"        # the linux set says freebsd11 here
+    for c in libc_priv_mod_use libc_union libc_const_size_o libc_align \
+             libc_core_cvoid libc_packedN libc_cfg_target_vendor \
+             libc_thread_local libc_const_extern_fn; do
+      echo "cargo:rustc-cfg=$c"
+    done
+  } > "$dir/build_libc.txt"
+  printf 'cargo:rustc-cfg=backtrace_in_libstd\ncargo:rustc-env=STD_ENV_ARCH=powerpc\n' > "$dir/build_std.txt"
+  printf '# No output for macos\n' > "$dir/build_unwind.txt"
+  note "created $dir"
+}
+
+# ---- stage 7: build rb-cli for PowerPC --------------------------------------
+# Transpiles the engine and compiles each emitted .c on the G5, same as stage 6.
 stage_ppc() {
-  banner "7. transpile rb-cli to C for $PPC_TARGET (deferred codegen)"
-  [ -d "$PPC_LIBS" ] || die "PPC libs missing -- stage 6 must succeed first (blocked on libc)"
+  banner "7. transpile+build rb-cli for $PPC_TARGET"
+  [ -n "$PPC_HOST" ] || die "PPC_HOST is not set (e.g. PPC_HOST=admin@g5.local)"
+  [ -e "$PPC_LIBS/libstd.rlib.o" ] || die "PPC libstd missing -- run 'ppclibs' first"
   cd "$MRUSTC_DIR"
   patch_crc_vendor
   mkdir -p "$PPC_OUT"
@@ -216,9 +261,28 @@ stage_ppc() {
       --vendor-dir "$VENDOR_DIR" \
       -L "$PPC_LIBS" \
       --output-dir "$PPC_OUT" \
-      --no-default-features --features "$FEATURES"
-  note "C emitted under $PPC_OUT. Next: scp it to the G4 and compile with gcc-mp-10"
-  note "(see docs/build-ppc-mrustc.md -- G4 half)."
+      --target "$PPC_TARGET" \
+      --no-default-features --features "$FEATURES" \
+      -j "$PPC_JOBS"
+  note "PowerPC rb-cli under $PPC_OUT (compiled on $PPC_HOST)."
+}
+
+# ---- stage 8: capture libc ground truth from the PowerPC Mac ----------------
+stage_probe() {
+  banner "8. probe the PowerPC SDKs for libc ground truth"
+  [ -n "$PPC_HOST" ] || die "PPC_HOST is not set"
+  local libc="$MRUSTC_DIR/rustc-${RUSTC_VERSION}-src/vendor/libc"
+  [ -d "$libc" ] || die "vendored libc not found at $libc"
+  mkdir -p "$RB_DIR/rb-cli-ppc/probe"
+  local sdk out
+  for sdk in /Developer/SDKs/MacOSX10.4u.sdk /Developer/SDKs/MacOSX10.5.sdk; do
+    out="$RB_DIR/rb-cli-ppc/probe/ppc-$(basename "$sdk" .sdk | sed 's/MacOSX//').tsv"
+    "$RB_DIR/scripts/ppc-libc-probe.py" --libc "$libc" --host "$PPC_HOST" \
+      --sdk "$sdk" --arch ppc --out "$out"
+    "$RB_DIR/scripts/ppc-libc-compare.py" --libc "$libc" --probe "$out" \
+      --quiet-missing > "${out%.tsv}.report.txt"
+    note "wrote $out and ${out%.tsv}.report.txt"
+  done
 }
 
 # ---- driver -----------------------------------------------------------------
@@ -233,15 +297,16 @@ main() {
     host)      stage_host ;;
     ppclibs)   stage_ppclibs ;;
     ppc)       stage_ppc ;;
+    probe)     stage_probe ;;
     all)
       stage_mrustc
       stage_overrides
       stage_hostlibs
       stage_vendor
       stage_host
-      banner "HOST path complete. PPC half is blocked on libc (stage 6); see the doc."
+      banner "HOST path complete. Run 'ppclibs' then 'ppc' for PowerPC (needs PPC_HOST)."
       ;;
-    *) die "unknown stage '$stage' (mrustc|overrides|hostlibs|vendor|hostc|host|ppclibs|ppc|all)" ;;
+    *) die "unknown stage '$stage' (mrustc|overrides|hostlibs|vendor|hostc|host|ppclibs|ppc|probe|all)" ;;
   esac
 }
 main "$@"
