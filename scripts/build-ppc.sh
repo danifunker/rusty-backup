@@ -39,7 +39,9 @@ VENDOR_DIR="$CRATE_DIR/vendor"
 
 RUSTC_VERSION="${RUSTC_VERSION:-1.74.0}"   # rustc source mrustc bootstraps from
 export MRUSTC_TARGET_VER="${MRUSTC_TARGET_VER:-1.74}"  # language mode for mrustc
-FEATURES="${FEATURES:-native-zstd,remote,tui,rust173-polyfill}"
+# os-stub: swap src/os/macos.rs for the portable stand-in (objc2 cannot transpile).
+# No `yaml`: serde_yml's libyml backend hits an mrustc macro-expansion gap.
+FEATURES="${FEATURES:-native-zstd,remote,tui,rust173-polyfill,os-stub}"
 HOST_ARCH="${HOST_ARCH:-aarch64}"          # aarch64 (Apple Silicon) or x86_64
 PPC_TARGET="powerpc-apple-darwin"
 
@@ -57,6 +59,12 @@ PPC_JOBS="${PPC_JOBS:-3}"
 # from Linux would pick -linux (whose build_libc.txt says freebsd11). Name the
 # macOS/PowerPC set explicitly; it differs from -macos only in STD_ENV_ARCH.
 PPC_OVERRIDE_SUFFIX="-macos-powerpc"
+# minicargo hands build scripts `RUSTC=<its own mrustc path>` so they can probe the
+# compiler version, and derives that path from argv[0] - which is relative when it
+# is invoked as `bin/minicargo`. Build scripts run with their cwd set to the crate
+# directory, so a relative RUSTC fails to spawn: libc's build.rs then dies with
+# "Failed to get rustc version" and takes the build with it. Pin it absolute.
+export MRUSTC_PATH="${MRUSTC_PATH:-$MRUSTC_DIR/bin/mrustc}"
 
 HOST_LIBS="$MRUSTC_DIR/output-${RUSTC_VERSION}"
 PPC_LIBS="$MRUSTC_DIR/output-${RUSTC_VERSION}-${PPC_TARGET}"

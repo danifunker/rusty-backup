@@ -285,11 +285,25 @@ implements in C, and it is the natural seam.
 
 The remaining work is not in the engine's logic at all. It is:
 
-1. **A feature gate that excludes `os/`** from the PowerPC configuration, so
-   `libc`/`nix`/`objc2-*` leave the dependency graph. This is currently the
-   build's blocker: mrustc aborts on libc 0.2.189's Linux-only
-   `new::linux::can::j1939` while building libc **for the host**, and it is only
-   there because `os/` wants it.
+1. ~~**A feature gate that excludes `os/`**~~ **Done, as a platform-leaf swap.**
+   The measured surface turned out to be small enough that replacing all of `os/`
+   was unnecessary: `os/mod.rs`'s `SectorAlignedReader`/`Writer`, `TempFileGuard`,
+   `ElevatedSource`, `DeviceWriteHandle` and `get_file_size` are already portable
+   Rust, and `wakelock` already ships a no-op arm. Only `os/macos.rs` is hostile
+   (IOKit/DiskArbitration via `objc2`, ~50 `libc` calls), and only **9** of its
+   items are referenced. So the `os-stub` feature swaps just that file for
+   `os/macos_stub.rs` via `#[path]`, leaving the portable trunk and all 51 call
+   sites untouched. `objc2-*` leaves the graph.
+
+   Note the diagnosis this corrected: the host-`libc` abort was **not** caused by
+   `os/`. It came from `cc`/`jobserver`, the build-dependencies of `bzip2-sys` and
+   `zstd-sys`, and `libc` cannot leave this build's graph at all - it is used
+   outside `os/` by `remote/service.rs`, `cli/verbs/tui_app.rs` and
+   (macOS-gated) `fs/resource_fork.rs`. The fix was a manifest pin: `nix 0.31` is
+   declared linux-only and never compiled for this target, but a target-agnostic
+   lockfile let its `libc >= 0.2.186` requirement drag in `src/new/`, which mrustc
+   cannot resolve through its glob re-export. Dropping that dep pins libc to
+   0.2.155, which predates `src/new/` entirely.
 2. ~~**A feature gate that excludes YAML output**, for the `libyml` macro gap.~~
    **Done.** `yaml` is a default-on feature; `rb-cli-ppc` leaves it off, which
    drops `serde_yml`/`libyml` from the graph, hides `yaml` from `--format`, and
@@ -341,9 +355,27 @@ that exercises `println!`, `BTreeMap`, iterators, `AtomicU64`, threads,
 `fs::metadata` and `read_dir`, with the filesystem results checked field-by-field
 against `stat -f` on the machine. Cost: eight fixes (see "Where this stands").
 
-**Phase 2 - finish the engine transpile.** *(next)* Currently 92 of 428 crates.
-YAML is done (section 6); the remaining gate is excluding `os/`, so
-`libc`/`nix`/`objc2-*` leave the graph. Then re-run `scripts/build-ppc.sh ppc`. Expect a further tail of per-crate mrustc gaps; the
+**Phase 2 - finish the engine transpile.** *(in progress)* **106 of 404 crates.**
+Both scope-downs from section 6 have landed - YAML is feature-gated out and
+`os-stub` replaces the macOS platform leaf - and the host-`libc` blocker is fixed
+by a manifest pin. What now blocks is not a dependency but **mrustc's model of
+the PowerPC "power" alignment ABI for nested aggregates**:
+
+- Fixed and verified: `libc`'s `tcp_connection_info` (all-scalar `repr(C)`). mrustc
+  computed align 8 where gcc derives 4, and emitted no forcing attribute because
+  it compared against *natural* field alignments. It now models what the C
+  compiler will derive.
+- Open: `lzfse_rust`'s `FseCore` / `LzfseDecoder` / `LzfseRingDecoder`. mrustc says
+  `Decoder` is align 8 and `FseCore` - which embeds it at offset 808 - is align 4;
+  gcc disagrees about the enclosing struct. Direct probes on the G5 show gcc
+  capping both interior scalars *and* interior aggregates to 4, which is what
+  mrustc models, so the disagreement is not yet explained.
+
+  Getting this right needs a proper harness rather than reasoning: compile the
+  *emitted* C against the PowerPC libcore so a probe can link, and have it print
+  gcc's `sizeof`/`__alignof__` for the exact structs whose assertions fail. The
+  guesswork loop is not converging. Note the assertions themselves are the system
+  working - a layout disagreement is a compile error here, not silent corruption. Expect a further tail of per-crate mrustc gaps; the
 ones already met were each a small, local workaround. Deliverable: every crate in
 the PowerPC configuration transpiles and compiles.
 

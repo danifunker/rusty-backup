@@ -88,6 +88,14 @@ crypto = ["dep:aes", "dep:cbc", "dep:des"]
 # hidden from `--help` and rejected; JSON carries the same schema. See
 # docs/build-ppc-mrustc.md.
 yaml = ["dep:serde_yml"]
+# Replace the native macOS device layer (IOKit / DiskArbitration via objc2) with a
+# signature-compatible stub. OFF everywhere except the PowerPC mrustc build:
+# powerpc-apple-darwin reports target_os = "macos", so the real module would be
+# compiled for it, and objc2 binds modern macOS frameworks that cannot be
+# transpiled for a 2005 Mac. With this on, objc2-* leaves the dependency graph and
+# raw-device access is unavailable while disk *images* work normally. See
+# docs/native_osx_10_dot_3.md.
+os-stub = []
 # Pull in eframe / egui / rfd plus the update-checker's reqwest client. Also
 # pulls in `remote` (dep-free) so Commander Mode's remote pane is always present
 # in a GUI build.

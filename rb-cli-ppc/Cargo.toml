@@ -70,6 +70,14 @@ windows-legacy = []
 # Declared so the shared source's `#[cfg(feature = "yaml")]` resolves, but
 # deliberately NOT in this build's feature list — see the serde_yml note below.
 yaml = ["dep:serde_yml"]
+# Replace the native macOS device layer (IOKit / DiskArbitration via objc2) with a
+# signature-compatible stub. OFF everywhere except the PowerPC mrustc build:
+# powerpc-apple-darwin reports target_os = "macos", so the real module would be
+# compiled for it, and objc2 binds modern macOS frameworks that cannot be
+# transpiled for a 2005 Mac. With this on, objc2-* leaves the dependency graph and
+# raw-device access is unavailable while disk *images* work normally. See
+# docs/native_osx_10_dot_3.md.
+os-stub = []
 
 [dependencies]
 # --- TUI (pinned to the last 1.73-buildable line) ---
@@ -127,18 +135,28 @@ jobserver = "=0.1.31"
 crc = "=3.3.0"
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
-libc = "0.2"  # NOTE: 0.2.189's src/new/ breaks mrustc on the linux host, but
-              # can't be pinned back (nix 0.31 needs newer). It's a host-proxy
-              # artifact — the os/ platform layer is hand-C on PPC (see below).
+# DEVIATION (see header): pinned below 0.2.186. From that version libc grows a
+# `src/new/` tree whose `linux` module arrives via a glob re-export
+# (`mod linux_uapi; pub(crate) use linux_uapi::*`), and mrustc cannot resolve
+# `crate::new::linux::can::j1939` through it. That bites when minicargo builds
+# libc for the *host* - required by `cc`/`jobserver`, the build-dependencies of
+# bzip2-sys and zstd-sys - where target_os = "linux" selects exactly that module.
+# 0.2.155 predates src/new/ entirely. libc itself cannot be dropped: it is used
+# outside os/ by remote/service.rs, cli/verbs/tui_app.rs and (macOS-gated)
+# fs/resource_fork.rs.
+libc = "=0.2.155"
 
-[target.'cfg(target_os = "linux")'.dependencies]
-nix = { version = "0.31", features = ["fs", "mount", "user"] }
+# DEVIATION (see header): no `nix`. It is a linux-only dependency (used only by
+# src/os/linux.rs, never compiled for powerpc-apple-darwin), but Cargo lockfiles
+# are target-agnostic, so nix 0.31's `libc >= 0.2.186` requirement would drag the
+# whole graph onto a libc mrustc cannot lower. Dropping it is what lets the pin
+# below work.
 
-[target.'cfg(target_os = "macos")'.dependencies]
-objc2-io-kit = { version = "0.3", default-features = false, features = ["libc", "pwr_mgt"] }
-objc2-disk-arbitration = { version = "0.3", default-features = false, features = ["DASession", "DADisk", "DADissenter", "libc"] }
-objc2-core-foundation = { version = "0.3", features = ["CFString", "CFDictionary", "CFNumber", "CFRunLoop", "CFURL"] }
-objc2-foundation = { version = "0.3", features = ["NSBundle", "NSString"] }
+# DEVIATION (see header): the objc2-* stack that rb-cli-vintage declares here is
+# absent. It is reachable only through src/os/macos.rs, which the `os-stub`
+# feature replaces for this target, so declaring it would pull IOKit /
+# DiskArbitration bindings into the graph that can neither transpile nor exist on
+# a 2005 Mac.
 
 [target.'cfg(target_os = "windows")'.dependencies]
 self-replace = "1"

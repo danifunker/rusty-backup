@@ -67,6 +67,14 @@ rust173-polyfill = []
 # .github/workflows/release.yml) so behaviour matches the desktop; it is a
 # feature only so the PowerPC mrustc build can drop it. See rb-cli-ppc.
 yaml = ["dep:serde_yml"]
+# Replace the native macOS device layer (IOKit / DiskArbitration via objc2) with a
+# signature-compatible stub. OFF everywhere except the PowerPC mrustc build:
+# powerpc-apple-darwin reports target_os = "macos", so the real module would be
+# compiled for it, and objc2 binds modern macOS frameworks that cannot be
+# transpiled for a 2005 Mac. With this on, objc2-* leaves the dependency graph and
+# raw-device access is unavailable while disk *images* work normally. See
+# docs/native_osx_10_dot_3.md.
+os-stub = []
 # `windows` crate 0.58 API shim (Windows 7/8 build only). Passed on the Windows
 # vintage build command; harmless (unused) on the macOS 10.7 build.
 windows-legacy = []

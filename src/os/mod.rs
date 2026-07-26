@@ -1,5 +1,20 @@
-#[cfg(target_os = "macos")]
+// `powerpc-apple-darwin` reports `target_os = "macos"`, so the real macOS module
+// would be compiled for it - and that module is IOKit + DiskArbitration through
+// `objc2-*`, which cannot be transpiled for a 2005 PowerPC Mac. The `os-stub`
+// feature swaps in a signature-compatible stand-in instead, which keeps every
+// caller and everything portable in this file untouched while dropping `objc2-*`
+// from the dependency graph. Off by default: an ordinary macOS build is
+// bit-for-bit unaffected. See docs/native_osx_10_dot_3.md.
+#[cfg(all(target_os = "macos", not(feature = "os-stub")))]
 pub mod macos;
+#[cfg(all(target_os = "macos", feature = "os-stub"))]
+#[path = "macos_stub.rs"]
+pub mod macos;
+
+/// Runtime OS-version detection. Dependency-free, and always compiled: which
+/// Mac OS X release we are on is the difference between 10.4 and 10.5, which is
+/// load-bearing on PowerPC.
+pub mod host_version;
 
 #[cfg(target_os = "linux")]
 pub mod linux;
