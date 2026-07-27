@@ -15,7 +15,7 @@ ground truth).
 Status (2026-07-26): **the full Rust standard library - core, alloc, std,
 panic_unwind, test, libc - builds for `powerpc-apple-darwin` and links into a
 running PowerPC Mach-O binary**, and the engine build is grinding through the
-dependency graph behind it. Getting here took twenty-one mrustc fixes and two
+dependency graph behind it. Getting here took twenty-three mrustc fixes and two
 rustc-source patches, all listed below.
 
 Two classes of remaining work, and they are different in kind:
@@ -308,6 +308,41 @@ All committed on `rb-cli-vintage-build`; each is a candidate upstream PR.
       **zero** - minicargo reported success and `build-ppc.sh` announced an
       `rb-cli` that had never been linked. `stage_ppc` now also checks for the
       binary, which `stage_host` always did.
+
+**The proc-macro bridge** (three gaps, all reached through ratatui's tree):
+
+22. **`lib/libproc_macro/src/lex.rs`** - the escape arm of the string-literal
+    lexer had *no cases at all*, so every escape hit the fallback panic. That
+    panic runs inside the proc-macro child, so the compiler never sees an error,
+    only the child going away: `Unexpected EOF while reading from child process`.
+    `indoc`'s `formatdoc!` (via `instability`) emits a doc string containing `\n`.
+    Now handles `\n \r \t \0 \\ \' \"`, `\xNN`, `\u{...}` and the end-of-line
+    continuation, plus the two missing char-literal escapes next to it. **Lives
+    in the plugin-side library**, so `libproc_macro` must be rebuilt and every
+    plugin relinked for the fix to take effect - `bin/minicargo --output-dir
+    output-<ver> lib/libproc_macro`.
+
+23. **`src/expand/proc_macro.cpp`** - `visit_item` had no `Trait` case, so an
+    attribute macro on a trait aborted with "TODO: visit_item - Trait". Because
+    that kills the compiler mid-conversation the plugin then reports its own
+    "Unexpected EOF", so it presents as two unrelated failures. ratatui puts
+    `#[instability::unstable(..)]` on `WidgetRef` and `StatefulWidgetRef`.
+    `visit_trait` mirrors `visit_impl`; two things arise only here:
+    trait items carry no visibility of their own (mrustc records them as `pub`,
+    and emitting it yields `trait X { pub fn .. }`, which the plugin's parser
+    rejects), and a trait method *declaration* has no body, where
+    `visit_function` dereferenced `fcn.code()` unconditionally. Associated types
+    are emitted un-bounded only; their bounds are stored as `Self: ...`, which is
+    not the shape the declaration site needs, so a bounded one is a loud TODO
+    rather than a silently dropped bound.
+
+A note on reading these: **an mrustc abort with no diagnostic at all is a C++
+exception escaping**, and an "Unexpected EOF while reading from child process" is
+usually the *plugin* dying, not the bridge. For the first,
+`gdb -ex 'break std::__throw_bad_function_call()' -ex run -ex bt` on the failing
+command names the line immediately. For the second, the child's own panic message
+appears in the log a few lines *above* the mrustc error - the compiler's message
+is the consequence, not the cause.
 
 ### Plus: a macOS/PowerPC build-script override set
 
