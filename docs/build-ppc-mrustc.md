@@ -409,7 +409,28 @@ Stages, in order:
 
 ### Traps in the build loop
 
-Six that have each cost real time:
+Nine that have each cost real time:
+
+- **The vendor patches must not rewrite an unchanged file.** `sed >tmp && mv tmp
+  file` bumps the mtime every run even when the content is already patched, and
+  minicargo is timestamp-driven - so crc went dirty on *every* build, taking
+  lzma-rs and then the **engine** with it, silently re-transpiling a 797 MB
+  translation unit each time. Every `patch_*_vendor` must compare before writing.
+- **Do not put a timeout on a build.** These run for hours; a `timeout` that
+  seemed generous for a link killed the driver mid-engine-compile.
+- **Killing the driver does not stop the Mac.** The ssh dies, the remote gcc
+  carries on, and its output goes nowhere because nothing is left to fetch it. A
+  later run then starts a *second* compile of the same unit alongside the orphan,
+  competing for the G5's memory. After any interruption:
+
+  ```sh
+  ssh $PPC_HOST 'ps ax | grep "[c]c1"'      # NOTE: Leopard has no `pgrep`
+  ```
+
+  `pgrep` is absent on 10.5, so `pgrep -f cc1` fails with "command not found" -
+  which, if you test it with `&&`/`||`, reads as "no such process". Three
+  successive watchdogs got this wrong before it was noticed. Use `ps ax | grep`.
+
 
 - **A layout change invalidates the PowerPC stdlib.** `minicargo`'s own rebuild
   check *does* compare against the compiler binary's timestamp
