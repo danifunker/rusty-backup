@@ -15,7 +15,7 @@ ground truth).
 Status (2026-07-26): **the full Rust standard library - core, alloc, std,
 panic_unwind, test, libc - builds for `powerpc-apple-darwin` and links into a
 running PowerPC Mach-O binary**, and the engine build is grinding through the
-dependency graph behind it. Getting here took twenty-three mrustc fixes and two
+dependency graph behind it. Getting here took twenty-four mrustc fixes and two
 rustc-source patches, all listed below.
 
 Two classes of remaining work, and they are different in kind:
@@ -344,6 +344,21 @@ command names the line immediately. For the second, the child's own panic messag
 appears in the log a few lines *above* the mrustc error - the compiler's message
 is the consequence, not the cause.
 
+**Layout, again:**
+
+24. **`src/trans/codegen_c.cpp`** - a type whose alignment is 1 is now emitted
+    inside a `#pragma pack(1)` region even when it is not `repr(packed)` itself,
+    because gcc ignores the pack applied where a *member's* type was defined and
+    re-derives from that member's natural alignment. See "`#pragma pack` does not
+    propagate to a containing type" above for the measurements. Restricted to
+    align 1, where Rust guarantees a tight layout, so `pack(1)` provably cannot
+    move a field and is a no-op wherever gcc already agreed. The `MaybeUninit`
+    union wrapping the same type is fixed transitively - which matters, since its
+    `aligned(1)` could never have lowered it. Verified with
+    `scripts/ppc-layout-probe.py`: libzip 5 mismatches -> 0 across 1728 structs,
+    and the whole PowerPC stdlib rebuilds clean. **This is a layout change, so it
+    invalidates the PowerPC stdlib** - see the traps.
+
 ### Plus: a macOS/PowerPC build-script override set
 
 mrustc ships `script-overrides/stable-1.74.0-{linux,windows}` but not `-macos`.
@@ -629,6 +644,32 @@ enclosing struct does not pull it back down. Measured - `{u16; u16; struct{union
 aligned(8) [2];};}` is 24/8 with or without an `aligned(4)` on the outer struct,
 and a plain `{u64; u32;}` marked `aligned(4)` is still 16/8. gcc's "aligned can
 only increase" holds here; the alignment has to come out of the model correctly.
+
+### `#pragma pack` does not propagate to a containing type
+
+The mirror image of the cap, and the one that bites `repr(packed)` Rust types.
+gcc derives a containing type's alignment from its member's **natural**
+alignment, ignoring any `#pragma pack` that was in force where that member's type
+was *defined*. Measured on the G5, with `#pragma pack(1) struct p4 { uint32_t a;
+uint16_t b; }` (itself a correct 6/1):
+
+| | gcc |
+|---|---|
+| `struct { p4 v; }` | 8/**4** - the pack is ignored, and the size padded |
+| `struct { uint8_t t; p4 v; }` | 8/**4** |
+| `struct { p4 v; }` **defined inside** `pack(1)` | 6/**1** |
+
+So a type that merely *contains* a packed type has to be emitted inside a pack
+region itself; `aligned(1)` cannot express it, by the "aligned can only increase"
+rule above. This is what `ManuallyDrop<T>` and `MaybeUninit<T>` are - transparent
+wrappers that inherit `T`'s align 1 - and zip's `#[repr(packed, C)]` block headers
+go through both. mrustc said 30/1 for `ManuallyDrop<ZipLocalEntryBlock>`, which is
+right; gcc said 32/4.
+
+The trap for the *model* is that mrustc's `c_max_align` is built from each
+member's own alignment, and a packed member honestly reports 1 - so this looks
+like a case where C already agrees, and neither the pack pragma nor
+`has_manual_align` fires. See fix 24.
 
 Two mrustc bugs came out of this, both fixed on `rb-cli-vintage-build`:
 
