@@ -13,13 +13,22 @@
 # that is a bug.
 #
 # DEVIATIONS FROM rb-cli-vintage (each entry is a crate mrustc cannot lower):
-#   - zip: feature `deflate` -> `deflate-flate2`.
-#       `deflate` = [deflate-zopfli, deflate-flate2]; deflate-zopfli pulls the
-#       `zopfli` crate, which pulls `bumpalo`, and mrustc asserts out
-#       transpiling bumpalo (`Bump::shrink`, hir_typeck/expr_cs.cpp:1665,
-#       "Failure to infer"). `deflate-flate2` keeps identical DEFLATE support
-#       through flate2 (already a dependency); only zopfli's slower/smaller
-#       encoder is dropped — no archive-format change.
+#   - zip: feature `deflate` -> `deflate-flate2` + `flate2`.
+#       `deflate` = [flate2/rust_backend, deflate-zopfli, deflate-flate2];
+#       deflate-zopfli pulls the `zopfli` crate, which pulls `bumpalo`, and
+#       mrustc asserts out transpiling bumpalo (`Bump::shrink`,
+#       hir_typeck/expr_cs.cpp:1665, "Failure to infer"). Only zopfli's
+#       slower/smaller encoder is dropped — no archive-format change.
+#       NOTE the `flate2` in that list, and don't remove it: `deflate-flate2`
+#       is only `["_deflate-any"]` and does NOT enable the optional `flate2`
+#       dependency — in zip's manifest that is `deflate`'s job, via
+#       `flate2/rust_backend`. Without it zip compiles `use flate2::..` behind
+#       `#[cfg(feature = "deflate-flate2")]` with no such crate in scope:
+#         zip/src/write.rs:33:5-50 error:0: Cannot find component 1 of
+#           crate::write::flate2::write::DeflateEncoder
+#       `flate2` here is the implicit feature cargo creates for an optional
+#       dependency; `rust_backend` comes from our own direct flate2 entry by
+#       feature unification. This would fail identically under real cargo.
 #   - env_logger: pin 0.11 -> 0.10. 0.11 switched its timestamp backend to
 #       `jiff`, whose const-generic code mrustc can't lower ("Type mismatch in
 #       path params" in jiff-core). 0.10 uses humantime instead. Same logging.
@@ -138,7 +147,7 @@ tar = "0.4"
 bzip2 = "=0.5.2"
 # DEVIATION (see header): deflate-flate2, NOT `deflate` — `deflate` pulls
 # zopfli -> bumpalo, which mrustc cannot transpile.
-zip = { version = "=2.4.2", default-features = false, features = ["deflate-flate2", "aes-crypto"] }
+zip = { version = "=2.4.2", default-features = false, features = ["deflate-flate2", "flate2", "aes-crypto"] }
 base64 = "0.22"
 # DEVIATION (see header): optional and left OFF for this target. serde_yml's
 # backend `libyml` hits an mrustc macro-expansion gap (`TOK_RWORD_AS`) in

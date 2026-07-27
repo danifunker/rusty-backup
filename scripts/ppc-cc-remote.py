@@ -29,6 +29,7 @@ Environment:
   PPC_CC_VERBOSE   set to echo each remote command
 """
 
+import glob
 import os
 import shlex
 import subprocess
@@ -70,7 +71,16 @@ INPUT_EXTS = (".c", ".cc", ".cpp", ".cxx", ".o", ".a", ".s", ".h", ".hpp", ".inc
 # through cc-rs, which compiles a C source tree: bzip2-sys passes
 # `-I bzip2-1.0.8` and zstd-sys a handful of `-I zstd/lib/...`. Shipping the
 # named file alone leaves every #include unresolved on the Mac.
-DIR_FLAGS = ("-I", "-isystem", "-iquote", "-idirafter", "-L")
+INCLUDE_DIR_FLAGS = ("-I", "-isystem", "-iquote", "-idirafter")
+# `-L` is handled separately. A library search directory is not wanted for its
+# contents the way an include directory is - only for the few archives `-l` can
+# resolve out of it - and mirroring it wholesale is actively wrong here: mrustc
+# passes `-L <stdlib output dir>` on every link, and that directory is 75 MB of
+# .c/.o/.rlib whose object files the link already names explicitly.
+LIB_DIR_FLAGS = ("-L",)
+# What `-l` can actually resolve, and so all that needs shipping from a `-L` dir.
+LIB_PATTERNS = ("*.a", "*.dylib", "*.so", "*.so.*")
+DIR_FLAGS = INCLUDE_DIR_FLAGS + LIB_DIR_FLAGS
 # ...but a directory argument is not automatically ours to mirror. PPC_LDFLAGS
 # names paths that exist on the *Mac* (`-L/opt/local/lib`), and some of those
 # prefixes also exist on this machine with entirely different contents - so a
@@ -164,13 +174,28 @@ def tree_size(path):
     return total
 
 
-def should_mirror_dir(path):
-    """True if `path` is a local directory we should ship to the Mac."""
+def libs_in(path):
+    """The files in `path` that `-l` could resolve - all a `-L` dir needs."""
+    out = []
+    for pat in LIB_PATTERNS:
+        out.extend(glob.glob(os.path.join(path, pat)))
+    return [p for p in out if os.path.isfile(p)]
+
+
+def should_mirror_dir(path, full):
+    """True if `path` is a local directory we should ship to the Mac.
+
+    `full` distinguishes an include directory, which is mirrored recursively for
+    the headers in it, from a `-L` directory, where only the handful of archives
+    `-l` can resolve are wanted and the size guard does not apply.
+    """
     absolute = os.path.abspath(path)
     if any(absolute.startswith(p) for p in SYSTEM_PREFIXES):
         return False        # names a path on the Mac, not here
     if not os.path.isdir(absolute):
         return False        # remote-only, or simply not a directory
+    if not full:
+        return bool(libs_in(absolute))
     size = tree_size(absolute)
     if size > MAX_MIRROR_BYTES:
         die("refusing to mirror %s (%.1f MB > %.0f MB limit); if this really "
@@ -190,6 +215,7 @@ def main():
     output = None
     inputs = []
     dirs = []
+    lib_dirs = []
     # Rewrites applied to the remote command line, keyed on the exact argument
     # string. Covers both the `-I dir` and `-Idir` spellings.
     remap = {}
@@ -205,15 +231,16 @@ def main():
         flag = next((f for f in DIR_FLAGS if a == f or
                      (a.startswith(f) and len(a) > len(f))), None)
         if flag is not None:
+            target = dirs if flag in INCLUDE_DIR_FLAGS else lib_dirs
             if a == flag and i + 1 < len(args):
-                if should_mirror_dir(args[i + 1]):
-                    dirs.append(args[i + 1])
+                if should_mirror_dir(args[i + 1], full=flag in INCLUDE_DIR_FLAGS):
+                    target.append(args[i + 1])
                     remap[args[i + 1]] = mirrored(args[i + 1])
                 i += 2
             else:
                 value = a[len(flag):]
-                if should_mirror_dir(value):
-                    dirs.append(value)
+                if should_mirror_dir(value, full=flag in INCLUDE_DIR_FLAGS):
+                    target.append(value)
                     remap[a] = flag + mirrored(value)
                 i += 1
             continue
@@ -232,7 +259,7 @@ def main():
 
     remote_dirs = sorted(
         {os.path.dirname(mirrored(p)) for p in inputs + [output]}
-        | {mirrored(d) for d in dirs}
+        | {mirrored(d) for d in dirs + lib_dirs}
     )
     mkdir = "mkdir -p %s" % " ".join(
         shlex.quote("%s/%s" % (REMOTE_ROOT, d)) for d in remote_dirs if d
@@ -244,6 +271,8 @@ def main():
     # tree mirrors ours. Directories go up recursively: a `-I` directory is
     # wanted for the headers it holds, not for itself.
     uploads = [os.path.abspath(p) for p in inputs] + [os.path.abspath(d) for d in dirs]
+    for d in lib_dirs:
+        uploads.extend(libs_in(os.path.abspath(d)))
     if uploads:
         rc = run(["rsync", "-qR", "-r", "--"] + uploads + ["%s:%s/" % (HOST, REMOTE_ROOT)])
         if rc != 0:

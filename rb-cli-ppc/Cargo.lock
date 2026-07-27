@@ -2019,6 +2019,7 @@ dependencies = [
  "crc32fast",
  "crossbeam-utils",
  "displaydoc",
+ "flate2",
  "getrandom 0.3.4",
  "hmac",
  "indexmap",
