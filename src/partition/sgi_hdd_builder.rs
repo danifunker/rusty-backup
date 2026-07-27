@@ -2,8 +2,8 @@
 //! volume header (dvh) + partition table at sector 0 wrapping a freshly
 //! formatted EFS root partition, mountable by IRIX 5.3–6.5 as a SCSI HDD.
 //!
-//! `rb-cli new --fs efs` produces a *bare* EFS superfloppy (fine for an EFS
-//! CD-ROM that IRIX reads with `mount -t efs`), but a real IRIX hard disk needs
+//! `rb-cli new volume efs` produces a *bare* EFS superfloppy, but a real IRIX
+//! hard disk (`rb-cli new hd sgi-efs`) needs
 //! the volume header at sector 0 so `fx` / `prtvtoc` and the disk driver see a
 //! partition table. This module writes that header — mirroring the field
 //! layout / big-endianness of [`crate::partition::sgi`], the parser used as the

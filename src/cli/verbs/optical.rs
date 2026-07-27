@@ -70,8 +70,11 @@ pub enum OpticalCommand {
 pub enum OpticalNewCommand {
     /// IRIX EFS CD-ROM (`.iso`): an SGI volume header with the EFS filesystem
     /// in slot 7 (typed SYSV, the IRIX EFS-CD convention) and CD geometry.
-    /// Mounts on IRIX with `mount -t efs <dev>s7`. Populate it with
-    /// `put IMG@1 host/file /file`. (Formerly `new-sgi-cdrom`.)
+    /// Mounts on IRIX with `mount -t efs <dev>s7`. Pass `--from-dir` to fill
+    /// it from a host folder in the same step (`--size auto` then sizes the
+    /// disc to fit, and `--expand-archives --flatten-folders` unpacks a
+    /// `.tardist` set into one `inst`-ready root); otherwise it comes out
+    /// blank for `import` / `put`.
     #[command(name = "sgi-efs")]
     SgiEfs(super::new_sgi_cdrom::NewSgiCdromArgs),
 }

@@ -162,7 +162,9 @@ pub enum HdCommand {
     X68k(super::new_x68k_hdd::NewX68kHddArgs),
 
     /// dvh-wrapped IRIX HDD: an SGI volume header + partition table wrapping a
-    /// formatted EFS root partition, mountable by IRIX 5.3-6.5.
+    /// formatted EFS root partition, mountable by IRIX 5.3-6.5. Pass
+    /// `--from-dir` to fill the root filesystem from a host folder in the
+    /// same step; otherwise it comes out blank for `import` / `put`.
     #[command(name = "sgi-efs")]
     SgiEfs(super::new_sgi_hdd::NewSgiHddArgs),
 }
