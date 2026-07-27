@@ -995,12 +995,13 @@ enum DiskClass {
     Floppy,
     Volume,
     Hd,
+    Cdrom,
 }
 
-/// The media classes the wizard can create end-to-end. The hard-disk targets
-/// build with their defaults (path + size is enough); their donor / custom
-/// partition options — `--system-disk`, `--boot-sector-donor`, `--partitions`,
-/// EFS geometry — remain CLI-only. CD-ROM (`optical new`) is still CLI-driven.
+/// The media classes the wizard can create end-to-end. The hard-disk and
+/// CD-ROM targets build with their defaults (path + size is enough); their
+/// donor / custom partition options — `--system-disk`, `--boot-sector-donor`,
+/// `--partitions`, EFS inode density — remain CLI-only.
 const NEW_CLASSES: &[(&str, DiskClass, &str)] = &[
     (
         "Floppy",
@@ -1017,7 +1018,21 @@ const NEW_CLASSES: &[(&str, DiskClass, &str)] = &[
         DiskClass::Hd,
         "Partition-table-wrapped, self-bootable HDD image (Sharp X68000, SGI IRIX).",
     ),
+    (
+        "CD-ROM",
+        DiskClass::Cdrom,
+        "Bootable-media disc image (.iso). Optionally filled from a host folder.",
+    ),
 ];
+
+/// Disc targets offered under the "CD-ROM" class. One today; the list exists so
+/// a second optical layout drops in the same way the HD platforms do.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CdTarget {
+    SgiEfs,
+}
+
+const CD_TARGETS: &[(&str, CdTarget)] = &[("SGI IRIX (EFS CD, slot-7 SYSV)", CdTarget::SgiEfs)];
 
 /// Bootable hard-disk platforms offered under the "Hard disk" class. Each
 /// builds with its defaults; donor-cloning and custom partition layouts stay on
@@ -1066,18 +1081,22 @@ const VOLUME_FS: &[(&str, VolumeFs)] = &[
     ("Minix V3", VolumeFs::Minix3),
 ];
 
-/// The details form's three text fields.
+/// The details form's text fields: path, size, name — plus, for a CD-ROM, an
+/// optional source folder. See [`NewWizard::field_count`].
 const WIZ_FIELDS: usize = 3;
 
 struct NewWizard {
     step: WizStep,
     class_sel: usize,
     fs_sel: usize,
-    /// Details form: 0 = path, 1 = size, 2 = name.
+    /// Details form: 0 = path, 1 = size, 2 = name, 3 = source folder (CD only).
     field: usize,
     path: String,
     size: String,
     name: String,
+    /// Host folder to fill a CD-ROM from, empty for a blank disc. Only
+    /// reachable on the CD-ROM class; `rb-cli optical new sgi-efs --from-dir`.
+    from_dir: String,
     /// Tab-to-browse picker for the path field.
     picker: Option<FilePicker>,
     /// Result of the last create attempt (success or error text).
@@ -1095,6 +1114,7 @@ impl Default for NewWizard {
             path: String::new(),
             size: "800K".to_string(),
             name: "rusty-backup".to_string(),
+            from_dir: String::new(),
             picker: None,
             status: None,
             is_error: false,
@@ -1113,15 +1133,28 @@ impl NewWizard {
     /// but only while it still holds another class's default — so a size the
     /// user typed is never clobbered by arrowing through the class list.
     fn seed_size_for_class(&mut self) {
-        const DEFAULTS: [&str; 3] = ["800K", "64M", "32M"];
+        const DEFAULTS: [&str; 4] = ["800K", "64M", "32M", "600M"];
         let cur = self.size.trim();
-        if cur.is_empty() || DEFAULTS.contains(&cur) {
+        // `auto` is a size the CD class can produce for itself, so treat it as
+        // a default too — otherwise arrowing off CD-ROM and back would leave a
+        // stale `auto` on a class that can't use it.
+        if cur.is_empty() || cur.eq_ignore_ascii_case("auto") || DEFAULTS.contains(&cur) {
             self.size = match self.class() {
                 DiskClass::Floppy => DEFAULTS[0],
                 DiskClass::Volume => DEFAULTS[1],
                 DiskClass::Hd => DEFAULTS[2],
+                DiskClass::Cdrom => DEFAULTS[3],
             }
             .to_string();
+        }
+    }
+
+    /// Text fields on the details form. The CD-ROM class adds the optional
+    /// source-folder row; every other class stops at name.
+    fn field_count(&self) -> usize {
+        match self.class() {
+            DiskClass::Cdrom => WIZ_FIELDS + 1,
+            _ => WIZ_FIELDS,
         }
     }
 
@@ -1129,8 +1162,10 @@ impl NewWizard {
         match self.class() {
             DiskClass::Floppy => FLOPPY_FS.len(),
             DiskClass::Volume => VOLUME_FS.len(),
-            // The "filesystem" step picks the target platform for a hard disk.
+            // The "filesystem" step picks the target platform / disc layout for
+            // a hard disk or a CD.
             DiskClass::Hd => HD_PLATFORMS.len(),
+            DiskClass::Cdrom => CD_TARGETS.len(),
         }
     }
     fn fs_label(&self, i: usize) -> &'static str {
@@ -1138,6 +1173,7 @@ impl NewWizard {
             DiskClass::Floppy => FLOPPY_FS[i.min(FLOPPY_FS.len() - 1)].0,
             DiskClass::Volume => VOLUME_FS[i.min(VOLUME_FS.len() - 1)].0,
             DiskClass::Hd => HD_PLATFORMS[i.min(HD_PLATFORMS.len() - 1)].0,
+            DiskClass::Cdrom => CD_TARGETS[i.min(CD_TARGETS.len() - 1)].0,
         }
     }
 }
@@ -4522,7 +4558,14 @@ impl App {
                 Some(PickResult::Confirm(path)) => {
                     let w = self.newdisk.as_mut().unwrap();
                     w.picker = None;
-                    w.path = path.to_string_lossy().into_owned();
+                    // Route to whichever field opened the picker — field 3 is
+                    // the CD-ROM source folder, everything else the image path.
+                    let picked = path.to_string_lossy().into_owned();
+                    if w.field == 3 {
+                        w.from_dir = picked;
+                    } else {
+                        w.path = picked;
+                    }
                 }
                 None => {}
             }
@@ -4584,19 +4627,29 @@ impl App {
                     true
                 }
                 KeyCode::Down => {
-                    w.field = (w.field + 1) % WIZ_FIELDS;
+                    let n = w.field_count();
+                    w.field = (w.field + 1) % n;
                     true
                 }
                 KeyCode::Up | KeyCode::BackTab => {
-                    w.field = (w.field + WIZ_FIELDS - 1) % WIZ_FIELDS;
+                    let n = w.field_count();
+                    w.field = (w.field + n - 1) % n;
                     true
                 }
-                // Tab browses for a path when on the path field, else advances.
+                // Tab browses on the two path-shaped fields, else advances.
                 KeyCode::Tab => {
-                    if w.field == 0 {
-                        w.picker = Some(FilePicker::new(PickKind::Any, "Browse for image path"));
-                    } else {
-                        w.field = (w.field + 1) % WIZ_FIELDS;
+                    match w.field {
+                        0 => {
+                            w.picker = Some(FilePicker::new(PickKind::Any, "Browse for image path"))
+                        }
+                        3 => {
+                            w.picker =
+                                Some(FilePicker::new(PickKind::Dir, "Browse for source folder"))
+                        }
+                        _ => {
+                            let n = w.field_count();
+                            w.field = (w.field + 1) % n;
+                        }
                     }
                     true
                 }
@@ -4605,7 +4658,8 @@ impl App {
                     match w.field {
                         0 => w.path.pop(),
                         1 => w.size.pop(),
-                        _ => w.name.pop(),
+                        2 => w.name.pop(),
+                        _ => w.from_dir.pop(),
                     };
                     true
                 }
@@ -4614,7 +4668,8 @@ impl App {
                     match w.field {
                         0 => w.path.push(c),
                         1 => w.size.push(c),
-                        _ => w.name.push(c),
+                        2 => w.name.push(c),
+                        _ => w.from_dir.push(c),
                     }
                     true
                 }
@@ -4638,6 +4693,16 @@ impl App {
         }
         let size = w.size.trim().to_string();
         let name = w.name.trim().to_string();
+        let from_dir = w.from_dir.trim().to_string();
+        // A CD-ROM is built by `optical new sgi-efs`, which is a different
+        // command tree from `new` — so the wizard produces one of two shapes
+        // and dispatches accordingly rather than forcing everything through
+        // `NewCommand`.
+        if w.class() == DiskClass::Cdrom {
+            let target = CD_TARGETS[w.fs_sel.min(CD_TARGETS.len() - 1)].1;
+            self.newdisk_create_cdrom(target, path, size, name, from_dir);
+            return;
+        }
         let cmd = match w.class() {
             DiskClass::Floppy => NewCommand::Floppy(FloppyArgs {
                 fs: FLOPPY_FS[w.fs_sel.min(FLOPPY_FS.len() - 1)].1,
@@ -4665,6 +4730,8 @@ impl App {
                 cluster_size: None,
                 sector_size: None,
             }),
+            // Handled above — a disc goes through `optical new`, not `new`.
+            DiskClass::Cdrom => unreachable!("CD-ROM dispatched before this match"),
             // Hard disks build with their defaults; the donor-clone and custom
             // partition-layout options stay on the CLI (`rb-cli new hd ...`).
             DiskClass::Hd => {
@@ -4725,6 +4792,69 @@ impl App {
             }
             Err(e) => {
                 // `{e:#}` shows the whole anyhow context chain (root cause).
+                w.status = Some(format!("{e:#}"));
+                w.is_error = true;
+            }
+        }
+    }
+
+    /// Build a CD-ROM disc image, optionally filling it from a host folder.
+    ///
+    /// Mirrors `rb-cli optical new sgi-efs`, including `--size auto`. Archive
+    /// expansion (`--expand-archives` / `--flatten-folders`) stays CLI-only:
+    /// the choice is content-dependent enough that a wizard toggle would be
+    /// guessing on the user's behalf, and it is one flag away on the CLI.
+    fn newdisk_create_cdrom(
+        &mut self,
+        target: CdTarget,
+        path: std::path::PathBuf,
+        size: String,
+        name: String,
+        from_dir: String,
+    ) {
+        let from = (!from_dir.is_empty()).then(|| expand_tilde(&from_dir));
+        if let Some(d) = &from {
+            if !d.is_dir() {
+                let w = self.newdisk.as_mut().unwrap();
+                w.status = Some(format!("Source folder not found: {}", d.display()));
+                w.is_error = true;
+                return;
+            }
+        }
+        if from.is_none() && size.eq_ignore_ascii_case("auto") {
+            let w = self.newdisk.as_mut().unwrap();
+            w.status = Some("Size 'auto' needs a source folder to measure.".to_string());
+            w.is_error = true;
+            return;
+        }
+        let args = match target {
+            CdTarget::SgiEfs => crate::cli::verbs::new_sgi_cdrom::NewSgiCdromArgs {
+                image: path.clone(),
+                size,
+                name,
+                inodes: None,
+                bytes_per_inode: None,
+                from_dir: from,
+                expand_archives: false,
+                flatten_folders: false,
+                force: false,
+                no_permissions: false,
+                include_appledouble: false,
+            },
+        };
+        // Same reason as `new::run` above: the builder logs advisories that
+        // would otherwise scribble on the alt-screen.
+        let outcome = with_stderr_suppressed(|| crate::cli::verbs::new_sgi_cdrom::run(args));
+        let w = self.newdisk.as_mut().unwrap();
+        match outcome {
+            Ok(()) => {
+                let size_note = std::fs::metadata(&path)
+                    .map(|m| format!(" ({})", format_size(m.len())))
+                    .unwrap_or_default();
+                w.status = Some(format!("Created {}{size_note}", path.display()));
+                w.is_error = false;
+            }
+            Err(e) => {
                 w.status = Some(format!("{e:#}"));
                 w.is_error = true;
             }
@@ -7601,8 +7731,25 @@ impl App {
                     &w.path,
                     "(type a path, or Tab to browse)",
                 ));
-                lines.push(field(1, "Size:", &w.size, "800K"));
+                lines.push(field(
+                    1,
+                    "Size:",
+                    &w.size,
+                    if w.class() == DiskClass::Cdrom {
+                        "600M (or auto)"
+                    } else {
+                        "800K"
+                    },
+                ));
                 lines.push(field(2, "Name:", &w.name, "rusty-backup"));
+                if w.class() == DiskClass::Cdrom {
+                    lines.push(field(
+                        3,
+                        "From:",
+                        &w.from_dir,
+                        "(optional: folder to fill the disc from, Tab to browse)",
+                    ));
+                }
                 lines.push(Line::raw(""));
                 if let Some(s) = &w.status {
                     let style = if w.is_error {
@@ -7614,7 +7761,7 @@ impl App {
                     lines.push(Line::raw(""));
                 }
                 lines.push(Line::styled(
-                    "Up/Down field   Tab browse (path)   Enter create   Esc back",
+                    "Up/Down field   Tab browse (path/folder)   Enter create   Esc back",
                     self.palette.dim(),
                 ));
             }
@@ -10310,6 +10457,74 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Walk the wizard's class list to a given class the way the arrow keys do.
+    fn wizard_on(class: DiskClass) -> NewWizard {
+        let mut w = NewWizard {
+            class_sel: NEW_CLASSES
+                .iter()
+                .position(|c| c.1 == class)
+                .expect("class"),
+            ..Default::default()
+        };
+        w.seed_size_for_class();
+        w
+    }
+
+    /// The CD-ROM class carries an extra "source folder" row. If `field_count`
+    /// didn't grow with it, Up/Down would never reach the field and Tab from
+    /// Name would wrap straight back to Path.
+    #[test]
+    fn cdrom_class_exposes_the_source_folder_field() {
+        assert_eq!(wizard_on(DiskClass::Cdrom).field_count(), WIZ_FIELDS + 1);
+        for other in [DiskClass::Floppy, DiskClass::Volume, DiskClass::Hd] {
+            assert_eq!(wizard_on(other).field_count(), WIZ_FIELDS);
+        }
+    }
+
+    /// Every class needs its own sensible default size, and `auto` — which
+    /// only the CD class can act on — must not survive a move to a class that
+    /// would choke on it.
+    #[test]
+    fn size_default_follows_the_selected_class() {
+        assert_eq!(wizard_on(DiskClass::Floppy).size, "800K");
+        assert_eq!(wizard_on(DiskClass::Volume).size, "64M");
+        assert_eq!(wizard_on(DiskClass::Hd).size, "32M");
+        assert_eq!(wizard_on(DiskClass::Cdrom).size, "600M");
+
+        // `auto` set on the CD class, then arrow away: must be re-seeded.
+        let mut w = wizard_on(DiskClass::Cdrom);
+        w.size = "auto".to_string();
+        w.class_sel = NEW_CLASSES
+            .iter()
+            .position(|c| c.1 == DiskClass::Volume)
+            .unwrap();
+        w.seed_size_for_class();
+        assert_eq!(w.size, "64M", "'auto' must not leak onto a non-CD class");
+
+        // A size the user typed is still never clobbered.
+        let mut w = wizard_on(DiskClass::Floppy);
+        w.size = "1440K".to_string();
+        w.class_sel = NEW_CLASSES
+            .iter()
+            .position(|c| c.1 == DiskClass::Cdrom)
+            .unwrap();
+        w.seed_size_for_class();
+        assert_eq!(w.size, "1440K");
+    }
+
+    /// The "filesystem" step doubles as the disc-layout picker for a CD, so
+    /// its list has to be non-empty and indexable without panicking.
+    #[test]
+    fn cdrom_class_offers_a_disc_target() {
+        let w = wizard_on(DiskClass::Cdrom);
+        assert_eq!(w.fs_count(), CD_TARGETS.len());
+        assert!(w.fs_count() > 0);
+        // Out-of-range selection clamps rather than panicking, matching the
+        // other classes.
+        assert_eq!(w.fs_label(999), CD_TARGETS[CD_TARGETS.len() - 1].0);
+        assert_eq!(CD_TARGETS[0].1, CdTarget::SgiEfs);
+    }
 
     /// The TUI explorer's metadata editor has to reach POSIX mode and owner,
     /// not just HFS type/creator — and it has to work on a filesystem that

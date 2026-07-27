@@ -974,7 +974,7 @@ Usage: hd <COMMAND>
 
 ### `new hd sgi-efs`
 
-dvh-wrapped IRIX HDD: an SGI volume header + partition table wrapping a formatted EFS root partition, mountable by IRIX 5.3-6.5
+dvh-wrapped IRIX HDD: an SGI volume header + partition table wrapping a formatted EFS root partition, mountable by IRIX 5.3-6.5. Pass `--from-dir` to fill the root filesystem from a host folder in the same step; otherwise it comes out blank for `import` / `put`
 
 ```
 Usage: sgi-efs [OPTIONS] <IMAGE>
@@ -1213,7 +1213,7 @@ Usage: new <COMMAND>
 
 ### `optical new sgi-efs`
 
-IRIX EFS CD-ROM (`.iso`): an SGI volume header with the EFS filesystem in slot 7 (typed SYSV, the IRIX EFS-CD convention) and CD geometry. Mounts on IRIX with `mount -t efs <dev>s7`. Populate it with `put IMG@1 host/file /file`. (Formerly `new-sgi-cdrom`.)
+IRIX EFS CD-ROM (`.iso`): an SGI volume header with the EFS filesystem in slot 7 (typed SYSV, the IRIX EFS-CD convention) and CD geometry. Mounts on IRIX with `mount -t efs <dev>s7`. Pass `--from-dir` to fill it from a host folder in the same step (`--size auto` then sizes the disc to fit, and `--expand-archives --flatten-folders` unpacks a `.tardist` set into one `inst`-ready root); otherwise it comes out blank for `import` / `put`
 
 ```
 Usage: sgi-efs [OPTIONS] <IMAGE>

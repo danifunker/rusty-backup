@@ -12,7 +12,7 @@
 <pre><code>Usage: new &lt;COMMAND&gt;</code></pre>
 <h2>Subcommands</h2>
 <ul class="verbs">
-<li><a href="optical-new-sgi-efs.html"><code>sgi-efs</code></a><span class="desc">IRIX EFS CD-ROM (`.iso`): an SGI volume header with the EFS filesystem in slot 7 (typed SYSV, the IRIX EFS-CD convention) and CD geometry. Mounts on IRIX with `mount -t efs &lt;dev&gt;s7`. Populate it with `put IMG@1 host/file /file`. (Formerly `new-sgi-cdrom`.)</span></li>
+<li><a href="optical-new-sgi-efs.html"><code>sgi-efs</code></a><span class="desc">IRIX EFS CD-ROM (`.iso`): an SGI volume header with the EFS filesystem in slot 7 (typed SYSV, the IRIX EFS-CD convention) and CD geometry. Mounts on IRIX with `mount -t efs &lt;dev&gt;s7`. Pass `--from-dir` to fill it from a host folder in the same step (`--size auto` then sizes the disc to fit, and `--expand-archives --flatten-folders` unpacks a `.tardist` set into one `inst`-ready root); otherwise it comes out blank for `import` / `put`</span></li>
 </ul>
 <footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_docs</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
 </body></html>
