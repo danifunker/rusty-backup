@@ -40,6 +40,19 @@
 #       it uses exactly `DefaultEditor`, `ReadlineError`, and the history calls,
 #       none of which are behind custom-bindings - so nothing is lost here. (The
 #       mrustc gap itself is generic and worth fixing; see docs/build-ppc-mrustc.md.)
+#   - serde_json: held below 1.0.147. That release swapped the float formatter
+#       from `ryu` to `zmij`, and zmij aborts mrustc outright:
+#         BUG: src/hir/hir_ops.cpp:133: Mismatched types - f64 and f32
+#       1.0.146 is the last `ryu` release. Identical JSON either way; only the
+#       shortest-round-trip float printer differs.
+#   - hashbrown: default-features = false. The entry is a version pin for
+#       indexmap and nothing more, but as a *direct* dependency it also enabled
+#       0.14's default `ahash` feature - and ahash pulls `zerocopy`, whose
+#       const-generic `HasField` impls mrustc resolves to the wrong one:
+#         error:0: Method project doesn't match trait:
+#           Expected *mut B/*I:1*/  Found *mut A/*I:0*/
+#       indexmap declares `default-features = false, features = ["raw"]` for
+#       itself, so no crate in the graph actually wanted those defaults.
 #   - serde_yml: optional, and this build leaves it OFF. Its backend `libyml`
 #       hits an mrustc macro-expansion gap ("Unused tokens at the end of macro
 #       expansion - TOK_RWORD_AS", scanner.rs:1937). The engine gates YAML
@@ -103,7 +116,10 @@ anyhow = "1"
 thiserror = "2"
 clap = { version = ">=4.4, <4.5", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# DEVIATION (see header): held below 1.0.147, the version that swapped its
+# float formatter from `ryu` to `zmij`. zmij aborts mrustc with
+# "BUG: hir/hir_ops.cpp:133: Mismatched types - f64 and f32". Same JSON.
+serde_json = ">=1, <1.0.147"
 byteorder = "1"
 encoding_rs = "0.8"
 log = "0.4"
@@ -141,7 +157,13 @@ lzfse_rust = "0.2.1"
 
 # --- Transitive pins (mirror of rb-cli-vintage) ---
 indexmap = "=2.5.0"
-hashbrown = "=0.14.5"
+# DEVIATION (see header): default-features = false. This entry exists only to
+# pin the version for indexmap, but declaring it as a direct dependency also
+# turned on 0.14's default `ahash` feature, and ahash pulls `zerocopy`, whose
+# const-generic `HasField` impls mrustc mis-selects ("Method project doesn't
+# match trait"). indexmap asks for `default-features = false, features =
+# ["raw"]` itself, so nothing else wanted the defaults.
+hashbrown = { version = "=0.14.5", default-features = false }
 zeroize = "=1.8.1"
 home = "=0.5.9"
 zeroize_derive = "=1.4.2"
