@@ -8,6 +8,8 @@ Topics:
 
 - [Inspect what's on a disk](#inspect-whats-on-a-disk)
 - [Create + populate an HFS floppy](#create--populate-an-hfs-floppy)
+- [Fill an image from a host folder](#fill-an-image-from-a-host-folder)
+- [Build an IRIX EFS CD-ROM](#build-an-irix-efs-cd-rom)
 - [Round-trip a real device through backup + restore](#round-trip-a-real-device-through-backup--restore)
 - [Use globs to extract or remove many files](#use-globs-to-extract-or-remove-many-files)
 - [Drive everything from a batch JSON script](#drive-everything-from-a-batch-json-script)
@@ -47,6 +49,88 @@ rb-cli put   disk.dsk ./Extensions/ATM /System/Extensions/ATM
 # Stamp the boot blocks verbatim (HFS-only)
 rb-cli put disk.dsk --boot ./bootblocks.bin
 ```
+
+## Fill an image from a host folder
+
+`put` copies one file; `import` copies a whole tree in one pass, with no
+tarball to stage first.
+
+```bash
+# The folder's *contents* land at the destination (default `/`).
+rb-cli import disk.hda ./stuff
+
+# ...or under an existing subdirectory. Like `untar`, the destination
+# must already exist -- `mkdir` it first.
+rb-cli mkdir  disk.hda /extras
+rb-cli import disk.hda ./stuff /extras
+
+# Re-running over an existing tree: pick a conflict policy explicitly.
+rb-cli import disk.hda ./stuff --skip-existing   # leave what's there
+rb-cli import disk.hda ./stuff --force           # replace it
+```
+
+Entries are visited in sorted order, so the same tree always produces the
+same on-disk layout. Symlinks are recreated where the filesystem supports
+them and counted where it can't (FAT/HFS), rather than aborting the run;
+the same goes for names the target can't store and for hardlinks / device
+nodes. macOS `._*` sidecars are skipped unless you pass
+`--include-appledouble`.
+
+Tar archives found in the tree are copied in as opaque files by default.
+`--expand-archives` unpacks them instead, into a directory named after
+each:
+
+```bash
+rb-cli import disk.hda ./downloads --expand-archives
+```
+
+Detection is a content sniff for the `ustar` magic, not an extension
+match — so an oddly-named archive (IRIX `.tardist`, say) is still found,
+and a gzipped *disk image* is not mistaken for one.
+
+## Build an IRIX EFS CD-ROM
+
+An IRIX-mountable disc is an SGI volume header with the EFS filesystem in
+slot 7 typed SYSV. `--from-dir` formats and fills in one command.
+
+```bash
+# Blank 600 MB disc (a CD-R), to fill later.
+rb-cli optical new sgi-efs irix.iso --size 600M --name IRIX53
+
+# Format and fill in one step; `auto` sizes the disc to the folder
+# rather than to a media size.
+rb-cli optical new sgi-efs irix.iso --size auto --name IRIX53 \
+    --from-dir ~/sgi-stuff
+
+# Real IRIX CDs are sparser than our default ~1 inode/4 KiB. With a
+# handful of large files, reclaim the inode tables:
+rb-cli optical new sgi-efs irix.iso --size 600M --bytes-per-inode 32768 \
+    --from-dir ~/sgi-stuff
+
+rb-cli ls   irix.iso@1 /
+rb-cli fsck irix.iso@1
+```
+
+Mount it on IRIX with `mount -t efs -o ro /dev/dsk/dks0d<N>s7 /CDROM`.
+
+For a folder of `.tardist` packages, `--flatten-folders` unpacks every
+archive into a single root instead of one directory each — the shape
+`inst` expects, since you point it at one directory holding all the
+product images:
+
+```bash
+rb-cli optical new sgi-efs irix.iso --size auto --name IRIX53 \
+    --from-dir ~/sgi-stuff --expand-archives --flatten-folders
+```
+
+Merging makes overlap normal rather than exceptional — SGI freeware
+tardists all ship the same `fw_common*` product — so `--flatten-folders`
+skips entries that already exist and reports the count. Pass `--force` to
+overwrite instead.
+
+The same `--from-dir` / `--size auto` flags work on `new hd sgi-efs` for a
+dvh-wrapped IRIX hard disk, and the TUI's new-image wizard offers the
+CD-ROM class with an optional source folder.
 
 ## Create a blank NTFS volume
 

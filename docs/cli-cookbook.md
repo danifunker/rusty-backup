@@ -18,8 +18,9 @@ Recipes assume you've installed shell completions
 2. [Expand an HFS volume from a 32 MB SCSI drive into a 2 GB image](#2-expand-an-hfs-volume-from-a-32-mb-scsi-drive-into-a-2-gb-image)
 3. [Shrink an IRIX disk by re-encoding to CHD](#3-shrink-an-irix-disk-by-re-encoding-to-chd)
 4. [Build a custom HFS image from a host directory](#4-build-a-custom-hfs-image-from-a-host-directory)
-5. [Rip and archive a CD-ROM library to CHD](#5-rip-and-archive-a-cd-rom-library-to-chd)
-6. [Drive complex flows from a single batch script](#6-drive-complex-flows-from-a-single-batch-script)
+5. [Build an IRIX software CD from a folder of tardists](#5-build-an-irix-software-cd-from-a-folder-of-tardists)
+6. [Rip and archive a CD-ROM library to CHD](#6-rip-and-archive-a-cd-rom-library-to-chd)
+7. [Drive complex flows from a single batch script](#7-drive-complex-flows-from-a-single-batch-script)
 
 ---
 
@@ -172,6 +173,12 @@ rb-cli convert /tank/irix-octane.chd /tank/restored/ --format raw \
 sitting in a host filesystem (or AppleDouble sidecars from `cp` on
 macOS). Assemble them into an HFS boot disk in one shot.
 
+> **Just need the files in?** `rb-cli import boot.dsk ./contents /System`
+> copies a whole tree in one command. Use the `batch` flow below when you
+> want per-file **type/creator** codes inferred from extensions — that
+> inference is what `batch-template` adds, and `import` does not do it.
+> On a non-Mac filesystem, reach for `import` first.
+
 The flow is: `batch-template` to generate a starter script,
 hand-edit if needed, then `batch` to apply.
 
@@ -206,7 +213,80 @@ preflights paths against the live FS state, then applies all of them
 under one `sync_metadata` at the end — so partial failures don't leave
 the volume in a half-written state.
 
-## 5. Rip and archive a CD-ROM library to CHD
+## 5. Build an IRIX software CD from a folder of tardists
+
+**Goal.** You've collected `.tardist` packages for an SGI running IRIX
+5.3 and want a disc the machine can mount and `inst` can read.
+
+An IRIX-mountable disc isn't ISO 9660 — it's an SGI volume header with
+the EFS filesystem in **slot 7 typed SYSV**, with CD geometry (1 head ×
+32 sectors). `optical new sgi-efs` writes exactly that shape, and
+`--from-dir` fills it in the same command.
+
+```bash
+# 1. See what you're working with.
+du -sh ~/sgi-stuff-5-3
+
+# 2. Format and fill in one step.
+rb-cli optical new sgi-efs ~/irix53.iso \
+    --size 600M --name IRIX53 \
+    --bytes-per-inode 32768 \
+    --from-dir ~/sgi-stuff-5-3
+
+# 3. Verify before burning.
+rb-cli ls   ~/irix53.iso@1 /
+rb-cli fsck ~/irix53.iso@1
+```
+
+**On `--bytes-per-inode`.** The default density is ~1 inode per 4 KiB,
+which on a 600 MB disc spends ~20 MB on inode tables. Real IRIX CDs are
+far sparser. With a few dozen large packages, `32768` reclaims most of
+that. It only affects metadata, never your data.
+
+**Archives: leave them, or unpack them?** This is the real decision, and
+it depends on what the disc is for.
+
+*Leave them* (the default) when the target machine's own installer
+consumes the archive. IRIX `inst` reads a `.tardist` as-is, so unpacking
+would actually get in the way. The summary tells you archives were found
+so you know the option exists.
+
+*Unpack them* with `--expand-archives` when you want the contents
+browsable. Each archive lands in a directory named after it. Add
+`--flatten-folders` to merge every archive into **one** root instead —
+which is what `inst` wants from a distribution directory, since you point
+it at a single directory holding all the product images rather than
+re-pointing it once per package:
+
+```bash
+rb-cli optical new sgi-efs ~/irix53.iso \
+    --size auto --name IRIX53 \
+    --from-dir ~/sgi-stuff-5-3 \
+    --expand-archives --flatten-folders
+```
+
+`--size auto` measures the folder and sizes the disc to it — and with
+`--expand-archives` it measures what the archives *become*, not their
+compressed size, because a tree of `.tar.gz` can easily triple on the way
+in and a disc sized off the packed total would run out mid-copy.
+
+Flattening makes overlapping entries normal rather than exceptional: SGI
+freeware tardists all ship the same shared `fw_common*` product, and
+source tarballs commonly both root at `usr/`. So `--flatten-folders`
+skips entries that already exist and reports the count; pass `--force` to
+overwrite instead.
+
+Mount it on the SGI with:
+
+```
+mount -t efs -o ro /dev/dsk/dks0d<N>s7 /CDROM
+```
+
+The same flags work on `new hd sgi-efs` for a dvh-wrapped IRIX hard disk,
+and the TUI's new-image wizard exposes the CD-ROM class with an optional
+source folder if you'd rather not type flags.
+
+## 6. Rip and archive a CD-ROM library to CHD
 
 **Goal.** A drawer of vintage CD-ROMs needs to be ripped to a stable
 archival format. CHD with the CD profile is what MAME and DuckStation
@@ -245,7 +325,7 @@ HFS type/creator codes; extract handles the resource-fork plumbing in
 whichever shape your downstream consumer wants (AppleDouble sidecars,
 MacBinary single-file, native `..namedfork/rsrc` on a Mac, etc.).
 
-## 6. Drive complex flows from a single batch script
+## 7. Drive complex flows from a single batch script
 
 **Goal.** You've got a CI job that needs to populate a fresh image with
 a Finder, a couple of extensions, and a few launch documents — and the
