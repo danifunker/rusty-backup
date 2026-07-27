@@ -12,11 +12,14 @@ remote archiver), [`../scripts/ppc-libc-probe.py`](../scripts/ppc-libc-probe.py)
 and [`../scripts/ppc-libc-compare.py`](../scripts/ppc-libc-compare.py) (libc
 ground truth).
 
-Status (2026-07-26): **the full Rust standard library - core, alloc, std,
+Status (2026-07-27): **the full Rust standard library - core, alloc, std,
 panic_unwind, test, libc - builds for `powerpc-apple-darwin` and links into a
-running PowerPC Mach-O binary**, and the engine build is grinding through the
-dependency graph behind it. Getting here took twenty-four mrustc fixes and two
-rustc-source patches, all listed below.
+running PowerPC Mach-O binary, and every one of the engine's 380 crates now
+compiles**, including the engine itself (an 81 MB object from a 797 MB
+translation unit). Only the final `rb-cli` link is outstanding.
+
+Getting here took twenty-four mrustc fixes and two rustc-source patches, all
+listed below.
 
 Two classes of remaining work, and they are different in kind:
 
@@ -401,7 +404,7 @@ Stages, in order:
 | `hostc`    | emit the engine's C on this machine (deferred codegen) | ok |
 | `host`     | transpile+build a native `rb-cli` | to validate |
 | `ppclibs`  | **PowerPC libcore/alloc/std/panic_unwind/test/libc** | **ok** |
-| `ppc`      | PowerPC `rb-cli` | 188 of 404 crates; see "Where this stands" |
+| `ppc`      | PowerPC `rb-cli` | **all 380 crates compile**; final link outstanding |
 | `probe`    | capture libc ground truth from the 10.4u / 10.5 SDKs | ok |
 
 ### Traps in the build loop
@@ -456,7 +459,119 @@ Six that have each cost real time:
       [ -e "$f.o" ] || echo "stale: $f"; done; done
   ```
 
-  Delete what it lists and re-run.
+  **Repair it by running the codegen script, not by deleting the `.rlib`.**
+  mrustc already emitted one next to the artifact:
+
+  ```sh
+  sh output-rb-ppc/lib<crate>-<tag>.rlib-codegen.sh    # produces the missing .o
+  ```
+
+  Deleting the `.rlib` also works, but it makes that crate dirty and therefore
+  everything downstream of it - and if the crate is anywhere under the engine,
+  "downstream" includes the engine's 797 MB translation unit, which is hours.
+  That mistake was made here for a *43 KB* `zstd-safe` object.
+
+  **How this gets created in the first place is worth knowing, because it is easy
+  to do to yourself:** running a single crate's mrustc command by hand to test a
+  fix - which is the normal debugging loop - produces the `.rlib` and, under
+  `MINICARGO_DEFER_CODEGEN`, only *emits* the codegen script rather than running
+  it. So every standalone crate test leaves exactly this footprint. Run the
+  check above afterwards, or just run the emitted script too.
+
+  **And the symptom is misleading.** A missing object is not remapped by
+  `ppc-cc-remote.py` (it only mirrors paths that exist locally), so the local
+  path is passed to the Mac verbatim - where `/home` is an autofs mount that
+  answers `Input/output error` rather than `No such file`:
+
+  ```
+  gcc: error: /home/dani/repos/mrustc/output-rb-ppc/libzstd_safe-....rlib.o: Input/output error
+  ```
+
+  That reads like a disk fault on a path that looks perfectly reasonable. It is a
+  missing file. Check the link's inputs exist locally before suspecting hardware:
+
+  ```sh
+  tr ' ' '\n' < output-rb-ppc/rb-cli_cmd.txt | tr -d '"' | grep '\.o$' \
+    | while read f; do [ -f "$f" ] || echo "MISSING: $f"; done
+  ```
+
+## The engine is one 797 MB translation unit
+
+mrustc emits **one `.c` per crate**, and there is no way to ask it for more -
+there is no codegen-units concept anywhere in `src/trans/`. For the engine crate
+that one file is **797 MB**, and it is the single most expensive thing in this
+build by a wide margin.
+
+Two consequences, both of which have bitten:
+
+**It exhausts a 32-bit compiler.** gcc's peak memory scales with the whole unit's
+IR, and `cc1` here is a 32-bit binary (`Mach-O executable ppc`), so at `-O1` it
+ran out of its own *address space* - about 3.5 GB on Darwin - after 25 minutes:
+
+```
+cc1: out of memory allocating 65536 bytes            (at ~2.9 GB RSS)
+```
+
+**Swap is not the constraint, and raising it is wasted effort.** Darwin's
+`dynamic_pager` grows swap on demand: it went 64 MB -> 1 GB unaided during one of
+these runs, with 45 GB of disk free. A 32-bit process cannot address more no
+matter how much backing store exists.
+
+`ppc-cc-remote.py` therefore gives an oversized unit its own flags, and only it -
+every other crate keeps what mrustc asked for:
+
+| flag | why |
+|---|---|
+| `-O0` | the significant one. At `-O1` gcc runs inter-procedural passes that need many function bodies live at once; at `-O0` it emits each function and releases it |
+| `--param ggc-min-expand=10` | collect far more often than the default "let the heap grow 30% between collections" |
+| `--param ggc-min-heapsize=32768` | and start doing so early |
+
+Result: an **81 MB `Mach-O ppc_7400` object**, peaking around 2.3 GB with RSS
+*falling* during the run as the collector reclaimed. Tunable with
+`PPC_BIG_TU_BYTES` / `PPC_BIG_TU_ARGS`; `PPC_BIG_TU_BYTES=0` disables the
+special-casing entirely.
+
+**Note the engine is consequently built unoptimised.** That is the right trade
+for having a binary at all, but it is a knob to revisit once it runs.
+
+**It makes anything that dirties the engine cost hours.** One compile is 70
+minutes with a warm page cache and closer to 3 hours without. So the dependency
+graph matters: anything the engine depends on, if invalidated, drags the engine
+with it. Deleting a 43 KB `zstd-safe` artifact cost three hours here for exactly
+that reason (see the traps above), and taking the first `APP_VERSION` stamp on an
+already-built tree cost another three.
+
+If this ceiling returns, in increasing order of cost: squeeze harder on flags
+(`--param ggc-min-expand=0`, `-fno-var-tracking`); split the crate across
+translation units, which is a **genuine mrustc feature** and not a flag; or build
+a 64-bit `cc1` (the G5 is a PPC970 and Leopard has a 64-bit userland, so a
+`ppc64` gcc would lift the ceiling while still emitting 32-bit target code - but
+that means rebuilding the bootstrap toolchain on a 2005 machine).
+
+## Version stamping
+
+The release pipeline sets `RELEASE_VERSION` to `date -u +"%Y-%m-%d-%H-%M"` and
+`build.rs` turns it into `cargo:rustc-env=APP_VERSION=<it>`. That whole path
+works unchanged under mrustc - minicargo parses `cargo:rustc-env` and passes it
+to the crate compile - so `build-ppc.sh` only has to set the variable.
+
+What does **not** carry over is the staleness guard. `build.rs` protects itself
+with `rerun-if-env-changed=RELEASE_VERSION`, and **minicargo does not implement
+rerun-if-env-changed at all**: once `build_rb-cli-ppc-*.txt` looks current the
+script never re-runs, so `APP_VERSION` would be pinned to whatever the first
+build stamped. The version is therefore recorded in `<output>/.release-version`
+and the build-script output dropped only when it genuinely changes.
+
+Dropping it re-transpiles the engine (hours), so the stamp is taken once and
+reused, and the *first* stamp on an existing tree deliberately adopts the value
+without invalidating anything - there is nothing stale to correct when nothing
+recorded a version before.
+
+```sh
+scripts/build-ppc.sh ppc                                   # stamp once, then reuse
+RELEASE_VERSION=2026-07-27-04-50 scripts/build-ppc.sh ppc  # set explicitly
+rm <output>/.release-version                               # take a fresh stamp
+```
 
 Building the PowerPC stdlib by hand, if you want to skip the driver:
 
@@ -890,8 +1005,20 @@ Open, in rough priority order:
      serde_json is held below the release that swapped `ryu` for `zmij`, and
      hashbrown's `ahash` default (the only thing pulling zerocopy) is off.
    - ~~`quote` aborting with no diagnostic at all~~ - fix 19.
+   - ~~`zeroize_derive`'s `#![crate_type = "proc-macro"]`~~ - fix 21.
+   - ~~`crossterm`'s attribute macro on a trait, and `indoc`'s escaped doc
+     string~~ - fixes 22-23.
+   - ~~`zip` resolving `flate2` as a relative path~~ - not an mrustc bug at all:
+     `deflate-flate2` does not enable the optional `flate2` dependency (that is
+     `deflate`'s job, via `flate2/rust_backend`), so the manifest needed the
+     implicit `flate2` feature adding. It would have failed the same way under
+     real cargo.
+   - ~~`zstd-safe`'s deref-coercion abort~~ - `ptr_mut(&mut *output)` spells out
+     what mrustc could not infer.
+   - ~~`ManuallyDrop`/`MaybeUninit` over `repr(packed)` failing their layout
+     assertions~~ - fix 24.
 
-   The frontier past that is a per-crate tail of the same kind. Each blocker has
+   **Every crate now compiles.** What is left is the final link. Each blocker has
    fallen into one of three buckets, in increasing order of what it costs to fix:
    a feature or version change in `rb-cli-ppc/Cargo.toml`, a `patch_*_vendor`
    rewrite in `build-ppc.sh`, or a change to mrustc itself. **Prefer the first two

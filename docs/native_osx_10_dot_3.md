@@ -7,7 +7,7 @@ off the table. Scope is deliberately limited to `rb-cli`; the GUI is a separate
 question (see the end). See [`build-ppc-mrustc.md`](build-ppc-mrustc.md) for the
 runnable build.
 
-## Where this stands (2026-07-25)
+## Where this stands (2026-07-27)
 
 **The Rust standard library builds and runs on PowerPC.** `core`, `alloc`, `std`,
 `panic_unwind`, `panic_abort`, `test`, `libc`, `hashbrown`, `compiler_builtins`
@@ -96,13 +96,18 @@ this plan predicted needed *engine* changes, and both are done:
   manifest pin drops the `nix 0.31` dependency whose `libc >= 0.2.186` requirement
   dragged in a post-`src/new/` libc. The build uses 0.2.155, which predates it.
 
-Everything hit since has been an **mrustc** bug rather than an engine or
-dependency problem - six of them so far, listed under phase 2 - and each has been
-small and local. That is the shape this plan expected for the tail, but the tail's
-length is still unknown.
+**The tail is done: all 380 crates compile**, the engine included. It ran to
+twenty-four mrustc fixes plus a handful of manifest and vendored-source
+workarounds, and - as this plan expected - almost every one was small and local.
+Notably **`src/` was never modified**; the two engine-side scope-downs above
+(`yaml`, `os-stub`) remain the only concessions the shared code has made.
 
-**Revised direction:** finish the engine transpile (section 8, phase 2), then link
-and smoke-test `rb-cli` on 10.5. Tiger is a separate, well-scoped follow-up
+The last few blockers changed character again, away from layout/ABI and toward
+proc-macro and macro-expansion support (attribute macros on traits, the
+plugin-side lexer, hygiene of forwarded tokens). Only the final `rb-cli` link
+remains.
+
+**Revised direction:** land the final link, then smoke-test `rb-cli` on 10.5. Tiger is a separate, well-scoped follow-up
 (phase 5). The `os/` platform layer stays out and remains hand-C, as section 5
 describes.
 
@@ -367,7 +372,7 @@ that exercises `println!`, `BTreeMap`, iterators, `AtomicU64`, threads,
 `fs::metadata` and `read_dir`, with the filesystem results checked field-by-field
 against `stat -f` on the machine. Cost: eight fixes (see "Where this stands").
 
-**Phase 2 - finish the engine transpile.** *(in progress)* Both scope-downs from
+**Phase 2 - finish the engine transpile.** *(all 380 crates compile; final link outstanding)* Both scope-downs from
 section 6 have landed - YAML is feature-gated out and `os-stub` replaces the macOS
 platform leaf - and the host-`libc` blocker is fixed by a manifest pin. The
 blockers met since are all mrustc bugs, each small and local, and each fixed on
@@ -419,8 +424,24 @@ full rebuild, so while the frontier is still moving the first two are preferred
 and mrustc work is batched. `radix_trie`, `zmij` and `zerocopy` left the graph
 this way, each for a feature or version the engine never wanted.
 
-Expect a further tail. Deliverable: every crate in the PowerPC configuration
-transpiles and compiles.
+Deliverable met: **every crate in the PowerPC configuration transpiles and
+compiles**, including the engine itself. Two things showed up only at the very
+end, and both are properties of the shape of this build rather than bugs:
+
+- **The engine is one 797 MB translation unit.** mrustc emits one `.c` per crate
+  and offers no way to split it. A 32-bit `cc1` runs out of *address space*
+  compiling that at `-O1`; it needs `-O0` plus aggressive GC tuning, which yields
+  an 81 MB object in ~70 minutes. Swap is irrelevant - Darwin grows it on demand
+  and a 32-bit process still cannot address past ~3.5 GB. The engine is therefore
+  built **unoptimised** for now.
+- **Anything that dirties the engine costs hours.** That makes the dependency
+  graph, and minicargo's cache invalidation, worth thinking about before running
+  a command. Two separate three-hour rebuilds were bought here: one by deleting a
+  43 KB stale artifact instead of running the codegen script mrustc had already
+  emitted next to it, and one by taking the first `APP_VERSION` stamp on an
+  already-built tree.
+
+Both are written up in `build-ppc-mrustc.md`.
 
 **Phase 3 - link and smoke-test on 10.5.** Get `rb-cli` linked, then exercise it
 against disk images on the G5: `inspect`, `backup`, `restore`, a browse-view
@@ -477,15 +498,14 @@ maintain.
   `repr(C)` was tried and fails differently. A real fix means mrustc emitting
   explicit padding plus forced alignment for `repr(Rust)` types instead of
   delegating - a much larger change. See "The alignment problem" in the build doc.
-- **The per-crate mrustc tail.** 188 of 404 crates so far. Each gap met to date
-  has been small and local (a turbofish, a feature swap, a dependency pin), but
-  the tail length is genuinely unknown until phase 2 runs to completion.
-- **`zstd-sys` is not proven yet.** The machinery it needs is: `bzip2-sys`
-  compiles its C on the G5 and archives it into a valid Mach-O static library
-  through the same cc-rs path, and zstd-sys's own C compiles (its x86-only
-  `huf_decompress_amd64.S` assembles to an empty object on PowerPC). What has not
-  happened yet is a complete zstd-sys build and a link against the result. If it
-  fights, the `native-zstd` feature can still come off.
+- ~~**The per-crate mrustc tail.**~~ Resolved - all 380 crates compile. Every
+  gap was small and local (a turbofish, a feature swap, a dependency pin, or a
+  contained mrustc fix), and the tail ran to roughly a dozen past the 188 that
+  phase 2 started from.
+- ~~**`zstd-sys` is not proven.**~~ Proven: a 937 KB `libzstd.a`, valid Mach-O
+  symbol index, 371 `_ZSTD*` symbols, built natively on the G5 through cc-rs and
+  the remote archiver. `native-zstd` stays; the escape hatch in section 3 is not
+  needed. (`zstd-safe` above it needed one turbofish-class source fix.)
 - **C++ dependencies remain a hard stop.** `chd` stays excluded permanently.
 - **10.4 vs 10.5 is a symbol problem, not just a layout one.** Tiger exports zero
   `$INODE64` symbols, so today's binaries cannot launch there at all. Phase 5.
