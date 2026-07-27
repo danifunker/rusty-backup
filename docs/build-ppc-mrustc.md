@@ -15,7 +15,7 @@ ground truth).
 Status (2026-07-26): **the full Rust standard library - core, alloc, std,
 panic_unwind, test, libc - builds for `powerpc-apple-darwin` and links into a
 running PowerPC Mach-O binary**, and the engine build is grinding through the
-dependency graph behind it. Getting here took nineteen mrustc fixes and two
+dependency graph behind it. Getting here took twenty-one mrustc fixes and two
 rustc-source patches, all listed below.
 
 Two classes of remaining work, and they are different in kind:
@@ -276,6 +276,39 @@ All committed on `rb-cli-vintage-build`; each is a candidate upstream PR.
     `gdb -ex 'break std::__throw_bad_function_call()' -ex run -ex bt` on the
     failing command names the line in one go. (Found on `quote` 1.0.47.)
 
+20. **`src/parse/root.cpp`** - `Parse_Trait_Item` had no case for
+    `TOK_INTERPOLATED_ITEM` at all, so an item reaching a *trait* body as an
+    already-parsed `$item:item` fragment was a hard error. Fixes 12-13 grew that
+    case for impl blocks (via `bitflags`); a trait body can hold one too.
+    `crossterm`'s `stylize_method!` is the case - it emits each method through
+    `calculated_docs!`, whose expansion is `$(#[doc = $doc] $item)*`, i.e. an
+    attribute in front of an interpolated function, straight into `trait
+    Stylize`. Simpler than the impl version, since a trait item *is* an
+    `AST::Named<AST::Item>` and the fragment is just handed back; attributes are
+    transferred onto it for the same reason as fix 13.
+
+21. **`tools/minicargo/{build,jobs}.cpp`** - a **regression from fix 15**, plus
+    two things that made it far harder to read than it should have been.
+    `make_dep_codegen` appends `" (codegen)"` to every entry in a crate's
+    dependency list under deferred codegen, and that list also holds the crate's
+    own build-script *run* job - which has no codegen job, being a host binary
+    built and run directly. The dependency became `quote v1.0.47 (script run)
+    (codegen)`, which nothing ever announces, and 91 jobs deadlocked behind it.
+    Fix 15 caused this: the original test (`not already ending in ')'`) excluded
+    those names by accident, and correcting it for `(host)` removed that
+    protection. It stayed hidden because it only fires when a build script
+    actually has a job that run - most have cached output and `bs_job_name` comes
+    back empty. Alongside it:
+
+    - the deadlock now **lists** the waiting jobs and each unmet dependency.
+      "Nothing runnable or running, but jobs are still waiting" names neither the
+      job nor the dependency, and a job-name mismatch is exactly what it is most
+      likely to be.
+    - it now sets `failed`. `run()` returns `!failed`, so a deadlock exited
+      **zero** - minicargo reported success and `build-ppc.sh` announced an
+      `rb-cli` that had never been linked. `stage_ppc` now also checks for the
+      binary, which `stage_host` always did.
+
 ### Plus: a macOS/PowerPC build-script override set
 
 mrustc ships `script-overrides/stable-1.74.0-{linux,windows}` but not `-macos`.
@@ -412,6 +445,15 @@ around a specific mrustc gap (all documented at their site):
   mrustc cannot resolve. Not avoidable by dropping a feature: crossterm's
   `events` needs signal-hook-mio, which genuinely imports
   `signal_hook::iterator::backend`.
+- **signal-hook-mio** — `patch_signal_hook_mio_vendor` turns
+  `use $pipe as Pipe;` into `type Pipe = $pipe;` inside
+  `implement_signals_with_pipe!`. mrustc cannot parse a `use` whose path is an
+  interpolated fragment followed by `as` — having consumed the path it insists on
+  `::` (`Unexpected token TOK_RWORD_AS, expected TOK_DOUBLE_COLON`). `Pipe` is
+  only ever used as a type here (`SignalDelivery<Pipe, E>`, `Pipe::pair()`), so
+  the alias binds it identically. **Same `TOK_RWORD_AS` family as the libyml gap
+  that keeps `yaml` off for this target** — see the open items; one parser fix
+  would plausibly clear both.
 - **rustyline** `default-features = false` (keeping `with-file-history`,
   `with-dirs`) — drops `custom-bindings`, the only thing pulling `radix_trie`.
   The engine uses `DefaultEditor`, `ReadlineError` and the history calls, none of
@@ -773,3 +815,14 @@ Open, in rough priority order:
    safety net - an enum whose alignment mrustc gets wrong is caught only through
    the size it rounds up to, or through an enclosing struct. Emitting the missing
    assertions is a small codegen change and the obvious next hardening step.
+7. **`TOK_RWORD_AS` in the parser - now worth fixing.** Two crates have hit it:
+   `libyml`, which is why the `yaml` feature is off for this target, and
+   `signal-hook-mio`'s `use $pipe as Pipe;`, where mrustc consumes an
+   interpolated path fragment and then demands `::` rather than accepting `as`
+   (`Unexpected token TOK_RWORD_AS, expected TOK_DOUBLE_COLON`). Both are worked
+   around today - YAML by a feature gate, signal-hook-mio by a type alias - but
+   the second occurrence makes the parser the right place to fix it, and doing so
+   would plausibly let `yaml` come back on. Confirm the two are the same root
+   cause first: libyml presents as "Unused tokens at the end of macro expansion"
+   at `scanner.rs:1937` rather than as a parse error, so it may be a different
+   manifestation.

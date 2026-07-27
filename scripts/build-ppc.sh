@@ -267,6 +267,43 @@ PY
   note "applied vendored-source workarounds (signal-hook UFCS add_signal)."
 }
 
+patch_signal_hook_mio_vendor() {
+  # `implement_signals_with_pipe!` binds its `$pipe:path` argument with
+  #
+  #     use $pipe as Pipe;
+  #
+  # and mrustc cannot parse a `use` whose path is an interpolated fragment
+  # followed by `as` - having consumed the path it insists on `::`:
+  #
+  #   signal-hook-mio/src/lib.rs:32:22 error:0:
+  #     Unexpected token TOK_RWORD_AS, expected TOK_DOUBLE_COLON
+  #
+  # `Pipe` is only ever used as a *type* here - `SignalDelivery<Pipe, E>` and
+  # `Pipe::pair()` - so a type alias binds it identically and sidesteps the use
+  # statement entirely. Every invocation passes a plain type path
+  # (`mio::net::UnixStream`, `mio_uds::UnixStream`).
+  #
+  # This is the same `TOK_RWORD_AS` family as the libyml gap that keeps the
+  # `yaml` feature off for this target; fixing the parser would likely clear
+  # both, and is the better long-term answer. See docs/build-ppc-mrustc.md.
+  local f="$VENDOR_DIR/signal-hook-mio/src/lib.rs"
+  [ -f "$f" ] || return 0
+  python3 - "$f" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+old = "        use $pipe as Pipe;"
+new = "        type Pipe = $pipe;"
+if new in s:
+    sys.exit(0)          # already patched
+if old not in s:
+    sys.stderr.write("signal-hook-mio: expected `use $pipe as Pipe;` not found; skipping patch\n")
+    sys.exit(0)
+open(p, "w").write(s.replace(old, new, 1))
+PY
+  note "applied vendored-source workarounds (signal-hook-mio \$pipe type alias)."
+}
+
 patch_zstd_sys_vendor() {
   # zstd-sys is the ONLY crate in this graph that asks for `cc`'s `parallel`
   # feature, and `parallel` is what drags in cc's async build-command runner
@@ -317,6 +354,7 @@ stage_host() {
   patch_chrono_vendor
   patch_rustversion_vendor
   patch_signal_hook_vendor
+  patch_signal_hook_mio_vendor
   patch_zstd_sys_vendor
   mkdir -p "$HOST_OUT"
   MRUSTC_TARGET_VER="$MRUSTC_TARGET_VER" \
@@ -349,6 +387,7 @@ stage_hostc() {
   patch_chrono_vendor
   patch_rustversion_vendor
   patch_signal_hook_vendor
+  patch_signal_hook_mio_vendor
   patch_zstd_sys_vendor
   mkdir -p "$HOSTC_OUT"
   MRUSTC_TARGET_VER="$MRUSTC_TARGET_VER" MINICARGO_DEFER_CODEGEN=1 \
@@ -419,6 +458,7 @@ stage_ppc() {
   patch_chrono_vendor
   patch_rustversion_vendor
   patch_signal_hook_vendor
+  patch_signal_hook_mio_vendor
   patch_zstd_sys_vendor
   mkdir -p "$PPC_OUT"
   MRUSTC_TARGET_VER="$MRUSTC_TARGET_VER" MINICARGO_DEFER_CODEGEN=1 \
@@ -429,6 +469,11 @@ stage_ppc() {
       --target "$PPC_TARGET" \
       --no-default-features --features "$FEATURES" \
       -j "$PPC_JOBS"
+  # Don't take a zero exit as proof. minicargo has returned success while
+  # deadlocking ("Nothing runnable or running, but jobs are still waiting"), and
+  # this note is the only thing the log then shows - it announced an rb-cli that
+  # was never linked. stage_host has always checked for its binary; so does this.
+  [ -e "$PPC_OUT/rb-cli" ] || die "minicargo exited 0 but produced no $PPC_OUT/rb-cli -- check the log for 'BUG:' and for a deadlock listing"
   note "PowerPC rb-cli under $PPC_OUT (compiled on $PPC_HOST)."
 }
 
