@@ -101,14 +101,29 @@ stamp_version() {
     RELEASE_VERSION="${prev:-$(date -u +%Y-%m-%d-%H-%M)}"
   fi
   export RELEASE_VERSION
-  if [ "$prev" != "$RELEASE_VERSION" ]; then
-    mkdir -p "$PPC_OUT" "$PPC_OUT/host"
-    rm -f "$PPC_OUT"/host/build_rb-cli-ppc-*.txt
-    printf '%s' "$RELEASE_VERSION" > "$marker"
-    note "APP_VERSION=$RELEASE_VERSION (changed - build script will re-run, engine re-transpiles)"
-  else
+  mkdir -p "$PPC_OUT" "$PPC_OUT/host"
+
+  if [ "$prev" = "$RELEASE_VERSION" ]; then
     note "APP_VERSION=$RELEASE_VERSION (unchanged)"
+    return
   fi
+
+  # First stamp on a tree that has no marker yet: adopt the version WITHOUT
+  # invalidating anything. There is nothing stale to correct - whatever is built
+  # was built before versioning existed - and dropping the build-script output
+  # here costs a full re-transpile of the engine's 797 MB translation unit, which
+  # is hours. Learned the hard way: introducing this function did exactly that to
+  # an already-complete tree that only needed its final link.
+  if [ -z "$prev" ]; then
+    printf '%s' "$RELEASE_VERSION" > "$marker"
+    note "APP_VERSION=$RELEASE_VERSION (first stamp - existing objects left alone;"
+    note "  re-run with RELEASE_VERSION set, or delete $marker, to force it in)"
+    return
+  fi
+
+  rm -f "$PPC_OUT"/host/build_rb-cli-ppc-*.txt
+  printf '%s' "$RELEASE_VERSION" > "$marker"
+  note "APP_VERSION=$RELEASE_VERSION (changed - build script will re-run, engine re-transpiles)"
 }
 
 HOST_LIBS="$MRUSTC_DIR/output-${RUSTC_VERSION}"
