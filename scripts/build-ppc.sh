@@ -72,6 +72,45 @@ PPC_OVERRIDE_SUFFIX="-macos-powerpc"
 # "Failed to get rustc version" and takes the build with it. Pin it absolute.
 export MRUSTC_PATH="${MRUSTC_PATH:-$MRUSTC_DIR/bin/mrustc}"
 
+# ---- version stamp -----------------------------------------------------------
+# The pipeline stamps a build date: `.github/workflows/release.yml` sets
+# RELEASE_VERSION to `date -u +"%Y-%m-%d-%H-%M"`, ../build.rs reads it and emits
+# `cargo:rustc-env=APP_VERSION=<it>`. That works unchanged here - minicargo does
+# parse `cargo:rustc-env` and pass it to the crate compile - so all this has to
+# do is set the variable and make sure it is not silently stale.
+#
+# The staleness matters, and differs from cargo. build.rs guards itself with
+# `rerun-if-env-changed=RELEASE_VERSION`, but **minicargo does not implement
+# rerun-if-env-changed**: once `build_rb-cli-ppc-*.txt` exists and looks current,
+# the script is never re-run and APP_VERSION is pinned to whatever the first
+# build stamped. So the version is recorded in a marker file and the build-script
+# output is dropped only when it actually changes.
+#
+# Deliberately *not* re-stamped on every invocation: a changed build-script
+# output makes the engine crate dirty, and re-transpiling the engine is the most
+# expensive thing in this build. So the stamp is taken once and reused until you
+# ask for a new one:
+#
+#   RELEASE_VERSION=2026-07-26-22-48 scripts/build-ppc.sh ppc   # explicit
+#   rm <output>/.release-version                                # re-stamp next run
+stamp_version() {
+  local marker="$PPC_OUT/.release-version"
+  local prev=""
+  [ -f "$marker" ] && prev="$(cat "$marker" 2>/dev/null)"
+  if [ -z "${RELEASE_VERSION:-}" ]; then
+    RELEASE_VERSION="${prev:-$(date -u +%Y-%m-%d-%H-%M)}"
+  fi
+  export RELEASE_VERSION
+  if [ "$prev" != "$RELEASE_VERSION" ]; then
+    mkdir -p "$PPC_OUT" "$PPC_OUT/host"
+    rm -f "$PPC_OUT"/host/build_rb-cli-ppc-*.txt
+    printf '%s' "$RELEASE_VERSION" > "$marker"
+    note "APP_VERSION=$RELEASE_VERSION (changed - build script will re-run, engine re-transpiles)"
+  else
+    note "APP_VERSION=$RELEASE_VERSION (unchanged)"
+  fi
+}
+
 HOST_LIBS="$MRUSTC_DIR/output-${RUSTC_VERSION}"
 PPC_LIBS="$MRUSTC_DIR/output-${RUSTC_VERSION}-${PPC_TARGET}"
 HOST_OUT="$MRUSTC_DIR/output-rb-host"
@@ -379,6 +418,45 @@ PY
   note "applied vendored-source workarounds (instability formatdoc -> format)."
 }
 
+patch_zstd_safe_vendor() {
+  # zstd-safe passes its `OutBufferWrapper` / `InBufferWrapper` to
+  #
+  #     fn ptr_mut<B>(ptr_void: &mut B) -> *mut B
+  #
+  # as `ptr_mut(&mut output)`. `B` is only pinned by *deref-coercing*
+  # `&mut OutBufferWrapper` to `&mut ZSTD_outBuffer` (the wrapper's `DerefMut`
+  # target), driven by what the enclosing zstd_sys call expects. mrustc gets as
+  # far as the autoderef and then aborts inside the coercion, with a bare C++
+  # assertion and no span:
+  #
+  #   autoderef: Deref OutBufferWrapper<..> into ZSTD_outBuffer_s
+  #   check_unsize_tys: From? ZSTD_outBuffer_s
+  #   mrustc: src/hir/type.hpp:236: as_Borrow(): Assertion `m_tag == TAG_Borrow' failed.
+  #
+  # (`add_coerce_borrow` assumes the node it is handed is a borrow; on this path
+  # it is the dereffed struct.) Writing the deref out - `&mut *output` - pins `B`
+  # directly and removes the coercion. Same class of fix as the crc and chrono
+  # turbofishes: say what mrustc cannot infer, change nothing else.
+  local f="$VENDOR_DIR/zstd-safe/src/lib.rs"
+  [ -f "$f" ] || return 0
+  python3 - "$f" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+n = 0
+for name in ("output", "input"):
+    old = "ptr_mut(&mut %s)" % name
+    new = "ptr_mut(&mut *%s)" % name
+    n += s.count(old)
+    s = s.replace(old, new)
+if n:
+    open(p, "w").write(s)
+elif "ptr_mut(&mut *" not in s:
+    sys.stderr.write("zstd-safe: no ptr_mut(&mut ..) call sites found; skipping patch\n")
+PY
+  note "applied vendored-source workarounds (zstd-safe explicit deref at ptr_mut)."
+}
+
 patch_zstd_sys_vendor() {
   # zstd-sys is the ONLY crate in this graph that asks for `cc`'s `parallel`
   # feature, and `parallel` is what drags in cc's async build-command runner
@@ -424,6 +502,7 @@ PY
 # ---- stage 5: transpile+compile the engine for the HOST (native proof) ------
 stage_host() {
   banner "5. transpile+build rb-cli for the HOST (native $HOST_ARCH proof)"
+  stamp_version
   cd "$MRUSTC_DIR"
   patch_crc_vendor
   patch_chrono_vendor
@@ -431,6 +510,7 @@ stage_host() {
   patch_signal_hook_vendor
   patch_signal_hook_mio_vendor
   patch_instability_vendor
+  patch_zstd_safe_vendor
   patch_zstd_sys_vendor
   mkdir -p "$HOST_OUT"
   MRUSTC_TARGET_VER="$MRUSTC_TARGET_VER" \
@@ -456,6 +536,7 @@ stage_host() {
 # (b) read the emitted C, months before the PPC libc is sorted.
 stage_hostc() {
   banner "5b. emit host C for the whole engine (deferred codegen) -> $HOSTC_OUT"
+  stamp_version
   cd "$MRUSTC_DIR"
   [ -e "$HOST_LIBS/libstd.rlib" ] || die "run 'hostlibs' first (need $HOST_LIBS)"
   [ -d "$VENDOR_DIR" ] || die "run 'vendor' first"
@@ -465,6 +546,7 @@ stage_hostc() {
   patch_signal_hook_vendor
   patch_signal_hook_mio_vendor
   patch_instability_vendor
+  patch_zstd_safe_vendor
   patch_zstd_sys_vendor
   mkdir -p "$HOSTC_OUT"
   MRUSTC_TARGET_VER="$MRUSTC_TARGET_VER" MINICARGO_DEFER_CODEGEN=1 \
@@ -525,6 +607,7 @@ stage_ppc_overrides() {
 # Transpiles the engine and compiles each emitted .c on the G5, same as stage 6.
 stage_ppc() {
   banner "7. transpile+build rb-cli for $PPC_TARGET"
+  stamp_version
   [ -n "$PPC_HOST" ] || die "PPC_HOST is not set (e.g. PPC_HOST=admin@g5.local)"
   [ -x "$PPC_CC_WRAPPER" ] || die "missing $PPC_CC_WRAPPER"
   # Only this stage reaches the -sys crates, so only this stage needs an archiver.
@@ -537,6 +620,7 @@ stage_ppc() {
   patch_signal_hook_vendor
   patch_signal_hook_mio_vendor
   patch_instability_vendor
+  patch_zstd_safe_vendor
   patch_zstd_sys_vendor
   mkdir -p "$PPC_OUT"
   MRUSTC_TARGET_VER="$MRUSTC_TARGET_VER" MINICARGO_DEFER_CODEGEN=1 \
