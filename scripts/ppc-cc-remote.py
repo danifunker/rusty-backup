@@ -92,6 +92,35 @@ SYSTEM_PREFIXES = ("/usr/", "/lib/", "/lib64/", "/opt/", "/bin/", "/sbin/",
 # home directory, say). Loud failure beats a silent multi-gigabyte rsync.
 MAX_MIRROR_BYTES = 64 * 1024 * 1024
 
+# --- the huge-translation-unit problem ---------------------------------------
+# mrustc emits one .c per crate, and for the engine crate that is ~800 MB. gcc's
+# peak memory scales with the whole unit's internal representation, and `cc1`
+# here is a 32-bit PowerPC binary - so it runs out of *address space* (~3.5 GB on
+# Darwin) long before the machine runs out of RAM or swap:
+#
+#     cc1: out of memory allocating 65536 bytes      (at ~2.9 GB RSS)
+#
+# No amount of swap helps with that; Darwin grows swap on demand and had plenty.
+# The levers that do help, applied only to the oversized unit so every other
+# crate keeps its normal flags:
+#
+#   -O0                     the big one. At -O1 gcc runs inter-procedural passes
+#                           that need many function bodies live at once; at -O0
+#                           it can emit each function and release it. Costs
+#                           runtime performance, which is the right trade for
+#                           getting a working binary at all.
+#   --param ggc-min-expand  make gcc's garbage collector run far more often
+#   --param ggc-min-heapsize  (default is to let the heap grow 30% between
+#                           collections) - trades compile time for peak memory.
+#
+# Tunable, because the right threshold depends on the machine: PPC_BIG_TU_BYTES=0
+# disables the special-casing entirely.
+BIG_TU_BYTES = int(os.environ.get("PPC_BIG_TU_BYTES", 64 * 1024 * 1024))
+BIG_TU_ARGS = shlex.split(os.environ.get(
+    "PPC_BIG_TU_ARGS", "-O0 --param ggc-min-expand=10 --param ggc-min-heapsize=32768"))
+# Optimisation flags to strip when BIG_TU_ARGS takes over (mrustc emits -O1).
+OPT_FLAGS = ("-O", "-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast")
+
 
 def die(msg):
     sys.stderr.write("ppc-cc-remote: %s\n" % msg)
@@ -289,6 +318,16 @@ def main():
         if shim_obj:
             remote_args.append(shim_obj)
         remote_args.extend(LDFLAGS)
+    elif BIG_TU_BYTES:
+        # An oversized translation unit needs its own flags or 32-bit cc1 runs
+        # out of address space - see BIG_TU_ARGS above.
+        biggest = max([os.path.getsize(p) for p in inputs
+                       if p.lower().endswith((".c", ".cc", ".cpp", ".cxx"))] or [0])
+        if biggest > BIG_TU_BYTES:
+            remote_args = [a for a in remote_args if a not in OPT_FLAGS] + BIG_TU_ARGS
+            sys.stderr.write(
+                "ppc-cc-remote: %.0f MB translation unit - compiling with %s\n"
+                % (biggest / 1048576.0, " ".join(BIG_TU_ARGS)))
 
     remote_cmd = "cd %s && %s %s" % (
         shlex.quote(REMOTE_ROOT),
