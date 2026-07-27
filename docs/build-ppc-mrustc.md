@@ -81,13 +81,20 @@ random library`, which is what Apple's `ld` wants.
 
 Two things about `ppc-cc-remote.py` exist only because of these crates:
 
-- It mirrors directories named by `-I` / `-isystem` / `-iquote` / `-idirafter` /
-  `-L`, not just files. bzip2-sys passes `-I bzip2-1.0.8`; shipping the named
-  `.c` alone leaves every `#include` unresolved. It does **not** mirror blindly:
-  `PPC_LDFLAGS` names paths that exist on the *Mac* (`-L/opt/local/lib`) and
-  some of those prefixes exist on the build host too with entirely different
-  contents, so anything under a system prefix is passed through as a remote
-  path, and a tree over 64 MB is a loud failure rather than a silent giant rsync.
+- It mirrors *directories*, not just files. An **include** directory
+  (`-I` / `-isystem` / `-iquote` / `-idirafter`) goes over recursively -
+  bzip2-sys passes `-I bzip2-1.0.8`, and shipping the named `.c` alone leaves
+  every `#include` unresolved. A **`-L`** directory is different: only the
+  archives `-l` can resolve (`*.a`, `*.dylib`, `*.so*`) are shipped. mrustc puts
+  `-L <stdlib output dir>` on every link and that directory is 75 MB of
+  .c/.o/.rlib whose objects the link already names explicitly, so mirroring it
+  wholesale is pure waste.
+- It does **not** mirror blindly. `PPC_LDFLAGS` names paths that exist on the
+  *Mac* (`-L/opt/local/lib`), and some of those prefixes exist on the build host
+  too with entirely different contents, so anything under a system prefix is
+  passed through as a remote path. An include tree over 64 MB is a loud failure
+  rather than a silent giant rsync - that guard is what caught the stdlib
+  directory being mirrored, before it was split out as a `-L` case.
 - Relative paths are mirrored against the **cwd**, not the remote root.
   minicargo runs each build script with its cwd set to that crate's directory,
   so `src/foo.c` from two different crates would otherwise land on the same
