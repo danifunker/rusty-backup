@@ -395,6 +395,29 @@ blockers met since are all mrustc bugs, each small and local, and each fixed on
   `#[cfg]` that should have removed an item did nothing.
 - **One target-description bug**: every `*-apple-darwin` target declared
   `target_env = "gnu"`, cfg'ing glibc-only code *in* on a platform with no glibc.
+- **The `-sys` crates**, which are a different kind of problem: they do not just
+  transpile, they compile a C source tree *for the target* through cc-rs. That
+  needed the remote-cc wrapper to mirror `-I` directories rather than only named
+  files, and a second wrapper standing in as `AR_powerpc_apple_darwin`, because
+  the host `ar` writes a System V symbol table where Apple's linker wants a
+  Mach-O `__.SYMDEF`. `bzip2-sys` now builds and archives on the G5.
+- **A minicargo cross-build bug**: a build script's generated sources went to the
+  `host/` output directory while the crate that consumed them was told to read
+  the target one. Invisible on a native build, where the two are the same path.
+- **Two lifetime bugs**, both a lifetime index outside a param list that was
+  never populated - a trait's own lifetime used from a default method body
+  (`radix_trie`), and the higher-ranked form one binder in (`compact_str`).
+- **One const-eval crash with no diagnostic at all** (`quote`): an uninstalled
+  `std::function` called while evaluating a const-generic argument, surfacing
+  only as "terminated with signal 6".
+
+Not every blocker is worth a compiler fix. Three buckets, in increasing cost: a
+feature or version change in `rb-cli-ppc/Cargo.toml`, a `patch_*_vendor` rewrite
+on the vendored source, or mrustc itself. The third invalidates every crate
+already built (minicargo rebuilds against the compiler's timestamp) and costs a
+full rebuild, so while the frontier is still moving the first two are preferred
+and mrustc work is batched. `radix_trie`, `zmij` and `zerocopy` left the graph
+this way, each for a feature or version the engine never wanted.
 
 Expect a further tail. Deliverable: every crate in the PowerPC configuration
 transpiles and compiles.
@@ -457,8 +480,12 @@ maintain.
 - **The per-crate mrustc tail.** 188 of 404 crates so far. Each gap met to date
   has been small and local (a turbofish, a feature swap, a dependency pin), but
   the tail length is genuinely unknown until phase 2 runs to completion.
-- **`zstd-sys` is unproven.** It compiles real C for the target and has not been
-  reached yet. If it fights, the `native-zstd` feature can come off.
+- **`zstd-sys` is not proven yet.** The machinery it needs is: `bzip2-sys`
+  compiles its C on the G5 and archives it into a valid Mach-O static library
+  through the same cc-rs path, and zstd-sys's own C compiles (its x86-only
+  `huf_decompress_amd64.S` assembles to an empty object on PowerPC). What has not
+  happened yet is a complete zstd-sys build and a link against the result. If it
+  fights, the `native-zstd` feature can still come off.
 - **C++ dependencies remain a hard stop.** `chd` stays excluded permanently.
 - **10.4 vs 10.5 is a symbol problem, not just a layout one.** Tiger exports zero
   `$INODE64` symbols, so today's binaries cannot launch there at all. Phase 5.

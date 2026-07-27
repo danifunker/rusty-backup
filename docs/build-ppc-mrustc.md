@@ -15,7 +15,7 @@ ground truth).
 Status (2026-07-26): **the full Rust standard library - core, alloc, std,
 panic_unwind, test, libc - builds for `powerpc-apple-darwin` and links into a
 running PowerPC Mach-O binary**, and the engine build is grinding through the
-dependency graph behind it. Getting here took eighteen mrustc fixes and two
+dependency graph behind it. Getting here took nineteen mrustc fixes and two
 rustc-source patches, all listed below.
 
 Two classes of remaining work, and they are different in kind:
@@ -261,6 +261,21 @@ All committed on `rb-cli-vintage-build`; each is a candidate upstream PR.
     that did not fire has no effect - so it does **not** invalidate the prebuilt
     standard libraries.
 
+19. **`src/hir_conv/constant_evaluation.cpp`** - `Expander::visit_path_params`
+    evaluates const-generic arguments, and to find the type of each it calls
+    `m_get_params`, a `std::function` that whichever enclosing *path* visitor is
+    responsible for installing. The expression visitor nested in
+    `Expander::visit_expr` forwards `visit_path` (which installs it) and
+    `visit_path_params` (which needs it) but not `visit_generic_path` - so the
+    default `ExprVisitorDef::visit_generic_path` ran instead and went straight to
+    `visit_path_params` with the function still empty. The result was
+    `std::bad_function_call`: `terminate` with no span, no phase, and nothing in
+    the crate's debug log past `Constant Evaluate: V V V`, surfacing only as
+    "Process was terminated with signal 6". Worth knowing as a *shape*: an mrustc
+    abort with no diagnostic at all is a C++ exception escaping, and
+    `gdb -ex 'break std::__throw_bad_function_call()' -ex run -ex bt` on the
+    failing command names the line in one go. (Found on `quote` 1.0.47.)
+
 ### Plus: a macOS/PowerPC build-script override set
 
 mrustc ships `script-overrides/stable-1.74.0-{linux,windows}` but not `-macos`.
@@ -385,6 +400,29 @@ around a specific mrustc gap (all documented at their site):
   in all 5 width files (mrustc can't infer the const-generic impl params).
 - **env_logger** `0.11` -> `=0.10.2` — drops `jiff` (0.11's timestamp backend;
   const-generic gap). Same logging via humantime.
+- **zstd-sys** — `patch_zstd_sys_vendor` drops `features = ["parallel"]` from its
+  `cc` build-dependency. It is the only crate in the graph asking for it, and
+  `parallel` is what compiles cc's `src/parallel/` — the only `async` in the
+  crate, and mrustc emits no `Future` impl for an async block. cc keeps a serial
+  arm behind `#[cfg(not(feature = "parallel"))]`, and cc never reaches the
+  PowerPC binary, so the only cost is that the C compiles one file at a time.
+- **signal-hook** — `patch_signal_hook_vendor` spells the one call to
+  `AddSignal::add_signal` as UFCS. The trait takes an arbitrary self type
+  (`self: Arc<Self>`) and the call used method syntax on a trait object, which
+  mrustc cannot resolve. Not avoidable by dropping a feature: crossterm's
+  `events` needs signal-hook-mio, which genuinely imports
+  `signal_hook::iterator::backend`.
+- **rustyline** `default-features = false` (keeping `with-file-history`,
+  `with-dirs`) — drops `custom-bindings`, the only thing pulling `radix_trie`.
+  The engine uses `DefaultEditor`, `ReadlineError` and the history calls, none of
+  which are gated on it.
+- **serde_json** `>=1, <1.0.147` — 1.0.147 swapped its float formatter from `ryu`
+  to `zmij`, and zmij aborts mrustc (`Mismatched types - f64 and f32`). Identical
+  JSON; only the shortest-round-trip float printer differs.
+- **hashbrown** `default-features = false` — the entry is a version pin for
+  indexmap, but as a direct dependency it also enabled 0.14's default `ahash`,
+  which pulls `zerocopy`, whose const-generic `HasField` impls mrustc
+  mis-selects. indexmap asks for `default-features = false` itself.
 - **chrono** — `patch_chrono_vendor` in build-ppc.sh turbofishes
   `DateTime::<Utc>::UNIX_EPOCH` at its two use sites. Nothing in
   `DateTime::UNIX_EPOCH.naive_utc()` pins `Tz`; rustc resolves it because only
@@ -697,14 +735,36 @@ Open, in rough priority order:
    - ~~`nix` reaching for `libc::SIGEV_THREAD_ID`~~ - `target_env` was `"gnu"` on
      every Apple target, so glibc-only code was cfg'd *in*.
 
-   **Currently stops at 188 of 404** on the first gap that is *not* small and
-   local: the `cc` crate's `parallel/command_runner.rs` uses `async fn`, and mrustc
-   reports `Cannot find an impl of core::future::Future for async[...]`. `cc` is a
-   build-dependency only (it compiles the C for `bzip2-sys` and `zstd-sys`), so the
-   options are to pin it below the version that added the async runner - which
-   means re-vendoring - or to drop `native-zstd`, which section 3 of the plan
-   already flags as the escape hatch if `zstd-sys` fights. Fixing async in mrustc
-   is a different order of work from anything above.
+   - ~~`cc`'s `async fn` build-command runner~~ - `zstd-sys` is the only crate in
+     the graph that asks for cc's `parallel` feature, and cc gates the whole
+     `src/parallel/` module (the only `async` in the crate) on it. Dropping the
+     feature from the vendored manifest deletes the problem; cc is a
+     build-dependency and never reaches the PowerPC binary, so the only cost is
+     that its C compiles serially. Cheaper than pinning cc back, and it keeps
+     `native-zstd` in the build.
+   - ~~the `-sys` crates could not compile C for the target~~ - cc-rs picks up
+     `CC_powerpc_apple_darwin` for free, but it needed `-I` *directories*
+     mirrored and an `AR_powerpc_apple_darwin`. See "The remote archiver".
+   - ~~minicargo pointed a cross-compiled crate at the wrong `OUT_DIR`~~ - fix 17.
+   - ~~`radix_trie` and `compact_str` lifetime aborts~~ - fix 18. radix_trie is
+     also out of the graph now (rustyline's `custom-bindings`, which the engine
+     does not use, was the only thing pulling it).
+   - ~~`signal-hook`'s `Arc<Self>` receiver on a trait object~~ - the one call
+     site is spelled UFCS by `patch_signal_hook_vendor`.
+   - ~~`zmij` and `zerocopy`~~ - both arrived transitively and neither was wanted:
+     serde_json is held below the release that swapped `ryu` for `zmij`, and
+     hashbrown's `ahash` default (the only thing pulling zerocopy) is off.
+   - ~~`quote` aborting with no diagnostic at all~~ - fix 19.
+
+   The frontier past that is a per-crate tail of the same kind. Each blocker has
+   fallen into one of three buckets, in increasing order of what it costs to fix:
+   a feature or version change in `rb-cli-ppc/Cargo.toml`, a `patch_*_vendor`
+   rewrite in `build-ppc.sh`, or a change to mrustc itself. **Prefer the first two
+   while the frontier is still moving.** A change to mrustc's source updates the
+   compiler binary, and minicargo's `outfile_needs_rebuild` compares against it -
+   so every mrustc fix invalidates all several-hundred crates already built and
+   costs a full rebuild, where a manifest or vendor change is incremental. Batch
+   the mrustc work.
 5. **C++ deps stay off forever** (`chd` = libchdman). Already excluded.
 6. **Enum and union alignment is unasserted.** mrustc emits an `alignof_assert`
    for every struct but only a `sizeof_assert` for enums and unions (in `libtest`:
