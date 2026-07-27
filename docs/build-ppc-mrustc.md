@@ -454,6 +454,16 @@ around a specific mrustc gap (all documented at their site):
   the alias binds it identically. **Same `TOK_RWORD_AS` family as the libyml gap
   that keeps `yaml` off for this target** — see the open items; one parser fix
   would plausibly clear both.
+- **instability** — `patch_instability_vendor` rewrites its three
+  `indoc::formatdoc!` doc strings as plain `format!` with the string already
+  unindented (byte-identical output). A proc macro that *forwards* a token from
+  its input loses that token's hygiene context crossing mrustc's proc-macro
+  bridge, and `formatdoc!` re-emits its trailing arguments verbatim, so
+  `formatdoc!{"...{}.", version.trim_start_matches('v')}` produced a `format!`
+  whose `version` no longer resolved to the `if let Some(ref version)` binding
+  around it (`Couldn't find variable name 'version'`). `format!` is a builtin, so
+  this takes the proc macro out of the picture. See the open items - the bridge
+  is the real bug.
 - **rustyline** `default-features = false` (keeping `with-file-history`,
   `with-dirs`) — drops `custom-bindings`, the only thing pulling `radix_trie`.
   The engine uses `DefaultEditor`, `ReadlineError` and the history calls, none of
@@ -826,3 +836,16 @@ Open, in rough priority order:
    cause first: libyml presents as "Unused tokens at the end of macro expansion"
    at `scanner.rs:1937` rather than as a parse error, so it may be a different
    manifestation.
+8. **A proc macro loses the hygiene of tokens it forwards.** An identifier taken
+   from a proc macro's input and re-emitted in its output comes back with an
+   empty hygiene context and no longer resolves to the binding it named at the
+   call site. `instability` hit this through `indoc::formatdoc!`, which re-emits
+   its trailing arguments verbatim: `formatdoc!{"...{}.", version.trim_start_matches('v')}`
+   became a `format!` that could not see the enclosing `if let Some(ref version)`
+   binding. Confirmed with `MRUSTC_DEBUG=Expand` - the expansion is correct
+   token-for-token, and the forwarded ident is the only one carrying
+   `/*Rust2021 /**/*/`. Worked around by rewriting the call sites, because the
+   fix is in the bridge's hygiene handling and is a much larger change. This is
+   worth watching: derive macros mostly emit *new* code referring to types, which
+   is why nothing else in ~380 crates has tripped it, but any macro that forwards
+   a caller's local will.

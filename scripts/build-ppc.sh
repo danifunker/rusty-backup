@@ -304,6 +304,81 @@ PY
   note "applied vendored-source workarounds (signal-hook-mio \$pipe type alias)."
 }
 
+patch_instability_vendor() {
+  # `instability` builds its doc strings with `indoc::formatdoc!`, and a proc
+  # macro that *forwards* a token from its input loses that token's hygiene
+  # context crossing mrustc's proc-macro bridge. `formatdoc!` re-emits the
+  # trailing arguments verbatim, so
+  #
+  #     formatdoc! {"... version {}.", version.trim_start_matches('v')}
+  #
+  # expands to a `format!` whose `version` carries an empty hygiene context and
+  # no longer resolves to the `if let Some(ref version)` binding around it:
+  #
+  #   MACRO<::"alloc"::format> error:0: Couldn't find variable name 'version'
+  #
+  # (Confirmed with MRUSTC_DEBUG=Expand: the expansion is correct token-for-token
+  # - `format!{"...{}.", version.trim_start_matches('v')}` - and the forwarded
+  # ident is the only one carrying `/*Rust2021 /**/*/`.)
+  #
+  # `format!` is a builtin, so writing these three call sites as `format!` with
+  # the string already unindented keeps the output byte-identical and takes the
+  # proc macro out of the picture. Fixing the bridge's hygiene is the real
+  # answer and is filed as an open item; it is a much larger change than this.
+  local f
+  f="$VENDOR_DIR/instability/src/stable.rs"
+  [ -f "$f" ] || return 0
+  python3 - "$VENDOR_DIR" <<'PY'
+import sys
+v = sys.argv[1]
+
+edits = [
+    (v + "/instability/src/stable.rs",
+     '            formatdoc! {"\n'
+     '                # Stability\n'
+     '\n'
+     '                This API was stabilized in version {}.",\n'
+     '                version.trim_start_matches(\'v\')\n'
+     '            }\n',
+     '            format!(\n'
+     '                "# Stability\\n\\nThis API was stabilized in version {}.",\n'
+     '                version.trim_start_matches(\'v\')\n'
+     '            )\n'),
+    (v + "/instability/src/stable.rs",
+     '            formatdoc! {"\n'
+     '                # Stability\n'
+     '\n'
+     '                This API is stable."}\n',
+     '            format!("# Stability\\n\\nThis API is stable.")\n'),
+    (v + "/instability/src/unstable.rs",
+     '        let doc = formatdoc! {"\n'
+     '            # Stability\n'
+     '\n'
+     '            **This API is marked as unstable** and is only available when the `{feature_flag}`\n'
+     '            crate feature is enabled. This comes with no stability guarantees, and could be changed\n'
+     '            or removed at any time."};\n',
+     '        let doc = format!(\n'
+     '            "# Stability\\n\\n**This API is marked as unstable** and is only available when the `{feature_flag}`\\n'
+     'crate feature is enabled. This comes with no stability guarantees, and could be changed\\n'
+     'or removed at any time."\n'
+     '        );\n'),
+]
+
+for path, old, new in edits:
+    try:
+        s = open(path).read()
+    except IOError:
+        continue
+    if new in s:
+        continue                      # already patched
+    if old not in s:
+        sys.stderr.write("instability: expected formatdoc block not found in %s; skipping\n" % path)
+        continue
+    open(path, "w").write(s.replace(old, new, 1))
+PY
+  note "applied vendored-source workarounds (instability formatdoc -> format)."
+}
+
 patch_zstd_sys_vendor() {
   # zstd-sys is the ONLY crate in this graph that asks for `cc`'s `parallel`
   # feature, and `parallel` is what drags in cc's async build-command runner
@@ -355,6 +430,7 @@ stage_host() {
   patch_rustversion_vendor
   patch_signal_hook_vendor
   patch_signal_hook_mio_vendor
+  patch_instability_vendor
   patch_zstd_sys_vendor
   mkdir -p "$HOST_OUT"
   MRUSTC_TARGET_VER="$MRUSTC_TARGET_VER" \
@@ -388,6 +464,7 @@ stage_hostc() {
   patch_rustversion_vendor
   patch_signal_hook_vendor
   patch_signal_hook_mio_vendor
+  patch_instability_vendor
   patch_zstd_sys_vendor
   mkdir -p "$HOSTC_OUT"
   MRUSTC_TARGET_VER="$MRUSTC_TARGET_VER" MINICARGO_DEFER_CODEGEN=1 \
@@ -459,6 +536,7 @@ stage_ppc() {
   patch_rustversion_vendor
   patch_signal_hook_vendor
   patch_signal_hook_mio_vendor
+  patch_instability_vendor
   patch_zstd_sys_vendor
   mkdir -p "$PPC_OUT"
   MRUSTC_TARGET_VER="$MRUSTC_TARGET_VER" MINICARGO_DEFER_CODEGEN=1 \
