@@ -59,8 +59,12 @@ SHIM = os.environ.get("PPC_SHIM")
 
 # Args that take a separate value we must not mistake for an input file.
 VALUE_FLAGS = {"-o", "-include", "-isysroot", "-x", "-Xlinker", "-u"}
-# Extensions we treat as files to ship to the Mac.
-INPUT_EXTS = (".c", ".o", ".a", ".s", ".h")
+# Extensions we treat as files to ship to the Mac. Matched case-insensitively:
+# zstd builds `huf_decompress_amd64.S`, and an upper-case `.S` (assembly *with*
+# the C preprocessor run over it) is a different thing to gcc than `.s`. Matching
+# only the lower-case form meant the file was silently never uploaded and the
+# remote gcc failed with a bare "No such file or directory".
+INPUT_EXTS = (".c", ".cc", ".cpp", ".cxx", ".o", ".a", ".s", ".h", ".hpp", ".inc")
 # Flags naming a *directory* whose contents the remote compiler needs. mrustc
 # only ever passes files, but the `-sys` crates' build scripts drive this script
 # through cc-rs, which compiles a C source tree: bzip2-sys passes
@@ -216,7 +220,7 @@ def main():
         if a in VALUE_FLAGS:
             i += 2
             continue
-        if not a.startswith("-") and a.endswith(INPUT_EXTS) and os.path.isfile(a):
+        if not a.startswith("-") and a.lower().endswith(INPUT_EXTS) and os.path.isfile(a):
             inputs.append(a)
         i += 1
 

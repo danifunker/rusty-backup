@@ -15,7 +15,7 @@ ground truth).
 Status (2026-07-26): **the full Rust standard library - core, alloc, std,
 panic_unwind, test, libc - builds for `powerpc-apple-darwin` and links into a
 running PowerPC Mach-O binary**, and the engine build is grinding through the
-dependency graph behind it. Getting here took sixteen mrustc fixes and two
+dependency graph behind it. Getting here took eighteen mrustc fixes and two
 rustc-source patches, all listed below.
 
 Two classes of remaining work, and they are different in kind:
@@ -226,6 +226,40 @@ All committed on `rb-cli-vintage-build`; each is a candidate upstream PR.
     is a **cfg** change, so it invalidates the PowerPC stdlib - see the traps above.
     (mrustc declares `"gnu"` for the BSD targets too, which is wrong for the same
     reason; left alone here as it is untested and out of scope.)
+
+**Cross-build correctness (minicargo):**
+
+17. **`tools/minicargo/build.cpp`** - a build script is native code, so minicargo
+    builds it, runs it, and captures its stdout under `get_output_dir(true)` (the
+    `host/` subdirectory when cross compiling) and runs it exactly once per
+    package. But the crate compile that consumes the sources it *generated* derived
+    `OUT_DIR` from its own host-ness, so on a cross build the two disagreed: the
+    script wrote to `<out>/host/build_<pkg>/` and the crate was told to read
+    `<out>/build_<pkg>/`. `get_output_dir` ignores its argument when not cross
+    compiling, which is why every host stage passed and only PowerPC hit it -
+    `crc32c` generates its CRC tables in `build.rs` and died on `Unable to open
+    file '.../sw.table'` with no hint that a directory prefix was the problem.
+    Both sides now go through one `get_build_script_out_dir()` accessor.
+
+**Lifetimes:**
+
+18. **`src/hir_typeck/{common.cpp,monomorph.hpp}`, `src/hir_expand/lifetime_infer.cpp`** -
+    three asserts, one cause: a lifetime parameter whose index the recorded param
+    list does not cover aborted the compile, in cases where that list was simply
+    never populated. `radix_trie` hit it through `trait TrieCommon<'a, K, V>`, a
+    trait that declares a lifetime on *itself* and uses it from a default method
+    body; `compact_str` hit the higher-ranked equivalent one binder in, through
+    `for<'a> &'a C: IntoIterator<Item = &'a I>`. Such a lifetime is now passed
+    through rather than aborting - which is the treatment the surrounding code had
+    already settled on twice: `Monomorphiser::monomorph_lifetime` has the same HRTB
+    range check commented out with a TODO noting the params are not reliably in
+    range once binders nest, and `sanity_check_lft` no longer rejects an HRL
+    outright. Deliberately limited to lifetimes: the neighbouring `get_type` and
+    `get_value` still assert, because an unresolved type or const genuinely breaks
+    codegen, whereas mrustc erases lifetimes before codegen and does no borrow
+    checking. Note this cannot change a crate that already compiled - an assert
+    that did not fire has no effect - so it does **not** invalidate the prebuilt
+    standard libraries.
 
 ### Plus: a macOS/PowerPC build-script override set
 
