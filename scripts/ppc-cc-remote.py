@@ -112,12 +112,23 @@ MAX_MIRROR_BYTES = 64 * 1024 * 1024
 #   --param ggc-min-expand  make gcc's garbage collector run far more often
 #   --param ggc-min-heapsize  (default is to let the heap grow 30% between
 #                           collections) - trades compile time for peak memory.
+#   -mlongcall              a PowerPC `bl` reaches +/-16 MB, and this unit's
+#                           __text alone is 55 MB, so its own internal calls do
+#                           not reach:
+#                             ld: bl out of range (-26114656 max is +/-16M)
+#                           -mlongcall loads the target address and branches
+#                           indirectly, removing the limit. Bigger and slower per
+#                           call, which is moot next to not linking at all. (-O0
+#                           is what makes the text this large; at -O1 it would be
+#                           smaller but still well over 16 MB, and -O1 is what
+#                           exhausts the address space.)
 #
 # Tunable, because the right threshold depends on the machine: PPC_BIG_TU_BYTES=0
 # disables the special-casing entirely.
 BIG_TU_BYTES = int(os.environ.get("PPC_BIG_TU_BYTES", 64 * 1024 * 1024))
 BIG_TU_ARGS = shlex.split(os.environ.get(
-    "PPC_BIG_TU_ARGS", "-O0 --param ggc-min-expand=10 --param ggc-min-heapsize=32768"))
+    "PPC_BIG_TU_ARGS",
+    "-O0 -mlongcall --param ggc-min-expand=10 --param ggc-min-heapsize=32768"))
 # Optimisation flags to strip when BIG_TU_ARGS takes over (mrustc emits -O1).
 OPT_FLAGS = ("-O", "-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast")
 
