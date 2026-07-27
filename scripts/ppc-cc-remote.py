@@ -177,6 +177,69 @@ def ensure_shim():
     return rel_o
 
 
+def reframework(args):
+    """Rewrite `-l Foo` to `-framework Foo` where Foo is a framework, not a library.
+
+    mrustc drops the `kind` from `#[link(name = "CoreFoundation", kind =
+    "framework")]` - `src/expand/codegen.cpp` parses it and says
+    `// TODO: save and use the kind` - so a framework arrives here as a plain
+    library name and the link fails:
+
+        ld: library not found for -lCoreFoundation
+
+    mrustc's own codegen already knows how to emit `-framework X`; it just never
+    sees the `framework=` prefix that would trigger it. Fixing it there is the
+    right answer, but it is an mrustc change and so costs a full rebuild of every
+    crate plus the engine - hours, for a link flag. Done here instead; see the
+    open items in docs/build-ppc-mrustc.md.
+
+    The test is deliberately *not* "does a framework of this name exist": on
+    Darwin `System` is both `System.framework` and `libSystem.dylib`, and it must
+    stay `-lSystem`. Only a name with no library but a framework is rewritten.
+    """
+    names = []
+    i = 0
+    while i < len(args):
+        if args[i] == "-l" and i + 1 < len(args):
+            names.append(args[i + 1])
+            i += 2
+        else:
+            i += 1
+    # Frameworks are conventionally capitalised; skip the obvious libraries so the
+    # common case costs no round trip at all.
+    cands = sorted({n for n in names if n[:1].isupper()})
+    if not cands:
+        return args
+
+    script = "; ".join(
+        'lib=no; for d in /usr/lib /opt/local/lib; do for e in dylib a; do '
+        '[ -e "$d/lib%s.$e" ] && lib=yes; done; done; '
+        '[ $lib = no ] && [ -d /System/Library/Frameworks/%s.framework ] && echo %s'
+        % (n, n, n) for n in cands)
+    # ...and a trailing `true`: the last `[ ] && echo` exits non-zero whenever the
+    # name is *not* a framework (which is the common case), which would make ssh
+    # itself fail and throw the whole classification away.
+    script += "; true"
+    try:
+        out = subprocess.check_output(["ssh", HOST, script]).decode()
+    except (subprocess.CalledProcessError, OSError):
+        return args                     # classification failed - leave it alone
+    fw = set(out.split())
+    if not fw:
+        return args
+
+    out_args, i = [], 0
+    while i < len(args):
+        if args[i] == "-l" and i + 1 < len(args) and args[i + 1] in fw:
+            out_args += ["-framework", args[i + 1]]
+            i += 2
+        else:
+            out_args.append(args[i])
+            i += 1
+    sys.stderr.write("ppc-cc-remote: linking %s as framework(s)\n" % ", ".join(sorted(fw)))
+    return out_args
+
+
 def mirrored(path):
     """Where `path` lives inside REMOTE_ROOT on the Mac.
 
@@ -318,6 +381,7 @@ def main():
         if shim_obj:
             remote_args.append(shim_obj)
         remote_args.extend(LDFLAGS)
+        remote_args = reframework(remote_args)
     elif BIG_TU_BYTES:
         # An oversized translation unit needs its own flags or 32-bit cc1 runs
         # out of address space - see BIG_TU_ARGS above.

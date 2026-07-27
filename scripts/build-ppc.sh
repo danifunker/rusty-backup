@@ -220,9 +220,19 @@ patch_crc_vendor() {
   # `Digest::<uN, Table<L>>::new` from the return type, so spell them out.
   local d="$VENDOR_DIR/crc/src" w
   [ -f "$d/crc128.rs" ] || return 0
+  # Only write when the content actually changes. `sed >tmp && mv` unconditionally
+  # rewrites the file, which bumps its mtime on EVERY run - and minicargo is
+  # timestamp-driven, so crc went dirty every build, dragging lzma-rs and then the
+  # engine with it. That silently forced a re-transpile of the 797 MB engine unit
+  # on every single invocation.
   for w in 8 16 32 64 128; do
     sed "s/        Digest::new(self, value)/        Digest::<u${w}, Table<L>>::new(self, value)/" \
-      "$d/crc${w}.rs" > "$d/crc${w}.rs.tmp" && mv "$d/crc${w}.rs.tmp" "$d/crc${w}.rs"
+      "$d/crc${w}.rs" > "$d/crc${w}.rs.tmp"
+    if cmp -s "$d/crc${w}.rs.tmp" "$d/crc${w}.rs"; then
+      rm -f "$d/crc${w}.rs.tmp"
+    else
+      mv "$d/crc${w}.rs.tmp" "$d/crc${w}.rs"
+    fi
   done
   note "applied vendored-source workarounds (crc turbofish)."
 }
@@ -240,8 +250,15 @@ patch_chrono_vendor() {
   # the path without using it. Idempotent - the rewritten form no longer matches.
   local f="$VENDOR_DIR/chrono/src/naive/datetime/mod.rs"
   [ -f "$f" ] || return 0
+  # Only write on an actual change - see patch_crc_vendor for why an unconditional
+  # rewrite is expensive here.
   sed -e '/^[[:space:]]*\/\/\//!{' -e '/#\[deprecated/!s/DateTime::UNIX_EPOCH/DateTime::<Utc>::UNIX_EPOCH/g' -e '}' \
-    "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+    "$f" > "$f.tmp"
+  if cmp -s "$f.tmp" "$f"; then
+    rm -f "$f.tmp"
+  else
+    mv "$f.tmp" "$f"
+  fi
   note "applied vendored-source workarounds (chrono UNIX_EPOCH turbofish)."
 }
 
