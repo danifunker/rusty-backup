@@ -228,6 +228,45 @@ PY
   note "applied vendored-source workarounds (rustversion --version parsing)."
 }
 
+patch_signal_hook_vendor() {
+  # signal-hook's internal `AddSignal` trait takes an *arbitrary self type*:
+  #
+  #   trait AddSignal: Debug + Send + Sync {
+  #       fn add_signal(self: Arc<Self>, write: Arc<dyn SelfPipeWrite>, ..)
+  #   }
+  #
+  # and the one call site invokes it with method syntax on a trait object,
+  # `Arc::clone(&self.pending).add_signal(..)`. mrustc does not consider an
+  # `Arc<Self>` receiver when resolving a method on `Arc<dyn AddSignal>`:
+  #
+  #   backend.rs:199:88 error:0: No applicable methods for
+  #     {alloc::sync::Arc<dyn signal_hook::iterator::backend::AddSignal, ..>}.add_signal
+  #
+  # Spelling the call as UFCS names the trait outright, so there is no receiver
+  # autoderef to do and mrustc lowers it fine. Same class of fix as the crc and
+  # chrono turbofishes: say what mrustc cannot infer, change nothing else.
+  #
+  # Not avoidable by dropping a feature - crossterm's `events` needs
+  # signal-hook-mio for SIGWINCH, and that genuinely imports
+  # `signal_hook::iterator::backend`, so the module is load bearing.
+  local f="$VENDOR_DIR/signal-hook/src/iterator/backend.rs"
+  [ -f "$f" ] || return 0
+  python3 - "$f" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+old = "Arc::clone(&self.pending).add_signal(Arc::clone(&self.write), signal)"
+new = "AddSignal::add_signal(Arc::clone(&self.pending), Arc::clone(&self.write), signal)"
+if new in s:
+    sys.exit(0)          # already patched
+if old not in s:
+    sys.stderr.write("signal-hook: expected call site not found; skipping patch\n")
+    sys.exit(0)
+open(p, "w").write(s.replace(old, new, 1))
+PY
+  note "applied vendored-source workarounds (signal-hook UFCS add_signal)."
+}
+
 patch_zstd_sys_vendor() {
   # zstd-sys is the ONLY crate in this graph that asks for `cc`'s `parallel`
   # feature, and `parallel` is what drags in cc's async build-command runner
@@ -277,6 +316,7 @@ stage_host() {
   patch_crc_vendor
   patch_chrono_vendor
   patch_rustversion_vendor
+  patch_signal_hook_vendor
   patch_zstd_sys_vendor
   mkdir -p "$HOST_OUT"
   MRUSTC_TARGET_VER="$MRUSTC_TARGET_VER" \
@@ -308,6 +348,7 @@ stage_hostc() {
   patch_crc_vendor
   patch_chrono_vendor
   patch_rustversion_vendor
+  patch_signal_hook_vendor
   patch_zstd_sys_vendor
   mkdir -p "$HOSTC_OUT"
   MRUSTC_TARGET_VER="$MRUSTC_TARGET_VER" MINICARGO_DEFER_CODEGEN=1 \
@@ -377,6 +418,7 @@ stage_ppc() {
   patch_crc_vendor
   patch_chrono_vendor
   patch_rustversion_vendor
+  patch_signal_hook_vendor
   patch_zstd_sys_vendor
   mkdir -p "$PPC_OUT"
   MRUSTC_TARGET_VER="$MRUSTC_TARGET_VER" MINICARGO_DEFER_CODEGEN=1 \

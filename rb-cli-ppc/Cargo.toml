@@ -28,6 +28,18 @@
 #       host-proxy artifact only: the os/ platform layer (which pulls libc+nix)
 #       is hand-C in the PPC shell, so the *engine* transpile shouldn't include
 #       it at all. See the platform-split decision in docs/build-ppc-mrustc.md.
+#   - rustyline: default-features = false, keeping only with-file-history and
+#       with-dirs. The dropped default is `custom-bindings`, which exists solely
+#       to pull `radix_trie`, and radix_trie aborts mrustc:
+#         trie_common.rs:43:36 BUG: ASSERT FAIL: hir_typeck/common.cpp:761
+#           Lifetime param /*I:0*/ out of range for (max 0)
+#       `trait TrieCommon<'a, K, V>` declares a lifetime on the *trait*, and when
+#       mrustc monomorphises a default method body that uses it (`fn iter(self)
+#       -> Iter<'a, K, V>`) the impl PathParams it looks the lifetime up in has
+#       no lifetimes recorded at all. The engine never touches the gated API -
+#       it uses exactly `DefaultEditor`, `ReadlineError`, and the history calls,
+#       none of which are behind custom-bindings - so nothing is lost here. (The
+#       mrustc gap itself is generic and worth fixing; see docs/build-ppc-mrustc.md.)
 #   - serde_yml: optional, and this build leaves it OFF. Its backend `libyml`
 #       hits an mrustc macro-expansion gap ("Unused tokens at the end of macro
 #       expansion - TOK_RWORD_AS", scanner.rs:1937). The engine gates YAML
@@ -119,7 +131,9 @@ serde_yml = { version = "=0.0.12", optional = true }
 csv = "1"
 clap_complete = ">=4.4, <4.5"
 globset = ">=0.4, <0.4.17"
-rustyline = { version = ">=12, <15", features = ["with-file-history"] }
+# DEVIATION (see header): default-features = false to drop `custom-bindings`,
+# which is the only thing pulling `radix_trie` (mrustc lifetime gap).
+rustyline = { version = ">=12, <15", default-features = false, features = ["with-file-history", "with-dirs"] }
 crossterm = "0.28"
 shell-words = "1.1.1"
 lzma-rs = "0.3.0"

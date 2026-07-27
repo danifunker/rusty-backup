@@ -7,9 +7,10 @@ scope decisions live in [`native_osx_10_dot_3.md`](native_osx_10_dot_3.md).
 
 Companion scripts: [`../scripts/build-ppc.sh`](../scripts/build-ppc.sh) (driver),
 [`../scripts/ppc-cc-remote.py`](../scripts/ppc-cc-remote.py) (the remote C
-compiler), [`../scripts/ppc-libc-probe.py`](../scripts/ppc-libc-probe.py) and
-[`../scripts/ppc-libc-compare.py`](../scripts/ppc-libc-compare.py) (libc ground
-truth).
+compiler) and [`../scripts/ppc-ar-remote.py`](../scripts/ppc-ar-remote.py) (the
+remote archiver), [`../scripts/ppc-libc-probe.py`](../scripts/ppc-libc-probe.py)
+and [`../scripts/ppc-libc-compare.py`](../scripts/ppc-libc-compare.py) (libc
+ground truth).
 
 Status (2026-07-26): **the full Rust standard library - core, alloc, std,
 panic_unwind, test, libc - builds for `powerpc-apple-darwin` and links into a
@@ -59,6 +60,38 @@ The wrapper also owns the platform's link line, which is not obvious:
 `_Unwind_GetIPInfo` is in Leopard's `libgcc_s.1` but **not** in
 `libgcc_s.10.4`, so a binary that must run on Tiger needs gcc10's own unwinder
 or `panic=abort`. That is an open item.
+
+### The remote archiver
+
+mrustc only ever needs a compiler, but the engine's dependency graph contains
+`-sys` crates, and *their* build scripts compile a C source tree of their own
+through [cc-rs](https://docs.rs/cc). cc-rs looks up `CC_<triple>` by the same
+convention mrustc does, so it picks up `ppc-cc-remote.py` for free - but then it
+wants an **archiver**, and that one cannot be borrowed from the host: the host
+`ar` writes a System V symbol table where Apple's linker wants a Mach-O
+`__.SYMDEF`. So [`scripts/ppc-ar-remote.py`](../scripts/ppc-ar-remote.py) is
+`AR_powerpc_apple_darwin`, and the archive is built where its objects were.
+
+Measured on the G5 rather than assumed: Leopard's `/usr/bin/ar` takes `cq` and
+`s` and rejects `D` (`ar: illegal option -- D`). That is exactly the probe cc-rs
+makes - it tries `sD`, and on failure retries `s` with `ZERO_AR_DATE=1` - so a
+non-zero exit from this wrapper is a legitimate answer and is passed straight
+back rather than turned into an error. The result is a `current ar archive
+random library`, which is what Apple's `ld` wants.
+
+Two things about `ppc-cc-remote.py` exist only because of these crates:
+
+- It mirrors directories named by `-I` / `-isystem` / `-iquote` / `-idirafter` /
+  `-L`, not just files. bzip2-sys passes `-I bzip2-1.0.8`; shipping the named
+  `.c` alone leaves every `#include` unresolved. It does **not** mirror blindly:
+  `PPC_LDFLAGS` names paths that exist on the *Mac* (`-L/opt/local/lib`) and
+  some of those prefixes exist on the build host too with entirely different
+  contents, so anything under a system prefix is passed through as a remote
+  path, and a tree over 64 MB is a loud failure rather than a silent giant rsync.
+- Relative paths are mirrored against the **cwd**, not the remote root.
+  minicargo runs each build script with its cwd set to that crate's directory,
+  so `src/foo.c` from two different crates would otherwise land on the same
+  remote path and one crate would quietly be compiled from the other's source.
 
 ## What transpiles vs. what stays hand-written C
 
