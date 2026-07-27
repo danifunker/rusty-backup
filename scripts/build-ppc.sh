@@ -51,8 +51,14 @@ PPC_TARGET="powerpc-apple-darwin"
 # PPC_HOST to an ssh destination with key auth already working.
 export PPC_HOST="${PPC_HOST:-}"
 PPC_CC_WRAPPER="$RB_DIR/scripts/ppc-cc-remote.py"
+PPC_AR_WRAPPER="$RB_DIR/scripts/ppc-ar-remote.py"
 # mrustc picks its C compiler from CC_<triple with - replaced by _>.
 export CC_powerpc_apple_darwin="$PPC_CC_WRAPPER"
+# cc-rs uses the same convention, so the -sys crates' build scripts (bzip2-sys,
+# zstd-sys) pick up the wrapper for free. They also need an *archiver*: the host
+# `ar` writes a System V symbol table and Apple's linker wants a Mach-O
+# __.SYMDEF, so the archive has to be built on the Mac as well.
+export AR_powerpc_apple_darwin="$PPC_AR_WRAPPER"
 # The G5 has 2 cores; the transpile is local and parallel, the compiles are not.
 PPC_JOBS="${PPC_JOBS:-3}"
 # OVERRIDE_SUFFIX is chosen from the *host* OS by minicargo.mk, so a cross build
@@ -222,6 +228,48 @@ PY
   note "applied vendored-source workarounds (rustversion --version parsing)."
 }
 
+patch_zstd_sys_vendor() {
+  # zstd-sys is the ONLY crate in this graph that asks for `cc`'s `parallel`
+  # feature, and `parallel` is what drags in cc's async build-command runner
+  # (src/parallel/{async_executor,command_runner}.rs). mrustc's `async fn`
+  # support does not produce a `Future` impl for the generated async block:
+  #
+  #   cc/src/parallel/command_runner.rs:175:1 error:0:
+  #     Cannot find an impl of ::"core"::future::future::Future for async[...]
+  #
+  # cc gates the whole module on the feature (`#[cfg(feature = "parallel")]
+  # mod parallel;`) and keeps a `#[cfg(not(feature = "parallel"))]` serial arm in
+  # command_helpers.rs, so dropping the feature deletes every async construct in
+  # the crate - there are none outside src/parallel/ - and leaves cc functionally
+  # identical, only compiling the C files one at a time.
+  #
+  # cc is a BUILD-dependency (of bzip2-sys and zstd-sys) and never reaches the
+  # PowerPC binary, so this costs build-script wall clock and nothing else.
+  # Chosen over pinning cc back to a pre-async 1.0.x, which would mean
+  # re-vendoring the whole graph to work around a crate that is not shipped.
+  local f="$VENDOR_DIR/zstd-sys/Cargo.toml"
+  [ -f "$f" ] || return 0
+  python3 - "$f" <<'PY'
+import sys
+p = sys.argv[1]
+lines = open(p).read().splitlines(True)
+out, section, dropped = [], None, 0
+for ln in lines:
+    s = ln.strip()
+    if s.startswith("[") and s.endswith("]"):
+        section = s
+    if section == "[build-dependencies.cc]" and s == 'features = ["parallel"]':
+        dropped += 1
+        continue
+    out.append(ln)
+if dropped:
+    open(p, "w").writelines(out)
+elif not any(l.strip() == "[build-dependencies.cc]" for l in lines):
+    sys.stderr.write("zstd-sys: no [build-dependencies.cc] section; skipping patch\n")
+PY
+  note "applied vendored-source workarounds (zstd-sys drops cc/parallel)."
+}
+
 # ---- stage 5: transpile+compile the engine for the HOST (native proof) ------
 stage_host() {
   banner "5. transpile+build rb-cli for the HOST (native $HOST_ARCH proof)"
@@ -229,6 +277,7 @@ stage_host() {
   patch_crc_vendor
   patch_chrono_vendor
   patch_rustversion_vendor
+  patch_zstd_sys_vendor
   mkdir -p "$HOST_OUT"
   MRUSTC_TARGET_VER="$MRUSTC_TARGET_VER" \
     bin/minicargo "$CRATE_DIR" \
@@ -259,6 +308,7 @@ stage_hostc() {
   patch_crc_vendor
   patch_chrono_vendor
   patch_rustversion_vendor
+  patch_zstd_sys_vendor
   mkdir -p "$HOSTC_OUT"
   MRUSTC_TARGET_VER="$MRUSTC_TARGET_VER" MINICARGO_DEFER_CODEGEN=1 \
     bin/minicargo "$CRATE_DIR" \
@@ -319,11 +369,15 @@ stage_ppc_overrides() {
 stage_ppc() {
   banner "7. transpile+build rb-cli for $PPC_TARGET"
   [ -n "$PPC_HOST" ] || die "PPC_HOST is not set (e.g. PPC_HOST=admin@g5.local)"
+  [ -x "$PPC_CC_WRAPPER" ] || die "missing $PPC_CC_WRAPPER"
+  # Only this stage reaches the -sys crates, so only this stage needs an archiver.
+  [ -x "$PPC_AR_WRAPPER" ] || die "missing $PPC_AR_WRAPPER"
   [ -e "$PPC_LIBS/libstd.rlib.o" ] || die "PPC libstd missing -- run 'ppclibs' first"
   cd "$MRUSTC_DIR"
   patch_crc_vendor
   patch_chrono_vendor
   patch_rustversion_vendor
+  patch_zstd_sys_vendor
   mkdir -p "$PPC_OUT"
   MRUSTC_TARGET_VER="$MRUSTC_TARGET_VER" MINICARGO_DEFER_CODEGEN=1 \
     bin/minicargo "$CRATE_DIR" \

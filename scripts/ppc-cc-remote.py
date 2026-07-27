@@ -61,6 +61,22 @@ SHIM = os.environ.get("PPC_SHIM")
 VALUE_FLAGS = {"-o", "-include", "-isysroot", "-x", "-Xlinker", "-u"}
 # Extensions we treat as files to ship to the Mac.
 INPUT_EXTS = (".c", ".o", ".a", ".s", ".h")
+# Flags naming a *directory* whose contents the remote compiler needs. mrustc
+# only ever passes files, but the `-sys` crates' build scripts drive this script
+# through cc-rs, which compiles a C source tree: bzip2-sys passes
+# `-I bzip2-1.0.8` and zstd-sys a handful of `-I zstd/lib/...`. Shipping the
+# named file alone leaves every #include unresolved on the Mac.
+DIR_FLAGS = ("-I", "-isystem", "-iquote", "-idirafter", "-L")
+# ...but a directory argument is not automatically ours to mirror. PPC_LDFLAGS
+# names paths that exist on the *Mac* (`-L/opt/local/lib`), and some of those
+# prefixes also exist on this machine with entirely different contents - so a
+# blind mirror of `-L/usr/lib` would upload a Linux userland onto Leopard. Treat
+# anything under a system prefix as a remote path and pass it through untouched.
+SYSTEM_PREFIXES = ("/usr/", "/lib/", "/lib64/", "/opt/", "/bin/", "/sbin/",
+                   "/etc/", "/var/", "/System/", "/Library/", "/Developer/")
+# A guard against mirroring something enormous by accident (a `-I` pointing at a
+# home directory, say). Loud failure beats a silent multi-gigabyte rsync.
+MAX_MIRROR_BYTES = 64 * 1024 * 1024
 
 
 def die(msg):
@@ -118,6 +134,47 @@ def ensure_shim():
     return rel_o
 
 
+def mirrored(path):
+    """Where `path` lives inside REMOTE_ROOT on the Mac.
+
+    Always keyed on the *absolute* local path minus its leading slash, which is
+    also what `rsync -R` produces. Resolving relative paths against the cwd
+    matters now that build scripts drive this script: minicargo runs each one
+    with its cwd set to that crate's directory, so `src/foo.c` from two
+    different crates would otherwise collide at the same remote path and one
+    crate would silently be compiled from the other's source.
+    """
+    return os.path.abspath(path).lstrip("/")
+
+
+def tree_size(path):
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+            if total > MAX_MIRROR_BYTES:
+                return total
+    return total
+
+
+def should_mirror_dir(path):
+    """True if `path` is a local directory we should ship to the Mac."""
+    absolute = os.path.abspath(path)
+    if any(absolute.startswith(p) for p in SYSTEM_PREFIXES):
+        return False        # names a path on the Mac, not here
+    if not os.path.isdir(absolute):
+        return False        # remote-only, or simply not a directory
+    size = tree_size(absolute)
+    if size > MAX_MIRROR_BYTES:
+        die("refusing to mirror %s (%.1f MB > %.0f MB limit); if this really "
+            "is a build directory, raise MAX_MIRROR_BYTES"
+            % (absolute, size / 1048576.0, MAX_MIRROR_BYTES / 1048576.0))
+    return True
+
+
 def main():
     if not HOST:
         die("PPC_HOST is not set (e.g. PPC_HOST=admin@192.168.99.116)")
@@ -126,9 +183,12 @@ def main():
     if not args:
         die("no arguments")
 
-    local_root = os.getcwd()
     output = None
     inputs = []
+    dirs = []
+    # Rewrites applied to the remote command line, keyed on the exact argument
+    # string. Covers both the `-I dir` and `-Idir` spellings.
+    remap = {}
 
     i = 0
     while i < len(args):
@@ -136,6 +196,22 @@ def main():
         if a == "-o" and i + 1 < len(args):
             output = args[i + 1]
             i += 2
+            continue
+        # A directory-valued flag, in either spelling.
+        flag = next((f for f in DIR_FLAGS if a == f or
+                     (a.startswith(f) and len(a) > len(f))), None)
+        if flag is not None:
+            if a == flag and i + 1 < len(args):
+                if should_mirror_dir(args[i + 1]):
+                    dirs.append(args[i + 1])
+                    remap[args[i + 1]] = mirrored(args[i + 1])
+                i += 2
+            else:
+                value = a[len(flag):]
+                if should_mirror_dir(value):
+                    dirs.append(value)
+                    remap[a] = flag + mirrored(value)
+                i += 1
             continue
         if a in VALUE_FLAGS:
             i += 2
@@ -147,28 +223,25 @@ def main():
     if output is None:
         die("no -o in command line: %s" % " ".join(args))
 
-    # Mirror every path under REMOTE_ROOT. minicargo passes paths relative to
-    # mrustc's cwd for a stdlib build but absolute ones when driven with an
-    # absolute --output-dir, so both have to work; an absolute path keeps its
-    # shape minus the leading slash, which is also what `rsync -R` produces.
-    def mirrored(path):
-        rel = path.lstrip("/") if os.path.isabs(path) else path
-        if rel.startswith(".." + os.sep):
-            die("path escapes the build root (not mirrorable): %s" % path)
-        return rel
+    for p in inputs + [output]:
+        remap[p] = mirrored(p)
 
-    remap = {p: mirrored(p) for p in inputs + [output]}
-
-    remote_dirs = sorted({os.path.dirname(p) for p in remap.values() if os.path.dirname(p)})
+    remote_dirs = sorted(
+        {os.path.dirname(mirrored(p)) for p in inputs + [output]}
+        | {mirrored(d) for d in dirs}
+    )
     mkdir = "mkdir -p %s" % " ".join(
-        shlex.quote("%s/%s" % (REMOTE_ROOT, d)) for d in remote_dirs
+        shlex.quote("%s/%s" % (REMOTE_ROOT, d)) for d in remote_dirs if d
     ) if remote_dirs else "true"
     if run(["ssh", HOST, "mkdir -p %s && %s" % (shlex.quote(REMOTE_ROOT), mkdir)]) != 0:
         die("failed to create remote directories")
 
-    if inputs:
-        # -R keeps each source's relative path, so the remote tree mirrors ours.
-        rc = run(["rsync", "-qR", "--"] + inputs + ["%s:%s/" % (HOST, REMOTE_ROOT)])
+    # -R rebuilds each source's absolute path under REMOTE_ROOT, so the remote
+    # tree mirrors ours. Directories go up recursively: a `-I` directory is
+    # wanted for the headers it holds, not for itself.
+    uploads = [os.path.abspath(p) for p in inputs] + [os.path.abspath(d) for d in dirs]
+    if uploads:
+        rc = run(["rsync", "-qR", "-r", "--"] + uploads + ["%s:%s/" % (HOST, REMOTE_ROOT)])
         if rc != 0:
             die("failed to upload inputs")
 
