@@ -104,6 +104,7 @@ TAG_WORDS = frozenset((
     b"_Atomic", b"extern", b"restrict", b"__restrict"))
 ATTRIBUTE = re.compile(rb"__attribute__\s*\(\(.*?\)\)", re.S)
 WEAK = re.compile(rb"__attribute__\s*\(\(\s*weak")
+WEAK_ATTR = re.compile(rb"__attribute__\s*\(\(\s*weak\s*\)\)\s*")
 BRACED = re.compile(rb"\{[^{}]*\}", re.S)
 SUBSCRIPT = re.compile(rb"\[[^\]]*\]", re.S)
 # `$` is part of a name here: mrustc puts a hash suffix on long mangled names
@@ -396,17 +397,30 @@ def classify(text, kind):
     if kind == DECL or body_at == -1:
         # A declaration, including every `// PROTO` prototype. The definition
         # it belongs to is moving to a unit, so it must not stay internal.
-        if declares_storage(text) and not WEAK.search(text):
+        if declares_storage(text):
             # A tentative definition - mrustc forward-declares each static
             # this way. The header keeps the type and declares the object
             # `extern`; the storage moves to a unit, joining the initialised
-            # definition of the same name when there is one. (Weak ones are
-            # left alone: mrustc marks vtables and type ids weak precisely so
-            # the copies coalesce, and duplicating those across units is how
-            # that is meant to work, exactly as it already does across crates.)
+            # definition of the same name when there is one.
+            #
+            # This applies to the weak ones too, and *especially* to them.
+            # mrustc marks vtables and type ids `__attribute__((weak))` so the
+            # copies different crates emit coalesce, which made it tempting to
+            # leave them duplicated in the header. That is silently fatal: the
+            # initialised definition lands in one unit and the other units get
+            # a zero-filled tentative one, all four weak, and the linker is
+            # free to keep any of them. It kept a zero - so the first call
+            # through a vtable jumped to 0:
+            #
+            #   #3 ..OnceLock..get_or_try_init  (frames 0-2 at address 0)
+            #
+            # Only the definition keeps `weak`, which is all cross-crate
+            # coalescing needs; a weak *declaration* in the header would make
+            # the reference weak too, and a missing definition would then
+            # silently resolve to 0 instead of failing the link.
             body = strip_static(text)
             at = code_offset(body)
-            return (EXTERN, body[:at] + b"extern " + body[at:],
+            return (EXTERN, body[:at] + b"extern " + WEAK_ATTR.sub(b"", body[at:]),
                     strip_static(without_aggregate_body(text)),
                     declared_name(text))
         return HEADER, text, None, None

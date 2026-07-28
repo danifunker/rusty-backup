@@ -690,9 +690,39 @@ How the split works, and the two traps in it:
   header therefore gets it as `extern`, the storage goes to a unit, and the
   initialised definition of the same name is routed to *that same unit* so the
   two merge exactly as they did in one file.
-- Vtables and type ids are already `__attribute__((weak))` and land in
-  `__datacoal_nt`. Those are left duplicated across units deliberately: it is
-  the same coalescing mrustc already relies on across crates.
+- **Weak tentative definitions must not be duplicated either**, and this one is
+  silently fatal rather than loud. Vtables and type ids are already
+  `__attribute__((weak))` and land in `__datacoal_nt`, which makes it look safe
+  to leave them in the header and let the copies coalesce - that is, after all,
+  exactly how mrustc gets them to coalesce *across crates*. Within one crate it
+  is not safe: the initialised definition lands in one unit and the other units
+  get a zero-filled tentative one, **all four weak and equally eligible**, and
+  the linker is free to keep any of them. It kept a zero. The binary linked,
+  started, and died on the first call through a vtable:
+
+  ```
+  #3  ..OnceLock..get_or_try_init      (frames 0-2 at address 0)
+  #11 ..bin4main0g
+  ```
+
+  A null function pointer, from a vtable that was 16 zero bytes. Confirmed by
+  reading the symbol's contents out of each object - `u2.o` had the real thing,
+  the other three had zeros:
+
+  ```
+  rlib.o  __DATA,__datacoal_nt weak=True bytes=00000000000000000000000000000000
+  u2.o    __DATA,__datacoal_nt weak=True bytes=00000000000000100000000100000000
+  ```
+
+  So weak tentative definitions get the same treatment as any other: `extern`
+  in the header, storage in exactly one unit. Only the definition keeps `weak`
+  (cross-crate coalescing still needs it) - the header declaration must *not*,
+  because a weak reference to a missing definition resolves to 0 instead of
+  failing the link, which is how this class of bug hides in the first place.
+
+  The invariant to check after any change here is stronger than "no strong
+  duplicates": **no symbol may be defined in more than one unit at all**, weak
+  included.
 
 The split is checked by comparing the pieces against the object built from the
 whole file - every global the original defines is defined once across the units,
