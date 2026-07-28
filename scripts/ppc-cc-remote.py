@@ -128,9 +128,21 @@ MAX_MIRROR_BYTES = 64 * 1024 * 1024
 BIG_TU_BYTES = int(os.environ.get("PPC_BIG_TU_BYTES", 64 * 1024 * 1024))
 BIG_TU_ARGS = shlex.split(os.environ.get(
     "PPC_BIG_TU_ARGS",
-    "-O0 -mlongcall --param ggc-min-expand=10 --param ggc-min-heapsize=32768"))
-# Optimisation flags to strip when BIG_TU_ARGS takes over (mrustc emits -O1).
-OPT_FLAGS = ("-O", "-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast")
+    "-O0 -mlongcall -mdynamic-no-pic "
+    "--param ggc-min-expand=10 --param ggc-min-heapsize=32768"))
+#   -mdynamic-no-pic        `-fPIC` gives every function a PIC base register, and
+#                           the offsets from it cannot span an object this size:
+#                             ld: 32-bit pic-base out of range in ___mrustc_bitrev32
+#                           This is an *executable*, not a dylib, so PIC buys
+#                           nothing. `-mdynamic-no-pic` is Darwin/PowerPC's
+#                           "non-relocatable code, relocatable external
+#                           references" mode, which is exactly right for a
+#                           program and drops the PIC base entirely.
+#
+# Flags to strip when BIG_TU_ARGS takes over: mrustc emits -O1 and -fPIC, and both
+# are replaced above.
+OPT_FLAGS = ("-O", "-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast",
+             "-fPIC", "-fpic", "-fPIE", "-fpie")
 
 
 def die(msg):
