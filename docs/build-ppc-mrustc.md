@@ -516,6 +516,20 @@ Nine that have each cost real time:
     | while read f; do [ -f "$f" ] || echo "MISSING: $f"; done
   ```
 
+- **Changing the compiler wrapper does not make anything recompile.** minicargo
+  only schedules a codegen job when the `.o` looks out of date against the
+  `.rlib` - it knows nothing about `ppc-cc-remote.py`, the split, or their
+  environment. So editing the wrapper and re-running `build-ppc.sh ppc` goes
+  straight to the link with the *old* objects, and re-reports whatever error
+  you were trying to fix, in a couple of minutes rather than the hour a
+  recompile would take. That fast failure is the tell. Run the crate's codegen
+  script directly instead:
+
+  ```sh
+  PPC_HOST=... PPC_SPLIT_UNITS=4 \
+    sh output-rb-ppc/librusty_backup-<tag>.rlib-codegen.sh   # then build-ppc.sh ppc
+  ```
+
 ## The engine is one 797 MB translation unit
 
 mrustc emits **one `.c` per crate**, and there is no way to ask it for more -
@@ -562,12 +576,142 @@ with it. Deleting a 43 KB `zstd-safe` artifact cost three hours here for exactly
 that reason (see the traps above), and taking the first `APP_VERSION` stamp on an
 already-built tree cost another three.
 
-If this ceiling returns, in increasing order of cost: squeeze harder on flags
-(`--param ggc-min-expand=0`, `-fno-var-tracking`); split the crate across
-translation units, which is a **genuine mrustc feature** and not a flag; or build
-a 64-bit `cc1` (the G5 is a PPC970 and Leopard has a 64-bit userland, so a
-`ppc64` gcc would lift the ceiling while still emitting 32-bit target code - but
-that means rebuilding the bootstrap toolchain on a 2005 machine).
+**Both of those numbers are now historical**, because the unit is no longer
+compiled whole - see the next section. The flags above still apply to whatever
+each *unit* is compiled with, and `-O0` is still what they say, but the reason
+to split turned out to be the linker rather than the compiler.
+
+## The 16 MB branch limit, and splitting the unit
+
+A PowerPC `bl` reaches +/-16 MB. The engine's `__text` alone is 61.8 MB, so its
+own calls do not reach, and `-mlongcall` was added to `PPC_BIG_TU_ARGS` to make
+them indirect. That got the build to the link, where one symbol was left:
+
+```
+ld: bl out of range (81065588 max is +/-16M)
+    from <engine symbol> in __text of librusty_backup-...rlib.o
+    to   restGPRx in __text of .../libef_ppc.a(darwin-gpsave.o)
+```
+
+`restGPRx` is libgcc's out-of-line epilogue helper. `-mlongcall` does not cover
+it, because gcc emits that call from its own prologue/epilogue code rather than
+through the call path the flag rewrites.
+
+**What is actually going on, measured rather than reasoned about.** `ld64-85.2.1`
+*does* insert branch islands - it names them in its own diagnostics
+(`_main$island`). What it will not do is place one inside an input object whose
+own `__text` is oversized. Three synthetic links on the G5, everything else held
+constant, each about 90 seconds to build:
+
+| the same 61 MB of small atoms, arranged as | result |
+|---|---|
+| **one** object, direct `bl` to a helper in another object | `ld: bl out of range (67553480 max is +/-16M)` |
+| **eight** objects | links clean |
+| **two** objects of 30 MB | links clean |
+| 112 MB of text as **eight** objects (the size of the real image) | links clean |
+
+So the ceiling is per *input object*, and it sits between 30 MB and 61 MB of
+`__text` - consistent with a signed 26-bit displacement (+/-32 MB) inside ld's
+own arithmetic. The *total* is not a constraint: 112 MB across enough objects,
+which is what the finished binary looks like, islands fine. Two things follow,
+both of which had cost time:
+
+- **`-dead_strip` and a local `darwin-gpsave.o` were never going to work.**
+  Neither gets the *calling* object under the ceiling; the failing branch is a
+  property of the object the call is in, not of where the target lives.
+- **Atom granularity was not the problem.** The engine object has 108,932
+  symbols in `__text` and its largest atom is 69 KB, so ld had somewhere to put
+  an island on any reasonable spacing. It still did not.
+
+The same +/-32 MB appears one stage earlier, in the assembler, which is what
+`-mlongcall` is really working around - a direct branch across a big unit fails
+before ld ever sees it:
+
+```
+/var/tmp//ccRt2eNL.s:832036: Fixup of -67328096 too large for field width of 26 bits
+```
+
+**The fix is to stop emitting one oversized object.** `scripts/ppc-split-tu.py`
+splits a generated `.c` into a header plus N units, and `ppc-cc-remote.py`
+compiles the units and leaves a `<output>.parts` sidecar next to the object.
+Unit 0 *is* the object mrustc asked for, so nothing upstream changes; the link
+expands the sidecar (`expand_parts`) and passes every piece. `PPC_SPLIT_UNITS`
+sets the count (default 4, so each unit carries ~16 MB of `__text`, half the
+measured ceiling); `PPC_SPLIT_UNITS=1` restores the single-object behaviour.
+
+How the split works, and the two traps in it:
+
+- mrustc's output is regular enough to split structurally: preamble, type
+  definitions with their `sizeof`/`alignof` asserts, a `// PROTO` declaration
+  for every function, then the bodies. Top-level constructs start and end at
+  column 0. **MIR basic-block labels (`bb2:`) are also at column 0**, so the
+  chunker only treats `}` as a terminator once it knows it is inside a body,
+  and top-level lines carry trailing `// ...` comments that have to come off
+  before a line can be recognised as terminated at all.
+- **Linkage, and why promoting is not enough.** mrustc gives crate-local
+  monomorphisations internal linkage - 115k `static` items in the engine - and
+  unit 3's `static` is invisible to unit 5, so they have to be promoted to
+  external linkage. The reasoning that promotion alone is safe ("it was
+  `static`, so nothing else can define that name") is wrong, and the link says
+  so:
+
+  ```
+  ld: duplicate symbol _ZRG3cF10alloc..vec_deque10wrap_index0g in
+      librusty_backup-...rlib.o and liballoc.rlib.o
+  ```
+
+  mrustc emits a crate-local copy of some items that the crate they belong to
+  also defines *globally*. Being `static` is what kept those apart. A sweep of
+  the engine's symbols against the other 138 objects on the link line found
+  **1,290** such names, so the first error was one of many.
+
+  Every promoted name is therefore renamed with a `__rbsplit` suffix. The
+  rename is done by the preprocessor, not by rewriting 800 MB of text:
+  `promoted.h` holds one `#define NAME NAME__rbsplit` per name (57,603 of them
+  for the engine) and each unit includes it ahead of `tu.h`, so the definition
+  and every reference move together for free.
+- **One name cannot be renamed**, and it is worth knowing why. mrustc points
+  `core::panicking::panic_fmt` at the real handler with `#define ...panic_fmt0g
+  rust_begin_unwind`, *and* emits a local definition of it - which that macro
+  turns into a definition of `rust_begin_unwind`, a symbol std also defines.
+  A `#define` of ours cannot win against one that comes later in the header, so
+  that definition is made weak instead: still visible to the other units, and
+  std's definition wins at link time.
+
+  The pre-flight that catches all of this reads the Mach-O symbol tables
+  directly and takes about a minute - much cheaper than the 85-minute compile
+  it guards. Weak duplicates must be excluded from it or the 188 coalesced
+  vtables look like failures: check `n_desc & N_WEAK_DEF (0x0080)` on both
+  sides and only count a clash when neither is weak.
+- **Tentative definitions.** mrustc forward-declares each static without
+  `extern` (`union u_static_X{...} NAME;`) before the initialised definition
+  that follows later. Left in the header, that is a tentative definition in
+  every unit, and gcc 10 defaults to `-fno-common` - duplicate symbols. The
+  header therefore gets it as `extern`, the storage goes to a unit, and the
+  initialised definition of the same name is routed to *that same unit* so the
+  two merge exactly as they did in one file.
+- Vtables and type ids are already `__attribute__((weak))` and land in
+  `__datacoal_nt`. Those are left duplicated across units deliberately: it is
+  the same coalescing mrustc already relies on across crates.
+
+The split is checked by comparing the pieces against the object built from the
+whole file - every global the original defines is defined once across the units,
+undefined sets match, and no strong symbol is defined twice:
+
+```sh
+nm -g whole.o | awk '$2 != "U" && NF==3 {print $3}' | sort -u          # defined
+for f in u*.o; do nm -m $f | grep -v '(undefined)' | grep ' external ' \
+  | grep -v non-external | grep -v 'weak external' | awk '{print $NF}'; done \
+  | sort | uniq -d                                                     # must be empty
+```
+
+Note the two nm traps that produced false results here: `nm -m` prints
+`non-external` for locals, which a naive `grep external` matches, and undefined
+symbols are `external` too - a cross-unit reference looks exactly like a
+duplicate definition unless `(undefined)` is filtered out first.
+
+Splitting also lifts the 32-bit `cc1` memory ceiling, so `-O1` is worth
+revisiting for the engine now that no unit is anywhere near 797 MB.
 
 ## Version stamping
 

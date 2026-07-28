@@ -27,13 +27,19 @@ Environment:
   PPC_MIN_VERSION  -mmacosx-version-min value, e.g. 10.4
   PPC_LDFLAGS      extra flags for link steps (see DEFAULT_LDFLAGS)
   PPC_CC_VERBOSE   set to echo each remote command
+  PPC_SPLIT_UNITS  how many objects an oversized unit becomes (default 4;
+                   1 disables splitting) -- see "splitting an oversized unit"
+  PPC_SPLIT_JOBS   how many of those to compile at once (default PPC_JOBS or 2)
+  PPC_SPLIT_FORCE  re-split and recompile even if the pieces look current
 """
 
 import glob
 import os
 import shlex
+import struct
 import subprocess
 import sys
+import threading
 
 HOST = os.environ.get("PPC_HOST")
 REMOTE_CC = os.environ.get("PPC_CC", "/opt/local/libexec/gcc10-bootstrap/bin/gcc")
@@ -144,6 +150,40 @@ BIG_TU_ARGS = shlex.split(os.environ.get(
 OPT_FLAGS = ("-O", "-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast",
              "-fPIC", "-fpic", "-fPIE", "-fpie")
 
+# --- splitting an oversized unit ---------------------------------------------
+# `-mlongcall` deals with the oversized unit's *own* calls, but not with the one
+# direct branch gcc emits from its own epilogue code, to libgcc's out-of-line
+# register-restore helper:
+#
+#   ld: bl out of range (81065588 max is +/-16M) from <engine symbol> in __text
+#   of librusty_backup-...rlib.o to restGPRx in __text of libef_ppc.a
+#
+# ld64-85.2.1 does insert branch islands - it names them in its own diagnostics
+# (`_main$island`) - but it cannot place one inside an input object whose own
+# __text is oversized. Measured on the G5 with synthetic objects, everything
+# else held constant: 61 MB of small atoms in ONE object fails exactly as above;
+# the same code as 8 objects links clean; and so does the same code as 2 objects
+# of 30 MB. So the ceiling is per *input object*, between 30 and 61 MB of
+# __text, which is why `-dead_strip` and a local `darwin-gpsave.o` both failed -
+# neither gets the *calling* object under it.
+#
+# Splitting the unit is therefore the fix, and it lifts the 32-bit `cc1` memory
+# ceiling that forced `-O0` at the same time. scripts/ppc-split-tu.py does the
+# work; this script compiles the pieces and keeps the rest of the build unaware
+# by leaving a `<output>.parts` sidecar, which the link expands.
+#
+# PPC_SPLIT_UNITS=1 restores the old single-object behaviour.
+SPLIT_UNITS = int(os.environ.get("PPC_SPLIT_UNITS", "4"))
+SPLIT_JOBS = int(os.environ.get("PPC_SPLIT_JOBS", os.environ.get("PPC_JOBS", "2")))
+SPLIT_FORCE = bool(os.environ.get("PPC_SPLIT_FORCE"))
+SPLITTER = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "ppc-split-tu.py")
+PARTS_SUFFIX = ".parts"
+# The measured ceiling is between 30 and 61 MB of __text in one input object.
+# Warn with room to spare, because the failure it prevents surfaces an hour
+# later as an out-of-range branch naming a symbol that looks unrelated.
+SPLIT_TEXT_WARN = int(os.environ.get("PPC_SPLIT_TEXT_WARN", 24 * 1024 * 1024))
+
 
 def die(msg):
     sys.stderr.write("ppc-cc-remote: %s\n" % msg)
@@ -198,6 +238,164 @@ def ensure_shim():
     if rc != 0:
         die("failed to compile the shim")
     return rel_o
+
+
+def macho_text_size(path):
+    """`__text` size of a 32-bit big-endian Mach-O object, or None.
+
+    Used to check that no unit came out over the branch-island ceiling. Reading
+    two structs beats shelling out to a `size` that only exists on the Mac.
+    """
+    try:
+        with open(path, "rb") as fh:
+            header = fh.read(28)
+            if len(header) < 28:
+                return None
+            magic, _cpu, _sub, _type, ncmds, _sz, _flags = struct.unpack(">7I", header)
+            if magic != 0xFEEDFACE:
+                return None
+            for _ in range(ncmds):
+                cmd, cmdsize = struct.unpack(">2I", fh.read(8))
+                body = fh.read(cmdsize - 8)
+                if cmd != 0x1:  # LC_SEGMENT
+                    continue
+                nsects = struct.unpack(">I", body[40:44])[0]
+                at = 48
+                for _ in range(nsects):
+                    if body[at:at + 16].rstrip(b"\0") == b"__text":
+                        return struct.unpack(">I", body[at + 36:at + 40])[0]
+                    at += 68
+    except (OSError, struct.error):
+        return None
+    return None
+
+
+def expand_parts(args):
+    """Replace a split object with the objects it was actually split into.
+
+    A crate compiled as N units leaves `<crate>.rlib.o` as unit 0 and lists the
+    rest in `<crate>.rlib.o.parts`. Everything upstream - minicargo, mrustc's
+    link line - still names the one path it knows about, so the expansion
+    happens here, before the arguments are scanned for files to upload.
+    """
+    out = []
+    previous = None
+    for a in args:
+        out.append(a)
+        was_output, previous = previous == "-o", a
+        if not a.endswith(".o") or was_output:
+            # Never expand the `-o` target. The split compile writes
+            # `<crate>.rlib.o` while a sidecar for that same path already
+            # exists, and expanding it there hands gcc its own output as an
+            # input: "input file u1.o is the same as output file".
+            continue
+        parts_file = a + PARTS_SUFFIX
+        if not os.path.isfile(parts_file):
+            continue
+        with open(parts_file) as fh:
+            parts = [l.strip() for l in fh if l.strip()]
+        missing = [p for p in parts if not os.path.isfile(p)]
+        if missing:
+            die("%s lists objects that do not exist: %s"
+                % (parts_file, " ".join(missing)))
+        out.extend(parts)
+        if VERBOSE:
+            sys.stderr.write("ppc-cc-remote: %s -> +%d split objects\n"
+                             % (os.path.basename(a), len(parts)))
+    return out
+
+
+def split_and_compile(source, output, remote_args, remap):
+    """Compile an oversized translation unit as several objects.
+
+    Unit 0 is compiled to `output` itself, so a consumer that never looks at
+    the sidecar still gets a real object and fails loudly (undefined symbols)
+    rather than silently linking nothing.
+    """
+    stem = source[:-2] if source.endswith(".c") else source
+    outdir = stem + ".split"
+    cmd = [sys.executable, SPLITTER, source, "-n", str(SPLIT_UNITS),
+           "-o", outdir]
+    if SPLIT_FORCE:
+        cmd.append("--force")
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+    units = [l.decode().strip() for l in proc.stdout if l.strip()]
+    if proc.wait() != 0 or not units:
+        die("failed to split %s" % source)
+
+    objects = [output] + [u[:-2] + ".o" for u in units[1:]]
+    # Every header the split produced - `tu.h` and the `promoted.h` that renames
+    # the crate-local symbols. Neither appears on a command line, so they have
+    # to be shipped by name or the remote compile cannot resolve the #include.
+    headers = sorted(glob.glob(os.path.join(outdir, "*.h")))
+
+    remote_dirs = sorted({os.path.dirname(mirrored(p)) for p in objects + units})
+    if run(["ssh", HOST, "mkdir -p %s" % " ".join(
+            shlex.quote("%s/%s" % (REMOTE_ROOT, d)) for d in remote_dirs if d)]) != 0:
+        die("failed to create remote directories for the split unit")
+    if run(["rsync", "-qR", "--"] + [os.path.abspath(p) for p in units + headers]
+           + ["%s:%s/" % (HOST, REMOTE_ROOT)]) != 0:
+        die("failed to upload the split unit")
+
+    # Anything already built from the same source is reused: these compiles are
+    # tens of minutes each, and a failed link should not cost them again.
+    todo = []
+    for unit, obj in zip(units, objects):
+        if (not SPLIT_FORCE and os.path.exists(obj)
+                and os.path.getmtime(obj) > os.path.getmtime(unit)):
+            sys.stderr.write("ppc-cc-remote: %s is current, not recompiling\n"
+                             % os.path.basename(obj))
+            continue
+        todo.append((unit, obj))
+
+    sys.stderr.write(
+        "ppc-cc-remote: %s split into %d units, %d to compile (%d at a time)\n"
+        % (os.path.basename(source), len(units), len(todo), SPLIT_JOBS))
+
+    failures = []
+    lock = threading.Lock()
+
+    def compile_one(unit, obj):
+        args = [mirrored(unit) if a == remap[source] else
+                mirrored(obj) if a == remap[output] else a
+                for a in remote_args]
+        rc = run(["ssh", HOST, "cd %s && %s %s" % (
+            shlex.quote(REMOTE_ROOT), shlex.quote(REMOTE_CC),
+            " ".join(shlex.quote(a) for a in args))])
+        if rc == 0:
+            rc = run(["rsync", "-q", "%s:%s/%s" % (HOST, REMOTE_ROOT, mirrored(obj)), obj])
+        if rc != 0:
+            with lock:
+                failures.append(os.path.basename(unit))
+
+    queue = list(todo)
+    while queue:
+        batch, queue = queue[:SPLIT_JOBS], queue[SPLIT_JOBS:]
+        threads = [threading.Thread(target=compile_one, args=(u, o)) for u, o in batch]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        if failures:
+            break
+    if failures:
+        sys.stderr.write("ppc-cc-remote: split units failed: %s\n"
+                         % " ".join(failures))
+        return 1
+
+    for obj in objects:
+        text = macho_text_size(obj)
+        if text and text > SPLIT_TEXT_WARN:
+            sys.stderr.write(
+                "ppc-cc-remote: WARNING: %s carries %.0f MB of __text. ld "
+                "cannot place a branch island inside an object much past "
+                "32 MB - raise PPC_SPLIT_UNITS (currently %d)\n"
+                % (os.path.basename(obj), text / 1048576.0, SPLIT_UNITS))
+
+    with open(output + PARTS_SUFFIX, "w") as fh:
+        for obj in objects[1:]:
+            fh.write(os.path.abspath(obj) + "\n")
+    return 0
 
 
 def reframework(args):
@@ -323,7 +521,7 @@ def main():
     if not HOST:
         die("PPC_HOST is not set (e.g. PPC_HOST=admin@192.168.99.116)")
 
-    args = expand_response_files(sys.argv[1:])
+    args = expand_parts(expand_response_files(sys.argv[1:]))
     if not args:
         die("no arguments")
 
@@ -408,13 +606,20 @@ def main():
     elif BIG_TU_BYTES:
         # An oversized translation unit needs its own flags or 32-bit cc1 runs
         # out of address space - see BIG_TU_ARGS above.
-        biggest = max([os.path.getsize(p) for p in inputs
-                       if p.lower().endswith((".c", ".cc", ".cpp", ".cxx"))] or [0])
-        if biggest > BIG_TU_BYTES:
+        oversized = [p for p in inputs
+                     if p.lower().endswith((".c", ".cc", ".cpp", ".cxx"))
+                     and os.path.getsize(p) > BIG_TU_BYTES]
+        if oversized:
             remote_args = [a for a in remote_args if a not in OPT_FLAGS] + BIG_TU_ARGS
             sys.stderr.write(
                 "ppc-cc-remote: %.0f MB translation unit - compiling with %s\n"
-                % (biggest / 1048576.0, " ".join(BIG_TU_ARGS)))
+                % (os.path.getsize(oversized[0]) / 1048576.0,
+                   " ".join(BIG_TU_ARGS)))
+            # ...and split it, so no single object carries more __text than the
+            # linker can reach across. One source per command line is all
+            # mrustc ever emits; anything else is not ours to second-guess.
+            if SPLIT_UNITS > 1 and len(oversized) == 1:
+                return split_and_compile(oversized[0], output, remote_args, remap)
 
     remote_cmd = "cd %s && %s %s" % (
         shlex.quote(REMOTE_ROOT),
