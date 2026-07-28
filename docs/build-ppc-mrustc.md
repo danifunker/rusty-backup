@@ -530,6 +530,16 @@ Nine that have each cost real time:
     sh output-rb-ppc/librusty_backup-<tag>.rlib-codegen.sh   # then build-ppc.sh ppc
   ```
 
+- **And recompiling a crate does not relink the binary**, for the same reason
+  one level up. After the engine's objects were rebuilt, `build-ppc.sh ppc`
+  reported success while `rb-cli` kept the timestamp - and the behaviour - of
+  the previous link. Check the binary's mtime against the objects, and drive
+  the link directly when they disagree:
+
+  ```sh
+  PPC_HOST=... PPC_SHIM=... sh output-rb-ppc/rb-cli-codegen.sh
+  ```
+
 ## The engine is one 797 MB translation unit
 
 mrustc emits **one `.c` per crate**, and there is no way to ask it for more -
@@ -1051,6 +1061,50 @@ from scratch. It does not: libc's `unix/bsd/apple/b32` module is arch-agnostic,
 and libc **compiles for this target unchanged**. `target_arch = "powerpc"` also
 happens to dodge the `$UNIX2003` `link_name` overrides, which are gated on
 `target_arch = "x86"`.
+
+### `File::try_clone` fails on Leopard, and the shim entry that fixes it
+
+The first thing the binary was asked to do that it could not was a backup:
+
+```
+error: backup failed: failed to clone local source handle:
+       Inappropriate ioctl for device (os error 25)
+```
+
+`File::try_clone` is `fcntl(fd, F_DUPFD_CLOEXEC, 0)` in Rust 1.74's
+`sys/unix/fd.rs`, with no fallback. `F_DUPFD_CLOEXEC` arrived in 10.7. Measured
+on 10.5.8, with the two-step form working perfectly:
+
+```
+F_DUPFD_CLOEXEC -> -1 errno=25 (Inappropriate ioctl for device)
+F_DUPFD -> 4
+ioctl(FIOCLEX) -> 0
+```
+
+`rb-cli-ppc/shim/ppc-compat.c` therefore intercepts that one command and
+forwards every other `fcntl` untouched. This is the only entry in that file
+that *overrides* something the OS does export rather than supplying something
+missing, and it is there rather than in std because patching std invalidates
+every crate downstream of it - the engine included, which is hours.
+
+**The trap, which cost two link cycles:** Leopard's `<sys/fcntl.h>` aliases
+`fcntl` to `_fcntl$UNIX2003`, so defining `fcntl` normally exports *that*
+symbol, while libstd - compiled from mrustc's C, without those feature macros -
+calls plain `_fcntl`. The override then does nothing at all, and the failure is
+indistinguishable from not having written it. A second `__asm__` label on
+`fcntl` does not help either: the header's declaration comes first and its
+label wins. The definition needs a C name of its own with the label attached:
+
+```c
+int rb_compat_fcntl(int fd, int cmd, ...) __asm__("_fcntl");
+```
+
+Check it landed, rather than assuming - the object should export the
+undecorated name:
+
+```sh
+nm -g ppc-xbuild/shim/ppc-compat.o | grep fcntl     # want: T _fcntl
+```
 
 What still needs checking is struct *layout*, and that is the dangerous class:
 it compiles cleanly and is wrong at runtime. mrustc's `sizeof_assert` /
