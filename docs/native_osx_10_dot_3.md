@@ -372,7 +372,9 @@ that exercises `println!`, `BTreeMap`, iterators, `AtomicU64`, threads,
 `fs::metadata` and `read_dir`, with the filesystem results checked field-by-field
 against `stat -f` on the machine. Cost: eight fixes (see "Where this stands").
 
-**Phase 2 - finish the engine transpile.** *(all 380 crates compile; final link outstanding)* Both scope-downs from
+**Phase 2 - finish the engine transpile.** *(DONE - all 380 crates compile and
+`rb-cli` links; the engine is compiled as 4 split objects, see the branch-limit
+section of `build-ppc-mrustc.md`)* Both scope-downs from
 section 6 have landed - YAML is feature-gated out and `os-stub` replaces the macOS
 platform leaf - and the host-`libc` blocker is fixed by a manifest pin. The
 blockers met since are all mrustc bugs, each small and local, and each fixed on
@@ -443,11 +445,18 @@ end, and both are properties of the shape of this build rather than bugs:
 
 Both are written up in `build-ppc-mrustc.md`.
 
-**Phase 3 - link and smoke-test on 10.5.** Get `rb-cli` linked, then exercise it
-against disk images on the G5: `inspect`, `backup`, `restore`, a browse-view
-listing, an `fsck`. Compare output against the desktop build on the same images -
-byte-identical `metadata.json` and checksums is the bar. Deliverable: a native
-PowerPC `rb-cli` doing real work on Leopard.
+**Phase 3 - link and smoke-test on 10.5.** *(largely done)* `rb-cli` links and
+runs natively on Leopard. Against the same images, `inspect`, `ls` and `fsck`
+produce **output identical to the desktop build**, and a `backup --format zstd
+--checksum sha256` produces an **identical sha256 and a byte-identical payload**
+- `metadata.json` differs only in its `created` timestamp. One real portability
+bug surfaced and is fixed: `File::try_clone` uses `F_DUPFD_CLOEXEC`, which
+Leopard does not have (see the shim entry in `build-ppc-mrustc.md`).
+
+What is left here is breadth rather than depth: `restore`, richer filesystems
+(FAT / HFS / Amiga rather than the CBM and CP/M images used so far), and a CHD
+backup. `scripts/` has no smoke-test driver checked in yet - the comparison was
+run ad hoc.
 
 **Phase 4 - the hand-C platform shell.** Reattach `os/` as C: device enumeration,
 `/dev/rdiskN`, unmount, elevation, reusing `ppc-tiger/`. Deliverable:
