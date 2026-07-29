@@ -146,6 +146,36 @@ where
         .collect()
 }
 
+/// The mounts that have to come down before `target_bsd` can be written.
+///
+/// `target_bsd` is a BSD name with no `/dev/` and no leading `r`
+/// (`"disk2"`, `"disk2s1"`). Naming a whole disk selects every volume on it;
+/// naming one slice selects only that slice, so a caller restoring into a
+/// single partition does not tear down its neighbours.
+///
+/// Returns references in the order given, and never matches a pseudo-filesystem
+/// (`devfs`, `map -hosts`) since those have no `/dev/` device.
+pub fn mounts_to_unmount<'a>(target_bsd: &str, mounts: &'a [MountEntry]) -> Vec<&'a MountEntry> {
+    let Some((disk_no, target_slice)) = parse_bsd_name(target_bsd) else {
+        return Vec::new();
+    };
+    mounts
+        .iter()
+        .filter(|m| {
+            let Some(bsd) = m.from.strip_prefix("/dev/") else {
+                return false;
+            };
+            match parse_bsd_name(bsd) {
+                Some((d, Some(s))) if d == disk_no => {
+                    // Whole disk named: every slice. One slice named: only it.
+                    target_slice.is_none() || target_slice == Some(s)
+                }
+                _ => false,
+            }
+        })
+        .collect()
+}
+
 /// Whether a mount lives on the given whole disk. Parsed rather than matched
 /// by prefix: `"disk1"` is a prefix of `"disk10s1"`, so a string comparison
 /// hangs partitions off the wrong disk once a machine has ten of them.
@@ -256,6 +286,41 @@ mod tests {
         // Unopenable (unprivileged) must still be listed, so the UI can show it
         // and explain why it has no size.
         assert_eq!(disk1.size_bytes, 0);
+    }
+
+    /// Restoring into one partition must not unmount its neighbours, and
+    /// naming the whole disk must take all of them down. The disk1/disk10 trap
+    /// applies here too - unmounting the wrong volume is worse than listing it
+    /// under the wrong heading.
+    #[test]
+    fn unmount_targets_follow_the_named_scope() {
+        let mounts = vec![
+            mount("/dev/disk2s1", "/Volumes/One"),
+            mount("/dev/disk2s2", "/Volumes/Two"),
+            mount("/dev/disk20s1", "/Volumes/Twenty"),
+            mount("devfs", "/dev"),
+            mount("/dev/disk0s5", "/"),
+        ];
+
+        let whole: Vec<&str> = mounts_to_unmount("disk2", &mounts)
+            .iter()
+            .map(|m| m.on.as_str())
+            .collect();
+        assert_eq!(
+            whole,
+            vec!["/Volumes/One", "/Volumes/Two"],
+            "whole disk takes all its slices"
+        );
+
+        let one: Vec<&str> = mounts_to_unmount("disk2s2", &mounts)
+            .iter()
+            .map(|m| m.on.as_str())
+            .collect();
+        assert_eq!(one, vec!["/Volumes/Two"], "a named slice takes only itself");
+
+        // Nothing for an unrelated disk, and pseudo-filesystems never match.
+        assert!(mounts_to_unmount("disk3", &mounts).is_empty());
+        assert!(mounts_to_unmount("not-a-disk", &mounts).is_empty());
     }
 
     #[test]

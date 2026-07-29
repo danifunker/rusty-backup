@@ -13,12 +13,13 @@
 //! `readdir("/dev")`, the `DKIOC*` ioctls and `getmntinfo(3)` cover it, and
 //! [`super::darwin_devices`] assembles the result (with the tests, which run on
 //! any host). What genuinely goes missing is the IOKit property tree -
-//! removable / bus protocol / marketing name - and the two
-//! DiskArbitration operations: claiming a disk and unmounting its volumes. The
-//! second of those is why this build reads devices but does not write them; a
-//! restore without the unmount-and-claim step risks corrupting the target
-//! rather than failing cleanly. That arrives with the hand-written C platform
-//! shell (see docs/native_osx_10_dot_3.md).
+//! removable / bus protocol / marketing name - and the one DiskArbitration
+//! operation that has no POSIX equivalent: *claiming* a disk,
+//! which keeps other DA clients and the Finder from remounting it mid-write.
+//! Unmounting does have one - `unmount(2)`, present on both 10.4 and 10.5 - so
+//! restores work here; they simply run without the exclusive claim the native
+//! build holds. That claim arrives with the hand-written C platform shell (see
+//! docs/native_osx_10_dot_3.md).
 //!
 //! Every function here keeps the signature of its counterpart in `macos.rs`, so
 //! `os/mod.rs` and its callers are untouched. Where an operation genuinely
@@ -211,24 +212,78 @@ pub(crate) fn open_device_for_inspect(path: &Path) -> Result<File> {
     File::open(path).map_err(|e| open_error(path, e))
 }
 
-pub(crate) fn open_target_for_writing(path: &Path) -> Result<(File, Option<DiskClaim>)> {
-    if is_device_path(path) {
-        // Reading a device is just an open; *writing* one is not. The native
-        // module unmounts every volume on the disk through DiskArbitration and
-        // holds the claim for the duration, which is what stops the OS writing
-        // underneath a restore. Without that, opening the device read-write
-        // here would risk a corrupted target rather than a refused one.
-        bail!(
-            "writing to a raw device needs the unmount-and-claim step this \
-             build does not have (host: {}). Reading devices - inspect, browse, \
-             backup - works; restoring to one does not yet.",
-            HostVersion::detect()
-        );
+/// `/dev/disk2` -> `/dev/rdisk2`. The raw node is unbuffered, which is what the
+/// native module writes through and what makes a restore run at disk speed
+/// rather than through the buffer cache.
+fn raw_device_path(path: &Path) -> std::path::PathBuf {
+    match path.to_str() {
+        Some(s) if s.starts_with("/dev/disk") => {
+            std::path::PathBuf::from(format!("/dev/r{}", &s["/dev/".len()..]))
+        }
+        _ => path.to_path_buf(),
     }
+}
+
+/// The BSD name behind a device path, with any `r` prefix removed:
+/// `/dev/rdisk2s1` -> `disk2s1`.
+fn bsd_name_of(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    let name = name.strip_prefix('r').unwrap_or(name);
+    super::darwin_devices::parse_bsd_name(name)?;
+    Some(name.to_string())
+}
+
+/// Take down the volumes that would otherwise be written underneath.
+///
+/// `unmount(2)` is plain libc and present on both 10.4 and 10.5, so this needs
+/// no DiskArbitration. Failures are logged rather than fatal, matching the
+/// native module: by the time a restore reaches here the CLI's
+/// `device_safety` has already refused a target with mounted partitions
+/// (unless the user overrode it), so a stubborn volume is a warning about a
+/// decision already made rather than a new one.
+fn unmount_target_volumes(path: &Path) {
+    let Some(bsd) = bsd_name_of(path) else { return };
+    let mounts = read_mounts();
+    for m in super::darwin_devices::mounts_to_unmount(&bsd, &mounts) {
+        let Ok(mount_point) = std::ffi::CString::new(m.on.as_str()) else {
+            continue;
+        };
+        if unsafe { libc::unmount(mount_point.as_ptr(), libc::MNT_FORCE) } == 0 {
+            log::info!("unmounted {} ({})", m.on, m.from);
+        } else {
+            log::warn!(
+                "could not unmount {} ({}): {}",
+                m.on,
+                m.from,
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+}
+
+pub(crate) fn open_target_for_writing(path: &Path) -> Result<(File, Option<DiskClaim>)> {
+    if !is_device_path(path) {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?;
+        return Ok((file, None));
+    }
+
+    unmount_target_volumes(path);
+
+    // No claim is returned, and that is the one thing this path cannot do: the
+    // native module holds a DiskArbitration claim for the duration, which stops
+    // other DA clients (and the Finder) remounting the disk mid-write. Here the
+    // volumes are unmounted and nothing prevents the OS mounting them again if
+    // it notices the disk. In practice the window is small and the restore holds
+    // the raw device open, but it is a real difference from the native build.
+    let raw = raw_device_path(path);
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open(path)?;
+        .open(&raw)
+        .map_err(|e| open_error(&raw, e))?;
     Ok((file, None))
 }
 
@@ -309,7 +364,7 @@ mod tests {
     }
 
     #[test]
-    fn reads_are_allowed_and_writes_explain_themselves() {
+    fn reads_and_writes_are_both_allowed_on_devices() {
         // Reading a device is now supported, so a *missing* device must fail on
         // its own I/O error rather than a blanket refusal.
         let err = open_source_for_reading(Path::new("/dev/rdisk99"))
@@ -317,18 +372,18 @@ mod tests {
             .to_string();
         assert!(!err.contains("needs the"), "{err}");
 
-        // Writing one is still refused, and must say why rather than looking
-        // like a missing file.
-        let err = open_target_for_writing(Path::new("/dev/rdisk9"))
+        // Writing a device is supported now, so a missing one must also fail
+        // on its own I/O error rather than a blanket refusal.
+        let err = open_target_for_writing(Path::new("/dev/rdisk99"))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("unmount"), "{err}");
+        assert!(!err.contains("needs the"), "{err}");
 
         // A regular path must fail (if at all) on its own I/O error.
         let err = open_source_for_reading(Path::new("/nonexistent/image.img"))
             .unwrap_err()
             .to_string();
-        assert!(!err.contains("unmount"), "{err}");
+        assert!(!err.contains("needs the"), "{err}");
     }
 
     #[test]
