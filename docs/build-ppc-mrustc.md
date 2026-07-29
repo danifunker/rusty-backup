@@ -1119,6 +1119,67 @@ undecorated name:
 nm -g ppc-xbuild/shim/ppc-compat.o | grep fcntl     # want: T _fcntl
 ```
 
+### Tiger: translating `$INODE64` at the link line instead of rebuilding libc
+
+Tiger exports **no** `$INODE64` symbols. libstd binds nine of them, so the plan
+had always been a `powerpc-apple-darwin` libc arch file - plain symbols, 10.4's
+legacy structs - and a rebuild of the standard library and everything below it.
+
+The shim reaches the same place for far less. Each of those nine symbols is
+*defined* in `shim/ppc-compat.c` and dispatched at runtime:
+
+- **Leopard**: `dlsym(RTLD_NEXT, "stat$INODE64")` resolves, so forward to it.
+- **Tiger**: call the plain entry point, which fills the *legacy* struct, and
+  convert it to the 64-bit-inode struct libc's Rust declarations describe.
+
+`RTLD_NEXT`, never `RTLD_DEFAULT` - these definitions live in the main
+executable, so a default-scope lookup finds *itself* and recurses.
+
+The layouts are measured by `probe/inode64-layout.c`, not read out of a header:
+
+|  | legacy (Tiger) | 64-bit-inode (what Rust expects) |
+|---|---|---|
+| `stat` | 96 B, `st_ino` @4 (4 B), `st_mode` @8 | 108 B, `st_ino` @8 (8 B), `st_mode` @4 |
+| `statfs` | 272 B, counts 4 B, names 15/90 B | 2168 B, counts 8 B, names 16/1024 B |
+| `dirent` | 264 B, `d_namlen` @7 (1 B) | 1048 B, `d_namlen` @18 (2 B) |
+
+Six static assertions in the shim pin both sides, so a future compile that
+leaks `_DARWIN_USE_64_BIT_INODE` into this file fails loudly instead of
+converting one layout into itself.
+
+**Testing the Tiger path without Tiger.** The converting half is unreachable on
+a 10.5 machine, which is the only one available - so `RB_COMPAT_FORCE_LEGACY=1`
+makes the shim take the Tiger branch anyway. `probe/inode64-diff.c` then calls
+the real 10.5 entry point *and* the forced-legacy path for the same subject and
+compares field by field, and the whole `rb-cli` can be run either way:
+
+```sh
+RB_COMPAT_FORCE_LEGACY=1 ./rb-cli show devices     # same output as without
+RB_COMPAT_FORCE_LEGACY=1 /tmp/inode64-diff         # conversions agree
+```
+
+That immediately earned its keep: it caught the `opendir` entry choosing the
+64-bit variant while the `readdir` entries took the legacy branch. A crossed
+pair reads as **zero entries**, so /dev came back empty exactly as it had
+before any of this was fixed - see the next section for why that failure mode
+is so quiet. Both entries must consult the same `rb_have_inode64()`.
+
+**The shim must not itself depend on Leopard.** Compiled here, `close`, `select`
+and `fcntl` are aliased by the headers to their `$UNIX2003` conformance
+variants, which Tiger lacks - a compatibility layer that cannot bind on the
+system it exists to support. They are bound to the plain names explicitly. The
+check is one command:
+
+```sh
+nm -u ppc-compat.o    # no `$UNIX2003` may appear
+```
+
+**What is still missing on 10.4**, all lazily bound (so they fail when called,
+not at launch): the `posix_spawn*` family (9 symbols, libstd's `Command`),
+`fcopyfile` / `copyfile_state_*` (`fs::copy`), `_Unwind_GetIPInfo` (absent from
+`libgcc_s.10.4`), plus `clock$UNIX2003`, `lutimes`, `waitid` and
+`realpath$DARWIN_EXTSN`. 27 Tiger-only blockers became 18.
+
 ### `read_dir` returns nothing on devfs (the crossed `opendir` ABI)
 
 Device enumeration came back empty on 10.5 while the *same* enumeration written
