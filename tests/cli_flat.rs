@@ -1081,3 +1081,224 @@ fn inspect_explains_a_stray_partition_selector() {
         "missing file should not get the selector hint: {missing_err}"
     );
 }
+
+/// A filesystem smaller than the image containing it must survive
+/// backup -> restore. It did not, and nothing caught it.
+///
+/// Compaction packs the volume, and the restore then tries to grow it to fill
+/// the target. When that growth crossed a FAT width boundary the resize
+/// rewrote the total-sector count anyway and reported success, leaving a
+/// filesystem claiming the whole container while its FAT still described the
+/// small original. The restore said it worked; the image failed on its first
+/// directory read.
+///
+/// The existing coverage could not see it: `test_fat12_compaction_round_trip`
+/// exercises `CompactFatReader` alone and never restores, and
+/// `backup_then_restore_round_trip_file_to_file` restores but uses HFS - and
+/// every fixture has a filesystem that exactly fills its container, which is
+/// the one shape where this cannot happen. You reach it by restoring a small
+/// image onto a larger device.
+#[test]
+fn backup_restore_round_trip_when_fs_is_smaller_than_its_container() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let small = dir.path().join("small.img");
+    let big = dir.path().join("big.img");
+    let host = dir.path().join("payload.txt");
+    std::fs::write(&host, b"smaller than its container\n").unwrap();
+
+    // An 800 KB FAT12 volume sitting at the start of a 40 MB image - what a
+    // device looks like after a floppy image is written to it.
+    run(&["new", "floppy", "fat", small.to_str().unwrap()]);
+    run(&[
+        "put",
+        small.to_str().unwrap(),
+        host.to_str().unwrap(),
+        "/PROOF.TXT",
+    ]);
+    let small_bytes = std::fs::read(&small).unwrap();
+    let mut container = vec![0u8; 40 * 1024 * 1024];
+    container[..small_bytes.len()].copy_from_slice(&small_bytes);
+    std::fs::write(&big, &container).unwrap();
+
+    // Sanity: the container reads before we go anywhere near a backup.
+    let listing = run(&["ls", big.to_str().unwrap(), "/"]);
+    assert!(
+        String::from_utf8_lossy(&listing.stdout).contains("PROOF.TXT"),
+        "test setup is wrong - the container should list before backup"
+    );
+
+    let backups = dir.path().join("bk");
+    std::fs::create_dir_all(&backups).unwrap();
+    run(&[
+        "backup",
+        big.to_str().unwrap(),
+        backups.to_str().unwrap(),
+        "--name",
+        "shrunk",
+        "--checksum",
+        "sha256",
+    ]);
+
+    let restored = dir.path().join("restored.img");
+    run(&[
+        "restore",
+        backups.join("shrunk").to_str().unwrap(),
+        restored.to_str().unwrap(),
+    ]);
+
+    // The whole point: the restored image must still be a readable filesystem.
+    let out = run(&["ls", restored.to_str().unwrap(), "/"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("PROOF.TXT"),
+        "restored image should still list its file, got:\n{text}"
+    );
+
+    // And the file's contents must survive, not just its name.
+    let back = dir.path().join("back.txt");
+    run(&[
+        "get",
+        restored.to_str().unwrap(),
+        "/PROOF.TXT",
+        back.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        std::fs::read(&back).unwrap(),
+        std::fs::read(&host).unwrap(),
+        "restored file contents differ from the original"
+    );
+}
+
+/// `restore --size minimum` must actually shrink the partition.
+///
+/// The flag parsed, resolved against the config file, mapped to a
+/// `RestoreSizeChoice` - and was then dropped on the floor, because
+/// `partition_sizes` was hardcoded empty. Every `--size minimum` restore
+/// silently produced an original-sized image. The variable holding the
+/// resolved choice was named `_size_choice`, so no dead-code warning fired.
+///
+/// This also pins the FAT16 minimum-size floor: `defragmented_min_size_bytes`
+/// is what the restore targets, and it has to be at least as large as the
+/// image compaction emits, or the restore refuses with "size is smaller than
+/// minimum" instead of shrinking.
+#[test]
+fn restore_at_minimum_actually_shrinks_a_fat16_partition() {
+    restore_at_minimum_shrinks_with_format("zstd");
+}
+
+/// The same, through the **default** backup format. This one is the likelier
+/// user path and it had an extra way to fail: `run_restore` only takes the
+/// single-file-CHD *resize* branch when some partition is non-Original, so an
+/// empty `partition_sizes` sent every CHD restore down the as-is byte-copy and
+/// no amount of correct resize logic downstream would ever have run.
+#[test]
+fn restore_at_minimum_actually_shrinks_a_fat16_partition_from_chd() {
+    restore_at_minimum_shrinks_with_format("chd");
+}
+
+fn restore_at_minimum_shrinks_with_format(format: &str) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let vol = dir.path().join("vol.img");
+    let disk = dir.path().join("disk.img");
+    let host = dir.path().join("payload.txt");
+    std::fs::write(&host, b"restore --size minimum must shrink\n").unwrap();
+
+    // A 64 MB FAT16 volume, nearly empty, so its minimum is far below its
+    // original size and a working --size minimum is unmistakable.
+    run(&[
+        "new",
+        "volume",
+        "fat",
+        "--size",
+        "64M",
+        "--name",
+        "MID",
+        vol.to_str().unwrap(),
+    ]);
+    run(&[
+        "put",
+        vol.to_str().unwrap(),
+        host.to_str().unwrap(),
+        "/PROOF.TXT",
+    ]);
+
+    // Wrap it in an MBR at LBA 2048 — partition sizing only has meaning on a
+    // partitioned disk.
+    const START_LBA: u32 = 2048;
+    let vol_bytes = std::fs::read(&vol).unwrap();
+    let mut img = vec![0u8; START_LBA as usize * 512 + vol_bytes.len()];
+    img[START_LBA as usize * 512..].copy_from_slice(&vol_bytes);
+    let e = 0x1BE;
+    img[e + 1..e + 4].copy_from_slice(&[0xFE, 0xFF, 0xFF]); // CHS start (unused)
+    img[e + 4] = 0x06; // FAT16
+    img[e + 5..e + 8].copy_from_slice(&[0xFE, 0xFF, 0xFF]); // CHS end (unused)
+    img[e + 8..e + 12].copy_from_slice(&START_LBA.to_le_bytes());
+    img[e + 12..e + 16].copy_from_slice(&((vol_bytes.len() / 512) as u32).to_le_bytes());
+    img[510] = 0x55;
+    img[511] = 0xAA;
+    std::fs::write(&disk, &img).unwrap();
+
+    // Sanity: it reads as a partitioned FAT16 disk before we back it up.
+    let pre = run(&["ls", &format!("{}@1", disk.to_str().unwrap()), "/"]);
+    assert!(
+        String::from_utf8_lossy(&pre.stdout).contains("PROOF.TXT"),
+        "test setup is wrong - the partition should list before backup"
+    );
+
+    let backups = dir.path().join("bk");
+    std::fs::create_dir_all(&backups).unwrap();
+    run(&[
+        "backup",
+        disk.to_str().unwrap(),
+        backups.to_str().unwrap(),
+        "--name",
+        "shrink",
+        "--format",
+        format,
+        "--checksum",
+        "sha256",
+    ]);
+
+    let restored = dir.path().join("restored.img");
+    run(&[
+        "restore",
+        backups.join("shrink").to_str().unwrap(),
+        restored.to_str().unwrap(),
+        "--size",
+        "minimum",
+    ]);
+
+    // The partition entry must have shrunk. Read it straight out of the MBR
+    // rather than trusting a log line.
+    let out = std::fs::read(&restored).unwrap();
+    let part_sectors = u32::from_le_bytes([out[e + 12], out[e + 13], out[e + 14], out[e + 15]]);
+    let part_bytes = part_sectors as u64 * 512;
+    let original_bytes = vol_bytes.len() as u64;
+    assert!(
+        part_bytes < original_bytes,
+        "--size minimum left the partition at {part_bytes} bytes (original {original_bytes}) \
+         - the flag did nothing"
+    );
+
+    // ...and the shrunken partition must still be a readable filesystem with
+    // its file intact, which is the half a merely-smaller number doesn't prove.
+    let listing = run(&["ls", &format!("{}@1", restored.to_str().unwrap()), "/"]);
+    let text = String::from_utf8_lossy(&listing.stdout);
+    assert!(
+        text.contains("PROOF.TXT"),
+        "shrunk partition should still list its file, got:\n{text}"
+    );
+
+    let back = dir.path().join("back.txt");
+    run(&[
+        "get",
+        &format!("{}@1", restored.to_str().unwrap()),
+        "/PROOF.TXT",
+        back.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        std::fs::read(&back).unwrap(),
+        std::fs::read(&host).unwrap(),
+        "restored file contents differ from the original"
+    );
+}
