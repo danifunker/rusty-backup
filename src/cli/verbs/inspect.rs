@@ -45,6 +45,18 @@ pub struct InspectArgs {
 
 pub fn run(args: InspectArgs) -> Result<()> {
     require_non_flat(args.format, "inspect")?;
+    // `inspect` is whole-disk and takes a plain path, so an `@N` the user
+    // brought over from `ls` / `get` lands inside the filename and the open
+    // fails with a bare ENOENT. Say what actually happened.
+    if let Some((real, n)) = crate::cli::img_at::stray_selector(&args.image) {
+        anyhow::bail!(
+            "`inspect` reads the whole disk, so `@{n}` was taken as part of the \
+             filename. Drop it to inspect {}, or use `show fs-info {}@{n}` for \
+             just that partition.",
+            real.display(),
+            real.display()
+        );
+    }
     let pw_bytes = args.password.as_deref().map(|s| s.as_bytes());
     // Peel container *and* image-wrapper layers (CHD / GHO / zip / … plus
     // VHD / 2MG / DMG / DiskCopy 4.2) so inspect sees the same flat disk the

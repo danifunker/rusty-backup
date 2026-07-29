@@ -1053,3 +1053,31 @@ fn inspect_indices_are_the_numbers_the_selector_takes() {
         );
     }
 }
+
+/// `inspect` is whole-disk and takes a plain path, so an `@N` brought over
+/// from `ls` / `get` lands inside the filename. It used to fail with a bare
+/// `No such file or directory`, which reads as a missing file and led to the
+/// conclusion that the `@N` syntax was broken. It must explain itself.
+#[test]
+fn inspect_explains_a_stray_partition_selector() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let img = dir.path().join("disk.img");
+    let img_s = img.to_str().unwrap();
+    run(&["new", "volume", "fat", img_s, "--size", "8M"]);
+
+    let out = run_expect_fail(&["inspect", &format!("{img_s}@2")]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("whole disk") && err.contains("show fs-info"),
+        "should explain the selector and point at the per-partition verb, got:\n{err}"
+    );
+
+    // A genuinely missing file must still report as missing, not as a stray
+    // selector.
+    let missing = run_expect_fail(&["inspect", dir.path().join("absent.img").to_str().unwrap()]);
+    let missing_err = String::from_utf8_lossy(&missing.stderr);
+    assert!(
+        !missing_err.contains("whole disk"),
+        "missing file should not get the selector hint: {missing_err}"
+    );
+}
