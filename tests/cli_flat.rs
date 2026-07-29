@@ -968,3 +968,88 @@ fn octal_field(f: &[u8]) -> u32 {
         .collect();
     u32::from_str_radix(&s, 8).unwrap_or(0)
 }
+
+/// The number `inspect` prints must be the number the selectors take.
+///
+/// These were not the same. `IMG@N` resolves as `partitions[N - 1]`, while
+/// `inspect` printed `PartitionInfo::index` — the raw table slot, which MBR
+/// numbers from 0 (it enumerates its four entries before discarding the empty
+/// ones) and APM numbers from 1. So on an MBR image the listing named a
+/// partition and handed you the number of its neighbour. Reported from a G5,
+/// where the APM disk happened to agree and the MBR case did not.
+///
+/// Asserted end to end rather than on the text: each partition holds a
+/// differently-named file, so selecting by the printed index has to land on the
+/// matching content.
+#[test]
+fn inspect_indices_are_the_numbers_the_selector_takes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let one = dir.path().join("p1.img");
+    let two = dir.path().join("p2.img");
+    let host = dir.path().join("f.txt");
+    std::fs::write(&host, b"x").unwrap();
+
+    // Two FAT volumes, each carrying a file named after its partition.
+    for (vol, name) in [(&one, "/ONE.TXT"), (&two, "/TWO.TXT")] {
+        run(&[
+            "new",
+            "volume",
+            "fat",
+            vol.to_str().unwrap(),
+            "--size",
+            "16M",
+        ]);
+        run(&["put", vol.to_str().unwrap(), host.to_str().unwrap(), name]);
+    }
+
+    // Wrap them in an MBR. The first entry deliberately starts at LBA 2048, so
+    // slot number and list position cannot coincide by accident.
+    const SECTOR: u64 = 512;
+    const START1: u64 = 2048;
+    let vol_sectors = 16 * 1024 * 1024 / SECTOR;
+    let start2 = START1 + vol_sectors;
+    let mut disk = vec![0u8; ((start2 + vol_sectors) * SECTOR) as usize];
+    for (vol, start) in [(&one, START1), (&two, start2)] {
+        let bytes = std::fs::read(vol).unwrap();
+        let at = (start * SECTOR) as usize;
+        disk[at..at + bytes.len()].copy_from_slice(&bytes);
+    }
+    let mut entry = |off: usize, boot: u8, lba: u64| {
+        disk[off] = boot;
+        disk[off + 1..off + 4].copy_from_slice(&[0xfe, 0xff, 0xff]);
+        disk[off + 4] = 0x0e; // FAT16 LBA
+        disk[off + 5..off + 8].copy_from_slice(&[0xfe, 0xff, 0xff]);
+        disk[off + 8..off + 12].copy_from_slice(&(lba as u32).to_le_bytes());
+        disk[off + 12..off + 16].copy_from_slice(&(vol_sectors as u32).to_le_bytes());
+    };
+    entry(446, 0x80, START1);
+    entry(462, 0x00, start2);
+    disk[510] = 0x55;
+    disk[511] = 0xAA;
+    let img = dir.path().join("two_parts.img");
+    std::fs::write(&img, &disk).unwrap();
+    let img_s = img.to_str().unwrap();
+
+    // JSON is the machine-facing contract, so assert on it directly.
+    let out = run(&["inspect", img_s, "--format", "json"]);
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).expect("inspect JSON");
+    let rows = json["result"]["partitions"]
+        .as_array()
+        .expect("partitions array");
+    assert_eq!(rows.len(), 2, "{json}");
+    assert_eq!(rows[0]["index"], 1, "first partition is selector 1: {json}");
+    assert_eq!(
+        rows[1]["index"], 2,
+        "second partition is selector 2: {json}"
+    );
+
+    // The invariant that matters: the printed number selects that partition.
+    for (idx, want) in [(1, "ONE.TXT"), (2, "TWO.TXT")] {
+        let listing = run(&["ls", &format!("{img_s}@{idx}"), "/"]);
+        let text = String::from_utf8_lossy(&listing.stdout);
+        assert!(
+            text.contains(want),
+            "@{idx} should list {want}, got:\n{text}"
+        );
+    }
+}

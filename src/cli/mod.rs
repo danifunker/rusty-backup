@@ -224,7 +224,8 @@ pub enum Command {
     Grow(verbs::grow::GrowArgs),
 
     /// Whole-disk aggregate read-only view (partition table + per-partition
-    /// summary + CHD metadata when applicable).
+    /// summary + CHD metadata when applicable). The `idx` column is the
+    /// selector: pass it back as `IMG@N`, `--partition N` or `--partitions N`.
     Inspect(verbs::inspect::InspectArgs),
 
     /// Run the network daemon so a remote `rb-cli` (or the GUI / TUI Commander)

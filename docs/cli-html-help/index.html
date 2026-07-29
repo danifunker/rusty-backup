@@ -47,7 +47,7 @@
 <li><a href="get-binhex.html"><code>get-binhex</code></a><span class="desc">Extract a file and encode it as BinHex 4.0 (.hqx), preserving both forks and the type/creator codes</span></li>
 <li><a href="grow.html"><code>grow</code></a><span class="desc">Grow a disk image by `--add SIZE` of trailing zero-padding so a subsequent `partmap` edit can place a new partition</span></li>
 <li><a href="import.html"><code>import</code></a><span class="desc">Copy a host directory tree INTO a filesystem in an image — the bulk counterpart to `put`, with no tarball needed. `--expand-archives` unpacks tar archives found in the tree instead of copying them in whole</span></li>
-<li><a href="inspect.html"><code>inspect</code></a><span class="desc">Whole-disk aggregate read-only view (partition table + per-partition summary + CHD metadata when applicable)</span></li>
+<li><a href="inspect.html"><code>inspect</code></a><span class="desc">Whole-disk aggregate read-only view (partition table + per-partition summary + CHD metadata when applicable). The `idx` column is the selector: pass it back as `IMG@N`, `--partition N` or `--partitions N`</span></li>
 <li><a href="install-completions.html"><code>install-completions</code></a><span class="desc">Install shell completions to the user-scoped canonical location</span></li>
 <li><a href="locate.html"><code>locate</code></a><span class="desc">Print the absolute byte offset and length of a file inside an image (HFS only today). Output is JSON so build scripts that patch disk offsets into boot blocks can parse it with `jq`</span></li>
 <li><a href="ls.html"><code>ls</code></a><span class="desc">List a directory inside a filesystem</span></li>

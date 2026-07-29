@@ -806,7 +806,7 @@ Usage: import [OPTIONS] <IMAGE> <DIR> [DEST]
 
 ### `inspect`
 
-Whole-disk aggregate read-only view (partition table + per-partition summary + CHD metadata when applicable)
+Whole-disk aggregate read-only view (partition table + per-partition summary + CHD metadata when applicable). The `idx` column is the selector: pass it back as `IMG@N`, `--partition N` or `--partitions N`
 
 ```
 Usage: inspect [OPTIONS] <IMAGE>
