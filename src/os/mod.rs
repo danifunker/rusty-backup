@@ -16,6 +16,11 @@ pub mod macos;
 /// load-bearing on PowerPC.
 pub mod host_version;
 
+/// Device-list assembly for the Darwin platform modules. Deliberately not
+/// `cfg`-gated: it holds no syscalls, so keeping it compiled everywhere means
+/// its tests run on the development machine rather than only on a PowerPC Mac.
+pub mod darwin_devices;
+
 #[cfg(target_os = "linux")]
 pub mod linux;
 
