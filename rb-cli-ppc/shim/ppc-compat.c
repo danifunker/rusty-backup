@@ -13,10 +13,13 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <math.h>
+#include <poll.h>
 #include <stdarg.h>
 #include <sys/fcntl.h>
 #include <sys/ioctl.h>
+#include <sys/select.h>
 #include <sys/syscall.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 /*
@@ -129,4 +132,143 @@ int rb_compat_fcntl(int fd, int cmd, ...)
         return real_fcntl(fd, cmd, arg);
     }
     return (int)syscall(SYS_fcntl, fd, cmd, arg);
+}
+
+/*
+ * `poll` -- intercepted because Leopard's does not work on character devices.
+ *
+ * That is a broad claim, so it is measured rather than asserted:
+ * `probe/poll-devices.c` asks poll, select and kqueue about the same
+ * descriptor, across kinds. On 10.5.8:
+ *
+ *   descriptor kind                        poll        kqueue     select
+ *   stdin/tty, /dev/tty, pty master+slave  POLLNVAL    ENOTSUP    correct
+ *   /dev/null, /dev/zero, /dev/random      POLLNVAL    ENOTSUP    correct
+ *   regular file, fifo, unix socket        correct     ok         correct
+ *
+ * Every S_ISCHR descriptor, nothing else. Not an artifact of how the fd was
+ * obtained - a pty created in-process by openpty() fails identically - and not
+ * a "nothing to read" confusion: a pty slave with a byte already waiting still
+ * answers POLLNVAL rather than POLLIN. POSIX is explicit that an open
+ * descriptor must never yield POLLNVAL, so this is the kernel, not the caller.
+ *
+ * This is the second override in this file rather than a missing symbol, and it
+ * earns its place because it is not one crate's problem: anything that waits
+ * for a keypress goes through poll. `rb-cli tui` dies with "Failed to
+ * initialize input reader", and rustyline's line editor (`src/tty/unix.rs`)
+ * waits the same way.
+ *
+ * kqueue is not an escape - the table above shows EVFILT_READ returning ENOTSUP
+ * (45) on the same descriptors, which is what breaks crossterm's default (mio)
+ * event source and is why the PowerPC build selects crossterm's `use-dev-tty`
+ * source. That leaves select(2) as the only readiness primitive Leopard offers
+ * for a terminal, so poll is reimplemented on top of it.
+ *
+ * Conservative on purpose: the real poll runs first and its answer is kept
+ * unless it claims POLLNVAL for a descriptor that `F_GETFD` says is open. Only
+ * then do we redo the wait with select. Sockets and pipes - where this poll
+ * behaves - are therefore untouched, and the emulation's rougher edges (no
+ * distinct POLLHUP; POLLPRI approximated by select's exceptfds) apply only to
+ * the case that was already broken.
+ */
+static int rb_compat_poll_via_select(struct pollfd *fds, nfds_t nfds, int timeout)
+{
+    fd_set rd, wr, ex;
+    struct timeval tv;
+    struct timeval *ptv;
+    int maxfd = -1;
+    int rc;
+    int ready = 0;
+    nfds_t i;
+
+    FD_ZERO(&rd);
+    FD_ZERO(&wr);
+    FD_ZERO(&ex);
+
+    for (i = 0; i < nfds; i++) {
+        fds[i].revents = 0;
+        if (fds[i].fd < 0) {
+            continue;
+        }
+        /* select cannot express a descriptor past the set's fixed width; say
+         * so rather than smash the stack the way FD_SET would. */
+        if (fds[i].fd >= FD_SETSIZE) {
+            errno = EINVAL;
+            return -1;
+        }
+        if (fds[i].events & POLLIN) {
+            FD_SET(fds[i].fd, &rd);
+        }
+        if (fds[i].events & POLLOUT) {
+            FD_SET(fds[i].fd, &wr);
+        }
+        FD_SET(fds[i].fd, &ex);
+        if (fds[i].fd > maxfd) {
+            maxfd = fds[i].fd;
+        }
+    }
+
+    if (timeout < 0) {
+        ptv = 0; /* block indefinitely */
+    } else {
+        tv.tv_sec = timeout / 1000;
+        tv.tv_usec = (timeout % 1000) * 1000;
+        ptv = &tv;
+    }
+
+    rc = select(maxfd + 1, &rd, &wr, &ex, ptv);
+    if (rc <= 0) {
+        return rc; /* timeout (0) or error (-1, errno already set) */
+    }
+
+    for (i = 0; i < nfds; i++) {
+        if (fds[i].fd < 0) {
+            continue;
+        }
+        if (FD_ISSET(fds[i].fd, &rd)) {
+            fds[i].revents |= POLLIN;
+        }
+        if (FD_ISSET(fds[i].fd, &wr)) {
+            fds[i].revents |= POLLOUT;
+        }
+        if (FD_ISSET(fds[i].fd, &ex)) {
+            fds[i].revents |= POLLPRI;
+        }
+        if (fds[i].revents != 0) {
+            ready++;
+        }
+    }
+    return ready;
+}
+
+int rb_compat_poll(struct pollfd *fds, nfds_t nfds, int timeout) __asm__("_poll");
+
+int rb_compat_poll(struct pollfd *fds, nfds_t nfds, int timeout)
+{
+    static int (*real_poll)(struct pollfd *, nfds_t, int);
+    int rc;
+    nfds_t i;
+
+    if (real_poll == 0) {
+        real_poll = (int (*)(struct pollfd *, nfds_t, int))dlsym(RTLD_NEXT, "poll");
+    }
+    if (real_poll == 0) {
+        return rb_compat_poll_via_select(fds, nfds, timeout);
+    }
+
+    rc = real_poll(fds, nfds, timeout);
+    if (rc <= 0) {
+        return rc;
+    }
+
+    /* A POLLNVAL on a descriptor that is demonstrably open is the Leopard bug,
+     * not the caller's mistake. Redo the whole wait with select; a genuinely
+     * closed fd keeps poll's verdict. */
+    for (i = 0; i < nfds; i++) {
+        if ((fds[i].revents & POLLNVAL) && fds[i].fd >= 0
+            && fcntl(fds[i].fd, F_GETFD) != -1) {
+            return rb_compat_poll_via_select(fds, nfds, timeout);
+        }
+    }
+    return rc;
 }

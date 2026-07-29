@@ -59,6 +59,17 @@ export CC_powerpc_apple_darwin="$PPC_CC_WRAPPER"
 # `ar` writes a System V symbol table and Apple's linker wants a Mach-O
 # __.SYMDEF, so the archive has to be built on the Mac as well.
 export AR_powerpc_apple_darwin="$PPC_AR_WRAPPER"
+# The compat shim (lgammaf_r, and the fcntl/poll overrides) has to be on the
+# final link line or libstd's references to it go unresolved. ppc-cc-remote.py
+# reads it from PPC_SHIM and simply omits it when unset - so a build driven by
+# this script used to end in
+#
+#     Undefined symbols: "_lgammaf_r", referenced from: ... in libstd.rlib.o
+#
+# after every crate had compiled, with nothing in the log mentioning the shim.
+# The manual link in docs/build-ppc-mrustc.md always passed it; the script did
+# not. There is no build that wants it unset, so default it here.
+export PPC_SHIM="${PPC_SHIM:-$CRATE_DIR/shim/ppc-compat.c}"
 # The G5 has 2 cores; the transpile is local and parallel, the compiles are not.
 PPC_JOBS="${PPC_JOBS:-3}"
 # OVERRIDE_SUFFIX is chosen from the *host* OS by minicargo.mk, so a cross build

@@ -453,10 +453,31 @@ produce **output identical to the desktop build**, and a `backup --format zstd
 bug surfaced and is fixed: `File::try_clone` uses `F_DUPFD_CLOEXEC`, which
 Leopard does not have (see the shim entry in `build-ppc-mrustc.md`).
 
-What is left here is breadth rather than depth: `restore`, richer filesystems
-(FAT / HFS / Amiga rather than the CBM and CP/M images used so far), and a CHD
-backup. `scripts/` has no smoke-test driver checked in yet - the comparison was
-run ad hoc.
+Two more real bugs came out of first contact with the binary, and both are
+fixed:
+
+- **`rb-cli tui` could not start** - "Failed to initialize input reader". Not a
+  crossterm bug: Darwin 9 cannot watch a character device with *either* `poll`
+  or `kqueue`, `select` being the only primitive that works on a terminal. The
+  fix is a `poll`-on-`select` entry in the shim plus crossterm's `use-dev-tty`
+  source. Measured and written up in `build-ppc-mrustc.md`; the TUI now renders
+  and takes keys on 10.5. This also un-breaks rustyline, which waits the same way.
+- **`rb-cli inspect /dev/disk0` aborted** with "capacity overflow" after minutes
+  of I/O. An engine bug, not a PowerPC one: `fs::resource_fork.rs`'s MacBinary
+  probe read whatever path it was handed in full, so a raw device was slurped
+  until the `Vec` passed `isize::MAX` - which 32-bit PowerPC reaches at 2 GB.
+  Every platform was paying it (a 1 GiB image cost 1 GiB of RSS to `inspect`);
+  the 128-byte header gate that fixes it took `inspect /dev/disk1` on the G5
+  from **6.35 s to 0.11 s**.
+
+Re-verified after those fixes, desktop vs PowerPC on the same FAT and HFS
+images: `inspect` / `ls` / `fsck` outputs **identical** for both, and a
+`backup --format zstd --checksum sha256` whose payload and `.sha256` sidecar are
+**byte-identical**, `metadata.json` differing only in `created`.
+
+What is left here is breadth rather than depth: `restore`, Amiga filesystems,
+and a CHD backup. `scripts/` has no smoke-test driver checked in yet - the
+comparison is still run ad hoc.
 
 **Phase 4 - the hand-C platform shell.** Reattach `os/` as C: device enumeration,
 `/dev/rdiskN`, unmount, elevation, reusing `ppc-tiger/`. Deliverable:

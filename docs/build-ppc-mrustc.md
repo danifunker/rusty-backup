@@ -409,8 +409,21 @@ Stages, in order:
 
 ### Traps in the build loop
 
-Nine that have each cost real time:
+Ten that have each cost real time:
 
+- **The shim only reaches the link line if `PPC_SHIM` is set.** `ppc-cc-remote.py`
+  reads it from the environment and quietly links without the shim when it is
+  unset - so `build-ppc.sh ppc`, which never set it, compiled all 388 crates and
+  then died at the last step with
+
+  ```
+  Undefined symbols: "_lgammaf_r", referenced from: ... in libstd.rlib.o
+  ```
+
+  Nothing in the log mentions the shim, and the symbol it names belongs to
+  libstd, so the error points away from the cause. Earlier links worked because
+  the manual command in this document passes `PPC_SHIM` explicitly. `build-ppc.sh`
+  now defaults it; no build wants it unset.
 - **The vendor patches must not rewrite an unchanged file.** `sed >tmp && mv tmp
   file` bumps the mtime every run even when the content is already patched, and
   minicargo is timestamp-driven - so crc went dirty on *every* build, taking
@@ -1104,6 +1117,63 @@ undecorated name:
 
 ```sh
 nm -g ppc-xbuild/shim/ppc-compat.o | grep fcntl     # want: T _fcntl
+```
+
+### Leopard cannot watch a terminal with `poll` or `kqueue`
+
+`rb-cli tui` came up as:
+
+```
+error: Failed to initialize input reader
+```
+
+which is crossterm's, and is a *lost* error: `InternalEventReader::default()`
+builds its event source with `UnixInternalEventSource::new().ok()`, so whatever
+the kernel said is discarded and only resurfaces as that string when `poll()`
+later finds `source == None`. There is nothing to read in the message itself.
+
+`probe/kqueue-tty.c` replays that init call by call, and found the kernel
+refusing to watch the terminal. The obvious next move - crossterm's
+`use-dev-tty` feature, whose event source waits with `poll(2)` instead of
+kqueue - is *also* broken here, which would have cost a full rebuild to
+discover. `probe/poll-devices.c` therefore asks all three primitives about the
+same descriptor, across descriptor kinds:
+
+| descriptor | `poll` | `kqueue` (`EVFILT_READ`) | `select` |
+|---|---|---|---|
+| stdin (a tty), `/dev/tty` | `POLLNVAL` | `ENOTSUP` (45) | correct |
+| `openpty()` master **and** slave | `POLLNVAL` | `ENOTSUP` (45) | correct |
+| pty slave with a byte already waiting | `POLLNVAL` | `ENOTSUP` (45) | correct |
+| `/dev/null`, `/dev/zero`, `/dev/random` | `POLLNVAL` | `ENOTSUP` (45) | correct |
+| regular file, fifo, unix socket | correct | ok | correct |
+
+Every `S_ISCHR` descriptor, and nothing else. It is not an artifact of how the
+descriptor was obtained - a pty created in-process by `openpty()` fails the same
+way as one inherited from ssh - and not a "nothing to read yet" confusion: a pty
+slave with a byte pending still answers `POLLNVAL` instead of `POLLIN`. POSIX
+requires that an open descriptor never yield `POLLNVAL`, so this is the kernel.
+`select(2)` answers correctly for every row.
+
+Two changes follow, and both are needed:
+
+- **`shim/ppc-compat.c` reimplements `poll` on `select`.** Conservatively: the
+  real `poll` runs first and its answer stands unless it claims `POLLNVAL` for a
+  descriptor that `F_GETFD` says is open. Sockets and pipes, where this `poll`
+  works, are untouched. The same `_poll` asm-label trick as `fcntl` applies.
+  This is the right layer because it is not one crate's problem - rustyline's
+  line editor (`src/tty/unix.rs`) waits on the terminal the same way.
+- **`rb-cli-ppc/Cargo.toml` selects crossterm's `use-dev-tty`**, so crossterm
+  waits with `poll` (now working) rather than kqueue (unfixable from userspace).
+  Costs one crate, `filedescriptor` - which pulls `thiserror` 1.x alongside the
+  2.x already in the graph, so three crates in total. `rustix/process`, the
+  feature's other requirement, is already there.
+
+Verify the shim on the machine before rebuilding anything - `probe/poll-shim-test.c`
+links against it and checks the tty case, the pipe case (must still take the
+kernel path) and a genuinely closed descriptor (must still report `POLLNVAL`):
+
+```sh
+gcc -o /tmp/poll-shim-test poll-shim-test.c ../shim/ppc-compat.c && /tmp/poll-shim-test
 ```
 
 What still needs checking is struct *layout*, and that is the dangerous class:

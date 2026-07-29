@@ -159,7 +159,16 @@ globset = ">=0.4, <0.4.17"
 # DEVIATION (see header): default-features = false to drop `custom-bindings`,
 # which is the only thing pulling `radix_trie` (mrustc lifetime gap).
 rustyline = { version = ">=12, <15", default-features = false, features = ["with-file-history", "with-dirs"] }
-crossterm = "0.28"
+# DEVIATION (see header): `use-dev-tty`. crossterm's default event source waits
+# on the terminal with kqueue, and Darwin 9 cannot do that - `EVFILT_READ` on a
+# tty returns ENOTSUP (45), measured by probe/kqueue-tty.c - so `rb-cli tui`
+# fails at startup with "Failed to initialize input reader". This feature
+# selects the source that waits with poll(2) instead. Leopard's poll is itself
+# broken on character devices (it answers POLLNVAL), which shim/ppc-compat.c
+# fixes by reimplementing poll on select(2) - the one primitive that does work
+# on a terminal here. Costs one crate, `filedescriptor`; `rustix/process`, the
+# feature's other requirement, is already in the graph.
+crossterm = { version = "0.28", features = ["use-dev-tty"] }
 shell-words = "1.1.1"
 lzma-rs = "0.3.0"
 lzfse_rust = "0.2.1"
