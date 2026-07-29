@@ -10,6 +10,7 @@
  * Built and linked by scripts/ppc-cc-remote.py (see PPC_SHIM).
  */
 
+#include <dirent.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <math.h>
@@ -132,6 +133,48 @@ int rb_compat_fcntl(int fd, int cmd, ...)
         return real_fcntl(fd, cmd, arg);
     }
     return (int)syscall(SYS_fcntl, fd, cmd, arg);
+}
+
+/*
+ * `opendir` -- intercepted so it returns a DIR the 64-bit-inode `readdir` can
+ * actually read.
+ *
+ * libstd links a crossed pair on this target, which `nm -u` shows plainly:
+ *
+ *     _opendir            (legacy)
+ *     _readdir$INODE64    (64-bit inode)
+ *
+ * Those are two ABIs. A DIR opened by the legacy call is not one that
+ * `readdir$INODE64` can walk, and the failure mode is silence: no error, no
+ * garbage, just **zero entries**.
+ *
+ * It hid for a long time because it is filesystem-dependent. Measured by
+ * `probe/opendir-abi.c` on 10.5.8:
+ *
+ *     /usr/lib   legacy pair -> 392 entries    matched pair -> 392 entries
+ *     /dev       legacy pair ->   0 entries    matched pair -> 313 entries
+ *
+ * So HFS+ tolerates the crossed pair and devfs does not - which is why an
+ * earlier check that `read_dir` "works" (it counted /usr/lib correctly) was
+ * true and still missed this, and why the symptom that surfaced it was
+ * `enumerate_devices` finding no disks rather than anything about directories.
+ *
+ * The matching call is `opendir$INODE64$UNIX2003`. The doubled suffix matters:
+ * searching for a plain `opendir$INODE64` finds nothing and reads as "10.5 has
+ * no 64-bit opendir", which is the wrong conclusion.
+ *
+ * `closedir` needs no equivalent - it has no `$INODE64` variant, so it is
+ * version-agnostic. `rewinddir` / `seekdir` / `telldir` do have one each; libstd
+ * does not reference them today, and they are left alone rather than
+ * speculatively overridden.
+ */
+extern DIR *rb_compat_opendir_inode64(const char *) __asm__("_opendir$INODE64$UNIX2003");
+
+DIR *rb_compat_opendir(const char *path) __asm__("_opendir");
+
+DIR *rb_compat_opendir(const char *path)
+{
+    return rb_compat_opendir_inode64(path);
 }
 
 /*

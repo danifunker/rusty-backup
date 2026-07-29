@@ -1119,6 +1119,45 @@ undecorated name:
 nm -g ppc-xbuild/shim/ppc-compat.o | grep fcntl     # want: T _fcntl
 ```
 
+### `read_dir` returns nothing on devfs (the crossed `opendir` ABI)
+
+Device enumeration came back empty on 10.5 while the *same* enumeration written
+in C (`probe/devlist.c`) listed `/dev` correctly. The difference is visible in
+the symbol table:
+
+```sh
+nm -u rb-cli | grep -iE 'dir'
+    _opendir              # legacy
+    _readdir$INODE64      # 64-bit inode
+```
+
+libstd links a crossed pair. On Darwin those are two ABIs - `readdir$INODE64`
+yields the 64-bit `dirent`, and the `DIR` has to have been opened by the
+matching call - and crossing them does not fail. It returns **zero entries**.
+
+What makes this one nasty is that it is filesystem-dependent, measured by
+`probe/opendir-abi.c`:
+
+| directory | legacy `opendir` + `readdir$INODE64` | matched pair |
+|---|---|---|
+| `/usr/lib` | 392 entries | 392 entries |
+| `/dev` | **0 entries** | 313 entries |
+
+HFS+ tolerates the crossed pair; devfs does not. So the earlier check that
+`read_dir` "works on 10.5" - it counted `/usr/lib` correctly - was true and
+still missed this, and the symptom surfaced years away from the cause, as
+`enumerate_devices` finding no disks.
+
+The matching call is **`opendir$INODE64$UNIX2003`**. The doubled suffix is the
+detail worth remembering: searching for a plain `opendir$INODE64` finds nothing
+and reads as "Leopard has no 64-bit opendir", which is the wrong conclusion and
+sends you looking at the wrong layer. `closedir` has no `$INODE64` variant and
+needs no shim; `rewinddir` / `seekdir` / `telldir` each have one, and libstd
+does not currently reference them.
+
+Fixed by an `_opendir` entry in `shim/ppc-compat.c`, so it is a **link-line
+change** - a relink, about two minutes, not an 80-minute engine rebuild.
+
 ### Leopard cannot watch a terminal with `poll` or `kqueue`
 
 `rb-cli tui` came up as:
@@ -1168,12 +1207,12 @@ Two changes follow, and both are needed:
   2.x already in the graph, so three crates in total. `rustix/process`, the
   feature's other requirement, is already there.
 
-Verify the shim on the machine before rebuilding anything - `probe/poll-shim-test.c`
+Verify the shim on the machine before rebuilding anything - `probe/shim-test.c`
 links against it and checks the tty case, the pipe case (must still take the
 kernel path) and a genuinely closed descriptor (must still report `POLLNVAL`):
 
 ```sh
-gcc -o /tmp/poll-shim-test poll-shim-test.c ../shim/ppc-compat.c && /tmp/poll-shim-test
+gcc -D_DARWIN_USE_64_BIT_INODE -o /tmp/shim-test shim-test.c ../shim/ppc-compat.c && /tmp/shim-test
 ```
 
 What still needs checking is struct *layout*, and that is the dangerous class:

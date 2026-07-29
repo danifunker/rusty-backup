@@ -1,10 +1,10 @@
 /*
- * poll-shim-test.c -- exercise the `poll` override in shim/ppc-compat.c.
+ * shim-test.c -- exercise the overrides in shim/ppc-compat.c.
  *
  * Link this against the shim and run it on a terminal:
  *
- *   gcc -o /tmp/poll-shim-test poll-shim-test.c ../shim/ppc-compat.c
- *   /tmp/poll-shim-test          # via ssh -tt, or at the console
+ *   gcc -D_DARWIN_USE_64_BIT_INODE -o /tmp/shim-test shim-test.c ../shim/ppc-compat.c
+ *   /tmp/shim-test               # via ssh -tt, or at the console
  *
  * The call goes through the *undecorated* `_poll`, which is what mrustc's
  * generated C references (it is compiled without the SDK headers, so it never
@@ -20,6 +20,7 @@
  *                         paper over an actual caller error
  */
 
+#include <dirent.h>
 #include <errno.h>
 #include <poll.h>
 #include <stdio.h>
@@ -27,6 +28,9 @@
 #include <unistd.h>
 
 extern int rb_test_poll(struct pollfd *, nfds_t, int) __asm__("_poll");
+/* libstd calls the undecorated names; so does this test, deliberately. */
+extern DIR *rb_test_opendir(const char *) __asm__("_opendir");
+extern struct dirent *rb_test_readdir(DIR *) __asm__("_readdir$INODE64");
 
 static int failures;
 
@@ -92,6 +96,23 @@ int main(void)
 	sprintf(buf, "rc=%d revents=0x%04x", rc, pfd.revents);
 	check("poll(closed fd) still reports POLLNVAL",
 	      rc == 1 && (pfd.revents & POLLNVAL), buf);
+
+	printf("== 4. /dev listing (opendir + readdir$INODE64 must agree) ==\n");
+	{
+		DIR *d = rb_test_opendir("/dev");
+		struct dirent *e;
+		int total = 0, found_disk = 0;
+		while (d && (e = rb_test_readdir(d)) != NULL) {
+			total++;
+			if (strncmp(e->d_name, "disk", 4) == 0)
+				found_disk = 1;
+		}
+		if (d)
+			closedir(d);
+		sprintf(buf, "entries=%d disk*=%s", total, found_disk ? "yes" : "no");
+		check("readdir sees /dev through the shim's opendir",
+		      total > 0 && found_disk, buf);
+	}
 
 	printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "all good",
 	       failures, failures == 1 ? "" : "s");
