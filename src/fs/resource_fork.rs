@@ -304,10 +304,25 @@ pub fn detect_resource_fork(host_path: &std::path::Path) -> Option<ImportedResou
         }
     }
 
-    // 3. MacBinary — check if the file itself is a MacBinary container
-    if let Ok(mb_data) = std::fs::read(host_path) {
-        if let Some(parsed) = parse_macbinary(&mb_data) {
-            return Some(parsed);
+    // 3. MacBinary — check if the file itself is a MacBinary container.
+    //
+    // Peek the 128-byte header before reading the whole thing. `host_path` is
+    // whatever the user named, and that is not always a regular file:
+    // `rb-cli inspect /dev/disk0` lands here, where an unguarded read pulls the
+    // entire disk into RAM. On a 64-bit host that is "merely" a 238 GiB read;
+    // on 32-bit PowerPC the Vec passes `isize::MAX` and the process aborts with
+    // "capacity overflow" after minutes of I/O. Even for ordinary files the old
+    // form read every byte of a multi-GB image only to reject it — an `inspect`
+    // of a 1 GiB image peaked at 1 GiB RSS.
+    if is_regular_file(host_path) {
+        if let Some(head) = read_header_128(host_path) {
+            if macbinary_header_ok(&head) {
+                if let Ok(mb_data) = std::fs::read(host_path) {
+                    if let Some(parsed) = parse_macbinary(&mb_data) {
+                        return Some(parsed);
+                    }
+                }
+            }
         }
     }
 
@@ -432,6 +447,49 @@ pub fn parse_appledouble(data: &[u8]) -> Option<ImportedResourceFork> {
         type_code,
         creator_code,
     })
+}
+
+/// Whether `path` is a regular file — i.e. something it is safe to read whole.
+/// A device node, FIFO or directory is not: reading one is either unbounded or
+/// meaningless, and [`detect_resource_fork`] is reached with raw device paths
+/// (`rb-cli inspect /dev/disk0`).
+fn is_regular_file(path: &std::path::Path) -> bool {
+    std::fs::metadata(path)
+        .map(|m| m.file_type().is_file())
+        .unwrap_or(false)
+}
+
+/// Read just the 128-byte container header. `None` if the file is shorter than
+/// that or unreadable — either way it cannot be a MacBinary container.
+fn read_header_128(path: &std::path::Path) -> Option<[u8; 128]> {
+    use std::io::Read as _;
+    let mut head = [0u8; 128];
+    let mut f = std::fs::File::open(path).ok()?;
+    f.read_exact(&mut head).ok()?;
+    Some(head)
+}
+
+/// Header-only precondition for [`parse_macbinary`]: every check that function
+/// makes against the first 128 bytes, and nothing else.
+///
+/// Deliberately *not* [`crate::macarchive::macbinary::is_macbinary`], which is a
+/// different predicate — it accepts a MacBinary I on an exact whole-file size
+/// match, which a header alone cannot establish, and it rejects some headers
+/// `parse_macbinary` would take. Gating on it would silently change which files
+/// yield a resource fork. Keep this in step with `parse_macbinary` if that
+/// function's header checks ever change.
+fn macbinary_header_ok(head: &[u8; 128]) -> bool {
+    if head[0] != 0 {
+        return false;
+    }
+    let name_len = head[1] as usize;
+    if name_len == 0 || name_len > 63 {
+        return false;
+    }
+    if head[122] != 129 && head[122] != 130 {
+        return false;
+    }
+    BigEndian::read_u16(&head[124..126]) == macbinary_crc16(&head[0..124])
 }
 
 /// Parse a MacBinary (II/III) file and extract both forks and Finder info.
@@ -758,5 +816,54 @@ mod tests {
         assert_eq!(BigEndian::read_u16(&ad[24..26]), 2);
         // Second descriptor is the resource fork (id 2), not a dates entry.
         assert_eq!(BigEndian::read_u32(&ad[38..42]), 2);
+    }
+
+    /// The 128-byte gate must accept exactly what `parse_macbinary` accepts —
+    /// it exists to avoid reading a whole file to reach the same verdict, not
+    /// to change it.
+    #[test]
+    fn macbinary_header_gate_agrees_with_the_parser() {
+        let mb = build_macbinary(
+            "note.txt",
+            b"TEXT",
+            b"ttxt",
+            MacFileDates::default(),
+            b"data",
+            &[0xAA, 0xBB],
+        );
+        let head: [u8; 128] = mb[..128].try_into().unwrap();
+        assert!(macbinary_header_ok(&head));
+        assert!(parse_macbinary(&mb).is_some());
+
+        // An APM Driver Descriptor Record — byte 0 is 'E' of "ER", the first
+        // thing `rb-cli inspect /dev/disk0` reads. Rejected on the header.
+        let mut ddr = [0u8; 128];
+        ddr[0] = b'E';
+        ddr[1] = b'R';
+        assert!(!macbinary_header_ok(&ddr));
+        assert!(parse_macbinary(&ddr).is_none());
+    }
+
+    /// `detect_resource_fork` probes whether the path *itself* is a MacBinary
+    /// container, and it is reached with paths the user typed — including raw
+    /// devices (`rb-cli inspect /dev/disk0`). Reading one of those is
+    /// unbounded: on 32-bit PowerPC it aborts with "capacity overflow" once the
+    /// Vec passes `isize::MAX`, after minutes of I/O.
+    ///
+    /// A FIFO stands in for the device here: before the `is_regular_file` guard
+    /// this call blocked forever on a reader with no writer.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn non_regular_paths_are_not_read_whole() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe");
+        let c_path = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) }, 0);
+
+        assert!(!is_regular_file(&fifo));
+        assert!(detect_resource_fork(&fifo).is_none());
     }
 }
