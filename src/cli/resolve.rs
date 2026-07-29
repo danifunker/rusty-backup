@@ -651,9 +651,16 @@ fn resolve_with_override<R: Read + Seek>(
 ///   extended container, not bootable-only, not Apple_Driver*), pick it.
 /// - Otherwise raise an error listing the candidates.
 fn pick_default_partition(partitions: &[PartitionInfo]) -> Result<PartitionInfo> {
-    let candidates: Vec<&PartitionInfo> = partitions
+    // Each candidate keeps its *position* in `partitions`, because that - not
+    // `PartitionInfo::index` - is what the selector means: the caller above
+    // resolves `@N` as `partitions[N - 1]`, precisely because `index` is 0- or
+    // 1-based depending on the table type. Listing `index` here would print a
+    // number that selects a different partition on any table where the two
+    // disagree.
+    let candidates: Vec<(usize, &PartitionInfo)> = partitions
         .iter()
-        .filter(|p| {
+        .enumerate()
+        .filter(|(_, p)| {
             !p.is_extended_container
                 && !p
                     .partition_type_string
@@ -664,19 +671,27 @@ fn pick_default_partition(partitions: &[PartitionInfo]) -> Result<PartitionInfo>
         .collect();
     match candidates.len() {
         0 => bail!("no usable partition found in image"),
-        1 => Ok(candidates[0].clone()),
+        1 => Ok(candidates[0].1.clone()),
         _ => {
+            // Size, not `partition_type_byte`: the byte is an MBR concept and
+            // reads `(0)` for every row on APM/GPT/RDB, which tells the user
+            // nothing. The size is what distinguishes two same-typed volumes.
             let summary: Vec<String> = candidates
                 .iter()
-                .map(|p| {
+                .map(|(pos, p)| {
                     format!(
-                        "  {}  {}  ({})",
-                        p.index, p.type_name, p.partition_type_byte
+                        "  {}  {:<28}  {}",
+                        pos + 1,
+                        p.type_name,
+                        crate::partition::format_size(p.size_bytes)
                     )
                 })
                 .collect();
+            let example = candidates[0].0 + 1;
             bail!(
-                "image has multiple FS partitions; pass `IMG@N` or `--partition N` to pick one:\n{}",
+                "image has multiple filesystem partitions; select one by appending \
+                 `@N` to the image path (e.g. `IMAGE@{example}`) or with \
+                 `--partition {example}`:\n{}",
                 summary.join("\n")
             )
         }
@@ -754,5 +769,102 @@ impl FsDispatchOverride {
             ctx.type_byte = 0; // Force string-dispatch
             ctx.label = format!("{} [--fs-type {}]", ctx.label, t);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn part(index: usize, type_name: &str, apm_type: Option<&str>, size: u64) -> PartitionInfo {
+        PartitionInfo {
+            index,
+            type_name: type_name.to_string(),
+            partition_type_byte: 0,
+            start_lba: 0,
+            start_byte: None,
+            size_bytes: size,
+            bootable: false,
+            is_logical: false,
+            is_extended_container: false,
+            partition_type_string: apm_type.map(|s| s.to_string()),
+            hfs_block_size: None,
+            rdb_part_block: None,
+            drv_name: None,
+        }
+    }
+
+    /// The ambiguity error has to name the number that actually selects the
+    /// partition. `@N` resolves as `partitions[N - 1]`, so the listing must be
+    /// positional - `PartitionInfo::index` is 0- or 1-based depending on the
+    /// table type, and printing it would hand the user a number that picks a
+    /// different volume. The `index` values here disagree with position on
+    /// purpose.
+    #[test]
+    fn ambiguity_error_numbers_partitions_by_selector_position() {
+        let parts = vec![
+            part(
+                70,
+                "Apple_HFS (untitled)",
+                Some("Apple_HFS"),
+                256 * 1024 * 1024,
+            ),
+            part(
+                80,
+                "Apple_HFS (Untitled)",
+                Some("Apple_HFS"),
+                85 * 1024 * 1024 * 1024,
+            ),
+            part(
+                90,
+                "Apple_UNIX_SVR2 (untitled)",
+                Some("Apple_UNIX_SVR2"),
+                80 * 1024 * 1024 * 1024,
+            ),
+        ];
+        let err = pick_default_partition(&parts).unwrap_err().to_string();
+
+        for (pos, needle) in [
+            (1, "Apple_HFS (untitled)"),
+            (3, "Apple_UNIX_SVR2 (untitled)"),
+        ] {
+            let line = err
+                .lines()
+                .find(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("no line for {needle} in:\n{err}"));
+            assert_eq!(
+                line.split_whitespace().next(),
+                Some(pos.to_string().as_str()),
+                "line should lead with selector position {pos}: {line}"
+            );
+        }
+        assert!(
+            !err.contains("70"),
+            "must not print PartitionInfo::index:\n{err}"
+        );
+        // Size, so two same-typed volumes can be told apart - and not the MBR
+        // type byte, which is `(0)` for every row on APM.
+        assert!(
+            err.contains(&crate::partition::format_size(80 * 1024 * 1024 * 1024)),
+            "sizes should be listed:\n{err}"
+        );
+        assert!(!err.contains("(0)"), "type byte is noise on APM:\n{err}");
+    }
+
+    /// The APM partition map is a wrapper, not a volume: with it filtered out
+    /// a single real filesystem must resolve without an ambiguity error.
+    #[test]
+    fn partition_map_entry_is_not_a_candidate() {
+        let parts = vec![
+            part(
+                1,
+                "Apple_partition_map",
+                Some("Apple_partition_map"),
+                32 * 1024,
+            ),
+            part(2, "Apple_HFS (Untitled)", Some("Apple_HFS"), 1024 * 1024),
+        ];
+        let picked = pick_default_partition(&parts).expect("one real filesystem");
+        assert_eq!(picked.type_name, "Apple_HFS (Untitled)");
     }
 }
