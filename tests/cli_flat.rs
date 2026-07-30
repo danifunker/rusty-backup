@@ -1302,3 +1302,154 @@ fn restore_at_minimum_shrinks_with_format(format: &str) {
         "restored file contents differ from the original"
     );
 }
+
+/// Replacing a file must keep what the file carried.
+///
+/// A replace writes new *contents*; it is not a request to reset who may read
+/// the file, when it was made, or which application owns it. The old path
+/// deleted the entry and recreated it, so everything except xattrs and the
+/// POSIX triple was silently dropped - and the generic BINA/???? fallback fired
+/// before any preservation could, so replacing a TEXT/MSWD document turned it
+/// into a BINA blob.
+#[test]
+fn replacing_a_file_preserves_its_type_and_creator() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let img = dir.path().join("h.img");
+    let a = dir.path().join("a.txt");
+    let b = dir.path().join("b.txt");
+    std::fs::write(&a, b"original\n").unwrap();
+    std::fs::write(&b, b"replacement-longer\n").unwrap();
+
+    run(&["new", "floppy", "hfs", img.to_str().unwrap()]);
+    run(&[
+        "put",
+        img.to_str().unwrap(),
+        a.to_str().unwrap(),
+        "/DOC",
+        "--type",
+        "TEXT",
+        "--creator",
+        "MSWD",
+    ]);
+
+    let listing = |img: &std::path::Path| -> String {
+        let out = run(&["ls", img.to_str().unwrap(), "/"]);
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find(|l| l.contains("DOC"))
+            .unwrap_or_default()
+            .to_string()
+    };
+    assert!(listing(&img).contains("TEXT MSWD"), "setup");
+
+    // Default replace: type/creator survive, contents do not.
+    run(&[
+        "put",
+        img.to_str().unwrap(),
+        b.to_str().unwrap(),
+        "/DOC",
+        "--force",
+    ]);
+    let after = listing(&img);
+    assert!(
+        after.contains("TEXT MSWD"),
+        "type/creator should survive a replace, got: {after}"
+    );
+    assert!(
+        after.contains("19"),
+        "the contents should still have been replaced, got: {after}"
+    );
+
+    // Explicit flags outrank the preserved values - they are an instruction.
+    run(&[
+        "put",
+        img.to_str().unwrap(),
+        a.to_str().unwrap(),
+        "/DOC",
+        "--force",
+        "--type",
+        "APPL",
+        "--creator",
+        "RBKP",
+    ]);
+    assert!(
+        listing(&img).contains("APPL RBKP"),
+        "an explicit --type must win over preservation"
+    );
+
+    // And the opt-out really opts out.
+    run(&[
+        "put",
+        img.to_str().unwrap(),
+        b.to_str().unwrap(),
+        "/DOC",
+        "--force",
+        "--no-preserve-meta",
+    ]);
+    let fresh = listing(&img);
+    assert!(
+        fresh.contains("BINA") && fresh.contains("????"),
+        "--no-preserve-meta should start clean, got: {fresh}"
+    );
+}
+
+/// The POSIX triple survives a replace on a Unix filesystem, and the opt-out
+/// drops it. Editing one line of a config file must not silently reset who can
+/// read it.
+#[test]
+fn replacing_a_file_preserves_unix_permissions_and_owner() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let img = dir.path().join("e.img");
+    let a = dir.path().join("a.txt");
+    let b = dir.path().join("b.txt");
+    std::fs::write(&a, b"original\n").unwrap();
+    std::fs::write(&b, b"replacement\n").unwrap();
+
+    run(&[
+        "new",
+        "volume",
+        "ext3",
+        img.to_str().unwrap(),
+        "--size",
+        "16M",
+    ]);
+    run(&[
+        "put",
+        img.to_str().unwrap(),
+        a.to_str().unwrap(),
+        "/conf",
+        "--mode",
+        "600",
+        "--uid",
+        "42",
+        "--gid",
+        "7",
+    ]);
+
+    let out = run(&[
+        "put",
+        img.to_str().unwrap(),
+        b.to_str().unwrap(),
+        "/conf",
+        "--force",
+    ]);
+    let log = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        log.contains("mode 0600") && log.contains("42:7"),
+        "the replace should report what it preserved, got:\n{log}"
+    );
+
+    let out = run(&[
+        "put",
+        img.to_str().unwrap(),
+        a.to_str().unwrap(),
+        "/conf",
+        "--force",
+        "--no-preserve-meta",
+    ]);
+    let log = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        log.contains("fresh metadata"),
+        "--no-preserve-meta should say so, got:\n{log}"
+    );
+}

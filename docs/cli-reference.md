@@ -1411,6 +1411,7 @@ Usage: put [OPTIONS] <IMAGE> [HOST_FILE] [DST]
 - `--type` — 4-character type code (HFS / HFS+ / ProDOS). Falls back to `[put] type` from the config file, then — on HFS / HFS+ / MFS — to the file extension (same list as the GUI's type/creator picker), and finally to `BINA` for names the list doesn't recognize
 - `--creator` — 4-character creator code (HFS / HFS+ only). Falls back to `[put] creator` from the config file, then to the file extension, and finally to `????`
 - `--force` — Overwrite an existing entry at the destination path
+- `--no-preserve-meta` — Give the replacement fresh metadata instead of the replaced file's
 - `--mode` — Unix permission bits for the new file, as octal (e.g. `755`, `0644`). Unix filesystems only (ext / UFS / XFS / EFS / Minix / SquashFS); ignored on FAT / HFS / exFAT, which have no such concept
 - `--uid` — Owner UID for the new file. Unix filesystems only
 - `--gid` — Owning GID for the new file. Unix filesystems only. Same precedence as `--uid`
@@ -1764,6 +1765,7 @@ Usage: put [OPTIONS] <IMAGE> [HOST_FILE] [DST]
 - `--type` — 4-character type code (HFS / HFS+ / ProDOS). Falls back to `[put] type` from the config file, then — on HFS / HFS+ / MFS — to the file extension (same list as the GUI's type/creator picker), and finally to `BINA` for names the list doesn't recognize
 - `--creator` — 4-character creator code (HFS / HFS+ only). Falls back to `[put] creator` from the config file, then to the file extension, and finally to `????`
 - `--force` — Overwrite an existing entry at the destination path
+- `--no-preserve-meta` — Give the replacement fresh metadata instead of the replaced file's
 - `--mode` — Unix permission bits for the new file, as octal (e.g. `755`, `0644`). Unix filesystems only (ext / UFS / XFS / EFS / Minix / SquashFS); ignored on FAT / HFS / exFAT, which have no such concept
 - `--uid` — Owner UID for the new file. Unix filesystems only
 - `--gid` — Owning GID for the new file. Unix filesystems only. Same precedence as `--uid`
