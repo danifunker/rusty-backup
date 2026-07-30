@@ -162,6 +162,9 @@ struct Explorer {
     mkdir_input: Option<String>,
     /// The `(name, is_dir)` of an entry pending a delete confirmation.
     confirm_delete: Option<(String, bool)>,
+    /// An import whose destination name is taken: `(host path, file name)`.
+    /// Held until the user answers Replace / Skip.
+    confirm_overwrite: Option<(std::path::PathBuf, String)>,
     /// A scrollable fsck check / repair report overlay, when open.
     fsck_report: Option<FsckReportView>,
     /// The whole-image "Transform" launcher menu (selected index), when open.
@@ -3505,6 +3508,7 @@ impl App {
                 confirm_bless: None,
                 mkdir_input: None,
                 confirm_delete: None,
+                confirm_overwrite: None,
                 fsck_report: None,
                 transform_menu: None,
             };
@@ -3809,6 +3813,32 @@ impl App {
             return;
         }
 
+        // Overwrite confirmation. Three answers, because "no" is ambiguous
+        // here: leaving the existing file alone and abandoning the import are
+        // different intentions, and only one of them is what the user meant.
+        let overwrite_pending = self
+            .explorer
+            .as_ref()
+            .and_then(|e| e.confirm_overwrite.clone());
+        if let Some((host, _leaf)) = overwrite_pending {
+            match code {
+                KeyCode::Char('r') | KeyCode::Char('R') | KeyCode::Enter => {
+                    self.explorer_import_with(&host, crate::fs::replace::OnConflict::Replace);
+                }
+                KeyCode::Char('s') | KeyCode::Char('S') => {
+                    self.explorer_import_with(&host, crate::fs::replace::OnConflict::Skip);
+                }
+                KeyCode::Char('c') | KeyCode::Char('C') | KeyCode::Esc => {
+                    if let Some(ex) = self.explorer.as_mut() {
+                        ex.confirm_overwrite = None;
+                        ex.status = Some("Import cancelled".to_string());
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
         // Delete confirmation.
         let delete_pending = self
             .explorer
@@ -4098,6 +4128,17 @@ impl App {
     /// Explorer directory (opens the partition read-write, reusing the `put`
     /// core), then refresh the view.
     fn explorer_import(&mut self, host: &std::path::Path) {
+        // `Fail` here means "ask": the import reports the collision back rather
+        // than refusing, and the answer arrives via `explorer_import_with`.
+        self.explorer_import_with(host, crate::fs::replace::OnConflict::Fail);
+    }
+
+    /// The import itself, once the conflict question (if any) is settled.
+    fn explorer_import_with(
+        &mut self,
+        host: &std::path::Path,
+        on_conflict: crate::fs::replace::OnConflict,
+    ) {
         let (image_path, selector, part_label, cur_path, comps) = match self.explorer.as_ref() {
             Some(ex) => (
                 ex.image_path.clone(),
@@ -4108,8 +4149,18 @@ impl App {
             ),
             None => return,
         };
-        match import_host_file(&image_path, selector, &cur_path, host) {
-            Ok(name) => {
+        match import_host_file(&image_path, selector, &cur_path, host, on_conflict) {
+            Ok(ImportOutcome::Exists(leaf)) => {
+                // Ask rather than refuse. The answer comes back through
+                // `explorer_import_with` with an explicit choice.
+                if let Some(ex) = self.explorer.as_mut() {
+                    ex.confirm_overwrite = Some((host.to_path_buf(), leaf));
+                }
+            }
+            Ok(ImportOutcome::Done(name)) => {
+                if let Some(ex) = self.explorer.as_mut() {
+                    ex.confirm_overwrite = None;
+                }
                 // Re-open read-only at the same path so the new file shows.
                 self.reopen_explorer(
                     &image_path,
@@ -4121,6 +4172,7 @@ impl App {
             }
             Err(e) => {
                 if let Some(ex) = self.explorer.as_mut() {
+                    ex.confirm_overwrite = None;
                     ex.status = Some(format!("Import failed: {e}"));
                 }
             }
@@ -7337,6 +7389,26 @@ impl App {
             );
         }
 
+        // Overwrite confirmation. Says what will be kept, because "replace"
+        // sounds like it discards everything about the old file and it does
+        // not - the metadata comes across.
+        if let Some((_, leaf)) = &ex.confirm_overwrite {
+            let cp = centered_rect(64, 7, area);
+            frame.render_widget(Clear, cp);
+            frame.render_widget(
+                Paragraph::new(Text::from(vec![
+                    Line::raw(""),
+                    Line::styled(format!("  \"{leaf}\" already exists."), self.palette.warn()),
+                    Line::raw(""),
+                    Line::raw("  r  Replace it (keeps its permissions, dates and type)"),
+                    Line::raw("  s  Skip - leave the existing file alone"),
+                    Line::raw("  c  Cancel the import"),
+                ]))
+                .block(self.pane_block("File exists", true)),
+                cp,
+            );
+        }
+
         // Delete confirmation.
         if let Some((name, is_dir)) = &ex.confirm_delete {
             let cp = centered_rect(56, 5, area);
@@ -10348,12 +10420,21 @@ fn apply_delete(
     Ok(())
 }
 
+/// Outcome of an import attempt, so the caller can ask before overwriting.
+enum ImportOutcome {
+    /// Written (created or replaced); carries the file name.
+    Done(String),
+    /// The name is taken and `on_conflict` said to ask first.
+    Exists(String),
+}
+
 fn import_host_file(
     image_path: &str,
     selector: Option<u32>,
     cur_dir: &str,
     host: &std::path::Path,
-) -> anyhow::Result<String> {
+    on_conflict: crate::fs::replace::OnConflict,
+) -> anyhow::Result<ImportOutcome> {
     use crate::cli::resolve::resolve_partition_rw_forced;
     let meta = std::fs::metadata(host)?;
     if !meta.is_file() {
@@ -10379,25 +10460,42 @@ fn import_host_file(
     if !parent.is_directory() {
         anyhow::bail!("parent is not a directory");
     }
+    // Ask before overwriting rather than refusing outright, which is what this
+    // did before: a name collision was a dead end, so the only way to correct a
+    // file in an image was to delete it first and remember what it carried.
     let exists = fs
         .list_directory(&parent)
         .map_err(|e| anyhow::anyhow!("list_directory: {e}"))?
         .into_iter()
         .any(|e| e.name == leaf);
-    if exists {
-        anyhow::bail!("{leaf} already exists");
+    if exists && on_conflict == crate::fs::replace::OnConflict::Fail {
+        return Ok(ImportOutcome::Exists(leaf));
     }
 
     let len = meta.len();
     let mut hf = std::fs::File::open(host)?;
     let options = crate::fs::filesystem::CreateFileOptions::default();
-    fs.create_file(&parent, &leaf, &mut hf, len, &options)
-        .map_err(|e| anyhow::anyhow!("create_file: {e}"))?;
+    let outcome = crate::fs::replace::create_or_replace(
+        fs.as_mut(),
+        &parent,
+        &leaf,
+        &mut hf,
+        len,
+        &options,
+        crate::fs::replace::ReplacePolicy {
+            on_conflict,
+            ..Default::default()
+        },
+    )
+    .map_err(|e| anyhow::anyhow!("create_file: {e}"))?;
+    if outcome.skipped {
+        return Ok(ImportOutcome::Done(format!("{name} (skipped)")));
+    }
     fs.sync_metadata()
         .map_err(|e| anyhow::anyhow!("sync_metadata: {e}"))?;
     drop(fs);
     commit.commit()?;
-    Ok(name)
+    Ok(ImportOutcome::Done(name))
 }
 
 /// A short filetype label for a file entry: HFS/HFS+/MFS `TYPE/crea`, a ProDOS
@@ -10695,6 +10793,63 @@ mod tests {
             "the disk's hardware facts must come along so the header can show \
              them instead of needing a screen of their own"
         );
+    }
+
+    /// Importing onto an existing name must offer to replace, not dead-end.
+    ///
+    /// `import_host_file` used to `bail!("already exists")`, so the only way to
+    /// correct a file inside an image from the TUI was to delete it first - and
+    /// deleting it threw away the permissions, dates and type/creator that the
+    /// corrected file should have kept.
+    #[test]
+    fn importing_over_an_existing_name_offers_to_replace() {
+        use crate::fs::replace::OnConflict;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let img = dir.path().join("v.img");
+        let bytes = crate::fs::fat::create_blank_fat(2 * 1024 * 1024, Some("T")).unwrap();
+        std::fs::write(&img, &bytes).unwrap();
+
+        let host = dir.path().join("A.TXT");
+        std::fs::write(&host, b"first").unwrap();
+        let path = img.to_string_lossy().into_owned();
+
+        // First import creates.
+        match import_host_file(&path, None, "/", &host, OnConflict::Fail) {
+            Ok(ImportOutcome::Done(_)) => {}
+            other => panic!("first import should create: {:?}", other.is_ok()),
+        }
+
+        // Second import reports the collision instead of failing, so the UI can
+        // ask rather than dead-end.
+        std::fs::write(&host, b"second-longer").unwrap();
+        match import_host_file(&path, None, "/", &host, OnConflict::Fail) {
+            Ok(ImportOutcome::Exists(leaf)) => assert_eq!(leaf, "A.TXT"),
+            _ => panic!("a collision should be reported, not refused"),
+        }
+
+        // Skip leaves the original contents alone.
+        import_host_file(&path, None, "/", &host, OnConflict::Skip).expect("skip");
+        assert_eq!(read_root_file(&img, "A.TXT"), b"first");
+
+        // Replace swaps them.
+        import_host_file(&path, None, "/", &host, OnConflict::Replace).expect("replace");
+        assert_eq!(read_root_file(&img, "A.TXT"), b"second-longer");
+    }
+
+    /// Read a root-level file's contents straight from the image on disk.
+    fn read_root_file(img: &std::path::Path, name: &str) -> Vec<u8> {
+        use crate::fs::filesystem::Filesystem;
+        let f = std::fs::File::open(img).unwrap();
+        let mut fs = crate::fs::fat::FatFilesystem::open(f, 0).unwrap();
+        let root = fs.root().unwrap();
+        let e = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name.eq_ignore_ascii_case(name))
+            .expect("entry");
+        fs.read_file(&e, usize::MAX).unwrap()
     }
 
     /// The file picker must accept a raw device path.

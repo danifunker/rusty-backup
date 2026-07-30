@@ -466,6 +466,59 @@ impl EditQueue {
         self.edits.drain(..)
     }
 
+    /// Staged additions whose destination name is already taken, as
+    /// `(full path, file name)`.
+    ///
+    /// Answered before applying, on purpose. The alternative — discovering each
+    /// collision mid-batch — means interrupting the user file by file and
+    /// leaving a half-applied queue behind if they change their mind at file 7
+    /// of 12. Staging exists precisely so the questions can be asked once.
+    pub fn conflicting_adds(&self, efs: &mut dyn EditableFilesystem) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for edit in &self.edits {
+            let StagedEdit::AddFile { parent, name, .. } = edit else {
+                continue;
+            };
+            let Ok(dir) = resolve_dir_by_path(efs, &parent.path) else {
+                continue;
+            };
+            let Ok(children) = efs.list_directory(&dir) else {
+                continue;
+            };
+            if children.iter().any(|e| &e.name == name) {
+                out.push((Self::pending_path(&parent.path, name), name.clone()));
+            }
+        }
+        out
+    }
+
+    /// Apply a conflict decision to one staged addition, keyed by the full path
+    /// [`conflicting_adds`] reported.
+    pub fn set_conflict_for(&mut self, path: &str, on: crate::fs::replace::OnConflict) {
+        for edit in &mut self.edits {
+            if let StagedEdit::AddFile {
+                parent,
+                name,
+                on_conflict,
+                ..
+            } = edit
+            {
+                if Self::pending_path(&parent.path, name) == path {
+                    *on_conflict = on;
+                }
+            }
+        }
+    }
+
+    /// Apply one decision to every staged addition.
+    pub fn set_all_conflicts(&mut self, on: crate::fs::replace::OnConflict) {
+        for edit in &mut self.edits {
+            if let StagedEdit::AddFile { on_conflict, .. } = edit {
+                *on_conflict = on;
+            }
+        }
+    }
+
     /// Full path for an `AddFile` / `CreateDirectory` edit, anchored at root.
     fn pending_path(parent_path: &str, name: &str) -> String {
         if parent_path == "/" {
@@ -1124,6 +1177,76 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert!(lines[0].starts_with("Permissions: /d/f -> 600"));
         assert!(lines[1].starts_with("Delete: /d/f"));
+    }
+
+    /// Conflicts are found before anything is applied, so the user answers once
+    /// instead of being interrupted per file mid-batch.
+    #[test]
+    fn conflicting_adds_are_detected_up_front_and_decided_per_file() {
+        use crate::fs::fat::{create_blank_fat, FatFilesystem};
+        use crate::fs::filesystem::{CreateFileOptions, Filesystem};
+        use crate::fs::replace::OnConflict;
+        use std::io::Cursor;
+
+        let img = create_blank_fat(2 * 1024 * 1024, Some("T")).unwrap();
+        let mut fs = FatFilesystem::open(Cursor::new(img), 0).unwrap();
+        let root = fs.root().unwrap();
+        // Two of the three names are already taken.
+        for name in ["A.TXT", "B.TXT"] {
+            let mut d = Cursor::new(b"old".to_vec());
+            fs.create_file(&root, name, &mut d, 3, &CreateFileOptions::default())
+                .unwrap();
+        }
+
+        let host = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(host.path(), b"new").unwrap();
+        let mut q = EditQueue::new();
+        for name in ["A.TXT", "B.TXT", "C.TXT"] {
+            q.push(StagedEdit::AddFile {
+                parent: root.clone(),
+                name: name.to_string(),
+                host_path: host.path().to_path_buf(),
+                size: 3,
+                prodos_type: None,
+                prodos_aux: None,
+                resource_fork: None,
+                hfs_type_override: None,
+                hfs_creator_override: None,
+                dates: None,
+                on_conflict: OnConflict::Fail,
+            });
+        }
+
+        let conflicts = q.conflicting_adds(&mut fs);
+        let names: Vec<&str> = conflicts.iter().map(|(_, n)| n.as_str()).collect();
+        assert_eq!(names, vec!["A.TXT", "B.TXT"], "C.TXT is free");
+
+        // Decisions are per file: replace one, skip the other.
+        q.set_conflict_for(&conflicts[0].0, OnConflict::Replace);
+        q.set_conflict_for(&conflicts[1].0, OnConflict::Skip);
+        for edit in q.iter() {
+            if let StagedEdit::AddFile {
+                name, on_conflict, ..
+            } = edit
+            {
+                let want = match name.as_str() {
+                    "A.TXT" => OnConflict::Replace,
+                    "B.TXT" => OnConflict::Skip,
+                    _ => OnConflict::Fail,
+                };
+                assert_eq!(*on_conflict, want, "{name}");
+            }
+        }
+
+        // And the blanket answer covers everything at once.
+        q.set_all_conflicts(OnConflict::Replace);
+        assert!(q.iter().all(|e| matches!(
+            e,
+            StagedEdit::AddFile {
+                on_conflict: OnConflict::Replace,
+                ..
+            }
+        )));
     }
 
     /// The GUI and Commander go through `apply_edit`, which used to call

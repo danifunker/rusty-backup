@@ -172,6 +172,9 @@ pub struct BrowseView {
     squashfs_budget_dialog: Option<Box<super::squashfs_budget_dialog::SquashfsBudgetDialog>>,
     /// Whether to show the "unsaved changes" confirmation dialog.
     show_unsaved_dialog: bool,
+    /// Staged additions whose destination already exists, awaiting one review
+    /// before anything is written: `(full path, name, decision)`.
+    conflict_review: Option<Vec<(String, String, rusty_backup::fs::replace::OnConflict)>>,
     /// When true, a successful Discard/Apply from the unsaved dialog should
     /// fully close the browse view rather than just leaving edit mode. Set by
     /// the in-view Close intercept when staged edits force the dialog first.
@@ -450,6 +453,7 @@ impl Default for BrowseView {
             show_tree_large_dialog: false,
             staged_edits: EditQueue::new(),
             show_unsaved_dialog: false,
+            conflict_review: None,
             pending_close: false,
             prodos_type_editor: None,
             hfs_type_editor: None,
@@ -1214,6 +1218,9 @@ impl BrowseView {
 
         // Unsaved changes dialog
         self.render_unsaved_dialog(ui);
+
+        // File-exists review, shown once before anything is written
+        self.render_conflict_review(ui);
 
         // New folder dialog
         self.render_new_folder_dialog(ui);
@@ -4040,6 +4047,30 @@ impl BrowseView {
             }
         };
 
+        // Find every collision before writing anything. Staging exists so the
+        // questions can be asked once; discovering them mid-batch would mean
+        // interrupting per file and leaving a half-applied queue if the user
+        // changes their mind at file 7 of 12.
+        if self.conflict_review.is_none() {
+            let conflicts = self.staged_edits.conflicting_adds(&mut *efs);
+            if !conflicts.is_empty() {
+                drop(efs);
+                self.conflict_review = Some(
+                    conflicts
+                        .into_iter()
+                        // Default to Replace: staging an add onto an existing
+                        // name is what "copy this file here" means, and the
+                        // review shows exactly what will happen before any
+                        // write. The replaced file's metadata is carried over.
+                        .map(|(path, name)| {
+                            (path, name, rusty_backup::fs::replace::OnConflict::Replace)
+                        })
+                        .collect(),
+                );
+                return;
+            }
+        }
+
         let edits: Vec<StagedEdit> = self.staged_edits.drain().collect();
         let total = edits.len();
 
@@ -4132,6 +4163,95 @@ impl BrowseView {
     }
 
     /// Render the unsaved changes confirmation dialog.
+    /// One review of every name collision, before any write happens.
+    ///
+    /// Each row is decided individually because a batch rarely has one answer:
+    /// overwriting a config file you meant to fix and overwriting a document
+    /// you forgot you had are different things, and a single blanket prompt
+    /// makes the user guess which files it covers.
+    fn render_conflict_review(&mut self, ui: &mut egui::Ui) {
+        use rusty_backup::fs::replace::OnConflict;
+        let Some(mut rows) = self.conflict_review.clone() else {
+            return;
+        };
+
+        let mut apply = false;
+        let mut cancel = false;
+        egui::Window::new("Some files already exist")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ui.ctx(), |ui| {
+                ui.label(format!(
+                    "{} of the staged file(s) would overwrite something already on the image.",
+                    rows.len()
+                ));
+                ui.label("Replacing keeps the existing file's permissions, dates and type.");
+                ui.add_space(6.0);
+
+                ui.horizontal(|ui| {
+                    if ui.button("Replace all").clicked() {
+                        for r in rows.iter_mut() {
+                            r.2 = OnConflict::Replace;
+                        }
+                    }
+                    if ui.button("Skip all").clicked() {
+                        for r in rows.iter_mut() {
+                            r.2 = OnConflict::Skip;
+                        }
+                    }
+                });
+                ui.add_space(4.0);
+
+                egui::ScrollArea::vertical()
+                    .max_height(240.0)
+                    .show(ui, |ui| {
+                        for (path, _name, decision) in rows.iter_mut() {
+                            ui.horizontal(|ui| {
+                                ui.radio_value(decision, OnConflict::Replace, "Replace");
+                                ui.radio_value(decision, OnConflict::Skip, "Skip");
+                                ui.label(path.as_str());
+                            });
+                        }
+                    });
+
+                ui.add_space(6.0);
+                let replacing = rows.iter().filter(|r| r.2 == OnConflict::Replace).count();
+                ui.label(format!(
+                    "{replacing} to replace, {} to skip",
+                    rows.len() - replacing
+                ));
+                ui.horizontal(|ui| {
+                    if ui.button("Continue").clicked() {
+                        apply = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if cancel {
+            // Nothing has been written, and the queue is untouched, so the user
+            // still has every staged edit to reconsider.
+            self.conflict_review = None;
+            self.edit_result = Some("Save cancelled - nothing was written".to_string());
+            return;
+        }
+        if apply {
+            for (path, _name, decision) in &rows {
+                self.staged_edits.set_conflict_for(path, *decision);
+            }
+            // Keep the review non-None so the re-entry does not ask again;
+            // apply_staged_edits clears it when it finishes.
+            self.conflict_review = Some(rows);
+            self.apply_staged_edits();
+            self.conflict_review = None;
+            return;
+        }
+        self.conflict_review = Some(rows);
+    }
+
     fn render_unsaved_dialog(&mut self, ui: &mut egui::Ui) {
         if !self.show_unsaved_dialog {
             return;
