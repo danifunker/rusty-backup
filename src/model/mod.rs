@@ -43,6 +43,7 @@ pub mod restore_remote;
 pub mod size_mode;
 pub mod source_reader;
 pub mod status;
+pub mod text_edit;
 // `update_runner` wraps the GUI's update-download/install flow on top of
 // `src/update.rs` — both depend on `reqwest`, which is GUI-feature-only.
 #[cfg(feature = "gui")]

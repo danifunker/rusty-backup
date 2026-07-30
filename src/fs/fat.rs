@@ -2041,12 +2041,28 @@ fn decode_oem_string(bytes: &[u8]) -> String {
 }
 
 /// Map a single CP437 byte to a Unicode character.
-fn cp437_to_char(b: u8) -> char {
+pub(crate) fn cp437_to_char(b: u8) -> char {
     if b < 0x80 {
         b as char
     } else {
         CP437_HIGH[b as usize - 0x80]
     }
+}
+
+/// Map a Unicode character back to its CP437 byte, if it has one.
+///
+/// The inverse of [`cp437_to_char`], derived from the same table so the two
+/// cannot drift. `None` means the character has no CP437 representation — the
+/// caller decides whether that is an error or a substitution, since silently
+/// replacing it is how a DOS text file quietly stops being what it was.
+pub(crate) fn char_to_cp437(c: char) -> Option<u8> {
+    if (c as u32) < 0x80 {
+        return Some(c as u8);
+    }
+    CP437_HIGH
+        .iter()
+        .position(|&t| t == c)
+        .map(|i| (i + 0x80) as u8)
 }
 
 /// CP437 to Unicode mapping for bytes 0x80-0xFF.
