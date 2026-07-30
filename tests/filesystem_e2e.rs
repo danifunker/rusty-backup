@@ -2165,6 +2165,7 @@ fn test_pfs3_staged_edits_round_trip() {
             hfs_type_override: None,
             hfs_creator_override: None,
             dates: None,
+            on_conflict: rusty_backup::fs::replace::OnConflict::Fail,
         },
     ];
     for edit in &edits {
@@ -2757,6 +2758,7 @@ fn test_affs_staged_edits_round_trip() {
             hfs_type_override: None,
             hfs_creator_override: None,
             dates: None,
+            on_conflict: rusty_backup::fs::replace::OnConflict::Fail,
         },
     ];
     for edit in &edits {
@@ -2855,6 +2857,7 @@ fn test_sfs_staged_edits_round_trip() {
             hfs_type_override: None,
             hfs_creator_override: None,
             dates: None,
+            on_conflict: rusty_backup::fs::replace::OnConflict::Fail,
         },
     ];
     for edit in &edits {

@@ -459,6 +459,7 @@ fn stage_copy_into(
                     } else {
                         None
                     },
+                    on_conflict: crate::fs::replace::OnConflict::Fail,
                 });
 
                 if let Some(s) = status {
@@ -522,6 +523,7 @@ fn stage_host_into(entries: &[FileEntry], dest_parent: &FileEntry, edits: &mut V
                 hfs_creator_override: None,
                 // Host files carry no Amiga/HFS raw dates to preserve.
                 dates: None,
+                on_conflict: crate::fs::replace::OnConflict::Fail,
             });
         }
     }
@@ -1418,6 +1420,7 @@ mod tests {
                 hfs_type_override: None,
                 hfs_creator_override: None,
                 dates: None,
+                on_conflict: crate::fs::replace::OnConflict::Fail,
             },
         ];
         apply_edits(&session, &edits).expect("apply");

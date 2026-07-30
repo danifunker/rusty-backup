@@ -71,6 +71,15 @@ pub enum StagedEdit {
         /// created copy so dates survive a cross-image copy (the "keep original
         /// dates" option). `None` lets `create_file` stamp the current time.
         dates: Option<PreservedDates>,
+        /// What to do if the destination name is already taken.
+        ///
+        /// Defaults to [`OnConflict::Fail`], which is what every caller did
+        /// before a replace was possible here: the driver rejected the
+        /// duplicate name and the batch errored. The GUI and Commander set this
+        /// from the conflict review the user is shown before applying, so the
+        /// decision is made once, up front, rather than by a modal interrupting
+        /// a half-applied batch.
+        on_conflict: crate::fs::replace::OnConflict,
     },
     CreateDirectory {
         parent: FileEntry,
@@ -218,6 +227,7 @@ pub fn apply_edit(
             hfs_type_override,
             hfs_creator_override,
             dates,
+            on_conflict,
         } => {
             let mut opts = CreateFileOptions {
                 type_code: prodos_type.map(|t| format!("${:02X}", t)),
@@ -259,14 +269,44 @@ pub fn apply_edit(
                     let mut cursor = Cursor::new(data_fork);
                     let df_size = data_fork.len() as u64;
                     let resolved_parent = resolve_dir_by_path(efs, &parent.path)?;
-                    efs.create_file(&resolved_parent, name, &mut cursor, df_size, &opts)?;
+                    crate::fs::replace::create_or_replace(
+                        efs,
+                        &resolved_parent,
+                        name,
+                        &mut cursor,
+                        df_size,
+                        &opts,
+                        crate::fs::replace::ReplacePolicy {
+                            on_conflict: *on_conflict,
+                            ..Default::default()
+                        },
+                    )?;
                     return Ok(());
                 }
             }
 
             let mut file = File::open(host_path).map_err(FilesystemError::Io)?;
             let resolved_parent = resolve_dir_by_path(efs, &parent.path)?;
-            let created = efs.create_file(&resolved_parent, name, &mut file, *size, &opts)?;
+            // Routed through the shared helper so the GUI and Commander get the
+            // same replace semantics as the CLI: metadata carried over from the
+            // file being replaced, and the swap staged so a failure mid-write
+            // leaves the original intact.
+            let outcome = crate::fs::replace::create_or_replace(
+                efs,
+                &resolved_parent,
+                name,
+                &mut file,
+                *size,
+                &opts,
+                crate::fs::replace::ReplacePolicy {
+                    on_conflict: *on_conflict,
+                    ..Default::default()
+                },
+            )?;
+            let Some(created) = outcome.created else {
+                // Skipped by the user's conflict choice; nothing further to do.
+                return Ok(());
+            };
             // HFS/HFS+ dates aren't a create_file option, so apply them after
             // the fact. Best-effort: filesystems without set_dates return
             // Unsupported, which we ignore (the copy keeps its create-time stamp).
@@ -1086,6 +1126,111 @@ mod tests {
         assert!(lines[1].starts_with("Delete: /d/f"));
     }
 
+    /// The GUI and Commander go through `apply_edit`, which used to call
+    /// `create_file` with no existence check - so a name collision was simply
+    /// an error from the driver, mid-batch. With `OnConflict::Replace` the same
+    /// path now replaces, and carries the previous file's metadata across.
+    #[test]
+    fn apply_edit_can_replace_and_keeps_the_old_files_metadata() {
+        use crate::fs::fat::{create_blank_fat, FatFilesystem};
+        use crate::fs::filesystem::{CreateFileOptions, Filesystem};
+        use std::io::Cursor;
+
+        let img = create_blank_fat(2 * 1024 * 1024, Some("T")).unwrap();
+        let mut fs = FatFilesystem::open(Cursor::new(img), 0).unwrap();
+
+        // An existing file carrying attribute bits worth keeping.
+        let root = fs.root().unwrap();
+        let mut original = Cursor::new(b"original".to_vec());
+        fs.create_file(
+            &root,
+            "A.TXT",
+            &mut original,
+            8,
+            &CreateFileOptions {
+                dos_attributes: Some(0x01), // read-only
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let host = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(host.path(), b"replacement").unwrap();
+
+        let edit = StagedEdit::AddFile {
+            parent: fs.root().unwrap(),
+            name: "A.TXT".to_string(),
+            host_path: host.path().to_path_buf(),
+            size: 11,
+            prodos_type: None,
+            prodos_aux: None,
+            resource_fork: None,
+            hfs_type_override: None,
+            hfs_creator_override: None,
+            dates: None,
+            on_conflict: crate::fs::replace::OnConflict::Replace,
+        };
+        apply_edit(&mut fs, &edit).expect("replace should succeed");
+
+        let root = fs.root().unwrap();
+        let entries = fs.list_directory(&root).unwrap();
+        assert_eq!(entries.len(), 1, "no staging leftovers: {entries:?}");
+        let e = &entries[0];
+        assert_eq!(fs.read_file(e, usize::MAX).unwrap(), b"replacement");
+        assert_eq!(
+            e.dos_attributes.map(|a| a & 0x01),
+            Some(0x01),
+            "the read-only bit should have survived the replace"
+        );
+    }
+
+    /// The default stays `Fail`, so every caller that has not been taught about
+    /// conflicts keeps refusing rather than silently overwriting.
+    #[test]
+    fn apply_edit_still_refuses_a_collision_by_default() {
+        use crate::fs::fat::{create_blank_fat, FatFilesystem};
+        use crate::fs::filesystem::{CreateFileOptions, Filesystem};
+        use std::io::Cursor;
+
+        let img = create_blank_fat(2 * 1024 * 1024, Some("T")).unwrap();
+        let mut fs = FatFilesystem::open(Cursor::new(img), 0).unwrap();
+        let root = fs.root().unwrap();
+        let mut original = Cursor::new(b"original".to_vec());
+        fs.create_file(
+            &root,
+            "A.TXT",
+            &mut original,
+            8,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+
+        let host = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(host.path(), b"replacement").unwrap();
+        let edit = StagedEdit::AddFile {
+            parent: fs.root().unwrap(),
+            name: "A.TXT".to_string(),
+            host_path: host.path().to_path_buf(),
+            size: 11,
+            prodos_type: None,
+            prodos_aux: None,
+            resource_fork: None,
+            hfs_type_override: None,
+            hfs_creator_override: None,
+            dates: None,
+            on_conflict: crate::fs::replace::OnConflict::default(),
+        };
+        assert!(apply_edit(&mut fs, &edit).is_err(), "default must refuse");
+
+        let root = fs.root().unwrap();
+        let e = &fs.list_directory(&root).unwrap()[0];
+        assert_eq!(
+            fs.read_file(e, usize::MAX).unwrap(),
+            b"original",
+            "the original must be untouched after a refused collision"
+        );
+    }
+
     /// "Keep original dates": an AddFile carrying a source Amiga datestamp
     /// reproduces it on the destination (via CreateFileOptions::amiga_dates)
     /// instead of stamping the current time — end to end through apply_edit.
@@ -1121,6 +1266,7 @@ mod tests {
                         amiga: Some(target),
                         mac: None,
                     }),
+                    on_conflict: crate::fs::replace::OnConflict::Fail,
                 },
             )
             .unwrap();

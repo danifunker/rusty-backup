@@ -255,13 +255,17 @@ pub fn run_with_budget(
     } else {
         crate::fs::attrs::preserved_meta(fs.as_filesystem_mut(), existing.as_ref())
     };
-    if let Some(ref e) = existing {
-        if !args.force {
-            bail!("{dst} already exists (pass --force to overwrite)");
-        }
-        fs.delete_entry(&parent, e)
-            .map_err(|e| anyhow!("delete existing: {e}"))?;
+    if existing.is_some() && !args.force {
+        bail!("{dst} already exists (pass --force to overwrite)");
     }
+    // The delete is NOT done here. `create_or_replace` stages the swap so a
+    // failure mid-write leaves the original intact, which delete-then-create
+    // could not promise.
+    let on_conflict = if existing.is_some() {
+        crate::fs::replace::OnConflict::Replace
+    } else {
+        crate::fs::replace::OnConflict::Fail
+    };
 
     // An explicit --type / --creator (or the config default) always wins. Failing
     // that, on the classic-Mac filesystems we leave both unset so `create_file`
@@ -355,10 +359,35 @@ pub fn run_with_budget(
     // Fills only what nobody set explicitly, so --type / --mode still win.
     preserved.apply_to_options(&mut options);
 
+    let write_through = |fs: &mut dyn crate::fs::filesystem::EditableFilesystem,
+                         reader: &mut dyn std::io::Read,
+                         len: u64|
+     -> anyhow::Result<()> {
+        let outcome = crate::fs::replace::create_or_replace(
+            fs,
+            &parent,
+            &name,
+            reader,
+            len,
+            &options,
+            crate::fs::replace::ReplacePolicy {
+                on_conflict,
+                preserve_meta: !args.no_preserve_meta,
+            },
+        )
+        .map_err(|e| anyhow!("create_file: {e}"))?;
+        if outcome.unsafe_fallback {
+            log_stderr(
+                "Note: this filesystem cannot stage a replace (no rename), so the original \
+                 was removed before the new contents were written",
+            );
+        }
+        Ok(())
+    };
+
     if let Some(n) = args.zero {
         let mut zr = ZeroReader { remaining: n };
-        fs.create_file(&parent, &name, &mut zr, n, &options)
-            .map_err(|e| anyhow!("create_file: {e}"))?;
+        write_through(fs.as_mut(), &mut zr, n)?;
     } else {
         let host = args.host_file.ok_or_else(|| {
             anyhow!(
@@ -369,8 +398,7 @@ pub fn run_with_budget(
         let len = meta.len();
         let mut hf =
             std::fs::File::open(&host).map_err(|e| anyhow!("open {}: {e}", host.display()))?;
-        fs.create_file(&parent, &name, &mut hf, len, &options)
-            .map_err(|e| anyhow!("create_file: {e}"))?;
+        write_through(fs.as_mut(), &mut hf, len)?;
     }
 
     // Timestamps are the one preserved field no filesystem here accepts at

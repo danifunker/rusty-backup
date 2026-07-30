@@ -85,6 +85,7 @@ pub mod prodos_types;
 pub mod qdos;
 pub mod qdos_mdv;
 pub mod reiserfs;
+pub mod replace;
 pub mod resource_fork;
 pub mod rsdos;
 pub mod sfs;

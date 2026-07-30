@@ -3994,6 +3994,9 @@ impl BrowseView {
             hfs_type_override: None,
             hfs_creator_override: None,
             dates: None,
+            // Set from the conflict review shown before Apply; staging one is
+            // not the moment to decide, because the user has not been asked yet.
+            on_conflict: rusty_backup::fs::replace::OnConflict::Fail,
         });
         Ok(())
     }
