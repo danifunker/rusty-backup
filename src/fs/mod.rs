@@ -1091,14 +1091,39 @@ pub fn effective_partition_size<R: Read + Seek + Send + 'static>(
     partition_type: u8,
     partition_type_string: Option<&str>,
 ) -> Option<u64> {
+    effective_partition_size_reported(
+        reader,
+        partition_offset,
+        partition_type,
+        partition_type_string,
+    )
+    .ok()
+}
+
+/// [`effective_partition_size`] keeping the reason it failed.
+///
+/// The `Option`-returning form discards both the open error and the
+/// `last_data_byte` error, and a caller that treats `None` as "no trim
+/// possible" then silently images the whole partition. That is how a
+/// PowerPC ext backup came out at 32 MiB where the desktop produced 4.5 MiB:
+/// identical compact analysis, identical `used_size`, but `minimum_size_bytes`
+/// missing from the metadata entirely, with nothing anywhere saying why. Give
+/// callers that can log a way to say what went wrong.
+pub fn effective_partition_size_reported<R: Read + Seek + Send + 'static>(
+    reader: R,
+    partition_offset: u64,
+    partition_type: u8,
+    partition_type_string: Option<&str>,
+) -> Result<u64, String> {
     let mut fs = open_filesystem(
         reader,
         partition_offset,
         partition_type,
         partition_type_string,
     )
-    .ok()?;
-    fs.last_data_byte().ok()
+    .map_err(|e| format!("cannot open filesystem: {e}"))?;
+    fs.last_data_byte()
+        .map_err(|e| format!("last_data_byte failed: {e}"))
 }
 
 /// Calculate the defragmented minimum size for a partition — the smallest

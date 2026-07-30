@@ -164,18 +164,49 @@ pub(super) fn analyze_partitions(
             let minimum = if !is_lp && result.data_size < part.size_bytes {
                 Some(result.data_size)
             } else {
-                source
-                    .open()
-                    .ok()
-                    .and_then(|clone| {
-                        fs::effective_partition_size(
-                            BufReader::new(clone),
-                            part_offset,
-                            part.partition_type_byte,
-                            part.partition_type_string.as_deref(),
-                        )
-                    })
-                    .map(|min| min.min(part.size_bytes))
+                // Report a failure here rather than swallowing it. For a
+                // layout-preserving filesystem this value *is* the imaged size
+                // (see the `stream` calculation below), so losing it silently
+                // images the whole partition - a PowerPC ext backup came out
+                // 7x larger than the desktop's for exactly this reason, with
+                // no line in the log to explain it.
+                match source.open() {
+                    Ok(clone) => match fs::effective_partition_size_reported(
+                        BufReader::new(clone),
+                        part_offset,
+                        part.partition_type_byte,
+                        part.partition_type_string.as_deref(),
+                    ) {
+                        Ok(min) => Some(min.min(part.size_bytes)),
+                        Err(why) => {
+                            log(
+                                progress,
+                                LogLevel::Warning,
+                                format!(
+                                    "Partition-{}: no trim point for {} ({why}); imaging the \
+                                     full {} instead of just its used extent",
+                                    part.index,
+                                    part.type_name,
+                                    partition::format_size(part.size_bytes),
+                                ),
+                            );
+                            None
+                        }
+                    },
+                    Err(e) => {
+                        log(
+                            progress,
+                            LogLevel::Warning,
+                            format!(
+                                "Partition-{}: cannot reopen source to find its trim point \
+                                 ({e}); imaging the full {}",
+                                part.index,
+                                partition::format_size(part.size_bytes),
+                            ),
+                        );
+                        None
+                    }
+                }
             };
             sizing.minimum_sizes.push(minimum);
 

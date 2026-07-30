@@ -102,8 +102,23 @@ export MRUSTC_PATH="${MRUSTC_PATH:-$MRUSTC_DIR/bin/mrustc}"
 # expensive thing in this build. So the stamp is taken once and reused until you
 # ask for a new one:
 #
-#   RELEASE_VERSION=2026-07-26-22-48 scripts/build-ppc.sh ppc   # explicit
-#   rm <output>/.release-version                                # re-stamp next run
+#   RELEASE_VERSION=$(date -u +%Y-%m-%d-%H-%M) scripts/build-ppc.sh ppc
+#       The ONLY way to bake a new version in. Drops the build-script output, so
+#       the engine re-transpiles - budget the full build time, not a relink.
+#
+#   rm <output>/.release-version
+#       Does NOT re-stamp. With no marker this takes the first-stamp path below,
+#       which adopts the current time into the marker and deliberately leaves
+#       every existing object alone - so the binary keeps whatever APP_VERSION
+#       was already baked into it, and `rb-cli --version` still reports the old
+#       date. Use it to (re)establish a marker cheaply, never to refresh the
+#       version. This comment used to advertise it as "re-stamp next run", which
+#       sends you looking for the bug in build.rs instead of here.
+#
+# The stickiness is why a fresh PowerPC binary can report a date two days old:
+# `env!("APP_VERSION")` is read from 12 sites inside the *lib* (src/cli/,
+# src/gui/), so the version cannot change without re-transpiling the engine.
+# Moving those reads into the bin crate would make re-stamping cheap.
 stamp_version() {
   local marker="$PPC_OUT/.release-version"
   local prev=""
