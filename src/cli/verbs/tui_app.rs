@@ -3267,22 +3267,53 @@ impl App {
                 }
                 Err(e) => self.status = Some(format!("Cannot open: {e}")),
             }
-        } else if path.is_file() {
-            match std::fs::metadata(&path) {
-                Ok(m) => {
-                    let display = path.display().to_string();
-                    crate::update::push_recent(crate::update::RecentMode::Inspect, &display);
-                    let parts = parse_partitions(&path, m.len());
-                    self.opened = Some(Opened::Image {
-                        path: display,
-                        size: m.len(),
-                        parts,
-                    });
-                }
-                Err(e) => self.status = Some(format!("{}: {e}", path.display())),
-            }
+        } else if path.exists() {
+            // `exists()` rather than `is_file()`: a raw device (`/dev/sda`) is
+            // neither a file nor a directory, so `is_file()` sent every device
+            // path to the "No such file or directory" arm below - a flat denial
+            // for something plainly present, with no hint that the tab simply
+            // did not handle devices. Opening one is the whole point of the
+            // disk list next to it.
+            self.open_image_at(path);
         } else {
             self.status = Some(format!("No such file or directory: {}", path.display()));
+        }
+    }
+
+    /// Open an image *or* a raw device as the Inspect tab's image view.
+    ///
+    /// `size` is looked up via [`readable_size`] so block devices come out at
+    /// their true size instead of the zero `metadata` reports for them.
+    fn open_image_at(&mut self, path: std::path::PathBuf) {
+        let display = path.display().to_string();
+        let size = match readable_size(&path) {
+            Ok(s) => s,
+            Err(e) => {
+                self.status = Some(Self::access_hint(&display, &e));
+                return;
+            }
+        };
+        match parse_partitions(&path, size) {
+            Ok(parts) => {
+                crate::update::push_recent(crate::update::RecentMode::Inspect, &display);
+                self.opened = Some(Opened::Image {
+                    path: display,
+                    size,
+                    parts,
+                });
+            }
+            Err(e) => self.status = Some(Self::access_hint(&display, &e)),
+        }
+    }
+
+    /// Explain an open failure, naming elevation when that is the actual cause.
+    /// A bare "Permission denied" on `/dev/sda` reads like a bug rather than the
+    /// expected cost of raw device access.
+    fn access_hint(what: &str, e: &std::io::Error) -> String {
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            format!("{what}: {e} - raw device access needs elevation; re-run rb-cli tui elevated")
+        } else {
+            format!("{what}: {e}")
         }
     }
 
@@ -3331,6 +3362,30 @@ impl App {
                 };
                 if let Some((path, selector, label)) = target {
                     self.open_explorer(&path, selector, label);
+                }
+            }
+            // Disk detail: Enter again → open the disk as an image, so its
+            // partition table (and from there each filesystem's Explorer) is
+            // reachable.
+            //
+            // Without this arm the disk list dead-ended: Enter showed the detail
+            // pane, and a second Enter did nothing at all - while the footer
+            // still advertised "Enter Open" - because the arm below required
+            // `detail.is_none()`. The detail pane lists only the partitions the
+            // *OS* has mounted, with no way to descend into any of them, so
+            // there was no route from a physical disk to a filesystem at all;
+            // only the `o` file picker could reach one.
+            TabId::Inspect if self.detail.is_some() => {
+                let sel = self.detail.unwrap_or(self.selection);
+                let target = self
+                    .disks
+                    .as_ref()
+                    .and_then(|d| d.get(sel))
+                    .map(|d| d.path.clone());
+                if let Some(path) = target {
+                    self.detail = None;
+                    self.selection = 0;
+                    self.open_image_at(path);
                 }
             }
             // Disk list: Enter a disk → its detail view.
@@ -9543,7 +9598,10 @@ impl App {
         }
         lines.push(Line::raw(""));
         lines.push(Line::styled(
-            "Full MBR/GPT/APM partition-table parse (via wrapper_tree) lands in M2.".to_string(),
+            "Note: the list above is what the OS has mounted. Press Enter to read the \
+             disk's own partition table and browse any volume on it - including \
+             unmounted ones. Raw device access needs elevation."
+                .to_string(),
             self.palette.dim(),
         ));
         Text::from(lines)
@@ -10294,23 +10352,27 @@ fn sort_entries(entries: &mut [FileEntry]) {
 /// `resolve` semantics: `@N` selects `partitions()[N-1]`, and an image with no
 /// table is a single superfloppy volume (selector `None`). `total` is the file
 /// size, used for the superfloppy row.
-fn parse_partitions(path: &std::path::Path, total: u64) -> Vec<PartRow> {
+/// Read the partition table for the Inspect tab's image view.
+///
+/// Returns the open error rather than an empty list: a raw device is unreadable
+/// without elevation, and swallowing that produced an image view with no
+/// partitions and no explanation - indistinguishable from a genuinely empty
+/// disk. `Ok(_)` always has at least one row (a table-less image is reported as
+/// one whole-volume row).
+fn parse_partitions(path: &std::path::Path, total: u64) -> std::io::Result<Vec<PartRow>> {
     use crate::partition::PartitionTable;
-    let file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return Vec::new(),
-    };
+    let file = std::fs::File::open(path)?;
     let mut reader = std::io::BufReader::new(file);
-    match PartitionTable::detect(&mut reader) {
+    Ok(match PartitionTable::detect(&mut reader) {
         Ok(pt) => {
             let parts = pt.partitions();
             if parts.is_empty() {
-                return vec![PartRow {
+                return Ok(vec![PartRow {
                     selector: None,
                     label: format!("Whole volume ({})", pt.type_name()),
                     fs_hint: pt.type_name().to_string(),
                     size: total,
-                }];
+                }]);
             }
             parts
                 .iter()
@@ -10337,7 +10399,23 @@ fn parse_partitions(path: &std::path::Path, total: u64) -> Vec<PartRow> {
             fs_hint: String::new(),
             size: total,
         }],
+    })
+}
+
+/// Size of a path that `std::fs::metadata` cannot measure.
+///
+/// A block device reports `len() == 0`, so the image view sized every disk at
+/// zero and a table-less device came out as a "Whole volume" of 0 bytes. Seeking
+/// to the end asks the kernel instead, which works on Linux and macOS without
+/// an ioctl per platform.
+fn readable_size(path: &std::path::Path) -> std::io::Result<u64> {
+    let m = std::fs::metadata(path)?;
+    if m.len() > 0 {
+        return Ok(m.len());
     }
+    use std::io::{Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)?;
+    f.seek(SeekFrom::End(0))
 }
 
 /// A bordered pane block with the given (already-resolved) palette + border set.
@@ -10457,6 +10535,110 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A disk-list entry pointing at a real path, so the open path can run.
+    fn fake_disk(path: &std::path::Path, size: u64) -> DiskDevice {
+        DiskDevice {
+            name: "test".into(),
+            path: path.to_path_buf(),
+            size_bytes: size,
+            is_removable: false,
+            is_read_only: false,
+            is_system: false,
+            bus_protocol: "test".into(),
+            media_name: "Test Disk".into(),
+            partitions: Vec::new(),
+        }
+    }
+
+    /// Build an MBR disk with a FAT16 and an ext partition - the shape of an
+    /// ordinary Linux system disk (ESP + root).
+    fn mbr_with_ext(dir: &std::path::Path) -> std::path::PathBuf {
+        const START: u32 = 2048;
+        let vol =
+            crate::fs::ext_format::create_blank_ext4(16 * 1024 * 1024, "ROOT").expect("blank ext4");
+        let img = dir.join("disk.img");
+        let mut bytes = vec![0u8; START as usize * 512 + vol.len()];
+        bytes[START as usize * 512..].copy_from_slice(&vol);
+        let e = 0x1BE;
+        bytes[e + 4] = 0x83; // Linux
+        bytes[e + 8..e + 12].copy_from_slice(&START.to_le_bytes());
+        bytes[e + 12..e + 16].copy_from_slice(&((vol.len() / 512) as u32).to_le_bytes());
+        bytes[510] = 0x55;
+        bytes[511] = 0xAA;
+        std::fs::write(&img, &bytes).expect("write img");
+        img
+    }
+
+    /// Enter on a disk, then Enter again, must reach its partition table.
+    ///
+    /// The disk list used to dead-end: the first Enter opened a detail pane
+    /// listing only the partitions the *OS* had mounted, and a second Enter did
+    /// nothing whatsoever because `activate` required `detail.is_none()` - while
+    /// the footer still advertised "Enter Open". An unmounted volume was
+    /// therefore unreachable, and a mounted one could only be read about, never
+    /// opened. The `o` file picker was the sole route to a filesystem.
+    #[test]
+    fn enter_on_a_disk_reaches_its_partition_table() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let img = mbr_with_ext(dir.path());
+        let size = std::fs::metadata(&img).unwrap().len();
+
+        let mut app = App::new_on(DEFAULT_TAB);
+        app.disks = Some(vec![fake_disk(&img, size)]);
+        app.selection = 0;
+        assert!(app.opened.is_none());
+
+        app.activate(); // -> detail pane
+        assert_eq!(
+            app.detail,
+            Some(0),
+            "first Enter should open the detail pane"
+        );
+
+        app.activate(); // -> partition table
+        let Some(Opened::Image { parts, .. }) = &app.opened else {
+            panic!(
+                "second Enter should have opened the disk, got {:?}",
+                app.detail
+            );
+        };
+        assert!(
+            parts.iter().any(|p| p.selector == Some(1)),
+            "the ext partition should be selectable, got {:?}",
+            parts.iter().map(|p| &p.label).collect::<Vec<_>>()
+        );
+    }
+
+    /// A raw device path is neither a file nor a directory, so the picker's
+    /// `is_file()` test sent every one of them to "No such file or directory" -
+    /// a flat denial for something plainly present.
+    #[test]
+    fn opening_a_path_that_is_not_a_regular_file_does_not_claim_it_is_missing() {
+        let mut app = App::new_on(DEFAULT_TAB);
+        // A directory that is not a backup folder stands in for the shape of the
+        // bug without needing a real device: it exists, so whatever the status
+        // says, it must not be "No such file or directory".
+        let dir = tempfile::tempdir().expect("tempdir");
+        app.open_target(dir.path().to_path_buf());
+        let status = app.status.clone().unwrap_or_default();
+        assert!(
+            !status.contains("No such file or directory"),
+            "an existing path must not be reported as missing: {status}"
+        );
+    }
+
+    /// `parse_partitions` must report an unreadable target rather than return an
+    /// empty list, which the image view rendered as a disk with no partitions -
+    /// indistinguishable from a genuinely empty one.
+    #[test]
+    fn parse_partitions_reports_an_unreadable_target() {
+        let missing = std::path::Path::new("/nonexistent/rb-tui-test/disk.img");
+        assert!(
+            parse_partitions(missing, 0).is_err(),
+            "an unreadable path must surface its error"
+        );
+    }
 
     /// Walk the wizard's class list to a given class the way the arrow keys do.
     fn wizard_on(class: DiskClass) -> NewWizard {
