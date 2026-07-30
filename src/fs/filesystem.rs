@@ -649,6 +649,20 @@ pub trait EditableFilesystem: Filesystem {
     /// manage and are masked off rather than trusted from a caller.
     ///
     /// `Unsupported` on filesystems with no such concept, which is most of them.
+    /// Set the AmigaDOS protection bits on an entry (the `access` longword:
+    /// HSPA RWED, held at offset 0x140 of the file header block).
+    ///
+    /// `Unsupported` off the Amiga filesystems, which is everywhere else.
+    fn set_amiga_protection(
+        &mut self,
+        _entry: &FileEntry,
+        _protection: u32,
+    ) -> Result<(), FilesystemError> {
+        Err(FilesystemError::Unsupported(
+            "AmigaDOS protection bits are not supported by this filesystem".into(),
+        ))
+    }
+
     fn set_dos_attributes(
         &mut self,
         _parent: &FileEntry,

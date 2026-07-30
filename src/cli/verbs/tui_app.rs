@@ -165,6 +165,8 @@ struct Explorer {
     /// An import whose destination name is taken: `(host path, file name)`.
     /// Held until the user answers Replace / Skip.
     confirm_overwrite: Option<(std::path::PathBuf, String)>,
+    /// The in-app text editor, when open.
+    editor: Option<TextEditor>,
     /// A scrollable fsck check / repair report overlay, when open.
     fsck_report: Option<FsckReportView>,
     /// The whole-image "Transform" launcher menu (selected index), when open.
@@ -213,6 +215,10 @@ struct MetaEdit {
     type_code: String,
     creator: String,
     modified: String,
+    /// Creation date. Editable separately from `modified`, because a restored
+    /// file whose creation date has been reset to today has lost information
+    /// nothing else records.
+    created: String,
     /// Octal permission bits, or empty when the filesystem has none.
     mode: String,
     /// `uid:gid`, or empty when the filesystem has no ownership.
@@ -224,18 +230,20 @@ struct MetaEdit {
 
 impl MetaEdit {
     /// Field order in the editor, matching the render order.
-    const FIELDS: usize = 5;
+    const FIELDS: usize = 6;
     const F_TYPE: usize = 0;
     const F_CREATOR: usize = 1;
     const F_MODIFIED: usize = 2;
-    const F_MODE: usize = 3;
-    const F_OWNER: usize = 4;
+    const F_CREATED: usize = 3;
+    const F_MODE: usize = 4;
+    const F_OWNER: usize = 5;
 
     /// The text buffer for the focused field.
     fn focused_mut(&mut self) -> &mut String {
         match self.field {
             Self::F_CREATOR => &mut self.creator,
             Self::F_MODIFIED => &mut self.modified,
+            Self::F_CREATED => &mut self.created,
             Self::F_MODE => &mut self.mode,
             Self::F_OWNER => &mut self.owner,
             _ => &mut self.type_code,
@@ -321,6 +329,139 @@ const EXPORT_FORMATS: &[(&str, ExportFormat)] = &[
         ExportFormat::Archive(EsFormat::MacArchive),
     ),
 ];
+
+/// A small text editor over one file inside an image.
+///
+/// Exists because the `$EDITOR` round trip (`rb-cli edit`) needs a host, a
+/// temp directory and an editor to launch, and the machines this tool is
+/// pointed at often have none of those - a serial console on a vintage box, or
+/// the GUI, where shelling out is worse than useless. The conversion rules are
+/// the shared ones in [`crate::model::text_edit`], so a file edited here comes
+/// out byte-identical to one edited through `$EDITOR`.
+///
+/// Deliberately small: no undo, no search, no wrapping. It is for correcting a
+/// line in a config file, which is the job that has no other answer here.
+struct TextEditor {
+    name: String,
+    /// One entry per line, never empty (an empty file is one empty line).
+    lines: Vec<String>,
+    /// Cursor, as (line index, character index within that line).
+    row: usize,
+    col: usize,
+    scroll: usize,
+    dirty: bool,
+    /// How to put the file back the way it was found.
+    shape: crate::model::text_edit::TextShape,
+    /// Set when a save failed, shown in the editor's own status line.
+    status: Option<String>,
+    /// Esc with unsaved changes asks rather than discarding them.
+    confirm_discard: bool,
+}
+
+impl TextEditor {
+    fn new(name: String, decoded: crate::model::text_edit::DecodedText) -> Self {
+        // `split('\n')` rather than `lines()`: the latter swallows a trailing
+        // newline, so a file ending in one would lose it on every save.
+        let lines: Vec<String> = decoded.text.split('\n').map(str::to_string).collect();
+        Self {
+            name,
+            lines: if lines.is_empty() {
+                vec![String::new()]
+            } else {
+                lines
+            },
+            row: 0,
+            col: 0,
+            scroll: 0,
+            dirty: false,
+            shape: decoded.shape,
+            status: None,
+            confirm_discard: false,
+        }
+    }
+
+    /// The edited text, in the LF form `encode_after_edit` expects.
+    fn text(&self) -> String {
+        self.lines.join("\n")
+    }
+
+    fn cur_len(&self) -> usize {
+        self.lines[self.row].chars().count()
+    }
+
+    /// Byte offset of character index `col` in the current line, since Rust
+    /// strings are indexed by byte and a vintage file can hold multi-byte
+    /// characters once decoded.
+    fn byte_at(&self, col: usize) -> usize {
+        self.lines[self.row]
+            .char_indices()
+            .nth(col)
+            .map(|(i, _)| i)
+            .unwrap_or(self.lines[self.row].len())
+    }
+
+    fn insert(&mut self, c: char) {
+        let at = self.byte_at(self.col);
+        self.lines[self.row].insert(at, c);
+        self.col += 1;
+        self.dirty = true;
+    }
+
+    fn newline(&mut self) {
+        let at = self.byte_at(self.col);
+        let rest = self.lines[self.row].split_off(at);
+        self.lines.insert(self.row + 1, rest);
+        self.row += 1;
+        self.col = 0;
+        self.dirty = true;
+    }
+
+    fn backspace(&mut self) {
+        if self.col > 0 {
+            let at = self.byte_at(self.col - 1);
+            self.lines[self.row].remove(at);
+            self.col -= 1;
+            self.dirty = true;
+        } else if self.row > 0 {
+            // Joining lines is how a stray blank line gets removed, so it has
+            // to work, not just be a no-op at column zero.
+            let cur = self.lines.remove(self.row);
+            self.row -= 1;
+            self.col = self.cur_len();
+            self.lines[self.row].push_str(&cur);
+            self.dirty = true;
+        }
+    }
+
+    fn delete(&mut self) {
+        if self.col < self.cur_len() {
+            let at = self.byte_at(self.col);
+            self.lines[self.row].remove(at);
+            self.dirty = true;
+        } else if self.row + 1 < self.lines.len() {
+            let next = self.lines.remove(self.row + 1);
+            self.lines[self.row].push_str(&next);
+            self.dirty = true;
+        }
+    }
+
+    fn move_to(&mut self, row: usize, col: usize) {
+        self.row = row.min(self.lines.len() - 1);
+        self.col = col.min(self.cur_len());
+    }
+
+    /// Keep the cursor on screen for a viewport of `height` lines.
+    fn follow_cursor(&mut self, height: usize) {
+        if height == 0 {
+            return;
+        }
+        if self.row < self.scroll {
+            self.scroll = self.row;
+        } else if self.row >= self.scroll + height {
+            self.scroll = self.row + 1 - height;
+        }
+    }
+}
 
 /// A scrollable file view (text lines, or a hex dump for binary content).
 struct Preview {
@@ -3509,6 +3650,7 @@ impl App {
                 mkdir_input: None,
                 confirm_delete: None,
                 confirm_overwrite: None,
+                editor: None,
                 fsck_report: None,
                 transform_menu: None,
             };
@@ -3604,6 +3746,110 @@ impl App {
                 }
                 KeyCode::Enter => self.launch_transform(sel),
                 _ => {}
+            }
+            return;
+        }
+
+        // Text editor (modal). Checked before every other overlay: while it is
+        // open, keys are text, not commands.
+        if self
+            .explorer
+            .as_ref()
+            .map(|e| e.editor.is_some())
+            .unwrap_or(false)
+        {
+            let page = self.explorer_page();
+            let discarding = self
+                .explorer
+                .as_ref()
+                .and_then(|e| e.editor.as_ref())
+                .map(|ed| ed.confirm_discard)
+                .unwrap_or(false);
+            if discarding {
+                match code {
+                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                        if let Some(ex) = self.explorer.as_mut() {
+                            ex.editor = None;
+                        }
+                    }
+                    _ => {
+                        if let Some(ed) = self.explorer.as_mut().and_then(|e| e.editor.as_mut()) {
+                            ed.confirm_discard = false;
+                        }
+                    }
+                }
+                return;
+            }
+            // F2 saves, the Midnight Commander convention this TUI already
+            // follows. Deliberately not Ctrl-S: on a real serial console that
+            // is XOFF and freezes the terminal, and a serial console is exactly
+            // where this editor earns its place.
+            if matches!(code, KeyCode::F(2)) {
+                self.explorer_editor_save();
+                return;
+            }
+            let Some(ed) = self.explorer.as_mut().and_then(|e| e.editor.as_mut()) else {
+                return;
+            };
+            ed.status = None;
+            match code {
+                KeyCode::Esc => {
+                    if ed.dirty {
+                        // Losing an edit to a stray Esc is exactly the failure
+                        // this whole feature exists to avoid.
+                        ed.confirm_discard = true;
+                    } else {
+                        self.explorer.as_mut().unwrap().editor = None;
+                        return;
+                    }
+                }
+                KeyCode::Char(c) => ed.insert(c),
+                KeyCode::Enter => ed.newline(),
+                KeyCode::Backspace => ed.backspace(),
+                KeyCode::Delete => ed.delete(),
+                KeyCode::Tab => {
+                    for _ in 0..4 {
+                        ed.insert(' ');
+                    }
+                }
+                KeyCode::Left => {
+                    if ed.col > 0 {
+                        ed.col -= 1;
+                    } else if ed.row > 0 {
+                        let r = ed.row - 1;
+                        let c = ed.lines[r].chars().count();
+                        ed.move_to(r, c);
+                    }
+                }
+                KeyCode::Right => {
+                    if ed.col < ed.cur_len() {
+                        ed.col += 1;
+                    } else if ed.row + 1 < ed.lines.len() {
+                        ed.move_to(ed.row + 1, 0);
+                    }
+                }
+                KeyCode::Up => {
+                    let (r, c) = (ed.row.saturating_sub(1), ed.col);
+                    ed.move_to(r, c);
+                }
+                KeyCode::Down => {
+                    let (r, c) = (ed.row + 1, ed.col);
+                    ed.move_to(r, c);
+                }
+                KeyCode::Home => ed.col = 0,
+                KeyCode::End => ed.col = ed.cur_len(),
+                KeyCode::PageUp => {
+                    let (r, c) = (ed.row.saturating_sub(page), ed.col);
+                    ed.move_to(r, c);
+                }
+                KeyCode::PageDown => {
+                    let (r, c) = (ed.row + page, ed.col);
+                    ed.move_to(r, c);
+                }
+                _ => {}
+            }
+            if let Some(ed) = self.explorer.as_mut().and_then(|e| e.editor.as_mut()) {
+                ed.follow_cursor(page);
             }
             return;
         }
@@ -3879,6 +4125,8 @@ impl App {
                 return;
             }
             // Edit metadata: HFS/HFS+ type/creator + modified date, and the
+            // `E` opens the in-app editor on the selected file.
+            KeyCode::Char('E') => self.explorer_edit(),
             // POSIX mode / owner on any filesystem that carries them. A
             // directory qualifies too — its permissions are as real as a
             // file's, even though it has no type code.
@@ -3898,6 +4146,10 @@ impl App {
                                 modified: e
                                     .mac_dates
                                     .map(|d| format_mac_date(d.1))
+                                    .unwrap_or_default(),
+                                created: e
+                                    .mac_dates
+                                    .map(|d| format_mac_date(d.0))
                                     .unwrap_or_default(),
                                 mode: e
                                     .mode
@@ -4124,6 +4376,110 @@ impl App {
         }
     }
 
+    /// Open the selected file in the in-app editor.
+    fn explorer_edit(&mut self) {
+        use crate::model::text_edit::{decode_for_edit, TextEditError};
+        const LIMIT: usize = 1024 * 1024;
+
+        let Some(ex) = self.explorer.as_mut() else {
+            return;
+        };
+        let Some(entry) = ex.selected_entry().cloned() else {
+            return;
+        };
+        if entry.is_directory() {
+            ex.status = Some("Not a file".to_string());
+            return;
+        }
+        // A cap, because this holds the whole file in memory as lines and the
+        // editor has no business opening a disk image inside a disk image.
+        if entry.size > LIMIT as u64 {
+            ex.status = Some(format!(
+                "Too large to edit here ({} KiB); use rb-cli edit",
+                entry.size / 1024
+            ));
+            return;
+        }
+        let fs_type = ex.fs.fs_type().to_string();
+        let bytes = match ex.fs.read_file(&entry, LIMIT) {
+            Ok(b) => b,
+            Err(e) => {
+                ex.status = Some(format!("Cannot read: {e}"));
+                return;
+            }
+        };
+        match decode_for_edit(&bytes, &fs_type, None) {
+            Ok(decoded) => {
+                ex.editor = Some(TextEditor::new(entry.name.clone(), decoded));
+            }
+            Err(TextEditError::NotText { reason }) => {
+                // Refuse rather than mangle: a round trip through a text editor
+                // does not preserve arbitrary bytes.
+                ex.status = Some(format!("Not a text file ({reason})"));
+            }
+            Err(e) => ex.status = Some(format!("Cannot edit: {e}")),
+        }
+    }
+
+    /// Write the editor's contents back through the shared replace path.
+    fn explorer_editor_save(&mut self) {
+        use crate::model::text_edit::{encode_after_edit, TextEditError};
+
+        let Some(ex) = self.explorer.as_ref() else {
+            return;
+        };
+        let Some(ed) = ex.editor.as_ref() else {
+            return;
+        };
+        let (image_path, selector, part_label, cur_dir, comps) = (
+            ex.image_path.clone(),
+            ex.selector,
+            ex.part_label.clone(),
+            ex.path_display(),
+            ex.dir_components(),
+        );
+        let (name, text, shape) = (ed.name.clone(), ed.text(), ed.shape);
+
+        let bytes = match encode_after_edit(&text, &shape, false) {
+            Ok(b) => b,
+            Err(e @ TextEditError::Unrepresentable { .. }) => {
+                // Named in place, and nothing written - the same contract the
+                // CLI gives, because silently substituting is how a vintage
+                // text file stops saying what it said.
+                if let Some(ed) = self.explorer.as_mut().and_then(|e| e.editor.as_mut()) {
+                    ed.status = Some(format!("Cannot save as {}: {e}", shape.encoding.label()));
+                }
+                return;
+            }
+            Err(e) => {
+                if let Some(ed) = self.explorer.as_mut().and_then(|e| e.editor.as_mut()) {
+                    ed.status = Some(format!("Cannot save: {e}"));
+                }
+                return;
+            }
+        };
+
+        match write_file_bytes(&image_path, selector, &cur_dir, &name, &bytes) {
+            Ok(()) => {
+                if let Some(ex) = self.explorer.as_mut() {
+                    ex.editor = None;
+                }
+                self.reopen_explorer(
+                    &image_path,
+                    selector,
+                    part_label,
+                    &comps,
+                    Some(format!("Saved {name} ({} bytes)", bytes.len())),
+                );
+            }
+            Err(e) => {
+                if let Some(ed) = self.explorer.as_mut().and_then(|e| e.editor.as_mut()) {
+                    ed.status = Some(format!("Save failed: {e:#}"));
+                }
+            }
+        }
+    }
+
     /// Import a host file (already validated by the picker) into the current
     /// Explorer directory (opens the partition read-write, reusing the `put`
     /// core), then refresh the view.
@@ -4195,11 +4551,12 @@ impl App {
             ex.path_display(),
             ex.dir_components(),
         );
-        let (name, ty, cr, modstr) = (
+        let (name, ty, cr, modstr, crestr) = (
             m.entry_name.clone(),
             m.type_code.clone(),
             m.creator.clone(),
             m.modified.clone(),
+            m.created.clone(),
         );
         // POSIX fields: blank means "leave alone" (and is what a filesystem
         // without them always shows).
@@ -4247,10 +4604,24 @@ impl App {
                 }
             }
         };
+        let create_mac = if crestr.trim().is_empty() {
+            None
+        } else {
+            match parse_mac_date(&crestr) {
+                Some(v) => Some(v),
+                None => {
+                    if let Some(m) = self.explorer.as_mut().and_then(|e| e.metadata.as_mut()) {
+                        m.error = Some("Bad created date - use YYYY-MM-DD HH:MM:SS".to_string());
+                    }
+                    return;
+                }
+            }
+        };
         let values = MetaEditValues {
             type_code: ty,
             creator: cr,
             modify_mac,
+            create_mac,
             mode: new_mode,
             owner: new_owner,
         };
@@ -7272,6 +7643,7 @@ impl App {
                 field(MetaEdit::F_TYPE, "Type:", &m.type_code),
                 field(MetaEdit::F_CREATOR, "Creator:", &m.creator),
                 field(MetaEdit::F_MODIFIED, "Modified:", &m.modified),
+                field(MetaEdit::F_CREATED, "Created:", &m.created),
                 field(MetaEdit::F_MODE, "Mode:", &m.mode),
                 field(MetaEdit::F_OWNER, "Owner:", &m.owner),
             ];
@@ -7387,6 +7759,73 @@ impl App {
                 .block(self.pane_block("New folder", true)),
                 cp,
             );
+        }
+
+        // Text editor overlay.
+        if let Some(ed) = &ex.editor {
+            let ep = centered_rect(
+                area.width.saturating_sub(4),
+                area.height.saturating_sub(4),
+                area,
+            );
+            frame.render_widget(Clear, ep);
+            let inner_h = ep.height.saturating_sub(2) as usize;
+            let visible = ed
+                .lines
+                .iter()
+                .enumerate()
+                .skip(ed.scroll)
+                .take(inner_h.saturating_sub(1))
+                .map(|(i, l)| {
+                    if i == ed.row {
+                        // Mark the cursor line: a block cursor cannot be drawn
+                        // portably here, and losing track of the cursor in a
+                        // config file is how the wrong line gets edited.
+                        Line::styled(format!("{:>4} >{l}", i + 1), self.palette.accent())
+                    } else {
+                        Line::raw(format!("{:>4}  {l}", i + 1))
+                    }
+                })
+                .collect::<Vec<_>>();
+            let mut lines = visible;
+            let footer = match &ed.status {
+                Some(msg) => msg.clone(),
+                None => format!(
+                    "line {}/{} col {}  |  {} {}  |  F2 save   Esc close{}",
+                    ed.row + 1,
+                    ed.lines.len(),
+                    ed.col + 1,
+                    ed.shape.encoding.label(),
+                    ed.shape.ending.label(),
+                    if ed.dirty { "   *modified" } else { "" },
+                ),
+            };
+            lines.push(Line::styled(
+                footer,
+                if ed.status.is_some() {
+                    self.palette.warn()
+                } else {
+                    self.palette.dim()
+                },
+            ));
+            let title = format!("Edit  {}{}", ed.name, if ed.dirty { " *" } else { "" });
+            frame.render_widget(
+                Paragraph::new(Text::from(lines)).block(self.pane_block(&title, true)),
+                ep,
+            );
+
+            if ed.confirm_discard {
+                let cp = centered_rect(52, 5, area);
+                frame.render_widget(Clear, cp);
+                frame.render_widget(
+                    Paragraph::new(Text::from(vec![
+                        Line::raw(""),
+                        Line::styled("  Discard unsaved changes?  (y / n)", self.palette.warn()),
+                    ]))
+                    .block(self.pane_block("Unsaved changes", true)),
+                    cp,
+                );
+            }
         }
 
         // Overwrite confirmation. Says what will be kept, because "replace"
@@ -10138,6 +10577,7 @@ struct MetaEditValues {
     type_code: String,
     creator: String,
     modify_mac: Option<u32>,
+    create_mac: Option<u32>,
     mode: Option<u32>,
     owner: Option<(u32, u32)>,
 }
@@ -10156,10 +10596,12 @@ fn apply_metadata_edit(
         type_code,
         creator,
         modify_mac,
+        create_mac,
         mode: new_mode,
         owner: new_owner,
     } = values;
-    let (modify_mac, new_mode, new_owner) = (*modify_mac, *new_mode, *new_owner);
+    let (modify_mac, create_mac, new_mode, new_owner) =
+        (*modify_mac, *create_mac, *new_mode, *new_owner);
     use crate::cli::resolve::resolve_partition_rw_forced;
     let dst = if cur_dir == "/" {
         format!("/{name}")
@@ -10187,9 +10629,17 @@ fn apply_metadata_edit(
         fs.set_owner(&entry, uid, gid)
             .map_err(|e| anyhow::anyhow!("set owner: {e}"))?;
     }
-    if let Some(modify) = modify_mac {
-        let (create, _, backup) = entry.mac_dates.unwrap_or((modify, modify, modify));
-        fs.set_dates(&entry, create, modify, backup)
+    // Either date may be edited on its own, so start from what the file has
+    // and override only what was filled in. Writing today's date into the
+    // untouched half is how a restored file quietly loses its creation date.
+    if modify_mac.is_some() || create_mac.is_some() {
+        let (cur_create, cur_modify, cur_backup) = entry.mac_dates.unwrap_or_else(|| {
+            let now = modify_mac.or(create_mac).unwrap_or(0);
+            (now, now, now)
+        });
+        let create = create_mac.unwrap_or(cur_create);
+        let modify = modify_mac.unwrap_or(cur_modify);
+        fs.set_dates(&entry, create, modify, cur_backup)
             .map_err(|e| anyhow::anyhow!("set dates: {e}"))?;
     }
     fs.sync_metadata()
@@ -10413,6 +10863,48 @@ fn apply_delete(
     let entry = crate::cli::verbs::ls::resolve_path(fs.as_filesystem_mut(), &child_path)?;
     fs.delete_recursive(&parent, &entry)
         .map_err(|e| anyhow::anyhow!("delete: {e}"))?;
+    fs.sync_metadata()
+        .map_err(|e| anyhow::anyhow!("sync_metadata: {e}"))?;
+    drop(fs);
+    commit.commit()?;
+    Ok(())
+}
+
+/// Replace one file's contents in an image, preserving what it carried.
+///
+/// The editor's save path. Goes through `fs::replace` like every other write
+/// here, so the edited file keeps its permissions, dates and type, and a
+/// failure part-way leaves the original intact.
+fn write_file_bytes(
+    image_path: &str,
+    selector: Option<u32>,
+    cur_dir: &str,
+    name: &str,
+    bytes: &[u8],
+) -> anyhow::Result<()> {
+    use crate::cli::resolve::resolve_partition_rw_forced;
+    let dst = if cur_dir == "/" {
+        format!("/{name}")
+    } else {
+        format!("{cur_dir}/{name}")
+    };
+    let (file, ctx, commit) =
+        resolve_partition_rw_forced(std::path::Path::new(image_path), selector, None)?;
+    let mut fs = ctx
+        .open_editable(file)
+        .map_err(|e| anyhow::anyhow!("opening filesystem for write: {e}"))?;
+    let (parent, leaf) = crate::cli::verbs::ls::resolve_parent(fs.as_filesystem_mut(), &dst)?;
+    let mut reader = std::io::Cursor::new(bytes.to_vec());
+    crate::fs::replace::create_or_replace(
+        fs.as_mut(),
+        &parent,
+        &leaf,
+        &mut reader,
+        bytes.len() as u64,
+        &crate::fs::filesystem::CreateFileOptions::default(),
+        crate::fs::replace::ReplacePolicy::replace(),
+    )
+    .map_err(|e| anyhow::anyhow!("writing {leaf}: {e}"))?;
     fs.sync_metadata()
         .map_err(|e| anyhow::anyhow!("sync_metadata: {e}"))?;
     drop(fs);
@@ -10795,6 +11287,92 @@ mod tests {
         );
     }
 
+    /// The editing core, without a terminal: the operations a user performs to
+    /// correct a line in a config file must produce exactly the expected text.
+    #[test]
+    fn the_editor_edits_text_the_way_typing_would() {
+        use crate::model::text_edit::decode_for_edit;
+
+        let decoded = decode_for_edit(b"one\ntwo\nthree\n", "ext4", None).unwrap();
+        let mut ed = TextEditor::new("f.txt".into(), decoded);
+        // A trailing newline is a trailing empty line, and must survive: losing
+        // it on every save would rewrite files nobody edited.
+        assert_eq!(ed.lines, vec!["one", "two", "three", ""]);
+        assert!(!ed.dirty);
+
+        // Type at the end of line 2.
+        ed.move_to(1, 3);
+        for c in "-and-a-half".chars() {
+            ed.insert(c);
+        }
+        assert_eq!(ed.lines[1], "two-and-a-half");
+        assert!(ed.dirty);
+
+        // Split a line, then join it back with backspace at column zero.
+        ed.move_to(0, 3);
+        ed.newline();
+        assert_eq!(ed.lines[0], "one");
+        assert_eq!(ed.lines[1], "");
+        ed.backspace();
+        assert_eq!(ed.lines[0], "one");
+        assert_eq!(ed.lines.len(), 4);
+
+        // Delete at end-of-line joins with the next, which is how a stray blank
+        // line gets removed.
+        ed.move_to(2, 5);
+        ed.delete();
+        assert_eq!(ed.lines[2], "three");
+
+        assert_eq!(ed.text(), "one\ntwo-and-a-half\nthree");
+    }
+
+    /// The cursor is a character index, not a byte index - a decoded vintage
+    /// file can hold multi-byte characters, and indexing a Rust string by byte
+    /// at the wrong place panics.
+    #[test]
+    fn the_editor_handles_multibyte_characters() {
+        use crate::model::text_edit::decode_for_edit;
+
+        let decoded = decode_for_edit("café ok\n".as_bytes(), "ext4", None).unwrap();
+        let mut ed = TextEditor::new("f".into(), decoded);
+        // Position after the accented character.
+        ed.move_to(0, 4);
+        ed.insert('!');
+        assert_eq!(ed.lines[0], "café! ok");
+        ed.backspace();
+        assert_eq!(ed.lines[0], "café ok");
+        // And deleting the multi-byte character itself.
+        ed.move_to(0, 3);
+        ed.delete();
+        assert_eq!(ed.lines[0], "caf ok");
+    }
+
+    /// The viewport follows the cursor, or editing past the bottom of the
+    /// window edits lines the user cannot see.
+    #[test]
+    fn the_editor_scrolls_to_keep_the_cursor_visible() {
+        use crate::model::text_edit::decode_for_edit;
+
+        let body = (0..50)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let decoded = decode_for_edit(body.as_bytes(), "ext4", None).unwrap();
+        let mut ed = TextEditor::new("f".into(), decoded);
+
+        ed.move_to(40, 0);
+        ed.follow_cursor(10);
+        assert!(
+            ed.scroll <= 40 && 40 < ed.scroll + 10,
+            "cursor must be on screen, scroll={}",
+            ed.scroll
+        );
+
+        ed.move_to(0, 0);
+        ed.follow_cursor(10);
+        assert_eq!(ed.scroll, 0, "scrolling back up must follow too");
+    }
+
     /// Importing onto an existing name must offer to replace, not dead-end.
     ///
     /// `import_host_file` used to `bail!("already exists")`, so the only way to
@@ -11053,6 +11631,7 @@ mod tests {
                 type_code: String::new(), // ext has no type code
                 creator: String::new(),   // nor a creator
                 modify_mac: None,         // nor Mac dates
+                create_mac: None,
                 mode: Some(0o750),
                 owner: Some((4242, 4243)),
             },

@@ -1370,6 +1370,25 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AffsFilesystem<R> {
         Ok(())
     }
 
+    fn set_amiga_protection(
+        &mut self,
+        entry: &FileEntry,
+        protection: u32,
+    ) -> Result<(), FilesystemError> {
+        // The protection word lives in the entry's own header block, so this is
+        // a read-modify-write of one block plus its checksum - no directory
+        // walk, and nothing else in the volume moves.
+        let block = entry.location as u32;
+        let mut buf = self.read_block(block)?;
+        buf[0x140..0x144].copy_from_slice(&protection.to_be_bytes());
+        // The checksum covers the whole block, so it has to be recomputed or
+        // the volume reads as corrupt on the next mount.
+        let sum = normal_checksum(&buf, 5);
+        buf[0x14..0x18].copy_from_slice(&sum.to_be_bytes());
+        self.write_block_cached(block, buf);
+        Ok(())
+    }
+
     fn rename(
         &mut self,
         parent: &FileEntry,
@@ -2617,6 +2636,54 @@ mod tests {
         assert!(out[880 * BSIZE..881 * BSIZE].iter().any(|&b| b != 0));
         // Block 881 should have the bitmap — non-zero.
         assert!(out[881 * BSIZE..882 * BSIZE].iter().any(|&b| b != 0));
+    }
+
+    /// Protection bits must be editable on an existing file, not only settable
+    /// at creation - the whole point of a metadata editor.
+    #[test]
+    fn set_amiga_protection_round_trips_and_keeps_the_volume_valid() {
+        use crate::fs::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+        use std::io::Cursor;
+
+        let img = create_blank_affs(880 * 1024, 1, "PROT").unwrap();
+        let mut buf = img.clone();
+        let mut fs = AffsFilesystem::open(Cursor::new(&mut buf), 0).unwrap();
+        let root = fs.root().unwrap();
+        let mut data = Cursor::new(b"payload".to_vec());
+        fs.create_file(&root, "P.TXT", &mut data, 7, &CreateFileOptions::default())
+            .unwrap();
+
+        let find = |fs: &mut AffsFilesystem<Cursor<&mut Vec<u8>>>| {
+            let root = fs.root().unwrap();
+            fs.list_directory(&root)
+                .unwrap()
+                .into_iter()
+                .find(|e| e.name == "P.TXT")
+                .expect("entry")
+        };
+
+        // HSPARWED: set a recognisable pattern.
+        let e = find(&mut fs);
+        fs.set_amiga_protection(&e, 0x0000_00A5).expect("set");
+        fs.sync_metadata().expect("sync");
+
+        let e = find(&mut fs);
+        assert_eq!(
+            e.amiga_protection,
+            Some(0x0000_00A5),
+            "protection bits should read back as written"
+        );
+
+        // The block checksum has to be recomputed or the volume reads as
+        // corrupt - listing it again is the cheapest proof it was.
+        let root = fs.root().unwrap();
+        assert!(
+            fs.list_directory(&root).is_ok(),
+            "the volume must still parse after the edit"
+        );
+        // And the file's contents are untouched by a metadata-only change.
+        let e = find(&mut fs);
+        assert_eq!(fs.read_file(&e, usize::MAX).unwrap(), b"payload");
     }
 
     /// Verify that `CreateFileOptions::amiga_protection` /

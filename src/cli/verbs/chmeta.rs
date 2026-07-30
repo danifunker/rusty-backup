@@ -34,6 +34,62 @@ pub struct ChmetaArgs {
     /// as the start of another flag.
     #[arg(long, allow_hyphen_values = true)]
     pub attrs: Option<String>,
+
+    /// AmigaDOS protection bits (AFFS / PFS3 / SFS), as the letters AmigaDOS
+    /// itself prints: `hsparwed`. Letters present are set, absent are clear, so
+    /// `--protection rwed` is the ordinary state and `--protection rwd` marks a
+    /// file unexecutable.
+    #[arg(long)]
+    pub protection: Option<String>,
+}
+
+/// Parse the AmigaDOS `hsparwed` protection letters into the access longword.
+///
+/// The low four bits are **inverted** on Amiga: a set bit means the operation
+/// is *denied*. So the letters a user types (what they want to allow) are the
+/// complement of what goes on disk, and getting that backwards silently makes
+/// every file unreadable rather than failing loudly.
+fn parse_protection(spec: &str) -> Result<u32> {
+    let mut deny_bits = 0u32; // RWED, active-low
+    let mut extra = 0u32; // HSPA, active-high
+    let mut seen = [false; 8];
+    for c in spec.chars().filter(|c| !c.is_whitespace()) {
+        let (idx, bit, low) = match c.to_ascii_lowercase() {
+            'd' => (0, 1 << 0, true),
+            'e' => (1, 1 << 1, true),
+            'w' => (2, 1 << 2, true),
+            'r' => (3, 1 << 3, true),
+            'a' => (4, 1 << 4, false),
+            'p' => (5, 1 << 5, false),
+            's' => (6, 1 << 6, false),
+            'h' => (7, 1 << 7, false),
+            other => bail!("unknown protection letter {other:?}; expected h s p a r w e d"),
+        };
+        if seen[idx] {
+            bail!("protection letter {c:?} given twice");
+        }
+        seen[idx] = true;
+        if low {
+            deny_bits |= bit;
+        } else {
+            extra |= bit;
+        }
+    }
+    // Present letters mean "allowed", and allowed is a *clear* bit on disk.
+    Ok((!deny_bits & 0x0F) | extra)
+}
+
+/// Render an access longword back as the AmigaDOS letters.
+fn describe_protection(a: u32) -> String {
+    let mut out = String::new();
+    for (bit, ch) in [(1 << 7, 'h'), (1 << 6, 's'), (1 << 5, 'p'), (1 << 4, 'a')] {
+        out.push(if a & bit != 0 { ch } else { '-' });
+    }
+    for (bit, ch) in [(1 << 3, 'r'), (1 << 2, 'w'), (1 << 1, 'e'), (1 << 0, 'd')] {
+        // Active-low: a clear bit means the operation is permitted.
+        out.push(if a & bit == 0 { ch } else { '-' });
+    }
+    out
 }
 
 /// Parse the `--attrs` grammar into `(set_mask, clear_mask, absolute)`.
@@ -84,8 +140,12 @@ fn parse_attrs(spec: &str) -> Result<(u16, u16, bool)> {
 }
 
 pub fn run(args: ChmetaArgs) -> Result<()> {
-    if args.type_code.is_none() && args.creator.is_none() && args.attrs.is_none() {
-        bail!("chmeta: pass at least one of --type, --creator or --attrs");
+    if args.type_code.is_none()
+        && args.creator.is_none()
+        && args.attrs.is_none()
+        && args.protection.is_none()
+    {
+        bail!("chmeta: pass at least one of --type, --creator, --attrs or --protection");
     }
     let (file, ctx, commit) = resolve_partition_rw(&args.image.path, args.image.partition)?;
     log_stderr(&ctx.label);
@@ -111,6 +171,18 @@ pub fn run(args: ChmetaArgs) -> Result<()> {
             args.path,
             describe_attrs(current),
             describe_attrs(next),
+        ));
+    }
+    if let Some(spec) = args.protection.as_deref() {
+        let next = parse_protection(spec)?;
+        let current = entry.amiga_protection.unwrap_or(0);
+        fs.set_amiga_protection(&entry, next)
+            .map_err(|e| anyhow!("set_amiga_protection: {e}"))?;
+        log_stderr(format!(
+            "{}: protection {} -> {}",
+            args.path,
+            describe_protection(current),
+            describe_protection(next),
         ));
     }
     if args.type_code.is_none() && args.creator.is_none() {
@@ -170,6 +242,33 @@ fn describe_attrs(a: u16) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The low four bits are active-low on Amiga, so the letters a user types
+    /// are the complement of the bits on disk. Getting this backwards would
+    /// make every edited file unreadable, silently.
+    #[test]
+    fn protection_letters_account_for_the_active_low_rwed_bits() {
+        // Fully permitted is all four low bits *clear*.
+        assert_eq!(parse_protection("rwed").unwrap() & 0x0F, 0x00);
+        // Denying execute sets that bit.
+        assert_eq!(parse_protection("rwd").unwrap() & 0x0F, 0x02);
+        // The high bits are ordinary active-high flags.
+        assert_eq!(parse_protection("hrwed").unwrap(), 0x80);
+
+        // Round trip through the renderer.
+        for spec in ["rwed", "rwd", "hsrwed", ""] {
+            let bits = parse_protection(spec).unwrap();
+            let shown = describe_protection(bits);
+            assert_eq!(
+                parse_protection(&shown.replace('-', "")).unwrap(),
+                bits,
+                "{spec} -> {shown} should round trip"
+            );
+        }
+
+        assert!(parse_protection("rr").is_err(), "a repeat is a typo");
+        assert!(parse_protection("z").is_err());
+    }
 
     #[test]
     fn attrs_grammar_covers_absolute_and_delta_forms() {
