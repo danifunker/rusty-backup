@@ -499,7 +499,15 @@ impl FilePicker {
     fn validate(&mut self, path: std::path::PathBuf) -> Option<PickResult> {
         let ok = match self.kind {
             PickKind::Any => path.exists(),
-            PickKind::File => path.is_file(),
+            // A raw device (`/dev/sda`, `/dev/disk0`) is neither a regular file
+            // nor a directory, so `is_file()` rejected every one of them with
+            // "No such file" - for something plainly present. Accepting
+            // "exists and is not a directory" lets a device be typed wherever an
+            // image can be, which is what makes Commander able to open a raw
+            // partition at all. Everything downstream already copes: the
+            // partition probe reads through a plain reader, and sizes come from
+            // seeking rather than `metadata.len()` (which is 0 for a device).
+            PickKind::File => path.exists() && !path.is_dir(),
             PickKind::Dir => path.is_dir(),
         };
         if ok {
@@ -510,7 +518,13 @@ impl FilePicker {
                 PickKind::File => "file",
                 PickKind::Any => "path",
             };
-            self.error = Some(format!("No such {what}: {}", path.display()));
+            // Distinguish "wrong kind" from "absent"; the old message claimed
+            // absence for both.
+            self.error = Some(if path.exists() {
+                format!("Not a {what}: {}", path.display())
+            } else {
+                format!("No such {what}: {}", path.display())
+            });
             None
         }
     }
@@ -1835,7 +1849,31 @@ impl CommanderState {
             }
         }
 
-        let parts = crate::model::commander_source::probe_partitions(&path).unwrap_or_default();
+        // Report a probe failure instead of discarding it. On a raw device this
+        // is normally "needs elevation", and `unwrap_or_default()` turned that
+        // into an empty partition list, which then failed one step later trying
+        // to open a filesystem at offset 0 - an error that named the filesystem
+        // and never mentioned privileges.
+        let parts = match crate::model::commander_source::probe_partitions(&path) {
+            Ok(p) => p,
+            Err(e) => {
+                let denied = e
+                    .chain()
+                    .any(|c| c.to_string().to_lowercase().contains("permission denied"));
+                if denied {
+                    self.status = Some(format!(
+                        "{}: permission denied - raw device access needs elevation; \
+                         re-run rb-cli tui elevated",
+                        path.display()
+                    ));
+                    self.is_error = true;
+                    return;
+                }
+                // Not a privilege problem: it may legitimately have no table
+                // (a superfloppy), so fall through and try it as one volume.
+                Vec::new()
+            }
+        };
         if parts.len() > 1 {
             let p = self.pane_mut(side);
             p.parts = parts;
@@ -10657,6 +10695,48 @@ mod tests {
             "the disk's hardware facts must come along so the header can show \
              them instead of needing a screen of their own"
         );
+    }
+
+    /// The file picker must accept a raw device path.
+    ///
+    /// `PickKind::File` gated on `is_file()`, which is false for a block device,
+    /// so every picker in the TUI - Commander's image open included - refused
+    /// `/dev/sda` with "No such file". That single line was what stopped
+    /// Commander from opening a raw disk partition at all.
+    #[test]
+    fn the_file_picker_accepts_a_device_and_still_rejects_a_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("img.bin");
+        std::fs::write(&file, b"x").unwrap();
+
+        let mut p = FilePicker::new(PickKind::File, "Open");
+        assert!(
+            p.validate(file.clone()).is_some(),
+            "a regular file must still be accepted"
+        );
+
+        // A directory is the wrong kind and must stay rejected, with a message
+        // that says so rather than claiming the path is absent.
+        let mut p = FilePicker::new(PickKind::File, "Open");
+        assert!(p.validate(dir.path().to_path_buf()).is_none());
+        let err = p.error.clone().unwrap_or_default();
+        assert!(
+            err.contains("Not a file"),
+            "an existing directory should report the wrong kind, got: {err}"
+        );
+
+        // Character devices exist on every platform this runs on and are, like
+        // block devices, neither file nor directory - the exact shape that used
+        // to be rejected.
+        let devnull = std::path::PathBuf::from("/dev/null");
+        if devnull.exists() {
+            let mut p = FilePicker::new(PickKind::File, "Open");
+            assert!(
+                p.validate(devnull).is_some(),
+                "a device node must be accepted: {:?}",
+                p.error
+            );
+        }
     }
 
     /// Esc from the merged view goes straight back to the disk list - one level,
