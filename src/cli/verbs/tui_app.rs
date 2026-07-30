@@ -3788,6 +3788,27 @@ impl App {
                 self.explorer_editor_save();
                 return;
             }
+            // F3 cycles the line endings the file will be saved with. Endings
+            // are read from the file on open, never assumed - this is for when
+            // the file itself is wrong.
+            if matches!(code, KeyCode::F(3)) {
+                if let Some(ed) = self.explorer.as_mut().and_then(|e| e.editor.as_mut()) {
+                    use crate::model::text_edit::LineEnding;
+                    ed.shape.ending = match ed.shape.ending {
+                        LineEnding::Lf => LineEnding::CrLf,
+                        LineEnding::CrLf => LineEnding::Cr,
+                        LineEnding::Cr => LineEnding::Lf,
+                    };
+                    // A conversion is a change even when no character was
+                    // typed, so Esc must warn about it like any other edit.
+                    ed.dirty = true;
+                    ed.status = Some(format!(
+                        "Line endings will be saved as {}",
+                        ed.shape.ending.label()
+                    ));
+                }
+                return;
+            }
             let Some(ed) = self.explorer.as_mut().and_then(|e| e.editor.as_mut()) else {
                 return;
             };
@@ -7791,7 +7812,7 @@ impl App {
             let footer = match &ed.status {
                 Some(msg) => msg.clone(),
                 None => format!(
-                    "line {}/{} col {}  |  {} {}  |  F2 save   Esc close{}",
+                    "line {}/{} col {}  |  {} {}  |  F2 save  F3 endings  Esc close{}",
                     ed.row + 1,
                     ed.lines.len(),
                     ed.col + 1,

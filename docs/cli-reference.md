@@ -658,6 +658,8 @@ Usage: edit [OPTIONS] <IMAGE> <PATH>
 - `--editor` — Editor to run. Defaults to `$VISUAL`, then `$EDITOR`, then `vi` (`notepad` on Windows)
 - `--encoding` — Force the file's character encoding instead of inferring it
 - `--force-substitute` — Write a best-effort replacement for characters the file's encoding cannot represent, instead of refusing
+- `--line-endings` — Write the file with these line endings instead of the ones it has
+- `--no-edit` — Convert without opening an editor
 - `--force-binary` — Edit the file as text even if it looks binary. Almost never what you want — a round trip through an editor will not preserve arbitrary bytes
 - `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zxplus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
 - `--carve-full` — Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga "NDOS" disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem

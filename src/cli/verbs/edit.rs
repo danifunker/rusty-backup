@@ -51,6 +51,24 @@ pub struct EditArgs {
     #[arg(long = "force-substitute")]
     pub force_substitute: bool,
 
+    /// Write the file with these line endings instead of the ones it has.
+    ///
+    /// One of `lf` (`unix`), `crlf` (`dos`) or `cr` (`mac`). Without this the
+    /// file keeps whatever it was found with — endings are read from the
+    /// content, never assumed from the filesystem, because a DOS-formatted
+    /// volume holds LF-only files all the time.
+    ///
+    /// Applies to the whole file, so it also repairs one with mixed endings.
+    #[arg(long = "line-endings")]
+    pub line_endings: Option<String>,
+
+    /// Convert without opening an editor.
+    ///
+    /// For repairing files in bulk: `--line-endings crlf --no-edit` rewrites
+    /// the endings and changes nothing else.
+    #[arg(long = "no-edit")]
+    pub no_edit: bool,
+
     /// Edit the file as text even if it looks binary. Almost never what you
     /// want — a round trip through an editor will not preserve arbitrary bytes.
     #[arg(long)]
@@ -61,6 +79,16 @@ pub struct EditArgs {
 }
 
 pub fn run(args: EditArgs) -> Result<()> {
+    let target_endings = match args.line_endings.as_deref() {
+        Some(name) => Some(
+            crate::model::text_edit::LineEnding::parse(name)
+                .ok_or_else(|| anyhow!("unknown --line-endings value: {name}"))?,
+        ),
+        None => None,
+    };
+    if args.no_edit && target_endings.is_none() {
+        bail!("--no-edit needs something to change; pass --line-endings too");
+    }
     let forced = match args.encoding.as_deref() {
         Some(name) => Some(
             TextEncoding::parse(name).ok_or_else(|| anyhow!("unknown --encoding value: {name}"))?,
@@ -120,6 +148,50 @@ pub fn run(args: EditArgs) -> Result<()> {
 
     // A real file on the host, so the editor behaves normally: a name it can
     // syntax-highlight, and a directory it can write a swapfile into.
+    // The shape actually written: the file's own, with the requested endings
+    // substituted when asked.
+    let mut out_shape = decoded.shape;
+    if let Some(target) = target_endings {
+        if target != decoded.shape.ending {
+            log_stderr(format!(
+                "converting line endings {} -> {}",
+                decoded.shape.ending.label(),
+                target.label()
+            ));
+        }
+        out_shape.ending = target;
+    }
+
+    if args.no_edit {
+        // Nothing to edit, but there is still something to write: re-encode the
+        // untouched text under the new shape.
+        let bytes = encode_after_edit(&decoded.text, &out_shape, args.force_substitute)
+            .map_err(|e| anyhow!("{}: {e}", args.path))?;
+        let mut reader = std::io::Cursor::new(bytes.clone());
+        crate::fs::replace::create_or_replace(
+            fs.as_mut(),
+            &parent,
+            &name,
+            &mut reader,
+            bytes.len() as u64,
+            &CreateFileOptions::default(),
+            crate::fs::replace::ReplacePolicy::replace(),
+        )
+        .map_err(|e| anyhow!("writing {}: {e}", args.path))?;
+        fs.sync_metadata()
+            .map_err(|e| anyhow!("sync_metadata: {e}"))?;
+        drop(fs);
+        commit.commit()?;
+        log_stderr(format!(
+            "wrote {} bytes back to {} as {} with {} endings",
+            bytes.len(),
+            args.path,
+            out_shape.encoding.label(),
+            out_shape.ending.label(),
+        ));
+        return Ok(());
+    }
+
     let tmp = tempfile::Builder::new()
         .prefix("rb-edit-")
         .tempdir()
@@ -133,19 +205,19 @@ pub fn run(args: EditArgs) -> Result<()> {
 
     let edited = std::fs::read_to_string(&host_path)
         .with_context(|| format!("reading back {}", host_path.display()))?;
-    if edited == before {
+    if edited == before && out_shape.ending == decoded.shape.ending {
         log_stderr("No changes; nothing written");
         return Ok(());
     }
 
-    let bytes = match encode_after_edit(&edited, &decoded.shape, args.force_substitute) {
+    let bytes = match encode_after_edit(&edited, &out_shape, args.force_substitute) {
         Ok(b) => b,
         Err(e @ TextEditError::Unrepresentable { .. }) => {
             bail!(
                 "cannot write {} as {}\n  {e}\n  nothing was written; edit the character \
                  or pass --force-substitute",
                 args.path,
-                decoded.shape.encoding.label(),
+                out_shape.encoding.label(),
             );
         }
         Err(e) => bail!("{}: {e}", args.path),
@@ -178,8 +250,8 @@ pub fn run(args: EditArgs) -> Result<()> {
         "wrote {} bytes back to {} as {} with {} endings{kept}",
         bytes.len(),
         args.path,
-        decoded.shape.encoding.label(),
-        decoded.shape.ending.label(),
+        out_shape.encoding.label(),
+        out_shape.ending.label(),
     ));
     if outcome.unsafe_fallback {
         log_stderr(

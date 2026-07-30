@@ -89,6 +89,19 @@ impl LineEnding {
         }
     }
 
+    /// Parse a `--line-endings` value.
+    ///
+    /// Named the way people describe them rather than by control character:
+    /// someone repairing a file thinks "make it DOS", not "make it 0x0D 0x0A".
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().replace(['-', '_'], "").as_str() {
+            "lf" | "unix" | "linux" | "n" => Some(Self::Lf),
+            "crlf" | "dos" | "windows" | "rn" => Some(Self::CrLf),
+            "cr" | "mac" | "classicmac" | "r" => Some(Self::Cr),
+            _ => None,
+        }
+    }
+
     fn as_bytes(self) -> &'static [u8] {
         match self {
             Self::Lf => b"\n",
@@ -533,6 +546,45 @@ mod tests {
         // A forced encoding does not override the binary check: the point is to
         // avoid writing a mangled executable back.
         assert!(decode_for_edit(b"\x00\x01", "ext4", Some(TextEncoding::Utf8)).is_err());
+    }
+
+    /// Endings are always read from the file, never assumed from the
+    /// filesystem - a DOS-formatted volume holds LF-only files all the time,
+    /// and rewriting them to CRLF because of where they live would corrupt
+    /// files nobody asked to change.
+    #[test]
+    fn endings_come_from_the_content_not_the_filesystem() {
+        // An LF file on a FAT volume stays LF.
+        let d = decode_for_edit(b"one\ntwo\n", "fat16", None).unwrap();
+        assert_eq!(d.shape.ending, LineEnding::Lf);
+        assert_eq!(
+            encode_after_edit(&d.text, &d.shape, false).unwrap(),
+            b"one\ntwo\n"
+        );
+
+        // A CRLF file on ext stays CRLF.
+        let d = decode_for_edit(b"one\r\ntwo\r\n", "ext4", None).unwrap();
+        assert_eq!(d.shape.ending, LineEnding::CrLf);
+
+        // And a deliberate conversion is just a different shape.
+        let converted = TextShape {
+            ending: LineEnding::Lf,
+            ..d.shape
+        };
+        assert_eq!(
+            encode_after_edit(&d.text, &converted, false).unwrap(),
+            b"one\ntwo\n"
+        );
+    }
+
+    #[test]
+    fn line_ending_names_parse_the_way_a_user_would_type_them() {
+        assert_eq!(LineEnding::parse("crlf"), Some(LineEnding::CrLf));
+        assert_eq!(LineEnding::parse("dos"), Some(LineEnding::CrLf));
+        assert_eq!(LineEnding::parse("unix"), Some(LineEnding::Lf));
+        assert_eq!(LineEnding::parse("LF"), Some(LineEnding::Lf));
+        assert_eq!(LineEnding::parse("mac"), Some(LineEnding::Cr));
+        assert_eq!(LineEnding::parse("ebcdic"), None);
     }
 
     #[test]
