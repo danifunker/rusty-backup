@@ -104,6 +104,11 @@ pub enum Command {
     /// to the host.
     Get(verbs::get::GetArgs),
 
+    /// Edit a text file inside a filesystem in `$EDITOR`, converting the
+    /// file's encoding and line endings on the way out and back so the
+    /// editor never sees (or rewrites) its vintage form.
+    Edit(verbs::edit::EditArgs),
+
     /// Archive a filesystem (or a subtree) to a single `.tar.gz` /
     /// `.tar.zst` / `.tar`. Preserves exact case-sensitive names and real
     /// symlinks, so extracting on a case-insensitive host won't clobber
@@ -469,6 +474,7 @@ pub fn dispatch(command: Command) -> Result<()> {
         Command::Locate(args) => verbs::locate::run(args),
         Command::Put(args) => verbs::put::run(args),
         Command::Get(args) => verbs::get::run(args),
+        Command::Edit(args) => verbs::edit::run(args),
         Command::Tar(args) => verbs::tar::run(args),
         Command::Untar(args) => verbs::untar::run(args),
         Command::Import(args) => verbs::import::run(args),

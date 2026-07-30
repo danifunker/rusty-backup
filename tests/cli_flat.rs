@@ -1453,3 +1453,71 @@ fn replacing_a_file_preserves_unix_permissions_and_owner() {
         "--no-preserve-meta should say so, got:\n{log}"
     );
 }
+
+/// `edit` must hand the editor clean UTF-8/LF and put the file's own encoding
+/// and endings back, so a DOS file survives a trip through a UTF-8 editor.
+#[test]
+fn edit_round_trips_a_dos_file_through_an_editor() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let img = dir.path().join("d.img");
+    let src = dir.path().join("auto.bat");
+    // 0xB3 is a CP437 box-drawing bar, and invalid UTF-8.
+    std::fs::write(&src, b"REM start \xb3 bar\r\nPATH C:\\DOS\r\n").unwrap();
+
+    run(&["new", "floppy", "fat", img.to_str().unwrap()]);
+    run(&[
+        "put",
+        img.to_str().unwrap(),
+        src.to_str().unwrap(),
+        "/AUTOEXEC.BAT",
+    ]);
+
+    // An "editor" that appends a line using CRLF, the way a Windows editor
+    // would - the file was handed to it as LF, so re-applying CRLF naively
+    // produced a doubled CR on that line.
+    let ed = dir.path().join("ed.sh");
+    std::fs::write(&ed, "#!/bin/sh\nprintf 'REM added\\r\\n' >> \"$1\"\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&ed, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let out = std::process::Command::new(cli_bin())
+        .args(["edit", img.to_str().unwrap(), "/AUTOEXEC.BAT"])
+        .env("EDITOR", &ed)
+        .output()
+        .expect("spawn rb-cli edit");
+    assert!(
+        out.status.success(),
+        "edit failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let back = dir.path().join("out.bin");
+    run(&[
+        "get",
+        img.to_str().unwrap(),
+        "/AUTOEXEC.BAT",
+        back.to_str().unwrap(),
+    ]);
+    let bytes = std::fs::read(&back).unwrap();
+
+    assert!(
+        bytes.contains(&0xb3),
+        "the CP437 box-drawing byte must survive; a UTF-8 round trip loses it"
+    );
+    assert!(
+        !bytes.windows(2).any(|w| w == b"\r\r"),
+        "no doubled CR from the editor's own CRLF: {bytes:?}"
+    );
+    assert!(
+        bytes.ends_with(b"REM added\r\n"),
+        "the appended line should be there with CRLF: {:?}",
+        String::from_utf8_lossy(&bytes)
+    );
+    assert!(
+        std::str::from_utf8(&bytes).is_err(),
+        "the file must still be CP437, not re-encoded as UTF-8"
+    );
+}

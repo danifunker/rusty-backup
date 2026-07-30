@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli edit</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <span>edit</span></nav>
+<h1><code>rb-cli edit</code></h1>
+<p>Edit a text file inside a filesystem in `$EDITOR`, converting the file's encoding and line endings on the way out and back so the editor never sees (or rewrites) its vintage form</p>
+<h2>Usage</h2>
+<pre><code>Usage: edit [OPTIONS] &lt;IMAGE&gt; &lt;PATH&gt;</code></pre>
+<h2>Arguments</h2>
+<dl class="args">
+<dt><code>&lt;IMAGE&gt;</code></dt>
+<dd>Image reference (`path` or `path@N` for the 1-based partition index)</dd>
+<dt><code>&lt;PATH&gt;</code></dt>
+<dd>Path of the text file inside the filesystem</dd>
+</dl>
+<h2>Options</h2>
+<dl class="args">
+<dt><code>--editor</code></dt>
+<dd>Editor to run. Defaults to `$VISUAL`, then `$EDITOR`, then `vi` (`notepad` on Windows)</dd>
+<dt><code>--encoding</code></dt>
+<dd>Force the file's character encoding instead of inferring it</dd>
+<dt><code>--force-substitute</code></dt>
+<dd>Write a best-effort replacement for characters the file's encoding cannot represent, instead of refusing</dd>
+<dt><code>--force-binary</code></dt>
+<dd>Edit the file as text even if it looks binary. Almost never what you want — a round trip through an editor will not preserve arbitrary bytes</dd>
+<dt><code>--fs-type</code></dt>
+<dd>Force a specific filesystem dispatch. The main use is `cpm:&lt;preset&gt;` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zxplus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch</dd>
+<dt><code>--carve-full</code></dt>
+<dd>Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga &quot;NDOS&quot; disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem</dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_docs</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>

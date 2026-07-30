@@ -327,6 +327,16 @@ pub fn encode_after_edit(
     shape: &TextShape,
     substitute: bool,
 ) -> Result<Vec<u8>, TextEditError> {
+    // Normalise whatever came back before re-applying the file's convention.
+    // The editor was handed LF-only text, but plenty of editors write CRLF
+    // regardless (every Windows one, and anything configured with
+    // `fileformat=dos`). Re-applying CRLF on top of a CR the editor added
+    // produces `\r\r\n` - a doubled carriage return on every line it
+    // touched, which is exactly the silent corruption this module exists to
+    // prevent.
+    let normalised = text.replace("\r\n", "\n").replace('\r', "\n");
+    let text: &str = &normalised;
+
     let mut out = Vec::with_capacity(text.len() + 16);
     let eol = shape.ending.as_bytes();
     let mut line = 1usize;
@@ -404,6 +414,33 @@ mod tests {
             let back = encode_after_edit(&d.text, &d.shape, false).expect("encode");
             assert_eq!(back, raw, "round trip of {raw:?}");
         }
+    }
+
+    /// An editor that writes CRLF into the LF text it was handed must not
+    /// produce a doubled CR when the file's own convention is re-applied.
+    #[test]
+    fn endings_the_editor_introduced_are_normalised_before_re_encoding() {
+        let shape = TextShape {
+            encoding: TextEncoding::Cp437,
+            ending: LineEnding::CrLf,
+            mixed_endings: false,
+        };
+        // What a Windows editor hands back after appending a line.
+        let edited = "PATH C:\\DOS\r\nREM added\r\n";
+        let bytes = encode_after_edit(edited, &shape, false).expect("encode");
+        assert!(
+            !bytes.windows(2).any(|w| w == b"\r\r"),
+            "no doubled CR: {bytes:?}"
+        );
+        assert_eq!(bytes, b"PATH C:\\DOS\r\nREM added\r\n");
+
+        // A CR-only file gets CR-only back, whatever the editor used.
+        let mac = TextShape {
+            ending: LineEnding::Cr,
+            ..shape
+        };
+        let bytes = encode_after_edit("one\r\ntwo\n", &mac, false).expect("encode");
+        assert_eq!(bytes, b"one\rtwo\r");
     }
 
     #[test]
