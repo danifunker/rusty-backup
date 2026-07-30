@@ -79,6 +79,10 @@ enum Opened {
         path: String,
         size: u64,
         parts: Vec<PartRow>,
+        /// Set when this was opened from the disk list, so the view can show
+        /// the hardware facts (media, bus, flags, what the OS has mounted)
+        /// above the partition table instead of on a separate screen.
+        disk: Option<Box<DiskDevice>>,
     },
     Backup {
         path: String,
@@ -2938,7 +2942,6 @@ struct App {
     /// Cursor index into the active tab's selectable rows (Inspect disk list).
     selection: usize,
     /// When the Inspect tab has drilled into a disk, the index of that disk.
-    detail: Option<usize>,
     /// An image/backup opened from the Inspect tab (takes over the Inspect body).
     opened: Option<Opened>,
     /// The shared "Open file / backup" picker (path + recent + Tab-browse).
@@ -2987,7 +2990,6 @@ impl App {
             active,
             scroll: 0,
             selection: 0,
-            detail: None,
             opened: None,
             open_picker: None,
             explorer: None,
@@ -3230,7 +3232,6 @@ impl App {
             KeyCode::Char('r') if self.current() == TabId::Inspect => {
                 self.disks = Some(enumerate_devices());
                 self.selection = 0;
-                self.detail = None;
             }
             _ => {}
         }
@@ -3241,7 +3242,6 @@ impl App {
     /// (rusty-backup folder or Clonezilla image); a file is a disk image. On
     /// success the path is recorded in the MRU (move-to-front).
     fn open_target(&mut self, path: std::path::PathBuf) {
-        self.detail = None;
         self.selection = 0;
         self.status = None;
         if path.is_dir() {
@@ -3274,7 +3274,7 @@ impl App {
             // for something plainly present, with no hint that the tab simply
             // did not handle devices. Opening one is the whole point of the
             // disk list next to it.
-            self.open_image_at(path);
+            self.open_image_at(path, None);
         } else {
             self.status = Some(format!("No such file or directory: {}", path.display()));
         }
@@ -3283,26 +3283,53 @@ impl App {
     /// Open an image *or* a raw device as the Inspect tab's image view.
     ///
     /// `size` is looked up via [`readable_size`] so block devices come out at
-    /// their true size instead of the zero `metadata` reports for them.
-    fn open_image_at(&mut self, path: std::path::PathBuf) {
+    /// their true size instead of the zero `metadata` reports for them. Pass
+    /// `disk` when opening from the disk list so the view can show the hardware
+    /// facts alongside the partition table.
+    fn open_image_at(&mut self, path: std::path::PathBuf, disk: Option<Box<DiskDevice>>) {
         let display = path.display().to_string();
         let size = match readable_size(&path) {
             Ok(s) => s,
-            Err(e) => {
-                self.status = Some(Self::access_hint(&display, &e));
-                return;
-            }
+            // Fall back to the size the enumerator already reported. Reading a
+            // raw device needs elevation, and refusing to show anything at all
+            // is a worse answer than showing the hardware facts plus why the
+            // table could not be read.
+            Err(e) => match disk.as_ref().map(|d| d.size_bytes).filter(|&s| s > 0) {
+                Some(s) => {
+                    self.status = Some(Self::access_hint(&display, &e));
+                    s
+                }
+                None => {
+                    self.status = Some(Self::access_hint(&display, &e));
+                    return;
+                }
+            },
         };
         match parse_partitions(&path, size) {
             Ok(parts) => {
                 crate::update::push_recent(crate::update::RecentMode::Inspect, &display);
+                self.status = None;
                 self.opened = Some(Opened::Image {
                     path: display,
                     size,
                     parts,
+                    disk,
                 });
             }
-            Err(e) => self.status = Some(Self::access_hint(&display, &e)),
+            Err(e) => {
+                self.status = Some(Self::access_hint(&display, &e));
+                // A device we cannot read still has facts worth showing, and
+                // leaving the user on the list with only a status line makes it
+                // look as though Enter did nothing.
+                if disk.is_some() {
+                    self.opened = Some(Opened::Image {
+                        path: display,
+                        size,
+                        parts: Vec::new(),
+                        disk,
+                    });
+                }
+            }
         }
     }
 
@@ -3364,33 +3391,25 @@ impl App {
                     self.open_explorer(&path, selector, label);
                 }
             }
-            // Disk detail: Enter again → open the disk as an image, so its
-            // partition table (and from there each filesystem's Explorer) is
-            // reachable.
+            // Disk list: Enter → the disk's own partition table, with its
+            // hardware facts shown above it.
             //
-            // Without this arm the disk list dead-ended: Enter showed the detail
-            // pane, and a second Enter did nothing at all - while the footer
-            // still advertised "Enter Open" - because the arm below required
-            // `detail.is_none()`. The detail pane lists only the partitions the
-            // *OS* has mounted, with no way to descend into any of them, so
-            // there was no route from a physical disk to a filesystem at all;
-            // only the `o` file picker could reach one.
-            TabId::Inspect if self.detail.is_some() => {
-                let sel = self.detail.unwrap_or(self.selection);
+            // One Enter, one screen. This used to take two: the first opened a
+            // read-only pane of media/bus/flags plus the partitions the *OS* had
+            // mounted, and a second - undiscoverable, and for a while not wired
+            // up at all - reached the real table. Nothing on screen said the
+            // second press existed, and the two screens were describing the same
+            // disk, so they are now one view.
+            TabId::Inspect if self.row_count() > 0 => {
                 let target = self
                     .disks
                     .as_ref()
-                    .and_then(|d| d.get(sel))
-                    .map(|d| d.path.clone());
-                if let Some(path) = target {
-                    self.detail = None;
+                    .and_then(|d| d.get(self.selection))
+                    .map(|d| (d.path.clone(), Box::new(d.clone())));
+                if let Some((path, disk)) = target {
                     self.selection = 0;
-                    self.open_image_at(path);
+                    self.open_image_at(path, Some(disk));
                 }
-            }
-            // Disk list: Enter a disk → its detail view.
-            TabId::Inspect if self.detail.is_none() && self.row_count() > 0 => {
-                self.detail = Some(self.selection);
             }
             _ => {}
         }
@@ -4411,9 +4430,11 @@ impl App {
         if self.progress.is_some() {
             self.cancel_progress();
         } else if self.opened.is_some() {
+            // One level to unwind now that the disk's facts and its partition
+            // table are a single view: Esc goes straight back to the disk list.
             self.opened = None;
-        } else if self.detail.is_some() {
-            self.detail = None;
+            self.selection = 0;
+            self.status = None;
         } else {
             self.should_quit = true;
         }
@@ -4453,7 +4474,6 @@ impl App {
     /// Lazily load anything a freshly-shown tab needs; reset per-tab cursor.
     fn on_tab_changed(&mut self) {
         self.selection = 0;
-        self.detail = None;
         self.opened = None;
         self.open_picker = None;
         self.explorer = None;
@@ -6713,7 +6733,7 @@ impl App {
 
     /// Whether the Inspect tab is showing its top-level selectable disk list.
     fn inspect_list_active(&self) -> bool {
-        self.current() == TabId::Inspect && self.detail.is_none() && self.opened.is_none()
+        self.current() == TabId::Inspect && self.opened.is_none()
     }
 
     /// Number of selectable rows in the active tab (0 = the pane just scrolls).
@@ -7518,8 +7538,14 @@ impl App {
             self.draw_inspect_list(frame, area);
             return;
         }
-        if let Some(Opened::Image { path, size, parts }) = &self.opened {
-            self.draw_partition_list(frame, area, path, *size, parts);
+        if let Some(Opened::Image {
+            path,
+            size,
+            parts,
+            disk,
+        }) = &self.opened
+        {
+            self.draw_partition_list(frame, area, path, *size, parts, disk.as_deref());
             return;
         }
         if self.current() == TabId::NewDisk {
@@ -7621,7 +7647,7 @@ impl App {
             })
             .collect();
         let title = format!(
-            "Inspect  [{} disk(s)]  Enter=disk  o=open file",
+            "Inspect  [{} disk(s)]  Enter=partitions  o=open file",
             disks.len()
         );
         let list = List::new(items)
@@ -7642,12 +7668,39 @@ impl App {
         path: &str,
         size: u64,
         parts: &[PartRow],
+        disk: Option<&DiskDevice>,
     ) {
         let name = basename(path);
+
+        // Opened from the disk list: the hardware facts live in a header above
+        // the table rather than on a screen of their own. They describe the same
+        // disk, and splitting them meant an extra keypress nothing advertised.
+        let area = match disk {
+            Some(d) => {
+                let header = self.disk_header_lines(d);
+                // +2 for the block's own borders.
+                let height = (header.len() as u16 + 2).min(area.height.saturating_sub(3));
+                let rows =
+                    Layout::vertical([Constraint::Length(height), Constraint::Min(3)]).split(area);
+                frame.render_widget(
+                    Paragraph::new(Text::from(header))
+                        .block(self.pane_block(&format!("Disk  {}", d.path.display()), false)),
+                    rows[0],
+                );
+                rows[1]
+            }
+            None => area,
+        };
+
         if parts.is_empty() {
+            let msg = match &self.status {
+                // A device that could not be read: say so here, where the user
+                // is looking, not only in the footer.
+                Some(s) => format!("No partition table could be read.\n\n{s}"),
+                None => "No partitions detected.".to_string(),
+            };
             frame.render_widget(
-                Paragraph::new("No partitions detected.")
-                    .block(self.pane_block(&format!("Image  {name}"), true)),
+                Paragraph::new(msg).block(self.pane_block(&format!("Partitions  {name}"), true)),
                 area,
             );
             return;
@@ -7661,13 +7714,16 @@ impl App {
                 ]))
             })
             .collect();
+        // With a header above, the title names the table rather than repeating
+        // the disk; on its own it still identifies the image.
+        let subject = if disk.is_some() {
+            format!("Partitions on {name}")
+        } else {
+            format!("Image  {name} ({})", format_size(size))
+        };
         let title = match &self.status {
-            Some(s) => format!("Image  {name} ({})  -  {s}", format_size(size)),
-            None => format!(
-                "Image  {name} ({})  [{} partition(s)]  Enter=browse",
-                format_size(size),
-                parts.len()
-            ),
+            Some(s) => format!("{subject}  -  {s}"),
+            None => format!("{subject}  [{} partition(s)]  Enter=browse", parts.len()),
         };
         let list = List::new(items)
             .block(self.pane_block(&title, true))
@@ -7676,6 +7732,57 @@ impl App {
         let mut state = ListState::default();
         state.select(Some(self.selection.min(parts.len() - 1)));
         frame.render_stateful_widget(list, area, &mut state);
+    }
+
+    /// The hardware facts for the header above a disk's partition table: what
+    /// the enumerator knows, plus what the OS has mounted.
+    ///
+    /// The mounted list is worth keeping visible precisely because it is *not*
+    /// the partition table - a volume the host cannot mount (ext on Mac OS X,
+    /// say) is absent from it while being present in the table below, and seeing
+    /// both together is what makes that difference legible.
+    fn disk_header_lines(&self, d: &DiskDevice) -> Vec<Line<'static>> {
+        let field = |k: &str, v: String| {
+            Line::from(vec![
+                Span::styled(format!("{k:<9}"), self.palette.accent()),
+                Span::raw(v),
+            ])
+        };
+        let media = if d.media_name.is_empty() {
+            d.name.clone()
+        } else {
+            d.media_name.clone()
+        };
+        let mut lines = vec![
+            field(
+                "Media:",
+                format!(
+                    "{media}  ({})  {}",
+                    format_size(d.size_bytes),
+                    d.bus_protocol
+                ),
+            ),
+            field(
+                "Flags:",
+                format!(
+                    "{}{}{}",
+                    if d.is_removable { "removable" } else { "fixed" },
+                    if d.is_read_only { ", read-only" } else { "" },
+                    if d.is_system { ", system" } else { "" },
+                ),
+            ),
+        ];
+        if d.partitions.is_empty() {
+            lines.push(field("Mounted:", "(none)".to_string()));
+        } else {
+            let mounted: Vec<String> = d
+                .partitions
+                .iter()
+                .map(|p| format!("{} {}", p.name, p.mount_point.display()))
+                .collect();
+            lines.push(field("Mounted:", mounted.join(", ")));
+        }
+        lines
     }
 
     /// The New Disk wizard: media class → filesystem → path/size/name, drawn as
@@ -9328,12 +9435,20 @@ impl App {
                 ("?", "Help"),
             ]
         } else {
-            let mut k = vec![("<-/->", "Tabs"), ("Up/Dn", "Select"), ("Enter", "Open")];
-            if self.detail.is_some() || self.opened.is_some() {
+            // On the disk list, name what Enter actually produces. "Open" was
+            // vague enough that the partition table read as a hidden second step
+            // rather than the destination.
+            let enter = if self.inspect_list_active() {
+                ("Enter", "Partitions")
+            } else {
+                ("Enter", "Open")
+            };
+            let mut k = vec![("<-/->", "Tabs"), ("Up/Dn", "Select"), enter];
+            if self.opened.is_some() {
                 k.push(("Esc", "Back"));
             }
             if self.inspect_list_active() {
-                k.push(("o", "Open"));
+                k.push(("o", "Open file"));
                 k.push(("r", "Rescan"));
             }
             k.push(("?", "Help"));
@@ -9534,77 +9649,11 @@ impl App {
             lines.push(Line::raw("Esc to close."));
             return Text::from(lines);
         }
-        let Some(i) = self.detail else {
-            return Text::from("Select a disk and press Enter, or `o` to open a file/backup.");
-        };
-        let disks = self.disks.as_deref().unwrap_or(&[]);
-        let Some(d) = disks.get(i) else {
-            return Text::from("That disk is no longer present. Press Esc.");
-        };
-
-        let field = |k: &str, v: String| {
-            Line::from(vec![
-                Span::styled(format!("{k:<11}"), self.palette.accent()),
-                Span::raw(v),
-            ])
-        };
-        let mut lines = vec![
-            Line::styled(
-                format!("Disk {}", d.path.display()),
-                self.palette.accent().add_modifier(Modifier::BOLD),
-            ),
-            Line::raw(""),
-            field(
-                "Media:",
-                if d.media_name.is_empty() {
-                    d.name.clone()
-                } else {
-                    d.media_name.clone()
-                },
-            ),
-            field("Size:", format_size(d.size_bytes)),
-            field("Bus:", d.bus_protocol.clone()),
-            field(
-                "Flags:",
-                format!(
-                    "{}{}{}",
-                    if d.is_removable { "removable" } else { "fixed" },
-                    if d.is_read_only { ", read-only" } else { "" },
-                    if d.is_system { ", system" } else { "" },
-                ),
-            ),
-            Line::raw(""),
-            Line::styled(
-                format!("Mounted partitions ({}):", d.partitions.len()),
-                self.palette.accent().add_modifier(Modifier::BOLD),
-            ),
-        ];
-        if d.partitions.is_empty() {
-            lines.push(Line::raw("  (none mounted)"));
-        } else {
-            for p in &d.partitions {
-                let used = p.total_space.saturating_sub(p.available_space);
-                lines.push(Line::from(vec![
-                    Span::styled(format!("  {:<12}", p.name), self.palette.accent()),
-                    Span::raw(format!(
-                        " {:<8} {} used / {}  {}",
-                        p.filesystem,
-                        format_size(used),
-                        format_size(p.total_space),
-                        p.mount_point.display(),
-                    )),
-                ]));
-            }
-        }
-        lines.push(Line::raw(""));
-        lines.push(Line::styled(
-            "Note: the list above is what the OS has mounted. Press Enter to read the \
-             disk's own partition table and browse any volume on it - including \
-             unmounted ones. Raw device access needs elevation."
-                .to_string(),
-            self.palette.dim(),
-        ));
-        Text::from(lines)
+        // No disk selected yet. The disk list is the selectable widget; this
+        // text is what the scrollable pane shows behind it.
+        Text::from(
+            "Select a disk and press Enter to see its partitions, or `o` to open a file/backup.",
+        )
     }
 
     fn settings_content(&self) -> Text<'static> {
@@ -10570,16 +10619,20 @@ mod tests {
         img
     }
 
-    /// Enter on a disk, then Enter again, must reach its partition table.
+    /// A **single** Enter on a disk must reach its partition table, with the
+    /// disk's own facts carried along for the header.
     ///
-    /// The disk list used to dead-end: the first Enter opened a detail pane
-    /// listing only the partitions the *OS* had mounted, and a second Enter did
-    /// nothing whatsoever because `activate` required `detail.is_none()` - while
-    /// the footer still advertised "Enter Open". An unmounted volume was
-    /// therefore unreachable, and a mounted one could only be read about, never
-    /// opened. The `o` file picker was the sole route to a filesystem.
+    /// The disk list used to dead-end: the first Enter opened a pane listing
+    /// only the partitions the *OS* had mounted, and a second Enter did nothing
+    /// whatsoever because `activate` required `detail.is_none()` - while the
+    /// footer still advertised "Enter Open". An unmounted volume was therefore
+    /// unreachable, and a mounted one could only be read about, never opened.
+    /// Wiring the second press up fixed the dead end but left the extra step,
+    /// which nothing on screen mentioned; the two screens described the same
+    /// disk, so they are now one. This asserts the count of keypresses, because
+    /// that is the part a user notices.
     #[test]
-    fn enter_on_a_disk_reaches_its_partition_table() {
+    fn one_enter_on_a_disk_reaches_its_partition_table() {
         let dir = tempfile::tempdir().expect("tempdir");
         let img = mbr_with_ext(dir.path());
         let size = std::fs::metadata(&img).unwrap().len();
@@ -10589,25 +10642,43 @@ mod tests {
         app.selection = 0;
         assert!(app.opened.is_none());
 
-        app.activate(); // -> detail pane
-        assert_eq!(
-            app.detail,
-            Some(0),
-            "first Enter should open the detail pane"
-        );
+        app.activate(); // one press
 
-        app.activate(); // -> partition table
-        let Some(Opened::Image { parts, .. }) = &app.opened else {
-            panic!(
-                "second Enter should have opened the disk, got {:?}",
-                app.detail
-            );
+        let Some(Opened::Image { parts, disk, .. }) = &app.opened else {
+            panic!("a single Enter should have opened the disk's partition table");
         };
         assert!(
             parts.iter().any(|p| p.selector == Some(1)),
             "the ext partition should be selectable, got {:?}",
             parts.iter().map(|p| &p.label).collect::<Vec<_>>()
         );
+        assert!(
+            disk.is_some(),
+            "the disk's hardware facts must come along so the header can show \
+             them instead of needing a screen of their own"
+        );
+    }
+
+    /// Esc from the merged view goes straight back to the disk list - one level,
+    /// since there is no longer an intermediate pane to unwind through.
+    #[test]
+    fn esc_from_the_partition_view_returns_to_the_disk_list() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let img = mbr_with_ext(dir.path());
+        let size = std::fs::metadata(&img).unwrap().len();
+
+        let mut app = App::new_on(DEFAULT_TAB);
+        app.disks = Some(vec![fake_disk(&img, size)]);
+        app.activate();
+        assert!(app.opened.is_some());
+
+        app.on_back();
+        assert!(app.opened.is_none(), "Esc should close the partition view");
+        assert!(
+            app.inspect_list_active(),
+            "and land back on the selectable disk list"
+        );
+        assert!(!app.should_quit, "Esc must not quit from one level in");
     }
 
     /// A raw device path is neither a file nor a directory, so the picker's
