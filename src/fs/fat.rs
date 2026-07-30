@@ -2003,6 +2003,95 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for FatFilesystem<R> {
         Ok(())
     }
 
+    fn set_dos_attributes(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+        attrs: u16,
+    ) -> Result<(), FilesystemError> {
+        if entry.is_directory() {
+            // The directory bit is structural; changing the rest of a
+            // directory's attributes is legal but not what any caller here
+            // means, and getting it wrong corrupts the tree.
+            return Err(FilesystemError::Unsupported(
+                "attributes on a directory are not editable".into(),
+            ));
+        }
+        // Mask to the user-settable bits. Directory (0x10) and volume-id (0x08)
+        // describe what the entry *is*; accepting them from a caller would let
+        // an attribute edit turn a file into something else.
+        let attr = (attrs as u8) & 0x27;
+
+        // Patched in place rather than re-added. `rename`'s add-then-remove
+        // works because the names differ, so the removal can tell the two
+        // records apart - here the name is unchanged, and the removal took out
+        // the record that had just been added, silently leaving the old
+        // attributes in place.
+        let is_root_fat16 = parent.path == "/" && self.fat_type != FatType::Fat32;
+        let (mut dir_data, write_back) = if is_root_fat16 {
+            (self.read_root_directory()?, None)
+        } else {
+            let cluster = parent.location as u32;
+            (self.read_cluster_chain(cluster)?, Some(cluster))
+        };
+
+        let num_entries = dir_data.len() / DIR_ENTRY_SIZE;
+        let mut target = None;
+        for i in 0..num_entries {
+            let off = i * DIR_ENTRY_SIZE;
+            if dir_data[off] == 0x00 {
+                break;
+            }
+            if dir_data[off] == 0xE5 || dir_data[off + 11] == ATTR_LONG_NAME {
+                continue;
+            }
+            let lo = u16::from_le_bytes([dir_data[off + 26], dir_data[off + 27]]) as u32;
+            let hi = u16::from_le_bytes([dir_data[off + 20], dir_data[off + 21]]) as u32;
+            let cluster = (hi << 16) | lo;
+            let size = u32::from_le_bytes([
+                dir_data[off + 28],
+                dir_data[off + 29],
+                dir_data[off + 30],
+                dir_data[off + 31],
+            ]);
+            if cluster != entry.location as u32 || size != entry.size as u32 {
+                continue;
+            }
+            // An empty file has no start cluster, so cluster+size cannot
+            // identify it on its own - two empty files look identical. Fall
+            // back to the 8.3 name for those.
+            if cluster == 0 {
+                let sfn = build_short_name(&dir_data[off..off + 8], &dir_data[off + 8..off + 11]);
+                if !sfn.eq_ignore_ascii_case(&entry.name) {
+                    continue;
+                }
+            }
+            target = Some(off);
+            break;
+        }
+        let off = target.ok_or_else(|| {
+            FilesystemError::NotFound(format!("entry '{}' not found in parent", entry.name))
+        })?;
+
+        // Keep whatever structural bits the record already had.
+        let structural = dir_data[off + 11] & 0x18;
+        dir_data[off + 11] = attr | structural;
+
+        match write_back {
+            None => {
+                let root_start =
+                    self.reserved_sectors + (self.num_fats as u64 * self.sectors_per_fat);
+                let abs_offset = self.sector_offset(root_start);
+                self.reader.seek(SeekFrom::Start(abs_offset))?;
+                self.reader.write_all(&dir_data)?;
+            }
+            Some(cluster) => {
+                self.write_cluster_chain(cluster, &dir_data)?;
+            }
+        }
+        Ok(())
+    }
+
     fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
         self.update_fsinfo()?;
         self.reader.flush()?;
@@ -5830,6 +5919,64 @@ mod tests {
         } else {
             u32::from_le_bytes([img[32], img[33], img[34], img[35]])
         }
+    }
+
+    /// The read-only / hidden / system / archive bits must be settable and
+    /// must survive a re-read, and the structural bits must not be reachable
+    /// from a caller.
+    #[test]
+    fn dos_attributes_can_be_set_and_read_back() {
+        use crate::fs::filesystem::EditableFilesystem;
+
+        let img = create_blank_fat(1024 * 1024, Some("ATTRS")).expect("blank");
+        let mut fs = FatFilesystem::open(std::io::Cursor::new(img), 0).expect("open");
+        let root = fs.root().expect("root");
+        let mut data = std::io::Cursor::new(b"x".to_vec());
+        fs.create_file(&root, "A.TXT", &mut data, 1, &CreateFileOptions::default())
+            .expect("create");
+
+        let find = |fs: &mut FatFilesystem<std::io::Cursor<Vec<u8>>>| {
+            let root = fs.root().unwrap();
+            fs.list_directory(&root)
+                .unwrap()
+                .into_iter()
+                .find(|e| e.name.eq_ignore_ascii_case("A.TXT"))
+                .expect("entry")
+        };
+
+        // Read-only + hidden + system.
+        let e = find(&mut fs);
+        let root = fs.root().unwrap();
+        fs.set_dos_attributes(&root, &e, 0x07).expect("set attrs");
+        let e = find(&mut fs);
+        assert_eq!(
+            e.dos_attributes.map(|a| a & 0x07),
+            Some(0x07),
+            "read-only + hidden + system should have stuck"
+        );
+
+        // Clearing works too - an attribute editor that can only add is not an
+        // editor.
+        let root = fs.root().unwrap();
+        fs.set_dos_attributes(&root, &e, 0x20).expect("clear attrs");
+        let e = find(&mut fs);
+        assert_eq!(e.dos_attributes.map(|a| a & 0x07), Some(0x00));
+
+        // The directory bit is structural: a caller must not be able to set it
+        // and turn a file into something the tree walker will follow.
+        let root = fs.root().unwrap();
+        fs.set_dos_attributes(&root, &e, 0x10).expect("masked");
+        let e = find(&mut fs);
+        assert_eq!(
+            e.dos_attributes.map(|a| a & 0x10),
+            Some(0x00),
+            "the directory bit must be masked off"
+        );
+        assert!(!e.is_directory(), "and the entry must still be a file");
+
+        // The volume still reads cleanly afterwards.
+        let root = fs.root().unwrap();
+        fs.list_directory(&root).expect("directory still lists");
     }
 
     /// Growing a volume past what its FAT width can address grows it as far as

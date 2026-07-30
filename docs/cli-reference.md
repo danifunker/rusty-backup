@@ -481,6 +481,7 @@ Usage: chmeta [OPTIONS] <IMAGE> <PATH>
 
 - `--type` — New 4-character type code
 - `--creator` — New 4-character creator code (HFS / HFS+ only)
+- `--attrs` — DOS attribute bits (FAT / exFAT). Comma-separated flags, each optionally prefixed `+` to set or `-` to clear: `readonly`, `hidden`, `system`, `archive`. Without a prefix the listed set becomes the whole set, so `--attrs readonly,hidden` clears anything else
 
 ### `chmod`
 

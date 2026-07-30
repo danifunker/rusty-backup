@@ -640,6 +640,26 @@ pub trait EditableFilesystem: Filesystem {
     /// Overwrite the create/modify/backup dates on a file's catalog
     /// record. Dates are Mac epoch (seconds since 1904-01-01 00:00 UTC).
     /// HFS today; others `Unsupported`.
+    /// Set the DOS attribute bits on an entry: read-only `0x01`, hidden `0x02`,
+    /// system `0x04`, archive `0x20`.
+    ///
+    /// Takes the parent because that is where the bits live — a FAT directory
+    /// entry is the record, and there is nothing else to address it by.
+    /// Structural bits (directory `0x10`, volume-id `0x08`) are the driver's to
+    /// manage and are masked off rather than trusted from a caller.
+    ///
+    /// `Unsupported` on filesystems with no such concept, which is most of them.
+    fn set_dos_attributes(
+        &mut self,
+        _parent: &FileEntry,
+        _entry: &FileEntry,
+        _attrs: u16,
+    ) -> Result<(), FilesystemError> {
+        Err(FilesystemError::Unsupported(
+            "DOS attribute bits are not supported by this filesystem".into(),
+        ))
+    }
+
     fn set_dates(
         &mut self,
         _entry: &FileEntry,
