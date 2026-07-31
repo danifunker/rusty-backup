@@ -398,11 +398,8 @@ def split_and_compile(source, output, remote_args, remap):
     return 0
 
 
-# Libraries that must come from /usr/lib, keyed to the absolute path to link instead.
-# A plain `-l` takes the first hit in the search path, and MacPorts' /opt/local/lib
-# comes first: its libiconv is compatibility version 10.0.0 against Leopard's 7.0.0, so
-# the binary then refuses to start on any Mac without MacPorts, and it is built ppc7400
-# with AltiVec, which rules out a G3. The system copy is neither.
+# Libraries pinned to /usr/lib: a plain -l takes MacPorts' copy first, whose libiconv is
+# compat 10.0.0 against Leopard's 7.0.0 and is ppc7400 with AltiVec (no G3).
 SYSTEM_LIBS = {"iconv": "/usr/lib/libiconv.2.dylib"}
 
 

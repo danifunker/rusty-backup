@@ -773,10 +773,7 @@ stage_ppc() {
 }
 
 # ---- stage 9: package a self-contained tree -------------------------------
-# The link records absolute /opt/local paths for MacPorts' gcc runtime and legacy-support
-# shim, so the binary only starts on the build box. Copy each one next to the binary and
-# repoint it at @executable_path (supported since 10.4), which needs no installer: unpack
-# and run. Anything still naming /opt/local afterwards is a dependency we failed to carry.
+# Copies the MacPorts dylibs the link named by absolute path and repoints them at @executable_path.
 stage_dist() {
   banner "9. package a relocatable PowerPC tree"
   [ -n "$PPC_HOST" ] || die "PPC_HOST is not set"
@@ -791,8 +788,7 @@ D=~/rb-cli-dist
 rm -rf "$D"; mkdir -p "$D/lib"
 cp "$BIN" "$D/rb-cli"; chmod u+w "$D/rb-cli"
 
-# Walk the dependency closure: a dylib can name further /opt/local dylibs of its own
-# (libgcc_s.1.dylib is a stub in front of two more), so collect until it stops growing.
+# Walk the closure, not just the direct deps: libgcc_s.1.dylib is a stub in front of two more.
 pending=$(otool -L "$D/rb-cli" | tail -n +2 | awk '{print $1}' | grep '^/opt/local/' || true)
 seen=""
 while [ -n "$pending" ]; do
@@ -806,6 +802,29 @@ while [ -n "$pending" ]; do
   done
   pending="$next"
 done
+
+# MacPorts' host build imports fstat$INODE64 from libSystem, which Tiger lacks; the 10.4 SDK rebuild binds plain symbols and still exports both names.
+LEG=$(ls -t /opt/local/var/macports/distfiles/legacy-support/macports-legacy-support-*.tar.gz 2>/dev/null | head -1)
+SDK104=/Developer/SDKs/MacOSX10.4u.sdk
+CACHE=~/.rb-cli-legacy104/libMacportsLegacySupport.dylib
+if [ ! -e "$CACHE" ] && [ -n "$LEG" ] && [ -d "$SDK104" ]; then
+  rm -rf /tmp/rb-legacy104 && mkdir -p /tmp/rb-legacy104 && cd /tmp/rb-legacy104
+  tar xzf "$LEG"
+  cd macports-legacy-support-*/
+  MACOSX_DEPLOYMENT_TARGET=10.4 make \
+    CC=/opt/local/libexec/gcc10-bootstrap/bin/gcc \
+    CFLAGS="-O2 -mmacosx-version-min=10.4 -isysroot $SDK104" \
+    PREFIX=/opt/local -j2 >/tmp/rb-legacy104/build.log 2>&1 \
+    && mkdir -p "$(dirname "$CACHE")" && cp lib/libMacportsLegacySupport.dylib "$CACHE"
+  cd ~
+fi
+if [ -e "$CACHE" ] && [ -e "$D/lib/libMacportsLegacySupport.dylib" ]; then
+  cp "$CACHE" "$D/lib/libMacportsLegacySupport.dylib"
+  chmod u+w "$D/lib/libMacportsLegacySupport.dylib"
+  echo "legacy-support: using the 10.4-targeted rebuild (Tiger-capable)"
+elif [ -e "$D/lib/libMacportsLegacySupport.dylib" ]; then
+  echo "legacy-support: no 10.4 rebuild available - bundle is Leopard-only" >&2
+fi
 
 for f in "$D"/lib/*.dylib; do
   install_name_tool -id "@executable_path/lib/$(basename "$f")" "$f"
@@ -821,6 +840,13 @@ done
 left=$(otool -L "$D/rb-cli" "$D"/lib/*.dylib | grep -c '/opt/local' || true)
 [ "$left" -eq 0 ] || { echo "$left /opt/local reference(s) survived packaging" >&2; exit 1; }
 (cd "$D" && ./rb-cli --version >/dev/null) || { echo "packaged rb-cli does not run" >&2; exit 1; }
+# Tiger's libSystem has no $INODE64 symbols, so any left here means 10.4 refuses the bundle at load.
+i64=0
+for f in "$D/rb-cli" "$D"/lib/*.dylib; do
+  i64=$((i64 + $(nm -mu "$f" 2>/dev/null | grep INODE64 | grep -c 'from libSystem' || true)))
+done
+[ "$i64" -eq 0 ] && echo "no \$INODE64 imports from libSystem: Tiger-capable" \
+                 || echo "$i64 \$INODE64 import(s) from libSystem: Leopard-only" >&2
 rm -f ~/rb-cli-ppc.tar.gz
 (cd ~ && tar czf rb-cli-ppc.tar.gz rb-cli-dist)
 echo "bundled $(ls "$D/lib" | wc -l | tr -d ' ') dylib(s); $(ls -l ~/rb-cli-ppc.tar.gz | awk '{print $5}') bytes"
