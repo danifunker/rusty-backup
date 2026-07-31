@@ -163,6 +163,62 @@ banner() { printf '\n\033[1;36m==== %s ====\033[0m\n' "$*"; }
 note()   { printf '\033[33m%s\033[0m\n' "$*"; }
 die()    { printf '\033[1;31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
 
+# ---- reaping orphaned compiles on the Mac -----------------------------------
+# Interrupting this script used to leave cc1 running on the PowerPC Mac. Every
+# remote compile is `ssh HOST gcc ...`, and with no tty on the far side there is
+# nothing to deliver SIGHUP to the remote process group: when the local driver
+# dies, each in-flight translation unit is orphaned and keeps burning a core.
+# On a 2-core G5 a couple of those silently halve the speed of the *next* build,
+# and the symptom - "why is this build twice as slow today" - points nowhere
+# near the interrupted run that caused it.
+#
+# The match anchor is the toolchain prefix, not the build directory. cc1 is
+# spawned with relative mirrored paths (`home/dani/repos/...`, no leading slash)
+# and inherits its cwd, so its argv never mentions ppc-xbuild. Everything this
+# pipeline runs on the Mac comes out of gcc10-bootstrap and nothing else on the
+# machine does - notably not the root-owned ppc64 Linux CI leg, which is a
+# different toolchain entirely.
+#
+# Killing loops because gcc respawns cc1 as it works through its queue: one pass
+# kills the current unit and the driver immediately starts the next. Leopard's
+# pkill has no -f pattern that matches these, so they go by explicit pid.
+#
+# Caveat: this reaps by toolchain, not by build, so two concurrent
+# build-ppc.sh runs against the same Mac would kill each other's compiles. The
+# pipeline is single-Mac by construction, so that is not a shape worth guarding.
+ppc_reap_orphans() {
+  [ -n "${PPC_HOST:-}" ] || return 0
+  local result killed remaining
+  result="$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$PPC_HOST" '
+    total=0
+    for _ in 1 2 3 4 5; do
+      pids=`ps ax -o pid,command | grep -E "[g]cc10-bootstrap|[p]pc-xbuild" | sed "s/^ *//; s/ .*//"`
+      [ -z "$pids" ] && break
+      for p in $pids; do kill -9 "$p" 2>/dev/null && total=`expr $total + 1`; done
+      sleep 1
+    done
+    remaining=`ps ax -o pid,command | grep -cE "[g]cc10-bootstrap|[p]pc-xbuild"`
+    echo "$total $remaining"
+  ' 2>/dev/null)" || return 0
+  killed="${result%% *}"
+  remaining="${result##* }"
+  [ -n "${killed:-}" ] || return 0
+  [ "$killed" = 0 ] && return 0
+  note "reaped $killed orphaned remote compile(s) on $PPC_HOST ($remaining still up)"
+}
+
+_ppc_cleaned=0
+ppc_cleanup() {
+  local rc=$?
+  [ "$_ppc_cleaned" = 1 ] && return $rc
+  _ppc_cleaned=1
+  ppc_reap_orphans
+  return $rc
+}
+trap ppc_cleanup EXIT
+trap 'ppc_cleanup; exit 130' INT
+trap 'ppc_cleanup; exit 143' TERM
+
 # ---- stage 1: build mrustc + minicargo (with our parser patches) ------------
 stage_mrustc() {
   banner "1. build mrustc + minicargo"

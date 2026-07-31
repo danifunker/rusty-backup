@@ -286,8 +286,7 @@ fn launch_editor(explicit: Option<&str>, path: &std::path::Path) -> Result<()> {
 
     // Split so `EDITOR="code --wait"` works, which is common enough that not
     // handling it looks like a bug.
-    let mut parts = shell_words::split(&chosen)
-        .map_err(|e| anyhow!("cannot parse editor command {chosen:?}: {e}"))?;
+    let mut parts = split_editor_command(&chosen)?;
     if parts.is_empty() {
         bail!("editor command is empty");
     }
@@ -303,4 +302,113 @@ fn launch_editor(explicit: Option<&str>, path: &std::path::Path) -> Result<()> {
         bail!("editor {program:?} exited with {status}; nothing was written");
     }
     Ok(())
+}
+
+/// Split an editor command into program + arguments.
+///
+/// POSIX word-splitting is wrong on Windows, where `\` is the path separator
+/// and not an escape character: `shell_words::split` turns the perfectly
+/// ordinary `EDITOR=C:\Windows\notepad.exe` into `C:Windowsnotepad.exe`, and the
+/// spawn then fails with a "not found" naming a path the user never typed.
+///
+/// So the two platforms get the rule that matches their own shell. Unix keeps
+/// POSIX splitting. Windows splits on whitespace, honours double quotes for a
+/// path that contains spaces, and leaves every backslash alone — which is what
+/// `cmd.exe` itself does.
+///
+/// On Windows an unquoted string that names an existing file is taken whole,
+/// so `EDITOR=C:\Program Files\Vim\vim.exe` works without the user having to
+/// know to quote it. That guess is only made when the file is actually there,
+/// so it can never swallow a real trailing argument.
+fn split_editor_command(chosen: &str) -> Result<Vec<String>> {
+    #[cfg(not(windows))]
+    {
+        shell_words::split(chosen)
+            .map_err(|e| anyhow!("cannot parse editor command {chosen:?}: {e}"))
+    }
+    #[cfg(windows)]
+    {
+        let trimmed = chosen.trim();
+        if !trimmed.starts_with('"') && std::path::Path::new(trimmed).is_file() {
+            return Ok(vec![trimmed.to_string()]);
+        }
+        let mut out = Vec::new();
+        let mut cur = String::new();
+        let mut in_quotes = false;
+        let mut has_word = false;
+        for c in trimmed.chars() {
+            match c {
+                '"' => {
+                    in_quotes = !in_quotes;
+                    has_word = true;
+                }
+                c if c.is_whitespace() && !in_quotes => {
+                    if has_word {
+                        out.push(std::mem::take(&mut cur));
+                        has_word = false;
+                    }
+                }
+                c => {
+                    cur.push(c);
+                    has_word = true;
+                }
+            }
+        }
+        if in_quotes {
+            bail!("cannot parse editor command {chosen:?}: unbalanced quote");
+        }
+        if has_word {
+            out.push(cur);
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_editor_command;
+
+    /// An editor with arguments has to keep working on both platforms — this is
+    /// the `EDITOR="code --wait"` shape, which is common enough that breaking it
+    /// reads as a bug.
+    #[test]
+    fn an_editor_with_arguments_splits_into_program_and_args() {
+        assert_eq!(
+            split_editor_command("code --wait").unwrap(),
+            vec!["code".to_string(), "--wait".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_quoted_path_with_spaces_stays_one_word() {
+        assert_eq!(
+            split_editor_command("\"/usr/local/my editor\" --wait").unwrap(),
+            vec!["/usr/local/my editor".to_string(), "--wait".to_string()]
+        );
+    }
+
+    /// The regression this splitter exists for. POSIX splitting eats the
+    /// backslashes in a Windows path and the spawn fails naming a mangled path
+    /// the user never typed.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_path_keeps_its_backslashes() {
+        assert_eq!(
+            split_editor_command(r"C:\Windows\notepad.exe").unwrap(),
+            vec![r"C:\Windows\notepad.exe".to_string()]
+        );
+        assert_eq!(
+            split_editor_command(r#""C:\Program Files\Vim\vim.exe" --nofork"#).unwrap(),
+            vec![
+                r"C:\Program Files\Vim\vim.exe".to_string(),
+                "--nofork".to_string()
+            ]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_unbalanced_quote_is_reported_not_silently_accepted() {
+        assert!(split_editor_command("\"C:\\bin\\ed.exe").is_err());
+    }
 }

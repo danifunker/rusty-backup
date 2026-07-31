@@ -1452,10 +1452,37 @@ fn replacing_a_file_preserves_unix_permissions_and_owner() {
         log.contains("fresh metadata"),
         "--no-preserve-meta should say so, got:\n{log}"
     );
+    // And it has to be true of the file, not just of the log line. Asserting
+    // only on the message is how this shipped inheriting mode and owner from
+    // the replaced file while announcing the opposite: the entry stayed
+    // 0600 42:7 through every run of this test.
+    let listing =
+        String::from_utf8_lossy(&run(&["ls", img.to_str().unwrap(), "/", "-o"]).stdout).to_string();
+    let line = listing
+        .lines()
+        .find(|l| l.contains("conf"))
+        .unwrap_or_else(|| panic!("no /conf in listing:\n{listing}"));
+    assert!(
+        !line.contains("42:7"),
+        "--no-preserve-meta must not carry the replaced file's owner over, got: {line}"
+    );
+    assert!(
+        !line.contains("rw-------"),
+        "--no-preserve-meta must not carry the replaced file's mode over, got: {line}"
+    );
 }
 
 /// `edit` must hand the editor clean UTF-8/LF and put the file's own encoding
 /// and endings back, so a DOS file survives a trip through a UTF-8 editor.
+///
+/// Unix-only because the stand-in editor is a `/bin/sh` script: Windows cannot
+/// spawn one, so on that platform the test failed in the harness rather than in
+/// anything it was meant to cover. What it uniquely exercises is the
+/// spawn-an-editor glue; the conversion rules themselves are covered on every
+/// platform by the unit tests in `src/model/text_edit.rs` (including the
+/// doubled-CR case this test's editor reproduces), and the editor-command
+/// splitting by `split_editor_command`'s own tests.
+#[cfg(unix)]
 #[test]
 fn edit_round_trips_a_dos_file_through_an_editor() {
     let dir = tempfile::tempdir().expect("tempdir");

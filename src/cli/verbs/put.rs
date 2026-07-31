@@ -324,7 +324,18 @@ pub fn run_with_budget(
             uid: args.uid,
             gid: args.gid,
         },
-        existing.as_ref(),
+        // `--no-preserve-meta` has to be withheld here too, not just from
+        // `preserved` above. These are two independent inheritance paths and
+        // zeroing only one left the opt-out half-done: the POSIX triple kept
+        // coming from the replaced entry (`AttrSource::Replaced`) while the log
+        // line promised the previous file's permissions and owner were "not
+        // carried over". Type/creator went through `preserved` and did reset,
+        // so the two halves of one flag disagreed.
+        if args.no_preserve_meta {
+            None
+        } else {
+            existing.as_ref()
+        },
         Some(&parent),
         host_mode,
         0o644,
