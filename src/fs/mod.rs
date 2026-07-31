@@ -1881,6 +1881,9 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
     partition_type_string: Option<&str>,
 ) -> Result<Box<dyn EditableFilesystem>, FilesystemError> {
     let partition_len = edit_ctx.partition_len;
+    // Set when the type string is one we have no arm for, so the type-byte
+    // match below is entered in auto-detect mode instead of erroring out.
+    let mut auto_detect = false;
     // Check string-based type first (APM partitions)
     if let Some(type_str) = partition_type_string {
         match type_str {
@@ -1997,13 +2000,20 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                     geom.body_len(),
                 )?));
             }
+            // Unrecognized type string: fall through to content detection
+            // below, exactly as the read path does. A GPT type GUID describes
+            // what a partition is *for*, not what is in it - an EFI System
+            // Partition is plain FAT32 - so refusing here made the ESP
+            // read-only for no reason, while an identical FAT32 in an MBR
+            // partition edited fine.
             _ => {
-                return Err(FilesystemError::Unsupported(format!(
-                    "editing not yet supported for APM type '{type_str}'"
-                )));
+                auto_detect = true;
             }
         }
     }
+    // Only forced when a type string was present and unrecognized; a partition
+    // with no type string keeps whatever type byte it came with.
+    let partition_type = if auto_detect { 0x00 } else { partition_type };
     match partition_type {
         // Auto-detect (superfloppy / type byte 0)
         0x00 => {
@@ -2463,10 +2473,19 @@ fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
         // is opened as a whole (the driver parses the header + 12-byte sector
         // tags itself), so `partition_offset` is ignored. Read-only.
         "lisafs" => Ok(Box::new(lisa::LisaFilesystem::open(reader)?)),
-        _ => Err(FilesystemError::Unsupported(format!(
-            "APM partition type '{}' not supported for browsing",
-            type_str
-        ))),
+        // An unrecognized partition *type* is not a reason to refuse. On GPT the
+        // type GUID says what a partition is **for**, not what is inside it: the
+        // EFI System Partition is plain FAT32, "Microsoft Basic Data" is
+        // NTFS / exFAT / FAT, "Windows Recovery" is NTFS. Only three GUIDs ever
+        // had arms here, so browsing the ESP on any ordinary PC failed with
+        // "APM partition type 'C12A7328-...' not supported" - naming the wrong
+        // partition scheme, about a filesystem we have supported all along.
+        //
+        // So fall through to the superblock, which is the real authority on
+        // what a partition holds. Auto-detect ends at the carve view rather
+        // than an error, so an genuinely unknown payload still opens as
+        // something inspectable instead of a dead end.
+        _ => open_filesystem_with_passphrase(reader, partition_offset, 0x00, None, passphrase),
     }
 }
 
@@ -3178,6 +3197,55 @@ pub fn probe_apple_hfs_type<R: Read + Seek>(reader: &mut R, partition_offset: u6
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    /// The EFI System Partition on every UEFI PC is plain FAT32, but its GPT
+    /// type GUID had no arm in the dispatch, so browsing it failed with
+    /// "APM partition type 'C12A7328-...' not supported for browsing" - the
+    /// wrong partition scheme, about a filesystem supported all along. A GPT
+    /// type GUID says what a partition is *for*; the superblock says what is in
+    /// it, and that is what has to decide.
+    #[test]
+    fn an_efi_system_partition_opens_as_the_fat_it_holds() {
+        const ESP: &str = "C12A7328-F81F-11D2-BA4B-00A0C93EC93B";
+        let img = crate::fs::fat::create_blank_fat(64 * 1024 * 1024, Some("ESP")).unwrap();
+        let fs = open_filesystem_with_passphrase(Cursor::new(img), 0, 0, Some(ESP), None)
+            .expect("an ESP must open as the FAT volume it is");
+        assert!(
+            fs.fs_type().starts_with("FAT"),
+            "expected a FAT variant, got {}",
+            fs.fs_type()
+        );
+    }
+
+    /// And it must be writable: refusing the write path made the ESP read-only
+    /// while an identical FAT32 in an MBR partition edited fine.
+    #[test]
+    fn an_efi_system_partition_is_editable() {
+        const ESP: &str = "C12A7328-F81F-11D2-BA4B-00A0C93EC93B";
+        let img = crate::fs::fat::create_blank_fat(64 * 1024 * 1024, Some("ESP")).unwrap();
+        let mut fs = open_editable_filesystem_with(
+            Cursor::new(img),
+            0,
+            EditContext::default(),
+            0,
+            Some(ESP),
+        )
+        .expect("an ESP must open for write");
+        let root = fs.as_filesystem_mut().root().unwrap();
+        fs.create_directory(&root, "EFI", &Default::default())
+            .expect("mkdir on an ESP must work");
+    }
+
+    /// The same reasoning covers every other GPT GUID we have no arm for -
+    /// "Microsoft Basic Data" is the one on every Windows data partition.
+    #[test]
+    fn an_unknown_gpt_type_guid_falls_back_to_the_superblock() {
+        const MS_BASIC_DATA: &str = "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7";
+        let img = crate::fs::fat::create_blank_fat(64 * 1024 * 1024, Some("DATA")).unwrap();
+        let fs = open_filesystem_with_passphrase(Cursor::new(img), 0, 0, Some(MS_BASIC_DATA), None)
+            .expect("an unknown GPT GUID must fall back to content detection");
+        assert!(fs.fs_type().starts_with("FAT"));
+    }
 
     #[test]
     fn browsable_gate_excludes_apm_driver_partitions() {
