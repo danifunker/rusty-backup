@@ -4680,6 +4680,20 @@ pub fn compute_fat_blank_layout_with_sector_size(
     size_bytes: u64,
     bytes_per_sector: u32,
 ) -> Result<FatBlankLayout> {
+    compute_fat_blank_layout_forced(size_bytes, bytes_per_sector, false)
+}
+
+/// Like [`compute_fat_blank_layout_with_sector_size`], but can be told to emit
+/// FAT32 whatever the capacity.
+///
+/// Needed because an EFI System Partition is FAT32 and typically 100-512 MiB:
+/// firmware wants the FAT32 BPB, and size-based selection would hand back
+/// FAT16 for every ESP anyone actually builds.
+pub fn compute_fat_blank_layout_forced(
+    size_bytes: u64,
+    bytes_per_sector: u32,
+    force_fat32: bool,
+) -> Result<FatBlankLayout> {
     if size_bytes < 64 * 1024 {
         return Err(anyhow::anyhow!(
             "FAT volume must be at least 64 KiB, got {size_bytes}"
@@ -4733,11 +4747,25 @@ pub fn compute_fat_blank_layout_with_sector_size(
         }
     };
 
-    // --- FAT32: capacity above 2 GiB. Distinct BPB shape (32 reserved sectors,
-    //     no fixed root directory, FSInfo + backup boot). ---
-    if size_bytes > 2u64 * 1024 * 1024 * 1024 {
+    // --- FAT32: capacity above 2 GiB, or asked for outright. Distinct BPB
+    //     shape (32 reserved sectors, no fixed root directory, FSInfo + backup
+    //     boot). ---
+    //
+    // Size alone cannot decide this. An EFI System Partition is FAT32 and is
+    // routinely 100-512 MiB, so "big enough for FAT32" and "must be FAT32" are
+    // different questions - firmware wants the FAT32 BPB regardless of how
+    // little the partition holds. Without `force_fat32` the only way to get a
+    // FAT32 volume out of this formatter was to ask for more than 2 GiB of it.
+    if force_fat32 || size_bytes > 2u64 * 1024 * 1024 * 1024 {
+        // Smallest cluster the size allows, so a small volume still clears the
+        // spec's 65525-cluster FAT32 floor: 512-byte clusters reach it from
+        // ~32 MiB up. Below that the volume is under-clustered for the letter
+        // of the spec, which mkfs.vfat also permits and which `open` reads back
+        // correctly - it takes the type from the BPB before the cluster count,
+        // exactly for these.
         let spc: u32 = match size_bytes {
-            0..=8_589_934_592 => 8,
+            0..=2_147_483_648 => 1,
+            2_147_483_649..=8_589_934_592 => 8,
             8_589_934_593..=17_179_869_184 => 16,
             17_179_869_185..=34_359_738_368 => 32,
             _ => 64,
@@ -4931,6 +4959,19 @@ pub fn write_blank_fat_metadata_to_sink<W: std::io::Write + std::io::Seek>(
 
 pub fn create_blank_fat(size_bytes: u64, label: Option<&str>) -> Result<Vec<u8>> {
     create_blank_fat_with_sector_size(size_bytes, 512, label)
+}
+
+/// Format a blank **FAT32** volume regardless of capacity.
+///
+/// [`create_blank_fat`] picks the type from the size and so only reaches FAT32
+/// above 2 GiB, which cannot express an EFI System Partition - FAT32, and
+/// usually 100-512 MiB.
+pub fn create_blank_fat32(size_bytes: u64, label: Option<&str>) -> Result<Vec<u8>> {
+    let layout = compute_fat_blank_layout_forced(size_bytes, 512, true)?;
+    let mut img = vec![0u8; layout.image_size() as usize];
+    let mut cur = std::io::Cursor::new(&mut img);
+    write_blank_fat_metadata_to_sink(&mut cur, &layout, label)?;
+    Ok(img)
 }
 
 /// Like [`create_blank_fat`], but lets the caller choose the logical

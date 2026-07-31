@@ -5458,6 +5458,9 @@ impl App {
                 catalog_size: None,
                 extents_size: None,
                 cpm_preset: None,
+                // The TUI wizard has no FAT32 toggle yet; size-based selection
+                // is the existing behaviour. `rb-cli new ... --fat32` forces it.
+                fat32: false,
             }),
             DiskClass::Volume => NewCommand::Volume(VolumeArgs {
                 fs: VOLUME_FS[w.fs_sel.min(VOLUME_FS.len() - 1)].1,
@@ -5470,6 +5473,7 @@ impl App {
                 case_sensitive: false,
                 min_catalog: None,
                 affs_variant: 1,
+                fat32: false,
                 inodes: None,
                 bytes_per_inode: None,
                 cluster_size: None,

@@ -33,6 +33,8 @@
 <dd>HFS+ only: format a case-sensitive (HFSX) volume</dd>
 <dt><code>--min-catalog</code></dt>
 <dd>HFS+ only: minimum catalog B-tree size in bytes (a floor)</dd>
+<dt><code>--fat32</code></dt>
+<dd>FAT only: format FAT32 regardless of size. Without this the type is picked from the capacity and only reaches FAT32 above 2 GiB, which cannot express an EFI System Partition - FAT32, and usually 100-512 MiB</dd>
 <dt><code>--affs-variant</code></dt>
 <dd>AFFS variant byte (0=OFS, 1=FFS, 2=OFS+intl, 3=FFS+intl, 4=OFS+dircache, 5=FFS+dircache). Defaults to 1 (FFS)</dd>
 <dt><code>--inodes</code></dt>

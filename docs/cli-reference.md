@@ -998,6 +998,7 @@ Usage: floppy [OPTIONS] <FS> <IMAGE>
 - `--catalog-size` — HFS Catalog B-tree initial size in bytes. Auto when unset
 - `--extents-size` — HFS Extents-overflow B-tree initial size in bytes. Auto when unset
 - `--cpm-preset` — CP/M disk-parameter-block preset (required with `cpm`). One of: amstrad_data, amstrad_sys, amstrad_pcw, einstein, svi328_cpm, altair_8in, altair_cf, multicomp, zxplus3
+- `--fat32` — FAT only: format FAT32 regardless of size. Without this the type comes from the capacity and only reaches FAT32 above 2 GiB, which cannot express an EFI System Partition - FAT32, and usually 100-512 MiB
 
 ### `new hd`
 
@@ -1079,6 +1080,7 @@ Usage: volume [OPTIONS] <FS> <IMAGE>
 - `--extents-size` — HFS Extents-overflow B-tree initial size in bytes. Auto when unset
 - `--case-sensitive` — HFS+ only: format a case-sensitive (HFSX) volume
 - `--min-catalog` — HFS+ only: minimum catalog B-tree size in bytes (a floor)
+- `--fat32` — FAT only: format FAT32 regardless of size. Without this the type is picked from the capacity and only reaches FAT32 above 2 GiB, which cannot express an EFI System Partition - FAT32, and usually 100-512 MiB
 - `--affs-variant` — AFFS variant byte (0=OFS, 1=FFS, 2=OFS+intl, 3=FFS+intl, 4=OFS+dircache, 5=FFS+dircache). Defaults to 1 (FFS)
 - `--inodes` — EFS only: approximate total inode count. Mutually exclusive with `--bytes-per-inode`
 - `--bytes-per-inode` — EFS only: inode density in bytes per inode (smaller = more inodes)
