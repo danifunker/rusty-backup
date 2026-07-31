@@ -914,7 +914,8 @@ pub fn request_elevation() -> Result<()> {
     }
 }
 
-/// Rename `src` over `dest`, retrying 12 times (25ms->400ms, ~2.5s) because Windows fails a rename with ERROR_ACCESS_DENIED / ERROR_SHARING_VIOLATION while Defender or the indexer holds a handle on a file we just wrote.
+/// Rename `src` over `dest`, retrying ~2.5s on the ERROR_ACCESS_DENIED /
+/// ERROR_SHARING_VIOLATION a Windows scanner's handle causes. No-op on Unix.
 pub fn replace_file(src: &Path, dest: &Path) -> io::Result<()> {
     const ATTEMPTS: u32 = 12;
     let mut delay_ms = 25u64;

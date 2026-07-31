@@ -276,6 +276,13 @@ If you think one of these *now* makes sense for new work, that's fine — but th
 - `eprintln!` is allowed inside `#[cfg(test)]` blocks; nowhere else.
 - For user-facing log lines (the in-app `LogPanel`), use the `log_cb: &dyn Fn(&str)` callback the leaf I/O takes. Plain ASCII only (see hard rules above).
 
+### Comments
+
+- **One line. Two if it truly needs it. Never three or more — ever.** This is a hard rule for every comment you write inside a `.rs` file, inline `//` and doc `///` alike.
+- If the explanation doesn't fit in two lines, it isn't a comment — it's documentation. Put it in the module's `//!` header, `src/fs/README.md`, `src/rbformats/README.md`, or a `docs/` page, and reference that from the one-line comment.
+- Say **why**, not what. `// bump the cursor past the BPB` restates the code; `// FAT32's BPB is 90 bytes, not 62 — 0x24 onward differs` earns its line.
+- Existing multi-line blocks are grandfathered; don't retrofit files you aren't otherwise touching. But don't add new ones.
+
 ### Error handling
 
 - Library code returns `Result<T, FilesystemError>` (or the relevant typed error).
