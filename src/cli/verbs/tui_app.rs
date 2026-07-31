@@ -1115,6 +1115,145 @@ const TABS: &[(TabId, &str)] = &[
 /// Inspect is the GUI's default tab; open on it too.
 const DEFAULT_TAB: usize = 2;
 
+// ---------------------------------------------------------------- key hints --
+//
+// One table per screen, and both the footer and the `?` overlay render from it.
+// They used to be written out by hand in each draw fn, which is how `E` (edit)
+// came to exist in the key handler and nowhere on screen at all: there was no
+// place that had to list it. A binding added here shows up in both, or in
+// neither - it cannot show up in one.
+
+/// One key binding, as shown in the footer strip and the `?` window.
+struct KeyHint {
+    /// Printable key, e.g. `"d"`, `"F2"`, `"Up/Down"`.
+    keys: &'static str,
+    /// What it does, phrased to fit a footer strip.
+    desc: &'static str,
+}
+
+const fn hint(keys: &'static str, desc: &'static str) -> KeyHint {
+    KeyHint { keys, desc }
+}
+
+/// Keys that work on every screen. Appended to each context in the `?` window,
+/// and deliberately left out of the footer strip, which has no room to repeat
+/// them on every screen.
+const HINTS_GLOBAL: &[KeyHint] = &[
+    hint("?", "This key list  (also F1)"),
+    hint(":", "Command palette - run any rb-cli verb"),
+    hint("q", "Quit"),
+    hint("Ctrl-C", "Quit immediately"),
+];
+
+// Command keys first, navigation after. The footer strip fills left to right
+// and stops when it runs out of room, so whatever leads is what a user actually
+// sees - and the arrow keys are the one part nobody needs telling. Leading with
+// navigation pushed every real command off the end of an 80-column terminal,
+// which is how `d` stayed as invisible as `E` had been.
+const HINTS_EXPLORER: &[KeyHint] = &[
+    hint("d", "Edit as text"),
+    hint("e", "Export"),
+    hint("i", "Import"),
+    hint("m", "Metadata (mode, owner, type)"),
+    hint("n", "New folder"),
+    hint("x", "Delete"),
+    hint("f", "Check (fsck)"),
+    hint("r", "Repair"),
+    hint("b", "Bless System Folder"),
+    hint("t", "Transform image"),
+    hint("Esc", "Close"),
+    hint("Enter", "Open directory / view file"),
+    hint("Tab", "Switch pane (tree <-> list)"),
+    hint("Space", "Mark / unmark"),
+    hint("Up/Down", "Move  (also k/j)"),
+    hint("Left/Right", "Collapse/expand, switch pane  (also h/l)"),
+    hint("PgUp/PgDn", "Page up / down"),
+    hint("Home/End", "First / last entry"),
+];
+
+/// The scrolling read-only overlays: file preview, and the fsck / repair
+/// report. They sit over the Explorer and take every key, so the footer has to
+/// stop advertising the Explorer's while one is up.
+const HINTS_REPORT: &[KeyHint] = &[
+    hint("Up/Down", "Scroll  (also k/j)"),
+    hint("PgUp/PgDn", "Page up / down"),
+    hint("Home/End", "Top / bottom"),
+    hint("Esc", "Close  (also q, Enter)"),
+];
+
+const HINTS_EDITOR: &[KeyHint] = &[
+    hint("F2", "Save"),
+    hint("F3", "Line endings (LF/CRLF/CR)"),
+    hint("Esc", "Close  (prompts if modified)"),
+    hint("Arrows", "Move cursor"),
+    hint("PgUp/PgDn", "Page up / down"),
+    hint("Home/End", "Start / end of line"),
+    hint("Enter", "New line"),
+    hint("Tab", "Insert four spaces"),
+    hint("Backspace", "Delete back  (Del deletes forward)"),
+];
+
+const HINTS_INSPECT_DISKS: &[KeyHint] = &[
+    hint("Up/Down", "Move  (also k/j)"),
+    hint("Enter", "Open the disk's partition table"),
+    hint("o", "Open an image file or backup folder"),
+    hint("r", "Rescan disks"),
+    hint("g/G", "Top / bottom  (also Home/End)"),
+];
+
+const HINTS_INSPECT_IMAGE: &[KeyHint] = &[
+    hint("Up/Down", "Move  (also k/j)"),
+    hint("Enter", "Browse this partition's filesystem"),
+    hint("o", "Open another image or backup folder"),
+    hint("Esc", "Back to the disk list"),
+    hint("g/G", "Top / bottom  (also Home/End)"),
+];
+
+const HINTS_TAB: &[KeyHint] = &[
+    hint("Left/Right", "Previous / next tab  (also h/l, Tab)"),
+    hint("1-9", "Jump to a tab by number"),
+    hint("Up/Down", "Move selection / scroll  (also k/j)"),
+    hint("g/G", "Top / bottom  (also Home/End)"),
+    hint("Enter", "Open / activate"),
+    hint("Esc", "Back, or cancel a running task"),
+];
+
+/// Fold a *command* key to lower case, so a binding fires whether or not shift
+/// was held. Only ever applied after every text-entry overlay has taken its
+/// turn - the editor, the `:` palette and the name prompts all return before
+/// this, or typing a capital letter would become impossible.
+///
+/// `G` is the deliberate exception: `g`/`G` is the vim top/bottom pair, kept as
+/// a pair and spelled out as `g/G` in the footer and the `?` window rather than
+/// left for the user to discover.
+fn fold_cmd_key(code: KeyCode) -> KeyCode {
+    match code {
+        KeyCode::Char('G') => code,
+        KeyCode::Char(c) if c.is_ascii_uppercase() => KeyCode::Char(c.to_ascii_lowercase()),
+        _ => code,
+    }
+}
+
+/// Render hints as a single footer strip, clipped to `width`.
+///
+/// Drops whole hints rather than cutting one mid-word, and appends `?` as the
+/// last thing standing so there is always a route to the full list even on a
+/// narrow terminal.
+fn footer_strip(hints: &[KeyHint], width: usize) -> String {
+    const TAIL: &str = "  ?=keys";
+    let budget = width.saturating_sub(TAIL.len() + 1);
+    let mut out = String::new();
+    for h in hints {
+        let piece = format!(" {} {} ", h.keys, h.desc);
+        if out.chars().count() + piece.chars().count() > budget {
+            break;
+        }
+        out.push_str(&piece);
+    }
+    out.push_str(TAIL);
+    out
+}
+
 /// Entry point for the `tui` verb. Guards the terminal, runs the event loop,
 /// and always restores the terminal (ratatui installs a panic hook that does
 /// the same on an unwind).
@@ -3159,6 +3298,10 @@ struct App {
     /// executes it, and re-enters).
     pending_palette: Option<String>,
     show_help: bool,
+    /// First visible row of the `?` window. The list is per-screen and the
+    /// Explorer's is longer than a short terminal, so it scrolls rather than
+    /// silently stopping at the bottom edge.
+    help_scroll: usize,
     should_quit: bool,
 }
 
@@ -3190,6 +3333,7 @@ impl App {
             palette_input: None,
             pending_palette: None,
             show_help: false,
+            help_scroll: 0,
             should_quit: false,
         };
         app.on_tab_changed();
@@ -3281,13 +3425,26 @@ impl App {
             return Ok(());
         }
 
-        // The help overlay is modal.
+        // The help overlay is modal. It scrolls: the Explorer's list is longer
+        // than a short terminal can show, and a list that silently stops at the
+        // bottom edge is the same discoverability bug this window exists to fix.
         if self.show_help {
-            if matches!(
-                key.code,
-                KeyCode::Esc | KeyCode::Char('?') | KeyCode::Enter | KeyCode::F(1)
-            ) {
-                self.show_help = false;
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('?') | KeyCode::Enter | KeyCode::F(1) => {
+                    self.show_help = false;
+                    self.help_scroll = 0;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.help_scroll = self.help_scroll.saturating_sub(1)
+                }
+                KeyCode::Down | KeyCode::Char('j') => self.help_scroll += 1,
+                KeyCode::PageUp => self.help_scroll = self.help_scroll.saturating_sub(10),
+                KeyCode::PageDown => self.help_scroll += 10,
+                KeyCode::Home => self.help_scroll = 0,
+                // Clamped against the real row count when drawn, so overshooting
+                // here just parks at the bottom.
+                KeyCode::End => self.help_scroll = usize::MAX / 2,
+                _ => {}
             }
             return Ok(());
         }
@@ -3332,6 +3489,28 @@ impl App {
 
         // The filesystem Explorer is a modal window over the Inspect tab.
         if self.explorer.is_some() {
+            // `?` has to reach the key list from in here too - the Explorer
+            // consumes every key below, and it is the screen with the most
+            // bindings to discover. Suppressed wherever something is taking
+            // text, where `?` is simply a character; F1 never is, so it always
+            // works, including inside the editor.
+            let ex_typing = self
+                .explorer
+                .as_ref()
+                .map(|e| {
+                    e.editor.is_some()
+                        || e.mkdir_input.is_some()
+                        || e.picker.is_some()
+                        || e.metadata.is_some()
+                })
+                .unwrap_or(false);
+            if matches!(key.code, KeyCode::F(1))
+                || (matches!(key.code, KeyCode::Char('?')) && !ex_typing)
+            {
+                self.show_help = true;
+                self.help_scroll = 0;
+                return Ok(());
+            }
             self.handle_explorer_key(key.code);
             return Ok(());
         }
@@ -4125,6 +4304,12 @@ impl App {
             return;
         }
 
+        // Everything from here down is a *command*, not text entry: the editor,
+        // the name prompts and the pickers have all had their turn and returned
+        // above. So fold the case here and a binding works with or without
+        // shift. Doing it any earlier would make a capital letter untypeable.
+        let code = fold_cmd_key(code);
+
         // `e` (export) / `i` (import) start a path prompt.
         match code {
             KeyCode::Char('e') => {
@@ -4145,9 +4330,10 @@ impl App {
                 }
                 return;
             }
-            // Edit metadata: HFS/HFS+ type/creator + modified date, and the
-            // `E` opens the in-app editor on the selected file.
-            KeyCode::Char('E') => self.explorer_edit(),
+            // `d` opens the in-app editor on the selected file. It was `E`,
+            // which collided with `e` (export) the moment keys became
+            // shift-agnostic, and was the least discoverable binding here.
+            KeyCode::Char('d') => self.explorer_edit(),
             // POSIX mode / owner on any filesystem that carries them. A
             // directory qualifies too — its permissions are as real as a
             // file's, even though it has no type code.
@@ -4226,7 +4412,9 @@ impl App {
                 return;
             }
             // Repair this partition's filesystem in place (with confirmation).
-            KeyCode::Char('F') => {
+            // `r`, not `F`: shift-agnostic keys make `f`/`F` the same key, and
+            // "check" and "repair" are much too different to share one.
+            KeyCode::Char('r') => {
                 self.explorer_repair();
                 return;
             }
@@ -7568,8 +7756,11 @@ impl App {
         if let Some(s) = &ex.status {
             fl.push(Line::styled(format!(" {s}"), self.palette.warn()));
         }
+        // This popup covers the main footer bar, so it is the one actually on
+        // screen - it has to answer for whichever overlay is up, not just the
+        // Explorer itself.
         fl.push(Line::styled(
-            " Enter open  e Exp i Imp  n New x Del  m Meta b Bless  f Chk F Rep  t Transform  Esc close",
+            footer_strip(self.key_context().1, rows[2].width as usize),
             self.palette.dim(),
         ));
         frame.render_widget(Paragraph::new(Text::from(fl)), rows[2]);
@@ -7790,13 +7981,25 @@ impl App {
                 area,
             );
             frame.render_widget(Clear, ep);
-            let inner_h = ep.height.saturating_sub(2) as usize;
+            // The status/keys line is a *footer*: it gets its own row at the
+            // bottom of the window, not a line pushed on after the last line of
+            // text. Appending it to the text meant it floated up the screen on
+            // any file shorter than the window, which reads as content.
+            let title = format!("Edit  {}{}", ed.name, if ed.dirty { " *" } else { "" });
+            let outer = self.pane_block(&title, true);
+            let inner = outer.inner(ep);
+            frame.render_widget(outer, ep);
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(1), Constraint::Length(2)])
+                .split(inner);
+            let inner_h = rows[0].height as usize;
             let visible = ed
                 .lines
                 .iter()
                 .enumerate()
                 .skip(ed.scroll)
-                .take(inner_h.saturating_sub(1))
+                .take(inner_h)
                 .map(|(i, l)| {
                     if i == ed.row {
                         // Mark the cursor line: a block cursor cannot be drawn
@@ -7808,11 +8011,14 @@ impl App {
                     }
                 })
                 .collect::<Vec<_>>();
-            let mut lines = visible;
-            let footer = match &ed.status {
+            frame.render_widget(Paragraph::new(Text::from(visible)), rows[0]);
+
+            // Row one: where the cursor is and what the file will be saved as.
+            // Row two: the keys, from the same table `?` renders.
+            let state = match &ed.status {
                 Some(msg) => msg.clone(),
                 None => format!(
-                    "line {}/{} col {}  |  {} {}  |  F2 save  F3 endings  Esc close{}",
+                    " line {}/{} col {}  |  {} {}{}",
                     ed.row + 1,
                     ed.lines.len(),
                     ed.col + 1,
@@ -7821,18 +8027,22 @@ impl App {
                     if ed.dirty { "   *modified" } else { "" },
                 ),
             };
-            lines.push(Line::styled(
-                footer,
-                if ed.status.is_some() {
-                    self.palette.warn()
-                } else {
-                    self.palette.dim()
-                },
-            ));
-            let title = format!("Edit  {}{}", ed.name, if ed.dirty { " *" } else { "" });
             frame.render_widget(
-                Paragraph::new(Text::from(lines)).block(self.pane_block(&title, true)),
-                ep,
+                Paragraph::new(Text::from(vec![
+                    Line::styled(
+                        state,
+                        if ed.status.is_some() {
+                            self.palette.warn()
+                        } else {
+                            self.palette.dim()
+                        },
+                    ),
+                    Line::styled(
+                        footer_strip(HINTS_EDITOR, rows[1].width as usize),
+                        self.palette.dim(),
+                    ),
+                ])),
+                rows[1],
             );
 
             if ed.confirm_discard {
@@ -9852,23 +10062,17 @@ impl App {
             .constraints([Constraint::Min(10), Constraint::Length(24)])
             .split(area);
 
-        // Context-sensitive footer.
-        let explorer_preview = self
-            .explorer
-            .as_ref()
-            .map(|e| e.preview.is_some())
-            .unwrap_or(false);
-        let keys: Vec<(&str, &str)> = if explorer_preview {
-            vec![("Up/Dn", "Scroll"), ("PgUp/Dn", "Page"), ("Esc", "Close")]
-        } else if self.explorer.is_some() {
-            vec![
-                ("Tab", "Pane"),
-                ("Up/Dn", "Move"),
-                ("Enter", "Open/View"),
-                ("Space", "Mark"),
-                ("e/i", "Export/Import"),
-                ("Esc", "Close"),
-            ]
+        // Context-sensitive footer. Inside the Explorer this defers to
+        // `key_context`, the same table its own footer and `?` render from,
+        // rather than a second hand-written list. The hand-written one had
+        // drifted: it never mentioned edit, metadata, new, delete, bless,
+        // check, repair or transform.
+        let keys: Vec<(&str, &str)> = if self.explorer.is_some() {
+            self.key_context()
+                .1
+                .iter()
+                .map(|h| (h.keys, h.desc))
+                .collect()
         } else if self.progress.is_some() {
             vec![("Esc", "Cancel")]
         } else if self.current() == TabId::Backup {
@@ -10052,30 +10256,100 @@ impl App {
         Line::from(spans)
     }
 
+    /// The active screen's name and key list.
+    ///
+    /// Ordered innermost-first: the editor sits over the Explorer, which sits
+    /// over the Inspect tab, and the keys that work are the innermost one's.
+    /// The footer and the `?` window both call this, so what is drawn at the
+    /// bottom of the screen is by construction what `?` will list.
+    fn key_context(&self) -> (&'static str, &'static [KeyHint]) {
+        if let Some(ex) = self.explorer.as_ref() {
+            if ex.editor.is_some() {
+                return ("Text editor", HINTS_EDITOR);
+            }
+            if ex.fsck_report.is_some() {
+                return ("Filesystem report", HINTS_REPORT);
+            }
+            if ex.preview.is_some() {
+                return ("File preview", HINTS_REPORT);
+            }
+            return ("Explorer", HINTS_EXPLORER);
+        }
+        if self.current() == TabId::Inspect {
+            return match self.opened {
+                Some(Opened::Image { .. }) => ("Inspect - partitions", HINTS_INSPECT_IMAGE),
+                _ => ("Inspect - disks", HINTS_INSPECT_DISKS),
+            };
+        }
+        ("Tabs", HINTS_TAB)
+    }
+
     fn draw_help(&self, frame: &mut Frame, area: Rect) {
-        let body = Text::from(vec![
-            Line::raw(""),
-            Line::raw("  Tabs (windows)"),
-            Line::raw("    Left / Right   Previous / next tab   (also h / l, Tab)"),
-            Line::raw("    1 - 9          Jump to a tab by number"),
-            Line::raw(""),
-            Line::raw("  Within a tab"),
-            Line::raw("    Up / Down      Move selection (or scroll)   (also j / k)"),
-            Line::raw("    g / G          Top / bottom"),
-            Line::raw("    Enter          Open / activate the selection"),
-            Line::raw("    Esc            Back (or cancel a running task)"),
-            Line::raw(""),
-            Line::raw("  Global"),
-            Line::raw("    o              Open a file/backup (Inspect): path, recent, Tab=browse"),
-            Line::raw("    r              Rescan disks (Inspect)"),
-            Line::raw("    ? / F1         Toggle this help        q  Quit"),
-            Line::raw(""),
-            Line::raw("  Press Esc to close."),
-        ]);
-        let popup = centered_rect(62, 21, area);
+        let (title, hints) = self.key_context();
+
+        // Every key that works here, then the ones that work everywhere. Built
+        // as rows first so the scroll maths below counts what is really drawn.
+        let mut rows: Vec<(String, String)> = Vec::new();
+        for h in hints {
+            rows.push((h.keys.to_string(), h.desc.to_string()));
+        }
+        // Blank spacer, then a heading, then the always-available keys. A row
+        // with an empty description renders as a heading; both empty is a gap.
+        rows.push((String::new(), String::new()));
+        rows.push(("Anywhere".to_string(), String::new()));
+        for h in HINTS_GLOBAL {
+            rows.push((h.keys.to_string(), h.desc.to_string()));
+        }
+        let key_w = rows
+            .iter()
+            .map(|(k, _)| k.chars().count())
+            .max()
+            .unwrap_or(8)
+            .max(8);
+
+        let popup = centered_rect(
+            72.min(area.width.saturating_sub(4)),
+            area.height.saturating_sub(4).min(24),
+            area,
+        );
+        // Two chrome rows for the border, one for the scroll hint at the foot.
+        let view_h = popup.height.saturating_sub(3) as usize;
+        let total = rows.len();
+        let max_scroll = total.saturating_sub(view_h);
+        let scroll = self.help_scroll.min(max_scroll);
+
+        let mut lines: Vec<Line> = Vec::new();
+        for (k, d) in rows.iter().skip(scroll).take(view_h) {
+            if k.is_empty() && d.is_empty() {
+                lines.push(Line::raw(""));
+            } else if d.is_empty() {
+                lines.push(Line::styled(format!("  {k}"), self.palette.accent()));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {k:<key_w$}  "), self.palette.accent()),
+                    Span::raw(d.clone()),
+                ]));
+            }
+        }
+        let more = total > view_h;
+        lines.push(Line::styled(
+            if more {
+                format!(
+                    "  {}-{} of {}   Up/Down PgUp/PgDn scroll   Esc close",
+                    scroll + 1,
+                    (scroll + view_h).min(total),
+                    total
+                )
+            } else {
+                "  Esc close".to_string()
+            },
+            self.palette.dim(),
+        ));
+
         frame.render_widget(Clear, popup);
         frame.render_widget(
-            Paragraph::new(body).block(self.pane_block("Help", true)),
+            Paragraph::new(Text::from(lines))
+                .block(self.pane_block(&format!("Keys - {title}"), true)),
             popup,
         );
     }
@@ -11233,6 +11507,73 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Shift must not change what a command key does.
+    #[test]
+    fn command_keys_are_shift_agnostic() {
+        for (shifted, plain) in [('D', 'd'), ('F', 'f'), ('R', 'r'), ('T', 't'), ('X', 'x')] {
+            assert_eq!(
+                fold_cmd_key(KeyCode::Char(shifted)),
+                KeyCode::Char(plain),
+                "{shifted} should act as {plain}"
+            );
+        }
+    }
+
+    /// `g`/`G` is the deliberate exception - the vim top/bottom pair. It is
+    /// kept *and* spelled out in the hint tables, rather than left to be
+    /// discovered.
+    #[test]
+    fn the_vim_top_bottom_pair_survives_folding() {
+        assert_eq!(fold_cmd_key(KeyCode::Char('G')), KeyCode::Char('G'));
+        assert_eq!(fold_cmd_key(KeyCode::Char('g')), KeyCode::Char('g'));
+        for table in [HINTS_TAB, HINTS_INSPECT_DISKS, HINTS_INSPECT_IMAGE] {
+            assert!(
+                table.iter().any(|h| h.keys == "g/G"),
+                "a screen using g/G must say so in its key list"
+            );
+        }
+    }
+
+    /// The footer clips to the terminal, and never at the cost of the one hint
+    /// that leads to all the others.
+    #[test]
+    fn the_footer_always_offers_the_key_list() {
+        for width in [12usize, 24, 40, 80, 200] {
+            let strip = footer_strip(HINTS_EXPLORER, width);
+            assert!(
+                strip.contains("?=keys"),
+                "width {width} dropped the route to the full list: {strip:?}"
+            );
+        }
+        // Wide enough to show the binding that started all this.
+        assert!(footer_strip(HINTS_EXPLORER, 200).contains(" d "));
+    }
+
+    /// A hint table is only useful if it is complete: `E` (edit) existed in the
+    /// key handler and in no on-screen list at all, which is the bug these
+    /// tables exist to make impossible. Pin the Explorer's command keys.
+    #[test]
+    fn the_explorer_lists_every_command_key_it_binds() {
+        for k in ["d", "e", "i", "m", "n", "b", "f", "r", "t", "x"] {
+            assert!(
+                HINTS_EXPLORER.iter().any(|h| h.keys == k),
+                "Explorer binds {k:?} but never lists it"
+            );
+        }
+        // Edit moved off `E` so it stops colliding with export once shift is
+        // ignored; nothing should advertise the old key.
+        assert!(!HINTS_EXPLORER.iter().any(|h| h.keys == "E"));
+    }
+
+    /// F2 saves, not Ctrl-S: Ctrl-S is XOFF and freezes a serial console, which
+    /// is exactly where this editor is worth having.
+    #[test]
+    fn the_editor_lists_save_and_line_endings() {
+        assert!(HINTS_EDITOR.iter().any(|h| h.keys == "F2"));
+        assert!(HINTS_EDITOR.iter().any(|h| h.keys == "F3"));
+        assert!(!HINTS_EDITOR.iter().any(|h| h.keys.contains("Ctrl-S")));
+    }
 
     /// A disk-list entry pointing at a real path, so the open path can run.
     fn fake_disk(path: &std::path::Path, size: u64) -> DiskDevice {
