@@ -772,6 +772,64 @@ stage_ppc() {
   note "PowerPC rb-cli under $PPC_OUT (compiled on $PPC_HOST)."
 }
 
+# ---- stage 9: package a self-contained tree -------------------------------
+# The link records absolute /opt/local paths for MacPorts' gcc runtime and legacy-support
+# shim, so the binary only starts on the build box. Copy each one next to the binary and
+# repoint it at @executable_path (supported since 10.4), which needs no installer: unpack
+# and run. Anything still naming /opt/local afterwards is a dependency we failed to carry.
+stage_dist() {
+  banner "9. package a relocatable PowerPC tree"
+  [ -n "$PPC_HOST" ] || die "PPC_HOST is not set"
+  [ -e "$PPC_OUT/rb-cli" ] || die "no $PPC_OUT/rb-cli -- run 'ppc' first"
+  # install_name_tool and otool only exist on the Mac, so the rewrite happens there.
+  note "uploading rb-cli to $PPC_HOST for packaging"
+  scp -q "$PPC_OUT/rb-cli" "$PPC_HOST:~/rb-cli-dist-src" || die "could not upload rb-cli"
+  ssh "$PPC_HOST" "bash -s" <<'REMOTE' || die "packaging failed on $PPC_HOST"
+set -e
+BIN=~/rb-cli-dist-src
+D=~/rb-cli-dist
+rm -rf "$D"; mkdir -p "$D/lib"
+cp "$BIN" "$D/rb-cli"; chmod u+w "$D/rb-cli"
+
+# Walk the dependency closure: a dylib can name further /opt/local dylibs of its own
+# (libgcc_s.1.dylib is a stub in front of two more), so collect until it stops growing.
+pending=$(otool -L "$D/rb-cli" | tail -n +2 | awk '{print $1}' | grep '^/opt/local/' || true)
+seen=""
+while [ -n "$pending" ]; do
+  next=""
+  for f in $pending; do
+    case " $seen " in *" $f "*) continue;; esac
+    seen="$seen $f"
+    [ -e "$f" ] || { echo "missing dependency $f" >&2; exit 1; }
+    cp "$f" "$D/lib/"; chmod u+w "$D/lib/$(basename "$f")"
+    next="$next $(otool -L "$f" | tail -n +2 | awk '{print $1}' | grep '^/opt/local/' || true)"
+  done
+  pending="$next"
+done
+
+for f in "$D"/lib/*.dylib; do
+  install_name_tool -id "@executable_path/lib/$(basename "$f")" "$f"
+done
+for f in $seen; do
+  b=$(basename "$f")
+  install_name_tool -change "$f" "@executable_path/lib/$b" "$D/rb-cli" 2>/dev/null || true
+  for g in "$D"/lib/*.dylib; do
+    install_name_tool -change "$f" "@executable_path/lib/$b" "$g" 2>/dev/null || true
+  done
+done
+
+left=$(otool -L "$D/rb-cli" "$D"/lib/*.dylib | grep -c '/opt/local' || true)
+[ "$left" -eq 0 ] || { echo "$left /opt/local reference(s) survived packaging" >&2; exit 1; }
+(cd "$D" && ./rb-cli --version >/dev/null) || { echo "packaged rb-cli does not run" >&2; exit 1; }
+rm -f ~/rb-cli-ppc.tar.gz
+(cd ~ && tar czf rb-cli-ppc.tar.gz rb-cli-dist)
+echo "bundled $(ls "$D/lib" | wc -l | tr -d ' ') dylib(s); $(ls -l ~/rb-cli-ppc.tar.gz | awk '{print $5}') bytes"
+REMOTE
+  mkdir -p "$RB_DIR/dist"
+  scp -q "$PPC_HOST:~/rb-cli-ppc.tar.gz" "$RB_DIR/dist/rb-cli-ppc.tar.gz" || die "could not fetch the tarball"
+  note "PowerPC bundle at $RB_DIR/dist/rb-cli-ppc.tar.gz (unpack and run; no install step)."
+}
+
 # ---- stage 8: capture libc ground truth from the PowerPC Mac ----------------
 stage_probe() {
   banner "8. probe the PowerPC SDKs for libc ground truth"
@@ -803,15 +861,16 @@ main() {
     ppclibs)   stage_ppclibs ;;
     ppc)       stage_ppc ;;
     probe)     stage_probe ;;
+    dist)      stage_dist ;;
     all)
       stage_mrustc
       stage_overrides
       stage_hostlibs
       stage_vendor
       stage_host
-      banner "HOST path complete. Run 'ppclibs' then 'ppc' for PowerPC (needs PPC_HOST)."
+      banner "HOST path complete. Run 'ppclibs', 'ppc' then 'dist' for PowerPC (needs PPC_HOST)."
       ;;
-    *) die "unknown stage '$stage' (mrustc|overrides|hostlibs|vendor|hostc|host|ppclibs|ppc|probe|all)" ;;
+    *) die "unknown stage '$stage' (mrustc|overrides|hostlibs|vendor|hostc|host|ppclibs|ppc|probe|dist|all)" ;;
   esac
 }
 main "$@"

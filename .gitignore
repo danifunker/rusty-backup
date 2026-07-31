@@ -63,3 +63,6 @@ rb-cli-*/vendor/
 
 # Python bytecode from the scripts/ probe + build helpers
 scripts/__pycache__/
+
+# Packaged PowerPC bundle from `scripts/build-ppc.sh dist`
+dist/

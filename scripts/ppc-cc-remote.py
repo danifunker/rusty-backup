@@ -398,6 +398,30 @@ def split_and_compile(source, output, remote_args, remap):
     return 0
 
 
+# Libraries that must come from /usr/lib, keyed to the absolute path to link instead.
+# A plain `-l` takes the first hit in the search path, and MacPorts' /opt/local/lib
+# comes first: its libiconv is compatibility version 10.0.0 against Leopard's 7.0.0, so
+# the binary then refuses to start on any Mac without MacPorts, and it is built ppc7400
+# with AltiVec, which rules out a G3. The system copy is neither.
+SYSTEM_LIBS = {"iconv": "/usr/lib/libiconv.2.dylib"}
+
+
+def pin_system_libs(args):
+    """Rewrite `-l foo` to an absolute /usr/lib path for everything in SYSTEM_LIBS."""
+    out_args, pinned, i = [], [], 0
+    while i < len(args):
+        if args[i] == "-l" and i + 1 < len(args) and args[i + 1] in SYSTEM_LIBS:
+            out_args.append(SYSTEM_LIBS[args[i + 1]])
+            pinned.append(args[i + 1])
+            i += 2
+        else:
+            out_args.append(args[i])
+            i += 1
+    if pinned:
+        sys.stderr.write("ppc-cc-remote: pinning %s to /usr/lib\n" % ", ".join(sorted(pinned)))
+    return out_args
+
+
 def reframework(args):
     """Rewrite `-l Foo` to `-framework Foo` where Foo is a framework, not a library.
 
@@ -602,7 +626,7 @@ def main():
         if shim_obj:
             remote_args.append(shim_obj)
         remote_args.extend(LDFLAGS)
-        remote_args = reframework(remote_args)
+        remote_args = reframework(pin_system_libs(remote_args))
     elif BIG_TU_BYTES:
         # An oversized translation unit needs its own flags or 32-bit cc1 runs
         # out of address space - see BIG_TU_ARGS above.
