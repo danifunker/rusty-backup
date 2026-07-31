@@ -189,7 +189,7 @@ impl RwCommit {
                 let tmp_out = cbk_path.with_extension("cbk.tmp");
                 crate::rbformats::cbk::pack_folder_to_cbk(temp_folder.path(), &tmp_out)
                     .with_context(|| format!("repacking {}", cbk_path.display()))?;
-                std::fs::rename(&tmp_out, &cbk_path).with_context(|| {
+                crate::os::replace_file(&tmp_out, &cbk_path).with_context(|| {
                     format!(
                         "replacing {} with the repacked container",
                         cbk_path.display()

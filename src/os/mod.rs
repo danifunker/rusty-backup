@@ -914,6 +914,33 @@ pub fn request_elevation() -> Result<()> {
     }
 }
 
+/// Rename `src` over `dest`, retrying 12 times (25ms->400ms, ~2.5s) because Windows fails a rename with ERROR_ACCESS_DENIED / ERROR_SHARING_VIOLATION while Defender or the indexer holds a handle on a file we just wrote.
+pub fn replace_file(src: &Path, dest: &Path) -> io::Result<()> {
+    const ATTEMPTS: u32 = 12;
+    let mut delay_ms = 25u64;
+    for attempt in 1..=ATTEMPTS {
+        match std::fs::rename(src, dest) {
+            Ok(()) => return Ok(()),
+            Err(e) if attempt < ATTEMPTS && is_transient_share_error(&e) => {
+                log::debug!(
+                    "rename {} -> {} failed ({e}); retry {attempt}/{ATTEMPTS} in {delay_ms}ms",
+                    src.display(),
+                    dest.display(),
+                );
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                delay_ms = (delay_ms * 2).min(400);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!("the final attempt returns rather than looping")
+}
+
+/// True only on Windows, and only for the two codes a scanner's handle yields.
+fn is_transient_share_error(e: &io::Error) -> bool {
+    cfg!(windows) && matches!(e.raw_os_error(), Some(5) | Some(32))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -960,5 +987,26 @@ mod tests {
             "first sector should contain the payload, not zeros (was {:?}..)",
             &first[..16]
         );
+    }
+
+    #[test]
+    fn replace_file_overwrites_an_existing_destination() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let src = tmp.path().join("new");
+        let dest = tmp.path().join("old");
+        std::fs::write(&src, b"new").unwrap();
+        std::fs::write(&dest, b"old").unwrap();
+
+        replace_file(&src, &dest).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new");
+        assert!(!src.exists(), "source should have been renamed away");
+    }
+
+    #[test]
+    fn replace_file_still_reports_a_missing_source() {
+        // A non-transient error must surface immediately, not after 12 retries.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let err = replace_file(&tmp.path().join("nope"), &tmp.path().join("dest")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 }
