@@ -2324,7 +2324,11 @@ mod tests {
     /// Build a populated HPFS volume with the clean-room oracle. Returns the
     /// image bytes and the temp paths (kept alive by the caller via drop).
     fn oracle_volume() -> Option<Vec<u8>> {
-        let dir = std::env::temp_dir().join(format!("rb_hpfs_src_{}", std::process::id()));
+        // Per-call suffix, as in oracle_cross_check: both callers run in
+        // parallel and a pid-only path had them clobbering each other's image.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let uniq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("rb_hpfs_src_{}_{}", std::process::id(), uniq));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("DOCS")).ok()?;
         std::fs::create_dir_all(dir.join("SUB/NESTED")).ok()?;
@@ -2332,7 +2336,7 @@ mod tests {
         std::fs::write(dir.join("CONFIG.SYS"), b"REM config\n").ok()?;
         std::fs::write(dir.join("DOCS/BIG.DAT"), vec![0x5Au8; 9000]).ok()?;
         std::fs::write(dir.join("SUB/NESTED/DEEP.TXT"), b"deep\n").ok()?;
-        let img = std::env::temp_dir().join(format!("rb_hpfs_{}.img", std::process::id()));
+        let img = std::env::temp_dir().join(format!("rb_hpfs_{}_{}.img", std::process::id(), uniq));
         let ok = run_oracle(&["build", img.to_str()?, "4", dir.to_str()?])
             .map(|o| o.status.success())
             .unwrap_or(false);
