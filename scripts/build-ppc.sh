@@ -207,6 +207,22 @@ ppc_reap_orphans() {
   note "reaped $killed orphaned remote compile(s) on $PPC_HOST ($remaining still up)"
 }
 
+# ---- rustc source patch marker ----------------------------------------------
+# A branch switch refreshes the patch's mtime without changing it; refresh dl-version so minicargo.mk won't re-apply it.
+sync_rustc_src_patch() {
+  local src="$MRUSTC_DIR/rustc-${RUSTC_VERSION}-src"
+  local patch_file="$MRUSTC_DIR/rustc-${RUSTC_VERSION}-src.patch"
+  [ -d "$src" ] && [ -f "$patch_file" ] && [ -f "$src/dl-version" ] || return 0
+  [ "$patch_file" -nt "$src/dl-version" ] || return 0
+  if (cd "$src" && patch -p0 -R --dry-run -f < "$patch_file" >/dev/null 2>&1); then
+    find "$src" -name '*.rej' -delete 2>/dev/null || true
+    touch "$src/dl-version"
+    note "rustc source already carries rustc-${RUSTC_VERSION}-src.patch; refreshed dl-version (branch switch, identical content)"
+  else
+    note "rustc source does not match rustc-${RUSTC_VERSION}-src.patch - leaving it to minicargo to (re)apply"
+  fi
+}
+
 _ppc_cleaned=0
 ppc_cleanup() {
   local rc=$?
@@ -684,11 +700,14 @@ stage_hostc() {
 # See docs/build-ppc-mrustc.md and scripts/ppc-libc-probe.py.
 stage_ppclibs() {
   banner "6. build PPC libstd -> $PPC_LIBS"
+  sync_rustc_src_patch
   [ -n "$PPC_HOST" ] || die "PPC_HOST is not set (e.g. PPC_HOST=admin@g5.local)"
   [ -x "$PPC_CC_WRAPPER" ] || die "missing $PPC_CC_WRAPPER"
   cd "$MRUSTC_DIR"
   stage_ppc_overrides
+  # No debug_assertions: assert_unsafe_precondition! aborts in rt::init here (docs/build-ppc-mrustc.md "The alignment problem").
   MRUSTC_TARGET_VER="$MRUSTC_TARGET_VER" MINICARGO_DEFER_CODEGEN=1 \
+  MINICARGO_NO_DEBUG_ASSERTIONS=1 \
     make -f minicargo.mk LIBS \
       RUSTC_VERSION="$RUSTC_VERSION" \
       MRUSTC_TARGET="$PPC_TARGET" \

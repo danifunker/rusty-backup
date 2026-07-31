@@ -793,6 +793,8 @@ first and then ingested as a `.woz` / `.dc42` / `.2mg` image.
   [`docs/appliance_hardware_support.md`](docs/appliance_hardware_support.md) —
   the bootable Linux backup appliance and its vintage-hardware driver support
   (which cards work, and how to add more in Buildroot).
+- [`docs/build-ppc-mrustc.md`](docs/build-ppc-mrustc.md) — building `rb-cli` for
+  PowerPC Mac OS X 10.4/10.5 through the mrustc fork (`scripts/build-ppc.sh`).
 
 ## Donations
 
