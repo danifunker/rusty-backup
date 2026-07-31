@@ -52,6 +52,12 @@ printf 'attribute subject\n'  > "$WORK/attr.txt"
 printf 'protection subject\n' > "$WORK/prot.txt"
 printf 'metadata subject\n'   > "$WORK/meta.txt"
 printf 'replacement bytes\n'  > "$WORK/replace.txt"
+# Pin the fixtures' permissions on both hosts. With `--no-preserve-meta` a new
+# file correctly inherits the *host file's* mode, and the two machines have
+# different umasks (0002 here, 0022 on the Mac), so an unpinned fixture makes
+# the two builds disagree by 0664 vs 0644 - a difference in the test rig that
+# reads exactly like an engine bug.
+chmod 644 "$WORK"/*.txt
 
 # Editors, as shell scripts taking the temp file as $1. Octal escapes only:
 # \nnn is POSIX printf, \xNN is not.
@@ -89,7 +95,7 @@ for i in fat affs hfs ext; do cp "$WORK/$i.img" "$WORK/$i.pristine"; done
 echo "== shipping to $PPC_HOST =="
 ssh "$PPC_HOST" "mkdir -p $REMOTE_DIR" || exit 2
 scp -q "$WORK"/*.img "$WORK"/*.txt "$WORK"/ed-*.sh "$PPC_HOST:$REMOTE_DIR/" || exit 2
-ssh "$PPC_HOST" "cd $REMOTE_DIR && chmod +x ed-*.sh && for i in fat affs hfs ext; do cp \$i.img \$i.pristine; done" || exit 2
+ssh "$PPC_HOST" "cd $REMOTE_DIR && chmod +x ed-*.sh && chmod 644 *.txt && for i in fat affs hfs ext; do cp \$i.img \$i.pristine; done" || exit 2
 
 # run_both NAME IMG CMD...
 #   Resets IMG from its pristine copy on both hosts, runs the same command on
