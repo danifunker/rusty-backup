@@ -25,6 +25,10 @@ Environment:
   PPC_REMOTE_ROOT  remote mirror of the local build tree (default: ppc-xbuild)
   PPC_SDK          -isysroot to pass, e.g. /Developer/SDKs/MacOSX10.4u.sdk
   PPC_MIN_VERSION  -mmacosx-version-min value, e.g. 10.4
+  PPC_CPU_FLAGS    -mcpu/-maltivec flags prepended to every compile and link,
+                   e.g. "-mcpu=750 -mno-altivec". Decides the Mach-O cpusubtype
+                   tag (which Darwin grades at exec) and whether the vectorizer
+                   may emit AltiVec. scripts/build-ppc.sh derives it from PPC_CPU.
   PPC_LDFLAGS      extra flags for link steps (see DEFAULT_LDFLAGS)
   PPC_CC_VERBOSE   set to echo each remote command
   PPC_SPLIT_UNITS  how many objects an oversized unit becomes (default 4;
@@ -46,6 +50,9 @@ REMOTE_CC = os.environ.get("PPC_CC", "/opt/local/libexec/gcc10-bootstrap/bin/gcc
 REMOTE_ROOT = os.environ.get("PPC_REMOTE_ROOT", "ppc-xbuild")
 SDK = os.environ.get("PPC_SDK")
 MIN_VERSION = os.environ.get("PPC_MIN_VERSION")
+# Prepended, not appended, so anything mrustc or a -sys build script puts on the
+# command line still wins - gcc takes the last -mcpu/-maltivec it is given.
+CPU_FLAGS = shlex.split(os.environ.get("PPC_CPU_FLAGS", ""))
 VERBOSE = bool(os.environ.get("PPC_CC_VERBOSE"))
 
 # What a Rust libstd needs on this platform beyond libSystem:
@@ -212,6 +219,14 @@ def run(cmd):
     return subprocess.call(cmd)
 
 
+def cpu_suffix():
+    """A filename-safe tag for the current CPU flags ('' when none are set)."""
+    if not CPU_FLAGS:
+        return ""
+    raw = "-".join(CPU_FLAGS).replace("-m", "").replace("=", "")
+    return "." + "".join(c if c.isalnum() else "-" for c in raw)[:40]
+
+
 def ensure_shim():
     """Compile the platform shim on the Mac once; return its remote .o path."""
     if not SHIM:
@@ -221,7 +236,11 @@ def ensure_shim():
     # Paths on the link line are resolved from inside REMOTE_ROOT (the remote
     # command cd's there), so hand back the root-relative form.
     rel_c = "shim/%s" % os.path.basename(SHIM)
-    rel_o = rel_c[:-2] + ".o"
+    # The object name carries the CPU flags because the staleness check below is
+    # "is the .o newer than the .c", which a flag change does not disturb: a
+    # ppc7400 shim object would survive a switch to -mcpu=750 and, being on the
+    # link line, drag the whole executable's cpusubtype back up to 7400.
+    rel_o = rel_c[:-2] + cpu_suffix() + ".o"
     remote_c = "%s/%s" % (REMOTE_ROOT, rel_c)
     remote_o = "%s/%s" % (REMOTE_ROOT, rel_o)
     # Rebuild whenever the source is newer, so editing the shim takes effect.
@@ -229,11 +248,13 @@ def ensure_shim():
         die("failed to create remote shim directory")
     if run(["rsync", "-q", SHIM, "%s:%s" % (HOST, remote_c)]) != 0:
         die("failed to upload the shim")
+    cpu = " ".join(shlex.quote(a) for a in CPU_FLAGS)
     rc = run([
         "ssh", HOST,
-        "test %s -nt %s || %s -c -O1 -fPIC -o %s %s"
+        "test %s -nt %s || %s %s -c -O1 -fPIC -o %s %s"
         % (shlex.quote(remote_o), shlex.quote(remote_c),
-           shlex.quote(REMOTE_CC), shlex.quote(remote_o), shlex.quote(remote_c)),
+           shlex.quote(REMOTE_CC), cpu,
+           shlex.quote(remote_o), shlex.quote(remote_c)),
     ])
     if rc != 0:
         die("failed to compile the shim")
@@ -619,6 +640,8 @@ def main():
         remote_args = ["-isysroot", SDK] + remote_args
     if MIN_VERSION:
         remote_args = ["-mmacosx-version-min=" + MIN_VERSION] + remote_args
+    if CPU_FLAGS:
+        remote_args = CPU_FLAGS + remote_args
     if is_link:
         shim_obj = ensure_shim()
         if shim_obj:

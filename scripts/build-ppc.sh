@@ -47,6 +47,41 @@ PPC_TARGET="powerpc-apple-darwin"
 # 10.4 floor: binds the plain symbols rather than the $UNIX2003 variants Tiger lacks.
 export PPC_MIN_VERSION="${PPC_MIN_VERSION:-10.4}"
 
+# ---- target CPU --------------------------------------------------------------
+# PPC_CPU picks the oldest CPU the binary is allowed to run on. It decides two
+# separate things, and both matter:
+#
+#   1. the Mach-O cpusubtype tag. Darwin's exec path grades it against the host,
+#      so a `ppc7400` executable is refused outright on a 750 - the G3 never even
+#      reaches main(). Older tags run on newer CPUs, so a 750 build covers every
+#      PowerPC Mac from one binary.
+#   2. whether AltiVec is on. gcc10-bootstrap defaults to `-mcpu=7400`, which
+#      defines __ALTIVEC__ and lets the vectorizer emit vector ops; those are an
+#      illegal instruction on a 750. See docs/build-ppc-mrustc.md "Targeting a G3".
+#
+# 750 is the default because AltiVec buys this workload nothing measurable: at
+# -mcpu=7400 the whole 40 MB binary contained exactly two vector instructions
+# (a vxor/stvx pair zeroing a buffer in zstd's HUF_buildCTable_wksp). Set
+# PPC_CPU=7400 or 970 for a CPU-specific build; set PPC_CPU_FLAGS to bypass the
+# mapping entirely.
+PPC_CPU="${PPC_CPU:-750}"
+if [ -z "${PPC_CPU_FLAGS:-}" ]; then
+  case "$PPC_CPU" in
+    g3|G3|750|740|745|755)  PPC_CPU_FLAGS="-mcpu=750 -mno-altivec" ;;
+    603|603e|604|604e)      PPC_CPU_FLAGS="-mcpu=$PPC_CPU -mno-altivec" ;;
+    g4|G4|7400|7410)        PPC_CPU_FLAGS="-mcpu=7400 -maltivec" ;;
+    7450|7455)              PPC_CPU_FLAGS="-mcpu=$PPC_CPU -maltivec" ;;
+    g5|G5|970)              PPC_CPU_FLAGS="-mcpu=970 -maltivec" ;;
+    generic|ppc|none)       PPC_CPU_FLAGS="" ;;
+    *)                      PPC_CPU_FLAGS="-mcpu=$PPC_CPU" ;;
+  esac
+fi
+# Optional: schedule for a newer chip than the ISA floor. `PPC_CPU=750
+# PPC_TUNE=7450` keeps every instruction legal on a G3 but orders them for a G4,
+# which is the sane shape when one binary has to serve both.
+[ -n "${PPC_TUNE:-}" ] && PPC_CPU_FLAGS="$PPC_CPU_FLAGS -mtune=$PPC_TUNE"
+export PPC_CPU_FLAGS
+
 # The PowerPC Mac that compiles the emitted C. Nothing here cross-compiles:
 # there is no usable powerpc-apple-darwin cross-gcc, so scripts/ppc-cc-remote.py
 # stands in as the C compiler and ships each translation unit over ssh. Set
@@ -783,7 +818,9 @@ stage_dist() {
   # install_name_tool and otool only exist on the Mac, so the rewrite happens there.
   note "uploading rb-cli to $PPC_HOST for packaging"
   scp -q "$PPC_OUT/rb-cli" "$PPC_HOST:~/rb-cli-dist-src" || die "could not upload rb-cli"
-  ssh "$PPC_HOST" "bash -s" <<'REMOTE' || die "packaging failed on $PPC_HOST"
+  ssh "$PPC_HOST" \
+    "RB_CPU=$(printf '%q' "$PPC_CPU") RB_CPU_FLAGS=$(printf '%q' "$PPC_CPU_FLAGS") bash -s" \
+    <<'REMOTE' || die "packaging failed on $PPC_HOST"
 set -e
 BIN=~/rb-cli-dist-src
 D=~/rb-cli-dist
@@ -808,14 +845,16 @@ done
 # MacPorts' host build imports fstat$INODE64 from libSystem, which Tiger lacks; the 10.4 SDK rebuild binds plain symbols and still exports both names.
 LEG=$(ls -t /opt/local/var/macports/distfiles/legacy-support/macports-legacy-support-*.tar.gz 2>/dev/null | head -1)
 SDK104=/Developer/SDKs/MacOSX10.4u.sdk
-CACHE=~/.rb-cli-legacy104/libMacportsLegacySupport.dylib
+# Cache per CPU: the flags change the cpusubtype, so one cache would hand a
+# ppc7400 dylib to a 750-targeted bundle and the G3 would refuse it at load.
+CACHE=~/.rb-cli-legacy104/libMacportsLegacySupport-${RB_CPU:-default}.dylib
 if [ ! -e "$CACHE" ] && [ -n "$LEG" ] && [ -d "$SDK104" ]; then
   rm -rf /tmp/rb-legacy104 && mkdir -p /tmp/rb-legacy104 && cd /tmp/rb-legacy104
   tar xzf "$LEG"
   cd macports-legacy-support-*/
   MACOSX_DEPLOYMENT_TARGET=10.4 make \
     CC=/opt/local/libexec/gcc10-bootstrap/bin/gcc \
-    CFLAGS="-O2 -mmacosx-version-min=10.4 -isysroot $SDK104" \
+    CFLAGS="-O2 -mmacosx-version-min=10.4 -isysroot $SDK104 $RB_CPU_FLAGS" \
     PREFIX=/opt/local -j2 >/tmp/rb-legacy104/build.log 2>&1 \
     && mkdir -p "$(dirname "$CACHE")" && cp lib/libMacportsLegacySupport.dylib "$CACHE"
   cd ~
@@ -841,6 +880,47 @@ done
 
 left=$(otool -L "$D/rb-cli" "$D"/lib/*.dylib | grep -c '/opt/local' || true)
 [ "$left" -eq 0 ] || { echo "$left /opt/local reference(s) survived packaging" >&2; exit 1; }
+
+# ---- CPU floor: retag what is only mis-labelled, reject what is not ---------
+# Two independent things decide whether the bundle runs on the target CPU: the
+# cpusubtype tag (Darwin grades it at exec, so a ppc7400 binary never reaches
+# main() on a 750) and the vector instructions actually present. MacPorts'
+# prebuilt dylibs are compiled -mcpu=7400 and carry that tag even when they hold
+# no vector code at all, so those are retagged rather than rebuilt.
+VEC_RE='^[0-9a-f]+[[:space:]]+(v[a-z0-9_]+|lvx|lvxl|stvx|stvxl|lvebx|lvehx|lvewx|stvebx|stvehx|stvewx|lvsl|lvsr|dst|dstt|dstst|dststt|dss|dssall|mfvscr|mtvscr)[[:space:]]'
+altivec_count() { otool -tv "$1" 2>/dev/null | grep -cE "$VEC_RE" || true; }
+# libgcc's save_world/rest_world do carry vector code, but branch over it when
+# libSystem's __cpu_has_altivec is 0. Importing that symbol is the proof, so the
+# check verifies the gating instead of hardcoding a list of known-safe dylibs.
+cpu_gated() { nm -mu "$1" 2>/dev/null | grep -q '__cpu_has_altivec'; }
+retag_ppc_all() {
+  # cpusubtype is the 3rd big-endian word of a Mach-O header; 0 is POWERPC_ALL.
+  [ "$(od -An -tx1 -N4 "$1" | tr -d ' \n')" = "feedface" ] || return 1
+  printf '\0\0\0\0' | dd of="$1" bs=1 seek=8 count=4 conv=notrunc 2>/dev/null
+}
+
+case "$RB_CPU_FLAGS" in *-mno-altivec*) NOVEC=1 ;; *) NOVEC=0 ;; esac
+fail=0
+echo "CPU floor: PPC_CPU=${RB_CPU:-default} ($RB_CPU_FLAGS)"
+for f in "$D/rb-cli" "$D"/lib/*.dylib; do
+  n=$(altivec_count "$f")
+  gated=""
+  if [ "$n" -gt 0 ] && cpu_gated "$f"; then gated=" (runtime-gated)"; fi
+  if [ "$NOVEC" = 1 ] && [ "$n" -gt 0 ] && [ -z "$gated" ]; then
+    echo "  FAIL $(basename "$f"): $n AltiVec instruction(s), not runtime-gated" >&2
+    fail=1
+  fi
+  arch=$(lipo -info "$f" 2>/dev/null | sed 's/.*: //')
+  if [ "$NOVEC" = 1 ] && [ "$n" -eq 0 ]; then
+    case "$arch" in
+      ppc|ppc750|ppc601|ppc603*|ppc604*) ;;
+      *) retag_ppc_all "$f" && arch="$(lipo -info "$f" | sed 's/.*: //') (retagged)" ;;
+    esac
+  fi
+  printf '  %-36s %-22s altivec=%s%s\n' "$(basename "$f")" "$arch" "$n" "$gated"
+done
+[ "$fail" -eq 0 ] || { echo "bundle carries unguarded AltiVec for this CPU floor" >&2; exit 1; }
+
 (cd "$D" && ./rb-cli --version >/dev/null) || { echo "packaged rb-cli does not run" >&2; exit 1; }
 # Tiger's libSystem has no $INODE64 symbols, so any left here means 10.4 refuses the bundle at load.
 i64=0

@@ -553,6 +553,119 @@ Ten that have each cost real time:
   PPC_HOST=... PPC_SHIM=... sh output-rb-ppc/rb-cli-codegen.sh
   ```
 
+## Targeting a G3
+
+`PPC_CPU` picks the oldest CPU the bundle is allowed to run on. It defaults to
+**750** (G3), which runs on every PowerPC Mac:
+
+```sh
+PPC_CPU=750  scripts/build-ppc.sh ppc     # G3 floor - the default
+PPC_CPU=7400 scripts/build-ppc.sh ppc     # G4, AltiVec on
+PPC_CPU=970  scripts/build-ppc.sh ppc     # G5
+PPC_CPU=750 PPC_TUNE=7450 ...             # G3-legal, scheduled for a G4
+PPC_CPU_FLAGS='-mcpu=601' ...             # bypass the mapping entirely
+```
+
+`build-ppc.sh` maps the name to gcc flags and exports `PPC_CPU_FLAGS`;
+`ppc-cc-remote.py` prepends them to every compile and link. Prepended, so
+anything mrustc or a `-sys` build script puts on the line still wins.
+
+### The two problems, which are not the same problem
+
+**1. The cpusubtype tag.** Darwin grades it at exec, so a `ppc7400` executable is
+refused outright on a 750 - the G3 never reaches `main()`. Older tags run on
+newer CPUs, so one 750 build covers G3/G4/G5 and no fat binary is needed.
+
+**2. AltiVec instructions.** gcc10-bootstrap defaults to `-mcpu=7400`, which
+defines `__ALTIVEC__` and lets the vectorizer emit vector ops. Those are an
+illegal instruction on a 750. At the 7400 default the entire 40 MB binary
+contained exactly **two**: a `vxor`/`stvx` pair zeroing a buffer in zstd's
+`HUF_buildCTable_wksp`. So the AltiVec floor costs nothing measurable here -
+which is why 750 is the default rather than an opt-in.
+
+### libgcc's vector code is runtime-gated, and does not need rebuilding
+
+`libgcc_s.1.1.dylib` and `libgcc_ehs.1.1.dylib` each carry 24 AltiVec
+instructions, all inside Darwin's out-of-line `save_world` / `rest_world` /
+`eh_rest_world_r10` register helpers. They are **not** a G3 blocker: both blocks
+are branched over when libSystem's `__cpu_has_altivec` is zero.
+
+```
+save_world:  lwz r12,0(r12) ; cmpwi r12,0 ; ... bne+ 0x4cb0   -> skips the stvx run
+rest_world:  lwz r12,0(r12) ; cmpwi r12,0 ; ... beq  0x4dd4   -> skips the lvx  run
+```
+
+`mfspr VRsave` sits inside the guard too. This is worth knowing because the
+alternative - rebuilding gcc10 on a G5 - is a day of work that buys nothing.
+
+### What `dist` verifies
+
+`stage_dist` will not package a bundle that cannot run on the declared floor. For
+every Mach-O it ships it counts vector instructions and prints the arch tag:
+
+- **rb-cli with unguarded AltiVec in a `-mno-altivec` build - hard failure.**
+- A dylib with vector code passes only if it imports `__cpu_has_altivec`, i.e.
+  the gating is *verified* rather than assumed from a hardcoded allowlist.
+- A dylib with zero vector code but a too-new tag is **retagged** to
+  `POWERPC_ALL` in place (a 4-byte cpusubtype write). MacPorts' prebuilt
+  `libatomic.1.dylib` is exactly this case: compiled `-mcpu=7400`, carries the
+  tag, contains no vector code at all. Retagging it is correct; rebuilding
+  MacPorts' gcc to fix a label is not.
+
+The `libMacportsLegacySupport` 10.4 rebuild is cached per CPU
+(`~/.rb-cli-legacy104/libMacportsLegacySupport-<cpu>.dylib`) - one shared cache
+would hand a `ppc7400` dylib to a 750-targeted bundle.
+
+### Rebuild both trees when the CPU changes
+
+Neither minicargo nor the wrapper's split-piece cache tracks compiler *flags* -
+both compare timestamps only. A stale `ppc7400` object survives a flag change
+and drags the whole link back up, so a CPU switch means:
+
+```sh
+rm -rf ~/repos/mrustc/output-1.74.0-powerpc-apple-darwin ~/repos/mrustc/output-rb-ppc
+```
+
+The shim is the one piece that self-invalidates: its object name carries the CPU
+flags (`ppc-compat.cpu750-no-altivec.o`), because it is on the link line and
+would otherwise silently pin the executable's cpusubtype at 7400.
+
+## The parity gates
+
+Two scripts decide whether the PowerPC build agrees with the desktop build. Both
+take the remote binary as `$1`, defaulting to `/Users/admin/rb-cli-dev`:
+
+```sh
+export PPC_HOST=admin@192.168.99.116
+scripts/ppc-smoke.sh                        # inspect / ls / fsck / backup parity
+scripts/ppc-newcode-smoke.sh                # edit / chmeta / put parity
+scripts/ppc-smoke.sh /Users/admin/other     # grade a different binary
+```
+
+**They never upload the binary - only the test images.** `rb-cli-dev` is
+maintained by hand, so a gate run right after a build grades whatever was last
+copied there, which is usually the *previous* build:
+
+```sh
+scp ~/repos/mrustc/output-rb-ppc/rb-cli $PPC_HOST:~/rb-cli-dev
+```
+
+Skipping that produced 33 mismatches and a double-panic on every image-touching
+command - all of it from a binary three weeks stale. Check
+`ssh $PPC_HOST '~/rb-cli-dev --version'` against the build you meant to test.
+
+**Two checks are timing-sensitive and flake.** Re-run before believing either:
+
+- `rb-cli ls ext.img /` - the partition banner goes to a different stream than
+  the listing, so the merged output occasionally orders them differently. The
+  diff shows the *same* line moving between position 1 and 3.
+- `put-preserve-hfs` / `put-fresh-hfs` - 2 bytes at `0x408` and again in the
+  alternate MDB. That is the low half of `drLsMod` (HFS MDB at byte 1024, date
+  at +6), which ticks every second. The local and remote runs land either side
+  of a second boundary and the byte-run sets stop matching.
+
+A real regression is neither of those shapes, and reproduces on a second run.
+
 ## The engine is one 797 MB translation unit
 
 mrustc emits **one `.c` per crate**, and there is no way to ask it for more -

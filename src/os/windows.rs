@@ -98,8 +98,20 @@ fn lock_and_dismount_volumes(drive_num: u32) -> Result<VolumeLockSet> {
         };
 
         // Lock the volume for exclusive access
-        let lock_result =
-            unsafe { DeviceIoControl(handle.0, FSCTL_LOCK_VOLUME, None, 0, None, 0, None, None) };
+        // Win7 writes through lpBytesReturned unconditionally; a NULL there access-violates.
+        let mut returned = 0u32;
+        let lock_result = unsafe {
+            DeviceIoControl(
+                handle.0,
+                FSCTL_LOCK_VOLUME,
+                None,
+                0,
+                None,
+                0,
+                Some(&mut returned),
+                None,
+            )
+        };
         match lock_result {
             Ok(_) => log::info!("Volume {} locked successfully", volume_path),
             Err(e) => log::warn!(
@@ -118,7 +130,7 @@ fn lock_and_dismount_volumes(drive_num: u32) -> Result<VolumeLockSet> {
                 0,
                 None,
                 0,
-                None,
+                Some(&mut returned),
                 None,
             )
         };
@@ -367,7 +379,21 @@ fn query_device_properties(handle: HANDLE) -> (bool, String, String) {
 
 /// Check if a disk is writable via IOCTL_DISK_IS_WRITABLE.
 fn is_disk_writable(handle: HANDLE) -> bool {
-    unsafe { DeviceIoControl(handle, IOCTL_DISK_IS_WRITABLE, None, 0, None, 0, None, None).is_ok() }
+    // Win7 writes through lpBytesReturned unconditionally; a NULL there access-violates.
+    let mut returned = 0u32;
+    unsafe {
+        DeviceIoControl(
+            handle,
+            IOCTL_DISK_IS_WRITABLE,
+            None,
+            0,
+            None,
+            0,
+            Some(&mut returned),
+            None,
+        )
+        .is_ok()
+    }
 }
 
 /// Information about a mounted volume (drive letter).
