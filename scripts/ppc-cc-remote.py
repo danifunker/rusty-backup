@@ -398,24 +398,25 @@ def split_and_compile(source, output, remote_args, remap):
     return 0
 
 
-# Libraries pinned to /usr/lib: a plain -l takes MacPorts' copy first, whose libiconv is
-# compat 10.0.0 against Leopard's 7.0.0 and is ppc7400 with AltiVec (no G3).
-SYSTEM_LIBS = {"iconv": "/usr/lib/libiconv.2.dylib"}
+# Dropped from the link: nothing imports a symbol from these, and linking one records the
+# build box's compatibility version, which an older Mac then refuses at load - Leopard's
+# libiconv is 7.0.0, Tiger's 5.0.0, MacPorts' 10.0.0. If a crate ever does need one, the
+# link fails loudly on the undefined symbol rather than shipping a version trap.
+DROP_LIBS = {"iconv"}
 
 
-def pin_system_libs(args):
-    """Rewrite `-l foo` to an absolute /usr/lib path for everything in SYSTEM_LIBS."""
-    out_args, pinned, i = [], [], 0
+def drop_unused_libs(args):
+    """Remove `-l foo` for everything in DROP_LIBS."""
+    out_args, dropped, i = [], [], 0
     while i < len(args):
-        if args[i] == "-l" and i + 1 < len(args) and args[i + 1] in SYSTEM_LIBS:
-            out_args.append(SYSTEM_LIBS[args[i + 1]])
-            pinned.append(args[i + 1])
+        if args[i] == "-l" and i + 1 < len(args) and args[i + 1] in DROP_LIBS:
+            dropped.append(args[i + 1])
             i += 2
         else:
             out_args.append(args[i])
             i += 1
-    if pinned:
-        sys.stderr.write("ppc-cc-remote: pinning %s to /usr/lib\n" % ", ".join(sorted(pinned)))
+    if dropped:
+        sys.stderr.write("ppc-cc-remote: dropping unused -l %s\n" % ", ".join(sorted(dropped)))
     return out_args
 
 
@@ -623,7 +624,7 @@ def main():
         if shim_obj:
             remote_args.append(shim_obj)
         remote_args.extend(LDFLAGS)
-        remote_args = reframework(pin_system_libs(remote_args))
+        remote_args = reframework(drop_unused_libs(remote_args))
     elif BIG_TU_BYTES:
         # An oversized translation unit needs its own flags or 32-bit cc1 runs
         # out of address space - see BIG_TU_ARGS above.

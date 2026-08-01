@@ -849,6 +849,22 @@ for f in "$D/rb-cli" "$D"/lib/*.dylib; do
 done
 [ "$i64" -eq 0 ] && echo "no \$INODE64 imports from libSystem: Tiger-capable" \
                  || echo "$i64 \$INODE64 import(s) from libSystem: Leopard-only" >&2
+
+# The link records the *build box's* compat version for each system dylib, so a Leopard-only
+# version requirement gets baked in silently and 10.4 refuses the binary at load.
+SDK104=/Developer/SDKs/MacOSX10.4u.sdk
+if [ -d "$SDK104" ]; then
+  otool -L "$D/rb-cli" | tail -n +2 | grep -E '^\	(/usr/lib|/System)' | while read -r path rest; do
+    want=$(echo "$rest" | sed -n 's/.*compatibility version \([0-9.]*\).*/\1/p')
+    sdklib="$SDK104$path"
+    [ -e "$sdklib" ] || continue
+    have=$(otool -L "$sdklib" 2>/dev/null | sed -n "2s/.*compatibility version \([0-9.]*\).*/\1/p")
+    [ -n "$want" ] && [ -n "$have" ] || continue
+    if [ "$(printf '%s\n%s\n' "$want" "$have" | sort -t. -k1,1n -k2,2n -k3,3n | head -1)" != "$want" ]; then
+      echo "10.4 will refuse $path: needs $want, Tiger has $have" >&2
+    fi
+  done
+fi
 rm -f ~/rb-cli-ppc.tar.gz
 (cd ~ && tar czf rb-cli-ppc.tar.gz rb-cli-dist)
 echo "bundled $(ls "$D/lib" | wc -l | tr -d ' ') dylib(s); $(ls -l ~/rb-cli-ppc.tar.gz | awk '{print $5}') bytes"
