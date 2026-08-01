@@ -541,42 +541,41 @@ impl SectorAlignedWriter {
 #[cfg(target_os = "windows")]
 impl Write for SectorAlignedWriter {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-        // If data won't fit, flush sectors first
-        if self.buf.len() + data.len() > WRITE_BUF_CAPACITY {
-            self.flush_sectors()?;
-        }
-
-        // If data is still too large for the buffer, write it directly
-        if data.len() > WRITE_BUF_CAPACITY {
-            self.flush_padded()?;
-
-            // Write large data directly, padding to sector boundary if needed
-            let aligned_len = (data.len() / SECTOR_SIZE) * SECTOR_SIZE;
-            if aligned_len > 0 {
-                use std::io::Seek;
-                self.inner.seek(std::io::SeekFrom::Start(self.position))?;
-                self.inner.write_all(&data[..aligned_len])?;
-                self.position += aligned_len as u64;
+        // Nothing buffered and a full-size run: straight to the device, no copy.
+        if self.buf.is_empty() && data.len() >= WRITE_BUF_CAPACITY {
+            if !self.position.is_multiple_of(SECTOR_SIZE as u64) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("file position {} is not sector-aligned", self.position),
+                ));
             }
-
-            // Buffer any remaining partial sector
+            let aligned_len = (data.len() / SECTOR_SIZE) * SECTOR_SIZE;
+            use std::io::Seek;
+            self.inner.seek(std::io::SeekFrom::Start(self.position))?;
+            self.inner.write_all(&data[..aligned_len])?;
+            self.position += aligned_len as u64;
             let remainder = &data[aligned_len..];
             if !remainder.is_empty() {
                 self.buf
                     .extend_from_slice(remainder)
                     .map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "buffer full"))?;
             }
-        } else {
-            // Normal path: buffer the data
-            self.buf
-                .extend_from_slice(data)
-                .map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "buffer full"))?;
+            return Ok(data.len());
+        }
 
+        // flush_sectors keeps the trailing partial sector, so what fits has to be
+        // re-measured every pass rather than inferred from data.len() alone.
+        let mut rest = data;
+        while !rest.is_empty() {
+            let take = (WRITE_BUF_CAPACITY - self.buf.len()).min(rest.len());
+            self.buf
+                .extend_from_slice(&rest[..take])
+                .map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "buffer full"))?;
+            rest = &rest[take..];
             if self.buf.len() >= WRITE_BUF_CAPACITY {
                 self.flush_sectors()?;
             }
         }
-
         Ok(data.len())
     }
 
@@ -1030,6 +1029,55 @@ mod tests {
             first.iter().all(|&b| b == 0xAB),
             "first sector should contain the payload, not zeros (was {:?}..)",
             &first[..16]
+        );
+    }
+
+    /// Regression: a partial-sector write then a full-capacity one overflowed the
+    /// Windows writer's fixed buffer -- restore died with "buffer full".
+    #[test]
+    fn sector_aligned_writer_survives_partial_then_full_chunk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("restore.img");
+
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .expect("create");
+        let mut writer = SectorAlignedWriter::new(file);
+
+        // zstd hands back arbitrary sizes, so a chunk that is not a whole number
+        // of sectors leaves a remainder that flush_sectors deliberately keeps.
+        let partial = vec![0xAAu8; 100];
+        let full = vec![0xBBu8; WRITE_BUF_CAPACITY];
+        writer.write_all(&partial).expect("partial chunk");
+        writer
+            .write_all(&full)
+            .expect("full chunk after a partial one");
+        writer.flush().expect("flush");
+        drop(writer);
+
+        let mut got = Vec::new();
+        OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .expect("reopen")
+            .read_to_end(&mut got)
+            .expect("read back");
+
+        // The tail is zero-padded up to a sector; everything before it is verbatim.
+        assert!(got.len() >= partial.len() + full.len(), "short write");
+        assert_eq!(
+            &got[..partial.len()],
+            &partial[..],
+            "partial chunk corrupted"
+        );
+        assert_eq!(
+            &got[partial.len()..partial.len() + full.len()],
+            &full[..],
+            "full chunk corrupted or misplaced"
         );
     }
 
