@@ -1053,12 +1053,18 @@ fn locale_is_utf8() -> bool {
     false
 }
 
-/// crossterm writes every colour as `38;5;N`, which these 8/16-colour terminals cannot parse at all.
+/// crossterm writes every colour as `38;5;N`, which an 8/16-colour terminal cannot parse at all.
+///
+/// Keyed on the OS as well as `$TERM`: no terminal shipped for Mac OS X 10.5 or earlier does 256
+/// colours, and third-party ones (iTerm) report a `$TERM` no blocklist can enumerate.
 fn low_color_terminal() -> bool {
     const LOW: [&str; 5] = ["xterm-color", "vt100", "vt102", "ansi", "dumb"];
-    std::env::var("TERM")
-        .map(|t| LOW.contains(&t.as_str()))
-        .unwrap_or(false)
+    if std::env::var("TERM").map(|t| LOW.contains(&t.as_str())) == Ok(true) {
+        return true;
+    }
+    // Only on a version we positively read: an unknown one keeps colour rather than dropping it.
+    let host = crate::os::host_version::HostVersion::detect();
+    cfg!(target_vendor = "apple") && host.version.is_some() && !host.at_least(10, 6)
 }
 
 /// Semantic 16-color palette. Colors *reinforce* meaning already carried by
