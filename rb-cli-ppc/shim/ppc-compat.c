@@ -24,6 +24,7 @@
 #include <sys/stat.h>
 #include <sys/fcntl.h>
 #include <sys/ioctl.h>
+#include <sys/resource.h>
 #include <sys/select.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
@@ -46,6 +47,7 @@ extern double lgamma_r(double, int *);
 extern int rb_sys_close(int) __asm__("_close");
 extern int rb_sys_select(int, fd_set *, fd_set *, fd_set *, struct timeval *)
 	__asm__("_select");
+extern char *rb_sys_realpath(const char *, char *) __asm__("_realpath");
 
 /*
  * `lgammaf_r` -- referenced by `core`/`std`'s `f32::ln_gamma`.
@@ -59,6 +61,55 @@ extern int rb_sys_select(int, fd_set *, fd_set *, fd_set *, struct timeval *)
 float lgammaf_r(float x, int *signgamp)
 {
     return (float)lgamma_r((double)x, signgamp);
+}
+
+/*
+ * `realpath$DARWIN_EXTSN` -- 10.5+. Rust's `libc` hardcodes this name with
+ * `#[link_name]`, so `fs::canonicalize` binds it whatever the deployment target,
+ * and Tiger exports only plain `realpath`. The difference that matters is the
+ * NULL second argument: the EXTSN variant allocates, Tiger's requires a caller
+ * buffer, and `canonicalize` passes NULL - so forwarding blindly would hand the
+ * legacy implementation a null pointer to write through.
+ */
+char *rb_compat_realpath_extsn(const char *, char *) __asm__("_realpath$DARWIN_EXTSN");
+
+char *rb_compat_realpath_extsn(const char *path, char *resolved)
+{
+    char *buf, *out;
+    int saved;
+
+    if (resolved)
+        return rb_sys_realpath(path, resolved);
+    if ((buf = malloc(PATH_MAX)) == 0) {
+        errno = ENOMEM;
+        return 0;
+    }
+    if ((out = rb_sys_realpath(path, buf)) == 0) {
+        saved = errno;
+        free(buf);
+        errno = saved;
+        return 0;
+    }
+    return out;
+}
+
+/*
+ * `clock$UNIX2003` -- 10.5+. The two variants disagree about their unit, not
+ * just their name: 10.5 defines CLOCKS_PER_SEC as 1000000 for the conformance
+ * entry point, while Tiger's plain `clock` counts __DARWIN_CLK_TCK (100/sec).
+ * Forwarding would under-report CPU time by 10000x, silently. Take the value
+ * from getrusage instead, which is exact and means the same thing on both.
+ */
+clock_t rb_compat_clock_unix2003(void) __asm__("_clock$UNIX2003");
+
+clock_t rb_compat_clock_unix2003(void)
+{
+    struct rusage ru;
+
+    if (getrusage(RUSAGE_SELF, &ru) != 0)
+        return (clock_t)-1;
+    return (clock_t)((ru.ru_utime.tv_sec + ru.ru_stime.tv_sec) * 1000000
+                     + ru.ru_utime.tv_usec + ru.ru_stime.tv_usec);
 }
 
 /*

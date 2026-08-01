@@ -44,6 +44,8 @@ export MRUSTC_TARGET_VER="${MRUSTC_TARGET_VER:-1.74}"  # language mode for mrust
 FEATURES="${FEATURES:-native-zstd,remote,tui,rust173-polyfill,os-stub}"
 HOST_ARCH="${HOST_ARCH:-aarch64}"          # aarch64 (Apple Silicon) or x86_64
 PPC_TARGET="powerpc-apple-darwin"
+# 10.4 floor: binds the plain symbols rather than the $UNIX2003 variants Tiger lacks.
+export PPC_MIN_VERSION="${PPC_MIN_VERSION:-10.4}"
 
 # The PowerPC Mac that compiles the emitted C. Nothing here cross-compiles:
 # there is no usable powerpc-apple-darwin cross-gcc, so scripts/ppc-cc-remote.py
