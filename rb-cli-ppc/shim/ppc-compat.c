@@ -315,7 +315,9 @@ static int rb_have_inode64(void)
 		if (force != 0 && force[0] == '1') {
 			cached = 0;
 		} else {
-			cached = dlsym(RTLD_NEXT, "stat$INODE64") != 0;
+			/* Ask libSystem by name: RTLD_NEXT also finds the bundled legacy-support, which exports stat$INODE64 on 10.4. */
+			void *sys = dlopen("/usr/lib/libSystem.B.dylib", RTLD_LAZY);
+			cached = sys != 0 && dlsym(sys, "stat$INODE64") != 0;
 		}
 	}
 	return cached;
@@ -393,7 +395,9 @@ int rb_compat_stat64(const char *path, struct rb_stat64 *buf)
 			real = (int (*)(const char *, struct rb_stat64 *))dlsym(
 				RTLD_NEXT, "stat$INODE64");
 		}
-		return real(path, buf);
+		/* A missing symbol falls through to the conversion below rather than calling null. */
+		if (real != 0)
+			return real(path, buf);
 	}
 	if (stat(path, &legacy) != 0) {
 		return -1;
@@ -412,7 +416,9 @@ int rb_compat_lstat64(const char *path, struct rb_stat64 *buf)
 			real = (int (*)(const char *, struct rb_stat64 *))dlsym(
 				RTLD_NEXT, "lstat$INODE64");
 		}
-		return real(path, buf);
+		/* A missing symbol falls through to the conversion below rather than calling null. */
+		if (real != 0)
+			return real(path, buf);
 	}
 	if (lstat(path, &legacy) != 0) {
 		return -1;
@@ -431,7 +437,9 @@ int rb_compat_fstat64(int fd, struct rb_stat64 *buf)
 			real = (int (*)(int, struct rb_stat64 *))dlsym(RTLD_NEXT,
 								      "fstat$INODE64");
 		}
-		return real(fd, buf);
+		/* A missing symbol falls through to the conversion below rather than calling null. */
+		if (real != 0)
+			return real(fd, buf);
 	}
 	if (fstat(fd, &legacy) != 0) {
 		return -1;
@@ -450,7 +458,9 @@ int rb_compat_statfs64(const char *path, struct rb_statfs64 *buf)
 			real = (int (*)(const char *, struct rb_statfs64 *))dlsym(
 				RTLD_NEXT, "statfs$INODE64");
 		}
-		return real(path, buf);
+		/* A missing symbol falls through to the conversion below rather than calling null. */
+		if (real != 0)
+			return real(path, buf);
 	}
 	if (statfs(path, &legacy) != 0) {
 		return -1;
@@ -469,7 +479,9 @@ int rb_compat_fstatfs64(int fd, struct rb_statfs64 *buf)
 			real = (int (*)(int, struct rb_statfs64 *))dlsym(
 				RTLD_NEXT, "fstatfs$INODE64");
 		}
-		return real(fd, buf);
+		/* A missing symbol falls through to the conversion below rather than calling null. */
+		if (real != 0)
+			return real(fd, buf);
 	}
 	if (fstatfs(fd, &legacy) != 0) {
 		return -1;
@@ -499,7 +511,9 @@ int rb_compat_getmntinfo64(struct rb_statfs64 **mntbufp, int flags)
 			real = (int (*)(struct rb_statfs64 **, int))dlsym(
 				RTLD_NEXT, "getmntinfo$INODE64");
 		}
-		return real(mntbufp, flags);
+		/* A missing symbol falls through to the conversion below rather than calling null. */
+		if (real != 0)
+			return real(mntbufp, flags);
 	}
 
 	n = getmntinfo(&legacy, flags);
@@ -545,7 +559,9 @@ struct rb_dirent64 *rb_compat_readdir64(DIR *dirp)
 			real = (struct rb_dirent64 * (*)(DIR *))
 				dlsym(RTLD_NEXT, "readdir$INODE64");
 		}
-		return real(dirp);
+		/* A missing symbol falls through to the conversion below rather than calling null. */
+		if (real != 0)
+			return real(dirp);
 	}
 	errno = 0;
 	legacy = readdir(dirp);
@@ -570,7 +586,9 @@ int rb_compat_readdir64_r(DIR *dirp, struct rb_dirent64 *entry,
 					struct rb_dirent64 **))
 				dlsym(RTLD_NEXT, "readdir_r$INODE64");
 		}
-		return real(dirp, entry, result);
+		/* A missing symbol falls through to the conversion below rather than calling null. */
+		if (real != 0)
+			return real(dirp, entry, result);
 	}
 	rc = readdir_r(dirp, &legacy, &legacy_result);
 	if (rc != 0) {
