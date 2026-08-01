@@ -3713,7 +3713,10 @@ impl InspectTab {
                             };
                             if is_device {
                                 rusty_backup::fs::partition_minimum_size(
-                                    rusty_backup::os::SectorAlignedReader::new(f),
+                                    // SectorAlignedReader delegates End to inner, so wrap first.
+                                    rusty_backup::os::SectorAlignedReader::new(
+                                        rusty_backup::os::known_len_reader(f, &path),
+                                    ),
                                     part.byte_offset(),
                                     part.partition_type_byte,
                                     part.partition_type_string.as_deref(),

@@ -324,10 +324,12 @@ impl SourceFactory {
     /// Mint a fresh, independent seekable reader positioned at offset 0.
     fn open(&self) -> Result<Box<dyn crate::rbformats::ReadSeek>> {
         match self {
-            SourceFactory::Local { file, .. } => Ok(Box::new(
+            // A device cannot answer seek(End); carry the length the OS reports instead.
+            SourceFactory::Local { file, path, .. } => Ok(Box::new(crate::os::known_len_reader(
                 file.try_clone()
                     .context("failed to clone local source handle")?,
-            )),
+                path,
+            ))),
             #[cfg(feature = "remote")]
             SourceFactory::Remote {
                 conn,

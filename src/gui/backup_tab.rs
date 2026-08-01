@@ -1568,8 +1568,14 @@ impl BackupTab {
                     let Some(Ok(clone)) = source_handle.as_ref().map(|f| f.try_clone()) else {
                         continue;
                     };
+                    // AFFS / Atari / DFS / CBM size themselves via seek(End), which a device refuses.
+                    let probe: Box<dyn rusty_backup::rbformats::ReadSeek> = if is_device {
+                        Box::new(rusty_backup::os::known_len_reader(clone, &path))
+                    } else {
+                        Box::new(BufReader::new(clone))
+                    };
                     let result = fs::partition_minimum_size(
-                        BufReader::new(clone),
+                        probe,
                         offset,
                         type_byte,
                         type_str.as_deref(),
