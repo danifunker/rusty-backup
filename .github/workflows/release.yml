@@ -1708,13 +1708,29 @@ jobs:
             --no-default-features --features native-zstd,remote,tui,rust173-polyfill,windows-legacy,yaml \
             --ignore-rust-version --locked
 
-      - name: Report PE imports (Win7 sanity — no UCRT/WinRT hard deps expected)
+      - name: Assert PE imports are Win7-safe
         shell: bash
         run: |
           BIN="rb-cli-vintage/target/${{ matrix.target }}/release/rb-cli.exe"
           ls -lh "$BIN"
           # dumpbin ships with the MSVC toolchain on the runner.
-          dumpbin //dependents "$BIN" || true
+          dumpbin //dependents "$BIN" | tee deps.txt
+          # A silent pass is the failure mode that matters: if dumpbin is missing or
+          # its output changes shape, an empty file would satisfy every grep below.
+          if ! grep -qiE '\.dll' deps.txt; then
+            echo "::error::dumpbin produced no DLL list - cannot verify Win7 imports"
+            exit 1
+          fi
+          # None of these exist on Windows 7: combase arrived in 8, the api-ms-win-*
+          # sets and the UCRT in 8/10. A dependency bump that moves a symbol into one
+          # is invisible until the binary refuses to start on the target - which is
+          # exactly how windows-sys 0.61 put CoTaskMemFree in combase.dll and broke it.
+          if grep -qiE '(combase\.dll|ucrtbase\.dll|api-ms-win-)' deps.txt; then
+            echo "::error::Win7-incompatible imports in $BIN:"
+            grep -iE '(combase\.dll|ucrtbase\.dll|api-ms-win-)' deps.txt
+            exit 1
+          fi
+          echo "PE imports are Win7-safe."
 
       - name: Package CLI
         shell: bash
