@@ -48,6 +48,49 @@ use crate::device::DiskDevice;
 const SECTOR_SIZE: usize = 512;
 const WRITE_BUF_CAPACITY: usize = 256 * 1024; // 256 KB, must be a multiple of SECTOR_SIZE
 
+/// A reader whose `SeekFrom::End` answers from [`get_file_size`], which a device handle cannot.
+pub struct KnownLen<R> {
+    inner: R,
+    len: u64,
+    pos: u64,
+}
+
+impl<R> KnownLen<R> {
+    pub fn new(inner: R, len: u64) -> Self {
+        Self { inner, len, pos: 0 }
+    }
+}
+
+impl<R: Read> Read for KnownLen<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl<R: Seek> Seek for KnownLen<R> {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        // Resolve End against the known length; the device itself cannot answer it.
+        let target = match pos {
+            SeekFrom::Start(n) => n as i128,
+            SeekFrom::End(n) => self.len as i128 + n as i128,
+            SeekFrom::Current(n) => self.pos as i128 + n as i128,
+        };
+        if target < 0 {
+            return Err(crate::compat::io_other("seek before start of device"));
+        }
+        self.pos = self.inner.seek(SeekFrom::Start(target as u64))?;
+        Ok(self.pos)
+    }
+}
+
+/// Wrap a source so `SeekFrom::End` works even when the OS will not report a device's length.
+pub fn known_len_reader(file: File, path: &Path) -> KnownLen<File> {
+    let len = get_file_size(&file, path).unwrap_or(0);
+    KnownLen::new(file, len)
+}
+
 /// A read adapter that ensures all I/O to the underlying reader is performed
 /// at sector-aligned offsets with sector-multiple sizes.
 ///
@@ -1009,5 +1052,48 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let err = replace_file(&tmp.path().join("nope"), &tmp.path().join("dest")).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    /// A Windows `\\.\PhysicalDriveN` handle: reads fine, but `SeekFrom::End` is ERROR_INVALID_FUNCTION.
+    struct NoEndSeek(io::Cursor<Vec<u8>>);
+
+    impl Read for NoEndSeek {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.0.read(buf)
+        }
+    }
+
+    impl Seek for NoEndSeek {
+        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+            match pos {
+                SeekFrom::End(_) => Err(io::Error::from_raw_os_error(1)),
+                other => self.0.seek(other),
+            }
+        }
+    }
+
+    #[test]
+    fn known_len_answers_end_seeks_a_device_cannot() {
+        let data: Vec<u8> = (0..=255u8).cycle().take(4096).collect();
+        let mut raw = NoEndSeek(io::Cursor::new(data.clone()));
+        assert!(
+            raw.seek(SeekFrom::End(0)).is_err(),
+            "bare device must reject End"
+        );
+
+        let mut r = KnownLen::new(NoEndSeek(io::Cursor::new(data.clone())), 4096);
+        assert_eq!(r.seek(SeekFrom::End(0)).unwrap(), 4096);
+        assert_eq!(r.seek(SeekFrom::End(-512)).unwrap(), 3584);
+
+        // Reads still land where the caller asked, and Current stays relative.
+        let mut buf = [0u8; 4];
+        r.seek(SeekFrom::Start(10)).unwrap();
+        r.read_exact(&mut buf).unwrap();
+        assert_eq!(buf, data[10..14]);
+        assert_eq!(r.seek(SeekFrom::Current(-4)).unwrap(), 10);
+        assert!(
+            r.seek(SeekFrom::End(-8192)).is_err(),
+            "negative target must error"
+        );
     }
 }

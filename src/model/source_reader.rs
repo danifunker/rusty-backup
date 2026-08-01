@@ -1159,6 +1159,10 @@ fn open_read_dispatch(
             }
         }
         let f = File::open(path).with_context(|| format!("open {}", path.display()))?;
+        // A device cannot answer seek(End); carry the length the OS reports instead.
+        if crate::cli::device_safety::looks_like_device_path(path) {
+            return Ok(Box::new(crate::os::known_len_reader(f, path)));
+        }
         Ok(Box::new(BufReader::new(f)))
     }
 }

@@ -3201,6 +3201,10 @@ impl InspectTab {
                     }
                 } else {
                     match device_file.as_ref().unwrap().try_clone() {
+                        // A device cannot answer seek(End); carry the length the OS reports instead.
+                        Ok(f) if is_device => {
+                            Box::new(rusty_backup::os::known_len_reader(f, &path))
+                        }
                         Ok(f) => Box::new(BufReader::new(f)),
                         Err(e) => {
                             finish_err(format!("Cannot clone file handle: {e}"));
