@@ -1053,6 +1053,14 @@ fn locale_is_utf8() -> bool {
     false
 }
 
+/// crossterm writes every colour as `38;5;N`, which these 8/16-colour terminals cannot parse at all.
+fn low_color_terminal() -> bool {
+    const LOW: [&str; 5] = ["xterm-color", "vt100", "vt102", "ansi", "dumb"];
+    std::env::var("TERM")
+        .map(|t| LOW.contains(&t.as_str()))
+        .unwrap_or(false)
+}
+
 /// Semantic 16-color palette. Colors *reinforce* meaning already carried by
 /// layout and reversed video; they never carry it alone. Honors `$NO_COLOR` by
 /// collapsing every slot to the terminal default.
@@ -1064,7 +1072,7 @@ struct Palette {
 impl Palette {
     fn detect() -> Self {
         Palette {
-            color: std::env::var_os("NO_COLOR").is_none(),
+            color: std::env::var_os("NO_COLOR").is_none() && !low_color_terminal(),
         }
     }
     fn styled(self, c: Color) -> Style {
@@ -1272,6 +1280,8 @@ pub fn run_on(initial_tab: usize, label: &'static str) -> Result<()> {
     )?;
 
     let mut terminal = ratatui::init();
+    // An old Terminal.app may not give a blank alternate screen, and ratatui only redraws changed cells.
+    let _ = terminal.clear();
     let outcome = App::new_on(initial_tab).run(&mut terminal);
     ratatui::restore();
     outcome
