@@ -1868,7 +1868,12 @@ fn build_nonresident_attr(attr_type: u32, runs: &[(u64, u64)], real_size: u64) -
 }
 
 /// Assemble a complete MFT record from attribute blobs.
-fn assemble_mft_record(attrs: &[Vec<u8>], flags: u16, record_size: u32) -> Vec<u8> {
+fn assemble_mft_record(
+    attrs: &[Vec<u8>],
+    flags: u16,
+    record_size: u32,
+    record_num: u64,
+) -> Vec<u8> {
     let mut record = vec![0u8; record_size as usize];
 
     // FILE magic
@@ -1893,14 +1898,18 @@ fn assemble_mft_record(attrs: &[Vec<u8>], flags: u16, record_size: u32) -> Vec<u
     record[0x1C..0x20].copy_from_slice(&record_size.to_le_bytes());
     // Next attribute ID (offset 0x28) — count of attrs
     record[0x28..0x2A].copy_from_slice(&(attrs.len() as u16).to_le_bytes());
+    // NTFS 3.1 records carry their own index here; chkdsk rejects the record without it.
+    record[0x2C..0x30].copy_from_slice(&(record_num as u32).to_le_bytes());
 
     // Write attributes
     let mut pos = first_attr_aligned;
-    for attr in attrs {
+    for (id, attr) in attrs.iter().enumerate() {
         if pos + attr.len() + 4 > record_size as usize {
             break; // shouldn't happen if record_size is adequate
         }
         record[pos..pos + attr.len()].copy_from_slice(attr);
+        // Instance ids must be unique within the record and below next_attribute_id above.
+        record[pos + 0x0E..pos + 0x10].copy_from_slice(&(id as u16).to_le_bytes());
         pos += attr.len();
     }
 
@@ -2967,7 +2976,8 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
         let sd_attr = build_resident_attr(ATTR_SECURITY_DESCRIPTOR, &sd_value);
 
         let attrs = vec![std_info, file_name_attr, sd_attr, data_attr];
-        let mut record = assemble_mft_record(&attrs, MFT_RECORD_IN_USE, self.mft_record_size);
+        let mut record =
+            assemble_mft_record(&attrs, MFT_RECORD_IN_USE, self.mft_record_size, record_num);
         self.write_mft_record(record_num, &mut record)?;
 
         // Build index entry and insert
@@ -3026,6 +3036,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
             &attrs,
             MFT_RECORD_IN_USE | MFT_RECORD_IS_DIRECTORY,
             self.mft_record_size,
+            record_num,
         );
         self.write_mft_record(record_num, &mut record)?;
 
@@ -3998,6 +4009,44 @@ mod tests {
         let (len, id) = sec_of(&mut fs, file.location);
         assert_eq!(len, 72, "not the 48-byte NTFS 1.2 form");
         assert_eq!(id, pid, "must inherit the parent's $Secure id");
+
+        // chkdsk rejects a 3.1 record whose self-index is absent or whose attribute
+        // instance ids collide, and deletes the file outright.
+        let rec = fs.read_mft_record(file.location).unwrap();
+        assert_eq!(
+            u32::from_le_bytes([rec[0x2C], rec[0x2D], rec[0x2E], rec[0x2F]]) as u64,
+            file.location,
+            "record must carry its own MFT index at 0x2C"
+        );
+        let mut seen = Vec::new();
+        let mut off = u16::from_le_bytes([rec[0x14], rec[0x15]]) as usize;
+        while off + 8 <= rec.len() {
+            let atype = u32::from_le_bytes([rec[off], rec[off + 1], rec[off + 2], rec[off + 3]]);
+            if atype == ATTR_END {
+                break;
+            }
+            let alen = u32::from_le_bytes([rec[off + 4], rec[off + 5], rec[off + 6], rec[off + 7]])
+                as usize;
+            if alen == 0 {
+                break;
+            }
+            seen.push(u16::from_le_bytes([rec[off + 0x0E], rec[off + 0x0F]]));
+            off += alen;
+        }
+        assert!(!seen.is_empty(), "record must have attributes");
+        let mut sorted = seen.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            seen.len(),
+            "attribute instance ids must be unique: {seen:?}"
+        );
+        let next = u16::from_le_bytes([rec[0x28], rec[0x29]]);
+        assert!(
+            seen.iter().all(|i| *i < next),
+            "next_attribute_id {next} must exceed every instance {seen:?}"
+        );
 
         let dir = fs
             .create_directory(&root, "acldir", &CreateDirectoryOptions::default())
