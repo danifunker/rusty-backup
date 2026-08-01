@@ -82,6 +82,19 @@ fi
 [ -n "${PPC_TUNE:-}" ] && PPC_CPU_FLAGS="$PPC_CPU_FLAGS -mtune=$PPC_TUNE"
 export PPC_CPU_FLAGS
 
+# The download has to say which CPU it needs. A G4 or G5 build does not merely
+# run slower on an older machine, it refuses to launch, so the artifacts are
+# named per family rather than all landing on rb-cli-ppc.tar.gz.
+case "$PPC_CPU" in
+  g3|G3|750|740|745|755)      PPC_CPU_LABEL="g3" ;;
+  603|603e|604|604e)          PPC_CPU_LABEL="ppc$PPC_CPU" ;;
+  g4|G4|7400|7410|7450|7455)  PPC_CPU_LABEL="g4" ;;
+  g5|G5|970)                  PPC_CPU_LABEL="g5" ;;
+  generic|ppc|none)           PPC_CPU_LABEL="generic" ;;
+  *)                          PPC_CPU_LABEL="$PPC_CPU" ;;
+esac
+export PPC_CPU_LABEL
+
 # The PowerPC Mac that compiles the emitted C. Nothing here cross-compiles:
 # there is no usable powerpc-apple-darwin cross-gcc, so scripts/ppc-cc-remote.py
 # stands in as the C compiler and ships each translation unit over ssh. Set
@@ -819,7 +832,7 @@ stage_dist() {
   note "uploading rb-cli to $PPC_HOST for packaging"
   scp -q "$PPC_OUT/rb-cli" "$PPC_HOST:~/rb-cli-dist-src" || die "could not upload rb-cli"
   ssh "$PPC_HOST" \
-    "RB_CPU=$(printf '%q' "$PPC_CPU") RB_CPU_FLAGS=$(printf '%q' "$PPC_CPU_FLAGS") bash -s" \
+    "RB_CPU=$(printf '%q' "$PPC_CPU") RB_CPU_FLAGS=$(printf '%q' "$PPC_CPU_FLAGS") RB_CPU_LABEL=$(printf '%q' "$PPC_CPU_LABEL") bash -s" \
     <<'REMOTE' || die "packaging failed on $PPC_HOST"
 set -e
 BIN=~/rb-cli-dist-src
@@ -945,13 +958,16 @@ if [ -d "$SDK104" ]; then
     fi
   done
 fi
-rm -f ~/rb-cli-ppc.tar.gz
-(cd ~ && tar czf rb-cli-ppc.tar.gz rb-cli-dist)
-echo "bundled $(ls "$D/lib" | wc -l | tr -d ' ') dylib(s); $(ls -l ~/rb-cli-ppc.tar.gz | awk '{print $5}') bytes"
+TARBALL=~/rb-cli-ppc-${RB_CPU_LABEL:-unknown}.tar.gz
+rm -f "$TARBALL"
+(cd ~ && tar czf "$TARBALL" rb-cli-dist)
+echo "bundled $(ls "$D/lib" | wc -l | tr -d ' ') dylib(s); $(ls -l "$TARBALL" | awk '{print $5}') bytes -> $(basename "$TARBALL")"
 REMOTE
   mkdir -p "$RB_DIR/dist"
-  scp -q "$PPC_HOST:~/rb-cli-ppc.tar.gz" "$RB_DIR/dist/rb-cli-ppc.tar.gz" || die "could not fetch the tarball"
-  note "PowerPC bundle at $RB_DIR/dist/rb-cli-ppc.tar.gz (unpack and run; no install step)."
+  local art="rb-cli-ppc-${PPC_CPU_LABEL}.tar.gz"
+  scp -q "$PPC_HOST:~/$art" "$RB_DIR/dist/$art" || die "could not fetch the tarball"
+  note "PowerPC bundle at $RB_DIR/dist/$art (unpack and run; no install step)."
+  note "Needs a $(echo "$PPC_CPU_LABEL" | tr 'a-z' 'A-Z') or newer; older Macs refuse it at exec."
 }
 
 # ---- stage 8: capture libc ground truth from the PowerPC Mac ----------------
