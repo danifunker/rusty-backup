@@ -837,7 +837,8 @@ pub fn create_ntfs<W: Write + Seek>(
             0x03, // in use | directory
             &geo,
             &[
-                resident_attr(0x10, "", &std_info(sys_flags, 0), 0, false),
+                // The root is what every created file inherits from, so it needs a real id.
+                resident_attr(0x10, "", &std_info(sys_flags, SECURITY_ID), 0, false),
                 resident_attr(
                     0x30,
                     "",

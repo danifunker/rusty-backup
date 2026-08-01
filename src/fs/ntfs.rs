@@ -32,6 +32,8 @@ const ATTR_END: u32 = 0xFFFF_FFFF;
 
 // Additional attribute type codes (for editing)
 const ATTR_STANDARD_INFORMATION: u32 = 0x10;
+/// First `$Secure` id every NTFS formatter registers; used when the parent has no usable one.
+const DEFAULT_SECURITY_ID: u32 = 0x100;
 const ATTR_FILE_NAME: u32 = 0x30;
 const ATTR_SECURITY_DESCRIPTOR: u32 = 0x50;
 
@@ -1608,15 +1610,28 @@ fn prepare_fixup(record: &mut [u8]) {
     }
 }
 
-/// Build a $STANDARD_INFORMATION attribute value (48 bytes).
-fn build_standard_information() -> Vec<u8> {
-    let mut data = vec![0u8; 48];
+/// Build a $STANDARD_INFORMATION value: 72 bytes with a `security_id` on NTFS 3.x, else 48.
+///
+/// 3.0 moved ACLs into `$Secure`, keyed by that id; the 48-byte 1.2 record has no field for it and
+/// carries a per-file `$SECURITY_DESCRIPTOR` instead. Writing the 1.2 form on a 3.x volume leaves
+/// Windows unable to resolve the ACL at all.
+fn build_standard_information(security_id: Option<u32>) -> Vec<u8> {
+    let Some(security_id) = security_id else {
+        let mut data = vec![0u8; 48];
+        let ts = FIXED_NTFS_TIMESTAMP.to_le_bytes();
+        for i in 0..4 {
+            data[i * 8..i * 8 + 8].copy_from_slice(&ts);
+        }
+        return data;
+    };
+    let mut data = vec![0u8; 72];
     let ts = FIXED_NTFS_TIMESTAMP.to_le_bytes();
     data[0..8].copy_from_slice(&ts); // creation time
     data[8..16].copy_from_slice(&ts); // modification time
     data[16..24].copy_from_slice(&ts); // MFT modification time
     data[24..32].copy_from_slice(&ts); // access time
                                        // flags at offset 32 = 0 (normal)
+    data[0x34..0x38].copy_from_slice(&security_id.to_le_bytes());
     data
 }
 
@@ -2255,6 +2270,27 @@ impl<R: Read + Write + Seek> NtfsFilesystem<R> {
 
     /// Read parent directory's security descriptor, or build a default one.
     /// If the parent's SD is too large to fit as a resident attribute, uses a minimal default.
+    /// Inherit the parent's `$Secure` entry: its descriptor is already registered, so no new one
+    /// is written. Falls back to the id every formatter registers when the parent predates NTFS 3.
+    fn read_parent_security_id(&mut self, parent_record_num: u64) -> u32 {
+        if let Ok(record) = self.read_mft_record(parent_record_num) {
+            for attr in &parse_mft_attributes(&record, self.mft_record_size) {
+                if attr.attr_type == ATTR_STANDARD_INFORMATION {
+                    if let Ok(v) = self.read_attribute_data(attr, None) {
+                        if v.len() >= 0x38 {
+                            let id = u32::from_le_bytes([v[0x34], v[0x35], v[0x36], v[0x37]]);
+                            if id != 0 {
+                                return id;
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        DEFAULT_SECURITY_ID
+    }
+
     fn read_parent_security_descriptor(
         &mut self,
         parent_record_num: u64,
@@ -2918,8 +2954,13 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
         };
 
         // Build attributes
-        let std_info =
-            build_resident_attr(ATTR_STANDARD_INFORMATION, &build_standard_information());
+        // Follow the volume's own version: only 3.x has a security_id field to fill.
+        let sec_id =
+            (self.ntfs_version.0 >= 3).then(|| self.read_parent_security_id(parent_record_num));
+        let std_info = build_resident_attr(
+            ATTR_STANDARD_INFORMATION,
+            &build_standard_information(sec_id),
+        );
         let file_name_value = build_file_name_attr(parent_record_num, name, false, data_len);
         let file_name_attr = build_resident_attr(ATTR_FILE_NAME, &file_name_value);
         let sd_value = self.read_parent_security_descriptor(parent_record_num)?;
@@ -2967,8 +3008,13 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
 
         let record_num = self.allocate_mft_record()?;
 
-        let std_info =
-            build_resident_attr(ATTR_STANDARD_INFORMATION, &build_standard_information());
+        // Follow the volume's own version: only 3.x has a security_id field to fill.
+        let sec_id =
+            (self.ntfs_version.0 >= 3).then(|| self.read_parent_security_id(parent_record_num));
+        let std_info = build_resident_attr(
+            ATTR_STANDARD_INFORMATION,
+            &build_standard_information(sec_id),
+        );
         let file_name_value = build_file_name_attr(parent_record_num, name, true, 0);
         let file_name_attr = build_resident_attr(ATTR_FILE_NAME, &file_name_value);
         let sd_value = self.read_parent_security_descriptor(parent_record_num)?;
@@ -3906,6 +3952,80 @@ mod tests {
         // Free space should have decreased (or stayed same for resident)
         let new_free = fs.free_space().unwrap();
         assert!(new_free <= initial_free);
+    }
+
+    #[test]
+    fn created_file_carries_a_usable_security_id() {
+        // A 48-byte NTFS 1.2 $STANDARD_INFORMATION has no security_id, and on a 3.x volume
+        // Windows resolves a file's ACL through $Secure by that id.
+        fn sec_of<T: Read + Seek>(fs: &mut NtfsFilesystem<T>, rec: u64) -> (usize, u32) {
+            let record = fs.read_mft_record(rec).unwrap();
+            let attrs = parse_mft_attributes(&record, fs.mft_record_size);
+            let a = attrs
+                .iter()
+                .find(|a| a.attr_type == ATTR_STANDARD_INFORMATION)
+                .expect("$STANDARD_INFORMATION");
+            let v = fs.read_attribute_data(a, None).unwrap();
+            let id = if v.len() >= 0x38 {
+                u32::from_le_bytes([v[0x34], v[0x35], v[0x36], v[0x37]])
+            } else {
+                0
+            };
+            (v.len(), id)
+        }
+
+        // A volume our own formatter wrote: the root carries a real id, so it must be inherited.
+        let mut blank = Cursor::new(Vec::new());
+        crate::fs::ntfs_format::create_blank_ntfs(&mut blank, 64 * 1024 * 1024, 64, Some("T"))
+            .unwrap();
+        let mut img = blank.into_inner();
+        let mut fs = NtfsFilesystem::open(Cursor::new(&mut img), 0).unwrap();
+        let root = fs.root().unwrap();
+        let (plen, pid) = sec_of(&mut fs, root.location);
+        assert_eq!(plen, 72, "formatter writes the NTFS 3.x form");
+        assert_ne!(pid, 0);
+
+        let data = b"acl inheritance";
+        let file = fs
+            .create_file(
+                &root,
+                "acl.txt",
+                &mut Cursor::new(data.as_slice()),
+                data.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+        let (len, id) = sec_of(&mut fs, file.location);
+        assert_eq!(len, 72, "not the 48-byte NTFS 1.2 form");
+        assert_eq!(id, pid, "must inherit the parent's $Secure id");
+
+        let dir = fs
+            .create_directory(&root, "acldir", &CreateDirectoryOptions::default())
+            .unwrap();
+        let (dlen, did) = sec_of(&mut fs, dir.location);
+        assert_eq!(dlen, 72);
+        assert_eq!(did, pid);
+
+        // A volume whose root predates NTFS 3 still gets a usable id, not zero.
+        let mut fixture = load_fixture("test_ntfs.img.zst");
+        let mut fs2 = NtfsFilesystem::open(Cursor::new(&mut fixture), 0).unwrap();
+        let root2 = fs2.root().unwrap();
+        let f2 = fs2
+            .create_file(
+                &root2,
+                "acl2.txt",
+                &mut Cursor::new(data.as_slice()),
+                data.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+        let (len2, id2) = sec_of(&mut fs2, f2.location);
+        if fs2.ntfs_version.0 >= 3 {
+            assert_eq!(len2, 72, "3.x volume must get the 3.x record");
+            assert_ne!(id2, 0, "and a resolvable id, never zero");
+        } else {
+            assert_eq!(len2, 48, "a 1.2 volume must keep the 1.2 record");
+        }
     }
 
     #[test]
