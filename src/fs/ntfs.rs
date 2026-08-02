@@ -1775,16 +1775,31 @@ fn build_empty_index_root() -> Vec<u8> {
 
 /// Build a resident attribute header + data, padded to 8-byte alignment.
 fn build_resident_attr(attr_type: u32, data: &[u8]) -> Vec<u8> {
-    let value_offset = 0x18u16;
-    let total = (value_offset as usize + data.len() + 7) & !7; // 8-byte aligned
+    build_named_resident_attr(attr_type, "", data)
+}
+
+/// A directory's index attributes are *named* `$I30`; Windows looks the index up
+/// by that name and treats a nameless `$INDEX_ROOT` as no index at all.
+fn build_named_resident_attr(attr_type: u32, name: &str, data: &[u8]) -> Vec<u8> {
+    let name_utf16: Vec<u16> = name.encode_utf16().collect();
+    let name_offset = 0x18usize;
+    let name_bytes = name_utf16.len() * 2;
+    let value_offset = ((name_offset + name_bytes) + 7) & !7;
+    let total = (value_offset + data.len() + 7) & !7; // 8-byte aligned
     let mut attr = vec![0u8; total];
     attr[0..4].copy_from_slice(&attr_type.to_le_bytes());
     attr[4..8].copy_from_slice(&(total as u32).to_le_bytes());
-    // non-resident flag = 0 (resident)
-    // name_len = 0, name_offset = 0, flags = 0
+    // non-resident flag = 0 (resident); flags = 0
+    attr[9] = name_utf16.len() as u8; // name length, in characters
+    if name_bytes > 0 {
+        attr[0x0A..0x0C].copy_from_slice(&(name_offset as u16).to_le_bytes());
+        for (i, ch) in name_utf16.iter().enumerate() {
+            attr[name_offset + i * 2..name_offset + i * 2 + 2].copy_from_slice(&ch.to_le_bytes());
+        }
+    }
     attr[0x10..0x14].copy_from_slice(&(data.len() as u32).to_le_bytes()); // value length
-    attr[0x14..0x16].copy_from_slice(&value_offset.to_le_bytes());
-    attr[value_offset as usize..value_offset as usize + data.len()].copy_from_slice(data);
+    attr[0x14..0x16].copy_from_slice(&(value_offset as u16).to_le_bytes());
+    attr[value_offset..value_offset + data.len()].copy_from_slice(data);
     attr
 }
 
@@ -3068,7 +3083,8 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
         let parent_ref = self.file_reference(parent_record_num);
         let file_name_value = build_file_name_attr(parent_ref, name, true, 0, now);
         let file_name_attr = build_resident_attr(ATTR_FILE_NAME, &file_name_value);
-        let index_root = build_resident_attr(ATTR_INDEX_ROOT, &build_empty_index_root());
+        let index_root =
+            build_named_resident_attr(ATTR_INDEX_ROOT, "$I30", &build_empty_index_root());
 
         let mut attrs = vec![std_info, file_name_attr];
         if sec_id.is_none() {

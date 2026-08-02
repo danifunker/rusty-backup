@@ -46,6 +46,12 @@ Run `dir` plainly and read the message.
   cannot be it.
 - **Parent reference sequence number** — was genuinely wrong (always 0) and is
   now fixed (`2700551`), but fixing it did **not** stop the pruning.
+- **The `$I30` attribute name** — `build_resident_attr` had no name support at
+  all, so every directory we created carried a *nameless* `$INDEX_ROOT` while
+  `ntfs_format.rs` correctly writes `resident_attr(0x90, "$I30", ...)`. Fixed,
+  and it did **not** stop the pruning either. Note `rootfile.txt` is a plain file
+  in the volume root, whose index the formatter already named correctly, and it
+  is pruned too — so the name was never the whole story.
 
 ## Where to look next
 
@@ -54,10 +60,6 @@ reproduce. Candidates not yet checked:
 
 - Whether Windows requires a directory's `$FILE_NAME` `allocatedSize`/`realSize`
   to be 0, and what ours carry.
-- Whether the `$I30` **attribute name** is present and correct on `$INDEX_ROOT`
-  (`nameLength`/`nameOffset` in the attribute header — Windows names this
-  attribute `$I30`; a nameless `$INDEX_ROOT` may be what it rejects). **This is
-  the strongest untested candidate.**
 - Whether a directory needs `$INDEX_ALLOCATION` + `$BITMAP` present even when
   empty.
 - What `$LogFile` state Windows expects; self-healing may distrust a volume whose
@@ -73,12 +75,13 @@ reproduce. Candidates not yet checked:
 - `qcow.py` / `qread.py` in the session scratchpad read qcow2 and parse MFT
   records without root or conversion.
 
-## Related, still open
+## Related
 
-- `rb-cli backup --format zstd` is silently ignored for partition-table-less
-  (superfloppy) sources: it writes raw and records `compression_type: "none"`.
-  The arg is wired correctly in `src/cli/verbs/backup.rs`, so the override is
-  downstream. Note the default (`chd`) is ignored the same way.
+- `--format` on a superfloppy source: the raw override is **deliberate**
+  (`src/backup/mod.rs`, "a compressed superfloppy output needs restore-path
+  work"), not a bug — but it used to be silent, so asking for zstd and getting a
+  `.img` read as one. It now warns. Making it actually honour the format is still
+  open work.
 - A directory we create fills up at ~6 entries (`directory index full, no room in
   existing nodes`) because the index never spills to `$INDEX_ALLOCATION`. Fixing
   the pruning above does not fix this; it needs real index-node allocation.

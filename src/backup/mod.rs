@@ -1444,6 +1444,19 @@ fn run_backup_inner(
         // written raw — so a lightly-used volume shrinks to ~its real data size. A
         // compressed superfloppy output needs restore-path work; see OPEN-WORK.)
         let effective_compression = if is_superfloppy {
+            // Say so: asking for --format zstd and silently getting a .img reads as
+            // a bug, and metadata then records compression_type "none".
+            if config.compression != CompressionType::None {
+                log(
+                    &progress,
+                    LogLevel::Warning,
+                    format!(
+                        "{}: {} output is not supported for a partition-table-less image; writing raw .img instead",
+                        part_label,
+                        config.compression.as_str()
+                    ),
+                );
+            }
             CompressionType::None
         } else {
             config.compression
