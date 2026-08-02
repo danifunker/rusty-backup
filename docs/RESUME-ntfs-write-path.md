@@ -1,156 +1,113 @@
 # Resume: the NTFS write path (and what else is still open)
 
-Written 2026-08-02, superseding `RESUME-ntfs-index-root.md`. Branch
-`ppc-macos-work`. Everything marked *measured* was observed against real Windows
-7 in the QEMU rig, not inferred from code.
+Rewritten 2026-08-02 after the write path was closed out; supersedes the
+earlier revision of this file and `RESUME-ntfs-index-root.md`. Branch
+`ppc-macos-work`. Everything marked *measured* was observed against real
+Windows 7 in the QEMU rig, not inferred from code.
 
-Read the rig section before touching anything — several of these bugs were
-mis-diagnosed twice because the evidence destroys itself.
+**The NTFS write path now works end to end on real Windows.** Read the rig
+section before touching anything — several of the bugs below were mis-diagnosed
+twice because the evidence destroys itself.
 
 ---
 
-## Landed and verified this session (do not re-investigate)
+## The state of it (measured on Win7, 2026-08-02)
+
+A 64 MB volume our formatter wrote, populated entirely by `rb-cli`
+(`mkdir`, `put`, 45-entry directory, three-level nesting, a 31 MB
+executable), mounted as `D:` on Windows 7:
+
+| check | result |
+|---|---|
+| every entry we wrote still present after mount | **yes** — nothing pruned |
+| `chkdsk D:` | **"Windows has checked the file system and found no problems"** (294 index entries) |
+| `d:\mydir\tool.exe --version` | **runs**, prints its version |
+| `icacls d:\mydir\tool.exe` | Administrators:(F) SYSTEM:(F) Authenticated Users:(M) Users:(RX), `(OI)(CI)` inheritance |
+| Windows writes into a 45-entry directory *we* built | **succeeds**, 45 -> 46 files |
+| we read Windows' file back afterwards | **yes**, byte-exact |
+| 31 MB payload md5 after the round trip | identical |
+
+That last pair is the strongest statement available: Windows accepted a
+large ($INDEX_ALLOCATION-backed) directory index we constructed, inserted
+its own entry into it, and we parsed the result back.
+
+---
+
+## Landed and verified (do not re-investigate)
 
 | commit | fix | verified how |
 |---|---|---|
 | `31c0c0c` | restore: `SectorAlignedWriter` overflowed on a partial chunk | zstd restore of a 129 MB stream on Win7; payload md5 identical |
-| `95f960c` | NTFS: inherit the ACL instead of writing a fabricated one | Windows read the file; Security tab populated; `icacls /reset` clean |
-| `3c1d44f` | NTFS: **sign-safe data-run lengths**; real timestamps | 31 MB file now readable *and* executable on Win7 |
+| `95f960c` | NTFS: inherit the ACL instead of writing a fabricated one | Windows read the file; Security tab populated |
+| `3c1d44f` | NTFS: **sign-safe data-run lengths**; real timestamps | 31 MB file readable *and* executable on Win7 |
 | `2700551` | NTFS: parent reference carries the parent's sequence number | measured before/after |
 | `5ab770a` | NTFS: `$INDEX_ROOT` named `$I30`; `--format` downgrade now warns | measured |
+| `9dcc9dc` | NTFS: **real B-tree directory indexes** + index geometry from the volume + case-folded lookup | unit tests across geometries; Win7 mount |
+| `1c712a0` | NTFS: LCN 0 is not "sparse"; backup boot checked at its real sector | `fsck` on a fresh volume is now clean |
+| `7311f59` | NTFS: only claim the DOS namespace for genuine 8.3 names | measured |
+| `1a4808a` | NTFS: inherit the parent's real ACL, correctly framed DACL | `icacls` + execute + Windows-writes-into-our-dir |
 
-Files created into an **existing Windows directory** work end to end — a 31 MB
-executable written by us runs on Win7. The broken cases are all below.
+### What `9dcc9dc` actually changed
 
----
+The old create path could only splice an entry into a node that already had
+room. That produced both of the headline bugs:
 
-## ISSUE 1 — Windows deletes entries we splice into a resident `$INDEX_ROOT`
+- **`insert_index_entry`** now promotes a full resident `$INDEX_ROOT` to a
+  large index (entries move into a fresh INDX block; `$INDEX_ALLOCATION` +
+  `$BITMAP` attributes appended), descends the tree in collation order
+  instead of picking any node with room, and splits full leaves upward,
+  pushing the median separator into the parent.
+- **`remove_index_entry`** replaces a removed separator with its in-order
+  predecessor (or drops an empty single-leaf subtree).
+- Index geometry (`index_record_size`, clusters-per-index-block) is read
+  from BPB 0x44 and the directory's own `$INDEX_ROOT`, never hardcoded.
+- `$FILE_NAME` carries the indexed flag; `free_mft_record` bumps the record
+  sequence and reuse preserves it, so an index entry can never carry a
+  stale reference.
 
-**Severity: high.** This is why `restore` could not read a backup folder we had
-staged with `mkdir` + `put`.
+The regression net is in `src/fs/ntfs.rs`'s test module:
+`directory_grows_past_resident_root_across_geometry` (512/1024/4096-byte
+clusters), `root_directory_takes_a_hundred_files_alongside_metafiles`,
+`deleting_separator_entries_keeps_the_tree_sound`,
+`rename_moves_entries_between_index_nodes`,
+`reused_mft_record_bumps_sequence_and_index_entry_matches`, plus
+`verify_directory_index`, a recursive checker asserting sorted order, key
+bounds per subtree, `$BITMAP` agreement, and that every index entry points
+at an in-use record with a matching sequence number.
 
-### Symptom (measured)
+### The ACL bug worth remembering
 
-An entry we insert shows in `rb-cli ls`, and **Windows removes it when it mounts
-the volume** — not merely hides it. On a volume our own formatter wrote, `mydir`
-and `rootfile.txt` were absent from the image afterwards, and Windows had added
-its own `$RECYCLE.BIN` and `bootsqm.dat`. `chkdsk` then reports "found no
-problems" because nothing wrong is left to find.
+Created files were getting `$Secure` id `0x100` — the *metafile* descriptor,
+granting only SYSTEM and Administrators plain **Read**. Hence "Access is
+denied" when running our executable, and Windows being unable to write into
+a directory we made. Files now inherit the parent's own
+`$SECURITY_DESCRIPTOR` (the formatter's root carries the standard permissive
+data-volume ACL), repacked compactly because mkntfs pads the root's DACL to
+4 KiB.
 
-### The split — the most useful fact
-
-| entry inserted into | result |
-|---|---|
-| existing **`$INDEX_ALLOCATION`** (Windows-made dir: Desktop, `C:\` root) | **survives** — readable, executable |
-| resident **`$INDEX_ROOT`** (any dir *we* create; root of a volume *we* format) | **pruned on mount** |
-
-### The isolating experiment (already run — this is the sharpest statement)
-
-`rootfile.txt` was inserted into the **formatter's own root index**, which is
-built by `root_index_root()` (`src/fs/ntfs_format.rs:457`) and is definitely
-well-formed — Windows mounts that volume, reads its root, and writes
-`bootsqm.dat` into it. That entry was **still pruned**.
-
-So the bug is in **`try_insert_into_index_root`**
-(`src/fs/ntfs.rs:2417`), *not* in how we construct an index root.
-`try_insert_into_index_allocation` (`src/fs/ntfs.rs:2542`) appears fine.
-
-### Ruled out — each compared byte-for-byte against a Windows-written peer
-
-- MFT record header: flags `0x0003`, `used`, `alloc`, first-attribute offset,
-  self index at `0x2C`, update-sequence fixups (USN at `0x30`, count 3, both
-  sector tails equal the USN, originals saved in the USA).
-- `$INDEX_ROOT` header: indexed attr `0x30`, collation 1.
-- Index node header: entries offset 16, `index_used` / `index_allocated`
-  self-consistent with the attribute value length.
-- Index entry header: `length` (8-byte aligned), `keyLength` == `66 + 2*nameLen`,
-  `flags`, padding, end sentinel `0x02`.
-- Target file reference sequence == the target record's own sequence.
-- Splice bookkeeping: `try_insert_into_index_root` **does** update node
-  `index_used`, node `index_allocated`, the `$INDEX_ROOT` value length, the
-  attribute length, and the record's `used_size` at `0x18`.
-- Collation order — reproduces with a **single** entry, so ordering cannot be it.
-- Parent reference sequence (was 0, fixed in `2700551`) — did not stop it.
-- `$I30` attribute name (was absent, fixed in `5ab770a`) — did not stop it.
-
-### Candidates not yet checked
-
-1. **A directory's own `$FILE_NAME` `allocatedSize` / `realSize`.** Windows keeps
-   both 0 for a directory. Ours are written by `build_file_name_attr` with
-   `size = 0` for directories, so probably fine — but the *index entry copy* in
-   the parent has never been checked against this.
-2. **Whether a directory needs `$INDEX_ALLOCATION` + `$BITMAP` present even when
-   empty.** Windows-made directories that have ever held entries carry both.
-   Our created directories carry neither. This is my leading candidate — and it
-   overlaps with ISSUE 2, so implementing index-block allocation may fix both.
-3. **`$LogFile` state.** We never touch it. NTFS self-healing may distrust a
-   volume whose log does not corroborate recent index changes.
-4. **`$Secure` / `$UpCase` collation dependence** — the index is collated with
-   `COLLATION_FILE_NAME`, which uses `$UpCase`. If our inserted key's ordering
-   disagrees with what Windows computes from `$UpCase`, a B-tree lookup can miss
-   even when a linear walk finds it. Unlikely with one entry, but untested.
+The repack has to frame the ACL header exactly — revision(1) sbz1(1)
+size(2) count(2) sbz2(2). Copying 4 source bytes instead of 2 shifted every
+field, and the DACL read back as 184 zero-length ACEs. **Windows accepted
+that silently and treated it as granting nothing** — no chkdsk complaint, no
+error, just mysterious access-denied. If permissions ever look wrong again,
+dump the DACL and check that its ACEs exactly fill the declared size;
+`dacl_extent` in the tests does this.
 
 ---
 
-## ISSUE 2 — a directory we create fills up at ~6 entries
+## Still open
 
-`insert_index_entry` (`src/fs/ntfs.rs:2385`) tries `$INDEX_ROOT`, then existing
-`$INDEX_ALLOCATION` INDX blocks, then gives up:
+### ISSUE 4 — `--format` is not honoured for partition-table-less sources
 
-```
-error: create_file: disk full: directory index full, no room in existing nodes
-```
+`src/backup/mod.rs:1446` forces `CompressionType::None` for a superfloppy.
+This is **deliberate** ("a compressed superfloppy output needs restore-path
+work"), not an accident; as of `5ab770a` it warns instead of silently
+writing a `.img` and recording `compression_type: "none"`.
 
-There is no path that **allocates a new INDX block** and promotes the resident
-index root to a large index. A 1024-byte MFT record holds roughly six ~104-byte
-entries alongside `$STANDARD_INFORMATION` + `$FILE_NAME`, hence the limit.
+Making it actually honour zstd/gzip/lz4 for superfloppies is open work, and
+the restore side is the part that needs doing.
 
-Fixing this properly means: allocate a cluster-aligned INDX block, write its
-`INDX` header + fixups, move the root's entries into it, rewrite `$INDEX_ROOT`
-as a *large* index (node flags bit 0 set, single end entry with a sub-node VCN —
-`root_index_root()` at `ntfs_format.rs:457` already shows the exact shape), and
-add `$INDEX_ALLOCATION` (non-resident) plus `$BITMAP`. The formatter already
-builds all three for `$Extend`, so the byte layouts can be copied from there
-rather than re-derived.
-
----
-
-## ISSUE 3 — `build_empty_index_root` hardcodes index geometry
-
-`src/fs/ntfs.rs:1744`:
-
-```rust
-data[8..12].copy_from_slice(&4096u32.to_le_bytes()); // index alloc size
-data[12] = 1;                                        // clusters per index record
-```
-
-The formatter derives both (`idxroot_clusters_per_block`,
-`src/fs/ntfs_format.rs:229`): when `index_record_size >= cluster_size` the field
-is *clusters per block*, otherwise it is a sector count.
-
-On the 64 MB test volume our own formatter makes — **cluster = 512** — the
-correct value is `4096/512 = 8`, and we write `1`. On the Win7 C: volume
-(cluster 4096) `1` happens to be right, which is why this did not show up there.
-
-Real defect. Not the cause of ISSUE 1 (pruning happens on C: too, where the
-hardcoded value is correct), but it must be fixed before ISSUE 1 conclusions on
-small-cluster volumes mean anything.
-
----
-
-## ISSUE 4 — `--format` is not honoured for partition-table-less sources
-
-`src/backup/mod.rs:1446` forces `CompressionType::None` for a superfloppy. This
-is **deliberate** ("a compressed superfloppy output needs restore-path work"),
-not an accident. As of `5ab770a` it warns instead of silently writing a `.img`
-and recording `compression_type: "none"`.
-
-Making it actually honour zstd/gzip/lz4 for superfloppies is open work, and the
-restore side is the part that needs doing.
-
----
-
-## ISSUE 5 — stale precomputed minimum across devices
+### ISSUE 5 — stale precomputed minimum across devices
 
 `src/backup/sizes.rs:234`. From a real user log: a 64 GB card was scanned
 (minimum 27.2 GiB), the card was swapped for a 32 GB one behind the same
@@ -161,20 +118,34 @@ Compact analysis (partition-0): ... data=3.4 GiB ...
 Partition-0: reusing precomputed defragmented minimum 27.2 GiB (skipped volume walk)
 ```
 
-`precomputed_min` is keyed on **partition index only**, with no device identity
-or size check. The imaged data was correct (smart sizing used 3.4 GiB) but
-`mbr-min.bin` records 27.2 GiB, so a `--size minimum` restore from that backup
-produces a wrongly-sized partition. Not data loss; still wrong.
+`precomputed_min` is keyed on **partition index only**, with no device
+identity or size check. The imaged data was correct (smart sizing used
+3.4 GiB) but `mbr-min.bin` records 27.2 GiB, so a `--size minimum` restore
+from that backup produces a wrongly-sized partition. Not data loss; still
+wrong. Fix: key the cache on something device-identifying (path + source
+size + a partition fingerprint), or invalidate whenever the scanned geometry
+differs.
 
-Fix: key the cache on something device-identifying (path + source size + a
-partition fingerprint), or invalidate it whenever the scanned geometry differs.
+### NTFS work not needed yet, but known missing
+
+- **`$LogFile` is never written.** Windows replays/resets it on mount and has
+  not objected, but a torn write mid-`put` has no journal to recover from.
+- **No `$Secure` authoring.** We inherit an SD attribute rather than adding a
+  descriptor to `$SDS` and referencing it by id. Inline SDs are legal and
+  Windows honours them; ids would be tidier and cheaper per file.
+- **`$ATTRIBUTE_LIST` is not produced**, so a single file cannot outgrow one
+  MFT record. Not reachable through the CLI surface today.
+- **The defragmenting clone** (`src/fs/ntfs_clone.rs`) still does not replay
+  reparse points, named streams, or per-file security descriptors beyond the
+  inherited default — documented in its module header.
 
 ---
 
 ## The structural problem behind most of this
 
-`src/fs/ntfs_format.rs` and the create path in `src/fs/ntfs.rs` build the same
-on-disk structures independently, and have now disagreed **six** times:
+`src/fs/ntfs_format.rs` and the create path in `src/fs/ntfs.rs` build the
+same on-disk structures independently, and have now disagreed **eight**
+times:
 
 1. version-aware `$STANDARD_INFORMATION` (`9017f92`)
 2. inherited `security_id` (`9017f92`)
@@ -183,23 +154,30 @@ on-disk structures independently, and have now disagreed **six** times:
 5. sign-safe data-run lengths (`3c1d44f`) — the formatter's `enc_run`
    (`ntfs_format.rs:266`) even documents the rule the create path violated
 6. the `$I30` attribute name (`5ab770a`) — again, the formatter had it right
+7. index-block geometry: hardcoded 4096/1 vs. the formatter's derived
+   `idxroot_clusters_per_block` (`9dcc9dc`)
+8. the `$FILE_NAME` indexed flag, set by `resident_attr` but not by
+   `build_resident_attr` (`9dcc9dc`)
 
-Every one was found by diffing our bytes against a Windows-written peer. They
-should share one record/attribute builder; until they do, expect a seventh.
+Every one was found by diffing our bytes against a Windows-written peer.
+They should share one record/attribute builder; until they do, expect a
+ninth.
 
 ---
 
 ## The rig — how to reproduce any of this
 
 ```sh
-# small NTFS volume, wrapped in a hand-built MBR so Windows gives it a letter
-rb-cli new volume ntfs nt.img --size 64M
-rb-cli mkdir nt.img /mydir
-rb-cli put   nt.img f.txt /mydir/inner.txt
-# prepend an MBR: type 0x07, start LBA 2048, size len(vol)/512, 0x55AA at 510
+# small NTFS volume, populated entirely through the CLI
+rb-cli new volume ntfs ntvol.img --size 64M --name RBTEST
+rb-cli put   ntvol.img rootfile.txt /rootfile.txt
+rb-cli mkdir ntvol.img /mydir
+rb-cli put   ntvol.img tool.exe /mydir/tool.exe
+# then prepend an MBR so Windows gives it a letter:
+# type 0x07, start LBA 2048, size = len(vol)/512, 0x55AA at 510
 ```
 
-Boot Win7 with it as a **second** disk so `chkdsk D: /f` can run live (elevated):
+Boot Win7 with it as a **second** disk so `chkdsk D:` can run live:
 
 ```sh
 qemu-system-x86_64 -m 2048 -smp 2 \
@@ -211,47 +189,57 @@ qemu-system-x86_64 -m 2048 -smp 2 \
   -netdev user,id=n0 -device e1000,netdev=n0
 ```
 
-`shot.py` (screendump -> PNG) and `type.py` (sendkey) drive it over the monitor
-socket. `qcow.py` / `qread.py` read qcow2 and parse MFT records on the host with
-no root and no conversion — `qread.attributes()` walks a record, `qread.fixup()`
-applies the update sequence.
+The Win7 image is `~/Win7/8D5CAE93-....qcow2`; **snapshot it first**
+(`qemu-img snapshot -c <tag>`). `shot.py` (screendump -> PNG via PIL) and
+`type.py` (sendkey, with `{win}` `{csenter}` `{alty}` `{esc}` tokens) drive
+it over the monitor socket.
+
+### Free oracles — try these before booting anything
+
+- **`ntfs-3g` tools are installed and need no root**: `ntfsls -R vol.img`,
+  `ntfscat vol.img /path/file | md5sum`, `ntfsinfo`. They caught nothing
+  Windows didn't, but they run in a second and are a real independent parser.
+- **`rb-cli fsck`** on the image. On a fresh volume it must be silent; any
+  output is a regression.
+- A **python MFT dump** on the host (fixups are 3 lines) beats guessing.
+  Parse the record, list attribute types, print `$STANDARD_INFORMATION`'s
+  security id and any `$SECURITY_DESCRIPTOR`. This is how the ACL bug was
+  localised, after the VM only said "Access is denied".
 
 ### Traps that cost real time here
 
-- **Analyse only images Windows has never mounted.** Mounting sets VolumeDirty,
-  self-heals, and *deletes the evidence* — a corrupt 31 MB file was gone before I
-  could dump its record, and a later `chkdsk` then reported a clean volume.
-- **`dir X >nul && echo ok || echo BROKEN` lies.** `dir` exits 1 on an *empty*
-  directory ("File Not Found"). That produced a bogus "directories are
-  untraversable" conclusion. Run `dir` plainly and read the message.
+- **Analyse only images Windows has never mounted.** Mounting sets
+  VolumeDirty, self-heals, and *deletes the evidence*.
+- **`dir X >nul && echo ok || echo BROKEN` lies.** `dir` exits 1 on an
+  *empty* directory ("File Not Found"). Run `dir` plainly and read it.
 - **`copy FILE NUL`** distinguishes "cannot read" from "cannot execute".
 - **Non-elevated writes to `C:\` are virtualised** to
-  `C:\Users\<u>\AppData\Local\VirtualStore\`. A restore that "produced no output"
-  had actually written 210 MB there.
+  `C:\Users\<u>\AppData\Local\VirtualStore\`.
 - **Never `pkill -f` / `pgrep -f` a pattern that appears in your own command
-  line** — it kills the shell (exit 144). This bit three times. Use
+  line** — it kills the shell (exit 144). Use
   `ps -eo pid,comm | awk '$2=="qemu-system-x86"{print $1}'`.
-- **Check the binary you are testing.** Four separate stale-artifact traps this
-  session: `rb-cli-dev` on the G5, the loose `rb-cli.exe` on the VM Desktop, a
-  day-old `target/release/rb-cli`, and a CI zip that predated its own fix.
-  Confirm with `--version` before drawing conclusions.
-- CI zips are **nested** (`.zip` containing a `.zip`); unzipping once and running
-  `objdump` on the missing path yields a silent false negative.
+- **One VM at a time.** A second qemu on the same qcow2 dies with `Failed to
+  get "write" lock`, and — worse — keystrokes meant for it go to whichever
+  VM owns `mon.sock`. Shut the old one down and confirm the process is gone
+  before booting the next.
+- **Never regenerate the test disk while a VM has it open.** The guest is
+  writing to the file you just replaced.
+- **`screendump` is asynchronous**: PIL will read a truncated PPM if you
+  convert immediately. Retry the open until it parses (`shot.py` does).
+- **UAC often lands late** after `{csenter}`, and a duplicate consent prompt
+  can queue up behind it. Screenshot before assuming a command ran.
+- **Check the binary you are testing.** `--version` before drawing
+  conclusions. CI zips are **nested** (`.zip` containing a `.zip`).
 
 ---
 
 ## Other open items (not NTFS)
 
-- **Win7 TUI rendering.** Could not reproduce on `2026-08-02-04-48`: renders and
-  redraws correctly at 80x25 and maximised. Needs a screenshot plus console font
-  and window size from the reporter before it is worth chasing further.
-- **Text encoding audit** — see `docs/RESUME-text-encoding-audit.md`. Two jobs:
+- **Win7 TUI rendering.** Could not reproduce on `2026-08-02-04-48`.
+  Needs a screenshot plus console font and window size from the reporter.
+- **Text encoding audit** — see `docs/RESUME-text-encoding-audit.md`.
   ~325 non-ASCII characters in our own UI/log strings, and per-filesystem
-  filename charsets (114 `from_utf8_lossy` uses under `src/fs/`; Amiga/HPFS/CP-M
-  are wrong).
-- **`rb-cli get` path lookup is case-sensitive on NTFS.** `KernelBase.dll` works,
-  `KERNELBASE.dll` does not. NTFS is case-insensitive; this is a real usability
-  bug and probably a one-line collation change in the lookup.
-- **PowerPC**: ship `rb-cli-ppc-g3.tar.gz` only — measured ~50% *faster* than the
-  G5-targeted build on a G5. `PPC_CPU=750 PPC_TUNE=970` is untried if anyone
-  wants to chase G5 scheduling.
+  filename charsets (114 `from_utf8_lossy` uses under `src/fs/`;
+  Amiga/HPFS/CP-M are wrong).
+- **PowerPC**: ship `rb-cli-ppc-g3.tar.gz` only — measured ~50% *faster*
+  than the G5-targeted build on a G5. `PPC_CPU=750 PPC_TUNE=970` is untried.
