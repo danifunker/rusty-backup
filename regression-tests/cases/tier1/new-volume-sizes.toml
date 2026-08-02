@@ -1,0 +1,137 @@
+# Tier 1 — size sweeps for the self-fixturing builders.
+#
+# The single-size cases in new-volume.toml prove a builder works at its
+# minimum. These prove it keeps working as the volume grows, which is where
+# per-filesystem structural limits (bitmap pages, allocation groups, table
+# growth) actually bite.
+#
+# Every case here is a real finding pinned in place; see COVERAGE.md § R-008.
+
+[meta]
+tier = 1
+group = "fs.new-volume.sizes"
+description = "Builders must scale past their minimum volume size."
+
+# --- Known finding R-008b ----------------------------------------------------
+# `new volume affs` panics (exit 101, no file) once the root block index passes
+# the single 4064-bit bitmap page the formatter writes. 3 MB works; 4 MB and up
+# panic in src/fs/affs.rs. A panic is never an acceptable outcome for ordinary
+# input, and exit 101 is not in the exit-code contract at all.
+
+[[case]]
+id = "fs.new-volume.affs.3m"
+description = "AFFS at 3 MB — the largest size that currently works"
+[[case.step]]
+args = ["new", "volume", "affs", "--size", "3M", "{scratch}/v.img"]
+expect_exit = 0
+files_exist = ["{scratch}/v.img"]
+
+[[case]]
+id = "fs.new-volume.affs.4m"
+description = "R-008b: AFFS at 4 MB panics instead of formatting"
+[[case.step]]
+args = ["new", "volume", "affs", "--size", "4M", "{scratch}/v.img"]
+expect_exit = 0
+files_exist = ["{scratch}/v.img"]
+
+[[case]]
+id = "fs.new-volume.affs.32m"
+description = "R-008b: AFFS at 32 MB panics instead of formatting"
+[[case.step]]
+args = ["new", "volume", "affs", "--size", "32M", "{scratch}/v.img"]
+expect_exit = 0
+files_exist = ["{scratch}/v.img"]
+
+# --- Known finding R-008a ----------------------------------------------------
+# One AFFS bitmap block covers blocks 2..4065. At exactly 4066 blocks
+# (2033 KB) fsck is clean; any larger volume leaves tail blocks uncovered and
+# fsck reports them as allocated-but-unreachable. The pair documents the
+# boundary so a fix can be verified rather than guessed at.
+
+[[case]]
+id = "fs.new-volume.affs.bitmap-boundary-exact"
+description = "AFFS at exactly one bitmap page (4066 blocks) fscks clean"
+[[case.step]]
+args = ["new", "volume", "affs", "--size", "2033K", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+
+[[case]]
+id = "fs.new-volume.affs.bitmap-boundary-plus-one"
+description = "R-008a: AFFS just past one bitmap page leaves 30 blocks uncovered"
+[[case.step]]
+args = ["new", "volume", "affs", "--size", "2M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+
+# --- Known finding R-007 -----------------------------------------------------
+# A freshly formatted NTFS volume fails its own fsck with BitmapLeaked and
+# BackupBootMismatch. Swept across sizes so a partial fix is visible.
+
+[[case]]
+id = "fs.new-volume.ntfs.2m-fsck"
+description = "R-007: fresh 2 MB NTFS should fsck clean"
+[[case.step]]
+args = ["new", "volume", "ntfs", "--size", "2M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+
+[[case]]
+id = "fs.new-volume.ntfs.32m-fsck"
+description = "R-007: fresh 32 MB NTFS should fsck clean"
+[[case.step]]
+args = ["new", "volume", "ntfs", "--size", "32M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+
+# --- Scaling sanity for the builders that do work ----------------------------
+# These should stay green. If one goes red, a structural limit was crossed and
+# it belongs in the findings list alongside AFFS.
+
+[[case]]
+id = "fs.new-volume.fat.32m"
+description = "FAT scales to 32 MB and fscks clean"
+[[case.step]]
+args = ["new", "volume", "fat", "--size", "32M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+
+[[case]]
+id = "fs.new-volume.hfsplus.32m"
+description = "HFS+ scales to 32 MB and fscks clean"
+[[case.step]]
+args = ["new", "volume", "hfsplus", "--size", "32M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+
+[[case]]
+id = "fs.new-volume.ext4.32m"
+description = "ext4 scales to 32 MB and fscks clean"
+[[case.step]]
+args = ["new", "volume", "ext4", "--size", "32M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+
+[[case]]
+id = "fs.new-volume.efs.32m"
+description = "IRIX EFS scales to 32 MB and fscks clean"
+[[case.step]]
+args = ["new", "volume", "efs", "--size", "32M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0

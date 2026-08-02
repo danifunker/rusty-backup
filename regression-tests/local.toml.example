@@ -1,0 +1,35 @@
+# Host-local regression config. Copy to `local.toml` and edit.
+#
+# `local.toml` is gitignored: it carries this machine's fixture root and the
+# address and credentials of hardware on this network. Neither belongs in the
+# repository. See FIXTURES.md and EMULATORS.md.
+
+# Root of the fixture corpus on this host. Overridden by --fixture-root or
+# RB_FIXTURE_ROOT. Cases backed by `repo:` catalogue rows resolve without
+# this, so tiers 0-2 largely work with it unset.
+fixture_root = "//NAS/share/rb-fixtures/fixtures"
+
+# Where run bundles are written. Defaults to regression-tests/runs.
+# report_root = "//NAS/share/rb-fixtures/runs"
+
+# --- Tier 7A: MiSTer over SSH -------------------------------------------------
+#
+# The board needs a key that is actually offered. Note the global
+# `IdentitiesOnly yes` in ~/.ssh/config: with it set, ssh offers *only* keys
+# named explicitly, so a MiSTer key sitting in ~/.ssh is silently not tried
+# and auth fails with "Permission denied (publickey,password,...)" even
+# though the key is right there. Name it here, or add a matching `Host` block
+# with an `IdentityFile` to ~/.ssh/config.
+
+[mister]
+enabled = true
+host = "mister.local"
+user = "root"
+identity_file = "~/.ssh/mister_key"
+games_dir = "/media/fat/games"
+
+# --- Tier 7: hardware ---------------------------------------------------------
+#
+# Physical device cases additionally require --allow-hardware and a device
+# allowlist; see HARDWARE.md. Listing a device here does not enable anything.
+# device_allowlist = "regression-tests/local-devices.toml"

@@ -1,0 +1,191 @@
+# Tier 2 — read and inspect, backed entirely by fixtures already committed to
+# the repository.
+#
+# Every fixture referenced here resolves through a `repo:` row in
+# fixture-map.repo.tsv, so this file runs on a bare clone with **no NAS, no
+# network and no downloads**. That is the whole point: the corpus we have to
+# distribute should be as close to zero as we can make it.
+#
+# Cases live here only for filesystems and containers `rb-cli` cannot build
+# itself. Anything the engine can synthesize belongs in tier 1 instead — see
+# FIXTURES.md § Minimum corpus.
+
+[meta]
+tier = 2
+group = "fs.read"
+description = "Read-side coverage for filesystems with no builder, from repo fixtures."
+
+# --- Filesystems with no `new` builder ---------------------------------------
+
+[[case]]
+id = "fs.read.exfat"
+description = "exFAT — no builder exists, so this must come from a fixture"
+fixture = "fs.exfat.base.hd"
+[[case.step]]
+args = ["inspect", "{fixture}", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+json_exists = ["partitions"]
+
+[[case]]
+id = "fs.read.apfs"
+fixture = "fs.apfs.base.hd"
+[[case.step]]
+args = ["inspect", "{fixture}", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+
+[[case]]
+id = "fs.read.btrfs"
+fixture = "fs.btrfs.base.hd"
+[[case.step]]
+args = ["inspect", "{fixture}", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+
+[[case]]
+id = "fs.read.jfs"
+fixture = "fs.jfs.base.hd"
+[[case.step]]
+args = ["inspect", "{fixture}", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+
+[[case]]
+id = "fs.read.reiserfs"
+fixture = "fs.reiserfs.v3-6.hd"
+[[case.step]]
+args = ["inspect", "{fixture}", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+
+[[case]]
+id = "fs.read.ufs1"
+fixture = "fs.ufs1.base.hd"
+[[case.step]]
+args = ["inspect", "{fixture}", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+
+[[case]]
+id = "fs.read.ufs2"
+fixture = "fs.ufs2.base.hd"
+[[case.step]]
+args = ["inspect", "{fixture}", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+
+[[case]]
+id = "fs.read.xfs-v4"
+fixture = "fs.xfs.v4.hd"
+[[case.step]]
+args = ["inspect", "{fixture}", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+
+[[case]]
+id = "fs.read.xfs-v5"
+fixture = "fs.xfs.v5.hd"
+[[case.step]]
+args = ["inspect", "{fixture}", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+
+# --- Vintage filesystems with no builder -------------------------------------
+
+[[case]]
+id = "fs.read.cbm-1541"
+fixture = "fs.cbm.1541.floppy"
+[[case.step]]
+args = ["inspect", "{fixture}", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+
+[[case]]
+id = "fs.read.cbm-1571-gcr"
+description = "GCR container, not the sector-image form"
+fixture = "fs.cbm.1571-gcr.floppy"
+[[case.step]]
+args = ["inspect", "{fixture}", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+
+[[case]]
+id = "fs.read.rsdos"
+fixture = "fs.rsdos.base.floppy"
+[[case.step]]
+args = ["inspect", "{fixture}", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+
+[[case]]
+id = "fs.read.dragondos"
+fixture = "fs.dragondos.base.floppy"
+[[case.step]]
+args = ["inspect", "{fixture}", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+
+[[case]]
+id = "fs.read.acorn-dfs"
+fixture = "fs.dfs.base.floppy"
+[[case.step]]
+args = ["inspect", "{fixture}", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+
+[[case]]
+id = "fs.read.cpc-amsdos"
+description = "real-world EDSK from TOSEC — the messy-container case"
+fixture = "fs.cpc.amsdos.floppy"
+# CP/M has no on-disk signature, so the DPB must be named explicitly. Note
+# `inspect` exposes no --fs-type (see COVERAGE.md R-010), so the read path for
+# signature-less filesystems goes through `ls` / `fsck` instead.
+[[case.step]]
+args = ["ls", "{fixture}", "--fs-type", "cpm:amstrad_data"]
+expect_exit = 0
+stdout_contains = ["MANIC.BAS", "MANIC.BIN"]
+
+# --- Containers with no writer -----------------------------------------------
+
+[[case]]
+id = "fmt.read.gho-uncompressed"
+fixture = "fmt.gho.uncompressed.hd"
+[[case.step]]
+args = ["inspect", "{fixture}", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+
+[[case]]
+id = "fmt.read.msa"
+description = "Atari MSA container"
+fixture = "fmt.msa.base.floppy"
+[[case.step]]
+args = ["inspect", "{fixture}", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+
+# --- Partition schemes -------------------------------------------------------
+
+[[case]]
+id = "part.read.ahdi"
+description = "Atari AHDI — one of the two schemes missing from the README table (R-001)"
+fixture = "part.ahdi.base.multipart"
+# NB: `show partmap` is APM-only by design (docs/cli-reference.md), so the
+# per-scheme partition-table assertion goes through `inspect`, not partmap.
+[[case.step]]
+args = ["inspect", "{fixture}", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+stdout_contains = ["AHDI"]
+
+[[case]]
+id = "part.read.ahdi.both-partitions"
+description = "AHDI GEM (FAT12) and BGM (FAT16) partitions are both walkable"
+fixture = "part.ahdi.base.multipart"
+[[case.step]]
+args = ["ls", "{fixture}@1", "/"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{fixture}@2", "/"]
+expect_exit = 0

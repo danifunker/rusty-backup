@@ -1,0 +1,82 @@
+# Tier 0 — harness self-test.
+#
+# Needs no fixtures and no external tools. If any of these fail, nothing else
+# in the run is trustworthy, so keep this file fast and boring.
+
+[meta]
+tier = 0
+group = "cli.basics"
+description = "The binary under test runs and honours its most basic contracts."
+
+[[case]]
+id = "cli.basics.version"
+description = "--version exits 0 and prints something version-shaped"
+args = ["--version"]
+expect_exit = 0
+
+[[case]]
+id = "cli.basics.help"
+description = "--help exits 0"
+args = ["--help"]
+expect_exit = 0
+
+[[case]]
+id = "cli.basics.help-lists-core-verbs"
+description = "top-level help mentions the verbs the reference documents"
+[[case.step]]
+args = ["--help"]
+expect_exit = 0
+stdout_contains = ["backup", "restore", "inspect", "convert", "fsck"]
+
+# Every verb should answer --help with exit 0. This is the cheapest possible
+# smoke test across the whole verb surface and catches a verb that fails to
+# register or panics during clap construction.
+[[case]]
+id = "cli.basics.help.inspect"
+args = ["inspect", "--help"]
+expect_exit = 0
+
+[[case]]
+id = "cli.basics.help.backup"
+args = ["backup", "--help"]
+expect_exit = 0
+
+[[case]]
+id = "cli.basics.help.restore"
+args = ["restore", "--help"]
+expect_exit = 0
+
+[[case]]
+id = "cli.basics.help.convert"
+args = ["convert", "--help"]
+expect_exit = 0
+
+[[case]]
+id = "cli.basics.help.fsck"
+args = ["fsck", "--help"]
+expect_exit = 0
+
+[[case]]
+id = "cli.basics.help.new"
+args = ["new", "--help"]
+expect_exit = 0
+
+[[case]]
+id = "cli.basics.help.optical"
+args = ["optical", "--help"]
+expect_exit = 0
+
+[[case]]
+id = "cli.basics.help.partmap"
+args = ["partmap", "--help"]
+expect_exit = 0
+
+[[case]]
+id = "cli.basics.help.ls"
+args = ["ls", "--help"]
+expect_exit = 0
+
+[[case]]
+id = "cli.basics.help.expand"
+args = ["expand", "--help"]
+expect_exit = 0

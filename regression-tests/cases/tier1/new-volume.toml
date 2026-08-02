@@ -1,0 +1,248 @@
+# Tier 1 — self-fixturing.
+#
+# `rb-cli new volume` builds its own input, so this whole file runs on a bare
+# machine with an empty fixture corpus. Every filesystem that gains a builder
+# here retires a fixture we would otherwise have to host and copy around, so
+# this is the highest-leverage tier in the suite (see README.md § Tier model).
+#
+# The shape is the same for each filesystem:
+#   1. format a minimal volume
+#   2. inspect it and assert the engine recognises what it just wrote
+#   3. fsck --checkonly must come back clean on a freshly formatted volume
+#
+# Step 3 is the one that earns its keep: a formatter that emits a subtly
+# invalid volume is exactly the class of bug that survives unit tests.
+#
+# Sizes were probed empirically on 2026-08-01: every filesystem here formats
+# at 2 MB except ext3/ext4, which need 8 MB. Minimum sizes are deliberate —
+# the corpus has to be copyable to a laptop and eventually a PowerPC machine.
+
+[meta]
+tier = 1
+group = "fs.new-volume"
+description = "Format a minimal volume per filesystem, then inspect and fsck it."
+
+# --- Mac ---------------------------------------------------------------------
+
+[[case]]
+id = "fs.new-volume.hfs"
+description = "classic HFS superfloppy formats, inspects and fscks clean"
+[[case.step]]
+args = ["new", "volume", "hfs", "--size", "2M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/v.img", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+json_exists = ["partitions.0.type_name"]
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+
+[[case]]
+id = "fs.new-volume.hfsplus"
+description = "HFS+ superfloppy formats, inspects and fscks clean"
+[[case.step]]
+args = ["new", "volume", "hfsplus", "--size", "2M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/v.img", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+
+[[case]]
+id = "fs.new-volume.hfv"
+description = "BasiliskII HFV (flat classic HFS, 2047 MB ceiling)"
+[[case.step]]
+args = ["new", "volume", "hfv", "--size", "2M", "{scratch}/v.hfv"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/v.hfv", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+[[case.step]]
+args = ["fsck", "{scratch}/v.hfv", "--checkonly"]
+expect_exit = 0
+
+# --- PC ----------------------------------------------------------------------
+
+[[case]]
+id = "fs.new-volume.fat"
+description = "FAT superfloppy (size-selected FAT12/16/32)"
+[[case.step]]
+args = ["new", "volume", "fat", "--size", "2M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/v.img", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+[[case.step.json_equals]]
+path = "partitions.0.type_name"
+value = "FAT"
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+
+[[case]]
+id = "fs.new-volume.ntfs"
+description = "NTFS superfloppy"
+[[case.step]]
+args = ["new", "volume", "ntfs", "--size", "2M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/v.img", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+
+[[case]]
+id = "fs.new-volume.hpfs"
+description = "HPFS (OS/2) superfloppy"
+[[case.step]]
+args = ["new", "volume", "hpfs", "--size", "2M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/v.img", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+
+# --- Linux -------------------------------------------------------------------
+
+[[case]]
+id = "fs.new-volume.ext2"
+description = "ext2, plain rev-1, no journal or checksums"
+[[case.step]]
+args = ["new", "volume", "ext", "--size", "2M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/v.img", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+
+[[case]]
+id = "fs.new-volume.ext3"
+description = "ext3 — ext2 plus an empty jbd2 journal (needs 8 MB)"
+[[case.step]]
+args = ["new", "volume", "ext3", "--size", "8M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/v.img", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+
+[[case]]
+id = "fs.new-volume.ext4"
+description = "ext4 — extents + metadata_csum (crc32c) + jbd2 journal (needs 8 MB)"
+[[case.step]]
+args = ["new", "volume", "ext4", "--size", "8M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/v.img", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+
+[[case]]
+id = "fs.new-volume.minix2"
+description = "Minix V2 — 32-bit zone pointers"
+[[case.step]]
+args = ["new", "volume", "minix2", "--size", "2M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/v.img", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+
+[[case]]
+id = "fs.new-volume.minix3"
+description = "Minix V3 — 60-char names"
+[[case.step]]
+args = ["new", "volume", "minix3", "--size", "2M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/v.img", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+
+# --- Vintage -----------------------------------------------------------------
+
+[[case]]
+id = "fs.new-volume.affs"
+description = "Amiga FFS/OFS"
+[[case.step]]
+args = ["new", "volume", "affs", "--size", "2M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/v.img", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+
+[[case]]
+id = "fs.new-volume.efs"
+description = "IRIX EFS, single cylinder group"
+[[case.step]]
+args = ["new", "volume", "efs", "--size", "2M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/v.img", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+
+# --- Known finding R-006 -----------------------------------------------------
+# The default volume name is `rusty-backup`, which ProDOS rejects because of
+# the hyphen, so `new volume prodos` always fails on defaults. Both cases are
+# kept: the first asserts the default *should* work, the second proves the
+# builder itself is sound when given a legal name. When R-006 is fixed the
+# first case goes green on its own.
+
+[[case]]
+id = "fs.new-volume.prodos-default-name"
+description = "R-006: prodos should format with the default volume name"
+[[case.step]]
+args = ["new", "volume", "prodos", "--size", "2M", "{scratch}/v.img"]
+expect_exit = 0
+
+[[case]]
+id = "fs.new-volume.prodos-legal-name"
+description = "prodos formats, inspects and fscks clean given a ProDOS-legal name"
+[[case.step]]
+args = ["new", "volume", "prodos", "--size", "2M", "--name", "TESTVOL", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/v.img", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+[[case.step.json_equals]]
+path = "partitions.0.type_name"
+value = "ProDOS"
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
