@@ -169,6 +169,13 @@ pub trait Filesystem: Send {
         false
     }
 
+    /// Whether name lookup should fall back to case-insensitive matching, the
+    /// way the native OS resolves paths on this filesystem (NTFS today).
+    /// An exact-case match always wins first.
+    fn case_insensitive_lookup(&self) -> bool {
+        false
+    }
+
     /// Whether this filesystem stores POSIX extended attributes (`user.*`,
     /// `security.*`, …). True on ext / XFS / SquashFS; false on filesystems with
     /// no xattr concept (Minix, EFS, FAT, HFS). The UI uses this to show or hide

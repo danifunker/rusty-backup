@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::IntIsMultipleOf as _;
 use anyhow::{bail, Result};
 
 use super::entry::{EntryType, FileEntry};
@@ -58,6 +60,7 @@ pub(crate) struct NtfsVbr {
     pub(crate) mft_cluster: u64,
     pub(crate) mft_mirror_cluster: u64,
     pub(crate) mft_record_size: u32,
+    pub(crate) index_record_size: u32,
 }
 
 pub(crate) fn parse_vbr(vbr: &[u8; 512]) -> Result<NtfsVbr, FilesystemError> {
@@ -102,6 +105,14 @@ pub(crate) fn parse_vbr(vbr: &[u8; 512]) -> Result<NtfsVbr, FilesystemError> {
         clusters_per_mft_raw as u32 * sectors_per_cluster as u32 * bytes_per_sector as u32
     };
 
+    // Clusters per index record at 0x44: same signed encoding as 0x40.
+    let clusters_per_index_raw = vbr[0x44] as i8;
+    let index_record_size = if clusters_per_index_raw < 0 {
+        1u32 << ((-clusters_per_index_raw) as u32)
+    } else {
+        clusters_per_index_raw as u32 * sectors_per_cluster as u32 * bytes_per_sector as u32
+    };
+
     Ok(NtfsVbr {
         bytes_per_sector,
         sectors_per_cluster,
@@ -109,6 +120,11 @@ pub(crate) fn parse_vbr(vbr: &[u8; 512]) -> Result<NtfsVbr, FilesystemError> {
         mft_cluster,
         mft_mirror_cluster,
         mft_record_size,
+        index_record_size: if index_record_size == 0 || !index_record_size.is_power_of_two() {
+            4096
+        } else {
+            index_record_size
+        },
     })
 }
 
@@ -396,6 +412,7 @@ pub struct NtfsFilesystem<R> {
     #[allow(dead_code)]
     mft_mirror_cluster: u64,
     mft_record_size: u32,
+    index_record_size: u32,
     cluster_size: u64,
     label: Option<String>,
     ntfs_version: (u8, u8),
@@ -429,6 +446,7 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
             mft_cluster: vbr.mft_cluster,
             mft_mirror_cluster: vbr.mft_mirror_cluster,
             mft_record_size: vbr.mft_record_size,
+            index_record_size: vbr.index_record_size,
             cluster_size,
             label: None,
             ntfs_version: (0, 0),
@@ -874,9 +892,17 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
 
         let mut entries = Vec::new();
 
-        // Parse $INDEX_ROOT (always resident)
+        // Parse $INDEX_ROOT (always resident); its header declares the volume's
+        // index block size, which the $INDEX_ALLOCATION walk below must honour.
+        let mut block_size = self.index_record_size;
         for attr in &attrs {
             if attr.attr_type == ATTR_INDEX_ROOT && attr.resident {
+                if let Some(raw) = attr.value.get(8..12) {
+                    let bs = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+                    if bs != 0 && bs.is_power_of_two() && bs <= 2 * 1024 * 1024 {
+                        block_size = bs;
+                    }
+                }
                 self.parse_index_root_entries(&attr.value, parent_path, &mut entries)?;
             }
         }
@@ -893,7 +919,13 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
 
         for attr in &attrs {
             if attr.attr_type == ATTR_INDEX_ALLOCATION && !attr.resident {
-                self.parse_index_allocation_entries(attr, &bitmap_data, parent_path, &mut entries)?;
+                self.parse_index_allocation_entries(
+                    attr,
+                    &bitmap_data,
+                    block_size,
+                    parent_path,
+                    &mut entries,
+                )?;
             }
         }
 
@@ -964,11 +996,11 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
         &mut self,
         attr: &MftAttribute,
         bitmap: &[u8],
+        block_size: u32,
         parent_path: &str,
         entries: &mut Vec<FileEntry>,
     ) -> Result<(), FilesystemError> {
-        let record_size: u64 = 4096;
-        let clusters_per_record = record_size.div_ceil(self.cluster_size);
+        let record_size = block_size.max(512) as u64;
         let total_records = if attr.real_size > 0 {
             attr.real_size / record_size
         } else {
@@ -986,15 +1018,37 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
                 }
             }
 
-            let vcn = i * clusters_per_record;
-            let disk_offset = match self.resolve_vcn_to_offset(&runs, vcn) {
-                Some(off) => off,
-                None => continue,
-            };
-
-            self.reader.seek(SeekFrom::Start(disk_offset))?;
+            // Blocks are dense in the stream: block i starts at byte i * size.
+            // Gather cluster-by-cluster so a block spanning a run boundary
+            // still reads correctly.
+            let stream_off = i * record_size;
             let mut record_buf = vec![0u8; record_size as usize];
-            if self.reader.read_exact(&mut record_buf).is_err() {
+            let mut got = 0u64;
+            let mut ok = true;
+            while got < record_size {
+                let off = stream_off + got;
+                let intra = off % self.cluster_size;
+                let chunk = (self.cluster_size - intra).min(record_size - got);
+                match self.resolve_vcn_to_offset(&runs, off / self.cluster_size) {
+                    Some(disk) => {
+                        self.reader.seek(SeekFrom::Start(disk + intra))?;
+                        if self
+                            .reader
+                            .read_exact(&mut record_buf[got as usize..(got + chunk) as usize])
+                            .is_err()
+                        {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+                got += chunk;
+            }
+            if !ok {
                 continue;
             }
 
@@ -1418,6 +1472,10 @@ impl<R: Read + Seek + Send> Filesystem for NtfsFilesystem<R> {
         self.label.as_deref()
     }
 
+    fn case_insensitive_lookup(&self) -> bool {
+        true
+    }
+
     fn fs_type(&self) -> &str {
         &self.fs_type_string
     }
@@ -1740,35 +1798,71 @@ fn build_default_security_descriptor() -> Vec<u8> {
     sd
 }
 
-/// Build an empty $INDEX_ROOT attribute value for a new directory.
-fn build_empty_index_root() -> Vec<u8> {
-    // Index root header (16 bytes):
-    // attr_type=0x30 ($FILE_NAME), collation=0x01 (filename),
-    // index_alloc_size=4096, clusters_per_index=1
-    // Then index node header + end sentinel
-    let end_entry_size = 16u32; // minimal end entry
-    let entries_total = 0x10 + end_entry_size; // node header (16) + entries
+/// Sub-node pointer flag on an index entry (trailing 8-byte VCN present).
+const INDEX_ENTRY_NODE: u32 = 0x01;
+/// Index node header flag: this node has children (a "large" index).
+const INDEX_NODE_HAS_CHILDREN: u8 = 0x01;
+
+/// The `clusters_per_index_block` byte for an `$INDEX_ROOT` header; a sector
+/// count when the block is smaller than a cluster (same rule as the formatter).
+fn idx_clusters_per_block_byte(index_block_size: u32, cluster_size: u64, sector_size: u64) -> u8 {
+    if index_block_size as u64 >= cluster_size {
+        (index_block_size as u64 / cluster_size) as u8
+    } else {
+        (index_block_size as u64 / sector_size.max(512)) as u8
+    }
+}
+
+/// VCN units spanned by one index block: clusters normally, 512-byte blocks
+/// when the cluster is larger than the index block (ntfs-3g's vcn_size rule).
+fn idx_vcn_units_per_block(index_block_size: u32, cluster_size: u64) -> u64 {
+    if cluster_size <= index_block_size as u64 {
+        index_block_size as u64 / cluster_size
+    } else {
+        index_block_size as u64 / 512
+    }
+}
+
+/// Byte offset of a sub-node VCN within the $INDEX_ALLOCATION stream.
+fn idx_vcn_to_stream_offset(vcn: u64, index_block_size: u32, cluster_size: u64) -> u64 {
+    if cluster_size <= index_block_size as u64 {
+        vcn * cluster_size
+    } else {
+        vcn * 512
+    }
+}
+
+/// $INDEX_ROOT value: 16-byte root header + node header + a lone end sentinel.
+/// `large` selects the has-children form whose end entry carries sub-node VCN 0.
+fn build_empty_index_root(
+    index_block_size: u32,
+    cluster_size: u64,
+    sector_size: u64,
+    large: bool,
+) -> Vec<u8> {
+    let end_entry_size: u32 = if large { 24 } else { 16 };
+    let entries_total = 0x10 + end_entry_size;
 
     let mut data = vec![0u8; 16 + entries_total as usize];
-    // Index root header
     data[0..4].copy_from_slice(&ATTR_FILE_NAME.to_le_bytes()); // indexed attr type
     data[4..8].copy_from_slice(&1u32.to_le_bytes()); // collation rule
-    data[8..12].copy_from_slice(&4096u32.to_le_bytes()); // index alloc size
-    data[12] = 1; // clusters per index record
+    data[8..12].copy_from_slice(&index_block_size.to_le_bytes());
+    data[12] = idx_clusters_per_block_byte(index_block_size, cluster_size, sector_size);
 
     // Index node header (at offset 16)
     let node = 16;
     data[node..node + 4].copy_from_slice(&0x10u32.to_le_bytes()); // entries offset
-    data[node + 4..node + 8].copy_from_slice(&(0x10 + end_entry_size).to_le_bytes()); // total size of entries
-    data[node + 8..node + 12].copy_from_slice(&(0x10 + end_entry_size).to_le_bytes()); // allocated size
-                                                                                       // flags = 0 (small index, no children)
+    data[node + 4..node + 8].copy_from_slice(&entries_total.to_le_bytes()); // index_used
+    data[node + 8..node + 12].copy_from_slice(&entries_total.to_le_bytes()); // index_allocated
+    if large {
+        data[node + 12] = INDEX_NODE_HAS_CHILDREN;
+    }
 
-    // End sentinel entry (at node + 0x10)
+    // End sentinel entry (at node + 0x10); sub-node VCN 0 trails it when large.
     let entry = node + 0x10;
-    // MFT ref = 0 (bytes 0-7 already zero)
-    data[entry + 8..entry + 10].copy_from_slice(&16u16.to_le_bytes()); // entry length
-                                                                       // content length = 0
-    data[entry + 12..entry + 16].copy_from_slice(&INDEX_ENTRY_END.to_le_bytes()); // flags
+    data[entry + 8..entry + 10].copy_from_slice(&(end_entry_size as u16).to_le_bytes());
+    let flags = INDEX_ENTRY_END | if large { INDEX_ENTRY_NODE } else { 0 };
+    data[entry + 12..entry + 16].copy_from_slice(&flags.to_le_bytes());
 
     data
 }
@@ -1799,6 +1893,10 @@ fn build_named_resident_attr(attr_type: u32, name: &str, data: &[u8]) -> Vec<u8>
     }
     attr[0x10..0x14].copy_from_slice(&(data.len() as u32).to_le_bytes()); // value length
     attr[0x14..0x16].copy_from_slice(&(value_offset as u16).to_le_bytes());
+    // Windows flags every $FILE_NAME as indexed (it lives in the parent's $I30 too).
+    if attr_type == ATTR_FILE_NAME {
+        attr[0x16] = 1;
+    }
     attr[value_offset..value_offset + data.len()].copy_from_slice(data);
     attr
 }
@@ -1906,6 +2004,7 @@ fn assemble_mft_record(
     flags: u16,
     record_size: u32,
     record_num: u64,
+    seq: u16,
 ) -> Vec<u8> {
     let mut record = vec![0u8; record_size as usize];
 
@@ -1917,8 +2016,7 @@ fn assemble_mft_record(
     let fixup_count = (record_size / NTFS_BLOCK_SIZE as u32 + 1) as u16;
     record[0x06..0x08].copy_from_slice(&fixup_count.to_le_bytes());
     // Log file sequence = 0 (offset 0x08..0x10)
-    // Sequence number = 1 (offset 0x10..0x12)
-    record[0x10..0x12].copy_from_slice(&1u16.to_le_bytes());
+    record[0x10..0x12].copy_from_slice(&seq.max(1).to_le_bytes());
     // Hard link count = 1 (offset 0x12..0x14)
     record[0x12..0x14].copy_from_slice(&1u16.to_le_bytes());
     // First attribute offset = 0x38 (after fixup array)
@@ -2149,7 +2247,9 @@ impl<R: Read + Write + Seek> NtfsFilesystem<R> {
     }
 
     /// Allocate an MFT record. Returns the record number.
-    fn allocate_mft_record(&mut self) -> Result<u64, FilesystemError> {
+    /// Allocate an MFT record; returns (record number, sequence number).
+    /// A reused record keeps its bumped sequence so stale references stay stale.
+    fn allocate_mft_record(&mut self) -> Result<(u64, u16), FilesystemError> {
         let mut bitmap = self.read_mft_bitmap()?;
 
         // Find first free bit starting from record 24 (skip system metafiles)
@@ -2163,6 +2263,14 @@ impl<R: Read + Write + Seek> NtfsFilesystem<R> {
                         bitmap[byte_idx] |= 1 << bit;
                         self.write_mft_bitmap(&bitmap)?;
 
+                        let seq = self
+                            .read_mft_record(record_num)
+                            .ok()
+                            .filter(|r| &r[0..4] == b"FILE")
+                            .map(|r| u16::from_le_bytes([r[0x10], r[0x11]]))
+                            .filter(|&s| s != 0)
+                            .unwrap_or(1);
+
                         // Initialize blank MFT record
                         let mut blank = vec![0u8; self.mft_record_size as usize];
                         blank[0..4].copy_from_slice(b"FILE");
@@ -2170,7 +2278,7 @@ impl<R: Read + Write + Seek> NtfsFilesystem<R> {
                         let fixup_count =
                             (self.mft_record_size / NTFS_BLOCK_SIZE as u32 + 1) as u16;
                         blank[0x06..0x08].copy_from_slice(&fixup_count.to_le_bytes());
-                        blank[0x10..0x12].copy_from_slice(&1u16.to_le_bytes()); // seq = 1
+                        blank[0x10..0x12].copy_from_slice(&seq.to_le_bytes());
                         let first_attr = (0x30 + fixup_count as usize * 2 + 7) & !7;
                         blank[0x14..0x16].copy_from_slice(&(first_attr as u16).to_le_bytes());
                         blank[0x18..0x1C].copy_from_slice(&((first_attr + 4) as u32).to_le_bytes()); // used size
@@ -2179,7 +2287,7 @@ impl<R: Read + Write + Seek> NtfsFilesystem<R> {
                         blank[first_attr..first_attr + 4].copy_from_slice(&ATTR_END.to_le_bytes());
 
                         self.write_mft_record(record_num, &mut blank)?;
-                        return Ok(record_num);
+                        return Ok((record_num, seq));
                     }
                 }
             }
@@ -2200,13 +2308,17 @@ impl<R: Read + Write + Seek> NtfsFilesystem<R> {
             self.write_mft_bitmap(&bitmap)?;
         }
 
-        // Mark record as not-in-use
+        // Mark record as not-in-use; bump the sequence so old references go stale.
         let mut record = self
             .read_mft_record(record_number)
             .unwrap_or_else(|_| vec![0u8; self.mft_record_size as usize]);
         if &record[0..4] == b"FILE" {
             record[0x16] = 0;
             record[0x17] = 0;
+            let seq = u16::from_le_bytes([record[0x10], record[0x11]])
+                .wrapping_add(1)
+                .max(1);
+            record[0x10..0x12].copy_from_slice(&seq.to_le_bytes());
             self.write_mft_record(record_number, &mut record)?;
         }
 
@@ -2390,226 +2502,464 @@ impl<R: Read + Write + Seek> NtfsFilesystem<R> {
         let mut record = self.read_mft_record(parent_record_num)?;
         let record_size = self.mft_record_size;
 
-        // Try inserting into $INDEX_ROOT first
-        if self.try_insert_into_index_root(&mut record, entry_bytes, record_size)? {
-            self.write_mft_record(parent_record_num, &mut record)?;
-            return Ok(());
-        }
+        let root = parse_root_node(&record, self.index_record_size).ok_or_else(|| {
+            FilesystemError::Parse("directory record has no resident $INDEX_ROOT".into())
+        })?;
 
-        // Try inserting into existing $INDEX_ALLOCATION INDX nodes
-        let attrs = parse_mft_attributes(&record, record_size);
-        for attr in &attrs {
-            if attr.attr_type == ATTR_INDEX_ALLOCATION && !attr.resident {
-                let mut alloc_data = self.read_attribute_data(attr, None)?;
-                if self.try_insert_into_index_allocation(&mut alloc_data, entry_bytes)? {
-                    self.write_data_to_runs(&attr.data_runs, &alloc_data)?;
-                    return Ok(());
-                }
+        if !root.large {
+            if self.try_splice_into_root(&mut record, entry_bytes, record_size)? {
+                self.write_mft_record(parent_record_num, &mut record)?;
+                return Ok(());
             }
+            // Small root is full: move its entries out into a fresh INDX block.
+            self.promote_index_root(&mut record)?;
         }
-
-        Err(FilesystemError::DiskFull(
-            "directory index full, no room in existing nodes".into(),
-        ))
+        self.insert_into_large_index(parent_record_num, &mut record, entry_bytes)
     }
 
-    /// Try to insert an index entry into $INDEX_ROOT. Returns true if successful.
-    fn try_insert_into_index_root(
+    /// Splice an entry into the resident $INDEX_ROOT node at its sorted
+    /// position (leaf entries and pushed-up separators alike). False = no room.
+    fn try_splice_into_root(
         &self,
         record: &mut [u8],
         entry_bytes: &[u8],
         record_size: u32,
     ) -> Result<bool, FilesystemError> {
-        // Find $INDEX_ROOT attribute in the record
-        let attr_offset = u16::from_le_bytes([record[0x14], record[0x15]]) as usize;
-        let mut pos = attr_offset;
-
-        while pos + 16 <= record.len() {
-            let attr_type = u32::from_le_bytes([
-                record[pos],
-                record[pos + 1],
-                record[pos + 2],
-                record[pos + 3],
-            ]);
-            if attr_type == ATTR_END || attr_type == 0 {
-                break;
-            }
-            let attr_len = u32::from_le_bytes([
-                record[pos + 4],
-                record[pos + 5],
-                record[pos + 6],
-                record[pos + 7],
-            ]) as usize;
-            if attr_len < 16 || pos + attr_len > record.len() {
-                break;
-            }
-
-            if attr_type == ATTR_INDEX_ROOT && record[pos + 8] == 0 {
-                // Found resident $INDEX_ROOT
-                let value_offset =
-                    u16::from_le_bytes([record[pos + 0x14], record[pos + 0x15]]) as usize;
-                let value_length = u32::from_le_bytes([
-                    record[pos + 0x10],
-                    record[pos + 0x11],
-                    record[pos + 0x12],
-                    record[pos + 0x13],
-                ]) as usize;
-
-                let ir_start = pos + value_offset; // start of INDEX_ROOT value
-                if ir_start + 32 > record.len() || value_length < 32 {
-                    return Ok(false);
-                }
-
-                // Index node header is at ir_start + 16
-                let node_start = ir_start + 16;
-                // If this $INDEX_ROOT is a B-tree ROOT (flags bit 0 = "node has
-                // children" — entries carry trailing child VCNs into
-                // $INDEX_ALLOCATION), a new leaf entry must NOT be spliced in
-                // here; that mangles the internal node and breaks name lookups
-                // (e.g. ntfs-3g resolving $Secure through the root index).
-                // Defer to the leaf INDX block instead.
-                let node_flags = record[node_start + 0x0C];
-                if node_flags & 0x01 != 0 {
-                    return Ok(false);
-                }
-                let entries_offset = u32::from_le_bytes([
-                    record[node_start],
-                    record[node_start + 1],
-                    record[node_start + 2],
-                    record[node_start + 3],
-                ]) as usize;
-                let entries_size = u32::from_le_bytes([
-                    record[node_start + 4],
-                    record[node_start + 5],
-                    record[node_start + 6],
-                    record[node_start + 7],
-                ]) as usize;
-
-                let entries_start = node_start + entries_offset;
-                let entries_end = node_start + entries_size;
-
-                // Find insertion point (sorted by name, before end sentinel)
-                let insert_pos = self
-                    .find_index_insert_position(&record[entries_start..entries_end], entry_bytes);
-                let abs_insert = entries_start + insert_pos;
-
-                // Check if there's room in the MFT record
-                let used_size =
-                    u32::from_le_bytes([record[0x18], record[0x19], record[0x1A], record[0x1B]])
-                        as usize;
-                if used_size + entry_bytes.len() > record_size as usize {
-                    return Ok(false);
-                }
-
-                // Make room: shift everything after insert point
-                let shift_end = used_size; // end of used record data
-                record.copy_within(abs_insert..shift_end, abs_insert + entry_bytes.len());
-
-                // Insert the entry
-                record[abs_insert..abs_insert + entry_bytes.len()].copy_from_slice(entry_bytes);
-
-                // Update entries_size in node header
-                let new_entries_size = entries_size + entry_bytes.len();
-                record[node_start + 4..node_start + 8]
-                    .copy_from_slice(&(new_entries_size as u32).to_le_bytes());
-                // Update allocated_entries_size too
-                record[node_start + 8..node_start + 12]
-                    .copy_from_slice(&(new_entries_size as u32).to_le_bytes());
-
-                // Update INDEX_ROOT value length
-                let new_value_length = value_length + entry_bytes.len();
-                record[pos + 0x10..pos + 0x14]
-                    .copy_from_slice(&(new_value_length as u32).to_le_bytes());
-
-                // Update INDEX_ROOT attribute length
-                let new_attr_len = attr_len + entry_bytes.len();
-                record[pos + 4..pos + 8].copy_from_slice(&(new_attr_len as u32).to_le_bytes());
-
-                // Update record used_size
-                let new_used = used_size + entry_bytes.len();
-                record[0x18..0x1C].copy_from_slice(&(new_used as u32).to_le_bytes());
-
-                return Ok(true);
-            }
-
-            pos += attr_len;
+        let Some(root) = parse_root_node(record, self.index_record_size) else {
+            return Ok(false);
+        };
+        let used_size = record_used_size(record);
+        if used_size + entry_bytes.len() > record_size as usize {
+            return Ok(false);
         }
 
-        Ok(false)
+        let insert_pos = self
+            .find_index_insert_position(&record[root.entries_start..root.entries_end], entry_bytes);
+        let abs_insert = root.entries_start + insert_pos;
+
+        record.copy_within(abs_insert..used_size, abs_insert + entry_bytes.len());
+        record[abs_insert..abs_insert + entry_bytes.len()].copy_from_slice(entry_bytes);
+
+        let grow = entry_bytes.len();
+        let node_start = root.node_start;
+        let new_node_used = (root.entries_end - node_start + grow) as u32;
+        record[node_start + 4..node_start + 8].copy_from_slice(&new_node_used.to_le_bytes());
+        // Resident node: allocated tracks used.
+        record[node_start + 8..node_start + 12].copy_from_slice(&new_node_used.to_le_bytes());
+        record[root.attr_pos + 0x10..root.attr_pos + 0x14]
+            .copy_from_slice(&((root.value_len + grow) as u32).to_le_bytes());
+        record[root.attr_pos + 4..root.attr_pos + 8]
+            .copy_from_slice(&((root.attr_len + grow) as u32).to_le_bytes());
+        set_record_used_size(record, used_size + grow);
+        Ok(true)
     }
 
-    /// Try to insert an index entry into an existing INDX node in $INDEX_ALLOCATION.
-    fn try_insert_into_index_allocation(
+    /// Remove `len` bytes at `abs_off` from the resident $INDEX_ROOT node,
+    /// shrinking the attribute and shifting the record tail.
+    fn splice_out_of_root(&self, record: &mut [u8], abs_off: usize, len: usize) {
+        let Some(root) = parse_root_node(record, self.index_record_size) else {
+            return;
+        };
+        let used_size = record_used_size(record);
+        record.copy_within(abs_off + len..used_size, abs_off);
+        record[used_size - len..used_size].fill(0);
+
+        let node_start = root.node_start;
+        let new_node_used = (root.entries_end - node_start - len) as u32;
+        record[node_start + 4..node_start + 8].copy_from_slice(&new_node_used.to_le_bytes());
+        record[node_start + 8..node_start + 12].copy_from_slice(&new_node_used.to_le_bytes());
+        record[root.attr_pos + 0x10..root.attr_pos + 0x14]
+            .copy_from_slice(&((root.value_len - len) as u32).to_le_bytes());
+        record[root.attr_pos + 4..root.attr_pos + 8]
+            .copy_from_slice(&((root.attr_len - len) as u32).to_le_bytes());
+        set_record_used_size(record, used_size - len);
+    }
+
+    /// Convert a fresh cluster allocation to the DataRun form used by
+    /// write_data_to_runs.
+    fn runs_to_data_runs(runs: &[(u64, u64)]) -> Vec<DataRun> {
+        runs.iter()
+            .map(|&(start, len)| DataRun {
+                cluster_offset: start as i64,
+                length: len,
+            })
+            .collect()
+    }
+
+    /// Turn a full small $INDEX_ROOT into a large one: the resident entries
+    /// move into a newly allocated INDX block 0, and the record gains
+    /// $INDEX_ALLOCATION + $BITMAP attributes (both named $I30).
+    fn promote_index_root(&mut self, record: &mut [u8]) -> Result<(), FilesystemError> {
+        let root = parse_root_node(record, self.index_record_size).ok_or_else(|| {
+            FilesystemError::Parse("directory record has no resident $INDEX_ROOT".into())
+        })?;
+        if root.large {
+            return Ok(());
+        }
+        let block_size = root.block_size;
+
+        // Everything before the end sentinel moves to the INDX block.
+        let region = &record[root.entries_start..root.entries_end];
+        let end_off = entries_end_sentinel_offset(region);
+        let moved: Vec<u8> = region[..end_off].to_vec();
+
+        let clusters = (block_size as u64).div_ceil(self.cluster_size).max(1);
+        let runs = self.allocate_volume_clusters(clusters as u32)?;
+        let mut block = build_indx_block(block_size, 0, &moved, &leaf_end_sentinel())?;
+        prepare_fixup(&mut block);
+        self.write_data_to_runs(&Self::runs_to_data_runs(&runs), &block)?;
+
+        // Swap the root value for the large-empty form, keeping the instance id.
+        let instance =
+            u16::from_le_bytes([record[root.attr_pos + 0x0E], record[root.attr_pos + 0x0F]]);
+        let mut new_root = build_named_resident_attr(
+            ATTR_INDEX_ROOT,
+            "$I30",
+            &build_empty_index_root(block_size, self.cluster_size, self.bytes_per_sector, true),
+        );
+        new_root[0x0E..0x10].copy_from_slice(&instance.to_le_bytes());
+        replace_attr_at(record, root.attr_pos, &new_root)?;
+
+        let root = parse_root_node(record, self.index_record_size).ok_or_else(|| {
+            FilesystemError::Parse("promoted $INDEX_ROOT vanished from record".into())
+        })?;
+        let insert_at = root.attr_pos + root.attr_len;
+        let next_instance = u16::from_le_bytes([record[0x28], record[0x29]]);
+
+        let alloc_bytes = clusters * self.cluster_size;
+        let mut alloc_attr = build_named_nonresident_attr(
+            ATTR_INDEX_ALLOCATION,
+            "$I30",
+            &runs,
+            alloc_bytes,
+            block_size as u64,
+        );
+        alloc_attr[0x0E..0x10].copy_from_slice(&next_instance.to_le_bytes());
+
+        let mut bitmap_value = [0u8; 8];
+        bitmap_value[0] = 1;
+        let mut bitmap_attr = build_named_resident_attr(ATTR_BITMAP, "$I30", &bitmap_value);
+        bitmap_attr[0x0E..0x10].copy_from_slice(&(next_instance + 1).to_le_bytes());
+
+        insert_attr_at(record, insert_at, &alloc_attr)?;
+        insert_attr_at(record, insert_at + alloc_attr.len(), &bitmap_attr)?;
+        record[0x28..0x2A].copy_from_slice(&(next_instance + 2).to_le_bytes());
+        Ok(())
+    }
+
+    /// Read the whole $I30 $INDEX_ALLOCATION stream of a directory record.
+    fn read_i30_allocation(&mut self, record: &[u8]) -> Result<Vec<u8>, FilesystemError> {
+        let attrs = parse_mft_attributes(record, self.mft_record_size);
+        for attr in &attrs {
+            if attr.attr_type == ATTR_INDEX_ALLOCATION && !attr.resident {
+                return self.read_attribute_data(attr, None);
+            }
+        }
+        Err(FilesystemError::Parse(
+            "large index has no $INDEX_ALLOCATION attribute".into(),
+        ))
+    }
+
+    /// Write the whole $I30 $INDEX_ALLOCATION stream back through its runs.
+    fn write_i30_allocation(
+        &mut self,
+        record: &[u8],
+        stream: &[u8],
+    ) -> Result<(), FilesystemError> {
+        let attrs = parse_mft_attributes(record, self.mft_record_size);
+        for attr in &attrs {
+            if attr.attr_type == ATTR_INDEX_ALLOCATION && !attr.resident {
+                return self.write_data_to_runs(&attr.data_runs, stream);
+            }
+        }
+        Err(FilesystemError::Parse(
+            "large index has no $INDEX_ALLOCATION attribute".into(),
+        ))
+    }
+
+    fn block_index_to_vcn(&self, index: u64, block_size: u32) -> u64 {
+        index * idx_vcn_units_per_block(block_size, self.cluster_size)
+    }
+
+    fn vcn_to_block_index(&self, vcn: u64, block_size: u32) -> Result<u64, FilesystemError> {
+        let off = idx_vcn_to_stream_offset(vcn, block_size, self.cluster_size);
+        if !off.is_multiple_of(block_size as u64) {
+            return Err(FilesystemError::Parse(format!(
+                "index sub-node VCN {vcn} is not block-aligned"
+            )));
+        }
+        Ok(off / block_size as u64)
+    }
+
+    /// Grow $INDEX_ALLOCATION by one index block (clusters, sizes, bitmap bit,
+    /// zero-filled stream tail). Returns the new block's index.
+    fn append_index_block(
+        &mut self,
+        record: &mut [u8],
+        stream: &mut Vec<u8>,
+        block_size: u32,
+    ) -> Result<u64, FilesystemError> {
+        let new_index = (stream.len() / block_size as usize) as u64;
+        let clusters = (block_size as u64).div_ceil(self.cluster_size).max(1);
+        let new_runs = self.allocate_volume_clusters(clusters as u32)?;
+
+        // Rebuild the $INDEX_ALLOCATION attribute with the extended run list.
+        let (attr_pos, _) =
+            find_attr_pos(record, ATTR_INDEX_ALLOCATION, false).ok_or_else(|| {
+                FilesystemError::Parse("large index has no $INDEX_ALLOCATION attribute".into())
+            })?;
+        let instance = u16::from_le_bytes([record[attr_pos + 0x0E], record[attr_pos + 0x0F]]);
+        let attrs = parse_mft_attributes(record, self.mft_record_size);
+        let old = attrs
+            .iter()
+            .find(|a| a.attr_type == ATTR_INDEX_ALLOCATION && !a.resident)
+            .ok_or_else(|| {
+                FilesystemError::Parse("large index has no $INDEX_ALLOCATION attribute".into())
+            })?;
+        let mut all_runs: Vec<(u64, u64)> = old
+            .data_runs
+            .iter()
+            .filter(|r| r.cluster_offset > 0)
+            .map(|r| (r.cluster_offset as u64, r.length))
+            .collect();
+        all_runs.extend_from_slice(&new_runs);
+        let new_alloc = old.allocated_size + clusters * self.cluster_size;
+        let new_real = old.real_size + block_size as u64;
+        let mut new_attr = build_named_nonresident_attr(
+            ATTR_INDEX_ALLOCATION,
+            "$I30",
+            &all_runs,
+            new_alloc,
+            new_real,
+        );
+        new_attr[0x0E..0x10].copy_from_slice(&instance.to_le_bytes());
+        replace_attr_at(record, attr_pos, &new_attr)?;
+
+        self.set_i30_bitmap_bit(record, new_index)?;
+        stream.resize(stream.len() + block_size as usize, 0);
+        Ok(new_index)
+    }
+
+    /// Set (or clear) bit `index` in the directory's $I30 $BITMAP.
+    fn set_i30_bitmap_bit_value(
+        &mut self,
+        record: &mut [u8],
+        index: u64,
+        value: bool,
+    ) -> Result<(), FilesystemError> {
+        let byte = (index / 8) as usize;
+        let bit = (index % 8) as u8;
+        let Some((attr_pos, _)) = find_attr_pos(record, ATTR_BITMAP, true) else {
+            // Non-resident $I30 bitmap (huge Windows-made directory).
+            let attrs = parse_mft_attributes(record, self.mft_record_size);
+            for attr in &attrs {
+                if attr.attr_type == ATTR_BITMAP && !attr.resident {
+                    let mut data = self.read_attribute_data(attr, None)?;
+                    if byte >= data.len() {
+                        return Err(FilesystemError::DiskFull(
+                            "directory index bitmap is full".into(),
+                        ));
+                    }
+                    if value {
+                        data[byte] |= 1 << bit;
+                    } else {
+                        data[byte] &= !(1 << bit);
+                    }
+                    return self.write_data_to_runs(&attr.data_runs, &data);
+                }
+            }
+            return Err(FilesystemError::Parse(
+                "large index has no $I30 $BITMAP attribute".into(),
+            ));
+        };
+
+        let instance = u16::from_le_bytes([record[attr_pos + 0x0E], record[attr_pos + 0x0F]]);
+        let value_off =
+            u16::from_le_bytes([record[attr_pos + 0x14], record[attr_pos + 0x15]]) as usize;
+        let value_len = u32::from_le_bytes([
+            record[attr_pos + 0x10],
+            record[attr_pos + 0x11],
+            record[attr_pos + 0x12],
+            record[attr_pos + 0x13],
+        ]) as usize;
+        if byte < value_len {
+            let at = attr_pos + value_off + byte;
+            if value {
+                record[at] |= 1 << bit;
+            } else {
+                record[at] &= !(1 << bit);
+            }
+            return Ok(());
+        }
+        // Grow the resident bitmap value in 8-byte steps.
+        let mut data = record[attr_pos + value_off..attr_pos + value_off + value_len].to_vec();
+        data.resize((byte + 8) & !7, 0);
+        if value {
+            data[byte] |= 1 << bit;
+        }
+        let mut new_attr = build_named_resident_attr(ATTR_BITMAP, "$I30", &data);
+        new_attr[0x0E..0x10].copy_from_slice(&instance.to_le_bytes());
+        replace_attr_at(record, attr_pos, &new_attr)
+    }
+
+    fn set_i30_bitmap_bit(&mut self, record: &mut [u8], index: u64) -> Result<(), FilesystemError> {
+        self.set_i30_bitmap_bit_value(record, index, true)
+    }
+
+    /// Descend a large index to the leaf that should hold `entry_bytes`,
+    /// recording (node, routed-entry offset within the entries region) per hop.
+    /// Node None = the root; Some(i) = INDX block i.
+    #[allow(clippy::type_complexity)]
+    fn descend_to_leaf(
         &self,
-        alloc_data: &mut [u8],
+        record: &[u8],
+        stream: &[u8],
+        block_size: u32,
+        name_upper: &str,
+    ) -> Result<(Vec<(Option<u64>, usize)>, u64), FilesystemError> {
+        let mut path: Vec<(Option<u64>, usize)> = Vec::new();
+        let mut node: Option<u64> = None;
+        loop {
+            let (entries, internal): (Vec<u8>, bool) = match node {
+                None => {
+                    let root =
+                        parse_root_node(record, self.index_record_size).ok_or_else(|| {
+                            FilesystemError::Parse(
+                                "directory record has no resident $INDEX_ROOT".into(),
+                            )
+                        })?;
+                    (
+                        record[root.entries_start..root.entries_end].to_vec(),
+                        root.large,
+                    )
+                }
+                Some(i) => {
+                    let block = get_indx_block(stream, i, block_size)?;
+                    let (es, ee, _) = indx_entry_bounds(&block).ok_or_else(|| {
+                        FilesystemError::Parse(format!("INDX block {i} has a bad node header"))
+                    })?;
+                    (block[es..ee].to_vec(), indx_is_internal(&block))
+                }
+            };
+            if !internal {
+                let leaf = node.ok_or_else(|| {
+                    FilesystemError::Parse("large index root is not marked as internal".into())
+                })?;
+                return Ok((path, leaf));
+            }
+            let (off, vcn) = route_in_entries(&entries, name_upper)?;
+            let child = self.vcn_to_block_index(vcn, block_size)?;
+            path.push((node, off));
+            node = Some(child);
+        }
+    }
+
+    /// Insert into a large index, splitting full nodes upward as needed.
+    fn insert_into_large_index(
+        &mut self,
+        parent_record_num: u64,
+        record: &mut [u8],
         entry_bytes: &[u8],
-    ) -> Result<bool, FilesystemError> {
-        let indx_size = 4096usize;
-        let mut pos = 0;
+    ) -> Result<(), FilesystemError> {
+        let record_size = self.mft_record_size;
+        let root = parse_root_node(record, self.index_record_size).ok_or_else(|| {
+            FilesystemError::Parse("directory record has no resident $INDEX_ROOT".into())
+        })?;
+        let block_size = root.block_size;
+        let mut stream = self.read_i30_allocation(record)?;
 
-        while pos + indx_size <= alloc_data.len() {
-            if &alloc_data[pos..pos + 4] != b"INDX" {
-                pos += indx_size;
-                continue;
+        let name_upper = extract_name_from_index_entry(entry_bytes).to_uppercase();
+        let (mut path, leaf) = self.descend_to_leaf(record, &stream, block_size, &name_upper)?;
+
+        let mut pending: Vec<u8> = entry_bytes.to_vec();
+        let mut target: Option<u64> = Some(leaf);
+        loop {
+            match target {
+                Some(i) => {
+                    let mut block = get_indx_block(&stream, i, block_size)?;
+                    let pos = {
+                        let (es, ee, _) = indx_entry_bounds(&block).ok_or_else(|| {
+                            FilesystemError::Parse(format!("INDX block {i} has a bad node header"))
+                        })?;
+                        es + self.find_index_insert_position(&block[es..ee], &pending)
+                    };
+                    if splice_into_indx(&mut block, pos, &pending) {
+                        put_indx_block(&mut stream, i, block_size, &mut block)?;
+                        break;
+                    }
+
+                    // Node is full: split it around the median.
+                    let (left_entries, median, right_entries, end_sentinel) =
+                        split_indx_entries(&block, pos, &pending)?;
+                    let new_i = self.append_index_block(record, &mut stream, block_size)?;
+
+                    // Left keeps this block's VCN; a median child pointer, if
+                    // any, becomes the left node's end-sentinel sub-node.
+                    let left_end = match entry_sub_vcn(&median) {
+                        Some(v) => internal_end_sentinel(v),
+                        None => leaf_end_sentinel(),
+                    };
+                    let mut left = build_indx_block(
+                        block_size,
+                        self.block_index_to_vcn(i, block_size),
+                        &left_entries,
+                        &left_end,
+                    )?;
+                    put_indx_block(&mut stream, i, block_size, &mut left)?;
+                    let mut right = build_indx_block(
+                        block_size,
+                        self.block_index_to_vcn(new_i, block_size),
+                        &right_entries,
+                        &end_sentinel,
+                    )?;
+                    put_indx_block(&mut stream, new_i, block_size, &mut right)?;
+
+                    // The entry that routed here now covers only the right half.
+                    let (parent, routed_off) = path.pop().ok_or_else(|| {
+                        FilesystemError::Parse("index split reached a node with no parent".into())
+                    })?;
+                    let right_vcn = self.block_index_to_vcn(new_i, block_size);
+                    match parent {
+                        None => {
+                            let r = parse_root_node(record, self.index_record_size).ok_or_else(
+                                || {
+                                    FilesystemError::Parse(
+                                        "directory record has no resident $INDEX_ROOT".into(),
+                                    )
+                                },
+                            )?;
+                            set_entry_sub_vcn_at(record, r.entries_start + routed_off, right_vcn)?;
+                        }
+                        Some(p) => {
+                            let mut pblock = get_indx_block(&stream, p, block_size)?;
+                            let (es, _, _) = indx_entry_bounds(&pblock).ok_or_else(|| {
+                                FilesystemError::Parse(format!(
+                                    "INDX block {p} has a bad node header"
+                                ))
+                            })?;
+                            set_entry_sub_vcn_at(&mut pblock, es + routed_off, right_vcn)?;
+                            put_indx_block(&mut stream, p, block_size, &mut pblock)?;
+                        }
+                    }
+
+                    // Median moves up, pointing at the left half.
+                    pending = entry_with_sub_vcn(&median, self.block_index_to_vcn(i, block_size));
+                    target = parent;
+                }
+                None => {
+                    if self.try_splice_into_root(record, &pending, record_size)? {
+                        break;
+                    }
+                    return Err(FilesystemError::DiskFull(
+                        "directory index root is full; cannot grow this directory further".into(),
+                    ));
+                }
             }
-
-            // Apply fixup to work with the record
-            let mut indx = alloc_data[pos..pos + indx_size].to_vec();
-            let _ = apply_fixup(&mut indx);
-
-            let node_offset = 0x18;
-            if node_offset + 16 > indx.len() {
-                pos += indx_size;
-                continue;
-            }
-
-            let entries_offset = u32::from_le_bytes([
-                indx[node_offset],
-                indx[node_offset + 1],
-                indx[node_offset + 2],
-                indx[node_offset + 3],
-            ]) as usize;
-            let entries_size = u32::from_le_bytes([
-                indx[node_offset + 4],
-                indx[node_offset + 5],
-                indx[node_offset + 6],
-                indx[node_offset + 7],
-            ]) as usize;
-            let alloc_entries_size = u32::from_le_bytes([
-                indx[node_offset + 8],
-                indx[node_offset + 9],
-                indx[node_offset + 10],
-                indx[node_offset + 11],
-            ]) as usize;
-
-            let available = alloc_entries_size - entries_size;
-            if available >= entry_bytes.len() {
-                let entries_start = node_offset + entries_offset;
-                let entries_end = node_offset + entries_size;
-
-                let insert_pos =
-                    self.find_index_insert_position(&indx[entries_start..entries_end], entry_bytes);
-                let abs_insert = entries_start + insert_pos;
-
-                // Shift and insert
-                indx.copy_within(abs_insert..entries_end, abs_insert + entry_bytes.len());
-                indx[abs_insert..abs_insert + entry_bytes.len()].copy_from_slice(entry_bytes);
-
-                // Update entries_size
-                let new_entries_size = entries_size + entry_bytes.len();
-                indx[node_offset + 4..node_offset + 8]
-                    .copy_from_slice(&(new_entries_size as u32).to_le_bytes());
-
-                // Apply fixup for writing back
-                prepare_fixup(&mut indx);
-                alloc_data[pos..pos + indx_size].copy_from_slice(&indx);
-                return Ok(true);
-            }
-
-            pos += indx_size;
         }
 
-        Ok(false)
+        self.write_i30_allocation(record, &stream)?;
+        self.write_mft_record(parent_record_num, record)?;
+        Ok(())
     }
 
     /// Find the sorted insertion position in an index entry list.
@@ -2657,21 +3007,57 @@ impl<R: Read + Write + Seek> NtfsFilesystem<R> {
         name: &str,
     ) -> Result<(), FilesystemError> {
         let mut record = self.read_mft_record(parent_record_num)?;
-        let record_size = self.mft_record_size;
 
-        // Try removing from $INDEX_ROOT first
-        if self.try_remove_from_index_root(&mut record, name, record_size)? {
-            self.write_mft_record(parent_record_num, &mut record)?;
-            return Ok(());
+        let Some(root) = parse_root_node(&record, self.index_record_size) else {
+            return Err(FilesystemError::Parse(
+                "directory record has no resident $INDEX_ROOT".into(),
+            ));
+        };
+        let block_size = root.block_size;
+
+        // The root node first.
+        let region = record[root.entries_start..root.entries_end].to_vec();
+        if let Some((off, len)) = find_entry_by_name(&region, name) {
+            let entry = region[off..off + len].to_vec();
+            if let Some(left_vcn) = entry_sub_vcn(&entry) {
+                return self.replace_separator_with_predecessor(
+                    parent_record_num,
+                    &mut record,
+                    None,
+                    &entry,
+                    left_vcn,
+                );
+            }
+            self.splice_out_of_root(&mut record, root.entries_start + off, len);
+            return self.write_mft_record(parent_record_num, &mut record);
         }
 
-        // Try removing from $INDEX_ALLOCATION
-        let attrs = parse_mft_attributes(&record, record_size);
-        for attr in &attrs {
-            if attr.attr_type == ATTR_INDEX_ALLOCATION && !attr.resident {
-                let mut alloc_data = self.read_attribute_data(attr, None)?;
-                if self.try_remove_from_index_allocation(&mut alloc_data, name)? {
-                    self.write_data_to_runs(&attr.data_runs, &alloc_data)?;
+        // Then every INDX block.
+        if find_attr_pos(&record, ATTR_INDEX_ALLOCATION, false).is_some() {
+            let mut stream = self.read_i30_allocation(&record)?;
+            let nblocks = stream.len() / block_size as usize;
+            for i in 0..nblocks as u64 {
+                let Ok(block) = get_indx_block(&stream, i, block_size) else {
+                    continue; // unused / never-initialized block
+                };
+                let Some((es, ee, _)) = indx_entry_bounds(&block) else {
+                    continue;
+                };
+                if let Some((off, len)) = find_entry_by_name(&block[es..ee], name) {
+                    let entry = block[es + off..es + off + len].to_vec();
+                    if let Some(left_vcn) = entry_sub_vcn(&entry) {
+                        return self.replace_separator_with_predecessor(
+                            parent_record_num,
+                            &mut record,
+                            Some(i),
+                            &entry,
+                            left_vcn,
+                        );
+                    }
+                    let mut b = block;
+                    splice_out_of_indx(&mut b, es + off, len);
+                    put_indx_block(&mut stream, i, block_size, &mut b)?;
+                    self.write_i30_allocation(&record, &stream)?;
                     return Ok(());
                 }
             }
@@ -2683,176 +3069,160 @@ impl<R: Read + Write + Seek> NtfsFilesystem<R> {
         )))
     }
 
-    /// Try to remove an entry from $INDEX_ROOT. Returns true if found and removed.
-    fn try_remove_from_index_root(
-        &self,
+    /// Remove a separator entry from an internal node by pulling up its
+    /// in-order predecessor (the last entry of the rightmost leaf of the left
+    /// subtree), which keeps the B-tree ordering invariants intact.
+    fn replace_separator_with_predecessor(
+        &mut self,
+        parent_record_num: u64,
         record: &mut [u8],
-        name: &str,
-        record_size: u32,
-    ) -> Result<bool, FilesystemError> {
-        let _ = record_size;
-        let attr_offset = u16::from_le_bytes([record[0x14], record[0x15]]) as usize;
-        let mut pos = attr_offset;
+        node: Option<u64>,
+        old_entry: &[u8],
+        left_vcn: u64,
+    ) -> Result<(), FilesystemError> {
+        let root = parse_root_node(record, self.index_record_size).ok_or_else(|| {
+            FilesystemError::Parse("directory record has no resident $INDEX_ROOT".into())
+        })?;
+        let block_size = root.block_size;
+        let record_size = self.mft_record_size;
+        let mut stream = self.read_i30_allocation(record)?;
 
-        while pos + 16 <= record.len() {
-            let attr_type = u32::from_le_bytes([
-                record[pos],
-                record[pos + 1],
-                record[pos + 2],
-                record[pos + 3],
-            ]);
-            if attr_type == ATTR_END || attr_type == 0 {
+        // Rightmost leaf of the left subtree.
+        let direct_child = self.vcn_to_block_index(left_vcn, block_size)?;
+        let mut leaf_i = direct_child;
+        loop {
+            let block = get_indx_block(&stream, leaf_i, block_size)?;
+            if !indx_is_internal(&block) {
                 break;
             }
-            let attr_len = u32::from_le_bytes([
-                record[pos + 4],
-                record[pos + 5],
-                record[pos + 6],
-                record[pos + 7],
-            ]) as usize;
-            if attr_len < 16 || pos + attr_len > record.len() {
-                break;
-            }
-
-            if attr_type == ATTR_INDEX_ROOT && record[pos + 8] == 0 {
-                let value_offset =
-                    u16::from_le_bytes([record[pos + 0x14], record[pos + 0x15]]) as usize;
-                let value_length = u32::from_le_bytes([
-                    record[pos + 0x10],
-                    record[pos + 0x11],
-                    record[pos + 0x12],
-                    record[pos + 0x13],
-                ]) as usize;
-
-                let ir_start = pos + value_offset;
-                let node_start = ir_start + 16;
-                if node_start + 16 > record.len() {
-                    return Ok(false);
-                }
-
-                let entries_offset = u32::from_le_bytes([
-                    record[node_start],
-                    record[node_start + 1],
-                    record[node_start + 2],
-                    record[node_start + 3],
-                ]) as usize;
-                let entries_size = u32::from_le_bytes([
-                    record[node_start + 4],
-                    record[node_start + 5],
-                    record[node_start + 6],
-                    record[node_start + 7],
-                ]) as usize;
-
-                let entries_start = node_start + entries_offset;
-                let entries_end = node_start + entries_size;
-
-                if let Some((entry_off, entry_len)) =
-                    find_entry_by_name(&record[entries_start..entries_end], name)
-                {
-                    let abs_off = entries_start + entry_off;
-                    let used_size = u32::from_le_bytes([
-                        record[0x18],
-                        record[0x19],
-                        record[0x1A],
-                        record[0x1B],
-                    ]) as usize;
-
-                    // Shift data after the entry
-                    record.copy_within(abs_off + entry_len..used_size, abs_off);
-                    // Zero out freed space
-                    let new_used = used_size - entry_len;
-                    record[new_used..used_size].fill(0);
-
-                    // Update entries_size
-                    let new_entries_size = entries_size - entry_len;
-                    record[node_start + 4..node_start + 8]
-                        .copy_from_slice(&(new_entries_size as u32).to_le_bytes());
-                    record[node_start + 8..node_start + 12]
-                        .copy_from_slice(&(new_entries_size as u32).to_le_bytes());
-
-                    // Update value length
-                    let new_value_length = value_length - entry_len;
-                    record[pos + 0x10..pos + 0x14]
-                        .copy_from_slice(&(new_value_length as u32).to_le_bytes());
-
-                    // Update attr length
-                    let new_attr_len = attr_len - entry_len;
-                    record[pos + 4..pos + 8].copy_from_slice(&(new_attr_len as u32).to_le_bytes());
-
-                    // Update record used_size
-                    record[0x18..0x1C].copy_from_slice(&(new_used as u32).to_le_bytes());
-
-                    return Ok(true);
-                }
-            }
-
-            pos += attr_len;
+            let (es, ee, _) = indx_entry_bounds(&block).ok_or_else(|| {
+                FilesystemError::Parse(format!("INDX block {leaf_i} has a bad node header"))
+            })?;
+            let end_off = entries_end_sentinel_offset(&block[es..ee]);
+            let end_entry = &block[es + end_off..ee];
+            let vcn = entry_sub_vcn(end_entry).ok_or_else(|| {
+                FilesystemError::Parse("internal index node's end entry has no sub-node".into())
+            })?;
+            leaf_i = self.vcn_to_block_index(vcn, block_size)?;
         }
 
-        Ok(false)
-    }
+        let mut leaf = get_indx_block(&stream, leaf_i, block_size)?;
+        let (es, ee, _) = indx_entry_bounds(&leaf).ok_or_else(|| {
+            FilesystemError::Parse(format!("INDX block {leaf_i} has a bad node header"))
+        })?;
+        let region = leaf[es..ee].to_vec();
+        let pred = last_real_entry(&region);
 
-    /// Try to remove an entry from $INDEX_ALLOCATION INDX nodes.
-    fn try_remove_from_index_allocation(
-        &self,
-        alloc_data: &mut [u8],
-        name: &str,
-    ) -> Result<bool, FilesystemError> {
-        let indx_size = 4096usize;
-        let mut pos = 0;
-
-        while pos + indx_size <= alloc_data.len() {
-            if &alloc_data[pos..pos + 4] != b"INDX" {
-                pos += indx_size;
-                continue;
+        let name = extract_name_from_index_entry(old_entry);
+        match pred {
+            None => {
+                // Empty left subtree: only handled when it is a single leaf —
+                // then dropping the separator orphans nothing but that block.
+                if leaf_i != direct_child {
+                    return Err(FilesystemError::InvalidData(format!(
+                        "cannot remove '{name}': its left index subtree is deeper than one level and empty"
+                    )));
+                }
+                match node {
+                    None => {
+                        let r =
+                            parse_root_node(record, self.index_record_size).ok_or_else(|| {
+                                FilesystemError::Parse(
+                                    "directory record has no resident $INDEX_ROOT".into(),
+                                )
+                            })?;
+                        let region = record[r.entries_start..r.entries_end].to_vec();
+                        let (off, len) = find_entry_by_name(&region, &name).ok_or_else(|| {
+                            FilesystemError::NotFound(format!("index entry '{name}' vanished"))
+                        })?;
+                        self.splice_out_of_root(record, r.entries_start + off, len);
+                    }
+                    Some(p) => {
+                        let mut pblock = get_indx_block(&stream, p, block_size)?;
+                        let (pes, pee, _) = indx_entry_bounds(&pblock).ok_or_else(|| {
+                            FilesystemError::Parse(format!("INDX block {p} has a bad node header"))
+                        })?;
+                        let (off, len) =
+                            find_entry_by_name(&pblock[pes..pee], &name).ok_or_else(|| {
+                                FilesystemError::NotFound(format!("index entry '{name}' vanished"))
+                            })?;
+                        splice_out_of_indx(&mut pblock, pes + off, len);
+                        put_indx_block(&mut stream, p, block_size, &mut pblock)?;
+                    }
+                }
+                self.set_i30_bitmap_bit_value(record, leaf_i, false)?;
             }
+            Some((pred_off, pred_len)) => {
+                let pred_entry = region[pred_off..pred_off + pred_len].to_vec();
+                let new_sep = entry_with_sub_vcn(&pred_entry, left_vcn);
 
-            let mut indx = alloc_data[pos..pos + indx_size].to_vec();
-            let _ = apply_fixup(&mut indx);
+                // Pre-check room so a failed swap cannot lose the old entry.
+                match node {
+                    None => {
+                        let grow = new_sep.len().saturating_sub(old_entry.len());
+                        if record_used_size(record) + grow > record_size as usize {
+                            return Err(FilesystemError::DiskFull(
+                                "directory index root has no room to rewrite a separator".into(),
+                            ));
+                        }
+                        let r =
+                            parse_root_node(record, self.index_record_size).ok_or_else(|| {
+                                FilesystemError::Parse(
+                                    "directory record has no resident $INDEX_ROOT".into(),
+                                )
+                            })?;
+                        let region = record[r.entries_start..r.entries_end].to_vec();
+                        let (off, len) = find_entry_by_name(&region, &name).ok_or_else(|| {
+                            FilesystemError::NotFound(format!("index entry '{name}' vanished"))
+                        })?;
+                        self.splice_out_of_root(record, r.entries_start + off, len);
+                        if !self.try_splice_into_root(record, &new_sep, record_size)? {
+                            return Err(FilesystemError::DiskFull(
+                                "directory index root has no room to rewrite a separator".into(),
+                            ));
+                        }
+                    }
+                    Some(p) => {
+                        let mut pblock = get_indx_block(&stream, p, block_size)?;
+                        let (pes, pee, alloc_end) =
+                            indx_entry_bounds(&pblock).ok_or_else(|| {
+                                FilesystemError::Parse(format!(
+                                    "INDX block {p} has a bad node header"
+                                ))
+                            })?;
+                        let (off, len) =
+                            find_entry_by_name(&pblock[pes..pee], &name).ok_or_else(|| {
+                                FilesystemError::NotFound(format!("index entry '{name}' vanished"))
+                            })?;
+                        if pee - len + new_sep.len() > alloc_end {
+                            return Err(FilesystemError::DiskFull(
+                                "index node has no room to rewrite a separator".into(),
+                            ));
+                        }
+                        splice_out_of_indx(&mut pblock, pes + off, len);
+                        let (pes2, pee2, _) = indx_entry_bounds(&pblock).ok_or_else(|| {
+                            FilesystemError::Parse(format!("INDX block {p} has a bad node header"))
+                        })?;
+                        let pos =
+                            pes2 + self.find_index_insert_position(&pblock[pes2..pee2], &new_sep);
+                        if !splice_into_indx(&mut pblock, pos, &new_sep) {
+                            return Err(FilesystemError::DiskFull(
+                                "index node has no room to rewrite a separator".into(),
+                            ));
+                        }
+                        put_indx_block(&mut stream, p, block_size, &mut pblock)?;
+                    }
+                }
 
-            let node_offset = 0x18;
-            if node_offset + 16 > indx.len() {
-                pos += indx_size;
-                continue;
+                // Finally drop the predecessor from its leaf.
+                splice_out_of_indx(&mut leaf, es + pred_off, pred_len);
+                put_indx_block(&mut stream, leaf_i, block_size, &mut leaf)?;
             }
-
-            let entries_offset = u32::from_le_bytes([
-                indx[node_offset],
-                indx[node_offset + 1],
-                indx[node_offset + 2],
-                indx[node_offset + 3],
-            ]) as usize;
-            let entries_size = u32::from_le_bytes([
-                indx[node_offset + 4],
-                indx[node_offset + 5],
-                indx[node_offset + 6],
-                indx[node_offset + 7],
-            ]) as usize;
-
-            let entries_start = node_offset + entries_offset;
-            let entries_end = node_offset + entries_size;
-
-            if let Some((entry_off, entry_len)) =
-                find_entry_by_name(&indx[entries_start..entries_end], name)
-            {
-                let abs_off = entries_start + entry_off;
-                indx.copy_within(abs_off + entry_len..entries_end, abs_off);
-                let freed_start = entries_end - entry_len;
-                indx[freed_start..entries_end].fill(0);
-
-                let new_entries_size = entries_size - entry_len;
-                indx[node_offset + 4..node_offset + 8]
-                    .copy_from_slice(&(new_entries_size as u32).to_le_bytes());
-
-                prepare_fixup(&mut indx);
-                alloc_data[pos..pos + indx_size].copy_from_slice(&indx);
-                return Ok(true);
-            }
-
-            pos += indx_size;
         }
 
-        Ok(false)
+        self.write_i30_allocation(record, &stream)?;
+        self.write_mft_record(parent_record_num, record)?;
+        Ok(())
     }
 
     // ---- fsck repair helpers (see ntfs_fsck.rs) ----
@@ -2930,6 +3300,505 @@ fn find_entry_by_name(entries_data: &[u8], target_name: &str) -> Option<(usize, 
     None
 }
 
+// ---- B-tree index plumbing (shapes mirror ntfs_format.rs) ----
+
+/// Parsed location of a directory's resident $INDEX_ROOT within its record.
+struct RootNode {
+    attr_pos: usize,
+    attr_len: usize,
+    value_len: usize,
+    node_start: usize,
+    entries_start: usize,
+    entries_end: usize,
+    block_size: u32,
+    large: bool,
+}
+
+fn record_used_size(record: &[u8]) -> usize {
+    u32::from_le_bytes([record[0x18], record[0x19], record[0x1A], record[0x1B]]) as usize
+}
+
+fn set_record_used_size(record: &mut [u8], used: usize) {
+    record[0x18..0x1C].copy_from_slice(&(used as u32).to_le_bytes());
+}
+
+/// First attribute of `attr_type` with the requested residency: (pos, len).
+fn find_attr_pos(record: &[u8], attr_type: u32, resident: bool) -> Option<(usize, usize)> {
+    let mut pos = u16::from_le_bytes([record[0x14], record[0x15]]) as usize;
+    while pos + 16 <= record.len() {
+        let atype = u32::from_le_bytes([
+            record[pos],
+            record[pos + 1],
+            record[pos + 2],
+            record[pos + 3],
+        ]);
+        if atype == ATTR_END || atype == 0 {
+            break;
+        }
+        let alen = u32::from_le_bytes([
+            record[pos + 4],
+            record[pos + 5],
+            record[pos + 6],
+            record[pos + 7],
+        ]) as usize;
+        if alen < 16 || pos + alen > record.len() {
+            break;
+        }
+        if atype == attr_type && (record[pos + 8] == 0) == resident {
+            return Some((pos, alen));
+        }
+        pos += alen;
+    }
+    None
+}
+
+/// Locate and sanity-check the resident $INDEX_ROOT node of a directory record.
+fn parse_root_node(record: &[u8], default_block_size: u32) -> Option<RootNode> {
+    let (attr_pos, attr_len) = find_attr_pos(record, ATTR_INDEX_ROOT, true)?;
+    let value_off = u16::from_le_bytes([record[attr_pos + 0x14], record[attr_pos + 0x15]]) as usize;
+    let value_len = u32::from_le_bytes([
+        record[attr_pos + 0x10],
+        record[attr_pos + 0x11],
+        record[attr_pos + 0x12],
+        record[attr_pos + 0x13],
+    ]) as usize;
+    let ir_start = attr_pos + value_off;
+    let node_start = ir_start + 16;
+    if value_len < 32 || node_start + 16 > record.len() || ir_start + value_len > record.len() {
+        return None;
+    }
+    let raw_bs = u32::from_le_bytes([
+        record[ir_start + 8],
+        record[ir_start + 9],
+        record[ir_start + 10],
+        record[ir_start + 11],
+    ]);
+    let block_size = if raw_bs == 0 || !raw_bs.is_power_of_two() || raw_bs > 2 * 1024 * 1024 {
+        default_block_size
+    } else {
+        raw_bs
+    };
+    let entries_offset = u32::from_le_bytes([
+        record[node_start],
+        record[node_start + 1],
+        record[node_start + 2],
+        record[node_start + 3],
+    ]) as usize;
+    let node_used = u32::from_le_bytes([
+        record[node_start + 4],
+        record[node_start + 5],
+        record[node_start + 6],
+        record[node_start + 7],
+    ]) as usize;
+    let entries_start = node_start + entries_offset;
+    let entries_end = node_start + node_used;
+    if entries_start > entries_end || entries_end > record.len() {
+        return None;
+    }
+    Some(RootNode {
+        attr_pos,
+        attr_len,
+        value_len,
+        node_start,
+        entries_start,
+        entries_end,
+        block_size,
+        large: record[node_start + 12] & INDEX_NODE_HAS_CHILDREN != 0,
+    })
+}
+
+/// Replace the attribute at `pos` with `new_attr`, shifting the record tail.
+fn replace_attr_at(record: &mut [u8], pos: usize, new_attr: &[u8]) -> Result<(), FilesystemError> {
+    let old_len = u32::from_le_bytes([
+        record[pos + 4],
+        record[pos + 5],
+        record[pos + 6],
+        record[pos + 7],
+    ]) as usize;
+    let used = record_used_size(record);
+    let new_used = used - old_len + new_attr.len();
+    if new_used > record.len() {
+        return Err(FilesystemError::DiskFull(
+            "MFT record has no room to grow an index attribute".into(),
+        ));
+    }
+    record.copy_within(pos + old_len..used, pos + new_attr.len());
+    if new_used < used {
+        record[new_used..used].fill(0);
+    }
+    record[pos..pos + new_attr.len()].copy_from_slice(new_attr);
+    set_record_used_size(record, new_used);
+    Ok(())
+}
+
+/// Insert a whole attribute blob at `pos`, shifting the record tail.
+fn insert_attr_at(record: &mut [u8], pos: usize, attr: &[u8]) -> Result<(), FilesystemError> {
+    let used = record_used_size(record);
+    let new_used = used + attr.len();
+    if new_used > record.len() {
+        return Err(FilesystemError::DiskFull(
+            "MFT record has no room for a new index attribute".into(),
+        ));
+    }
+    record.copy_within(pos..used, pos + attr.len());
+    record[pos..pos + attr.len()].copy_from_slice(attr);
+    set_record_used_size(record, new_used);
+    Ok(())
+}
+
+/// Build a named non-resident attribute over `runs` ((start, len) clusters).
+fn build_named_nonresident_attr(
+    attr_type: u32,
+    name: &str,
+    runs: &[(u64, u64)],
+    alloc_size: u64,
+    real_size: u64,
+) -> Vec<u8> {
+    let encoded = encode_data_runs(runs);
+    let name_utf16: Vec<u16> = name.encode_utf16().collect();
+    let name_off = 0x40usize;
+    let mp_off = (name_off + name_utf16.len() * 2 + 7) & !7;
+    let total = (mp_off + encoded.len() + 7) & !7;
+    let mut attr = vec![0u8; total];
+    attr[0..4].copy_from_slice(&attr_type.to_le_bytes());
+    attr[4..8].copy_from_slice(&(total as u32).to_le_bytes());
+    attr[8] = 1; // non-resident
+    attr[9] = name_utf16.len() as u8;
+    attr[0x0A..0x0C].copy_from_slice(&(name_off as u16).to_le_bytes());
+    let total_clusters: u64 = runs.iter().map(|(_, l)| l).sum();
+    if total_clusters > 0 {
+        attr[0x18..0x20].copy_from_slice(&(total_clusters - 1).to_le_bytes());
+    }
+    attr[0x20..0x22].copy_from_slice(&(mp_off as u16).to_le_bytes());
+    attr[0x28..0x30].copy_from_slice(&alloc_size.to_le_bytes());
+    attr[0x30..0x38].copy_from_slice(&real_size.to_le_bytes());
+    attr[0x38..0x40].copy_from_slice(&real_size.to_le_bytes()); // initialized
+    for (i, ch) in name_utf16.iter().enumerate() {
+        attr[name_off + i * 2..name_off + i * 2 + 2].copy_from_slice(&ch.to_le_bytes());
+    }
+    attr[mp_off..mp_off + encoded.len()].copy_from_slice(&encoded);
+    attr
+}
+
+/// Walk an entries region; yields (offset, length, flags) including the end.
+fn walk_index_entries(region: &[u8]) -> Vec<(usize, usize, u32)> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while pos + 16 <= region.len() {
+        let len = u16::from_le_bytes([region[pos + 8], region[pos + 9]]) as usize;
+        let flags = u32::from_le_bytes([
+            region[pos + 12],
+            region[pos + 13],
+            region[pos + 14],
+            region[pos + 15],
+        ]);
+        if len < 16 || pos + len > region.len() {
+            break;
+        }
+        out.push((pos, len, flags));
+        if flags & INDEX_ENTRY_END != 0 {
+            break;
+        }
+        pos += len;
+    }
+    out
+}
+
+/// Offset of the end sentinel within an entries region.
+fn entries_end_sentinel_offset(region: &[u8]) -> usize {
+    for (off, _, flags) in walk_index_entries(region) {
+        if flags & INDEX_ENTRY_END != 0 {
+            return off;
+        }
+    }
+    region.len()
+}
+
+/// Last real (non-end) entry of an entries region: (offset, length).
+fn last_real_entry(region: &[u8]) -> Option<(usize, usize)> {
+    let mut last = None;
+    for (off, len, flags) in walk_index_entries(region) {
+        if flags & INDEX_ENTRY_END != 0 {
+            break;
+        }
+        last = Some((off, len));
+    }
+    last
+}
+
+/// Sub-node VCN carried by an entry, when its NODE flag is set.
+fn entry_sub_vcn(entry: &[u8]) -> Option<u64> {
+    if entry.len() < 24 {
+        return None;
+    }
+    let flags = u32::from_le_bytes([entry[12], entry[13], entry[14], entry[15]]);
+    if flags & INDEX_ENTRY_NODE == 0 {
+        return None;
+    }
+    let n = entry.len();
+    Some(u64::from_le_bytes([
+        entry[n - 8],
+        entry[n - 7],
+        entry[n - 6],
+        entry[n - 5],
+        entry[n - 4],
+        entry[n - 3],
+        entry[n - 2],
+        entry[n - 1],
+    ]))
+}
+
+/// Copy of `entry` carrying sub-node `vcn` (replacing an existing one if set).
+fn entry_with_sub_vcn(entry: &[u8], vcn: u64) -> Vec<u8> {
+    let mut out = entry.to_vec();
+    let flags = u32::from_le_bytes([out[12], out[13], out[14], out[15]]);
+    if flags & INDEX_ENTRY_NODE == 0 {
+        out.extend_from_slice(&vcn.to_le_bytes());
+        let new_len = out.len() as u16;
+        out[8..10].copy_from_slice(&new_len.to_le_bytes());
+        let new_flags = flags | INDEX_ENTRY_NODE;
+        out[12..16].copy_from_slice(&new_flags.to_le_bytes());
+    } else {
+        let n = out.len();
+        out[n - 8..].copy_from_slice(&vcn.to_le_bytes());
+    }
+    out
+}
+
+/// Rewrite the sub-node VCN of the entry at `abs_off` in place.
+fn set_entry_sub_vcn_at(buf: &mut [u8], abs_off: usize, vcn: u64) -> Result<(), FilesystemError> {
+    let len = u16::from_le_bytes([buf[abs_off + 8], buf[abs_off + 9]]) as usize;
+    let flags = u32::from_le_bytes([
+        buf[abs_off + 12],
+        buf[abs_off + 13],
+        buf[abs_off + 14],
+        buf[abs_off + 15],
+    ]);
+    if flags & INDEX_ENTRY_NODE == 0 || len < 24 || abs_off + len > buf.len() {
+        return Err(FilesystemError::Parse(
+            "index entry expected to carry a sub-node VCN does not".into(),
+        ));
+    }
+    buf[abs_off + len - 8..abs_off + len].copy_from_slice(&vcn.to_le_bytes());
+    Ok(())
+}
+
+/// Pick the child to follow for `name_upper`: (entry offset, sub-node VCN).
+fn route_in_entries(region: &[u8], name_upper: &str) -> Result<(usize, u64), FilesystemError> {
+    for (off, len, flags) in walk_index_entries(region) {
+        let is_end = flags & INDEX_ENTRY_END != 0;
+        if !is_end {
+            let entry_name = extract_name_from_index_entry(&region[off..off + len]).to_uppercase();
+            if name_upper >= entry_name.as_str() {
+                continue;
+            }
+        }
+        let vcn = entry_sub_vcn(&region[off..off + len]).ok_or_else(|| {
+            FilesystemError::Parse("internal index node entry has no sub-node VCN".into())
+        })?;
+        return Ok((off, vcn));
+    }
+    Err(FilesystemError::Parse(
+        "internal index node has no end entry".into(),
+    ))
+}
+
+/// A 16-byte leaf end sentinel.
+fn leaf_end_sentinel() -> Vec<u8> {
+    let mut e = vec![0u8; 16];
+    e[8..10].copy_from_slice(&16u16.to_le_bytes());
+    e[12..16].copy_from_slice(&INDEX_ENTRY_END.to_le_bytes());
+    e
+}
+
+/// A 24-byte end sentinel pointing at sub-node `vcn`.
+fn internal_end_sentinel(vcn: u64) -> Vec<u8> {
+    let mut e = vec![0u8; 24];
+    e[8..10].copy_from_slice(&24u16.to_le_bytes());
+    e[12..16].copy_from_slice(&(INDEX_ENTRY_END | INDEX_ENTRY_NODE).to_le_bytes());
+    e[16..24].copy_from_slice(&vcn.to_le_bytes());
+    e
+}
+
+/// Assemble an INDX block from concatenated entries plus an end sentinel.
+fn build_indx_block(
+    block_size: u32,
+    vcn_field: u64,
+    entries: &[u8],
+    end_sentinel: &[u8],
+) -> Result<Vec<u8>, FilesystemError> {
+    let bs = block_size as usize;
+    let usa_count = (bs / NTFS_BLOCK_SIZE + 1) as u16;
+    let entries_start = (0x28 + usa_count as usize * 2 + 7) & !7;
+    let content_end = entries_start + entries.len() + end_sentinel.len();
+    if content_end > bs {
+        return Err(FilesystemError::DiskFull(
+            "index entries overflow an INDX block".into(),
+        ));
+    }
+    let mut b = vec![0u8; bs];
+    b[0..4].copy_from_slice(b"INDX");
+    b[4..6].copy_from_slice(&0x28u16.to_le_bytes());
+    b[6..8].copy_from_slice(&usa_count.to_le_bytes());
+    b[0x10..0x18].copy_from_slice(&vcn_field.to_le_bytes());
+    let node = 0x18;
+    b[node..node + 4].copy_from_slice(&((entries_start - node) as u32).to_le_bytes());
+    b[node + 4..node + 8].copy_from_slice(&((content_end - node) as u32).to_le_bytes());
+    b[node + 8..node + 12].copy_from_slice(&((bs - node) as u32).to_le_bytes());
+    if end_sentinel
+        .get(12)
+        .is_some_and(|f| f & INDEX_NODE_HAS_CHILDREN != 0)
+    {
+        b[node + 12] = INDEX_NODE_HAS_CHILDREN;
+    }
+    b[entries_start..entries_start + entries.len()].copy_from_slice(entries);
+    b[entries_start + entries.len()..content_end].copy_from_slice(end_sentinel);
+    Ok(b)
+}
+
+/// Copy INDX block `i` out of the allocation stream with fixups applied.
+fn get_indx_block(stream: &[u8], i: u64, block_size: u32) -> Result<Vec<u8>, FilesystemError> {
+    let bs = block_size as usize;
+    let start = i as usize * bs;
+    if start + bs > stream.len() {
+        return Err(FilesystemError::Parse(format!(
+            "INDX block {i} lies beyond the $INDEX_ALLOCATION stream"
+        )));
+    }
+    let mut block = stream[start..start + bs].to_vec();
+    if &block[0..4] != b"INDX" {
+        return Err(FilesystemError::Parse(format!(
+            "block {i} in $INDEX_ALLOCATION is not an INDX record"
+        )));
+    }
+    apply_fixup(&mut block)?;
+    Ok(block)
+}
+
+/// Re-protect a block with fixups and store it back into the stream.
+fn put_indx_block(
+    stream: &mut [u8],
+    i: u64,
+    block_size: u32,
+    block: &mut [u8],
+) -> Result<(), FilesystemError> {
+    let bs = block_size as usize;
+    let start = i as usize * bs;
+    if start + bs > stream.len() || block.len() != bs {
+        return Err(FilesystemError::Parse(format!(
+            "INDX block {i} does not fit the $INDEX_ALLOCATION stream"
+        )));
+    }
+    prepare_fixup(block);
+    stream[start..start + bs].copy_from_slice(block);
+    Ok(())
+}
+
+/// (entries start, entries end, allocation end), absolute within the block.
+fn indx_entry_bounds(block: &[u8]) -> Option<(usize, usize, usize)> {
+    let node = 0x18;
+    if node + 16 > block.len() {
+        return None;
+    }
+    let entries_offset = u32::from_le_bytes([
+        block[node],
+        block[node + 1],
+        block[node + 2],
+        block[node + 3],
+    ]) as usize;
+    let used = u32::from_le_bytes([
+        block[node + 4],
+        block[node + 5],
+        block[node + 6],
+        block[node + 7],
+    ]) as usize;
+    let alloc = u32::from_le_bytes([
+        block[node + 8],
+        block[node + 9],
+        block[node + 10],
+        block[node + 11],
+    ]) as usize;
+    let es = node + entries_offset;
+    let ee = node + used;
+    let ae = node + alloc;
+    if es > ee || ee > ae || ae > block.len() {
+        return None;
+    }
+    Some((es, ee, ae))
+}
+
+fn indx_is_internal(block: &[u8]) -> bool {
+    block
+        .get(0x18 + 12)
+        .is_some_and(|f| f & INDEX_NODE_HAS_CHILDREN != 0)
+}
+
+/// Insert `entry` at absolute `pos` in a block. False = no room.
+fn splice_into_indx(block: &mut [u8], pos: usize, entry: &[u8]) -> bool {
+    let Some((_, ee, ae)) = indx_entry_bounds(block) else {
+        return false;
+    };
+    if ee + entry.len() > ae {
+        return false;
+    }
+    block.copy_within(pos..ee, pos + entry.len());
+    block[pos..pos + entry.len()].copy_from_slice(entry);
+    let node = 0x18;
+    let new_used = (ee - node + entry.len()) as u32;
+    block[node + 4..node + 8].copy_from_slice(&new_used.to_le_bytes());
+    true
+}
+
+/// Remove `len` bytes at absolute `pos` from a block's entries.
+fn splice_out_of_indx(block: &mut [u8], pos: usize, len: usize) {
+    let Some((_, ee, _)) = indx_entry_bounds(block) else {
+        return;
+    };
+    block.copy_within(pos + len..ee, pos);
+    block[ee - len..ee].fill(0);
+    let node = 0x18;
+    let new_used = (ee - node - len) as u32;
+    block[node + 4..node + 8].copy_from_slice(&new_used.to_le_bytes());
+}
+
+/// Split a full block's entries around the median, with `pending` occupying
+/// `insert_pos`. Returns (left entries, median entry, right entries, end
+/// sentinel preserved verbatim).
+#[allow(clippy::type_complexity)]
+fn split_indx_entries(
+    block: &[u8],
+    insert_pos: usize,
+    pending: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>), FilesystemError> {
+    let (es, ee, _) = indx_entry_bounds(block).ok_or_else(|| {
+        FilesystemError::Parse("INDX block has a bad node header during split".into())
+    })?;
+    let region = &block[es..ee];
+    let end_off = entries_end_sentinel_offset(region);
+    let end_sentinel = region[end_off..].to_vec();
+
+    let mut combined: Vec<&[u8]> = Vec::new();
+    for (off, len, flags) in walk_index_entries(region) {
+        if es + off == insert_pos {
+            combined.push(pending);
+        }
+        if flags & INDEX_ENTRY_END != 0 {
+            break;
+        }
+        combined.push(&region[off..off + len]);
+    }
+    if combined.len() < 3 {
+        return Err(FilesystemError::Parse(
+            "index node too small to split".into(),
+        ));
+    }
+    let m = combined.len() / 2;
+    let left: Vec<u8> = combined[..m].concat();
+    let median = combined[m].to_vec();
+    let right: Vec<u8> = combined[m + 1..].concat();
+    Ok((left, median, right, end_sentinel))
+}
+
 // =============================================================================
 // EditableFilesystem Implementation
 // =============================================================================
@@ -2961,7 +3830,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
             return Err(FilesystemError::AlreadyExists(name.to_string()));
         }
 
-        let record_num = self.allocate_mft_record()?;
+        let (record_num, record_seq) = self.allocate_mft_record()?;
 
         // Read file data
         let mut file_data = vec![0u8; data_len as usize];
@@ -3029,12 +3898,17 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
             attrs.push(build_resident_attr(ATTR_SECURITY_DESCRIPTOR, &sd_value));
         }
         attrs.push(data_attr);
-        let mut record =
-            assemble_mft_record(&attrs, MFT_RECORD_IN_USE, self.mft_record_size, record_num);
+        let mut record = assemble_mft_record(
+            &attrs,
+            MFT_RECORD_IN_USE,
+            self.mft_record_size,
+            record_num,
+            record_seq,
+        );
         self.write_mft_record(record_num, &mut record)?;
 
         // Build index entry and insert
-        let index_entry = build_index_entry(record_num, 1, &file_name_value);
+        let index_entry = build_index_entry(record_num, record_seq, &file_name_value);
         self.insert_index_entry(parent_record_num, &index_entry)?;
 
         let path = if parent.path == "/" {
@@ -3069,7 +3943,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
             return Err(FilesystemError::AlreadyExists(name.to_string()));
         }
 
-        let record_num = self.allocate_mft_record()?;
+        let (record_num, record_seq) = self.allocate_mft_record()?;
 
         // Follow the volume's own version: only 3.x has a security_id field to fill.
         let sec_id =
@@ -3083,8 +3957,16 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
         let parent_ref = self.file_reference(parent_record_num);
         let file_name_value = build_file_name_attr(parent_ref, name, true, 0, now);
         let file_name_attr = build_resident_attr(ATTR_FILE_NAME, &file_name_value);
-        let index_root =
-            build_named_resident_attr(ATTR_INDEX_ROOT, "$I30", &build_empty_index_root());
+        let index_root = build_named_resident_attr(
+            ATTR_INDEX_ROOT,
+            "$I30",
+            &build_empty_index_root(
+                self.index_record_size,
+                self.cluster_size,
+                self.bytes_per_sector,
+                false,
+            ),
+        );
 
         let mut attrs = vec![std_info, file_name_attr];
         if sec_id.is_none() {
@@ -3097,11 +3979,12 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
             MFT_RECORD_IN_USE | MFT_RECORD_IS_DIRECTORY,
             self.mft_record_size,
             record_num,
+            record_seq,
         );
         self.write_mft_record(record_num, &mut record)?;
 
         // Build index entry and insert
-        let index_entry = build_index_entry(record_num, 1, &file_name_value);
+        let index_entry = build_index_entry(record_num, record_seq, &file_name_value);
         self.insert_index_entry(parent_record_num, &index_entry)?;
 
         let path = if parent.path == "/" {
@@ -3136,12 +4019,14 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
         // Remove from parent's index
         self.remove_index_entry(parent_record_num, &entry.name)?;
 
-        // Free data clusters if non-resident
+        // Free data and index-allocation clusters if non-resident
         let record_number = entry.location;
         if let Ok(record) = self.read_mft_record(record_number) {
             let attrs = parse_mft_attributes(&record, self.mft_record_size);
             for attr in &attrs {
-                if attr.attr_type == ATTR_DATA && !attr.resident {
+                if (attr.attr_type == ATTR_DATA || attr.attr_type == ATTR_INDEX_ALLOCATION)
+                    && !attr.resident
+                {
                     let runs: Vec<(u64, u64)> = attr
                         .data_runs
                         .iter()
@@ -3816,6 +4701,431 @@ mod tests {
         assert_eq!(parsed.mft_cluster, 100);
         assert_eq!(parsed.mft_mirror_cluster, 50);
         assert_eq!(parsed.mft_record_size, 1024);
+        // 0x44 is zero in this fixture; the parser falls back to 4096.
+        assert_eq!(parsed.index_record_size, 4096);
+    }
+
+    #[test]
+    fn test_parse_vbr_index_record_size_encodings() {
+        let mut vbr = make_ntfs_vbr();
+        vbr[0x44] = 1; // positive: clusters per index record (cluster = 4096)
+        assert_eq!(parse_vbr(&vbr).unwrap().index_record_size, 4096);
+        vbr[0x44] = (-12i8) as u8; // negative power: 2^12
+        assert_eq!(parse_vbr(&vbr).unwrap().index_record_size, 4096);
+        vbr[0x44] = (-11i8) as u8; // 2^11 (unusual but well-formed)
+        assert_eq!(parse_vbr(&vbr).unwrap().index_record_size, 2048);
+    }
+
+    // ---- B-tree index editing tests ----
+
+    fn format_test_volume(cluster: u32, mft_hint: u64) -> Cursor<Vec<u8>> {
+        use crate::fs::ntfs_format::{create_ntfs, NtfsFormatParams, NtfsGeometry};
+        let mut cur = Cursor::new(Vec::new());
+        create_ntfs(
+            &mut cur,
+            &NtfsFormatParams {
+                total_size: 64 * 1024 * 1024,
+                geometry: NtfsGeometry::with_cluster_size(cluster, 512).unwrap(),
+                mft_records_hint: mft_hint,
+                label: Some("RBIDX".to_string()),
+            },
+        )
+        .unwrap();
+        cur.seek(SeekFrom::Start(0)).unwrap();
+        cur
+    }
+
+    /// Deterministic non-sorted creation order covering 0..n (gcd(7, n) == 1).
+    fn shuffled_names(n: usize) -> Vec<String> {
+        (0..n)
+            .map(|i| format!("file-{:03}.dat", (i * 7 + 3) % n))
+            .collect()
+    }
+
+    /// Recursively assert a node's entries are sorted, bounded, and that child
+    /// pointers match the node kind; collects visited blocks and entry refs.
+    #[allow(clippy::too_many_arguments)]
+    fn verify_index_node(
+        stream: &[u8],
+        block_size: u32,
+        cluster_size: u64,
+        region: &[u8],
+        internal: bool,
+        lower: Option<&str>,
+        upper: Option<&str>,
+        blocks: &mut Vec<u64>,
+        refs: &mut Vec<(String, u64)>,
+    ) {
+        let mut prev: Option<String> = lower.map(|s| s.to_string());
+        let mut saw_end = false;
+        for (off, len, flags) in walk_index_entries(region) {
+            let entry = &region[off..off + len];
+            let is_end = flags & INDEX_ENTRY_END != 0;
+            let vcn = entry_sub_vcn(entry);
+            assert_eq!(
+                vcn.is_some(),
+                internal,
+                "sub-node VCN presence must match node kind"
+            );
+            let name_opt = if is_end {
+                saw_end = true;
+                None
+            } else {
+                let name = extract_name_from_index_entry(entry).to_uppercase();
+                if let Some(p) = &prev {
+                    assert!(p.as_str() < name.as_str(), "sorted order: {p} !< {name}");
+                }
+                if let Some(u) = upper {
+                    assert!(name.as_str() < u, "{name} exceeds upper bound {u}");
+                }
+                refs.push((
+                    extract_name_from_index_entry(entry),
+                    u64::from_le_bytes(entry[0..8].try_into().unwrap()),
+                ));
+                Some(name)
+            };
+            if let Some(v) = vcn {
+                // The child holds keys strictly between the previous entry and
+                // this one (or `upper` for the end sentinel's child).
+                let child_upper = name_opt.as_deref().or(upper);
+                let off_bytes = idx_vcn_to_stream_offset(v, block_size, cluster_size);
+                assert_eq!(off_bytes % block_size as u64, 0, "child VCN block-aligned");
+                let bi = off_bytes / block_size as u64;
+                blocks.push(bi);
+                let block = get_indx_block(stream, bi, block_size).expect("child INDX block");
+                let (es, ee, ae) = indx_entry_bounds(&block).expect("child node bounds");
+                assert_eq!(ae, block_size as usize, "index_allocated spans the block");
+                verify_index_node(
+                    stream,
+                    block_size,
+                    cluster_size,
+                    &block[es..ee],
+                    indx_is_internal(&block),
+                    prev.as_deref(),
+                    child_upper,
+                    blocks,
+                    refs,
+                );
+            }
+            if let Some(name) = name_opt {
+                prev = Some(name);
+            }
+            if is_end {
+                break;
+            }
+        }
+        assert!(saw_end, "every index node ends with an end sentinel");
+    }
+
+    /// Full structural check of a directory's $I30 tree; returns every entry's
+    /// (name, raw file reference) found in the index.
+    fn verify_directory_index<R: Read + Write + Seek + Send>(
+        fs: &mut NtfsFilesystem<R>,
+        dir_record: u64,
+    ) -> Vec<(String, u64)> {
+        let record = fs.read_mft_record(dir_record).unwrap();
+        let root = parse_root_node(&record, fs.index_record_size).expect("resident $INDEX_ROOT");
+        assert_eq!(root.block_size, fs.index_record_size, "declared block size");
+        let ir_start = root.node_start - 16;
+        assert_eq!(
+            record[ir_start + 12],
+            idx_clusters_per_block_byte(fs.index_record_size, fs.cluster_size, fs.bytes_per_sector),
+            "clusters-per-index-block byte must match the volume geometry"
+        );
+
+        let region = record[root.entries_start..root.entries_end].to_vec();
+        let mut blocks = Vec::new();
+        let mut refs = Vec::new();
+        if root.large {
+            let stream = fs.read_i30_allocation(&record).unwrap();
+            verify_index_node(
+                &stream,
+                root.block_size,
+                fs.cluster_size,
+                &region,
+                true,
+                None,
+                None,
+                &mut blocks,
+                &mut refs,
+            );
+            // Every reachable block must be marked in the $I30 bitmap.
+            let (bpos, _) = find_attr_pos(&record, ATTR_BITMAP, true).expect("$I30 $BITMAP");
+            let voff = u16::from_le_bytes([record[bpos + 0x14], record[bpos + 0x15]]) as usize;
+            let vlen = u32::from_le_bytes([
+                record[bpos + 0x10],
+                record[bpos + 0x11],
+                record[bpos + 0x12],
+                record[bpos + 0x13],
+            ]) as usize;
+            let bm = &record[bpos + voff..bpos + voff + vlen];
+            for b in &blocks {
+                assert!(
+                    bm[(b / 8) as usize] & (1 << (b % 8)) != 0,
+                    "INDX block {b} must be set in the $I30 bitmap"
+                );
+            }
+        } else {
+            assert!(
+                find_attr_pos(&record, ATTR_INDEX_ALLOCATION, false).is_none(),
+                "small index must not carry $INDEX_ALLOCATION"
+            );
+            verify_index_node(
+                &[],
+                root.block_size,
+                fs.cluster_size,
+                &region,
+                false,
+                None,
+                None,
+                &mut blocks,
+                &mut refs,
+            );
+        }
+
+        // Every index entry's file reference must resolve to an in-use record
+        // whose sequence matches (Windows prunes entries when it does not).
+        for (name, raw_ref) in &refs {
+            let rec_num = raw_ref & 0x0000_FFFF_FFFF_FFFF;
+            let seq = (raw_ref >> 48) as u16;
+            let child = fs.read_mft_record(rec_num).unwrap();
+            let child_seq = u16::from_le_bytes([child[0x10], child[0x11]]);
+            let flags = u16::from_le_bytes([child[0x16], child[0x17]]);
+            assert_eq!(child_seq, seq, "entry '{name}' carries a stale sequence");
+            assert!(
+                flags & MFT_RECORD_IN_USE != 0,
+                "entry '{name}' points at a free record"
+            );
+        }
+        refs
+    }
+
+    fn put_file<R: Read + Write + Seek + Send>(
+        fs: &mut NtfsFilesystem<R>,
+        dir: &FileEntry,
+        name: &str,
+        content: &[u8],
+    ) {
+        let mut src = Cursor::new(content.to_vec());
+        fs.create_file(
+            dir,
+            name,
+            &mut src,
+            content.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .unwrap_or_else(|e| panic!("create {name}: {e:?}"));
+    }
+
+    #[test]
+    fn directory_grows_past_resident_root_across_geometry() {
+        for cluster in [512u32, 1024, 4096] {
+            let cur = format_test_volume(cluster, 256);
+            let mut fs = NtfsFilesystem::open(cur, 0).unwrap();
+            let root = fs.root().unwrap();
+            let dir = fs
+                .create_directory(&root, "stage", &CreateDirectoryOptions::default())
+                .unwrap();
+
+            let names = shuffled_names(40);
+            for name in &names {
+                put_file(&mut fs, &dir, name, name.as_bytes());
+            }
+            // One non-resident file exercises cluster allocation alongside.
+            let big = vec![0xA5u8; 200_000];
+            put_file(&mut fs, &dir, "big-payload.bin", &big);
+
+            let refs = verify_directory_index(&mut fs, dir.location);
+            assert_eq!(refs.len(), 41, "cluster={cluster}: all entries indexed");
+            EditableFilesystem::sync_metadata(&mut fs).unwrap();
+
+            // Reopen from scratch and read everything back.
+            let cur = fs.into_reader();
+            let mut fs = NtfsFilesystem::open(cur, 0).unwrap();
+            let root = fs.root().unwrap();
+            let dir = fs
+                .list_directory(&root)
+                .unwrap()
+                .into_iter()
+                .find(|e| e.name == "stage")
+                .expect("stage dir listed");
+            let listed = fs.list_directory(&dir).unwrap();
+            assert_eq!(listed.len(), 41, "cluster={cluster}");
+            for name in &names {
+                let f = listed
+                    .iter()
+                    .find(|e| e.name == *name)
+                    .unwrap_or_else(|| panic!("cluster={cluster}: {name} missing after reopen"));
+                assert_eq!(fs.read_file(f, f.size as usize).unwrap(), name.as_bytes());
+            }
+            let f = listed.iter().find(|e| e.name == "big-payload.bin").unwrap();
+            assert_eq!(fs.read_file(f, f.size as usize).unwrap(), big);
+        }
+    }
+
+    #[test]
+    fn root_directory_takes_a_hundred_files_alongside_metafiles() {
+        let cur = format_test_volume(512, 512);
+        let mut fs = NtfsFilesystem::open(cur, 0).unwrap();
+        let root = fs.root().unwrap();
+        let names = shuffled_names(100);
+        for name in &names {
+            put_file(&mut fs, &root, name, name.as_bytes());
+        }
+        let refs = verify_directory_index(&mut fs, MFT_RECORD_ROOT);
+        // 100 files + 12 system entries ('.' + 11 metafiles).
+        assert_eq!(refs.len(), 112);
+
+        let cur = fs.into_reader();
+        let mut fs = NtfsFilesystem::open(cur, 0).unwrap();
+        let root = fs.root().unwrap();
+        let listed = fs.list_directory(&root).unwrap();
+        assert_eq!(listed.len(), 100, "metafiles filtered, user files kept");
+        for name in &names {
+            let f = listed.iter().find(|e| e.name == *name).unwrap();
+            assert_eq!(fs.read_file(f, f.size as usize).unwrap(), name.as_bytes());
+        }
+    }
+
+    #[test]
+    fn deleting_separator_entries_keeps_the_tree_sound() {
+        let cur = format_test_volume(512, 256);
+        let mut fs = NtfsFilesystem::open(cur, 0).unwrap();
+        let root = fs.root().unwrap();
+        let dir = fs
+            .create_directory(&root, "stage", &CreateDirectoryOptions::default())
+            .unwrap();
+        for name in &shuffled_names(60) {
+            put_file(&mut fs, &dir, name, name.as_bytes());
+        }
+
+        // The large root's own entries are the separators.
+        let record = fs.read_mft_record(dir.location).unwrap();
+        let rn = parse_root_node(&record, fs.index_record_size).unwrap();
+        assert!(rn.large, "60 entries must have promoted the root");
+        let separators: Vec<String> = walk_index_entries(&record[rn.entries_start..rn.entries_end])
+            .iter()
+            .filter(|(_, _, f)| f & INDEX_ENTRY_END == 0)
+            .map(|(o, l, _)| {
+                extract_name_from_index_entry(
+                    &record[rn.entries_start + o..rn.entries_start + o + l],
+                )
+            })
+            .collect();
+        assert!(!separators.is_empty(), "expected pushed-up separators");
+
+        for sep in &separators {
+            let listing = fs.list_directory(&dir).unwrap();
+            let victim = listing
+                .iter()
+                .find(|e| e.name == *sep)
+                .expect("separator listed");
+            fs.delete_entry(&dir, victim).unwrap();
+            verify_directory_index(&mut fs, dir.location);
+        }
+
+        // Delete everything else; the directory must empty out cleanly.
+        for entry in fs.list_directory(&dir).unwrap() {
+            fs.delete_entry(&dir, &entry).unwrap();
+            verify_directory_index(&mut fs, dir.location);
+        }
+        assert!(fs.list_directory(&dir).unwrap().is_empty());
+        let root = fs.root().unwrap();
+        let dir_entry = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "stage")
+            .unwrap();
+        fs.delete_entry(&root, &dir_entry).unwrap();
+        let root = fs.root().unwrap();
+        assert!(fs.list_directory(&root).unwrap().is_empty());
+    }
+
+    #[test]
+    fn rename_moves_entries_between_index_nodes() {
+        let cur = format_test_volume(512, 256);
+        let mut fs = NtfsFilesystem::open(cur, 0).unwrap();
+        let root = fs.root().unwrap();
+        let dir = fs
+            .create_directory(&root, "stage", &CreateDirectoryOptions::default())
+            .unwrap();
+        for name in &shuffled_names(50) {
+            put_file(&mut fs, &dir, name, name.as_bytes());
+        }
+        let listing = fs.list_directory(&dir).unwrap();
+        let first = listing.iter().find(|e| e.name == "file-000.dat").unwrap();
+        fs.rename(&dir, first, "zzz-moved-to-the-far-end.dat")
+            .unwrap();
+        verify_directory_index(&mut fs, dir.location);
+
+        let listing = fs.list_directory(&dir).unwrap();
+        assert!(listing
+            .iter()
+            .any(|e| e.name == "zzz-moved-to-the-far-end.dat"));
+        assert!(!listing.iter().any(|e| e.name == "file-000.dat"));
+        let moved = listing
+            .iter()
+            .find(|e| e.name == "zzz-moved-to-the-far-end.dat")
+            .unwrap();
+        assert_eq!(
+            fs.read_file(moved, moved.size as usize).unwrap(),
+            b"file-000.dat"
+        );
+    }
+
+    #[test]
+    fn reused_mft_record_bumps_sequence_and_index_entry_matches() {
+        let cur = format_test_volume(512, 128);
+        let mut fs = NtfsFilesystem::open(cur, 0).unwrap();
+        let root = fs.root().unwrap();
+        put_file(&mut fs, &root, "first.txt", b"one");
+        let listing = fs.list_directory(&root).unwrap();
+        let first = listing.iter().find(|e| e.name == "first.txt").unwrap();
+        let rec_num = first.location;
+        let seq1 = {
+            let r = fs.read_mft_record(rec_num).unwrap();
+            u16::from_le_bytes([r[0x10], r[0x11]])
+        };
+        fs.delete_entry(&root, first).unwrap();
+
+        put_file(&mut fs, &root, "second.txt", b"two");
+        let listing = fs.list_directory(&root).unwrap();
+        let second = listing.iter().find(|e| e.name == "second.txt").unwrap();
+        assert_eq!(second.location, rec_num, "record slot reused");
+        let seq2 = {
+            let r = fs.read_mft_record(rec_num).unwrap();
+            u16::from_le_bytes([r[0x10], r[0x11]])
+        };
+        assert_eq!(seq2, seq1 + 1, "sequence bumped on reuse");
+        let refs = verify_directory_index(&mut fs, MFT_RECORD_ROOT);
+        let (_, raw) = refs.iter().find(|(n, _)| n == "second.txt").unwrap();
+        assert_eq!(
+            (raw >> 48) as u16,
+            seq2,
+            "index entry carries the new sequence"
+        );
+    }
+
+    #[test]
+    fn created_directory_declares_volume_index_geometry() {
+        // Regression for the hardcoded 4096/1 geometry: on a 512-byte-cluster
+        // volume the clusters-per-index-block byte must be 8.
+        let cur = format_test_volume(512, 128);
+        let mut fs = NtfsFilesystem::open(cur, 0).unwrap();
+        let root = fs.root().unwrap();
+        let dir = fs
+            .create_directory(&root, "geomdir", &CreateDirectoryOptions::default())
+            .unwrap();
+        let record = fs.read_mft_record(dir.location).unwrap();
+        let rn = parse_root_node(&record, fs.index_record_size).unwrap();
+        let ir_start = rn.node_start - 16;
+        assert_eq!(rn.block_size, 4096);
+        assert_eq!(
+            record[ir_start + 12],
+            8,
+            "8 clusters of 512 bytes per block"
+        );
     }
 
     #[test]
