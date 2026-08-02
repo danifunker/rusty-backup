@@ -1769,6 +1769,59 @@ fn build_file_name_attr(
     data
 }
 
+/// Repack a self-relative security descriptor compactly: mkntfs stores the
+/// root's with a padded 4 KiB DACL, far too big to inherit resident.
+/// None when the blob is malformed or carries a SACL (never ours).
+fn repack_security_descriptor(sd: &[u8]) -> Option<Vec<u8>> {
+    if sd.len() < 20 {
+        return None;
+    }
+    let off = |i: usize| u32::from_le_bytes([sd[i], sd[i + 1], sd[i + 2], sd[i + 3]]) as usize;
+    let (o_own, o_grp, o_sacl, o_dacl) = (off(4), off(8), off(12), off(16));
+    if o_sacl != 0 || o_own == 0 || o_grp == 0 || o_dacl == 0 {
+        return None;
+    }
+    let sid = |o: usize| -> Option<&[u8]> {
+        let count = *sd.get(o + 1)? as usize;
+        sd.get(o..o + 8 + count * 4)
+    };
+    let owner = sid(o_own)?;
+    let group = sid(o_grp)?;
+
+    // Walk the DACL's ACEs by their own size fields; the ACL header's size
+    // includes slack we drop.
+    let ace_count = u16::from_le_bytes([*sd.get(o_dacl + 4)?, *sd.get(o_dacl + 5)?]) as usize;
+    let mut aces: Vec<u8> = Vec::new();
+    let mut pos = o_dacl + 8;
+    for _ in 0..ace_count {
+        let size = u16::from_le_bytes([*sd.get(pos + 2)?, *sd.get(pos + 3)?]) as usize;
+        if size < 8 {
+            return None;
+        }
+        aces.extend_from_slice(sd.get(pos..pos + size)?);
+        pos += size;
+    }
+    let acl_len = 8 + aces.len();
+
+    let mut out = vec![0u8; 20];
+    out[0] = sd[0]; // revision
+    out[2..4].copy_from_slice(&sd[2..4]); // control
+    out[16..20].copy_from_slice(&20u32.to_le_bytes()); // DACL right after header
+                                                       // ACL header: revision(1) sbz1(1) size(2) ace_count(2) sbz2(2).
+    out.extend_from_slice(&sd[o_dacl..o_dacl + 2]);
+    out.extend_from_slice(&(acl_len as u16).to_le_bytes());
+    out.extend_from_slice(&(ace_count as u16).to_le_bytes());
+    out.extend_from_slice(&[0, 0]);
+    out.extend_from_slice(&aces);
+    let o = out.len() as u32;
+    out[4..8].copy_from_slice(&o.to_le_bytes()); // owner offset
+    out.extend_from_slice(owner);
+    let g = out.len() as u32;
+    out[8..12].copy_from_slice(&g.to_le_bytes()); // group offset
+    out.extend_from_slice(group);
+    Some(out)
+}
+
 /// Build a minimal security descriptor granting Everyone:FullControl.
 fn build_default_security_descriptor() -> Vec<u8> {
     // Self-relative SD with DACL, owner=Everyone SID, group=Everyone SID
@@ -2462,28 +2515,35 @@ impl<R: Read + Write + Seek> NtfsFilesystem<R> {
         DEFAULT_SECURITY_ID
     }
 
+    /// The parent's own $SECURITY_DESCRIPTOR value, trimmed to its effective
+    /// length. None when the parent carries no SD attribute (3.x volumes
+    /// normally express ACLs through $Secure ids instead), or it cannot fit.
+    fn parent_sd_attr_value(&mut self, parent_record_num: u64) -> Option<Vec<u8>> {
+        // Max SD size that will fit as a resident attr in a 1024-byte record
+        // alongside other attributes (leave ~600 bytes for other attrs + header)
+        let max_sd_size = (self.mft_record_size as usize).saturating_sub(600);
+        let record = self.read_mft_record(parent_record_num).ok()?;
+        let attrs = parse_mft_attributes(&record, self.mft_record_size);
+        for attr in &attrs {
+            if attr.attr_type == ATTR_SECURITY_DESCRIPTOR {
+                let raw = self.read_attribute_data(attr, None).ok()?;
+                let sd = repack_security_descriptor(&raw)?;
+                if sd.len() <= max_sd_size {
+                    return Some(sd);
+                }
+                return None;
+            }
+        }
+        None
+    }
+
     fn read_parent_security_descriptor(
         &mut self,
         parent_record_num: u64,
     ) -> Result<Vec<u8>, FilesystemError> {
-        // Max SD size that will fit as a resident attr in a 1024-byte record
-        // alongside other attributes (leave ~600 bytes for other attrs + header)
-        let max_sd_size = (self.mft_record_size as usize).saturating_sub(600);
-
-        if let Ok(record) = self.read_mft_record(parent_record_num) {
-            let attrs = parse_mft_attributes(&record, self.mft_record_size);
-            for attr in &attrs {
-                if attr.attr_type == ATTR_SECURITY_DESCRIPTOR {
-                    let sd = self.read_attribute_data(attr, None)?;
-                    if sd.len() <= max_sd_size {
-                        return Ok(sd);
-                    }
-                    // Parent SD too large, fall through to default
-                    break;
-                }
-            }
-        }
-        Ok(build_default_security_descriptor())
+        Ok(self
+            .parent_sd_attr_value(parent_record_num)
+            .unwrap_or_else(build_default_security_descriptor))
     }
 
     /// Check if a name exists in a directory's index.
@@ -3895,9 +3955,16 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
         };
 
         // Build attributes
-        // Follow the volume's own version: only 3.x has a security_id field to fill.
-        let sec_id =
-            (self.ntfs_version.0 >= 3).then(|| self.read_parent_security_id(parent_record_num));
+        // A parent with its own $SECURITY_DESCRIPTOR (our formatter's root) is
+        // inherited verbatim; otherwise 3.x volumes inherit the $Secure id.
+        let parent_sd = self.parent_sd_attr_value(parent_record_num);
+        let sec_id = (self.ntfs_version.0 >= 3).then(|| {
+            if parent_sd.is_some() {
+                0
+            } else {
+                self.read_parent_security_id(parent_record_num)
+            }
+        });
         // One stamp for both structures: Windows writes them equal at creation.
         let now = now_ntfs_timestamp();
         let std_info = build_resident_attr(
@@ -3911,7 +3978,9 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
         // 3.x resolves the ACL through $Secure by the inherited id; a per-file
         // descriptor beside it is the 1.2 form, and Windows honours that instead.
         let mut attrs = vec![std_info, file_name_attr];
-        if sec_id.is_none() {
+        if let Some(sd) = &parent_sd {
+            attrs.push(build_resident_attr(ATTR_SECURITY_DESCRIPTOR, sd));
+        } else if sec_id.is_none() {
             let sd_value = self.read_parent_security_descriptor(parent_record_num)?;
             attrs.push(build_resident_attr(ATTR_SECURITY_DESCRIPTOR, &sd_value));
         }
@@ -3963,9 +4032,16 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
 
         let (record_num, record_seq) = self.allocate_mft_record()?;
 
-        // Follow the volume's own version: only 3.x has a security_id field to fill.
-        let sec_id =
-            (self.ntfs_version.0 >= 3).then(|| self.read_parent_security_id(parent_record_num));
+        // A parent with its own $SECURITY_DESCRIPTOR (our formatter's root) is
+        // inherited verbatim; otherwise 3.x volumes inherit the $Secure id.
+        let parent_sd = self.parent_sd_attr_value(parent_record_num);
+        let sec_id = (self.ntfs_version.0 >= 3).then(|| {
+            if parent_sd.is_some() {
+                0
+            } else {
+                self.read_parent_security_id(parent_record_num)
+            }
+        });
         // Directories carry no archive bit; their directory flag lives in $FILE_NAME.
         let now = now_ntfs_timestamp();
         let std_info = build_resident_attr(
@@ -3987,7 +4063,9 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
         );
 
         let mut attrs = vec![std_info, file_name_attr];
-        if sec_id.is_none() {
+        if let Some(sd) = &parent_sd {
+            attrs.push(build_resident_attr(ATTR_SECURITY_DESCRIPTOR, sd));
+        } else if sec_id.is_none() {
             let sd_value = self.read_parent_security_descriptor(parent_record_num)?;
             attrs.push(build_resident_attr(ATTR_SECURITY_DESCRIPTOR, &sd_value));
         }
@@ -5125,6 +5203,111 @@ mod tests {
         );
     }
 
+    /// Walk a self-relative SD's DACL, returning (mask, sid-bytes) per ACE.
+    /// Panics on any structural inconsistency — this is the shape Windows
+    /// parses, and a malformed one silently reads as "no access".
+    fn parse_dacl(sd: &[u8]) -> Vec<(u32, Vec<u8>)> {
+        let off = |i: usize| u32::from_le_bytes(sd[i..i + 4].try_into().unwrap()) as usize;
+        let (o_own, o_grp, o_dacl) = (off(4), off(8), off(16));
+        assert_eq!(off(12), 0, "no SACL expected");
+        assert!(o_own > 0 && o_grp > 0 && o_dacl > 0);
+        let acl_size = u16::from_le_bytes([sd[o_dacl + 2], sd[o_dacl + 3]]) as usize;
+        let ace_count = u16::from_le_bytes([sd[o_dacl + 4], sd[o_dacl + 5]]) as usize;
+        assert!(
+            o_dacl + acl_size <= sd.len(),
+            "ACL size {acl_size} overruns the {}-byte SD",
+            sd.len()
+        );
+        let mut out = Vec::new();
+        let mut pos = o_dacl + 8;
+        for i in 0..ace_count {
+            let size = u16::from_le_bytes([sd[pos + 2], sd[pos + 3]]) as usize;
+            assert!(size >= 8, "ACE {i} has size {size}");
+            assert!(pos + size <= o_dacl + acl_size, "ACE {i} overruns the ACL");
+            let mask = u32::from_le_bytes(sd[pos + 4..pos + 8].try_into().unwrap());
+            out.push((mask, sd[pos + 8..pos + size].to_vec()));
+            pos += size;
+        }
+        out
+    }
+
+    /// Bytes the DACL declares vs. the bytes its ACEs actually occupy. A
+    /// repacked SD must have no slack; mkntfs's source SD legitimately does.
+    fn dacl_extent(sd: &[u8]) -> (usize, usize) {
+        let o_dacl = u32::from_le_bytes(sd[16..20].try_into().unwrap()) as usize;
+        let acl_size = u16::from_le_bytes([sd[o_dacl + 2], sd[o_dacl + 3]]) as usize;
+        let ace_count = u16::from_le_bytes([sd[o_dacl + 4], sd[o_dacl + 5]]) as usize;
+        let mut pos = o_dacl + 8;
+        for _ in 0..ace_count {
+            pos += u16::from_le_bytes([sd[pos + 2], sd[pos + 3]]) as usize;
+        }
+        (acl_size, pos - o_dacl)
+    }
+
+    #[test]
+    fn repacked_security_descriptor_keeps_every_ace() {
+        // The formatter's root SD: a 4 KiB blob whose DACL is mostly padding.
+        let root = crate::fs::ntfs_tables::root_secdesc_for_test();
+        let orig = parse_dacl(root);
+        assert_eq!(orig.len(), 8, "root SD carries 8 ACEs");
+
+        let packed = repack_security_descriptor(root).expect("repack the root SD");
+        assert!(packed.len() < 400, "repacked to {} bytes", packed.len());
+        assert_eq!(parse_dacl(&packed), orig, "same ACEs, same order");
+        let (declared, used) = dacl_extent(&packed);
+        assert_eq!(declared, used, "repacked ACL size must match its ACEs");
+
+        // Idempotent: a child inheriting from a child must repack again.
+        let twice = repack_security_descriptor(&packed).expect("repack a repacked SD");
+        assert_eq!(twice, packed, "repacking is a fixed point");
+
+        // Users (S-1-5-32-545) keep read+execute, so a file we write is runnable.
+        let users = [1u8, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 33, 2, 0, 0];
+        let (mask, _) = orig
+            .iter()
+            .find(|(_, sid)| sid[..] == users[..])
+            .expect("Users ACE present");
+        assert_eq!(*mask & 0x20, 0x20, "FILE_EXECUTE granted to Users");
+    }
+
+    #[test]
+    fn created_files_inherit_a_working_dacl_down_the_tree() {
+        let cur = format_test_volume(512, 128);
+        let mut fs = NtfsFilesystem::open(cur, 0).unwrap();
+        let root = fs.root().unwrap();
+        let expected = parse_dacl(&fs.parent_sd_attr_value(root.location).unwrap());
+
+        // Three levels deep: each level's parent SD is the previous repack.
+        let a = fs
+            .create_directory(&root, "a", &CreateDirectoryOptions::default())
+            .unwrap();
+        let b = fs
+            .create_directory(&a, "b", &CreateDirectoryOptions::default())
+            .unwrap();
+        put_file(&mut fs, &b, "deep.txt", b"payload");
+        let deep = fs
+            .list_directory(&b)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "deep.txt")
+            .unwrap();
+
+        for (rec, what) in [
+            (a.location, "dir a"),
+            (b.location, "dir b"),
+            (deep.location, "deep.txt"),
+        ] {
+            let record = fs.read_mft_record(rec).unwrap();
+            let attrs = parse_mft_attributes(&record, fs.mft_record_size);
+            let sd_attr = attrs
+                .iter()
+                .find(|x| x.attr_type == ATTR_SECURITY_DESCRIPTOR)
+                .unwrap_or_else(|| panic!("{what} carries no $SECURITY_DESCRIPTOR"));
+            let sd = fs.read_attribute_data(sd_attr, None).unwrap();
+            assert_eq!(parse_dacl(&sd), expected, "{what} lost the inherited DACL");
+        }
+    }
+
     #[test]
     fn file_name_namespace_matches_dos_validity() {
         assert!(is_valid_dos_name("file.txt"));
@@ -5456,17 +5639,60 @@ mod tests {
             .unwrap();
         let (len, id) = sec_of(&mut fs, file.location);
         assert_eq!(len, 72, "not the 48-byte NTFS 1.2 form");
-        assert_eq!(id, pid, "must inherit the parent's $Secure id");
-
-        // An inline $SECURITY_DESCRIPTOR beside the id is the 1.2 form; Windows honours
-        // it over $Secure and the file lands unreadable with an empty Security tab.
+        // The formatter's root carries a real $SECURITY_DESCRIPTOR (the standard
+        // permissive data-volume ACL); children inherit that SD verbatim with a
+        // zero $Secure id, so Users keep read+execute on everything we write.
+        assert_eq!(id, 0, "SD-attr inheritance leaves the $Secure id unset");
         let raw = fs.read_mft_record(file.location).unwrap();
         let attrs = parse_mft_attributes(&raw, fs.mft_record_size);
+        let sd_attr = attrs
+            .iter()
+            .find(|a| a.attr_type == ATTR_SECURITY_DESCRIPTOR)
+            .expect("child inherits the root's $SECURITY_DESCRIPTOR");
+        let child_sd = fs.read_attribute_data(sd_attr, None).unwrap();
+        let root_sd = fs.parent_sd_attr_value(root.location).unwrap();
+        assert_eq!(child_sd, root_sd, "child SD is the repacked parent SD");
+        assert!(child_sd.len() < 400, "repacked SD is compact");
+
+        // A parent WITHOUT an SD attribute (Windows-made dirs) still inherits
+        // the parent's $Secure id: strip the SD attr off a fresh dir to model
+        // one, then create a child inside it.
+        let dir = fs
+            .create_directory(&root, "plain", &CreateDirectoryOptions::default())
+            .unwrap();
+        {
+            let mut rec = fs.read_mft_record(dir.location).unwrap();
+            let (pos, alen) = find_attr_pos(&rec, ATTR_SECURITY_DESCRIPTOR, true).unwrap();
+            let used = record_used_size(&rec);
+            rec.copy_within(pos + alen..used, pos);
+            rec[used - alen..used].fill(0);
+            set_record_used_size(&mut rec, used - alen);
+            // Give the dir a real id so the child has something to inherit.
+            let si = find_attr_pos(&rec, ATTR_STANDARD_INFORMATION, true)
+                .unwrap()
+                .0;
+            let voff = u16::from_le_bytes([rec[si + 0x14], rec[si + 0x15]]) as usize;
+            rec[si + voff + 0x34..si + voff + 0x38].copy_from_slice(&0x101u32.to_le_bytes());
+            fs.write_mft_record(dir.location, &mut rec).unwrap();
+        }
+        let child = fs
+            .create_file(
+                &dir,
+                "byid.txt",
+                &mut Cursor::new(b"x".as_slice()),
+                1,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+        let (clen, cid) = sec_of(&mut fs, child.location);
+        assert_eq!(clen, 72);
+        assert_eq!(cid, 0x101, "id path inherits the parent's $Secure id");
+        let raw = fs.read_mft_record(child.location).unwrap();
         assert!(
-            !attrs
+            !parse_mft_attributes(&raw, fs.mft_record_size)
                 .iter()
                 .any(|a| a.attr_type == ATTR_SECURITY_DESCRIPTOR),
-            "a 3.x file must not carry an inline $SECURITY_DESCRIPTOR"
+            "id-path children carry no inline $SECURITY_DESCRIPTOR"
         );
 
         // Windows never writes a zero attribute word for a real file.
@@ -5531,12 +5757,13 @@ mod tests {
             .unwrap();
         let (dlen, did) = sec_of(&mut fs, dir.location);
         assert_eq!(dlen, 72);
-        assert_eq!(did, pid);
+        assert_eq!(did, 0, "directories inherit the root SD the same way");
 
-        // A volume whose root predates NTFS 3 still gets a usable id, not zero.
+        // A volume whose root predates NTFS 3 still gets a usable ACL.
         let mut fixture = load_fixture("test_ntfs.img.zst");
         let mut fs2 = NtfsFilesystem::open(Cursor::new(&mut fixture), 0).unwrap();
         let root2 = fs2.root().unwrap();
+        let root2_has_sd = fs2.parent_sd_attr_value(root2.location).is_some();
         let f2 = fs2
             .create_file(
                 &root2,
@@ -5549,7 +5776,11 @@ mod tests {
         let (len2, id2) = sec_of(&mut fs2, f2.location);
         if fs2.ntfs_version.0 >= 3 {
             assert_eq!(len2, 72, "3.x volume must get the 3.x record");
-            assert_ne!(id2, 0, "and a resolvable id, never zero");
+            if root2_has_sd {
+                assert_eq!(id2, 0, "SD-attr inheritance leaves the id unset");
+            } else {
+                assert_ne!(id2, 0, "id inheritance needs a resolvable id");
+            }
         } else {
             assert_eq!(len2, 48, "a 1.2 volume must keep the 1.2 record");
         }
