@@ -2355,6 +2355,18 @@ impl<R: Read + Write + Seek> NtfsFilesystem<R> {
 
     /// Insert an index entry into a directory's $INDEX_ROOT.
     /// Falls back to $INDEX_ALLOCATION if $INDEX_ROOT is full.
+    /// An NTFS file reference: 48-bit record number plus the record's own
+    /// sequence number on top. A parent reference carrying a zero sequence looks
+    /// stale to Windows, which prunes the entry when it self-heals on mount.
+    fn file_reference(&mut self, record_num: u64) -> u64 {
+        let seq = self
+            .read_mft_record(record_num)
+            .ok()
+            .map(|r| u16::from_le_bytes([r[0x10], r[0x11]]))
+            .unwrap_or(1);
+        (record_num & 0x0000_FFFF_FFFF_FFFF) | ((seq as u64) << 48)
+    }
+
     fn insert_index_entry(
         &mut self,
         parent_record_num: u64,
@@ -2990,7 +3002,8 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
             ATTR_STANDARD_INFORMATION,
             &build_standard_information(FILE_ATTR_ARCHIVE, sec_id, now),
         );
-        let file_name_value = build_file_name_attr(parent_record_num, name, false, data_len, now);
+        let parent_ref = self.file_reference(parent_record_num);
+        let file_name_value = build_file_name_attr(parent_ref, name, false, data_len, now);
         let file_name_attr = build_resident_attr(ATTR_FILE_NAME, &file_name_value);
 
         // 3.x resolves the ACL through $Secure by the inherited id; a per-file
@@ -3052,7 +3065,8 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
             ATTR_STANDARD_INFORMATION,
             &build_standard_information(0, sec_id, now),
         );
-        let file_name_value = build_file_name_attr(parent_record_num, name, true, 0, now);
+        let parent_ref = self.file_reference(parent_record_num);
+        let file_name_value = build_file_name_attr(parent_ref, name, true, 0, now);
         let file_name_attr = build_resident_attr(ATTR_FILE_NAME, &file_name_value);
         let index_root = build_resident_attr(ATTR_INDEX_ROOT, &build_empty_index_root());
 
@@ -3170,8 +3184,9 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
         // The new name lives in two places: the child record's $FILE_NAME
         // attribute and the parent directory's $I30 index entry. Both carry a
         // $FILE_NAME structure; build it once.
+        let parent_ref = self.file_reference(parent_record_num);
         let mut new_fn_value = build_file_name_attr(
-            parent_record_num,
+            parent_ref,
             new_name,
             is_dir,
             entry.size,
