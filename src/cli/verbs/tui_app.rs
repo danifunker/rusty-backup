@@ -4794,7 +4794,7 @@ impl App {
                 Ok(v) if v <= 0o7777 => Some(v),
                 _ => {
                     if let Some(m) = self.explorer.as_mut().and_then(|e| e.metadata.as_mut()) {
-                        m.error = Some("Bad mode — octal, 1-4 digits, <= 7777".to_string());
+                        m.error = Some("Bad mode - octal, 1-4 digits, <= 7777".to_string());
                     }
                     return;
                 }
@@ -4810,7 +4810,7 @@ impl App {
                 Some(pair) => Some(pair),
                 None => {
                     if let Some(m) = self.explorer.as_mut().and_then(|e| e.metadata.as_mut()) {
-                        m.error = Some("Bad owner — want uid:gid, e.g. 0:0".to_string());
+                        m.error = Some("Bad owner - want uid:gid, e.g. 0:0".to_string());
                     }
                     return;
                 }
@@ -4823,7 +4823,7 @@ impl App {
                 Some(v) => Some(v),
                 None => {
                     if let Some(m) = self.explorer.as_mut().and_then(|e| e.metadata.as_mut()) {
-                        m.error = Some("Bad date — use YYYY-MM-DD HH:MM:SS".to_string());
+                        m.error = Some("Bad date - use YYYY-MM-DD HH:MM:SS".to_string());
                     }
                     return;
                 }
