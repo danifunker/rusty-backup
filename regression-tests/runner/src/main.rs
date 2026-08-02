@@ -8,6 +8,7 @@
 //! seven verdicts in [`report::Verdict`].
 
 mod assertion;
+mod db;
 mod envelope;
 mod exec;
 mod fixtures;
@@ -33,12 +34,17 @@ struct Args {
     allow_hardware: bool,
     keep_scratch: bool,
     scratch_root: PathBuf,
+    db: Option<PathBuf>,
 }
 
 enum Command {
     Run,
     List,
     Validate,
+    /// Rebuild the database from data/*.toml, the fixture maps and run bundles.
+    DbBuild,
+    /// Ask the database a question, by named query or raw SQL.
+    DbQuery(String),
     Help,
 }
 
@@ -72,6 +78,7 @@ fn parse_args() -> Result<Args, String> {
         allow_hardware: false,
         keep_scratch: false,
         scratch_root: base.join("scratch"),
+        db: None,
     };
 
     let mut i = 0;
@@ -81,6 +88,26 @@ fn parse_args() -> Result<Args, String> {
             "run" => args.command = Command::Run,
             "list" => args.command = Command::List,
             "validate" => args.command = Command::Validate,
+            "db" => {
+                // `db build` | `db query <name-or-sql>`
+                match raw.get(i + 1).map(|s| s.as_str()) {
+                    Some("build") => {
+                        args.command = Command::DbBuild;
+                        i += 1;
+                    }
+                    Some("query") => {
+                        let q = raw.get(i + 2).cloned().unwrap_or_default();
+                        args.command = Command::DbQuery(q);
+                        i += 2;
+                    }
+                    other => {
+                        return Err(format!(
+                            "`db` needs `build` or `query`, got {:?}",
+                            other.unwrap_or("nothing")
+                        ))
+                    }
+                }
+            }
             "-h" | "--help" | "help" => args.command = Command::Help,
             "--allow-hardware" => args.allow_hardware = true,
             "--keep-scratch" => args.keep_scratch = true,
@@ -113,6 +140,10 @@ fn parse_args() -> Result<Args, String> {
                     }
                     "--filter" => {
                         args.filter = Some(value()?);
+                        i += 1;
+                    }
+                    "--db" => {
+                        args.db = Some(PathBuf::from(value()?));
                         i += 1;
                     }
                     "--tiers" => {
@@ -199,8 +230,80 @@ fn main() {
         Command::Validate => cmd_validate(&args),
         Command::List => cmd_list(&args),
         Command::Run => cmd_run(&args),
+        Command::DbBuild => cmd_db_build(&args),
+        Command::DbQuery(ref q) => cmd_db_query(&args, q),
     };
     std::process::exit(code);
+}
+
+fn db_path(args: &Args) -> PathBuf {
+    args.db.clone().unwrap_or_else(|| regression_dir().join("db").join("regression.db"))
+}
+
+fn cmd_db_build(args: &Args) -> i32 {
+    let path = db_path(args);
+    match db::build(&regression_dir(), &path) {
+        Ok(r) => {
+            println!("built {}", path.display());
+            println!(
+                "  {} formats, {} oracles, {} verifications, {} fixtures",
+                r.formats, r.oracles, r.verifications, r.fixtures
+            );
+            println!("  {} runs, {} results ingested", r.runs, r.results);
+            for w in &r.warnings {
+                println!("  warning: {}", w);
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("error: {}", e);
+            2
+        }
+    }
+}
+
+fn cmd_db_query(args: &Args, q: &str) -> i32 {
+    if q.is_empty() {
+        println!("named queries: {}", db::QUERY_NAMES.join(", "));
+        println!("or pass raw SQL");
+        return 0;
+    }
+    let sql = db::named_query(q).map(|s| s.to_string()).unwrap_or_else(|| q.to_string());
+    match db::query(&db_path(args), &sql) {
+        Ok((cols, rows)) => {
+            // Width-aligned so output is readable in a terminal without
+            // piping through another tool.
+            let mut w: Vec<usize> = cols.iter().map(|c| c.len()).collect();
+            for r in &rows {
+                for (i, c) in r.iter().enumerate() {
+                    if i < w.len() && c.len() > w[i] {
+                        w[i] = c.len();
+                    }
+                }
+            }
+            let line: Vec<String> = cols
+                .iter()
+                .enumerate()
+                .map(|(i, c)| format!("{:<width$}", c, width = w[i]))
+                .collect();
+            println!("{}", line.join("  "));
+            println!("{}", w.iter().map(|n| "-".repeat(*n)).collect::<Vec<_>>().join("  "));
+            for r in &rows {
+                let line: Vec<String> = r
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| format!("{:<width$}", c, width = w.get(i).copied().unwrap_or(0)))
+                    .collect();
+                println!("{}", line.join("  "));
+            }
+            println!("\n{} row(s)", rows.len());
+            0
+        }
+        Err(e) => {
+            eprintln!("error: {}", e);
+            2
+        }
+    }
 }
 
 fn cmd_validate(args: &Args) -> i32 {

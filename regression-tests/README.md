@@ -35,21 +35,57 @@ the gaps can be filled deliberately.
 
 ---
 
+## Data, not prose
+
+The matrix is relational — formats x oracles x platforms x fixtures x runs.
+It is held as **data the harness can execute**, not as tables in markdown.
+Three layers, and the direction of flow matters:
+
+| Layer | What | Edited by |
+|-------|------|-----------|
+| 1. Declarative input | `data/formats.toml`, `data/oracles.toml`, `fixture-map*.tsv`, `cases/**.toml` | **hand** — reviewable in a diff |
+| 2. Database | `db/regression.db`, built by `rb-regress db build` | **never** — regenerable |
+| 3. Human views | generated markdown | **never** — outputs |
+
+Prose is reserved for things that genuinely are prose: policy, rationale and
+runbooks. Anything that is a table of facts belongs in layer 1.
+
+Ask the database directly rather than reading four documents:
+
+```bash
+rb-regress db build
+rb-regress db query unverified-writes   # formats we write with no oracle
+rb-regress db query platform-pins       # what each OS uniquely verifies
+rb-regress db query coverage            # per-format fixture + oracle status
+rb-regress db query latest              # verdicts per platform, last run
+rb-regress db query "SELECT ..."        # or raw SQL
+```
+
+SQLite is compiled into the binary, so no test host needs a `sqlite3`
+package — and the `.db` is still openable by any standard tool.
+
 ## Layout
 
 ```
 regression-tests/
   README.md          <- you are here
-  PLAN.md            <- master phased tracker; the source of truth for progress
-  COVERAGE.md        <- the enumerated surface + tier assignment + status
-  FIXTURES.md        <- fixture policy, ID scheme, NAS catalog format
-  EMULATORS.md       <- tiered emulator / on-hardware verification design
+  PLAN.md            <- master phased tracker
+  FIXTURES.md        <- fixture policy and provenance rule (prose: it is an argument)
+  EMULATORS.md       <- emulator / on-hardware verification design
   HARDWARE.md        <- physical backup/restore design + safety interlocks
   REPORTING.md       <- run bundle format and triage workflow
-  runner/            <- the harness itself (standalone Rust crate)
+  data/              <- LAYER 1: formats.toml, oracles.toml
+  db/                <- schema.sql + the generated regression.db
+  runner/            <- the harness (standalone Rust crate)
   cases/             <- declarative TOML case manifests, grouped by tier
   scripts/           <- fixture inventory + corpus sync helpers
 ```
+
+`COVERAGE.md`, `VERIFICATION-MATRIX.md`, `GAPS.md` and `EMULATOR-IMAGES.md`
+are **being migrated** into layer 1. Their tables are already represented in
+`data/` and the database; the markdown remains for now as the human view and
+for the findings narrative, but should end up generated rather than
+hand-maintained.
 
 Nothing under `regression-tests/` is wired into the main `Cargo.toml`. The
 runner is a separate crate so it can be built for a test host without

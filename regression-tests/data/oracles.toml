@@ -1,0 +1,277 @@
+# Oracle registry — source of truth for VERIFICATION-MATRIX.md.
+#
+# Hand-edited, diffable, reviewable. `rb-regress db build` loads this into
+# SQLite; the markdown matrix is GENERATED from the database, never written
+# by hand.
+#
+# status values for availability:
+#   verified — actually run on that platform, with a date
+#   expected — should be there, not yet confirmed
+#   install  — exists but needs installing
+#   absent   — confirmed not available
+#
+# strength values for what an oracle proves:
+#   authoritative — the vendor's own tool (IRIX checking EFS)
+#   structural    — a competent third party (qemu-img, fsck.vfat)
+#   smoke         — opens without error, little more
+
+[[oracle]]
+id = "qemu-img"
+tool = "qemu-img"
+kind = "package"
+availability = [
+  { platform = "windows", status = "verified", path_hint = "C:/Program Files/qemu", verified_on = "2026-08-02" },
+  { platform = "wsl",     status = "verified", path_hint = "/usr/bin/qemu-img",      verified_on = "2026-08-02" },
+  { platform = "linux",   status = "expected" },
+  { platform = "macos",   status = "install",  path_hint = "brew install qemu" },
+]
+verifies = [
+  { format = "fmt.raw",         direction = "write", strength = "structural", status = "proven", evidence = "qemu-img info -> raw" },
+  { format = "fmt.qcow2",       direction = "write", strength = "structural", status = "proven", evidence = "qemu-img check -> clean" },
+  { format = "fmt.vhd-dynamic", direction = "write", strength = "structural", status = "proven", evidence = "qemu-img info -> vpc" },
+  { format = "fmt.vhd-fixed",   direction = "write", strength = "smoke",      status = "proven", evidence = "qemu-img info -> raw; vpc prober scores below raw, unresolved" },
+  { format = "fmt.vmdk-flat",   direction = "write", strength = "structural", status = "proven", evidence = "descriptor -> vmdk, extent -> raw" },
+  { format = "fmt.vmdk-sparse", direction = "write", strength = "structural", status = "proven", evidence = "qemu-img check -> No errors were found" },
+]
+
+[[oracle]]
+id = "chdman"
+tool = "chdman"
+kind = "package"
+notes = "Four versions present locally (0.174/0.189/0.273/0.288); our output verifies on all four, so the version spread is itself a coverage axis."
+availability = [
+  { platform = "windows", status = "verified", path_hint = "C:/Tools/chdman (0.288)", verified_on = "2026-08-02" },
+  { platform = "linux",   status = "install" },
+  { platform = "macos",   status = "install" },
+  { platform = "mister",  status = "absent" },
+]
+verifies = [
+  { format = "fmt.chd", direction = "write", strength = "structural", status = "proven", evidence = "chdman verify -> Raw SHA1 + Overall SHA1 successful, chdman 0.174 through 0.288" },
+]
+
+[[oracle]]
+id = "fsck.ext4"
+tool = "fsck.ext4"
+kind = "package"
+availability = [
+  { platform = "wsl",    status = "verified", path_hint = "/usr/sbin/fsck.ext4", verified_on = "2026-08-02" },
+  { platform = "mister", status = "verified", path_hint = "/usr/sbin/fsck.ext4", verified_on = "2026-08-02" },
+  { platform = "linux",  status = "expected" },
+  { platform = "macos",  status = "install", path_hint = "brew install e2fsprogs" },
+  { platform = "windows", status = "absent" },
+]
+verifies = [
+  { format = "fs.ext2", direction = "write", strength = "authoritative", status = "untested" },
+  { format = "fs.ext3", direction = "write", strength = "authoritative", status = "untested" },
+  { format = "fs.ext4", direction = "write", strength = "authoritative", status = "untested" },
+]
+
+[[oracle]]
+id = "fsck.vfat"
+tool = "fsck.vfat"
+kind = "package"
+availability = [
+  { platform = "wsl",    status = "verified", verified_on = "2026-08-02" },
+  { platform = "mister", status = "verified", verified_on = "2026-08-02" },
+  { platform = "linux",  status = "expected" },
+  { platform = "windows", status = "absent" },
+]
+verifies = [
+  { format = "fs.fat12", direction = "write", strength = "structural", status = "untested" },
+  { format = "fs.fat16", direction = "write", strength = "structural", status = "untested" },
+  { format = "fs.fat32", direction = "write", strength = "structural", status = "untested" },
+]
+
+[[oracle]]
+id = "fsck_hfs"
+tool = "fsck_hfs"
+kind = "package"
+notes = "macOS only. Nothing equivalent exists elsewhere, which is what makes a Mac non-optional."
+availability = [
+  { platform = "macos",   status = "expected" },
+  { platform = "windows", status = "absent" },
+  { platform = "linux",   status = "absent" },
+]
+verifies = [
+  { format = "fs.hfs",     direction = "write", strength = "authoritative", status = "untested" },
+  { format = "fs.hfsplus", direction = "write", strength = "authoritative", status = "untested" },
+  { format = "fs.hfv",     direction = "write", strength = "authoritative", status = "untested" },
+]
+
+[[oracle]]
+id = "fsck_apfs"
+tool = "fsck_apfs"
+kind = "package"
+availability = [
+  { platform = "macos", status = "expected" },
+  { platform = "linux", status = "absent" },
+  { platform = "windows", status = "absent" },
+]
+verifies = [{ format = "fs.apfs", direction = "write", strength = "authoritative", status = "untested" }]
+
+[[oracle]]
+id = "hdiutil"
+tool = "hdiutil"
+kind = "package"
+availability = [
+  { platform = "macos", status = "expected" },
+  { platform = "linux", status = "absent" },
+  { platform = "windows", status = "absent" },
+]
+verifies = [
+  { format = "fmt.dmg",         direction = "write", strength = "authoritative", status = "untested" },
+  { format = "fmt.sparseimage", direction = "write", strength = "authoritative", status = "untested" },
+  { format = "fmt.ndif",        direction = "write", strength = "authoritative", status = "untested" },
+]
+
+[[oracle]]
+id = "ghostexp"
+tool = "ghostexp.exe"
+kind = "package"
+notes = "Symantec Ghost Explorer 11.5. Windows only; three copies present locally."
+availability = [
+  { platform = "windows", status = "verified", path_hint = "C:/Temp/pebuilder-isolinux/Programs/ghost11", verified_on = "2026-08-02" },
+  { platform = "linux",   status = "absent" },
+  { platform = "macos",   status = "absent" },
+]
+verifies = [{ format = "fmt.gho", direction = "read", strength = "authoritative", status = "untested" }]
+
+[[oracle]]
+id = "unsquashfs"
+tool = "unsquashfs"
+kind = "package"
+availability = [
+  { platform = "wsl",   status = "verified", verified_on = "2026-08-02" },
+  { platform = "linux", status = "expected" },
+  { platform = "macos", status = "install" },
+  { platform = "windows", status = "absent" },
+]
+verifies = [{ format = "fs.squashfs", direction = "write", strength = "authoritative", status = "untested" }]
+
+[[oracle]]
+id = "xfs_repair"
+tool = "xfs_repair"
+kind = "package"
+notes = "Checks Linux-flavoured XFS; IRIX is the authority for SGI XFS."
+availability = [
+  { platform = "wsl",   status = "verified", verified_on = "2026-08-02" },
+  { platform = "linux", status = "expected" },
+]
+verifies = [{ format = "fs.xfs", direction = "write", strength = "structural", status = "untested" }]
+
+[[oracle]]
+id = "jfs_fsck"
+tool = "jfs_fsck"
+kind = "package"
+availability = [
+  { platform = "wsl",   status = "verified", verified_on = "2026-08-02" },
+  { platform = "linux", status = "expected" },
+]
+verifies = [{ format = "fs.jfs", direction = "write", strength = "authoritative", status = "untested" }]
+
+[[oracle]]
+id = "fsck.minix"
+tool = "fsck.minix"
+kind = "package"
+availability = [
+  { platform = "wsl",   status = "verified", verified_on = "2026-08-02" },
+  { platform = "linux", status = "expected" },
+]
+verifies = [
+  { format = "fs.minix1", direction = "write", strength = "authoritative", status = "untested" },
+  { format = "fs.minix2", direction = "write", strength = "authoritative", status = "untested" },
+  { format = "fs.minix3", direction = "write", strength = "authoritative", status = "untested" },
+]
+
+[[oracle]]
+id = "mount-affs"
+tool = "mount -t affs"
+kind = "mount"
+notes = "MiSTer's 5.15 kernel has affs built in; WSL does not."
+availability = [
+  { platform = "mister", status = "verified", path_hint = "/proc/filesystems", verified_on = "2026-08-02" },
+  { platform = "linux",  status = "install", path_hint = "linux-modules-extra" },
+  { platform = "wsl",    status = "absent" },
+]
+verifies = [{ format = "fs.affs", direction = "write", strength = "structural", status = "untested" }]
+
+[[oracle]]
+id = "cpmtools"
+tool = "cpmls"
+kind = "package"
+notes = "Closes the nine-DPB CP/M axis, the largest sub-axis in the suite, for one apt install."
+availability = [
+  { platform = "wsl",   status = "install" },
+  { platform = "linux", status = "expected" },
+  { platform = "macos", status = "install" },
+]
+verifies = [{ format = "fs.cpm", direction = "write", strength = "authoritative", status = "untested" }]
+
+[[oracle]]
+id = "7z"
+tool = "7z"
+kind = "package"
+availability = [
+  { platform = "windows", status = "verified", path_hint = "C:/Program Files/7-Zip", verified_on = "2026-08-02" },
+  { platform = "linux",   status = "expected" },
+  { platform = "macos",   status = "install" },
+]
+verifies = [{ format = "fmt.zip-disk", direction = "write", strength = "structural", status = "untested" }]
+
+# --- Emulator oracles --------------------------------------------------------
+
+[[oracle]]
+id = "iris"
+tool = "Iris"
+kind = "emulator"
+notes = "SGI emulator written in Rust; in-house, so blockers are fixable at source. Replaces MAME for IRIX."
+availability = [
+  { platform = "windows", status = "install" },
+  { platform = "linux",   status = "install" },
+  { platform = "macos",   status = "install" },
+]
+verifies = [
+  { format = "fs.efs",  direction = "write", strength = "authoritative", status = "plausible", evidence = "IRIX 6.5 image reads OK; boot not yet wired" },
+  { format = "fs.xfs",  direction = "write", strength = "authoritative", status = "plausible", evidence = "IRIX 6.5 mounts both XFS and EFS" },
+  { format = "part.sgi", direction = "write", strength = "authoritative", status = "plausible" },
+]
+
+[[oracle]]
+id = "fs-uae"
+tool = "FS-UAE"
+kind = "emulator"
+notes = "Cross-platform Amiga. WinUAE is Windows-only, so this is the portable choice."
+availability = [
+  { platform = "windows", status = "install" },
+  { platform = "linux",   status = "install" },
+  { platform = "macos",   status = "install" },
+]
+verifies = [
+  { format = "fs.pfs3", direction = "write", strength = "authoritative", status = "plausible", evidence = "Workbench 1.3/2.1 RDB+PFS disks on the MiSTer, 960 MB each" },
+  { format = "fs.affs", direction = "write", strength = "authoritative", status = "plausible" },
+  { format = "part.rdb", direction = "write", strength = "authoritative", status = "plausible" },
+]
+
+[[oracle]]
+id = "86box-os2"
+tool = "86Box + OS/2"
+kind = "emulator"
+notes = "OS/2's own CHKDSK is the only real HPFS oracle; the Linux hpfs module is read-only and absent from WSL."
+availability = [
+  { platform = "windows", status = "install" },
+  { platform = "linux",   status = "install" },
+  { platform = "macos",   status = "install" },
+]
+verifies = [{ format = "fs.hpfs", direction = "write", strength = "authoritative", status = "plausible" }]
+
+[[oracle]]
+id = "mister-core"
+tool = "MiSTer FPGA core"
+kind = "hardware"
+notes = "For vintage formats the core IS the reference implementation."
+availability = [{ platform = "mister", status = "verified", verified_on = "2026-08-02" }]
+verifies = [
+  { format = "fs.human68k", direction = "write", strength = "authoritative", status = "plausible" },
+  { format = "fmt.d88",     direction = "write", strength = "authoritative", status = "plausible" },
+  { format = "part.x68k",   direction = "write", strength = "authoritative", status = "plausible" },
+]

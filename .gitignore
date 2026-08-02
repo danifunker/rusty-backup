@@ -80,3 +80,6 @@ dist/
 /regression-tests/scans/
 /regression-tests/runner/target/
 regression-tests/**/*.local.toml
+
+# Generated regression database — rebuild with `rb-regress db build`.
+/regression-tests/db/*.db

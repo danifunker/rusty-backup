@@ -1,0 +1,481 @@
+# Format registry — what rb-cli reads and writes.
+#
+# Source of truth for the COVERAGE.md and VERIFICATION-MATRIX.md tables, both
+# of which are now GENERATED from this plus oracles.toml. Hand-edit here.
+#
+# `builder` names the rb-cli verb that can construct one. Presence means the
+# WRITE path exists and therefore needs an oracle behind it. It is never
+# itself evidence of correctness — see README.md "Why tier 1 is not coverage".
+
+# --- Filesystems -------------------------------------------------------------
+
+[[format]]
+id = "fs.fat12"
+kind = "fs"
+name = "FAT12"
+we_read = true
+we_write = true
+builder = "new floppy fat"
+
+[[format]]
+id = "fs.fat16"
+kind = "fs"
+name = "FAT16"
+we_read = true
+we_write = true
+builder = "new volume fat"
+
+[[format]]
+id = "fs.fat32"
+kind = "fs"
+name = "FAT32"
+we_read = true
+we_write = true
+builder = "new volume fat"
+notes = "FAT32 is auto-selected above 2 GiB, so a synthesized FAT32 volume is expensive"
+
+[[format]]
+id = "fs.exfat"
+kind = "fs"
+name = "exFAT"
+we_read = true
+we_write = false
+notes = "No builder — read/edit only, so a reference fixture is mandatory"
+
+[[format]]
+id = "fs.ntfs"
+kind = "fs"
+name = "NTFS"
+we_read = true
+we_write = true
+builder = "new volume ntfs"
+
+[[format]]
+id = "fs.hpfs"
+kind = "fs"
+name = "HPFS"
+we_read = true
+we_write = true
+builder = "new volume hpfs"
+
+[[format]]
+id = "fs.ext2"
+kind = "fs"
+name = "ext2"
+we_read = true
+we_write = true
+builder = "new volume ext"
+
+[[format]]
+id = "fs.ext3"
+kind = "fs"
+name = "ext3"
+we_read = true
+we_write = true
+builder = "new volume ext3"
+
+[[format]]
+id = "fs.ext4"
+kind = "fs"
+name = "ext4"
+we_read = true
+we_write = true
+builder = "new volume ext4"
+
+[[format]]
+id = "fs.squashfs"
+kind = "fs"
+name = "SquashFS 4.0"
+we_read = true
+we_write = true
+builder = "squashfs create"
+
+[[format]]
+id = "fs.hfs"
+kind = "fs"
+name = "HFS (Mac OS Standard)"
+we_read = true
+we_write = true
+builder = "new volume hfs"
+
+[[format]]
+id = "fs.hfsplus"
+kind = "fs"
+name = "HFS+ / HFSX"
+we_read = true
+we_write = true
+builder = "new volume hfsplus"
+
+[[format]]
+id = "fs.hfv"
+kind = "fs"
+name = "BasiliskII HFV"
+we_read = true
+we_write = true
+builder = "new volume hfv"
+notes = "Classic HFS only, 2047 MB ceiling"
+
+[[format]]
+id = "fs.mfs"
+kind = "fs"
+name = "MacPlus MFS"
+we_read = true
+we_write = true
+builder = "new floppy mfs"
+
+[[format]]
+id = "fs.apfs"
+kind = "fs"
+name = "APFS"
+we_read = true
+we_write = false
+
+[[format]]
+id = "fs.btrfs"
+kind = "fs"
+name = "btrfs"
+we_read = true
+we_write = false
+
+[[format]]
+id = "fs.jfs"
+kind = "fs"
+name = "JFS2"
+we_read = true
+we_write = false
+
+[[format]]
+id = "fs.reiserfs"
+kind = "fs"
+name = "ReiserFS v3"
+we_read = true
+we_write = false
+
+[[format]]
+id = "fs.minix1"
+kind = "fs"
+name = "Minix V1"
+we_read = true
+we_write = true
+builder = "new floppy minix"
+
+[[format]]
+id = "fs.minix2"
+kind = "fs"
+name = "Minix V2"
+we_read = true
+we_write = true
+builder = "new volume minix2"
+
+[[format]]
+id = "fs.minix3"
+kind = "fs"
+name = "Minix V3"
+we_read = true
+we_write = true
+builder = "new volume minix3"
+
+[[format]]
+id = "fs.ufs"
+kind = "fs"
+name = "UFS / FFS (UFS1, UFS2)"
+we_read = true
+we_write = false
+notes = "R-013: Solaris UFS directories mistyped as files with a garbage size"
+
+[[format]]
+id = "fs.xfs"
+kind = "fs"
+name = "SGI XFS v4/v5"
+we_read = true
+we_write = false
+
+[[format]]
+id = "fs.efs"
+kind = "fs"
+name = "SGI EFS"
+we_read = true
+we_write = true
+builder = "new hd sgi-efs"
+
+[[format]]
+id = "fs.affs"
+kind = "fs"
+name = "AFFS (OFS/FFS)"
+we_read = true
+we_write = true
+builder = "new volume affs"
+
+[[format]]
+id = "fs.pfs3"
+kind = "fs"
+name = "PFS3 / PDS3 / muFS"
+we_read = true
+we_write = true
+notes = "create_blank_pfs3 exists in-engine for tests but is not exposed on the CLI"
+
+[[format]]
+id = "fs.sfs"
+kind = "fs"
+name = "SFS (Smart File System)"
+we_read = true
+we_write = true
+notes = "No oracle and no fixture anywhere — the last uncovered Amiga filesystem"
+
+[[format]]
+id = "fs.prodos"
+kind = "fs"
+name = "ProDOS"
+we_read = true
+we_write = true
+builder = "new volume prodos"
+
+[[format]]
+id = "fs.apple-dos"
+kind = "fs"
+name = "Apple DOS 3.3"
+we_read = true
+we_write = true
+builder = "new floppy apple-dos"
+
+[[format]]
+id = "fs.cpm"
+kind = "fs"
+name = "CP/M 2.2 / 3 / Plus"
+we_read = true
+we_write = true
+builder = "new floppy cpm"
+notes = "Nine DPB presets — the largest sub-axis in the suite"
+
+[[format]]
+id = "fs.human68k"
+kind = "fs"
+name = "Human68k"
+we_read = true
+we_write = true
+builder = "new hd x68k"
+
+[[format]]
+id = "fs.cbm"
+kind = "fs"
+name = "CBM DOS (1541/1571/1581/8050/8250)"
+we_read = true
+we_write = false
+
+[[format]]
+id = "fs.lisa"
+kind = "fs"
+name = "Apple Lisa File System"
+we_read = true
+we_write = false
+
+[[format]]
+id = "fs.alto-bfs"
+kind = "fs"
+name = "Alto BFS / TFS"
+we_read = true
+we_write = false
+
+# --- Containers --------------------------------------------------------------
+
+[[format]]
+id = "fmt.raw"
+kind = "container"
+name = "Raw"
+we_read = true
+we_write = true
+builder = "convert --format raw"
+
+[[format]]
+id = "fmt.chd"
+kind = "container"
+name = "CHD (MAME)"
+we_read = true
+we_write = true
+builder = "convert --format chd"
+
+[[format]]
+id = "fmt.vhd-fixed"
+kind = "container"
+name = "Fixed VHD"
+we_read = true
+we_write = true
+builder = "convert --format vhd"
+
+[[format]]
+id = "fmt.vhd-dynamic"
+kind = "container"
+name = "Dynamic VHD"
+we_read = true
+we_write = true
+builder = "convert --format vhd-dynamic"
+
+[[format]]
+id = "fmt.qcow2"
+kind = "container"
+name = "QCOW2"
+we_read = true
+we_write = true
+builder = "convert --format qcow2"
+
+[[format]]
+id = "fmt.vmdk-flat"
+kind = "container"
+name = "VMDK flat"
+we_read = true
+we_write = true
+builder = "convert --format vmdk-flat"
+
+[[format]]
+id = "fmt.vmdk-sparse"
+kind = "container"
+name = "VMDK sparse"
+we_read = true
+we_write = true
+builder = "convert --format vmdk-sparse"
+
+[[format]]
+id = "fmt.gho"
+kind = "container"
+name = "Norton Ghost"
+we_read = true
+we_write = false
+notes = "Includes the password-protected path"
+
+[[format]]
+id = "fmt.dmg"
+kind = "container"
+name = "Apple DMG"
+we_read = true
+we_write = false
+
+[[format]]
+id = "fmt.sparseimage"
+kind = "container"
+name = "Apple sparseimage"
+we_read = true
+we_write = false
+
+[[format]]
+id = "fmt.ndif"
+kind = "container"
+name = "NDIF / self-mounting"
+we_read = true
+we_write = false
+
+[[format]]
+id = "fmt.zip-disk"
+kind = "container"
+name = "ZIP (raw disk)"
+we_read = true
+we_write = false
+
+[[format]]
+id = "fmt.d88"
+kind = "container"
+name = "Sharp D88"
+we_read = true
+we_write = true
+builder = "floppy convert --to d88"
+
+[[format]]
+id = "fmt.cbk"
+kind = "container"
+name = "cb-dos container"
+we_read = true
+we_write = true
+builder = "cbk pack"
+notes = "Our own format — no third-party reader exists, so verify the full backup/restore/boot flow instead"
+
+# --- Optical -----------------------------------------------------------------
+
+[[format]]
+id = "optical.iso9660"
+kind = "optical"
+name = "ISO 9660 (+ Joliet, Rock Ridge)"
+we_read = true
+we_write = false
+
+[[format]]
+id = "optical.high-sierra"
+kind = "optical"
+name = "High Sierra"
+we_read = true
+we_write = false
+notes = "Implemented but was untested until a fixture arrived"
+
+[[format]]
+id = "optical.udf"
+kind = "optical"
+name = "UDF"
+we_read = true
+we_write = false
+
+[[format]]
+id = "optical.cdda"
+kind = "optical"
+name = "CD-DA / mixed mode"
+we_read = true
+we_write = false
+notes = "R-012: optical info rejects discs with no data track"
+
+# --- Partition schemes -------------------------------------------------------
+
+[[format]]
+id = "part.mbr"
+kind = "partition"
+name = "MBR"
+we_read = true
+we_write = true
+
+[[format]]
+id = "part.gpt"
+kind = "partition"
+name = "GPT"
+we_read = true
+we_write = true
+
+[[format]]
+id = "part.apm"
+kind = "partition"
+name = "APM"
+we_read = true
+we_write = true
+
+[[format]]
+id = "part.rdb"
+kind = "partition"
+name = "RDB (Amiga)"
+we_read = true
+we_write = false
+
+[[format]]
+id = "part.sgi"
+kind = "partition"
+name = "SGI volume header"
+we_read = true
+we_write = true
+builder = "new hd sgi-efs"
+
+[[format]]
+id = "part.sun"
+kind = "partition"
+name = "Sun disk label"
+we_read = true
+we_write = false
+
+[[format]]
+id = "part.ahdi"
+kind = "partition"
+name = "Atari AHDI"
+we_read = true
+we_write = false
+notes = "R-001: missing from the README partition-table list"
+
+[[format]]
+id = "part.x68k"
+kind = "partition"
+name = "Sharp X68000"
+we_read = true
+we_write = true
+builder = "new hd x68k"
