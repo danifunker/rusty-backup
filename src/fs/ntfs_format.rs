@@ -1025,6 +1025,8 @@ pub fn create_ntfs<W: Write + Seek>(
     for c in 0..end_meta {
         bm[(c / 8) as usize] |= 1 << (c % 8);
     }
+    // The last cluster holds the backup boot sector; keep the allocator off it.
+    bm[((tc - 1) / 8) as usize] |= 1 << ((tc - 1) % 8);
     for c in tc..(bm.len() as u64 * 8) {
         bm[(c / 8) as usize] |= 1 << (c % 8);
     }

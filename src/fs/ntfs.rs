@@ -154,6 +154,8 @@ pub(crate) struct DataRun {
     pub(crate) cluster_offset: i64,
     /// Number of clusters in this run.
     pub(crate) length: u64,
+    /// Hole (no offset field). LCN 0 alone cannot mean sparse: $Boot lives there.
+    pub(crate) sparse: bool,
 }
 
 /// Decode data runs from an MFT attribute's non-resident data.
@@ -189,6 +191,7 @@ pub(crate) fn decode_data_runs(data: &[u8]) -> Vec<DataRun> {
             runs.push(DataRun {
                 cluster_offset: 0,
                 length,
+                sparse: true,
             });
         } else {
             let mut offset: i64 = 0;
@@ -209,6 +212,7 @@ pub(crate) fn decode_data_runs(data: &[u8]) -> Vec<DataRun> {
             runs.push(DataRun {
                 cluster_offset: abs_offset,
                 length,
+                sparse: false,
             });
         }
     }
@@ -766,7 +770,7 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
             let remaining = limit - written;
             let to_write = run_bytes.min(remaining);
 
-            if run.cluster_offset == 0 {
+            if run.sparse {
                 // Sparse run — emit zeros in chunks.
                 let mut left = to_write;
                 while left > 0 {
@@ -812,7 +816,7 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
             let remaining = limit - data.len() as u64;
             let to_read = run_bytes.min(remaining);
 
-            if run.cluster_offset == 0 {
+            if run.sparse {
                 // Sparse run - fill with zeros
                 data.resize(data.len() + to_read as usize, 0);
             } else {
@@ -979,7 +983,7 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
         for run in runs {
             let run_end = run_vcn + run.length;
             if vcn >= run_vcn && vcn < run_end {
-                if run.cluster_offset == 0 {
+                if run.sparse || run.cluster_offset < 0 {
                     return None;
                 }
                 let offset_in_run = vcn - run_vcn;
@@ -1251,7 +1255,7 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
                 continue;
             }
             for run in &a.data_runs {
-                if run.cluster_offset > 0 && run.length > 0 {
+                if !run.sparse && run.cluster_offset >= 0 && run.length > 0 {
                     out.push((run.cluster_offset as u64, run.length));
                 }
             }
@@ -2231,7 +2235,7 @@ impl<R: Read + Write + Seek> NtfsFilesystem<R> {
             if written >= data.len() {
                 break;
             }
-            if run.cluster_offset <= 0 {
+            if run.sparse || run.cluster_offset < 0 {
                 // Sparse — skip
                 written += (run.length * self.cluster_size) as usize;
                 continue;
@@ -2582,6 +2586,7 @@ impl<R: Read + Write + Seek> NtfsFilesystem<R> {
             .map(|&(start, len)| DataRun {
                 cluster_offset: start as i64,
                 length: len,
+                sparse: false,
             })
             .collect()
     }
@@ -2719,7 +2724,7 @@ impl<R: Read + Write + Seek> NtfsFilesystem<R> {
         let mut all_runs: Vec<(u64, u64)> = old
             .data_runs
             .iter()
-            .filter(|r| r.cluster_offset > 0)
+            .filter(|r| !r.sparse && r.cluster_offset >= 0)
             .map(|r| (r.cluster_offset as u64, r.length))
             .collect();
         all_runs.extend_from_slice(&new_runs);
@@ -4030,7 +4035,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
                     let runs: Vec<(u64, u64)> = attr
                         .data_runs
                         .iter()
-                        .filter(|r| r.cluster_offset > 0)
+                        .filter(|r| !r.sparse && r.cluster_offset >= 0)
                         .map(|r| (r.cluster_offset as u64, r.length))
                         .collect();
                     if !runs.is_empty() {
@@ -4204,7 +4209,7 @@ impl<R: Read + Seek> CompactNtfsReader<R> {
                 } else {
                     // Read bitmap from data runs
                     for run in &attr.data_runs {
-                        if run.cluster_offset <= 0 {
+                        if run.sparse || run.cluster_offset < 0 {
                             bitmap_data.resize(
                                 bitmap_data.len() + (run.length * cluster_size) as usize,
                                 0,
@@ -4502,7 +4507,7 @@ fn read_last_used_cluster_from_bitmap(
             } else {
                 let mut data = Vec::new();
                 for run in &attr.data_runs {
-                    if run.cluster_offset <= 0 {
+                    if run.sparse || run.cluster_offset < 0 {
                         data.resize(data.len() + (run.length * cluster_size) as usize, 0);
                         continue;
                     }
