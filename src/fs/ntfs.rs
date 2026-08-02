@@ -1487,9 +1487,10 @@ fn encode_data_runs(runs: &[(u64, u64)]) -> Vec<u8> {
         let delta = abs_cluster as i64 - prev_offset;
         prev_offset = abs_cluster as i64;
 
-        // Calculate minimum bytes needed for length (unsigned)
-        let length_size = min_unsigned_bytes(length);
-        // Calculate minimum bytes needed for offset (signed)
+        // Both fields are signed: a length whose top bit lands in the high byte
+        // reads back negative and Windows calls the whole file corrupt, so a
+        // 128-cluster run must be `12 80 00`, never `11 80`.
+        let length_size = min_signed_bytes(length as i64);
         let offset_size = min_signed_bytes(delta);
 
         let header = (offset_size as u8) << 4 | (length_size as u8);
@@ -1508,15 +1509,6 @@ fn encode_data_runs(runs: &[(u64, u64)]) -> Vec<u8> {
 
     result.push(0x00); // terminator
     result
-}
-
-/// Minimum bytes to represent an unsigned value.
-fn min_unsigned_bytes(val: u64) -> usize {
-    if val == 0 {
-        return 1;
-    }
-    let bits = 64 - val.leading_zeros() as usize;
-    bits.div_ceil(8)
 }
 
 /// Minimum bytes to represent a signed value.
@@ -1539,9 +1531,22 @@ fn min_signed_bytes(val: i64) -> usize {
 // Editing Helpers
 // =============================================================================
 
-/// Fixed NTFS timestamp for new files (2024-01-01 00:00:00 UTC).
-/// 100-nanosecond intervals since 1601-01-01.
+/// Fallback NTFS timestamp (2024-01-01 00:00:00 UTC), used only when the host
+/// clock reads before the Unix epoch. 100-nanosecond intervals since 1601-01-01.
 const FIXED_NTFS_TIMESTAMP: u64 = 133_480_416_000_000_000;
+
+/// Seconds between the NTFS epoch (1601-01-01) and the Unix epoch (1970-01-01).
+const NTFS_EPOCH_OFFSET_SECS: u64 = 11_644_473_600;
+
+/// Wall-clock now, as NTFS 100 ns intervals since 1601-01-01.
+fn now_ntfs_timestamp() -> u64 {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => {
+            (d.as_secs() + NTFS_EPOCH_OFFSET_SECS) * 10_000_000 + (d.subsec_nanos() / 100) as u64
+        }
+        Err(_) => FIXED_NTFS_TIMESTAMP,
+    }
+}
 
 /// Validate an NTFS filename.
 fn validate_ntfs_name(name: &str) -> Result<(), FilesystemError> {
@@ -1617,10 +1622,10 @@ fn prepare_fixup(record: &mut [u8]) {
 /// 3.0 moved ACLs into `$Secure`, keyed by that id; the 48-byte 1.2 record has no field for it and
 /// carries a per-file `$SECURITY_DESCRIPTOR` instead. Writing the 1.2 form on a 3.x volume leaves
 /// Windows unable to resolve the ACL at all.
-fn build_standard_information(file_attrs: u32, security_id: Option<u32>) -> Vec<u8> {
+fn build_standard_information(file_attrs: u32, security_id: Option<u32>, when: u64) -> Vec<u8> {
     let Some(security_id) = security_id else {
         let mut data = vec![0u8; 48];
-        let ts = FIXED_NTFS_TIMESTAMP.to_le_bytes();
+        let ts = when.to_le_bytes();
         for i in 0..4 {
             data[i * 8..i * 8 + 8].copy_from_slice(&ts);
         }
@@ -1628,7 +1633,7 @@ fn build_standard_information(file_attrs: u32, security_id: Option<u32>) -> Vec<
         return data;
     };
     let mut data = vec![0u8; 72];
-    let ts = FIXED_NTFS_TIMESTAMP.to_le_bytes();
+    let ts = when.to_le_bytes();
     data[0..8].copy_from_slice(&ts); // creation time
     data[8..16].copy_from_slice(&ts); // modification time
     data[16..24].copy_from_slice(&ts); // MFT modification time
@@ -1639,7 +1644,13 @@ fn build_standard_information(file_attrs: u32, security_id: Option<u32>) -> Vec<
 }
 
 /// Build a $FILE_NAME attribute value.
-fn build_file_name_attr(parent_ref: u64, name: &str, is_dir: bool, size: u64) -> Vec<u8> {
+fn build_file_name_attr(
+    parent_ref: u64,
+    name: &str,
+    is_dir: bool,
+    size: u64,
+    when: u64,
+) -> Vec<u8> {
     let utf16: Vec<u16> = name.encode_utf16().collect();
     let name_bytes = utf16.len() * 2;
     let data_len = 66 + name_bytes;
@@ -1648,7 +1659,7 @@ fn build_file_name_attr(parent_ref: u64, name: &str, is_dir: bool, size: u64) ->
     // Parent MFT reference (6 bytes ref + 2 bytes sequence number = 0)
     data[0..8].copy_from_slice(&parent_ref.to_le_bytes());
 
-    let ts = FIXED_NTFS_TIMESTAMP.to_le_bytes();
+    let ts = when.to_le_bytes();
     data[8..16].copy_from_slice(&ts); // creation
     data[16..24].copy_from_slice(&ts); // modification
     data[24..32].copy_from_slice(&ts); // MFT modification
@@ -2973,11 +2984,13 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
         // Follow the volume's own version: only 3.x has a security_id field to fill.
         let sec_id =
             (self.ntfs_version.0 >= 3).then(|| self.read_parent_security_id(parent_record_num));
+        // One stamp for both structures: Windows writes them equal at creation.
+        let now = now_ntfs_timestamp();
         let std_info = build_resident_attr(
             ATTR_STANDARD_INFORMATION,
-            &build_standard_information(FILE_ATTR_ARCHIVE, sec_id),
+            &build_standard_information(FILE_ATTR_ARCHIVE, sec_id, now),
         );
-        let file_name_value = build_file_name_attr(parent_record_num, name, false, data_len);
+        let file_name_value = build_file_name_attr(parent_record_num, name, false, data_len, now);
         let file_name_attr = build_resident_attr(ATTR_FILE_NAME, &file_name_value);
 
         // 3.x resolves the ACL through $Secure by the inherited id; a per-file
@@ -3034,11 +3047,12 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
         let sec_id =
             (self.ntfs_version.0 >= 3).then(|| self.read_parent_security_id(parent_record_num));
         // Directories carry no archive bit; their directory flag lives in $FILE_NAME.
+        let now = now_ntfs_timestamp();
         let std_info = build_resident_attr(
             ATTR_STANDARD_INFORMATION,
-            &build_standard_information(0, sec_id),
+            &build_standard_information(0, sec_id, now),
         );
-        let file_name_value = build_file_name_attr(parent_record_num, name, true, 0);
+        let file_name_value = build_file_name_attr(parent_record_num, name, true, 0, now);
         let file_name_attr = build_resident_attr(ATTR_FILE_NAME, &file_name_value);
         let index_root = build_resident_attr(ATTR_INDEX_ROOT, &build_empty_index_root());
 
@@ -3144,14 +3158,31 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
         let record_number = entry.location;
         let is_dir = entry.is_directory();
 
+        // A rename is not a creation: Windows keeps the original four timestamps,
+        // so carry them over from the existing $FILE_NAME instead of stamping now.
+        let mut record = self.read_mft_record(record_number)?;
+        let old_times: Option<[u8; 32]> = parse_mft_attributes(&record, self.mft_record_size)
+            .iter()
+            .find(|a| a.attr_type == ATTR_FILE_NAME)
+            .and_then(|a| self.read_attribute_data(a, None).ok())
+            .and_then(|v| v.get(8..40).and_then(|s| s.try_into().ok()));
+
         // The new name lives in two places: the child record's $FILE_NAME
         // attribute and the parent directory's $I30 index entry. Both carry a
         // $FILE_NAME structure; build it once.
-        let new_fn_value = build_file_name_attr(parent_record_num, new_name, is_dir, entry.size);
+        let mut new_fn_value = build_file_name_attr(
+            parent_record_num,
+            new_name,
+            is_dir,
+            entry.size,
+            now_ntfs_timestamp(),
+        );
+        if let Some(times) = old_times {
+            new_fn_value[8..40].copy_from_slice(&times);
+        }
 
         // 1) Rewrite the child's $FILE_NAME in place (grow/shrink), preserving
         //    the record's sequence number, link count, and every other attribute.
-        let mut record = self.read_mft_record(record_number)?;
         let child_seq = u16::from_le_bytes([record[0x10], record[0x11]]);
         let new_attr = build_resident_attr(ATTR_FILE_NAME, &new_fn_value);
         replace_resident_attr(&mut record, ATTR_FILE_NAME, &new_attr)?;
@@ -3979,6 +4010,33 @@ mod tests {
         // Free space should have decreased (or stayed same for resident)
         let new_free = fs.free_space().unwrap();
         assert!(new_free <= initial_free);
+    }
+
+    #[test]
+    fn data_run_lengths_never_set_the_sign_bit() {
+        // Both mapping-pair fields are signed. A run length whose top bit lands in
+        // the high byte reads back negative and Windows calls the file corrupt:
+        // measured on Win7, a 200-cluster run encoded `21 97 ..` was unreadable.
+        for clusters in [
+            1u64, 100, 127, 128, 200, 251, 255, 256, 300, 32767, 32768, 70000,
+        ] {
+            let enc = encode_data_runs(&[(5956, clusters)]);
+            let len_size = (enc[0] & 0x0F) as usize;
+            let bytes = &enc[1..1 + len_size];
+            assert_eq!(
+                u64::from_le_bytes({
+                    let mut b = [0u8; 8];
+                    b[..len_size].copy_from_slice(bytes);
+                    b
+                }),
+                clusters,
+                "{clusters} clusters must round-trip"
+            );
+            assert!(
+                bytes[len_size - 1] < 0x80,
+                "{clusters} clusters encoded {bytes:02x?}: high bit set, Windows reads this negative"
+            );
+        }
     }
 
     #[test]
