@@ -1705,6 +1705,19 @@ fn build_standard_information(file_attrs: u32, security_id: Option<u32>, when: u
     data
 }
 
+/// True when `name` is usable verbatim as a DOS 8.3 name (namespace 3);
+/// Windows stores long names as WIN32-only instead of lying about it.
+fn is_valid_dos_name(name: &str) -> bool {
+    let mut parts = name.split('.');
+    let base = parts.next().unwrap_or("");
+    let ext = parts.next().unwrap_or("");
+    if parts.next().is_some() || base.is_empty() || base.len() > 8 || ext.len() > 3 {
+        return false;
+    }
+    let ok = |c: char| c.is_ascii_alphanumeric() || "$%'-_@~`!(){}^#&".contains(c);
+    base.chars().all(ok) && ext.chars().all(ok)
+}
+
 /// Build a $FILE_NAME attribute value.
 fn build_file_name_attr(
     parent_ref: u64,
@@ -1744,8 +1757,8 @@ fn build_file_name_attr(
 
     // name length
     data[64] = utf16.len() as u8;
-    // namespace = 0x03 (Win32+DOS)
-    data[65] = 0x03;
+    // Win32+DOS only when the name really is a valid 8.3 name; else Win32.
+    data[65] = if is_valid_dos_name(name) { 0x03 } else { 0x01 };
 
     // UTF-16LE name
     for (i, &ch) in utf16.iter().enumerate() {
@@ -5110,6 +5123,21 @@ mod tests {
             seq2,
             "index entry carries the new sequence"
         );
+    }
+
+    #[test]
+    fn file_name_namespace_matches_dos_validity() {
+        assert!(is_valid_dos_name("file.txt"));
+        assert!(is_valid_dos_name("TOOL.EXE"));
+        assert!(is_valid_dos_name("noext"));
+        assert!(!is_valid_dos_name("big-payload.bin")); // 11-char base
+        assert!(!is_valid_dos_name("two.dots.txt"));
+        assert!(!is_valid_dos_name("has space.txt"));
+        assert!(!is_valid_dos_name("file.text")); // 4-char extension
+        let short = build_file_name_attr(5, "ok.txt", false, 0, 0);
+        assert_eq!(short[65], 0x03);
+        let long = build_file_name_attr(5, "Long File Name.textfile", false, 0, 0);
+        assert_eq!(long[65], 0x01);
     }
 
     #[test]
