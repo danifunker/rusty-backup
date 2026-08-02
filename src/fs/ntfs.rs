@@ -46,6 +46,8 @@ const INDEX_ENTRY_END: u32 = 0x02;
 
 // File attribute flags (from $FILE_NAME)
 const FILE_ATTR_DIRECTORY: u32 = 0x1000_0000;
+/// Windows writes this on every ordinary file; a zero attribute word is a shape it never produces.
+const FILE_ATTR_ARCHIVE: u32 = 0x20;
 
 /// NTFS Volume Boot Record fields.
 #[derive(Clone)]
@@ -1615,13 +1617,14 @@ fn prepare_fixup(record: &mut [u8]) {
 /// 3.0 moved ACLs into `$Secure`, keyed by that id; the 48-byte 1.2 record has no field for it and
 /// carries a per-file `$SECURITY_DESCRIPTOR` instead. Writing the 1.2 form on a 3.x volume leaves
 /// Windows unable to resolve the ACL at all.
-fn build_standard_information(security_id: Option<u32>) -> Vec<u8> {
+fn build_standard_information(file_attrs: u32, security_id: Option<u32>) -> Vec<u8> {
     let Some(security_id) = security_id else {
         let mut data = vec![0u8; 48];
         let ts = FIXED_NTFS_TIMESTAMP.to_le_bytes();
         for i in 0..4 {
             data[i * 8..i * 8 + 8].copy_from_slice(&ts);
         }
+        data[0x20..0x24].copy_from_slice(&file_attrs.to_le_bytes());
         return data;
     };
     let mut data = vec![0u8; 72];
@@ -1630,7 +1633,7 @@ fn build_standard_information(security_id: Option<u32>) -> Vec<u8> {
     data[8..16].copy_from_slice(&ts); // modification time
     data[16..24].copy_from_slice(&ts); // MFT modification time
     data[24..32].copy_from_slice(&ts); // access time
-                                       // flags at offset 32 = 0 (normal)
+    data[0x20..0x24].copy_from_slice(&file_attrs.to_le_bytes());
     data[0x34..0x38].copy_from_slice(&security_id.to_le_bytes());
     data
 }
@@ -1656,8 +1659,12 @@ fn build_file_name_attr(parent_ref: u64, name: &str, is_dir: bool, size: u64) ->
     // real size
     data[48..56].copy_from_slice(&size.to_le_bytes());
 
-    // flags
-    let flags: u32 = if is_dir { FILE_ATTR_DIRECTORY } else { 0 };
+    // Windows puts the directory bit in $FILE_NAME only, never in $STANDARD_INFORMATION.
+    let flags: u32 = if is_dir {
+        FILE_ATTR_DIRECTORY
+    } else {
+        FILE_ATTR_ARCHIVE
+    };
     data[56..60].copy_from_slice(&flags.to_le_bytes());
 
     // reparse = 0 (bytes 60..64 already zero)
@@ -2968,14 +2975,19 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
             (self.ntfs_version.0 >= 3).then(|| self.read_parent_security_id(parent_record_num));
         let std_info = build_resident_attr(
             ATTR_STANDARD_INFORMATION,
-            &build_standard_information(sec_id),
+            &build_standard_information(FILE_ATTR_ARCHIVE, sec_id),
         );
         let file_name_value = build_file_name_attr(parent_record_num, name, false, data_len);
         let file_name_attr = build_resident_attr(ATTR_FILE_NAME, &file_name_value);
-        let sd_value = self.read_parent_security_descriptor(parent_record_num)?;
-        let sd_attr = build_resident_attr(ATTR_SECURITY_DESCRIPTOR, &sd_value);
 
-        let attrs = vec![std_info, file_name_attr, sd_attr, data_attr];
+        // 3.x resolves the ACL through $Secure by the inherited id; a per-file
+        // descriptor beside it is the 1.2 form, and Windows honours that instead.
+        let mut attrs = vec![std_info, file_name_attr];
+        if sec_id.is_none() {
+            let sd_value = self.read_parent_security_descriptor(parent_record_num)?;
+            attrs.push(build_resident_attr(ATTR_SECURITY_DESCRIPTOR, &sd_value));
+        }
+        attrs.push(data_attr);
         let mut record =
             assemble_mft_record(&attrs, MFT_RECORD_IN_USE, self.mft_record_size, record_num);
         self.write_mft_record(record_num, &mut record)?;
@@ -3021,17 +3033,21 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
         // Follow the volume's own version: only 3.x has a security_id field to fill.
         let sec_id =
             (self.ntfs_version.0 >= 3).then(|| self.read_parent_security_id(parent_record_num));
+        // Directories carry no archive bit; their directory flag lives in $FILE_NAME.
         let std_info = build_resident_attr(
             ATTR_STANDARD_INFORMATION,
-            &build_standard_information(sec_id),
+            &build_standard_information(0, sec_id),
         );
         let file_name_value = build_file_name_attr(parent_record_num, name, true, 0);
         let file_name_attr = build_resident_attr(ATTR_FILE_NAME, &file_name_value);
-        let sd_value = self.read_parent_security_descriptor(parent_record_num)?;
-        let sd_attr = build_resident_attr(ATTR_SECURITY_DESCRIPTOR, &sd_value);
         let index_root = build_resident_attr(ATTR_INDEX_ROOT, &build_empty_index_root());
 
-        let attrs = vec![std_info, file_name_attr, sd_attr, index_root];
+        let mut attrs = vec![std_info, file_name_attr];
+        if sec_id.is_none() {
+            let sd_value = self.read_parent_security_descriptor(parent_record_num)?;
+            attrs.push(build_resident_attr(ATTR_SECURITY_DESCRIPTOR, &sd_value));
+        }
+        attrs.push(index_root);
         let mut record = assemble_mft_record(
             &attrs,
             MFT_RECORD_IN_USE | MFT_RECORD_IS_DIRECTORY,
@@ -4009,6 +4025,36 @@ mod tests {
         let (len, id) = sec_of(&mut fs, file.location);
         assert_eq!(len, 72, "not the 48-byte NTFS 1.2 form");
         assert_eq!(id, pid, "must inherit the parent's $Secure id");
+
+        // An inline $SECURITY_DESCRIPTOR beside the id is the 1.2 form; Windows honours
+        // it over $Secure and the file lands unreadable with an empty Security tab.
+        let raw = fs.read_mft_record(file.location).unwrap();
+        let attrs = parse_mft_attributes(&raw, fs.mft_record_size);
+        assert!(
+            !attrs
+                .iter()
+                .any(|a| a.attr_type == ATTR_SECURITY_DESCRIPTOR),
+            "a 3.x file must not carry an inline $SECURITY_DESCRIPTOR"
+        );
+
+        // Windows never writes a zero attribute word for a real file.
+        for (ty, off, what) in [
+            (
+                ATTR_STANDARD_INFORMATION,
+                0x20usize,
+                "$STANDARD_INFORMATION",
+            ),
+            (ATTR_FILE_NAME, 0x38usize, "$FILE_NAME"),
+        ] {
+            let a = attrs.iter().find(|a| a.attr_type == ty).expect(what);
+            let v = fs.read_attribute_data(a, None).unwrap();
+            let got = u32::from_le_bytes([v[off], v[off + 1], v[off + 2], v[off + 3]]);
+            assert_eq!(
+                got & FILE_ATTR_ARCHIVE,
+                FILE_ATTR_ARCHIVE,
+                "{what} must set the archive bit (got {got:#010x})"
+            );
+        }
 
         // chkdsk rejects a 3.1 record whose self-index is absent or whose attribute
         // instance ids collide, and deletes the file outright.
