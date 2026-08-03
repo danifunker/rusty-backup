@@ -363,29 +363,21 @@ pub fn run_single_partition_restore(
     let bytes_written = match &config.source {
         SinglePartitionSource::Backup { .. } => {
             let folder = backup_folder.as_ref().unwrap();
-            let mut total_written: u64 = 0;
-
-            for file_name in &compressed_files {
-                let data_path = folder.join(file_name);
-                let remaining = source_data_size.saturating_sub(total_written);
-
-                let written = rbformats::decompress_to_writer(
-                    &data_path,
-                    &compression_type,
-                    &mut target,
-                    Some(remaining),
-                    &mut |bytes| {
-                        set_progress_bytes(&progress_clone, total_written + bytes, write_size);
-                    },
-                    &|| is_cancelled(&progress_cancel),
-                    &mut |msg| log(&progress_log, LogLevel::Info, msg),
-                )
-                .with_context(|| format!("failed to decompress {}", file_name))?;
-
-                total_written += written;
-            }
-
-            total_written
+            // One decode over every member: a split backup cuts a single byte
+            // stream across them, so decoding each file separately only works
+            // for raw and corrupts a split .chd / .zst.
+            let members: Vec<std::path::PathBuf> =
+                compressed_files.iter().map(|f| folder.join(f)).collect();
+            rbformats::decompress_members_to_writer(
+                &members,
+                &compression_type,
+                &mut target,
+                Some(source_data_size),
+                &mut |bytes| set_progress_bytes(&progress_clone, bytes, write_size),
+                &|| is_cancelled(&progress_cancel),
+                &mut |msg| log(&progress_log, LogLevel::Info, msg),
+            )
+            .with_context(|| format!("failed to decompress {}", compressed_files.join(", ")))?
         }
         SinglePartitionSource::ImageFile { path } => {
             let file = File::open(path)?;

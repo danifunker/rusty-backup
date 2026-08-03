@@ -697,8 +697,22 @@ pub(crate) fn split_file(
     extension: &str,
     split_bytes: u64,
 ) -> Result<Vec<String>> {
+    // Chunk 0 lands on the source's own path, so move the source aside first:
+    // creating it would otherwise truncate the file being read and the split
+    // would silently produce nothing.
+    let staging = source.with_file_name(format!(
+        "{}.splitting",
+        source.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    fs::rename(source, &staging).with_context(|| {
+        format!(
+            "failed to stage {} for splitting as {}",
+            source.display(),
+            staging.display()
+        )
+    })?;
     let mut reader = BufReader::new(
-        File::open(source).with_context(|| format!("failed to open {}", source.display()))?,
+        File::open(&staging).with_context(|| format!("failed to open {}", staging.display()))?,
     );
     let mut files = Vec::new();
     let mut part_index: u32 = 0;
@@ -738,8 +752,9 @@ pub(crate) fn split_file(
         }
     }
 
-    // Remove the original unsplit file
-    let _ = fs::remove_file(source);
+    // Remove the staged original now its bytes are in the chunks.
+    drop(reader);
+    let _ = fs::remove_file(&staging);
 
     Ok(files)
 }

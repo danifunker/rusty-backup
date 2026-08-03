@@ -703,8 +703,10 @@ fn run_per_partition(
                 .get(&pm.index)
                 .copied()
                 .unwrap_or(pm.original_size_bytes);
-            let data_file = &pm.compressed_files[0];
-            let data_path = folder.join(data_file);
+            // Every member: a split backup cuts one stream across them, so
+            // exporting only the first truncates the output.
+            let members: Vec<std::path::PathBuf> =
+                pm.compressed_files.iter().map(|f| folder.join(f)).collect();
             let dest_path = dest_folder.join(format!("partition-{}.{}", pm.index, ext));
 
             if let Ok(mut s) = status.lock() {
@@ -722,7 +724,7 @@ fn run_per_partition(
             let status_log = Arc::clone(status);
             export_partition(
                 format,
-                &data_path,
+                &members,
                 &meta.compression_type,
                 &dest_path,
                 Some(export_size),

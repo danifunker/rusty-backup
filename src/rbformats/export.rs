@@ -11,7 +11,7 @@ use std::fs::File;
 #[cfg(feature = "chd")]
 use std::io::BufReader;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
@@ -19,7 +19,7 @@ use super::dc42;
 use super::twomg::build_twomg_header;
 use super::vhd::build_vhd_footer;
 use super::woz_write;
-use super::{decompress_to_writer, reconstruct_disk_from_backup, write_zeros, CHUNK_SIZE};
+use super::{decompress_members_to_writer, reconstruct_disk_from_backup, write_zeros, CHUNK_SIZE};
 use crate::backup::metadata::BackupMetadata;
 use crate::partition::PartitionSizeOverride;
 
@@ -309,7 +309,7 @@ fn write_moof_from_sectors(
 /// Slurp a source path (via decompress_to_writer) into an in-memory buffer.
 /// Intended for floppy-sized content only — bounded by `max_bytes`.
 fn read_source_to_memory(
-    source_path: &Path,
+    members: &[PathBuf],
     compression_type: &str,
     max_bytes: Option<u64>,
     progress_cb: &mut impl FnMut(u64),
@@ -317,8 +317,8 @@ fn read_source_to_memory(
     log_cb: &mut impl FnMut(&str),
 ) -> Result<Vec<u8>> {
     let mut buf: Vec<u8> = Vec::new();
-    decompress_to_writer(
-        source_path,
+    decompress_members_to_writer(
+        members,
         compression_type,
         &mut buf,
         max_bytes,
@@ -944,7 +944,7 @@ pub fn export_whole_disk(
 /// Export a single partition in the specified format.
 pub fn export_partition(
     format: ExportFormat,
-    source_path: &Path,
+    members: &[PathBuf],
     compression_type: &str,
     dest_path: &Path,
     max_bytes: Option<u64>,
@@ -955,7 +955,7 @@ pub fn export_partition(
     // For VHD, delegate to existing implementation
     if format == ExportFormat::Vhd {
         return super::vhd::export_partition_vhd(
-            source_path,
+            members,
             compression_type,
             dest_path,
             max_bytes,
@@ -969,7 +969,7 @@ pub fn export_partition(
     // decompressed partition size to be a recognised floppy size.
     if format == ExportFormat::Woz || format == ExportFormat::Moof || format == ExportFormat::Dc42 {
         let buf = read_source_to_memory(
-            source_path,
+            members,
             compression_type,
             max_bytes,
             &mut progress_cb,
@@ -993,8 +993,8 @@ pub fn export_partition(
     // Write header placeholder (2MG)
     let header_size = format.write_header(&mut writer, 0)?;
 
-    let bytes_written = decompress_to_writer(
-        source_path,
+    let bytes_written = decompress_members_to_writer(
+        members,
         compression_type,
         &mut writer,
         max_bytes,

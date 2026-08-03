@@ -233,27 +233,35 @@ Still true, and unchanged by this fix: a superfloppy restore ignores a
 identically for raw and for every codec, so it is a separate gap rather than a
 regression.
 
-### 3.2 Split backups restore truncated — **silent data loss**
+### 3.2 Split backups round-trip — **[RESOLVED]**
 
-Found while verifying §3.1, pre-existing and unrelated to it.
-`reconstruct_disk_from_backup` (`src/rbformats/mod.rs`) reads only
-`pm.compressed_files[0]`; the `.001` / `.002` / … members a `--split-size`
-backup writes are never opened. The restore reports success.
+`--split-size` had two silent defects, both fixed:
 
-Measured: a 64 MiB ext4 superfloppy, `--format raw --split-size 4`, writes
-`partition-0.img` (4 MiB) + `.001.img` (4 MiB) + `.002.img` (188 KiB). The
-restored image is all-zero past 4.16 MiB where the source has data to
-8.18 MiB, and `fsck.ext4` reports "Filesystem still has errors".
+* **Restore dropped every member but the first.** `reconstruct_disk_from_backup`
+  read only `pm.compressed_files[0]`, so a split backup restored truncated and
+  reported success. Measured before the fix: a 64 MiB ext4 superfloppy at
+  `--format raw --split-size 4` restored all-zero past 4.16 MiB where the source
+  had data to 8.18 MiB, and `fsck.ext4` said "Filesystem still has errors".
+  Restore now reads the members as the one byte stream they were cut from
+  (`MemberChain` in `rbformats/compress.rs`). The same `[0]`-only bug was in the
+  export path (`model/export_runner.rs`) and is fixed with it.
+* **A split CHD backup destroyed itself.** `chd::split_file` wrote chunk 0 to
+  the path it was reading from — `File::create` truncated the source mid-read,
+  so the split produced *nothing*: a `metadata.json` with an empty file list and
+  no data files at all. The source is now staged aside before any chunk is
+  written.
 
-Affects **every** source shape, not just superfloppies — a partitioned MBR/FAT
-split backup restores the same way; it only looks fine when all the data
-happens to fit inside the first member. Compressed splits are hit whenever the
-compressed stream exceeds the split size.
+A split CHD is reassembled to a temp file before opening, because libchdman
+seeks and cannot read a chain.
 
-Fix: teach the restore path to concatenate the members in order (they are a
-byte-stream split, so a chained reader over `compressed_files` feeds the
-existing decompressor unchanged). Until then, `--split-size` should arguably
-be refused rather than producing a backup that cannot be restored.
+`tests/split_backup_roundtrip.rs` covers all of it: raw and CHD splits restore
+byte-identical, a 5 MiB file spanning several 1 MiB members reads back intact,
+and `split_file` no longer eats its own source. Each test was confirmed to fail
+with its fix reverted.
+
+Note `--split-size` is still ignored by zstd / gzip / lz4: `SplitWriter` is a
+no-op wrapper, so those codecs always emit one file. That is safe (one member
+restores correctly) but silent — worth either honouring or saying so.
 
 ---
 

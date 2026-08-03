@@ -2,12 +2,12 @@
 use crate::rust173_compat::IntIsMultipleOf as _;
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 
-use super::{decompress_to_writer, reconstruct_disk_from_backup, write_zeros, CHUNK_SIZE};
+use super::{decompress_members_to_writer, reconstruct_disk_from_backup, write_zeros, CHUNK_SIZE};
 use crate::backup::metadata::BackupMetadata;
 use crate::fs::{patch_hidden_sectors_for, resize_filesystem_for};
 use crate::partition::mbr::{
@@ -1311,7 +1311,7 @@ pub fn export_whole_disk_vhd(
 /// Handles raw, zstd, and CHD compressed partition files.
 /// If `max_bytes` is `Some(n)`, the output is limited to at most `n` bytes of data.
 pub fn export_partition_vhd(
-    source_path: &Path,
+    members: &[PathBuf],
     compression_type: &str,
     dest_path: &Path,
     max_bytes: Option<u64>,
@@ -1324,8 +1324,8 @@ pub fn export_partition_vhd(
             .with_context(|| format!("failed to create {}", dest_path.display()))?,
     );
 
-    let bytes_written = decompress_to_writer(
-        source_path,
+    let bytes_written = decompress_members_to_writer(
+        members,
         compression_type,
         &mut writer,
         max_bytes,
