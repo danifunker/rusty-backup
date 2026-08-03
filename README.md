@@ -322,7 +322,12 @@ The app has five tabs:
   1 MB, or custom) is preserved from the source by default. A top-level
   "Add free space for in-OS expansion" toggle pads the target image so
   the guest OS can extend partitions there after boot — see the *Disk
-  expansion workflow* section below.
+  expansion workflow* section below. A **Write Image File** mode pours a
+  plain disk image onto a device, or into one of its partitions, leaving
+  the partition table and the rest of the disk untouched; any format
+  Rusty Backup can read works (raw, DMG, CHD, VHD, 2MG, GHO, IMZ, and
+  gzip- or zip-wrapped images are decoded on the way to the disk). The
+  CLI equivalent is `rb-cli write IMAGE DEVICE [--partition N] --yes`.
 - **Inspect** — pick any supported source and browse the partition table,
   filesystem info, and file listings. Several actions live here:
   - **Browse** filesystem contents read-only (per partition). A checkbox
