@@ -1439,28 +1439,10 @@ fn run_backup_inner(
         let progress_clone = Arc::clone(&progress);
         let base_bytes = overall_bytes_done;
 
-        // Superfloppy: force raw compression to produce a universally compatible
-        // .img file. (Compaction still applies — the compacted stream is what gets
-        // written raw — so a lightly-used volume shrinks to ~its real data size. A
-        // compressed superfloppy output needs restore-path work; see OPEN-WORK.)
-        let effective_compression = if is_superfloppy {
-            // Say so: asking for --format zstd and silently getting a .img reads as
-            // a bug, and metadata then records compression_type "none".
-            if config.compression != CompressionType::None {
-                log(
-                    &progress,
-                    LogLevel::Warning,
-                    format!(
-                        "{}: {} output is not supported for a partition-table-less image; writing raw .img instead",
-                        part_label,
-                        config.compression.as_str()
-                    ),
-                );
-            }
-            CompressionType::None
-        } else {
-            config.compression
-        };
+        // A superfloppy is one partition-shaped member, so every per-partition
+        // codec applies to it unchanged; only the raw output gets the friendlier
+        // .img extension below.
+        let effective_compression = config.compression;
 
         log(
             &progress,
@@ -1886,7 +1868,7 @@ fn run_backup_inner(
         set_progress_bytes(&progress, overall_bytes_done, total_stream_bytes);
 
         // Superfloppy: rename .raw to .img for universally compatible raw image
-        let compressed_files = if is_superfloppy {
+        let compressed_files = if is_superfloppy && effective_compression == CompressionType::None {
             let mut renamed = Vec::new();
             for file_name in &compressed_files {
                 let new_name = file_name.replace(".raw", ".img");
@@ -2005,11 +1987,7 @@ fn run_backup_inner(
         source_size_bytes: source_size,
         partition_table_type: table.type_name().to_string(),
         checksum_type: config.checksum.as_str().to_string(),
-        compression_type: if is_superfloppy {
-            CompressionType::None.as_str().to_string()
-        } else {
-            config.compression.as_str().to_string()
-        },
+        compression_type: config.compression.as_str().to_string(),
         split_size_mib: config.split_size_mib,
         sector_by_sector: config.sector_by_sector,
         layout: BackupLayout::PerPartition,

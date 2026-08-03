@@ -97,15 +97,22 @@ dump the DACL and check that its ACEs exactly fill the declared size;
 
 ## Still open
 
-### ISSUE 4 — `--format` is not honoured for partition-table-less sources
+### ISSUE 4 — `--format` for partition-table-less sources — **fixed**
 
-`src/backup/mod.rs:1446` forces `CompressionType::None` for a superfloppy.
-This is **deliberate** ("a compressed superfloppy output needs restore-path
-work"), not an accident; as of `5ab770a` it warns instead of silently
-writing a `.img` and recording `compression_type: "none"`.
+A superfloppy now honours every codec (`zstd` / `gzip` / `lz4` / `vhd` /
+`chd` / `raw`); a 64 MiB ext4 superfloppy backs up to ~47 KB with zstd and
+restores byte-identical.
 
-Making it actually honour zstd/gzip/lz4 for superfloppies is open work, and
-the restore side is the part that needs doing.
+The restore path was never at fault. Backup forced `CompressionType::None`
+*and* recorded `compression_type: "none"` in metadata unconditionally — the
+force made the lie harmless, and honouring the format made the two diverge,
+so restore (which dispatches on `metadata.compression_type`) wrote the
+compressed member to the target verbatim. Metadata now records the codec
+actually written. `tests/superfloppy_compression.rs` pins it.
+
+Still open, and unchanged by that fix: a superfloppy restore ignores a
+`--target-size` larger than the source and lands the original size. Raw
+behaves the same way, so it is a separate gap, not a regression.
 
 ### ISSUE 5 — stale precomputed minimum across devices
 

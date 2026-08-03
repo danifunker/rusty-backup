@@ -210,19 +210,50 @@ layout-preserving compactor.
 
 ## 3. Filesystem engine — small to medium
 
-### 3.1 Compressed superfloppy output (restore-path fix)
+### 3.1 Compressed superfloppy output — **[RESOLVED]**
 
-Superfloppy (partition-less) volumes now go through compaction — a lightly-used
-raw ext4 `.img` backs up to a smaller **packed** `.img` and restores/grows back
-e2fsck-clean (backup `sizes.rs`, restore already handles it). But the output is
-still forced to raw (`CompressionType::None` in `backup/mod.rs`): honoring an
-explicit `--format zstd|gzip|lz4` for a superfloppy produced a tiny backup
-(64 MiB → ~1.7 KB) that **failed to restore** ("Bad magic number in super-block",
-wrong size) — the per-partition restore path mishandles a compressed superfloppy
-member. Fix the compressed-superfloppy restore, then re-enable honoring the
-compression format for superfloppy (the codec-gating match was reverted; see the
-comment on `effective_compression`). Big win: KB-scale backups of mostly-empty
-raw fs images.
+Superfloppy (partition-less) volumes honour `--format` like any other source:
+`zstd` / `gzip` / `lz4` / `vhd` / `chd` / `raw` all back up and restore. A 64 MiB
+ext4 superfloppy backs up to ~47 KB with zstd and restores byte-identical.
+
+The restore path was never the problem. Backup forced `CompressionType::None`
+*and* recorded `compression_type: "none"` in `metadata.json` unconditionally. The
+force made the lie harmless; the moment the format was honoured, the two
+diverged, and restore — which dispatches on `metadata.compression_type` — fed the
+compressed member to the target verbatim. That is the whole of the reported
+"tiny backup that fails to restore with Bad magic number in super-block".
+
+Metadata now records the codec that was actually written, and the `.raw` -> `.img`
+rename is gated on the output really being raw. `tests/superfloppy_compression.rs`
+pins the invariant: every codec restores byte-identical to the raw restore, and
+metadata names the codec on disk.
+
+Still true, and unchanged by this fix: a superfloppy restore ignores a
+`--target-size` larger than the source and lands the original size. That behaves
+identically for raw and for every codec, so it is a separate gap rather than a
+regression.
+
+### 3.2 Split backups restore truncated — **silent data loss**
+
+Found while verifying §3.1, pre-existing and unrelated to it.
+`reconstruct_disk_from_backup` (`src/rbformats/mod.rs`) reads only
+`pm.compressed_files[0]`; the `.001` / `.002` / … members a `--split-size`
+backup writes are never opened. The restore reports success.
+
+Measured: a 64 MiB ext4 superfloppy, `--format raw --split-size 4`, writes
+`partition-0.img` (4 MiB) + `.001.img` (4 MiB) + `.002.img` (188 KiB). The
+restored image is all-zero past 4.16 MiB where the source has data to
+8.18 MiB, and `fsck.ext4` reports "Filesystem still has errors".
+
+Affects **every** source shape, not just superfloppies — a partitioned MBR/FAT
+split backup restores the same way; it only looks fine when all the data
+happens to fit inside the first member. Compressed splits are hit whenever the
+compressed stream exceeds the split size.
+
+Fix: teach the restore path to concatenate the members in order (they are a
+byte-stream split, so a chained reader over `compressed_files` feeds the
+existing decompressor unchanged). Until then, `--split-size` should arguably
+be refused rather than producing a backup that cannot be restored.
 
 ---
 
