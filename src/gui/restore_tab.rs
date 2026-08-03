@@ -1131,7 +1131,7 @@ impl RestoreTab {
             Ok(elevated) => {
                 let (file, _guard) = elevated.into_parts();
                 // A device cannot answer seek(End); carry the length the OS reports instead.
-                let mut reader = rusty_backup::os::known_len_reader(file, &device.path);
+                let mut reader = rusty_backup::os::known_len_source(file, &device.path);
                 match PartitionTable::detect(&mut reader) {
                     Ok(table) => {
                         self.sp_target_partitions = table.partitions();
@@ -1662,6 +1662,12 @@ impl RestoreTab {
 
         ctx.log
             .info(format!("Starting restore to {}", target_path.display(),));
+
+        // TEMP-DIAG: log the access we hold before touching the device, so a
+        // late "Permission denied" can be traced back to the starting state.
+        for line in rusty_backup::os::describe_device_access(&target_path) {
+            ctx.log.info(line);
+        }
 
         std::thread::spawn(move || {
             let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: disk restore");

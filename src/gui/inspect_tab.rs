@@ -23,6 +23,7 @@ use rusty_backup::model::export_runner::{
 use rusty_backup::model::partition_editor::PartitionEditor;
 use rusty_backup::model::status::{BlockCacheScan, CacheStatus, InspectStatus};
 use rusty_backup::partition::editor as pt_editor;
+use rusty_backup::partition::type_catalog;
 use rusty_backup::partition::{
     self, detect_alignment, PartitionAlignment, PartitionInfo, PartitionTable,
 };
@@ -808,39 +809,31 @@ impl InspectTab {
             }
 
             // Add Partition button (Phase 5 of disk_expansion.md) — opens
-            // the partition editor with the new-entry inputs pre-filled
-            // for the trailing free space, so the user doesn't have to
-            // hand-compute the start LBA + size. Only meaningful when
-            // there's >= 1 MiB of trailing free space.
-            let trailing_free = self
-                .actual_disk_size_bytes()
-                .map(|disk| {
-                    let used = self
-                        .partitions
-                        .iter()
-                        .filter(|p| !p.is_extended_container)
-                        .map(|p| p.start_lba.saturating_mul(512).saturating_add(p.size_bytes))
-                        .max()
-                        .unwrap_or(0);
-                    disk.saturating_sub(used)
-                })
-                .unwrap_or(0);
+            // the partition editor with the new-entry inputs pre-filled for
+            // the largest free gap, so the user doesn't have to hand-compute
+            // the start LBA + size. Gaps between partitions count, not just
+            // trailing space: reclaiming a deleted partition's hole is as
+            // common as growing into the tail.
+            let biggest_gap = self.largest_free_gap();
+            let gap_bytes = biggest_gap.map(|g| g.size_bytes).unwrap_or(0);
             if ui
                 .add_enabled(
-                    is_editable_source && !export_running && trailing_free >= 1024 * 1024,
+                    is_editable_source && !export_running && gap_bytes >= 1024 * 1024,
                     egui::Button::new("Add Partition..."),
                 )
-                .on_hover_text(if trailing_free >= 1024 * 1024 {
-                    format!(
-                        "Add a new partition into the {} of trailing free space",
-                        partition::format_size(trailing_free),
-                    )
-                } else {
-                    "No trailing free space available".to_string()
+                .on_hover_text(match biggest_gap {
+                    Some(gap) if gap.size_bytes >= 1024 * 1024 => format!(
+                        "Add a new partition into the {} gap at LBA {}",
+                        partition::format_size(gap.size_bytes),
+                        gap.start_lba,
+                    ),
+                    _ => "No free space available".to_string(),
                 })
                 .clicked()
             {
-                self.init_add_partition(trailing_free);
+                if let Some(gap) = biggest_gap {
+                    self.init_add_partition(gap);
+                }
             }
 
             // Expand Image button (Phases 6b + 6c of disk_expansion.md) —
@@ -1120,32 +1113,42 @@ impl InspectTab {
     }
 
     fn init_editor(&mut self) {
+        let disk_size = self.actual_disk_size_bytes();
         self.editor
-            .seed_from_with_minimums(&self.partitions, &self.partition_min_sizes);
+            .seed_from_with_minimums(&self.partitions, &self.partition_min_sizes, disk_size);
         self.editor_popup = true;
     }
 
-    /// Open the partition-table editor pre-filled to add one new partition
-    /// into the trailing free space. The user reviews/changes the size +
-    /// type, then clicks Validate + Apply through the existing editor flow.
-    ///
-    /// Defaults:
-    ///   - Start LBA: first sector past the existing partitions
-    ///   - Size: all trailing free space, in MiB (rounded down)
-    ///   - Type: platform-appropriate (XFS for SGI, 0x83 for MBR Linux,
-    ///     Linux Filesystem GUID for GPT, Apple_HFS for APM)
-    fn init_add_partition(&mut self, trailing_free_bytes: u64) {
-        self.editor
-            .seed_from_with_minimums(&self.partitions, &self.partition_min_sizes);
-
-        let first_free_lba = self
+    /// The largest gap a new partition could occupy, fenced off from the
+    /// head-of-disk table area (never offered below the first partition's
+    /// start, or below LBA 2048 on a table with no partitions yet).
+    fn largest_free_gap(&mut self) -> Option<partition::FreeRegion> {
+        let disk_size = self.actual_disk_size_bytes()?;
+        let min_start = self
             .partitions
             .iter()
             .filter(|p| !p.is_extended_container)
-            .map(|p| p.start_lba + (p.size_bytes / 512))
-            .max()
-            .unwrap_or(0);
-        let size_mib = (trailing_free_bytes / (1024 * 1024)).max(1);
+            .map(|p| p.start_lba)
+            .min()
+            .unwrap_or(2048);
+        partition::largest_free_region(&self.partitions, disk_size, min_start)
+    }
+
+    /// Open the partition-table editor pre-filled to add one new partition
+    /// into `gap`. The user reviews/changes the start, size + type, then
+    /// clicks Validate + Apply through the existing editor flow.
+    ///
+    /// Defaults:
+    ///   - Start LBA: the first sector of the gap
+    ///   - Size: the whole gap, in MiB (rounded down)
+    ///   - Type: platform-appropriate (XFS for SGI, 0x83 for MBR Linux,
+    ///     Linux Filesystem GUID for GPT, Apple_HFS for APM)
+    fn init_add_partition(&mut self, gap: partition::FreeRegion) {
+        let disk_size = self.actual_disk_size_bytes();
+        self.editor
+            .seed_from_with_minimums(&self.partitions, &self.partition_min_sizes, disk_size);
+
+        let size_mib = (gap.size_bytes / (1024 * 1024)).max(1);
 
         // Pick a sensible default partition type per table layout.
         let default_type: &str = match self.partition_table.as_ref() {
@@ -1156,7 +1159,7 @@ impl InspectTab {
             _ => "83",
         };
 
-        self.editor.add_start_lba = first_free_lba.to_string();
+        self.editor.add_start_lba = gap.start_lba.to_string();
         self.editor.add_size_mb = format!("{}", size_mib);
         self.editor.add_type = default_type.to_string();
         self.editor.add_bootable = false;
@@ -1467,17 +1470,17 @@ impl InspectTab {
         let mut open = true;
         let mut apply_requested = false;
 
-        let table_type = match &self.partition_table {
-            Some(PartitionTable::Mbr(_)) => "MBR",
-            Some(PartitionTable::Gpt { .. }) => "GPT",
-            Some(PartitionTable::Apm(_)) => "APM",
-            _ => "Unknown",
-        };
+        let kind = self
+            .partition_table
+            .as_ref()
+            .map(type_catalog::kind_of)
+            .unwrap_or(type_catalog::TableKind::Other);
+        let table_type = kind.label();
 
         egui::Window::new("Edit Partition Table")
             .open(&mut open)
             .resizable(true)
-            .default_width(700.0)
+            .default_width(760.0)
             .show(ui.ctx(), |ui| {
                 ui.label(format!("Table type: {}", table_type));
                 ui.add_space(4.0);
@@ -1487,7 +1490,7 @@ impl InspectTab {
                 // add-partition inputs so the bar updates live as the user
                 // edits sizes, marks rows deleted, or fills in the
                 // Add Partition fields.
-                show_editor_disk_layout_bars(ui, &self.partitions, &self.editor);
+                show_editor_disk_layout_bars(ui, &self.partitions, &self.editor, kind);
                 ui.add_space(8.0);
 
                 // Partition entry grid
@@ -1572,12 +1575,12 @@ impl InspectTab {
                             };
                             ui.label(label);
 
-                            // Type field (editable)
-                            let type_id = format!("ed_type_{}", i);
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.editor.entries[i].type_text)
-                                    .desired_width(100.0)
-                                    .id(egui::Id::new(&type_id)),
+                            // Type field: free-form text plus a catalog picker.
+                            type_field(
+                                ui,
+                                kind,
+                                &format!("ed_type_{}", i),
+                                &mut self.editor.entries[i].type_text,
                             );
 
                             // Start LBA (read-only)
@@ -1703,32 +1706,76 @@ impl InspectTab {
 
                 ui.add_space(8.0);
 
-                // Add partition section
-                ui.collapsing("Add Partition", |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Start LBA:");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.editor.add_start_lba)
-                                .desired_width(80.0),
-                        );
-                        ui.label("Size (MiB):");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.editor.add_size_mb)
-                                .desired_width(80.0),
-                        );
-                        ui.label("Type:");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.editor.add_type)
-                                .desired_width(80.0),
-                        );
-                        if table_type == "MBR" {
-                            ui.checkbox(&mut self.editor.add_bootable, "Bootable");
+                // Add partition section. Open by default — reaching this
+                // popup at all usually means the user wants to allocate
+                // something, and a collapsed section hid the only way to do
+                // it.
+                egui::CollapsingHeader::new("Add Partition")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        // Free gaps, so the user can fill a hole left by a
+                        // deleted partition without hand-computing the LBA.
+                        let gaps = self.editor.free_gaps();
+                        if gaps.is_empty() {
+                            ui.label(
+                                egui::RichText::new("No unallocated space on this disk.").weak(),
+                            );
+                        } else {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label("Free space:");
+                                for gap in &gaps {
+                                    let label = format!(
+                                        "{} at LBA {}",
+                                        partition::format_size(gap.size_bytes),
+                                        gap.start_lba,
+                                    );
+                                    if ui
+                                        .button(label)
+                                        .on_hover_text("Fill this gap with the new partition")
+                                        .clicked()
+                                    {
+                                        self.editor.add_start_lba = gap.start_lba.to_string();
+                                        self.editor.add_size_mb =
+                                            format!("{}", (gap.size_bytes / (1024 * 1024)).max(1));
+                                    }
+                                }
+                            });
                         }
-                        if ui.button("Add").clicked() {
-                            self.editor.add_entry_from_inputs(table_type == "MBR");
-                        }
+
+                        ui.horizontal(|ui| {
+                            ui.label("Start LBA:");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.editor.add_start_lba)
+                                    .desired_width(90.0),
+                            )
+                            .on_hover_text(
+                                "First 512-byte sector of the new partition. It does not \
+                                 have to be past the existing partitions -- any free gap works.",
+                            );
+                            ui.label("Size (MiB):");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.editor.add_size_mb)
+                                    .desired_width(80.0),
+                            );
+                            ui.label("Type:");
+                            type_field(ui, kind, "ed_add_type", &mut self.editor.add_type);
+                            if kind == type_catalog::TableKind::Mbr {
+                                ui.checkbox(&mut self.editor.add_bootable, "Bootable");
+                            }
+                            if ui.button("Add").clicked() {
+                                self.editor.add_entry_from_inputs(kind);
+                            }
+                        });
+
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Will be added as partition {} (slot assigned automatically; \
+                                 a slot freed by a Delete above is reused).",
+                                self.editor.next_entry_index(kind) + 1,
+                            ))
+                            .weak(),
+                        );
                     });
-                });
 
                 ui.add_space(8.0);
 
@@ -2668,8 +2715,16 @@ impl InspectTab {
                 // can reuse it without re-opening (and without another auth dialog).
                 #[cfg(target_os = "macos")]
                 {
+                    // BrowseView and the min-size runner are typed on `File` and
+                    // already share one handle between them; take a concrete dup
+                    // of whatever descriptor inspect escalated.
                     if let Some(f) = status.device_file.take() {
-                        self.open_device_file = Some(Arc::new(f));
+                        match f.into_file() {
+                            Ok(file) => self.open_device_file = Some(Arc::new(file)),
+                            Err(e) => ctx.log.warn(format!(
+                                "Could not retain the device handle for browsing: {e}"
+                            )),
+                        }
                     }
                     self.open_device_guard = status.device_guard.take();
                 }
@@ -2972,9 +3027,12 @@ impl InspectTab {
         self.seekable_cache_files.clear();
         self.cache_status = None;
         self.inspect_status = None;
-        // Release the open device fd and disk claim (remounts the disk).
+        // Release the open device fd and disk claim (remounts the disk). The
+        // process-wide escalation cache holds a descriptor too, and that would
+        // keep the raw device open past this point and block a clean eject.
         self.open_device_file = None;
         self.open_device_guard = None;
+        rusty_backup::os::release_elevated_devices(None);
         self.chd_image_path = None;
         self.cached_disk_size = None;
         self.single_file_chd_backup_folder = None;
@@ -3085,6 +3143,10 @@ impl InspectTab {
                 .info(format!("Inspecting remote image {}...", path.display()));
         } else {
             ctx.log.info(format!("Inspecting {}...", path.display()));
+            // TEMP-DIAG: log the access we hold before touching the device.
+            for line in rusty_backup::os::describe_device_access(&path) {
+                ctx.log.info(line);
+            }
         }
 
         // Cache CHD path: subsequent per-partition probes (HFS variant probe,
@@ -3203,7 +3265,7 @@ impl InspectTab {
                     match device_file.as_ref().unwrap().try_clone() {
                         // A device cannot answer seek(End); carry the length the OS reports instead.
                         Ok(f) if is_device => {
-                            Box::new(rusty_backup::os::known_len_reader(f, &path))
+                            Box::new(rusty_backup::os::known_len_source(f, &path))
                         }
                         Ok(f) => Box::new(BufReader::new(f)),
                         Err(e) => {
@@ -3213,103 +3275,110 @@ impl InspectTab {
                     }
                 };
 
-            let detect_result =
-                if remote.is_some() {
-                    // A remote image is served as a raw disk; parse the table
-                    // directly over the wire (no local format detection).
-                    PartitionTable::detect(&mut reader)
-                } else if uses_streaming_reader {
-                    // Streaming containers (GHO, IMZ) already provide a decoded
-                    // raw disk image; skip VHD/2MG/DMG format detection.
-                    let ext = path
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .map(|s| s.to_ascii_lowercase());
-                    let label = match ext.as_deref() {
-                        Some("gho") | Some("ghs") => "Norton Ghost (GHO)",
-                        Some("imz") => "WinImage (IMZ)",
-                        Some("msa") => "Atari ST MSA floppy",
-                        Some("dsk") => "CPCEMU DSK/EDSK floppy",
-                        Some("d88") => "Sharp .d88 floppy",
-                        Some("dim") => "DiskExplorer DIM floppy",
-                        Some("xdf") => "X68000 XDF floppy",
-                        Some("hdm") => "PC-98 HDM floppy",
-                        Some("hdf") => "Acorn ADFS image",
-                        Some("do") | Some("po") => "Apple II floppy",
-                        _ => "Streaming image",
-                    };
-                    push_log(format!("Detected format: {}", label));
+            let detect_result = if remote.is_some() {
+                // A remote image is served as a raw disk; parse the table
+                // directly over the wire (no local format detection).
+                PartitionTable::detect(&mut reader)
+            } else if uses_streaming_reader {
+                // Streaming containers (GHO, IMZ) already provide a decoded
+                // raw disk image; skip VHD/2MG/DMG format detection.
+                let ext = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|s| s.to_ascii_lowercase());
+                let label = match ext.as_deref() {
+                    Some("gho") | Some("ghs") => "Norton Ghost (GHO)",
+                    Some("imz") => "WinImage (IMZ)",
+                    Some("msa") => "Atari ST MSA floppy",
+                    Some("dsk") => "CPCEMU DSK/EDSK floppy",
+                    Some("d88") => "Sharp .d88 floppy",
+                    Some("dim") => "DiskExplorer DIM floppy",
+                    Some("xdf") => "X68000 XDF floppy",
+                    Some("hdm") => "PC-98 HDM floppy",
+                    Some("hdf") => "Acorn ADFS image",
+                    Some("do") | Some("po") => "Apple II floppy",
+                    _ => "Streaming image",
+                };
+                push_log(format!("Detected format: {}", label));
 
-                    // Surface GHO metadata (description, compression, etc.)
-                    if matches!(ext.as_deref(), Some("gho") | Some("ghs")) {
-                        if let Ok(info) = rusty_backup::rbformats::gho::format_gho_info(&path) {
-                            for line in info.lines() {
-                                if !line.is_empty() {
-                                    push_log(line.to_string());
+                // Surface GHO metadata (description, compression, etc.)
+                if matches!(ext.as_deref(), Some("gho") | Some("ghs")) {
+                    if let Ok(info) = rusty_backup::rbformats::gho::format_gho_info(&path) {
+                        for line in info.lines() {
+                            if !line.is_empty() {
+                                push_log(line.to_string());
+                            }
+                        }
+                    }
+                    set_step("Reconstructing partitions from Ghost image...");
+                }
+
+                if let Ok(mut s) = status.lock() {
+                    s.format_label = Some(label.to_string());
+                }
+                PartitionTable::detect(&mut reader)
+            } else if !is_device {
+                // For image files, use unified format detection
+                // Image-file branch only, so the handle is always a plain
+                // File and `into_file` is just an unwrap.
+                match device_file
+                    .as_ref()
+                    .unwrap()
+                    .try_clone()
+                    .and_then(|h| h.into_file())
+                {
+                    Ok(clone) => match rusty_backup::rbformats::detect_image_format_with_path(
+                        clone,
+                        Some(&path),
+                    ) {
+                        Ok(format) => {
+                            let desc = format.description();
+                            push_log(format!("Detected format: {}", desc));
+                            if let Ok(mut s) = status.lock() {
+                                s.format_label = Some(desc.clone());
+                            }
+                            match rusty_backup::rbformats::wrap_image_reader(
+                                device_file
+                                    .as_ref()
+                                    .unwrap()
+                                    .try_clone()
+                                    .and_then(|h| h.into_file())
+                                    .unwrap_or_else(|_| {
+                                        std::fs::File::open(&path).expect("reopen failed")
+                                    }),
+                                format,
+                            ) {
+                                Ok((mut wrapped_reader, _data_size)) => {
+                                    PartitionTable::detect(&mut wrapped_reader)
+                                }
+                                Err(e) => {
+                                    push_log(format!("Format wrap failed, trying raw: {e}"));
+                                    let _ = reader.seek(SeekFrom::Start(0));
+                                    PartitionTable::detect(&mut reader)
                                 }
                             }
                         }
-                        set_step("Reconstructing partitions from Ghost image...");
-                    }
-
-                    if let Ok(mut s) = status.lock() {
-                        s.format_label = Some(label.to_string());
-                    }
-                    PartitionTable::detect(&mut reader)
-                } else if !is_device {
-                    // For image files, use unified format detection
-                    match device_file.as_ref().unwrap().try_clone() {
-                        Ok(clone) => match rusty_backup::rbformats::detect_image_format_with_path(
-                            clone,
-                            Some(&path),
-                        ) {
-                            Ok(format) => {
-                                let desc = format.description();
-                                push_log(format!("Detected format: {}", desc));
-                                if let Ok(mut s) = status.lock() {
-                                    s.format_label = Some(desc.clone());
-                                }
-                                match rusty_backup::rbformats::wrap_image_reader(
-                                    device_file.as_ref().unwrap().try_clone().unwrap_or_else(
-                                        |_| std::fs::File::open(&path).expect("reopen failed"),
-                                    ),
-                                    format,
-                                ) {
-                                    Ok((mut wrapped_reader, _data_size)) => {
-                                        PartitionTable::detect(&mut wrapped_reader)
-                                    }
-                                    Err(e) => {
-                                        push_log(format!("Format wrap failed, trying raw: {e}"));
-                                        let _ = reader.seek(SeekFrom::Start(0));
-                                        PartitionTable::detect(&mut reader)
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                push_log(format!("Format detection failed, trying raw: {e}"));
-                                PartitionTable::detect(&mut reader)
-                            }
-                        },
-                        Err(_) => PartitionTable::detect(&mut reader),
-                    }
-                } else {
-                    // Device path — always treat as raw
-                    PartitionTable::detect(&mut reader)
-                };
+                        Err(e) => {
+                            push_log(format!("Format detection failed, trying raw: {e}"));
+                            PartitionTable::detect(&mut reader)
+                        }
+                    },
+                    Err(_) => PartitionTable::detect(&mut reader),
+                }
+            } else {
+                // Device path — always treat as raw
+                PartitionTable::detect(&mut reader)
+            };
 
             match detect_result {
                 Ok(mut table) => {
                     // Fix up superfloppy size: seek(End(0)) returns 0 for macOS devices
                     if let PartitionTable::None { size_bytes, .. } = &mut table {
                         if *size_bytes == 0 {
-                            if let Some(ref df) = device_file {
-                                if let Ok(f) = df.try_clone() {
-                                    if let Ok(real_size) =
-                                        rusty_backup::os::get_file_size(&f, &path)
-                                    {
-                                        *size_bytes = real_size;
-                                    }
-                                }
+                            if let Some(real_size) =
+                                device_file.as_ref().and_then(|df| df.byte_len(&path))
+                            {
+                                *size_bytes = real_size;
                             }
                         }
                     }
@@ -3715,7 +3784,7 @@ impl InspectTab {
                                 rusty_backup::fs::partition_minimum_size(
                                     // SectorAlignedReader delegates End to inner, so wrap first.
                                     rusty_backup::os::SectorAlignedReader::new(
-                                        rusty_backup::os::known_len_reader(f, &path),
+                                        rusty_backup::os::known_len_source(f, &path),
                                     ),
                                     part.byte_offset(),
                                     part.partition_type_byte,
@@ -5881,99 +5950,203 @@ fn show_export_disk_layout_bars(
     });
 }
 
+/// Partition-type entry field: free-form text plus a catalog dropdown and the
+/// resolved type name.
+///
+/// The text field stays authoritative — the dropdown only stamps a value into
+/// it — so a type that isn't in the catalog is still reachable by typing it.
+fn type_field(ui: &mut egui::Ui, kind: type_catalog::TableKind, id: &str, text: &mut String) {
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::TextEdit::singleline(text)
+                .desired_width(if kind == type_catalog::TableKind::Gpt {
+                    250.0
+                } else {
+                    90.0
+                })
+                .id(egui::Id::new(id)),
+        )
+        .on_hover_text(kind.field_hint());
+
+        let choices = type_catalog::choices(kind);
+        if !choices.is_empty() {
+            egui::ComboBox::from_id_salt(format!("{}_pick", id))
+                .selected_text("Pick...")
+                .width(230.0)
+                .show_ui(ui, |ui| {
+                    for choice in choices {
+                        let selected =
+                            type_catalog::describe(kind, text).is_some_and(|l| l == choice.label);
+                        if ui
+                            .selectable_label(
+                                selected,
+                                format!("{}  -  {}", choice.value, choice.label),
+                            )
+                            .clicked()
+                        {
+                            *text = choice.value.to_string();
+                        }
+                    }
+                })
+                .response
+                .on_hover_text("Choose a well-known partition type");
+        }
+
+        match type_catalog::describe(kind, text) {
+            Some(label) => {
+                ui.label(egui::RichText::new(label).weak());
+            }
+            None if !text.trim().is_empty() => {
+                ui.label(egui::RichText::new("custom").weak().italics());
+            }
+            None => {}
+        }
+    });
+}
+
+/// A partition's place on the disk, for the editor's layout bars.
+struct PlacedSegment {
+    label: String,
+    fs: String,
+    start_byte: u64,
+    size_bytes: u64,
+    color_index: usize,
+}
+
+/// Lay `placed` out across a `disk_size`-byte disk, inserting `Free` segments
+/// for every unallocated gap.
+///
+/// Segments are painted at their real byte offsets, so a partition added into
+/// a hole between two others renders in that hole rather than at the end of
+/// the bar. Input must be sorted by `start_byte`; an entry that starts before
+/// the previous one ends (an overlap the user hasn't validated away yet) is
+/// drawn straight after it instead of producing a negative gap.
+fn place_segments(placed: &[PlacedSegment], disk_size: u64) -> Vec<super::partition_bar::Segment> {
+    use super::partition_bar::{Segment, SegmentKind};
+
+    let mut segments = Vec::new();
+    let mut cursor = 0u64;
+    for p in placed {
+        if p.start_byte > cursor {
+            segments.push(Segment {
+                label: String::new(),
+                fs: String::new(),
+                size_bytes: p.start_byte - cursor,
+                kind: SegmentKind::Free,
+            });
+        }
+        segments.push(Segment {
+            label: p.label.clone(),
+            fs: p.fs.clone(),
+            size_bytes: p.size_bytes,
+            kind: SegmentKind::Partition {
+                color_index: p.color_index,
+            },
+        });
+        cursor = cursor.max(p.start_byte.saturating_add(p.size_bytes));
+    }
+    if disk_size > cursor {
+        segments.push(Segment {
+            label: String::new(),
+            fs: String::new(),
+            size_bytes: disk_size - cursor,
+            kind: SegmentKind::Free,
+        });
+    }
+    segments
+}
+
 /// Render the Current vs After PartitionBar pair inside the partition-table
-/// editor popup. "Current" mirrors the loaded `partitions` list; "After"
-/// walks the editor's working entries — applying parsed sizes, hiding
-/// deleted entries, and appending the pending Add-Partition row when its
-/// size field has a positive value. Both bars share the byte-per-pixel
-/// scale, so the After bar grows/shrinks visibly with the working edits.
+/// editor popup.
+///
+/// Both bars span the whole disk and place every partition at its real start
+/// LBA, with unallocated gaps drawn as free space — so the bar answers "where
+/// on the disk does this land", not merely "in what order are the entries".
+/// "Current" mirrors the loaded `partitions` list; "After" walks the editor's
+/// working entries plus the pending Add-Partition row.
 fn show_editor_disk_layout_bars(
     ui: &mut egui::Ui,
     partitions: &[PartitionInfo],
     editor: &rusty_backup::model::partition_editor::PartitionEditor,
+    kind: type_catalog::TableKind,
 ) {
-    use super::partition_bar::{PartitionBar, Segment, SegmentKind};
+    use super::partition_bar::PartitionBar;
 
-    fn parse_mib(text: &str) -> Option<u64> {
-        text.trim()
-            .parse::<f64>()
-            .ok()
-            .filter(|v| *v > 0.0)
-            .map(|v| ((v * 1024.0 * 1024.0) as u64 / 512) * 512)
-    }
+    // Color by partition index, not by position, so a row keeps its color
+    // between the two bars even when an insertion shifts disk order.
+    let color_of = |index: usize| index;
 
-    // Current bar from the loaded partition list (same shape as the
-    // inspect-tab disk-layout bar minus the trailing-free segment, since
-    // the editor's free space is implicit in the bar-pair scale).
-    let mut current = Vec::new();
-    let mut color_index = 0usize;
-    for p in partitions {
-        if p.is_extended_container || p.is_logical {
-            continue;
-        }
-        let kind = SegmentKind::Partition { color_index };
-        color_index += 1;
-        current.push(Segment {
+    let mut current: Vec<PlacedSegment> = partitions
+        .iter()
+        .filter(|p| !p.is_extended_container)
+        .map(|p| PlacedSegment {
             label: format!("Partition {}", p.index + 1),
             fs: p.type_name.clone(),
+            start_byte: p.byte_offset(),
             size_bytes: p.size_bytes,
-            kind,
-        });
-    }
+            color_index: color_of(p.index),
+        })
+        .collect();
+    current.sort_by_key(|p| p.start_byte);
 
-    // After bar from the editor working state. We preserve original entry
-    // order (partition table order) and reuse the same color cycle so the
-    // before/after pair stays visually aligned.
-    let mut after = Vec::new();
-    color_index = 0;
-    for entry in &editor.entries {
-        if entry.deleted || entry.is_extended_container || entry.is_logical {
-            // Reserve the color slot anyway so the next entry's color
-            // matches its Current counterpart.
-            if !entry.is_extended_container && !entry.is_logical {
-                color_index += 1;
-            }
-            continue;
-        }
-        let size_bytes = parse_mib(&entry.size_text).unwrap_or(entry.size_bytes);
-        let kind = SegmentKind::Partition { color_index };
-        color_index += 1;
-        after.push(Segment {
-            label: format!("Partition {}", entry.index + 1),
-            fs: entry.type_name.clone(),
-            size_bytes,
-            kind,
-        });
-    }
-
-    // Pending Add Partition row (rendered as a sequential segment in the
-    // current color slot). Surfaces while the user is filling in the
-    // Add-Partition fields, so they can see the addition in the bar before
-    // clicking Validate.
-    if let Some(add_size) = parse_mib(&editor.add_size_mb) {
-        after.push(Segment {
-            label: "New".to_string(),
-            fs: if editor.add_type.trim().is_empty() {
-                String::new()
+    let mut after: Vec<PlacedSegment> = editor
+        .working_layout()
+        .into_iter()
+        .map(|p| PlacedSegment {
+            label: if p.is_new {
+                format!("New (part {})", p.index + 1)
             } else {
-                editor.add_type.trim().to_string()
+                format!("Partition {}", p.index + 1)
             },
-            size_bytes: add_size,
-            kind: SegmentKind::Partition { color_index },
+            fs: p.type_name.clone(),
+            start_byte: p.start_byte(),
+            size_bytes: p.size_bytes,
+            color_index: color_of(p.index),
+        })
+        .collect();
+    // Pending Add-Partition inputs preview in place, before the user commits
+    // them with the Add button.
+    if let Some(pending) = editor.pending_add(kind) {
+        after.push(PlacedSegment {
+            label: "New".to_string(),
+            fs: pending.type_name.clone(),
+            start_byte: pending.start_byte(),
+            size_bytes: pending.size_bytes,
+            color_index: color_of(pending.index),
         });
     }
+    after.sort_by_key(|p| p.start_byte);
 
-    let current_total: u64 = current.iter().map(|s| s.size_bytes).sum();
-    let after_total: u64 = after.iter().map(|s| s.size_bytes).sum();
-    let max_total = current_total.max(after_total).max(1);
+    // Overlaps or entries running past the end make the working layout wider
+    // than the disk; scale both bars to that so the overflow stays visible
+    // instead of being silently clipped.
+    let allocated = |segs: &[PlacedSegment]| -> u64 { segs.iter().map(|p| p.size_bytes).sum() };
+    let extent = |segs: &[PlacedSegment]| -> u64 {
+        segs.iter()
+            .map(|p| p.start_byte.saturating_add(p.size_bytes))
+            .max()
+            .unwrap_or(0)
+    };
+    let disk_size = editor
+        .disk_size
+        .max(extent(&current))
+        .max(extent(&after))
+        .max(1);
+
     let available_width = ui.available_width().max(120.0);
+    let current_free = disk_size.saturating_sub(allocated(&current));
+    let after_free = disk_size.saturating_sub(allocated(&after));
 
-    ui.label("Current:");
-    let current_w = available_width * (current_total as f64 / max_total as f64) as f32;
+    ui.label(format!(
+        "Current  (disk {}, {} allocated, {} free):",
+        partition::format_size(disk_size),
+        partition::format_size(allocated(&current)),
+        partition::format_size(current_free),
+    ));
     ui.scope(|ui| {
-        ui.set_width(current_w.max(60.0));
+        ui.set_width(available_width);
         PartitionBar {
-            segments: current,
+            segments: place_segments(&current, disk_size),
             show_inline_labels: true,
             show_legend: false,
         }
@@ -5982,15 +6155,14 @@ fn show_editor_disk_layout_bars(
 
     ui.add_space(4.0);
     ui.label(format!(
-        "After  ({} -> {}):",
-        partition::format_size(current_total),
-        partition::format_size(after_total),
+        "After  ({} allocated, {} free):",
+        partition::format_size(allocated(&after)),
+        partition::format_size(after_free),
     ));
-    let after_w = available_width * (after_total as f64 / max_total as f64) as f32;
     ui.scope(|ui| {
-        ui.set_width(after_w.max(60.0));
+        ui.set_width(available_width);
         PartitionBar {
-            segments: after,
+            segments: place_segments(&after, disk_size),
             show_inline_labels: true,
             show_legend: true,
         }

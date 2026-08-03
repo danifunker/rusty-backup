@@ -2,10 +2,12 @@ mod sudo;
 
 use std::ffi::{c_void, CString};
 use std::fs::File;
-use std::os::unix::io::FromRawFd;
+use std::mem::ManuallyDrop;
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -698,6 +700,301 @@ fn da_claim_disk_on(
 // authopen-based privileged device access
 // ---------------------------------------------------------------------------
 
+/// Privileged device descriptors kept for the life of the process, so a device
+/// is escalated once instead of once per operation.
+///
+/// `authopen` issues no reusable credential — it opens one file, passes the
+/// descriptor back over `SCM_RIGHTS`, and exits — so the descriptor itself is
+/// the only cacheable artifact. Inspecting a disk and then backing it up used
+/// to mean two authorization prompts for the same device; now the second call
+/// finds the first call's descriptor.
+///
+/// Entries are `(raw device path, writable, fd)`. A writable entry satisfies a
+/// read-only request; the reverse re-escalates.
+static ELEVATED_DEVICES: Mutex<Vec<(String, bool, Arc<OwnedFd>)>> = Mutex::new(Vec::new());
+
+/// A privileged descriptor shared between operations, each holding its own
+/// file offset.
+///
+/// The cached fd is one open file *description*, so a plain `dup` would make
+/// every holder share a single offset — an Inspect browse session and a running
+/// backup would silently seek out from under each other. All I/O here is
+/// positional (`pread` / `pwrite`) against a private `pos` instead.
+pub struct SharedDevice {
+    fd: Arc<OwnedFd>,
+    pos: u64,
+    /// Device length; raw devices can't answer `seek(End)`.
+    len: u64,
+}
+
+impl SharedDevice {
+    fn new(fd: Arc<OwnedFd>) -> Self {
+        let len = {
+            // get_device_size wants a File; borrow the fd without owning it.
+            let borrowed = ManuallyDrop::new(unsafe { File::from_raw_fd(fd.as_raw_fd()) });
+            get_device_size(&borrowed).unwrap_or(0)
+        };
+        Self { fd, pos: 0, len }
+    }
+
+    /// An independent handle onto the same descriptor, starting at offset 0.
+    pub fn try_clone(&self) -> std::io::Result<Self> {
+        Ok(Self {
+            fd: Arc::clone(&self.fd),
+            pos: 0,
+            len: self.len,
+        })
+    }
+
+    /// Device length in bytes, or 0 when the OS wouldn't say.
+    pub fn byte_len(&self) -> u64 {
+        self.len
+    }
+
+    /// Dup the cached descriptor into an owned `File`.
+    ///
+    /// The dup shares one file *description* — and therefore one file offset —
+    /// with the cached entry. That's fine because `SharedDevice` itself only
+    /// ever uses `pread` / `pwrite`, which leave that offset untouched, so the
+    /// returned `File` is its sole user.
+    pub fn dup_as_file(&self) -> std::io::Result<File> {
+        let fd = unsafe { libc::dup(self.fd.as_raw_fd()) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    pub fn as_raw_fd(&self) -> libc::c_int {
+        self.fd.as_raw_fd()
+    }
+}
+
+impl std::io::Read for SharedDevice {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = unsafe {
+            libc::pread(
+                self.fd.as_raw_fd(),
+                buf.as_mut_ptr() as *mut c_void,
+                buf.len(),
+                self.pos as libc::off_t,
+            )
+        };
+        if n < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        self.pos += n as u64;
+        Ok(n as usize)
+    }
+}
+
+impl std::io::Write for SharedDevice {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = unsafe {
+            libc::pwrite(
+                self.fd.as_raw_fd(),
+                buf.as_ptr() as *const c_void,
+                buf.len(),
+                self.pos as libc::off_t,
+            )
+        };
+        if n < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        self.pos += n as u64;
+        Ok(n as usize)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        // Positional writes go straight to the device; F_NOCACHE is already set.
+        Ok(())
+    }
+}
+
+impl std::io::Seek for SharedDevice {
+    fn seek(&mut self, from: std::io::SeekFrom) -> std::io::Result<u64> {
+        use std::io::SeekFrom;
+        let next = match from {
+            SeekFrom::Start(n) => n as i64,
+            SeekFrom::Current(d) => self.pos as i64 + d,
+            SeekFrom::End(d) => self.len as i64 + d,
+        };
+        if next < 0 {
+            return Err(crate::compat::io_other("seek before start of device"));
+        }
+        self.pos = next as u64;
+        Ok(self.pos)
+    }
+}
+
+/// A cached descriptor for `path` that covers the requested access, if any.
+fn reuse_elevated_device(path: &str, needs_write: bool) -> Option<SharedDevice> {
+    let cache = ELEVATED_DEVICES.lock().ok()?;
+    for (cached_path, writable, fd) in cache.iter() {
+        if cached_path == path && (*writable || !needs_write) {
+            log::info!("reusing the elevated descriptor for {path} (no new prompt)");
+            return Some(SharedDevice::new(Arc::clone(fd)));
+        }
+    }
+    None
+}
+
+/// Escalate `path`, reusing a descriptor from an earlier prompt when one
+/// covers the requested access.
+fn cached_authopen(path: &str, flags: libc::c_int) -> Result<SharedDevice> {
+    let needs_write = flags & libc::O_ACCMODE != libc::O_RDONLY;
+
+    if let Some(shared) = reuse_elevated_device(path, needs_write) {
+        return Ok(shared);
+    }
+
+    let file = authopen_device(path, flags)?;
+    let fd = Arc::new(OwnedFd::from(file));
+    if let Ok(mut cache) = ELEVATED_DEVICES.lock() {
+        if needs_write {
+            // A writable descriptor supersedes a read-only one for this device,
+            // so drop the narrower entry and let every later operation — read
+            // or write — reuse this one.
+            cache.retain(|(cached, writable, _)| cached != path || *writable);
+        }
+        cache.push((path.to_string(), needs_write, Arc::clone(&fd)));
+    }
+    Ok(SharedDevice::new(fd))
+}
+
+/// TEMP-DIAG: report what access we hold on `path` right now, without
+/// escalating. Tracking down a macOS restore that fails with EACCES at the very
+/// end after an earlier authopen succeeded. Remove with the rest of TEMP-DIAG
+/// once that's understood — grep the tag.
+pub fn probe_device_access(path: &str) -> Vec<String> {
+    let raw = raw_device_path(path);
+    let mut out = Vec::new();
+
+    out.push(format!(
+        "[perm] euid={} ({}), can show an auth prompt: {}",
+        unsafe { libc::geteuid() },
+        if running_as_root() {
+            "root"
+        } else {
+            "not elevated"
+        },
+        if session_can_prompt() { "yes" } else { "no" },
+    ));
+
+    // Plain open(2) only — probing must never raise a dialog of its own, or it
+    // would change the very thing it is measuring.
+    for (label, flags) in [("O_RDONLY", libc::O_RDONLY), ("O_RDWR", libc::O_RDWR)] {
+        let Ok(c_path) = CString::new(raw.as_str()) else {
+            continue;
+        };
+        let fd = unsafe { libc::open(c_path.as_ptr(), flags) };
+        if fd >= 0 {
+            unsafe { libc::close(fd) };
+            out.push(format!("[perm] {raw}: {label} ok"));
+        } else {
+            let err = std::io::Error::last_os_error();
+            out.push(format!(
+                "[perm] {raw}: {label} failed - {} (errno {})",
+                err,
+                err.raw_os_error().unwrap_or(0),
+            ));
+        }
+    }
+
+    let cached = ELEVATED_DEVICES
+        .lock()
+        .map(|c| {
+            c.iter()
+                .filter(|(p, _, _)| p == &raw)
+                .map(|(_, w, _)| if *w { "read-write" } else { "read-only" })
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_else(|_| "<cache lock poisoned>".to_string());
+    out.push(format!(
+        "[perm] {raw}: cached elevated descriptor: {}",
+        if cached.is_empty() { "none" } else { &cached },
+    ));
+
+    out
+}
+
+/// Drop cached descriptors for `path` (all of them when `path` is `None`).
+///
+/// A held descriptor keeps the raw device open, which blocks a clean eject, so
+/// the GUI releases them when it closes a disk or the user asks to eject.
+pub fn release_elevated_devices(path: Option<&str>) {
+    if let Ok(mut cache) = ELEVATED_DEVICES.lock() {
+        match path {
+            Some(p) => {
+                let raw = raw_device_path(p);
+                cache.retain(|(cached, _, _)| cached != &raw && cached != p);
+            }
+            None => cache.clear(),
+        }
+    }
+}
+
+/// Already root, so a privileged `open(2)` needs no escalation at all.
+fn running_as_root() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+
+// Security.framework session attributes (AuthSession.h). `authopen` delegates
+// to SecurityAgent, which can only draw its dialog in a session that has
+// graphic access — without it the helper waits on input that can never come.
+const CALLER_SECURITY_SESSION: libc::c_int = -1;
+const SESSION_HAS_GRAPHIC_ACCESS: u32 = 0x0010;
+
+#[link(name = "Security", kind = "framework")]
+extern "C" {
+    fn SessionGetInfo(
+        session: libc::c_int,
+        session_id: *mut libc::c_int,
+        attributes: *mut u32,
+    ) -> i32;
+}
+
+/// Whether this process sits in a session that can show an auth dialog.
+///
+/// Returns `true` when the query itself fails: an unknown session must not be
+/// treated as headless, or we would refuse to escalate on a perfectly normal
+/// desktop.
+fn session_can_prompt() -> bool {
+    let mut id: libc::c_int = 0;
+    let mut attrs: u32 = 0;
+    let status = unsafe { SessionGetInfo(CALLER_SECURITY_SESSION, &mut id, &mut attrs) };
+    if status != 0 {
+        log::debug!("SessionGetInfo failed ({status}); assuming a GUI session is present");
+        return true;
+    }
+    attrs & SESSION_HAS_GRAPHIC_ACCESS != 0
+}
+
+/// Why `authopen` would not work right now, or `None` when it should.
+///
+/// Checked *before* forking the helper: authopen with no way to prompt hangs
+/// indefinitely rather than failing, and the parent blocks in `recvmsg` behind
+/// it. Diagnosing that from the outside just looks like the app is wedged.
+fn authopen_blocked_reason() -> Option<String> {
+    if running_as_root() {
+        return Some("already running as root; a direct open needs no prompt".to_string());
+    }
+    if !session_can_prompt() {
+        return Some(
+            "this session has no GUI access (SSH / cron / launchd daemon), so the \
+             administrator prompt cannot be shown -- re-run with sudo instead"
+                .to_string(),
+        );
+    }
+    None
+}
+
+/// How long to wait for `authopen` to hand back a descriptor. Generous, since
+/// it spans the user reading and answering the password prompt; the point is
+/// only that a wedged helper eventually becomes an error instead of a hang.
+const AUTHOPEN_TIMEOUT: libc::time_t = 120;
+
 /// Receive a file descriptor sent via `SCM_RIGHTS` ancillary data on a Unix socket.
 fn receive_fd_from_socket(sock: libc::c_int) -> Result<libc::c_int> {
     use std::mem;
@@ -725,6 +1022,14 @@ fn receive_fd_from_socket(sock: libc::c_int) -> Result<libc::c_int> {
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EINTR) {
                 continue;
+            }
+            // EAGAIN == EWOULDBLOCK on macOS; SO_RCVTIMEO reports the timeout here.
+            if err.raw_os_error() == Some(libc::EAGAIN) {
+                bail!(
+                    "authopen did not respond within {}s (its authorization prompt \
+                     may not be reachable from this session)",
+                    AUTHOPEN_TIMEOUT
+                );
             }
             bail!("recvmsg failed: {}", err);
         }
@@ -767,6 +1072,10 @@ fn receive_fd_from_socket(sock: libc::c_int) -> Result<libc::c_int> {
 /// auth dialog when needed. If already running as root it returns the fd
 /// immediately without any dialog.
 fn authopen_device(path: &str, flags: libc::c_int) -> Result<File> {
+    if let Some(reason) = authopen_blocked_reason() {
+        bail!("not using authopen: {reason}");
+    }
+
     // 1. Create IPC socket pair:
     //    sv[0] — parent receives the fd via SCM_RIGHTS
     //    sv[1] — child (authopen) sends the fd via stdout
@@ -774,6 +1083,22 @@ fn authopen_device(path: &str, flags: libc::c_int) -> Result<File> {
 
     if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) } != 0 {
         bail!("socketpair failed: {}", std::io::Error::last_os_error());
+    }
+
+    // Bound the parent's wait so a helper that never answers surfaces as an
+    // error instead of wedging the caller forever.
+    let tv = libc::timeval {
+        tv_sec: AUTHOPEN_TIMEOUT,
+        tv_usec: 0,
+    };
+    unsafe {
+        libc::setsockopt(
+            sv[0],
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            &tv as *const _ as *const c_void,
+            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+        );
     }
 
     // Prepare all execv arguments BEFORE fork (CStrings must stay alive until after exec)
@@ -836,7 +1161,10 @@ fn authopen_device(path: &str, flags: libc::c_int) -> Result<File> {
                 Err(e) => {
                     unsafe {
                         libc::close(sv[0]);
-                        // Reap child to avoid zombie
+                        // Kill before reaping: on the timeout path the helper is
+                        // still sitting on a prompt, so a plain waitpid would
+                        // block for exactly as long as we just refused to.
+                        libc::kill(child_pid, libc::SIGKILL);
                         let mut wstatus = 0i32;
                         libc::waitpid(child_pid, &mut wstatus, 0);
                     }
@@ -879,21 +1207,30 @@ fn authopen_device(path: &str, flags: libc::c_int) -> Result<File> {
 /// Never uses `O_EXLOCK`, which is unreliable on raw character devices and
 /// causes intermittent `EBUSY` errors even after a successful unmount.
 fn open_device(path: &str, flags: libc::c_int) -> Result<File> {
-    // Try authopen first
-    match authopen_device(path, flags) {
-        Ok(file) => return Ok(file),
-        Err(e) => {
-            let msg = e.to_string().to_lowercase();
-            if msg.contains("cancelled") || msg.contains("canceled") {
-                return Err(e);
+    // Only escalate when escalation can actually work. Under `sudo` the old
+    // unconditional authopen-first forked a helper that waited on a dialog no
+    // terminal session can show, and the parent blocked in recvmsg behind it —
+    // the process just appeared to hang.
+    // Goes through the same descriptor cache as the read path, so a restore
+    // that follows an inspect (or any second operation on the device) reuses
+    // the first prompt's descriptor instead of raising another dialog.
+    match authopen_blocked_reason() {
+        Some(reason) => log::info!("skipping authopen for {path}: {reason}"),
+        None => match cached_authopen(path, flags).and_then(|d| Ok(d.dup_as_file()?)) {
+            Ok(file) => return Ok(file),
+            Err(e) => {
+                let msg = e.to_string().to_lowercase();
+                if msg.contains("cancelled") || msg.contains("canceled") {
+                    return Err(e);
+                }
+                log::warn!("authopen warning: {} — falling back to direct open", e);
             }
-            log::warn!("authopen warning: {} — falling back to direct open", e);
-        }
+        },
     }
 
     // Direct open fallback (used when the app is already running as root via sudo)
     let c_path = CString::new(path).context("invalid device path")?;
-    let mut last_err = None;
+    let mut last_err: Option<std::io::Error> = None;
 
     for attempt in 0..5 {
         if attempt > 0 {
@@ -912,10 +1249,13 @@ fn open_device(path: &str, flags: libc::c_int) -> Result<File> {
         let raw = err.raw_os_error().unwrap_or(0);
 
         if raw == libc::EPERM {
-            return Err(anyhow::anyhow!(err).context(format!(
-                "permission denied opening {} — run without sudo or check disk permissions",
-                path
-            )));
+            let hint = if running_as_root() {
+                "even as root -- the disk may be protected by SIP or be a live system volume"
+            } else {
+                "run with sudo, or launch the GUI so it can prompt for administrator rights"
+            };
+            return Err(anyhow::anyhow!(err)
+                .context(format!("permission denied opening {} ({})", path, hint)));
         }
         if raw != libc::EBUSY {
             return Err(anyhow::anyhow!(err).context(format!("cannot open {}", path)));
@@ -924,8 +1264,12 @@ fn open_device(path: &str, flags: libc::c_int) -> Result<File> {
         last_err = Some(err);
     }
 
-    Err(anyhow::anyhow!(last_err.unwrap())
-        .context(format!("cannot open {} (EBUSY after 5 attempts)", path)))
+    Err(anyhow::anyhow!(last_err.unwrap()).context(format!(
+        "{} is busy after 5 attempts -- something still holds it. Unmount every \
+         volume on the disk first: `diskutil unmountDisk {}`",
+        path,
+        bsd_name_from_path(Path::new(path)),
+    )))
 }
 
 /// Extract the BSD disk name from a device path like `/dev/diskN` or `/dev/rdiskN`.
@@ -1057,15 +1401,25 @@ pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
             path_str.to_string()
         };
 
+        // 1. An earlier operation may already have escalated this device; reuse
+        //    that descriptor rather than prompting again.
+        if let Some(shared) = reuse_elevated_device(&raw_device, false) {
+            return Ok(ElevatedSource {
+                file: super::SourceHandle::Device(shared),
+                temp_path: None,
+                disk_claim,
+            });
+        }
+
         let c_path = CString::new(raw_device.as_str()).context("invalid device path")?;
 
-        // 1. Try a direct O_RDONLY open first — succeeds if we're already root
-        //    or if the media is accessible without privileges.
+        // 2. Try a direct O_RDONLY open — succeeds if we're already root or the
+        //    media is accessible without privileges.
         let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY) };
         if fd >= 0 {
             unsafe { libc::fcntl(fd, F_NOCACHE, 1) };
             return Ok(ElevatedSource {
-                file: unsafe { File::from_raw_fd(fd) },
+                file: super::SourceHandle::File(unsafe { File::from_raw_fd(fd) }),
                 temp_path: None,
                 disk_claim,
             });
@@ -1074,26 +1428,27 @@ pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
         let err = std::io::Error::last_os_error();
         let raw = err.raw_os_error().unwrap_or(0);
 
-        // 2. On EPERM or EACCES, escalate via authopen (authopen always opens
-        //    O_RDWR, which is fine for reading).
+        // 3. On EPERM or EACCES, escalate via authopen and cache the result.
+        //    Read-only: a backup only reads, and O_RDONLY also succeeds against
+        //    a still-mounted disk where O_RDWR would be refused with EBUSY.
         if raw == libc::EPERM || raw == libc::EACCES {
-            let file = authopen_device(&raw_device, libc::O_RDWR).with_context(|| {
+            let shared = cached_authopen(&raw_device, libc::O_RDONLY).with_context(|| {
                 format!("cannot open {} for reading (authopen failed)", raw_device)
             })?;
             return Ok(ElevatedSource {
-                file,
+                file: super::SourceHandle::Device(shared),
                 temp_path: None,
                 disk_claim,
             });
         }
 
-        // 3. Any other error is non-recoverable
+        // 4. Any other error is non-recoverable
         Err(anyhow::anyhow!(err).context(format!("cannot open {} for reading", raw_device)))
     } else {
         // Regular file — open normally
         let file = File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
         Ok(ElevatedSource {
-            file,
+            file: super::SourceHandle::File(file),
             temp_path: None,
             disk_claim: None,
         })
@@ -1188,5 +1543,175 @@ mod optical_device_path_tests {
         assert_eq!(raw_device_path("/dev/rdisk6"), "/dev/rdisk6");
         assert_eq!(raw_device_path("disk6"), "/dev/rdisk6");
         assert_eq!(raw_device_path("rdisk6"), "/dev/rdisk6");
+    }
+}
+
+#[cfg(test)]
+mod escalation_gate_tests {
+    use super::*;
+
+    #[test]
+    fn session_query_is_callable_and_total() {
+        // Exercises the Security.framework binding: any answer is acceptable
+        // (CI runners are headless), but it must not trap or hang.
+        let _ = session_can_prompt();
+    }
+
+    #[test]
+    fn root_never_takes_the_authopen_path() {
+        // The sudo hang: authopen was forked while already root, then blocked on
+        // a prompt no terminal session can show.
+        let reason = authopen_blocked_reason();
+        if running_as_root() {
+            let reason = reason.expect("root must short-circuit authopen");
+            assert!(reason.contains("root"), "unexpected reason: {reason}");
+        } else if session_can_prompt() {
+            assert!(reason.is_none(), "unexpected reason: {reason:?}");
+        } else {
+            // Headless and unprivileged: refused up front rather than hung.
+            assert!(reason.is_some());
+        }
+    }
+}
+
+#[cfg(test)]
+mod shared_device_tests {
+    use super::*;
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    /// Build a `SharedDevice` over a temp file. `len` is 0 (the ioctl only
+    /// answers for real devices), so `SeekFrom::End` is not exercised here.
+    fn shared_over_temp(contents: &[u8]) -> (tempfile::NamedTempFile, SharedDevice) {
+        let mut tmp = tempfile::NamedTempFile::new().expect("temp file");
+        tmp.write_all(contents).expect("seed");
+        tmp.flush().expect("flush");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(tmp.path())
+            .expect("reopen");
+        let device = SharedDevice::new(Arc::new(OwnedFd::from(file)));
+        (tmp, device)
+    }
+
+    #[test]
+    fn two_handles_on_one_descriptor_keep_separate_offsets() {
+        // The reason this type exists: a dup'd fd shares one file offset, so an
+        // open Inspect session and a running backup would seek out from under
+        // each other. Positional I/O keeps each handle independent.
+        let (_tmp, mut a) = shared_over_temp(b"0123456789ABCDEF");
+        let mut b = a.try_clone().expect("clone");
+
+        a.seek(SeekFrom::Start(0)).unwrap();
+        b.seek(SeekFrom::Start(8)).unwrap();
+
+        let mut buf_a = [0u8; 4];
+        let mut buf_b = [0u8; 4];
+        a.read_exact(&mut buf_a).unwrap();
+        b.read_exact(&mut buf_b).unwrap();
+        assert_eq!(&buf_a, b"0123");
+        assert_eq!(&buf_b, b"89AB");
+
+        // Interleaving must not disturb the other handle's position either.
+        a.read_exact(&mut buf_a).unwrap();
+        b.read_exact(&mut buf_b).unwrap();
+        assert_eq!(&buf_a, b"4567");
+        assert_eq!(&buf_b, b"CDEF");
+    }
+
+    #[test]
+    fn reads_advance_and_seek_current_is_relative() {
+        let (_tmp, mut d) = shared_over_temp(b"abcdefghij");
+        let mut buf = [0u8; 3];
+        d.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"abc");
+        assert_eq!(d.stream_position().unwrap(), 3);
+        d.seek(SeekFrom::Current(2)).unwrap();
+        d.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"fgh");
+    }
+
+    #[test]
+    fn writes_are_positional_and_visible_to_the_other_handle() {
+        let (_tmp, mut a) = shared_over_temp(b"...............");
+        let mut b = a.try_clone().expect("clone");
+
+        a.seek(SeekFrom::Start(4)).unwrap();
+        a.write_all(b"XYZ").unwrap();
+        // `a` advanced by exactly what it wrote, and left `b` where it was.
+        assert_eq!(a.stream_position().unwrap(), 7);
+        assert_eq!(b.stream_position().unwrap(), 0);
+
+        let mut buf = [0u8; 3];
+        b.seek(SeekFrom::Start(4)).unwrap();
+        b.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"XYZ");
+    }
+
+    #[test]
+    fn seeking_before_the_start_is_an_error_not_a_wrap() {
+        let (_tmp, mut d) = shared_over_temp(b"data");
+        assert!(d.seek(SeekFrom::Current(-1)).is_err());
+        // The failed seek must not have moved us.
+        assert_eq!(d.stream_position().unwrap(), 0);
+    }
+
+    #[test]
+    fn dup_as_file_reads_the_same_bytes() {
+        use std::io::Read as _;
+        let (_tmp, d) = shared_over_temp(b"hello world");
+        let mut file = d.dup_as_file().expect("dup");
+        let mut s = String::new();
+        file.read_to_string(&mut s).unwrap();
+        assert_eq!(s, "hello world");
+    }
+
+    /// Serializes the tests that touch the process-wide cache — one clears it
+    /// wholesale, which would otherwise yank entries out from under the other.
+    static CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Seed the cache directly, standing in for a completed authopen.
+    fn seed_cache(path: &str, writable: bool) -> tempfile::NamedTempFile {
+        let tmp = tempfile::NamedTempFile::new().expect("temp file");
+        let file = std::fs::File::open(tmp.path()).expect("open");
+        ELEVATED_DEVICES.lock().unwrap().push((
+            path.to_string(),
+            writable,
+            Arc::new(OwnedFd::from(file)),
+        ));
+        tmp
+    }
+
+    #[test]
+    fn a_writable_entry_serves_reads_but_not_the_reverse() {
+        // Decides how many prompts the user sees: a backup (read) after an
+        // inspect (read) reuses the descriptor; a restore (write) after a
+        // read-only inspect genuinely needs its own escalation.
+        let _serialize = CACHE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let path = "/dev/rdisk-test-rw";
+        let _tmp = seed_cache(path, true);
+        assert!(reuse_elevated_device(path, false).is_some(), "read hits");
+        assert!(reuse_elevated_device(path, true).is_some(), "write hits");
+        release_elevated_devices(Some(path));
+
+        let path = "/dev/rdisk-test-ro";
+        let _tmp = seed_cache(path, false);
+        assert!(reuse_elevated_device(path, false).is_some(), "read hits");
+        assert!(
+            reuse_elevated_device(path, true).is_none(),
+            "a read-only descriptor must not satisfy a write",
+        );
+        release_elevated_devices(Some(path));
+        assert!(reuse_elevated_device(path, false).is_none());
+    }
+
+    #[test]
+    fn releasing_the_cache_is_idempotent_and_path_scoped() {
+        // No entries for these paths, so both calls are no-ops — the point is
+        // that neither panics or poisons the lock.
+        let _serialize = CACHE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        release_elevated_devices(Some("/dev/disk99"));
+        release_elevated_devices(None);
+        assert!(reuse_elevated_device("/dev/rdisk99", false).is_none());
     }
 }

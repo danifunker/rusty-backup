@@ -1497,7 +1497,7 @@ impl BackupTab {
         let is_device = path_str.starts_with("/dev/") || path_str.starts_with("\\\\.\\");
 
         // Open file (with elevation for devices)
-        let open_result: Result<File, String> = if is_device {
+        let open_result: Result<rusty_backup::os::SourceHandle, String> = if is_device {
             match rusty_backup::os::open_source_for_reading(&path) {
                 Ok(elevated) => {
                     let (file, _guard) = elevated.into_parts();
@@ -1507,7 +1507,9 @@ impl BackupTab {
                 Err(e) => Err(format!("Cannot access device: {e}")),
             }
         } else {
-            File::open(&path).map_err(|e| format!("Cannot open source: {e}"))
+            File::open(&path)
+                .map(Into::into)
+                .map_err(|e| format!("Cannot open source: {e}"))
         };
 
         let file = match open_result {
@@ -1523,7 +1525,7 @@ impl BackupTab {
         let source_handle = file.try_clone().ok();
         // A device cannot answer seek(End); carry the length the OS reports instead.
         let mut reader: Box<dyn rusty_backup::rbformats::ReadSeek> = if is_device {
-            Box::new(rusty_backup::os::known_len_reader(file, &path))
+            Box::new(rusty_backup::os::known_len_source(file, &path))
         } else {
             Box::new(BufReader::new(file))
         };
@@ -1570,7 +1572,7 @@ impl BackupTab {
                     };
                     // AFFS / Atari / DFS / CBM size themselves via seek(End), which a device refuses.
                     let probe: Box<dyn rusty_backup::rbformats::ReadSeek> = if is_device {
-                        Box::new(rusty_backup::os::known_len_reader(clone, &path))
+                        Box::new(rusty_backup::os::known_len_source(clone, &path))
                     } else {
                         Box::new(BufReader::new(clone))
                     };
@@ -1631,7 +1633,10 @@ impl BackupTab {
                     }
                 }
                 // Stash the open source file so worker threads can clone it later.
-                if let Some(Ok(f)) = source_handle.as_ref().map(|f| f.try_clone()) {
+                if let Some(Ok(f)) = source_handle
+                    .as_ref()
+                    .map(|f| f.try_clone().and_then(|h| h.into_file()))
+                {
                     self.source_file = Some(Arc::new(f));
                 }
             }
@@ -2505,6 +2510,11 @@ impl BackupTab {
                 return;
             }
         };
+
+        // TEMP-DIAG: log the access we hold before touching the device.
+        for line in rusty_backup::os::describe_device_access(&source_path) {
+            ctx.log.info(line);
+        }
 
         let partition_filter = if self.selected_partitions.len()
             < self

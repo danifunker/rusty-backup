@@ -1312,8 +1312,8 @@ Usage: add [OPTIONS] --start-lba <START_LBA> --size <SIZE> <IMAGE>
 
 - `--start-lba` — Start LBA (512-byte sector). MBR / GPT: linear LBA. APM: block #
 - `--size` — Partition size in bytes (accepts `K`/`M`/`G` suffixes)
-- `--type-byte` — MBR type byte (decimal or `0xNN`). Ignored for non-MBR tables
-- `--type-string` — GPT type GUID string, or APM type string (`"Apple_HFS"`, etc.)
+- `--type-byte` — MBR type byte (decimal or `0xNN`). Ignored for non-MBR tables. See `partmap types --table mbr`
+- `--type-string` — GPT type GUID string, or APM type string (`"Apple_HFS"`, etc.). See `partmap types --table gpt|apm`
 - `--bootable` — Mark active/bootable
 
 ### `partmap apply`
@@ -1412,8 +1412,21 @@ Usage: set-type [OPTIONS] <IMAGE> <INDEX>
 
 **Options**
 
-- `--type-byte` — MBR type byte (decimal or `0xNN`)
-- `--type-string` — GPT type GUID / APM type string
+- `--type-byte` — MBR type byte (decimal or `0xNN`). See `partmap types`
+- `--type-string` — GPT type GUID / APM type string. See `partmap types`
+
+### `partmap types`
+
+List the well-known partition type values for a table flavor
+
+```
+Usage: types [OPTIONS]
+```
+
+**Options**
+
+- `--table` — Table flavor to list types for. Omit to read it from an image
+- `--image` — Image whose partition table decides which list to print
 
 ### `put`
 
