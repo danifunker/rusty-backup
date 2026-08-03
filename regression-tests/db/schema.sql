@@ -54,7 +54,11 @@ CREATE TABLE IF NOT EXISTS format (
 CREATE TABLE IF NOT EXISTS oracle (
     id          TEXT PRIMARY KEY,          -- 'chdman', 'fsck_hfs', 'iris'
     tool        TEXT NOT NULL,
-    kind        TEXT NOT NULL CHECK (kind IN ('package','mount','emulator','hardware')),
+    -- 'roundtrip' is its own thing: for formats we invented, no third party
+    -- exists and never will, so the only honest check is to run the whole
+    -- cycle and see whether the result still works. We are the oracle, and
+    -- the assertion is behavioural rather than structural.
+    kind        TEXT NOT NULL CHECK (kind IN ('package','mount','emulator','hardware','roundtrip')),
     notes       TEXT
 );
 

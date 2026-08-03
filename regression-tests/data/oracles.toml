@@ -312,3 +312,68 @@ availability = [{ platform = "mister-core", status = "expected" }]
 verifies = [
   { format = "part.ahdi", direction = "write", strength = "authoritative", status = "plausible" },
 ]
+
+[[oracle]]
+id = "mister-core-appleii"
+tool = "MiSTer Apple-II core"
+kind = "hardware"
+notes = """Real Apple II reading the disk with ProDOS / DOS 3.3 themselves.
+/media/fat/games/Apple-II is already populated on the board, so this needs no
+new material — it closes two write gaps that had no oracle at all."""
+availability = [{ platform = "mister-core", status = "expected" }]
+verifies = [
+  { format = "fs.prodos",    direction = "write", strength = "authoritative", status = "plausible" },
+  { format = "fs.apple-dos", direction = "write", strength = "authoritative", status = "plausible" },
+]
+
+# --- Classic Mac -------------------------------------------------------------
+
+[[oracle]]
+id = "snow"
+tool = "Snow"
+kind = "emulator"
+notes = """Modern Macintosh emulator written in Rust. Emulating a Mac Plus gives
+a real MFS implementation — the only realistic judge of MFS, which otherwise
+has no oracle anywhere. NB: snowemu.com returned HTTP 403 when checked on
+2026-08-02, so confirm the project and its automation surface before the
+matrix leans on it."""
+availability = [
+  { platform = "windows", status = "install" },
+  { platform = "linux",   status = "install" },
+  { platform = "macos",   status = "install" },
+]
+verifies = [
+  { format = "fs.mfs", direction = "write", strength = "authoritative", status = "plausible", evidence = "Mac Plus profile; MFS is the pre-HFS 400/800K format" },
+  { format = "fs.hfs", direction = "write", strength = "authoritative", status = "plausible" },
+]
+
+# --- Formats we invented -----------------------------------------------------
+
+[[oracle]]
+id = "full-cycle-boot"
+tool = "backup -> restore -> boot"
+kind = "roundtrip"
+notes = """For our own container formats there is no third party and never will
+be, so structural inspection is circular by construction. The honest check is
+behavioural: back up a real installed system, restore it, and boot the result.
+If the machine still comes up and its files are intact, the format did its job.
+
+Canonical scenario, which also exercises CB-DOS end to end:
+
+  1. Build a small DOS 6.22 VM (QEMU or VMware) and install it bootable.
+  2. Back that disk up with rb-cli into cbk.
+  3. Restore onto an SD card (or back into a VM disk).
+  4. Boot it and assert the guest reaches a prompt with its files intact.
+
+This single case covers more than the container: backup, restore, the CB-DOS
+path, partition and boot-sector fidelity, and — when the target is real media
+— the hardware write path from HARDWARE.md. Highest coverage-per-case in the
+suite, which is why it is worth the setup cost."""
+availability = [
+  { platform = "windows", status = "install" },
+  { platform = "linux",   status = "install" },
+  { platform = "macos",   status = "install" },
+]
+verifies = [
+  { format = "fmt.cbk", direction = "write", strength = "authoritative", status = "plausible", evidence = "we are the oracle; assertion is 'the restored machine still boots'" },
+]

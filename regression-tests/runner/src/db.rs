@@ -112,6 +112,21 @@ pub fn build(regression_dir: &Path, db_path: &Path) -> Result<BuildReport, Strin
     if let Some(parent) = db_path.parent() {
         let _ = fs::create_dir_all(parent);
     }
+
+    // Recreate from scratch rather than opening in place. The schema uses
+    // CREATE TABLE IF NOT EXISTS, so editing schema.sql would otherwise have
+    // no effect on an existing file and the change would fail silently — a
+    // new CHECK constraint, say, would appear to apply while the old one was
+    // still enforced. The database is derived by definition, so throwing it
+    // away is always safe.
+    //
+    // Run history is the one thing worth keeping, and it is re-ingested from
+    // the bundles under runs/ at the end of this function.
+    if db_path.exists() {
+        fs::remove_file(db_path)
+            .map_err(|e| format!("cannot replace {}: {}", db_path.display(), e))?;
+    }
+
     let conn = Connection::open(db_path).map_err(|e| format!("cannot open {}: {}", db_path.display(), e))?;
     conn.execute_batch(SCHEMA)
         .map_err(|e| format!("applying schema: {}", e))?;
