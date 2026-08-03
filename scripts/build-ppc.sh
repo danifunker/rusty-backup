@@ -203,10 +203,15 @@ stamp_version() {
 }
 
 HOST_LIBS="$MRUSTC_DIR/output-${RUSTC_VERSION}"
-PPC_LIBS="$MRUSTC_DIR/output-${RUSTC_VERSION}-${PPC_TARGET}"
+# Both PowerPC trees are keyed on the CPU family. The objects in them are
+# compiled with $PPC_CPU_FLAGS, so sharing one tree across families silently
+# links G5 AltiVec objects into a "G3" binary — the packaging guard catches it,
+# but only after a full engine rebuild. One tree per family keeps each cache
+# warm and makes a mixed binary impossible.
+PPC_LIBS="$MRUSTC_DIR/output-${RUSTC_VERSION}-${PPC_TARGET}-${PPC_CPU_LABEL}"
 HOST_OUT="$MRUSTC_DIR/output-rb-host"
 HOSTC_OUT="$MRUSTC_DIR/output-rb-hostc"
-PPC_OUT="$MRUSTC_DIR/output-rb-ppc"
+PPC_OUT="$MRUSTC_DIR/output-rb-ppc-${PPC_CPU_LABEL}"
 JOBS="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)"
 
 banner() { printf '\n\033[1;36m==== %s ====\033[0m\n' "$*"; }
@@ -756,15 +761,32 @@ stage_ppclibs() {
   cd "$MRUSTC_DIR"
   stage_ppc_overrides
   # No debug_assertions: assert_unsafe_precondition! aborts in rt::init here (docs/build-ppc-mrustc.md "The alignment problem").
+  # OUTDIR_SUF on the command line pins minicargo.mk's output directory to the
+  # CPU-stamped one. minicargo.mk would otherwise derive
+  # `output-<ver>-<target>` and append the target itself (its `:=` is ignored
+  # for a command-line variable), so libstd would land in a tree shared by
+  # every CPU family — the objects are built with $PPC_CPU_FLAGS and must not be.
   MRUSTC_TARGET_VER="$MRUSTC_TARGET_VER" MINICARGO_DEFER_CODEGEN=1 \
   MINICARGO_NO_DEBUG_ASSERTIONS=1 \
     make -f minicargo.mk LIBS \
       RUSTC_VERSION="$RUSTC_VERSION" \
       MRUSTC_TARGET="$PPC_TARGET" \
+      OUTDIR_SUF="-${RUSTC_VERSION}-${PPC_TARGET}-${PPC_CPU_LABEL}" \
       OVERRIDE_SUFFIX="$PPC_OVERRIDE_SUFFIX" \
       PARLEVEL="$PPC_JOBS"
   ls "$PPC_LIBS"/libstd.rlib.o >/dev/null 2>&1 || die "PPC libstd not produced"
   note "PPC libstd ready ($(ls "$PPC_LIBS"/*.o | wc -l | tr -d ' ') PowerPC objects)."
+}
+
+# minicargo derives the *host* lib dir from the target one by dropping the
+# target triple, so a CPU-stamped `output-<ver>-<triple>-g3` yields
+# `output-<ver>-g3` — which nothing builds. Host libs are CPU-independent
+# (they run here, not on the Mac), so alias the derived name at the real one.
+ensure_host_lib_alias() {
+  local alias_dir="$MRUSTC_DIR/output-${RUSTC_VERSION}-${PPC_CPU_LABEL}"
+  [ -e "$alias_dir" ] && return 0
+  ln -sfn "output-${RUSTC_VERSION}" "$alias_dir" \
+    && note "aliased $(basename "$alias_dir") -> output-${RUSTC_VERSION} (host libs)"
 }
 
 # The macOS/PowerPC build-script override set (mrustc ships -linux/-windows).
@@ -795,6 +817,7 @@ stage_ppc() {
   [ -x "$PPC_CC_WRAPPER" ] || die "missing $PPC_CC_WRAPPER"
   # Only this stage reaches the -sys crates, so only this stage needs an archiver.
   [ -x "$PPC_AR_WRAPPER" ] || die "missing $PPC_AR_WRAPPER"
+  ensure_host_lib_alias
   [ -e "$PPC_LIBS/libstd.rlib.o" ] || die "PPC libstd missing -- run 'ppclibs' first"
   cd "$MRUSTC_DIR"
   patch_crc_vendor
