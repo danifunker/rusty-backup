@@ -79,6 +79,7 @@ regression-tests/
   FIXTURES.md        <- fixture policy and provenance rule (prose: it is an argument)
   EMULATORS.md       <- emulator / on-hardware verification design
   HARDWARE.md        <- physical backup/restore design + safety interlocks
+  RUNBOOK.md         <- HOW TO RUN ONE. Kept accurate against what executes
   REPORTING.md       <- run bundle format and triage workflow
   data/              <- LAYER 1 (toml) + the generated regression.json
   runner/            <- the harness (standalone Rust crate)
@@ -147,21 +148,25 @@ thing standing behind everything rusty-backup writes.
 
 ## Running
 
-```bash
-cargo run --manifest-path regression-tests/runner/Cargo.toml -- --help
-```
+See **[RUNBOOK.md](RUNBOOK.md)** — it is kept accurate against what actually
+executes, and states plainly what is not implemented yet.
 
-Typical monthly run (see `PLAN.md` for current status of each flag):
-
-```bash
-rb-regress run --tiers 0-6 --report-root //NAS/share/rb-fixtures/runs
-```
-
-Hardware and emulator tiers are opt-in and never run by default:
+Short version, from a clean tree:
 
 ```bash
-rb-regress run --tiers 7 --allow-hardware --device-allowlist ./local-devices.toml
+cargo build --release --bin rb-cli
+cd regression-tests/runner
+cargo run --release -- run --rb-cli ../../target/release/rb-cli --tiers 0-2 --require-clean
+cargo run --release -- consolidate
 ```
+
+Building rb-cli as part of the run is not optional: it is what makes the
+recorded git sha describe the binary rather than merely the checkout.
+
+**Status: tiers 0-2 only, 68 cases, one machine.** Tiers 3-7 have no case
+manifests and the case schema has no oracle step, so no third-party
+verification runs yet. `rb-regress plan` shows the shape it is heading for;
+RUNBOOK.md § The run/verify split explains the gap.
 
 ---
 
