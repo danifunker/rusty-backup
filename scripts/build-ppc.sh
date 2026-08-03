@@ -25,6 +25,8 @@
 #     (hostc = emit the engine's C on this machine, no PowerPC needed; the
 #      fastest test that the whole engine transpiles)
 #     (ppclibs/ppc/dist/probe need PPC_HOST=<ssh dest of a PowerPC Mac>)
+#     (`seed <family>` clones a completed family's transpile so this family
+#      only runs codegen+link; scripts/build-all-ppc.sh drives the full set)
 #
 set -euo pipefail
 
@@ -351,6 +353,9 @@ stage_ppclibs() {
   [ -x "$PPC_CC_WRAPPER" ] || die "missing $PPC_CC_WRAPPER"
   cd "$MRUSTC_DIR"
   stage_ppc_overrides
+  # A seeded tree's artifacts may predate a later mrustc relink; skip the
+  # older-than-mrustc check for them (doc: "Transpile once across CPU families").
+  [ -f "$PPC_LIBS/.seeded-from" ] && export MINICARGO_IGNTOOLS=1
   # No debug_assertions: assert_unsafe_precondition! aborts in rt::init here (docs/build-ppc-mrustc.md "The alignment problem").
   # OUTDIR_SUF (a command-line variable beats minicargo.mk's own `:=`) pins
   # libstd into the CPU-stamped tree; doc: "One output tree per CPU family".
@@ -373,6 +378,98 @@ ensure_host_lib_alias() {
   [ -e "$alias_dir" ] && return 0
   ln -sfn "output-${RUSTC_VERSION}" "$alias_dir" \
     && note "aliased $(basename "$alias_dir") -> output-${RUSTC_VERSION} (host libs)"
+}
+
+# ---- seed: clone another family's transpile into this family's trees --------
+# The emitted C is identical across CPU families (mrustc never sees the CPU
+# flags), so a later family skips the 1h33m engine transpile: copy a completed
+# family's transpile products and let minicargo run codegen + link only.
+# Doc: "Transpile once across CPU families".
+stage_seed() {
+  local from="${1:-}"
+  banner "seed $PPC_CPU_LABEL from ${from:-?}"
+  [ -n "$from" ] || die "usage: build-ppc.sh seed <from-label>   (e.g. seed g3)"
+  [ "$from" != "$PPC_CPU_LABEL" ] || die "cannot seed $PPC_CPU_LABEL from itself"
+  seed_tree "$MRUSTC_DIR/output-${RUSTC_VERSION}-${PPC_TARGET}-${from}" "$PPC_LIBS" "$from"
+  seed_tree "$MRUSTC_DIR/output-rb-ppc-${from}" "$PPC_OUT" "$from"
+}
+
+# Skipped per tree when a sentinel or a real (unseeded) tree is already there,
+# so build-all can call it unconditionally without clobbering a full build.
+seed_tree() {
+  local src="$1" dst="$2" from="$3" rel base dstf n_copy=0 n_rewrite=0
+  [ -d "$src" ] || die "seed source $src missing -- build the $from family first"
+  if [ -f "$dst/.seeded-from" ]; then
+    note "$(basename "$dst") already seeded from $(cat "$dst/.seeded-from"); leaving it."
+    return 0
+  fi
+  if [ -d "$dst" ] && [ -n "$(ls -A "$dst" 2>/dev/null)" ]; then
+    note "$(basename "$dst") already exists (built the long way?); not seeding."
+    return 0
+  fi
+  mkdir -p "$dst"
+  while IFS= read -r -d '' f; do
+    rel="${f#"$src"/}"
+    base="${rel##*/}"
+    # Arch-specific state stays behind: root-level target objects, the
+    # engine's split-compile bookkeeping, and the linked executables.
+    case "$rel" in *".rlib.split/"*) continue ;; esac
+    if [ "$base" = "$rel" ]; then
+      case "$base" in *.o|*.o.parts) continue ;; esac
+      case "$base" in *.*) ;; *) continue ;; esac
+    fi
+    dstf="$dst/$rel"
+    [ "$base" = "$rel" ] || mkdir -p "${dstf%/*}"
+    case "$base" in
+      *.txt|*.d|*.sh|.release-version)
+        # Text mirrors embed tree paths; rewrite them, keep the mtime --
+        # minicargo is timestamp-driven and the ordering must survive.
+        sed -e "s|output-rb-ppc-${from}|output-rb-ppc-${PPC_CPU_LABEL}|g" \
+            -e "s|output-${RUSTC_VERSION}-${PPC_TARGET}-${from}|output-${RUSTC_VERSION}-${PPC_TARGET}-${PPC_CPU_LABEL}|g" \
+            "$f" > "$dstf"
+        touch -r "$f" "$dstf"
+        n_rewrite=$((n_rewrite + 1)) ;;
+      *)
+        # cp, never ln: mrustc truncates outputs in place, so a hardlinked
+        # seed writes through the shared inode and corrupts the donor tree.
+        cp -p "$f" "$dstf"
+        n_copy=$((n_copy + 1)) ;;
+    esac
+  done < <(find "$src" -type f -print0)
+  seed_retime_build_outputs "$dst"
+  printf '%s' "$from" > "$dst/.seeded-from"
+  note "seeded $(basename "$dst"): $n_copy copied, $n_rewrite rewritten from $from"
+}
+
+# Cold builds run a crate's build script in parallel with its proc-macro deps,
+# so build_<X>.txt is often OLDER than a main-dep artifact -- and minicargo
+# then re-runs the script on every warm pass, cascading up to a full engine
+# re-transpile. Retime each txt to its own crate's newest lib artifact: that
+# is > every dep of the script run and <= the lib jobs that consume it.
+seed_retime_build_outputs() {
+  local dst="$1" txt stem norm cand best ts n=0
+  [ -d "$dst/host" ] || return 0
+  for txt in "$dst"/host/build_*.txt; do
+    [ -f "$txt" ] || continue
+    stem="$(basename "$txt" .txt)"; stem="${stem#build_}"
+    # Lib artifacts underscore the crate name but keep the -<version> dash.
+    norm="$(printf '%s' "${stem%-*}" | tr -- '-' '_')-${stem##*-}"
+    best=""
+    for cand in "$dst/lib${norm}.rlib" "$dst/host/lib${norm}.rlib" \
+                "$dst/host/lib${norm}-plugin" "$dst"/librusty_backup-*.rlib; do
+      # The engine glob only matters for the root package, whose lib name differs.
+      case "$cand" in *librusty_backup*) case "$stem" in rb-cli-ppc-*) ;; *) continue ;; esac ;; esac
+      [ -e "$cand" ] || continue
+      ts="$(stat -c %Y "$cand")"
+      [ -z "$best" ] || [ "$ts" -lt "$(stat -c %Y "$best")" ] && best="$cand"
+    done
+    if [ -n "$best" ]; then
+      touch -r "$best" "$txt"
+      n=$((n + 1))
+    fi
+  done
+  [ "$n" -gt 0 ] && note "retimed $n build-script output(s) to their crates' lib artifacts"
+  return 0
 }
 
 # The macOS/PowerPC build-script override set (mrustc ships -linux/-windows).
@@ -405,6 +502,8 @@ stage_ppc() {
   [ -x "$PPC_AR_WRAPPER" ] || die "missing $PPC_AR_WRAPPER"
   ensure_host_lib_alias
   [ -e "$PPC_LIBS/libstd.rlib.o" ] || die "PPC libstd missing -- run 'ppclibs' first"
+  # Seeded artifacts may predate a later mrustc relink; skip that check.
+  [ -f "$PPC_OUT/.seeded-from" ] && export MINICARGO_IGNTOOLS=1
   cd "$MRUSTC_DIR"
   apply_vendor_patches
   mkdir -p "$PPC_OUT"
@@ -419,6 +518,9 @@ stage_ppc() {
   # minicargo can exit 0 while deadlocked, without linking (see Traps in the
   # doc) -- so check for the binary rather than trusting the exit code.
   [ -e "$PPC_OUT/rb-cli" ] || die "minicargo exited 0 but produced no $PPC_OUT/rb-cli -- check the log for 'BUG:' and for a deadlock listing"
+  # A fresh build already carries the script-vs-plugin staleness (see the
+  # retimer); heal the tree so the next warm run is transpile-quiet.
+  seed_retime_build_outputs "$PPC_OUT"
   note "PowerPC rb-cli under $PPC_OUT (compiled on $PPC_HOST)."
 }
 
@@ -474,6 +576,9 @@ main() {
     ppc)       stage_ppc ;;
     probe)     stage_probe ;;
     dist)      stage_dist ;;
+    seed)      stage_seed "${2:-}" ;;
+    retime)    seed_retime_build_outputs "$PPC_OUT" ;;
+    label)     printf '%s\n' "$PPC_CPU_LABEL" ;;
     all)
       stage_mrustc
       stage_overrides
@@ -482,7 +587,7 @@ main() {
       stage_host
       banner "HOST path complete. Run 'ppclibs', 'ppc' then 'dist' for PowerPC (needs PPC_HOST)."
       ;;
-    *) die "unknown stage '$stage' (mrustc|overrides|hostlibs|vendor|hostc|host|ppclibs|ppc|probe|dist|all)" ;;
+    *) die "unknown stage '$stage' (mrustc|overrides|hostlibs|vendor|hostc|host|ppclibs|ppc|probe|dist|seed|retime|label|all)" ;;
   esac
 }
 main "$@"

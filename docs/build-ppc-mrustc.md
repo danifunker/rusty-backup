@@ -408,6 +408,11 @@ Stages, in order:
 | `ppc`      | PowerPC `rb-cli` | ok |
 | `probe`    | capture libc ground truth from the 10.4u / 10.5 SDKs | ok |
 | `dist`     | package a relocatable bundle on the Mac (`scripts/ppc-package.sh`) | ok |
+| `seed`     | clone a completed family's transpile into this family's trees | ok |
+
+`scripts/build-all-ppc.sh` chains the PowerPC stages for every CPU family:
+full build for the first family, `seed` + codegen for the rest (see "Transpile
+once across CPU families").
 
 ### Traps in the build loop
 
@@ -497,6 +502,11 @@ Each of these cost real time:
   so a driver that trusts the exit code announces an rb-cli that was never
   produced. Both build stages check that the binary actually exists; when it is
   missing, grep the log for `BUG:` and for that deadlock listing.
+- **Never hardlink files into an output tree.** mrustc truncates outputs in
+  place, so the moment anything in the linked tree rebuilds, the write goes
+  through the shared inode and silently corrupts the other tree's copy - which
+  may be a *completed, verified* build. Copy (`cp -p`) instead; `seed` learned
+  this the hard way.
 - **Don't `tail` the build log.** Redirect to a file and grep it. A run reported
   as three failing assertions actually had four; the fourth was below a `tail -30`
   cutoff and cost a session's worth of wrong hypotheses.
@@ -678,6 +688,74 @@ structurally impossible. Two wrinkles make the stamping work:
 The shim self-invalidates independently of all this: its object name carries
 the CPU flags (`ppc-compat.cpu750-no-altivec.o`), because it is on the link
 line and would otherwise silently pin the executable's cpusubtype at 7400.
+
+### Transpile once across CPU families
+
+The emitted C is architecture-independent. Verified by `cmp` on the two
+810 MB engine files from the g3 and g4 trees: byte-identical except the
+16-character `APP_VERSION` timestamp string. Mechanically this must be so -
+all families are the *same* mrustc target (`powerpc-apple-darwin`), and
+`PPC_CPU_FLAGS` is consumed only by `ppc-cc-remote.py` at compile time;
+mrustc never sees it. Yet a naive 3-family build spends ~1h33m transpiling
+that same file three times, on a single core, while the Mac sits idle.
+
+`build-ppc.sh seed <family>` therefore clones a completed family's transpile
+products into the current family's (empty) trees, and the normal `ppclibs` /
+`ppc` stages then see current rlibs with missing objects - so minicargo goes
+straight to codegen + link, compiled on the Mac with *this* family's
+`PPC_CPU_FLAGS`. What seeding does, exactly:
+
+- copies (`cp -p`) everything except the arch-specific state: root-level
+  `.o` objects, the engine's split-compile bookkeeping (`.rlib.split/`,
+  `.o.parts`), and the linked executables. **Copies, never hardlinks**:
+  mrustc truncates its outputs in place, so if anything does re-transpile
+  in the seeded tree, a hardlink writes through the shared inode and
+  corrupts the *donor* tree - the first seeding attempt did exactly that
+  to g3's `libcore.rlib.c`;
+- copies the path-bearing text files (`.d`, `.txt`, `.sh`,
+  `.release-version`) with the tree names rewritten to this family - the
+  `.d` prerequisites name the stamped libs tree, so without the rewrite the
+  new family's staleness checks would point into the donor's tree - and
+  restores each file's mtime with `touch -r`, because minicargo is
+  timestamp-driven and the build ordering must survive the copy;
+- drops a `.seeded-from` sentinel, which makes `ppclibs` / `ppc` export
+  `MINICARGO_IGNTOOLS=1` for that tree. minicargo otherwise rebuilds any
+  output older than `bin/mrustc` itself, and a routine mrustc relink
+  after the donor was built (a `make` inside `minicargo.mk` can do this)
+  would silently defeat the whole seed. Sound because the seed's content
+  came from this same pipeline; if mrustc genuinely changes, the *donor*
+  family's own unseeded build catches it and the re-seed propagates it;
+- retimes every `host/build_<crate>.txt` to its own crate's newest lib
+  artifact. A cold build runs a crate's build script in parallel with its
+  proc-macro dependencies, so the script's output lands a few seconds
+  *older* than a main-dep artifact - and minicargo's script-run staleness
+  check then re-runs the script on **every warm pass**, regenerating the
+  `.txt` with a fresh mtime and cascading re-transpiles up through serde /
+  thiserror / zip to the engine itself. This latent bug is why warm builds
+  measured barely faster than cold (1h33m vs 1h39m): the engine
+  re-transpiled every time whether or not `src/` changed. The `ppc` stage
+  now retimes its own tree after every successful build (`build-ppc.sh
+  retime` does it by hand for an existing tree), so ordinary warm rebuilds
+  are transpile-quiet too, not just seeded ones.
+
+Two things deliberately ride along from the donor family:
+
+- **`APP_VERSION`**: every bundle carries the first family's stamp - one
+  version for one source state, rather than three timestamps for identical
+  code.
+- **The `-sys` crates' C archives** (zstd, bzip2): their build scripts do not
+  re-run (re-running would bump `build_*.txt` and dirty everything up to the
+  engine), so the donor's OUT_DIR archives are linked into every bundle.
+  Build the lowest floor (g3) first and this is always legal - g3 code runs
+  on every later CPU, and measured on real hardware the CPU-tuned builds buy
+  nothing (the G5 build ran ~50% *slower* than the G3 build on a G5).
+
+Re-verify the byte-identity (`cmp` two families' engine `.c`) after any
+mrustc or target-model change; if mrustc ever folds CPU-specific data into
+the C, seeding silently becomes wrong. `build-all-ppc.sh` guards the gross
+case - it warns if a seeded family's engine `.c` changed during the build
+(i.e. a re-transpile happened anyway), and `dist`'s AltiVec/cpusubtype floor
+check still gates every bundle independently.
 
 ## The parity gates
 
