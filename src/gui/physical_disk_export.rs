@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 
 use rusty_backup::device::DiskDevice;
 use rusty_backup::model::physical_write_runner::{
-    self, PhysicalWriteRequest, PhysicalWriteSource, PhysicalWriteStatus,
+    self, PhysicalWriteRequest, PhysicalWriteSource, PhysicalWriteStatus, WriteExtent,
 };
 use rusty_backup::model::size_mode::SizeMode;
 use rusty_backup::partition::PartitionTable;
@@ -437,9 +437,10 @@ impl PhysicalDiskExport {
             None
         };
         let req = PhysicalWriteRequest {
-            source: PhysicalWriteSource::RawFile(source.path.clone()),
+            source: PhysicalWriteSource::Image(source.path.clone()),
             target_device_path: device.path.clone(),
             target_size_bytes: target_size,
+            extent: WriteExtent::whole_disk(target_size),
             wrap,
         };
         self.last_error = None;

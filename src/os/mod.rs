@@ -825,8 +825,30 @@ pub fn open_for_inspect(path: &Path) -> Result<File> {
 /// On Windows, locks and dismounts volumes via `DeviceIoControl`.
 /// On macOS, uses DiskArbitration to unmount.
 pub fn open_target_for_writing(path: &Path) -> Result<DeviceWriteHandle> {
+    open_target_for_writing_inner(path, true)
+}
+
+/// [`open_target_for_writing`] that keeps a regular file's existing contents.
+///
+/// Writing into one partition must not disturb the rest of the target, and the
+/// default path creates + truncates a regular file. Devices behave identically
+/// either way — there is nothing to truncate.
+pub fn open_target_preserving(path: &Path) -> Result<DeviceWriteHandle> {
+    open_target_for_writing_inner(path, false)
+}
+
+fn open_target_for_writing_inner(path: &Path, truncate: bool) -> Result<DeviceWriteHandle> {
     let path_str = path.to_string_lossy();
     let is_device = path_str.starts_with("/dev/") || path_str.starts_with("\\\\.\\");
+
+    if !is_device && !truncate {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .with_context(|| format!("failed to open {} for writing", path.display()))?;
+        return Ok(DeviceWriteHandle::from_file(file));
+    }
 
     if !is_device {
         // Regular file — create/truncate AND open read+write. Restore's
