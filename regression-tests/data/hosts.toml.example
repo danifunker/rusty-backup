@@ -1,0 +1,59 @@
+# Host inventory for the planner.
+#
+# Copy to `hosts.toml` (gitignored — it names real machines) and edit.
+#
+# `platform` is the important field: it joins this host to every oracle
+# marked available on that platform in oracles.toml. Declare one Linux box
+# and it inherits fsck.ext4, unsquashfs, xfs_repair, jfs_fsck and the whole
+# mount set without listing them here.
+#
+# The planner uses this to work out who produces each artifact, who verifies
+# it, and which artifacts have to move between machines. Anything it cannot
+# route is reported as a gap rather than silently dropped.
+
+[[host]]
+id = "local"
+platform = "windows"
+transport = "local"
+can_produce = true
+can_verify = true
+notes = "Development box. Uniquely holds ghostexp (GHO) and chkdsk."
+
+# WSL is a separate host even though it is the same machine: different
+# platform, different oracle set, and artifacts need a wslpath translation.
+[[host]]
+id = "wsl"
+platform = "wsl"
+transport = "wsl"
+can_produce = false
+can_verify = true
+notes = "Ubuntu 24.04. Lighter than a real Linux box - no hfs, affs, minix, jfs or ntfs3 mounts."
+
+# The example from the design discussion: one Linux box does all Linux
+# filesystem validation, taking artifacts produced on Windows and macOS.
+[[host]]
+id = "linuxbox"
+platform = "linux"
+transport = "ssh"
+can_produce = true
+can_verify = true
+notes = "Needs linux-modules-extra for the hfs/hfsplus/affs/minix/jfs/ntfs3/ufs/efs mounts."
+
+[[host]]
+id = "mac"
+platform = "macos"
+transport = "ssh"
+can_produce = true
+can_verify = true
+notes = "Not optional: fsck_hfs, fsck_apfs and hdiutil exist nowhere else."
+
+[[host]]
+id = "mister"
+platform = "mister"
+transport = "ssh"
+can_produce = true
+can_verify = true
+notes = "armv7. Mounts affs, which WSL cannot. rb-cli already deployed at /media/fat/Scripts/rb-cli."
+
+# Connection details (address, user, identity file) live in local.toml, not
+# here, so this file stays about capability rather than credentials.

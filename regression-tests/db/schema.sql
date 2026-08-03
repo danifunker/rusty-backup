@@ -124,6 +124,40 @@ CREATE TABLE IF NOT EXISTS emulator_image (
 );
 
 -- ---------------------------------------------------------------------------
+-- Hosts
+-- ---------------------------------------------------------------------------
+
+-- The machines actually available. Loaded from data/hosts.toml, which is
+-- gitignored because it names real addresses; hosts.toml.example is the
+-- template. A host's *platform* is what joins it to oracle_availability, so
+-- one Linux box inherits every oracle marked available on linux.
+CREATE TABLE IF NOT EXISTS host (
+    id          TEXT PRIMARY KEY,
+    platform    TEXT NOT NULL,             -- windows | wsl | linux | macos | mister
+    transport   TEXT NOT NULL              -- local | ssh | wsl
+                CHECK (transport IN ('local','ssh','wsl')),
+    -- Can this host run rb-cli to *produce* artifacts? A MiSTer can verify
+    -- (mounts AFFS) without necessarily being where we build things.
+    can_produce INTEGER NOT NULL DEFAULT 1,
+    can_verify  INTEGER NOT NULL DEFAULT 1,
+    notes       TEXT
+);
+
+-- What each configured host can verify, derived by joining its platform
+-- against oracle availability. The planner's core lookup.
+CREATE VIEW IF NOT EXISTS v_host_capability AS
+SELECT h.id AS host, h.platform, h.transport,
+       o.id AS oracle, o.kind AS oracle_kind,
+       v.format_id, v.direction, v.strength, v.status AS verify_status,
+       a.status AS availability
+FROM host h
+JOIN oracle_availability a ON a.platform = h.platform
+JOIN oracle o              ON o.id = a.oracle_id
+JOIN verification v        ON v.oracle_id = o.id
+WHERE h.can_verify = 1
+  AND a.status IN ('verified','expected','install');
+
+-- ---------------------------------------------------------------------------
 -- Runs and results
 -- ---------------------------------------------------------------------------
 

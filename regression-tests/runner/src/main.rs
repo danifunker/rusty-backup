@@ -13,6 +13,7 @@ mod envelope;
 mod exec;
 mod fixtures;
 mod manifest;
+mod plan;
 mod report;
 
 use report::{Bundle, CaseResult, Verdict};
@@ -45,6 +46,8 @@ enum Command {
     DbBuild,
     /// Ask the database a question, by named query or raw SQL.
     DbQuery(String),
+    /// Map requirements onto the machines that exist.
+    Plan,
     Help,
 }
 
@@ -88,6 +91,7 @@ fn parse_args() -> Result<Args, String> {
             "run" => args.command = Command::Run,
             "list" => args.command = Command::List,
             "validate" => args.command = Command::Validate,
+            "plan" => args.command = Command::Plan,
             "db" => {
                 // `db build` | `db query <name-or-sql>`
                 match raw.get(i + 1).map(|s| s.as_str()) {
@@ -232,8 +236,23 @@ fn main() {
         Command::Run => cmd_run(&args),
         Command::DbBuild => cmd_db_build(&args),
         Command::DbQuery(ref q) => cmd_db_query(&args, q),
+        Command::Plan => cmd_plan(&args),
     };
     std::process::exit(code);
+}
+
+fn cmd_plan(args: &Args) -> i32 {
+    match plan::build_plan(&db_path(args), &regression_dir()) {
+        Ok(p) => {
+            print!("{}", plan::render(&p));
+            0
+        }
+        Err(e) => {
+            eprintln!("error: {}", e);
+            eprintln!("hint: run `rb-regress db build` first");
+            2
+        }
+    }
 }
 
 fn db_path(args: &Args) -> PathBuf {
