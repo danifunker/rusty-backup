@@ -1604,7 +1604,7 @@ jobs:
           cargo +1.73.0 build --release --bin rb-cli \
             --manifest-path rb-cli-vintage/Cargo.toml \
             --target x86_64-apple-darwin \
-            --no-default-features --features native-zstd,remote,tui,rust173-polyfill \
+            --no-default-features --features native-zstd,remote,tui,rust173-polyfill,yaml \
             --ignore-rust-version --locked
 
       - name: Verify 10.7 floor + no post-10.7 symbols
@@ -1705,16 +1705,61 @@ jobs:
           cargo +1.73.0 build --release --bin rb-cli \
             --manifest-path rb-cli-vintage/Cargo.toml \
             --target ${{ matrix.target }} \
-            --no-default-features --features native-zstd,remote,tui,rust173-polyfill,windows-legacy \
+            --no-default-features --features native-zstd,remote,tui,rust173-polyfill,windows-legacy,yaml \
             --ignore-rust-version --locked
 
-      - name: Report PE imports (Win7 sanity — no UCRT/WinRT hard deps expected)
-        shell: bash
+      - name: Assert PE imports are Win7-safe
+        shell: pwsh
         run: |
-          BIN="rb-cli-vintage/target/${{ matrix.target }}/release/rb-cli.exe"
-          ls -lh "$BIN"
-          # dumpbin ships with the MSVC toolchain on the runner.
-          dumpbin //dependents "$BIN" || true
+          # Reads the PE import directory directly rather than shelling out to dumpbin,
+          # which is not on PATH without the vcvars environment - the reason the previous
+          # version of this check hid behind `|| true` and never actually asserted.
+          $bin = "rb-cli-vintage/target/${{ matrix.target }}/release/rb-cli.exe"
+          $b = [IO.File]::ReadAllBytes($bin)
+          Write-Host "$bin ($($b.Length) bytes)"
+          $pe = [BitConverter]::ToInt32($b, 0x3C)
+          if ([Text.Encoding]::ASCII.GetString($b, $pe, 4).TrimEnd("`0") -ne "PE") { throw "not a PE image" }
+          $coff = $pe + 4
+          $nsec = [BitConverter]::ToUInt16($b, $coff + 2)
+          $optsz = [BitConverter]::ToUInt16($b, $coff + 16)
+          $opt = $coff + 20
+          $magic = [BitConverter]::ToUInt16($b, $opt)
+          $dd = if ($magic -eq 0x20b) { $opt + 112 } else { $opt + 96 }
+          $impRva = [BitConverter]::ToUInt32($b, $dd + 8)
+          if ($impRva -eq 0) { throw "no import directory" }
+          $sec = $opt + $optsz
+          function Rva2Off($rva) {
+            for ($i = 0; $i -lt $nsec; $i++) {
+              $s = $sec + $i * 40
+              $va = [BitConverter]::ToUInt32($b, $s + 12)
+              $sz = [BitConverter]::ToUInt32($b, $s + 16)
+              $pr = [BitConverter]::ToUInt32($b, $s + 20)
+              if ($rva -ge $va -and $rva -lt ($va + $sz)) { return $pr + ($rva - $va) }
+            }
+            throw "unmapped RVA $rva"
+          }
+          $dlls = @()
+          $p = Rva2Off $impRva
+          while ($true) {
+            $nameRva = [BitConverter]::ToUInt32($b, $p + 12)
+            if ($nameRva -eq 0) { break }
+            $o = Rva2Off $nameRva
+            $e = $o; while ($b[$e] -ne 0) { $e++ }
+            $dlls += [Text.Encoding]::ASCII.GetString($b, $o, $e - $o)
+            $p += 20
+          }
+          if ($dlls.Count -eq 0) { throw "no imported DLLs parsed - cannot verify" }
+          $dlls | Sort-Object | ForEach-Object { Write-Host "  $_" }
+          # None of these exist on Windows 7: combase arrived in 8, the api-ms-win-* sets
+          # and the UCRT in 8/10. A dependency bump that moves a symbol into one is
+          # invisible until the binary refuses to start - which is exactly how
+          # windows-sys 0.61 put CoTaskMemFree in combase.dll and broke this target.
+          $bad = $dlls | Where-Object { $_ -imatch '^(combase|ucrtbase)\.dll$|^api-ms-win-' }
+          if ($bad) {
+            Write-Host "::error::Win7-incompatible imports: $($bad -join ', ')"
+            exit 1
+          }
+          Write-Host "PE imports are Win7-safe."
 
       - name: Package CLI
         shell: bash

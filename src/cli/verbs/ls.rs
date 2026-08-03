@@ -285,14 +285,21 @@ pub fn resolve_components(
     fs: &mut dyn Filesystem,
     components: &[String],
 ) -> Result<crate::fs::entry::FileEntry> {
+    let fold_case = fs.case_insensitive_lookup();
     let mut current = fs.root().map_err(|e| anyhow!("root: {e}"))?;
     for component in components {
         let children = fs
             .list_directory(&current)
             .map_err(|e| anyhow!("list_directory: {e}"))?;
-        let next = children
-            .into_iter()
-            .find(|c| &c.name == component)
+        // Exact case first; fall back to the filesystem's native folding.
+        let mut idx = children.iter().position(|c| &c.name == component);
+        if idx.is_none() && fold_case {
+            idx = children
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(component));
+        }
+        let next = idx
+            .map(|i| children.into_iter().nth(i).expect("index within listing"))
             .ok_or_else(|| anyhow!("path component not found: {component}"))?;
         current = next;
     }
@@ -375,5 +382,51 @@ mod tests {
         assert!(parent.is_directory());
         assert_eq!(parent.name, "Oxyd 3.6");
         assert_eq!(name, "Oxyd b/w");
+    }
+
+    #[test]
+    fn ntfs_path_lookup_folds_case() {
+        use crate::fs::ntfs::NtfsFilesystem;
+        use crate::fs::ntfs_format::{create_ntfs, NtfsFormatParams, NtfsGeometry};
+        use std::io::{Seek, SeekFrom};
+
+        let mut cur = Cursor::new(Vec::new());
+        create_ntfs(
+            &mut cur,
+            &NtfsFormatParams {
+                total_size: 16 * 1024 * 1024,
+                geometry: NtfsGeometry::with_cluster_size(4096, 512).unwrap(),
+                mft_records_hint: 64,
+                label: None,
+            },
+        )
+        .unwrap();
+        cur.seek(SeekFrom::Start(0)).unwrap();
+        let mut fs = NtfsFilesystem::open(cur, 0).unwrap();
+        let root = fs.root().unwrap();
+        let dir = fs
+            .create_directory(&root, "MyDir", &CreateDirectoryOptions::default())
+            .unwrap();
+        let data = b"payload";
+        let mut reader: &[u8] = data;
+        fs.create_file(
+            &dir,
+            "KernelBase.dll",
+            &mut reader,
+            data.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+
+        // NTFS is case-insensitive: any casing must resolve to the one file.
+        for p in [
+            "/MyDir/KernelBase.dll",
+            "/mydir/KERNELBASE.DLL",
+            "/MYDIR/kernelbase.dll",
+        ] {
+            let entry = resolve_path(&mut fs, p).unwrap_or_else(|e| panic!("{p}: {e}"));
+            assert_eq!(entry.name, "KernelBase.dll");
+        }
+        assert!(resolve_path(&mut fs, "/MyDir/NoSuchFile.dll").is_err());
     }
 }

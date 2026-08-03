@@ -625,6 +625,30 @@ impl InspectTab {
             }
         });
 
+        // Physical devices need elevation, and the failure is otherwise
+        // confusing: raw disks belong to root, so an un-elevated process may
+        // list no devices at all, and Edit Mode fails at `open_editable` with a
+        // bare permission error well after the user has picked a disk and
+        // browsed into it. Say so up front, next to the picker, and only while
+        // it is actually true - once elevated there is nothing to warn about.
+        // Disk *images* are ordinary files and are unaffected, which is why
+        // this names devices specifically rather than warning about everything.
+        if !rusty_backup::os::is_elevated() {
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new(format!(
+                    "Note: physical devices need {}. Without it they may not be \
+                     listed, and Edit Mode will fail. Disk image files are unaffected.",
+                    if cfg!(windows) {
+                        "administrator privileges"
+                    } else {
+                        "root privileges (sudo)"
+                    }
+                ))
+                .color(egui::Color32::YELLOW),
+            );
+        }
+
         ui.add_space(4.0);
 
         // While the remote picker is active it takes over the main area; once
@@ -3177,6 +3201,10 @@ impl InspectTab {
                     }
                 } else {
                     match device_file.as_ref().unwrap().try_clone() {
+                        // A device cannot answer seek(End); carry the length the OS reports instead.
+                        Ok(f) if is_device => {
+                            Box::new(rusty_backup::os::known_len_reader(f, &path))
+                        }
                         Ok(f) => Box::new(BufReader::new(f)),
                         Err(e) => {
                             finish_err(format!("Cannot clone file handle: {e}"));
@@ -3685,7 +3713,10 @@ impl InspectTab {
                             };
                             if is_device {
                                 rusty_backup::fs::partition_minimum_size(
-                                    rusty_backup::os::SectorAlignedReader::new(f),
+                                    // SectorAlignedReader delegates End to inner, so wrap first.
+                                    rusty_backup::os::SectorAlignedReader::new(
+                                        rusty_backup::os::known_len_reader(f, &path),
+                                    ),
                                     part.byte_offset(),
                                     part.partition_type_byte,
                                     part.partition_type_string.as_deref(),

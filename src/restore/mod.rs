@@ -144,6 +144,41 @@ fn set_progress_bytes(progress: &Arc<Mutex<RestoreProgress>>, current: u64, tota
 /// this function accounts for EBR overhead (1 sector before each logical
 /// partition) and generates a synthetic override for the extended container
 /// entry so that `patch_mbr_entries` can resize it in the MBR.
+/// Smallest size a partition may be restored to: the number of bytes that
+/// actually have to land inside it.
+///
+/// For the per-partition layout that is `imaged_size_bytes` — the length of the
+/// stream we are about to write, already compacted if compaction ran.
+///
+/// The single-file CHD layout stores each partition at its **full original**
+/// byte range with the tail zero-filled, so there `imaged_size_bytes` equals
+/// the original size and says nothing about how little the data could fit into.
+/// Flooring on it rejected every shrink of a CHD backup - including the whole
+/// point of the CHD re-resize path - so a `--size minimum` restore of a backup
+/// in the *default* format always bailed with "smaller than minimum". Use the
+/// recorded in-place minimum instead: it is the last-data-byte trim point, so
+/// trimming to it never needs data relocation, which is exactly what the copy
+/// loop (`to_copy = chd_size.min(export_size)`) and the follow-up
+/// `resize_filesystem_for` can deliver.
+fn restore_size_floor(
+    metadata: &BackupMetadata,
+    pm: &crate::backup::metadata::PartitionMetadata,
+) -> u64 {
+    if matches!(
+        metadata.layout,
+        crate::backup::metadata::BackupLayout::SingleFileChd
+    ) {
+        if let Some(min) = pm.minimum_size_bytes.filter(|&m| m > 0) {
+            return min;
+        }
+    }
+    if pm.imaged_size_bytes > 0 {
+        pm.imaged_size_bytes
+    } else {
+        pm.original_size_bytes
+    }
+}
+
 pub fn calculate_restore_layout(
     metadata: &BackupMetadata,
     alignment: &RestoreAlignment,
@@ -353,11 +388,7 @@ pub fn calculate_restore_layout(
         }
         let pm = metadata.partitions.iter().find(|p| p.index == ov.index);
         if let Some(pm) = pm {
-            let min = if pm.imaged_size_bytes > 0 {
-                pm.imaged_size_bytes
-            } else {
-                pm.original_size_bytes
-            };
+            let min = restore_size_floor(metadata, pm);
             if ov.export_size < min {
                 bail!(
                     "Partition {} size ({}) is smaller than minimum ({})",
@@ -492,11 +523,7 @@ fn calculate_apm_restore_layout(
     for ov in &overrides {
         let pm = metadata.partitions.iter().find(|p| p.index == ov.index);
         if let Some(pm) = pm {
-            let min = if pm.imaged_size_bytes > 0 {
-                pm.imaged_size_bytes
-            } else {
-                pm.original_size_bytes
-            };
+            let min = restore_size_floor(metadata, pm);
             if ov.export_size < min {
                 bail!(
                     "Partition {} size ({}) is smaller than minimum ({})",

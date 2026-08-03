@@ -91,6 +91,16 @@ pub struct PutArgs {
     #[arg(long)]
     pub force: bool,
 
+    /// Give the replacement fresh metadata instead of the replaced file's.
+    ///
+    /// Replacing a file normally keeps what it carried - permissions, owner,
+    /// timestamps, type/creator, DOS attribute bits, Amiga protection and
+    /// extended attributes - because a replace changes contents, not who may
+    /// read the file or when it was made. Pass this to start clean instead.
+    /// Only meaningful with `--force`.
+    #[arg(long = "no-preserve-meta")]
+    pub no_preserve_meta: bool,
+
     /// Unix permission bits for the new file, as octal (e.g. `755`, `0644`).
     /// Unix filesystems only (ext / UFS / XFS / EFS / Minix / SquashFS);
     /// ignored on FAT / HFS / exFAT, which have no such concept.
@@ -237,15 +247,25 @@ pub fn run_with_budget(
         .into_iter()
         .find(|e| e.name == name);
     // Capture before the delete: afterwards there is nothing left to ask.
-    let inherited_xattrs =
-        crate::fs::attrs::inherited_xattrs(fs.as_filesystem_mut(), existing.as_ref());
-    if let Some(ref e) = existing {
-        if !args.force {
-            bail!("{dst} already exists (pass --force to overwrite)");
-        }
-        fs.delete_entry(&parent, e)
-            .map_err(|e| anyhow!("delete existing: {e}"))?;
+    // Everything the replaced file carried, not just its xattrs. A replace
+    // writes new *contents*; it is not a request to reset permissions, owner,
+    // timestamps or type/creator. Must be captured before the delete below.
+    let preserved = if args.no_preserve_meta {
+        crate::fs::attrs::PreservedMeta::default()
+    } else {
+        crate::fs::attrs::preserved_meta(fs.as_filesystem_mut(), existing.as_ref())
+    };
+    if existing.is_some() && !args.force {
+        bail!("{dst} already exists (pass --force to overwrite)");
     }
+    // The delete is NOT done here. `create_or_replace` stages the swap so a
+    // failure mid-write leaves the original intact, which delete-then-create
+    // could not promise.
+    let on_conflict = if existing.is_some() {
+        crate::fs::replace::OnConflict::Replace
+    } else {
+        crate::fs::replace::OnConflict::Fail
+    };
 
     // An explicit --type / --creator (or the config default) always wins. Failing
     // that, on the classic-Mac filesystems we leave both unset so `create_file`
@@ -254,8 +274,15 @@ pub fn run_with_budget(
     // generic BINA blob. BINA/???? stays the fallback for names the dictionary
     // doesn't recognize, and for every other filesystem (ProDOS types are `$XX`,
     // a different space entirely).
+    //
+    // The generic BINA/???? fallback must rank *below* the type the replaced
+    // file carried, or replacing `DOC` (TEXT/MSWD) turns it into a BINA blob -
+    // the fallback would fire first and leave nothing for preservation to fill
+    // in. Precedence, highest first: explicit flag, config default, the
+    // replaced file's own type, the extension dictionary, then BINA/????.
     let auto_from_extension = crate::fs::hfs_common::uses_hfs_type_dictionary(fs.fs_type())
         && crate::fs::hfs_common::type_creator_for_filename(&name).is_some();
+    let preserves_type = preserved.os_type.is_some();
     let type_code = args
         .type_code
         .clone()
@@ -264,7 +291,8 @@ pub fn run_with_budget(
                 .and_then(|c| c.get("put", "type"))
                 .map(|s| s.to_string())
         })
-        .or_else(|| (!auto_from_extension).then(|| "BINA".to_string()));
+        .or_else(|| (!auto_from_extension && !preserves_type).then(|| "BINA".to_string()));
+    let preserves_creator = preserved.os_creator.is_some();
     let creator = args
         .creator
         .clone()
@@ -273,7 +301,7 @@ pub fn run_with_budget(
                 .and_then(|c| c.get("put", "creator"))
                 .map(|s| s.to_string())
         })
-        .or_else(|| (!auto_from_extension).then(|| "????".to_string()));
+        .or_else(|| (!auto_from_extension && !preserves_creator).then(|| "????".to_string()));
     // POSIX attributes. Every editable Unix filesystem honours these; until now
     // nothing set them, so each driver's `unwrap_or` silently made every added
     // file root:root 0644. Resolution (and its precedence rules) lives in
@@ -296,7 +324,18 @@ pub fn run_with_budget(
             uid: args.uid,
             gid: args.gid,
         },
-        existing.as_ref(),
+        // `--no-preserve-meta` has to be withheld here too, not just from
+        // `preserved` above. These are two independent inheritance paths and
+        // zeroing only one left the opt-out half-done: the POSIX triple kept
+        // coming from the replaced entry (`AttrSource::Replaced`) while the log
+        // line promised the previous file's permissions and owner were "not
+        // carried over". Type/creator went through `preserved` and did reset,
+        // so the two halves of one flag disagreed.
+        if args.no_preserve_meta {
+            None
+        } else {
+            existing.as_ref()
+        },
         Some(&parent),
         host_mode,
         0o644,
@@ -307,26 +346,59 @@ pub fn run_with_budget(
         log_stderr(format!("Attributes: {}", attrs.describe()));
     }
 
-    if !inherited_xattrs.is_empty() {
-        log_stderr(format!(
-            "Carrying {} extended attribute(s) over from the replaced file",
-            inherited_xattrs.len()
-        ));
+    if existing.is_some() {
+        if args.no_preserve_meta {
+            log_stderr(
+                "Replacing with fresh metadata (--no-preserve-meta); the previous \
+                 file's permissions, owner, dates and type/creator are not carried over",
+            );
+        } else if !preserved.is_empty() {
+            log_stderr(format!(
+                "Preserving from the replaced file: {}",
+                preserved.summary()
+            ));
+        }
     }
-    let options = CreateFileOptions {
+    let mut options = CreateFileOptions {
         type_code,
         creator_code: creator,
         mode: Some(attrs.file_mode()),
         uid: Some(attrs.uid),
         gid: Some(attrs.gid),
-        xattrs: inherited_xattrs,
         ..Default::default()
+    };
+    // Fills only what nobody set explicitly, so --type / --mode still win.
+    preserved.apply_to_options(&mut options);
+
+    let write_through = |fs: &mut dyn crate::fs::filesystem::EditableFilesystem,
+                         reader: &mut dyn std::io::Read,
+                         len: u64|
+     -> anyhow::Result<()> {
+        let outcome = crate::fs::replace::create_or_replace(
+            fs,
+            &parent,
+            &name,
+            reader,
+            len,
+            &options,
+            crate::fs::replace::ReplacePolicy {
+                on_conflict,
+                preserve_meta: !args.no_preserve_meta,
+            },
+        )
+        .map_err(|e| anyhow!("create_file: {e}"))?;
+        if outcome.unsafe_fallback {
+            log_stderr(
+                "Note: this filesystem cannot stage a replace (no rename), so the original \
+                 was removed before the new contents were written",
+            );
+        }
+        Ok(())
     };
 
     if let Some(n) = args.zero {
         let mut zr = ZeroReader { remaining: n };
-        fs.create_file(&parent, &name, &mut zr, n, &options)
-            .map_err(|e| anyhow!("create_file: {e}"))?;
+        write_through(fs.as_mut(), &mut zr, n)?;
     } else {
         let host = args.host_file.ok_or_else(|| {
             anyhow!(
@@ -337,8 +409,25 @@ pub fn run_with_budget(
         let len = meta.len();
         let mut hf =
             std::fs::File::open(&host).map_err(|e| anyhow!("open {}: {e}", host.display()))?;
-        fs.create_file(&parent, &name, &mut hf, len, &options)
-            .map_err(|e| anyhow!("create_file: {e}"))?;
+        write_through(fs.as_mut(), &mut hf, len)?;
+    }
+
+    // Timestamps are the one preserved field no filesystem here accepts at
+    // creation time, so they go back once the entry exists. Best-effort: a
+    // filesystem with no date setter answers Unsupported, and failing an
+    // otherwise-good write over a timestamp would be the worse outcome.
+    if preserved.mac_dates.is_some() {
+        match super::ls::resolve_path(fs.as_filesystem_mut(), &dst) {
+            Ok(new_entry) => {
+                if !preserved.reapply_dates(fs.as_mut(), &new_entry) {
+                    log_stderr(
+                        "Note: this filesystem cannot set timestamps, so the replacement \
+                         carries today's date",
+                    );
+                }
+            }
+            Err(e) => log_stderr(format!("Note: could not restore timestamps ({e})")),
+        }
     }
 
     fs.sync_metadata()

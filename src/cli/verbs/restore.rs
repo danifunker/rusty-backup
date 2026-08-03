@@ -130,20 +130,11 @@ pub fn run(args: RestoreArgs) -> Result<()> {
                 .and_then(parse_alignment_mode)
         })
         .unwrap_or(AlignmentMode::Original);
-    let _size_choice_unresolved = args.size.or_else(|| {
-        crate::cli::logging::loaded_config()
-            .and_then(|c| c.get("restore", "size"))
-            .and_then(parse_size_mode)
-    });
     let alignment = match alignment_choice {
         AlignmentMode::Original => RestoreAlignment::Original,
         AlignmentMode::Modern1mb => RestoreAlignment::Modern1MB,
     };
-    let size_choice = _size_choice_unresolved.unwrap_or(SizeMode::Original);
-    let _size_choice = match size_choice {
-        SizeMode::Original => RestoreSizeChoice::Original,
-        SizeMode::Minimum => RestoreSizeChoice::Minimum,
-    };
+    let partition_sizes = resolve_partition_sizes(args.size, &args.backup_dir)?;
 
     let config = RestoreConfig {
         backup_folder: args.backup_dir,
@@ -151,10 +142,9 @@ pub fn run(args: RestoreArgs) -> Result<()> {
         target_is_device: args.device,
         target_size,
         alignment,
-        // Phase C: per-partition size selection ships from --size (uniform
-        // across all partitions). Phase D's batch + per-partition flag map
-        // lets the user vary per partition.
-        partition_sizes: Vec::new(),
+        // Phase D's batch + per-partition flag map lets the user vary the
+        // choice per partition; `--size` is uniform across all of them.
+        partition_sizes,
         write_zeros_to_unused: args.write_zeros_to_unused,
     };
 
@@ -202,6 +192,8 @@ fn run_remote(args: RestoreArgs, remote: crate::remote::RemoteRef) -> Result<()>
         AlignmentMode::Modern1mb => RestoreAlignment::Modern1MB,
     };
 
+    let partition_sizes = resolve_partition_sizes(args.size, &args.backup_dir)?;
+
     let config = RestoreConfig {
         backup_folder: args.backup_dir,
         // Overridden by restore_to_remote (a local staging image is used for the
@@ -210,7 +202,7 @@ fn run_remote(args: RestoreArgs, remote: crate::remote::RemoteRef) -> Result<()>
         target_is_device: false,
         target_size,
         alignment,
-        partition_sizes: Vec::new(),
+        partition_sizes,
         write_zeros_to_unused: args.write_zeros_to_unused,
     };
 
@@ -231,13 +223,53 @@ fn run_remote(args: RestoreArgs, remote: crate::remote::RemoteRef) -> Result<()>
         .context("remote restore failed")
 }
 
-fn read_source_size_from_metadata(backup_dir: &std::path::Path) -> Result<u64> {
+/// Expand the uniform `--size` policy across every partition in the backup.
+///
+/// `RestoreConfig::partition_sizes` is per-partition, and an empty list already
+/// means "original size for everything", so only `Minimum` needs entries.
+///
+/// Both restore paths used to hardcode this empty. The local path at least
+/// resolved the flag first — into a variable named `_size_choice` that was then
+/// dropped on the floor (the leading underscore is why no dead-code warning
+/// ever pointed at it); the remote path never read `--size` at all. Either way
+/// `--size minimum` parsed, validated against the config file, and then did
+/// nothing. Note this also silently disabled resizing for the *default* backup
+/// format: `run_restore` picks the single-file-CHD resize path over the plain
+/// byte-copy only when some partition is non-Original, so an empty list sent
+/// every CHD restore down the as-is branch.
+fn resolve_partition_sizes(
+    size: Option<SizeMode>,
+    backup_dir: &std::path::Path,
+) -> Result<Vec<crate::restore::RestorePartitionSize>> {
+    let size_choice = size
+        .or_else(|| {
+            crate::cli::logging::loaded_config()
+                .and_then(|c| c.get("restore", "size"))
+                .and_then(parse_size_mode)
+        })
+        .unwrap_or(SizeMode::Original);
+    Ok(match size_choice {
+        SizeMode::Original => Vec::new(),
+        SizeMode::Minimum => read_metadata(backup_dir)?
+            .partitions
+            .iter()
+            .map(|pm| crate::restore::RestorePartitionSize {
+                index: pm.index,
+                size_choice: RestoreSizeChoice::Minimum,
+            })
+            .collect(),
+    })
+}
+
+fn read_metadata(backup_dir: &std::path::Path) -> Result<crate::backup::metadata::BackupMetadata> {
     let meta_path = backup_dir.join("metadata.json");
     let text = std::fs::read_to_string(&meta_path)
         .with_context(|| format!("reading {}", meta_path.display()))?;
-    let meta: crate::backup::metadata::BackupMetadata =
-        serde_json::from_str(&text).with_context(|| format!("parsing {}", meta_path.display()))?;
-    Ok(meta.source_size_bytes)
+    serde_json::from_str(&text).with_context(|| format!("parsing {}", meta_path.display()))
+}
+
+fn read_source_size_from_metadata(backup_dir: &std::path::Path) -> Result<u64> {
+    Ok(read_metadata(backup_dir)?.source_size_bytes)
 }
 
 fn spawn_progress_pump(progress: Arc<Mutex<RestoreProgress>>) {

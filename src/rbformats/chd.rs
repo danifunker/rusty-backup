@@ -3,7 +3,7 @@
 #![allow(clippy::too_many_arguments)]
 
 use std::fs::{self, File};
-use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -14,7 +14,7 @@ use libchdman_rs::{
 };
 
 use super::chd_options::{ChdOptions, ChdProfile};
-use super::{file_name, output_path, CHUNK_SIZE};
+use super::{file_name, output_path};
 
 /// Read+Seek adapter over a CHD file backed by libchdman-rs. Enables
 /// filesystem browsing without extracting to a temp file.
@@ -357,7 +357,6 @@ pub(crate) fn compress_chd(
     reader: &mut impl Read,
     output_base: &Path,
     logical_size: u64,
-    split_size: Option<u64>,
     opts: Option<ChdOptions>,
     progress_cb: &mut impl FnMut(u64),
     cancel_check: &impl Fn() -> bool,
@@ -407,16 +406,6 @@ pub(crate) fn compress_chd(
     // terms of padded size, but the caller's total is `logical_size`.
     progress_cb(logical_size);
 
-    if let Some(split_bytes) = split_size {
-        let chd_size = fs::metadata(&chd_path)
-            .with_context(|| format!("failed to stat CHD output: {}", chd_path.display()))?
-            .len();
-
-        if chd_size > split_bytes {
-            return split_file(&chd_path, output_base, "chd", split_bytes);
-        }
-    }
-
     Ok(vec![file_name(&chd_path)])
 }
 
@@ -429,7 +418,6 @@ pub fn compress_chd_expand(
     reader: &mut impl Read,
     output_base: &Path,
     logical_size: u64,
-    split_size: Option<u64>,
     opts: Option<ChdOptions>,
     progress_cb: &mut impl FnMut(u64),
     cancel_check: &impl Fn() -> bool,
@@ -439,7 +427,6 @@ pub fn compress_chd_expand(
         reader,
         output_base,
         logical_size,
-        split_size,
         opts,
         progress_cb,
         cancel_check,
@@ -588,7 +575,6 @@ pub fn shrink_sgi_disk_to_chd(
         dst,
         new_logical,
         None,
-        None,
         progress_cb,
         cancel_check,
         log_cb,
@@ -638,7 +624,6 @@ pub(crate) fn compress_chd_dvd(
     reader: &mut impl Read,
     output_base: &Path,
     logical_size: u64,
-    split_size: Option<u64>,
     opts: Option<ChdOptions>,
     progress_cb: &mut impl FnMut(u64),
     cancel_check: &impl Fn() -> bool,
@@ -677,71 +662,7 @@ pub(crate) fn compress_chd_dvd(
 
     progress_cb(logical_size);
 
-    if let Some(split_bytes) = split_size {
-        let chd_size = fs::metadata(&chd_path)
-            .with_context(|| format!("failed to stat CHD output: {}", chd_path.display()))?
-            .len();
-
-        if chd_size > split_bytes {
-            return split_file(&chd_path, output_base, "chd", split_bytes);
-        }
-    }
-
     Ok(vec![file_name(&chd_path)])
-}
-
-/// Split an existing file into chunks, removing the original.
-pub(crate) fn split_file(
-    source: &Path,
-    output_base: &Path,
-    extension: &str,
-    split_bytes: u64,
-) -> Result<Vec<String>> {
-    let mut reader = BufReader::new(
-        File::open(source).with_context(|| format!("failed to open {}", source.display()))?,
-    );
-    let mut files = Vec::new();
-    let mut part_index: u32 = 0;
-    let mut buf = vec![0u8; CHUNK_SIZE];
-
-    loop {
-        let out_path = output_path(output_base, extension, true, part_index);
-        let mut writer = BufWriter::new(
-            File::create(&out_path)
-                .with_context(|| format!("failed to create {}", out_path.display()))?,
-        );
-        let mut written: u64 = 0;
-        let mut eof = false;
-
-        while written < split_bytes {
-            let to_read = ((split_bytes - written) as usize).min(CHUNK_SIZE);
-            let n = reader.read(&mut buf[..to_read])?;
-            if n == 0 {
-                eof = true;
-                break;
-            }
-            writer.write_all(&buf[..n])?;
-            written += n as u64;
-        }
-        writer.flush()?;
-
-        if written > 0 {
-            files.push(file_name(&out_path));
-        } else {
-            // Empty chunk, remove it
-            let _ = fs::remove_file(&out_path);
-        }
-
-        part_index += 1;
-        if eof {
-            break;
-        }
-    }
-
-    // Remove the original unsplit file
-    let _ = fs::remove_file(source);
-
-    Ok(files)
 }
 
 #[cfg(test)]
@@ -764,7 +685,6 @@ mod tests {
             &mut reader,
             &base,
             data.len() as u64,
-            None,
             None,
             &mut |_| {},
             &|| false,
@@ -796,7 +716,6 @@ mod tests {
             &mut reader,
             &base,
             data.len() as u64,
-            None,
             None,
             &mut |_| {},
             &|| false,

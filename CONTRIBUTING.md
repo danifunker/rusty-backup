@@ -276,6 +276,13 @@ If you think one of these *now* makes sense for new work, that's fine — but th
 - `eprintln!` is allowed inside `#[cfg(test)]` blocks; nowhere else.
 - For user-facing log lines (the in-app `LogPanel`), use the `log_cb: &dyn Fn(&str)` callback the leaf I/O takes. Plain ASCII only (see hard rules above).
 
+### Comments
+
+- **One line. Two if it truly needs it. Never three or more — ever.** This is a hard rule for every comment you write inside a `.rs` file, inline `//` and doc `///` alike.
+- If the explanation doesn't fit in two lines, it isn't a comment — it's documentation. Put it in the module's `//!` header, `src/fs/README.md`, `src/rbformats/README.md`, or a `docs/` page, and reference that from the one-line comment.
+- Say **why**, not what. `// bump the cursor past the BPB` restates the code; `// FAT32's BPB is 90 bytes, not 62 — 0x24 onward differs` earns its line.
+- Existing multi-line blocks are grandfathered; don't retrofit files you aren't otherwise touching. But don't add new ones.
+
 ### Error handling
 
 - Library code returns `Result<T, FilesystemError>` (or the relevant typed error).
@@ -324,6 +331,53 @@ cargo build --manifest-path rb-cli-vintage/Cargo.toml \
 ```
 
 The definitive check is an actual `rustup toolchain install 1.73.0` build of that manifest; the command above is the cheap proxy that catches the wiring mistakes (wrong shim path, raw `io::Error::other` left in, unused imports).
+
+### mrustc mis-lowers `leading_zeros` / `leading_ones` on narrow integers
+
+The PowerPC build (`rb-cli-ppc`, via mrustc's C backend — see `scripts/build-ppc.sh`)
+gets the **wrong answer**, not a compile error, for these:
+
+| on `u8` / `u16` | mrustc | rustc |
+| --- | --- | --- |
+| `0x01u8.leading_zeros()` | **31** | 7 |
+| `0x80u8.leading_zeros()` | **24** | 0 |
+| `0x01u8.leading_ones()` | **24** | 0 |
+
+mrustc counts as if the value were 32 bits wide. `u32` and `u64` are correct, and
+`trailing_zeros`, `trailing_ones`, and `count_ones` are correct at every width.
+
+**Widen to `u32` before the call** in engine code:
+
+```rust
+// WRONG on PowerPC - wraps to ~4.29e9 for any byte
+let top_bit = 7 - byte.leading_zeros();
+// Correct on both
+let top_bit = 31 - (byte as u32).leading_zeros();
+```
+
+Why this deserves its own section: `cargo build`, `cargo clippy`, and the whole
+test suite pass, because native rustc is right. It cost a day. `BitmapReader`
+used the wrong form, so **every** PowerPC backup of ext / UFS / JFS / AFFS
+imaged the volume at full size instead of its used extent — a silent ~7x size
+regression with no error anywhere. It hid especially well because `count_ones`
+*is* correct, so bit *counts* agreed across platforms and only *positions* were
+wrong: `inspect`, `ls`, `fsck`, and `show fs-info` all matched.
+
+To check a suspect intrinsic in about a minute, without a PowerPC build at all —
+this is a codegen bug, so it reproduces on the host:
+
+```bash
+cat > /tmp/t.rs <<'EOF'
+fn main() { println!("{}", 0x01u8.leading_zeros()); }
+EOF
+cd ~/repos/mrustc && MRUSTC_TARGET_VER=1.74 \
+  bin/mrustc /tmp/t.rs -o /tmp/t_m -L output-1.74.0 && /tmp/t_m   # mrustc
+rustc -O -o /tmp/t_n /tmp/t.rs && /tmp/t_n                        # truth
+```
+
+No vendored dependency is affected — every dependency use is on `u32`/`u64`/
+`usize` (checked, including `hashbrown`, whose generic `GroupWord` is `u32` or
+`u64`). Re-check if that ever changes.
 
 ---
 

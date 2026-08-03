@@ -1,5 +1,25 @@
-#[cfg(target_os = "macos")]
+// `powerpc-apple-darwin` reports `target_os = "macos"`, so the real macOS module
+// would be compiled for it - and that module is IOKit + DiskArbitration through
+// `objc2-*`, which cannot be transpiled for a 2005 PowerPC Mac. The `os-stub`
+// feature swaps in a signature-compatible stand-in instead, which keeps every
+// caller and everything portable in this file untouched while dropping `objc2-*`
+// from the dependency graph. Off by default: an ordinary macOS build is
+// bit-for-bit unaffected. See docs/native_osx_10_dot_3.md.
+#[cfg(all(target_os = "macos", not(feature = "os-stub")))]
 pub mod macos;
+#[cfg(all(target_os = "macos", feature = "os-stub"))]
+#[path = "macos_stub.rs"]
+pub mod macos;
+
+/// Runtime OS-version detection. Dependency-free, and always compiled: which
+/// Mac OS X release we are on is the difference between 10.4 and 10.5, which is
+/// load-bearing on PowerPC.
+pub mod host_version;
+
+/// Device-list assembly for the Darwin platform modules. Deliberately not
+/// `cfg`-gated: it holds no syscalls, so keeping it compiled everywhere means
+/// its tests run on the development machine rather than only on a PowerPC Mac.
+pub mod darwin_devices;
 
 #[cfg(target_os = "linux")]
 pub mod linux;
@@ -27,6 +47,49 @@ use crate::device::DiskDevice;
 
 const SECTOR_SIZE: usize = 512;
 const WRITE_BUF_CAPACITY: usize = 256 * 1024; // 256 KB, must be a multiple of SECTOR_SIZE
+
+/// A reader whose `SeekFrom::End` answers from [`get_file_size`], which a device handle cannot.
+pub struct KnownLen<R> {
+    inner: R,
+    len: u64,
+    pos: u64,
+}
+
+impl<R> KnownLen<R> {
+    pub fn new(inner: R, len: u64) -> Self {
+        Self { inner, len, pos: 0 }
+    }
+}
+
+impl<R: Read> Read for KnownLen<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl<R: Seek> Seek for KnownLen<R> {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        // Resolve End against the known length; the device itself cannot answer it.
+        let target = match pos {
+            SeekFrom::Start(n) => n as i128,
+            SeekFrom::End(n) => self.len as i128 + n as i128,
+            SeekFrom::Current(n) => self.pos as i128 + n as i128,
+        };
+        if target < 0 {
+            return Err(crate::compat::io_other("seek before start of device"));
+        }
+        self.pos = self.inner.seek(SeekFrom::Start(target as u64))?;
+        Ok(self.pos)
+    }
+}
+
+/// Wrap a source so `SeekFrom::End` works even when the OS will not report a device's length.
+pub fn known_len_reader(file: File, path: &Path) -> KnownLen<File> {
+    let len = get_file_size(&file, path).unwrap_or(0);
+    KnownLen::new(file, len)
+}
 
 /// A read adapter that ensures all I/O to the underlying reader is performed
 /// at sector-aligned offsets with sector-multiple sizes.
@@ -478,42 +541,41 @@ impl SectorAlignedWriter {
 #[cfg(target_os = "windows")]
 impl Write for SectorAlignedWriter {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-        // If data won't fit, flush sectors first
-        if self.buf.len() + data.len() > WRITE_BUF_CAPACITY {
-            self.flush_sectors()?;
-        }
-
-        // If data is still too large for the buffer, write it directly
-        if data.len() > WRITE_BUF_CAPACITY {
-            self.flush_padded()?;
-
-            // Write large data directly, padding to sector boundary if needed
-            let aligned_len = (data.len() / SECTOR_SIZE) * SECTOR_SIZE;
-            if aligned_len > 0 {
-                use std::io::Seek;
-                self.inner.seek(std::io::SeekFrom::Start(self.position))?;
-                self.inner.write_all(&data[..aligned_len])?;
-                self.position += aligned_len as u64;
+        // Nothing buffered and a full-size run: straight to the device, no copy.
+        if self.buf.is_empty() && data.len() >= WRITE_BUF_CAPACITY {
+            if !self.position.is_multiple_of(SECTOR_SIZE as u64) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("file position {} is not sector-aligned", self.position),
+                ));
             }
-
-            // Buffer any remaining partial sector
+            let aligned_len = (data.len() / SECTOR_SIZE) * SECTOR_SIZE;
+            use std::io::Seek;
+            self.inner.seek(std::io::SeekFrom::Start(self.position))?;
+            self.inner.write_all(&data[..aligned_len])?;
+            self.position += aligned_len as u64;
             let remainder = &data[aligned_len..];
             if !remainder.is_empty() {
                 self.buf
                     .extend_from_slice(remainder)
                     .map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "buffer full"))?;
             }
-        } else {
-            // Normal path: buffer the data
-            self.buf
-                .extend_from_slice(data)
-                .map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "buffer full"))?;
+            return Ok(data.len());
+        }
 
+        // flush_sectors keeps the trailing partial sector, so what fits has to be
+        // re-measured every pass rather than inferred from data.len() alone.
+        let mut rest = data;
+        while !rest.is_empty() {
+            let take = (WRITE_BUF_CAPACITY - self.buf.len()).min(rest.len());
+            self.buf
+                .extend_from_slice(&rest[..take])
+                .map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "buffer full"))?;
+            rest = &rest[take..];
             if self.buf.len() >= WRITE_BUF_CAPACITY {
                 self.flush_sectors()?;
             }
         }
-
         Ok(data.len())
     }
 
@@ -894,6 +956,34 @@ pub fn request_elevation() -> Result<()> {
     }
 }
 
+/// Rename `src` over `dest`, retrying ~2.5s on the ERROR_ACCESS_DENIED /
+/// ERROR_SHARING_VIOLATION a Windows scanner's handle causes. No-op on Unix.
+pub fn replace_file(src: &Path, dest: &Path) -> io::Result<()> {
+    const ATTEMPTS: u32 = 12;
+    let mut delay_ms = 25u64;
+    for attempt in 1..=ATTEMPTS {
+        match std::fs::rename(src, dest) {
+            Ok(()) => return Ok(()),
+            Err(e) if attempt < ATTEMPTS && is_transient_share_error(&e) => {
+                log::debug!(
+                    "rename {} -> {} failed ({e}); retry {attempt}/{ATTEMPTS} in {delay_ms}ms",
+                    src.display(),
+                    dest.display(),
+                );
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                delay_ms = (delay_ms * 2).min(400);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!("the final attempt returns rather than looping")
+}
+
+/// True only on Windows, and only for the two codes a scanner's handle yields.
+fn is_transient_share_error(e: &io::Error) -> bool {
+    cfg!(windows) && matches!(e.raw_os_error(), Some(5) | Some(32))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -939,6 +1029,119 @@ mod tests {
             first.iter().all(|&b| b == 0xAB),
             "first sector should contain the payload, not zeros (was {:?}..)",
             &first[..16]
+        );
+    }
+
+    /// Regression: a partial-sector write then a full-capacity one overflowed the
+    /// Windows writer's fixed buffer -- restore died with "buffer full".
+    #[test]
+    fn sector_aligned_writer_survives_partial_then_full_chunk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("restore.img");
+
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .expect("create");
+        let mut writer = SectorAlignedWriter::new(file);
+
+        // zstd hands back arbitrary sizes, so a chunk that is not a whole number
+        // of sectors leaves a remainder that flush_sectors deliberately keeps.
+        let partial = vec![0xAAu8; 100];
+        let full = vec![0xBBu8; WRITE_BUF_CAPACITY];
+        writer.write_all(&partial).expect("partial chunk");
+        writer
+            .write_all(&full)
+            .expect("full chunk after a partial one");
+        writer.flush().expect("flush");
+        drop(writer);
+
+        let mut got = Vec::new();
+        OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .expect("reopen")
+            .read_to_end(&mut got)
+            .expect("read back");
+
+        // The tail is zero-padded up to a sector; everything before it is verbatim.
+        assert!(got.len() >= partial.len() + full.len(), "short write");
+        assert_eq!(
+            &got[..partial.len()],
+            &partial[..],
+            "partial chunk corrupted"
+        );
+        assert_eq!(
+            &got[partial.len()..partial.len() + full.len()],
+            &full[..],
+            "full chunk corrupted or misplaced"
+        );
+    }
+
+    #[test]
+    fn replace_file_overwrites_an_existing_destination() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let src = tmp.path().join("new");
+        let dest = tmp.path().join("old");
+        std::fs::write(&src, b"new").unwrap();
+        std::fs::write(&dest, b"old").unwrap();
+
+        replace_file(&src, &dest).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new");
+        assert!(!src.exists(), "source should have been renamed away");
+    }
+
+    #[test]
+    fn replace_file_still_reports_a_missing_source() {
+        // A non-transient error must surface immediately, not after 12 retries.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let err = replace_file(&tmp.path().join("nope"), &tmp.path().join("dest")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    /// A Windows `\\.\PhysicalDriveN` handle: reads fine, but `SeekFrom::End` is ERROR_INVALID_FUNCTION.
+    struct NoEndSeek(io::Cursor<Vec<u8>>);
+
+    impl Read for NoEndSeek {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.0.read(buf)
+        }
+    }
+
+    impl Seek for NoEndSeek {
+        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+            match pos {
+                SeekFrom::End(_) => Err(io::Error::from_raw_os_error(1)),
+                other => self.0.seek(other),
+            }
+        }
+    }
+
+    #[test]
+    fn known_len_answers_end_seeks_a_device_cannot() {
+        let data: Vec<u8> = (0..=255u8).cycle().take(4096).collect();
+        let mut raw = NoEndSeek(io::Cursor::new(data.clone()));
+        assert!(
+            raw.seek(SeekFrom::End(0)).is_err(),
+            "bare device must reject End"
+        );
+
+        let mut r = KnownLen::new(NoEndSeek(io::Cursor::new(data.clone())), 4096);
+        assert_eq!(r.seek(SeekFrom::End(0)).unwrap(), 4096);
+        assert_eq!(r.seek(SeekFrom::End(-512)).unwrap(), 3584);
+
+        // Reads still land where the caller asked, and Current stays relative.
+        let mut buf = [0u8; 4];
+        r.seek(SeekFrom::Start(10)).unwrap();
+        r.read_exact(&mut buf).unwrap();
+        assert_eq!(buf, data[10..14]);
+        assert_eq!(r.seek(SeekFrom::Current(-4)).unwrap(), 10);
+        assert!(
+            r.seek(SeekFrom::End(-8192)).is_err(),
+            "negative target must error"
         );
     }
 }

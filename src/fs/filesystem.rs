@@ -169,6 +169,13 @@ pub trait Filesystem: Send {
         false
     }
 
+    /// Whether name lookup should fall back to case-insensitive matching, the
+    /// way the native OS resolves paths on this filesystem (NTFS today).
+    /// An exact-case match always wins first.
+    fn case_insensitive_lookup(&self) -> bool {
+        false
+    }
+
     /// Whether this filesystem stores POSIX extended attributes (`user.*`,
     /// `security.*`, …). True on ext / XFS / SquashFS; false on filesystems with
     /// no xattr concept (Minix, EFS, FAT, HFS). The UI uses this to show or hide
@@ -640,6 +647,40 @@ pub trait EditableFilesystem: Filesystem {
     /// Overwrite the create/modify/backup dates on a file's catalog
     /// record. Dates are Mac epoch (seconds since 1904-01-01 00:00 UTC).
     /// HFS today; others `Unsupported`.
+    /// Set the DOS attribute bits on an entry: read-only `0x01`, hidden `0x02`,
+    /// system `0x04`, archive `0x20`.
+    ///
+    /// Takes the parent because that is where the bits live — a FAT directory
+    /// entry is the record, and there is nothing else to address it by.
+    /// Structural bits (directory `0x10`, volume-id `0x08`) are the driver's to
+    /// manage and are masked off rather than trusted from a caller.
+    ///
+    /// `Unsupported` on filesystems with no such concept, which is most of them.
+    /// Set the AmigaDOS protection bits on an entry (the `access` longword:
+    /// HSPA RWED, held at offset 0x140 of the file header block).
+    ///
+    /// `Unsupported` off the Amiga filesystems, which is everywhere else.
+    fn set_amiga_protection(
+        &mut self,
+        _entry: &FileEntry,
+        _protection: u32,
+    ) -> Result<(), FilesystemError> {
+        Err(FilesystemError::Unsupported(
+            "AmigaDOS protection bits are not supported by this filesystem".into(),
+        ))
+    }
+
+    fn set_dos_attributes(
+        &mut self,
+        _parent: &FileEntry,
+        _entry: &FileEntry,
+        _attrs: u16,
+    ) -> Result<(), FilesystemError> {
+        Err(FilesystemError::Unsupported(
+            "DOS attribute bits are not supported by this filesystem".into(),
+        ))
+    }
+
     fn set_dates(
         &mut self,
         _entry: &FileEntry,

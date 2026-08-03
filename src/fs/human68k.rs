@@ -2567,8 +2567,15 @@ mod tests {
 
         // Build a FAT16 Human68k disk (16 MiB) so the resize_fat_in_place
         // path has room to shrink without changing FAT type.
+        // 16 MiB -> 10 MiB. The old numbers (8 MiB) left 4071 clusters, which
+        // is *below* FAT12's 4085 floor - so by the standard rule the result
+        // would be a FAT12 volume carrying a 16-bit FAT, which every other
+        // implementation misreads. `resize_fat_in_place` now declines that
+        // rather than writing a BPB its FAT contradicts, so this shrinks to a
+        // size that genuinely stays FAT16, which is what the test set out to
+        // cover.
         let total_sectors_old: u32 = 32_768; // 16 MiB / 512
-        let total_sectors_new: u32 = 16_384; // 8 MiB / 512
+        let total_sectors_new: u32 = 20_480; // 10 MiB / 512
         let bps = 512usize;
         let mut disk =
             crate::fs::fat::create_blank_fat(total_sectors_old as u64 * bps as u64, Some("X68K"))

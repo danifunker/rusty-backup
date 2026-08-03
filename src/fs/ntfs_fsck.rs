@@ -152,8 +152,9 @@ fn analyze<R: Read + Seek + Send>(fs: &mut NtfsFilesystem<R>) -> Result<Analysis
             attribute_list_seen = true;
         }
 
+        // LCN 0 is a legal run start ($Boot); sparse runs never reach here.
         for (lcn, len) in fs.fsck_record_clusters(&record) {
-            if lcn == 0 || len == 0 {
+            if len == 0 {
                 continue;
             }
             let end = lcn.saturating_add(len);
@@ -272,10 +273,11 @@ fn analyze<R: Read + Seek + Send>(fs: &mut NtfsFilesystem<R>) -> Result<Analysis
         a.fixes.push(Fix::MftMirror);
     }
 
-    // ---- Boot backup (last sector). ----
+    // ---- Boot backup: at sector index total_sectors (the VBR field excludes
+    // the backup sector, so it sits one past the last addressable sector). ----
     let bps = g.bytes_per_sector;
     let vbr = fs.fsck_read_raw(g.partition_offset, bps as usize)?;
-    let backup_off = g.partition_offset + (g.total_sectors - 1) * bps;
+    let backup_off = g.partition_offset + g.total_sectors * bps;
     let backup = fs.fsck_read_raw(backup_off, bps as usize)?;
     if backup != vbr {
         a.err(
@@ -358,7 +360,7 @@ pub fn repair_ntfs<R: Read + Write + Seek + Send>(
             }
             Fix::BackupBoot => {
                 let vbr = fs.fsck_read_raw(g.partition_offset, g.bytes_per_sector as usize)?;
-                let backup_off = g.partition_offset + (g.total_sectors - 1) * g.bytes_per_sector;
+                let backup_off = g.partition_offset + g.total_sectors * g.bytes_per_sector;
                 fs.fsck_write_raw(backup_off, &vbr)
                     .map(|_| "rewrote backup boot sector from the VBR".into())
             }
@@ -605,11 +607,11 @@ mod tests {
     #[test]
     fn detects_and_repairs_backup_boot() {
         let mut img = load();
-        // Overwrite the last sector so it no longer matches the VBR.
+        // Overwrite the backup boot sector so it no longer matches the VBR.
         {
             let mut fs = open(&mut img);
             let g = fs.fsck_geometry();
-            let backup_off = g.partition_offset + (g.total_sectors - 1) * g.bytes_per_sector;
+            let backup_off = g.partition_offset + g.total_sectors * g.bytes_per_sector;
             fs.fsck_write_raw(backup_off, &vec![0xAA; g.bytes_per_sector as usize])
                 .unwrap();
             fs.fsck_flush_writer().unwrap();

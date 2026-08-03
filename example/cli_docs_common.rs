@@ -47,6 +47,7 @@ pub fn write_reference(out_path: &Path) -> std::io::Result<()> {
     writeln!(md, "## Global options\n").unwrap();
     render_args_md(&mut md, &cmd);
 
+    md.push_str(YAML_FEATURE_NOTE);
     md.push_str(PATH_GRAMMAR);
 
     writeln!(md, "## Verbs\n").unwrap();
@@ -62,6 +63,21 @@ pub fn write_reference(out_path: &Path) -> std::io::Result<()> {
 /// generator (not a per-arg help string) because it applies uniformly to every
 /// path-taking verb (`ls`, `get`, `get-binhex`, `put`, `put-binhex`, `mkdir`,
 /// `rm`, `cp`, `locate`).
+// `--format yaml` is the one documented value whose availability depends on how
+// the binary was built, so say so once here rather than qualifying it at each of
+// the verbs that offer it.
+const YAML_FEATURE_NOTE: &str = "\
+**A note on `--format yaml`.** The read-only verbs below list `yaml` alongside
+`json` wherever structured output is supported. YAML sits behind the `yaml` build
+feature, which is **on by default** - every released desktop and vintage build has
+it. It is off in exactly one configuration, the PowerPC/mrustc build
+(`rb-cli-ppc`, see [build-ppc-mrustc.md](build-ppc-mrustc.md)), because
+`serde_yml`'s backend cannot be transpiled. Where it is off, `yaml` is absent from
+`--format`'s accepted values and from `--help`; JSON carries the identical schema,
+so a script that must run anywhere should prefer `--format json`.
+
+";
+
 const PATH_GRAMMAR: &str = "\
 ## Path grammar (in-image paths)
 

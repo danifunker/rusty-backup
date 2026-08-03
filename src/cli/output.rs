@@ -6,7 +6,9 @@
 //!
 //! - **text** (default) — human-readable tabular/paragraph form.
 //! - **json** — pretty-printed JSON object with the schema below.
-//! - **yaml** — same shape as JSON, serialized to YAML.
+//! - **yaml** — same shape as JSON, serialized to YAML. Behind the `yaml`
+//!   feature (on by default); the PowerPC mrustc build drops it because
+//!   `serde_yml`'s backend hits an mrustc macro-expansion gap.
 //! - **csv** — flat tabular outputs only.
 //! - **tsv** — same scope as CSV.
 //!
@@ -51,6 +53,12 @@ pub enum OutputFormat {
     /// Pretty-printed JSON, status-wrapped.
     Json,
     /// YAML, same structure as JSON.
+    ///
+    /// Hidden from `--format` when the `yaml` feature is off (the PowerPC
+    /// mrustc build; see docs/build-ppc-mrustc.md). The variant itself stays so
+    /// every `Json | Yaml` match arm in the verbs keeps compiling - only the
+    /// serializer and the CLI's acceptance of the value go away.
+    #[cfg_attr(not(feature = "yaml"), value(skip))]
     Yaml,
     /// CSV. Flat tabular outputs only.
     Csv,
@@ -139,12 +147,22 @@ pub fn emit_envelope<T: Serialize>(format: OutputFormat, env: &Envelope<T>) -> R
             println!("{s}");
             Ok(())
         }
+        #[cfg(feature = "yaml")]
         OutputFormat::Yaml => {
             let s = serde_yml::to_string(env)?;
             // serde_yml already appends a trailing newline.
             print!("{s}");
             Ok(())
         }
+        // Unreachable in practice - `value(skip)` stops clap accepting
+        // `--format yaml` in this configuration - but a caller that builds the
+        // variant directly deserves a straight answer rather than the
+        // "non-structured format" message below.
+        #[cfg(not(feature = "yaml"))]
+        OutputFormat::Yaml => anyhow::bail!(
+            "this build has no YAML output support (built without the `yaml` feature); \
+             use --format json"
+        ),
         // Text / CSV / TSV are emitted by per-verb code; this function is
         // only meant for structured envelopes.
         _ => anyhow::bail!(
@@ -160,9 +178,14 @@ pub fn emit_envelope<T: Serialize>(format: OutputFormat, env: &Envelope<T>) -> R
 /// `anyhow`.
 pub fn require_non_flat(format: OutputFormat, verb_name: &str) -> Result<()> {
     if format.is_flat_only() {
+        // Don't advertise a format this build can't produce.
+        #[cfg(feature = "yaml")]
+        let suggestion = "Use --format json or --format yaml instead.";
+        #[cfg(not(feature = "yaml"))]
+        let suggestion = "Use --format json instead.";
         anyhow::bail!(
             "{verb_name} returns nested data; --format {format} only supports flat tabular \
-             results. Use --format json or --format yaml instead."
+             results. {suggestion}"
         );
     }
     Ok(())
@@ -192,6 +215,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "yaml")]
     fn yaml_serializer_works() {
         let env = Envelope::ok(serde_json::json!({"a": 1}));
         let s = serde_yml::to_string(&env).unwrap();

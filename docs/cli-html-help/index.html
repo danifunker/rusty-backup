@@ -40,6 +40,7 @@
 <li><a href="convert.html"><code>convert</code></a><span class="desc">Re-encode one or more disk images into a chosen output format</span></li>
 <li><a href="cp.html"><code>cp</code></a><span class="desc">Copy files / directory trees between two disk images without staging through the host. SRC may be a glob; DST follows `cp` semantics (into an existing directory, or rename to a target)</span></li>
 <li><a href="du.html"><code>du</code></a><span class="desc">Recursive both-fork (data + resource) disk usage of paths inside a filesystem. Unlike `ls`, which reports data-fork sizes only, `du` counts the resource fork too — essential for classic-Mac apps whose code lives in a resource fork over a 0-byte data fork</span></li>
+<li><a href="edit.html"><code>edit</code></a><span class="desc">Edit a text file inside a filesystem in `$EDITOR`, converting the file's encoding and line endings on the way out and back so the editor never sees (or rewrites) its vintage form</span></li>
 <li><a href="expand.html"><code>expand</code></a><span class="desc">Expand a classic-HFS volume to a new size + allocation block size by cloning into a fresh APM disk image (default) or a bare HFS image (`--to-hfv`). Accepts APM-wrapped sources or raw single- partition HFS images</span></li>
 <li><a href="floppy.html"><code>floppy</code></a><span class="desc">Floppy-container verbs (convert / info) for XDF, HDM, DIM, D88</span></li>
 <li><a href="fsck.html"><code>fsck</code></a><span class="desc">Check (and optionally repair) a filesystem</span></li>
@@ -47,7 +48,7 @@
 <li><a href="get-binhex.html"><code>get-binhex</code></a><span class="desc">Extract a file and encode it as BinHex 4.0 (.hqx), preserving both forks and the type/creator codes</span></li>
 <li><a href="grow.html"><code>grow</code></a><span class="desc">Grow a disk image by `--add SIZE` of trailing zero-padding so a subsequent `partmap` edit can place a new partition</span></li>
 <li><a href="import.html"><code>import</code></a><span class="desc">Copy a host directory tree INTO a filesystem in an image — the bulk counterpart to `put`, with no tarball needed. `--expand-archives` unpacks tar archives found in the tree instead of copying them in whole</span></li>
-<li><a href="inspect.html"><code>inspect</code></a><span class="desc">Whole-disk aggregate read-only view (partition table + per-partition summary + CHD metadata when applicable)</span></li>
+<li><a href="inspect.html"><code>inspect</code></a><span class="desc">Whole-disk aggregate read-only view (partition table + per-partition summary + CHD metadata when applicable). The `idx` column is the selector: pass it back as `IMG@N`, `--partition N` or `--partitions N`</span></li>
 <li><a href="install-completions.html"><code>install-completions</code></a><span class="desc">Install shell completions to the user-scoped canonical location</span></li>
 <li><a href="locate.html"><code>locate</code></a><span class="desc">Print the absolute byte offset and length of a file inside an image (HFS only today). Output is JSON so build scripts that patch disk offsets into boot blocks can parse it with `jq`</span></li>
 <li><a href="ls.html"><code>ls</code></a><span class="desc">List a directory inside a filesystem</span></li>

@@ -298,6 +298,193 @@ fn resolve_id(
     }
 }
 
+/// Everything worth carrying from a file that is about to be replaced.
+///
+/// Replacing a file writes new *contents*; it is not a request to reset who may
+/// read it, when it was made, or what application owns it. But a replace is
+/// implemented as delete-then-create on every filesystem here, so unless these
+/// are captured first they are simply gone. Only xattrs used to be carried,
+/// which meant fixing one line of a config file silently reset its permissions,
+/// owner and timestamps.
+///
+/// Capture with [`preserved_meta`] **before** the delete, apply with
+/// [`PreservedMeta::apply_to_options`] and [`PreservedMeta::reapply_dates`].
+///
+/// Deliberately *not* preserved: the resource fork. That is content rather than
+/// metadata, and pairing a new data fork with the previous resource fork
+/// produces a file that is neither of the two things it came from.
+#[derive(Debug, Clone, Default)]
+pub struct PreservedMeta {
+    pub mode: Option<u32>,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    /// Classic-Mac OSType / creator, kept raw so a non-ASCII code survives.
+    pub os_type: Option<[u8; 4]>,
+    pub os_creator: Option<[u8; 4]>,
+    /// ProDOS auxiliary type (a file's load address, say).
+    pub aux_type: Option<u16>,
+    /// FAT attribute bits: read-only, hidden, system, archive.
+    pub dos_attributes: Option<u16>,
+    pub amiga_protection: Option<u32>,
+    pub amiga_comment: Option<String>,
+    pub amiga_dates: Option<(i32, i32, i32)>,
+    /// `(created, modified, backup)` in Mac epoch seconds.
+    pub mac_dates: Option<(u32, u32, u32)>,
+    pub xattrs: Vec<crate::fs::xattr::Xattr>,
+}
+
+impl PreservedMeta {
+    /// Whether anything was actually captured, so callers can stay quiet when
+    /// there is nothing to say.
+    pub fn is_empty(&self) -> bool {
+        self.mode.is_none()
+            && self.uid.is_none()
+            && self.gid.is_none()
+            && self.os_type.is_none()
+            && self.os_creator.is_none()
+            && self.aux_type.is_none()
+            && self.dos_attributes.is_none()
+            && self.amiga_protection.is_none()
+            && self.amiga_comment.is_none()
+            && self.amiga_dates.is_none()
+            && self.mac_dates.is_none()
+            && self.xattrs.is_empty()
+    }
+
+    /// A short, ASCII-only summary for the log line — the GUI font has no
+    /// glyph coverage beyond ASCII.
+    pub fn summary(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(m) = self.mode {
+            parts.push(format!("mode {:04o}", m & 0o7777));
+        }
+        if let (Some(u), Some(g)) = (self.uid, self.gid) {
+            parts.push(format!("owner {u}:{g}"));
+        }
+        if let (Some(t), Some(c)) = (self.os_type, self.os_creator) {
+            parts.push(format!("type/creator {}/{}", ascii4(&t), ascii4(&c)));
+        }
+        if let Some(a) = self.dos_attributes {
+            parts.push(format!("DOS attrs 0x{a:02x}"));
+        }
+        if self.amiga_protection.is_some() {
+            parts.push("Amiga protection".to_string());
+        }
+        if self.mac_dates.is_some() || self.amiga_dates.is_some() {
+            parts.push("dates".to_string());
+        }
+        if !self.xattrs.is_empty() {
+            parts.push(format!("{} xattr(s)", self.xattrs.len()));
+        }
+        if parts.is_empty() {
+            "nothing to preserve".to_string()
+        } else {
+            parts.join(", ")
+        }
+    }
+
+    /// Fill a [`CreateFileOptions`] with the preserved values, leaving anything
+    /// the caller already set alone.
+    ///
+    /// An explicit `--type`/`--mode` is an instruction and must win; preserved
+    /// metadata is only the default for fields nobody spoke about.
+    pub fn apply_to_options(&self, opts: &mut crate::fs::filesystem::CreateFileOptions) {
+        if opts.mode.is_none() {
+            opts.mode = self.mode;
+        }
+        if opts.uid.is_none() {
+            opts.uid = self.uid;
+        }
+        if opts.gid.is_none() {
+            opts.gid = self.gid;
+        }
+        // Only when the caller named neither form of type/creator, since the
+        // string and raw forms are two spellings of one field.
+        if opts.type_code.is_none() && opts.os_type.is_none() {
+            opts.os_type = self.os_type;
+        }
+        if opts.creator_code.is_none() && opts.os_creator.is_none() {
+            opts.os_creator = self.os_creator;
+        }
+        if opts.aux_type.is_none() {
+            opts.aux_type = self.aux_type;
+        }
+        if opts.dos_attributes.is_none() {
+            opts.dos_attributes = self.dos_attributes;
+        }
+        if opts.amiga_protection.is_none() {
+            opts.amiga_protection = self.amiga_protection;
+        }
+        if opts.amiga_comment.is_none() {
+            opts.amiga_comment = self.amiga_comment.clone();
+        }
+        if opts.amiga_dates.is_none() {
+            opts.amiga_dates = self.amiga_dates;
+        }
+        if opts.xattrs.is_empty() {
+            opts.xattrs = self.xattrs.clone();
+        }
+    }
+
+    /// Restore timestamps, which no filesystem here accepts at creation time.
+    ///
+    /// Best-effort by design: a filesystem with no date setter answers
+    /// `Unsupported`, and failing the whole write over a timestamp would be a
+    /// worse outcome than the file keeping today's date. Returns whether the
+    /// dates were actually applied so the caller can report honestly.
+    pub fn reapply_dates(
+        &self,
+        fs: &mut dyn crate::fs::filesystem::EditableFilesystem,
+        entry: &FileEntry,
+    ) -> bool {
+        let Some((create, modify, backup)) = self.mac_dates else {
+            return false;
+        };
+        fs.set_dates(entry, create, modify, backup).is_ok()
+    }
+}
+
+/// Render a four-byte OSType for display, non-printables as `.`.
+fn ascii4(v: &[u8; 4]) -> String {
+    v.iter()
+        .map(|&b| {
+            if (0x20..0x7f).contains(&b) {
+                b as char
+            } else {
+                '.'
+            }
+        })
+        .collect()
+}
+
+/// Capture the metadata of a file about to be replaced.
+///
+/// Returns an empty set for a new file, which correctly means "nothing to carry
+/// over". Must be called **before** the delete: afterwards there is nothing left
+/// to ask.
+pub fn preserved_meta(
+    fs: &mut dyn crate::fs::filesystem::Filesystem,
+    replacing: Option<&FileEntry>,
+) -> PreservedMeta {
+    let Some(entry) = replacing else {
+        return PreservedMeta::default();
+    };
+    PreservedMeta {
+        mode: entry.mode,
+        uid: entry.uid,
+        gid: entry.gid,
+        os_type: entry.type_code,
+        os_creator: entry.creator_code,
+        aux_type: entry.aux_type,
+        dos_attributes: entry.dos_attributes,
+        amiga_protection: entry.amiga_protection,
+        amiga_comment: entry.amiga_comment.clone(),
+        amiga_dates: entry.amiga_date,
+        mac_dates: entry.mac_dates,
+        xattrs: inherited_xattrs(fs, Some(entry)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

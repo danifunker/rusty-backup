@@ -1,5 +1,4 @@
 use std::fs::File;
-use std::io::BufReader;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -1131,7 +1130,8 @@ impl RestoreTab {
         match rusty_backup::os::open_source_for_reading(&device.path) {
             Ok(elevated) => {
                 let (file, _guard) = elevated.into_parts();
-                let mut reader = BufReader::new(file);
+                // A device cannot answer seek(End); carry the length the OS reports instead.
+                let mut reader = rusty_backup::os::known_len_reader(file, &device.path);
                 match PartitionTable::detect(&mut reader) {
                     Ok(table) => {
                         self.sp_target_partitions = table.partitions();

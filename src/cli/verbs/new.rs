@@ -321,6 +321,12 @@ pub struct FloppyArgs {
     /// altair_8in, altair_cf, multicomp, zxplus3.
     #[arg(long = "cpm-preset")]
     pub cpm_preset: Option<String>,
+
+    /// FAT only: format FAT32 regardless of size. Without this the type comes
+    /// from the capacity and only reaches FAT32 above 2 GiB, which cannot
+    /// express an EFI System Partition - FAT32, and usually 100-512 MiB.
+    #[arg(long = "fat32")]
+    pub fat32: bool,
 }
 
 impl FloppyArgs {
@@ -336,6 +342,7 @@ impl FloppyArgs {
             case_sensitive: false,
             min_catalog: None,
             affs_variant: 1,
+            fat32: self.fat32,
             cpm_preset: self.cpm_preset,
             inodes: None,
             bytes_per_inode: None,
@@ -383,6 +390,13 @@ pub struct VolumeArgs {
     #[arg(long = "min-catalog")]
     pub min_catalog: Option<String>,
 
+    /// FAT only: format FAT32 regardless of size. Without this the type is
+    /// picked from the capacity and only reaches FAT32 above 2 GiB, which
+    /// cannot express an EFI System Partition - FAT32, and usually
+    /// 100-512 MiB.
+    #[arg(long = "fat32")]
+    pub fat32: bool,
+
     /// AFFS variant byte (0=OFS, 1=FFS, 2=OFS+intl, 3=FFS+intl,
     /// 4=OFS+dircache, 5=FFS+dircache). Defaults to 1 (FFS).
     #[arg(long = "affs-variant", default_value = "1")]
@@ -419,6 +433,7 @@ impl VolumeArgs {
             case_sensitive: self.case_sensitive,
             min_catalog: self.min_catalog,
             affs_variant: self.affs_variant,
+            fat32: self.fat32,
             cpm_preset: None,
             inodes: self.inodes,
             bytes_per_inode: self.bytes_per_inode,
@@ -498,6 +513,13 @@ pub struct NewArgs {
     /// filesystems.
     #[arg(long = "min-catalog")]
     pub min_catalog: Option<String>,
+
+    /// FAT only: format FAT32 regardless of size. Without this the type is
+    /// picked from the capacity and only reaches FAT32 above 2 GiB, which
+    /// cannot express an EFI System Partition - FAT32, and usually
+    /// 100-512 MiB.
+    #[arg(long = "fat32")]
+    pub fat32: bool,
 
     /// AFFS variant byte (0=OFS, 1=FFS, 2=OFS+intl, 3=FFS+intl,
     /// 4=OFS+dircache, 5=FFS+dircache). Defaults to 1 (FFS).
@@ -605,9 +627,16 @@ fn format_image(args: NewArgs) -> Result<()> {
                 Ok(crate::fs::hfv::build_blank_hfv(size, bs, name)?)
             })
         }
-        FsKind::Fat => format_and_write(&args.image, &args.size, &args.name, |size, name| {
-            crate::fs::fat::create_blank_fat(size, Some(name))
-        }),
+        FsKind::Fat => {
+            let fat32 = args.fat32;
+            format_and_write(&args.image, &args.size, &args.name, move |size, name| {
+                if fat32 {
+                    crate::fs::fat::create_blank_fat32(size, Some(name))
+                } else {
+                    crate::fs::fat::create_blank_fat(size, Some(name))
+                }
+            })
+        }
         FsKind::Efs => write_blank_efs_image(
             &args.image,
             &args.size,

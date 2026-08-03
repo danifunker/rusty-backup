@@ -224,8 +224,8 @@ use crate::partition::PartitionSizeOverride;
 // `super::CHUNK_SIZE` paths working for callers in `restore/` and the
 // per-format submodules.
 pub use compress::{
-    compress_file_to_archive, compress_partition, decompress_partition_to_file,
-    decompress_to_writer,
+    compress_file_to_archive, compress_partition, decompress_members_to_writer,
+    decompress_partition_to_file, decompress_to_writer,
 };
 pub(crate) use compress::{
     compress_partition_hashed, file_name, is_all_zeros, output_path, write_zeros,
@@ -607,14 +607,21 @@ pub fn reconstruct_disk_from_backup(
             continue;
         }
 
-        let data_file = &pm.compressed_files[0];
-        let data_path = backup_folder.join(data_file);
+        // Every member, in order: a `--split-size` backup cuts one byte stream
+        // across `partition-N.raw` + `.001` + …, so reading only the first
+        // silently restores a truncated image.
+        let members: Vec<std::path::PathBuf> = pm
+            .compressed_files
+            .iter()
+            .map(|f| backup_folder.join(f))
+            .collect();
+        let data_path = members[0].clone();
 
-        if !data_path.exists() {
+        if let Some(missing) = members.iter().find(|p| !p.exists()) {
             log_cb(&format!(
                 "partition-{}: data file not found: {}, filling with zeros",
                 pm.index,
-                data_path.display()
+                missing.display()
             ));
             write_zeros(writer, export_size)?;
             total_written += export_size;
@@ -622,15 +629,20 @@ pub fn reconstruct_disk_from_backup(
         }
 
         log_cb(&format!(
-            "partition-{}: decompressing {} to writer (target size: {} bytes)...",
+            "partition-{}: decompressing {}{} to writer (target size: {} bytes)...",
             pm.index,
             data_path.display(),
+            if members.len() > 1 {
+                format!(" (+{} split members)", members.len() - 1)
+            } else {
+                String::new()
+            },
             export_size
         ));
 
         let base_offset = total_written;
-        let bytes_written = decompress_to_writer(
-            &data_path,
+        let bytes_written = decompress_members_to_writer(
+            &members,
             &metadata.compression_type,
             writer,
             Some(export_size),

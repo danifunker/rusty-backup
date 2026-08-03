@@ -506,7 +506,6 @@ pub fn flatten_to_parent(
         &mut scratch_reader,
         &staging_base,
         logical_size,
-        None,
         opts,
         progress_cb,
         cancel_check,
@@ -518,7 +517,8 @@ pub fn flatten_to_parent(
     match result {
         Ok(_files) => {
             log_cb("replacing original CHD with the recompressed image");
-            fs::rename(&staging_chd, parent_path).with_context(|| {
+            // Retrying rename: a Windows scanner's handle on the just-written staging CHD turns a bare fs::rename into ERROR_ACCESS_DENIED.
+            crate::os::replace_file(&staging_chd, parent_path).with_context(|| {
                 format!(
                     "failed to replace {} with {}",
                     parent_path.display(),
@@ -600,7 +600,6 @@ mod tests {
             &mut reader,
             &base,
             data.len() as u64,
-            None,
             None,
             &mut |_| {},
             &|| false,

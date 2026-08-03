@@ -85,6 +85,7 @@ pub mod prodos_types;
 pub mod qdos;
 pub mod qdos_mdv;
 pub mod reiserfs;
+pub mod replace;
 pub mod resource_fork;
 pub mod rsdos;
 pub mod sfs;
@@ -1091,14 +1092,39 @@ pub fn effective_partition_size<R: Read + Seek + Send + 'static>(
     partition_type: u8,
     partition_type_string: Option<&str>,
 ) -> Option<u64> {
+    effective_partition_size_reported(
+        reader,
+        partition_offset,
+        partition_type,
+        partition_type_string,
+    )
+    .ok()
+}
+
+/// [`effective_partition_size`] keeping the reason it failed.
+///
+/// The `Option`-returning form discards both the open error and the
+/// `last_data_byte` error, and a caller that treats `None` as "no trim
+/// possible" then silently images the whole partition. That is how a
+/// PowerPC ext backup came out at 32 MiB where the desktop produced 4.5 MiB:
+/// identical compact analysis, identical `used_size`, but `minimum_size_bytes`
+/// missing from the metadata entirely, with nothing anywhere saying why. Give
+/// callers that can log a way to say what went wrong.
+pub fn effective_partition_size_reported<R: Read + Seek + Send + 'static>(
+    reader: R,
+    partition_offset: u64,
+    partition_type: u8,
+    partition_type_string: Option<&str>,
+) -> Result<u64, String> {
     let mut fs = open_filesystem(
         reader,
         partition_offset,
         partition_type,
         partition_type_string,
     )
-    .ok()?;
-    fs.last_data_byte().ok()
+    .map_err(|e| format!("cannot open filesystem: {e}"))?;
+    fs.last_data_byte()
+        .map_err(|e| format!("last_data_byte failed: {e}"))
 }
 
 /// Calculate the defragmented minimum size for a partition — the smallest
@@ -1699,9 +1725,12 @@ pub fn open_filesystem_with_passphrase<R: Read + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
-                _ => Err(FilesystemError::Unsupported(
-                    "type 0x07 partition is neither NTFS, exFAT, nor HPFS".into(),
-                )),
+                // `detect_0x07_type` only ever answers ntfs / exfat / hpfs, so
+                // anything else means the type byte is simply wrong about its
+                // own contents - FAT under 0x07 is the common case. Hand it to
+                // full detection rather than refusing on the strength of a
+                // label the disk has already contradicted.
+                _ => open_filesystem_with_passphrase(reader, partition_offset, 0x00, None, None),
             }
         }
         // Linux — detect ext / btrfs / xfs by magic bytes.
@@ -1782,10 +1811,24 @@ pub fn open_filesystem_with_passphrase<R: Read + Seek + Send + 'static>(
             reader,
             partition_offset,
         )?)),
-        _ => Err(FilesystemError::Unsupported(format!(
-            "filesystem type 0x{:02X} not supported for browsing",
-            partition_type
-        ))),
+        // An unhandled type byte is not proof there is nothing here. MBR type
+        // codes are a sprawl - the "hidden" FAT variants (0x11/0x14/0x1B/0x1C),
+        // 0x27 for Windows RE, 0xEF for an ESP on an MBR disk - and no table
+        // will ever have all of them. If the superblock names a filesystem we
+        // support, open it; the type byte was simply wrong.
+        //
+        // The original error is kept for the case that matters: content we
+        // genuinely do not recognize. Naming the type byte there is more use
+        // than silently handing back the carve view auto-detect would end at.
+        _ => {
+            if detect_filesystem_type(&mut reader, partition_offset) == "unknown" {
+                return Err(FilesystemError::Unsupported(format!(
+                    "filesystem type 0x{:02X} not supported for browsing",
+                    partition_type
+                )));
+            }
+            open_filesystem_with_passphrase(reader, partition_offset, 0x00, None, passphrase)
+        }
     }
 }
 
@@ -1855,6 +1898,9 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
     partition_type_string: Option<&str>,
 ) -> Result<Box<dyn EditableFilesystem>, FilesystemError> {
     let partition_len = edit_ctx.partition_len;
+    // Set when the type string is one we have no arm for, so the type-byte
+    // match below is entered in auto-detect mode instead of erroring out.
+    let mut auto_detect = false;
     // Check string-based type first (APM partitions)
     if let Some(type_str) = partition_type_string {
         match type_str {
@@ -1971,13 +2017,20 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                     geom.body_len(),
                 )?));
             }
+            // Unrecognized type string: fall through to content detection
+            // below, exactly as the read path does. A GPT type GUID describes
+            // what a partition is *for*, not what is in it - an EFI System
+            // Partition is plain FAT32 - so refusing here made the ESP
+            // read-only for no reason, while an identical FAT32 in an MBR
+            // partition edited fine.
             _ => {
-                return Err(FilesystemError::Unsupported(format!(
-                    "editing not yet supported for APM type '{type_str}'"
-                )));
+                auto_detect = true;
             }
         }
     }
+    // Only forced when a type string was present and unrecognized; a partition
+    // with no type string keeps whatever type byte it came with.
+    let partition_type = if auto_detect { 0x00 } else { partition_type };
     match partition_type {
         // Auto-detect (superfloppy / type byte 0)
         0x00 => {
@@ -2162,9 +2215,10 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
-                _ => Err(FilesystemError::Unsupported(
-                    "type 0x07 partition is neither NTFS, exFAT, nor HPFS".into(),
-                )),
+                // As on the read path: the type byte has already been
+                // contradicted by the contents, so let the contents decide.
+                // Refusing here made FAT under 0x07 browsable but not editable.
+                _ => open_editable_filesystem_with(reader, partition_offset, edit_ctx, 0x00, None),
             }
         }
         // Linux — detect ext2/3/4. Also FAT for MSX HDDs that mis-stamp the
@@ -2250,9 +2304,19 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                 )),
             }
         }
-        _ => Err(FilesystemError::Unsupported(format!(
-            "editing not yet supported for filesystem type 0x{partition_type:02X}"
-        ))),
+        // Same reasoning as the read path: an unhandled type byte is a wrong
+        // label, not an absent filesystem. Without this, a FAT partition
+        // stamped 0x27 (Windows RE) or 0x11 (hidden FAT12) browsed fine and
+        // then refused every write - the partition type quietly deciding that
+        // a volume is read-only.
+        _ => {
+            if detect_filesystem_type(&mut reader, partition_offset) == "unknown" {
+                return Err(FilesystemError::Unsupported(format!(
+                    "editing not yet supported for filesystem type 0x{partition_type:02X}"
+                )));
+            }
+            open_editable_filesystem_with(reader, partition_offset, edit_ctx, 0x00, None)
+        }
     }
 }
 
@@ -2302,6 +2366,16 @@ fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                // Same as the Linux Filesystem GUID: detection already named
+                // it, so open it rather than reporting what we just identified
+                // as "unrecognized". A UFS or JFS A/UX partition lands here.
+                _ if fs_type != "unknown" => open_filesystem_with_passphrase(
+                    reader,
+                    partition_offset,
+                    0x00,
+                    None,
+                    passphrase,
+                ),
                 _ => Err(FilesystemError::Unsupported(format!(
                     "{type_str} partition: unrecognized filesystem (detected: {fs_type})"
                 ))),
@@ -2413,6 +2487,17 @@ fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                // This arm knew the answer and threw it away: it reported
+                // "unrecognized filesystem (detected: fat)" for a FAT volume in
+                // a Linux Filesystem partition. Anything detection can name,
+                // the auto-detect path can open.
+                _ if fs_type != "unknown" => open_filesystem_with_passphrase(
+                    reader,
+                    partition_offset,
+                    0x00,
+                    None,
+                    passphrase,
+                ),
                 _ => Err(FilesystemError::Unsupported(format!(
                     "Linux Filesystem GPT partition: unrecognized filesystem (detected: {fs_type})"
                 ))),
@@ -2437,10 +2522,19 @@ fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
         // is opened as a whole (the driver parses the header + 12-byte sector
         // tags itself), so `partition_offset` is ignored. Read-only.
         "lisafs" => Ok(Box::new(lisa::LisaFilesystem::open(reader)?)),
-        _ => Err(FilesystemError::Unsupported(format!(
-            "APM partition type '{}' not supported for browsing",
-            type_str
-        ))),
+        // An unrecognized partition *type* is not a reason to refuse. On GPT the
+        // type GUID says what a partition is **for**, not what is inside it: the
+        // EFI System Partition is plain FAT32, "Microsoft Basic Data" is
+        // NTFS / exFAT / FAT, "Windows Recovery" is NTFS. Only three GUIDs ever
+        // had arms here, so browsing the ESP on any ordinary PC failed with
+        // "APM partition type 'C12A7328-...' not supported" - naming the wrong
+        // partition scheme, about a filesystem we have supported all along.
+        //
+        // So fall through to the superblock, which is the real authority on
+        // what a partition holds. Auto-detect ends at the carve view rather
+        // than an error, so an genuinely unknown payload still opens as
+        // something inspectable instead of a dead end.
+        _ => open_filesystem_with_passphrase(reader, partition_offset, 0x00, None, passphrase),
     }
 }
 
@@ -3152,6 +3246,193 @@ pub fn probe_apple_hfs_type<R: Read + Seek>(reader: &mut R, partition_offset: u6
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    /// The EFI System Partition on every UEFI PC is plain FAT32, but its GPT
+    /// type GUID had no arm in the dispatch, so browsing it failed with
+    /// "APM partition type 'C12A7328-...' not supported for browsing" - the
+    /// wrong partition scheme, about a filesystem supported all along. A GPT
+    /// type GUID says what a partition is *for*; the superblock says what is in
+    /// it, and that is what has to decide.
+    #[test]
+    fn an_efi_system_partition_opens_as_the_fat_it_holds() {
+        const ESP: &str = "C12A7328-F81F-11D2-BA4B-00A0C93EC93B";
+        let img = crate::fs::fat::create_blank_fat(64 * 1024 * 1024, Some("ESP")).unwrap();
+        let fs = open_filesystem_with_passphrase(Cursor::new(img), 0, 0, Some(ESP), None)
+            .expect("an ESP must open as the FAT volume it is");
+        assert!(
+            fs.fs_type().starts_with("FAT"),
+            "expected a FAT variant, got {}",
+            fs.fs_type()
+        );
+    }
+
+    /// And it must be writable: refusing the write path made the ESP read-only
+    /// while an identical FAT32 in an MBR partition edited fine.
+    #[test]
+    fn an_efi_system_partition_is_editable() {
+        const ESP: &str = "C12A7328-F81F-11D2-BA4B-00A0C93EC93B";
+        let img = crate::fs::fat::create_blank_fat(64 * 1024 * 1024, Some("ESP")).unwrap();
+        let mut fs = open_editable_filesystem_with(
+            Cursor::new(img),
+            0,
+            EditContext::default(),
+            0,
+            Some(ESP),
+        )
+        .expect("an ESP must open for write");
+        let root = fs.as_filesystem_mut().root().unwrap();
+        fs.create_directory(&root, "EFI", &Default::default())
+            .expect("mkdir on an ESP must work");
+    }
+
+    /// The same reasoning covers every other GPT GUID we have no arm for -
+    /// "Microsoft Basic Data" is the one on every Windows data partition.
+    #[test]
+    fn an_unknown_gpt_type_guid_falls_back_to_the_superblock() {
+        const MS_BASIC_DATA: &str = "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7";
+        let img = crate::fs::fat::create_blank_fat(64 * 1024 * 1024, Some("DATA")).unwrap();
+        let fs = open_filesystem_with_passphrase(Cursor::new(img), 0, 0, Some(MS_BASIC_DATA), None)
+            .expect("an unknown GPT GUID must fall back to content detection");
+        assert!(fs.fs_type().starts_with("FAT"));
+    }
+
+    /// A FAT32 volume must open no matter what the partition table calls it.
+    ///
+    /// The partition type is a *label*, and in the wild it is wrong constantly:
+    /// an ESP is FAT32 under an EFI GUID, Windows RE is FAT32 under 0x27, MSX
+    /// formatters write FAT under 0x83, and "hidden" variants (0x11/0x1B/0x1C)
+    /// are the ordinary types with a bit flipped. The bytes on disk are the only
+    /// thing that actually knows, so every route into the dispatch has to end at
+    /// the superblock rather than at a table of blessed type codes.
+    ///
+    /// This is the regression net for that: each entry is a real shape someone
+    /// has a disk of, and any of them failing means a user cannot read a
+    /// perfectly ordinary FAT32 partition.
+    ///
+    /// The fixture is a real FAT32 at 64 MiB - an ESP's shape, not a 2 GiB one.
+    /// `FatFilesystem::open` takes the type from the BPB (`sectors_per_fat_16`
+    /// and `root_entry_count` both zero) *before* falling back to cluster
+    /// counts, precisely so an under-clustered FAT32 like this reads back as
+    /// FAT32 rather than being misread as FAT16.
+    #[test]
+    fn fat32_opens_behind_every_partition_type_that_carries_it() {
+        let img = crate::fs::fat::create_blank_fat32(64 * 1024 * 1024, Some("DATA")).unwrap();
+        let probe = open_filesystem_with_passphrase(Cursor::new(img.clone()), 0, 0, None, None)
+            .expect("the fixture itself must open");
+        assert_eq!(probe.fs_type(), "FAT32", "fixture is not FAT32");
+
+        // MBR type bytes, with why each one turns up holding FAT32.
+        for (ty, why) in [
+            (0x00u8, "auto-detect / superfloppy"),
+            (0x01, "FAT12"),
+            (0x04, "FAT16 <32M"),
+            (0x06, "FAT16"),
+            (0x07, "usually NTFS/exFAT, but tools do write FAT here"),
+            (0x0B, "FAT32 CHS"),
+            (0x0C, "FAT32 LBA"),
+            (0x0E, "FAT16 LBA"),
+            (0x11, "hidden FAT12"),
+            (0x14, "hidden FAT16 <32M"),
+            (0x16, "hidden FAT16"),
+            (0x1B, "hidden FAT32"),
+            (0x1C, "hidden FAT32 LBA"),
+            (0x1E, "hidden FAT16 LBA"),
+            (0x27, "Windows Recovery"),
+            (0x83, "Linux, but MSX Nextor writes FAT here"),
+            (0xEF, "EFI System Partition on an MBR disk"),
+        ] {
+            let fs = open_filesystem_with_passphrase(Cursor::new(img.clone()), 0, ty, None, None)
+                .unwrap_or_else(|e| panic!("MBR type 0x{ty:02X} ({why}) must open FAT32: {e}"));
+            assert_eq!(
+                fs.fs_type(),
+                "FAT32",
+                "MBR type 0x{ty:02X} ({why}) opened as the wrong filesystem"
+            );
+        }
+
+        // GPT type GUIDs. The GUID says what the partition is *for*; all of
+        // these are found holding FAT32.
+        for (guid, why) in [
+            ("C12A7328-F81F-11D2-BA4B-00A0C93EC93B", "EFI System"),
+            (
+                "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7",
+                "Microsoft Basic Data",
+            ),
+            ("DE94BBA4-06D1-4D40-A16A-BFD50179D6AC", "Windows Recovery"),
+            ("0FC63DAF-8483-4772-8E79-3D69D8477DE4", "Linux Filesystem"),
+            ("933AC7E1-2EB4-4F13-B844-0E14E2AEF915", "Linux Home"),
+            ("21686148-6449-6E6F-7468-656564454649", "BIOS Boot"),
+        ] {
+            let fs =
+                open_filesystem_with_passphrase(Cursor::new(img.clone()), 0, 0, Some(guid), None)
+                    .unwrap_or_else(|e| panic!("GPT {why} must open FAT32: {e}"));
+            assert_eq!(
+                fs.fs_type(),
+                "FAT32",
+                "GPT {why} opened as the wrong filesystem"
+            );
+        }
+    }
+
+    /// And the same set has to be *writable*, or the partition type quietly
+    /// decides whether a volume is read-only - which is how the ESP ended up
+    /// browsable but not editable.
+    #[test]
+    fn fat32_is_editable_behind_the_same_partition_types() {
+        let img = crate::fs::fat::create_blank_fat32(64 * 1024 * 1024, Some("DATA")).unwrap();
+        for ty in [0x00u8, 0x07, 0x0C, 0x1B, 0x27, 0x83, 0xEF] {
+            let mut fs = open_editable_filesystem_with(
+                Cursor::new(img.clone()),
+                0,
+                EditContext::default(),
+                ty,
+                None,
+            )
+            .unwrap_or_else(|e| panic!("MBR type 0x{ty:02X} must open FAT32 for write: {e}"));
+            let root = fs.as_filesystem_mut().root().unwrap();
+            fs.create_directory(&root, "T", &Default::default())
+                .unwrap_or_else(|e| panic!("MBR type 0x{ty:02X}: mkdir failed: {e}"));
+        }
+        for guid in [
+            "C12A7328-F81F-11D2-BA4B-00A0C93EC93B",
+            "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7",
+            "0FC63DAF-8483-4772-8E79-3D69D8477DE4",
+        ] {
+            let mut fs = open_editable_filesystem_with(
+                Cursor::new(img.clone()),
+                0,
+                EditContext::default(),
+                0,
+                Some(guid),
+            )
+            .unwrap_or_else(|e| panic!("GPT {guid} must open FAT32 for write: {e}"));
+            let root = fs.as_filesystem_mut().root().unwrap();
+            fs.create_directory(&root, "T", &Default::default())
+                .unwrap_or_else(|e| panic!("GPT {guid}: mkdir failed: {e}"));
+        }
+    }
+
+    /// The formatter has to be able to *make* an ESP, not just read one.
+    /// Size-based selection tops out at FAT16 below 2 GiB, so before `--fat32`
+    /// there was no way to produce the 100-512 MiB FAT32 that firmware expects.
+    #[test]
+    fn a_small_fat32_volume_can_be_formatted_and_reopened() {
+        for mb in [33u64, 64, 100, 512] {
+            let img = crate::fs::fat::create_blank_fat32(mb * 1024 * 1024, Some("ESP")).unwrap();
+            let fs = open_filesystem_with_passphrase(Cursor::new(img), 0, 0, None, None)
+                .unwrap_or_else(|e| panic!("{mb} MiB forced FAT32 must reopen: {e}"));
+            assert_eq!(
+                fs.fs_type(),
+                "FAT32",
+                "{mb} MiB came back as the wrong type"
+            );
+        }
+        // Size-based selection is unchanged: the same capacity without the flag
+        // still resolves by cluster count.
+        let img = crate::fs::fat::create_blank_fat(100 * 1024 * 1024, Some("DATA")).unwrap();
+        let fs = open_filesystem_with_passphrase(Cursor::new(img), 0, 0, None, None).unwrap();
+        assert_eq!(fs.fs_type(), "FAT16");
+    }
 
     #[test]
     fn browsable_gate_excludes_apm_driver_partitions() {

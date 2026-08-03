@@ -153,7 +153,6 @@ pub(crate) fn compress_partition_hashed(
                 reader,
                 output_base,
                 logical_size,
-                split_size,
                 chd_options,
                 &mut p,
                 &c,
@@ -169,7 +168,6 @@ pub(crate) fn compress_partition_hashed(
                 reader,
                 output_base,
                 logical_size,
-                split_size,
                 chd_options,
                 &mut p,
                 &c,
@@ -184,6 +182,80 @@ pub(crate) fn compress_partition_hashed(
     }
 }
 
+/// Reads a backup's member files back as the single byte stream they were cut
+/// from. `--split-size` chops the *output* at a byte boundary, so
+/// `partition-0.raw` + `partition-0.001.raw` + … are chunks of one stream, not
+/// independent archives — decoding only the first one silently truncates.
+struct MemberChain {
+    // Owned, not borrowed: the zstd decoder wants a 'static reader.
+    members: Vec<PathBuf>,
+    next: usize,
+    current: Option<BufReader<File>>,
+}
+
+impl MemberChain {
+    fn new(members: &[PathBuf]) -> Result<Self> {
+        let mut chain = Self {
+            members: members.to_owned(),
+            next: 0,
+            current: None,
+        };
+        chain.advance()?;
+        Ok(chain)
+    }
+
+    fn advance(&mut self) -> Result<()> {
+        self.current = match self.members.get(self.next) {
+            Some(path) => {
+                self.next += 1;
+                Some(BufReader::new(File::open(path).with_context(|| {
+                    format!("failed to open {}", path.display())
+                })?))
+            }
+            None => None,
+        };
+        Ok(())
+    }
+}
+
+impl Read for MemberChain {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            let Some(current) = self.current.as_mut() else {
+                return Ok(0);
+            };
+            let n = current.read(buf)?;
+            if n > 0 {
+                return Ok(n);
+            }
+            self.advance().map_err(crate::compat::io_other)?;
+        }
+    }
+}
+
+/// Total size of every member, and whether the last one ends in a VHD footer.
+fn members_size(members: &[PathBuf], compression_type: &str) -> Result<u64> {
+    let mut total = 0u64;
+    for path in members {
+        total += std::fs::metadata(path)
+            .with_context(|| format!("failed to stat {}", path.display()))?
+            .len();
+    }
+    // The VHD footer trails the whole stream, so it lives in the last member.
+    if compression_type == "vhd" && total >= 512 {
+        if let Some(last) = members.last() {
+            let mut f = File::open(last)?;
+            f.seek(SeekFrom::End(-512))?;
+            let mut footer_buf = [0u8; 8];
+            f.read_exact(&mut footer_buf)?;
+            if &footer_buf == vhd::VHD_COOKIE {
+                return Ok(total - 512);
+            }
+        }
+    }
+    Ok(total)
+}
+
 /// Decompress a partition data file and write it to the given writer.
 /// If `max_bytes` is `Some(n)`, writing stops after `n` bytes.
 /// Returns the number of raw bytes written.
@@ -196,35 +268,51 @@ pub fn decompress_to_writer(
     cancel_check: &impl Fn() -> bool,
     log_cb: &mut impl FnMut(&str),
 ) -> Result<u64> {
+    let members = [data_path.to_path_buf()];
+    decompress_members_to_writer(
+        &members,
+        compression_type,
+        writer,
+        max_bytes,
+        progress_cb,
+        cancel_check,
+        log_cb,
+    )
+}
+
+/// Decompress a partition's members — one file, or the `.001` / `.002` / …
+/// sequence a `--split-size` backup wrote — and write the result to `writer`.
+/// If `max_bytes` is `Some(n)`, writing stops after `n` bytes.
+/// Returns the number of raw bytes written.
+pub fn decompress_members_to_writer(
+    members: &[PathBuf],
+    compression_type: &str,
+    writer: &mut impl Write,
+    max_bytes: Option<u64>,
+    progress_cb: &mut impl FnMut(u64),
+    cancel_check: &impl Fn() -> bool,
+    log_cb: &mut impl FnMut(&str),
+) -> Result<u64> {
     let limit = max_bytes.unwrap_or(u64::MAX);
     let mut total_written: u64 = 0;
     let mut buf = vec![0u8; CHUNK_SIZE];
+    if members.is_empty() {
+        bail!("no data files to decompress");
+    }
+    let data_path = &members[0];
+    if members.len() > 1 {
+        log_cb(&format!(
+            "Reading {} split members as one stream",
+            members.len()
+        ));
+    }
 
     match compression_type {
         "none" | "raw" | "vhd" => {
-            // Raw data — if it's a VHD file, strip the footer
-            let file = File::open(data_path)
-                .with_context(|| format!("failed to open {}", data_path.display()))?;
-            let file_size = file.metadata()?.len();
-
-            // Check if this is a VHD file (has footer)
-            let data_size = if file_size >= 512 && compression_type == "vhd" {
-                // Read last 512 bytes to check for VHD footer
-                let mut f = File::open(data_path)?;
-                f.seek(SeekFrom::End(-512))?;
-                let mut footer_buf = [0u8; 8];
-                f.read_exact(&mut footer_buf)?;
-                if &footer_buf == vhd::VHD_COOKIE {
-                    file_size - 512
-                } else {
-                    file_size
-                }
-            } else {
-                file_size
-            };
-
+            // Raw data — if it's a VHD stream, strip the trailing footer.
+            let data_size = members_size(members, compression_type)?;
             let effective_size = data_size.min(limit);
-            let mut reader = BufReader::new(File::open(data_path)?).take(effective_size);
+            let mut reader = MemberChain::new(members)?.take(effective_size);
             loop {
                 if cancel_check() {
                     bail!("export cancelled");
@@ -242,7 +330,9 @@ pub fn decompress_to_writer(
             // WOZ files contain GCR-encoded bitstreams.  We decode the whole
             // image into memory (floppies are small) and then stream the
             // resulting flat sector buffer to the writer, respecting `limit`.
-            let raw = fs::read(data_path)
+            let mut raw = Vec::new();
+            MemberChain::new(members)?
+                .read_to_end(&mut raw)
                 .with_context(|| format!("failed to read WOZ file: {}", data_path.display()))?;
             let mut reader = woz::WozReader::from_bytes(raw)
                 .with_context(|| format!("failed to decode WOZ: {}", data_path.display()))?;
@@ -267,9 +357,7 @@ pub fn decompress_to_writer(
             // MultiGzDecoder so a file of several concatenated gzip members
             // (the network `.cbk` chunk shape) decodes as well as a single
             // cb-dos-streamed member.
-            let file = File::open(data_path)
-                .with_context(|| format!("failed to open {}", data_path.display()))?;
-            let mut decoder = flate2::read::MultiGzDecoder::new(BufReader::new(file));
+            let mut decoder = flate2::read::MultiGzDecoder::new(MemberChain::new(members)?);
             loop {
                 if cancel_check() {
                     bail!("export cancelled");
@@ -291,9 +379,7 @@ pub fn decompress_to_writer(
             }
         }
         "zstd" => {
-            let file = File::open(data_path)
-                .with_context(|| format!("failed to open {}", data_path.display()))?;
-            let mut decoder = super::zstd_compat::decoder(BufReader::new(file))
+            let mut decoder = super::zstd_compat::decoder(MemberChain::new(members)?)
                 .context("failed to create zstd decoder")?;
             loop {
                 if cancel_check() {
@@ -318,9 +404,7 @@ pub fn decompress_to_writer(
         "lz4" => {
             // LZ4 frame (the cb-dos `/CODEC:LZ4` member, or a desktop
             // `--format lz4` backup).
-            let file = File::open(data_path)
-                .with_context(|| format!("failed to open {}", data_path.display()))?;
-            let mut decoder = lz4_flex::frame::FrameDecoder::new(BufReader::new(file));
+            let mut decoder = lz4_flex::frame::FrameDecoder::new(MemberChain::new(members)?);
             loop {
                 if cancel_check() {
                     bail!("export cancelled");
@@ -343,6 +427,14 @@ pub fn decompress_to_writer(
         }
         "chd" | "chd-dvd" => {
             log_cb(&format!("Extracting CHD: {}", data_path.display()));
+            // A .chd is one self-contained container; we never write it split.
+            if members.len() > 1 {
+                bail!(
+                    "CHD backup lists {} data files, but a .chd is always a single \
+                     container — this is not a backup folder we wrote",
+                    members.len()
+                );
+            }
             let chd_reader = chd::ChdReader::open(data_path)
                 .with_context(|| format!("failed to open CHD: {}", data_path.display()))?;
             let logical_size = chd_reader.logical_size();
@@ -463,7 +555,6 @@ pub fn compress_file_to_archive(
                 &mut reader,
                 output_path_base,
                 logical_size,
-                None,
                 chd_options,
                 progress_cb,
                 cancel_check,
@@ -477,7 +568,6 @@ pub fn compress_file_to_archive(
                 &mut reader,
                 output_path_base,
                 logical_size,
-                None,
                 chd_options,
                 progress_cb,
                 cancel_check,

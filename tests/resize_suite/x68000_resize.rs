@@ -166,6 +166,11 @@ fn write_backup_folder(
 /// End-to-end: build a 1 MiB Human68k image inside an X68k disk →
 /// backup folder → restore-with-resize to a 3 MiB partition →
 /// per-FS FAT resize → reopen + verify seed file survives.
+///
+/// The partition table grows to 3 MiB; the filesystem inside it grows only as
+/// far as FAT12 can describe, because the full extent would cross into FAT16
+/// territory (see the total-sectors assertions below). The tail of the
+/// partition is simply unclaimed.
 #[test]
 fn x68k_disk_round_trips_through_restore_with_resize() {
     const PART_BYTES_ORIG: u64 = 1024 * 1024;
@@ -296,10 +301,29 @@ fn x68k_disk_round_trips_through_restore_with_resize() {
         "disk_size_field on the X68k header refreshes to the new size"
     );
 
-    // BPB total_sectors at the partition's first sector now reflects
-    // the FAT resize. FAT12/16 stores small total at bytes 19..21 and
-    // big total at bytes 32..36 — pick whichever is non-zero (same
-    // convention `Human68kBpb::parse` uses).
+    // BPB total_sectors at the partition's first sector. FAT12/16 stores
+    // small total at bytes 19..21 and big total at bytes 32..36 — pick
+    // whichever is non-zero (same convention `Human68kBpb::parse` uses).
+    //
+    // The filesystem grows, but not all the way to the partition's new size:
+    // the seed volume is FAT12 at 1 sector per cluster (2021 clusters), and
+    // stretching it to the full 6144 sectors at that cluster size would give
+    // 6093 clusters, which by the standard rule is FAT16. So the resizer takes
+    // it as far as FAT12 can describe and leaves the remainder unclaimed. A
+    // blank 3 MiB volume avoids the ceiling entirely by using 2 sectors per
+    // cluster, but changing the cluster size in place would mean relocating
+    // every byte of data, and widening the FAT would mean rewriting every
+    // entry — neither is something an in-place resize does.
+    //
+    // This assertion used to expect the full 6144, which is what the resizer
+    // wrote before it learned about the ceiling: the total-sector count was
+    // patched while the 12-bit, 6-sector FAT underneath still described 2021
+    // clusters, so anything reading the volume by the rule computed 6093
+    // clusters and parsed them as 16-bit entries running far past the FAT's
+    // end. The round-trip check below still passed because HELLO.TXT sits in
+    // the first cluster and the root directory lives outside the FAT — a
+    // single small file at the front survives the mismatch that would corrupt
+    // a full one.
     let part_bpb = &restored[part_offset as usize..part_offset as usize + 512];
     let small_total = u16::from_le_bytes([part_bpb[19], part_bpb[20]]) as u32;
     let big_total = u32::from_le_bytes([part_bpb[32], part_bpb[33], part_bpb[34], part_bpb[35]]);
@@ -307,11 +331,17 @@ fn x68k_disk_round_trips_through_restore_with_resize() {
         small_total
     } else {
         big_total
-    };
-    assert_eq!(
-        observed_total as u64,
+    } as u64;
+    assert!(
+        observed_total > PART_BYTES_ORIG / SECTOR_SIZE,
+        "the filesystem should have grown past its original {} sectors, got {observed_total}",
+        PART_BYTES_ORIG / SECTOR_SIZE,
+    );
+    assert!(
+        observed_total < PART_BYTES_NEW / SECTOR_SIZE,
+        "the filesystem must stop short of the {} sectors the partition now spans \
+         (that many clusters would make it FAT16), got {observed_total}",
         PART_BYTES_NEW / SECTOR_SIZE,
-        "BPB total_sectors reflects the FAT resize",
     );
 
     // Human68k FS opens at the new offset; HELLO.TXT round-trips byte-exact.

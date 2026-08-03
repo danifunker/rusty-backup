@@ -1519,19 +1519,16 @@ impl BackupTab {
             }
         };
 
-        let mut reader = BufReader::new(file);
+        // Kept so the probes below can still clone the handle once `file` moves into the reader.
+        let source_handle = file.try_clone().ok();
+        // A device cannot answer seek(End); carry the length the OS reports instead.
+        let mut reader: Box<dyn rusty_backup::rbformats::ReadSeek> = if is_device {
+            Box::new(rusty_backup::os::known_len_reader(file, &path))
+        } else {
+            Box::new(BufReader::new(file))
+        };
         match PartitionTable::detect(&mut reader) {
-            Ok(mut table) => {
-                // Fix up superfloppy size: seek(End(0)) returns 0 for macOS devices
-                if let PartitionTable::None { size_bytes, .. } = &mut table {
-                    if *size_bytes == 0 {
-                        if let Ok(real_size) =
-                            rusty_backup::os::get_file_size(reader.get_ref(), &path)
-                        {
-                            *size_bytes = real_size;
-                        }
-                    }
-                }
+            Ok(table) => {
                 self.source_partitions = table.partitions();
                 self.select_all_partitions();
                 let table_desc = if matches!(table, PartitionTable::None { .. }) {
@@ -1568,11 +1565,17 @@ impl BackupTab {
                     if ext_container {
                         continue;
                     }
-                    let Ok(clone) = reader.get_ref().try_clone() else {
+                    let Some(Ok(clone)) = source_handle.as_ref().map(|f| f.try_clone()) else {
                         continue;
                     };
+                    // AFFS / Atari / DFS / CBM size themselves via seek(End), which a device refuses.
+                    let probe: Box<dyn rusty_backup::rbformats::ReadSeek> = if is_device {
+                        Box::new(rusty_backup::os::known_len_reader(clone, &path))
+                    } else {
+                        Box::new(BufReader::new(clone))
+                    };
                     let result = fs::partition_minimum_size(
-                        BufReader::new(clone),
+                        probe,
                         offset,
                         type_byte,
                         type_str.as_deref(),
@@ -1628,7 +1631,7 @@ impl BackupTab {
                     }
                 }
                 // Stash the open source file so worker threads can clone it later.
-                if let Ok(f) = reader.get_ref().try_clone() {
+                if let Some(Ok(f)) = source_handle.as_ref().map(|f| f.try_clone()) {
                     self.source_file = Some(Arc::new(f));
                 }
             }

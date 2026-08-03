@@ -842,6 +842,26 @@ impl<R: Read + Seek + Send> Filesystem for FatFilesystem<R> {
         }
         let used_clusters = self.total_clusters.saturating_sub(free);
 
+        // Apply the same FAT16 cluster floor `CompactFatReader` applies when it
+        // actually writes the packed volume (see the `type_min_clusters` note
+        // there). Without it the two disagree: a lightly-used FAT16 volume
+        // reports a minimum of a few kilobytes while compaction emits ~8 MB,
+        // because the packed volume has to keep at least 4085 clusters or it
+        // gets re-read as FAT12 and every multi-cluster chain is misparsed.
+        //
+        // The reported number is what a restore *targets* — it lands in
+        // metadata as `defragmented_min_size_bytes`, and both the GUI's and the
+        // TUI's "Minimum" pick it up. Reporting a size smaller than the image
+        // that has to fit in it made restore-at-minimum fail outright ("size is
+        // smaller than minimum") for any FAT16 volume that wasn't nearly full.
+        let type_min_clusters: u64 = match self.fat_type {
+            FatType::Fat16 => 4085 + 16,
+            // FAT12 is already the narrowest type, and FAT32 is detected by BPB
+            // shape rather than cluster count, so neither needs a floor.
+            FatType::Fat12 | FatType::Fat32 => 0,
+        };
+        let used_clusters = used_clusters.max(type_min_clusters);
+
         let fat_bytes = match self.fat_type {
             FatType::Fat12 => ((used_clusters + 2) * 3).div_ceil(2),
             FatType::Fat16 => (used_clusters + 2) * 2,
@@ -1983,6 +2003,95 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for FatFilesystem<R> {
         Ok(())
     }
 
+    fn set_dos_attributes(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+        attrs: u16,
+    ) -> Result<(), FilesystemError> {
+        if entry.is_directory() {
+            // The directory bit is structural; changing the rest of a
+            // directory's attributes is legal but not what any caller here
+            // means, and getting it wrong corrupts the tree.
+            return Err(FilesystemError::Unsupported(
+                "attributes on a directory are not editable".into(),
+            ));
+        }
+        // Mask to the user-settable bits. Directory (0x10) and volume-id (0x08)
+        // describe what the entry *is*; accepting them from a caller would let
+        // an attribute edit turn a file into something else.
+        let attr = (attrs as u8) & 0x27;
+
+        // Patched in place rather than re-added. `rename`'s add-then-remove
+        // works because the names differ, so the removal can tell the two
+        // records apart - here the name is unchanged, and the removal took out
+        // the record that had just been added, silently leaving the old
+        // attributes in place.
+        let is_root_fat16 = parent.path == "/" && self.fat_type != FatType::Fat32;
+        let (mut dir_data, write_back) = if is_root_fat16 {
+            (self.read_root_directory()?, None)
+        } else {
+            let cluster = parent.location as u32;
+            (self.read_cluster_chain(cluster)?, Some(cluster))
+        };
+
+        let num_entries = dir_data.len() / DIR_ENTRY_SIZE;
+        let mut target = None;
+        for i in 0..num_entries {
+            let off = i * DIR_ENTRY_SIZE;
+            if dir_data[off] == 0x00 {
+                break;
+            }
+            if dir_data[off] == 0xE5 || dir_data[off + 11] == ATTR_LONG_NAME {
+                continue;
+            }
+            let lo = u16::from_le_bytes([dir_data[off + 26], dir_data[off + 27]]) as u32;
+            let hi = u16::from_le_bytes([dir_data[off + 20], dir_data[off + 21]]) as u32;
+            let cluster = (hi << 16) | lo;
+            let size = u32::from_le_bytes([
+                dir_data[off + 28],
+                dir_data[off + 29],
+                dir_data[off + 30],
+                dir_data[off + 31],
+            ]);
+            if cluster != entry.location as u32 || size != entry.size as u32 {
+                continue;
+            }
+            // An empty file has no start cluster, so cluster+size cannot
+            // identify it on its own - two empty files look identical. Fall
+            // back to the 8.3 name for those.
+            if cluster == 0 {
+                let sfn = build_short_name(&dir_data[off..off + 8], &dir_data[off + 8..off + 11]);
+                if !sfn.eq_ignore_ascii_case(&entry.name) {
+                    continue;
+                }
+            }
+            target = Some(off);
+            break;
+        }
+        let off = target.ok_or_else(|| {
+            FilesystemError::NotFound(format!("entry '{}' not found in parent", entry.name))
+        })?;
+
+        // Keep whatever structural bits the record already had.
+        let structural = dir_data[off + 11] & 0x18;
+        dir_data[off + 11] = attr | structural;
+
+        match write_back {
+            None => {
+                let root_start =
+                    self.reserved_sectors + (self.num_fats as u64 * self.sectors_per_fat);
+                let abs_offset = self.sector_offset(root_start);
+                self.reader.seek(SeekFrom::Start(abs_offset))?;
+                self.reader.write_all(&dir_data)?;
+            }
+            Some(cluster) => {
+                self.write_cluster_chain(cluster, &dir_data)?;
+            }
+        }
+        Ok(())
+    }
+
     fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
         self.update_fsinfo()?;
         self.reader.flush()?;
@@ -2021,12 +2130,28 @@ fn decode_oem_string(bytes: &[u8]) -> String {
 }
 
 /// Map a single CP437 byte to a Unicode character.
-fn cp437_to_char(b: u8) -> char {
+pub(crate) fn cp437_to_char(b: u8) -> char {
     if b < 0x80 {
         b as char
     } else {
         CP437_HIGH[b as usize - 0x80]
     }
+}
+
+/// Map a Unicode character back to its CP437 byte, if it has one.
+///
+/// The inverse of [`cp437_to_char`], derived from the same table so the two
+/// cannot drift. `None` means the character has no CP437 representation — the
+/// caller decides whether that is an error or a substitution, since silently
+/// replacing it is how a DOS text file quietly stops being what it was.
+pub(crate) fn char_to_cp437(c: char) -> Option<u8> {
+    if (c as u32) < 0x80 {
+        return Some(c as u8);
+    }
+    CP437_HIGH
+        .iter()
+        .position(|&t| t == c)
+        .map(|i| (i + 0x80) as u8)
 }
 
 /// CP437 to Unicode mapping for bytes 0x80-0xFF.
@@ -3677,21 +3802,108 @@ pub fn resize_fat_in_place(
     // FAT sectors at the tail — all data stays exactly where it was, and the
     // FAT still describes the (smaller) cluster count correctly. We only grow
     // the FAT when a resize genuinely needs more entries.
-    let min_spf = compute_fat_sectors(
-        new_total_sectors,
-        reserved_sectors,
-        num_fats,
-        root_dir_sectors,
-        spc,
-        fat_bits,
-        bytes_per_sector,
-    );
-    let new_spf = min_spf.max(old_spf);
-    let new_data_start = reserved_sectors + num_fats * new_spf + root_dir_sectors;
-    let new_data_sectors = new_total_sectors.saturating_sub(new_data_start);
-    let new_clusters = new_data_sectors / spc;
+    // Recomputed below if the request has to be capped, so this is a closure
+    // rather than a straight-line calculation.
+    let layout_for = |total: u32| -> (u32, u32) {
+        let min_spf = compute_fat_sectors(
+            total,
+            reserved_sectors,
+            num_fats,
+            root_dir_sectors,
+            spc,
+            fat_bits,
+            bytes_per_sector,
+        );
+        let spf = min_spf.max(old_spf);
+        let data_start = reserved_sectors + num_fats * spf + root_dir_sectors;
+        let clusters = total.saturating_sub(data_start) / spc;
+        (spf, clusters)
+    };
+    let (mut new_spf, mut new_clusters) = layout_for(new_total_sectors);
+    let mut new_total_sectors = new_total_sectors;
 
-    // Verify FAT type doesn't change
+    // How many clusters the *current* width can address at all. These are the
+    // classic limits every implementation uses to decide the type, and they
+    // matter here because the FAT12/16 rule below can never return 32 for a
+    // volume that is not already FAT32: a FAT16 grown past 65524 clusters would
+    // otherwise compare equal to itself and sail straight through into a BPB
+    // describing more clusters than its FAT can index.
+    let max_clusters_for_width: u32 = match fat_bits {
+        12 => 4084,
+        16 => 65524,
+        _ => 268_435_444,
+    };
+
+    // A growth that runs past the width's ceiling is capped at the largest size
+    // this width can actually describe, rather than refused outright: the user
+    // asked for more room and we give them all of it we can represent. Widening
+    // the FAT to reach the rest would mean rewriting every entry at a new width,
+    // which this in-place resize does not do.
+    //
+    // Writing the requested size without that rewrite is what the code used to
+    // do, and it produced a filesystem claiming the whole container while its
+    // FAT still described the old, smaller one - unmountable. Restoring an
+    // 800 KB FAT12 floppy onto a 40 MB target is enough to hit it: 1600 sectors
+    // -> 81920, far past FAT12's 4084-cluster ceiling. The restore reported
+    // success and the image failed on its first directory read.
+    let requested_total = new_total_sectors;
+    if new_total_sectors > old_total && new_clusters > max_clusters_for_width {
+        // Find the largest total this width can describe. Solving directly is
+        // awkward because the FAT's own length depends on the cluster count it
+        // has to cover (and for FAT12 that sizing is iterative), so search for
+        // it instead: more sectors never yields fewer clusters, so the "fits in
+        // this width" predicate crosses exactly once between the current size
+        // (representable by definition - it is what the volume already is) and
+        // the requested one.
+        let mut lo = old_total;
+        let mut hi = requested_total;
+        while hi - lo > 1 {
+            let mid = lo + (hi - lo) / 2;
+            if layout_for(mid).1 <= max_clusters_for_width {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        let capped_total = lo;
+
+        // Re-derive through the same path the uncapped request took, so the
+        // numbers we act on are the ones the resize will actually produce.
+        let (capped_spf, capped_clusters_actual) = layout_for(capped_total);
+        if capped_total <= old_total || capped_clusters_actual > max_clusters_for_width {
+            // No representable growth left - the volume is already at (or past)
+            // what this width can describe. Leave it alone.
+            log_cb(&format!(
+                "Warning: FAT resize: {} sectors declined - FAT{} already spans {} of its \
+                 {} addressable clusters, so there is no room to grow without widening \
+                 the FAT. Leaving it at {} sectors",
+                requested_total, fat_bits, old_clusters, max_clusters_for_width, old_total,
+            ));
+            return Ok(false);
+        }
+
+        log_cb(&format!(
+            "Warning: FAT resize: {} sectors is past what FAT{} can address ({} clusters, \
+             max {}). Growing to the largest size this width can describe instead: {} \
+             sectors ({} clusters). The remaining {} sectors stay unclaimed - using them \
+             would mean converting to FAT{}, which rewrites every FAT entry and is not \
+             something an in-place resize does",
+            requested_total,
+            fat_bits,
+            new_clusters,
+            max_clusters_for_width,
+            capped_total,
+            capped_clusters_actual,
+            requested_total - capped_total,
+            if fat_bits == 12 { 16 } else { 32 },
+        ));
+
+        new_total_sectors = capped_total;
+        new_spf = capped_spf;
+        new_clusters = capped_clusters_actual;
+    }
+
+    // Re-derive the type from the (possibly capped) cluster count.
     let new_fat_bits = if is_fat32 {
         32
     } else if new_clusters < 4085 {
@@ -3699,14 +3911,22 @@ pub fn resize_fat_in_place(
     } else {
         16
     };
-    if new_fat_bits != fat_bits {
+    if new_fat_bits != fat_bits || new_clusters > max_clusters_for_width {
+        // Still not representable at this width. Growth was handled above, so
+        // this is the shrink direction: the cluster count fell *below* this
+        // width's floor, which by the standard rule makes it a narrower type.
+        // Capping doesn't help there - the nearest representable size is
+        // *larger* than what was asked for, and a filesystem bigger than the
+        // partition holding it is worse than one that simply didn't shrink.
         log_cb(&format!(
-            "FAT resize: type would change from FAT{} to FAT{}, updating BPB only",
-            fat_bits, new_fat_bits,
+            "Warning: FAT resize: {} sectors declined - {} clusters makes this a FAT{} \
+             volume by the usual rule, not FAT{}. Converting the width means rewriting \
+             every FAT entry, which this in-place resize does not do, and writing the new \
+             size without it would leave a volume whose BPB and FAT disagree. Leaving it \
+             at {} sectors",
+            requested_total, new_clusters, new_fat_bits, fat_bits, old_total,
         ));
-        patch_bpb_total_sectors(&mut bpb, new_total_sectors, ts16);
-        write_bpb(file, partition_offset, &bpb, is_fat32, bytes_per_sector)?;
-        return Ok(true);
+        return Ok(false);
     }
 
     let growing = new_total_sectors > old_total;
@@ -4460,6 +4680,20 @@ pub fn compute_fat_blank_layout_with_sector_size(
     size_bytes: u64,
     bytes_per_sector: u32,
 ) -> Result<FatBlankLayout> {
+    compute_fat_blank_layout_forced(size_bytes, bytes_per_sector, false)
+}
+
+/// Like [`compute_fat_blank_layout_with_sector_size`], but can be told to emit
+/// FAT32 whatever the capacity.
+///
+/// Needed because an EFI System Partition is FAT32 and typically 100-512 MiB:
+/// firmware wants the FAT32 BPB, and size-based selection would hand back
+/// FAT16 for every ESP anyone actually builds.
+pub fn compute_fat_blank_layout_forced(
+    size_bytes: u64,
+    bytes_per_sector: u32,
+    force_fat32: bool,
+) -> Result<FatBlankLayout> {
     if size_bytes < 64 * 1024 {
         return Err(anyhow::anyhow!(
             "FAT volume must be at least 64 KiB, got {size_bytes}"
@@ -4513,11 +4747,25 @@ pub fn compute_fat_blank_layout_with_sector_size(
         }
     };
 
-    // --- FAT32: capacity above 2 GiB. Distinct BPB shape (32 reserved sectors,
-    //     no fixed root directory, FSInfo + backup boot). ---
-    if size_bytes > 2u64 * 1024 * 1024 * 1024 {
+    // --- FAT32: capacity above 2 GiB, or asked for outright. Distinct BPB
+    //     shape (32 reserved sectors, no fixed root directory, FSInfo + backup
+    //     boot). ---
+    //
+    // Size alone cannot decide this. An EFI System Partition is FAT32 and is
+    // routinely 100-512 MiB, so "big enough for FAT32" and "must be FAT32" are
+    // different questions - firmware wants the FAT32 BPB regardless of how
+    // little the partition holds. Without `force_fat32` the only way to get a
+    // FAT32 volume out of this formatter was to ask for more than 2 GiB of it.
+    if force_fat32 || size_bytes > 2u64 * 1024 * 1024 * 1024 {
+        // Smallest cluster the size allows, so a small volume still clears the
+        // spec's 65525-cluster FAT32 floor: 512-byte clusters reach it from
+        // ~32 MiB up. Below that the volume is under-clustered for the letter
+        // of the spec, which mkfs.vfat also permits and which `open` reads back
+        // correctly - it takes the type from the BPB before the cluster count,
+        // exactly for these.
         let spc: u32 = match size_bytes {
-            0..=8_589_934_592 => 8,
+            0..=2_147_483_648 => 1,
+            2_147_483_649..=8_589_934_592 => 8,
             8_589_934_593..=17_179_869_184 => 16,
             17_179_869_185..=34_359_738_368 => 32,
             _ => 64,
@@ -4711,6 +4959,19 @@ pub fn write_blank_fat_metadata_to_sink<W: std::io::Write + std::io::Seek>(
 
 pub fn create_blank_fat(size_bytes: u64, label: Option<&str>) -> Result<Vec<u8>> {
     create_blank_fat_with_sector_size(size_bytes, 512, label)
+}
+
+/// Format a blank **FAT32** volume regardless of capacity.
+///
+/// [`create_blank_fat`] picks the type from the size and so only reaches FAT32
+/// above 2 GiB, which cannot express an EFI System Partition - FAT32, and
+/// usually 100-512 MiB.
+pub fn create_blank_fat32(size_bytes: u64, label: Option<&str>) -> Result<Vec<u8>> {
+    let layout = compute_fat_blank_layout_forced(size_bytes, 512, true)?;
+    let mut img = vec![0u8; layout.image_size() as usize];
+    let mut cur = std::io::Cursor::new(&mut img);
+    write_blank_fat_metadata_to_sink(&mut cur, &layout, label)?;
+    Ok(img)
 }
 
 /// Like [`create_blank_fat`], but lets the caller choose the logical
@@ -5689,5 +5950,252 @@ mod tests {
         );
         // Should generate a different SFN (with ~N tail)
         assert_ne!(sfn1, sfn2);
+    }
+
+    /// Read the BPB's effective total-sector count (small field, else large).
+    fn bpb_total_sectors(img: &[u8]) -> u32 {
+        let small = u16::from_le_bytes([img[19], img[20]]) as u32;
+        if small != 0 {
+            small
+        } else {
+            u32::from_le_bytes([img[32], img[33], img[34], img[35]])
+        }
+    }
+
+    /// The read-only / hidden / system / archive bits must be settable and
+    /// must survive a re-read, and the structural bits must not be reachable
+    /// from a caller.
+    #[test]
+    fn dos_attributes_can_be_set_and_read_back() {
+        use crate::fs::filesystem::EditableFilesystem;
+
+        let img = create_blank_fat(1024 * 1024, Some("ATTRS")).expect("blank");
+        let mut fs = FatFilesystem::open(std::io::Cursor::new(img), 0).expect("open");
+        let root = fs.root().expect("root");
+        let mut data = std::io::Cursor::new(b"x".to_vec());
+        fs.create_file(&root, "A.TXT", &mut data, 1, &CreateFileOptions::default())
+            .expect("create");
+
+        let find = |fs: &mut FatFilesystem<std::io::Cursor<Vec<u8>>>| {
+            let root = fs.root().unwrap();
+            fs.list_directory(&root)
+                .unwrap()
+                .into_iter()
+                .find(|e| e.name.eq_ignore_ascii_case("A.TXT"))
+                .expect("entry")
+        };
+
+        // Read-only + hidden + system.
+        let e = find(&mut fs);
+        let root = fs.root().unwrap();
+        fs.set_dos_attributes(&root, &e, 0x07).expect("set attrs");
+        let e = find(&mut fs);
+        assert_eq!(
+            e.dos_attributes.map(|a| a & 0x07),
+            Some(0x07),
+            "read-only + hidden + system should have stuck"
+        );
+
+        // Clearing works too - an attribute editor that can only add is not an
+        // editor.
+        let root = fs.root().unwrap();
+        fs.set_dos_attributes(&root, &e, 0x20).expect("clear attrs");
+        let e = find(&mut fs);
+        assert_eq!(e.dos_attributes.map(|a| a & 0x07), Some(0x00));
+
+        // The directory bit is structural: a caller must not be able to set it
+        // and turn a file into something the tree walker will follow.
+        let root = fs.root().unwrap();
+        fs.set_dos_attributes(&root, &e, 0x10).expect("masked");
+        let e = find(&mut fs);
+        assert_eq!(
+            e.dos_attributes.map(|a| a & 0x10),
+            Some(0x00),
+            "the directory bit must be masked off"
+        );
+        assert!(!e.is_directory(), "and the entry must still be a file");
+
+        // The volume still reads cleanly afterwards.
+        let root = fs.root().unwrap();
+        fs.list_directory(&root).expect("directory still lists");
+    }
+
+    /// Growing a volume past what its FAT width can address grows it as far as
+    /// the width *can* describe, and says so - it must never write the size it
+    /// was asked for.
+    ///
+    /// The old code patched the total-sector count whenever the type "would
+    /// change" and reported success, leaving a filesystem that claimed the
+    /// whole target while its FAT still described the original, smaller one.
+    /// It was reachable from an ordinary restore - an 800 KB FAT12 floppy onto
+    /// a 40 MB target - and the damage only surfaced on the first directory
+    /// read, long after the restore said it had succeeded.
+    #[test]
+    fn resize_caps_growth_at_what_the_fat_width_can_address() {
+        // 800 KB FAT12, as `new floppy fat` produces.
+        let img = create_blank_fat(819_200, Some("SMALL")).expect("blank fat12");
+        let old_total = bpb_total_sectors(&img);
+        let mut buf = img.clone();
+        buf.resize(40 * 1024 * 1024, 0); // the oversized target to grow into
+        let mut cursor = std::io::Cursor::new(buf);
+
+        // Ask for 40 MB worth of sectors. At 1 sector per cluster that leaves
+        // 81425 data clusters, far past FAT12's 4084 ceiling.
+        let mut log = Vec::new();
+        let resized = resize_fat_in_place(&mut cursor, 0, 81_920, &mut |m| log.push(m.to_string()))
+            .expect("resize call");
+
+        assert!(resized, "a capped growth still resizes: {log:?}");
+        let after = cursor.into_inner();
+        let new_total = bpb_total_sectors(&after);
+        assert!(
+            new_total > old_total,
+            "should have grown past {old_total}, got {new_total}"
+        );
+        assert!(
+            new_total < 81_920,
+            "must not write the requested size ({new_total} sectors)"
+        );
+        assert!(
+            log.iter()
+                .any(|m| m.starts_with("Warning:") && m.contains("past what FAT12 can address")),
+            "should warn that the request was capped: {log:?}"
+        );
+
+        // The capped size must still be a FAT12 volume by the standard rule -
+        // that is the whole point of stopping where we did.
+        let mut fs = FatFilesystem::open(std::io::Cursor::new(after), 0).expect("still opens");
+        assert_eq!(fs.fat_type, FatType::Fat12, "must still be FAT12");
+        assert!(
+            fs.total_clusters <= 4084,
+            "capped at {} clusters, past FAT12's 4084 ceiling",
+            fs.total_clusters
+        );
+        let root = fs.root().expect("root");
+        fs.list_directory(&root).expect("root still lists");
+    }
+
+    /// The same ceiling one width up. The FAT12/16 rule can never compute 32 for
+    /// a non-FAT32 volume, so a FAT16 grown past 65524 clusters compared equal
+    /// to itself and went straight through the guard - the identical
+    /// corruption, just needing a larger target to reach.
+    #[test]
+    fn resize_caps_growth_of_a_fat16_at_its_ceiling() {
+        // 64 MB is comfortably FAT16.
+        let img = create_blank_fat(64 * 1024 * 1024, Some("MID")).expect("blank fat16");
+        let old_total = bpb_total_sectors(&img);
+        let spc = img[0x0D] as u32;
+        // Enough sectors that even at this cluster size the count clears 65524.
+        let huge_sectors = 70_000u32.saturating_mul(spc).saturating_add(1_000);
+        let mut buf = img.clone();
+        buf.resize(huge_sectors as usize * 512, 0);
+        let mut cursor = std::io::Cursor::new(buf);
+
+        let mut log = Vec::new();
+        let resized = resize_fat_in_place(&mut cursor, 0, huge_sectors, &mut |m| {
+            log.push(m.to_string())
+        })
+        .expect("resize call");
+
+        assert!(resized, "a capped growth still resizes: {log:?}");
+        let after = cursor.into_inner();
+        let new_total = bpb_total_sectors(&after);
+        assert!(
+            new_total > old_total && new_total < huge_sectors,
+            "{new_total}"
+        );
+        assert!(
+            log.iter()
+                .any(|m| m.starts_with("Warning:") && m.contains("past what FAT16 can address")),
+            "should warn that the request was capped: {log:?}"
+        );
+
+        let mut fs = FatFilesystem::open(std::io::Cursor::new(after), 0).expect("still opens");
+        assert_eq!(fs.fat_type, FatType::Fat16, "must still be FAT16");
+        assert!(
+            fs.total_clusters <= 65524,
+            "capped at {} clusters, past FAT16's 65524 ceiling",
+            fs.total_clusters
+        );
+        let root = fs.root().expect("root");
+        fs.list_directory(&root).expect("root still lists");
+    }
+
+    /// The cap must land on the largest size the width can describe, not merely
+    /// on *a* smaller one - "you get the maximum" is the promise.
+    #[test]
+    fn resize_cap_lands_on_the_largest_representable_size() {
+        let img = create_blank_fat(819_200, Some("SMALL")).expect("blank fat12");
+        let mut buf = img.clone();
+        buf.resize(40 * 1024 * 1024, 0);
+        let mut cursor = std::io::Cursor::new(buf);
+        resize_fat_in_place(&mut cursor, 0, 81_920, &mut |_| {}).expect("resize call");
+        let capped = bpb_total_sectors(&cursor.into_inner());
+
+        // One sector more must not fit: growing the original to capped+1 has to
+        // land on the same capped total, proving nothing was left on the table.
+        let img2 = create_blank_fat(819_200, Some("SMALL")).expect("blank fat12");
+        let mut buf2 = img2;
+        buf2.resize(40 * 1024 * 1024, 0);
+        let mut cursor2 = std::io::Cursor::new(buf2);
+        resize_fat_in_place(&mut cursor2, 0, capped + 1, &mut |_| {}).expect("resize call");
+        assert_eq!(
+            bpb_total_sectors(&cursor2.into_inner()),
+            capped,
+            "asking for one sector more should still cap at the same maximum"
+        );
+    }
+
+    /// The refusal must be narrow: a growth the width *can* represent still has
+    /// to work, or the fix would trade a corruption bug for a silent no-op.
+    #[test]
+    fn resize_still_grows_within_the_same_fat_width() {
+        let img = create_blank_fat(819_200, Some("SMALL")).expect("blank fat12");
+        let mut buf = img.clone();
+        buf.resize(2 * 1024 * 1024, 0); // room to grow into
+        let mut cursor = std::io::Cursor::new(buf);
+
+        let mut log = Vec::new();
+        let resized = resize_fat_in_place(&mut cursor, 0, 3_000, &mut |m| log.push(m.to_string()))
+            .expect("resize call");
+
+        assert!(resized, "a representable growth should proceed: {log:?}");
+        let mut fs =
+            FatFilesystem::open(std::io::Cursor::new(cursor.into_inner()), 0).expect("opens");
+        let root = fs.root().expect("root");
+        fs.list_directory(&root).expect("lists");
+    }
+
+    /// The reported minimum has to be big enough to hold the image compaction
+    /// actually produces, because that number is what a restore targets.
+    ///
+    /// `CompactFatReader` floors FAT16 at 4085+16 clusters so the packed volume
+    /// isn't re-read as FAT12; `defragmented_minimum_size` did not, so a
+    /// lightly-used FAT16 volume advertised a minimum of ~18 KB while
+    /// compaction emitted ~8 MB. The gap surfaced as a restore-at-minimum that
+    /// refused to run at all ("size is smaller than minimum") in the GUI and
+    /// TUI, both of which prefer `defragmented_min_size_bytes`.
+    #[test]
+    fn defragmented_minimum_can_hold_what_compaction_emits() {
+        for size in [16 * 1024 * 1024u64, 64 * 1024 * 1024, 512 * 1024 * 1024] {
+            let img = create_blank_fat(size, Some("MID")).expect("blank fat");
+
+            let mut fs = FatFilesystem::open(std::io::Cursor::new(img.clone()), 0).expect("opens");
+            let fat_type = fs.fat_type;
+            let reported = fs
+                .defragmented_minimum_size()
+                .expect("defragmented minimum");
+
+            let (_reader, info) =
+                CompactFatReader::new(std::io::Cursor::new(img), 0).expect("compact reader");
+
+            assert!(
+                reported >= info.compacted_size,
+                "{size}-byte {fat_type:?} volume: reported minimum {reported} is smaller \
+                 than the {} bytes compaction emits - a restore at Minimum would size the \
+                 partition too small to hold its own image",
+                info.compacted_size,
+            );
+        }
     }
 }

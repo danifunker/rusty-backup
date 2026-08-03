@@ -837,7 +837,8 @@ pub fn create_ntfs<W: Write + Seek>(
             0x03, // in use | directory
             &geo,
             &[
-                resident_attr(0x10, "", &std_info(sys_flags, 0), 0, false),
+                // The root is what every created file inherits from, so it needs a real id.
+                resident_attr(0x10, "", &std_info(sys_flags, SECURITY_ID), 0, false),
                 resident_attr(
                     0x30,
                     "",
@@ -1024,6 +1025,8 @@ pub fn create_ntfs<W: Write + Seek>(
     for c in 0..end_meta {
         bm[(c / 8) as usize] |= 1 << (c % 8);
     }
+    // The last cluster holds the backup boot sector; keep the allocator off it.
+    bm[((tc - 1) / 8) as usize] |= 1 << ((tc - 1) % 8);
     for c in tc..(bm.len() as u64 * 8) {
         bm[(c / 8) as usize] |= 1 << (c % 8);
     }

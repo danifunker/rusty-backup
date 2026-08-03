@@ -1,361 +1,558 @@
 # Native rb-cli for Mac OS X 10.3 / 10.4 / 10.5 (PowerPC)
 
-Status: **IN PROGRESS.** The mrustc toolchain is up and the engine has been
-pushed through it far enough to map the real obstacles. Scope is deliberately
-limited to `rb-cli`; the GUI is a separate question (see the end). See
-[`build-ppc-mrustc.md`](build-ppc-mrustc.md) for the runnable build.
+Status: **IN PROGRESS - the hard part is done.** The Rust standard library builds
+for `powerpc-apple-darwin` and runs on real hardware, so the engine can target
+real `std` and the `no_std` carve-out this plan was originally built around is
+off the table. Scope is deliberately limited to `rb-cli`; the GUI is a separate
+question (see the end). See [`build-ppc-mrustc.md`](build-ppc-mrustc.md) for the
+runnable build.
 
-## Where this stands (2026-07-25)
+## Where this stands (2026-07-27)
 
-**Toolchain proven.** mrustc builds and runs (both an arm Mac and an x86_64
-Linux box, `m900`). It transpiles Rust to C99; `powerpc-apple-darwin` is a
-built-in target. The x86_64-linux host is mrustc's best-supported target and is
-our current proxy while the PPC libc is unbuilt.
+**The Rust standard library builds and runs on PowerPC.** `core`, `alloc`, `std`,
+`panic_unwind`, `panic_abort`, `test`, `libc`, `hashbrown`, `compiler_builtins`
+and `std_detect` all transpile for `powerpc-apple-darwin`, compile to PowerPC
+Mach-O, and link into a binary that executes on a Power Mac G5 under Leopard
+10.5.8. This was the top risk in section 3 and section 10, and it is retired.
 
-**Two mrustc source fixes landed.** (1) TOML parser: nested arrays / inline
-tables / full escape set — **merged upstream** (thepowersgang/mrustc). (2) A
-`CallPath` typecheck revisit — partial; see below.
+**The two-machine pipeline is automatic.** There is no usable
+`powerpc-apple-darwin` cross-gcc, so
+[`scripts/ppc-cc-remote.py`](../scripts/ppc-cc-remote.py) *is* the C compiler as
+far as mrustc is concerned: it ships each emitted `.c` to the Mac over ssh, runs
+MacPorts gcc 10.5.0 there, and copies the `.o` back. minicargo's dependency
+graph, parallelism and incremental rebuilds keep working across both machines.
+libcore's 29.7 MB of C compiles on the G5 in ~104 seconds.
 
-**The engine transpiles far but hits a *diverse long tail* of mrustc gaps.**
-Across ~45 of 240 crates we hit ~6 distinct issues plus target-specific noise:
-- `bumpalo` (const-generic infer) — dropped via a zip feature deviation.
-- `constant_time_eq` (aarch64 `asm!`) — a *host* artifact; x86_64 handles it.
-- `crc` (const-generic `Digest::new`) — worked around with a turbofish patch;
-  mrustc genuinely can't infer const-generic impl params from context.
-- `jiff-core` (const-generic) — dropped by pinning env_logger to 0.10.
-- `libyml` (macro-expansion gap) — YAML output; needs a feature-gate.
-- `libc` 0.2.189 (`linux::can` path-res) — a *host* artifact (Linux-only code).
+**Eight fixes were needed**, all recorded in
+[`build-ppc-mrustc.md`](build-ppc-mrustc.md) and committed to the mrustc fork's
+`rb-cli-vintage-build` branch: four mrustc compiler fixes (an over-strict
+integer-literal-suffix lexer that made libcore unbuildable for every `powerpc*`
+target; two missing const-eval intrinsics reached only on 32-bit targets; union
+alignment being left to the C compiler), one target-descriptor fix (declaring
+64-bit atomics, which libatomic provides, plus `-l atomic`), one minicargo knob,
+and two rustc-stdlib patches (macOS-only code that assumed x86 or assumed
+libdispatch). Several are not PowerPC-specific and are candidate upstream PRs.
 
-**The load-bearing finding: the pain splits by layer.** The **portable engine**
-(fs drivers, partition, backup/restore, formats) is tractable with per-crate
-workarounds. The **platform layer** (`os/`, `libc`, `nix`, `objc2`) is where
-most of the pain lives, it is *target-specific* (nix + libc-linux on the x64
-host; objc2 on ppc-darwin), and per §5 it is **hand-C in the PPC shell anyway**.
-So the right scope-down is to transpile the portable engine and **exclude
-`os/`** (which drops libc/nix from the graph) — this is exactly §5's
-architecture, and it is **not** FAT-only (every filesystem stays). The first PPC
-`rb-cli` operates on disk-image files; raw-device I/O is the later hand-C shell.
+**The libc premise was wrong, in a good way.** This plan said a
+`powerpc-apple-darwin` libc arch file "must be created". In fact `libc`'s
+`unix/bsd/apple/b32` module is arch-agnostic and **compiles for this target
+unchanged**, and `target_arch = "powerpc"` even selects the right symbol variants
+by accident (the `$UNIX2003` / `$INODE64` overrides are gated on
+`target_arch = "x86"`, and 10.4 has none of those symbols). What is wrong is
+struct *layout*: libc's `apple` module describes modern macOS.
 
-**The libc port (for the real PPC target) is fully sourceable.** A real PowerPC
-Mac (Power Mac G5, Leopard 10.5.8) on the LAN carries the **MacOSX10.4u SDK**
-(plus 10.3.9 / 10.2.8) and **native `gcc-4.0.1` / `gcc-4.2.1`** (`powerpc-apple-
-darwin9`). That means the reliable method is available: compile `sizeof` /
-`offsetof` / `alignof` probes **on real PPC** against the 10.4u SDK to generate a
-byte-correct `libc` `powerpc-apple-darwin` arch file (big-endian layout is where
-you otherwise get silently-wrong offsets). No off-the-shelf Rust libc port
-exists to lift (the `libc` crate postdates PPC Macs; rust-ppc-tiger has none),
-so it must be *created* — but the ground truth is on hand.
+**How wrong is now measured, not guessed.**
+[`scripts/ppc-libc-probe.py`](../scripts/ppc-libc-probe.py) compiles
+`sizeof`/`alignof`/`offsetof` probes on the real G5 against the real SDKs, and
+[`scripts/ppc-libc-compare.py`](../scripts/ppc-libc-compare.py) diffs the result
+against libc's Rust declarations. Ground truth for 10.4u and 10.5 is checked in
+under `rb-cli-ppc/probe/`.
 
-**Revised direction:** (B-then-C) trim `rb-cli-ppc` to the portable engine
-(exclude `os/`, drop the mrustc-hostile utility deps), get *that* transpiling on
-the x64 host, then build the `powerpc-apple-darwin` libc from the G5's 10.4u SDK
-to move onto real hardware and add the platform layer back as hand-C.
+On **10.5, 86 structs match exactly, 6 differ only in field naming, and 8 are
+genuinely wrong** - `statfs`, `passwd`, `ipc_perm`, `semid_ds`, `shmid_ds`,
+`rt_metrics`, `malloc_zone_t`, `vnode_info`. `stat` and `dirent` are *correct*,
+confirmed end to end: a PowerPC binary reports `/etc/hosts` at 236 bytes with the
+right mode/ino/uid/gid/nlink/mtime/blocks/dev and counts `/usr/lib` at 390
+entries, both matching `stat -f` on the machine.
 
-> **§3 was materially corrected on 2026-07-23** against the mrustc source. Two
-> claims that shaped this plan — that PPC needs the rustc 1.54 baseline, and that
-> proc macros are a hard stop — turned out to be wrong. The single-`no_std`-core
-> architecture in §5 was a consequence of those claims, so **read §3 before
-> treating §5 as settled.**
+**Tiger is the real gap, and it is a symbol problem before a layout one.** 10.4's
+libSystem exports **zero** `$INODE64` symbols, so a binary linked as today's is
+cannot even launch there - the dynamic linker fails on `_stat$INODE64` before
+`main`. A `powerpc-apple-darwin` arch file has to bind the plain symbols and
+declare 10.4's legacy structs (`stat` 96 bytes with a 4-byte `st_ino`, `statfs`
+272, `dirent` 264 - all measured). `_Unwind_GetIPInfo` is likewise absent from
+`libgcc_s.10.4`.
+
+**The alignment model is now measured rather than inferred.** Darwin/PowerPC's
+"power" alignment ABI (a struct's alignment follows its first member; later
+members are capped to 4) disagrees with Rust's `repr(C)` rule, and mrustc has to
+model it because it delegates layout to the C compiler. Getting that model right
+turned out to hinge on a detail the summary hides: gcc applies the cap to
+*natural* alignment only, skipping any member whose alignment was requested
+explicitly, and that exemption propagates outward through arrays and enclosing
+aggregates. mrustc creates such alignment itself, too, by pinning every union's
+alignment with an attribute. Three mrustc bugs came out of that, all fixed and
+all verified against gcc 10.5 on the G5 with
+[`scripts/ppc-layout-probe.py`](../scripts/ppc-layout-probe.py), which reads
+gcc's real `sizeof`/`__alignof__` out of its own diagnostics rather than guessing.
+See "The alignment problem" in the build doc.
+
+**One wart is still open.** The power rule applies to Rust's own types, where a
+field can land at an offset its own `align_of` rejects -
+`std::thread::Inner`'s `ThreadId` is the case, and `ptr::write`'s
+`assert_unsafe_precondition!` then aborts every program inside `std::rt::init`.
+The stdlib is built with `MINICARGO_NO_DEBUG_ASSERTIONS=1`; the generated C is
+correct, only the assertion disagrees. Restricting the rule to `repr(C)` was
+tried and fails differently.
+
+**The engine build runs, and the blockers have changed character.** Both things
+this plan predicted needed *engine* changes, and both are done:
+
+- ~~`libyml` - the known `TOK_RWORD_AS` macro-expansion gap~~ **done**: YAML output
+  sits behind a default-on `yaml` feature that this build leaves off, so
+  `serde_yml`/`libyml` leave the dependency graph. Verified: `libyml` no longer
+  appears in the build at all.
+- ~~`libc` 0.2.189 built for the host - `new::linux::can::j1939`~~ **done**: a
+  manifest pin drops the `nix 0.31` dependency whose `libc >= 0.2.186` requirement
+  dragged in a post-`src/new/` libc. The build uses 0.2.155, which predates it.
+
+**The tail is done: all 380 crates compile**, the engine included. It ran to
+twenty-four mrustc fixes plus a handful of manifest and vendored-source
+workarounds, and - as this plan expected - almost every one was small and local.
+Notably **`src/` was never modified**; the two engine-side scope-downs above
+(`yaml`, `os-stub`) remain the only concessions the shared code has made.
+
+The last few blockers changed character again, away from layout/ABI and toward
+proc-macro and macro-expansion support (attribute macros on traits, the
+plugin-side lexer, hygiene of forwarded tokens). Only the final `rb-cli` link
+remains.
+
+**Revised direction:** land the final link, then smoke-test `rb-cli` on 10.5. Tiger is a separate, well-scoped follow-up
+(phase 5). The `os/` platform layer stays out and remains hand-C, as section 5
+describes.
+
+> **Sections 1-12 were rewritten on 2026-07-25** against the working build. The
+> `no_std` carve-out, the FAT-only filesystem scope and the hand-C ABI boundary
+> that earlier revisions were organised around are all **gone** - they existed to
+> dodge a libstd port that turned out to work. Anything describing them is
+> historical and is marked as such.
 
 ## 1. Goal
 
-Ship a native PowerPC `rb-cli` that runs on Mac OS X Panther (10.3), Tiger
-(10.4), and Leopard (10.5), **single-sourcing the engine logic from the existing
-Rust** instead of hand-porting it to C a second time.
+Ship a native PowerPC `rb-cli` that runs on Mac OS X Tiger (10.4) and Leopard
+(10.5), **single-sourcing the engine logic from the existing Rust** instead of
+hand-porting it to C a second time.
 
 We already have a hand-written C port in [`ppc-tiger/`](../ppc-tiger/) that works
 (verified on a dual-G4 running 10.4.11). This plan is the *next evolution* of
-that port: replace the hand-C engine with a **Rust core transpiled to C via
-[mrustc](https://github.com/thepowersgang/mrustc)**, so the bug-prone kernels
-(partition parsing, FAT compaction remap, checksums) stop drifting from the
-desktop build. The platform shell stays hand-written C.
+that port: replace the hand-C engine with **the real engine, transpiled to C via
+[mrustc](https://github.com/thepowersgang/mrustc)**, so the whole thing - not
+just the bug-prone kernels - stops drifting from the desktop build. Only the
+platform layer (`os/`: device enumeration, raw disk IO) stays hand-written C.
 
 This is a rewrite of *how the engine gets there*, not of what the CLI does.
 
+**On 10.3 (Panther):** earlier revisions listed it alongside 10.4 and 10.5.
+Treat it as aspirational rather than targeted. Everything is currently built and
+run on 10.5, 10.4 is a scoped follow-up with measured ground truth (section 8,
+phase 5), and nothing has been checked against Panther at all - it predates even
+the `$UNIX2003` conformance symbols, and MacPorts gcc10 does not target it. The
+hand-C `ppc-tiger/` port remains the answer there.
+
 ## 2. Why C at all (recap)
 
-Modern rustc/LLVM dropped `powerpc-apple-darwin` years ago — you cannot
+Modern rustc/LLVM dropped `powerpc-apple-darwin` years ago - you cannot
 `--target` your way onto these machines. The escape hatch is to emit **C99** and
 compile it with a PPC-Darwin C toolchain. mrustc's default backend emits exactly
-that C, and **`powerpc-apple-darwin` is a built-in mrustc target** (confirmed at
-`src/trans/target.cpp:632` in the local clone `/Users/dani/repos/mrustc`).
+that C, and **`powerpc-apple-darwin` is a built-in mrustc target**
+(`src/trans/target.cpp`, `ARCH_POWERPC` / `CodegenMode::Gnu11`).
 
-**Toolchain gotcha — NOT stock gcc-4.0.** mrustc-emitted C requires
-`<stdatomic.h>` (C11). Stock Tiger/Xcode-2.x `gcc-4.0` does **not** have it, so
-the mrustc path needs **MacPorts gcc + MacportsLegacySupport**, not the system
-compiler. (The hand-C `ppc-tiger/` port uses stock `gcc-4.0.1`; the mrustc path
-cannot.) `@catap` maintains a working MacPorts port of this exact chain — proof
-the toolchain works end-to-end.
+**Toolchain - NOT stock gcc-4.0.** mrustc-emitted C requires `<stdatomic.h>`
+(C11). Stock Tiger/Xcode gcc-4.0 and Leopard's gcc-4.2 do not have it. The build
+box therefore uses **MacPorts gcc 10.5.0**, which on the G5 lives at
+`/opt/local/libexec/gcc10-bootstrap/bin/gcc` (`powerpc-apple-darwin9`) - note
+that path, not `/opt/local/bin/gcc-mp-10`; MacPorts is only partly extracted
+there and `port` itself is not installed. gcc10 also supplies `libatomic` and
+emulated TLS, both of which are load-bearing. **MacportsLegacySupport**
+(`/opt/local/lib`) backfills `pthread_setname_np` and friends.
 
-## 3. The version problem (and the discipline it forces)
+This is all confirmed working, not projected: libcore's 29.7 MB of emitted C
+compiles on the G5 in ~104 seconds, and the resulting binaries run.
 
-> **Corrected 2026-07-23** by reading the local mrustc clone
-> (`/Users/dani/repos/mrustc`) directly, instead of the second-hand summary this
-> section previously rested on. **Two load-bearing claims here were wrong** — they
-> are what pushed this plan toward a 1.54 / edition-2018 `no_std` core. Both
-> corrections are inline below.
+## 3. The version problem (resolved)
 
-We build on **rustc 1.96, edition 2021**. mrustc's own README states its
-baselines:
+> This section drove the whole original plan toward a 1.54 / edition-2018
+> `no_std` core. Every claim that pushed it there has since been checked and
+> found wrong. The corrections are kept because they are the reason the plan
+> changed shape twice.
 
-- **1.90.0** — currently tested to *fully bootstrap*, binary-equal against
-  1.91.1. This is upstream's headline version.
-- **1.19.0 / 1.29.0 / 1.39.0 / 1.54.0 / 1.74.0** — also supported, "might still
-  bootstrap (assuming the right environment)".
-- mrustc's default `rust-version` is **1.29.0**, and the tree ships
-  `rustc-1.74.0-{src.patch,overrides.toml}` and `rustc-1.90.0-*` next to the
-  older ones.
+We build on **rustc 1.96, edition 2021**; mrustc bootstraps from the **1.74.0**
+source, and that is what the PowerPC target uses.
 
-**CORRECTION 1 — the version wall is far lower than previously written here.**
+**CORRECTION 1 (2026-07-23) - the version wall is far lower than first written.**
 The earlier revision claimed "1.54 safest, 1.74 partial, 1.90+ actively broken on
-PPC" and concluded the core must target the **1.54 language subset**. That table
-reflects `@catap`'s older PPC-Darwin experience, not upstream mrustc today.
-**1.74 is a supported baseline** — and it is one minor version above
+PPC" and concluded the core must target the **1.54 language subset**. That
+reflected older second-hand PPC-Darwin experience, not upstream mrustc. **1.74 is
+a supported baseline** - one minor version above
 [`rb-cli-vintage/`](../rb-cli-vintage/), which already compiles the *entire shared
-engine* at **rustc 1.73 / edition 2021**. That is a vastly smaller gap than
-edition 2018.
+engine* at rustc 1.73 / edition 2021.
 
-For scale, here is what the abandoned 1.54 plan would have cost, measured across
-`src/` (340k lines, 406 files): **1,530** inline-format-arg sites (1.58), **450**
-`let … else` (1.65), **355** `div_ceil` (1.73), **22** `is_some_and` (1.70), plus
-dropping the whole tree to edition 2018. Library gaps are shimmable —
-[`src/rust173_compat.rs`](../src/rust173_compat.rs) already does exactly that for
-1.87's `is_multiple_of` — but **syntax and edition gaps are not**. Do not go down
-this path.
+For scale, the abandoned 1.54 plan would have cost, across `src/` (340k lines,
+406 files): **1,530** inline-format-arg sites (1.58), **450** `let ... else`
+(1.65), **355** `div_ceil` (1.73), **22** `is_some_and` (1.70), plus dropping the
+tree to edition 2018. Library gaps are shimmable -
+[`src/rust173_compat.rs`](../src/rust173_compat.rs) already does that for 1.87's
+`is_multiple_of` - but **syntax and edition gaps are not**. Do not go down this
+path.
 
-**CORRECTION 2 — proc macros are NOT a hard stop.** The earlier revision stated
-"Proc macros are a hard stop" and used it to justify never transpiling the app.
-mrustc implements them: `src/expand/proc_macro.cpp` is **2,094 lines** (it builds
-the macro crate for the host and drives it over a token-stream pipe). The 108
+**CORRECTION 2 (2026-07-23) - proc macros are NOT a hard stop.** mrustc
+implements them (`src/expand/proc_macro.cpp`, 2,094 lines: it builds the macro
+crate for the host and drives it over a token-stream pipe). The 108
 `Serialize`/`Deserialize` derives, 93 `clap` derives and 4 `thiserror` in this
-tree are therefore not automatically fatal.
+tree are not fatal. Confirmed in practice - the PowerPC engine build gets 93
+crates deep, derives and all.
 
-### The gap that actually matters: libstd for `powerpc-apple-darwin`
+**CORRECTION 3 (2026-07-25) - libstd for `powerpc-apple-darwin` works.** This was
+the last remaining blocker and the one the `no_std` core existed to dodge. It is
+true that PowerPC-Darwin is not on mrustc's CI-tested libstd list, and that a
+target descriptor is the cheap part. But the port turned out to be eight fixes,
+not a project: see "Where this stands" above. `core`, `alloc`, `std`,
+`panic_unwind`, `panic_abort`, `test` and `libc` all build and run.
 
-mrustc's README lists its **CI-tested libstd targets**: x86-64 Linux GNU and
-x86-64 Windows MSVC, with x86-64 / arm64 macOS as secondary.
-**PowerPC-Darwin is not on that list.**
+### What survives from this section
 
-The *target spec* exists and is well-formed — `src/trans/target.cpp:632` defines
-`powerpc-apple-darwin` as `ARCH_POWERPC`, `CodegenMode::Gnu11`, with
-`m_emulated_i128 = true` (set for 32-bit PPC; clear on the `powerpc64-apple-darwin`
-entry directly below it). But a target descriptor is the cheap part. A working
-`std` — libc bindings, threads, filesystem, process — on Mach-O/PPC is the
-project, and nobody upstream validates it.
+Two constraints, both still real:
 
-Ordered blockers, then:
-
-1. **libstd on `powerpc-apple-darwin`** — untested upstream. This is the real
-   work, and it is precisely what `no_std` was proposed to dodge.
-2. **A PPC-Darwin C toolchain** — MacPorts gcc + MacportsLegacySupport, not stock
-   `gcc-4.0.1` (see §2).
-3. **`-sys` crates** — `zstd-sys` compiles real C for the target, so it inherits
-   blocker 2. Note that `rb-cli-vintage`'s feature set
-   (`native-zstd,remote,tui`) already excludes `chd`: **libchdman is C++**, which
-   mrustc cannot help with at all.
-
-### What this means for the plan below
-
-The `no_std` core in §5 is **no longer forced** by proc macros. It may still be
-the right shape — it sidesteps blocker 1, the expensive one — but it is now a
-*choice*, and the alternative deserves a fair hearing: point mrustc at rustc-1.74
-and try to build `rb-cli-vintage` roughly as-is.
-
-**Cheapest next experiment**, and it costs no changes to this repo: build mrustc,
-point it at the 1.74 source, and try `--target powerpc-apple-darwin` on a
-hello-world. That answers the single unknown which decides between the two
-shapes. If libstd collapses immediately, the `no_std` core is vindicated; if it
-survives, the whole `no_std` restructuring may be unnecessary.
+1. **C++ dependencies are a hard stop.** `libchdman-rs` is C++; mrustc cannot
+   help. Any transpiled configuration must leave `chd` off, as
+   `rb-cli-vintage`'s feature set already does.
+2. **`-sys` crates compile real C for the target**, so they inherit the C
+   toolchain. `zstd-sys` is the one in our graph; it has not been reached yet
+   (the build stops earlier), so treat it as unproven.
 
 ## 4. Target scope
 
-### In scope — the MVP command set (proven by the hand-C port)
+> **Rewritten 2026-07-25.** Earlier revisions scoped this to five verbs and
+> FAT12/16/32 only. That was a consequence of the `no_std` carve-out - hand-porting
+> filesystem kernels one at a time is expensive, so you pick one. With real `std`
+> there is no carve-out and no per-driver cost, so the scope is now "the engine,
+> minus what genuinely cannot cross".
 
-| Command | Notes |
+### In scope - the portable engine
+
+Everything `rb-cli-vintage` builds: **every filesystem driver**, partition tables
+(MBR / GPT / APM / RDB), backup, restore, inspect, browse-view editing, fsck,
+the image builders, the ratatui TUI. These are ordinary Rust over byte buffers
+and they transpile like any other crate.
+
+### Out of scope - and why
+
+| Excluded | Reason |
 |---|---|
-| `list-devices` | enumerate disks (platform C: `rdisk`, ioctl, `statfs`) |
-| `backup` | MBR/EBR/APM + superfloppy; FAT compaction; gzip; crc32/sha1 |
-| `restore` | reconstruct disk from backup dir; handles `.gz` |
-| `inspect` | read `metadata.json`, print partition summary |
-| `rip` | optical disc -> `.iso` |
+| `src/os/` (device enumeration, raw disk IO, elevation) | `objc2-*` targets modern macOS frameworks; `nix` is Linux-only. This is the platform layer, and it is hand-C on PowerPC (section 5). Excluding it also drops `libc`/`nix` from the graph, which removes a current build blocker. |
+| `chd` / `libchdman-rs` | C++. mrustc cannot help, at all, ever. |
+| The egui GUI | eframe/wgpu will not transpile and would not run on 10.3-10.5 GPUs anyway (section 12). |
+| YAML output (`serde_yml` -> `libyml`) | An mrustc macro-expansion gap (`TOK_RWORD_AS`). Gated out via the default-on `yaml` feature, which `rb-cli-ppc` leaves off; JSON carries the identical schema. |
 
-### Filesystem scope — **FAT12/16/32 only**
+The first PowerPC `rb-cli` therefore operates on **disk-image files**.
+Raw-device IO arrives with the hand-C platform shell, not before.
 
-The vintage CF/SD use case is DOS/Win9x, which is FAT. The desktop build has ~70
-fs drivers; **none of the others come across.** FAT compaction (skip
-unallocated clusters, remap cluster chains, patch BPB/dir entries) is the one
-filesystem kernel worth single-sourcing — it is subtle and has bitten us before
-(the FAT-below-4085-cluster truncation bug). Everything non-FAT is a
-sector-by-sector raw copy.
+### Dependency deviations
 
-### Explicitly OUT of scope
-
-The other ~42 rb-cli verbs and their machinery: `fsck` (all filesystems),
-`archive`/`sit`/`binhex`, `serve`/remote, optical authoring, `expand`/`grow`/
-`shrink`/`resize`/`repack`, `bless`/`make-bootable`, `convert`, all the
-`new-*` image builders, browse-view editing (`ls`/`cp`/`rm`/`put`/`get`), CHD
-(libchdman is a C++ dep we will not transpile), zstd. If a later phase wants one,
-it gets added deliberately, not by default.
+`rb-cli-ppc/Cargo.toml` is a third top-level package (sibling of
+`rb-cli-vintage`) that reuses `../src` but carries the deviations mrustc forces,
+so `rb-cli-vintage` stays pristine for the x86_64-10.7 / Win7 builds. Each is
+documented at its site; the current set is `zip`'s deflate backend (drops
+`zopfli` -> `bumpalo`), `env_logger` pinned to 0.10 (drops `jiff`), and a
+turbofish patch applied to vendored `crc`. See
+[`build-ppc-mrustc.md`](build-ppc-mrustc.md).
 
 ## 5. Architecture
 
-> **Conditional on §3.** This shape was chosen when proc macros looked like a
-> hard stop and 1.54 looked mandatory. Neither holds. It remains a reasonable
-> design *if* mrustc's `powerpc-apple-darwin` libstd proves unusable — which is
-> the experiment §3 ends with. If libstd works, transpiling `rb-cli-vintage`
-> largely as-is is the cheaper route and this whole section is moot.
+> **Rewritten 2026-07-25.** The previous version of this section described a
+> `#![no_std]` `rusty-backup-core` crate exposing a C ABI to a hand-written C
+> shell, with `metadata.json` hand-emitted in the core and no serde. That design
+> existed solely because libstd for this target was assumed unusable. It is not,
+> so none of it is needed. It is recorded in git history if the assumption ever
+> reverses.
 
 ```
-rusty-backup-core     (#![no_std] + alloc, 1.74 subset, deps ~= none)
-        |   mrustc -> C99 -> gcc-4.0.1
-        |   exposes a stable C ABI (extern "C")
+    ../src  (the shared engine, unchanged, real std, edition 2021)
+        |
+        |  rb-cli-ppc/Cargo.toml  -- same engine, mrustc-forced dep deviations
+        |
         v
-+-------------------------------+
-| hand-written C platform shell |
-|   - argv parsing              |
-|   - device enumeration/IO     |  <- ppc-tiger/rust_cli_real.c territory
-|   - file IO, gzip (zlib)      |
-|   - sha1/crc32 (CommonCrypto) |
-|   - malloc GlobalAlloc bridge |  <- ppc-tiger/malloc_wrapper.c
-+-------------------------------+
+    mrustc --target powerpc-apple-darwin  -->  C99
+        |
+        |  scripts/ppc-cc-remote.py  (stands in as the C compiler, over ssh)
         v
-   rb-cli-ppc  (~single Mach-O, PPC)
+    gcc 10.5.0 on the PowerPC Mac  -->  PowerPC Mach-O
+        |
+        +-- linked against: libSystem, libatomic, MacportsLegacySupport,
+        |                   libgcc_s.1, rb-cli-ppc/shim/ppc-compat.o
+        v
+    rb-cli  (PowerPC, operates on disk images)
+
+    [later] hand-written C platform shell for os/: device enumeration,
+            raw disk IO, elevation -- reusing ppc-tiger/
 ```
 
-### The C ABI boundary
+**The engine is not modified for PowerPC.** That is the point of the whole
+exercise: a desktop bug-fix in a filesystem driver propagates for free. The only
+PowerPC-specific code in this repo is build tooling
+([`scripts/`](../scripts/)), the dependency manifest
+([`rb-cli-ppc/Cargo.toml`](../rb-cli-ppc/Cargo.toml)), and one small C file of
+libc/libm stand-ins
+([`rb-cli-ppc/shim/ppc-compat.c`](../rb-cli-ppc/shim/ppc-compat.c)).
 
-The core is pure computation over buffers. It does **no I/O itself** — the C
-shell reads bytes, hands slices to the core, and writes what the core returns.
-Rough surface (to be firmed up):
+### The platform boundary
 
-- `partition table parse`: `(bytes, len) -> parsed layout struct`
-- `fat compaction plan`: `(fat region bytes, bpb) -> {clusters to copy, remap
-  table, patched BPB/dir bytes}` — the C side then streams only those clusters
-- `metadata emit`: core produces the `metadata.json` byte buffer (we hand-roll
-  JSON in the core — no serde)
-- `checksum`: prefer delegating crc32/sha1 to CommonCrypto in C; only vendor a
-  no_std impl if we want it single-sourced
+The split is no longer "pure computation vs I/O" - the engine does its own file
+I/O through `std::fs`, which works. The split is now just **`os/`**: enumerating
+physical disks, opening `/dev/rdiskN`, unmounting, asking for elevation. That
+is a small, genuinely platform-specific surface, it is what `ppc-tiger/` already
+implements in C, and it is the natural seam.
 
-Progress/streaming stays entirely on the C side (loops over sectors, calls the
-core per-region). No callbacks needed for the CLI — this matters more for a
-future GUI.
+## 6. What actually has to change
 
-## 6. Coupling audit (what actually has to change)
+> **Rewritten 2026-07-25.** The previous coupling audit catalogued what it would
+> take to make `partition/` and `fs/fat.rs` `no_std`-clean (strip `std::io`
+> bounds, swap `HashMap` for `BTreeMap`, drop serde and `thiserror`). None of
+> that is needed now; `std`, serde, `thiserror` and `HashMap` all work.
 
-Findings from the current tree:
+The remaining work is not in the engine's logic at all. It is:
 
-- **`partition/mbr.rs`, `apm.rs`** — already parse `&[u8; 512]` / `&[u8]`
-  slices. Nearly no_std-ready. The one hostile spot is `parse_ebr_chain(reader:
-  &mut (impl Read + Seek))` — replace the `std::io` bound with a local minimal
-  `trait ByteSource { fn read_at(off, buf) }` or just pre-read the EBR sectors on
-  the C side and pass slices.
-- **`fs/fat.rs`** — uses `std::collections::HashMap`/`HashSet` (swap to
-  `alloc::collections::BTreeMap`/`BTreeSet` or vendor `hashbrown`) and
-  `std::io::{Read,Seek,Write}` (replace with slice-based API). `VecDeque`,
-  `Vec`, `String` are all in `alloc` — fine.
-- **serde** — 23 files derive `Serialize`. The core cannot use it. `metadata.json`
-  is hand-emitted in the core (ppc-tiger already hand-writes this exact format in
-  C, so there is a reference).
-- **`error.rs`** — `thiserror` (proc macro) won't transpile; the core uses a
-  plain `enum` + hand-written `Display`, or returns integer codes across the ABI.
-- Everything under `os/`, `backup/` orchestration, `restore/`, `device.rs` is
-  I/O-bound and **stays in the C shell**, not the core.
+1. ~~**A feature gate that excludes `os/`**~~ **Done, as a platform-leaf swap.**
+   The measured surface turned out to be small enough that replacing all of `os/`
+   was unnecessary: `os/mod.rs`'s `SectorAlignedReader`/`Writer`, `TempFileGuard`,
+   `ElevatedSource`, `DeviceWriteHandle` and `get_file_size` are already portable
+   Rust, and `wakelock` already ships a no-op arm. Only `os/macos.rs` is hostile
+   (IOKit/DiskArbitration via `objc2`, ~50 `libc` calls), and only **9** of its
+   items are referenced. So the `os-stub` feature swaps just that file for
+   `os/macos_stub.rs` via `#[path]`, leaving the portable trunk and all 51 call
+   sites untouched. `objc2-*` leaves the graph.
 
-The core crate is therefore a *carve-out*, mostly of `partition/` (the pure
-parts) + `fs/fat.rs` (compaction math), rewritten to no_std. Estimated core
-surface: low thousands of LOC, not the 285k of the full tree.
+   Note the diagnosis this corrected: the host-`libc` abort was **not** caused by
+   `os/`. It came from `cc`/`jobserver`, the build-dependencies of `bzip2-sys` and
+   `zstd-sys`, and `libc` cannot leave this build's graph at all - it is used
+   outside `os/` by `remote/service.rs`, `cli/verbs/tui_app.rs` and
+   (macOS-gated) `fs/resource_fork.rs`. The fix was a manifest pin: `nix 0.31` is
+   declared linux-only and never compiled for this target, but a target-agnostic
+   lockfile let its `libc >= 0.2.186` requirement drag in `src/new/`, which mrustc
+   cannot resolve through its glob re-export. Dropping that dep pins libc to
+   0.2.155, which predates `src/new/` entirely.
+2. ~~**A feature gate that excludes YAML output**, for the `libyml` macro gap.~~
+   **Done.** `yaml` is a default-on feature; `rb-cli-ppc` leaves it off, which
+   drops `serde_yml`/`libyml` from the graph, hides `yaml` from `--format`, and
+   leaves JSON carrying the identical schema. The `Yaml` enum variant stays (so
+   the verbs' `Json | Yaml` match arms are untouched) and is marked
+   `#[value(skip)]` when the feature is off.
+3. **The hand-C platform shell**, later, once there is a working image-only
+   `rb-cli` to attach it to.
+
+Items 1 and 2 are the only changes that touch `src/`, and both are additive
+feature gates rather than rewrites - consistent with keeping the shared engine
+single-sourced. Item 2 landed as four lines of `#[cfg]` in two files plus the
+manifests, which is the shape to aim for with item 1.
 
 ## 7. Build pipeline
 
-1. `cargo` (host, 1.96) builds `rusty-backup-core` normally as a lib for CI
-   testing — it must compile and pass unit tests on the desktop too.
-2. mrustc (local clone at `/Users/dani/repos/mrustc`, pinned build) transpiles
-   `rusty-backup-core` + `core`/`alloc` to C, targeting `powerpc-apple-darwin`.
-3. Transfer the emitted C + the hand-written shell C to a Tiger box (or a
-   `powerpc-apple-darwin8` cross-toolchain if we can stand one up).
-4. **MacPorts gcc + MacportsLegacySupport** (NOT stock `gcc-4.0` — mrustc's C
-   needs C11 `<stdatomic.h>`) compiles + links against zlib + CommonCrypto.
-   `@catap`'s MacPorts port is the reference for getting this toolchain up.
-5. Output: `rb-cli-ppc` Mach-O. Reuse `ppc-tiger/build.sh` as a starting point
-   for the shell's build, adjusting the compiler from stock gcc to MacPorts gcc.
+Fully automated across two machines; see
+[`build-ppc-mrustc.md`](build-ppc-mrustc.md) for the runnable commands.
 
-Open: whether to run mrustc on-device or cross. ppc-tiger built on-device; a
-cross-mrustc + cross-gcc pipeline on the Mac dev box would be far nicer for
-iteration but is more setup.
+```sh
+export PPC_HOST=admin@<the PowerPC Mac>
+scripts/build-ppc.sh ppclibs    # PowerPC core/alloc/std/panic_unwind/test/libc
+scripts/build-ppc.sh ppc        # PowerPC rb-cli
+scripts/build-ppc.sh probe      # re-capture libc ground truth from the SDKs
+```
+
+The "cross vs on-device" question earlier revisions left open is **settled: both,
+automatically.** mrustc runs on the fast machine; `scripts/ppc-cc-remote.py` is
+registered as `CC_powerpc_apple_darwin`, so every codegen step ships its `.c`
+over ssh, compiles it with gcc10 on the Mac, and copies the `.o` back. minicargo's
+dependency graph, parallelism and incremental rebuilds all keep working across
+the boundary, and there is no manual "scp the output and compile it by hand"
+step. The wrapper also owns the platform link line and builds the shim.
 
 ## 8. Phased plan
 
-- **Phase 0 — spike.** Build the local mrustc (`/Users/dani/repos/mrustc`) with
-  the `powerpc-apple-darwin` target, pin the exact rustc baseline (start 1.54)
-  and core-crate edition, transpile a trivial `no_std` crate with one function,
-  compile the emitted C with **MacPorts gcc + MacportsLegacySupport**, run on
-  Tiger. Proves the toolchain (including the `<stdatomic.h>`/C11 hurdle)
-  end-to-end before touching real code. **Go/no-go gate.**
-- **Phase 1 — core crate skeleton.** Create `rusty-backup-core` (`no_std` +
-  `alloc`, malloc allocator). Move MBR/APM/EBR parsing in, strip `std::io`.
-  Unit-tested on host at 1.96 *and* transpiled+run on Tiger. Deliverable:
-  `inspect` of a raw MBR image works natively via the core.
-- **Phase 2 — FAT compaction kernel.** Port `fs/fat.rs` compaction math into the
-  core (BTreeMap, slice API). Deliverable: `backup` with FAT compaction produces
-  a byte-identical plan to the desktop build (differential test against the Rust
-  original).
-- **Phase 3 — metadata + backup/restore round-trip.** Hand-roll `metadata.json`
-  emit in the core; wire the C shell's backup/restore loops to the core.
-  Deliverable: backup -> restore -> checksum match on Tiger, matching the desktop
-  metadata format.
-- **Phase 4 — parity pass.** `list-devices`, `rip`, gzip, crc32/sha1 wired
-  through (mostly reused from the existing ppc-tiger C). Deliverable: the 5-verb
-  MVP at parity with `ppc-tiger/` — but now with the engine single-sourced.
+> **Rewritten 2026-07-25.** Phases 0-4 in earlier revisions were about carving
+> out and validating a `no_std` core, kernel by kernel. That work is moot.
 
-Each phase is independently shippable and reverts cleanly to the hand-C port if
-we stop.
+**Phase 0 - toolchain spike. DONE.** mrustc builds, targets
+`powerpc-apple-darwin`, and its emitted C compiles with gcc10 on the G5. The
+`<stdatomic.h>` / C11 hurdle is cleared. This was the go/no-go gate and it is
+green.
 
-## 9. Decision gate — is this worth doing?
+**Phase 1 - PowerPC standard library. DONE.** `core`, `alloc`, `std`,
+`panic_unwind`, `panic_abort`, `test`, `libc`, `hashbrown`, `compiler_builtins`,
+`std_detect` - 20 PowerPC Mach-O objects. Verified by running a binary on the G5
+that exercises `println!`, `BTreeMap`, iterators, `AtomicU64`, threads,
+`fs::metadata` and `read_dir`, with the filesystem results checked field-by-field
+against `stat -f` on the machine. Cost: eight fixes (see "Where this stands").
 
-The hand-C `ppc-tiger/` port already works. This effort only pays off if:
+**Phase 2 - finish the engine transpile.** *(DONE - all 380 crates compile and
+`rb-cli` links; the engine is compiled as 4 split objects, see the branch-limit
+section of `build-ppc-mrustc.md`)* Both scope-downs from
+section 6 have landed - YAML is feature-gated out and `os-stub` replaces the macOS
+platform leaf - and the host-`libc` blocker is fixed by a manifest pin. The
+blockers met since are all mrustc bugs, each small and local, and each fixed on
+`rb-cli-vintage-build`:
 
-- The **engine kernels churn** on the desktop (partition/FAT logic changes) and
-  we're tired of re-porting them by hand, **and**
-- We value **single provenance** for the subtle bits (FAT compaction remap,
-  cluster-floor edge cases) so a desktop bug-fix propagates to PPC for free.
+- **The alignment model** (three bugs). The "power" ABI's member-alignment cap
+  applies to *natural* alignment only; gcc exempts anything explicitly aligned, and
+  that exemption propagates outward - including from the alignment attributes
+  mrustc itself puts on unions. Separately, a niche enum took its size and
+  alignment from variant layouts computed before the tag was added. Between them
+  these accounted for `lzfse_rust`'s `FseCore` / `LzfseDecoder` /
+  `LzfseRingDecoder`, `Result<u64, Error>` and `BTreeMap`'s `LeafNode`.
 
-If the FAT/partition logic is effectively frozen, **keep the hand-C port** —
-mrustc setup + no_std carve-out is real work for little marginal gain. The
-tie-breaker is Phase 0: if standing up mrustc is painful, that alone argues for
-staying hand-C.
+  The previous revision of this plan said the guesswork loop was not converging and
+  that a proper harness was needed. That harness is
+  [`scripts/ppc-layout-probe.py`](../scripts/ppc-layout-probe.py): it never links,
+  it reads gcc's real `sizeof`/`__alignof__` out of its own diagnostics, and it
+  settled the question in one run. Every rule above is measured, not inferred - and
+  one of them (an `aligned(2)` member permanently exempting its enclosing struct
+  from a 4-byte cap) is counter-intuitive enough that guessing would have got it
+  wrong.
+- **Two parser bugs**, both reached through `bitflags` 2.13 and neither
+  PowerPC-specific: an interpolated associated `const` in an `impl` hit a `TODO`,
+  and attributes written in front of an interpolated item were dropped, so a
+  `#[cfg]` that should have removed an item did nothing.
+- **One target-description bug**: every `*-apple-darwin` target declared
+  `target_env = "gnu"`, cfg'ing glibc-only code *in* on a platform with no glibc.
+- **The `-sys` crates**, which are a different kind of problem: they do not just
+  transpile, they compile a C source tree *for the target* through cc-rs. That
+  needed the remote-cc wrapper to mirror `-I` directories rather than only named
+  files, and a second wrapper standing in as `AR_powerpc_apple_darwin`, because
+  the host `ar` writes a System V symbol table where Apple's linker wants a
+  Mach-O `__.SYMDEF`. `bzip2-sys` now builds and archives on the G5.
+- **A minicargo cross-build bug**: a build script's generated sources went to the
+  `host/` output directory while the crate that consumed them was told to read
+  the target one. Invisible on a native build, where the two are the same path.
+- **Two lifetime bugs**, both a lifetime index outside a param list that was
+  never populated - a trait's own lifetime used from a default method body
+  (`radix_trie`), and the higher-ranked form one binder in (`compact_str`).
+- **One const-eval crash with no diagnostic at all** (`quote`): an uninstalled
+  `std::function` called while evaluating a const-generic argument, surfacing
+  only as "terminated with signal 6".
 
-> **The payoff changes if libstd works (§3).** This gate was written assuming the
-> only option was carving out a `no_std` core — i.e. paying real effort to
-> single-source just the FAT/partition kernels, which is a thin prize when that
-> logic is stable. If mrustc's `powerpc-apple-darwin` libstd turns out usable,
-> the prize is not two kernels but **the whole of `rb-cli-vintage`** — every
-> filesystem driver, every verb — with no carve-out at all. That is a
-> categorically better deal, and it is why the hello-world experiment should run
-> before this gate is answered.
+Not every blocker is worth a compiler fix. Three buckets, in increasing cost: a
+feature or version change in `rb-cli-ppc/Cargo.toml`, a `patch_*_vendor` rewrite
+on the vendored source, or mrustc itself. The third invalidates every crate
+already built (minicargo rebuilds against the compiler's timestamp) and costs a
+full rebuild, so while the frontier is still moving the first two are preferred
+and mrustc work is batched. `radix_trie`, `zmij` and `zerocopy` left the graph
+this way, each for a feature or version the engine never wanted.
+
+Deliverable met: **every crate in the PowerPC configuration transpiles and
+compiles**, including the engine itself. Two things showed up only at the very
+end, and both are properties of the shape of this build rather than bugs:
+
+- **The engine is one 797 MB translation unit.** mrustc emits one `.c` per crate
+  and offers no way to split it. A 32-bit `cc1` runs out of *address space*
+  compiling that at `-O1`; it needs `-O0` plus aggressive GC tuning, which yields
+  an 81 MB object in ~70 minutes. Swap is irrelevant - Darwin grows it on demand
+  and a 32-bit process still cannot address past ~3.5 GB. The engine is therefore
+  built **unoptimised** for now.
+- **Anything that dirties the engine costs hours.** That makes the dependency
+  graph, and minicargo's cache invalidation, worth thinking about before running
+  a command. Two separate three-hour rebuilds were bought here: one by deleting a
+  43 KB stale artifact instead of running the codegen script mrustc had already
+  emitted next to it, and one by taking the first `APP_VERSION` stamp on an
+  already-built tree.
+
+Both are written up in `build-ppc-mrustc.md`.
+
+**Phase 3 - link and smoke-test on 10.5.** *(largely done)* `rb-cli` links and
+runs natively on Leopard. Against the same images, `inspect`, `ls` and `fsck`
+produce **output identical to the desktop build**, and a `backup --format zstd
+--checksum sha256` produces an **identical sha256 and a byte-identical payload**
+- `metadata.json` differs only in its `created` timestamp. One real portability
+bug surfaced and is fixed: `File::try_clone` uses `F_DUPFD_CLOEXEC`, which
+Leopard does not have (see the shim entry in `build-ppc-mrustc.md`).
+
+Two more real bugs came out of first contact with the binary, and both are
+fixed:
+
+- **`rb-cli tui` could not start** - "Failed to initialize input reader". Not a
+  crossterm bug: Darwin 9 cannot watch a character device with *either* `poll`
+  or `kqueue`, `select` being the only primitive that works on a terminal. The
+  fix is a `poll`-on-`select` entry in the shim plus crossterm's `use-dev-tty`
+  source. Measured and written up in `build-ppc-mrustc.md`; the TUI now renders
+  and takes keys on 10.5. This also un-breaks rustyline, which waits the same way.
+- **`rb-cli inspect /dev/disk0` aborted** with "capacity overflow" after minutes
+  of I/O. An engine bug, not a PowerPC one: `fs::resource_fork.rs`'s MacBinary
+  probe read whatever path it was handed in full, so a raw device was slurped
+  until the `Vec` passed `isize::MAX` - which 32-bit PowerPC reaches at 2 GB.
+  Every platform was paying it (a 1 GiB image cost 1 GiB of RSS to `inspect`);
+  the 128-byte header gate that fixes it took `inspect /dev/disk1` on the G5
+  from **6.35 s to 0.11 s**.
+
+Re-verified after those fixes, desktop vs PowerPC on the same FAT and HFS
+images: `inspect` / `ls` / `fsck` outputs **identical** for both, and a
+`backup --format zstd --checksum sha256` whose payload and `.sha256` sidecar are
+**byte-identical**, `metadata.json` differing only in `created`.
+
+What is left here is breadth rather than depth: `restore`, Amiga filesystems,
+and a CHD backup. `scripts/` has no smoke-test driver checked in yet - the
+comparison is still run ad hoc.
+
+**Phase 4 - the hand-C platform shell.** Reattach `os/` as C: device enumeration,
+`/dev/rdiskN`, unmount, elevation, reusing `ppc-tiger/`. Deliverable:
+`list-devices` and backing up a physical CF card.
+
+**Phase 5 - Tiger (10.4).** A `powerpc-apple-darwin` `libc` arch file that binds
+the plain (non-`$INODE64`) symbols and declares 10.4's legacy `stat` (96 bytes),
+`statfs` (272) and `dirent` (264) - all measured and checked in under
+`rb-cli-ppc/probe/`. Also resolve `_Unwind_GetIPInfo`, absent from
+`libgcc_s.10.4`: either gcc10's own unwinder or `panic=abort`. Deliverable: the
+same binary running on `/Volumes/MacOS TigerLNX`.
+
+**Phase 6 - clean-up and upstreaming.** The alignment wart (section 10), the
+cosmetic `STD_ENV_ARCH` bug, and PRs for the mrustc fixes that are not
+PowerPC-specific.
+
+Phases 2-4 are independently useful; 5 is the one that satisfies the original
+10.4 goal. Nothing here removes the hand-C `ppc-tiger/` port, which still works.
+
+## 9. Decision gate - answered
+
+Earlier revisions ended with a real question: the hand-C `ppc-tiger/` port
+already works, so is this worth doing? The gate was written assuming the prize
+was single-sourcing *two kernels* (partition parsing and FAT compaction) at the
+cost of a `no_std` carve-out - a thin prize when that logic is stable.
+
+**That is no longer the trade.** With libstd working, the prize is the **whole
+engine** - every filesystem driver, every verb - with no carve-out and no
+engine-side rewrite. The earlier text called that "a categorically better deal",
+and it is now the actual situation rather than a hypothetical.
+
+The gate is therefore closed in favour of continuing. The remaining cost is
+build-tooling work and a per-crate mrustc tail, not a parallel implementation to
+maintain.
 
 ## 10. Risks / open questions
 
-- **libstd for `powerpc-apple-darwin` — the top risk, and previously understated
-  here.** mrustc's README lists its CI-tested libstd targets (x86-64 Linux /
-  Windows, secondary x86-64 + arm64 macOS); **PPC-Darwin is absent.** The target
-  spec at `src/trans/target.cpp:632` is well-formed, but that is the descriptor,
-  not a std port. The earlier text called Darwin output "lower risk than it
-  looks" on the grounds that `@catap`'s MacPorts port runs mrustc-emitted C on
-  PPC — note that establishes the *C toolchain* works, which is blocker 2, and
-  says nothing about whether libstd builds and runs for this target. Settle this
-  first (§3's hello-world experiment); everything else is downstream of it.
-- **Language baseline** in whatever we transpile. Against the **1.74** baseline
-  (not 1.54 — see §3) `partition/` + `fat.rs` are old-school byte code and
-  almost certainly fine; `rb-cli-vintage` already builds the whole engine at
-  1.73. Inventory only if the `no_std` core route is actually taken.
-- **C++ dependencies are a genuine hard stop** (unlike proc macros, which are
-  not). `libchdman-rs` is C++; mrustc cannot help. Any transpiled configuration
-  must leave `chd` off, as `rb-cli-vintage`'s feature set already does.
-- **Cross vs on-device build** ergonomics (Section 7).
-- **HashMap iteration-order** differences if we swap to BTreeMap could change
-  output byte-for-byte — must be checked in the Phase 2 differential test.
-- **Allocator pressure** — no_std + malloc bridge on a G3 with limited RAM;
-  keep the streaming block model, never buffer a whole partition.
+- **The "power" alignment wart - the one real design problem.** Darwin/PowerPC
+  gives a struct the alignment of its *first* member, so an 8-byte member that is
+  not first is only 4-aligned. mrustc models this and must, because it delegates
+  layout to the C compiler and emits `sizeof`/`alignof` static assertions that
+  fail otherwise. But the rule then also applies to Rust's own types, where a
+  field can land at an offset its own `align_of` rejects -
+  `std::thread::Inner`'s `ThreadId` is the concrete case, and `ptr::write`'s
+  `assert_unsafe_precondition!` aborts every program inside `std::rt::init`
+  because of it. Worked around with `MINICARGO_NO_DEBUG_ASSERTIONS=1`; the
+  generated C is correct, only the assertion disagrees. Restricting the rule to
+  `repr(C)` was tried and fails differently. A real fix means mrustc emitting
+  explicit padding plus forced alignment for `repr(Rust)` types instead of
+  delegating - a much larger change. See "The alignment problem" in the build doc.
+- ~~**The per-crate mrustc tail.**~~ Resolved - all 380 crates compile. Every
+  gap was small and local (a turbofish, a feature swap, a dependency pin, or a
+  contained mrustc fix), and the tail ran to roughly a dozen past the 188 that
+  phase 2 started from.
+- ~~**`zstd-sys` is not proven.**~~ Proven: a 937 KB `libzstd.a`, valid Mach-O
+  symbol index, 371 `_ZSTD*` symbols, built natively on the G5 through cc-rs and
+  the remote archiver. `native-zstd` stays; the escape hatch in section 3 is not
+  needed. (`zstd-safe` above it needed one turbofish-class source fix.)
+- **C++ dependencies remain a hard stop.** `chd` stays excluded permanently.
+- **10.4 vs 10.5 is a symbol problem, not just a layout one.** Tiger exports zero
+  `$INODE64` symbols, so today's binaries cannot launch there at all. Phase 5.
+- **Eight libc structs are wrong even on 10.5** - `statfs`, `passwd`, `ipc_perm`,
+  `semid_ds`, `shmid_ds`, `rt_metrics`, `malloc_zone_t`, `vnode_info`. None are on
+  the engine's file paths; `passwd` (`home_dir`) is the one worth doing first.
+- **`std::env::consts::ARCH` reports `x86_64`.** Cosmetic: minicargo.mk sets
+  `STD_ENV_ARCH` from the host triple, overriding the build-script override set.
+  One-line fix, noted so nobody mistakes it for something deeper.
+- **Allocator pressure** on a G3/G4 with limited RAM - keep the streaming block
+  model, never buffer a whole partition. Unchanged from the original plan and
+  still worth watching.
+- ~~libstd for `powerpc-apple-darwin`~~ - resolved, see section 3.
+- ~~Proc macros~~ - resolved, see section 3.
+- ~~Cross vs on-device build ergonomics~~ - resolved, see section 7.
+- ~~HashMap iteration order changing output~~ - moot; `HashMap` is used as-is,
+  there is no `BTreeMap` swap.
 
 ## 11. Prior art / references
 
@@ -366,15 +563,24 @@ staying hand-C.
   reference used to guide the original hand port.
 - [mrustc](https://github.com/thepowersgang/mrustc) — the Rust->C transpiler this
   plan depends on.
-- Desktop engine to carve from: `src/partition/{mbr,apm,mod}.rs`,
-  `src/fs/fat.rs`, `src/backup/`, `src/restore/`.
+- PowerPC build tooling in this repo: [`scripts/build-ppc.sh`](../scripts/build-ppc.sh)
+  (driver), [`scripts/ppc-cc-remote.py`](../scripts/ppc-cc-remote.py) (the remote
+  C compiler), [`scripts/ppc-libc-probe.py`](../scripts/ppc-libc-probe.py) and
+  [`scripts/ppc-libc-compare.py`](../scripts/ppc-libc-compare.py) (libc ground
+  truth), [`rb-cli-ppc/`](../rb-cli-ppc/) (manifest, shim, captured probe data).
 
 ## 12. GUI (out of scope here, noted for later)
 
-The egui GUI does **not** come across — eframe/wgpu won't transpile and wouldn't
-run on 10.3-10.5 GPUs regardless. A native GUI is possible but is a **hand-written
+The egui GUI does **not** come across - eframe/wgpu won't transpile and wouldn't
+run on 10.4/10.5 GPUs regardless. A native GUI is possible but is a **hand-written
 Carbon frontend** (HIToolbox + Navigation Services, as in
-`ppc-tiger/rusty_backup_gui.c`) calling the same core over the C ABI. That's a
-separate plan; the core's ABI should be designed with a progress **callback**
-boundary from day one so the GUI can drive long ops on a worker thread without a
-retrofit.
+`ppc-tiger/rusty_backup_gui.c`) driving the transpiled engine. That's a separate
+plan.
+
+One thing this section used to insist on is now moot: it said the core's ABI
+"should be designed with a progress **callback** boundary from day one so the GUI
+can drive long ops on a worker thread without a retrofit". That was because the
+GUI would have had to reach the `no_std` core through a hand-written C ABI. There
+is no such ABI - a Carbon frontend would link the transpiled engine directly and
+use its ordinary Rust progress interfaces, exactly as the CLI does. Nothing needs
+deciding early.

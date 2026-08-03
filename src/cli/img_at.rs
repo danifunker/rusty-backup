@@ -85,6 +85,27 @@ impl std::str::FromStr for ImageRef {
     }
 }
 
+/// Detect an `@N` suffix on a verb that takes a *whole disk* rather than an
+/// `IMG@N` reference (`inspect`, `partmap`).
+///
+/// Those take a plain path, so a trailing `@2` is read as part of the filename
+/// and the open fails with `No such file or directory` - which describes a
+/// missing file, not a misapplied selector, and reads as "`@N` is broken" to
+/// anyone who has just been told `@N` is how you choose a partition. Returns
+/// `Some((real_path, index))` only when stripping the suffix names a file that
+/// exists, so a filename that genuinely ends in `@2` is left alone.
+pub fn stray_selector(path: &std::path::Path) -> Option<(PathBuf, u32)> {
+    let s = path.to_str()?;
+    let at = s.rfind('@')?;
+    let (prefix, suffix) = s.split_at(at);
+    let n: u32 = suffix[1..].parse().ok()?;
+    if n == 0 || prefix.is_empty() {
+        return None;
+    }
+    let real = PathBuf::from(prefix);
+    real.exists().then_some((real, n))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,6 +163,40 @@ mod tests {
     fn fromstr_works_for_clap() {
         let r: ImageRef = "disk.hda@3".parse().unwrap();
         assert_eq!(r.partition, Some(3));
+    }
+
+    /// The hint fires only when stripping `@N` names something real, so a
+    /// missing file still reports as missing and a filename that genuinely
+    /// ends in `@2` is left alone.
+    #[test]
+    fn stray_selector_only_fires_when_the_stripped_path_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("disk.img");
+        std::fs::write(&img, b"x").unwrap();
+
+        let with_suffix = dir.path().join("disk.img@2");
+        assert_eq!(
+            stray_selector(&with_suffix),
+            Some((img.clone(), 2)),
+            "a selector on an existing image should be recognised"
+        );
+
+        // Nothing to strip to: a plain missing file, report it as such.
+        assert!(stray_selector(&dir.path().join("absent.img@2")).is_none());
+        // No suffix at all.
+        assert!(stray_selector(&img).is_none());
+        // `@0` is not a valid selector, so it is just part of a name.
+        let zero = dir.path().join("disk.img@0");
+        assert!(stray_selector(&zero).is_none());
+
+        // A file whose name really ends in `@2`: opening it must not be
+        // hijacked by the hint.
+        let literal = dir.path().join("weird@2");
+        std::fs::write(&literal, b"x").unwrap();
+        assert!(
+            stray_selector(&literal).is_none(),
+            "`weird` does not exist, so `weird@2` is a filename"
+        );
     }
 
     #[test]

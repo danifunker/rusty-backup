@@ -122,7 +122,6 @@ fn run_expand(
         &output_base,
         new_logical,
         None,
-        None,
         &mut progress_cb,
         &cancel_check,
         &mut log_cb,
@@ -135,7 +134,7 @@ fn run_expand(
                 status,
                 format!("Renaming {} -> {}", tmp_chd_path.display(), path.display(),),
             );
-            std::fs::rename(&tmp_chd_path, path).map_err(|e| {
+            crate::os::replace_file(&tmp_chd_path, path).map_err(|e| {
                 anyhow::anyhow!("failed to replace source CHD with re-encoded copy: {e}")
             })?;
             log(status, "CHD expansion complete.".to_string());

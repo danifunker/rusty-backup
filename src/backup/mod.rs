@@ -324,10 +324,12 @@ impl SourceFactory {
     /// Mint a fresh, independent seekable reader positioned at offset 0.
     fn open(&self) -> Result<Box<dyn crate::rbformats::ReadSeek>> {
         match self {
-            SourceFactory::Local { file, .. } => Ok(Box::new(
+            // A device cannot answer seek(End); carry the length the OS reports instead.
+            SourceFactory::Local { file, path, .. } => Ok(Box::new(crate::os::known_len_reader(
                 file.try_clone()
                     .context("failed to clone local source handle")?,
-            )),
+                path,
+            ))),
             #[cfg(feature = "remote")]
             SourceFactory::Remote {
                 conn,
@@ -386,6 +388,29 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
     run_backup_from(source, config, progress)
 }
 
+/// Reject configurations that cannot produce a restorable backup, before any
+/// work starts. Shared by the GUI and the CLI.
+pub fn validate_backup_config(config: &BackupConfig) -> Result<()> {
+    // A .chd is a self-describing container — header, hunk map, embedded
+    // SHA-1s. Cutting one into byte chunks yields files no CHD tool can open,
+    // so the combination has no valid output rather than a degraded one.
+    if config.split_size_mib.is_some()
+        && matches!(
+            config.compression,
+            CompressionType::Chd | CompressionType::Dvd
+        )
+    {
+        bail!(
+            "--split-size cannot be combined with {} output: a .chd is a single \
+             self-contained container, and chunks of one are not readable by \
+             chdman, MAME or this tool. Drop --split-size, or pick a format \
+             that splits (raw).",
+            config.compression.as_str()
+        );
+    }
+    Ok(())
+}
+
 /// Backup orchestrator parameterised on the byte source. The path-based
 /// [`run_backup`] and (with the `remote` feature) a remote-image source both
 /// funnel here. Runs on a background thread.
@@ -394,6 +419,7 @@ pub fn run_backup_from(
     config: BackupConfig,
     progress: Arc<Mutex<BackupProgress>>,
 ) -> Result<()> {
+    validate_backup_config(&config)?;
     // Build the reader factory: a local backup opens + elevates the path; a
     // remote backup brokers ranged reads over the shared connection.
     let (factory, source_display): (SourceFactory, String) = match source {
@@ -1437,15 +1463,10 @@ fn run_backup_inner(
         let progress_clone = Arc::clone(&progress);
         let base_bytes = overall_bytes_done;
 
-        // Superfloppy: force raw compression to produce a universally compatible
-        // .img file. (Compaction still applies — the compacted stream is what gets
-        // written raw — so a lightly-used volume shrinks to ~its real data size. A
-        // compressed superfloppy output needs restore-path work; see OPEN-WORK.)
-        let effective_compression = if is_superfloppy {
-            CompressionType::None
-        } else {
-            config.compression
-        };
+        // A superfloppy is one partition-shaped member, so every per-partition
+        // codec applies to it unchanged; only the raw output gets the friendlier
+        // .img extension below.
+        let effective_compression = config.compression;
 
         log(
             &progress,
@@ -1871,7 +1892,7 @@ fn run_backup_inner(
         set_progress_bytes(&progress, overall_bytes_done, total_stream_bytes);
 
         // Superfloppy: rename .raw to .img for universally compatible raw image
-        let compressed_files = if is_superfloppy {
+        let compressed_files = if is_superfloppy && effective_compression == CompressionType::None {
             let mut renamed = Vec::new();
             for file_name in &compressed_files {
                 let new_name = file_name.replace(".raw", ".img");
@@ -1990,11 +2011,7 @@ fn run_backup_inner(
         source_size_bytes: source_size,
         partition_table_type: table.type_name().to_string(),
         checksum_type: config.checksum.as_str().to_string(),
-        compression_type: if is_superfloppy {
-            CompressionType::None.as_str().to_string()
-        } else {
-            config.compression.as_str().to_string()
-        },
+        compression_type: config.compression.as_str().to_string(),
         split_size_mib: config.split_size_mib,
         sector_by_sector: config.sector_by_sector,
         layout: BackupLayout::PerPartition,

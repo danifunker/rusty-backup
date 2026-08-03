@@ -19,6 +19,15 @@ Usage: rb-cli [OPTIONS] [COMMAND]
 - `--log-file` — Mirror full trace-level log output to PATH regardless of `--log-level`. Useful on Windows cmd where redirection is awkward
 - `--config` — Path to a config file. Overrides the platform default location. See `rb-cli config path` for what that location is
 
+**A note on `--format yaml`.** The read-only verbs below list `yaml` alongside
+`json` wherever structured output is supported. YAML sits behind the `yaml` build
+feature, which is **on by default** - every released desktop and vintage build has
+it. It is off in exactly one configuration, the PowerPC/mrustc build
+(`rb-cli-ppc`, see [build-ppc-mrustc.md](build-ppc-mrustc.md)), because
+`serde_yml`'s backend cannot be transpiled. Where it is off, `yaml` is absent from
+`--format`'s accepted values and from `--help`; JSON carries the identical schema,
+so a script that must run anywhere should prefer `--format json`.
+
 ## Path grammar (in-image paths)
 
 Verbs that take a path *inside* an image (`ls`, `get`, `get-binhex`, `put`,
@@ -332,7 +341,7 @@ Usage: backup [OPTIONS] <SOURCE> <DEST>
 - `--sector-by-sector` — Skip filesystem-aware compaction; copy every sector verbatim
 - `--defrag` — Defragment FAT partitions: relocate each file's clusters contiguously (boot files first) before imaging. Same output size as ordinary compaction — the restored disk is just defragmented. Non-FAT filesystems are unaffected. (The desktop sibling of cb-dos `/DEFRAG`.)
 - `--partitions` — Per-partition filter — comma-separated 1-based indices to include (e.g. `1,3,4`; `1` is the first partition, matching the `img@N` selector). Default is "all partitions"
-- `--split-size` — Split each output stream after this many MiB (Zstd / Raw only)
+- `--split-size` — Split the output after this many MiB. Raw (`--format raw`) only: a `.chd` is a single self-contained container and refuses to be split, and the compressed codecs currently ignore this
 - `--keep-swap` — Image swap/page files verbatim instead of excluding them. By default a FAT volume's swap/page files (`386SPART.PAR`, `WIN386.SWP`, `PAGEFILE.SYS`, `HIBERFIL.SYS`, `SWAPPER.DAT`) are kept full-size but their content is zeroed (they reinitialize on boot), which the codec crushes; `--keep-swap` images them as-is. (The desktop sibling of cb-dos `/KEEPSWAP`.)
 
 ### `batch`
@@ -472,6 +481,8 @@ Usage: chmeta [OPTIONS] <IMAGE> <PATH>
 
 - `--type` — New 4-character type code
 - `--creator` — New 4-character creator code (HFS / HFS+ only)
+- `--attrs` — DOS attribute bits (FAT / exFAT). Comma-separated flags, each optionally prefixed `+` to set or `-` to clear: `readonly`, `hidden`, `system`, `archive`. Without a prefix the listed set becomes the whole set, so `--attrs readonly,hidden` clears anything else
+- `--protection` — AmigaDOS protection bits (AFFS / PFS3 / SFS), as the letters AmigaDOS itself prints: `hsparwed`. Letters present are set, absent are clear, so `--protection rwed` is the ordinary state and `--protection rwd` marks a file unexecutable
 
 ### `chmod`
 
@@ -626,6 +637,30 @@ Usage: du [OPTIONS] <IMAGE> [PATH]...
 - `--format` — Output format
 - `--password` — Password for encrypted containers / filesystems (see `ls`)
 - `--inside` — For a `.zip` holding more than one disk image, the archive entry to open
+- `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zxplus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
+- `--carve-full` — Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga "NDOS" disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem
+
+### `edit`
+
+Edit a text file inside a filesystem in `$EDITOR`, converting the file's encoding and line endings on the way out and back so the editor never sees (or rewrites) its vintage form
+
+```
+Usage: edit [OPTIONS] <IMAGE> <PATH>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image reference (`path` or `path@N` for the 1-based partition index)
+- `<PATH>` — Path of the text file inside the filesystem
+
+**Options**
+
+- `--editor` — Editor to run. Defaults to `$VISUAL`, then `$EDITOR`, then `vi` (`notepad` on Windows)
+- `--encoding` — Force the file's character encoding instead of inferring it
+- `--force-substitute` — Write a best-effort replacement for characters the file's encoding cannot represent, instead of refusing
+- `--line-endings` — Write the file with these line endings instead of the ones it has
+- `--no-edit` — Convert without opening an editor
+- `--force-binary` — Edit the file as text even if it looks binary. Almost never what you want — a round trip through an editor will not preserve arbitrary bytes
 - `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zxplus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
 - `--carve-full` — Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga "NDOS" disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem
 
@@ -797,7 +832,7 @@ Usage: import [OPTIONS] <IMAGE> <DIR> [DEST]
 
 ### `inspect`
 
-Whole-disk aggregate read-only view (partition table + per-partition summary + CHD metadata when applicable)
+Whole-disk aggregate read-only view (partition table + per-partition summary + CHD metadata when applicable). The `idx` column is the selector: pass it back as `IMG@N`, `--partition N` or `--partitions N`
 
 ```
 Usage: inspect [OPTIONS] <IMAGE>
@@ -963,6 +998,7 @@ Usage: floppy [OPTIONS] <FS> <IMAGE>
 - `--catalog-size` — HFS Catalog B-tree initial size in bytes. Auto when unset
 - `--extents-size` — HFS Extents-overflow B-tree initial size in bytes. Auto when unset
 - `--cpm-preset` — CP/M disk-parameter-block preset (required with `cpm`). One of: amstrad_data, amstrad_sys, amstrad_pcw, einstein, svi328_cpm, altair_8in, altair_cf, multicomp, zxplus3
+- `--fat32` — FAT only: format FAT32 regardless of size. Without this the type comes from the capacity and only reaches FAT32 above 2 GiB, which cannot express an EFI System Partition - FAT32, and usually 100-512 MiB
 
 ### `new hd`
 
@@ -1044,6 +1080,7 @@ Usage: volume [OPTIONS] <FS> <IMAGE>
 - `--extents-size` — HFS Extents-overflow B-tree initial size in bytes. Auto when unset
 - `--case-sensitive` — HFS+ only: format a case-sensitive (HFSX) volume
 - `--min-catalog` — HFS+ only: minimum catalog B-tree size in bytes (a floor)
+- `--fat32` — FAT only: format FAT32 regardless of size. Without this the type is picked from the capacity and only reaches FAT32 above 2 GiB, which cannot express an EFI System Partition - FAT32, and usually 100-512 MiB
 - `--affs-variant` — AFFS variant byte (0=OFS, 1=FFS, 2=OFS+intl, 3=FFS+intl, 4=OFS+dircache, 5=FFS+dircache). Defaults to 1 (FFS)
 - `--inodes` — EFS only: approximate total inode count. Mutually exclusive with `--bytes-per-inode`
 - `--bytes-per-inode` — EFS only: inode density in bytes per inode (smaller = more inodes)
@@ -1402,6 +1439,7 @@ Usage: put [OPTIONS] <IMAGE> [HOST_FILE] [DST]
 - `--type` — 4-character type code (HFS / HFS+ / ProDOS). Falls back to `[put] type` from the config file, then — on HFS / HFS+ / MFS — to the file extension (same list as the GUI's type/creator picker), and finally to `BINA` for names the list doesn't recognize
 - `--creator` — 4-character creator code (HFS / HFS+ only). Falls back to `[put] creator` from the config file, then to the file extension, and finally to `????`
 - `--force` — Overwrite an existing entry at the destination path
+- `--no-preserve-meta` — Give the replacement fresh metadata instead of the replaced file's
 - `--mode` — Unix permission bits for the new file, as octal (e.g. `755`, `0644`). Unix filesystems only (ext / UFS / XFS / EFS / Minix / SquashFS); ignored on FAT / HFS / exFAT, which have no such concept
 - `--uid` — Owner UID for the new file. Unix filesystems only
 - `--gid` — Owning GID for the new file. Unix filesystems only. Same precedence as `--uid`
@@ -1755,6 +1793,7 @@ Usage: put [OPTIONS] <IMAGE> [HOST_FILE] [DST]
 - `--type` — 4-character type code (HFS / HFS+ / ProDOS). Falls back to `[put] type` from the config file, then — on HFS / HFS+ / MFS — to the file extension (same list as the GUI's type/creator picker), and finally to `BINA` for names the list doesn't recognize
 - `--creator` — 4-character creator code (HFS / HFS+ only). Falls back to `[put] creator` from the config file, then to the file extension, and finally to `????`
 - `--force` — Overwrite an existing entry at the destination path
+- `--no-preserve-meta` — Give the replacement fresh metadata instead of the replaced file's
 - `--mode` — Unix permission bits for the new file, as octal (e.g. `755`, `0644`). Unix filesystems only (ext / UFS / XFS / EFS / Minix / SquashFS); ignored on FAT / HFS / exFAT, which have no such concept
 - `--uid` — Owner UID for the new file. Unix filesystems only
 - `--gid` — Owning GID for the new file. Unix filesystems only. Same precedence as `--uid`

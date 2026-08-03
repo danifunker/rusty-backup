@@ -210,19 +210,58 @@ layout-preserving compactor.
 
 ## 3. Filesystem engine — small to medium
 
-### 3.1 Compressed superfloppy output (restore-path fix)
+### 3.1 Compressed superfloppy output — **[RESOLVED]**
 
-Superfloppy (partition-less) volumes now go through compaction — a lightly-used
-raw ext4 `.img` backs up to a smaller **packed** `.img` and restores/grows back
-e2fsck-clean (backup `sizes.rs`, restore already handles it). But the output is
-still forced to raw (`CompressionType::None` in `backup/mod.rs`): honoring an
-explicit `--format zstd|gzip|lz4` for a superfloppy produced a tiny backup
-(64 MiB → ~1.7 KB) that **failed to restore** ("Bad magic number in super-block",
-wrong size) — the per-partition restore path mishandles a compressed superfloppy
-member. Fix the compressed-superfloppy restore, then re-enable honoring the
-compression format for superfloppy (the codec-gating match was reverted; see the
-comment on `effective_compression`). Big win: KB-scale backups of mostly-empty
-raw fs images.
+Superfloppy (partition-less) volumes honour `--format` like any other source:
+`zstd` / `gzip` / `lz4` / `vhd` / `chd` / `raw` all back up and restore. A 64 MiB
+ext4 superfloppy backs up to ~47 KB with zstd and restores byte-identical.
+
+The restore path was never the problem. Backup forced `CompressionType::None`
+*and* recorded `compression_type: "none"` in `metadata.json` unconditionally. The
+force made the lie harmless; the moment the format was honoured, the two
+diverged, and restore — which dispatches on `metadata.compression_type` — fed the
+compressed member to the target verbatim. That is the whole of the reported
+"tiny backup that fails to restore with Bad magic number in super-block".
+
+Metadata now records the codec that was actually written, and the `.raw` -> `.img`
+rename is gated on the output really being raw. `tests/superfloppy_compression.rs`
+pins the invariant: every codec restores byte-identical to the raw restore, and
+metadata names the codec on disk.
+
+Still true, and unchanged by this fix: a superfloppy restore ignores a
+`--target-size` larger than the source and lands the original size. That behaves
+identically for raw and for every codec, so it is a separate gap rather than a
+regression.
+
+### 3.2 Split backups round-trip — **[RESOLVED]**
+
+`--split-size` had two defects, both silent, both fixed:
+
+* **Restore dropped every member but the first.** `reconstruct_disk_from_backup`
+  read only `pm.compressed_files[0]`, so a split backup restored truncated and
+  reported success. Measured before the fix: a 64 MiB ext4 superfloppy at
+  `--format raw --split-size 4` restored all-zero past 4.16 MiB where the source
+  had data to 8.18 MiB, and `fsck.ext4` said "Filesystem still has errors".
+  Restore now reads the members as the one byte stream they were cut from
+  (`MemberChain` in `rbformats/compress.rs`). The same `[0]`-only bug was in the
+  export path (`model/export_runner.rs`) and is fixed with it.
+* **`--split-size` was accepted with `--format chd`, which cannot work.** A
+  `.chd` is a self-contained container — header, hunk map, embedded SHA-1s — so
+  byte-chunks of one are not readable by chdman, MAME, or this tool. The old
+  code split it anyway (and, because chunk 0 landed on the source's own path,
+  truncated the `.chd` mid-read and produced a backup with *no* data files).
+  The combination is now refused up front by `backup::validate_backup_config`,
+  before any work starts, and the CHD splitting code is gone.
+
+`tests/split_backup_roundtrip.rs` covers it: raw splits restore byte-identical,
+a 5 MiB file spanning several 1 MiB members reads back intact through the
+filesystem, and `--format chd --split-size` is refused with an error naming both
+(while an unsplit CHD still round-trips).
+
+Still true: `--split-size` is a no-op for zstd / gzip / lz4 — `SplitWriter` is a
+pass-through, so those codecs always emit one file. Safe (a single member
+restores correctly) but silent. The flag's help now says raw-only; honouring it
+for the compressed codecs, or warning when it is ignored, is open.
 
 ---
 

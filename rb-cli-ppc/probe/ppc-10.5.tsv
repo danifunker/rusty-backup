@@ -1,0 +1,2716 @@
+# arch=ppc sdk=/Developer/SDKs/MacOSX10.5.sdk cc=/usr/bin/gcc-4.0 inode64=True
+S	group	struct group	16	4
+F	group	gr_name	0	4
+F	group	gr_passwd	4	4
+F	group	gr_gid	8	4
+F	group	gr_mem	12	4
+S	utimbuf	struct utimbuf	8	4
+F	utimbuf	actime	0	4
+F	utimbuf	modtime	4	4
+S	timeval	struct timeval	8	4
+F	timeval	tv_sec	0	4
+F	timeval	tv_usec	4	4
+S	timespec	struct timespec	8	4
+F	timespec	tv_sec	0	4
+F	timespec	tv_nsec	4	4
+S	rlimit	struct rlimit	16	8
+F	rlimit	rlim_cur	0	8
+F	rlimit	rlim_max	8	8
+S	rusage	struct rusage	72	4
+F	rusage	ru_utime	0	8
+F	rusage	ru_stime	8	8
+F	rusage	ru_maxrss	16	4
+F	rusage	ru_ixrss	20	4
+F	rusage	ru_idrss	24	4
+F	rusage	ru_isrss	28	4
+F	rusage	ru_minflt	32	4
+F	rusage	ru_majflt	36	4
+F	rusage	ru_nswap	40	4
+F	rusage	ru_inblock	44	4
+F	rusage	ru_oublock	48	4
+F	rusage	ru_msgsnd	52	4
+F	rusage	ru_msgrcv	56	4
+F	rusage	ru_nsignals	60	4
+F	rusage	ru_nvcsw	64	4
+F	rusage	ru_nivcsw	68	4
+S	ipv6_mreq	struct ipv6_mreq	20	4
+F	ipv6_mreq	ipv6mr_multiaddr	0	16
+F	ipv6_mreq	ipv6mr_interface	16	4
+S	hostent	struct hostent	20	4
+F	hostent	h_name	0	4
+F	hostent	h_aliases	4	4
+F	hostent	h_addrtype	8	4
+F	hostent	h_length	12	4
+F	hostent	h_addr_list	16	4
+S	iovec	struct iovec	8	4
+F	iovec	iov_base	0	4
+F	iovec	iov_len	4	4
+S	pollfd	struct pollfd	8	4
+F	pollfd	fd	0	4
+F	pollfd	events	4	2
+F	pollfd	revents	6	2
+S	winsize	struct winsize	8	2
+F	winsize	ws_row	0	2
+F	winsize	ws_col	2	2
+F	winsize	ws_xpixel	4	2
+F	winsize	ws_ypixel	6	2
+S	linger	struct linger	8	4
+F	linger	l_onoff	0	4
+F	linger	l_linger	4	4
+S	itimerval	struct itimerval	16	4
+F	itimerval	it_interval	0	8
+F	itimerval	it_value	8	8
+S	tms	struct tms	16	4
+F	tms	tms_utime	0	4
+F	tms	tms_stime	4	4
+F	tms	tms_cutime	8	4
+F	tms	tms_cstime	12	4
+S	servent	struct servent	16	4
+F	servent	s_name	0	4
+F	servent	s_aliases	4	4
+F	servent	s_port	8	4
+F	servent	s_proto	12	4
+S	protoent	struct protoent	12	4
+F	protoent	p_name	0	4
+F	protoent	p_aliases	4	4
+F	protoent	p_proto	8	4
+S	sockaddr	struct sockaddr	16	1
+F	sockaddr	sa_len	0	1
+F	sockaddr	sa_family	1	1
+F	sockaddr	sa_data	2	14
+S	sockaddr_in6	struct sockaddr_in6	28	4
+F	sockaddr_in6	sin6_len	0	1
+F	sockaddr_in6	sin6_family	1	1
+F	sockaddr_in6	sin6_port	2	2
+F	sockaddr_in6	sin6_flowinfo	4	4
+F	sockaddr_in6	sin6_addr	8	16
+F	sockaddr_in6	sin6_scope_id	24	4
+S	passwd	struct passwd	40	4
+F	passwd	pw_name	0	4
+F	passwd	pw_passwd	4	4
+F	passwd	pw_uid	8	4
+F	passwd	pw_gid	12	4
+F	passwd	pw_change	16	4
+F	passwd	pw_class	20	4
+F	passwd	pw_gecos	24	4
+F	passwd	pw_dir	28	4
+F	passwd	pw_shell	32	4
+F	passwd	pw_expire	36	4
+S	fd_set	struct fd_set	128	4
+F	fd_set	fds_bits	0	128
+F	fd_set	fds_bits	0	128
+S	fd_set	fd_set	128	4
+F	fd_set	fds_bits	0	128
+F	fd_set	fds_bits	0	128
+S	tm	struct tm	44	4
+F	tm	tm_sec	0	4
+F	tm	tm_min	4	4
+F	tm	tm_hour	8	4
+F	tm	tm_mday	12	4
+F	tm	tm_mon	16	4
+F	tm	tm_year	20	4
+F	tm	tm_wday	24	4
+F	tm	tm_yday	28	4
+F	tm	tm_isdst	32	4
+F	tm	tm_gmtoff	36	4
+F	tm	tm_zone	40	4
+S	msghdr	struct msghdr	28	4
+F	msghdr	msg_name	0	4
+F	msghdr	msg_namelen	4	4
+F	msghdr	msg_iov	8	4
+F	msghdr	msg_iovlen	12	4
+F	msghdr	msg_control	16	4
+F	msghdr	msg_controllen	20	4
+F	msghdr	msg_flags	24	4
+S	cmsghdr	struct cmsghdr	12	4
+F	cmsghdr	cmsg_len	0	4
+F	cmsghdr	cmsg_level	4	4
+F	cmsghdr	cmsg_type	8	4
+S	fsid_t	fsid_t	8	4
+S	if_nameindex	struct if_nameindex	8	4
+F	if_nameindex	if_index	0	4
+F	if_nameindex	if_name	4	4
+S	if_nameindex	if_nameindex	1	4
+S	regex_t	regex_t	16	4
+S	regmatch_t	regmatch_t	16	8
+F	regmatch_t	rm_so	0	8
+F	regmatch_t	rm_eo	8	8
+S	sockaddr_un	struct sockaddr_un	106	1
+F	sockaddr_un	sun_len	0	1
+F	sockaddr_un	sun_family	1	1
+F	sockaddr_un	sun_path	2	104
+S	utsname	struct utsname	1280	1
+F	utsname	sysname	0	256
+F	utsname	nodename	256	256
+F	utsname	release	512	256
+F	utsname	version	768	256
+F	utsname	machine	1024	256
+S	ip_mreq	struct ip_mreq	8	4
+F	ip_mreq	imr_multiaddr	0	4
+F	ip_mreq	imr_interface	4	4
+S	aiocb	struct aiocb	48	4
+F	aiocb	aio_fildes	0	4
+F	aiocb	aio_offset	4	8
+F	aiocb	aio_buf	12	4
+F	aiocb	aio_nbytes	16	4
+F	aiocb	aio_reqprio	20	4
+F	aiocb	aio_sigevent	24	20
+F	aiocb	aio_lio_opcode	44	4
+S	glob_t	glob_t	44	4
+F	glob_t	gl_pathc	0	4
+F	glob_t	gl_offs	8	4
+F	glob_t	gl_pathv	16	4
+S	addrinfo	struct addrinfo	32	4
+F	addrinfo	ai_flags	0	4
+F	addrinfo	ai_family	4	4
+F	addrinfo	ai_socktype	8	4
+F	addrinfo	ai_protocol	12	4
+F	addrinfo	ai_addrlen	16	4
+F	addrinfo	ai_canonname	20	4
+F	addrinfo	ai_addr	24	4
+F	addrinfo	ai_next	28	4
+S	mach_timebase_info	struct mach_timebase_info	8	4
+F	mach_timebase_info	numer	0	4
+F	mach_timebase_info	denom	4	4
+S	mach_timebase_info	mach_timebase_info	1	4
+S	stat	struct stat	108	4
+F	stat	st_dev	0	4
+F	stat	st_mode	4	2
+F	stat	st_nlink	6	2
+F	stat	st_ino	8	8
+F	stat	st_uid	16	4
+F	stat	st_gid	20	4
+F	stat	st_rdev	24	4
+F	stat	st_atime	28	4
+F	stat	st_mtime	36	4
+F	stat	st_ctime	44	4
+F	stat	st_birthtime	52	4
+F	stat	st_size	60	8
+F	stat	st_blocks	68	8
+F	stat	st_blksize	76	4
+F	stat	st_flags	80	4
+F	stat	st_gen	84	4
+F	stat	st_lspare	88	4
+F	stat	st_qspare	92	16
+S	stat	stat	1	4
+S	pthread_mutexattr_t	pthread_mutexattr_t	12	4
+F	pthread_mutexattr_t	__sig	0	4
+F	pthread_mutexattr_t	__opaque	4	8
+S	pthread_condattr_t	pthread_condattr_t	8	4
+F	pthread_condattr_t	__sig	0	4
+F	pthread_condattr_t	__opaque	4	4
+S	pthread_rwlockattr_t	pthread_rwlockattr_t	16	4
+F	pthread_rwlockattr_t	__sig	0	4
+F	pthread_rwlockattr_t	__opaque	4	12
+S	siginfo_t	siginfo_t	64	4
+F	siginfo_t	si_signo	0	4
+F	siginfo_t	si_errno	4	4
+F	siginfo_t	si_code	8	4
+F	siginfo_t	si_pid	12	4
+F	siginfo_t	si_uid	16	4
+F	siginfo_t	si_status	20	4
+F	siginfo_t	si_addr	24	4
+S	sigaction	struct sigaction	12	4
+F	sigaction	sa_sigaction	0	4
+F	sigaction	sa_mask	4	4
+F	sigaction	sa_flags	8	4
+S	sigaction	sigaction	1	4
+S	stack_t	stack_t	12	4
+F	stack_t	ss_sp	0	4
+F	stack_t	ss_size	4	4
+F	stack_t	ss_flags	8	4
+S	fstore_t	fstore_t	32	4
+F	fstore_t	fst_flags	0	4
+F	fstore_t	fst_posmode	4	4
+F	fstore_t	fst_offset	8	8
+F	fstore_t	fst_length	16	8
+F	fstore_t	fst_bytesalloc	24	8
+S	radvisory	struct radvisory	16	8
+F	radvisory	ra_offset	0	8
+F	radvisory	ra_count	8	4
+S	statvfs	struct statvfs	44	4
+F	statvfs	f_bsize	0	4
+F	statvfs	f_frsize	4	4
+F	statvfs	f_blocks	8	4
+F	statvfs	f_bfree	12	4
+F	statvfs	f_bavail	16	4
+F	statvfs	f_files	20	4
+F	statvfs	f_ffree	24	4
+F	statvfs	f_favail	28	4
+F	statvfs	f_fsid	32	4
+F	statvfs	f_flag	36	4
+F	statvfs	f_namemax	40	4
+S	statvfs	statvfs	1	4
+S	sockaddr_in	struct sockaddr_in	16	4
+F	sockaddr_in	sin_len	0	1
+F	sockaddr_in	sin_family	1	1
+F	sockaddr_in	sin_port	2	2
+F	sockaddr_in	sin_addr	4	4
+F	sockaddr_in	sin_zero	8	8
+S	dqblk	struct dqblk	64	8
+F	dqblk	dqb_bhardlimit	0	8
+F	dqblk	dqb_bsoftlimit	8	8
+F	dqblk	dqb_curbytes	16	8
+F	dqblk	dqb_ihardlimit	24	4
+F	dqblk	dqb_isoftlimit	28	4
+F	dqblk	dqb_curinodes	32	4
+F	dqblk	dqb_btime	36	4
+F	dqblk	dqb_itime	40	4
+F	dqblk	dqb_id	44	4
+F	dqblk	dqb_spare	48	16
+S	if_msghdr	struct if_msghdr	112	4
+F	if_msghdr	ifm_msglen	0	2
+F	if_msghdr	ifm_version	2	1
+F	if_msghdr	ifm_type	3	1
+F	if_msghdr	ifm_addrs	4	4
+F	if_msghdr	ifm_flags	8	4
+F	if_msghdr	ifm_index	12	2
+F	if_msghdr	ifm_data	16	96
+S	ifa_msghdr	struct ifa_msghdr	20	4
+F	ifa_msghdr	ifam_msglen	0	2
+F	ifa_msghdr	ifam_version	2	1
+F	ifa_msghdr	ifam_type	3	1
+F	ifa_msghdr	ifam_addrs	4	4
+F	ifa_msghdr	ifam_flags	8	4
+F	ifa_msghdr	ifam_index	12	2
+F	ifa_msghdr	ifam_metric	16	4
+S	ifma_msghdr	struct ifma_msghdr	16	4
+F	ifma_msghdr	ifmam_msglen	0	2
+F	ifma_msghdr	ifmam_version	2	1
+F	ifma_msghdr	ifmam_type	3	1
+F	ifma_msghdr	ifmam_addrs	4	4
+F	ifma_msghdr	ifmam_flags	8	4
+F	ifma_msghdr	ifmam_index	12	2
+S	ifma_msghdr2	struct ifma_msghdr2	20	4
+F	ifma_msghdr2	ifmam_msglen	0	2
+F	ifma_msghdr2	ifmam_version	2	1
+F	ifma_msghdr2	ifmam_type	3	1
+F	ifma_msghdr2	ifmam_addrs	4	4
+F	ifma_msghdr2	ifmam_flags	8	4
+F	ifma_msghdr2	ifmam_index	12	2
+F	ifma_msghdr2	ifmam_refcount	16	4
+S	rt_metrics	struct rt_metrics	56	4
+F	rt_metrics	rmx_locks	0	4
+F	rt_metrics	rmx_mtu	4	4
+F	rt_metrics	rmx_hopcount	8	4
+F	rt_metrics	rmx_expire	12	4
+F	rt_metrics	rmx_recvpipe	16	4
+F	rt_metrics	rmx_sendpipe	20	4
+F	rt_metrics	rmx_ssthresh	24	4
+F	rt_metrics	rmx_rtt	28	4
+F	rt_metrics	rmx_rttvar	32	4
+F	rt_metrics	rmx_pksent	36	4
+F	rt_metrics	rmx_filler	40	16
+S	rt_msghdr	struct rt_msghdr	92	4
+F	rt_msghdr	rtm_msglen	0	2
+F	rt_msghdr	rtm_version	2	1
+F	rt_msghdr	rtm_type	3	1
+F	rt_msghdr	rtm_index	4	2
+F	rt_msghdr	rtm_flags	8	4
+F	rt_msghdr	rtm_addrs	12	4
+F	rt_msghdr	rtm_pid	16	4
+F	rt_msghdr	rtm_seq	20	4
+F	rt_msghdr	rtm_errno	24	4
+F	rt_msghdr	rtm_use	28	4
+F	rt_msghdr	rtm_inits	32	4
+F	rt_msghdr	rtm_rmx	36	56
+S	rt_msghdr2	struct rt_msghdr2	92	4
+F	rt_msghdr2	rtm_msglen	0	2
+F	rt_msghdr2	rtm_version	2	1
+F	rt_msghdr2	rtm_type	3	1
+F	rt_msghdr2	rtm_index	4	2
+F	rt_msghdr2	rtm_flags	8	4
+F	rt_msghdr2	rtm_addrs	12	4
+F	rt_msghdr2	rtm_refcnt	16	4
+F	rt_msghdr2	rtm_parentflags	20	4
+F	rt_msghdr2	rtm_reserved	24	4
+F	rt_msghdr2	rtm_use	28	4
+F	rt_msghdr2	rtm_inits	32	4
+F	rt_msghdr2	rtm_rmx	36	56
+S	termios	struct termios	44	4
+F	termios	c_iflag	0	4
+F	termios	c_oflag	4	4
+F	termios	c_cflag	8	4
+F	termios	c_lflag	12	4
+F	termios	c_cc	16	20
+F	termios	c_ispeed	36	4
+F	termios	c_ospeed	40	4
+S	flock	struct flock	24	8
+F	flock	l_start	0	8
+F	flock	l_len	8	8
+F	flock	l_pid	16	4
+F	flock	l_type	20	2
+F	flock	l_whence	22	2
+S	flock	flock	1	4
+S	sf_hdtr	struct sf_hdtr	16	4
+F	sf_hdtr	headers	0	4
+F	sf_hdtr	hdr_cnt	4	4
+F	sf_hdtr	trailers	8	4
+F	sf_hdtr	trl_cnt	12	4
+S	lconv	struct lconv	56	4
+F	lconv	decimal_point	0	4
+F	lconv	thousands_sep	4	4
+F	lconv	grouping	8	4
+F	lconv	int_curr_symbol	12	4
+F	lconv	currency_symbol	16	4
+F	lconv	mon_decimal_point	20	4
+F	lconv	mon_thousands_sep	24	4
+F	lconv	mon_grouping	28	4
+F	lconv	positive_sign	32	4
+F	lconv	negative_sign	36	4
+F	lconv	int_frac_digits	40	1
+F	lconv	frac_digits	41	1
+F	lconv	p_cs_precedes	42	1
+F	lconv	p_sep_by_space	43	1
+F	lconv	n_cs_precedes	44	1
+F	lconv	n_sep_by_space	45	1
+F	lconv	p_sign_posn	46	1
+F	lconv	n_sign_posn	47	1
+F	lconv	int_p_cs_precedes	48	1
+F	lconv	int_n_cs_precedes	49	1
+F	lconv	int_p_sep_by_space	50	1
+F	lconv	int_n_sep_by_space	51	1
+F	lconv	int_p_sign_posn	52	1
+F	lconv	int_n_sign_posn	53	1
+S	proc_taskinfo	struct proc_taskinfo	96	8
+F	proc_taskinfo	pti_virtual_size	0	8
+F	proc_taskinfo	pti_resident_size	8	8
+F	proc_taskinfo	pti_total_user	16	8
+F	proc_taskinfo	pti_total_system	24	8
+F	proc_taskinfo	pti_threads_user	32	8
+F	proc_taskinfo	pti_threads_system	40	8
+F	proc_taskinfo	pti_policy	48	4
+F	proc_taskinfo	pti_faults	52	4
+F	proc_taskinfo	pti_pageins	56	4
+F	proc_taskinfo	pti_cow_faults	60	4
+F	proc_taskinfo	pti_messages_sent	64	4
+F	proc_taskinfo	pti_messages_received	68	4
+F	proc_taskinfo	pti_syscalls_mach	72	4
+F	proc_taskinfo	pti_syscalls_unix	76	4
+F	proc_taskinfo	pti_csw	80	4
+F	proc_taskinfo	pti_threadnum	84	4
+F	proc_taskinfo	pti_numrunning	88	4
+F	proc_taskinfo	pti_priority	92	4
+S	proc_bsdinfo	struct proc_bsdinfo	128	4
+F	proc_bsdinfo	pbi_flags	0	4
+F	proc_bsdinfo	pbi_status	4	4
+F	proc_bsdinfo	pbi_xstatus	8	4
+F	proc_bsdinfo	pbi_pid	12	4
+F	proc_bsdinfo	pbi_ppid	16	4
+F	proc_bsdinfo	pbi_uid	20	4
+F	proc_bsdinfo	pbi_gid	24	4
+F	proc_bsdinfo	pbi_ruid	28	4
+F	proc_bsdinfo	pbi_rgid	32	4
+F	proc_bsdinfo	pbi_svuid	36	4
+F	proc_bsdinfo	pbi_svgid	40	4
+F	proc_bsdinfo	pbi_comm	44	17
+F	proc_bsdinfo	pbi_name	61	33
+F	proc_bsdinfo	pbi_nfiles	96	4
+F	proc_bsdinfo	pbi_pgid	100	4
+F	proc_bsdinfo	pbi_pjobc	104	4
+F	proc_bsdinfo	e_tdev	108	4
+F	proc_bsdinfo	e_tpgid	112	4
+F	proc_bsdinfo	pbi_nice	124	4
+S	proc_taskallinfo	struct proc_taskallinfo	224	4
+F	proc_taskallinfo	pbsd	0	128
+F	proc_taskallinfo	ptinfo	128	96
+S	xsw_usage	struct xsw_usage	32	8
+F	xsw_usage	xsu_total	0	8
+F	xsw_usage	xsu_avail	8	8
+F	xsw_usage	xsu_used	16	8
+F	xsw_usage	xsu_pagesize	24	4
+F	xsw_usage	xsu_encrypted	28	4
+S	xucred	struct xucred	76	4
+F	xucred	cr_version	0	4
+F	xucred	cr_uid	4	4
+F	xucred	cr_ngroups	8	2
+F	xucred	cr_groups	12	64
+S	mach_header	struct mach_header	28	4
+F	mach_header	magic	0	4
+F	mach_header	cputype	4	4
+F	mach_header	cpusubtype	8	4
+F	mach_header	filetype	12	4
+F	mach_header	ncmds	16	4
+F	mach_header	sizeofcmds	20	4
+F	mach_header	flags	24	4
+S	mach_header_64	struct mach_header_64	32	4
+F	mach_header_64	magic	0	4
+F	mach_header_64	cputype	4	4
+F	mach_header_64	cpusubtype	8	4
+F	mach_header_64	filetype	12	4
+F	mach_header_64	ncmds	16	4
+F	mach_header_64	sizeofcmds	20	4
+F	mach_header_64	flags	24	4
+F	mach_header_64	reserved	28	4
+S	segment_command	struct segment_command	56	4
+F	segment_command	cmd	0	4
+F	segment_command	cmdsize	4	4
+F	segment_command	segname	8	16
+F	segment_command	vmaddr	24	4
+F	segment_command	vmsize	28	4
+F	segment_command	fileoff	32	4
+F	segment_command	filesize	36	4
+F	segment_command	maxprot	40	4
+F	segment_command	initprot	44	4
+F	segment_command	nsects	48	4
+F	segment_command	flags	52	4
+S	segment_command_64	struct segment_command_64	72	4
+F	segment_command_64	cmd	0	4
+F	segment_command_64	cmdsize	4	4
+F	segment_command_64	segname	8	16
+F	segment_command_64	vmaddr	24	8
+F	segment_command_64	vmsize	32	8
+F	segment_command_64	fileoff	40	8
+F	segment_command_64	filesize	48	8
+F	segment_command_64	maxprot	56	4
+F	segment_command_64	initprot	60	4
+F	segment_command_64	nsects	64	4
+F	segment_command_64	flags	68	4
+S	load_command	struct load_command	8	4
+F	load_command	cmd	0	4
+F	load_command	cmdsize	4	4
+S	sockaddr_dl	struct sockaddr_dl	20	2
+F	sockaddr_dl	sdl_len	0	1
+F	sockaddr_dl	sdl_family	1	1
+F	sockaddr_dl	sdl_index	2	2
+F	sockaddr_dl	sdl_type	4	1
+F	sockaddr_dl	sdl_nlen	5	1
+F	sockaddr_dl	sdl_alen	6	1
+F	sockaddr_dl	sdl_slen	7	1
+F	sockaddr_dl	sdl_data	8	12
+S	sockaddr_ctl	struct sockaddr_ctl	32	4
+F	sockaddr_ctl	sc_len	0	1
+F	sockaddr_ctl	sc_family	1	1
+F	sockaddr_ctl	ss_sysaddr	2	2
+F	sockaddr_ctl	sc_id	4	4
+F	sockaddr_ctl	sc_unit	8	4
+F	sockaddr_ctl	sc_reserved	12	20
+S	in6_pktinfo	struct in6_pktinfo	20	4
+F	in6_pktinfo	ipi6_addr	0	16
+F	in6_pktinfo	ipi6_ifindex	16	4
+S	ipc_perm	struct ipc_perm	16	4
+F	ipc_perm	uid	4	2
+F	ipc_perm	gid	6	2
+F	ipc_perm	cuid	0	2
+F	ipc_perm	cgid	2	2
+F	ipc_perm	mode	8	2
+S	sembuf	struct sembuf	6	2
+F	sembuf	sem_num	0	2
+F	sembuf	sem_op	2	2
+F	sembuf	sem_flg	4	2
+S	in_addr	struct in_addr	4	4
+F	in_addr	s_addr	0	4
+S	thread_standard_policy	struct thread_standard_policy	4	4
+F	thread_standard_policy	no_data	0	4
+S	thread_extended_policy	struct thread_extended_policy	4	4
+F	thread_extended_policy	timeshare	0	4
+S	thread_time_constraint_policy	struct thread_time_constraint_policy	16	4
+F	thread_time_constraint_policy	period	0	4
+F	thread_time_constraint_policy	computation	4	4
+F	thread_time_constraint_policy	constraint	8	4
+F	thread_time_constraint_policy	preemptible	12	4
+S	thread_precedence_policy	struct thread_precedence_policy	4	4
+F	thread_precedence_policy	importance	0	4
+S	thread_affinity_policy	struct thread_affinity_policy	4	4
+F	thread_affinity_policy	affinity_tag	0	4
+S	malloc_statistics_t	struct malloc_statistics_t	16	4
+F	malloc_statistics_t	blocks_in_use	0	4
+F	malloc_statistics_t	size_in_use	4	4
+F	malloc_statistics_t	max_size_in_use	8	4
+F	malloc_statistics_t	size_allocated	12	4
+S	malloc_statistics_t	malloc_statistics_t	16	4
+F	malloc_statistics_t	blocks_in_use	0	4
+F	malloc_statistics_t	size_in_use	4	4
+F	malloc_statistics_t	max_size_in_use	8	4
+F	malloc_statistics_t	size_allocated	12	4
+S	mstats	struct mstats	20	4
+F	mstats	bytes_total	0	4
+F	mstats	chunks_used	4	4
+F	mstats	bytes_used	8	4
+F	mstats	chunks_free	12	4
+F	mstats	bytes_free	16	4
+S	mstats	mstats	1	4
+S	vm_range_t	vm_range_t	8	4
+F	vm_range_t	address	0	4
+F	vm_range_t	size	4	4
+S	sched_param	struct sched_param	8	4
+F	sched_param	sched_priority	0	4
+F	sched_param	__opaque	4	4
+S	vinfo_stat	struct vinfo_stat	136	4
+F	vinfo_stat	vst_dev	0	4
+F	vinfo_stat	vst_mode	4	2
+F	vinfo_stat	vst_nlink	6	2
+F	vinfo_stat	vst_ino	8	8
+F	vinfo_stat	vst_uid	16	4
+F	vinfo_stat	vst_gid	20	4
+F	vinfo_stat	vst_atime	24	8
+F	vinfo_stat	vst_atimensec	32	8
+F	vinfo_stat	vst_mtime	40	8
+F	vinfo_stat	vst_mtimensec	48	8
+F	vinfo_stat	vst_ctime	56	8
+F	vinfo_stat	vst_ctimensec	64	8
+F	vinfo_stat	vst_birthtime	72	8
+F	vinfo_stat	vst_birthtimensec	80	8
+F	vinfo_stat	vst_size	88	8
+F	vinfo_stat	vst_blocks	96	8
+F	vinfo_stat	vst_blksize	104	4
+F	vinfo_stat	vst_flags	108	4
+F	vinfo_stat	vst_gen	112	4
+F	vinfo_stat	vst_rdev	116	4
+F	vinfo_stat	vst_qspare	120	16
+S	vnode_info	struct vnode_info	152	4
+F	vnode_info	vi_stat	0	136
+F	vnode_info	vi_type	136	4
+F	vnode_info	vi_pad	148	4
+F	vnode_info	vi_fsid	140	8
+S	vnode_info_path	struct vnode_info_path	1176	4
+F	vnode_info_path	vip_vi	0	152
+F	vnode_info_path	vip_path	152	1024
+S	proc_vnodepathinfo	struct proc_vnodepathinfo	2352	4
+F	proc_vnodepathinfo	pvi_cdir	0	1176
+F	proc_vnodepathinfo	pvi_rdir	1176	1176
+S	vm_statistics	struct vm_statistics	60	4
+F	vm_statistics	free_count	0	4
+F	vm_statistics	active_count	4	4
+F	vm_statistics	inactive_count	8	4
+F	vm_statistics	wire_count	12	4
+F	vm_statistics	zero_fill_count	16	4
+F	vm_statistics	reactivations	20	4
+F	vm_statistics	pageins	24	4
+F	vm_statistics	pageouts	28	4
+F	vm_statistics	faults	32	4
+F	vm_statistics	cow_faults	36	4
+F	vm_statistics	lookups	40	4
+F	vm_statistics	hits	44	4
+F	vm_statistics	purgeable_count	48	4
+F	vm_statistics	purges	52	4
+F	vm_statistics	speculative_count	56	4
+S	task_thread_times_info	struct task_thread_times_info	16	4
+F	task_thread_times_info	user_time	0	8
+F	task_thread_times_info	system_time	8	8
+S	attrlist	struct attrlist	24	4
+F	attrlist	bitmapcount	0	2
+F	attrlist	reserved	2	2
+F	attrlist	commonattr	4	4
+F	attrlist	volattr	8	4
+F	attrlist	dirattr	12	4
+F	attrlist	fileattr	16	4
+F	attrlist	forkattr	20	4
+S	attrreference_t	attrreference_t	8	4
+F	attrreference_t	attr_dataoffset	0	4
+F	attrreference_t	attr_length	4	4
+S	vol_capabilities_attr_t	vol_capabilities_attr_t	32	4
+F	vol_capabilities_attr_t	capabilities	0	16
+F	vol_capabilities_attr_t	valid	16	16
+S	attribute_set_t	attribute_set_t	20	4
+F	attribute_set_t	commonattr	0	4
+F	attribute_set_t	volattr	4	4
+F	attribute_set_t	dirattr	8	4
+F	attribute_set_t	fileattr	12	4
+F	attribute_set_t	forkattr	16	4
+S	vol_attributes_attr_t	vol_attributes_attr_t	40	4
+F	vol_attributes_attr_t	validattr	0	20
+F	vol_attributes_attr_t	nativeattr	20	20
+S	kevent	struct kevent	20	4
+F	kevent	ident	0	4
+F	kevent	filter	4	2
+F	kevent	flags	6	2
+F	kevent	fflags	8	4
+F	kevent	data	12	4
+F	kevent	udata	16	4
+S	kevent	kevent	1	4
+S	semid_ds	struct semid_ds	56	4
+F	semid_ds	sem_perm	0	16
+F	semid_ds	sem_base	16	4
+F	semid_ds	sem_nsems	20	2
+F	semid_ds	sem_otime	24	4
+F	semid_ds	sem_pad1	28	4
+F	semid_ds	sem_ctime	32	4
+F	semid_ds	sem_pad2	36	4
+F	semid_ds	sem_pad3	40	16
+S	shmid_ds	struct shmid_ds	48	4
+F	shmid_ds	shm_perm	0	16
+F	shmid_ds	shm_segsz	16	4
+F	shmid_ds	shm_lpid	20	4
+F	shmid_ds	shm_cpid	24	4
+F	shmid_ds	shm_nattch	28	2
+F	shmid_ds	shm_atime	32	4
+F	shmid_ds	shm_dtime	36	4
+F	shmid_ds	shm_ctime	40	4
+F	shmid_ds	shm_internal	44	4
+S	proc_threadinfo	struct proc_threadinfo	304	8
+F	proc_threadinfo	pth_user_time	0	8
+F	proc_threadinfo	pth_system_time	8	8
+F	proc_threadinfo	pth_cpu_usage	16	4
+F	proc_threadinfo	pth_policy	20	4
+F	proc_threadinfo	pth_run_state	24	4
+F	proc_threadinfo	pth_flags	28	4
+F	proc_threadinfo	pth_sleep_time	32	4
+F	proc_threadinfo	pth_curpri	36	4
+F	proc_threadinfo	pth_priority	40	4
+F	proc_threadinfo	pth_maxpriority	44	4
+F	proc_threadinfo	pth_name	48	256
+S	statfs	struct statfs	2168	4
+F	statfs	f_bsize	0	4
+F	statfs	f_iosize	4	4
+F	statfs	f_blocks	8	8
+F	statfs	f_bfree	16	8
+F	statfs	f_bavail	24	8
+F	statfs	f_files	32	8
+F	statfs	f_ffree	40	8
+F	statfs	f_fsid	48	8
+F	statfs	f_owner	56	4
+F	statfs	f_type	60	4
+F	statfs	f_flags	64	4
+F	statfs	f_fssubtype	68	4
+F	statfs	f_fstypename	72	16
+F	statfs	f_mntonname	88	1024
+F	statfs	f_mntfromname	1112	1024
+F	statfs	f_reserved	2136	32
+S	statfs	statfs	1	4
+S	dirent	struct dirent	1048	8
+F	dirent	d_ino	0	8
+F	dirent	d_seekoff	8	8
+F	dirent	d_reclen	16	2
+F	dirent	d_namlen	18	2
+F	dirent	d_type	20	1
+F	dirent	d_name	21	1024
+S	pthread_rwlock_t	pthread_rwlock_t	128	4
+F	pthread_rwlock_t	__sig	0	4
+F	pthread_rwlock_t	__opaque	4	124
+S	pthread_mutex_t	pthread_mutex_t	44	4
+F	pthread_mutex_t	__sig	0	4
+F	pthread_mutex_t	__opaque	4	40
+S	pthread_cond_t	pthread_cond_t	28	4
+F	pthread_cond_t	__sig	0	4
+F	pthread_cond_t	__opaque	4	24
+S	sockaddr_storage	struct sockaddr_storage	128	4
+F	sockaddr_storage	ss_len	0	1
+F	sockaddr_storage	ss_family	1	1
+F	sockaddr_storage	__ss_pad1	2	6
+F	sockaddr_storage	__ss_align	8	8
+F	sockaddr_storage	__ss_pad2	16	112
+S	sigevent	struct sigevent	20	4
+F	sigevent	sigev_notify	0	4
+F	sigevent	sigev_signo	4	4
+F	sigevent	sigev_value	8	4
+F	sigevent	sigev_notify_attributes	16	4
+S	processor_cpu_load_info	struct processor_cpu_load_info	16	4
+F	processor_cpu_load_info	cpu_ticks	0	16
+S	processor_basic_info	struct processor_basic_info	20	4
+F	processor_basic_info	cpu_type	0	4
+F	processor_basic_info	cpu_subtype	4	4
+F	processor_basic_info	running	8	4
+F	processor_basic_info	slot_num	12	4
+F	processor_basic_info	is_master	16	4
+S	processor_set_basic_info	struct processor_set_basic_info	8	4
+F	processor_set_basic_info	processor_count	0	4
+F	processor_set_basic_info	default_policy	4	4
+S	processor_set_load_info	struct processor_set_load_info	16	4
+F	processor_set_load_info	task_count	0	4
+F	processor_set_load_info	thread_count	4	4
+F	processor_set_load_info	load_average	8	4
+F	processor_set_load_info	mach_factor	12	4
+S	time_value_t	time_value_t	8	4
+F	time_value_t	seconds	0	4
+F	time_value_t	microseconds	4	4
+S	thread_basic_info	struct thread_basic_info	40	4
+F	thread_basic_info	user_time	0	8
+F	thread_basic_info	system_time	8	8
+F	thread_basic_info	cpu_usage	16	4
+F	thread_basic_info	policy	20	4
+F	thread_basic_info	run_state	24	4
+F	thread_basic_info	flags	28	4
+F	thread_basic_info	suspend_count	32	4
+F	thread_basic_info	sleep_time	36	4
+S	if_data64	struct if_data64	128	4
+F	if_data64	ifi_type	0	1
+F	if_data64	ifi_typelen	1	1
+F	if_data64	ifi_physical	2	1
+F	if_data64	ifi_addrlen	3	1
+F	if_data64	ifi_hdrlen	4	1
+F	if_data64	ifi_recvquota	5	1
+F	if_data64	ifi_xmitquota	6	1
+F	if_data64	ifi_unused1	7	1
+F	if_data64	ifi_mtu	8	4
+F	if_data64	ifi_metric	12	4
+F	if_data64	ifi_baudrate	16	8
+F	if_data64	ifi_ipackets	24	8
+F	if_data64	ifi_ierrors	32	8
+F	if_data64	ifi_opackets	40	8
+F	if_data64	ifi_oerrors	48	8
+F	if_data64	ifi_collisions	56	8
+F	if_data64	ifi_ibytes	64	8
+F	if_data64	ifi_obytes	72	8
+F	if_data64	ifi_imcasts	80	8
+F	if_data64	ifi_omcasts	88	8
+F	if_data64	ifi_iqdrops	96	8
+F	if_data64	ifi_noproto	104	8
+F	if_data64	ifi_recvtiming	112	4
+F	if_data64	ifi_xmittiming	116	4
+F	if_data64	ifi_lastchange	120	8
+S	if_msghdr2	struct if_msghdr2	160	4
+F	if_msghdr2	ifm_msglen	0	2
+F	if_msghdr2	ifm_version	2	1
+F	if_msghdr2	ifm_type	3	1
+F	if_msghdr2	ifm_addrs	4	4
+F	if_msghdr2	ifm_flags	8	4
+F	if_msghdr2	ifm_index	12	2
+F	if_msghdr2	ifm_snd_len	16	4
+F	if_msghdr2	ifm_snd_maxlen	20	4
+F	if_msghdr2	ifm_snd_drops	24	4
+F	if_msghdr2	ifm_timer	28	4
+F	if_msghdr2	ifm_data	32	128
+S	log2phys	struct log2phys	20	4
+F	log2phys	l2p_flags	0	4
+F	log2phys	l2p_contigbytes	4	8
+F	log2phys	l2p_devoffset	12	8
+S	if_data	struct if_data	96	4
+F	if_data	ifi_type	0	1
+F	if_data	ifi_typelen	1	1
+F	if_data	ifi_physical	2	1
+F	if_data	ifi_addrlen	3	1
+F	if_data	ifi_hdrlen	4	1
+F	if_data	ifi_recvquota	5	1
+F	if_data	ifi_xmitquota	6	1
+F	if_data	ifi_unused1	7	1
+F	if_data	ifi_mtu	8	4
+F	if_data	ifi_metric	12	4
+F	if_data	ifi_baudrate	16	4
+F	if_data	ifi_ipackets	20	4
+F	if_data	ifi_ierrors	24	4
+F	if_data	ifi_opackets	28	4
+F	if_data	ifi_oerrors	32	4
+F	if_data	ifi_collisions	36	4
+F	if_data	ifi_ibytes	40	4
+F	if_data	ifi_obytes	44	4
+F	if_data	ifi_imcasts	48	4
+F	if_data	ifi_omcasts	52	4
+F	if_data	ifi_iqdrops	56	4
+F	if_data	ifi_noproto	60	4
+F	if_data	ifi_recvtiming	64	4
+F	if_data	ifi_xmittiming	68	4
+F	if_data	ifi_lastchange	72	8
+F	if_data	ifi_unused2	80	4
+F	if_data	ifi_hwassist	84	4
+F	if_data	ifi_reserved1	88	4
+F	if_data	ifi_reserved2	92	4
+S	bpf_hdr	struct bpf_hdr	20	4
+F	bpf_hdr	bh_tstamp	0	8
+F	bpf_hdr	bh_caplen	8	4
+F	bpf_hdr	bh_datalen	12	4
+F	bpf_hdr	bh_hdrlen	16	2
+S	malloc_zone_t	malloc_zone_t	56	4
+S	pthread_attr_t	pthread_attr_t	40	4
+F	pthread_attr_t	__sig	0	4
+F	pthread_attr_t	__opaque	4	36
+C	INT_MIN	-2147483648
+C	INT_MAX	2147483647
+C	SIG_DFL	0
+C	SIG_IGN	1
+C	SIG_ERR	-1
+C	DT_UNKNOWN	0
+C	DT_FIFO	1
+C	DT_CHR	2
+C	DT_DIR	4
+C	DT_BLK	6
+C	DT_REG	8
+C	DT_LNK	10
+C	DT_SOCK	12
+C	FD_CLOEXEC	1
+C	USRQUOTA	0
+C	GRPQUOTA	1
+C	SIGIOT	6
+C	S_ISUID	2048
+C	S_ISGID	1024
+C	S_ISVTX	512
+C	IF_NAMESIZE	16
+C	IFNAMSIZ	16
+C	LOG_EMERG	0
+C	LOG_ALERT	1
+C	LOG_CRIT	2
+C	LOG_ERR	3
+C	LOG_WARNING	4
+C	LOG_NOTICE	5
+C	LOG_INFO	6
+C	LOG_DEBUG	7
+C	LOG_KERN	0
+C	LOG_USER	8
+C	LOG_MAIL	16
+C	LOG_DAEMON	24
+C	LOG_AUTH	32
+C	LOG_SYSLOG	40
+C	LOG_LPR	48
+C	LOG_NEWS	56
+C	LOG_UUCP	64
+C	LOG_LOCAL0	128
+C	LOG_LOCAL1	136
+C	LOG_LOCAL2	144
+C	LOG_LOCAL3	152
+C	LOG_LOCAL4	160
+C	LOG_LOCAL5	168
+C	LOG_LOCAL6	176
+C	LOG_LOCAL7	184
+C	LOG_PID	1
+C	LOG_CONS	2
+C	LOG_ODELAY	4
+C	LOG_NDELAY	8
+C	LOG_NOWAIT	16
+C	LOG_PRIMASK	7
+C	LOG_FACMASK	1016
+C	PRIO_MIN	-20
+C	PRIO_MAX	20
+C	IPPROTO_ICMP	1
+C	IPPROTO_ICMPV6	58
+C	IPPROTO_TCP	6
+C	IPPROTO_UDP	17
+C	IPPROTO_IP	0
+C	IPPROTO_IPV6	41
+C	INADDR_LOOPBACK	2130706433
+C	INADDR_ANY	0
+C	INADDR_BROADCAST	4294967295
+C	INADDR_NONE	4294967295
+C	LC_ALL	0
+C	LC_COLLATE	1
+C	LC_CTYPE	2
+C	LC_MONETARY	3
+C	LC_NUMERIC	4
+C	LC_TIME	5
+C	LC_MESSAGES	6
+C	FIOCLEX	536897025
+C	FIONCLEX	536897026
+C	FIONREAD	1074030207
+C	FIONBIO	2147772030
+C	FIOASYNC	2147772029
+C	FIOSETOWN	2147772028
+C	FIOGETOWN	1074030203
+C	PATH_MAX	1024
+C	MAXPATHLEN	1024
+C	IOV_MAX	1024
+C	SA_ONSTACK	1
+C	SA_SIGINFO	64
+C	SA_RESTART	2
+C	SA_RESETHAND	4
+C	SA_NOCLDSTOP	8
+C	SA_NODEFER	16
+C	SA_NOCLDWAIT	32
+C	SS_ONSTACK	1
+C	SS_DISABLE	4
+C	SIGCHLD	20
+C	SIGBUS	10
+C	SIGUSR1	30
+C	SIGUSR2	31
+C	SIGCONT	19
+C	SIGSTOP	17
+C	SIGTSTP	18
+C	SIGURG	16
+C	SIGIO	23
+C	SIGSYS	12
+C	SIGTTIN	21
+C	SIGTTOU	22
+C	SIGXCPU	24
+C	SIGXFSZ	25
+C	SIGVTALRM	26
+C	SIGPROF	27
+C	SIGWINCH	28
+C	SIGINFO	29
+C	SIG_SETMASK	3
+C	SIG_BLOCK	1
+C	SIG_UNBLOCK	2
+C	IP_TOS	3
+C	IP_MULTICAST_IF	9
+C	IP_MULTICAST_TTL	10
+C	IP_MULTICAST_LOOP	11
+C	IPV6_UNICAST_HOPS	4
+C	IPV6_MULTICAST_IF	9
+C	IPV6_MULTICAST_HOPS	10
+C	IPV6_MULTICAST_LOOP	11
+C	IPV6_V6ONLY	27
+C	IPTOS_ECN_NOTECT	0
+C	IPTOS_ECN_MASK	3
+C	IPTOS_ECN_ECT1	1
+C	IPTOS_ECN_ECT0	2
+C	IPTOS_ECN_CE	3
+C	ST_RDONLY	1
+C	SCM_RIGHTS	1
+C	NCCS	20
+C	O_ACCMODE	3
+C	O_RDONLY	0
+C	O_WRONLY	1
+C	O_RDWR	2
+C	O_APPEND	8
+C	O_CREAT	512
+C	O_TRUNC	1024
+C	O_EXCL	2048
+C	O_ASYNC	64
+C	O_SYNC	128
+C	O_NONBLOCK	4
+C	O_NOFOLLOW	256
+C	O_SHLOCK	16
+C	O_EXLOCK	32
+C	O_FSYNC	128
+C	O_NDELAY	4
+C	F_GETOWN	5
+C	F_SETOWN	6
+C	F_RDLCK	1
+C	F_UNLCK	2
+C	F_WRLCK	3
+C	MNT_RDONLY	1
+C	MNT_SYNCHRONOUS	2
+C	MNT_NOEXEC	4
+C	MNT_NOSUID	8
+C	MNT_ASYNC	64
+C	MNT_EXPORTED	256
+C	MNT_UPDATE	65536
+C	MNT_RELOAD	262144
+C	MNT_FORCE	524288
+C	Q_SYNC	1536
+C	Q_QUOTAON	256
+C	Q_QUOTAOFF	512
+C	TCIOFF	3
+C	TCION	4
+C	TCOOFF	1
+C	TCOON	2
+C	TCIFLUSH	1
+C	TCOFLUSH	2
+C	TCIOFLUSH	3
+C	TCSANOW	0
+C	TCSADRAIN	1
+C	TCSAFLUSH	2
+C	VEOF	0
+C	VEOL	1
+C	VEOL2	2
+C	VERASE	3
+C	VWERASE	4
+C	VKILL	5
+C	VREPRINT	6
+C	VINTR	8
+C	VQUIT	9
+C	VSUSP	10
+C	VDSUSP	11
+C	VSTART	12
+C	VSTOP	13
+C	VLNEXT	14
+C	VDISCARD	15
+C	VMIN	16
+C	VTIME	17
+C	VSTATUS	18
+C	_POSIX_VDISABLE	255
+C	IGNBRK	1
+C	BRKINT	2
+C	IGNPAR	4
+C	PARMRK	8
+C	INPCK	16
+C	ISTRIP	32
+C	INLCR	64
+C	IGNCR	128
+C	ICRNL	256
+C	IXON	512
+C	IXOFF	1024
+C	IXANY	2048
+C	IMAXBEL	8192
+C	OPOST	1
+C	ONLCR	2
+C	OXTABS	4
+C	ONOEOT	8
+C	CIGNORE	1
+C	CSIZE	768
+C	CS5	0
+C	CS6	256
+C	CS7	512
+C	CS8	768
+C	CSTOPB	1024
+C	CREAD	2048
+C	PARENB	4096
+C	PARODD	8192
+C	HUPCL	16384
+C	CLOCAL	32768
+C	ECHOKE	1
+C	ECHOE	2
+C	ECHOK	4
+C	ECHO	8
+C	ECHONL	16
+C	ECHOPRT	32
+C	ECHOCTL	64
+C	ISIG	128
+C	ICANON	256
+C	ALTWERASE	512
+C	IEXTEN	1024
+C	EXTPROC	2048
+C	TOSTOP	4194304
+C	FLUSHO	8388608
+C	NOKERNINFO	33554432
+C	PENDIN	536870912
+C	NOFLSH	2147483648
+C	MDMBUF	1048576
+C	WNOHANG	1
+C	WUNTRACED	2
+C	LOG_CRON	72
+C	LOG_AUTHPRIV	80
+C	LOG_FTP	88
+C	LOG_PERROR	32
+C	TCP_NODELAY	1
+C	TCP_MAXSEG	2
+C	PIPE_BUF	512
+C	BUS_ADRALN	1
+C	BUS_ADRERR	2
+C	BUS_OBJERR	3
+C	CLD_EXITED	1
+C	CLD_KILLED	2
+C	CLD_DUMPED	3
+C	CLD_TRAPPED	4
+C	CLD_STOPPED	5
+C	CLD_CONTINUED	6
+C	POLLIN	1
+C	POLLPRI	2
+C	POLLOUT	4
+C	POLLERR	8
+C	POLLHUP	16
+C	POLLNVAL	32
+C	POLLRDNORM	64
+C	POLLWRNORM	4
+C	POLLRDBAND	128
+C	POLLWRBAND	256
+C	BIOCGBLEN	1074020966
+C	BIOCSBLEN	3221504614
+C	BIOCFLUSH	536887912
+C	BIOCPROMISC	536887913
+C	BIOCGDLT	1074020970
+C	BIOCGETIF	1075855979
+C	BIOCSETIF	2149597804
+C	BIOCGSTATS	1074283119
+C	BIOCIMMEDIATE	2147762800
+C	BIOCVERSION	1074020977
+C	BIOCGHDRCMPLT	1074020980
+C	BIOCSHDRCMPLT	2147762805
+C	SIOCGIFADDR	3223349537
+C	REG_BASIC	0
+C	REG_EXTENDED	1
+C	REG_ICASE	2
+C	REG_NOSUB	4
+C	REG_NEWLINE	8
+C	REG_NOSPEC	16
+C	REG_PEND	32
+C	REG_DUMP	128
+C	REG_NOMATCH	1
+C	REG_BADPAT	2
+C	REG_ECOLLATE	3
+C	REG_ECTYPE	4
+C	REG_EESCAPE	5
+C	REG_ESUBREG	6
+C	REG_EBRACK	7
+C	REG_EPAREN	8
+C	REG_EBRACE	9
+C	REG_BADBR	10
+C	REG_ERANGE	11
+C	REG_ESPACE	12
+C	REG_BADRPT	13
+C	REG_EMPTY	14
+C	REG_ASSERT	15
+C	REG_INVARG	16
+C	REG_ATOI	255
+C	REG_ITOA	256
+C	REG_NOTBOL	1
+C	REG_NOTEOL	2
+C	REG_STARTEND	4
+C	REG_TRACE	256
+C	REG_LARGE	512
+C	REG_BACKR	1024
+C	TIOCCBRK	536900730
+C	TIOCSBRK	536900731
+C	PRIO_PROCESS	0
+C	PRIO_PGRP	1
+C	PRIO_USER	2
+C	ITIMER_REAL	0
+C	ITIMER_VIRTUAL	1
+C	ITIMER_PROF	2
+C	CODESET	0
+C	D_T_FMT	1
+C	D_FMT	2
+C	T_FMT	3
+C	T_FMT_AMPM	4
+C	AM_STR	5
+C	PM_STR	6
+C	DAY_1	7
+C	DAY_2	8
+C	DAY_3	9
+C	DAY_4	10
+C	DAY_5	11
+C	DAY_6	12
+C	DAY_7	13
+C	ABDAY_1	14
+C	ABDAY_2	15
+C	ABDAY_3	16
+C	ABDAY_4	17
+C	ABDAY_5	18
+C	ABDAY_6	19
+C	ABDAY_7	20
+C	MON_1	21
+C	MON_2	22
+C	MON_3	23
+C	MON_4	24
+C	MON_5	25
+C	MON_6	26
+C	MON_7	27
+C	MON_8	28
+C	MON_9	29
+C	MON_10	30
+C	MON_11	31
+C	MON_12	32
+C	ABMON_1	33
+C	ABMON_2	34
+C	ABMON_3	35
+C	ABMON_4	36
+C	ABMON_5	37
+C	ABMON_6	38
+C	ABMON_7	39
+C	ABMON_8	40
+C	ABMON_9	41
+C	ABMON_10	42
+C	ABMON_11	43
+C	ABMON_12	44
+C	ERA	45
+C	ERA_D_FMT	46
+C	ERA_D_T_FMT	47
+C	ERA_T_FMT	48
+C	ALT_DIGITS	49
+C	RADIXCHAR	50
+C	THOUSEP	51
+C	YESEXPR	52
+C	NOEXPR	53
+C	YESSTR	54
+C	NOSTR	55
+C	CRNCYSTR	56
+C	D_MD_ORDER	57
+C	EXIT_FAILURE	1
+C	EXIT_SUCCESS	0
+C	RAND_MAX	2147483647
+C	EOF	-1
+C	SEEK_SET	0
+C	SEEK_CUR	1
+C	SEEK_END	2
+C	_IOFBF	0
+C	_IONBF	2
+C	_IOLBF	1
+C	BUFSIZ	1024
+C	FOPEN_MAX	20
+C	FILENAME_MAX	1024
+C	L_tmpnam	1024
+C	TMP_MAX	308915776
+C	_PC_LINK_MAX	1
+C	_PC_MAX_CANON	2
+C	_PC_MAX_INPUT	3
+C	_PC_NAME_MAX	4
+C	_PC_PATH_MAX	5
+C	_PC_PIPE_BUF	6
+C	_PC_CHOWN_RESTRICTED	7
+C	_PC_NO_TRUNC	8
+C	_PC_VDISABLE	9
+C	O_EVTONLY	32768
+C	O_NOCTTY	131072
+C	O_DIRECTORY	1048576
+C	O_SYMLINK	2097152
+C	S_IFIFO	4096
+C	S_IFCHR	8192
+C	S_IFBLK	24576
+C	S_IFDIR	16384
+C	S_IFREG	32768
+C	S_IFLNK	40960
+C	S_IFSOCK	49152
+C	S_IFMT	61440
+C	S_IEXEC	64
+C	S_IWRITE	128
+C	S_IREAD	256
+C	S_IRWXU	448
+C	S_IXUSR	64
+C	S_IWUSR	128
+C	S_IRUSR	256
+C	S_IRWXG	56
+C	S_IXGRP	8
+C	S_IWGRP	16
+C	S_IRGRP	32
+C	S_IRWXO	7
+C	S_IXOTH	1
+C	S_IWOTH	2
+C	S_IROTH	4
+C	F_OK	0
+C	R_OK	4
+C	W_OK	2
+C	X_OK	1
+C	STDIN_FILENO	0
+C	STDOUT_FILENO	1
+C	STDERR_FILENO	2
+C	F_LOCK	1
+C	F_TEST	3
+C	F_TLOCK	2
+C	F_ULOCK	0
+C	F_GETLK	7
+C	F_SETLK	8
+C	F_SETLKW	9
+C	SIGHUP	1
+C	SIGINT	2
+C	SIGQUIT	3
+C	SIGILL	4
+C	SIGABRT	6
+C	SIGEMT	7
+C	SIGFPE	8
+C	SIGKILL	9
+C	SIGSEGV	11
+C	SIGPIPE	13
+C	SIGALRM	14
+C	SIGTERM	15
+C	PROT_NONE	0
+C	PROT_READ	1
+C	PROT_WRITE	2
+C	PROT_EXEC	4
+C	MAP_FILE	0
+C	MAP_SHARED	1
+C	MAP_PRIVATE	2
+C	MAP_FIXED	16
+C	MAP_ANON	4096
+C	CPU_STATE_USER	0
+C	CPU_STATE_SYSTEM	1
+C	CPU_STATE_IDLE	2
+C	CPU_STATE_NICE	3
+C	CPU_STATE_MAX	4
+C	PROCESSOR_BASIC_INFO	1
+C	PROCESSOR_CPU_LOAD_INFO	2
+C	PROCESSOR_PM_REGS_INFO	268435457
+C	PROCESSOR_TEMPERATURE	268435458
+C	PROCESSOR_SET_LOAD_INFO	4
+C	PROCESSOR_SET_BASIC_INFO	5
+C	VM_FLAGS_FIXED	0
+C	VM_FLAGS_ANYWHERE	1
+C	VM_FLAGS_PURGABLE	2
+C	VM_FLAGS_NO_CACHE	16
+C	VM_FLAGS_ALIAS_MASK	4278190080
+C	VM_FLAGS_USER_ALLOCATE	4278190099
+C	VM_FLAGS_USER_MAP	4278190099
+C	VM_MEMORY_MALLOC	1
+C	VM_MEMORY_MALLOC_SMALL	2
+C	VM_MEMORY_MALLOC_LARGE	3
+C	VM_MEMORY_MALLOC_HUGE	4
+C	VM_MEMORY_SBRK	5
+C	VM_MEMORY_REALLOC	6
+C	VM_MEMORY_MALLOC_TINY	7
+C	VM_MEMORY_ANALYSIS_TOOL	10
+C	VM_MEMORY_MACH_MSG	20
+C	VM_MEMORY_IOKIT	21
+C	VM_MEMORY_STACK	30
+C	VM_MEMORY_GUARD	31
+C	VM_MEMORY_SHARED_PMAP	32
+C	VM_MEMORY_DYLIB	33
+C	VM_MEMORY_APPKIT	40
+C	VM_MEMORY_FOUNDATION	41
+C	VM_MEMORY_COREGRAPHICS	42
+C	VM_MEMORY_CARBON	43
+C	VM_MEMORY_JAVA	44
+C	VM_MEMORY_ATS	50
+C	VM_MEMORY_LAYERKIT	51
+C	VM_MEMORY_CGIMAGE	52
+C	VM_MEMORY_TCMALLOC	53
+C	VM_MEMORY_COREGRAPHICS_DATA	54
+C	VM_MEMORY_COREGRAPHICS_SHARED	55
+C	VM_MEMORY_COREGRAPHICS_FRAMEBUFFERS	56
+C	VM_MEMORY_COREGRAPHICS_BACKINGSTORES	57
+C	VM_MEMORY_COREGRAPHICS_MISC	42
+C	VM_MEMORY_DYLD	60
+C	VM_MEMORY_DYLD_MALLOC	61
+C	VM_MEMORY_APPLICATION_SPECIFIC_1	240
+C	VM_MEMORY_APPLICATION_SPECIFIC_16	255
+C	MAP_FAILED	-1
+C	MCL_CURRENT	1
+C	MCL_FUTURE	2
+C	MS_ASYNC	1
+C	MS_INVALIDATE	2
+C	MS_SYNC	16
+C	MS_KILLPAGES	4
+C	MS_DEACTIVATE	8
+C	EPERM	1
+C	ENOENT	2
+C	ESRCH	3
+C	EINTR	4
+C	EIO	5
+C	ENXIO	6
+C	E2BIG	7
+C	ENOEXEC	8
+C	EBADF	9
+C	ECHILD	10
+C	EDEADLK	11
+C	ENOMEM	12
+C	EACCES	13
+C	EFAULT	14
+C	ENOTBLK	15
+C	EBUSY	16
+C	EEXIST	17
+C	EXDEV	18
+C	ENODEV	19
+C	ENOTDIR	20
+C	EISDIR	21
+C	EINVAL	22
+C	ENFILE	23
+C	EMFILE	24
+C	ENOTTY	25
+C	ETXTBSY	26
+C	EFBIG	27
+C	ENOSPC	28
+C	ESPIPE	29
+C	EROFS	30
+C	EMLINK	31
+C	EPIPE	32
+C	EDOM	33
+C	ERANGE	34
+C	EAGAIN	35
+C	EWOULDBLOCK	35
+C	EINPROGRESS	36
+C	EALREADY	37
+C	ENOTSOCK	38
+C	EDESTADDRREQ	39
+C	EMSGSIZE	40
+C	EPROTOTYPE	41
+C	ENOPROTOOPT	42
+C	EPROTONOSUPPORT	43
+C	ESOCKTNOSUPPORT	44
+C	ENOTSUP	45
+C	EPFNOSUPPORT	46
+C	EAFNOSUPPORT	47
+C	EADDRINUSE	48
+C	EADDRNOTAVAIL	49
+C	ENETDOWN	50
+C	ENETUNREACH	51
+C	ENETRESET	52
+C	ECONNABORTED	53
+C	ECONNRESET	54
+C	ENOBUFS	55
+C	EISCONN	56
+C	ENOTCONN	57
+C	ESHUTDOWN	58
+C	ETOOMANYREFS	59
+C	ETIMEDOUT	60
+C	ECONNREFUSED	61
+C	ELOOP	62
+C	ENAMETOOLONG	63
+C	EHOSTDOWN	64
+C	EHOSTUNREACH	65
+C	ENOTEMPTY	66
+C	EPROCLIM	67
+C	EUSERS	68
+C	EDQUOT	69
+C	ESTALE	70
+C	EREMOTE	71
+C	EBADRPC	72
+C	ERPCMISMATCH	73
+C	EPROGUNAVAIL	74
+C	EPROGMISMATCH	75
+C	EPROCUNAVAIL	76
+C	ENOLCK	77
+C	ENOSYS	78
+C	EFTYPE	79
+C	EAUTH	80
+C	ENEEDAUTH	81
+C	EPWROFF	82
+C	EDEVERR	83
+C	EOVERFLOW	84
+C	EBADEXEC	85
+C	EBADARCH	86
+C	ESHLIBVERS	87
+C	EBADMACHO	88
+C	ECANCELED	89
+C	EIDRM	90
+C	ENOMSG	91
+C	EILSEQ	92
+C	ENOATTR	93
+C	EBADMSG	94
+C	EMULTIHOP	95
+C	ENODATA	96
+C	ENOLINK	97
+C	ENOSR	98
+C	ENOSTR	99
+C	EPROTO	100
+C	ETIME	101
+C	EOPNOTSUPP	45
+C	ENOPOLICY	103
+C	ELAST	103
+C	EAI_AGAIN	2
+C	EAI_BADFLAGS	3
+C	EAI_FAIL	4
+C	EAI_FAMILY	5
+C	EAI_MEMORY	6
+C	EAI_NODATA	7
+C	EAI_NONAME	8
+C	EAI_SERVICE	9
+C	EAI_SOCKTYPE	10
+C	EAI_SYSTEM	11
+C	F_DUPFD	0
+C	F_GETFD	1
+C	F_SETFD	2
+C	F_GETFL	3
+C	F_SETFL	4
+C	F_PREALLOCATE	42
+C	F_RDADVISE	44
+C	F_RDAHEAD	45
+C	F_NOCACHE	48
+C	F_LOG2PHYS	49
+C	F_GETPATH	50
+C	F_FULLFSYNC	51
+C	F_FREEZE_FS	53
+C	F_THAW_FS	54
+C	F_GLOBAL_NOCACHE	55
+C	F_ALLOCATECONTIG	2
+C	F_ALLOCATEALL	4
+C	F_PEOFPOSMODE	3
+C	F_VOLPOSMODE	4
+C	TIOCMODG	1074033667
+C	TIOCMODS	2147775492
+C	TIOCM_LE	1
+C	TIOCM_DTR	2
+C	TIOCM_RTS	4
+C	TIOCM_ST	8
+C	TIOCM_SR	16
+C	TIOCM_CTS	32
+C	TIOCM_CAR	64
+C	TIOCM_CD	64
+C	TIOCM_RNG	128
+C	TIOCM_RI	128
+C	TIOCM_DSR	256
+C	TIOCEXCL	536900621
+C	TIOCNXCL	536900622
+C	TIOCFLUSH	2147775504
+C	TIOCGETD	1074033690
+C	TIOCSETD	2147775515
+C	TIOCIXON	536900737
+C	TIOCIXOFF	536900736
+C	TIOCSDTR	536900729
+C	TIOCCDTR	536900728
+C	TIOCGPGRP	1074033783
+C	TIOCSPGRP	2147775606
+C	TIOCOUTQ	1074033779
+C	TIOCSTI	2147578994
+C	TIOCNOTTY	536900721
+C	TIOCPKT	2147775600
+C	TIOCPKT_DATA	0
+C	TIOCPKT_FLUSHREAD	1
+C	TIOCPKT_FLUSHWRITE	2
+C	TIOCPKT_STOP	4
+C	TIOCPKT_START	8
+C	TIOCPKT_NOSTOP	16
+C	TIOCPKT_DOSTOP	32
+C	TIOCPKT_IOCTL	64
+C	TIOCSTOP	536900719
+C	TIOCSTART	536900718
+C	TIOCMSET	2147775597
+C	TIOCMBIS	2147775596
+C	TIOCMBIC	2147775595
+C	TIOCMGET	1074033770
+C	TIOCREMOTE	2147775593
+C	TIOCGWINSZ	1074295912
+C	TIOCSWINSZ	2148037735
+C	TIOCUCNTL	2147775590
+C	TIOCSTAT	536900709
+C	TIOCSCONS	536900707
+C	TIOCCONS	2147775586
+C	TIOCSCTTY	536900705
+C	TIOCEXT	2147775584
+C	TIOCSIG	536900703
+C	TIOCDRAIN	536900702
+C	TIOCMSDTRWAIT	2147775579
+C	TIOCMGDTRWAIT	1074033754
+C	TIOCSDRAINWAIT	2147775575
+C	TIOCGDRAINWAIT	1074033750
+C	TIOCDSIMICROCODE	536900693
+C	TIOCPTYGRANT	536900692
+C	TIOCPTYGNAME	1082160211
+C	TIOCPTYUNLK	536900690
+C	BIOCGRSIG	1074020978
+C	BIOCSRSIG	2147762803
+C	BIOCSDLT	2147762808
+C	BIOCGSEESENT	1074020982
+C	BIOCSSEESENT	2147762807
+C	BIOCGDLTLIST	3222028921
+C	FIODTYPE	1074030202
+C	B0	0
+C	B50	50
+C	B75	75
+C	B110	110
+C	B134	134
+C	B150	150
+C	B200	200
+C	B300	300
+C	B600	600
+C	B1200	1200
+C	B1800	1800
+C	B2400	2400
+C	B4800	4800
+C	B9600	9600
+C	B19200	19200
+C	B38400	38400
+C	B7200	7200
+C	B14400	14400
+C	B28800	28800
+C	B57600	57600
+C	B76800	76800
+C	B115200	115200
+C	B230400	230400
+C	EXTA	19200
+C	EXTB	38400
+C	SIGTRAP	5
+C	GLOB_APPEND	1
+C	GLOB_DOOFFS	2
+C	GLOB_ERR	4
+C	GLOB_MARK	8
+C	GLOB_NOCHECK	16
+C	GLOB_NOSORT	32
+C	GLOB_NOESCAPE	8192
+C	GLOB_NOSPACE	-1
+C	GLOB_ABORTED	-2
+C	GLOB_NOMATCH	-3
+C	POSIX_MADV_NORMAL	0
+C	POSIX_MADV_RANDOM	1
+C	POSIX_MADV_SEQUENTIAL	2
+C	POSIX_MADV_WILLNEED	3
+C	POSIX_MADV_DONTNEED	4
+C	_SC_IOV_MAX	56
+C	_SC_GETGR_R_SIZE_MAX	70
+C	_SC_GETPW_R_SIZE_MAX	71
+C	_SC_LOGIN_NAME_MAX	73
+C	_SC_MQ_PRIO_MAX	75
+C	_SC_THREAD_ATTR_STACKADDR	82
+C	_SC_THREAD_ATTR_STACKSIZE	83
+C	_SC_THREAD_DESTRUCTOR_ITERATIONS	85
+C	_SC_THREAD_KEYS_MAX	86
+C	_SC_THREAD_PRIO_INHERIT	87
+C	_SC_THREAD_PRIO_PROTECT	88
+C	_SC_THREAD_PRIORITY_SCHEDULING	89
+C	_SC_THREAD_PROCESS_SHARED	90
+C	_SC_THREAD_SAFE_FUNCTIONS	91
+C	_SC_THREAD_STACK_MIN	93
+C	_SC_THREAD_THREADS_MAX	94
+C	_SC_THREADS	96
+C	_SC_TTY_NAME_MAX	101
+C	_SC_ATEXIT_MAX	107
+C	_SC_XOPEN_CRYPT	108
+C	_SC_XOPEN_ENH_I18N	109
+C	_SC_XOPEN_LEGACY	110
+C	_SC_XOPEN_REALTIME	111
+C	_SC_XOPEN_REALTIME_THREADS	112
+C	_SC_XOPEN_SHM	113
+C	_SC_XOPEN_UNIX	115
+C	_SC_XOPEN_VERSION	116
+C	_SC_XOPEN_XCU_VERSION	121
+C	PTHREAD_PROCESS_PRIVATE	2
+C	PTHREAD_PROCESS_SHARED	1
+C	PTHREAD_CREATE_JOINABLE	1
+C	PTHREAD_CREATE_DETACHED	2
+C	PTHREAD_STACK_MIN	8192
+C	PTHREAD_STACK_MIN	8192
+C	RLIMIT_CPU	0
+C	RLIMIT_FSIZE	1
+C	RLIMIT_DATA	2
+C	RLIMIT_STACK	3
+C	RLIMIT_CORE	4
+C	RLIMIT_AS	5
+C	RLIMIT_RSS	5
+C	RLIMIT_MEMLOCK	6
+C	RLIMIT_NPROC	7
+C	RLIMIT_NOFILE	8
+C	RLIM_NLIMITS	9
+C	_RLIMIT_POSIX_FLAG	4096
+C	RLIM_INFINITY	9223372036854775807
+C	RUSAGE_SELF	0
+C	RUSAGE_CHILDREN	-1
+C	MADV_NORMAL	0
+C	MADV_RANDOM	1
+C	MADV_SEQUENTIAL	2
+C	MADV_WILLNEED	3
+C	MADV_DONTNEED	4
+C	MADV_FREE	5
+C	MINCORE_INCORE	1
+C	MINCORE_REFERENCED	2
+C	MINCORE_MODIFIED	4
+C	MINCORE_REFERENCED_OTHER	8
+C	MINCORE_MODIFIED_OTHER	16
+C	CTLIOCGINFO	3227799043
+C	IPPROTO_HOPOPTS	0
+C	IPPROTO_IGMP	2
+C	IPPROTO_GGP	3
+C	IPPROTO_IPIP	4
+C	IPPROTO_ST	7
+C	IPPROTO_EGP	8
+C	IPPROTO_PIGP	9
+C	IPPROTO_RCCMON	10
+C	IPPROTO_NVPII	11
+C	IPPROTO_PUP	12
+C	IPPROTO_ARGUS	13
+C	IPPROTO_EMCON	14
+C	IPPROTO_XNET	15
+C	IPPROTO_CHAOS	16
+C	IPPROTO_MUX	18
+C	IPPROTO_MEAS	19
+C	IPPROTO_HMP	20
+C	IPPROTO_PRM	21
+C	IPPROTO_IDP	22
+C	IPPROTO_TRUNK1	23
+C	IPPROTO_TRUNK2	24
+C	IPPROTO_LEAF1	25
+C	IPPROTO_LEAF2	26
+C	IPPROTO_RDP	27
+C	IPPROTO_IRTP	28
+C	IPPROTO_TP	29
+C	IPPROTO_BLT	30
+C	IPPROTO_NSP	31
+C	IPPROTO_INP	32
+C	IPPROTO_SEP	33
+C	IPPROTO_3PC	34
+C	IPPROTO_IDPR	35
+C	IPPROTO_XTP	36
+C	IPPROTO_DDP	37
+C	IPPROTO_CMTP	38
+C	IPPROTO_TPXX	39
+C	IPPROTO_IL	40
+C	IPPROTO_SDRP	42
+C	IPPROTO_ROUTING	43
+C	IPPROTO_FRAGMENT	44
+C	IPPROTO_IDRP	45
+C	IPPROTO_RSVP	46
+C	IPPROTO_GRE	47
+C	IPPROTO_MHRP	48
+C	IPPROTO_BHA	49
+C	IPPROTO_ESP	50
+C	IPPROTO_AH	51
+C	IPPROTO_INLSP	52
+C	IPPROTO_SWIPE	53
+C	IPPROTO_NHRP	54
+C	IPPROTO_NONE	59
+C	IPPROTO_DSTOPTS	60
+C	IPPROTO_AHIP	61
+C	IPPROTO_CFTP	62
+C	IPPROTO_HELLO	63
+C	IPPROTO_SATEXPAK	64
+C	IPPROTO_KRYPTOLAN	65
+C	IPPROTO_RVD	66
+C	IPPROTO_IPPC	67
+C	IPPROTO_ADFS	68
+C	IPPROTO_SATMON	69
+C	IPPROTO_VISA	70
+C	IPPROTO_IPCV	71
+C	IPPROTO_CPNX	72
+C	IPPROTO_CPHB	73
+C	IPPROTO_WSN	74
+C	IPPROTO_PVP	75
+C	IPPROTO_BRSATMON	76
+C	IPPROTO_ND	77
+C	IPPROTO_WBMON	78
+C	IPPROTO_WBEXPAK	79
+C	IPPROTO_EON	80
+C	IPPROTO_VMTP	81
+C	IPPROTO_SVMTP	82
+C	IPPROTO_VINES	83
+C	IPPROTO_TTP	84
+C	IPPROTO_IGP	85
+C	IPPROTO_DGP	86
+C	IPPROTO_TCF	87
+C	IPPROTO_IGRP	88
+C	IPPROTO_OSPFIGP	89
+C	IPPROTO_SRPC	90
+C	IPPROTO_LARP	91
+C	IPPROTO_MTP	92
+C	IPPROTO_AX25	93
+C	IPPROTO_IPEIP	94
+C	IPPROTO_MICP	95
+C	IPPROTO_SCCSP	96
+C	IPPROTO_ETHERIP	97
+C	IPPROTO_ENCAP	98
+C	IPPROTO_APES	99
+C	IPPROTO_GMTP	100
+C	IPPROTO_PIM	103
+C	IPPROTO_IPCOMP	108
+C	IPPROTO_PGM	113
+C	IPPROTO_DIVERT	254
+C	IPPROTO_RAW	255
+C	IPPROTO_MAX	256
+C	IPPROTO_DONE	257
+C	AF_UNSPEC	0
+C	AF_LOCAL	1
+C	AF_UNIX	1
+C	AF_INET	2
+C	AF_IMPLINK	3
+C	AF_PUP	4
+C	AF_CHAOS	5
+C	AF_NS	6
+C	AF_ISO	7
+C	AF_OSI	7
+C	AF_ECMA	8
+C	AF_DATAKIT	9
+C	AF_CCITT	10
+C	AF_SNA	11
+C	AF_DECnet	12
+C	AF_DLI	13
+C	AF_LAT	14
+C	AF_HYLINK	15
+C	AF_APPLETALK	16
+C	AF_ROUTE	17
+C	AF_LINK	18
+C	pseudo_AF_XTP	19
+C	AF_COIP	20
+C	AF_CNT	21
+C	pseudo_AF_RTIP	22
+C	AF_IPX	23
+C	AF_SIP	24
+C	pseudo_AF_PIP	25
+C	AF_NDRV	27
+C	AF_ISDN	28
+C	AF_E164	28
+C	pseudo_AF_KEY	29
+C	AF_INET6	30
+C	AF_NATM	31
+C	AF_SYSTEM	32
+C	AF_NETBIOS	33
+C	AF_PPP	34
+C	pseudo_AF_HDRCMPLT	35
+C	PF_UNSPEC	0
+C	PF_LOCAL	1
+C	PF_UNIX	1
+C	PF_INET	2
+C	PF_IMPLINK	3
+C	PF_PUP	4
+C	PF_CHAOS	5
+C	PF_NS	6
+C	PF_ISO	7
+C	PF_OSI	7
+C	PF_ECMA	8
+C	PF_DATAKIT	9
+C	PF_CCITT	10
+C	PF_SNA	11
+C	PF_DECnet	12
+C	PF_DLI	13
+C	PF_LAT	14
+C	PF_HYLINK	15
+C	PF_APPLETALK	16
+C	PF_ROUTE	17
+C	PF_LINK	18
+C	PF_XTP	19
+C	PF_COIP	20
+C	PF_CNT	21
+C	PF_SIP	24
+C	PF_IPX	23
+C	PF_RTIP	22
+C	PF_PIP	25
+C	PF_NDRV	27
+C	PF_ISDN	28
+C	PF_KEY	29
+C	PF_INET6	30
+C	PF_NATM	31
+C	PF_SYSTEM	32
+C	PF_NETBIOS	33
+C	PF_PPP	34
+C	NET_RT_DUMP	1
+C	NET_RT_FLAGS	2
+C	NET_RT_IFLIST	3
+C	SOMAXCONN	128
+C	SOCK_MAXADDRLEN	255
+C	SOCK_STREAM	1
+C	SOCK_DGRAM	2
+C	SOCK_RAW	3
+C	SOCK_RDM	4
+C	SOCK_SEQPACKET	5
+C	IP_TTL	4
+C	IP_HDRINCL	2
+C	IP_RECVDSTADDR	7
+C	IP_ADD_MEMBERSHIP	12
+C	IP_DROP_MEMBERSHIP	13
+C	IP_RECVIF	20
+C	IPV6_JOIN_GROUP	12
+C	IPV6_LEAVE_GROUP	13
+C	IPV6_CHECKSUM	26
+C	IPV6_PKTINFO	19
+C	IPV6_HOPLIMIT	20
+C	TCP_NOPUSH	4
+C	TCP_NOOPT	8
+C	TCP_KEEPALIVE	16
+C	LOCAL_PEERCRED	1
+C	SOL_SOCKET	65535
+C	SO_DEBUG	1
+C	SO_ACCEPTCONN	2
+C	SO_REUSEADDR	4
+C	SO_KEEPALIVE	8
+C	SO_DONTROUTE	16
+C	SO_BROADCAST	32
+C	SO_USELOOPBACK	64
+C	SO_LINGER	128
+C	SO_OOBINLINE	256
+C	SO_REUSEPORT	512
+C	SO_TIMESTAMP	1024
+C	SO_DONTTRUNC	8192
+C	SO_WANTMORE	16384
+C	SO_WANTOOBFLAG	32768
+C	SO_SNDBUF	4097
+C	SO_RCVBUF	4098
+C	SO_SNDLOWAT	4099
+C	SO_RCVLOWAT	4100
+C	SO_SNDTIMEO	4101
+C	SO_RCVTIMEO	4102
+C	SO_ERROR	4103
+C	SO_TYPE	4104
+C	SO_LABEL	4112
+C	SO_PEERLABEL	4113
+C	SO_NREAD	4128
+C	SO_NKE	4129
+C	SO_NOSIGPIPE	4130
+C	SO_NOADDRERR	4131
+C	SO_NWRITE	4132
+C	SO_REUSESHAREUID	4133
+C	SO_NOTIFYCONFLICT	4134
+C	SO_LINGER_SEC	4224
+C	MSG_OOB	1
+C	MSG_PEEK	2
+C	MSG_DONTROUTE	4
+C	MSG_EOR	8
+C	MSG_TRUNC	16
+C	MSG_CTRUNC	32
+C	MSG_WAITALL	64
+C	MSG_DONTWAIT	128
+C	MSG_EOF	256
+C	MSG_FLUSH	1024
+C	MSG_HOLD	2048
+C	MSG_SEND	4096
+C	MSG_HAVEMORE	8192
+C	MSG_RCVMORE	16384
+C	MSG_NEEDSA	65536
+C	SCM_TIMESTAMP	2
+C	SCM_CREDS	3
+C	IFF_UP	1
+C	IFF_BROADCAST	2
+C	IFF_DEBUG	4
+C	IFF_LOOPBACK	8
+C	IFF_POINTOPOINT	16
+C	IFF_NOTRAILERS	32
+C	IFF_RUNNING	64
+C	IFF_NOARP	128
+C	IFF_PROMISC	256
+C	IFF_ALLMULTI	512
+C	IFF_OACTIVE	1024
+C	IFF_SIMPLEX	2048
+C	IFF_LINK0	4096
+C	IFF_LINK1	8192
+C	IFF_LINK2	16384
+C	IFF_ALTPHYS	16384
+C	IFF_MULTICAST	32768
+C	SHUT_RD	0
+C	SHUT_WR	1
+C	SHUT_RDWR	2
+C	LOCK_SH	1
+C	LOCK_EX	2
+C	LOCK_NB	4
+C	LOCK_UN	8
+C	MAP_COPY	2
+C	MAP_RENAME	32
+C	MAP_NORESERVE	64
+C	MAP_NOEXTEND	256
+C	MAP_HASSEMAPHORE	512
+C	MAP_NOCACHE	1024
+C	_SC_ARG_MAX	1
+C	_SC_CHILD_MAX	2
+C	_SC_CLK_TCK	3
+C	_SC_NGROUPS_MAX	4
+C	_SC_OPEN_MAX	5
+C	_SC_JOB_CONTROL	6
+C	_SC_SAVED_IDS	7
+C	_SC_VERSION	8
+C	_SC_BC_BASE_MAX	9
+C	_SC_BC_DIM_MAX	10
+C	_SC_BC_SCALE_MAX	11
+C	_SC_BC_STRING_MAX	12
+C	_SC_COLL_WEIGHTS_MAX	13
+C	_SC_EXPR_NEST_MAX	14
+C	_SC_LINE_MAX	15
+C	_SC_RE_DUP_MAX	16
+C	_SC_2_VERSION	17
+C	_SC_2_C_BIND	18
+C	_SC_2_C_DEV	19
+C	_SC_2_CHAR_TERM	20
+C	_SC_2_FORT_DEV	21
+C	_SC_2_FORT_RUN	22
+C	_SC_2_LOCALEDEF	23
+C	_SC_2_SW_DEV	24
+C	_SC_2_UPE	25
+C	_SC_STREAM_MAX	26
+C	_SC_TZNAME_MAX	27
+C	_SC_ASYNCHRONOUS_IO	28
+C	_SC_PAGESIZE	29
+C	_SC_MEMLOCK	30
+C	_SC_MEMLOCK_RANGE	31
+C	_SC_MEMORY_PROTECTION	32
+C	_SC_MESSAGE_PASSING	33
+C	_SC_PRIORITIZED_IO	34
+C	_SC_PRIORITY_SCHEDULING	35
+C	_SC_REALTIME_SIGNALS	36
+C	_SC_SEMAPHORES	37
+C	_SC_FSYNC	38
+C	_SC_SHARED_MEMORY_OBJECTS	39
+C	_SC_SYNCHRONIZED_IO	40
+C	_SC_TIMERS	41
+C	_SC_AIO_LISTIO_MAX	42
+C	_SC_AIO_MAX	43
+C	_SC_AIO_PRIO_DELTA_MAX	44
+C	_SC_DELAYTIMER_MAX	45
+C	_SC_MQ_OPEN_MAX	46
+C	_SC_MAPPED_FILES	47
+C	_SC_RTSIG_MAX	48
+C	_SC_SEM_NSEMS_MAX	49
+C	_SC_SEM_VALUE_MAX	50
+C	_SC_SIGQUEUE_MAX	51
+C	_SC_TIMER_MAX	52
+C	_SC_NPROCESSORS_CONF	57
+C	_SC_NPROCESSORS_ONLN	58
+C	_SC_2_PBS	59
+C	_SC_2_PBS_ACCOUNTING	60
+C	_SC_2_PBS_CHECKPOINT	61
+C	_SC_2_PBS_LOCATE	62
+C	_SC_2_PBS_MESSAGE	63
+C	_SC_2_PBS_TRACK	64
+C	_SC_ADVISORY_INFO	65
+C	_SC_BARRIERS	66
+C	_SC_CLOCK_SELECTION	67
+C	_SC_CPUTIME	68
+C	_SC_FILE_LOCKING	69
+C	_SC_HOST_NAME_MAX	72
+C	_SC_MONOTONIC_CLOCK	74
+C	_SC_READER_WRITER_LOCKS	76
+C	_SC_REGEXP	77
+C	_SC_SHELL	78
+C	_SC_SPAWN	79
+C	_SC_SPIN_LOCKS	80
+C	_SC_SPORADIC_SERVER	81
+C	_SC_THREAD_CPUTIME	84
+C	_SC_THREAD_SPORADIC_SERVER	92
+C	_SC_TIMEOUTS	95
+C	_SC_TRACE	97
+C	_SC_TRACE_EVENT_FILTER	98
+C	_SC_TRACE_INHERIT	99
+C	_SC_TRACE_LOG	100
+C	_SC_TYPED_MEMORY_OBJECTS	102
+C	_SC_V6_ILP32_OFF32	103
+C	_SC_V6_ILP32_OFFBIG	104
+C	_SC_V6_LP64_OFF64	105
+C	_SC_V6_LPBIG_OFFBIG	106
+C	_SC_IPV6	118
+C	_SC_RAW_SOCKETS	119
+C	_SC_SYMLOOP_MAX	120
+C	_SC_PAGE_SIZE	29
+C	_SC_XOPEN_STREAMS	114
+C	_SC_XBS5_ILP32_OFF32	122
+C	_SC_XBS5_ILP32_OFFBIG	123
+C	_SC_XBS5_LP64_OFF64	124
+C	_SC_XBS5_LPBIG_OFFBIG	125
+C	_SC_SS_REPL_MAX	126
+C	_SC_TRACE_EVENT_NAME_MAX	127
+C	_SC_TRACE_NAME_MAX	128
+C	_SC_TRACE_SYS_MAX	129
+C	_SC_TRACE_USER_EVENT_MAX	130
+C	_SC_PASS_MAX	131
+C	_CS_PATH	1
+C	_CS_DARWIN_USER_DIR	65536
+C	_CS_DARWIN_USER_TEMP_DIR	65537
+C	_CS_DARWIN_USER_CACHE_DIR	65538
+C	PTHREAD_MUTEX_NORMAL	0
+C	PTHREAD_MUTEX_ERRORCHECK	1
+C	PTHREAD_MUTEX_RECURSIVE	2
+C	PTHREAD_MUTEX_DEFAULT	0
+C	_PTHREAD_MUTEX_SIG_init	850045863
+C	_PTHREAD_COND_SIG_init	1018212795
+C	_PTHREAD_RWLOCK_SIG_init	766030772
+C	MINSIGSTKSZ	32768
+C	SIGSTKSZ	131072
+C	FD_SETSIZE	1024
+C	ST_NOSUID	2
+C	SCHED_OTHER	1
+C	SCHED_FIFO	4
+C	SCHED_RR	2
+C	EVFILT_READ	-1
+C	EVFILT_WRITE	-2
+C	EVFILT_AIO	-3
+C	EVFILT_VNODE	-4
+C	EVFILT_PROC	-5
+C	EVFILT_SIGNAL	-6
+C	EVFILT_TIMER	-7
+C	EVFILT_MACHPORT	-8
+C	EVFILT_FS	-9
+C	EV_ADD	1
+C	EV_DELETE	2
+C	EV_ENABLE	4
+C	EV_DISABLE	8
+C	EV_ONESHOT	16
+C	EV_CLEAR	32
+C	EV_RECEIPT	64
+C	EV_FLAG0	4096
+C	EV_POLL	4096
+C	EV_FLAG1	8192
+C	EV_OOBAND	8192
+C	EV_ERROR	16384
+C	EV_EOF	32768
+C	EV_SYSFLAGS	61440
+C	NOTE_LOWAT	1
+C	NOTE_DELETE	1
+C	NOTE_WRITE	2
+C	NOTE_EXTEND	4
+C	NOTE_ATTRIB	8
+C	NOTE_LINK	16
+C	NOTE_RENAME	32
+C	NOTE_REVOKE	64
+C	NOTE_EXIT	2147483648
+C	NOTE_FORK	1073741824
+C	NOTE_EXEC	536870912
+C	NOTE_REAP	268435456
+C	NOTE_SIGNAL	134217728
+C	NOTE_PDATAMASK	1048575
+C	NOTE_PCTRLMASK	-1048576
+C	NOTE_SECONDS	1
+C	NOTE_USECONDS	2
+C	NOTE_NSECONDS	4
+C	NOTE_ABSOLUTE	8
+C	NOTE_TRACK	1
+C	NOTE_TRACKERR	2
+C	NOTE_CHILD	4
+C	OCRNL	16
+C	ONOCR	32
+C	ONLRET	64
+C	OFILL	128
+C	NLDLY	768
+C	TABDLY	3076
+C	CRDLY	12288
+C	FFDLY	16384
+C	BSDLY	32768
+C	VTDLY	65536
+C	OFDEL	131072
+C	NL0	0
+C	NL1	256
+C	TAB0	0
+C	TAB1	1024
+C	TAB2	2048
+C	CR0	0
+C	CR1	4096
+C	CR2	8192
+C	CR3	12288
+C	FF0	0
+C	FF1	16384
+C	BS0	0
+C	BS1	32768
+C	TAB3	4
+C	VT0	0
+C	VT1	65536
+C	IUTF8	16384
+C	CRTSCTS	196608
+C	NI_MAXHOST	1025
+C	NI_MAXSERV	32
+C	NI_NOFQDN	1
+C	NI_NUMERICHOST	2
+C	NI_NAMEREQD	4
+C	NI_NUMERICSERV	8
+C	NI_DGRAM	16
+C	Q_GETQUOTA	768
+C	Q_SETQUOTA	1024
+C	_WSTOPPED	127
+C	LOG_NETINFO	96
+C	LOG_REMOTEAUTH	104
+C	LOG_INSTALL	112
+C	LOG_RAS	120
+C	LOG_LAUNCHD	192
+C	LOG_NFACILITIES	25
+C	CTLTYPE	15
+C	CTLTYPE_NODE	1
+C	CTLTYPE_INT	2
+C	CTLTYPE_STRING	3
+C	CTLTYPE_QUAD	4
+C	CTLTYPE_OPAQUE	5
+C	CTLTYPE_STRUCT	5
+C	CTLFLAG_RD	2147483648
+C	CTLFLAG_WR	1073741824
+C	CTLFLAG_RW	3221225472
+C	CTLFLAG_NOLOCK	536870912
+C	CTLFLAG_ANYBODY	268435456
+C	CTLFLAG_SECURE	134217728
+C	CTLFLAG_MASKED	67108864
+C	CTLFLAG_NOAUTO	33554432
+C	CTLFLAG_KERN	16777216
+C	CTLFLAG_LOCKED	8388608
+C	CTL_UNSPEC	0
+C	CTL_KERN	1
+C	CTL_VM	2
+C	CTL_VFS	3
+C	CTL_NET	4
+C	CTL_DEBUG	5
+C	CTL_HW	6
+C	CTL_MACHDEP	7
+C	CTL_USER	8
+C	CTL_MAXID	9
+C	KERN_OSTYPE	1
+C	KERN_OSRELEASE	2
+C	KERN_OSREV	3
+C	KERN_VERSION	4
+C	KERN_MAXVNODES	5
+C	KERN_MAXPROC	6
+C	KERN_MAXFILES	7
+C	KERN_ARGMAX	8
+C	KERN_SECURELVL	9
+C	KERN_HOSTNAME	10
+C	KERN_HOSTID	11
+C	KERN_CLOCKRATE	12
+C	KERN_VNODE	13
+C	KERN_PROC	14
+C	KERN_FILE	15
+C	KERN_PROF	16
+C	KERN_POSIX1	17
+C	KERN_NGROUPS	18
+C	KERN_JOB_CONTROL	19
+C	KERN_SAVED_IDS	20
+C	KERN_BOOTTIME	21
+C	KERN_NISDOMAINNAME	22
+C	KERN_DOMAINNAME	22
+C	KERN_MAXPARTITIONS	23
+C	KERN_KDEBUG	24
+C	KERN_UPDATEINTERVAL	25
+C	KERN_OSRELDATE	26
+C	KERN_NTP_PLL	27
+C	KERN_BOOTFILE	28
+C	KERN_MAXFILESPERPROC	29
+C	KERN_MAXPROCPERUID	30
+C	KERN_DUMPDEV	31
+C	KERN_IPC	32
+C	KERN_DUMMY	33
+C	KERN_PS_STRINGS	34
+C	KERN_USRSTACK32	35
+C	KERN_LOGSIGEXIT	36
+C	KERN_SYMFILE	37
+C	KERN_PROCARGS	38
+C	KERN_NETBOOT	40
+C	KERN_SYSV	42
+C	KERN_AFFINITY	43
+C	KERN_TRANSLATE	44
+C	KERN_CLASSIC	44
+C	KERN_EXEC	45
+C	KERN_CLASSICHANDLER	45
+C	KERN_AIOMAX	46
+C	KERN_AIOPROCMAX	47
+C	KERN_AIOTHREADS	48
+C	KERN_COREFILE	50
+C	KERN_COREDUMP	51
+C	KERN_SUGID_COREDUMP	52
+C	KERN_PROCDELAYTERM	53
+C	KERN_SHREG_PRIVATIZABLE	54
+C	KERN_LOW_PRI_WINDOW	56
+C	KERN_LOW_PRI_DELAY	57
+C	KERN_POSIX	58
+C	KERN_USRSTACK64	59
+C	KERN_NX_PROTECTION	60
+C	KERN_TFP	61
+C	KERN_PROCNAME	62
+C	KERN_THALTSTACK	63
+C	KERN_SPECULATIVE_READS	64
+C	KERN_OSVERSION	65
+C	KERN_SAFEBOOT	66
+C	KERN_RAGEVNODE	68
+C	KERN_TTY	69
+C	KERN_CHECKOPENEVT	70
+C	KERN_MAXID	71
+C	KERN_RAGE_PROC	1
+C	KERN_RAGE_THREAD	2
+C	KERN_UNRAGE_PROC	3
+C	KERN_UNRAGE_THREAD	4
+C	KERN_OPENEVT_PROC	1
+C	KERN_UNOPENEVT_PROC	2
+C	KERN_TFP_POLICY	1
+C	KERN_TFP_POLICY_DENY	0
+C	KERN_TFP_POLICY_DEFAULT	2
+C	KERN_KDEFLAGS	1
+C	KERN_KDDFLAGS	2
+C	KERN_KDENABLE	3
+C	KERN_KDSETBUF	4
+C	KERN_KDGETBUF	5
+C	KERN_KDSETUP	6
+C	KERN_KDREMOVE	7
+C	KERN_KDSETREG	8
+C	KERN_KDGETREG	9
+C	KERN_KDREADTR	10
+C	KERN_KDPIDTR	11
+C	KERN_KDTHRMAP	12
+C	KERN_KDPIDEX	14
+C	KERN_KDSETRTCDEC	15
+C	KERN_KDGETENTROPY	16
+C	KERN_PROC_ALL	0
+C	KERN_PROC_PID	1
+C	KERN_PROC_PGRP	2
+C	KERN_PROC_SESSION	3
+C	KERN_PROC_TTY	4
+C	KERN_PROC_UID	5
+C	KERN_PROC_RUID	6
+C	KERN_PROC_LCID	7
+C	KERN_SUCCESS	0
+C	KERN_INVALID_ADDRESS	1
+C	KERN_PROTECTION_FAILURE	2
+C	KERN_NO_SPACE	3
+C	KERN_INVALID_ARGUMENT	4
+C	KERN_FAILURE	5
+C	KERN_RESOURCE_SHORTAGE	6
+C	KERN_NOT_RECEIVER	7
+C	KERN_NO_ACCESS	8
+C	KERN_MEMORY_FAILURE	9
+C	KERN_MEMORY_ERROR	10
+C	KERN_ALREADY_IN_SET	11
+C	KERN_NOT_IN_SET	12
+C	KERN_NAME_EXISTS	13
+C	KERN_ABORTED	14
+C	KERN_INVALID_NAME	15
+C	KERN_INVALID_TASK	16
+C	KERN_INVALID_RIGHT	17
+C	KERN_INVALID_VALUE	18
+C	KERN_UREFS_OVERFLOW	19
+C	KERN_INVALID_CAPABILITY	20
+C	KERN_RIGHT_EXISTS	21
+C	KERN_INVALID_HOST	22
+C	KERN_MEMORY_PRESENT	23
+C	KERN_MEMORY_DATA_MOVED	24
+C	KERN_MEMORY_RESTART_COPY	25
+C	KERN_INVALID_PROCESSOR_SET	26
+C	KERN_POLICY_LIMIT	27
+C	KERN_INVALID_POLICY	28
+C	KERN_INVALID_OBJECT	29
+C	KERN_ALREADY_WAITING	30
+C	KERN_DEFAULT_SET	31
+C	KERN_EXCEPTION_PROTECTED	32
+C	KERN_INVALID_LEDGER	33
+C	KERN_INVALID_MEMORY_CONTROL	34
+C	KERN_INVALID_SECURITY	35
+C	KERN_NOT_DEPRESSED	36
+C	KERN_TERMINATED	37
+C	KERN_LOCK_SET_DESTROYED	38
+C	KERN_LOCK_UNSTABLE	39
+C	KERN_LOCK_OWNED	40
+C	KERN_LOCK_OWNED_SELF	41
+C	KERN_SEMAPHORE_DESTROYED	42
+C	KERN_RPC_SERVER_TERMINATED	43
+C	KERN_RPC_TERMINATE_ORPHAN	44
+C	KERN_RPC_CONTINUE_ORPHAN	45
+C	KERN_NOT_SUPPORTED	46
+C	KERN_NODE_DOWN	47
+C	KERN_NOT_WAITING	48
+C	KERN_OPERATION_TIMED_OUT	49
+C	KIPC_MAXSOCKBUF	1
+C	KIPC_SOCKBUF_WASTE	2
+C	KIPC_SOMAXCONN	3
+C	KIPC_MAX_LINKHDR	4
+C	KIPC_MAX_PROTOHDR	5
+C	KIPC_MAX_HDR	6
+C	KIPC_MAX_DATALEN	7
+C	KIPC_MBSTAT	8
+C	KIPC_NMBCLUSTERS	9
+C	KIPC_SOQLIMITCOMPAT	10
+C	VM_METER	1
+C	VM_LOADAVG	2
+C	VM_MACHFACTOR	4
+C	VM_SWAPUSAGE	5
+C	VM_MAXID	6
+C	VM_PROT_NONE	0
+C	VM_PROT_READ	1
+C	VM_PROT_WRITE	2
+C	VM_PROT_EXECUTE	4
+C	MEMORY_OBJECT_NULL	0
+C	HW_MACHINE	1
+C	HW_MODEL	2
+C	HW_NCPU	3
+C	HW_BYTEORDER	4
+C	HW_PHYSMEM	5
+C	HW_USERMEM	6
+C	HW_PAGESIZE	7
+C	HW_DISKNAMES	8
+C	HW_DISKSTATS	9
+C	HW_EPOCH	10
+C	HW_FLOATINGPT	11
+C	HW_MACHINE_ARCH	12
+C	HW_VECTORUNIT	13
+C	HW_BUS_FREQ	14
+C	HW_CPU_FREQ	15
+C	HW_CACHELINE	16
+C	HW_L1ICACHESIZE	17
+C	HW_L1DCACHESIZE	18
+C	HW_L2SETTINGS	19
+C	HW_L2CACHESIZE	20
+C	HW_L3SETTINGS	21
+C	HW_L3CACHESIZE	22
+C	HW_TB_FREQ	23
+C	HW_MEMSIZE	24
+C	HW_AVAILCPU	25
+C	HW_MAXID	26
+C	USER_CS_PATH	1
+C	USER_BC_BASE_MAX	2
+C	USER_BC_DIM_MAX	3
+C	USER_BC_SCALE_MAX	4
+C	USER_BC_STRING_MAX	5
+C	USER_COLL_WEIGHTS_MAX	6
+C	USER_EXPR_NEST_MAX	7
+C	USER_LINE_MAX	8
+C	USER_RE_DUP_MAX	9
+C	USER_POSIX2_VERSION	10
+C	USER_POSIX2_C_BIND	11
+C	USER_POSIX2_C_DEV	12
+C	USER_POSIX2_CHAR_TERM	13
+C	USER_POSIX2_FORT_DEV	14
+C	USER_POSIX2_FORT_RUN	15
+C	USER_POSIX2_LOCALEDEF	16
+C	USER_POSIX2_SW_DEV	17
+C	USER_POSIX2_UPE	18
+C	USER_STREAM_MAX	19
+C	USER_TZNAME_MAX	20
+C	USER_MAXID	21
+C	CTL_DEBUG_NAME	0
+C	CTL_DEBUG_VALUE	1
+C	CTL_DEBUG_MAXID	20
+C	PRIO_DARWIN_THREAD	3
+C	PRIO_DARWIN_BG	4096
+C	SEM_FAILED	-1
+C	AI_PASSIVE	1
+C	AI_CANONNAME	2
+C	AI_NUMERICHOST	4
+C	AI_MASK	7
+C	AI_ALL	256
+C	AI_V4MAPPED_CFG	512
+C	AI_ADDRCONFIG	1024
+C	AI_V4MAPPED	2048
+C	AI_DEFAULT	1536
+C	SIGEV_NONE	0
+C	SIGEV_SIGNAL	1
+C	SIGEV_THREAD	3
+C	AIO_CANCELED	2
+C	AIO_NOTCANCELED	4
+C	AIO_ALLDONE	1
+C	AIO_LISTIO_MAX	16
+C	LIO_NOP	0
+C	LIO_WRITE	2
+C	LIO_READ	1
+C	LIO_WAIT	2
+C	LIO_NOWAIT	1
+C	WEXITED	4
+C	WSTOPPED	127
+C	WCONTINUED	16
+C	WNOWAIT	32
+C	P_ALL	0
+C	P_PID	1
+C	P_PGID	2
+C	XATTR_NOFOLLOW	1
+C	XATTR_CREATE	2
+C	XATTR_REPLACE	4
+C	XATTR_NOSECURITY	8
+C	XATTR_NODEFAULT	16
+C	NET_RT_IFLIST2	6
+C	RTF_UP	1
+C	RTF_GATEWAY	2
+C	RTF_HOST	4
+C	RTF_REJECT	8
+C	RTF_DYNAMIC	16
+C	RTF_MODIFIED	32
+C	RTF_DONE	64
+C	RTF_DELCLONE	128
+C	RTF_CLONING	256
+C	RTF_XRESOLVE	512
+C	RTF_LLINFO	1024
+C	RTF_STATIC	2048
+C	RTF_BLACKHOLE	4096
+C	RTF_PROTO2	16384
+C	RTF_PROTO1	32768
+C	RTF_PRCLONING	65536
+C	RTF_WASCLONED	131072
+C	RTF_PROTO3	262144
+C	RTF_PINNED	1048576
+C	RTF_LOCAL	2097152
+C	RTF_BROADCAST	4194304
+C	RTF_MULTICAST	8388608
+C	RTM_VERSION	5
+C	RTM_ADD	1
+C	RTM_DELETE	2
+C	RTM_CHANGE	3
+C	RTM_GET	4
+C	RTM_LOSING	5
+C	RTM_REDIRECT	6
+C	RTM_MISS	7
+C	RTM_LOCK	8
+C	RTM_OLDADD	9
+C	RTM_OLDDEL	10
+C	RTM_RESOLVE	11
+C	RTM_NEWADDR	12
+C	RTM_DELADDR	13
+C	RTM_IFINFO	14
+C	RTM_NEWMADDR	15
+C	RTM_DELMADDR	16
+C	RTM_IFINFO2	18
+C	RTM_NEWMADDR2	19
+C	RTM_GET2	20
+C	RTV_MTU	1
+C	RTV_HOPCOUNT	2
+C	RTV_EXPIRE	4
+C	RTV_RPIPE	8
+C	RTV_SPIPE	16
+C	RTV_SSTHRESH	32
+C	RTV_RTT	64
+C	RTV_RTTVAR	128
+C	RTA_DST	1
+C	RTA_GATEWAY	2
+C	RTA_NETMASK	4
+C	RTA_GENMASK	8
+C	RTA_IFP	16
+C	RTA_IFA	32
+C	RTA_AUTHOR	64
+C	RTA_BRD	128
+C	RTAX_DST	0
+C	RTAX_GATEWAY	1
+C	RTAX_NETMASK	2
+C	RTAX_GENMASK	3
+C	RTAX_IFP	4
+C	RTAX_IFA	5
+C	RTAX_AUTHOR	6
+C	RTAX_BRD	7
+C	RTAX_MAX	8
+C	KERN_PROCARGS2	49
+C	PROC_PIDTASKALLINFO	2
+C	PROC_PIDTBSDINFO	3
+C	PROC_PIDTASKINFO	4
+C	PROC_PIDTHREADINFO	5
+C	PROC_PIDVNODEPATHINFO	9
+C	PROC_PIDPATHINFO_MAXSIZE	4096
+C	MAXCOMLEN	16
+C	XUCRED_VERSION	0
+C	LC_SEGMENT	1
+C	LC_SEGMENT_64	25
+C	MH_MAGIC	4277009102
+C	MH_MAGIC_64	4277009103
+C	DLT_NULL	0
+C	DLT_EN10MB	1
+C	DLT_EN3MB	2
+C	DLT_AX25	3
+C	DLT_PRONET	4
+C	DLT_CHAOS	5
+C	DLT_IEEE802	6
+C	DLT_ARCNET	7
+C	DLT_SLIP	8
+C	DLT_PPP	9
+C	DLT_FDDI	10
+C	DLT_ATM_RFC1483	11
+C	DLT_RAW	12
+C	DLT_LOOP	108
+C	BPF_ALIGNMENT	4
+C	MNT_NODEV	16
+C	MNT_UNION	32
+C	MNT_QUARANTINE	1024
+C	MNT_LOCAL	4096
+C	MNT_QUOTA	8192
+C	MNT_ROOTFS	16384
+C	MNT_DOVOLFS	32768
+C	MNT_DONTBROWSE	1048576
+C	MNT_IGNORE_OWNERSHIP	2097152
+C	MNT_AUTOMOUNTED	4194304
+C	MNT_JOURNALED	8388608
+C	MNT_NOUSERXATTR	16777216
+C	MNT_DEFWRITE	33554432
+C	MNT_MULTILABEL	67108864
+C	MNT_NOATIME	268435456
+C	POSIX_SPAWN_RESETIDS	1
+C	POSIX_SPAWN_SETPGROUP	2
+C	POSIX_SPAWN_SETSIGDEF	4
+C	POSIX_SPAWN_SETSIGMASK	8
+C	POSIX_SPAWN_SETEXEC	64
+C	POSIX_SPAWN_START_SUSPENDED	128
+C	IPC_CREAT	512
+C	IPC_EXCL	1024
+C	IPC_NOWAIT	2048
+C	IPC_PRIVATE	0
+C	IPC_RMID	0
+C	IPC_SET	1
+C	IPC_STAT	2
+C	IPC_R	256
+C	IPC_W	128
+C	IPC_M	4096
+C	SEM_UNDO	4096
+C	GETNCNT	3
+C	GETPID	4
+C	GETVAL	5
+C	GETALL	6
+C	GETZCNT	7
+C	SETVAL	8
+C	SETALL	9
+C	SHM_RDONLY	4096
+C	SHM_RND	8192
+C	SHMLBA	4096
+C	SHMLBA	4096
+C	SHM_R	256
+C	SHM_W	128
+C	UF_SETTABLE	65535
+C	UF_NODUMP	1
+C	UF_IMMUTABLE	2
+C	UF_APPEND	4
+C	UF_OPAQUE	8
+C	SF_SETTABLE	4294901760
+C	SF_ARCHIVED	65536
+C	SF_IMMUTABLE	131072
+C	SF_APPEND	262144
+C	UF_HIDDEN	32768
+C	MNT_WAIT	1
+C	MNT_NOWAIT	2
+C	THREAD_STANDARD_POLICY	1
+C	THREAD_STANDARD_POLICY_COUNT	0
+C	THREAD_EXTENDED_POLICY	1
+C	THREAD_TIME_CONSTRAINT_POLICY	2
+C	THREAD_PRECEDENCE_POLICY	3
+C	THREAD_AFFINITY_POLICY	4
+C	THREAD_AFFINITY_TAG_NULL	0
+C	TH_STATE_RUNNING	1
+C	TH_STATE_STOPPED	2
+C	TH_STATE_WAITING	3
+C	TH_STATE_UNINTERRUPTIBLE	4
+C	TH_STATE_HALTED	5
+C	TH_FLAGS_SWAPPED	1
+C	TH_FLAGS_IDLE	2
+C	THREAD_BASIC_INFO	3
+C	HOST_LOAD_INFO	1
+C	HOST_VM_INFO	2
+C	HOST_CPU_LOAD_INFO	3
+C	VM_PAGE_QUERY_PAGE_PRESENT	1
+C	VM_PAGE_QUERY_PAGE_FICTITIOUS	2
+C	VM_PAGE_QUERY_PAGE_REF	4
+C	VM_PAGE_QUERY_PAGE_DIRTY	8
+C	VM_PAGE_QUERY_PAGE_PAGED_OUT	16
+C	VM_PAGE_QUERY_PAGE_COPIED	32
+C	VM_PAGE_QUERY_PAGE_SPECULATIVE	64
+C	TASK_THREAD_TIMES_INFO	3
+C	HOST_CPU_LOAD_INFO_COUNT	4
+C	MACH_PORT_NULL	0
+C	COPYFILE_ACL	1
+C	COPYFILE_STAT	2
+C	COPYFILE_XATTR	4
+C	COPYFILE_DATA	8
+C	COPYFILE_SECURITY	3
+C	COPYFILE_METADATA	7
+C	COPYFILE_CHECK	65536
+C	COPYFILE_EXCL	131072
+C	COPYFILE_NOFOLLOW_SRC	262144
+C	COPYFILE_NOFOLLOW_DST	524288
+C	COPYFILE_MOVE	1048576
+C	COPYFILE_UNLINK	2097152
+C	COPYFILE_NOFOLLOW	786432
+C	COPYFILE_PACK	4194304
+C	COPYFILE_UNPACK	8388608
+C	COPYFILE_VERBOSE	1073741824
+C	ATTR_BIT_MAP_COUNT	5
+C	FSOPT_NOFOLLOW	1
+C	FSOPT_REPORT_FULLSIZE	4
+C	ATTR_CMN_NAME	1
+C	ATTR_CMN_DEVID	2
+C	ATTR_CMN_FSID	4
+C	ATTR_CMN_OBJTYPE	8
+C	ATTR_CMN_OBJTAG	16
+C	ATTR_CMN_OBJID	32
+C	ATTR_CMN_OBJPERMANENTID	64
+C	ATTR_CMN_PAROBJID	128
+C	ATTR_CMN_SCRIPT	256
+C	ATTR_CMN_CRTIME	512
+C	ATTR_CMN_MODTIME	1024
+C	ATTR_CMN_CHGTIME	2048
+C	ATTR_CMN_ACCTIME	4096
+C	ATTR_CMN_BKUPTIME	8192
+C	ATTR_CMN_FNDRINFO	16384
+C	ATTR_CMN_OWNERID	32768
+C	ATTR_CMN_GRPID	65536
+C	ATTR_CMN_ACCESSMASK	131072
+C	ATTR_CMN_FLAGS	262144
+C	ATTR_CMN_USERACCESS	2097152
+C	ATTR_CMN_EXTENDED_SECURITY	4194304
+C	ATTR_CMN_UUID	8388608
+C	ATTR_CMN_GRPUUID	16777216
+C	ATTR_CMN_FILEID	33554432
+C	ATTR_CMN_PARENTID	67108864
+C	ATTR_VOL_FSTYPE	1
+C	ATTR_VOL_SIGNATURE	2
+C	ATTR_VOL_SIZE	4
+C	ATTR_VOL_SPACEFREE	8
+C	ATTR_VOL_SPACEAVAIL	16
+C	ATTR_VOL_MINALLOCATION	32
+C	ATTR_VOL_ALLOCATIONCLUMP	64
+C	ATTR_VOL_IOBLOCKSIZE	128
+C	ATTR_VOL_OBJCOUNT	256
+C	ATTR_VOL_FILECOUNT	512
+C	ATTR_VOL_DIRCOUNT	1024
+C	ATTR_VOL_MAXOBJCOUNT	2048
+C	ATTR_VOL_MOUNTPOINT	4096
+C	ATTR_VOL_NAME	8192
+C	ATTR_VOL_MOUNTFLAGS	16384
+C	ATTR_VOL_MOUNTEDDEVICE	32768
+C	ATTR_VOL_ENCODINGSUSED	65536
+C	ATTR_VOL_CAPABILITIES	131072
+C	ATTR_VOL_ATTRIBUTES	1073741824
+C	ATTR_VOL_INFO	2147483648
+C	ATTR_DIR_LINKCOUNT	1
+C	ATTR_DIR_ENTRYCOUNT	2
+C	ATTR_DIR_MOUNTSTATUS	4
+C	ATTR_FILE_LINKCOUNT	1
+C	ATTR_FILE_TOTALSIZE	2
+C	ATTR_FILE_ALLOCSIZE	4
+C	ATTR_FILE_IOBLOCKSIZE	8
+C	ATTR_FILE_DEVTYPE	32
+C	ATTR_FILE_FORKCOUNT	128
+C	ATTR_FILE_FORKLIST	256
+C	ATTR_FILE_DATALENGTH	512
+C	ATTR_FILE_DATAALLOCSIZE	1024
+C	ATTR_FILE_RSRCLENGTH	4096
+C	ATTR_FILE_RSRCALLOCSIZE	8192
+C	DIR_MNTSTATUS_MNTPOINT	1
+C	VOL_CAPABILITIES_FORMAT	0
+C	VOL_CAPABILITIES_INTERFACES	1
+C	VOL_CAP_FMT_PERSISTENTOBJECTIDS	1
+C	VOL_CAP_FMT_SYMBOLICLINKS	2
+C	VOL_CAP_FMT_HARDLINKS	4
+C	VOL_CAP_FMT_JOURNAL	8
+C	VOL_CAP_FMT_JOURNAL_ACTIVE	16
+C	VOL_CAP_FMT_NO_ROOT_TIMES	32
+C	VOL_CAP_FMT_SPARSE_FILES	64
+C	VOL_CAP_FMT_ZERO_RUNS	128
+C	VOL_CAP_FMT_CASE_SENSITIVE	256
+C	VOL_CAP_FMT_CASE_PRESERVING	512
+C	VOL_CAP_FMT_FAST_STATFS	1024
+C	VOL_CAP_FMT_2TB_FILESIZE	2048
+C	VOL_CAP_FMT_OPENDENYMODES	4096
+C	VOL_CAP_FMT_HIDDEN_FILES	8192
+C	VOL_CAP_FMT_PATH_FROM_ID	16384
+C	VOL_CAP_INT_SEARCHFS	1
+C	VOL_CAP_INT_ATTRLIST	2
+C	VOL_CAP_INT_NFSEXPORT	4
+C	VOL_CAP_INT_READDIRATTR	8
+C	VOL_CAP_INT_EXCHANGEDATA	16
+C	VOL_CAP_INT_COPYFILE	32
+C	VOL_CAP_INT_ALLOCATE	64
+C	VOL_CAP_INT_VOL_RENAME	128
+C	VOL_CAP_INT_ADVLOCK	256
+C	VOL_CAP_INT_FLOCK	512
+C	VOL_CAP_INT_EXTENDED_SECURITY	1024
+C	VOL_CAP_INT_USERACCESS	2048
+C	VOL_CAP_INT_MANLOCK	4096
+C	VOL_CAP_INT_NAMEDSTREAMS	8192
+C	VOL_CAP_INT_EXTENDED_ATTR	16384
+C	SIDL	1
+C	SRUN	2
+C	SSLEEP	3
+C	SSTOP	4
+C	SZOMB	5
+C	THREAD_EXTENDED_POLICY_COUNT	1
+C	THREAD_TIME_CONSTRAINT_POLICY_COUNT	4
+C	THREAD_PRECEDENCE_POLICY_COUNT	1
+C	THREAD_AFFINITY_POLICY_COUNT	1
+C	THREAD_BASIC_INFO_COUNT	10
+C	TASK_THREAD_TIMES_INFO_COUNT	4
+C	NET_RT_MAXID	8
+C	__PTHREAD_MUTEX_SIZE__	40
+C	__PTHREAD_COND_SIZE__	24
+C	__PTHREAD_CONDATTR_SIZE__	4
+C	__PTHREAD_RWLOCK_SIZE__	124
+C	__PTHREAD_RWLOCKATTR_SIZE__	12
+C	TIOCTIMESTAMP	1074295897
+C	TIOCDCDTIMESTAMP	1074295896
+C	BIOCSETF	2148024935
+C	BIOCSRTIMEOUT	2148024941
+C	BIOCGRTIMEOUT	1074283118

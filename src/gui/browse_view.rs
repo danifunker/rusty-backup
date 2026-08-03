@@ -172,6 +172,11 @@ pub struct BrowseView {
     squashfs_budget_dialog: Option<Box<super::squashfs_budget_dialog::SquashfsBudgetDialog>>,
     /// Whether to show the "unsaved changes" confirmation dialog.
     show_unsaved_dialog: bool,
+    /// Staged additions whose destination already exists, awaiting one review
+    /// before anything is written: `(full path, name, decision)`.
+    conflict_review: Option<Vec<(String, String, rusty_backup::fs::replace::OnConflict)>>,
+    /// The text editor window, when open.
+    text_editor: Option<GuiTextEditor>,
     /// When true, a successful Discard/Apply from the unsaved dialog should
     /// fully close the browse view rather than just leaving edit mode. Set by
     /// the in-view Close intercept when staged edits force the dialog first.
@@ -450,6 +455,8 @@ impl Default for BrowseView {
             show_tree_large_dialog: false,
             staged_edits: EditQueue::new(),
             show_unsaved_dialog: false,
+            conflict_review: None,
+            text_editor: None,
             pending_close: false,
             prodos_type_editor: None,
             hfs_type_editor: None,
@@ -491,6 +498,26 @@ pub struct TreeStatus {
     pub text: Option<String>,
     pub error: Option<String>,
     pub fs: Option<Box<dyn Filesystem>>,
+}
+
+/// A text file open for editing in the GUI.
+///
+/// egui supplies the text widget, so this only has to hold the conversion
+/// state, which is the part that matters: the file is decoded to UTF-8/LF on
+/// open and re-encoded to its own encoding and endings on save, exactly as the
+/// CLI and TUI editors do, via the shared `model::text_edit`.
+struct GuiTextEditor {
+    /// Path inside the image, used as the write target.
+    path: String,
+    name: String,
+    /// The editable buffer: UTF-8 with LF endings.
+    text: String,
+    /// What the file was, and what it will be written back as.
+    shape: rusty_backup::model::text_edit::TextShape,
+    /// The endings it was found with, so a conversion can be shown as one.
+    original_ending: rusty_backup::model::text_edit::LineEnding,
+    dirty: bool,
+    status: Option<String>,
 }
 
 impl BrowseView {
@@ -1214,6 +1241,12 @@ impl BrowseView {
 
         // Unsaved changes dialog
         self.render_unsaved_dialog(ui);
+
+        // File-exists review, shown once before anything is written
+        self.render_conflict_review(ui);
+
+        // Text editor window
+        self.render_text_editor(ui);
 
         // New folder dialog
         self.render_new_folder_dialog(ui);
@@ -2143,6 +2176,10 @@ impl BrowseView {
                 // Remaining height for the scroll area after the header
                 let content_height = ui.available_height().min(panel_height);
 
+                // Deferred: `self.content` is borrowed for the match below, so
+                // the editor cannot be opened from inside it.
+                let mut open_editor_for: Option<(String, String)> = None;
+
                 match &self.content {
                     None => {
                         if entry.is_file() {
@@ -2151,6 +2188,11 @@ impl BrowseView {
                         }
                     }
                     Some(FileContent::Text(text)) => {
+                        // Editing is offered only where it is safe: a text
+                        // preview means the content decoded cleanly.
+                        if ui.button("Edit as text...").clicked() {
+                            open_editor_for = Some((entry.path.clone(), entry.name.clone()));
+                        }
                         egui::ScrollArea::vertical()
                             .id_salt("file_content")
                             .max_height(content_height)
@@ -2172,6 +2214,9 @@ impl BrowseView {
                                 file_detail::render_hex_view(ui, data);
                             });
                     }
+                }
+                if let Some((path, name)) = open_editor_for.take() {
+                    self.open_text_editor(&path, &name);
                 }
             }
         }
@@ -3994,6 +4039,9 @@ impl BrowseView {
             hfs_type_override: None,
             hfs_creator_override: None,
             dates: None,
+            // Set from the conflict review shown before Apply; staging one is
+            // not the moment to decide, because the user has not been asked yet.
+            on_conflict: rusty_backup::fs::replace::OnConflict::Fail,
         });
         Ok(())
     }
@@ -4036,6 +4084,30 @@ impl BrowseView {
                 return;
             }
         };
+
+        // Find every collision before writing anything. Staging exists so the
+        // questions can be asked once; discovering them mid-batch would mean
+        // interrupting per file and leaving a half-applied queue if the user
+        // changes their mind at file 7 of 12.
+        if self.conflict_review.is_none() {
+            let conflicts = self.staged_edits.conflicting_adds(&mut *efs);
+            if !conflicts.is_empty() {
+                drop(efs);
+                self.conflict_review = Some(
+                    conflicts
+                        .into_iter()
+                        // Default to Replace: staging an add onto an existing
+                        // name is what "copy this file here" means, and the
+                        // review shows exactly what will happen before any
+                        // write. The replaced file's metadata is carried over.
+                        .map(|(path, name)| {
+                            (path, name, rusty_backup::fs::replace::OnConflict::Replace)
+                        })
+                        .collect(),
+                );
+                return;
+            }
+        }
 
         let edits: Vec<StagedEdit> = self.staged_edits.drain().collect();
         let total = edits.len();
@@ -4129,6 +4201,277 @@ impl BrowseView {
     }
 
     /// Render the unsaved changes confirmation dialog.
+    /// Open a text file in the editor window, decoding it the way the CLI and
+    /// TUI editors do.
+    fn open_text_editor(&mut self, path: &str, name: &str) {
+        use rusty_backup::model::text_edit::{decode_for_edit, TextEditError};
+        const LIMIT: usize = 1024 * 1024;
+
+        let (mut fs, _commit) = match self.session.open_editable() {
+            Ok(pair) => pair,
+            Err(e) => {
+                self.edit_result = Some(format!("Cannot open for editing: {e}"));
+                return;
+            }
+        };
+        let entry = match rusty_backup::cli::verbs::ls::resolve_path(fs.as_filesystem_mut(), path) {
+            Ok(e) => e,
+            Err(e) => {
+                self.edit_result = Some(format!("Cannot find {path}: {e}"));
+                return;
+            }
+        };
+        let fs_type = fs.fs_type().to_string();
+        let bytes = match fs.read_file(&entry, LIMIT) {
+            Ok(b) => b,
+            Err(e) => {
+                self.edit_result = Some(format!("Cannot read {path}: {e}"));
+                return;
+            }
+        };
+        match decode_for_edit(&bytes, &fs_type, None) {
+            Ok(decoded) => {
+                self.text_editor = Some(GuiTextEditor {
+                    path: path.to_string(),
+                    name: name.to_string(),
+                    text: decoded.text,
+                    shape: decoded.shape,
+                    original_ending: decoded.shape.ending,
+                    dirty: false,
+                    status: None,
+                });
+            }
+            Err(TextEditError::NotText { reason }) => {
+                self.edit_result = Some(format!("{name} is not a text file ({reason})"));
+            }
+            Err(e) => self.edit_result = Some(format!("{name}: {e}")),
+        }
+    }
+
+    /// The text editor window.
+    fn render_text_editor(&mut self, ui: &mut egui::Ui) {
+        use rusty_backup::model::text_edit::LineEnding;
+        let Some(mut ed) = self.text_editor.take() else {
+            return;
+        };
+        let mut keep_open = true;
+        let mut save = false;
+
+        egui::Window::new(format!("Edit  {}", ed.name))
+            .collapsible(false)
+            .resizable(true)
+            .default_size([720.0, 480.0])
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ui.ctx(), |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(format!("Encoding: {}", ed.shape.encoding.label()));
+                    ui.separator();
+                    ui.label("Line endings:");
+                    // Changeable, for a file whose endings are simply wrong.
+                    // They are *read* from the content on open, never assumed
+                    // from the filesystem.
+                    for (v, label) in [
+                        (LineEnding::Lf, "LF (Unix)"),
+                        (LineEnding::CrLf, "CRLF (DOS)"),
+                        (LineEnding::Cr, "CR (classic Mac)"),
+                    ] {
+                        if ui.selectable_label(ed.shape.ending == v, label).clicked()
+                            && ed.shape.ending != v
+                        {
+                            ed.shape.ending = v;
+                            // A conversion is a change even with nothing typed.
+                            ed.dirty = true;
+                        }
+                    }
+                });
+                if ed.shape.mixed_endings {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(255, 200, 100),
+                        "This file mixes line-ending styles; saving makes them all the same.",
+                    );
+                }
+                if ed.shape.ending != ed.original_ending {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(255, 200, 100),
+                        format!(
+                            "Will convert {} -> {}",
+                            ed.original_ending.label(),
+                            ed.shape.ending.label()
+                        ),
+                    );
+                }
+                ui.separator();
+
+                egui::ScrollArea::vertical()
+                    .max_height(ui.available_height() - 40.0)
+                    .show(ui, |ui| {
+                        let r = ui.add(
+                            egui::TextEdit::multiline(&mut ed.text)
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(24)
+                                .font(egui::TextStyle::Monospace),
+                        );
+                        if r.changed() {
+                            ed.dirty = true;
+                        }
+                    });
+
+                if let Some(msg) = &ed.status {
+                    ui.colored_label(egui::Color32::from_rgb(255, 140, 140), msg);
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        save = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        keep_open = false;
+                    }
+                    if ed.dirty {
+                        ui.label("modified");
+                    }
+                });
+            });
+
+        if save {
+            match self.save_text_editor(&ed) {
+                Ok(n) => {
+                    self.edit_result = Some(format!("Saved {} ({n} bytes)", ed.name));
+                    // Drop the cached read so the preview shows what is now on
+                    // disk rather than what was there when it was opened.
+                    self.content = None;
+                    self.invalidate_cached_fs();
+                    return; // window closes
+                }
+                Err(e) => {
+                    // Keep the window open with the text intact: losing an edit
+                    // to a failed save is the worst outcome here.
+                    ed.status = Some(format!("{e:#}"));
+                    self.text_editor = Some(ed);
+                    return;
+                }
+            }
+        }
+        if keep_open {
+            self.text_editor = Some(ed);
+        }
+    }
+
+    /// Encode and write the editor's contents through the shared replace path.
+    fn save_text_editor(&mut self, ed: &GuiTextEditor) -> anyhow::Result<usize> {
+        use rusty_backup::model::text_edit::encode_after_edit;
+        let bytes = encode_after_edit(&ed.text, &ed.shape, false)
+            .map_err(|e| anyhow::anyhow!("cannot save as {}: {e}", ed.shape.encoding.label()))?;
+
+        let (mut fs, commit) = self.session.open_editable()?;
+        let (parent, leaf) =
+            rusty_backup::cli::verbs::ls::resolve_parent(fs.as_filesystem_mut(), &ed.path)?;
+        let mut reader = std::io::Cursor::new(bytes.clone());
+        rusty_backup::fs::replace::create_or_replace(
+            fs.as_mut(),
+            &parent,
+            &leaf,
+            &mut reader,
+            bytes.len() as u64,
+            &rusty_backup::fs::filesystem::CreateFileOptions::default(),
+            rusty_backup::fs::replace::ReplacePolicy::replace(),
+        )
+        .map_err(|e| anyhow::anyhow!("writing {}: {e}", ed.path))?;
+        fs.sync_metadata()
+            .map_err(|e| anyhow::anyhow!("sync_metadata: {e}"))?;
+        drop(fs);
+        commit.commit()?;
+        Ok(bytes.len())
+    }
+
+    /// One review of every name collision, before any write happens.
+    ///
+    /// Each row is decided individually because a batch rarely has one answer:
+    /// overwriting a config file you meant to fix and overwriting a document
+    /// you forgot you had are different things, and a single blanket prompt
+    /// makes the user guess which files it covers.
+    fn render_conflict_review(&mut self, ui: &mut egui::Ui) {
+        use rusty_backup::fs::replace::OnConflict;
+        let Some(mut rows) = self.conflict_review.clone() else {
+            return;
+        };
+
+        let mut apply = false;
+        let mut cancel = false;
+        egui::Window::new("Some files already exist")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ui.ctx(), |ui| {
+                ui.label(format!(
+                    "{} of the staged file(s) would overwrite something already on the image.",
+                    rows.len()
+                ));
+                ui.label("Replacing keeps the existing file's permissions, dates and type.");
+                ui.add_space(6.0);
+
+                ui.horizontal(|ui| {
+                    if ui.button("Replace all").clicked() {
+                        for r in rows.iter_mut() {
+                            r.2 = OnConflict::Replace;
+                        }
+                    }
+                    if ui.button("Skip all").clicked() {
+                        for r in rows.iter_mut() {
+                            r.2 = OnConflict::Skip;
+                        }
+                    }
+                });
+                ui.add_space(4.0);
+
+                egui::ScrollArea::vertical()
+                    .max_height(240.0)
+                    .show(ui, |ui| {
+                        for (path, _name, decision) in rows.iter_mut() {
+                            ui.horizontal(|ui| {
+                                ui.radio_value(decision, OnConflict::Replace, "Replace");
+                                ui.radio_value(decision, OnConflict::Skip, "Skip");
+                                ui.label(path.as_str());
+                            });
+                        }
+                    });
+
+                ui.add_space(6.0);
+                let replacing = rows.iter().filter(|r| r.2 == OnConflict::Replace).count();
+                ui.label(format!(
+                    "{replacing} to replace, {} to skip",
+                    rows.len() - replacing
+                ));
+                ui.horizontal(|ui| {
+                    if ui.button("Continue").clicked() {
+                        apply = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if cancel {
+            // Nothing has been written, and the queue is untouched, so the user
+            // still has every staged edit to reconsider.
+            self.conflict_review = None;
+            self.edit_result = Some("Save cancelled - nothing was written".to_string());
+            return;
+        }
+        if apply {
+            for (path, _name, decision) in &rows {
+                self.staged_edits.set_conflict_for(path, *decision);
+            }
+            // Keep the review non-None so the re-entry does not ask again;
+            // apply_staged_edits clears it when it finishes.
+            self.conflict_review = Some(rows);
+            self.apply_staged_edits();
+            self.conflict_review = None;
+            return;
+        }
+        self.conflict_review = Some(rows);
+    }
+
     fn render_unsaved_dialog(&mut self, ui: &mut egui::Ui) {
         if !self.show_unsaved_dialog {
             return;

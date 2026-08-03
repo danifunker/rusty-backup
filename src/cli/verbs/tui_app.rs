@@ -79,6 +79,10 @@ enum Opened {
         path: String,
         size: u64,
         parts: Vec<PartRow>,
+        /// Set when this was opened from the disk list, so the view can show
+        /// the hardware facts (media, bus, flags, what the OS has mounted)
+        /// above the partition table instead of on a separate screen.
+        disk: Option<Box<DiskDevice>>,
     },
     Backup {
         path: String,
@@ -158,6 +162,11 @@ struct Explorer {
     mkdir_input: Option<String>,
     /// The `(name, is_dir)` of an entry pending a delete confirmation.
     confirm_delete: Option<(String, bool)>,
+    /// An import whose destination name is taken: `(host path, file name)`.
+    /// Held until the user answers Replace / Skip.
+    confirm_overwrite: Option<(std::path::PathBuf, String)>,
+    /// The in-app text editor, when open.
+    editor: Option<TextEditor>,
     /// A scrollable fsck check / repair report overlay, when open.
     fsck_report: Option<FsckReportView>,
     /// The whole-image "Transform" launcher menu (selected index), when open.
@@ -206,6 +215,10 @@ struct MetaEdit {
     type_code: String,
     creator: String,
     modified: String,
+    /// Creation date. Editable separately from `modified`, because a restored
+    /// file whose creation date has been reset to today has lost information
+    /// nothing else records.
+    created: String,
     /// Octal permission bits, or empty when the filesystem has none.
     mode: String,
     /// `uid:gid`, or empty when the filesystem has no ownership.
@@ -217,18 +230,20 @@ struct MetaEdit {
 
 impl MetaEdit {
     /// Field order in the editor, matching the render order.
-    const FIELDS: usize = 5;
+    const FIELDS: usize = 6;
     const F_TYPE: usize = 0;
     const F_CREATOR: usize = 1;
     const F_MODIFIED: usize = 2;
-    const F_MODE: usize = 3;
-    const F_OWNER: usize = 4;
+    const F_CREATED: usize = 3;
+    const F_MODE: usize = 4;
+    const F_OWNER: usize = 5;
 
     /// The text buffer for the focused field.
     fn focused_mut(&mut self) -> &mut String {
         match self.field {
             Self::F_CREATOR => &mut self.creator,
             Self::F_MODIFIED => &mut self.modified,
+            Self::F_CREATED => &mut self.created,
             Self::F_MODE => &mut self.mode,
             Self::F_OWNER => &mut self.owner,
             _ => &mut self.type_code,
@@ -314,6 +329,139 @@ const EXPORT_FORMATS: &[(&str, ExportFormat)] = &[
         ExportFormat::Archive(EsFormat::MacArchive),
     ),
 ];
+
+/// A small text editor over one file inside an image.
+///
+/// Exists because the `$EDITOR` round trip (`rb-cli edit`) needs a host, a
+/// temp directory and an editor to launch, and the machines this tool is
+/// pointed at often have none of those - a serial console on a vintage box, or
+/// the GUI, where shelling out is worse than useless. The conversion rules are
+/// the shared ones in [`crate::model::text_edit`], so a file edited here comes
+/// out byte-identical to one edited through `$EDITOR`.
+///
+/// Deliberately small: no undo, no search, no wrapping. It is for correcting a
+/// line in a config file, which is the job that has no other answer here.
+struct TextEditor {
+    name: String,
+    /// One entry per line, never empty (an empty file is one empty line).
+    lines: Vec<String>,
+    /// Cursor, as (line index, character index within that line).
+    row: usize,
+    col: usize,
+    scroll: usize,
+    dirty: bool,
+    /// How to put the file back the way it was found.
+    shape: crate::model::text_edit::TextShape,
+    /// Set when a save failed, shown in the editor's own status line.
+    status: Option<String>,
+    /// Esc with unsaved changes asks rather than discarding them.
+    confirm_discard: bool,
+}
+
+impl TextEditor {
+    fn new(name: String, decoded: crate::model::text_edit::DecodedText) -> Self {
+        // `split('\n')` rather than `lines()`: the latter swallows a trailing
+        // newline, so a file ending in one would lose it on every save.
+        let lines: Vec<String> = decoded.text.split('\n').map(str::to_string).collect();
+        Self {
+            name,
+            lines: if lines.is_empty() {
+                vec![String::new()]
+            } else {
+                lines
+            },
+            row: 0,
+            col: 0,
+            scroll: 0,
+            dirty: false,
+            shape: decoded.shape,
+            status: None,
+            confirm_discard: false,
+        }
+    }
+
+    /// The edited text, in the LF form `encode_after_edit` expects.
+    fn text(&self) -> String {
+        self.lines.join("\n")
+    }
+
+    fn cur_len(&self) -> usize {
+        self.lines[self.row].chars().count()
+    }
+
+    /// Byte offset of character index `col` in the current line, since Rust
+    /// strings are indexed by byte and a vintage file can hold multi-byte
+    /// characters once decoded.
+    fn byte_at(&self, col: usize) -> usize {
+        self.lines[self.row]
+            .char_indices()
+            .nth(col)
+            .map(|(i, _)| i)
+            .unwrap_or(self.lines[self.row].len())
+    }
+
+    fn insert(&mut self, c: char) {
+        let at = self.byte_at(self.col);
+        self.lines[self.row].insert(at, c);
+        self.col += 1;
+        self.dirty = true;
+    }
+
+    fn newline(&mut self) {
+        let at = self.byte_at(self.col);
+        let rest = self.lines[self.row].split_off(at);
+        self.lines.insert(self.row + 1, rest);
+        self.row += 1;
+        self.col = 0;
+        self.dirty = true;
+    }
+
+    fn backspace(&mut self) {
+        if self.col > 0 {
+            let at = self.byte_at(self.col - 1);
+            self.lines[self.row].remove(at);
+            self.col -= 1;
+            self.dirty = true;
+        } else if self.row > 0 {
+            // Joining lines is how a stray blank line gets removed, so it has
+            // to work, not just be a no-op at column zero.
+            let cur = self.lines.remove(self.row);
+            self.row -= 1;
+            self.col = self.cur_len();
+            self.lines[self.row].push_str(&cur);
+            self.dirty = true;
+        }
+    }
+
+    fn delete(&mut self) {
+        if self.col < self.cur_len() {
+            let at = self.byte_at(self.col);
+            self.lines[self.row].remove(at);
+            self.dirty = true;
+        } else if self.row + 1 < self.lines.len() {
+            let next = self.lines.remove(self.row + 1);
+            self.lines[self.row].push_str(&next);
+            self.dirty = true;
+        }
+    }
+
+    fn move_to(&mut self, row: usize, col: usize) {
+        self.row = row.min(self.lines.len() - 1);
+        self.col = col.min(self.cur_len());
+    }
+
+    /// Keep the cursor on screen for a viewport of `height` lines.
+    fn follow_cursor(&mut self, height: usize) {
+        if height == 0 {
+            return;
+        }
+        if self.row < self.scroll {
+            self.scroll = self.row;
+        } else if self.row >= self.scroll + height {
+            self.scroll = self.row + 1 - height;
+        }
+    }
+}
 
 /// A scrollable file view (text lines, or a hex dump for binary content).
 struct Preview {
@@ -495,7 +643,15 @@ impl FilePicker {
     fn validate(&mut self, path: std::path::PathBuf) -> Option<PickResult> {
         let ok = match self.kind {
             PickKind::Any => path.exists(),
-            PickKind::File => path.is_file(),
+            // A raw device (`/dev/sda`, `/dev/disk0`) is neither a regular file
+            // nor a directory, so `is_file()` rejected every one of them with
+            // "No such file" - for something plainly present. Accepting
+            // "exists and is not a directory" lets a device be typed wherever an
+            // image can be, which is what makes Commander able to open a raw
+            // partition at all. Everything downstream already copes: the
+            // partition probe reads through a plain reader, and sizes come from
+            // seeking rather than `metadata.len()` (which is 0 for a device).
+            PickKind::File => path.exists() && !path.is_dir(),
             PickKind::Dir => path.is_dir(),
         };
         if ok {
@@ -506,7 +662,13 @@ impl FilePicker {
                 PickKind::File => "file",
                 PickKind::Any => "path",
             };
-            self.error = Some(format!("No such {what}: {}", path.display()));
+            // Distinguish "wrong kind" from "absent"; the old message claimed
+            // absence for both.
+            self.error = Some(if path.exists() {
+                format!("Not a {what}: {}", path.display())
+            } else {
+                format!("No such {what}: {}", path.display())
+            });
             None
         }
     }
@@ -891,6 +1053,20 @@ fn locale_is_utf8() -> bool {
     false
 }
 
+/// crossterm writes every colour as `38;5;N`, which an 8/16-colour terminal cannot parse at all.
+///
+/// Keyed on the OS as well as `$TERM`: no terminal shipped for Mac OS X 10.5 or earlier does 256
+/// colours, and third-party ones (iTerm) report a `$TERM` no blocklist can enumerate.
+fn low_color_terminal() -> bool {
+    const LOW: [&str; 5] = ["xterm-color", "vt100", "vt102", "ansi", "dumb"];
+    if std::env::var("TERM").map(|t| LOW.contains(&t.as_str())) == Ok(true) {
+        return true;
+    }
+    // Only on a version we positively read: an unknown one keeps colour rather than dropping it.
+    let host = crate::os::host_version::HostVersion::detect();
+    cfg!(target_vendor = "apple") && host.version.is_some() && !host.at_least(10, 6)
+}
+
 /// Semantic 16-color palette. Colors *reinforce* meaning already carried by
 /// layout and reversed video; they never carry it alone. Honors `$NO_COLOR` by
 /// collapsing every slot to the terminal default.
@@ -902,7 +1078,7 @@ struct Palette {
 impl Palette {
     fn detect() -> Self {
         Palette {
-            color: std::env::var_os("NO_COLOR").is_none(),
+            color: std::env::var_os("NO_COLOR").is_none() && !low_color_terminal(),
         }
     }
     fn styled(self, c: Color) -> Style {
@@ -953,6 +1129,145 @@ const TABS: &[(TabId, &str)] = &[
 /// Inspect is the GUI's default tab; open on it too.
 const DEFAULT_TAB: usize = 2;
 
+// ---------------------------------------------------------------- key hints --
+//
+// One table per screen, and both the footer and the `?` overlay render from it.
+// They used to be written out by hand in each draw fn, which is how `E` (edit)
+// came to exist in the key handler and nowhere on screen at all: there was no
+// place that had to list it. A binding added here shows up in both, or in
+// neither - it cannot show up in one.
+
+/// One key binding, as shown in the footer strip and the `?` window.
+struct KeyHint {
+    /// Printable key, e.g. `"d"`, `"F2"`, `"Up/Down"`.
+    keys: &'static str,
+    /// What it does, phrased to fit a footer strip.
+    desc: &'static str,
+}
+
+const fn hint(keys: &'static str, desc: &'static str) -> KeyHint {
+    KeyHint { keys, desc }
+}
+
+/// Keys that work on every screen. Appended to each context in the `?` window,
+/// and deliberately left out of the footer strip, which has no room to repeat
+/// them on every screen.
+const HINTS_GLOBAL: &[KeyHint] = &[
+    hint("?", "This key list  (also F1)"),
+    hint(":", "Command palette - run any rb-cli verb"),
+    hint("q", "Quit"),
+    hint("Ctrl-C", "Quit immediately"),
+];
+
+// Command keys first, navigation after. The footer strip fills left to right
+// and stops when it runs out of room, so whatever leads is what a user actually
+// sees - and the arrow keys are the one part nobody needs telling. Leading with
+// navigation pushed every real command off the end of an 80-column terminal,
+// which is how `d` stayed as invisible as `E` had been.
+const HINTS_EXPLORER: &[KeyHint] = &[
+    hint("d", "Edit as text"),
+    hint("e", "Export"),
+    hint("i", "Import"),
+    hint("m", "Metadata (mode, owner, type)"),
+    hint("n", "New folder"),
+    hint("x", "Delete"),
+    hint("f", "Check (fsck)"),
+    hint("r", "Repair"),
+    hint("b", "Bless System Folder"),
+    hint("t", "Transform image"),
+    hint("Esc", "Close"),
+    hint("Enter", "Open directory / view file"),
+    hint("Tab", "Switch pane (tree <-> list)"),
+    hint("Space", "Mark / unmark"),
+    hint("Up/Down", "Move  (also k/j)"),
+    hint("Left/Right", "Collapse/expand, switch pane  (also h/l)"),
+    hint("PgUp/PgDn", "Page up / down"),
+    hint("Home/End", "First / last entry"),
+];
+
+/// The scrolling read-only overlays: file preview, and the fsck / repair
+/// report. They sit over the Explorer and take every key, so the footer has to
+/// stop advertising the Explorer's while one is up.
+const HINTS_REPORT: &[KeyHint] = &[
+    hint("Up/Down", "Scroll  (also k/j)"),
+    hint("PgUp/PgDn", "Page up / down"),
+    hint("Home/End", "Top / bottom"),
+    hint("Esc", "Close  (also q, Enter)"),
+];
+
+const HINTS_EDITOR: &[KeyHint] = &[
+    hint("F2", "Save"),
+    hint("F3", "Line endings (LF/CRLF/CR)"),
+    hint("Esc", "Close  (prompts if modified)"),
+    hint("Arrows", "Move cursor"),
+    hint("PgUp/PgDn", "Page up / down"),
+    hint("Home/End", "Start / end of line"),
+    hint("Enter", "New line"),
+    hint("Tab", "Insert four spaces"),
+    hint("Backspace", "Delete back  (Del deletes forward)"),
+];
+
+const HINTS_INSPECT_DISKS: &[KeyHint] = &[
+    hint("Up/Down", "Move  (also k/j)"),
+    hint("Enter", "Open the disk's partition table"),
+    hint("o", "Open an image file or backup folder"),
+    hint("r", "Rescan disks"),
+    hint("g/G", "Top / bottom  (also Home/End)"),
+];
+
+const HINTS_INSPECT_IMAGE: &[KeyHint] = &[
+    hint("Up/Down", "Move  (also k/j)"),
+    hint("Enter", "Browse this partition's filesystem"),
+    hint("o", "Open another image or backup folder"),
+    hint("Esc", "Back to the disk list"),
+    hint("g/G", "Top / bottom  (also Home/End)"),
+];
+
+const HINTS_TAB: &[KeyHint] = &[
+    hint("Left/Right", "Previous / next tab  (also h/l, Tab)"),
+    hint("1-9", "Jump to a tab by number"),
+    hint("Up/Down", "Move selection / scroll  (also k/j)"),
+    hint("g/G", "Top / bottom  (also Home/End)"),
+    hint("Enter", "Open / activate"),
+    hint("Esc", "Back, or cancel a running task"),
+];
+
+/// Fold a *command* key to lower case, so a binding fires whether or not shift
+/// was held. Only ever applied after every text-entry overlay has taken its
+/// turn - the editor, the `:` palette and the name prompts all return before
+/// this, or typing a capital letter would become impossible.
+///
+/// `G` is the deliberate exception: `g`/`G` is the vim top/bottom pair, kept as
+/// a pair and spelled out as `g/G` in the footer and the `?` window rather than
+/// left for the user to discover.
+fn fold_cmd_key(code: KeyCode) -> KeyCode {
+    match code {
+        KeyCode::Char('G') => code,
+        KeyCode::Char(c) if c.is_ascii_uppercase() => KeyCode::Char(c.to_ascii_lowercase()),
+        _ => code,
+    }
+}
+
+/// Render hints as a single footer strip, clipped to `width`.
+///
+/// Drops whole hints rather than cutting one mid-word, and appends `?` as the
+/// last thing standing so there is always a route to the full list even on a
+/// narrow terminal.
+fn footer_strip(hints: &[KeyHint], width: usize) -> String {
+    const TAIL: &str = "  ?=keys";
+    let budget = width.saturating_sub(TAIL.len() + 1);
+    let mut out = String::new();
+    for h in hints {
+        let piece = format!(" {} {} ", h.keys, h.desc);
+        if out.chars().count() + piece.chars().count() > budget {
+            break;
+        }
+        out.push_str(&piece);
+    }
+    out.push_str(TAIL);
+    out
+}
+
 /// Entry point for the `tui` verb. Guards the terminal, runs the event loop,
 /// and always restores the terminal (ratatui installs a panic hook that does
 /// the same on an unwind).
@@ -971,6 +1286,8 @@ pub fn run_on(initial_tab: usize, label: &'static str) -> Result<()> {
     )?;
 
     let mut terminal = ratatui::init();
+    // An old Terminal.app may not give a blank alternate screen, and ratatui only redraws changed cells.
+    let _ = terminal.clear();
     let outcome = App::new_on(initial_tab).run(&mut terminal);
     ratatui::restore();
     outcome
@@ -1831,7 +2148,31 @@ impl CommanderState {
             }
         }
 
-        let parts = crate::model::commander_source::probe_partitions(&path).unwrap_or_default();
+        // Report a probe failure instead of discarding it. On a raw device this
+        // is normally "needs elevation", and `unwrap_or_default()` turned that
+        // into an empty partition list, which then failed one step later trying
+        // to open a filesystem at offset 0 - an error that named the filesystem
+        // and never mentioned privileges.
+        let parts = match crate::model::commander_source::probe_partitions(&path) {
+            Ok(p) => p,
+            Err(e) => {
+                let denied = e
+                    .chain()
+                    .any(|c| c.to_string().to_lowercase().contains("permission denied"));
+                if denied {
+                    self.status = Some(format!(
+                        "{}: permission denied - raw device access needs elevation; \
+                         re-run rb-cli tui elevated",
+                        path.display()
+                    ));
+                    self.is_error = true;
+                    return;
+                }
+                // Not a privilege problem: it may legitimately have no table
+                // (a superfloppy), so fall through and try it as one volume.
+                Vec::new()
+            }
+        };
         if parts.len() > 1 {
             let p = self.pane_mut(side);
             p.parts = parts;
@@ -2938,7 +3279,6 @@ struct App {
     /// Cursor index into the active tab's selectable rows (Inspect disk list).
     selection: usize,
     /// When the Inspect tab has drilled into a disk, the index of that disk.
-    detail: Option<usize>,
     /// An image/backup opened from the Inspect tab (takes over the Inspect body).
     opened: Option<Opened>,
     /// The shared "Open file / backup" picker (path + recent + Tab-browse).
@@ -2974,6 +3314,10 @@ struct App {
     /// executes it, and re-enters).
     pending_palette: Option<String>,
     show_help: bool,
+    /// First visible row of the `?` window. The list is per-screen and the
+    /// Explorer's is longer than a short terminal, so it scrolls rather than
+    /// silently stopping at the bottom edge.
+    help_scroll: usize,
     should_quit: bool,
 }
 
@@ -2987,7 +3331,6 @@ impl App {
             active,
             scroll: 0,
             selection: 0,
-            detail: None,
             opened: None,
             open_picker: None,
             explorer: None,
@@ -3006,6 +3349,7 @@ impl App {
             palette_input: None,
             pending_palette: None,
             show_help: false,
+            help_scroll: 0,
             should_quit: false,
         };
         app.on_tab_changed();
@@ -3097,13 +3441,26 @@ impl App {
             return Ok(());
         }
 
-        // The help overlay is modal.
+        // The help overlay is modal. It scrolls: the Explorer's list is longer
+        // than a short terminal can show, and a list that silently stops at the
+        // bottom edge is the same discoverability bug this window exists to fix.
         if self.show_help {
-            if matches!(
-                key.code,
-                KeyCode::Esc | KeyCode::Char('?') | KeyCode::Enter | KeyCode::F(1)
-            ) {
-                self.show_help = false;
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('?') | KeyCode::Enter | KeyCode::F(1) => {
+                    self.show_help = false;
+                    self.help_scroll = 0;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.help_scroll = self.help_scroll.saturating_sub(1)
+                }
+                KeyCode::Down | KeyCode::Char('j') => self.help_scroll += 1,
+                KeyCode::PageUp => self.help_scroll = self.help_scroll.saturating_sub(10),
+                KeyCode::PageDown => self.help_scroll += 10,
+                KeyCode::Home => self.help_scroll = 0,
+                // Clamped against the real row count when drawn, so overshooting
+                // here just parks at the bottom.
+                KeyCode::End => self.help_scroll = usize::MAX / 2,
+                _ => {}
             }
             return Ok(());
         }
@@ -3148,6 +3505,28 @@ impl App {
 
         // The filesystem Explorer is a modal window over the Inspect tab.
         if self.explorer.is_some() {
+            // `?` has to reach the key list from in here too - the Explorer
+            // consumes every key below, and it is the screen with the most
+            // bindings to discover. Suppressed wherever something is taking
+            // text, where `?` is simply a character; F1 never is, so it always
+            // works, including inside the editor.
+            let ex_typing = self
+                .explorer
+                .as_ref()
+                .map(|e| {
+                    e.editor.is_some()
+                        || e.mkdir_input.is_some()
+                        || e.picker.is_some()
+                        || e.metadata.is_some()
+                })
+                .unwrap_or(false);
+            if matches!(key.code, KeyCode::F(1))
+                || (matches!(key.code, KeyCode::Char('?')) && !ex_typing)
+            {
+                self.show_help = true;
+                self.help_scroll = 0;
+                return Ok(());
+            }
             self.handle_explorer_key(key.code);
             return Ok(());
         }
@@ -3230,7 +3609,6 @@ impl App {
             KeyCode::Char('r') if self.current() == TabId::Inspect => {
                 self.disks = Some(enumerate_devices());
                 self.selection = 0;
-                self.detail = None;
             }
             _ => {}
         }
@@ -3241,7 +3619,6 @@ impl App {
     /// (rusty-backup folder or Clonezilla image); a file is a disk image. On
     /// success the path is recorded in the MRU (move-to-front).
     fn open_target(&mut self, path: std::path::PathBuf) {
-        self.detail = None;
         self.selection = 0;
         self.status = None;
         if path.is_dir() {
@@ -3267,22 +3644,80 @@ impl App {
                 }
                 Err(e) => self.status = Some(format!("Cannot open: {e}")),
             }
-        } else if path.is_file() {
-            match std::fs::metadata(&path) {
-                Ok(m) => {
-                    let display = path.display().to_string();
-                    crate::update::push_recent(crate::update::RecentMode::Inspect, &display);
-                    let parts = parse_partitions(&path, m.len());
-                    self.opened = Some(Opened::Image {
-                        path: display,
-                        size: m.len(),
-                        parts,
-                    });
-                }
-                Err(e) => self.status = Some(format!("{}: {e}", path.display())),
-            }
+        } else if path.exists() {
+            // `exists()` rather than `is_file()`: a raw device (`/dev/sda`) is
+            // neither a file nor a directory, so `is_file()` sent every device
+            // path to the "No such file or directory" arm below - a flat denial
+            // for something plainly present, with no hint that the tab simply
+            // did not handle devices. Opening one is the whole point of the
+            // disk list next to it.
+            self.open_image_at(path, None);
         } else {
             self.status = Some(format!("No such file or directory: {}", path.display()));
+        }
+    }
+
+    /// Open an image *or* a raw device as the Inspect tab's image view.
+    ///
+    /// `size` is looked up via [`readable_size`] so block devices come out at
+    /// their true size instead of the zero `metadata` reports for them. Pass
+    /// `disk` when opening from the disk list so the view can show the hardware
+    /// facts alongside the partition table.
+    fn open_image_at(&mut self, path: std::path::PathBuf, disk: Option<Box<DiskDevice>>) {
+        let display = path.display().to_string();
+        let size = match readable_size(&path) {
+            Ok(s) => s,
+            // Fall back to the size the enumerator already reported. Reading a
+            // raw device needs elevation, and refusing to show anything at all
+            // is a worse answer than showing the hardware facts plus why the
+            // table could not be read.
+            Err(e) => match disk.as_ref().map(|d| d.size_bytes).filter(|&s| s > 0) {
+                Some(s) => {
+                    self.status = Some(Self::access_hint(&display, &e));
+                    s
+                }
+                None => {
+                    self.status = Some(Self::access_hint(&display, &e));
+                    return;
+                }
+            },
+        };
+        match parse_partitions(&path, size) {
+            Ok(parts) => {
+                crate::update::push_recent(crate::update::RecentMode::Inspect, &display);
+                self.status = None;
+                self.opened = Some(Opened::Image {
+                    path: display,
+                    size,
+                    parts,
+                    disk,
+                });
+            }
+            Err(e) => {
+                self.status = Some(Self::access_hint(&display, &e));
+                // A device we cannot read still has facts worth showing, and
+                // leaving the user on the list with only a status line makes it
+                // look as though Enter did nothing.
+                if disk.is_some() {
+                    self.opened = Some(Opened::Image {
+                        path: display,
+                        size,
+                        parts: Vec::new(),
+                        disk,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Explain an open failure, naming elevation when that is the actual cause.
+    /// A bare "Permission denied" on `/dev/sda` reads like a bug rather than the
+    /// expected cost of raw device access.
+    fn access_hint(what: &str, e: &std::io::Error) -> String {
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            format!("{what}: {e} - raw device access needs elevation; re-run rb-cli tui elevated")
+        } else {
+            format!("{what}: {e}")
         }
     }
 
@@ -3333,9 +3768,25 @@ impl App {
                     self.open_explorer(&path, selector, label);
                 }
             }
-            // Disk list: Enter a disk → its detail view.
-            TabId::Inspect if self.detail.is_none() && self.row_count() > 0 => {
-                self.detail = Some(self.selection);
+            // Disk list: Enter → the disk's own partition table, with its
+            // hardware facts shown above it.
+            //
+            // One Enter, one screen. This used to take two: the first opened a
+            // read-only pane of media/bus/flags plus the partitions the *OS* had
+            // mounted, and a second - undiscoverable, and for a while not wired
+            // up at all - reached the real table. Nothing on screen said the
+            // second press existed, and the two screens were describing the same
+            // disk, so they are now one view.
+            TabId::Inspect if self.row_count() > 0 => {
+                let target = self
+                    .disks
+                    .as_ref()
+                    .and_then(|d| d.get(self.selection))
+                    .map(|d| (d.path.clone(), Box::new(d.clone())));
+                if let Some((path, disk)) = target {
+                    self.selection = 0;
+                    self.open_image_at(path, Some(disk));
+                }
             }
             _ => {}
         }
@@ -3393,6 +3844,8 @@ impl App {
                 confirm_bless: None,
                 mkdir_input: None,
                 confirm_delete: None,
+                confirm_overwrite: None,
+                editor: None,
                 fsck_report: None,
                 transform_menu: None,
             };
@@ -3488,6 +3941,131 @@ impl App {
                 }
                 KeyCode::Enter => self.launch_transform(sel),
                 _ => {}
+            }
+            return;
+        }
+
+        // Text editor (modal). Checked before every other overlay: while it is
+        // open, keys are text, not commands.
+        if self
+            .explorer
+            .as_ref()
+            .map(|e| e.editor.is_some())
+            .unwrap_or(false)
+        {
+            let page = self.explorer_page();
+            let discarding = self
+                .explorer
+                .as_ref()
+                .and_then(|e| e.editor.as_ref())
+                .map(|ed| ed.confirm_discard)
+                .unwrap_or(false);
+            if discarding {
+                match code {
+                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                        if let Some(ex) = self.explorer.as_mut() {
+                            ex.editor = None;
+                        }
+                    }
+                    _ => {
+                        if let Some(ed) = self.explorer.as_mut().and_then(|e| e.editor.as_mut()) {
+                            ed.confirm_discard = false;
+                        }
+                    }
+                }
+                return;
+            }
+            // F2 saves, the Midnight Commander convention this TUI already
+            // follows. Deliberately not Ctrl-S: on a real serial console that
+            // is XOFF and freezes the terminal, and a serial console is exactly
+            // where this editor earns its place.
+            if matches!(code, KeyCode::F(2)) {
+                self.explorer_editor_save();
+                return;
+            }
+            // F3 cycles the line endings the file will be saved with. Endings
+            // are read from the file on open, never assumed - this is for when
+            // the file itself is wrong.
+            if matches!(code, KeyCode::F(3)) {
+                if let Some(ed) = self.explorer.as_mut().and_then(|e| e.editor.as_mut()) {
+                    use crate::model::text_edit::LineEnding;
+                    ed.shape.ending = match ed.shape.ending {
+                        LineEnding::Lf => LineEnding::CrLf,
+                        LineEnding::CrLf => LineEnding::Cr,
+                        LineEnding::Cr => LineEnding::Lf,
+                    };
+                    // A conversion is a change even when no character was
+                    // typed, so Esc must warn about it like any other edit.
+                    ed.dirty = true;
+                    ed.status = Some(format!(
+                        "Line endings will be saved as {}",
+                        ed.shape.ending.label()
+                    ));
+                }
+                return;
+            }
+            let Some(ed) = self.explorer.as_mut().and_then(|e| e.editor.as_mut()) else {
+                return;
+            };
+            ed.status = None;
+            match code {
+                KeyCode::Esc => {
+                    if ed.dirty {
+                        // Losing an edit to a stray Esc is exactly the failure
+                        // this whole feature exists to avoid.
+                        ed.confirm_discard = true;
+                    } else {
+                        self.explorer.as_mut().unwrap().editor = None;
+                        return;
+                    }
+                }
+                KeyCode::Char(c) => ed.insert(c),
+                KeyCode::Enter => ed.newline(),
+                KeyCode::Backspace => ed.backspace(),
+                KeyCode::Delete => ed.delete(),
+                KeyCode::Tab => {
+                    for _ in 0..4 {
+                        ed.insert(' ');
+                    }
+                }
+                KeyCode::Left => {
+                    if ed.col > 0 {
+                        ed.col -= 1;
+                    } else if ed.row > 0 {
+                        let r = ed.row - 1;
+                        let c = ed.lines[r].chars().count();
+                        ed.move_to(r, c);
+                    }
+                }
+                KeyCode::Right => {
+                    if ed.col < ed.cur_len() {
+                        ed.col += 1;
+                    } else if ed.row + 1 < ed.lines.len() {
+                        ed.move_to(ed.row + 1, 0);
+                    }
+                }
+                KeyCode::Up => {
+                    let (r, c) = (ed.row.saturating_sub(1), ed.col);
+                    ed.move_to(r, c);
+                }
+                KeyCode::Down => {
+                    let (r, c) = (ed.row + 1, ed.col);
+                    ed.move_to(r, c);
+                }
+                KeyCode::Home => ed.col = 0,
+                KeyCode::End => ed.col = ed.cur_len(),
+                KeyCode::PageUp => {
+                    let (r, c) = (ed.row.saturating_sub(page), ed.col);
+                    ed.move_to(r, c);
+                }
+                KeyCode::PageDown => {
+                    let (r, c) = (ed.row + page, ed.col);
+                    ed.move_to(r, c);
+                }
+                _ => {}
+            }
+            if let Some(ed) = self.explorer.as_mut().and_then(|e| e.editor.as_mut()) {
+                ed.follow_cursor(page);
             }
             return;
         }
@@ -3697,6 +4275,32 @@ impl App {
             return;
         }
 
+        // Overwrite confirmation. Three answers, because "no" is ambiguous
+        // here: leaving the existing file alone and abandoning the import are
+        // different intentions, and only one of them is what the user meant.
+        let overwrite_pending = self
+            .explorer
+            .as_ref()
+            .and_then(|e| e.confirm_overwrite.clone());
+        if let Some((host, _leaf)) = overwrite_pending {
+            match code {
+                KeyCode::Char('r') | KeyCode::Char('R') | KeyCode::Enter => {
+                    self.explorer_import_with(&host, crate::fs::replace::OnConflict::Replace);
+                }
+                KeyCode::Char('s') | KeyCode::Char('S') => {
+                    self.explorer_import_with(&host, crate::fs::replace::OnConflict::Skip);
+                }
+                KeyCode::Char('c') | KeyCode::Char('C') | KeyCode::Esc => {
+                    if let Some(ex) = self.explorer.as_mut() {
+                        ex.confirm_overwrite = None;
+                        ex.status = Some("Import cancelled".to_string());
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
         // Delete confirmation.
         let delete_pending = self
             .explorer
@@ -3715,6 +4319,12 @@ impl App {
             }
             return;
         }
+
+        // Everything from here down is a *command*, not text entry: the editor,
+        // the name prompts and the pickers have all had their turn and returned
+        // above. So fold the case here and a binding works with or without
+        // shift. Doing it any earlier would make a capital letter untypeable.
+        let code = fold_cmd_key(code);
 
         // `e` (export) / `i` (import) start a path prompt.
         match code {
@@ -3736,7 +4346,10 @@ impl App {
                 }
                 return;
             }
-            // Edit metadata: HFS/HFS+ type/creator + modified date, and the
+            // `d` opens the in-app editor on the selected file. It was `E`,
+            // which collided with `e` (export) the moment keys became
+            // shift-agnostic, and was the least discoverable binding here.
+            KeyCode::Char('d') => self.explorer_edit(),
             // POSIX mode / owner on any filesystem that carries them. A
             // directory qualifies too — its permissions are as real as a
             // file's, even though it has no type code.
@@ -3756,6 +4369,10 @@ impl App {
                                 modified: e
                                     .mac_dates
                                     .map(|d| format_mac_date(d.1))
+                                    .unwrap_or_default(),
+                                created: e
+                                    .mac_dates
+                                    .map(|d| format_mac_date(d.0))
                                     .unwrap_or_default(),
                                 mode: e
                                     .mode
@@ -3811,7 +4428,9 @@ impl App {
                 return;
             }
             // Repair this partition's filesystem in place (with confirmation).
-            KeyCode::Char('F') => {
+            // `r`, not `F`: shift-agnostic keys make `f`/`F` the same key, and
+            // "check" and "repair" are much too different to share one.
+            KeyCode::Char('r') => {
                 self.explorer_repair();
                 return;
             }
@@ -3982,10 +4601,125 @@ impl App {
         }
     }
 
+    /// Open the selected file in the in-app editor.
+    fn explorer_edit(&mut self) {
+        use crate::model::text_edit::{decode_for_edit, TextEditError};
+        const LIMIT: usize = 1024 * 1024;
+
+        let Some(ex) = self.explorer.as_mut() else {
+            return;
+        };
+        let Some(entry) = ex.selected_entry().cloned() else {
+            return;
+        };
+        if entry.is_directory() {
+            ex.status = Some("Not a file".to_string());
+            return;
+        }
+        // A cap, because this holds the whole file in memory as lines and the
+        // editor has no business opening a disk image inside a disk image.
+        if entry.size > LIMIT as u64 {
+            ex.status = Some(format!(
+                "Too large to edit here ({} KiB); use rb-cli edit",
+                entry.size / 1024
+            ));
+            return;
+        }
+        let fs_type = ex.fs.fs_type().to_string();
+        let bytes = match ex.fs.read_file(&entry, LIMIT) {
+            Ok(b) => b,
+            Err(e) => {
+                ex.status = Some(format!("Cannot read: {e}"));
+                return;
+            }
+        };
+        match decode_for_edit(&bytes, &fs_type, None) {
+            Ok(decoded) => {
+                ex.editor = Some(TextEditor::new(entry.name.clone(), decoded));
+            }
+            Err(TextEditError::NotText { reason }) => {
+                // Refuse rather than mangle: a round trip through a text editor
+                // does not preserve arbitrary bytes.
+                ex.status = Some(format!("Not a text file ({reason})"));
+            }
+            Err(e) => ex.status = Some(format!("Cannot edit: {e}")),
+        }
+    }
+
+    /// Write the editor's contents back through the shared replace path.
+    fn explorer_editor_save(&mut self) {
+        use crate::model::text_edit::{encode_after_edit, TextEditError};
+
+        let Some(ex) = self.explorer.as_ref() else {
+            return;
+        };
+        let Some(ed) = ex.editor.as_ref() else {
+            return;
+        };
+        let (image_path, selector, part_label, cur_dir, comps) = (
+            ex.image_path.clone(),
+            ex.selector,
+            ex.part_label.clone(),
+            ex.path_display(),
+            ex.dir_components(),
+        );
+        let (name, text, shape) = (ed.name.clone(), ed.text(), ed.shape);
+
+        let bytes = match encode_after_edit(&text, &shape, false) {
+            Ok(b) => b,
+            Err(e @ TextEditError::Unrepresentable { .. }) => {
+                // Named in place, and nothing written - the same contract the
+                // CLI gives, because silently substituting is how a vintage
+                // text file stops saying what it said.
+                if let Some(ed) = self.explorer.as_mut().and_then(|e| e.editor.as_mut()) {
+                    ed.status = Some(format!("Cannot save as {}: {e}", shape.encoding.label()));
+                }
+                return;
+            }
+            Err(e) => {
+                if let Some(ed) = self.explorer.as_mut().and_then(|e| e.editor.as_mut()) {
+                    ed.status = Some(format!("Cannot save: {e}"));
+                }
+                return;
+            }
+        };
+
+        match write_file_bytes(&image_path, selector, &cur_dir, &name, &bytes) {
+            Ok(()) => {
+                if let Some(ex) = self.explorer.as_mut() {
+                    ex.editor = None;
+                }
+                self.reopen_explorer(
+                    &image_path,
+                    selector,
+                    part_label,
+                    &comps,
+                    Some(format!("Saved {name} ({} bytes)", bytes.len())),
+                );
+            }
+            Err(e) => {
+                if let Some(ed) = self.explorer.as_mut().and_then(|e| e.editor.as_mut()) {
+                    ed.status = Some(format!("Save failed: {e:#}"));
+                }
+            }
+        }
+    }
+
     /// Import a host file (already validated by the picker) into the current
     /// Explorer directory (opens the partition read-write, reusing the `put`
     /// core), then refresh the view.
     fn explorer_import(&mut self, host: &std::path::Path) {
+        // `Fail` here means "ask": the import reports the collision back rather
+        // than refusing, and the answer arrives via `explorer_import_with`.
+        self.explorer_import_with(host, crate::fs::replace::OnConflict::Fail);
+    }
+
+    /// The import itself, once the conflict question (if any) is settled.
+    fn explorer_import_with(
+        &mut self,
+        host: &std::path::Path,
+        on_conflict: crate::fs::replace::OnConflict,
+    ) {
         let (image_path, selector, part_label, cur_path, comps) = match self.explorer.as_ref() {
             Some(ex) => (
                 ex.image_path.clone(),
@@ -3996,8 +4730,18 @@ impl App {
             ),
             None => return,
         };
-        match import_host_file(&image_path, selector, &cur_path, host) {
-            Ok(name) => {
+        match import_host_file(&image_path, selector, &cur_path, host, on_conflict) {
+            Ok(ImportOutcome::Exists(leaf)) => {
+                // Ask rather than refuse. The answer comes back through
+                // `explorer_import_with` with an explicit choice.
+                if let Some(ex) = self.explorer.as_mut() {
+                    ex.confirm_overwrite = Some((host.to_path_buf(), leaf));
+                }
+            }
+            Ok(ImportOutcome::Done(name)) => {
+                if let Some(ex) = self.explorer.as_mut() {
+                    ex.confirm_overwrite = None;
+                }
                 // Re-open read-only at the same path so the new file shows.
                 self.reopen_explorer(
                     &image_path,
@@ -4009,6 +4753,7 @@ impl App {
             }
             Err(e) => {
                 if let Some(ex) = self.explorer.as_mut() {
+                    ex.confirm_overwrite = None;
                     ex.status = Some(format!("Import failed: {e}"));
                 }
             }
@@ -4031,11 +4776,12 @@ impl App {
             ex.path_display(),
             ex.dir_components(),
         );
-        let (name, ty, cr, modstr) = (
+        let (name, ty, cr, modstr, crestr) = (
             m.entry_name.clone(),
             m.type_code.clone(),
             m.creator.clone(),
             m.modified.clone(),
+            m.created.clone(),
         );
         // POSIX fields: blank means "leave alone" (and is what a filesystem
         // without them always shows).
@@ -4048,7 +4794,7 @@ impl App {
                 Ok(v) if v <= 0o7777 => Some(v),
                 _ => {
                     if let Some(m) = self.explorer.as_mut().and_then(|e| e.metadata.as_mut()) {
-                        m.error = Some("Bad mode — octal, 1-4 digits, <= 7777".to_string());
+                        m.error = Some("Bad mode - octal, 1-4 digits, <= 7777".to_string());
                     }
                     return;
                 }
@@ -4064,7 +4810,7 @@ impl App {
                 Some(pair) => Some(pair),
                 None => {
                     if let Some(m) = self.explorer.as_mut().and_then(|e| e.metadata.as_mut()) {
-                        m.error = Some("Bad owner — want uid:gid, e.g. 0:0".to_string());
+                        m.error = Some("Bad owner - want uid:gid, e.g. 0:0".to_string());
                     }
                     return;
                 }
@@ -4077,7 +4823,20 @@ impl App {
                 Some(v) => Some(v),
                 None => {
                     if let Some(m) = self.explorer.as_mut().and_then(|e| e.metadata.as_mut()) {
-                        m.error = Some("Bad date — use YYYY-MM-DD HH:MM:SS".to_string());
+                        m.error = Some("Bad date - use YYYY-MM-DD HH:MM:SS".to_string());
+                    }
+                    return;
+                }
+            }
+        };
+        let create_mac = if crestr.trim().is_empty() {
+            None
+        } else {
+            match parse_mac_date(&crestr) {
+                Some(v) => Some(v),
+                None => {
+                    if let Some(m) = self.explorer.as_mut().and_then(|e| e.metadata.as_mut()) {
+                        m.error = Some("Bad created date - use YYYY-MM-DD HH:MM:SS".to_string());
                     }
                     return;
                 }
@@ -4087,6 +4846,7 @@ impl App {
             type_code: ty,
             creator: cr,
             modify_mac,
+            create_mac,
             mode: new_mode,
             owner: new_owner,
         };
@@ -4356,9 +5116,11 @@ impl App {
         if self.progress.is_some() {
             self.cancel_progress();
         } else if self.opened.is_some() {
+            // One level to unwind now that the disk's facts and its partition
+            // table are a single view: Esc goes straight back to the disk list.
             self.opened = None;
-        } else if self.detail.is_some() {
-            self.detail = None;
+            self.selection = 0;
+            self.status = None;
         } else {
             self.should_quit = true;
         }
@@ -4398,7 +5160,6 @@ impl App {
     /// Lazily load anything a freshly-shown tab needs; reset per-tab cursor.
     fn on_tab_changed(&mut self) {
         self.selection = 0;
-        self.detail = None;
         self.opened = None;
         self.open_picker = None;
         self.explorer = None;
@@ -4713,6 +5474,9 @@ impl App {
                 catalog_size: None,
                 extents_size: None,
                 cpm_preset: None,
+                // The TUI wizard has no FAT32 toggle yet; size-based selection
+                // is the existing behaviour. `rb-cli new ... --fat32` forces it.
+                fat32: false,
             }),
             DiskClass::Volume => NewCommand::Volume(VolumeArgs {
                 fs: VOLUME_FS[w.fs_sel.min(VOLUME_FS.len() - 1)].1,
@@ -4725,6 +5489,7 @@ impl App {
                 case_sensitive: false,
                 min_catalog: None,
                 affs_variant: 1,
+                fat32: false,
                 inodes: None,
                 bytes_per_inode: None,
                 cluster_size: None,
@@ -6658,7 +7423,7 @@ impl App {
 
     /// Whether the Inspect tab is showing its top-level selectable disk list.
     fn inspect_list_active(&self) -> bool {
-        self.current() == TabId::Inspect && self.detail.is_none() && self.opened.is_none()
+        self.current() == TabId::Inspect && self.opened.is_none()
     }
 
     /// Number of selectable rows in the active tab (0 = the pane just scrolls).
@@ -7011,8 +7776,11 @@ impl App {
         if let Some(s) = &ex.status {
             fl.push(Line::styled(format!(" {s}"), self.palette.warn()));
         }
+        // This popup covers the main footer bar, so it is the one actually on
+        // screen - it has to answer for whichever overlay is up, not just the
+        // Explorer itself.
         fl.push(Line::styled(
-            " Enter open  e Exp i Imp  n New x Del  m Meta b Bless  f Chk F Rep  t Transform  Esc close",
+            footer_strip(self.key_context().1, rows[2].width as usize),
             self.palette.dim(),
         ));
         frame.render_widget(Paragraph::new(Text::from(fl)), rows[2]);
@@ -7107,6 +7875,7 @@ impl App {
                 field(MetaEdit::F_TYPE, "Type:", &m.type_code),
                 field(MetaEdit::F_CREATOR, "Creator:", &m.creator),
                 field(MetaEdit::F_MODIFIED, "Modified:", &m.modified),
+                field(MetaEdit::F_CREATED, "Created:", &m.created),
                 field(MetaEdit::F_MODE, "Mode:", &m.mode),
                 field(MetaEdit::F_OWNER, "Owner:", &m.owner),
             ];
@@ -7220,6 +7989,112 @@ impl App {
                     Line::styled("  Enter create   Esc cancel", self.palette.dim()),
                 ]))
                 .block(self.pane_block("New folder", true)),
+                cp,
+            );
+        }
+
+        // Text editor overlay.
+        if let Some(ed) = &ex.editor {
+            let ep = centered_rect(
+                area.width.saturating_sub(4),
+                area.height.saturating_sub(4),
+                area,
+            );
+            frame.render_widget(Clear, ep);
+            // The status/keys line is a *footer*: it gets its own row at the
+            // bottom of the window, not a line pushed on after the last line of
+            // text. Appending it to the text meant it floated up the screen on
+            // any file shorter than the window, which reads as content.
+            let title = format!("Edit  {}{}", ed.name, if ed.dirty { " *" } else { "" });
+            let outer = self.pane_block(&title, true);
+            let inner = outer.inner(ep);
+            frame.render_widget(outer, ep);
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(1), Constraint::Length(2)])
+                .split(inner);
+            let inner_h = rows[0].height as usize;
+            let visible = ed
+                .lines
+                .iter()
+                .enumerate()
+                .skip(ed.scroll)
+                .take(inner_h)
+                .map(|(i, l)| {
+                    if i == ed.row {
+                        // Mark the cursor line: a block cursor cannot be drawn
+                        // portably here, and losing track of the cursor in a
+                        // config file is how the wrong line gets edited.
+                        Line::styled(format!("{:>4} >{l}", i + 1), self.palette.accent())
+                    } else {
+                        Line::raw(format!("{:>4}  {l}", i + 1))
+                    }
+                })
+                .collect::<Vec<_>>();
+            frame.render_widget(Paragraph::new(Text::from(visible)), rows[0]);
+
+            // Row one: where the cursor is and what the file will be saved as.
+            // Row two: the keys, from the same table `?` renders.
+            let state = match &ed.status {
+                Some(msg) => msg.clone(),
+                None => format!(
+                    " line {}/{} col {}  |  {} {}{}",
+                    ed.row + 1,
+                    ed.lines.len(),
+                    ed.col + 1,
+                    ed.shape.encoding.label(),
+                    ed.shape.ending.label(),
+                    if ed.dirty { "   *modified" } else { "" },
+                ),
+            };
+            frame.render_widget(
+                Paragraph::new(Text::from(vec![
+                    Line::styled(
+                        state,
+                        if ed.status.is_some() {
+                            self.palette.warn()
+                        } else {
+                            self.palette.dim()
+                        },
+                    ),
+                    Line::styled(
+                        footer_strip(HINTS_EDITOR, rows[1].width as usize),
+                        self.palette.dim(),
+                    ),
+                ])),
+                rows[1],
+            );
+
+            if ed.confirm_discard {
+                let cp = centered_rect(52, 5, area);
+                frame.render_widget(Clear, cp);
+                frame.render_widget(
+                    Paragraph::new(Text::from(vec![
+                        Line::raw(""),
+                        Line::styled("  Discard unsaved changes?  (y / n)", self.palette.warn()),
+                    ]))
+                    .block(self.pane_block("Unsaved changes", true)),
+                    cp,
+                );
+            }
+        }
+
+        // Overwrite confirmation. Says what will be kept, because "replace"
+        // sounds like it discards everything about the old file and it does
+        // not - the metadata comes across.
+        if let Some((_, leaf)) = &ex.confirm_overwrite {
+            let cp = centered_rect(64, 7, area);
+            frame.render_widget(Clear, cp);
+            frame.render_widget(
+                Paragraph::new(Text::from(vec![
+                    Line::raw(""),
+                    Line::styled(format!("  \"{leaf}\" already exists."), self.palette.warn()),
+                    Line::raw(""),
+                    Line::raw("  r  Replace it (keeps its permissions, dates and type)"),
+                    Line::raw("  s  Skip - leave the existing file alone"),
+                    Line::raw("  c  Cancel the import"),
+                ]))
+                .block(self.pane_block("File exists", true)),
                 cp,
             );
         }
@@ -7463,8 +8338,14 @@ impl App {
             self.draw_inspect_list(frame, area);
             return;
         }
-        if let Some(Opened::Image { path, size, parts }) = &self.opened {
-            self.draw_partition_list(frame, area, path, *size, parts);
+        if let Some(Opened::Image {
+            path,
+            size,
+            parts,
+            disk,
+        }) = &self.opened
+        {
+            self.draw_partition_list(frame, area, path, *size, parts, disk.as_deref());
             return;
         }
         if self.current() == TabId::NewDisk {
@@ -7566,7 +8447,7 @@ impl App {
             })
             .collect();
         let title = format!(
-            "Inspect  [{} disk(s)]  Enter=disk  o=open file",
+            "Inspect  [{} disk(s)]  Enter=partitions  o=open file",
             disks.len()
         );
         let list = List::new(items)
@@ -7587,12 +8468,39 @@ impl App {
         path: &str,
         size: u64,
         parts: &[PartRow],
+        disk: Option<&DiskDevice>,
     ) {
         let name = basename(path);
+
+        // Opened from the disk list: the hardware facts live in a header above
+        // the table rather than on a screen of their own. They describe the same
+        // disk, and splitting them meant an extra keypress nothing advertised.
+        let area = match disk {
+            Some(d) => {
+                let header = self.disk_header_lines(d);
+                // +2 for the block's own borders.
+                let height = (header.len() as u16 + 2).min(area.height.saturating_sub(3));
+                let rows =
+                    Layout::vertical([Constraint::Length(height), Constraint::Min(3)]).split(area);
+                frame.render_widget(
+                    Paragraph::new(Text::from(header))
+                        .block(self.pane_block(&format!("Disk  {}", d.path.display()), false)),
+                    rows[0],
+                );
+                rows[1]
+            }
+            None => area,
+        };
+
         if parts.is_empty() {
+            let msg = match &self.status {
+                // A device that could not be read: say so here, where the user
+                // is looking, not only in the footer.
+                Some(s) => format!("No partition table could be read.\n\n{s}"),
+                None => "No partitions detected.".to_string(),
+            };
             frame.render_widget(
-                Paragraph::new("No partitions detected.")
-                    .block(self.pane_block(&format!("Image  {name}"), true)),
+                Paragraph::new(msg).block(self.pane_block(&format!("Partitions  {name}"), true)),
                 area,
             );
             return;
@@ -7606,13 +8514,16 @@ impl App {
                 ]))
             })
             .collect();
+        // With a header above, the title names the table rather than repeating
+        // the disk; on its own it still identifies the image.
+        let subject = if disk.is_some() {
+            format!("Partitions on {name}")
+        } else {
+            format!("Image  {name} ({})", format_size(size))
+        };
         let title = match &self.status {
-            Some(s) => format!("Image  {name} ({})  -  {s}", format_size(size)),
-            None => format!(
-                "Image  {name} ({})  [{} partition(s)]  Enter=browse",
-                format_size(size),
-                parts.len()
-            ),
+            Some(s) => format!("{subject}  -  {s}"),
+            None => format!("{subject}  [{} partition(s)]  Enter=browse", parts.len()),
         };
         let list = List::new(items)
             .block(self.pane_block(&title, true))
@@ -7621,6 +8532,57 @@ impl App {
         let mut state = ListState::default();
         state.select(Some(self.selection.min(parts.len() - 1)));
         frame.render_stateful_widget(list, area, &mut state);
+    }
+
+    /// The hardware facts for the header above a disk's partition table: what
+    /// the enumerator knows, plus what the OS has mounted.
+    ///
+    /// The mounted list is worth keeping visible precisely because it is *not*
+    /// the partition table - a volume the host cannot mount (ext on Mac OS X,
+    /// say) is absent from it while being present in the table below, and seeing
+    /// both together is what makes that difference legible.
+    fn disk_header_lines(&self, d: &DiskDevice) -> Vec<Line<'static>> {
+        let field = |k: &str, v: String| {
+            Line::from(vec![
+                Span::styled(format!("{k:<9}"), self.palette.accent()),
+                Span::raw(v),
+            ])
+        };
+        let media = if d.media_name.is_empty() {
+            d.name.clone()
+        } else {
+            d.media_name.clone()
+        };
+        let mut lines = vec![
+            field(
+                "Media:",
+                format!(
+                    "{media}  ({})  {}",
+                    format_size(d.size_bytes),
+                    d.bus_protocol
+                ),
+            ),
+            field(
+                "Flags:",
+                format!(
+                    "{}{}{}",
+                    if d.is_removable { "removable" } else { "fixed" },
+                    if d.is_read_only { ", read-only" } else { "" },
+                    if d.is_system { ", system" } else { "" },
+                ),
+            ),
+        ];
+        if d.partitions.is_empty() {
+            lines.push(field("Mounted:", "(none)".to_string()));
+        } else {
+            let mounted: Vec<String> = d
+                .partitions
+                .iter()
+                .map(|p| format!("{} {}", p.name, p.mount_point.display()))
+                .collect();
+            lines.push(field("Mounted:", mounted.join(", ")));
+        }
+        lines
     }
 
     /// The New Disk wizard: media class → filesystem → path/size/name, drawn as
@@ -9120,23 +10082,17 @@ impl App {
             .constraints([Constraint::Min(10), Constraint::Length(24)])
             .split(area);
 
-        // Context-sensitive footer.
-        let explorer_preview = self
-            .explorer
-            .as_ref()
-            .map(|e| e.preview.is_some())
-            .unwrap_or(false);
-        let keys: Vec<(&str, &str)> = if explorer_preview {
-            vec![("Up/Dn", "Scroll"), ("PgUp/Dn", "Page"), ("Esc", "Close")]
-        } else if self.explorer.is_some() {
-            vec![
-                ("Tab", "Pane"),
-                ("Up/Dn", "Move"),
-                ("Enter", "Open/View"),
-                ("Space", "Mark"),
-                ("e/i", "Export/Import"),
-                ("Esc", "Close"),
-            ]
+        // Context-sensitive footer. Inside the Explorer this defers to
+        // `key_context`, the same table its own footer and `?` render from,
+        // rather than a second hand-written list. The hand-written one had
+        // drifted: it never mentioned edit, metadata, new, delete, bless,
+        // check, repair or transform.
+        let keys: Vec<(&str, &str)> = if self.explorer.is_some() {
+            self.key_context()
+                .1
+                .iter()
+                .map(|h| (h.keys, h.desc))
+                .collect()
         } else if self.progress.is_some() {
             vec![("Esc", "Cancel")]
         } else if self.current() == TabId::Backup {
@@ -9273,12 +10229,20 @@ impl App {
                 ("?", "Help"),
             ]
         } else {
-            let mut k = vec![("<-/->", "Tabs"), ("Up/Dn", "Select"), ("Enter", "Open")];
-            if self.detail.is_some() || self.opened.is_some() {
+            // On the disk list, name what Enter actually produces. "Open" was
+            // vague enough that the partition table read as a hidden second step
+            // rather than the destination.
+            let enter = if self.inspect_list_active() {
+                ("Enter", "Partitions")
+            } else {
+                ("Enter", "Open")
+            };
+            let mut k = vec![("<-/->", "Tabs"), ("Up/Dn", "Select"), enter];
+            if self.opened.is_some() {
                 k.push(("Esc", "Back"));
             }
             if self.inspect_list_active() {
-                k.push(("o", "Open"));
+                k.push(("o", "Open file"));
                 k.push(("r", "Rescan"));
             }
             k.push(("?", "Help"));
@@ -9312,30 +10276,100 @@ impl App {
         Line::from(spans)
     }
 
+    /// The active screen's name and key list.
+    ///
+    /// Ordered innermost-first: the editor sits over the Explorer, which sits
+    /// over the Inspect tab, and the keys that work are the innermost one's.
+    /// The footer and the `?` window both call this, so what is drawn at the
+    /// bottom of the screen is by construction what `?` will list.
+    fn key_context(&self) -> (&'static str, &'static [KeyHint]) {
+        if let Some(ex) = self.explorer.as_ref() {
+            if ex.editor.is_some() {
+                return ("Text editor", HINTS_EDITOR);
+            }
+            if ex.fsck_report.is_some() {
+                return ("Filesystem report", HINTS_REPORT);
+            }
+            if ex.preview.is_some() {
+                return ("File preview", HINTS_REPORT);
+            }
+            return ("Explorer", HINTS_EXPLORER);
+        }
+        if self.current() == TabId::Inspect {
+            return match self.opened {
+                Some(Opened::Image { .. }) => ("Inspect - partitions", HINTS_INSPECT_IMAGE),
+                _ => ("Inspect - disks", HINTS_INSPECT_DISKS),
+            };
+        }
+        ("Tabs", HINTS_TAB)
+    }
+
     fn draw_help(&self, frame: &mut Frame, area: Rect) {
-        let body = Text::from(vec![
-            Line::raw(""),
-            Line::raw("  Tabs (windows)"),
-            Line::raw("    Left / Right   Previous / next tab   (also h / l, Tab)"),
-            Line::raw("    1 - 9          Jump to a tab by number"),
-            Line::raw(""),
-            Line::raw("  Within a tab"),
-            Line::raw("    Up / Down      Move selection (or scroll)   (also j / k)"),
-            Line::raw("    g / G          Top / bottom"),
-            Line::raw("    Enter          Open / activate the selection"),
-            Line::raw("    Esc            Back (or cancel a running task)"),
-            Line::raw(""),
-            Line::raw("  Global"),
-            Line::raw("    o              Open a file/backup (Inspect): path, recent, Tab=browse"),
-            Line::raw("    r              Rescan disks (Inspect)"),
-            Line::raw("    ? / F1         Toggle this help        q  Quit"),
-            Line::raw(""),
-            Line::raw("  Press Esc to close."),
-        ]);
-        let popup = centered_rect(62, 21, area);
+        let (title, hints) = self.key_context();
+
+        // Every key that works here, then the ones that work everywhere. Built
+        // as rows first so the scroll maths below counts what is really drawn.
+        let mut rows: Vec<(String, String)> = Vec::new();
+        for h in hints {
+            rows.push((h.keys.to_string(), h.desc.to_string()));
+        }
+        // Blank spacer, then a heading, then the always-available keys. A row
+        // with an empty description renders as a heading; both empty is a gap.
+        rows.push((String::new(), String::new()));
+        rows.push(("Anywhere".to_string(), String::new()));
+        for h in HINTS_GLOBAL {
+            rows.push((h.keys.to_string(), h.desc.to_string()));
+        }
+        let key_w = rows
+            .iter()
+            .map(|(k, _)| k.chars().count())
+            .max()
+            .unwrap_or(8)
+            .max(8);
+
+        let popup = centered_rect(
+            72.min(area.width.saturating_sub(4)),
+            area.height.saturating_sub(4).min(24),
+            area,
+        );
+        // Two chrome rows for the border, one for the scroll hint at the foot.
+        let view_h = popup.height.saturating_sub(3) as usize;
+        let total = rows.len();
+        let max_scroll = total.saturating_sub(view_h);
+        let scroll = self.help_scroll.min(max_scroll);
+
+        let mut lines: Vec<Line> = Vec::new();
+        for (k, d) in rows.iter().skip(scroll).take(view_h) {
+            if k.is_empty() && d.is_empty() {
+                lines.push(Line::raw(""));
+            } else if d.is_empty() {
+                lines.push(Line::styled(format!("  {k}"), self.palette.accent()));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {k:<key_w$}  "), self.palette.accent()),
+                    Span::raw(d.clone()),
+                ]));
+            }
+        }
+        let more = total > view_h;
+        lines.push(Line::styled(
+            if more {
+                format!(
+                    "  {}-{} of {}   Up/Down PgUp/PgDn scroll   Esc close",
+                    scroll + 1,
+                    (scroll + view_h).min(total),
+                    total
+                )
+            } else {
+                "  Esc close".to_string()
+            },
+            self.palette.dim(),
+        ));
+
         frame.render_widget(Clear, popup);
         frame.render_widget(
-            Paragraph::new(body).block(self.pane_block("Help", true)),
+            Paragraph::new(Text::from(lines))
+                .block(self.pane_block(&format!("Keys - {title}"), true)),
             popup,
         );
     }
@@ -9479,74 +10513,11 @@ impl App {
             lines.push(Line::raw("Esc to close."));
             return Text::from(lines);
         }
-        let Some(i) = self.detail else {
-            return Text::from("Select a disk and press Enter, or `o` to open a file/backup.");
-        };
-        let disks = self.disks.as_deref().unwrap_or(&[]);
-        let Some(d) = disks.get(i) else {
-            return Text::from("That disk is no longer present. Press Esc.");
-        };
-
-        let field = |k: &str, v: String| {
-            Line::from(vec![
-                Span::styled(format!("{k:<11}"), self.palette.accent()),
-                Span::raw(v),
-            ])
-        };
-        let mut lines = vec![
-            Line::styled(
-                format!("Disk {}", d.path.display()),
-                self.palette.accent().add_modifier(Modifier::BOLD),
-            ),
-            Line::raw(""),
-            field(
-                "Media:",
-                if d.media_name.is_empty() {
-                    d.name.clone()
-                } else {
-                    d.media_name.clone()
-                },
-            ),
-            field("Size:", format_size(d.size_bytes)),
-            field("Bus:", d.bus_protocol.clone()),
-            field(
-                "Flags:",
-                format!(
-                    "{}{}{}",
-                    if d.is_removable { "removable" } else { "fixed" },
-                    if d.is_read_only { ", read-only" } else { "" },
-                    if d.is_system { ", system" } else { "" },
-                ),
-            ),
-            Line::raw(""),
-            Line::styled(
-                format!("Mounted partitions ({}):", d.partitions.len()),
-                self.palette.accent().add_modifier(Modifier::BOLD),
-            ),
-        ];
-        if d.partitions.is_empty() {
-            lines.push(Line::raw("  (none mounted)"));
-        } else {
-            for p in &d.partitions {
-                let used = p.total_space.saturating_sub(p.available_space);
-                lines.push(Line::from(vec![
-                    Span::styled(format!("  {:<12}", p.name), self.palette.accent()),
-                    Span::raw(format!(
-                        " {:<8} {} used / {}  {}",
-                        p.filesystem,
-                        format_size(used),
-                        format_size(p.total_space),
-                        p.mount_point.display(),
-                    )),
-                ]));
-            }
-        }
-        lines.push(Line::raw(""));
-        lines.push(Line::styled(
-            "Full MBR/GPT/APM partition-table parse (via wrapper_tree) lands in M2.".to_string(),
-            self.palette.dim(),
-        ));
-        Text::from(lines)
+        // No disk selected yet. The disk list is the selectable widget; this
+        // text is what the scrollable pane shows behind it.
+        Text::from(
+            "Select a disk and press Enter to see its partitions, or `o` to open a file/backup.",
+        )
     }
 
     fn settings_content(&self) -> Text<'static> {
@@ -9921,6 +10892,7 @@ struct MetaEditValues {
     type_code: String,
     creator: String,
     modify_mac: Option<u32>,
+    create_mac: Option<u32>,
     mode: Option<u32>,
     owner: Option<(u32, u32)>,
 }
@@ -9939,10 +10911,12 @@ fn apply_metadata_edit(
         type_code,
         creator,
         modify_mac,
+        create_mac,
         mode: new_mode,
         owner: new_owner,
     } = values;
-    let (modify_mac, new_mode, new_owner) = (*modify_mac, *new_mode, *new_owner);
+    let (modify_mac, create_mac, new_mode, new_owner) =
+        (*modify_mac, *create_mac, *new_mode, *new_owner);
     use crate::cli::resolve::resolve_partition_rw_forced;
     let dst = if cur_dir == "/" {
         format!("/{name}")
@@ -9970,9 +10944,17 @@ fn apply_metadata_edit(
         fs.set_owner(&entry, uid, gid)
             .map_err(|e| anyhow::anyhow!("set owner: {e}"))?;
     }
-    if let Some(modify) = modify_mac {
-        let (create, _, backup) = entry.mac_dates.unwrap_or((modify, modify, modify));
-        fs.set_dates(&entry, create, modify, backup)
+    // Either date may be edited on its own, so start from what the file has
+    // and override only what was filled in. Writing today's date into the
+    // untouched half is how a restored file quietly loses its creation date.
+    if modify_mac.is_some() || create_mac.is_some() {
+        let (cur_create, cur_modify, cur_backup) = entry.mac_dates.unwrap_or_else(|| {
+            let now = modify_mac.or(create_mac).unwrap_or(0);
+            (now, now, now)
+        });
+        let create = create_mac.unwrap_or(cur_create);
+        let modify = modify_mac.unwrap_or(cur_modify);
+        fs.set_dates(&entry, create, modify, cur_backup)
             .map_err(|e| anyhow::anyhow!("set dates: {e}"))?;
     }
     fs.sync_metadata()
@@ -10203,12 +11185,63 @@ fn apply_delete(
     Ok(())
 }
 
+/// Replace one file's contents in an image, preserving what it carried.
+///
+/// The editor's save path. Goes through `fs::replace` like every other write
+/// here, so the edited file keeps its permissions, dates and type, and a
+/// failure part-way leaves the original intact.
+fn write_file_bytes(
+    image_path: &str,
+    selector: Option<u32>,
+    cur_dir: &str,
+    name: &str,
+    bytes: &[u8],
+) -> anyhow::Result<()> {
+    use crate::cli::resolve::resolve_partition_rw_forced;
+    let dst = if cur_dir == "/" {
+        format!("/{name}")
+    } else {
+        format!("{cur_dir}/{name}")
+    };
+    let (file, ctx, commit) =
+        resolve_partition_rw_forced(std::path::Path::new(image_path), selector, None)?;
+    let mut fs = ctx
+        .open_editable(file)
+        .map_err(|e| anyhow::anyhow!("opening filesystem for write: {e}"))?;
+    let (parent, leaf) = crate::cli::verbs::ls::resolve_parent(fs.as_filesystem_mut(), &dst)?;
+    let mut reader = std::io::Cursor::new(bytes.to_vec());
+    crate::fs::replace::create_or_replace(
+        fs.as_mut(),
+        &parent,
+        &leaf,
+        &mut reader,
+        bytes.len() as u64,
+        &crate::fs::filesystem::CreateFileOptions::default(),
+        crate::fs::replace::ReplacePolicy::replace(),
+    )
+    .map_err(|e| anyhow::anyhow!("writing {leaf}: {e}"))?;
+    fs.sync_metadata()
+        .map_err(|e| anyhow::anyhow!("sync_metadata: {e}"))?;
+    drop(fs);
+    commit.commit()?;
+    Ok(())
+}
+
+/// Outcome of an import attempt, so the caller can ask before overwriting.
+enum ImportOutcome {
+    /// Written (created or replaced); carries the file name.
+    Done(String),
+    /// The name is taken and `on_conflict` said to ask first.
+    Exists(String),
+}
+
 fn import_host_file(
     image_path: &str,
     selector: Option<u32>,
     cur_dir: &str,
     host: &std::path::Path,
-) -> anyhow::Result<String> {
+    on_conflict: crate::fs::replace::OnConflict,
+) -> anyhow::Result<ImportOutcome> {
     use crate::cli::resolve::resolve_partition_rw_forced;
     let meta = std::fs::metadata(host)?;
     if !meta.is_file() {
@@ -10234,25 +11267,42 @@ fn import_host_file(
     if !parent.is_directory() {
         anyhow::bail!("parent is not a directory");
     }
+    // Ask before overwriting rather than refusing outright, which is what this
+    // did before: a name collision was a dead end, so the only way to correct a
+    // file in an image was to delete it first and remember what it carried.
     let exists = fs
         .list_directory(&parent)
         .map_err(|e| anyhow::anyhow!("list_directory: {e}"))?
         .into_iter()
         .any(|e| e.name == leaf);
-    if exists {
-        anyhow::bail!("{leaf} already exists");
+    if exists && on_conflict == crate::fs::replace::OnConflict::Fail {
+        return Ok(ImportOutcome::Exists(leaf));
     }
 
     let len = meta.len();
     let mut hf = std::fs::File::open(host)?;
     let options = crate::fs::filesystem::CreateFileOptions::default();
-    fs.create_file(&parent, &leaf, &mut hf, len, &options)
-        .map_err(|e| anyhow::anyhow!("create_file: {e}"))?;
+    let outcome = crate::fs::replace::create_or_replace(
+        fs.as_mut(),
+        &parent,
+        &leaf,
+        &mut hf,
+        len,
+        &options,
+        crate::fs::replace::ReplacePolicy {
+            on_conflict,
+            ..Default::default()
+        },
+    )
+    .map_err(|e| anyhow::anyhow!("create_file: {e}"))?;
+    if outcome.skipped {
+        return Ok(ImportOutcome::Done(format!("{name} (skipped)")));
+    }
     fs.sync_metadata()
         .map_err(|e| anyhow::anyhow!("sync_metadata: {e}"))?;
     drop(fs);
     commit.commit()?;
-    Ok(name)
+    Ok(ImportOutcome::Done(name))
 }
 
 /// A short filetype label for a file entry: HFS/HFS+/MFS `TYPE/crea`, a ProDOS
@@ -10294,23 +11344,27 @@ fn sort_entries(entries: &mut [FileEntry]) {
 /// `resolve` semantics: `@N` selects `partitions()[N-1]`, and an image with no
 /// table is a single superfloppy volume (selector `None`). `total` is the file
 /// size, used for the superfloppy row.
-fn parse_partitions(path: &std::path::Path, total: u64) -> Vec<PartRow> {
+/// Read the partition table for the Inspect tab's image view.
+///
+/// Returns the open error rather than an empty list: a raw device is unreadable
+/// without elevation, and swallowing that produced an image view with no
+/// partitions and no explanation - indistinguishable from a genuinely empty
+/// disk. `Ok(_)` always has at least one row (a table-less image is reported as
+/// one whole-volume row).
+fn parse_partitions(path: &std::path::Path, total: u64) -> std::io::Result<Vec<PartRow>> {
     use crate::partition::PartitionTable;
-    let file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return Vec::new(),
-    };
+    let file = std::fs::File::open(path)?;
     let mut reader = std::io::BufReader::new(file);
-    match PartitionTable::detect(&mut reader) {
+    Ok(match PartitionTable::detect(&mut reader) {
         Ok(pt) => {
             let parts = pt.partitions();
             if parts.is_empty() {
-                return vec![PartRow {
+                return Ok(vec![PartRow {
                     selector: None,
                     label: format!("Whole volume ({})", pt.type_name()),
                     fs_hint: pt.type_name().to_string(),
                     size: total,
-                }];
+                }]);
             }
             parts
                 .iter()
@@ -10337,7 +11391,23 @@ fn parse_partitions(path: &std::path::Path, total: u64) -> Vec<PartRow> {
             fs_hint: String::new(),
             size: total,
         }],
+    })
+}
+
+/// Size of a path that `std::fs::metadata` cannot measure.
+///
+/// A block device reports `len() == 0`, so the image view sized every disk at
+/// zero and a table-less device came out as a "Whole volume" of 0 bytes. Seeking
+/// to the end asks the kernel instead, which works on Linux and macOS without
+/// an ioctl per platform.
+fn readable_size(path: &std::path::Path) -> std::io::Result<u64> {
+    let m = std::fs::metadata(path)?;
+    if m.len() > 0 {
+        return Ok(m.len());
     }
+    use std::io::{Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)?;
+    f.seek(SeekFrom::End(0))
 }
 
 /// A bordered pane block with the given (already-resolved) palette + border set.
@@ -10458,6 +11528,384 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 mod tests {
     use super::*;
 
+    /// Shift must not change what a command key does.
+    #[test]
+    fn command_keys_are_shift_agnostic() {
+        for (shifted, plain) in [('D', 'd'), ('F', 'f'), ('R', 'r'), ('T', 't'), ('X', 'x')] {
+            assert_eq!(
+                fold_cmd_key(KeyCode::Char(shifted)),
+                KeyCode::Char(plain),
+                "{shifted} should act as {plain}"
+            );
+        }
+    }
+
+    /// `g`/`G` is the deliberate exception - the vim top/bottom pair. It is
+    /// kept *and* spelled out in the hint tables, rather than left to be
+    /// discovered.
+    #[test]
+    fn the_vim_top_bottom_pair_survives_folding() {
+        assert_eq!(fold_cmd_key(KeyCode::Char('G')), KeyCode::Char('G'));
+        assert_eq!(fold_cmd_key(KeyCode::Char('g')), KeyCode::Char('g'));
+        for table in [HINTS_TAB, HINTS_INSPECT_DISKS, HINTS_INSPECT_IMAGE] {
+            assert!(
+                table.iter().any(|h| h.keys == "g/G"),
+                "a screen using g/G must say so in its key list"
+            );
+        }
+    }
+
+    /// The footer clips to the terminal, and never at the cost of the one hint
+    /// that leads to all the others.
+    #[test]
+    fn the_footer_always_offers_the_key_list() {
+        for width in [12usize, 24, 40, 80, 200] {
+            let strip = footer_strip(HINTS_EXPLORER, width);
+            assert!(
+                strip.contains("?=keys"),
+                "width {width} dropped the route to the full list: {strip:?}"
+            );
+        }
+        // Wide enough to show the binding that started all this.
+        assert!(footer_strip(HINTS_EXPLORER, 200).contains(" d "));
+    }
+
+    /// A hint table is only useful if it is complete: `E` (edit) existed in the
+    /// key handler and in no on-screen list at all, which is the bug these
+    /// tables exist to make impossible. Pin the Explorer's command keys.
+    #[test]
+    fn the_explorer_lists_every_command_key_it_binds() {
+        for k in ["d", "e", "i", "m", "n", "b", "f", "r", "t", "x"] {
+            assert!(
+                HINTS_EXPLORER.iter().any(|h| h.keys == k),
+                "Explorer binds {k:?} but never lists it"
+            );
+        }
+        // Edit moved off `E` so it stops colliding with export once shift is
+        // ignored; nothing should advertise the old key.
+        assert!(!HINTS_EXPLORER.iter().any(|h| h.keys == "E"));
+    }
+
+    /// F2 saves, not Ctrl-S: Ctrl-S is XOFF and freezes a serial console, which
+    /// is exactly where this editor is worth having.
+    #[test]
+    fn the_editor_lists_save_and_line_endings() {
+        assert!(HINTS_EDITOR.iter().any(|h| h.keys == "F2"));
+        assert!(HINTS_EDITOR.iter().any(|h| h.keys == "F3"));
+        assert!(!HINTS_EDITOR.iter().any(|h| h.keys.contains("Ctrl-S")));
+    }
+
+    /// A disk-list entry pointing at a real path, so the open path can run.
+    fn fake_disk(path: &std::path::Path, size: u64) -> DiskDevice {
+        DiskDevice {
+            name: "test".into(),
+            path: path.to_path_buf(),
+            size_bytes: size,
+            is_removable: false,
+            is_read_only: false,
+            is_system: false,
+            bus_protocol: "test".into(),
+            media_name: "Test Disk".into(),
+            partitions: Vec::new(),
+        }
+    }
+
+    /// Build an MBR disk with a FAT16 and an ext partition - the shape of an
+    /// ordinary Linux system disk (ESP + root).
+    fn mbr_with_ext(dir: &std::path::Path) -> std::path::PathBuf {
+        const START: u32 = 2048;
+        let vol =
+            crate::fs::ext_format::create_blank_ext4(16 * 1024 * 1024, "ROOT").expect("blank ext4");
+        let img = dir.join("disk.img");
+        let mut bytes = vec![0u8; START as usize * 512 + vol.len()];
+        bytes[START as usize * 512..].copy_from_slice(&vol);
+        let e = 0x1BE;
+        bytes[e + 4] = 0x83; // Linux
+        bytes[e + 8..e + 12].copy_from_slice(&START.to_le_bytes());
+        bytes[e + 12..e + 16].copy_from_slice(&((vol.len() / 512) as u32).to_le_bytes());
+        bytes[510] = 0x55;
+        bytes[511] = 0xAA;
+        std::fs::write(&img, &bytes).expect("write img");
+        img
+    }
+
+    /// A **single** Enter on a disk must reach its partition table, with the
+    /// disk's own facts carried along for the header.
+    ///
+    /// The disk list used to dead-end: the first Enter opened a pane listing
+    /// only the partitions the *OS* had mounted, and a second Enter did nothing
+    /// whatsoever because `activate` required `detail.is_none()` - while the
+    /// footer still advertised "Enter Open". An unmounted volume was therefore
+    /// unreachable, and a mounted one could only be read about, never opened.
+    /// Wiring the second press up fixed the dead end but left the extra step,
+    /// which nothing on screen mentioned; the two screens described the same
+    /// disk, so they are now one. This asserts the count of keypresses, because
+    /// that is the part a user notices.
+    #[test]
+    fn one_enter_on_a_disk_reaches_its_partition_table() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let img = mbr_with_ext(dir.path());
+        let size = std::fs::metadata(&img).unwrap().len();
+
+        let mut app = App::new_on(DEFAULT_TAB);
+        app.disks = Some(vec![fake_disk(&img, size)]);
+        app.selection = 0;
+        assert!(app.opened.is_none());
+
+        app.activate(); // one press
+
+        let Some(Opened::Image { parts, disk, .. }) = &app.opened else {
+            panic!("a single Enter should have opened the disk's partition table");
+        };
+        assert!(
+            parts.iter().any(|p| p.selector == Some(1)),
+            "the ext partition should be selectable, got {:?}",
+            parts.iter().map(|p| &p.label).collect::<Vec<_>>()
+        );
+        assert!(
+            disk.is_some(),
+            "the disk's hardware facts must come along so the header can show \
+             them instead of needing a screen of their own"
+        );
+    }
+
+    /// The editing core, without a terminal: the operations a user performs to
+    /// correct a line in a config file must produce exactly the expected text.
+    #[test]
+    fn the_editor_edits_text_the_way_typing_would() {
+        use crate::model::text_edit::decode_for_edit;
+
+        let decoded = decode_for_edit(b"one\ntwo\nthree\n", "ext4", None).unwrap();
+        let mut ed = TextEditor::new("f.txt".into(), decoded);
+        // A trailing newline is a trailing empty line, and must survive: losing
+        // it on every save would rewrite files nobody edited.
+        assert_eq!(ed.lines, vec!["one", "two", "three", ""]);
+        assert!(!ed.dirty);
+
+        // Type at the end of line 2.
+        ed.move_to(1, 3);
+        for c in "-and-a-half".chars() {
+            ed.insert(c);
+        }
+        assert_eq!(ed.lines[1], "two-and-a-half");
+        assert!(ed.dirty);
+
+        // Split a line, then join it back with backspace at column zero.
+        ed.move_to(0, 3);
+        ed.newline();
+        assert_eq!(ed.lines[0], "one");
+        assert_eq!(ed.lines[1], "");
+        ed.backspace();
+        assert_eq!(ed.lines[0], "one");
+        assert_eq!(ed.lines.len(), 4);
+
+        // Delete at end-of-line joins with the next, which is how a stray blank
+        // line gets removed.
+        ed.move_to(2, 5);
+        ed.delete();
+        assert_eq!(ed.lines[2], "three");
+
+        assert_eq!(ed.text(), "one\ntwo-and-a-half\nthree");
+    }
+
+    /// The cursor is a character index, not a byte index - a decoded vintage
+    /// file can hold multi-byte characters, and indexing a Rust string by byte
+    /// at the wrong place panics.
+    #[test]
+    fn the_editor_handles_multibyte_characters() {
+        use crate::model::text_edit::decode_for_edit;
+
+        let decoded = decode_for_edit("café ok\n".as_bytes(), "ext4", None).unwrap();
+        let mut ed = TextEditor::new("f".into(), decoded);
+        // Position after the accented character.
+        ed.move_to(0, 4);
+        ed.insert('!');
+        assert_eq!(ed.lines[0], "café! ok");
+        ed.backspace();
+        assert_eq!(ed.lines[0], "café ok");
+        // And deleting the multi-byte character itself.
+        ed.move_to(0, 3);
+        ed.delete();
+        assert_eq!(ed.lines[0], "caf ok");
+    }
+
+    /// The viewport follows the cursor, or editing past the bottom of the
+    /// window edits lines the user cannot see.
+    #[test]
+    fn the_editor_scrolls_to_keep_the_cursor_visible() {
+        use crate::model::text_edit::decode_for_edit;
+
+        let body = (0..50)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let decoded = decode_for_edit(body.as_bytes(), "ext4", None).unwrap();
+        let mut ed = TextEditor::new("f".into(), decoded);
+
+        ed.move_to(40, 0);
+        ed.follow_cursor(10);
+        assert!(
+            ed.scroll <= 40 && 40 < ed.scroll + 10,
+            "cursor must be on screen, scroll={}",
+            ed.scroll
+        );
+
+        ed.move_to(0, 0);
+        ed.follow_cursor(10);
+        assert_eq!(ed.scroll, 0, "scrolling back up must follow too");
+    }
+
+    /// Importing onto an existing name must offer to replace, not dead-end.
+    ///
+    /// `import_host_file` used to `bail!("already exists")`, so the only way to
+    /// correct a file inside an image from the TUI was to delete it first - and
+    /// deleting it threw away the permissions, dates and type/creator that the
+    /// corrected file should have kept.
+    #[test]
+    fn importing_over_an_existing_name_offers_to_replace() {
+        use crate::fs::replace::OnConflict;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let img = dir.path().join("v.img");
+        let bytes = crate::fs::fat::create_blank_fat(2 * 1024 * 1024, Some("T")).unwrap();
+        std::fs::write(&img, &bytes).unwrap();
+
+        let host = dir.path().join("A.TXT");
+        std::fs::write(&host, b"first").unwrap();
+        let path = img.to_string_lossy().into_owned();
+
+        // First import creates.
+        match import_host_file(&path, None, "/", &host, OnConflict::Fail) {
+            Ok(ImportOutcome::Done(_)) => {}
+            other => panic!("first import should create: {:?}", other.is_ok()),
+        }
+
+        // Second import reports the collision instead of failing, so the UI can
+        // ask rather than dead-end.
+        std::fs::write(&host, b"second-longer").unwrap();
+        match import_host_file(&path, None, "/", &host, OnConflict::Fail) {
+            Ok(ImportOutcome::Exists(leaf)) => assert_eq!(leaf, "A.TXT"),
+            _ => panic!("a collision should be reported, not refused"),
+        }
+
+        // Skip leaves the original contents alone.
+        import_host_file(&path, None, "/", &host, OnConflict::Skip).expect("skip");
+        assert_eq!(read_root_file(&img, "A.TXT"), b"first");
+
+        // Replace swaps them.
+        import_host_file(&path, None, "/", &host, OnConflict::Replace).expect("replace");
+        assert_eq!(read_root_file(&img, "A.TXT"), b"second-longer");
+    }
+
+    /// Read a root-level file's contents straight from the image on disk.
+    fn read_root_file(img: &std::path::Path, name: &str) -> Vec<u8> {
+        use crate::fs::filesystem::Filesystem;
+        let f = std::fs::File::open(img).unwrap();
+        let mut fs = crate::fs::fat::FatFilesystem::open(f, 0).unwrap();
+        let root = fs.root().unwrap();
+        let e = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name.eq_ignore_ascii_case(name))
+            .expect("entry");
+        fs.read_file(&e, usize::MAX).unwrap()
+    }
+
+    /// The file picker must accept a raw device path.
+    ///
+    /// `PickKind::File` gated on `is_file()`, which is false for a block device,
+    /// so every picker in the TUI - Commander's image open included - refused
+    /// `/dev/sda` with "No such file". That single line was what stopped
+    /// Commander from opening a raw disk partition at all.
+    #[test]
+    fn the_file_picker_accepts_a_device_and_still_rejects_a_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("img.bin");
+        std::fs::write(&file, b"x").unwrap();
+
+        let mut p = FilePicker::new(PickKind::File, "Open");
+        assert!(
+            p.validate(file.clone()).is_some(),
+            "a regular file must still be accepted"
+        );
+
+        // A directory is the wrong kind and must stay rejected, with a message
+        // that says so rather than claiming the path is absent.
+        let mut p = FilePicker::new(PickKind::File, "Open");
+        assert!(p.validate(dir.path().to_path_buf()).is_none());
+        let err = p.error.clone().unwrap_or_default();
+        assert!(
+            err.contains("Not a file"),
+            "an existing directory should report the wrong kind, got: {err}"
+        );
+
+        // Character devices exist on every platform this runs on and are, like
+        // block devices, neither file nor directory - the exact shape that used
+        // to be rejected.
+        let devnull = std::path::PathBuf::from("/dev/null");
+        if devnull.exists() {
+            let mut p = FilePicker::new(PickKind::File, "Open");
+            assert!(
+                p.validate(devnull).is_some(),
+                "a device node must be accepted: {:?}",
+                p.error
+            );
+        }
+    }
+
+    /// Esc from the merged view goes straight back to the disk list - one level,
+    /// since there is no longer an intermediate pane to unwind through.
+    #[test]
+    fn esc_from_the_partition_view_returns_to_the_disk_list() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let img = mbr_with_ext(dir.path());
+        let size = std::fs::metadata(&img).unwrap().len();
+
+        let mut app = App::new_on(DEFAULT_TAB);
+        app.disks = Some(vec![fake_disk(&img, size)]);
+        app.activate();
+        assert!(app.opened.is_some());
+
+        app.on_back();
+        assert!(app.opened.is_none(), "Esc should close the partition view");
+        assert!(
+            app.inspect_list_active(),
+            "and land back on the selectable disk list"
+        );
+        assert!(!app.should_quit, "Esc must not quit from one level in");
+    }
+
+    /// A raw device path is neither a file nor a directory, so the picker's
+    /// `is_file()` test sent every one of them to "No such file or directory" -
+    /// a flat denial for something plainly present.
+    #[test]
+    fn opening_a_path_that_is_not_a_regular_file_does_not_claim_it_is_missing() {
+        let mut app = App::new_on(DEFAULT_TAB);
+        // A directory that is not a backup folder stands in for the shape of the
+        // bug without needing a real device: it exists, so whatever the status
+        // says, it must not be "No such file or directory".
+        let dir = tempfile::tempdir().expect("tempdir");
+        app.open_target(dir.path().to_path_buf());
+        let status = app.status.clone().unwrap_or_default();
+        assert!(
+            !status.contains("No such file or directory"),
+            "an existing path must not be reported as missing: {status}"
+        );
+    }
+
+    /// `parse_partitions` must report an unreadable target rather than return an
+    /// empty list, which the image view rendered as a disk with no partitions -
+    /// indistinguishable from a genuinely empty one.
+    #[test]
+    fn parse_partitions_reports_an_unreadable_target() {
+        let missing = std::path::Path::new("/nonexistent/rb-tui-test/disk.img");
+        assert!(
+            parse_partitions(missing, 0).is_err(),
+            "an unreadable path must surface its error"
+        );
+    }
+
     /// Walk the wizard's class list to a given class the way the arrow keys do.
     fn wizard_on(class: DiskClass) -> NewWizard {
         let mut w = NewWizard {
@@ -10565,6 +12013,7 @@ mod tests {
                 type_code: String::new(), // ext has no type code
                 creator: String::new(),   // nor a creator
                 modify_mac: None,         // nor Mac dates
+                create_mac: None,
                 mode: Some(0o750),
                 owner: Some((4242, 4243)),
             },

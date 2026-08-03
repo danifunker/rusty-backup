@@ -45,6 +45,18 @@ pub struct InspectArgs {
 
 pub fn run(args: InspectArgs) -> Result<()> {
     require_non_flat(args.format, "inspect")?;
+    // `inspect` is whole-disk and takes a plain path, so an `@N` the user
+    // brought over from `ls` / `get` lands inside the filename and the open
+    // fails with a bare ENOENT. Say what actually happened.
+    if let Some((real, n)) = crate::cli::img_at::stray_selector(&args.image) {
+        anyhow::bail!(
+            "`inspect` reads the whole disk, so `@{n}` was taken as part of the \
+             filename. Drop it to inspect {}, or use `show fs-info {}@{n}` for \
+             just that partition.",
+            real.display(),
+            real.display()
+        );
+    }
     let pw_bytes = args.password.as_deref().map(|s| s.as_bytes());
     // Peel container *and* image-wrapper layers (CHD / GHO / zip / … plus
     // VHD / 2MG / DMG / DiskCopy 4.2) so inspect sees the same flat disk the
@@ -128,7 +140,13 @@ fn emit_text(
         "{:>3}  {:<24}  {:>12}  {:>14}  {}",
         "idx", "type", "start_lba", "size", "flags"
     ));
-    for p in partitions {
+    // `idx` is the number the user types back at us - `IMG@N` / `--partition N`
+    // / `--partitions 1,3` - which is the 1-based position in this same list.
+    // Deliberately not `PartitionInfo::index`: that field is the raw table slot
+    // (MBR enumerates its four entries before discarding the empty ones), so it
+    // is 0-based on MBR/GPT and 1-based on APM, and printing it told the user a
+    // number that selects a different partition.
+    for (pos, p) in partitions.iter().enumerate() {
         let mut flags = Vec::new();
         if p.bootable {
             flags.push("boot");
@@ -141,7 +159,7 @@ fn emit_text(
         }
         out_stdout(format!(
             "{:>3}  {:<24}  {:>12}  {:>14}  {}",
-            p.index,
+            pos + 1,
             p.type_name,
             p.start_lba,
             format_size(p.size_bytes),
@@ -205,8 +223,9 @@ fn emit_structured(
         chd_info: chd_report.map(|s| s.to_string()),
         partitions: partitions
             .iter()
-            .map(|p| PartitionRow {
-                index: p.index,
+            .enumerate()
+            .map(|(pos, p)| PartitionRow {
+                index: pos + 1,
                 type_name: p.type_name.clone(),
                 partition_type_byte: p.partition_type_byte,
                 partition_type_string: p.partition_type_string.clone(),
@@ -239,6 +258,9 @@ struct InspectPayload {
 
 #[derive(Debug, Serialize)]
 struct PartitionRow {
+    /// 1-based position in the partition list, i.e. the number the selectors
+    /// take (`IMG@N`, `--partition N`, `--partitions 1,3`). Not the raw table
+    /// slot — see the note in `emit_text`.
     index: usize,
     type_name: String,
     partition_type_byte: u8,

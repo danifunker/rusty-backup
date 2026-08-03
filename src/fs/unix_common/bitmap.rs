@@ -74,6 +74,28 @@ impl<'a> BitmapReader<'a> {
         self.bit_count - self.count_set_bits()
     }
 
+    /// Index (0..=7) of the most significant set bit of a **non-zero** byte.
+    ///
+    /// Widened to `u32` before `leading_zeros` deliberately, and it must stay
+    /// that way: mrustc's C backend lowers `leading_zeros` on integers narrower
+    /// than 32 bits as a *32-bit* count, so under it `0x01u8.leading_zeros()`
+    /// is 31 rather than 7 (and `0x80u8` gives 24 rather than 0; `u16` is wrong
+    /// the same way). The obvious `7 - byte.leading_zeros()` therefore wraps to
+    /// about 4.29e9 on any mrustc-built binary - which is how the PowerPC build
+    /// came to report every ext volume's last used block as the end of the
+    /// volume, silently imaging 32 MiB where the desktop imaged 4.5 MiB. It was
+    /// invisible because `count_ones` *is* lowered correctly, so bit *counts*
+    /// agreed everywhere and only positions were wrong.
+    ///
+    /// `u32`/`u64` `leading_zeros` are correct under mrustc, so this form is
+    /// identical on both compilers. Verified directly against mrustc, not
+    /// assumed.
+    #[inline]
+    fn top_set_bit(byte: u8) -> u32 {
+        debug_assert!(byte != 0, "top_set_bit requires a non-zero byte");
+        31 - (byte as u32).leading_zeros()
+    }
+
     /// Find the index of the highest set bit, scanning from the end.
     ///
     /// Returns `None` if no bits are set.
@@ -90,7 +112,7 @@ impl<'a> BitmapReader<'a> {
             let mask = (1u8 << remaining_bits) - 1;
             let masked = self.data[full_bytes] & mask;
             if masked != 0 {
-                let top_bit = 7 - masked.leading_zeros();
+                let top_bit = Self::top_set_bit(masked);
                 return Some(full_bytes as u64 * 8 + top_bit as u64);
             }
         }
@@ -98,7 +120,7 @@ impl<'a> BitmapReader<'a> {
         // Scan full bytes from end to start
         for i in (0..full_bytes).rev() {
             if self.data[i] != 0 {
-                let top_bit = 7 - self.data[i].leading_zeros();
+                let top_bit = Self::top_set_bit(self.data[i]);
                 return Some(i as u64 * 8 + top_bit as u64);
             }
         }
@@ -125,7 +147,7 @@ impl<'a> BitmapReader<'a> {
             let mask = (1u8 << remaining_bits) - 1;
             let inv = (!self.data[full_bytes]) & mask;
             if inv != 0 {
-                let top_bit = 7 - inv.leading_zeros();
+                let top_bit = Self::top_set_bit(inv);
                 // `mask` guarantees `top_bit < remaining_bits`, so the
                 // result is already inside the valid range.
                 return Some(full_bytes as u64 * 8 + top_bit as u64);
@@ -135,7 +157,7 @@ impl<'a> BitmapReader<'a> {
         for i in (0..full_bytes).rev() {
             let inv = !self.data[i];
             if inv != 0 {
-                let top_bit = 7 - inv.leading_zeros();
+                let top_bit = Self::top_set_bit(inv);
                 return Some(i as u64 * 8 + top_bit as u64);
             }
         }
@@ -290,6 +312,57 @@ pub fn bitmap_find_clear_bit(data: &[u8], bit_count: u64) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `top_set_bit` must agree with a from-scratch bit scan for every byte.
+    ///
+    /// This pins the widening in `top_set_bit`. The natural-looking
+    /// `7 - byte.leading_zeros()` is correct on rustc and *wrong* on mrustc,
+    /// which lowers `leading_zeros` for sub-32-bit integers as a 32-bit count -
+    /// so `0x01u8` yields 31, the subtraction wraps to ~4.29e9, and every
+    /// caller silently believes the last used block is off the end of the
+    /// volume. A native `cargo test` cannot see that difference, so this test
+    /// guards the *shape* of the computation: it fails only if someone changes
+    /// the arithmetic itself, and the doc comment on `top_set_bit` explains why
+    /// the obvious simplification must not be applied.
+    #[test]
+    fn top_set_bit_matches_a_plain_scan_for_every_byte() {
+        for byte in 1u8..=255 {
+            let expected = (0..8u32).filter(|b| byte & (1 << b) != 0).max().unwrap();
+            assert_eq!(
+                BitmapReader::top_set_bit(byte),
+                expected,
+                "top_set_bit({byte:#04x})"
+            );
+        }
+    }
+
+    /// The whole-bitmap entry points, over every single-bit pattern: a wrong
+    /// top-bit calculation would show up as an off-by-N index here.
+    #[test]
+    fn highest_set_and_clear_bits_are_positionally_correct() {
+        for bit in 0..8u64 {
+            let data = [1u8 << bit];
+            let bm = BitmapReader::new(&data, 8);
+            assert_eq!(bm.highest_set_bit(), Some(bit), "highest_set_bit for {bit}");
+
+            // Inverse pattern: exactly one clear bit, at the same position.
+            let inv = [!(1u8 << bit)];
+            let bmi = BitmapReader::new(&inv, 8);
+            assert_eq!(
+                bmi.highest_clear_bit(),
+                Some(bit),
+                "highest_clear_bit for {bit}"
+            );
+        }
+
+        // Multi-byte: the highest set bit is in an earlier byte than the last.
+        let data = [0x00u8, 0b0001_0000, 0x00];
+        assert_eq!(
+            BitmapReader::new(&data, 24).highest_set_bit(),
+            Some(8 + 4),
+            "highest set bit should be byte 1, bit 4"
+        );
+    }
 
     #[test]
     fn test_single_byte_set_bits() {

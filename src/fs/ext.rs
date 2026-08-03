@@ -1072,7 +1072,23 @@ impl<R: Read + Seek + Send> Filesystem for ExtFilesystem<R> {
         let mut highest_block: u64 = 0;
         let blocks_per_group = self.total_blocks.div_ceil(self.group_count as u64);
 
+        // This value is the trim point for a layout-preserving backup - it *is*
+        // the imaged size - so getting it wrong silently images the whole
+        // partition. On PowerPC it comes back as the entire volume where the
+        // desktop returns the used extent, with no error on either side, so the
+        // geometry and the per-group scan are logged to find where they diverge.
+        log::debug!(
+            "ext last_data_byte: block_size={} total_blocks={} group_count={} \
+             first_data_block={} blocks_per_group={}",
+            self.block_size,
+            self.total_blocks,
+            self.group_count,
+            self.first_data_block,
+            blocks_per_group,
+        );
+
         for group in 0..self.group_count as usize {
+            let bitmap_block = self.group_descriptors[group].block_bitmap;
             let bitmap_data = self.read_block_bitmap(group)?;
 
             // Calculate how many blocks are in this group
@@ -1085,7 +1101,16 @@ impl<R: Read + Seek + Send> Filesystem for ExtFilesystem<R> {
             };
 
             let bm = BitmapReader::new(&bitmap_data, group_blocks);
-            if let Some(highest_in_group) = bm.highest_set_bit() {
+            let highest = bm.highest_set_bit();
+            log::debug!(
+                "ext last_data_byte: group {group}: bitmap_block={bitmap_block} \
+                 bitmap_len={} group_start={group_start} group_blocks={group_blocks} \
+                 set_bits={} highest_set_bit={highest:?} first_bytes={:02x?}",
+                bitmap_data.len(),
+                bm.count_set_bits(),
+                &bitmap_data[..bitmap_data.len().min(8)],
+            );
+            if let Some(highest_in_group) = highest {
                 let absolute_block = group_start + highest_in_group;
                 if absolute_block > highest_block {
                     highest_block = absolute_block;
@@ -1094,7 +1119,9 @@ impl<R: Read + Seek + Send> Filesystem for ExtFilesystem<R> {
         }
 
         // Return byte offset of the end of the highest used block
-        Ok((highest_block + 1) * self.block_size)
+        let end = (highest_block + 1) * self.block_size;
+        log::debug!("ext last_data_byte: highest_block={highest_block} -> {end} bytes");
+        Ok(end)
     }
 }
 

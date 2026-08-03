@@ -37,6 +37,8 @@
 <dd>4-character creator code (HFS / HFS+ only). Falls back to `[put] creator` from the config file, then to the file extension, and finally to `????`</dd>
 <dt><code>--force</code></dt>
 <dd>Overwrite an existing entry at the destination path</dd>
+<dt><code>--no-preserve-meta</code></dt>
+<dd>Give the replacement fresh metadata instead of the replaced file's</dd>
 <dt><code>--mode</code></dt>
 <dd>Unix permission bits for the new file, as octal (e.g. `755`, `0644`). Unix filesystems only (ext / UFS / XFS / EFS / Minix / SquashFS); ignored on FAT / HFS / exFAT, which have no such concept</dd>
 <dt><code>--uid</code></dt>

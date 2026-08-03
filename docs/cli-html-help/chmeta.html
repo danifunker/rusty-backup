@@ -23,6 +23,10 @@
 <dd>New 4-character type code</dd>
 <dt><code>--creator</code></dt>
 <dd>New 4-character creator code (HFS / HFS+ only)</dd>
+<dt><code>--attrs</code></dt>
+<dd>DOS attribute bits (FAT / exFAT). Comma-separated flags, each optionally prefixed `+` to set or `-` to clear: `readonly`, `hidden`, `system`, `archive`. Without a prefix the listed set becomes the whole set, so `--attrs readonly,hidden` clears anything else</dd>
+<dt><code>--protection</code></dt>
+<dd>AmigaDOS protection bits (AFFS / PFS3 / SFS), as the letters AmigaDOS itself prints: `hsparwed`. Letters present are set, absent are clear, so `--protection rwed` is the ordinary state and `--protection rwd` marks a file unexecutable</dd>
 </dl>
 <footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_docs</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
 </body></html>

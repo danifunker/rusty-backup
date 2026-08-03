@@ -15,7 +15,7 @@
 //! still returns a guard (which does nothing on drop) so callers don't have
 //! to handle errors.
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(feature = "os-stub")))]
 mod imp {
     use objc2_core_foundation::CFString;
     use objc2_io_kit::{
@@ -131,7 +131,13 @@ mod imp {
     }
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+// The macOS implementation is IOPMAssertion via `objc2-io-kit`; under `os-stub`
+// there is no objc2, so fall back to this no-op. Preventing idle sleep is a
+// nicety, not a correctness requirement.
+#[cfg(any(
+    not(any(target_os = "macos", target_os = "windows", target_os = "linux")),
+    all(target_os = "macos", feature = "os-stub")
+))]
 mod imp {
     pub struct WakeLock;
     pub fn acquire(_reason: &str) -> WakeLock {

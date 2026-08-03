@@ -286,6 +286,19 @@ fn apply_batch(
 ) -> Result<()> {
     use std::io::{Seek, Write};
 
+    // `partmap` rewrites the whole disk's table and takes a plain path, so an
+    // `@N` carried over from `ls` / `get` ends up inside the filename and the
+    // open fails with a bare ENOENT. Name the real problem: here the partition
+    // is chosen by the positional index argument, not by a path suffix.
+    if let Some((real, n)) = crate::cli::img_at::stray_selector(image) {
+        anyhow::bail!(
+            "`partmap` edits the whole partition table, so `@{n}` was taken as \
+             part of the filename. Drop it and pass the partition as the index \
+             argument instead, e.g. `partmap resize {} {n} <SIZE>`.",
+            real.display()
+        );
+    }
+
     // Probe the table + disk size read-only first (peels a CHD / container),
     // so `--dry-run` never opens a write handle — which, for a compressed CHD,
     // would make a backup copy + diff for nothing.

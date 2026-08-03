@@ -968,3 +968,583 @@ fn octal_field(f: &[u8]) -> u32 {
         .collect();
     u32::from_str_radix(&s, 8).unwrap_or(0)
 }
+
+/// The number `inspect` prints must be the number the selectors take.
+///
+/// These were not the same. `IMG@N` resolves as `partitions[N - 1]`, while
+/// `inspect` printed `PartitionInfo::index` — the raw table slot, which MBR
+/// numbers from 0 (it enumerates its four entries before discarding the empty
+/// ones) and APM numbers from 1. So on an MBR image the listing named a
+/// partition and handed you the number of its neighbour. Reported from a G5,
+/// where the APM disk happened to agree and the MBR case did not.
+///
+/// Asserted end to end rather than on the text: each partition holds a
+/// differently-named file, so selecting by the printed index has to land on the
+/// matching content.
+#[test]
+fn inspect_indices_are_the_numbers_the_selector_takes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let one = dir.path().join("p1.img");
+    let two = dir.path().join("p2.img");
+    let host = dir.path().join("f.txt");
+    std::fs::write(&host, b"x").unwrap();
+
+    // Two FAT volumes, each carrying a file named after its partition.
+    for (vol, name) in [(&one, "/ONE.TXT"), (&two, "/TWO.TXT")] {
+        run(&[
+            "new",
+            "volume",
+            "fat",
+            vol.to_str().unwrap(),
+            "--size",
+            "16M",
+        ]);
+        run(&["put", vol.to_str().unwrap(), host.to_str().unwrap(), name]);
+    }
+
+    // Wrap them in an MBR. The first entry deliberately starts at LBA 2048, so
+    // slot number and list position cannot coincide by accident.
+    const SECTOR: u64 = 512;
+    const START1: u64 = 2048;
+    let vol_sectors = 16 * 1024 * 1024 / SECTOR;
+    let start2 = START1 + vol_sectors;
+    let mut disk = vec![0u8; ((start2 + vol_sectors) * SECTOR) as usize];
+    for (vol, start) in [(&one, START1), (&two, start2)] {
+        let bytes = std::fs::read(vol).unwrap();
+        let at = (start * SECTOR) as usize;
+        disk[at..at + bytes.len()].copy_from_slice(&bytes);
+    }
+    let mut entry = |off: usize, boot: u8, lba: u64| {
+        disk[off] = boot;
+        disk[off + 1..off + 4].copy_from_slice(&[0xfe, 0xff, 0xff]);
+        disk[off + 4] = 0x0e; // FAT16 LBA
+        disk[off + 5..off + 8].copy_from_slice(&[0xfe, 0xff, 0xff]);
+        disk[off + 8..off + 12].copy_from_slice(&(lba as u32).to_le_bytes());
+        disk[off + 12..off + 16].copy_from_slice(&(vol_sectors as u32).to_le_bytes());
+    };
+    entry(446, 0x80, START1);
+    entry(462, 0x00, start2);
+    disk[510] = 0x55;
+    disk[511] = 0xAA;
+    let img = dir.path().join("two_parts.img");
+    std::fs::write(&img, &disk).unwrap();
+    let img_s = img.to_str().unwrap();
+
+    // JSON is the machine-facing contract, so assert on it directly.
+    let out = run(&["inspect", img_s, "--format", "json"]);
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).expect("inspect JSON");
+    let rows = json["result"]["partitions"]
+        .as_array()
+        .expect("partitions array");
+    assert_eq!(rows.len(), 2, "{json}");
+    assert_eq!(rows[0]["index"], 1, "first partition is selector 1: {json}");
+    assert_eq!(
+        rows[1]["index"], 2,
+        "second partition is selector 2: {json}"
+    );
+
+    // The invariant that matters: the printed number selects that partition.
+    for (idx, want) in [(1, "ONE.TXT"), (2, "TWO.TXT")] {
+        let listing = run(&["ls", &format!("{img_s}@{idx}"), "/"]);
+        let text = String::from_utf8_lossy(&listing.stdout);
+        assert!(
+            text.contains(want),
+            "@{idx} should list {want}, got:\n{text}"
+        );
+    }
+}
+
+/// `inspect` is whole-disk and takes a plain path, so an `@N` brought over
+/// from `ls` / `get` lands inside the filename. It used to fail with a bare
+/// `No such file or directory`, which reads as a missing file and led to the
+/// conclusion that the `@N` syntax was broken. It must explain itself.
+#[test]
+fn inspect_explains_a_stray_partition_selector() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let img = dir.path().join("disk.img");
+    let img_s = img.to_str().unwrap();
+    run(&["new", "volume", "fat", img_s, "--size", "8M"]);
+
+    let out = run_expect_fail(&["inspect", &format!("{img_s}@2")]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("whole disk") && err.contains("show fs-info"),
+        "should explain the selector and point at the per-partition verb, got:\n{err}"
+    );
+
+    // A genuinely missing file must still report as missing, not as a stray
+    // selector.
+    let missing = run_expect_fail(&["inspect", dir.path().join("absent.img").to_str().unwrap()]);
+    let missing_err = String::from_utf8_lossy(&missing.stderr);
+    assert!(
+        !missing_err.contains("whole disk"),
+        "missing file should not get the selector hint: {missing_err}"
+    );
+}
+
+/// A filesystem smaller than the image containing it must survive
+/// backup -> restore. It did not, and nothing caught it.
+///
+/// Compaction packs the volume, and the restore then tries to grow it to fill
+/// the target. When that growth crossed a FAT width boundary the resize
+/// rewrote the total-sector count anyway and reported success, leaving a
+/// filesystem claiming the whole container while its FAT still described the
+/// small original. The restore said it worked; the image failed on its first
+/// directory read.
+///
+/// The existing coverage could not see it: `test_fat12_compaction_round_trip`
+/// exercises `CompactFatReader` alone and never restores, and
+/// `backup_then_restore_round_trip_file_to_file` restores but uses HFS - and
+/// every fixture has a filesystem that exactly fills its container, which is
+/// the one shape where this cannot happen. You reach it by restoring a small
+/// image onto a larger device.
+#[test]
+fn backup_restore_round_trip_when_fs_is_smaller_than_its_container() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let small = dir.path().join("small.img");
+    let big = dir.path().join("big.img");
+    let host = dir.path().join("payload.txt");
+    std::fs::write(&host, b"smaller than its container\n").unwrap();
+
+    // An 800 KB FAT12 volume sitting at the start of a 40 MB image - what a
+    // device looks like after a floppy image is written to it.
+    run(&["new", "floppy", "fat", small.to_str().unwrap()]);
+    run(&[
+        "put",
+        small.to_str().unwrap(),
+        host.to_str().unwrap(),
+        "/PROOF.TXT",
+    ]);
+    let small_bytes = std::fs::read(&small).unwrap();
+    let mut container = vec![0u8; 40 * 1024 * 1024];
+    container[..small_bytes.len()].copy_from_slice(&small_bytes);
+    std::fs::write(&big, &container).unwrap();
+
+    // Sanity: the container reads before we go anywhere near a backup.
+    let listing = run(&["ls", big.to_str().unwrap(), "/"]);
+    assert!(
+        String::from_utf8_lossy(&listing.stdout).contains("PROOF.TXT"),
+        "test setup is wrong - the container should list before backup"
+    );
+
+    let backups = dir.path().join("bk");
+    std::fs::create_dir_all(&backups).unwrap();
+    run(&[
+        "backup",
+        big.to_str().unwrap(),
+        backups.to_str().unwrap(),
+        "--name",
+        "shrunk",
+        "--checksum",
+        "sha256",
+    ]);
+
+    let restored = dir.path().join("restored.img");
+    run(&[
+        "restore",
+        backups.join("shrunk").to_str().unwrap(),
+        restored.to_str().unwrap(),
+    ]);
+
+    // The whole point: the restored image must still be a readable filesystem.
+    let out = run(&["ls", restored.to_str().unwrap(), "/"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("PROOF.TXT"),
+        "restored image should still list its file, got:\n{text}"
+    );
+
+    // And the file's contents must survive, not just its name.
+    let back = dir.path().join("back.txt");
+    run(&[
+        "get",
+        restored.to_str().unwrap(),
+        "/PROOF.TXT",
+        back.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        std::fs::read(&back).unwrap(),
+        std::fs::read(&host).unwrap(),
+        "restored file contents differ from the original"
+    );
+}
+
+/// `restore --size minimum` must actually shrink the partition.
+///
+/// The flag parsed, resolved against the config file, mapped to a
+/// `RestoreSizeChoice` - and was then dropped on the floor, because
+/// `partition_sizes` was hardcoded empty. Every `--size minimum` restore
+/// silently produced an original-sized image. The variable holding the
+/// resolved choice was named `_size_choice`, so no dead-code warning fired.
+///
+/// This also pins the FAT16 minimum-size floor: `defragmented_min_size_bytes`
+/// is what the restore targets, and it has to be at least as large as the
+/// image compaction emits, or the restore refuses with "size is smaller than
+/// minimum" instead of shrinking.
+#[test]
+fn restore_at_minimum_actually_shrinks_a_fat16_partition() {
+    restore_at_minimum_shrinks_with_format("zstd");
+}
+
+/// The same, through the **default** backup format. This one is the likelier
+/// user path and it had an extra way to fail: `run_restore` only takes the
+/// single-file-CHD *resize* branch when some partition is non-Original, so an
+/// empty `partition_sizes` sent every CHD restore down the as-is byte-copy and
+/// no amount of correct resize logic downstream would ever have run.
+#[test]
+fn restore_at_minimum_actually_shrinks_a_fat16_partition_from_chd() {
+    restore_at_minimum_shrinks_with_format("chd");
+}
+
+fn restore_at_minimum_shrinks_with_format(format: &str) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let vol = dir.path().join("vol.img");
+    let disk = dir.path().join("disk.img");
+    let host = dir.path().join("payload.txt");
+    std::fs::write(&host, b"restore --size minimum must shrink\n").unwrap();
+
+    // A 64 MB FAT16 volume, nearly empty, so its minimum is far below its
+    // original size and a working --size minimum is unmistakable.
+    run(&[
+        "new",
+        "volume",
+        "fat",
+        "--size",
+        "64M",
+        "--name",
+        "MID",
+        vol.to_str().unwrap(),
+    ]);
+    run(&[
+        "put",
+        vol.to_str().unwrap(),
+        host.to_str().unwrap(),
+        "/PROOF.TXT",
+    ]);
+
+    // Wrap it in an MBR at LBA 2048 — partition sizing only has meaning on a
+    // partitioned disk.
+    const START_LBA: u32 = 2048;
+    let vol_bytes = std::fs::read(&vol).unwrap();
+    let mut img = vec![0u8; START_LBA as usize * 512 + vol_bytes.len()];
+    img[START_LBA as usize * 512..].copy_from_slice(&vol_bytes);
+    let e = 0x1BE;
+    img[e + 1..e + 4].copy_from_slice(&[0xFE, 0xFF, 0xFF]); // CHS start (unused)
+    img[e + 4] = 0x06; // FAT16
+    img[e + 5..e + 8].copy_from_slice(&[0xFE, 0xFF, 0xFF]); // CHS end (unused)
+    img[e + 8..e + 12].copy_from_slice(&START_LBA.to_le_bytes());
+    img[e + 12..e + 16].copy_from_slice(&((vol_bytes.len() / 512) as u32).to_le_bytes());
+    img[510] = 0x55;
+    img[511] = 0xAA;
+    std::fs::write(&disk, &img).unwrap();
+
+    // Sanity: it reads as a partitioned FAT16 disk before we back it up.
+    let pre = run(&["ls", &format!("{}@1", disk.to_str().unwrap()), "/"]);
+    assert!(
+        String::from_utf8_lossy(&pre.stdout).contains("PROOF.TXT"),
+        "test setup is wrong - the partition should list before backup"
+    );
+
+    let backups = dir.path().join("bk");
+    std::fs::create_dir_all(&backups).unwrap();
+    run(&[
+        "backup",
+        disk.to_str().unwrap(),
+        backups.to_str().unwrap(),
+        "--name",
+        "shrink",
+        "--format",
+        format,
+        "--checksum",
+        "sha256",
+    ]);
+
+    let restored = dir.path().join("restored.img");
+    run(&[
+        "restore",
+        backups.join("shrink").to_str().unwrap(),
+        restored.to_str().unwrap(),
+        "--size",
+        "minimum",
+    ]);
+
+    // The partition entry must have shrunk. Read it straight out of the MBR
+    // rather than trusting a log line.
+    let out = std::fs::read(&restored).unwrap();
+    let part_sectors = u32::from_le_bytes([out[e + 12], out[e + 13], out[e + 14], out[e + 15]]);
+    let part_bytes = part_sectors as u64 * 512;
+    let original_bytes = vol_bytes.len() as u64;
+    assert!(
+        part_bytes < original_bytes,
+        "--size minimum left the partition at {part_bytes} bytes (original {original_bytes}) \
+         - the flag did nothing"
+    );
+
+    // ...and the shrunken partition must still be a readable filesystem with
+    // its file intact, which is the half a merely-smaller number doesn't prove.
+    let listing = run(&["ls", &format!("{}@1", restored.to_str().unwrap()), "/"]);
+    let text = String::from_utf8_lossy(&listing.stdout);
+    assert!(
+        text.contains("PROOF.TXT"),
+        "shrunk partition should still list its file, got:\n{text}"
+    );
+
+    let back = dir.path().join("back.txt");
+    run(&[
+        "get",
+        &format!("{}@1", restored.to_str().unwrap()),
+        "/PROOF.TXT",
+        back.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        std::fs::read(&back).unwrap(),
+        std::fs::read(&host).unwrap(),
+        "restored file contents differ from the original"
+    );
+}
+
+/// Replacing a file must keep what the file carried.
+///
+/// A replace writes new *contents*; it is not a request to reset who may read
+/// the file, when it was made, or which application owns it. The old path
+/// deleted the entry and recreated it, so everything except xattrs and the
+/// POSIX triple was silently dropped - and the generic BINA/???? fallback fired
+/// before any preservation could, so replacing a TEXT/MSWD document turned it
+/// into a BINA blob.
+#[test]
+fn replacing_a_file_preserves_its_type_and_creator() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let img = dir.path().join("h.img");
+    let a = dir.path().join("a.txt");
+    let b = dir.path().join("b.txt");
+    std::fs::write(&a, b"original\n").unwrap();
+    std::fs::write(&b, b"replacement-longer\n").unwrap();
+
+    run(&["new", "floppy", "hfs", img.to_str().unwrap()]);
+    run(&[
+        "put",
+        img.to_str().unwrap(),
+        a.to_str().unwrap(),
+        "/DOC",
+        "--type",
+        "TEXT",
+        "--creator",
+        "MSWD",
+    ]);
+
+    let listing = |img: &std::path::Path| -> String {
+        let out = run(&["ls", img.to_str().unwrap(), "/"]);
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find(|l| l.contains("DOC"))
+            .unwrap_or_default()
+            .to_string()
+    };
+    assert!(listing(&img).contains("TEXT MSWD"), "setup");
+
+    // Default replace: type/creator survive, contents do not.
+    run(&[
+        "put",
+        img.to_str().unwrap(),
+        b.to_str().unwrap(),
+        "/DOC",
+        "--force",
+    ]);
+    let after = listing(&img);
+    assert!(
+        after.contains("TEXT MSWD"),
+        "type/creator should survive a replace, got: {after}"
+    );
+    assert!(
+        after.contains("19"),
+        "the contents should still have been replaced, got: {after}"
+    );
+
+    // Explicit flags outrank the preserved values - they are an instruction.
+    run(&[
+        "put",
+        img.to_str().unwrap(),
+        a.to_str().unwrap(),
+        "/DOC",
+        "--force",
+        "--type",
+        "APPL",
+        "--creator",
+        "RBKP",
+    ]);
+    assert!(
+        listing(&img).contains("APPL RBKP"),
+        "an explicit --type must win over preservation"
+    );
+
+    // And the opt-out really opts out.
+    run(&[
+        "put",
+        img.to_str().unwrap(),
+        b.to_str().unwrap(),
+        "/DOC",
+        "--force",
+        "--no-preserve-meta",
+    ]);
+    let fresh = listing(&img);
+    assert!(
+        fresh.contains("BINA") && fresh.contains("????"),
+        "--no-preserve-meta should start clean, got: {fresh}"
+    );
+}
+
+/// The POSIX triple survives a replace on a Unix filesystem, and the opt-out
+/// drops it. Editing one line of a config file must not silently reset who can
+/// read it.
+#[test]
+fn replacing_a_file_preserves_unix_permissions_and_owner() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let img = dir.path().join("e.img");
+    let a = dir.path().join("a.txt");
+    let b = dir.path().join("b.txt");
+    std::fs::write(&a, b"original\n").unwrap();
+    std::fs::write(&b, b"replacement\n").unwrap();
+
+    run(&[
+        "new",
+        "volume",
+        "ext3",
+        img.to_str().unwrap(),
+        "--size",
+        "16M",
+    ]);
+    run(&[
+        "put",
+        img.to_str().unwrap(),
+        a.to_str().unwrap(),
+        "/conf",
+        "--mode",
+        "600",
+        "--uid",
+        "42",
+        "--gid",
+        "7",
+    ]);
+
+    let out = run(&[
+        "put",
+        img.to_str().unwrap(),
+        b.to_str().unwrap(),
+        "/conf",
+        "--force",
+    ]);
+    let log = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        log.contains("mode 0600") && log.contains("42:7"),
+        "the replace should report what it preserved, got:\n{log}"
+    );
+
+    let out = run(&[
+        "put",
+        img.to_str().unwrap(),
+        a.to_str().unwrap(),
+        "/conf",
+        "--force",
+        "--no-preserve-meta",
+    ]);
+    let log = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        log.contains("fresh metadata"),
+        "--no-preserve-meta should say so, got:\n{log}"
+    );
+    // And it has to be true of the file, not just of the log line. Asserting
+    // only on the message is how this shipped inheriting mode and owner from
+    // the replaced file while announcing the opposite: the entry stayed
+    // 0600 42:7 through every run of this test.
+    let listing =
+        String::from_utf8_lossy(&run(&["ls", img.to_str().unwrap(), "/", "-o"]).stdout).to_string();
+    let line = listing
+        .lines()
+        .find(|l| l.contains("conf"))
+        .unwrap_or_else(|| panic!("no /conf in listing:\n{listing}"));
+    assert!(
+        !line.contains("42:7"),
+        "--no-preserve-meta must not carry the replaced file's owner over, got: {line}"
+    );
+    assert!(
+        !line.contains("rw-------"),
+        "--no-preserve-meta must not carry the replaced file's mode over, got: {line}"
+    );
+}
+
+/// `edit` must hand the editor clean UTF-8/LF and put the file's own encoding
+/// and endings back, so a DOS file survives a trip through a UTF-8 editor.
+///
+/// Unix-only because the stand-in editor is a `/bin/sh` script: Windows cannot
+/// spawn one, so on that platform the test failed in the harness rather than in
+/// anything it was meant to cover. What it uniquely exercises is the
+/// spawn-an-editor glue; the conversion rules themselves are covered on every
+/// platform by the unit tests in `src/model/text_edit.rs` (including the
+/// doubled-CR case this test's editor reproduces), and the editor-command
+/// splitting by `split_editor_command`'s own tests.
+#[cfg(unix)]
+#[test]
+fn edit_round_trips_a_dos_file_through_an_editor() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let img = dir.path().join("d.img");
+    let src = dir.path().join("auto.bat");
+    // 0xB3 is a CP437 box-drawing bar, and invalid UTF-8.
+    std::fs::write(&src, b"REM start \xb3 bar\r\nPATH C:\\DOS\r\n").unwrap();
+
+    run(&["new", "floppy", "fat", img.to_str().unwrap()]);
+    run(&[
+        "put",
+        img.to_str().unwrap(),
+        src.to_str().unwrap(),
+        "/AUTOEXEC.BAT",
+    ]);
+
+    // An "editor" that appends a line using CRLF, the way a Windows editor
+    // would - the file was handed to it as LF, so re-applying CRLF naively
+    // produced a doubled CR on that line.
+    let ed = dir.path().join("ed.sh");
+    std::fs::write(&ed, "#!/bin/sh\nprintf 'REM added\\r\\n' >> \"$1\"\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&ed, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let out = std::process::Command::new(cli_bin())
+        .args(["edit", img.to_str().unwrap(), "/AUTOEXEC.BAT"])
+        .env("EDITOR", &ed)
+        .output()
+        .expect("spawn rb-cli edit");
+    assert!(
+        out.status.success(),
+        "edit failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let back = dir.path().join("out.bin");
+    run(&[
+        "get",
+        img.to_str().unwrap(),
+        "/AUTOEXEC.BAT",
+        back.to_str().unwrap(),
+    ]);
+    let bytes = std::fs::read(&back).unwrap();
+
+    assert!(
+        bytes.contains(&0xb3),
+        "the CP437 box-drawing byte must survive; a UTF-8 round trip loses it"
+    );
+    assert!(
+        !bytes.windows(2).any(|w| w == b"\r\r"),
+        "no doubled CR from the editor's own CRLF: {bytes:?}"
+    );
+    assert!(
+        bytes.ends_with(b"REM added\r\n"),
+        "the appended line should be there with CRLF: {:?}",
+        String::from_utf8_lossy(&bytes)
+    );
+    assert!(
+        std::str::from_utf8(&bytes).is_err(),
+        "the file must still be CP437, not re-encoded as UTF-8"
+    );
+}
