@@ -45,6 +45,52 @@ pub fn looks_like_device_path(path: &Path) -> bool {
     false
 }
 
+/// The whole-disk path behind a partition/slice node, or `None` if `path` is
+/// already a whole disk.
+///
+/// `/dev/disk6s3` -> `/dev/disk6`, `/dev/sda2` -> `/dev/sda`,
+/// `/dev/nvme0n1p2` -> `/dev/nvme0n1`, `/dev/mmcblk0p1` -> `/dev/mmcblk0`.
+/// Windows physical drives have no slice nodes, so they never match.
+pub fn parent_device_path(path: &Path) -> Option<std::path::PathBuf> {
+    let s = path.to_string_lossy();
+    let rest = s.strip_prefix("/dev/")?;
+
+    // macOS: diskNsM / rdiskNsM. The trailing sM is the slice.
+    let base = rest.strip_prefix('r').unwrap_or(rest);
+    if base.starts_with("disk") {
+        if let Some((disk, slice)) = rest.rsplit_once('s') {
+            // Guard against "disk6" itself, whose only 's' is in "disk".
+            if !slice.is_empty()
+                && slice.chars().all(|c| c.is_ascii_digit())
+                && disk.trim_start_matches('r').len() > "disk".len()
+            {
+                return Some(std::path::PathBuf::from(format!("/dev/{disk}")));
+            }
+        }
+        return None;
+    }
+
+    // Linux nvme/mmcblk/loop: the partition suffix is "p<N>".
+    if rest.starts_with("nvme") || rest.starts_with("mmcblk") || rest.starts_with("loop") {
+        if let Some((base, part)) = rest.rsplit_once('p') {
+            if !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()) {
+                return Some(std::path::PathBuf::from(format!("/dev/{base}")));
+            }
+        }
+        return None;
+    }
+
+    // Linux sd/hd/vd: trailing digits are the partition number.
+    if rest.starts_with("sd") || rest.starts_with("hd") || rest.starts_with("vd") {
+        let stem = rest.trim_end_matches(|c: char| c.is_ascii_digit());
+        if stem.len() < rest.len() {
+            return Some(std::path::PathBuf::from(format!("/dev/{stem}")));
+        }
+    }
+
+    None
+}
+
 /// Result of `preflight`. Always Ok if the target is safe to write to;
 /// errors carry a human-readable explanation for the user.
 pub struct PreflightOk {
@@ -79,6 +125,19 @@ pub fn preflight(device_path: &Path, allow_system_disk: bool) -> Result<Prefligh
             "{} does not look like a device path. Expected /dev/* (Linux/macOS) \
              or \\\\.\\PhysicalDriveN (Windows).",
             device_path.display()
+        );
+    }
+
+    // A slice path would slip past every check below: enumerate_devices lists
+    // whole disks only, so the lookup misses and the system-disk and mounted
+    // refusals are skipped entirely. Writes address a partition as an offset
+    // into its parent anyway, so name the parent and refuse.
+    if let Some(parent) = parent_device_path(device_path) {
+        bail!(
+            "{} is a partition, not a whole disk. Pass the parent disk and \
+             select the partition explicitly, e.g. `--partition N` with {}.",
+            device_path.display(),
+            parent.display(),
         );
     }
 
@@ -207,5 +266,59 @@ mod tests {
         assert!(is_mount_point(&PathBuf::from("/mnt/data")));
         assert!(is_mount_point(&PathBuf::from("/media/usb")));
         assert!(!is_mount_point(&PathBuf::from("/tmp/foo.img")));
+    }
+
+    #[test]
+    fn slice_paths_resolve_to_their_parent_disk() {
+        let cases = [
+            ("/dev/disk6s3", "/dev/disk6"),
+            ("/dev/rdisk6s3", "/dev/rdisk6"),
+            ("/dev/disk12s10", "/dev/disk12"),
+            ("/dev/sda2", "/dev/sda"),
+            ("/dev/sdb15", "/dev/sdb"),
+            ("/dev/hda1", "/dev/hda"),
+            ("/dev/vdb3", "/dev/vdb"),
+            ("/dev/nvme0n1p2", "/dev/nvme0n1"),
+            ("/dev/mmcblk0p1", "/dev/mmcblk0"),
+        ];
+        for (slice, parent) in cases {
+            assert_eq!(
+                parent_device_path(&PathBuf::from(slice)),
+                Some(PathBuf::from(parent)),
+                "{slice}",
+            );
+        }
+    }
+
+    #[test]
+    fn whole_disks_have_no_parent() {
+        for whole in [
+            "/dev/disk6",
+            "/dev/rdisk6",
+            "/dev/sda",
+            "/dev/nvme0n1",
+            "/dev/mmcblk0",
+            r"\\.\PhysicalDrive0",
+            "/tmp/image.img",
+        ] {
+            assert_eq!(
+                parent_device_path(&PathBuf::from(whole)),
+                None,
+                "{whole} must not be treated as a partition",
+            );
+        }
+    }
+
+    #[test]
+    fn preflight_refuses_a_partition_path() {
+        // The hole this closes: enumerate_devices lists whole disks only, so a
+        // slice used to miss the lookup and skip the system-disk and mounted
+        // refusals entirely.
+        let Err(err) = preflight(&PathBuf::from("/dev/disk0s2"), false) else {
+            panic!("a slice must be refused");
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("is a partition"), "unexpected: {msg}");
+        assert!(msg.contains("/dev/disk0"), "should name the parent: {msg}");
     }
 }

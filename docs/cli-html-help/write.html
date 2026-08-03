@@ -19,6 +19,8 @@
 </dl>
 <h2>Options</h2>
 <dl class="args">
+<dt><code>--partition</code></dt>
+<dd>Write into this 1-based partition instead of the whole disk. The partition's own bounds cap the write; the rest of the disk, including the partition table, is left untouched</dd>
 <dt><code>--yes</code></dt>
 <dd>Required confirmation. Skips the prompt but never the safety summary printed on stderr</dd>
 <dt><code>--write-to-system-disk</code></dt>

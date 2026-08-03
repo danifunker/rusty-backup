@@ -7,11 +7,14 @@
 
 use anyhow::{bail, Context, Result};
 use clap::Args;
-use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use crate::cli::device_safety::{preflight, print_safety_summary};
 use crate::cli::logging::log_stderr;
+use crate::model::physical_write_runner::{
+    self, PhysicalWriteRequest, PhysicalWriteSource, WriteExtent,
+};
 use crate::partition::format_size;
 
 #[derive(Debug, Args)]
@@ -25,6 +28,12 @@ pub struct WriteArgs {
     ///   - Windows: `"\\.\PhysicalDriveN"` (quote for PowerShell)
     pub device: PathBuf,
 
+    /// Write into this 1-based partition instead of the whole disk. The
+    /// partition's own bounds cap the write; the rest of the disk, including
+    /// the partition table, is left untouched.
+    #[arg(long)]
+    pub partition: Option<u32>,
+
     /// Required confirmation. Skips the prompt but never the safety
     /// summary printed on stderr.
     #[arg(long)]
@@ -33,6 +42,31 @@ pub struct WriteArgs {
     /// Allow writing to the system boot disk (refused by default).
     #[arg(long = "write-to-system-disk")]
     pub write_to_system_disk: bool,
+}
+
+/// Resolve `--partition N` to the region it occupies on `device`.
+fn partition_extent(device: &std::path::Path, index: u32) -> Result<WriteExtent> {
+    if index == 0 {
+        bail!("partition index is 1-based");
+    }
+    let mut probe = crate::model::source_reader::open_peeled_read_with_entry(device, None, None)
+        .with_context(|| format!("opening {} to read its partition table", device.display()))?;
+    let table = crate::partition::PartitionTable::detect(&mut probe).map_err(|e| {
+        anyhow::anyhow!("detecting the partition table on {}: {e}", device.display())
+    })?;
+    let partitions = table.partitions();
+    let part = partitions
+        .iter()
+        .find(|p| p.index + 1 == index as usize)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} has no partition {} (found {})",
+                device.display(),
+                index,
+                partitions.len(),
+            )
+        })?;
+    Ok(WriteExtent::partition(part.start_lba, part.size_bytes))
 }
 
 pub fn run(args: WriteArgs) -> Result<()> {
@@ -45,10 +79,20 @@ pub fn run(args: WriteArgs) -> Result<()> {
 
     let pre = preflight(&args.device, args.write_to_system_disk)?;
 
-    let src_size = std::fs::metadata(&args.image)
-        .with_context(|| format!("stat {}", args.image.display()))?
-        .len();
+    let device_size = pre.device.as_ref().map(|d| d.size_bytes).unwrap_or(0);
+    let extent = match args.partition {
+        Some(n) => partition_extent(&args.device, n)?,
+        None => WriteExtent::whole_disk(device_size),
+    };
 
+    // The decoded size, which for a compressed container is nothing like the
+    // file's byte count on disk.
+    let src_size = decoded_size(&args.image)?;
+
+    let target_label = match args.partition {
+        Some(n) => format!("{} partition {}", args.device.display(), n),
+        None => args.device.display().to_string(),
+    };
     print_safety_summary(
         "write",
         &args.image.display().to_string(),
@@ -56,39 +100,47 @@ pub fn run(args: WriteArgs) -> Result<()> {
         src_size,
         pre.device.as_ref(),
     );
+    log_stderr(format!(
+        "  target region: {} at byte offset {}",
+        format_size(extent.capacity),
+        extent.offset,
+    ));
 
-    let mut src = std::fs::File::open(&args.image)
-        .with_context(|| format!("opening {}", args.image.display()))?;
-    let dst_file = std::fs::OpenOptions::new()
-        .write(true)
-        .open(&args.device)
-        .with_context(|| format!("opening {} for write", args.device.display()))?;
-    let mut dst = crate::os::SectorAlignedWriter::new(dst_file);
+    let req = PhysicalWriteRequest {
+        source: PhysicalWriteSource::Image(args.image.clone()),
+        target_device_path: args.device.clone(),
+        target_size_bytes: device_size,
+        extent,
+        wrap: None,
+    };
 
-    let mut buf = vec![0u8; 1024 * 1024];
-    let mut total: u64 = 0;
-    let mut last_log: u64 = 0;
-    loop {
-        let n = src.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        dst.write_all(&buf[..n])?;
-        total += n as u64;
-        if total - last_log >= 64 * 1024 * 1024 {
-            log_stderr(format!(
-                "  wrote {} of {}",
-                format_size(total),
-                format_size(src_size)
-            ));
-            last_log = total;
-        }
-    }
-    dst.flush()?;
+    let status = Arc::new(Mutex::new(new_cli_status(src_size)));
+    physical_write_runner::run_worker(&req, Arc::clone(&status))
+        .with_context(|| format!("writing {} to {}", args.image.display(), target_label))?;
+
     log_stderr(format!(
         "done: wrote {} to {}",
-        format_size(total),
-        args.device.display()
+        format_size(src_size),
+        target_label
     ));
     Ok(())
+}
+
+/// Decoded length of `path`, peeling any container/wrapper layer.
+fn decoded_size(path: &std::path::Path) -> Result<u64> {
+    use std::io::Seek;
+    let mut src = crate::model::source_reader::open_peeled_read_with_entry(path, None, None)
+        .with_context(|| format!("opening {}", path.display()))?;
+    Ok(src.seek(std::io::SeekFrom::End(0))?)
+}
+
+fn new_cli_status(total: u64) -> physical_write_runner::PhysicalWriteStatus {
+    physical_write_runner::PhysicalWriteStatus {
+        finished: false,
+        error: None,
+        log_messages: Vec::new(),
+        current_bytes: 0,
+        total_bytes: total,
+        cancel_requested: false,
+    }
 }

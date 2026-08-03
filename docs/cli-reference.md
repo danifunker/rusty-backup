@@ -1947,6 +1947,7 @@ Usage: write [OPTIONS] <IMAGE> <DEVICE>
 
 **Options**
 
+- `--partition` — Write into this 1-based partition instead of the whole disk. The partition's own bounds cap the write; the rest of the disk, including the partition table, is left untouched
 - `--yes` — Required confirmation. Skips the prompt but never the safety summary printed on stderr
 - `--write-to-system-disk` — Allow writing to the system boot disk (refused by default)
 
