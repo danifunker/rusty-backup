@@ -8,7 +8,7 @@
 //! The mechanism is deliberately the dumbest thing that works: **concatenate
 //! the `results.jsonl` files**. That only works because every line carries its
 //! own provenance (`run_id`, `git_sha`, `rb_version`) — see `report.rs`. With
-//! that, merging is `cat` and every rollup is a group-by. No campaign
+//! that, merging is `cat` and every rollup is a group-by. No results
 //! database, no merge protocol, no coordination.
 //!
 //! The build sha matters more than it looks. Consolidating results from two

@@ -1,6 +1,6 @@
 # Runbook — how to run a regression
 
-Accurate as of commit `3eb322a`. Everything below has been executed; nothing
+Accurate as of commit `bb20c16`. Everything below has been executed; nothing
 here is aspirational. Where a thing does not exist yet it says so plainly,
 because a runbook that describes unimplemented features is worse than no
 runbook.
@@ -79,10 +79,10 @@ by platform, and by group worst-first, then lists failing cases. This is the
 because every result line carries its own `run_id`, `git_sha` and
 `rb_version`.
 
-Point it at a different tree to consolidate a campaign:
+Point it at a different tree to consolidate a regression spread across hosts:
 
 ```bash
-cargo run --release -- consolidate //NAS/share/rb-fixtures/runs
+cargo run --release -- consolidate //NAS/share/rb-fixtures/regressions/2026-08
 ```
 
 It groups by sha and **warns rather than averaging** if results span several
@@ -146,36 +146,80 @@ currently hands an artifact to `fsck.ext4`, `chdman` or a MiSTer core.
 
 ### How the split is designed to work
 
-The separation is **by host capability, not by process**. `plan` already
-computes it:
+**Produce runs everywhere; only verification is OS-specific.**
+
+rb-cli is cross-platform, so every host can generate the whole artifact set.
+That matters because **the producer is the thing under test** — rb-cli on
+macOS and rb-cli on Windows are different builds taking different code paths,
+so you want all three artifacts, not one. An earlier design produced on a
+single host and shipped the result to whoever held the oracle; that tested
+one build and called it coverage.
+
+Verification is the only OS-specific half. It walks the artifact tree as a
+**queue**, checks whatever it has an oracle for, and records a reason for
+everything it skips. It does not care which OS produced what.
 
 ```
-STAGE 1  produce    rb-cli writes an artifact          (a host that can build)
-STAGE 2  transfer   the artifact crosses machines      (only when needed)
-STAGE 3  verify     an oracle judges it                (the host holding it)
+regressions/<id>/
+  artifacts/<producer-os>/<format-id>/
+      image.<ext>
+      meta.json    # format, producer os + sha, source fixture, argv, sha256
+  verifications/<verifier-os>/
+      <format-id>.<producer-os>.json
+  parity/
+      produce.json     # cross-OS byte compare
+      read.json        # same fixture read on N hosts
 ```
 
-One agent binary claims whatever job kinds its host can do. Windows produces
-and runs `chdman`/`ghostexp`; the Linux box mostly verifies what Windows
-produced; the MiSTer HPS is plumbing plus `fsck.*`, while the *core* is the
-authoritative oracle for Amiga, X68000 and Atari formats.
+Two independent commands, neither needing to know about the other:
 
-Run `rb-regress plan` to see the current shape — 61 verify jobs across six
-hosts, 41 of which need an artifact to cross a machine boundary.
+```bash
+rb-regress produce --out regressions/2026-08/artifacts/$OS
+rb-regress verify  --artifacts regressions/2026-08/artifacts                    --out regressions/2026-08/verifications/$OS
+```
+
+So the Mac verifies Windows-produced HFS, the MiSTer core verifies
+Linux-produced AFFS, and nothing coordinates. Verification does **not** belong
+in the case schema — it is a separate pass over artifacts driven by
+`oracles.toml` plus local capability.
+
+### Two checks that need no oracle at all
+
+Producing on every OS gives two cross-checks for free, and they catch the
+class of bug a cross-platform regression exists to find:
+
+- **Producer parity** — same format, same arguments, three OSes. The bytes
+  should match, or it is a finding. The OSes check each other.
+- **Read parity** — same pre-validated fixture, `inspect --format json` on
+  three OSes. Outputs must match.
+
+Producer parity needs one wrinkle handled. Measured 2026-08-02:
+
+| Builder | Same command twice |
+|---------|--------------------|
+| FAT, NTFS, ProDOS | byte-identical |
+| HFS, ext, HFS+ | 6-13 bytes differ (embedded creation timestamps) |
+
+So parity cannot be a naked sha compare. The fix is self-calibrating: produce
+each artifact **twice on the same machine**, diff to discover the volatile
+byte ranges empirically, then compare across machines with those offsets
+masked. No per-format table to maintain, and any difference outside the
+volatile set is a genuine cross-OS divergence.
 
 ### What is missing to make that real
 
-1. An oracle step in the case schema (`[[case.oracle]]` with tool, role,
-   args, expected exit).
-2. Local oracle execution — enough for `chdman`, `qemu-img`, `7z` on the
-   machine that produced the artifact.
-3. Remote execution and artifact transfer (ssh / wsl), which is what turns
-   `plan`'s stage 2 and 3 into something that runs.
-4. Case manifests for tiers 3-6.
+1. `produce` — walk the registry, build every artifact rb-cli can, write
+   `meta.json` beside each.
+2. Volatile-range discovery (produce twice, diff) and the parity comparison.
+3. `verify` — walk the artifact queue, run the oracles this host has, record
+   verdicts and skip reasons.
+4. Read-parity comparison across hosts.
 
-(1) and (2) together would cover a large share of the container matrix on a
-single machine, because `chdman` and `qemu-img` are already present and
-proven. (3) is the bigger piece.
+(1) and (2) are useful on a single machine immediately — they catch
+determinism regressions — and become the cross-OS check the moment a second
+host runs them. (3) needs no remote execution to start: a host can verify
+artifacts it produced itself, and artifact trees can be synced by any means,
+including the NAS.
 
 ---
 

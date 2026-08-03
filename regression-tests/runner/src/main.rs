@@ -52,7 +52,7 @@ enum Command {
     Query(String),
     /// Map requirements onto the machines that exist.
     Plan,
-    /// Merge results from many hosts/runs and report how far a campaign got.
+    /// Merge results from many hosts/runs and report how far a regression got.
     Consolidate(String),
     Help,
 }
@@ -226,7 +226,7 @@ COMMANDS:
     list         List the cases that would run, without running them
     validate     Parse every manifest and report problems; runs nothing
     plan         Map requirements onto the machines that exist
-    consolidate  Merge results from many hosts/runs; reports how far a campaign got
+    consolidate  Merge results from many hosts/runs; reports how far a regression got
     export       Write the normalised JSON snapshot of the registry
     query        Ask the registry a named question
 

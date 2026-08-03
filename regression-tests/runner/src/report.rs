@@ -62,7 +62,7 @@ pub struct CaseResult {
     // --- provenance, stamped by Bundle::record ------------------------------
     //
     // Every line carries its own identity so that concatenating results from
-    // six hosts is lossless: `cat campaigns/*/results/*.jsonl` yields a file
+    // six hosts is lossless: `cat regressions/*/results/*.jsonl` yields a file
     // where every verdict still knows which build and which run produced it.
     // Without these, a merged file is a pile of verdicts with no way to
     // separate this month's from last month's, or Windows' from the Mac's.
