@@ -58,10 +58,33 @@ pub struct CaseResult {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub failed_assertions: Vec<FailedAssertion>,
     pub platform: String,
+
+    // --- provenance, stamped by Bundle::record ------------------------------
+    //
+    // Every line carries its own identity so that concatenating results from
+    // six hosts is lossless: `cat campaigns/*/results/*.jsonl` yields a file
+    // where every verdict still knows which build and which run produced it.
+    // Without these, a merged file is a pile of verdicts with no way to
+    // separate this month's from last month's, or Windows' from the Mac's.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub run_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub git_sha: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub rb_version: String,
+}
+
+/// Identity of the thing under test, stamped onto every result line.
+#[derive(Debug, Clone, Default)]
+pub struct RunIdentity {
+    pub run_id: String,
+    pub git_sha: String,
+    pub rb_version: String,
 }
 
 pub struct Bundle {
     pub dir: PathBuf,
+    pub identity: RunIdentity,
     results: File,
     pub missing_fixtures: BTreeMap<String, Vec<String>>,
     pub tool_skips: BTreeMap<String, Vec<String>>,
@@ -69,7 +92,13 @@ pub struct Bundle {
 }
 
 impl Bundle {
-    pub fn create(report_root: &Path, host: &str, platform: &str, stamp: &str) -> std::io::Result<Bundle> {
+    pub fn create(
+        report_root: &Path,
+        host: &str,
+        platform: &str,
+        stamp: &str,
+        identity: RunIdentity,
+    ) -> std::io::Result<Bundle> {
         let dir = report_root.join(format!("{}-{}-{}", stamp, host, platform));
         fs::create_dir_all(dir.join("failures"))?;
         fs::create_dir_all(dir.join("checklists"))?;
@@ -81,6 +110,7 @@ impl Bundle {
 
         Ok(Bundle {
             dir,
+            identity,
             results,
             missing_fixtures: BTreeMap::new(),
             tool_skips: BTreeMap::new(),
@@ -89,6 +119,15 @@ impl Bundle {
     }
 
     pub fn record(&mut self, r: &CaseResult) -> std::io::Result<()> {
+        // Stamp provenance here rather than at every construction site, so a
+        // new result type cannot forget it.
+        let mut r = CaseResult {
+            run_id: self.identity.run_id.clone(),
+            git_sha: self.identity.git_sha.clone(),
+            rb_version: self.identity.rb_version.clone(),
+            ..clone_result(r)
+        };
+        let r = &mut r;
         let line = serde_json::to_string(r)
             .unwrap_or_else(|e| format!("{{\"case_id\":\"{}\",\"serialize_error\":\"{}\"}}", r.case_id, e));
         writeln!(self.results, "{}", line)?;
@@ -307,4 +346,34 @@ fn sanitise(id: &str) -> String {
             }
         })
         .collect()
+}
+
+/// `CaseResult` holds a `Vec<FailedAssertion>`, which is not `Clone`, so the
+/// stamping step rebuilds it field by field rather than deriving `Clone` on a
+/// type that is otherwise move-only.
+fn clone_result(r: &CaseResult) -> CaseResult {
+    CaseResult {
+        case_id: r.case_id.clone(),
+        group: r.group.clone(),
+        tier: r.tier,
+        verdict: r.verdict,
+        fixture_id: r.fixture_id.clone(),
+        skip_reason: r.skip_reason.clone(),
+        duration_ms: r.duration_ms,
+        failed_step: r.failed_step,
+        failed_assertions: r
+            .failed_assertions
+            .iter()
+            .map(|a| FailedAssertion {
+                op: a.op.clone(),
+                selector: a.selector.clone(),
+                expected: a.expected.clone(),
+                observed: a.observed.clone(),
+            })
+            .collect(),
+        platform: r.platform.clone(),
+        run_id: r.run_id.clone(),
+        git_sha: r.git_sha.clone(),
+        rb_version: r.rb_version.clone(),
+    }
 }

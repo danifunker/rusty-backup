@@ -8,15 +8,17 @@
 //! seven verdicts in [`report::Verdict`].
 
 mod assertion;
+mod consolidate;
 mod envelope;
 mod exec;
 mod fixtures;
+mod gitinfo;
 mod manifest;
 mod plan;
 mod registry;
 mod report;
 
-use report::{Bundle, CaseResult, Verdict};
+use report::{Bundle, CaseResult, RunIdentity, Verdict};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -34,6 +36,8 @@ struct Args {
     filter: Option<String>,
     allow_hardware: bool,
     keep_scratch: bool,
+    require_clean: bool,
+    check: bool,
     scratch_root: PathBuf,
     db: Option<PathBuf>,
 }
@@ -48,6 +52,8 @@ enum Command {
     Query(String),
     /// Map requirements onto the machines that exist.
     Plan,
+    /// Merge results from many hosts/runs and report how far a campaign got.
+    Consolidate(String),
     Help,
 }
 
@@ -56,6 +62,29 @@ enum Command {
 /// nothing extra on any machine — they arrive with the clone.
 fn repo_root() -> Option<PathBuf> {
     regression_dir().parent().map(|p| p.to_path_buf())
+}
+
+/// A bare `consolidate` with no path should not swallow the next flag.
+fn root_is_flag(s: &str) -> bool {
+    s.is_empty() || s.starts_with('-')
+}
+
+fn cmd_consolidate(args: &Args, root: &str) -> i32 {
+    let root = if root_is_flag(root) {
+        args.report_root.clone()
+    } else {
+        PathBuf::from(root)
+    };
+    match consolidate::consolidate(&root) {
+        Ok(c) => {
+            print!("{}", consolidate::render(&c, &root));
+            0
+        }
+        Err(e) => {
+            eprintln!("error: {}", e);
+            2
+        }
+    }
 }
 
 fn regression_dir() -> PathBuf {
@@ -80,6 +109,8 @@ fn parse_args() -> Result<Args, String> {
         filter: None,
         allow_hardware: false,
         keep_scratch: false,
+        require_clean: false,
+        check: false,
         scratch_root: base.join("scratch"),
         db: None,
     };
@@ -92,6 +123,13 @@ fn parse_args() -> Result<Args, String> {
             "list" => args.command = Command::List,
             "validate" => args.command = Command::Validate,
             "plan" => args.command = Command::Plan,
+            "consolidate" => {
+                let root = raw.get(i + 1).cloned().unwrap_or_default();
+                if !root_is_flag(&root) {
+                    i += 1;
+                }
+                args.command = Command::Consolidate(root);
+            }
             "export" => args.command = Command::Export,
             "query" => {
                 let q = raw.get(i + 1).cloned().unwrap_or_default();
@@ -101,6 +139,8 @@ fn parse_args() -> Result<Args, String> {
             "-h" | "--help" | "help" => args.command = Command::Help,
             "--allow-hardware" => args.allow_hardware = true,
             "--keep-scratch" => args.keep_scratch = true,
+            "--require-clean" => args.require_clean = true,
+            "--check" => args.check = true,
             _ => {
                 let value = || -> Result<String, String> {
                     raw.get(i + 1)
@@ -182,9 +222,13 @@ USAGE:
     rb-regress <run|list|validate> [OPTIONS]
 
 COMMANDS:
-    run         Execute the matrix and write a report bundle
-    list        List the cases that would run, without running them
-    validate    Parse every manifest and report problems; runs nothing
+    run          Execute the matrix and write a report bundle
+    list         List the cases that would run, without running them
+    validate     Parse every manifest and report problems; runs nothing
+    plan         Map requirements onto the machines that exist
+    consolidate  Merge results from many hosts/runs; reports how far a campaign got
+    export       Write the normalised JSON snapshot of the registry
+    query        Ask the registry a named question
 
 OPTIONS:
     --cases <DIR>          Case manifests           [default: regression-tests/cases]
@@ -196,6 +240,9 @@ OPTIONS:
     --filter <SUBSTR>      Only cases whose ID contains SUBSTR
     --allow-hardware       Permit cases that write to physical devices
     --keep-scratch         Keep scratch dirs for passing cases too
+    --require-clean        Refuse to run on a dirty tree, so results can be
+                           attributed to a commit
+    --check                (export) verify the snapshot is current; write nothing
 
 Fixture IDs that cannot be resolved are reported as skip-fixture and written
 to the run's shopping list. They are never failures. See FIXTURES.md."#
@@ -223,11 +270,12 @@ fn main() {
         Command::Export => cmd_export(&args),
         Command::Query(ref q) => cmd_query(q),
         Command::Plan => cmd_plan(&args),
+        Command::Consolidate(ref root) => cmd_consolidate(&args, root),
     };
     std::process::exit(code);
 }
 
-fn cmd_plan(args: &Args) -> i32 {
+fn cmd_plan(_args: &Args) -> i32 {
     match plan::build_plan(&regression_dir()) {
         Ok(p) => {
             print!("{}", plan::render(&p));
@@ -262,6 +310,23 @@ fn cmd_export(args: &Args) -> i32 {
         }
     };
     let path = export_path(args);
+
+    // --check verifies the committed snapshot is current WITHOUT writing.
+    // The export is generated but tracked, so a stale copy would otherwise
+    // dirty the tree and block a --require-clean run. This is the usual
+    // codegen treatment: regenerate, compare, report.
+    if args.check {
+        let current = fs::read_to_string(&path).unwrap_or_default();
+        let want = json + "
+";
+        if current == want {
+            println!("{} is up to date", path.display());
+            return 0;
+        }
+        eprintln!("error: {} is stale — run `rb-regress export`", path.display());
+        return 1;
+    }
+
     if let Some(p) = path.parent() {
         let _ = fs::create_dir_all(p);
     }
@@ -444,6 +509,33 @@ fn cmd_run(args: &Args) -> i32 {
         eprintln!("warning: {}", w);
     }
 
+    // Build provenance. rb-cli does not self-report its commit, so the sha
+    // comes from the working tree — sound only if the tree is clean and the
+    // binary was built from it. See gitinfo.rs.
+    let repo = repo_root().unwrap_or_else(|| PathBuf::from("."));
+    let git_sha = gitinfo::head_sha(&repo).unwrap_or_default();
+    let dirty = gitinfo::dirty_files(&repo).unwrap_or_default();
+
+    if args.require_clean && !dirty.is_empty() {
+        eprintln!("error: working tree is dirty; refusing to run with --require-clean");
+        eprintln!("  a dirty tree means no commit describes what is being tested,");
+        eprintln!("  so results could not be attributed to a build.");
+        for f in dirty.iter().take(10) {
+            eprintln!("    {}", f);
+        }
+        if dirty.len() > 10 {
+            eprintln!("    ... and {} more", dirty.len() - 10);
+        }
+        eprintln!("  commit, stash, or add transient paths to .gitignore.");
+        return 2;
+    }
+    if !dirty.is_empty() {
+        eprintln!(
+            "warning: working tree is dirty ({} path(s)); results will be tagged .dirty",
+            dirty.len()
+        );
+    }
+
     let rb_version = probe_version(&args.rb_cli);
     if rb_version.is_none() {
         eprintln!(
@@ -453,7 +545,14 @@ fn cmd_run(args: &Args) -> i32 {
         return 2;
     }
 
-    let mut bundle = match Bundle::create(&args.report_root, &host, platform, &stamp) {
+    let build_label = gitinfo::build_label(&repo, rb_version.as_deref().unwrap_or("unknown"));
+    let identity = RunIdentity {
+        run_id: format!("{}-{}-{}", stamp, host, platform),
+        git_sha: git_sha.clone(),
+        rb_version: build_label.clone(),
+    };
+
+    let mut bundle = match Bundle::create(&args.report_root, &host, platform, &stamp, identity) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("error: could not create report bundle: {}", e);
@@ -469,6 +568,10 @@ fn cmd_run(args: &Args) -> i32 {
         "stamp": stamp,
         "rb_cli": args.rb_cli.display().to_string(),
         "rb_cli_version": rb_version,
+        "build_label": build_label,
+        "git_sha": git_sha,
+        "git_branch": gitinfo::branch(&repo),
+        "git_clean": dirty.is_empty(),
         "fixture_root": catalog.root().map(|p| p.display().to_string()),
         "fixtures_catalogued": catalog.len(),
         "allow_hardware": args.allow_hardware,
@@ -480,6 +583,9 @@ fn cmd_run(args: &Args) -> i32 {
     // recorded like any other result rather than aborting the run.
     for e in &load_errors {
         let r = CaseResult {
+            run_id: String::new(),
+            git_sha: String::new(),
+            rb_version: String::new(),
             case_id: format!("harness.manifest.{}", sanitise_id(&e.path.to_string_lossy())),
             group: "harness.manifest".to_string(),
             tier: 0,
@@ -536,6 +642,9 @@ fn run_case(
 ) -> CaseResult {
     let started = Instant::now();
     let mut result = CaseResult {
+        run_id: String::new(),
+        git_sha: String::new(),
+        rb_version: String::new(),
         case_id: case.id.clone(),
         group: group.to_string(),
         tier,
