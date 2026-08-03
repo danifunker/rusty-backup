@@ -43,7 +43,7 @@ availability = [
   { platform = "windows", status = "verified", path_hint = "C:/Tools/chdman (0.288)", verified_on = "2026-08-02" },
   { platform = "linux",   status = "install" },
   { platform = "macos",   status = "install" },
-  { platform = "mister",  status = "absent" },
+  { platform = "mister-hps", status = "absent" },
 ]
 verifies = [
   { format = "fmt.chd", direction = "write", strength = "structural", status = "proven", evidence = "chdman verify -> Raw SHA1 + Overall SHA1 successful, chdman 0.174 through 0.288" },
@@ -55,7 +55,7 @@ tool = "fsck.ext4"
 kind = "package"
 availability = [
   { platform = "wsl",    status = "verified", path_hint = "/usr/sbin/fsck.ext4", verified_on = "2026-08-02" },
-  { platform = "mister", status = "verified", path_hint = "/usr/sbin/fsck.ext4", verified_on = "2026-08-02" },
+  { platform = "mister-hps", status = "verified", path_hint = "/usr/sbin/fsck.ext4", verified_on = "2026-08-02" },
   { platform = "linux",  status = "expected" },
   { platform = "macos",  status = "install", path_hint = "brew install e2fsprogs" },
   { platform = "windows", status = "absent" },
@@ -72,7 +72,7 @@ tool = "fsck.vfat"
 kind = "package"
 availability = [
   { platform = "wsl",    status = "verified", verified_on = "2026-08-02" },
-  { platform = "mister", status = "verified", verified_on = "2026-08-02" },
+  { platform = "mister-hps", status = "verified", verified_on = "2026-08-02" },
   { platform = "linux",  status = "expected" },
   { platform = "windows", status = "absent" },
 ]
@@ -187,11 +187,14 @@ verifies = [
 id = "mount-affs"
 tool = "mount -t affs"
 kind = "mount"
-notes = "MiSTer's 5.15 kernel has affs built in; WSL does not."
+notes = """Linux kernel AFFS driver. Available on the MiSTer's HPS because that
+is ARM Linux with affs built in — but this is a LINUX opinion, not an Amiga
+one, and is worth exactly what the same mount on any Linux box is worth. The
+Amiga's own filesystem code lives in the core; see mister-core-amiga."""
 availability = [
-  { platform = "mister", status = "verified", path_hint = "/proc/filesystems", verified_on = "2026-08-02" },
-  { platform = "linux",  status = "install", path_hint = "linux-modules-extra" },
-  { platform = "wsl",    status = "absent" },
+  { platform = "mister-hps", status = "verified", path_hint = "/proc/filesystems", verified_on = "2026-08-02" },
+  { platform = "linux",      status = "install", path_hint = "linux-modules-extra" },
+  { platform = "wsl",        status = "absent" },
 ]
 verifies = [{ format = "fs.affs", direction = "write", strength = "structural", status = "untested" }]
 
@@ -264,14 +267,48 @@ availability = [
 ]
 verifies = [{ format = "fs.hpfs", direction = "write", strength = "authoritative", status = "plausible" }]
 
+# --- MiSTer CORE side --------------------------------------------------------
+#
+# The distinction that matters: the HPS is ARM Linux and its opinions are
+# Linux opinions. The CORE is the vintage machine itself, running the real
+# guest OS with its own filesystem code — Workbench's AFFS handler, Human68k's
+# own driver. That is the authoritative reference, and it is the only thing
+# about a MiSTer that a generic Linux box cannot also do.
+#
+# The HPS still matters, but as plumbing: it is how images get onto the SD
+# card and how a guest-written result file gets read back off it.
+
 [[oracle]]
-id = "mister-core"
-tool = "MiSTer FPGA core"
+id = "mister-core-amiga"
+tool = "MiSTer Minimig core"
 kind = "hardware"
-notes = "For vintage formats the core IS the reference implementation."
-availability = [{ platform = "mister", status = "verified", verified_on = "2026-08-02" }]
+notes = """Real AmigaOS reading the volume with its own filesystem handlers.
+Unlike the HPS affs mount, this is the Amiga's opinion. Bootable Workbench
+1.3 / 2.1 RDB+PFS disks are already on the board."""
+availability = [{ platform = "mister-core", status = "expected" }]
+verifies = [
+  { format = "fs.affs", direction = "write", strength = "authoritative", status = "plausible" },
+  { format = "fs.pfs3", direction = "write", strength = "authoritative", status = "plausible" },
+  { format = "fs.sfs",  direction = "write", strength = "authoritative", status = "plausible", evidence = "needs the SFS handler installed in the guest" },
+  { format = "part.rdb", direction = "write", strength = "authoritative", status = "plausible" },
+]
+
+[[oracle]]
+id = "mister-core-x68000"
+tool = "MiSTer X68000 core"
+kind = "hardware"
+availability = [{ platform = "mister-core", status = "expected" }]
 verifies = [
   { format = "fs.human68k", direction = "write", strength = "authoritative", status = "plausible" },
   { format = "fmt.d88",     direction = "write", strength = "authoritative", status = "plausible" },
   { format = "part.x68k",   direction = "write", strength = "authoritative", status = "plausible" },
+]
+
+[[oracle]]
+id = "mister-core-atarist"
+tool = "MiSTer AtariST core"
+kind = "hardware"
+availability = [{ platform = "mister-core", status = "expected" }]
+verifies = [
+  { format = "part.ahdi", direction = "write", strength = "authoritative", status = "plausible" },
 ]

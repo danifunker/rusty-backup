@@ -46,14 +46,20 @@ Verified on this hardware 2026-08-02 unless marked *expected*.
 | Host | Mountable |
 |------|-----------|
 | WSL Ubuntu 24.04 | ext2/3/4, squashfs, vfat, udf, xfs; modules for btrfs, exfat, isofs, cramfs, erofs, f2fs |
-| **MiSTer** (5.15 armv7) | ext2/3/4, vfat, exfat, iso9660, **affs**, udf |
+| **MiSTer HPS** (5.15 armv7 Linux) | ext2/3/4, vfat, exfat, iso9660, affs, udf — *Linux-grade, not vintage-authoritative* |
 | Full Linux + `linux-modules-extra` | all of the above plus hfs, hfsplus, minix, jfs, ntfs3, ufs (ro), efs (ro), reiserfs |
 | macOS | hfs, hfs+, apfs, fat, exfat |
 
 Two things fall out of that table immediately:
 
-- **MiSTer mounts AFFS.** WSL does not. That makes the board the cheapest
-  Amiga oracle we have, and it is already on the network.
+- **The MiSTer HPS mounts AFFS, but that is a Linux opinion, not an Amiga
+  one.** The HPS is ARM Linux; its `mount -t affs` result is worth exactly
+  what the same mount on any Linux box is worth. The Amiga's own filesystem
+  code lives in the **core**, and that is the only thing a MiSTer offers
+  that a Linux box cannot. Treat HPS as plumbing — how images reach the SD
+  card and how a guest-written result file is read back — and the core as
+  the oracle. See the two `mister-hps` / `mister-core` platforms in
+  `data/oracles.toml`.
 - **WSL is materially weaker than a real Linux box** — no hfs, hfsplus,
   affs, minix, jfs, ntfs3. A full Linux host with `linux-modules-extra` is
   the single highest-value machine in the matrix.
@@ -192,7 +198,7 @@ multi-machine:
 | **macOS** | HFS, HFS+, APFS, DMG, sparseimage, NDIF, APM |
 | **Windows** | GHO/GHS (`ghostexp`), NTFS via `chkdsk` |
 | **Full Linux** | hfs/hfsplus/affs/minix/jfs/ntfs3/ufs/efs mounts, xfs, squashfs |
-| **MiSTer** | AFFS mount, plus every MiSTer core at tier 7 |
+| **MiSTer core** | AFFS, PFS3, SFS, Human68k, D88, X68K and AHDI — judged by the real guest OS, not by Linux |
 | any | qemu-img containers, chdman, 7z, cpmtools |
 
 The runner already models this: a case declares `requires = [...]`, an

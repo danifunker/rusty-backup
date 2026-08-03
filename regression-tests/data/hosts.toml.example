@@ -47,13 +47,35 @@ can_produce = true
 can_verify = true
 notes = "Not optional: fsck_hfs, fsck_apfs and hdiutil exist nowhere else."
 
+# A MiSTer is TWO verification surfaces and they are worth very different
+# things. Declaring one host would conflate them.
+#
+#   HPS  — the ARM Linux side (Hard Processor System). Its fsck and mount
+#          results are LINUX results that happen to run on ARM. Useful, but
+#          no more authoritative than the same check on linuxbox.
+#   CORE — the FPGA core: the vintage machine itself, running the real guest
+#          OS with its own filesystem code. This is the authoritative
+#          reference, and the only thing a MiSTer offers that a Linux box
+#          cannot.
+#
+# The HPS remains essential as plumbing — it is how images reach the SD card
+# and how a guest-written result file is read back — but plumbing is not an
+# oracle.
 [[host]]
-id = "mister"
-platform = "mister"
+id = "mister-hps"
+platform = "mister-hps"
 transport = "ssh"
 can_produce = true
 can_verify = true
-notes = "armv7. Mounts affs, which WSL cannot. rb-cli already deployed at /media/fat/Scripts/rb-cli."
+notes = "ARM Linux side. rb-cli already deployed at /media/fat/Scripts/rb-cli. Also the transport for core-side jobs."
+
+[[host]]
+id = "mister-core"
+platform = "mister-core"
+transport = "ssh"
+can_produce = false
+can_verify = true
+notes = "The FPGA cores. Reached via the HPS. Authoritative for Amiga, X68000 and Atari ST formats."
 
 # Connection details (address, user, identity file) live in local.toml, not
 # here, so this file stays about capability rather than credentials.
