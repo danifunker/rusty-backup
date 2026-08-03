@@ -362,326 +362,15 @@ stage_vendor() {
   cd "$CRATE_DIR"
   cargo vendor --locked vendor >/dev/null
   note "vendored $(ls vendor | wc -l | tr -d ' ') crates."
+  apply_vendor_patches
 }
 
-# ---- mrustc-workaround patches on the vendored sources ----------------------
-# Re-applied before every transpile because `cargo vendor` regenerates the
-# tree. Each patch works around a specific mrustc gap; idempotent (the pattern
-# stops matching once applied). See docs/build-ppc-mrustc.md.
-patch_crc_vendor() {
-  # crc 3.x: mrustc can't infer the const-generic impl params of
-  # `Digest::<uN, Table<L>>::new` from the return type, so spell them out.
-  local d="$VENDOR_DIR/crc/src" w
-  [ -f "$d/crc128.rs" ] || return 0
-  # Only write when the content actually changes. `sed >tmp && mv` unconditionally
-  # rewrites the file, which bumps its mtime on EVERY run - and minicargo is
-  # timestamp-driven, so crc went dirty every build, dragging lzma-rs and then the
-  # engine with it. That silently forced a re-transpile of the 797 MB engine unit
-  # on every single invocation.
-  for w in 8 16 32 64 128; do
-    sed "s/        Digest::new(self, value)/        Digest::<u${w}, Table<L>>::new(self, value)/" \
-      "$d/crc${w}.rs" > "$d/crc${w}.rs.tmp"
-    if cmp -s "$d/crc${w}.rs.tmp" "$d/crc${w}.rs"; then
-      rm -f "$d/crc${w}.rs.tmp"
-    else
-      mv "$d/crc${w}.rs.tmp" "$d/crc${w}.rs"
-    fi
-  done
-  note "applied vendored-source workarounds (crc turbofish)."
-}
-
-patch_chrono_vendor() {
-  # chrono 0.4: `NaiveDateTime::UNIX_EPOCH` is defined as
-  # `DateTime::UNIX_EPOCH.naive_utc()`. Nothing in that expression pins
-  # `DateTime`'s `Tz`; rustc resolves it because only one inherent impl
-  # (`impl DateTime<Utc>`) declares a `UNIX_EPOCH`, but mrustc can't infer an
-  # impl's type parameter from which impl happens to carry the associated const.
-  # Same class of gap as the crc turbofish above, same shape of fix. `Utc` is
-  # already in scope in that module.
-  # Two sites: `NaiveDateTime::UNIX_EPOCH` and `impl Default for NaiveDateTime`.
-  # Skip doc comments and the `#[deprecated(note = ...)]` string, which mention
-  # the path without using it. Idempotent - the rewritten form no longer matches.
-  local f="$VENDOR_DIR/chrono/src/naive/datetime/mod.rs"
-  [ -f "$f" ] || return 0
-  # Only write on an actual change - see patch_crc_vendor for why an unconditional
-  # rewrite is expensive here.
-  sed -e '/^[[:space:]]*\/\/\//!{' -e '/#\[deprecated/!s/DateTime::UNIX_EPOCH/DateTime::<Utc>::UNIX_EPOCH/g' -e '}' \
-    "$f" > "$f.tmp"
-  if cmp -s "$f.tmp" "$f"; then
-    rm -f "$f.tmp"
-  else
-    mv "$f.tmp" "$f"
-  fi
-  note "applied vendored-source workarounds (chrono UNIX_EPOCH turbofish)."
-}
-
-patch_rustversion_vendor() {
-  # rustversion identifies the compiler from the *last* line of `rustc --version`,
-  # which is right for real rustc (one line, possibly preceded by warnings) but
-  # wrong for mrustc, which prints four lines with the `rustc <ver>` one first and
-  # informational lines after it. Pick the last line that actually starts with
-  # `rustc ` instead - identical behaviour on real rustc, and it keeps working if
-  # mrustc's trailing lines change.
-  #
-  # Fixing this in mrustc instead is not obviously safe: the line order is load
-  # bearing in both directions. libc's build.rs parses from the *start* of the
-  # output, and mrustc's own comments note that `autoconfig` looks for the
-  # `release:` line, so neither reordering nor trimming is free.
-  local f="$VENDOR_DIR/rustversion/build/rustc.rs"
-  [ -f "$f" ] || return 0
-  python3 - "$f" <<'PY'
-import sys
-p = sys.argv[1]
-s = open(p).read()
-old = "    let last_line = string.lines().last().unwrap_or(string);"
-new = ("    // rb-cli-ppc: mrustc prints informational lines *after* the `rustc <ver>`\n"
-       "    // line, so take the last line that actually looks like a version banner.\n"
-       "    let last_line = string\n"
-       "        .lines()\n"
-       "        .filter(|l| l.trim_start().starts_with(\"rustc \"))\n"
-       "        .last()\n"
-       "        .or_else(|| string.lines().last())\n"
-       "        .unwrap_or(string);")
-if new.splitlines()[0] in s:
-    sys.exit(0)          # already patched
-if old not in s:
-    sys.stderr.write("rustversion: expected line not found; skipping patch\n")
-    sys.exit(0)
-open(p, "w").write(s.replace(old, new, 1))
-PY
-  note "applied vendored-source workarounds (rustversion --version parsing)."
-}
-
-patch_signal_hook_vendor() {
-  # signal-hook's internal `AddSignal` trait takes an *arbitrary self type*:
-  #
-  #   trait AddSignal: Debug + Send + Sync {
-  #       fn add_signal(self: Arc<Self>, write: Arc<dyn SelfPipeWrite>, ..)
-  #   }
-  #
-  # and the one call site invokes it with method syntax on a trait object,
-  # `Arc::clone(&self.pending).add_signal(..)`. mrustc does not consider an
-  # `Arc<Self>` receiver when resolving a method on `Arc<dyn AddSignal>`:
-  #
-  #   backend.rs:199:88 error:0: No applicable methods for
-  #     {alloc::sync::Arc<dyn signal_hook::iterator::backend::AddSignal, ..>}.add_signal
-  #
-  # Spelling the call as UFCS names the trait outright, so there is no receiver
-  # autoderef to do and mrustc lowers it fine. Same class of fix as the crc and
-  # chrono turbofishes: say what mrustc cannot infer, change nothing else.
-  #
-  # Not avoidable by dropping a feature - crossterm's `events` needs
-  # signal-hook-mio for SIGWINCH, and that genuinely imports
-  # `signal_hook::iterator::backend`, so the module is load bearing.
-  local f="$VENDOR_DIR/signal-hook/src/iterator/backend.rs"
-  [ -f "$f" ] || return 0
-  python3 - "$f" <<'PY'
-import sys
-p = sys.argv[1]
-s = open(p).read()
-old = "Arc::clone(&self.pending).add_signal(Arc::clone(&self.write), signal)"
-new = "AddSignal::add_signal(Arc::clone(&self.pending), Arc::clone(&self.write), signal)"
-if new in s:
-    sys.exit(0)          # already patched
-if old not in s:
-    sys.stderr.write("signal-hook: expected call site not found; skipping patch\n")
-    sys.exit(0)
-open(p, "w").write(s.replace(old, new, 1))
-PY
-  note "applied vendored-source workarounds (signal-hook UFCS add_signal)."
-}
-
-patch_signal_hook_mio_vendor() {
-  # `implement_signals_with_pipe!` binds its `$pipe:path` argument with
-  #
-  #     use $pipe as Pipe;
-  #
-  # and mrustc cannot parse a `use` whose path is an interpolated fragment
-  # followed by `as` - having consumed the path it insists on `::`:
-  #
-  #   signal-hook-mio/src/lib.rs:32:22 error:0:
-  #     Unexpected token TOK_RWORD_AS, expected TOK_DOUBLE_COLON
-  #
-  # `Pipe` is only ever used as a *type* here - `SignalDelivery<Pipe, E>` and
-  # `Pipe::pair()` - so a type alias binds it identically and sidesteps the use
-  # statement entirely. Every invocation passes a plain type path
-  # (`mio::net::UnixStream`, `mio_uds::UnixStream`).
-  #
-  # This is the same `TOK_RWORD_AS` family as the libyml gap that keeps the
-  # `yaml` feature off for this target; fixing the parser would likely clear
-  # both, and is the better long-term answer. See docs/build-ppc-mrustc.md.
-  local f="$VENDOR_DIR/signal-hook-mio/src/lib.rs"
-  [ -f "$f" ] || return 0
-  python3 - "$f" <<'PY'
-import sys
-p = sys.argv[1]
-s = open(p).read()
-old = "        use $pipe as Pipe;"
-new = "        type Pipe = $pipe;"
-if new in s:
-    sys.exit(0)          # already patched
-if old not in s:
-    sys.stderr.write("signal-hook-mio: expected `use $pipe as Pipe;` not found; skipping patch\n")
-    sys.exit(0)
-open(p, "w").write(s.replace(old, new, 1))
-PY
-  note "applied vendored-source workarounds (signal-hook-mio \$pipe type alias)."
-}
-
-patch_instability_vendor() {
-  # `instability` builds its doc strings with `indoc::formatdoc!`, and a proc
-  # macro that *forwards* a token from its input loses that token's hygiene
-  # context crossing mrustc's proc-macro bridge. `formatdoc!` re-emits the
-  # trailing arguments verbatim, so
-  #
-  #     formatdoc! {"... version {}.", version.trim_start_matches('v')}
-  #
-  # expands to a `format!` whose `version` carries an empty hygiene context and
-  # no longer resolves to the `if let Some(ref version)` binding around it:
-  #
-  #   MACRO<::"alloc"::format> error:0: Couldn't find variable name 'version'
-  #
-  # (Confirmed with MRUSTC_DEBUG=Expand: the expansion is correct token-for-token
-  # - `format!{"...{}.", version.trim_start_matches('v')}` - and the forwarded
-  # ident is the only one carrying `/*Rust2021 /**/*/`.)
-  #
-  # `format!` is a builtin, so writing these three call sites as `format!` with
-  # the string already unindented keeps the output byte-identical and takes the
-  # proc macro out of the picture. Fixing the bridge's hygiene is the real
-  # answer and is filed as an open item; it is a much larger change than this.
-  local f
-  f="$VENDOR_DIR/instability/src/stable.rs"
-  [ -f "$f" ] || return 0
-  python3 - "$VENDOR_DIR" <<'PY'
-import sys
-v = sys.argv[1]
-
-edits = [
-    (v + "/instability/src/stable.rs",
-     '            formatdoc! {"\n'
-     '                # Stability\n'
-     '\n'
-     '                This API was stabilized in version {}.",\n'
-     '                version.trim_start_matches(\'v\')\n'
-     '            }\n',
-     '            format!(\n'
-     '                "# Stability\\n\\nThis API was stabilized in version {}.",\n'
-     '                version.trim_start_matches(\'v\')\n'
-     '            )\n'),
-    (v + "/instability/src/stable.rs",
-     '            formatdoc! {"\n'
-     '                # Stability\n'
-     '\n'
-     '                This API is stable."}\n',
-     '            format!("# Stability\\n\\nThis API is stable.")\n'),
-    (v + "/instability/src/unstable.rs",
-     '        let doc = formatdoc! {"\n'
-     '            # Stability\n'
-     '\n'
-     '            **This API is marked as unstable** and is only available when the `{feature_flag}`\n'
-     '            crate feature is enabled. This comes with no stability guarantees, and could be changed\n'
-     '            or removed at any time."};\n',
-     '        let doc = format!(\n'
-     '            "# Stability\\n\\n**This API is marked as unstable** and is only available when the `{feature_flag}`\\n'
-     'crate feature is enabled. This comes with no stability guarantees, and could be changed\\n'
-     'or removed at any time."\n'
-     '        );\n'),
-]
-
-for path, old, new in edits:
-    try:
-        s = open(path).read()
-    except IOError:
-        continue
-    if new in s:
-        continue                      # already patched
-    if old not in s:
-        sys.stderr.write("instability: expected formatdoc block not found in %s; skipping\n" % path)
-        continue
-    open(path, "w").write(s.replace(old, new, 1))
-PY
-  note "applied vendored-source workarounds (instability formatdoc -> format)."
-}
-
-patch_zstd_safe_vendor() {
-  # zstd-safe passes its `OutBufferWrapper` / `InBufferWrapper` to
-  #
-  #     fn ptr_mut<B>(ptr_void: &mut B) -> *mut B
-  #
-  # as `ptr_mut(&mut output)`. `B` is only pinned by *deref-coercing*
-  # `&mut OutBufferWrapper` to `&mut ZSTD_outBuffer` (the wrapper's `DerefMut`
-  # target), driven by what the enclosing zstd_sys call expects. mrustc gets as
-  # far as the autoderef and then aborts inside the coercion, with a bare C++
-  # assertion and no span:
-  #
-  #   autoderef: Deref OutBufferWrapper<..> into ZSTD_outBuffer_s
-  #   check_unsize_tys: From? ZSTD_outBuffer_s
-  #   mrustc: src/hir/type.hpp:236: as_Borrow(): Assertion `m_tag == TAG_Borrow' failed.
-  #
-  # (`add_coerce_borrow` assumes the node it is handed is a borrow; on this path
-  # it is the dereffed struct.) Writing the deref out - `&mut *output` - pins `B`
-  # directly and removes the coercion. Same class of fix as the crc and chrono
-  # turbofishes: say what mrustc cannot infer, change nothing else.
-  local f="$VENDOR_DIR/zstd-safe/src/lib.rs"
-  [ -f "$f" ] || return 0
-  python3 - "$f" <<'PY'
-import sys
-p = sys.argv[1]
-s = open(p).read()
-n = 0
-for name in ("output", "input"):
-    old = "ptr_mut(&mut %s)" % name
-    new = "ptr_mut(&mut *%s)" % name
-    n += s.count(old)
-    s = s.replace(old, new)
-if n:
-    open(p, "w").write(s)
-elif "ptr_mut(&mut *" not in s:
-    sys.stderr.write("zstd-safe: no ptr_mut(&mut ..) call sites found; skipping patch\n")
-PY
-  note "applied vendored-source workarounds (zstd-safe explicit deref at ptr_mut)."
-}
-
-patch_zstd_sys_vendor() {
-  # zstd-sys is the ONLY crate in this graph that asks for `cc`'s `parallel`
-  # feature, and `parallel` is what drags in cc's async build-command runner
-  # (src/parallel/{async_executor,command_runner}.rs). mrustc's `async fn`
-  # support does not produce a `Future` impl for the generated async block:
-  #
-  #   cc/src/parallel/command_runner.rs:175:1 error:0:
-  #     Cannot find an impl of ::"core"::future::future::Future for async[...]
-  #
-  # cc gates the whole module on the feature (`#[cfg(feature = "parallel")]
-  # mod parallel;`) and keeps a `#[cfg(not(feature = "parallel"))]` serial arm in
-  # command_helpers.rs, so dropping the feature deletes every async construct in
-  # the crate - there are none outside src/parallel/ - and leaves cc functionally
-  # identical, only compiling the C files one at a time.
-  #
-  # cc is a BUILD-dependency (of bzip2-sys and zstd-sys) and never reaches the
-  # PowerPC binary, so this costs build-script wall clock and nothing else.
-  # Chosen over pinning cc back to a pre-async 1.0.x, which would mean
-  # re-vendoring the whole graph to work around a crate that is not shipped.
-  local f="$VENDOR_DIR/zstd-sys/Cargo.toml"
-  [ -f "$f" ] || return 0
-  python3 - "$f" <<'PY'
-import sys
-p = sys.argv[1]
-lines = open(p).read().splitlines(True)
-out, section, dropped = [], None, 0
-for ln in lines:
-    s = ln.strip()
-    if s.startswith("[") and s.endswith("]"):
-        section = s
-    if section == "[build-dependencies.cc]" and s == 'features = ["parallel"]':
-        dropped += 1
-        continue
-    out.append(ln)
-if dropped:
-    open(p, "w").writelines(out)
-elif not any(l.strip() == "[build-dependencies.cc]" for l in lines):
-    sys.stderr.write("zstd-sys: no [build-dependencies.cc] section; skipping patch\n")
-PY
-  note "applied vendored-source workarounds (zstd-sys drops cc/parallel)."
+# The mrustc-workaround patch set: one module per crate in rb-cli-ppc/patches/
+# (see its README); the runner owns idempotency, mtime safety and loud failure
+# when a crate version bump breaks a patch. Re-run before every transpile
+# because `cargo vendor` regenerates the tree; a no-op run moves no mtimes.
+apply_vendor_patches() {
+  "$RB_DIR/scripts/apply-vendor-patches.py" --vendor-dir "$VENDOR_DIR"
 }
 
 # ---- stage 5: transpile+compile the engine for the HOST (native proof) ------
@@ -689,14 +378,7 @@ stage_host() {
   banner "5. transpile+build rb-cli for the HOST (native $HOST_ARCH proof)"
   stamp_version
   cd "$MRUSTC_DIR"
-  patch_crc_vendor
-  patch_chrono_vendor
-  patch_rustversion_vendor
-  patch_signal_hook_vendor
-  patch_signal_hook_mio_vendor
-  patch_instability_vendor
-  patch_zstd_safe_vendor
-  patch_zstd_sys_vendor
+  apply_vendor_patches
   mkdir -p "$HOST_OUT"
   MRUSTC_TARGET_VER="$MRUSTC_TARGET_VER" \
     bin/minicargo "$CRATE_DIR" \
@@ -725,14 +407,7 @@ stage_hostc() {
   cd "$MRUSTC_DIR"
   [ -e "$HOST_LIBS/libstd.rlib" ] || die "run 'hostlibs' first (need $HOST_LIBS)"
   [ -d "$VENDOR_DIR" ] || die "run 'vendor' first"
-  patch_crc_vendor
-  patch_chrono_vendor
-  patch_rustversion_vendor
-  patch_signal_hook_vendor
-  patch_signal_hook_mio_vendor
-  patch_instability_vendor
-  patch_zstd_safe_vendor
-  patch_zstd_sys_vendor
+  apply_vendor_patches
   mkdir -p "$HOSTC_OUT"
   MRUSTC_TARGET_VER="$MRUSTC_TARGET_VER" MINICARGO_DEFER_CODEGEN=1 \
     bin/minicargo "$CRATE_DIR" \
@@ -820,14 +495,7 @@ stage_ppc() {
   ensure_host_lib_alias
   [ -e "$PPC_LIBS/libstd.rlib.o" ] || die "PPC libstd missing -- run 'ppclibs' first"
   cd "$MRUSTC_DIR"
-  patch_crc_vendor
-  patch_chrono_vendor
-  patch_rustversion_vendor
-  patch_signal_hook_vendor
-  patch_signal_hook_mio_vendor
-  patch_instability_vendor
-  patch_zstd_safe_vendor
-  patch_zstd_sys_vendor
+  apply_vendor_patches
   mkdir -p "$PPC_OUT"
   MRUSTC_TARGET_VER="$MRUSTC_TARGET_VER" MINICARGO_DEFER_CODEGEN=1 \
     bin/minicargo "$CRATE_DIR" \
