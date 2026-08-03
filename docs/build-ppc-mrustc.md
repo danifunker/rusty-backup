@@ -390,6 +390,7 @@ export PPC_HOST=admin@192.168.99.116        # the PowerPC Mac
 scripts/build-ppc.sh                        # the host path, end to end
 scripts/build-ppc.sh ppclibs                # PowerPC stdlib
 scripts/build-ppc.sh ppc                    # PowerPC rb-cli
+scripts/build-ppc.sh dist                   # package rb-cli-ppc-<cpu>.tar.gz
 scripts/build-ppc.sh probe                  # libc ground truth from the SDKs
 ```
 
@@ -400,16 +401,22 @@ Stages, in order:
 | `mrustc`   | build mrustc + minicargo (verifies the patches) | ok |
 | `overrides`| create the macOS 1.74 override sets | ok |
 | `hostlibs` | transpile+compile host libcore/alloc/std | ok |
-| `vendor`   | `cargo vendor` the 240+ deps | ok |
+| `vendor`   | `cargo vendor` the 225 deps, apply `rb-cli-ppc/patches/` | ok |
 | `hostc`    | emit the engine's C on this machine (deferred codegen) | ok |
-| `host`     | transpile+build a native `rb-cli` | to validate |
+| `host`     | transpile+build a native `rb-cli` | ok |
 | `ppclibs`  | **PowerPC libcore/alloc/std/panic_unwind/test/libc** | **ok** |
-| `ppc`      | PowerPC `rb-cli` | **all 380 crates compile**; final link outstanding |
+| `ppc`      | PowerPC `rb-cli` | ok |
 | `probe`    | capture libc ground truth from the 10.4u / 10.5 SDKs | ok |
+| `dist`     | package a relocatable bundle on the Mac (`scripts/ppc-package.sh`) | ok |
+| `seed`     | clone a completed family's transpile into this family's trees | ok |
+
+`scripts/build-all-ppc.sh` chains the PowerPC stages for every CPU family:
+full build for the first family, `seed` + codegen for the rest (see "Transpile
+once across CPU families").
 
 ### Traps in the build loop
 
-Ten that have each cost real time:
+Each of these cost real time:
 
 - **The shim only reaches the link line if `PPC_SHIM` is set.** `ppc-cc-remote.py`
   reads it from the environment and quietly links without the shim when it is
@@ -428,7 +435,9 @@ Ten that have each cost real time:
   file` bumps the mtime every run even when the content is already patched, and
   minicargo is timestamp-driven - so crc went dirty on *every* build, taking
   lzma-rs and then the **engine** with it, silently re-transpiling a 797 MB
-  translation unit each time. Every `patch_*_vendor` must compare before writing.
+  translation unit each time. `scripts/apply-vendor-patches.py` now owns this
+  structurally: the patches (`rb-cli-ppc/patches/`) are pure transforms, and
+  the runner writes a file only when its content actually changes.
 - **Do not put a timeout on a build.** These run for hours; a `timeout` that
   seemed generous for a link killed the driver mid-engine-compile.
 - **Killing the driver does not stop the Mac.** The ssh dies, the remote gcc
@@ -443,6 +452,22 @@ Ten that have each cost real time:
   `pgrep` is absent on 10.5, so `pgrep -f cc1` fails with "command not found" -
   which, if you test it with `&&`/`||`, reads as "no such process". Three
   successive watchdogs got this wrong before it was noticed. Use `ps ax | grep`.
+
+  `build-ppc.sh` now reaps automatically on exit (`ppc_reap_orphans`): with no
+  tty on the far side there is nothing to deliver SIGHUP to, so each in-flight
+  unit is orphaned and keeps burning a core - on a 2-core G5 a couple of those
+  silently halve the speed of the *next* build, and the symptom ("why is this
+  build twice as slow today") points nowhere near the interrupted run that
+  caused it. The reap anchors on the `gcc10-bootstrap` toolchain prefix rather
+  than the build directory: cc1 is spawned with relative mirrored paths and
+  inherits its cwd, so its argv never mentions ppc-xbuild - and everything this
+  pipeline runs on the Mac comes out of that toolchain while nothing else on
+  the machine does, notably not the root-owned ppc64 Linux CI leg. It kills by
+  explicit pid in a loop (gcc respawns cc1 as it works through its queue, and
+  Leopard's pkill has no pattern that matches these). Caveat: it reaps by
+  toolchain, not by build, so two concurrent build-ppc.sh runs against the same
+  Mac would kill each other's compiles; the pipeline is single-Mac by
+  construction, so that is not a shape worth guarding.
 
 
 - **A layout change invalidates the PowerPC stdlib.** `minicargo`'s own rebuild
@@ -466,6 +491,22 @@ Ten that have each cost real time:
   Build scripts version-gate on that. `libc`'s emits 6 cfgs at 1.29 and 14 at
   1.74 - among the missing eight is `libc_core_cvoid` again. This is the same
   trap as the previous bullet with a different cause and the identical symptom.
+- **minicargo hands build scripts a relative `RUSTC` when invoked as
+  `bin/minicargo`.** It derives the path from its own argv[0], and build
+  scripts run with cwd set to their crate directory, so the spawn fails:
+  libc's build.rs dies with "Failed to get rustc version" and takes the build
+  with it. The driver pins `MRUSTC_PATH` absolute; export it yourself if you
+  bypass the driver.
+- **minicargo can exit 0 without linking anything.** It has returned success
+  while deadlocked ("Nothing runnable or running, but jobs are still waiting"),
+  so a driver that trusts the exit code announces an rb-cli that was never
+  produced. Both build stages check that the binary actually exists; when it is
+  missing, grep the log for `BUG:` and for that deadlock listing.
+- **Never hardlink files into an output tree.** mrustc truncates outputs in
+  place, so the moment anything in the linked tree rebuilds, the write goes
+  through the shared inode and silently corrupts the other tree's copy - which
+  may be a *completed, verified* build. Copy (`cp -p`) instead; `seed` learned
+  this the hard way.
 - **Don't `tail` the build log.** Redirect to a file and grep it. A run reported
   as three failing assertions actually had four; the fourth was below a `tail -30`
   cutoff and cost a session's worth of wrong hypotheses.
@@ -600,8 +641,10 @@ alternative - rebuilding gcc10 on a G5 - is a day of work that buys nothing.
 
 ### What `dist` verifies
 
-`stage_dist` will not package a bundle that cannot run on the declared floor. For
-every Mach-O it ships it counts vector instructions and prints the arch tag:
+`stage_dist` will not package a bundle that cannot run on the declared floor.
+The Mac-side packaging lives in `scripts/ppc-package.sh`, fed over `ssh bash
+-s` and runnable by hand on the Mac when a bundle gets rejected. For every
+Mach-O it ships it counts vector instructions and prints the arch tag:
 
 - **rb-cli with unguarded AltiVec in a `-mno-altivec` build - hard failure.**
 - A dylib with vector code passes only if it imports `__cpu_has_altivec`, i.e.
@@ -616,19 +659,103 @@ The `libMacportsLegacySupport` 10.4 rebuild is cached per CPU
 (`~/.rb-cli-legacy104/libMacportsLegacySupport-<cpu>.dylib`) - one shared cache
 would hand a `ppc7400` dylib to a 750-targeted bundle.
 
-### Rebuild both trees when the CPU changes
+### One output tree per CPU family
 
 Neither minicargo nor the wrapper's split-piece cache tracks compiler *flags* -
-both compare timestamps only. A stale `ppc7400` object survives a flag change
-and drags the whole link back up, so a CPU switch means:
+both compare timestamps only, so a stale `ppc7400` object survives a flag
+change and drags the whole link back up. Shared trees produced exactly that: a
+"G3" build tagged `ppc970` carrying 2752 AltiVec instructions, caught only by
+the packaging guard after a full engine rebuild. Both PowerPC trees are
+therefore stamped with the CPU family, and switching `PPC_CPU` switches trees
+instead of invalidating anything:
 
-```sh
-rm -rf ~/repos/mrustc/output-1.74.0-powerpc-apple-darwin ~/repos/mrustc/output-rb-ppc
+```
+output-1.74.0-powerpc-apple-darwin-g3/    PPC_LIBS  (the PowerPC stdlib)
+output-rb-ppc-g3/                         PPC_OUT   (the engine)
 ```
 
-The shim is the one piece that self-invalidates: its object name carries the CPU
-flags (`ppc-compat.cpu750-no-altivec.o`), because it is on the link line and
-would otherwise silently pin the executable's cpusubtype at 7400.
+Each family's cache stays warm (~2.7 GB per tree) and a mixed binary is
+structurally impossible. Two wrinkles make the stamping work:
+
+- `minicargo.mk` derives its own output directory, and make ignores a
+  makefile's assignment to a command-line variable - so `stage_ppclibs` passes
+  `OUTDIR_SUF` on the make command line to pin libstd into the stamped tree.
+- minicargo derives the *host* lib dir from the target one by dropping the
+  triple, so a stamped tree yields `output-1.74.0-g3`, which nothing builds.
+  Host libs are CPU-independent, so `ensure_host_lib_alias` symlinks that
+  derived name at the real `output-1.74.0`.
+
+The shim self-invalidates independently of all this: its object name carries
+the CPU flags (`ppc-compat.cpu750-no-altivec.o`), because it is on the link
+line and would otherwise silently pin the executable's cpusubtype at 7400.
+
+### Transpile once across CPU families
+
+The emitted C is architecture-independent. Verified by `cmp` on the two
+810 MB engine files from the g3 and g4 trees: byte-identical except the
+16-character `APP_VERSION` timestamp string. Mechanically this must be so -
+all families are the *same* mrustc target (`powerpc-apple-darwin`), and
+`PPC_CPU_FLAGS` is consumed only by `ppc-cc-remote.py` at compile time;
+mrustc never sees it. Yet a naive 3-family build spends ~1h33m transpiling
+that same file three times, on a single core, while the Mac sits idle.
+
+`build-ppc.sh seed <family>` therefore clones a completed family's transpile
+products into the current family's (empty) trees, and the normal `ppclibs` /
+`ppc` stages then see current rlibs with missing objects - so minicargo goes
+straight to codegen + link, compiled on the Mac with *this* family's
+`PPC_CPU_FLAGS`. What seeding does, exactly:
+
+- copies (`cp -p`) everything except the arch-specific state: root-level
+  `.o` objects, the engine's split-compile bookkeeping (`.rlib.split/`,
+  `.o.parts`), and the linked executables. **Copies, never hardlinks**:
+  mrustc truncates its outputs in place, so if anything does re-transpile
+  in the seeded tree, a hardlink writes through the shared inode and
+  corrupts the *donor* tree - the first seeding attempt did exactly that
+  to g3's `libcore.rlib.c`;
+- copies the path-bearing text files (`.d`, `.txt`, `.sh`,
+  `.release-version`) with the tree names rewritten to this family - the
+  `.d` prerequisites name the stamped libs tree, so without the rewrite the
+  new family's staleness checks would point into the donor's tree - and
+  restores each file's mtime with `touch -r`, because minicargo is
+  timestamp-driven and the build ordering must survive the copy;
+- drops a `.seeded-from` sentinel, which makes `ppclibs` / `ppc` export
+  `MINICARGO_IGNTOOLS=1` for that tree. minicargo otherwise rebuilds any
+  output older than `bin/mrustc` itself, and a routine mrustc relink
+  after the donor was built (a `make` inside `minicargo.mk` can do this)
+  would silently defeat the whole seed. Sound because the seed's content
+  came from this same pipeline; if mrustc genuinely changes, the *donor*
+  family's own unseeded build catches it and the re-seed propagates it;
+- retimes every `host/build_<crate>.txt` to its own crate's newest lib
+  artifact. A cold build runs a crate's build script in parallel with its
+  proc-macro dependencies, so the script's output lands a few seconds
+  *older* than a main-dep artifact - and minicargo's script-run staleness
+  check then re-runs the script on **every warm pass**, regenerating the
+  `.txt` with a fresh mtime and cascading re-transpiles up through serde /
+  thiserror / zip to the engine itself. This latent bug is why warm builds
+  measured barely faster than cold (1h33m vs 1h39m): the engine
+  re-transpiled every time whether or not `src/` changed. The `ppc` stage
+  now retimes its own tree after every successful build (`build-ppc.sh
+  retime` does it by hand for an existing tree), so ordinary warm rebuilds
+  are transpile-quiet too, not just seeded ones.
+
+Two things deliberately ride along from the donor family:
+
+- **`APP_VERSION`**: every bundle carries the first family's stamp - one
+  version for one source state, rather than three timestamps for identical
+  code.
+- **The `-sys` crates' C archives** (zstd, bzip2): their build scripts do not
+  re-run (re-running would bump `build_*.txt` and dirty everything up to the
+  engine), so the donor's OUT_DIR archives are linked into every bundle.
+  Build the lowest floor (g3) first and this is always legal - g3 code runs
+  on every later CPU, and measured on real hardware the CPU-tuned builds buy
+  nothing (the G5 build ran ~50% *slower* than the G3 build on a G5).
+
+Re-verify the byte-identity (`cmp` two families' engine `.c`) after any
+mrustc or target-model change; if mrustc ever folds CPU-specific data into
+the C, seeding silently becomes wrong. `build-all-ppc.sh` guards the gross
+case - it warns if a seeded family's engine `.c` changed during the build
+(i.e. a re-transpile happened anyway), and `dist`'s AltiVec/cpusubtype floor
+check still gates every bundle independently.
 
 ## The parity gates
 
@@ -899,10 +1026,22 @@ without invalidating anything - there is nothing stale to correct when nothing
 recorded a version before.
 
 ```sh
-scripts/build-ppc.sh ppc                                   # stamp once, then reuse
-RELEASE_VERSION=2026-07-27-04-50 scripts/build-ppc.sh ppc  # set explicitly
-rm <output>/.release-version                               # take a fresh stamp
+scripts/build-ppc.sh ppc                                            # stamp once, then reuse
+RELEASE_VERSION=$(date -u +%Y-%m-%d-%H-%M) scripts/build-ppc.sh ppc # bake a NEW version in
 ```
+
+Setting `RELEASE_VERSION` is the **only** way to refresh the baked-in version,
+and it costs the full engine re-transpile, not a relink. `rm
+<output>/.release-version` does *not* re-stamp: with no marker the next run
+takes the first-stamp path, which adopts the current time into the marker while
+deliberately leaving every existing object alone - so `rb-cli --version` keeps
+reporting the old date. Use it to (re)establish a marker cheaply, never to
+refresh the version (this document used to advertise it as "take a fresh
+stamp", which sends you hunting the bug in build.rs instead of here). The
+stickiness is structural: `env!("APP_VERSION")` is read from 12 sites inside
+the *lib* (src/cli/, src/gui/), so the version cannot change without
+re-transpiling the engine; moving those reads into the bin crate would make
+re-stamping cheap.
 
 Building the PowerPC stdlib by hand, if you want to skip the driver:
 
@@ -927,46 +1066,37 @@ ssh $PPC_HOST './ppc-xbuild/output-1.74.0-powerpc-apple-darwin/hello'
 
 ## rb-cli-ppc deviations (mrustc workarounds)
 
-`rb-cli-ppc/Cargo.toml` and `scripts/build-ppc.sh` carry these, each working
-around a specific mrustc gap (all documented at their site):
+`rb-cli-ppc/Cargo.toml` carries the manifest-level deviations; the vendored
+sources are patched by `rb-cli-ppc/patches/` (one module per crate, applied by
+`scripts/apply-vendor-patches.py` -- see the README there for the contract).
+Each entry works around a specific mrustc gap; for the patched crates the
+authoritative write-up is the `GAP` string in the patch file:
 
 - **zip** `deflate` -> `deflate-flate2` — drops `zopfli` -> `bumpalo` (mrustc
   can't infer `Bump::shrink`). Same DEFLATE via flate2.
-- **crc** — `patch_crc_vendor` in build-ppc.sh turbofishes `Digest::<uN,Table<L>>::new`
-  in all 5 width files (mrustc can't infer the const-generic impl params).
+- **crc** — `patches/crc.py` turbofishes `Digest::<uN,Table<L>>::new` in all 5
+  width files (mrustc can't infer the const-generic impl params from the
+  return type).
 - **env_logger** `0.11` -> `=0.10.2` — drops `jiff` (0.11's timestamp backend;
   const-generic gap). Same logging via humantime.
-- **zstd-sys** — `patch_zstd_sys_vendor` drops `features = ["parallel"]` from its
-  `cc` build-dependency. It is the only crate in the graph asking for it, and
-  `parallel` is what compiles cc's `src/parallel/` — the only `async` in the
-  crate, and mrustc emits no `Future` impl for an async block. cc keeps a serial
-  arm behind `#[cfg(not(feature = "parallel"))]`, and cc never reaches the
-  PowerPC binary, so the only cost is that the C compiles one file at a time.
-- **signal-hook** — `patch_signal_hook_vendor` spells the one call to
-  `AddSignal::add_signal` as UFCS. The trait takes an arbitrary self type
-  (`self: Arc<Self>`) and the call used method syntax on a trait object, which
-  mrustc cannot resolve. Not avoidable by dropping a feature: crossterm's
-  `events` needs signal-hook-mio, which genuinely imports
-  `signal_hook::iterator::backend`.
-- **signal-hook-mio** — `patch_signal_hook_mio_vendor` turns
-  `use $pipe as Pipe;` into `type Pipe = $pipe;` inside
-  `implement_signals_with_pipe!`. mrustc cannot parse a `use` whose path is an
-  interpolated fragment followed by `as` — having consumed the path it insists on
-  `::` (`Unexpected token TOK_RWORD_AS, expected TOK_DOUBLE_COLON`). `Pipe` is
-  only ever used as a type here (`SignalDelivery<Pipe, E>`, `Pipe::pair()`), so
-  the alias binds it identically. **Same `TOK_RWORD_AS` family as the libyml gap
-  that keeps `yaml` off for this target** — see the open items; one parser fix
-  would plausibly clear both.
-- **instability** — `patch_instability_vendor` rewrites its three
-  `indoc::formatdoc!` doc strings as plain `format!` with the string already
-  unindented (byte-identical output). A proc macro that *forwards* a token from
-  its input loses that token's hygiene context crossing mrustc's proc-macro
-  bridge, and `formatdoc!` re-emits its trailing arguments verbatim, so
-  `formatdoc!{"...{}.", version.trim_start_matches('v')}` produced a `format!`
-  whose `version` no longer resolved to the `if let Some(ref version)` binding
-  around it (`Couldn't find variable name 'version'`). `format!` is a builtin, so
-  this takes the proc macro out of the picture. See the open items - the bridge
-  is the real bug.
+- **zstd-sys** — `patches/zstd-sys.py` drops `features = ["parallel"]` from its
+  `cc` build-dependency (`parallel` compiles cc's only `async`, and mrustc
+  emits no `Future` impl for an async block; cc keeps a serial arm and never
+  reaches the PowerPC binary, so the cost is C compiling one file at a time).
+- **signal-hook** — `patches/signal-hook.py` spells the one call to
+  `AddSignal::add_signal` as UFCS (arbitrary self type `self: Arc<Self>`
+  invoked with method syntax on a trait object, which mrustc cannot resolve;
+  not avoidable by dropping a feature).
+- **signal-hook-mio** — `patches/signal-hook-mio.py` turns `use $pipe as Pipe;`
+  into `type Pipe = $pipe;` (mrustc cannot parse a `use` whose path is an
+  interpolated fragment followed by `as`). **Same `TOK_RWORD_AS` family as the
+  libyml gap that keeps `yaml` off for this target** — see the open items; one
+  parser fix would plausibly clear both.
+- **instability** — `patches/instability.py` rewrites its three
+  `indoc::formatdoc!` doc strings as plain `format!` with byte-identical
+  output (a proc macro that *forwards* a token loses its hygiene context
+  crossing mrustc's proc-macro bridge; the bridge is the real bug - see the
+  open items).
 - **rustyline** `default-features = false` (keeping `with-file-history`,
   `with-dirs`) — drops `custom-bindings`, the only thing pulling `radix_trie`.
   The engine uses `DefaultEditor`, `ReadlineError` and the history calls, none of
@@ -978,19 +1108,14 @@ around a specific mrustc gap (all documented at their site):
   indexmap, but as a direct dependency it also enabled 0.14's default `ahash`,
   which pulls `zerocopy`, whose const-generic `HasField` impls mrustc
   mis-selects. indexmap asks for `default-features = false` itself.
-- **chrono** — `patch_chrono_vendor` in build-ppc.sh turbofishes
-  `DateTime::<Utc>::UNIX_EPOCH` at its two use sites. Nothing in
-  `DateTime::UNIX_EPOCH.naive_utc()` pins `Tz`; rustc resolves it because only
-  `impl DateTime<Utc>` declares that associated const, but mrustc cannot infer an
-  impl's type parameter from which impl happens to carry the const. Same class of
-  gap as the crc turbofish.
-- **rustversion** — `patch_rustversion_vendor` makes it identify the compiler from
-  the last line of `rustc --version` that actually starts with `rustc `, rather
-  than the last line full stop. Real rustc prints one line; mrustc prints four,
-  with the version banner first and informational lines after. Fixing this in
-  mrustc is not obviously safe - `libc`'s build script parses from the *start* of
-  the same output and mrustc's own comments note that `autoconfig` looks for the
-  `release:` line, so neither reordering nor trimming is free.
+- **chrono** — `patches/chrono.py` turbofishes `DateTime::<Utc>::UNIX_EPOCH` at
+  its two use sites (mrustc cannot infer an impl's type parameter from which
+  impl happens to carry the associated const; same class as the crc turbofish).
+- **rustversion** — `patches/rustversion.py` identifies the compiler from the
+  last line of `rustc --version` that actually starts with `rustc ` (mrustc
+  prints four lines with the banner first; fixing the order in mrustc instead
+  is not obviously safe - libc parses the same output from the *start* and
+  `autoconfig` wants the `release:` line).
 - **YAML** (`serde_yml` -> `libyml`) - an mrustc macro-expansion gap
   (`TOK_RWORD_AS` at `scanner.rs:1937`). **Done:** the engine gates YAML output
   behind a `yaml` feature, on by default everywhere else, and this build leaves it
