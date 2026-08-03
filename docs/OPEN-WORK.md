@@ -235,7 +235,7 @@ regression.
 
 ### 3.2 Split backups round-trip — **[RESOLVED]**
 
-`--split-size` had two silent defects, both fixed:
+`--split-size` had two defects, both silent, both fixed:
 
 * **Restore dropped every member but the first.** `reconstruct_disk_from_backup`
   read only `pm.compressed_files[0]`, so a split backup restored truncated and
@@ -245,23 +245,23 @@ regression.
   Restore now reads the members as the one byte stream they were cut from
   (`MemberChain` in `rbformats/compress.rs`). The same `[0]`-only bug was in the
   export path (`model/export_runner.rs`) and is fixed with it.
-* **A split CHD backup destroyed itself.** `chd::split_file` wrote chunk 0 to
-  the path it was reading from — `File::create` truncated the source mid-read,
-  so the split produced *nothing*: a `metadata.json` with an empty file list and
-  no data files at all. The source is now staged aside before any chunk is
-  written.
+* **`--split-size` was accepted with `--format chd`, which cannot work.** A
+  `.chd` is a self-contained container — header, hunk map, embedded SHA-1s — so
+  byte-chunks of one are not readable by chdman, MAME, or this tool. The old
+  code split it anyway (and, because chunk 0 landed on the source's own path,
+  truncated the `.chd` mid-read and produced a backup with *no* data files).
+  The combination is now refused up front by `backup::validate_backup_config`,
+  before any work starts, and the CHD splitting code is gone.
 
-A split CHD is reassembled to a temp file before opening, because libchdman
-seeks and cannot read a chain.
+`tests/split_backup_roundtrip.rs` covers it: raw splits restore byte-identical,
+a 5 MiB file spanning several 1 MiB members reads back intact through the
+filesystem, and `--format chd --split-size` is refused with an error naming both
+(while an unsplit CHD still round-trips).
 
-`tests/split_backup_roundtrip.rs` covers all of it: raw and CHD splits restore
-byte-identical, a 5 MiB file spanning several 1 MiB members reads back intact,
-and `split_file` no longer eats its own source. Each test was confirmed to fail
-with its fix reverted.
-
-Note `--split-size` is still ignored by zstd / gzip / lz4: `SplitWriter` is a
-no-op wrapper, so those codecs always emit one file. That is safe (one member
-restores correctly) but silent — worth either honouring or saying so.
+Still true: `--split-size` is a no-op for zstd / gzip / lz4 — `SplitWriter` is a
+pass-through, so those codecs always emit one file. Safe (a single member
+restores correctly) but silent. The flag's help now says raw-only; honouring it
+for the compressed codecs, or warning when it is ignored, is open.
 
 ---
 

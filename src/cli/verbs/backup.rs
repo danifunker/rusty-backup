@@ -107,7 +107,9 @@ pub struct BackupArgs {
     #[arg(long)]
     pub partitions: Option<String>,
 
-    /// Split each output stream after this many MiB (Zstd / Raw only).
+    /// Split the output after this many MiB. Raw (`--format raw`) only: a
+    /// `.chd` is a single self-contained container and refuses to be split,
+    /// and the compressed codecs currently ignore this.
     #[arg(long = "split-size")]
     pub split_size_mib: Option<u32>,
 

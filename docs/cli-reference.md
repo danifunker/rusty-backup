@@ -341,7 +341,7 @@ Usage: backup [OPTIONS] <SOURCE> <DEST>
 - `--sector-by-sector` — Skip filesystem-aware compaction; copy every sector verbatim
 - `--defrag` — Defragment FAT partitions: relocate each file's clusters contiguously (boot files first) before imaging. Same output size as ordinary compaction — the restored disk is just defragmented. Non-FAT filesystems are unaffected. (The desktop sibling of cb-dos `/DEFRAG`.)
 - `--partitions` — Per-partition filter — comma-separated 1-based indices to include (e.g. `1,3,4`; `1` is the first partition, matching the `img@N` selector). Default is "all partitions"
-- `--split-size` — Split each output stream after this many MiB (Zstd / Raw only)
+- `--split-size` — Split the output after this many MiB. Raw (`--format raw`) only: a `.chd` is a single self-contained container and refuses to be split, and the compressed codecs currently ignore this
 - `--keep-swap` — Image swap/page files verbatim instead of excluding them. By default a FAT volume's swap/page files (`386SPART.PAR`, `WIN386.SWP`, `PAGEFILE.SYS`, `HIBERFIL.SYS`, `SWAPPER.DAT`) are kept full-size but their content is zeroed (they reinitialize on boot), which the codec crushes; `--keep-swap` images them as-is. (The desktop sibling of cb-dos `/KEEPSWAP`.)
 
 ### `batch`

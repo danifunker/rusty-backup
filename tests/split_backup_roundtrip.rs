@@ -6,9 +6,11 @@
 //!   stream across `partition-0.raw` + `.001` + …, so everything past the first
 //!   member was dropped and the image restored truncated while reporting
 //!   success.
-//! * `chd::split_file` wrote chunk 0 to the path it was reading from, so
-//!   `File::create` truncated the source mid-read: a split CHD backup produced
-//!   a `metadata.json` with an empty file list and no data at all.
+//! * `--split-size` was accepted alongside `--format chd`, which cannot work:
+//!   a `.chd` is a self-contained container (header, hunk map, embedded
+//!   SHA-1s), so byte-chunks of one are not readable by chdman, MAME or this
+//!   tool. The old code tried to split it anyway and produced a backup with no
+//!   data files at all. The combination is now refused up front.
 
 use std::sync::{Arc, Mutex};
 
@@ -211,51 +213,65 @@ fn a_file_spanning_several_members_reads_back_intact() {
 
 #[cfg(feature = "chd")]
 #[test]
-fn chd_split_backup_keeps_its_data() {
+fn chd_rejects_split_size_up_front() {
     let dir = tempfile::tempdir().unwrap();
     let work = dir.path().to_path_buf();
     let src = work.join("source.img");
     source_image(&src, 5 * 1024 * 1024);
-    let expected = std::fs::read(&src).unwrap();
+    let backups = work.join("backups-chd");
+    std::fs::create_dir_all(&backups).unwrap();
 
-    let (restored, members) = split_round_trip(&work, &src, "chd", CompressionType::Chd);
+    let err = run_backup(
+        backup_config(&src, &backups, "chd", CompressionType::Chd, Some(1)),
+        Arc::new(Mutex::new(BackupProgress::default())),
+    )
+    .expect_err("splitting a CHD must be refused, not attempted");
+    let msg = format!("{err:#}");
     assert!(
-        members.len() > 1,
-        "expected the CHD to split, got {members:?}"
+        msg.contains("--split-size") && msg.contains("chd"),
+        "the error should name both the flag and the format: {msg}"
     );
-    // split_file used to truncate the .chd it was reading from, leaving none.
+
+    // Refused before any work: no half-written backup folder left behind.
     assert!(
-        members.iter().all(|m| m.ends_with(".chd")),
-        "unexpected member names: {members:?}"
+        !backups.join("chd").join("metadata.json").exists(),
+        "a refused backup must not leave a metadata.json"
     );
-    assert_eq!(restored, expected, "split CHD restore lost data");
-}
 
-/// `split_file` must not clobber the file it is reading: chunk 0's path is the
-/// source's own path, so the source has to be staged aside first.
-#[cfg(feature = "chd")]
-#[test]
-fn split_file_does_not_destroy_its_source() {
-    let dir = tempfile::tempdir().unwrap();
-    let base = dir.path().join("partition-0");
-    let source = dir.path().join("partition-0.chd");
-    let content: Vec<u8> = (0..(3 * 1024 * 1024u32)).map(|i| (i % 253) as u8).collect();
-    std::fs::write(&source, &content).unwrap();
+    // Without --split-size the same source backs up and restores fine.
+    let backups_ok = work.join("backups-chd-ok");
+    std::fs::create_dir_all(&backups_ok).unwrap();
+    run_backup(
+        backup_config(&src, &backups_ok, "ok", CompressionType::Chd, None),
+        Arc::new(Mutex::new(BackupProgress::default())),
+    )
+    .expect("an unsplit CHD backup still works");
+    let folder = backups_ok.join("ok");
+    let meta: serde_json::Value =
+        serde_json::from_reader(std::fs::File::open(folder.join("metadata.json")).unwrap())
+            .unwrap();
+    let members = meta["partitions"][0]["compressed_files"]
+        .as_array()
+        .unwrap();
+    assert_eq!(members.len(), 1, "a CHD backup is always one container");
 
-    let files = rusty_backup::rbformats::split_file_for_test(&source, &base, "chd", 1024 * 1024)
-        .expect("split");
-    assert!(files.len() >= 3, "expected several chunks, got {files:?}");
-
-    let mut joined = Vec::new();
-    for f in &files {
-        joined.extend_from_slice(&std::fs::read(dir.path().join(f)).unwrap());
-    }
+    let target = work.join("restored-chd.img");
+    rusty_backup::restore::run_restore(
+        RestoreConfig {
+            backup_folder: folder,
+            target_path: target.clone(),
+            target_is_device: false,
+            target_size: std::fs::metadata(&src).unwrap().len(),
+            alignment: RestoreAlignment::Original,
+            partition_sizes: Vec::new(),
+            write_zeros_to_unused: false,
+        },
+        Arc::new(Mutex::new(RestoreProgress::default())),
+    )
+    .expect("restore the unsplit CHD");
     assert_eq!(
-        joined, content,
-        "chunks must rejoin into the original bytes"
-    );
-    assert!(
-        !dir.path().join("partition-0.chd.splitting").exists(),
-        "the staging file must be cleaned up"
+        std::fs::read(&target).unwrap(),
+        std::fs::read(&src).unwrap(),
+        "unsplit CHD restore must be byte-identical"
     );
 }

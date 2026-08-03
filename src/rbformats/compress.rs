@@ -153,7 +153,6 @@ pub(crate) fn compress_partition_hashed(
                 reader,
                 output_base,
                 logical_size,
-                split_size,
                 chd_options,
                 &mut p,
                 &c,
@@ -169,7 +168,6 @@ pub(crate) fn compress_partition_hashed(
                 reader,
                 output_base,
                 logical_size,
-                split_size,
                 chd_options,
                 &mut p,
                 &c,
@@ -429,20 +427,16 @@ pub fn decompress_members_to_writer(
         }
         "chd" | "chd-dvd" => {
             log_cb(&format!("Extracting CHD: {}", data_path.display()));
-            // libchdman seeks, so a split CHD has to be whole on disk first.
-            let joined = if members.len() > 1 {
-                let mut tmp =
-                    tempfile::NamedTempFile::new().context("failed to create temp file")?;
-                std::io::copy(&mut MemberChain::new(members)?, tmp.as_file_mut())
-                    .context("failed to reassemble split CHD")?;
-                tmp.as_file_mut().flush()?;
-                Some(tmp)
-            } else {
-                None
-            };
-            let chd_path = joined.as_ref().map_or(data_path.as_path(), |t| t.path());
-            let chd_reader = chd::ChdReader::open(chd_path)
-                .with_context(|| format!("failed to open CHD: {}", chd_path.display()))?;
+            // A .chd is one self-contained container; we never write it split.
+            if members.len() > 1 {
+                bail!(
+                    "CHD backup lists {} data files, but a .chd is always a single \
+                     container — this is not a backup folder we wrote",
+                    members.len()
+                );
+            }
+            let chd_reader = chd::ChdReader::open(data_path)
+                .with_context(|| format!("failed to open CHD: {}", data_path.display()))?;
             let logical_size = chd_reader.logical_size();
             let effective_size = logical_size.min(limit);
             let mut reader = chd_reader.take(effective_size);
@@ -561,7 +555,6 @@ pub fn compress_file_to_archive(
                 &mut reader,
                 output_path_base,
                 logical_size,
-                None,
                 chd_options,
                 progress_cb,
                 cancel_check,
@@ -575,7 +568,6 @@ pub fn compress_file_to_archive(
                 &mut reader,
                 output_path_base,
                 logical_size,
-                None,
                 chd_options,
                 progress_cb,
                 cancel_check,

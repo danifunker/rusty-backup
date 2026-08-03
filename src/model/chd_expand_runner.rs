@@ -122,7 +122,6 @@ fn run_expand(
         &output_base,
         new_logical,
         None,
-        None,
         &mut progress_cb,
         &cancel_check,
         &mut log_cb,

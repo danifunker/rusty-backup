@@ -232,18 +232,6 @@ pub(crate) use compress::{
     write_zeros_with_progress, OutputHasherHandle, SplitWriter, CHUNK_SIZE,
 };
 
-/// Split an existing output file into `--split-size` chunks. Exposed for the
-/// regression test that pins it against clobbering its own source.
-#[cfg(feature = "chd")]
-pub fn split_file_for_test(
-    source: &std::path::Path,
-    output_base: &std::path::Path,
-    extension: &str,
-    split_bytes: u64,
-) -> anyhow::Result<Vec<String>> {
-    chd::split_file(source, output_base, extension, split_bytes)
-}
-
 /// Reconstruct a disk image from a backup folder, writing to any seekable writer.
 ///
 /// Shared by: VHD export (file writer), restore (device or file writer).

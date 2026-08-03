@@ -388,6 +388,29 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
     run_backup_from(source, config, progress)
 }
 
+/// Reject configurations that cannot produce a restorable backup, before any
+/// work starts. Shared by the GUI and the CLI.
+pub fn validate_backup_config(config: &BackupConfig) -> Result<()> {
+    // A .chd is a self-describing container — header, hunk map, embedded
+    // SHA-1s. Cutting one into byte chunks yields files no CHD tool can open,
+    // so the combination has no valid output rather than a degraded one.
+    if config.split_size_mib.is_some()
+        && matches!(
+            config.compression,
+            CompressionType::Chd | CompressionType::Dvd
+        )
+    {
+        bail!(
+            "--split-size cannot be combined with {} output: a .chd is a single \
+             self-contained container, and chunks of one are not readable by \
+             chdman, MAME or this tool. Drop --split-size, or pick a format \
+             that splits (raw).",
+            config.compression.as_str()
+        );
+    }
+    Ok(())
+}
+
 /// Backup orchestrator parameterised on the byte source. The path-based
 /// [`run_backup`] and (with the `remote` feature) a remote-image source both
 /// funnel here. Runs on a background thread.
@@ -396,6 +419,7 @@ pub fn run_backup_from(
     config: BackupConfig,
     progress: Arc<Mutex<BackupProgress>>,
 ) -> Result<()> {
+    validate_backup_config(&config)?;
     // Build the reader factory: a local backup opens + elevates the path; a
     // remote backup brokers ranged reads over the shared connection.
     let (factory, source_display): (SourceFactory, String) = match source {

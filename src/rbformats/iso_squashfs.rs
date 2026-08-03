@@ -286,7 +286,6 @@ mod tests {
             &base,
             data.len() as u64,
             None,
-            None,
             &mut |_| {},
             &|| false,
             &mut |_| {},
