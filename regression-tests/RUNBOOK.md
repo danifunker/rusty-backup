@@ -175,7 +175,7 @@ Two independent commands, neither needing to know about the other:
 
 ```bash
 rb-regress produce --out regressions/2026-08/artifacts/$OS
-rb-regress verify  --artifacts regressions/2026-08/artifacts                    --out regressions/2026-08/verifications/$OS
+rb-regress verify --artifacts regressions/2026-08/artifacts --out regressions/2026-08/verifications/$OS
 ```
 
 So the Mac verifies Windows-produced HFS, the MiSTer core verifies
