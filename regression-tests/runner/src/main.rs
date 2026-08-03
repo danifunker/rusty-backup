@@ -8,12 +8,12 @@
 //! seven verdicts in [`report::Verdict`].
 
 mod assertion;
-mod db;
 mod envelope;
 mod exec;
 mod fixtures;
 mod manifest;
 mod plan;
+mod registry;
 mod report;
 
 use report::{Bundle, CaseResult, Verdict};
@@ -42,10 +42,10 @@ enum Command {
     Run,
     List,
     Validate,
-    /// Rebuild the database from data/*.toml, the fixture maps and run bundles.
-    DbBuild,
-    /// Ask the database a question, by named query or raw SQL.
-    DbQuery(String),
+    /// Write the normalised JSON snapshot of the registry.
+    Export,
+    /// Ask the registry a question by name.
+    Query(String),
     /// Map requirements onto the machines that exist.
     Plan,
     Help,
@@ -92,25 +92,11 @@ fn parse_args() -> Result<Args, String> {
             "list" => args.command = Command::List,
             "validate" => args.command = Command::Validate,
             "plan" => args.command = Command::Plan,
-            "db" => {
-                // `db build` | `db query <name-or-sql>`
-                match raw.get(i + 1).map(|s| s.as_str()) {
-                    Some("build") => {
-                        args.command = Command::DbBuild;
-                        i += 1;
-                    }
-                    Some("query") => {
-                        let q = raw.get(i + 2).cloned().unwrap_or_default();
-                        args.command = Command::DbQuery(q);
-                        i += 2;
-                    }
-                    other => {
-                        return Err(format!(
-                            "`db` needs `build` or `query`, got {:?}",
-                            other.unwrap_or("nothing")
-                        ))
-                    }
-                }
+            "export" => args.command = Command::Export,
+            "query" => {
+                let q = raw.get(i + 1).cloned().unwrap_or_default();
+                args.command = Command::Query(q);
+                i += 1;
             }
             "-h" | "--help" | "help" => args.command = Command::Help,
             "--allow-hardware" => args.allow_hardware = true,
@@ -234,95 +220,136 @@ fn main() {
         Command::Validate => cmd_validate(&args),
         Command::List => cmd_list(&args),
         Command::Run => cmd_run(&args),
-        Command::DbBuild => cmd_db_build(&args),
-        Command::DbQuery(ref q) => cmd_db_query(&args, q),
+        Command::Export => cmd_export(&args),
+        Command::Query(ref q) => cmd_query(q),
         Command::Plan => cmd_plan(&args),
     };
     std::process::exit(code);
 }
 
 fn cmd_plan(args: &Args) -> i32 {
-    match plan::build_plan(&db_path(args), &regression_dir()) {
+    match plan::build_plan(&regression_dir()) {
         Ok(p) => {
             print!("{}", plan::render(&p));
             0
         }
         Err(e) => {
             eprintln!("error: {}", e);
-            eprintln!("hint: run `rb-regress db build` first");
             2
         }
     }
 }
 
-fn db_path(args: &Args) -> PathBuf {
-    args.db.clone().unwrap_or_else(|| regression_dir().join("db").join("regression.db"))
+fn export_path(args: &Args) -> PathBuf {
+    args.db
+        .clone()
+        .unwrap_or_else(|| regression_dir().join("data").join("regression.json"))
 }
 
-fn cmd_db_build(args: &Args) -> i32 {
-    let path = db_path(args);
-    match db::build(&regression_dir(), &path) {
-        Ok(r) => {
-            println!("built {}", path.display());
-            println!(
-                "  {} formats, {} oracles, {} verifications, {} fixtures",
-                r.formats, r.oracles, r.verifications, r.fixtures
-            );
-            println!("  {} runs, {} results ingested", r.runs, r.results);
-            for w in &r.warnings {
-                println!("  warning: {}", w);
-            }
-            0
-        }
+fn cmd_export(args: &Args) -> i32 {
+    let reg = match registry::Registry::load(&regression_dir()) {
+        Ok(r) => r,
         Err(e) => {
             eprintln!("error: {}", e);
-            2
+            return 2;
         }
+    };
+    let json = match reg.export_json() {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return 2;
+        }
+    };
+    let path = export_path(args);
+    if let Some(p) = path.parent() {
+        let _ = fs::create_dir_all(p);
     }
+    if let Err(e) = fs::write(&path, json + "
+") {
+        eprintln!("error: writing {}: {}", path.display(), e);
+        return 2;
+    }
+    println!("wrote {}", path.display());
+    for (k, v) in reg.counts() {
+        println!("  {:<14} {}", k, v);
+    }
+    for w in &reg.warnings {
+        println!("  warning: {}", w);
+    }
+    0
 }
 
-fn cmd_db_query(args: &Args, q: &str) -> i32 {
-    if q.is_empty() {
-        println!("named queries: {}", db::QUERY_NAMES.join(", "));
-        println!("or pass raw SQL");
+fn cmd_query(name: &str) -> i32 {
+    const NAMES: &[&str] = &[
+        "unverified-writes",
+        "unfixtured-reads",
+        "platform-pins",
+        "counts",
+        "fixtures",
+    ];
+    if name.is_empty() {
+        println!("queries: {}", NAMES.join(", "));
         return 0;
     }
-    let sql = db::named_query(q).map(|s| s.to_string()).unwrap_or_else(|| q.to_string());
-    match db::query(&db_path(args), &sql) {
-        Ok((cols, rows)) => {
-            // Width-aligned so output is readable in a terminal without
-            // piping through another tool.
-            let mut w: Vec<usize> = cols.iter().map(|c| c.len()).collect();
-            for r in &rows {
-                for (i, c) in r.iter().enumerate() {
-                    if i < w.len() && c.len() > w[i] {
-                        w[i] = c.len();
-                    }
-                }
-            }
-            let line: Vec<String> = cols
-                .iter()
-                .enumerate()
-                .map(|(i, c)| format!("{:<width$}", c, width = w[i]))
-                .collect();
-            println!("{}", line.join("  "));
-            println!("{}", w.iter().map(|n| "-".repeat(*n)).collect::<Vec<_>>().join("  "));
-            for r in &rows {
-                let line: Vec<String> = r
-                    .iter()
-                    .enumerate()
-                    .map(|(i, c)| format!("{:<width$}", c, width = w.get(i).copied().unwrap_or(0)))
-                    .collect();
-                println!("{}", line.join("  "));
-            }
-            println!("\n{} row(s)", rows.len());
-            0
-        }
+    let reg = match registry::Registry::load(&regression_dir()) {
+        Ok(r) => r,
         Err(e) => {
             eprintln!("error: {}", e);
-            2
+            return 2;
+        }
+    };
+    match name {
+        "unverified-writes" => {
+            for f in reg.unverified_writes() {
+                println!(
+                    "{:<22} {:<10} {}",
+                    f.id,
+                    f.kind,
+                    f.builder.as_deref().unwrap_or("")
+                );
+            }
+        }
+        "unfixtured-reads" => {
+            for f in reg.unfixtured_reads() {
+                println!("{:<22} {:<10} {}", f.id, f.kind, f.name);
+            }
+        }
+        "platform-pins" => {
+            let mut by_plat: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
+            for (fmt, dir, plat) in reg.platform_pins() {
+                println!("{:<22} {:<6} {}", fmt, dir, plat);
+                *by_plat.entry(plat).or_insert(0) += 1;
+            }
+            println!();
+            for (p, n) in by_plat {
+                println!("  {:<14} {}", p, n);
+            }
+        }
+        "counts" => {
+            for (k, v) in reg.counts() {
+                println!("{:<14} {}", k, v);
+            }
+        }
+        "fixtures" => {
+            let mut by_loc: std::collections::BTreeMap<&str, (usize, u64)> =
+                std::collections::BTreeMap::new();
+            for f in &reg.fixtures {
+                let e = by_loc.entry(f.location.as_str()).or_insert((0, 0));
+                e.0 += 1;
+                e.1 += f.bytes;
+            }
+            for (loc, (n, b)) in by_loc {
+                println!("{:<10} {:>4} fixtures  {:>8.1} MB", loc, n, b as f64 / 1048576.0);
+            }
+        }
+        other => {
+            eprintln!("unknown query '{}'; try one of: {}", other, NAMES.join(", "));
+            return 2;
         }
     }
+    0
 }
 
 fn cmd_validate(args: &Args) -> i32 {

@@ -25,12 +25,6 @@ sha2 = "0.10"
 # and rb-cli does not open .zst in place. Decompressing in-process keeps the
 # harness free of an external `zstd` binary. Version matches the engine's.
 zstd = "0.13"
-# The matrix is relational data (formats x oracles x platforms x runs), so it
-# lives in SQLite rather than in prose tables. `bundled` compiles SQLite into
-# the binary: no sqlite3 package on any test host, and the resulting .db is
-# still readable by any standard tool. Adds no new build requirement — zstd-sys
-# above already needs a C compiler.
-rusqlite = { version = "0.31", features = ["bundled"] }
 
 [profile.release]
 # The harness is I/O bound on subprocess execution; optimise for build time.

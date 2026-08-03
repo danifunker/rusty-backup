@@ -43,26 +43,32 @@ Three layers, and the direction of flow matters:
 
 | Layer | What | Edited by |
 |-------|------|-----------|
-| 1. Declarative input | `data/formats.toml`, `data/oracles.toml`, `fixture-map*.tsv`, `cases/**.toml` | **hand** — reviewable in a diff |
-| 2. Database | `db/regression.db`, built by `rb-regress db build` | **never** — regenerable |
+| 1. Declarative input | `data/formats.toml`, `data/oracles.toml`, `data/hosts.toml`, `fixture-map*.tsv`, `cases/**.toml` | **hand** — reviewable in a diff |
+| 2. Normalised snapshot | `data/regression.json`, written by `rb-regress export` | **never** — regenerate |
 | 3. Human views | generated markdown | **never** — outputs |
+
+There is deliberately **no database**. The whole matrix is ~52 KB of TOML, and
+every question the planner asks is a few iterator chains over it. An earlier
+revision materialised it into SQLite; that made the store larger than the data,
+added a C-compiled dependency, produced a binary artifact nobody could review
+in a diff, and introduced a build step that went stale twice in one afternoon.
+A year of run history is ~11 MB across 72 JSONL files, which did not justify it
+either. The registry is loaded in memory; `regression.json` is an export for
+other tools, and nothing reads it back.
 
 Prose is reserved for things that genuinely are prose: policy, rationale and
 runbooks. Anything that is a table of facts belongs in layer 1.
 
-Ask the database directly rather than reading four documents:
+Ask the registry directly rather than reading four documents:
 
 ```bash
-rb-regress db build
-rb-regress db query unverified-writes   # formats we write with no oracle
-rb-regress db query platform-pins       # what each OS uniquely verifies
-rb-regress db query coverage            # per-format fixture + oracle status
-rb-regress db query latest              # verdicts per platform, last run
-rb-regress db query "SELECT ..."        # or raw SQL
+rb-regress query unverified-writes   # formats we write with no oracle
+rb-regress query unfixtured-reads    # formats we read with no reference fixture
+rb-regress query platform-pins       # what each OS uniquely verifies
+rb-regress query fixtures            # corpus size by location
+rb-regress plan                      # who produces what, who verifies it, what moves
+rb-regress export                    # refresh data/regression.json
 ```
-
-SQLite is compiled into the binary, so no test host needs a `sqlite3`
-package — and the `.db` is still openable by any standard tool.
 
 ## Layout
 
@@ -74,8 +80,7 @@ regression-tests/
   EMULATORS.md       <- emulator / on-hardware verification design
   HARDWARE.md        <- physical backup/restore design + safety interlocks
   REPORTING.md       <- run bundle format and triage workflow
-  data/              <- LAYER 1: formats.toml, oracles.toml
-  db/                <- schema.sql + the generated regression.db
+  data/              <- LAYER 1 (toml) + the generated regression.json
   runner/            <- the harness (standalone Rust crate)
   cases/             <- declarative TOML case manifests, grouped by tier
   scripts/           <- fixture inventory + corpus sync helpers
@@ -83,7 +88,7 @@ regression-tests/
 
 `COVERAGE.md`, `VERIFICATION-MATRIX.md`, `GAPS.md` and `EMULATOR-IMAGES.md`
 are **being migrated** into layer 1. Their tables are already represented in
-`data/` and the database; the markdown remains for now as the human view and
+`data/`; the markdown remains for now as the human view and
 for the findings narrative, but should end up generated rather than
 hand-maintained.
 
