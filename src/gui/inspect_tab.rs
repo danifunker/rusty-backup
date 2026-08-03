@@ -1287,7 +1287,9 @@ impl InspectTab {
     /// Disk Export sub-window. Returns `None` if no raw image file is loaded.
     fn build_physical_disk_export_source(&self) -> Option<PhysicalDiskExportSource> {
         let path = self.image_file_path.as_ref()?.clone();
-        let size_bytes = std::fs::metadata(&path).ok().map(|m| m.len()).unwrap_or(0);
+        // Decoded length: a container's file size is not its disk size.
+        let size_bytes = rusty_backup::model::source_reader::decoded_image_size(&path)
+            .unwrap_or_else(|| std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0));
         let (fs_hint, has_partition_table) = match &self.partition_table {
             Some(PartitionTable::None { fs_hint, .. }) => (fs_hint.clone(), false),
             Some(_) => ("partitioned".to_string(), true),

@@ -29,6 +29,8 @@ enum RestoreMode {
     SinglePartition,
     /// Restore a single partition to a new/empty disk with a fresh partition table.
     NewDisk,
+    /// Write a plain image file (any readable format) to a disk or partition.
+    WriteImage,
 }
 
 /// Per-partition restore configuration in the GUI.
@@ -103,6 +105,11 @@ struct RemoteConnectStatus {
 pub struct RestoreTab {
     // Mode
     restore_mode: RestoreMode,
+    /// Write Image File mode: chosen source, and its decoded size.
+    image_write_path: Option<PathBuf>,
+    image_write_size: u64,
+    /// Target picker + progress, shared with the Inspect tab's export action.
+    image_write: super::physical_disk_export::PhysicalDiskExport,
 
     /// MRU of opened backup-folder paths (newest first), mirrored to
     /// `config.json` — the "Recent:" quick-pick row.
@@ -191,6 +198,9 @@ impl Default for RestoreTab {
     fn default() -> Self {
         Self {
             restore_mode: RestoreMode::FullDisk,
+            image_write_path: None,
+            image_write_size: 0,
+            image_write: Default::default(),
             recent_files: super::load_recent(rusty_backup::update::RecentMode::Restore),
             backup_folder: None,
             backup_metadata: None,
@@ -327,6 +337,16 @@ impl RestoreTab {
                     RestoreMode::NewDisk,
                     "Restore to New Disk",
                 );
+                ui.radio_value(
+                    &mut self.restore_mode,
+                    RestoreMode::WriteImage,
+                    "Write Image File",
+                )
+                .on_hover_text(
+                    "Write a disk image straight to a device or one of its \
+                     partitions. Any format Rusty Backup can read works, \
+                     including DMG, CHD, VHD and compressed images.",
+                );
             });
         });
         ui.add_space(4.0);
@@ -337,6 +357,11 @@ impl RestoreTab {
                 self.show_single_partition_mode(ui, ctx, controls_enabled)
             }
             RestoreMode::NewDisk => self.show_new_disk_mode(ui, ctx, controls_enabled),
+            RestoreMode::WriteImage => self.show_write_image_mode(ui, ctx, controls_enabled),
+        }
+
+        if self.image_write.open {
+            let _ = self.image_write.show(ui.ctx(), ctx);
         }
 
         // --- Confirmation popup ---
@@ -822,6 +847,8 @@ impl RestoreTab {
                         };
                         has_source && has_target
                     }
+                    // Drives its own target picker + confirmation sub-window.
+                    RestoreMode::WriteImage => false,
                 };
                 if ui
                     .add_enabled(can_start, egui::Button::new("Restore"))
@@ -1563,6 +1590,8 @@ impl RestoreTab {
                         );
                         ui.label("All existing data will be destroyed.");
                     }
+                    // Never reaches this popup; it confirms in its own window.
+                    RestoreMode::WriteImage => {}
                 }
 
                 ui.add_space(8.0);
@@ -1581,6 +1610,8 @@ impl RestoreTab {
                                 self.start_single_partition_restore(ctx)
                             }
                             RestoreMode::NewDisk => self.start_new_disk_restore(ctx),
+                            // Never reaches this popup; it confirms in its own window.
+                            RestoreMode::WriteImage => {}
                         }
                     }
                     if ui.button("Cancel").clicked() {
@@ -2075,6 +2106,96 @@ impl RestoreTab {
                 }
             }
         });
+    }
+
+    /// Write Image File: pour any readable image onto a device or one of its
+    /// partitions. Target selection, confirmation and progress are the shared
+    /// [`PhysicalDiskExport`](super::physical_disk_export::PhysicalDiskExport)
+    /// sub-window.
+    fn show_write_image_mode(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &mut TabContext,
+        controls_enabled: bool,
+    ) {
+        ui.label(egui::RichText::new("Source Image").strong());
+        ui.separator();
+
+        ui.add_enabled_ui(controls_enabled, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Image file:");
+                let label = self
+                    .image_write_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "(none selected)".to_string());
+                ui.label(label);
+                if ui.button("Choose...").clicked() {
+                    let mut dialog = rfd::FileDialog::new();
+                    dialog = dialog.add_filter(
+                        "Disk images",
+                        rusty_backup::model::file_types::DISK_IMAGE_EXTS,
+                    );
+                    if let Some(path) = dialog.pick_file() {
+                        self.image_write_size =
+                            rusty_backup::model::source_reader::decoded_image_size(&path)
+                                .unwrap_or(0);
+                        if self.image_write_size == 0 {
+                            ctx.log.error(format!(
+                                "Could not read {} as a disk image",
+                                path.display()
+                            ));
+                        } else {
+                            ctx.log.info(format!(
+                                "Source image: {} ({})",
+                                path.display(),
+                                partition::format_size(self.image_write_size),
+                            ));
+                        }
+                        self.image_write_path = Some(path);
+                    }
+                }
+            });
+        });
+
+        if let Some(path) = self.image_write_path.clone() {
+            if self.image_write_size > 0 {
+                ui.label(format!(
+                    "Decoded size: {} (the file on disk may be smaller if it is compressed)",
+                    partition::format_size(self.image_write_size),
+                ));
+                ui.add_space(6.0);
+                if ui
+                    .add_enabled(
+                        controls_enabled,
+                        egui::Button::new("Choose target and write..."),
+                    )
+                    .clicked()
+                {
+                    let source = super::physical_disk_export::PhysicalDiskExportSource {
+                        path,
+                        size_bytes: self.image_write_size,
+                        fs_hint: "image".to_string(),
+                        has_partition_table: true,
+                    };
+                    self.image_write.open_for(source, None);
+                }
+            } else {
+                ui.colored_label(
+                    egui::Color32::from_rgb(220, 70, 70),
+                    "That file could not be opened as a disk image.",
+                );
+            }
+        } else {
+            ui.label(
+                egui::RichText::new(
+                    "Pick an image to write. Any format Rusty Backup can read works -- \
+                     raw, DMG, CHD, VHD, 2MG, GHO, IMZ, and gzip- or zip-wrapped images \
+                     are decoded on the way to the disk.",
+                )
+                .weak(),
+            );
+        }
     }
 
     fn show_new_disk_mode(

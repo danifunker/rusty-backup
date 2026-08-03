@@ -72,6 +72,12 @@ pub struct PhysicalDiskExport {
     /// Source snapshot taken when the sub-window was opened.
     source: Option<PhysicalDiskExportSource>,
     last_error: Option<String>,
+    /// `None` writes the whole disk; `Some(i)` writes into that partition only.
+    target_partition: Option<usize>,
+    /// Partitions on the selected device, re-read when the selection changes.
+    target_partitions: Vec<rusty_backup::partition::PartitionInfo>,
+    /// Device index `target_partitions` was read from.
+    scanned_device: Option<usize>,
 }
 
 impl Default for PhysicalDiskExport {
@@ -91,6 +97,9 @@ impl Default for PhysicalDiskExport {
             write_rate: super::progress::RateTracker::default(),
             source: None,
             last_error: None,
+            target_partition: None,
+            target_partitions: Vec::new(),
+            scanned_device: None,
         }
     }
 }
@@ -321,11 +330,18 @@ impl PhysicalDiskExport {
             .map(|d| d.display_name())
             .unwrap_or_else(|| "(no device)".to_string());
 
+        self.render_target_region(ui, device);
+
+        let confirm_hint = if self.target_partition.is_some() {
+            "Writing replaces the contents of the selected partition."
+        } else {
+            "Writing erases all data on the selected device."
+        };
         ui.label(egui::RichText::new(format!(
             "Confirm: type the device name `{}` to enable Write",
             device_name
         )))
-        .on_hover_text("Writing erases all data on the selected device.");
+        .on_hover_text(confirm_hint);
         ui.add_enabled(
             ready,
             egui::TextEdit::singleline(&mut self.confirm_text).hint_text(&device_name),
@@ -343,6 +359,68 @@ impl PhysicalDiskExport {
                 *close_requested = true;
             }
         });
+    }
+
+    /// Whole-disk vs single-partition target, with the partition list read off
+    /// the selected device.
+    fn render_target_region(&mut self, ui: &mut egui::Ui, device: Option<&DiskDevice>) {
+        let Some(dev) = device else { return };
+
+        if self.scanned_device != self.selected_device {
+            self.target_partitions = read_device_partitions(&dev.path);
+            self.scanned_device = self.selected_device;
+            self.target_partition = None;
+        }
+
+        ui.separator();
+        ui.label(egui::RichText::new("Write to").strong());
+        ui.radio_value(
+            &mut self.target_partition,
+            None,
+            format!(
+                "Entire disk ({}) - replaces the partition table",
+                rusty_backup::partition::format_size(dev.size_bytes),
+            ),
+        );
+
+        if self.target_partitions.is_empty() {
+            ui.label(
+                egui::RichText::new(
+                    "No partition table detected on the target, so only a \
+                     whole-disk write is available.",
+                )
+                .weak(),
+            );
+            return;
+        }
+
+        // Synthesizing a table is a whole-disk operation; the two are exclusive.
+        for p in &self.target_partitions {
+            let label = format!(
+                "Partition {} - {} ({}) at LBA {}",
+                p.index + 1,
+                p.type_name,
+                rusty_backup::partition::format_size(p.size_bytes),
+                p.start_lba,
+            );
+            ui.radio_value(&mut self.target_partition, Some(p.index), label);
+        }
+
+        if let (Some(idx), Some(src)) = (self.target_partition, self.source.as_ref()) {
+            if let Some(p) = self.target_partitions.iter().find(|p| p.index == idx) {
+                if src.size_bytes > p.size_bytes {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(220, 70, 70),
+                        format!(
+                            "Source is {} but the partition holds {}",
+                            rusty_backup::partition::format_size(src.size_bytes),
+                            rusty_backup::partition::format_size(p.size_bytes),
+                        ),
+                    );
+                }
+            }
+        }
+        ui.separator();
     }
 
     fn render_progress(&mut self, ui: &mut egui::Ui) {
@@ -409,6 +487,36 @@ impl PhysicalDiskExport {
 
     fn start_write(&mut self, source: &PhysicalDiskExportSource, device: &DiskDevice) {
         let target_size = device.size_bytes;
+
+        // Writing into one partition leaves the table alone, so none of the
+        // synthesize / alignment machinery below applies.
+        if let Some(idx) = self.target_partition {
+            let Some(part) = self.target_partitions.iter().find(|p| p.index == idx) else {
+                self.last_error = Some("Selected partition is no longer present".to_string());
+                return;
+            };
+            if source.size_bytes > part.size_bytes {
+                self.last_error = Some(format!(
+                    "Source is {} but partition {} holds only {}",
+                    rusty_backup::partition::format_size(source.size_bytes),
+                    part.index + 1,
+                    rusty_backup::partition::format_size(part.size_bytes),
+                ));
+                return;
+            }
+            let req = PhysicalWriteRequest {
+                source: PhysicalWriteSource::Image(source.path.clone()),
+                target_device_path: device.path.clone(),
+                target_size_bytes: target_size,
+                extent: WriteExtent::partition(part.start_lba, part.size_bytes),
+                wrap: None,
+            };
+            self.last_error = None;
+            self.write_status = Some(physical_write_runner::start_physical_write(req));
+            self.write_rate.reset();
+            return;
+        }
+
         let first_lba = self.resolved_alignment().first_partition_lba();
         let first_byte = first_lba * 512;
 
@@ -572,6 +680,23 @@ fn type_byte_picker(ui: &mut egui::Ui, type_byte: &mut u8, fs_hint: &str) {
 
 /// Probe the source's VBR for the `hidden_sectors` field at offset 0x1C.
 /// Reads only the first 512 bytes; returns `None` on any error.
+/// Partitions on `device`, or empty when it has no readable table.
+fn read_device_partitions(device: &std::path::Path) -> Vec<rusty_backup::partition::PartitionInfo> {
+    let Ok(mut reader) =
+        rusty_backup::model::source_reader::open_peeled_read_with_entry(device, None, None)
+    else {
+        return Vec::new();
+    };
+    match rusty_backup::partition::PartitionTable::detect(&mut reader) {
+        Ok(table) => table
+            .partitions()
+            .into_iter()
+            .filter(|p| !p.is_extended_container && p.size_bytes > 0)
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 fn detect_hidden_sectors_from_source(source: &PhysicalDiskExportSource) -> Option<u32> {
     use std::fs::File;
     use std::io::Read;
