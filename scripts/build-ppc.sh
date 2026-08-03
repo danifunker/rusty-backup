@@ -21,10 +21,10 @@
 # Usage:
 #   scripts/build-ppc.sh            # run every stage in order (host path)
 #   scripts/build-ppc.sh <stage>    # run a single stage
-#   stages: mrustc overrides hostlibs vendor hostc host  ppclibs ppc probe
+#   stages: mrustc overrides hostlibs vendor hostc host  ppclibs ppc dist probe
 #     (hostc = emit the engine's C on this machine, no PowerPC needed; the
 #      fastest test that the whole engine transpiles)
-#     (ppclibs/ppc/probe need PPC_HOST=<ssh dest of a PowerPC Mac>)
+#     (ppclibs/ppc/dist/probe need PPC_HOST=<ssh dest of a PowerPC Mac>)
 #
 set -euo pipefail
 
@@ -48,22 +48,10 @@ PPC_TARGET="powerpc-apple-darwin"
 export PPC_MIN_VERSION="${PPC_MIN_VERSION:-10.4}"
 
 # ---- target CPU --------------------------------------------------------------
-# PPC_CPU picks the oldest CPU the binary is allowed to run on. It decides two
-# separate things, and both matter:
-#
-#   1. the Mach-O cpusubtype tag. Darwin's exec path grades it against the host,
-#      so a `ppc7400` executable is refused outright on a 750 - the G3 never even
-#      reaches main(). Older tags run on newer CPUs, so a 750 build covers every
-#      PowerPC Mac from one binary.
-#   2. whether AltiVec is on. gcc10-bootstrap defaults to `-mcpu=7400`, which
-#      defines __ALTIVEC__ and lets the vectorizer emit vector ops; those are an
-#      illegal instruction on a 750. See docs/build-ppc-mrustc.md "Targeting a G3".
-#
-# 750 is the default because AltiVec buys this workload nothing measurable: at
-# -mcpu=7400 the whole 40 MB binary contained exactly two vector instructions
-# (a vxor/stvx pair zeroing a buffer in zstd's HUF_buildCTable_wksp). Set
-# PPC_CPU=7400 or 970 for a CPU-specific build; set PPC_CPU_FLAGS to bypass the
-# mapping entirely.
+# PPC_CPU is the oldest CPU the binary may run on; it sets both the Mach-O
+# cpusubtype tag (a too-new tag is refused at exec) and whether AltiVec is on.
+# 750 is the default because AltiVec buys this workload nothing measurable.
+# Full story + usage examples: docs/build-ppc-mrustc.md "Targeting a G3".
 PPC_CPU="${PPC_CPU:-750}"
 if [ -z "${PPC_CPU_FLAGS:-}" ]; then
   case "$PPC_CPU" in
@@ -76,9 +64,8 @@ if [ -z "${PPC_CPU_FLAGS:-}" ]; then
     *)                      PPC_CPU_FLAGS="-mcpu=$PPC_CPU" ;;
   esac
 fi
-# Optional: schedule for a newer chip than the ISA floor. `PPC_CPU=750
-# PPC_TUNE=7450` keeps every instruction legal on a G3 but orders them for a G4,
-# which is the sane shape when one binary has to serve both.
+# PPC_TUNE schedules for a newer chip than the ISA floor (PPC_CPU=750
+# PPC_TUNE=7450 stays G3-legal but orders instructions for a G4).
 [ -n "${PPC_TUNE:-}" ] && PPC_CPU_FLAGS="$PPC_CPU_FLAGS -mtune=$PPC_TUNE"
 export PPC_CPU_FLAGS
 
@@ -95,30 +82,20 @@ case "$PPC_CPU" in
 esac
 export PPC_CPU_LABEL
 
-# The PowerPC Mac that compiles the emitted C. Nothing here cross-compiles:
-# there is no usable powerpc-apple-darwin cross-gcc, so scripts/ppc-cc-remote.py
-# stands in as the C compiler and ships each translation unit over ssh. Set
-# PPC_HOST to an ssh destination with key auth already working.
+# The PowerPC Mac that compiles the emitted C: an ssh destination with key
+# auth already working. scripts/ppc-cc-remote.py ships each unit to it.
 export PPC_HOST="${PPC_HOST:-}"
 PPC_CC_WRAPPER="$RB_DIR/scripts/ppc-cc-remote.py"
 PPC_AR_WRAPPER="$RB_DIR/scripts/ppc-ar-remote.py"
 # mrustc picks its C compiler from CC_<triple with - replaced by _>.
 export CC_powerpc_apple_darwin="$PPC_CC_WRAPPER"
-# cc-rs uses the same convention, so the -sys crates' build scripts (bzip2-sys,
-# zstd-sys) pick up the wrapper for free. They also need an *archiver*: the host
-# `ar` writes a System V symbol table and Apple's linker wants a Mach-O
-# __.SYMDEF, so the archive has to be built on the Mac as well.
+# cc-rs uses the same convention, so the -sys crates pick the wrapper up free.
+# Archives must also be built on the Mac (Mach-O __.SYMDEF): see the doc's
+# "The remote archiver".
 export AR_powerpc_apple_darwin="$PPC_AR_WRAPPER"
-# The compat shim (lgammaf_r, and the fcntl/poll overrides) has to be on the
-# final link line or libstd's references to it go unresolved. ppc-cc-remote.py
-# reads it from PPC_SHIM and simply omits it when unset - so a build driven by
-# this script used to end in
-#
-#     Undefined symbols: "_lgammaf_r", referenced from: ... in libstd.rlib.o
-#
-# after every crate had compiled, with nothing in the log mentioning the shim.
-# The manual link in docs/build-ppc-mrustc.md always passed it; the script did
-# not. There is no build that wants it unset, so default it here.
+# The compat shim must reach the final link line or libstd references go
+# unresolved, and no build wants it unset - so default it here. The silent
+# failure this once caused is in the doc's "Traps in the build loop".
 export PPC_SHIM="${PPC_SHIM:-$CRATE_DIR/shim/ppc-compat.c}"
 # The G5 has 2 cores; the transpile is local and parallel, the compiles are not.
 PPC_JOBS="${PPC_JOBS:-3}"
@@ -126,49 +103,17 @@ PPC_JOBS="${PPC_JOBS:-3}"
 # from Linux would pick -linux (whose build_libc.txt says freebsd11). Name the
 # macOS/PowerPC set explicitly; it differs from -macos only in STD_ENV_ARCH.
 PPC_OVERRIDE_SUFFIX="-macos-powerpc"
-# minicargo hands build scripts `RUSTC=<its own mrustc path>` so they can probe the
-# compiler version, and derives that path from argv[0] - which is relative when it
-# is invoked as `bin/minicargo`. Build scripts run with their cwd set to the crate
-# directory, so a relative RUSTC fails to spawn: libc's build.rs then dies with
-# "Failed to get rustc version" and takes the build with it. Pin it absolute.
+# Pin RUSTC absolute for build scripts: the argv[0]-derived path is relative
+# when invoked as `bin/minicargo` and fails to spawn from a crate cwd (Traps).
 export MRUSTC_PATH="${MRUSTC_PATH:-$MRUSTC_DIR/bin/mrustc}"
 
 # ---- version stamp -----------------------------------------------------------
-# The pipeline stamps a build date: `.github/workflows/release.yml` sets
-# RELEASE_VERSION to `date -u +"%Y-%m-%d-%H-%M"`, ../build.rs reads it and emits
-# `cargo:rustc-env=APP_VERSION=<it>`. That works unchanged here - minicargo does
-# parse `cargo:rustc-env` and pass it to the crate compile - so all this has to
-# do is set the variable and make sure it is not silently stale.
-#
-# The staleness matters, and differs from cargo. build.rs guards itself with
-# `rerun-if-env-changed=RELEASE_VERSION`, but **minicargo does not implement
-# rerun-if-env-changed**: once `build_rb-cli-ppc-*.txt` exists and looks current,
-# the script is never re-run and APP_VERSION is pinned to whatever the first
-# build stamped. So the version is recorded in a marker file and the build-script
-# output is dropped only when it actually changes.
-#
-# Deliberately *not* re-stamped on every invocation: a changed build-script
-# output makes the engine crate dirty, and re-transpiling the engine is the most
-# expensive thing in this build. So the stamp is taken once and reused until you
-# ask for a new one:
-#
-#   RELEASE_VERSION=$(date -u +%Y-%m-%d-%H-%M) scripts/build-ppc.sh ppc
-#       The ONLY way to bake a new version in. Drops the build-script output, so
-#       the engine re-transpiles - budget the full build time, not a relink.
-#
-#   rm <output>/.release-version
-#       Does NOT re-stamp. With no marker this takes the first-stamp path below,
-#       which adopts the current time into the marker and deliberately leaves
-#       every existing object alone - so the binary keeps whatever APP_VERSION
-#       was already baked into it, and `rb-cli --version` still reports the old
-#       date. Use it to (re)establish a marker cheaply, never to refresh the
-#       version. This comment used to advertise it as "re-stamp next run", which
-#       sends you looking for the bug in build.rs instead of here.
-#
-# The stickiness is why a fresh PowerPC binary can report a date two days old:
-# `env!("APP_VERSION")` is read from 12 sites inside the *lib* (src/cli/,
-# src/gui/), so the version cannot change without re-transpiling the engine.
-# Moving those reads into the bin crate would make re-stamping cheap.
+# minicargo never re-runs a current-looking build script (no
+# rerun-if-env-changed), so APP_VERSION lives in a marker file and the
+# build-script output is dropped only when the version actually changes --
+# dropping it re-transpiles the whole engine, which is hours. Setting
+# RELEASE_VERSION is the ONLY way to bake a new version in; removing the
+# marker does NOT re-stamp. Full flow + traps: the doc's "Version stamping".
 stamp_version() {
   local marker="$PPC_OUT/.release-version"
   local prev=""
@@ -184,12 +129,8 @@ stamp_version() {
     return
   fi
 
-  # First stamp on a tree that has no marker yet: adopt the version WITHOUT
-  # invalidating anything. There is nothing stale to correct - whatever is built
-  # was built before versioning existed - and dropping the build-script output
-  # here costs a full re-transpile of the engine's 797 MB translation unit, which
-  # is hours. Learned the hard way: introducing this function did exactly that to
-  # an already-complete tree that only needed its final link.
+  # First stamp on a markerless tree: adopt the version WITHOUT invalidating
+  # anything -- nothing recorded a version before, so nothing is stale.
   if [ -z "$prev" ]; then
     printf '%s' "$RELEASE_VERSION" > "$marker"
     note "APP_VERSION=$RELEASE_VERSION (first stamp - existing objects left alone;"
@@ -203,11 +144,9 @@ stamp_version() {
 }
 
 HOST_LIBS="$MRUSTC_DIR/output-${RUSTC_VERSION}"
-# Both PowerPC trees are keyed on the CPU family. The objects in them are
-# compiled with $PPC_CPU_FLAGS, so sharing one tree across families silently
-# links G5 AltiVec objects into a "G3" binary — the packaging guard catches it,
-# but only after a full engine rebuild. One tree per family keeps each cache
-# warm and makes a mixed binary impossible.
+# Both PowerPC trees are stamped per CPU family: nothing tracks compiler
+# flags, so a shared tree mixes families' objects into one binary. Doc:
+# "One output tree per CPU family".
 PPC_LIBS="$MRUSTC_DIR/output-${RUSTC_VERSION}-${PPC_TARGET}-${PPC_CPU_LABEL}"
 HOST_OUT="$MRUSTC_DIR/output-rb-host"
 HOSTC_OUT="$MRUSTC_DIR/output-rb-hostc"
@@ -219,28 +158,10 @@ note()   { printf '\033[33m%s\033[0m\n' "$*"; }
 die()    { printf '\033[1;31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
 
 # ---- reaping orphaned compiles on the Mac -----------------------------------
-# Interrupting this script used to leave cc1 running on the PowerPC Mac. Every
-# remote compile is `ssh HOST gcc ...`, and with no tty on the far side there is
-# nothing to deliver SIGHUP to the remote process group: when the local driver
-# dies, each in-flight translation unit is orphaned and keeps burning a core.
-# On a 2-core G5 a couple of those silently halve the speed of the *next* build,
-# and the symptom - "why is this build twice as slow today" - points nowhere
-# near the interrupted run that caused it.
-#
-# The match anchor is the toolchain prefix, not the build directory. cc1 is
-# spawned with relative mirrored paths (`home/dani/repos/...`, no leading slash)
-# and inherits its cwd, so its argv never mentions ppc-xbuild. Everything this
-# pipeline runs on the Mac comes out of gcc10-bootstrap and nothing else on the
-# machine does - notably not the root-owned ppc64 Linux CI leg, which is a
-# different toolchain entirely.
-#
-# Killing loops because gcc respawns cc1 as it works through its queue: one pass
-# kills the current unit and the driver immediately starts the next. Leopard's
-# pkill has no -f pattern that matches these, so they go by explicit pid.
-#
-# Caveat: this reaps by toolchain, not by build, so two concurrent
-# build-ppc.sh runs against the same Mac would kill each other's compiles. The
-# pipeline is single-Mac by construction, so that is not a shape worth guarding.
+# A dead driver orphans in-flight remote compiles (no tty, so no SIGHUP), which
+# keep burning the G5's two cores into the next build. Reaped by explicit pid,
+# anchored on the gcc10-bootstrap toolchain prefix; details + the concurrent-
+# runs caveat live in the doc's "Traps in the build loop".
 ppc_reap_orphans() {
   [ -n "${PPC_HOST:-}" ] || return 0
   local result killed remaining
@@ -396,11 +317,9 @@ stage_host() {
 }
 
 # ---- stage 5b: emit the engine's C on the HOST (no PPC libc needed) ---------
-# The host analog of `ppc`: transpile the whole engine to C against the working
-# host libstd, codegen DEFERRED -- so you get every crate's .c plus a
-# <crate>-codegen.sh, WITHOUT needing the final link to succeed. This is the
-# fastest unblocked way to (a) prove mrustc digests the entire engine and
-# (b) read the emitted C, months before the PPC libc is sorted.
+# The host analog of `ppc` with codegen deferred: every crate's .c plus its
+# codegen.sh, no final link needed -- the fastest proof mrustc digests the
+# whole engine, and the way to read the emitted C.
 stage_hostc() {
   banner "5b. emit host C for the whole engine (deferred codegen) -> $HOSTC_OUT"
   stamp_version
@@ -422,12 +341,9 @@ stage_hostc() {
 }
 
 # ---- stage 6: build the PowerPC standard library ----------------------------
-# Transpiles core/alloc/std/panic_unwind/test for powerpc-apple-darwin and
-# compiles each emitted .c on the G5 via the remote-cc wrapper. The vendored
-# libc needs no source changes to *compile* for this target - b32 is
-# arch-agnostic and mrustc's own layout asserts pass - but several of its struct
-# definitions describe modern macOS and are wrong for 10.4/10.5 at *runtime*.
-# See docs/build-ppc-mrustc.md and scripts/ppc-libc-probe.py.
+# Transpiles core/alloc/std/panic_unwind/test and compiles each .c on the Mac.
+# The vendored libc compiles unchanged but misdescribes 10.4/10.5 at runtime:
+# see the doc's "The libc situation" and scripts/ppc-libc-probe.py.
 stage_ppclibs() {
   banner "6. build PPC libstd -> $PPC_LIBS"
   sync_rustc_src_patch
@@ -436,11 +352,8 @@ stage_ppclibs() {
   cd "$MRUSTC_DIR"
   stage_ppc_overrides
   # No debug_assertions: assert_unsafe_precondition! aborts in rt::init here (docs/build-ppc-mrustc.md "The alignment problem").
-  # OUTDIR_SUF on the command line pins minicargo.mk's output directory to the
-  # CPU-stamped one. minicargo.mk would otherwise derive
-  # `output-<ver>-<target>` and append the target itself (its `:=` is ignored
-  # for a command-line variable), so libstd would land in a tree shared by
-  # every CPU family — the objects are built with $PPC_CPU_FLAGS and must not be.
+  # OUTDIR_SUF (a command-line variable beats minicargo.mk's own `:=`) pins
+  # libstd into the CPU-stamped tree; doc: "One output tree per CPU family".
   MRUSTC_TARGET_VER="$MRUSTC_TARGET_VER" MINICARGO_DEFER_CODEGEN=1 \
   MINICARGO_NO_DEBUG_ASSERTIONS=1 \
     make -f minicargo.mk LIBS \
@@ -453,10 +366,8 @@ stage_ppclibs() {
   note "PPC libstd ready ($(ls "$PPC_LIBS"/*.o | wc -l | tr -d ' ') PowerPC objects)."
 }
 
-# minicargo derives the *host* lib dir from the target one by dropping the
-# target triple, so a CPU-stamped `output-<ver>-<triple>-g3` yields
-# `output-<ver>-g3` — which nothing builds. Host libs are CPU-independent
-# (they run here, not on the Mac), so alias the derived name at the real one.
+# minicargo derives the host lib dir by dropping the triple, so a stamped tree
+# yields `output-<ver>-g3`, which nothing builds; alias it at the real one.
 ensure_host_lib_alias() {
   local alias_dir="$MRUSTC_DIR/output-${RUSTC_VERSION}-${PPC_CPU_LABEL}"
   [ -e "$alias_dir" ] && return 0
@@ -505,10 +416,8 @@ stage_ppc() {
       --target "$PPC_TARGET" \
       --no-default-features --features "$FEATURES" \
       -j "$PPC_JOBS"
-  # Don't take a zero exit as proof. minicargo has returned success while
-  # deadlocking ("Nothing runnable or running, but jobs are still waiting"), and
-  # this note is the only thing the log then shows - it announced an rb-cli that
-  # was never linked. stage_host has always checked for its binary; so does this.
+  # minicargo can exit 0 while deadlocked, without linking (see Traps in the
+  # doc) -- so check for the binary rather than trusting the exit code.
   [ -e "$PPC_OUT/rb-cli" ] || die "minicargo exited 0 but produced no $PPC_OUT/rb-cli -- check the log for 'BUG:' and for a deadlock listing"
   note "PowerPC rb-cli under $PPC_OUT (compiled on $PPC_HOST)."
 }
