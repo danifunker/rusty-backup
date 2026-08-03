@@ -47,6 +47,8 @@ availability = [
 ]
 verifies = [
   { format = "fmt.chd", direction = "write", strength = "structural", status = "proven", evidence = "chdman verify -> Raw SHA1 + Overall SHA1 successful, chdman 0.174 through 0.288" },
+  { format = "optical.chdcd", direction = "write", strength = "structural", status = "untested" },
+  { format = "fmt.bincue", direction = "write", strength = "structural", status = "untested", evidence = "chdman createcd round-trip" },
 ]
 
 [[oracle]]
@@ -236,7 +238,8 @@ availability = [
 verifies = [
   { format = "fs.efs",  direction = "write", strength = "authoritative", status = "plausible", evidence = "IRIX 6.5 image reads OK; boot not yet wired" },
   { format = "fs.xfs",  direction = "write", strength = "authoritative", status = "plausible", evidence = "IRIX 6.5 mounts both XFS and EFS" },
-  { format = "part.sgi", direction = "write", strength = "authoritative", status = "plausible" },
+  { format = "part.sgi",     direction = "write", strength = "authoritative", status = "plausible" },
+  { format = "optical.efs", direction = "write", strength = "authoritative", status = "plausible", evidence = "IRIX mounts an EFS CD natively" },
 ]
 
 [[oracle]]
@@ -300,8 +303,10 @@ kind = "hardware"
 availability = [{ platform = "mister-core", status = "expected" }]
 verifies = [
   { format = "fs.human68k", direction = "write", strength = "authoritative", status = "plausible" },
-  { format = "fmt.d88",     direction = "write", strength = "authoritative", status = "plausible" },
-  { format = "part.x68k",   direction = "write", strength = "authoritative", status = "plausible" },
+  { format = "fmt.d88",      direction = "write", strength = "authoritative", status = "plausible" },
+  { format = "part.x68k",    direction = "write", strength = "authoritative", status = "plausible" },
+  { format = "fmt.xdf",      direction = "write", strength = "authoritative", status = "plausible" },
+  { format = "fmt.x68k-hdd", direction = "write", strength = "authoritative", status = "plausible" },
 ]
 
 [[oracle]]
@@ -310,7 +315,9 @@ tool = "MiSTer AtariST core"
 kind = "hardware"
 availability = [{ platform = "mister-core", status = "expected" }]
 verifies = [
-  { format = "part.ahdi", direction = "write", strength = "authoritative", status = "plausible" },
+  { format = "part.ahdi",  direction = "write", strength = "authoritative", status = "plausible" },
+  { format = "fs.atarist", direction = "write", strength = "authoritative", status = "plausible" },
+  { format = "fmt.msa",    direction = "read",  strength = "authoritative", status = "plausible" },
 ]
 
 [[oracle]]
@@ -324,6 +331,7 @@ availability = [{ platform = "mister-core", status = "expected" }]
 verifies = [
   { format = "fs.prodos",    direction = "write", strength = "authoritative", status = "plausible" },
   { format = "fs.apple-dos", direction = "write", strength = "authoritative", status = "plausible" },
+  { format = "fs.ucsd",      direction = "write", strength = "authoritative", status = "plausible" },
 ]
 
 # --- Classic Mac -------------------------------------------------------------
@@ -375,5 +383,247 @@ availability = [
   { platform = "macos",   status = "install" },
 ]
 verifies = [
-  { format = "fmt.cbk", direction = "write", strength = "authoritative", status = "plausible", evidence = "we are the oracle; assertion is 'the restored machine still boots'" },
+  { format = "fmt.cbk",          direction = "write", strength = "authoritative", status = "plausible", evidence = "we are the oracle; assertion is 'the restored machine still boots'" },
+  { format = "fmt.raw-physical", direction = "write", strength = "authoritative", status = "plausible", evidence = "restoring to an SD card and booting it is the only real proof of the device write path" },
+]
+
+# =============================================================================
+# Cluster oracles, added 2026-08-02.
+#
+# Each of these closes a group of write gaps rather than one, which is why
+# they were worth doing before hunting any more fixtures.
+# =============================================================================
+
+# --- Compressed streams ------------------------------------------------------
+# The cheapest rows in the file: every one of these tools tests its own format
+# natively and exists everywhere.
+
+[[oracle]]
+id = "zstd-t"
+tool = "zstd -t"
+kind = "package"
+availability = [
+  { platform = "wsl",   status = "expected" },
+  { platform = "linux", status = "expected" },
+  { platform = "macos", status = "install" },
+  { platform = "windows", status = "install" },
+]
+verifies = [{ format = "fmt.zstd", direction = "write", strength = "authoritative", status = "untested" }]
+
+[[oracle]]
+id = "gzip-t"
+tool = "gzip -t"
+kind = "package"
+availability = [
+  { platform = "wsl",   status = "expected" },
+  { platform = "linux", status = "expected" },
+  { platform = "macos", status = "expected" },
+  { platform = "windows", status = "install" },
+  { platform = "mister-hps", status = "expected" },
+]
+verifies = [
+  { format = "fmt.gzip", direction = "write", strength = "authoritative", status = "untested" },
+  { format = "fmt.adz",  direction = "read",  strength = "authoritative", status = "untested" },
+]
+
+[[oracle]]
+id = "lz4-t"
+tool = "lz4 -t"
+kind = "package"
+availability = [
+  { platform = "wsl",   status = "install" },
+  { platform = "linux", status = "expected" },
+  { platform = "macos", status = "install" },
+]
+verifies = [{ format = "fmt.lz4", direction = "write", strength = "authoritative", status = "untested" }]
+
+# --- Apple floppy containers -------------------------------------------------
+
+[[oracle]]
+id = "applecommander"
+tool = "AppleCommander"
+kind = "package"
+notes = """Java, so it runs on all three desktop hosts — which is why it is
+preferred over the per-OS alternatives (CiderPress on Windows, Applesauce on
+macOS). Reads 2MG / DSK / PO / DO and lists ProDOS and DOS 3.3 volumes."""
+availability = [
+  { platform = "windows", status = "install" },
+  { platform = "linux",   status = "install" },
+  { platform = "macos",   status = "install" },
+]
+verifies = [
+  { format = "fmt.2mg",       direction = "write", strength = "structural", status = "untested" },
+  { format = "fmt.apple-dsk", direction = "read",  strength = "structural", status = "untested" },
+  { format = "fs.prodos",     direction = "write", strength = "structural", status = "untested" },
+  { format = "fs.apple-dos",  direction = "write", strength = "structural", status = "untested" },
+]
+
+[[oracle]]
+id = "applesauce"
+tool = "Applesauce"
+kind = "package"
+notes = "macOS only, but it is the reference implementation for the flux formats."
+availability = [
+  { platform = "macos",   status = "install" },
+  { platform = "windows", status = "absent" },
+  { platform = "linux",   status = "absent" },
+]
+verifies = [
+  { format = "fmt.woz",  direction = "write", strength = "authoritative", status = "untested" },
+  { format = "fmt.moof", direction = "write", strength = "authoritative", status = "untested" },
+  { format = "fmt.dc42", direction = "write", strength = "authoritative", status = "untested" },
+]
+
+# --- Japanese PC floppies ----------------------------------------------------
+
+[[oracle]]
+id = "mame-pc98"
+tool = "MAME pc9801"
+kind = "emulator"
+notes = "No PC-98 core exists on the MiSTer, so MAME's pc9801 drivers are the route for HDM and DIM."
+availability = [
+  { platform = "windows", status = "install" },
+  { platform = "linux",   status = "install" },
+  { platform = "macos",   status = "install" },
+]
+verifies = [
+  { format = "fmt.hdm", direction = "write", strength = "authoritative", status = "plausible" },
+  { format = "fmt.dim", direction = "write", strength = "authoritative", status = "plausible" },
+]
+
+# --- MiSTer cores, per machine -----------------------------------------------
+# All confirmed present on the board 2026-08-02. For these formats the core is
+# the reference implementation, so `authoritative` is the honest strength.
+
+[[oracle]]
+id = "mister-core-atari800"
+tool = "MiSTer ATARI800 core"
+kind = "hardware"
+availability = [{ platform = "mister-core", status = "expected" }]
+verifies = [
+  { format = "fs.atari-dos2",   direction = "write", strength = "authoritative", status = "plausible" },
+  { format = "fmt.atari-disk",  direction = "write", strength = "authoritative", status = "plausible" },
+]
+
+[[oracle]]
+id = "mister-core-ti99"
+tool = "MiSTer TI-99_4A core"
+kind = "hardware"
+availability = [{ platform = "mister-core", status = "expected" }]
+verifies = [
+  { format = "fs.ti99",       direction = "write", strength = "authoritative", status = "plausible" },
+  { format = "fmt.ti99-disk", direction = "write", strength = "authoritative", status = "plausible" },
+]
+
+[[oracle]]
+id = "mister-core-oric"
+tool = "MiSTer Oric core"
+kind = "hardware"
+availability = [{ platform = "mister-core", status = "expected" }]
+verifies = [{ format = "fs.oric", direction = "write", strength = "authoritative", status = "plausible" }]
+
+[[oracle]]
+id = "mister-core-spectrum"
+tool = "MiSTer Spectrum core"
+kind = "hardware"
+availability = [{ platform = "mister-core", status = "expected" }]
+verifies = [
+  { format = "fs.trdos",       direction = "write", strength = "authoritative", status = "plausible" },
+  { format = "fmt.trdos-disk", direction = "write", strength = "authoritative", status = "plausible" },
+]
+
+[[oracle]]
+id = "mister-core-coco"
+tool = "MiSTer CoCo2 / COCO3 core"
+kind = "hardware"
+availability = [{ platform = "mister-core", status = "expected" }]
+verifies = [
+  { format = "fs.os9",        direction = "write", strength = "authoritative", status = "plausible" },
+  { format = "fs.rsdos",      direction = "read",  strength = "authoritative", status = "plausible" },
+  { format = "fmt.coco-disk", direction = "write", strength = "authoritative", status = "plausible" },
+]
+
+[[oracle]]
+id = "mister-core-archie"
+tool = "MiSTer ARCHIE core"
+kind = "hardware"
+notes = "Acorn Archimedes; RISC OS reads ADFS with its own FileCore."
+availability = [{ platform = "mister-core", status = "expected" }]
+verifies = [{ format = "fs.adfs", direction = "write", strength = "authoritative", status = "plausible" }]
+
+[[oracle]]
+id = "mister-core-bbcmicro"
+tool = "MiSTer BBCMicro core"
+kind = "hardware"
+availability = [{ platform = "mister-core", status = "expected" }]
+verifies = [
+  { format = "fs.dfs",              direction = "read", strength = "authoritative", status = "plausible" },
+  { format = "fmt.acorn-dfs-disk",  direction = "read", strength = "authoritative", status = "plausible" },
+]
+
+[[oracle]]
+id = "mister-core-lisa"
+tool = "MiSTer Apple-Lisa core"
+kind = "hardware"
+notes = """Confirmed present on the board. Lisa FS was listed as having no
+oracle anywhere — the core is one, and it is the only realistic one."""
+availability = [{ platform = "mister-core", status = "expected" }]
+verifies = [{ format = "fs.lisa", direction = "read", strength = "authoritative", status = "plausible" }]
+
+# --- NTFS --------------------------------------------------------------------
+
+[[oracle]]
+id = "chkdsk"
+tool = "chkdsk"
+kind = "package"
+notes = "Windows' own NTFS checker. Relevant to R-007, where a freshly formatted volume fails its own fsck on BackupBootMismatch — chkdsk is the arbiter."
+availability = [
+  { platform = "windows", status = "expected" },
+  { platform = "linux",   status = "absent" },
+  { platform = "macos",   status = "absent" },
+]
+verifies = [{ format = "fs.ntfs", direction = "write", strength = "authoritative", status = "untested" }]
+
+[[oracle]]
+id = "mount-ntfs3"
+tool = "mount -t ntfs3"
+kind = "mount"
+notes = "In-kernel NTFS driver; absent from WSL, needs a full Linux host."
+availability = [
+  { platform = "linux", status = "install", path_hint = "linux-modules-extra" },
+  { platform = "wsl",   status = "absent" },
+]
+verifies = [{ format = "fs.ntfs", direction = "write", strength = "structural", status = "untested" }]
+
+# --- Partition schemes -------------------------------------------------------
+
+[[oracle]]
+id = "sfdisk"
+tool = "sfdisk -l"
+kind = "package"
+notes = "Reads MBR, GPT and Sun disk labels. MBR and GPT are the two commonest schemes we write and had no oracle at all until now."
+availability = [
+  { platform = "wsl",        status = "expected" },
+  { platform = "linux",      status = "expected" },
+  { platform = "mister-hps", status = "expected" },
+]
+verifies = [
+  { format = "part.mbr", direction = "write", strength = "structural", status = "untested" },
+  { format = "part.gpt", direction = "write", strength = "structural", status = "untested" },
+  { format = "part.sun", direction = "read",  strength = "structural", status = "untested" },
+]
+
+[[oracle]]
+id = "diskutil"
+tool = "diskutil list"
+kind = "package"
+notes = "APM is an Apple scheme, so Apple's own tool is the authority."
+availability = [
+  { platform = "macos",   status = "expected" },
+  { platform = "linux",   status = "absent" },
+  { platform = "windows", status = "absent" },
+]
+verifies = [
+  { format = "part.apm", direction = "write", strength = "authoritative", status = "untested" },
+  { format = "part.gpt", direction = "write", strength = "structural",    status = "untested" },
 ]

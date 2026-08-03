@@ -964,5 +964,10 @@ id = "part.none"
 kind = "partition"
 name = "None (superfloppy)"
 we_read = true
-we_write = true
-notes = "R-009: detection misses JFS, UFS1/2 and ReiserFS"
+we_write = false
+notes = """R-009: detection misses JFS, UFS1/2 and ReiserFS.
+
+Deliberately we_write = false. A superfloppy is defined by the ABSENCE of a
+partition table, so there is nothing for an oracle to inspect — any filesystem
+oracle that reads the volume at offset 0 has already proved it. Listing it as
+a write path would manufacture a permanent unfillable gap."""
