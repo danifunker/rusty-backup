@@ -167,6 +167,19 @@ pub enum HdCommand {
     /// same step; otherwise it comes out blank for `import` / `put`.
     #[command(name = "sgi-efs")]
     SgiEfs(super::new_sgi_hdd::NewSgiHddArgs),
+
+    /// MBR (DOS / PC) disk with partitions you size and type yourself. The
+    /// partitions come out empty — fill them with `write --partition N` or
+    /// format them with `reformat`.
+    Mbr(super::new_partitioned_hd::PartitionedHdArgs),
+
+    /// GPT (UEFI, modern macOS / Linux) disk with partitions you size and
+    /// type yourself.
+    Gpt(super::new_partitioned_hd::PartitionedHdArgs),
+
+    /// APM (Apple Partition Map) disk for classic Mac OS / PowerPC, with
+    /// partitions you size and type yourself.
+    Apm(super::new_partitioned_hd::PartitionedHdArgs),
 }
 
 /// Filesystems offered under `new floppy`. Converts to the master [`FsKind`].
@@ -451,6 +464,15 @@ pub fn run(cmd: NewCommand) -> Result<()> {
         NewCommand::Hd { cmd } => match cmd {
             HdCommand::X68k(args) => super::new_x68k_hdd::run(args),
             HdCommand::SgiEfs(args) => super::new_sgi_hdd::run(args),
+            HdCommand::Mbr(args) => super::new_partitioned_hd::run(
+                super::new_partitioned_hd::PartitionedHdCommand::Mbr(args),
+            ),
+            HdCommand::Gpt(args) => super::new_partitioned_hd::run(
+                super::new_partitioned_hd::PartitionedHdCommand::Gpt(args),
+            ),
+            HdCommand::Apm(args) => super::new_partitioned_hd::run(
+                super::new_partitioned_hd::PartitionedHdCommand::Apm(args),
+            ),
         },
     }
 }

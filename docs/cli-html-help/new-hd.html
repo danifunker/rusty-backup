@@ -14,6 +14,9 @@
 <ul class="verbs">
 <li><a href="new-hd-x68k.html"><code>x68k</code></a><span class="desc">Sharp X68000 HDD (SASI / SCSI): X68K partition table + IPL stub + a blank or donor-cloned Human68k partition</span></li>
 <li><a href="new-hd-sgi-efs.html"><code>sgi-efs</code></a><span class="desc">dvh-wrapped IRIX HDD: an SGI volume header + partition table wrapping a formatted EFS root partition, mountable by IRIX 5.3-6.5. Pass `--from-dir` to fill the root filesystem from a host folder in the same step; otherwise it comes out blank for `import` / `put`</span></li>
+<li><a href="new-hd-mbr.html"><code>mbr</code></a><span class="desc">MBR (DOS / PC) disk with partitions you size and type yourself. The partitions come out empty — fill them with `write --partition N` or format them with `reformat`</span></li>
+<li><a href="new-hd-gpt.html"><code>gpt</code></a><span class="desc">GPT (UEFI, modern macOS / Linux) disk with partitions you size and type yourself</span></li>
+<li><a href="new-hd-apm.html"><code>apm</code></a><span class="desc">APM (Apple Partition Map) disk for classic Mac OS / PowerPC, with partitions you size and type yourself</span></li>
 </ul>
 <footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_docs</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
 </body></html>
