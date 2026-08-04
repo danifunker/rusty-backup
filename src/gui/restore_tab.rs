@@ -809,6 +809,13 @@ impl RestoreTab {
                             partition::format_size(target_size),
                         ),
                     );
+
+                    // Sizes fitting is not the same as the layout fitting: with
+                    // Original alignment each partition keeps its absolute start,
+                    // so shrinking leaves gaps and the last partition can still
+                    // run off the end. Project the real layout the engine will
+                    // build rather than letting Restore fail after the click.
+                    self.show_layout_fit_warning(ui, target_size);
                 }
             });
         }
@@ -1712,6 +1719,57 @@ impl RestoreTab {
     }
 
     /// Resolve the alignment radio into a `RestoreAlignment`.
+    /// Warn when the projected layout overruns the target even though the
+    /// sizes add up — the Original-alignment case, where positions are frozen.
+    fn show_layout_fit_warning(&self, ui: &mut egui::Ui, target_size: u64) {
+        let Some(metadata) = self.backup_metadata.as_ref() else {
+            return;
+        };
+        let alignment = self.resolve_alignment();
+        let sizes = self.build_partition_sizes(self.target_is_device);
+        // Ask the engine's own layout function so the projection can't drift.
+        let overrides = match rusty_backup::restore::calculate_restore_layout(
+            metadata,
+            &alignment,
+            &sizes,
+            target_size,
+        ) {
+            Ok(o) => o,
+            Err(e) => {
+                ui.colored_label(
+                    egui::Color32::from_rgb(255, 100, 100),
+                    format!("This layout will not fit: {e}"),
+                );
+                if matches!(alignment, RestoreAlignment::Original) {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(255, 180, 80),
+                        "Original alignment keeps every partition at its \
+                             original position, so shrinking only leaves gaps. \
+                             Choose 1 MB boundaries or Custom to repack them \
+                             from the start of the disk.",
+                    );
+                }
+                return;
+            }
+        };
+
+        let end_bytes = overrides
+            .iter()
+            .map(|o| o.effective_start_lba() * 512 + o.export_size)
+            .max()
+            .unwrap_or(0);
+        if end_bytes > target_size {
+            ui.colored_label(
+                egui::Color32::from_rgb(255, 100, 100),
+                format!(
+                    "Layout ends at {} but the target holds {}",
+                    partition::format_size(end_bytes),
+                    partition::format_size(target_size),
+                ),
+            );
+        }
+    }
+
     fn resolve_alignment(&self) -> RestoreAlignment {
         match self.alignment_choice {
             AlignmentChoice::Original => RestoreAlignment::Original,

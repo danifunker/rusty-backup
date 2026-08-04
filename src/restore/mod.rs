@@ -179,6 +179,22 @@ fn restore_size_floor(
     }
 }
 
+/// Extra guidance for an overrun, when the alignment choice is the cause.
+///
+/// `Original` keeps every partition at its absolute start, so shrinking only
+/// opens gaps and a tail partition still runs off a smaller disk. The other
+/// alignments repack from the front, which is what actually reclaims the space.
+fn repack_hint(alignment: &RestoreAlignment) -> &'static str {
+    match alignment {
+        RestoreAlignment::Original => {
+            " Original alignment keeps each partition at its original position, \
+             so shrinking only leaves gaps behind them. Choose 1 MB or Custom \
+             alignment to repack the partitions from the start of the disk."
+        }
+        _ => "",
+    }
+}
+
 pub fn calculate_restore_layout(
     metadata: &BackupMetadata,
     alignment: &RestoreAlignment,
@@ -372,10 +388,11 @@ pub fn calculate_restore_layout(
         let end_lba = ov.effective_start_lba() + ov.export_size / 512;
         if end_lba > usable_sectors {
             bail!(
-                "Partition {} would end at LBA {} which exceeds usable area ({} sectors)",
+                "Partition {} would end at LBA {} which exceeds usable area ({} sectors).{}",
                 ov.index,
                 end_lba,
                 usable_sectors,
+                repack_hint(alignment),
             );
         }
     }
@@ -511,10 +528,11 @@ fn calculate_apm_restore_layout(
         let end_lba = ov.effective_start_lba() + ov.export_size / 512;
         if end_lba > usable_sectors {
             bail!(
-                "Partition {} would end at LBA {} which exceeds usable area ({} sectors)",
+                "Partition {} would end at LBA {} which exceeds usable area ({} sectors).{}",
                 ov.index,
                 end_lba,
                 usable_sectors,
+                repack_hint(alignment),
             );
         }
     }
@@ -1940,10 +1958,11 @@ pub fn calculate_clonezilla_restore_layout(
         let end_lba = ov.effective_start_lba() + ov.export_size / 512;
         if end_lba > usable_sectors {
             bail!(
-                "Partition {} would end at LBA {} which exceeds usable area ({} sectors)",
+                "Partition {} would end at LBA {} which exceeds usable area ({} sectors).{}",
                 ov.index,
                 end_lba,
                 usable_sectors,
+                repack_hint(alignment),
             );
         }
     }
@@ -2781,6 +2800,119 @@ mod tests {
     use crate::backup::single_file_chd::{self, SingleFileChdInputs};
     use crate::partition::PartitionTable;
     use std::io::BufReader;
+
+    /// One APM partition at an absolute position, sized in bytes.
+    fn apm_part(index: usize, start_lba: u64, size: u64, minimum: u64) -> PartitionMetadata {
+        PartitionMetadata {
+            index,
+            type_name: "Apple_HFS".to_string(),
+            partition_type_byte: 0xAF,
+            start_lba,
+            start_byte: None,
+            original_size_bytes: size,
+            // Compacted at backup time, so the floor is the smaller imaged size
+            // — that is what makes Minimum meaningful on restore.
+            imaged_size_bytes: minimum,
+            compressed_files: vec![],
+            checksum: String::new(),
+            resized: false,
+            compacted: true,
+            is_logical: false,
+            partition_type_string: Some("Apple_HFS".to_string()),
+            minimum_size_bytes: Some(minimum),
+            defragmented_min_size_bytes: None,
+            hfsplus_signature: None,
+            defragmented_clone: false,
+        }
+    }
+
+    fn apm_metadata(parts: Vec<PartitionMetadata>, source_size: u64) -> BackupMetadata {
+        BackupMetadata {
+            version: 1,
+            created: "2026-08-04T00:00:00Z".to_string(),
+            source_device: "/dev/disk8".to_string(),
+            source_size_bytes: source_size,
+            partition_table_type: "APM".to_string(),
+            checksum_type: "none".to_string(),
+            compression_type: "none".to_string(),
+            split_size_mib: None,
+            sector_by_sector: false,
+            layout: BackupLayout::PerPartition,
+            container: None,
+            container_logical_size: None,
+            container_sha1: None,
+            size_policy: None,
+            alignment: AlignmentMetadata {
+                detected_type: "Custom".to_string(),
+                first_partition_lba: 800,
+                alignment_sectors: 16,
+                heads: 0,
+                sectors_per_track: 0,
+            },
+            partitions: parts,
+            bad_sectors: vec![],
+            extended_container: None,
+        }
+    }
+
+    /// The 2026-08-04 report: a 119.2 GiB APM disk restored onto 111.8 GiB with
+    /// partitions set to Minimum. Under Original alignment every partition keeps
+    /// its absolute start, so the tail one still runs off the end however small
+    /// it is made — repacking is the only thing that reclaims the space.
+    #[test]
+    fn original_alignment_cannot_shrink_a_disk_but_repacking_can() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let source = 119 * GIB;
+        let target = 111 * GIB;
+        // Three ~39 GiB partitions laid end to end, each shrinkable to ~34 GiB.
+        let parts = vec![
+            apm_part(9, 800, 39 * GIB, 34 * GIB),
+            apm_part(11, 800 + 39 * GIB / 512, 39 * GIB, 34 * GIB),
+            apm_part(13, 800 + 78 * GIB / 512, 39 * GIB, 34 * GIB),
+        ];
+        let metadata = apm_metadata(parts, source);
+        let sizes: Vec<RestorePartitionSize> = [9, 11, 13]
+            .iter()
+            .map(|i| RestorePartitionSize {
+                index: *i,
+                size_choice: RestoreSizeChoice::Minimum,
+            })
+            .collect();
+
+        // Positions frozen: the tail partition still ends past the target.
+        let Err(err) =
+            calculate_restore_layout(&metadata, &RestoreAlignment::Original, &sizes, target)
+        else {
+            panic!("Original alignment must not fit");
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("exceeds usable area"), "{msg}");
+        assert!(
+            msg.contains("repack") || msg.contains("Choose 1 MB"),
+            "the error must say how to fix it: {msg}",
+        );
+
+        // Repacked at the disk's own 16-sector alignment: 3 x 34 GiB fits in 111.
+        let layout =
+            calculate_restore_layout(&metadata, &RestoreAlignment::Custom(16), &sizes, target)
+                .expect("repacking must fit");
+        let end = layout
+            .iter()
+            .map(|o| o.effective_start_lba() * 512 + o.export_size)
+            .max()
+            .unwrap();
+        assert!(
+            end <= target,
+            "repacked layout ends at {end}, target {target}"
+        );
+    }
+
+    #[test]
+    fn repack_hint_only_fires_for_original_alignment() {
+        assert!(!repack_hint(&RestoreAlignment::Original).is_empty());
+        assert!(repack_hint(&RestoreAlignment::Modern1MB).is_empty());
+        assert!(repack_hint(&RestoreAlignment::Custom(16)).is_empty());
+    }
 
     fn build_test_mbr(part_sectors: u32) -> [u8; 512] {
         let mut mbr = [0u8; 512];
