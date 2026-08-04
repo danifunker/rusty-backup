@@ -26,8 +26,16 @@ use sha2::{Digest, Sha256};
 use crate::backup::LogMessage;
 use crate::cli::logging::log_stderr;
 use crate::cli::output::{emit_envelope, require_non_flat, Envelope, OutputFormat};
+#[cfg(feature = "chd")]
+use crate::optical::convert::{chd_to_bincue, chd_to_iso, to_chd};
+
+/// Message for a build that has `optical` but not `chd`.
+#[cfg(not(feature = "chd"))]
+fn no_chd_support(action: &str) -> String {
+    format!("{action} needs CHD support, which this build was compiled without (enable the `chd` feature)")
+}
 use crate::optical::{
-    convert::{bincue_to_iso, chd_to_bincue, chd_to_iso, iso_to_bincue, to_chd, ConvertProgress},
+    convert::{bincue_to_iso, iso_to_bincue, ConvertProgress},
     rip::{run_rip, OpticalTarget, RipConfig, RipFormat, RipProgress},
 };
 use crate::partition::format_size;
@@ -455,10 +463,16 @@ fn run_convert_verb(args: ConvertArgs) -> Result<()> {
     let chd_options = Some(ChdOptions::defaults_for(ChdProfile::Cd));
     let worker = std::thread::spawn(move || -> Result<()> {
         match args.format {
+            #[cfg(feature = "chd")]
             OpticalConvertFmt::Chd => to_chd(&source, &dest, chd_options, progress_thread),
+            #[cfg(not(feature = "chd"))]
+            OpticalConvertFmt::Chd => bail!(no_chd_support("converting to CHD")),
             OpticalConvertFmt::Iso => match src_ext.as_str() {
                 "cue" => bincue_to_iso(&source, &dest, progress_thread),
+                #[cfg(feature = "chd")]
                 "chd" => chd_to_iso(&source, &dest, progress_thread),
+                #[cfg(not(feature = "chd"))]
+                "chd" => bail!(no_chd_support("reading a CHD")),
                 _ => bail!(
                     "don't know how to convert {} to ISO; source must be .cue or .chd",
                     source.display()
@@ -469,7 +483,10 @@ fn run_convert_verb(args: ConvertArgs) -> Result<()> {
                     let bin = dest.with_extension("bin");
                     iso_to_bincue(&source, &bin, &dest, progress_thread)
                 }
+                #[cfg(feature = "chd")]
                 "chd" => chd_to_bincue(&source, &dest, progress_thread),
+                #[cfg(not(feature = "chd"))]
+                "chd" => bail!(no_chd_support("reading a CHD")),
                 _ => bail!(
                     "don't know how to convert {} to BIN/CUE; source must be .iso or .chd",
                     source.display()
