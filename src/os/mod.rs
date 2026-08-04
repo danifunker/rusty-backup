@@ -792,7 +792,7 @@ pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
     {
         let file = File::open(path)?;
         Ok(ElevatedSource {
-            file,
+            file: SourceHandle::File(file),
             temp_path: None,
         })
     }
