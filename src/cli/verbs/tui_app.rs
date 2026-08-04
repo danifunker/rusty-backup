@@ -1358,11 +1358,19 @@ const CD_TARGETS: &[(&str, CdTarget)] = &[("SGI IRIX (EFS CD, slot-7 SYSV)", CdT
 enum HdPlatform {
     X68k,
     SgiEfs,
+    /// Generic tables. The wizard builds one partition filling the disk;
+    /// multi-partition layouts stay on the CLI, which takes `--partition`.
+    Mbr,
+    Gpt,
+    Apm,
 }
 
 const HD_PLATFORMS: &[(&str, HdPlatform)] = &[
     ("Sharp X68000 (Human68k)", HdPlatform::X68k),
     ("SGI IRIX (EFS, dvh)", HdPlatform::SgiEfs),
+    ("MBR (DOS / PC), one partition", HdPlatform::Mbr),
+    ("GPT (UEFI), one partition", HdPlatform::Gpt),
+    ("APM (Apple / PowerPC), one partition", HdPlatform::Apm),
 ];
 
 /// Filesystems offered under `new floppy` in the wizard. CP/M is omitted here
@@ -5539,6 +5547,22 @@ impl App {
                                 include_appledouble: false,
                             })
                         }
+                        HdPlatform::Mbr | HdPlatform::Gpt | HdPlatform::Apm => {
+                            // One partition over the whole disk, at the CLI's
+                            // default type and alignment.
+                            let args = crate::cli::verbs::new_partitioned_hd::PartitionedHdArgs {
+                                image: path.clone(),
+                                size: size.clone(),
+                                partitions: vec!["rest".to_string()],
+                                align: "1M".to_string(),
+                                force: false,
+                            };
+                            match platform {
+                                HdPlatform::Mbr => HdCommand::Mbr(args),
+                                HdPlatform::Gpt => HdCommand::Gpt(args),
+                                _ => HdCommand::Apm(args),
+                            }
+                        }
                     },
                 }
             }
@@ -8615,8 +8639,9 @@ impl App {
                 }
                 lines.push(Line::raw(""));
                 lines.push(Line::styled(
-                    "Hard disks build with their defaults; donor-cloning and custom \
-                     partition layouts need the CLI (`rb-cli new hd ...`). \
+                    "Hard disks build with their defaults - MBR / GPT / APM get one \
+                     partition over the whole disk. Donor-cloning and multi-partition \
+                     layouts need the CLI (`rb-cli new hd <table> --partition ...`). \
                      CD-ROM images: the Optical tab.",
                     self.palette.dim(),
                 ));
