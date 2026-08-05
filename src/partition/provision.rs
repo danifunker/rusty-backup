@@ -842,6 +842,7 @@ pub fn describe_placed(kind: TableKind, index: usize, p: &Placed) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
 
     const DEFAULT_ALIGN: u64 = 1024 * 1024;
 
@@ -987,13 +988,12 @@ mod tests {
     #[test]
     fn rdb_carries_dos_types_and_drive_names() {
         use crate::partition::PartitionTable;
-        use std::io::Cursor;
 
-        let disk = 32 * 1024 * 1024;
+        let disk = 200 * 1024 * 1024;
         let geometry = Geometry::default();
         let specs = vec![
             PartSpec {
-                size: Some(8 * 1024 * 1024),
+                size: Some(60 * 1024 * 1024),
                 type_text: Some("DOS\\3".to_string()),
                 name: Some("WORK".to_string()),
             },
@@ -1010,10 +1010,7 @@ mod tests {
             default_align(TableKind::Rdb, geometry),
         )
         .unwrap();
-        let mut buf = Cursor::new(vec![0u8; disk as usize]);
-        write_table(&mut buf, TableKind::Rdb, &placed, disk, geometry).unwrap();
-
-        let mut reader = Cursor::new(buf.into_inner());
+        let mut reader = table_on_temp_disk(TableKind::Rdb, &placed, disk, geometry);
         let table = PartitionTable::detect(&mut reader).unwrap();
         let PartitionTable::Rdb(rdb) = &table else {
             panic!("did not reparse as RDB: {table:?}");
@@ -1039,13 +1036,12 @@ mod tests {
     #[test]
     fn sun_label_checksums_and_reserves_the_backup_slice() {
         use crate::partition::sun::{SunDiskLabel, SUN_TAG_WHOLE_DISK};
-        use std::io::Cursor;
 
-        let disk = 32 * 1024 * 1024;
+        let disk = 200 * 1024 * 1024;
         let geometry = Geometry::default();
         let specs = vec![
             PartSpec {
-                size: Some(8 * 1024 * 1024),
+                size: Some(20 * 1024 * 1024),
                 type_text: Some("root".to_string()),
                 name: None,
             },
@@ -1058,12 +1054,10 @@ mod tests {
         ];
         let align = default_align(TableKind::Sun, geometry);
         let placed = place(&specs, TableKind::Sun, disk, align).unwrap();
-        let mut buf = Cursor::new(vec![0u8; disk as usize]);
-        write_table(&mut buf, TableKind::Sun, &placed, disk, geometry).unwrap();
-        let img = buf.into_inner();
+        let sector = first_sector_of(table_on_temp_disk(TableKind::Sun, &placed, disk, geometry));
 
-        assert!(SunDiskLabel::detect(&img[..512]), "checksum or magic wrong");
-        let label = SunDiskLabel::parse(&img[..512]).unwrap();
+        assert!(SunDiskLabel::detect(&sector), "checksum or magic wrong");
+        let label = SunDiskLabel::parse(&sector).unwrap();
         assert!(label.vtoc_valid);
         assert_eq!(label.ntrks, geometry.heads);
         assert_eq!(label.nsect, geometry.sectors_per_track);
@@ -1087,12 +1081,11 @@ mod tests {
     #[test]
     fn ahdi_stamps_its_checksum_and_promotes_oversized_gem_to_bgm() {
         use crate::partition::atari::{AhdiPartitionKind, AhdiTable};
-        use std::io::Cursor;
 
-        let disk = 48 * 1024 * 1024;
+        let disk = 64 * 1024 * 1024;
         let specs = vec![
             spec(Some(8 * 1024 * 1024)),
-            spec(Some(20 * 1024 * 1024)),
+            spec(Some(24 * 1024 * 1024)),
             PartSpec {
                 size: None,
                 type_text: Some("RAW".to_string()),
@@ -1104,18 +1097,14 @@ mod tests {
         assert_eq!(placed[1].type_text, "BGM", "24 MiB must be promoted");
         assert_eq!(placed[2].type_text, "RAW", "an explicit tag is left alone");
 
-        let mut buf = Cursor::new(vec![0u8; disk as usize]);
-        write_table(
-            &mut buf,
+        let sector = first_sector_of(table_on_temp_disk(
             TableKind::Atari,
             &placed,
             disk,
             Geometry::default(),
-        )
-        .unwrap();
-        let img = buf.into_inner();
+        ));
 
-        let table = AhdiTable::parse_root(&img[..512]).unwrap();
+        let table = AhdiTable::parse_root(&sector).unwrap();
         assert!(table.checksum_valid, "root sector word-sum is not 0x1234");
         assert!(matches!(table.primary[0].kind, AhdiPartitionKind::Gem));
         assert!(matches!(table.primary[1].kind, AhdiPartitionKind::Bgm));
@@ -1131,9 +1120,8 @@ mod tests {
 
     #[test]
     fn rdb_refuses_a_disk_smaller_than_two_cylinders() {
-        use std::io::Cursor;
         let geometry = Geometry::default();
-        let mut buf = Cursor::new(vec![0u8; 4096]);
+        let mut buf = std::io::Cursor::new(vec![0u8; 4096]);
         let err = write_table(&mut buf, TableKind::Rdb, &[], 4096, geometry)
             .expect_err("one cylinder is 504 KiB");
         assert!(format!("{err:#}").contains("two cylinders"), "{err:#}");
@@ -1163,30 +1151,49 @@ mod tests {
         }
     }
 
+    /// Write `placed` onto a sparse temp file sized `disk`, rewound and ready
+    /// to re-parse.
+    ///
+    /// A file, not a `Vec` — a realistic disk size is hundreds of MiB, and that
+    /// much contiguous heap fails outright on 32-bit Windows (it broke the
+    /// i686 CI leg). `set_len` costs no RAM and nothing but a hole on disk.
+    fn table_on_temp_disk(
+        kind: TableKind,
+        placed: &[Placed],
+        disk: u64,
+        geometry: Geometry,
+    ) -> std::fs::File {
+        let mut file = tempfile::tempfile().expect("temp disk");
+        file.set_len(disk).expect("size the temp disk");
+        write_table(&mut file, kind, placed, disk, geometry)
+            .unwrap_or_else(|e| panic!("{} write: {e:#}", kind.label()));
+        file.seek(SeekFrom::Start(0)).expect("rewind");
+        file
+    }
+
+    /// The first 512 bytes of a temp disk, for the tables that keep their whole
+    /// table in sector 0.
+    fn first_sector_of(mut disk: std::fs::File) -> [u8; 512] {
+        let mut sector = [0u8; 512];
+        disk.read_exact(&mut sector).expect("read the table sector");
+        sector
+    }
+
     /// Round-trip every writable table through `write_table` and re-parse it,
     /// which is what proves the GUI's in-memory path matches the CLI's file one.
-    ///
-    /// Disks here are deliberately small: this materializes the whole thing in
-    /// RAM once per table, and the 32-bit Windows target runs out of address
-    /// space well before it runs out of memory.
     #[test]
     fn every_writable_table_writes_and_reparses() {
         use crate::partition::PartitionTable;
-        use std::io::Cursor;
 
-        let disk = 64 * 1024 * 1024;
+        let disk = 512 * 1024 * 1024;
         for &kind in WRITABLE_TABLES {
             let geometry = Geometry::default();
             let align = default_align(kind, geometry);
-            let specs = vec![spec(Some(8 * 1024 * 1024)), spec(None)];
+            let specs = vec![spec(Some(64 * 1024 * 1024)), spec(None)];
             let placed = place(&specs, kind, disk, align)
                 .unwrap_or_else(|e| panic!("{} place: {e:#}", kind.label()));
 
-            let mut buf = Cursor::new(vec![0u8; disk as usize]);
-            write_table(&mut buf, kind, &placed, disk, geometry)
-                .unwrap_or_else(|e| panic!("{} write: {e:#}", kind.label()));
-
-            let mut reader = Cursor::new(buf.into_inner());
+            let mut reader = table_on_temp_disk(kind, &placed, disk, geometry);
             let table = PartitionTable::detect(&mut reader)
                 .unwrap_or_else(|e| panic!("{} reparse: {e:#}", kind.label()));
             assert_eq!(
@@ -1210,11 +1217,10 @@ mod tests {
     #[test]
     fn named_entries_survive_the_round_trip() {
         use crate::partition::PartitionTable;
-        use std::io::Cursor;
 
-        let disk = 32 * 1024 * 1024;
+        let disk = 128 * 1024 * 1024;
         let named = |n: &str| PartSpec {
-            size: Some(4 * 1024 * 1024),
+            size: Some(32 * 1024 * 1024),
             type_text: None,
             name: Some(n.to_string()),
         };
@@ -1228,10 +1234,7 @@ mod tests {
             let specs = vec![named(wanted)];
             let geometry = Geometry::default();
             let placed = place(&specs, kind, disk, default_align(kind, geometry)).unwrap();
-            let mut buf = Cursor::new(vec![0u8; disk as usize]);
-            write_table(&mut buf, kind, &placed, disk, geometry).unwrap();
-
-            let mut reader = Cursor::new(buf.into_inner());
+            let mut reader = table_on_temp_disk(kind, &placed, disk, geometry);
             let table = PartitionTable::detect(&mut reader).unwrap();
             let names = format!("{:?}", table.partitions());
             assert!(

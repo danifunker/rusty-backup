@@ -497,15 +497,24 @@ pub fn create_blank_xfs(size_bytes: u64, label: &str) -> Result<Vec<u8>, Filesys
 mod tests {
     use super::*;
     use crate::fs::filesystem::Filesystem;
-    use std::io::Cursor;
 
     /// 32 MiB is the two-AG floor, 64 MiB the first four-AG size, 300 MiB the
     /// smallest mkfs.xfs will itself make — and the one with non-power-of-two
-    /// AGs, which is what caught the `bb_blkno` bug. Each is materialized in
-    /// RAM, so anything larger is checked through `plan` instead: the 32-bit
-    /// Windows target runs out of address space long before it runs out of
-    /// memory.
-    const SIZES: &[u64] = &[32 << 20, 64 << 20, 300 << 20];
+    /// AGs, which is what caught the `bb_blkno` bug. 1 GiB gives four full ones.
+    const SIZES: &[u64] = &[32 << 20, 64 << 20, 300 << 20, 1 << 30];
+
+    /// Format `size` onto a sparse temp file and hand back the opened volume.
+    ///
+    /// A file, not the in-memory `create_blank_xfs`: only a fraction of an XFS
+    /// volume is populated, and a gigabyte of contiguous heap fails outright on
+    /// 32-bit Windows.
+    fn blank_on_temp_disk(size: u64) -> crate::fs::xfs::XfsFilesystem<std::fs::File> {
+        let mut file = tempfile::tempfile().expect("temp disk");
+        let len = write_blank_xfs(&mut file, 0, size, "rbtest")
+            .unwrap_or_else(|e| panic!("{size}: format: {e}"));
+        file.set_len(len).expect("size the temp disk");
+        crate::fs::xfs::XfsFilesystem::open(file, 0).unwrap_or_else(|e| panic!("{size}: open: {e}"))
+    }
 
     #[test]
     fn geometry_matches_mkfs_for_a_512_mib_volume() {
@@ -516,6 +525,17 @@ mod tests {
         assert_eq!(l.agblklog, 15);
         assert_eq!(l.rootino, 64);
         assert_eq!(l.free_start(1), 8);
+    }
+
+    /// `create_blank_xfs` is what the `batch` builder calls, so it needs its
+    /// own check — at the smallest size, since it does materialize the volume.
+    #[test]
+    fn create_blank_xfs_returns_a_readable_image() {
+        let img = create_blank_xfs(32 << 20, "rbtest").unwrap();
+        let mut fs = crate::fs::xfs::XfsFilesystem::open(std::io::Cursor::new(img), 0).unwrap();
+        assert_eq!(fs.volume_label(), Some("rbtest"));
+        let root = fs.root().unwrap();
+        assert!(fs.list_directory(&root).unwrap().is_empty());
     }
 
     #[test]
@@ -553,9 +573,7 @@ mod tests {
     #[test]
     fn every_size_round_trips_through_our_own_reader() {
         for &size in SIZES {
-            let img = create_blank_xfs(size, "rbtest").unwrap();
-            let mut fs = crate::fs::xfs::XfsFilesystem::open(Cursor::new(img), 0)
-                .unwrap_or_else(|e| panic!("{size}: open: {e}"));
+            let mut fs = blank_on_temp_disk(size);
             let root = fs.root().unwrap();
             assert!(
                 fs.list_directory(&root).unwrap().is_empty(),
@@ -568,8 +586,7 @@ mod tests {
     #[test]
     fn our_own_fsck_finds_a_fresh_volume_clean() {
         for &size in SIZES {
-            let img = create_blank_xfs(size, "rbtest").unwrap();
-            let mut fs = crate::fs::xfs::XfsFilesystem::open(Cursor::new(img), 0).unwrap();
+            let mut fs = blank_on_temp_disk(size);
             let report = fs
                 .run_fsck()
                 .unwrap_or_else(|e| panic!("{size}: fsck: {e}"));
