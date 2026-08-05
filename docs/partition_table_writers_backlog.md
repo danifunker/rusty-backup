@@ -194,3 +194,16 @@ Two things worth knowing if you touch it:
 **Validation.** `scripts/xfs-oracle.sh sweep` formats at a range of sizes and
 runs the real `xfs_repair -n` on each over SSH; clean from 32 MiB to 16 GiB
 against xfsprogs 6.6.0.
+
+The motivating case this page opened with now closes end to end:
+
+```
+rb-cli new volume xfs root.xfs --size 300M --name IRIXROOT
+rb-cli new hd sgi disk.img --size 512M \
+    --partition 300M:XFS --partition rest:XFS --fill 1=root.xfs
+```
+
+gives an SGI volume header whose first partition is a real XFS filesystem —
+`rb-cli inspect` and `ls` browse it, and `xfs_repair -n` on the slice cut out
+at its declared offset comes back clean. There is still no
+`rb-cli reformat --fs xfs` (reformat remains HFS-only); `--fill` is the path.
