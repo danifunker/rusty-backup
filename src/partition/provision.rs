@@ -295,16 +295,23 @@ pub fn place(
     for (i, spec) in specs.iter().enumerate() {
         let start = round_up(cursor, align);
         let size = match spec.size {
-            Some(n) => round_up(n, gran),
+            Some(n) => {
+                // Check what was asked for, not what it rounds to, so a
+                // sub-sector request is still refused rather than silently
+                // becoming one sector.
+                if n < SECTOR {
+                    bail!("partition {} is smaller than one sector", i + 1);
+                }
+                round_up(n, gran)
+            }
+            // `rest` rounds down instead: rounding it up would run past the
+            // end of the disk it is defined as filling.
             None => usable_end
                 .checked_sub(start)
                 .map(|n| (n / gran) * gran)
-                .filter(|n| *n > 0)
+                .filter(|n| *n >= SECTOR)
                 .ok_or_else(|| anyhow::anyhow!("no space left for the `rest` partition"))?,
         };
-        if size < SECTOR {
-            bail!("partition {} is smaller than one sector", i + 1);
-        }
         let end = start
             .checked_add(size)
             .filter(|e| *e <= usable_end)
@@ -893,6 +900,18 @@ mod tests {
             placed[1].end_byte(),
         );
         assert!(placed[1].size_bytes > 100 * 1024 * 1024);
+    }
+
+    /// Rounding a requested size up to the table's granularity must not turn
+    /// a nonsense request into a valid one-sector partition.
+    #[test]
+    fn a_sub_sector_request_is_still_refused() {
+        let specs = vec![spec(Some(300))];
+        for kind in [TableKind::Mbr, TableKind::Rdb] {
+            let err = place(&specs, kind, 200 * 1024 * 1024, DEFAULT_ALIGN)
+                .expect_err("300 bytes is not a partition");
+            assert!(format!("{err:#}").contains("one sector"), "{err:#}");
+        }
     }
 
     #[test]
