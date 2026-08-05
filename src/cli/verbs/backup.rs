@@ -101,9 +101,9 @@ pub struct BackupArgs {
     #[arg(long)]
     pub defrag: bool,
 
-    /// Per-partition filter — comma-separated 1-based indices to
-    /// include (e.g. `1,3,4`; `1` is the first partition, matching the
-    /// `img@N` selector). Default is "all partitions".
+    /// Per-partition filter — comma-separated selectors to include, in any of
+    /// the `IMG@…` forms: `1,3` (the `idx` column of `inspect`), `s6,s7` (the
+    /// table's own slots) or `DH0,DH1`. Default is "all partitions".
     #[arg(long)]
     pub partitions: Option<String>,
 
@@ -127,8 +127,8 @@ pub fn run(args: BackupArgs) -> Result<()> {
         .name
         .clone()
         .unwrap_or_else(|| default_name(&args.source));
-    let partition_filter = match args.partitions {
-        Some(list) => Some(parse_indices(&list)?),
+    let partition_filter = match &args.partitions {
+        Some(list) => Some(resolve_partition_filter(&args.source, list)?),
         None => None,
     };
 
@@ -211,22 +211,31 @@ fn parse_checksum(s: &str) -> Option<ChecksumKind> {
     }
 }
 
-/// Parse the `--partitions` value: comma-separated **1-based** indices (the
-/// same numbering as the `img@N` selector, where `1` is the first partition)
-/// into the **0-based** indices `partition_filter` matches against
-/// `PartitionInfo::index`. So `--partitions 1,3` keeps the 1st and 3rd
-/// partitions. Rejects `0` (1-based has no partition 0) and non-numbers.
-fn parse_indices(s: &str) -> Result<Vec<usize>> {
-    s.split(',')
-        .map(|p| {
-            let trimmed = p.trim();
-            let n = trimmed
-                .parse::<usize>()
-                .map_err(|_| anyhow!("invalid partition index {trimmed:?}"))?;
-            if n == 0 {
-                bail!("partition indices are 1-based (the first partition is 1, matching img@N)")
+/// Resolve `--partitions` to the table slots `partition_filter` matches against
+/// `PartitionInfo::index`. Each element accepts any `IMG@…` form.
+///
+/// Resolving here rather than at parse time means an entry that names nothing
+/// is an error, not an empty backup: the old parser turned `--partitions 1`
+/// into slot 0, which on an APM disk is the partition map, and produced a
+/// backup folder with no partitions in it and no complaint.
+fn resolve_partition_filter(source: &std::path::Path, list: &str) -> Result<Vec<usize>> {
+    let mut probe = crate::model::source_reader::open_peeled_read_with_entry(source, None, None)
+        .with_context(|| format!("opening {} to read its partition table", source.display()))?;
+    let table = crate::partition::PartitionTable::detect(&mut probe)
+        .map_err(|e| anyhow!("detecting the partition table on {}: {e}", source.display()))?;
+    let partitions = table.partitions();
+
+    list.split(',')
+        .map(|item| {
+            let trimmed = item.trim();
+            if trimmed.is_empty() {
+                bail!("empty entry in --partitions");
             }
-            Ok(n - 1)
+            let sel = crate::cli::img_at::ImageRef::parse(&format!("x@{trimmed}"))?
+                .partition
+                .ok_or_else(|| anyhow!("empty partition selector {trimmed:?}"))?;
+            let part = crate::cli::resolve::select_partition(&table, &partitions, &sel)?;
+            Ok(part.index)
         })
         .collect()
 }
@@ -287,26 +296,46 @@ fn spawn_progress_pump(progress: Arc<Mutex<BackupProgress>>) {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_indices;
+    use super::resolve_partition_filter;
 
+    /// Builds a 3-partition MBR disk and checks each selector form lands on the
+    /// slot `partition_filter` matches, and that a miss is an error rather than
+    /// an empty backup.
     #[test]
-    fn parse_indices_is_one_based_to_zero_based() {
-        // `1` (the first partition, like img@1) maps to the 0-based index 0
-        // that partition_filter matches against PartitionInfo::index.
-        assert_eq!(parse_indices("1").unwrap(), vec![0]);
-        assert_eq!(parse_indices("1,3,4").unwrap(), vec![0, 2, 3]);
-        // whitespace tolerated
-        assert_eq!(parse_indices(" 2 , 1 ").unwrap(), vec![1, 0]);
-    }
+    fn partitions_flag_accepts_every_selector_form() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("d.img");
+        let size = 64 * 1024 * 1024;
+        let f = std::fs::File::create(&img).unwrap();
+        f.set_len(size).unwrap();
+        drop(f);
+        use crate::partition::provision::{place, write_table, Geometry, PartSpec};
+        let kind = crate::partition::type_catalog::TableKind::Mbr;
+        let spec = |mb: u64| PartSpec {
+            size: Some(mb * 1024 * 1024),
+            type_text: Some("0b".into()),
+            name: None,
+        };
+        let placed = place(&[spec(16), spec(16)], kind, size, 2048 * 512).unwrap();
+        let mut w = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&img)
+            .unwrap();
+        write_table(&mut w, kind, &placed, size, Geometry::default()).unwrap();
+        drop(w);
 
-    #[test]
-    fn parse_indices_rejects_zero_and_garbage() {
-        // 0 is invalid in 1-based numbering (the regression: the first
-        // partition used to be unreachable because 0 was rejected *and* the
-        // values were never decremented).
-        assert!(parse_indices("0").is_err());
-        assert!(parse_indices("1,0").is_err());
-        assert!(parse_indices("x").is_err());
-        assert!(parse_indices("1,,2").is_err());
+        assert_eq!(resolve_partition_filter(&img, "1").unwrap(), vec![0]);
+        assert_eq!(resolve_partition_filter(&img, "1,2").unwrap(), vec![0, 1]);
+        assert_eq!(
+            resolve_partition_filter(&img, " 2 , 1 ").unwrap(),
+            vec![1, 0]
+        );
+        // MBR slots are fdisk's 1-4, so `s1` is the same partition as `@1`.
+        assert_eq!(resolve_partition_filter(&img, "s1").unwrap(), vec![0]);
+
+        assert!(resolve_partition_filter(&img, "0").is_err());
+        assert!(resolve_partition_filter(&img, "99").is_err());
+        assert!(resolve_partition_filter(&img, "1,,2").is_err());
     }
 }

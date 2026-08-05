@@ -632,7 +632,7 @@ fn resolve_with_override<R: Read + Seek>(
         type_byte: info.partition_type_byte,
         type_string: info.partition_type_string.clone(),
         size: info.size_bytes,
-        label: format_label(&info, pt.type_name()),
+        label: format_label(&pt, &info, &partitions),
         whole_file_path: None,
         rebuild_budget: None,
     })
@@ -771,15 +771,27 @@ fn pick_default_partition(partitions: &[PartitionInfo]) -> Result<PartitionInfo>
     }
 }
 
-fn format_label(info: &PartitionInfo, pt_name: &str) -> String {
+fn format_label(pt: &PartitionTable, info: &PartitionInfo, partitions: &[PartitionInfo]) -> String {
+    let pt_name = pt.type_name();
+    // Name it the two ways the user can select it, rather than echoing the raw
+    // `index` — which matched neither `@N` nor `@sN` and read as a third answer.
+    let pos = partitions
+        .iter()
+        .position(|p| p.start_lba == info.start_lba && p.size_bytes == info.size_bytes)
+        .map(|i| format!("@{}", i + 1))
+        .unwrap_or_default();
+    let slot = pt
+        .native_slot(info)
+        .map(|s| format!(" / @s{s}"))
+        .unwrap_or_default();
     match &info.partition_type_string {
         Some(s) => format!(
-            "Partition {} ({pt_name}): {} {s} @ LBA {}, {} bytes",
-            info.index, info.type_name, info.start_lba, info.size_bytes
+            "Partition {pos}{slot} ({pt_name}): {} {s} @ LBA {}, {} bytes",
+            info.type_name, info.start_lba, info.size_bytes
         ),
         None => format!(
-            "Partition {} ({pt_name}): {} 0x{:02x} @ LBA {}, {} bytes",
-            info.index, info.type_name, info.partition_type_byte, info.start_lba, info.size_bytes
+            "Partition {pos}{slot} ({pt_name}): {} 0x{:02x} @ LBA {}, {} bytes",
+            info.type_name, info.partition_type_byte, info.start_lba, info.size_bytes
         ),
     }
 }
