@@ -9292,10 +9292,17 @@ impl App {
                     // the choice that matters is where on the target it lands.
                     let region = match r.target_partition {
                         None => "< Entire disk >".to_string(),
-                        Some(idx) => match r.target_partitions.iter().find(|p| p.index == idx) {
-                            Some(p) => format!(
+                        // Position, matching every other surface; selection
+                        // still keys on the slot in `p.index`.
+                        Some(idx) => match r
+                            .target_partitions
+                            .iter()
+                            .enumerate()
+                            .find(|(_, p)| p.index == idx)
+                        {
+                            Some((pos, p)) => format!(
                                 "< Partition {} - {} ({}) >",
-                                p.index + 1,
+                                pos + 1,
                                 p.type_name,
                                 format_size(p.size_bytes),
                             ),

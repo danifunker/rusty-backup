@@ -3821,12 +3821,24 @@ impl InspectTab {
         // Calc min, and Check (fsck) all work over the block reader.
         let is_remote = self.remote_inspect.is_some();
 
+        let has_slots = self
+            .partition_table
+            .as_ref()
+            .is_some_and(|pt| pt.has_native_slots());
         egui::Grid::new("partition_table")
             .striped(true)
             .min_col_width(60.0)
             .show(ui, |ui| {
                 // Header
-                ui.label(egui::RichText::new("#").strong());
+                ui.label(egui::RichText::new("#").strong())
+                    .on_hover_text("Position in this list — the number `IMG@N` takes");
+                if has_slots {
+                    ui.label(egui::RichText::new("Slot").strong())
+                        .on_hover_text(
+                            "The partition table's own slot, as the platform names it \
+                         (diskutil's disk4s6, IRIX slot 0) — the number `IMG@sN` takes",
+                        );
+                }
                 ui.label(egui::RichText::new("Type").strong());
                 ui.label(egui::RichText::new("Volume").strong());
                 ui.label(egui::RichText::new("Start LBA").strong());
@@ -3849,16 +3861,29 @@ impl InspectTab {
                 ui.label(egui::RichText::new("").strong());
                 ui.end_row();
 
-                for part in &self.partitions {
+                for (pos, part) in self.partitions.iter().enumerate() {
+                    // Position, not `PartitionInfo::index`: this is the number
+                    // the user types back as `@N`. The slot goes in its own column.
                     let index_label = if part.is_logical {
-                        format!("  {} (logical)", part.index)
+                        format!("  {} (logical)", pos + 1)
                     } else if part.is_extended_container {
-                        format!("{} (container)", part.index)
+                        format!("{} (container)", pos + 1)
                     } else {
-                        format!("{}", part.index)
+                        format!("{}", pos + 1)
                     };
+                    let slot_label = self
+                        .partition_table
+                        .as_ref()
+                        .and_then(|pt| pt.native_slot(part))
+                        .map(|s| s.to_string())
+                        .unwrap_or_default();
                     if part.is_extended_container {
                         ui.label(egui::RichText::new(index_label).color(egui::Color32::GRAY));
+                        if has_slots {
+                            ui.label(
+                                egui::RichText::new(slot_label.clone()).color(egui::Color32::GRAY),
+                            );
+                        }
                         ui.label(egui::RichText::new(&part.type_name).color(egui::Color32::GRAY));
                         // Volume column — extended containers have no filesystem.
                         ui.label("");
@@ -3898,6 +3923,9 @@ impl InspectTab {
                         ui.label("");
                     } else {
                         ui.label(index_label);
+                        if has_slots {
+                            ui.label(slot_label);
+                        }
                         ui.label(&part.type_name);
                         // Volume column. Always probed live from the
                         // partition itself — never persisted to backup

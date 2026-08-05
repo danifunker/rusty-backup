@@ -1985,7 +1985,11 @@ impl CommanderPane {
                             .map(|c| c.label.clone())
                             .collect()
                     } else {
-                        self.partitions.iter().map(partition_label).collect()
+                        self.partitions
+                            .iter()
+                            .enumerate()
+                            .map(|(i, p)| partition_label(i, p))
+                            .collect()
                     };
                     let empty_text = if self.optical_source {
                         "(no filesystems)"
@@ -2502,7 +2506,7 @@ impl CommanderPane {
                         return format!(
                             "[{}] scanning Clonezilla metadata for {} ...",
                             self.side.label(),
-                            partition_label(&part)
+                            partition_label(idx, &part)
                         );
                     }
                 }
@@ -2512,7 +2516,7 @@ impl CommanderPane {
                 return format!(
                     "[{}] cannot browse {}: {e}",
                     self.side.label(),
-                    partition_label(&part)
+                    partition_label(idx, &part)
                 );
             }
             None => commander_source::session_for(&path, &part),
@@ -2524,7 +2528,7 @@ impl CommanderPane {
         format!(
             "[{}] opening {} ...",
             self.side.label(),
-            partition_label(&part)
+            partition_label(idx, &part)
         )
     }
 
@@ -3505,11 +3509,12 @@ fn tree_row_to_display(tr: &TreeRow) -> DisplayRow {
     }
 }
 
-/// Short label for a partition in the dropdown: `1: FAT16 (510.0 MiB)`.
-fn partition_label(p: &PartitionInfo) -> String {
+/// Short label for a partition in the dropdown: `1: FAT16 (510.0 MiB)`. `pos`
+/// is the position in the list, matching `inspect`'s `#` and `IMG@N`.
+fn partition_label(pos: usize, p: &PartitionInfo) -> String {
     format!(
         "{}: {} ({})",
-        p.index + 1,
+        pos + 1,
         p.type_name,
         format_size(p.size_bytes)
     )

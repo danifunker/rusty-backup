@@ -513,7 +513,7 @@ impl BackupTab {
                             );
                         ui.end_row();
 
-                        for part in &self.source_partitions {
+                        for (pos, part) in self.source_partitions.iter().enumerate() {
                             if part.is_extended_container {
                                 continue;
                             }
@@ -525,7 +525,9 @@ impl BackupTab {
                                     self.selected_partitions.remove(&part.index);
                                 }
                             }
-                            ui.label(format!("{}", part.index));
+                            // Position, matching `inspect`'s `#` and `--partitions N`;
+                            // selection still keys on the slot in `part.index`.
+                            ui.label(format!("{}", pos + 1));
                             ui.label(&part.type_name);
                             ui.label(partition::format_size(part.size_bytes));
 

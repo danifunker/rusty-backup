@@ -2284,3 +2284,32 @@ mod tests {
         assert_eq!(parts[0].partition_type_string.as_deref(), Some("human68k"));
     }
 }
+
+#[cfg(test)]
+mod native_slot_tests {
+    use super::*;
+
+    /// The `slot` column and `@sN` must agree with the platform's own tools:
+    /// `diskutil` counts APM map entries from 1, so the third entry is `s3`.
+    #[test]
+    fn apm_slots_match_diskutil_numbering() {
+        let apm = apm::build_minimal_apm(
+            &[
+                ("Apple_Driver43".to_string(), 64, 32),
+                ("Apple_HFS".to_string(), 96, 1000),
+                ("Apple_HFS".to_string(), 1096, 1000),
+            ],
+            512,
+            4000,
+        );
+        let table = PartitionTable::Apm(apm);
+        assert!(table.has_native_slots());
+
+        // The map and driver entries are filtered out, so position and slot
+        // diverge — which is the whole reason both are shown.
+        let parts = table.partitions();
+        assert_eq!(parts.len(), 2, "map + driver are not data partitions");
+        assert_eq!(table.native_slot(&parts[0]), Some(3));
+        assert_eq!(table.native_slot(&parts[1]), Some(4));
+    }
+}
