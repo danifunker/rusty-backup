@@ -591,12 +591,31 @@ mod tests {
         }
     }
 
+    /// Write `placed` onto a sparse temp file sized `disk`, rewound and ready
+    /// to re-parse.
+    ///
+    /// A file, not a `Vec` — a realistic disk size is hundreds of MiB, and that
+    /// much contiguous heap fails outright on 32-bit Windows (it broke the
+    /// i686 CI leg). `set_len` costs no RAM and nothing but a hole on disk.
+    fn table_on_temp_disk(
+        kind: TableKind,
+        placed: &[Placed],
+        disk: u64,
+        geometry: Geometry,
+    ) -> std::fs::File {
+        let mut file = tempfile::tempfile().expect("temp disk");
+        file.set_len(disk).expect("size the temp disk");
+        write_table(&mut file, kind, placed, disk, geometry)
+            .unwrap_or_else(|e| panic!("{} write: {e:#}", kind.label()));
+        file.seek(SeekFrom::Start(0)).expect("rewind");
+        file
+    }
+
     /// Round-trip every writable table through `write_table` and re-parse it,
     /// which is what proves the GUI's in-memory path matches the CLI's file one.
     #[test]
     fn every_writable_table_writes_and_reparses() {
         use crate::partition::PartitionTable;
-        use std::io::Cursor;
 
         let disk = 512 * 1024 * 1024;
         for &kind in WRITABLE_TABLES {
@@ -606,11 +625,7 @@ mod tests {
             let placed = place(&specs, kind, disk, align)
                 .unwrap_or_else(|e| panic!("{} place: {e:#}", kind.label()));
 
-            let mut buf = Cursor::new(vec![0u8; disk as usize]);
-            write_table(&mut buf, kind, &placed, disk, geometry)
-                .unwrap_or_else(|e| panic!("{} write: {e:#}", kind.label()));
-
-            let mut reader = Cursor::new(buf.into_inner());
+            let mut reader = table_on_temp_disk(kind, &placed, disk, geometry);
             let table = PartitionTable::detect(&mut reader)
                 .unwrap_or_else(|e| panic!("{} reparse: {e:#}", kind.label()));
             assert_eq!(
@@ -634,7 +649,6 @@ mod tests {
     #[test]
     fn named_entries_survive_the_round_trip() {
         use crate::partition::PartitionTable;
-        use std::io::Cursor;
 
         let disk = 128 * 1024 * 1024;
         let named = |n: &str| PartSpec {
@@ -651,10 +665,7 @@ mod tests {
             let specs = vec![named(wanted)];
             let geometry = Geometry::default();
             let placed = place(&specs, kind, disk, default_align(kind, geometry)).unwrap();
-            let mut buf = Cursor::new(vec![0u8; disk as usize]);
-            write_table(&mut buf, kind, &placed, disk, geometry).unwrap();
-
-            let mut reader = Cursor::new(buf.into_inner());
+            let mut reader = table_on_temp_disk(kind, &placed, disk, geometry);
             let table = PartitionTable::detect(&mut reader).unwrap();
             let names = format!("{:?}", table.partitions());
             assert!(

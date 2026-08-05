@@ -212,9 +212,20 @@ mod tests {
     use super::*;
     use crate::partition::provision::PartSpec;
     use crate::partition::PartitionTable;
-    use std::io::{Cursor, Write};
+    use std::io::{Read, Seek, SeekFrom, Write};
 
     const MIB: u64 = 1024 * 1024;
+
+    /// Read `len` bytes at `offset` without pulling the whole target into
+    /// memory — a 64 MiB `fs::read` is wasteful everywhere and fails on the
+    /// 32-bit Windows CI leg.
+    fn read_at(path: &std::path::Path, offset: u64, len: usize) -> Vec<u8> {
+        let mut f = std::fs::File::open(path).expect("open target");
+        f.seek(SeekFrom::Start(offset)).expect("seek");
+        let mut buf = vec![0u8; len];
+        f.read_exact(&mut buf).expect("read");
+        buf
+    }
 
     fn fat_ish_source(size: u64, marker: &[u8]) -> tempfile::NamedTempFile {
         let mut f = tempfile::Builder::new().suffix(".img").tempfile().unwrap();
@@ -256,10 +267,13 @@ mod tests {
         };
         run_worker(&req, new_status(0)).expect("worker");
 
-        let bytes = std::fs::read(&target_path).unwrap();
-        assert_eq!(bytes.len() as u64, disk, "target sized to the whole disk");
-
-        let mut reader = Cursor::new(bytes.clone());
+        let mut reader = std::fs::File::open(&target_path).unwrap();
+        assert_eq!(
+            reader.seek(SeekFrom::End(0)).unwrap(),
+            disk,
+            "target sized to the whole disk",
+        );
+        reader.seek(SeekFrom::Start(0)).unwrap();
         let table = PartitionTable::detect(&mut reader).expect("reparse");
         let parts = table.partitions();
         assert_eq!(parts.len(), 2);
@@ -268,10 +282,10 @@ mod tests {
 
         // The filled partition holds the source at its offset; the unfilled one
         // is untouched.
-        let off = placed[0].start_byte() as usize;
-        assert_eq!(&bytes[off + 3..off + 11], b"RBTEST01");
-        let off2 = placed[1].start_byte() as usize;
-        assert!(bytes[off2..off2 + 512].iter().all(|b| *b == 0));
+        let filled = read_at(&target_path, placed[0].start_byte(), 512);
+        assert_eq!(&filled[3..11], b"RBTEST01");
+        let empty = read_at(&target_path, placed[1].start_byte(), 512);
+        assert!(empty.iter().all(|b| *b == 0));
     }
 
     #[test]
