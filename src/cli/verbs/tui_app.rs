@@ -1363,6 +1363,9 @@ enum HdPlatform {
     Mbr,
     Gpt,
     Apm,
+    /// Partition table only — no EFS format, no IPL stub, unlike the two above.
+    SgiTable,
+    X68kTable,
 }
 
 /// Step the "write to" choice: whole disk -> each partition -> back to whole
@@ -1405,6 +1408,11 @@ const HD_PLATFORMS: &[(&str, HdPlatform)] = &[
     ("MBR (DOS / PC), one partition", HdPlatform::Mbr),
     ("GPT (UEFI), one partition", HdPlatform::Gpt),
     ("APM (Apple / PowerPC), one partition", HdPlatform::Apm),
+    (
+        "SGI volume header (IRIX), one partition",
+        HdPlatform::SgiTable,
+    ),
+    ("X68000 table only, one partition", HdPlatform::X68kTable),
 ];
 
 /// Filesystems offered under `new floppy` in the wizard. CP/M is omitted here
@@ -5598,7 +5606,11 @@ impl App {
                                 include_appledouble: false,
                             })
                         }
-                        HdPlatform::Mbr | HdPlatform::Gpt | HdPlatform::Apm => {
+                        HdPlatform::Mbr
+                        | HdPlatform::Gpt
+                        | HdPlatform::Apm
+                        | HdPlatform::SgiTable
+                        | HdPlatform::X68kTable => {
                             // One partition over the whole disk, at the CLI's
                             // default type and alignment.
                             let args = crate::cli::verbs::new_partitioned_hd::PartitionedHdArgs {
@@ -5611,6 +5623,15 @@ impl App {
                             match platform {
                                 HdPlatform::Mbr => HdCommand::Mbr(args),
                                 HdPlatform::Gpt => HdCommand::Gpt(args),
+                                HdPlatform::X68kTable => HdCommand::X68kTable(args),
+                                HdPlatform::SgiTable => HdCommand::Sgi(
+                                    crate::cli::verbs::new_partitioned_hd::SgiHdArgs {
+                                        common: args,
+                                        heads: crate::partition::sgi_hdd_builder::DEFAULT_HEADS,
+                                        sectors:
+                                            crate::partition::sgi_hdd_builder::DEFAULT_SECTORS_PER_TRACK,
+                                    },
+                                ),
                                 _ => HdCommand::Apm(args),
                             }
                         }
@@ -8835,9 +8856,10 @@ impl App {
                 }
                 lines.push(Line::raw(""));
                 lines.push(Line::styled(
-                    "Hard disks build with their defaults - MBR / GPT / APM get one \
-                     partition over the whole disk. Donor-cloning and multi-partition \
-                     layouts need the CLI (`rb-cli new hd <table> --partition ...`). \
+                    "Hard disks build with their defaults - the table-only entries get \
+                     one partition over the whole disk, empty. Donor-cloning and \
+                     multi-partition layouts need the CLI \
+                     (`rb-cli new hd <table> --partition ...`). \
                      CD-ROM images: the Optical tab.",
                     self.palette.dim(),
                 ));
