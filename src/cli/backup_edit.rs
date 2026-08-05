@@ -20,6 +20,7 @@ use std::path::Path;
 use crate::backup::metadata::{
     update_partition_checksum, BackupLayout, BackupMetadata, PartitionMetadata,
 };
+use crate::cli::img_at::PartSelector;
 use crate::cli::io::open_image_rw;
 use crate::cli::logging::log_stderr;
 use crate::cli::resolve::{PartitionContext, RwCommit};
@@ -107,7 +108,7 @@ impl BackupArchiveCommit {
 /// [`RwCommit::BackupArchive`] that recompresses + rewrites metadata on commit.
 pub fn open_backup_partition_rw(
     folder: &Path,
-    selector: Option<u32>,
+    selector: Option<PartSelector>,
 ) -> Result<(BoxRwSeek, PartitionContext, RwCommit)> {
     let (meta, part) = load_and_select(folder, selector)?;
     let ectx = build_edit_ctx(folder, &meta, &part)?;
@@ -178,7 +179,7 @@ fn is_uncompressed(compression_type: &str) -> bool {
 /// hand back a `Read + Seek` reader that owns (and cleans up) the temp.
 pub fn open_backup_partition_ro(
     folder: &Path,
-    selector: Option<u32>,
+    selector: Option<PartSelector>,
 ) -> Result<(BoxReadSeek, PartitionContext)> {
     let (meta, part) = load_and_select(folder, selector)?;
     let ectx = build_edit_ctx(folder, &meta, &part)?;
@@ -231,7 +232,7 @@ fn extract_to_temp(ectx: &ArchiveEditContext, temp_path: &Path) -> Result<()> {
 /// backup has exactly one partition).
 fn load_and_select(
     folder: &Path,
-    selector: Option<u32>,
+    selector: Option<PartSelector>,
 ) -> Result<(BackupMetadata, PartitionMetadata)> {
     let meta_path = folder.join("metadata.json");
     let text = std::fs::read_to_string(&meta_path)
@@ -258,7 +259,7 @@ fn load_and_select(
         bail!("backup {} has no partitions", folder.display());
     }
     let part = match selector {
-        Some(idx) => {
+        Some(PartSelector::Position(idx)) => {
             let i = idx as usize;
             if i == 0 || i > meta.partitions.len() {
                 bail!(
@@ -268,6 +269,26 @@ fn load_and_select(
             }
             meta.partitions[i - 1].clone()
         }
+        // metadata.json keys partitions by slot, so `@sN` addresses one directly.
+        Some(PartSelector::Slot(slot)) => meta
+            .partitions
+            .iter()
+            .find(|p| p.index as u32 == slot)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow!(
+                    "backup has no partition in slot {slot} (recorded slots: {})",
+                    meta.partitions
+                        .iter()
+                        .map(|p| p.index.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                )
+            })?,
+        Some(PartSelector::Name(name)) => bail!(
+            "@{name} names an AmigaDOS device, which a backup folder doesn't record; \
+             use FOLDER@N or FOLDER@sN"
+        ),
         None => {
             if meta.partitions.len() == 1 {
                 meta.partitions[0].clone()

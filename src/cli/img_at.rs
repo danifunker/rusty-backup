@@ -1,11 +1,21 @@
 //! `IMG@N` partition-selector parser.
 //!
-//! `IMG` is a path to an image file (or eventually a block device);
-//! the optional `@N` suffix names a 1-based partition index inside that
-//! image. The `@` character is unambiguous because it is illegal in
-//! every filesystem name we support, and is safe-by-default in every
-//! shell that matters (bash, zsh, fish, sh, dash, PowerShell, cmd) when
+//! `IMG` is a path to an image file (or a block device); the optional suffix
+//! names one partition inside it. The `@` character is unambiguous because it
+//! is illegal in every filesystem name we support, and is safe-by-default in
+//! every shell that matters (bash, zsh, fish, sh, dash, PowerShell, cmd) when
 //! used mid-token.
+//!
+//! Three suffix forms, in precedence order:
+//!
+//! | form | meaning | example |
+//! |------|---------|---------|
+//! | `@N` | 1-based position in the list `inspect` prints | `disk.img@2` |
+//! | `@sN` | the partition table's own slot, as the platform names it | `disk.img@s6` |
+//! | `@NAME` | AmigaDOS device name (RDB only) | `amiga.hdf@DH0` |
+//!
+//! `@N` is portable across every table type; `@sN` is stable across changes to
+//! which partitions we consider browsable. See `docs/partition-selectors.md`.
 //!
 //! Real-world disk-image filenames very rarely contain `@`. The
 //! `--partition N` flag stays available as a fallback for anyone whose
@@ -14,14 +24,49 @@
 use anyhow::{bail, Result};
 use std::path::PathBuf;
 
-/// Parsed `IMG[@N]` argument.
+/// Which partition an `IMG@…` suffix names. Serialized over the wire as-is.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum PartSelector {
+    /// `@N` — 1-based position in the `#` column `inspect` prints.
+    Position(u32),
+    /// `@sN` — the table's own slot, spelled as the platform spells it.
+    Slot(u32),
+    /// `@DH0` — AmigaDOS device name, case-insensitive. RDB only.
+    Name(String),
+}
+
+impl PartSelector {
+    /// How the user typed it, for error messages that echo the input back.
+    pub fn display(&self) -> String {
+        match self {
+            PartSelector::Position(n) => format!("@{n}"),
+            PartSelector::Slot(n) => format!("@s{n}"),
+            PartSelector::Name(s) => format!("@{s}"),
+        }
+    }
+}
+
+impl From<u32> for PartSelector {
+    /// A bare `--partition N` flag is the positional form.
+    fn from(n: u32) -> Self {
+        PartSelector::Position(n)
+    }
+}
+
+impl std::fmt::Display for PartSelector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.display())
+    }
+}
+
+/// Parsed `IMG[@…]` argument.
 ///
-/// `path` is the image / device path; `partition` is the 1-based index
-/// supplied via `@N`, or `None` when the user didn't pass one.
+/// `path` is the image / device path; `partition` is the selector supplied
+/// after `@`, or `None` when the user didn't pass one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageRef {
     pub path: PathBuf,
-    pub partition: Option<u32>,
+    pub partition: Option<PartSelector>,
 }
 
 impl ImageRef {
@@ -57,17 +102,9 @@ impl ImageRef {
                 if partition_str.is_empty() {
                     bail!("image reference missing partition index after '@'");
                 }
-                let n: u32 = partition_str.parse().map_err(|_| {
-                    anyhow::anyhow!(
-                        "invalid partition index after '@' in {s:?} (expected 1-based integer)"
-                    )
-                })?;
-                if n == 0 {
-                    bail!("partition index 0 is invalid (use 1-based indexing)");
-                }
                 Ok(Self {
                     path: PathBuf::from(path_str),
-                    partition: Some(n),
+                    partition: Some(parse_selector(partition_str, s)?),
                 })
             }
             _ => bail!(
@@ -76,6 +113,35 @@ impl ImageRef {
             ),
         }
     }
+}
+
+/// Classify the text after `@`. All-digits is a position, `s` + digits a slot,
+/// anything else a device name. `whole` is the original argument, for errors.
+fn parse_selector(suffix: &str, whole: &str) -> Result<PartSelector> {
+    if suffix.chars().all(|c| c.is_ascii_digit()) {
+        let n: u32 = suffix.parse().map_err(|_| {
+            anyhow::anyhow!("invalid partition index after '@' in {whole:?} (expected an integer)")
+        })?;
+        if n == 0 {
+            bail!("partition index 0 is invalid (use 1-based indexing, or @s0 for slot 0)");
+        }
+        return Ok(PartSelector::Position(n));
+    }
+
+    // Slot 0 is legal here: SGI numbers its partitions from zero.
+    if let Some(rest) = suffix
+        .strip_prefix('s')
+        .or_else(|| suffix.strip_prefix('S'))
+    {
+        if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
+            let n: u32 = rest
+                .parse()
+                .map_err(|_| anyhow::anyhow!("invalid slot number after '@s' in {whole:?}"))?;
+            return Ok(PartSelector::Slot(n));
+        }
+    }
+
+    Ok(PartSelector::Name(suffix.to_string()))
 }
 
 impl std::str::FromStr for ImageRef {
@@ -94,16 +160,24 @@ impl std::str::FromStr for ImageRef {
 /// anyone who has just been told `@N` is how you choose a partition. Returns
 /// `Some((real_path, index))` only when stripping the suffix names a file that
 /// exists, so a filename that genuinely ends in `@2` is left alone.
-pub fn stray_selector(path: &std::path::Path) -> Option<(PathBuf, u32)> {
+pub fn stray_selector(path: &std::path::Path) -> Option<(PathBuf, String)> {
     let s = path.to_str()?;
     let at = s.rfind('@')?;
     let (prefix, suffix) = s.split_at(at);
-    let n: u32 = suffix[1..].parse().ok()?;
-    if n == 0 || prefix.is_empty() {
+    if prefix.is_empty() {
+        return None;
+    }
+    // Numeric forms only: a name-shaped suffix is likelier to be a filename.
+    let body = &suffix[1..];
+    let numeric = body.chars().all(|c| c.is_ascii_digit()) && body.parse::<u32>().ok()? > 0;
+    let slotted = body
+        .strip_prefix('s')
+        .is_some_and(|r| !r.is_empty() && r.chars().all(|c| c.is_ascii_digit()));
+    if !numeric && !slotted {
         return None;
     }
     let real = PathBuf::from(prefix);
-    real.exists().then_some((real, n))
+    real.exists().then_some((real, body.to_string()))
 }
 
 #[cfg(test)]
@@ -121,18 +195,47 @@ mod tests {
     fn parses_partition_suffix() {
         let r = ImageRef::parse("disk.hda@2").unwrap();
         assert_eq!(r.path, PathBuf::from("disk.hda"));
-        assert_eq!(r.partition, Some(2));
+        assert_eq!(r.partition, Some(PartSelector::Position(2)));
     }
 
     #[test]
     fn accepts_complex_paths() {
         let r = ImageRef::parse("/path/to/disk.hda@1").unwrap();
         assert_eq!(r.path, PathBuf::from("/path/to/disk.hda"));
-        assert_eq!(r.partition, Some(1));
+        assert_eq!(r.partition, Some(PartSelector::Position(1)));
 
         let r = ImageRef::parse("../images/foo.img").unwrap();
         assert_eq!(r.path, PathBuf::from("../images/foo.img"));
         assert!(r.partition.is_none());
+    }
+
+    #[test]
+    fn parses_the_slot_form() {
+        // `@sN` is the table's own numbering, so slot 0 is legal here even
+        // though `@0` is not — SGI volume headers number from zero.
+        let r = ImageRef::parse("disk.hda@s6").unwrap();
+        assert_eq!(r.path, PathBuf::from("disk.hda"));
+        assert_eq!(r.partition, Some(PartSelector::Slot(6)));
+        assert_eq!(
+            ImageRef::parse("irix.img@s0").unwrap().partition,
+            Some(PartSelector::Slot(0)),
+        );
+        assert_eq!(
+            ImageRef::parse("disk.hda@S6").unwrap().partition,
+            Some(PartSelector::Slot(6)),
+        );
+    }
+
+    #[test]
+    fn parses_the_amiga_device_name_form() {
+        let r = ImageRef::parse("amiga.hdf@DH0").unwrap();
+        assert_eq!(r.path, PathBuf::from("amiga.hdf"));
+        assert_eq!(r.partition, Some(PartSelector::Name("DH0".into())));
+        // A name that merely starts with `s` is still a name.
+        assert_eq!(
+            ImageRef::parse("amiga.hdf@System").unwrap().partition,
+            Some(PartSelector::Name("System".into())),
+        );
     }
 
     #[test]
@@ -141,9 +244,17 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_numeric_suffix() {
-        assert!(ImageRef::parse("disk.hda@abc").is_err());
-        assert!(ImageRef::parse("disk.hda@1.5").is_err());
+    fn non_numeric_suffixes_are_device_names_now() {
+        // These used to be errors; they are RDB device names today and fail
+        // later, at resolution, where we can say which names the disk has.
+        assert_eq!(
+            ImageRef::parse("disk.hda@abc").unwrap().partition,
+            Some(PartSelector::Name("abc".into())),
+        );
+        assert_eq!(
+            ImageRef::parse("disk.hda@1.5").unwrap().partition,
+            Some(PartSelector::Name("1.5".into())),
+        );
     }
 
     #[test]
@@ -162,7 +273,7 @@ mod tests {
     #[test]
     fn fromstr_works_for_clap() {
         let r: ImageRef = "disk.hda@3".parse().unwrap();
-        assert_eq!(r.partition, Some(3));
+        assert_eq!(r.partition, Some(PartSelector::Position(3)));
     }
 
     /// The hint fires only when stripping `@N` names something real, so a
@@ -177,9 +288,16 @@ mod tests {
         let with_suffix = dir.path().join("disk.img@2");
         assert_eq!(
             stray_selector(&with_suffix),
-            Some((img.clone(), 2)),
+            Some((img.clone(), "2".to_string())),
             "a selector on an existing image should be recognised"
         );
+        assert_eq!(
+            stray_selector(&dir.path().join("disk.img@s6")),
+            Some((img.clone(), "s6".to_string())),
+            "the slot form lands on whole-disk verbs the same way"
+        );
+        // A name-shaped suffix is left alone: far likelier to be a filename.
+        assert!(stray_selector(&dir.path().join("disk.img@DH0")).is_none());
 
         // Nothing to strip to: a plain missing file, report it as such.
         assert!(stray_selector(&dir.path().join("absent.img@2")).is_none());

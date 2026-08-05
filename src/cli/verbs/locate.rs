@@ -76,7 +76,7 @@ pub fn run(args: LocateArgs) -> Result<()> {
 /// Opens the image read-only, resolves the partition, walks the path to
 /// the file's CNID, and asks the HFS engine for its first-extent offset.
 pub fn locate_payload(image: &ImageRef, path: &str) -> Result<LocatePayload> {
-    let (file, ctx) = resolve_partition_ro(&image.path, image.partition)?;
+    let (file, ctx) = resolve_partition_ro(&image.path, image.partition.clone())?;
     log_stderr(&ctx.label);
 
     // Filesystem dispatch. Classic HFS is the only locator wired up

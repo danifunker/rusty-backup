@@ -95,7 +95,7 @@ enum Opened {
 /// One row of an opened image's partition table, plus the `@N` selector the
 /// shared `resolve` path uses to open its filesystem (`None` = superfloppy).
 struct PartRow {
-    selector: Option<u32>,
+    selector: Option<crate::cli::img_at::PartSelector>,
     label: String,
     fs_hint: String,
     size: u64,
@@ -124,7 +124,7 @@ struct Explorer {
     /// The source image + partition selector, kept so import can reopen the
     /// partition read-write and the view can refresh afterwards.
     image_path: String,
-    selector: Option<u32>,
+    selector: Option<crate::cli::img_at::PartSelector>,
     part_label: String,
     volume: Option<String>,
     /// The currently-blessed (bootable) System Folder, if any — HFS/HFS+ only.
@@ -2062,10 +2062,10 @@ impl CmdPane {
     /// The remote image `(image_path, partition)` this pane is browsing, if it
     /// is inside a disk image on the daemon (vs. the host file browser).
     #[cfg(feature = "remote")]
-    fn remote_image_target(&self) -> Option<(String, Option<u32>)> {
+    fn remote_image_target(&self) -> Option<(String, Option<crate::cli::img_at::PartSelector>)> {
         match self.remote.as_ref().map(|b| b.mode()) {
             Some(crate::model::remote_browser::BrowseMode::Image { path, partition }) => {
-                Some((path.clone(), *partition))
+                Some((path.clone(), partition.clone()))
             }
             _ => None,
         }
@@ -3845,7 +3845,7 @@ impl App {
                 let target = if let Some(Opened::Image { path, parts, .. }) = &self.opened {
                     parts
                         .get(sel)
-                        .map(|r| (path.clone(), r.selector, r.label.clone()))
+                        .map(|r| (path.clone(), r.selector.clone(), r.label.clone()))
                 } else {
                     None
                 };
@@ -3879,12 +3879,22 @@ impl App {
 
     /// Open the per-partition filesystem Explorer, reusing the shared
     /// `resolve` + `open_filesystem` path (the same core `ls`/`get` use).
-    fn open_explorer(&mut self, image_path: &str, selector: Option<u32>, part_label: String) {
+    fn open_explorer(
+        &mut self,
+        image_path: &str,
+        selector: Option<crate::cli::img_at::PartSelector>,
+        part_label: String,
+    ) {
         use crate::cli::resolve::resolve_partition_streaming_forced_inside;
         let path = std::path::Path::new(image_path);
         let built = (|| -> anyhow::Result<Explorer> {
-            let (reader, ctx) =
-                resolve_partition_streaming_forced_inside(path, selector, None, None, None)?;
+            let (reader, ctx) = resolve_partition_streaming_forced_inside(
+                path,
+                selector.clone(),
+                None,
+                None,
+                None,
+            )?;
             let mut fs = crate::fs::open_filesystem_with_passphrase(
                 reader,
                 ctx.offset,
@@ -4743,7 +4753,7 @@ impl App {
         };
         let (image_path, selector, part_label, cur_dir, comps) = (
             ex.image_path.clone(),
-            ex.selector,
+            ex.selector.clone(),
             ex.part_label.clone(),
             ex.path_display(),
             ex.dir_components(),
@@ -4769,7 +4779,7 @@ impl App {
             }
         };
 
-        match write_file_bytes(&image_path, selector, &cur_dir, &name, &bytes) {
+        match write_file_bytes(&image_path, selector.clone(), &cur_dir, &name, &bytes) {
             Ok(()) => {
                 if let Some(ex) = self.explorer.as_mut() {
                     ex.editor = None;
@@ -4808,14 +4818,14 @@ impl App {
         let (image_path, selector, part_label, cur_path, comps) = match self.explorer.as_ref() {
             Some(ex) => (
                 ex.image_path.clone(),
-                ex.selector,
+                ex.selector.clone(),
                 ex.part_label.clone(),
                 ex.path_display(),
                 ex.dir_components(),
             ),
             None => return,
         };
-        match import_host_file(&image_path, selector, &cur_path, host, on_conflict) {
+        match import_host_file(&image_path, selector.clone(), &cur_path, host, on_conflict) {
             Ok(ImportOutcome::Exists(leaf)) => {
                 // Ask rather than refuse. The answer comes back through
                 // `explorer_import_with` with an explicit choice.
@@ -4856,7 +4866,7 @@ impl App {
         };
         let (image_path, selector, part_label, cur_dir, comps) = (
             ex.image_path.clone(),
-            ex.selector,
+            ex.selector.clone(),
             ex.part_label.clone(),
             ex.path_display(),
             ex.dir_components(),
@@ -4935,7 +4945,7 @@ impl App {
             mode: new_mode,
             owner: new_owner,
         };
-        match apply_metadata_edit(&image_path, selector, &cur_dir, &name, &values) {
+        match apply_metadata_edit(&image_path, selector.clone(), &cur_dir, &name, &values) {
             Ok(()) => {
                 if let Some(ex) = self.explorer.as_mut() {
                     ex.metadata = None;
@@ -5010,11 +5020,11 @@ impl App {
         };
         let (image_path, selector, part_label, comps) = (
             ex.image_path.clone(),
-            ex.selector,
+            ex.selector.clone(),
             ex.part_label.clone(),
             ex.dir_components(),
         );
-        match with_stderr_suppressed(|| apply_repair(&image_path, selector)) {
+        match with_stderr_suppressed(|| apply_repair(&image_path, selector.clone())) {
             Ok(report) => {
                 let mut lines = format_repair_lines(&report);
                 self.reopen_explorer(
@@ -5060,11 +5070,11 @@ impl App {
         };
         let (image_path, selector, part_label, comps) = (
             ex.image_path.clone(),
-            ex.selector,
+            ex.selector.clone(),
             ex.part_label.clone(),
             ex.dir_components(),
         );
-        match apply_bless_folder(&image_path, selector, &dir_path) {
+        match apply_bless_folder(&image_path, selector.clone(), &dir_path) {
             Ok(()) => self.reopen_explorer(
                 &image_path,
                 selector,
@@ -5094,7 +5104,7 @@ impl App {
             .to_string();
         let (image_path, selector, part_label, cur_dir, comps) = (
             ex.image_path.clone(),
-            ex.selector,
+            ex.selector.clone(),
             ex.part_label.clone(),
             ex.path_display(),
             ex.dir_components(),
@@ -5106,7 +5116,7 @@ impl App {
             }
             return;
         }
-        match apply_mkdir(&image_path, selector, &cur_dir, &name) {
+        match apply_mkdir(&image_path, selector.clone(), &cur_dir, &name) {
             Ok(()) => {
                 if let Some(ex) = self.explorer.as_mut() {
                     ex.mkdir_input = None;
@@ -5138,12 +5148,12 @@ impl App {
         };
         let (image_path, selector, part_label, cur_dir, comps) = (
             ex.image_path.clone(),
-            ex.selector,
+            ex.selector.clone(),
             ex.part_label.clone(),
             ex.path_display(),
             ex.dir_components(),
         );
-        match apply_delete(&image_path, selector, &cur_dir, &name) {
+        match apply_delete(&image_path, selector.clone(), &cur_dir, &name) {
             Ok(()) => {
                 if let Some(ex) = self.explorer.as_mut() {
                     ex.confirm_delete = None;
@@ -5170,7 +5180,7 @@ impl App {
     fn reopen_explorer(
         &mut self,
         image_path: &str,
-        selector: Option<u32>,
+        selector: Option<crate::cli::img_at::PartSelector>,
         part_label: String,
         comps: &[String],
         status: Option<String>,
@@ -11236,7 +11246,7 @@ struct MetaEditValues {
 /// then commit. Errors bubble up to the editor's status line.
 fn apply_metadata_edit(
     image_path: &str,
-    selector: Option<u32>,
+    selector: Option<crate::cli::img_at::PartSelector>,
     cur_dir: &str,
     name: &str,
     values: &MetaEditValues,
@@ -11303,7 +11313,7 @@ fn apply_metadata_edit(
 /// commit); errors (unsupported fs, CHD source, etc.) bubble up.
 fn apply_repair(
     image_path: &str,
-    selector: Option<u32>,
+    selector: Option<crate::cli::img_at::PartSelector>,
 ) -> anyhow::Result<crate::fs::RepairReport> {
     use crate::cli::resolve::resolve_partition_rw_forced;
     let (file, ctx, commit) =
@@ -11429,7 +11439,7 @@ fn build_checksum_lines(status: &crate::model::checksum::ChecksumStatus) -> Vec<
 /// to the Explorer status line.
 fn apply_bless_folder(
     image_path: &str,
-    selector: Option<u32>,
+    selector: Option<crate::cli::img_at::PartSelector>,
     dir_path: &str,
 ) -> anyhow::Result<()> {
     use crate::cli::resolve::resolve_partition_rw_forced;
@@ -11455,7 +11465,7 @@ fn apply_bless_folder(
 /// Explorer's current directory, then commit.
 fn apply_mkdir(
     image_path: &str,
-    selector: Option<u32>,
+    selector: Option<crate::cli::img_at::PartSelector>,
     cur_dir: &str,
     name: &str,
 ) -> anyhow::Result<()> {
@@ -11488,7 +11498,7 @@ fn apply_mkdir(
 /// directory (recursively for a folder), then commit.
 fn apply_delete(
     image_path: &str,
-    selector: Option<u32>,
+    selector: Option<crate::cli::img_at::PartSelector>,
     cur_dir: &str,
     name: &str,
 ) -> anyhow::Result<()> {
@@ -11526,7 +11536,7 @@ fn apply_delete(
 /// failure part-way leaves the original intact.
 fn write_file_bytes(
     image_path: &str,
-    selector: Option<u32>,
+    selector: Option<crate::cli::img_at::PartSelector>,
     cur_dir: &str,
     name: &str,
     bytes: &[u8],
@@ -11571,7 +11581,7 @@ enum ImportOutcome {
 
 fn import_host_file(
     image_path: &str,
-    selector: Option<u32>,
+    selector: Option<crate::cli::img_at::PartSelector>,
     cur_dir: &str,
     host: &std::path::Path,
     on_conflict: crate::fs::replace::OnConflict,
@@ -11710,7 +11720,7 @@ fn parse_partitions(path: &std::path::Path, total: u64) -> std::io::Result<Vec<P
                         .clone()
                         .unwrap_or_else(|| p.type_name.clone());
                     PartRow {
-                        selector: Some(n),
+                        selector: Some(n.into()),
                         label: format!("#{n}  {}", p.type_name),
                         fs_hint,
                         size: p.size_bytes,
@@ -12034,7 +12044,7 @@ mod tests {
             panic!("a single Enter should have opened the disk's partition table");
         };
         assert!(
-            parts.iter().any(|p| p.selector == Some(1)),
+            parts.iter().any(|p| p.selector == Some(1u32.into())),
             "the ext partition should be selectable, got {:?}",
             parts.iter().map(|p| &p.label).collect::<Vec<_>>()
         );

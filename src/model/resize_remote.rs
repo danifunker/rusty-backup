@@ -46,7 +46,7 @@ pub struct RemoteResizeOutcome {
 pub fn resize_remote_partition(
     conn: Arc<Mutex<RemoteConnection>>,
     path: &str,
-    partition: Option<u32>,
+    partition: Option<crate::cli::img_at::PartSelector>,
     new_size_bytes: u64,
     log_cb: &mut impl FnMut(&str),
 ) -> Result<RemoteResizeOutcome> {

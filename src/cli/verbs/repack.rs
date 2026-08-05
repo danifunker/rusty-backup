@@ -44,7 +44,7 @@ pub struct RepackArgs {
 pub fn run(args: RepackArgs) -> Result<()> {
     // Read-only handle for the clone source. Opening the filesystem also
     // validates that the selected partition is actually a Human68k volume.
-    let (ro_file, ctx) = resolve_partition_ro(&args.image.path, args.image.partition)?;
+    let (ro_file, ctx) = resolve_partition_ro(&args.image.path, args.image.partition.clone())?;
     log_stderr(&ctx.label);
     let mut source = Human68kFilesystem::open(ro_file, ctx.offset).map_err(|e| {
         anyhow::anyhow!(
@@ -84,7 +84,8 @@ pub fn run(args: RepackArgs) -> Result<()> {
     // containers, so this commit is a no-op. (A floppy-container path fails
     // earlier at the read-only Human68k open above, which is the intended
     // scope boundary — floppies use `floppy convert` / put/rm/mkdir.)
-    let (mut rw_file, _, commit) = resolve_partition_rw(&args.image.path, args.image.partition)?;
+    let (mut rw_file, _, commit) =
+        resolve_partition_rw(&args.image.path, args.image.partition.clone())?;
     rw_file.seek(SeekFrom::Start(ctx.offset))?;
 
     let mut log_cb = |s: &str| log_stderr(format!("  {s}"));

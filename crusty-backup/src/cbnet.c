@@ -21,7 +21,7 @@ static const unsigned char RB_MAGIC[4] = {'R', 'B', 'K', '0'};
 static const unsigned char PUT_MAGIC[4] = {'R', 'B', 'K', 'P'};
 static const unsigned char MEMBER_MAGIC[4] = {'R', 'B', 'K', 'M'};
 static const unsigned char RESUME_MAGIC[4] = {'R', 'B', 'K', 'R'};
-#define RB_PROTO_VER 2
+#define RB_PROTO_VER 3
 #define CAP_FAMILY_B 0x0002
 #define PUT_ACK 0x06
 

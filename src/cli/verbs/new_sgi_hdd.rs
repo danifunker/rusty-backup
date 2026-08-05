@@ -205,7 +205,7 @@ fn populate(args: &NewSgiHddArgs, dir: &std::path::Path) -> Result<()> {
     if !dir.is_dir() {
         anyhow::bail!("--from-dir: not a directory: {}", dir.display());
     }
-    let (file, ctx, commit) = resolve_partition_rw_forced(&args.image, Some(1), None)?;
+    let (file, ctx, commit) = resolve_partition_rw_forced(&args.image, Some(1u32.into()), None)?;
     let mut fs = ctx
         .open_editable(file)
         .map_err(|e| anyhow::anyhow!("opening the new EFS filesystem for writing: {e}"))?;

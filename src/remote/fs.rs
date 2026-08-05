@@ -51,7 +51,7 @@ impl RemoteFilesystem {
     pub fn on_connection(
         conn: Arc<Mutex<RemoteConnection>>,
         image_path: &str,
-        partition: Option<u32>,
+        partition: Option<crate::cli::img_at::PartSelector>,
     ) -> anyhow::Result<(Self, FileEntry, Vec<FileEntry>)> {
         let (opened, root_children) = {
             let mut c = conn
@@ -83,7 +83,7 @@ impl RemoteFilesystem {
     pub fn open(
         addr: &str,
         image_path: &str,
-        partition: Option<u32>,
+        partition: Option<crate::cli::img_at::PartSelector>,
     ) -> anyhow::Result<(Self, FileEntry, Vec<FileEntry>)> {
         let conn = RemoteConnection::connect_shared(addr)?;
         Self::on_connection(conn, image_path, partition)

@@ -497,7 +497,7 @@ impl CommanderPane {
             return Some(commander_ops::StageSource::Remote {
                 addr: addr.clone(),
                 path: path.clone(),
-                partition: *partition,
+                partition: partition.clone(),
             });
         }
         if self.archive_source {
@@ -1185,7 +1185,7 @@ impl CommanderPane {
     fn spawn_open_image(
         &mut self,
         path: String,
-        partition: Option<u32>,
+        partition: Option<rusty_backup::cli::img_at::PartSelector>,
         opened_from: String,
     ) -> String {
         let Some(mut browser) = self.browser.take() else {
@@ -1480,7 +1480,13 @@ impl CommanderPane {
     /// and while a wrapper mount is the active source (that stays on the sync
     /// [`commander_ops::stage_copy`] path — a small, local temp fs).
     #[cfg(feature = "remote")]
-    pub(crate) fn remote_image_source(&self) -> Option<(String, String, Option<u32>)> {
+    pub(crate) fn remote_image_source(
+        &self,
+    ) -> Option<(
+        String,
+        String,
+        Option<rusty_backup::cli::img_at::PartSelector>,
+    )> {
         if self.tree_active() {
             return None;
         }
@@ -1488,7 +1494,7 @@ impl CommanderPane {
             Some(RemoteConn {
                 addr,
                 mode: BrowseMode::Image { path, partition },
-            }) => Some((addr.clone(), path.clone(), *partition)),
+            }) => Some((addr.clone(), path.clone(), partition.clone())),
             _ => None,
         }
     }
@@ -1783,7 +1789,10 @@ impl CommanderPane {
                             .rsplit('/')
                             .find(|s| !s.is_empty())
                             .unwrap_or(path.as_str());
-                        let part = partition.map(|n| format!("@{n}")).unwrap_or_default();
+                        let part = partition
+                            .as_ref()
+                            .map(|n| format!("{n}"))
+                            .unwrap_or_default();
                         format!("Remote {}: {base}{part}", r.addr)
                     }
                 }
@@ -2678,7 +2687,7 @@ impl CommanderPane {
             Some(RemoteConn {
                 addr,
                 mode: BrowseMode::Image { path, partition },
-            }) => (addr.clone(), path.clone(), *partition),
+            }) => (addr.clone(), path.clone(), partition.clone()),
             _ => return format!("[{}] no remote image to apply to.", self.side.label()),
         };
         if self.queue.iter().any(|e| {
@@ -2736,7 +2745,7 @@ impl CommanderPane {
                 Some(RemoteConn {
                     mode: BrowseMode::Image { path, partition },
                     ..
-                }) => Some((path.clone(), *partition)),
+                }) => Some((path.clone(), partition.clone())),
                 _ => None,
             };
             if let Some((path, partition)) = reopen {

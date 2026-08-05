@@ -891,6 +891,36 @@ impl PartitionTable {
         }
     }
 
+    /// Slot number this table's platform gives `info`; `None` when it has none.
+    /// GPT is `None` because the parser drops unused entries. See `@sN` docs.
+    pub fn native_slot(&self, info: &PartitionInfo) -> Option<u32> {
+        let raw = info.index as u32;
+        match self {
+            // fdisk: primaries 1-4, logicals from 5; `index` is 0-3 then 4+j.
+            PartitionTable::Mbr(_) | PartitionTable::Ahdi(_) => Some(raw + 1),
+            // diskutil's `sN` counts map entries from 1.
+            PartitionTable::Apm(_) => Some(raw + 1),
+            // IRIX `fx` and Sun `format(1M)` both number from 0.
+            PartitionTable::Sgi(_) | PartitionTable::Sun(_) => Some(raw),
+            // No platform convention; `@DH0` is the identity users know.
+            PartitionTable::Rdb(_) => Some(raw),
+            _ => None,
+        }
+    }
+
+    /// Whether `@sN` means anything here; the negative needs its own error.
+    pub fn has_native_slots(&self) -> bool {
+        matches!(
+            self,
+            PartitionTable::Mbr(_)
+                | PartitionTable::Ahdi(_)
+                | PartitionTable::Apm(_)
+                | PartitionTable::Sgi(_)
+                | PartitionTable::Sun(_)
+                | PartitionTable::Rdb(_)
+        )
+    }
+
     /// Get a unified list of partition info for display.
     pub fn partitions(&self) -> Vec<PartitionInfo> {
         match self {

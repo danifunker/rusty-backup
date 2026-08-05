@@ -186,7 +186,8 @@ fn run_create(args: SquashfsCreateArgs) -> Result<()> {
 }
 
 fn run_verify(args: SquashfsVerifyArgs) -> Result<()> {
-    let (reader, ctx) = resolve_partition_streaming(&args.image.path, args.image.partition)?;
+    let (reader, ctx) =
+        resolve_partition_streaming(&args.image.path, args.image.partition.clone())?;
     log_stderr(&ctx.label);
     // Open the reader concretely rather than through the trait object, because
     // the verifier drives the SquashFS reader's own traversal.
@@ -208,7 +209,8 @@ fn run_verify(args: SquashfsVerifyArgs) -> Result<()> {
     }
 
     // Reopen concretely for the verifier.
-    let (reader, _ctx) = resolve_partition_streaming(&args.image.path, args.image.partition)?;
+    let (reader, _ctx) =
+        resolve_partition_streaming(&args.image.path, args.image.partition.clone())?;
     let mut fs = crate::fs::squashfs::SquashfsFilesystem::open(reader, ctx.offset)
         .map_err(|e| anyhow!("opening SquashFS: {e}"))?;
     let report =
@@ -227,7 +229,8 @@ fn run_verify(args: SquashfsVerifyArgs) -> Result<()> {
 }
 
 fn run_plan(args: SquashfsPlanArgs) -> Result<()> {
-    let (reader, ctx) = resolve_partition_streaming(&args.image.path, args.image.partition)?;
+    let (reader, ctx) =
+        resolve_partition_streaming(&args.image.path, args.image.partition.clone())?;
     log_stderr(&ctx.label);
     let mut fs = crate::fs::open_filesystem(
         reader,
