@@ -189,12 +189,29 @@ pub fn reserved_tail(kind: TableKind) -> u64 {
     }
 }
 
+/// True for the tables that place partitions on cylinder boundaries, so the
+/// caller has to offer a heads / sectors-per-track control. Shared so the GUI,
+/// the TUI and the CLI gate on the same predicate.
+pub fn uses_cylinder_geometry(kind: TableKind) -> bool {
+    matches!(kind, TableKind::Sgi | TableKind::Rdb | TableKind::Sun)
+}
+
+/// True for the tables whose entries carry a name the user can set — GPT and
+/// APM labels, X68000's 8-byte name, and RDB's AmigaDOS device name.
+pub fn carries_entry_name(kind: TableKind) -> bool {
+    matches!(
+        kind,
+        TableKind::Gpt | TableKind::Apm | TableKind::X68k | TableKind::Rdb
+    )
+}
+
 /// The alignment to lay partitions on when the caller has no preference.
-/// SGI and RDB want cylinder boundaries; everything else gets 1 MiB.
+/// The cylinder-based tables want one cylinder; everything else gets 1 MiB.
 pub fn default_align(kind: TableKind, geometry: Geometry) -> u64 {
-    match kind {
-        TableKind::Sgi | TableKind::Rdb | TableKind::Sun => geometry.cylinder_bytes().max(SECTOR),
-        _ => 1024 * 1024,
+    if uses_cylinder_geometry(kind) {
+        geometry.cylinder_bytes().max(SECTOR)
+    } else {
+        1024 * 1024
     }
 }
 
@@ -909,6 +926,28 @@ mod tests {
         // Must start past the 2 MiB volume header, on a cylinder boundary.
         assert!(placed[0].start_byte() >= 2 * 1024 * 1024);
         assert_eq!(placed[0].start_lba % 5040, 0);
+    }
+
+    /// The GUI hides the heads / sectors controls and the Name column behind
+    /// these predicates, so a table that needs either and doesn't declare it
+    /// silently loses the input.
+    #[test]
+    fn geometry_and_name_predicates_match_what_the_writers_use() {
+        let geometry = Geometry {
+            heads: 8,
+            sectors_per_track: 32,
+        };
+        for &kind in WRITABLE_TABLES {
+            assert_eq!(
+                uses_cylinder_geometry(kind),
+                default_align(kind, geometry) == geometry.cylinder_bytes(),
+                "{} disagrees about cylinder alignment",
+                kind.label(),
+            );
+        }
+        assert!(carries_entry_name(TableKind::Rdb), "RDB drive names");
+        assert!(!carries_entry_name(TableKind::Mbr));
+        assert!(!carries_entry_name(TableKind::Atari));
     }
 
     #[test]

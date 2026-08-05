@@ -429,10 +429,10 @@ fn show_build_new(ui: &mut egui::Ui, builder: &mut DiskBuilder, allow_apply: boo
                 )
                 .on_hover_text(
                     "Partition starts are rounded up to this. Blank uses the \
-                     table default -- 1 MiB, or one cylinder on SGI. Accepts \
-                     1M / 63s (sectors).",
+                     table default -- 1 MiB, or one cylinder on SGI / RDB / \
+                     Sun. Accepts 1M / 63s (sectors).",
                 );
-                if builder.kind == type_catalog::TableKind::Sgi {
+                if provision::uses_cylinder_geometry(builder.kind) {
                     ui.label("Heads:");
                     ui.add(egui::DragValue::new(&mut builder.geometry.heads).range(1..=255));
                     ui.label("Sectors/track:");
@@ -447,12 +447,7 @@ fn show_build_new(ui: &mut egui::Ui, builder: &mut DiskBuilder, allow_apply: boo
             show_planned_layout_bar(ui, builder);
             ui.add_space(8.0);
 
-            let shows_name = matches!(
-                builder.kind,
-                type_catalog::TableKind::Gpt
-                    | type_catalog::TableKind::Apm
-                    | type_catalog::TableKind::X68k
-            );
+            let shows_name = provision::carries_entry_name(builder.kind);
             let planned = builder.plan().unwrap_or_default();
             let row_count = builder.rows.len();
 

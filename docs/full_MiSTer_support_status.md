@@ -73,7 +73,9 @@ support the disk types (floppy / hard disk / CD-ROM) of the outstanding cores.
   VMS ODS-2, plus the video-game console filesystems Nintendo GameCube / Wii,
   Philips CD-i, and 3DO Opera — browse/extract, see **Optical / CD-ROM**
   below).
-- **Partition tables:** MBR, GPT, APM, Amiga RDB, Atari AHDI, Sharp X68000.
+- **Partition tables:** MBR, GPT, APM, Amiga RDB, Atari AHDI, Sun SMI VTOC,
+  SGI volume header, Sharp X68000 — every one of them can now be **written**
+  from scratch as well as parsed (`rb-cli new hd <table>`).
 - **Containers:** CHD, VHD (fixed + dynamic), QCOW2, VMDK, 2MG, WOZ,
   DC42, HFV, IMZ (encrypted ZIP), `.zip` (a RAW disk image inside a plain
   ZIP, inflated sparsely; `--inside` picks among multiple), GHO/GHS (Ghost
@@ -120,7 +122,7 @@ Legend for the **Support** column:
 | TSConf | ZX-Evolution | SD/HDD (VHD) | FAT32 (non-MBR) | **Yes** |
 | Minimig-AGA | Commodore Amiga | Floppy, HDD, CD | OFS/FFS, PFS3, SFS (RDB) / ISO9660 | **Yes** |
 | MacPlus | Macintosh Plus | Floppy, HDD | HFS / MFS (400K floppy) | **Yes** — HFS + MFS both read/edit/create/fsck (400K / 800K MFS floppy) |
-| AtariST | Atari ST/STe | Floppy, HDD | GEMDOS = FAT12 / FAT16 | **Partial** — FAT yes; needs Atari AHDI partition table for HDD |
+| AtariST | Atari ST/STe | Floppy, HDD | GEMDOS = FAT12 / FAT16 | **Yes** — floppy (`.st` / `.msa` FAT12) and HDD. The AHDI partition table reads and writes: the four primary entries plus XGM extended chains are parsed, and `rb-cli new hd atari` lays down a fresh root sector with the tags you name (GEM / BGM / RAW; a GEM partition over 16 MiB is promoted to BGM as TOS requires). Partitions route to the existing FAT12/16 driver, so browse / extract / edit / fsck / backup / restore all work. Creating an XGM chain and writing a bootable bootstrap into the root sector are the remaining gaps. |
 | Apple-II | Apple IIe | Floppy, HDD | DOS 3.3 / ProDOS | **Yes** — ProDOS (read + edit + create + fsck; `rb-cli new volume prodos`) + Apple DOS 3.3 (read + edit + create + fsck; `rb-cli new floppy apple-dos`, 140 KB `.dsk`/`.do`/`.po`). Sector-order auto-detect via `containers::sector_order`. |
 | ZX-Spectrum | Sinclair ZX Spectrum | Floppy, SD/HDD | TR-DOS, G+DOS, +3DOS (CP/M-like), esxDOS FAT | **Partial** — TR-DOS (`.trd`, full quartet) + esxDOS FAT yes; +3DOS via CP/M (`zxplus3` preset); G+DOS (MGT) no |
 | X68000 | Sharp X68000 | Floppy, SASI/SCSI HDD | Human68k (FAT-derived dialect) | **Yes** — floppy (Human68k read/browse/extract + add/delete/mkdir on `.d88` / `.xdf` / `.hdm` / `.dim`; edits decode->mutate->re-encode back into the container, GUI and CLI) and SASI/SCSI HDD (`.hda` / `.hdf` / `.hds`) read/browse/extract/add/delete/mkdir + in-place FS grow/shrink (`rb-cli resize`) + defragmenting repack (`rb-cli repack` / Inspect-tab "Defragment…" — packs files contiguously, reclaiming holes left by deletions) + fsck (`rb-cli fsck` / Inspect-tab Check — FAT-chain reconciliation + FAT-mirror resync, lost-cluster reclaim), incl. real BlueSCSI `X68SCSI1` 1024-byte-sector images (sector size derived from the boot signature; Sharp/KG big-endian BPB + big-endian FAT). Verified byte-exact on the BlueSCSI HD10 SCSI fixture and the Populous/Lemmings/SSF2/Votoms 256-byte SASI game disks across grow→shrink round-trips (multi-cluster `COMMAND.X` + Japanese filenames survive). Backup/restore/reconstruct honor the true (non-512-aligned) partition byte offset via the persisted `start_byte`, so SASI backup→restore lands the partition region byte-identical. **New 2026-06-10:** `rb-cli new hd x68k` scaffolds self-bootable SASI/SCSI HDDs from scratch — emits the Sharp IPL signature, X68K partition table, IPL stub (halt or printed-banner via IOCS B_PRINT), and optionally clones an entire Human68k donor floppy (flat or `.dim` / `.D88` / `.xdf` / `.hdm`) into the partition. MAME-verified on `x68000 -sasi` (SASI variant, 256-B sectors) and `x68030 -hard` (SCSI variant, 1024-B sectors). The donor's `SWITCH.X /HD` installs the partition boot sector on first FDD0 boot, after which the HDD self-boots to C:. **Zero-manual-step mode** also available: `--boot-sector-donor hd0.hds --size 100M --variant scsi` extracts the Sharp partition boot sector (Sharp IPL Copyright 1990 SHARP) from the well-known `hd0.hds` 100 MB Sharp/Keisoku Giken donor at build time and overlays it onto the output partition — no `SWITCH.X` step needed, self-boots straight to C:> on first power-on. Sharp's boot-sector bytes never live in the rusty-backup repo; same legal pattern as `--system-disk` (you provide the donor file, the bytes flow user→user). |
@@ -233,7 +235,6 @@ convert only.
 
 | Item | Core(s) | Effort | Notes |
 |---|---|---|---|
-| **Atari AHDI partition table** | AtariST | S | Atari's MBR-like scheme; makes ST hard-disk images first-class (FAT already supported). |
 | **Apple DOS 3.3** | Apple-II | S-M | Complements existing ProDOS; covers sector-order .dsk/.do. |
 
 ---
@@ -256,7 +257,8 @@ no CD-using core is filesystem-blocked.)
 1. **CP/M (parameterized + EDSK decoder)** — unlocks ~6 cores including two
    HDD-relevant ones. Biggest payoff.
 2. **CBM DOS (+ GCR)** — unlocks 5 Commodore cores.
-3. **Near-complete touch-ups** — AtariST AHDI partition table, Apple DOS 3.3.
+3. **Near-complete touch-ups** — Apple DOS 3.3. (AtariST AHDI is done: read,
+   write, and `rb-cli new hd atari`.)
 4. **Human68k, ADFS/FileCore, QDOS** — the three outstanding HDD filesystems
    where resize/compaction actually pays off.
 5. Everything else is floppy-only long-tail: implement on demand;
