@@ -135,11 +135,9 @@ pub fn default_name(kind: TableKind, index: usize) -> String {
     }
 }
 
-/// Adjust a requested type to what the table can actually express at this
-/// size. AHDI's `GEM` describes a partition with a 16-bit sector count, so
-/// anything over 16 MiB has to become `BGM`; every other table takes the value
-/// as given. Applied in [`place`] so the log, the picker and the writer all
-/// agree on the effective type.
+/// Adjust a requested type to what the table can express at this size — only
+/// AHDI needs it. Applied in [`place`] so the log, the picker and the writer
+/// cannot disagree about the effective type.
 fn effective_type(kind: TableKind, text: String, size_bytes: u64) -> String {
     match kind {
         TableKind::Atari if size_bytes > AHDI_GEM_MAX_BYTES && text.eq_ignore_ascii_case("GEM") => {
@@ -168,8 +166,7 @@ pub fn reserved_head(kind: TableKind) -> u64 {
         // X68k: table at byte 2048, partitions conventionally from sector 64.
         TableKind::X68k => u64::from(crate::partition::x68k::X68K_FIRST_PARTITION_SECTOR) * SECTOR,
         // RDB: the RDSK plus its PART chain. Cylinder alignment then pushes
-        // the first partition out to cylinder 1, which is where Amiga tools
-        // put it.
+        // the first partition to cylinder 1, where Amiga tools put it.
         TableKind::Rdb => crate::partition::rdb::RDB_SCAN_BLOCKS * SECTOR,
         // Sun keeps only the 512-byte label at sector 0, but slices start on
         // cylinder boundaries, so alignment pushes slice 0 out to cylinder 1.
@@ -190,8 +187,7 @@ pub fn reserved_tail(kind: TableKind) -> u64 {
 }
 
 /// True for the tables that place partitions on cylinder boundaries, so the
-/// caller has to offer a heads / sectors-per-track control. Shared so the GUI,
-/// the TUI and the CLI gate on the same predicate.
+/// caller must offer a heads / sectors-per-track control. Shared by all UIs.
 pub fn uses_cylinder_geometry(kind: TableKind) -> bool {
     matches!(kind, TableKind::Sgi | TableKind::Rdb | TableKind::Sun)
 }
@@ -215,9 +211,8 @@ pub fn default_align(kind: TableKind, geometry: Geometry) -> u64 {
     }
 }
 
-/// Granularity a partition's *size* has to land on, not just its start. RDB
-/// stores bounds as low/high cylinder numbers, so a size that isn't a whole
-/// number of cylinders cannot be expressed; every other table counts sectors.
+/// Granularity a partition's *size* must land on, not just its start: the
+/// cylinder-based tables cannot express a part-cylinder size.
 fn size_granularity(kind: TableKind, align: u64) -> u64 {
     match kind {
         TableKind::Rdb | TableKind::Sun => align.max(SECTOR),
@@ -297,8 +292,7 @@ pub fn place(
         let size = match spec.size {
             Some(n) => {
                 // Check what was asked for, not what it rounds to, so a
-                // sub-sector request is still refused rather than silently
-                // becoming one sector.
+                // sub-sector request is refused instead of becoming a sector.
                 if n < SECTOR {
                     bail!("partition {} is smaller than one sector", i + 1);
                 }
@@ -353,7 +347,8 @@ fn round_up(v: u64, to: u64) -> u64 {
 
 /// Write `kind`'s table describing `placed` onto a `disk_size`-byte disk.
 ///
-/// `geometry` only matters for SGI; every other table ignores it.
+/// `geometry` matters only to the cylinder-based tables (see
+/// [`uses_cylinder_geometry`]); the rest ignore it.
 pub fn write_table<W: Write + Seek>(
     out: &mut W,
     kind: TableKind,
@@ -543,12 +538,8 @@ pub fn sgi_type_raw(text: &str) -> u32 {
     }
 }
 
-/// Amiga Rigid Disk Block: an `RDSK` at sector 0 followed by one `PART` block
-/// per partition, chained through `pb_Next`. Every field is big-endian, bounds
-/// are cylinders, and each block's longs must sum to zero.
-///
-/// Field placement follows `amitools`' `RDBlock.py` / `PartitionBlock.py`,
-/// which is the reference AmigaOS-compatible writer.
+/// Amiga RDB: an `RDSK` at sector 0 plus a `PART` chain. Big-endian, bounds in
+/// cylinders, every block's longs summing to zero; fields per `amitools`.
 fn write_rdb<W: Write + Seek>(
     out: &mut W,
     placed: &[Placed],
@@ -653,10 +644,8 @@ fn write_rdb<W: Write + Seek>(
     Ok(())
 }
 
-/// Atari AHDI: a single root sector holding four 12-byte entries at 0x1C6,
-/// the disk size, and a checksum word chosen so the sector's big-endian
-/// word-sum is `0x1234`. `AhdiTable::root_to_bytes` does the serialising, so
-/// this only has to fill the slots.
+/// Atari AHDI: four 12-byte entries at 0x1C6 in a root sector whose word-sum
+/// must be 0x1234. `AhdiTable::root_to_bytes` serialises; this fills slots.
 fn write_ahdi<W: Write + Seek>(out: &mut W, placed: &[Placed], disk_size: u64) -> Result<()> {
     use crate::partition::atari::{
         AhdiPartitionEntry, AhdiPartitionKind, AhdiTable, AHDI_NUM_SLOTS,
@@ -704,13 +693,9 @@ fn write_ahdi<W: Write + Seek>(out: &mut W, placed: &[Placed], disk_size: u64) -
     Ok(())
 }
 
-/// Sun disk label (SMI VTOC): one 512-byte label at sector 0 holding geometry,
-/// an 8-entry VTOC tag table and 8 `{start_cylinder, num_sectors}` slices.
-///
-/// Slice 2 is the whole-disk "backup" alias every Sun tool expects, so user
-/// partitions fill the other seven. Field offsets follow the kernel's
-/// `struct sun_disklabel` (`block/partitions/sun.c`), which is also what our
-/// parser reads.
+/// Sun SMI VTOC: one 512-byte label of geometry, tags and 8 cylinder-based
+/// slices, laid out per the kernel's `struct sun_disklabel`. Slice 2 is the
+/// whole-disk alias, so user partitions fill the other seven.
 fn write_sun<W: Write + Seek>(
     out: &mut W,
     placed: &[Placed],
@@ -947,9 +932,8 @@ mod tests {
         assert_eq!(placed[0].start_lba % 5040, 0);
     }
 
-    /// The GUI hides the heads / sectors controls and the Name column behind
-    /// these predicates, so a table that needs either and doesn't declare it
-    /// silently loses the input.
+    /// The GUI hides its geometry controls and Name column behind these, so a
+    /// table that needs either and doesn't declare it loses the input.
     #[test]
     fn geometry_and_name_predicates_match_what_the_writers_use() {
         let geometry = Geometry {
@@ -977,9 +961,8 @@ mod tests {
         assert_eq!(slot_limit(TableKind::Gpt), None);
     }
 
-    /// RDB bounds are low/high cylinder numbers, so both ends of every
-    /// partition have to be cylinder-aligned — not just the start, which is
-    /// all the other tables need.
+    /// RDB bounds are low/high cylinder numbers, so both ends of a partition
+    /// must be cylinder-aligned — not just the start, as elsewhere.
     #[test]
     fn rdb_sizes_round_up_to_whole_cylinders() {
         let geometry = Geometry::default();
@@ -1099,9 +1082,8 @@ mod tests {
         assert_eq!(browsable, vec![placed[0].start_lba, placed[1].start_lba]);
     }
 
-    /// AHDI has no magic number, so its root sector is only recognised by the
-    /// 0x1234 word-sum plus plausibly-shaped entries. GEM also cannot describe
-    /// a partition over 16 MiB, which is why `place` promotes it.
+    /// AHDI has no magic number — only the 0x1234 word-sum and plausible
+    /// entries — and GEM cannot describe a partition over 16 MiB.
     #[test]
     fn ahdi_stamps_its_checksum_and_promotes_oversized_gem_to_bgm() {
         use crate::partition::atari::{AhdiPartitionKind, AhdiTable};

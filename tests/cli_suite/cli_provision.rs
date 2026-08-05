@@ -85,9 +85,8 @@ fn sun_disk_reports_its_slices_and_skips_the_backup_alias() {
     assert_eq!(listed, 2, "backup slice leaked into the list:\n{info}");
 }
 
-/// AHDI's `GEM` cannot describe a partition over 16 MiB, so `place` promotes
-/// it — and the whole point of the table is that a filesystem poured into a
-/// partition is then reachable through it.
+/// GEM cannot describe a partition over 16 MiB, so `place` promotes it; and a
+/// filesystem poured into a partition has to be reachable through the table.
 #[test]
 fn atari_disk_promotes_oversized_gem_and_reaches_a_filled_partition() {
     let dir = tempfile::tempdir().expect("tempdir");

@@ -191,9 +191,8 @@ fn make_uuid() -> [u8; 16] {
     u
 }
 
-/// Build one superblock sector. `primary` carries the live counters; the
-/// per-AG copies keep `sb_inprogress` set the way `mkfs.xfs` leaves them, so
-/// `xfs_repair` knows they are not authoritative.
+/// Build one superblock sector. Only the primary carries live counters; the
+/// per-AG copies keep `sb_inprogress` set, as `mkfs.xfs` leaves them.
 fn build_superblock(l: &Layout, label: &str, uuid: &[u8; 16], primary: bool) -> Vec<u8> {
     let mut b = vec![0u8; SECTSIZE as usize];
     BigEndian::write_u32(&mut b[0..4], XFS_SB_MAGIC);
@@ -387,8 +386,8 @@ fn build_log_head(uuid: &[u8; 16]) -> Vec<u8> {
 }
 
 /// Stream a blank XFS volume into `sink` at `part_off`, writing only the
-/// regions that carry metadata. Returns the formatted length in bytes, which
-/// can be slightly under `size_bytes` when the trailing partial AG is dropped.
+/// regions that carry metadata. Returns the formatted length, which can be a
+/// touch under `size_bytes` when the trailing partial AG is dropped.
 pub fn write_blank_xfs<W: Write + Seek>(
     sink: &mut W,
     part_off: u64,
