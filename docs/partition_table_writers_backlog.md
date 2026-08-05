@@ -4,9 +4,9 @@
 provision a blank disk with a real partition table and partitions you size and
 type yourself. The layout maths and every table writer live in
 `src/partition/provision.rs`; `src/cli/verbs/new_partitioned_hd.rs` is only the
-CLI grammar over it. This page tracks which tables can be *written* and what
-each remaining one needs. Every format here already **parses** correctly — the
-gap is only the write side.
+CLI grammar over it. This page tracked which tables could be *written*; that
+list is now complete, so what remains is a record of how each writer is put
+together and what was learned building it.
 
 ## Status
 
@@ -19,7 +19,12 @@ gap is only the write side.
 | X68000 | Done | `partition::provision::write_x68k` |
 | RDB (Amiga) | Done | `partition::provision::write_rdb` |
 | Sun (SMI VTOC) | Done | `partition::provision::write_sun` |
-| **AHDI (Atari ST)** | **Missing** | see below |
+| AHDI (Atari ST) | Done | `partition::provision::write_ahdi` |
+
+Every table this project parses can now also be written. What is left is
+narrower: creating an AHDI **XGM extended chain** (only the four primary slots
+are written today), and editing an existing RDB or Sun label rather than
+laying down a fresh one.
 
 Filesystem creation is separate from table creation. A table writer produces
 empty partitions; `rb-cli reformat --fs <fs>` fills them. See
@@ -27,7 +32,7 @@ empty partitions; `rb-cli reformat --fs <fs>` fills them. See
 
 ## How to add a writer
 
-All seven existing writers follow the same shape, so a new one slots in without
+All eight existing writers follow the same shape, so a new one slots in without
 touching the layout engine:
 
 1. Add the variant to `PartitionedHdCommand` and to `HdCommand` in
@@ -122,26 +127,39 @@ DosTypes, the drive names and the exact free cylinder range.
 
 ---
 
-## AHDI (Atari ST)
+## AHDI (Atari ST) — done
 
-**Parser:** `src/partition/atari.rs`. `AtariPartitionType::to_bytes` exists but
-returns only the 3-byte type tag (`GEM`/`BGM`/`XGM`/`RAW`) — there is no table
-serialiser.
+Shipped as `partition::provision::write_ahdi`, reached from
+`rb-cli new hd atari`, the TUI's New wizard and the GUI's Build Disk picker.
+It turned out to be the thinnest of the four: `AhdiTable::root_to_bytes` was
+already a complete root-sector serialiser (including the checksum), so the
+writer only fills the four primary slots and hands it the table.
 
-**What a writer needs**
+Notes for anyone extending it:
 
-- The root sector: 4 primary entries at byte 0x1C6, each 12 bytes (flags byte,
-  3-byte type tag, 4-byte start sector, 4-byte length), plus the total-sector
-  count at 0x1C2. Big-endian, and there is **no boot signature** — detection is
-  by checksum and plausibility.
-- `GEM` for partitions up to 16 MB, `BGM` above it; `XGM` marks an extended
-  chain whose logical entries are relative to the XGM sector, MBR-EBR style.
-- The root sector checksum word makes the 16-bit sum of the sector equal
-  `0x1234` when the disk is meant to be bootable; non-bootable disks leave it
-  alone.
+- **Only the four primary slots are written.** XGM extended chains parse
+  (`AhdiTable::detect_and_walk` walks them, MBR-EBR style) but are not created,
+  so `slot_limit(Atari)` is 4. Creating an XGM chain is the one piece of this
+  page still open.
+- A `GEM` partition over 16 MiB is promoted to `BGM`, because GEM describes its
+  size with a 16-bit sector count. The promotion happens in `place()` via
+  `effective_type`, not in the writer, so the CLI log, the GUI picker and the
+  on-disk bytes all name the same type.
+- AHDI has **no magic number**. Detection keys off the 0x1234 word-sum plus at
+  least one plausibly-shaped entry, and it only runs on sectors that lack the
+  0xAA55 MBR signature — which a table we write never has.
+- The root sector's leading 454-byte bootstrap area is left zeroed, so a disk
+  we create is not TOS-bootable. Grafting in a real bootstrap is future work.
 
-**Validation.** Hatari with a TOS ROM, or `atari-hd-image` output to diff
-against.
+**Validation.** Round-trips through our own parser in
+`every_writable_table_writes_and_reparses` and
+`ahdi_stamps_its_checksum_and_promotes_oversized_gem_to_bgm`; independently
+re-parsed with a throwaway Python reader modelled on
+`scripts/generate-ahdi-fixture.sh` (the script that produced the committed
+real-tool fixture), which agrees on the checksum, both tags and both extents;
+and exercised end to end by pouring a FAT12 volume into partition 1 with
+`--fill`, then `put`-ing and `ls`-ing a file through it. Booting a real TOS
+machine is unproven — there is no bootstrap in the root sector to boot from.
 
 ---
 

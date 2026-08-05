@@ -1,9 +1,9 @@
 //! Lay out and write a fresh partition table on a blank disk.
 //!
-//! Shared by `rb-cli new hd {mbr|gpt|apm|sgi|x68k|rdb|sun}`, the TUI's New
-//! wizard and the GUI's Build Disk mode, so all three place partitions
-//! identically and emit byte-for-byte the same tables. AHDI is parse-only; see
-//! `docs/partition_table_writers_backlog.md` for what that writer still needs.
+//! Shared by `rb-cli new hd {mbr|gpt|apm|sgi|x68k|rdb|sun|atari}`, the TUI's
+//! New wizard and the GUI's Build Disk mode, so all three place partitions
+//! identically and emit byte-for-byte the same tables. See
+//! `docs/partition_table_writers_backlog.md` for how each writer is built.
 //!
 //! Sizes are laid out in order from `align` (1 MiB by default), each rounded up
 //! to the alignment, past whatever head/tail region the table itself reserves.
@@ -80,7 +80,11 @@ pub const WRITABLE_TABLES: &[TableKind] = &[
     TableKind::X68k,
     TableKind::Rdb,
     TableKind::Sun,
+    TableKind::Atari,
 ];
+
+/// A `GEM` partition cannot exceed 16 MiB; past that TOS wants `BGM`.
+const AHDI_GEM_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
 /// The slice a Sun label reserves for the whole-disk "backup" alias, which is
 /// conventionally slice 2 and overlaps every real slice.
@@ -99,6 +103,9 @@ pub fn slot_limit(kind: TableKind) -> Option<usize> {
         TableKind::Rdb => Some(crate::partition::rdb::RDB_SCAN_BLOCKS as usize - 1),
         // Sun has 8 slices; slice 2 is the whole-disk backup alias.
         TableKind::Sun => Some(7),
+        // Four primary slots. XGM extended chains parse, but we don't create
+        // them — see docs/partition_table_writers_backlog.md.
+        TableKind::Atari => Some(crate::partition::atari::AHDI_NUM_SLOTS),
         _ => None,
     }
 }
@@ -114,6 +121,7 @@ pub fn default_type(kind: TableKind) -> &'static str {
         TableKind::X68k => "Human68k",
         TableKind::Rdb => "DOS\\3",
         TableKind::Sun => "root",
+        TableKind::Atari => "GEM",
         _ => "83",
     }
 }
@@ -124,6 +132,20 @@ pub fn default_name(kind: TableKind, index: usize) -> String {
     match kind {
         TableKind::Rdb => format!("DH{index}"),
         _ => format!("Partition {}", index + 1),
+    }
+}
+
+/// Adjust a requested type to what the table can actually express at this
+/// size. AHDI's `GEM` describes a partition with a 16-bit sector count, so
+/// anything over 16 MiB has to become `BGM`; every other table takes the value
+/// as given. Applied in [`place`] so the log, the picker and the writer all
+/// agree on the effective type.
+fn effective_type(kind: TableKind, text: String, size_bytes: u64) -> String {
+    match kind {
+        TableKind::Atari if size_bytes > AHDI_GEM_MAX_BYTES && text.eq_ignore_ascii_case("GEM") => {
+            "BGM".to_string()
+        }
+        _ => text,
     }
 }
 
@@ -152,6 +174,9 @@ pub fn reserved_head(kind: TableKind) -> u64 {
         // Sun keeps only the 512-byte label at sector 0, but slices start on
         // cylinder boundaries, so alignment pushes slice 0 out to cylinder 1.
         TableKind::Sun => SECTOR,
+        // AHDI's root sector is sector 0; TOS tools conventionally leave
+        // sector 1 free too.
+        TableKind::Atari => 2 * SECTOR,
         _ => SECTOR,
     }
 }
@@ -276,11 +301,14 @@ pub fn place(
         out.push(Placed {
             start_lba: start / SECTOR,
             size_bytes: (size / SECTOR) * SECTOR,
-            type_text: spec
-                .type_text
-                .clone()
-                .filter(|t| !t.trim().is_empty())
-                .unwrap_or_else(|| default_type(kind).to_string()),
+            type_text: effective_type(
+                kind,
+                spec.type_text
+                    .clone()
+                    .filter(|t| !t.trim().is_empty())
+                    .unwrap_or_else(|| default_type(kind).to_string()),
+                size,
+            ),
             name: spec
                 .name
                 .clone()
@@ -317,6 +345,7 @@ pub fn write_table<W: Write + Seek>(
         TableKind::Sgi => write_sgi(out, placed, disk_size, geometry),
         TableKind::Rdb => write_rdb(out, placed, disk_size, geometry),
         TableKind::Sun => write_sun(out, placed, disk_size, geometry),
+        TableKind::Atari => write_ahdi(out, placed, disk_size),
         _ => bail!("no table writer for {}", kind.label()),
     }
 }
@@ -597,6 +626,57 @@ fn write_rdb<W: Write + Seek>(
         out.write_all(&part)
             .with_context(|| format!("writing PART block {block}"))?;
     }
+    Ok(())
+}
+
+/// Atari AHDI: a single root sector holding four 12-byte entries at 0x1C6,
+/// the disk size, and a checksum word chosen so the sector's big-endian
+/// word-sum is `0x1234`. `AhdiTable::root_to_bytes` does the serialising, so
+/// this only has to fill the slots.
+fn write_ahdi<W: Write + Seek>(out: &mut W, placed: &[Placed], disk_size: u64) -> Result<()> {
+    use crate::partition::atari::{
+        AhdiPartitionEntry, AhdiPartitionKind, AhdiTable, AHDI_NUM_SLOTS,
+    };
+
+    let empty = || AhdiPartitionEntry {
+        flags: 0,
+        kind: AhdiPartitionKind::Other([0, 0, 0]),
+        start_sector: 0,
+        sector_count: 0,
+        is_logical: false,
+    };
+    let mut primary: [AhdiPartitionEntry; AHDI_NUM_SLOTS] = std::array::from_fn(|_| empty());
+
+    for (slot, p) in primary.iter_mut().zip(placed.iter()) {
+        let tag = p.type_text.trim().to_ascii_uppercase();
+        let id: [u8; 3] = tag
+            .as_bytes()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("AHDI type tags are exactly 3 characters: '{tag}'"))?;
+        let kind = AhdiPartitionKind::from_bytes(id);
+        if !kind.is_recognized_or_printable() {
+            bail!("AHDI type tag '{tag}' is not upper-case alphanumeric");
+        }
+        *slot = AhdiPartitionEntry {
+            flags: 0x01, // bit 0 = exists
+            kind,
+            start_sector: p.start_lba as u32,
+            sector_count: (p.size_bytes / SECTOR) as u32,
+            is_logical: false,
+        };
+    }
+
+    let table = AhdiTable {
+        primary,
+        logical: Vec::new(),
+        disk_size_sectors: (disk_size / SECTOR) as u32,
+        bad_sector_list_start: 0,
+        checksum: 0,
+        checksum_valid: true,
+    };
+    out.seek(SeekFrom::Start(0))?;
+    out.write_all(&table.root_to_bytes())
+        .context("writing the AHDI root sector")?;
     Ok(())
 }
 
@@ -959,6 +1039,54 @@ mod tests {
             .map(|(_, s)| s.start_sector)
             .collect();
         assert_eq!(browsable, vec![placed[0].start_lba, placed[1].start_lba]);
+    }
+
+    /// AHDI has no magic number, so its root sector is only recognised by the
+    /// 0x1234 word-sum plus plausibly-shaped entries. GEM also cannot describe
+    /// a partition over 16 MiB, which is why `place` promotes it.
+    #[test]
+    fn ahdi_stamps_its_checksum_and_promotes_oversized_gem_to_bgm() {
+        use crate::partition::atari::{AhdiPartitionKind, AhdiTable};
+        use std::io::Cursor;
+
+        let disk = 64 * 1024 * 1024;
+        let specs = vec![
+            spec(Some(8 * 1024 * 1024)),
+            spec(Some(24 * 1024 * 1024)),
+            PartSpec {
+                size: None,
+                type_text: Some("RAW".to_string()),
+                name: None,
+            },
+        ];
+        let placed = place(&specs, TableKind::Atari, disk, DEFAULT_ALIGN).unwrap();
+        assert_eq!(placed[0].type_text, "GEM", "8 MiB still fits GEM");
+        assert_eq!(placed[1].type_text, "BGM", "24 MiB must be promoted");
+        assert_eq!(placed[2].type_text, "RAW", "an explicit tag is left alone");
+
+        let mut buf = Cursor::new(vec![0u8; disk as usize]);
+        write_table(
+            &mut buf,
+            TableKind::Atari,
+            &placed,
+            disk,
+            Geometry::default(),
+        )
+        .unwrap();
+        let img = buf.into_inner();
+
+        let table = AhdiTable::parse_root(&img[..512]).unwrap();
+        assert!(table.checksum_valid, "root sector word-sum is not 0x1234");
+        assert!(matches!(table.primary[0].kind, AhdiPartitionKind::Gem));
+        assert!(matches!(table.primary[1].kind, AhdiPartitionKind::Bgm));
+        assert!(matches!(table.primary[2].kind, AhdiPartitionKind::Raw));
+        assert!(table.primary[3].is_empty(), "unused slot must stay zeroed");
+        for (want, got) in placed.iter().zip(table.primary.iter()) {
+            assert!(got.exists());
+            assert_eq!(u64::from(got.start_sector), want.start_lba);
+            assert_eq!(got.size_bytes(), want.size_bytes);
+        }
+        assert_eq!(u64::from(table.disk_size_sectors), disk / 512);
     }
 
     #[test]

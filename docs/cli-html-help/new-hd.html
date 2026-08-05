@@ -21,6 +21,7 @@
 <li><a href="new-hd-rdb.html"><code>rdb</code></a><span class="desc">Amiga Rigid Disk Block (RDB) with partitions you size and type yourself. Cylinder-aligned from `--heads` / `--sectors`; types are AmigaDOS DosType tags (`DOS\\3`, `PFS\\3`, `SFS\\0`, ...)</span></li>
 <li><a href="new-hd-sun.html"><code>sun</code></a><span class="desc">Sun disk label (SMI VTOC) for SPARC Solaris / SunOS, with slices you size and tag yourself. Cylinder-aligned from `--heads` / `--sectors`; slice 2 is reserved for the whole-disk &quot;backup&quot; alias</span></li>
 <li><a href="new-hd-x68k-table.html"><code>x68k-table</code></a><span class="desc">Sharp X68000 SCSI/SASI table with partitions you size yourself. Unlike `x68k` this writes only the table -- no IPL stub, no Human68k formatting -- so it is a data disk, not a bootable one</span></li>
+<li><a href="new-hd-atari.html"><code>atari</code></a><span class="desc">Atari ST / TT / Falcon AHDI disk with partitions you size and type yourself. Types are the 3-character tags GEM / BGM / RAW; a GEM partition over 16 MiB is promoted to BGM, which is what TOS needs</span></li>
 </ul>
 <footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_docs</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
 </body></html>

@@ -1028,6 +1028,26 @@ Usage: apm [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
 - `--align` — Alignment for partition starts. Default 1 MiB; use 63s for DOS-era cylinder alignment on vintage machines
 - `--force` — Overwrite `image` if it already exists
 
+### `new hd atari`
+
+Atari ST / TT / Falcon AHDI disk with partitions you size and type yourself. Types are the 3-character tags GEM / BGM / RAW; a GEM partition over 16 MiB is promoted to BGM, which is what TOS needs
+
+```
+Usage: atari [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image file to create
+
+**Options**
+
+- `--size` — Total disk size (accepts `K`/`M`/`G` suffixes)
+- `--partition` — A partition, repeatable, in disk order: `SIZE[:TYPE[:NAME]]`. SIZE accepts `K`/`M`/`G`, or `rest` for the remaining space (once). TYPE is a value from `partmap types`; NAME is APM/GPT only
+- `--fill` — Pour an image into a partition as it is created: `N=PATH`, 1-based, repeatable. Any format the engine can read is decoded on the way in
+- `--align` — Alignment for partition starts. Default 1 MiB; use 63s for DOS-era cylinder alignment on vintage machines
+- `--force` — Overwrite `image` if it already exists
+
 ### `new hd gpt`
 
 GPT (UEFI, modern macOS / Linux) disk with partitions you size and type yourself

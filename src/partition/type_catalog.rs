@@ -22,6 +22,8 @@ pub enum TableKind {
     Sgi,
     /// Sun disk label (SMI VTOC). Entries carry a numeric VTOC tag.
     Sun,
+    /// Atari ST AHDI. Entries carry a 3-character ASCII type tag.
+    Atari,
     /// Sharp X68000. Entries carry a name, not a type code.
     X68k,
     /// Tables whose type field the editor does not expose a catalog for.
@@ -38,6 +40,7 @@ impl TableKind {
             TableKind::Rdb => "RDB",
             TableKind::Sgi => "SGI",
             TableKind::Sun => "Sun",
+            TableKind::Atari => "AHDI",
             TableKind::X68k => "X68000",
             TableKind::Other => "Unknown",
         }
@@ -52,6 +55,7 @@ impl TableKind {
             TableKind::Rdb => "AmigaDOS DosType tag (e.g. DOS\\3, PFS\\3, SFS\\0)",
             TableKind::Sgi => "SGI partition type keyword (e.g. XFS, EFS)",
             TableKind::Sun => "Sun VTOC slice tag, by name or number (e.g. root, usr, 4)",
+            TableKind::Atari => "AHDI 3-character type tag (GEM, BGM, XGM, RAW)",
             TableKind::X68k => "X68000 partition name (e.g. Human68k)",
             TableKind::Other => "Partition type value",
         }
@@ -76,6 +80,7 @@ pub fn kind_of(table: &PartitionTable) -> TableKind {
         PartitionTable::Rdb(_) => TableKind::Rdb,
         PartitionTable::Sgi(_) => TableKind::Sgi,
         PartitionTable::Sun(_) => TableKind::Sun,
+        PartitionTable::Ahdi(_) => TableKind::Atari,
         PartitionTable::X68k { .. } => TableKind::X68k,
         _ => TableKind::Other,
     }
@@ -90,6 +95,7 @@ pub fn choices(kind: TableKind) -> &'static [TypeChoice] {
         TableKind::Rdb => RDB_TYPES,
         TableKind::Sgi => SGI_TYPES,
         TableKind::Sun => SUN_TYPES,
+        TableKind::Atari => ATARI_TYPES,
         // X68k entries are named, not typed, so there is nothing to offer.
         TableKind::X68k => &[],
         TableKind::Other => &[],
@@ -125,7 +131,9 @@ fn normalize(kind: TableKind, value: &str) -> String {
                 Err(_) => String::new(),
             }
         }
-        TableKind::Gpt | TableKind::Apm | TableKind::Sgi => trimmed.to_ascii_uppercase(),
+        TableKind::Gpt | TableKind::Apm | TableKind::Sgi | TableKind::Atari => {
+            trimmed.to_ascii_uppercase()
+        }
         // A Sun slice tag is a number; the names are just aliases for one.
         TableKind::Sun => match crate::partition::sun::tag_from_text(trimmed) {
             Some(tag) => tag.to_string(),
@@ -325,6 +333,27 @@ const APM_TYPES: &[TypeChoice] = &[
     TypeChoice {
         value: "Apple_Scratch",
         label: "Empty / scratch",
+    },
+];
+
+/// AHDI type tags. `GEM` is the FAT12 / small-FAT16 partition every TOS
+/// version understands; `BGM` is its over-16-MiB counterpart.
+const ATARI_TYPES: &[TypeChoice] = &[
+    TypeChoice {
+        value: "GEM",
+        label: "GEMDOS (FAT12 / small FAT16)",
+    },
+    TypeChoice {
+        value: "BGM",
+        label: "Big GEM (FAT16 over 16 MiB)",
+    },
+    TypeChoice {
+        value: "RAW",
+        label: "Raw / non-filesystem",
+    },
+    TypeChoice {
+        value: "XGM",
+        label: "Extended container",
     },
 ];
 

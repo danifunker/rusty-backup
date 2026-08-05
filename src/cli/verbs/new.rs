@@ -4,7 +4,7 @@
 //!   (the fixed-geometry retro filesystems plus small FAT/HFS).
 //! * `new volume <fs> IMG`  — a bare single-volume image of arbitrary size
 //!   (a "superfloppy": NTFS, ext4, HFS+, EFS, …). No partition table.
-//! * `new hd {x68k|sgi-efs|mbr|gpt|apm|sgi|rdb|sun|x68k-table} IMG` — a
+//! * `new hd {x68k|sgi-efs|mbr|gpt|apm|sgi|rdb|sun|atari|x68k-table} IMG` — a
 //!   partition-table-wrapped, bootable
 //!   hard-disk image.
 //!
@@ -205,6 +205,11 @@ pub enum HdCommand {
     /// formatting -- so it is a data disk, not a bootable one.
     #[command(name = "x68k-table")]
     X68kTable(super::new_partitioned_hd::PartitionedHdArgs),
+
+    /// Atari ST / TT / Falcon AHDI disk with partitions you size and type
+    /// yourself. Types are the 3-character tags GEM / BGM / RAW; a GEM
+    /// partition over 16 MiB is promoted to BGM, which is what TOS needs.
+    Atari(super::new_partitioned_hd::PartitionedHdArgs),
 }
 
 /// Filesystems offered under `new floppy`. Converts to the master [`FsKind`].
@@ -512,6 +517,9 @@ pub fn run(cmd: NewCommand) -> Result<()> {
             ),
             HdCommand::X68kTable(args) => super::new_partitioned_hd::run(
                 super::new_partitioned_hd::PartitionedHdCommand::X68k(args),
+            ),
+            HdCommand::Atari(args) => super::new_partitioned_hd::run(
+                super::new_partitioned_hd::PartitionedHdCommand::Atari(args),
             ),
         },
     }

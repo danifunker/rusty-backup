@@ -1,10 +1,11 @@
-//! `rb-cli new hd {mbr|gpt|apm|sgi|x68k-table|rdb|sun} IMG` — a blank disk image
+//! `rb-cli new hd {mbr|gpt|apm|sgi|x68k-table|rdb|sun|atari} IMG` — a blank disk
+//! image
 //! carrying a real partition table with partitions you size and type yourself.
 //!
 //! This is the CLI grammar only; the layout maths and the table writers
 //! live in [`crate::partition::provision`], shared with the GUI's Build Disk
-//! mode. AHDI is parse-only for now; see
-//! `docs/partition_table_writers_backlog.md` for what each writer needs.
+//! mode. See `docs/partition_table_writers_backlog.md` for how each writer is
+//! put together.
 //!
 //! The existing `new hd` targets (`x68k`, `sgi-efs`) each build one specific
 //! platform's bootable disk. This one is the generic counterpart: it lays down
@@ -49,6 +50,8 @@ pub enum PartitionedHdCommand {
     Sun(CylinderHdArgs),
     /// Sharp X68000 SCSI/SASI table. Up to 8 partitions.
     X68k(PartitionedHdArgs),
+    /// Atari ST AHDI root sector. Up to 4 partitions.
+    Atari(PartitionedHdArgs),
 }
 
 #[derive(Debug, Args)]
@@ -103,6 +106,7 @@ pub fn run(cmd: PartitionedHdCommand) -> Result<()> {
         PartitionedHdCommand::Gpt(a) => (TableKind::Gpt, a),
         PartitionedHdCommand::Apm(a) => (TableKind::Apm, a),
         PartitionedHdCommand::X68k(a) => (TableKind::X68k, a),
+        PartitionedHdCommand::Atari(a) => (TableKind::Atari, a),
         PartitionedHdCommand::Sgi(a) => {
             geometry = Some(Geometry {
                 heads: a.heads,

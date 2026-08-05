@@ -1368,6 +1368,7 @@ enum HdPlatform {
     X68kTable,
     Rdb,
     Sun,
+    Atari,
 }
 
 /// Step the "write to" choice: whole disk -> each partition -> back to whole
@@ -1429,6 +1430,7 @@ const HD_PLATFORMS: &[(&str, HdPlatform)] = &[
     ("X68000 table only, one partition", HdPlatform::X68kTable),
     ("Amiga RDB, one partition", HdPlatform::Rdb),
     ("Sun disk label (SPARC), one slice", HdPlatform::Sun),
+    ("Atari ST AHDI, one partition", HdPlatform::Atari),
 ];
 
 /// Filesystems offered under `new floppy` in the wizard. CP/M is omitted here
@@ -5628,7 +5630,8 @@ impl App {
                         | HdPlatform::SgiTable
                         | HdPlatform::X68kTable
                         | HdPlatform::Rdb
-                        | HdPlatform::Sun => {
+                        | HdPlatform::Sun
+                        | HdPlatform::Atari => {
                             // One partition over the whole disk, at the CLI's
                             // default type and alignment.
                             let args = crate::cli::verbs::new_partitioned_hd::PartitionedHdArgs {
@@ -5643,6 +5646,7 @@ impl App {
                                 HdPlatform::Mbr => HdCommand::Mbr(args),
                                 HdPlatform::Gpt => HdCommand::Gpt(args),
                                 HdPlatform::X68kTable => HdCommand::X68kTable(args),
+                                HdPlatform::Atari => HdCommand::Atari(args),
                                 HdPlatform::SgiTable => HdCommand::Sgi(cylinder_args(args)),
                                 HdPlatform::Rdb => HdCommand::Rdb(cylinder_args(args)),
                                 HdPlatform::Sun => HdCommand::Sun(cylinder_args(args)),
