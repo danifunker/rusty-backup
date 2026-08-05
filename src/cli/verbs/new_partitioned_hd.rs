@@ -1,9 +1,12 @@
-//! `rb-cli new hd {mbr|gpt|apm} IMG` — a blank disk image carrying a real
-//! partition table with partitions you size and type yourself.
+//! `rb-cli new hd {mbr|gpt|apm|sgi|x68k-table} IMG` — a blank disk image
+//! carrying a real partition table with partitions you size and type yourself.
+//!
+//! Sun, RDB and AHDI are parse-only for now; see
+//! `docs/partition_table_writers_backlog.md` for what each writer needs.
 //!
 //! The existing `new hd` targets (`x68k`, `sgi-efs`) each build one specific
 //! platform's bootable disk. This one is the generic counterpart: it lays down
-//! an MBR, GPT or APM with N partitions and leaves them empty, so the volumes
+//! a table with N partitions and leaves them empty, so the volumes
 //! can be poured in afterwards with `rb-cli write IMG DEV --partition N` (or
 //! the GUI's Write Image File mode) and the filesystems formatted with
 //! `rb-cli reformat`.
@@ -36,6 +39,24 @@ pub enum PartitionedHdCommand {
     Gpt(PartitionedHdArgs),
     /// APM (Apple Partition Map) — classic Mac OS and PowerPC.
     Apm(PartitionedHdArgs),
+    /// SGI volume header (IRIX). Partitions are cylinder-aligned.
+    Sgi(SgiHdArgs),
+    /// Sharp X68000 SCSI/SASI table. Up to 8 partitions.
+    X68k(PartitionedHdArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct SgiHdArgs {
+    #[command(flatten)]
+    pub common: PartitionedHdArgs,
+
+    /// Disk geometry: heads. IRIX places partitions on cylinder boundaries.
+    #[arg(long, default_value_t = crate::partition::sgi_hdd_builder::DEFAULT_HEADS)]
+    pub heads: u16,
+
+    /// Disk geometry: sectors per track.
+    #[arg(long, default_value_t = crate::partition::sgi_hdd_builder::DEFAULT_SECTORS_PER_TRACK)]
+    pub sectors: u16,
 }
 
 #[derive(Debug, Args)]
@@ -82,25 +103,47 @@ struct Placed {
 }
 
 pub fn run(cmd: PartitionedHdCommand) -> Result<()> {
+    let mut geometry = None;
     let (kind, args) = match cmd {
         PartitionedHdCommand::Mbr(a) => (TableKind::Mbr, a),
         PartitionedHdCommand::Gpt(a) => (TableKind::Gpt, a),
         PartitionedHdCommand::Apm(a) => (TableKind::Apm, a),
+        PartitionedHdCommand::X68k(a) => (TableKind::X68k, a),
+        PartitionedHdCommand::Sgi(a) => {
+            geometry = Some((a.heads, a.sectors));
+            (TableKind::Sgi, a.common)
+        }
     };
 
     let disk_size = parse_size(&args.size)?;
-    let align = parse_align(&args.align)?;
+    // IRIX wants partitions on cylinder boundaries, so the geometry sets the
+    // alignment unless the user overrode it.
+    let align = match geometry {
+        Some((heads, spt)) if args.align == "1M" => u64::from(heads) * u64::from(spt) * SECTOR,
+        _ => parse_align(&args.align)?,
+    };
     let specs = args
         .partitions
         .iter()
         .map(|s| parse_spec(s))
         .collect::<Result<Vec<_>>>()?;
 
-    if kind == TableKind::Mbr && specs.len() > 4 {
-        bail!(
-            "MBR holds at most 4 primary partitions; {} were given",
-            specs.len()
-        );
+    let slot_limit = match kind {
+        TableKind::Mbr => Some(4),
+        TableKind::X68k => Some(crate::partition::x68k::X68K_MAX_PARTITIONS),
+        // SGI has 16 slots but reserves 8 (volhdr) and 10 (whole volume).
+        TableKind::Sgi => Some(crate::partition::sgi::SGI_NUM_PARTITIONS - 2),
+        _ => None,
+    };
+    if let Some(limit) = slot_limit {
+        if specs.len() > limit {
+            bail!(
+                "{} holds at most {} partitions; {} were given",
+                kind.label(),
+                limit,
+                specs.len(),
+            );
+        }
     }
 
     let placed = place(&specs, kind, disk_size, align)?;
@@ -126,7 +169,15 @@ pub fn run(cmd: PartitionedHdCommand) -> Result<()> {
         TableKind::Mbr => write_mbr(&mut file, &placed)?,
         TableKind::Gpt => write_gpt(&mut file, &placed, disk_size)?,
         TableKind::Apm => write_apm(&mut file, &placed, disk_size)?,
-        _ => unreachable!("only mbr/gpt/apm reach here"),
+        TableKind::X68k => write_x68k(&mut file, &placed, disk_size)?,
+        TableKind::Sgi => {
+            let (heads, spt) = geometry.unwrap_or((
+                crate::partition::sgi_hdd_builder::DEFAULT_HEADS,
+                crate::partition::sgi_hdd_builder::DEFAULT_SECTORS_PER_TRACK,
+            ));
+            write_sgi(&mut file, &placed, disk_size, heads, spt)?
+        }
+        _ => bail!("no table writer for {}", kind.label()),
     }
     file.flush().context("flushing the new image")?;
 
@@ -199,6 +250,9 @@ fn default_type(kind: TableKind) -> &'static str {
         TableKind::Mbr => "83",
         TableKind::Gpt => "0FC63DAF-8483-4772-8E79-3D69D8477DE4",
         TableKind::Apm => "Apple_HFS",
+        TableKind::Sgi => "XFS",
+        // X68k entries carry a name, not a type code.
+        TableKind::X68k => "Human68k",
         _ => "83",
     }
 }
@@ -211,6 +265,10 @@ fn reserved_head(kind: TableKind) -> u64 {
         // APM: block 0 driver descriptor + the map itself (63 blocks is the
         // convention every Apple tool writes).
         TableKind::Apm => 64 * SECTOR,
+        // SGI reserves a 2 MiB volume-header region at the front (slot 8).
+        TableKind::Sgi => 2 * 1024 * 1024,
+        // X68k: table at byte 2048, partitions conventionally from sector 64.
+        TableKind::X68k => u64::from(crate::partition::x68k::X68K_FIRST_PARTITION_SECTOR) * SECTOR,
         _ => SECTOR,
     }
 }
@@ -364,6 +422,136 @@ fn write_apm(file: &mut std::fs::File, placed: &[Placed], disk_size: u64) -> Res
     Ok(())
 }
 
+/// SGI volume header: data partitions in the low slots, the volume-header
+/// region in slot 8 and the whole-disk entry in slot 10, as IRIX expects.
+fn write_sgi(
+    file: &mut std::fs::File,
+    placed: &[Placed],
+    disk_size: u64,
+    heads: u16,
+    spt: u16,
+) -> Result<()> {
+    use crate::partition::sgi::{
+        SgiPartitionEntry, SgiPartitionType, SgiVolumeDirEntry, SgiVolumeHeader,
+        SGI_NUM_PARTITIONS, SGI_NUM_VOL_DIR, SGI_VOLHDR_MAGIC,
+    };
+
+    let cyl_sectors = u64::from(heads) * u64::from(spt);
+    if cyl_sectors == 0 {
+        bail!("heads and sectors-per-track must both be non-zero");
+    }
+    let total_sectors = disk_size / SECTOR;
+    let volhdr_sectors = reserved_head(TableKind::Sgi).div_ceil(SECTOR);
+
+    let mut partitions: Vec<SgiPartitionEntry> = (0..SGI_NUM_PARTITIONS)
+        .map(|_| SgiPartitionEntry {
+            blocks: 0,
+            first: 0,
+            partition_type_raw: SgiPartitionType::VolHdr.as_u32(),
+        })
+        .collect();
+
+    let mut slot = 0usize;
+    for p in placed {
+        // Slots 8 and 10 are spoken for by the volume header and whole volume.
+        while slot == 8 || slot == 10 {
+            slot += 1;
+        }
+        if slot >= SGI_NUM_PARTITIONS {
+            bail!("ran out of SGI partition slots");
+        }
+        partitions[slot] = SgiPartitionEntry {
+            blocks: (p.size_bytes / SECTOR) as u32,
+            first: p.start_lba as u32,
+            partition_type_raw: sgi_type_raw(&p.type_text),
+        };
+        slot += 1;
+    }
+    partitions[8] = SgiPartitionEntry {
+        blocks: volhdr_sectors as u32,
+        first: 0,
+        partition_type_raw: SgiPartitionType::VolHdr.as_u32(),
+    };
+    partitions[10] = SgiPartitionEntry {
+        blocks: total_sectors as u32,
+        first: 0,
+        partition_type_raw: SgiPartitionType::Volume.as_u32(),
+    };
+
+    let vh = SgiVolumeHeader {
+        magic: SGI_VOLHDR_MAGIC,
+        root_part_num: 0,
+        swap_part_num: 1,
+        device_parameters: crate::partition::sgi::SgiDeviceParameters::for_geometry(
+            (total_sectors / cyl_sectors) as u32,
+            heads,
+            spt,
+        ),
+        bootfile: "/unix".to_string(),
+        volume_directory: (0..SGI_NUM_VOL_DIR)
+            .map(|_| SgiVolumeDirEntry {
+                name: String::new(),
+                block_num: 0,
+                bytes: 0,
+            })
+            .collect(),
+        partitions,
+        checksum: 0,
+        checksum_valid: true,
+    };
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(&vh.to_bytes())
+        .context("writing the SGI volume header")?;
+    Ok(())
+}
+
+/// Map a type keyword to the SGI discriminant, falling back to XFS.
+fn sgi_type_raw(text: &str) -> u32 {
+    use crate::partition::sgi::SgiPartitionType;
+    let t = text.trim().to_ascii_lowercase();
+    match t.as_str() {
+        "efs" => SgiPartitionType::Efs.as_u32(),
+        "raw" => SgiPartitionType::Raw.as_u32(),
+        "volume" => SgiPartitionType::Volume.as_u32(),
+        "volhdr" => SgiPartitionType::VolHdr.as_u32(),
+        "xfslog" => SgiPartitionType::XfsLog.as_u32(),
+        "xlv" => SgiPartitionType::Xlv.as_u32(),
+        "xvm" => SgiPartitionType::Xvm.as_u32(),
+        _ => SgiPartitionType::Xfs.as_u32(),
+    }
+}
+
+/// X68000 table at byte 2048; `start`/`length` count logical sectors.
+fn write_x68k(file: &mut std::fs::File, placed: &[Placed], disk_size: u64) -> Result<()> {
+    use crate::partition::x68k::{X68kEntry, X68kPartitionTable, X68K_TABLE_OFFSET};
+
+    let entries = placed
+        .iter()
+        .map(|p| {
+            let mut name_raw = [b' '; 8];
+            // The name is the spec's third field; X68k has no type code.
+            let src = p.name.as_bytes();
+            let n = src.len().min(8);
+            name_raw[..n].copy_from_slice(&src[..n]);
+            X68kEntry {
+                name_raw,
+                name_display: p.name.clone(),
+                start_sector: p.start_lba as u32,
+                length_sectors: (p.size_bytes / SECTOR) as u32,
+            }
+        })
+        .collect();
+
+    let table = X68kPartitionTable {
+        disk_size_field: (disk_size / SECTOR) as u32,
+        entries,
+    };
+    file.seek(SeekFrom::Start(X68K_TABLE_OFFSET))?;
+    file.write_all(&table.to_bytes())
+        .context("writing the X68000 partition table")?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -437,6 +625,32 @@ mod tests {
         let err = place(&specs, TableKind::Mbr, 64 * 1024 * 1024, DEFAULT_ALIGN)
             .expect_err("must refuse");
         assert!(format!("{err:#}").contains("usable"), "{err:#}");
+    }
+
+    #[test]
+    fn sgi_reserves_its_volume_header_region() {
+        let specs = vec![spec("100M")];
+        let placed = place(&specs, TableKind::Sgi, 512 * 1024 * 1024, 5040 * 512).unwrap();
+        // Must start past the 2 MiB volume header, on a cylinder boundary.
+        assert!(placed[0].start_lba * 512 >= 2 * 1024 * 1024);
+        assert_eq!(placed[0].start_lba % 5040, 0);
+    }
+
+    #[test]
+    fn sgi_and_x68k_have_slot_limits() {
+        // SGI keeps slots 8 and 10 for itself.
+        assert_eq!(crate::partition::sgi::SGI_NUM_PARTITIONS - 2, 14);
+        assert_eq!(crate::partition::x68k::X68K_MAX_PARTITIONS, 8);
+    }
+
+    #[test]
+    fn sgi_type_keywords_map_to_discriminants() {
+        use crate::partition::sgi::SgiPartitionType;
+        assert_eq!(sgi_type_raw("EFS"), SgiPartitionType::Efs.as_u32());
+        assert_eq!(sgi_type_raw("raw"), SgiPartitionType::Raw.as_u32());
+        assert_eq!(sgi_type_raw("xfslog"), SgiPartitionType::XfsLog.as_u32());
+        // Anything unrecognised lands on XFS, the sane default for a data slice.
+        assert_eq!(sgi_type_raw("nonsense"), SgiPartitionType::Xfs.as_u32());
     }
 
     #[test]

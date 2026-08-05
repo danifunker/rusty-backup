@@ -17,6 +17,8 @@
 <li><a href="new-hd-mbr.html"><code>mbr</code></a><span class="desc">MBR (DOS / PC) disk with partitions you size and type yourself. The partitions come out empty — fill them with `write --partition N` or format them with `reformat`</span></li>
 <li><a href="new-hd-gpt.html"><code>gpt</code></a><span class="desc">GPT (UEFI, modern macOS / Linux) disk with partitions you size and type yourself</span></li>
 <li><a href="new-hd-apm.html"><code>apm</code></a><span class="desc">APM (Apple Partition Map) disk for classic Mac OS / PowerPC, with partitions you size and type yourself</span></li>
+<li><a href="new-hd-sgi.html"><code>sgi</code></a><span class="desc">SGI volume header (IRIX) with partitions you size and type yourself. Cylinder-aligned from `--heads` / `--sectors`. Unlike `sgi-efs` the partitions come out empty rather than EFS-formatted</span></li>
+<li><a href="new-hd-x68k-table.html"><code>x68k-table</code></a><span class="desc">Sharp X68000 SCSI/SASI table with partitions you size yourself. Unlike `x68k` this writes only the table -- no IPL stub, no Human68k formatting -- so it is a data disk, not a bootable one</span></li>
 </ul>
 <footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_docs</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
 </body></html>

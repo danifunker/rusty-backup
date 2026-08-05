@@ -20,6 +20,8 @@ pub enum TableKind {
     Apm,
     Rdb,
     Sgi,
+    /// Sharp X68000. Entries carry a name, not a type code.
+    X68k,
     /// Tables whose type field the editor does not expose a catalog for.
     Other,
 }
@@ -33,6 +35,7 @@ impl TableKind {
             TableKind::Apm => "APM",
             TableKind::Rdb => "RDB",
             TableKind::Sgi => "SGI",
+            TableKind::X68k => "X68000",
             TableKind::Other => "Unknown",
         }
     }
@@ -45,6 +48,7 @@ impl TableKind {
             TableKind::Apm => "APM partition type string (e.g. Apple_HFS)",
             TableKind::Rdb => "AmigaDOS DosType tag (e.g. DOS\\3, PFS\\3, SFS\\0)",
             TableKind::Sgi => "SGI partition type keyword (e.g. XFS, EFS)",
+            TableKind::X68k => "X68000 partition name (e.g. Human68k)",
             TableKind::Other => "Partition type value",
         }
     }
@@ -79,6 +83,8 @@ pub fn choices(kind: TableKind) -> &'static [TypeChoice] {
         TableKind::Apm => APM_TYPES,
         TableKind::Rdb => RDB_TYPES,
         TableKind::Sgi => SGI_TYPES,
+        // X68k entries are named, not typed, so there is nothing to offer.
+        TableKind::X68k => &[],
         TableKind::Other => &[],
     }
 }
@@ -113,7 +119,7 @@ fn normalize(kind: TableKind, value: &str) -> String {
             }
         }
         TableKind::Gpt | TableKind::Apm | TableKind::Sgi => trimmed.to_ascii_uppercase(),
-        TableKind::Rdb | TableKind::Other => trimmed.to_string(),
+        TableKind::Rdb | TableKind::X68k | TableKind::Other => trimmed.to_string(),
     }
 }
 

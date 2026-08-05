@@ -180,6 +180,17 @@ pub enum HdCommand {
     /// APM (Apple Partition Map) disk for classic Mac OS / PowerPC, with
     /// partitions you size and type yourself.
     Apm(super::new_partitioned_hd::PartitionedHdArgs),
+
+    /// SGI volume header (IRIX) with partitions you size and type yourself.
+    /// Cylinder-aligned from `--heads` / `--sectors`. Unlike `sgi-efs` the
+    /// partitions come out empty rather than EFS-formatted.
+    Sgi(super::new_partitioned_hd::SgiHdArgs),
+
+    /// Sharp X68000 SCSI/SASI table with partitions you size yourself.
+    /// Unlike `x68k` this writes only the table -- no IPL stub, no Human68k
+    /// formatting -- so it is a data disk, not a bootable one.
+    #[command(name = "x68k-table")]
+    X68kTable(super::new_partitioned_hd::PartitionedHdArgs),
 }
 
 /// Filesystems offered under `new floppy`. Converts to the master [`FsKind`].
@@ -472,6 +483,12 @@ pub fn run(cmd: NewCommand) -> Result<()> {
             ),
             HdCommand::Apm(args) => super::new_partitioned_hd::run(
                 super::new_partitioned_hd::PartitionedHdCommand::Apm(args),
+            ),
+            HdCommand::Sgi(args) => super::new_partitioned_hd::run(
+                super::new_partitioned_hd::PartitionedHdCommand::Sgi(args),
+            ),
+            HdCommand::X68kTable(args) => super::new_partitioned_hd::run(
+                super::new_partitioned_hd::PartitionedHdCommand::X68k(args),
             ),
         },
     }
