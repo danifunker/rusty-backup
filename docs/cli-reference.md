@@ -1068,6 +1068,28 @@ Usage: mbr [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
 - `--align` — Alignment for partition starts. Default 1 MiB; use 63s for DOS-era cylinder alignment on vintage machines
 - `--force` — Overwrite `image` if it already exists
 
+### `new hd rdb`
+
+Amiga Rigid Disk Block (RDB) with partitions you size and type yourself. Cylinder-aligned from `--heads` / `--sectors`; types are AmigaDOS DosType tags (`DOS\\3`, `PFS\\3`, `SFS\\0`, ...)
+
+```
+Usage: rdb [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image file to create
+
+**Options**
+
+- `--size` — Total disk size (accepts `K`/`M`/`G` suffixes)
+- `--partition` — A partition, repeatable, in disk order: `SIZE[:TYPE[:NAME]]`. SIZE accepts `K`/`M`/`G`, or `rest` for the remaining space (once). TYPE is a value from `partmap types`; NAME is APM/GPT only
+- `--fill` — Pour an image into a partition as it is created: `N=PATH`, 1-based, repeatable. Any format the engine can read is decoded on the way in
+- `--align` — Alignment for partition starts. Default 1 MiB; use 63s for DOS-era cylinder alignment on vintage machines
+- `--force` — Overwrite `image` if it already exists
+- `--heads` — Disk geometry: heads. These tables place partitions on cylinder boundaries, so the geometry sets the default alignment
+- `--sectors` — Disk geometry: sectors per track
+
 ### `new hd sgi`
 
 SGI volume header (IRIX) with partitions you size and type yourself. Cylinder-aligned from `--heads` / `--sectors`. Unlike `sgi-efs` the partitions come out empty rather than EFS-formatted
@@ -1087,7 +1109,7 @@ Usage: sgi [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
 - `--fill` — Pour an image into a partition as it is created: `N=PATH`, 1-based, repeatable. Any format the engine can read is decoded on the way in
 - `--align` — Alignment for partition starts. Default 1 MiB; use 63s for DOS-era cylinder alignment on vintage machines
 - `--force` — Overwrite `image` if it already exists
-- `--heads` — Disk geometry: heads. IRIX places partitions on cylinder boundaries
+- `--heads` — Disk geometry: heads. These tables place partitions on cylinder boundaries, so the geometry sets the default alignment
 - `--sectors` — Disk geometry: sectors per track
 
 ### `new hd sgi-efs`

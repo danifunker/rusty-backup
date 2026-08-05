@@ -17,8 +17,8 @@ gap is only the write side.
 | APM | Done | `partition::apm::build_minimal_apm` |
 | SGI (IRIX) | Done | `partition::provision::write_sgi` |
 | X68000 | Done | `partition::provision::write_x68k` |
+| RDB (Amiga) | Done | `partition::provision::write_rdb` |
 | **Sun (SMI VTOC)** | **Missing** | see below |
-| **RDB (Amiga)** | **Missing** | see below |
 | **AHDI (Atari ST)** | **Missing** | see below |
 
 Filesystem creation is separate from table creation. A table writer produces
@@ -27,7 +27,7 @@ empty partitions; `rb-cli reformat --fs <fs>` fills them. See
 
 ## How to add a writer
 
-All five existing writers follow the same shape, so a new one slots in without
+All six existing writers follow the same shape, so a new one slots in without
 touching the layout engine:
 
 1. Add the variant to `PartitionedHdCommand` and to `HdCommand` in
@@ -78,30 +78,36 @@ OpenIndiana VM, the way the EFS work was validated against IRIX.
 
 ---
 
-## RDB (Amiga Rigid Disk Block)
+## RDB (Amiga Rigid Disk Block) — done
 
-**Parser:** `src/partition/rdb.rs` — RDSK block plus a linked list of PART
-blocks. Note the editor currently supports only `SetBootable` on RDB
-(`partition::editor::apply_rdb_edits`); everything else bails.
+Shipped as `partition::provision::write_rdb`, reached from `rb-cli new hd rdb`,
+the TUI's New wizard and the GUI's Build Disk picker. It writes an `RDSK` at
+sector 0 and one `PART` block per partition at sectors 1..N, chained through
+`pb_Next`, with field placement taken from `amitools`' `RDBlock.py` /
+`PartitionBlock.py` — the reference AmigaOS-compatible writer.
 
-**What a writer needs**
+Notes for anyone extending it:
 
-- An `RDSK` block in the first 16 sectors: block size, cylinders, heads,
-  sectors, `rdb_PartitionList` pointing at the first PART block, and the usual
-  "highest/lowest cylinder" fields.
-- A chain of `PART` blocks, each holding a BSTR drive name (`DH0`), the
-  `de_` DosEnvec geometry sub-struct (block size in longs, surfaces, blocks per
-  track, low/high cylinder, reserved, `de_DosType`), and `pb_Next`.
-- **Every block carries a checksum: the 32-bit sum of all longs in the block
-  must be zero.** `rdb.rs` already computes this for `set_partition_bootable` —
-  reuse that helper rather than writing a second one.
-- Everything is **big-endian**, and partition bounds are in **cylinders**.
-- `de_DosType` is the filesystem tag (`DOS\3`, `PFS\3`, `SFS\0`); the values are
-  already in `type_catalog`'s `RDB_TYPES`.
+- Partitions are laid out in **cylinders**, so RDB is the first table whose
+  partition *sizes* also have to land on the alignment, not just their starts.
+  `place()` grew a `size_granularity` hook for that; every other table still
+  works in sectors.
+- The RDB owns cylinder 0 (`rdb_RDBBlocksLo` = 0, `rdb_RDBBlocksHi` =
+  `cyl_blks - 1`, `lo_cyl` = 1), which is what `rdb_cyls=1` gives you in
+  `rdbtool`. `slot_limit` caps partitions at 15 so every `PART` block stays
+  inside the first 16 sectors that Amiga tools scan.
+- The zero-sum block checksum is `rdb::stamp_checksum`, lifted out of
+  `set_partition_bootable` so both paths share one implementation.
+- Entries default to the AmigaDOS device names `DH0`, `DH1`, ... rather than the
+  generic `Partition N`, via `provision::default_name`.
+- The editor is still `SetBootable`-only on an *existing* RDB; that is
+  unchanged.
 
-**Validation.** Round-trip through our parser, then mount in an emulator
-(FS-UAE / vAmiga) with the matching filesystem handler. A wrong DosEnvec
-produces a partition AmigaOS sees but cannot mount.
+**Validation.** Round-trips through our own parser in
+`every_writable_table_writes_and_reparses`, and cross-checked against
+`amitools`' `rdbtool` (`python3 bin/rdbtool IMG info` / `free` from a checkout
+of <https://github.com/cnvogelg/amitools>), which reads back the geometry, both
+DosTypes, the drive names and the exact free cylinder range.
 
 ---
 

@@ -1,8 +1,8 @@
 //! Lay out and write a fresh partition table on a blank disk.
 //!
-//! Shared by `rb-cli new hd {mbr|gpt|apm|sgi|x68k}`, the TUI's New wizard and
-//! the GUI's Build Disk mode, so all three place partitions identically and
-//! emit byte-for-byte the same tables. Sun, RDB and AHDI are parse-only; see
+//! Shared by `rb-cli new hd {mbr|gpt|apm|sgi|x68k|rdb}`, the TUI's New wizard
+//! and the GUI's Build Disk mode, so all three place partitions identically and
+//! emit byte-for-byte the same tables. Sun and AHDI are parse-only; see
 //! `docs/partition_table_writers_backlog.md` for what each writer still needs.
 //!
 //! Sizes are laid out in order from `align` (1 MiB by default), each rounded up
@@ -78,6 +78,7 @@ pub const WRITABLE_TABLES: &[TableKind] = &[
     TableKind::Apm,
     TableKind::Sgi,
     TableKind::X68k,
+    TableKind::Rdb,
 ];
 
 /// How many partitions the table can hold, or `None` when it is unbounded in
@@ -88,6 +89,9 @@ pub fn slot_limit(kind: TableKind) -> Option<usize> {
         TableKind::X68k => Some(crate::partition::x68k::X68K_MAX_PARTITIONS),
         // SGI has 16 slots but reserves 8 (volhdr) and 10 (whole volume).
         TableKind::Sgi => Some(crate::partition::sgi::SGI_NUM_PARTITIONS - 2),
+        // RDB is a linked list, but keeping every PART block inside the first
+        // 16 sectors is what every Amiga tool scans for.
+        TableKind::Rdb => Some(crate::partition::rdb::RDB_SCAN_BLOCKS as usize - 1),
         _ => None,
     }
 }
@@ -101,7 +105,17 @@ pub fn default_type(kind: TableKind) -> &'static str {
         TableKind::Sgi => "XFS",
         // X68k entries carry a name, not a type code.
         TableKind::X68k => "Human68k",
+        TableKind::Rdb => "DOS\\3",
         _ => "83",
+    }
+}
+
+/// Default entry name when a spec doesn't give one. RDB names are AmigaDOS
+/// device names, so they get the conventional `DH0`, `DH1`, ... instead.
+pub fn default_name(kind: TableKind, index: usize) -> String {
+    match kind {
+        TableKind::Rdb => format!("DH{index}"),
+        _ => format!("Partition {}", index + 1),
     }
 }
 
@@ -117,6 +131,10 @@ pub fn reserved_head(kind: TableKind) -> u64 {
         TableKind::Sgi => 2 * 1024 * 1024,
         // X68k: table at byte 2048, partitions conventionally from sector 64.
         TableKind::X68k => u64::from(crate::partition::x68k::X68K_FIRST_PARTITION_SECTOR) * SECTOR,
+        // RDB: the RDSK plus its PART chain. Cylinder alignment then pushes
+        // the first partition out to cylinder 1, which is where Amiga tools
+        // put it.
+        TableKind::Rdb => crate::partition::rdb::RDB_SCAN_BLOCKS * SECTOR,
         _ => SECTOR,
     }
 }
@@ -130,11 +148,21 @@ pub fn reserved_tail(kind: TableKind) -> u64 {
 }
 
 /// The alignment to lay partitions on when the caller has no preference.
-/// SGI wants cylinder boundaries; everything else gets 1 MiB.
+/// SGI and RDB want cylinder boundaries; everything else gets 1 MiB.
 pub fn default_align(kind: TableKind, geometry: Geometry) -> u64 {
     match kind {
-        TableKind::Sgi => geometry.cylinder_bytes().max(SECTOR),
+        TableKind::Sgi | TableKind::Rdb => geometry.cylinder_bytes().max(SECTOR),
         _ => 1024 * 1024,
+    }
+}
+
+/// Granularity a partition's *size* has to land on, not just its start. RDB
+/// stores bounds as low/high cylinder numbers, so a size that isn't a whole
+/// number of cylinders cannot be expressed; every other table counts sectors.
+fn size_granularity(kind: TableKind, align: u64) -> u64 {
+    match kind {
+        TableKind::Rdb => align.max(SECTOR),
+        _ => SECTOR,
     }
 }
 
@@ -187,7 +215,12 @@ pub fn place(
             )
         })?;
 
-    let fixed: u64 = specs.iter().filter_map(|s| s.size).sum();
+    let gran = size_granularity(kind, align);
+    let fixed: u64 = specs
+        .iter()
+        .filter_map(|s| s.size)
+        .map(|n| round_up(n, gran))
+        .sum();
     let mut cursor = round_up(reserved_head(kind).max(align), align);
     if cursor.saturating_add(fixed) > usable_end {
         bail!(
@@ -203,9 +236,10 @@ pub fn place(
     for (i, spec) in specs.iter().enumerate() {
         let start = round_up(cursor, align);
         let size = match spec.size {
-            Some(n) => n,
+            Some(n) => round_up(n, gran),
             None => usable_end
                 .checked_sub(start)
+                .map(|n| (n / gran) * gran)
                 .filter(|n| *n > 0)
                 .ok_or_else(|| anyhow::anyhow!("no space left for the `rest` partition"))?,
         };
@@ -234,7 +268,7 @@ pub fn place(
                 .name
                 .clone()
                 .filter(|n| !n.trim().is_empty())
-                .unwrap_or_else(|| format!("Partition {}", i + 1)),
+                .unwrap_or_else(|| default_name(kind, i)),
         });
         cursor = end;
     }
@@ -264,6 +298,7 @@ pub fn write_table<W: Write + Seek>(
         TableKind::Apm => write_apm(out, placed, disk_size),
         TableKind::X68k => write_x68k(out, placed, disk_size),
         TableKind::Sgi => write_sgi(out, placed, disk_size, geometry),
+        TableKind::Rdb => write_rdb(out, placed, disk_size, geometry),
         _ => bail!("no table writer for {}", kind.label()),
     }
 }
@@ -437,6 +472,135 @@ pub fn sgi_type_raw(text: &str) -> u32 {
     }
 }
 
+/// Amiga Rigid Disk Block: an `RDSK` at sector 0 followed by one `PART` block
+/// per partition, chained through `pb_Next`. Every field is big-endian, bounds
+/// are cylinders, and each block's longs must sum to zero.
+///
+/// Field placement follows `amitools`' `RDBlock.py` / `PartitionBlock.py`,
+/// which is the reference AmigaOS-compatible writer.
+fn write_rdb<W: Write + Seek>(
+    out: &mut W,
+    placed: &[Placed],
+    disk_size: u64,
+    geometry: Geometry,
+) -> Result<()> {
+    use crate::partition::rdb::{parse_dos_type, stamp_checksum, NO_BLOCK, RDB_SCAN_BLOCKS};
+
+    let heads = u64::from(geometry.heads);
+    let sectors = u64::from(geometry.sectors_per_track);
+    let cyl_blks = heads * sectors;
+    if cyl_blks == 0 {
+        bail!("heads and sectors-per-track must both be non-zero");
+    }
+    let cylinders = disk_size / SECTOR / cyl_blks;
+    if cylinders < 2 {
+        bail!(
+            "an RDB disk needs at least two cylinders ({} each); {} is too small",
+            format_size(cyl_blks * SECTOR),
+            format_size(disk_size),
+        );
+    }
+
+    let mut rdsk = [0u8; 512];
+    rdsk[0..4].copy_from_slice(crate::partition::rdb::RDSK_SIGNATURE);
+    let part_list = if placed.is_empty() { NO_BLOCK } else { 1 };
+    for (long, value) in [
+        (1u32, 64u32),      // rdb_SummedLongs
+        (3, 7),             // rdb_HostID
+        (4, SECTOR as u32), // rdb_BlockBytes
+        (5, 0x17),          // last disk/lun/tid + disk ID valid
+        (6, NO_BLOCK),      // rdb_BadBlockList
+        (7, part_list),     // rdb_PartitionList
+        (8, NO_BLOCK),      // rdb_FileSysHeaderList
+        (9, NO_BLOCK),      // rdb_DriveInit
+        (16, cylinders as u32),
+        (17, sectors as u32),
+        (18, heads as u32),
+        (19, 1),                      // interleave
+        (20, cylinders as u32),       // parking zone
+        (24, cylinders as u32),       // write pre-comp
+        (25, cylinders as u32),       // reduced write
+        (26, 3),                      // step rate
+        (32, 0),                      // rdb_RDBBlocksLo
+        (33, (cyl_blks - 1) as u32),  // rdb_RDBBlocksHi: cylinder 0 is ours
+        (34, 1),                      // rdb_LoCylinder
+        (35, (cylinders - 1) as u32), // rdb_HiCylinder
+        (36, cyl_blks as u32),
+        (38, placed.len() as u32), // rdb_HighRDSKBlock
+    ] {
+        put_long(&mut rdsk, long as usize, value);
+    }
+    put_cstr(&mut rdsk, 40, 8, "RUSTYBK");
+    put_cstr(&mut rdsk, 42, 16, "RB IMAGE");
+    put_cstr(&mut rdsk, 46, 4, "0001");
+    stamp_checksum(&mut rdsk);
+    out.seek(SeekFrom::Start(0))?;
+    out.write_all(&rdsk).context("writing the RDSK block")?;
+
+    for (i, p) in placed.iter().enumerate() {
+        let block = 1 + i as u32;
+        if u64::from(block) >= RDB_SCAN_BLOCKS {
+            bail!("more RDB partitions than fit in the first {RDB_SCAN_BLOCKS} sectors");
+        }
+        let low_cyl = p.start_lba / cyl_blks;
+        let high_cyl = (p.start_lba + p.size_bytes / SECTOR) / cyl_blks - 1;
+        let dos_type = parse_dos_type(&p.type_text)
+            .ok_or_else(|| anyhow::anyhow!("bad Amiga DosType '{}'", p.type_text))?;
+
+        let mut part = [0u8; 512];
+        part[0..4].copy_from_slice(crate::partition::rdb::PART_SIGNATURE);
+        let next = if i + 1 < placed.len() {
+            block + 1
+        } else {
+            NO_BLOCK
+        };
+        for (long, value) in [
+            (1u32, 64u32), // pb_SummedLongs
+            (3, 7),        // pb_HostID
+            (4, next),
+            (32, 16),  // de_TableSize: the classic 16-long DosEnvec
+            (33, 128), // de_SizeBlock, in longs
+            (35, heads as u32),
+            (36, 1), // de_SectorPerBlock
+            (37, sectors as u32),
+            (38, 2),           // de_Reserved: the two AmigaDOS boot blocks
+            (43, 30),          // de_NumBuffers
+            (45, 0x00FF_FFFF), // de_MaxTransfer
+            (46, 0x7FFF_FFFE), // de_Mask
+            (41, low_cyl as u32),
+            (42, high_cyl as u32),
+            (48, dos_type),
+        ] {
+            put_long(&mut part, long as usize, value);
+        }
+        put_bstr(&mut part, 9, 31, &p.name);
+        stamp_checksum(&mut part);
+        out.seek(SeekFrom::Start(u64::from(block) * SECTOR))?;
+        out.write_all(&part)
+            .with_context(|| format!("writing PART block {block}"))?;
+    }
+    Ok(())
+}
+
+fn put_long(buf: &mut [u8; 512], long_idx: usize, value: u32) {
+    buf[long_idx * 4..long_idx * 4 + 4].copy_from_slice(&value.to_be_bytes());
+}
+
+/// Fixed-width, NUL-padded string field, as the RDSK's drive-ID block uses.
+fn put_cstr(buf: &mut [u8; 512], long_idx: usize, max_bytes: usize, text: &str) {
+    let start = long_idx * 4;
+    let n = text.len().min(max_bytes);
+    buf[start..start + n].copy_from_slice(&text.as_bytes()[..n]);
+}
+
+/// BSTR: one length byte then the characters, as PART's drive name uses.
+fn put_bstr(buf: &mut [u8; 512], long_idx: usize, max_chars: usize, text: &str) {
+    let start = long_idx * 4;
+    let n = text.len().min(max_chars);
+    buf[start] = n as u8;
+    buf[start + 1..start + 1 + n].copy_from_slice(&text.as_bytes()[..n]);
+}
+
 /// X68000 table at byte 2048; `start`/`length` count logical sectors.
 fn write_x68k<W: Write + Seek>(out: &mut W, placed: &[Placed], disk_size: u64) -> Result<()> {
     use crate::partition::x68k::{X68kEntry, X68kPartitionTable, X68K_TABLE_OFFSET};
@@ -564,7 +728,92 @@ mod tests {
     fn sgi_and_x68k_have_slot_limits() {
         assert_eq!(slot_limit(TableKind::Sgi), Some(14));
         assert_eq!(slot_limit(TableKind::X68k), Some(8));
+        assert_eq!(slot_limit(TableKind::Rdb), Some(15));
         assert_eq!(slot_limit(TableKind::Gpt), None);
+    }
+
+    /// RDB bounds are low/high cylinder numbers, so both ends of every
+    /// partition have to be cylinder-aligned — not just the start, which is
+    /// all the other tables need.
+    #[test]
+    fn rdb_sizes_round_up_to_whole_cylinders() {
+        let geometry = Geometry::default();
+        let cyl = geometry.cylinder_bytes();
+        let align = default_align(TableKind::Rdb, geometry);
+        assert_eq!(align, cyl);
+
+        // 60 MiB is not a whole number of 504 KiB cylinders.
+        let specs = vec![spec(Some(60 * 1024 * 1024)), spec(None)];
+        let placed = place(&specs, TableKind::Rdb, 200 * 1024 * 1024, align).unwrap();
+        for p in &placed {
+            assert_eq!(p.start_byte() % cyl, 0, "start {p:?}");
+            assert_eq!(p.size_bytes % cyl, 0, "size {p:?}");
+        }
+        // The RDB itself owns cylinder 0, so the first partition starts at 1.
+        assert_eq!(placed[0].start_byte(), cyl);
+        assert!(placed[0].size_bytes >= 60 * 1024 * 1024);
+    }
+
+    /// The AmigaDOS DosType tag and drive name are the two fields that make an
+    /// RDB entry mountable, and neither is checked by the generic round-trip.
+    #[test]
+    fn rdb_carries_dos_types_and_drive_names() {
+        use crate::partition::PartitionTable;
+        use std::io::Cursor;
+
+        let disk = 200 * 1024 * 1024;
+        let geometry = Geometry::default();
+        let specs = vec![
+            PartSpec {
+                size: Some(60 * 1024 * 1024),
+                type_text: Some("DOS\\3".to_string()),
+                name: Some("WORK".to_string()),
+            },
+            PartSpec {
+                size: None,
+                type_text: Some("PFS\\3".to_string()),
+                name: None,
+            },
+        ];
+        let placed = place(
+            &specs,
+            TableKind::Rdb,
+            disk,
+            default_align(TableKind::Rdb, geometry),
+        )
+        .unwrap();
+        let mut buf = Cursor::new(vec![0u8; disk as usize]);
+        write_table(&mut buf, TableKind::Rdb, &placed, disk, geometry).unwrap();
+
+        let mut reader = Cursor::new(buf.into_inner());
+        let table = PartitionTable::detect(&mut reader).unwrap();
+        let PartitionTable::Rdb(rdb) = &table else {
+            panic!("did not reparse as RDB: {table:?}");
+        };
+        assert_eq!(rdb.partitions.len(), 2);
+        assert_eq!(rdb.partitions[0].dos_type_string(), "DOS\\3");
+        assert_eq!(rdb.partitions[0].drv_name, "WORK");
+        assert_eq!(rdb.partitions[1].dos_type_string(), "PFS\\3");
+        // An unnamed entry gets the conventional AmigaDOS device name.
+        assert_eq!(rdb.partitions[1].drv_name, "DH1");
+        // Partition geometry has to agree with the RDSK's, or AmigaOS computes
+        // a different offset than we wrote.
+        assert_eq!(rdb.partitions[0].surfaces, u32::from(geometry.heads));
+        assert_eq!(
+            rdb.partitions[0].blk_per_trk,
+            u32::from(geometry.sectors_per_track)
+        );
+        assert_eq!(rdb.header.cyl_blks, geometry.cylinder_bytes() as u32 / 512);
+    }
+
+    #[test]
+    fn rdb_refuses_a_disk_smaller_than_two_cylinders() {
+        use std::io::Cursor;
+        let geometry = Geometry::default();
+        let mut buf = Cursor::new(vec![0u8; 4096]);
+        let err = write_table(&mut buf, TableKind::Rdb, &[], 4096, geometry)
+            .expect_err("one cylinder is 504 KiB");
+        assert!(format!("{err:#}").contains("two cylinders"), "{err:#}");
     }
 
     #[test]
@@ -647,6 +896,7 @@ mod tests {
             (TableKind::Gpt, "MyData"),
             // X68000 truncates names to 8 bytes.
             (TableKind::X68k, "HUMAN68K"),
+            (TableKind::Rdb, "DH4"),
         ] {
             let specs = vec![named(wanted)];
             let geometry = Geometry::default();

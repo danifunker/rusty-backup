@@ -1,9 +1,9 @@
-//! `rb-cli new hd {mbr|gpt|apm|sgi|x68k-table} IMG` — a blank disk image
+//! `rb-cli new hd {mbr|gpt|apm|sgi|x68k-table|rdb} IMG` — a blank disk image
 //! carrying a real partition table with partitions you size and type yourself.
 //!
-//! This is the CLI grammar only; the layout maths and the five table writers
+//! This is the CLI grammar only; the layout maths and the table writers
 //! live in [`crate::partition::provision`], shared with the GUI's Build Disk
-//! mode. Sun, RDB and AHDI are parse-only for now; see
+//! mode. Sun and AHDI are parse-only for now; see
 //! `docs/partition_table_writers_backlog.md` for what each writer needs.
 //!
 //! The existing `new hd` targets (`x68k`, `sgi-efs`) each build one specific
@@ -41,17 +41,20 @@ pub enum PartitionedHdCommand {
     /// APM (Apple Partition Map) — classic Mac OS and PowerPC.
     Apm(PartitionedHdArgs),
     /// SGI volume header (IRIX). Partitions are cylinder-aligned.
-    Sgi(SgiHdArgs),
+    Sgi(CylinderHdArgs),
+    /// Amiga Rigid Disk Block. Partitions are cylinder-aligned.
+    Rdb(CylinderHdArgs),
     /// Sharp X68000 SCSI/SASI table. Up to 8 partitions.
     X68k(PartitionedHdArgs),
 }
 
 #[derive(Debug, Args)]
-pub struct SgiHdArgs {
+pub struct CylinderHdArgs {
     #[command(flatten)]
     pub common: PartitionedHdArgs,
 
-    /// Disk geometry: heads. IRIX places partitions on cylinder boundaries.
+    /// Disk geometry: heads. These tables place partitions on cylinder
+    /// boundaries, so the geometry sets the default alignment.
     #[arg(long, default_value_t = crate::partition::sgi_hdd_builder::DEFAULT_HEADS)]
     pub heads: u16,
 
@@ -104,12 +107,19 @@ pub fn run(cmd: PartitionedHdCommand) -> Result<()> {
             });
             (TableKind::Sgi, a.common)
         }
+        PartitionedHdCommand::Rdb(a) => {
+            geometry = Some(Geometry {
+                heads: a.heads,
+                sectors_per_track: a.sectors,
+            });
+            (TableKind::Rdb, a.common)
+        }
     };
     let geometry = geometry.unwrap_or_default();
 
     let disk_size = parse_size(&args.size)?;
-    // IRIX wants partitions on cylinder boundaries, so the geometry sets the
-    // alignment unless the user overrode it.
+    // IRIX and AmigaDOS want partitions on cylinder boundaries, so the geometry
+    // sets the alignment unless the user overrode it.
     let align = if args.align == "1M" {
         provision::default_align(kind, geometry)
     } else {

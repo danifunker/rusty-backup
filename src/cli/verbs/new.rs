@@ -4,7 +4,8 @@
 //!   (the fixed-geometry retro filesystems plus small FAT/HFS).
 //! * `new volume <fs> IMG`  — a bare single-volume image of arbitrary size
 //!   (a "superfloppy": NTFS, ext4, HFS+, EFS, …). No partition table.
-//! * `new hd {x68k|sgi-efs} IMG` — a partition-table-wrapped, bootable
+//! * `new hd {x68k|sgi-efs|mbr|gpt|apm|sgi|rdb|x68k-table} IMG` — a
+//!   partition-table-wrapped, bootable
 //!   hard-disk image.
 //!
 //! CD-ROM images live under `optical new` (e.g. `optical new sgi-efs`).
@@ -187,7 +188,12 @@ pub enum HdCommand {
     /// SGI volume header (IRIX) with partitions you size and type yourself.
     /// Cylinder-aligned from `--heads` / `--sectors`. Unlike `sgi-efs` the
     /// partitions come out empty rather than EFS-formatted.
-    Sgi(super::new_partitioned_hd::SgiHdArgs),
+    Sgi(super::new_partitioned_hd::CylinderHdArgs),
+
+    /// Amiga Rigid Disk Block (RDB) with partitions you size and type
+    /// yourself. Cylinder-aligned from `--heads` / `--sectors`; types are
+    /// AmigaDOS DosType tags (`DOS\\3`, `PFS\\3`, `SFS\\0`, ...).
+    Rdb(super::new_partitioned_hd::CylinderHdArgs),
 
     /// Sharp X68000 SCSI/SASI table with partitions you size yourself.
     /// Unlike `x68k` this writes only the table -- no IPL stub, no Human68k
@@ -492,6 +498,9 @@ pub fn run(cmd: NewCommand) -> Result<()> {
             ),
             HdCommand::Sgi(args) => super::new_partitioned_hd::run(
                 super::new_partitioned_hd::PartitionedHdCommand::Sgi(args),
+            ),
+            HdCommand::Rdb(args) => super::new_partitioned_hd::run(
+                super::new_partitioned_hd::PartitionedHdCommand::Rdb(args),
             ),
             HdCommand::X68kTable(args) => super::new_partitioned_hd::run(
                 super::new_partitioned_hd::PartitionedHdCommand::X68k(args),

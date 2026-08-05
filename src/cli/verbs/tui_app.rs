@@ -1366,6 +1366,7 @@ enum HdPlatform {
     /// Partition table only — no EFS format, no IPL stub, unlike the two above.
     SgiTable,
     X68kTable,
+    Rdb,
 }
 
 /// Step the "write to" choice: whole disk -> each partition -> back to whole
@@ -1402,6 +1403,18 @@ fn read_target_partitions(device: &std::path::Path) -> Vec<crate::partition::Par
     }
 }
 
+/// Wrap the shared args with the default cylinder geometry, for the two
+/// tables whose partitions land on cylinder boundaries.
+fn cylinder_args(
+    common: crate::cli::verbs::new_partitioned_hd::PartitionedHdArgs,
+) -> crate::cli::verbs::new_partitioned_hd::CylinderHdArgs {
+    crate::cli::verbs::new_partitioned_hd::CylinderHdArgs {
+        common,
+        heads: crate::partition::sgi_hdd_builder::DEFAULT_HEADS,
+        sectors: crate::partition::sgi_hdd_builder::DEFAULT_SECTORS_PER_TRACK,
+    }
+}
+
 const HD_PLATFORMS: &[(&str, HdPlatform)] = &[
     ("Sharp X68000 (Human68k)", HdPlatform::X68k),
     ("SGI IRIX (EFS, dvh)", HdPlatform::SgiEfs),
@@ -1413,6 +1426,7 @@ const HD_PLATFORMS: &[(&str, HdPlatform)] = &[
         HdPlatform::SgiTable,
     ),
     ("X68000 table only, one partition", HdPlatform::X68kTable),
+    ("Amiga RDB, one partition", HdPlatform::Rdb),
 ];
 
 /// Filesystems offered under `new floppy` in the wizard. CP/M is omitted here
@@ -5610,7 +5624,8 @@ impl App {
                         | HdPlatform::Gpt
                         | HdPlatform::Apm
                         | HdPlatform::SgiTable
-                        | HdPlatform::X68kTable => {
+                        | HdPlatform::X68kTable
+                        | HdPlatform::Rdb => {
                             // One partition over the whole disk, at the CLI's
                             // default type and alignment.
                             let args = crate::cli::verbs::new_partitioned_hd::PartitionedHdArgs {
@@ -5625,14 +5640,8 @@ impl App {
                                 HdPlatform::Mbr => HdCommand::Mbr(args),
                                 HdPlatform::Gpt => HdCommand::Gpt(args),
                                 HdPlatform::X68kTable => HdCommand::X68kTable(args),
-                                HdPlatform::SgiTable => HdCommand::Sgi(
-                                    crate::cli::verbs::new_partitioned_hd::SgiHdArgs {
-                                        common: args,
-                                        heads: crate::partition::sgi_hdd_builder::DEFAULT_HEADS,
-                                        sectors:
-                                            crate::partition::sgi_hdd_builder::DEFAULT_SECTORS_PER_TRACK,
-                                    },
-                                ),
+                                HdPlatform::SgiTable => HdCommand::Sgi(cylinder_args(args)),
+                                HdPlatform::Rdb => HdCommand::Rdb(cylinder_args(args)),
                                 _ => HdCommand::Apm(args),
                             }
                         }
