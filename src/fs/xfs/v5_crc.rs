@@ -121,12 +121,16 @@ pub fn fsblock_to_daddr(fsblock: u64, sb: &XfsSuperblock) -> u64 {
 
 /// Convenience wrapper around [`stamp_sblock_crc_header`] for AG-relative
 /// btree blocks (inobt / bnobt / cntbt). Takes the host AG and the block's
-/// AG-relative number, computes the fsblock + daddr, and stamps the
-/// standard `bb_blkno` / `bb_lsn` / `bb_uuid` / `bb_owner` (= agno) /
-/// `bb_crc` tuple. v4 callers must guard with `sb.is_v5()`.
+/// AG-relative number, computes the daddr, and stamps the standard
+/// `bb_blkno` / `bb_lsn` / `bb_uuid` / `bb_owner` (= agno) / `bb_crc` tuple.
+/// v4 callers must guard with `sb.is_v5()`.
+///
+/// `bb_blkno` is a *physical* address, so it comes from `agno * sb_agblocks`
+/// (`XFS_AGB_TO_DADDR`) — not from the sparse `agno << sb_agblklog` fsblock
+/// encoding, which only coincides when `sb_agblocks` is a power of two.
 pub fn stamp_sblock_hdr_for_ag(buf: &mut [u8], sb: &XfsSuperblock, agno: u64, agbno: u32) {
-    let fsblock = (agno << sb.agblklog) | agbno as u64;
-    let blkno = fsblock_to_daddr(fsblock, sb);
+    let physical = agno * sb.agblocks as u64 + agbno as u64;
+    let blkno = fsblock_to_daddr(physical, sb);
     stamp_sblock_crc_header(buf, blkno, agno as u32, sb);
 }
 

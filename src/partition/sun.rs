@@ -84,6 +84,27 @@ impl SunSlice {
     }
 }
 
+/// Resolve a slice-tag spelling — a name as [`SunSlice::tag_name`] prints it,
+/// or a bare decimal number — to its VTOC tag.
+pub fn tag_from_text(text: &str) -> Option<u16> {
+    let t = text.trim();
+    if let Ok(n) = t.parse::<u16>() {
+        return Some(n);
+    }
+    let lower = t.to_ascii_lowercase();
+    (0..=11u16).find(|&tag| {
+        SunSlice {
+            start_cylinder: 0,
+            start_sector: 0,
+            num_sectors: 0,
+            tag,
+            flags: 0,
+        }
+        .tag_name()
+            == lower
+    })
+}
+
 /// A parsed Sun disk label.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SunDiskLabel {

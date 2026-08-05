@@ -1008,6 +1008,130 @@ Partition-table-wrapped, self-bootable hard-disk image
 Usage: hd <COMMAND>
 ```
 
+### `new hd apm`
+
+APM (Apple Partition Map) disk for classic Mac OS / PowerPC, with partitions you size and type yourself
+
+```
+Usage: apm [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image file to create
+
+**Options**
+
+- `--size` — Total disk size (accepts `K`/`M`/`G` suffixes)
+- `--partition` — A partition, repeatable, in disk order: `SIZE[:TYPE[:NAME]]`. SIZE accepts `K`/`M`/`G`, or `rest` for the remaining space (once). TYPE is a value from `partmap types`; NAME is APM/GPT only
+- `--fill` — Pour an image into a partition as it is created: `N=PATH`, 1-based, repeatable. Any format the engine can read is decoded on the way in
+- `--align` — Alignment for partition starts. Default 1 MiB; use 63s for DOS-era cylinder alignment on vintage machines
+- `--force` — Overwrite `image` if it already exists
+
+### `new hd atari`
+
+Atari ST / TT / Falcon AHDI disk with partitions you size and type yourself. Types are the 3-character tags GEM / BGM / RAW; a GEM partition over 16 MiB is promoted to BGM, which is what TOS needs
+
+```
+Usage: atari [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image file to create
+
+**Options**
+
+- `--size` — Total disk size (accepts `K`/`M`/`G` suffixes)
+- `--partition` — A partition, repeatable, in disk order: `SIZE[:TYPE[:NAME]]`. SIZE accepts `K`/`M`/`G`, or `rest` for the remaining space (once). TYPE is a value from `partmap types`; NAME is APM/GPT only
+- `--fill` — Pour an image into a partition as it is created: `N=PATH`, 1-based, repeatable. Any format the engine can read is decoded on the way in
+- `--align` — Alignment for partition starts. Default 1 MiB; use 63s for DOS-era cylinder alignment on vintage machines
+- `--force` — Overwrite `image` if it already exists
+
+### `new hd gpt`
+
+GPT (UEFI, modern macOS / Linux) disk with partitions you size and type yourself
+
+```
+Usage: gpt [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image file to create
+
+**Options**
+
+- `--size` — Total disk size (accepts `K`/`M`/`G` suffixes)
+- `--partition` — A partition, repeatable, in disk order: `SIZE[:TYPE[:NAME]]`. SIZE accepts `K`/`M`/`G`, or `rest` for the remaining space (once). TYPE is a value from `partmap types`; NAME is APM/GPT only
+- `--fill` — Pour an image into a partition as it is created: `N=PATH`, 1-based, repeatable. Any format the engine can read is decoded on the way in
+- `--align` — Alignment for partition starts. Default 1 MiB; use 63s for DOS-era cylinder alignment on vintage machines
+- `--force` — Overwrite `image` if it already exists
+
+### `new hd mbr`
+
+MBR (DOS / PC) disk with partitions you size and type yourself. The partitions come out empty — fill them with `write --partition N` or format them with `reformat`
+
+```
+Usage: mbr [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image file to create
+
+**Options**
+
+- `--size` — Total disk size (accepts `K`/`M`/`G` suffixes)
+- `--partition` — A partition, repeatable, in disk order: `SIZE[:TYPE[:NAME]]`. SIZE accepts `K`/`M`/`G`, or `rest` for the remaining space (once). TYPE is a value from `partmap types`; NAME is APM/GPT only
+- `--fill` — Pour an image into a partition as it is created: `N=PATH`, 1-based, repeatable. Any format the engine can read is decoded on the way in
+- `--align` — Alignment for partition starts. Default 1 MiB; use 63s for DOS-era cylinder alignment on vintage machines
+- `--force` — Overwrite `image` if it already exists
+
+### `new hd rdb`
+
+Amiga Rigid Disk Block (RDB) with partitions you size and type yourself. Cylinder-aligned from `--heads` / `--sectors`; types are AmigaDOS DosType tags (`DOS\\3`, `PFS\\3`, `SFS\\0`, ...)
+
+```
+Usage: rdb [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image file to create
+
+**Options**
+
+- `--size` — Total disk size (accepts `K`/`M`/`G` suffixes)
+- `--partition` — A partition, repeatable, in disk order: `SIZE[:TYPE[:NAME]]`. SIZE accepts `K`/`M`/`G`, or `rest` for the remaining space (once). TYPE is a value from `partmap types`; NAME is APM/GPT only
+- `--fill` — Pour an image into a partition as it is created: `N=PATH`, 1-based, repeatable. Any format the engine can read is decoded on the way in
+- `--align` — Alignment for partition starts. Default 1 MiB; use 63s for DOS-era cylinder alignment on vintage machines
+- `--force` — Overwrite `image` if it already exists
+- `--heads` — Disk geometry: heads. These tables place partitions on cylinder boundaries, so the geometry sets the default alignment
+- `--sectors` — Disk geometry: sectors per track
+
+### `new hd sgi`
+
+SGI volume header (IRIX) with partitions you size and type yourself. Cylinder-aligned from `--heads` / `--sectors`. Unlike `sgi-efs` the partitions come out empty rather than EFS-formatted
+
+```
+Usage: sgi [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image file to create
+
+**Options**
+
+- `--size` — Total disk size (accepts `K`/`M`/`G` suffixes)
+- `--partition` — A partition, repeatable, in disk order: `SIZE[:TYPE[:NAME]]`. SIZE accepts `K`/`M`/`G`, or `rest` for the remaining space (once). TYPE is a value from `partmap types`; NAME is APM/GPT only
+- `--fill` — Pour an image into a partition as it is created: `N=PATH`, 1-based, repeatable. Any format the engine can read is decoded on the way in
+- `--align` — Alignment for partition starts. Default 1 MiB; use 63s for DOS-era cylinder alignment on vintage machines
+- `--force` — Overwrite `image` if it already exists
+- `--heads` — Disk geometry: heads. These tables place partitions on cylinder boundaries, so the geometry sets the default alignment
+- `--sectors` — Disk geometry: sectors per track
+
 ### `new hd sgi-efs`
 
 dvh-wrapped IRIX HDD: an SGI volume header + partition table wrapping a formatted EFS root partition, mountable by IRIX 5.3-6.5. Pass `--from-dir` to fill the root filesystem from a host folder in the same step; otherwise it comes out blank for `import` / `put`
@@ -1036,6 +1160,28 @@ Usage: sgi-efs [OPTIONS] <IMAGE>
 - `--inodes` — Approximate total inode count for the EFS root. The formatter scales the cylinder groups to hit roughly this many inodes. Mutually exclusive with `--bytes-per-inode`. When neither is given the density is ~1 inode/4 KiB
 - `--bytes-per-inode` — EFS inode density, in bytes per inode (smaller = more inodes). Floored at one inode per 512-byte block. Mutually exclusive with `--inodes`
 
+### `new hd sun`
+
+Sun disk label (SMI VTOC) for SPARC Solaris / SunOS, with slices you size and tag yourself. Cylinder-aligned from `--heads` / `--sectors`; slice 2 is reserved for the whole-disk "backup" alias
+
+```
+Usage: sun [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image file to create
+
+**Options**
+
+- `--size` — Total disk size (accepts `K`/`M`/`G` suffixes)
+- `--partition` — A partition, repeatable, in disk order: `SIZE[:TYPE[:NAME]]`. SIZE accepts `K`/`M`/`G`, or `rest` for the remaining space (once). TYPE is a value from `partmap types`; NAME is APM/GPT only
+- `--fill` — Pour an image into a partition as it is created: `N=PATH`, 1-based, repeatable. Any format the engine can read is decoded on the way in
+- `--align` — Alignment for partition starts. Default 1 MiB; use 63s for DOS-era cylinder alignment on vintage machines
+- `--force` — Overwrite `image` if it already exists
+- `--heads` — Disk geometry: heads. These tables place partitions on cylinder boundaries, so the geometry sets the default alignment
+- `--sectors` — Disk geometry: sectors per track
+
 ### `new hd x68k`
 
 Sharp X68000 HDD (SASI / SCSI): X68K partition table + IPL stub + a blank or donor-cloned Human68k partition
@@ -1057,6 +1203,26 @@ Usage: x68k [OPTIONS] <IMAGE>
 - `--system-disk` — Optional donor Human68k system floppy (flat `.img` or `.dim` / `.D88` / `.xdf` / `.hdm` container). When present, the builder recursively clones every file and subdirectory from the donor into the output partition. Without this flag, three seed text files (`HELLO.TXT`, `MISTER.TXT`, `README.TXT`) are written for engine validation
 - `--boot-sector-donor` — Optional donor *real* Sharp X68000 SCSI HDD whose Human68k partition boot sector (Sharp IPL Copyright 1990 SHARP) we'll extract and overlay onto the output partition. Eliminates the post-build `SWITCH.X /HD` step — the HDD self-boots straight to `C:>` on every power-on
 - `--builtin-boot-sector` — Use the **in-tree Hero Soft V1.10 boot sector** (1024 bytes, SHA1 `3e88955020de2191441e5829ee5a6e95890a3212`) instead of requiring `--boot-sector-donor PATH`. SCSI only
+
+### `new hd x68k-table`
+
+Sharp X68000 SCSI/SASI table with partitions you size yourself. Unlike `x68k` this writes only the table -- no IPL stub, no Human68k formatting -- so it is a data disk, not a bootable one
+
+```
+Usage: x68k-table [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image file to create
+
+**Options**
+
+- `--size` — Total disk size (accepts `K`/`M`/`G` suffixes)
+- `--partition` — A partition, repeatable, in disk order: `SIZE[:TYPE[:NAME]]`. SIZE accepts `K`/`M`/`G`, or `rest` for the remaining space (once). TYPE is a value from `partmap types`; NAME is APM/GPT only
+- `--fill` — Pour an image into a partition as it is created: `N=PATH`, 1-based, repeatable. Any format the engine can read is decoded on the way in
+- `--align` — Alignment for partition starts. Default 1 MiB; use 63s for DOS-era cylinder alignment on vintage machines
+- `--force` — Overwrite `image` if it already exists
 
 ### `new volume`
 
@@ -1312,8 +1478,8 @@ Usage: add [OPTIONS] --start-lba <START_LBA> --size <SIZE> <IMAGE>
 
 - `--start-lba` — Start LBA (512-byte sector). MBR / GPT: linear LBA. APM: block #
 - `--size` — Partition size in bytes (accepts `K`/`M`/`G` suffixes)
-- `--type-byte` — MBR type byte (decimal or `0xNN`). Ignored for non-MBR tables
-- `--type-string` — GPT type GUID string, or APM type string (`"Apple_HFS"`, etc.)
+- `--type-byte` — MBR type byte (decimal or `0xNN`). Ignored for non-MBR tables. See `partmap types --table mbr`
+- `--type-string` — GPT type GUID string, or APM type string (`"Apple_HFS"`, etc.). See `partmap types --table gpt|apm`
 - `--bootable` — Mark active/bootable
 
 ### `partmap apply`
@@ -1412,8 +1578,21 @@ Usage: set-type [OPTIONS] <IMAGE> <INDEX>
 
 **Options**
 
-- `--type-byte` — MBR type byte (decimal or `0xNN`)
-- `--type-string` — GPT type GUID / APM type string
+- `--type-byte` — MBR type byte (decimal or `0xNN`). See `partmap types`
+- `--type-string` — GPT type GUID / APM type string. See `partmap types`
+
+### `partmap types`
+
+List the well-known partition type values for a table flavor
+
+```
+Usage: types [OPTIONS]
+```
+
+**Options**
+
+- `--table` — Table flavor to list types for. Omit to read it from an image
+- `--image` — Image whose partition table decides which list to print
 
 ### `put`
 
@@ -1934,6 +2113,7 @@ Usage: write [OPTIONS] <IMAGE> <DEVICE>
 
 **Options**
 
+- `--partition` — Write into this 1-based partition instead of the whole disk. The partition's own bounds cap the write; the rest of the disk, including the partition table, is left untouched
 - `--yes` — Required confirmation. Skips the prompt but never the safety summary printed on stderr
 - `--write-to-system-disk` — Allow writing to the system boot disk (refused by default)
 

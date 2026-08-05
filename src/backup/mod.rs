@@ -444,7 +444,13 @@ pub fn run_backup_from(
                     format!("Created temporary device image: {}", tmp.display()),
                 );
             }
-            let (file, guard) = elevated.into_parts();
+            let (handle, guard) = elevated.into_parts();
+            // The backup engine's local paths (CHD staging, defrag-clone) are
+            // typed on a concrete `File`; on macOS this dups whatever descriptor
+            // the device was escalated with, reusing an earlier prompt's.
+            let file = handle
+                .into_file()
+                .context("failed to take a file handle on the source")?;
             let display = path.display().to_string();
             (
                 SourceFactory::Local {

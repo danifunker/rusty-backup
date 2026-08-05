@@ -4,11 +4,13 @@ pub mod atari;
 pub mod editor;
 pub mod gpt;
 pub mod mbr;
+pub mod provision;
 pub mod rdb;
 pub mod resize;
 pub mod sgi;
 pub mod sgi_hdd_builder;
 pub mod sun;
+pub mod type_catalog;
 pub mod x68k;
 pub mod x68k_hdd_builder;
 pub mod x68k_ipl;
@@ -1316,6 +1318,120 @@ pub fn format_size(bytes: u64) -> String {
     }
 }
 
+/// Parse a human-friendly size string — the inverse of [`format_size`].
+/// Accepts plain bytes plus `B`/`K`/`KiB`/`M`/`MiB`/`G`/`GiB` suffixes.
+pub fn parse_size(s: &str) -> anyhow::Result<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        anyhow::bail!("empty size");
+    }
+    let (num_part, mult): (&str, u64) =
+        if let Some(rest) = s.strip_suffix("KiB").or_else(|| s.strip_suffix('K')) {
+            (rest, 1024)
+        } else if let Some(rest) = s.strip_suffix("MiB").or_else(|| s.strip_suffix('M')) {
+            (rest, 1024 * 1024)
+        } else if let Some(rest) = s.strip_suffix("GiB").or_else(|| s.strip_suffix('G')) {
+            (rest, 1024 * 1024 * 1024)
+        } else if let Some(rest) = s.strip_suffix('B') {
+            (rest, 1)
+        } else {
+            (s, 1)
+        };
+    let n: u64 = num_part
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid size {s:?}"))?;
+    n.checked_mul(mult)
+        .ok_or_else(|| anyhow::anyhow!("size {s:?} overflows u64"))
+}
+
+/// An unallocated byte range between (or after) partitions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FreeRegion {
+    pub start_lba: u64,
+    pub size_bytes: u64,
+}
+
+impl FreeRegion {
+    pub fn start_byte(&self) -> u64 {
+        self.start_lba * 512
+    }
+}
+
+/// Every unallocated gap on a `disk_size_bytes` disk, in disk order.
+///
+/// Extended containers are skipped so their logical children account for the
+/// space instead of double-counting it. Overlapping entries collapse into the
+/// running high-water mark rather than producing negative gaps.
+pub fn free_regions(partitions: &[PartitionInfo], disk_size_bytes: u64) -> Vec<FreeRegion> {
+    free_regions_from_ranges(
+        partitions
+            .iter()
+            .filter(|p| !p.is_extended_container && p.size_bytes > 0)
+            .map(|p| {
+                let start = p.start_lba.saturating_mul(512);
+                (start, start.saturating_add(p.size_bytes))
+            }),
+        disk_size_bytes,
+    )
+}
+
+/// [`free_regions`] over raw `(start_byte, end_byte)` ranges, for callers
+/// holding a pending layout rather than a parsed partition list.
+pub fn free_regions_from_ranges(
+    used: impl IntoIterator<Item = (u64, u64)>,
+    disk_size_bytes: u64,
+) -> Vec<FreeRegion> {
+    let mut used: Vec<(u64, u64)> = used.into_iter().collect();
+    used.sort_unstable();
+
+    let mut regions = Vec::new();
+    let mut cursor = 0u64;
+    for (start, end) in used {
+        if start > cursor {
+            regions.push(FreeRegion {
+                start_lba: cursor / 512,
+                size_bytes: start - cursor,
+            });
+        }
+        cursor = cursor.max(end);
+    }
+    if disk_size_bytes > cursor {
+        regions.push(FreeRegion {
+            start_lba: cursor / 512,
+            size_bytes: disk_size_bytes - cursor,
+        });
+    }
+    regions
+}
+
+/// The largest gap a new partition could occupy, or `None` when the disk is
+/// full. Gaps reaching below `min_start_lba` are clamped up to it, so the
+/// caller can fence off the partition-table / boot area at the head of the
+/// disk instead of being offered a start LBA that would overwrite it.
+pub fn largest_free_region(
+    partitions: &[PartitionInfo],
+    disk_size_bytes: u64,
+    min_start_lba: u64,
+) -> Option<FreeRegion> {
+    free_regions(partitions, disk_size_bytes)
+        .into_iter()
+        .filter_map(|r| {
+            if r.start_lba >= min_start_lba {
+                return Some(r);
+            }
+            let shift = (min_start_lba - r.start_lba) * 512;
+            r.size_bytes
+                .checked_sub(shift)
+                .filter(|s| *s > 0)
+                .map(|s| FreeRegion {
+                    start_lba: min_start_lba,
+                    size_bytes: s,
+                })
+        })
+        .max_by_key(|r| r.size_bytes)
+}
+
 /// Partition size override for VHD export and restore.
 pub struct PartitionSizeOverride {
     pub index: usize,
@@ -1355,6 +1471,93 @@ impl PartitionSizeOverride {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    fn part(index: usize, start_lba: u64, size_bytes: u64) -> PartitionInfo {
+        PartitionInfo {
+            index,
+            type_name: "t".into(),
+            partition_type_byte: 0,
+            start_lba,
+            start_byte: None,
+            size_bytes,
+            bootable: false,
+            is_logical: false,
+            is_extended_container: false,
+            partition_type_string: None,
+            hfs_block_size: None,
+            rdb_part_block: None,
+            drv_name: None,
+        }
+    }
+
+    const MIB: u64 = 1024 * 1024;
+
+    #[test]
+    fn free_regions_finds_leading_middle_and_trailing_gaps() {
+        // 100 MiB disk: table area, 10 MiB part, 10 MiB hole, 10 MiB part, rest free.
+        let parts = vec![
+            part(0, 2048, 10 * MIB),
+            part(1, 2048 + (20 * MIB / 512), 10 * MIB),
+        ];
+        let regions = free_regions(&parts, 100 * MIB);
+        assert_eq!(
+            regions,
+            vec![
+                FreeRegion {
+                    start_lba: 0,
+                    size_bytes: 2048 * 512
+                },
+                FreeRegion {
+                    start_lba: 2048 + (10 * MIB / 512),
+                    size_bytes: 10 * MIB
+                },
+                FreeRegion {
+                    start_lba: 2048 + (30 * MIB / 512),
+                    size_bytes: 70 * MIB - 2048 * 512
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn free_regions_ignores_extended_container_and_full_disk() {
+        let mut container = part(0, 2048, 90 * MIB);
+        container.is_extended_container = true;
+        let parts = vec![container, part(1, 2048 + 2048, 90 * MIB - MIB)];
+        // The container is skipped, so the trailing gap is measured off the
+        // logical partition's end, not the container's.
+        let regions = free_regions(&parts, 100 * MIB);
+        assert_eq!(regions.len(), 2);
+        assert_eq!(regions[0].start_lba, 0);
+
+        // A disk with no room left reports nothing.
+        assert!(free_regions(&[part(0, 0, 100 * MIB)], 100 * MIB).is_empty());
+    }
+
+    #[test]
+    fn largest_free_region_clamps_below_min_start() {
+        // Only gap is the head-of-disk table area plus a 40 MiB tail.
+        let parts = vec![part(0, 2048, 50 * MIB)];
+        let biggest = largest_free_region(&parts, 100 * MIB, 2048).unwrap();
+        assert_eq!(biggest.start_lba, 2048 + (50 * MIB / 512));
+        assert_eq!(biggest.size_bytes, 50 * MIB - 2048 * 512);
+
+        // With no partitions the whole disk is one gap, clamped past the table.
+        let whole = largest_free_region(&[], 100 * MIB, 2048).unwrap();
+        assert_eq!(whole.start_lba, 2048);
+        assert_eq!(whole.size_bytes, 100 * MIB - 2048 * 512);
+    }
+
+    #[test]
+    fn largest_free_region_prefers_a_middle_gap_over_a_smaller_tail() {
+        let parts = vec![
+            part(0, 2048, 10 * MIB),
+            part(1, 2048 + (60 * MIB / 512), 35 * MIB),
+        ];
+        let biggest = largest_free_region(&parts, 100 * MIB, 2048).unwrap();
+        assert_eq!(biggest.start_lba, 2048 + (10 * MIB / 512));
+        assert_eq!(biggest.size_bytes, 50 * MIB);
+    }
 
     #[test]
     fn byte_offset_honors_start_byte_override() {

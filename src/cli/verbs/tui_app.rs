@@ -1358,11 +1358,79 @@ const CD_TARGETS: &[(&str, CdTarget)] = &[("SGI IRIX (EFS CD, slot-7 SYSV)", CdT
 enum HdPlatform {
     X68k,
     SgiEfs,
+    /// Generic tables. The wizard builds one partition filling the disk;
+    /// multi-partition layouts stay on the CLI, which takes `--partition`.
+    Mbr,
+    Gpt,
+    Apm,
+    /// Partition table only — no EFS format, no IPL stub, unlike the two above.
+    SgiTable,
+    X68kTable,
+    Rdb,
+    Sun,
+    Atari,
+}
+
+/// Step the "write to" choice: whole disk -> each partition -> back to whole
+/// disk. `None` is the whole device.
+fn next_write_region(
+    parts: &[crate::partition::PartitionInfo],
+    current: Option<usize>,
+) -> Option<usize> {
+    match current {
+        None => parts.first().map(|p| p.index),
+        Some(cur) => match parts.iter().position(|p| p.index == cur) {
+            Some(i) if i + 1 < parts.len() => Some(parts[i + 1].index),
+            // Past the last one, and an index that has since vanished, both
+            // land back on the whole disk rather than sticking.
+            _ => None,
+        },
+    }
+}
+
+/// Partitions on a write target, or empty when it has no readable table.
+fn read_target_partitions(device: &std::path::Path) -> Vec<crate::partition::PartitionInfo> {
+    let Ok(mut reader) =
+        crate::model::source_reader::open_peeled_read_with_entry(device, None, None)
+    else {
+        return Vec::new();
+    };
+    match crate::partition::PartitionTable::detect(&mut reader) {
+        Ok(t) => t
+            .partitions()
+            .into_iter()
+            .filter(|p| !p.is_extended_container && p.size_bytes > 0)
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Wrap the shared args with the default cylinder geometry, for the two
+/// tables whose partitions land on cylinder boundaries.
+fn cylinder_args(
+    common: crate::cli::verbs::new_partitioned_hd::PartitionedHdArgs,
+) -> crate::cli::verbs::new_partitioned_hd::CylinderHdArgs {
+    crate::cli::verbs::new_partitioned_hd::CylinderHdArgs {
+        common,
+        heads: crate::partition::sgi_hdd_builder::DEFAULT_HEADS,
+        sectors: crate::partition::sgi_hdd_builder::DEFAULT_SECTORS_PER_TRACK,
+    }
 }
 
 const HD_PLATFORMS: &[(&str, HdPlatform)] = &[
     ("Sharp X68000 (Human68k)", HdPlatform::X68k),
     ("SGI IRIX (EFS, dvh)", HdPlatform::SgiEfs),
+    ("MBR (DOS / PC), one partition", HdPlatform::Mbr),
+    ("GPT (UEFI), one partition", HdPlatform::Gpt),
+    ("APM (Apple / PowerPC), one partition", HdPlatform::Apm),
+    (
+        "SGI volume header (IRIX), one partition",
+        HdPlatform::SgiTable,
+    ),
+    ("X68000 table only, one partition", HdPlatform::X68kTable),
+    ("Amiga RDB, one partition", HdPlatform::Rdb),
+    ("Sun disk label (SPARC), one slice", HdPlatform::Sun),
+    ("Atari ST AHDI, one partition", HdPlatform::Atari),
 ];
 
 /// Filesystems offered under `new floppy` in the wizard. CP/M is omitted here
@@ -1624,6 +1692,18 @@ struct RestoreState {
     target_is_device: bool,
     /// The device path + label pending a destructive-write confirmation.
     confirm_device: Option<(String, String)>,
+    /// Source kind: `false` restores a backup folder, `true` pours a plain
+    /// image file onto the target (any format the engine can read).
+    source_is_image: bool,
+    /// Decoded length of the chosen image; a container's file size is not it.
+    image_size: u64,
+    /// Partitions on the chosen device, for writing an image into just one.
+    /// Empty when the target has no readable table.
+    target_partitions: Vec<crate::partition::PartitionInfo>,
+    /// `None` writes the whole device; `Some(index)` writes one partition.
+    target_partition: Option<usize>,
+    /// A running image write's shared status, once started.
+    write_run: Option<Arc<Mutex<crate::model::physical_write_runner::PhysicalWriteStatus>>>,
 }
 
 impl Default for RestoreState {
@@ -1650,6 +1730,11 @@ impl Default for RestoreState {
             device_sel: 0,
             target_is_device: false,
             confirm_device: None,
+            source_is_image: false,
+            image_size: 0,
+            target_partitions: Vec::new(),
+            target_partition: None,
+            write_run: None,
         }
     }
 }
@@ -5539,6 +5624,35 @@ impl App {
                                 include_appledouble: false,
                             })
                         }
+                        HdPlatform::Mbr
+                        | HdPlatform::Gpt
+                        | HdPlatform::Apm
+                        | HdPlatform::SgiTable
+                        | HdPlatform::X68kTable
+                        | HdPlatform::Rdb
+                        | HdPlatform::Sun
+                        | HdPlatform::Atari => {
+                            // One partition over the whole disk, at the CLI's
+                            // default type and alignment.
+                            let args = crate::cli::verbs::new_partitioned_hd::PartitionedHdArgs {
+                                image: path.clone(),
+                                size: size.clone(),
+                                partitions: vec!["rest".to_string()],
+                                fills: Vec::new(),
+                                align: "1M".to_string(),
+                                force: false,
+                            };
+                            match platform {
+                                HdPlatform::Mbr => HdCommand::Mbr(args),
+                                HdPlatform::Gpt => HdCommand::Gpt(args),
+                                HdPlatform::X68kTable => HdCommand::X68kTable(args),
+                                HdPlatform::Atari => HdCommand::Atari(args),
+                                HdPlatform::SgiTable => HdCommand::Sgi(cylinder_args(args)),
+                                HdPlatform::Rdb => HdCommand::Rdb(cylinder_args(args)),
+                                HdPlatform::Sun => HdCommand::Sun(cylinder_args(args)),
+                                _ => HdCommand::Apm(args),
+                            }
+                        }
                     },
                 }
             }
@@ -6030,10 +6144,15 @@ impl App {
                         .and_then(|d| d.get(sel))
                         .map(|d| d.path.display().to_string());
                     if let Some(path) = dev {
+                        // Read the target's partitions so an image can be
+                        // written into just one of them.
+                        let parts = read_target_partitions(std::path::Path::new(&path));
                         let r = self.restore.as_mut().unwrap();
                         r.device_pick = false;
                         r.target = path;
                         r.target_is_device = true;
+                        r.target_partitions = parts;
+                        r.target_partition = None;
                     }
                 }
                 _ => {}
@@ -6080,11 +6199,20 @@ impl App {
             RestoreStep::Source => match code {
                 KeyCode::Enter | KeyCode::Char('o') => {
                     let recent = crate::update::load_recent(crate::update::RecentMode::Restore);
-                    r.picker = Some(
-                        FilePicker::new(PickKind::Any, "Choose backup folder or .cbk")
-                            .with_recent(recent),
-                    );
+                    let prompt = if r.source_is_image {
+                        "Choose a disk image to write"
+                    } else {
+                        "Choose backup folder or .cbk"
+                    };
+                    r.picker = Some(FilePicker::new(PickKind::Any, prompt).with_recent(recent));
                     r.picker_target = false;
+                    true
+                }
+                // Same toggle key the rest of the wizard uses for a choice.
+                KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') => {
+                    r.source_is_image = !r.source_is_image;
+                    r.loaded = false;
+                    r.result = None;
                     true
                 }
                 _ => false,
@@ -6100,6 +6228,15 @@ impl App {
                 }
                 KeyCode::Up | KeyCode::BackTab => {
                     r.field = (r.field + RESTORE_FIELDS - 1) % RESTORE_FIELDS;
+                    true
+                }
+                // Image mode reuses this row for the target region, since size
+                // mode means nothing when pouring a fixed image.
+                KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
+                    if r.field == 1 && r.source_is_image =>
+                {
+                    r.target_partition =
+                        next_write_region(&r.target_partitions, r.target_partition);
                     true
                 }
                 KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if r.field == 1 => {
@@ -6171,7 +6308,108 @@ impl App {
     /// Load a chosen backup source (native folder or `.cbk`), read its metadata
     /// for defaults, and advance to the config form. Errors show on the source
     /// screen.
+    /// Pour the chosen image onto the target, whole-disk or into one partition.
+    fn start_image_write(&mut self, target: std::path::PathBuf, is_device: bool) {
+        use crate::model::physical_write_runner::{
+            self, PhysicalWriteRequest, PhysicalWriteSource, WriteExtent,
+        };
+        let Some(r) = self.restore.as_mut() else {
+            return;
+        };
+
+        let target_size = if is_device {
+            crate::device::enumerate_devices()
+                .into_iter()
+                .find(|d| d.path == target)
+                .map(|d| d.size_bytes)
+                .unwrap_or(0)
+        } else {
+            std::fs::metadata(&target).map(|m| m.len()).unwrap_or(0)
+        };
+
+        let extent = match r.target_partition {
+            Some(idx) => match r.target_partitions.iter().find(|p| p.index == idx) {
+                Some(p) => WriteExtent::partition(p.start_lba, p.size_bytes),
+                None => {
+                    r.result = Some("Selected partition is no longer present.".to_string());
+                    r.is_error = true;
+                    r.step = RestoreStep::Run;
+                    return;
+                }
+            },
+            None => WriteExtent::whole_disk(target_size.max(r.image_size)),
+        };
+
+        let req = PhysicalWriteRequest {
+            source: PhysicalWriteSource::Image(std::path::PathBuf::from(&r.backup_folder)),
+            target_device_path: target,
+            target_size_bytes: target_size,
+            extent,
+            wrap: None,
+        };
+        r.write_run = Some(physical_write_runner::start_physical_write(req));
+        r.op = "Writing image...".to_string();
+        r.result = None;
+        r.is_error = false;
+        r.step = RestoreStep::Run;
+    }
+
+    /// Read the image-write status into the shared result/op fields the Run
+    /// step already renders.
+    fn poll_image_write(&mut self) {
+        let Some(r) = self.restore.as_mut() else {
+            return;
+        };
+        let Some(status) = r.write_run.as_ref() else {
+            return;
+        };
+        let Ok(s) = status.lock() else { return };
+        if s.finished {
+            r.result = Some(match &s.error {
+                Some(e) => format!("Image write failed: {e}"),
+                None => format!("Wrote {} to the target.", format_size(s.current_bytes)),
+            });
+            r.is_error = s.error.is_some();
+            r.op = String::new();
+            drop(s);
+            r.write_run = None;
+        } else if s.total_bytes > 0 {
+            r.op = format!(
+                "Writing image: {} / {}",
+                format_size(s.current_bytes),
+                format_size(s.total_bytes),
+            );
+        }
+    }
+
     fn load_restore_source(&mut self, path: std::path::PathBuf) {
+        // Image-write source: no metadata to read, just the decoded length.
+        if self.restore.as_ref().map(|r| r.source_is_image) == Some(true) {
+            let size = crate::model::source_reader::decoded_image_size(&path);
+            let r = self.restore.as_mut().unwrap();
+            match size {
+                Some(n) => {
+                    crate::update::push_recent(
+                        crate::update::RecentMode::Restore,
+                        &path.to_string_lossy(),
+                    );
+                    r.backup_folder = path.to_string_lossy().into_owned();
+                    r.image_size = n;
+                    r.source_size = n;
+                    r.part_count = 0;
+                    r.loaded = true;
+                    r.result = None;
+                    r.is_error = false;
+                    r.step = RestoreStep::Config;
+                }
+                None => {
+                    r.result = Some(format!("Cannot read {} as a disk image", path.display()));
+                    r.is_error = true;
+                }
+            }
+            return;
+        }
+
         // Materialize a .cbk container to a temp folder we keep alive.
         let (folder, guard): (std::path::PathBuf, Option<tempfile::TempDir>) =
             if path.is_file() && crate::rbformats::cbk::is_cbk(&path) {
@@ -6303,6 +6541,10 @@ impl App {
         } else {
             Vec::new()
         };
+        if r.source_is_image {
+            self.start_image_write(target, is_device);
+            return;
+        }
         let alignment = if r.align_sel == 1 {
             crate::restore::RestoreAlignment::Modern1MB
         } else {
@@ -7479,6 +7721,23 @@ impl App {
                 }
             }
         }
+        // An image write reports through its own status struct.
+        if let Some(run) = self.restore.as_ref().and_then(|r| r.write_run.clone()) {
+            let snap = run
+                .lock()
+                .ok()
+                .map(|s| (s.current_bytes, s.total_bytes, s.finished));
+            if let Some((cur, total, done)) = snap {
+                if let Some(prog) = self.progress.as_ref() {
+                    if let Ok(mut sh) = prog.shared.lock() {
+                        sh.current = cur;
+                        sh.total = total;
+                        sh.done = done;
+                    }
+                }
+            }
+            self.poll_image_write();
+        }
         // Mirror a running restore's progress into the visual bar (same shape).
         if let Some(run) = self.restore.as_ref().and_then(|r| r.run.clone()) {
             let snap = run.lock().ok().map(|p| {
@@ -8615,8 +8874,10 @@ impl App {
                 }
                 lines.push(Line::raw(""));
                 lines.push(Line::styled(
-                    "Hard disks build with their defaults; donor-cloning and custom \
-                     partition layouts need the CLI (`rb-cli new hd ...`). \
+                    "Hard disks build with their defaults - the table-only entries get \
+                     one partition over the whole disk, empty. Donor-cloning and \
+                     multi-partition layouts need the CLI \
+                     (`rb-cli new hd <table> --partition ...`). \
                      CD-ROM images: the Optical tab.",
                     self.palette.dim(),
                 ));
@@ -8921,13 +9182,43 @@ impl App {
         match r.step {
             RestoreStep::Source => {
                 lines.push(Line::styled(
-                    "Choose a backup to restore:",
+                    "Choose what to restore:",
                     self.palette.accent(),
                 ));
                 lines.push(Line::raw(""));
+                let (folder_mark, image_mark) = if r.source_is_image {
+                    ("  ", "> ")
+                } else {
+                    ("> ", "  ")
+                };
+                lines.push(Line::styled(
+                    format!("{folder_mark}Backup folder or .cbk"),
+                    if r.source_is_image {
+                        self.palette.dim()
+                    } else {
+                        self.palette.accent().add_modifier(Modifier::BOLD)
+                    },
+                ));
+                lines.push(Line::styled(
+                    format!("{image_mark}Disk image file (raw, DMG, CHD, VHD, ...)"),
+                    if r.source_is_image {
+                        self.palette.accent().add_modifier(Modifier::BOLD)
+                    } else {
+                        self.palette.dim()
+                    },
+                ));
+                lines.push(Line::raw(""));
+                lines.push(Line::from(vec![
+                    Span::styled("  Space      ", self.palette.accent()),
+                    Span::raw("switch between the two"),
+                ]));
                 lines.push(Line::from(vec![
                     Span::styled("  Enter / o  ", self.palette.accent()),
-                    Span::raw("choose a backup folder or .cbk file"),
+                    Span::raw(if r.source_is_image {
+                        "choose the image file to write"
+                    } else {
+                        "choose a backup folder or .cbk file"
+                    }),
                 ]));
                 if let Some(res) = &r.result {
                     lines.push(Line::raw(""));
@@ -8936,16 +9227,27 @@ impl App {
             }
             RestoreStep::Config => {
                 lines.push(Line::from(vec![
-                    Span::styled("Backup: ", self.palette.dim()),
+                    Span::styled(
+                        if r.source_is_image {
+                            "Image:  "
+                        } else {
+                            "Backup: "
+                        },
+                        self.palette.dim(),
+                    ),
                     Span::raw(r.backup_folder.clone()),
                 ]));
                 lines.push(Line::from(vec![
                     Span::styled("Contents: ", self.palette.dim()),
-                    Span::raw(format!(
-                        "{} partition(s), original size {}",
-                        r.part_count,
-                        format_size(r.source_size)
-                    )),
+                    Span::raw(if r.source_is_image {
+                        format!("{} decoded", format_size(r.image_size))
+                    } else {
+                        format!(
+                            "{} partition(s), original size {}",
+                            r.part_count,
+                            format_size(r.source_size)
+                        )
+                    }),
                 ]));
                 lines.push(Line::raw(""));
                 let row = |idx: usize, label: &str, val: String, editable: bool| -> Line<'static> {
@@ -8975,18 +9277,42 @@ impl App {
                     r.target.clone()
                 };
                 lines.push(row(0, "Target:", tgt_disp, !r.target_is_device));
-                lines.push(row(
-                    1,
-                    "Size:",
-                    format!("< {} >", RESTORE_SIZE_LABELS[r.size_sel]),
-                    false,
-                ));
-                lines.push(row(
-                    2,
-                    "Alignment:",
-                    format!("< {} >", RESTORE_ALIGN_LABELS[r.align_sel]),
-                    false,
-                ));
+                if r.source_is_image {
+                    // Size mode and alignment don't apply to a fixed image;
+                    // the choice that matters is where on the target it lands.
+                    let region = match r.target_partition {
+                        None => "< Entire disk >".to_string(),
+                        Some(idx) => match r.target_partitions.iter().find(|p| p.index == idx) {
+                            Some(p) => format!(
+                                "< Partition {} - {} ({}) >",
+                                p.index + 1,
+                                p.type_name,
+                                format_size(p.size_bytes),
+                            ),
+                            None => "< Entire disk >".to_string(),
+                        },
+                    };
+                    lines.push(row(1, "Write to:", region, false));
+                    if r.target_is_device && r.target_partitions.is_empty() {
+                        lines.push(Line::styled(
+                            "             (no partition table on the target)",
+                            self.palette.dim(),
+                        ));
+                    }
+                } else {
+                    lines.push(row(
+                        1,
+                        "Size:",
+                        format!("< {} >", RESTORE_SIZE_LABELS[r.size_sel]),
+                        false,
+                    ));
+                    lines.push(row(
+                        2,
+                        "Alignment:",
+                        format!("< {} >", RESTORE_ALIGN_LABELS[r.align_sel]),
+                        false,
+                    ));
+                }
                 lines.push(Line::raw(""));
                 let start_sel = r.field == 3;
                 let start_style = if start_sel {
@@ -8997,7 +9323,15 @@ impl App {
                     self.palette.accent()
                 };
                 lines.push(Line::styled(
-                    format!("{}[ Start restore ]", if start_sel { "> " } else { "  " }),
+                    format!(
+                        "{}[ {} ]",
+                        if start_sel { "> " } else { "  " },
+                        if r.source_is_image {
+                            "Write image"
+                        } else {
+                            "Start restore"
+                        },
+                    ),
                     start_style,
                 ));
                 lines.push(Line::raw(""));
@@ -11527,6 +11861,48 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn part(index: usize) -> crate::partition::PartitionInfo {
+        crate::partition::PartitionInfo {
+            index,
+            type_name: "HFS".into(),
+            partition_type_byte: 0xAF,
+            start_lba: 2048 * (index as u64 + 1),
+            start_byte: None,
+            size_bytes: 1024 * 1024,
+            bootable: false,
+            is_logical: false,
+            is_extended_container: false,
+            partition_type_string: None,
+            hfs_block_size: None,
+            rdb_part_block: None,
+            drv_name: None,
+        }
+    }
+
+    #[test]
+    fn write_region_cycles_whole_disk_then_each_partition() {
+        let parts = vec![part(0), part(1), part(2)];
+        // Whole disk -> first -> second -> third -> back to whole disk.
+        let mut sel = None;
+        sel = next_write_region(&parts, sel);
+        assert_eq!(sel, Some(0));
+        sel = next_write_region(&parts, sel);
+        assert_eq!(sel, Some(1));
+        sel = next_write_region(&parts, sel);
+        assert_eq!(sel, Some(2));
+        sel = next_write_region(&parts, sel);
+        assert_eq!(sel, None, "must wrap back to the whole disk");
+    }
+
+    #[test]
+    fn write_region_handles_no_table_and_stale_selection() {
+        // A target with no partition table only ever offers the whole disk.
+        assert_eq!(next_write_region(&[], None), None);
+        assert_eq!(next_write_region(&[], Some(3)), None);
+        // A selection that no longer exists falls back rather than sticking.
+        assert_eq!(next_write_region(&[part(0)], Some(9)), None);
+    }
 
     /// Shift must not change what a command key does.
     #[test]

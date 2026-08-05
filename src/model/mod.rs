@@ -18,6 +18,7 @@ pub mod commander_ops;
 pub mod commander_source;
 pub mod container_edit;
 pub mod dir_listing;
+pub mod disk_builder;
 pub mod edit_queue;
 pub mod export_runner;
 pub mod file_types;
@@ -29,6 +30,7 @@ pub mod multi_volume_fs;
 pub mod optical_devices;
 pub mod partition_editor;
 pub mod physical_write_runner;
+pub mod provision_runner;
 pub mod rate_tracker;
 pub mod wrapper_tree;
 // The remote file-browser core depends on `crate::remote`, which is itself

@@ -448,20 +448,43 @@ pub fn set_partition_bootable<W: Read + std::io::Write + Seek>(
     };
     BigEndian::write_u32(&mut buf[5 * 4..5 * 4 + 4], new_flags);
 
-    // Recompute checksum: zero the checksum word, sum the rest, store the
-    // 2's-complement negation. The PART (and RDSK) checksum lives at long 2.
-    BigEndian::write_u32(&mut buf[2 * 4..2 * 4 + 4], 0);
-    let mut sum: i32 = 0;
-    for i in 0..128 {
-        sum = sum.wrapping_add(BigEndian::read_i32(&buf[i * 4..i * 4 + 4]));
-    }
-    BigEndian::write_i32(&mut buf[2 * 4..2 * 4 + 4], sum.wrapping_neg());
+    stamp_checksum(&mut buf);
 
     rw.seek(SeekFrom::Start(part_block_num * 512))?;
     rw.write_all(&buf)?;
     rw.flush()?;
 
     Ok(new_flags & PART_FLAG_BOOTABLE != 0)
+}
+
+/// Recompute an RDB block's checksum in place: zero the checksum word, sum
+/// every long as i32, and store the two's-complement negation so the whole
+/// block sums to zero. RDSK and PART both keep it at long 2.
+pub fn stamp_checksum(buf: &mut [u8; 512]) {
+    BigEndian::write_u32(&mut buf[2 * 4..2 * 4 + 4], 0);
+    let mut sum: i32 = 0;
+    for i in 0..128 {
+        sum = sum.wrapping_add(BigEndian::read_i32(&buf[i * 4..i * 4 + 4]));
+    }
+    BigEndian::write_i32(&mut buf[2 * 4..2 * 4 + 4], sum.wrapping_neg());
+}
+
+/// Parse a DosType tag written the way [`format_dos_type`] prints it —
+/// `DOS\3`, `PFS\3`, `SFS\0`, or four printable characters like `muFS`.
+/// Returns `None` for anything that isn't one of those two shapes.
+pub fn parse_dos_type(text: &str) -> Option<u32> {
+    let bytes = text.trim().as_bytes();
+    if bytes.len() < 4 || !bytes[..3].iter().all(|c| (0x20..0x7F).contains(c)) {
+        return None;
+    }
+    let version = if bytes[3] == b'\\' {
+        std::str::from_utf8(&bytes[4..]).ok()?.parse::<u8>().ok()?
+    } else if bytes.len() == 4 {
+        bytes[3]
+    } else {
+        return None;
+    };
+    Some(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], version]))
 }
 
 fn find_rdsk(reader: &mut (impl Read + Seek)) -> Result<(u64, [u8; 512]), RustyBackupError> {
@@ -672,6 +695,20 @@ mod tests {
         }
         BigEndian::write_i32(&mut buf[2 * 4..2 * 4 + 4], sum.wrapping_neg());
         buf
+    }
+
+    #[test]
+    fn dos_type_parses_back_from_every_catalogued_tag() {
+        for choice in
+            crate::partition::type_catalog::choices(crate::partition::type_catalog::TableKind::Rdb)
+        {
+            let parsed = parse_dos_type(choice.value)
+                .unwrap_or_else(|| panic!("{} did not parse", choice.value));
+            assert_eq!(format_dos_type(parsed), choice.value);
+        }
+        assert_eq!(parse_dos_type("muFS"), Some(0x6D75_4653));
+        assert_eq!(parse_dos_type("DOS"), None);
+        assert_eq!(parse_dos_type("DOS\\x"), None);
     }
 
     #[test]

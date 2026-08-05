@@ -18,7 +18,9 @@ use std::path::PathBuf;
 use crate::cli::logging::log_stderr;
 use crate::cli::parse::parse_size;
 use crate::partition::editor::{apply_edits, validate_edits, PartitionTableEdit};
+use crate::partition::type_catalog::{self, TableKind};
 use crate::partition::PartitionTable;
+use crate::rbformats::BoxReadSeek;
 
 #[derive(Debug, Subcommand)]
 pub enum PartmapCommand {
@@ -37,6 +39,8 @@ pub enum PartmapCommand {
     SetBootable(SetBootableArgs),
     /// Apply a JSON script of edits as one transaction.
     Apply(ApplyArgs),
+    /// List the well-known partition type values for a table flavor.
+    Types(TypesArgs),
 }
 
 #[derive(Debug, Args)]
@@ -50,9 +54,11 @@ pub struct AddArgs {
     #[arg(long)]
     pub size: String,
     /// MBR type byte (decimal or `0xNN`). Ignored for non-MBR tables.
-    #[arg(long, default_value_t = 0x83)]
+    /// See `partmap types --table mbr`.
+    #[arg(long, default_value_t = 0x83, value_parser = parse_type_byte)]
     pub type_byte: u8,
     /// GPT type GUID string, or APM type string (`"Apple_HFS"`, etc.).
+    /// See `partmap types --table gpt|apm`.
     #[arg(long)]
     pub type_string: Option<String>,
     /// Mark active/bootable.
@@ -87,12 +93,24 @@ pub struct DeleteArgs {
 pub struct SetTypeArgs {
     pub image: PathBuf,
     pub index: u32,
-    /// MBR type byte (decimal or `0xNN`).
-    #[arg(long)]
+    /// MBR type byte (decimal or `0xNN`). See `partmap types`.
+    #[arg(long, value_parser = parse_type_byte)]
     pub type_byte: Option<u8>,
-    /// GPT type GUID / APM type string.
+    /// GPT type GUID / APM type string. See `partmap types`.
     #[arg(long)]
     pub type_string: Option<String>,
+}
+
+/// Parse an MBR type byte as decimal, or as hex given an explicit `0x`
+/// prefix. Clap's stock `u8` parser rejected the `0xNN` form the help text
+/// has always advertised.
+fn parse_type_byte(s: &str) -> Result<u8, String> {
+    let t = s.trim();
+    let parsed = match t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        Some(hex) => u8::from_str_radix(hex, 16),
+        None => t.parse::<u8>(),
+    };
+    parsed.map_err(|_| format!("'{}' is not a partition type byte (try 0x83 or 131)", t))
 }
 
 #[derive(Debug, Args)]
@@ -101,6 +119,16 @@ pub struct SetBootableArgs {
     pub index: u32,
     #[arg(long)]
     pub bootable: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct TypesArgs {
+    /// Table flavor to list types for. Omit to read it from an image.
+    #[arg(long, value_parser = ["mbr", "gpt", "apm", "rdb", "sgi"])]
+    pub table: Option<String>,
+    /// Image whose partition table decides which list to print.
+    #[arg(long)]
+    pub image: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -210,7 +238,51 @@ pub fn run(cmd: PartmapCommand) -> Result<()> {
             },
         ),
         PartmapCommand::Apply(a) => run_apply(a),
+        PartmapCommand::Types(a) => run_types(a),
     }
+}
+
+fn run_types(a: TypesArgs) -> Result<()> {
+    let kind = match (a.table.as_deref(), a.image.as_ref()) {
+        (Some(t), _) => match t {
+            "mbr" => TableKind::Mbr,
+            "gpt" => TableKind::Gpt,
+            "apm" => TableKind::Apm,
+            "rdb" => TableKind::Rdb,
+            "sgi" => TableKind::Sgi,
+            other => bail!("unknown table flavor '{}'", other),
+        },
+        (None, Some(image)) => type_catalog::kind_of(&open_table(image)?),
+        (None, None) => bail!("types: pass --table <mbr|gpt|apm|rdb|sgi> or --image <FILE>"),
+    };
+
+    let choices = type_catalog::choices(kind);
+    if choices.is_empty() {
+        bail!("no partition type catalog for {} tables", kind.label());
+    }
+    // MBR values print `0x`-prefixed: the catalog stores the bare hex the GUI
+    // type field wants, but `--type-byte` reads an unprefixed number as
+    // decimal, so copying a bare `83` off this list would silently mean 0x53.
+    let (flag, values): (&str, Vec<String>) = if kind == TableKind::Mbr {
+        (
+            "--type-byte",
+            choices.iter().map(|c| format!("0x{}", c.value)).collect(),
+        )
+    } else {
+        (
+            "--type-string",
+            choices.iter().map(|c| c.value.to_string()).collect(),
+        )
+    };
+
+    println!("{} partition types ({}):", kind.label(), kind.field_hint());
+    let width = values.iter().map(|v| v.len()).max().unwrap_or(0);
+    for (value, choice) in values.iter().zip(choices) {
+        println!("  {:<width$}  {}", value, choice.label, width = width);
+    }
+    println!("\nPass one to `partmap add {} <VALUE>`.", flag);
+    println!("Any other value is accepted verbatim -- the list is not exhaustive.");
+    Ok(())
 }
 
 fn idx_1based(idx: u32) -> Result<usize> {
@@ -279,12 +351,52 @@ fn json_edit_to_edit(j: JsonEdit) -> Result<PartitionTableEdit> {
     })
 }
 
+/// Read-only whole-disk probe, peeling a CHD / container as needed.
+///
+/// `partmap` edits the disk's table, so it opens the *disk*, not a partition
+/// within it — going through `resolve_partition_streaming` made every verb
+/// here refuse a multi-partition image with "select one by appending `@N`",
+/// which is both wrong and the exact shape of disk these verbs are for.
+fn open_disk(image: &std::path::Path) -> Result<BoxReadSeek> {
+    crate::model::source_reader::open_peeled_read_with_entry(image, None, None)
+}
+
+fn open_table(image: &std::path::Path) -> Result<PartitionTable> {
+    let mut probe = open_disk(image)?;
+    PartitionTable::detect(&mut probe)
+        .map_err(|e| anyhow::anyhow!("detecting partition table: {e}"))
+}
+
+/// Is `image` a raw device node rather than a file on disk?
+fn is_device_path(image: &std::path::Path) -> bool {
+    let s = image.to_string_lossy();
+    s.starts_with("/dev/") || s.starts_with(r"\\.\")
+}
+
+/// Total addressable size of the disk behind `image`.
+///
+/// A device node answers `seek(End)` with 0 on macOS (and Windows physical
+/// drives aren't seekable either), so asking the stream would hand validation a
+/// zero-sector disk and make every edit look like it runs past the end. Ask the
+/// OS for a device; for an image *file* keep using the stream, whose length is
+/// the decoded size of a CHD / container rather than the file's byte count.
+fn disk_size_of(image: &std::path::Path, probe: &mut BoxReadSeek) -> Result<u64> {
+    use std::io::Seek;
+    if is_device_path(image) {
+        let file = std::fs::File::open(image)
+            .with_context(|| format!("opening {} to measure it", image.display()))?;
+        return crate::os::get_file_size(&file, image)
+            .with_context(|| format!("cannot determine the size of {}", image.display()));
+    }
+    Ok(probe.seek(std::io::SeekFrom::End(0))?)
+}
+
 fn apply_batch(
     image: &std::path::Path,
     edits: Vec<PartitionTableEdit>,
     dry_run: bool,
 ) -> Result<()> {
-    use std::io::{Seek, Write};
+    use std::io::Write;
 
     // `partmap` rewrites the whole disk's table and takes a plain path, so an
     // `@N` carried over from `ls` / `get` ends up inside the filename and the
@@ -302,10 +414,10 @@ fn apply_batch(
     // Probe the table + disk size read-only first (peels a CHD / container),
     // so `--dry-run` never opens a write handle — which, for a compressed CHD,
     // would make a backup copy + diff for nothing.
-    let (mut probe, _ctx) = crate::cli::resolve::resolve_partition_streaming(image, None)?;
+    let mut probe = open_disk(image)?;
     let table = PartitionTable::detect(&mut probe)
         .map_err(|e| anyhow::anyhow!("detecting partition table: {e}"))?;
-    let disk_size = probe.seek(std::io::SeekFrom::End(0))?;
+    let disk_size = disk_size_of(image, &mut probe)?;
     drop(probe);
 
     let warnings = validate_edits(&table, &edits, disk_size)

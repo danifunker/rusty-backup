@@ -23,6 +23,7 @@ pub mod dir1;
 pub mod dir2;
 pub mod dir_repair;
 pub mod edit;
+pub mod format;
 pub mod freespace_rebuild;
 pub mod fsck;
 pub mod inobt_repair;

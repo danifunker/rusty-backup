@@ -91,6 +91,134 @@ pub fn known_len_reader(file: File, path: &Path) -> KnownLen<File> {
     KnownLen::new(file, len)
 }
 
+/// [`known_len_reader`] for an elevated handle, which on macOS may be a shared
+/// authopen descriptor rather than an owned `File`.
+pub fn known_len_source(handle: SourceHandle, path: &Path) -> KnownLen<SourceHandle> {
+    let len = handle.byte_len(path).unwrap_or(0);
+    KnownLen::new(handle, len)
+}
+
+/// A read/write handle to an elevated source.
+///
+/// Plain files (and every non-macOS platform) carry an owned `File`. On macOS a
+/// raw device may instead be backed by a descriptor shared with earlier
+/// operations, so the user is prompted for administrator rights once per device
+/// rather than once per operation — see [`macos::SharedDevice`].
+pub enum SourceHandle {
+    File(File),
+    #[cfg(target_os = "macos")]
+    Device(macos::SharedDevice),
+}
+
+impl SourceHandle {
+    /// An independent handle onto the same source, with its own file offset.
+    pub fn try_clone(&self) -> io::Result<SourceHandle> {
+        match self {
+            SourceHandle::File(f) => f.try_clone().map(SourceHandle::File),
+            #[cfg(target_os = "macos")]
+            SourceHandle::Device(d) => d.try_clone().map(SourceHandle::Device),
+        }
+    }
+
+    /// A concrete `File`, for consumers typed on one (backup's CHD staging).
+    ///
+    /// For a shared device this dups the cached descriptor. That is safe even
+    /// while other handles are live: [`macos::SharedDevice`] reads and writes
+    /// positionally and never moves the description's file offset, so the
+    /// returned `File` is that offset's only user.
+    pub fn into_file(self) -> io::Result<File> {
+        match self {
+            SourceHandle::File(f) => Ok(f),
+            #[cfg(target_os = "macos")]
+            SourceHandle::Device(d) => d.dup_as_file(),
+        }
+    }
+
+    /// Total length in bytes, consulting the OS for devices that can't seek.
+    pub fn byte_len(&self, path: &Path) -> Option<u64> {
+        match self {
+            SourceHandle::File(f) => get_file_size(f, path).ok(),
+            #[cfg(target_os = "macos")]
+            SourceHandle::Device(d) => match d.byte_len() {
+                0 => None,
+                n => Some(n),
+            },
+        }
+    }
+}
+
+impl From<File> for SourceHandle {
+    fn from(f: File) -> Self {
+        SourceHandle::File(f)
+    }
+}
+
+impl Read for SourceHandle {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            SourceHandle::File(f) => f.read(buf),
+            #[cfg(target_os = "macos")]
+            SourceHandle::Device(d) => d.read(buf),
+        }
+    }
+}
+
+impl Write for SourceHandle {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            SourceHandle::File(f) => f.write(buf),
+            #[cfg(target_os = "macos")]
+            SourceHandle::Device(d) => d.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            SourceHandle::File(f) => f.flush(),
+            #[cfg(target_os = "macos")]
+            SourceHandle::Device(d) => d.flush(),
+        }
+    }
+}
+
+impl Seek for SourceHandle {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        match self {
+            SourceHandle::File(f) => f.seek(pos),
+            #[cfg(target_os = "macos")]
+            SourceHandle::Device(d) => d.seek(pos),
+        }
+    }
+}
+
+/// TEMP-DIAG: describe the access we currently hold on `path`, for the GUI log.
+///
+/// Non-escalating and read-only in effect, so it is safe to call before any
+/// operation. Added to diagnose a macOS restore failing with `Permission
+/// denied` at the very end of an otherwise successful run; delete this and its
+/// call sites (grep `TEMP-DIAG`) once that is resolved.
+#[allow(unused_variables)]
+pub fn describe_device_access(path: &Path) -> Vec<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let s = path.to_string_lossy();
+        if s.starts_with("/dev/") {
+            return macos::probe_device_access(&s);
+        }
+    }
+    Vec::new()
+}
+
+/// Release cached privileged device descriptors so the disk can be ejected.
+///
+/// Pass `None` to release every cached device. A no-op off macOS, which has no
+/// descriptor cache.
+#[allow(unused_variables)]
+pub fn release_elevated_devices(path: Option<&str>) {
+    #[cfg(target_os = "macos")]
+    macos::release_elevated_devices(path);
+}
+
 /// A read adapter that ensures all I/O to the underlying reader is performed
 /// at sector-aligned offsets with sector-multiple sizes.
 ///
@@ -664,7 +792,7 @@ pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
     {
         let file = File::open(path)?;
         Ok(ElevatedSource {
-            file,
+            file: SourceHandle::File(file),
             temp_path: None,
         })
     }
@@ -697,8 +825,36 @@ pub fn open_for_inspect(path: &Path) -> Result<File> {
 /// On Windows, locks and dismounts volumes via `DeviceIoControl`.
 /// On macOS, uses DiskArbitration to unmount.
 pub fn open_target_for_writing(path: &Path) -> Result<DeviceWriteHandle> {
-    let path_str = path.to_string_lossy();
-    let is_device = path_str.starts_with("/dev/") || path_str.starts_with("\\\\.\\");
+    open_target_for_writing_inner(path, true)
+}
+
+/// [`open_target_for_writing`] that keeps a regular file's existing contents.
+///
+/// Writing into one partition must not disturb the rest of the target, and the
+/// default path creates + truncates a regular file. Devices behave identically
+/// either way — there is nothing to truncate.
+pub fn open_target_preserving(path: &Path) -> Result<DeviceWriteHandle> {
+    open_target_for_writing_inner(path, false)
+}
+
+/// Whether a target path names a raw device rather than a regular file.
+/// Matches what [`open_target_for_writing`] keys off internally.
+pub fn is_device_path(path: &Path) -> bool {
+    let s = path.to_string_lossy();
+    s.starts_with("/dev/") || s.starts_with("\\\\.\\")
+}
+
+fn open_target_for_writing_inner(path: &Path, truncate: bool) -> Result<DeviceWriteHandle> {
+    let is_device = is_device_path(path);
+
+    if !is_device && !truncate {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .with_context(|| format!("failed to open {} for writing", path.display()))?;
+        return Ok(DeviceWriteHandle::from_file(file));
+    }
 
     if !is_device {
         // Regular file — create/truncate AND open read+write. Restore's
@@ -747,7 +903,7 @@ pub fn open_target_for_writing(path: &Path) -> Result<DeviceWriteHandle> {
 /// Call `into_parts()` to get the file and a cleanup guard that auto-deletes
 /// the temp file when dropped.
 pub struct ElevatedSource {
-    file: File,
+    file: SourceHandle,
     temp_path: Option<PathBuf>,
     /// On macOS: exclusive disk claim kept alive for the duration of the backup.
     #[cfg(target_os = "macos")]
@@ -760,10 +916,10 @@ impl ElevatedSource {
         self.temp_path.as_deref()
     }
 
-    /// Consume self and return the file plus a cleanup guard.
-    /// Keep the guard alive until you're done with the file — dropping it
+    /// Consume self and return the handle plus a cleanup guard.
+    /// Keep the guard alive until you're done with the handle — dropping it
     /// deletes the temp file (if any) and releases the disk claim.
-    pub fn into_parts(self) -> (File, TempFileGuard) {
+    pub fn into_parts(self) -> (SourceHandle, TempFileGuard) {
         (
             self.file,
             TempFileGuard {

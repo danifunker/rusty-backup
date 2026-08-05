@@ -5,6 +5,9 @@ use std::sync::{Arc, Mutex};
 use rusty_backup::backup::metadata::BackupMetadata;
 use rusty_backup::clonezilla;
 use rusty_backup::clonezilla::metadata::ClonezillaImage;
+use rusty_backup::model::disk_builder::DiskBuilder;
+use rusty_backup::model::physical_write_runner::PhysicalWriteStatus;
+use rusty_backup::model::provision_runner::{self, ProvisionRequest};
 use rusty_backup::model::size_mode::SizeMode;
 use rusty_backup::partition::{self, PartitionInfo, PartitionTable};
 
@@ -29,6 +32,10 @@ enum RestoreMode {
     SinglePartition,
     /// Restore a single partition to a new/empty disk with a fresh partition table.
     NewDisk,
+    /// Write a plain image file (any readable format) to a disk or partition.
+    WriteImage,
+    /// Lay a fresh partition table on a blank disk and fill its partitions.
+    BuildDisk,
 }
 
 /// Per-partition restore configuration in the GUI.
@@ -103,6 +110,11 @@ struct RemoteConnectStatus {
 pub struct RestoreTab {
     // Mode
     restore_mode: RestoreMode,
+    /// Write Image File mode: chosen source, and its decoded size.
+    image_write_path: Option<PathBuf>,
+    image_write_size: u64,
+    /// Target picker + progress, shared with the Inspect tab's export action.
+    image_write: super::physical_disk_export::PhysicalDiskExport,
 
     /// MRU of opened backup-folder paths (newest first), mirrored to
     /// `config.json` — the "Recent:" quick-pick row.
@@ -185,12 +197,32 @@ pub struct RestoreTab {
     nd_target_device_idx: Option<usize>,
     nd_image_file_path: Option<PathBuf>,
     nd_target_is_device: bool,
+
+    // --- Build Disk mode state ---
+    bd_target_is_device: bool,
+    bd_target_device_idx: Option<usize>,
+    bd_image_file_path: Option<PathBuf>,
+    /// Size of an image-file target, in the `rb-cli new hd --size` grammar.
+    bd_image_size_text: String,
+    /// Partition plan. `Some` while the Build Disk modal is open.
+    bd_builder: Option<rusty_backup::model::disk_builder::DiskBuilder>,
+    /// Typed device name, so a build can't erase the wrong disk by a stray click.
+    bd_confirm_text: String,
+    bd_status: Option<Arc<Mutex<PhysicalWriteStatus>>>,
+    bd_rate: super::progress::RateTracker,
+    /// How many of the worker's log lines have already reached the log panel.
+    bd_logged: usize,
+    /// Guards the one-shot completion message; the poll runs every frame.
+    bd_finished_reported: bool,
 }
 
 impl Default for RestoreTab {
     fn default() -> Self {
         Self {
             restore_mode: RestoreMode::FullDisk,
+            image_write_path: None,
+            image_write_size: 0,
+            image_write: Default::default(),
             recent_files: super::load_recent(rusty_backup::update::RecentMode::Restore),
             backup_folder: None,
             backup_metadata: None,
@@ -223,6 +255,16 @@ impl Default for RestoreTab {
             nd_target_device_idx: None,
             nd_image_file_path: None,
             nd_target_is_device: true,
+            bd_target_is_device: false,
+            bd_target_device_idx: None,
+            bd_image_file_path: None,
+            bd_image_size_text: "512M".to_string(),
+            bd_builder: None,
+            bd_confirm_text: String::new(),
+            bd_status: None,
+            bd_rate: super::progress::RateTracker::default(),
+            bd_logged: 0,
+            bd_finished_reported: false,
             expand_disk_enabled: false,
             expand_free_space_mib: 0,
             expand_extend_last_partition: false,
@@ -232,7 +274,15 @@ impl Default for RestoreTab {
 
 impl RestoreTab {
     pub fn is_running(&self) -> bool {
-        self.restore_running
+        self.restore_running || self.build_running()
+    }
+
+    /// True while a Build Disk job is writing to the target.
+    fn build_running(&self) -> bool {
+        self.bd_status
+            .as_ref()
+            .and_then(|s| s.lock().ok().map(|g| !g.finished))
+            .unwrap_or(false)
     }
 
     pub fn get_loaded_backup(&self) -> Option<PathBuf> {
@@ -303,10 +353,13 @@ impl RestoreTab {
         #[cfg(feature = "remote")]
         self.poll_remote(ctx);
 
+        // Drain the Build Disk worker's log lines into the shared log panel.
+        self.poll_build(ctx);
+
         ui.heading("Restore Backup");
         ui.add_space(8.0);
 
-        let controls_enabled = !self.restore_running;
+        let controls_enabled = !self.is_running();
 
         // --- Restore Mode Selector ---
         ui.add_enabled_ui(controls_enabled, |ui| {
@@ -327,6 +380,22 @@ impl RestoreTab {
                     RestoreMode::NewDisk,
                     "Restore to New Disk",
                 );
+                ui.radio_value(
+                    &mut self.restore_mode,
+                    RestoreMode::WriteImage,
+                    "Write Image File",
+                )
+                .on_hover_text(
+                    "Write a disk image straight to a device or one of its \
+                     partitions. Any format Rusty Backup can read works, \
+                     including DMG, CHD, VHD and compressed images.",
+                );
+                ui.radio_value(&mut self.restore_mode, RestoreMode::BuildDisk, "Build Disk")
+                    .on_hover_text(
+                        "Lay a fresh MBR / GPT / APM / SGI / X68000 partition \
+                         table on a blank disk or image file, and optionally \
+                         pour an image into each partition in one pass.",
+                    );
             });
         });
         ui.add_space(4.0);
@@ -337,6 +406,16 @@ impl RestoreTab {
                 self.show_single_partition_mode(ui, ctx, controls_enabled)
             }
             RestoreMode::NewDisk => self.show_new_disk_mode(ui, ctx, controls_enabled),
+            RestoreMode::WriteImage => self.show_write_image_mode(ui, ctx, controls_enabled),
+            RestoreMode::BuildDisk => self.show_build_disk_mode(ui, ctx, controls_enabled),
+        }
+
+        if self.image_write.open {
+            let _ = self.image_write.show(ui.ctx(), ctx);
+        }
+
+        if self.bd_builder.is_some() {
+            self.show_build_disk_modal(ui, ctx);
         }
 
         // --- Confirmation popup ---
@@ -784,6 +863,13 @@ impl RestoreTab {
                             partition::format_size(target_size),
                         ),
                     );
+
+                    // Sizes fitting is not the same as the layout fitting: with
+                    // Original alignment each partition keeps its absolute start,
+                    // so shrinking leaves gaps and the last partition can still
+                    // run off the end. Project the real layout the engine will
+                    // build rather than letting Restore fail after the click.
+                    self.show_layout_fit_warning(ui, target_size);
                 }
             });
         }
@@ -822,6 +908,9 @@ impl RestoreTab {
                         };
                         has_source && has_target
                     }
+                    // Both drive their own action from a sub-window rather than
+                    // this row's Restore button.
+                    RestoreMode::WriteImage | RestoreMode::BuildDisk => false,
                 };
                 if ui
                     .add_enabled(can_start, egui::Button::new("Restore"))
@@ -1131,7 +1220,7 @@ impl RestoreTab {
             Ok(elevated) => {
                 let (file, _guard) = elevated.into_parts();
                 // A device cannot answer seek(End); carry the length the OS reports instead.
-                let mut reader = rusty_backup::os::known_len_reader(file, &device.path);
+                let mut reader = rusty_backup::os::known_len_source(file, &device.path);
                 match PartitionTable::detect(&mut reader) {
                     Ok(table) => {
                         self.sp_target_partitions = table.partitions();
@@ -1563,14 +1652,50 @@ impl RestoreTab {
                         );
                         ui.label("All existing data will be destroyed.");
                     }
+                    RestoreMode::BuildDisk => {
+                        let device_name = self
+                            .bd_target_device_idx
+                            .and_then(|idx| ctx.devices.get(idx))
+                            .map(|d| d.display_name())
+                            .unwrap_or_else(|| "Unknown".into());
+                        let table = self
+                            .bd_builder
+                            .as_ref()
+                            .map(|b| b.kind.label())
+                            .unwrap_or("?");
+                        ui.colored_label(
+                            egui::Color32::from_rgb(255, 100, 100),
+                            format!(
+                                "A new {} partition table will be written to {}, \
+                                 destroying everything on it!",
+                                table, device_name,
+                            ),
+                        );
+                        ui.add_space(4.0);
+                        ui.label(format!(
+                            "Confirm: type the device name `{}` to enable the build",
+                            device_name,
+                        ));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.bd_confirm_text)
+                                .hint_text(&device_name),
+                        );
+                    }
+                    // Never reaches this popup; it confirms in its own window.
+                    RestoreMode::WriteImage => {}
                 }
 
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
+                    let armed = self.restore_mode != RestoreMode::BuildDisk
+                        || self.build_confirm_matches(ctx);
                     if ui
-                        .button(
-                            egui::RichText::new("I understand, proceed")
-                                .color(egui::Color32::from_rgb(255, 100, 100)),
+                        .add_enabled(
+                            armed,
+                            egui::Button::new(
+                                egui::RichText::new("I understand, proceed")
+                                    .color(egui::Color32::from_rgb(255, 100, 100)),
+                            ),
                         )
                         .clicked()
                     {
@@ -1581,6 +1706,9 @@ impl RestoreTab {
                                 self.start_single_partition_restore(ctx)
                             }
                             RestoreMode::NewDisk => self.start_new_disk_restore(ctx),
+                            RestoreMode::BuildDisk => self.start_build_disk(ctx),
+                            // Never reaches this popup; it confirms in its own window.
+                            RestoreMode::WriteImage => {}
                         }
                     }
                     if ui.button("Cancel").clicked() {
@@ -1663,6 +1791,12 @@ impl RestoreTab {
         ctx.log
             .info(format!("Starting restore to {}", target_path.display(),));
 
+        // TEMP-DIAG: log the access we hold before touching the device, so a
+        // late "Permission denied" can be traced back to the starting state.
+        for line in rusty_backup::os::describe_device_access(&target_path) {
+            ctx.log.info(line);
+        }
+
         std::thread::spawn(move || {
             let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: disk restore");
             if let Err(e) = restore::run_restore(config, Arc::clone(&progress_arc)) {
@@ -1675,6 +1809,57 @@ impl RestoreTab {
     }
 
     /// Resolve the alignment radio into a `RestoreAlignment`.
+    /// Warn when the projected layout overruns the target even though the
+    /// sizes add up — the Original-alignment case, where positions are frozen.
+    fn show_layout_fit_warning(&self, ui: &mut egui::Ui, target_size: u64) {
+        let Some(metadata) = self.backup_metadata.as_ref() else {
+            return;
+        };
+        let alignment = self.resolve_alignment();
+        let sizes = self.build_partition_sizes(self.target_is_device);
+        // Ask the engine's own layout function so the projection can't drift.
+        let overrides = match rusty_backup::restore::calculate_restore_layout(
+            metadata,
+            &alignment,
+            &sizes,
+            target_size,
+        ) {
+            Ok(o) => o,
+            Err(e) => {
+                ui.colored_label(
+                    egui::Color32::from_rgb(255, 100, 100),
+                    format!("This layout will not fit: {e}"),
+                );
+                if matches!(alignment, RestoreAlignment::Original) {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(255, 180, 80),
+                        "Original alignment keeps every partition at its \
+                             original position, so shrinking only leaves gaps. \
+                             Choose 1 MB boundaries or Custom to repack them \
+                             from the start of the disk.",
+                    );
+                }
+                return;
+            }
+        };
+
+        let end_bytes = overrides
+            .iter()
+            .map(|o| o.effective_start_lba() * 512 + o.export_size)
+            .max()
+            .unwrap_or(0);
+        if end_bytes > target_size {
+            ui.colored_label(
+                egui::Color32::from_rgb(255, 100, 100),
+                format!(
+                    "Layout ends at {} but the target holds {}",
+                    partition::format_size(end_bytes),
+                    partition::format_size(target_size),
+                ),
+            );
+        }
+    }
+
     fn resolve_alignment(&self) -> RestoreAlignment {
         match self.alignment_choice {
             AlignmentChoice::Original => RestoreAlignment::Original,
@@ -2069,6 +2254,394 @@ impl RestoreTab {
                 }
             }
         });
+    }
+
+    /// Write Image File: pour any readable image onto a device or one of its
+    /// partitions. Target selection, confirmation and progress are the shared
+    /// [`PhysicalDiskExport`](super::physical_disk_export::PhysicalDiskExport)
+    /// sub-window.
+    fn show_write_image_mode(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &mut TabContext,
+        controls_enabled: bool,
+    ) {
+        ui.label(egui::RichText::new("Source Image").strong());
+        ui.separator();
+
+        ui.add_enabled_ui(controls_enabled, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Image file:");
+                let label = self
+                    .image_write_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "(none selected)".to_string());
+                ui.label(label);
+                if ui.button("Choose...").clicked() {
+                    let mut dialog = rfd::FileDialog::new();
+                    dialog = dialog.add_filter(
+                        "Disk images",
+                        rusty_backup::model::file_types::DISK_IMAGE_EXTS,
+                    );
+                    if let Some(path) = dialog.pick_file() {
+                        self.image_write_size =
+                            rusty_backup::model::source_reader::decoded_image_size(&path)
+                                .unwrap_or(0);
+                        if self.image_write_size == 0 {
+                            ctx.log.error(format!(
+                                "Could not read {} as a disk image",
+                                path.display()
+                            ));
+                        } else {
+                            ctx.log.info(format!(
+                                "Source image: {} ({})",
+                                path.display(),
+                                partition::format_size(self.image_write_size),
+                            ));
+                        }
+                        self.image_write_path = Some(path);
+                    }
+                }
+            });
+        });
+
+        if let Some(path) = self.image_write_path.clone() {
+            if self.image_write_size > 0 {
+                ui.label(format!(
+                    "Decoded size: {} (the file on disk may be smaller if it is compressed)",
+                    partition::format_size(self.image_write_size),
+                ));
+                ui.add_space(6.0);
+                if ui
+                    .add_enabled(
+                        controls_enabled,
+                        egui::Button::new("Choose target and write..."),
+                    )
+                    .clicked()
+                {
+                    let source = super::physical_disk_export::PhysicalDiskExportSource {
+                        path,
+                        size_bytes: self.image_write_size,
+                        fs_hint: "image".to_string(),
+                        has_partition_table: true,
+                    };
+                    self.image_write.open_for(source, None);
+                }
+            } else {
+                ui.colored_label(
+                    egui::Color32::from_rgb(220, 70, 70),
+                    "That file could not be opened as a disk image.",
+                );
+            }
+        } else {
+            ui.label(
+                egui::RichText::new(
+                    "Pick an image to write. Any format Rusty Backup can read works -- \
+                     raw, DMG, CHD, VHD, 2MG, GHO, IMZ, and gzip- or zip-wrapped images \
+                     are decoded on the way to the disk.",
+                )
+                .weak(),
+            );
+        }
+    }
+
+    /// Build Disk mode: pick a blank target, then define its partitions in the
+    /// shared modal. The table and every assigned image land in one pass.
+    fn show_build_disk_mode(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &mut TabContext,
+        controls_enabled: bool,
+    ) {
+        ui.label(egui::RichText::new("Target").strong());
+        ui.separator();
+
+        ui.add_enabled_ui(controls_enabled, |ui| {
+            ui.horizontal(|ui| {
+                ui.radio_value(&mut self.bd_target_is_device, false, "New image file");
+                ui.radio_value(&mut self.bd_target_is_device, true, "Physical device");
+            });
+
+            if self.bd_target_is_device {
+                ui.horizontal(|ui| {
+                    ui.label("Device:");
+                    let current_label = self
+                        .bd_target_device_idx
+                        .and_then(|idx| ctx.devices.get(idx))
+                        .map(|d| d.display_name())
+                        .unwrap_or_else(|| "Select a target device...".into());
+                    egui::ComboBox::from_id_salt("bd_target_device")
+                        .selected_text(&current_label)
+                        .width(400.0)
+                        .height(400.0)
+                        .show_ui(ui, |ui| {
+                            for (i, device) in ctx.devices.iter().enumerate() {
+                                let label = format!(
+                                    "{} ({}){}",
+                                    device.display_name(),
+                                    partition::format_size(device.size_bytes),
+                                    if device.is_system { " [SYSTEM]" } else { "" },
+                                );
+                                ui.selectable_value(&mut self.bd_target_device_idx, Some(i), label);
+                            }
+                            if ctx.devices.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(super::no_devices_hint())
+                                        .italics()
+                                        .weak(),
+                                );
+                            }
+                        });
+                });
+                ui.label(
+                    egui::RichText::new("Building erases everything on the selected device.")
+                        .color(egui::Color32::from_rgb(220, 150, 70)),
+                );
+            } else {
+                ui.horizontal(|ui| {
+                    ui.label("Image file:");
+                    let label = self
+                        .bd_image_file_path
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "No file selected".into());
+                    ui.label(&label);
+                    if ui.button("Save As...").clicked() {
+                        if let Some(path) = super::file_dialog()
+                            .add_filter("Disk Images", &["img", "raw", "bin"])
+                            .save_file()
+                        {
+                            self.bd_image_file_path = Some(path);
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Disk size:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.bd_image_size_text)
+                            .desired_width(90.0),
+                    )
+                    .on_hover_text("Accepts K / M / G suffixes, e.g. 512M or 2G.");
+                    match rusty_backup::partition::parse_size(&self.bd_image_size_text) {
+                        Ok(n) => {
+                            ui.label(egui::RichText::new(partition::format_size(n)).weak());
+                        }
+                        Err(e) => {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(220, 70, 70),
+                                format!("{e:#}"),
+                            );
+                        }
+                    }
+                });
+            }
+        });
+
+        ui.add_space(8.0);
+
+        let target = self.build_disk_target(ctx);
+        ui.add_enabled_ui(controls_enabled && target.is_some(), |ui| {
+            if ui
+                .button("Define Partitions...")
+                .on_hover_text("Choose the table type and lay out the partitions")
+                .clicked()
+            {
+                if let Some((_, size)) = &target {
+                    let keep = self
+                        .bd_builder
+                        .as_ref()
+                        .map(|b| b.kind)
+                        .unwrap_or(rusty_backup::partition::type_catalog::TableKind::Mbr);
+                    let mut builder = DiskBuilder::new(keep, *size);
+                    builder.disk_size = *size;
+                    self.bd_builder = Some(builder);
+                    self.bd_confirm_text.clear();
+                }
+            }
+        });
+        if target.is_none() {
+            ui.label(egui::RichText::new("Pick a target first.").weak());
+        }
+
+        self.show_build_progress(ui);
+    }
+
+    /// The chosen target as `(path, size_bytes)`, or `None` when the selection
+    /// is incomplete or the size field doesn't parse.
+    fn build_disk_target(&self, ctx: &TabContext) -> Option<(PathBuf, u64)> {
+        if self.bd_target_is_device {
+            let device = self.bd_target_device_idx.and_then(|i| ctx.devices.get(i))?;
+            Some((device.path.clone(), device.size_bytes))
+        } else {
+            let path = self.bd_image_file_path.clone()?;
+            let size = rusty_backup::partition::parse_size(&self.bd_image_size_text).ok()?;
+            (size > 0).then_some((path, size))
+        }
+    }
+
+    fn show_build_disk_modal(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext) {
+        let Some(builder) = self.bd_builder.as_mut() else {
+            return;
+        };
+        let action = super::partition_editor_modal::show(
+            ui,
+            super::partition_editor_modal::Mode::BuildNew { builder },
+            true,
+        );
+        match action {
+            super::partition_editor_modal::Action::Stay => {}
+            super::partition_editor_modal::Action::Close => self.bd_builder = None,
+            super::partition_editor_modal::Action::Apply => {
+                // Erasing a physical disk needs the same typed confirmation the
+                // Inspect tab's disk export asks for; an image file does not.
+                if self.bd_target_is_device {
+                    self.confirm_popup_open = true;
+                } else {
+                    self.start_build_disk(ctx);
+                }
+            }
+        }
+    }
+
+    fn start_build_disk(&mut self, ctx: &mut TabContext) {
+        let (target_path, target_size) = match self.build_disk_target(ctx) {
+            Some(t) => t,
+            None => {
+                ctx.log.error("No target selected");
+                return;
+            }
+        };
+        let Some(builder) = self.bd_builder.as_mut() else {
+            return;
+        };
+        let Some(placed) = builder.validate() else {
+            ctx.log
+                .error("Partition layout is not valid; fix the errors and try again");
+            return;
+        };
+
+        let req = ProvisionRequest {
+            target_path: target_path.clone(),
+            target_size_bytes: target_size,
+            kind: builder.kind,
+            geometry: builder.geometry,
+            partitions: placed,
+            sources: builder.sources(),
+        };
+        let kind_label = builder.kind.label();
+        ctx.log.info(format!(
+            "Building a {} disk on {} ({})",
+            kind_label,
+            target_path.display(),
+            partition::format_size(target_size),
+        ));
+        self.bd_logged = 0;
+        self.bd_finished_reported = false;
+        self.bd_rate.reset();
+        self.bd_status = Some(provision_runner::start_provision(req));
+        self.bd_builder = None;
+        self.bd_confirm_text.clear();
+    }
+
+    fn show_build_progress(&mut self, ui: &mut egui::Ui) {
+        let Some(status) = self.bd_status.as_ref() else {
+            return;
+        };
+        let Some((finished, error, current, total, cancel_requested)) =
+            status.lock().ok().map(|g| {
+                (
+                    g.finished,
+                    g.error.clone(),
+                    g.current_bytes,
+                    g.total_bytes,
+                    g.cancel_requested,
+                )
+            })
+        else {
+            return;
+        };
+
+        ui.add_space(8.0);
+        ui.separator();
+        let frac = if total > 0 {
+            (current as f32 / total as f32).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let text = if total > 0 {
+            self.bd_rate.record(current, "Building disk");
+            let suffix = self.bd_rate.suffix(current, total);
+            format!(
+                "{} / {} ({:.0}%){}",
+                partition::format_size(current),
+                partition::format_size(total),
+                frac * 100.0,
+                suffix,
+            )
+        } else if finished {
+            "done".to_string()
+        } else {
+            "writing the partition table...".to_string()
+        };
+        ui.add(egui::ProgressBar::new(if finished { 1.0 } else { frac }).text(text));
+
+        if finished {
+            match error {
+                Some(err) => ui.colored_label(
+                    egui::Color32::from_rgb(220, 70, 70),
+                    format!("Error: {err}"),
+                ),
+                None => ui.label("Disk build complete."),
+            };
+        } else if !cancel_requested {
+            if ui.button("Cancel build").clicked() {
+                if let Ok(mut g) = status.lock() {
+                    g.cancel_requested = true;
+                }
+            }
+        } else {
+            ui.label("Cancelling...");
+        }
+    }
+
+    /// The typed confirmation matches the selected device, so a build can't
+    /// erase the wrong disk by a stray click.
+    fn build_confirm_matches(&self, ctx: &TabContext) -> bool {
+        self.bd_target_device_idx
+            .and_then(|idx| ctx.devices.get(idx))
+            .is_some_and(|d| self.bd_confirm_text == d.display_name())
+    }
+
+    /// Forward the Build Disk worker's log lines to the shared log panel once
+    /// each, and report the outcome when it finishes.
+    fn poll_build(&mut self, ctx: &mut TabContext) {
+        let Some(status) = self.bd_status.as_ref() else {
+            return;
+        };
+        let Ok(guard) = status.lock() else { return };
+        let fresh: Vec<String> = guard
+            .log_messages
+            .iter()
+            .skip(self.bd_logged)
+            .cloned()
+            .collect();
+        let finished = guard.finished;
+        let error = guard.error.clone();
+        drop(guard);
+
+        self.bd_logged += fresh.len();
+        for msg in fresh {
+            ctx.log.info(msg);
+        }
+        if finished && !self.bd_finished_reported {
+            self.bd_finished_reported = true;
+            match error {
+                Some(e) => ctx.log.error(format!("Disk build failed: {e}")),
+                None => ctx.log.info("Disk build complete"),
+            }
+            self.bd_rate.reset();
+        }
     }
 
     fn show_new_disk_mode(

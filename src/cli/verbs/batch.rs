@@ -584,6 +584,8 @@ fn build_blank_fs(
     match fs {
         "fat" => crate::fs::fat::create_blank_fat(size, Some(name)),
         "efs" => crate::fs::efs::create_blank_efs(size, name),
+        "xfs" => crate::fs::xfs::format::create_blank_xfs(size, name)
+            .map_err(|e| anyhow!("create_blank_xfs: {e}")),
         "affs" => crate::fs::affs::create_blank_affs(size, affs_variant.unwrap_or(1), name),
         "hfs" => {
             let bs = block_size.unwrap_or_else(|| crate::cli::parse::pick_block_size(size));
@@ -611,7 +613,7 @@ fn build_blank_fs(
         "ti99" => crate::fs::ti99::create_blank_ti99(size, name)
             .map_err(|e| anyhow!("create_blank_ti99: {e}")),
         other => {
-            bail!("unsupported fs {other:?}; expected one of fat, efs, affs, hfs, ext, ext3, ext4, minix, minix2, minix3, ucsd, trdos, ti99")
+            bail!("unsupported fs {other:?}; expected one of fat, efs, xfs, affs, hfs, ext, ext3, ext4, minix, minix2, minix3, ucsd, trdos, ti99")
         }
     }
 }
@@ -703,6 +705,7 @@ fn apply_disk_block(path: &std::path::Path, disk: &DiskBlock) -> Result<()> {
         let type_byte = match p.fs.as_str() {
             "fat" => fat_type_byte_for(size),
             "efs" => 0x83, // Linux native; close enough — IRIX uses its own SGI table normally
+            "xfs" => 0x83, // what Linux itself uses for XFS on an MBR disk
             "affs" => 0x83,
             "hfs" => 0xAF,                                    // Apple HFS
             "minix" | "minix1" | "minix2" | "minix3" => 0x81, // Minix

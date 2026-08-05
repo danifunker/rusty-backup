@@ -657,7 +657,7 @@ pub fn open_source_for_reading(path: &Path) -> Result<crate::os::ElevatedSource>
         // Regular file - just open normally
         let file = File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
         return Ok(crate::os::ElevatedSource {
-            file,
+            file: crate::os::SourceHandle::File(file),
             temp_path: None,
         });
     }
@@ -691,7 +691,7 @@ pub fn open_source_for_reading(path: &Path) -> Result<crate::os::ElevatedSource>
 
     let file = unsafe { File::from_raw_handle(handle.0) };
     Ok(crate::os::ElevatedSource {
-        file,
+        file: crate::os::SourceHandle::File(file),
         temp_path: None,
     })
 }

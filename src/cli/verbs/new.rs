@@ -4,7 +4,8 @@
 //!   (the fixed-geometry retro filesystems plus small FAT/HFS).
 //! * `new volume <fs> IMG`  — a bare single-volume image of arbitrary size
 //!   (a "superfloppy": NTFS, ext4, HFS+, EFS, …). No partition table.
-//! * `new hd {x68k|sgi-efs} IMG` — a partition-table-wrapped, bootable
+//! * `new hd {x68k|sgi-efs|mbr|gpt|apm|sgi|rdb|sun|atari|x68k-table} IMG` — a
+//!   partition-table-wrapped, bootable
 //!   hard-disk image.
 //!
 //! CD-ROM images live under `optical new` (e.g. `optical new sgi-efs`).
@@ -41,6 +42,9 @@ pub enum FsKind {
     Fat,
     /// IRIX EFS (single cylinder group).
     Efs,
+    /// XFS (IRIX 6 / Linux). A v5/CRC volume with 4 KiB blocks, 512-byte
+    /// inodes and an internal log; minimum 32 MiB.
+    Xfs,
     /// Amiga FFS / OFS (variant selected via --affs-variant).
     Affs,
     /// NTFS (Windows NT / 2000 / XP). Cluster and sector size via
@@ -167,6 +171,45 @@ pub enum HdCommand {
     /// same step; otherwise it comes out blank for `import` / `put`.
     #[command(name = "sgi-efs")]
     SgiEfs(super::new_sgi_hdd::NewSgiHddArgs),
+
+    /// MBR (DOS / PC) disk with partitions you size and type yourself. The
+    /// partitions come out empty — fill them with `write --partition N` or
+    /// format them with `reformat`.
+    Mbr(super::new_partitioned_hd::PartitionedHdArgs),
+
+    /// GPT (UEFI, modern macOS / Linux) disk with partitions you size and
+    /// type yourself.
+    Gpt(super::new_partitioned_hd::PartitionedHdArgs),
+
+    /// APM (Apple Partition Map) disk for classic Mac OS / PowerPC, with
+    /// partitions you size and type yourself.
+    Apm(super::new_partitioned_hd::PartitionedHdArgs),
+
+    /// SGI volume header (IRIX) with partitions you size and type yourself.
+    /// Cylinder-aligned from `--heads` / `--sectors`. Unlike `sgi-efs` the
+    /// partitions come out empty rather than EFS-formatted.
+    Sgi(super::new_partitioned_hd::CylinderHdArgs),
+
+    /// Amiga Rigid Disk Block (RDB) with partitions you size and type
+    /// yourself. Cylinder-aligned from `--heads` / `--sectors`; types are
+    /// AmigaDOS DosType tags (`DOS\\3`, `PFS\\3`, `SFS\\0`, ...).
+    Rdb(super::new_partitioned_hd::CylinderHdArgs),
+
+    /// Sun disk label (SMI VTOC) for SPARC Solaris / SunOS, with slices you
+    /// size and tag yourself. Cylinder-aligned from `--heads` / `--sectors`;
+    /// slice 2 is reserved for the whole-disk "backup" alias.
+    Sun(super::new_partitioned_hd::CylinderHdArgs),
+
+    /// Sharp X68000 SCSI/SASI table with partitions you size yourself.
+    /// Unlike `x68k` this writes only the table -- no IPL stub, no Human68k
+    /// formatting -- so it is a data disk, not a bootable one.
+    #[command(name = "x68k-table")]
+    X68kTable(super::new_partitioned_hd::PartitionedHdArgs),
+
+    /// Atari ST / TT / Falcon AHDI disk with partitions you size and type
+    /// yourself. Types are the 3-character tags GEM / BGM / RAW; a GEM
+    /// partition over 16 MiB is promoted to BGM, which is what TOS needs.
+    Atari(super::new_partitioned_hd::PartitionedHdArgs),
 }
 
 /// Filesystems offered under `new floppy`. Converts to the master [`FsKind`].
@@ -258,6 +301,8 @@ pub enum VolumeFs {
     Prodos,
     /// IRIX EFS (single cylinder group) — a bare EFS superfloppy.
     Efs,
+    /// XFS (IRIX 6 / Linux) — a bare v5/CRC volume, minimum 32 MiB.
+    Xfs,
     /// Minix V2 — 32-bit zone pointers, `mkfs.minix -2`.
     Minix2,
     /// Minix V3 — 60-char names, `mkfs.minix -3`.
@@ -279,6 +324,7 @@ impl VolumeFs {
             VolumeFs::Affs => FsKind::Affs,
             VolumeFs::Prodos => FsKind::Prodos,
             VolumeFs::Efs => FsKind::Efs,
+            VolumeFs::Xfs => FsKind::Xfs,
             VolumeFs::Minix2 => FsKind::Minix2,
             VolumeFs::Minix3 => FsKind::Minix3,
         }
@@ -451,6 +497,30 @@ pub fn run(cmd: NewCommand) -> Result<()> {
         NewCommand::Hd { cmd } => match cmd {
             HdCommand::X68k(args) => super::new_x68k_hdd::run(args),
             HdCommand::SgiEfs(args) => super::new_sgi_hdd::run(args),
+            HdCommand::Mbr(args) => super::new_partitioned_hd::run(
+                super::new_partitioned_hd::PartitionedHdCommand::Mbr(args),
+            ),
+            HdCommand::Gpt(args) => super::new_partitioned_hd::run(
+                super::new_partitioned_hd::PartitionedHdCommand::Gpt(args),
+            ),
+            HdCommand::Apm(args) => super::new_partitioned_hd::run(
+                super::new_partitioned_hd::PartitionedHdCommand::Apm(args),
+            ),
+            HdCommand::Sgi(args) => super::new_partitioned_hd::run(
+                super::new_partitioned_hd::PartitionedHdCommand::Sgi(args),
+            ),
+            HdCommand::Rdb(args) => super::new_partitioned_hd::run(
+                super::new_partitioned_hd::PartitionedHdCommand::Rdb(args),
+            ),
+            HdCommand::Sun(args) => super::new_partitioned_hd::run(
+                super::new_partitioned_hd::PartitionedHdCommand::Sun(args),
+            ),
+            HdCommand::X68kTable(args) => super::new_partitioned_hd::run(
+                super::new_partitioned_hd::PartitionedHdCommand::X68k(args),
+            ),
+            HdCommand::Atari(args) => super::new_partitioned_hd::run(
+                super::new_partitioned_hd::PartitionedHdCommand::Atari(args),
+            ),
         },
     }
 }
@@ -647,6 +717,7 @@ fn format_image(args: NewArgs) -> Result<()> {
                 args.bytes_per_inode,
             ),
         ),
+        FsKind::Xfs => write_blank_xfs_image(&args.image, &args.size, &args.name),
         FsKind::Affs => {
             let variant = args.affs_variant;
             format_and_write(&args.image, &args.size, &args.name, |size, name| {
@@ -903,6 +974,26 @@ fn write_blank_ext_image(
         .with_context(|| format!("sizing {}", image.display()))?;
     log_stderr(format!(
         "wrote {} ({disk_bytes} bytes, {kind}, volume {:?})",
+        image.display(),
+        name
+    ));
+    Ok(())
+}
+
+/// Format a bare XFS superfloppy by streaming only its metadata regions to the
+/// output file; the log body and the free space past them stay sparse. The
+/// formatted length can be a touch under `--size` when the trailing partial
+/// allocation group is dropped.
+fn write_blank_xfs_image(image: &std::path::Path, size_str: &str, name: &str) -> Result<()> {
+    let size = parse_size(size_str).context("parsing --size")?;
+    let mut file =
+        std::fs::File::create(image).with_context(|| format!("creating {}", image.display()))?;
+    let disk_bytes = crate::fs::xfs::format::write_blank_xfs(&mut file, 0, size, name)
+        .with_context(|| format!("formatting XFS into {}", image.display()))?;
+    file.set_len(disk_bytes)
+        .with_context(|| format!("sizing {}", image.display()))?;
+    log_stderr(format!(
+        "wrote {} ({disk_bytes} bytes, XFS v5, volume {:?})",
         image.display(),
         name
     ));

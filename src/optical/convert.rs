@@ -263,6 +263,7 @@ pub fn bincue_to_iso(
 /// BIN/CUE feeds straight into `cd::create_from_cue`; ISO uses
 /// `cd::create_from_iso` (which synthesises a tempfile CUE next to the
 /// source — no manual `.rusty-backup-temp.cue` to clean up).
+#[cfg(feature = "chd")]
 pub fn to_chd(
     input_path: &Path,
     output_path: &Path,
@@ -348,6 +349,7 @@ pub fn to_chd(
 /// metadata (per-track MODE/AUDIO + INDEX/PREGAP/POSTGAP). Tracks with
 /// stored subcode are silently dropped (CUE/BIN can't carry it); we log
 /// a one-liner so the user isn't surprised.
+#[cfg(feature = "chd")]
 pub fn chd_to_bincue(
     chd_path: &Path,
     cue_path: &Path,
@@ -428,6 +430,7 @@ pub fn chd_to_bincue(
 /// `sum(frames * datasize) != bin_size` (typically only happens when the CHD
 /// has stored padframes/splitframes the public API can't see), we fall back to
 /// single-bin output and log a warning so the user isn't surprised.
+#[cfg(feature = "chd")]
 pub fn chd_to_bincue_multi(
     chd_path: &Path,
     cue_path: &Path,
@@ -623,6 +626,7 @@ struct ParsedCue {
 /// Tight parser for libchdman-rs's cue output (not a general cue parser).
 /// Recognizes `FILE … BINARY`, `TRACK NN <mode>`, `INDEX 00/01 MSF`,
 /// `PREGAP MSF`, `POSTGAP MSF`. Unknown lines are tolerated and skipped.
+#[cfg(feature = "chd")]
 fn parse_libchdman_cue(text: &str) -> Result<ParsedCue> {
     let mut out = ParsedCue::default();
     let mut current: Option<ParsedTrack> = None;
@@ -682,6 +686,7 @@ fn parse_libchdman_cue(text: &str) -> Result<ParsedCue> {
 ///
 /// libchdman-rs's `cd::extract_to_iso` rejects multi-track or non-MODE1
 /// CHDs — we surface a friendly error pointing at chd_to_bincue.
+#[cfg(feature = "chd")]
 pub fn chd_to_iso(
     chd_path: &Path,
     iso_path: &Path,

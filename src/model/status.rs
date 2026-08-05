@@ -9,7 +9,6 @@
 //! `docs/codecleanup.md`.
 
 use std::collections::HashMap;
-use std::fs::File;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -44,9 +43,9 @@ pub struct InspectStatus {
     pub deferred_min_sizes: HashMap<usize, &'static str>,
     /// Detected image format label (e.g. "WOZ 3.5\"", "Fixed VHD").
     pub format_label: Option<String>,
-    /// The open device file handle, passed back to the main thread so
-    /// that BrowseView can reuse it without re-opening (and re-prompting).
-    pub device_file: Option<File>,
+    /// The open device handle, passed back to the main thread so that
+    /// BrowseView can reuse it without re-opening (and re-prompting).
+    pub device_file: Option<crate::os::SourceHandle>,
     /// The `TempFileGuard` that holds the DiskClaim / temp file alive.
     /// Kept here so the main thread can decide when to release it.
     pub device_guard: Option<TempFileGuard>,

@@ -1,34 +1,16 @@
 //! Shared argument parsers — size strings, Mac paths, and a small
 //! zero-byte reader used by `put --zero N`.
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::Result;
 use std::io::Read;
 
 /// Parse a human-friendly size string. Accepts plain bytes, optional
 /// `B`/`K`/`KiB`/`M`/`MiB`/`G`/`GiB` suffixes.
+///
+/// The implementation lives beside `partition::format_size` so the GUI and TUI
+/// reach it without going through the CLI module.
 pub fn parse_size(s: &str) -> Result<u64> {
-    let s = s.trim();
-    if s.is_empty() {
-        bail!("empty size");
-    }
-    let (num_part, mult): (&str, u64) =
-        if let Some(rest) = s.strip_suffix("KiB").or_else(|| s.strip_suffix('K')) {
-            (rest, 1024)
-        } else if let Some(rest) = s.strip_suffix("MiB").or_else(|| s.strip_suffix('M')) {
-            (rest, 1024 * 1024)
-        } else if let Some(rest) = s.strip_suffix("GiB").or_else(|| s.strip_suffix('G')) {
-            (rest, 1024 * 1024 * 1024)
-        } else if let Some(rest) = s.strip_suffix('B') {
-            (rest, 1)
-        } else {
-            (s, 1)
-        };
-    let n: u64 = num_part
-        .trim()
-        .parse()
-        .map_err(|_| anyhow!("invalid size {s:?}"))?;
-    n.checked_mul(mult)
-        .ok_or_else(|| anyhow!("size {s:?} overflows u64"))
+    crate::partition::parse_size(s)
 }
 
 /// Pick the smallest 512-byte-multiple block size that keeps total_blocks

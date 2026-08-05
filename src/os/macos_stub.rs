@@ -291,10 +291,70 @@ pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
     // `ElevatedSource`'s fields are private to `os`, and this module is a child
     // of it - the same way the real `macos.rs` constructs one.
     Ok(ElevatedSource {
-        file: File::open(path).map_err(|e| open_error(path, e))?,
+        file: super::SourceHandle::File(File::open(path).map_err(|e| open_error(path, e))?),
         temp_path: None,
         disk_claim: None,
     })
+}
+
+/// Stand-in for the real module's shared authopen descriptor.
+///
+/// There is no `authopen` to escalate through here, so nothing is ever cached
+/// and no value of this type is ever constructed. It exists so
+/// [`super::SourceHandle`] keeps one shape across both modules.
+pub enum SharedDevice {}
+
+impl SharedDevice {
+    pub fn try_clone(&self) -> std::io::Result<Self> {
+        match *self {}
+    }
+
+    pub fn byte_len(&self) -> u64 {
+        match *self {}
+    }
+
+    pub fn dup_as_file(&self) -> std::io::Result<File> {
+        match *self {}
+    }
+}
+
+impl std::io::Read for SharedDevice {
+    fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+        match *self {}
+    }
+}
+
+impl std::io::Write for SharedDevice {
+    fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+        match *self {}
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match *self {}
+    }
+}
+
+impl std::io::Seek for SharedDevice {
+    fn seek(&mut self, _pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        match *self {}
+    }
+}
+
+/// Nothing is cached without `authopen`, so releasing is a no-op.
+pub fn release_elevated_devices(_path: Option<&str>) {}
+
+/// TEMP-DIAG counterpart. Reports the plain-`open(2)` outcome; there is no
+/// escalation path here to describe.
+pub fn probe_device_access(path: &str) -> Vec<String> {
+    let mut out = vec![format!(
+        "[perm] euid={} (no authopen on this build)",
+        unsafe { libc::geteuid() },
+    )];
+    match std::fs::OpenOptions::new().read(true).open(path) {
+        Ok(_) => out.push(format!("[perm] {path}: O_RDONLY ok")),
+        Err(e) => out.push(format!("[perm] {path}: O_RDONLY failed - {e}")),
+    }
+    out
 }
 
 /// No optical drive to claim without DiskArbitration.

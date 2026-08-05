@@ -18,6 +18,7 @@ mod metadata_editor;
 mod optical_audio;
 mod optical_tab;
 mod partition_bar;
+mod partition_editor_modal;
 mod physical_disk_export;
 mod progress;
 mod remote_browser;

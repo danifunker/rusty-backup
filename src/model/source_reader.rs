@@ -1430,6 +1430,12 @@ pub fn is_squashfs_bearing_iso(path: &Path) -> bool {
     squashfs_bearing_iso_payload(path).is_some()
 }
 
+/// Decoded length of an image, peeling any container/wrapper layer.
+pub fn decoded_image_size(path: &Path) -> Option<u64> {
+    let mut r = open_peeled_read_with_entry(path, None, None).ok()?;
+    r.seek(std::io::SeekFrom::End(0)).ok().filter(|n| *n > 0)
+}
+
 pub fn is_container_path(path: &Path) -> bool {
     crate::rbformats::appimage::is_squashfs_appimage(path)
         || squashfs_bearing_iso_payload(path).is_some()
