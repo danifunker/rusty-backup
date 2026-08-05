@@ -205,6 +205,9 @@ pub struct InspectTab {
     open_device_file: Option<Arc<File>>,
     /// Guard that keeps the DiskClaim (and any temp file) alive while browsing.
     open_device_guard: Option<rusty_backup::os::TempFileGuard>,
+    /// Device path this tab last escalated, so closing the source can release
+    /// that one cached descriptor (and only that one) for a clean eject.
+    open_device_path: Option<PathBuf>,
     /// When the source is a CHD container, we route every reader through a
     /// fresh `ChdReader` opened from this path. `None` for raw devices/images.
     chd_image_path: Option<PathBuf>,
@@ -315,6 +318,7 @@ impl Default for InspectTab {
             inspect_status: None,
             open_device_file: None,
             open_device_guard: None,
+            open_device_path: None,
             chd_image_path: None,
             cached_disk_size: None,
             editor_popup: false,
@@ -2569,6 +2573,7 @@ impl InspectTab {
                 self.image_file_path = None;
                 self.amiga_tempdir = None;
                 self.backup_folder_path = None;
+                self.release_open_device();
                 self.clear_results();
             }
             SourceEvent::Image { path, tempdir } => {
@@ -2582,12 +2587,14 @@ impl InspectTab {
                 self.backup_folder_path = None;
                 self.image_file_path = Some(path);
                 self.amiga_tempdir = tempdir;
+                self.release_open_device();
                 self.clear_results();
             }
             SourceEvent::BackupFolder(path) => {
                 self.backup_folder_path = Some(path);
                 self.selected_device_idx = None;
                 self.image_file_path = None;
+                self.release_open_device();
                 self.clear_results();
             }
             // Inspect's picker doesn't offer a host folder.
@@ -2606,6 +2613,7 @@ impl InspectTab {
     fn do_close(&mut self, ctx: &mut TabContext) {
         let was_backup = self.backup_folder_path.is_some();
         self.browse_view.close();
+        self.release_open_device();
         self.clear_results();
         self.selected_device_idx = None;
         self.prev_device_idx = None;
@@ -2679,15 +2687,23 @@ impl InspectTab {
         self.seekable_cache_files.clear();
         self.cache_status = None;
         self.inspect_status = None;
-        // Release the open device fd and disk claim (remounts the disk). The
-        // process-wide escalation cache holds a descriptor too, and that would
-        // keep the raw device open past this point and block a clean eject.
+        // Drop this tab's fd and claim, but never the process-wide escalation
+        // cache — that re-prompts on Re-inspect. `release_open_device` owns it.
         self.open_device_file = None;
         self.open_device_guard = None;
-        rusty_backup::os::release_elevated_devices(None);
         self.chd_image_path = None;
         self.cached_disk_size = None;
         self.single_file_chd_backup_folder = None;
+    }
+
+    /// Give up the escalated descriptor for the device this tab had open, so it
+    /// can eject. Scoped to that path — other tabs' devices keep theirs.
+    fn release_open_device(&mut self) {
+        self.open_device_file = None;
+        self.open_device_guard = None;
+        if let Some(path) = self.open_device_path.take() {
+            rusty_backup::os::release_elevated_devices(Some(&path.to_string_lossy()));
+        }
     }
 
     fn load_backup_metadata(&mut self, ctx: &mut TabContext) {
@@ -2789,6 +2805,17 @@ impl InspectTab {
         } else {
             return;
         };
+
+        // Remember which device this tab escalated, so closing releases exactly
+        // that one. Re-inspecting the same device keeps it — hence no re-prompt.
+        if remote.is_none() && rusty_backup::os::is_device_path(&path) {
+            if self.open_device_path.as_deref() != Some(path.as_path()) {
+                self.release_open_device();
+            }
+            self.open_device_path = Some(path.clone());
+        } else {
+            self.release_open_device();
+        }
 
         if remote.is_some() {
             ctx.log

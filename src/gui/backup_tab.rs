@@ -88,6 +88,9 @@ pub struct BackupTab {
     last_logged_min_size_phase: std::collections::HashMap<usize, String>,
     /// Open file handle for the source (kept alive so min-size workers can clone it).
     source_file: Option<Arc<File>>,
+    /// Device path this tab escalated, so Close Source can release that one
+    /// cached descriptor and let the drive eject.
+    open_device_path: Option<PathBuf>,
     /// Human-readable description of the partition table type for the
     /// currently-loaded source (e.g. "MBR", "GPT", "APM"). Shown above
     /// the partition list.
@@ -227,6 +230,7 @@ impl Default for BackupTab {
             pending_min_size_calcs: std::collections::HashMap::new(),
             last_logged_min_size_phase: std::collections::HashMap::new(),
             source_file: None,
+            open_device_path: None,
             source_partition_table_desc: None,
             pending_backup_after_min_sizes: false,
             partition_load_error: None,
@@ -1496,6 +1500,10 @@ impl BackupTab {
         let path_str = path.to_string_lossy();
         let is_device = path_str.starts_with("/dev/") || path_str.starts_with("\\\\.\\");
 
+        // Remember what we escalate, so Close Source can hand the device back
+        // (the descriptor is cached process-wide and would block an eject).
+        self.open_device_path = if is_device { Some(path.clone()) } else { None };
+
         // Open file (with elevation for devices)
         let open_result: Result<rusty_backup::os::SourceHandle, String> = if is_device {
             match rusty_backup::os::open_source_for_reading(&path) {
@@ -2100,6 +2108,9 @@ impl BackupTab {
         // Dropping the Arc<File> here releases the OS handle on the drive so it
         // can be safely ejected (min-size workers hold their own clones).
         self.source_file = None;
+        if let Some(path) = self.open_device_path.take() {
+            rusty_backup::os::release_elevated_devices(Some(&path.to_string_lossy()));
+        }
         self.source_partitions.clear();
         self.selected_partitions.clear();
         self.partition_min_sizes.clear();
