@@ -18,7 +18,7 @@ gap is only the write side.
 | SGI (IRIX) | Done | `partition::provision::write_sgi` |
 | X68000 | Done | `partition::provision::write_x68k` |
 | RDB (Amiga) | Done | `partition::provision::write_rdb` |
-| **Sun (SMI VTOC)** | **Missing** | see below |
+| Sun (SMI VTOC) | Done | `partition::provision::write_sun` |
 | **AHDI (Atari ST)** | **Missing** | see below |
 
 Filesystem creation is separate from table creation. A table writer produces
@@ -27,7 +27,7 @@ empty partitions; `rb-cli reformat --fs <fs>` fills them. See
 
 ## How to add a writer
 
-All six existing writers follow the same shape, so a new one slots in without
+All seven existing writers follow the same shape, so a new one slots in without
 touching the layout engine:
 
 1. Add the variant to `PartitionedHdCommand` and to `HdCommand` in
@@ -51,30 +51,41 @@ overrun refusal; a writer only serialises.
 
 ---
 
-## Sun (SMI VTOC)
+## Sun (SMI VTOC) — done
 
-**Parser:** `src/partition/sun.rs`. 8 slices, big-endian, magic `0xDABE` at byte
-508 of sector 0.
+Shipped as `partition::provision::write_sun`, reached from `rb-cli new hd sun`,
+the TUI's New wizard and the GUI's Build Disk picker. It writes the single
+512-byte label at sector 0: the free-form `info` text, the VTOC tag table, the
+geometry words, and the 8 `{start_cylinder, num_sectors}` slices. Field offsets
+follow the kernel's `struct sun_disklabel` (`block/partitions/sun.c`), which is
+also what `src/partition/sun.rs` reads.
 
-**What a writer needs**
+Notes for anyone extending it:
 
-- The 512-byte label: ASCII `info` text, `rpm`, `pcyl`, `apc`, `nhead`,
-  `nsect`, `ncyl`, then the 8 × 8-byte slice array (tag, flags, start cylinder,
-  sector count), magic and checksum.
-- **The checksum is a plain XOR of every 16-bit big-endian word in the label,
-  and it must come out zero.** Get this wrong and Solaris refuses the disk.
-- Slices are expressed in **cylinders, not sectors**, so the geometry
-  (`nhead` × `nsect`) is load-bearing: every partition start and length must be
-  a whole number of cylinders. `place()` handles this if the caller passes
-  `align = nhead * nsect * 512`, exactly as the SGI path does.
-- Slice 2 is conventionally the whole disk ("backup"), the same role SGI's slot
-  10 plays. Slice tags: 0 unassigned, 1 boot, 2 root, 3 swap, 4 usr, 5 backup,
-  7 var, 8 home.
+- **Slice 2** is the whole-disk "backup" alias, written unconditionally with
+  tag 5 spanning `ncyl * spc`. User slices fill the other seven, hence
+  `slot_limit(Sun) == 7`.
+- The checksum is a 16-bit XOR over all 256 big-endian words that has to come
+  out **zero**, so the stored `csum` is the XOR of the other 255. `fdisk`
+  refuses the label outright if this is wrong, which makes it easy to catch.
+- Slices are cylinder-granular, so Sun shares RDB's `size_granularity` hook —
+  a size that is not a whole number of cylinders cannot be expressed.
+- Slice tags accept either a name (`root`, `usr`, `swap`, ...) or a bare number,
+  resolved by `sun::tag_from_text`, which `type_catalog::normalize` also uses so
+  the two spellings compare equal.
+- We start slice 0 at **cylinder 1**, not cylinder 0. Real Sun disks put the
+  root slice at cylinder 0 and rely on UFS leaving the label sector alone, but
+  this tool pours arbitrary images into partitions, so overlapping the label
+  would be a footgun. `sfdisk --verify` reports the first cylinder as an unused
+  gap and still exits 0.
 
-**Validation.** Do not ship this without an oracle. A wrong VTOC yields a disk
-that looks plausible and won't boot. Build a label, then check it round-trips
-through our own parser *and* through `prtvtoc`/`fdisk` in a Solaris or
-OpenIndiana VM, the way the EFS work was validated against IRIX.
+**Validation.** Round-trips through our own parser in
+`every_writable_table_writes_and_reparses` and
+`sun_label_checksums_and_reserves_the_backup_slice`, and cross-checked against
+util-linux `fdisk -l` / `sfdisk --dump` / `sfdisk --verify` on a Linux box,
+which report our geometry, every slice's start and length, and each tag.
+Booting a real Solaris install is still unproven — the label is right by every
+tool that reads it, but nobody has put an actual SunOS root on one yet.
 
 ---
 

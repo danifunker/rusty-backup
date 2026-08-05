@@ -1140,6 +1140,28 @@ Usage: sgi-efs [OPTIONS] <IMAGE>
 - `--inodes` — Approximate total inode count for the EFS root. The formatter scales the cylinder groups to hit roughly this many inodes. Mutually exclusive with `--bytes-per-inode`. When neither is given the density is ~1 inode/4 KiB
 - `--bytes-per-inode` — EFS inode density, in bytes per inode (smaller = more inodes). Floored at one inode per 512-byte block. Mutually exclusive with `--inodes`
 
+### `new hd sun`
+
+Sun disk label (SMI VTOC) for SPARC Solaris / SunOS, with slices you size and tag yourself. Cylinder-aligned from `--heads` / `--sectors`; slice 2 is reserved for the whole-disk "backup" alias
+
+```
+Usage: sun [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image file to create
+
+**Options**
+
+- `--size` — Total disk size (accepts `K`/`M`/`G` suffixes)
+- `--partition` — A partition, repeatable, in disk order: `SIZE[:TYPE[:NAME]]`. SIZE accepts `K`/`M`/`G`, or `rest` for the remaining space (once). TYPE is a value from `partmap types`; NAME is APM/GPT only
+- `--fill` — Pour an image into a partition as it is created: `N=PATH`, 1-based, repeatable. Any format the engine can read is decoded on the way in
+- `--align` — Alignment for partition starts. Default 1 MiB; use 63s for DOS-era cylinder alignment on vintage machines
+- `--force` — Overwrite `image` if it already exists
+- `--heads` — Disk geometry: heads. These tables place partitions on cylinder boundaries, so the geometry sets the default alignment
+- `--sectors` — Disk geometry: sectors per track
+
 ### `new hd x68k`
 
 Sharp X68000 HDD (SASI / SCSI): X68K partition table + IPL stub + a blank or donor-cloned Human68k partition

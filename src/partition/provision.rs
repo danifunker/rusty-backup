@@ -1,9 +1,9 @@
 //! Lay out and write a fresh partition table on a blank disk.
 //!
-//! Shared by `rb-cli new hd {mbr|gpt|apm|sgi|x68k|rdb}`, the TUI's New wizard
-//! and the GUI's Build Disk mode, so all three place partitions identically and
-//! emit byte-for-byte the same tables. Sun and AHDI are parse-only; see
-//! `docs/partition_table_writers_backlog.md` for what each writer still needs.
+//! Shared by `rb-cli new hd {mbr|gpt|apm|sgi|x68k|rdb|sun}`, the TUI's New
+//! wizard and the GUI's Build Disk mode, so all three place partitions
+//! identically and emit byte-for-byte the same tables. AHDI is parse-only; see
+//! `docs/partition_table_writers_backlog.md` for what that writer still needs.
 //!
 //! Sizes are laid out in order from `align` (1 MiB by default), each rounded up
 //! to the alignment, past whatever head/tail region the table itself reserves.
@@ -79,7 +79,12 @@ pub const WRITABLE_TABLES: &[TableKind] = &[
     TableKind::Sgi,
     TableKind::X68k,
     TableKind::Rdb,
+    TableKind::Sun,
 ];
+
+/// The slice a Sun label reserves for the whole-disk "backup" alias, which is
+/// conventionally slice 2 and overlaps every real slice.
+const SUN_BACKUP_SLICE: usize = 2;
 
 /// How many partitions the table can hold, or `None` when it is unbounded in
 /// any practical sense.
@@ -92,6 +97,8 @@ pub fn slot_limit(kind: TableKind) -> Option<usize> {
         // RDB is a linked list, but keeping every PART block inside the first
         // 16 sectors is what every Amiga tool scans for.
         TableKind::Rdb => Some(crate::partition::rdb::RDB_SCAN_BLOCKS as usize - 1),
+        // Sun has 8 slices; slice 2 is the whole-disk backup alias.
+        TableKind::Sun => Some(7),
         _ => None,
     }
 }
@@ -106,6 +113,7 @@ pub fn default_type(kind: TableKind) -> &'static str {
         // X68k entries carry a name, not a type code.
         TableKind::X68k => "Human68k",
         TableKind::Rdb => "DOS\\3",
+        TableKind::Sun => "root",
         _ => "83",
     }
 }
@@ -117,6 +125,12 @@ pub fn default_name(kind: TableKind, index: usize) -> String {
         TableKind::Rdb => format!("DH{index}"),
         _ => format!("Partition {}", index + 1),
     }
+}
+
+/// Slice numbers a Sun label offers to user partitions, in order: everything
+/// but the whole-disk backup alias.
+fn sun_user_slices() -> impl Iterator<Item = usize> {
+    (0..8).filter(|&i| i != SUN_BACKUP_SLICE)
 }
 
 /// Bytes at the head of the disk the table itself needs.
@@ -135,6 +149,9 @@ pub fn reserved_head(kind: TableKind) -> u64 {
         // the first partition out to cylinder 1, which is where Amiga tools
         // put it.
         TableKind::Rdb => crate::partition::rdb::RDB_SCAN_BLOCKS * SECTOR,
+        // Sun keeps only the 512-byte label at sector 0, but slices start on
+        // cylinder boundaries, so alignment pushes slice 0 out to cylinder 1.
+        TableKind::Sun => SECTOR,
         _ => SECTOR,
     }
 }
@@ -151,7 +168,7 @@ pub fn reserved_tail(kind: TableKind) -> u64 {
 /// SGI and RDB want cylinder boundaries; everything else gets 1 MiB.
 pub fn default_align(kind: TableKind, geometry: Geometry) -> u64 {
     match kind {
-        TableKind::Sgi | TableKind::Rdb => geometry.cylinder_bytes().max(SECTOR),
+        TableKind::Sgi | TableKind::Rdb | TableKind::Sun => geometry.cylinder_bytes().max(SECTOR),
         _ => 1024 * 1024,
     }
 }
@@ -161,7 +178,7 @@ pub fn default_align(kind: TableKind, geometry: Geometry) -> u64 {
 /// number of cylinders cannot be expressed; every other table counts sectors.
 fn size_granularity(kind: TableKind, align: u64) -> u64 {
     match kind {
-        TableKind::Rdb => align.max(SECTOR),
+        TableKind::Rdb | TableKind::Sun => align.max(SECTOR),
         _ => SECTOR,
     }
 }
@@ -299,6 +316,7 @@ pub fn write_table<W: Write + Seek>(
         TableKind::X68k => write_x68k(out, placed, disk_size),
         TableKind::Sgi => write_sgi(out, placed, disk_size, geometry),
         TableKind::Rdb => write_rdb(out, placed, disk_size, geometry),
+        TableKind::Sun => write_sun(out, placed, disk_size, geometry),
         _ => bail!("no table writer for {}", kind.label()),
     }
 }
@@ -582,6 +600,95 @@ fn write_rdb<W: Write + Seek>(
     Ok(())
 }
 
+/// Sun disk label (SMI VTOC): one 512-byte label at sector 0 holding geometry,
+/// an 8-entry VTOC tag table and 8 `{start_cylinder, num_sectors}` slices.
+///
+/// Slice 2 is the whole-disk "backup" alias every Sun tool expects, so user
+/// partitions fill the other seven. Field offsets follow the kernel's
+/// `struct sun_disklabel` (`block/partitions/sun.c`), which is also what our
+/// parser reads.
+fn write_sun<W: Write + Seek>(
+    out: &mut W,
+    placed: &[Placed],
+    disk_size: u64,
+    geometry: Geometry,
+) -> Result<()> {
+    use crate::partition::sun::{
+        tag_from_text, SUN_LABEL_MAGIC, SUN_TAG_WHOLE_DISK, SUN_VTOC_SANITY,
+    };
+
+    let heads = u64::from(geometry.heads);
+    let sectors = u64::from(geometry.sectors_per_track);
+    let spc = heads * sectors;
+    if spc == 0 {
+        bail!("heads and sectors-per-track must both be non-zero");
+    }
+    let ncyl = disk_size / SECTOR / spc;
+    if ncyl < 2 {
+        bail!(
+            "a Sun disk needs at least two cylinders ({} each); {} is too small",
+            format_size(spc * SECTOR),
+            format_size(disk_size),
+        );
+    }
+    if ncyl > u64::from(u16::MAX) {
+        bail!(
+            "Sun labels count cylinders in 16 bits; {ncyl} is too many — raise --heads/--sectors"
+        );
+    }
+
+    let mut label = [0u8; 512];
+    // The `info` text is free-form, but every Sun tool writes the geometry
+    // into it and `fdisk` shows it verbatim.
+    let info = format!("rusty-backup cyl {ncyl} alt 0 hd {heads} sec {sectors}");
+    let n = info.len().min(128);
+    label[..n].copy_from_slice(&info.as_bytes()[..n]);
+
+    let put16 = |b: &mut [u8; 512], off: usize, v: u16| {
+        b[off..off + 2].copy_from_slice(&v.to_be_bytes());
+    };
+    let put32 = |b: &mut [u8; 512], off: usize, v: u32| {
+        b[off..off + 4].copy_from_slice(&v.to_be_bytes());
+    };
+
+    put32(&mut label, 128, 1); // vtoc.version
+    put16(&mut label, 140, 8); // vtoc.nparts
+    put32(&mut label, 188, SUN_VTOC_SANITY);
+    put16(&mut label, 420, 5400); // rspeed
+    put16(&mut label, 422, ncyl as u16); // pcylcount
+    put16(&mut label, 430, 1); // ilfact
+    put16(&mut label, 432, ncyl as u16);
+    put16(&mut label, 436, heads as u16); // ntrks
+    put16(&mut label, 438, sectors as u16); // nsect
+
+    // Slice 2 spans the whole disk and deliberately overlaps the real slices.
+    put16(&mut label, 142 + SUN_BACKUP_SLICE * 4, SUN_TAG_WHOLE_DISK);
+    put32(&mut label, 444 + SUN_BACKUP_SLICE * 8, 0);
+    put32(&mut label, 448 + SUN_BACKUP_SLICE * 8, (ncyl * spc) as u32);
+
+    for (p, slice) in placed.iter().zip(sun_user_slices()) {
+        let tag = tag_from_text(&p.type_text)
+            .ok_or_else(|| anyhow::anyhow!("bad Sun slice tag '{}'", p.type_text))?;
+        put16(&mut label, 142 + slice * 4, tag);
+        put32(&mut label, 444 + slice * 8, (p.start_lba / spc) as u32);
+        put32(&mut label, 448 + slice * 8, (p.size_bytes / SECTOR) as u32);
+    }
+
+    put16(&mut label, 508, SUN_LABEL_MAGIC);
+    // The label's checksum is a 16-bit XOR over all 256 big-endian words that
+    // has to come out zero, so the stored word is the XOR of the other 255.
+    let mut csum = 0u16;
+    for w in label[..510].chunks_exact(2) {
+        csum ^= u16::from_be_bytes([w[0], w[1]]);
+    }
+    put16(&mut label, 510, csum);
+
+    out.seek(SeekFrom::Start(0))?;
+    out.write_all(&label)
+        .context("writing the Sun disk label")?;
+    Ok(())
+}
+
 fn put_long(buf: &mut [u8; 512], long_idx: usize, value: u32) {
     buf[long_idx * 4..long_idx * 4 + 4].copy_from_slice(&value.to_be_bytes());
 }
@@ -804,6 +911,54 @@ mod tests {
             u32::from(geometry.sectors_per_track)
         );
         assert_eq!(rdb.header.cyl_blks, geometry.cylinder_bytes() as u32 / 512);
+    }
+
+    /// A Sun label is only valid if its 256 big-endian words XOR to zero, and
+    /// slice 2 has to carry the whole-disk alias every Sun tool looks for.
+    #[test]
+    fn sun_label_checksums_and_reserves_the_backup_slice() {
+        use crate::partition::sun::{SunDiskLabel, SUN_TAG_WHOLE_DISK};
+        use std::io::Cursor;
+
+        let disk = 200 * 1024 * 1024;
+        let geometry = Geometry::default();
+        let specs = vec![
+            PartSpec {
+                size: Some(20 * 1024 * 1024),
+                type_text: Some("root".to_string()),
+                name: None,
+            },
+            PartSpec {
+                size: None,
+                // A bare tag number has to be accepted alongside the name.
+                type_text: Some("4".to_string()),
+                name: None,
+            },
+        ];
+        let align = default_align(TableKind::Sun, geometry);
+        let placed = place(&specs, TableKind::Sun, disk, align).unwrap();
+        let mut buf = Cursor::new(vec![0u8; disk as usize]);
+        write_table(&mut buf, TableKind::Sun, &placed, disk, geometry).unwrap();
+        let img = buf.into_inner();
+
+        assert!(SunDiskLabel::detect(&img[..512]), "checksum or magic wrong");
+        let label = SunDiskLabel::parse(&img[..512]).unwrap();
+        assert!(label.vtoc_valid);
+        assert_eq!(label.ntrks, geometry.heads);
+        assert_eq!(label.nsect, geometry.sectors_per_track);
+        assert_eq!(label.slices[2].tag, SUN_TAG_WHOLE_DISK);
+        assert_eq!(
+            label.slices[2].num_sectors as u64,
+            u64::from(label.ncyl) * label.sectors_per_cylinder,
+        );
+        // User slices skip 2 and keep the tags we asked for.
+        assert_eq!(label.slices[0].tag, 2, "root");
+        assert_eq!(label.slices[1].tag, 4, "usr");
+        let browsable: Vec<u64> = label
+            .browsable_slices()
+            .map(|(_, s)| s.start_sector)
+            .collect();
+        assert_eq!(browsable, vec![placed[0].start_lba, placed[1].start_lba]);
     }
 
     #[test]
