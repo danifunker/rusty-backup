@@ -23,8 +23,7 @@ gap is only the write side.
 
 Filesystem creation is separate from table creation. A table writer produces
 empty partitions; `rb-cli reformat --fs <fs>` fills them. See
-[XFS creation](#xfs-creation) for the one filesystem an SGI disk usually wants
-that we cannot yet make.
+[XFS creation](#xfs-creation--done), which has since shipped.
 
 ## How to add a writer
 
@@ -129,27 +128,34 @@ against.
 
 ---
 
-## XFS creation
+## XFS creation — done
 
-`rb-cli new hd sgi` can lay out XFS-*typed* partitions, but cannot format them —
-there is **no XFS creator**. `src/fs/xfs/` is 18 files of read, fsck and repair
-with no `create` / `format` / `mkfs` entry point, and `xfs` is absent from
-`new`'s `--fs` list.
+Shipped as `src/fs/xfs/format.rs`, reached from `rb-cli new volume xfs` and the
+`batch` builder's `"xfs"` filesystem. It emits a **v5/CRC** filesystem with the
+conservative feature set our reader already speaks (`ftype` on; `finobt`,
+`rmapbt`, `reflink`, `bigtime`, `sparse` and `nrext64` off), at fixed 4 KiB
+blocks / 512-byte sectors / 512-byte inodes.
 
-**What a writer needs**
+The layout mirrors `mkfs.xfs`: per AG, block 0 holds the superblock, AGF, AGI
+and AGFL sectors, blocks 1-3 the bnobt / cntbt / inobt roots, blocks 4-7 the
+four blocks parked on the AGFL, then the log (in the middle AG) and the root
+inode chunk (AG 0), and one free extent for the rest. Only populated regions are
+written, so the log body and the free space stay sparse.
 
-- Superblock (`sb`), then per-allocation-group `AGF`, `AGI` and `AGFL` headers.
-- The free-space B-trees (`bnobt` by block, `cntbt` by count) and the inode
-  B-tree (`inobt`) for every AG.
-- Root inode and its (short-form) directory.
-- The log, zeroed and formatted.
-- v5 CRCs throughout if anything modern is to mount it.
+Two things worth knowing if you touch it:
 
-**Head start:** `src/fs/xfs/btree_build.rs` and `freespace_rebuild.rs` already
-construct valid XFS B-trees for the repair path, and `v5_crc.rs` has the
-checksums. Those are the hardest pieces and they exist — a creator should build
-on them rather than start cold.
+- The minimum is **32 MiB** — two allocation groups of `XFS_AG_MIN_BLOCKS`. That
+  is far below the 300 MB floor `mkfs.xfs` 6.x imposes on itself, which is a
+  mkfs policy rather than an on-disk constraint. A single-AG filesystem is
+  refused because `xfs_repair` will not validate its geometry without
+  `-o force_geometry`.
+- Building this surfaced a real bug in `v5_crc::stamp_sblock_hdr_for_ag`: it
+  derived a btree block's `bb_blkno` from the `agno << sb_agblklog` fsblock
+  encoding, which only equals the physical address when `sb_agblocks` is a power
+  of two. Every non-power-of-two-AG filesystem (a 300 MiB one, say) got corrupt
+  headers in AGs 1 and up. It now uses `agno * sb_agblocks`, per
+  `XFS_AGB_TO_DADDR`. The repair path shared the same helper.
 
-**Validation.** Docker `mkfs.xfs` as an oracle, diffing our output structurally
-and then round-tripping through `xfs_repair -n`, the way the XFS repair work was
-validated.
+**Validation.** `scripts/xfs-oracle.sh sweep` formats at a range of sizes and
+runs the real `xfs_repair -n` on each over SSH; clean from 32 MiB to 16 GiB
+against xfsprogs 6.6.0.

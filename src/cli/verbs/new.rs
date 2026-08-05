@@ -41,6 +41,9 @@ pub enum FsKind {
     Fat,
     /// IRIX EFS (single cylinder group).
     Efs,
+    /// XFS (IRIX 6 / Linux). A v5/CRC volume with 4 KiB blocks, 512-byte
+    /// inodes and an internal log; minimum 32 MiB.
+    Xfs,
     /// Amiga FFS / OFS (variant selected via --affs-variant).
     Affs,
     /// NTFS (Windows NT / 2000 / XP). Cluster and sector size via
@@ -282,6 +285,8 @@ pub enum VolumeFs {
     Prodos,
     /// IRIX EFS (single cylinder group) — a bare EFS superfloppy.
     Efs,
+    /// XFS (IRIX 6 / Linux) — a bare v5/CRC volume, minimum 32 MiB.
+    Xfs,
     /// Minix V2 — 32-bit zone pointers, `mkfs.minix -2`.
     Minix2,
     /// Minix V3 — 60-char names, `mkfs.minix -3`.
@@ -303,6 +308,7 @@ impl VolumeFs {
             VolumeFs::Affs => FsKind::Affs,
             VolumeFs::Prodos => FsKind::Prodos,
             VolumeFs::Efs => FsKind::Efs,
+            VolumeFs::Xfs => FsKind::Xfs,
             VolumeFs::Minix2 => FsKind::Minix2,
             VolumeFs::Minix3 => FsKind::Minix3,
         }
@@ -686,6 +692,7 @@ fn format_image(args: NewArgs) -> Result<()> {
                 args.bytes_per_inode,
             ),
         ),
+        FsKind::Xfs => write_blank_xfs_image(&args.image, &args.size, &args.name),
         FsKind::Affs => {
             let variant = args.affs_variant;
             format_and_write(&args.image, &args.size, &args.name, |size, name| {
@@ -942,6 +949,26 @@ fn write_blank_ext_image(
         .with_context(|| format!("sizing {}", image.display()))?;
     log_stderr(format!(
         "wrote {} ({disk_bytes} bytes, {kind}, volume {:?})",
+        image.display(),
+        name
+    ));
+    Ok(())
+}
+
+/// Format a bare XFS superfloppy by streaming only its metadata regions to the
+/// output file; the log body and the free space past them stay sparse. The
+/// formatted length can be a touch under `--size` when the trailing partial
+/// allocation group is dropped.
+fn write_blank_xfs_image(image: &std::path::Path, size_str: &str, name: &str) -> Result<()> {
+    let size = parse_size(size_str).context("parsing --size")?;
+    let mut file =
+        std::fs::File::create(image).with_context(|| format!("creating {}", image.display()))?;
+    let disk_bytes = crate::fs::xfs::format::write_blank_xfs(&mut file, 0, size, name)
+        .with_context(|| format!("formatting XFS into {}", image.display()))?;
+    file.set_len(disk_bytes)
+        .with_context(|| format!("sizing {}", image.display()))?;
+    log_stderr(format!(
+        "wrote {} ({disk_bytes} bytes, XFS v5, volume {:?})",
         image.display(),
         name
     ));
