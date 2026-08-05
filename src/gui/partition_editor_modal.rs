@@ -1,14 +1,17 @@
-//! The "Edit Partition Table" modal, shared across tabs.
+//! The partition modal, shared across tabs and across two jobs.
 //!
-//! Extracted verbatim from `gui/inspect_tab.rs` so a second caller (the Restore
-//! tab's build-a-disk flow) can reuse the same window rather than growing a
-//! parallel partition UI — the pattern `gui/size_mode_row.rs` already follows.
+//! [`Mode::EditExisting`] is the Inspect tab's "Edit Partition Table" window,
+//! extracted from `gui/inspect_tab.rs`. [`Mode::BuildNew`] is the Restore tab's
+//! Build Disk flow: the same window, plus a table-type picker and a source
+//! image per row, laying a fresh table on a blank target. They share the type
+//! field, the layout bar and the button row rather than growing a second
+//! partition UI — the pattern `gui/size_mode_row.rs` already follows.
 //!
 //! The widget owns no state: it renders a caller-held
 //! [`PartitionEditor`](rusty_backup::model::partition_editor::PartitionEditor)
-//! against the loaded partition list and returns an [`Action`] for the caller
-//! to act on. Applying edits stays with the caller, which owns the device
-//! handle and the worker thread.
+//! or [`DiskBuilder`](rusty_backup::model::disk_builder::DiskBuilder) and
+//! returns an [`Action`] for the caller to act on. Applying stays with the
+//! caller, which owns the device handle and the worker thread.
 //!
 //! Both layout bars place partitions at their real byte offsets with
 //! unallocated gaps drawn as free space, so the bar answers "where on the disk
@@ -16,7 +19,9 @@
 
 use eframe::egui;
 
+use rusty_backup::model::disk_builder::{BuilderRow, DiskBuilder};
 use rusty_backup::model::partition_editor::PartitionEditor;
+use rusty_backup::partition::provision;
 use rusty_backup::partition::type_catalog;
 use rusty_backup::partition::{self, PartitionInfo, PartitionTable};
 
@@ -29,9 +34,32 @@ pub enum Action {
     Apply,
 }
 
+/// Which job the modal is doing this frame.
+pub enum Mode<'a> {
+    /// Edit the table already on a loaded disk.
+    EditExisting {
+        editor: &'a mut PartitionEditor,
+        partitions: &'a [PartitionInfo],
+        table: Option<&'a PartitionTable>,
+    },
+    /// Lay a fresh table on a blank target, optionally filling partitions.
+    BuildNew { builder: &'a mut DiskBuilder },
+}
+
 /// Render the modal. `allow_apply` gates the Apply button for callers that
 /// have no writable target (the inspect tab passes `false` for a backup folder).
-pub fn show(
+pub fn show(ui: &mut egui::Ui, mode: Mode<'_>, allow_apply: bool) -> Action {
+    match mode {
+        Mode::EditExisting {
+            editor,
+            partitions,
+            table,
+        } => show_edit_existing(ui, editor, partitions, table, allow_apply),
+        Mode::BuildNew { builder } => show_build_new(ui, builder, allow_apply),
+    }
+}
+
+fn show_edit_existing(
     ui: &mut egui::Ui,
     editor: &mut PartitionEditor,
     partitions: &[PartitionInfo],
@@ -362,6 +390,320 @@ pub fn show(
     action
 }
 
+/// The Build Disk window: table-type picker, one row per partition, and a
+/// source image per row.
+///
+/// Rows carry a size *string*, not a start LBA — `provision::place` derives the
+/// layout every frame, so the preview bar is always what will actually be
+/// written and the user never hand-computes an offset.
+fn show_build_new(ui: &mut egui::Ui, builder: &mut DiskBuilder, allow_apply: bool) -> Action {
+    let mut open = true;
+    let mut action = Action::Stay;
+    // Deferred so the row list isn't mutated while it is being iterated.
+    let mut remove_row: Option<usize> = None;
+    let mut move_row: Option<(usize, isize)> = None;
+
+    egui::Window::new("Build Disk")
+        .open(&mut open)
+        .resizable(true)
+        .default_width(880.0)
+        .show(ui.ctx(), |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Table type:");
+                let mut kind = builder.kind;
+                for &k in provision::WRITABLE_TABLES {
+                    ui.radio_value(&mut kind, k, k.label());
+                }
+                builder.set_kind(kind);
+            });
+            ui.horizontal(|ui| {
+                ui.label("Target size:");
+                ui.label(partition::format_size(builder.disk_size));
+                ui.add_space(12.0);
+                ui.label("Alignment:");
+                let align_hint = partition::format_size(builder.align_bytes());
+                ui.add(
+                    egui::TextEdit::singleline(&mut builder.align_text)
+                        .desired_width(80.0)
+                        .hint_text(align_hint),
+                )
+                .on_hover_text(
+                    "Partition starts are rounded up to this. Blank uses the \
+                     table default -- 1 MiB, or one cylinder on SGI. Accepts \
+                     1M / 63s (sectors).",
+                );
+                if builder.kind == type_catalog::TableKind::Sgi {
+                    ui.label("Heads:");
+                    ui.add(egui::DragValue::new(&mut builder.geometry.heads).range(1..=255));
+                    ui.label("Sectors/track:");
+                    ui.add(
+                        egui::DragValue::new(&mut builder.geometry.sectors_per_track)
+                            .range(1..=1024),
+                    );
+                }
+            });
+
+            ui.add_space(6.0);
+            show_planned_layout_bar(ui, builder);
+            ui.add_space(8.0);
+
+            let shows_name = matches!(
+                builder.kind,
+                type_catalog::TableKind::Gpt
+                    | type_catalog::TableKind::Apm
+                    | type_catalog::TableKind::X68k
+            );
+            let planned = builder.plan().unwrap_or_default();
+            let row_count = builder.rows.len();
+
+            egui::Grid::new("builder_grid")
+                .striped(true)
+                .min_col_width(50.0)
+                .show(ui, |ui| {
+                    ui.label(egui::RichText::new("#").strong());
+                    ui.label(egui::RichText::new("Size").strong());
+                    ui.label(egui::RichText::new("Type").strong());
+                    if shows_name {
+                        ui.label(egui::RichText::new("Name").strong());
+                    }
+                    ui.label(egui::RichText::new("Start LBA").strong());
+                    ui.label(egui::RichText::new("Source image").strong());
+                    ui.label(egui::RichText::new("").strong());
+                    ui.end_row();
+
+                    for i in 0..row_count {
+                        ui.label(format!("{}", i + 1));
+
+                        ui.add(
+                            egui::TextEdit::singleline(&mut builder.rows[i].size_text)
+                                .desired_width(80.0)
+                                .id(egui::Id::new(format!("bld_size_{}", i))),
+                        )
+                        .on_hover_text(
+                            "20M / 1G / a plain byte count, or `rest` for whatever \
+                             is left. Only one partition may claim the rest.",
+                        );
+
+                        type_field(
+                            ui,
+                            builder.kind,
+                            &format!("bld_type_{}", i),
+                            &mut builder.rows[i].type_text,
+                        );
+
+                        if shows_name {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut builder.rows[i].name)
+                                    .desired_width(110.0)
+                                    .id(egui::Id::new(format!("bld_name_{}", i))),
+                            )
+                            .on_hover_text("Entry name. X68000 truncates it to 8 characters.");
+                        }
+
+                        match planned.get(i) {
+                            Some(p) => {
+                                ui.label(format!("{}", p.start_lba))
+                                    .on_hover_text(partition::format_size(p.size_bytes));
+                            }
+                            None => {
+                                ui.label(egui::RichText::new("-").weak());
+                            }
+                        }
+
+                        source_cell(ui, &mut builder.rows[i], i);
+
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(i > 0, egui::Button::new("Up").small())
+                                .clicked()
+                            {
+                                move_row = Some((i, -1));
+                            }
+                            if ui
+                                .add_enabled(i + 1 < row_count, egui::Button::new("Down").small())
+                                .clicked()
+                            {
+                                move_row = Some((i, 1));
+                            }
+                            if ui
+                                .add_enabled(row_count > 1, egui::Button::new("Remove").small())
+                                .clicked()
+                            {
+                                remove_row = Some(i);
+                            }
+                        });
+
+                        ui.end_row();
+                    }
+                });
+
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(builder.can_add_row(), egui::Button::new("Add Partition"))
+                    .clicked()
+                {
+                    builder.add_row();
+                }
+                if let Some(left) = builder.remaining_slots() {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} of {} slots used",
+                            row_count,
+                            row_count + left,
+                        ))
+                        .weak(),
+                    );
+                }
+            });
+
+            ui.add_space(8.0);
+            for err in &builder.errors {
+                let color = if err.starts_with("Warning:") {
+                    egui::Color32::from_rgb(230, 180, 90)
+                } else {
+                    egui::Color32::from_rgb(255, 100, 100)
+                };
+                ui.colored_label(color, err);
+            }
+            if let Some(status) = &builder.status {
+                ui.colored_label(egui::Color32::from_rgb(100, 255, 100), status);
+            }
+
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if ui.button("Validate").clicked() {
+                    builder.validate();
+                }
+                let can_apply = allow_apply && builder.plan().is_ok();
+                if ui
+                    .add_enabled(can_apply, egui::Button::new("Create Disk"))
+                    .on_hover_text(
+                        "Writes the partition table, then pours each assigned \
+                         image into its partition. This erases the target.",
+                    )
+                    .clicked()
+                    && builder.validate().is_some()
+                {
+                    action = Action::Apply;
+                }
+                if ui.button("Cancel").clicked() {
+                    action = Action::Close;
+                }
+            });
+        });
+
+    if let Some((i, delta)) = move_row {
+        builder.move_row(i, delta);
+    }
+    if let Some(i) = remove_row {
+        builder.remove_row(i);
+    }
+
+    if !open {
+        return Action::Close;
+    }
+    action
+}
+
+/// Source-image cell: pick / clear, with the decoded size cached on the row so
+/// validation doesn't reopen the container every frame.
+fn source_cell(ui: &mut egui::Ui, row: &mut BuilderRow, index: usize) {
+    ui.horizontal(|ui| {
+        match row.source.clone() {
+            Some(path) => {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| path.display().to_string());
+                ui.label(format!(
+                    "{} ({})",
+                    name,
+                    partition::format_size(row.source_size),
+                ))
+                .on_hover_text(path.display().to_string());
+                if ui.small_button("Clear").clicked() {
+                    row.source = None;
+                    row.source_size = 0;
+                }
+            }
+            None => {
+                ui.label(egui::RichText::new("(empty)").weak());
+            }
+        }
+        if ui
+            .small_button("Choose...")
+            .on_hover_text(
+                "Image poured into this partition after the table is written. \
+                 Any format Rusty Backup can read works.",
+            )
+            .clicked()
+        {
+            let picked = rfd::FileDialog::new()
+                .add_filter(
+                    "Disk images",
+                    rusty_backup::model::file_types::DISK_IMAGE_EXTS,
+                )
+                .add_filter("All Files", &["*"])
+                .set_title(format!("Source image for partition {}", index + 1))
+                .pick_file();
+            if let Some(path) = picked {
+                row.source_size =
+                    rusty_backup::model::source_reader::decoded_image_size(&path).unwrap_or(0);
+                row.source = Some(path);
+            }
+        }
+    });
+}
+
+/// One bar showing the planned layout, or the reason there isn't one.
+fn show_planned_layout_bar(ui: &mut egui::Ui, builder: &DiskBuilder) {
+    use super::partition_bar::PartitionBar;
+
+    let planned = match builder.plan() {
+        Ok(p) => p,
+        Err(e) => {
+            ui.colored_label(
+                egui::Color32::from_rgb(255, 100, 100),
+                format!("Layout: {e:#}"),
+            );
+            return;
+        }
+    };
+
+    let placed: Vec<PlacedSegment> = planned
+        .iter()
+        .enumerate()
+        .map(|(i, p)| PlacedSegment {
+            label: format!("Partition {}", i + 1),
+            fs: type_catalog::describe(builder.kind, &p.type_text)
+                .unwrap_or(&p.type_text)
+                .to_string(),
+            start_byte: p.start_byte(),
+            size_bytes: p.size_bytes,
+            color_index: i,
+        })
+        .collect();
+
+    let allocated: u64 = placed.iter().map(|p| p.size_bytes).sum();
+    ui.label(format!(
+        "Layout  (disk {}, {} allocated, {} free):",
+        partition::format_size(builder.disk_size),
+        partition::format_size(allocated),
+        partition::format_size(builder.disk_size.saturating_sub(allocated)),
+    ));
+    let available_width = ui.available_width().max(120.0);
+    ui.scope(|ui| {
+        ui.set_width(available_width);
+        PartitionBar {
+            segments: place_segments(&placed, builder.disk_size.max(1)),
+            show_inline_labels: true,
+            show_legend: true,
+        }
+        .show(ui);
+    });
+}
+
 /// Partition-type entry field: free-form text plus a catalog dropdown and the
 /// resolved type name.
 ///
@@ -569,4 +911,90 @@ pub fn show_disk_layout_bars(
         }
         .show(ui);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusty_backup::partition::type_catalog::TableKind;
+
+    const MIB: u64 = 1024 * 1024;
+
+    fn info(index: usize, start_lba: u64, size_bytes: u64) -> PartitionInfo {
+        PartitionInfo {
+            index,
+            type_name: "0x83".to_string(),
+            partition_type_byte: 0x83,
+            start_lba,
+            start_byte: None,
+            size_bytes,
+            bootable: false,
+            is_logical: false,
+            is_extended_container: false,
+            partition_type_string: None,
+            hfs_block_size: None,
+            rdb_part_block: None,
+            drv_name: None,
+        }
+    }
+
+    /// Renders headlessly. Guards the modal against the panics egui raises for
+    /// a Grid whose rows disagree on cell count, or an id clash between the two
+    /// modes' widgets — neither of which a compile catches.
+    #[test]
+    fn both_modes_render_without_panicking() {
+        let parts = vec![info(0, 2048, 10 * MIB), info(1, 2048 + 20480, 10 * MIB)];
+        let mut editor = PartitionEditor::new();
+        editor.seed_from_with_minimums(&parts, &Default::default(), Some(100 * MIB));
+
+        egui::__run_test_ui(|ui| {
+            let action = show(
+                ui,
+                Mode::EditExisting {
+                    editor: &mut editor,
+                    partitions: &parts,
+                    table: None,
+                },
+                false,
+            );
+            assert_eq!(action, Action::Stay);
+        });
+
+        // Every writable table, since the row shape varies with the kind (the
+        // Name column only exists on GPT / APM / X68000).
+        for &kind in provision::WRITABLE_TABLES {
+            let mut builder = DiskBuilder::new(kind, 512 * MIB);
+            builder.add_row();
+            builder.rows[0].source = Some(std::path::PathBuf::from("/tmp/example.img"));
+            builder.rows[0].source_size = 8 * MIB;
+            egui::__run_test_ui(|ui| {
+                let action = show(
+                    ui,
+                    Mode::BuildNew {
+                        builder: &mut builder,
+                    },
+                    true,
+                );
+                assert_eq!(action, Action::Stay, "{}", kind.label());
+            });
+        }
+    }
+
+    /// A layout that cannot be placed must render the reason, not panic or
+    /// silently draw an empty bar.
+    #[test]
+    fn an_unplaceable_layout_still_renders() {
+        let mut builder = DiskBuilder::new(TableKind::Mbr, 16 * MIB);
+        builder.rows[0].size_text = "900M".to_string();
+        assert!(builder.plan().is_err());
+        egui::__run_test_ui(|ui| {
+            show(
+                ui,
+                Mode::BuildNew {
+                    builder: &mut builder,
+                },
+                true,
+            );
+        });
+    }
 }

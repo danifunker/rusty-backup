@@ -71,6 +71,7 @@ pub fn kind_of(table: &PartitionTable) -> TableKind {
         PartitionTable::Apm(_) => TableKind::Apm,
         PartitionTable::Rdb(_) => TableKind::Rdb,
         PartitionTable::Sgi(_) => TableKind::Sgi,
+        PartitionTable::X68k { .. } => TableKind::X68k,
         _ => TableKind::Other,
     }
 }

@@ -181,22 +181,6 @@ pub fn run_worker(
 
     match &req.source {
         PhysicalWriteSource::Image(path) => {
-            let (mut src, source_size) = open_source_image(path)?;
-            log_cb(&format!(
-                "Source: {} ({} bytes decoded)",
-                path.display(),
-                source_size,
-            ));
-
-            if source_size > req.extent.capacity {
-                anyhow::bail!(
-                    "source is {} but the target region holds only {} -- \
-                     pick a larger target",
-                    crate::partition::format_size(source_size),
-                    crate::partition::format_size(req.extent.capacity),
-                );
-            }
-
             if let Some(params) = &req.wrap {
                 if !req.extent.is_whole_disk() {
                     anyhow::bail!(
@@ -204,6 +188,13 @@ pub fn run_worker(
                          for a whole-disk write, not into a single partition",
                     );
                 }
+                let (mut src, source_size) = open_source_image(path)?;
+                log_cb(&format!(
+                    "Source: {} ({} bytes decoded)",
+                    path.display(),
+                    source_size,
+                ));
+                check_fits(source_size, req.extent.capacity)?;
                 superfloppy_wrap::wrap_and_write(
                     &mut src,
                     source_size,
@@ -214,11 +205,11 @@ pub fn run_worker(
                     &mut log_cb,
                 )?;
             } else {
-                direct_copy(
-                    &mut src,
+                write_image_into(
                     &mut target,
-                    source_size,
-                    req.extent.offset,
+                    path,
+                    req.extent,
+                    0,
                     &mut progress_cb,
                     &cancel_check,
                     &mut log_cb,
@@ -229,6 +220,59 @@ pub fn run_worker(
 
     target.flush().context("flushing target after write")?;
     log_cb("Physical disk export complete");
+    Ok(())
+}
+
+/// Stream one decoded image into `target` at `extent`, refusing a source too
+/// big for the region.
+///
+/// `progress_base` is added to the byte count handed to `progress_cb`, so a
+/// caller pouring several images into one disk reports one running total.
+/// Shared with [`crate::model::provision_runner`].
+pub fn write_image_into<W: Write + Seek>(
+    target: &mut W,
+    path: &std::path::Path,
+    extent: WriteExtent,
+    progress_base: u64,
+    progress_cb: &mut impl FnMut(u64),
+    cancel_check: &impl Fn() -> bool,
+    log_cb: &mut impl FnMut(&str),
+) -> Result<()> {
+    let (mut src, source_size) = open_source_image(path)?;
+    log_cb(&format!(
+        "Source: {} ({} bytes decoded)",
+        path.display(),
+        source_size,
+    ));
+    check_fits(source_size, extent.capacity)?;
+
+    let mut bump = |n: u64| progress_cb(progress_base + n);
+    direct_copy(
+        &mut src,
+        target,
+        source_size,
+        extent.offset,
+        &mut bump,
+        cancel_check,
+        log_cb,
+    )?;
+    Ok(())
+}
+
+/// Decoded length of `path`, so a caller can total up progress before writing.
+pub fn decoded_source_size(path: &std::path::Path) -> Result<u64> {
+    open_source_image(path).map(|(_, len)| len)
+}
+
+fn check_fits(source_size: u64, capacity: u64) -> Result<()> {
+    if source_size > capacity {
+        anyhow::bail!(
+            "source is {} but the target region holds only {} -- \
+             pick a larger target",
+            crate::partition::format_size(source_size),
+            crate::partition::format_size(capacity),
+        );
+    }
     Ok(())
 }
 

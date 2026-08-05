@@ -5617,6 +5617,7 @@ impl App {
                                 image: path.clone(),
                                 size: size.clone(),
                                 partitions: vec!["rest".to_string()],
+                                fills: Vec::new(),
                                 align: "1M".to_string(),
                                 force: false,
                             };

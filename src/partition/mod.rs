@@ -4,6 +4,7 @@ pub mod atari;
 pub mod editor;
 pub mod gpt;
 pub mod mbr;
+pub mod provision;
 pub mod rdb;
 pub mod resize;
 pub mod sgi;
@@ -1315,6 +1316,33 @@ pub fn format_size(bytes: u64) -> String {
     } else {
         format!("{bytes} B")
     }
+}
+
+/// Parse a human-friendly size string — the inverse of [`format_size`].
+/// Accepts plain bytes plus `B`/`K`/`KiB`/`M`/`MiB`/`G`/`GiB` suffixes.
+pub fn parse_size(s: &str) -> anyhow::Result<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        anyhow::bail!("empty size");
+    }
+    let (num_part, mult): (&str, u64) =
+        if let Some(rest) = s.strip_suffix("KiB").or_else(|| s.strip_suffix('K')) {
+            (rest, 1024)
+        } else if let Some(rest) = s.strip_suffix("MiB").or_else(|| s.strip_suffix('M')) {
+            (rest, 1024 * 1024)
+        } else if let Some(rest) = s.strip_suffix("GiB").or_else(|| s.strip_suffix('G')) {
+            (rest, 1024 * 1024 * 1024)
+        } else if let Some(rest) = s.strip_suffix('B') {
+            (rest, 1)
+        } else {
+            (s, 1)
+        };
+    let n: u64 = num_part
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid size {s:?}"))?;
+    n.checked_mul(mult)
+        .ok_or_else(|| anyhow::anyhow!("size {s:?} overflows u64"))
 }
 
 /// An unallocated byte range between (or after) partitions.

@@ -837,9 +837,15 @@ pub fn open_target_preserving(path: &Path) -> Result<DeviceWriteHandle> {
     open_target_for_writing_inner(path, false)
 }
 
+/// Whether a target path names a raw device rather than a regular file.
+/// Matches what [`open_target_for_writing`] keys off internally.
+pub fn is_device_path(path: &Path) -> bool {
+    let s = path.to_string_lossy();
+    s.starts_with("/dev/") || s.starts_with("\\\\.\\")
+}
+
 fn open_target_for_writing_inner(path: &Path, truncate: bool) -> Result<DeviceWriteHandle> {
-    let path_str = path.to_string_lossy();
-    let is_device = path_str.starts_with("/dev/") || path_str.starts_with("\\\\.\\");
+    let is_device = is_device_path(path);
 
     if !is_device && !truncate {
         let file = std::fs::OpenOptions::new()

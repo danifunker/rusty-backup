@@ -1024,6 +1024,7 @@ Usage: apm [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
 
 - `--size` — Total disk size (accepts `K`/`M`/`G` suffixes)
 - `--partition` — A partition, repeatable, in disk order: `SIZE[:TYPE[:NAME]]`. SIZE accepts `K`/`M`/`G`, or `rest` for the remaining space (once). TYPE is a value from `partmap types`; NAME is APM/GPT only
+- `--fill` — Pour an image into a partition as it is created: `N=PATH`, 1-based, repeatable. Any format the engine can read is decoded on the way in
 - `--align` — Alignment for partition starts. Default 1 MiB; use 63s for DOS-era cylinder alignment on vintage machines
 - `--force` — Overwrite `image` if it already exists
 
@@ -1043,6 +1044,7 @@ Usage: gpt [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
 
 - `--size` — Total disk size (accepts `K`/`M`/`G` suffixes)
 - `--partition` — A partition, repeatable, in disk order: `SIZE[:TYPE[:NAME]]`. SIZE accepts `K`/`M`/`G`, or `rest` for the remaining space (once). TYPE is a value from `partmap types`; NAME is APM/GPT only
+- `--fill` — Pour an image into a partition as it is created: `N=PATH`, 1-based, repeatable. Any format the engine can read is decoded on the way in
 - `--align` — Alignment for partition starts. Default 1 MiB; use 63s for DOS-era cylinder alignment on vintage machines
 - `--force` — Overwrite `image` if it already exists
 
@@ -1062,6 +1064,7 @@ Usage: mbr [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
 
 - `--size` — Total disk size (accepts `K`/`M`/`G` suffixes)
 - `--partition` — A partition, repeatable, in disk order: `SIZE[:TYPE[:NAME]]`. SIZE accepts `K`/`M`/`G`, or `rest` for the remaining space (once). TYPE is a value from `partmap types`; NAME is APM/GPT only
+- `--fill` — Pour an image into a partition as it is created: `N=PATH`, 1-based, repeatable. Any format the engine can read is decoded on the way in
 - `--align` — Alignment for partition starts. Default 1 MiB; use 63s for DOS-era cylinder alignment on vintage machines
 - `--force` — Overwrite `image` if it already exists
 
@@ -1081,6 +1084,7 @@ Usage: sgi [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
 
 - `--size` — Total disk size (accepts `K`/`M`/`G` suffixes)
 - `--partition` — A partition, repeatable, in disk order: `SIZE[:TYPE[:NAME]]`. SIZE accepts `K`/`M`/`G`, or `rest` for the remaining space (once). TYPE is a value from `partmap types`; NAME is APM/GPT only
+- `--fill` — Pour an image into a partition as it is created: `N=PATH`, 1-based, repeatable. Any format the engine can read is decoded on the way in
 - `--align` — Alignment for partition starts. Default 1 MiB; use 63s for DOS-era cylinder alignment on vintage machines
 - `--force` — Overwrite `image` if it already exists
 - `--heads` — Disk geometry: heads. IRIX places partitions on cylinder boundaries
@@ -1152,6 +1156,7 @@ Usage: x68k-table [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
 
 - `--size` — Total disk size (accepts `K`/`M`/`G` suffixes)
 - `--partition` — A partition, repeatable, in disk order: `SIZE[:TYPE[:NAME]]`. SIZE accepts `K`/`M`/`G`, or `rest` for the remaining space (once). TYPE is a value from `partmap types`; NAME is APM/GPT only
+- `--fill` — Pour an image into a partition as it is created: `N=PATH`, 1-based, repeatable. Any format the engine can read is decoded on the way in
 - `--align` — Alignment for partition starts. Default 1 MiB; use 63s for DOS-era cylinder alignment on vintage machines
 - `--force` — Overwrite `image` if it already exists
 

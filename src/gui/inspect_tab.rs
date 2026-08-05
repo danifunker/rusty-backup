@@ -1470,9 +1470,11 @@ impl InspectTab {
     fn show_editor_popup(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext) {
         let action = super::partition_editor_modal::show(
             ui,
-            &mut self.editor,
-            &self.partitions,
-            self.partition_table.as_ref(),
+            super::partition_editor_modal::Mode::EditExisting {
+                editor: &mut self.editor,
+                partitions: &self.partitions,
+                table: self.partition_table.as_ref(),
+            },
             self.backup_folder_path.is_none(),
         );
         match action {

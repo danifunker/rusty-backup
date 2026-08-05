@@ -1,10 +1,12 @@
 # Partition-table writers: what's done, what's left
 
-`rb-cli new hd <table>` provisions a blank disk with a real partition table and
-partitions you size and type yourself
-(`src/cli/verbs/new_partitioned_hd.rs`). This page tracks which tables can be
-*written* and what each remaining one needs. Every format here already **parses**
-correctly — the gap is only the write side.
+`rb-cli new hd <table>` and the GUI Restore tab's **Build Disk** mode both
+provision a blank disk with a real partition table and partitions you size and
+type yourself. The layout maths and every table writer live in
+`src/partition/provision.rs`; `src/cli/verbs/new_partitioned_hd.rs` is only the
+CLI grammar over it. This page tracks which tables can be *written* and what
+each remaining one needs. Every format here already **parses** correctly — the
+gap is only the write side.
 
 ## Status
 
@@ -13,8 +15,8 @@ correctly — the gap is only the write side.
 | MBR | Done | `partition::mbr::build_minimal_mbr` |
 | GPT | Done | `partition::gpt::build_minimal_gpt` + protective MBR + backup header |
 | APM | Done | `partition::apm::build_minimal_apm` |
-| SGI (IRIX) | Done | `new_partitioned_hd::write_sgi` |
-| X68000 | Done | `new_partitioned_hd::write_x68k` |
+| SGI (IRIX) | Done | `partition::provision::write_sgi` |
+| X68000 | Done | `partition::provision::write_x68k` |
 | **Sun (SMI VTOC)** | **Missing** | see below |
 | **RDB (Amiga)** | **Missing** | see below |
 | **AHDI (Atari ST)** | **Missing** | see below |
@@ -33,10 +35,16 @@ touching the layout engine:
    `cli/verbs/new.rs`.
 2. Add the table to `partition::type_catalog::TableKind` — the compiler will
    point at every match arm that needs updating, which is the safety net.
-3. Give it `default_type()` and `reserved_head()` / `reserved_tail()` entries so
-   the shared `place()` keeps partitions clear of the table's own regions.
-4. Write `fn write_<table>(file, placed, disk_size) -> Result<()>`.
-5. Populate `<TABLE>_TYPES` in `type_catalog` so `partmap types` and the GUI
+3. In `partition::provision`, give it `default_type()`, `slot_limit()` and
+   `reserved_head()` / `reserved_tail()` entries so the shared `place()` keeps
+   partitions clear of the table's own regions.
+4. Write `fn write_<table>(out: &mut impl Write + Seek, placed, disk_size)` and
+   dispatch to it from `provision::write_table`.
+5. Add the kind to `provision::WRITABLE_TABLES` — that is the single list the
+   GUI's Build Disk picker and the `every_writable_table_writes_and_reparses`
+   round-trip test both read, so a new writer gets a picker entry and a
+   write-then-reparse test for free.
+6. Populate `<TABLE>_TYPES` in `type_catalog` so `partmap types` and the GUI
    type dropdown work.
 
 `place()` already handles alignment, ordering, the single `rest` partition and

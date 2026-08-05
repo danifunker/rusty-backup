@@ -328,6 +328,13 @@ The app has five tabs:
   Rusty Backup can read works (raw, DMG, CHD, VHD, 2MG, GHO, IMZ, and
   gzip- or zip-wrapped images are decoded on the way to the disk). The
   CLI equivalent is `rb-cli write IMAGE DEVICE [--partition N] --yes`.
+  A **Build Disk** mode goes the other way: pick a blank device or name a
+  new image file, choose a table type (MBR / GPT / APM / SGI volume header
+  / X68000), lay out the partitions in the shared partition editor, and
+  optionally assign a source image to each one. Applying writes the table
+  and pours every assigned image into its partition in a single pass. The
+  CLI equivalent is
+  `rb-cli new hd {mbr|gpt|apm|sgi|x68k} IMG --size 2G --partition 512M:0C:DOS --partition rest --fill 1=dos.img`.
 - **Inspect** — pick any supported source and browse the partition table,
   filesystem info, and file listings. Several actions live here:
   - **Browse** filesystem contents read-only (per partition). A checkbox
