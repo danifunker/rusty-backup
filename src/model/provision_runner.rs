@@ -16,6 +16,7 @@
 //! `cancel_check` / `log_cb`; the runner owns the `Arc<Mutex<..>>` Status the
 //! GUI polls. See `docs/progress_pattern.md`.
 
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -188,7 +189,7 @@ pub fn run_worker(req: &ProvisionRequest, status: Arc<Mutex<PhysicalWriteStatus>
             path.display(),
         ));
         let extent = WriteExtent::partition(placed.start_lba, placed.size_bytes);
-        physical_write_runner::write_image_into(
+        done += physical_write_runner::write_image_into(
             &mut target,
             path,
             extent,
@@ -198,11 +199,9 @@ pub fn run_worker(req: &ProvisionRequest, status: Arc<Mutex<PhysicalWriteStatus>
             &mut log_cb,
         )
         .with_context(|| format!("filling partition {}", i + 1))?;
-        done += physical_write_runner::decoded_source_size(path).unwrap_or(0);
         progress_cb(done);
     }
 
-    use std::io::Write;
     target.flush().context("flushing target after build")?;
     log_cb("Disk build complete");
     Ok(())

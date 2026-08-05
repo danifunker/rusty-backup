@@ -325,7 +325,14 @@ fn write_apm<W: Write + Seek>(out: &mut W, placed: &[Placed], disk_size: u64) ->
         })
         .collect();
     let total_blocks = (disk_size / SECTOR) as u32;
-    let table = apm::build_minimal_apm(&entries, block_size, total_blocks);
+    let mut table = apm::build_minimal_apm(&entries, block_size, total_blocks);
+    // `build_minimal_apm` names entries "Partition N"; entry 0 is its own
+    // self-referencing map, so user entries start at 1.
+    for (slot, p) in table.entries.iter_mut().skip(1).zip(placed.iter()) {
+        if !p.name.trim().is_empty() {
+            slot.name = p.name.trim().to_string();
+        }
+    }
     let bytes = table.build_apm_blocks(Some(total_blocks));
     out.seek(SeekFrom::Start(0))?;
     out.write_all(&bytes).context("writing the APM")?;
@@ -618,6 +625,43 @@ mod tests {
                 assert_eq!(got.start_lba, want.start_lba, "{} start", kind.label());
                 assert_eq!(got.size_bytes, want.size_bytes, "{} size", kind.label());
             }
+        }
+    }
+
+    /// The name column in the Build Disk modal has to reach the disk on the
+    /// tables that carry one. APM ignored it until `write_apm` re-stamped the
+    /// entries `build_minimal_apm` had already named "Partition N".
+    #[test]
+    fn named_entries_survive_the_round_trip() {
+        use crate::partition::PartitionTable;
+        use std::io::Cursor;
+
+        let disk = 128 * 1024 * 1024;
+        let named = |n: &str| PartSpec {
+            size: Some(32 * 1024 * 1024),
+            type_text: None,
+            name: Some(n.to_string()),
+        };
+        for (kind, wanted) in [
+            (TableKind::Apm, "MacVolume"),
+            (TableKind::Gpt, "MyData"),
+            // X68000 truncates names to 8 bytes.
+            (TableKind::X68k, "HUMAN68K"),
+        ] {
+            let specs = vec![named(wanted)];
+            let geometry = Geometry::default();
+            let placed = place(&specs, kind, disk, default_align(kind, geometry)).unwrap();
+            let mut buf = Cursor::new(vec![0u8; disk as usize]);
+            write_table(&mut buf, kind, &placed, disk, geometry).unwrap();
+
+            let mut reader = Cursor::new(buf.into_inner());
+            let table = PartitionTable::detect(&mut reader).unwrap();
+            let names = format!("{:?}", table.partitions());
+            assert!(
+                names.contains(wanted),
+                "{} lost the entry name; got {names}",
+                kind.label(),
+            );
         }
     }
 }

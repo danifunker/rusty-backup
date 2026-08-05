@@ -205,7 +205,7 @@ pub fn run_worker(
                     &mut log_cb,
                 )?;
             } else {
-                write_image_into(
+                let _ = write_image_into(
                     &mut target,
                     path,
                     req.extent,
@@ -228,6 +228,7 @@ pub fn run_worker(
 ///
 /// `progress_base` is added to the byte count handed to `progress_cb`, so a
 /// caller pouring several images into one disk reports one running total.
+/// Returns the decoded byte count written, which is the next caller's base.
 /// Shared with [`crate::model::provision_runner`].
 pub fn write_image_into<W: Write + Seek>(
     target: &mut W,
@@ -237,7 +238,7 @@ pub fn write_image_into<W: Write + Seek>(
     progress_cb: &mut impl FnMut(u64),
     cancel_check: &impl Fn() -> bool,
     log_cb: &mut impl FnMut(&str),
-) -> Result<()> {
+) -> Result<u64> {
     let (mut src, source_size) = open_source_image(path)?;
     log_cb(&format!(
         "Source: {} ({} bytes decoded)",
@@ -256,7 +257,7 @@ pub fn write_image_into<W: Write + Seek>(
         cancel_check,
         log_cb,
     )?;
-    Ok(())
+    Ok(source_size)
 }
 
 /// Decoded length of `path`, so a caller can total up progress before writing.
