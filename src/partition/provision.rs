@@ -989,11 +989,11 @@ mod tests {
         use crate::partition::PartitionTable;
         use std::io::Cursor;
 
-        let disk = 200 * 1024 * 1024;
+        let disk = 32 * 1024 * 1024;
         let geometry = Geometry::default();
         let specs = vec![
             PartSpec {
-                size: Some(60 * 1024 * 1024),
+                size: Some(8 * 1024 * 1024),
                 type_text: Some("DOS\\3".to_string()),
                 name: Some("WORK".to_string()),
             },
@@ -1041,11 +1041,11 @@ mod tests {
         use crate::partition::sun::{SunDiskLabel, SUN_TAG_WHOLE_DISK};
         use std::io::Cursor;
 
-        let disk = 200 * 1024 * 1024;
+        let disk = 32 * 1024 * 1024;
         let geometry = Geometry::default();
         let specs = vec![
             PartSpec {
-                size: Some(20 * 1024 * 1024),
+                size: Some(8 * 1024 * 1024),
                 type_text: Some("root".to_string()),
                 name: None,
             },
@@ -1089,10 +1089,10 @@ mod tests {
         use crate::partition::atari::{AhdiPartitionKind, AhdiTable};
         use std::io::Cursor;
 
-        let disk = 64 * 1024 * 1024;
+        let disk = 48 * 1024 * 1024;
         let specs = vec![
             spec(Some(8 * 1024 * 1024)),
-            spec(Some(24 * 1024 * 1024)),
+            spec(Some(20 * 1024 * 1024)),
             PartSpec {
                 size: None,
                 type_text: Some("RAW".to_string()),
@@ -1165,16 +1165,20 @@ mod tests {
 
     /// Round-trip every writable table through `write_table` and re-parse it,
     /// which is what proves the GUI's in-memory path matches the CLI's file one.
+    ///
+    /// Disks here are deliberately small: this materializes the whole thing in
+    /// RAM once per table, and the 32-bit Windows target runs out of address
+    /// space well before it runs out of memory.
     #[test]
     fn every_writable_table_writes_and_reparses() {
         use crate::partition::PartitionTable;
         use std::io::Cursor;
 
-        let disk = 512 * 1024 * 1024;
+        let disk = 64 * 1024 * 1024;
         for &kind in WRITABLE_TABLES {
             let geometry = Geometry::default();
             let align = default_align(kind, geometry);
-            let specs = vec![spec(Some(64 * 1024 * 1024)), spec(None)];
+            let specs = vec![spec(Some(8 * 1024 * 1024)), spec(None)];
             let placed = place(&specs, kind, disk, align)
                 .unwrap_or_else(|e| panic!("{} place: {e:#}", kind.label()));
 
@@ -1208,9 +1212,9 @@ mod tests {
         use crate::partition::PartitionTable;
         use std::io::Cursor;
 
-        let disk = 128 * 1024 * 1024;
+        let disk = 32 * 1024 * 1024;
         let named = |n: &str| PartSpec {
-            size: Some(32 * 1024 * 1024),
+            size: Some(4 * 1024 * 1024),
             type_text: None,
             name: Some(n.to_string()),
         };

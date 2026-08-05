@@ -63,9 +63,10 @@ const AG_RESERVED_BLOCKS: u32 = 4;
 const AGFL_RESERVE: u32 = 4;
 const FIRST_USABLE_AGBNO: u32 = AG_RESERVED_BLOCKS + AGFL_RESERVE;
 
-/// `XFS_AG_MIN_BLOCKS` / `XFS_AG_MAX_BLOCKS` at 4 KiB blocks.
+/// `XFS_AG_MIN_BLOCKS` / `XFS_AG_MAX_BLOCKS` at 4 KiB blocks. The maximum is
+/// `XFS_MAX_AG_BYTES` (1 TiB) over the block size, less one.
 const AG_MIN_BLOCKS: u64 = 4096;
-const AG_MAX_BLOCKS: u64 = (1 << 30) - 1;
+const AG_MAX_BLOCKS: u64 = (1 << 28) - 1;
 
 /// Log bounds in blocks: the kernel's 10 MiB floor and 2 GiB ceiling.
 const LOG_MIN_BLOCKS: u64 = 2560;
@@ -498,9 +499,13 @@ mod tests {
     use crate::fs::filesystem::Filesystem;
     use std::io::Cursor;
 
-    /// 32 MiB is the two-AG floor, 300 MiB is the smallest size mkfs.xfs will
-    /// itself make (and has non-power-of-two AGs), 1 GiB gives four full ones.
-    const SIZES: &[u64] = &[32 << 20, 64 << 20, 300 << 20, 1 << 30];
+    /// 32 MiB is the two-AG floor, 64 MiB the first four-AG size, 300 MiB the
+    /// smallest mkfs.xfs will itself make — and the one with non-power-of-two
+    /// AGs, which is what caught the `bb_blkno` bug. Each is materialized in
+    /// RAM, so anything larger is checked through `plan` instead: the 32-bit
+    /// Windows target runs out of address space long before it runs out of
+    /// memory.
+    const SIZES: &[u64] = &[32 << 20, 64 << 20, 300 << 20];
 
     #[test]
     fn geometry_matches_mkfs_for_a_512_mib_volume() {
@@ -516,6 +521,33 @@ mod tests {
     #[test]
     fn refuses_volumes_that_cannot_hold_a_log() {
         assert!(plan(4 << 20).is_err());
+    }
+
+    /// Geometry at sizes too large to materialize in a test. AG count stays at
+    /// the mkfs.xfs default of four until an AG would pass XFS_AG_MAX_BLOCKS,
+    /// and the log tracks dblocks/2048 between its 10 MiB and 2 GiB bounds.
+    #[test]
+    fn large_volumes_scale_their_ags_and_log() {
+        let one_gib = plan(1 << 30).unwrap();
+        assert_eq!(one_gib.agcount, 4);
+        assert_eq!(one_gib.agblocks, 65536);
+        assert_eq!(one_gib.logblocks as u64, LOG_MIN_BLOCKS);
+
+        // 1 TiB: still four AGs, but the log has grown past its floor.
+        let one_tib = plan(1 << 40).unwrap();
+        assert_eq!(one_tib.agcount, 4);
+        assert_eq!(one_tib.logblocks as u64, one_tib.dblocks / 2048);
+
+        // 8 TiB: four AGs would each pass the 1 TiB XFS_AG_MAX_BLOCKS ceiling,
+        // so the count has to grow instead.
+        let eight_tib = plan(8u64 << 40).unwrap();
+        assert!(eight_tib.agcount > 4, "agcount {}", eight_tib.agcount);
+        assert!(
+            u64::from(eight_tib.agblocks) <= AG_MAX_BLOCKS,
+            "agblocks {} over the 1 TiB ceiling",
+            eight_tib.agblocks,
+        );
+        assert!(u64::from(eight_tib.logblocks) <= LOG_MAX_BLOCKS);
     }
 
     #[test]
