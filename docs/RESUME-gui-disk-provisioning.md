@@ -2,6 +2,11 @@
 
 Branch `fix-permission-issues`. Working tree clean as of the Build Disk commit.
 
+**This thread is done.** For what is left, see
+[`RESUME-disk-provisioning-followups.md`](RESUME-disk-provisioning-followups.md),
+which orders the remaining items smallest-first. Keep reading here for how the
+shipped pieces fit together.
+
 ## Read first
 
 1. `CONTRIBUTING.md` — especially the zero-warning rule, the Rust 1.73 engine
