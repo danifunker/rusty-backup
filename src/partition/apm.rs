@@ -137,6 +137,9 @@ impl ApmPartitionEntry {
                 | "Apple_Driver43_CD"
                 | "Apple_Driver_ATA"
                 | "Apple_Driver_ATAPI"
+                // Drive Setup reserves this on every ATA disk it formats and
+                // leaves it zeroed; without it here it lists as a data partition.
+                | "Apple_Driver_IOKit"
                 | "Apple_Patches"
                 | "Apple_FWDriver"
                 | "Apple_Void"

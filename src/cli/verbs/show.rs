@@ -40,6 +40,14 @@ pub enum ShowCommand {
         /// Output format. `csv`/`tsv` produce one row per partition entry.
         #[arg(long, value_enum, default_value_t = OutputFormat::Text, global = false)]
         format: OutputFormat,
+        /// Password for encrypted containers (WinImage IMZ, password-protected
+        /// `.zip` disks).
+        #[arg(long)]
+        password: Option<String>,
+        /// For a `.zip` holding more than one disk image, the archive entry to
+        /// open (e.g. `--inside disk.hda`).
+        #[arg(long = "inside", value_name = "NAME")]
+        inside: Option<String>,
     },
     /// Print filesystem-level metadata (type, volume label, used / free
     /// space) for any filesystem the engine can open.
@@ -66,7 +74,12 @@ pub enum ShowCommand {
 
 pub fn run(cmd: ShowCommand) -> Result<()> {
     match cmd {
-        ShowCommand::Partmap { image, format } => show_partmap(image, format),
+        ShowCommand::Partmap {
+            image,
+            format,
+            password,
+            inside,
+        } => show_partmap(image, format, password, inside),
         ShowCommand::FsInfo { image, format } => show_fs_info(image, format),
         ShowCommand::ChdInfo { image, format } => show_chd_info(image, format),
         ShowCommand::Devices {
@@ -80,8 +93,20 @@ pub fn run(cmd: ShowCommand) -> Result<()> {
 // partmap
 // ---------------------------------------------------------------------------
 
-fn show_partmap(image: PathBuf, format: OutputFormat) -> Result<()> {
-    let mut file = crate::cli::io::open_image_ro(&image)?;
+fn show_partmap(
+    image: PathBuf,
+    format: OutputFormat,
+    password: Option<String>,
+    inside: Option<String>,
+) -> Result<()> {
+    // Whole-disk read, peeling any container / wrapper (CHD, zip, GHO, VHD,
+    // DMG, ...). A plain `File::open` here read the container's own bytes and
+    // reported them as a bad DDR signature — `0x504B` for a zip, i.e. "PK".
+    let mut file = crate::model::source_reader::open_peeled_read_with_entry(
+        &image,
+        password.as_deref().map(|s| s.as_bytes()),
+        inside.as_deref(),
+    )?;
     let apm = Apm::parse(&mut file).map_err(|e| anyhow::anyhow!("parsing APM: {e}"))?;
     let bs = apm.ddr.block_size as u64;
 

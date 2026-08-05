@@ -1896,6 +1896,8 @@ Usage: partmap [OPTIONS] <IMAGE>
 **Options**
 
 - `--format` — Output format. `csv`/`tsv` produce one row per partition entry
+- `--password` — Password for encrypted containers (WinImage IMZ, password-protected `.zip` disks)
+- `--inside` — For a `.zip` holding more than one disk image, the archive entry to open (e.g. `--inside disk.hda`)
 
 ### `shrink`
 
