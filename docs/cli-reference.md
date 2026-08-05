@@ -340,7 +340,7 @@ Usage: backup [OPTIONS] <SOURCE> <DEST>
 - `--checksum` — Checksum to record per file. Defaults to `sha256`, or the `[backup] checksum` value from the config file when set
 - `--sector-by-sector` — Skip filesystem-aware compaction; copy every sector verbatim
 - `--defrag` — Defragment FAT partitions: relocate each file's clusters contiguously (boot files first) before imaging. Same output size as ordinary compaction — the restored disk is just defragmented. Non-FAT filesystems are unaffected. (The desktop sibling of cb-dos `/DEFRAG`.)
-- `--partitions` — Per-partition filter — comma-separated 1-based indices to include (e.g. `1,3,4`; `1` is the first partition, matching the `img@N` selector). Default is "all partitions"
+- `--partitions` — Per-partition filter — comma-separated selectors to include, in any of the `IMG@…` forms: `1,3` (the `idx` column of `inspect`), `s6,s7` (the table's own slots) or `DH0,DH1`. Default is "all partitions"
 - `--split-size` — Split the output after this many MiB. Raw (`--format raw`) only: a `.chd` is a single self-contained container and refuses to be split, and the compressed codecs currently ignore this
 - `--keep-swap` — Image swap/page files verbatim instead of excluding them. By default a FAT volume's swap/page files (`386SPART.PAR`, `WIN386.SWP`, `PAGEFILE.SYS`, `HIBERFIL.SYS`, `SWAPPER.DAT`) are kept full-size but their content is zeroed (they reinitialize on boot), which the codec crushes; `--keep-swap` images them as-is. (The desktop sibling of cb-dos `/KEEPSWAP`.)
 
@@ -1896,6 +1896,8 @@ Usage: partmap [OPTIONS] <IMAGE>
 **Options**
 
 - `--format` — Output format. `csv`/`tsv` produce one row per partition entry
+- `--password` — Password for encrypted containers (WinImage IMZ, password-protected `.zip` disks)
+- `--inside` — For a `.zip` holding more than one disk image, the archive entry to open (e.g. `--inside disk.hda`)
 
 ### `shrink`
 
@@ -2113,7 +2115,7 @@ Usage: write [OPTIONS] <IMAGE> <DEVICE>
 
 **Options**
 
-- `--partition` — Write into this 1-based partition instead of the whole disk. The partition's own bounds cap the write; the rest of the disk, including the partition table, is left untouched
+- `--partition` — Write into one partition instead of the whole disk: `N` (the `idx` column of `inspect`), `sN` (the table's own slot) or an AmigaDOS device name. The partition's bounds cap the write; the rest of the disk, including the partition table, is left untouched
 - `--yes` — Required confirmation. Skips the prompt but never the safety summary printed on stderr
 - `--write-to-system-disk` — Allow writing to the system boot disk (refused by default)
 

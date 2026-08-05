@@ -891,6 +891,36 @@ impl PartitionTable {
         }
     }
 
+    /// Slot number this table's platform gives `info`; `None` when it has none.
+    /// GPT is `None` because the parser drops unused entries. See `@sN` docs.
+    pub fn native_slot(&self, info: &PartitionInfo) -> Option<u32> {
+        let raw = info.index as u32;
+        match self {
+            // fdisk: primaries 1-4, logicals from 5; `index` is 0-3 then 4+j.
+            PartitionTable::Mbr(_) | PartitionTable::Ahdi(_) => Some(raw + 1),
+            // diskutil's `sN` counts map entries from 1.
+            PartitionTable::Apm(_) => Some(raw + 1),
+            // IRIX `fx` and Sun `format(1M)` both number from 0.
+            PartitionTable::Sgi(_) | PartitionTable::Sun(_) => Some(raw),
+            // No platform convention; `@DH0` is the identity users know.
+            PartitionTable::Rdb(_) => Some(raw),
+            _ => None,
+        }
+    }
+
+    /// Whether `@sN` means anything here; the negative needs its own error.
+    pub fn has_native_slots(&self) -> bool {
+        matches!(
+            self,
+            PartitionTable::Mbr(_)
+                | PartitionTable::Ahdi(_)
+                | PartitionTable::Apm(_)
+                | PartitionTable::Sgi(_)
+                | PartitionTable::Sun(_)
+                | PartitionTable::Rdb(_)
+        )
+    }
+
     /// Get a unified list of partition info for display.
     pub fn partitions(&self) -> Vec<PartitionInfo> {
         match self {
@@ -2252,5 +2282,34 @@ mod tests {
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0].type_name, "Human68k (FAT)");
         assert_eq!(parts[0].partition_type_string.as_deref(), Some("human68k"));
+    }
+}
+
+#[cfg(test)]
+mod native_slot_tests {
+    use super::*;
+
+    /// The `slot` column and `@sN` must agree with the platform's own tools:
+    /// `diskutil` counts APM map entries from 1, so the third entry is `s3`.
+    #[test]
+    fn apm_slots_match_diskutil_numbering() {
+        let apm = apm::build_minimal_apm(
+            &[
+                ("Apple_Driver43".to_string(), 64, 32),
+                ("Apple_HFS".to_string(), 96, 1000),
+                ("Apple_HFS".to_string(), 1096, 1000),
+            ],
+            512,
+            4000,
+        );
+        let table = PartitionTable::Apm(apm);
+        assert!(table.has_native_slots());
+
+        // The map and driver entries are filtered out, so position and slot
+        // diverge — which is the whole reason both are shown.
+        let parts = table.partitions();
+        assert_eq!(parts.len(), 2, "map + driver are not data partitions");
+        assert_eq!(table.native_slot(&parts[0]), Some(3));
+        assert_eq!(table.native_slot(&parts[1]), Some(4));
     }
 }

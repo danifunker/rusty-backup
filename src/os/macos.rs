@@ -862,6 +862,16 @@ fn cached_authopen(path: &str, flags: libc::c_int) -> Result<SharedDevice> {
     Ok(SharedDevice::new(fd))
 }
 
+/// Access mode to escalate a read with: `O_RDWR`, so one prompt also covers a
+/// later restore — unless a volume is still mounted, which refuses it (EBUSY).
+fn read_escalation_flags(unmounted: bool, saw_busy: bool) -> libc::c_int {
+    if unmounted && !saw_busy {
+        libc::O_RDWR
+    } else {
+        libc::O_RDONLY
+    }
+}
+
 /// TEMP-DIAG: report what access we hold on `path` right now, without
 /// escalating. Tracking down a macOS restore that fails with EACCES at the very
 /// end after an earlier authopen succeeded. Remove with the rest of TEMP-DIAG
@@ -1365,14 +1375,8 @@ pub(crate) fn open_target_for_writing(path: &Path) -> Result<(File, Option<DiskC
     Ok((file, claim))
 }
 
-/// Open a source device or image file for reading.
-///
-/// For device paths (`/dev/disk*`), unmounts all volumes and opens with
-/// `authopen` for privileged access. For regular files, opens normally.
-///
-/// Read path: tries a direct `O_RDONLY` open first (works on removable media
-/// accessible without root), falling back to `authopen` (always `O_RDWR`)
-/// only on `EPERM`.
+/// Open a source device or image file for reading. Devices are unmounted and
+/// claimed, then opened directly or via `authopen` ([`read_escalation_flags`]).
 pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
     let path_str = path.to_string_lossy();
     let is_device = path_str.starts_with("/dev/disk") || path_str.starts_with("/dev/rdisk");
@@ -1380,10 +1384,15 @@ pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
     if is_device {
         let disk_name = bsd_name_from_path(path);
 
-        // Unmount all volumes before claiming/opening
-        if let Err(e) = da_unmount_disk(disk_name) {
-            log::warn!("DA unmount warning: {}", e);
-        }
+        // Unmount first; the outcome is also the mounted-ness signal below, which
+        // a probe of a root-owned node can't give us (EACCES comes before EBUSY).
+        let unmounted = match da_unmount_disk(disk_name) {
+            Ok(()) => true,
+            Err(e) => {
+                log::warn!("DA unmount warning: {}", e);
+                false
+            }
+        };
 
         // Claim the disk to keep other DA clients (e.g. VMware) away
         let disk_claim = match da_claim_disk(disk_name) {
@@ -1413,26 +1422,42 @@ pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
 
         let c_path = CString::new(raw_device.as_str()).context("invalid device path")?;
 
-        // 2. Try a direct O_RDONLY open — succeeds if we're already root or the
-        //    media is accessible without privileges.
-        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY) };
-        if fd >= 0 {
-            unsafe { libc::fcntl(fd, F_NOCACHE, 1) };
-            return Ok(ElevatedSource {
-                file: super::SourceHandle::File(unsafe { File::from_raw_fd(fd) }),
-                temp_path: None,
-                disk_claim,
-            });
+        // 2. Direct open — we may be root already, or the media may need no
+        //    privilege. O_RDWR first so the handle also covers a later write.
+        let mut busy = false;
+        let mut last_err = None;
+        for flags in [libc::O_RDWR, libc::O_RDONLY] {
+            let fd = unsafe { libc::open(c_path.as_ptr(), flags) };
+            if fd >= 0 {
+                unsafe { libc::fcntl(fd, F_NOCACHE, 1) };
+                return Ok(ElevatedSource {
+                    file: super::SourceHandle::File(unsafe { File::from_raw_fd(fd) }),
+                    temp_path: None,
+                    disk_claim,
+                });
+            }
+            let err = std::io::Error::last_os_error();
+            let is_busy = err.raw_os_error() == Some(libc::EBUSY);
+            busy |= is_busy;
+            last_err = Some(err);
+            // Only EBUSY is worth retrying read-only; a permission failure is
+            // about privilege, not access mode, and goes to authopen below.
+            if !is_busy {
+                break;
+            }
         }
 
-        let err = std::io::Error::last_os_error();
+        let err = last_err.expect("the probe loop always records its last error");
         let raw = err.raw_os_error().unwrap_or(0);
 
-        // 3. On EPERM or EACCES, escalate via authopen and cache the result.
-        //    Read-only: a backup only reads, and O_RDONLY also succeeds against
-        //    a still-mounted disk where O_RDWR would be refused with EBUSY.
+        // 3. On EPERM or EACCES, escalate via authopen and cache the result, in
+        //    the widest mode this disk can give ([`read_escalation_flags`]).
         if raw == libc::EPERM || raw == libc::EACCES {
-            let shared = cached_authopen(&raw_device, libc::O_RDONLY).with_context(|| {
+            let flags = read_escalation_flags(unmounted, busy);
+            if flags == libc::O_RDONLY {
+                log::info!("{raw_device} still has a volume mounted; escalating read-only");
+            }
+            let shared = cached_authopen(&raw_device, flags).with_context(|| {
                 format!("cannot open {} for reading (authopen failed)", raw_device)
             })?;
             return Ok(ElevatedSource {
@@ -1703,6 +1728,35 @@ mod shared_device_tests {
         );
         release_elevated_devices(Some(path));
         assert!(reuse_elevated_device(path, false).is_none());
+    }
+
+    #[test]
+    fn a_read_escalates_read_write_unless_a_volume_is_still_mounted() {
+        // One prompt for the whole session: the read path escalates read-write
+        // so a later restore reuses the descriptor instead of prompting again.
+        assert_eq!(read_escalation_flags(true, false), libc::O_RDWR);
+
+        // ...except on a disk that would not unmount, where the kernel refuses
+        // O_RDWR outright (EBUSY) and read-only is the only mode that works.
+        assert_eq!(read_escalation_flags(false, false), libc::O_RDONLY);
+        assert_eq!(read_escalation_flags(true, true), libc::O_RDONLY);
+        assert_eq!(read_escalation_flags(false, true), libc::O_RDONLY);
+    }
+
+    #[test]
+    fn a_writable_descriptor_means_a_later_restore_never_prompts() {
+        // What the read-write escalation buys: inspect caches a writable fd, and
+        // open_target_for_writing's O_RDWR request finds it instead of prompting.
+        let _serialize = CACHE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let path = "/dev/rdisk-test-inspect-then-restore";
+        let _tmp = seed_cache(path, true);
+        let needs_write = libc::O_RDWR & libc::O_ACCMODE != libc::O_RDONLY;
+        assert!(needs_write, "O_RDWR must read as a write request");
+        assert!(
+            reuse_elevated_device(path, needs_write).is_some(),
+            "a restore after an inspect must reuse the inspect's descriptor",
+        );
+        release_elevated_devices(Some(path));
     }
 
     #[test]

@@ -13,6 +13,7 @@ use std::fs::File;
 use std::io::{Read, Seek};
 
 use crate::cli::backup_edit;
+use crate::cli::img_at::PartSelector;
 use crate::cli::io::{open_image_ro, open_image_rw};
 use crate::model::source_reader;
 use crate::partition::{PartitionInfo, PartitionTable};
@@ -104,7 +105,7 @@ impl PartitionContext {
 ///   range fires `NOT_FOUND`.
 pub fn resolve_partition_ro(
     path: &std::path::Path,
-    selector: Option<u32>,
+    selector: Option<PartSelector>,
 ) -> Result<(File, PartitionContext)> {
     let mut file = open_image_ro(path)?;
     let ctx = resolve(&mut file, selector)?;
@@ -249,7 +250,7 @@ fn chd_diff_path(parent: &Path) -> PathBuf {
 /// `commit` re-encodes / flattens. See [`RwCommit`].
 pub fn resolve_partition_rw(
     path: &std::path::Path,
-    selector: Option<u32>,
+    selector: Option<PartSelector>,
 ) -> Result<(BoxRwSeek, PartitionContext, RwCommit)> {
     resolve_partition_rw_forced(path, selector, None)
 }
@@ -260,7 +261,7 @@ pub fn resolve_partition_rw(
 /// [`FsDispatchOverride::apply`] to install the override.
 pub fn resolve_partition_rw_forced(
     path: &std::path::Path,
-    selector: Option<u32>,
+    selector: Option<PartSelector>,
     fs_override: Option<&str>,
 ) -> Result<(BoxRwSeek, PartitionContext, RwCommit)> {
     // A `.cbk` container: materialize it to a temp folder, edit the partition
@@ -485,7 +486,7 @@ fn try_open_chd_rw(_path: &std::path::Path) -> Result<Option<(BoxRwSeek, RwCommi
 /// streaming readers so the caller sees a raw disk image.
 pub fn resolve_partition_streaming(
     path: &std::path::Path,
-    selector: Option<u32>,
+    selector: Option<PartSelector>,
 ) -> Result<(BoxReadSeek, PartitionContext)> {
     resolve_partition_streaming_with_password(path, selector, None)
 }
@@ -495,7 +496,7 @@ pub fn resolve_partition_streaming(
 /// [`resolve_partition_streaming`].
 pub fn resolve_partition_streaming_with_password(
     path: &std::path::Path,
-    selector: Option<u32>,
+    selector: Option<PartSelector>,
     password: Option<&[u8]>,
 ) -> Result<(BoxReadSeek, PartitionContext)> {
     resolve_partition_streaming_forced(path, selector, password, None)
@@ -507,7 +508,7 @@ pub fn resolve_partition_streaming_with_password(
 /// then call [`FsDispatchOverride::apply`] to install the override.
 pub fn resolve_partition_streaming_forced(
     path: &std::path::Path,
-    selector: Option<u32>,
+    selector: Option<PartSelector>,
     password: Option<&[u8]>,
     fs_override: Option<&str>,
 ) -> Result<(BoxReadSeek, PartitionContext)> {
@@ -519,7 +520,7 @@ pub fn resolve_partition_streaming_forced(
 /// (the CLI `--inside` flag). Ignored for every non-zip source.
 pub fn resolve_partition_streaming_forced_inside(
     path: &std::path::Path,
-    selector: Option<u32>,
+    selector: Option<PartSelector>,
     password: Option<&[u8]>,
     fs_override: Option<&str>,
     inside: Option<&str>,
@@ -542,7 +543,10 @@ pub fn resolve_partition_streaming_forced_inside(
     Ok((reader, ctx))
 }
 
-fn resolve<R: Read + Seek>(reader: &mut R, selector: Option<u32>) -> Result<PartitionContext> {
+fn resolve<R: Read + Seek>(
+    reader: &mut R,
+    selector: Option<PartSelector>,
+) -> Result<PartitionContext> {
     resolve_with_override(reader, selector, None)
 }
 
@@ -553,7 +557,7 @@ fn resolve<R: Read + Seek>(reader: &mut R, selector: Option<u32>) -> Result<Part
 /// image gets the **exact same** `@N` semantics as a local one.
 pub fn resolve_partition_in_reader<R: Read + Seek>(
     reader: &mut R,
-    selector: Option<u32>,
+    selector: Option<PartSelector>,
 ) -> Result<PartitionContext> {
     resolve(reader, selector)
 }
@@ -567,7 +571,7 @@ pub fn resolve_partition_in_reader<R: Read + Seek>(
 /// [`FsDispatchOverride::apply`].
 fn resolve_with_override<R: Read + Seek>(
     reader: &mut R,
-    selector: Option<u32>,
+    selector: Option<PartSelector>,
     fs_override: Option<&str>,
 ) -> Result<PartitionContext> {
     let total = reader_size(reader)?;
@@ -619,18 +623,7 @@ fn resolve_with_override<R: Read + Seek>(
     }
 
     let info = match selector {
-        Some(idx) => {
-            let i = idx as usize;
-            if i == 0 || i > partitions.len() {
-                bail!(
-                    "partition index {idx} out of range (image has {} partition(s))",
-                    partitions.len()
-                );
-            }
-            // PartitionInfo `index` may be 0- or 1-based depending on PT
-            // type, so we trust the `Vec` ordering instead.
-            partitions[i - 1].clone()
-        }
+        Some(sel) => select_partition(&pt, &partitions, &sel)?,
         None => pick_default_partition(&partitions)?,
     };
 
@@ -639,10 +632,90 @@ fn resolve_with_override<R: Read + Seek>(
         type_byte: info.partition_type_byte,
         type_string: info.partition_type_string.clone(),
         size: info.size_bytes,
-        label: format_label(&info, pt.type_name()),
+        label: format_label(&pt, &info, &partitions),
         whole_file_path: None,
         rebuild_budget: None,
     })
+}
+
+/// Apply an `IMG@…` selector; each form gets its own failure message.
+pub(crate) fn select_partition(
+    pt: &PartitionTable,
+    partitions: &[PartitionInfo],
+    sel: &PartSelector,
+) -> Result<PartitionInfo> {
+    match sel {
+        PartSelector::Position(idx) => {
+            let i = *idx as usize;
+            if i == 0 || i > partitions.len() {
+                bail!(
+                    "partition index {idx} out of range (image has {} partition(s))",
+                    partitions.len()
+                );
+            }
+            // `index` is the slot: 0- or 1-based per table, and it skips.
+            Ok(partitions[i - 1].clone())
+        }
+        PartSelector::Slot(slot) => {
+            if !pt.has_native_slots() {
+                bail!(
+                    "{} partitions have no slot number to select by — use @N \
+                     (the position `inspect` prints) instead",
+                    pt.type_name(),
+                );
+            }
+            partitions
+                .iter()
+                .find(|p| pt.native_slot(p) == Some(*slot))
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "no browsable partition in slot {slot} (this image has {})",
+                        list_slots(pt, partitions),
+                    )
+                })
+        }
+        PartSelector::Name(name) => {
+            let hit = partitions.iter().find(|p| {
+                p.drv_name
+                    .as_deref()
+                    .is_some_and(|d| d.eq_ignore_ascii_case(name))
+            });
+            match hit {
+                Some(p) => Ok(p.clone()),
+                None => {
+                    let names: Vec<&str> = partitions
+                        .iter()
+                        .filter_map(|p| p.drv_name.as_deref())
+                        .collect();
+                    if names.is_empty() {
+                        bail!(
+                            "@{name} names a device, but {} partitions don't carry device \
+                             names — use @N, or @sN for the table's own slot",
+                            pt.type_name(),
+                        );
+                    }
+                    bail!(
+                        "no partition named {name:?} (this image has {})",
+                        names.join(", ")
+                    )
+                }
+            }
+        }
+    }
+}
+
+/// `slot 0, slot 1, slot 8` — for the not-found message.
+fn list_slots(pt: &PartitionTable, partitions: &[PartitionInfo]) -> String {
+    let slots: Vec<String> = partitions
+        .iter()
+        .filter_map(|p| pt.native_slot(p).map(|s| format!("slot {s}")))
+        .collect();
+    if slots.is_empty() {
+        "no slots".to_string()
+    } else {
+        slots.join(", ")
+    }
 }
 
 /// Default-partition picker.
@@ -698,15 +771,27 @@ fn pick_default_partition(partitions: &[PartitionInfo]) -> Result<PartitionInfo>
     }
 }
 
-fn format_label(info: &PartitionInfo, pt_name: &str) -> String {
+fn format_label(pt: &PartitionTable, info: &PartitionInfo, partitions: &[PartitionInfo]) -> String {
+    let pt_name = pt.type_name();
+    // Name it the two ways the user can select it, rather than echoing the raw
+    // `index` — which matched neither `@N` nor `@sN` and read as a third answer.
+    let pos = partitions
+        .iter()
+        .position(|p| p.start_lba == info.start_lba && p.size_bytes == info.size_bytes)
+        .map(|i| format!("@{}", i + 1))
+        .unwrap_or_default();
+    let slot = pt
+        .native_slot(info)
+        .map(|s| format!(" / @s{s}"))
+        .unwrap_or_default();
     match &info.partition_type_string {
         Some(s) => format!(
-            "Partition {} ({pt_name}): {} {s} @ LBA {}, {} bytes",
-            info.index, info.type_name, info.start_lba, info.size_bytes
+            "Partition {pos}{slot} ({pt_name}): {} {s} @ LBA {}, {} bytes",
+            info.type_name, info.start_lba, info.size_bytes
         ),
         None => format!(
-            "Partition {} ({pt_name}): {} 0x{:02x} @ LBA {}, {} bytes",
-            info.index, info.type_name, info.partition_type_byte, info.start_lba, info.size_bytes
+            "Partition {pos}{slot} ({pt_name}): {} 0x{:02x} @ LBA {}, {} bytes",
+            info.type_name, info.partition_type_byte, info.start_lba, info.size_bytes
         ),
     }
 }

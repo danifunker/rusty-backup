@@ -181,7 +181,11 @@ pub fn run(args: LsArgs) -> Result<()> {
 /// of an image on it (`rb://host/img@N`), auto-detected. Literal paths only —
 /// globbing would need server-side volume walking, deferred.
 #[cfg(feature = "remote")]
-fn remote_ls(rref: &crate::remote::RemoteRef, partition: Option<u32>, path: &str) -> Result<()> {
+fn remote_ls(
+    rref: &crate::remote::RemoteRef,
+    partition: Option<crate::cli::img_at::PartSelector>,
+    path: &str,
+) -> Result<()> {
     if has_glob_chars(path) {
         bail!("glob patterns aren't supported over rb:// yet (literal paths only)");
     }

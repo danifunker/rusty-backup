@@ -189,7 +189,7 @@ pub fn run(args: CpArgs) -> Result<()> {
     let pw = args.password.as_deref().map(|s| s.as_bytes());
     let (reader, mut src_ctx) = resolve_partition_streaming_forced(
         &args.src_image.path,
-        args.src_image.partition,
+        args.src_image.partition.clone(),
         pw,
         args.src_fs_type.as_deref(),
     )?;
@@ -211,7 +211,7 @@ pub fn run(args: CpArgs) -> Result<()> {
     // --- Open destination (read+write) -----------------------------------
     let (file, mut dst_ctx, commit) = resolve_partition_rw_forced(
         &args.dst_image.path,
-        args.dst_image.partition,
+        args.dst_image.partition.clone(),
         args.dst_fs_type.as_deref(),
     )?;
     if let Some(t) = &args.dst_fs_type {
@@ -275,11 +275,11 @@ fn remote_cp(
     }
 
     let mut session = crate::remote::RemoteSession::connect(&dst.addr())?;
-    let sid = session.open_session(&dst.path, args.dst_image.partition)?;
+    let sid = session.open_session(&dst.path, args.dst_image.partition.clone())?;
     session.stage_copy_local(
         sid,
         &src.path,
-        args.src_image.partition,
+        args.src_image.partition.clone(),
         &args.src,
         &parent,
         &name,
@@ -543,6 +543,7 @@ fn preflight_free_space(dst: &mut dyn EditableFilesystem, need: u64, args: &CpAr
         args.dst_image.path.display(),
         args.dst_image
             .partition
+            .clone()
             .map(|n| format!("@{n}"))
             .unwrap_or_default(),
     )

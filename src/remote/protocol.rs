@@ -40,16 +40,12 @@ pub const RB_HELLO_MAGIC_BYTES: [u8; 4] = RB_HELLO_MAGIC.to_be_bytes();
 /// additive so a newer client still talks to an older daemon where possible.
 ///
 /// v2 added the block-reader tier (`OpenBlock` / `ReadBlock` / `CloseBlock`,
-/// later `OpenBlockRw` / `WriteBlock` / `FlushBlock` for in-place editing) — a
-/// daemon must be at v2 to serve ranged reads/writes, so a remote *image
-/// inspection or edit* (vs the v1 operation-level file browse) needs the daemon
-/// refreshed. The write verbs are additive, so a v2 read-only daemon still
-/// serves browse / inspect / backup; only editing needs the newer build.
-pub const PROTOCOL_VERSION: u16 = 2;
-
-/// Oldest protocol version this build still understands. The v1 verbs are
-/// unchanged, so a v1 daemon still serves browse / read / write.
-pub const MIN_PROTOCOL_VERSION: u16 = 1;
+/// later `OpenBlockRw` / `WriteBlock` / `FlushBlock` for in-place editing).
+///
+/// v3 typed the partition selector (`@N` / `@sN` / `@DH0`). Not additive: a v2
+/// peer reads it as a bare integer and would act on the wrong partition, so both
+/// ends now require an exact match and say which side to update.
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// Default daemon port (mrext owns 8182; we take 7341). Configurable on both
 /// ends via `--bind` / an explicit `rb://host:PORT/...`.
@@ -85,7 +81,7 @@ pub enum Request {
     /// an optional 1-based partition selector, mirroring the CLI's `IMG@N`.
     OpenImage {
         path: String,
-        partition: Option<u32>,
+        partition: Option<crate::cli::img_at::PartSelector>,
     },
     /// List a directory inside a previously-opened image.
     ListDir { handle: u64, path: String },
@@ -103,7 +99,7 @@ pub enum Request {
     /// editable only at `Apply`; staged edits accumulate until then.
     OpenSession {
         image_path: String,
-        partition: Option<u32>,
+        partition: Option<crate::cli::img_at::PartSelector>,
     },
     /// Stage a host file into the session's queue. The file body follows
     /// **immediately** as a chunk stream (client -> server) after this frame,
@@ -222,7 +218,7 @@ pub enum Request {
     StageCopyLocal {
         session: u64,
         src_image: String,
-        src_partition: Option<u32>,
+        src_partition: Option<crate::cli::img_at::PartSelector>,
         src_path: String,
         dest_parent: String,
         name: String,
@@ -1456,7 +1452,7 @@ mod tests {
         // The whole client wiring relies on clap's ImageRef keeping the rb://
         // string intact through its PathBuf (and on `@N` still splitting).
         let r = crate::cli::img_at::ImageRef::parse("rb://mister:7341/d.img@2").unwrap();
-        assert_eq!(r.partition, Some(2));
+        assert_eq!(r.partition, Some(2u32.into()));
         let s = r.path.to_string_lossy();
         assert_eq!(s, "rb://mister:7341/d.img");
         assert_eq!(RemoteRef::parse(&s).unwrap().path, "/d.img");

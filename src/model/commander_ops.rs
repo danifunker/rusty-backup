@@ -180,7 +180,7 @@ pub enum StageSource {
     Remote {
         addr: String,
         path: String,
-        partition: Option<u32>,
+        partition: Option<crate::cli::img_at::PartSelector>,
     },
     /// Reopen a session-less local source — a Mac archive or an inline-expanded
     /// disk-image / optical wrapper mount — fresh from a
@@ -1237,7 +1237,7 @@ fn os4_to_string(code: &[u8; 4]) -> String {
 fn remote_apply(
     addr: &str,
     image_path: &str,
-    partition: Option<u32>,
+    partition: Option<crate::cli::img_at::PartSelector>,
     edits: &[StagedEdit],
     mut on_progress: impl FnMut(EditProgress<'_>),
 ) -> Result<()> {
@@ -1308,7 +1308,7 @@ fn remote_apply(
 pub fn apply_edits_to_remote_image(
     addr: &str,
     image_path: &str,
-    partition: Option<u32>,
+    partition: Option<crate::cli::img_at::PartSelector>,
     edits: &[StagedEdit],
 ) -> Result<()> {
     remote_apply(addr, image_path, partition, edits, |_| {})
@@ -1320,7 +1320,7 @@ pub fn apply_edits_to_remote_image(
 pub fn spawn_remote_apply(
     addr: String,
     image_path: String,
-    partition: Option<u32>,
+    partition: Option<crate::cli::img_at::PartSelector>,
     edits: Vec<StagedEdit>,
 ) -> Arc<Mutex<ApplyStatus>> {
     let status = Arc::new(Mutex::new(ApplyStatus::default()));

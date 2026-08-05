@@ -730,6 +730,24 @@ fn infer_partition_type_byte(name: &str) -> u8 {
     }
 }
 
+/// Set FAT clean-shutdown flags at each partition offset, through the handle the
+/// restore holds — reopening the path is an unprivileged open, so it EACCESes.
+pub(crate) fn write_fat_clean_flags(
+    target: &mut SectorAlignedWriter,
+    partition_offsets: &[u64],
+    log_cb: &mut impl FnMut(&str),
+) -> Result<()> {
+    let device_file = target
+        .inner_mut()
+        .context("failed to access the target for FAT clean flags")?;
+    for &offset in partition_offsets {
+        // Best-effort: a partition whose BPB we can't parse is not a reason to
+        // fail a restore that has already written every byte.
+        let _ = set_fat_clean_flags(device_file, offset, log_cb);
+    }
+    Ok(())
+}
+
 /// Main restore orchestrator. Runs on a background thread.
 pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>) -> Result<()> {
     log(
@@ -1187,64 +1205,38 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
         }
     }
 
-    target.flush()?;
-
-    // Close the file to ensure all writes are committed
-    drop(target);
-
-    // Step 9: Reopen device and set FAT clean flags (requires fresh file handle on macOS)
-    // Only do this if at least one FAT partition was resized or compacted.
-    let any_fat_needs_flags = config.target_is_device
-        && metadata.partitions.iter().any(|pm| {
+    // Step 9: FAT clean flags for every FAT partition that was resized or
+    // compacted — one entry per partition offset.
+    let mut fat_flag_offsets: Vec<u64> = Vec::new();
+    if config.target_is_device {
+        for pm in &metadata.partitions {
             if !pm.type_name.to_ascii_lowercase().contains("fat") {
-                return false;
+                continue;
             }
             let Some(ov) = overrides.iter().find(|o| o.index == pm.index) else {
-                return false;
+                continue;
             };
-            ov.export_size != pm.original_size_bytes || pm.compacted
-        });
+            if ov.export_size != pm.original_size_bytes || pm.compacted {
+                fat_flag_offsets.push(ov.effective_start_lba() * 512);
+            }
+        }
+    }
 
-    if any_fat_needs_flags {
+    if !fat_flag_offsets.is_empty() {
         log(
             &progress,
             LogLevel::Info,
             "Setting FAT clean shutdown flags...",
         );
-
-        // Reopen device for read-write
-        let mut device_file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&config.target_path)
-            .with_context(|| {
-                format!(
-                    "failed to reopen {} for setting flags",
-                    config.target_path.display()
-                )
-            })?;
-
-        for pm in &metadata.partitions {
-            if !pm.type_name.to_ascii_lowercase().contains("fat") {
-                continue;
-            }
-            let ov = match overrides.iter().find(|o| o.index == pm.index) {
-                Some(o) => o,
-                None => continue,
-            };
-            let part_offset = ov.effective_start_lba() * 512;
-            let export_size = ov.export_size;
-
-            // Set clean flags if this FAT partition was resized or compacted
-            if export_size != pm.original_size_bytes || pm.compacted {
-                let _ = set_fat_clean_flags(&mut device_file, part_offset, &mut |msg| {
-                    log(&progress, LogLevel::Info, msg)
-                });
-            }
-        }
-
-        device_file.flush()?;
+        write_fat_clean_flags(&mut target, &fat_flag_offsets, &mut |msg| {
+            log(&progress, LogLevel::Info, msg)
+        })?;
     }
+
+    target.flush()?;
+
+    // Close the file to ensure all writes are committed
+    drop(target);
 
     // Step 10: Post-restore summary
     log(
@@ -2260,62 +2252,37 @@ fn run_clonezilla_restore(
         }
     }
 
-    target.flush()?;
-    drop(target);
-
-    // Reopen device to set FAT clean flags (only if any FAT partition was resized/used partclone)
-    let any_fat_needs_flags = config.target_is_device
-        && sorted_parts.iter().any(|cz_part| {
-            let fs = cz_part.filesystem_type.to_ascii_lowercase();
-            if !fs.contains("fat") && !fs.contains("vfat") {
-                return false;
-            }
-            let Some(ov) = overrides.iter().find(|o| o.index == cz_part.index) else {
-                return false;
-            };
-            ov.export_size != cz_part.size_bytes() || !cz_part.partclone_files.is_empty()
-        });
-
-    if any_fat_needs_flags {
-        log(
-            &progress,
-            LogLevel::Info,
-            "Setting FAT clean shutdown flags...",
-        );
-
-        let mut device_file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&config.target_path)
-            .with_context(|| {
-                format!(
-                    "failed to reopen {} for setting flags",
-                    config.target_path.display()
-                )
-            })?;
-
+    // FAT clean flags for every FAT partition that was resized or came from
+    // partclone — one entry per partition offset.
+    let mut fat_flag_offsets: Vec<u64> = Vec::new();
+    if config.target_is_device {
         for cz_part in &sorted_parts {
             let fs = cz_part.filesystem_type.to_ascii_lowercase();
             if !fs.contains("fat") && !fs.contains("vfat") {
                 continue;
             }
-            let ov = match overrides.iter().find(|o| o.index == cz_part.index) {
-                Some(o) => o,
-                None => continue,
+            let Some(ov) = overrides.iter().find(|o| o.index == cz_part.index) else {
+                continue;
             };
-
-            let part_offset = ov.effective_start_lba() * 512;
-            let export_size = ov.export_size;
-
-            if export_size != cz_part.size_bytes() || !cz_part.partclone_files.is_empty() {
-                let _ = set_fat_clean_flags(&mut device_file, part_offset, &mut |msg| {
-                    log(&progress, LogLevel::Info, msg)
-                });
+            if ov.export_size != cz_part.size_bytes() || !cz_part.partclone_files.is_empty() {
+                fat_flag_offsets.push(ov.effective_start_lba() * 512);
             }
         }
-
-        device_file.flush()?;
     }
+
+    if !fat_flag_offsets.is_empty() {
+        log(
+            &progress,
+            LogLevel::Info,
+            "Setting FAT clean shutdown flags...",
+        );
+        write_fat_clean_flags(&mut target, &fat_flag_offsets, &mut |msg| {
+            log(&progress, LogLevel::Info, msg)
+        })?;
+    }
+
+    target.flush()?;
+    drop(target);
 
     log(
         &progress,
@@ -3895,5 +3862,67 @@ mod tests {
         let beta = kids.iter().find(|e| e.name == "beta.txt").unwrap().clone();
         let beta_bytes = tgt.read_file(&beta, usize::MAX).expect("read beta.txt");
         assert_eq!(beta_bytes, b"beta\n");
+    }
+
+    /// Renames the target away first: a Unix fd outlives its directory entry, so
+    /// this passes only while the step uses the handle it already holds.
+    #[test]
+    fn fat_clean_flags_are_written_through_the_open_target_handle() {
+        use crate::fs::fat::create_blank_fat;
+        use crate::os::SectorAlignedWriter;
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        const PART_OFFSET: u64 = 1024 * 1024;
+        // 64 MiB is over the FAT12 cluster cap, so this formats as FAT16 --
+        // FAT12 has no clean-shutdown bits to set.
+        let img = create_blank_fat(64 * 1024 * 1024, Some("CFCARD")).expect("format FAT16");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("target.img");
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .expect("create target");
+        file.seek(SeekFrom::Start(PART_OFFSET)).expect("seek");
+        file.write_all(&img).expect("write partition");
+        drop(img);
+
+        // Mimic the restore: everything goes through one SectorAlignedWriter.
+        file.seek(SeekFrom::Start(PART_OFFSET)).expect("rewind");
+        let mut target = SectorAlignedWriter::new(file);
+
+        // Stand in for a device the process cannot open by path. Only the fd
+        // inside `target` can reach these bytes now.
+        let hidden = dir.path().join("unlinked.img");
+        std::fs::rename(&path, &hidden).expect("rename target out from under the path");
+
+        write_fat_clean_flags(&mut target, &[PART_OFFSET], &mut |_| {})
+            .expect("clean flags through the open handle");
+        target.flush().expect("flush");
+        drop(target);
+
+        // FAT[1] lives at byte 2 of the first FAT sector; bits 15 and 14 are
+        // "cleanly unmounted" and "no I/O errors".
+        let mut check = std::fs::File::open(&hidden).expect("reopen");
+        let mut bpb = [0u8; 512];
+        check.seek(SeekFrom::Start(PART_OFFSET)).expect("seek bpb");
+        check.read_exact(&mut bpb).expect("read bpb");
+        let bytes_per_sector = u16::from_le_bytes([bpb[11], bpb[12]]) as u64;
+        let reserved = u16::from_le_bytes([bpb[14], bpb[15]]) as u64;
+
+        let mut fat = [0u8; 4];
+        check
+            .seek(SeekFrom::Start(PART_OFFSET + reserved * bytes_per_sector))
+            .expect("seek fat");
+        check.read_exact(&mut fat).expect("read fat");
+        let entry1 = u16::from_le_bytes([fat[2], fat[3]]);
+        assert_eq!(
+            entry1 & 0xC000,
+            0xC000,
+            "FAT[1] clean bits not set: {entry1:#06x}",
+        );
     }
 }

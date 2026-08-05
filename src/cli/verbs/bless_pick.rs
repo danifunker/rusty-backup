@@ -46,7 +46,8 @@ pub fn run(args: BlessPickArgs) -> Result<()> {
         );
     }
 
-    let (reader, ctx) = resolve_partition_streaming(&args.image.path, args.image.partition)?;
+    let (reader, ctx) =
+        resolve_partition_streaming(&args.image.path, args.image.partition.clone())?;
     log_stderr(&ctx.label);
     let mut fs = crate::fs::open_filesystem(
         reader,

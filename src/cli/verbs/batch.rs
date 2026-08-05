@@ -20,7 +20,7 @@ use clap::Args;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-use crate::cli::img_at::ImageRef;
+use crate::cli::img_at::{ImageRef, PartSelector};
 use crate::cli::logging::{log_stderr, out_stdout};
 use crate::cli::parse::split_mac_path;
 use crate::cli::resolve::resolve_partition_rw;
@@ -288,7 +288,7 @@ pub fn run(args: BatchArgs) -> Result<()> {
     // partition N to a temp file, run ops on the temp, then recompress
     // + update metadata.json checksum. Detected by the presence of a
     // sibling metadata.json.
-    let archive_ctx = detect_archive_target(&target.path, target.partition)?;
+    let archive_ctx = detect_archive_target(&target.path, target.partition.clone())?;
 
     let (applied, failures) = if let Some(arch) = archive_ctx {
         log_stderr(format!(
@@ -352,7 +352,7 @@ struct ArchiveTarget {
 /// `None` for plain image files.
 fn detect_archive_target(
     target_path: &std::path::Path,
-    partition: Option<u32>,
+    partition: Option<PartSelector>,
 ) -> Result<Option<ArchiveTarget>> {
     if !target_path.is_dir() {
         return Ok(None);
@@ -361,20 +361,22 @@ fn detect_archive_target(
     if !metadata_path.exists() {
         return Ok(None);
     }
-    let part = partition.ok_or_else(|| {
+    let sel = partition.clone().ok_or_else(|| {
         anyhow!(
             "{} is a backup folder; pass IMG@N to pick a partition",
             target_path.display()
         )
-    })? as usize;
+    })?;
     let outcome = crate::model::backup_loader::load_backup_metadata(target_path)?;
     let meta = outcome.metadata;
-    let pmeta = meta
-        .partitions
-        .iter()
-        .find(|p| p.index == part)
-        .or_else(|| meta.partitions.get(part.saturating_sub(1)))
-        .ok_or_else(|| anyhow!("partition {part} not found in backup metadata"))?;
+    // metadata.json keys by slot, so `@sN` hits directly and `@N` counts.
+    let pmeta = match &sel {
+        PartSelector::Slot(slot) => meta.partitions.iter().find(|p| p.index as u32 == *slot),
+        PartSelector::Position(n) => meta.partitions.get((*n as usize).saturating_sub(1)),
+        PartSelector::Name(_) => None,
+    }
+    .ok_or_else(|| anyhow!("partition {sel} not found in backup metadata"))?;
+    let part = pmeta.index;
     if pmeta.compressed_files.is_empty() {
         bail!("partition {part} has no compressed_files entry in metadata.json");
     }
@@ -445,7 +447,7 @@ fn drain_archive(
 
 fn run_fs_ops_on_path(
     path: &std::path::Path,
-    partition: Option<u32>,
+    partition: Option<PartSelector>,
     operations: &[Operation],
     fs_ops_start: usize,
     defaults: &DefaultOptions,

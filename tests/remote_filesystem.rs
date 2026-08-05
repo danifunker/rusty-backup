@@ -784,7 +784,7 @@ fn restore_to_remote_image_round_trips() {
 
     let payload = vec![0x42u8; 11000]; // multi-cluster
     {
-        let (file, ctx, commit) = resolve_partition_rw(&src_img, Some(1)).unwrap();
+        let (file, ctx, commit) = resolve_partition_rw(&src_img, Some(1u32.into())).unwrap();
         let mut efs =
             open_editable_filesystem(file, ctx.offset, ctx.type_byte, ctx.type_string.as_deref())
                 .unwrap();
@@ -1217,7 +1217,7 @@ fn block_reader_parses_remote_partition_table_and_filesystem() {
     // Write a known file into partition 1.
     let payload = vec![0xABu8; 9000];
     {
-        let (file, ctx, commit) = resolve_partition_rw(&img, Some(1)).unwrap();
+        let (file, ctx, commit) = resolve_partition_rw(&img, Some(1u32.into())).unwrap();
         let mut efs =
             open_editable_filesystem(file, ctx.offset, ctx.type_byte, ctx.type_string.as_deref())
                 .unwrap();
@@ -1337,7 +1337,7 @@ fn run_backup_pulls_remote_image_byte_exact() {
 
     let payload = vec![0x5Au8; 12345];
     {
-        let (file, ctx, commit) = resolve_partition_rw(&img, Some(1)).unwrap();
+        let (file, ctx, commit) = resolve_partition_rw(&img, Some(1u32.into())).unwrap();
         let mut efs =
             open_editable_filesystem(file, ctx.offset, ctx.type_byte, ctx.type_string.as_deref())
                 .unwrap();
@@ -1606,7 +1606,7 @@ fn run_backup_chd_materializes_remote_and_round_trips() {
 
     let payload = vec![0x7Eu8; 21000];
     {
-        let (file, ctx, commit) = resolve_partition_rw(&img, Some(1)).unwrap();
+        let (file, ctx, commit) = resolve_partition_rw(&img, Some(1u32.into())).unwrap();
         let mut efs =
             open_editable_filesystem(file, ctx.offset, ctx.type_byte, ctx.type_string.as_deref())
                 .unwrap();

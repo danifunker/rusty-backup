@@ -182,7 +182,7 @@ fn populate(args: &NewSgiCdromArgs, dir: &std::path::Path) -> Result<()> {
     }
     // The EFS filesystem is the disc's only mountable partition; `@1` is how
     // every other verb addresses it.
-    let (file, ctx, commit) = resolve_partition_rw_forced(&args.image, Some(1), None)?;
+    let (file, ctx, commit) = resolve_partition_rw_forced(&args.image, Some(1u32.into()), None)?;
     let mut fs = ctx
         .open_editable(file)
         .map_err(|e| anyhow::anyhow!("opening the new EFS filesystem for writing: {e}"))?;

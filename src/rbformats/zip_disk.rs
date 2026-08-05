@@ -89,8 +89,22 @@ fn is_disk_image_entry(name: &str) -> bool {
         ".img", ".raw", ".dd", ".iso", ".hdd", ".hda", ".hdv", ".dsk", ".vhd", ".hdf", ".hds",
         ".ima", ".vmdk", ".qcow2", ".chd",
     ];
+    if is_apple_double(name) {
+        return false;
+    }
     let lower = name.to_ascii_lowercase();
     EXTS.iter().any(|e| lower.ends_with(e))
+}
+
+/// A macOS resource-fork stub, not content. Zipping `disk.hda` in Finder also
+/// stores `__MACOSX/._disk.hda`, which shares the extension and so used to be
+/// offered as a second disk image — forcing `--inside` on a one-image archive.
+fn is_apple_double(name: &str) -> bool {
+    name.starts_with("__MACOSX/")
+        || name
+            .rsplit(['/', '\\'])
+            .next()
+            .is_some_and(|base| base.starts_with("._"))
 }
 
 #[derive(Clone)]
@@ -331,6 +345,23 @@ mod tests {
         ]);
         let r = ZipDiskReader::open(&zip).unwrap();
         assert_eq!(r.entry_name(), "disk.RAW");
+    }
+
+    #[test]
+    fn finder_resource_fork_stubs_are_not_disk_images() {
+        // Zipping `disk.hda` on macOS also stores `__MACOSX/._disk.hda`, which
+        // shares the extension — it used to count as a second disk image and
+        // force `--inside` on an archive holding exactly one.
+        let payload = b"real disk bytes";
+        let zip = build_zip(&[
+            ("disk.hda", payload),
+            ("__MACOSX/._disk.hda", b"\x00\x05\x16\x07rsrc"),
+        ]);
+        let mut r = ZipDiskReader::open(&zip).expect("must auto-pick the real image");
+        assert_eq!(r.entry_name(), "disk.hda");
+        let mut got = Vec::new();
+        r.read_to_end(&mut got).unwrap();
+        assert_eq!(got, payload);
     }
 
     #[test]

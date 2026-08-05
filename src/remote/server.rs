@@ -36,8 +36,7 @@ use crate::remote::protocol::{
     read_member_header, read_member_request, write_binary_hello, write_control,
     write_get_open_reply, write_member_stream, write_put_ack, write_put_result, write_resume_map,
     ChunkWriter, FamilyBOp, Handshake, PutHeader, Request, Response, ResumeEntry, WireEntry,
-    WireKind, CAP_FAMILY_B, CAP_FAMILY_F, MAX_PUT_CHUNK, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION,
-    RB_HELLO_MAGIC,
+    WireKind, CAP_FAMILY_B, CAP_FAMILY_F, MAX_PUT_CHUNK, PROTOCOL_VERSION, RB_HELLO_MAGIC,
 };
 
 /// A block-tier handle: a host image file (or raw device) kept open for ranged
@@ -93,7 +92,7 @@ enum StagedEdit {
 /// staging dir holding uploaded blobs (cleaned when the session is dropped).
 struct Session {
     image_path: PathBuf,
-    partition: Option<u32>,
+    partition: Option<crate::cli::img_at::PartSelector>,
     staging: tempfile::TempDir,
     edits: Vec<StagedEdit>,
     blob_seq: u64,
@@ -799,12 +798,11 @@ fn handle_conn(
             version,
             capabilities,
         }) => {
-            if version < MIN_PROTOCOL_VERSION {
-                // Can't speak the JSON error path to a binary client; just log
-                // and drop. The reply omits any capability so the client sees
-                // the mismatch (its own version is above ours).
+            if version != PROTOCOL_VERSION {
+                // No JSON error path to a binary client; log and drop.
                 eprintln!(
-                    "rb-cli serve: rejecting Family-B client (version {version} < {MIN_PROTOCOL_VERSION})"
+                    "rb-cli serve: rejecting Family-B client speaking v{version}; this daemon \
+                     is v{PROTOCOL_VERSION}. Update cb-dos (RB_PROTO_VER in cbnet.c)."
                 );
                 return Ok(());
             }
@@ -829,10 +827,20 @@ fn handle_conn(
 
         match req {
             Request::Hello { magic, version } => {
-                if magic != RB_HELLO_MAGIC || version < MIN_PROTOCOL_VERSION {
+                if magic != RB_HELLO_MAGIC {
                     reply_err(
                         &mut writer,
-                        format!("unsupported client (magic {magic:#x}, version {version})"),
+                        format!("not an rb-cli client (magic {magic:#x})"),
+                    )?;
+                    return Ok(());
+                }
+                if version != PROTOCOL_VERSION {
+                    reply_err(
+                        &mut writer,
+                        format!(
+                            "this daemon speaks protocol v{PROTOCOL_VERSION}, the client \
+                             speaks v{version} — update rb-cli on the client"
+                        ),
                     )?;
                     return Ok(());
                 }
@@ -1550,7 +1558,11 @@ struct OpenedFs {
 
 /// Open `rel` (relative to `root`, partition `partition`) for reading exactly
 /// as the local CLI would, returning the live filesystem + display metadata.
-fn open_image(root: &Path, rel: &str, partition: Option<u32>) -> Result<OpenedFs> {
+fn open_image(
+    root: &Path,
+    rel: &str,
+    partition: Option<crate::cli::img_at::PartSelector>,
+) -> Result<OpenedFs> {
     let full = sandbox_join(root, rel)?;
     let (reader, ctx) = crate::cli::resolve::resolve_partition_streaming_forced_inside(
         &full, partition, None, None, None,
@@ -1577,7 +1589,7 @@ fn open_image(root: &Path, rel: &str, partition: Option<u32>) -> Result<OpenedFs
 fn open_session(
     root: &Path,
     rel: &str,
-    partition: Option<u32>,
+    partition: Option<crate::cli::img_at::PartSelector>,
     staging_dir: Option<&Path>,
 ) -> Result<Session> {
     let image_path = sandbox_join(root, rel)?;
@@ -1601,8 +1613,11 @@ fn open_session(
 /// Replay a session's staged edits onto its image (open editable once, mutate,
 /// sync, commit). Mirrors the local `put` / `mkdir` verbs.
 fn apply_session(sess: &Session) -> Result<u64> {
-    let (file, ctx, commit) =
-        crate::cli::resolve::resolve_partition_rw_forced(&sess.image_path, sess.partition, None)?;
+    let (file, ctx, commit) = crate::cli::resolve::resolve_partition_rw_forced(
+        &sess.image_path,
+        sess.partition.clone(),
+        None,
+    )?;
     let mut fs = crate::fs::open_editable_filesystem(
         file,
         ctx.offset,
@@ -1688,7 +1703,7 @@ type StagedCopy = (PathBuf, u64, Option<[u8; 4]>, Option<[u8; 4]>);
 fn stage_copy_local(
     root: &Path,
     src_rel: &str,
-    src_partition: Option<u32>,
+    src_partition: Option<crate::cli::img_at::PartSelector>,
     src_path: &str,
     sess: &mut Session,
 ) -> Result<StagedCopy> {

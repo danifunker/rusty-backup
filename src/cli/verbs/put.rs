@@ -182,10 +182,10 @@ pub fn run_with_budget(
         // overwriting byte 0 would smash the APM Driver Descriptor
         // Record. We resolve the partition through the same dispatch
         // every other verb uses so `--boot` honors `@N`.
-        return put_boot(&args.image.path, args.image.partition, &bb_file);
+        return put_boot(&args.image.path, args.image.partition.clone(), &bb_file);
     }
     if let Some(donor) = args.boot_from {
-        return put_boot_from(&args.image.path, args.image.partition, &donor);
+        return put_boot_from(&args.image.path, args.image.partition.clone(), &donor);
     }
 
     let dst = match (args.dst, args.dst_flag) {
@@ -207,7 +207,7 @@ pub fn run_with_budget(
         }
         return remote_put(
             &rref,
-            args.image.partition,
+            args.image.partition.clone(),
             &parent_path,
             &name,
             args.host_file,
@@ -220,7 +220,7 @@ pub fn run_with_budget(
 
     let (file, mut ctx, commit) = resolve_partition_rw_forced(
         &args.image.path,
-        args.image.partition,
+        args.image.partition.clone(),
         args.fs_override.fs_type.as_deref(),
     )?;
     args.fs_override.apply(&mut ctx);
@@ -455,7 +455,7 @@ pub fn run_with_budget(
 #[allow(clippy::too_many_arguments)]
 fn remote_put(
     rref: &crate::remote::RemoteRef,
-    partition: Option<u32>,
+    partition: Option<crate::cli::img_at::PartSelector>,
     parent_path: &str,
     name: &str,
     host_file: Option<PathBuf>,
@@ -506,7 +506,7 @@ fn remote_put(
 /// in by relaxing the type-byte check.
 fn put_boot(
     image: &std::path::Path,
-    partition: Option<u32>,
+    partition: Option<crate::cli::img_at::PartSelector>,
     bb_file: &std::path::Path,
 ) -> Result<()> {
     let bb = std::fs::read(bb_file).map_err(|e| anyhow!("reading {}: {e}", bb_file.display()))?;
@@ -523,13 +523,18 @@ fn put_boot(
 /// boot-block region into the target's first sector. The donor's classic-HFS
 /// volume is auto-located and its `'LK'` signature checked before anything is
 /// written to the target.
-fn put_boot_from(image: &std::path::Path, partition: Option<u32>, donor: &ImageRef) -> Result<()> {
+fn put_boot_from(
+    image: &std::path::Path,
+    partition: Option<crate::cli::img_at::PartSelector>,
+    donor: &ImageRef,
+) -> Result<()> {
     use crate::cli::resolve::resolve_partition_streaming;
     use crate::fs::hfs_boot::read_donor_boot_blocks;
 
     // Read + validate from the donor first; never touch the target if the
     // donor isn't actually bootable.
-    let (mut reader, donor_ctx) = resolve_partition_streaming(&donor.path, donor.partition)?;
+    let (mut reader, donor_ctx) =
+        resolve_partition_streaming(&donor.path, donor.partition.clone())?;
     let blocks = read_donor_boot_blocks(&mut reader, donor_ctx.offset).map_err(|e| {
         anyhow!(
             "reading boot blocks from donor {}: {e}",
@@ -564,7 +569,11 @@ fn is_boot_block_target(type_byte: u8, type_string: Option<&str>) -> bool {
 
 /// Shared write side for `--boot` / `--boot-from`: place `bb` (up to 1024
 /// bytes, zero-padded if shorter) at the selected partition's first sector.
-fn write_boot_region(image: &std::path::Path, partition: Option<u32>, bb: &[u8]) -> Result<()> {
+fn write_boot_region(
+    image: &std::path::Path,
+    partition: Option<crate::cli::img_at::PartSelector>,
+    bb: &[u8],
+) -> Result<()> {
     use std::io::{Seek, SeekFrom, Write};
 
     let (mut file, ctx, commit) = resolve_partition_rw(image, partition)?;

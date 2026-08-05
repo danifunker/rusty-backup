@@ -21,6 +21,7 @@ Recipes assume you've installed shell completions
 5. [Build an IRIX software CD from a folder of tardists](#5-build-an-irix-software-cd-from-a-folder-of-tardists)
 6. [Rip and archive a CD-ROM library to CHD](#6-rip-and-archive-a-cd-rom-library-to-chd)
 7. [Drive complex flows from a single batch script](#7-drive-complex-flows-from-a-single-batch-script)
+8. [Pick the right partition every time](#8-pick-the-right-partition-every-time)
 
 ---
 
@@ -86,7 +87,8 @@ catalog — the GUI's "Expand HFS Volume…" dialog and the new
 ```bash
 # 1. Identify the source partition. APM disks usually have one Apple_HFS.
 rb-cli inspect ~/MacBackups/quadra-system7-restored.hda
-# Note which partition is the Apple_HFS one. Suppose it's @2.
+# Read the row you want: `#` is the number for @N, `slot` the one for @sN.
+# Suppose the Apple_HFS row shows `#` 2. See recipe 8 if you're scripting.
 
 # 2. Expand it. The verb picks the smallest block size whose 65535-block
 #    ceiling holds --size; specify --block-size yourself only to force a
@@ -378,3 +380,62 @@ When adding a new feature, follow the pattern: build the engine
 function in `src/`, expose it through a `model::*_runner` if it's
 long-running, then write a thin wrapper in `src/cli/verbs/`. The GUI
 follows the same path through `src/gui/`.
+
+---
+
+## 8. Pick the right partition every time
+
+**Goal.** Aim a verb at one partition of a multi-partition disk and be
+sure you hit the one you meant — interactively, and in a script that has
+to keep working.
+
+`rb-cli inspect` prints both numbers you can type:
+
+```
+$ rb-cli inspect ~/MacBackups/os9-120gb.img
+Partition table: APM
+
+idx  slot  type                         start_lba            size  flags
+  1     6  Apple_HFS (untitled)              1216        39.1 GiB  boot
+  2     7  Apple_HFS (untitled 2)        81921216        72.7 GiB  boot
+```
+
+- **`@N`** takes the `idx` column — the position in that list. Portable
+  across every partition table.
+- **`@sN`** takes the `slot` column — the table's own numbering, spelled
+  the way the platform spells it. Here `@s6` is the partition macOS calls
+  `disk4s6`; on an SGI disk `@s0` is the slice IRIX calls 0.
+
+```bash
+rb-cli ls        ~/MacBackups/os9-120gb.img@1  /
+rb-cli ls        ~/MacBackups/os9-120gb.img@s6 /     # the same partition
+rb-cli show fs-info ~/MacBackups/os9-120gb.img@s7
+```
+
+**In scripts, prefer `@sN`.** The position depends on which partitions
+rusty-backup currently considers browsable, and that set grows as the tool
+learns about more partition types — a disk whose driver partitions were once
+listed will renumber when they stop being. The slot names the table itself and
+does not move.
+
+Amiga RDB disks can be addressed by device name, which is what an Amiga user
+actually knows:
+
+```bash
+rb-cli ls ~/amiga/workbench.hdf@DH0 /
+rb-cli ls ~/amiga/workbench.hdf@dh1 /       # case-insensitive
+```
+
+The same forms work on the flags, so a filename containing `@` is never a
+problem:
+
+```bash
+rb-cli write install.img /dev/disk6 --partition s7 --yes
+rb-cli backup /dev/disk6 ~/backups --partitions s6,s7
+```
+
+GPT disks have no slot form — the parser drops unused entries, so a truthful
+entry number can't be recovered. `@sN` says so and points at `@N`.
+
+Full details, including how each table numbers its slots:
+[docs/partition-selectors.md](partition-selectors.md).

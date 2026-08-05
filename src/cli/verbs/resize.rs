@@ -43,10 +43,11 @@ pub fn run(args: ResizeArgs) -> Result<()> {
     // only the I/O path differs (ranged read/write requests to the daemon).
     #[cfg(feature = "remote")]
     if let Some(remote) = crate::remote::RemoteRef::parse(&args.image.path.to_string_lossy()) {
-        return run_remote(remote, args.image.partition, new_size);
+        return run_remote(remote, args.image.partition.clone(), new_size);
     }
 
-    let (mut file, ctx, commit) = resolve_partition_rw(&args.image.path, args.image.partition)?;
+    let (mut file, ctx, commit) =
+        resolve_partition_rw(&args.image.path, args.image.partition.clone())?;
     log_stderr(&ctx.label);
     log_stderr(format!(
         "resize: target size {} ({} bytes), partition offset {} ({} bytes available)",
@@ -80,7 +81,7 @@ pub fn run(args: ResizeArgs) -> Result<()> {
 #[cfg(feature = "remote")]
 fn run_remote(
     remote: crate::remote::RemoteRef,
-    partition: Option<u32>,
+    partition: Option<crate::cli::img_at::PartSelector>,
     new_size: u64,
 ) -> Result<()> {
     use crate::model::resize_remote::resize_remote_partition;
@@ -90,6 +91,7 @@ fn run_remote(
         "resize: remote {} (partition {}), target size {} ({new_size} bytes)",
         remote.path,
         partition
+            .as_ref()
             .map(|n| n.to_string())
             .unwrap_or_else(|| "auto".into()),
         format_size(new_size),

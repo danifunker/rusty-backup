@@ -235,7 +235,7 @@ pub fn run(args: GetArgs) -> Result<()> {
 #[cfg(feature = "remote")]
 fn remote_get(
     rref: &crate::remote::RemoteRef,
-    partition: Option<u32>,
+    partition: Option<crate::cli::img_at::PartSelector>,
     src: &str,
     dst: &Path,
     conflict: ConflictMode,

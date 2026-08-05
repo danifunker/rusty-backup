@@ -28,11 +28,12 @@ pub struct WriteArgs {
     ///   - Windows: `"\\.\PhysicalDriveN"` (quote for PowerShell)
     pub device: PathBuf,
 
-    /// Write into this 1-based partition instead of the whole disk. The
-    /// partition's own bounds cap the write; the rest of the disk, including
-    /// the partition table, is left untouched.
-    #[arg(long)]
-    pub partition: Option<u32>,
+    /// Write into one partition instead of the whole disk: `N` (the `idx`
+    /// column of `inspect`), `sN` (the table's own slot) or an AmigaDOS device
+    /// name. The partition's bounds cap the write; the rest of the disk,
+    /// including the partition table, is left untouched.
+    #[arg(long, value_parser = parse_partition_selector)]
+    pub partition: Option<crate::cli::img_at::PartSelector>,
 
     /// Required confirmation. Skips the prompt but never the safety
     /// summary printed on stderr.
@@ -45,27 +46,21 @@ pub struct WriteArgs {
 }
 
 /// Resolve `--partition N` to the region it occupies on `device`.
-fn partition_extent(device: &std::path::Path, index: u32) -> Result<WriteExtent> {
-    if index == 0 {
-        bail!("partition index is 1-based");
-    }
+fn partition_extent(
+    device: &std::path::Path,
+    index: &crate::cli::img_at::PartSelector,
+) -> Result<WriteExtent> {
     let mut probe = crate::model::source_reader::open_peeled_read_with_entry(device, None, None)
         .with_context(|| format!("opening {} to read its partition table", device.display()))?;
     let table = crate::partition::PartitionTable::detect(&mut probe).map_err(|e| {
         anyhow::anyhow!("detecting the partition table on {}: {e}", device.display())
     })?;
     let partitions = table.partitions();
-    let part = partitions
-        .iter()
-        .find(|p| p.index + 1 == index as usize)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "{} has no partition {} (found {})",
-                device.display(),
-                index,
-                partitions.len(),
-            )
-        })?;
+    // Positional, matching `inspect`'s `idx` column. This used to key on
+    // `PartitionInfo::index + 1` — the raw table slot — so on an APM disk
+    // `--partition 2` silently wrote to the first partition.
+    let part = crate::cli::resolve::select_partition(&table, &partitions, index)
+        .with_context(|| format!("selecting a partition on {}", device.display()))?;
     Ok(WriteExtent::partition(part.start_lba, part.size_bytes))
 }
 
@@ -80,7 +75,7 @@ pub fn run(args: WriteArgs) -> Result<()> {
     let pre = preflight(&args.device, args.write_to_system_disk)?;
 
     let device_size = pre.device.as_ref().map(|d| d.size_bytes).unwrap_or(0);
-    let extent = match args.partition {
+    let extent = match &args.partition {
         Some(n) => partition_extent(&args.device, n)?,
         None => WriteExtent::whole_disk(device_size),
     };
@@ -89,7 +84,7 @@ pub fn run(args: WriteArgs) -> Result<()> {
     // file's byte count on disk.
     let src_size = decoded_size(&args.image)?;
 
-    let target_label = match args.partition {
+    let target_label = match &args.partition {
         Some(n) => format!("{} partition {}", args.device.display(), n),
         None => args.device.display().to_string(),
     };
@@ -143,4 +138,12 @@ fn new_cli_status(total: u64) -> physical_write_runner::PhysicalWriteStatus {
         total_bytes: total,
         cancel_requested: false,
     }
+}
+
+/// Parse `--partition`: the same forms the `IMG@…` suffix accepts.
+fn parse_partition_selector(s: &str) -> Result<crate::cli::img_at::PartSelector, String> {
+    crate::cli::img_at::ImageRef::parse(&format!("x@{s}"))
+        .map_err(|e| e.to_string())?
+        .partition
+        .ok_or_else(|| "empty partition selector".to_string())
 }

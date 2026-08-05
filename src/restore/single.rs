@@ -11,9 +11,9 @@ use crate::fs::patch_hidden_sectors_for;
 use crate::fs::{
     resize_btrfs_in_place, resize_exfat_in_place, resize_ext_in_place, resize_fat_in_place,
     resize_hfs_in_place, resize_hfsplus_in_place, resize_ntfs_in_place, resize_prodos_in_place,
-    set_fat_clean_flags, validate_btrfs_integrity, validate_exfat_integrity,
-    validate_ext_integrity, validate_fat_integrity, validate_hfs_integrity,
-    validate_hfsplus_integrity, validate_ntfs_integrity, validate_prodos_integrity,
+    validate_btrfs_integrity, validate_exfat_integrity, validate_ext_integrity,
+    validate_fat_integrity, validate_hfs_integrity, validate_hfsplus_integrity,
+    validate_ntfs_integrity, validate_prodos_integrity,
 };
 use crate::os::SectorAlignedWriter;
 use crate::partition::apm::build_minimal_apm;
@@ -21,7 +21,7 @@ use crate::partition::gpt::{build_minimal_gpt, Gpt};
 use crate::partition::mbr::build_minimal_mbr;
 use crate::rbformats;
 
-use super::{detect_partition_fs_type, PartitionFsType, RestoreProgress};
+use super::{detect_partition_fs_type, write_fat_clean_flags, PartitionFsType, RestoreProgress};
 
 // Re-use the existing log/progress helpers from the parent module.
 fn log(progress: &Arc<Mutex<RestoreProgress>>, level: LogLevel, message: impl Into<String>) {
@@ -642,33 +642,30 @@ pub fn run_single_partition_restore(
         }
     }
 
-    // Step 8: Set FAT clean flags if needed (requires flush + reopen on macOS devices)
-    target.flush()?;
-    drop(target);
-
+    // Step 8: Set FAT clean flags, through the handle we already hold — see
+    // `write_fat_clean_flags` for why this must not reopen the target.
     if config.target_is_device {
-        let fs_type_check = {
-            let mut f = std::fs::OpenOptions::new()
-                .read(true)
-                .open(&config.target_path)?;
-            detect_partition_fs_type(&mut f, config.target_offset_bytes)
-        };
-        if matches!(fs_type_check, PartitionFsType::Fat) {
+        let inner_file = target
+            .inner_mut()
+            .context("failed to access device for FAT clean flags")?;
+        let is_fat = matches!(
+            detect_partition_fs_type(inner_file, config.target_offset_bytes),
+            PartitionFsType::Fat
+        );
+        if is_fat {
             log(
                 &progress,
                 LogLevel::Info,
                 "Setting FAT clean shutdown flags...",
             );
-            let mut device_file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&config.target_path)?;
-            let _ = set_fat_clean_flags(&mut device_file, config.target_offset_bytes, &mut |msg| {
+            write_fat_clean_flags(&mut target, &[config.target_offset_bytes], &mut |msg| {
                 log(&progress, LogLevel::Info, msg)
-            });
-            device_file.flush()?;
+            })?;
         }
     }
+
+    target.flush()?;
+    drop(target);
 
     log(
         &progress,

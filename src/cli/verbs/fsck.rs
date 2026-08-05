@@ -120,7 +120,7 @@ fn check_mode(
     // image (CP/M) dispatchable when detection alone can't identify it.
     let (file, mut ctx) = resolve_partition_streaming_forced(
         &image.path,
-        image.partition,
+        image.partition.clone(),
         None,
         fs_override.fs_type.as_deref(),
     )?;
@@ -192,8 +192,11 @@ fn repair_mode(
         return alto_repair(disk, is_pdi, image, format);
     }
 
-    let (file, mut ctx, commit) =
-        resolve_partition_rw_forced(&image.path, image.partition, fs_override.fs_type.as_deref())?;
+    let (file, mut ctx, commit) = resolve_partition_rw_forced(
+        &image.path,
+        image.partition.clone(),
+        fs_override.fs_type.as_deref(),
+    )?;
     fs_override.apply(&mut ctx);
     log_stderr(&ctx.label);
     let mut fs = ctx

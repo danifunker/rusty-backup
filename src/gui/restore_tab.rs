@@ -814,8 +814,10 @@ impl RestoreTab {
                         ui.label(egui::RichText::new("Size (MiB)").strong());
                         ui.end_row();
 
-                        for cfg in &mut self.partition_configs {
-                            ui.label(format!("{}", cfg.index));
+                        for (pos, cfg) in self.partition_configs.iter_mut().enumerate() {
+                            // Position, matching `inspect`'s `#`; `cfg.index` is
+                            // the table slot and stays the matching key.
+                            ui.label(format!("{}", pos + 1));
                             ui.label(&cfg.type_name);
                             ui.label(partition::format_size(cfg.original_size));
                             ui.label(partition::format_size(cfg.minimum_size));
@@ -1141,7 +1143,7 @@ impl RestoreTab {
                         ui.label(egui::RichText::new("").strong()); // compat
                         ui.end_row();
 
-                        for part in &self.sp_target_partitions {
+                        for (pos, part) in self.sp_target_partitions.iter().enumerate() {
                             if part.is_extended_container {
                                 continue;
                             }
@@ -1149,7 +1151,7 @@ impl RestoreTab {
                             if ui.radio(selected, "").clicked() {
                                 self.sp_target_partition_idx = Some(part.index);
                             }
-                            ui.label(format!("{}", part.index));
+                            ui.label(format!("{}", pos + 1));
                             ui.label(&part.type_name);
                             ui.label(partition::format_size(part.size_bytes));
 
@@ -1475,7 +1477,9 @@ impl RestoreTab {
                 let kind = SegmentKind::Partition { color_index };
                 color_index += 1;
                 segs.push(Segment {
-                    label: format!("Partition {}", pm.index + 1),
+                    // `color_index` counts the rendered segments, so this is the
+                    // partition's position — the same number the tables show.
+                    label: format!("Partition {color_index}"),
                     fs: pm.type_name.clone(),
                     size_bytes: pm.original_size_bytes,
                     kind,

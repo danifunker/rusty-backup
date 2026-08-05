@@ -46,9 +46,11 @@ pub struct MacScsiBlessArgs {
 
 pub fn run(args: MacScsiBlessArgs) -> Result<()> {
     let driver = if let Some(donor) = &args.driver_from {
-        // Read the donor read-only through the streaming resolver so a CHD /
-        // container donor is decoded before we look for its Apple_Driver.
-        let (mut f, _ctx) = crate::cli::resolve::resolve_partition_streaming(donor, None)?;
+        // Whole-disk read (peeling a CHD / container): the donor's *partition
+        // map* is what we mine. The partition resolver refused both shapes a
+        // real Apple-formatted donor comes in — several filesystems ("select
+        // one by appending @N") or none at all ("no usable partition found").
+        let mut f = crate::model::source_reader::open_peeled_read_with_entry(donor, None, None)?;
         MacScsiDriver::from_donor(&mut f)
             .map_err(|e| anyhow::anyhow!("{e}"))
             .with_context(|| format!("extracting driver from {}", donor.display()))?

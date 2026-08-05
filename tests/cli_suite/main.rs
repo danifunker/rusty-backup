@@ -31,4 +31,5 @@ mod cli_macplus_appleii;
 mod cli_provision;
 mod cli_ql;
 mod cli_sgi_hdd;
+mod cli_show_partmap;
 mod cli_x68000;

@@ -63,7 +63,11 @@ impl RemoteConnection {
 
     /// Open a disk image on the daemon and remember its handle. Many images can
     /// be open at once on the same connection.
-    pub fn open_image(&mut self, path: &str, partition: Option<u32>) -> Result<OpenedImage> {
+    pub fn open_image(
+        &mut self,
+        path: &str,
+        partition: Option<crate::cli::img_at::PartSelector>,
+    ) -> Result<OpenedImage> {
         let opened = self.session.open_image(path, partition)?;
         self.open_handles.push(opened.handle);
         Ok(opened)

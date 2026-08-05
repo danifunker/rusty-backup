@@ -11,8 +11,8 @@ use std::path::Path;
 
 use crate::remote::protocol::{
     read_chunks, read_control, write_control, ChunkWriter, Request, Response, WireEntry,
-    WireOpticalDrive, WireRetryConfig, WireSectorMode, WireToc, CAP_FAMILY_F, MIN_PROTOCOL_VERSION,
-    PROTOCOL_VERSION, RB_HELLO_MAGIC,
+    WireOpticalDrive, WireRetryConfig, WireSectorMode, WireToc, CAP_FAMILY_F, PROTOCOL_VERSION,
+    RB_HELLO_MAGIC,
 };
 
 /// Result of opening a remote image: a handle + the filesystem's display
@@ -60,8 +60,12 @@ impl RemoteSession {
                 capabilities,
                 ..
             } => {
-                if version < MIN_PROTOCOL_VERSION {
-                    bail!("remote daemon speaks protocol v{version}, too old for this client");
+                if version != PROTOCOL_VERSION {
+                    bail!(
+                        "the daemon speaks protocol v{version} but this client needs \
+                         v{PROTOCOL_VERSION} — update rb-cli on the server and restart \
+                         `rb-cli serve`"
+                    );
                 }
                 if capabilities & CAP_FAMILY_F == 0 {
                     bail!("remote daemon doesn't offer file transfer (Family F)");
@@ -75,7 +79,11 @@ impl RemoteSession {
 
     /// Open a disk image on the daemon. `label` mirrors the CLI's partition
     /// line; the rest is the opened filesystem's display metadata.
-    pub fn open_image(&mut self, path: &str, partition: Option<u32>) -> Result<OpenedImage> {
+    pub fn open_image(
+        &mut self,
+        path: &str,
+        partition: Option<crate::cli::img_at::PartSelector>,
+    ) -> Result<OpenedImage> {
         write_control(
             &mut self.writer,
             &Request::OpenImage {
@@ -174,7 +182,11 @@ impl RemoteSession {
 
     /// Open a write session bound to a destination image. Returns the session
     /// id used by the `stage_*` / `apply` / `close_session` calls.
-    pub fn open_session(&mut self, image_path: &str, partition: Option<u32>) -> Result<u64> {
+    pub fn open_session(
+        &mut self,
+        image_path: &str,
+        partition: Option<crate::cli::img_at::PartSelector>,
+    ) -> Result<u64> {
         write_control(
             &mut self.writer,
             &Request::OpenSession {
@@ -251,7 +263,7 @@ impl RemoteSession {
         &mut self,
         session: u64,
         src_image: &str,
-        src_partition: Option<u32>,
+        src_partition: Option<crate::cli::img_at::PartSelector>,
         src_path: &str,
         dest_parent: &str,
         name: &str,

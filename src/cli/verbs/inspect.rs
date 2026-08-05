@@ -135,17 +135,22 @@ fn emit_text(
         out_stdout("\nNo partitions detected.");
         return Ok(());
     }
+    // Two selectors, both typeable: `idx` is `IMG@N`, the 1-based position in
+    // this list; `slot` is `IMG@sN`, the table's own numbering (blank for GPT
+    // and friends, which have none). They differ whenever a table hides rows.
+    let has_slots = pt.has_native_slots();
     out_stdout("");
-    out_stdout(format!(
-        "{:>3}  {:<24}  {:>12}  {:>14}  {}",
-        "idx", "type", "start_lba", "size", "flags"
-    ));
-    // `idx` is the number the user types back at us - `IMG@N` / `--partition N`
-    // / `--partitions 1,3` - which is the 1-based position in this same list.
-    // Deliberately not `PartitionInfo::index`: that field is the raw table slot
-    // (MBR enumerates its four entries before discarding the empty ones), so it
-    // is 0-based on MBR/GPT and 1-based on APM, and printing it told the user a
-    // number that selects a different partition.
+    if has_slots {
+        out_stdout(format!(
+            "{:>3}  {:>4}  {:<24}  {:>12}  {:>14}  {}",
+            "idx", "slot", "type", "start_lba", "size", "flags"
+        ));
+    } else {
+        out_stdout(format!(
+            "{:>3}  {:<24}  {:>12}  {:>14}  {}",
+            "idx", "type", "start_lba", "size", "flags"
+        ));
+    }
     for (pos, p) in partitions.iter().enumerate() {
         let mut flags = Vec::new();
         if p.bootable {
@@ -157,14 +162,30 @@ fn emit_text(
         if p.is_extended_container {
             flags.push("extended");
         }
-        out_stdout(format!(
-            "{:>3}  {:<24}  {:>12}  {:>14}  {}",
-            pos + 1,
-            p.type_name,
-            p.start_lba,
-            format_size(p.size_bytes),
-            flags.join(",")
-        ));
+        if has_slots {
+            let slot = pt
+                .native_slot(p)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "-".into());
+            out_stdout(format!(
+                "{:>3}  {:>4}  {:<24}  {:>12}  {:>14}  {}",
+                pos + 1,
+                slot,
+                p.type_name,
+                p.start_lba,
+                format_size(p.size_bytes),
+                flags.join(",")
+            ));
+        } else {
+            out_stdout(format!(
+                "{:>3}  {:<24}  {:>12}  {:>14}  {}",
+                pos + 1,
+                p.type_name,
+                p.start_lba,
+                format_size(p.size_bytes),
+                flags.join(",")
+            ));
+        }
     }
     // For SGI disks the browsable list above filters out the disk-wide
     // wrappers (VOLHDR / VOLUME) and swap/raw slots; dump the full 16-slot
@@ -188,19 +209,27 @@ fn emit_sgi_volume_header(vh: &crate::partition::sgi::SgiVolumeHeader) {
         dp.secbytes,
     ));
     out_stdout(format!(
-        "{:>4}  {:<8}  {:>12}  {:>12}",
-        "slot", "type", "first", "blocks"
+        "{:>4}  {:<8}  {:>12}  {:>12}  {}",
+        "slot", "type", "first", "blocks", "browsable"
     ));
     for (i, e) in vh.partitions.iter().enumerate() {
         if e.is_empty() {
             continue;
         }
+        // The wrappers and swap/raw slots appear here but not in the table
+        // above, so say which of these `@sN` can actually open.
+        let browsable = if e.partition_type().is_skipped_from_browse() {
+            ""
+        } else {
+            "yes"
+        };
         out_stdout(format!(
-            "{:>4}  {:<8}  {:>12}  {:>12}",
+            "{:>4}  {:<8}  {:>12}  {:>12}  {}",
             i,
             e.partition_type().display_name(),
             e.first,
             e.blocks,
+            browsable,
         ));
     }
 }

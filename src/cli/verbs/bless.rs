@@ -52,7 +52,7 @@ pub fn run(cmd: BlessCommand) -> Result<()> {
 /// Open the partition read-write, bless the folder at `path`, and commit.
 /// Shared by `bless set` and the interactive picker's confirm step.
 pub fn apply_bless(image: &ImageRef, path: &str) -> Result<()> {
-    let (file, ctx, commit) = resolve_partition_rw(&image.path, image.partition)?;
+    let (file, ctx, commit) = resolve_partition_rw(&image.path, image.partition.clone())?;
     log_stderr(&ctx.label);
     let mut fs = ctx
         .open_editable(file)
@@ -73,7 +73,8 @@ pub fn apply_bless(image: &ImageRef, path: &str) -> Result<()> {
 }
 
 fn run_show(args: BlessShowArgs) -> Result<()> {
-    let (reader, ctx) = resolve_partition_streaming(&args.image.path, args.image.partition)?;
+    let (reader, ctx) =
+        resolve_partition_streaming(&args.image.path, args.image.partition.clone())?;
     log_stderr(&ctx.label);
     let mut fs = crate::fs::open_filesystem(
         reader,

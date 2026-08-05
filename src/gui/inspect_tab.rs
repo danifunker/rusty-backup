@@ -205,6 +205,9 @@ pub struct InspectTab {
     open_device_file: Option<Arc<File>>,
     /// Guard that keeps the DiskClaim (and any temp file) alive while browsing.
     open_device_guard: Option<rusty_backup::os::TempFileGuard>,
+    /// Device path this tab last escalated, so closing the source can release
+    /// that one cached descriptor (and only that one) for a clean eject.
+    open_device_path: Option<PathBuf>,
     /// When the source is a CHD container, we route every reader through a
     /// fresh `ChdReader` opened from this path. `None` for raw devices/images.
     chd_image_path: Option<PathBuf>,
@@ -315,6 +318,7 @@ impl Default for InspectTab {
             inspect_status: None,
             open_device_file: None,
             open_device_guard: None,
+            open_device_path: None,
             chd_image_path: None,
             cached_disk_size: None,
             editor_popup: false,
@@ -2569,6 +2573,7 @@ impl InspectTab {
                 self.image_file_path = None;
                 self.amiga_tempdir = None;
                 self.backup_folder_path = None;
+                self.release_open_device();
                 self.clear_results();
             }
             SourceEvent::Image { path, tempdir } => {
@@ -2582,12 +2587,14 @@ impl InspectTab {
                 self.backup_folder_path = None;
                 self.image_file_path = Some(path);
                 self.amiga_tempdir = tempdir;
+                self.release_open_device();
                 self.clear_results();
             }
             SourceEvent::BackupFolder(path) => {
                 self.backup_folder_path = Some(path);
                 self.selected_device_idx = None;
                 self.image_file_path = None;
+                self.release_open_device();
                 self.clear_results();
             }
             // Inspect's picker doesn't offer a host folder.
@@ -2606,6 +2613,7 @@ impl InspectTab {
     fn do_close(&mut self, ctx: &mut TabContext) {
         let was_backup = self.backup_folder_path.is_some();
         self.browse_view.close();
+        self.release_open_device();
         self.clear_results();
         self.selected_device_idx = None;
         self.prev_device_idx = None;
@@ -2679,15 +2687,23 @@ impl InspectTab {
         self.seekable_cache_files.clear();
         self.cache_status = None;
         self.inspect_status = None;
-        // Release the open device fd and disk claim (remounts the disk). The
-        // process-wide escalation cache holds a descriptor too, and that would
-        // keep the raw device open past this point and block a clean eject.
+        // Drop this tab's fd and claim, but never the process-wide escalation
+        // cache — that re-prompts on Re-inspect. `release_open_device` owns it.
         self.open_device_file = None;
         self.open_device_guard = None;
-        rusty_backup::os::release_elevated_devices(None);
         self.chd_image_path = None;
         self.cached_disk_size = None;
         self.single_file_chd_backup_folder = None;
+    }
+
+    /// Give up the escalated descriptor for the device this tab had open, so it
+    /// can eject. Scoped to that path — other tabs' devices keep theirs.
+    fn release_open_device(&mut self) {
+        self.open_device_file = None;
+        self.open_device_guard = None;
+        if let Some(path) = self.open_device_path.take() {
+            rusty_backup::os::release_elevated_devices(Some(&path.to_string_lossy()));
+        }
     }
 
     fn load_backup_metadata(&mut self, ctx: &mut TabContext) {
@@ -2789,6 +2805,17 @@ impl InspectTab {
         } else {
             return;
         };
+
+        // Remember which device this tab escalated, so closing releases exactly
+        // that one. Re-inspecting the same device keeps it — hence no re-prompt.
+        if remote.is_none() && rusty_backup::os::is_device_path(&path) {
+            if self.open_device_path.as_deref() != Some(path.as_path()) {
+                self.release_open_device();
+            }
+            self.open_device_path = Some(path.clone());
+        } else {
+            self.release_open_device();
+        }
 
         if remote.is_some() {
             ctx.log
@@ -3794,12 +3821,24 @@ impl InspectTab {
         // Calc min, and Check (fsck) all work over the block reader.
         let is_remote = self.remote_inspect.is_some();
 
+        let has_slots = self
+            .partition_table
+            .as_ref()
+            .is_some_and(|pt| pt.has_native_slots());
         egui::Grid::new("partition_table")
             .striped(true)
             .min_col_width(60.0)
             .show(ui, |ui| {
                 // Header
-                ui.label(egui::RichText::new("#").strong());
+                ui.label(egui::RichText::new("#").strong())
+                    .on_hover_text("Position in this list — the number `IMG@N` takes");
+                if has_slots {
+                    ui.label(egui::RichText::new("Slot").strong())
+                        .on_hover_text(
+                            "The partition table's own slot, as the platform names it \
+                         (diskutil's disk4s6, IRIX slot 0) — the number `IMG@sN` takes",
+                        );
+                }
                 ui.label(egui::RichText::new("Type").strong());
                 ui.label(egui::RichText::new("Volume").strong());
                 ui.label(egui::RichText::new("Start LBA").strong());
@@ -3822,16 +3861,29 @@ impl InspectTab {
                 ui.label(egui::RichText::new("").strong());
                 ui.end_row();
 
-                for part in &self.partitions {
+                for (pos, part) in self.partitions.iter().enumerate() {
+                    // Position, not `PartitionInfo::index`: this is the number
+                    // the user types back as `@N`. The slot goes in its own column.
                     let index_label = if part.is_logical {
-                        format!("  {} (logical)", part.index)
+                        format!("  {} (logical)", pos + 1)
                     } else if part.is_extended_container {
-                        format!("{} (container)", part.index)
+                        format!("{} (container)", pos + 1)
                     } else {
-                        format!("{}", part.index)
+                        format!("{}", pos + 1)
                     };
+                    let slot_label = self
+                        .partition_table
+                        .as_ref()
+                        .and_then(|pt| pt.native_slot(part))
+                        .map(|s| s.to_string())
+                        .unwrap_or_default();
                     if part.is_extended_container {
                         ui.label(egui::RichText::new(index_label).color(egui::Color32::GRAY));
+                        if has_slots {
+                            ui.label(
+                                egui::RichText::new(slot_label.clone()).color(egui::Color32::GRAY),
+                            );
+                        }
                         ui.label(egui::RichText::new(&part.type_name).color(egui::Color32::GRAY));
                         // Volume column — extended containers have no filesystem.
                         ui.label("");
@@ -3871,6 +3923,9 @@ impl InspectTab {
                         ui.label("");
                     } else {
                         ui.label(index_label);
+                        if has_slots {
+                            ui.label(slot_label);
+                        }
                         ui.label(&part.type_name);
                         // Volume column. Always probed live from the
                         // partition itself — never persisted to backup
