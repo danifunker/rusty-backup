@@ -51,7 +51,9 @@ draws it and feeds it keys. Main file: `src/cli/verbs/tui_app.rs`.
   **Import** (`i`), **metadata edit** (`m`: HFS/HFS+ Type/Creator + modified
   date), **bless** (`b`, with a confirmation naming the folder it replaces).
 - [x] **New Disk** — 3-step wizard (class → filesystem → path/size/name) driving
-  `cli::verbs::new::run` (Floppy + Volume; HD/CD-ROM noted as CLI-driven).
+  `cli::verbs::new::run` (Floppy + Volume) and, for the CD-ROM class,
+  `optical new {sgi-efs|mac-hfs|mac-hfsplus}` with a source folder, `auto`
+  sizing, and a Space-toggled `--expand-archives` row.
 - [x] **Backup** — source (image file or physical disk) → config (output/name/
   format/checksum) → run on a worker thread via `backup::run_backup` with the
   live progress bar; output identical to the `rb-cli backup` verb.

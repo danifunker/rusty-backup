@@ -61,6 +61,7 @@ pub mod jfs_fsck;
 pub mod layout_preserving;
 pub mod lisa;
 pub mod mac_alias;
+pub mod mac_archive_import;
 pub mod mac_scsi_bless;
 pub mod make_bootable;
 pub mod mem_archive;

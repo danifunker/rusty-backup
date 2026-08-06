@@ -41,10 +41,12 @@ pub struct ImportArgs {
     #[arg(default_value = "/")]
     pub dest: String,
 
-    /// Unpack tar archives found in the tree into a directory named after
-    /// each, instead of copying them in verbatim. Detected by content (the
-    /// `ustar` magic), so IRIX `.tardist` and oddly-named archives are found
-    /// and a gzipped disk image is not mistaken for one.
+    /// Unpack archives found in the tree into a directory named after each,
+    /// instead of copying them in verbatim. Two families: tar (detected by the
+    /// `ustar` magic, so IRIX `.tardist` and oddly-named archives are found and
+    /// a gzipped disk image is not mistaken for one) and classic Mac
+    /// (`.sit` / `.sea` / `.cpt` / `.hqx` / `.mar`, which land with both forks
+    /// and their Finder type/creator intact).
     #[arg(long = "expand-archives")]
     pub expand_archives: bool,
 
@@ -191,7 +193,7 @@ pub(crate) fn summarize(dir: &std::path::Path, dest: &str, stats: &ImportStats, 
         let archives = count_archives(dir);
         if archives > 0 {
             log_stderr(format!(
-                "  Info: {archives} tar archive(s) were copied in as files. \
+                "  Info: {archives} archive(s) were copied in as files. \
                  Pass --expand-archives to unpack them into the image instead."
             ));
         }
@@ -231,15 +233,19 @@ pub(crate) fn summarize(dir: &std::path::Path, dest: &str, stats: &ImportStats, 
     }
 }
 
-/// Shallow count of tar archives directly under `dir`, for the hint above.
-/// Deliberately not recursive: this is a nudge, not an audit, and sniffing
-/// every file in a deep tree after the import has already run is wasted work.
+/// Shallow count of expandable archives (tar or classic Mac) directly under
+/// `dir`, for the hint above. Deliberately not recursive: this is a nudge, not
+/// an audit, and sniffing every file in a deep tree after the import has
+/// already run is wasted work.
 fn count_archives(dir: &std::path::Path) -> usize {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return 0;
     };
     rd.flatten()
         .filter(|d| d.path().is_file())
-        .filter(|d| crate::fs::tar_import::looks_like_tar_archive(&d.path()))
+        .filter(|d| {
+            crate::fs::tar_import::looks_like_tar_archive(&d.path())
+                || crate::fs::mac_archive_import::looks_like_mac_archive(&d.path())
+        })
         .count()
 }

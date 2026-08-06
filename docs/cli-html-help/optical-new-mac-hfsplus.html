@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli optical new mac-hfsplus</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <a href="optical.html">optical</a> &raquo; <a href="optical-new.html">new</a> &raquo; <span>mac-hfsplus</span></nav>
+<h1><code>rb-cli optical new mac-hfsplus</code></h1>
+<p>Mac CD-ROM with an HFS+ (Mac OS Extended) volume instead of HFS — readable by Mac OS 8.1 and later. Same layout and flags as `mac-hfs`</p>
+<h2>Usage</h2>
+<pre><code>Usage: mac-hfsplus [OPTIONS] &lt;IMAGE&gt;</code></pre>
+<h2>Arguments</h2>
+<dl class="args">
+<dt><code>&lt;IMAGE&gt;</code></dt>
+<dd>Image file to create (conventionally `.iso`). Overwritten if it exists</dd>
+</dl>
+<h2>Options</h2>
+<dl class="args">
+<dt><code>--size</code></dt>
+<dd>Disc size (plain bytes or `K`/`M`/`G` suffixes, e.g. `600M`), or `auto` to size it to `--from-dir` plus filesystem overhead and headroom. Defaults to 600M (a CD-R); keep an explicit size at or below your target media (~650-700 MiB for a CD), and use `auto` for an image you intend to mount rather than burn</dd>
+<dt><code>--from-dir</code></dt>
+<dd>Populate the disc from this host directory after formatting it. The directory's *contents* land at the volume root</dd>
+<dt><code>--expand-archives</code></dt>
+<dd>With `--from-dir`: unpack archives found in the tree into a directory named after each, instead of copying them in verbatim. Classic Mac archives (`.sit`, `.sea`, `.cpt`, `.hqx`, `.mar`) land with both forks and their Finder type/creator intact — a disc the target Mac can run straight off, rather than one it has to unstuff first. Tar archives are unpacked too. `--size auto` measures what they unpack to</dd>
+<dt><code>--force</code></dt>
+<dd>With `--from-dir`: overwrite entries that already exist rather than failing on the collision</dd>
+<dt><code>--include-appledouble</code></dt>
+<dd>With `--from-dir`: import macOS AppleDouble sidecars (`._*`) too. Off by default because the resource fork they carry is imported into the Mac volume's own resource fork instead</dd>
+<dt><code>--name</code></dt>
+<dd>Volume name, as it appears on the Mac desktop. HFS truncates at 27 Mac Roman bytes. Defaults to `rusty-backup`</dd>
+<dt><code>--block-size</code></dt>
+<dd>Allocation block size in bytes. HFS wants a multiple of 512 and auto- picks the smallest that keeps the volume inside its 65535-block ceiling; HFS+ wants a power of two in [512, 4096] and defaults to 4096</dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_docs</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>

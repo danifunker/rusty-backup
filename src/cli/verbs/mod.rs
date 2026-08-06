@@ -36,6 +36,7 @@ pub mod make_bootable;
 pub mod menu;
 pub mod mkdir;
 pub mod new;
+pub mod new_mac_cdrom;
 pub mod new_partitioned_hd;
 pub mod new_sgi_cdrom;
 pub mod new_sgi_hdd;

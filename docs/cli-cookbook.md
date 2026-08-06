@@ -215,6 +215,20 @@ preflights paths against the live FS state, then applies all of them
 under one `sync_metadata` at the end — so partial failures don't leave
 the volume in a half-written state.
 
+**Want a CD-ROM instead of a bare volume?** Swap step 1 for
+`rb-cli optical new mac-hfs ~/Builds/disc.iso --size 600M --name "Boot
+Disk"` (or `mac-hfsplus` for Mac OS 8.1 and later) and address the volume
+as `disc.iso@1` from there on. That wraps the same HFS volume in an Apple
+Partition Map, which is what a Mac CD-ROM actually is; `--from-dir` fills
+it in the same command if you don't need per-file type/creator inference.
+No ISO 9660 side is written, so the disc is Mac-only.
+
+**A folder of `.sit` downloads?** Add `--expand-archives` (to `optical new`
+or to `import`) and they are unstuffed onto the volume rather than copied
+in packed — both forks and each file's Finder type/creator carried across,
+so the target Mac can run them without a copy of StuffIt Expander. With
+`--size auto` the disc is sized to what the archives *unpack* to.
+
 ## 5. Build an IRIX software CD from a folder of tardists
 
 **Goal.** You've collected `.tardist` packages for an SGI running IRIX

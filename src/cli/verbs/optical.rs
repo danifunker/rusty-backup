@@ -8,7 +8,8 @@
 //! - `convert` — re-encode an optical image (ISO ↔ BIN/CUE ↔ CHD)
 //! - `browse` — list files on an optical image (ISO9660 / Joliet / HFS)
 //! - `extract` — extract files from an optical image to a host folder
-//! - `new` — create a blank CD-ROM disc image (e.g. `new sgi-efs`)
+//! - `new` — create a blank CD-ROM disc image (`new sgi-efs`, `new mac-hfs`,
+//!   `new mac-hfsplus`)
 //!
 //! The GUI's interactive drive picker has no terminal equivalent; run
 //! `rb-cli optical drives` to find a drive path, then pass it as
@@ -85,6 +86,19 @@ pub enum OpticalNewCommand {
     /// blank for `import` / `put`.
     #[command(name = "sgi-efs")]
     SgiEfs(super::new_sgi_cdrom::NewSgiCdromArgs),
+
+    /// Classic Mac CD-ROM (`.iso`): an Apple Partition Map with one
+    /// `Apple_HFS` partition holding a blank HFS volume — what every Mac since
+    /// System 3 mounts. Pass `--from-dir` to fill it from a host folder in the
+    /// same step (`--size auto` then sizes the disc to fit); otherwise it comes
+    /// out blank for `import` / `put`. Mac-only: no ISO 9660 side is written.
+    #[command(name = "mac-hfs")]
+    MacHfs(super::new_mac_cdrom::NewMacCdromArgs),
+
+    /// Mac CD-ROM with an HFS+ (Mac OS Extended) volume instead of HFS —
+    /// readable by Mac OS 8.1 and later. Same layout and flags as `mac-hfs`.
+    #[command(name = "mac-hfsplus")]
+    MacHfsPlus(super::new_mac_cdrom::NewMacCdromArgs),
 }
 
 pub fn run(cmd: OpticalCommand) -> Result<()> {
@@ -102,8 +116,11 @@ pub fn run(cmd: OpticalCommand) -> Result<()> {
 }
 
 fn run_new(cmd: OpticalNewCommand) -> Result<()> {
+    use crate::partition::mac_cd_builder::MacCdFs;
     match cmd {
         OpticalNewCommand::SgiEfs(a) => super::new_sgi_cdrom::run(a),
+        OpticalNewCommand::MacHfs(a) => super::new_mac_cdrom::run(MacCdFs::Hfs, a),
+        OpticalNewCommand::MacHfsPlus(a) => super::new_mac_cdrom::run(MacCdFs::HfsPlus, a),
     }
 }
 

@@ -14,17 +14,9 @@ pub fn parse_size(s: &str) -> Result<u64> {
 }
 
 /// Pick the smallest 512-byte-multiple block size that keeps total_blocks
-/// at or below 65535 (the HFS limit).
-pub fn pick_block_size(volume_bytes: u64) -> u32 {
-    let mut bs: u32 = 512;
-    while volume_bytes / bs as u64 > 65535 {
-        bs = bs.saturating_mul(2);
-        if bs == 0 {
-            return 1 << 16;
-        }
-    }
-    bs
-}
+/// at or below 65535 (the HFS limit). Lives in the engine so the CD-ROM
+/// builder and the GUI reach it without going through the CLI module.
+pub use crate::fs::hfs::pick_block_size;
 
 /// Split an in-image path into its decoded components.
 ///
