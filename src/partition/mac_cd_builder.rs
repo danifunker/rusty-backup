@@ -236,6 +236,10 @@ pub fn write_mac_hfs_cd<W: Write + Seek>(sink: &mut W, opts: &MacCdOptions) -> R
 /// bytes (exactly `layout.disk_bytes`) plus the [`MacCdLayout`]. For real discs
 /// prefer [`write_mac_hfs_cd`], which streams to a file without allocating the
 /// whole image.
+///
+/// Only for small sizes: a `Vec` of a realistic disc size fails to allocate on
+/// the 32-bit CI leg, which aborts the whole test binary rather than failing
+/// one test. Anything past a few tens of MiB belongs in a sparse tempfile.
 pub fn build_mac_hfs_cd(opts: &MacCdOptions) -> Result<(Vec<u8>, MacCdLayout)> {
     let mut cursor = Cursor::new(Vec::new());
     let layout = write_mac_hfs_cd(&mut cursor, opts)?;
@@ -270,8 +274,10 @@ mod tests {
     /// that opens as classic HFS with an empty, correctly-named root.
     #[test]
     fn hfs_disc_detects_and_opens() {
+        // 16 MiB, not a disc-sized image: `open_volume` clones the bytes, so
+        // peak is twice this, and the 32-bit CI leg has a modest heap.
         let (img, layout) =
-            build_mac_hfs_cd(&MacCdOptions::new(64 * 1024 * 1024, "MacCD", MacCdFs::Hfs)).unwrap();
+            build_mac_hfs_cd(&MacCdOptions::new(16 * 1024 * 1024, "MacCD", MacCdFs::Hfs)).unwrap();
         assert_eq!(img.len() as u64, layout.disk_bytes);
         assert_eq!(layout.disk_sectors % 4, 0, "whole 2048-byte CD sectors");
         assert_eq!(layout.hfs_first_sector, 64);
@@ -288,7 +294,7 @@ mod tests {
     #[test]
     fn hfsplus_disc_detects_and_opens() {
         let (img, layout) = build_mac_hfs_cd(&MacCdOptions::new(
-            64 * 1024 * 1024,
+            16 * 1024 * 1024,
             "PlusCD",
             MacCdFs::HfsPlus,
         ))
@@ -308,7 +314,7 @@ mod tests {
     fn partition_exactly_covers_the_volume() {
         for fs in [MacCdFs::Hfs, MacCdFs::HfsPlus] {
             let (_img, layout) =
-                build_mac_hfs_cd(&MacCdOptions::new(32 * 1024 * 1024, "Exact", fs)).unwrap();
+                build_mac_hfs_cd(&MacCdOptions::new(8 * 1024 * 1024, "Exact", fs)).unwrap();
             assert_eq!(
                 layout.hfs_bytes() % layout.block_size as u64,
                 0,
@@ -345,17 +351,30 @@ mod tests {
     /// A 650 MiB HFS disc needs a block size above 512 to stay inside HFS's
     /// 16-bit allocation-block count; the auto pick handles that, and an
     /// explicit too-small block size is refused rather than mis-formatted.
+    ///
+    /// Streams into a sparse tempfile rather than building the image: a `Vec`
+    /// of a real disc size fails to allocate on the 32-bit CI leg and takes
+    /// the whole test binary down with it.
     #[test]
     fn hfs_block_size_is_picked_and_validated() {
         let big = 650 * 1024 * 1024;
-        let (_img, layout) =
-            build_mac_hfs_cd(&MacCdOptions::new(big, "Big", MacCdFs::Hfs)).unwrap();
+        let mut file = tempfile::tempfile().expect("tempfile");
+        let layout =
+            write_mac_hfs_cd(&mut file, &MacCdOptions::new(big, "Big", MacCdFs::Hfs)).unwrap();
+        // No `set_len`: only the metadata regions matter here, and reserving
+        // 650 MB of runner disk for a layout assertion is its own hazard.
         assert!(layout.block_size >= 16384, "auto block size scales up");
         assert!(layout.hfs_bytes() / layout.block_size as u64 <= 65535);
 
         let mut too_small = MacCdOptions::new(big, "Big", MacCdFs::Hfs);
         too_small.block_size = Some(512);
-        assert!(build_mac_hfs_cd(&too_small).is_err(), "65535-block ceiling");
+        // Refused while planning, so nothing is written and nothing allocated.
+        let mut sink = Cursor::new(Vec::new());
+        assert!(
+            write_mac_hfs_cd(&mut sink, &too_small).is_err(),
+            "65535-block ceiling"
+        );
+        assert!(sink.into_inner().is_empty(), "nothing written on refusal");
     }
 
     /// An HFS+ block size the formatter would assert on is rejected with a
