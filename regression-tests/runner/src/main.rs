@@ -1016,10 +1016,29 @@ fn probe_version(rb_cli: &Path) -> Option<String> {
     Some(out.stdout.trim().to_string())
 }
 
+/// Every result line and bundle directory is attributed to a host, and
+/// `consolidate` groups by it, so "unknown-host" from a second machine would
+/// quietly merge two hosts into one row. `COMPUTERNAME` is Windows-only and
+/// `HOSTNAME` is a shell variable most Unix shells never export, so the
+/// portable answer is to ask the system.
 fn hostname() -> String {
-    std::env::var("COMPUTERNAME")
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .unwrap_or_else(|_| "unknown-host".to_string())
+    if let Ok(h) = std::env::var("COMPUTERNAME") {
+        if !h.trim().is_empty() {
+            return h.trim().to_string();
+        }
+    }
+    if let Ok(h) = std::env::var("HOSTNAME") {
+        if !h.trim().is_empty() {
+            return h.trim().to_string();
+        }
+    }
+    if let Ok(out) = std::process::Command::new("hostname").output() {
+        let h = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !h.is_empty() {
+            return h;
+        }
+    }
+    "unknown-host".to_string()
 }
 
 /// UTC-ish stamp without pulling in a date crate. Seconds since the epoch
