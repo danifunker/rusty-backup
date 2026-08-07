@@ -1,6 +1,6 @@
 # Runbook — how to run a regression
 
-Accurate as of commit `bb20c16`. Everything below has been executed; nothing
+Accurate as of commit `b87d688`. Everything below has been executed; nothing
 here is aspirational. Where a thing does not exist yet it says so plainly,
 because a runbook that describes unimplemented features is worse than no
 runbook.
@@ -9,9 +9,12 @@ runbook.
 
 ## What exists today, in one line
 
-`rb-regress run` executes **68 cases across tiers 0-2 on one machine**. That
-is rb-cli checked against itself and against reference fixtures. **No
-third-party verification runs yet** — see § The run/verify split.
+`rb-regress run` executes **87 cases across tiers 0-2 on one machine**. That
+is rb-cli checked against itself and against reference fixtures.
+
+`rb-regress produce` builds **35 artifacts** and `rb-regress parity` compares
+them across producer OSes. Neither needs an oracle. **`verify` does not exist
+yet** — no third-party tool is invoked by anything. See § The run/verify split.
 
 ---
 
@@ -44,7 +47,7 @@ With the fixture corpus mounted, add:
 --fixture-root //NAS/share/rb-fixtures/fixtures
 ```
 
-Expect roughly: **68 cases, ~52 pass, ~16 fail**, under a minute. Every
+Expect roughly: **87 cases, ~69 pass, ~18 fail**, under a minute. Every
 failure maps to a finding in `docs/Regression_Bugs.md` — none are unknown.
 
 ---
@@ -97,6 +100,8 @@ existed.
 rb-regress list --tiers 0-2     # what would run, without running it
 rb-regress validate             # parse every manifest, report problems
 rb-regress plan                 # who produces / verifies what, and the gaps
+rb-regress produce              # build every artifact rb-cli can, into artifacts/<os>
+rb-regress parity               # compare those artifacts across producer OSes
 rb-regress query <name>         # ask the registry a question
 rb-regress export --check       # verify the committed JSON snapshot is current
 ```
@@ -128,17 +133,18 @@ true by construction. Do not skip the build step.
 
 ## The run/verify split
 
-**Today there is no split, because verification is not implemented.**
+**`produce` and `parity` exist. `verify` does not — no third-party tool is
+invoked by anything yet.**
 
 `run` executes cases. A case is a sequence of rb-cli invocations with
-assertions on exit codes, JSON envelope fields, and produced files. All 68
+assertions on exit codes, JSON envelope fields, and produced files. All 87
 current cases are tiers 0-2:
 
-- **tier 0** (23 cases) — rb-cli runs, exit codes and envelope shape hold
-- **tier 1** (26 cases) — rb-cli builds a volume and reads it back. A smoke
-  test only; per `README.md`, this proves nothing about format correctness
-  because a bug on both sides cancels out
-- **tier 2** (19 cases) — read third-party reference fixtures
+- **tier 0** — rb-cli runs, exit codes and envelope shape hold
+- **tier 1** — rb-cli builds a volume and reads it back. A smoke test only;
+  per `README.md`, this proves nothing about format correctness because a bug
+  on both sides cancels out
+- **tier 2** — read third-party reference fixtures
 
 Tiers 3-7 have **no case manifests**, and the case schema has **no oracle
 step** — there is no `[[case.oracle]]` block in `manifest.rs`. So nothing
@@ -206,27 +212,75 @@ byte ranges empirically, then compare across machines with those offsets
 masked. No per-format table to maintain, and any difference outside the
 volatile set is a genuine cross-OS divergence.
 
-### What is missing to make that real
+### What exists now
 
-1. `produce` — walk the registry, build every artifact rb-cli can, write
-   `meta.json` beside each.
-2. Volatile-range discovery (produce twice, diff) and the parity comparison.
-3. `verify` — walk the artifact queue, run the oracles this host has, record
-   verdicts and skip reasons.
-4. Read-parity comparison across hosts.
+`produce` and `parity` shipped 2026-08-07.
 
-(1) and (2) are useful on a single machine immediately — they catch
-determinism regressions — and become the cross-OS check the moment a second
-host runs them. (3) needs no remote execution to start: a host can verify
-artifacts it produced itself, and artifact trees can be synced by any means,
-including the NAS.
+```bash
+rb-regress produce --rb-cli ../../target/release/rb-cli   # -> artifacts/<os>/
+rb-regress parity                                          # compares artifacts/*/
+```
+
+`produce` walks `data/produce.toml` — the runnable argv behind each format's
+`builder` in `formats.toml` — and writes `artifacts/<os>/<format-id>/` holding
+the image and a self-contained `meta.json` (argv, sha256, producer OS + host,
+rb-cli build label, git sha, volatile ranges). Any `builder` with no recipe is
+listed at the end of the run, so an absent format is never mistaken for a
+covered one. **35 of 55 builders have recipes**; `produce` names the other 20
+every time it runs.
+
+The recipe file also carries the two shapes that needed more than an argv: a
+`pre` step, for the container formats that convert an image rather than format
+a volume and so need a source first, and `produces`, for `convert` — which
+takes a destination *folder* and names the output after its input.
+
+`parity` compares every unordered pair of producer OSes for each format, so
+three OSes give three comparisons and a single odd one out stays visible
+rather than being averaged away. It exits 1 on any divergence.
+
+`verify` and read-parity are still missing. `verify` needs no remote execution
+to start: a host can verify artifacts it produced itself, and artifact trees
+sync by any means, including the NAS. What it lacks is a runnable check per
+(oracle, format) pair — `oracles.toml` records `evidence` strings like
+`qemu-img info -> raw`, which describe a check rather than being one, so that
+file needs the same treatment `produce.toml` just gave `formats.toml`.
+
+### Volatile-range discovery is timing-sensitive, and that bites
+
+The two produce runs are **two passes over the whole recipe set at least three
+seconds apart**, not two back-to-back runs of one recipe. Measured 2026-08-07
+on Windows:
+
+| pairing | HFS | HFS+ | ext2 | NTFS |
+|---------|----:|-----:|-----:|-----:|
+| back-to-back | 0 | 0 | 4 | 0 |
+| 3 seconds apart | 6 | 10 | 13 | 0 |
+
+A fast builder writes both copies inside one clock tick, the embedded
+timestamp does not move, and the range is never discovered. That does not fail
+the run — it makes `parity` report a false divergence on the *next* host,
+which is worse. The 3-second floor clears both the one-second granularity
+HFS/ext use and a two-second DOS timestamp.
+
+Discovery still only finds a **lower bound**. Two samples seconds apart move
+the low byte of a seconds field and not the high ones, so hosts producing days
+apart can differ in bytes this never saw vary. `parity` handles that by
+reporting a divergence within 8 bytes of a known volatile range as *adjacent*
+and printing the count, rather than either calling it a finding or silently
+widening the mask.
 
 ---
 
 ## Known limitations, so nothing surprises you
 
-- **Tiers 3-7 do not exist.** `--tiers 0-6` selects the same 68 cases as
+- **Tiers 3-7 do not exist.** `--tiers 0-6` selects the same 87 cases as
   `--tiers 0-2`.
+- **`verify` does not exist.** `produce` and `parity` do; nothing runs an
+  oracle.
+- **20 builders have no produce recipe** and `fmt.vmdk-flat` cannot get one
+  yet — monolithicFlat is a descriptor plus a sibling `-flat.vmdk` extent, and
+  comparing the 301-byte descriptor alone would read as coverage. Multi-file
+  artifacts need supporting first.
 - **`--device-allowlist` does not exist.** `HARDWARE.md` describes it;
   `--allow-hardware` is a flag but no hardware cases are written, so it
   currently gates nothing.

@@ -78,6 +78,9 @@ dist/
 /regression-tests/scratch/
 /regression-tests/runs/
 /regression-tests/scans/
+# `produce` output. Binary, per-host, and regenerated on demand — the tree is
+# synced between hosts by any means (NAS, rsync), never through git.
+/regression-tests/artifacts/
 /regression-tests/runner/target/
 regression-tests/**/*.local.toml
 

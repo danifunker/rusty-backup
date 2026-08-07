@@ -14,7 +14,9 @@ mod exec;
 mod fixtures;
 mod gitinfo;
 mod manifest;
+mod parity;
 mod plan;
+mod produce;
 mod registry;
 mod report;
 
@@ -39,6 +41,7 @@ struct Args {
     require_clean: bool,
     check: bool,
     scratch_root: PathBuf,
+    artifacts_root: PathBuf,
     db: Option<PathBuf>,
 }
 
@@ -52,6 +55,10 @@ enum Command {
     Query(String),
     /// Map requirements onto the machines that exist.
     Plan,
+    /// Build every artifact rb-cli can write, on whatever OS is running.
+    Produce,
+    /// Compare artifacts produced on different OSes. Needs no oracle.
+    Parity(String),
     /// Merge results from many hosts/runs and report how far a regression got.
     Consolidate(String),
     Help,
@@ -102,7 +109,11 @@ fn parse_args() -> Result<Args, String> {
     let mut args = Args {
         command: Command::Help,
         cases_dir: base.join("cases"),
-        rb_cli: PathBuf::from(if cfg!(windows) { "rb-cli.exe" } else { "rb-cli" }),
+        rb_cli: PathBuf::from(if cfg!(windows) {
+            "rb-cli.exe"
+        } else {
+            "rb-cli"
+        }),
         fixture_root: None,
         report_root: base.join("runs"),
         tiers: BTreeSet::new(),
@@ -112,6 +123,7 @@ fn parse_args() -> Result<Args, String> {
         require_clean: false,
         check: false,
         scratch_root: base.join("scratch"),
+        artifacts_root: base.join("artifacts"),
         db: None,
     };
 
@@ -123,6 +135,14 @@ fn parse_args() -> Result<Args, String> {
             "list" => args.command = Command::List,
             "validate" => args.command = Command::Validate,
             "plan" => args.command = Command::Plan,
+            "produce" => args.command = Command::Produce,
+            "parity" => {
+                let root = raw.get(i + 1).cloned().unwrap_or_default();
+                if !root_is_flag(&root) {
+                    i += 1;
+                }
+                args.command = Command::Parity(root);
+            }
             "consolidate" => {
                 let root = raw.get(i + 1).cloned().unwrap_or_default();
                 if !root_is_flag(&root) {
@@ -168,6 +188,10 @@ fn parse_args() -> Result<Args, String> {
                         args.scratch_root = PathBuf::from(value()?);
                         i += 1;
                     }
+                    "--artifacts" => {
+                        args.artifacts_root = PathBuf::from(value()?);
+                        i += 1;
+                    }
                     "--filter" => {
                         args.filter = Some(value()?);
                         i += 1;
@@ -199,8 +223,14 @@ fn parse_tiers(spec: &str) -> Result<BTreeSet<u8>, String> {
             continue;
         }
         if let Some((lo, hi)) = part.split_once('-') {
-            let lo: u8 = lo.trim().parse().map_err(|_| format!("bad tier: {}", part))?;
-            let hi: u8 = hi.trim().parse().map_err(|_| format!("bad tier: {}", part))?;
+            let lo: u8 = lo
+                .trim()
+                .parse()
+                .map_err(|_| format!("bad tier: {}", part))?;
+            let hi: u8 = hi
+                .trim()
+                .parse()
+                .map_err(|_| format!("bad tier: {}", part))?;
             if lo > hi {
                 return Err(format!("bad tier range: {}", part));
             }
@@ -226,6 +256,8 @@ COMMANDS:
     list         List the cases that would run, without running them
     validate     Parse every manifest and report problems; runs nothing
     plan         Map requirements onto the machines that exist
+    produce      Build every artifact rb-cli can write, twice, into <artifacts>/<os>
+    parity       Compare artifacts across producer OSes; needs no oracle
     consolidate  Merge results from many hosts/runs; reports how far a regression got
     export       Write the normalised JSON snapshot of the registry
     query        Ask the registry a named question
@@ -236,6 +268,8 @@ OPTIONS:
     --fixture-root <DIR>   Fixture corpus root      [or RB_FIXTURE_ROOT, or local.toml]
     --report-root <DIR>    Where bundles are written[default: regression-tests/runs]
     --scratch-root <DIR>   Working directory root   [default: regression-tests/scratch]
+    --artifacts <DIR>      Artifact tree root       [default: regression-tests/artifacts]
+                           produce writes <DIR>/<os>; parity reads <DIR>
     --tiers <SPEC>         e.g. 0-6, or 0,1,5       [default: all]
     --filter <SUBSTR>      Only cases whose ID contains SUBSTR
     --allow-hardware       Permit cases that write to physical devices
@@ -270,9 +304,130 @@ fn main() {
         Command::Export => cmd_export(&args),
         Command::Query(ref q) => cmd_query(q),
         Command::Plan => cmd_plan(&args),
+        Command::Produce => cmd_produce(&args),
+        Command::Parity(ref root) => cmd_parity(&args, root),
         Command::Consolidate(ref root) => cmd_consolidate(&args, root),
     };
     std::process::exit(code);
+}
+
+/// `produce` writes into `<artifacts>/<platform>`, so every host can fill the
+/// same tree without coordinating and the result is still attributable.
+fn cmd_produce(args: &Args) -> i32 {
+    let base = regression_dir();
+    let recipes = match produce::load_recipes(&base.join("data").join("produce.toml")) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return 2;
+        }
+    };
+    let reg = match registry::Registry::load(&base) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return 2;
+        }
+    };
+    let known: std::collections::BTreeMap<String, String> = reg
+        .formats
+        .iter()
+        .map(|f| (f.id.clone(), f.name.clone()))
+        .collect();
+    let builders: std::collections::BTreeMap<String, String> = reg
+        .formats
+        .iter()
+        .filter_map(|f| f.builder.clone().map(|b| (f.id.clone(), b)))
+        .collect();
+
+    let repo = repo_root().unwrap_or_else(|| PathBuf::from("."));
+    let git_sha = gitinfo::head_sha(&repo).unwrap_or_default();
+    let dirty = gitinfo::dirty_files(&repo).unwrap_or_default();
+    if args.require_clean && !dirty.is_empty() {
+        eprintln!("error: working tree is dirty; refusing to produce with --require-clean");
+        eprintln!("  artifacts outlive the run that made them, so one built from an");
+        eprintln!("  uncommitted tree can never be traced back to a build.");
+        return 2;
+    }
+    let rb_version = match probe_version(&args.rb_cli) {
+        Some(v) => v,
+        None => {
+            eprintln!(
+                "error: could not run {} — nothing to produce with",
+                args.rb_cli.display()
+            );
+            return 2;
+        }
+    };
+    let build_label = gitinfo::build_label(&repo, &rb_version);
+
+    let out_root = args.artifacts_root.join(exec::platform_token());
+    let scratch = args.scratch_root.join("produce");
+    let report = match produce::produce(
+        &args.rb_cli,
+        &recipes,
+        &known,
+        &builders,
+        &out_root,
+        &scratch,
+        &hostname(),
+        &build_label,
+        &git_sha,
+        args.filter.as_deref(),
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return 2;
+        }
+    };
+
+    print!("{}", produce::render(&report, &out_root));
+    // A recipe that cannot build its artifact is a finding, so the exit code
+    // has to say so — a green produce is what lets `parity` and `verify` trust
+    // the tree.
+    let failed = report
+        .outcomes
+        .iter()
+        .filter(|(_, o)| matches!(o, produce::Outcome::Failed { .. }))
+        .count();
+    if failed > 0 {
+        1
+    } else {
+        0
+    }
+}
+
+fn cmd_parity(args: &Args, root: &str) -> i32 {
+    let root = if root_is_flag(root) {
+        args.artifacts_root.clone()
+    } else {
+        PathBuf::from(root)
+    };
+    match parity::parity(&root) {
+        Ok(r) => {
+            print!("{}", parity::render(&r));
+            let bad = r
+                .comparisons
+                .iter()
+                .filter(|c| {
+                    matches!(
+                        c.verdict,
+                        parity::Verdict::Differ { .. } | parity::Verdict::SizeDiffer { .. }
+                    )
+                })
+                .count();
+            if bad > 0 {
+                1
+            } else {
+                0
+            }
+        }
+        Err(e) => {
+            eprintln!("error: {}", e);
+            2
+        }
+    }
 }
 
 fn cmd_plan(_args: &Args) -> i32 {
@@ -317,21 +472,28 @@ fn cmd_export(args: &Args) -> i32 {
     // codegen treatment: regenerate, compare, report.
     if args.check {
         let current = fs::read_to_string(&path).unwrap_or_default();
-        let want = json + "
+        let want = json
+            + "
 ";
         if current == want {
             println!("{} is up to date", path.display());
             return 0;
         }
-        eprintln!("error: {} is stale — run `rb-regress export`", path.display());
+        eprintln!(
+            "error: {} is stale — run `rb-regress export`",
+            path.display()
+        );
         return 1;
     }
 
     if let Some(p) = path.parent() {
         let _ = fs::create_dir_all(p);
     }
-    if let Err(e) = fs::write(&path, json + "
-") {
+    if let Err(e) = fs::write(
+        &path,
+        json + "
+",
+    ) {
         eprintln!("error: writing {}: {}", path.display(), e);
         return 2;
     }
@@ -406,11 +568,20 @@ fn cmd_query(name: &str) -> i32 {
                 e.1 += f.bytes;
             }
             for (loc, (n, b)) in by_loc {
-                println!("{:<10} {:>4} fixtures  {:>8.1} MB", loc, n, b as f64 / 1048576.0);
+                println!(
+                    "{:<10} {:>4} fixtures  {:>8.1} MB",
+                    loc,
+                    n,
+                    b as f64 / 1048576.0
+                );
             }
         }
         other => {
-            eprintln!("unknown query '{}'; try one of: {}", other, NAMES.join(", "));
+            eprintln!(
+                "unknown query '{}'; try one of: {}",
+                other,
+                NAMES.join(", ")
+            );
             return 2;
         }
     }
@@ -586,7 +757,10 @@ fn cmd_run(args: &Args) -> i32 {
             run_id: String::new(),
             git_sha: String::new(),
             rb_version: String::new(),
-            case_id: format!("harness.manifest.{}", sanitise_id(&e.path.to_string_lossy())),
+            case_id: format!(
+                "harness.manifest.{}",
+                sanitise_id(&e.path.to_string_lossy())
+            ),
             group: "harness.manifest".to_string(),
             tier: 0,
             verdict: Verdict::Error,
@@ -608,7 +782,15 @@ fn cmd_run(args: &Args) -> i32 {
             if !selected(args, &case.id, tier) {
                 continue;
             }
-            let result = run_case(args, &catalog, &m.meta.group, tier, case, platform, &mut bundle);
+            let result = run_case(
+                args,
+                &catalog,
+                &m.meta.group,
+                tier,
+                case,
+                platform,
+                &mut bundle,
+            );
             *counts.entry(result.verdict.label()).or_insert(0) += 1;
             println!("{:<12} {}", result.verdict.label(), result.case_id);
             let _ = bundle.record(&result);
@@ -736,7 +918,8 @@ fn run_case(
                 let dst = scratch.join(name);
                 if let Err(e) = fs::copy(src, &dst) {
                     result.verdict = Verdict::Error;
-                    result.skip_reason = Some(format!("could not copy fixture into scratch: {}", e));
+                    result.skip_reason =
+                        Some(format!("could not copy fixture into scratch: {}", e));
                     result.duration_ms = started.elapsed().as_millis();
                     return result;
                 }
@@ -801,9 +984,7 @@ fn run_case(
                 &out.stdout,
                 &out.stderr,
                 &failures,
-                case.fixture
-                    .as_deref()
-                    .zip(fixture_path.as_deref()),
+                case.fixture.as_deref().zip(fixture_path.as_deref()),
             );
             result.failed_assertions = failures;
             result.duration_ms = started.elapsed().as_millis();
