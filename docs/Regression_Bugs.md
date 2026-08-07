@@ -1,4 +1,4 @@
-# Regression Findings (R-001 … R-017)
+# Regression Findings (R-001 … R-018)
 
 Defects and documentation drift turned up while building the regression suite
 (`regression-tests/`), 2026-08-01/02. The suite work was deliberately kept
@@ -20,6 +20,7 @@ finding depends on a fixture, the fixture is named.
 | ID | Severity | Area | Finding |
 |----|----------|------|---------|
 | [R-016](#r-016) | **High** | `src/cli/verbs/backup.rs` | `backup` accepts only flat-layout sources: CHD, dynamic VHD, QCOW2 and VMDK all fail |
+| [R-018](#r-018) | **Blocker** | `src/os/windows.rs` | The documented Rust-1.73 verification build does not compile on Windows |
 | ~~R-017~~ | ~~High~~ **FIXED** | `src/partition/mod.rs` | ~~Superfloppy detection also misses SFS (extends R-009)~~ — probe added 2026-08-07 |
 | [R-015](#r-015) | Medium | `src/optical/` (cue parser) | A `.cue` with unpadded track numbers (`TRACK 1`) is rejected |
 | ~~R-014~~ | ~~Blocker~~ **FIXED** | `src/cli/verbs/squashfs.rs` | ~~Pre-existing clippy failure blocks every commit via the pre-commit hook~~ — boxed 2026-08-07 |
@@ -41,6 +42,39 @@ finding depends on a fixture, the fixture is named.
 ---
 
 ## Blocker
+
+### R-018 — the vintage-build check does not compile on Windows {#r-018}
+
+CONTRIBUTING.md § "Rust 1.73 floor for engine code" gives this as the command
+to run before pushing any change under `src/`. It fails on a clean `HEAD`:
+
+```
+cargo build --manifest-path rb-cli-vintage/Cargo.toml \
+  --no-default-features --features native-zstd,remote,tui,rust173-polyfill \
+  --ignore-rust-version
+
+error[E0308]: mismatched types
+   --> ..\src\os\windows.rs:178:13    expected `PSID`, found `Option<PSID>`
+error[E0271]: type mismatch resolving `<Option<HWND> as TypeKind>::TypeKind == CopyType`
+   --> ..\src\os\windows.rs:233:9
+error: could not compile `rb-cli-vintage` (lib) due to 4 previous errors
+```
+
+Not a 1.73 std-API violation — a `windows`-crate version skew. The vintage
+manifest pins a release whose `CreateWellKnownSid` / `ShellExecuteW` take bare
+`PSID` / `HWND`, while `src/os/windows.rs` passes the `Option<..>` forms the
+modern crate wants. Both call sites are `#[cfg(windows)]`, so this is a
+Windows-only failure; the macOS-10.7 leg of the vintage target is unaffected,
+which is presumably why it has survived.
+
+The effect is that the *only* documented way to catch a 1.73 violation is
+itself red on Windows, so a real violation is indistinguishable from this
+noise and the check gets skipped. Both call sites need a `#[cfg]`-split shim
+in `src/os/windows.rs`, the same pattern `crate::compat` already uses.
+
+Confirmed pre-existing: identical four errors with all local work stashed.
+
+Discovered 2026-08-07 running the check after the R-009 / R-017 fix.
 
 ### R-014 — clippy fails on `SquashfsCommand`, blocking every commit {#r-014}
 
@@ -587,6 +621,8 @@ already works.
 - **R-011** — only the working half is pinned. No case asserts that
   copy-protected G64 dumps open, because whether they should is undecided;
   asserting either way would prejudge it.
+- **R-018** — a build-configuration failure, not runtime behaviour, and the
+  suite runs the modern binary.
 - **R-014** — a lint failure, not runtime behaviour. The pre-commit hook is
   itself the regression guard: it runs `clippy --all-targets -- -D warnings`
   on every commit, so a reintroduction cannot be committed.
@@ -594,6 +630,7 @@ already works.
 ## Suggested order
 
 0. ~~**R-014**~~ — done; commits work without `--no-verify` again.
+0b. **R-018** — until this clears, no 1.73 violation can be caught on Windows.
 1. ~~**R-009** / **R-017**~~ — done; five filesystems' worth of tier-2
    coverage went green.
 2. **R-008b** — a panic with no file produced is the worst failure mode here,
