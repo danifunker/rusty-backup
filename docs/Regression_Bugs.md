@@ -1,9 +1,11 @@
-# Regression Findings (R-001 … R-013)
+# Regression Findings (R-001 … R-017)
 
 Defects and documentation drift turned up while building the regression suite
-(`regression-tests/`), 2026-08-01/02. **None of these have been fixed** — the
-suite work was deliberately kept separate from bug fixing, and nothing outside
-`regression-tests/` was modified while finding them.
+(`regression-tests/`), 2026-08-01/02. The suite work was deliberately kept
+separate from bug fixing, and nothing outside `regression-tests/` was modified
+while finding them. Fixes land afterwards, one finding at a time; a fixed entry
+is struck through in the table and keeps its original report below the
+**FIXED** note, so the reproduction stays readable.
 
 Capability gaps — things the engine never claimed to do — are tracked
 separately in [`missing_features_from_regression.md`](missing_features_from_regression.md).
@@ -20,7 +22,7 @@ finding depends on a fixture, the fixture is named.
 | [R-016](#r-016) | **High** | `src/cli/verbs/backup.rs` | `backup` accepts only flat-layout sources: CHD, dynamic VHD, QCOW2 and VMDK all fail |
 | [R-017](#r-017) | **High** | `src/partition/mod.rs` | Superfloppy detection also misses SFS (extends R-009) |
 | [R-015](#r-015) | Medium | `src/optical/` (cue parser) | A `.cue` with unpadded track numbers (`TRACK 1`) is rejected |
-| [R-014](#r-014) | **Blocker** | `src/cli/verbs/squashfs.rs` | Pre-existing clippy failure blocks every commit via the pre-commit hook |
+| ~~R-014~~ | ~~Blocker~~ **FIXED** | `src/cli/verbs/squashfs.rs` | ~~Pre-existing clippy failure blocks every commit via the pre-commit hook~~ — boxed 2026-08-07 |
 | [R-008b](#r-008b) | **High** | `src/fs/affs.rs` | `new volume affs --size 4M` panics; no file produced, exit 101 |
 | ~~R-007~~ | ~~High~~ **FIXED** | `src/fs/ntfs_format.rs` | ~~Freshly formatted NTFS fails its own fsck~~ — verified clean 2026-08-07 |
 | [R-009](#r-009) | **High** | `src/partition/mod.rs` | Bare JFS / UFS1 / UFS2 / ReiserFS images cannot be opened at all |
@@ -41,6 +43,14 @@ finding depends on a fixture, the fixture is named.
 ## Blocker
 
 ### R-014 — clippy fails on `SquashfsCommand`, blocking every commit {#r-014}
+
+**FIXED 2026-08-07.** `Put` now holds a `Box<SquashfsPutArgs>`; clippy's own
+suggestion, applied verbatim. `cargo clippy --all-targets -- -D warnings`
+passes clean — boxing only `Put` did *not* move the complaint to `Rm`, so the
+192-byte variant was left alone. clap parses the boxed variant unchanged
+(`clap::Args` is implemented for `Box<T>`), and the single match arm needed no
+edit: `Box` supports the partial field moves it already did. Original report
+follows.
 
 `cargo clippy --all-targets -- -D warnings` fails on a clean tree:
 
@@ -77,13 +87,14 @@ Put(Box<SquashfsPutArgs>),
 simply move the complaint to the next-largest variant — worth checking the
 lint passes rather than assuming.
 
-Not fixed here: this file is engine code, and the session that found it was
-scoped to `regression-tests/` with an explicit instruction not to change
-anything outside it. Flagging rather than silently widening that scope.
+Not fixed when found: this file is engine code, and the session that found it
+was scoped to `regression-tests/` with an explicit instruction not to change
+anything outside it. Flagged rather than silently widening that scope, then
+fixed in the following session once the scope was lifted.
 
 Discovered 2026-08-07 while committing `tests/cli_suite/cli_native_slots.rs`,
-which is written, passing and mutation-verified but cannot be committed until
-this clears.
+which was written, passing and mutation-verified but could not be committed
+until this cleared.
 
 ---
 
@@ -549,11 +560,13 @@ already works.
 - **R-011** — only the working half is pinned. No case asserts that
   copy-protected G64 dumps open, because whether they should is undecided;
   asserting either way would prejudge it.
-- **R-014** — a lint failure, not runtime behaviour.
+- **R-014** — a lint failure, not runtime behaviour. The pre-commit hook is
+  itself the regression guard: it runs `clippy --all-targets -- -D warnings`
+  on every commit, so a reintroduction cannot be committed.
 
 ## Suggested order
 
-0. **R-014** — nothing else can be committed until this clears.
+0. ~~**R-014**~~ — done; commits work without `--no-verify` again.
 1. **R-008b** — a panic with no file produced is the worst failure mode here,
    and R-008a shares its fix.
 2. **R-009** — smallest change of the high-severity set; unlocks four

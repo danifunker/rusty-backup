@@ -30,7 +30,7 @@ pub enum SquashfsCommand {
     /// compressed — the numbers a size budget is chosen from. Writes nothing.
     Plan(SquashfsPlanArgs),
     /// Copy a host file into the image, rebuilding it within a size budget.
-    Put(SquashfsPutArgs),
+    Put(Box<SquashfsPutArgs>),
     /// Delete a path from the image, rebuilding it within a size budget.
     Rm(SquashfsRmArgs),
     /// Build a new SquashFS image from a host directory, as `mksquashfs` does.
