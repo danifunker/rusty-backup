@@ -39,10 +39,23 @@ use crate::exec;
 
 const PRODUCE_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Minimum separation between the two produce passes. Three seconds clears
-/// both the one-second granularity HFS/ext use and the two-second granularity
-/// of a DOS timestamp, with a tick to spare.
-const MIN_GAP: Duration = Duration::from_secs(3);
+/// Minimum separation between the two produce passes.
+///
+/// Was three seconds, which cleared the one-second granularity HFS/ext use and
+/// the two-second DOS timestamp. ProDOS then proved that insufficient: it
+/// stamps the volume directory header to the **minute**, so both passes landed
+/// in the same minute, `produce` recorded it as byte-deterministic, and the
+/// first three-OS `parity` run reported a one-byte cross-OS divergence that was
+/// nothing but the clock. A false finding is the expensive kind.
+///
+/// Sixty-five seconds guarantees a minute boundary is crossed. Once the minute
+/// byte is discovered, the ±8-byte adjacency rule in `parity` covers the hour
+/// and date bytes beside it, so the whole field is handled by finding one byte
+/// of it. Coarser fields than a minute — an hour-granularity stamp — remain out
+/// of reach by this method and would need declaring via `expect_divergence`.
+///
+/// The cost is one sleep per produce run, not per recipe.
+const MIN_GAP: Duration = Duration::from_secs(65);
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Recipe {
