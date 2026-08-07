@@ -113,11 +113,7 @@ fn parse_args() -> Result<Args, String> {
     let mut args = Args {
         command: Command::Help,
         cases_dir: base.join("cases"),
-        rb_cli: PathBuf::from(if cfg!(windows) {
-            "rb-cli.exe"
-        } else {
-            "rb-cli"
-        }),
+        rb_cli: default_rb_cli(&base),
         fixture_root: None,
         report_root: base.join("runs"),
         tiers: BTreeSet::new(),
@@ -224,11 +220,7 @@ fn parse_args() -> Result<Args, String> {
     // Cases and recipes all run with a scratch directory as cwd, so anything
     // that becomes a program path or is handed to a subprocess must be
     // absolute before it gets there. See exec::absolutise.
-    // A bare name like `rb-cli` is a PATH lookup, not a path; absolutising it
-    // would turn it into <cwd>/rb-cli and break the default.
-    if args.rb_cli.components().count() > 1 {
-        args.rb_cli = exec::absolutise(&args.rb_cli);
-    }
+    args.rb_cli = exec::absolutise(&args.rb_cli);
     args.scratch_root = exec::absolutise(&args.scratch_root);
     args.artifacts_root = exec::absolutise(&args.artifacts_root);
     args.verifications_root = exec::absolutise(&args.verifications_root);
@@ -287,7 +279,11 @@ COMMANDS:
 
 OPTIONS:
     --cases <DIR>          Case manifests           [default: regression-tests/cases]
-    --rb-cli <PATH>        Binary under test        [default: rb-cli from PATH]
+    --rb-cli <PATH>        Binary under test        [default: <repo>/target/release/rb-cli]
+                           Always resolved to an absolute path. run and produce
+                           print it with its version and refuse to start if it
+                           is missing; they warn if it is not a release build or
+                           is older than the sources in the tree.
     --fixture-root <DIR>   Fixture corpus root      [or RB_FIXTURE_ROOT, or local.toml]
     --report-root <DIR>    Where bundles are written[default: regression-tests/runs]
     --scratch-root <DIR>   Working directory root   [default: regression-tests/scratch]
@@ -375,16 +371,14 @@ fn cmd_produce(args: &Args) -> i32 {
         eprintln!("  uncommitted tree can never be traced back to a build.");
         return 2;
     }
-    let rb_version = match probe_version(&args.rb_cli) {
-        Some(v) => v,
-        None => {
-            eprintln!(
-                "error: could not run {} — nothing to produce with",
-                args.rb_cli.display()
-            );
+    match preflight(&args.rb_cli, &repo) {
+        Ok(banner) => print!("{}", banner),
+        Err(e) => {
+            eprintln!("error: {}", e);
             return 2;
         }
-    };
+    }
+    let rb_version = probe_version(&args.rb_cli).unwrap_or_else(|| "unknown".to_string());
     let build_label = gitinfo::build_label(&repo, &rb_version);
 
     let out_root = args.artifacts_root.join(exec::platform_token());
@@ -772,14 +766,14 @@ fn cmd_run(args: &Args) -> i32 {
         );
     }
 
-    let rb_version = probe_version(&args.rb_cli);
-    if rb_version.is_none() {
-        eprintln!(
-            "error: could not run {} — nothing to test",
-            args.rb_cli.display()
-        );
-        return 2;
+    match preflight(&args.rb_cli, &repo) {
+        Ok(banner) => print!("{}", banner),
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return 2;
+        }
     }
+    let rb_version = probe_version(&args.rb_cli);
 
     let build_label = gitinfo::build_label(&repo, rb_version.as_deref().unwrap_or("unknown"));
     let identity = RunIdentity {
@@ -1064,6 +1058,99 @@ fn run_case(
         let _ = fs::remove_dir_all(&scratch);
     }
     result
+}
+
+/// The binary under test, as an absolute path into the repo's **release**
+/// target directory.
+///
+/// It used to be a bare `rb-cli`, i.e. a PATH lookup, which meant the harness
+/// could test whichever build happened to be on PATH — or, once cases started
+/// running in a scratch cwd, nothing at all. An absolute default makes the
+/// answer to "what did we just test?" a property of the path rather than of
+/// the caller's shell.
+fn default_rb_cli(regression_dir: &Path) -> PathBuf {
+    let repo = regression_dir
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    repo.join("target").join("release").join(if cfg!(windows) {
+        "rb-cli.exe"
+    } else {
+        "rb-cli"
+    })
+}
+
+/// Newest mtime under `src/`, so a binary older than the sources it was built
+/// from can be called out.
+fn newest_source_mtime(repo: &Path) -> Option<SystemTime> {
+    fn walk(dir: &Path, newest: &mut Option<SystemTime>) {
+        let entries = match fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, newest);
+            } else if p.extension().map(|x| x == "rs").unwrap_or(false) {
+                if let Ok(m) = e.metadata().and_then(|m| m.modified()) {
+                    if newest.map(|n| m > n).unwrap_or(true) {
+                        *newest = Some(m);
+                    }
+                }
+            }
+        }
+    }
+    let mut newest = None;
+    walk(&repo.join("src"), &mut newest);
+    newest
+}
+
+/// What is about to be tested, checked and printed before anything runs.
+///
+/// The harness cannot tell a stale binary from a current one by looking at it —
+/// rb-cli does not bake its commit into `--version` — so this checks the three
+/// things that can be checked: the binary exists where we say, it runs and
+/// reports a version, and it is not older than the sources in the tree. A run
+/// against a month-old binary produces a full report that describes nothing
+/// anyone can act on, and nothing in the output would have said so.
+fn preflight(rb_cli: &Path, repo: &Path) -> Result<String, String> {
+    if !rb_cli.is_file() {
+        return Err(format!(
+            "no rb-cli at {}
+  build it first:  cargo build --release --bin rb-cli",
+            rb_cli.display()
+        ));
+    }
+    let version = probe_version(rb_cli)
+        .ok_or_else(|| format!("{} exists but will not run --version", rb_cli.display()))?;
+
+    let mut notes = Vec::new();
+    // A debug build is a different program: different assertions, different
+    // timing, and every published number assumes release.
+    if !rb_cli.to_string_lossy().replace('\\', "/").contains("/release/") {
+        notes.push("WARNING: not a /release/ build — results will not be comparable".to_string());
+    }
+    if let (Ok(bin), Some(src)) = (
+        rb_cli.metadata().and_then(|m| m.modified()),
+        newest_source_mtime(repo),
+    ) {
+        if src > bin {
+            notes.push(
+                "WARNING: sources under src/ are newer than this binary; rebuild, or the run describes a build that no longer exists"
+                    .to_string(),
+            );
+        }
+    }
+
+    let mut s = format!("rb-cli   : {}
+version  : {}
+", rb_cli.display(), version);
+    for n in notes {
+        s.push_str(&format!("{}
+", n));
+    }
+    Ok(s)
 }
 
 fn probe_version(rb_cli: &Path) -> Option<String> {

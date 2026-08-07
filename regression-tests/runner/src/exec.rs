@@ -151,12 +151,44 @@ pub fn tool_available(tool: &str) -> bool {
 /// and cannot launch anything on Linux or macOS. Absolutising at the boundary
 /// makes the two agree.
 pub fn absolutise(p: &Path) -> PathBuf {
-    if p.is_absolute() {
-        return p.to_path_buf();
+    let joined = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(p))
+            .unwrap_or_else(|_| p.to_path_buf())
+    };
+    lexically_normalise(&joined)
+}
+
+/// Collapse `.` and `..` without touching the filesystem, so a resolved path
+/// reads as one place rather than as directions to it. Purely lexical: it must
+/// work for paths that do not exist yet, which is most of what `produce` and
+/// the scratch tree deal in.
+fn lexically_normalise(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // Only pop a real directory name; popping past a root or a
+                // Windows prefix would silently rewrite the path.
+                let poppable = out
+                    .components()
+                    .next_back()
+                    .map(|c| matches!(c, Component::Normal(_)))
+                    .unwrap_or(false);
+                if poppable {
+                    out.pop();
+                } else {
+                    out.push(c.as_os_str());
+                }
+            }
+            _ => out.push(c.as_os_str()),
+        }
     }
-    std::env::current_dir()
-        .map(|cwd| cwd.join(p))
-        .unwrap_or_else(|_| p.to_path_buf())
+    out
 }
 
 /// Short platform token used by `platforms` filters and report directory
