@@ -54,6 +54,10 @@ pub struct Recipe {
     #[serde(default)]
     pub pre: Vec<Vec<String>>,
     pub args: Vec<String>,
+    /// Byte ranges this format is *expected* to differ in across producer
+    /// OSes, with a reason. See [`ExpectedDivergence`].
+    #[serde(default)]
+    pub expect_divergence: Vec<ExpectedDivergence>,
     /// Where the artifact actually lands, when the verb does not write to
     /// `{out}` directly. `convert` takes a destination *folder* and names the
     /// file after its input, so those recipes point here instead.
@@ -65,6 +69,40 @@ pub struct Recipe {
 struct RecipeFile {
     #[serde(default)]
     recipe: Vec<Recipe>,
+}
+
+/// A range a format is allowed to differ in between producer OSes, declared
+/// up front with a reason.
+///
+/// Distinct from a volatile range, which `produce` discovers by building twice
+/// on one machine. This is the opposite: a difference that will *never* show up
+/// that way, because it is stable on any single host and varies only by which
+/// host built it — VHD's Creator Host OS field being the case that prompted it
+/// (R-019). Declaring it keeps `parity` honest in both directions: the
+/// divergence stops being reported as a finding, and it stays visible and
+/// attributed rather than being silently swallowed by a widened mask.
+///
+/// Give exactly one of `at` (absolute) or `from_end` (offset back from EOF).
+/// `from_end` exists because container footers are anchored to the end of the
+/// file, so an absolute offset would be wrong the moment a recipe's size
+/// changes.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ExpectedDivergence {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_end: Option<u64>,
+    pub len: u64,
+    pub reason: String,
+}
+
+/// An `ExpectedDivergence` resolved against a real artifact, so `meta.json`
+/// stays self-contained and `parity` never needs the recipe file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExpectedRange {
+    pub start: u64,
+    pub end: u64,
+    pub reason: String,
 }
 
 /// A byte range that differed between two runs of the same recipe on the same
@@ -92,6 +130,9 @@ pub struct ArtifactMeta {
     pub size: u64,
     /// Empty means the recipe is byte-deterministic on this build.
     pub volatile: Vec<VolatileRange>,
+    /// Declared cross-OS differences, resolved against this artifact's size.
+    #[serde(default)]
+    pub expected: Vec<ExpectedRange>,
     /// Set when the two runs produced different *sizes*, which makes range
     /// discovery meaningless — the artifact is kept but parity must skip it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -153,6 +194,33 @@ pub fn diff_ranges(a: &[u8], b: &[u8]) -> Vec<VolatileRange> {
             start,
             end: a.len().min(b.len()) as u64,
         });
+    }
+    out
+}
+
+/// Turn declared ranges into absolute ones for an artifact of `size` bytes.
+/// A range that would fall outside the file is dropped rather than clamped —
+/// a mis-declared offset should stop masking anything, not mask the wrong
+/// bytes.
+fn resolve_expected(decls: &[ExpectedDivergence], size: u64) -> Vec<ExpectedRange> {
+    let mut out = Vec::new();
+    for d in decls {
+        let start = match (d.at, d.from_end) {
+            (Some(a), None) => a,
+            (None, Some(f)) => match size.checked_sub(f) {
+                Some(v) => v,
+                None => continue,
+            },
+            _ => continue,
+        };
+        let end = start.saturating_add(d.len);
+        if end <= size {
+            out.push(ExpectedRange {
+                start,
+                end,
+                reason: d.reason.clone(),
+            });
+        }
     }
     out
 }
@@ -305,6 +373,7 @@ pub fn produce(
             sha256: sha256_hex(&bytes_a),
             size: bytes_a.len() as u64,
             volatile,
+            expected: resolve_expected(&recipe.expect_divergence, bytes_a.len() as u64),
             nondeterministic: if unstable {
                 Some(format!(
                     "two runs produced {} and {} bytes",
@@ -440,6 +509,30 @@ mod tests {
         assert_eq!(r.len(), 2);
         assert_eq!((r[0].start, r[0].end), (1, 3));
         assert_eq!((r[1].start, r[1].end), (5, 6));
+    }
+
+    #[test]
+    fn from_end_resolves_against_the_artifact_size() {
+        // A VHD footer is the last 512 bytes; Creator Host OS sits at +0x24.
+        let d = ExpectedDivergence {
+            at: None,
+            from_end: Some(476),
+            len: 4,
+            reason: "r".into(),
+        };
+        let r = resolve_expected(&[d], 2_097_664);
+        assert_eq!((r[0].start, r[0].end), (0x0020_0024, 0x0020_0028));
+    }
+
+    #[test]
+    fn a_range_past_the_end_is_dropped_not_clamped() {
+        let d = ExpectedDivergence {
+            at: Some(90),
+            from_end: None,
+            len: 20,
+            reason: "r".into(),
+        };
+        assert!(resolve_expected(&[d], 100).is_empty());
     }
 
     #[test]

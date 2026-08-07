@@ -206,6 +206,13 @@ ext = "vhd"
 pre = [["new", "volume", "fat", "--size", "2M", "{work}/src.img"]]
 args = ["convert", "{work}/src.img", "{work}/out", "--format", "vhd"]
 produces = "{work}/out/src.vhd"
+# The footer is the last 512 bytes, so 512 - 0x24 = 476 back from EOF. Anchored
+# to the end rather than an absolute offset, which would go wrong the moment the
+# recipe's --size changes.
+[[recipe.expect_divergence]]
+from_end = 476
+len = 4
+reason = "VHD footer offset 0x24 is Creator Host OS: macOS writes \"Mac \", Windows and Linux write \"Wi2k\". Deliberate and spec-legal (R-019); the field records the creating host by design."
 
 [[recipe]]
 id = "fmt.vhd-dynamic"
@@ -213,6 +220,16 @@ ext = "vhd"
 pre = [["new", "volume", "fat", "--size", "2M", "{work}/src.img"]]
 args = ["convert", "{work}/src.img", "{work}/out", "--format", "vhd-dynamic"]
 produces = "{work}/out/src.vhd"
+# A dynamic VHD carries the footer twice — a copy at byte 0 and the real one at
+# EOF - 512 — so the same field diverges in both places, eight bytes total.
+[[recipe.expect_divergence]]
+at = 0x24
+len = 4
+reason = "VHD footer offset 0x24 is Creator Host OS: macOS writes \"Mac \", Windows and Linux write \"Wi2k\". Deliberate and spec-legal (R-019); the field records the creating host by design."
+[[recipe.expect_divergence]]
+from_end = 476
+len = 4
+reason = "VHD footer offset 0x24 is Creator Host OS: macOS writes \"Mac \", Windows and Linux write \"Wi2k\". Deliberate and spec-legal (R-019); the field records the creating host by design."
 
 [[recipe]]
 id = "fmt.qcow2"

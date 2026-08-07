@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::produce::{ArtifactMeta, VolatileRange};
+use crate::produce::{ArtifactMeta, ExpectedRange, VolatileRange};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Divergence {
@@ -42,9 +42,13 @@ const ADJACENCY: u64 = 8;
 
 #[derive(Debug, Clone, Serialize)]
 pub enum Verdict {
-    /// Bytes agree once volatile ranges are masked.
+    /// Bytes agree once volatile and declared-expected ranges are masked.
     Match {
         masked_bytes: u64,
+        /// Differed inside a range the recipe declares as an expected cross-OS
+        /// difference. Counted and named, never silent.
+        expected_bytes: u64,
+        expected_reasons: Vec<String>,
         /// Differed, but within [`ADJACENCY`] of a volatile range — almost
         /// certainly the untravelled half of a timestamp. Reported, not
         /// counted as a divergence, so the distinction stays visible.
@@ -54,6 +58,7 @@ pub enum Verdict {
     Differ {
         diverged_bytes: u64,
         adjacent_bytes: u64,
+        expected_bytes: u64,
         first: Vec<Divergence>,
     },
     /// Different lengths — a divergence too, and a louder one.
@@ -86,6 +91,13 @@ struct Loaded {
 /// True when `offset` falls inside any range.
 fn masked(ranges: &[VolatileRange], offset: u64) -> bool {
     ranges.iter().any(|r| offset >= r.start && offset < r.end)
+}
+
+/// The declared range covering `offset`, if any.
+fn expected_at(ranges: &[ExpectedRange], offset: u64) -> Option<&ExpectedRange> {
+    ranges
+        .iter()
+        .find(|r| offset >= r.start && offset < r.end)
 }
 
 /// True when `offset` sits within [`ADJACENCY`] of any range without being in
@@ -149,6 +161,8 @@ fn compare(left: &Loaded, right: &Loaded) -> Verdict {
     let mut diverged = 0u64;
     let mut masked_bytes = 0u64;
     let mut adjacent_bytes = 0u64;
+    let mut expected_bytes = 0u64;
+    let mut expected_reasons: Vec<String> = Vec::new();
     let mut first = Vec::new();
     for i in 0..left.bytes.len() {
         if left.bytes[i] == right.bytes[i] {
@@ -157,6 +171,17 @@ fn compare(left: &Loaded, right: &Loaded) -> Verdict {
         let off = i as u64;
         if masked(&left.meta.volatile, off) || masked(&right.meta.volatile, off) {
             masked_bytes += 1;
+            continue;
+        }
+        // Declared on either side: an artifact produced before the declaration
+        // existed should not turn its counterpart's exemption into a finding.
+        if let Some(r) =
+            expected_at(&left.meta.expected, off).or_else(|| expected_at(&right.meta.expected, off))
+        {
+            expected_bytes += 1;
+            if !expected_reasons.contains(&r.reason) {
+                expected_reasons.push(r.reason.clone());
+            }
             continue;
         }
         if adjacent(&left.meta.volatile, off) || adjacent(&right.meta.volatile, off) {
@@ -179,11 +204,14 @@ fn compare(left: &Loaded, right: &Loaded) -> Verdict {
         Verdict::Match {
             masked_bytes,
             adjacent_bytes,
+            expected_bytes,
+            expected_reasons,
         }
     } else {
         Verdict::Differ {
             diverged_bytes: diverged,
             adjacent_bytes,
+            expected_bytes,
             first,
         }
     }
@@ -268,21 +296,39 @@ pub fn render(report: &Report) -> String {
             Verdict::Match {
                 masked_bytes,
                 adjacent_bytes,
+                expected_bytes,
+                expected_reasons,
             } => {
                 ok += 1;
-                let note = match (*masked_bytes, *adjacent_bytes) {
-                    (0, 0) => "identical".to_string(),
-                    (m, 0) => format!("identical outside {} masked byte(s)", m),
-                    (m, a) => format!("identical outside {} masked + {} adjacent byte(s)", m, a),
+                let mut parts = Vec::new();
+                if *masked_bytes > 0 {
+                    parts.push(format!("{} masked", masked_bytes));
+                }
+                if *adjacent_bytes > 0 {
+                    parts.push(format!("{} adjacent", adjacent_bytes));
+                }
+                if *expected_bytes > 0 {
+                    parts.push(format!("{} expected", expected_bytes));
+                }
+                let note = if parts.is_empty() {
+                    "identical".to_string()
+                } else {
+                    format!("identical outside {} byte(s)", parts.join(" + "))
                 };
                 s.push_str(&format!(
                     "ok    {:<24} {} vs {}  {}\n",
                     c.format, c.left_os, c.right_os, note
                 ));
+                // Naming the reason is the whole point of declaring it; an
+                // unexplained exemption is just a quieter blind spot.
+                for r in expected_reasons {
+                    s.push_str(&format!("        expected: {}\n", r));
+                }
             }
             Verdict::Differ {
                 diverged_bytes,
                 adjacent_bytes: _,
+                expected_bytes: _,
                 first,
             } => {
                 bad += 1;
@@ -349,6 +395,7 @@ mod tests {
                 sha256: String::new(),
                 size: bytes.len() as u64,
                 volatile,
+                expected: Vec::new(),
                 nondeterministic: None,
             },
             bytes: bytes.to_vec(),
@@ -397,6 +444,7 @@ mod tests {
             Verdict::Match {
                 masked_bytes,
                 adjacent_bytes,
+                ..
             } => {
                 assert_eq!(masked_bytes, 1);
                 assert_eq!(adjacent_bytes, 1);
@@ -413,6 +461,57 @@ mod tests {
         match compare(&a, &b) {
             Verdict::Match { masked_bytes, .. } => assert_eq!(masked_bytes, 1),
             other => panic!("expected Match, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_declared_range_is_expected_not_a_divergence() {
+        // R-019: VHD's Creator Host OS is a deliberate, spec-legal difference.
+        // It must not read as a finding, and the reason must survive to the
+        // report — an unexplained exemption is just a quieter blind spot.
+        let mut a = loaded("windows", &[0, b'W', b'i', 0], vec![]);
+        a.meta.expected = vec![ExpectedRange {
+            start: 1,
+            end: 3,
+            reason: "VHD Creator Host OS".into(),
+        }];
+        let b = loaded("macos", &[0, b'M', b'a', 0], vec![]);
+        match compare(&a, &b) {
+            Verdict::Match {
+                expected_bytes,
+                expected_reasons,
+                ..
+            } => {
+                assert_eq!(expected_bytes, 2);
+                assert_eq!(expected_reasons, vec!["VHD Creator Host OS".to_string()]);
+            }
+            other => panic!("expected Match, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_declared_range_exempts_only_itself() {
+        // The exemption must stay narrow: one byte inside the declared range,
+        // one outside, and only the outside one is a finding.
+        let mut a = loaded("windows", &[0, b'W', 5, 0], vec![]);
+        a.meta.expected = vec![ExpectedRange {
+            start: 1,
+            end: 2,
+            reason: "declared".into(),
+        }];
+        let b = loaded("macos", &[0, b'M', 9, 0], vec![]);
+        match compare(&a, &b) {
+            Verdict::Differ {
+                diverged_bytes,
+                expected_bytes,
+                first,
+                ..
+            } => {
+                assert_eq!(diverged_bytes, 1);
+                assert_eq!(expected_bytes, 1);
+                assert_eq!(first[0].offset, 2);
+            }
+            other => panic!("expected Differ, got {:?}", other),
         }
     }
 
