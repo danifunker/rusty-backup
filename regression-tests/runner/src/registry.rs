@@ -49,6 +49,10 @@ pub struct Oracle {
     pub id: String,
     pub tool: String,
     pub kind: String,
+    /// Executable to launch, when `tool` is a display string rather than a
+    /// program name (`mount -t affs`). Defaults to `tool`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
 }
@@ -73,6 +77,17 @@ pub struct Verification {
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<String>,
+    /// Argv after the program, with `{artifact}` / `{dir}` substituted. Absent
+    /// means this pair has no automated check — `verify` records that as a
+    /// skip with a reason rather than passing it silently.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect_exit: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect_stdout: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect_stdout_not: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,6 +142,8 @@ struct OracleDef {
     tool: String,
     kind: String,
     #[serde(default)]
+    program: Option<String>,
+    #[serde(default)]
     notes: Option<String>,
     #[serde(default)]
     availability: Vec<AvailDef>,
@@ -153,6 +170,14 @@ struct VerifyDef {
     status: String,
     #[serde(default)]
     evidence: Option<String>,
+    #[serde(default)]
+    check: Option<Vec<String>>,
+    #[serde(default)]
+    expect_exit: Option<i32>,
+    #[serde(default)]
+    expect_stdout: Option<String>,
+    #[serde(default)]
+    expect_stdout_not: Option<String>,
 }
 
 fn untested() -> String {
@@ -250,12 +275,17 @@ impl Registry {
                     strength: v.strength.clone(),
                     status: v.status.clone(),
                     evidence: v.evidence.clone(),
+                    check: v.check.clone(),
+                    expect_exit: v.expect_exit,
+                    expect_stdout: v.expect_stdout.clone(),
+                    expect_stdout_not: v.expect_stdout_not.clone(),
                 });
             }
             r.oracles.push(Oracle {
                 id: o.id,
                 tool: o.tool,
                 kind: o.kind,
+                program: o.program,
                 notes: o.notes,
             });
         }

@@ -19,6 +19,7 @@ mod plan;
 mod produce;
 mod registry;
 mod report;
+mod verify;
 
 use report::{Bundle, CaseResult, RunIdentity, Verdict};
 use std::collections::BTreeSet;
@@ -42,6 +43,7 @@ struct Args {
     check: bool,
     scratch_root: PathBuf,
     artifacts_root: PathBuf,
+    verifications_root: PathBuf,
     db: Option<PathBuf>,
 }
 
@@ -59,6 +61,8 @@ enum Command {
     Produce,
     /// Compare artifacts produced on different OSes. Needs no oracle.
     Parity(String),
+    /// Hand produced artifacts to whatever oracles this host has.
+    Verify,
     /// Merge results from many hosts/runs and report how far a regression got.
     Consolidate(String),
     Help,
@@ -124,6 +128,7 @@ fn parse_args() -> Result<Args, String> {
         check: false,
         scratch_root: base.join("scratch"),
         artifacts_root: base.join("artifacts"),
+        verifications_root: base.join("verifications"),
         db: None,
     };
 
@@ -136,6 +141,7 @@ fn parse_args() -> Result<Args, String> {
             "validate" => args.command = Command::Validate,
             "plan" => args.command = Command::Plan,
             "produce" => args.command = Command::Produce,
+            "verify" => args.command = Command::Verify,
             "parity" => {
                 let root = raw.get(i + 1).cloned().unwrap_or_default();
                 if !root_is_flag(&root) {
@@ -190,6 +196,10 @@ fn parse_args() -> Result<Args, String> {
                     }
                     "--artifacts" => {
                         args.artifacts_root = PathBuf::from(value()?);
+                        i += 1;
+                    }
+                    "--verifications" => {
+                        args.verifications_root = PathBuf::from(value()?);
                         i += 1;
                     }
                     "--filter" => {
@@ -258,6 +268,7 @@ COMMANDS:
     plan         Map requirements onto the machines that exist
     produce      Build every artifact rb-cli can write, twice, into <artifacts>/<os>
     parity       Compare artifacts across producer OSes; needs no oracle
+    verify       Run this host's oracles over the artifact tree
     consolidate  Merge results from many hosts/runs; reports how far a regression got
     export       Write the normalised JSON snapshot of the registry
     query        Ask the registry a named question
@@ -269,7 +280,9 @@ OPTIONS:
     --report-root <DIR>    Where bundles are written[default: regression-tests/runs]
     --scratch-root <DIR>   Working directory root   [default: regression-tests/scratch]
     --artifacts <DIR>      Artifact tree root       [default: regression-tests/artifacts]
-                           produce writes <DIR>/<os>; parity reads <DIR>
+                           produce writes <DIR>/<os>; parity and verify read <DIR>
+    --verifications <DIR>  Verdict tree root        [default: regression-tests/verifications]
+                           verify writes <DIR>/<os>
     --tiers <SPEC>         e.g. 0-6, or 0,1,5       [default: all]
     --filter <SUBSTR>      Only cases whose ID contains SUBSTR
     --allow-hardware       Permit cases that write to physical devices
@@ -306,6 +319,7 @@ fn main() {
         Command::Plan => cmd_plan(&args),
         Command::Produce => cmd_produce(&args),
         Command::Parity(ref root) => cmd_parity(&args, root),
+        Command::Verify => cmd_verify(&args),
         Command::Consolidate(ref root) => cmd_consolidate(&args, root),
     };
     std::process::exit(code);
@@ -392,6 +406,45 @@ fn cmd_produce(args: &Args) -> i32 {
         .filter(|(_, o)| matches!(o, produce::Outcome::Failed { .. }))
         .count();
     if failed > 0 {
+        1
+    } else {
+        0
+    }
+}
+
+/// Verification is per-verifier, so this host writes only into its own
+/// directory and several machines can fill one tree with no coordination.
+fn cmd_verify(args: &Args) -> i32 {
+    let reg = match registry::Registry::load(&regression_dir()) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return 2;
+        }
+    };
+    let out_dir = args
+        .verifications_root
+        .join(exec::platform_token());
+    let report = match verify::verify(
+        &reg,
+        &args.artifacts_root,
+        &out_dir,
+        &hostname(),
+        args.filter.as_deref(),
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return 2;
+        }
+    };
+    print!("{}", verify::render(&report, &out_dir));
+    let bad = report
+        .records
+        .iter()
+        .filter(|r| matches!(r.verdict, verify::Verdict::Fail { .. }))
+        .count();
+    if bad > 0 {
         1
     } else {
         0

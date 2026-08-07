@@ -26,12 +26,12 @@ availability = [
   { platform = "macos",   status = "install",  path_hint = "brew install qemu" },
 ]
 verifies = [
-  { format = "fmt.raw",         direction = "write", strength = "structural", status = "proven", evidence = "qemu-img info -> raw" },
-  { format = "fmt.qcow2",       direction = "write", strength = "structural", status = "proven", evidence = "qemu-img check -> clean" },
-  { format = "fmt.vhd-dynamic", direction = "write", strength = "structural", status = "proven", evidence = "qemu-img info -> vpc" },
-  { format = "fmt.vhd-fixed",   direction = "write", strength = "smoke",      status = "proven", evidence = "qemu-img info -> raw; vpc prober scores below raw, unresolved" },
+  { format = "fmt.raw",         direction = "write", strength = "structural", status = "proven", evidence = "qemu-img info -> raw", check = ["info", "{artifact}"], expect_stdout = "file format: raw" },
+  { format = "fmt.qcow2",       direction = "write", strength = "structural", status = "proven", evidence = "qemu-img check -> clean", check = ["check", "{artifact}"], expect_stdout = "No errors were found" },
+  { format = "fmt.vhd-dynamic", direction = "write", strength = "structural", status = "proven", evidence = "qemu-img info -> vpc", check = ["info", "{artifact}"], expect_stdout = "file format: vpc" },
+  { format = "fmt.vhd-fixed",   direction = "write", strength = "smoke",      status = "proven", evidence = "qemu-img info -> raw; vpc prober scores below raw, unresolved", check = ["info", "{artifact}"], expect_stdout = "file format: raw" },
   { format = "fmt.vmdk-flat",   direction = "write", strength = "structural", status = "proven", evidence = "descriptor -> vmdk, extent -> raw" },
-  { format = "fmt.vmdk-sparse", direction = "write", strength = "structural", status = "proven", evidence = "qemu-img check -> No errors were found" },
+  { format = "fmt.vmdk-sparse", direction = "write", strength = "structural", status = "proven", evidence = "qemu-img check -> No errors were found", check = ["check", "{artifact}"], expect_stdout = "No errors were found" },
 ]
 
 [[oracle]]
@@ -40,13 +40,13 @@ tool = "chdman"
 kind = "package"
 notes = "Four versions present locally (0.174/0.189/0.273/0.288); our output verifies on all four, so the version spread is itself a coverage axis."
 availability = [
-  { platform = "windows", status = "verified", path_hint = "C:/Tools/chdman (0.288)", verified_on = "2026-08-02" },
+  { platform = "windows", status = "verified", path_hint = "C:/Tools/chdman", verified_on = "2026-08-02" },
   { platform = "linux",   status = "install" },
   { platform = "macos",   status = "install" },
   { platform = "mister-hps", status = "absent" },
 ]
 verifies = [
-  { format = "fmt.chd", direction = "write", strength = "structural", status = "proven", evidence = "chdman verify -> Raw SHA1 + Overall SHA1 successful, chdman 0.174 through 0.288" },
+  { format = "fmt.chd", direction = "write", strength = "structural", status = "proven", evidence = "chdman verify -> Raw SHA1 + Overall SHA1 successful, chdman 0.174 through 0.288", check = ["verify", "-i", "{artifact}"], expect_stdout = "Overall SHA1 verification successful" },
   { format = "optical.chdcd", direction = "write", strength = "structural", status = "untested" },
   { format = "fmt.bincue", direction = "write", strength = "structural", status = "untested", evidence = "chdman createcd round-trip" },
 ]
@@ -63,9 +63,9 @@ availability = [
   { platform = "windows", status = "absent" },
 ]
 verifies = [
-  { format = "fs.ext2", direction = "write", strength = "authoritative", status = "untested" },
-  { format = "fs.ext3", direction = "write", strength = "authoritative", status = "untested" },
-  { format = "fs.ext4", direction = "write", strength = "authoritative", status = "untested" },
+  { format = "fs.ext2", direction = "write", strength = "authoritative", status = "untested", check = ["-fn", "{artifact}"] },
+  { format = "fs.ext3", direction = "write", strength = "authoritative", status = "untested", check = ["-fn", "{artifact}"] },
+  { format = "fs.ext4", direction = "write", strength = "authoritative", status = "untested", check = ["-fn", "{artifact}"] },
 ]
 
 [[oracle]]
@@ -79,9 +79,9 @@ availability = [
   { platform = "windows", status = "absent" },
 ]
 verifies = [
-  { format = "fs.fat12", direction = "write", strength = "structural", status = "untested" },
-  { format = "fs.fat16", direction = "write", strength = "structural", status = "untested" },
-  { format = "fs.fat32", direction = "write", strength = "structural", status = "untested" },
+  { format = "fs.fat12", direction = "write", strength = "structural", status = "untested", check = ["-n", "{artifact}"] },
+  { format = "fs.fat16", direction = "write", strength = "structural", status = "untested", check = ["-n", "{artifact}"] },
+  { format = "fs.fat32", direction = "write", strength = "structural", status = "untested", check = ["-n", "{artifact}"] },
 ]
 
 [[oracle]]
@@ -159,7 +159,7 @@ availability = [
   { platform = "wsl",   status = "verified", verified_on = "2026-08-02" },
   { platform = "linux", status = "expected" },
 ]
-verifies = [{ format = "fs.xfs", direction = "write", strength = "structural", status = "untested" }]
+verifies = [{ format = "fs.xfs", direction = "write", strength = "structural", status = "untested", check = ["-n", "{artifact}"] }]
 
 [[oracle]]
 id = "jfs_fsck"
@@ -180,9 +180,9 @@ availability = [
   { platform = "linux", status = "expected" },
 ]
 verifies = [
-  { format = "fs.minix1", direction = "write", strength = "authoritative", status = "untested" },
-  { format = "fs.minix2", direction = "write", strength = "authoritative", status = "untested" },
-  { format = "fs.minix3", direction = "write", strength = "authoritative", status = "untested" },
+  { format = "fs.minix1", direction = "write", strength = "authoritative", status = "untested", check = ["{artifact}"] },
+  { format = "fs.minix2", direction = "write", strength = "authoritative", status = "untested", check = ["{artifact}"] },
+  { format = "fs.minix3", direction = "write", strength = "authoritative", status = "untested", check = ["{artifact}"] },
 ]
 
 [[oracle]]
