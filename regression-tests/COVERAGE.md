@@ -187,6 +187,10 @@ in-use marking loop.
 
 ### R-009 — superfloppy detection is missing JFS, UFS1/UFS2 and ReiserFS
 
+**FIXED 2026-08-07**, together with R-017 (SFS). `fs.read.{jfs,reiserfs,ufs1,
+ufs2}` and `fs.detect.sfs-bare-volume` went green; see `docs/Regression_Bugs.md`
+for what changed. Report as filed follows.
+
 `rb-cli inspect` cannot open a bare (partition-table-free) image of four
 filesystems the engine has complete drivers for:
 

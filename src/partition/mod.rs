@@ -437,6 +437,19 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
         return Some("Amiga-NDOS".to_string());
     }
 
+    // Smart File System volume dumped bare (no RDB). The root block sits at
+    // block 0 with the `SFS\0` id, so `looks_like_sfs` validates id + ownblock
+    // + checksum. `detect_filesystem_type` deliberately does not know SFS —
+    // like AmigaDOS above, the DosType goes out through `partition_type_string`
+    // so the string dispatcher reaches the SFS driver. Both DosTypes share this
+    // on-disk format, and the root block always carries `SFS\0` regardless, so
+    // that is the tag we report.
+    if &first_sector[0..3] == b"SFS" && crate::fs::sfs::looks_like_sfs(reader, 0) {
+        let _ = reader.seek(SeekFrom::Start(0));
+        return Some("SFS\\0".to_string());
+    }
+    let _ = reader.seek(SeekFrom::Start(0));
+
     // Check for HFS / HFS+ / HFSX / ext / ProDOS at offset 1024.
     // Read a full 512-byte sector for raw device compatibility (macOS /dev/rdiskN
     // requires sector-aligned reads).
@@ -486,12 +499,52 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
         }
     }
 
-    // btrfs superblock magic "_BHRfS_M" at offset 0x40 of the superblock
-    // at byte offset 0x10000 (64 KiB) from the partition start.
+    // btrfs and ReiserFS both keep a superblock at byte 0x10000 (64 KiB):
+    // btrfs magic "_BHRfS_M" at +0x40, ReiserFS magic at +52. One
+    // sector-aligned read disambiguates them. UFS2's FreeBSD-default
+    // superblock is at the same 0x10000 but its magic lands at +1372, past
+    // this 512-byte window, so it is probed separately below.
     if reader.seek(SeekFrom::Start(0x10000)).is_ok() {
         let mut buf = [0u8; 512];
-        if reader.read_exact(&mut buf).is_ok() && &buf[0x40..0x48] == b"_BHRfS_M" {
-            return Some("btrfs".to_string());
+        if reader.read_exact(&mut buf).is_ok() {
+            if &buf[0x40..0x48] == b"_BHRfS_M" {
+                return Some("btrfs".to_string());
+            }
+            // v3.5 = "ReIsErFs", v3.6 = "ReIsEr2Fs", reiser4 = "ReIsEr4"
+            // (claimed here, then rejected with a clear message at open).
+            let rmagic = &buf[52..62];
+            if rmagic.starts_with(b"ReIsErFs")
+                || rmagic.starts_with(b"ReIsEr2Fs")
+                || rmagic.starts_with(b"ReIsEr4")
+            {
+                return Some("ReiserFS".to_string());
+            }
+        }
+    }
+
+    // UFS1 lives at byte 8192 (SBLOCK_UFS1); UFS2 at 8192 (NetBSD makefs on
+    // small images) or 65536 (FreeBSD newfs). The magic is at +1372 in both,
+    // and both byte orders occur, so probe each candidate in both.
+    for &cand in &[8192u64, 65536u64] {
+        if reader.seek(SeekFrom::Start(cand + 1372)).is_ok() {
+            let mut m = [0u8; 4];
+            if reader.read_exact(&mut m).is_ok() {
+                let le = u32::from_le_bytes(m);
+                let be = u32::from_be_bytes(m);
+                if le == 0x0001_1954 || le == 0x1954_0119 || be == 0x0001_1954 || be == 0x1954_0119
+                {
+                    return Some("UFS".to_string());
+                }
+            }
+        }
+    }
+
+    // JFS2 aggregate superblock at byte 32768, ASCII magic "JFS1". (AIX JFS1
+    // is an unrelated on-disk format and is excluded by this same magic.)
+    if reader.seek(SeekFrom::Start(0x8000)).is_ok() {
+        let mut m = [0u8; 4];
+        if reader.read_exact(&mut m).is_ok() && &m == b"JFS1" {
+            return Some("JFS".to_string());
         }
     }
 
@@ -1222,6 +1275,10 @@ impl PartitionTable {
                 // ext, etc.) keep `partition_type_string: None` so dispatch
                 // falls back to MBR type-byte detection.
                 let is_amiga_dos = fs_hint.starts_with("DOS\\") && fs_hint.len() == 5;
+                // A bare SFS volume reports its DosType too, and routes the
+                // same way — `detect_filesystem_type` has no SFS probe, so the
+                // string dispatcher is the only path to the driver.
+                let is_amiga_sfs = fs_hint == "SFS\\0";
                 let is_human68k = fs_hint == "human68k";
                 // A custom bootblock Amiga disk with no filesystem. Route the
                 // hint through `partition_type_string` so the dispatcher opens
@@ -1230,9 +1287,9 @@ impl PartitionTable {
                 // Apple Lisa: the tag-bearing DC42/DART container is opened as a
                 // whole by the Lisa driver, so route the hint through the string.
                 let is_lisa = fs_hint == "lisafs";
-                let display_name = if is_amiga_dos {
-                    let variant = fs_hint.as_bytes()[4] - b'0';
-                    let raw = u32::from_be_bytes([b'D', b'O', b'S', variant]);
+                let display_name = if is_amiga_dos || is_amiga_sfs {
+                    let b = fs_hint.as_bytes();
+                    let raw = u32::from_be_bytes([b[0], b[1], b[2], b[4] - b'0']);
                     rdb::dos_type_display_name(raw)
                 } else if is_human68k {
                     "Human68k (FAT)".to_string()
@@ -1254,6 +1311,7 @@ impl PartitionTable {
                     is_logical: false,
                     is_extended_container: false,
                     partition_type_string: if is_amiga_dos
+                        || is_amiga_sfs
                         || is_human68k
                         || is_amiga_ndos
                         || is_lisa
@@ -1844,6 +1902,64 @@ mod tests {
             assert_eq!(parts.len(), 1, "{expected}: one synthetic partition");
             assert_eq!(&parts[0].type_name, expected, "{expected}: wrong fs type");
         }
+    }
+
+    #[test]
+    fn detect_superfloppy_unix_fs_from_real_images() {
+        // R-009: JFS, UFS1, UFS2 and ReiserFS drivers all worked, but
+        // `detect_superfloppy` had no probe for them, so a bare partition dump
+        // died with "invalid boot signature" before reaching the driver. Real
+        // fixtures, not planted magic — the deep superblock offsets are exactly
+        // what a synthetic image would get wrong in the same way twice.
+        for (fixture, expected) in [
+            ("test_jfs.img.zst", "JFS"),
+            ("test_ufs1.img.zst", "UFS"),
+            ("test_ufs2.img.zst", "UFS"),
+            ("test_reiserfs_v3_6.img.zst", "ReiserFS"),
+        ] {
+            let path = format!("tests/fixtures/{fixture}");
+            let compressed = std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+            let mut decoder = crate::rbformats::zstd_compat::decoder(Cursor::new(compressed))
+                .unwrap_or_else(|e| panic!("zstd decoder for {path}: {e}"));
+            let mut img = Vec::new();
+            std::io::Read::read_to_end(&mut decoder, &mut img).expect("decompress");
+
+            let table = PartitionTable::detect(&mut Cursor::new(img))
+                .unwrap_or_else(|e| panic!("{fixture}: detect failed: {e}"));
+            assert_eq!(table.type_name(), "None", "{fixture}: expected bare FS");
+            let parts = table.partitions();
+            assert_eq!(parts.len(), 1, "{fixture}");
+            assert_eq!(parts[0].type_name, expected, "{fixture}: wrong fs type");
+            assert_eq!(parts[0].start_lba, 0, "{fixture}");
+            // Auto-detect at open time, so no dispatch string is needed.
+            assert!(parts[0].partition_type_string.is_none(), "{fixture}");
+        }
+    }
+
+    #[test]
+    fn detect_superfloppy_bare_sfs_routes_by_dostype() {
+        // R-017: same omission as R-009, but SFS resolves differently.
+        // `detect_filesystem_type` has no SFS probe, so the hint must travel as
+        // a DosType in `partition_type_string` — the AmigaDOS route — or the
+        // volume is detected and then fails to open.
+        let img = crate::fs::sfs::create_blank_sfs(8192, "Test").expect("format SFS");
+        let table = PartitionTable::detect(&mut Cursor::new(img)).expect("detect");
+        assert_eq!(table.type_name(), "None");
+        let parts = table.partitions();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].partition_type_string.as_deref(), Some("SFS\\0"));
+        assert_eq!(parts[0].type_name, "SFS (Amiga)");
+    }
+
+    #[test]
+    fn detect_superfloppy_sfs_probe_rejects_bare_magic() {
+        // `SFS\0` at byte 0 with nothing behind it is a custom bootblock, not a
+        // volume. The ownblock + checksum gate must reject it rather than hand
+        // the SFS driver a face-plant.
+        let mut d = vec![0u8; 1024 * 1024];
+        d[0..4].copy_from_slice(b"SFS\0");
+        d[52..56].copy_from_slice(&512u32.to_be_bytes());
+        assert!(!crate::fs::sfs::looks_like_sfs(&mut Cursor::new(&d), 0));
     }
 
     #[test]

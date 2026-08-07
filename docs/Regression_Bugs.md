@@ -20,12 +20,12 @@ finding depends on a fixture, the fixture is named.
 | ID | Severity | Area | Finding |
 |----|----------|------|---------|
 | [R-016](#r-016) | **High** | `src/cli/verbs/backup.rs` | `backup` accepts only flat-layout sources: CHD, dynamic VHD, QCOW2 and VMDK all fail |
-| [R-017](#r-017) | **High** | `src/partition/mod.rs` | Superfloppy detection also misses SFS (extends R-009) |
+| ~~R-017~~ | ~~High~~ **FIXED** | `src/partition/mod.rs` | ~~Superfloppy detection also misses SFS (extends R-009)~~ — probe added 2026-08-07 |
 | [R-015](#r-015) | Medium | `src/optical/` (cue parser) | A `.cue` with unpadded track numbers (`TRACK 1`) is rejected |
 | ~~R-014~~ | ~~Blocker~~ **FIXED** | `src/cli/verbs/squashfs.rs` | ~~Pre-existing clippy failure blocks every commit via the pre-commit hook~~ — boxed 2026-08-07 |
 | [R-008b](#r-008b) | **High** | `src/fs/affs.rs` | `new volume affs --size 4M` panics; no file produced, exit 101 |
 | ~~R-007~~ | ~~High~~ **FIXED** | `src/fs/ntfs_format.rs` | ~~Freshly formatted NTFS fails its own fsck~~ — verified clean 2026-08-07 |
-| [R-009](#r-009) | **High** | `src/partition/mod.rs` | Bare JFS / UFS1 / UFS2 / ReiserFS images cannot be opened at all |
+| ~~R-009~~ | ~~High~~ **FIXED** | `src/partition/mod.rs` | ~~Bare JFS / UFS1 / UFS2 / ReiserFS images cannot be opened at all~~ — probes added 2026-08-07 |
 | [R-013](#r-013) | **High** | `src/fs/ufs.rs` | Solaris UFS directories reported as files, one with a garbage size |
 | [R-005](#r-005) | Medium | `src/cli/output.rs` | No error envelope emitted under `--format json` |
 | [R-008a](#r-008a) | Medium | `src/fs/affs.rs` | AFFS volumes above 4066 blocks have uncovered tail blocks |
@@ -202,6 +202,16 @@ Reproduces on a 64 MB synthetic image; no fixture required.
 
 ### R-017 — superfloppy detection also misses SFS {#r-017}
 
+**FIXED 2026-08-07**, with [R-009](#r-009). SFS needed more than a magic:
+`detect_filesystem_type` has no SFS probe, so the auto-detect-at-open path the
+other four rely on does not exist for it. The hint therefore travels as a
+DosType in `partition_type_string`, the same route a bare AmigaDOS floppy
+takes, which reaches the driver through the string dispatcher.
+`fs::sfs::looks_like_sfs` gates on the `SFS\0` id, ownblock == 0 *and* the
+whole-block checksum, so a custom bootblock carrying the magic is not claimed.
+`rb-cli ls` on the Workbench fixture now walks the tree with no `--fs-type`.
+Original report follows.
+
 Same shape as [R-009](#r-009), found separately and worth its own line because
 it extends the affected list.
 
@@ -234,6 +244,23 @@ filesystems with working drivers that cannot be opened from a bare image.
 Fixture: `fs.sfs.workbench-dh0.hd` (annex).
 
 ### R-009 — bare JFS / UFS / ReiserFS images cannot be opened {#r-009}
+
+**FIXED 2026-08-07.** `detect_superfloppy` gained the three missing probes, at
+the offsets `detect_filesystem_type` was already using: ReiserFS at 0x10000+52
+(folded into the existing btrfs read, which covers the same sector), UFS at
+8192/65536 + 1372 in both byte orders, JFS at 0x8000. No dispatch string is
+needed — a type-byte-0 partition auto-detects at open, and those drivers were
+always reachable that way. `inspect` and `ls` both work on all four fixtures
+with no `--fs-type`. Each probe was mutation-verified individually: breaking
+any one magic reproduces this finding's exact error for that fixture alone.
+
+The four hints also had to be added to `fs::is_browsable_superfloppy`, whose
+doc comment requires it to cover every hint `detect_superfloppy` emits or the
+GUI silently refuses the filesystem. Auditing that list found two unrelated
+pre-existing omissions — `squashfs` and `Oric Jasmin` — fixed in the same
+pass, and the guard test now carries the full set instead of a subset.
+
+Original report follows.
 
 ```
 rb-cli inspect test_jfs.img
@@ -532,14 +559,14 @@ Run `rb-regress run --tiers 0-4` to check them all.
 | R-007 | `fs.new-volume.ntfs{,.2m-fsck,.32m-fsck}` | **green — fixed** |
 | R-008a | `fs.new-volume.affs.bitmap-boundary-plus-one` | red |
 | R-008b | `fs.new-volume.affs.{4m,32m}` | red |
-| R-009 | `fs.read.{jfs,reiserfs,ufs1,ufs2}` | red |
+| R-009 | `fs.read.{jfs,reiserfs,ufs1,ufs2}` | **green — fixed** |
 | R-010 | `cli.flags.inspect-accepts-fs-type` | red |
 | R-011 | `fmt.g64.standard-dump-opens` | green — **pins the working half only** |
 | R-012 | `optical.cdda.no-data-track-opens` | red |
 | R-013 | `fs.detect.ufs-{solaris-entry-types,no-absurd-sizes}` | red |
 | R-015 | `optical.cue.unpadded-track-number` | red |
 | R-016 | `backup.container.{chd,vhd-dynamic,qcow2,vmdk-sparse}` | red |
-| R-017 | `fs.detect.sfs-bare-volume` | red |
+| R-017 | `fs.detect.sfs-bare-volume` | **green — fixed** |
 
 Cases assert the **intended** behaviour, so each is red until its finding is
 fixed and green afterwards. Never "fix" one by asserting the broken
@@ -567,12 +594,11 @@ already works.
 ## Suggested order
 
 0. ~~**R-014**~~ — done; commits work without `--no-verify` again.
-1. **R-008b** — a panic with no file produced is the worst failure mode here,
+1. ~~**R-009** / **R-017**~~ — done; five filesystems' worth of tier-2
+   coverage went green.
+2. **R-008b** — a panic with no file produced is the worst failure mode here,
    and R-008a shares its fix.
-2. **R-009** — smallest change of the high-severity set; unlocks four
-   filesystems' worth of tier-2 coverage.
-3. **R-007** — `BackupBootMismatch` means our NTFS is not what Windows
-   expects.
+3. ~~**R-007**~~ — done; the formatter was already correct when re-verified.
 4. **R-013** — wrong entry types and an absurd size are user-visible
    immediately.
 5. **R-005**, **R-004**, **R-003** — the CLI contract group; cheap, and the
