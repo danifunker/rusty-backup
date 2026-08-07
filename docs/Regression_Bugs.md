@@ -17,10 +17,12 @@ finding depends on a fixture, the fixture is named.
 
 | ID | Severity | Area | Finding |
 |----|----------|------|---------|
+| [R-016](#r-016) | **High** | `src/cli/verbs/backup.rs` | `backup` accepts only flat-layout sources: CHD, dynamic VHD, QCOW2 and VMDK all fail |
+| [R-017](#r-017) | **High** | `src/partition/mod.rs` | Superfloppy detection also misses SFS (extends R-009) |
 | [R-015](#r-015) | Medium | `src/optical/` (cue parser) | A `.cue` with unpadded track numbers (`TRACK 1`) is rejected |
 | [R-014](#r-014) | **Blocker** | `src/cli/verbs/squashfs.rs` | Pre-existing clippy failure blocks every commit via the pre-commit hook |
 | [R-008b](#r-008b) | **High** | `src/fs/affs.rs` | `new volume affs --size 4M` panics; no file produced, exit 101 |
-| [R-007](#r-007) | **High** | `src/fs/ntfs_format.rs` | Freshly formatted NTFS fails its own fsck, incl. `BackupBootMismatch` |
+| ~~R-007~~ | ~~High~~ **FIXED** | `src/fs/ntfs_format.rs` | ~~Freshly formatted NTFS fails its own fsck~~ — verified clean 2026-08-07 |
 | [R-009](#r-009) | **High** | `src/partition/mod.rs` | Bare JFS / UFS1 / UFS2 / ReiserFS images cannot be opened at all |
 | [R-013](#r-013) | **High** | `src/fs/ufs.rs` | Solaris UFS directories reported as files, one with a garbage size |
 | [R-005](#r-005) | Medium | `src/cli/output.rs` | No error envelope emitted under `--format json` |
@@ -111,7 +113,15 @@ Works up to 3 MB; broken at 4 MB and above. A user asking for an ordinary
 4 MB Amiga volume gets a stack trace and no file. Exit 101 is not in the
 exit-code contract (`src/cli/exit.rs`) at all.
 
-### R-007 — a freshly formatted NTFS volume fails its own fsck {#r-007}
+### R-007 — FIXED: a freshly formatted NTFS volume failed its own fsck {#r-007}
+
+**Fixed.** Re-verified 2026-08-07: `new volume ntfs --size 2M` then
+`fsck --checkonly` reports `0 files / 0 dirs checked`, exit 0. The three
+cases (`fs.new-volume.ntfs`, `.2m-fsck`, `.32m-fsck`) went green without
+being touched — the suite noticing a fix is as useful as it noticing a break.
+They stay in place as regression guards.
+
+Original report follows.
 
 ```
 rb-cli new volume ntfs --size 2M v.img
@@ -128,6 +138,89 @@ Either the formatter or the fsck is wrong; they cannot both be right, and
 VBR in the volume's last sector and Windows checks it. A volume whose backup
 boot sector does not mirror the VBR is not one `chkdsk` will accept, which
 undercuts the point of writing NTFS.
+
+### R-016 — `backup` accepts only flat-layout containers {#r-016}
+
+`backup --help` documents SOURCE as "an image file or a block-device path",
+and `inspect` reads every container we write. `backup` reads only the ones
+whose data begins at offset 0:
+
+| source | `inspect` | `backup` |
+|--------|-----------|----------|
+| raw `.img` | `Partition table: MBR` | **ok** |
+| fixed VHD | `Partition table: MBR` | **ok** |
+| **CHD** | `Partition table: MBR` | **fails** |
+| **dynamic VHD** | `Partition table: MBR` | **fails** |
+| **QCOW2** | `Partition table: MBR` | **fails** |
+| **VMDK sparse** | `Partition table: MBR` | **fails** |
+
+Fixed VHD only passes because it *is* raw data with a trailing footer. Every
+container with a non-flat internal layout fails, in one of two ways:
+
+```
+rb-cli backup o-chd/disk.chd ./out --format raw --sector-by-sector
+  -> error: backup failed: cannot read first sector: failed to fill whole buffer
+
+rb-cli backup o-qcow2/disk.qcow2 ./out --format raw --sector-by-sector
+  -> error: backup failed: failed to detect partition table:
+     Invalid MBR: invalid boot signature: expected 0xAA55, got 0x...
+```
+
+Same root cause — the container is not decoded, so raw file bytes are read as
+though they were the disk. Which message appears depends on whether the read
+runs off the end of a small file or lands on header bytes that resemble a bad
+MBR. `--sector-by-sector` does not help; the failure precedes all partition
+logic.
+
+**Why it matters.** These are four of our own output formats, CHD being the
+default for `convert`. A user can convert a disk to any of them and then find
+they cannot back it up — archive to QCOW2, later try to make a working copy,
+and the tool refuses. `inspect` reading them fine makes the failure look
+arbitrary from outside.
+
+Reproduces on a 64 MB synthetic image; no fixture required.
+
+**Two traps when verifying this**, both of which caught me:
+
+1. `backup` prints `rb-cli backup: SRC -> DEST` *before* doing any work, so a
+   grep for `->` reports success on a run that then fails. **Check the exit
+   code**, not the output.
+2. `--format raw` writes `partition-N.img` files, so a `find` over several
+   directories can pick up an unrelated `.img` and attribute the wrong result
+   to the wrong container. Use explicit paths per case.
+
+### R-017 — superfloppy detection also misses SFS {#r-017}
+
+Same shape as [R-009](#r-009), found separately and worth its own line because
+it extends the affected list.
+
+A bare SFS volume is not recognised:
+
+```
+rb-cli inspect dh0.img
+  -> error: detecting partition table: Invalid MBR: invalid boot signature:
+     expected 0xAA55, got 0x0000
+```
+
+The volume is unambiguously SFS — `SFS\0` is the first four bytes:
+
+```
+00000000: 5346 5300 f85c 2753 0000 0000 0003 0000  SFS..'S........
+```
+
+and the engine reads it perfectly once told what it is:
+
+```
+rb-cli ls dh0.img / --fs-type "SFS\0"
+  DIR  Utilities    DIR  WBStartup    DIR  Expansion
+  DIR  L            DIR  Fonts        FILE Devs.info
+```
+
+So the driver is fine; only the magic is missing from `detect_superfloppy`.
+The affected set is now **JFS, UFS1, UFS2, ReiserFS and SFS** — five
+filesystems with working drivers that cannot be opened from a bare image.
+
+Fixture: `fs.sfs.workbench-dh0.hd` (annex).
 
 ### R-009 — bare JFS / UFS / ReiserFS images cannot be opened {#r-009}
 
@@ -413,6 +506,50 @@ forty other filesystems. Either regenerate from `fs/mod.rs` dispatch or delete
 it and point at the README.
 
 ---
+
+## Regression coverage
+
+Which finding is guarded by which case, so a fix cannot silently regress.
+Run `rb-regress run --tiers 0-4` to check them all.
+
+| Finding | Case | State |
+|---------|------|-------|
+| R-003 | `cli.envelope.ls-supports-format` | red |
+| R-004 | `cli.exit.{csv,tsv}-on-nested-verb-is-usage-error` | red |
+| R-005 | `cli.envelope.error-envelope-on-failure` | red |
+| R-006 | `fs.new-volume.prodos-default-name` | red |
+| R-007 | `fs.new-volume.ntfs{,.2m-fsck,.32m-fsck}` | **green — fixed** |
+| R-008a | `fs.new-volume.affs.bitmap-boundary-plus-one` | red |
+| R-008b | `fs.new-volume.affs.{4m,32m}` | red |
+| R-009 | `fs.read.{jfs,reiserfs,ufs1,ufs2}` | red |
+| R-010 | `cli.flags.inspect-accepts-fs-type` | red |
+| R-011 | `fmt.g64.standard-dump-opens` | green — **pins the working half only** |
+| R-012 | `optical.cdda.no-data-track-opens` | red |
+| R-013 | `fs.detect.ufs-{solaris-entry-types,no-absurd-sizes}` | red |
+| R-015 | `optical.cue.unpadded-track-number` | red |
+| R-016 | `backup.container.{chd,vhd-dynamic,qcow2,vmdk-sparse}` | red |
+| R-017 | `fs.detect.sfs-bare-volume` | red |
+
+Cases assert the **intended** behaviour, so each is red until its finding is
+fixed and green afterwards. Never "fix" one by asserting the broken
+behaviour — the red case is the tracking mechanism, and the same case guards
+against the bug returning.
+
+Several findings are paired with a **working-half** case
+(`fs.detect.sfs-reads-when-told`, `optical.cdda.mixed-mode-still-opens`,
+`backup.container.{raw,vhd-fixed}`, `cli.flags.ls-accepts-fs-type`). Those are
+green now and exist so a fix for the red one cannot break the path that
+already works.
+
+**Not covered:**
+
+- **R-001, R-002** — documentation drift. Not expressible as a CLI case; they
+  need a source-parity test comparing the README tables against the
+  `PartitionTable` enum and the `fs/mod.rs` dispatch.
+- **R-011** — only the working half is pinned. No case asserts that
+  copy-protected G64 dumps open, because whether they should is undecided;
+  asserting either way would prejudge it.
+- **R-014** — a lint failure, not runtime behaviour.
 
 ## Suggested order
 

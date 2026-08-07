@@ -13,7 +13,7 @@ concrete reason to.
 | # | Feature | Area | Blocks |
 |---|---------|------|--------|
 | [F-001](#f-001) | `optical extract` cannot extract a single path | `src/cli/verbs/optical.rs` | fixture harvesting from ISOs |
-| [F-002](#f-002) | CloneCD (`.ccd` / `.img` / `.sub`) not supported | `src/rbformats/` | a whole rip format users have |
+| ~~F-002~~ | ~~CloneCD not supported~~ — **retracted, it is supported** | — | — |
 | [F-003](#f-003) | PFS3 / SFS builders exist but are not on the CLI | `src/cli/verbs/new.rs` | two Amiga fixture gaps |
 | [F-004](#f-004) | `show partmap` is APM-only | `src/cli/verbs/show.rs` | scripted partition inspection |
 
@@ -52,39 +52,50 @@ and not on NTFS — but it means a full-disc extract cannot be assumed complete
 on Windows, and a per-path extract would sidestep the issue entirely for the
 common case.
 
-## F-002 — CloneCD sets are not readable {#f-002}
+## F-002 — RETRACTED: CloneCD is supported {#f-002}
 
-A CloneCD rip is a set of sibling files:
+**This entry was wrong and is withdrawn.** CloneCD reads correctly today:
 
-| File | Contents |
-|------|----------|
-| `.ccd` | the disc's table of contents / control file |
-| `.img` | raw 2352-byte sectors |
-| `.sub` | subchannel data |
+```
+rb-cli optical info BOOKSHELF.ccd
+  Container:   clonecd
+  Filesystems: high_sierra
+  ISO 9660:
+    Volume id:   BOOKSHELF
+    Space size:  162838 blocks x 2048 B
 
-We read none of them. `optical info` on the `.img` reports
-`Container: unknown`, which is correct — there is no support to speak of.
+rb-cli optical du BOOKSHELF.ccd
+  148.7 MiB   1056 files   17 dirs   /
+```
 
-**Why it matters.** CloneCD was a mainstream ripping tool, so these sets are
-common in the wild, and the `.sub` subchannel data is exactly what makes them
-worth having: it preserves protection and pregap information that a plain
-`.iso` discards. For a project whose stated purpose is preserving vintage
-media, "we cannot read the format that preserves the most" is a real gap.
+**How I got it wrong.** I ran `optical info` on the `.img` and saw
+`Container: unknown`. That is correct behaviour — a CloneCD `.img` is raw
+2352-byte sectors with no header, so there is nothing to identify it by. The
+`.ccd` control file is the entry point, exactly as `.cue` is for a bin/cue
+pair. Testing the payload instead of the descriptor produced a confident
+wrong conclusion, and I deleted the fixture on the strength of it.
 
-The `.ccd` control file is plain text and the `.img` is raw MODE1/2352, so
-basic read support is not a large piece of work. Subchannel interpretation is
-the harder half and could come later.
+Two things worth keeping from the episode:
 
-**Fixture status — needs re-sourcing.** A `BOOKSHELF.ccd/.cue/.img/.sub` set
-(383 MB + 15 MB subchannel) was dropped into the fixture inbox on
-2026-08-07 and **deleted during triage** on the reasoning that CloneCD is not
-a supported format — which was precisely backwards, since an unsupported
-format is the one worth keeping a specimen of. It is not recoverable from the
-share. The same disc survives in ISO form as
-`optical.high-sierra.bookshelf.cd`, but the ISO is not a substitute: it has
-no subchannel data and no `.ccd`, so it cannot exercise this feature at all.
+**A real, smaller limitation does exist.** The container reports:
 
-Re-source the CloneCD set before starting F-002.
+> `warning: raw-sector metadata (preparer id, El Torito) unavailable for the
+> clonecd container`
+
+So CloneCD is read at the filesystem level but the raw-sector layer is not
+plumbed through, which is where El Torito boot records and the preparer ID
+live. That is a genuine partial — much narrower than "unsupported" — and the
+`.sub` subchannel data is likewise carried but not interpreted. Neither
+blocks reading a disc.
+
+**The fixture is now held**, in the annex as
+`optical.clonecd.bookshelf.cd/` (`.ccd` + `.img` + `.sub` + `.cue`, 399 MB).
+It is a good one: CloneCD container, High Sierra filesystem, real subchannel
+data, and its `.cue` is the R-015 repro. Verified internally consistent —
+`.img` at 2352 B/sector, `.sub` at 96 B/sector and the sibling `.ISO` at
+2048 B/sector all describe exactly **162,840 sectors**, and that `.ISO` is
+byte-identical to the one already held as
+`optical.high-sierra.bookshelf.cd`.
 
 ## F-003 — PFS3 and SFS can be created, but only from inside the engine {#f-003}
 

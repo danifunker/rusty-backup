@@ -1,0 +1,126 @@
+# Tier 4 — conversion matrix. First cases in this tier.
+#
+# R-016: `backup` reads only sources whose data begins at offset 0. `inspect`
+# reads every container we write, so the failure looks arbitrary from outside:
+# convert a disk to CHD — the default for `convert` — and it can no longer be
+# backed up.
+#
+# Entirely self-fixturing. Each case builds its own 64 MB MBR disk, converts
+# it, and backs the result up, so none of this needs the corpus.
+#
+# Two traps when hand-checking these, both of which produced wrong conclusions
+# before the cases existed:
+#
+#   1. `backup` prints `rb-cli backup: SRC -> DEST` *before* doing any work.
+#      Grepping for `->` reports success on a run that then exits 1. The
+#      `expect_exit` assertions below are what actually decide it.
+#   2. `--format raw` writes `partition-N.img`, so a `find` across several
+#      directories can attribute the wrong result to the wrong container.
+#      Every case here uses an explicit per-case scratch path.
+
+[meta]
+tier = 4
+group = "backup.container"
+description = "backup must accept every container inspect can read."
+
+# --- the baseline that works ------------------------------------------------
+
+[[case]]
+id = "backup.container.raw"
+description = "Flat raw source — the case that already works, pinned so a fix elsewhere cannot break it"
+[[case.step]]
+args = ["new", "hd", "mbr", "{scratch}/disk.img", "--size", "64M",
+        "--partition", "16M:0b", "--partition", "16M:0b"]
+expect_exit = 0
+[[case.step]]
+args = ["backup", "{scratch}/disk.img", "{scratch}/bk", "--format", "raw", "--sector-by-sector"]
+expect_exit = 0
+
+[[case]]
+id = "backup.container.vhd-fixed"
+description = "Fixed VHD works only because it is raw plus a trailing footer — data still starts at offset 0"
+[[case.step]]
+args = ["new", "hd", "mbr", "{scratch}/disk.img", "--size", "64M",
+        "--partition", "16M:0b", "--partition", "16M:0b"]
+expect_exit = 0
+[[case.step]]
+args = ["convert", "{scratch}/disk.img", "{scratch}/c", "--format", "vhd"]
+expect_exit = 0
+[[case.step]]
+args = ["backup", "{scratch}/c/disk.vhd", "{scratch}/bk", "--format", "raw", "--sector-by-sector"]
+expect_exit = 0
+
+# --- R-016: the four that fail ----------------------------------------------
+
+[[case]]
+id = "backup.container.chd"
+description = "R-016: CHD is the default output of `convert`, and cannot be backed up. Fails with 'cannot read first sector'."
+[[case.step]]
+args = ["new", "hd", "mbr", "{scratch}/disk.img", "--size", "64M",
+        "--partition", "16M:0b", "--partition", "16M:0b"]
+expect_exit = 0
+[[case.step]]
+args = ["convert", "{scratch}/disk.img", "{scratch}/c", "--format", "chd"]
+expect_exit = 0
+[[case.step]]
+args = ["backup", "{scratch}/c/disk.chd", "{scratch}/bk", "--format", "raw", "--sector-by-sector"]
+expect_exit = 0
+
+[[case]]
+id = "backup.container.vhd-dynamic"
+description = "R-016: dynamic VHD has a non-flat block layout, so the raw bytes at offset 0 are not the disk"
+[[case.step]]
+args = ["new", "hd", "mbr", "{scratch}/disk.img", "--size", "64M",
+        "--partition", "16M:0b", "--partition", "16M:0b"]
+expect_exit = 0
+[[case.step]]
+args = ["convert", "{scratch}/disk.img", "{scratch}/c", "--format", "vhd-dynamic"]
+expect_exit = 0
+[[case.step]]
+args = ["backup", "{scratch}/c/disk.vhd", "{scratch}/bk", "--format", "raw", "--sector-by-sector"]
+expect_exit = 0
+
+[[case]]
+id = "backup.container.qcow2"
+description = "R-016: QCOW2 fails with 'failed to detect partition table' — header bytes read as a bad MBR"
+[[case.step]]
+args = ["new", "hd", "mbr", "{scratch}/disk.img", "--size", "64M",
+        "--partition", "16M:0b", "--partition", "16M:0b"]
+expect_exit = 0
+[[case.step]]
+args = ["convert", "{scratch}/disk.img", "{scratch}/c", "--format", "qcow2"]
+expect_exit = 0
+[[case.step]]
+args = ["backup", "{scratch}/c/disk.qcow2", "{scratch}/bk", "--format", "raw", "--sector-by-sector"]
+expect_exit = 0
+
+[[case]]
+id = "backup.container.vmdk-sparse"
+description = "R-016: VMDK sparse, same shape as QCOW2"
+[[case.step]]
+args = ["new", "hd", "mbr", "{scratch}/disk.img", "--size", "64M",
+        "--partition", "16M:0b", "--partition", "16M:0b"]
+expect_exit = 0
+[[case.step]]
+args = ["convert", "{scratch}/disk.img", "{scratch}/c", "--format", "vmdk-sparse"]
+expect_exit = 0
+[[case.step]]
+args = ["backup", "{scratch}/c/disk.vmdk", "{scratch}/bk", "--format", "raw", "--sector-by-sector"]
+expect_exit = 0
+
+# --- the asymmetry itself ---------------------------------------------------
+
+[[case]]
+id = "backup.container.inspect-reads-what-backup-cannot"
+description = "Pins the asymmetry at the heart of R-016: inspect reads CHD fine, so the backup failure is a gap rather than an unsupported format"
+[[case.step]]
+args = ["new", "hd", "mbr", "{scratch}/disk.img", "--size", "64M",
+        "--partition", "16M:0b", "--partition", "16M:0b"]
+expect_exit = 0
+[[case.step]]
+args = ["convert", "{scratch}/disk.img", "{scratch}/c", "--format", "chd"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/c/disk.chd"]
+expect_exit = 0
+stdout_contains = ["MBR"]

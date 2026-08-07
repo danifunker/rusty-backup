@@ -129,6 +129,11 @@ pub struct Step {
     pub stdout_contains: Vec<String>,
     #[serde(default)]
     pub stdout_matches: Vec<String>,
+    /// Text that must NOT appear. There is no way to express this with a
+    /// regex — Rust's engine has no look-around — and "the output must not
+    /// contain this" is a normal thing to assert.
+    #[serde(default)]
+    pub stdout_not_contains: Vec<String>,
     #[serde(default)]
     pub stderr_empty: bool,
 
@@ -282,6 +287,7 @@ impl Case {
                     expect_envelope_ok: s.expect_envelope_ok,
                     stdout_contains: s.stdout_contains.clone(),
                     stdout_matches: s.stdout_matches.clone(),
+                    stdout_not_contains: s.stdout_not_contains.clone(),
                     stderr_empty: s.stderr_empty,
                     json_equals: s
                         .json_equals

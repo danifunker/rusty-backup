@@ -18,19 +18,25 @@ Every fixture has been opened with `rb-cli` before admission — nothing is
 admitted on the strength of its extension. See § False positives for why that
 rule exists.
 
-## Re-source: CloneCD set (deleted in error)
+## CloneCD set — recovered, and the format was never missing
 
-A `BOOKSHELF.ccd` / `.img` / `.sub` CloneCD rip was dropped into the inbox on
-2026-08-07 and deleted during triage, on the reasoning that CloneCD is not a
-supported container. That was backwards — an unsupported format is exactly
-what you keep a specimen of, and the `.sub` subchannel data is the part no
-`.iso` can carry. Not recoverable from the share.
+A `BOOKSHELF.ccd`/`.img`/`.sub` set was deleted during triage on 2026-08-07
+and has since been repopulated. Now held as
+`optical.clonecd.bookshelf.cd/` in the annex.
 
-The same disc survives as `optical.high-sierra.bookshelf.cd` in ISO form, but
-that cannot stand in: no subchannel, no `.ccd`. See F-002 in
-`docs/missing_features_from_regression.md`.
+Worth recording why it was deleted, because the reasoning was wrong twice
+over: it was discarded as "an unsupported format", and CloneCD turned out to
+be **supported** — `optical info` on the `.ccd` reports
+`Container: clonecd`, `Filesystems: high_sierra`, and walks 1,056 files. The
+earlier test had been run against the `.img`, which correctly reports
+`unknown` because raw 2352-byte sectors carry no header.
 
-**Wanted:** any CloneCD set, not necessarily this disc.
+Two lessons, both cheap:
+
+- **Test the descriptor, not the payload.** `.ccd` for CloneCD, `.cue` for
+  bin/cue. Pointing a detector at the raw data file proves nothing.
+- **Never discard an unrecognised specimen.** Even if the format genuinely
+  were unsupported, that is the one case where a sample has the most value.
 
 ## Shopping list
 

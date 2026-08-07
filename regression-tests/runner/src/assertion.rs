@@ -143,6 +143,17 @@ pub fn evaluate(
         }
     }
 
+    for needle in &step.stdout_not_contains {
+        let needle = resolve(needle);
+        if out.stdout.contains(&needle) {
+            failures.push(FailedAssertion::new(
+                "stdout_not_contains",
+                format!("output must not contain {:?}", needle),
+                truncate(&out.stdout, 400),
+            ));
+        }
+    }
+
     if step.stderr_empty && !out.stderr.trim().is_empty() {
         failures.push(FailedAssertion::new(
             "stderr_empty",
