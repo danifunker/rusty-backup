@@ -20,7 +20,7 @@ finding depends on a fixture, the fixture is named.
 | ID | Severity | Area | Finding |
 |----|----------|------|---------|
 | [R-016](#r-016) | **High** | `src/cli/verbs/backup.rs` | `backup` accepts only flat-layout sources: CHD, dynamic VHD, QCOW2 and VMDK all fail |
-| [R-018](#r-018) | **Blocker** | `src/os/windows.rs` | The documented Rust-1.73 verification build does not compile on Windows |
+| ~~R-018~~ | ~~Blocker~~ **FIXED** | `CONTRIBUTING.md` | ~~The documented Rust-1.73 verification build does not compile on Windows~~ — missing `windows-legacy` feature, 2026-08-07 |
 | ~~R-017~~ | ~~High~~ **FIXED** | `src/partition/mod.rs` | ~~Superfloppy detection also misses SFS (extends R-009)~~ — probe added 2026-08-07 |
 | [R-015](#r-015) | Medium | `src/optical/` (cue parser) | A `.cue` with unpadded track numbers (`TRACK 1`) is rejected |
 | ~~R-014~~ | ~~Blocker~~ **FIXED** | `src/cli/verbs/squashfs.rs` | ~~Pre-existing clippy failure blocks every commit via the pre-commit hook~~ — boxed 2026-08-07 |
@@ -44,6 +44,27 @@ finding depends on a fixture, the fixture is named.
 ## Blocker
 
 ### R-018 — the vintage-build check does not compile on Windows {#r-018}
+
+**FIXED 2026-08-07 — and it was documentation drift, not a code defect.** The
+command was missing `windows-legacy` from its `--features` list. That feature
+already exists in both manifests and already does exactly the right thing:
+`src/os/windows.rs` carries `#[cfg]`-split call sites for `CreateWellKnownSid`
+and `ShellExecuteW`, and CI's Windows vintage leg has been passing the flag all
+along. Only the CONTRIBUTING.md command had drifted from it.
+
+Adding the flag builds clean — zero errors. CONTRIBUTING.md now quotes CI's
+exact feature list (`native-zstd,remote,tui,rust173-polyfill,windows-legacy,yaml`),
+verified locally, with a note that the two must stay together. `windows-legacy`
+gates only `#[cfg(windows)]` code, so it is inert on the macOS 10.7 leg and the
+single command is correct on every platform.
+
+Correcting the original report below: it concluded "both call sites need a
+`#[cfg]`-split shim in `src/os/windows.rs`". They already had one. The error
+text names the call sites, which reads as missing shim code, and the report
+stopped at the symptom instead of checking whether the feature that fixes it
+existed. Worth recording — the finding was real and the diagnosis was not.
+
+Original report follows.
 
 CONTRIBUTING.md § "Rust 1.73 floor for engine code" gives this as the command
 to run before pushing any change under `src/`. It fails on a clean `HEAD`:
@@ -71,6 +92,7 @@ The effect is that the *only* documented way to catch a 1.73 violation is
 itself red on Windows, so a real violation is indistinguishable from this
 noise and the check gets skipped. Both call sites need a `#[cfg]`-split shim
 in `src/os/windows.rs`, the same pattern `crate::compat` already uses.
+*(Wrong — see the correction above. The shims were already there.)*
 
 Confirmed pre-existing: identical four errors with all local work stashed.
 
@@ -621,8 +643,10 @@ already works.
 - **R-011** — only the working half is pinned. No case asserts that
   copy-protected G64 dumps open, because whether they should is undecided;
   asserting either way would prejudge it.
-- **R-018** — a build-configuration failure, not runtime behaviour, and the
-  suite runs the modern binary.
+- **R-018** — a documentation failure, not runtime behaviour, and the suite
+  runs the modern binary. A docs-parity test comparing CONTRIBUTING.md's
+  feature list against the workflow's would guard it; that is the same
+  source-parity test R-001 / R-002 need, so it belongs with them.
 - **R-014** — a lint failure, not runtime behaviour. The pre-commit hook is
   itself the regression guard: it runs `clippy --all-targets -- -D warnings`
   on every commit, so a reintroduction cannot be committed.
@@ -630,7 +654,7 @@ already works.
 ## Suggested order
 
 0. ~~**R-014**~~ — done; commits work without `--no-verify` again.
-0b. **R-018** — until this clears, no 1.73 violation can be caught on Windows.
+0b. ~~**R-018**~~ — done; the verification command works on Windows again.
 1. ~~**R-009** / **R-017**~~ — done; five filesystems' worth of tier-2
    coverage went green.
 2. **R-008b** — a panic with no file produced is the worst failure mode here,
