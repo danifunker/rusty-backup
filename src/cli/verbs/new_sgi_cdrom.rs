@@ -43,9 +43,10 @@ pub struct NewSgiCdromArgs {
     #[arg(long = "from-dir")]
     pub from_dir: Option<PathBuf>,
 
-    /// With `--from-dir`: unpack tar archives found in the tree into a
-    /// directory named after each, instead of copying them in verbatim.
-    /// Detected by content, so IRIX `.tardist` files count.
+    /// With `--from-dir`: unpack archives found in the tree into a directory
+    /// named after each, instead of copying them in verbatim. Tar is detected
+    /// by content, so IRIX `.tardist` files count; classic Mac archives
+    /// (`.sit`, `.cpt`, `.hqx`, …) are unpacked too.
     ///
     /// Off by default: a software-distribution disc usually wants its
     /// archives left intact so the target system's installer can consume

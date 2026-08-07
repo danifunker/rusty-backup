@@ -22,7 +22,7 @@
 <h2>Options</h2>
 <dl class="args">
 <dt><code>--expand-archives</code></dt>
-<dd>Unpack tar archives found in the tree into a directory named after each, instead of copying them in verbatim. Detected by content (the `ustar` magic), so IRIX `.tardist` and oddly-named archives are found and a gzipped disk image is not mistaken for one</dd>
+<dd>Unpack archives found in the tree into a directory named after each, instead of copying them in verbatim. Two families: tar (detected by the `ustar` magic, so IRIX `.tardist` and oddly-named archives are found and a gzipped disk image is not mistaken for one) and classic Mac (`.sit` / `.sea` / `.cpt` / `.hqx` / `.mar`, which land with both forks and their Finder type/creator intact)</dd>
 <dt><code>--flatten-folders</code></dt>
 <dd>With `--expand-archives`: unpack each archive into the directory that held it rather than into a subdirectory named after it, so every archive shares one root</dd>
 <dt><code>--force</code></dt>

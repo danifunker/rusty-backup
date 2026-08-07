@@ -3,6 +3,7 @@ pub mod apm;
 pub mod atari;
 pub mod editor;
 pub mod gpt;
+pub mod mac_cd_builder;
 pub mod mbr;
 pub mod provision;
 pub mod rdb;

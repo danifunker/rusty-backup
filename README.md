@@ -48,7 +48,7 @@ rb-cli du  disk.dsk "/System Folder" --json   # recursive both-fork (data+resour
 rb-cli cp  floppy.adf / harddisk.hda@1 /Floppies/d01/ -r   # consolidate an image onto a HD
 rb-cli tar irix.img@1 / irix.tar.gz   # archive a case-sensitive volume (keeps case + symlinks)
 rb-cli untar disk.hda src.tar.gz /   # import an archive's contents INTO an image (skips ._* + unstorable names)
-rb-cli import disk.hda ./stuff /     # copy a whole host folder in; --expand-archives unpacks tarballs it finds
+rb-cli import disk.hda ./stuff /     # copy a whole host folder in; --expand-archives unpacks tarballs + .sit/.cpt/.hqx it finds
 rb-cli get backup.zip /unix ./unix --inside disk.img   # extract from a RAW disk inside a .zip
 rb-cli fsck disk.dsk --checkonly
 rb-cli inspect disk.hda
@@ -65,6 +65,10 @@ rb-cli optical new sgi-efs irix.iso --size 600M                  # IRIX EFS CD-R
 rb-cli optical new sgi-efs irix.iso --size auto --from-dir ./sgi-stuff  # format + fill in one step
 rb-cli optical new sgi-efs irix.iso --size auto --from-dir ./sgi-stuff \
        --expand-archives --flatten-folders   # unpack every .tardist into one inst-ready root
+rb-cli optical new mac-hfs mac.iso --size 600M --name "My CD"     # classic Mac CD-ROM (APM + HFS)
+rb-cli optical new mac-hfsplus mac.iso --size auto --from-dir ./mac-stuff  # HFS+ (Mac OS 8.1+), filled
+rb-cli optical new mac-hfs mac.iso --size auto --from-dir ./mac-stuff \
+       --expand-archives     # unstuff every .sit/.cpt/.hqx onto the disc, forks intact
 rb-cli put irix.img@1 ./bstoolbox /bstoolbox               # populate its EFS root partition
 rb-cli mac-scsi-bless mac.hda                              # install Apple SCSI driver + DDR
 rb-cli mac-scsi-bless mac.hda --driver-from donor.hda      # use a donor disk's driver verbatim
@@ -451,7 +455,10 @@ The app has five tabs:
   itself a disk image (DiskCopy 4.2, raw HFS, raw HFS+) get a one-click
   "Mount in new Inspect tab" handoff. `rb-cli archive list` / `archive
   extract` / `archive create` (formerly `sit`, still accepted) is the
-  scriptable counterpart.
+  scriptable counterpart. The same decoders back `--expand-archives` on
+  `rb-cli import` and `optical new`, which unstuffs a folder's archives
+  straight into the image — forks and Finder type/creator intact — instead
+  of copying them in packed.
 
 Most popups (Resize Partitions, Edit Partition Table, Export Disk Image,
 restore-tab partition list) use a shared **Size Mode** radio set
@@ -673,7 +680,7 @@ PC Engine CD, CD32, GameCube, Wii, CD-i, and 3DO.
 |--------|:-----:|:-------------------------------------:|-------|
 | MBR    | Yes   | Yes  | PC standard. Logical partitions inside an extended container are surfaced read-only. |
 | GPT    | Yes   | Yes  | Primary + backup header rewritten with refreshed CRCs on every edit. |
-| APM    | Yes   | Yes  | Apple Partition Map (68k / PowerPC Macs). |
+| APM    | Yes   | Yes  | Apple Partition Map (68k / PowerPC Macs). `rb-cli optical new mac-hfs` / `mac-hfsplus` synthesizes a classic-Mac CD-ROM image from scratch — DDR + map + one `Apple_HFS` partition holding a blank HFS or HFS+ volume (Mac-only; no ISO 9660 side). |
 | RDB    | Yes   | Bootable flag only; writes whole tables from scratch | Amiga `RDSK`. `rb-cli new hd rdb` lays down an RDSK plus a `PART` chain with the DosType tags you name (`DOS\3`, `PFS\3`, `SFS\0`, …), cylinder-aligned from `--heads` / `--sectors`; the output is read back cleanly by `amitools`' `rdbtool`. Editing an *existing* RDB is still bootable-flag-only, deferred until the DosEnv geometry story is settled. |
 | SGI    | Yes   | Yes  | SGI Volume Header (IRIX). 16 fixed slots; checksum recomputed on every write; geometry (`vh_dp`) preserved across edits. `rb-cli new hd sgi-efs` synthesizes a dvh + EFS-root hard disk from scratch (IRIX 5.3-6.5). |
 | AHDI   | Yes   | No (browse); writes whole tables from scratch | Atari ST / TT / Falcon hard disks. Four primary entries at 0x1C6 plus XGM extended chains, big-endian, no magic number — detection keys off the 0x1234 word-sum and plausible geometry. `rb-cli new hd atari` writes a fresh root sector with the tags you name (GEM / BGM / RAW); a GEM partition over 16 MiB is promoted to BGM, which is what TOS needs. Creating an XGM chain, and grafting in a bootable bootstrap, are future work. |

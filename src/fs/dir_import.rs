@@ -37,17 +37,21 @@ pub use crate::fs::import_sink::{
 #[derive(Default)]
 pub struct DirImportOptions {
     pub shared: ImportOptions,
-    /// Unpack tar archives found in the tree (`.tar`, `.tar.gz`, `.tgz`,
-    /// `.tar.zst`, and anything else carrying the `ustar` magic — IRIX
-    /// `.tardist` files included) into a directory named after the archive,
-    /// instead of copying the archive in as an opaque file.
+    /// Unpack archives found in the tree into a directory named after each,
+    /// instead of copying them in as opaque files. Two families:
+    ///
+    /// - **tar** (`.tar`, `.tar.gz`, `.tgz`, `.tar.zst`, and anything else
+    ///   carrying the `ustar` magic — IRIX `.tardist` files included),
+    /// - **classic Mac** (`.sit`, `.sea`, `.cpt`, `.hqx`, `.mar`), which land
+    ///   with both forks and Finder type/creator intact.
     ///
     /// **Off by default.** Which one you want is a genuine judgement call: a
     /// software-distribution disc usually wants the archives left intact so
     /// the target system's own installer can consume them, while a "just give
-    /// me the files" disc wants them unpacked. Detection is by content sniff,
-    /// not extension, so an oddly-named archive is still found and a `.gz`
-    /// disk image is not mistaken for one.
+    /// me the files" disc wants them unpacked. Tar detection is a pure content
+    /// sniff (an oddly-named archive is still found, a `.gz` disk image is
+    /// not); the Mac family gates on extension first so a tree walk never
+    /// reads a multi-GB image just to classify it, then confirms by content.
     pub expand_archives: bool,
 
     /// With [`Self::expand_archives`]: unpack each archive's contents into the
@@ -65,9 +69,37 @@ pub struct DirImportOptions {
     pub flatten_archives: bool,
 }
 
+/// Which expander handles a host file under `expand_archives`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArchiveFlavor {
+    Tar,
+    Mac,
+}
+
+/// Classify a host file for expansion. Tar first: its `ustar` sniff reads a
+/// fixed header, while the Mac gate may read the whole (small) archive.
+fn archive_flavor(path: &Path) -> Option<ArchiveFlavor> {
+    if crate::fs::tar_import::looks_like_tar_archive(path) {
+        Some(ArchiveFlavor::Tar)
+    } else if crate::fs::mac_archive_import::looks_like_mac_archive(path) {
+        Some(ArchiveFlavor::Mac)
+    } else {
+        None
+    }
+}
+
+/// `(files, dirs, bytes)` the archive expands to, per flavor.
+fn measure_expanded(flavor: ArchiveFlavor, path: &Path) -> Result<(u64, u64, u64)> {
+    match flavor {
+        ArchiveFlavor::Tar => crate::fs::tar_import::measure_tar_expanded(path),
+        ArchiveFlavor::Mac => crate::fs::mac_archive_import::measure_mac_archive_expanded(path),
+    }
+}
+
 /// Directory name for an expanded archive: the file name with its archive
 /// extension(s) stripped. `foo-1.2.tar.gz` -> `foo-1.2`, `bar.tardist` ->
-/// `bar`. A name that strips to nothing keeps the original.
+/// `bar`, `Tool.sit.hqx` -> `Tool`. A name that strips to nothing keeps the
+/// original.
 fn expanded_dir_name(file_name: &str) -> String {
     let lower = file_name.to_ascii_lowercase();
     for suffix in [
@@ -82,6 +114,14 @@ fn expanded_dir_name(file_name: &str) -> String {
         ".txz",
         ".tardist",
         ".tar",
+        ".sit.hqx",
+        ".sea.hqx",
+        ".cpt.hqx",
+        ".sit",
+        ".sea",
+        ".cpt",
+        ".hqx",
+        ".mar",
     ] {
         if lower.ends_with(suffix) {
             let stem = &file_name[..file_name.len() - suffix.len()];
@@ -264,12 +304,15 @@ fn import_dir_inner(
                 )?;
             }
             HostKind::File { size } => {
-                if opts.expand_archives
-                    && crate::fs::tar_import::looks_like_tar_archive(&e.host)
-                    && expand_archive(efs, &mut sink, &e, opts, progress)?
+                if let Some(flavor) = opts
+                    .expand_archives
+                    .then(|| archive_flavor(&e.host))
+                    .flatten()
                 {
-                    progress(&sink.stats);
-                    continue;
+                    if expand_archive(efs, &mut sink, &e, flavor, opts, progress)? {
+                        progress(&sink.stats);
+                        continue;
+                    }
                 }
                 let mut f = File::open(&e.host).with_context(|| format!("opening {display}"))?;
                 sink.push(
@@ -311,6 +354,7 @@ fn expand_archive(
     efs: &mut dyn EditableFilesystem,
     sink: &mut Importer,
     e: &HostEntry,
+    flavor: ArchiveFlavor,
     opts: &DirImportOptions,
     progress: &dyn Fn(&ImportStats),
 ) -> Result<bool> {
@@ -337,17 +381,27 @@ fn expand_archive(
     // The nested import's tally is reported against the parent's totals, so
     // the caller's progress callback keeps counting up rather than restarting.
     let base = sink.stats.clone();
-    let nested = crate::fs::tar_import::import_tar_from_path_into(
-        efs,
-        &dir,
-        &e.host,
-        &opts.shared,
-        &|s: &ImportStats| {
-            let mut merged = base.clone();
-            merged.merge(s);
-            progress(&merged);
-        },
-    )
+    let report = &|s: &ImportStats| {
+        let mut merged = base.clone();
+        merged.merge(s);
+        progress(&merged);
+    };
+    let nested = match flavor {
+        ArchiveFlavor::Tar => crate::fs::tar_import::import_tar_from_path_into(
+            efs,
+            &dir,
+            &e.host,
+            &opts.shared,
+            report,
+        ),
+        ArchiveFlavor::Mac => crate::fs::mac_archive_import::import_mac_archive_from_path_into(
+            efs,
+            &dir,
+            &e.host,
+            &opts.shared,
+            report,
+        ),
+    }
     // `{e:#}` not `{e}`: the CLI flattens this error into a message with
     // `{e}` further up, which keeps only the outermost layer. Without the
     // alternate form the real cause — which file, which filesystem limit —
@@ -394,9 +448,13 @@ pub fn preflight_dir(
                 }
             }
             HostKind::File { size } => {
-                if opts.expand_archives && crate::fs::tar_import::looks_like_tar_archive(&e.host) {
+                if let Some(flavor) = opts
+                    .expand_archives
+                    .then(|| archive_flavor(&e.host))
+                    .flatten()
+                {
                     // Count what the archive becomes, not the archive.
-                    let (f, d, b) = crate::fs::tar_import::measure_tar_expanded(&e.host)?;
+                    let (f, d, b) = measure_expanded(flavor, &e.host)?;
                     pf.files += f;
                     // Plus the directory it unpacks into, unless flattened —
                     // then it shares the one that already exists.
@@ -433,8 +491,8 @@ pub fn measure_dir(root: &Path, expand_archives: bool, flatten: bool) -> Result<
         match e.kind {
             HostKind::Dir => dirs += 1,
             HostKind::File { size } => {
-                if expand_archives && crate::fs::tar_import::looks_like_tar_archive(&e.host) {
-                    let (f, d, b) = crate::fs::tar_import::measure_tar_expanded(&e.host)?;
+                if let Some(flavor) = expand_archives.then(|| archive_flavor(&e.host)).flatten() {
+                    let (f, d, b) = measure_expanded(flavor, &e.host)?;
                     files += f;
                     dirs += d + u64::from(!flatten);
                     bytes += b;

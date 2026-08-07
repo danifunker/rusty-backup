@@ -821,7 +821,7 @@ Usage: import [OPTIONS] <IMAGE> <DIR> [DEST]
 
 **Options**
 
-- `--expand-archives` — Unpack tar archives found in the tree into a directory named after each, instead of copying them in verbatim. Detected by content (the `ustar` magic), so IRIX `.tardist` and oddly-named archives are found and a gzipped disk image is not mistaken for one
+- `--expand-archives` — Unpack archives found in the tree into a directory named after each, instead of copying them in verbatim. Two families: tar (detected by the `ustar` magic, so IRIX `.tardist` and oddly-named archives are found and a gzipped disk image is not mistaken for one) and classic Mac (`.sit` / `.sea` / `.cpt` / `.hqx` / `.mar`, which land with both forks and their Finder type/creator intact)
 - `--flatten-folders` — With `--expand-archives`: unpack each archive into the directory that held it rather than into a subdirectory named after it, so every archive shares one root
 - `--force` — Overwrite entries that already exist at the destination. Mutually exclusive with `--skip-existing`
 - `--skip-existing` — Skip entries that already exist at the destination. Mutually exclusive with `--force`
@@ -1414,6 +1414,50 @@ Create a blank CD-ROM disc image
 Usage: new <COMMAND>
 ```
 
+### `optical new mac-hfs`
+
+Classic Mac CD-ROM (`.iso`): an Apple Partition Map with one `Apple_HFS` partition holding a blank HFS volume — what every Mac since System 3 mounts. Pass `--from-dir` to fill it from a host folder in the same step (`--size auto` then sizes the disc to fit); otherwise it comes out blank for `import` / `put`. Mac-only: no ISO 9660 side is written
+
+```
+Usage: mac-hfs [OPTIONS] <IMAGE>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image file to create (conventionally `.iso`). Overwritten if it exists
+
+**Options**
+
+- `--size` — Disc size (plain bytes or `K`/`M`/`G` suffixes, e.g. `600M`), or `auto` to size it to `--from-dir` plus filesystem overhead and headroom. Defaults to 600M (a CD-R); keep an explicit size at or below your target media (~650-700 MiB for a CD), and use `auto` for an image you intend to mount rather than burn
+- `--from-dir` — Populate the disc from this host directory after formatting it. The directory's *contents* land at the volume root
+- `--expand-archives` — With `--from-dir`: unpack archives found in the tree into a directory named after each, instead of copying them in verbatim. Classic Mac archives (`.sit`, `.sea`, `.cpt`, `.hqx`, `.mar`) land with both forks and their Finder type/creator intact — a disc the target Mac can run straight off, rather than one it has to unstuff first. Tar archives are unpacked too. `--size auto` measures what they unpack to
+- `--force` — With `--from-dir`: overwrite entries that already exist rather than failing on the collision
+- `--include-appledouble` — With `--from-dir`: import macOS AppleDouble sidecars (`._*`) too. Off by default because the resource fork they carry is imported into the Mac volume's own resource fork instead
+- `--name` — Volume name, as it appears on the Mac desktop. HFS truncates at 27 Mac Roman bytes. Defaults to `rusty-backup`
+- `--block-size` — Allocation block size in bytes. HFS wants a multiple of 512 and auto- picks the smallest that keeps the volume inside its 65535-block ceiling; HFS+ wants a power of two in [512, 4096] and defaults to 4096
+
+### `optical new mac-hfsplus`
+
+Mac CD-ROM with an HFS+ (Mac OS Extended) volume instead of HFS — readable by Mac OS 8.1 and later. Same layout and flags as `mac-hfs`
+
+```
+Usage: mac-hfsplus [OPTIONS] <IMAGE>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image file to create (conventionally `.iso`). Overwritten if it exists
+
+**Options**
+
+- `--size` — Disc size (plain bytes or `K`/`M`/`G` suffixes, e.g. `600M`), or `auto` to size it to `--from-dir` plus filesystem overhead and headroom. Defaults to 600M (a CD-R); keep an explicit size at or below your target media (~650-700 MiB for a CD), and use `auto` for an image you intend to mount rather than burn
+- `--from-dir` — Populate the disc from this host directory after formatting it. The directory's *contents* land at the volume root
+- `--expand-archives` — With `--from-dir`: unpack archives found in the tree into a directory named after each, instead of copying them in verbatim. Classic Mac archives (`.sit`, `.sea`, `.cpt`, `.hqx`, `.mar`) land with both forks and their Finder type/creator intact — a disc the target Mac can run straight off, rather than one it has to unstuff first. Tar archives are unpacked too. `--size auto` measures what they unpack to
+- `--force` — With `--from-dir`: overwrite entries that already exist rather than failing on the collision
+- `--include-appledouble` — With `--from-dir`: import macOS AppleDouble sidecars (`._*`) too. Off by default because the resource fork they carry is imported into the Mac volume's own resource fork instead
+- `--name` — Volume name, as it appears on the Mac desktop. HFS truncates at 27 Mac Roman bytes. Defaults to `rusty-backup`
+- `--block-size` — Allocation block size in bytes. HFS wants a multiple of 512 and auto- picks the smallest that keeps the volume inside its 65535-block ceiling; HFS+ wants a power of two in [512, 4096] and defaults to 4096
+
 ### `optical new sgi-efs`
 
 IRIX EFS CD-ROM (`.iso`): an SGI volume header with the EFS filesystem in slot 7 (typed SYSV, the IRIX EFS-CD convention) and CD geometry. Mounts on IRIX with `mount -t efs <dev>s7`. Pass `--from-dir` to fill it from a host folder in the same step (`--size auto` then sizes the disc to fit, and `--expand-archives --flatten-folders` unpacks a `.tardist` set into one `inst`-ready root); otherwise it comes out blank for `import` / `put`
@@ -1430,7 +1474,7 @@ Usage: sgi-efs [OPTIONS] <IMAGE>
 
 - `--size` — Disc size (plain bytes or `K`/`M`/`G` suffixes, e.g. `600M`), or `auto` to size it to `--from-dir` plus filesystem overhead and headroom. Rounded up to a whole 32-sector CD cylinder. Defaults to 600M (a CD-R); keep an explicit size at or below your target media (~650-700 MiB for a CD), and use `auto` for an image you intend to mount rather than burn
 - `--from-dir` — Populate the disc from this host directory after formatting it. The directory's *contents* land at the volume root
-- `--expand-archives` — With `--from-dir`: unpack tar archives found in the tree into a directory named after each, instead of copying them in verbatim. Detected by content, so IRIX `.tardist` files count
+- `--expand-archives` — With `--from-dir`: unpack archives found in the tree into a directory named after each, instead of copying them in verbatim. Tar is detected by content, so IRIX `.tardist` files count; classic Mac archives (`.sit`, `.cpt`, `.hqx`, …) are unpacked too
 - `--flatten-folders` — With `--expand-archives`: unpack each archive into the volume root rather than a subdirectory named after it, so every archive shares one root. This is the shape IRIX `inst` wants — point it at one directory holding every `.tardist`'s product images instead of re-pointing it per archive. Overlapping entries are then expected (SGI freeware tardists all ship the same `fw_common*` product), so this skips entries that already exist unless `--force` is given
 - `--force` — With `--from-dir`: overwrite entries that already exist rather than skipping them. Only meaningful alongside `--flatten-folders`, where archives can legitimately carry the same entry
 - `--no-permissions` — With `--from-dir`: ignore the host's Unix mode and ownership

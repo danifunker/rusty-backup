@@ -129,8 +129,52 @@ skips entries that already exist and reports the count. Pass `--force` to
 overwrite instead.
 
 The same `--from-dir` / `--size auto` flags work on `new hd sgi-efs` for a
-dvh-wrapped IRIX hard disk, and the TUI's new-image wizard offers the
-CD-ROM class with an optional source folder.
+dvh-wrapped IRIX hard disk. The TUI's new-image wizard offers the CD-ROM
+class for every disc target, with an optional source folder and a
+Space-toggled "Expand" row for `--expand-archives`
+(`--flatten-folders` stays CLI-only).
+
+## Build a classic Mac CD-ROM
+
+A Mac CD-ROM is an Apple Partition Map with one `Apple_HFS` partition — the
+Apple CD-ROM driver hands the ROM 512-byte logical blocks, so the map uses
+512-byte blocks even though the medium's sectors are 2048 bytes. Same flags
+as the IRIX disc above.
+
+```bash
+# Blank 600 MB HFS disc (readable by every Mac since System 3).
+rb-cli optical new mac-hfs mac.iso --size 600M --name "My CD"
+
+# HFS+ instead (Mac OS 8.1 and later), formatted and filled in one step.
+rb-cli optical new mac-hfsplus mac.iso --size auto --name "My CD" \
+    --from-dir ~/mac-stuff
+
+rb-cli ls   mac.iso@1 /
+rb-cli fsck mac.iso@1
+```
+
+The allocation block size is picked for you — HFS scales it up until the
+volume fits inside its 16-bit block count, so a 600 MB disc lands on 16 KiB
+blocks; `--block-size` overrides it (HFS+ takes a power of two up to 4096).
+
+`--expand-archives` unstuffs the folder's `.sit` / `.sea` / `.cpt` / `.hqx` /
+`.mar` archives onto the disc instead of copying them in packed, with both
+forks and each file's Finder type/creator intact — a disc the target Mac can
+run straight off. `--size auto` then measures what they unpack to (resource
+forks included), not their packed size:
+
+```bash
+rb-cli optical new mac-hfs mac.iso --size auto --name "My CD" \
+    --from-dir ~/mac-downloads --expand-archives
+```
+
+The same flag on `rb-cli import` does the same thing to an existing image.
+Tar archives are handled by the same pass, so a mixed folder works either way.
+
+These discs are Mac-only: no ISO 9660 volume descriptor is written, so a PC
+or a modern `mount -t iso9660` sees nothing. macOS mounts the HFS+ variant
+directly (`hdiutil attach`); classic HFS needs an emulator or a Mac running
+10.14 or earlier.
 
 ## Create a blank NTFS volume
 

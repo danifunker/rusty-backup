@@ -5861,16 +5861,19 @@ fn build_blank_hfsplus_front(
 }
 
 /// Streaming variant of [`create_blank_hfsplus`]. Writes the metadata
-/// regions (boot, VH, bitmap, B-trees, alt-VH) into `target` and leaves
-/// the free middle untouched. Caller is responsible for sizing the
-/// underlying file to `size_bytes` (e.g. via `File::set_len`) so reads of
-/// the free area return zeros.
+/// regions (boot, VH, bitmap, B-trees, alt-VH) into `target` at `at_offset`
+/// and leaves the free middle untouched. Caller is responsible for sizing
+/// the underlying file (e.g. via `File::set_len`) so reads of the free area
+/// return zeros.
 ///
-/// Used by the defrag-clone backup path so a 38 GiB blank target doesn't
-/// need 38 GiB of contiguous RAM. Only the front region (~2 MiB worst
-/// case) plus the 512-byte alt VH is held in memory.
+/// Used by the defrag-clone backup path and the Mac CD-ROM builder so a
+/// multi-hundred-MB blank target doesn't need that much contiguous RAM. Only
+/// the front region (~2 MiB worst case) plus the 512-byte alt VH is held in
+/// memory. `size_bytes` should be a whole multiple of `block_size`, otherwise
+/// the alt VH lands past the volume's last allocation block.
 pub fn write_blank_hfsplus_into<W: Write + Seek>(
     target: &mut W,
+    at_offset: u64,
     size_bytes: u64,
     block_size: u32,
     name: &str,
@@ -5878,9 +5881,9 @@ pub fn write_blank_hfsplus_into<W: Write + Seek>(
 ) -> std::io::Result<()> {
     let (front, vh_bytes, _image_size) =
         build_blank_hfsplus_front(size_bytes, block_size, name, case_sensitive, 0, 0);
-    target.seek(SeekFrom::Start(0))?;
+    target.seek(SeekFrom::Start(at_offset))?;
     target.write_all(&front)?;
-    target.seek(SeekFrom::Start(size_bytes - 1024))?;
+    target.seek(SeekFrom::Start(at_offset + size_bytes - 1024))?;
     target.write_all(&vh_bytes)?;
     target.write_all(&[0u8; 512])?;
     Ok(())

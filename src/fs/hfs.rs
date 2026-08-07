@@ -2445,6 +2445,19 @@ pub fn clone_target_btree_sizes(
     (catalog, extents)
 }
 
+/// Pick the smallest 512-byte-multiple allocation block size that keeps a
+/// volume of `volume_bytes` within HFS's 65535-block (`drNmAlBlks`) ceiling.
+pub fn pick_block_size(volume_bytes: u64) -> u32 {
+    let mut bs: u32 = 512;
+    while volume_bytes / bs as u64 > 65535 {
+        bs = bs.saturating_mul(2);
+        if bs == 0 {
+            return 1 << 16;
+        }
+    }
+    bs
+}
+
 /// Variant of [`create_blank_hfs`] that lets the caller request minimum
 /// extents-overflow and catalog B-tree sizes (in bytes). Each is rounded up
 /// to a whole allocation block; values smaller than the 4-block default are
@@ -2457,6 +2470,56 @@ pub fn create_blank_hfs_sized(
     min_extents_bytes: u32,
     min_catalog_bytes: u32,
 ) -> Result<Vec<u8>, FilesystemError> {
+    let (front, mdb, image_size) = build_blank_hfs_front(
+        target_size_bytes,
+        block_size,
+        volume_name,
+        min_extents_bytes,
+        min_catalog_bytes,
+    )?;
+    let mut img = vec![0u8; image_size as usize];
+    img[..front.len()].copy_from_slice(&front);
+    let alt_off = image_size as usize - 1024;
+    img[alt_off..alt_off + 512].copy_from_slice(&mdb);
+    Ok(img)
+}
+
+/// Streaming variant of [`create_blank_hfs_sized`]: writes the metadata regions
+/// (boot blocks, MDB, bitmap, B-trees, alternate MDB) at `at_offset` in `target`
+/// and leaves the free middle untouched. Returns the volume's image size, which
+/// is `target_size_bytes` rounded down to what a whole number of allocation
+/// blocks covers.
+///
+/// The caller sizes the backing file (`File::set_len`) so the untouched middle
+/// reads back as zeros — the same contract as [`crate::fs::efs::write_blank_efs`].
+pub fn write_blank_hfs_into<W: Write + Seek>(
+    target: &mut W,
+    at_offset: u64,
+    target_size_bytes: u64,
+    block_size: u32,
+    volume_name: &str,
+) -> Result<u64, FilesystemError> {
+    let (front, mdb, image_size) =
+        build_blank_hfs_front(target_size_bytes, block_size, volume_name, 0, 0)?;
+    target.seek(SeekFrom::Start(at_offset))?;
+    target.write_all(&front)?;
+    target.seek(SeekFrom::Start(at_offset + image_size - 1024))?;
+    target.write_all(&mdb)?;
+    target.write_all(&[0u8; 512])?;
+    Ok(image_size)
+}
+
+/// Build a blank HFS volume's front region (boot blocks, MDB, bitmap, both
+/// B-trees) plus the 512-byte MDB the tail mirrors and the total image size.
+/// Shared by the in-memory and streaming constructors above, so a multi-hundred-
+/// MB blank never has to materialize its free space in RAM.
+fn build_blank_hfs_front(
+    target_size_bytes: u64,
+    block_size: u32,
+    volume_name: &str,
+    min_extents_bytes: u32,
+    min_catalog_bytes: u32,
+) -> Result<(Vec<u8>, [u8; 512], u64), FilesystemError> {
     if block_size == 0 || !block_size.is_multiple_of(512) {
         return Err(FilesystemError::InvalidData(format!(
             "HFS block_size must be a non-zero multiple of 512 (got {block_size})"
@@ -2537,7 +2600,11 @@ pub fn create_blank_hfs_sized(
     // and the very last sector is reserved (zero). Reserve two trailing sectors.
     let image_size =
         first_alloc_block as u64 * 512 + total_blocks as u64 * block_size as u64 + 1024;
-    let mut img = vec![0u8; image_size as usize];
+    // Everything the format touches at the head is contiguous: the reserved
+    // sectors (boot blocks, MDB, bitmap) then the B-trees in the first
+    // allocation blocks. The rest of the volume is free space.
+    let front_size = first_alloc_block as usize * 512 + btree_blocks as usize * block_size as usize;
+    let mut front = vec![0u8; front_size];
 
     // Volume bitmap at sector 3: mark the first btree_blocks allocation
     // blocks as used (the rest remain free).
@@ -2545,14 +2612,14 @@ pub fn create_blank_hfs_sized(
     for b in 0..btree_blocks as u32 {
         let byte_idx = (b / 8) as usize;
         let bit_idx = 7 - (b % 8) as u8;
-        img[bitmap_off + byte_idx] |= 1 << bit_idx;
+        front[bitmap_off + byte_idx] |= 1 << bit_idx;
     }
 
     // Extents B-tree (header-only; no leaf records)
     let extents_bytes =
         build_empty_hfs_extents_btree_with_node_size(extents_size as usize, extents_node_size)?;
     let extents_off = first_alloc_block as u64 * 512 + extents_start as u64 * block_size as u64;
-    img[extents_off as usize..extents_off as usize + extents_bytes.len()]
+    front[extents_off as usize..extents_off as usize + extents_bytes.len()]
         .copy_from_slice(&extents_bytes);
 
     // Catalog B-tree with root directory (CNID 2) + its thread record.
@@ -2565,7 +2632,7 @@ pub fn create_blank_hfs_sized(
         &name_raw,
     )?;
     let catalog_off = first_alloc_block as u64 * 512 + catalog_start as u64 * block_size as u64;
-    img[catalog_off as usize..catalog_off as usize + catalog_bytes.len()]
+    front[catalog_off as usize..catalog_off as usize + catalog_bytes.len()]
         .copy_from_slice(&catalog_bytes);
 
     // Primary MDB at sector 2
@@ -2582,14 +2649,12 @@ pub fn create_blank_hfs_sized(
         extents_size,
         btree_blocks,
     );
-    img[1024..1024 + 512].copy_from_slice(&mdb);
+    front[1024..1024 + 512].copy_from_slice(&mdb);
 
-    // Alternate MDB at the next-to-last sector (= immediately after the last
-    // allocation block); the final sector stays zero (reserved by Apple).
-    let alt_off = image_size as usize - 1024;
-    img[alt_off..alt_off + 512].copy_from_slice(&mdb);
-
-    Ok(img)
+    // The alternate MDB goes at the next-to-last sector (= immediately after the
+    // last allocation block); the final sector stays zero (reserved by Apple).
+    // Both constructors place it from the returned copy.
+    Ok((front, mdb, image_size))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4012,6 +4077,40 @@ pub fn validate_hfs_integrity(
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    /// The streaming and in-memory blank formatters must agree byte for byte —
+    /// the streaming one only skips writing the free middle, which reads back
+    /// as zeros from a `set_len`'d file.
+    #[test]
+    fn write_blank_hfs_into_matches_create_blank_hfs() {
+        let (size, bs) = (8 * 1024 * 1024u64, 4096u32);
+        let mem = create_blank_hfs(size, bs, "StreamEq").unwrap();
+
+        let mut sink = Cursor::new(vec![0u8; 0]);
+        let written = write_blank_hfs_into(&mut sink, 0, size, bs, "StreamEq").unwrap();
+        let mut streamed = sink.into_inner();
+        streamed.resize(written as usize, 0);
+
+        assert_eq!(written as usize, mem.len());
+        assert_eq!(streamed, mem);
+    }
+
+    /// The same at a non-zero offset, which is how the Mac CD-ROM builder lays
+    /// the volume inside its `Apple_HFS` partition.
+    #[test]
+    fn write_blank_hfs_into_honours_the_offset() {
+        let (size, bs) = (4 * 1024 * 1024u64, 2048u32);
+        let mem = create_blank_hfs(size, bs, "Offset").unwrap();
+
+        let offset = 64 * 512u64;
+        let mut sink = Cursor::new(vec![0u8; 0]);
+        let written = write_blank_hfs_into(&mut sink, offset, size, bs, "Offset").unwrap();
+        let mut streamed = sink.into_inner();
+        streamed.resize((offset + written) as usize, 0);
+
+        assert!(streamed[..offset as usize].iter().all(|&b| b == 0));
+        assert_eq!(&streamed[offset as usize..], &mem[..]);
+    }
 
     #[test]
     fn test_mac_roman_to_utf8_ascii() {

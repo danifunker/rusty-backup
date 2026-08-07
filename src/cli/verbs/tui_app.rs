@@ -1342,14 +1342,20 @@ const NEW_CLASSES: &[(&str, DiskClass, &str)] = &[
     ),
 ];
 
-/// Disc targets offered under the "CD-ROM" class. One today; the list exists so
-/// a second optical layout drops in the same way the HD platforms do.
+/// Disc targets offered under the "CD-ROM" class. Each maps to one
+/// `optical new <target>` verb.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum CdTarget {
     SgiEfs,
+    MacHfs,
+    MacHfsPlus,
 }
 
-const CD_TARGETS: &[(&str, CdTarget)] = &[("SGI IRIX (EFS CD, slot-7 SYSV)", CdTarget::SgiEfs)];
+const CD_TARGETS: &[(&str, CdTarget)] = &[
+    ("SGI IRIX (EFS CD, slot-7 SYSV)", CdTarget::SgiEfs),
+    ("Classic Mac (APM + HFS)", CdTarget::MacHfs),
+    ("Mac OS 8.1+ (APM + HFS+)", CdTarget::MacHfsPlus),
+];
 
 /// Bootable hard-disk platforms offered under the "Hard disk" class. Each
 /// builds with its defaults; donor-cloning and custom partition layouts stay on
@@ -1467,14 +1473,20 @@ const VOLUME_FS: &[(&str, VolumeFs)] = &[
 ];
 
 /// The details form's text fields: path, size, name — plus, for a CD-ROM, an
-/// optional source folder. See [`NewWizard::field_count`].
+/// optional source folder and the expand-archives toggle. See
+/// [`NewWizard::field_count`].
 const WIZ_FIELDS: usize = 3;
+
+/// Index of the expand-archives toggle on the CD-ROM details form. The only
+/// non-text row, so the key handler special-cases it.
+const WIZ_FIELD_EXPAND: usize = 4;
 
 struct NewWizard {
     step: WizStep,
     class_sel: usize,
     fs_sel: usize,
-    /// Details form: 0 = path, 1 = size, 2 = name, 3 = source folder (CD only).
+    /// Details form: 0 = path, 1 = size, 2 = name, 3 = source folder (CD only),
+    /// 4 = expand-archives toggle (CD only).
     field: usize,
     path: String,
     size: String,
@@ -1482,6 +1494,10 @@ struct NewWizard {
     /// Host folder to fill a CD-ROM from, empty for a blank disc. Only
     /// reachable on the CD-ROM class; `rb-cli optical new sgi-efs --from-dir`.
     from_dir: String,
+    /// Unpack tar / classic-Mac archives found in [`Self::from_dir`] instead of
+    /// copying them in packed; `--expand-archives` on either CD verb. Also
+    /// changes what `--size auto` measures (what the archives unpack to).
+    expand_archives: bool,
     /// Tab-to-browse picker for the path field.
     picker: Option<FilePicker>,
     /// Result of the last create attempt (success or error text).
@@ -1500,6 +1516,7 @@ impl Default for NewWizard {
             size: "800K".to_string(),
             name: "rusty-backup".to_string(),
             from_dir: String::new(),
+            expand_archives: false,
             picker: None,
             status: None,
             is_error: false,
@@ -1534,11 +1551,12 @@ impl NewWizard {
         }
     }
 
-    /// Text fields on the details form. The CD-ROM class adds the optional
-    /// source-folder row; every other class stops at name.
+    /// Rows on the details form. The CD-ROM class adds the optional
+    /// source-folder row and the expand-archives toggle; every other class
+    /// stops at name.
     fn field_count(&self) -> usize {
         match self.class() {
-            DiskClass::Cdrom => WIZ_FIELDS + 1,
+            DiskClass::Cdrom => WIZ_FIELD_EXPAND + 1,
             _ => WIZ_FIELDS,
         }
     }
@@ -1867,6 +1885,14 @@ const OPTICAL_IMAGE_OPS: &[(&str, &str)] = &[
     (
         "New blank CD-ROM (SGI EFS)",
         "optical new sgi-efs \"<OUTPUT.iso>\"",
+    ),
+    (
+        "New blank CD-ROM (Mac HFS)",
+        "optical new mac-hfs \"<OUTPUT.iso>\"",
+    ),
+    (
+        "New blank CD-ROM (Mac HFS+)",
+        "optical new mac-hfsplus \"<OUTPUT.iso>\"",
     ),
 ];
 
@@ -5515,8 +5541,18 @@ impl App {
                         0 => w.path.pop(),
                         1 => w.size.pop(),
                         2 => w.name.pop(),
+                        // The toggle row holds no text to erase.
+                        WIZ_FIELD_EXPAND => None,
                         _ => w.from_dir.pop(),
                     };
+                    true
+                }
+                // Space flips the toggle rather than typing into it; every
+                // other row takes it as an ordinary character (a volume name
+                // may well contain one).
+                KeyCode::Char(' ') if w.field == WIZ_FIELD_EXPAND => {
+                    w.status = None;
+                    w.expand_archives = !w.expand_archives;
                     true
                 }
                 KeyCode::Char(c) if !c.is_control() => {
@@ -5525,6 +5561,7 @@ impl App {
                         0 => w.path.push(c),
                         1 => w.size.push(c),
                         2 => w.name.push(c),
+                        WIZ_FIELD_EXPAND => {}
                         _ => w.from_dir.push(c),
                     }
                     true
@@ -5550,13 +5587,14 @@ impl App {
         let size = w.size.trim().to_string();
         let name = w.name.trim().to_string();
         let from_dir = w.from_dir.trim().to_string();
-        // A CD-ROM is built by `optical new sgi-efs`, which is a different
+        // A CD-ROM is built by `optical new <target>`, which is a different
         // command tree from `new` — so the wizard produces one of two shapes
         // and dispatches accordingly rather than forcing everything through
         // `NewCommand`.
         if w.class() == DiskClass::Cdrom {
             let target = CD_TARGETS[w.fs_sel.min(CD_TARGETS.len() - 1)].1;
-            self.newdisk_create_cdrom(target, path, size, name, from_dir);
+            let expand = w.expand_archives;
+            self.newdisk_create_cdrom(target, path, size, name, from_dir, expand);
             return;
         }
         let cmd = match w.class() {
@@ -5689,10 +5727,12 @@ impl App {
 
     /// Build a CD-ROM disc image, optionally filling it from a host folder.
     ///
-    /// Mirrors `rb-cli optical new sgi-efs`, including `--size auto`. Archive
-    /// expansion (`--expand-archives` / `--flatten-folders`) stays CLI-only:
-    /// the choice is content-dependent enough that a wizard toggle would be
-    /// guessing on the user's behalf, and it is one flag away on the CLI.
+    /// Mirrors `rb-cli optical new <target>`, including `--size auto` and
+    /// `--expand-archives`. Only `--flatten-folders` stays CLI-only: it is
+    /// meaningful for an IRIX `inst` distribution and near-meaningless
+    /// elsewhere, so it would be a fourth row that misleads on two of the
+    /// three targets.
+    #[allow(clippy::too_many_arguments)]
     fn newdisk_create_cdrom(
         &mut self,
         target: CdTarget,
@@ -5700,6 +5740,7 @@ impl App {
         size: String,
         name: String,
         from_dir: String,
+        expand_archives: bool,
     ) {
         let from = (!from_dir.is_empty()).then(|| expand_tilde(&from_dir));
         if let Some(d) = &from {
@@ -5716,24 +5757,45 @@ impl App {
             w.is_error = true;
             return;
         }
-        let args = match target {
-            CdTarget::SgiEfs => crate::cli::verbs::new_sgi_cdrom::NewSgiCdromArgs {
-                image: path.clone(),
-                size,
-                name,
-                inodes: None,
-                bytes_per_inode: None,
-                from_dir: from,
-                expand_archives: false,
-                flatten_folders: false,
-                force: false,
-                no_permissions: false,
-                include_appledouble: false,
-            },
-        };
-        // Same reason as `new::run` above: the builder logs advisories that
+        // Same reason as `new::run` above: the builders log advisories that
         // would otherwise scribble on the alt-screen.
-        let outcome = with_stderr_suppressed(|| crate::cli::verbs::new_sgi_cdrom::run(args));
+        let outcome = with_stderr_suppressed(|| match target {
+            CdTarget::SgiEfs => crate::cli::verbs::new_sgi_cdrom::run(
+                crate::cli::verbs::new_sgi_cdrom::NewSgiCdromArgs {
+                    image: path.clone(),
+                    size,
+                    name,
+                    inodes: None,
+                    bytes_per_inode: None,
+                    from_dir: from,
+                    expand_archives,
+                    flatten_folders: false,
+                    force: false,
+                    no_permissions: false,
+                    include_appledouble: false,
+                },
+            ),
+            CdTarget::MacHfs | CdTarget::MacHfsPlus => {
+                let fs = if target == CdTarget::MacHfs {
+                    crate::partition::mac_cd_builder::MacCdFs::Hfs
+                } else {
+                    crate::partition::mac_cd_builder::MacCdFs::HfsPlus
+                };
+                crate::cli::verbs::new_mac_cdrom::run(
+                    fs,
+                    crate::cli::verbs::new_mac_cdrom::NewMacCdromArgs {
+                        image: path.clone(),
+                        size,
+                        name,
+                        from_dir: from,
+                        expand_archives,
+                        force: false,
+                        include_appledouble: false,
+                        block_size: None,
+                    },
+                )
+            }
+        });
         let w = self.newdisk.as_mut().unwrap();
         match outcome {
             Ok(()) => {
@@ -8982,6 +9044,31 @@ impl App {
                         &w.from_dir,
                         "(optional: folder to fill the disc from, Tab to browse)",
                     ));
+                    // The toggle only bites with a source folder, so it reads
+                    // dim until one is set.
+                    let armed = !w.from_dir.trim().is_empty();
+                    let active = w.field == WIZ_FIELD_EXPAND;
+                    let box_ = if w.expand_archives { "[x]" } else { "[ ]" };
+                    let label_style = if armed || active {
+                        Style::default()
+                    } else {
+                        self.palette.dim()
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled("  Expand: ", self.palette.accent()),
+                        Span::styled(
+                            format!("{box_} unpack .tar / .sit / .cpt / .hqx into the disc"),
+                            label_style,
+                        ),
+                        if active {
+                            Span::styled(
+                                " ",
+                                self.palette.accent().add_modifier(Modifier::REVERSED),
+                            )
+                        } else {
+                            Span::raw("")
+                        },
+                    ]));
                 }
                 lines.push(Line::raw(""));
                 if let Some(s) = &w.status {
@@ -8994,7 +9081,11 @@ impl App {
                     lines.push(Line::raw(""));
                 }
                 lines.push(Line::styled(
-                    "Up/Down field   Tab browse (path/folder)   Enter create   Esc back",
+                    if w.class() == DiskClass::Cdrom {
+                        "Up/Down field   Tab browse (path/folder)   Space toggle   Enter create   Esc back"
+                    } else {
+                        "Up/Down field   Tab browse (path/folder)   Enter create   Esc back"
+                    },
                     self.palette.dim(),
                 ));
             }
@@ -10548,13 +10639,16 @@ impl App {
         } else if self.current() == TabId::NewDisk {
             let step = self.newdisk.as_ref().map(|w| w.step);
             match step {
-                Some(WizStep::Details) => vec![
-                    ("<-/->", "Tabs"),
-                    ("Up/Dn", "Field"),
-                    ("Tab", "Browse"),
-                    ("Enter", "Create"),
-                    ("Esc", "Back"),
-                ],
+                Some(WizStep::Details) => {
+                    let mut keys = vec![("<-/->", "Tabs"), ("Up/Dn", "Field"), ("Tab", "Browse")];
+                    // The toggle row only exists on the CD-ROM class.
+                    if self.newdisk.as_ref().map(|w| w.class()) == Some(DiskClass::Cdrom) {
+                        keys.push(("Space", "Toggle"));
+                    }
+                    keys.push(("Enter", "Create"));
+                    keys.push(("Esc", "Back"));
+                    keys
+                }
                 _ => vec![
                     ("<-/->", "Tabs"),
                     ("Up/Dn", "Select"),
@@ -12312,15 +12406,54 @@ mod tests {
         w
     }
 
-    /// The CD-ROM class carries an extra "source folder" row. If `field_count`
-    /// didn't grow with it, Up/Down would never reach the field and Tab from
-    /// Name would wrap straight back to Path.
+    /// The CD-ROM class carries two extra rows — "source folder" and the
+    /// expand-archives toggle. If `field_count` didn't grow with them, Up/Down
+    /// would never reach them and Tab from Name would wrap back to Path.
     #[test]
     fn cdrom_class_exposes_the_source_folder_field() {
-        assert_eq!(wizard_on(DiskClass::Cdrom).field_count(), WIZ_FIELDS + 1);
+        assert_eq!(
+            wizard_on(DiskClass::Cdrom).field_count(),
+            WIZ_FIELD_EXPAND + 1
+        );
         for other in [DiskClass::Floppy, DiskClass::Volume, DiskClass::Hd] {
             assert_eq!(wizard_on(other).field_count(), WIZ_FIELDS);
         }
+    }
+
+    /// Space flips the expand-archives toggle on its own row, and stays an
+    /// ordinary character everywhere else — a volume name may contain one.
+    #[test]
+    fn space_toggles_expand_archives_only_on_its_row() {
+        let mut app = App::new_on(DEFAULT_TAB);
+        app.newdisk = Some(wizard_on(DiskClass::Cdrom));
+        {
+            let w = app.newdisk.as_mut().unwrap();
+            w.step = WizStep::Details;
+            w.name = "My".to_string();
+            w.field = 2;
+        }
+        app.handle_newdisk_key(KeyCode::Char(' '));
+        {
+            let w = app.newdisk.as_ref().unwrap();
+            assert_eq!(w.name, "My ", "Space types into the name field");
+            assert!(!w.expand_archives);
+        }
+
+        app.newdisk.as_mut().unwrap().field = WIZ_FIELD_EXPAND;
+        app.handle_newdisk_key(KeyCode::Char(' '));
+        assert!(app.newdisk.as_ref().unwrap().expand_archives, "toggled on");
+        app.handle_newdisk_key(KeyCode::Char(' '));
+        assert!(
+            !app.newdisk.as_ref().unwrap().expand_archives,
+            "toggled back off"
+        );
+
+        // The toggle row holds no text: typing and Backspace must not corrupt
+        // the source-folder field it sits under.
+        app.newdisk.as_mut().unwrap().from_dir = "/tmp/src".to_string();
+        app.handle_newdisk_key(KeyCode::Char('x'));
+        app.handle_newdisk_key(KeyCode::Backspace);
+        assert_eq!(app.newdisk.as_ref().unwrap().from_dir, "/tmp/src");
     }
 
     /// Every class needs its own sensible default size, and `auto` — which
@@ -12365,6 +12498,12 @@ mod tests {
         // other classes.
         assert_eq!(w.fs_label(999), CD_TARGETS[CD_TARGETS.len() - 1].0);
         assert_eq!(CD_TARGETS[0].1, CdTarget::SgiEfs);
+        assert!(
+            CD_TARGETS
+                .iter()
+                .any(|(_, t)| *t == CdTarget::MacHfs || *t == CdTarget::MacHfsPlus),
+            "the Mac disc targets are reachable from the wizard"
+        );
     }
 
     /// The TUI explorer's metadata editor has to reach POSIX mode and owner,
