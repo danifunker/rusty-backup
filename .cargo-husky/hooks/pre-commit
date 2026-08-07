@@ -39,6 +39,20 @@ cargo check --all-targets
 echo "pre-commit: cargo clippy --all-targets -- -D warnings"
 cargo clippy --all-targets -- -D warnings
 
+# --- 3b. Lint the regression harness ----------------------------------------
+# regression-tests/runner is its OWN crate, not a member of the root
+# workspace, so steps 2 and 3 never see it. It accumulated ten warnings that
+# way before anyone noticed. Only runs when the commit touches it, so the
+# usual engine commit pays nothing.
+staged_regress=$(git diff --cached --name-only --diff-filter=ACMR \
+  | grep -E '^regression-tests/runner/' || true)
+
+if [ -n "$staged_regress" ]; then
+  echo "pre-commit: regression-tests/runner changed — clippy there too"
+  cargo clippy --manifest-path regression-tests/runner/Cargo.toml \
+    --all-targets -- -D warnings
+fi
+
 # --- 4. Regenerate CLI docs when the grammar may have changed ---------------
 # The reference (docs/cli-reference.md) and HTML bundle (docs/cli-html-help/)
 # are generated from the clap definitions under src/cli/. Regenerate and

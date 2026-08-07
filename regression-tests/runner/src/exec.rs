@@ -17,6 +17,8 @@ pub struct Output {
     pub exit_code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
+    /// Captured for every step; no report surfaces per-step timing yet.
+    #[allow(dead_code)]
     pub duration: Duration,
     pub timed_out: bool,
 }

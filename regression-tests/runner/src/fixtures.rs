@@ -12,6 +12,9 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// One catalogue row. The trailing columns are unread today and kept anyway:
+/// this struct is the only in-code record of the TSV's shape.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct FixtureRow {
     pub id: String,
@@ -47,8 +50,10 @@ impl Catalog {
     /// than duplicated onto the NAS. Those rows work on any clone with no
     /// network at all.
     pub fn load(root: Option<&Path>, repo_root: Option<&Path>) -> Catalog {
-        let mut cat = Catalog::default();
-        cat.repo_root = repo_root.map(|p| p.to_path_buf());
+        let mut cat = Catalog {
+            repo_root: repo_root.map(|p| p.to_path_buf()),
+            ..Default::default()
+        };
 
         // The repo-backed half of the catalogue is usable even with no NAS
         // reachable, so load it before bailing out on a missing corpus.
@@ -236,6 +241,8 @@ impl Catalog {
         self.rows.len()
     }
 
+    /// Unused, but `len` without it is its own clippy lint.
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
     }

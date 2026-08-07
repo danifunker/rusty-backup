@@ -66,6 +66,8 @@ impl JobKind {
 #[derive(Debug)]
 pub struct Gap {
     pub format: String,
+    /// Classifies the gap; `render` groups by section instead, for now.
+    #[allow(dead_code)]
     pub kind: String,
     pub reason: String,
 }

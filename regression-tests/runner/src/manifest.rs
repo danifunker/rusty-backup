@@ -59,6 +59,8 @@ pub struct Meta {
     pub tier: u8,
     /// Human-facing grouping, used to cluster failures in the summary.
     pub group: String,
+    /// Read by humans in the manifest; no report renders it yet.
+    #[allow(dead_code)]
     #[serde(default)]
     pub description: Option<String>,
 }

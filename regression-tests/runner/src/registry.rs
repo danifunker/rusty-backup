@@ -351,10 +351,6 @@ impl Registry {
         Ok(r)
     }
 
-    pub fn format(&self, id: &str) -> Option<&Format> {
-        self.formats.iter().find(|f| f.id == id)
-    }
-
     /// Formats we can write with no independent oracle behind them.
     pub fn unverified_writes(&self) -> Vec<&Format> {
         self.formats

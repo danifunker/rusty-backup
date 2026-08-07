@@ -19,6 +19,9 @@ use serde_json::Value;
 
 #[derive(Debug)]
 pub struct Parsed {
+    /// Parsed and named because it is the envelope contract's version field;
+    /// no assertion reads it yet.
+    #[allow(dead_code)]
     pub schema_version: u64,
     pub status_error: bool,
     pub status_code: i64,

@@ -212,7 +212,7 @@ fn produce_once(
         ));
     }
     let artifact = match &recipe.produces {
-        Some(p) => std::path::PathBuf::from(expand(&[p.clone()], &out, work).remove(0)),
+        Some(p) => std::path::PathBuf::from(expand(std::slice::from_ref(p), &out, work).remove(0)),
         None => out.clone(),
     };
     // An exit code of 0 with no file is its own failure, and one worth naming

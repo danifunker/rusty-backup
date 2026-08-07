@@ -304,7 +304,8 @@ impl Bundle {
         } else {
             s.push_str("Clustered so a single root cause reads as one entry.\n\n");
             let mut groups: Vec<_> = by_group.iter().collect();
-            groups.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+            // Worst-first, so the biggest cluster is the first thing read.
+            groups.sort_by_key(|(_, ids)| std::cmp::Reverse(ids.len()));
             for (group, ids) in groups {
                 s.push_str(&format!("### `{}` — {} failing\n\n", group, ids.len()));
                 for id in ids {
