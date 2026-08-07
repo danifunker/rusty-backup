@@ -251,23 +251,58 @@ The two produce runs are **two passes over the whole recipe set at least three
 seconds apart**, not two back-to-back runs of one recipe. Measured 2026-08-07
 on Windows:
 
-| pairing | HFS | HFS+ | ext2 | NTFS |
-|---------|----:|-----:|-----:|-----:|
-| back-to-back | 0 | 0 | 4 | 0 |
-| 3 seconds apart | 6 | 10 | 13 | 0 |
+| pairing | HFS | HFS+ | ext2 | ProDOS | NTFS |
+|---------|----:|-----:|-----:|-------:|-----:|
+| back-to-back | 0 | 0 | 4 | 0 | 0 |
+| 3 seconds apart | 6 | 10 | 13 | **0** | 0 |
+| 65 seconds apart | 6 | 10 | 13 | **1** | 0 |
 
 A fast builder writes both copies inside one clock tick, the embedded
 timestamp does not move, and the range is never discovered. That does not fail
 the run — it makes `parity` report a false divergence on the *next* host,
-which is worse. The 3-second floor clears both the one-second granularity
-HFS/ext use and a two-second DOS timestamp.
+which is worse.
 
-Discovery still only finds a **lower bound**. Two samples seconds apart move
-the low byte of a seconds field and not the high ones, so hosts producing days
+ProDOS is why the gap is now **65 seconds** rather than 3. It stamps the
+volume directory header to the *minute*, so a 3-second pair never crosses a
+boundary and the field reads as deterministic. The first three-OS parity run
+duly reported `fs.prodos` differing by one byte between Windows and the other
+two — byte 0x41E, minute 45 against minute 46. A false finding, and the
+expensive kind. 65 seconds guarantees a minute boundary; finding one byte of
+the field is enough, because the adjacency rule below then covers the hour and
+date bytes beside it.
+
+Discovery still only finds a **lower bound**. Two samples a minute apart move
+the low bytes of a time field and not the high ones, so hosts producing days
 apart can differ in bytes this never saw vary. `parity` handles that by
 reporting a divergence within 8 bytes of a known volatile range as *adjacent*
 and printing the count, rather than either calling it a finding or silently
-widening the mask.
+widening the mask. A field coarser than a minute — an hour-granularity stamp —
+is out of reach of this method entirely and must be declared.
+
+### Declaring a difference that discovery can never find
+
+Some differences are stable on any one host and vary only by *which* host
+built the artifact, so no amount of local sampling finds them. VHD's Creator
+Host OS is the case in hand: macOS writes `"Mac "`, Windows and Linux write
+`"Wi2k"` (R-019). A recipe declares those:
+
+```toml
+[[recipe.expect_divergence]]
+from_end = 476     # footer is the last 512 bytes; +0x24 is Creator Host OS
+len = 4
+reason = "..."
+```
+
+`at` gives an absolute offset, `from_end` an offset back from EOF — footers
+are anchored to the end, so an absolute offset silently points at the wrong
+bytes the moment a recipe's `--size` changes. Ranges resolve against the real
+artifact at produce time and land in `meta.json`, so `parity` never needs the
+recipe file.
+
+Keep them narrow. The exemption covers the 4 bytes, not the footer and not the
+format; a byte one past the range is still a finding; and `parity` prints the
+reason on every match that used one. An unexplained exemption is just a
+quieter blind spot.
 
 ---
 

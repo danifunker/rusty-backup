@@ -19,7 +19,7 @@ finding depends on a fixture, the fixture is named.
 
 | ID | Severity | Area | Finding |
 |----|----------|------|---------|
-| [R-019](#r-019) | Low | `src/rbformats/vhd.rs` | VHD Creator Host OS makes output non-reproducible across platforms, inconsistently |
+| [R-019](#r-019) | Low — **accepted** | `src/rbformats/vhd.rs` | VHD Creator Host OS makes output non-reproducible across platforms; behaviour kept, parity declares it |
 | [R-016](#r-016) | **High** | `src/cli/verbs/backup.rs` | `backup` accepts only flat-layout sources: CHD, dynamic VHD, QCOW2 and VMDK all fail |
 | ~~R-018~~ | ~~Blocker~~ **FIXED** | `CONTRIBUTING.md` | ~~The documented Rust-1.73 verification build does not compile on Windows~~ — missing `windows-legacy` feature, 2026-08-07 |
 | ~~R-017~~ | ~~High~~ **FIXED** | `src/partition/mod.rs` | ~~Superfloppy detection also misses SFS (extends R-009)~~ — probe added 2026-08-07 |
@@ -186,10 +186,20 @@ variant. It is recorded because of the consequence and the inconsistency:
    macOS writes the truthful `"Mac "`. Whichever principle is right,
    compatibility or fidelity, only one of the two platforms is following it.
 
-Needs a decision, not a fix: either macOS also writes `"Wi2k"` and VHD output
-becomes byte-identical everywhere, or `"Mac "` stays and `parity` gains a way
-to declare a per-format expected divergence. Silently leaving it means every
-future parity run reports four DIFFs that someone has to re-diagnose.
+**Resolved 2026-08-07 by keeping the behaviour and declaring it.** The field
+is spec-legal and the divergence is intentional, so `vhd.rs` is untouched.
+`produce.toml` now carries an `expect_divergence` declaration for both VHD
+recipes and `parity` honours it.
+
+The exemption is deliberately narrow and loud: it covers 4 bytes rather than
+the footer or the format, a byte one past the declared range is still a
+finding, and every match that used it prints the reason. Counts stay separate
+— `identical outside 18 masked + 4 expected byte(s)` — so an exemption can
+never be mistaken for agreement.
+
+Point 2 above still stands as an open inconsistency: Linux lies for
+compatibility, macOS tells the truth. Nothing depends on resolving it, but if
+uniformity is ever wanted, the declaration is one line to delete.
 
 The creation timestamp at footer offset 0x18 also differs, as expected, and
 was correctly absorbed by the volatile-range mask — 18 masked bytes on
