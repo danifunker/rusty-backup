@@ -5,6 +5,11 @@ Defects and documentation drift turned up while building the regression suite
 suite work was deliberately kept separate from bug fixing, and nothing outside
 `regression-tests/` was modified while finding them.
 
+Capability gaps — things the engine never claimed to do — are tracked
+separately in [`missing_features_from_regression.md`](missing_features_from_regression.md).
+This file is for defects: code disagreeing with its own documentation or
+with reality.
+
 Every entry was reproduced against `target/release/rb-cli` on Windows. Where a
 finding depends on a fixture, the fixture is named.
 
@@ -12,6 +17,8 @@ finding depends on a fixture, the fixture is named.
 
 | ID | Severity | Area | Finding |
 |----|----------|------|---------|
+| [R-015](#r-015) | Medium | `src/optical/` (cue parser) | A `.cue` with unpadded track numbers (`TRACK 1`) is rejected |
+| [R-014](#r-014) | **Blocker** | `src/cli/verbs/squashfs.rs` | Pre-existing clippy failure blocks every commit via the pre-commit hook |
 | [R-008b](#r-008b) | **High** | `src/fs/affs.rs` | `new volume affs --size 4M` panics; no file produced, exit 101 |
 | [R-007](#r-007) | **High** | `src/fs/ntfs_format.rs` | Freshly formatted NTFS fails its own fsck, incl. `BackupBootMismatch` |
 | [R-009](#r-009) | **High** | `src/partition/mod.rs` | Bare JFS / UFS1 / UFS2 / ReiserFS images cannot be opened at all |
@@ -26,6 +33,55 @@ finding depends on a fixture, the fixture is named.
 | [R-011](#r-011) | Unknown | `src/rbformats/` | G64 decoding fails on copy-protected / patched dumps |
 | [R-001](#r-001) | Doc | `README.md` | Partition-table list missing AHDI and X68000 |
 | [R-002](#r-002) | Doc | `src/fs/README.md` | Capability table stale — ext listed as "planned" |
+
+---
+
+## Blocker
+
+### R-014 — clippy fails on `SquashfsCommand`, blocking every commit {#r-014}
+
+`cargo clippy --all-targets -- -D warnings` fails on a clean tree:
+
+```
+error: large size difference between variants
+  --> src\clierbs\squashfs.rs:28:1
+   |
+28 | pub enum SquashfsCommand {
+33 |     Put(SquashfsPutArgs),
+   |     -------------------- the largest variant contains at least 400 bytes
+35 |     Rm(SquashfsRmArgs),
+   |     ------------------ the second-largest variant contains at least 192 bytes
+   |
+   = note: `-D clippy::large-enum-variant` implied by `-D warnings`
+error: could not compile `rusty-backup` (lib) due to 1 previous error
+```
+
+The repository's pre-commit hook runs exactly that command, so **no commit
+can be made until this is resolved** — including commits that touch nothing
+but `tests/`.
+
+Confirmed pre-existing: it reproduces on a clean `HEAD` with all local work
+stashed. The lint URL names `rust-1.96.0`, so this is a newer clippy
+tightening `large_enum_variant` against code that has not changed, rather
+than a recent regression.
+
+Clippy's own suggestion is a one-line fix:
+
+```rust
+Put(Box<SquashfsPutArgs>),
+```
+
+`Rm` at 192 bytes may want the same treatment, and boxing only `Put` may
+simply move the complaint to the next-largest variant — worth checking the
+lint passes rather than assuming.
+
+Not fixed here: this file is engine code, and the session that found it was
+scoped to `regression-tests/` with an explicit instruction not to change
+anything outside it. Flagging rather than silently widening that scope.
+
+Discovered 2026-08-07 while committing `tests/cli_suite/cli_native_slots.rs`,
+which is written, passing and mutation-verified but cannot be committed until
+this clears.
 
 ---
 
@@ -135,6 +191,44 @@ ever exercised. Fixture: `part.sun.solaris-disk.multipart` (annex).
 ---
 
 ## Medium
+
+### R-015 — cue sheets with unpadded track numbers are rejected {#r-015}
+
+A CUE sheet written with `TRACK 1` rather than `TRACK 01` fails to parse:
+
+```
+rb-cli optical info BOOKSHELF.cue
+  Container:   unknown
+  Filesystems: (none recognized)
+  warning: unrecognized disc image: CUE error:
+    Error(Msg("Expeceted number but found String(\"1\") instead"), ...)
+```
+
+Confirmed as zero-padding and nothing else. The same disc parses when the
+track number is padded, and every cue currently in the corpus happens to use
+the padded form:
+
+| cue | track line | result |
+|-----|-----------|--------|
+| `mixedmode-both.cue` | `TRACK 01 MODE1/2352` | parses |
+| `BOOKSHELF.cue` | `TRACK 1 MODE1/2352` | **rejected** |
+
+The CUE format does not require zero-padding, and real tools emit both —
+this sheet came from CloneCD alongside a `.ccd`/`.sub` pair. So any disc
+ripped by such a tool is unreadable through the cue path, and the failure
+surfaces as "unrecognized disc image" rather than as a parse problem the user
+could act on.
+
+Note the upstream message also carries a typo ("Expeceted"), which places the
+fault in the cue-parsing dependency rather than in our own code — worth
+checking whether it is fixed upstream before working around it locally.
+
+Found 2026-08-07 while triaging the fixture drop folder. No fixture is needed
+to reproduce: take any working cue and remove the leading zero from a track
+number.
+
+---
+
 
 ### R-005 — no error envelope under `--format json` {#r-005}
 
@@ -322,6 +416,7 @@ it and point at the README.
 
 ## Suggested order
 
+0. **R-014** — nothing else can be committed until this clears.
 1. **R-008b** — a panic with no file produced is the worst failure mode here,
    and R-008a shares its fix.
 2. **R-009** — smallest change of the high-severity set; unlocks four
