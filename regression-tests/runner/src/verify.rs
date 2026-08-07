@@ -132,22 +132,6 @@ fn expand(args: &[String], artifact: &Path) -> Vec<String> {
         .collect()
 }
 
-/// Make a path absolute without `canonicalize`, whose `\\?\` prefix on Windows
-/// confuses tools that parse their own arguments.
-///
-/// Checks run with the artifact's directory as cwd, so a relative
-/// `--artifacts` would otherwise be resolved twice and every oracle would
-/// report "No such file or directory" as a FAIL — a whole tree of findings
-/// that are really one path bug.
-fn absolutise(p: &Path) -> PathBuf {
-    if p.is_absolute() {
-        return p.to_path_buf();
-    }
-    std::env::current_dir()
-        .map(|cwd| cwd.join(p))
-        .unwrap_or_else(|_| p.to_path_buf())
-}
-
 /// Every artifact in the tree, across all producer OSes.
 fn walk_artifacts(root: &Path) -> Vec<(ArtifactMeta, PathBuf)> {
     let mut out = Vec::new();
@@ -193,7 +177,7 @@ pub fn verify(
     let platform = exec::platform_token();
     fs::create_dir_all(out_dir).map_err(|e| format!("{}: {}", out_dir.display(), e))?;
 
-    let artifacts_root = &absolutise(artifacts_root);
+    let artifacts_root = &exec::absolutise(artifacts_root);
     let artifacts = walk_artifacts(artifacts_root);
     if artifacts.is_empty() {
         return Err(format!(

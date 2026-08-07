@@ -5,7 +5,7 @@
 //! — the whole suite is built around always reaching the end.
 
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -139,6 +139,24 @@ pub fn tool_available(tool: &str) -> bool {
         }
     }
     false
+}
+
+/// Make a path absolute without `canonicalize`, whose `\?\` prefix on Windows
+/// breaks tools that parse their own arguments.
+///
+/// Every subprocess here runs with a scratch or artifact directory as its cwd,
+/// and the two platforms disagree about what a relative *program* path means:
+/// Windows resolves it against the parent's cwd, Unix against the child's,
+/// after the chdir. So `--rb-cli ../../target/release/rb-cli` works on Windows
+/// and cannot launch anything on Linux or macOS. Absolutising at the boundary
+/// makes the two agree.
+pub fn absolutise(p: &Path) -> PathBuf {
+    if p.is_absolute() {
+        return p.to_path_buf();
+    }
+    std::env::current_dir()
+        .map(|cwd| cwd.join(p))
+        .unwrap_or_else(|_| p.to_path_buf())
 }
 
 /// Short platform token used by `platforms` filters and report directory

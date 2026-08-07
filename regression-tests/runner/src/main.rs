@@ -221,6 +221,18 @@ fn parse_args() -> Result<Args, String> {
         i += 1;
     }
 
+    // Cases and recipes all run with a scratch directory as cwd, so anything
+    // that becomes a program path or is handed to a subprocess must be
+    // absolute before it gets there. See exec::absolutise.
+    // A bare name like `rb-cli` is a PATH lookup, not a path; absolutising it
+    // would turn it into <cwd>/rb-cli and break the default.
+    if args.rb_cli.components().count() > 1 {
+        args.rb_cli = exec::absolutise(&args.rb_cli);
+    }
+    args.scratch_root = exec::absolutise(&args.scratch_root);
+    args.artifacts_root = exec::absolutise(&args.artifacts_root);
+    args.verifications_root = exec::absolutise(&args.verifications_root);
+
     Ok(args)
 }
 
