@@ -1,4 +1,4 @@
-# Regression Findings (R-001 … R-018)
+# Regression Findings (R-001 … R-019)
 
 Defects and documentation drift turned up while building the regression suite
 (`regression-tests/`), 2026-08-01/02. The suite work was deliberately kept
@@ -19,6 +19,7 @@ finding depends on a fixture, the fixture is named.
 
 | ID | Severity | Area | Finding |
 |----|----------|------|---------|
+| [R-019](#r-019) | Low | `src/rbformats/vhd.rs` | VHD Creator Host OS makes output non-reproducible across platforms, inconsistently |
 | [R-016](#r-016) | **High** | `src/cli/verbs/backup.rs` | `backup` accepts only flat-layout sources: CHD, dynamic VHD, QCOW2 and VMDK all fail |
 | ~~R-018~~ | ~~Blocker~~ **FIXED** | `CONTRIBUTING.md` | ~~The documented Rust-1.73 verification build does not compile on Windows~~ — missing `windows-legacy` feature, 2026-08-07 |
 | ~~R-017~~ | ~~High~~ **FIXED** | `src/partition/mod.rs` | ~~Superfloppy detection also misses SFS (extends R-009)~~ — probe added 2026-08-07 |
@@ -151,6 +152,49 @@ fixed in the following session once the scope was lifted.
 Discovered 2026-08-07 while committing `tests/cli_suite/cli_native_slots.rs`,
 which was written, passing and mutation-verified but could not be committed
 until this cleared.
+
+---
+
+## Low
+
+### R-019 — VHD output is not byte-reproducible across platforms {#r-019}
+
+Found by the first three-OS `parity` run, 2026-08-07. 101 of 105 comparisons
+matched; all four divergences were VHD, and all four were the same four bytes.
+
+```
+DIFF  fmt.vhd-dynamic   macos vs windows   8 byte(s) outside the mask
+        @0x00000024  4d != 57      "M" vs "W"
+        @0x00000025  61 != 69      "a" vs "i"
+        @0x00000026  63 != 32      "c" vs "2"
+        @0x00000027  20 != 6b      " " vs "k"
+```
+
+Footer offset 0x24 is **Creator Host OS**. macOS writes `"Mac "`, Windows and
+Linux write `"Wi2k"`. Dynamic VHDs carry the footer twice, so they diverge in
+eight bytes rather than four.
+
+This is deliberate — `src/rbformats/vhd.rs:82-86` writes it explicitly — and
+spec-legal: the field is *meant* to record the creating host. So it is not a
+correctness defect, and both `qemu-img info` and our own reader accept every
+variant. It is recorded because of the consequence and the inconsistency:
+
+1. **A VHD built on a Mac never checksums equal to the same VHD built on
+   Windows.** Anything comparing images across machines has to know that.
+2. **The policy is applied unevenly.** Linux writes `"Wi2k"` with the comment
+   "use Windows ID (most compatible)" — a deliberate lie for compatibility.
+   macOS writes the truthful `"Mac "`. Whichever principle is right,
+   compatibility or fidelity, only one of the two platforms is following it.
+
+Needs a decision, not a fix: either macOS also writes `"Wi2k"` and VHD output
+becomes byte-identical everywhere, or `"Mac "` stays and `parity` gains a way
+to declare a per-format expected divergence. Silently leaving it means every
+future parity run reports four DIFFs that someone has to re-diagnose.
+
+The creation timestamp at footer offset 0x18 also differs, as expected, and
+was correctly absorbed by the volatile-range mask — 18 masked bytes on
+`fmt.vhd-fixed`. That is the mask doing its job, and the reason these four
+bytes stood out at all.
 
 ---
 
