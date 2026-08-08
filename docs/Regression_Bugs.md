@@ -1,4 +1,4 @@
-# Regression Findings (R-001 … R-019)
+# Regression Findings (R-001 … R-020)
 
 Defects and documentation drift turned up while building the regression suite
 (`regression-tests/`), 2026-08-01/02. The suite work was deliberately kept
@@ -20,6 +20,7 @@ finding depends on a fixture, the fixture is named.
 | ID | Severity | Area | Finding |
 |----|----------|------|---------|
 | [R-019](#r-019) | Low — **accepted** | `src/rbformats/vhd.rs` | VHD Creator Host OS makes output non-reproducible across platforms; behaviour kept, parity declares it |
+| [R-020](#r-020) | **High** | `src/fs/affs.rs` | `new volume affs` output is "Not a DOS disk" on a real Amiga, at every size |
 | [R-016](#r-016) | **High** | `src/cli/verbs/backup.rs` | `backup` accepts only flat-layout sources: CHD, dynamic VHD, QCOW2 and VMDK all fail |
 | ~~R-018~~ | ~~Blocker~~ **FIXED** | `CONTRIBUTING.md` | ~~The documented Rust-1.73 verification build does not compile on Windows~~ — missing `windows-legacy` feature, 2026-08-07 |
 | ~~R-017~~ | ~~High~~ **FIXED** | `src/partition/mod.rs` | ~~Superfloppy detection also misses SFS (extends R-009)~~ — probe added 2026-08-07 |
@@ -209,6 +210,63 @@ bytes stood out at all.
 ---
 
 ## High
+
+### R-020 — every AFFS volume we write is unmountable on a real Amiga {#r-020}
+
+Found 2026-08-07 by the first FS-UAE emulator-oracle run — the first result
+from an oracle that is not a command-line tool, and the reason that oracle
+was built.
+
+`rb-cli new volume affs` output, attached to an A1200 under Kickstart 3.1:
+
+```
+Mounted disks:
+Unit       Size     Used     Free Full Errs   Status   Name
+DH1:      Not a DOS disk
+```
+
+**The control rules out the harness.** A real MiSTer FFS volume
+(`Mister-3-2.hdf`, bare, no RDB, same shape as ours) mounted through the
+identical config and geometry:
+
+```
+DH1:      1999M   278618  3817380   7%   0  Read/Write Amiga32
+```
+
+Same emulator, same config, same mount path — only the image differs.
+
+**It is not R-008a.** That finding says AFFS breaks above 4066 blocks. A
+volume of *exactly* 4066 blocks (`--size 2033K`), which our own fsck reports
+as `0 files / 1 dirs checked`, exit 0, is equally "Not a DOS disk". The defect
+is present at every size, independent of the bitmap bug.
+
+**Root cause.** Comparing our root block against the working volume's:
+
+| offset | field | ours | working |
+|--------|-------|------|---------|
+| 0x00 | type | `00000002` (T_HEADER) | `00000002` |
+| **0x04** | **header_key** | **`00000800` = 2048** | **`00000000`** |
+| 0x0C | ht_size | `00000048` (72) | `00000048` |
+| 0x1FC | sec_type | `00000001` (ST_ROOT) | `00000001` |
+
+An AFFS root block's `header_key` must be **zero**. We write the root block's
+own block number into it. AmigaDOS's FFS validates that field and rejects the
+volume outright — which is why the failure is "Not a DOS disk" (identification)
+rather than a structural complaint.
+
+**Why nothing caught it.** `rb-cli fsck` passes these volumes, and the tier-1
+case `fs.new-volume.affs` only ever asked rb-cli to read back what rb-cli
+wrote. Formatter and fsck share the same wrong assumption about `header_key`,
+so they agree with each other and disagree with every real Amiga. This is
+exactly the failure mode `README.md` warns tier 1 cannot detect — "a bug on
+both sides cancels out" — demonstrated rather than hypothesised.
+
+The fix must land in both places: the formatter must write 0, and `affs_fsck`
+must reject a non-zero `header_key` so the case cannot silently pass again.
+
+Reproduction: `regression-tests/oracles/fsuae/` (config template and guest
+probe). The guest writes its verdict to a host directory mounted as an Amiga
+volume, so no screen-scraping is involved.
 
 ### R-008b — `new volume affs` panics at 4 MB and above {#r-008b}
 

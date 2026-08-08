@@ -1,0 +1,20 @@
+# rb-regress AFFS oracle - generated
+amiga_model = A1200
+kickstart_file = <USER-DOCS>\FS-UAE\Kickstarts\amiga-os-310-a1200.rom
+fast_memory = 8192
+
+# DH0: bootable Workbench (host directory, copied so the probe can be added)
+hard_drive_0 = <WORKDIR>\System
+hard_drive_0_label = Workbench
+
+# DH1: the artifact under test
+hard_drive_1 = <WORKDIR>\small.hdf
+
+# DH2: results channel - a host directory the guest writes its verdict into
+hard_drive_2 = <WORKDIR>\results
+hard_drive_2_label = RESULTS
+
+fullscreen = 0
+window_width = 640
+window_height = 480
+floppy_drive_volume = 0
