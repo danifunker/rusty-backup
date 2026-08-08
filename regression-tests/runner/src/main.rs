@@ -13,6 +13,7 @@ mod envelope;
 mod exec;
 mod fixtures;
 mod gitinfo;
+mod inventory;
 mod known;
 mod manifest;
 mod parity;
@@ -35,6 +36,7 @@ struct Args {
     cases_dir: PathBuf,
     rb_cli: PathBuf,
     fixture_root: Option<PathBuf>,
+    sync_from: Option<PathBuf>,
     report_root: PathBuf,
     tiers: BTreeSet<u8>,
     filter: Option<String>,
@@ -42,6 +44,7 @@ struct Args {
     keep_scratch: bool,
     require_clean: bool,
     check: bool,
+    verbose: bool,
     scratch_root: PathBuf,
     artifacts_root: PathBuf,
     verifications_root: PathBuf,
@@ -58,6 +61,8 @@ enum Command {
     Query(String),
     /// Map requirements onto the machines that exist.
     Plan,
+    /// Take inventory of the fixture corpus and report which cases it enables.
+    Fixtures,
     /// Build every artifact rb-cli can write, on whatever OS is running.
     Produce,
     /// Compare artifacts produced on different OSes. Needs no oracle.
@@ -116,6 +121,7 @@ fn parse_args() -> Result<Args, String> {
         cases_dir: base.join("cases"),
         rb_cli: default_rb_cli(&base),
         fixture_root: None,
+        sync_from: None,
         report_root: base.join("runs"),
         tiers: BTreeSet::new(),
         filter: None,
@@ -123,6 +129,7 @@ fn parse_args() -> Result<Args, String> {
         keep_scratch: false,
         require_clean: false,
         check: false,
+        verbose: false,
         scratch_root: base.join("scratch"),
         artifacts_root: base.join("artifacts"),
         verifications_root: base.join("verifications"),
@@ -137,6 +144,7 @@ fn parse_args() -> Result<Args, String> {
             "list" => args.command = Command::List,
             "validate" => args.command = Command::Validate,
             "plan" => args.command = Command::Plan,
+            "fixtures" => args.command = Command::Fixtures,
             "produce" => args.command = Command::Produce,
             "verify" => args.command = Command::Verify,
             "parity" => {
@@ -164,6 +172,7 @@ fn parse_args() -> Result<Args, String> {
             "--keep-scratch" => args.keep_scratch = true,
             "--require-clean" => args.require_clean = true,
             "--check" => args.check = true,
+            "--verbose" | "-v" => args.verbose = true,
             _ => {
                 let value = || -> Result<String, String> {
                     raw.get(i + 1)
@@ -177,6 +186,10 @@ fn parse_args() -> Result<Args, String> {
                     }
                     "--rb-cli" => {
                         args.rb_cli = PathBuf::from(value()?);
+                        i += 1;
+                    }
+                    "--sync-from" => {
+                        args.sync_from = Some(PathBuf::from(value()?));
                         i += 1;
                     }
                     "--fixture-root" => {
@@ -270,6 +283,7 @@ COMMANDS:
     run          Execute the matrix and write a report bundle
     list         List the cases that would run, without running them
     validate     Parse every manifest and report problems; runs nothing
+    fixtures     Inventory the corpus: what is present, verified, and runnable
     plan         Map requirements onto the machines that exist
     produce      Build every artifact rb-cli can write, twice, into <artifacts>/<os>
     parity       Compare artifacts across producer OSes; needs no oracle
@@ -286,6 +300,9 @@ OPTIONS:
                            is missing; they warn if it is not a release build or
                            is older than the sources in the tree.
     --fixture-root <DIR>   Fixture corpus root      [or RB_FIXTURE_ROOT, or local.toml]
+    --sync-from <DIR>      (fixtures) copy the corpus from here into --fixture-root
+                           first, so a run reads local disk rather than a share
+    --verbose, -v          (fixtures) list every blocked case and unused fixture
     --report-root <DIR>    Where bundles are written[default: regression-tests/runs]
     --scratch-root <DIR>   Working directory root   [default: regression-tests/scratch]
     --artifacts <DIR>      Artifact tree root       [default: regression-tests/artifacts]
@@ -326,6 +343,7 @@ fn main() {
         Command::Export => cmd_export(&args),
         Command::Query(ref q) => cmd_query(q),
         Command::Plan => cmd_plan(&args),
+        Command::Fixtures => cmd_fixtures(&args),
         Command::Produce => cmd_produce(&args),
         Command::Parity(ref root) => cmd_parity(&args, root),
         Command::Verify => cmd_verify(&args),
@@ -336,6 +354,72 @@ fn main() {
 
 /// `produce` writes into `<artifacts>/<platform>`, so every host can fill the
 /// same tree without coordinating and the result is still attributable.
+/// Inventory first, then decide what to run. Exit 1 on a corrupt fixture or a
+/// case naming a fixture the catalogue does not have: both are problems with
+/// the corpus or the manifests, not with rb-cli, and both make a subsequent
+/// run untrustworthy. A merely *missing* fixture is not an error — the corpus
+/// is expected to be incomplete, and that is what the blocked list is for.
+fn cmd_fixtures(args: &Args) -> i32 {
+    let fixture_root = fixtures::discover_root(args.fixture_root.clone(), &regression_dir());
+    let catalog = fixtures::Catalog::load(fixture_root.as_deref(), repo_root().as_deref());
+    for w in &catalog.warnings {
+        eprintln!("warning: {}", w);
+    }
+    if let Some(r) = catalog.root() {
+        println!("corpus: {}", r.display());
+    }
+
+    // Pre-fill first, if asked, so the inventory below reflects what a run
+    // will actually see rather than what the NAS holds.
+    if let Some(src) = &args.sync_from {
+        let dest = match &args.fixture_root {
+            Some(d) => d.clone(),
+            None => {
+                eprintln!("error: --sync-from needs --fixture-root to say where to put them");
+                return 2;
+            }
+        };
+        let src_corpus = fixtures::Catalog::load(Some(src), repo_root().as_deref());
+        print!("{}", inventory::sync(&src_corpus, src, &dest));
+    }
+
+    // Reload AFTER the sync. The catalogue lives beside the corpus, so the one
+    // loaded above was read before anything had been copied — using it here
+    // would inventory the state we started in, not the one a run will see.
+    let catalog = fixtures::Catalog::load(
+        fixtures::discover_root(args.fixture_root.clone(), &regression_dir()).as_deref(),
+        repo_root().as_deref(),
+    );
+
+    let inv = inventory::take(&args.cases_dir, &catalog);
+    print!("{}", inventory::render(&inv, args.verbose));
+
+    let out = args.report_root.join("fixture-inventory.json");
+    if let Some(parent) = out.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    match serde_json::to_string_pretty(&inv) {
+        Ok(j) => {
+            if fs::write(&out, j).is_ok() {
+                println!("
+inventory: {}", out.display());
+            }
+        }
+        Err(e) => eprintln!("warning: could not serialise inventory: {}", e),
+    }
+
+    let corrupt = inv
+        .fixtures
+        .iter()
+        .filter(|f| f.state == inventory::FixtureState::Corrupt)
+        .count();
+    if corrupt > 0 || !inv.uncatalogued.is_empty() {
+        1
+    } else {
+        0
+    }
+}
+
 fn cmd_produce(args: &Args) -> i32 {
     let base = regression_dir();
     let recipes = match produce::load_recipes(&base.join("data").join("produce.toml")) {

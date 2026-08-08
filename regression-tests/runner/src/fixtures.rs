@@ -237,6 +237,43 @@ impl Catalog {
         Ok(out)
     }
 
+    /// Every catalogued row, for the fixture inventory.
+    pub fn rows(&self) -> impl Iterator<Item = &FixtureRow> {
+        self.rows.values()
+    }
+
+    /// Verify a fixture's bytes against the sha256 the catalogue records.
+    ///
+    /// Presence is not enough. A truncated or half-copied fixture resolves
+    /// fine and then produces a FAIL that looks like an engine defect — the
+    /// most expensive kind of wrong answer this suite can give. Rows with no
+    /// recorded hash return `Ok(false)`, meaning "present but unverified",
+    /// which is reported separately from "verified".
+    pub fn verify(&self, id: &str) -> Result<bool, String> {
+        let row = self
+            .rows
+            .get(id)
+            .ok_or_else(|| format!("'{}' is not in the catalogue", id))?;
+        let path = self.resolve(id)?;
+        if row.sha256.is_empty() {
+            return Ok(false);
+        }
+        let bytes = fs::read(&path).map_err(|e| format!("{}: {}", path.display(), e))?;
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(&bytes);
+        let got: String = h.finalize().iter().map(|b| format!("{:02x}", b)).collect();
+        if got.eq_ignore_ascii_case(&row.sha256) {
+            Ok(true)
+        } else {
+            Err(format!(
+                "checksum mismatch: catalogue {}, file {}",
+                &row.sha256[..row.sha256.len().min(16)],
+                &got[..16]
+            ))
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.rows.len()
     }

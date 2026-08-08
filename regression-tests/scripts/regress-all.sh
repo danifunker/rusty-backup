@@ -67,6 +67,17 @@ step "local: build"
 step "local: validate"
 "$RB" validate || die "manifests or bug list are invalid"
 
+# Fixture inventory drives test selection, so it runs BEFORE anything else.
+# A corrupt fixture or a case naming a fixture the catalogue has never heard of
+# makes every later result suspect, so those exit non-zero here. A merely
+# missing fixture does not: the corpus is expected to be incomplete, and the
+# blocked list says exactly what to fetch and what it would buy.
+#
+# RB_SYNC_FROM pre-fills the local corpus from a share first, so the run reads
+# local disk rather than SMB.
+step "local: fixture inventory"
+"$RB" fixtures     ${RB_SYNC_FROM:+--sync-from "$RB_SYNC_FROM"}     ${RB_FIXTURE_ROOT:+--fixture-root "$RB_FIXTURE_ROOT"}     || die "fixture corpus is not trustworthy - see above"
+
 # --- remote hosts ------------------------------------------------------------
 # A host that cannot be reached is a warning, not a failure: the point is to
 # reach the end and report, and a laptop being off is not a regression in
