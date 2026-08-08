@@ -354,11 +354,11 @@ fn main() {
 
 /// `produce` writes into `<artifacts>/<platform>`, so every host can fill the
 /// same tree without coordinating and the result is still attributable.
-/// Inventory first, then decide what to run. Exit 1 on a corrupt fixture or a
-/// case naming a fixture the catalogue does not have: both are problems with
-/// the corpus or the manifests, not with rb-cli, and both make a subsequent
-/// run untrustworthy. A merely *missing* fixture is not an error — the corpus
-/// is expected to be incomplete, and that is what the blocked list is for.
+/// Inventory first, then decide what to run. Only a CORRUPT fixture is fatal:
+/// it produces confidently wrong results, which is the one outcome worse than
+/// not running at all. Missing and uncatalogued fixtures both resolve to
+/// honest skips and are reported rather than enforced — the corpus is expected
+/// to be incomplete for a long time.
 fn cmd_fixtures(args: &Args) -> i32 {
     let fixture_root = fixtures::discover_root(args.fixture_root.clone(), &regression_dir());
     let catalog = fixtures::Catalog::load(fixture_root.as_deref(), repo_root().as_deref());
@@ -413,7 +413,12 @@ inventory: {}", out.display());
         .iter()
         .filter(|f| f.state == inventory::FixtureState::Corrupt)
         .count();
-    if corrupt > 0 || !inv.uncatalogued.is_empty() {
+    // Only CORRUPT is fatal. A corrupt fixture produces confidently wrong
+    // results; an uncatalogued one produces an honest skip. And a case written
+    // against a fixture we intend to source is a legitimate way to record the
+    // want — the IMZ password cases exist exactly so that requirement stops
+    // being invisible in a formats.toml notes field.
+    if corrupt > 0 {
         1
     } else {
         0

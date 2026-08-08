@@ -349,3 +349,51 @@ fixture = "part.sun.minimal-slot6.hd"
 args = ["inspect", "{fixture}"]
 expect_exit = 0
 stdout_contains = ["Sun"]
+
+# --- WinImage IMZ ---------------------------------------------------------------
+# `fmt.imz` is a known read format and formats.toml already records what it
+# needs: "Encrypted variant needs both a correct- and a wrong-password case".
+# No IMZ fixture exists anywhere — not on the NAS, not locally — so these are
+# written against the `password` convention and will report skip-fixture until
+# one is sourced. `rb-regress fixtures` lists them in the blocked shopping list,
+# which is the point: a requirement recorded in a notes field was invisible,
+# and a blocked case is not.
+#
+# IMZ is a ZIP-wrapped floppy image. The canonical producer is WinImage, so the
+# fixture has to come from there rather than be synthesised — the same rule
+# that keeps every other fixture honest.
+
+[[case]]
+id = "read.imz.plain"
+description = "An unencrypted IMZ must decode to its flat floppy stream"
+fixture = "fmt.imz.plain.floppy"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+
+[[case]]
+id = "read.imz.encrypted.refuses-without-password"
+fixture = "fmt.imz.encrypted.floppy"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 1
+stdout_contains = ["password"]
+
+[[case]]
+id = "read.imz.encrypted.opens-with-password"
+description = "The `password` convention applies to any fixture sourced from here on"
+fixture = "fmt.imz.encrypted.floppy"
+[[case.step]]
+args = ["inspect", "{fixture}", "--password", "password"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{fixture}", "/", "--password", "password"]
+expect_exit = 0
+
+[[case]]
+id = "read.imz.encrypted.wrong-password-is-an-error"
+description = "Must fail loudly rather than returning plausible garbage"
+fixture = "fmt.imz.encrypted.floppy"
+[[case.step]]
+args = ["inspect", "{fixture}", "--password", "not-the-password"]
+expect_exit = 1
