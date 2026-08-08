@@ -276,8 +276,15 @@ error: sync_metadata: I/O error: replacing <path>
 
 SquashFS edits rebuild the whole image and swap it in atomically (temp +
 fsync + rename). The rename fails on Windows, so the edit path is unusable
-there. Case `subcmd.squashfs.put-rebuilds`. `squashfs create` and `verify`
-both pass, so it is specific to the replace step.
+there. Cases `subcmd.squashfs.put-rebuilds` and `meta.xattr.set-list-rm` —
+`xattr set` reaches the same replace path, so it is not xattr-specific.
+`squashfs create` and `verify` both pass, so it is specific to the replace
+step.
+
+**Confirmed Windows-only, 2026-08-08.** Both cases pass on macOS. That is
+what `platforms = ["windows"]` in known-failures.toml now records — before it
+existed, the first macOS run reported them as XPASS, which is supposed to
+mean "fixed, remove the entry" rather than "never applied here".
 
 ### R-026 — `show partmap` cannot read an SGI disk {#r-026}
 

@@ -954,7 +954,7 @@ fn cmd_validate(args: &Args) -> i32 {
     let base = regression_dir();
     match known::KnownFailures::load(&base.join("data").join("known-failures.toml")) {
         Ok(k) => {
-            for id in k.ids() {
+            for (id, _) in k.all_entries() {
                 if !seen.contains(id) {
                     known_problems.push(format!(
                         "known-failures.toml lists '{}', which is not a case id",
@@ -967,14 +967,12 @@ fn cmd_validate(args: &Args) -> i32 {
             let bugs = fs::read_to_string(base.join("..").join("docs").join("Regression_Bugs.md"))
                 .unwrap_or_default();
             if !bugs.is_empty() {
-                for id in k.ids() {
-                    if let Some(f) = k.finding_for(id) {
-                        if !bugs.contains(f) {
-                            known_problems.push(format!(
-                                "known-failures.toml: '{}' cites finding {}, which is not in docs/Regression_Bugs.md",
-                                id, f
-                            ));
-                        }
+                for (id, f) in k.all_entries() {
+                    if !bugs.contains(f) {
+                        known_problems.push(format!(
+                            "known-failures.toml: '{}' cites finding {}, which is not in docs/Regression_Bugs.md",
+                            id, f
+                        ));
                     }
                 }
             }
@@ -1118,6 +1116,18 @@ fn cmd_run(args: &Args) -> i32 {
     };
     println!("report bundle: {}", bundle.dir.display());
     println!("fixtures     : {} catalogued", catalog.len());
+    // Say what the bug list is NOT applying here. Silence would make a
+    // platform-scoped entry look like it had simply been forgotten.
+    let scoped = known.not_applicable_here();
+    if !scoped.is_empty() {
+        println!(
+            "bug list     : {} entr(y/ies) scoped to another platform, not applied here:",
+            scoped.len()
+        );
+        for (id, platforms, finding) in scoped {
+            println!("               {} ({}, {})", id, finding, platforms);
+        }
+    }
 
     let env = serde_json::json!({
         "platform": platform,
