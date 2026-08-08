@@ -10,8 +10,12 @@
 # did not create. Depth belongs in the tier-3 edit cases, which use a
 # {fixture_copy} because they mutate.
 #
-# Where a fixture is encrypted or password-protected the expectation is only
-# that we identify the container and say so clearly, not that we decrypt it.
+# ENCRYPTED FIXTURES: the convention is that the password is `password`.
+# Verified 2026-08-08 — the Ghost image conforms. The encrypted APFS volume
+# does NOT: it was built with `rbtest-apfs`, a throwaway constant, before the
+# convention existed. Its case uses the value that actually works and is
+# flagged below, because a case that fails on a passphrase mismatch looks
+# exactly like a decryption defect.
 
 [meta]
 tier = 2
@@ -145,12 +149,33 @@ args = ["inspect", "{fixture}"]
 expect_exit = 0
 
 [[case]]
-id = "read.apfs.encrypted"
-description = "Encrypted APFS. The expectation is that we identify the container, not that we decrypt it."
+id = "read.apfs.encrypted.locked"
+description = "Locked: identifying the container without a passphrase must still work"
 fixture = "fs.apfs.encrypted.hd"
 [[case.step]]
 args = ["inspect", "{fixture}"]
 expect_exit = 0
+stdout_contains = ["APFS"]
+
+[[case]]
+id = "read.apfs.encrypted.unlocked"
+description = """FileVault decrypt. NOTE: the passphrase is `rbtest-apfs`, not the
+`password` convention — this fixture predates it. Standardising means rebuilding
+the volume on the Mac; until then this value is the one that works, and hard-coding
+`password` here would produce a KEK-unwrap failure that reads like a decryption bug."""
+fixture = "fs.apfs.encrypted.hd"
+[[case.step]]
+args = ["ls", "{fixture}", "/", "--password", "rbtest-apfs"]
+expect_exit = 0
+stdout_contains = ["hello.txt"]
+
+[[case]]
+id = "read.apfs.encrypted.wrong-passphrase-is-an-error"
+description = "A wrong passphrase must fail loudly rather than returning garbage"
+fixture = "fs.apfs.encrypted.hd"
+[[case.step]]
+args = ["ls", "{fixture}", "/", "--password", "not-the-passphrase"]
+expect_exit = 1
 
 [[case]]
 id = "read.lisa.los31-blank"
@@ -172,12 +197,22 @@ expect_exit = 0
 # --- Ghost ------------------------------------------------------------------------
 
 [[case]]
-id = "read.gho.password"
-description = "A password-protected Ghost image. Identifying it and reporting that it needs a password is the contract; decrypting it is not asserted here."
+id = "read.gho.password.refuses-without-one"
+description = "Without a password it must say so, not fail obscurely"
 fixture = "fmt.gho.password.hd"
 [[case.step]]
 args = ["inspect", "{fixture}"]
+expect_exit = 1
+stdout_contains = ["password"]
+
+[[case]]
+id = "read.gho.password.opens-with-one"
+description = "Conforms to the `password` convention. Decrypts to a real four-partition disk."
+fixture = "fmt.gho.password.hd"
+[[case.step]]
+args = ["inspect", "{fixture}", "--password", "password"]
 expect_exit = 0
+stdout_contains = ["FAT32", "Extended"]
 
 # --- PC / DOS ----------------------------------------------------------------------
 
