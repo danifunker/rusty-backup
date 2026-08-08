@@ -4,7 +4,9 @@
 
 **No fixture file, and no path to a fixture file, is ever committed to this
 repository.** Case manifests reference fixtures by *logical ID* only. The
-mapping from ID to a real file lives on the NAS.
+mapping from ID to a real file lives in the catalogue beside the corpus, which
+is itself gitignored — and a run resolves it entirely on local disk. See
+§ Local first.
 
 This keeps the repo small, keeps redistribution-restricted material out of
 git history, and lets different hosts hold different subsets of the corpus
@@ -16,13 +18,48 @@ The regression corpus is the large, real-world, non-redistributable set.
 
 ## Locations
 
-**The share's address is not in this repository and must not be added.** It
+### Local first
+
+**A run reads local disk. It never reads a share.**
+
+```
+rb-regress fixtures --sync      # copy the corpus down, once
+rb-regress run                  # everything from here is local
+```
+
+`local.toml` names two separate things and the difference matters:
+
+| key | what | read by |
+|-----|------|---------|
+| `fixture_root` | the working copy a run reads | every command |
+| `corpus_source` | where `--sync` fetches from | `fixtures --sync`, nothing else |
+
+Pointing `fixture_root` straight at the share works, and is a mistake. It is
+slow; a share that drops mid-run produces a wall of `skip-fixture` that reads
+like a corpus problem; it makes the share's address a runtime dependency of
+the suite, which on a public repository is how a private path ends up in a
+doc; and it hides gaps in the corpus itself.
+
+That last one is not hypothetical. Three optical cases passed for weeks
+against the share and failed the moment the corpus was copied local, because
+the share still held sibling files — `BOOKSHELF.img`, `BOOKSHELF.sub`,
+`mixedmode-both.bin` — that `sync` had never been asked to fetch. A fixture
+stored in its own directory is a **set**: only its entry point is catalogued,
+and a CloneCD dump is nothing without its `.img` and `.sub`. `sync` now brings
+the whole directory.
+
+The control for "is it really local": move `fixtures/` aside and run. Every
+corpus-backed case must report `skip-fixture`. Anything that still passes is
+reading something it should not be.
+
+### Where things live
+
+**The source's address is not in this repository and must not be added.** It
 lives in `regression-tests/local.toml`, which is gitignored; see
 `local.toml.example`. This table used to give a literal `\\HOST\share\...`
 path, which was both wrong and something a public repo should never carry.
-Everything below is relative to whatever `fixture_root` points at.
 
-| What | Where, relative to the share root |
+| What | Where, relative to the corpus root |
 |------|-------|
 | Corpus | `fixtures\` |
 | Large-fixture annex | `fixtures-large\` |
@@ -31,12 +68,17 @@ Everything below is relative to whatever `fixture_root` points at.
 | Run reports | `runs\` |
 | Inventory scans | `scans\` |
 
-**The catalogue beside the corpus is the authoritative one.** The runner reads
-`fixture-map.tsv` from the share; `regression-tests/fixture-map.tsv` is a
-gitignored local mirror that goes stale — it was four rows behind when this was
-written, which is long enough to edit the wrong copy and wonder why
-`rb-regress fixtures` reports the old count. Append to the share, then copy it
-down.
+**The catalogue travels with the corpus.** It sits beside the fixture
+directory, not inside it, and `--sync` copies it down first — so with
+`fixture_root = "fixtures"` the runner reads
+`regression-tests/fixture-map.tsv` (gitignored), and `--sync` keeps it
+current.
+
+That closes a trap the old share-rooted setup had. There were two copies of
+the catalogue, the repo one drifted four rows behind, and appending to the
+wrong one produced a `fixtures` count that stubbornly refused to change. Now
+there is one local copy and one command that refreshes it. When you add a
+fixture, append to the catalogue at the source and re-run `--sync`.
 
 The runner locates the corpus through, in order: `--fixture-root`, the
 `RB_FIXTURE_ROOT` environment variable, then a gitignored

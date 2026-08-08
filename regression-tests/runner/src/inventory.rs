@@ -114,6 +114,30 @@ pub fn sync(catalog: &Catalog, source: &Path, dest: &Path) -> String {
             failed.push(format!("{}: not at {}", row.id, src.display()));
             continue;
         }
+
+        // A fixture stored inside its own directory is stored that way because
+        // it is a SET: a CloneCD dump is .ccd + .img + .sub, a cue is nothing
+        // without its .bin. Only the entry point is catalogued, so copying
+        // catalogued files alone lands a directory that looks present and
+        // fails to open. Bring the whole directory.
+        //
+        // Found by moving the corpus off the share: three optical cases passed
+        // against the NAS and failed against a local copy, because the share
+        // still held siblings the sync had never fetched.
+        if Path::new(&row.relpath).parent().is_some_and(|p| !p.as_os_str().is_empty()) {
+            match copy_dir(src.parent().unwrap(), dst.parent().unwrap()) {
+                Ok((n, b)) => {
+                    if n == 0 {
+                        skipped += 1;
+                    } else {
+                        copied += n;
+                        bytes += b;
+                    }
+                }
+                Err(e) => failed.push(format!("{}: {}", row.id, e)),
+            }
+            continue;
+        }
         // Already here and the right size? Trust it; the full verify pass
         // happens in `take` and would catch a bad one anyway.
         if let (Ok(a), Ok(b)) = (fs::metadata(&src), fs::metadata(&dst)) {
@@ -147,6 +171,32 @@ pub fn sync(catalog: &Catalog, source: &Path, dest: &Path) -> String {
 ", f));
     }
     s
+}
+
+/// Copy every file in `src` into `dst`, skipping same-size ones. Returns the
+/// count and bytes actually written. Not recursive: fixture sets are flat.
+fn copy_dir(src: &Path, dst: &Path) -> Result<(usize, u64), String> {
+    use std::fs;
+    fs::create_dir_all(dst).map_err(|e| format!("{}: {}", dst.display(), e))?;
+    let mut n = 0usize;
+    let mut bytes = 0u64;
+    let entries = fs::read_dir(src).map_err(|e| format!("{}: {}", src.display(), e))?;
+    for e in entries.flatten() {
+        if !e.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            continue;
+        }
+        let from = e.path();
+        let to = dst.join(e.file_name());
+        if let (Ok(a), Ok(b)) = (fs::metadata(&from), fs::metadata(&to)) {
+            if a.len() == b.len() {
+                continue;
+            }
+        }
+        let w = fs::copy(&from, &to).map_err(|err| format!("{}: {}", from.display(), err))?;
+        n += 1;
+        bytes += w;
+    }
+    Ok((n, bytes))
 }
 
 pub fn take(cases_dir: &Path, catalog: &Catalog) -> Inventory {

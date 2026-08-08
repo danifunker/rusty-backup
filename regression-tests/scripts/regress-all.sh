@@ -74,7 +74,10 @@ step "local: validate"
 # RB_SYNC_FROM pre-fills the local corpus from a share first, so the run reads
 # local disk rather than SMB.
 step "local: fixture inventory"
-"$RB" fixtures     ${RB_SYNC_FROM:+--sync-from "$RB_SYNC_FROM"}     ${RB_FIXTURE_ROOT:+--fixture-root "$RB_FIXTURE_ROOT"}     || die "fixture corpus is not trustworthy - see above"
+# --sync pulls the corpus from local.toml's `corpus_source` into the local
+# fixture root before anything reads it, so the run below touches local disk
+# only. A host with no source configured says so and carries on.
+"$RB" fixtures --sync     ${RB_SYNC_FROM:+--sync-from "$RB_SYNC_FROM"}     ${RB_FIXTURE_ROOT:+--fixture-root "$RB_FIXTURE_ROOT"}     || die "fixture corpus is not trustworthy - see above"
 
 # --- remote hosts ------------------------------------------------------------
 # A host that cannot be reached is a warning, not a failure: the point is to

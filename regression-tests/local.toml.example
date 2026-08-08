@@ -14,14 +14,34 @@
 # inventory drifted from the connection half.
 
 # --- Paths --------------------------------------------------------------------
-
-# Root of the fixture corpus on this host. Overridden by --fixture-root or
-# RB_FIXTURE_ROOT. Cases backed by `repo:` catalogue rows resolve without it,
-# so tiers 0-2 largely work with it unset.
 #
-# The catalogue the runner actually reads is `fixture-map.tsv` sitting BESIDE
-# this directory, not the copy in the repo — see FIXTURES.md.
-fixture_root = "//SERVER/share/rb-fixtures/fixtures"
+# LOCAL FIRST. A run reads `fixture_root` and nothing else — never a network
+# share. `corpus_source` is where the corpus is *fetched from*, once, by
+# `rb-regress fixtures --sync`. Keeping those separate is the point:
+#
+#   * a run over SMB is slow, and a share that drops mid-run turns into a wall
+#     of skip-fixture that reads like a corpus problem
+#   * it makes the share's address a runtime dependency of the suite, which on
+#     a public repository is exactly how a private path ends up in a doc
+#   * it hides gaps in the corpus itself: three optical cases passed for weeks
+#     against the share and failed the moment the corpus was copied local,
+#     because the share held sibling files the sync had never fetched
+#
+# A relative path is relative to this file, so "fixtures" means
+# regression-tests/fixtures/ no matter where the command is run from. That
+# directory and its `fixtures-large/` sibling are gitignored.
+#
+# Overridden by --fixture-root or RB_FIXTURE_ROOT. Cases backed by `repo:`
+# catalogue rows resolve without either, so tiers 0-2 largely work unset.
+#
+# The catalogue the runner reads is `fixture-map.tsv` BESIDE the corpus
+# directory, and `--sync` copies it down with the fixtures — see FIXTURES.md.
+fixture_root = "fixtures"
+
+# Where `--sync` fetches from: a NAS, an external disk, another machine.
+# Optional. A host that already has its corpus needs no source at all, and a
+# host with no source simply cannot sync — nothing else changes.
+corpus_source = "//SERVER/share/rb-fixtures/fixtures"
 
 # Where run bundles are written. Defaults to regression-tests/runs.
 # report_root = "//SERVER/share/rb-fixtures/runs"

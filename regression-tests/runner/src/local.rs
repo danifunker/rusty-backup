@@ -18,7 +18,16 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Default, Deserialize)]
 pub struct LocalConfig {
+    /// Where a run reads fixtures. **Local disk.** A run that reads a network
+    /// share is slower, fails differently when the share is not mounted, and
+    /// makes the share's address a runtime dependency of the suite — which on
+    /// a public repository is how a private path ends up in a doc.
     pub fixture_root: Option<String>,
+
+    /// Where `fixtures --sync` fetches from: the NAS, an external disk, another
+    /// machine. Used for that one copy and nothing else. Optional — a host
+    /// that already has its corpus needs no source at all.
+    pub corpus_source: Option<String>,
     /// Not read yet — `--report-root` is the only way in today. Declared so a
     /// local.toml carrying it does not fail to parse.
     #[allow(dead_code)]
@@ -83,6 +92,33 @@ pub fn load(regression_dir: &Path) -> (LocalConfig, PathBuf, Option<String>) {
     }
 }
 
+/// The distribution source, if this host has one configured.
+///
+/// Never answers from `local.toml.example`: its value is a placeholder, and
+/// syncing from a placeholder is a confusing failure rather than a helpful
+/// default. Same reason `query hosts` refuses to emit the example's addresses.
+pub fn corpus_source(regression_dir: &Path) -> Option<PathBuf> {
+    let (cfg, from, _) = load(regression_dir);
+    if from.extension().is_some_and(|e| e == "example") {
+        return None;
+    }
+    cfg.corpus_source
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| resolve(&s, regression_dir))
+}
+
+/// A relative path in `local.toml` is relative to the file itself, not to
+/// whatever directory the command happened to be run from. `fixture_root =
+/// "fixtures"` has to mean the same thing from anywhere.
+fn resolve(value: &str, regression_dir: &Path) -> PathBuf {
+    let p = PathBuf::from(value);
+    if p.is_absolute() || value.starts_with("//") || value.starts_with("\\\\") {
+        p
+    } else {
+        regression_dir.join(p)
+    }
+}
+
 /// Fixture root from, in order: an explicit flag, the environment, then
 /// `local.toml`. Never hardcodes a path — see FIXTURES.md.
 pub fn discover_root(explicit: Option<PathBuf>, regression_dir: &Path) -> Option<PathBuf> {
@@ -95,5 +131,5 @@ pub fn discover_root(explicit: Option<PathBuf>, regression_dir: &Path) -> Option
     let (cfg, _, _) = load(regression_dir);
     cfg.fixture_root
         .filter(|s| !s.trim().is_empty())
-        .map(PathBuf::from)
+        .map(|s| resolve(&s, regression_dir))
 }

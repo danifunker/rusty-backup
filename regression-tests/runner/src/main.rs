@@ -38,6 +38,7 @@ struct Args {
     rb_cli: PathBuf,
     fixture_root: Option<PathBuf>,
     sync_from: Option<PathBuf>,
+    sync: bool,
     report_root: PathBuf,
     tiers: BTreeSet<u8>,
     filter: Option<String>,
@@ -123,6 +124,7 @@ fn parse_args() -> Result<Args, String> {
         rb_cli: default_rb_cli(&base),
         fixture_root: None,
         sync_from: None,
+        sync: false,
         report_root: base.join("runs"),
         tiers: BTreeSet::new(),
         filter: None,
@@ -171,6 +173,7 @@ fn parse_args() -> Result<Args, String> {
             "-h" | "--help" | "help" => args.command = Command::Help,
             "--allow-hardware" => args.allow_hardware = true,
             "--keep-scratch" => args.keep_scratch = true,
+            "--sync" => args.sync = true,
             "--require-clean" => args.require_clean = true,
             "--check" => args.check = true,
             "--verbose" | "-v" => args.verbose = true,
@@ -301,8 +304,10 @@ OPTIONS:
                            is missing; they warn if it is not a release build or
                            is older than the sources in the tree.
     --fixture-root <DIR>   Fixture corpus root      [or RB_FIXTURE_ROOT, or local.toml]
-    --sync-from <DIR>      (fixtures) copy the corpus from here into --fixture-root
-                           first, so a run reads local disk rather than a share
+    --sync                 (fixtures) copy the corpus from local.toml's
+                           `corpus_source` into the fixture root first. Runs
+                           read local disk; the source is touched only here.
+    --sync-from <DIR>      (fixtures) same, from an explicit directory
     --verbose, -v          (fixtures) list every blocked case and unused fixture
     --report-root <DIR>    Where bundles are written[default: regression-tests/runs]
     --scratch-root <DIR>   Working directory root   [default: regression-tests/scratch]
@@ -371,17 +376,38 @@ fn cmd_fixtures(args: &Args) -> i32 {
     }
 
     // Pre-fill first, if asked, so the inventory below reflects what a run
-    // will actually see rather than what the NAS holds.
-    if let Some(src) = &args.sync_from {
-        let dest = match &args.fixture_root {
+    // will actually see rather than what the source holds.
+    let source = match (&args.sync_from, args.sync) {
+        (Some(s), _) => Some(s.clone()),
+        // No source configured is not an error: a host that already holds its
+        // corpus has nothing to fetch, and the driver passes --sync
+        // unconditionally so it works on the machines that do.
+        (None, true) => match local::corpus_source(&regression_dir()) {
+            Some(s) => Some(s),
+            None => {
+                println!("sync: no `corpus_source` in local.toml - nothing to fetch");
+                None
+            }
+        },
+        (None, false) => None,
+    };
+    if let Some(src) = source {
+        // Destination is the resolved fixture root, so `--sync` on its own
+        // works: local.toml already says where the corpus lives here.
+        let dest = match &fixture_root {
             Some(d) => d.clone(),
             None => {
-                eprintln!("error: --sync-from needs --fixture-root to say where to put them");
+                eprintln!("error: no fixture root configured; set `fixture_root` in local.toml");
                 return 2;
             }
         };
-        let src_corpus = fixtures::Catalog::load(Some(src), repo_root().as_deref());
-        print!("{}", inventory::sync(&src_corpus, src, &dest));
+        if src == dest {
+            eprintln!("error: corpus_source and fixture_root are the same directory");
+            return 2;
+        }
+        println!("sync: {} -> {}", src.display(), dest.display());
+        let src_corpus = fixtures::Catalog::load(Some(&src), repo_root().as_deref());
+        print!("{}", inventory::sync(&src_corpus, &src, &dest));
     }
 
     // Reload AFTER the sync. The catalogue lives beside the corpus, so the one

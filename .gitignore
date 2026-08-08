@@ -78,7 +78,11 @@ dist/
 # fixtures already committed under tests/ via a repo: prefix.
 /regression-tests/fixture-map.tsv
 /regression-tests/fixture-map.json
+# The local working copy of the corpus, synced from wherever local.toml's
+# `corpus_source` points. Runs read THIS, never a network share — see
+# FIXTURES.md § Local-first.
 /regression-tests/fixtures/
+/regression-tests/fixtures-large/
 /regression-tests/scratch/
 /regression-tests/runs/
 /regression-tests/scans/
