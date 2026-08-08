@@ -1,18 +1,17 @@
 # Fixture Gaps
 
-State of the corpus as of 2026-08-02. Regenerate whenever fixtures are added
-or a new `rb-cli new` builder lands.
+Narrative only. **The counts are computed — do not maintain them here:**
 
-## Where things stand
+```
+rb-regress fixtures            # catalogued, verified, runnable, and what is unused
+rb-regress query verbs         # rb-cli verbs no case invokes
+rb-regress query unfixtured-reads   # formats we read with no real-media fixture
+rb-regress produce             # builders with no recipe
+rb-regress validate            # manifests, registry, bug list
+```
 
-Regenerate whenever fixtures are added or a builder lands.
-
-| | Count | Size |
-|---|---:|---:|
-| Core corpus (`rb-fixtures/fixtures/`) | **75** | see catalogue |
-| Large-fixture annex (`fixtures-large/`) | **5** | — |
-| Catalogued total | **80** | **3251 MB** |
-| Soft budget for the core corpus | — | 250 MB |
+The table that used to sit here said 80 fixtures and 3251 MB. It was wrong
+within a week, and a wrong count reads as authority. Ask the tools.
 
 Every fixture has been opened with `rb-cli` before admission — nothing is
 admitted on the strength of its extension. See § False positives for why that
@@ -123,3 +122,51 @@ size.
 4. One focused session on `PARC-Stuff.zip` — potentially closes six container
    rows and two filesystem rows at once.
 5. Optical, last and most carefully, with aggressive minimisation.
+
+## Open, 2026-08-08
+
+Not fixture gaps in the corpus sense — things the suite cannot yet assert.
+Listed because each one was discovered by trying, and would otherwise be
+rediscovered.
+
+**Harness**
+
+- **Multi-file artifacts.** `fmt.vmdk-flat` (descriptor + `-flat.vmdk` extent)
+  and `fmt.bincue` (66-byte `.cue` + sibling `.bin`) are the only two builders
+  `produce` still has no recipe for, both for this reason. Keeping half of
+  either would read as coverage of a format only half looked at.
+- **Emulator oracles cannot be invoked.** They all resolve to `skip-manual`,
+  so R-020 — the highest-severity Amiga finding — was found by hand and cannot
+  be re-checked by a run. FS-UAE works interactively; `verify` cannot drive it.
+- **27 package oracles have no runnable check command**, so `verify` skips
+  them with `skip-no-check`.
+
+**Assertions we cannot write yet**
+
+- **Documented-lossy conversions.** Every conversion case asserts identity.
+  Where a conversion is *meant* to lose something, nothing asserts what it
+  loses, so a conversion that starts losing more would pass. Needs the losses
+  enumerated per format pair first — the format matrix does not record them.
+- **Amiga file comments.** `FileEntry` carries `amiga_comment` and the GUI
+  browse view shows it, but no CLI verb reads or writes one — `chmeta` covers
+  protection bits only. A CLI/GUI parity gap, not a defect; the case cannot be
+  written until the surface exists. Protection bits *are* covered
+  (`edit.affs.protection-bits-persist`).
+- **HFS type/creator on a directory**, and resource-fork content beyond
+  `setrsrc` writing one.
+
+**Fixtures still wanted**
+
+- **A pure CD-DA disc inside a CHD.** `optical.chdcd.audio-test.cd` was
+  assumed to be one on the strength of its AUDIOTST volume label and is not —
+  it carries an ISO 9660 data track. R-012's CHD half is therefore uncovered;
+  only the cue/bin half is pinned.
+- **A donor Mac volume with a blessed System Folder**, so
+  `make-bootable` has a positive case rather than only the diagnostic one.
+
+**Verbs**
+
+`rb-regress query verbs` is the live answer. Of what it lists, only `write`
+(physical media, needs a `--device-allowlist` that does not exist) and `serve`
+(a daemon lifecycle) are worth closing; the rest are interactive or reach the
+network.

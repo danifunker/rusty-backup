@@ -163,30 +163,43 @@ error — met. Tier 2 runs today on a bare clone.
 
 ## Phase 4 — Tier 3, mutation round-trips
 
-- [ ] `put` -> `ls` -> `get` -> byte-compare, per editable filesystem
-- [ ] `mkdir` / `rm` / `setvolname` / `chmod` / `chown` / `chmeta` / `xattr` / `setrsrc`
-- [ ] Mac-specific: resource forks, type/creator, BinHex, MacBinary
-- [ ] Amiga-specific: protection bits, file comments
-- [ ] `fsck` must come back clean after every mutation
+- [x] `put` -> `ls` -> `get` -> byte-compare, per editable filesystem
+- [x] `mkdir` / `rm` / `setvolname` / `chmod` / `chown` / `chmeta` / `xattr` / `setrsrc`
+- [x] Mac-specific: resource forks, type/creator, BinHex, MacBinary
+- [~] Amiga-specific: protection bits done; **file comments have no CLI surface
+      at all**, so the case cannot be written — see GAPS.md § Open
+- [x] `fsck` must come back clean after every mutation
 - [ ] Free-space and duplicate-name preflight behaviour
-- [ ] Negative cases: writing to a read-only filesystem must exit non-zero with the right code
+- [x] Negative cases: writing to a read-only filesystem must exit non-zero with
+      the right code — R-034, red until fixed
 
 ---
 
 ## Phase 5 — Tier 4, conversion matrix
 
-- [ ] Container N x M conversion via `convert` / `repack`
+Tier 4 exists now (`cases/tier4/`) and holds three cases. Everything below is
+still the plan. Note `produce` builds 53 artifacts across these formats, so
+the *writers* are exercised even where a conversion case is not.
+
+- [~] Container N x M conversion via `convert` / `repack` — 3 of N
 - [ ] `floppy convert` across the floppy container family
 - [ ] `optical convert` across optical containers
-- [ ] Round-trip identity assertion where the conversion is lossless
-- [ ] Documented-lossy conversions assert the expected loss, not identity
-- [ ] `expand` / `shrink` / `resize` / `grow`, including `--to-hfv` and the 2047 MB HFV ceiling
+- [x] Round-trip identity assertion where the conversion is lossless
+- [ ] Documented-lossy conversions assert the expected loss, not identity —
+      blocked on enumerating the losses per format pair; formats.toml does not
+      record them
+- [x] `expand` / `shrink` / `resize` / `grow`, including `--to-hfv` and the 2047 MB HFV ceiling
 
 ---
 
 ## Phase 6 — Tier 5, backup and restore
 
-- [ ] `backup` in every output format (raw, zstd, VHD fixed/dynamic, single-file CHD)
+Tier 5 exists now (`cases/tier5/`). The round-trip and container-source cases
+were authored into tiers 3 and 4 and were re-tiered here on 2026-08-08; case
+IDs were left alone, because renaming one is a breaking change to every
+manifest that references it.
+
+- [~] `backup` in every output format (raw, zstd, VHD fixed/dynamic, single-file CHD)
 - [ ] Both backup layouts: per-partition and `layout: "single-file-chd"`
 - [ ] `restore` at original / minimum / custom sizes
 - [ ] Alignment preservation across all four alignment modes
