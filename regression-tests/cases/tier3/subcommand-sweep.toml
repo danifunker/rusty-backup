@@ -639,3 +639,72 @@ expect_exit = 0
 [[case.step]]
 args = ["fsck", "{scratch}/v.img", "--checkonly"]
 expect_exit = 0
+
+# --- negative: writing to a read-only filesystem --------------------------------
+#
+# PLAN.md § Phase 4 asked for these and none existed. formats.toml records
+# `we_write = false` for Lisa and Alto BFS, so a write must be refused — and
+# refused *by name*. `exit.rs` reserves PERMISSION_DENIED (4) for "hitting a
+# read-only filesystem on a write path", which is exactly this branch.
+#
+# Both currently exit 1 and call the volume 'unknown' even though `ls` and
+# `inspect` identify it correctly on the same file. That is R-034; the cases
+# assert the intended behaviour and are on the bug list until it is fixed.
+
+[[case]]
+id = "edit.readonly.lisa-refuses-a-write"
+description = "Lisa is read-only in formats.toml; a put must be refused, name the filesystem, and exit 4"
+fixture = "fs.lisa.los31-blank.floppy"
+[[case.step]]
+args = ["ls", "{fixture_copy}", "/"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{fixture_copy}", "{cases}/tier3/payload.bin", "/PAYLOAD"]
+expect_exit = 4
+stderr_contains = ["Lisa"]
+
+[[case]]
+id = "edit.readonly.alto-refuses-a-write"
+description = "Same contract on Alto BFS, the other filesystem the registry marks read-only and we have a fixture for"
+fixture = "fs.alto-bfs.mesa5.hd"
+[[case.step]]
+args = ["ls", "{fixture_copy}", "/"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{fixture_copy}", "{cases}/tier3/payload.bin", "/PAYLOAD"]
+expect_exit = 4
+stderr_contains = ["Alto"]
+
+# --- Amiga protection bits ------------------------------------------------------
+#
+# FileEntry carries amiga_protection and amiga_comment (CLAUDE.md), and the GUI
+# browse view shows both. On the CLI only `chmeta --protection` touches them,
+# and its own output is the only read path: `ls` and `ls -o` print neither.
+# Setting twice is what makes this a real round-trip — the second invocation
+# reports the value it found on disk, so it reads back across a process
+# boundary rather than trusting the writer.
+
+[[case]]
+id = "edit.affs.protection-bits-persist"
+description = "hsparwed set, then read back by a second process"
+[[case.step]]
+args = ["new", "volume", "affs", "--size", "2M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["chmeta", "{scratch}/v.img", "/payload.bin", "--protection", "hsparwed"]
+expect_exit = 0
+stderr_contains = ["-> hsparwed"]
+[[case.step]]
+# The "from" side is what was on disk, so this asserts persistence. The value
+# is written as bare letters — a leading `-` is parsed as a flag by clap, and
+# the letters-present-are-set form is what chmeta documents anyway.
+args = ["chmeta", "{scratch}/v.img", "/payload.bin", "--protection", "rwd"]
+expect_exit = 0
+stderr_contains = ["hsparwed -> ----rw-d"]
+# No fsck step: a fresh AFFS volume already fails its own fsck (R-008a) and one
+# put makes it worse (R-024). Both are pinned by their own cases; repeating the
+# check here would make this case red for a reason that has nothing to do with
+# protection bits.

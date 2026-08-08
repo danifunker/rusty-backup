@@ -1,4 +1,4 @@
-# Regression Findings (R-001 … R-033)
+# Regression Findings (R-001 … R-034)
 
 Defects and documentation drift turned up while building the regression suite
 (`regression-tests/`), 2026-08-01/02. The suite work was deliberately kept
@@ -33,6 +33,7 @@ finding depends on a fixture, the fixture is named.
 | [R-028](#r-028) | Medium | `src/fs/apple_dos.rs` | Apple DOS 3.3 reports three different sizes for one file: 104 in, 512 by `ls`, 256 by `get` |
 | [R-032](#r-032) | Low | `src/fs/sfs.rs` | SFS `put` fails on any volume with a multi-leaf extent btree — i.e. any real one |
 | [R-033](#r-033) | **High** | `src/partition/mod.rs` | A QL Microdrive `.mdv` fails at MBR detection, though its own probe matches it exactly |
+| [R-034](#r-034) | Medium | `src/fs/mod.rs` | Refusing a write to a read-only filesystem says `unknown` and exits 1, not 4 |
 | [R-020](#r-020) | **High** | `src/fs/affs.rs` | `new volume affs` output is "Not a DOS disk" on a real Amiga, at every size |
 | [R-016](#r-016) | **High** | `src/cli/verbs/backup.rs` | `backup` accepts only flat-layout sources: CHD, dynamic VHD, QCOW2 and VMDK all fail |
 | ~~R-018~~ | ~~Blocker~~ **FIXED** | `CONTRIBUTING.md` | ~~The documented Rust-1.73 verification build does not compile on Windows~~ — missing `windows-legacy` feature, 2026-08-07 |
@@ -689,6 +690,37 @@ tool that copies a file out of one image and into another silently grows it.
 Apple DOS 3.3's catalog stores a sector count rather than a byte length, so
 some rounding is inherent; three *different* numbers is not. Case
 `edit.apple-dos.put-get`.
+
+### R-034 — a read-only filesystem is refused as 'unknown', with the wrong code {#r-034}
+
+Found 2026-08-08 writing the negative cases PLAN.md § Phase 4 asks for, which
+did not exist at all until now.
+
+```
+rb-cli ls  fs.lisa.los31-blank.floppy.dsk /        -> lists fine
+rb-cli put fs.lisa.los31-blank.floppy.dsk payload.bin /PAYLOAD
+  -> error: opening filesystem for write: unsupported:
+     editing not yet supported for filesystem type 'unknown'
+     exit 1
+```
+
+Identical on `fs.alto-bfs.mesa5.hd`. Both are `we_write = false` in
+formats.toml, so refusing is correct — two things about *how* are not.
+
+The filesystem is called `unknown`, though `ls` and `inspect` identify it
+correctly on the same file a moment earlier. Whatever the write path uses to
+resolve a filesystem is not what the read path uses, so a user is told the
+disk is unreadable when it was read. This is the same shape as
+[R-031](#r-031), where a real Apple DOS 3.3 disk also arrives at the write
+path as `unknown`, and it is worth checking whether one fix covers both.
+
+And the code is 1. `exit.rs` gives PERMISSION_DENIED (4) explicitly for
+"hitting a read-only filesystem on a write path" — this branch and no other.
+A script cannot currently tell "this filesystem is read-only" from any other
+generic failure. Compare [R-004](#r-004): the same habit of letting
+`anyhow::bail!` pick the exit code.
+
+Cases `edit.readonly.{lisa,alto}-refuses-a-write`.
 
 ### R-031 — a real Apple DOS 3.3 disk is detected as 'unknown' {#r-031}
 
