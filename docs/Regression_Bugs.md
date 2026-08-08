@@ -1,4 +1,4 @@
-# Regression Findings (R-001 … R-020)
+# Regression Findings (R-001 … R-026)
 
 Defects and documentation drift turned up while building the regression suite
 (`regression-tests/`), 2026-08-01/02. The suite work was deliberately kept
@@ -20,6 +20,12 @@ finding depends on a fixture, the fixture is named.
 | ID | Severity | Area | Finding |
 |----|----------|------|---------|
 | [R-019](#r-019) | Low — **accepted** | `src/rbformats/vhd.rs` | VHD Creator Host OS makes output non-reproducible across platforms; behaviour kept, parity declares it |
+| [R-023](#r-023) | **High** | `src/cli/verbs/repack.rs` | `repack` loses every file in the volume |
+| [R-022](#r-022) | **High** | `src/fs/hpfs.rs` | HPFS sector-by-sector backup -> restore is not byte-identical |
+| [R-021](#r-021) | **High** | `src/cli/verbs/resize.rs` | `resize --size` reports success and changes nothing |
+| [R-024](#r-024) | Medium | `src/fs/affs.rs` | AFFS `put` leaves the volume failing its own fsck |
+| [R-025](#r-025) | Medium | `src/fs/squashfs_edit.rs` | `squashfs put` fails to replace the image on Windows |
+| [R-026](#r-026) | Low | `src/cli/verbs/show.rs` | `show partmap` cannot read an SGI disk that `inspect` reads fine |
 | [R-020](#r-020) | **High** | `src/fs/affs.rs` | `new volume affs` output is "Not a DOS disk" on a real Amiga, at every size |
 | [R-016](#r-016) | **High** | `src/cli/verbs/backup.rs` | `backup` accepts only flat-layout sources: CHD, dynamic VHD, QCOW2 and VMDK all fail |
 | ~~R-018~~ | ~~Blocker~~ **FIXED** | `CONTRIBUTING.md` | ~~The documented Rust-1.73 verification build does not compile on Windows~~ — missing `windows-legacy` feature, 2026-08-07 |
@@ -206,6 +212,77 @@ The creation timestamp at footer offset 0x18 also differs, as expected, and
 was correctly absorbed by the volatile-range mask — 18 masked bytes on
 `fmt.vhd-fixed`. That is the mask doing its job, and the reason these four
 bytes stood out at all.
+
+---
+
+## Found by the tier-3 sweep, 2026-08-08
+
+Six findings from the first run of the round-trip, edit and resize cases —
+the surface COMMAND-COVERAGE.md showed was untested. Recorded, not diagnosed:
+each names its reproduction and stops there.
+
+### R-021 — `resize --size` reports success and does nothing {#r-021}
+
+```
+rb-cli new volume fat --size 8M v.img
+rb-cli resize v.img --size 16M     -> "resize complete", exit 0
+rb-cli inspect v.img               -> FAT   8.0 MiB
+```
+
+Exit 0 and a success message for work that did not happen. Silent no-ops are
+the worst shape of bug in a tool whose job is moving data: nothing downstream
+has any reason to check. Case `resize.to-explicit-size`.
+
+### R-022 — HPFS does not survive a sector-by-sector round-trip {#r-022}
+
+`backup --sector-by-sector` then `restore` returns bytes that differ from the
+source. Every other filesystem tested — FAT, NTFS, ext4, HFS, minix3, EFS,
+ProDOS — comes back byte-identical through the same path, so this is specific
+to HPFS rather than to the backup format. `--sector-by-sector` asks for a
+faithful image, so any difference is a defect. Case `roundtrip.hpfs.raw`.
+
+### R-023 — `repack` loses every file {#r-023}
+
+```
+rb-cli put v.img payload.bin /payload.bin
+rb-cli repack v.img                -> exit 0
+rb-cli get v.img /payload.bin      -> error: path component not found: payload.bin
+```
+
+Exit 0, and the data is gone. Case `resize.repack.keeps-data`.
+
+### R-024 — AFFS `put` leaves the volume failing its own fsck {#r-024}
+
+A single `put` into a freshly formatted 3 MB AFFS volume — the largest size
+R-008 leaves working — makes `fsck --checkonly` report
+`1 error(s), 1 warning(s) (some repairable)`. The file reads back correctly,
+so the damage is to the allocation structures rather than the data. Related to
+but distinct from R-008a/b (sizing) and R-020 (root block); this is the
+editor, not the formatter. Case `edit.affs.put-get`.
+
+### R-025 — `squashfs put` cannot replace the image on Windows {#r-025}
+
+```
+error: sync_metadata: I/O error: replacing <path>
+```
+
+SquashFS edits rebuild the whole image and swap it in atomically (temp +
+fsync + rename). The rename fails on Windows, so the edit path is unusable
+there. Case `subcmd.squashfs.put-rebuilds`. `squashfs create` and `verify`
+both pass, so it is specific to the replace step.
+
+### R-026 — `show partmap` cannot read an SGI disk {#r-026}
+
+```
+rb-cli new hd sgi-efs --size 16M d.img
+rb-cli inspect d.img        -> reads the SGI volume header fine
+rb-cli show partmap d.img   -> error: parsing APM: Invalid APM: bad DDR signature: 0x0BE5
+```
+
+0x0BE5 is the leading half of the SGI volume-header magic, so `show partmap`
+is trying APM on a disk it should have recognised. `inspect` gets it right on
+the same file, so the detection that exists is simply not being used here.
+Case `subcmd.show.partmap`.
 
 ---
 

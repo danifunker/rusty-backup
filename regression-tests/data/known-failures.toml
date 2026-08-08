@@ -94,3 +94,23 @@ finding = "R-012"
 [[known]]
 id = "optical.cue.unpadded-track-number"
 finding = "R-015"
+
+# --- Found by the tier-3 sweep, 2026-08-08 -----------------------------------
+[[known]]
+id = "resize.to-explicit-size"
+finding = "R-021"
+[[known]]
+id = "roundtrip.hpfs.raw"
+finding = "R-022"
+[[known]]
+id = "resize.repack.keeps-data"
+finding = "R-023"
+[[known]]
+id = "edit.affs.put-get"
+finding = "R-024"
+[[known]]
+id = "subcmd.squashfs.put-rebuilds"
+finding = "R-025"
+[[known]]
+id = "subcmd.show.partmap"
+finding = "R-026"

@@ -1,0 +1,345 @@
+# Tier 3 — the edit surface.
+#
+# README advertises edit mode on about twenty filesystems. Before this file,
+# not one of put / get / rm / mkdir / cp / du / tar / untar / setvolname was
+# invoked anywhere in the suite (COMMAND-COVERAGE.md). Every write path beyond
+# "format a blank volume" was unverified.
+#
+# The shape: write something, read it back, prove the bytes match, then fsck.
+# The fsck matters as much as the read-back — a driver can return the right
+# file while leaving the allocation structures inconsistent, and only the fsck
+# would notice.
+#
+# `{cases}/tier3/payload.bin` is a committed file, so these need no fixture
+# corpus and run on a bare clone.
+
+[meta]
+tier = 3
+group = "edit"
+description = "Write to a volume, read it back unchanged, and leave it sound."
+
+# --- put / get round-trip, per filesystem ------------------------------------
+
+[[case]]
+id = "edit.fat.put-get"
+description = "FAT: put a file, get it back byte-identical, fsck clean"
+[[case.step]]
+args = ["new", "volume", "fat", "--size", "4M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{scratch}/v.img", "/payload.bin", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+
+[[case]]
+id = "edit.ntfs.put-get"
+[[case.step]]
+args = ["new", "volume", "ntfs", "--size", "4M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{scratch}/v.img", "/payload.bin", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+
+[[case]]
+id = "edit.ext4.put-get"
+[[case.step]]
+args = ["new", "volume", "ext4", "--size", "8M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{scratch}/v.img", "/payload.bin", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+
+[[case]]
+id = "edit.hfs.put-get"
+[[case.step]]
+args = ["new", "volume", "hfs", "--size", "4M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{scratch}/v.img", "/payload.bin", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+
+[[case]]
+id = "edit.hfsplus.put-get"
+[[case.step]]
+args = ["new", "volume", "hfsplus", "--size", "4M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{scratch}/v.img", "/payload.bin", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+
+[[case]]
+id = "edit.hpfs.put-get"
+[[case.step]]
+args = ["new", "volume", "hpfs", "--size", "4M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{scratch}/v.img", "/payload.bin", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+
+[[case]]
+id = "edit.minix3.put-get"
+[[case.step]]
+args = ["new", "volume", "minix3", "--size", "4M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{scratch}/v.img", "/payload.bin", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+
+[[case]]
+id = "edit.efs.put-get"
+[[case.step]]
+args = ["new", "volume", "efs", "--size", "4M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{scratch}/v.img", "/payload.bin", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+
+[[case]]
+id = "edit.prodos.put-get"
+[[case.step]]
+args = ["new", "volume", "prodos", "--size", "4M", "--name", "TESTVOL", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/PAYLOAD"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{scratch}/v.img", "/PAYLOAD", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+
+[[case]]
+id = "edit.affs.put-get"
+description = "AFFS at 3M — the largest size R-008 leaves working"
+[[case.step]]
+args = ["new", "volume", "affs", "--size", "3M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{scratch}/v.img", "/payload.bin", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+
+# --- directory operations -----------------------------------------------------
+
+[[case]]
+id = "edit.fat.mkdir-nested-put"
+description = "mkdir then put into the new directory, then list it"
+[[case.step]]
+args = ["new", "volume", "fat", "--size", "4M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["mkdir", "{scratch}/v.img", "/sub"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/sub/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{scratch}/v.img", "/sub"]
+expect_exit = 0
+stdout_contains = ["payload.bin"]
+[[case.step]]
+args = ["get", "{scratch}/v.img", "/sub/payload.bin", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+
+[[case]]
+id = "edit.fat.rm-removes-it"
+description = "rm must delete the entry AND leave the volume sound"
+[[case.step]]
+args = ["new", "volume", "fat", "--size", "4M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/gone.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{scratch}/v.img", "/gone.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{scratch}/v.img", "/"]
+expect_exit = 0
+stdout_not_contains = ["gone.bin"]
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+
+[[case]]
+id = "edit.ext4.rm-removes-it"
+[[case.step]]
+args = ["new", "volume", "ext4", "--size", "8M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/gone.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{scratch}/v.img", "/gone.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{scratch}/v.img", "/"]
+expect_exit = 0
+stdout_not_contains = ["gone.bin"]
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+
+# --- cross-image copy ----------------------------------------------------------
+
+[[case]]
+id = "edit.cp.across-filesystems"
+description = "cp from a FAT volume into an ext4 one — the bytes must survive the crossing"
+[[case.step]]
+args = ["new", "volume", "fat", "--size", "4M", "{scratch}/a.img"]
+expect_exit = 0
+[[case.step]]
+args = ["new", "volume", "ext4", "--size", "8M", "{scratch}/b.img"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/a.img", "{cases}/tier3/payload.bin", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["cp", "{scratch}/a.img", "/payload.bin", "{scratch}/b.img", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{scratch}/b.img", "/payload.bin", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+[[case.step]]
+args = ["fsck", "{scratch}/b.img", "--checkonly"]
+expect_exit = 0
+
+# --- du / locate ---------------------------------------------------------------
+
+[[case]]
+id = "edit.du.reports-written-bytes"
+description = "du must account for a file that was just written"
+[[case.step]]
+args = ["new", "volume", "fat", "--size", "4M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["du", "{scratch}/v.img"]
+expect_exit = 0
+stdout_not_contains = ["0 B         0 B"]
+
+[[case]]
+id = "edit.locate.finds-a-written-file"
+description = "locate is classic-HFS only today, so this targets HFS deliberately"
+[[case.step]]
+args = ["new", "volume", "hfs", "--size", "4M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/needle.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["locate", "{scratch}/v.img", "needle.bin"]
+expect_exit = 0
+stdout_contains = ["needle.bin"]
+
+# --- tar / untar ---------------------------------------------------------------
+
+[[case]]
+id = "edit.tar.export-then-reimport"
+description = "tar a directory out, untar it back into a fresh volume, compare the file"
+[[case.step]]
+args = ["new", "volume", "fat", "--size", "4M", "{scratch}/a.img"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/a.img", "{cases}/tier3/payload.bin", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["tar", "{scratch}/a.img", "/", "{scratch}/out.tar"]
+expect_exit = 0
+files_exist = ["{scratch}/out.tar"]
+[[case.step]]
+args = ["new", "volume", "fat", "--size", "4M", "{scratch}/b.img"]
+expect_exit = 0
+[[case.step]]
+args = ["untar", "{scratch}/b.img", "{scratch}/out.tar", "/"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{scratch}/b.img", "/payload.bin", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+
+# --- volume metadata -----------------------------------------------------------
+
+[[case]]
+id = "edit.setvolname.takes-effect"
+description = "setvolname is HFS-only today (its own --help says so), so this targets HFS"
+[[case.step]]
+args = ["new", "volume", "hfs", "--size", "4M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["setvolname", "{scratch}/v.img", "RENAMED"]
+expect_exit = 0
+[[case.step]]
+args = ["show", "fs-info", "{scratch}/v.img"]
+expect_exit = 0
+stdout_contains = ["RENAMED"]

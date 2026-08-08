@@ -1,0 +1,2 @@
+rb-regress round-trip payload.
+Fixed bytes, committed, so a data-survival case needs no fixture corpus.

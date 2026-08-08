@@ -1,0 +1,252 @@
+# Tier 3 — backup -> restore -> compare.
+#
+# The product's headline feature, and until now it had no test: `restore`
+# appeared exactly once in the whole suite, as `restore --help`. See
+# COMMAND-COVERAGE.md.
+#
+# The shape every case here uses:
+#
+#   1. new volume <fs>              build a source
+#   2. backup --name job            back it up (--name, or the folder is
+#                                   timestamped and the restore path is
+#                                   unpredictable)
+#   3. restore <bk>/job <out>       restore to a new file
+#   4. files_identical              compare - the whole point
+#
+# `--sector-by-sector` is what makes step 4 meaningful: it asks for a faithful
+# image rather than a compacted one, so anything but byte-equality is a defect.
+# The compaction paths get their own cases below, where equality is NOT the
+# expectation and the assertion is that the volume still fscks clean.
+
+[meta]
+tier = 3
+group = "roundtrip"
+description = "Back up a volume, restore it, and prove the bytes survived."
+
+# --- sector-by-sector must be byte-exact -------------------------------------
+
+[[case]]
+id = "roundtrip.fat.raw"
+description = "FAT: backup -> restore -> byte-identical"
+[[case.step]]
+args = ["new", "volume", "fat", "--size", "2M", "{scratch}/src.img"]
+expect_exit = 0
+[[case.step]]
+args = ["backup", "{scratch}/src.img", "{scratch}/bk", "--name", "job", "--format", "raw", "--sector-by-sector"]
+expect_exit = 0
+[[case.step]]
+args = ["restore", "{scratch}/bk/job", "{scratch}/out.img"]
+expect_exit = 0
+files_identical = [["{scratch}/src.img", "{scratch}/out.img"]]
+
+[[case]]
+id = "roundtrip.ntfs.raw"
+[[case.step]]
+args = ["new", "volume", "ntfs", "--size", "2M", "{scratch}/src.img"]
+expect_exit = 0
+[[case.step]]
+args = ["backup", "{scratch}/src.img", "{scratch}/bk", "--name", "job", "--format", "raw", "--sector-by-sector"]
+expect_exit = 0
+[[case.step]]
+args = ["restore", "{scratch}/bk/job", "{scratch}/out.img"]
+expect_exit = 0
+files_identical = [["{scratch}/src.img", "{scratch}/out.img"]]
+
+[[case]]
+id = "roundtrip.ext4.raw"
+[[case.step]]
+args = ["new", "volume", "ext4", "--size", "8M", "{scratch}/src.img"]
+expect_exit = 0
+[[case.step]]
+args = ["backup", "{scratch}/src.img", "{scratch}/bk", "--name", "job", "--format", "raw", "--sector-by-sector"]
+expect_exit = 0
+[[case.step]]
+args = ["restore", "{scratch}/bk/job", "{scratch}/out.img"]
+expect_exit = 0
+files_identical = [["{scratch}/src.img", "{scratch}/out.img"]]
+
+[[case]]
+id = "roundtrip.hfs.raw"
+[[case.step]]
+args = ["new", "volume", "hfs", "--size", "2M", "{scratch}/src.img"]
+expect_exit = 0
+[[case.step]]
+args = ["backup", "{scratch}/src.img", "{scratch}/bk", "--name", "job", "--format", "raw", "--sector-by-sector"]
+expect_exit = 0
+[[case.step]]
+args = ["restore", "{scratch}/bk/job", "{scratch}/out.img"]
+expect_exit = 0
+files_identical = [["{scratch}/src.img", "{scratch}/out.img"]]
+
+[[case]]
+id = "roundtrip.hpfs.raw"
+[[case.step]]
+args = ["new", "volume", "hpfs", "--size", "2M", "{scratch}/src.img"]
+expect_exit = 0
+[[case.step]]
+args = ["backup", "{scratch}/src.img", "{scratch}/bk", "--name", "job", "--format", "raw", "--sector-by-sector"]
+expect_exit = 0
+[[case.step]]
+args = ["restore", "{scratch}/bk/job", "{scratch}/out.img"]
+expect_exit = 0
+files_identical = [["{scratch}/src.img", "{scratch}/out.img"]]
+
+[[case]]
+id = "roundtrip.minix3.raw"
+[[case.step]]
+args = ["new", "volume", "minix3", "--size", "2M", "{scratch}/src.img"]
+expect_exit = 0
+[[case.step]]
+args = ["backup", "{scratch}/src.img", "{scratch}/bk", "--name", "job", "--format", "raw", "--sector-by-sector"]
+expect_exit = 0
+[[case.step]]
+args = ["restore", "{scratch}/bk/job", "{scratch}/out.img"]
+expect_exit = 0
+files_identical = [["{scratch}/src.img", "{scratch}/out.img"]]
+
+[[case]]
+id = "roundtrip.efs.raw"
+[[case.step]]
+args = ["new", "volume", "efs", "--size", "2M", "{scratch}/src.img"]
+expect_exit = 0
+[[case.step]]
+args = ["backup", "{scratch}/src.img", "{scratch}/bk", "--name", "job", "--format", "raw", "--sector-by-sector"]
+expect_exit = 0
+[[case.step]]
+args = ["restore", "{scratch}/bk/job", "{scratch}/out.img"]
+expect_exit = 0
+files_identical = [["{scratch}/src.img", "{scratch}/out.img"]]
+
+[[case]]
+id = "roundtrip.prodos.raw"
+[[case.step]]
+args = ["new", "volume", "prodos", "--size", "2M", "--name", "TESTVOL", "{scratch}/src.img"]
+expect_exit = 0
+[[case.step]]
+args = ["backup", "{scratch}/src.img", "{scratch}/bk", "--name", "job", "--format", "raw", "--sector-by-sector"]
+expect_exit = 0
+[[case.step]]
+args = ["restore", "{scratch}/bk/job", "{scratch}/out.img"]
+expect_exit = 0
+files_identical = [["{scratch}/src.img", "{scratch}/out.img"]]
+
+# --- output-format matrix ----------------------------------------------------
+# Same round-trip, different backup containers. A format that cannot restore
+# what it stored is worse than one that cannot store at all, because the loss
+# is only discovered when the backup is needed.
+
+[[case]]
+id = "roundtrip.format.zstd"
+description = "zstd-compressed backup must restore byte-identical"
+[[case.step]]
+args = ["new", "volume", "fat", "--size", "2M", "{scratch}/src.img"]
+expect_exit = 0
+[[case.step]]
+args = ["backup", "{scratch}/src.img", "{scratch}/bk", "--name", "job", "--format", "zstd", "--sector-by-sector"]
+expect_exit = 0
+[[case.step]]
+args = ["restore", "{scratch}/bk/job", "{scratch}/out.img"]
+expect_exit = 0
+files_identical = [["{scratch}/src.img", "{scratch}/out.img"]]
+
+[[case]]
+id = "roundtrip.format.chd"
+[[case.step]]
+args = ["new", "volume", "fat", "--size", "2M", "{scratch}/src.img"]
+expect_exit = 0
+[[case.step]]
+args = ["backup", "{scratch}/src.img", "{scratch}/bk", "--name", "job", "--format", "chd", "--sector-by-sector"]
+expect_exit = 0
+[[case.step]]
+args = ["restore", "{scratch}/bk/job", "{scratch}/out.img"]
+expect_exit = 0
+files_identical = [["{scratch}/src.img", "{scratch}/out.img"]]
+
+[[case]]
+id = "roundtrip.format.vhd"
+[[case.step]]
+args = ["new", "volume", "fat", "--size", "2M", "{scratch}/src.img"]
+expect_exit = 0
+[[case.step]]
+args = ["backup", "{scratch}/src.img", "{scratch}/bk", "--name", "job", "--format", "vhd", "--sector-by-sector"]
+expect_exit = 0
+[[case.step]]
+args = ["restore", "{scratch}/bk/job", "{scratch}/out.img"]
+expect_exit = 0
+files_identical = [["{scratch}/src.img", "{scratch}/out.img"]]
+
+# --- checksums ---------------------------------------------------------------
+# The metadata records a checksum per file. Restoring is the only thing that
+# proves the recorded value was ever right.
+
+[[case]]
+id = "roundtrip.checksum.sha256"
+[[case.step]]
+args = ["new", "volume", "fat", "--size", "2M", "{scratch}/src.img"]
+expect_exit = 0
+[[case.step]]
+args = ["backup", "{scratch}/src.img", "{scratch}/bk", "--name", "job", "--format", "raw", "--sector-by-sector", "--checksum", "sha256"]
+expect_exit = 0
+[[case.step]]
+args = ["restore", "{scratch}/bk/job", "{scratch}/out.img"]
+expect_exit = 0
+files_identical = [["{scratch}/src.img", "{scratch}/out.img"]]
+
+[[case]]
+id = "roundtrip.checksum.crc32"
+[[case.step]]
+args = ["new", "volume", "fat", "--size", "2M", "{scratch}/src.img"]
+expect_exit = 0
+[[case.step]]
+args = ["backup", "{scratch}/src.img", "{scratch}/bk", "--name", "job", "--format", "raw", "--sector-by-sector", "--checksum", "crc32"]
+expect_exit = 0
+[[case.step]]
+args = ["restore", "{scratch}/bk/job", "{scratch}/out.img"]
+expect_exit = 0
+files_identical = [["{scratch}/src.img", "{scratch}/out.img"]]
+
+# --- compacted backup --------------------------------------------------------
+# Without --sector-by-sector the backup may compact, so byte-equality is NOT
+# expected. What must hold is that the restored volume is still a valid
+# filesystem — the thing a user actually needs back.
+
+[[case]]
+id = "roundtrip.compacted.fat-still-fscks"
+description = "A compacted backup need not be byte-identical, but must restore to a sound volume"
+[[case.step]]
+args = ["new", "volume", "fat", "--size", "4M", "{scratch}/src.img"]
+expect_exit = 0
+[[case.step]]
+args = ["backup", "{scratch}/src.img", "{scratch}/bk", "--name", "job", "--format", "raw"]
+expect_exit = 0
+[[case.step]]
+args = ["restore", "{scratch}/bk/job", "{scratch}/out.img"]
+expect_exit = 0
+files_exist = ["{scratch}/out.img"]
+[[case.step]]
+args = ["fsck", "{scratch}/out.img", "--checkonly"]
+expect_exit = 0
+
+# --- data survival -----------------------------------------------------------
+# The assertion users care about most: a file written before the backup is
+# readable after the restore, with the same bytes.
+
+[[case]]
+id = "roundtrip.data-survives"
+description = "A file put into the volume must come back out of the restored copy unchanged"
+[[case.step]]
+args = ["new", "volume", "fat", "--size", "4M", "{scratch}/src.img"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/src.img", "{cases}/tier3/payload.bin", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["backup", "{scratch}/src.img", "{scratch}/bk", "--name", "job", "--format", "raw", "--sector-by-sector"]
+expect_exit = 0
+[[case.step]]
+args = ["restore", "{scratch}/bk/job", "{scratch}/out.img"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{scratch}/out.img", "/payload.bin", "{scratch}/payload.out"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/payload.out"]]

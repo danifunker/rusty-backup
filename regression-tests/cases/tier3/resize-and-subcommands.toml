@@ -1,0 +1,225 @@
+# Tier 3 — resize, and the subcommand surface nothing had touched.
+#
+# `resize`, `shrink` and `grow` were never invoked by any case; `expand` ran
+# once. Alignment-preserving resize is a stated design goal in CLAUDE.md and
+# had no coverage at all. Nor did `squashfs` (five subcommands — the verb R-014
+# was about), `partmap`, `show`, `config`, `repack` or `archive`.
+#
+# Every resize case ends in an fsck. A resize that returns 0 and leaves an
+# inconsistent volume is the failure mode that matters, and only the fsck sees
+# it.
+
+[meta]
+tier = 3
+group = "resize"
+description = "Grow, shrink and repack volumes; exercise the untouched subcommands."
+
+# --- grow ---------------------------------------------------------------------
+
+[[case]]
+id = "resize.grow.fat"
+description = "grow --add must enlarge the file and leave a sound filesystem"
+[[case.step]]
+args = ["new", "volume", "fat", "--size", "8M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["grow", "{scratch}/v.img", "--add", "4M"]
+expect_exit = 0
+[[case.step]]
+# grow reports on stderr, so the size is asserted through inspect.
+args = ["inspect", "{scratch}/v.img"]
+expect_exit = 0
+stdout_contains = ["12.0 MiB"]
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+
+[[case]]
+id = "resize.grow.preserves-data"
+description = "A file written before the grow must still read back identical after it"
+[[case.step]]
+args = ["new", "volume", "fat", "--size", "8M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["grow", "{scratch}/v.img", "--add", "8M"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{scratch}/v.img", "/payload.bin", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+
+[[case]]
+id = "resize.grow.ext4"
+[[case.step]]
+args = ["new", "volume", "ext4", "--size", "8M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["grow", "{scratch}/v.img", "--add", "8M"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+
+# --- resize -------------------------------------------------------------------
+# Observed 2026-08-08: `resize --size 16M` on a 12 MiB FAT superfloppy printed
+# "resize complete" and left the file at 12 MiB. This case asserts the intended
+# behaviour — the volume ends up the size that was asked for — so it is red
+# until that is either fixed or explained.
+
+[[case]]
+id = "resize.to-explicit-size"
+description = "resize --size must produce a volume of that size"
+[[case.step]]
+args = ["new", "volume", "fat", "--size", "8M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["resize", "{scratch}/v.img", "--size", "16M"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/v.img"]
+expect_exit = 0
+stdout_contains = ["16.0 MiB"]
+
+# --- repack -------------------------------------------------------------------
+
+[[case]]
+id = "resize.repack.keeps-data"
+description = "repack must not lose a file, and must leave the volume sound"
+[[case.step]]
+args = ["new", "volume", "fat", "--size", "8M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["repack", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{scratch}/v.img", "/payload.bin", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+
+# --- squashfs -----------------------------------------------------------------
+# Five subcommands, none previously exercised — including on the verb whose
+# clippy failure was R-014.
+
+[[case]]
+id = "subcmd.squashfs.create-verify"
+description = "Build an image from a host directory and structurally verify it"
+[[case.step]]
+args = ["squashfs", "create", "{cases}/tier3", "{scratch}/t.squashfs"]
+expect_exit = 0
+files_exist = ["{scratch}/t.squashfs"]
+[[case.step]]
+args = ["squashfs", "verify", "{scratch}/t.squashfs"]
+expect_exit = 0
+[[case.step]]
+args = ["squashfs", "plan", "{scratch}/t.squashfs"]
+expect_exit = 0
+
+[[case]]
+id = "subcmd.squashfs.roundtrip-a-file"
+description = "A file packed into a SquashFS image must read back identical"
+[[case.step]]
+args = ["squashfs", "create", "{cases}/tier3", "{scratch}/t.squashfs"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{scratch}/t.squashfs", "/payload.bin", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+
+[[case]]
+id = "subcmd.squashfs.put-rebuilds"
+description = "squashfs put rebuilds the whole image; the added file must be readable"
+[[case.step]]
+args = ["squashfs", "create", "{cases}/tier3", "{scratch}/t.squashfs"]
+expect_exit = 0
+[[case.step]]
+args = ["squashfs", "put", "{scratch}/t.squashfs", "{cases}/tier3/payload.bin", "/added.bin", "--grow", "1M"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{scratch}/t.squashfs", "/added.bin", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+
+# --- partmap ------------------------------------------------------------------
+
+[[case]]
+id = "subcmd.show.partmap"
+description = "show partmap must read back the table new hd wrote"
+[[case.step]]
+args = ["new", "hd", "sgi-efs", "--size", "16M", "{scratch}/d.img"]
+expect_exit = 0
+[[case.step]]
+args = ["show", "partmap", "{scratch}/d.img"]
+expect_exit = 0
+
+# --- show / config: read-only introspection ------------------------------------
+
+[[case]]
+id = "subcmd.show.fs-info"
+[[case.step]]
+args = ["new", "volume", "fat", "--size", "2M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["show", "fs-info", "{scratch}/v.img"]
+expect_exit = 0
+[[case]]
+id = "subcmd.config.show"
+[[case.step]]
+args = ["config", "show"]
+expect_exit = 0
+
+# --- inspect on everything produce can build -----------------------------------
+# Cheap breadth: every container `convert` writes must be re-openable by us.
+# This is deliberately tier-1-grade evidence (rb-cli reading its own output),
+# but it is the difference between "we wrote a file" and "we wrote a file we
+# can still open".
+
+[[case]]
+id = "subcmd.convert.qcow2-reopens"
+[[case.step]]
+args = ["new", "volume", "fat", "--size", "2M", "{scratch}/src.img"]
+expect_exit = 0
+[[case.step]]
+args = ["convert", "{scratch}/src.img", "{scratch}/out", "--format", "qcow2"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/out/src.qcow2"]
+expect_exit = 0
+stdout_contains = ["FAT"]
+
+[[case]]
+id = "subcmd.convert.vmdk-sparse-reopens"
+[[case.step]]
+args = ["new", "volume", "fat", "--size", "2M", "{scratch}/src.img"]
+expect_exit = 0
+[[case.step]]
+args = ["convert", "{scratch}/src.img", "{scratch}/out", "--format", "vmdk-sparse"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/out/src.vmdk"]
+expect_exit = 0
+stdout_contains = ["FAT"]
+
+[[case]]
+id = "subcmd.convert.chd-reopens"
+[[case.step]]
+args = ["new", "volume", "fat", "--size", "2M", "{scratch}/src.img"]
+expect_exit = 0
+[[case.step]]
+args = ["convert", "{scratch}/src.img", "{scratch}/out", "--format", "chd"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/out/src.chd"]
+expect_exit = 0
+stdout_contains = ["FAT"]
