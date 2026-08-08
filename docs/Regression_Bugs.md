@@ -1,4 +1,4 @@
-# Regression Findings (R-001 … R-034)
+# Regression Findings (R-001 … R-035)
 
 Defects and documentation drift turned up while building the regression suite
 (`regression-tests/`), 2026-08-01/02. The suite work was deliberately kept
@@ -34,6 +34,7 @@ finding depends on a fixture, the fixture is named.
 | [R-032](#r-032) | Low | `src/fs/sfs.rs` | SFS `put` fails on any volume with a multi-leaf extent btree — i.e. any real one |
 | [R-033](#r-033) | **High** | `src/partition/mod.rs` | A QL Microdrive `.mdv` fails at MBR detection, though its own probe matches it exactly |
 | [R-034](#r-034) | Medium | `src/fs/mod.rs` | Refusing a write to a read-only filesystem says `unknown` and exits 1, not 4 |
+| [R-035](#r-035) | Medium | `src/backup/` | `.cbk` embeds the producing host's absolute path, so it can never be byte-identical across machines |
 | [R-020](#r-020) | **High** | `src/fs/affs.rs` | `new volume affs` output is "Not a DOS disk" on a real Amiga, at every size |
 | [R-016](#r-016) | **High** | `src/cli/verbs/backup.rs` | `backup` accepts only flat-layout sources: CHD, dynamic VHD, QCOW2 and VMDK all fail |
 | ~~R-018~~ | ~~Blocker~~ **FIXED** | `CONTRIBUTING.md` | ~~The documented Rust-1.73 verification build does not compile on Windows~~ — missing `windows-legacy` feature, 2026-08-07 |
@@ -638,6 +639,50 @@ exist, and neither is reachable for a real cartridge.
 Same shape as [R-026](#r-026) and the R-009 / R-017 group — detection that
 exists but is not consulted on the path the user takes. Case
 `read.qdos.microdrive`.
+
+### R-035 — `.cbk` embeds the producing host's absolute path {#r-035}
+
+Found 2026-08-08 by the first three-way `parity` run over all 53 produced
+formats. 157 comparisons matched; this was the only real divergence.
+
+```
+DIFF  fmt.cbk   linux vs windows   size 951 != 959
+DIFF  fmt.cbk   macos vs windows   size 951 != 959
+```
+
+Linux and macOS agree with each other and Windows is 8 bytes larger, which
+looks like a Windows defect and is not. Unpacking both and diffing the
+metadata shows what actually varies:
+
+```
+< "source_device": "/home/dani/repos/.../scratch/produce/fmt.cbk-a/src.img"
+> "source_device": "C:\Temp\mistercore\...\scratch\produce\fmt.cbk-a/src.img"
+```
+
+The container records the absolute path of whatever it was made from. The two
+paths are different lengths, gzip turns that into an 8-byte difference in the
+compressed stream, and the sizes diverge. So the 8 bytes are a red herring:
+the real property is that **a `.cbk` is not reproducible across machines at
+all** — two Linux boxes with different checkout paths would differ too, and
+nothing about the OS is involved.
+
+Whether to keep the field is a decision, not a bug: a backup container that
+records what it backed up is reasonable, and [R-019](#r-019) set the precedent
+for a deliberate, spec-legal field that records the producing host (VHD's
+Creator Host OS), declared to `parity` rather than removed. Two things make
+this one different:
+
+- `expect_divergence` masks byte *ranges*. Here the *length* changes, so
+  `parity` cannot align the two files to mask anything. The existing mechanism
+  cannot express this, whatever we decide.
+- The value is a filesystem path from the producing machine, so it travels
+  inside any `.cbk` that is shared. That is a mild information leak on top of
+  the reproducibility question.
+
+Recording the source as a device identity or a relative name would make the
+format reproducible and drop the leak. Case: none yet — this is a `parity`
+finding, not a case failure; `fmt.cbk` is produced by `produce.toml` and
+`cbk.pack-unpack-roundtrip` passes on all three platforms.
 
 ### R-030 — a real Workbench 1.3 AFFS volume cannot be opened at all {#r-030}
 
