@@ -350,24 +350,24 @@ args = ["inspect", "{fixture}"]
 expect_exit = 0
 stdout_contains = ["Sun"]
 
-# --- WinImage IMZ ---------------------------------------------------------------
-# `fmt.imz` is a known read format and formats.toml already records what it
-# needs: "Encrypted variant needs both a correct- and a wrong-password case".
-# The unencrypted one is now catalogued as `fmt.imz.plain.floppy` — a genuine
-# WinImage file found locally, 2,025 bytes decoding to a 1.44 MB FAT floppy.
-# The ENCRYPTED variant is still wanted; those cases are written against the
-# `password` convention and report as unsourced until one arrives. `rb-regress fixtures` lists them in the blocked shopping list,
-# which is the point: a requirement recorded in a notes field was invisible,
-# and a blocked case is not.
+# --- WinImage IMA / IMZ -----------------------------------------------------
+# formats.toml recorded the requirement and nothing acted on it:
+#   "Encrypted variant needs both a correct- and a wrong-password case"
 #
-# IMZ is a ZIP-wrapped floppy image. The canonical producer is WinImage, so the
-# fixture has to come from there rather than be synthesised — the same rule
-# that keeps every other fixture honest.
+# All three fixtures hold the SAME 1.44 MB FAT12 volume: the raw .IMA, the
+# plain .IMZ, and the password-protected .IMZ. That is what makes the encrypted
+# case worth having — asserting a shared file from the volume proves the
+# decrypt produced the CORRECT plaintext, not merely that it returned something
+# without erroring. A decrypt that yields plausible-but-wrong bytes is the
+# failure mode that silently corrupts a restore, and exit 0 alone cannot see it.
+#
+# Password is `password`, per the convention. Produced by WinImage, the
+# canonical tool, rather than synthesised here.
 
 [[case]]
-id = "read.imz.plain"
-description = "An unencrypted IMZ must decode to its flat floppy stream. 2 KB on disk for a 1.44 MB volume - the cheapest fixture in the corpus."
-fixture = "fmt.imz.plain.floppy"
+id = "read.ima.transferdisk"
+description = "The raw plaintext behind both IMZ fixtures"
+fixture = "fmt.ima.transferdisk.floppy"
 [[case.step]]
 args = ["inspect", "{fixture}"]
 expect_exit = 0
@@ -375,25 +375,42 @@ stdout_contains = ["FAT"]
 [[case.step]]
 args = ["ls", "{fixture}", "/"]
 expect_exit = 0
+stdout_contains = ["bcwdef.csm", "makefile"]
+
+[[case]]
+id = "read.imz.plain"
+description = "An unencrypted IMZ must decode to the same volume as the .IMA"
+fixture = "fmt.imz.transferdisk.floppy"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["FAT"]
+[[case.step]]
+args = ["ls", "{fixture}", "/"]
+expect_exit = 0
+stdout_contains = ["bcwdef.csm", "makefile"]
 
 [[case]]
 id = "read.imz.encrypted.refuses-without-password"
+description = "Must say it needs a password, and name the entry, rather than failing obscurely"
 fixture = "fmt.imz.encrypted.floppy"
 [[case.step]]
 args = ["inspect", "{fixture}"]
 expect_exit = 1
-stdout_contains = ["password"]
+stdout_contains = ["password-protected"]
 
 [[case]]
 id = "read.imz.encrypted.opens-with-password"
-description = "The `password` convention applies to any fixture sourced from here on"
+description = "Decrypts to the SAME volume as the plain pair — the assertion that matters"
 fixture = "fmt.imz.encrypted.floppy"
 [[case.step]]
 args = ["inspect", "{fixture}", "--password", "password"]
 expect_exit = 0
+stdout_contains = ["FAT"]
 [[case.step]]
 args = ["ls", "{fixture}", "/", "--password", "password"]
 expect_exit = 0
+stdout_contains = ["bcwdef.csm", "makefile"]
 
 [[case]]
 id = "read.imz.encrypted.wrong-password-is-an-error"
@@ -402,3 +419,15 @@ fixture = "fmt.imz.encrypted.floppy"
 [[case.step]]
 args = ["inspect", "{fixture}", "--password", "not-the-password"]
 expect_exit = 1
+
+[[case]]
+id = "read.imz.tiny"
+description = "A second, unrelated IMZ — 2 KB decoding to a full 1.44 MB floppy. Kept alongside the transferdisk set because two independent samples of a compressed container catch packer differences one sample cannot."
+fixture = "fmt.imz.plain.floppy"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["FAT"]
+[[case.step]]
+args = ["ls", "{fixture}", "/"]
+expect_exit = 0
