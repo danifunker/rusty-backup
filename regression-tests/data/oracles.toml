@@ -88,16 +88,30 @@ verifies = [
 id = "fsck_hfs"
 tool = "fsck_hfs"
 kind = "package"
-notes = "macOS only. Nothing equivalent exists elsewhere, which is what makes a Mac non-optional."
+program = "oracles/fsck_hfs_image.sh"
+notes = """macOS only. Nothing equivalent exists elsewhere, which is what makes a
+Mac non-optional.
+
+fsck_hfs will not read a plain file — "not a character device / Can't get
+device block size" — so the oracle runs through oracles/fsck_hfs_image.sh,
+which attaches the image read-only and no-mount, checks it, and always
+detaches.
+
+Measured 2026-08-07 on macOS 26.5.2 (fsck_hfs hfs-715.120.4): it still checks
+**classic HFS**, announcing "Checking HFS volume", as well as "Checking
+non-journaled HFS Plus Volume". macOS dropped HFS Standard *mounting* years
+ago, so the assumption that fsck_hfs went with it is easy to make and wrong.
+Both were also confirmed against Mac OS X 10.5.8 on a PowerMac G5, which
+agrees — a period-authentic second opinion for the classic-HFS rows."""
 availability = [
-  { platform = "macos",   status = "expected" },
+  { platform = "macos",   status = "verified", verified_on = "2026-08-07" },
   { platform = "windows", status = "absent" },
   { platform = "linux",   status = "absent" },
 ]
 verifies = [
-  { format = "fs.hfs",     direction = "write", strength = "authoritative", status = "untested" },
-  { format = "fs.hfsplus", direction = "write", strength = "authoritative", status = "untested" },
-  { format = "fs.hfv",     direction = "write", strength = "authoritative", status = "untested" },
+  { format = "fs.hfs",     direction = "write", strength = "authoritative", status = "proven", evidence = "fsck_hfs -> 'Checking HFS volume' + 'appears to be OK', macOS 26.5.2 and 10.5.8", check = ["{artifact}"], expect_stdout = "appears to be OK" },
+  { format = "fs.hfsplus", direction = "write", strength = "authoritative", status = "proven", evidence = "fsck_hfs -> 'Checking non-journaled HFS Plus Volume' + 'appears to be OK'", check = ["{artifact}"], expect_stdout = "appears to be OK" },
+  { format = "fs.hfv",     direction = "write", strength = "authoritative", status = "proven", evidence = "flat classic-HFS volume; same path as fs.hfs", check = ["{artifact}"], expect_stdout = "appears to be OK" },
 ]
 
 [[oracle]]
@@ -342,9 +356,25 @@ tool = "Snow"
 kind = "emulator"
 notes = """Modern Macintosh emulator written in Rust. Emulating a Mac Plus gives
 a real MFS implementation — the only realistic judge of MFS, which otherwise
-has no oracle anywhere. NB: snowemu.com returned HTTP 403 when checked on
-2026-08-02, so confirm the project and its automation surface before the
-matrix leans on it."""
+has no oracle anywhere.
+
+Confirmed 2026-08-07. The project is real and active: github.com/twvd/snow,
+MIT, Linux/macOS/Windows, hardware-level 68000/020/030 emulation of the 128K
+through SE/30, with SCSI hard disk and CD support. The 2026-08-02 HTTP 403 was
+snowemu.com blocking the fetch, not a dead project.
+
+Its automation surface is the open question, and the answer is "not directly".
+There is no CLI frontend — `frontend_egui` is the only one. The `testrunner`
+crate IS headless (clap, PNG/GIF output, parallel), but it is built for Snow's
+own emulation-accuracy suite: `single` takes a ROM, a floppy image, a recorded
+input replay and a control *frame*, boots, and image-diffs the framebuffer.
+Repurposing that as a format oracle means authoring an input replay and a
+known-good screenshot per format, and supplying Mac ROMs. Possible, but a
+project rather than a check command, and brittle in a way a fsck is not.
+
+So: keep it registered as the emulator oracle of record for MFS, but do not
+plan on automating it soon. For classic HFS an older macOS with a real
+HFS-Standard-capable fsck_hfs is far cheaper and equally authoritative."""
 availability = [
   { platform = "windows", status = "install" },
   { platform = "linux",   status = "install" },

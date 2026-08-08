@@ -90,7 +90,24 @@ pub struct Report {
 /// PATH first, then the `path_hint` recorded for this platform — qemu-img and
 /// chdman are both installed here but neither is on PATH, and treating that as
 /// "oracle absent" would silently drop the two best container checks we have.
-fn resolve_program(reg: &Registry, oracle_id: &str, program: &str, platform: &str) -> Option<PathBuf> {
+fn resolve_program(
+    reg: &Registry,
+    oracle_id: &str,
+    program: &str,
+    platform: &str,
+    regression_dir: &Path,
+) -> Option<PathBuf> {
+    // A repo-relative helper, e.g. "oracles/fsck_hfs_image.sh". Some oracles
+    // need setup and teardown around the actual check — fsck_hfs wants a block
+    // device, so its image has to be attached and detached — and a shipped
+    // script keeps that reviewable and versioned instead of buried in a TOML
+    // string. Checked first so the repo's copy always wins over a stray one.
+    if program.contains('/') && !Path::new(program).is_absolute() {
+        let local = regression_dir.join(program);
+        if local.is_file() {
+            return Some(local);
+        }
+    }
     if exec::tool_available(program) {
         return Some(PathBuf::from(program));
     }
@@ -167,12 +184,14 @@ fn walk_artifacts(root: &Path) -> Vec<(ArtifactMeta, PathBuf)> {
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn verify(
     reg: &Registry,
     artifacts_root: &Path,
     out_dir: &Path,
     verifier_host: &str,
     filter: Option<&str>,
+    regression_dir: &Path,
 ) -> Result<Report, String> {
     let platform = exec::platform_token();
     fs::create_dir_all(out_dir).map_err(|e| format!("{}: {}", out_dir.display(), e))?;
@@ -237,7 +256,7 @@ pub fn verify(
             } else if claim.check.is_none() {
                 (Verdict::SkipNoCheck, Vec::new(), None)
             } else {
-                match resolve_program(reg, &oracle.id, program, platform) {
+                match resolve_program(reg, &oracle.id, program, platform, regression_dir) {
                     None => (
                         Verdict::SkipUnavailable {
                             reason: format!("{} not on PATH or at its path_hint", program),

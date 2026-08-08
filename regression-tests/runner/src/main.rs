@@ -437,6 +437,7 @@ fn cmd_verify(args: &Args) -> i32 {
         &out_dir,
         &hostname(),
         args.filter.as_deref(),
+        &regression_dir(),
     ) {
         Ok(r) => r,
         Err(e) => {
