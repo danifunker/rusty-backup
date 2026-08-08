@@ -24,7 +24,7 @@ finding depends on a fixture, the fixture is named.
 | [R-022](#r-022) | **High** | `src/fs/hpfs.rs` | HPFS sector-by-sector backup -> restore is not byte-identical |
 | [R-021](#r-021) | **High** | `src/cli/verbs/resize.rs` | `resize --size` reports success and changes nothing |
 | [R-024](#r-024) | Medium | `src/fs/affs.rs` | AFFS `put` leaves the volume failing its own fsck |
-| [R-025](#r-025) | Medium | `src/fs/squashfs_edit.rs` | `squashfs put` fails to replace the image on Windows |
+| ~~R-025~~ | ~~Medium~~ **FIXED** | `src/fs/squashfs_edit.rs` | ~~`squashfs put` fails to replace the image on Windows~~ — handle released before the rename, 2026-08-08 |
 | [R-026](#r-026) | Low | `src/cli/verbs/show.rs` | `show partmap` cannot read an SGI disk that `inspect` reads fine |
 | [R-027](#r-027) | Medium | `src/rbformats/zip_disk.rs` | A Finder-made `.zip` holding one `.dmg` is rejected as ambiguous |
 | [R-030](#r-030) | **High** | `src/fs/affs.rs` | A real Workbench 1.3 AFFS volume cannot be opened at all — read, fsck and write alike |
@@ -270,6 +270,28 @@ but distinct from R-008a/b (sizing) and R-020 (root block); this is the
 editor, not the formatter. Case `edit.affs.put-get`.
 
 ### R-025 — `squashfs put` cannot replace the image on Windows {#r-025}
+
+**FIXED 2026-08-08.** `commit_by_replacing` now closes its handle on the target
+before renaming the rebuilt temp over it.
+
+The original code held the handle across the rename and said so explicitly,
+reasoning that nothing reads through it afterwards. That is true, and it is
+still not safe on Windows: a file marked for deletion **keeps its name until
+the last handle closes**, so the rename cannot reuse a name we are still
+holding. Unix frees the name immediately, which is why every developer machine
+and both other CI platforms passed.
+
+`FILE_SHARE_DELETE` looks like the fix and is not — tried first, and it changed
+nothing. It permits the delete to *begin*; it does not let the name be reused
+while a handle is open. An isolating test made that unambiguous: replacing an
+unheld file succeeded, replacing a held one failed with the same `os error 5`,
+with no editor code in the picture.
+
+The handle is now `Option<RW>`, released before `persist`. `commit_in_place` —
+the only other reader — runs solely when `backing_file` is `None`, which is
+exactly when the replacement path never ran.
+
+
 
 ```
 error: sync_metadata: I/O error: replacing <path>

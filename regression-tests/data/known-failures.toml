@@ -108,14 +108,7 @@ finding = "R-023"
 [[known]]
 id = "edit.affs.put-get"
 finding = "R-024"
-# R-025 is a Windows-only defect (a tempfile persist failure), so scope it.
-# Without `platforms` these two XPASS on macOS and Linux, and XPASS is supposed
-# to mean "fixed, remove the entry" — not "never applied here". Confirmed by
-# the first macOS run, 2026-08-08: both passed there.
-[[known]]
-id = "subcmd.squashfs.put-rebuilds"
-finding = "R-025"
-platforms = ["windows"]
+
 [[known]]
 id = "subcmd.show.partmap"
 finding = "R-026"
@@ -157,12 +150,7 @@ finding = "R-032"
 id = "shrink.rejects-non-chd-output"
 finding = "R-004"
 
-# `xattr set` reaches SquashFS's rebuild-and-replace path, which is R-025 —
-# the same Windows persist failure `squashfs put` hits. Nothing xattr-specific.
-[[known]]
-id = "meta.xattr.set-list-rm"
-finding = "R-025"
-platforms = ["windows"]
+
 
 # The detector matches the fixture byte for byte; inspect never reaches it.
 [[known]]

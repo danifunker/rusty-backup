@@ -217,7 +217,10 @@ pub fn plan_size(
 
 /// An editable SquashFS image backed by an in-memory tree.
 pub struct SquashfsEditor<RW: Read + Write + Seek> {
-    rw: RW,
+    /// `None` once a replacement commit has released it — see
+    /// [`SquashfsEditor::commit_by_replacing`]. Only the in-place commit reads
+    /// it, and that path never releases it.
+    rw: Option<RW>,
     /// Byte offset of the image within `rw` (0 for a bare superfloppy).
     offset: u64,
     /// Bytes the image may occupy in its container, or `None` when it can grow
@@ -310,7 +313,7 @@ impl<RW: Read + Write + Seek> SquashfsEditor<RW> {
         }
 
         Ok(Self {
-            rw,
+            rw: Some(rw),
             offset,
             capacity,
             budget,
@@ -343,7 +346,10 @@ impl<RW: Read + Write + Seek> SquashfsEditor<RW> {
     /// The counterpart of [`SquashfsFilesystem::into_inner`], for a caller that
     /// wrapped the handle itself — an AppImage's payload window, say — and
     /// wants it back to inspect what landed.
-    pub fn into_backing(self) -> RW {
+    /// `None` after a replacement commit, which closes the handle before
+    /// renaming over it. Callers that wrap the handle themselves always commit
+    /// in place, so they always get it back.
+    pub fn into_backing(self) -> Option<RW> {
         self.rw
     }
 
@@ -378,11 +384,17 @@ impl<RW: Read + Write + Seek> SquashfsEditor<RW> {
     /// before the rename so the rename cannot become visible ahead of the bytes
     /// it points at.
     ///
-    /// Note `self.rw` still refers to the *replaced* file afterwards. Nothing
-    /// reads through it — every read this editor serves comes from the
-    /// in-memory tree — and a second sync writes a fresh temp and renames
-    /// again, so the stale handle never matters. It is not reopened only
-    /// because `RW` is generic and there is nothing to reopen it *as*.
+    /// The handle is **closed before the rename**, and that is load-bearing on
+    /// Windows: a file marked for deletion keeps its name until the last handle
+    /// closes, so renaming over a file we still hold fails with
+    /// `Access is denied (os error 5)` — R-025, which made every SquashFS edit
+    /// and every `xattr set` unusable there while passing on Unix, where the
+    /// name is freed immediately. `FILE_SHARE_DELETE` does *not* fix it: it
+    /// lets the delete begin, not the name be reused.
+    ///
+    /// Closing is safe because nothing reads through the handle — every read
+    /// this editor serves comes from the in-memory tree — and a second sync
+    /// writes a fresh temp and renames again, needing only the path.
     fn commit_by_replacing(
         &mut self,
         path: &std::path::Path,
@@ -406,6 +418,9 @@ impl<RW: Read + Write + Seek> SquashfsEditor<RW> {
         if let Ok(meta) = std::fs::metadata(path) {
             let _ = std::fs::set_permissions(tmp.path(), meta.permissions());
         }
+        // Release our handle on the target before renaming over it. See the
+        // doc comment: on Windows the rename cannot reuse a name we still hold.
+        self.rw = None;
         tmp.persist(path).map_err(|e| {
             FilesystemError::Io(crate::compat::io_other(format!(
                 "replacing {} with the rebuilt image: {e}",
@@ -425,10 +440,16 @@ impl<RW: Read + Write + Seek> SquashfsEditor<RW> {
     /// lying around — they would be carried into a backup and could be
     /// mistaken for live data by anything scanning for magic bytes. Zero them.
     fn commit_in_place(&mut self, image: &[u8]) -> Result<(), FilesystemError> {
-        self.rw
-            .seek(SeekFrom::Start(self.offset))
+        // Only reachable with `backing_file` None, which is exactly when the
+        // replacement path never ran and the handle is still ours.
+        let rw = self.rw.as_mut().ok_or_else(|| {
+            FilesystemError::Io(crate::compat::io_other(
+                "squashfs: the backing handle was released by a replacement commit",
+            ))
+        })?;
+        rw.seek(SeekFrom::Start(self.offset))
             .map_err(FilesystemError::Io)?;
-        self.rw.write_all(image).map_err(FilesystemError::Io)?;
+        rw.write_all(image).map_err(FilesystemError::Io)?;
 
         let written = image.len() as u64;
         if written < self.source_len {
@@ -436,13 +457,11 @@ impl<RW: Read + Write + Seek> SquashfsEditor<RW> {
             let zeros = vec![0u8; 64 * 1024];
             while remaining > 0 {
                 let n = remaining.min(zeros.len() as u64) as usize;
-                self.rw
-                    .write_all(&zeros[..n])
-                    .map_err(FilesystemError::Io)?;
+                rw.write_all(&zeros[..n]).map_err(FilesystemError::Io)?;
                 remaining -= n as u64;
             }
         }
-        self.rw.flush().map_err(FilesystemError::Io)?;
+        rw.flush().map_err(FilesystemError::Io)?;
         Ok(())
     }
 
@@ -1071,7 +1090,11 @@ mod tests {
 
         // Nothing was written: the backing store still holds the original image,
         // and everything after the partition is still zero.
-        let after = std::mem::replace(&mut ed.rw, Cursor::new(Vec::new())).into_inner();
+        let after = ed
+            .rw
+            .replace(Cursor::new(Vec::new()))
+            .expect("an in-memory editor commits in place and keeps its handle")
+            .into_inner();
         assert_eq!(after, before, "a refused rebuild still touched the disk");
     }
 
@@ -1100,7 +1123,11 @@ mod tests {
         .expect("create");
         ed.sync_metadata().expect("sync must fit");
 
-        let disk = std::mem::replace(&mut ed.rw, Cursor::new(Vec::new())).into_inner();
+        let disk = ed
+            .rw
+            .replace(Cursor::new(Vec::new()))
+            .expect("an in-memory editor commits in place and keeps its handle")
+            .into_inner();
         assert_eq!(
             disk.len() as u64,
             OFFSET + partition_len,
@@ -1231,7 +1258,11 @@ mod tests {
         .expect("create");
         assert_eq!(ed.free_space().unwrap(), u64::MAX, "a bare file has no cap");
         ed.sync_metadata().expect("a bare file simply grows");
-        let bytes = std::mem::replace(&mut ed.rw, Cursor::new(Vec::new())).into_inner();
+        let bytes = ed
+            .rw
+            .replace(Cursor::new(Vec::new()))
+            .expect("an in-memory editor commits in place and keeps its handle")
+            .into_inner();
         assert!(
             bytes.len() > 1 << 20,
             "the added megabyte did not land: {} bytes",
@@ -1398,7 +1429,11 @@ mod tests {
         )
         .expect("create");
         ed.sync_metadata().expect("first sync");
-        let disk = std::mem::replace(&mut ed.rw, Cursor::new(Vec::new())).into_inner();
+        let disk = ed
+            .rw
+            .replace(Cursor::new(Vec::new()))
+            .expect("an in-memory editor commits in place and keeps its handle")
+            .into_inner();
 
         // Reopen: `source_len` is measured at open, so this is the grown
         // image's real footprint — the region the shrink has to clean up.
@@ -1421,7 +1456,11 @@ mod tests {
         ed.delete_entry(&root, &bulk).expect("delete");
         ed.sync_metadata().expect("second sync");
 
-        let disk = std::mem::replace(&mut ed.rw, Cursor::new(Vec::new())).into_inner();
+        let disk = ed
+            .rw
+            .replace(Cursor::new(Vec::new()))
+            .expect("an in-memory editor commits in place and keeps its handle")
+            .into_inner();
         let fs = SquashfsFilesystem::open(Cursor::new(disk.clone()), OFFSET).expect("reopen");
         let used = image_footprint(fs.bytes_used());
         assert!(used < grown_len, "the image did not actually shrink");
@@ -1531,7 +1570,10 @@ mod tests {
         // Incompressible content: the true size lands near the pessimistic end,
         // and the range must contain it.
         ed.sync_metadata().expect("sync");
-        let actual = std::mem::replace(&mut ed.rw, Cursor::new(Vec::new()))
+        let actual = ed
+            .rw
+            .replace(Cursor::new(Vec::new()))
+            .expect("an in-memory editor commits in place and keeps its handle")
             .into_inner()
             .len() as u64;
         assert!(
@@ -1576,7 +1618,11 @@ mod tests {
 
         // Rebuild, reopen through the reader, and check the tree.
         ed.sync_metadata().expect("sync");
-        let bytes = std::mem::replace(&mut ed.rw, Cursor::new(Vec::new())).into_inner();
+        let bytes = ed
+            .rw
+            .replace(Cursor::new(Vec::new()))
+            .expect("an in-memory editor commits in place and keeps its handle")
+            .into_inner();
         let mut fs = SquashfsFilesystem::open(Cursor::new(bytes), 0).expect("reopen");
         let root = fs.root().unwrap();
         let names: Vec<String> = fs
@@ -1628,7 +1674,11 @@ mod tests {
         .expect("create");
         ed.sync_metadata().expect("sync");
 
-        let bytes = std::mem::replace(&mut ed.rw, Cursor::new(Vec::new())).into_inner();
+        let bytes = ed
+            .rw
+            .replace(Cursor::new(Vec::new()))
+            .expect("an in-memory editor commits in place and keeps its handle")
+            .into_inner();
         let mut fs = SquashfsFilesystem::open(Cursor::new(bytes), 0).expect("reopen");
         // Re-read the tree and confirm /bin/ping still has its capability.
         let tree = fs.read_build_tree().expect("read tree");
@@ -1728,7 +1778,11 @@ mod tests {
         assert!(ed.list_xattrs(&ping).unwrap().is_empty());
 
         ed.sync_metadata().expect("sync");
-        let bytes = std::mem::replace(&mut ed.rw, Cursor::new(Vec::new())).into_inner();
+        let bytes = ed
+            .rw
+            .replace(Cursor::new(Vec::new()))
+            .expect("an in-memory editor commits in place and keeps its handle")
+            .into_inner();
         let mut fs = SquashfsFilesystem::open(Cursor::new(bytes), 0).expect("reopen");
         let tree = fs.read_build_tree().expect("read tree");
         let BK::Dir(top) = &tree.kind else { panic!() };
@@ -1784,7 +1838,11 @@ mod tests {
         .expect("create replacement");
         ed.sync_metadata().expect("sync");
 
-        let bytes = std::mem::replace(&mut ed.rw, Cursor::new(Vec::new())).into_inner();
+        let bytes = ed
+            .rw
+            .replace(Cursor::new(Vec::new()))
+            .expect("an in-memory editor commits in place and keeps its handle")
+            .into_inner();
         let mut fs = SquashfsFilesystem::open(Cursor::new(bytes), 0).expect("reopen");
         let tree = fs.read_build_tree().expect("read tree");
         let BK::Dir(top) = &tree.kind else { panic!() };
@@ -1865,7 +1923,11 @@ mod tests {
         )
         .expect("create");
         ed.sync_metadata().expect("sync");
-        let bytes = std::mem::replace(&mut ed.rw, Cursor::new(Vec::new())).into_inner();
+        let bytes = ed
+            .rw
+            .replace(Cursor::new(Vec::new()))
+            .expect("an in-memory editor commits in place and keeps its handle")
+            .into_inner();
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("edited.squashfs");
