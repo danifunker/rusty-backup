@@ -16,14 +16,27 @@ The regression corpus is the large, real-world, non-redistributable set.
 
 ## Locations
 
-| What | Where |
+**The share's address is not in this repository and must not be added.** It
+lives in `regression-tests/local.toml`, which is gitignored; see
+`local.toml.example`. This table used to give a literal `\\HOST\share\...`
+path, which was both wrong and something a public repo should never carry.
+Everything below is relative to whatever `fixture_root` points at.
+
+| What | Where, relative to the share root |
 |------|-------|
-| Corpus | `\\NAS\share\rb-fixtures\fixtures\` |
-| Catalog | `\\NAS\share\rb-fixtures\fixture-map.tsv` |
-| Catalog (machine form) | `\\NAS\share\rb-fixtures\fixture-map.json` |
-| Gap list | `\\NAS\share\rb-fixtures\missing-fixtures.md` |
-| Run reports | `\\NAS\share\rb-fixtures\runs\` |
-| Inventory scans | `\\NAS\share\rb-fixtures\scans\` |
+| Corpus | `fixtures\` |
+| Large-fixture annex | `fixtures-large\` |
+| Catalog | `fixture-map.tsv` |
+| Gap list | `missing-fixtures.md` |
+| Run reports | `runs\` |
+| Inventory scans | `scans\` |
+
+**The catalogue beside the corpus is the authoritative one.** The runner reads
+`fixture-map.tsv` from the share; `regression-tests/fixture-map.tsv` is a
+gitignored local mirror that goes stale — it was four rows behind when this was
+written, which is long enough to edit the wrong copy and wonder why
+`rb-regress fixtures` reports the old count. Append to the share, then copy it
+down.
 
 The runner locates the corpus through, in order: `--fixture-root`, the
 `RB_FIXTURE_ROOT` environment variable, then a gitignored
