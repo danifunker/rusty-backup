@@ -98,9 +98,10 @@ spec; the microdrive on-disk format is described in
 
 ## Provenance
 
-- Pulled 2026-06-04 from `192.168.99.143` (MiSTer ARM build at
-  `/media/fat/games/{X68000,QL}/`) via `scp` using the `~/.ssh/
-  mister_only` key the user provided.
+- Pulled 2026-06-04 from a MiSTer on the maintainer's LAN
+  (`/media/fat/games/{X68000,QL}/`) via `scp`. The board's address is not
+  recorded here — this repository is public; it lives in the gitignored
+  `regression-tests/local.toml`.
 - Files have been part of the public MiSTer-Distribution build for
   > 12 months at pull time; the BLANK_disk_X68000.D88 ships with
   the X68000 core, GamesCart.mdv + crazy.mdv ship with the QL core.

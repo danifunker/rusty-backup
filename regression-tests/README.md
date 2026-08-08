@@ -43,7 +43,7 @@ Three layers, and the direction of flow matters:
 
 | Layer | What | Edited by |
 |-------|------|-----------|
-| 1. Declarative input | `data/formats.toml`, `data/oracles.toml`, `data/hosts.toml`, `fixture-map*.tsv`, `cases/**.toml` | **hand** — reviewable in a diff |
+| 1. Declarative input | `data/formats.toml`, `data/oracles.toml`, `local.toml`, `fixture-map*.tsv`, `cases/**.toml` | **hand** — reviewable in a diff |
 | 2. Normalised snapshot | `data/regression.json`, written by `rb-regress export` | **never** — regenerate |
 | 3. Human views | generated markdown | **never** — outputs |
 

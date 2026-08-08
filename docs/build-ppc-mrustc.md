@@ -386,7 +386,7 @@ for the `LIBS` target - the script does.
 ## Running it
 
 ```sh
-export PPC_HOST=admin@192.168.99.116        # the PowerPC Mac
+export PPC_HOST=user@host                    # the PowerPC Mac; yours, not this
 scripts/build-ppc.sh                        # the host path, end to end
 scripts/build-ppc.sh ppclibs                # PowerPC stdlib
 scripts/build-ppc.sh ppc                    # PowerPC rb-cli
@@ -763,7 +763,7 @@ Two scripts decide whether the PowerPC build agrees with the desktop build. Both
 take the remote binary as `$1`, defaulting to `/Users/admin/rb-cli-dev`:
 
 ```sh
-export PPC_HOST=admin@192.168.99.116
+export PPC_HOST=user@ppcmac.example
 scripts/ppc-smoke.sh                        # inspect / ls / fsck / backup parity
 scripts/ppc-newcode-smoke.sh                # edit / chmeta / put parity
 scripts/ppc-smoke.sh /Users/admin/other     # grade a different binary
@@ -1288,7 +1288,7 @@ translation unit answers in seconds. Every struct in the file with an assertion 
 probed and diffed against what mrustc claimed:
 
 ```sh
-PPC_HOST=admin@192.168.99.116 \
+PPC_HOST=user@ppcmac.example \
   scripts/ppc-layout-probe.py ~/repos/mrustc/output-rb-ppc/liblzfse_rust-0_2_1.rlib.c
 
 struct                          mrustc      gcc         verdict

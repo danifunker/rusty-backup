@@ -15,6 +15,7 @@ mod fixtures;
 mod gitinfo;
 mod inventory;
 mod known;
+mod local;
 mod manifest;
 mod parity;
 mod plan;
@@ -360,7 +361,7 @@ fn main() {
 /// honest skips and are reported rather than enforced — the corpus is expected
 /// to be incomplete for a long time.
 fn cmd_fixtures(args: &Args) -> i32 {
-    let fixture_root = fixtures::discover_root(args.fixture_root.clone(), &regression_dir());
+    let fixture_root = local::discover_root(args.fixture_root.clone(), &regression_dir());
     let catalog = fixtures::Catalog::load(fixture_root.as_deref(), repo_root().as_deref());
     for w in &catalog.warnings {
         eprintln!("warning: {}", w);
@@ -387,7 +388,7 @@ fn cmd_fixtures(args: &Args) -> i32 {
     // loaded above was read before anything had been copied — using it here
     // would inventory the state we started in, not the one a run will see.
     let catalog = fixtures::Catalog::load(
-        fixtures::discover_root(args.fixture_root.clone(), &regression_dir()).as_deref(),
+        local::discover_root(args.fixture_root.clone(), &regression_dir()).as_deref(),
         repo_root().as_deref(),
     );
 
@@ -665,6 +666,7 @@ fn cmd_query(args: &Args, name: &str) -> i32 {
         "counts",
         "fixtures",
         "verbs",
+        "hosts",
     ];
     if name.is_empty() {
         println!("queries: {}", NAMES.join(", "));
@@ -673,6 +675,11 @@ fn cmd_query(args: &Args, name: &str) -> i32 {
     // `verbs` asks the binary and the manifests, not the registry.
     if name == "verbs" {
         return query_verbs(args);
+    }
+    // `hosts` is the machine-readable form scripts/regress-all.sh consumes,
+    // so it goes straight to local.toml rather than through the registry.
+    if name == "hosts" {
+        return query_hosts();
     }
     let reg = match registry::Registry::load(&regression_dir()) {
         Ok(r) => r,
@@ -739,6 +746,43 @@ fn cmd_query(args: &Args, name: &str) -> i32 {
             );
             return 2;
         }
+    }
+    0
+}
+
+/// The ssh-reachable hosts, tab-separated, for `scripts/regress-all.sh`.
+///
+/// The script used to read its own `scripts/hosts.local`, which meant two
+/// gitignored files describing the same machines and drifting apart. Emitting
+/// the table here keeps local.toml the single place an address appears.
+fn query_hosts() -> i32 {
+    let (cfg, from, err) = local::load(&regression_dir());
+    if let Some(e) = err {
+        eprintln!("warning: {}", e);
+    }
+    // Falling back to the example would hand regress-all.sh the placeholder
+    // addresses and send it ssh'ing at hosts that do not exist.
+    if from.extension().is_some_and(|e| e == "example") {
+        eprintln!(
+            "warning: no local.toml (only {}); no hosts to drive",
+            from.display()
+        );
+        return 0;
+    }
+    let mut n = 0;
+    for h in &cfg.hosts {
+        let (Some(ssh), Some(repo)) = (&h.ssh, &h.repo) else {
+            continue;
+        };
+        let shell = h.shell.as_deref().unwrap_or("bash");
+        println!("{}	{}	{}	{}", h.id, ssh, repo, shell);
+        n += 1;
+    }
+    if n == 0 {
+        eprintln!(
+            "warning: no host in {} has both `ssh` and `repo`",
+            from.display()
+        );
     }
     0
 }
@@ -982,7 +1026,7 @@ fn cmd_run(args: &Args) -> i32 {
         eprintln!("warning: {}", e);
     }
 
-    let fixture_root = fixtures::discover_root(args.fixture_root.clone(), &regression_dir());
+    let fixture_root = local::discover_root(args.fixture_root.clone(), &regression_dir());
     let catalog = fixtures::Catalog::load(fixture_root.as_deref(), repo_root().as_deref());
     for w in &catalog.warnings {
         eprintln!("warning: {}", w);

@@ -184,29 +184,6 @@ fn untested() -> String {
     "untested".to_string()
 }
 
-#[derive(Deserialize)]
-struct HostsFile {
-    #[serde(default, rename = "host")]
-    hosts: Vec<HostDef>,
-}
-
-#[derive(Deserialize)]
-struct HostDef {
-    id: String,
-    platform: String,
-    transport: String,
-    #[serde(default = "yes")]
-    can_produce: bool,
-    #[serde(default = "yes")]
-    can_verify: bool,
-    #[serde(default)]
-    notes: Option<String>,
-}
-
-fn yes() -> bool {
-    true
-}
-
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Default, Serialize)]
@@ -291,24 +268,22 @@ impl Registry {
         }
 
         // --- hosts ---------------------------------------------------------
-        let p = data.join("hosts.toml");
-        let p = if p.is_file() { p } else { data.join("hosts.toml.example") };
-        if let Ok(text) = fs::read_to_string(&p) {
-            match toml::from_str::<HostsFile>(&text) {
-                Ok(hf) => {
-                    for h in hf.hosts {
-                        r.hosts.push(Host {
-                            id: h.id,
-                            platform: h.platform,
-                            transport: h.transport,
-                            can_produce: h.can_produce,
-                            can_verify: h.can_verify,
-                            notes: h.notes,
-                        });
-                    }
-                }
-                Err(e) => r.warnings.push(format!("{}: {}", p.display(), e)),
-            }
+        // From local.toml, the one gitignored file that names this network.
+        // It used to be data/hosts.toml; see runner/src/local.rs.
+        let (cfg, from, err) = crate::local::load(regression_dir);
+        if let Some(e) = err {
+            r.warnings.push(e);
+        }
+        let _ = from;
+        for h in cfg.hosts {
+            r.hosts.push(Host {
+                id: h.id,
+                platform: h.platform,
+                transport: h.transport,
+                can_produce: h.can_produce,
+                can_verify: h.can_verify,
+                notes: h.notes,
+            });
         }
 
         // --- fixtures ------------------------------------------------------

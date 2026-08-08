@@ -4,7 +4,7 @@
 #   ./scripts/regress-all.sh [--skip-remote] [--no-pull]
 #
 # Runs on the orchestrating host (Windows via Git Bash, or any Unix). For every
-# host in hosts.local (see below) it pulls, builds, and runs `run` + `produce`;
+# host in local.toml (see below) it pulls, builds, and runs `run` + `produce`;
 # then it collects every artifact tree here, compares them with `parity`, runs
 # `verify` locally, and consolidates.
 #
@@ -12,11 +12,10 @@
 # failures are on the bug list and everything else passed. Non-zero means
 # something changed. See §Exit codes below.
 #
-# Host list lives in scripts/hosts.local (gitignored — it names real machines):
-#
-#     # id      ssh-target              repo path                     shell
-#     linuxbox  dani@192.168.99.153     repos/rusty-backup            bash
-#     mac       dani@192.168.99.121     repos/rusty-backup            zsh -lc
+# The host list comes from `rb-regress query hosts`, which reads the gitignored
+# regression-tests/local.toml — the one file that names real machines. It emits
+# tab-separated `id  ssh-target  repo-path  shell` for every host that has both
+# an `ssh` and a `repo`. See local.toml.example.
 #
 # The shell column matters: a non-interactive ssh session on macOS gets
 # /usr/bin:/bin only, so Homebrew's cargo is invisible without a login shell.
@@ -26,7 +25,6 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REGRESS="$(cd "$HERE/.." && pwd)"
 REPO="$(cd "$REGRESS/.." && pwd)"
-HOSTS_FILE="$HERE/hosts.local"
 
 SKIP_REMOTE=0
 PULL=1
@@ -84,9 +82,9 @@ step "local: fixture inventory"
 # rb-cli. It IS recorded, so a silently-absent host cannot be mistaken for a
 # host that passed.
 UNREACHABLE=""
-if [ "$SKIP_REMOTE" -eq 0 ] && [ -f "$HOSTS_FILE" ]; then
-    while read -r id target path shell_cmd; do
-        case "$id" in ''|'#'*) continue ;; esac
+if [ "$SKIP_REMOTE" -eq 0 ]; then
+    while IFS="$(printf '	')" read -r id target path shell_cmd; do
+        [ -n "$id" ] || continue
         step "$id: pull, build, run, produce"
 
         if ! $SSH "$target" true 2>/dev/null; then
@@ -135,9 +133,12 @@ if [ "$SKIP_REMOTE" -eq 0 ] && [ -f "$HOSTS_FILE" ]; then
             fi
             rm -rf "$REGRESS/artifacts/$os.incoming"
         done
-    done < "$HOSTS_FILE"
-elif [ "$SKIP_REMOTE" -eq 0 ]; then
-    warn "no $HOSTS_FILE - running locally only"
+    done <<EOF
+$("$RB" query hosts 2>/dev/null)
+EOF
+    if [ -z "$("$RB" query hosts 2>/dev/null)" ]; then
+        warn "no ssh-reachable host in local.toml - running locally only"
+    fi
 fi
 
 # --- local run ---------------------------------------------------------------

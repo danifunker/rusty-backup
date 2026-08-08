@@ -4,7 +4,7 @@
 //!
 //!   - what rb-cli reads and writes      (`data/formats.toml`)
 //!   - what verifies it, and where       (`data/oracles.toml`)
-//!   - which machines are available      (`data/hosts.toml`)
+//!   - which machines are available      (`local.toml`, gitignored)
 //!
 //! it computes a staged job graph: who produces each artifact, who verifies
 //! it, and which artifacts have to cross a machine boundary to get there.
@@ -99,7 +99,7 @@ fn availability_rank(s: &str) -> i32 {
 pub fn build_plan(regression_dir: &Path) -> Result<Plan, String> {
     let reg = Registry::load(regression_dir)?;
     if reg.hosts.is_empty() {
-        return Err("no hosts configured; copy data/hosts.toml.example".into());
+        return Err("no hosts configured; copy local.toml.example to local.toml".into());
     }
 
     let hosts: Vec<String> = reg.hosts.iter().map(|h| h.id.clone()).collect();

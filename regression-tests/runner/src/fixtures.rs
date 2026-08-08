@@ -302,27 +302,3 @@ fn sanitise(id: &str) -> String {
         .collect()
 }
 
-/// Work out the fixture root from, in order: an explicit flag, the
-/// environment, then a gitignored `local.toml` beside the cases directory.
-/// Never hardcodes a path — see FIXTURES.md.
-pub fn discover_root(explicit: Option<PathBuf>, repo_regression_dir: &Path) -> Option<PathBuf> {
-    if let Some(p) = explicit {
-        return Some(p);
-    }
-    if let Some(env) = std::env::var_os("RB_FIXTURE_ROOT") {
-        return Some(PathBuf::from(env));
-    }
-    let local = repo_regression_dir.join("local.toml");
-    let text = fs::read_to_string(local).ok()?;
-    for line in text.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("fixture_root") {
-            let rest = rest.trim_start().strip_prefix('=')?.trim();
-            let unquoted = rest.trim_matches('"').trim_matches('\'');
-            if !unquoted.is_empty() {
-                return Some(PathBuf::from(unquoted));
-            }
-        }
-    }
-    None
-}

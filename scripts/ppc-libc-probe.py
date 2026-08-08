@@ -27,7 +27,7 @@ drift (`$INODE64`, `$UNIX2003`, birthtime-era `struct stat`).
 
 Usage:
     scripts/ppc-libc-probe.py --libc ~/repos/mrustc/rustc-1.74.0-src/vendor/libc \\
-        --host admin@192.168.99.116 \\
+        --host user@ppc-host \\
         --sdk /Developer/SDKs/MacOSX10.4u.sdk --arch ppc \\
         --out probe-ppc-10.4.tsv
 """

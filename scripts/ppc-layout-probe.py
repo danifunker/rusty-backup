@@ -24,7 +24,7 @@ pre-tagged and are trivial to parse. `-fsyntax-only` means no codegen, so a
 5 MB translation unit answers in seconds.
 
 Usage:
-    PPC_HOST=admin@192.168.99.116 scripts/ppc-layout-probe.py <file.c> [name...]
+    PPC_HOST=user@ppc-host scripts/ppc-layout-probe.py <file.c> [name...]
 
 With no names, every struct carrying a sizeof/alignof assertion in the file is
 probed and the result is diffed against what mrustc asserted - which is the
@@ -224,7 +224,7 @@ def main():
     args = ap.parse_args()
 
     if not HOST:
-        die("PPC_HOST is not set (e.g. PPC_HOST=admin@192.168.99.116)")
+        die("PPC_HOST is not set (e.g. PPC_HOST=user@ppc-host)")
 
     if args.synthetic:
         body = SYNTHETIC

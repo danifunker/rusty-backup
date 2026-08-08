@@ -108,8 +108,11 @@ Its WSL Ubuntu covers the lighter Linux oracles without a VM.
 
 The runner needs to send an artifact to whichever host can judge it. Design:
 
-`regression-tests/oracle-hosts.toml` — **gitignored**, template committed as
-`oracle-hosts.toml.example`. Addresses, users and key paths never enter git.
+**Superseded 2026-08-08:** do not add a fourth private file. The host table
+lives in `regression-tests/local.toml`, which is gitignored and is the one
+place an address, user or key path may appear — see `local.toml.example`.
+Oracle routing extends the `[[host]]` entries already there. The sketch below
+is kept for the shape of the fields, not the filename.
 
 ```toml
 [[host]]
@@ -247,7 +250,7 @@ is scriptable before planning around it.
 2. `apt install cpmtools xorriso` in WSL — closes the nine-DPB CP/M axis and
    ISO checking for one command.
 3. Wire `ghostexp.exe` (already present, Ghost 11.5) as the GHO oracle.
-4. Add oracle routing + `oracle-hosts.toml` to the runner.
+4. Add oracle routing to the runner, on the `[[host]]` table in `local.toml`.
 5. Stand up one Linux host with `linux-modules-extra` — biggest single
    coverage jump.
 6. Build the `86box-os2-hpfs` profile.

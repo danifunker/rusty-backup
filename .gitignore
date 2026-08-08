@@ -64,14 +64,14 @@ rb-cli-*/vendor/
 __pycache__/
 # Packaged PowerPC bundle from `scripts/build-ppc.sh dist`
 dist/
-# local.toml carries this host's fixture root; local-devices.toml is the
-# allowlist of physical devices the hardware tier is permitted to write to,
-# and committing one would be actively dangerous on someone else's machine.
-# Names real machines; hosts.toml.example is the committed template.
-/regression-tests/data/hosts.toml
-# Names real machines; hosts.local.example is the committed template.
-/regression-tests/scripts/hosts.local
+# local.toml is THE private file: this repository is public, and it is the only
+# place a real corpus path, hostname, address or user may appear. It carries
+# the fixture root and the whole host inventory (it replaced data/hosts.toml
+# and scripts/hosts.local, which were two more chances to leak the same
+# things). local.toml.example is the committed template.
 /regression-tests/local.toml
+# The allowlist of physical devices the hardware tier may write to. Committing
+# one would be actively dangerous on someone else's machine.
 /regression-tests/local-devices.toml
 # The NAS catalogue maps IDs to real corpus paths and stays on the NAS.
 # fixture-map.repo.tsv is deliberately NOT ignored: it only references
