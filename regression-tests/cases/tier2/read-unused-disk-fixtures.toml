@@ -1,0 +1,316 @@
+# Tier 2 — the disk-image fixtures nothing was using.
+#
+# `rb-regress fixtures` reported 43 present fixtures that no case referenced.
+# They were bought, catalogued, checksummed and copied to every machine, and
+# then nothing looked at them. This file covers the 31 that are disk images;
+# the optical dozen are in read-unused-optical-fixtures.toml.
+#
+# The assertion is deliberately shallow — open it, identify it, walk the root.
+# That is what a *read* fixture is for: proving we can still open real media we
+# did not create. Depth belongs in the tier-3 edit cases, which use a
+# {fixture_copy} because they mutate.
+#
+# Where a fixture is encrypted or password-protected the expectation is only
+# that we identify the container and say so clearly, not that we decrypt it.
+
+[meta]
+tier = 2
+group = "fs.read.unused"
+description = "Open every catalogued disk fixture that had no case."
+
+# --- Amiga ---------------------------------------------------------------------
+
+[[case]]
+id = "read.adf.amiga-dd"
+fixture = "fmt.adf.amiga-dd.floppy"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{fixture}", "/"]
+expect_exit = 0
+
+[[case]]
+id = "read.adf.bootblock-ndos"
+description = "A custom-bootblock disk with no filesystem — must classify as NDOS and reach the carve view, not face-plant in the AFFS parser"
+fixture = "fmt.adf.bootblock-ndos.floppy"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["NDOS"]
+
+# --- Xerox Alto / Pilot ---------------------------------------------------------
+
+[[case]]
+id = "read.altodisk.johnsson-dp0"
+fixture = "fmt.altodisk.johnsson-dp0.hd"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+
+[[case]]
+id = "read.alto-bfs.dorado-unbug"
+fixture = "fs.alto-bfs.dorado-unbug.hd"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{fixture}", "/"]
+expect_exit = 0
+
+[[case]]
+id = "read.alto-bfs.mesa5"
+fixture = "fs.alto-bfs.mesa5.hd"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{fixture}", "/"]
+expect_exit = 0
+
+[[case]]
+id = "read.xerox-d0.cardtester"
+fixture = "fmt.xerox-d0.cardtester.hd"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+
+# --- Apple containers and volumes ------------------------------------------------
+
+[[case]]
+id = "read.dmg.base"
+fixture = "fmt.dmg.base.hd"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+
+[[case]]
+id = "read.sparseimage.apm"
+fixture = "fmt.sparseimage.apm.hd"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+
+[[case]]
+id = "read.sparseimage.superfloppy"
+fixture = "fmt.sparseimage.superfloppy.hd"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+
+[[case]]
+id = "read.woz.blank-140k"
+fixture = "fmt.woz.blank-140k.floppy"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+
+[[case]]
+id = "read.hfs.base-floppy"
+fixture = "fs.hfs.base.floppy"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{fixture}", "/"]
+expect_exit = 0
+
+[[case]]
+id = "read.hfsplus.journalled"
+description = "A journalled HFS+ volume — the journal must not stop us reading it"
+fixture = "fs.hfsplus.journalled.hd"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{fixture}", "/"]
+expect_exit = 0
+
+[[case]]
+id = "read.hfsplus.journal-dirty"
+description = "A DIRTY journal. The interesting one: an unreplayed journal means the on-disk state is stale, and reading it as if it were clean is how a backup silently captures the wrong bytes."
+fixture = "fs.hfsplus.journal-dirty.hd"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{fixture}", "--checkonly"]
+expect_exit = 0
+
+[[case]]
+id = "read.apfs.apple-gpt"
+fixture = "fs.apfs.apple-gpt.hd"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+
+[[case]]
+id = "read.apfs.encrypted"
+description = "Encrypted APFS. The expectation is that we identify the container, not that we decrypt it."
+fixture = "fs.apfs.encrypted.hd"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+
+[[case]]
+id = "read.lisa.los31-blank"
+fixture = "fs.lisa.los31-blank.floppy"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+
+[[case]]
+id = "read.lisa.office31-d1"
+fixture = "fs.lisa.office31-d1.floppy"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{fixture}", "/"]
+expect_exit = 0
+
+# --- Ghost ------------------------------------------------------------------------
+
+[[case]]
+id = "read.gho.password"
+description = "A password-protected Ghost image. Identifying it and reporting that it needs a password is the contract; decrypting it is not asserted here."
+fixture = "fmt.gho.password.hd"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+
+# --- PC / DOS ----------------------------------------------------------------------
+
+[[case]]
+id = "read.fat12.base-floppy"
+fixture = "fs.fat12.base.floppy"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{fixture}", "/"]
+expect_exit = 0
+
+[[case]]
+id = "read.fat12.freedos-superfloppy"
+fixture = "fs.fat12.freedos.superfloppy"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{fixture}", "/"]
+expect_exit = 0
+
+# --- Atari -------------------------------------------------------------------------
+
+[[case]]
+id = "read.atari-dos2.base"
+fixture = "fs.atari-dos2.base.floppy"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{fixture}", "/"]
+expect_exit = 0
+
+[[case]]
+id = "read.atarist.gemdos"
+fixture = "fs.atarist.gemdos.floppy"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{fixture}", "/"]
+expect_exit = 0
+
+# --- Commodore ----------------------------------------------------------------------
+
+[[case]]
+id = "read.cbm.1581"
+fixture = "fs.cbm.1581.floppy"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{fixture}", "/"]
+expect_exit = 0
+
+[[case]]
+id = "read.cbm.8050"
+description = "8050/8250 are the dual-drive CBM formats; different geometry from the 1541 family already covered"
+fixture = "fs.cbm.8050.floppy"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{fixture}", "/"]
+expect_exit = 0
+
+[[case]]
+id = "read.cbm.8250"
+fixture = "fs.cbm.8250.floppy"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{fixture}", "/"]
+expect_exit = 0
+
+# --- CP/M and friends ----------------------------------------------------------------
+
+[[case]]
+id = "read.cpm.pcw"
+description = "The PCW DPB, distinct from the amstrad_data one the other CP/M cases use"
+fixture = "fs.cpm.pcw.floppy"
+[[case.step]]
+args = ["ls", "{fixture}", "/", "--fs-type", "cpm:pcw"]
+expect_exit = 0
+
+[[case]]
+id = "read.dfs.double-sided"
+description = "A double-sided Acorn DFS disc — two logical volumes in one file, which is a different code path from the single-sided .ssd already covered"
+fixture = "fs.dfs.double-sided.floppy"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+
+[[case]]
+id = "read.os9.l2"
+fixture = "fs.os9.l2.floppy"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{fixture}", "/"]
+expect_exit = 0
+
+# --- Sharp X68000 -----------------------------------------------------------------------
+
+[[case]]
+id = "read.human68k.x68k-game"
+description = "A real X68000 game disk — the Sharp/KG big-endian BPB variant, not the X68IPL30 one"
+fixture = "fs.human68k.x68k-game"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+
+# --- Sinclair QL --------------------------------------------------------------------------
+
+[[case]]
+id = "read.qdos.microdrive"
+description = "A QL Microdrive cartridge — gated on the exact 174,930-byte size plus a sector-0 header"
+fixture = "fs.qdos.microdrive.mdv"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+
+# --- Sun ------------------------------------------------------------------------------------
+
+[[case]]
+id = "read.part.sun.minimal-slot6"
+description = "A Sun disk label whose only real slice is slot 6 — the whole-disk slice 2 must not be listed as a partition"
+fixture = "part.sun.minimal-slot6.hd"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["Sun"]

@@ -114,3 +114,11 @@ finding = "R-025"
 [[known]]
 id = "subcmd.show.partmap"
 finding = "R-026"
+
+# --- R-012 again: the pure-CD-DA fixture -------------------------------------
+# Same defect as optical.cdda.no-data-track-opens, different fixture (a CHD
+# rather than a cue/bin). Listed so the corpus sweep does not read as a new
+# regression.
+[[known]]
+id = "read.optical.chdcd.audio-test"
+finding = "R-012"

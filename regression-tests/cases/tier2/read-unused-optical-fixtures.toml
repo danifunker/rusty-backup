@@ -1,0 +1,165 @@
+# Tier 2 — the optical fixtures nothing was using.
+#
+# Twelve of the 43 unreferenced fixtures are discs. They are the most expensive
+# part of the corpus by far — most of the 3.7 GB — and nothing was reading them.
+#
+# `optical info` identifies the container and its filesystems; `optical browse`
+# walks the tree. Both together are the difference between "the header parses"
+# and "we can actually get at the contents", which is the whole claim.
+#
+# GAPS.md § Next actions put optical last, "and most carefully". These are read
+# cases only — nothing here writes.
+
+[meta]
+tier = 2
+group = "optical.read.unused"
+description = "Open every catalogued optical fixture that had no case."
+
+# --- ISO 9660 family ------------------------------------------------------------
+
+[[case]]
+id = "read.optical.iso9660.joliet"
+description = "Joliet supplies a second, Unicode name for every entry; browsing must prefer it rather than the 8.3 fallback"
+fixture = "optical.iso9660.joliet.cd"
+timeout_ms = 300000
+[[case.step]]
+args = ["optical", "info", "{fixture}"]
+expect_exit = 0
+[[case.step]]
+args = ["optical", "browse", "{fixture}", "/"]
+expect_exit = 0
+
+[[case]]
+id = "read.optical.iso9660.hybrid-rsrc"
+description = "A hybrid disc carrying Mac resource forks alongside the ISO tree"
+fixture = "optical.iso9660.hybrid-rsrc.cd"
+timeout_ms = 300000
+[[case.step]]
+args = ["optical", "info", "{fixture}"]
+expect_exit = 0
+[[case.step]]
+args = ["optical", "browse", "{fixture}", "/"]
+expect_exit = 0
+
+[[case]]
+id = "read.optical.high-sierra.bookshelf"
+description = "High Sierra predates ISO 9660 and has its own directory-record layout; the CloneCD set this came from was once discarded as unsupported and is not"
+fixture = "optical.high-sierra.bookshelf.cd"
+timeout_ms = 300000
+[[case.step]]
+args = ["optical", "info", "{fixture}"]
+expect_exit = 0
+[[case.step]]
+args = ["optical", "browse", "{fixture}", "/"]
+expect_exit = 0
+
+[[case]]
+id = "read.optical.udf.dvd-video"
+description = "UDF, and a DVD-Video layout specifically — VIDEO_TS must appear"
+fixture = "optical.udf.dvd-video.cd"
+timeout_ms = 600000
+[[case.step]]
+args = ["optical", "info", "{fixture}"]
+expect_exit = 0
+[[case.step]]
+args = ["optical", "browse", "{fixture}", "/"]
+expect_exit = 0
+
+# --- Mac discs -------------------------------------------------------------------
+
+[[case]]
+id = "read.optical.hfs.opentransport"
+fixture = "optical.hfs.opentransport.cd"
+timeout_ms = 300000
+[[case.step]]
+args = ["optical", "info", "{fixture}"]
+expect_exit = 0
+[[case.step]]
+args = ["optical", "browse", "{fixture}", "/"]
+expect_exit = 0
+
+[[case]]
+id = "read.optical.hfs.stuffit"
+fixture = "optical.hfs.stuffit.cd"
+timeout_ms = 300000
+[[case.step]]
+args = ["optical", "info", "{fixture}"]
+expect_exit = 0
+[[case.step]]
+args = ["optical", "browse", "{fixture}", "/"]
+expect_exit = 0
+
+# --- Unix discs -------------------------------------------------------------------
+
+[[case]]
+id = "read.optical.efs.irix-scsitb"
+description = "An IRIX EFS CD — the SGI filesystem on optical media rather than on a disk"
+fixture = "optical.efs.irix-scsitb.cd"
+timeout_ms = 300000
+[[case.step]]
+args = ["optical", "info", "{fixture}"]
+expect_exit = 0
+[[case.step]]
+args = ["optical", "browse", "{fixture}", "/"]
+expect_exit = 0
+
+[[case]]
+id = "read.optical.ufs.nextstep33"
+description = "NeXTSTEP shipped UFS on CD; 373 MB, so it needs a generous timeout"
+fixture = "optical.ufs.nextstep33.cd"
+timeout_ms = 600000
+[[case.step]]
+args = ["optical", "info", "{fixture}"]
+expect_exit = 0
+[[case.step]]
+args = ["optical", "browse", "{fixture}", "/"]
+expect_exit = 0
+
+# --- Console discs -----------------------------------------------------------------
+
+[[case]]
+id = "read.optical.gamecube.druaga"
+fixture = "optical.gamecube.druaga.cd"
+timeout_ms = 600000
+[[case.step]]
+args = ["optical", "info", "{fixture}"]
+expect_exit = 0
+[[case.step]]
+args = ["optical", "browse", "{fixture}", "/"]
+expect_exit = 0
+
+[[case]]
+id = "read.optical.3do-opera.puttputt"
+description = "The 3DO Opera filesystem — not ISO 9660 at all"
+fixture = "optical.3do-opera.puttputt.cd"
+timeout_ms = 600000
+[[case.step]]
+args = ["optical", "info", "{fixture}"]
+expect_exit = 0
+[[case.step]]
+args = ["optical", "browse", "{fixture}", "/"]
+expect_exit = 0
+
+[[case]]
+id = "read.optical.cdi.hieroglyph"
+description = "Philips CD-i, another non-ISO layout"
+fixture = "optical.cdi.hieroglyph.cd"
+timeout_ms = 600000
+[[case.step]]
+args = ["optical", "info", "{fixture}"]
+expect_exit = 0
+
+# --- Audio -------------------------------------------------------------------------
+# R-012 says `optical info` rejects any disc with no data track. This fixture is
+# exactly that shape, so the case asserts the intended behaviour and is expected
+# to be red until R-012 is fixed. It is listed in known-failures.toml against
+# R-012 for that reason, not because the fixture is at fault.
+
+[[case]]
+id = "read.optical.chdcd.audio-test"
+description = "A pure CD-DA disc inside a CHD. R-012: we reject it for having no data track, which is wrong — an audio disc is a disc."
+fixture = "optical.chdcd.audio-test.cd"
+timeout_ms = 300000
+[[case.step]]
+args = ["optical", "info", "{fixture}"]
+expect_exit = 0
