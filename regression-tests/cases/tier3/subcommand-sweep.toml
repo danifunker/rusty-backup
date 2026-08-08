@@ -153,12 +153,21 @@ expect_exit = 0
 
 [[case]]
 id = "floppy.info.reads-a-container"
+description = "A 1232 KB FAT floppy is an X68000 XDF — a flat sector dump at that geometry. A 1440K one is raw and `floppy info` rightly refuses it."
+[[case.step]]
+args = ["new", "floppy", "fat", "--size", "1232K", "{scratch}/f.xdf"]
+expect_exit = 0
+[[case.step]]
+args = ["floppy", "info", "{scratch}/f.xdf"]
+expect_exit = 0
+stdout_contains = ["XDF"]
 [[case.step]]
 args = ["new", "floppy", "fat", "--size", "1440K", "{scratch}/f.img"]
 expect_exit = 0
 [[case.step]]
 args = ["floppy", "info", "{scratch}/f.img"]
-expect_exit = 0
+expect_exit = 1
+stderr_contains = ["not a recognised floppy container"]
 
 # --- cbk: incremental backup --------------------------------------------------
 # The only backup format with its own verb, and it had no coverage at all.
@@ -174,11 +183,19 @@ expect_exit = 0
 args = ["put", "{scratch}/src.img", "{cases}/tier3/payload.bin", "/payload.bin"]
 expect_exit = 0
 [[case.step]]
-args = ["cbk", "pack", "{scratch}/src.img", "{scratch}/out.cbk"]
+# `cbk pack` takes the backup FOLDER (the directory holding metadata.json),
+# not a disk image, so the round-trip is backup -> pack -> unpack -> restore.
+args = ["backup", "{scratch}/src.img", "{scratch}/bk", "--name", "job", "--format", "raw", "--sector-by-sector"]
+expect_exit = 0
+[[case.step]]
+args = ["cbk", "pack", "{scratch}/bk/job", "{scratch}/out.cbk"]
 expect_exit = 0
 files_exist = ["{scratch}/out.cbk"]
 [[case.step]]
-args = ["cbk", "unpack", "{scratch}/out.cbk", "{scratch}/back.img"]
+args = ["cbk", "unpack", "{scratch}/out.cbk", "{scratch}/back"]
+expect_exit = 0
+[[case.step]]
+args = ["restore", "{scratch}/back", "{scratch}/back.img"]
 expect_exit = 0
 files_identical = [["{scratch}/src.img", "{scratch}/back.img"]]
 
@@ -194,16 +211,21 @@ expect_exit = 0
 args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/payload.bin"]
 expect_exit = 0
 [[case.step]]
-args = ["archive", "create", "{scratch}/v.img", "{scratch}/a.zip"]
+# `archive create <OUTPUT> <INPUTS>...` packs HOST files, not a disk image, and
+# writes .sit / .hqx / .mar — there is no .zip output.
+args = ["archive", "create", "{scratch}/a.sit", "{cases}/tier3/payload.bin"]
 expect_exit = 0
-files_exist = ["{scratch}/a.zip"]
+files_exist = ["{scratch}/a.sit"]
 [[case.step]]
-args = ["archive", "list", "{scratch}/a.zip"]
+args = ["archive", "list", "{scratch}/a.sit"]
 expect_exit = 0
 stdout_contains = ["payload.bin"]
 [[case.step]]
-args = ["archive", "extract", "{scratch}/a.zip", "{scratch}/ex"]
+# `extract` defaults to --format binhex, one .hqx per file. `raw` is the data
+# fork on its own, which is the only shape a byte comparison can use.
+args = ["archive", "extract", "{scratch}/a.sit", "{scratch}/ex", "--format", "raw"]
 expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/ex/payload.bin"]]
 
 # --- POSIX metadata -----------------------------------------------------------
 # ext/UFS/XFS carry mode and ownership. Setting them and reading them back is
@@ -221,9 +243,9 @@ expect_exit = 0
 args = ["chmod", "{scratch}/v.img", "/payload.bin", "0640"]
 expect_exit = 0
 [[case.step]]
-args = ["ls", "{scratch}/v.img", "/", "--long"]
+args = ["ls", "{scratch}/v.img", "/", "-o"]
 expect_exit = 0
-stdout_contains = ["640"]
+stdout_contains = ["-rw-r-----"]
 [[case.step]]
 args = ["fsck", "{scratch}/v.img", "--checkonly"]
 expect_exit = 0
@@ -245,11 +267,9 @@ expect_exit = 0
 
 [[case]]
 id = "meta.xattr.set-list-rm"
+description = "SquashFS is the only driver that stores xattrs today (CLAUDE.md); ext4 answers 'does not store extended attributes', so the ext volume this used to build never tested anything."
 [[case.step]]
-args = ["new", "volume", "ext4", "--size", "8M", "{scratch}/v.img"]
-expect_exit = 0
-[[case.step]]
-args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/payload.bin"]
+args = ["squashfs", "create", "{cases}/tier3/isosrc", "{scratch}/v.img"]
 expect_exit = 0
 [[case.step]]
 args = ["xattr", "set", "{scratch}/v.img", "/payload.bin", "user.test", "hello"]
@@ -277,20 +297,49 @@ expect_exit = 0
 args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/payload.bin"]
 expect_exit = 0
 [[case.step]]
+# Plain `ls` on HFS prints type and creator in their own column — that is the
+# read-back, and asserting it rather than chmeta's own report is what makes the
+# case about the volume instead of about the writer. (`ls -o` is the POSIX-mode
+# view and shows nothing here; HFS carries no mode.)
 args = ["chmeta", "{scratch}/v.img", "/payload.bin", "--type", "TEXT", "--creator", "ttxt"]
 expect_exit = 0
 [[case.step]]
-args = ["ls", "{scratch}/v.img", "/", "--long"]
+args = ["ls", "{scratch}/v.img", "/"]
 expect_exit = 0
-stdout_contains = ["TEXT"]
+stdout_contains = ["TEXT ttxt"]
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
 
 [[case]]
 id = "mac.macbinary.put"
+description = """A real MacBinary III comes from `archive extract --format
+macbinary`, so this needs no fixture. The rejection of a plain file is pinned in
+the same case: the old version fed payload.bin straight to put-macbinary, which
+is not a put at all."""
 [[case.step]]
 args = ["new", "volume", "hfs", "--size", "4M", "{scratch}/v.img"]
 expect_exit = 0
 [[case.step]]
+args = ["archive", "create", "{scratch}/a.sit", "{cases}/tier3/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["archive", "extract", "{scratch}/a.sit", "{scratch}/mb", "--format", "macbinary"]
+expect_exit = 0
+files_exist = ["{scratch}/mb/payload.bin.bin"]
+[[case.step]]
+args = ["put-macbinary", "{scratch}/v.img", "{scratch}/mb/payload.bin.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{scratch}/v.img", "/"]
+expect_exit = 0
+stdout_contains = ["payload.bin"]
+[[case.step]]
 args = ["put-macbinary", "{scratch}/v.img", "{cases}/tier3/payload.bin"]
+expect_exit = 1
+stderr_contains = ["MacBinary"]
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
 expect_exit = 0
 
 [[case]]
@@ -381,12 +430,14 @@ description = "reformat must leave a volume of the requested type that fscks cle
 args = ["new", "volume", "fat", "--size", "8M", "{scratch}/v.img"]
 expect_exit = 0
 [[case.step]]
-args = ["reformat", "{scratch}/v.img", "--fs", "minix3"]
+# `reformat` is HFS-only today, so --fs minix3 was asking for a capability the
+# verb never claimed. Its own error says so; the second step pins that too.
+args = ["reformat", "{scratch}/v.img", "--fs", "hfs"]
 expect_exit = 0
 [[case.step]]
 args = ["inspect", "{scratch}/v.img"]
 expect_exit = 0
-stdout_contains = ["minix"]
+stdout_contains = ["HFS"]
 [[case.step]]
 args = ["fsck", "{scratch}/v.img", "--checkonly"]
 expect_exit = 0
@@ -394,13 +445,22 @@ expect_exit = 0
 # --- bootability -------------------------------------------------------------------
 
 [[case]]
-id = "boot.make-bootable.fat"
+id = "boot.make-bootable.reports-what-is-missing"
+description = """make-bootable takes flat classic-HFS images and APM disks, so the FAT
+volume this used to build was never in scope. The contract worth pinning is the
+diagnostic one: on a blank HFS volume it must name the missing piece and exit
+non-zero rather than claiming success. A positive case needs a donor volume with
+a blessed System Folder — a fixture we do not have."""
 [[case.step]]
-args = ["new", "volume", "fat", "--size", "8M", "{scratch}/v.img"]
+args = ["new", "volume", "hfs", "--size", "8M", "{scratch}/v.img"]
 expect_exit = 0
 [[case.step]]
 args = ["make-bootable", "{scratch}/v.img"]
-expect_exit = 0
+expect_exit = 1
+stdout_contains = ["System Folder"]
+[[case.step]]
+args = ["make-bootable", "{scratch}/f.img"]
+expect_exit = 1
 [[case.step]]
 args = ["fsck", "{scratch}/v.img", "--checkonly"]
 expect_exit = 0
@@ -418,39 +478,45 @@ expect_exit = 0
 # Nine subcommands; only `info` was previously touched. `drives` and `rip` need
 # real hardware, so they stay out.
 
+# `optical new` is grouped by disc type — sgi-efs / mac-hfs / mac-hfsplus. There
+# is no bare `optical new <dir> <out>`, which is what these three used to call,
+# so each was a usage error rather than a test. `--from-dir` fills the disc in
+# the same step. The source is `isosrc/`, a one-file directory: pointing
+# `--size auto` at the whole cases/tier3 tree overflows the HFS B-tree.
 [[case]]
 id = "optical.new.iso"
-description = "Build an ISO from a host directory, then read it back"
+description = "Build a Mac CD from a host directory, then read it back"
 [[case.step]]
-args = ["optical", "new", "{cases}/tier3", "{scratch}/out.iso"]
+args = ["optical", "new", "mac-hfs", "--from-dir", "{cases}/tier3/isosrc", "--size", "auto", "{scratch}/out.iso"]
 expect_exit = 0
 files_exist = ["{scratch}/out.iso"]
 [[case.step]]
 args = ["optical", "info", "{scratch}/out.iso"]
 expect_exit = 0
 [[case.step]]
-args = ["optical", "browse", "{scratch}/out.iso", "/"]
+args = ["optical", "browse", "{scratch}/out.iso"]
 expect_exit = 0
 stdout_contains = ["payload.bin"]
 
 [[case]]
 id = "optical.extract-roundtrip"
 [[case.step]]
-args = ["optical", "new", "{cases}/tier3", "{scratch}/out.iso"]
+args = ["optical", "new", "mac-hfs", "--from-dir", "{cases}/tier3/isosrc", "--size", "auto", "{scratch}/out.iso"]
 expect_exit = 0
 [[case.step]]
-args = ["optical", "extract", "{scratch}/out.iso", "/payload.bin", "{scratch}/out.bin"]
+args = ["optical", "extract", "{scratch}/out.iso", "--to", "{scratch}/ex"]
 expect_exit = 0
-files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+files_identical = [["{cases}/tier3/isosrc/payload.bin", "{scratch}/ex/payload.bin"]]
 
 [[case]]
 id = "optical.du"
 [[case.step]]
-args = ["optical", "new", "{cases}/tier3", "{scratch}/out.iso"]
+args = ["optical", "new", "mac-hfs", "--from-dir", "{cases}/tier3/isosrc", "--size", "auto", "{scratch}/out.iso"]
 expect_exit = 0
 [[case.step]]
 args = ["optical", "du", "{scratch}/out.iso"]
 expect_exit = 0
+stdout_contains = ["104"]
 
 # --- batch ------------------------------------------------------------------------
 
@@ -468,12 +534,15 @@ expect_exit = 0
 
 [[case]]
 id = "shrink.to-chd"
-description = "shrink writes a compacted CHD; the result must still be openable"
+description = """shrink writes a compacted CHD; the result must still be openable.
+It is SGI/IRIX-only, and it drops *trailing zero padding* — so a disk with none
+is refused as 'nothing to shrink'. The grow step is what creates something to
+drop, and is the only way to reach the code under test."""
 [[case.step]]
-args = ["new", "volume", "fat", "--size", "8M", "{scratch}/v.img"]
+args = ["new", "hd", "sgi-efs", "--size", "64M", "{scratch}/v.img"]
 expect_exit = 0
 [[case.step]]
-args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/payload.bin"]
+args = ["grow", "{scratch}/v.img", "--add", "32M"]
 expect_exit = 0
 [[case.step]]
 args = ["shrink", "{scratch}/v.img", "{scratch}/small.chd"]
@@ -482,7 +551,18 @@ files_exist = ["{scratch}/small.chd"]
 [[case.step]]
 args = ["inspect", "{scratch}/small.chd"]
 expect_exit = 0
-stdout_contains = ["FAT"]
+stdout_contains = ["SGI"]
+
+[[case]]
+id = "shrink.rejects-a-non-sgi-disk"
+description = "Everything else must be refused by name, not silently mangled"
+[[case.step]]
+args = ["new", "volume", "fat", "--size", "8M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["shrink", "{scratch}/v.img", "{scratch}/small.chd"]
+expect_exit = 1
+stderr_contains = ["SGI volume header"]
 
 [[case]]
 id = "shrink.rejects-non-chd-output"
@@ -496,6 +576,7 @@ expect_exit = 2
 
 [[case]]
 id = "mac.binhex.put"
+description = "put-binhex restores the name recorded inside the .hqx, which is the one `put` already used — so the round-trip lands on an existing file and needs --force."
 [[case.step]]
 args = ["new", "volume", "hfs", "--size", "4M", "{scratch}/v.img"]
 expect_exit = 0
@@ -506,7 +587,7 @@ expect_exit = 0
 args = ["get-binhex", "{scratch}/v.img", "/payload.bin", "{scratch}/out.hqx"]
 expect_exit = 0
 [[case.step]]
-args = ["put-binhex", "{scratch}/v.img", "{scratch}/out.hqx"]
+args = ["put-binhex", "{scratch}/v.img", "{scratch}/out.hqx", "--force"]
 expect_exit = 0
 [[case.step]]
 args = ["fsck", "{scratch}/v.img", "--checkonly"]

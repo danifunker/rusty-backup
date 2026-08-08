@@ -115,13 +115,10 @@ finding = "R-025"
 id = "subcmd.show.partmap"
 finding = "R-026"
 
-# --- R-012 again: the pure-CD-DA fixture -------------------------------------
-# Same defect as optical.cdda.no-data-track-opens, different fixture (a CHD
-# rather than a cue/bin). Listed so the corpus sweep does not read as a new
-# regression.
-[[known]]
-id = "read.optical.chdcd.audio-test"
-finding = "R-012"
+# `read.optical.chdcd.audio-test` was listed here as a second R-012 case. It
+# was not one: the fixture is named for its AUDIOTST volume label and actually
+# carries an ISO 9660 data track, so it never exercised "no data track" at all.
+# XPASS caught it. R-012 is still pinned by optical.cdda.no-data-track-opens.
 
 # --- R-027: the Finder-zipped .dmg ------------------------------------------
 # Catalogued 2026-08-02, first executed 2026-08-08. It has never passed; the
@@ -129,3 +126,39 @@ finding = "R-012"
 [[known]]
 id = "read.apfs.apple-gpt"
 finding = "R-027"
+
+# --- Found 2026-08-08, first execution of the tier-3 sweep -------------------
+# None of these had ever run: the last full Windows run predates the tier-2 and
+# tier-3 authoring commits, so it covered 134 of 256 cases and reported green.
+[[known]]
+id = "edit.real.affs-workbench13"
+finding = "R-030"
+[[known]]
+id = "edit.real.efs-small"
+finding = "R-029"
+[[known]]
+id = "edit.real.apple-dos-invaders"
+finding = "R-031"
+[[known]]
+id = "edit.apple-dos.put-get"
+finding = "R-028"
+[[known]]
+id = "edit.sfs.put-get"
+finding = "R-032"
+
+# The second instance of R-004: a handler-side usage rejection returning
+# GENERIC_FAILURE where exit.rs reserves USAGE_ERROR.
+[[known]]
+id = "shrink.rejects-non-chd-output"
+finding = "R-004"
+
+# `xattr set` reaches SquashFS's rebuild-and-replace path, which is R-025 —
+# the same Windows persist failure `squashfs put` hits. Nothing xattr-specific.
+[[known]]
+id = "meta.xattr.set-list-rm"
+finding = "R-025"
+
+# The detector matches the fixture byte for byte; inspect never reaches it.
+[[known]]
+id = "read.qdos.microdrive"
+finding = "R-033"

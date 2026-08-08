@@ -26,7 +26,7 @@ timeout_ms = 300000
 args = ["optical", "info", "{fixture}"]
 expect_exit = 0
 [[case.step]]
-args = ["optical", "browse", "{fixture}", "/"]
+args = ["optical", "browse", "{fixture}"]
 expect_exit = 0
 
 [[case]]
@@ -38,7 +38,7 @@ timeout_ms = 300000
 args = ["optical", "info", "{fixture}"]
 expect_exit = 0
 [[case.step]]
-args = ["optical", "browse", "{fixture}", "/"]
+args = ["optical", "browse", "{fixture}"]
 expect_exit = 0
 
 [[case]]
@@ -50,7 +50,7 @@ timeout_ms = 300000
 args = ["optical", "info", "{fixture}"]
 expect_exit = 0
 [[case.step]]
-args = ["optical", "browse", "{fixture}", "/"]
+args = ["optical", "browse", "{fixture}"]
 expect_exit = 0
 
 [[case]]
@@ -62,7 +62,7 @@ timeout_ms = 600000
 args = ["optical", "info", "{fixture}"]
 expect_exit = 0
 [[case.step]]
-args = ["optical", "browse", "{fixture}", "/"]
+args = ["optical", "browse", "{fixture}"]
 expect_exit = 0
 
 # --- Mac discs -------------------------------------------------------------------
@@ -75,7 +75,7 @@ timeout_ms = 300000
 args = ["optical", "info", "{fixture}"]
 expect_exit = 0
 [[case.step]]
-args = ["optical", "browse", "{fixture}", "/"]
+args = ["optical", "browse", "{fixture}"]
 expect_exit = 0
 
 [[case]]
@@ -86,7 +86,7 @@ timeout_ms = 300000
 args = ["optical", "info", "{fixture}"]
 expect_exit = 0
 [[case.step]]
-args = ["optical", "browse", "{fixture}", "/"]
+args = ["optical", "browse", "{fixture}"]
 expect_exit = 0
 
 # --- Unix discs -------------------------------------------------------------------
@@ -100,7 +100,7 @@ timeout_ms = 300000
 args = ["optical", "info", "{fixture}"]
 expect_exit = 0
 [[case.step]]
-args = ["optical", "browse", "{fixture}", "/"]
+args = ["optical", "browse", "{fixture}"]
 expect_exit = 0
 
 [[case]]
@@ -112,7 +112,7 @@ timeout_ms = 600000
 args = ["optical", "info", "{fixture}"]
 expect_exit = 0
 [[case.step]]
-args = ["optical", "browse", "{fixture}", "/"]
+args = ["optical", "browse", "{fixture}"]
 expect_exit = 0
 
 # --- Console discs -----------------------------------------------------------------
@@ -125,7 +125,7 @@ timeout_ms = 600000
 args = ["optical", "info", "{fixture}"]
 expect_exit = 0
 [[case.step]]
-args = ["optical", "browse", "{fixture}", "/"]
+args = ["optical", "browse", "{fixture}"]
 expect_exit = 0
 
 [[case]]
@@ -137,7 +137,7 @@ timeout_ms = 600000
 args = ["optical", "info", "{fixture}"]
 expect_exit = 0
 [[case.step]]
-args = ["optical", "browse", "{fixture}", "/"]
+args = ["optical", "browse", "{fixture}"]
 expect_exit = 0
 
 [[case]]
@@ -150,14 +150,15 @@ args = ["optical", "info", "{fixture}"]
 expect_exit = 0
 
 # --- Audio -------------------------------------------------------------------------
-# R-012 says `optical info` rejects any disc with no data track. This fixture is
-# exactly that shape, so the case asserts the intended behaviour and is expected
-# to be red until R-012 is fixed. It is listed in known-failures.toml against
-# R-012 for that reason, not because the fixture is at fault.
+# This was authored as a second R-012 case on the strength of the fixture's name
+# and listed as a known failure. It is not one — the disc has an ISO 9660 data
+# track, so it never exercised "no data track" and passed the moment it first
+# ran. R-012 is pinned by optical.cdda.no-data-track-opens, which is a real
+# pure-CD-DA cue/bin. The corpus still has no CD-DA-only CHD.
 
 [[case]]
 id = "read.optical.chdcd.audio-test"
-description = "A pure CD-DA disc inside a CHD. R-012: we reject it for having no data track, which is wrong — an audio disc is a disc."
+description = "A CD inside a CHD. Named for its AUDIOTST volume label, but it carries an ISO 9660 data track — it is not the pure-CD-DA case R-012 is about."
 fixture = "optical.chdcd.audio-test.cd"
 timeout_ms = 300000
 [[case.step]]

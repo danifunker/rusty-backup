@@ -340,7 +340,7 @@ fixture = "fmt.gho.password.hd"
 [[case.step]]
 args = ["inspect", "{fixture}"]
 expect_exit = 1
-stdout_contains = ["password"]
+stderr_contains = ["password"]
 
 [[case]]
 id = "read.gho.password.opens-with-one"
@@ -435,7 +435,7 @@ id = "read.cpm.pcw"
 description = "The PCW DPB, distinct from the amstrad_data one the other CP/M cases use"
 fixture = "fs.cpm.pcw.floppy"
 [[case.step]]
-args = ["ls", "{fixture}", "/", "--fs-type", "cpm:pcw"]
+args = ["ls", "{fixture}", "/", "--fs-type", "cpm:amstrad_pcw"]
 expect_exit = 0
 
 [[case]]
@@ -534,7 +534,7 @@ fixture = "fmt.imz.encrypted.floppy"
 [[case.step]]
 args = ["inspect", "{fixture}"]
 expect_exit = 1
-stdout_contains = ["password-protected"]
+stderr_contains = ["password-protected", "transferdisk-password.IMA"]
 
 [[case]]
 id = "read.imz.encrypted.opens-with-password"

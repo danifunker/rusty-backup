@@ -1,4 +1,4 @@
-# Regression Findings (R-001 … R-027)
+# Regression Findings (R-001 … R-033)
 
 Defects and documentation drift turned up while building the regression suite
 (`regression-tests/`), 2026-08-01/02. The suite work was deliberately kept
@@ -27,6 +27,12 @@ finding depends on a fixture, the fixture is named.
 | [R-025](#r-025) | Medium | `src/fs/squashfs_edit.rs` | `squashfs put` fails to replace the image on Windows |
 | [R-026](#r-026) | Low | `src/cli/verbs/show.rs` | `show partmap` cannot read an SGI disk that `inspect` reads fine |
 | [R-027](#r-027) | Medium | `src/rbformats/zip_disk.rs` | A Finder-made `.zip` holding one `.dmg` is rejected as ambiguous |
+| [R-030](#r-030) | **High** | `src/fs/affs.rs` | A real Workbench 1.3 AFFS volume cannot be opened at all — read, fsck and write alike |
+| [R-029](#r-029) | **High** | `src/fs/efs.rs` | EFS computes block addresses far outside the image; `fsck` fails on an unmodified volume |
+| [R-031](#r-031) | Medium | `src/partition/mod.rs` | A real Apple DOS 3.3 disk is detected as `unknown`, though our own output is not |
+| [R-028](#r-028) | Medium | `src/fs/apple_dos.rs` | Apple DOS 3.3 reports three different sizes for one file: 104 in, 512 by `ls`, 256 by `get` |
+| [R-032](#r-032) | Low | `src/fs/sfs.rs` | SFS `put` fails on any volume with a multi-leaf extent btree — i.e. any real one |
+| [R-033](#r-033) | **High** | `src/partition/mod.rs` | A QL Microdrive `.mdv` fails at MBR detection, though its own probe matches it exactly |
 | [R-020](#r-020) | **High** | `src/fs/affs.rs` | `new volume affs` output is "Not a DOS disk" on a real Amiga, at every size |
 | [R-016](#r-016) | **High** | `src/cli/verbs/backup.rs` | `backup` accepts only flat-layout sources: CHD, dynamic VHD, QCOW2 and VMDK all fail |
 | ~~R-018~~ | ~~Blocker~~ **FIXED** | `CONTRIBUTING.md` | ~~The documented Rust-1.73 verification build does not compile on Windows~~ — missing `windows-legacy` feature, 2026-08-07 |
@@ -593,6 +599,123 @@ Existing UFS fixtures are NetBSD `makefs` images read via `open_filesystem`
 directly, so neither the Solaris on-disk variant nor this listing path was
 ever exercised. Fixture: `part.sun.solaris-disk.multipart` (annex).
 
+### R-033 — a QL Microdrive cartridge never reaches its own detector {#r-033}
+
+```
+rb-cli inspect fs.qdos.microdrive.mdv.mdv
+  -> error: detecting partition table: Invalid MBR: invalid boot signature:
+     expected 0xAA55, got 0x00FF
+```
+
+The probe that should catch this is already written and already matches. From
+`src/fs/mod.rs:659`, a `.mdv` is recognised when the file is exactly
+`MDV_CART_BYTES` and `looks_like_mdv_sector_zero` holds. The fixture is
+174,930 bytes — exactly `MDV_CART_BYTES` — and its sector 0 is:
+
+```
+00000000  00 00 00 00 00 00 00 00 00 00 ff ff ff 00 54 65  ..............Te
+00000010  73 74 20 20 20 20 20 20 4b d5 8e 13 00 00 00 00  st      K.......
+```
+
+Ten zero bytes of preamble, `ff ff ff` sync at 0x0A, ASCII cartridge name
+"Test" at 0x0E — every condition the function tests. So the driver is not
+missing and the detection is not wrong; `inspect` fails before consulting it,
+in partition-table detection, which reports the sync bytes (`0x00FF`) as a bad
+MBR signature.
+
+`--fs-type qdos` is not a workaround: it routes to the QXL.WIN reader
+(`src/fs/qdos.rs`) and fails on a signature mismatch. The two QDOS drivers
+exist, and neither is reachable for a real cartridge.
+
+Same shape as [R-026](#r-026) and the R-009 / R-017 group — detection that
+exists but is not consulted on the path the user takes. Case
+`read.qdos.microdrive`.
+
+### R-030 — a real Workbench 1.3 AFFS volume cannot be opened at all {#r-030}
+
+Found 2026-08-08, the first time the tier-3 edit cases were executed against
+the reference volumes rather than against volumes we had formatted ourselves.
+
+```
+rb-cli ls   fs.affs.workbench13.hd.hdf@1 /
+rb-cli fsck fs.affs.workbench13.hd.hdf@1 --checkonly
+rb-cli put  fs.affs.workbench13.hd.hdf ... /PAYLOAD.BIN
+  -> Partition @1 / @s0 (RDB): AmigaDOS FFS (DH0) DOS\1 @ LBA 2020, 2068480 bytes
+     error: opening filesystem: parse error: root block: type != T_HEADER
+```
+
+All three fail identically, so this is not a write-path problem — the volume
+cannot be opened at all. The RDB above it parses fine: the partition, its
+DosType and its extent are all reported correctly, so the failure is inside
+AFFS with a correct offset handed to it. Either the root block's position is
+being computed wrong for this geometry, or a 1.3-era root block is being
+rejected on a field a 3.x one carries.
+
+Worth reading beside [R-020](#r-020), which is the mirror image: every AFFS
+volume *we write* is unmountable on a real Amiga because we put the block
+number in `header_key` where 0 belongs. Both are the reader and the writer
+disagreeing with the real format about the root block; they may or may not
+share a fix. Cases `edit.real.affs-workbench13`.
+
+### R-029 — EFS computes block addresses far outside the image {#r-029}
+
+```
+rb-cli ls    fs.efs.small.hd.img /            -> lists the tree fine
+rb-cli fsck  fs.efs.small.hd.img --checkonly
+  -> error: EFS short read at byte 50065408: got 0 of 512
+rb-cli put   fs.efs.small.hd.img payload.bin /PAYLOAD.BIN
+  -> error: EFS short read at byte 344826880: got 0 of 512
+```
+
+The image is 4,194,304 bytes. The two offsets are roughly 12x and 82x its
+size, and they differ between the two operations, so this is a computed
+address rather than a fixed constant. Browsing works, which puts the fault in
+whatever converts an inode's extent list into a byte offset on the paths
+`fsck` and `create_file` take. Case `edit.real.efs-small`; `fsck` failing on
+an unmodified fixture means read-only use is affected too.
+
+### R-028 — Apple DOS 3.3 reports three different sizes for one file {#r-028}
+
+```
+rb-cli new floppy apple-dos v.dsk
+rb-cli put v.dsk payload.bin /PAYLOAD     # payload.bin is 104 bytes
+rb-cli ls  v.dsk /                        -> FILE 512  PAYLOAD
+rb-cli get v.dsk /PAYLOAD out.bin         -> out.bin is 256 bytes
+```
+
+104 in, 512 reported, 256 out. The first 104 bytes of `out.bin` are correct
+and the rest is padding, so no data is lost — but nothing round-trips, and a
+tool that copies a file out of one image and into another silently grows it.
+Apple DOS 3.3's catalog stores a sector count rather than a byte length, so
+some rounding is inherent; three *different* numbers is not. Case
+`edit.apple-dos.put-get`.
+
+### R-031 — a real Apple DOS 3.3 disk is detected as 'unknown' {#r-031}
+
+```
+rb-cli put fs.apple-dos.invaders.floppy.dsk payload.bin /PAYLOAD.BIN
+  -> Partition @1 (None): Unknown 0x00 @ LBA 0, 143360 bytes
+     error: editing not yet supported for filesystem type 'unknown'
+```
+
+Our own `new floppy apple-dos` output on the same path reports `DOS 3.3`, so
+the detector works on what we write and not on a real disk of the same size
+and geometry. The error message is about editing, which is misleading — the
+volume was never identified. Case `edit.real.apple-dos-invaders`.
+
+### R-032 — SFS `put` fails on any volume with a multi-leaf extent btree {#r-032}
+
+```
+rb-cli ls  fs.sfs.workbench-dh0.hd.img /    -> lists the tree fine
+rb-cli put fs.sfs.workbench-dh0.hd.img payload.bin /PAYLOAD.BIN
+  -> error: create_file: parse error: extent_btree_insert: only single-leaf BNDC supported
+```
+
+CLAUDE.md records the single-leaf restriction, so this is a documented limit
+rather than a surprise — logged because a 499 MiB reference volume is the
+normal case, not an edge one, and "SFS: edit" in the README reads as
+unqualified. Read is unaffected. Case `edit.sfs.put-get`.
+
 ---
 
 ## Medium
@@ -774,6 +897,20 @@ The message is right, the code is not. `require_non_flat`
 (`src/cli/output.rs:161`) uses `anyhow::bail!`, which propagates as a generic
 failure. The unit test `require_non_flat_rejects_csv_for_nested` only asserts
 `is_err()`, so it cannot catch this.
+
+**A second instance, found 2026-08-08** — the same shape in a different verb,
+which makes it a pattern rather than one slip:
+
+```
+rb-cli shrink v.img nope.img   ->  exit 1
+error: output path must end in .chd (got .../nope.img)
+```
+
+`exit.rs` reserves USAGE_ERROR "for handler-side usage-bad-input branches",
+which is exactly what refusing a wrong output extension is. Every one of these
+is an `anyhow::bail!` in a handler, so the fix is the same everywhere: a usage
+rejection has to carry the code, not the message alone. Case
+`shrink.rejects-non-chd-output`.
 
 ### R-011 — G64 fails on copy-protected / patched dumps {#r-011}
 

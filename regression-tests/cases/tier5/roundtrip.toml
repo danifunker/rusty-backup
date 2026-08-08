@@ -1,4 +1,4 @@
-# Tier 3 — backup -> restore -> compare.
+# Tier 5 — backup -> restore -> compare.
 #
 # The product's headline feature, and until now it had no test: `restore`
 # appeared exactly once in the whole suite, as `restore --help`. See
@@ -19,7 +19,7 @@
 # expectation and the assertion is that the volume still fscks clean.
 
 [meta]
-tier = 3
+tier = 5
 group = "roundtrip"
 description = "Back up a volume, restore it, and prove the bytes survived."
 
