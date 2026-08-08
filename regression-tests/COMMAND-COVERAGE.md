@@ -13,6 +13,7 @@ before/after is the useful part.
 | backup -> restore -> compare | none | 14 cases, 8 filesystems, 4 formats |
 | edit surface (put/get/rm/mkdir/cp/tar/xattr/chmod/...) | none | **18/18 advertised filesystems** |
 | resize (grow/resize/repack/expand/shrink) | 1 | 9 cases |
+| catalogued fixtures used | 26/84 | 41/84 |
 
 Six findings came out of the first run: R-021 (`resize --size` is a silent
 no-op), R-022 (HPFS is the only filesystem that fails a sector-by-sector
@@ -40,6 +41,31 @@ the reminder, which is better than the case not existing.
 **SFS is the case the FS-UAE oracle work was aiming at.** rb-cli cannot write
 an SFS volume from scratch, so editing the reference volume and checking the
 result is the only way to exercise the SFS editor at all.
+
+### Fixture usage was the bigger miss
+
+58 of the 84 catalogued fixtures were referenced by nothing. That was never
+measured because the audit above counted *commands*, and a suite can invoke
+every verb while still testing them all against volumes it made itself.
+
+Two things fell out of checking:
+
+* **`fs.pfs3.rdb-cd32saves.hd` existed all along.** An earlier draft claimed no
+  PFS3 fixture was catalogued. That claim came from reading the case files
+  rather than the catalogue — the wrong direction to check in, and the same
+  shortcut that produced the "no L: directory anywhere" mistake during the
+  FS-UAE work.
+* **Two real AFFS volumes were sitting unused** (`fs.affs.workbench13.hd`,
+  `fs.affs.ffs-intl-cd32.hd`). Given R-020 — our AFFS formatter emits volumes
+  no Amiga will mount, and our own fsck agrees with the formatter rather than
+  with reality — an AFFS editor tested only against our own output proves very
+  little. `cases/tier3/edit-real-volumes.toml` now runs the same put/get/fsck
+  round-trip against third-party volumes for AFFS, NTFS, ext2/4, FAT16/32,
+  HFS+, HFS, HFV, ProDOS, CP/M, Human68k, Apple DOS and EFS.
+
+43 remain unused, mostly optical discs and the exotic end (Alto, Lisa, Xerox
+D0, 3DO, GameCube, CD-i). Those are read-path fixtures whose cases belong in
+tier 2, not here.
 
 ### Still not invoked, and why
 

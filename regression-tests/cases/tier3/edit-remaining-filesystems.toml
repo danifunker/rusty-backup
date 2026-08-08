@@ -170,16 +170,15 @@ args = ["fsck", "{fixture_copy}", "--checkonly", "--fs-type", "SFS\\0"]
 expect_exit = 0
 
 # --- PFS3 ---------------------------------------------------------------------
-# No builder, and no PFS3 fixture is catalogued either — the only PFS3 volumes
-# on hand are inside AmigaVision.hdf (9.1 GB, on the MiSTer) and 2.1-HD.hdf.
-# Recorded as an explicit fixture gap rather than left silent: this case will
-# report skip-fixture until a PFS3 reference volume is catalogued, and that
-# skip is the reminder.
+# `fs.pfs3.rdb-cd32saves.hd` (80 MB, RDB-partitioned) is catalogued and was
+# simply unused. An earlier draft of this file claimed no PFS3 fixture existed;
+# that came from reading the case files rather than the catalogue, which is the
+# wrong direction to check in.
 
 [[case]]
 id = "edit.pfs3.put-get"
-description = "PFS3 edit round-trip — blocked on a catalogued PFS3 fixture"
-fixture = "fs.pfs3.base.hd"
+description = "PFS3 edit round-trip against the catalogued RDB volume"
+fixture = "fs.pfs3.rdb-cd32saves.hd"
 [[case.step]]
 args = ["put", "{fixture_copy}", "{cases}/tier3/payload.bin", "/payload.bin"]
 expect_exit = 0
