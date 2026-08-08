@@ -1,0 +1,66 @@
+# Tier 2 — optical containers and the cue parser.
+#
+# Both findings here were turned up by hand while triaging fixture drops, not
+# by the suite, so nothing was stopping them regressing until now.
+
+[meta]
+tier = 2
+group = "optical.container"
+description = "CD-DA discs, cue parsing, and CloneCD."
+
+# --- R-012 ------------------------------------------------------------------
+
+[[case]]
+id = "optical.cdda.no-data-track-opens"
+description = "R-012: optical info rejects any disc with no data track, so a pure audio CD cannot be opened at all"
+fixture = "optical.cdda.no-data-track.cd"
+# src/optical/cd_audio.rs exists to read audio tracks and `optical rip`
+# handles CD-DA, so the one shape a user is most likely to point at should
+# not be the one shape that is refused.
+[[case.step]]
+args = ["optical", "info", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["bincue"]
+
+[[case]]
+id = "optical.cdda.mixed-mode-still-opens"
+description = "The working half of R-012 — a disc WITH a data track parses. Guards against a fix for R-012 breaking mixed mode."
+fixture = "optical.cdda.mixedmode.cd"
+[[case.step]]
+args = ["optical", "info", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["bincue"]
+
+# --- R-015 ------------------------------------------------------------------
+
+[[case]]
+id = "optical.cue.unpadded-track-number"
+description = "R-015: a cue with `TRACK 1` rather than `TRACK 01` is rejected, so any CloneCD-style rip is unreadable through the cue path"
+fixture = "optical.cue.unpadded-track.cd"
+# Deliberately the .cue, not the .ccd. Both describe the same disc, so the
+# .ccd case below passing while this one fails isolates the parser exactly.
+[[case.step]]
+args = ["optical", "info", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["bincue"]
+
+# --- CloneCD, the working path ----------------------------------------------
+
+[[case]]
+id = "optical.clonecd.reads-through-ccd"
+description = "CloneCD reads via the .ccd descriptor. Pins it, because it was briefly and wrongly recorded as unsupported after testing the .img instead."
+fixture = "optical.clonecd.bookshelf.cd"
+[[case.step]]
+args = ["optical", "info", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["clonecd", "high_sierra", "BOOKSHELF"]
+
+[[case]]
+id = "optical.clonecd.walks-the-tree"
+description = "CloneCD is readable at the filesystem level, not merely identifiable"
+fixture = "optical.clonecd.bookshelf.cd"
+timeout_ms = 300000
+[[case.step]]
+args = ["optical", "du", "{fixture}"]
+expect_exit = 0
+stdout_matches = ["[0-9]+ +[0-9]+ +/"]

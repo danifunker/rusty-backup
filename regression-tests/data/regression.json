@@ -1,0 +1,3405 @@
+{
+  "schema_version": 1,
+  "formats": [
+    {
+      "id": "fs.fat12",
+      "kind": "fs",
+      "name": "FAT12",
+      "we_read": true,
+      "we_write": true,
+      "builder": "new floppy fat"
+    },
+    {
+      "id": "fs.fat16",
+      "kind": "fs",
+      "name": "FAT16",
+      "we_read": true,
+      "we_write": true,
+      "builder": "new volume fat"
+    },
+    {
+      "id": "fs.fat32",
+      "kind": "fs",
+      "name": "FAT32",
+      "we_read": true,
+      "we_write": true,
+      "builder": "new volume fat",
+      "notes": "FAT32 is auto-selected above 2 GiB, so a synthesized FAT32 volume is expensive"
+    },
+    {
+      "id": "fs.exfat",
+      "kind": "fs",
+      "name": "exFAT",
+      "we_read": true,
+      "we_write": false,
+      "notes": "No builder — read/edit only, so a reference fixture is mandatory"
+    },
+    {
+      "id": "fs.ntfs",
+      "kind": "fs",
+      "name": "NTFS",
+      "we_read": true,
+      "we_write": true,
+      "builder": "new volume ntfs"
+    },
+    {
+      "id": "fs.hpfs",
+      "kind": "fs",
+      "name": "HPFS",
+      "we_read": true,
+      "we_write": true,
+      "builder": "new volume hpfs"
+    },
+    {
+      "id": "fs.ext2",
+      "kind": "fs",
+      "name": "ext2",
+      "we_read": true,
+      "we_write": true,
+      "builder": "new volume ext"
+    },
+    {
+      "id": "fs.ext3",
+      "kind": "fs",
+      "name": "ext3",
+      "we_read": true,
+      "we_write": true,
+      "builder": "new volume ext3"
+    },
+    {
+      "id": "fs.ext4",
+      "kind": "fs",
+      "name": "ext4",
+      "we_read": true,
+      "we_write": true,
+      "builder": "new volume ext4"
+    },
+    {
+      "id": "fs.squashfs",
+      "kind": "fs",
+      "name": "SquashFS 4.0",
+      "we_read": true,
+      "we_write": true,
+      "builder": "squashfs create"
+    },
+    {
+      "id": "fs.hfs",
+      "kind": "fs",
+      "name": "HFS (Mac OS Standard)",
+      "we_read": true,
+      "we_write": true,
+      "builder": "new volume hfs"
+    },
+    {
+      "id": "fs.hfsplus",
+      "kind": "fs",
+      "name": "HFS+ / HFSX",
+      "we_read": true,
+      "we_write": true,
+      "builder": "new volume hfsplus"
+    },
+    {
+      "id": "fs.hfv",
+      "kind": "fs",
+      "name": "BasiliskII HFV",
+      "we_read": true,
+      "we_write": true,
+      "builder": "new volume hfv",
+      "notes": "Classic HFS only, 2047 MB ceiling"
+    },
+    {
+      "id": "fs.mfs",
+      "kind": "fs",
+      "name": "MacPlus MFS",
+      "we_read": true,
+      "we_write": true,
+      "builder": "new floppy mfs"
+    },
+    {
+      "id": "fs.apfs",
+      "kind": "fs",
+      "name": "APFS",
+      "we_read": true,
+      "we_write": false
+    },
+    {
+      "id": "fs.btrfs",
+      "kind": "fs",
+      "name": "btrfs",
+      "we_read": true,
+      "we_write": false
+    },
+    {
+      "id": "fs.jfs",
+      "kind": "fs",
+      "name": "JFS2",
+      "we_read": true,
+      "we_write": false
+    },
+    {
+      "id": "fs.reiserfs",
+      "kind": "fs",
+      "name": "ReiserFS v3",
+      "we_read": true,
+      "we_write": false
+    },
+    {
+      "id": "fs.minix1",
+      "kind": "fs",
+      "name": "Minix V1",
+      "we_read": true,
+      "we_write": true,
+      "builder": "new floppy minix"
+    },
+    {
+      "id": "fs.minix2",
+      "kind": "fs",
+      "name": "Minix V2",
+      "we_read": true,
+      "we_write": true,
+      "builder": "new volume minix2"
+    },
+    {
+      "id": "fs.minix3",
+      "kind": "fs",
+      "name": "Minix V3",
+      "we_read": true,
+      "we_write": true,
+      "builder": "new volume minix3"
+    },
+    {
+      "id": "fs.ufs1",
+      "kind": "fs",
+      "name": "UFS1 / FFS",
+      "we_read": true,
+      "we_write": false,
+      "notes": "R-013: Solaris UFS directories mistyped as files with a garbage size"
+    },
+    {
+      "id": "fs.ufs2",
+      "kind": "fs",
+      "name": "UFS2",
+      "we_read": true,
+      "we_write": false,
+      "notes": "Superblock offset differs: NetBSD makefs 8192, FreeBSD newfs 65536"
+    },
+    {
+      "id": "fs.xfs",
+      "kind": "fs",
+      "name": "SGI XFS v4/v5",
+      "we_read": true,
+      "we_write": false
+    },
+    {
+      "id": "fs.efs",
+      "kind": "fs",
+      "name": "SGI EFS",
+      "we_read": true,
+      "we_write": true,
+      "builder": "new hd sgi-efs"
+    },
+    {
+      "id": "fs.affs",
+      "kind": "fs",
+      "name": "AFFS (OFS/FFS)",
+      "we_read": true,
+      "we_write": true,
+      "builder": "new volume affs"
+    },
+    {
+      "id": "fs.pfs3",
+      "kind": "fs",
+      "name": "PFS3 / PDS3 / muFS",
+      "we_read": true,
+      "we_write": true,
+      "notes": "create_blank_pfs3 exists in-engine for tests but is not exposed on the CLI"
+    },
+    {
+      "id": "fs.sfs",
+      "kind": "fs",
+      "name": "SFS (Smart File System)",
+      "we_read": true,
+      "we_write": true,
+      "notes": "No oracle and no fixture anywhere — the last uncovered Amiga filesystem"
+    },
+    {
+      "id": "fs.prodos",
+      "kind": "fs",
+      "name": "ProDOS",
+      "we_read": true,
+      "we_write": true,
+      "builder": "new volume prodos"
+    },
+    {
+      "id": "fs.apple-dos",
+      "kind": "fs",
+      "name": "Apple DOS 3.3",
+      "we_read": true,
+      "we_write": true,
+      "builder": "new floppy apple-dos"
+    },
+    {
+      "id": "fs.cpm",
+      "kind": "fs",
+      "name": "CP/M 2.2 / 3 / Plus",
+      "we_read": true,
+      "we_write": true,
+      "builder": "new floppy cpm",
+      "notes": "Nine DPB presets — the largest sub-axis in the suite"
+    },
+    {
+      "id": "fs.human68k",
+      "kind": "fs",
+      "name": "Human68k",
+      "we_read": true,
+      "we_write": true,
+      "builder": "new hd x68k"
+    },
+    {
+      "id": "fs.cbm",
+      "kind": "fs",
+      "name": "CBM DOS (1541/1571/1581/8050/8250)",
+      "we_read": true,
+      "we_write": false
+    },
+    {
+      "id": "fs.lisa",
+      "kind": "fs",
+      "name": "Apple Lisa File System",
+      "we_read": true,
+      "we_write": false
+    },
+    {
+      "id": "fs.alto-bfs",
+      "kind": "fs",
+      "name": "Alto BFS / TFS",
+      "we_read": true,
+      "we_write": false
+    },
+    {
+      "id": "fmt.raw",
+      "kind": "container",
+      "name": "Raw",
+      "we_read": true,
+      "we_write": true,
+      "builder": "convert --format raw"
+    },
+    {
+      "id": "fmt.chd",
+      "kind": "container",
+      "name": "CHD (MAME)",
+      "we_read": true,
+      "we_write": true,
+      "builder": "convert --format chd"
+    },
+    {
+      "id": "fmt.vhd-fixed",
+      "kind": "container",
+      "name": "Fixed VHD",
+      "we_read": true,
+      "we_write": true,
+      "builder": "convert --format vhd"
+    },
+    {
+      "id": "fmt.vhd-dynamic",
+      "kind": "container",
+      "name": "Dynamic VHD",
+      "we_read": true,
+      "we_write": true,
+      "builder": "convert --format vhd-dynamic"
+    },
+    {
+      "id": "fmt.qcow2",
+      "kind": "container",
+      "name": "QCOW2",
+      "we_read": true,
+      "we_write": true,
+      "builder": "convert --format qcow2"
+    },
+    {
+      "id": "fmt.vmdk-flat",
+      "kind": "container",
+      "name": "VMDK flat",
+      "we_read": true,
+      "we_write": true,
+      "builder": "convert --format vmdk-flat"
+    },
+    {
+      "id": "fmt.vmdk-sparse",
+      "kind": "container",
+      "name": "VMDK sparse",
+      "we_read": true,
+      "we_write": true,
+      "builder": "convert --format vmdk-sparse"
+    },
+    {
+      "id": "fmt.gho",
+      "kind": "container",
+      "name": "Norton Ghost",
+      "we_read": true,
+      "we_write": false,
+      "notes": "Includes the password-protected path"
+    },
+    {
+      "id": "fmt.dmg",
+      "kind": "container",
+      "name": "Apple DMG",
+      "we_read": true,
+      "we_write": false
+    },
+    {
+      "id": "fmt.sparseimage",
+      "kind": "container",
+      "name": "Apple sparseimage",
+      "we_read": true,
+      "we_write": false
+    },
+    {
+      "id": "fmt.ndif",
+      "kind": "container",
+      "name": "NDIF / self-mounting",
+      "we_read": true,
+      "we_write": false
+    },
+    {
+      "id": "fmt.zip-disk",
+      "kind": "container",
+      "name": "ZIP (raw disk)",
+      "we_read": true,
+      "we_write": false
+    },
+    {
+      "id": "fmt.d88",
+      "kind": "container",
+      "name": "Sharp D88",
+      "we_read": true,
+      "we_write": true,
+      "builder": "floppy convert --to d88"
+    },
+    {
+      "id": "fmt.cbk",
+      "kind": "container",
+      "name": "cb-dos container",
+      "we_read": true,
+      "we_write": true,
+      "builder": "cbk pack",
+      "notes": "Our own format — no third-party reader exists, so verify the full backup/restore/boot flow instead"
+    },
+    {
+      "id": "optical.iso9660",
+      "kind": "optical",
+      "name": "ISO 9660 (+ Joliet, Rock Ridge)",
+      "we_read": true,
+      "we_write": false
+    },
+    {
+      "id": "optical.high-sierra",
+      "kind": "optical",
+      "name": "High Sierra",
+      "we_read": true,
+      "we_write": false,
+      "notes": "Implemented but was untested until a fixture arrived"
+    },
+    {
+      "id": "optical.udf",
+      "kind": "optical",
+      "name": "UDF",
+      "we_read": true,
+      "we_write": false
+    },
+    {
+      "id": "optical.cdda",
+      "kind": "optical",
+      "name": "CD-DA / mixed mode",
+      "we_read": true,
+      "we_write": false,
+      "notes": "R-012: optical info rejects discs with no data track"
+    },
+    {
+      "id": "part.mbr",
+      "kind": "partition",
+      "name": "MBR",
+      "we_read": true,
+      "we_write": true
+    },
+    {
+      "id": "part.gpt",
+      "kind": "partition",
+      "name": "GPT",
+      "we_read": true,
+      "we_write": true
+    },
+    {
+      "id": "part.apm",
+      "kind": "partition",
+      "name": "APM",
+      "we_read": true,
+      "we_write": true
+    },
+    {
+      "id": "part.rdb",
+      "kind": "partition",
+      "name": "RDB (Amiga)",
+      "we_read": true,
+      "we_write": false
+    },
+    {
+      "id": "part.sgi",
+      "kind": "partition",
+      "name": "SGI volume header",
+      "we_read": true,
+      "we_write": true,
+      "builder": "new hd sgi-efs"
+    },
+    {
+      "id": "part.sun",
+      "kind": "partition",
+      "name": "Sun disk label",
+      "we_read": true,
+      "we_write": false
+    },
+    {
+      "id": "part.ahdi",
+      "kind": "partition",
+      "name": "Atari AHDI",
+      "we_read": true,
+      "we_write": false,
+      "notes": "R-001: missing from the README partition-table list"
+    },
+    {
+      "id": "part.x68k",
+      "kind": "partition",
+      "name": "Sharp X68000",
+      "we_read": true,
+      "we_write": true,
+      "builder": "new hd x68k"
+    },
+    {
+      "id": "fs.ucsd",
+      "kind": "fs",
+      "name": "UCSD p-System",
+      "we_read": true,
+      "we_write": true,
+      "builder": "new floppy ucsd"
+    },
+    {
+      "id": "fs.atari-dos2",
+      "kind": "fs",
+      "name": "Atari DOS 2 (2.0S / 2.5)",
+      "we_read": true,
+      "we_write": true,
+      "builder": "new floppy atari",
+      "notes": "Enhanced density (2.5) is read-only"
+    },
+    {
+      "id": "fs.atarist",
+      "kind": "fs",
+      "name": "Atari GEMDOS",
+      "we_read": true,
+      "we_write": true,
+      "notes": "FAT-derived; rides the FAT engine"
+    },
+    {
+      "id": "fs.rsdos",
+      "kind": "fs",
+      "name": "RS-DOS (CoCo Disk BASIC)",
+      "we_read": true,
+      "we_write": false
+    },
+    {
+      "id": "fs.os9",
+      "kind": "fs",
+      "name": "OS-9 / NitrOS-9 RBF",
+      "we_read": true,
+      "we_write": true,
+      "builder": "new floppy os9"
+    },
+    {
+      "id": "fs.dragondos",
+      "kind": "fs",
+      "name": "DragonDOS",
+      "we_read": true,
+      "we_write": false
+    },
+    {
+      "id": "fs.dfs",
+      "kind": "fs",
+      "name": "Acorn DFS",
+      "we_read": true,
+      "we_write": false
+    },
+    {
+      "id": "fs.adfs",
+      "kind": "fs",
+      "name": "Acorn ADFS / FileCore",
+      "we_read": true,
+      "we_write": true,
+      "builder": "new floppy adfs"
+    },
+    {
+      "id": "fs.ti99",
+      "kind": "fs",
+      "name": "TI-99/4A",
+      "we_read": true,
+      "we_write": true,
+      "builder": "new floppy ti99"
+    },
+    {
+      "id": "fs.trdos",
+      "kind": "fs",
+      "name": "TR-DOS (ZX Spectrum Beta Disk)",
+      "we_read": true,
+      "we_write": true,
+      "builder": "new floppy trdos"
+    },
+    {
+      "id": "fs.oric",
+      "kind": "fs",
+      "name": "Oric Jasmin",
+      "we_read": true,
+      "we_write": true,
+      "builder": "new floppy oric"
+    },
+    {
+      "id": "fs.cpc",
+      "kind": "fs",
+      "name": "Amstrad CPC AMSDOS",
+      "we_read": true,
+      "we_write": false,
+      "notes": "CP/M-derived; needs an explicit DPB via --fs-type"
+    },
+    {
+      "id": "fs.qdos",
+      "kind": "fs",
+      "name": "QDOS (QXL.WIN)",
+      "we_read": true,
+      "we_write": false,
+      "notes": "Microdrive anchor held; the QXL.WIN hard-disk container is still unsourced"
+    },
+    {
+      "id": "fs.pilot-cedar",
+      "kind": "fs",
+      "name": "Xerox Pilot / Cedar",
+      "we_read": true,
+      "we_write": false
+    },
+    {
+      "id": "fs.carve",
+      "kind": "fs",
+      "name": "Carve (raw recovery)",
+      "we_read": true,
+      "we_write": false,
+      "notes": "Synthetic view over unrecognised media; nothing third-party can verify it"
+    },
+    {
+      "id": "fmt.zstd",
+      "kind": "container",
+      "name": "Zstd stream",
+      "we_read": true,
+      "we_write": true,
+      "builder": "backup --format zstd"
+    },
+    {
+      "id": "fmt.gzip",
+      "kind": "container",
+      "name": "Gzip stream",
+      "we_read": true,
+      "we_write": true,
+      "builder": "backup --format gzip"
+    },
+    {
+      "id": "fmt.lz4",
+      "kind": "container",
+      "name": "LZ4 stream",
+      "we_read": true,
+      "we_write": true,
+      "builder": "backup --format lz4"
+    },
+    {
+      "id": "fmt.2mg",
+      "kind": "container",
+      "name": "Apple 2MG",
+      "we_read": true,
+      "we_write": true,
+      "builder": "convert --format twomg"
+    },
+    {
+      "id": "fmt.apple-dsk",
+      "kind": "container",
+      "name": "Apple II DSK (.do / .po)",
+      "we_read": true,
+      "we_write": false
+    },
+    {
+      "id": "fmt.dc42",
+      "kind": "container",
+      "name": "Disk Copy 4.2",
+      "we_read": true,
+      "we_write": true,
+      "builder": "convert --format dc42"
+    },
+    {
+      "id": "fmt.woz",
+      "kind": "container",
+      "name": "WOZ 2.0",
+      "we_read": true,
+      "we_write": true,
+      "builder": "convert --format woz"
+    },
+    {
+      "id": "fmt.moof",
+      "kind": "container",
+      "name": "MOOF",
+      "we_read": true,
+      "we_write": true,
+      "builder": "convert --format moof"
+    },
+    {
+      "id": "fmt.dart",
+      "kind": "container",
+      "name": "DART",
+      "we_read": true,
+      "we_write": false
+    },
+    {
+      "id": "fmt.adf",
+      "kind": "container",
+      "name": "Amiga ADF / HDF",
+      "we_read": true,
+      "we_write": false
+    },
+    {
+      "id": "fmt.adz",
+      "kind": "container",
+      "name": "Gzip-wrapped ADZ / HDZ",
+      "we_read": true,
+      "we_write": false
+    },
+    {
+      "id": "fmt.msa",
+      "kind": "container",
+      "name": "Atari MSA",
+      "we_read": true,
+      "we_write": false
+    },
+    {
+      "id": "fmt.atari-disk",
+      "kind": "container",
+      "name": "Atari disk (ATR / XFD)",
+      "we_read": true,
+      "we_write": false
+    },
+    {
+      "id": "fmt.edsk",
+      "kind": "container",
+      "name": "CPCEMU DSK / EDSK",
+      "we_read": true,
+      "we_write": false
+    },
+    {
+      "id": "fmt.cbm-disk",
+      "kind": "container",
+      "name": "Commodore disk (D64 / D71 / D81 / D80 / D82)",
+      "we_read": true,
+      "we_write": false
+    },
+    {
+      "id": "fmt.g64",
+      "kind": "container",
+      "name": "Commodore GCR (G64 / G71)",
+      "we_read": true,
+      "we_write": false,
+      "notes": "R-011: copy-protected and patched dumps fail to decode"
+    },
+    {
+      "id": "fmt.coco-disk",
+      "kind": "container",
+      "name": "CoCo disk (JVC / VDK)",
+      "we_read": true,
+      "we_write": false
+    },
+    {
+      "id": "fmt.acorn-dfs-disk",
+      "kind": "container",
+      "name": "Acorn DFS disk (SSD / DSD)",
+      "we_read": true,
+      "we_write": false
+    },
+    {
+      "id": "fmt.trdos-disk",
+      "kind": "container",
+      "name": "ZX Spectrum TR-DOS (TRD)",
+      "we_read": true,
+      "we_write": false
+    },
+    {
+      "id": "fmt.ti99-disk",
+      "kind": "container",
+      "name": "TI-99/4A disk (V9T9)",
+      "we_read": true,
+      "we_write": false
+    },
+    {
+      "id": "fmt.xdf",
+      "kind": "container",
+      "name": "X68000 XDF",
+      "we_read": true,
+      "we_write": true,
+      "builder": "floppy convert --to xdf"
+    },
+    {
+      "id": "fmt.hdm",
+      "kind": "container",
+      "name": "PC-98 HDM",
+      "we_read": true,
+      "we_write": true,
+      "builder": "floppy convert --to hdm"
+    },
+    {
+      "id": "fmt.dim",
+      "kind": "container",
+      "name": "DiskExplorer DIM",
+      "we_read": true,
+      "we_write": true,
+      "builder": "floppy convert --to dim"
+    },
+    {
+      "id": "fmt.x68k-hdd",
+      "kind": "container",
+      "name": "X68000 HDD (HDS / HDF)",
+      "we_read": true,
+      "we_write": true,
+      "builder": "new hd x68k"
+    },
+    {
+      "id": "fmt.winimage",
+      "kind": "container",
+      "name": "WinImage (IMA)",
+      "we_read": true,
+      "we_write": false
+    },
+    {
+      "id": "fmt.imz",
+      "kind": "container",
+      "name": "WinImage compressed (IMZ)",
+      "we_read": true,
+      "we_write": false,
+      "notes": "Encrypted variant needs both a correct- and a wrong-password case"
+    },
+    {
+      "id": "fmt.appimage",
+      "kind": "container",
+      "name": "AppImage",
+      "we_read": true,
+      "we_write": false,
+      "notes": "ELF stub with an appended SquashFS; the payload opens in place"
+    },
+    {
+      "id": "fmt.bincue",
+      "kind": "container",
+      "name": "BIN/CUE",
+      "we_read": true,
+      "we_write": true,
+      "builder": "convert --format bincue",
+      "notes": "R-012: a cue with no data track is rejected"
+    },
+    {
+      "id": "fmt.raw-physical",
+      "kind": "container",
+      "name": "Raw physical disk",
+      "we_read": true,
+      "we_write": true,
+      "notes": "Device paths differ per OS and writes need elevation. See HARDWARE.md"
+    },
+    {
+      "id": "fmt.altodisk",
+      "kind": "container",
+      "name": "Xerox Alto pack",
+      "we_read": true,
+      "we_write": false
+    },
+    {
+      "id": "fmt.salto",
+      "kind": "container",
+      "name": "Salto disk",
+      "we_read": true,
+      "we_write": false
+    },
+    {
+      "id": "fmt.contralto2",
+      "kind": "container",
+      "name": "ContrAlto2",
+      "we_read": true,
+      "we_write": false
+    },
+    {
+      "id": "fmt.diablo",
+      "kind": "container",
+      "name": "Diablo Trident pack",
+      "we_read": true,
+      "we_write": false
+    },
+    {
+      "id": "fmt.xerox-d0",
+      "kind": "container",
+      "name": "Xerox D0 disk",
+      "we_read": true,
+      "we_write": false
+    },
+    {
+      "id": "fmt.pilot-cedar-vol",
+      "kind": "container",
+      "name": "Xerox Pilot / Cedar volume",
+      "we_read": true,
+      "we_write": false
+    },
+    {
+      "id": "fmt.dwarf",
+      "kind": "container",
+      "name": "Dwarf 6085 disk",
+      "we_read": true,
+      "we_write": false
+    },
+    {
+      "id": "optical.hfs",
+      "kind": "optical",
+      "name": "Optical HFS / HFS+",
+      "we_read": true,
+      "we_write": false
+    },
+    {
+      "id": "optical.efs",
+      "kind": "optical",
+      "name": "Optical SGI EFS",
+      "we_read": true,
+      "we_write": true,
+      "builder": "optical new sgi-efs"
+    },
+    {
+      "id": "optical.ufs",
+      "kind": "optical",
+      "name": "Optical UFS / FFS",
+      "we_read": true,
+      "we_write": false,
+      "notes": "NeXTSTEP install media is the canonical case; Solaris CDs are plain ISO 9660"
+    },
+    {
+      "id": "optical.ods2",
+      "kind": "optical",
+      "name": "VMS ODS-2 / Files-11",
+      "we_read": true,
+      "we_write": false
+    },
+    {
+      "id": "optical.gamecube",
+      "kind": "optical",
+      "name": "GameCube / Wii",
+      "we_read": true,
+      "we_write": false
+    },
+    {
+      "id": "optical.cdi",
+      "kind": "optical",
+      "name": "CD-i",
+      "we_read": true,
+      "we_write": false
+    },
+    {
+      "id": "optical.3do-opera",
+      "kind": "optical",
+      "name": "3DO Opera",
+      "we_read": true,
+      "we_write": false
+    },
+    {
+      "id": "optical.chdcd",
+      "kind": "optical",
+      "name": "CHD CD profile",
+      "we_read": true,
+      "we_write": true,
+      "builder": "convert --format chd-cd"
+    },
+    {
+      "id": "part.none",
+      "kind": "partition",
+      "name": "None (superfloppy)",
+      "we_read": true,
+      "we_write": false,
+      "notes": "R-009: detection misses JFS, UFS1/2 and ReiserFS.\n\nDeliberately we_write = false. A superfloppy is defined by the ABSENCE of a\npartition table, so there is nothing for an oracle to inspect — any filesystem\noracle that reads the volume at offset 0 has already proved it. Listing it as\na write path would manufacture a permanent unfillable gap."
+    }
+  ],
+  "oracles": [
+    {
+      "id": "qemu-img",
+      "tool": "qemu-img",
+      "kind": "package"
+    },
+    {
+      "id": "chdman",
+      "tool": "chdman",
+      "kind": "package",
+      "notes": "Four versions present locally (0.174/0.189/0.273/0.288); our output verifies on all four, so the version spread is itself a coverage axis."
+    },
+    {
+      "id": "fsck.ext4",
+      "tool": "fsck.ext4",
+      "kind": "package"
+    },
+    {
+      "id": "fsck.vfat",
+      "tool": "fsck.vfat",
+      "kind": "package"
+    },
+    {
+      "id": "fsck_hfs",
+      "tool": "fsck_hfs",
+      "kind": "package",
+      "notes": "macOS only. Nothing equivalent exists elsewhere, which is what makes a Mac non-optional."
+    },
+    {
+      "id": "fsck_apfs",
+      "tool": "fsck_apfs",
+      "kind": "package"
+    },
+    {
+      "id": "hdiutil",
+      "tool": "hdiutil",
+      "kind": "package"
+    },
+    {
+      "id": "ghostexp",
+      "tool": "ghostexp.exe",
+      "kind": "package",
+      "notes": "Symantec Ghost Explorer 11.5. Windows only; three copies present locally."
+    },
+    {
+      "id": "unsquashfs",
+      "tool": "unsquashfs",
+      "kind": "package"
+    },
+    {
+      "id": "xfs_repair",
+      "tool": "xfs_repair",
+      "kind": "package",
+      "notes": "Checks Linux-flavoured XFS; IRIX is the authority for SGI XFS."
+    },
+    {
+      "id": "jfs_fsck",
+      "tool": "jfs_fsck",
+      "kind": "package"
+    },
+    {
+      "id": "fsck.minix",
+      "tool": "fsck.minix",
+      "kind": "package"
+    },
+    {
+      "id": "mount-affs",
+      "tool": "mount -t affs",
+      "kind": "mount",
+      "notes": "Linux kernel AFFS driver. Available on the MiSTer's HPS because that\nis ARM Linux with affs built in — but this is a LINUX opinion, not an Amiga\none, and is worth exactly what the same mount on any Linux box is worth. The\nAmiga's own filesystem code lives in the core; see mister-core-amiga."
+    },
+    {
+      "id": "cpmtools",
+      "tool": "cpmls",
+      "kind": "package",
+      "notes": "Closes the nine-DPB CP/M axis, the largest sub-axis in the suite, for one apt install."
+    },
+    {
+      "id": "7z",
+      "tool": "7z",
+      "kind": "package"
+    },
+    {
+      "id": "iris",
+      "tool": "Iris",
+      "kind": "emulator",
+      "notes": "SGI emulator written in Rust; in-house, so blockers are fixable at source. Replaces MAME for IRIX."
+    },
+    {
+      "id": "fs-uae",
+      "tool": "FS-UAE",
+      "kind": "emulator",
+      "notes": "Cross-platform Amiga. WinUAE is Windows-only, so this is the portable choice."
+    },
+    {
+      "id": "86box-os2",
+      "tool": "86Box + OS/2",
+      "kind": "emulator",
+      "notes": "OS/2's own CHKDSK is the only real HPFS oracle; the Linux hpfs module is read-only and absent from WSL."
+    },
+    {
+      "id": "mister-core-amiga",
+      "tool": "MiSTer Minimig core",
+      "kind": "hardware",
+      "notes": "Real AmigaOS reading the volume with its own filesystem handlers.\nUnlike the HPS affs mount, this is the Amiga's opinion. Bootable Workbench\n1.3 / 2.1 RDB+PFS disks are already on the board."
+    },
+    {
+      "id": "mister-core-x68000",
+      "tool": "MiSTer X68000 core",
+      "kind": "hardware"
+    },
+    {
+      "id": "mister-core-atarist",
+      "tool": "MiSTer AtariST core",
+      "kind": "hardware"
+    },
+    {
+      "id": "mister-core-appleii",
+      "tool": "MiSTer Apple-II core",
+      "kind": "hardware",
+      "notes": "Real Apple II reading the disk with ProDOS / DOS 3.3 themselves.\n/media/fat/games/Apple-II is already populated on the board, so this needs no\nnew material — it closes two write gaps that had no oracle at all."
+    },
+    {
+      "id": "snow",
+      "tool": "Snow",
+      "kind": "emulator",
+      "notes": "Modern Macintosh emulator written in Rust. Emulating a Mac Plus gives\na real MFS implementation — the only realistic judge of MFS, which otherwise\nhas no oracle anywhere. NB: snowemu.com returned HTTP 403 when checked on\n2026-08-02, so confirm the project and its automation surface before the\nmatrix leans on it."
+    },
+    {
+      "id": "full-cycle-boot",
+      "tool": "backup -> restore -> boot",
+      "kind": "roundtrip",
+      "notes": "For our own container formats there is no third party and never will\nbe, so structural inspection is circular by construction. The honest check is\nbehavioural: back up a real installed system, restore it, and boot the result.\nIf the machine still comes up and its files are intact, the format did its job.\n\nCanonical scenario, which also exercises CB-DOS end to end:\n\n  1. Build a small DOS 6.22 VM (QEMU or VMware) and install it bootable.\n  2. Back that disk up with rb-cli into cbk.\n  3. Restore onto an SD card (or back into a VM disk).\n  4. Boot it and assert the guest reaches a prompt with its files intact.\n\nThis single case covers more than the container: backup, restore, the CB-DOS\npath, partition and boot-sector fidelity, and — when the target is real media\n— the hardware write path from HARDWARE.md. Highest coverage-per-case in the\nsuite, which is why it is worth the setup cost."
+    },
+    {
+      "id": "zstd-t",
+      "tool": "zstd -t",
+      "kind": "package"
+    },
+    {
+      "id": "gzip-t",
+      "tool": "gzip -t",
+      "kind": "package"
+    },
+    {
+      "id": "lz4-t",
+      "tool": "lz4 -t",
+      "kind": "package"
+    },
+    {
+      "id": "applecommander",
+      "tool": "AppleCommander",
+      "kind": "package",
+      "notes": "Java, so it runs on all three desktop hosts — which is why it is\npreferred over the per-OS alternatives (CiderPress on Windows, Applesauce on\nmacOS). Reads 2MG / DSK / PO / DO and lists ProDOS and DOS 3.3 volumes."
+    },
+    {
+      "id": "applesauce",
+      "tool": "Applesauce",
+      "kind": "package",
+      "notes": "macOS only, but it is the reference implementation for the flux formats."
+    },
+    {
+      "id": "mame-pc98",
+      "tool": "MAME pc9801",
+      "kind": "emulator",
+      "notes": "No PC-98 core exists on the MiSTer, so MAME's pc9801 drivers are the route for HDM and DIM."
+    },
+    {
+      "id": "mister-core-atari800",
+      "tool": "MiSTer ATARI800 core",
+      "kind": "hardware"
+    },
+    {
+      "id": "mister-core-ti99",
+      "tool": "MiSTer TI-99_4A core",
+      "kind": "hardware"
+    },
+    {
+      "id": "mister-core-oric",
+      "tool": "MiSTer Oric core",
+      "kind": "hardware"
+    },
+    {
+      "id": "mister-core-spectrum",
+      "tool": "MiSTer Spectrum core",
+      "kind": "hardware"
+    },
+    {
+      "id": "mister-core-coco",
+      "tool": "MiSTer CoCo2 / COCO3 core",
+      "kind": "hardware"
+    },
+    {
+      "id": "mister-core-archie",
+      "tool": "MiSTer ARCHIE core",
+      "kind": "hardware",
+      "notes": "Acorn Archimedes; RISC OS reads ADFS with its own FileCore."
+    },
+    {
+      "id": "mister-core-bbcmicro",
+      "tool": "MiSTer BBCMicro core",
+      "kind": "hardware"
+    },
+    {
+      "id": "mister-core-lisa",
+      "tool": "MiSTer Apple-Lisa core",
+      "kind": "hardware",
+      "notes": "Confirmed present on the board. Lisa FS was listed as having no\noracle anywhere — the core is one, and it is the only realistic one."
+    },
+    {
+      "id": "chkdsk",
+      "tool": "chkdsk",
+      "kind": "package",
+      "notes": "Windows' own NTFS checker. Relevant to R-007, where a freshly formatted volume fails its own fsck on BackupBootMismatch — chkdsk is the arbiter."
+    },
+    {
+      "id": "mount-ntfs3",
+      "tool": "mount -t ntfs3",
+      "kind": "mount",
+      "notes": "In-kernel NTFS driver; absent from WSL, needs a full Linux host."
+    },
+    {
+      "id": "sfdisk",
+      "tool": "sfdisk -l",
+      "kind": "package",
+      "notes": "Reads MBR, GPT and Sun disk labels. MBR and GPT are the two commonest schemes we write and had no oracle at all until now."
+    },
+    {
+      "id": "diskutil",
+      "tool": "diskutil list",
+      "kind": "package",
+      "notes": "APM is an Apple scheme, so Apple's own tool is the authority."
+    }
+  ],
+  "availability": [
+    {
+      "oracle": "qemu-img",
+      "platform": "windows",
+      "status": "verified",
+      "path_hint": "C:/Program Files/qemu",
+      "verified_on": "2026-08-02"
+    },
+    {
+      "oracle": "qemu-img",
+      "platform": "wsl",
+      "status": "verified",
+      "path_hint": "/usr/bin/qemu-img",
+      "verified_on": "2026-08-02"
+    },
+    {
+      "oracle": "qemu-img",
+      "platform": "linux",
+      "status": "expected"
+    },
+    {
+      "oracle": "qemu-img",
+      "platform": "macos",
+      "status": "install",
+      "path_hint": "brew install qemu"
+    },
+    {
+      "oracle": "chdman",
+      "platform": "windows",
+      "status": "verified",
+      "path_hint": "C:/Tools/chdman (0.288)",
+      "verified_on": "2026-08-02"
+    },
+    {
+      "oracle": "chdman",
+      "platform": "linux",
+      "status": "install"
+    },
+    {
+      "oracle": "chdman",
+      "platform": "macos",
+      "status": "install"
+    },
+    {
+      "oracle": "chdman",
+      "platform": "mister-hps",
+      "status": "absent"
+    },
+    {
+      "oracle": "fsck.ext4",
+      "platform": "wsl",
+      "status": "verified",
+      "path_hint": "/usr/sbin/fsck.ext4",
+      "verified_on": "2026-08-02"
+    },
+    {
+      "oracle": "fsck.ext4",
+      "platform": "mister-hps",
+      "status": "verified",
+      "path_hint": "/usr/sbin/fsck.ext4",
+      "verified_on": "2026-08-02"
+    },
+    {
+      "oracle": "fsck.ext4",
+      "platform": "linux",
+      "status": "expected"
+    },
+    {
+      "oracle": "fsck.ext4",
+      "platform": "macos",
+      "status": "install",
+      "path_hint": "brew install e2fsprogs"
+    },
+    {
+      "oracle": "fsck.ext4",
+      "platform": "windows",
+      "status": "absent"
+    },
+    {
+      "oracle": "fsck.vfat",
+      "platform": "wsl",
+      "status": "verified",
+      "verified_on": "2026-08-02"
+    },
+    {
+      "oracle": "fsck.vfat",
+      "platform": "mister-hps",
+      "status": "verified",
+      "verified_on": "2026-08-02"
+    },
+    {
+      "oracle": "fsck.vfat",
+      "platform": "linux",
+      "status": "expected"
+    },
+    {
+      "oracle": "fsck.vfat",
+      "platform": "windows",
+      "status": "absent"
+    },
+    {
+      "oracle": "fsck_hfs",
+      "platform": "macos",
+      "status": "expected"
+    },
+    {
+      "oracle": "fsck_hfs",
+      "platform": "windows",
+      "status": "absent"
+    },
+    {
+      "oracle": "fsck_hfs",
+      "platform": "linux",
+      "status": "absent"
+    },
+    {
+      "oracle": "fsck_apfs",
+      "platform": "macos",
+      "status": "expected"
+    },
+    {
+      "oracle": "fsck_apfs",
+      "platform": "linux",
+      "status": "absent"
+    },
+    {
+      "oracle": "fsck_apfs",
+      "platform": "windows",
+      "status": "absent"
+    },
+    {
+      "oracle": "hdiutil",
+      "platform": "macos",
+      "status": "expected"
+    },
+    {
+      "oracle": "hdiutil",
+      "platform": "linux",
+      "status": "absent"
+    },
+    {
+      "oracle": "hdiutil",
+      "platform": "windows",
+      "status": "absent"
+    },
+    {
+      "oracle": "ghostexp",
+      "platform": "windows",
+      "status": "verified",
+      "path_hint": "C:/Temp/pebuilder-isolinux/Programs/ghost11",
+      "verified_on": "2026-08-02"
+    },
+    {
+      "oracle": "ghostexp",
+      "platform": "linux",
+      "status": "absent"
+    },
+    {
+      "oracle": "ghostexp",
+      "platform": "macos",
+      "status": "absent"
+    },
+    {
+      "oracle": "unsquashfs",
+      "platform": "wsl",
+      "status": "verified",
+      "verified_on": "2026-08-02"
+    },
+    {
+      "oracle": "unsquashfs",
+      "platform": "linux",
+      "status": "expected"
+    },
+    {
+      "oracle": "unsquashfs",
+      "platform": "macos",
+      "status": "install"
+    },
+    {
+      "oracle": "unsquashfs",
+      "platform": "windows",
+      "status": "absent"
+    },
+    {
+      "oracle": "xfs_repair",
+      "platform": "wsl",
+      "status": "verified",
+      "verified_on": "2026-08-02"
+    },
+    {
+      "oracle": "xfs_repair",
+      "platform": "linux",
+      "status": "expected"
+    },
+    {
+      "oracle": "jfs_fsck",
+      "platform": "wsl",
+      "status": "verified",
+      "verified_on": "2026-08-02"
+    },
+    {
+      "oracle": "jfs_fsck",
+      "platform": "linux",
+      "status": "expected"
+    },
+    {
+      "oracle": "fsck.minix",
+      "platform": "wsl",
+      "status": "verified",
+      "verified_on": "2026-08-02"
+    },
+    {
+      "oracle": "fsck.minix",
+      "platform": "linux",
+      "status": "expected"
+    },
+    {
+      "oracle": "mount-affs",
+      "platform": "mister-hps",
+      "status": "verified",
+      "path_hint": "/proc/filesystems",
+      "verified_on": "2026-08-02"
+    },
+    {
+      "oracle": "mount-affs",
+      "platform": "linux",
+      "status": "install",
+      "path_hint": "linux-modules-extra"
+    },
+    {
+      "oracle": "mount-affs",
+      "platform": "wsl",
+      "status": "absent"
+    },
+    {
+      "oracle": "cpmtools",
+      "platform": "wsl",
+      "status": "install"
+    },
+    {
+      "oracle": "cpmtools",
+      "platform": "linux",
+      "status": "expected"
+    },
+    {
+      "oracle": "cpmtools",
+      "platform": "macos",
+      "status": "install"
+    },
+    {
+      "oracle": "7z",
+      "platform": "windows",
+      "status": "verified",
+      "path_hint": "C:/Program Files/7-Zip",
+      "verified_on": "2026-08-02"
+    },
+    {
+      "oracle": "7z",
+      "platform": "linux",
+      "status": "expected"
+    },
+    {
+      "oracle": "7z",
+      "platform": "macos",
+      "status": "install"
+    },
+    {
+      "oracle": "iris",
+      "platform": "windows",
+      "status": "install"
+    },
+    {
+      "oracle": "iris",
+      "platform": "linux",
+      "status": "install"
+    },
+    {
+      "oracle": "iris",
+      "platform": "macos",
+      "status": "install"
+    },
+    {
+      "oracle": "fs-uae",
+      "platform": "windows",
+      "status": "install"
+    },
+    {
+      "oracle": "fs-uae",
+      "platform": "linux",
+      "status": "install"
+    },
+    {
+      "oracle": "fs-uae",
+      "platform": "macos",
+      "status": "install"
+    },
+    {
+      "oracle": "86box-os2",
+      "platform": "windows",
+      "status": "install"
+    },
+    {
+      "oracle": "86box-os2",
+      "platform": "linux",
+      "status": "install"
+    },
+    {
+      "oracle": "86box-os2",
+      "platform": "macos",
+      "status": "install"
+    },
+    {
+      "oracle": "mister-core-amiga",
+      "platform": "mister-core",
+      "status": "expected"
+    },
+    {
+      "oracle": "mister-core-x68000",
+      "platform": "mister-core",
+      "status": "expected"
+    },
+    {
+      "oracle": "mister-core-atarist",
+      "platform": "mister-core",
+      "status": "expected"
+    },
+    {
+      "oracle": "mister-core-appleii",
+      "platform": "mister-core",
+      "status": "expected"
+    },
+    {
+      "oracle": "snow",
+      "platform": "windows",
+      "status": "install"
+    },
+    {
+      "oracle": "snow",
+      "platform": "linux",
+      "status": "install"
+    },
+    {
+      "oracle": "snow",
+      "platform": "macos",
+      "status": "install"
+    },
+    {
+      "oracle": "full-cycle-boot",
+      "platform": "windows",
+      "status": "install"
+    },
+    {
+      "oracle": "full-cycle-boot",
+      "platform": "linux",
+      "status": "install"
+    },
+    {
+      "oracle": "full-cycle-boot",
+      "platform": "macos",
+      "status": "install"
+    },
+    {
+      "oracle": "zstd-t",
+      "platform": "wsl",
+      "status": "expected"
+    },
+    {
+      "oracle": "zstd-t",
+      "platform": "linux",
+      "status": "expected"
+    },
+    {
+      "oracle": "zstd-t",
+      "platform": "macos",
+      "status": "install"
+    },
+    {
+      "oracle": "zstd-t",
+      "platform": "windows",
+      "status": "install"
+    },
+    {
+      "oracle": "gzip-t",
+      "platform": "wsl",
+      "status": "expected"
+    },
+    {
+      "oracle": "gzip-t",
+      "platform": "linux",
+      "status": "expected"
+    },
+    {
+      "oracle": "gzip-t",
+      "platform": "macos",
+      "status": "expected"
+    },
+    {
+      "oracle": "gzip-t",
+      "platform": "windows",
+      "status": "install"
+    },
+    {
+      "oracle": "gzip-t",
+      "platform": "mister-hps",
+      "status": "expected"
+    },
+    {
+      "oracle": "lz4-t",
+      "platform": "wsl",
+      "status": "install"
+    },
+    {
+      "oracle": "lz4-t",
+      "platform": "linux",
+      "status": "expected"
+    },
+    {
+      "oracle": "lz4-t",
+      "platform": "macos",
+      "status": "install"
+    },
+    {
+      "oracle": "applecommander",
+      "platform": "windows",
+      "status": "install"
+    },
+    {
+      "oracle": "applecommander",
+      "platform": "linux",
+      "status": "install"
+    },
+    {
+      "oracle": "applecommander",
+      "platform": "macos",
+      "status": "install"
+    },
+    {
+      "oracle": "applesauce",
+      "platform": "macos",
+      "status": "install"
+    },
+    {
+      "oracle": "applesauce",
+      "platform": "windows",
+      "status": "absent"
+    },
+    {
+      "oracle": "applesauce",
+      "platform": "linux",
+      "status": "absent"
+    },
+    {
+      "oracle": "mame-pc98",
+      "platform": "windows",
+      "status": "install"
+    },
+    {
+      "oracle": "mame-pc98",
+      "platform": "linux",
+      "status": "install"
+    },
+    {
+      "oracle": "mame-pc98",
+      "platform": "macos",
+      "status": "install"
+    },
+    {
+      "oracle": "mister-core-atari800",
+      "platform": "mister-core",
+      "status": "expected"
+    },
+    {
+      "oracle": "mister-core-ti99",
+      "platform": "mister-core",
+      "status": "expected"
+    },
+    {
+      "oracle": "mister-core-oric",
+      "platform": "mister-core",
+      "status": "expected"
+    },
+    {
+      "oracle": "mister-core-spectrum",
+      "platform": "mister-core",
+      "status": "expected"
+    },
+    {
+      "oracle": "mister-core-coco",
+      "platform": "mister-core",
+      "status": "expected"
+    },
+    {
+      "oracle": "mister-core-archie",
+      "platform": "mister-core",
+      "status": "expected"
+    },
+    {
+      "oracle": "mister-core-bbcmicro",
+      "platform": "mister-core",
+      "status": "expected"
+    },
+    {
+      "oracle": "mister-core-lisa",
+      "platform": "mister-core",
+      "status": "expected"
+    },
+    {
+      "oracle": "chkdsk",
+      "platform": "windows",
+      "status": "expected"
+    },
+    {
+      "oracle": "chkdsk",
+      "platform": "linux",
+      "status": "absent"
+    },
+    {
+      "oracle": "chkdsk",
+      "platform": "macos",
+      "status": "absent"
+    },
+    {
+      "oracle": "mount-ntfs3",
+      "platform": "linux",
+      "status": "install",
+      "path_hint": "linux-modules-extra"
+    },
+    {
+      "oracle": "mount-ntfs3",
+      "platform": "wsl",
+      "status": "absent"
+    },
+    {
+      "oracle": "sfdisk",
+      "platform": "wsl",
+      "status": "expected"
+    },
+    {
+      "oracle": "sfdisk",
+      "platform": "linux",
+      "status": "expected"
+    },
+    {
+      "oracle": "sfdisk",
+      "platform": "mister-hps",
+      "status": "expected"
+    },
+    {
+      "oracle": "diskutil",
+      "platform": "macos",
+      "status": "expected"
+    },
+    {
+      "oracle": "diskutil",
+      "platform": "linux",
+      "status": "absent"
+    },
+    {
+      "oracle": "diskutil",
+      "platform": "windows",
+      "status": "absent"
+    }
+  ],
+  "verifications": [
+    {
+      "oracle": "qemu-img",
+      "format": "fmt.raw",
+      "direction": "write",
+      "strength": "structural",
+      "status": "proven",
+      "evidence": "qemu-img info -> raw"
+    },
+    {
+      "oracle": "qemu-img",
+      "format": "fmt.qcow2",
+      "direction": "write",
+      "strength": "structural",
+      "status": "proven",
+      "evidence": "qemu-img check -> clean"
+    },
+    {
+      "oracle": "qemu-img",
+      "format": "fmt.vhd-dynamic",
+      "direction": "write",
+      "strength": "structural",
+      "status": "proven",
+      "evidence": "qemu-img info -> vpc"
+    },
+    {
+      "oracle": "qemu-img",
+      "format": "fmt.vhd-fixed",
+      "direction": "write",
+      "strength": "smoke",
+      "status": "proven",
+      "evidence": "qemu-img info -> raw; vpc prober scores below raw, unresolved"
+    },
+    {
+      "oracle": "qemu-img",
+      "format": "fmt.vmdk-flat",
+      "direction": "write",
+      "strength": "structural",
+      "status": "proven",
+      "evidence": "descriptor -> vmdk, extent -> raw"
+    },
+    {
+      "oracle": "qemu-img",
+      "format": "fmt.vmdk-sparse",
+      "direction": "write",
+      "strength": "structural",
+      "status": "proven",
+      "evidence": "qemu-img check -> No errors were found"
+    },
+    {
+      "oracle": "chdman",
+      "format": "fmt.chd",
+      "direction": "write",
+      "strength": "structural",
+      "status": "proven",
+      "evidence": "chdman verify -> Raw SHA1 + Overall SHA1 successful, chdman 0.174 through 0.288"
+    },
+    {
+      "oracle": "chdman",
+      "format": "optical.chdcd",
+      "direction": "write",
+      "strength": "structural",
+      "status": "untested"
+    },
+    {
+      "oracle": "chdman",
+      "format": "fmt.bincue",
+      "direction": "write",
+      "strength": "structural",
+      "status": "untested",
+      "evidence": "chdman createcd round-trip"
+    },
+    {
+      "oracle": "fsck.ext4",
+      "format": "fs.ext2",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "untested"
+    },
+    {
+      "oracle": "fsck.ext4",
+      "format": "fs.ext3",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "untested"
+    },
+    {
+      "oracle": "fsck.ext4",
+      "format": "fs.ext4",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "untested"
+    },
+    {
+      "oracle": "fsck.vfat",
+      "format": "fs.fat12",
+      "direction": "write",
+      "strength": "structural",
+      "status": "untested"
+    },
+    {
+      "oracle": "fsck.vfat",
+      "format": "fs.fat16",
+      "direction": "write",
+      "strength": "structural",
+      "status": "untested"
+    },
+    {
+      "oracle": "fsck.vfat",
+      "format": "fs.fat32",
+      "direction": "write",
+      "strength": "structural",
+      "status": "untested"
+    },
+    {
+      "oracle": "fsck_hfs",
+      "format": "fs.hfs",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "untested"
+    },
+    {
+      "oracle": "fsck_hfs",
+      "format": "fs.hfsplus",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "untested"
+    },
+    {
+      "oracle": "fsck_hfs",
+      "format": "fs.hfv",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "untested"
+    },
+    {
+      "oracle": "fsck_apfs",
+      "format": "fs.apfs",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "untested"
+    },
+    {
+      "oracle": "hdiutil",
+      "format": "fmt.dmg",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "untested"
+    },
+    {
+      "oracle": "hdiutil",
+      "format": "fmt.sparseimage",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "untested"
+    },
+    {
+      "oracle": "hdiutil",
+      "format": "fmt.ndif",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "untested"
+    },
+    {
+      "oracle": "ghostexp",
+      "format": "fmt.gho",
+      "direction": "read",
+      "strength": "authoritative",
+      "status": "untested"
+    },
+    {
+      "oracle": "unsquashfs",
+      "format": "fs.squashfs",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "untested"
+    },
+    {
+      "oracle": "xfs_repair",
+      "format": "fs.xfs",
+      "direction": "write",
+      "strength": "structural",
+      "status": "untested"
+    },
+    {
+      "oracle": "jfs_fsck",
+      "format": "fs.jfs",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "untested"
+    },
+    {
+      "oracle": "fsck.minix",
+      "format": "fs.minix1",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "untested"
+    },
+    {
+      "oracle": "fsck.minix",
+      "format": "fs.minix2",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "untested"
+    },
+    {
+      "oracle": "fsck.minix",
+      "format": "fs.minix3",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "untested"
+    },
+    {
+      "oracle": "mount-affs",
+      "format": "fs.affs",
+      "direction": "write",
+      "strength": "structural",
+      "status": "untested"
+    },
+    {
+      "oracle": "cpmtools",
+      "format": "fs.cpm",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "untested"
+    },
+    {
+      "oracle": "7z",
+      "format": "fmt.zip-disk",
+      "direction": "write",
+      "strength": "structural",
+      "status": "untested"
+    },
+    {
+      "oracle": "iris",
+      "format": "fs.efs",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "plausible",
+      "evidence": "IRIX 6.5 image reads OK; boot not yet wired"
+    },
+    {
+      "oracle": "iris",
+      "format": "fs.xfs",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "plausible",
+      "evidence": "IRIX 6.5 mounts both XFS and EFS"
+    },
+    {
+      "oracle": "iris",
+      "format": "part.sgi",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "plausible"
+    },
+    {
+      "oracle": "iris",
+      "format": "optical.efs",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "plausible",
+      "evidence": "IRIX mounts an EFS CD natively"
+    },
+    {
+      "oracle": "fs-uae",
+      "format": "fs.pfs3",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "plausible",
+      "evidence": "Workbench 1.3/2.1 RDB+PFS disks on the MiSTer, 960 MB each"
+    },
+    {
+      "oracle": "fs-uae",
+      "format": "fs.affs",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "plausible"
+    },
+    {
+      "oracle": "fs-uae",
+      "format": "part.rdb",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "plausible"
+    },
+    {
+      "oracle": "86box-os2",
+      "format": "fs.hpfs",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "plausible"
+    },
+    {
+      "oracle": "mister-core-amiga",
+      "format": "fs.affs",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "plausible"
+    },
+    {
+      "oracle": "mister-core-amiga",
+      "format": "fs.pfs3",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "plausible"
+    },
+    {
+      "oracle": "mister-core-amiga",
+      "format": "fs.sfs",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "plausible",
+      "evidence": "needs the SFS handler installed in the guest"
+    },
+    {
+      "oracle": "mister-core-amiga",
+      "format": "part.rdb",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "plausible"
+    },
+    {
+      "oracle": "mister-core-x68000",
+      "format": "fs.human68k",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "plausible"
+    },
+    {
+      "oracle": "mister-core-x68000",
+      "format": "fmt.d88",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "plausible"
+    },
+    {
+      "oracle": "mister-core-x68000",
+      "format": "part.x68k",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "plausible"
+    },
+    {
+      "oracle": "mister-core-x68000",
+      "format": "fmt.xdf",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "plausible"
+    },
+    {
+      "oracle": "mister-core-x68000",
+      "format": "fmt.x68k-hdd",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "plausible"
+    },
+    {
+      "oracle": "mister-core-atarist",
+      "format": "part.ahdi",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "plausible"
+    },
+    {
+      "oracle": "mister-core-atarist",
+      "format": "fs.atarist",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "plausible"
+    },
+    {
+      "oracle": "mister-core-atarist",
+      "format": "fmt.msa",
+      "direction": "read",
+      "strength": "authoritative",
+      "status": "plausible"
+    },
+    {
+      "oracle": "mister-core-appleii",
+      "format": "fs.prodos",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "plausible"
+    },
+    {
+      "oracle": "mister-core-appleii",
+      "format": "fs.apple-dos",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "plausible"
+    },
+    {
+      "oracle": "mister-core-appleii",
+      "format": "fs.ucsd",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "plausible"
+    },
+    {
+      "oracle": "snow",
+      "format": "fs.mfs",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "plausible",
+      "evidence": "Mac Plus profile; MFS is the pre-HFS 400/800K format"
+    },
+    {
+      "oracle": "snow",
+      "format": "fs.hfs",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "plausible"
+    },
+    {
+      "oracle": "full-cycle-boot",
+      "format": "fmt.cbk",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "plausible",
+      "evidence": "we are the oracle; assertion is 'the restored machine still boots'"
+    },
+    {
+      "oracle": "full-cycle-boot",
+      "format": "fmt.raw-physical",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "plausible",
+      "evidence": "restoring to an SD card and booting it is the only real proof of the device write path"
+    },
+    {
+      "oracle": "zstd-t",
+      "format": "fmt.zstd",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "untested"
+    },
+    {
+      "oracle": "gzip-t",
+      "format": "fmt.gzip",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "untested"
+    },
+    {
+      "oracle": "gzip-t",
+      "format": "fmt.adz",
+      "direction": "read",
+      "strength": "authoritative",
+      "status": "untested"
+    },
+    {
+      "oracle": "lz4-t",
+      "format": "fmt.lz4",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "untested"
+    },
+    {
+      "oracle": "applecommander",
+      "format": "fmt.2mg",
+      "direction": "write",
+      "strength": "structural",
+      "status": "untested"
+    },
+    {
+      "oracle": "applecommander",
+      "format": "fmt.apple-dsk",
+      "direction": "read",
+      "strength": "structural",
+      "status": "untested"
+    },
+    {
+      "oracle": "applecommander",
+      "format": "fs.prodos",
+      "direction": "write",
+      "strength": "structural",
+      "status": "untested"
+    },
+    {
+      "oracle": "applecommander",
+      "format": "fs.apple-dos",
+      "direction": "write",
+      "strength": "structural",
+      "status": "untested"
+    },
+    {
+      "oracle": "applesauce",
+      "format": "fmt.woz",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "untested"
+    },
+    {
+      "oracle": "applesauce",
+      "format": "fmt.moof",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "untested"
+    },
+    {
+      "oracle": "applesauce",
+      "format": "fmt.dc42",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "untested"
+    },
+    {
+      "oracle": "mame-pc98",
+      "format": "fmt.hdm",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "plausible"
+    },
+    {
+      "oracle": "mame-pc98",
+      "format": "fmt.dim",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "plausible"
+    },
+    {
+      "oracle": "mister-core-atari800",
+      "format": "fs.atari-dos2",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "plausible"
+    },
+    {
+      "oracle": "mister-core-atari800",
+      "format": "fmt.atari-disk",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "plausible"
+    },
+    {
+      "oracle": "mister-core-ti99",
+      "format": "fs.ti99",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "plausible"
+    },
+    {
+      "oracle": "mister-core-ti99",
+      "format": "fmt.ti99-disk",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "plausible"
+    },
+    {
+      "oracle": "mister-core-oric",
+      "format": "fs.oric",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "plausible"
+    },
+    {
+      "oracle": "mister-core-spectrum",
+      "format": "fs.trdos",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "plausible"
+    },
+    {
+      "oracle": "mister-core-spectrum",
+      "format": "fmt.trdos-disk",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "plausible"
+    },
+    {
+      "oracle": "mister-core-coco",
+      "format": "fs.os9",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "plausible"
+    },
+    {
+      "oracle": "mister-core-coco",
+      "format": "fs.rsdos",
+      "direction": "read",
+      "strength": "authoritative",
+      "status": "plausible"
+    },
+    {
+      "oracle": "mister-core-coco",
+      "format": "fmt.coco-disk",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "plausible"
+    },
+    {
+      "oracle": "mister-core-archie",
+      "format": "fs.adfs",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "plausible"
+    },
+    {
+      "oracle": "mister-core-bbcmicro",
+      "format": "fs.dfs",
+      "direction": "read",
+      "strength": "authoritative",
+      "status": "plausible"
+    },
+    {
+      "oracle": "mister-core-bbcmicro",
+      "format": "fmt.acorn-dfs-disk",
+      "direction": "read",
+      "strength": "authoritative",
+      "status": "plausible"
+    },
+    {
+      "oracle": "mister-core-lisa",
+      "format": "fs.lisa",
+      "direction": "read",
+      "strength": "authoritative",
+      "status": "plausible"
+    },
+    {
+      "oracle": "chkdsk",
+      "format": "fs.ntfs",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "untested"
+    },
+    {
+      "oracle": "mount-ntfs3",
+      "format": "fs.ntfs",
+      "direction": "write",
+      "strength": "structural",
+      "status": "untested"
+    },
+    {
+      "oracle": "sfdisk",
+      "format": "part.mbr",
+      "direction": "write",
+      "strength": "structural",
+      "status": "untested"
+    },
+    {
+      "oracle": "sfdisk",
+      "format": "part.gpt",
+      "direction": "write",
+      "strength": "structural",
+      "status": "untested"
+    },
+    {
+      "oracle": "sfdisk",
+      "format": "part.sun",
+      "direction": "read",
+      "strength": "structural",
+      "status": "untested"
+    },
+    {
+      "oracle": "diskutil",
+      "format": "part.apm",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "untested"
+    },
+    {
+      "oracle": "diskutil",
+      "format": "part.gpt",
+      "direction": "write",
+      "strength": "structural",
+      "status": "untested"
+    }
+  ],
+  "hosts": [
+    {
+      "id": "local",
+      "platform": "windows",
+      "transport": "local",
+      "can_produce": true,
+      "can_verify": true,
+      "notes": "Development box. Uniquely holds ghostexp (GHO) and chkdsk."
+    },
+    {
+      "id": "wsl",
+      "platform": "wsl",
+      "transport": "wsl",
+      "can_produce": false,
+      "can_verify": true,
+      "notes": "Ubuntu 24.04. Lighter than a real Linux box - no hfs, affs, minix, jfs or ntfs3 mounts."
+    },
+    {
+      "id": "linuxbox",
+      "platform": "linux",
+      "transport": "ssh",
+      "can_produce": true,
+      "can_verify": true,
+      "notes": "Needs linux-modules-extra for the hfs/hfsplus/affs/minix/jfs/ntfs3/ufs/efs mounts."
+    },
+    {
+      "id": "mac",
+      "platform": "macos",
+      "transport": "ssh",
+      "can_produce": true,
+      "can_verify": true,
+      "notes": "Not optional: fsck_hfs, fsck_apfs and hdiutil exist nowhere else."
+    },
+    {
+      "id": "mister-hps",
+      "platform": "mister-hps",
+      "transport": "ssh",
+      "can_produce": true,
+      "can_verify": true,
+      "notes": "ARM Linux side. rb-cli already deployed at /media/fat/Scripts/rb-cli. Also the transport for core-side jobs."
+    },
+    {
+      "id": "mister-core",
+      "platform": "mister-core",
+      "transport": "ssh",
+      "can_produce": false,
+      "can_verify": true,
+      "notes": "The FPGA cores. Reached via the HPS. Authoritative for Amiga, X68000 and Atari ST formats."
+    }
+  ],
+  "fixtures": [
+    {
+      "id": "fmt.adf.amiga-dd.floppy",
+      "relpath": "fmt.adf.amiga-dd.floppy.adf",
+      "bytes": 901120,
+      "sha256": "6378aaca0fe9792cecd3d22cb59f6dacf117dfffdee49a76f2cf2553178840d5",
+      "origin": "harvested-verified",
+      "redistributable": "unknown",
+      "location": "corpus",
+      "formats": [
+        "fmt.adf"
+      ],
+      "notes": "verified: rb-cli inspect opens it"
+    },
+    {
+      "id": "fmt.adf.bootblock-ndos.floppy",
+      "relpath": "fmt.adf.bootblock-ndos.floppy.adf",
+      "bytes": 11264,
+      "sha256": "a4a06bbdc51163bbabe93940f05b8685a97dedb62b263abc0affd0b3f77faf0f",
+      "origin": "harvested-verified",
+      "redistributable": "unknown",
+      "location": "corpus",
+      "formats": [
+        "fmt.adf"
+      ],
+      "notes": "verified: rb-cli inspect opens it"
+    },
+    {
+      "id": "fmt.altodisk.johnsson-dp0.hd",
+      "relpath": "fmt.altodisk.johnsson-dp0.hd.altodisk",
+      "bytes": 2592466,
+      "sha256": "15ccbb445b763972248dfa0ff7cbd34f132793a73cad8976c8557dda0327b0dd",
+      "origin": "harvested-parc-zip",
+      "redistributable": "unknown",
+      "location": "corpus",
+      "formats": [
+        "fmt.altodisk"
+      ],
+      "notes": "Alto BFS from PARC-Stuff.zip"
+    },
+    {
+      "id": "fmt.dmg.base.hd",
+      "relpath": "fmt.dmg.base.hd.dmg",
+      "bytes": 899075,
+      "sha256": "bf9dfb0d586f2c1ddff2c39900c0d2c0fa6eee156a74aaf4dc2c1cb552f8bab5",
+      "origin": "harvested-verified",
+      "redistributable": "unknown",
+      "location": "corpus",
+      "formats": [
+        "fmt.dmg"
+      ],
+      "notes": "verified: rb-cli inspect opens it"
+    },
+    {
+      "id": "fmt.g64.gcr.floppy",
+      "relpath": "fmt.g64.gcr.floppy.g64",
+      "bytes": 278234,
+      "sha256": "815a67b6a5bcce364369c1844181adccbd1cd2e9fb30114fb003c20c888e4ce9",
+      "origin": "harvested-verified",
+      "redistributable": "unknown",
+      "location": "corpus",
+      "formats": [
+        "fmt.g64"
+      ],
+      "notes": "verified: rb-cli inspect opens it"
+    },
+    {
+      "id": "fmt.gho.password.hd",
+      "relpath": "fmt.gho.password.hd.gho.zst",
+      "bytes": 281525,
+      "sha256": "483539a80af501ecff70447b58de2c0600327c66c88f9923cc4cf3aff9d7290e",
+      "origin": "mirrored-from-repo",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "fmt.gho"
+      ]
+    },
+    {
+      "id": "fmt.gho.uncompressed.hd",
+      "relpath": "fmt.gho.uncompressed.hd.gho.zst",
+      "bytes": 242379,
+      "sha256": "2752147dfb1d23a4ba17e3b4b368d29f39b71af1ca622a6274cdc6abad122d61",
+      "origin": "mirrored-from-repo",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "fmt.gho"
+      ]
+    },
+    {
+      "id": "fmt.msa.base.floppy",
+      "relpath": "fmt.msa.base.floppy.msa.zst",
+      "bytes": 364,
+      "sha256": "7a4b455fe2d6eebe695ddc411e9c8efe45c1e9a4fc941c843d22f2a7bfa802c7",
+      "origin": "mirrored-from-repo",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "fmt.msa"
+      ]
+    },
+    {
+      "id": "fmt.woz.blank-140k.floppy",
+      "relpath": "fmt.woz.blank-140k.floppy.woz",
+      "bytes": 234496,
+      "sha256": "e2e1b338285772a17ebe2c18cd87b9c0444ab41cfc4e82228b48f883ac2fe9bc",
+      "origin": "harvested-verified",
+      "redistributable": "unknown",
+      "location": "corpus",
+      "formats": [
+        "fmt.woz"
+      ],
+      "notes": "verified: rb-cli inspect opens it"
+    },
+    {
+      "id": "fmt.xerox-d0.cardtester.hd",
+      "relpath": "fmt.xerox-d0.cardtester.hd.disk",
+      "bytes": 2490578,
+      "sha256": "2d2830eda4694ec3c29affa6bcd984c9a5c85226bd2eb283770b412bc0a6418e",
+      "origin": "harvested-parc-zip",
+      "redistributable": "unknown",
+      "location": "corpus",
+      "formats": [
+        "fmt.xerox-d0"
+      ],
+      "notes": "Alto BFS from PARC-Stuff.zip"
+    },
+    {
+      "id": "fs.affs.ffs-intl-cd32.hd",
+      "relpath": "fs.affs.ffs-intl-cd32.hd.hdf",
+      "bytes": 6291456,
+      "sha256": "f9cd7a0351cbdf9e8c5cdc6a8b271605297e06c398ffd44805276a29f0e9f114",
+      "origin": "harvested-mister",
+      "redistributable": "unknown",
+      "location": "corpus",
+      "formats": [
+        "fs.affs"
+      ],
+      "notes": "real AmigaOS volume from the MiSTer"
+    },
+    {
+      "id": "fs.affs.workbench13.hd",
+      "relpath": "fs.affs.workbench13.hd.hdf",
+      "bytes": 3145728,
+      "sha256": "a0297f7ddc1f7abd01400ff24b81c5c19d1a1b414f9d0bf490d8ad7d0730eb9e",
+      "origin": "harvested-verified",
+      "redistributable": "unknown",
+      "location": "corpus",
+      "formats": [
+        "fs.affs"
+      ],
+      "notes": "verified: rb-cli inspect opens it"
+    },
+    {
+      "id": "fs.alto-bfs.dorado-unbug.hd",
+      "relpath": "fs.alto-bfs.dorado-unbug.hd.bfs",
+      "bytes": 2289362,
+      "sha256": "ea540db12f49d99f76357ab967a5d1472f2492a32c489d355fefd576d3e3587a",
+      "origin": "harvested-parc-zip",
+      "redistributable": "unknown",
+      "location": "corpus",
+      "formats": [
+        "fs.alto-bfs"
+      ],
+      "notes": "Alto BFS from PARC-Stuff.zip"
+    },
+    {
+      "id": "fs.alto-bfs.mesa5.hd",
+      "relpath": "fs.alto-bfs.mesa5.hd.bfs",
+      "bytes": 3783954,
+      "sha256": "740f9b92d1b2f1727aff49f8c3fbd6976d63d5324fa72a75108ef0f893130ff8",
+      "origin": "harvested-parc-zip",
+      "redistributable": "unknown",
+      "location": "corpus",
+      "formats": [
+        "fs.alto-bfs"
+      ],
+      "notes": "Alto BFS from PARC-Stuff.zip"
+    },
+    {
+      "id": "fs.apfs.apple-gpt.hd",
+      "relpath": "fs.apfs.apple-gpt.hd.dmg.zip",
+      "bytes": 35761625,
+      "sha256": "bf2e2df5f8ab67e5cd58849f1147efbb718e686bca747c50b43b5e13ff1845d0",
+      "origin": "harvested",
+      "redistributable": "unknown",
+      "location": "corpus",
+      "formats": [
+        "fs.apfs"
+      ],
+      "notes": "verified via rb-cli"
+    },
+    {
+      "id": "fs.apfs.base.hd",
+      "relpath": "fs.apfs.base.hd.img.zst",
+      "bytes": 528451,
+      "sha256": "8d331046f01555fa3ffacd5933d1ff76637d5067e4225ec382f27ca1c60f8544",
+      "origin": "mirrored-from-repo",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "fs.apfs"
+      ]
+    },
+    {
+      "id": "fs.apfs.encrypted.hd",
+      "relpath": "fs.apfs.encrypted.hd.img.zst",
+      "bytes": 258234,
+      "sha256": "7308b487feb2f431aad884f7d8b53556c486a078c7a022a0d7da6252111ba742",
+      "origin": "mirrored-from-repo",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "fs.apfs"
+      ]
+    },
+    {
+      "id": "fs.apple-dos.invaders.floppy",
+      "relpath": "fs.apple-dos.invaders.floppy.dsk",
+      "bytes": 143360,
+      "sha256": "4dfeabafdfe0ef18d42343aac25045f531467f18497382c023a1038d6c759356",
+      "origin": "harvested-verified",
+      "redistributable": "unknown",
+      "location": "corpus",
+      "formats": [
+        "fs.apple-dos"
+      ],
+      "notes": "verified: rb-cli inspect opens it"
+    },
+    {
+      "id": "fs.atari-dos2.base.floppy",
+      "relpath": "fs.atari-dos2.base.floppy.atr.zst",
+      "bytes": 519,
+      "sha256": "5a8d9b1e4adf1a88dee535cbf9aab39e07ed9256008f1f0ec6ff462b3cab6aad",
+      "origin": "mirrored-from-repo",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "fs.atari-dos2"
+      ]
+    },
+    {
+      "id": "fs.atarist.gemdos.floppy",
+      "relpath": "fs.atarist.gemdos.floppy.st.zst",
+      "bytes": 378,
+      "sha256": "8910d4ad4d659a276127256b8af09d9e0d00061f5caf642a602a1387d8c184e2",
+      "origin": "mirrored-from-repo",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "fs.atarist"
+      ]
+    },
+    {
+      "id": "fs.btrfs.base.hd",
+      "relpath": "fs.btrfs.base.hd.img.zst",
+      "bytes": 2780,
+      "sha256": "8b3d52876825b5b491d30e162a9754d8282122c604c2e8da94507e0c5a25f163",
+      "origin": "mirrored-from-repo",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "fs.btrfs"
+      ]
+    },
+    {
+      "id": "fs.cbm.1541.floppy",
+      "relpath": "fs.cbm.1541.floppy.d64.zst",
+      "bytes": 196,
+      "sha256": "a4e86894f81c438928b509fa8c05ccc5fc6ba463bb9a7ad58e0f6d308741dd81",
+      "origin": "mirrored-from-repo",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "fs.cbm"
+      ]
+    },
+    {
+      "id": "fs.cbm.1571-gcr.floppy",
+      "relpath": "fs.cbm.1571-gcr.floppy.g71.zst",
+      "bytes": 12388,
+      "sha256": "f6520bce3f4f9fd76a9d45ad13dac1b536230fdba452de6736fb3bd5ea3acbc3",
+      "origin": "mirrored-from-repo",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "fs.cbm"
+      ]
+    },
+    {
+      "id": "fs.cbm.1581.floppy",
+      "relpath": "fs.cbm.1581.floppy.d81.zst",
+      "bytes": 267,
+      "sha256": "0b0fe23b2bf1c8c82aa3ba44b9acf5407b0ae4e5866b532ea0782eab33a77556",
+      "origin": "mirrored-from-repo",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "fs.cbm"
+      ]
+    },
+    {
+      "id": "fs.cbm.8050.floppy",
+      "relpath": "fs.cbm.8050.floppy.d80.zst",
+      "bytes": 285,
+      "sha256": "99eeb25daa8d3cf67a6f112c48ea00867997696171b55585f3f2ba380a96cbeb",
+      "origin": "mirrored-from-repo",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "fs.cbm"
+      ]
+    },
+    {
+      "id": "fs.cbm.8250.floppy",
+      "relpath": "fs.cbm.8250.floppy.d82.zst",
+      "bytes": 320,
+      "sha256": "0d974a31be3690770edc91a2307433fee9ab6af8c0eabd2355b090f5f5e31231",
+      "origin": "mirrored-from-repo",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "fs.cbm"
+      ]
+    },
+    {
+      "id": "fs.cpc.amsdos.floppy",
+      "relpath": "fs.cpc.amsdos.floppy.dsk.zst",
+      "bytes": 14835,
+      "sha256": "8f99cfd3b88de56d6f769b4ff109aa245e39432396d20423c1846975af7787b6",
+      "origin": "mirrored-from-repo",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "fs.cpc"
+      ]
+    },
+    {
+      "id": "fs.cpm.amstrad-data.floppy",
+      "relpath": "fs.cpm.amstrad-data.floppy.dsk.zst",
+      "bytes": 159,
+      "sha256": "4dcf2acf4516d53131360438e17588638adf75756fc6e7e578096f1798483f12",
+      "origin": "mirrored-from-repo",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "fs.cpm"
+      ]
+    },
+    {
+      "id": "fs.cpm.pcw.floppy",
+      "relpath": "fs.cpm.pcw.floppy.dsk.zst",
+      "bytes": 161,
+      "sha256": "582d6524d534b8af790c2e38128bec827b950df5277c54fb53439e36189d7ae0",
+      "origin": "mirrored-from-repo",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "fs.cpm"
+      ]
+    },
+    {
+      "id": "fs.dfs.base.floppy",
+      "relpath": "fs.dfs.base.floppy.ssd.zst",
+      "bytes": 463,
+      "sha256": "f8db42e15ca8f91a9b117797e4bd2821a8a50e050f8d17ca407b0b6989cdad05",
+      "origin": "mirrored-from-repo",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "fs.dfs"
+      ]
+    },
+    {
+      "id": "fs.dfs.double-sided.floppy",
+      "relpath": "fs.dfs.double-sided.floppy.dsd.zst",
+      "bytes": 489,
+      "sha256": "84e876d8d9552b10896ef45da976aef7e7d287b6d579fc8dda9fba8ee0efeb92",
+      "origin": "mirrored-from-repo",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "fs.dfs"
+      ]
+    },
+    {
+      "id": "fs.dragondos.base.floppy",
+      "relpath": "fs.dragondos.base.floppy.dsk.zst",
+      "bytes": 441,
+      "sha256": "bd3d53778afa90a84318fe6672a012ca452baeb867f3b939f4303f102779a014",
+      "origin": "mirrored-from-repo",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "fs.dragondos"
+      ]
+    },
+    {
+      "id": "fs.efs.small.hd",
+      "relpath": "fs.efs.small.hd.img.zst",
+      "bytes": 557958,
+      "sha256": "40f21c8b9364789fbec8a126c6e1e3ce8f8f8d2bae223f8b0eaea0546e354502",
+      "origin": "mirrored-from-repo",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "fs.efs"
+      ]
+    },
+    {
+      "id": "fs.exfat.base.hd",
+      "relpath": "fs.exfat.base.hd.img.zst",
+      "bytes": 4481,
+      "sha256": "709cb4ae3c7cf196c081e39c9bb32a2f7a984e21b492e7dcef9fccd7bdb81e6f",
+      "origin": "mirrored-from-repo",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "fs.exfat"
+      ]
+    },
+    {
+      "id": "fs.ext2.base.hd",
+      "relpath": "fs.ext2.base.hd.img.zst",
+      "bytes": 619,
+      "sha256": "10c73dd89242f2c3d3773d61941e09957d90f6653ac9c3d95be37602452dc34b",
+      "origin": "mirrored-from-repo",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "fs.ext2"
+      ]
+    },
+    {
+      "id": "fs.ext4.base.hd",
+      "relpath": "fs.ext4.base.hd.img.zst",
+      "bytes": 1275,
+      "sha256": "fe2beebb115715ff1cd6321283317ebd2076cf9f9b90dd839483459f7ac94931",
+      "origin": "mirrored-from-repo",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "fs.ext4"
+      ]
+    },
+    {
+      "id": "fs.fat12.base.floppy",
+      "relpath": "fs.fat12.base.floppy.img.zst",
+      "bytes": 356,
+      "sha256": "5a6a0ddd87c100da2da0be3c82ca8011ca98a7ca66b6dd35fad13157fe8683e5",
+      "origin": "mirrored-from-repo",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "fs.fat12"
+      ]
+    },
+    {
+      "id": "fs.fat12.freedos.superfloppy",
+      "relpath": "fs.fat12.freedos.superfloppy.img.zst",
+      "bytes": 1007702,
+      "sha256": "5aa4dd1dcaa95453831566aff24dafb5b33a6af36c922bb198cc5acd99268cd0",
+      "origin": "mirrored-from-repo",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "fs.fat12"
+      ]
+    },
+    {
+      "id": "fs.fat16.base.hd",
+      "relpath": "fs.fat16.base.hd.img.zst",
+      "bytes": 842,
+      "sha256": "a9b2d602d90688ab8c223b7d2cbd9aee8d6c45a78dc24662d58c14367a2ff991",
+      "origin": "mirrored-from-repo",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "fs.fat16"
+      ]
+    },
+    {
+      "id": "fs.fat32.base.hd",
+      "relpath": "fs.fat32.base.hd.img.zst",
+      "bytes": 930,
+      "sha256": "72f8ac36280cee038ab35aa684d23762bc81543bb659152fb9b0f32482d11717",
+      "origin": "mirrored-from-repo",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "fs.fat32"
+      ]
+    },
+    {
+      "id": "fs.hfs.base.floppy",
+      "relpath": "fs.hfs.base.floppy.img.zst",
+      "bytes": 411,
+      "sha256": "6a64376f8727c5a1eaf7a613464323d847df3aaabbe7201f708656791a1e5aed",
+      "origin": "mirrored-from-repo",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "fs.hfs"
+      ]
+    },
+    {
+      "id": "fs.hfs.populated-macii.hd",
+      "relpath": "fs.hfs.populated-macii.hd.hda",
+      "bytes": 21020672,
+      "sha256": "ba627e9bdb9f9addc64432f9427413eba34cc241ae4200827badb3fb0d18f151",
+      "origin": "harvested-vintagebackups",
+      "redistributable": "unknown",
+      "location": "corpus",
+      "formats": [
+        "fs.hfs"
+      ],
+      "notes": "populated real system disk for edit testing"
+    },
+    {
+      "id": "fs.hfsplus.base.hd",
+      "relpath": "fs.hfsplus.base.hd.img.zst",
+      "bytes": 1335,
+      "sha256": "c2ae3c6c3f1a3f187258e83c9307e4965430f327ae1d1feb4b0ef51cc8802607",
+      "origin": "mirrored-from-repo",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "fs.hfsplus"
+      ]
+    },
+    {
+      "id": "fs.hfsplus.journal-dirty.hd",
+      "relpath": "fs.hfsplus.journal-dirty.hd.img.zst",
+      "bytes": 1877,
+      "sha256": "629cd924426542b4edc0decb274cf8e9a10582395b24c03b67e7572c102b1d9a",
+      "origin": "mirrored-from-repo",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "fs.hfsplus"
+      ]
+    },
+    {
+      "id": "fs.hfsplus.journalled.hd",
+      "relpath": "fs.hfsplus.journalled.hd.img.zst",
+      "bytes": 1801,
+      "sha256": "10d0d769b36f440c3369adf9b99077430f658165598ef791987b8fe714241953",
+      "origin": "mirrored-from-repo",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "fs.hfsplus"
+      ]
+    },
+    {
+      "id": "fs.hfv.populated-macos81.hd",
+      "relpath": "../fixtures-large/fs.hfv.populated-macos81.hd.hfv",
+      "bytes": 314572800,
+      "sha256": "a85f25f3c1b3c8183ab1be3fde690d24b9541178daaceba0331b55ca9d65a443",
+      "origin": "harvested-vintagebackups",
+      "redistributable": "unknown",
+      "location": "annex",
+      "formats": [
+        "fs.hfv"
+      ],
+      "notes": "populated real system disk for edit testing"
+    },
+    {
+      "id": "fs.human68k.2dd.floppy",
+      "relpath": "fs.human68k.2dd.floppy.d88.zst",
+      "bytes": 3500,
+      "sha256": "a024e2a6d2eb944fc545c84ae8640665bd297b20b4e6c5eff58d15cbe3d5dda8",
+      "origin": "mirrored-from-repo",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "fs.human68k"
+      ]
+    },
+    {
+      "id": "fs.human68k.x68k-game",
+      "relpath": "fs.human68k.x68k-game.d88",
+      "bytes": 1267888,
+      "sha256": "83b0d9a30aaf7ac4511cb674b68d586ab43c63c5e57d9c9b10c214081283b1b7",
+      "origin": "harvested-verified",
+      "redistributable": "unknown",
+      "location": "corpus",
+      "formats": [
+        "fs.human68k"
+      ],
+      "notes": "verified: rb-cli inspect opens it"
+    },
+    {
+      "id": "fs.jfs.base.hd",
+      "relpath": "fs.jfs.base.hd.img.zst",
+      "bytes": 27339,
+      "sha256": "e89cafc004ece6676a854dcdfce594bc2f630825c6859d67c421774af38ba136",
+      "origin": "mirrored-from-repo",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "fs.jfs"
+      ]
+    },
+    {
+      "id": "fs.lisa.los31-blank.floppy",
+      "relpath": "fs.lisa.los31-blank.floppy.image",
+      "bytes": 419284,
+      "sha256": "6f9b948a3bc67702d063f80ba2bc38a37be33fa52576fb2eeb29db4e941d78a1",
+      "origin": "harvested-bmow-zip",
+      "redistributable": "unknown",
+      "location": "corpus",
+      "formats": [
+        "fs.lisa"
+      ],
+      "notes": "from BMOW.zip Lisa stuff"
+    },
+    {
+      "id": "fs.lisa.office31-d1.floppy",
+      "relpath": "fs.lisa.office31-d1.floppy.image",
+      "bytes": 419284,
+      "sha256": "4ed27f04f6d8bc7bfd5a0b8068237e39f30c0b0218be26fca7d081fbfb898348",
+      "origin": "harvested-bmow-zip",
+      "redistributable": "unknown",
+      "location": "corpus",
+      "formats": [
+        "fs.lisa"
+      ],
+      "notes": "from BMOW.zip Lisa stuff"
+    },
+    {
+      "id": "fs.ntfs.base.hd",
+      "relpath": "fs.ntfs.base.hd.img.zst",
+      "bytes": 127297,
+      "sha256": "f4f1c4922e5f9ad03634dada0a790ea1ec7c29f10126e45715d837f0e61b19d9",
+      "origin": "mirrored-from-repo",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "fs.ntfs"
+      ]
+    },
+    {
+      "id": "fs.os9.l2.floppy",
+      "relpath": "fs.os9.l2.floppy.dsk.zst",
+      "bytes": 73297,
+      "sha256": "90fbc97c1a0d13e0b1f5984236ba61ddc14954f39573849d97c03c4ea012e4aa",
+      "origin": "mirrored-from-repo",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "fs.os9"
+      ]
+    },
+    {
+      "id": "fs.pfs3.rdb-cd32saves.hd",
+      "relpath": "fs.pfs3.rdb-cd32saves.hd.hdf",
+      "bytes": 83994624,
+      "sha256": "eb2da42edd614c2fbe5fdb907cea4757b144483c18ed3c1a45e0c3f1150da19e",
+      "origin": "harvested-mister",
+      "redistributable": "unknown",
+      "location": "corpus",
+      "formats": [
+        "fs.pfs3"
+      ],
+      "notes": "real AmigaOS volume from the MiSTer"
+    },
+    {
+      "id": "fs.prodos.base.hd",
+      "relpath": "fs.prodos.base.hd.hdv.zst",
+      "bytes": 59718,
+      "sha256": "e49e2039883a266a8ebff6794ea0fa4d03d9d1b7f1e6728967102a5c036afa5e",
+      "origin": "mirrored-from-repo",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "fs.prodos"
+      ]
+    },
+    {
+      "id": "fs.qdos.microdrive.mdv",
+      "relpath": "fs.qdos.microdrive.mdv.mdv.zst",
+      "bytes": 54566,
+      "sha256": "9b19d33dacb4f6b4a370f5554c04a012ad3fabd553d8ba6f345cb558fc7d1a29",
+      "origin": "mirrored-from-repo",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "fs.qdos"
+      ]
+    },
+    {
+      "id": "fs.reiserfs.v3-6.hd",
+      "relpath": "fs.reiserfs.v3-6.hd.img.zst",
+      "bytes": 3724,
+      "sha256": "fe8b6337cd48f7b0f24ef840c357e9b33422100db925acee53fcb17bd324178f",
+      "origin": "mirrored-from-repo",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "fs.reiserfs"
+      ]
+    },
+    {
+      "id": "fs.rsdos.base.floppy",
+      "relpath": "fs.rsdos.base.floppy.dsk.zst",
+      "bytes": 381,
+      "sha256": "705212011edce8acac62bb5dab1a04908ca0f74f554ce70a24ffc860b3205129",
+      "origin": "mirrored-from-repo",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "fs.rsdos"
+      ]
+    },
+    {
+      "id": "fs.ufs1.base.hd",
+      "relpath": "fs.ufs1.base.hd.img.zst",
+      "bytes": 1349,
+      "sha256": "9091348010964b977ffa10c73812401f187aa81d6970e22847f55b0e495d6a49",
+      "origin": "mirrored-from-repo",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "fs.ufs1"
+      ]
+    },
+    {
+      "id": "fs.ufs2.base.hd",
+      "relpath": "fs.ufs2.base.hd.img.zst",
+      "bytes": 1495,
+      "sha256": "18f183130758e52fa77226032540a36dead36167ad4a95002549187969736a3d",
+      "origin": "mirrored-from-repo",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "fs.ufs2"
+      ]
+    },
+    {
+      "id": "fs.xfs.v4.hd",
+      "relpath": "fs.xfs.v4.hd.img.zst",
+      "bytes": 17509,
+      "sha256": "13392407a9cfa7d0b07ac8e0b42594483c506e69c561c446db584169acb31d1c",
+      "origin": "mirrored-from-repo",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "fs.xfs"
+      ]
+    },
+    {
+      "id": "fs.xfs.v5.hd",
+      "relpath": "fs.xfs.v5.hd.img.zst",
+      "bytes": 18086,
+      "sha256": "8a8bae9cd9b63c0899323867ca8dd0693c7d983cd1bd76f933cb954cff377eec",
+      "origin": "mirrored-from-repo",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "fs.xfs"
+      ]
+    },
+    {
+      "id": "optical.3do-opera.puttputt.cd",
+      "relpath": "optical.3do-opera.puttputt.cd.chd",
+      "bytes": 11343237,
+      "sha256": "92aa8f2c01a529ad5e9246cf65a884d6fea5a78bddd07fc58b4485a6edb20039",
+      "origin": "harvested",
+      "redistributable": "unknown",
+      "location": "corpus",
+      "formats": [
+        "optical.3do-opera"
+      ],
+      "notes": "verified via rb-cli"
+    },
+    {
+      "id": "optical.cdda.mixedmode.cd",
+      "relpath": "optical.cdda.mixedmode.cd/mixedmode-both.cue",
+      "bytes": 154,
+      "sha256": "ed206dceda21b80449e717f8ee575e53bc1b60815e79f8f2111f60731dbd20fc",
+      "origin": "harvested",
+      "redistributable": "unknown",
+      "location": "corpus",
+      "formats": [
+        "optical.cdda"
+      ],
+      "notes": "verified via rb-cli"
+    },
+    {
+      "id": "optical.cdi.hieroglyph.cd",
+      "relpath": "optical.cdi.hieroglyph.cd.chd",
+      "bytes": 3743092,
+      "sha256": "c16562bd7386b75cf441d429ec661950d7a267288070c287d034d14536b6cd5c",
+      "origin": "harvested",
+      "redistributable": "unknown",
+      "location": "corpus",
+      "formats": [
+        "optical.cdi"
+      ],
+      "notes": "verified via rb-cli"
+    },
+    {
+      "id": "optical.chdcd.audio-test.cd",
+      "relpath": "optical.chdcd.audio-test.cd.chd",
+      "bytes": 19378947,
+      "sha256": "86c717d64813d32ea7572b6cba52954b7f3c6a9b346fa50ea8249de8bed355e4",
+      "origin": "harvested",
+      "redistributable": "unknown",
+      "location": "corpus",
+      "formats": [
+        "optical.chdcd"
+      ],
+      "notes": "verified via rb-cli"
+    },
+    {
+      "id": "optical.efs.irix-scsitb.cd",
+      "relpath": "optical.efs.irix-scsitb.cd.iso",
+      "bytes": 8388608,
+      "sha256": "241143f772fe6f1ae9142e1c96d610c31bb2e5fed3d4d7382a4b66050203a21f",
+      "origin": "harvested",
+      "redistributable": "unknown",
+      "location": "corpus",
+      "formats": [
+        "optical.efs"
+      ],
+      "notes": "verified via rb-cli"
+    },
+    {
+      "id": "optical.gamecube.druaga.cd",
+      "relpath": "optical.gamecube.druaga.cd.iso",
+      "bytes": 425984,
+      "sha256": "ad4365014b1ad0f4b7b8c4b75da6d568481d1c388d51ae66b664adb8f38baef0",
+      "origin": "harvested",
+      "redistributable": "unknown",
+      "location": "corpus",
+      "formats": [
+        "optical.gamecube"
+      ],
+      "notes": "verified via rb-cli"
+    },
+    {
+      "id": "optical.hfs.opentransport.cd",
+      "relpath": "optical.hfs.opentransport.cd.iso",
+      "bytes": 7112704,
+      "sha256": "8bd23525925fe1bd4027e08be80788ac63d541f0067fb8af27428fb3d98f6795",
+      "origin": "harvested",
+      "redistributable": "unknown",
+      "location": "corpus",
+      "formats": [
+        "optical.hfs"
+      ],
+      "notes": "verified via rb-cli"
+    },
+    {
+      "id": "optical.hfs.stuffit.cd",
+      "relpath": "optical.hfs.stuffit.cd.iso",
+      "bytes": 4059136,
+      "sha256": "13e52cba81f4cd2daca61905ee80af12cf73dbd7e1106324aa71f3f887a7e321",
+      "origin": "harvested",
+      "redistributable": "unknown",
+      "location": "corpus",
+      "formats": [
+        "optical.hfs"
+      ],
+      "notes": "verified via rb-cli"
+    },
+    {
+      "id": "optical.high-sierra.bookshelf.cd",
+      "relpath": "../fixtures-large/optical.high-sierra.bookshelf.cd.iso",
+      "bytes": 333496320,
+      "sha256": "c866d530850e34e2a88f1064b78a528ae4cc57e4694261a38aae527696f6099b",
+      "origin": "harvested",
+      "redistributable": "unknown",
+      "location": "annex",
+      "formats": [
+        "optical.high-sierra"
+      ],
+      "notes": "verified via rb-cli"
+    },
+    {
+      "id": "optical.iso9660.hybrid-rsrc.cd",
+      "relpath": "optical.iso9660.hybrid-rsrc.cd.iso.zst",
+      "bytes": 1175,
+      "sha256": "5bf54d308665af45d2a3a0507ce01692ae2fd558bd6385fab2d765fdcfd65141",
+      "origin": "harvested",
+      "redistributable": "unknown",
+      "location": "corpus",
+      "formats": [
+        "optical.iso9660"
+      ],
+      "notes": "verified via rb-cli"
+    },
+    {
+      "id": "optical.iso9660.joliet.cd",
+      "relpath": "optical.iso9660.joliet.cd.iso",
+      "bytes": 999424,
+      "sha256": "e2513d4091c333d78c3354856dac5f8b4ae04168b2dab6a53c9b8c1912a5703f",
+      "origin": "harvested",
+      "redistributable": "unknown",
+      "location": "corpus",
+      "formats": [
+        "optical.iso9660"
+      ],
+      "notes": "verified via rb-cli"
+    },
+    {
+      "id": "optical.udf.dvd-video.cd",
+      "relpath": "../fixtures-large/optical.udf.dvd-video.cd.iso",
+      "bytes": 506660864,
+      "sha256": "7eb096ffdb7b9b2491332c51eef7302775867d1e62b4767e824668f0561d56b3",
+      "origin": "harvested",
+      "redistributable": "unknown",
+      "location": "annex",
+      "formats": [
+        "optical.udf"
+      ],
+      "notes": "verified via rb-cli"
+    },
+    {
+      "id": "optical.ufs.nextstep33.cd",
+      "relpath": "../fixtures-large/optical.ufs.nextstep33.cd.iso",
+      "bytes": 373768192,
+      "sha256": "3525538bdbab5b56c5a6fd4abb1570f1ee28ac7942b447ae6be76ed8643d4013",
+      "origin": "harvested",
+      "redistributable": "unknown",
+      "location": "annex",
+      "formats": [
+        "optical.ufs"
+      ],
+      "notes": "verified via rb-cli"
+    },
+    {
+      "id": "part.ahdi.base.multipart",
+      "relpath": "part.ahdi.base.multipart.img.zst",
+      "bytes": 1593,
+      "sha256": "b81cab10ad32dd7cfcdd1cfe58effa1551549603febb5ab8fc18ea6821184b5b",
+      "origin": "mirrored-from-repo",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "part.ahdi"
+      ]
+    },
+    {
+      "id": "part.sun.solaris-disk.multipart",
+      "relpath": "../fixtures-large/part.sun.solaris-disk.multipart.qcow2",
+      "bytes": 1644560384,
+      "sha256": "bd38374ae7c26d9af1e21b4ecab6928d5ef013a34ded03c479bf064b100873b3",
+      "origin": "mirrored-from-repo",
+      "redistributable": "yes",
+      "location": "annex",
+      "formats": [
+        "part.sun"
+      ]
+    }
+  ]
+}

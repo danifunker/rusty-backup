@@ -1,0 +1,31 @@
+[package]
+name = "rb-regress"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0"
+description = "Cross-platform regression harness for the rb-cli disk-image engine"
+publish = false
+
+# Deliberately pinned to the same floor as the engine (CLAUDE.md: "Engine code
+# must compile on Rust 1.73"). The harness itself will need to build for the
+# vintage and PPC hosts once PLAN.md phase 11 starts, and discovering that
+# eighteen months of harness code uses newer std APIs would be an unpleasant
+# surprise. Keep the dependency list short for the same reason.
+rust-version = "1.73"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+# stdout_matches assertions; pure Rust, no build script.
+regex = "1"
+# file_sha256 assertions and fixture integrity checks.
+sha2 = "0.10"
+# Fixtures are stored zstd-compressed (a 4 MB corpus decompresses to far more),
+# and rb-cli does not open .zst in place. Decompressing in-process keeps the
+# harness free of an external `zstd` binary. Version matches the engine's.
+zstd = "0.13"
+
+[profile.release]
+# The harness is I/O bound on subprocess execution; optimise for build time.
+opt-level = 1

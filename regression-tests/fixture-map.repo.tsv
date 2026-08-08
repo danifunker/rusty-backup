@@ -1,0 +1,46 @@
+id	relpath	bytes	sha256	inner_sha256	origin	redistributable	minimised	notes
+fs.fat12.base.floppy	repo:tests/fixtures/test_fat12.img.zst	356	5a6a0ddd87c100da2da0be3c82ca8011ca98a7ca66b6dd35fad13157fe8683e5		committed-in-repo	yes	synthetic-minimal	canonical five-file payload
+fs.fat16.base.hd	repo:tests/fixtures/test_fat16.img.zst	842	a9b2d602d90688ab8c223b7d2cbd9aee8d6c45a78dc24662d58c14367a2ff991		committed-in-repo	yes	synthetic-minimal	
+fs.fat32.base.hd	repo:tests/fixtures/test_fat32.img.zst	930	72f8ac36280cee038ab35aa684d23762bc81543bb659152fb9b0f32482d11717		committed-in-repo	yes	synthetic-minimal	
+fs.fat12.freedos.superfloppy	repo:tests/fixtures/test_fat12_freedos_superfloppy.img.zst	1007702	5aa4dd1dcaa95453831566aff24dafb5b33a6af36c922bb198cc5acd99268cd0		committed-in-repo	yes	synthetic-minimal	real FreeDOS superfloppy
+fs.exfat.base.hd	repo:tests/fixtures/test_exfat.img.zst	4481	709cb4ae3c7cf196c081e39c9bb32a2f7a984e21b492e7dcef9fccd7bdb81e6f		committed-in-repo	yes	synthetic-minimal	not synthesizable: no exFAT builder
+fs.ntfs.base.hd	repo:tests/fixtures/test_ntfs.img.zst	127297	f4f1c4922e5f9ad03634dada0a790ea1ec7c29f10126e45715d837f0e61b19d9		committed-in-repo	yes	synthetic-minimal	
+fs.hfs.base.floppy	repo:tests/fixtures/test_hfs.img.zst	411	6a64376f8727c5a1eaf7a613464323d847df3aaabbe7201f708656791a1e5aed		committed-in-repo	yes	synthetic-minimal	
+fs.hfsplus.base.hd	repo:tests/fixtures/test_hfsplus.img.zst	1335	c2ae3c6c3f1a3f187258e83c9307e4965430f327ae1d1feb4b0ef51cc8802607		committed-in-repo	yes	synthetic-minimal	
+fs.hfsplus.journalled.hd	repo:tests/fixtures/test_hfsplus_journaled_clean.img.zst	1801	10d0d769b36f440c3369adf9b99077430f658165598ef791987b8fe714241953		committed-in-repo	yes	synthetic-minimal	clean journal
+fs.hfsplus.journal-dirty.hd	repo:tests/fixtures/test_hfsplus_journaled_dirty.img.zst	1877	629cd924426542b4edc0decb274cf8e9a10582395b24c03b67e7572c102b1d9a		committed-in-repo	yes	synthetic-minimal	dirty journal replay
+fs.apfs.base.hd	repo:tests/fixtures/test_apfs.img.zst	528451	8d331046f01555fa3ffacd5933d1ff76637d5067e4225ec382f27ca1c60f8544		committed-in-repo	yes	synthetic-minimal	not synthesizable
+fs.apfs.encrypted.hd	repo:tests/fixtures/test_apfs_encrypted.img.zst	258234	7308b487feb2f431aad884f7d8b53556c486a078c7a022a0d7da6252111ba742		committed-in-repo	yes	synthetic-minimal	FileVault path
+fs.btrfs.base.hd	repo:tests/fixtures/test_btrfs.img.zst	2780	8b3d52876825b5b491d30e162a9754d8282122c604c2e8da94507e0c5a25f163		committed-in-repo	yes	synthetic-minimal	not synthesizable
+fs.ext2.base.hd	repo:tests/fixtures/test_ext2.img.zst	619	10c73dd89242f2c3d3773d61941e09957d90f6653ac9c3d95be37602452dc34b		committed-in-repo	yes	synthetic-minimal	
+fs.ext4.base.hd	repo:tests/fixtures/test_ext4.img.zst	1275	fe2beebb115715ff1cd6321283317ebd2076cf9f9b90dd839483459f7ac94931		committed-in-repo	yes	synthetic-minimal	
+fs.jfs.base.hd	repo:tests/fixtures/test_jfs.img.zst	27339	e89cafc004ece6676a854dcdfce594bc2f630825c6859d67c421774af38ba136		committed-in-repo	yes	synthetic-minimal	not synthesizable
+fs.reiserfs.v3-6.hd	repo:tests/fixtures/test_reiserfs_v3_6.img.zst	3724	fe8b6337cd48f7b0f24ef840c357e9b33422100db925acee53fcb17bd324178f		committed-in-repo	yes	synthetic-minimal	not synthesizable
+fs.ufs1.base.hd	repo:tests/fixtures/test_ufs1.img.zst	1349	9091348010964b977ffa10c73812401f187aa81d6970e22847f55b0e495d6a49		committed-in-repo	yes	synthetic-minimal	not synthesizable
+fs.ufs2.base.hd	repo:tests/fixtures/test_ufs2.img.zst	1495	18f183130758e52fa77226032540a36dead36167ad4a95002549187969736a3d		committed-in-repo	yes	synthetic-minimal	not synthesizable
+fs.efs.small.hd	repo:tests/fixtures/sgi/efs_small.img.zst	557958	40f21c8b9364789fbec8a126c6e1e3ce8f8f8d2bae223f8b0eaea0546e354502		committed-in-repo	yes	synthetic-minimal	real IRIX EFS
+fs.prodos.base.hd	repo:tests/fixtures/test_prodos.hdv.zst	59718	e49e2039883a266a8ebff6794ea0fa4d03d9d1b7f1e6728967102a5c036afa5e		committed-in-repo	yes	synthetic-minimal	
+fs.xfs.v4.hd	repo:tests/fixtures/sgi/xfs_v2_dir2_small.img.zst	17509	13392407a9cfa7d0b07ac8e0b42594483c506e69c561c446db584169acb31d1c		committed-in-repo	yes	synthetic-minimal	not synthesizable
+fs.xfs.v5.hd	repo:tests/fixtures/sgi/xfs_v5_modern_small.img.zst	18086	8a8bae9cd9b63c0899323867ca8dd0693c7d983cd1bd76f933cb954cff377eec		committed-in-repo	yes	synthetic-minimal	not synthesizable
+fs.cbm.1541.floppy	repo:tests/fixtures/test_cbm_1541.d64.zst	196	a4e86894f81c438928b509fa8c05ccc5fc6ba463bb9a7ad58e0f6d308741dd81		committed-in-repo	yes	synthetic-minimal	not synthesizable
+fs.cbm.1571-gcr.floppy	repo:tests/fixtures/test_cbm_1571.g71.zst	12388	f6520bce3f4f9fd76a9d45ad13dac1b536230fdba452de6736fb3bd5ea3acbc3		committed-in-repo	yes	synthetic-minimal	GCR container
+fs.cbm.1581.floppy	repo:tests/fixtures/cbm_fsck_1581_base.d81.zst	267	0b0fe23b2bf1c8c82aa3ba44b9acf5407b0ae4e5866b532ea0782eab33a77556		committed-in-repo	yes	synthetic-minimal	
+fs.cbm.8050.floppy	repo:tests/fixtures/cbm_fsck_8050_base.d80.zst	285	99eeb25daa8d3cf67a6f112c48ea00867997696171b55585f3f2ba380a96cbeb		committed-in-repo	yes	synthetic-minimal	
+fs.cbm.8250.floppy	repo:tests/fixtures/cbm_fsck_8250_base.d82.zst	320	0d974a31be3690770edc91a2307433fee9ab6af8c0eabd2355b090f5f5e31231		committed-in-repo	yes	synthetic-minimal	
+fs.rsdos.base.floppy	repo:tests/fixtures/test_coco_rsdos.dsk.zst	381	705212011edce8acac62bb5dab1a04908ca0f74f554ce70a24ffc860b3205129		committed-in-repo	yes	synthetic-minimal	not synthesizable
+fs.os9.l2.floppy	repo:tests/fixtures/test_coco_os9l2.dsk.zst	73297	90fbc97c1a0d13e0b1f5984236ba61ddc14954f39573849d97c03c4ea012e4aa		committed-in-repo	yes	synthetic-minimal	real NitrOS-9 L2
+fs.dragondos.base.floppy	repo:tests/fixtures/test_dragon_dragondos.dsk.zst	441	bd3d53778afa90a84318fe6672a012ca452baeb867f3b939f4303f102779a014		committed-in-repo	yes	synthetic-minimal	not synthesizable
+fs.dfs.base.floppy	repo:tests/fixtures/test_bbc_dfs.ssd.zst	463	f8db42e15ca8f91a9b117797e4bd2821a8a50e050f8d17ca407b0b6989cdad05		committed-in-repo	yes	synthetic-minimal	not synthesizable
+fs.dfs.double-sided.floppy	repo:tests/fixtures/test_bbc_dfs_ds.dsd.zst	489	84e876d8d9552b10896ef45da976aef7e7d287b6d579fc8dda9fba8ee0efeb92		committed-in-repo	yes	synthetic-minimal	DSD container
+fs.atari-dos2.base.floppy	repo:tests/fixtures/test_atari_dos2.atr.zst	519	5a8d9b1e4adf1a88dee535cbf9aab39e07ed9256008f1f0ec6ff462b3cab6aad		committed-in-repo	yes	synthetic-minimal	
+fs.atarist.gemdos.floppy	repo:tests/fixtures/test_atarist_floppy.st.zst	378	8910d4ad4d659a276127256b8af09d9e0d00061f5caf642a602a1387d8c184e2		committed-in-repo	yes	synthetic-minimal	
+fmt.msa.base.floppy	repo:tests/fixtures/test_atarist_floppy.msa.zst	364	7a4b455fe2d6eebe695ddc411e9c8efe45c1e9a4fc941c843d22f2a7bfa802c7		committed-in-repo	yes	synthetic-minimal	Atari MSA container
+part.ahdi.base.multipart	repo:tests/fixtures/test_atarist_ahdi.img.zst	1593	b81cab10ad32dd7cfcdd1cfe58effa1551549603febb5ab8fc18ea6821184b5b		committed-in-repo	yes	synthetic-minimal	AHDI partition table
+fs.cpm.amstrad-data.floppy	repo:tests/fixtures/test_cpm_amstrad_data.dsk.zst	159	4dcf2acf4516d53131360438e17588638adf75756fc6e7e578096f1798483f12		committed-in-repo	yes	synthetic-minimal	
+fs.cpm.pcw.floppy	repo:tests/fixtures/test_pcw_format_a.dsk.zst	161	582d6524d534b8af790c2e38128bec827b950df5277c54fb53439e36189d7ae0		committed-in-repo	yes	synthetic-minimal	
+fs.human68k.2dd.floppy	repo:tests/fixtures/test_x68000_human68k_2dd.d88.zst	3500	a024e2a6d2eb944fc545c84ae8640665bd297b20b4e6c5eff58d15cbe3d5dda8		committed-in-repo	yes	synthetic-minimal	D88 container
+fmt.gho.uncompressed.hd	repo:tests/fixtures/test_gho_75_none.gho.zst	242379	2752147dfb1d23a4ba17e3b4b368d29f39b71af1ca622a6274cdc6abad122d61		committed-in-repo	yes	synthetic-minimal	Norton Ghost, no compression
+fmt.gho.password.hd	repo:tests/fixtures/test_gho_11_high_pw.gho.zst	281525	483539a80af501ecff70447b58de2c0600327c66c88f9923cc4cf3aff9d7290e		committed-in-repo	yes	synthetic-minimal	password-protected Ghost
+optical.iso9660.hybrid-rsrc.cd	repo:tests/fixtures/optical/hybrid_rsrc.iso.zst	1175	5bf54d308665af45d2a3a0507ce01692ae2fd558bd6385fab2d765fdcfd65141		committed-in-repo	yes	synthetic-minimal	hybrid ISO with resource forks
+fs.cpc.amsdos.floppy	repo:tests/fixtures/anchor_cpc_ManicMiner.dsk.zst	14835	8f99cfd3b88de56d6f769b4ff109aa245e39432396d20423c1846975af7787b6		committed-in-repo	yes	synthetic-minimal	real EDSK, TOSEC
+fs.qdos.microdrive.mdv	repo:tests/fixtures/anchor_mister_crazy.mdv.zst	54566	9b19d33dacb4f6b4a370f5554c04a012ad3fabd553d8ba6f345cb558fc7d1a29		committed-in-repo	yes	synthetic-minimal	QDOS microdrive from MiSTer

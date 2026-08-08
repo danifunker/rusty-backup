@@ -1,0 +1,83 @@
+# Tier 2 — bare-volume detection and on-disk reads.
+#
+# `detect_superfloppy` (src/partition/mod.rs) decides whether an image with no
+# partition table can be opened at all. Where it lacks a magic, a filesystem
+# with a perfectly good driver is unreachable — the drivers are covered by
+# `cargo test` calling `open_filesystem` directly, which is exactly why this
+# path went unnoticed.
+#
+# The jfs/ufs/reiserfs cases for R-009 live in read-repo-fixtures.toml; this
+# file adds the ones found later.
+
+[meta]
+tier = 2
+group = "fs.detect"
+description = "Bare-volume detection, and reads that need real vendor media."
+
+# --- R-017 ------------------------------------------------------------------
+
+[[case]]
+id = "fs.detect.sfs-bare-volume"
+description = "R-017: a bare SFS volume is not detected, extending R-009's set to five filesystems (JFS, UFS1, UFS2, ReiserFS, SFS)"
+fixture = "fs.sfs.workbench-dh0.hd"
+timeout_ms = 300000
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["SFS"]
+
+[[case]]
+id = "fs.detect.sfs-reads-when-told"
+description = "The working half of R-017 — the driver is fine, only the magic is missing from detection. Guards the forced-dispatch path."
+fixture = "fs.sfs.workbench-dh0.hd"
+timeout_ms = 300000
+[[case.step]]
+args = ["ls", "{fixture}", "/", "--fs-type", "SFS\\0"]
+expect_exit = 0
+# A real Workbench tree, so these are stable directory names rather than
+# anything incidental to how the disk was built.
+stdout_contains = ["Utilities", "WBStartup", "Fonts"]
+
+# --- R-013 ------------------------------------------------------------------
+
+[[case]]
+id = "fs.detect.ufs-solaris-entry-types"
+description = "R-013: on a real Solaris UFS slice every directory except the first is typed FILE, and one reports a 1.5e19-byte size"
+fixture = "part.sun.solaris-disk.multipart"
+timeout_ms = 600000
+[[case.step]]
+args = ["ls", "{fixture}@1", "/"]
+expect_exit = 0
+# `usr`, `var` and `etc` are directories on any Solaris root. The bug reports
+# them as FILE, and `lost+found` — the first entry — is the only one correct,
+# which points at the walk breaking after the first record.
+stdout_matches = ["DIR\\s+\\d+\\s+usr", "DIR\\s+\\d+\\s+var", "DIR\\s+\\d+\\s+etc"]
+
+[[case]]
+id = "fs.detect.ufs-no-absurd-sizes"
+description = "R-013's second half — a size near u64::MAX means an unrelated field is being read as the size"
+fixture = "part.sun.solaris-disk.multipart"
+timeout_ms = 600000
+[[case.step]]
+args = ["ls", "{fixture}@1", "/"]
+expect_exit = 0
+# Rust's regex engine has no look-around, so "must not contain" needs its own
+# operator rather than a negative lookahead. 14989422569311248440 was the
+# observed size for `usr`.
+stdout_not_contains = ["14989422569311248440"]
+
+# --- R-011 ------------------------------------------------------------------
+
+[[case]]
+id = "fmt.g64.standard-dump-opens"
+description = "The working half of R-011. Two of three real G64s failed (both copy-protected or patched); this pins the one that works so a decoder change cannot quietly lose it too."
+fixture = "fmt.g64.gcr.floppy"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+
+# NOTE: no case asserts that protected/patched G64 dumps open. R-011 is
+# recorded as Unknown severity pending a decision on whether non-standard GCR
+# is in scope — preserving copy-protected disks is the reason G64 exists
+# rather than D64, so it may be a real limitation rather than an acceptable
+# boundary. Asserting either outcome now would prejudge that call.

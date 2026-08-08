@@ -1,0 +1,73 @@
+# Tier 0 — the exit-code contract from src/cli/exit.rs.
+#
+#   0  SUCCESS
+#   1  GENERIC_FAILURE
+#   2  USAGE_ERROR
+#   3  NOT_FOUND
+#   4  PERMISSION_DENIED
+#   5  USER_DECLINED
+# 130  SIGINT
+#
+# These cases assert the *documented* contract, not the observed behaviour.
+# Where the two disagree the case fails, which is exactly what the suite is
+# for. Known disagreements are written up in COVERAGE.md § Findings; do not
+# "fix" a case here to match a bug.
+
+[meta]
+tier = 0
+group = "cli.exit-codes"
+description = "Exit codes match the contract in src/cli/exit.rs."
+
+[[case]]
+id = "cli.exit.unknown-verb-is-usage-error"
+description = "an unrecognised subcommand exits 2 (USAGE_ERROR)"
+args = ["definitely-not-a-verb"]
+expect_exit = 2
+
+[[case]]
+id = "cli.exit.missing-required-arg-is-usage-error"
+description = "a verb invoked without its required arguments exits 2"
+args = ["get"]
+expect_exit = 2
+
+[[case]]
+id = "cli.exit.unknown-flag-is-usage-error"
+description = "an unrecognised flag on a real verb exits 2"
+args = ["inspect", "--no-such-flag"]
+expect_exit = 2
+
+# --- Known finding R-004 -----------------------------------------------------
+# src/cli/output.rs documents that a nested-result verb asked for csv/tsv
+# "errors out with crate::cli::exit::USAGE_ERROR" (2). It currently exits 1
+# because require_non_flat uses anyhow::bail!. Asserting the documented
+# contract so the finding stays visible every run until it is fixed.
+[[case]]
+id = "cli.exit.csv-on-nested-verb-is-usage-error"
+description = "R-004: --format csv on inspect should exit 2 per output.rs"
+[[case.step]]
+args = ["new", "volume", "fat", "--size", "2M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/v.img", "--format", "csv"]
+expect_exit = 2
+
+[[case]]
+id = "cli.exit.tsv-on-nested-verb-is-usage-error"
+description = "R-004: --format tsv on inspect should exit 2 per output.rs"
+[[case.step]]
+args = ["new", "volume", "fat", "--size", "2M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/v.img", "--format", "tsv"]
+expect_exit = 2
+
+# --- Missing host file -------------------------------------------------------
+# Deliberately asserted as GENERIC_FAILURE (1), which is what the engine does
+# today. NOT_FOUND (3) would arguably be the better code for "the image file
+# is not there", but the contract does not currently claim it, so this case
+# documents present behaviour rather than inventing a requirement.
+[[case]]
+id = "cli.exit.missing-image-file"
+description = "inspect on a nonexistent image exits 1 (current documented-free behaviour)"
+args = ["inspect", "{scratch}/does-not-exist.img"]
+expect_exit = 1

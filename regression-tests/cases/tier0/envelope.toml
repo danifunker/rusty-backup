@@ -1,0 +1,73 @@
+# Tier 0 — the structured-output envelope from src/cli/output.rs.
+#
+#   { "schema_version": 1,
+#     "status": { "error": bool, "code": int, "message": string|null },
+#     "result": { ... } }
+#
+# The harness validates this shape on every structured invocation it makes, so
+# these cases exist to pin the contract explicitly and to give an envelope
+# regression an obvious home rather than showing up as a thousand unrelated
+# failures elsewhere.
+
+[meta]
+tier = 0
+group = "cli.envelope"
+description = "Structured output conforms to the documented envelope."
+
+[[case]]
+id = "cli.envelope.inspect-success"
+description = "a successful inspect returns a well-formed ok envelope"
+[[case.step]]
+args = ["new", "volume", "fat", "--size", "2M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/v.img", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+json_exists = ["image", "partition_table", "partitions"]
+[[case.step.json_equals]]
+path = "partitions.0.type_name"
+value = "FAT"
+[[case.step.json_equals]]
+path = "partition_table"
+value = "None"
+
+[[case]]
+id = "cli.envelope.inspect-success-yaml"
+description = "yaml is accepted on a nested verb (only csv/tsv are rejected)"
+[[case.step]]
+args = ["new", "volume", "fat", "--size", "2M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/v.img", "--format", "yaml"]
+expect_exit = 0
+stdout_contains = ["schema_version"]
+
+# --- Known finding R-005 -----------------------------------------------------
+# output.rs documents that on error the envelope is still emitted, with
+# status.error true, status.code carrying the exit code, and result null.
+# Today a failing verb under --format json writes nothing to stdout and a
+# plain-text error to stderr, so a JSON consumer gets nothing parseable on
+# exactly the path the envelope exists to serve.
+[[case]]
+id = "cli.envelope.error-envelope-on-failure"
+description = "R-005: a failing verb under --format json should still emit an error envelope"
+[[case.step]]
+args = ["inspect", "{scratch}/does-not-exist.img", "--format", "json"]
+expect_exit = 1
+expect_envelope_ok = false
+
+# --- Known finding R-003 -----------------------------------------------------
+# output.rs lists `ls` among the verbs supporting --format, and names it in the
+# csv/tsv flat-output scope. `ls` exposes no --format flag today, so this case
+# fails with a usage error until either the flag lands or the doc is corrected.
+[[case]]
+id = "cli.envelope.ls-supports-format"
+description = "R-003: ls should accept --format per output.rs"
+[[case.step]]
+args = ["new", "volume", "fat", "--size", "2M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{scratch}/v.img", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true

@@ -1,0 +1,684 @@
+# Oracle registry — source of truth for VERIFICATION-MATRIX.md.
+#
+# Hand-edited, diffable, reviewable. `rb-regress db build` loads this into
+# SQLite; the markdown matrix is GENERATED from the database, never written
+# by hand.
+#
+# status values for availability:
+#   verified — actually run on that platform, with a date
+#   expected — should be there, not yet confirmed
+#   install  — exists but needs installing
+#   absent   — confirmed not available
+#
+# strength values for what an oracle proves:
+#   authoritative — the vendor's own tool (IRIX checking EFS)
+#   structural    — a competent third party (qemu-img, fsck.vfat)
+#   smoke         — opens without error, little more
+
+[[oracle]]
+id = "qemu-img"
+tool = "qemu-img"
+kind = "package"
+availability = [
+  { platform = "windows", status = "verified", path_hint = "C:/Program Files/qemu", verified_on = "2026-08-02" },
+  { platform = "wsl",     status = "verified", path_hint = "/usr/bin/qemu-img",      verified_on = "2026-08-02" },
+  { platform = "linux",   status = "expected" },
+  { platform = "macos",   status = "install",  path_hint = "brew install qemu" },
+]
+verifies = [
+  { format = "fmt.raw",         direction = "write", strength = "structural", status = "proven", evidence = "qemu-img info -> raw", check = ["info", "{artifact}"], expect_stdout = "file format: raw" },
+  { format = "fmt.qcow2",       direction = "write", strength = "structural", status = "proven", evidence = "qemu-img check -> clean", check = ["check", "{artifact}"], expect_stdout = "No errors were found" },
+  { format = "fmt.vhd-dynamic", direction = "write", strength = "structural", status = "proven", evidence = "qemu-img info -> vpc", check = ["info", "{artifact}"], expect_stdout = "file format: vpc" },
+  { format = "fmt.vhd-fixed",   direction = "write", strength = "smoke",      status = "proven", evidence = "qemu-img info -> raw; vpc prober scores below raw, unresolved", check = ["info", "{artifact}"], expect_stdout = "file format: raw" },
+  { format = "fmt.vmdk-flat",   direction = "write", strength = "structural", status = "proven", evidence = "descriptor -> vmdk, extent -> raw" },
+  { format = "fmt.vmdk-sparse", direction = "write", strength = "structural", status = "proven", evidence = "qemu-img check -> No errors were found", check = ["check", "{artifact}"], expect_stdout = "No errors were found" },
+]
+
+[[oracle]]
+id = "chdman"
+tool = "chdman"
+kind = "package"
+notes = "Four versions present locally (0.174/0.189/0.273/0.288); our output verifies on all four, so the version spread is itself a coverage axis."
+availability = [
+  { platform = "windows", status = "verified", path_hint = "C:/Tools/chdman", verified_on = "2026-08-02" },
+  { platform = "linux",   status = "install" },
+  { platform = "macos",   status = "install" },
+  { platform = "mister-hps", status = "absent" },
+]
+verifies = [
+  { format = "fmt.chd", direction = "write", strength = "structural", status = "proven", evidence = "chdman verify -> Raw SHA1 + Overall SHA1 successful, chdman 0.174 through 0.288", check = ["verify", "-i", "{artifact}"], expect_stdout = "Overall SHA1 verification successful" },
+  { format = "optical.chdcd", direction = "write", strength = "structural", status = "untested" },
+  { format = "fmt.bincue", direction = "write", strength = "structural", status = "untested", evidence = "chdman createcd round-trip" },
+]
+
+[[oracle]]
+id = "fsck.ext4"
+tool = "fsck.ext4"
+kind = "package"
+availability = [
+  { platform = "wsl",    status = "verified", path_hint = "/usr/sbin/fsck.ext4", verified_on = "2026-08-02" },
+  { platform = "mister-hps", status = "verified", path_hint = "/usr/sbin/fsck.ext4", verified_on = "2026-08-02" },
+  { platform = "linux",  status = "expected" },
+  { platform = "macos",  status = "install", path_hint = "brew install e2fsprogs" },
+  { platform = "windows", status = "absent" },
+]
+verifies = [
+  { format = "fs.ext2", direction = "write", strength = "authoritative", status = "untested", check = ["-fn", "{artifact}"] },
+  { format = "fs.ext3", direction = "write", strength = "authoritative", status = "untested", check = ["-fn", "{artifact}"] },
+  { format = "fs.ext4", direction = "write", strength = "authoritative", status = "untested", check = ["-fn", "{artifact}"] },
+]
+
+[[oracle]]
+id = "fsck.vfat"
+tool = "fsck.vfat"
+kind = "package"
+availability = [
+  { platform = "wsl",    status = "verified", verified_on = "2026-08-02" },
+  { platform = "mister-hps", status = "verified", verified_on = "2026-08-02" },
+  { platform = "linux",  status = "expected" },
+  { platform = "windows", status = "absent" },
+]
+verifies = [
+  { format = "fs.fat12", direction = "write", strength = "structural", status = "untested", check = ["-n", "{artifact}"] },
+  { format = "fs.fat16", direction = "write", strength = "structural", status = "untested", check = ["-n", "{artifact}"] },
+  { format = "fs.fat32", direction = "write", strength = "structural", status = "untested", check = ["-n", "{artifact}"] },
+]
+
+[[oracle]]
+id = "fsck_hfs"
+tool = "fsck_hfs"
+kind = "package"
+program = "oracles/fsck_hfs_image.sh"
+notes = """macOS only. Nothing equivalent exists elsewhere, which is what makes a
+Mac non-optional.
+
+fsck_hfs will not read a plain file — "not a character device / Can't get
+device block size" — so the oracle runs through oracles/fsck_hfs_image.sh,
+which attaches the image read-only and no-mount, checks it, and always
+detaches.
+
+Measured 2026-08-07 on macOS 26.5.2 (fsck_hfs hfs-715.120.4): it still checks
+**classic HFS**, announcing "Checking HFS volume", as well as "Checking
+non-journaled HFS Plus Volume". macOS dropped HFS Standard *mounting* years
+ago, so the assumption that fsck_hfs went with it is easy to make and wrong.
+Both were also confirmed against Mac OS X 10.5.8 on a PowerMac G5, which
+agrees — a period-authentic second opinion for the classic-HFS rows."""
+availability = [
+  { platform = "macos",   status = "verified", verified_on = "2026-08-07" },
+  { platform = "windows", status = "absent" },
+  { platform = "linux",   status = "absent" },
+]
+verifies = [
+  { format = "fs.hfs",     direction = "write", strength = "authoritative", status = "proven", evidence = "fsck_hfs -> 'Checking HFS volume' + 'appears to be OK', macOS 26.5.2 and 10.5.8", check = ["{artifact}"], expect_stdout = "appears to be OK" },
+  { format = "fs.hfsplus", direction = "write", strength = "authoritative", status = "proven", evidence = "fsck_hfs -> 'Checking non-journaled HFS Plus Volume' + 'appears to be OK'", check = ["{artifact}"], expect_stdout = "appears to be OK" },
+  { format = "fs.hfv",     direction = "write", strength = "authoritative", status = "proven", evidence = "flat classic-HFS volume; same path as fs.hfs", check = ["{artifact}"], expect_stdout = "appears to be OK" },
+]
+
+[[oracle]]
+id = "fsck_apfs"
+tool = "fsck_apfs"
+kind = "package"
+availability = [
+  { platform = "macos", status = "expected" },
+  { platform = "linux", status = "absent" },
+  { platform = "windows", status = "absent" },
+]
+verifies = [{ format = "fs.apfs", direction = "write", strength = "authoritative", status = "untested" }]
+
+[[oracle]]
+id = "hdiutil"
+tool = "hdiutil"
+kind = "package"
+availability = [
+  { platform = "macos", status = "expected" },
+  { platform = "linux", status = "absent" },
+  { platform = "windows", status = "absent" },
+]
+verifies = [
+  { format = "fmt.dmg",         direction = "write", strength = "authoritative", status = "untested" },
+  { format = "fmt.sparseimage", direction = "write", strength = "authoritative", status = "untested" },
+  { format = "fmt.ndif",        direction = "write", strength = "authoritative", status = "untested" },
+]
+
+[[oracle]]
+id = "ghostexp"
+tool = "ghostexp.exe"
+kind = "package"
+notes = "Symantec Ghost Explorer 11.5. Windows only; three copies present locally."
+availability = [
+  { platform = "windows", status = "verified", path_hint = "C:/Temp/pebuilder-isolinux/Programs/ghost11", verified_on = "2026-08-02" },
+  { platform = "linux",   status = "absent" },
+  { platform = "macos",   status = "absent" },
+]
+verifies = [{ format = "fmt.gho", direction = "read", strength = "authoritative", status = "untested" }]
+
+[[oracle]]
+id = "unsquashfs"
+tool = "unsquashfs"
+kind = "package"
+availability = [
+  { platform = "wsl",   status = "verified", verified_on = "2026-08-02" },
+  { platform = "linux", status = "expected" },
+  { platform = "macos", status = "install" },
+  { platform = "windows", status = "absent" },
+]
+verifies = [{ format = "fs.squashfs", direction = "write", strength = "authoritative", status = "untested" }]
+
+[[oracle]]
+id = "xfs_repair"
+tool = "xfs_repair"
+kind = "package"
+notes = "Checks Linux-flavoured XFS; IRIX is the authority for SGI XFS."
+availability = [
+  { platform = "wsl",   status = "verified", verified_on = "2026-08-02" },
+  { platform = "linux", status = "expected" },
+]
+verifies = [{ format = "fs.xfs", direction = "write", strength = "structural", status = "untested", check = ["-n", "{artifact}"] }]
+
+[[oracle]]
+id = "jfs_fsck"
+tool = "jfs_fsck"
+kind = "package"
+availability = [
+  { platform = "wsl",   status = "verified", verified_on = "2026-08-02" },
+  { platform = "linux", status = "expected" },
+]
+verifies = [{ format = "fs.jfs", direction = "write", strength = "authoritative", status = "untested" }]
+
+[[oracle]]
+id = "fsck.minix"
+tool = "fsck.minix"
+kind = "package"
+availability = [
+  { platform = "wsl",   status = "verified", verified_on = "2026-08-02" },
+  { platform = "linux", status = "expected" },
+]
+verifies = [
+  { format = "fs.minix1", direction = "write", strength = "authoritative", status = "untested", check = ["{artifact}"] },
+  { format = "fs.minix2", direction = "write", strength = "authoritative", status = "untested", check = ["{artifact}"] },
+  { format = "fs.minix3", direction = "write", strength = "authoritative", status = "untested", check = ["{artifact}"] },
+]
+
+[[oracle]]
+id = "mount-affs"
+tool = "mount -t affs"
+kind = "mount"
+notes = """Linux kernel AFFS driver. Available on the MiSTer's HPS because that
+is ARM Linux with affs built in — but this is a LINUX opinion, not an Amiga
+one, and is worth exactly what the same mount on any Linux box is worth. The
+Amiga's own filesystem code lives in the core; see mister-core-amiga."""
+availability = [
+  { platform = "mister-hps", status = "verified", path_hint = "/proc/filesystems", verified_on = "2026-08-02" },
+  { platform = "linux",      status = "install", path_hint = "linux-modules-extra" },
+  { platform = "wsl",        status = "absent" },
+]
+verifies = [{ format = "fs.affs", direction = "write", strength = "structural", status = "untested" }]
+
+[[oracle]]
+id = "cpmtools"
+tool = "cpmls"
+kind = "package"
+notes = "Closes the nine-DPB CP/M axis, the largest sub-axis in the suite, for one apt install."
+availability = [
+  { platform = "wsl",   status = "install" },
+  { platform = "linux", status = "expected" },
+  { platform = "macos", status = "install" },
+]
+verifies = [{ format = "fs.cpm", direction = "write", strength = "authoritative", status = "untested" }]
+
+[[oracle]]
+id = "7z"
+tool = "7z"
+kind = "package"
+availability = [
+  { platform = "windows", status = "verified", path_hint = "C:/Program Files/7-Zip", verified_on = "2026-08-02" },
+  { platform = "linux",   status = "expected" },
+  { platform = "macos",   status = "install" },
+]
+verifies = [{ format = "fmt.zip-disk", direction = "write", strength = "structural", status = "untested" }]
+
+# --- Emulator oracles --------------------------------------------------------
+
+[[oracle]]
+id = "iris"
+tool = "Iris"
+kind = "emulator"
+notes = "SGI emulator written in Rust; in-house, so blockers are fixable at source. Replaces MAME for IRIX."
+availability = [
+  { platform = "windows", status = "install" },
+  { platform = "linux",   status = "install" },
+  { platform = "macos",   status = "install" },
+]
+verifies = [
+  { format = "fs.efs",  direction = "write", strength = "authoritative", status = "plausible", evidence = "IRIX 6.5 image reads OK; boot not yet wired" },
+  { format = "fs.xfs",  direction = "write", strength = "authoritative", status = "plausible", evidence = "IRIX 6.5 mounts both XFS and EFS" },
+  { format = "part.sgi",     direction = "write", strength = "authoritative", status = "plausible" },
+  { format = "optical.efs", direction = "write", strength = "authoritative", status = "plausible", evidence = "IRIX mounts an EFS CD natively" },
+]
+
+[[oracle]]
+id = "fs-uae"
+tool = "FS-UAE"
+kind = "emulator"
+notes = """Portable Amiga emulator; the cross-platform half of the WinUAE pair.
+
+Assets located 2026-08-07, all already owned — nothing needs downloading:
+
+  * Kickstart ROMs — a full licensed AmigaForever set on the Windows box at
+    D:/ROMs/Amiga/Shared/rom (amiga-os-070 .. 3.x), plus Kickstart 3.2 ROMs on
+    the NAS and five ROMs on linuxbox at ~/kickstarts.
+  * A bootable environment — AmigaVision on the MiSTer (9.1 GB HDF, PFS3, with
+    an AmigaVision.fs-uae config already written).
+  * The results channel — that config's `hard_drive_2 = ./shared` mounts a HOST
+    DIRECTORY as an Amiga volume, so the guest writes a file and the host reads
+    it. No screen-scraping, unlike Snow.
+  * Filesystem handlers — SmartFilesystem 1.280 (02.06.2017, m68k, J.
+    Strohmayer) and PFS3AIO, extracted from the L: directory of the SFS
+    reference fixture itself and staged at rb-fixtures/oracle-assets/amiga.
+    Neither AmigaVision nor AmigaForever carries an SFS handler; the volume
+    under test turned out to carry its own.
+
+Not yet built: the config that attaches an artifact, the guest-side script
+that writes a verdict to the shared volume, and the host-side parser. AFFS is
+the one to prove it on — Kickstart mounts FFS with no extra handler, and we
+already produce fs.affs.
+
+Cross-platform Amiga; WinUAE is Windows-only, so this is the portable choice.
+Installed on the Windows box (FS-UAE 3.0.5, a per-user install under
+%LOCALAPPDATA%/Programs) and on linuxbox (3.1.66)."""
+availability = [
+  { platform = "windows", status = "install" },
+  { platform = "linux",   status = "install" },
+  { platform = "macos",   status = "install" },
+]
+verifies = [
+  { format = "fs.pfs3", direction = "write", strength = "authoritative", status = "plausible", evidence = "Workbench 1.3/2.1 RDB+PFS disks on the MiSTer, 960 MB each" },
+  { format = "fs.affs", direction = "write", strength = "authoritative", status = "plausible" },
+  { format = "part.rdb", direction = "write", strength = "authoritative", status = "plausible" },
+]
+
+[[oracle]]
+id = "86box-os2"
+tool = "86Box + OS/2"
+kind = "emulator"
+notes = "OS/2's own CHKDSK is the only real HPFS oracle; the Linux hpfs module is read-only and absent from WSL."
+availability = [
+  { platform = "windows", status = "install" },
+  { platform = "linux",   status = "install" },
+  { platform = "macos",   status = "install" },
+]
+verifies = [{ format = "fs.hpfs", direction = "write", strength = "authoritative", status = "plausible" }]
+
+# --- MiSTer CORE side --------------------------------------------------------
+#
+# The distinction that matters: the HPS is ARM Linux and its opinions are
+# Linux opinions. The CORE is the vintage machine itself, running the real
+# guest OS with its own filesystem code — Workbench's AFFS handler, Human68k's
+# own driver. That is the authoritative reference, and it is the only thing
+# about a MiSTer that a generic Linux box cannot also do.
+#
+# The HPS still matters, but as plumbing: it is how images get onto the SD
+# card and how a guest-written result file gets read back off it.
+
+[[oracle]]
+id = "mister-core-amiga"
+tool = "MiSTer Minimig core"
+kind = "hardware"
+notes = """Real AmigaOS reading the volume with its own filesystem handlers.
+Unlike the HPS affs mount, this is the Amiga's opinion. Bootable Workbench
+1.3 / 2.1 RDB+PFS disks are already on the board."""
+availability = [{ platform = "mister-core", status = "expected" }]
+verifies = [
+  { format = "fs.affs", direction = "write", strength = "authoritative", status = "plausible" },
+  { format = "fs.pfs3", direction = "write", strength = "authoritative", status = "plausible" },
+  { format = "fs.sfs",  direction = "write", strength = "authoritative", status = "plausible", evidence = "needs the SFS handler installed in the guest" },
+  { format = "part.rdb", direction = "write", strength = "authoritative", status = "plausible" },
+]
+
+[[oracle]]
+id = "mister-core-x68000"
+tool = "MiSTer X68000 core"
+kind = "hardware"
+availability = [{ platform = "mister-core", status = "expected" }]
+verifies = [
+  { format = "fs.human68k", direction = "write", strength = "authoritative", status = "plausible" },
+  { format = "fmt.d88",      direction = "write", strength = "authoritative", status = "plausible" },
+  { format = "part.x68k",    direction = "write", strength = "authoritative", status = "plausible" },
+  { format = "fmt.xdf",      direction = "write", strength = "authoritative", status = "plausible" },
+  { format = "fmt.x68k-hdd", direction = "write", strength = "authoritative", status = "plausible" },
+]
+
+[[oracle]]
+id = "mister-core-atarist"
+tool = "MiSTer AtariST core"
+kind = "hardware"
+availability = [{ platform = "mister-core", status = "expected" }]
+verifies = [
+  { format = "part.ahdi",  direction = "write", strength = "authoritative", status = "plausible" },
+  { format = "fs.atarist", direction = "write", strength = "authoritative", status = "plausible" },
+  { format = "fmt.msa",    direction = "read",  strength = "authoritative", status = "plausible" },
+]
+
+[[oracle]]
+id = "mister-core-appleii"
+tool = "MiSTer Apple-II core"
+kind = "hardware"
+notes = """Real Apple II reading the disk with ProDOS / DOS 3.3 themselves.
+/media/fat/games/Apple-II is already populated on the board, so this needs no
+new material — it closes two write gaps that had no oracle at all."""
+availability = [{ platform = "mister-core", status = "expected" }]
+verifies = [
+  { format = "fs.prodos",    direction = "write", strength = "authoritative", status = "plausible" },
+  { format = "fs.apple-dos", direction = "write", strength = "authoritative", status = "plausible" },
+  { format = "fs.ucsd",      direction = "write", strength = "authoritative", status = "plausible" },
+]
+
+# --- Classic Mac -------------------------------------------------------------
+
+[[oracle]]
+id = "snow"
+tool = "Snow"
+kind = "emulator"
+notes = """Modern Macintosh emulator written in Rust. Emulating a Mac Plus gives
+a real MFS implementation — the only realistic judge of MFS, which otherwise
+has no oracle anywhere.
+
+Confirmed 2026-08-07. The project is real and active: github.com/twvd/snow,
+MIT, Linux/macOS/Windows, hardware-level 68000/020/030 emulation of the 128K
+through SE/30, with SCSI hard disk and CD support. The 2026-08-02 HTTP 403 was
+snowemu.com blocking the fetch, not a dead project.
+
+Its automation surface is the open question, and the answer is "not directly".
+There is no CLI frontend — `frontend_egui` is the only one. The `testrunner`
+crate IS headless (clap, PNG/GIF output, parallel), but it is built for Snow's
+own emulation-accuracy suite: `single` takes a ROM, a floppy image, a recorded
+input replay and a control *frame*, boots, and image-diffs the framebuffer.
+Repurposing that as a format oracle means authoring an input replay and a
+known-good screenshot per format, and supplying Mac ROMs. Possible, but a
+project rather than a check command, and brittle in a way a fsck is not.
+
+So: keep it registered as the emulator oracle of record for MFS, but do not
+plan on automating it soon. For classic HFS an older macOS with a real
+HFS-Standard-capable fsck_hfs is far cheaper and equally authoritative."""
+availability = [
+  { platform = "windows", status = "install" },
+  { platform = "linux",   status = "install" },
+  { platform = "macos",   status = "install" },
+]
+verifies = [
+  { format = "fs.mfs", direction = "write", strength = "authoritative", status = "plausible", evidence = "Mac Plus profile; MFS is the pre-HFS 400/800K format" },
+  { format = "fs.hfs", direction = "write", strength = "authoritative", status = "plausible" },
+]
+
+# --- Formats we invented -----------------------------------------------------
+
+[[oracle]]
+id = "full-cycle-boot"
+tool = "backup -> restore -> boot"
+kind = "roundtrip"
+notes = """For our own container formats there is no third party and never will
+be, so structural inspection is circular by construction. The honest check is
+behavioural: back up a real installed system, restore it, and boot the result.
+If the machine still comes up and its files are intact, the format did its job.
+
+Canonical scenario, which also exercises CB-DOS end to end:
+
+  1. Build a small DOS 6.22 VM (QEMU or VMware) and install it bootable.
+  2. Back that disk up with rb-cli into cbk.
+  3. Restore onto an SD card (or back into a VM disk).
+  4. Boot it and assert the guest reaches a prompt with its files intact.
+
+This single case covers more than the container: backup, restore, the CB-DOS
+path, partition and boot-sector fidelity, and — when the target is real media
+— the hardware write path from HARDWARE.md. Highest coverage-per-case in the
+suite, which is why it is worth the setup cost."""
+availability = [
+  { platform = "windows", status = "install" },
+  { platform = "linux",   status = "install" },
+  { platform = "macos",   status = "install" },
+]
+verifies = [
+  { format = "fmt.cbk",          direction = "write", strength = "authoritative", status = "plausible", evidence = "we are the oracle; assertion is 'the restored machine still boots'" },
+  { format = "fmt.raw-physical", direction = "write", strength = "authoritative", status = "plausible", evidence = "restoring to an SD card and booting it is the only real proof of the device write path" },
+]
+
+# =============================================================================
+# Cluster oracles, added 2026-08-02.
+#
+# Each of these closes a group of write gaps rather than one, which is why
+# they were worth doing before hunting any more fixtures.
+# =============================================================================
+
+# --- Compressed streams ------------------------------------------------------
+# The cheapest rows in the file: every one of these tools tests its own format
+# natively and exists everywhere.
+
+[[oracle]]
+id = "zstd-t"
+tool = "zstd -t"
+kind = "package"
+availability = [
+  { platform = "wsl",   status = "expected" },
+  { platform = "linux", status = "expected" },
+  { platform = "macos", status = "install" },
+  { platform = "windows", status = "install" },
+]
+verifies = [{ format = "fmt.zstd", direction = "write", strength = "authoritative", status = "untested" }]
+
+[[oracle]]
+id = "gzip-t"
+tool = "gzip -t"
+kind = "package"
+availability = [
+  { platform = "wsl",   status = "expected" },
+  { platform = "linux", status = "expected" },
+  { platform = "macos", status = "expected" },
+  { platform = "windows", status = "install" },
+  { platform = "mister-hps", status = "expected" },
+]
+verifies = [
+  { format = "fmt.gzip", direction = "write", strength = "authoritative", status = "untested" },
+  { format = "fmt.adz",  direction = "read",  strength = "authoritative", status = "untested" },
+]
+
+[[oracle]]
+id = "lz4-t"
+tool = "lz4 -t"
+kind = "package"
+availability = [
+  { platform = "wsl",   status = "install" },
+  { platform = "linux", status = "expected" },
+  { platform = "macos", status = "install" },
+]
+verifies = [{ format = "fmt.lz4", direction = "write", strength = "authoritative", status = "untested" }]
+
+# --- Apple floppy containers -------------------------------------------------
+
+[[oracle]]
+id = "applecommander"
+tool = "AppleCommander"
+kind = "package"
+notes = """Java, so it runs on all three desktop hosts — which is why it is
+preferred over the per-OS alternatives (CiderPress on Windows, Applesauce on
+macOS). Reads 2MG / DSK / PO / DO and lists ProDOS and DOS 3.3 volumes."""
+availability = [
+  { platform = "windows", status = "install" },
+  { platform = "linux",   status = "install" },
+  { platform = "macos",   status = "install" },
+]
+verifies = [
+  { format = "fmt.2mg",       direction = "write", strength = "structural", status = "untested" },
+  { format = "fmt.apple-dsk", direction = "read",  strength = "structural", status = "untested" },
+  { format = "fs.prodos",     direction = "write", strength = "structural", status = "untested" },
+  { format = "fs.apple-dos",  direction = "write", strength = "structural", status = "untested" },
+]
+
+[[oracle]]
+id = "applesauce"
+tool = "Applesauce"
+kind = "package"
+notes = "macOS only, but it is the reference implementation for the flux formats."
+availability = [
+  { platform = "macos",   status = "install" },
+  { platform = "windows", status = "absent" },
+  { platform = "linux",   status = "absent" },
+]
+verifies = [
+  { format = "fmt.woz",  direction = "write", strength = "authoritative", status = "untested" },
+  { format = "fmt.moof", direction = "write", strength = "authoritative", status = "untested" },
+  { format = "fmt.dc42", direction = "write", strength = "authoritative", status = "untested" },
+]
+
+# --- Japanese PC floppies ----------------------------------------------------
+
+[[oracle]]
+id = "mame-pc98"
+tool = "MAME pc9801"
+kind = "emulator"
+notes = "No PC-98 core exists on the MiSTer, so MAME's pc9801 drivers are the route for HDM and DIM."
+availability = [
+  { platform = "windows", status = "install" },
+  { platform = "linux",   status = "install" },
+  { platform = "macos",   status = "install" },
+]
+verifies = [
+  { format = "fmt.hdm", direction = "write", strength = "authoritative", status = "plausible" },
+  { format = "fmt.dim", direction = "write", strength = "authoritative", status = "plausible" },
+]
+
+# --- MiSTer cores, per machine -----------------------------------------------
+# All confirmed present on the board 2026-08-02. For these formats the core is
+# the reference implementation, so `authoritative` is the honest strength.
+
+[[oracle]]
+id = "mister-core-atari800"
+tool = "MiSTer ATARI800 core"
+kind = "hardware"
+availability = [{ platform = "mister-core", status = "expected" }]
+verifies = [
+  { format = "fs.atari-dos2",   direction = "write", strength = "authoritative", status = "plausible" },
+  { format = "fmt.atari-disk",  direction = "write", strength = "authoritative", status = "plausible" },
+]
+
+[[oracle]]
+id = "mister-core-ti99"
+tool = "MiSTer TI-99_4A core"
+kind = "hardware"
+availability = [{ platform = "mister-core", status = "expected" }]
+verifies = [
+  { format = "fs.ti99",       direction = "write", strength = "authoritative", status = "plausible" },
+  { format = "fmt.ti99-disk", direction = "write", strength = "authoritative", status = "plausible" },
+]
+
+[[oracle]]
+id = "mister-core-oric"
+tool = "MiSTer Oric core"
+kind = "hardware"
+availability = [{ platform = "mister-core", status = "expected" }]
+verifies = [{ format = "fs.oric", direction = "write", strength = "authoritative", status = "plausible" }]
+
+[[oracle]]
+id = "mister-core-spectrum"
+tool = "MiSTer Spectrum core"
+kind = "hardware"
+availability = [{ platform = "mister-core", status = "expected" }]
+verifies = [
+  { format = "fs.trdos",       direction = "write", strength = "authoritative", status = "plausible" },
+  { format = "fmt.trdos-disk", direction = "write", strength = "authoritative", status = "plausible" },
+]
+
+[[oracle]]
+id = "mister-core-coco"
+tool = "MiSTer CoCo2 / COCO3 core"
+kind = "hardware"
+availability = [{ platform = "mister-core", status = "expected" }]
+verifies = [
+  { format = "fs.os9",        direction = "write", strength = "authoritative", status = "plausible" },
+  { format = "fs.rsdos",      direction = "read",  strength = "authoritative", status = "plausible" },
+  { format = "fmt.coco-disk", direction = "write", strength = "authoritative", status = "plausible" },
+]
+
+[[oracle]]
+id = "mister-core-archie"
+tool = "MiSTer ARCHIE core"
+kind = "hardware"
+notes = "Acorn Archimedes; RISC OS reads ADFS with its own FileCore."
+availability = [{ platform = "mister-core", status = "expected" }]
+verifies = [{ format = "fs.adfs", direction = "write", strength = "authoritative", status = "plausible" }]
+
+[[oracle]]
+id = "mister-core-bbcmicro"
+tool = "MiSTer BBCMicro core"
+kind = "hardware"
+availability = [{ platform = "mister-core", status = "expected" }]
+verifies = [
+  { format = "fs.dfs",              direction = "read", strength = "authoritative", status = "plausible" },
+  { format = "fmt.acorn-dfs-disk",  direction = "read", strength = "authoritative", status = "plausible" },
+]
+
+[[oracle]]
+id = "mister-core-lisa"
+tool = "MiSTer Apple-Lisa core"
+kind = "hardware"
+notes = """Confirmed present on the board. Lisa FS was listed as having no
+oracle anywhere — the core is one, and it is the only realistic one."""
+availability = [{ platform = "mister-core", status = "expected" }]
+verifies = [{ format = "fs.lisa", direction = "read", strength = "authoritative", status = "plausible" }]
+
+# --- NTFS --------------------------------------------------------------------
+
+[[oracle]]
+id = "chkdsk"
+tool = "chkdsk"
+kind = "package"
+notes = "Windows' own NTFS checker. Relevant to R-007, where a freshly formatted volume fails its own fsck on BackupBootMismatch — chkdsk is the arbiter."
+availability = [
+  { platform = "windows", status = "expected" },
+  { platform = "linux",   status = "absent" },
+  { platform = "macos",   status = "absent" },
+]
+verifies = [{ format = "fs.ntfs", direction = "write", strength = "authoritative", status = "untested" }]
+
+[[oracle]]
+id = "mount-ntfs3"
+tool = "mount -t ntfs3"
+kind = "mount"
+notes = "In-kernel NTFS driver; absent from WSL, needs a full Linux host."
+availability = [
+  { platform = "linux", status = "install", path_hint = "linux-modules-extra" },
+  { platform = "wsl",   status = "absent" },
+]
+verifies = [{ format = "fs.ntfs", direction = "write", strength = "structural", status = "untested" }]
+
+# --- Partition schemes -------------------------------------------------------
+
+[[oracle]]
+id = "sfdisk"
+tool = "sfdisk -l"
+kind = "package"
+notes = "Reads MBR, GPT and Sun disk labels. MBR and GPT are the two commonest schemes we write and had no oracle at all until now."
+availability = [
+  { platform = "wsl",        status = "expected" },
+  { platform = "linux",      status = "expected" },
+  { platform = "mister-hps", status = "expected" },
+]
+verifies = [
+  { format = "part.mbr", direction = "write", strength = "structural", status = "untested" },
+  { format = "part.gpt", direction = "write", strength = "structural", status = "untested" },
+  { format = "part.sun", direction = "read",  strength = "structural", status = "untested" },
+]
+
+[[oracle]]
+id = "diskutil"
+tool = "diskutil list"
+kind = "package"
+notes = "APM is an Apple scheme, so Apple's own tool is the authority."
+availability = [
+  { platform = "macos",   status = "expected" },
+  { platform = "linux",   status = "absent" },
+  { platform = "windows", status = "absent" },
+]
+verifies = [
+  { format = "part.apm", direction = "write", strength = "authoritative", status = "untested" },
+  { format = "part.gpt", direction = "write", strength = "structural",    status = "untested" },
+]

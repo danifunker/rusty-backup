@@ -1,0 +1,991 @@
+# Format registry — what rb-cli reads and writes.
+#
+# Source of truth for the COVERAGE.md and VERIFICATION-MATRIX.md tables, both
+# of which are now GENERATED from this plus oracles.toml. Hand-edit here.
+#
+# `builder` names the rb-cli verb that can construct one. Presence means the
+# WRITE path exists and therefore needs an oracle behind it. It is never
+# itself evidence of correctness — see README.md "Why tier 1 is not coverage".
+
+# --- Filesystems -------------------------------------------------------------
+
+[[format]]
+id = "fs.fat12"
+kind = "fs"
+name = "FAT12"
+we_read = true
+we_write = true
+builder = "new floppy fat"
+
+[[format]]
+id = "fs.fat16"
+kind = "fs"
+name = "FAT16"
+we_read = true
+we_write = true
+builder = "new volume fat"
+
+[[format]]
+id = "fs.fat32"
+kind = "fs"
+name = "FAT32"
+we_read = true
+we_write = true
+builder = "new volume fat"
+notes = "FAT32 is auto-selected above 2 GiB, so a synthesized FAT32 volume is expensive"
+
+[[format]]
+id = "fs.exfat"
+kind = "fs"
+name = "exFAT"
+we_read = true
+we_write = false
+notes = "No builder — read/edit only, so a reference fixture is mandatory"
+
+[[format]]
+id = "fs.ntfs"
+kind = "fs"
+name = "NTFS"
+we_read = true
+we_write = true
+builder = "new volume ntfs"
+
+[[format]]
+id = "fs.hpfs"
+kind = "fs"
+name = "HPFS"
+we_read = true
+we_write = true
+builder = "new volume hpfs"
+
+[[format]]
+id = "fs.ext2"
+kind = "fs"
+name = "ext2"
+we_read = true
+we_write = true
+builder = "new volume ext"
+
+[[format]]
+id = "fs.ext3"
+kind = "fs"
+name = "ext3"
+we_read = true
+we_write = true
+builder = "new volume ext3"
+
+[[format]]
+id = "fs.ext4"
+kind = "fs"
+name = "ext4"
+we_read = true
+we_write = true
+builder = "new volume ext4"
+
+[[format]]
+id = "fs.squashfs"
+kind = "fs"
+name = "SquashFS 4.0"
+we_read = true
+we_write = true
+builder = "squashfs create"
+
+[[format]]
+id = "fs.hfs"
+kind = "fs"
+name = "HFS (Mac OS Standard)"
+we_read = true
+we_write = true
+builder = "new volume hfs"
+
+[[format]]
+id = "fs.hfsplus"
+kind = "fs"
+name = "HFS+ / HFSX"
+we_read = true
+we_write = true
+builder = "new volume hfsplus"
+
+[[format]]
+id = "fs.hfv"
+kind = "fs"
+name = "BasiliskII HFV"
+we_read = true
+we_write = true
+builder = "new volume hfv"
+notes = "Classic HFS only, 2047 MB ceiling"
+
+[[format]]
+id = "fs.mfs"
+kind = "fs"
+name = "MacPlus MFS"
+we_read = true
+we_write = true
+builder = "new floppy mfs"
+
+[[format]]
+id = "fs.apfs"
+kind = "fs"
+name = "APFS"
+we_read = true
+we_write = false
+
+[[format]]
+id = "fs.btrfs"
+kind = "fs"
+name = "btrfs"
+we_read = true
+we_write = false
+
+[[format]]
+id = "fs.jfs"
+kind = "fs"
+name = "JFS2"
+we_read = true
+we_write = false
+
+[[format]]
+id = "fs.reiserfs"
+kind = "fs"
+name = "ReiserFS v3"
+we_read = true
+we_write = false
+
+[[format]]
+id = "fs.minix1"
+kind = "fs"
+name = "Minix V1"
+we_read = true
+we_write = true
+builder = "new floppy minix"
+
+[[format]]
+id = "fs.minix2"
+kind = "fs"
+name = "Minix V2"
+we_read = true
+we_write = true
+builder = "new volume minix2"
+
+[[format]]
+id = "fs.minix3"
+kind = "fs"
+name = "Minix V3"
+we_read = true
+we_write = true
+builder = "new volume minix3"
+
+[[format]]
+id = "fs.ufs1"
+kind = "fs"
+name = "UFS1 / FFS"
+we_read = true
+we_write = false
+notes = "R-013: Solaris UFS directories mistyped as files with a garbage size"
+
+[[format]]
+id = "fs.ufs2"
+kind = "fs"
+name = "UFS2"
+we_read = true
+we_write = false
+notes = "Superblock offset differs: NetBSD makefs 8192, FreeBSD newfs 65536"
+
+[[format]]
+id = "fs.xfs"
+kind = "fs"
+name = "SGI XFS v4/v5"
+we_read = true
+we_write = false
+
+[[format]]
+id = "fs.efs"
+kind = "fs"
+name = "SGI EFS"
+we_read = true
+we_write = true
+builder = "new hd sgi-efs"
+
+[[format]]
+id = "fs.affs"
+kind = "fs"
+name = "AFFS (OFS/FFS)"
+we_read = true
+we_write = true
+builder = "new volume affs"
+
+[[format]]
+id = "fs.pfs3"
+kind = "fs"
+name = "PFS3 / PDS3 / muFS"
+we_read = true
+we_write = true
+notes = "create_blank_pfs3 exists in-engine for tests but is not exposed on the CLI"
+
+[[format]]
+id = "fs.sfs"
+kind = "fs"
+name = "SFS (Smart File System)"
+we_read = true
+we_write = true
+notes = "No oracle and no fixture anywhere — the last uncovered Amiga filesystem"
+
+[[format]]
+id = "fs.prodos"
+kind = "fs"
+name = "ProDOS"
+we_read = true
+we_write = true
+builder = "new volume prodos"
+
+[[format]]
+id = "fs.apple-dos"
+kind = "fs"
+name = "Apple DOS 3.3"
+we_read = true
+we_write = true
+builder = "new floppy apple-dos"
+
+[[format]]
+id = "fs.cpm"
+kind = "fs"
+name = "CP/M 2.2 / 3 / Plus"
+we_read = true
+we_write = true
+builder = "new floppy cpm"
+notes = "Nine DPB presets — the largest sub-axis in the suite"
+
+[[format]]
+id = "fs.human68k"
+kind = "fs"
+name = "Human68k"
+we_read = true
+we_write = true
+builder = "new hd x68k"
+
+[[format]]
+id = "fs.cbm"
+kind = "fs"
+name = "CBM DOS (1541/1571/1581/8050/8250)"
+we_read = true
+we_write = false
+
+[[format]]
+id = "fs.lisa"
+kind = "fs"
+name = "Apple Lisa File System"
+we_read = true
+we_write = false
+
+[[format]]
+id = "fs.alto-bfs"
+kind = "fs"
+name = "Alto BFS / TFS"
+we_read = true
+we_write = false
+
+# --- Containers --------------------------------------------------------------
+
+[[format]]
+id = "fmt.raw"
+kind = "container"
+name = "Raw"
+we_read = true
+we_write = true
+builder = "convert --format raw"
+
+[[format]]
+id = "fmt.chd"
+kind = "container"
+name = "CHD (MAME)"
+we_read = true
+we_write = true
+builder = "convert --format chd"
+
+[[format]]
+id = "fmt.vhd-fixed"
+kind = "container"
+name = "Fixed VHD"
+we_read = true
+we_write = true
+builder = "convert --format vhd"
+
+[[format]]
+id = "fmt.vhd-dynamic"
+kind = "container"
+name = "Dynamic VHD"
+we_read = true
+we_write = true
+builder = "convert --format vhd-dynamic"
+
+[[format]]
+id = "fmt.qcow2"
+kind = "container"
+name = "QCOW2"
+we_read = true
+we_write = true
+builder = "convert --format qcow2"
+
+[[format]]
+id = "fmt.vmdk-flat"
+kind = "container"
+name = "VMDK flat"
+we_read = true
+we_write = true
+builder = "convert --format vmdk-flat"
+
+[[format]]
+id = "fmt.vmdk-sparse"
+kind = "container"
+name = "VMDK sparse"
+we_read = true
+we_write = true
+builder = "convert --format vmdk-sparse"
+
+[[format]]
+id = "fmt.gho"
+kind = "container"
+name = "Norton Ghost"
+we_read = true
+we_write = false
+notes = "Includes the password-protected path"
+
+[[format]]
+id = "fmt.dmg"
+kind = "container"
+name = "Apple DMG"
+we_read = true
+we_write = false
+
+[[format]]
+id = "fmt.sparseimage"
+kind = "container"
+name = "Apple sparseimage"
+we_read = true
+we_write = false
+
+[[format]]
+id = "fmt.ndif"
+kind = "container"
+name = "NDIF / self-mounting"
+we_read = true
+we_write = false
+
+[[format]]
+id = "fmt.zip-disk"
+kind = "container"
+name = "ZIP (raw disk)"
+we_read = true
+we_write = false
+
+[[format]]
+id = "fmt.d88"
+kind = "container"
+name = "Sharp D88"
+we_read = true
+we_write = true
+builder = "floppy convert --to d88"
+
+[[format]]
+id = "fmt.cbk"
+kind = "container"
+name = "cb-dos container"
+we_read = true
+we_write = true
+builder = "cbk pack"
+notes = "Our own format — no third-party reader exists, so verify the full backup/restore/boot flow instead"
+
+# --- Optical -----------------------------------------------------------------
+
+[[format]]
+id = "optical.iso9660"
+kind = "optical"
+name = "ISO 9660 (+ Joliet, Rock Ridge)"
+we_read = true
+we_write = false
+
+[[format]]
+id = "optical.high-sierra"
+kind = "optical"
+name = "High Sierra"
+we_read = true
+we_write = false
+notes = "Implemented but was untested until a fixture arrived"
+
+[[format]]
+id = "optical.udf"
+kind = "optical"
+name = "UDF"
+we_read = true
+we_write = false
+
+[[format]]
+id = "optical.cdda"
+kind = "optical"
+name = "CD-DA / mixed mode"
+we_read = true
+we_write = false
+notes = "R-012: optical info rejects discs with no data track"
+
+# --- Partition schemes -------------------------------------------------------
+
+[[format]]
+id = "part.mbr"
+kind = "partition"
+name = "MBR"
+we_read = true
+we_write = true
+
+[[format]]
+id = "part.gpt"
+kind = "partition"
+name = "GPT"
+we_read = true
+we_write = true
+
+[[format]]
+id = "part.apm"
+kind = "partition"
+name = "APM"
+we_read = true
+we_write = true
+
+[[format]]
+id = "part.rdb"
+kind = "partition"
+name = "RDB (Amiga)"
+we_read = true
+we_write = false
+
+[[format]]
+id = "part.sgi"
+kind = "partition"
+name = "SGI volume header"
+we_read = true
+we_write = true
+builder = "new hd sgi-efs"
+
+[[format]]
+id = "part.sun"
+kind = "partition"
+name = "Sun disk label"
+we_read = true
+we_write = false
+
+[[format]]
+id = "part.ahdi"
+kind = "partition"
+name = "Atari AHDI"
+we_read = true
+we_write = false
+notes = "R-001: missing from the README partition-table list"
+
+[[format]]
+id = "part.x68k"
+kind = "partition"
+name = "Sharp X68000"
+we_read = true
+we_write = true
+builder = "new hd x68k"
+
+# =============================================================================
+# Remaining surface, completing the README compatibility tables.
+# Added 2026-08-02. IDs deliberately match the fixture-catalogue prefixes so
+# the fixture -> format mapping resolves.
+# =============================================================================
+
+# --- Filesystems: vintage ----------------------------------------------------
+
+[[format]]
+id = "fs.ucsd"
+kind = "fs"
+name = "UCSD p-System"
+we_read = true
+we_write = true
+builder = "new floppy ucsd"
+
+[[format]]
+id = "fs.atari-dos2"
+kind = "fs"
+name = "Atari DOS 2 (2.0S / 2.5)"
+we_read = true
+we_write = true
+builder = "new floppy atari"
+notes = "Enhanced density (2.5) is read-only"
+
+[[format]]
+id = "fs.atarist"
+kind = "fs"
+name = "Atari GEMDOS"
+we_read = true
+we_write = true
+notes = "FAT-derived; rides the FAT engine"
+
+[[format]]
+id = "fs.rsdos"
+kind = "fs"
+name = "RS-DOS (CoCo Disk BASIC)"
+we_read = true
+we_write = false
+
+[[format]]
+id = "fs.os9"
+kind = "fs"
+name = "OS-9 / NitrOS-9 RBF"
+we_read = true
+we_write = true
+builder = "new floppy os9"
+
+[[format]]
+id = "fs.dragondos"
+kind = "fs"
+name = "DragonDOS"
+we_read = true
+we_write = false
+
+[[format]]
+id = "fs.dfs"
+kind = "fs"
+name = "Acorn DFS"
+we_read = true
+we_write = false
+
+[[format]]
+id = "fs.adfs"
+kind = "fs"
+name = "Acorn ADFS / FileCore"
+we_read = true
+we_write = true
+builder = "new floppy adfs"
+
+[[format]]
+id = "fs.ti99"
+kind = "fs"
+name = "TI-99/4A"
+we_read = true
+we_write = true
+builder = "new floppy ti99"
+
+[[format]]
+id = "fs.trdos"
+kind = "fs"
+name = "TR-DOS (ZX Spectrum Beta Disk)"
+we_read = true
+we_write = true
+builder = "new floppy trdos"
+
+[[format]]
+id = "fs.oric"
+kind = "fs"
+name = "Oric Jasmin"
+we_read = true
+we_write = true
+builder = "new floppy oric"
+
+[[format]]
+id = "fs.cpc"
+kind = "fs"
+name = "Amstrad CPC AMSDOS"
+we_read = true
+we_write = false
+notes = "CP/M-derived; needs an explicit DPB via --fs-type"
+
+[[format]]
+id = "fs.qdos"
+kind = "fs"
+name = "QDOS (QXL.WIN)"
+we_read = true
+we_write = false
+notes = "Microdrive anchor held; the QXL.WIN hard-disk container is still unsourced"
+
+[[format]]
+id = "fs.pilot-cedar"
+kind = "fs"
+name = "Xerox Pilot / Cedar"
+we_read = true
+we_write = false
+
+[[format]]
+id = "fs.carve"
+kind = "fs"
+name = "Carve (raw recovery)"
+we_read = true
+we_write = false
+notes = "Synthetic view over unrecognised media; nothing third-party can verify it"
+
+# --- Containers: compressed streams -----------------------------------------
+
+[[format]]
+id = "fmt.zstd"
+kind = "container"
+name = "Zstd stream"
+we_read = true
+we_write = true
+builder = "backup --format zstd"
+
+[[format]]
+id = "fmt.gzip"
+kind = "container"
+name = "Gzip stream"
+we_read = true
+we_write = true
+builder = "backup --format gzip"
+
+[[format]]
+id = "fmt.lz4"
+kind = "container"
+name = "LZ4 stream"
+we_read = true
+we_write = true
+builder = "backup --format lz4"
+
+# --- Containers: Apple -------------------------------------------------------
+
+[[format]]
+id = "fmt.2mg"
+kind = "container"
+name = "Apple 2MG"
+we_read = true
+we_write = true
+builder = "convert --format twomg"
+
+[[format]]
+id = "fmt.apple-dsk"
+kind = "container"
+name = "Apple II DSK (.do / .po)"
+we_read = true
+we_write = false
+
+[[format]]
+id = "fmt.dc42"
+kind = "container"
+name = "Disk Copy 4.2"
+we_read = true
+we_write = true
+builder = "convert --format dc42"
+
+[[format]]
+id = "fmt.woz"
+kind = "container"
+name = "WOZ 2.0"
+we_read = true
+we_write = true
+builder = "convert --format woz"
+
+[[format]]
+id = "fmt.moof"
+kind = "container"
+name = "MOOF"
+we_read = true
+we_write = true
+builder = "convert --format moof"
+
+[[format]]
+id = "fmt.dart"
+kind = "container"
+name = "DART"
+we_read = true
+we_write = false
+
+# --- Containers: Amiga / Atari ----------------------------------------------
+
+[[format]]
+id = "fmt.adf"
+kind = "container"
+name = "Amiga ADF / HDF"
+we_read = true
+we_write = false
+
+[[format]]
+id = "fmt.adz"
+kind = "container"
+name = "Gzip-wrapped ADZ / HDZ"
+we_read = true
+we_write = false
+
+[[format]]
+id = "fmt.msa"
+kind = "container"
+name = "Atari MSA"
+we_read = true
+we_write = false
+
+[[format]]
+id = "fmt.atari-disk"
+kind = "container"
+name = "Atari disk (ATR / XFD)"
+we_read = true
+we_write = false
+
+# --- Containers: 8-bit -------------------------------------------------------
+
+[[format]]
+id = "fmt.edsk"
+kind = "container"
+name = "CPCEMU DSK / EDSK"
+we_read = true
+we_write = false
+
+[[format]]
+id = "fmt.cbm-disk"
+kind = "container"
+name = "Commodore disk (D64 / D71 / D81 / D80 / D82)"
+we_read = true
+we_write = false
+
+[[format]]
+id = "fmt.g64"
+kind = "container"
+name = "Commodore GCR (G64 / G71)"
+we_read = true
+we_write = false
+notes = "R-011: copy-protected and patched dumps fail to decode"
+
+[[format]]
+id = "fmt.coco-disk"
+kind = "container"
+name = "CoCo disk (JVC / VDK)"
+we_read = true
+we_write = false
+
+[[format]]
+id = "fmt.acorn-dfs-disk"
+kind = "container"
+name = "Acorn DFS disk (SSD / DSD)"
+we_read = true
+we_write = false
+
+[[format]]
+id = "fmt.trdos-disk"
+kind = "container"
+name = "ZX Spectrum TR-DOS (TRD)"
+we_read = true
+we_write = false
+
+[[format]]
+id = "fmt.ti99-disk"
+kind = "container"
+name = "TI-99/4A disk (V9T9)"
+we_read = true
+we_write = false
+
+# --- Containers: Japanese PC -------------------------------------------------
+
+[[format]]
+id = "fmt.xdf"
+kind = "container"
+name = "X68000 XDF"
+we_read = true
+we_write = true
+builder = "floppy convert --to xdf"
+
+[[format]]
+id = "fmt.hdm"
+kind = "container"
+name = "PC-98 HDM"
+we_read = true
+we_write = true
+builder = "floppy convert --to hdm"
+
+[[format]]
+id = "fmt.dim"
+kind = "container"
+name = "DiskExplorer DIM"
+we_read = true
+we_write = true
+builder = "floppy convert --to dim"
+
+[[format]]
+id = "fmt.x68k-hdd"
+kind = "container"
+name = "X68000 HDD (HDS / HDF)"
+we_read = true
+we_write = true
+builder = "new hd x68k"
+
+# --- Containers: PC / misc ---------------------------------------------------
+
+[[format]]
+id = "fmt.ima"
+kind = "container"
+name = "WinImage (IMA)"
+we_read = true
+we_write = false
+
+[[format]]
+id = "fmt.imz"
+kind = "container"
+name = "WinImage compressed (IMZ)"
+we_read = true
+we_write = false
+notes = "Encrypted variant needs both a correct- and a wrong-password case"
+
+[[format]]
+id = "fmt.appimage"
+kind = "container"
+name = "AppImage"
+we_read = true
+we_write = false
+notes = "ELF stub with an appended SquashFS; the payload opens in place"
+
+# The .cue entry point and the CloneCD .ccd/.img/.sub set are separate formats
+# from the BIN/CUE pair below: a disc arrives as one or the other, and R-015 is
+# about the cue parser specifically.
+[[format]]
+id = "optical.cue"
+kind = "optical"
+name = "CUE sheet"
+we_read = true
+we_write = false
+notes = "R-015: a cue with unpadded track numbers (`TRACK 1`) is rejected"
+
+[[format]]
+id = "optical.clonecd"
+kind = "optical"
+name = "CloneCD (.ccd / .img / .sub)"
+we_read = true
+we_write = false
+
+[[format]]
+id = "fmt.bincue"
+kind = "container"
+name = "BIN/CUE"
+we_read = true
+we_write = true
+builder = "convert --format bincue"
+notes = "R-012: a cue with no data track is rejected"
+
+[[format]]
+id = "fmt.raw-physical"
+kind = "container"
+name = "Raw physical disk"
+we_read = true
+we_write = true
+notes = "Device paths differ per OS and writes need elevation. See HARDWARE.md"
+
+# --- Containers: Xerox -------------------------------------------------------
+
+[[format]]
+id = "fmt.altodisk"
+kind = "container"
+name = "Xerox Alto pack"
+we_read = true
+we_write = false
+
+[[format]]
+id = "fmt.salto"
+kind = "container"
+name = "Salto disk"
+we_read = true
+we_write = false
+
+[[format]]
+id = "fmt.contralto2"
+kind = "container"
+name = "ContrAlto2"
+we_read = true
+we_write = false
+
+[[format]]
+id = "fmt.diablo"
+kind = "container"
+name = "Diablo Trident pack"
+we_read = true
+we_write = false
+
+[[format]]
+id = "fmt.xerox-d0"
+kind = "container"
+name = "Xerox D0 disk"
+we_read = true
+we_write = false
+
+[[format]]
+id = "fmt.pilot-cedar-vol"
+kind = "container"
+name = "Xerox Pilot / Cedar volume"
+we_read = true
+we_write = false
+
+[[format]]
+id = "fmt.dwarf"
+kind = "container"
+name = "Dwarf 6085 disk"
+we_read = true
+we_write = false
+
+# --- Optical -----------------------------------------------------------------
+
+[[format]]
+id = "optical.hfs"
+kind = "optical"
+name = "Optical HFS / HFS+"
+we_read = true
+we_write = false
+
+[[format]]
+id = "optical.efs"
+kind = "optical"
+name = "Optical SGI EFS"
+we_read = true
+we_write = true
+builder = "optical new sgi-efs"
+
+[[format]]
+id = "optical.ufs"
+kind = "optical"
+name = "Optical UFS / FFS"
+we_read = true
+we_write = false
+notes = "NeXTSTEP install media is the canonical case; Solaris CDs are plain ISO 9660"
+
+[[format]]
+id = "optical.ods2"
+kind = "optical"
+name = "VMS ODS-2 / Files-11"
+we_read = true
+we_write = false
+
+[[format]]
+id = "optical.gamecube"
+kind = "optical"
+name = "GameCube / Wii"
+we_read = true
+we_write = false
+
+[[format]]
+id = "optical.cdi"
+kind = "optical"
+name = "CD-i"
+we_read = true
+we_write = false
+
+[[format]]
+id = "optical.3do-opera"
+kind = "optical"
+name = "3DO Opera"
+we_read = true
+we_write = false
+
+[[format]]
+id = "optical.chdcd"
+kind = "optical"
+name = "CHD CD profile"
+we_read = true
+we_write = true
+builder = "convert --format chd-cd"
+
+# --- Partition ---------------------------------------------------------------
+
+[[format]]
+id = "part.none"
+kind = "partition"
+name = "None (superfloppy)"
+we_read = true
+we_write = false
+notes = """R-009: detection misses JFS, UFS1/2 and ReiserFS.
+
+Deliberately we_write = false. A superfloppy is defined by the ABSENCE of a
+partition table, so there is nothing for an oracle to inspect — any filesystem
+oracle that reads the volume at offset 0 has already proved it. Listing it as
+a write path would manufacture a permanent unfillable gap."""

@@ -1,0 +1,171 @@
+# Host-local regression config. Copy to `local.toml` and edit.
+#
+# `local.toml` is THE gitignored file. It is the only place in this repository
+# where a real path, hostname, address or user may appear, and it is the only
+# file you have to carry when you set up another machine — copy it across,
+# adjust `fixture_root` for that host's mount point, and everything else works.
+#
+# This is a public repository. A committed corpus path or LAN address is a
+# leak, not a convenience. If you find one, take it out.
+#
+# It replaced three separate gitignored files — `data/hosts.toml`,
+# `scripts/hosts.local` and a fixture-root-only `local.toml`. Three files meant
+# three chances to leave one behind, and the capability half of the host
+# inventory drifted from the connection half.
+
+# --- Paths --------------------------------------------------------------------
+#
+# LOCAL FIRST. A run reads `fixture_root` and nothing else — never a network
+# share. `corpus_source` is where the corpus is *fetched from*, once, by
+# `rb-regress fixtures --sync`. Keeping those separate is the point:
+#
+#   * a run over SMB is slow, and a share that drops mid-run turns into a wall
+#     of skip-fixture that reads like a corpus problem
+#   * it makes the share's address a runtime dependency of the suite, which on
+#     a public repository is exactly how a private path ends up in a doc
+#   * it hides gaps in the corpus itself: three optical cases passed for weeks
+#     against the share and failed the moment the corpus was copied local,
+#     because the share held sibling files the sync had never fetched
+#
+# A relative path is relative to this file, so "fixtures" means
+# regression-tests/fixtures/ no matter where the command is run from. That
+# directory and its `fixtures-large/` sibling are gitignored.
+#
+# Overridden by --fixture-root or RB_FIXTURE_ROOT. Cases backed by `repo:`
+# catalogue rows resolve without either, so tiers 0-2 largely work unset.
+#
+# The catalogue the runner reads is `fixture-map.tsv` BESIDE the corpus
+# directory, and `--sync` copies it down with the fixtures — see FIXTURES.md.
+fixture_root = "fixtures"
+
+# Where `--sync` fetches from: a NAS, an external disk, another machine.
+# Optional. A host that already has its corpus needs no source at all, and a
+# host with no source simply cannot sync — nothing else changes.
+corpus_source = "//SERVER/share/rb-fixtures/fixtures"
+
+# Where run bundles are written. Defaults to regression-tests/runs.
+# report_root = "//SERVER/share/rb-fixtures/runs"
+
+# --- Hosts --------------------------------------------------------------------
+#
+# One entry per machine. Two consumers, one table:
+#
+#   `rb-regress plan`         uses platform / transport / can_produce /
+#                             can_verify to work out who produces each artifact
+#                             and who can verify it. `platform` is the field
+#                             that matters — it joins this host to every oracle
+#                             marked available on that platform in oracles.toml,
+#                             so declaring one Linux box inherits fsck.ext4,
+#                             unsquashfs, xfs_repair and the whole mount set
+#                             without listing any of them here.
+#
+#   `scripts/regress-all.sh`  uses ssh / repo / shell to drive it. A host
+#                             without both `ssh` and `repo` is skipped by the
+#                             driver but still counted by the planner.
+#
+# `shell` is `bash` for a host whose toolchain is on the default
+# non-interactive PATH, or a login-shell invocation for one whose is not.
+# macOS needs the latter: a non-interactive ssh session there gets
+# /usr/bin:/bin only, so Homebrew's cargo is invisible and the build fails
+# with "cargo: not found".
+#
+# Only list machines you have actually reached and probed. An aspirational
+# entry turns straight into an optimistic plan: a format reads as "verifiable"
+# because some machine that does not answer is supposed to hold its oracle.
+
+[[host]]
+id = "local"
+platform = "windows"
+transport = "local"
+can_produce = true
+can_verify = true
+notes = "Development box. Uniquely holds ghostexp (GHO) and chkdsk."
+
+# WSL is a separate host even though it is the same machine: different
+# platform, different oracle set, and artifacts need a wslpath translation.
+[[host]]
+id = "wsl"
+platform = "wsl"
+transport = "wsl"
+can_produce = false
+can_verify = true
+notes = "Lighter than a real Linux box - no hfs, affs, minix, jfs or ntfs3 mounts."
+
+# One Linux box does all Linux filesystem validation, taking artifacts
+# produced on Windows and macOS.
+[[host]]
+id = "linuxbox"
+platform = "linux"
+transport = "ssh"
+can_produce = true
+can_verify = true
+ssh = "user@linuxbox.example"
+repo = "repos/rusty-backup"
+shell = "bash"
+notes = "Needs linux-modules-extra for the hfs/hfsplus/affs/minix/jfs/ntfs3/ufs/efs mounts."
+
+[[host]]
+id = "mac"
+platform = "macos"
+transport = "ssh"
+can_produce = true
+can_verify = true
+ssh = "user@mac.example"
+repo = "repos/rusty-backup"
+shell = "zsh -lc"
+notes = "Not optional: fsck_hfs, fsck_apfs and hdiutil exist nowhere else."
+
+# A MiSTer is TWO verification surfaces and they are worth very different
+# things. Declaring one host would conflate them.
+#
+#   HPS  — the ARM Linux side (Hard Processor System). Its fsck and mount
+#          results are LINUX results that happen to run on ARM. Useful, but
+#          no more authoritative than the same check on linuxbox.
+#   CORE — the FPGA core: the vintage machine itself, running the real guest
+#          OS with its own filesystem code. This is the authoritative
+#          reference, and the only thing a MiSTer offers that a Linux box
+#          cannot.
+#
+# The HPS remains essential as plumbing — it is how images reach the SD card
+# and how a guest-written result file is read back — but plumbing is not an
+# oracle.
+#
+# Set can_verify = false while no session is booked: the hardware needs
+# scheduled time, so routing jobs there produces a plan nobody can execute.
+[[host]]
+id = "mister-hps"
+platform = "mister-hps"
+transport = "ssh"
+can_produce = true
+can_verify = false
+ssh = "root@mister.example"
+repo = "media/fat/Scripts"
+notes = "ARM Linux side. Also the transport for core-side jobs."
+
+[[host]]
+id = "mister-core"
+platform = "mister-core"
+transport = "ssh"
+can_produce = false
+can_verify = false
+notes = "The FPGA cores. Reached via the HPS. Authoritative for Amiga, X68000 and Atari ST formats."
+
+# --- MiSTer specifics ---------------------------------------------------------
+#
+# The board needs a key that is actually offered. Note the global
+# `IdentitiesOnly yes` in ~/.ssh/config: with it set, ssh offers *only* keys
+# named explicitly, so a MiSTer key sitting in ~/.ssh is silently not tried
+# and auth fails with "Permission denied (publickey,password,...)" even
+# though the key is right there. Name it here, or add a matching `Host` block
+# with an `IdentityFile` to ~/.ssh/config.
+
+# [mister]
+# enabled = true
+# identity_file = "~/.ssh/mister_key"
+# games_dir = "/media/fat/games"
+
+# --- Hardware tier ------------------------------------------------------------
+#
+# Physical device cases additionally require --allow-hardware and a device
+# allowlist; see HARDWARE.md. Listing a device here does not enable anything.
+# device_allowlist = "regression-tests/local-devices.toml"

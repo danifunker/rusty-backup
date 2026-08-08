@@ -1,0 +1,188 @@
+# Tier 3 — an edit case for the filesystems the first pass missed.
+#
+# README advertises edit mode on eighteen filesystems. After the first tier-3
+# sweep, nine of them still had no edit case at all: exFAT, PFS3, SFS, Apple
+# DOS 3.3, MacPlus MFS, UFS, CP/M, Human68k and XFS. Half the advertised
+# surface.
+#
+# They split into two shapes:
+#
+#   * buildable      `new` can create one, so the case formats a blank volume
+#                    and edits it, exactly like the first pass.
+#   * fixture-backed exFAT, PFS3, SFS and UFS have NO builder — formats.toml
+#                    says so explicitly for exFAT ("read/edit only, so a
+#                    reference fixture is mandatory"). Those use
+#                    `{fixture_copy}`, which takes a private copy into scratch
+#                    first, because an edit case must never write to the
+#                    corpus. A fixture that a test mutated is no longer a
+#                    reference.
+#
+# Fixture-backed cases report skip-fixture without the corpus, so this file
+# still runs on a bare clone — it just covers less.
+
+[meta]
+tier = 3
+group = "edit.remaining"
+description = "At least one edit case for every filesystem README says we can edit."
+
+# --- buildable ----------------------------------------------------------------
+
+[[case]]
+id = "edit.xfs.put-get"
+description = "XFS: minimum volume is 32 MiB, so this one is necessarily larger"
+[[case.step]]
+args = ["new", "volume", "xfs", "--size", "32M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{scratch}/v.img", "/payload.bin", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+
+[[case]]
+id = "edit.mfs.put-get"
+description = "MacPlus MFS — a 400/800K pre-HFS floppy"
+[[case.step]]
+args = ["new", "floppy", "mfs", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{scratch}/v.img", "/payload.bin", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+
+[[case]]
+id = "edit.apple-dos.put-get"
+description = "Apple DOS 3.3 — 140 KB, so the payload has to be small"
+[[case.step]]
+args = ["new", "floppy", "apple-dos", "{scratch}/v.dsk"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.dsk", "{cases}/tier3/payload.bin", "/PAYLOAD"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{scratch}/v.dsk", "/PAYLOAD", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+
+[[case]]
+id = "edit.cpm.put-get"
+description = "CP/M via the Amstrad DPB; the preset must be given on every call"
+[[case.step]]
+args = ["new", "floppy", "cpm", "--cpm-preset", "amstrad_data", "{scratch}/v.dsk"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.dsk", "{cases}/tier3/payload.bin", "/PAYLOAD.BIN", "--fs-type", "cpm:amstrad_data"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{scratch}/v.dsk", "/PAYLOAD.BIN", "{scratch}/out.bin", "--fs-type", "cpm:amstrad_data"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+
+[[case]]
+id = "edit.human68k.put-get"
+description = "Human68k lives on an X68000 hard disk, so the volume is partitioned"
+[[case.step]]
+args = ["new", "hd", "x68k", "--size", "16M", "{scratch}/v.hdf"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.hdf@1", "{cases}/tier3/payload.bin", "/PAYLOAD.BIN"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{scratch}/v.hdf@1", "/PAYLOAD.BIN", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+
+# --- fixture-backed: no builder exists ----------------------------------------
+# {fixture_copy} is essential here, not a convenience. These cases mutate the
+# volume, and a reference fixture that a test wrote to has stopped being a
+# reference.
+
+[[case]]
+id = "edit.exfat.put-get"
+description = "exFAT has no builder at all — formats.toml calls a fixture mandatory"
+fixture = "fs.exfat.base.hd"
+[[case.step]]
+args = ["put", "{fixture_copy}", "{cases}/tier3/payload.bin", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{fixture_copy}", "/payload.bin", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+[[case.step]]
+args = ["fsck", "{fixture_copy}", "--checkonly"]
+expect_exit = 0
+
+[[case]]
+id = "edit.ufs1.put-get"
+fixture = "fs.ufs1.base.hd"
+[[case.step]]
+args = ["put", "{fixture_copy}", "{cases}/tier3/payload.bin", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{fixture_copy}", "/payload.bin", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+[[case.step]]
+args = ["fsck", "{fixture_copy}", "--checkonly"]
+expect_exit = 0
+
+[[case]]
+id = "edit.ufs2.put-get"
+fixture = "fs.ufs2.base.hd"
+[[case.step]]
+args = ["put", "{fixture_copy}", "{cases}/tier3/payload.bin", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{fixture_copy}", "/payload.bin", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+[[case.step]]
+args = ["fsck", "{fixture_copy}", "--checkonly"]
+expect_exit = 0
+
+[[case]]
+id = "edit.sfs.put-get"
+description = """SFS edit round-trip. This is the case the FS-UAE oracle work was
+aiming at: rb-cli cannot WRITE an SFS volume from scratch, so the only way to
+exercise the SFS editor is to edit the reference volume and check the result."""
+fixture = "fs.sfs.workbench-dh0.hd"
+timeout_ms = 600000
+[[case.step]]
+args = ["put", "{fixture_copy}", "{cases}/tier3/payload.bin", "/payload.bin", "--fs-type", "SFS\\0"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{fixture_copy}", "/payload.bin", "{scratch}/out.bin", "--fs-type", "SFS\\0"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+[[case.step]]
+args = ["fsck", "{fixture_copy}", "--checkonly", "--fs-type", "SFS\\0"]
+expect_exit = 0
+
+# --- PFS3 ---------------------------------------------------------------------
+# `fs.pfs3.rdb-cd32saves.hd` (80 MB, RDB-partitioned) is catalogued and was
+# simply unused. An earlier draft of this file claimed no PFS3 fixture existed;
+# that came from reading the case files rather than the catalogue, which is the
+# wrong direction to check in.
+
+[[case]]
+id = "edit.pfs3.put-get"
+description = "PFS3 edit round-trip against the catalogued RDB volume"
+fixture = "fs.pfs3.rdb-cd32saves.hd"
+[[case.step]]
+args = ["put", "{fixture_copy}", "{cases}/tier3/payload.bin", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{fixture_copy}", "/payload.bin", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]

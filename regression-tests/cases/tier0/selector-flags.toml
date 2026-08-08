@@ -1,0 +1,34 @@
+# Tier 0 — flags the CLI contract says exist.
+#
+# These assert the **intended** behaviour, so they are red until the finding
+# they pin is fixed and green afterwards. That is the point: a failing case is
+# the tracking mechanism, and the same case then guards against the bug
+# coming back. Do not "fix" one of these by asserting the broken behaviour.
+
+[meta]
+tier = 0
+group = "cli.flags"
+description = "Flags documented or implied by the CLI contract, per finding."
+
+# --- R-010 ------------------------------------------------------------------
+
+[[case]]
+id = "cli.flags.inspect-accepts-fs-type"
+description = "R-010: --fs-type exists on ls/fsck/du but not inspect, so signature-less formats (all nine CP/M DPBs) cannot be inspected at all"
+# Needs no fixture: the flag is rejected during argument parsing, before the
+# image is ever opened, so a non-existent path still proves the point.
+[[case.step]]
+args = ["inspect", "no-such-image.dsk", "--fs-type", "cpm:amstrad_data"]
+# Exit 3 = NOT_FOUND would mean the flag parsed and the file was missing,
+# which is what we want. Exit 2 = USAGE_ERROR means the flag itself was
+# rejected — the bug.
+expect_exit = 3
+
+[[case]]
+id = "cli.flags.ls-accepts-fs-type"
+description = "The working half of R-010 — ls does take --fs-type. Guards the path CP/M currently depends on."
+fixture = "fs.cpc.amsdos.floppy"
+[[case.step]]
+args = ["ls", "{fixture}", "--fs-type", "cpm:amstrad_data"]
+expect_exit = 0
+stdout_contains = ["MANIC.BAS", "MANIC.BIN"]

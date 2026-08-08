@@ -8,7 +8,7 @@ something the host's `ar` can do. GNU ar writes a System V symbol table; Apple's
 linker wants a Mach-O `__.SYMDEF`, so an archive built here would be rejected on
 the Mac. So the archive is built where its objects were: on the Mac.
 
-    export PPC_HOST=admin@192.168.99.116
+    export PPC_HOST=user@ppc-host
     export AR_powerpc_apple_darwin=/path/to/scripts/ppc-ar-remote.py
 
 cc-rs drives this in two shapes (see its `assemble` / `assemble_progressive`):
@@ -23,7 +23,7 @@ which is exactly the probe cc-rs makes: it tries `sD`, and on failure retries
 passed straight back rather than being turned into an error.
 
 Environment:
-  PPC_HOST         ssh destination (required), e.g. admin@192.168.99.116
+  PPC_HOST         ssh destination (required), e.g. user@ppc-host
   PPC_AR           remote archiver (default: /usr/bin/ar -- Apple's cctools ar,
                    not gcc10's, so the archive is native Mach-O)
   PPC_REMOTE_ROOT  remote mirror of the local build tree (default: ppc-xbuild)
@@ -63,7 +63,7 @@ def mirrored(path):
 
 def main():
     if not HOST:
-        die("PPC_HOST is not set (e.g. PPC_HOST=admin@192.168.99.116)")
+        die("PPC_HOST is not set (e.g. PPC_HOST=user@ppc-host)")
 
     args = sys.argv[1:]
     if not args:

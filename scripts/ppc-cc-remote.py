@@ -12,14 +12,14 @@ and every codegen step transparently ships its `.c` to the Mac, runs gcc there,
 and copies the `.o` back. minicargo's dependency graph, parallelism and
 incremental rebuilds all keep working.
 
-    export PPC_HOST=admin@192.168.99.116
+    export PPC_HOST=user@ppc-host
     export CC_powerpc_apple_darwin=/path/to/scripts/ppc-cc-remote.py
 
 mrustc invokes the compiler as a single shell string with every argument in a
 response file (`cc @cmdfile`), so that form is handled here too.
 
 Environment:
-  PPC_HOST         ssh destination (required), e.g. admin@192.168.99.116
+  PPC_HOST         ssh destination (required), e.g. user@ppc-host
   PPC_CC           remote compiler (default: MacPorts gcc10 -- mrustc's C
                    needs C11 <stdatomic.h>, which Xcode's gcc-4.x lacks)
   PPC_REMOTE_ROOT  remote mirror of the local build tree (default: ppc-xbuild)
@@ -562,7 +562,7 @@ def should_mirror_dir(path, full):
 
 def main():
     if not HOST:
-        die("PPC_HOST is not set (e.g. PPC_HOST=admin@192.168.99.116)")
+        die("PPC_HOST is not set (e.g. PPC_HOST=user@ppc-host)")
 
     args = expand_parts(expand_response_files(sys.argv[1:]))
     if not args:

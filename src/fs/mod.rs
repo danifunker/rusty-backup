@@ -2759,6 +2759,15 @@ pub fn is_browsable_superfloppy(ptype: u8, type_name: &str) -> bool {
             | "XFS"
             | "ext"
             | "btrfs"
+            // Bare JFS / UFS / ReiserFS dumps. `detect_filesystem_type` has
+            // always known these; only `detect_superfloppy` was missing the
+            // probes, so a raw partition dump could not be opened at all.
+            | "JFS"
+            | "UFS"
+            | "ReiserFS"
+            // Appliance / live-CD SquashFS root, shipped with no partition
+            // table.
+            | "squashfs"
             | "EFS"
             | "MFS"
             // Minix (raw floppy / hard-disk superfloppy); auto-detected at
@@ -2788,6 +2797,9 @@ pub fn is_browsable_superfloppy(ptype: u8, type_name: &str) -> bool {
             | "TR-DOS"
             // TI-99/4A (flat V9T9 .dsk); auto-detected via the VIB "DSK" marker.
             | "TI-99"
+            // Oric Jasmin (flat 256-byte-sector .dsk); free-map markers at
+            // block 340.
+            | "Oric Jasmin"
             | "Unknown"
     )
 }
@@ -3490,6 +3502,17 @@ mod tests {
             "DragonDOS",
             "OS-9",
             "RS-DOS",
+            "minix",
+            "ucsd",
+            "TR-DOS",
+            "TI-99",
+            "Oric Jasmin",
+            "squashfs",
+            // R-009 / R-017: `detect_superfloppy` had no probe for these, so a
+            // bare dump failed partition-table detection outright.
+            "JFS",
+            "UFS",
+            "ReiserFS",
         ] {
             assert!(
                 is_browsable_superfloppy(0, hint),
@@ -3497,6 +3520,9 @@ mod tests {
             );
             assert!(partition_is_browsable(0, None, hint), "hint {hint:?}");
         }
+        // SFS reports its DosType and routes through `partition_type_string`,
+        // exactly as an AmigaDOS superfloppy does.
+        assert!(partition_is_browsable(0, Some("SFS\\0"), "SFS (Amiga)"));
     }
 
     #[test]

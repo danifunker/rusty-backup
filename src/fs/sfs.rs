@@ -299,6 +299,29 @@ pub struct SfsFilesystem<R: Read + Seek> {
     free_blocks_cached: u64,
 }
 
+/// Cheap identity probe for a bare SFS volume, used by
+/// `partition::detect_superfloppy`. The `SFS\0` id, the ownblock-is-0 field and
+/// the whole-block checksum together make a false positive negligible.
+pub fn looks_like_sfs<R: Read + Seek>(reader: &mut R, partition_offset: u64) -> bool {
+    let mut probe = [0u8; 512];
+    if reader.seek(SeekFrom::Start(partition_offset)).is_err()
+        || reader.read_exact(&mut probe).is_err()
+        || rd_u32(&probe, 0) != ROOTBLOCK_ID
+    {
+        return false;
+    }
+    let blocksize = rd_u32(&probe, 52) as u64;
+    if !(512..=65536).contains(&blocksize) || !blocksize.is_multiple_of(512) {
+        return false;
+    }
+    // Identity only, not capability: an unsupported structure version still
+    // gets claimed here so the user sees SFS's own error, not an MBR one.
+    let mut buf = vec![0u8; blocksize as usize];
+    reader.seek(SeekFrom::Start(partition_offset)).is_ok()
+        && reader.read_exact(&mut buf).is_ok()
+        && SfsRootBlock::parse(&buf, 0).is_ok()
+}
+
 impl<R: Read + Seek> SfsFilesystem<R> {
     pub fn open(mut reader: R, partition_offset: u64) -> Result<Self, FilesystemError> {
         let end = reader.seek(SeekFrom::End(0))?;

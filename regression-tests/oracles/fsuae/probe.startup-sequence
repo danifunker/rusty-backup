@@ -1,0 +1,12 @@
+; rb-regress guest probe. Appended to a Workbench S/Startup-Sequence, and it
+; MUST be inserted BEFORE the closing `EndCLI` — EndCLI ends the shell, so
+; anything after it never runs and the sentinel never appears.
+;
+; FAILAT 21 stops AmigaDOS aborting the script when a command against an
+; unrecognised volume returns ERROR(20). Without it the run dies before writing
+; done.txt and the host cannot tell "the volume is bad" from "the emulator
+; never booted" — the two outcomes that most need distinguishing.
+FAILAT 21
+Info >RESULTS:info.txt
+List DH1: >RESULTS:listing.txt
+Echo "DONE" >RESULTS:done.txt

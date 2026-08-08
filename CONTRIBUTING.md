@@ -326,9 +326,11 @@ Known-safe within the floor (no shim needed): `div_ceil` / `next_multiple_of` (1
 # unused-import warnings for the polyfill trait — those are the modern compiler
 # seeing the inherent method and are benign; a hard ERROR is the real signal.
 cargo build --manifest-path rb-cli-vintage/Cargo.toml \
-  --no-default-features --features native-zstd,remote,tui,rust173-polyfill \
+  --no-default-features --features native-zstd,remote,tui,rust173-polyfill,windows-legacy,yaml \
   --ignore-rust-version
 ```
+
+That feature list is exactly what CI's Windows vintage leg builds (`.github/workflows/release.yml`), so keep the two together. **`windows-legacy` is not optional on Windows** — the vintage manifest pins the `windows` crate to 0.58 (0.62 needs rustc 1.82), and 0.61 wrapped some nullable pointer params in `Option`, so `src/os/windows.rs` carries `#[cfg]`-split call sites for `CreateWellKnownSid` and `ShellExecuteW`. Omit the feature and the build dies with four `Option<PSID>` / `Option<HWND>` type errors that look like an engine bug and are not one. It gates only `#[cfg(windows)]` code, so it is inert on the macOS 10.7 leg and this one command is correct on every platform.
 
 The definitive check is an actual `rustup toolchain install 1.73.0` build of that manifest; the command above is the cheap proxy that catches the wiring mistakes (wrong shim path, raw `io::Error::other` left in, unused imports).
 

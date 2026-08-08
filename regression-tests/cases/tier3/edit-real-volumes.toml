@@ -1,0 +1,226 @@
+# Tier 3 — edit REAL volumes, not just ones we formatted ourselves.
+#
+# Every edit case so far starts with `new volume`, which means rb-cli edits a
+# volume rb-cli created. R-020 is the argument against relying on that: our
+# AFFS formatter produces volumes no real Amiga will mount, and rb-cli's own
+# fsck agrees with the formatter rather than with reality. An editor tested
+# only against our own output inherits every assumption the formatter made.
+#
+# So: the same put/get/fsck round-trip, against third-party reference volumes.
+# 58 of the 84 catalogued fixtures were unused when this file was written;
+# these are the ones that buy the most.
+#
+# All of these use {fixture_copy}. An edit case mutates the volume, and a
+# reference fixture a test has written to has stopped being a reference.
+
+[meta]
+tier = 3
+group = "edit.real"
+description = "Edit third-party reference volumes, so the editors are not judged against our own formatter."
+
+[[case]]
+id = "edit.real.affs-workbench13"
+description = "A genuine Workbench 1.3 AFFS volume. Worth more than the synthetic AFFS case: R-020 says our formatter's output is not a volume any Amiga accepts, so editing our own output proves very little."
+fixture = "fs.affs.workbench13.hd"
+[[case.step]]
+args = ["put", "{fixture_copy}", "{cases}/tier3/payload.bin", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{fixture_copy}", "/payload.bin", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+[[case.step]]
+args = ["fsck", "{fixture_copy}", "--checkonly"]
+expect_exit = 0
+
+[[case]]
+id = "edit.real.affs-ffs-intl-cd32"
+fixture = "fs.affs.ffs-intl-cd32.hd"
+[[case.step]]
+args = ["put", "{fixture_copy}", "{cases}/tier3/payload.bin", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{fixture_copy}", "/payload.bin", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+[[case.step]]
+args = ["fsck", "{fixture_copy}", "--checkonly"]
+expect_exit = 0
+
+[[case]]
+id = "edit.real.ntfs"
+fixture = "fs.ntfs.base.hd"
+[[case.step]]
+args = ["put", "{fixture_copy}", "{cases}/tier3/payload.bin", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{fixture_copy}", "/payload.bin", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+[[case.step]]
+args = ["fsck", "{fixture_copy}", "--checkonly"]
+expect_exit = 0
+
+[[case]]
+id = "edit.real.ext4"
+fixture = "fs.ext4.base.hd"
+[[case.step]]
+args = ["put", "{fixture_copy}", "{cases}/tier3/payload.bin", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{fixture_copy}", "/payload.bin", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+[[case.step]]
+args = ["fsck", "{fixture_copy}", "--checkonly"]
+expect_exit = 0
+
+[[case]]
+id = "edit.real.ext2"
+fixture = "fs.ext2.base.hd"
+[[case.step]]
+args = ["put", "{fixture_copy}", "{cases}/tier3/payload.bin", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{fixture_copy}", "/payload.bin", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+[[case.step]]
+args = ["fsck", "{fixture_copy}", "--checkonly"]
+expect_exit = 0
+
+[[case]]
+id = "edit.real.fat16"
+fixture = "fs.fat16.base.hd"
+[[case.step]]
+args = ["put", "{fixture_copy}", "{cases}/tier3/payload.bin", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{fixture_copy}", "/payload.bin", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+[[case.step]]
+args = ["fsck", "{fixture_copy}", "--checkonly"]
+expect_exit = 0
+
+[[case]]
+id = "edit.real.fat32"
+fixture = "fs.fat32.base.hd"
+[[case.step]]
+args = ["put", "{fixture_copy}", "{cases}/tier3/payload.bin", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{fixture_copy}", "/payload.bin", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+[[case.step]]
+args = ["fsck", "{fixture_copy}", "--checkonly"]
+expect_exit = 0
+
+[[case]]
+id = "edit.real.hfsplus"
+fixture = "fs.hfsplus.base.hd"
+[[case.step]]
+args = ["put", "{fixture_copy}", "{cases}/tier3/payload.bin", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{fixture_copy}", "/payload.bin", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+[[case.step]]
+args = ["fsck", "{fixture_copy}", "--checkonly"]
+expect_exit = 0
+
+[[case]]
+id = "edit.real.hfs-populated-macii"
+description = "A populated Mac II volume — a real directory tree, not an empty root"
+fixture = "fs.hfs.populated-macii.hd"
+[[case.step]]
+args = ["put", "{fixture_copy}", "{cases}/tier3/payload.bin", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{fixture_copy}", "/payload.bin", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+[[case.step]]
+args = ["fsck", "{fixture_copy}", "--checkonly"]
+expect_exit = 0
+
+[[case]]
+id = "edit.real.hfv-populated-macos81"
+fixture = "fs.hfv.populated-macos81.hd"
+[[case.step]]
+args = ["put", "{fixture_copy}", "{cases}/tier3/payload.bin", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{fixture_copy}", "/payload.bin", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+[[case.step]]
+args = ["fsck", "{fixture_copy}", "--checkonly"]
+expect_exit = 0
+
+[[case]]
+id = "edit.real.prodos"
+fixture = "fs.prodos.base.hd"
+[[case.step]]
+args = ["put", "{fixture_copy}", "{cases}/tier3/payload.bin", "/PAYLOAD"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{fixture_copy}", "/PAYLOAD", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+[[case.step]]
+args = ["fsck", "{fixture_copy}", "--checkonly"]
+expect_exit = 0
+
+[[case]]
+id = "edit.real.cpm-amstrad"
+fixture = "fs.cpm.amstrad-data.floppy"
+[[case.step]]
+args = ["put", "{fixture_copy}", "{cases}/tier3/payload.bin", "/PAYLOAD.BIN", "--fs-type", "cpm:amstrad_data"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{fixture_copy}", "/PAYLOAD.BIN", "{scratch}/out.bin", "--fs-type", "cpm:amstrad_data"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+
+[[case]]
+id = "edit.real.human68k-2dd"
+fixture = "fs.human68k.2dd.floppy"
+[[case.step]]
+args = ["put", "{fixture_copy}", "{cases}/tier3/payload.bin", "/PAYLOAD.BIN"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{fixture_copy}", "/PAYLOAD.BIN", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+
+[[case]]
+id = "edit.real.apple-dos-invaders"
+description = "A real Apple II game disk — the listing step guards against editing a volume we cannot even read"
+fixture = "fs.apple-dos.invaders.floppy"
+[[case.step]]
+args = ["ls", "{fixture_copy}", "/"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{fixture_copy}", "{cases}/tier3/payload.bin", "/PAYLOAD"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{fixture_copy}", "/PAYLOAD", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+
+[[case]]
+id = "edit.real.efs-small"
+fixture = "fs.efs.small.hd"
+[[case.step]]
+args = ["put", "{fixture_copy}", "{cases}/tier3/payload.bin", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{fixture_copy}", "/payload.bin", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+[[case.step]]
+args = ["fsck", "{fixture_copy}", "--checkonly"]
+expect_exit = 0
