@@ -341,7 +341,7 @@ fn main() {
         Command::List => cmd_list(&args),
         Command::Run => cmd_run(&args),
         Command::Export => cmd_export(&args),
-        Command::Query(ref q) => cmd_query(q),
+        Command::Query(ref q) => cmd_query(&args, q),
         Command::Plan => cmd_plan(&args),
         Command::Fixtures => cmd_fixtures(&args),
         Command::Produce => cmd_produce(&args),
@@ -657,17 +657,22 @@ fn cmd_export(args: &Args) -> i32 {
     0
 }
 
-fn cmd_query(name: &str) -> i32 {
+fn cmd_query(args: &Args, name: &str) -> i32 {
     const NAMES: &[&str] = &[
         "unverified-writes",
         "unfixtured-reads",
         "platform-pins",
         "counts",
         "fixtures",
+        "verbs",
     ];
     if name.is_empty() {
         println!("queries: {}", NAMES.join(", "));
         return 0;
+    }
+    // `verbs` asks the binary and the manifests, not the registry.
+    if name == "verbs" {
+        return query_verbs(args);
     }
     let reg = match registry::Registry::load(&regression_dir()) {
         Ok(r) => r,
@@ -736,6 +741,100 @@ fn cmd_query(name: &str) -> i32 {
         }
     }
     0
+}
+
+/// Which rb-cli verbs any case invokes, and which none does.
+///
+/// COMMAND-COVERAGE.md was a hand-maintained list of the same thing and went
+/// stale twice. The binary's own `--help` is the only authority on what verbs
+/// exist, so this asks it rather than carrying a copy.
+fn query_verbs(args: &Args) -> i32 {
+    let verbs = match verbs_from_help(&args.rb_cli) {
+        Ok(v) if !v.is_empty() => v,
+        Ok(_) => {
+            eprintln!(
+                "error: no verbs parsed from `{} --help`",
+                args.rb_cli.display()
+            );
+            return 2;
+        }
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return 2;
+        }
+    };
+
+    let (manifests, _) = manifest::load_dir(&args.cases_dir);
+    let mut used: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for (_, m) in &manifests {
+        for case in &m.cases {
+            for step in case.resolved_steps() {
+                // The verb is the first argument that is not a global flag.
+                if let Some(v) = step.args.iter().find(|a| !a.starts_with('-')) {
+                    *used.entry(v.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+
+    let covered: Vec<&String> = verbs.iter().filter(|v| used.contains_key(*v)).collect();
+    let missing: Vec<&String> = verbs.iter().filter(|v| !used.contains_key(*v)).collect();
+
+    println!(
+        "verbs: {} of {} invoked by at least one case",
+        covered.len(),
+        verbs.len()
+    );
+    println!();
+    for v in &covered {
+        println!("  {:<22} {}", v, used[*v]);
+    }
+    if !missing.is_empty() {
+        println!();
+        println!("never invoked:");
+        for v in &missing {
+            println!("  {}", v);
+        }
+    }
+    let unknown: Vec<&String> = used.keys().filter(|k| !verbs.contains(k)).collect();
+    if !unknown.is_empty() {
+        println!();
+        println!("invoked but not a verb (subcommand argument or typo):");
+        for v in unknown {
+            println!("  {:<22} {}", v, used[v]);
+        }
+    }
+    0
+}
+
+/// Verb names from `rb-cli --help`, taken from the `Commands:` block.
+fn verbs_from_help(rb_cli: &Path) -> Result<Vec<String>, String> {
+    let out = std::process::Command::new(rb_cli)
+        .arg("--help")
+        .output()
+        .map_err(|e| format!("{}: {}", rb_cli.display(), e))?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut verbs = Vec::new();
+    let mut in_commands = false;
+    for line in text.lines() {
+        if line.starts_with("Commands:") {
+            in_commands = true;
+            continue;
+        }
+        if in_commands {
+            // The block ends at the first non-indented line.
+            if !line.starts_with("  ") {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                break;
+            }
+            if let Some(name) = line.split_whitespace().next() {
+                verbs.push(name.to_string());
+            }
+        }
+    }
+    Ok(verbs)
 }
 
 fn cmd_validate(args: &Args) -> i32 {

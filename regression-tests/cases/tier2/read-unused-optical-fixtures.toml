@@ -7,6 +7,11 @@
 # walks the tree. Both together are the difference between "the header parses"
 # and "we can actually get at the contents", which is the whole claim.
 #
+# The browse steps originally asserted exit 0 and nothing else, which cannot
+# tell a correct tree from an empty one. Each now names an entry that is
+# actually on that disc. Three of them go further and extract, hashing the
+# result — those are the discs small enough that a full extract is cheap.
+#
 # GAPS.md § Next actions put optical last, "and most carefully". These are read
 # cases only — nothing here writes.
 
@@ -28,6 +33,12 @@ expect_exit = 0
 [[case.step]]
 args = ["optical", "browse", "{fixture}"]
 expect_exit = 0
+stdout_contains = ["CIV_II_GOLD_111_UPDATE.SIT"]
+[[case.step]]
+# The extracted name is the Joliet one, not the 8.3 fallback — that is the assertion the fixture exists for.
+args = ["optical", "extract", "{fixture}", "--to", "{scratch}/ex", "--resource-forks", "data-only"]
+expect_exit = 0
+file_sha256 = [{ path = "{scratch}/ex/CIV_II_GOLD_111_UPDATE.SIT", sha256 = "cb251f01aef8b05198f80b14db9a583258908849181a8ef71ac8880c92b28244" }]
 
 [[case]]
 id = "read.optical.iso9660.hybrid-rsrc"
@@ -40,6 +51,7 @@ expect_exit = 0
 [[case.step]]
 args = ["optical", "browse", "{fixture}"]
 expect_exit = 0
+stdout_contains = ["GAMEAPP", "README.TXT"]
 
 [[case]]
 id = "read.optical.high-sierra.bookshelf"
@@ -52,6 +64,7 @@ expect_exit = 0
 [[case.step]]
 args = ["optical", "browse", "{fixture}"]
 expect_exit = 0
+stdout_contains = ["ACCEPT.TXT"]
 
 [[case]]
 id = "read.optical.udf.dvd-video"
@@ -64,6 +77,7 @@ expect_exit = 0
 [[case.step]]
 args = ["optical", "browse", "{fixture}"]
 expect_exit = 0
+stdout_contains = ["VIDEO_TS"]
 
 # --- Mac discs -------------------------------------------------------------------
 
@@ -77,6 +91,7 @@ expect_exit = 0
 [[case.step]]
 args = ["optical", "browse", "{fixture}"]
 expect_exit = 0
+stdout_contains = ["AppleTalk"]
 
 [[case]]
 id = "read.optical.hfs.stuffit"
@@ -88,6 +103,7 @@ expect_exit = 0
 [[case.step]]
 args = ["optical", "browse", "{fixture}"]
 expect_exit = 0
+stdout_contains = ["Desktop DB"]
 
 # --- Unix discs -------------------------------------------------------------------
 
@@ -102,6 +118,12 @@ expect_exit = 0
 [[case.step]]
 args = ["optical", "browse", "{fixture}"]
 expect_exit = 0
+stdout_contains = ["irixscsitb-irix53-irix65_2f7eef4.tar"]
+[[case.step]]
+# EFS on optical media, read end to end rather than just identified.
+args = ["optical", "extract", "{fixture}", "--to", "{scratch}/ex", "--resource-forks", "data-only"]
+expect_exit = 0
+file_sha256 = [{ path = "{scratch}/ex/irixscsitb-irix53-irix65_2f7eef4.tar", sha256 = "f8ae396203ca0eb40b4e72b7ac172692edc285ac62fbcf66da43fba07d04dda5" }]
 
 [[case]]
 id = "read.optical.ufs.nextstep33"
@@ -114,6 +136,7 @@ expect_exit = 0
 [[case.step]]
 args = ["optical", "browse", "{fixture}"]
 expect_exit = 0
+stdout_contains = ["awk"]
 
 # --- Console discs -----------------------------------------------------------------
 
@@ -127,6 +150,12 @@ expect_exit = 0
 [[case.step]]
 args = ["optical", "browse", "{fixture}"]
 expect_exit = 0
+stdout_contains = ["opening.bnr"]
+[[case.step]]
+# A GameCube disc has no ISO 9660 at all; extracting the banner proves the GCM reader reaches file data.
+args = ["optical", "extract", "{fixture}", "--to", "{scratch}/ex", "--resource-forks", "data-only"]
+expect_exit = 0
+file_sha256 = [{ path = "{scratch}/ex/opening.bnr", sha256 = "39c7f6b3c1756509e8ba486573d2e80f289ea4b727d965418f6f21bfe9fd58d8" }]
 
 [[case]]
 id = "read.optical.3do-opera.puttputt"
@@ -139,6 +168,7 @@ expect_exit = 0
 [[case.step]]
 args = ["optical", "browse", "{fixture}"]
 expect_exit = 0
+stdout_contains = ["AppStartup"]
 
 [[case]]
 id = "read.optical.cdi.hieroglyph"

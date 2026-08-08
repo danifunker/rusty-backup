@@ -1,8 +1,21 @@
 # Command coverage audit
 
-**Updated 2026-08-08 after the tier-3 sweep: 41 of 54 verbs, 170 cases.**
-The original audit that prompted it follows below, unchanged, because the
-before/after is the useful part.
+**The live numbers are computed, not written here:**
+
+```
+rb-regress query verbs
+```
+
+It parses `rb-cli --help` for the verb list and every `args` array under
+`cases/`, then prints what is invoked, how often, and what is not. The binary
+is the only authority on which verbs exist, so asking it is the only way this
+does not drift — and it drifted twice before the query existed. It also
+reports anything invoked that is *not* a verb, which catches a typo in a case
+that would otherwise just be an exit-2 failure someone has to read.
+
+As of 2026-08-08 it reports **45 of 54**. The narrative below is kept for the
+before/after, which is the part a number cannot carry; treat every count in it
+as a snapshot of when it was written.
 
 ## After
 
@@ -78,11 +91,16 @@ Each of these is a decision, not an oversight:
 | `update` | reaches the network — would make the suite non-deterministic and fail offline |
 | `serve` | a daemon; needs a client and a lifecycle the harness cannot drive yet |
 | `write` | physical media; needs `--device-allowlist` (does not exist) and a dedicated throwaway device |
-| `mac-scsi-bless` | needs a real Mac SCSI disk |
-| `batch` | needs a manifest; `batch-template` is covered, chaining the two is future work |
 
-Of those, only `write`, `serve` and `batch` are gaps worth closing. The rest
-are outside what a headless harness can meaningfully assert.
+Two entries that used to be on that list were closed on 2026-08-08:
+
+| verb | how |
+|------|-----|
+| `batch` | `batch-template --out` writes the script to a file, so the two chain inside one case. Without `--out` the template goes to stdout and a case cannot redirect it. |
+| `mac-scsi-bless` | needs an APM disk, not a real Mac: `expand` writes one. `show partmap` is the read-back — an `Apple_Driver43` entry and `drivers=1` in the DDR. |
+
+Of what remains, only `write` and `serve` are gaps worth closing. The rest are
+outside what a headless harness can meaningfully assert.
 
 ---
 

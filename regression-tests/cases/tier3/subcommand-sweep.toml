@@ -527,6 +527,53 @@ description = "batch-template must emit a manifest batch can consume"
 args = ["batch-template", "{cases}/tier3", "--target", "{scratch}/t.img"]
 expect_exit = 0
 
+[[case]]
+id = "batch.applies-a-generated-script"
+description = """The half that matters: batch-template's output has to be
+something `batch` accepts. Asserting only that the template is emitted tests
+the writer against nobody. `--out` is what makes this expressible — the
+template goes to stdout otherwise, and a case cannot redirect."""
+[[case.step]]
+args = ["new", "volume", "fat", "--size", "4M", "{scratch}/t.img"]
+expect_exit = 0
+[[case.step]]
+args = ["batch-template", "{cases}/tier3/isosrc", "--target", "{scratch}/t.img", "--out", "{scratch}/job.json"]
+expect_exit = 0
+files_exist = ["{scratch}/job.json"]
+[[case.step]]
+args = ["batch", "{scratch}/job.json"]
+expect_exit = 0
+stdout_contains = ["Applied 1/1"]
+[[case.step]]
+args = ["get", "{scratch}/t.img", "/payload.bin", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/isosrc/payload.bin", "{scratch}/out.bin"]]
+[[case.step]]
+args = ["fsck", "{scratch}/t.img", "--checkonly"]
+expect_exit = 0
+
+[[case]]
+id = "mac.scsi-bless.installs-a-driver"
+description = """`expand` writes a fresh APM disk, which is the input shape
+mac-scsi-bless needs. `show partmap` is the read-back: an Apple_Driver43 entry
+must appear and the DDR must count one driver."""
+[[case.step]]
+args = ["new", "volume", "hfs", "--size", "4M", "{scratch}/src.img"]
+expect_exit = 0
+[[case.step]]
+args = ["expand", "{scratch}/src.img", "--size", "8M", "--output", "{scratch}/apm.img"]
+expect_exit = 0
+[[case.step]]
+args = ["mac-scsi-bless", "{scratch}/apm.img"]
+expect_exit = 0
+[[case.step]]
+args = ["show", "partmap", "{scratch}/apm.img"]
+expect_exit = 0
+stdout_contains = ["drivers=1", "Apple_Driver43"]
+[[case.step]]
+args = ["fsck", "{scratch}/apm.img", "--checkonly"]
+expect_exit = 0
+
 # --- shrink: CHD only -------------------------------------------------------
 # `shrink` refuses any output that is not a .chd ("output path must end in
 # .chd"), so the obvious "shrink an .img" shape is a usage error rather than a
