@@ -353,9 +353,10 @@ stdout_contains = ["Sun"]
 # --- WinImage IMZ ---------------------------------------------------------------
 # `fmt.imz` is a known read format and formats.toml already records what it
 # needs: "Encrypted variant needs both a correct- and a wrong-password case".
-# No IMZ fixture exists anywhere — not on the NAS, not locally — so these are
-# written against the `password` convention and will report skip-fixture until
-# one is sourced. `rb-regress fixtures` lists them in the blocked shopping list,
+# The unencrypted one is now catalogued as `fmt.imz.plain.floppy` — a genuine
+# WinImage file found locally, 2,025 bytes decoding to a 1.44 MB FAT floppy.
+# The ENCRYPTED variant is still wanted; those cases are written against the
+# `password` convention and report as unsourced until one arrives. `rb-regress fixtures` lists them in the blocked shopping list,
 # which is the point: a requirement recorded in a notes field was invisible,
 # and a blocked case is not.
 #
@@ -365,10 +366,14 @@ stdout_contains = ["Sun"]
 
 [[case]]
 id = "read.imz.plain"
-description = "An unencrypted IMZ must decode to its flat floppy stream"
+description = "An unencrypted IMZ must decode to its flat floppy stream. 2 KB on disk for a 1.44 MB volume - the cheapest fixture in the corpus."
 fixture = "fmt.imz.plain.floppy"
 [[case.step]]
 args = ["inspect", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["FAT"]
+[[case.step]]
+args = ["ls", "{fixture}", "/"]
 expect_exit = 0
 
 [[case]]
