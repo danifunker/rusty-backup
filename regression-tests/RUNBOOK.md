@@ -308,8 +308,15 @@ quieter blind spot.
 
 ## Known limitations, so nothing surprises you
 
+- **Only 11 of rb-cli's 54 verbs are invoked by anything.** Measured
+  2026-08-07; see [COMMAND-COVERAGE.md](COMMAND-COVERAGE.md). The big ones:
+  there is no backup->restore round-trip (`restore` appears once, as
+  `restore --help`), the entire edit surface is untested across ~20
+  filesystems, and `resize`/`shrink`/`grow`/`write`/`serve` are never run.
 - **Tiers 3-7 do not exist.** `--tiers 0-6` selects the same 87 cases as
-  `--tiers 0-2`.
+  `--tiers 0-2`. This is the structural cause of the line above: tiers 0-2 are
+  about reading and creating, and round-trips, edits, resizes and hardware all
+  live in the tiers that were never written.
 - **`verify` does not exist.** `produce` and `parity` do; nothing runs an
   oracle.
 - **20 builders have no produce recipe** and `fmt.vmdk-flat` cannot get one
