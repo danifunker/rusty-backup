@@ -281,8 +281,11 @@ Assets located 2026-08-07, all already owned — nothing needs downloading:
 Not yet built: the config that attaches an artifact, the guest-side script
 that writes a verdict to the shared volume, and the host-side parser. AFFS is
 the one to prove it on — Kickstart mounts FFS with no extra handler, and we
-already produce fs.affs."""
-notes = "Cross-platform Amiga. WinUAE is Windows-only, so this is the portable choice."
+already produce fs.affs.
+
+Cross-platform Amiga; WinUAE is Windows-only, so this is the portable choice.
+Installed on the Windows box (FS-UAE 3.0.5, a per-user install under
+%LOCALAPPDATA%/Programs) and on linuxbox (3.1.66)."""
 availability = [
   { platform = "windows", status = "install" },
   { platform = "linux",   status = "install" },

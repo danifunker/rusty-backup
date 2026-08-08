@@ -69,6 +69,8 @@ dist/
 # and committing one would be actively dangerous on someone else's machine.
 # Names real machines; hosts.toml.example is the committed template.
 /regression-tests/data/hosts.toml
+# Names real machines; hosts.local.example is the committed template.
+/regression-tests/scripts/hosts.local
 /regression-tests/local.toml
 /regression-tests/local-devices.toml
 # The NAS catalogue maps IDs to real corpus paths and stays on the NAS.

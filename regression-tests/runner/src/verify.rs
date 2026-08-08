@@ -97,6 +97,19 @@ fn resolve_program(
     platform: &str,
     regression_dir: &Path,
 ) -> Option<PathBuf> {
+    // Platform availability first. Without this, a repo-shipped helper script
+    // resolves on every host that has the checkout — so Windows found
+    // oracles/fsck_hfs_image.sh, tried to execute a shell script, and produced
+    // nine `error` records where the honest answer is "this oracle is macOS
+    // only". Errors that should be skips train people to ignore the report.
+    if reg
+        .availability
+        .iter()
+        .any(|a| a.oracle == oracle_id && a.platform == platform && a.status == "absent")
+    {
+        return None;
+    }
+
     // A repo-relative helper, e.g. "oracles/fsck_hfs_image.sh". Some oracles
     // need setup and teardown around the actual check — fsck_hfs wants a block
     // device, so its image has to be attached and detached — and a shipped

@@ -1,0 +1,96 @@
+# Known failures — cases that fail because of a recorded bug, not a regression.
+#
+# This does NOT skip anything. Every case here still runs, every time. What
+# changes is how the verdict is read:
+#
+#   fails   + listed  -> xfail   expected; the run stays green
+#   PASSES  + listed  -> XPASS   the bug is fixed — remove the entry
+#   fails   + unlisted-> fail    a real regression; the run goes red
+#
+# Skipping would stop the case running, so nobody would ever learn the bug had
+# been fixed, and the case would rot. Running it and expecting failure keeps it
+# honest in both directions.
+#
+# Rules:
+#
+#  * `finding` is mandatory and must name an entry in docs/Regression_Bugs.md.
+#    An expected failure with no recorded cause is just a disabled test.
+#  * Never edit a case's assertions to make it pass. Cases assert INTENDED
+#    behaviour; that is the whole design. This file is the only sanctioned way
+#    to say "we know, it is on the list".
+#  * When a finding is fixed, delete its entries here. XPASS exists to make
+#    forgetting loud — a stale entry silently swallows the next real regression
+#    in that case.
+#
+# `rb-regress validate` cross-checks: an id here that matches no case, or a
+# finding id not present in Regression_Bugs.md, is reported as a problem.
+
+# --- R-016 — backup accepts only flat-layout sources -------------------------
+[[known]]
+id = "backup.container.chd"
+finding = "R-016"
+[[known]]
+id = "backup.container.vhd-dynamic"
+finding = "R-016"
+[[known]]
+id = "backup.container.qcow2"
+finding = "R-016"
+[[known]]
+id = "backup.container.vmdk-sparse"
+finding = "R-016"
+
+# --- R-008a / R-008b — AFFS bitmap and panic ---------------------------------
+# Note R-020 says every AFFS volume we write is unmountable on a real Amiga at
+# any size, so these three are the *visible* part of a deeper problem. They stay
+# separate because they fail for the reasons R-008 describes, which a fix for
+# R-020 alone would not address.
+[[known]]
+id = "fs.new-volume.affs"
+finding = "R-008a"
+[[known]]
+id = "fs.new-volume.affs.4m"
+finding = "R-008b"
+[[known]]
+id = "fs.new-volume.affs.32m"
+finding = "R-008b"
+[[known]]
+id = "fs.new-volume.affs.bitmap-boundary-plus-one"
+finding = "R-008a"
+
+# --- CLI contract group ------------------------------------------------------
+[[known]]
+id = "cli.envelope.error-envelope-on-failure"
+finding = "R-005"
+[[known]]
+id = "cli.envelope.ls-supports-format"
+finding = "R-003"
+[[known]]
+id = "cli.exit.csv-on-nested-verb-is-usage-error"
+finding = "R-004"
+[[known]]
+id = "cli.exit.tsv-on-nested-verb-is-usage-error"
+finding = "R-004"
+[[known]]
+id = "cli.flags.inspect-accepts-fs-type"
+finding = "R-010"
+
+# --- R-006 — new volume prodos fails with default arguments ------------------
+[[known]]
+id = "fs.new-volume.prodos-default-name"
+finding = "R-006"
+
+# --- R-013 — Solaris UFS entry types and sizes -------------------------------
+[[known]]
+id = "fs.detect.ufs-solaris-entry-types"
+finding = "R-013"
+[[known]]
+id = "fs.detect.ufs-no-absurd-sizes"
+finding = "R-013"
+
+# --- Optical -----------------------------------------------------------------
+[[known]]
+id = "optical.cdda.no-data-track-opens"
+finding = "R-012"
+[[known]]
+id = "optical.cue.unpadded-track-number"
+finding = "R-015"

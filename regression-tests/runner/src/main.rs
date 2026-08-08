@@ -13,6 +13,7 @@ mod envelope;
 mod exec;
 mod fixtures;
 mod gitinfo;
+mod known;
 mod manifest;
 mod parity;
 mod plan;
@@ -668,11 +669,70 @@ fn cmd_validate(args: &Args) -> i32 {
         }
     }
 
+    // The registry is not loaded by the case machinery, so a syntax error in
+    // it used to surface only when `verify` or `plan` ran — and `verify`
+    // reports a bad registry as its own error, which reads like an oracle
+    // problem rather than a typo. A duplicate `notes` key sat there unnoticed
+    // for exactly that reason.
+    match registry::Registry::load(&regression_dir()) {
+        Ok(r) => {
+            println!(
+                "registry: {} format(s), {} oracle(s), {} host(s)",
+                r.formats.len(),
+                r.oracles.len(),
+                r.hosts.len()
+            );
+            for w in &r.warnings {
+                println!("  problem: registry: {}", w);
+            }
+        }
+        Err(e) => println!("  problem: registry will not parse: {}", e),
+    }
+
+    // Cross-check the bug list. A stale entry here is worse than no entry: it
+    // marks a case as expected-to-fail forever, so a genuine regression in it
+    // never turns the run red again.
+    let mut known_problems = Vec::new();
+    let base = regression_dir();
+    match known::KnownFailures::load(&base.join("data").join("known-failures.toml")) {
+        Ok(k) => {
+            for id in k.ids() {
+                if !seen.contains(id) {
+                    known_problems.push(format!(
+                        "known-failures.toml lists '{}', which is not a case id",
+                        id
+                    ));
+                }
+            }
+            // Every expected failure must name a recorded cause, or it is just
+            // a disabled test wearing a label.
+            let bugs = fs::read_to_string(base.join("..").join("docs").join("Regression_Bugs.md"))
+                .unwrap_or_default();
+            if !bugs.is_empty() {
+                for id in k.ids() {
+                    if let Some(f) = k.finding_for(id) {
+                        if !bugs.contains(f) {
+                            known_problems.push(format!(
+                                "known-failures.toml: '{}' cites finding {}, which is not in docs/Regression_Bugs.md",
+                                id, f
+                            ));
+                        }
+                    }
+                }
+            }
+            println!("{} known failure(s) on the bug list", k.len());
+        }
+        Err(e) => known_problems.push(e),
+    }
+
     for e in &errors {
         println!("  problem: {}", e);
     }
     for d in &dupes {
         println!("  problem: duplicate case id '{}'", d);
+    }
+    for k in &known_problems {
+        println!("  problem: {}", k);
     }
 
     if errors.is_empty() && dupes.is_empty() {
@@ -783,6 +843,14 @@ fn cmd_run(args: &Args) -> i32 {
         rb_version: build_label.clone(),
     };
 
+    let known = match known::KnownFailures::load(&regression_dir().join("data").join("known-failures.toml")) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return 2;
+        }
+    };
+
     let mut bundle = match Bundle::create(&args.report_root, &host, platform, &stamp, identity) {
         Ok(b) => b,
         Err(e) => {
@@ -842,7 +910,7 @@ fn cmd_run(args: &Args) -> i32 {
             if !selected(args, &case.id, tier) {
                 continue;
             }
-            let result = run_case(
+            let mut result = run_case(
                 args,
                 &catalog,
                 &m.meta.group,
@@ -851,6 +919,28 @@ fn cmd_run(args: &Args) -> i32 {
                 platform,
                 &mut bundle,
             );
+            // Reclassify against the bug list. Only fail/pass are touched: a
+            // skip means the case never really ran, so calling it "expected"
+            // would claim knowledge we do not have.
+            if let Some(finding) = known.finding_for(&result.case_id) {
+                match result.verdict {
+                    Verdict::Fail => {
+                        result.verdict = Verdict::XFail;
+                        result.skip_reason = Some(match known.note_for(&result.case_id) {
+                            Some(n) => format!("known failure {} - {}", finding, n),
+                            None => format!("known failure {}", finding),
+                        });
+                    }
+                    Verdict::Pass => {
+                        result.verdict = Verdict::XPass;
+                        result.skip_reason = Some(format!(
+                            "listed as known failure {} but PASSED - fix confirmed;                              remove it from known-failures.toml",
+                            finding
+                        ));
+                    }
+                    _ => {}
+                }
+            }
             *counts.entry(result.verdict.label()).or_insert(0) += 1;
             println!("{:<12} {}", result.verdict.label(), result.case_id);
             let _ = bundle.record(&result);
@@ -868,9 +958,36 @@ fn cmd_run(args: &Args) -> i32 {
     }
     println!("\nsummary: {}", bundle.dir.join("summary.md").display());
 
-    // Exit 0 even with failures: this harness reports, it does not gate. A
-    // non-zero exit is reserved for the harness itself being unable to run.
-    0
+    // The exit code is what an unattended run is judged by, so it has to mean
+    // something precise: "did anything happen that a human needs to look at?"
+    //
+    // Known failures do not count - they are on the bug list and the run is
+    // green with them. An XPASS does count, loudly: a fixed bug whose entry
+    // stays behind will silently absorb the next real regression in that case.
+    let unexpected = counts.get("fail").copied().unwrap_or(0)
+        + counts.get("error").copied().unwrap_or(0);
+    let xpass = counts.get("XPASS").copied().unwrap_or(0);
+
+    if xpass > 0 {
+        println!(
+            "
+{} case(s) XPASSED - listed as known failures but now passing.",
+            xpass
+        );
+        println!("Remove them from data/known-failures.toml and close the finding.");
+    }
+    if unexpected > 0 {
+        println!(
+            "
+{} unexpected failure(s)/error(s) - not on the bug list.",
+            unexpected
+        );
+    }
+    if unexpected > 0 || xpass > 0 {
+        1
+    } else {
+        0
+    }
 }
 
 fn run_case(

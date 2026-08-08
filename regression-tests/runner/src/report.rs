@@ -21,6 +21,13 @@ use std::path::{Path, PathBuf};
 pub enum Verdict {
     Pass,
     Fail,
+    /// Failed, and `known-failures.toml` says it is expected to. Not a
+    /// regression; the run stays green.
+    XFail,
+    /// PASSED while listed as a known failure — the bug is fixed. Loud on
+    /// purpose: a stale entry silently masks the next real regression in that
+    /// case, so this must be noticed and the entry removed.
+    XPass,
     SkipFixture,
     SkipPlatform,
     SkipTool,
@@ -33,6 +40,8 @@ impl Verdict {
         match self {
             Verdict::Pass => "pass",
             Verdict::Fail => "fail",
+            Verdict::XFail => "xfail",
+            Verdict::XPass => "XPASS",
             Verdict::SkipFixture => "skip-fixture",
             Verdict::SkipPlatform => "skip-platform",
             Verdict::SkipTool => "skip-tool",

@@ -1,0 +1,12 @@
+# Host list for scripts/regress-all.sh. Copy to hosts.local and edit.
+# hosts.local is gitignored: it names real machines.
+#
+# columns:  id  ssh-target  repo-path-relative-to-home  shell
+#
+# `shell` is `bash` for a host whose toolchain is on the default non-interactive
+# PATH, or a login-shell invocation for one whose is not. macOS needs the
+# latter: a non-interactive ssh session there gets /usr/bin:/bin only, so
+# Homebrew's cargo is invisible and the build fails with "cargo: not found".
+
+# linuxbox  dani@192.168.99.153  repos/rusty-backup  bash
+# mac       dani@192.168.99.121  repos/rusty-backup  zsh -lc
