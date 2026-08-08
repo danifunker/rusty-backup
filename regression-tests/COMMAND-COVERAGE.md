@@ -11,7 +11,7 @@ before/after is the useful part.
 | cases | 87 | 170 |
 | verbs invoked | 11 | 41 |
 | backup -> restore -> compare | none | 14 cases, 8 filesystems, 4 formats |
-| edit surface (put/get/rm/mkdir/cp/tar/xattr/chmod/...) | none | 9 filesystems |
+| edit surface (put/get/rm/mkdir/cp/tar/xattr/chmod/...) | none | **18/18 advertised filesystems** |
 | resize (grow/resize/repack/expand/shrink) | 1 | 9 cases |
 
 Six findings came out of the first run: R-021 (`resize --size` is a silent
@@ -19,6 +19,27 @@ no-op), R-022 (HPFS is the only filesystem that fails a sector-by-sector
 round-trip), R-023 (`repack` loses every file), R-024 (one `put` makes an AFFS
 volume fail its own fsck), R-025 (`squashfs put` cannot replace the image on
 Windows), R-026 (`show partmap` cannot read an SGI disk `inspect` reads fine).
+
+### Edit coverage is now complete against what README advertises
+
+README lists eighteen filesystems with edit mode. The first tier-3 pass
+covered nine; a follow-up pass covered the other nine — exFAT, PFS3, SFS,
+Apple DOS 3.3, MacPlus MFS, UFS, CP/M, Human68k and XFS.
+
+Four of those have **no builder at all**, so their cases edit a
+`{fixture_copy}` rather than a fresh volume: exFAT (formats.toml calls a
+reference fixture mandatory), PFS3, SFS and UFS. The copy is not a
+convenience — an edit case mutates the volume, and a reference fixture a test
+has written to has stopped being a reference.
+
+**PFS3 has no catalogued fixture either.** The only PFS3 volumes on hand are
+inside AmigaVision.hdf (9.1 GB, on the MiSTer) and 2.1-HD.hdf. Its case is
+written and will report `skip-fixture` until one is catalogued — the skip is
+the reminder, which is better than the case not existing.
+
+**SFS is the case the FS-UAE oracle work was aiming at.** rb-cli cannot write
+an SFS volume from scratch, so editing the reference volume and checking the
+result is the only way to exercise the SFS editor at all.
 
 ### Still not invoked, and why
 
