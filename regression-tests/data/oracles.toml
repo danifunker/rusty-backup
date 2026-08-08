@@ -260,6 +260,28 @@ verifies = [
 id = "fs-uae"
 tool = "FS-UAE"
 kind = "emulator"
+notes = """Portable Amiga emulator; the cross-platform half of the WinUAE pair.
+
+Assets located 2026-08-07, all already owned — nothing needs downloading:
+
+  * Kickstart ROMs — a full licensed AmigaForever set on the Windows box at
+    D:/ROMs/Amiga/Shared/rom (amiga-os-070 .. 3.x), plus Kickstart 3.2 ROMs on
+    the NAS and five ROMs on linuxbox at ~/kickstarts.
+  * A bootable environment — AmigaVision on the MiSTer (9.1 GB HDF, PFS3, with
+    an AmigaVision.fs-uae config already written).
+  * The results channel — that config's `hard_drive_2 = ./shared` mounts a HOST
+    DIRECTORY as an Amiga volume, so the guest writes a file and the host reads
+    it. No screen-scraping, unlike Snow.
+  * Filesystem handlers — SmartFilesystem 1.280 (02.06.2017, m68k, J.
+    Strohmayer) and PFS3AIO, extracted from the L: directory of the SFS
+    reference fixture itself and staged at rb-fixtures/oracle-assets/amiga.
+    Neither AmigaVision nor AmigaForever carries an SFS handler; the volume
+    under test turned out to carry its own.
+
+Not yet built: the config that attaches an artifact, the guest-side script
+that writes a verdict to the shared volume, and the host-side parser. AFFS is
+the one to prove it on — Kickstart mounts FFS with no extra handler, and we
+already produce fs.affs."""
 notes = "Cross-platform Amiga. WinUAE is Windows-only, so this is the portable choice."
 availability = [
   { platform = "windows", status = "install" },
