@@ -19,7 +19,7 @@ Settled 2026-08-01, at the outset:
 | Emulator verification | **Tiered** — automate what is scriptable, generate a manual checklist for the rest | MiSTer (SSH) and headless QEMU/MAME can assert automatically; WinUAE / Basilisk II / 86Box cannot, so they get a per-run checklist with screenshot slots. |
 | Hardware backup/restore | **Design now, execute later** | Cases and safety interlocks get authored and committed; execution stays gated behind `--allow-hardware` plus a gitignored device allowlist until scratch media is set aside. |
 | Bug reporting | **Report bundle on the NAS**, no automatic GitHub issues | A first full run may surface hundreds of failures. Triage from the summary, promote to issues by hand. |
-| Fixture hosting | `//NAS/share/rb-fixtures/` — corpus in `fixtures/`, catalog + run reports alongside | Fixtures and their paths never enter git. |
+| Fixture hosting | A working copy on local disk (`fixture_root`), synced once from a distribution source (`corpus_source`) | Both live in gitignored `local.toml`. Fixtures and their paths never enter git; see FIXTURES.md § Local first. |
 
 ---
 

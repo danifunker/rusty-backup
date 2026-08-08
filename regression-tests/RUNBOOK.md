@@ -41,11 +41,15 @@ cargo run --release -- run --rb-cli ../../target/release/rb-cli --tiers 0-2 --re
 
 On Windows the binary is `../../target/release/rb-cli.exe`.
 
-With the fixture corpus mounted, add:
+The corpus comes from `local.toml`, so no flag is needed. Fetch it once,
+then every run reads local disk:
 
 ```bash
---fixture-root //NAS/share/rb-fixtures/fixtures
+rb-regress fixtures --sync
 ```
+
+`--fixture-root <DIR>` overrides it for a one-off. Never point it at a share —
+see FIXTURES.md § Local first.
 
 Expect roughly: **87 cases, ~69 pass, ~18 fail**, under a minute. Every
 failure maps to a finding in `docs/Regression_Bugs.md` — none are unknown.
@@ -85,7 +89,7 @@ because every result line carries its own `run_id`, `git_sha` and
 Point it at a different tree to consolidate a regression spread across hosts:
 
 ```bash
-cargo run --release -- consolidate //NAS/share/rb-fixtures/regressions/2026-08
+cargo run --release -- consolidate /path/to/collected/runs
 ```
 
 It groups by sha and **warns rather than averaging** if results span several
