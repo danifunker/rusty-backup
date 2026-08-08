@@ -251,3 +251,157 @@ ext = "chd"
 pre = [["new", "volume", "fat", "--size", "2M", "{work}/src.img"]]
 args = ["convert", "{work}/src.img", "{work}/out", "--format", "chd"]
 produces = "{work}/out/src.chd"
+
+# --- Filesystems the volume recipes above missed -----------------------------
+
+# FAT32 needs `--fat32`: without it the type is picked from capacity and only
+# reaches FAT32 above 2 GiB, which is far too large to produce six times a run.
+# 33 MiB is the smallest size that formats cleanly and reports FAT32.
+[[recipe]]
+id = "fs.fat32"
+ext = "img"
+args = ["new", "volume", "fat", "--fat32", "--size", "33M", "{out}"]
+
+# `squashfs create` packs a host directory, and recipes can only run rb-cli —
+# no mkdir. `convert` creates its destination folder, so a raw conversion is
+# how a deterministic one-file tree comes into existence here.
+[[recipe]]
+id = "fs.squashfs"
+ext = "img"
+pre = [
+  ["new", "volume", "fat", "--size", "1M", "{work}/src.img"],
+  ["convert", "{work}/src.img", "{work}/pack", "--format", "raw"],
+]
+args = ["squashfs", "create", "{work}/pack", "{out}"]
+
+# `new hd x68k` writes one artifact that three format rows describe: the .hdf
+# container, the X68000 partition scheme (part.x68k above), and the Human68k
+# volume inside it. Same bytes, three ids, because `verify` runs a different
+# oracle against each — an X68000 core boot is not a Human68k fsck.
+[[recipe]]
+id = "fs.human68k"
+ext = "hdf"
+args = ["new", "hd", "x68k", "--size", "16M", "{out}"]
+
+[[recipe]]
+id = "fmt.x68k-hdd"
+ext = "hdf"
+args = ["new", "hd", "x68k", "--size", "16M", "{out}"]
+
+# --- Floppy containers -------------------------------------------------------
+#
+# XDF is a flat sector dump, so a 1232 KB FAT floppy *is* one — `floppy info`
+# identifies the result as X68000 XDF. The other three convert from it, which
+# is also the only input `floppy convert` accepts.
+
+[[recipe]]
+id = "fmt.xdf"
+ext = "xdf"
+args = ["new", "floppy", "fat", "--size", "1232K", "{out}"]
+
+[[recipe]]
+id = "fmt.hdm"
+ext = "hdm"
+pre = [["new", "floppy", "fat", "--size", "1232K", "{work}/src.xdf"]]
+args = ["floppy", "convert", "{work}/src.xdf", "{out}"]
+
+[[recipe]]
+id = "fmt.dim"
+ext = "dim"
+pre = [["new", "floppy", "fat", "--size", "1232K", "{work}/src.xdf"]]
+args = ["floppy", "convert", "{work}/src.xdf", "{out}"]
+
+[[recipe]]
+id = "fmt.d88"
+ext = "d88"
+pre = [["new", "floppy", "fat", "--size", "1232K", "{work}/src.xdf"]]
+args = ["floppy", "convert", "{work}/src.xdf", "{out}"]
+
+# --- Apple floppy containers --------------------------------------------------
+#
+# 2MG and WOZ carry an Apple II 5.25" disk; DC42 and MOOF carry a Mac 3.5" one.
+# DiskCopy 4.2 keeps the `.dsk` extension, so its `produces` is not `src.dc42`.
+
+[[recipe]]
+id = "fmt.2mg"
+ext = "2mg"
+pre = [["new", "floppy", "apple-dos", "{work}/src.dsk"]]
+args = ["convert", "{work}/src.dsk", "{work}/out", "--format", "twomg"]
+produces = "{work}/out/src.2mg"
+
+[[recipe]]
+id = "fmt.woz"
+ext = "woz"
+pre = [["new", "floppy", "apple-dos", "{work}/src.dsk"]]
+args = ["convert", "{work}/src.dsk", "{work}/out", "--format", "woz"]
+produces = "{work}/out/src.woz"
+
+[[recipe]]
+id = "fmt.dc42"
+ext = "dsk"
+pre = [["new", "floppy", "hfs", "--size", "800K", "{work}/src.dsk"]]
+args = ["convert", "{work}/src.dsk", "{work}/out", "--format", "dc42"]
+produces = "{work}/out/src.dsk"
+
+[[recipe]]
+id = "fmt.moof"
+ext = "moof"
+pre = [["new", "floppy", "hfs", "--size", "800K", "{work}/src.dsk"]]
+args = ["convert", "{work}/src.dsk", "{work}/out", "--format", "moof"]
+produces = "{work}/out/src.moof"
+
+# --- Backup containers --------------------------------------------------------
+#
+# `backup` names its folder after the source stem plus a date, so every one of
+# these passes `--name` — without it the output path is unpredictable and the
+# artifact could not be collected. The kept artifact is the partition file;
+# metadata.json carries timestamps and is not the format under test.
+
+[[recipe]]
+id = "fmt.zstd"
+ext = "zst"
+pre = [["new", "volume", "fat", "--size", "2M", "{work}/src.img"]]
+args = ["backup", "{work}/src.img", "{work}/out", "--name", "bk", "--format", "zstd"]
+produces = "{work}/out/bk/partition-0.zst"
+
+[[recipe]]
+id = "fmt.gzip"
+ext = "gz"
+pre = [["new", "volume", "fat", "--size", "2M", "{work}/src.img"]]
+args = ["backup", "{work}/src.img", "{work}/out", "--name", "bk", "--format", "gzip"]
+produces = "{work}/out/bk/partition-0.gz"
+
+[[recipe]]
+id = "fmt.lz4"
+ext = "lz4"
+pre = [["new", "volume", "fat", "--size", "2M", "{work}/src.img"]]
+args = ["backup", "{work}/src.img", "{work}/out", "--name", "bk", "--format", "lz4"]
+produces = "{work}/out/bk/partition-0.lz4"
+
+# The .cbk wraps a whole backup folder, so its `pre` has to build one first.
+[[recipe]]
+id = "fmt.cbk"
+ext = "cbk"
+pre = [
+  ["new", "volume", "fat", "--size", "2M", "{work}/src.img"],
+  ["backup", "{work}/src.img", "{work}/out", "--name", "bk", "--format", "zstd"],
+]
+args = ["cbk", "pack", "{work}/out/bk", "{out}"]
+
+# --- Optical ------------------------------------------------------------------
+#
+# `fmt.bincue` is deliberately absent, for the same reason as `fmt.vmdk-flat`:
+# BIN/CUE is a 66-byte .cue plus a sibling .bin, and keeping either alone would
+# read as coverage of a format only half looked at. Needs multi-file artifacts.
+
+[[recipe]]
+id = "optical.efs"
+ext = "iso"
+args = ["optical", "new", "sgi-efs", "--size", "8M", "{out}"]
+
+[[recipe]]
+id = "optical.chdcd"
+ext = "chd"
+pre = [["optical", "new", "sgi-efs", "--size", "8M", "{work}/src.iso"]]
+args = ["convert", "{work}/src.iso", "{work}/out", "--format", "chd-cd"]
+produces = "{work}/out/src.chd"

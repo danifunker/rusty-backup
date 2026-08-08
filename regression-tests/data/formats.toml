@@ -806,7 +806,7 @@ builder = "new hd x68k"
 # --- Containers: PC / misc ---------------------------------------------------
 
 [[format]]
-id = "fmt.winimage"
+id = "fmt.ima"
 kind = "container"
 name = "WinImage (IMA)"
 we_read = true
@@ -827,6 +827,24 @@ name = "AppImage"
 we_read = true
 we_write = false
 notes = "ELF stub with an appended SquashFS; the payload opens in place"
+
+# The .cue entry point and the CloneCD .ccd/.img/.sub set are separate formats
+# from the BIN/CUE pair below: a disc arrives as one or the other, and R-015 is
+# about the cue parser specifically.
+[[format]]
+id = "optical.cue"
+kind = "optical"
+name = "CUE sheet"
+we_read = true
+we_write = false
+notes = "R-015: a cue with unpadded track numbers (`TRACK 1`) is rejected"
+
+[[format]]
+id = "optical.clonecd"
+kind = "optical"
+name = "CloneCD (.ccd / .img / .sub)"
+we_read = true
+we_write = false
 
 [[format]]
 id = "fmt.bincue"
