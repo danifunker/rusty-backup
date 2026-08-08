@@ -11,10 +11,11 @@
 # {fixture_copy} because they mutate.
 #
 # ENCRYPTED FIXTURES: the convention is that the password is `password`.
-# Verified 2026-08-08 — the Ghost image conforms. The encrypted APFS volume
-# does NOT: it was built with `rbtest-apfs`, a throwaway constant, before the
-# convention existed. Its case uses the value that actually works and is
-# flagged below, because a case that fails on a passphrase mismatch looks
+# Verified 2026-08-08 — the Ghost image and both new APFS volumes conform.
+# fs.apfs.encrypted.hd does NOT: it was built with `rbtest-apfs`, a throwaway
+# constant, before the convention existed. It is kept rather than replaced —
+# a second passphrase is extra coverage — and its case uses the value that
+# actually works, because a case that fails on a passphrase mismatch looks
 # exactly like a decryption defect.
 
 [meta]
@@ -157,22 +158,158 @@ args = ["inspect", "{fixture}"]
 expect_exit = 0
 stdout_contains = ["APFS"]
 
+# The three encrypted-APFS fixtures below hold the SAME tree with the SAME file
+# bytes, under two different passphrases and two different container shapes.
+# Each `unlocked` case asserts the same five sha256s, so a KEK unwrap that
+# returns plausible garbage fails on content rather than passing on exit 0.
+# The plaintext hashes are the shared constant; do not edit one copy alone.
+
 [[case]]
 id = "read.apfs.encrypted.unlocked"
 description = """FileVault decrypt. NOTE: the passphrase is `rbtest-apfs`, not the
-`password` convention — this fixture predates it. Standardising means rebuilding
-the volume on the Mac; until then this value is the one that works, and hard-coding
-`password` here would produce a KEK-unwrap failure that reads like a decryption bug."""
+`password` convention — this fixture predates it and is kept for the extra
+coverage a second passphrase buys. The conforming replacements are
+fs.apfs.encrypted-gpt.hd and fs.apfs.encrypted-bare.hd."""
 fixture = "fs.apfs.encrypted.hd"
 [[case.step]]
 args = ["ls", "{fixture}", "/", "--password", "rbtest-apfs"]
 expect_exit = 0
-stdout_contains = ["hello.txt"]
+stdout_contains = ["hello.txt", "medium.txt", "big.bin", "link_to_hello", "docs"]
+[[case.step]]
+args = ["get", "{fixture}", "/hello.txt", "{scratch}/hello.txt", "--password", "rbtest-apfs"]
+expect_exit = 0
+file_sha256 = [{ path = "{scratch}/hello.txt", sha256 = "3c74c11f53769169dab4810549bb5f1d46cbf71da66ca4ff39d29e36aa870228" }]
+[[case.step]]
+args = ["get", "{fixture}", "/medium.txt", "{scratch}/medium.txt", "--password", "rbtest-apfs"]
+expect_exit = 0
+file_sha256 = [{ path = "{scratch}/medium.txt", sha256 = "b7fe4febe239781976b258506989f566502a8aec1a5dff4b1a19a2dcc7466233" }]
+[[case.step]]
+args = ["get", "{fixture}", "/big.bin", "{scratch}/big.bin", "--password", "rbtest-apfs"]
+expect_exit = 0
+file_sha256 = [{ path = "{scratch}/big.bin", sha256 = "e9c4c182616951b8f95c7881e13d11563c5c726c7f7cec6c92573d8048684b91" }]
+[[case.step]]
+args = ["get", "{fixture}", "/docs/readme.md", "{scratch}/readme.md", "--password", "rbtest-apfs"]
+expect_exit = 0
+file_sha256 = [{ path = "{scratch}/readme.md", sha256 = "e572aeb222ba1eca7a0a4ebd98617ea9ed6ee6d4c99bb72456c29faab94f3191" }]
+[[case.step]]
+args = ["get", "{fixture}", "/docs/nested/deep.txt", "{scratch}/deep.txt", "--password", "rbtest-apfs"]
+expect_exit = 0
+file_sha256 = [{ path = "{scratch}/deep.txt", sha256 = "30cf6f2de471343739bcc1dde393c0c0771814ac3ad798f68c8a74495174521a" }]
 
 [[case]]
 id = "read.apfs.encrypted.wrong-passphrase-is-an-error"
 description = "A wrong passphrase must fail loudly rather than returning garbage"
 fixture = "fs.apfs.encrypted.hd"
+[[case.step]]
+args = ["ls", "{fixture}", "/", "--password", "not-the-passphrase"]
+expect_exit = 1
+
+[[case]]
+id = "read.apfs.encrypted-gpt.locked"
+description = "GPT-wrapped FileVault volume. Identifying the container without a passphrase must still work"
+fixture = "fs.apfs.encrypted-gpt.hd"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["APFS"]
+
+[[case]]
+id = "read.apfs.encrypted-gpt.needs-a-passphrase"
+description = "Browsing a locked volume must say a passphrase is required, not fail obscurely"
+fixture = "fs.apfs.encrypted-gpt.hd"
+[[case.step]]
+args = ["ls", "{fixture}", "/"]
+expect_exit = 1
+stderr_contains = ["encrypted", "passphrase"]
+
+[[case]]
+id = "read.apfs.encrypted-gpt.unlocked"
+description = "Decrypts to the same tree and the same bytes as the other two encrypted APFS fixtures"
+fixture = "fs.apfs.encrypted-gpt.hd"
+[[case.step]]
+args = ["ls", "{fixture}", "/", "--password", "password"]
+expect_exit = 0
+stdout_contains = ["hello.txt", "medium.txt", "big.bin", "link_to_hello", "docs"]
+[[case.step]]
+args = ["get", "{fixture}", "/hello.txt", "{scratch}/hello.txt", "--password", "password"]
+expect_exit = 0
+file_sha256 = [{ path = "{scratch}/hello.txt", sha256 = "3c74c11f53769169dab4810549bb5f1d46cbf71da66ca4ff39d29e36aa870228" }]
+[[case.step]]
+args = ["get", "{fixture}", "/medium.txt", "{scratch}/medium.txt", "--password", "password"]
+expect_exit = 0
+file_sha256 = [{ path = "{scratch}/medium.txt", sha256 = "b7fe4febe239781976b258506989f566502a8aec1a5dff4b1a19a2dcc7466233" }]
+[[case.step]]
+args = ["get", "{fixture}", "/big.bin", "{scratch}/big.bin", "--password", "password"]
+expect_exit = 0
+file_sha256 = [{ path = "{scratch}/big.bin", sha256 = "e9c4c182616951b8f95c7881e13d11563c5c726c7f7cec6c92573d8048684b91" }]
+[[case.step]]
+args = ["get", "{fixture}", "/docs/readme.md", "{scratch}/readme.md", "--password", "password"]
+expect_exit = 0
+file_sha256 = [{ path = "{scratch}/readme.md", sha256 = "e572aeb222ba1eca7a0a4ebd98617ea9ed6ee6d4c99bb72456c29faab94f3191" }]
+[[case.step]]
+args = ["get", "{fixture}", "/docs/nested/deep.txt", "{scratch}/deep.txt", "--password", "password"]
+expect_exit = 0
+file_sha256 = [{ path = "{scratch}/deep.txt", sha256 = "30cf6f2de471343739bcc1dde393c0c0771814ac3ad798f68c8a74495174521a" }]
+
+[[case]]
+id = "read.apfs.encrypted-gpt.wrong-passphrase-is-an-error"
+description = "A wrong passphrase must fail loudly rather than returning garbage"
+fixture = "fs.apfs.encrypted-gpt.hd"
+[[case.step]]
+args = ["ls", "{fixture}", "/", "--password", "not-the-passphrase"]
+expect_exit = 1
+
+[[case]]
+id = "read.apfs.encrypted-bare.locked"
+description = "Same volume with no partition table at all — APFS at LBA 0, found by superfloppy detection"
+fixture = "fs.apfs.encrypted-bare.hd"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["APFS"]
+
+[[case]]
+id = "read.apfs.encrypted-bare.needs-a-passphrase"
+description = "Browsing a locked volume must say a passphrase is required, not fail obscurely"
+fixture = "fs.apfs.encrypted-bare.hd"
+[[case.step]]
+args = ["ls", "{fixture}", "/"]
+expect_exit = 1
+stderr_contains = ["encrypted", "passphrase"]
+
+[[case]]
+id = "read.apfs.encrypted-bare.unlocked"
+description = "Decrypts to the same tree and the same bytes as the other two encrypted APFS fixtures"
+fixture = "fs.apfs.encrypted-bare.hd"
+[[case.step]]
+args = ["ls", "{fixture}", "/", "--password", "password"]
+expect_exit = 0
+stdout_contains = ["hello.txt", "medium.txt", "big.bin", "link_to_hello", "docs"]
+[[case.step]]
+args = ["get", "{fixture}", "/hello.txt", "{scratch}/hello.txt", "--password", "password"]
+expect_exit = 0
+file_sha256 = [{ path = "{scratch}/hello.txt", sha256 = "3c74c11f53769169dab4810549bb5f1d46cbf71da66ca4ff39d29e36aa870228" }]
+[[case.step]]
+args = ["get", "{fixture}", "/medium.txt", "{scratch}/medium.txt", "--password", "password"]
+expect_exit = 0
+file_sha256 = [{ path = "{scratch}/medium.txt", sha256 = "b7fe4febe239781976b258506989f566502a8aec1a5dff4b1a19a2dcc7466233" }]
+[[case.step]]
+args = ["get", "{fixture}", "/big.bin", "{scratch}/big.bin", "--password", "password"]
+expect_exit = 0
+file_sha256 = [{ path = "{scratch}/big.bin", sha256 = "e9c4c182616951b8f95c7881e13d11563c5c726c7f7cec6c92573d8048684b91" }]
+[[case.step]]
+args = ["get", "{fixture}", "/docs/readme.md", "{scratch}/readme.md", "--password", "password"]
+expect_exit = 0
+file_sha256 = [{ path = "{scratch}/readme.md", sha256 = "e572aeb222ba1eca7a0a4ebd98617ea9ed6ee6d4c99bb72456c29faab94f3191" }]
+[[case.step]]
+args = ["get", "{fixture}", "/docs/nested/deep.txt", "{scratch}/deep.txt", "--password", "password"]
+expect_exit = 0
+file_sha256 = [{ path = "{scratch}/deep.txt", sha256 = "30cf6f2de471343739bcc1dde393c0c0771814ac3ad798f68c8a74495174521a" }]
+
+[[case]]
+id = "read.apfs.encrypted-bare.wrong-passphrase-is-an-error"
+description = "A wrong passphrase must fail loudly rather than returning garbage"
+fixture = "fs.apfs.encrypted-bare.hd"
 [[case.step]]
 args = ["ls", "{fixture}", "/", "--password", "not-the-passphrase"]
 expect_exit = 1

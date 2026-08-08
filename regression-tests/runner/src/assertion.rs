@@ -154,6 +154,28 @@ pub fn evaluate(
         }
     }
 
+    for needle in &step.stderr_contains {
+        let needle = resolve(needle);
+        if !out.stderr.contains(&needle) {
+            failures.push(FailedAssertion::new(
+                "stderr_contains",
+                needle,
+                truncate(&out.stderr, 400),
+            ));
+        }
+    }
+
+    for needle in &step.stderr_not_contains {
+        let needle = resolve(needle);
+        if out.stderr.contains(&needle) {
+            failures.push(FailedAssertion::new(
+                "stderr_not_contains",
+                format!("stderr must not contain {:?}", needle),
+                truncate(&out.stderr, 400),
+            ));
+        }
+    }
+
     if step.stderr_empty && !out.stderr.trim().is_empty() {
         failures.push(FailedAssertion::new(
             "stderr_empty",
@@ -258,8 +280,12 @@ pub fn evaluate(
                 }
             }
             Err(e) => failures.push(
-                FailedAssertion::new("file_sha256", want.sha256.clone(), format!("unreadable: {}", e))
-                    .with_selector(&path),
+                FailedAssertion::new(
+                    "file_sha256",
+                    want.sha256.clone(),
+                    format!("unreadable: {}", e),
+                )
+                .with_selector(&path),
             ),
         }
     }

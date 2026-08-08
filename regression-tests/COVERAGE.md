@@ -501,7 +501,8 @@ first-class operator, not a shell escape.
 | `exit` | Process exit code equals an expected value from `src/cli/exit.rs`. |
 | `envelope` | Output parses as the JSON envelope and `status.error` matches. |
 | `json_path` | A JSONPath-ish selector into `result` equals / matches / exists. |
-| `stdout_contains` / `stdout_matches` | Text-mode output assertions. |
+| `stdout_contains` / `stdout_matches` / `stdout_not_contains` | Text-mode output assertions. |
+| `stderr_contains` / `stderr_not_contains` | Diagnostics go to stderr, so a negative case asserting the *right* failure has nowhere else to look. |
 | `stderr_empty` | Nothing on stderr for a successful run. |
 | `file_exists` / `file_size` | Produced artifact checks. |
 | `file_sha256` | Exact artifact identity, for deterministic outputs. |

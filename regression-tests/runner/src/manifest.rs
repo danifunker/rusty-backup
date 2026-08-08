@@ -136,6 +136,12 @@ pub struct Step {
     /// contain this" is a normal thing to assert.
     #[serde(default)]
     pub stdout_not_contains: Vec<String>,
+    /// Diagnostics go to stderr, so a negative case asserting the *right*
+    /// failure — not merely a non-zero exit — has nowhere else to look.
+    #[serde(default)]
+    pub stderr_contains: Vec<String>,
+    #[serde(default)]
+    pub stderr_not_contains: Vec<String>,
     #[serde(default)]
     pub stderr_empty: bool,
 
@@ -290,6 +296,8 @@ impl Case {
                     stdout_contains: s.stdout_contains.clone(),
                     stdout_matches: s.stdout_matches.clone(),
                     stdout_not_contains: s.stdout_not_contains.clone(),
+                    stderr_contains: s.stderr_contains.clone(),
+                    stderr_not_contains: s.stderr_not_contains.clone(),
                     stderr_empty: s.stderr_empty,
                     json_equals: s
                         .json_equals

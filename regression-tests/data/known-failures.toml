@@ -122,3 +122,10 @@ finding = "R-026"
 [[known]]
 id = "read.optical.chdcd.audio-test"
 finding = "R-012"
+
+# --- R-027: the Finder-zipped .dmg ------------------------------------------
+# Catalogued 2026-08-02, first executed 2026-08-08. It has never passed; the
+# case is not a regression, it is the first look at a fixture nothing reached.
+[[known]]
+id = "read.apfs.apple-gpt"
+finding = "R-027"

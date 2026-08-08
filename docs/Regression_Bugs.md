@@ -1,4 +1,4 @@
-# Regression Findings (R-001 … R-026)
+# Regression Findings (R-001 … R-027)
 
 Defects and documentation drift turned up while building the regression suite
 (`regression-tests/`), 2026-08-01/02. The suite work was deliberately kept
@@ -26,6 +26,7 @@ finding depends on a fixture, the fixture is named.
 | [R-024](#r-024) | Medium | `src/fs/affs.rs` | AFFS `put` leaves the volume failing its own fsck |
 | [R-025](#r-025) | Medium | `src/fs/squashfs_edit.rs` | `squashfs put` fails to replace the image on Windows |
 | [R-026](#r-026) | Low | `src/cli/verbs/show.rs` | `show partmap` cannot read an SGI disk that `inspect` reads fine |
+| [R-027](#r-027) | Medium | `src/rbformats/zip_disk.rs` | A Finder-made `.zip` holding one `.dmg` is rejected as ambiguous |
 | [R-020](#r-020) | **High** | `src/fs/affs.rs` | `new volume affs` output is "Not a DOS disk" on a real Amiga, at every size |
 | [R-016](#r-016) | **High** | `src/cli/verbs/backup.rs` | `backup` accepts only flat-layout sources: CHD, dynamic VHD, QCOW2 and VMDK all fail |
 | ~~R-018~~ | ~~Blocker~~ **FIXED** | `CONTRIBUTING.md` | ~~The documented Rust-1.73 verification build does not compile on Windows~~ — missing `windows-legacy` feature, 2026-08-07 |
@@ -283,6 +284,34 @@ rb-cli show partmap d.img   -> error: parsing APM: Invalid APM: bad DDR signatur
 is trying APM on a disk it should have recognised. `inspect` gets it right on
 the same file, so the detection that exists is simply not being used here.
 Case `subcmd.show.partmap`.
+
+### R-027 — a Mac-made `.zip` holding one `.dmg` is called ambiguous {#r-027}
+
+Found 2026-08-08, the first time `fs.apfs.apple-gpt.hd` was ever executed —
+it was catalogued and checksummed but no run had reached it.
+
+```
+rb-cli inspect fs.apfs.apple-gpt.hd.dmg.zip
+  -> error: ZIP has no obvious disk image and contains multiple files;
+     pass --inside <name> to pick one. Entries:
+       APFS_Image.dmg (524288000 bytes)
+       __MACOSX/._APFS_Image.dmg (219 bytes)
+```
+
+Control: `--inside APFS_Image.dmg` reads the disk correctly (GPT, Apple APFS
+at LBA 40, 500 MiB), so neither the archive nor the ZIP reader is at fault.
+
+Two things line up to produce it, both in `is_disk_image_entry` /
+`pick_entry` in `src/rbformats/zip_disk.rs`. `.dmg` is absent from the `EXTS`
+list, so the archive's only real image is not recognised as one; and the
+zero-candidate fallback accepts a single-entry archive without first
+discarding AppleDouble stubs, which the `__MACOSX/._` sidecar defeats. Either
+alone would be survivable — together, every disk image zipped in Finder needs
+`--inside`. `is_apple_double` already exists and is applied in the wrong
+place. Note also that `EXTS` is a second hardcoded extension list living
+apart from `DISK_IMAGE_EXTS` in `src/model/file_types.rs`.
+
+Case `read.apfs.apple-gpt`.
 
 ---
 
