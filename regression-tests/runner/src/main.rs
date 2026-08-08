@@ -1529,6 +1529,25 @@ fn preflight(rb_cli: &Path, repo: &Path) -> Result<String, String> {
         }
     }
 
+    // And check ourselves. rb-regress reads the case manifests and the bug
+    // list, so a stale runner mis-reads results that a correct sha makes look
+    // trustworthy — which is worse than a stale rb-cli, not better. Hit for
+    // real on 2026-08-08: macOS pulled the platform-scoping commit, was not
+    // rebuilt, and reported two false XPASS under the new sha while Linux,
+    // rebuilt, reported the same two as plain passes.
+    if let (Ok(self_bin), Some(runner_src)) = (
+        std::env::current_exe().and_then(|p| p.metadata()).and_then(|m| m.modified()),
+        // newest_source_mtime appends "src" itself — hand it the crate root.
+        newest_source_mtime(&regression_dir().join("runner")),
+    ) {
+        if runner_src > self_bin {
+            notes.push(
+                "WARNING: regression-tests/runner/src is newer than this rb-regress; rebuild it, or the verdicts come from a harness that no longer exists"
+                    .to_string(),
+            );
+        }
+    }
+
     let mut s = format!("rb-cli   : {}
 version  : {}
 ", rb_cli.display(), version);
