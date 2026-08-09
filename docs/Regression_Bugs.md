@@ -26,7 +26,7 @@ finding depends on a fixture, the fixture is named.
 | [R-024](#r-024) | Medium | `src/fs/affs.rs` | AFFS `put` leaves the volume failing its own fsck |
 | ~~R-025~~ | ~~Medium~~ **FIXED** | `src/fs/squashfs_edit.rs` | ~~`squashfs put` fails to replace the image on Windows~~ — handle released before the rename, 2026-08-08 |
 | [R-026](#r-026) | Low | `src/cli/verbs/show.rs` | `show partmap` cannot read an SGI disk that `inspect` reads fine |
-| [R-027](#r-027) | Medium | `src/rbformats/zip_disk.rs` | A Finder-made `.zip` holding one `.dmg` is rejected as ambiguous |
+| ~~R-027~~ | ~~Medium~~ **FIXED** | `src/rbformats/zip_disk.rs` | ~~A Finder-made `.zip` holding one `.dmg` is rejected as ambiguous~~ — extension list derived from the canonical one, 2026-08-08 |
 | [R-030](#r-030) | **High** | `src/fs/affs.rs` | A real Workbench 1.3 AFFS volume cannot be opened at all — read, fsck and write alike |
 | [R-029](#r-029) | **High** | `src/fs/efs.rs` | EFS computes block addresses far outside the image; `fsck` fails on an unmodified volume |
 | [R-031](#r-031) | Medium | `src/partition/mod.rs` | A real Apple DOS 3.3 disk is detected as `unknown`, though our own output is not |
@@ -323,6 +323,23 @@ the same file, so the detection that exists is simply not being used here.
 Case `subcmd.show.partmap`.
 
 ### R-027 — a Mac-made `.zip` holding one `.dmg` is called ambiguous {#r-027}
+
+**FIXED 2026-08-08 — and the AppleDouble sidecar was not the cause.** The
+archive holds `APFS_Image.dmg` and `__MACOSX/._APFS_Image.dmg`, so the stub
+looked like the obvious culprit. It was already filtered. The real reason was
+that `.dmg` was not in this file's private extension list at all, so *neither*
+entry counted as a disk image and the single-entry fallback then saw two files.
+
+The list had drifted from `DISK_IMAGE_EXTS`, which has carried `dmg` all
+along — and `adf`, `2mg`, `woz`, `imz`, `dc42`, `moof`, `d88`, `xdf`, `hdm`,
+`dim`, `po`, `do`, `gho`, `hfv` and `squashfs` besides. Every one of those was
+the same bug waiting for a differently-shaped archive. It is now derived from
+the canonical list, so the two cannot drift again; `bin` is excluded, being far
+too common in a mixed archive to identify a disk image by.
+
+AppleDouble entries are now dropped at collection rather than only in the
+image filter, so the single-entry fallback and the "Entries:" listing ignore
+them too.
 
 Found 2026-08-08, the first time `fs.apfs.apple-gpt.hd` was ever executed —
 it was catalogued and checksummed but no run had reached it.

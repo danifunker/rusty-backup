@@ -118,12 +118,6 @@ finding = "R-026"
 # carries an ISO 9660 data track, so it never exercised "no data track" at all.
 # XPASS caught it. R-012 is still pinned by optical.cdda.no-data-track-opens.
 
-# --- R-027: the Finder-zipped .dmg ------------------------------------------
-# Catalogued 2026-08-02, first executed 2026-08-08. It has never passed; the
-# case is not a regression, it is the first look at a fixture nothing reached.
-[[known]]
-id = "read.apfs.apple-gpt"
-finding = "R-027"
 
 # --- Found 2026-08-08, first execution of the tier-3 sweep -------------------
 # None of these had ever run: the last full Windows run predates the tier-2 and
