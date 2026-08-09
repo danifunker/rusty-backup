@@ -11372,7 +11372,7 @@ fn apply_metadata_edit(
         resolve_partition_rw_forced(std::path::Path::new(image_path), selector, None)?;
     let mut fs = ctx
         .open_editable(file)
-        .map_err(|e| anyhow::anyhow!("opening filesystem for write: {e}"))?;
+        .map_err(|e| crate::cli::resolve::write_open_error("opening filesystem for write", e))?;
     let entry = crate::cli::verbs::ls::resolve_path(fs.as_filesystem_mut(), &dst)?;
     // Type/creator only where the filesystem has them: on a POSIX-only
     // volume the editor shows blank codes and this would otherwise fail the
@@ -11548,7 +11548,7 @@ fn apply_bless_folder(
         resolve_partition_rw_forced(std::path::Path::new(image_path), selector, None)?;
     let mut fs = ctx
         .open_editable(file)
-        .map_err(|e| anyhow::anyhow!("opening filesystem for write: {e}"))?;
+        .map_err(|e| crate::cli::resolve::write_open_error("opening filesystem for write", e))?;
     let entry = crate::cli::verbs::ls::resolve_path(fs.as_filesystem_mut(), dir_path)?;
     if !entry.is_directory() {
         anyhow::bail!("{dir_path} is not a directory");
@@ -11575,7 +11575,7 @@ fn apply_mkdir(
         resolve_partition_rw_forced(std::path::Path::new(image_path), selector, None)?;
     let mut fs = ctx
         .open_editable(file)
-        .map_err(|e| anyhow::anyhow!("opening filesystem for write: {e}"))?;
+        .map_err(|e| crate::cli::resolve::write_open_error("opening filesystem for write", e))?;
     let parent = if cur_dir == "/" {
         fs.root()
             .map_err(|e| anyhow::anyhow!("reading root: {e}"))?
@@ -11608,7 +11608,7 @@ fn apply_delete(
         resolve_partition_rw_forced(std::path::Path::new(image_path), selector, None)?;
     let mut fs = ctx
         .open_editable(file)
-        .map_err(|e| anyhow::anyhow!("opening filesystem for write: {e}"))?;
+        .map_err(|e| crate::cli::resolve::write_open_error("opening filesystem for write", e))?;
     let parent = if cur_dir == "/" {
         fs.root()
             .map_err(|e| anyhow::anyhow!("reading root: {e}"))?
@@ -11652,7 +11652,7 @@ fn write_file_bytes(
         resolve_partition_rw_forced(std::path::Path::new(image_path), selector, None)?;
     let mut fs = ctx
         .open_editable(file)
-        .map_err(|e| anyhow::anyhow!("opening filesystem for write: {e}"))?;
+        .map_err(|e| crate::cli::resolve::write_open_error("opening filesystem for write", e))?;
     let (parent, leaf) = crate::cli::verbs::ls::resolve_parent(fs.as_filesystem_mut(), &dst)?;
     let mut reader = std::io::Cursor::new(bytes.to_vec());
     crate::fs::replace::create_or_replace(
@@ -11706,7 +11706,7 @@ fn import_host_file(
         resolve_partition_rw_forced(std::path::Path::new(image_path), selector, None)?;
     let mut fs = ctx
         .open_editable(file)
-        .map_err(|e| anyhow::anyhow!("opening filesystem for write: {e}"))?;
+        .map_err(|e| crate::cli::resolve::write_open_error("opening filesystem for write", e))?;
 
     let (parent, leaf) = crate::cli::verbs::ls::resolve_parent(fs.as_filesystem_mut(), &dst)?;
     if !parent.is_directory() {

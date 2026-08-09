@@ -104,7 +104,7 @@ pub fn run(args: EditArgs) -> Result<()> {
     args.fs_override.apply(&mut ctx);
     let mut fs = ctx
         .open_editable(file)
-        .map_err(|e| anyhow!("opening filesystem for write: {e}"))?;
+        .map_err(|e| crate::cli::resolve::write_open_error("opening filesystem for write", e))?;
 
     let fs_type = fs.fs_type().to_string();
     let (parent, name) = super::ls::resolve_parent(fs.as_filesystem_mut(), &args.path)?;

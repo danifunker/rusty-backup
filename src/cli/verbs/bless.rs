@@ -56,7 +56,7 @@ pub fn apply_bless(image: &ImageRef, path: &str) -> Result<()> {
     log_stderr(&ctx.label);
     let mut fs = ctx
         .open_editable(file)
-        .map_err(|e| anyhow!("opening filesystem for write: {e}"))?;
+        .map_err(|e| crate::cli::resolve::write_open_error("opening filesystem for write", e))?;
 
     let entry = super::ls::resolve_path(fs.as_filesystem_mut(), path)?;
     if !entry.is_directory() {

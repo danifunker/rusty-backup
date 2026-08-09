@@ -33,7 +33,7 @@ finding depends on a fixture, the fixture is named.
 | [R-028](#r-028) | Medium | `src/fs/apple_dos.rs` | Apple DOS 3.3 reports three different sizes for one file: 104 in, 512 by `ls`, 256 by `get` |
 | [R-032](#r-032) | Low | `src/fs/sfs.rs` | SFS `put` fails on any volume with a multi-leaf extent btree — i.e. any real one |
 | [R-033](#r-033) | **High** | `src/partition/mod.rs` | A QL Microdrive `.mdv` fails at MBR detection, though its own probe matches it exactly |
-| [R-034](#r-034) | Medium | `src/fs/mod.rs` | Refusing a write to a read-only filesystem says `unknown` and exits 1, not 4 |
+| ~~R-034~~ | ~~Medium~~ **FIXED** | `src/fs/mod.rs` | ~~Refusing a write to a read-only filesystem says `unknown` and exits 1, not 4~~ — names the filesystem, exits 4, 2026-08-08 |
 | [R-035](#r-035) | Medium | `src/backup/` | `.cbk` embeds the producing host's absolute path, so it can never be byte-identical across machines |
 | [R-020](#r-020) | **High** | `src/fs/affs.rs` | `new volume affs` output is "Not a DOS disk" on a real Amiga, at every size |
 | [R-016](#r-016) | **High** | `src/cli/verbs/backup.rs` | `backup` accepts only flat-layout sources: CHD, dynamic VHD, QCOW2 and VMDK all fail |
@@ -783,6 +783,29 @@ some rounding is inherent; three *different* numbers is not. Case
 `edit.apple-dos.put-get`.
 
 ### R-034 — a read-only filesystem is refused as 'unknown', with the wrong code {#r-034}
+
+**FIXED 2026-08-08.** Both halves, and they had different causes.
+
+*The name.* `fs_name_for` had no entry for `lisafs`, and the Alto image
+carries no type string at all — its name lives in `PartitionInfo::type_name`,
+which the write path never received. So the fix is in two places: the missing
+`fs_name_for` entries, and `type_name` carried on `PartitionContext` so a
+refusal can say what the read path just said. Only a message that failed to
+name the filesystem is rewritten; every other `Unsupported` is more specific
+than anything this could substitute.
+
+*The code.* Nothing could carry an exit code out of a handler at all — see
+[R-004](#r-004), fixed first. `Unsupported` from a write-open is now
+`exit::permission_denied`, which is what `exit.rs` reserves code 4 for.
+
+    error: opening filesystem for write: unsupported: editing not yet
+    supported for filesystem type 'Apple Lisa File System'   [exit 4]
+
+**It does NOT also fix [R-031](#r-031)**, which this entry suggested checking.
+`edit.real.apple-dos-invaders` is still red: a real Apple DOS 3.3 disk arrives
+at the write path as `unknown` for a different reason, and needs its own
+diagnosis.
+
 
 Found 2026-08-08 writing the negative cases PLAN.md § Phase 4 asks for, which
 did not exist at all until now.

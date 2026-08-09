@@ -457,7 +457,7 @@ fn run_fs_ops_on_path(
     log_stderr(&ctx.label);
     let mut fs = ctx
         .open_editable(file)
-        .map_err(|e| anyhow!("opening filesystem for write: {e}"))?;
+        .map_err(|e| crate::cli::resolve::write_open_error("opening filesystem for write", e))?;
 
     let mut applied = fs_ops_start;
     let mut failures: Vec<(usize, String)> = Vec::new();

@@ -228,7 +228,7 @@ pub fn run_with_budget(
     log_stderr(&ctx.label);
     let mut fs = ctx
         .open_editable(file)
-        .map_err(|e| anyhow!("opening filesystem for write: {e}"))?;
+        .map_err(|e| crate::cli::resolve::write_open_error("opening filesystem for write", e))?;
 
     // Resolve parent + leaf with the shared escape / colon grammar so a file
     // whose name contains a literal `/` can be written.

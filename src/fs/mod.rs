@@ -1226,6 +1226,10 @@ pub fn fs_name_for(partition_type: u8, partition_type_string: Option<&str>) -> &
             // Amiga boot block present, no AmigaDOS filesystem (custom
             // bootblock / diagnostic disk). Browsable via the carve view.
             "Amiga-NDOS" => "Amiga NDOS (no filesystem)",
+            // Container-identified, so content probing cannot name them and
+            // the write path called both "unknown" (R-034).
+            "lisafs" => "Apple Lisa File System",
+            "Alto BFS" => "Alto BFS",
             _ => "unknown",
         };
     }
@@ -2180,9 +2184,19 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
-                _ => Err(FilesystemError::Unsupported(format!(
-                    "editing not yet supported for filesystem type '{fs_type}'"
-                ))),
+                _ => {
+                    // Name it the way the read path does. Detection returns
+                    // "unknown" for filesystems identified by their container
+                    // rather than a superblock, so reporting that told the user
+                    // the disk was unreadable moments after `ls` read it (R-034).
+                    let named = match fs_name_for(partition_type, partition_type_string) {
+                        "unknown" => partition_type_string.unwrap_or(fs_type),
+                        n => n,
+                    };
+                    Err(FilesystemError::Unsupported(format!(
+                        "editing not yet supported for filesystem type '{named}'"
+                    )))
+                }
             }
         }
         // FAT12

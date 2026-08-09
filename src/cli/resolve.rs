@@ -41,6 +41,12 @@ pub struct PartitionContext {
     /// APM / RDB type string (e.g. `"Apple_HFS"`, `"PFS\\3"`). `None`
     /// for MBR / GPT / raw superfloppy.
     pub type_string: Option<String>,
+    /// How the read path names this filesystem, e.g. `"Alto BFS"`. Carried so a
+    /// refusal can say what the volume is: content probing on the write path
+    /// returns "unknown" for filesystems identified by their container, which
+    /// told the user the disk was unreadable a moment after `ls` read it
+    /// (R-034).
+    pub type_name: String,
     /// Partition size in bytes. For raw superfloppies, the image's
     /// total length.
     pub size: u64,
@@ -77,6 +83,16 @@ impl PartitionContext {
         Box<dyn crate::fs::EditableFilesystem>,
         crate::fs::filesystem::FilesystemError,
     > {
+        // Rewrite only the "we could not name it" case; every other
+        // Unsupported message is specific and better than anything here.
+        let name_it = |e: crate::fs::filesystem::FilesystemError| match &e {
+            crate::fs::filesystem::FilesystemError::Unsupported(m) if m.contains("'unknown'") => {
+                crate::fs::filesystem::FilesystemError::Unsupported(
+                    m.replace("'unknown'", &format!("'{}'", self.type_name)),
+                )
+            }
+            _ => e,
+        };
         crate::fs::open_editable_filesystem_with(
             handle,
             self.offset,
@@ -90,6 +106,7 @@ impl PartitionContext {
             self.type_byte,
             self.type_string.as_deref(),
         )
+        .map_err(name_it)
     }
 }
 
@@ -589,6 +606,7 @@ fn resolve_with_override<R: Read + Seek>(
                     offset: 0,
                     type_byte: 0x00,
                     type_string: None,
+                    type_name: "raw".to_string(),
                     size: total,
                     label: "Partition: raw filesystem @ byte 0 (forced via --fs-type)".to_string(),
                     // `resolve` works from a reader and doesn't know whether it
@@ -615,6 +633,7 @@ fn resolve_with_override<R: Read + Seek>(
             offset: 0,
             type_byte: 0x00,
             type_string: None,
+            type_name: pt.type_name().to_string(),
             size: total,
             label: format!("Partition: raw filesystem @ byte 0 ({})", pt.type_name()),
             whole_file_path: None,
@@ -631,6 +650,7 @@ fn resolve_with_override<R: Read + Seek>(
         offset: info.byte_offset(),
         type_byte: info.partition_type_byte,
         type_string: info.partition_type_string.clone(),
+        type_name: info.type_name.clone(),
         size: info.size_bytes,
         label: format_label(&pt, &info, &partitions),
         whole_file_path: None,
@@ -854,6 +874,23 @@ impl FsDispatchOverride {
             ctx.type_byte = 0; // Force string-dispatch
             ctx.label = format!("{} [--fs-type {}]", ctx.label, t);
         }
+    }
+}
+
+/// Classify a failure to open a filesystem for writing.
+///
+/// `Unsupported` from a write-open means the volume is readable and this build
+/// will not write it — "a read-only filesystem on a write path", which is
+/// exactly what `exit.rs` reserves PERMISSION_DENIED for. It used to exit 1,
+/// indistinguishable from a genuine I/O failure (R-034). The caller's wording
+/// is preserved so each verb keeps its own phrasing.
+pub fn write_open_error(context: &str, e: crate::fs::filesystem::FilesystemError) -> anyhow::Error {
+    let msg = format!("{context}: {e}");
+    match e {
+        crate::fs::filesystem::FilesystemError::Unsupported(_) => {
+            crate::cli::exit::permission_denied(msg)
+        }
+        _ => anyhow!(msg),
     }
 }
 

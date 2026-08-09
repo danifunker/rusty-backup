@@ -1624,7 +1624,7 @@ fn apply_session(sess: &Session) -> Result<u64> {
         ctx.type_byte,
         ctx.type_string.as_deref(),
     )
-    .map_err(|e| anyhow!("opening filesystem for write: {e}"))?;
+    .map_err(|e| crate::cli::resolve::write_open_error("opening filesystem for write", e))?;
 
     let mut count = 0u64;
     for edit in &sess.edits {

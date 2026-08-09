@@ -136,10 +136,3 @@ finding = "R-032"
 id = "read.qdos.microdrive"
 finding = "R-033"
 
-# --- R-034: the read-only write refusal ---------------------------------------
-[[known]]
-id = "edit.readonly.lisa-refuses-a-write"
-finding = "R-034"
-[[known]]
-id = "edit.readonly.alto-refuses-a-write"
-finding = "R-034"

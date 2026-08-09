@@ -75,7 +75,7 @@ pub fn run_with_budget(
     log_stderr(&ctx.label);
     let mut fs = ctx
         .open_editable(file)
-        .map_err(|e| anyhow!("opening filesystem for write: {e}"))?;
+        .map_err(|e| crate::cli::resolve::write_open_error("opening filesystem for write", e))?;
 
     let case_insensitive = match (args.ignore_case, args.case_sensitive) {
         (true, _) => true,
