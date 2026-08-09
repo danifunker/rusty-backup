@@ -65,12 +65,6 @@ finding = "R-005"
 id = "cli.envelope.ls-supports-format"
 finding = "R-003"
 [[known]]
-id = "cli.exit.csv-on-nested-verb-is-usage-error"
-finding = "R-004"
-[[known]]
-id = "cli.exit.tsv-on-nested-verb-is-usage-error"
-finding = "R-004"
-[[known]]
 id = "cli.flags.inspect-accepts-fs-type"
 finding = "R-010"
 
@@ -138,11 +132,6 @@ finding = "R-028"
 id = "edit.sfs.put-get"
 finding = "R-032"
 
-# The second instance of R-004: a handler-side usage rejection returning
-# GENERIC_FAILURE where exit.rs reserves USAGE_ERROR.
-[[known]]
-id = "shrink.rejects-non-chd-output"
-finding = "R-004"
 
 
 

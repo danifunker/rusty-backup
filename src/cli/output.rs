@@ -183,10 +183,12 @@ pub fn require_non_flat(format: OutputFormat, verb_name: &str) -> Result<()> {
         let suggestion = "Use --format json or --format yaml instead.";
         #[cfg(not(feature = "yaml"))]
         let suggestion = "Use --format json instead.";
-        anyhow::bail!(
+        // A usage rejection, and it must exit 2 — this file has documented that
+        // since it was written, while `anyhow::bail!` sent 1 (R-004).
+        return Err(crate::cli::exit::usage(format!(
             "{verb_name} returns nested data; --format {format} only supports flat tabular \
              results. {suggestion}"
-        );
+        )));
     }
     Ok(())
 }
@@ -236,8 +238,16 @@ mod tests {
 
     #[test]
     fn require_non_flat_rejects_csv_for_nested() {
-        assert!(require_non_flat(OutputFormat::Csv, "inspect").is_err());
-        assert!(require_non_flat(OutputFormat::Tsv, "inspect").is_err());
+        // Asserting only `is_err()` is what let R-004 sit here unnoticed: the
+        // message said usage error while the process exited 1.
+        for f in [OutputFormat::Csv, OutputFormat::Tsv] {
+            let e = require_non_flat(f, "inspect").expect_err("must reject");
+            assert_eq!(
+                crate::cli::exit::code_for(&e),
+                crate::cli::exit::USAGE_ERROR,
+                "{f} rejection must exit 2"
+            );
+        }
         assert!(require_non_flat(OutputFormat::Json, "inspect").is_ok());
         assert!(require_non_flat(OutputFormat::Text, "inspect").is_ok());
     }

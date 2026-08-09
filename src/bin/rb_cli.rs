@@ -14,7 +14,9 @@ fn main() {
             // Best-effort plain-text error. Verbs that need to surface
             // structured errors do so before bubbling here.
             eprintln!("error: {e:#}");
-            rusty_backup::cli::exit::GENERIC_FAILURE
+            // Handlers that classified their failure keep that classification;
+            // everything else is a generic failure as before.
+            rusty_backup::cli::exit::code_for(&e)
         }
     };
     std::process::exit(code);

@@ -51,7 +51,7 @@ finding depends on a fixture, the fixture is named.
 | [R-003](#r-003) | Medium | `src/cli/output.rs` | Docs claim `ls` supports `--format`; it does not |
 | [R-010](#r-010) | Medium | `src/cli/verbs/inspect.rs` | `inspect` has no `--fs-type`, so CP/M images cannot be inspected |
 | [R-006](#r-006) | Medium | `src/cli/verbs/new.rs` | `new volume prodos` always fails with default arguments |
-| [R-004](#r-004) | Low | `src/cli/output.rs` | CSV/TSV rejection exits 1, documented as 2 |
+| ~~R-004~~ | ~~Low~~ **FIXED** | `src/cli/exit.rs` | ~~CSV/TSV rejection exits 1, documented as 2~~ — errors carry their exit code now, 2026-08-08 |
 | [R-011](#r-011) | Unknown | `src/rbformats/` | G64 decoding fails on copy-protected / patched dumps |
 | [R-001](#r-001) | Doc | `README.md` | Partition-table list missing AHDI and X68000 |
 | [R-002](#r-002) | Doc | `src/fs/README.md` | Capability table stale — ext listed as "planned" |
@@ -1006,6 +1006,22 @@ Every other `new volume` filesystem accepts the default.
 ## Low / undecided
 
 ### R-004 — CSV/TSV rejection exits 1, documented as 2 {#r-004}
+
+**FIXED 2026-08-08.** The cause was structural, not a wrong constant: nothing
+could carry an exit code out of a handler. `main` mapped every `Err` to
+`GENERIC_FAILURE`, so any message naming a specific code was describing
+something the process could not do.
+
+`exit::CodedError` now carries one, with `exit::usage()` and
+`exit::permission_denied()` constructors and `exit::code_for()` reading it back
+in `main`. `code_for` walks the whole `anyhow` chain, so a later
+`.context(..)` — added all over the CLI — cannot silently downgrade a coded
+error back to 1.
+
+Both instances use it: `require_non_flat` and the `.chd` output-extension
+check. The unit test that missed this asserted only `is_err()`; it now asserts
+the code.
+
 
 `src/cli/output.rs` states nested-result verbs "error out with
 `crate::cli::exit::USAGE_ERROR`" — exit 2. Observed exit 1.
