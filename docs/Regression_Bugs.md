@@ -50,7 +50,7 @@ finding depends on a fixture, the fixture is named.
 | [R-012](#r-012) | Medium | `src/optical/` | `optical info` rejects any disc with no data track (pure CD-DA) |
 | [R-003](#r-003) | Medium | `src/cli/output.rs` | Docs claim `ls` supports `--format`; it does not |
 | [R-010](#r-010) | Medium | `src/cli/verbs/inspect.rs` | `inspect` has no `--fs-type`, so CP/M images cannot be inspected |
-| [R-006](#r-006) | Medium | `src/cli/verbs/new.rs` | `new volume prodos` always fails with default arguments |
+| ~~R-006~~ | ~~Medium~~ **FIXED** | `src/cli/verbs/new.rs` | ~~`new volume prodos` always fails with default arguments~~ — per-filesystem default, 2026-08-08 |
 | ~~R-004~~ | ~~Low~~ **FIXED** | `src/cli/exit.rs` | ~~CSV/TSV rejection exits 1, documented as 2~~ — errors carry their exit code now, 2026-08-08 |
 | [R-011](#r-011) | Unknown | `src/rbformats/` | G64 decoding fails on copy-protected / patched dumps |
 | [R-001](#r-001) | Doc | `README.md` | Partition-table list missing AHDI and X68000 |
@@ -985,6 +985,21 @@ rb-cli inspect ManicMiner.dsk
 Every CP/M disk (nine DPB presets) is therefore un-inspectable.
 
 ### R-006 — `new volume prodos` fails with default arguments {#r-006}
+
+**FIXED 2026-08-08.** `new volume prodos` with no arguments now writes a
+volume named `RUSTY.BACKUP`.
+
+The shared `--name` default is a named constant, and ProDOS substitutes its
+own when that default is untouched. An explicitly passed `--name my-vol` still
+fails, and should — the user asked for something ProDOS cannot store.
+
+The message was the other half. It said "rename the file" about a *volume*
+name, because one validator serves both and hard-coded the noun. It takes the
+noun from the caller now:
+
+    volume name contains '-' - ProDOS allows only letters (A-Z), digits (0-9),
+    and '.' (spaces and most punctuation are not allowed)
+
 
 The default volume name is `rusty-backup`. ProDOS forbids `-`, so the default
 is invalid for that filesystem and the verb always fails:

@@ -160,7 +160,7 @@ impl<R: Read + Seek + Send> Filesystem for ProDosFilesystem<R> {
     }
 
     fn validate_name(&self, name: &str) -> Result<(), FilesystemError> {
-        validate_prodos_name(name).map(|_| ())
+        validate_prodos_name(name, "filename").map(|_| ())
     }
 
     fn total_size(&self) -> u64 {
@@ -1139,26 +1139,30 @@ fn days_to_ymd(days: i64) -> (i32, u32, u32) {
     (year as i32, m, d)
 }
 
-/// Validate a ProDOS filename: 1-15 chars, A-Z/0-9/period, first char must be a letter.
-/// Returns the uppercase name.
-fn validate_prodos_name(name: &str) -> Result<String, FilesystemError> {
+/// Validate a ProDOS name: 1-15 chars, A-Z/0-9/period, first char must be a
+/// letter. Returns the uppercase name.
+///
+/// `what` names the thing being validated — "filename" or "volume name". The
+/// rules govern both, but every message said "rename the file" even when the
+/// offending string was a volume name (R-006).
+fn validate_prodos_name(name: &str, what: &str) -> Result<String, FilesystemError> {
     if name.is_empty() {
-        return Err(FilesystemError::InvalidData(
-            "filename is empty — pick a non-blank name".into(),
-        ));
+        return Err(FilesystemError::InvalidData(format!(
+            "{what} is empty — pick a non-blank name"
+        )));
     }
     let upper = name.to_ascii_uppercase();
     let bytes = upper.as_bytes();
     if bytes.len() > 15 {
         return Err(FilesystemError::InvalidData(format!(
-            "filename is too long ({} chars); ProDOS allows up to 15 — shorten the name",
+            "{what} is too long ({} chars); ProDOS allows up to 15 — shorten it",
             bytes.len()
         )));
     }
     if !bytes[0].is_ascii_alphabetic() {
         return Err(FilesystemError::InvalidData(format!(
-            "filename starts with '{}' — ProDOS requires the first character to be a letter \
-             (A-Z); rename so it begins with a letter",
+            "{what} starts with '{}' — ProDOS requires the first character to be a letter \
+             (A-Z); change it to begin with a letter",
             upper.chars().next().unwrap_or('?')
         )));
     }
@@ -1166,8 +1170,8 @@ fn validate_prodos_name(name: &str) -> Result<String, FilesystemError> {
         if !b.is_ascii_alphanumeric() && b != b'.' {
             let c = upper.chars().nth(i).unwrap_or('?');
             return Err(FilesystemError::InvalidData(format!(
-                "filename contains '{c}' — ProDOS allows only letters (A-Z), digits (0-9), \
-                 and '.'; rename the file (spaces and most punctuation are not allowed)"
+                "{what} contains '{c}' — ProDOS allows only letters (A-Z), digits (0-9), \
+                 and '.' (spaces and most punctuation are not allowed)"
             )));
         }
     }
@@ -1218,7 +1222,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ProDosFilesystem<R> {
         data_len: u64,
         options: &CreateFileOptions,
     ) -> Result<FileEntry, FilesystemError> {
-        let validated_name = validate_prodos_name(name)?;
+        let validated_name = validate_prodos_name(name, "filename")?;
         let dir_key_block = parent.location as u16;
 
         // Check for duplicate
@@ -1291,7 +1295,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ProDosFilesystem<R> {
         name: &str,
         _options: &CreateDirectoryOptions,
     ) -> Result<FileEntry, FilesystemError> {
-        let validated_name = validate_prodos_name(name)?;
+        let validated_name = validate_prodos_name(name, "filename")?;
         let parent_key_block = parent.location as u16;
 
         // Check for duplicate
@@ -1439,7 +1443,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ProDosFilesystem<R> {
             return Ok(());
         }
         // Uppercases and validates (length / first-letter / allowed chars).
-        let validated = validate_prodos_name(new_name)?;
+        let validated = validate_prodos_name(new_name, "filename")?;
         let dir_key_block = parent.location as u16;
 
         // Reject a collision with a *different* entry. ProDOS folds case, so a
@@ -1724,7 +1728,7 @@ pub fn validate_prodos_integrity(
 /// block below is reserved by clearing its bit. The result round-trips through
 /// [`ProDosFilesystem::open`] and passes `fsck` clean.
 pub fn create_blank_prodos(size_bytes: u64, name: &str) -> anyhow::Result<Vec<u8>> {
-    let vname = validate_prodos_name(name).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let vname = validate_prodos_name(name, "volume name").map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // total_blocks is a u16 field: ProDOS tops out at 65535 blocks (~32 MiB).
     // Floor at 16 blocks (8 KiB) so boot + directory + bitmap always fit with
@@ -2767,21 +2771,21 @@ mod tests {
 
     #[test]
     fn test_name_validation() {
-        assert!(validate_prodos_name("HELLO").is_ok());
-        assert!(validate_prodos_name("A.FILE").is_ok());
-        assert!(validate_prodos_name("hello").is_ok()); // lowercased → OK
-        assert_eq!(validate_prodos_name("hello").unwrap(), "HELLO");
+        assert!(validate_prodos_name("HELLO", "filename").is_ok());
+        assert!(validate_prodos_name("A.FILE", "filename").is_ok());
+        assert!(validate_prodos_name("hello", "filename").is_ok()); // lowercased → OK
+        assert_eq!(validate_prodos_name("hello", "filename").unwrap(), "HELLO");
 
         // Invalid: empty
-        assert!(validate_prodos_name("").is_err());
+        assert!(validate_prodos_name("", "filename").is_err());
         // Invalid: too long (16 chars)
-        assert!(validate_prodos_name("ABCDEFGHIJKLMNOP").is_err());
+        assert!(validate_prodos_name("ABCDEFGHIJKLMNOP", "filename").is_err());
         // Invalid: starts with digit
-        assert!(validate_prodos_name("1FILE").is_err());
+        assert!(validate_prodos_name("1FILE", "filename").is_err());
         // Invalid: contains space
-        assert!(validate_prodos_name("MY FILE").is_err());
+        assert!(validate_prodos_name("MY FILE", "filename").is_err());
         // Invalid: special chars
-        assert!(validate_prodos_name("FILE/NAME").is_err());
+        assert!(validate_prodos_name("FILE/NAME", "filename").is_err());
     }
 
     /// Read the access byte for `path` directly from its on-disk directory

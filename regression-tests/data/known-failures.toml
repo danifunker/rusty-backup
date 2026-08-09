@@ -68,10 +68,6 @@ finding = "R-003"
 id = "cli.flags.inspect-accepts-fs-type"
 finding = "R-010"
 
-# --- R-006 — new volume prodos fails with default arguments ------------------
-[[known]]
-id = "fs.new-volume.prodos-default-name"
-finding = "R-006"
 
 # --- R-013 — Solaris UFS entry types and sizes -------------------------------
 [[known]]
