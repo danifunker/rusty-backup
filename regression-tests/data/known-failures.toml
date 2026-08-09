@@ -99,9 +99,6 @@ finding = "R-023"
 id = "edit.affs.put-get"
 finding = "R-024"
 
-[[known]]
-id = "subcmd.show.partmap"
-finding = "R-026"
 
 # `read.optical.chdcd.audio-test` was listed here as a second R-012 case. It
 # was not one: the fixture is named for its AUDIOTST volume label and actually

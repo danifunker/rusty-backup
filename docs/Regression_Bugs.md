@@ -25,7 +25,7 @@ finding depends on a fixture, the fixture is named.
 | [R-021](#r-021) | **High** | `src/cli/verbs/resize.rs` | `resize --size` reports success and changes nothing |
 | [R-024](#r-024) | Medium | `src/fs/affs.rs` | AFFS `put` leaves the volume failing its own fsck |
 | ~~R-025~~ | ~~Medium~~ **FIXED** | `src/fs/squashfs_edit.rs` | ~~`squashfs put` fails to replace the image on Windows~~ — handle released before the rename, 2026-08-08 |
-| [R-026](#r-026) | Low | `src/cli/verbs/show.rs` | `show partmap` cannot read an SGI disk that `inspect` reads fine |
+| ~~R-026~~ | ~~Low~~ **FIXED** | `src/cli/verbs/show.rs` | ~~`show partmap` cannot read an SGI disk that `inspect` reads fine~~ — detects the table first, 2026-08-08 |
 | ~~R-027~~ | ~~Medium~~ **FIXED** | `src/rbformats/zip_disk.rs` | ~~A Finder-made `.zip` holding one `.dmg` is rejected as ambiguous~~ — extension list derived from the canonical one, 2026-08-08 |
 | [R-030](#r-030) | **High** | `src/fs/affs.rs` | A real Workbench 1.3 AFFS volume cannot be opened at all — read, fsck and write alike |
 | [R-029](#r-029) | **High** | `src/fs/efs.rs` | EFS computes block addresses far outside the image; `fsck` fails on an unmodified volume |
@@ -310,6 +310,15 @@ existed, the first macOS run reported them as XPASS, which is supposed to
 mean "fixed, remove the entry" rather than "never applied here".
 
 ### R-026 — `show partmap` cannot read an SGI disk {#r-026}
+
+**FIXED 2026-08-08.** `show partmap` went straight to `Apm::parse` on any
+image, so every non-Apple table reported whatever its magic looked like as a
+bad DDR signature. It detects the table first now. APM keeps its full DDR and
+driver-descriptor rendering; every other table gets the generic partition
+list, which is all those tables have — faking a DDR for them would be worse
+than omitting it. `PartmapPayload` already carried a `kind` field, so the
+structured output anticipated this.
+
 
 ```
 rb-cli new hd sgi-efs --size 16M d.img
@@ -868,6 +877,25 @@ unqualified. Read is unaffected. Case `edit.sfs.put-get`.
 
 ### R-015 — cue sheets with unpadded track numbers are rejected {#r-015}
 
+**Blocked upstream, confirmed 2026-08-08.** The cue parser is in the
+`opticaldiscs` crate, not this repository. Bumping 0.13.0 -> 0.14.0 builds
+without any API change and does **not** fix it, so the bump was reverted
+rather than carried for nothing.
+
+Minimal reproduction for upstream — `TRACK 1` instead of `TRACK 01`:
+
+```
+FILE "BOOKSHELF.img" BINARY
+   TRACK 1 MODE1/2352
+   INDEX 1 00:00:00
+```
+
+```
+CUE error: Error(Msg("Expeceted number but found String(\"1\") instead"))
+```
+
+(The typo `Expeceted` is upstream's too, and pins the message's origin.)
+
 A CUE sheet written with `TRACK 1` rather than `TRACK 01` fails to parse:
 
 ```
@@ -943,6 +971,21 @@ volume requires, chained through the root block's `bm_pages` slots, with the
 marking loop bounded.
 
 ### R-012 — `optical info` rejects discs with no data track {#r-012}
+
+**Blocked upstream, confirmed 2026-08-08.** Same crate as [R-015](#r-015) and
+same result on 0.14.0: still `No data track found`.
+
+A pure CD-DA disc legitimately has no data track, so refusing to describe the
+image is the defect — `optical info` should report the audio tracks and total
+time. Minimal reproduction:
+
+```
+FILE "cdda-noaudiodata.bin" BINARY
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    INDEX 01 00:05:25
+```
 
 ```
 rb-cli optical info Audio-only.cue
