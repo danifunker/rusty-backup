@@ -12,14 +12,27 @@ concrete reason to.
 
 | # | Feature | Area | Blocks |
 |---|---------|------|--------|
-| [F-001](#f-001) | `optical extract` cannot extract a single path | `src/cli/verbs/optical.rs` | fixture harvesting from ISOs |
+| ~~F-001~~ | ~~`optical extract` cannot extract a single path~~ — **SHIPPED** 2026-08-09 | `src/cli/verbs/optical.rs` | — |
 | ~~F-002~~ | ~~CloneCD not supported~~ — **retracted, it is supported** | — | — |
 | [F-003](#f-003) | PFS3 / SFS builders exist but are not on the CLI | `src/cli/verbs/new.rs` | two Amiga fixture gaps |
-| [F-004](#f-004) | `show partmap` is APM-only | `src/cli/verbs/show.rs` | scripted partition inspection |
+| [F-005](#f-005) | Optical extract is CLI-only; the GUI cannot pull one file | `src/optical/browse_view.rs` | GUI parity with `optical extract` |
+| [F-006](#f-006) | IRIX support-disk building / browsing is thin | `src/cli/verbs/new_sgi_cdrom.rs` | bootable IRIX disc work — **needs scope** |
+| [F-007](#f-007) | No optical fixture with nested directories | `regression-tests/` | verifying `--path DIR --recursive` |
+| ~~F-004~~ | ~~`show partmap` is APM-only~~ — **SHIPPED** 2026-08-08, same gap as R-026 | `src/cli/verbs/show.rs` | — |
 
 ---
 
 ## F-001 — `optical extract` is whole-disc only {#f-001}
+
+**SHIPPED 2026-08-09.** `--path` takes a file or a folder, `--recursive`
+decides whether a named folder descends, `--tar` archives instead of writing
+loose files, and `--preserve-permissions` applies the disc's POSIX mode.
+Nine cases in `cases/tier3/optical-extract.toml`, the single-file one anchored
+on a sha256 so a truncated read fails on content rather than on exit code.
+
+The Windows-illegal-names observation below is largely addressed too: a
+per-path extract sidesteps it for the common case, and `--tar` sidesteps it
+entirely, since a tar entry stores a name NTFS would refuse.
 
 ```
 Usage: rb-cli optical extract [OPTIONS] --to <TO> <SOURCE>
@@ -117,6 +130,13 @@ handlers), which is the actual win. It does not by itself prove anything.
 
 ## F-004 — `show partmap` only understands APM {#f-004}
 
+**SHIPPED 2026-08-08.** It detects the partition table first; APM keeps its
+full DDR and driver-descriptor rendering, every other table gets the generic
+partition list. Tracked twice, here and as
+[R-026](Regression_Bugs.md#r-026) — the defect / missing-feature split is not
+always obvious from a symptom, and this was genuinely both: the verb never
+claimed to read other schemes, and its error blamed the image for it.
+
 `docs/cli-reference.md` is honest about this — "Print the partition table of a
 disk image (APM-only today)" — so it is a scoped feature rather than a defect.
 On anything else it fails:
@@ -141,3 +161,63 @@ Two things would help, in order of cost:
 2. **The feature.** Extend to MBR, GPT, RDB, SGI, Sun, AHDI and X68K, which
    are all already parsed by the engine — `inspect` prints them today, so the
    data is there and only the structured emitter is missing.
+
+---
+
+## F-005 — the GUI cannot extract a single file from a disc {#f-005}
+
+`optical extract` grew `--path`, `--recursive`, `--tar`,
+`--preserve-permissions`, `--filesystem` and `--filesystem-index` (F-001).
+None of it is reachable from the GUI, which can browse an optical disc but
+offers no way to pull anything out of it.
+
+**Why it is small.** The capability is already there:
+`src/optical/browse_view.rs` calls `fs.read_file(entry)` in three places, so
+the GUI can already read one file out of a disc — it just never offers to save
+one. This is wiring, not new engine work.
+
+**What it needs:**
+
+- an extract action on the selected browse entry, and on a selected folder
+- a destination chooser, with the folder-vs-archive choice `--tar` introduced
+- the `--filesystem` / `--filesystem-index` selector surfaced, **without which
+  the GUI can only ever reach one side of a hybrid Mac/PC disc** — the reason
+  this is listed rather than left implicit
+- CLAUDE.md's pre-commit doc sync applies: a new dialog wants a README
+  Inspect-tab bullet
+
+## F-006 — IRIX support-disk building and browsing is thin {#f-006}
+
+`optical new sgi-efs` builds an SGI volume header with EFS in slot 7, and
+takes `--from-dir`, `--expand-archives` and `--flatten-folders`. What it does
+not do is treat the disc as a *bootable* IRIX support disc.
+
+**Needs scope before any work starts.** "Extending the IRIX support disks"
+could reasonably mean any of:
+
+1. **Volume-header executables as first-class entries.** An SGI volume header
+   carries standalone programs (`sash`, `ide`, `/unix`) outside the EFS
+   filesystem. `inspect` reports the header; nothing lists, extracts or
+   replaces those entries.
+2. **Building a disc that actually boots.** Writing the right volume-header
+   entries and boot fields for real hardware or a MiSTer core.
+3. **Richer `--from-dir` ergonomics** for laying out an inst-ready tardist
+   tree.
+
+(1) is self-contained and testable from a fixture. (2) cannot be verified
+without hardware — every SGI oracle is `skip-manual`, so it would ship
+unproven, which is the same position [R-020](Regression_Bugs.md#r-020) is in
+for Amiga. (3) is ergonomics on an existing path.
+
+## F-007 — no optical fixture has nested directories {#f-007}
+
+`--path DIR --recursive` is implemented and unverified. The discs in the
+corpus are flat or single-file at the root:
+`optical.iso9660.joliet.cd` holds one file with no directories at all, which
+is why it makes such a clean single-file test and such a poor recursion test.
+
+**What would help:** a case against `optical.hfs.opentransport.cd` or the
+CloneCD Bookshelf set, both of which have real trees, asserting that
+`--recursive` descends and that its absence stops at one level. The fixtures
+are already catalogued — only the case is missing. It belongs in
+`cases/tier3/optical-extract.toml` beside the nine that exist.
