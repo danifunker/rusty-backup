@@ -9,7 +9,7 @@
 <h1><code>rb-cli optical extract</code></h1>
 <p>Extract files from an optical disc image into a host folder</p>
 <h2>Usage</h2>
-<pre><code>Usage: extract [OPTIONS] --to &lt;TO&gt; &lt;SOURCE&gt;</code></pre>
+<pre><code>Usage: extract [OPTIONS] &lt;SOURCE&gt;</code></pre>
 <h2>Arguments</h2>
 <dl class="args">
 <dt><code>&lt;SOURCE&gt;</code></dt>
@@ -18,7 +18,15 @@
 <h2>Options</h2>
 <dl class="args">
 <dt><code>--to</code></dt>
-<dd>Destination folder (created if absent)</dd>
+<dd>Destination folder (created if absent). Mutually exclusive with `--tar`; exactly one of the two is required</dd>
+<dt><code>--tar</code></dt>
+<dd>Write a `.tar` / `.tar.gz` / `.tar.zst` instead of loose files</dd>
+<dt><code>--path</code></dt>
+<dd>Extract only this path from the disc instead of the whole tree. Disc-relative, e.g. `/DOCS/README.TXT` or `/DOCS`. A file extracts on its own; a directory extracts the files directly inside it, and its subdirectories too when `--recursive` is given</dd>
+<dt><code>-r / --recursive</code></dt>
+<dd>Include subdirectories when `--path` names a directory. Whole-disc extraction (no `--path`) always recurses and ignores this</dd>
+<dt><code>--preserve-permissions</code></dt>
+<dd>Apply the POSIX mode a disc records (Rock Ridge, HFS+, EFS) to the extracted files. Unix hosts only — on Windows the bits have nowhere to go, so use `--tar`, which carries them regardless of host</dd>
 <dt><code>--resource-forks</code></dt>
 <dd>How to handle HFS resource forks. Ignored on non-HFS discs. Defaults to `appledouble`, or `[optical] resource-forks` from the config file when set</dd>
 <dt><code>--on-collision</code></dt>

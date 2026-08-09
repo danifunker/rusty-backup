@@ -1378,7 +1378,7 @@ Usage: du [OPTIONS] <SOURCE> [PATH]...
 Extract files from an optical disc image into a host folder
 
 ```
-Usage: extract [OPTIONS] --to <TO> <SOURCE>
+Usage: extract [OPTIONS] <SOURCE>
 ```
 
 **Arguments**
@@ -1387,7 +1387,11 @@ Usage: extract [OPTIONS] --to <TO> <SOURCE>
 
 **Options**
 
-- `--to` — Destination folder (created if absent)
+- `--to` — Destination folder (created if absent). Mutually exclusive with `--tar`; exactly one of the two is required
+- `--tar` — Write a `.tar` / `.tar.gz` / `.tar.zst` instead of loose files
+- `--path` — Extract only this path from the disc instead of the whole tree. Disc-relative, e.g. `/DOCS/README.TXT` or `/DOCS`. A file extracts on its own; a directory extracts the files directly inside it, and its subdirectories too when `--recursive` is given
+- `-r` / `--recursive` — Include subdirectories when `--path` names a directory. Whole-disc extraction (no `--path`) always recurses and ignores this
+- `--preserve-permissions` — Apply the POSIX mode a disc records (Rock Ridge, HFS+, EFS) to the extracted files. Unix hosts only — on Windows the bits have nowhere to go, so use `--tar`, which carries them regardless of host
 - `--resource-forks` — How to handle HFS resource forks. Ignored on non-HFS discs. Defaults to `appledouble`, or `[optical] resource-forks` from the config file when set
 - `--on-collision` — What to do when two names on a **case-sensitive** disc (UFS, NeXT, Rock Ridge, …) collide only by case on a **case-insensitive** destination (e.g. macOS). Defaults to `rename`, or `[optical] on-collision` from the config. Ignored when the destination is case-sensitive — everything extracts verbatim there
 - `--filesystem` — Which filesystem to extract from on a hybrid Mac/PC disc. `auto` (default) uses the primary (ISO 9660); `hfs` extracts the Apple HFS side; `iso` forces the ISO 9660 tree. See `optical info`

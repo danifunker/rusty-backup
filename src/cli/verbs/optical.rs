@@ -1641,9 +1641,37 @@ pub struct ExtractArgs {
     /// Optical disc image (.iso, .cue, .chd).
     pub source: PathBuf,
 
-    /// Destination folder (created if absent).
-    #[arg(long)]
-    pub to: PathBuf,
+    /// Destination folder (created if absent). Mutually exclusive with
+    /// `--tar`; exactly one of the two is required.
+    #[arg(long, required_unless_present = "tar", conflicts_with = "tar")]
+    pub to: Option<PathBuf>,
+
+    /// Write a `.tar` / `.tar.gz` / `.tar.zst` instead of loose files.
+    ///
+    /// The faithful option for archiving: a tar entry carries the POSIX mode,
+    /// uid and gid a Rock Ridge / HFS+ / EFS disc records, and real symlinks,
+    /// none of which survive extraction onto a filesystem that has no concept
+    /// of them. Compression follows the extension.
+    #[arg(long = "tar", value_name = "FILE")]
+    pub tar: Option<PathBuf>,
+
+    /// Extract only this path from the disc instead of the whole tree.
+    /// Disc-relative, e.g. `/DOCS/README.TXT` or `/DOCS`. A file extracts on
+    /// its own; a directory extracts the files directly inside it, and its
+    /// subdirectories too when `--recursive` is given.
+    #[arg(long = "path", value_name = "PATH")]
+    pub path: Option<String>,
+
+    /// Include subdirectories when `--path` names a directory. Whole-disc
+    /// extraction (no `--path`) always recurses and ignores this.
+    #[arg(long = "recursive", short = 'r')]
+    pub recursive: bool,
+
+    /// Apply the POSIX mode a disc records (Rock Ridge, HFS+, EFS) to the
+    /// extracted files. Unix hosts only — on Windows the bits have nowhere to
+    /// go, so use `--tar`, which carries them regardless of host.
+    #[arg(long = "preserve-permissions")]
+    pub preserve_permissions: bool,
 
     /// How to handle HFS resource forks. Ignored on non-HFS discs.
     /// Defaults to `appledouble`, or `[optical] resource-forks` from
@@ -1678,14 +1706,28 @@ pub enum CliCaseCollisionMode {
 }
 
 fn run_extract_verb(args: ExtractArgs) -> Result<()> {
-    std::fs::create_dir_all(&args.to).with_context(|| format!("creating {}", args.to.display()))?;
-
     let info = crate::optical::open_disc_image(&args.source)
         .with_context(|| format!("opening {}", args.source.display()))?;
     let (mut fs, _opened_fs) = open_selected_filesystem(&info, args.filesystem)?;
     let root = fs
         .root()
         .map_err(|e| anyhow::anyhow!("reading root: {e}"))?;
+
+    // Resolve --path before anything is created, so naming a path that is not
+    // on the disc fails without leaving an empty destination behind.
+    let target = match args.path.as_deref() {
+        None => None,
+        Some(p) => Some(resolve_disc_path(&mut *fs, &root, p)?),
+    };
+
+    if let Some(tar_path) = args.tar.clone() {
+        return extract_to_tar(&mut *fs, &root, target.as_ref(), &args, &tar_path);
+    }
+    let to = args
+        .to
+        .clone()
+        .expect("clap requires --to unless --tar is given");
+    std::fs::create_dir_all(&to).with_context(|| format!("creating {}", to.display()))?;
 
     let rf_mode = args
         .resource_forks
@@ -1698,7 +1740,7 @@ fn run_extract_verb(args: ExtractArgs) -> Result<()> {
     log_stderr(format!(
         "rb-cli optical extract: {} -> {} (resource forks: {:?})",
         args.source.display(),
-        args.to.display(),
+        to.display(),
         rf_mode
     ));
 
@@ -1714,23 +1756,45 @@ fn run_extract_verb(args: ExtractArgs) -> Result<()> {
 
     // Only disambiguate when the destination genuinely can't tell the names
     // apart; on a case-sensitive host everything extracts verbatim.
-    let case_insensitive_dest = dest_is_case_insensitive(&args.to);
+    let case_insensitive_dest = dest_is_case_insensitive(&to);
 
     let mut ctx = ExtractCtx {
         fork_mode: rf_mode.into(),
         collision,
         case_insensitive_dest,
+        // No --path means the whole disc, which has always recursed.
+        recursive: args.path.is_none() || args.recursive,
+        preserve_permissions: args.preserve_permissions,
         count: 0,
         skipped: 0,
         errors: 0,
     };
 
     let mut used = std::collections::HashSet::new();
-    for child in fs
-        .list_directory(&root)
-        .map_err(|e| anyhow::anyhow!("list_directory: {e}"))?
-    {
-        extract(&mut *fs, &child, &args.to, &mut ctx, &mut used);
+    match &target {
+        // A named file extracts on its own; a named directory extracts its
+        // contents into --to rather than recreating the directory itself,
+        // which is what `cp -r DIR/. DEST` does and what a user naming one
+        // folder expects.
+        Some(t) if t.entry_type == opticaldiscs::browse::entry::EntryType::File => {
+            extract(&mut *fs, t, &to, &mut ctx, &mut used);
+        }
+        Some(t) => {
+            for child in fs
+                .list_directory(t)
+                .map_err(|e| anyhow::anyhow!("list_directory: {e}"))?
+            {
+                extract(&mut *fs, &child, &to, &mut ctx, &mut used);
+            }
+        }
+        None => {
+            for child in fs
+                .list_directory(&root)
+                .map_err(|e| anyhow::anyhow!("list_directory: {e}"))?
+            {
+                extract(&mut *fs, &child, &to, &mut ctx, &mut used);
+            }
+        }
     }
 
     let mut summary = format!("extracted {} entry/entries", ctx.count);
@@ -1797,6 +1861,11 @@ struct ExtractCtx {
     fork_mode: crate::fs::resource_fork::ResourceForkMode,
     collision: CaseCollisionMode,
     case_insensitive_dest: bool,
+    /// Descend into subdirectories. Always true for a whole-disc extract;
+    /// under `--path DIR` it follows `--recursive`.
+    recursive: bool,
+    /// Apply the disc's POSIX mode to what we write. Unix only.
+    preserve_permissions: bool,
     count: u64,
     skipped: u64,
     errors: u64,
@@ -1958,11 +2027,20 @@ fn extract_one(
                     }
                 }
             }
+            if ctx.preserve_permissions {
+                apply_posix_mode(&dest.join(&safe_name), entry);
+            }
             ctx.count += 1;
         }
         EntryType::Directory => {
+            if !ctx.recursive {
+                return Ok(());
+            }
             let dir_path = dest.join(&safe_name);
             std::fs::create_dir_all(&dir_path)?;
+            if ctx.preserve_permissions {
+                apply_posix_mode(&dir_path, entry);
+            }
             let children = fs
                 .list_directory(entry)
                 .map_err(|e| anyhow::anyhow!("list_directory: {e}"))?;
@@ -1974,6 +2052,198 @@ fn extract_one(
         }
     }
     Ok(())
+}
+
+/// Walk `/A/B/C` from the disc root to the entry it names.
+///
+/// Falls back to a case-insensitive match: ISO 9660 upper-cases names, while
+/// the user reads them off `optical browse` in whatever case the Joliet or
+/// Rock Ridge tree reported.
+fn resolve_disc_path(
+    fs: &mut dyn opticaldiscs::browse::filesystem::Filesystem,
+    root: &opticaldiscs::browse::entry::FileEntry,
+    path: &str,
+) -> Result<opticaldiscs::browse::entry::FileEntry> {
+    let mut current = root.clone();
+    let mut walked = String::new();
+    for component in path.split('/').filter(|c| !c.is_empty() && *c != ".") {
+        let children = fs
+            .list_directory(&current)
+            .map_err(|e| anyhow::anyhow!("listing {}: {e}", walked))?;
+        let hit = children.iter().find(|c| c.name == component).or_else(|| {
+            children
+                .iter()
+                .find(|c| c.name.eq_ignore_ascii_case(component))
+        });
+        current = match hit {
+            Some(c) => c.clone(),
+            None => {
+                return Err(crate::cli::exit::not_found(format!(
+                    "{}/{} is not on this disc",
+                    walked, component
+                )))
+            }
+        };
+        walked.push('/');
+        walked.push_str(component);
+    }
+    Ok(current)
+}
+
+/// Apply the disc's POSIX mode where it records one and the host understands
+/// it. A no-op on Windows: the bits have nowhere to go, which is why `--tar`
+/// exists.
+#[allow(unused_variables)]
+fn apply_posix_mode(path: &Path, entry: &opticaldiscs::browse::entry::FileEntry) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Some(p) = &entry.posix {
+            let _ = std::fs::set_permissions(
+                path,
+                std::fs::Permissions::from_mode(p.permission_bits()),
+            );
+        }
+    }
+}
+
+/// Archive to `.tar` / `.tar.gz` / `.tar.zst`, carrying mode, uid, gid and
+/// symlinks — the metadata plain extraction drops on a host that cannot store
+/// it. Compression follows the extension.
+fn extract_to_tar(
+    fs: &mut dyn opticaldiscs::browse::filesystem::Filesystem,
+    root: &opticaldiscs::browse::entry::FileEntry,
+    target: Option<&opticaldiscs::browse::entry::FileEntry>,
+    args: &ExtractArgs,
+    out: &Path,
+) -> Result<()> {
+    let recursive = args.path.is_none() || args.recursive;
+    let file = std::fs::File::create(out).with_context(|| format!("creating {}", out.display()))?;
+    let name = out.to_string_lossy().to_ascii_lowercase();
+    let mut count = 0u64;
+
+    // Each arm finishes its own builder: `tar::Builder` is generic over the
+    // writer and the compressors do not share an object-safe trait.
+    if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
+        let enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut b = tar::Builder::new(enc);
+        tar_walk(fs, root, target, recursive, &mut b, &mut count)?;
+        b.into_inner()?.finish()?;
+    } else if name.ends_with(".tar.zst") || name.ends_with(".tzst") {
+        let enc = zstd::stream::write::Encoder::new(file, 0)?.auto_finish();
+        let mut b = tar::Builder::new(enc);
+        tar_walk(fs, root, target, recursive, &mut b, &mut count)?;
+        b.into_inner()?;
+    } else {
+        let mut b = tar::Builder::new(file);
+        tar_walk(fs, root, target, recursive, &mut b, &mut count)?;
+        b.into_inner()?;
+    }
+
+    log_stderr(format!(
+        "rb-cli optical extract: {} -> {} ({count} entry/entries)",
+        args.source.display(),
+        out.display()
+    ));
+    Ok(())
+}
+
+fn tar_walk<W: std::io::Write>(
+    fs: &mut dyn opticaldiscs::browse::filesystem::Filesystem,
+    root: &opticaldiscs::browse::entry::FileEntry,
+    target: Option<&opticaldiscs::browse::entry::FileEntry>,
+    recursive: bool,
+    builder: &mut tar::Builder<W>,
+    count: &mut u64,
+) -> Result<()> {
+    use opticaldiscs::browse::entry::EntryType;
+    let start = match target {
+        Some(t) if t.entry_type == EntryType::File => {
+            let n = t.name.clone();
+            return tar_add(fs, t, &n, builder, count);
+        }
+        Some(t) => t,
+        None => root,
+    };
+    for child in fs
+        .list_directory(start)
+        .map_err(|e| anyhow::anyhow!("list_directory: {e}"))?
+    {
+        let n = child.name.clone();
+        tar_add_tree(fs, &child, &n, recursive, builder, count)?;
+    }
+    Ok(())
+}
+
+fn tar_add_tree<W: std::io::Write>(
+    fs: &mut dyn opticaldiscs::browse::filesystem::Filesystem,
+    entry: &opticaldiscs::browse::entry::FileEntry,
+    rel: &str,
+    recursive: bool,
+    builder: &mut tar::Builder<W>,
+    count: &mut u64,
+) -> Result<()> {
+    use opticaldiscs::browse::entry::EntryType;
+    if entry.entry_type == EntryType::Directory {
+        if !recursive {
+            return Ok(());
+        }
+        for child in fs
+            .list_directory(entry)
+            .map_err(|e| anyhow::anyhow!("list_directory: {e}"))?
+        {
+            let sub = format!("{rel}/{}", child.name);
+            tar_add_tree(fs, &child, &sub, recursive, builder, count)?;
+        }
+        return Ok(());
+    }
+    tar_add(fs, entry, rel, builder, count)
+}
+
+fn tar_add<W: std::io::Write>(
+    fs: &mut dyn opticaldiscs::browse::filesystem::Filesystem,
+    entry: &opticaldiscs::browse::entry::FileEntry,
+    rel: &str,
+    builder: &mut tar::Builder<W>,
+    count: &mut u64,
+) -> Result<()> {
+    let mut header = tar::Header::new_gnu();
+    // A symlink carries its target, not its bytes; storing the bytes would
+    // silently turn a link into a copy.
+    if let Some(link) = &entry.symlink_target {
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_size(0);
+        set_tar_meta(&mut header, entry);
+        header.set_cksum();
+        builder.append_link(&mut header, rel, link)?;
+        *count += 1;
+        return Ok(());
+    }
+    let data = fs
+        .read_file(entry)
+        .map_err(|e| anyhow::anyhow!("read_file {}: {e}", entry.path))?;
+    header.set_size(data.len() as u64);
+    set_tar_meta(&mut header, entry);
+    header.set_cksum();
+    builder.append_data(&mut header, rel, &data[..])?;
+    *count += 1;
+    Ok(())
+}
+
+/// Mode / uid / gid from the disc where it records them, else a plain 0644.
+fn set_tar_meta(header: &mut tar::Header, entry: &opticaldiscs::browse::entry::FileEntry) {
+    match &entry.posix {
+        Some(p) => {
+            header.set_mode(p.permission_bits());
+            header.set_uid(p.uid as u64);
+            header.set_gid(p.gid as u64);
+        }
+        None => {
+            header.set_mode(0o644);
+            header.set_uid(0);
+            header.set_gid(0);
+        }
+    }
 }
 
 fn parse_resource_fork_mode(s: &str) -> Option<CliResourceForkMode> {
