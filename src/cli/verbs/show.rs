@@ -521,17 +521,5 @@ struct DeviceRow {
 // ---------------------------------------------------------------------------
 
 fn emit_csv_or_tsv<T: Serialize>(format: OutputFormat, rows: &[T]) -> Result<()> {
-    let delim = if format == OutputFormat::Tsv {
-        b'\t'
-    } else {
-        b','
-    };
-    let mut wtr = csv::WriterBuilder::new()
-        .delimiter(delim)
-        .from_writer(std::io::stdout().lock());
-    for row in rows {
-        wtr.serialize(row)?;
-    }
-    wtr.flush()?;
-    Ok(())
+    crate::cli::output::emit_csv_or_tsv(format, rows)
 }

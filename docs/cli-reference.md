@@ -905,6 +905,7 @@ Usage: ls [OPTIONS] <IMAGE> [PATH]
 - `-o` / `--owner` — Show each entry's Unix permissions and owner. On a Linux/Unix image the owner ids are resolved to names via the image's own `/etc/passwd` and `/etc/group` (falling back to the raw numbers where there's no entry)
 - `--password` — Password for encrypted containers (WinImage IMZ, password-protected `.zip` disks) or an encrypted filesystem (APFS FileVault — the volume password or personal recovery key)
 - `--inside` — For a `.zip` holding more than one disk image, the archive entry to open (e.g. `--inside backup.img`). Matched by exact name, then case- insensitively, then by basename. Ignored for non-zip sources
+- `--format` — Output format. `ls` is flat-tabular, so csv and tsv are in scope alongside json and yaml
 - `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zxplus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
 - `--carve-full` — Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga "NDOS" disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem
 

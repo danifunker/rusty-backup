@@ -57,14 +57,6 @@ finding = "R-008b"
 id = "fs.new-volume.affs.bitmap-boundary-plus-one"
 finding = "R-008a"
 
-# --- CLI contract group ------------------------------------------------------
-[[known]]
-id = "cli.envelope.error-envelope-on-failure"
-finding = "R-005"
-[[known]]
-id = "cli.envelope.ls-supports-format"
-finding = "R-003"
-
 
 # --- R-013 — Solaris UFS entry types and sizes -------------------------------
 [[known]]

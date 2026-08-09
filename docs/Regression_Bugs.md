@@ -45,10 +45,10 @@ finding depends on a fixture, the fixture is named.
 | ~~R-007~~ | ~~High~~ **FIXED** | `src/fs/ntfs_format.rs` | ~~Freshly formatted NTFS fails its own fsck~~ — verified clean 2026-08-07 |
 | ~~R-009~~ | ~~High~~ **FIXED** | `src/partition/mod.rs` | ~~Bare JFS / UFS1 / UFS2 / ReiserFS images cannot be opened at all~~ — probes added 2026-08-07 |
 | [R-013](#r-013) | **High** | `src/fs/ufs.rs` | Solaris UFS directories reported as files, one with a garbage size |
-| [R-005](#r-005) | Medium | `src/cli/output.rs` | No error envelope emitted under `--format json` |
+| ~~R-005~~ | ~~Medium~~ **FIXED** | `src/cli/output.rs` | ~~No error envelope emitted under `--format json`~~ — format recorded before dispatch, envelope emitted from `main`, 2026-08-09 |
 | [R-008a](#r-008a) | Medium | `src/fs/affs.rs` | AFFS volumes above 4066 blocks have uncovered tail blocks |
 | [R-012](#r-012) | Medium | `src/optical/` | `optical info` rejects any disc with no data track (pure CD-DA) |
-| [R-003](#r-003) | Medium | `src/cli/output.rs` | Docs claim `ls` supports `--format`; it does not |
+| ~~R-003~~ | ~~Medium~~ **FIXED** | `src/cli/output.rs` | ~~Docs claim `ls` supports `--format`; it does not~~ — flag implemented, all five formats, 2026-08-09 |
 | ~~R-010~~ | ~~Medium~~ **FIXED** | `src/cli/verbs/inspect.rs` | ~~`inspect` has no `--fs-type`, so CP/M images cannot be inspected~~ — flag added and honoured, 2026-08-08 |
 | ~~R-006~~ | ~~Medium~~ **FIXED** | `src/cli/verbs/new.rs` | ~~`new volume prodos` always fails with default arguments~~ — per-filesystem default, 2026-08-08 |
 | ~~R-004~~ | ~~Low~~ **FIXED** | `src/cli/exit.rs` | ~~CSV/TSV rejection exits 1, documented as 2~~ — errors carry their exit code now, 2026-08-08 |
@@ -934,6 +934,29 @@ number.
 
 ### R-005 — no error envelope under `--format json` {#r-005}
 
+**FIXED 2026-08-09.** The obstacle was structural, as with [R-004](#r-004):
+`--format` is a per-verb argument, so by the time an error reached `main` the
+selected format was gone with the verb's args.
+
+`rb-cli` now parses through `clap::ArgMatches`, walks to the deepest
+subcommand for a `--format`, and records it before dispatch
+(`output::record_active_format`). The error arm calls
+`output::emit_error_envelope_for`, which emits the documented envelope on
+stdout when — and only when — the caller asked for a structured format;
+`status.code` comes from `exit::code_for`, so the envelope and the process
+agree. The plain-text line still goes to stderr, which is the human channel.
+
+Reading clap's own matches rather than rescanning `argv` means a file named
+`--format` cannot be mistaken for the flag, and a verb added later is covered
+without touching the entry point.
+
+The case asserted `expect_exit = 1`, which contradicted
+`cli.exit.missing-image-file` once [R-010](#r-010) landed — a missing image is
+`NOT_FOUND`, and `exit.rs` has reserved 3 for it all along. Corrected to 3
+deliberately, not weakened to suit the fix.
+
+---
+
 `src/cli/output.rs` documents that on failure the envelope still returns, with
 `status.error: true`, `status.code` carrying the exit code, `status.message` a
 short description and `result` null.
@@ -1018,6 +1041,26 @@ rb-cli optical info cdda.cue
 the one shape `optical info` refuses. Mixed-mode is unaffected.
 
 ### R-003 — docs claim `ls` supports `--format`; it does not {#r-003}
+
+**FIXED 2026-08-09.** Decided in favour of implementing the flag rather than
+correcting the doc: `ls` is the most script-facing verb in the CLI, and the
+doc described the more useful shape.
+
+`ls` now takes `--format` with all five values. Text output is untouched —
+it still runs through `print_entry`, so no existing case's column layout
+moves. The structured paths collect an `LsRow` per entry instead: `kind`,
+`name`, `size`, `type_code`, `creator_code`, `mode`, `uid`, `gid`, `owner`.
+Every field is always present so the CSV header is stable across volumes, and
+a filesystem carrying none of a column leaves it null. `--owner` still governs
+whether ids are resolved to names, since that costs a read of the image's own
+`passwd`/`group`.
+
+CSV/TSV emission was private to `show.rs`; it moved to `output::emit_csv_or_tsv`
+and `show` now delegates, rather than the two verbs growing separate copies.
+The `rb://` remote listing path emits the same shapes, with `mode`/`uid`/`gid`
+null because the wire protocol does not carry them.
+
+---
 
 `src/cli/output.rs` lists `ls` among the verbs that "can emit their results in
 one of five formats", and its CSV/TSV note says those formats apply to "`ls`,
@@ -1204,21 +1247,25 @@ Run `rb-regress run --tiers 0-4` to check them all.
 
 | Finding | Case | State |
 |---------|------|-------|
-| R-003 | `cli.envelope.ls-supports-format` | red |
-| R-004 | `cli.exit.{csv,tsv}-on-nested-verb-is-usage-error` | red |
-| R-005 | `cli.envelope.error-envelope-on-failure` | red |
-| R-006 | `fs.new-volume.prodos-default-name` | red |
+| R-003 | `cli.envelope.ls-supports-format` | **green — fixed** |
+| R-004 | `cli.exit.{csv,tsv}-on-nested-verb-is-usage-error` | **green — fixed** |
+| R-005 | `cli.envelope.error-envelope-on-failure` | **green — fixed** |
+| R-006 | `fs.new-volume.prodos-default-name` | **green — fixed** |
 | R-007 | `fs.new-volume.ntfs{,.2m-fsck,.32m-fsck}` | **green — fixed** |
 | R-008a | `fs.new-volume.affs.bitmap-boundary-plus-one` | red |
 | R-008b | `fs.new-volume.affs.{4m,32m}` | red |
 | R-009 | `fs.read.{jfs,reiserfs,ufs1,ufs2}` | **green — fixed** |
-| R-010 | `cli.flags.inspect-accepts-fs-type` | red |
+| R-010 | `cli.flags.inspect-accepts-fs-type` | **green — fixed** |
 | R-011 | `fmt.g64.standard-dump-opens` | green — **pins the working half only** |
-| R-012 | `optical.cdda.no-data-track-opens` | red |
+| R-012 | `optical.cdda.no-data-track-opens` | red — blocked upstream |
 | R-013 | `fs.detect.ufs-{solaris-entry-types,no-absurd-sizes}` | red |
-| R-015 | `optical.cue.unpadded-track-number` | red |
-| R-016 | `backup.container.{chd,vhd-dynamic,qcow2,vmdk-sparse}` | red |
+| R-015 | `optical.cue.unpadded-track-number` | red — blocked upstream |
+| R-016 | `backup.container.{chd,vhd-dynamic,qcow2,vmdk-sparse}` | red — reclassified as a feature |
 | R-017 | `fs.detect.sfs-bare-volume` | **green — fixed** |
+| R-025 | `subcmd.squashfs.put-rebuilds`, `meta.xattr.set-list-rm` | red — Windows only |
+| R-026 | `subcmd.show.partmap` | **green — fixed** |
+| R-027 | `read.apfs.apple-gpt` | **green — fixed** |
+| R-034 | `edit.readonly.{lisa,alto}-refuses-a-write` | **green — fixed** |
 
 Cases assert the **intended** behaviour, so each is red until its finding is
 fixed and green afterwards. Never "fix" one by asserting the broken

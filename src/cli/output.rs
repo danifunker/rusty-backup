@@ -43,6 +43,7 @@
 use anyhow::Result;
 use serde::Serialize;
 use std::fmt;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 /// Output format selected via `--format`. Default is [`OutputFormat::Text`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
@@ -90,6 +91,83 @@ impl OutputFormat {
     pub fn is_flat_only(self) -> bool {
         matches!(self, Self::Csv | Self::Tsv)
     }
+
+    fn as_u8(self) -> u8 {
+        match self {
+            Self::Text => 0,
+            Self::Json => 1,
+            Self::Yaml => 2,
+            Self::Csv => 3,
+            Self::Tsv => 4,
+        }
+    }
+
+    fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Text),
+            1 => Some(Self::Json),
+            2 => Some(Self::Yaml),
+            3 => Some(Self::Csv),
+            4 => Some(Self::Tsv),
+            _ => None,
+        }
+    }
+}
+
+/// The `--format` the running verb was given, or `FORMAT_UNSET`.
+///
+/// `--format` is a per-verb argument, so the error path in `main` has no other
+/// way to learn that the caller asked for JSON (R-005).
+static ACTIVE_FORMAT: AtomicU8 = AtomicU8::new(FORMAT_UNSET);
+
+const FORMAT_UNSET: u8 = u8::MAX;
+
+/// Record the format the invoked verb parsed. Called once from the `rb-cli`
+/// entry point, before dispatch.
+pub fn record_active_format(format: Option<OutputFormat>) {
+    ACTIVE_FORMAT.store(
+        format.map_or(FORMAT_UNSET, OutputFormat::as_u8),
+        Ordering::Relaxed,
+    );
+}
+
+/// The recorded format, if the invoked verb has a `--format` at all.
+pub fn active_format() -> Option<OutputFormat> {
+    OutputFormat::from_u8(ACTIVE_FORMAT.load(Ordering::Relaxed))
+}
+
+/// Dig the `--format` value out of parsed clap matches, walking to the deepest
+/// subcommand so `show partmap --format json` finds the inner verb's flag.
+///
+/// Reading clap's own matches rather than rescanning `argv` means a file named
+/// `--format` can't be mistaken for the flag, and a verb added later is covered
+/// without touching this function.
+pub fn format_from_matches(matches: &clap::ArgMatches) -> Option<OutputFormat> {
+    let mut level = matches;
+    let mut found = None;
+    loop {
+        if let Ok(Some(f)) = level.try_get_one::<OutputFormat>("format") {
+            found = Some(*f);
+        }
+        match level.subcommand() {
+            Some((_, sub)) => level = sub,
+            None => return found,
+        }
+    }
+}
+
+/// Emit an error envelope for a failure on its way out of `main`, when the
+/// caller asked for a structured format. Returns whether anything was written.
+pub fn emit_error_envelope_for(err: &anyhow::Error) -> bool {
+    let Some(format) = active_format() else {
+        return false;
+    };
+    if !format.is_structured() {
+        return false;
+    }
+    let env: Envelope<()> =
+        Envelope::error(crate::cli::exit::code_for(err), format!("{err:#}"), None);
+    emit_envelope(format, &env).is_ok()
 }
 
 /// Top-level envelope for JSON/YAML payloads. Verbs construct one of
@@ -170,6 +248,24 @@ pub fn emit_envelope<T: Serialize>(format: OutputFormat, env: &Envelope<T>) -> R
              verbs must call the format-specific emitter directly"
         ),
     }
+}
+
+/// Emit flat rows as CSV or TSV, header included. Shared by every verb in the
+/// flat-tabular scope (`ls`, `show partmap`, `show devices`, `fsck` issues).
+pub fn emit_csv_or_tsv<T: Serialize>(format: OutputFormat, rows: &[T]) -> Result<()> {
+    let delim = if format == OutputFormat::Tsv {
+        b'\t'
+    } else {
+        b','
+    };
+    let mut wtr = csv::WriterBuilder::new()
+        .delimiter(delim)
+        .from_writer(std::io::stdout().lock());
+    for row in rows {
+        wtr.serialize(row)?;
+    }
+    wtr.flush()?;
+    Ok(())
 }
 
 /// Reject `--format csv|tsv` for nested-result verbs. Verbs whose result
