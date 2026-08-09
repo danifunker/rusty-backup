@@ -23,6 +23,8 @@
 <dd>Per-file content hash to attach to each file entry. Structured output only (`--format json`). Currently only `sha256`</dd>
 <dt><code>--filesystem</code></dt>
 <dd>Which filesystem to browse on a hybrid Mac/PC disc. `auto` (default) opens the primary (ISO 9660); `hfs` opens the Apple HFS side; `iso` forces the ISO 9660 tree. See `optical info` to see what a disc carries</dd>
+<dt><code>--filesystem-index</code></dt>
+<dd>Which filesystem to open when a disc carries more than one of the same kind — Apple shipped CD-ROMs with two HFS volumes. 0-based, indexing the list `optical info` prints. Overrides `--filesystem`</dd>
 </dl>
 <footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_docs</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
 </body></html>

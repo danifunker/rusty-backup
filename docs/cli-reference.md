@@ -1323,6 +1323,7 @@ Usage: browse [OPTIONS] <SOURCE>
 - `--format` — Output format. `text` (default) prints the human file tree unchanged; `json` / `yaml` emit a machine-readable, deterministically path-sorted listing
 - `--hash` — Per-file content hash to attach to each file entry. Structured output only (`--format json`). Currently only `sha256`
 - `--filesystem` — Which filesystem to browse on a hybrid Mac/PC disc. `auto` (default) opens the primary (ISO 9660); `hfs` opens the Apple HFS side; `iso` forces the ISO 9660 tree. See `optical info` to see what a disc carries
+- `--filesystem-index` — Which filesystem to open when a disc carries more than one of the same kind — Apple shipped CD-ROMs with two HFS volumes. 0-based, indexing the list `optical info` prints. Overrides `--filesystem`
 
 ### `optical convert`
 
@@ -1372,6 +1373,7 @@ Usage: du [OPTIONS] <SOURCE> [PATH]...
 - `--json` — Emit machine-readable JSON. Shorthand for `--format json`
 - `--format` — Output format
 - `--filesystem` — Which filesystem to measure on a hybrid Mac/PC disc. `auto` (default) opens the primary (ISO 9660); `hfs` opens the Apple HFS side — the one carrying resource forks. See `optical info` for what a disc holds
+- `--filesystem-index` — Which filesystem to open when a disc carries more than one of the same kind — Apple shipped CD-ROMs with two HFS volumes. 0-based, indexing the list `optical info` prints. Overrides `--filesystem`
 
 ### `optical extract`
 
@@ -1395,6 +1397,7 @@ Usage: extract [OPTIONS] <SOURCE>
 - `--resource-forks` — How to handle HFS resource forks. Ignored on non-HFS discs. Defaults to `appledouble`, or `[optical] resource-forks` from the config file when set
 - `--on-collision` — What to do when two names on a **case-sensitive** disc (UFS, NeXT, Rock Ridge, …) collide only by case on a **case-insensitive** destination (e.g. macOS). Defaults to `rename`, or `[optical] on-collision` from the config. Ignored when the destination is case-sensitive — everything extracts verbatim there
 - `--filesystem` — Which filesystem to extract from on a hybrid Mac/PC disc. `auto` (default) uses the primary (ISO 9660); `hfs` extracts the Apple HFS side; `iso` forces the ISO 9660 tree. See `optical info`
+- `--filesystem-index` — Which filesystem to open when a disc carries more than one of the same kind — Apple shipped CD-ROMs with two HFS volumes. 0-based, indexing the list `optical info` prints. Overrides `--filesystem`
 
 ### `optical info`
 

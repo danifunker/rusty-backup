@@ -600,6 +600,7 @@ pub enum FilesystemSelect {
 fn open_selected_filesystem(
     info: &opticaldiscs::detect::DiscImageInfo,
     select: FilesystemSelect,
+    index: Option<usize>,
 ) -> Result<(
     Box<dyn opticaldiscs::browse::filesystem::Filesystem>,
     opticaldiscs::FilesystemType,
@@ -619,6 +620,22 @@ fn open_selected_filesystem(
                 )
             })
     };
+
+    // An explicit index wins: it is the only way to reach the *second* volume
+    // of a kind, and --filesystem selects by type, which always finds the first.
+    if let Some(i) = index {
+        let n = info.hybrid_filesystems.len();
+        if i >= n {
+            return Err(crate::cli::exit::usage(format!(
+                "--filesystem-index {i} is out of range: this disc has {n} \
+                 selectable filesystem(s). `optical info` lists them."
+            )));
+        }
+        let ty = info.hybrid_filesystems[i].filesystem;
+        return open_hybrid_filesystem(info, i)
+            .map(|fs| (fs, ty))
+            .map_err(|e| anyhow::anyhow!("opening filesystem #{i}: {e}"));
+    }
 
     match select {
         FilesystemSelect::Auto => primary(),
@@ -673,6 +690,12 @@ pub struct BrowseArgs {
     /// forces the ISO 9660 tree. See `optical info` to see what a disc carries.
     #[arg(long = "filesystem", value_enum, default_value_t = FilesystemSelect::Auto)]
     pub filesystem: FilesystemSelect,
+
+    /// Which filesystem to open when a disc carries more than one of the same
+    /// kind — Apple shipped CD-ROMs with two HFS volumes. 0-based, indexing the
+    /// list `optical info` prints. Overrides `--filesystem`.
+    #[arg(long = "filesystem-index", value_name = "N")]
+    pub filesystem_index: Option<usize>,
 }
 
 fn run_browse_verb(args: BrowseArgs) -> Result<()> {
@@ -685,7 +708,8 @@ fn run_browse_verb(args: BrowseArgs) -> Result<()> {
 
     let info = crate::optical::open_disc_image(&args.source)
         .with_context(|| format!("opening {}", args.source.display()))?;
-    let (mut fs, opened_fs) = open_selected_filesystem(&info, args.filesystem)?;
+    let (mut fs, opened_fs) =
+        open_selected_filesystem(&info, args.filesystem, args.filesystem_index)?;
     let root = fs
         .root()
         .map_err(|e| anyhow::anyhow!("reading root: {e}"))?;
@@ -976,6 +1000,12 @@ pub struct OpticalDuArgs {
     /// carrying resource forks. See `optical info` for what a disc holds.
     #[arg(long = "filesystem", value_enum, default_value_t = FilesystemSelect::Auto)]
     pub filesystem: FilesystemSelect,
+
+    /// Which filesystem to open when a disc carries more than one of the same
+    /// kind — Apple shipped CD-ROMs with two HFS volumes. 0-based, indexing the
+    /// list `optical info` prints. Overrides `--filesystem`.
+    #[arg(long = "filesystem-index", value_name = "N")]
+    pub filesystem_index: Option<usize>,
 }
 
 fn run_du_verb(args: OpticalDuArgs) -> Result<()> {
@@ -988,7 +1018,8 @@ fn run_du_verb(args: OpticalDuArgs) -> Result<()> {
 
     let info = crate::optical::open_disc_image(&args.source)
         .with_context(|| format!("opening {}", args.source.display()))?;
-    let (inner, opened_fs) = open_selected_filesystem(&info, args.filesystem)?;
+    let (inner, opened_fs) =
+        open_selected_filesystem(&info, args.filesystem, args.filesystem_index)?;
 
     // Wrap the selected opticaldiscs filesystem in our adapter so the shared
     // `du` engine (both-fork sums + allocation-block rounding via the adapter's
@@ -1692,6 +1723,12 @@ pub struct ExtractArgs {
     /// side; `iso` forces the ISO 9660 tree. See `optical info`.
     #[arg(long = "filesystem", value_enum, default_value_t = FilesystemSelect::Auto)]
     pub filesystem: FilesystemSelect,
+
+    /// Which filesystem to open when a disc carries more than one of the same
+    /// kind — Apple shipped CD-ROMs with two HFS volumes. 0-based, indexing the
+    /// list `optical info` prints. Overrides `--filesystem`.
+    #[arg(long = "filesystem-index", value_name = "N")]
+    pub filesystem_index: Option<usize>,
 }
 
 /// How to resolve case-insensitive filename collisions during extraction.
@@ -1708,7 +1745,8 @@ pub enum CliCaseCollisionMode {
 fn run_extract_verb(args: ExtractArgs) -> Result<()> {
     let info = crate::optical::open_disc_image(&args.source)
         .with_context(|| format!("opening {}", args.source.display()))?;
-    let (mut fs, _opened_fs) = open_selected_filesystem(&info, args.filesystem)?;
+    let (mut fs, _opened_fs) =
+        open_selected_filesystem(&info, args.filesystem, args.filesystem_index)?;
     let root = fs
         .root()
         .map_err(|e| anyhow::anyhow!("reading root: {e}"))?;
