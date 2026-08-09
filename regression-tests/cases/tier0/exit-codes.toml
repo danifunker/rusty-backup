@@ -68,6 +68,11 @@ expect_exit = 2
 # documents present behaviour rather than inventing a requirement.
 [[case]]
 id = "cli.exit.missing-image-file"
-description = "inspect on a nonexistent image exits 1 (current documented-free behaviour)"
+description = """inspect on a nonexistent image exits 3. exit.rs reserves
+NOT_FOUND for exactly this ("image file missing"), and cli.flags.inspect-accepts-fs-type
+depends on it to tell "the flag parsed and the file was absent" from "the flag
+was rejected". This case asserted 1 until 2026-08-08, describing itself as
+"current documented-free behaviour" — it pinned the status quo rather than the
+contract, and the two cases contradicted each other once R-010 was fixed."""
 args = ["inspect", "{scratch}/does-not-exist.img"]
-expect_exit = 1
+expect_exit = 3

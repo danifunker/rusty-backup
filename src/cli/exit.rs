@@ -58,6 +58,15 @@ pub fn usage(message: impl Into<String>) -> anyhow::Error {
     })
 }
 
+/// A named thing does not exist: an image file, a partition index, a path
+/// inside a filesystem.
+pub fn not_found(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(CodedError {
+        code: NOT_FOUND,
+        message: message.into(),
+    })
+}
+
 /// A refusal for lack of permission, including writing to a read-only target.
 pub fn permission_denied(message: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(CodedError {

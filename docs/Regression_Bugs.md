@@ -49,7 +49,7 @@ finding depends on a fixture, the fixture is named.
 | [R-008a](#r-008a) | Medium | `src/fs/affs.rs` | AFFS volumes above 4066 blocks have uncovered tail blocks |
 | [R-012](#r-012) | Medium | `src/optical/` | `optical info` rejects any disc with no data track (pure CD-DA) |
 | [R-003](#r-003) | Medium | `src/cli/output.rs` | Docs claim `ls` supports `--format`; it does not |
-| [R-010](#r-010) | Medium | `src/cli/verbs/inspect.rs` | `inspect` has no `--fs-type`, so CP/M images cannot be inspected |
+| ~~R-010~~ | ~~Medium~~ **FIXED** | `src/cli/verbs/inspect.rs` | ~~`inspect` has no `--fs-type`, so CP/M images cannot be inspected~~ — flag added and honoured, 2026-08-08 |
 | ~~R-006~~ | ~~Medium~~ **FIXED** | `src/cli/verbs/new.rs` | ~~`new volume prodos` always fails with default arguments~~ — per-filesystem default, 2026-08-08 |
 | ~~R-004~~ | ~~Low~~ **FIXED** | `src/cli/exit.rs` | ~~CSV/TSV rejection exits 1, documented as 2~~ — errors carry their exit code now, 2026-08-08 |
 | [R-011](#r-011) | Unknown | `src/rbformats/` | G64 decoding fails on copy-protected / patched dumps |
@@ -1031,6 +1031,27 @@ Either the flag was dropped and the doc is stale, or structured `ls` output is
 a real gap. `ls` is among the most script-facing verbs in the CLI.
 
 ### R-010 — `inspect` has no `--fs-type` {#r-010}
+
+**FIXED 2026-08-08.** Accepting the flag was not enough on its own, and it is
+worth recording why. A signature-less filesystem has no partition table
+either, so `PartitionTable::detect` failed before the forced type could be
+applied — `inspect` took the flag and still refused the disk. It now does what
+`ls` already did: with `--fs-type`, a detection failure means "raw filesystem
+at byte 0" rather than an error.
+
+```
+rb-cli inspect ManicMiner.dsk --fs-type cpm:amstrad_data
+  Partition table: None
+    1  cpm:amstrad_data   0   180.0 KiB
+```
+
+A missing image also exits 3 now, which the case requires to tell "the flag
+parsed and the file was absent" from "the flag was rejected". That made
+`cli.exit.missing-image-file` contradict it: that case asserted 1 and called
+itself "current documented-free behaviour", pinning the status quo rather than
+the contract `exit.rs` states. Corrected to 3 deliberately, not weakened to
+suit the fix.
+
 
 `--fs-type` exists on `ls`, `fsck` and `du`, and `docs/cli-reference.md`
 describes it as the mechanism for CP/M images "which have no on-disk

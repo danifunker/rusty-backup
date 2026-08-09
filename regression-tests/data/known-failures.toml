@@ -64,9 +64,6 @@ finding = "R-005"
 [[known]]
 id = "cli.envelope.ls-supports-format"
 finding = "R-003"
-[[known]]
-id = "cli.flags.inspect-accepts-fs-type"
-finding = "R-010"
 
 
 # --- R-013 — Solaris UFS entry types and sizes -------------------------------

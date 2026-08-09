@@ -299,6 +299,7 @@ fn run_action(disk: &DiskDevice, action: Action) -> Result<()> {
                 format: OutputFormat::Text,
                 password: None,
                 inside: None,
+                fs_override: Default::default(),
             });
             report(r, "inspect");
         }

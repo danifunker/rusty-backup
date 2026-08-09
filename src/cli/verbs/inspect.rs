@@ -41,6 +41,12 @@ pub struct InspectArgs {
     /// insensitively, then by basename. Ignored for non-zip sources.
     #[arg(long = "inside", value_name = "NAME")]
     pub inside: Option<String>,
+
+    /// `--fs-type` / `--carve-full`, matching `ls`, `fsck` and `du`. A CP/M
+    /// disk has no on-disk signature, so without this `inspect` could not
+    /// report one at all (R-010).
+    #[command(flatten)]
+    pub fs_override: crate::cli::resolve::FsDispatchOverride,
 }
 
 pub fn run(args: InspectArgs) -> Result<()> {
@@ -62,23 +68,64 @@ pub fn run(args: InspectArgs) -> Result<()> {
     // VHD / 2MG / DMG / DiskCopy 4.2) so inspect sees the same flat disk the
     // browse path does; the plain-open path did not unwrap DMG/VHD/2MG and
     // mis-read the wrapped bytes as the partition table.
+    // A missing image is NOT_FOUND, which is what exit.rs reserves 3 for; it
+    // used to be the catch-all 1, indistinguishable from a corrupt image.
+    if !args.image.exists() {
+        return Err(crate::cli::exit::not_found(format!(
+            "{}: no such file",
+            args.image.display()
+        )));
+    }
     let mut reader = crate::model::source_reader::open_peeled_read_with_entry(
         &args.image,
         pw_bytes,
         args.inside.as_deref(),
     )?;
-    let pt = PartitionTable::detect(&mut reader).map_err(|e| {
-        // An optical `.iso` (incl. NKit-scrubbed GC/Wii) has no MBR/GPT, so
-        // detection fails with a cryptic "invalid boot signature". Point the user
-        // at the `optical` verbs, or give NKit images the convert-it-first hint.
-        let base = anyhow::anyhow!("detecting partition table: {e}");
-        if crate::cli::optical_hint::is_nkit_image(&args.image) {
-            crate::cli::optical_hint::with_nkit_hint(base, &args.image)
-        } else {
-            crate::cli::optical_hint::with_optical_hint(base, &args.image)
+    // A signature-less filesystem has no partition table either, so detection
+    // fails before the forced type could be applied. `ls` already treats
+    // --fs-type as "raw filesystem at byte 0"; do the same here rather than
+    // accept the flag and still refuse the disk (R-010).
+    let forced = args.fs_override.fs_type.clone();
+    let pt = if let Some(ref t) = forced {
+        let size = reader.seek(std::io::SeekFrom::End(0)).unwrap_or(0);
+        reader.seek(std::io::SeekFrom::Start(0)).ok();
+        match PartitionTable::detect(&mut reader) {
+            Ok(pt) => pt,
+            Err(_) => PartitionTable::None {
+                size_bytes: size,
+                fs_hint: t.clone(),
+            },
         }
-    })?;
-    let partitions = pt.partitions();
+    } else {
+        PartitionTable::detect(&mut reader).map_err(|e| {
+            // An optical `.iso` (incl. NKit-scrubbed GC/Wii) has no MBR/GPT, so
+            // detection fails with a cryptic "invalid boot signature". Point the user
+            // at the `optical` verbs, or give NKit images the convert-it-first hint.
+            let base = anyhow::anyhow!("detecting partition table: {e}");
+            if crate::cli::optical_hint::is_nkit_image(&args.image) {
+                crate::cli::optical_hint::with_nkit_hint(base, &args.image)
+            } else {
+                crate::cli::optical_hint::with_optical_hint(base, &args.image)
+            }
+        })?
+    };
+    let mut partitions = pt.partitions();
+    // Forced dispatch: a signature-less filesystem cannot be detected, so the
+    // user naming it is the only way inspect can report it. Applied only where
+    // the table declared nothing, so a real type string is never overwritten.
+    if let Some(forced) = args.fs_override.fs_type.as_deref() {
+        for p in &mut partitions {
+            if p.partition_type_string.is_none() {
+                p.partition_type_string = Some(forced.to_string());
+                // Fall back to the string the user gave: `cpm:amstrad_data`
+                // names the disk far better than "unknown" does.
+                p.type_name = match crate::fs::fs_name_for(p.partition_type_byte, Some(forced)) {
+                    "unknown" => forced.to_string(),
+                    n => n.to_string(),
+                };
+            }
+        }
+    }
     let ext = args
         .image
         .extension()
