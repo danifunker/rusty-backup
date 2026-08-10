@@ -110,6 +110,35 @@ impl PartitionContext {
     }
 }
 
+/// Fail with `NOT_FOUND` when the source simply is not there.
+///
+/// `exit.rs` reserves 3 for "image file missing" and `inspect` has honoured it
+/// since R-010 — with a per-verb `exists()` check that never spread. Every
+/// other verb surfaced the raw `io::Error` as the catch-all 1, so a script
+/// could not tell "no disk" from "bad disk", and the message was a
+/// platform-specific syscall error (R-036). Living here means a verb added
+/// later inherits it.
+///
+/// Three things are deliberately exempt, because none of them is a file whose
+/// absence we can judge: a raw device (`\\.\PhysicalDrive0` does not
+/// `exists()`), an `rb://` remote reference, and anything the caller has
+/// already peeled to a temp.
+pub fn require_source_exists(path: &std::path::Path) -> Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    if crate::cli::device_safety::looks_like_device_path(path) {
+        return Ok(());
+    }
+    if path.to_string_lossy().starts_with("rb://") {
+        return Ok(());
+    }
+    Err(crate::cli::exit::not_found(format!(
+        "{}: no such file",
+        path.display()
+    )))
+}
+
 /// Open `path` read-only and resolve which partition to use.
 ///
 /// - When `selector` is `None` and the image has no partition table,
@@ -124,6 +153,7 @@ pub fn resolve_partition_ro(
     path: &std::path::Path,
     selector: Option<PartSelector>,
 ) -> Result<(File, PartitionContext)> {
+    require_source_exists(path)?;
     let mut file = open_image_ro(path)?;
     let ctx = resolve(&mut file, selector)?;
     Ok((file, ctx))
@@ -285,6 +315,7 @@ pub fn resolve_partition_rw_forced(
     // there via the backup-folder path, and repack over the original `.cbk` on
     // commit (the "additional legwork" edit path — cb_dos_network_and_state.md
     // §2e). Read access to a `.cbk` is native (source_reader); editing repacks.
+    require_source_exists(path)?;
     if crate::rbformats::cbk::is_cbk(path) {
         let temp = tempfile::Builder::new()
             .prefix(".rb-cbk-edit-")
@@ -545,6 +576,7 @@ pub fn resolve_partition_streaming_forced_inside(
     // A backup folder stores each partition as a compressed file governed by
     // metadata.json; decompress the selected one to a temp flat (read-only) so
     // get / ls / inspect see it like any other raw partition.
+    require_source_exists(path)?;
     if backup_edit::is_backup_folder(path) {
         return backup_edit::open_backup_partition_ro(path, selector);
     }
@@ -988,5 +1020,48 @@ mod tests {
         ];
         let picked = pick_default_partition(&parts).expect("one real filesystem");
         assert_eq!(picked.type_name, "Apple_HFS (Untitled)");
+    }
+}
+
+#[cfg(test)]
+mod source_exists_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn a_missing_plain_file_is_not_found() {
+        let e = require_source_exists(Path::new("definitely-not-here-9e3f.img"))
+            .expect_err("a missing image must be refused");
+        assert_eq!(crate::cli::exit::code_for(&e), crate::cli::exit::NOT_FOUND);
+        assert!(format!("{e:#}").contains("no such file"));
+    }
+
+    /// The exemption that matters: backing up a raw disk is the app's job, and
+    /// a device node does not `exists()` as a file. Getting this wrong would
+    /// refuse every device before it was ever opened.
+    #[test]
+    fn device_paths_are_exempt() {
+        for p in [
+            r"\\.\PhysicalDrive0",
+            r"\\?\PhysicalDrive1",
+            "/dev/sda",
+            "/dev/disk3",
+        ] {
+            assert!(
+                require_source_exists(Path::new(p)).is_ok(),
+                "{p} must pass the guard and fail (or not) at open time instead"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_refs_are_exempt() {
+        assert!(require_source_exists(Path::new("rb://host:9000/disk.img")).is_ok());
+    }
+
+    #[test]
+    fn an_existing_path_passes() {
+        // A directory counts: a backup folder is a legitimate source.
+        assert!(require_source_exists(Path::new(env!("CARGO_MANIFEST_DIR"))).is_ok());
     }
 }

@@ -113,14 +113,18 @@ expect_exit = 3
 
 [[case]]
 id = "cli.exit.locate-missing-image-is-not-found"
-description = """R-036: locate on a nonexistent image should exit 3, not 2.
-2 is the worst of the three answers — a usage error says the command was
-malformed, and this one is well-formed."""
+description = "R-036: locate on a nonexistent image exits 3, not 1"
 args = ["locate", "{scratch}/does-not-exist.img", "/anything"]
 expect_exit = 3
 
 [[case]]
 id = "cli.exit.tar-missing-image-is-not-found"
-description = "R-036: tar on a nonexistent image should exit 3, not 2"
-args = ["tar", "{scratch}/does-not-exist.img", "{scratch}/out.tar"]
+description = """R-036: tar on a nonexistent image exits 3.
+
+First written with two positionals, which made clap reject it as a usage error
+before the image was ever opened — the case asserted 3 and got a correct 2 for
+the wrong reason. `tar` takes IMAGE, SRC and OUT. Corrected deliberately, and
+the finding's table corrected with it: `tar` was never a real 2, it was a
+malformed command in the survey."""
+args = ["tar", "{scratch}/does-not-exist.img", "/", "{scratch}/out.tar"]
 expect_exit = 3

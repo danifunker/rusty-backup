@@ -35,7 +35,7 @@ finding depends on a fixture, the fixture is named.
 | [R-033](#r-033) | **High** | `src/partition/mod.rs` | A QL Microdrive `.mdv` fails at MBR detection, though its own probe matches it exactly |
 | ~~R-034~~ | ~~Medium~~ **FIXED** | `src/fs/mod.rs` | ~~Refusing a write to a read-only filesystem says `unknown` and exits 1, not 4~~ — names the filesystem, exits 4, 2026-08-08 |
 | ~~R-035~~ | ~~Medium~~ **FIXED** | `src/backup/` | ~~`.cbk` embeds the producing host's absolute path, so it can never be byte-identical across machines~~ — path normalised to a leaf, 2026-08-09 |
-| [R-036](#r-036) | Medium | `src/cli/` | A missing image gets three different exit codes across the verb surface |
+| ~~R-036~~ | ~~Medium~~ **FIXED** | `src/cli/resolve.rs` | ~~A missing image gets three different exit codes across the verb surface~~ — one guard in the shared resolver, 2026-08-10 |
 | ~~R-037~~ | ~~**High**~~ **FIXED** | `src/cli/verbs/resize.rs` | ~~Shrinking rewrote the filesystem over live data and returned truncated files~~ — data floor + `--confirm-shrink` + truncation, 2026-08-09 |
 | [R-020](#r-020) | **High** | `src/fs/affs.rs` | `new volume affs` output is "Not a DOS disk" on a real Amiga, at every size |
 | ~~R-016~~ | ~~**High**~~ **RECLASSIFIED** | `src/cli/verbs/backup.rs` | ~~`backup` accepts only flat-layout sources: CHD, dynamic VHD, QCOW2 and VMDK all fail~~ — not a defect; moved to [F-008](missing_features_from_regression.md#f-008), 2026-08-09 |
@@ -1404,6 +1404,22 @@ it and point at the README.
 
 ### R-036 — a missing image gets three different exit codes {#r-036}
 
+**FIXED 2026-08-10.** `inspect` was right and alone: it carried a per-verb
+`if !args.image.exists()` check added with R-010, which no other verb copied.
+The fix is one guard in the shared CLI resolver — `resolve::require_source_exists`,
+called from the read-only, streaming and read-write entry points — so every
+verb inherits it and one added later does too. `inspect`'s local check is gone.
+
+Three things are exempt, none of them a file whose absence can be judged: a raw
+device (`\.\PhysicalDrive0` does not `exists()`, and backing up a disk is
+the app's core job), an `rb://` remote reference, and a backup folder, which is
+a directory and passes `exists()` anyway.
+
+`ls`, `du`, `fsck`, `show fs-info`, `locate` and `tar` now exit 3 with
+`nosuch.img: no such file` instead of 1 with a platform-specific
+`io::Error`. Six cases, red the same day they were written and green the next.
+
+
 Found 2026-08-09 while closing R-005, which needed a verb whose missing-file
 failure had a settled exit code. `exit.rs` reserves `NOT_FOUND` (3) for exactly
 this — "image file missing" is the first example in its own doc comment — and
@@ -1412,12 +1428,15 @@ this — "image file missing" is the first example in its own doc comment — an
 | verb | exit | message |
 |---|---|---|
 | `inspect` | **3** | `nosuch.img: no such file` |
-| `ls`, `fsck`, `du`, `get`, `resize`, `repack`, `backup`, `show fs-info` | **1** | `open nosuch.img: The system cannot find the file specified. (os error 2)` |
-| `locate`, `tar` | **2** | — |
+| `ls`, `fsck`, `du`, `get`, `locate`, `tar`, `resize`, `repack`, `backup`, `show fs-info` | **1** | `open nosuch.img: The system cannot find the file specified. (os error 2)` |
 
-Three answers to one condition, and 2 is the actively wrong one: a usage error
-means the *command* was malformed, and `rb-cli tar missing.img out.tar` is a
-well-formed command naming a file that does not exist.
+**Correction to the first version of this table**, which listed `locate` and
+`tar` at exit 2 and called that the worst of three answers. It was two answers,
+not three: the survey invoked `tar` with two positionals when it takes three
+(`IMAGE SRC OUT`), so clap rejected the command before the image was opened.
+That 2 was correct — for a malformed command, not a missing file. Given correct
+arity both verbs exit 1 like the rest. The case built on the bad invocation was
+corrected with it.
 
 Two things follow from the message, not just the code:
 
@@ -1535,7 +1554,7 @@ Run `rb-regress run --tiers 0-4` to check them all.
 | R-021 | `resize.to-explicit-size` | **green — fixed** |
 | R-023 | `resize.repack.{keeps-data,refuses-plain-fat}` | **green — fixed** |
 | R-022 | `roundtrip.hpfs.raw`, `fs.detect.hpfs-{bare-volume,backup-is-not-empty}` | **green — fixed** |
-| R-036 | `cli.exit.{ls,du,fsck,show-fs-info,locate,tar}-missing-image-is-not-found` | red |
+| R-036 | `cli.exit.{ls,du,fsck,show-fs-info,locate,tar}-missing-image-is-not-found` | **green — fixed** |
 | R-037 | `resize.shrink.{refuses-cutting-live-data,needs-confirmation,keeps-data-and-truncates}` | **green — fixed** |
 | R-017 | `fs.detect.sfs-bare-volume` | **green — fixed** |
 | R-025 | `subcmd.squashfs.put-rebuilds`, `meta.xattr.set-list-rm` | red — Windows only |

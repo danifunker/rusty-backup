@@ -68,14 +68,9 @@ pub fn run(args: InspectArgs) -> Result<()> {
     // VHD / 2MG / DMG / DiskCopy 4.2) so inspect sees the same flat disk the
     // browse path does; the plain-open path did not unwrap DMG/VHD/2MG and
     // mis-read the wrapped bytes as the partition table.
-    // A missing image is NOT_FOUND, which is what exit.rs reserves 3 for; it
-    // used to be the catch-all 1, indistinguishable from a corrupt image.
-    if !args.image.exists() {
-        return Err(crate::cli::exit::not_found(format!(
-            "{}: no such file",
-            args.image.display()
-        )));
-    }
+    // A missing image is NOT_FOUND. The check used to live here and nowhere
+    // else, which is what R-036 was; it is now in resolve::require_source_exists.
+    crate::cli::resolve::require_source_exists(&args.image)?;
     let mut reader = crate::model::source_reader::open_peeled_read_with_entry(
         &args.image,
         pw_bytes,

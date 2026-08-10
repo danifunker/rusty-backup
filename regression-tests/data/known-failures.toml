@@ -119,26 +119,3 @@ finding = "R-032"
 [[known]]
 id = "read.qdos.microdrive"
 finding = "R-033"
-
-
-# --- R-036 — a missing image gets three different exit codes -----------------
-# `inspect` exits 3 (correct, cli.exit.missing-image-file is green). These six
-# verbs do not. One entry each: each is a separate contract a script switches on.
-[[known]]
-id = "cli.exit.ls-missing-image-is-not-found"
-finding = "R-036"
-[[known]]
-id = "cli.exit.du-missing-image-is-not-found"
-finding = "R-036"
-[[known]]
-id = "cli.exit.fsck-missing-image-is-not-found"
-finding = "R-036"
-[[known]]
-id = "cli.exit.show-fs-info-missing-image-is-not-found"
-finding = "R-036"
-[[known]]
-id = "cli.exit.locate-missing-image-is-not-found"
-finding = "R-036"
-[[known]]
-id = "cli.exit.tar-missing-image-is-not-found"
-finding = "R-036"
