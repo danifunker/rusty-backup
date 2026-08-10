@@ -52,7 +52,85 @@ pub struct Consolidated {
     pub cases: BTreeSet<String>,
     /// Cases that failed, with the platforms they failed on — the triage list.
     pub failures: BTreeMap<String, BTreeSet<String>>,
+    /// (case, platform, verdict, run_id) for every line, so coverage skew can
+    /// be computed from each platform's *latest* run rather than from all of
+    /// history at once.
+    seen: Vec<(String, String, String, String)>,
     pub unstamped: usize,
+}
+
+/// A case that ran somewhere and was skipped for a missing fixture elsewhere.
+#[derive(Debug)]
+pub struct CoverageSkew {
+    pub case_id: String,
+    pub skipped_on: BTreeSet<String>,
+    pub ran_on: BTreeSet<String>,
+}
+
+impl Consolidated {
+    /// Cases covered on some hosts and skipped on others for want of a fixture.
+    ///
+    /// Invisible in the pass/fail columns: an unresolved fixture is
+    /// `skip-fixture`, not a failure, so a host missing part of the corpus
+    /// still reports zero failures — just a quietly smaller pass count. Three
+    /// hosts sat at 257/257/259 that way, all reporting 0 fail.
+    ///
+    /// Computed from each platform's **latest run only**. `consolidate` reads
+    /// every `results.jsonl` ever written, so comparing across all of history
+    /// reports skew that was fixed weeks ago — the first version of this did
+    /// exactly that, naming eleven optical cases as missing on Windows when
+    /// Windows had had them for weeks. Run ids are timestamp-prefixed, so the
+    /// lexical maximum per platform is that platform's most recent run.
+    pub fn coverage_skew(&self) -> Vec<CoverageSkew> {
+        let mut latest: BTreeMap<&str, &str> = BTreeMap::new();
+        for (_, platform, _, run_id) in &self.seen {
+            if run_id.is_empty() {
+                continue;
+            }
+            let e = latest.entry(platform.as_str()).or_insert(run_id.as_str());
+            if run_id.as_str() > *e {
+                *e = run_id.as_str();
+            }
+        }
+
+        let mut ran_on: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        let mut skipped_on: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        for (case, platform, verdict, run_id) in &self.seen {
+            if latest.get(platform.as_str()) != Some(&run_id.as_str()) {
+                continue;
+            }
+            ran_on
+                .entry(case.as_str())
+                .or_default()
+                .insert(platform.as_str());
+            if verdict == "skip-fixture" {
+                skipped_on
+                    .entry(case.as_str())
+                    .or_default()
+                    .insert(platform.as_str());
+            }
+        }
+
+        let mut out = Vec::new();
+        for (case_id, skipped) in &skipped_on {
+            let ran: BTreeSet<String> = ran_on
+                .get(case_id)
+                .map(|all| {
+                    all.difference(skipped)
+                        .map(|s| (*s).to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !ran.is_empty() {
+                out.push(CoverageSkew {
+                    case_id: (*case_id).to_string(),
+                    skipped_on: skipped.iter().map(|s| (*s).to_string()).collect(),
+                    ran_on: ran,
+                });
+            }
+        }
+        out
+    }
 }
 
 /// Find every `results.jsonl` under `root`, at any depth.
@@ -124,11 +202,20 @@ pub fn consolidate(root: &Path) -> Result<Consolidated, String> {
                 c.runs.insert(l.run_id.clone());
             }
 
+            let platform = if l.platform.is_empty() {
+                "?".to_string()
+            } else {
+                l.platform.clone()
+            };
+            c.seen.push((
+                l.case_id.clone(),
+                platform.clone(),
+                l.verdict.clone(),
+                l.run_id.clone(),
+            ));
+
             if l.verdict == "fail" || l.verdict == "error" {
-                c.failures
-                    .entry(l.case_id)
-                    .or_default()
-                    .insert(if l.platform.is_empty() { "?".into() } else { l.platform });
+                c.failures.entry(l.case_id).or_default().insert(platform);
             }
         }
     }
@@ -230,5 +317,107 @@ pub fn render(c: &Consolidated, root: &Path) -> String {
         }
     }
 
+    // Coverage skew is the failure mode the pass/fail columns cannot show: a
+    // host missing a fixture reports skip-fixture, not a failure, so it stays
+    // green while covering less than its peers.
+    let skew = c.coverage_skew();
+    if !skew.is_empty() {
+        s.push_str(&format!(
+            "\nCOVERAGE SKEW ({}) - ran on some hosts, skipped for a missing fixture on others\n\
+             Comparing each host's LATEST run. Those hosts are green on less than their\n\
+             peers. Sync the corpus AND the catalogue row (gitignored, so a pull does not\n\
+             bring it) before comparing pass counts.\n",
+            skew.len()
+        ));
+        for k in skew.iter().take(30) {
+            let miss: Vec<&str> = k.skipped_on.iter().map(|s| s.as_str()).collect();
+            let has: Vec<&str> = k.ran_on.iter().map(|s| s.as_str()).collect();
+            s.push_str(&format!(
+                "  {:<44} missing on {} (ran on {})\n",
+                k.case_id,
+                miss.join(", "),
+                has.join(", ")
+            ));
+        }
+        if skew.len() > 30 {
+            s.push_str(&format!("  ... and {} more\n", skew.len() - 30));
+        }
+    }
+
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seen(c: &mut Consolidated, case: &str, platform: &str, verdict: &str, run: &str) {
+        c.seen.push((
+            case.into(),
+            platform.into(),
+            verdict.into(),
+            run.into(),
+        ));
+    }
+
+    #[test]
+    fn a_case_skipped_on_one_host_and_run_on_another_is_skew() {
+        let mut c = Consolidated::default();
+        seen(&mut c, "read.hpfs.os2-warp45", "windows", "pass", "200-win");
+        seen(&mut c, "read.hpfs.os2-warp45", "linux", "skip-fixture", "200-lin");
+        seen(&mut c, "read.hpfs.os2-warp45", "macos", "skip-fixture", "200-mac");
+
+        let skew = c.coverage_skew();
+        assert_eq!(skew.len(), 1);
+        assert_eq!(skew[0].case_id, "read.hpfs.os2-warp45");
+        assert!(skew[0].skipped_on.contains("linux"));
+        assert!(skew[0].ran_on.contains("windows"));
+    }
+
+    #[test]
+    fn a_case_skipped_everywhere_is_not_skew() {
+        // Nobody holds the fixture. That is a corpus gap the inventory already
+        // reports; it is not one host being quietly less covered than another.
+        let mut c = Consolidated::default();
+        seen(&mut c, "read.something", "windows", "skip-fixture", "200-win");
+        seen(&mut c, "read.something", "linux", "skip-fixture", "200-lin");
+        assert!(c.coverage_skew().is_empty());
+    }
+
+    #[test]
+    fn a_case_that_ran_everywhere_is_not_skew() {
+        let mut c = Consolidated::default();
+        seen(&mut c, "read.something", "windows", "pass", "200-win");
+        seen(&mut c, "read.something", "linux", "xfail", "200-lin");
+        assert!(c.coverage_skew().is_empty());
+    }
+
+    #[test]
+    fn skew_fixed_in_a_later_run_is_not_reported() {
+        // The whole point of scoping to the latest run per platform. The first
+        // version compared all of history and named eleven optical cases as
+        // missing on Windows that Windows had held for weeks.
+        let mut c = Consolidated::default();
+        seen(&mut c, "read.optical.udf", "windows", "skip-fixture", "100-win");
+        seen(&mut c, "read.optical.udf", "linux", "pass", "100-lin");
+        // Later runs: Windows got the fixture.
+        seen(&mut c, "read.optical.udf", "windows", "pass", "300-win");
+        seen(&mut c, "read.optical.udf", "linux", "pass", "300-lin");
+        assert!(
+            c.coverage_skew().is_empty(),
+            "stale skew from an older run must not be reported"
+        );
+    }
+
+    #[test]
+    fn skew_still_present_in_the_latest_run_is_reported() {
+        let mut c = Consolidated::default();
+        seen(&mut c, "read.optical.udf", "windows", "pass", "100-win");
+        seen(&mut c, "read.optical.udf", "linux", "pass", "100-lin");
+        seen(&mut c, "read.optical.udf", "windows", "pass", "300-win");
+        seen(&mut c, "read.optical.udf", "linux", "skip-fixture", "300-lin");
+        let skew = c.coverage_skew();
+        assert_eq!(skew.len(), 1);
+        assert!(skew[0].skipped_on.contains("linux"));
+    }
 }

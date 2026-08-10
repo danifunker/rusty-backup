@@ -336,38 +336,26 @@ The definitive check is an actual `rustup toolchain install 1.73.0` build of tha
 
 ### The pipeline builds more than your machine does
 
-A green `cargo test` and a green `rb-regress run` are not a green pipeline. Two
-classes of breakage are invisible locally, and both have shipped:
-
-**1. CI tests in release mode.** The workflow's test step is `cargo test
---release`, not `cargo test`. Run that before pushing.
-
-**2. CI builds feature sets you don't.** The MiSTer armv7 binary is built with
-`optical` on and `native-zstd` off:
+A green `cargo test` and a green `rb-regress run` are not a green pipeline.
+Run this before pushing:
 
 ```bash
-cargo check --bin rb-cli --no-default-features --features chd,pure-zstd,remote,optical,tui
+scripts/preflight.sh
 ```
 
-Anything touching zstd must go through `crate::rbformats::zstd_compat`, never
-the `zstd` crate directly — naming the C crate compiles on the desktop and
-fails there. `src/fs/tar_export.rs` is the reference call site.
+It runs what CI runs: `cargo test --release` (CI's test step is release, not
+debug), the MiSTer feature set (`optical` on, `native-zstd` off — anything
+touching zstd must go through `crate::rbformats::zstd_compat`, never the `zstd`
+crate directly), the Rust 1.73 vintage floor, and the doc-parity tests.
 
-**Read the job list, not the run conclusion.** Several jobs are
-`continue-on-error: true` (the MiSTer `rb-cli-mini` build among them), so they
-can fail while `gh run list` still reports the run as `success`. Use:
+**After pushing, read the job list, not the run conclusion.** Several jobs are
+`continue-on-error: true` — the MiSTer `rb-cli-mini` build among them — so they
+can fail while `gh run list` still reports the run as `success`. That hid a
+compile error for a day.
 
 ```bash
 gh run view <run-id>
 ```
-
-The mini build was broken for a day behind a green-looking run because of
-exactly this.
-
-**Platform-dependent std APIs** are the third trap, and the regression suite
-cannot see them either: `Path::file_name` treats `\` as a separator only on
-Windows, so a Windows-path assertion passed on the dev machine and failed on
-every Unix job.
 
 ### mrustc mis-lowers `leading_zeros` / `leading_ones` on narrow integers
 

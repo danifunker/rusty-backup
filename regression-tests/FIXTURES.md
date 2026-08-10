@@ -274,9 +274,11 @@ Admitting a fixture therefore takes three steps per such host:
 3. `rb-regress fixtures` on the host — expect `N catalogued - N verified, 0
    missing, 0 CORRUPT`.
 
-Because a missing fixture degrades to `skip-fixture` rather than a failure,
-**compare pass counts across hosts, not just fail counts.** That is what
-surfaces a host running fewer cases than the others.
+Because a missing fixture degrades to `skip-fixture` rather than a failure, a
+host that never got the sync stays green while covering less than its peers.
+`rb-regress consolidate` reports that directly, as **COVERAGE SKEW** — cases
+that ran on some hosts and skipped on others. Read it rather than eyeballing
+pass counts.
 
 ### The large-fixture annex
 

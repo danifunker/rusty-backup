@@ -1434,9 +1434,10 @@ corrupt" without switching on the code, which is the entire reason the table in
 `exit.rs` exists. It is also the cheapest class of fix left — `exit::not_found`
 already exists and is already used by `inspect`.
 
-Not yet cased. The natural shape is one case per verb in
-`cases/tier0/exit-codes.toml`, beside `cli.exit.missing-image-file`, which
-already pins `inspect` at 3.
+**Cased 2026-08-10**, one per verb because each is a separate contract a
+script switches on: `cli.exit.{ls,du,fsck,show-fs-info,locate,tar}-missing-image-is-not-found`,
+all red, all citing this finding. `cli.exit.missing-image-file` is the green
+counterpart pinning `inspect` at 3.
 
 ---
 
@@ -1534,7 +1535,7 @@ Run `rb-regress run --tiers 0-4` to check them all.
 | R-021 | `resize.to-explicit-size` | **green — fixed** |
 | R-023 | `resize.repack.{keeps-data,refuses-plain-fat}` | **green — fixed** |
 | R-022 | `roundtrip.hpfs.raw`, `fs.detect.hpfs-{bare-volume,backup-is-not-empty}` | **green — fixed** |
-| R-036 | none yet — one case per verb in `cases/tier0/exit-codes.toml` | **not covered** |
+| R-036 | `cli.exit.{ls,du,fsck,show-fs-info,locate,tar}-missing-image-is-not-found` | red |
 | R-037 | `resize.shrink.{refuses-cutting-live-data,needs-confirmation,keeps-data-and-truncates}` | **green — fixed** |
 | R-017 | `fs.detect.sfs-bare-volume` | **green — fixed** |
 | R-025 | `subcmd.squashfs.put-rebuilds`, `meta.xattr.set-list-rm` | red — Windows only |
