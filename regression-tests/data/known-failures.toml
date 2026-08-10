@@ -111,11 +111,3 @@ finding = "R-028"
 [[known]]
 id = "edit.sfs.put-get"
 finding = "R-032"
-
-
-
-
-# The detector matches the fixture byte for byte; inspect never reaches it.
-[[known]]
-id = "read.qdos.microdrive"
-finding = "R-033"

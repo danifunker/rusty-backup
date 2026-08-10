@@ -32,7 +32,7 @@ finding depends on a fixture, the fixture is named.
 | [R-031](#r-031) | Medium | `src/partition/mod.rs` | A real Apple DOS 3.3 disk is detected as `unknown`, though our own output is not |
 | [R-028](#r-028) | Medium | `src/fs/apple_dos.rs` | Apple DOS 3.3 reports three different sizes for one file: 104 in, 512 by `ls`, 256 by `get` |
 | [R-032](#r-032) | Low | `src/fs/sfs.rs` | SFS `put` fails on any volume with a multi-leaf extent btree — i.e. any real one |
-| [R-033](#r-033) | **High** | `src/partition/mod.rs` | A QL Microdrive `.mdv` fails at MBR detection, though its own probe matches it exactly |
+| ~~R-033~~ | ~~High~~ **FIXED** | `src/partition/mod.rs` | ~~A QL Microdrive `.mdv` fails at MBR detection, though its own probe matches it exactly~~ — probe added beside the HPFS one, 2026-08-10 |
 | ~~R-034~~ | ~~Medium~~ **FIXED** | `src/fs/mod.rs` | ~~Refusing a write to a read-only filesystem says `unknown` and exits 1, not 4~~ — names the filesystem, exits 4, 2026-08-08 |
 | ~~R-035~~ | ~~Medium~~ **FIXED** | `src/backup/` | ~~`.cbk` embeds the producing host's absolute path, so it can never be byte-identical across machines~~ — path normalised to a leaf, 2026-08-09 |
 | ~~R-036~~ | ~~Medium~~ **FIXED** | `src/cli/resolve.rs` | ~~A missing image gets three different exit codes across the verb surface~~ — one guard in the shared resolver, 2026-08-10 |
@@ -754,6 +754,28 @@ directly, so neither the Solaris on-disk variant nor this listing path was
 ever exercised. Fixture: `part.sun.solaris-disk.multipart` (annex).
 
 ### R-033 — a QL Microdrive cartridge never reaches its own detector {#r-033}
+
+**FIXED 2026-08-10, and it was R-022's shape exactly** — which is what the
+resume note predicted. Both the driver and the detection existed; nothing
+consulted them on the path the user takes. `detect_superfloppy` had no MDV
+probe, so a cartridge fell through to the MBR parse, which read the `ff ff`
+sync at 0x0A as a bad 0xAA55 and refused the whole file.
+
+The probe now sits beside the HPFS one added for R-022, gated on **both** the
+exact 174,930-byte cartridge length and the sector-0 header, so it cannot claim
+anything else. Two unit tests pin both halves of that gate — a header at the
+wrong length and cartridge-sized bytes without a header must both be rejected.
+A probe that fires too eagerly is worse than one that never fires.
+
+`inspect` now reports `qdos_mdv`, 170.8 KiB, no partition table.
+
+**What this does not do.** Reaching the driver reveals that its directory walk
+is a stub: `ls` returns "QDOS microdrive directory walk not implemented". That
+is not a new finding — it is the `.mdv` QDOS microdrive reader already tracked
+in [OPEN-WORK.md](OPEN-WORK.md) §7, estimated at ~300 LOC against the two
+anchored fixtures. This finding was about reachability, and reachability is
+what it fixed.
+
 
 ```
 rb-cli inspect fs.qdos.microdrive.mdv.mdv
@@ -1597,10 +1619,10 @@ remains is different from the one that got us here.
 
 1. **R-008b** — a panic with no file produced is the worst failure mode left,
    and R-008a shares its fix.
-2. **R-033** — a QL Microdrive `.mdv` fails at MBR detection although its own
-   probe matches it exactly. **Very likely R-022's shape**: a bare volume
-   falling through to the MBR parse because no probe in `detect_superfloppy`
-   claimed it. Read that fix first — this may be short.
+2. ~~**R-033**~~ — done 2026-08-10. The prediction held exactly: R-022's
+   shape, a bare volume falling through to the MBR parse because no probe in
+   `detect_superfloppy` claimed it. The fix was a dozen lines beside the HPFS
+   probe.
 3. **R-013** — wrong entry types and an absurd size are user-visible
    immediately.
 4. **R-024** — the AFFS editor. Distinct from R-008 (formatter) and R-020

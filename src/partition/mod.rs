@@ -363,6 +363,24 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
     }
     let _ = reader.seek(SeekFrom::Start(0));
 
+    // QDOS Microdrive cartridge. Sector 0 is a cartridge header, not a VBR:
+    // ten zero bytes, an `ff ff ff` sync at 0x0A, then the ASCII name. Nothing
+    // there resembles a partition table, but the MBR parse read the sync as a
+    // bad 0xAA55 and refused the whole cartridge — before the probe that
+    // already recognises it could run (R-033). Same shape as R-022: the driver
+    // and the detection both existed; nothing consulted them on this path.
+    // Gated on the exact cartridge length as well as the header, so it cannot
+    // claim anything else.
+    if let Ok(end) = reader.seek(SeekFrom::End(0)) {
+        let _ = reader.seek(SeekFrom::Start(0));
+        if end == crate::fs::qdos_mdv::MDV_CART_BYTES as u64
+            && crate::fs::qdos_mdv::looks_like_mdv_sector_zero(first_sector)
+        {
+            return Some("qdos_mdv".to_string());
+        }
+    }
+    let _ = reader.seek(SeekFrom::Start(0));
+
     if first_sector[0] == 0xEB || first_sector[0] == 0xE9 {
         let bytes_per_sector = u16::from_le_bytes([first_sector[11], first_sector[12]]);
         let sectors_per_cluster = first_sector[13];
@@ -1849,6 +1867,54 @@ mod tests {
         assert_eq!(parts[0].start_lba, 0);
         assert_eq!(parts[0].size_bytes, 1474560);
         assert_eq!(parts[0].type_name, "FAT");
+    }
+
+    /// A `.mdv` cartridge header, as it appears on a real MiSTer cartridge:
+    /// ten zero bytes, an `ff ff ff` sync, then the ASCII name.
+    fn mdv_sector_zero() -> [u8; 512] {
+        let mut s = [0u8; 512];
+        s[0x0A] = 0xFF;
+        s[0x0B] = 0xFF;
+        s[0x0C] = 0xFF;
+        s[0x0E..0x18].copy_from_slice(b"Test      ");
+        s
+    }
+
+    #[test]
+    fn an_mdv_cartridge_is_a_superfloppy_not_a_bad_mbr() {
+        let sector0 = mdv_sector_zero();
+        let mut img = vec![0u8; crate::fs::qdos_mdv::MDV_CART_BYTES];
+        img[..512].copy_from_slice(&sector0);
+        let mut cur = std::io::Cursor::new(img);
+        assert_eq!(
+            detect_superfloppy(&sector0, &mut cur).as_deref(),
+            Some("qdos_mdv"),
+            "R-033: the MBR parse used to claim this and refuse the cartridge"
+        );
+    }
+
+    /// The control in the other direction, which is what R-022 taught: a probe
+    /// that fires too eagerly is worse than one that never fires. Both halves
+    /// of the gate have to be required.
+    #[test]
+    fn the_mdv_probe_needs_both_the_size_and_the_header() {
+        // Right header, wrong length.
+        let sector0 = mdv_sector_zero();
+        let mut short = std::io::Cursor::new(vec![0u8; 4096]);
+        assert_ne!(
+            detect_superfloppy(&sector0, &mut short).as_deref(),
+            Some("qdos_mdv"),
+            "a cartridge header at the wrong length must not be claimed"
+        );
+
+        // Right length, wrong header — an all-zero cartridge-sized file.
+        let blank = [0u8; 512];
+        let mut sized = std::io::Cursor::new(vec![0u8; crate::fs::qdos_mdv::MDV_CART_BYTES]);
+        assert_ne!(
+            detect_superfloppy(&blank, &mut sized).as_deref(),
+            Some("qdos_mdv"),
+            "cartridge-sized bytes without the header must not be claimed"
+        );
     }
 
     #[test]
