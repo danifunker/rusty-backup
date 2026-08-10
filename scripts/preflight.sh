@@ -50,6 +50,11 @@ run "Rust 1.73 floor (vintage manifest)" \
 run "doc parity (README / CONTRIBUTING vs source)" \
     cargo test --test doc_parity
 
+# The harness is its own crate, so nothing above compiles or tests it. The
+# pre-commit hook clippies it; this runs its tests.
+run "rb-regress (the harness's own tests)" \
+    cargo test --manifest-path regression-tests/runner/Cargo.toml
+
 printf '\n'
 if [ "$fail" -ne 0 ]; then
     printf 'preflight: FAILED - do not push\n'

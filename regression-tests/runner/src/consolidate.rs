@@ -50,8 +50,6 @@ pub struct Consolidated {
     pub builds: BTreeSet<String>,
     pub runs: BTreeSet<String>,
     pub cases: BTreeSet<String>,
-    /// Cases that failed, with the platforms they failed on — the triage list.
-    pub failures: BTreeMap<String, BTreeSet<String>>,
     /// (case, platform, verdict, run_id) for every line, so coverage skew can
     /// be computed from each platform's *latest* run rather than from all of
     /// history at once.
@@ -68,6 +66,45 @@ pub struct CoverageSkew {
 }
 
 impl Consolidated {
+    /// The most recent run id per platform. Run ids are timestamp-prefixed, so
+    /// the lexical maximum is the newest.
+    ///
+    /// Everything reported as "current" filters through this. `consolidate`
+    /// reads every `results.jsonl` ever written — 131 of them here — so an
+    /// unfiltered view describes no run that ever happened.
+    fn latest_run_per_platform(&self) -> BTreeMap<&str, &str> {
+        let mut latest: BTreeMap<&str, &str> = BTreeMap::new();
+        for (_, platform, _, run_id) in &self.seen {
+            if run_id.is_empty() {
+                continue;
+            }
+            let e = latest.entry(platform.as_str()).or_insert(run_id.as_str());
+            if run_id.as_str() > *e {
+                *e = run_id.as_str();
+            }
+        }
+        latest
+    }
+
+    /// Cases failing in each platform's latest run — the triage list.
+    ///
+    /// Accumulated across all of history until 2026-08-10, which listed 69
+    /// Windows failures that had been green for weeks. A triage list nobody
+    /// can trust is worse than none.
+    pub fn current_failures(&self) -> BTreeMap<String, BTreeSet<String>> {
+        let latest = self.latest_run_per_platform();
+        let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for (case, platform, verdict, run_id) in &self.seen {
+            if latest.get(platform.as_str()) != Some(&run_id.as_str()) {
+                continue;
+            }
+            if verdict == "fail" || verdict == "error" {
+                out.entry(case.clone()).or_default().insert(platform.clone());
+            }
+        }
+        out
+    }
+
     /// Cases covered on some hosts and skipped on others for want of a fixture.
     ///
     /// Invisible in the pass/fail columns: an unresolved fixture is
@@ -82,16 +119,7 @@ impl Consolidated {
     /// Windows had had them for weeks. Run ids are timestamp-prefixed, so the
     /// lexical maximum per platform is that platform's most recent run.
     pub fn coverage_skew(&self) -> Vec<CoverageSkew> {
-        let mut latest: BTreeMap<&str, &str> = BTreeMap::new();
-        for (_, platform, _, run_id) in &self.seen {
-            if run_id.is_empty() {
-                continue;
-            }
-            let e = latest.entry(platform.as_str()).or_insert(run_id.as_str());
-            if run_id.as_str() > *e {
-                *e = run_id.as_str();
-            }
-        }
+        let latest = self.latest_run_per_platform();
 
         let mut ran_on: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
         let mut skipped_on: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
@@ -214,9 +242,8 @@ pub fn consolidate(root: &Path) -> Result<Consolidated, String> {
                 l.run_id.clone(),
             ));
 
-            if l.verdict == "fail" || l.verdict == "error" {
-                c.failures.entry(l.case_id).or_default().insert(platform);
-            }
+            // Failures are derived at the end from `seen`, scoped to each
+            // platform's latest run — see `current_failures`.
         }
     }
 
@@ -305,15 +332,19 @@ pub fn render(c: &Consolidated, root: &Path) -> String {
         ));
     }
 
-    if !c.failures.is_empty() {
-        s.push_str(&format!("\nfailing cases ({})\n", c.failures.len()));
-        for (case, plats) in c.failures.iter().take(30) {
+    let failures = c.current_failures();
+    if !failures.is_empty() {
+        s.push_str(&format!(
+            "\nfailing cases ({}) - in each host's LATEST run\n",
+            failures.len()
+        ));
+        for (case, plats) in failures.iter().take(30) {
             let mut ps: Vec<&str> = plats.iter().map(|s| s.as_str()).collect();
             ps.sort_unstable();
             s.push_str(&format!("  {:<44} {}\n", case, ps.join(", ")));
         }
-        if c.failures.len() > 30 {
-            s.push_str(&format!("  ... and {} more\n", c.failures.len() - 30));
+        if failures.len() > 30 {
+            s.push_str(&format!("  ... and {} more\n", failures.len() - 30));
         }
     }
 
@@ -390,6 +421,24 @@ mod tests {
         seen(&mut c, "read.something", "windows", "pass", "200-win");
         seen(&mut c, "read.something", "linux", "xfail", "200-lin");
         assert!(c.coverage_skew().is_empty());
+    }
+
+    #[test]
+    fn failures_are_scoped_to_the_latest_run_too() {
+        // The failing-cases list had the same all-history flaw as the skew
+        // check: it reported 69 Windows failures that had been green for weeks.
+        let mut c = Consolidated::default();
+        seen(&mut c, "some.case", "windows", "fail", "100-win");
+        seen(&mut c, "some.case", "windows", "pass", "300-win");
+        assert!(
+            c.current_failures().is_empty(),
+            "a failure fixed in a later run must not stay on the triage list"
+        );
+
+        seen(&mut c, "other.case", "linux", "fail", "300-lin");
+        let f = c.current_failures();
+        assert_eq!(f.len(), 1);
+        assert!(f.contains_key("other.case"));
     }
 
     #[test]
