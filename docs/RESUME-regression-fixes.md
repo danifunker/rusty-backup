@@ -9,9 +9,9 @@ pushed and verified on all three hosts at `c6e66fd`).
 
 ## STATE
 
-- Suite: **259 pass / 19 xfail / 0 fail** on Windows. macOS and Linux last ran
-  at `c6e66fd` (254/19/0, zero XPASS) and have not run since — R-037 and the
-  OS/2 fixture are Windows-only so far.
+- Suite: **259 pass / 19 xfail / 0 fail**, zero XPASS, on Windows, macOS and
+  Linux — all three measured at `93a6d53`, with the OS/2 fixture present on
+  all three.
 - 21 findings fixed, 14 open (R-036 and R-037 were filed 2026-08-09; R-037 is
   already fixed). `data/known-failures.toml` holds 19 entries.
 - R-016 is no longer a defect: it was reclassified as
@@ -96,6 +96,30 @@ with spaces, fsck clean.
 
 Note the original drop is still at `new/OS2 Warp 4.52.zip` on the NAS; the
 annex copy is independent, so the drop can be deleted whenever.
+
+## HOW THE CORPUS REACHES THE OTHER HOSTS
+
+Not by `rb-regress fixtures --sync`. **linuxbox and the Mac have
+`corpus_source` commented out** — neither can reach the distribution share, and
+their `local.toml` says so. The corpus was scp'd to them from this Windows box,
+and that is still the mechanism.
+
+So admitting an annex fixture is three steps per host, not one:
+
+1. `scp` the file into `regression-tests/fixtures-large/`.
+2. Append the catalogue row to that host's `regression-tests/fixture-map.tsv`
+   — gitignored, so it does **not** arrive with `git pull`. This is the step
+   that is easy to miss: without it the file is present and the case still
+   reports `skip-fixture`.
+3. `rb-regress fixtures` on the host to confirm `N catalogued - N verified, 0
+   missing, 0 CORRUPT`.
+
+Windows `scp.exe` cannot resolve an MSYS `/tmp/...` path; stage anything you
+are copying at a real Windows path first.
+
+A case whose fixture is missing degrades to `skip-fixture`, not a failure — so
+a forgotten sync looks like a green run with a smaller number. Compare the pass
+count across hosts, not just the fail count.
 
 ## FEATURE WORK QUEUED
 

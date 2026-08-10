@@ -257,6 +257,27 @@ structure under test rather than storing a whole game or install disc.
 
 Track the total in the catalogue; the run report prints it.
 
+### Hosts that cannot reach the share
+
+`--sync` assumes the host can see `corpus_source`. Not all of them can: on the
+Linux and macOS oracle hosts `corpus_source` is deliberately **commented out**,
+and their corpus was `scp`'d over from the orchestrating box. Runs there read
+local disk like everywhere else; only the distribution differs.
+
+Admitting a fixture therefore takes three steps per such host:
+
+1. `scp` the file into `fixtures/` (or `fixtures-large/`).
+2. **Append the catalogue row to that host's `fixture-map.tsv`.** It is
+   gitignored, so it does not arrive with `git pull`. Miss this and the file is
+   present, the case still reports `skip-fixture`, and the run stays green with
+   a quietly smaller pass count.
+3. `rb-regress fixtures` on the host — expect `N catalogued - N verified, 0
+   missing, 0 CORRUPT`.
+
+Because a missing fixture degrades to `skip-fixture` rather than a failure,
+**compare pass counts across hosts, not just fail counts.** That is what
+surfaces a host running fewer cases than the others.
+
 ### The large-fixture annex
 
 Some formats have no small specimen. A UDF DVD-Video is 483 MB and cannot be
