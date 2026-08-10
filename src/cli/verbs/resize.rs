@@ -57,11 +57,7 @@ pub fn run(args: ResizeArgs) -> Result<()> {
         ctx.size,
     ));
     if new_size > ctx.size {
-        log_stderr(format!(
-            "warning: requested size {} exceeds partition capacity {}; the FS may refuse",
-            format_size(new_size),
-            format_size(ctx.size),
-        ));
+        grow_container_or_refuse(&mut file, &ctx, new_size)?;
     }
 
     let mut log_cb = |s: &str| log_stderr(format!("  {s}"));
@@ -73,6 +69,60 @@ pub fn run(args: ResizeArgs) -> Result<()> {
     // clear error rather than writing a malformed container.
     commit.commit()?;
     log_stderr("resize complete");
+    Ok(())
+}
+
+/// Make room for a grow, or refuse it.
+///
+/// Growing a filesystem past the end of whatever holds it writes metadata
+/// describing blocks that do not exist. This used to print "the FS may refuse"
+/// and carry on regardless: the FAT resize happily rewrote the BPB for twice
+/// the clusters, `resize complete` printed, and the process exited 0 (R-021).
+///
+/// The two cases are not the same, so they are no longer treated the same:
+///
+/// - **The volume is the whole file** (a bare superfloppy in a plain image).
+///   Nothing else lives there and there is no table to keep in step, so
+///   appending zeros *is* what the caller asked for. Do it, then resize into it.
+/// - **Anything else** — a partition inside a larger disk, a decoded container.
+///   Its length is set by something we are not editing here, so overrunning it
+///   is corruption. Refuse and name the verb that can move the boundary.
+fn grow_container_or_refuse(
+    file: &mut crate::rbformats::BoxRwSeek,
+    ctx: &crate::cli::resolve::PartitionContext,
+    new_size: u64,
+) -> Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+
+    if ctx.whole_file_path.is_none() {
+        return Err(crate::cli::exit::usage(format!(
+            "requested size {} exceeds the {} available at partition offset {}. \
+             Resizing the filesystem alone would describe blocks the partition does not \
+             have. Move the boundary first with `rb-cli partmap resize`, or grow the \
+             whole disk with `rb-cli grow IMG --add SIZE`, then resize again.",
+            format_size(new_size),
+            format_size(ctx.size),
+            ctx.offset,
+        )));
+    }
+
+    let add = new_size - ctx.size;
+    log_stderr(format!(
+        "growing the image by {} to {} before resizing (the volume is the whole file)",
+        format_size(add),
+        format_size(new_size),
+    ));
+    file.seek(SeekFrom::End(0))
+        .context("seeking to end of image to grow it")?;
+    // 1-MiB chunks so a very large grow doesn't allocate a buffer to match.
+    let chunk = vec![0u8; 1024 * 1024];
+    let mut remaining = add;
+    while remaining > 0 {
+        let n = remaining.min(chunk.len() as u64) as usize;
+        file.write_all(&chunk[..n]).context("growing image")?;
+        remaining -= n as u64;
+    }
+    file.flush().context("flushing grown image")?;
     Ok(())
 }
 

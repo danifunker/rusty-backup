@@ -22,7 +22,7 @@ finding depends on a fixture, the fixture is named.
 | [R-019](#r-019) | Low — **accepted** | `src/rbformats/vhd.rs` | VHD Creator Host OS makes output non-reproducible across platforms; behaviour kept, parity declares it |
 | [R-023](#r-023) | **High** | `src/cli/verbs/repack.rs` | `repack` loses every file in the volume |
 | [R-022](#r-022) | **High** | `src/fs/hpfs.rs` | HPFS sector-by-sector backup -> restore is not byte-identical |
-| [R-021](#r-021) | **High** | `src/cli/verbs/resize.rs` | `resize --size` reports success and changes nothing |
+| ~~R-021~~ | ~~**High**~~ **FIXED** | `src/cli/verbs/resize.rs` | ~~`resize --size` reports success and changes nothing~~ — grows the file when the volume is the file, refuses otherwise, 2026-08-09 |
 | [R-024](#r-024) | Medium | `src/fs/affs.rs` | AFFS `put` leaves the volume failing its own fsck |
 | ~~R-025~~ | ~~Medium~~ **FIXED** | `src/fs/squashfs_edit.rs` | ~~`squashfs put` fails to replace the image on Windows~~ — handle released before the rename, 2026-08-08 |
 | ~~R-026~~ | ~~Low~~ **FIXED** | `src/cli/verbs/show.rs` | ~~`show partmap` cannot read an SGI disk that `inspect` reads fine~~ — detects the table first, 2026-08-08 |
@@ -231,6 +231,36 @@ the surface COMMAND-COVERAGE.md showed was untested. Recorded, not diagnosed:
 each names its reproduction and stops there.
 
 ### R-021 — `resize --size` reports success and does nothing {#r-021}
+
+**FIXED 2026-08-09**, and it was not quite a no-op — which is worse. `resize`
+warned "the FS may refuse", then proceeded: the FAT resize rewrote the BPB for
+16303 clusters, appended 32 KB of new FAT sectors, printed `resize complete`
+and exited 0. The result was a filesystem describing twice the blocks its
+container held. `inspect` still said 8 MiB because the file length is what a
+superfloppy's size comes from, which is what made it look like nothing had
+happened.
+
+The warning was the bug. Two situations were being treated as one:
+
+- **The volume is the whole file** — a bare superfloppy in a plain image.
+  Nothing else lives there and there is no table to keep in step, so appending
+  zeros *is* what the caller asked for. `resize` now grows the image first,
+  then resizes into it. `PartitionContext::whole_file_path` is exactly this
+  condition and already existed.
+- **Anything else** — a partition inside a larger disk, a decoded container.
+  Its length is set by something `resize` is not editing, so overrunning it is
+  corruption. Now a hard refusal, exit 2, naming `partmap resize` and `grow` as
+  the verbs that can move the boundary.
+
+Verified both ways: an 8 MiB FAT superfloppy with a file in it grows to 16 MiB,
+fsck-clean, file intact; an X68k partition asked for 64 MiB in a 16 MiB slot is
+refused with the image byte-for-byte untouched and its three files still there.
+
+Growing only. A shrink still leaves the file at its old length rather than
+truncating — trailing slack, not damage, and truncation is irreversible enough
+that it should be asked for rather than inferred.
+
+---
 
 ```
 rb-cli new volume fat --size 8M v.img
@@ -1273,6 +1303,7 @@ Run `rb-regress run --tiers 0-4` to check them all.
 | R-001 | `doc_parity::readme_documents_every_partition_table_scheme` | **green — fixed** |
 | R-002 | `doc_parity::fs_readme_has_no_hand_kept_capability_table` | **green — fixed** |
 | R-018 | `doc_parity::contributing_vintage_features_match_ci` | **green — fixed** |
+| R-021 | `resize.to-explicit-size` | **green — fixed** |
 | R-017 | `fs.detect.sfs-bare-volume` | **green — fixed** |
 | R-025 | `subcmd.squashfs.put-rebuilds`, `meta.xattr.set-list-rm` | red — Windows only |
 | R-026 | `subcmd.show.partmap` | **green — fixed** |
