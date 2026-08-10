@@ -2168,10 +2168,15 @@ fn extract_to_tar(
         tar_walk(fs, root, target, recursive, &mut b, &mut count)?;
         b.into_inner()?.finish()?;
     } else if name.ends_with(".tar.zst") || name.ends_with(".tzst") {
-        let enc = zstd::stream::write::Encoder::new(file, 0)?.auto_finish();
+        // Through the backend shim, not the `zstd` crate: the MiSTer armv7 build
+        // has `optical` on and `native-zstd` off (it uses `pure-zstd`), so naming
+        // the C crate here fails to compile there. `fs::tar_export` does the same
+        // job the same way.
+        let enc = crate::rbformats::zstd_compat::ZstdEncoder::new(file, 0)
+            .context("init zstd encoder")?;
         let mut b = tar::Builder::new(enc);
         tar_walk(fs, root, target, recursive, &mut b, &mut count)?;
-        b.into_inner()?;
+        b.into_inner()?.finish().context("finishing zstd stream")?;
     } else {
         let mut b = tar::Builder::new(file);
         tar_walk(fs, root, target, recursive, &mut b, &mut count)?;

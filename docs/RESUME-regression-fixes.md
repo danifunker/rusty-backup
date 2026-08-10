@@ -149,6 +149,25 @@ annex copy is independent, so the drop can be deleted whenever.
 - Pre-commit runs `clippy --all-targets -- -D warnings` and does `git add -u`,
   which bundles every modified file — stash-dance for per-phase commits.
 - Commit per phase (3-5 a session). **Never push without being asked.**
+- **After a push, check CI and drive it green.** `gh run list` / `gh run view
+  <id>`. A green `rb-regress run` is not a green pipeline, and this was learned
+  the hard way — a push on 2026-08-09 turned Release red and nobody noticed
+  until it was mentioned in passing. Three specifics:
+  - CI's test step is **`cargo test --release`**, not `cargo test`. Run that
+    before pushing. (macOS x64 skips tests — it is cross-compiled — so only the
+    arm64 macOS job exercises them there.)
+  - **`gh run list` saying "success" does not mean every job passed.** Jobs
+    marked `continue-on-error: true` — the MiSTer `rb-cli-mini` build is one —
+    fail silently without reddening the run. Read the job list from
+    `gh run view <id>`. The mini build was broken for a full day that way.
+  - **Non-default feature sets are not covered locally.** The MiSTer one is
+    `cargo check --bin rb-cli --no-default-features --features
+    chd,pure-zstd,remote,optical,tui`. Anything touching zstd must go through
+    `crate::rbformats::zstd_compat`, never the `zstd` crate directly, or it
+    compiles on the desktop and breaks there.
+- **Platform-dependent std APIs are the other thing local runs miss.**
+  `Path::file_name` treats `\` as a separator only on Windows, which is how a
+  Windows-path assertion passed locally and failed on every Unix job.
 - Nothing private in the repo: corpus paths, machines and addresses live in
   gitignored `regression-tests/local.toml` only.
 - Windows: use `C:\Windows\System32\OpenSSH\ssh.exe`, not Git Bash ssh, with

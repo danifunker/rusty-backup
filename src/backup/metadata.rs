@@ -22,12 +22,21 @@ pub fn normalize_source_device(source: &str) -> String {
     if is_device {
         return source.to_string();
     }
-    std::path::Path::new(source)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        // A path with no file name (a bare root, or a trailing separator) has
-        // nothing to reduce to; keeping it is better than an empty field.
-        .unwrap_or_else(|| source.to_string())
+    // Both separators, on every host. `Path::file_name` only treats `\` as one
+    // on Windows, so a Windows path normalised on Linux kept its directories —
+    // which is the exact leak this function exists to close, and made the field
+    // depend on which OS ran the backup.
+    let leaf = source
+        .rsplit(['/', '\\'])
+        .find(|part| !part.is_empty())
+        .unwrap_or(source);
+    // A path with no file name (a bare root, or only separators) has nothing to
+    // reduce to; keeping the original beats an empty field.
+    if leaf.is_empty() {
+        source.to_string()
+    } else {
+        leaf.to_string()
+    }
 }
 
 /// Backup folder layout. Selects how partition data is stored on disk.
@@ -287,6 +296,23 @@ mod tests {
         // Nothing to reduce to — keeping it beats emptying the field.
         assert_eq!(normalize_source_device("/"), "/");
         assert_eq!(normalize_source_device(""), "");
+        assert_eq!(normalize_source_device(r"\\"), r"\\");
+    }
+
+    #[test]
+    fn normalize_source_device_is_the_same_answer_on_every_host() {
+        // This test is why CI went red: the first version used
+        // `Path::file_name`, which only treats `\` as a separator on Windows,
+        // so a Windows path normalised on Linux kept every directory. The
+        // whole point of the field is that two machines agree.
+        assert_eq!(
+            normalize_source_device(r"C:\Users\someone\images\disk.img"),
+            "disk.img"
+        );
+        assert_eq!(normalize_source_device(r"D:\disk.img"), "disk.img");
+        // A trailing separator must not yield an empty label.
+        assert_eq!(normalize_source_device("/srv/images/"), "images");
+        assert_eq!(normalize_source_device(r"C:\images\"), "images");
     }
 
     #[test]

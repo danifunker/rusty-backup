@@ -334,6 +334,41 @@ That feature list is exactly what CI's Windows vintage leg builds (`.github/work
 
 The definitive check is an actual `rustup toolchain install 1.73.0` build of that manifest; the command above is the cheap proxy that catches the wiring mistakes (wrong shim path, raw `io::Error::other` left in, unused imports).
 
+### The pipeline builds more than your machine does
+
+A green `cargo test` and a green `rb-regress run` are not a green pipeline. Two
+classes of breakage are invisible locally, and both have shipped:
+
+**1. CI tests in release mode.** The workflow's test step is `cargo test
+--release`, not `cargo test`. Run that before pushing.
+
+**2. CI builds feature sets you don't.** The MiSTer armv7 binary is built with
+`optical` on and `native-zstd` off:
+
+```bash
+cargo check --bin rb-cli --no-default-features --features chd,pure-zstd,remote,optical,tui
+```
+
+Anything touching zstd must go through `crate::rbformats::zstd_compat`, never
+the `zstd` crate directly — naming the C crate compiles on the desktop and
+fails there. `src/fs/tar_export.rs` is the reference call site.
+
+**Read the job list, not the run conclusion.** Several jobs are
+`continue-on-error: true` (the MiSTer `rb-cli-mini` build among them), so they
+can fail while `gh run list` still reports the run as `success`. Use:
+
+```bash
+gh run view <run-id>
+```
+
+The mini build was broken for a day behind a green-looking run because of
+exactly this.
+
+**Platform-dependent std APIs** are the third trap, and the regression suite
+cannot see them either: `Path::file_name` treats `\` as a separator only on
+Windows, so a Windows-path assertion passed on the dev machine and failed on
+every Unix job.
+
 ### mrustc mis-lowers `leading_zeros` / `leading_ones` on narrow integers
 
 The PowerPC build (`rb-cli-ppc`, via mrustc's C backend — see `scripts/build-ppc.sh`)
