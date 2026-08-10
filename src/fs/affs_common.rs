@@ -17,6 +17,15 @@ pub const BSIZE_U64: u64 = BSIZE as u64;
 pub const HT_SIZE: usize = 72;
 /// Number of bitmap-block pointers stored inline in the root block.
 pub const BM_PAGES_ROOT: usize = 25;
+/// Bit words in one bitmap block: 128 longs, less the leading checksum.
+pub const BITMAP_WORDS_PER_BLOCK: usize = 127;
+/// Blocks one bitmap block accounts for. A volume larger than this needs
+/// several, chained through the root's `bm_pages` and then extension blocks —
+/// assuming one covers the whole volume is what R-008a/R-008b were.
+pub const BITMAP_BITS_PER_BLOCK: usize = BITMAP_WORDS_PER_BLOCK * 32;
+/// Bitmap-page pointers in one bitmap extension block: 128 longs, less the
+/// trailing pointer to the next extension block.
+pub const BM_EXT_PAGES: usize = 127;
 /// Number of data-block pointers per file header / extension block.
 pub const MAX_DATA_BLOCKS: usize = 72;
 /// Maximum file/dir name length on AFFS (DOS\0..DOS\5).

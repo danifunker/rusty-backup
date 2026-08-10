@@ -23,11 +23,11 @@ finding depends on a fixture, the fixture is named.
 | ~~R-023~~ | ~~**High**~~ **FIXED** | `src/cli/verbs/repack.rs` | ~~`repack` loses every file in the volume~~ — scope guard; nothing was lost, a FAT long filename was dropped, 2026-08-09 |
 | ~~R-022~~ | ~~**High**~~ **FIXED** | `src/partition/mod.rs` | ~~HPFS sector-by-sector backup -> restore is not byte-identical~~ — detection, not fidelity: a bare HPFS volume backed up to nothing at all. Probe added, 2026-08-09 |
 | ~~R-021~~ | ~~**High**~~ **FIXED** | `src/cli/verbs/resize.rs` | ~~`resize --size` reports success and changes nothing~~ — grows the file when the volume is the file, refuses otherwise, 2026-08-09 |
-| [R-024](#r-024) | Medium | `src/fs/affs.rs` | AFFS `put` leaves the volume failing its own fsck |
+| ~~R-024~~ | ~~Medium~~ **FIXED** | `src/fs/affs.rs` | ~~AFFS `put` leaves the volume failing its own fsck~~ — was the truncated bitmap, not the editor; same fix, 2026-08-10 |
 | ~~R-025~~ | ~~Medium~~ **FIXED** | `src/fs/squashfs_edit.rs` | ~~`squashfs put` fails to replace the image on Windows~~ — handle released before the rename, 2026-08-08 |
 | ~~R-026~~ | ~~Low~~ **FIXED** | `src/cli/verbs/show.rs` | ~~`show partmap` cannot read an SGI disk that `inspect` reads fine~~ — detects the table first, 2026-08-08 |
 | ~~R-027~~ | ~~Medium~~ **FIXED** | `src/rbformats/zip_disk.rs` | ~~A Finder-made `.zip` holding one `.dmg` is rejected as ambiguous~~ — extension list derived from the canonical one, 2026-08-08 |
-| [R-030](#r-030) | **High** | `src/fs/affs.rs` | A real Workbench 1.3 AFFS volume cannot be opened at all — read, fsck and write alike |
+| ~~R-030~~ | ~~**High**~~ **FIXED** | `src/fs/affs.rs` | ~~A real Workbench 1.3 AFFS volume cannot be opened at all~~ — the root block was located from the end of the file, not the partition, 2026-08-10 |
 | [R-029](#r-029) | **High** | `src/fs/efs.rs` | EFS computes block addresses far outside the image; `fsck` fails on an unmodified volume |
 | [R-031](#r-031) | Medium | `src/partition/mod.rs` | A real Apple DOS 3.3 disk is detected as `unknown`, though our own output is not |
 | [R-028](#r-028) | Medium | `src/fs/apple_dos.rs` | Apple DOS 3.3 reports three different sizes for one file: 104 in, 512 by `ls`, 256 by `get` |
@@ -43,12 +43,12 @@ finding depends on a fixture, the fixture is named.
 | ~~R-017~~ | ~~High~~ **FIXED** | `src/partition/mod.rs` | ~~Superfloppy detection also misses SFS (extends R-009)~~ — probe added 2026-08-07 |
 | [R-015](#r-015) | Medium | `src/optical/` (cue parser) | A `.cue` with unpadded track numbers (`TRACK 1`) is rejected |
 | ~~R-014~~ | ~~Blocker~~ **FIXED** | `src/cli/verbs/squashfs.rs` | ~~Pre-existing clippy failure blocks every commit via the pre-commit hook~~ — boxed 2026-08-07 |
-| [R-008b](#r-008b) | **High** | `src/fs/affs.rs` | `new volume affs --size 4M` panics; no file produced, exit 101 |
+| ~~R-008b~~ | ~~**High**~~ **FIXED** | `src/fs/affs.rs` | ~~`new volume affs --size 4M` panics; no file produced, exit 101~~ — the formatter writes as many bitmap pages as the volume needs, 2026-08-10 |
 | ~~R-007~~ | ~~High~~ **FIXED** | `src/fs/ntfs_format.rs` | ~~Freshly formatted NTFS fails its own fsck~~ — verified clean 2026-08-07 |
 | ~~R-009~~ | ~~High~~ **FIXED** | `src/partition/mod.rs` | ~~Bare JFS / UFS1 / UFS2 / ReiserFS images cannot be opened at all~~ — probes added 2026-08-07 |
 | [R-013](#r-013) | **High** | `src/fs/ufs.rs` | Solaris UFS directories reported as files, one with a garbage size |
 | ~~R-005~~ | ~~Medium~~ **FIXED** | `src/cli/output.rs` | ~~No error envelope emitted under `--format json`~~ — format recorded before dispatch, envelope emitted from `main`, 2026-08-09 |
-| [R-008a](#r-008a) | Medium | `src/fs/affs.rs` | AFFS volumes above 4066 blocks have uncovered tail blocks |
+| ~~R-008a~~ | ~~Medium~~ **FIXED** | `src/fs/affs.rs` | ~~AFFS volumes above 4066 blocks have uncovered tail blocks~~ — same fix as R-008b, 2026-08-10 |
 | ~~R-012~~ | ~~Medium~~ **FIXED** | upstream `opticaldiscs` | ~~`optical info` rejects any disc with no data track (pure CD-DA)~~ — fixed upstream, pin bumped to 0.15.0, 2026-08-10 |
 | ~~R-003~~ | ~~Medium~~ **FIXED** | `src/cli/output.rs` | ~~Docs claim `ls` supports `--format`; it does not~~ — flag implemented, all five formats, 2026-08-09 |
 | ~~R-010~~ | ~~Medium~~ **FIXED** | `src/cli/verbs/inspect.rs` | ~~`inspect` has no `--fs-type`, so CP/M images cannot be inspected~~ — flag added and honoured, 2026-08-08 |
@@ -385,6 +385,14 @@ Exit 0, and the data is gone. Case `resize.repack.keeps-data`.
 
 ### R-024 — AFFS `put` leaves the volume failing its own fsck {#r-024}
 
+**FIXED 2026-08-10 — and this report's diagnosis was wrong.** It reads "this is
+the editor, not the formatter" and says to keep it separate from R-008. It was
+the formatter: `put` allocated into blocks past the end of the single bitmap
+page R-008a describes, and fsck correctly reported a bitmap that disagreed with
+the directory walk. Fixing the formatter's bitmap sizing turned this case green
+with no change to the edit path. See [R-008a](#r-008a).
+
+
 A single `put` into a freshly formatted 3 MB AFFS volume — the largest size
 R-008 leaves working — makes `fsck --checkonly` report
 `1 error(s), 1 warning(s) (some repairable)`. The file reads back correctly,
@@ -504,6 +512,30 @@ Case `read.apfs.apple-gpt`.
 ## High
 
 ### R-020 — every AFFS volume we write is unmountable on a real Amiga {#r-020}
+
+**Hypothesis CONFIRMED 2026-08-10, and the formatter half fixed.** This entry
+recorded "root block `header_key` must be 0 and we write the block number" as
+**unconfirmed**, needing an emulator. It did not: a real disk answers it. The
+Workbench 1.3 fixture admitted for [R-030](#r-030) has a root block reading
+
+```
+REAL Workbench1.3 root :  type=2  header_key=0     secType=1
+OUR 4M volume root     :  type=2  header_key=4096  secType=1
+```
+
+`create_blank_affs` now writes 0. Volumes still format, fsck clean, and accept
+a `put` that reads back.
+
+**Still open, and still needs an oracle.** That a correct `header_key` makes the
+volume *mount* on a real Amiga is a separate claim, and no automated run here
+can make it — all 62 emulator / MiSTer-core oracles are `skip-manual`. What has
+changed is that the remaining question is "does this fix it", not "is the
+hypothesis right". The other half of the entry — that `affs_fsck` agrees with
+the formatter and is wrong the same way — found nothing to change: fsck never
+inspected the root's `header_key` at all.
+
+---
+
 
 Found 2026-08-07 by the first FS-UAE emulator-oracle run — the first result
 from an oracle that is not a command-line tool, and the reason that oracle
@@ -883,6 +915,41 @@ finding, not a case failure; `fmt.cbk` is produced by `produce.toml` and
 
 ### R-030 — a real Workbench 1.3 AFFS volume cannot be opened at all {#r-030}
 
+**FIXED 2026-08-10.** Neither OFS-vs-FFS nor an older root-block layout — two
+of the three readings this entry asked to distinguish. It was arithmetic.
+
+AFFS records its size nowhere: the root block sits at the volume's midpoint, so
+the root block's *position* is the size. `AffsFilesystem::open` derived the
+block count from `seek(End) - partition_offset`, i.e. the end of the **file**.
+For a bare ADF that is the end of the volume. For a partition inside an RDB
+disk it is the end of the disk, so the candidate lands past the real root:
+
+```
+partition: 4040 blocks at LBA 2020        -> true root block 2020 ("Workbench1.3")
+computed from the file tail (4124 blocks) -> 2062, not a root block
+```
+
+The candidate is always an upper bound, so `locate_root_block` steps down from
+it until a block validates on tag, secType, hash-table size **and its own
+checksum** — a loose check would mount a directory block as the volume. The
+search is bounded (2048 blocks) so a non-AFFS partition cannot become a
+whole-disk scan, and every bare ADF and superfloppy still hits on the first
+try. `total_blocks` is then trusted from the root's position rather than the
+reader's length.
+
+`rb-cli ls` walks the real disk; `fsck --checkonly` reports 337 files / 31 dirs
+clean.
+
+**The architectural note.** The real fix is for the read-open path to carry the
+partition length, which the resolver already knows (`ctx.size`) and the *write*
+path already threads (`EditContext::partition_len`). AFFS is the only driver
+that cares today, being the only one that derives its geometry rather than
+reading it from a superblock — so the search is a contained workaround, not the
+end state.
+
+---
+
+
 Found 2026-08-08, the first time the tier-3 edit cases were executed against
 the reference volumes rather than against volumes we had formatted ourselves.
 
@@ -1128,6 +1195,41 @@ A JSON consumer gets no parseable output on exactly the path the envelope
 exists to serve.
 
 ### R-008a — AFFS tail blocks above 4066 are uncovered {#r-008a}
+
+**FIXED 2026-08-10. One fix closed R-008a, R-008b and R-024**, which the bug
+list had filed as three problems across two components.
+
+One bitmap block holds 127 words of bits, so it accounts for 4064 blocks. The
+formatter wrote exactly one, whatever the volume size. A 4 MB volume is 8192
+blocks, so marking the root block in use computed word index 128 and indexed
+`bm[512..516]` in a 512-byte block — the panic, exit 101, no file (R-008b).
+Below the panic threshold the same bug was silent: every block past 4066 simply
+had no bit, so the allocator could hand out blocks the bitmap did not describe
+(R-008a).
+
+**R-024 was the same bug wearing a third hat.** "One `put` into a fresh 3 MB
+volume makes `fsck --checkonly` report errors" was filed against the *editor*,
+with the note that R-008 was the formatter and the two were distinct. They were
+not: `put` allocated into the uncovered tail, and fsck correctly reported a
+bitmap that disagreed with the directory walk. Nothing in the editor was wrong.
+It went green with no change to the edit path at all.
+
+The formatter now computes `ceil((total_blocks - 2) / 4064)` pages, writes them
+all, records the first 25 in the root block's `bm_pages`, and chains any beyond
+that through bitmap extension blocks (127 pointers plus a `next` each). Bits
+past the end of the volume are cleared in the final page so the allocator can
+never hand out a block that does not exist.
+
+Verified at 1M, 3M, 4M, 8M and 32M: all create, all fsck clean. Five cases went
+green — `fs.new-volume.affs{,.4m,.32m,.bitmap-boundary-plus-one}` and
+`edit.affs.put-get`.
+
+Note this does **not** address [R-020](#r-020): these volumes are still
+"Not a DOS disk" on a real Amiga, and that needs an emulator or hardware oracle
+to confirm either way.
+
+---
+
 
 One AFFS bitmap block covers `(512 - 4) / 4 * 32 = 4064` bits, addressing
 blocks 2..4065. `src/fs/affs.rs` writes exactly one, commented "the bitmap
@@ -1614,10 +1716,11 @@ Run `rb-regress run --tiers 0-4` to check them all.
 | R-005 | `cli.envelope.error-envelope-on-failure` | **green — fixed** |
 | R-006 | `fs.new-volume.prodos-default-name` | **green — fixed** |
 | R-007 | `fs.new-volume.ntfs{,.2m-fsck,.32m-fsck}` | **green — fixed** |
-| R-008a | `fs.new-volume.affs.bitmap-boundary-plus-one` | red |
-| R-008b | `fs.new-volume.affs.{4m,32m}` | red |
+| R-008a | `fs.new-volume.affs{,.bitmap-boundary-plus-one}` | **green — fixed** |
+| R-008b | `fs.new-volume.affs.{4m,32m}` | **green — fixed** |
 | R-009 | `fs.read.{jfs,reiserfs,ufs1,ufs2}` | **green — fixed** |
 | R-010 | `cli.flags.inspect-accepts-fs-type` | **green — fixed** |
+| R-030 | `edit.real.affs-workbench13` | **green — fixed** |
 | R-011 | `fmt.g64.standard-dump-opens` | green — **pins the working half only** |
 | R-012 | `optical.cdda.no-data-track-opens` | **green — fixed upstream** |
 | R-013 | `fs.detect.ufs-{solaris-entry-types,no-absurd-sizes}` | red |

@@ -46,23 +46,6 @@ finding = "F-008"
 id = "backup.container.vmdk-sparse"
 finding = "F-008"
 
-# --- R-008a / R-008b — AFFS bitmap and panic ---------------------------------
-# Note R-020 says every AFFS volume we write is unmountable on a real Amiga at
-# any size, so these three are the *visible* part of a deeper problem. They stay
-# separate because they fail for the reasons R-008 describes, which a fix for
-# R-020 alone would not address.
-[[known]]
-id = "fs.new-volume.affs"
-finding = "R-008a"
-[[known]]
-id = "fs.new-volume.affs.4m"
-finding = "R-008b"
-[[known]]
-id = "fs.new-volume.affs.32m"
-finding = "R-008b"
-[[known]]
-id = "fs.new-volume.affs.bitmap-boundary-plus-one"
-finding = "R-008a"
 
 
 # --- R-013 — Solaris UFS entry types and sizes -------------------------------
@@ -73,10 +56,6 @@ finding = "R-013"
 id = "fs.detect.ufs-no-absurd-sizes"
 finding = "R-013"
 
-# --- Found by the tier-3 sweep, 2026-08-08 -----------------------------------
-[[known]]
-id = "edit.affs.put-get"
-finding = "R-024"
 
 
 # `read.optical.chdcd.audio-test` was listed here as a second R-012 case. It
@@ -88,9 +67,6 @@ finding = "R-024"
 # --- Found 2026-08-08, first execution of the tier-3 sweep -------------------
 # None of these had ever run: the last full Windows run predates the tier-2 and
 # tier-3 authoring commits, so it covered 134 of 256 cases and reported green.
-[[known]]
-id = "edit.real.affs-workbench13"
-finding = "R-030"
 [[known]]
 id = "edit.real.efs-small"
 finding = "R-029"
