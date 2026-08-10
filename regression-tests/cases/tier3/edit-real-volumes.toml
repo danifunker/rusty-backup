@@ -233,8 +233,10 @@ Corrected 2026-08-10. This asserted a put/get round-trip plus a clean fsck, and
 R-029 was filed when both failed at byte offsets far outside the image. The
 engine was right and the fixture is broken: its superblock declares 7,486,242
 blocks across 78 cylinder groups (3.8 GB) while the file is 8,192 blocks (4 MB).
-It was minimised by truncation — the catalogue still says `synthetic-minimal` —
-leaving a superblock that describes a volume which is not there.
+That is deliberate: it is the first 4 MB of a real IRIX 5.3 disk, kept as a
+prefix so `src/fs/efs.rs`'s superblock and read tests have ground truth (15 call
+sites). A prefix cannot support a write or a whole-volume fsck — those need
+every cylinder group present.
 
 Reads inside the surviving prefix work, so that is what this case pins. Editing
 EFS on a real volume needs an internally consistent fixture; see R-029."""

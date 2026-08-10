@@ -28,7 +28,7 @@ finding depends on a fixture, the fixture is named.
 | ~~R-026~~ | ~~Low~~ **FIXED** | `src/cli/verbs/show.rs` | ~~`show partmap` cannot read an SGI disk that `inspect` reads fine~~ — detects the table first, 2026-08-08 |
 | ~~R-027~~ | ~~Medium~~ **FIXED** | `src/rbformats/zip_disk.rs` | ~~A Finder-made `.zip` holding one `.dmg` is rejected as ambiguous~~ — extension list derived from the canonical one, 2026-08-08 |
 | ~~R-030~~ | ~~**High**~~ **FIXED** | `src/fs/affs.rs` | ~~A real Workbench 1.3 AFFS volume cannot be opened at all~~ — the root block was located from the end of the file, not the partition, 2026-08-10 |
-| ~~R-029~~ | ~~**High**~~ **FIXTURE DEFECT** | — | ~~EFS computes block addresses far outside the image~~ — the fixture is a truncated capture; the engine was following its superblock, 2026-08-10 |
+| ~~R-029~~ | ~~**High**~~ **NOT A DEFECT** | — | ~~EFS computes block addresses far outside the image~~ — a deliberate 4 MB prefix capture; the case asked it to do what a prefix cannot, 2026-08-10 |
 | ~~R-031~~ | ~~Medium~~ **NOT A DEFECT** | — | ~~A real Apple DOS 3.3 disk is detected as `unknown`~~ — the disk carries no filesystem at all; `Unknown` is correct, 2026-08-10 |
 | ~~R-028~~ | ~~Medium~~ **FIXED** | `src/fs/apple_dos.rs` | ~~Apple DOS 3.3 reports three different sizes for one file~~ — length stored in a type-B header; all three now agree, 2026-08-10 |
 | ~~R-032~~ | ~~Low~~ **RECLASSIFIED** | `src/fs/sfs.rs` | ~~SFS `put` fails on any volume with a multi-leaf extent btree~~ — the documented ceiling; moved to [F-009](missing_features_from_regression.md#f-009), 2026-08-10 |
@@ -1033,8 +1033,21 @@ bitmap spanning the declared size, so both run off the end — at byte 50,065,40
 and byte 344,826,880 respectively, which is what the entry recorded as the
 symptom.
 
-The catalogue still marks the fixture `synthetic-minimal`: it was minimised by
-truncation, and truncating a filesystem does not shrink it, it breaks it.
+**Correction to the first version of this note**, which called the fixture
+"broken" and blamed truncation. It is a *deliberate prefix capture*, and this
+project does that on purpose: `fs.efs.small.hd` is the first 4 MB of a real
+IRIX 5.3 disk, and `src/fs/efs.rs` has 15 unit-test call sites that read it —
+`parses_superblock_from_fixture` asserts the full disk's `fs_size` of 7,486,242
+precisely because that is what the original volume says. The same convention is
+documented for XFS in `docs/SGI_Filesystems_irix_sb.txt`: "dblocks claims a
+93 GiB partition but we only extracted the first 64 MiB. Superblock 0 is at
+offset 0 and unaffected."
+
+So the fixture does exactly what it was built for — superblock and read
+parsing — and the catalogue's `synthetic-minimal` is accurate. What was wrong
+is the *case*, which asked a 4 MB prefix to support a write and a whole-volume
+fsck. Those need every cylinder group present; nothing about a prefix capture
+promises that.
 
 **Two things did change.** `EfsFilesystem::open` now compares the declared size
 against what is actually present and warns when the image is short, naming both
