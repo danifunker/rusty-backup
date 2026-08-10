@@ -86,6 +86,84 @@ args = ["inspect", "{scratch}/v.img"]
 expect_exit = 0
 stdout_contains = ["16.0 MiB"]
 
+# --- shrink (R-037) -----------------------------------------------------------
+# A shrink used to rewrite the FAT for the smaller volume with live data still
+# beyond it, print "resize complete" and exit 0. `get` then returned a silently
+# truncated file, also exiting 0. These three pin the whole decision: refuse
+# what would cut data, refuse what was not asked for, and keep the data when it
+# does run.
+
+[[case]]
+id = "resize.shrink.refuses-cutting-live-data"
+description = """R-037: a shrink below where the data ends must be refused,
+--confirm-shrink or not.
+
+The volume is filled with a 40M zero-allocation so the data genuinely extends
+past the 16M target. An earlier draft of this case put the 104-byte payload in
+a 64M volume and shrank to 1M, expecting a refusal — the guard allowed it, and
+was right to: the file ends around 150 KB, so 1M is beyond it and the data
+survived. The guard reads `last_data_byte`; the case has to make the data
+actually reach past the target rather than assume it does."""
+[[case.step]]
+args = ["new", "volume", "fat", "--size", "64M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "--zero", "41943040", "--dst", "/BIG.BIN"]
+expect_exit = 0
+[[case.step]]
+args = ["resize", "{scratch}/v.img", "--size", "16M", "--confirm-shrink"]
+expect_exit = 2
+stderr_contains = ["refusing to shrink"]
+# The refusal must be a refusal: the image keeps its length and its file.
+[[case.step]]
+args = ["inspect", "{scratch}/v.img"]
+expect_exit = 0
+stdout_contains = ["64.0 MiB"]
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+
+[[case]]
+id = "resize.shrink.needs-confirmation"
+description = "R-037: a safe shrink still needs --confirm-shrink, because truncation is not reversible"
+[[case.step]]
+args = ["new", "volume", "fat", "--size", "64M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["resize", "{scratch}/v.img", "--size", "40M"]
+expect_exit = 2
+stderr_contains = ["--confirm-shrink"]
+[[case.step]]
+args = ["inspect", "{scratch}/v.img"]
+expect_exit = 0
+stdout_contains = ["64.0 MiB"]
+
+[[case]]
+id = "resize.shrink.keeps-data-and-truncates"
+description = "R-037: a confirmed, safe shrink resizes the filesystem, truncates the image, and keeps every byte"
+[[case.step]]
+args = ["new", "volume", "fat", "--size", "64M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["resize", "{scratch}/v.img", "--size", "40M", "--confirm-shrink"]
+expect_exit = 0
+# The image is truncated, not just the filesystem — a superfloppy's reported
+# size is its file length, so this asserts both.
+[[case.step]]
+args = ["inspect", "{scratch}/v.img"]
+expect_exit = 0
+stdout_contains = ["40.0 MiB"]
+[[case.step]]
+args = ["get", "{scratch}/v.img", "/payload.bin", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+
 # --- repack -------------------------------------------------------------------
 
 [[case]]

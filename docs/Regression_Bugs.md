@@ -1,4 +1,4 @@
-# Regression Findings (R-001 … R-035)
+# Regression Findings (R-001 … R-037)
 
 Defects and documentation drift turned up while building the regression suite
 (`regression-tests/`), 2026-08-01/02. The suite work was deliberately kept
@@ -35,6 +35,8 @@ finding depends on a fixture, the fixture is named.
 | [R-033](#r-033) | **High** | `src/partition/mod.rs` | A QL Microdrive `.mdv` fails at MBR detection, though its own probe matches it exactly |
 | ~~R-034~~ | ~~Medium~~ **FIXED** | `src/fs/mod.rs` | ~~Refusing a write to a read-only filesystem says `unknown` and exits 1, not 4~~ — names the filesystem, exits 4, 2026-08-08 |
 | ~~R-035~~ | ~~Medium~~ **FIXED** | `src/backup/` | ~~`.cbk` embeds the producing host's absolute path, so it can never be byte-identical across machines~~ — path normalised to a leaf, 2026-08-09 |
+| [R-036](#r-036) | Medium | `src/cli/` | A missing image gets three different exit codes across the verb surface |
+| ~~R-037~~ | ~~**High**~~ **FIXED** | `src/cli/verbs/resize.rs` | ~~Shrinking rewrote the filesystem over live data and returned truncated files~~ — data floor + `--confirm-shrink` + truncation, 2026-08-09 |
 | [R-020](#r-020) | **High** | `src/fs/affs.rs` | `new volume affs` output is "Not a DOS disk" on a real Amiga, at every size |
 | ~~R-016~~ | ~~**High**~~ **RECLASSIFIED** | `src/cli/verbs/backup.rs` | ~~`backup` accepts only flat-layout sources: CHD, dynamic VHD, QCOW2 and VMDK all fail~~ — not a defect; moved to [F-008](missing_features_from_regression.md#f-008), 2026-08-09 |
 | ~~R-018~~ | ~~Blocker~~ **FIXED** | `CONTRIBUTING.md` | ~~The documented Rust-1.73 verification build does not compile on Windows~~ — missing `windows-legacy` feature, 2026-08-07 |
@@ -256,9 +258,10 @@ Verified both ways: an 8 MiB FAT superfloppy with a file in it grows to 16 MiB,
 fsck-clean, file intact; an X68k partition asked for 64 MiB in a 16 MiB slot is
 refused with the image byte-for-byte untouched and its three files still there.
 
-Growing only. A shrink still leaves the file at its old length rather than
-truncating — trailing slack, not damage, and truncation is irreversible enough
-that it should be asked for rather than inferred.
+Growing only, at the time. **That half of this note was wrong and is corrected
+by [R-037](#r-037):** a shrink was not "trailing slack, not damage". It rewrote
+the filesystem for the smaller size with live data still beyond it, and the
+files came back truncated. Shrinking is handled properly as of R-037.
 
 ---
 
@@ -1394,6 +1397,111 @@ it and point at the README.
 
 ---
 
+### R-036 — a missing image gets three different exit codes {#r-036}
+
+Found 2026-08-09 while closing R-005, which needed a verb whose missing-file
+failure had a settled exit code. `exit.rs` reserves `NOT_FOUND` (3) for exactly
+this — "image file missing" is the first example in its own doc comment — and
+[R-010](#r-010) made `inspect` obey it. Nothing else does:
+
+| verb | exit | message |
+|---|---|---|
+| `inspect` | **3** | `nosuch.img: no such file` |
+| `ls`, `fsck`, `du`, `get`, `resize`, `repack`, `backup`, `show fs-info` | **1** | `open nosuch.img: The system cannot find the file specified. (os error 2)` |
+| `locate`, `tar` | **2** | — |
+
+Three answers to one condition, and 2 is the actively wrong one: a usage error
+means the *command* was malformed, and `rb-cli tar missing.img out.tar` is a
+well-formed command naming a file that does not exist.
+
+Two things follow from the message, not just the code:
+
+- It is a raw `std::io::Error`, so the text is **platform-specific**. Windows
+  says "The system cannot find the file specified. (os error 2)"; Unix says "No
+  such file or directory (os error 2)". Any case asserting on it has to be
+  written per-platform or not at all.
+- It names the syscall (`open`) rather than the thing the user got wrong.
+  `inspect`'s "nosuch.img: no such file" is the shape to copy.
+
+**Why it matters.** This is the CLI contract the regression harness itself
+depends on: a script cannot tell "the disk is missing" from "the disk is
+corrupt" without switching on the code, which is the entire reason the table in
+`exit.rs` exists. It is also the cheapest class of fix left — `exit::not_found`
+already exists and is already used by `inspect`.
+
+Not yet cased. The natural shape is one case per verb in
+`cases/tier0/exit-codes.toml`, beside `cli.exit.missing-image-file`, which
+already pins `inspect` at 3.
+
+---
+
+### R-037 — `resize` cannot shrink safely, and shrinking destroyed data {#r-037}
+
+**FIXED 2026-08-09.** Found by reading [R-021](#r-021)'s closing note, which
+claimed a shrink left "trailing slack, not damage". It did not, and that note
+is corrected in place.
+
+The reproduction, on a 64 MB FAT volume holding a 30 MB file:
+
+```
+rb-cli resize v.img --size 16M
+  -> "FAT16: clusters 32695 -> 8119"
+     "resize complete", exit 0
+
+rb-cli get v.img /D30.BIN out.bin
+  -> exit 0, out.bin is 16,629,760 bytes   (the source is 30,720,000)
+
+rb-cli fsck v.img --checkonly
+  -> ERROR [ChainPointerInvalid] /D30.BIN: cluster 8120 has an invalid forward link
+     ERROR [SizeExceedsChain]    /D30.BIN: size claims 15000 clusters but only 8119 are allocated
+```
+
+The FAT was rewritten for the smaller volume while the file's chain still ran
+past the new end. `resize` exits 0, `ls` still reports the full size, and `get`
+**also exits 0** while returning a short file — so nothing in the chain tells
+the caller the data is gone. The image was never truncated either, so the
+freed space was not even given back: the operation managed to be destructive
+and useless at the same time.
+
+**The fix has three parts**, all in `src/cli/verbs/resize.rs`:
+
+1. **A data floor.** The filesystem is the only thing that knows where its data
+   ends, so it is asked: `Filesystem::last_data_byte` — "bytes from the
+   partition start needed to hold everything allocated". A shrink below that is
+   refused outright, `--confirm-shrink` or not, and the message names the
+   smallest safe size. The trait's default implementation returns `total_size`,
+   so a driver that does not override it refuses every shrink; that is the
+   correct default, because without an answer no shrink can be shown to be safe.
+2. **`--confirm-shrink`.** A shrink that *is* safe still truncates the image,
+   which cannot be undone, so it has to be asked for. Growing needs no flag.
+3. **Truncation.** After the filesystem resize commits, the image is truncated
+   to the new size — but only when the volume is the whole file
+   (`whole_file_path`), the same condition R-021 established for growing. A
+   partition inside a larger disk has data after it, so there the filesystem
+   shrinks and the image keeps its length, and the log says to follow up with
+   `partmap resize`.
+
+Verified in all three directions on a 64 MB FAT volume: shrinking to 16 MB with
+40 MB of data is refused (exit 2, image untouched, fsck clean); shrinking to
+40 MB without the flag is refused (exit 2, image untouched); shrinking to 40 MB
+with the flag resizes the filesystem, truncates the image to 40 MiB, and the
+file reads back byte-identical with a clean fsck.
+
+Cases: `resize.shrink.{refuses-cutting-live-data,needs-confirmation,keeps-data-and-truncates}`.
+
+**Two things this does not cover**, both deliberate and both worth a follow-up:
+
+- **The remote path.** `resize rb://host/img --size` goes through
+  `resize_remote_partition` and does not consult `last_data_byte`. Adding an
+  unverified guard to a path with no daemon running to test it against would be
+  worse than recording the gap.
+- **The GUI.** "Resize Partitions…" calls `resize_filesystem_for` directly, so
+  the floor lives in the CLI verb rather than in the shared engine. Per
+  CLAUDE.md's shared-logic rule the check belongs in a core module both
+  surfaces call; that refactor is larger than this fix.
+
+---
+
 ## Regression coverage
 
 Which finding is guarded by which case, so a fix cannot silently regress.
@@ -1421,6 +1529,8 @@ Run `rb-regress run --tiers 0-4` to check them all.
 | R-021 | `resize.to-explicit-size` | **green — fixed** |
 | R-023 | `resize.repack.{keeps-data,refuses-plain-fat}` | **green — fixed** |
 | R-022 | `roundtrip.hpfs.raw`, `fs.detect.hpfs-{bare-volume,backup-is-not-empty}` | **green — fixed** |
+| R-036 | none yet — one case per verb in `cases/tier0/exit-codes.toml` | **not covered** |
+| R-037 | `resize.shrink.{refuses-cutting-live-data,needs-confirmation,keeps-data-and-truncates}` | **green — fixed** |
 | R-017 | `fs.detect.sfs-bare-volume` | **green — fixed** |
 | R-025 | `subcmd.squashfs.put-rebuilds`, `meta.xattr.set-list-rm` | red — Windows only |
 | R-026 | `subcmd.show.partmap` | **green — fixed** |

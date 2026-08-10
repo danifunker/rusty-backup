@@ -1760,7 +1760,7 @@ Usage: repack [OPTIONS] <IMAGE>
 Resize the filesystem at IMG@N to a new size (FAT/NTFS/exFAT/HFS+/ ext/btrfs/SFS/PFS3/AFFS/EFS — whichever magic matches)
 
 ```
-Usage: resize --size <SIZE> <IMAGE>
+Usage: resize [OPTIONS] --size <SIZE> <IMAGE>
 ```
 
 **Arguments**
@@ -1770,6 +1770,7 @@ Usage: resize --size <SIZE> <IMAGE>
 **Options**
 
 - `--size` — New filesystem size in bytes. Accepts suffixes (`K`, `M`, `G`)
+- `--confirm-shrink` — Required to shrink. Growing needs no flag; shrinking truncates the image, which is not reversible, so it has to be asked for. A shrink that would cut into live data is refused with or without this
 
 ### `restore`
 
