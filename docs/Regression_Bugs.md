@@ -20,7 +20,7 @@ finding depends on a fixture, the fixture is named.
 | ID | Severity | Area | Finding |
 |----|----------|------|---------|
 | [R-019](#r-019) | Low — **accepted** | `src/rbformats/vhd.rs` | VHD Creator Host OS makes output non-reproducible across platforms; behaviour kept, parity declares it |
-| [R-023](#r-023) | **High** | `src/cli/verbs/repack.rs` | `repack` loses every file in the volume |
+| ~~R-023~~ | ~~**High**~~ **FIXED** | `src/cli/verbs/repack.rs` | ~~`repack` loses every file in the volume~~ — scope guard; nothing was lost, a FAT long filename was dropped, 2026-08-09 |
 | [R-022](#r-022) | **High** | `src/fs/hpfs.rs` | HPFS sector-by-sector backup -> restore is not byte-identical |
 | ~~R-021~~ | ~~**High**~~ **FIXED** | `src/cli/verbs/resize.rs` | ~~`resize --size` reports success and changes nothing~~ — grows the file when the volume is the file, refuses otherwise, 2026-08-09 |
 | [R-024](#r-024) | Medium | `src/fs/affs.rs` | AFFS `put` leaves the volume failing its own fsck |
@@ -281,6 +281,40 @@ to HPFS rather than to the backup format. `--sector-by-sector` asks for a
 faithful image, so any difference is a defect. Case `roundtrip.hpfs.raw`.
 
 ### R-023 — `repack` loses every file {#r-023}
+
+**FIXED 2026-08-09 — and the diagnosis in the original report was wrong.**
+Nothing was lost. `payload.bin` came back as `PAYLOAD.BIN`, and the `get` in
+the next step asked for the lowercase name and missed. Recording that, because
+"exit 0 and the data is gone" and "exit 0 and a filename changed case" call for
+different fixes, and only the second one was happening.
+
+The real defect is scope. `repack` is documented Human68k-only, but it opened
+`Human68kFilesystem` directly instead of asking how the read path had routed
+the volume — and a plain FAT16 superfloppy opens cleanly as Human68k, because
+the two share a BPB layout on purpose (`Human68kBpb::parse` accepts the
+standard little-endian MS-DOS form, which is what X68000 floppies use). So
+`repack` rebuilt a FAT volume through a driver with no long-filename concept.
+The short name is all the Human68k driver can see, and FAT short names are
+upper-case, so the LFN was dropped on the way through.
+
+`repack` now requires `type_string == Some("human68k")` — the same dispatch
+identity that chose the driver in the first place, and one that both shapes
+carry (X68k partition entries and bare Human68k superfloppies, which are gated
+on the 68000 `BRA.S` opcode). A plain FAT volume is refused with exit 2 and a
+message naming `resize` instead.
+
+Control, run both ways before believing any of this: `repack` on a real
+Human68k volume (`new hd x68k`, four files including a lowercase
+`payload.bin`) already worked perfectly — all four files, name case intact,
+byte-identical, fsck clean. That is what proved the clone sound and the input
+wrong.
+
+The case was rewritten deliberately: it built a plain FAT volume, which
+`repack` was never for. It now uses a real Human68k volume, and a new sibling
+`resize.repack.refuses-plain-fat` pins the input it used to accept — including
+that the refusal leaves the volume untouched, long filename and all.
+
+---
 
 ```
 rb-cli put v.img payload.bin /payload.bin
@@ -1304,6 +1338,7 @@ Run `rb-regress run --tiers 0-4` to check them all.
 | R-002 | `doc_parity::fs_readme_has_no_hand_kept_capability_table` | **green — fixed** |
 | R-018 | `doc_parity::contributing_vintage_features_match_ci` | **green — fixed** |
 | R-021 | `resize.to-explicit-size` | **green — fixed** |
+| R-023 | `resize.repack.{keeps-data,refuses-plain-fat}` | **green — fixed** |
 | R-017 | `fs.detect.sfs-bare-volume` | **green — fixed** |
 | R-025 | `subcmd.squashfs.put-rebuilds`, `meta.xattr.set-list-rm` | red — Windows only |
 | R-026 | `subcmd.show.partmap` | **green — fixed** |

@@ -46,6 +46,21 @@ pub fn run(args: RepackArgs) -> Result<()> {
     // validates that the selected partition is actually a Human68k volume.
     let (ro_file, ctx) = resolve_partition_ro(&args.image.path, args.image.partition.clone())?;
     log_stderr(&ctx.label);
+    // Opening the Human68k driver directly used to skip the routing decision the
+    // read path had already made, and a plain FAT16 volume opens cleanly as
+    // Human68k — the two share a BPB layout, which is deliberate (X68000
+    // floppies use the standard MS-DOS one). So `repack` silently rebuilt a FAT
+    // volume through a driver with no long-filename concept and `payload.bin`
+    // came back as `PAYLOAD.BIN` (R-023). Ask the dispatch instead.
+    if ctx.type_string.as_deref() != Some("human68k") {
+        return Err(crate::cli::exit::usage(format!(
+            "`repack` is for Human68k (X68000) volumes; the volume at offset {} is {}. \
+             A plain FAT volume opens as Human68k because the two share a BPB layout, but \
+             rebuilding it through the Human68k driver would drop every long filename. \
+             Use `rb-cli resize` to change a FAT volume's size.",
+            ctx.offset, ctx.type_name,
+        )));
+    }
     let mut source = Human68kFilesystem::open(ro_file, ctx.offset).map_err(|e| {
         anyhow::anyhow!(
             "partition at offset {} is not a Human68k volume: {e}",

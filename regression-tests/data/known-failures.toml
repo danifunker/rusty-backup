@@ -86,9 +86,6 @@ finding = "R-015"
 id = "roundtrip.hpfs.raw"
 finding = "R-022"
 [[known]]
-id = "resize.repack.keeps-data"
-finding = "R-023"
-[[known]]
 id = "edit.affs.put-get"
 finding = "R-024"
 
