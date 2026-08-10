@@ -30,7 +30,7 @@ finding depends on a fixture, the fixture is named.
 | ~~R-030~~ | ~~**High**~~ **FIXED** | `src/fs/affs.rs` | ~~A real Workbench 1.3 AFFS volume cannot be opened at all~~ — the root block was located from the end of the file, not the partition, 2026-08-10 |
 | [R-029](#r-029) | **High** | `src/fs/efs.rs` | EFS computes block addresses far outside the image; `fsck` fails on an unmodified volume |
 | [R-031](#r-031) | Medium | `src/partition/mod.rs` | A real Apple DOS 3.3 disk is detected as `unknown`, though our own output is not |
-| [R-028](#r-028) | Medium | `src/fs/apple_dos.rs` | Apple DOS 3.3 reports three different sizes for one file: 104 in, 512 by `ls`, 256 by `get` |
+| ~~R-028~~ | ~~Medium~~ **FIXED** | `src/fs/apple_dos.rs` | ~~Apple DOS 3.3 reports three different sizes for one file~~ — length stored in a type-B header; all three now agree, 2026-08-10 |
 | [R-032](#r-032) | Low | `src/fs/sfs.rs` | SFS `put` fails on any volume with a multi-leaf extent btree — i.e. any real one |
 | ~~R-033~~ | ~~High~~ **FIXED** | `src/partition/mod.rs` | ~~A QL Microdrive `.mdv` fails at MBR detection, though its own probe matches it exactly~~ — probe added beside the HPFS one, 2026-08-10 |
 | ~~R-034~~ | ~~Medium~~ **FIXED** | `src/fs/mod.rs` | ~~Refusing a write to a read-only filesystem says `unknown` and exits 1, not 4~~ — names the filesystem, exits 4, 2026-08-08 |
@@ -993,6 +993,33 @@ an unmodified fixture means read-only use is affected too.
 
 ### R-028 — Apple DOS 3.3 reports three different sizes for one file {#r-028}
 
+**FIXED 2026-08-10.** All three numbers were explainable, and two were wrong.
+
+- **512 from `ls`** — the catalog's `length_sectors` counts *every* sector a
+  file occupies, including its track/sector lists. A one-sector file is 1 data +
+  1 T/S list = 2, reported as 512 bytes. Now `data_sectors()` subtracts the
+  lists (one per 122 data sectors).
+- **256 from `get`** — the data sector, unpadded. DOS 3.3 records no byte
+  length, so a headerless store loses it permanently.
+- **104, the truth** — recoverable only if the length is written to the disk.
+
+`create_file` stored type **T** with the comment that this "avoids stamping a
+binary header". That is what lost the length. It now stores type **B** with the
+standard 4-byte header (load address, then length, little-endian), which is what
+a real Apple II tool writes for arbitrary bytes — so the length is recoverable
+by anything reading the disk, not just by us. `read_file` strips the header and
+cuts to the declared length; `list_directory` reads it for the reported size,
+falling back to allocated bytes when the header is missing or implausible.
+
+104 in, 104 from `ls`, 104 from `get`, byte-identical.
+
+The unit test covering this asserted only a *prefix* match
+(`&read_back[..len] == payload`), which is exactly why a 104-in/256-out could
+pass it. It now asserts full equality and that the listed size matches.
+
+---
+
+
 ```
 rb-cli new floppy apple-dos v.dsk
 rb-cli put v.dsk payload.bin /PAYLOAD     # payload.bin is 104 bytes
@@ -1062,6 +1089,33 @@ generic failure. Compare [R-004](#r-004): the same habit of letting
 Cases `edit.readonly.{lisa,alto}-refuses-a-write`.
 
 ### R-031 — a real Apple DOS 3.3 disk is detected as 'unknown' {#r-031}
+
+**NOT A DEFECT — closed 2026-08-10.** The premise is wrong: the disk is not an
+Apple DOS 3.3 disk. `Unknown` is the right answer.
+
+`fs.apple-dos.invaders.floppy.dsk` has **no filesystem**. Track 17, where the
+DOS 3.3 VTOC lives, is 4096 zero bytes. No VTOC-shaped sector exists anywhere in
+the image even under loose criteria (any DOS version, 13- or 16-sector, 35- or
+40-track). There is no ProDOS volume directory at block 2 and no Pascal volume
+name. Meanwhile 68% of the disk is non-zero, tracks 0-3 are dense and tracks 17+
+are empty — a bootloader that reads raw sectors, which is what an Apple II game
+disk of this vintage usually is.
+
+Sector ordering does not explain it: DOS-order and ProDOS-order `.dsk` images
+differ in the arrangement of sectors *within* a track, so track 17 is empty
+either way.
+
+The entry advised trying [R-034](#r-034)'s fix first, on the grounds of "same
+shape". They are not the same: R-034 was a *write refusal* naming the wrong
+type; this is *detection*, and detection is right. What R-034 did give us is the
+honest refusal this disk now produces — exit 4, "editing not yet supported for
+filesystem type 'Unknown'".
+
+The case asserted a `put`/`get` round-trip on a disk with no filesystem. It now
+asserts the disk opens and that a write is refused, and records why.
+
+---
+
 
 ```
 rb-cli put fs.apple-dos.invaders.floppy.dsk payload.bin /PAYLOAD.BIN
@@ -1720,6 +1774,8 @@ Run `rb-regress run --tiers 0-4` to check them all.
 | R-008b | `fs.new-volume.affs.{4m,32m}` | **green — fixed** |
 | R-009 | `fs.read.{jfs,reiserfs,ufs1,ufs2}` | **green — fixed** |
 | R-010 | `cli.flags.inspect-accepts-fs-type` | **green — fixed** |
+| R-028 | `edit.apple-dos.put-get` | **green — fixed** |
+| R-031 | `edit.real.apple-dos-invaders` | **green — not a defect** |
 | R-030 | `edit.real.affs-workbench13` | **green — fixed** |
 | R-011 | `fmt.g64.standard-dump-opens` | green — **pins the working half only** |
 | R-012 | `optical.cdda.no-data-track-opens` | **green — fixed upstream** |

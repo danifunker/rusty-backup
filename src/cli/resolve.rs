@@ -459,13 +459,23 @@ pub fn resolve_image_rw(path: &std::path::Path) -> Result<(BoxRwSeek, RwCommit, 
     // through opened the undecoded container bytes and reported "Invalid MBR:
     // invalid boot signature", which reads as a corrupt disk a moment after
     // `ls` listed its files (R-011, same shape as R-034).
-    if source_reader::is_flat_floppy_container_path(path)
+    // Named explicitly rather than derived as "flat-floppy minus editable":
+    // that set also caught Apple-II `.dsk`, which is a plain sector image the
+    // write path handles fine, and refusing it broke `new floppy apple-dos`
+    // round-trips. These three re-encode their bytes on read — GCR bitstream,
+    // MSA run-length, EDSK track records — so there is nowhere for a write to go.
+    if (source_reader::is_g64_path(path)
+        || source_reader::is_msa_path(path)
+        || source_reader::is_edsk_path(path))
         && !source_reader::is_editable_container_path(path)
     {
+        // Name a raw target, not a specific vintage extension: this branch
+        // covers G64/G71, MSA, EDSK and Apple-II .dsk, and suggesting `.d64`
+        // for an Apple II disk is worse than suggesting nothing.
         return Err(crate::cli::exit::permission_denied(format!(
             "{}: this container is read-only — it decodes for reading but cannot be \
-             re-encoded, so edits would have nowhere to go. Convert it first: \
-             `rb-cli convert {} OUT.d64 --format raw`.",
+             re-encoded, so edits would have nowhere to go. Convert it to a raw image \
+             first: `rb-cli convert {} OUT.img --format raw`.",
             path.display(),
             path.display(),
         )));

@@ -198,18 +198,31 @@ files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
 
 [[case]]
 id = "edit.real.apple-dos-invaders"
-description = "A real Apple II game disk — the listing step guards against editing a volume we cannot even read"
+description = """A real Apple II bootable game disk: it opens, and editing it is
+refused.
+
+Corrected 2026-08-10. This case asserted that `put` then `get` round-trips, on
+the assumption that an Apple II game disk carries a DOS 3.3 filesystem. This one
+does not carry a filesystem at all — R-031 was filed against the resulting
+"Unknown" detection, and that detection is correct. Track 17, where the DOS 3.3
+VTOC lives, is 4096 zero bytes; no VTOC-shaped sector exists anywhere in the
+image; there is no ProDOS volume directory and no Pascal volume name. Tracks 0-3
+are dense and tracks 17+ empty — a bootloader reading raw sectors, which is what
+this class of disk is.
+
+Sector ordering cannot explain it: DOS-order and ProDOS-order .dsk images differ
+in the arrangement of sectors *within* a track, and track 17 is empty either way.
+
+So the case now asserts what is actually true and worth guarding: the image
+opens, and a write is refused rather than silently pretending to succeed."""
 fixture = "fs.apple-dos.invaders.floppy"
 [[case.step]]
 args = ["ls", "{fixture_copy}", "/"]
 expect_exit = 0
 [[case.step]]
 args = ["put", "{fixture_copy}", "{cases}/tier3/payload.bin", "/PAYLOAD"]
-expect_exit = 0
-[[case.step]]
-args = ["get", "{fixture_copy}", "/PAYLOAD", "{scratch}/out.bin"]
-expect_exit = 0
-files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+expect_exit = 4
+stderr_contains = ["editing not yet supported", "Unknown"]
 
 [[case]]
 id = "edit.real.efs-small"

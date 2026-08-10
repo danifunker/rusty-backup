@@ -71,11 +71,5 @@ finding = "R-013"
 id = "edit.real.efs-small"
 finding = "R-029"
 [[known]]
-id = "edit.real.apple-dos-invaders"
-finding = "R-031"
-[[known]]
-id = "edit.apple-dos.put-get"
-finding = "R-028"
-[[known]]
 id = "edit.sfs.put-get"
 finding = "R-032"
