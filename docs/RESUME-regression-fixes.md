@@ -4,36 +4,30 @@ Paste this into a fresh session to continue.
 
 ---
 
-Continuing regression fixes on rusty-backup (branch: `regression-fixes`, 6
-commits ahead of `origin/regression-fixes`, **nothing pushed**).
+Continuing regression fixes on rusty-backup (branch: `regression-fixes`,
+pushed and verified on all three hosts at `c6e66fd`).
 
 ## STATE
 
-- Suite: **246 pass / 24 xfail / 0 fail** on Windows. macOS and Linux are at
-  `9fe84e3` (235/26/0) and have **not** run since — six commits of drift.
-- 12 findings fixed (R-004, R-006, R-007, R-009, R-010, R-014, R-017, R-018,
-  R-025, R-026, R-027, R-034), 24 open. `data/known-failures.toml` holds 24
-  entries, each citing one.
-- `main` is at merge commit `48cee1f`; this branch is ahead of it.
+- Suite: **254 pass / 19 xfail / 0 fail**, zero XPASS, on Windows, macOS and
+  Linux — all three at `c6e66fd`.
+- 19 findings fixed, 14 open. `data/known-failures.toml` holds 19 entries.
+- R-016 is no longer a defect: it was reclassified as
+  [F-008](missing_features_from_regression.md#f-008), and `rb-regress validate`
+  now accepts an `F-nnn` citation as well as an `R-nnn` one.
+- `main` is at merge commit `48cee1f`; this branch is ahead of it and has
+  **not** been merged.
 
-## FIRST, BEFORE ANY NEW WORK
+## THE FOUR DECISIONS ARE NOW THREE ANSWERS AND ONE QUESTION
 
-**Verify the six unpushed commits on macOS and Linux.** They touch shared
-code — `exit::CodedError`, `PartitionContext::type_name`, the `optical`
-verbs — and only Windows has run them. Push, then on each host:
+Do not re-ask the first three.
 
-    git fetch origin regression-fixes && git reset --hard origin/regression-fixes
-    cargo build --release --bin rb-cli
-    cargo build --release --manifest-path regression-tests/runner/Cargo.toml   # BOTH binaries
-    cd regression-tests && ./runner/target/release/rb-regress run
-
-Expect 246/24/0 and **zero XPASS** on both. An XPASS means a finding I closed
-was platform-specific and closed too broadly — that is exactly how R-025 was
-caught.
-
-Rebuilding `rb-regress` as well as `rb-cli` is not optional: skipping it once
-already produced two false XPASS on macOS under a correct-looking sha. The
-runner now warns when its own sources are newer than the binary.
+1. **R-003** — decided: *implement* `ls --format`, not correct the docs.
+   Shipped.
+2. **R-016** — decided: an unimplemented *feature*. Now F-008.
+3. **R-035** — decided: *normalise* the path to a leaf. Shipped.
+4. **R-011** — **still open.** Should copy-protected G64 dumps open at all?
+   Asserting either way prejudges it, so only the working half is pinned.
 
 ## USE THE TOOLS, NOT THE MARKDOWN
 
@@ -48,57 +42,66 @@ aside and every corpus-backed case must report `skip-fixture`.
 
 ## WHAT IS READY TO FIX
 
-From `docs/regression-fix-prompt.md`, which tranches all 24 by whether they
-can actually be acted on. Ready now, no decision and no hardware needed:
+From [`regression-fix-prompt.md`](regression-fix-prompt.md), which tranches the
+remainder. The three highest-value ones are done (R-021, R-022, R-023), so what
+is left needs investigation before it needs a fix:
 
-- **R-005** — no error envelope under `--format json`. Cross-cutting: the
-  format is a per-verb arg and the error path in `main` cannot see it. The
-  `exit::CodedError` machinery added for R-004 is the half that already
-  exists; `status.code` should come from `code_for`.
-- **R-001 / R-002** — doc drift. Both would be caught permanently by the
-  source-parity test `Regression_Bugs.md` lists under "Not covered".
-- **R-021, R-023, R-022** — the heavy ones, in value order. Silent no-ops and
-  silent data loss: `resize --size` reports success and changes nothing;
-  `repack` exits 0 having lost every file; HPFS sector-by-sector round-trip is
-  not byte-identical.
-
-## DO NOT START THESE WITHOUT AN ANSWER
-
-Four are decisions for the maintainer, not bugs to fix. Ask first:
-
-1. **R-003** — implement `ls --format`, or correct the docs that claim it?
-2. **R-016** — is "backup refuses non-flat containers" a defect or an
-   unimplemented feature? Four red cases hang on the answer.
-3. **R-035** — `.cbk` embeds the producing host's absolute path. Keep,
-   normalise, or record a device identity instead?
-4. **R-011** — should copy-protected G64 dumps open at all?
+- **R-008b / R-008a** — `new volume affs --size 4M` panics, exit 101, no file.
+  A panic with no output is the worst remaining failure mode, and R-008a shares
+  the fix: volumes above 4066 blocks have uncovered tail blocks.
+- **R-024** — one `put` into a fresh 3 MB AFFS volume makes `fsck --checkonly`
+  report errors. Data reads back fine, so the damage is to allocation
+  structures. Three distinct AFFS bugs — R-008 is the formatter, R-024 the
+  editor, R-020 the root block. Do not conflate them.
+- **R-033** — a QL Microdrive `.mdv` fails at MBR detection although its own
+  probe matches it exactly. **Very likely the same shape as R-022**, which was
+  a bare volume falling through to the MBR parse because no probe claimed it.
+  Read the R-022 fix first; this may be twenty minutes.
+- **R-013, R-028, R-029, R-030, R-031, R-032** — tranche C. The symptom is
+  recorded, the cause is not. Each needs a scoped investigation, and the
+  investigation is the deliverable.
 
 ## BLOCKED, NOT FORGOTTEN
 
-- **R-015, R-012** are upstream in `opticaldiscs`. A fixed 0.15.0 exists in
-  the maintainer's working tree, unpublished. When it lands: bump the pin and
+- **R-015, R-012** are upstream in `opticaldiscs`. A fixed 0.15.0 exists in the
+  maintainer's working tree, unpublished. When it lands: bump the pin and
   re-run `optical.cue.unpadded-track-number` and
-  `optical.cdda.no-data-track-opens` — both red on purpose, and they will flip
-  to XPASS. `docs/opticaldiscs-upstream-prompt.md` has the detail.
+  `optical.cdda.no-data-track-opens` — both red on purpose, both will flip to
+  XPASS. `docs/opticaldiscs-upstream-prompt.md` has the detail.
 - **R-020** (every AFFS volume we write is unmountable on a real Amiga) needs
   an emulator or hardware oracle. All 62 emulator / MiSTer-core oracles are
   `skip-manual`, so no automated run can confirm a fix. Teaching `verify` to
   drive FS-UAE is the harness feature that unblocks it.
+- **R-025** is Windows-only and correctly scoped with `platforms = ["windows"]`.
 - MiSTer's `rb-cli` is from 2026-07-27 and must be redeployed before its 12
   core oracles mean anything.
 
+## FIXTURE GAP WORTH CLOSING
+
+There is **no HPFS fixture**. R-022 turned out to be a detection bug that made
+`backup` write nothing at all for a bare HPFS volume, and the control that
+mattered — a *partitioned* HPFS disk, the ao486 shape graded **Yes** in
+`full_MiSTer_support_status.md`, must not be hijacked by the new probe — had to
+be synthesized by hand and cannot be asserted by the suite. An MBR disk with a
+type-0x07 HPFS partition would close that.
+
 ## FEATURE WORK QUEUED
 
-`docs/missing_features_from_regression.md`, F-005 through F-007:
+`docs/missing_features_from_regression.md`, F-005 through F-008:
 
-- **F-005** — GUI cannot extract a single file. Small: `browse_view.rs`
-  already calls `read_file` in three places. Must surface the filesystem
-  selector or the GUI can never reach both sides of a hybrid disc.
-- **F-006** — IRIX support disks. **Needs scope** — three readings recorded,
-  one of which cannot be verified without hardware.
+- **F-005** — GUI cannot extract a single file. Small: `browse_view.rs` already
+  calls `read_file` in three places. Must surface the filesystem selector or the
+  GUI can never reach both sides of a hybrid disc.
+- **F-006** — IRIX support disks. **Needs scope** — three readings recorded, one
+  of which cannot be verified without hardware.
 - **F-007** — no optical fixture has nested directories, so
   `--path DIR --recursive` is implemented and unverified. Fixtures already
   catalogued; only the case is missing.
+- **F-008** — `backup` reads only flat-layout sources. `inspect` already opens
+  all four containers, so the decoding exists and `backup` simply takes a
+  different route to the bytes. Routing it through the same path is the whole
+  feature. `backup.container.inspect-reads-what-backup-cannot` is green and
+  pins the asymmetry — read it first.
 
 ## CONVENTIONS THAT MATTER
 
@@ -106,16 +109,28 @@ Four are decisions for the maintainer, not bugs to fix. Ask first:
   one pass by asserting broken behaviour — add it to `known-failures.toml`
   citing a finding instead. XPASS catches a stale entry.
 - If a case turns out to assert the wrong thing, change it **deliberately and
-  say so**. `cli.exit.missing-image-file` pinned exit 1 as "current
-  documented-free behaviour" and contradicted the contract in `exit.rs`; it
-  was corrected to 3 rather than weakening the fix.
+  say so**. Three precedents now: `cli.exit.missing-image-file` pinned exit 1
+  and contradicted `exit.rs`; `cli.envelope.error-envelope-on-failure` pinned
+  the same 1 for the same reason; `resize.repack.keeps-data` built a plain FAT
+  volume for a verb that is Human68k-only. All three were corrected, not
+  weakened.
+- **Doubt the diagnosis, not just the code.** Two findings this session were
+  filed with the wrong cause. R-023 said "every file is gone" — nothing was
+  lost, a FAT long filename was dropped. R-022 said "not byte-identical" — the
+  backup was empty. Reproduce and *measure* before fixing; both had a
+  one-command control (count the non-zero bytes; list the backup folder).
+- **Always run a control before believing a diagnosis.** R-023's control was
+  repacking a *real* Human68k volume, which worked perfectly and proved the
+  clone sound and the input wrong. R-022's was a synthesized MBR-partitioned
+  HPFS disk, proving the new probe does not hijack partitioned disks.
 - `platforms = ["windows"]` on a `[[known]]` entry scopes a platform-specific
   finding. Without it, the other platforms report a false XPASS.
-- **Always run a control before believing a diagnosis.** Two wrong root causes
-  this session died to one: `FILE_SHARE_DELETE` looked like the R-025 fix and
-  changed nothing, and the `__MACOSX` sidecar looked like the R-027 cause and
-  was already filtered. A test that isolates the mechanism settles it in one
-  run.
+- A `[[known]]` entry may cite an `R-nnn` defect **or** an `F-nnn` feature gap.
+  Before 2026-08-09 only the former validated, which is part of why a feature
+  gap looked like it had to be filed as a bug.
+- `tests/doc_parity.rs` guards README / CONTRIBUTING claims against the source.
+  It is a `cargo test`, not an `rb-regress` case, because the claim is *about*
+  the binary rather than something the binary does.
 - Engine code (`src/`) must compile on Rust 1.73 — your `cargo build` will not
   catch a violation. See CONTRIBUTING.md.
 - Comments are one line, two at most. No Unicode glyphs in UI or log strings.
@@ -125,6 +140,12 @@ Four are decisions for the maintainer, not bugs to fix. Ask first:
 - Nothing private in the repo: corpus paths, machines and addresses live in
   gitignored `regression-tests/local.toml` only.
 - Windows: use `C:\Windows\System32\OpenSSH\ssh.exe`, not Git Bash ssh, with
-  `-o IdentitiesOnly=no`. linuxbox needs `-A` for anything touching GitHub;
-  the Mac has its own key. macOS commands need `zsh -lc`. Export
-  `MSYS_NO_PATHCONV=1` for any `rb-cli` call with a `/` path.
+  `-o IdentitiesOnly=no`, and `GIT_SSH_COMMAND` for a push. **Fetching on the
+  remote hosts is easiest over HTTPS** (`git fetch
+  https://github.com/danifunker/rusty-backup.git regression-fixes`) — the repo
+  is public, linuxbox's own key needs `-A` forwarding and the Mac's key needs
+  an agent that non-interactive ssh does not have. macOS commands need
+  `zsh -lc`. Export `MSYS_NO_PATHCONV=1` for any `rb-cli` call with a `/` path.
+- Rebuilding `rb-regress` as well as `rb-cli` is not optional: skipping it once
+  already produced two false XPASS on macOS under a correct-looking sha. The
+  runner warns when its own sources are newer than the binary.

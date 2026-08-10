@@ -3,15 +3,17 @@
 A handoff for fixing the defects in [`Regression_Bugs.md`](Regression_Bugs.md).
 Paste a tranche into a fresh session; each is independently shippable.
 
-**Readiness, honestly.** 30 findings are open. 11 are specified well enough to
-fix without further investigation. 9 more have an unambiguous symptom and a
-red case but need real engine work. 8 cannot be turned into a fix prompt yet —
-the symptom is known and the cause is not, so a prompt would be guessing. 2 are
-decisions rather than defects and must not be quietly resolved by whoever
-picks them up.
+**Readiness, honestly.** Written when 30 findings were open. **14 remain as of
+2026-08-09.** Tranche A is empty but for two blocked upstream; Tranche B has
+lost its three highest-value entries and its one decision; Tranche C is
+untouched, because "the symptom is known and the cause is not" is exactly the
+state that does not clear on its own.
 
-One prompt for all 30 would be the wrong shape. The tranches below are sized
-to be reviewable.
+Struck-through rows are kept rather than deleted: the "what to do" column
+records what each fix turned on, and two of them turned on the *report being
+wrong*, which is the most reusable thing in this document.
+
+The tranches below are sized to be reviewable.
 
 ---
 
@@ -22,8 +24,8 @@ to be reviewable.
    the wrong thing, say so and change it deliberately; do not weaken it to get
    green.
 2. **Each fix must turn its named case green and leave every other case
-   unchanged.** `rb-regress run` is 226–228 pass / 33–35 xfail / 0 fail on
-   Windows, macOS and Linux at `c3e1984`. A fix that trades one red for
+   unchanged.** `rb-regress run` is **254 pass / 19 xfail / 0 fail** on
+   Windows, macOS and Linux at `c6e66fd`. A fix that trades one red for
    another is not a fix.
 3. **Remove the entry from `regression-tests/data/known-failures.toml`** when a
    finding goes green, and strike the row through in `Regression_Bugs.md`,
@@ -47,28 +49,30 @@ to be reviewable.
 
 ## Tranche A — fully specified, mechanical
 
-Eleven findings. Each has a repro, an expected behaviour, and a red case. No
-investigation needed; the work is deciding the exact wording and doing it.
+**Empty as of 2026-08-09** except the two that are blocked upstream. Eleven
+findings started here; nine are fixed and struck through below, kept because
+the "what to do" column records the decision each one turned on.
 
 | Finding | Case that must go green | What to do |
 |---|---|---|
-| R-006 | `fs.new-volume.prodos-default-name` | Default volume name `rusty-backup` contains `-`, which ProDOS forbids, so the verb always fails with defaults. Change the default (per-fs, or sanitise), and fix the message — it says "rename the file" when the offending string is the *volume* name. |
-| R-004 | `cli.exit.{csv,tsv}-on-nested-verb-is-usage-error`, `shrink.rejects-non-chd-output` | CSV/TSV rejection exits 1; documented as 2. Usage errors are 2. |
-| R-005 | `cli.envelope.error-envelope-on-failure` | No error envelope is emitted under `--format json`. Failures must produce the same envelope shape as successes. |
-| R-003 | `cli.envelope.ls-supports-format` | **Decision.** Docs claim `ls` supports `--format`; it does not. Either implement it or correct the docs. Do not assume — see Decisions below. |
-| R-010 | `cli.flags.inspect-accepts-fs-type` | `inspect` has no `--fs-type`, so CP/M images cannot be inspected. `ls` already accepts it (`cli.flags.ls-accepts-fs-type` is green) — mirror that. |
-| R-026 | `subcmd.show.partmap` | `show partmap` cannot read an SGI disk that `inspect` reads fine. Two code paths disagree; make `show` use the one that works. |
-| R-027 | `read.apfs.apple-gpt` | A Finder-made `.zip` holding one `.dmg` is rejected as ambiguous because `__MACOSX/._*` counts as a second candidate. Ignore the AppleDouble sidecar. Every zip made on a Mac has one. |
-| R-034 | `edit.readonly.{lisa,alto}-refuses-a-write` | Refusing a write to a read-only FS reports the type as `unknown` and exits 1. Refusing is correct; the type should be the one `ls`/`inspect` just reported, and the exit code 4. **Check whether this also fixes R-031** — same shape. |
-| R-015 | `optical.cue.unpadded-track-number` | A `.cue` with `TRACK 1` (unpadded) is rejected. Accept it. |
-| R-012 | `optical.cdda.no-data-track-opens` | `optical info` rejects any disc with no data track (pure CD-DA). `optical.cdda.mixed-mode-still-opens` is the green working-half — keep it green. |
-| R-001, R-002 | none (doc drift) | README partition-table list is missing AHDI and X68000; `src/fs/README.md` still lists ext as "planned". Both would be caught by the source-parity test noted below. |
+| ~~R-006~~ **FIXED** | `fs.new-volume.prodos-default-name` | Default volume name `rusty-backup` contains `-`, which ProDOS forbids, so the verb always fails with defaults. Change the default (per-fs, or sanitise), and fix the message — it says "rename the file" when the offending string is the *volume* name. |
+| ~~R-004~~ **FIXED** | `cli.exit.{csv,tsv}-on-nested-verb-is-usage-error`, `shrink.rejects-non-chd-output` | CSV/TSV rejection exits 1; documented as 2. Usage errors are 2. |
+| ~~R-005~~ **FIXED** | `cli.envelope.error-envelope-on-failure` | No error envelope is emitted under `--format json`. Failures must produce the same envelope shape as successes. |
+| ~~R-003~~ **FIXED** | `cli.envelope.ls-supports-format` | ~~**Decision.**~~ Decided: implement. Docs claim `ls` supports `--format`; it does not. Either implement it or correct the docs. Do not assume — see Decisions below. |
+| ~~R-010~~ **FIXED** | `cli.flags.inspect-accepts-fs-type` | `inspect` has no `--fs-type`, so CP/M images cannot be inspected. `ls` already accepts it (`cli.flags.ls-accepts-fs-type` is green) — mirror that. |
+| ~~R-026~~ **FIXED** | `subcmd.show.partmap` | `show partmap` cannot read an SGI disk that `inspect` reads fine. Two code paths disagree; make `show` use the one that works. |
+| ~~R-027~~ **FIXED** | `read.apfs.apple-gpt` | A Finder-made `.zip` holding one `.dmg` is rejected as ambiguous because `__MACOSX/._*` counts as a second candidate. Ignore the AppleDouble sidecar. Every zip made on a Mac has one. |
+| ~~R-034~~ **FIXED** | `edit.readonly.{lisa,alto}-refuses-a-write` | Refusing a write to a read-only FS reports the type as `unknown` and exits 1. Refusing is correct; the type should be the one `ls`/`inspect` just reported, and the exit code 4. **Check whether this also fixes R-031** — same shape. |
+| R-015 **blocked upstream** | `optical.cue.unpadded-track-number` | A `.cue` with `TRACK 1` (unpadded) is rejected. Accept it. |
+| R-012 **blocked upstream** | `optical.cdda.no-data-track-opens` | `optical info` rejects any disc with no data track (pure CD-DA). `optical.cdda.mixed-mode-still-opens` is the green working-half — keep it green. |
+| ~~R-001, R-002~~ **FIXED** | `tests/doc_parity.rs` (three tests) | README partition-table list is missing AHDI and X68000; `src/fs/README.md` still lists ext as "planned". Both would be caught by the source-parity test noted below. |
 
-**Worth doing while in here:** R-001/R-002/R-018 are all documentation drifting
-from code, and all three were found by hand. A source-parity test — comparing
-the README tables against the `PartitionTable` enum and the `fs/mod.rs`
-dispatch — would guard the whole class. It is currently listed as "Not
-covered" in `Regression_Bugs.md`.
+**That source-parity test now exists.** `tests/doc_parity.rs` covers R-001,
+R-002 and R-018 — the README partition-table list against
+`PartitionTable::ALL_TYPE_NAMES`, `src/fs/README.md` against a capability table
+growing back, and CONTRIBUTING.md's vintage feature list against the workflow's.
+It is a `cargo test`, not an `rb-regress` case, because the claim is *about* the
+binary rather than something the binary does.
 
 ---
 
@@ -77,17 +81,21 @@ covered" in `Regression_Bugs.md`.
 Nine findings. The symptom is unambiguous and reproducible; the fix is not
 mechanical. Take these one at a time.
 
-**Highest value first — these three are silent data loss or silent no-ops,
-the worst failure shape in a tool whose job is moving data:**
+**The three highest-value ones are done (2026-08-09) — and two of the three
+were filed with the wrong cause, which is the lesson worth carrying:**
 
-- **R-021** (`resize.to-explicit-size`) — `resize --size 16M` on an 8M volume
-  prints "resize complete", exits 0, changes nothing. Nothing downstream has
-  any reason to check.
-- **R-023** (`resize.repack.keeps-data`) — `repack` exits 0 and every file in
-  the volume is gone. Human68k.
-- **R-022** (`roundtrip.hpfs.raw`) — `backup --sector-by-sector` then `restore`
-  is not byte-identical for HPFS. FAT, NTFS, ext4, HFS, minix3, EFS and ProDOS
-  all survive the same path, so it is HPFS-specific, not a backup-format bug.
+- ~~**R-021**~~ — fixed. Not a no-op: it warned and proceeded, leaving a
+  filesystem describing twice the blocks its container held. `resize` now grows
+  the file when the volume *is* the file, and refuses otherwise.
+- ~~**R-023**~~ — fixed. **Nothing was lost.** A FAT long filename was dropped
+  because `repack`, documented Human68k-only, accepted a plain FAT volume.
+  Scope guard added.
+- ~~**R-022**~~ — fixed. **Not a fidelity bug.** A bare HPFS volume was
+  detected as an empty MBR, so `backup` wrote no partition file at all and
+  exited 0. A detection probe closed it.
+
+Reproduce and *measure* before fixing. Both wrong diagnoses had a one-command
+control: count the non-zero bytes; list the backup folder.
 
 **Then:**
 
@@ -107,6 +115,9 @@ the worst failure shape in a tool whose job is moving data:**
   single-leaf-only, so this is the known ceiling being hit, not a surprise.
 - **R-033** (`read.qdos.microdrive`) — a QL Microdrive `.mdv` fails at MBR
   detection although its own probe matches it exactly. Detection ordering.
+  **Very likely the same shape as R-022**, which was a bare volume falling
+  through to the MBR parse because no probe in `detect_superfloppy` claimed it.
+  Read that fix first.
 - ~~**R-016**~~ — **decided 2026-08-09: an unimplemented feature, not a
   defect.** Moved to
   [F-008](missing_features_from_regression.md#f-008); the four cases keep their

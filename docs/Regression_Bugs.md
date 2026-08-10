@@ -1457,18 +1457,25 @@ already works.
 
 ## Suggested order
 
-0. ~~**R-014**~~ — done; commits work without `--no-verify` again.
-0b. ~~**R-018**~~ — done; the verification command works on Windows again.
-1. ~~**R-009** / **R-017**~~ — done; five filesystems' worth of tier-2
-   coverage went green.
-2. **R-008b** — a panic with no file produced is the worst failure mode here,
+Rewritten 2026-08-09; 21 of 35 findings are closed and the ordering that
+remains is different from the one that got us here.
+
+1. **R-008b** — a panic with no file produced is the worst failure mode left,
    and R-008a shares its fix.
-3. ~~**R-007**~~ — done; the formatter was already correct when re-verified.
-4. **R-013** — wrong entry types and an absurd size are user-visible
+2. **R-033** — a QL Microdrive `.mdv` fails at MBR detection although its own
+   probe matches it exactly. **Very likely R-022's shape**: a bare volume
+   falling through to the MBR parse because no probe in `detect_superfloppy`
+   claimed it. Read that fix first — this may be short.
+3. **R-013** — wrong entry types and an absurd size are user-visible
    immediately.
-5. **R-005**, **R-004**, **R-003** — the CLI contract group; cheap, and the
-   regression harness depends on that contract being true.
-6. **R-006** — a one-line default change.
-7. ~~**R-001**, **R-002**~~ — done; both fixed and both now guarded by
-   `tests/doc_parity.rs`, along with R-018.
-8. **R-011** — decide scope first.
+4. **R-024** — the AFFS editor. Distinct from R-008 (formatter) and R-020
+   (root block); do not conflate them.
+5. **R-011** — decide scope first. The last open decision.
+6. Everything else is Tranche C in
+   [`regression-fix-prompt.md`](regression-fix-prompt.md): the symptom is
+   recorded, the cause is not, and the investigation is the deliverable.
+
+**Two of the closed findings had the wrong cause on file** — R-023 ("every file
+is gone"; nothing was lost) and R-022 ("not byte-identical"; the backup was
+empty). Both had a one-command control that settled it. Reproduce and *measure*
+before fixing anything below.
