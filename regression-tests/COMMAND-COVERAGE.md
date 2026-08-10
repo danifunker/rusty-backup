@@ -147,7 +147,7 @@ update  write  xattr
 
 **1. Backup/restore has no round-trip.** This is the product's headline
 feature and its name. All six functional `backup` calls are
-`--format raw --sector-by-sector`, and all six exist to demonstrate R-016
+`--format raw --sector-by-sector`, and all six exist to demonstrate F-008
 (container sources being rejected). Never tested: zstd / CHD / VHD / gzip / lz4
 output, checksum verification (CRC32 and SHA256), split backups, and
 `cbk` incremental. `restore` is only ever asked for its help text, so **no test

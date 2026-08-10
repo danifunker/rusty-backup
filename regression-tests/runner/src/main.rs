@@ -963,14 +963,21 @@ fn cmd_validate(args: &Args) -> i32 {
                 }
             }
             // Every expected failure must name a recorded cause, or it is just
-            // a disabled test wearing a label.
-            let bugs = fs::read_to_string(base.join("..").join("docs").join("Regression_Bugs.md"))
-                .unwrap_or_default();
+            // a disabled test wearing a label. A cause is either a defect
+            // (Regression_Bugs.md) or a capability the engine has never
+            // claimed (missing_features_from_regression.md) — a case pinned to
+            // an unimplemented feature is red for a reason, just not a bug.
+            let docs = base.join("..").join("docs");
+            let bugs = fs::read_to_string(docs.join("Regression_Bugs.md")).unwrap_or_default();
+            let features =
+                fs::read_to_string(docs.join("missing_features_from_regression.md"))
+                    .unwrap_or_default();
             if !bugs.is_empty() {
                 for (id, f) in k.all_entries() {
-                    if !bugs.contains(f) {
+                    if !bugs.contains(f) && !features.contains(f) {
                         known_problems.push(format!(
-                            "known-failures.toml: '{}' cites finding {}, which is not in docs/Regression_Bugs.md",
+                            "known-failures.toml: '{}' cites {}, which is in neither \
+                             docs/Regression_Bugs.md nor docs/missing_features_from_regression.md",
                             id, f
                         ));
                     }

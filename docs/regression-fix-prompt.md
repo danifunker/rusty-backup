@@ -107,11 +107,11 @@ the worst failure shape in a tool whose job is moving data:**
   single-leaf-only, so this is the known ceiling being hit, not a surprise.
 - **R-033** (`read.qdos.microdrive`) — a QL Microdrive `.mdv` fails at MBR
   detection although its own probe matches it exactly. Detection ordering.
-- **R-016** (`backup.container.{chd,vhd-dynamic,qcow2,vmdk-sparse}`) —
-  **Decision.** `backup` accepts only flat-layout sources.
-  `backup.container.inspect-reads-what-backup-cannot` is green and proves
-  `inspect` opens exactly what `backup` refuses. Is this a defect or an
-  unimplemented feature? See Decisions.
+- ~~**R-016**~~ — **decided 2026-08-09: an unimplemented feature, not a
+  defect.** Moved to
+  [F-008](missing_features_from_regression.md#f-008); the four cases keep their
+  assertions and now cite F-008, which `rb-regress validate` accepts as of the
+  same date. No longer in this tranche.
 
 ---
 
@@ -136,17 +136,18 @@ first, and the investigation is the deliverable.
 
 ## Decisions that must not be quietly resolved
 
-Four. Each changes what the fix is, so they belong to the maintainer, not to
-whoever picks up the ticket.
+Four were open. Three are now answered; each changed what the fix was, which
+is why they belonged to the maintainer rather than to whoever picked up the
+ticket.
 
-1. **R-003** — implement `ls --format`, or correct the docs?
-2. **R-016** — is "backup refuses non-flat containers" a defect or an
-   unimplemented feature? It is currently filed as a defect with four red
-   cases; if it is a feature, it belongs in
-   `missing_features_from_regression.md` and the cases should move to a
-   capability list.
-3. **R-035** — keep, normalise, or replace `source_device`?
-4. **R-011** — should copy-protected G64 dumps open at all?
+1. ~~**R-003**~~ — **decided: implement the flag**, not correct the doc. `ls`
+   is the most script-facing verb in the CLI. Shipped 2026-08-09.
+2. ~~**R-016**~~ — **decided: an unimplemented feature.** Moved to
+   [F-008](missing_features_from_regression.md#f-008), cases retagged,
+   `validate` taught to accept an F-nnn citation. 2026-08-09.
+3. ~~**R-035**~~ — **decided: normalise the path** to a device leaf rather than
+   keeping the absolute path or inventing a device identity.
+4. **R-011** — should copy-protected G64 dumps open at all? **Still open.**
 
 ---
 

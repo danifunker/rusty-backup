@@ -18,6 +18,7 @@ concrete reason to.
 | [F-005](#f-005) | Optical extract is CLI-only; the GUI cannot pull one file | `src/optical/browse_view.rs` | GUI parity with `optical extract` |
 | [F-006](#f-006) | IRIX support-disk building / browsing is thin | `src/cli/verbs/new_sgi_cdrom.rs` | bootable IRIX disc work — **needs scope** |
 | [F-007](#f-007) | No optical fixture with nested directories | `regression-tests/` | verifying `--path DIR --recursive` |
+| [F-008](#f-008) | `backup` reads only flat-layout sources | `src/cli/verbs/backup.rs` | backing up CHD / dynamic VHD / QCOW2 / VMDK — **four red cases** |
 | ~~F-004~~ | ~~`show partmap` is APM-only~~ — **SHIPPED** 2026-08-08, same gap as R-026 | `src/cli/verbs/show.rs` | — |
 
 ---
@@ -221,3 +222,65 @@ CloneCD Bookshelf set, both of which have real trees, asserting that
 `--recursive` descends and that its absence stops at one level. The fixtures
 are already catalogued — only the case is missing. It belongs in
 `cases/tier3/optical-extract.toml` beside the nine that exist.
+
+## F-008 — `backup` reads only flat-layout sources {#f-008}
+
+Filed as defect [R-016](Regression_Bugs.md#r-016) until 2026-08-09.
+**Reclassified**: `backup` has never claimed to decode containers, so this is
+a capability the engine lacks, not code disagreeing with itself. The four
+cases keep their assertions — they describe the behaviour we want — and now
+cite this entry.
+
+`backup --help` documents SOURCE as "an image file or a block-device path",
+and `inspect` reads every container we write. `backup` reads only the ones
+whose data begins at offset 0:
+
+| source | `inspect` | `backup` |
+|--------|-----------|----------|
+| raw `.img` | `Partition table: MBR` | **ok** |
+| fixed VHD | `Partition table: MBR` | **ok** |
+| **CHD** | `Partition table: MBR` | **fails** |
+| **dynamic VHD** | `Partition table: MBR` | **fails** |
+| **QCOW2** | `Partition table: MBR` | **fails** |
+| **VMDK sparse** | `Partition table: MBR` | **fails** |
+
+Fixed VHD only passes because it *is* raw data with a trailing footer. Every
+container with a non-flat internal layout fails, in one of two ways:
+
+```
+rb-cli backup o-chd/disk.chd ./out --format raw --sector-by-sector
+  -> error: backup failed: cannot read first sector: failed to fill whole buffer
+
+rb-cli backup o-qcow2/disk.qcow2 ./out --format raw --sector-by-sector
+  -> error: backup failed: failed to detect partition table:
+     Invalid MBR: invalid boot signature: expected 0xAA55, got 0x...
+```
+
+Same root cause — the container is not decoded, so raw file bytes are read as
+though they were the disk. Which message appears depends on whether the read
+runs off the end of a small file or lands on header bytes that resemble a bad
+MBR. `--sector-by-sector` does not help; the failure precedes all partition
+logic.
+
+**Why it matters.** These are four of our own output formats, CHD being the
+default for `convert`. A user can convert a disk to any of them and then find
+they cannot back it up — archive to QCOW2, later try to make a working copy,
+and the tool refuses. `inspect` reading them fine makes the gap look arbitrary
+from outside, which is what made it read as a defect for so long.
+
+**What would help.** `inspect` already opens all four, so the decoding exists;
+`backup` takes a different route to the bytes. Routing `backup`'s source open
+through the same container-aware path `inspect` uses is the whole feature.
+`backup.container.inspect-reads-what-backup-cannot` is green and pins that
+asymmetry, so it is the case to read first.
+
+Reproduces on a 64 MB synthetic image; no fixture required.
+
+**Two traps when verifying this**, both of which caught the original reporter:
+
+1. `backup` prints `rb-cli backup: SRC -> DEST` *before* doing any work, so a
+   grep for `->` reports success on a run that then fails. **Check the exit
+   code**, not the output.
+2. `--format raw` writes `partition-N.img` files, so a `find` over several
+   directories can pick up an unrelated `.img` and attribute the wrong result
+   to the wrong container. Use explicit paths per case.

@@ -36,7 +36,7 @@ finding depends on a fixture, the fixture is named.
 | ~~R-034~~ | ~~Medium~~ **FIXED** | `src/fs/mod.rs` | ~~Refusing a write to a read-only filesystem says `unknown` and exits 1, not 4~~ — names the filesystem, exits 4, 2026-08-08 |
 | [R-035](#r-035) | Medium | `src/backup/` | `.cbk` embeds the producing host's absolute path, so it can never be byte-identical across machines |
 | [R-020](#r-020) | **High** | `src/fs/affs.rs` | `new volume affs` output is "Not a DOS disk" on a real Amiga, at every size |
-| [R-016](#r-016) | **High** | `src/cli/verbs/backup.rs` | `backup` accepts only flat-layout sources: CHD, dynamic VHD, QCOW2 and VMDK all fail |
+| ~~R-016~~ | ~~**High**~~ **RECLASSIFIED** | `src/cli/verbs/backup.rs` | ~~`backup` accepts only flat-layout sources: CHD, dynamic VHD, QCOW2 and VMDK all fail~~ — not a defect; moved to [F-008](missing_features_from_regression.md#f-008), 2026-08-09 |
 | ~~R-018~~ | ~~Blocker~~ **FIXED** | `CONTRIBUTING.md` | ~~The documented Rust-1.73 verification build does not compile on Windows~~ — missing `windows-legacy` feature, 2026-08-07 |
 | ~~R-017~~ | ~~High~~ **FIXED** | `src/partition/mod.rs` | ~~Superfloppy detection also misses SFS (extends R-009)~~ — probe added 2026-08-07 |
 | [R-015](#r-015) | Medium | `src/optical/` (cue parser) | A `.cue` with unpadded track numbers (`TRACK 1`) is rejected |
@@ -489,53 +489,27 @@ undercuts the point of writing NTFS.
 
 ### R-016 — `backup` accepts only flat-layout containers {#r-016}
 
-`backup --help` documents SOURCE as "an image file or a block-device path",
-and `inspect` reads every container we write. `backup` reads only the ones
-whose data begins at offset 0:
+**RECLASSIFIED 2026-08-09 — not a defect.** `backup` has never claimed to
+decode containers; `--help` documents SOURCE as "an image file or a
+block-device path" and says nothing about non-flat internal layouts. Code that
+does not do something it never claimed is a capability gap, and this file's own
+rule for the split ("a bug means the code disagrees with its own documentation
+or with reality") puts it on the other side of the line.
 
-| source | `inspect` | `backup` |
-|--------|-----------|----------|
-| raw `.img` | `Partition table: MBR` | **ok** |
-| fixed VHD | `Partition table: MBR` | **ok** |
-| **CHD** | `Partition table: MBR` | **fails** |
-| **dynamic VHD** | `Partition table: MBR` | **fails** |
-| **QCOW2** | `Partition table: MBR` | **fails** |
-| **VMDK sparse** | `Partition table: MBR` | **fails** |
+The full report, the four-container table, the two verification traps and the
+route to a fix now live at
+[F-008](missing_features_from_regression.md#f-008). The four cases
+`backup.container.{chd,vhd-dynamic,qcow2,vmdk-sparse}` are unchanged — they
+assert the behaviour we want and stay red — and their `known-failures.toml`
+entries now cite F-008. `rb-regress validate` accepts an F-nnn citation as of
+the same date; before that a known failure could only name a defect, which is
+what made a feature gap look like the only available filing.
 
-Fixed VHD only passes because it *is* raw data with a trailing footer. Every
-container with a non-flat internal layout fails, in one of two ways:
-
-```
-rb-cli backup o-chd/disk.chd ./out --format raw --sector-by-sector
-  -> error: backup failed: cannot read first sector: failed to fill whole buffer
-
-rb-cli backup o-qcow2/disk.qcow2 ./out --format raw --sector-by-sector
-  -> error: backup failed: failed to detect partition table:
-     Invalid MBR: invalid boot signature: expected 0xAA55, got 0x...
-```
-
-Same root cause — the container is not decoded, so raw file bytes are read as
-though they were the disk. Which message appears depends on whether the read
-runs off the end of a small file or lands on header bytes that resemble a bad
-MBR. `--sector-by-sector` does not help; the failure precedes all partition
-logic.
-
-**Why it matters.** These are four of our own output formats, CHD being the
-default for `convert`. A user can convert a disk to any of them and then find
-they cannot back it up — archive to QCOW2, later try to make a working copy,
-and the tool refuses. `inspect` reading them fine makes the failure look
-arbitrary from outside.
-
-Reproduces on a 64 MB synthetic image; no fixture required.
-
-**Two traps when verifying this**, both of which caught me:
-
-1. `backup` prints `rb-cli backup: SRC -> DEST` *before* doing any work, so a
-   grep for `->` reports success on a run that then fails. **Check the exit
-   code**, not the output.
-2. `--format raw` writes `partition-N.img` files, so a `find` over several
-   directories can pick up an unrelated `.img` and attribute the wrong result
-   to the wrong container. Use explicit paths per case.
+What made it read as a defect for so long is real and worth keeping in mind:
+`backup.container.inspect-reads-what-backup-cannot` is green and proves
+`inspect` opens exactly what `backup` refuses. An asymmetry between two verbs
+on the same file looks like a bug from outside even when neither verb is
+misbehaving.
 
 ### R-017 — superfloppy detection also misses SFS {#r-017}
 
@@ -1260,7 +1234,7 @@ Run `rb-regress run --tiers 0-4` to check them all.
 | R-012 | `optical.cdda.no-data-track-opens` | red — blocked upstream |
 | R-013 | `fs.detect.ufs-{solaris-entry-types,no-absurd-sizes}` | red |
 | R-015 | `optical.cue.unpadded-track-number` | red — blocked upstream |
-| R-016 | `backup.container.{chd,vhd-dynamic,qcow2,vmdk-sparse}` | red — reclassified as a feature |
+| F-008 | `backup.container.{chd,vhd-dynamic,qcow2,vmdk-sparse}` | red — a feature gap, was R-016 |
 | R-017 | `fs.detect.sfs-bare-volume` | **green — fixed** |
 | R-025 | `subcmd.squashfs.put-rebuilds`, `meta.xattr.set-list-rm` | red — Windows only |
 | R-026 | `subcmd.show.partmap` | **green — fixed** |

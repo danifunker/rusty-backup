@@ -1,7 +1,8 @@
 # Tier 5 — backup and restore. These cases are about `backup`'s input side:
 # which container shapes it can read at all.
 #
-# R-016: `backup` reads only sources whose data begins at offset 0. `inspect`
+# F-008 (filed as R-016 until 2026-08-09): `backup` reads only sources whose
+# data begins at offset 0. `inspect`
 # reads every container we write, so the failure looks arbitrary from outside:
 # convert a disk to CHD — the default for `convert` — and it can no longer be
 # backed up.
@@ -51,11 +52,11 @@ expect_exit = 0
 args = ["backup", "{scratch}/c/disk.vhd", "{scratch}/bk", "--format", "raw", "--sector-by-sector"]
 expect_exit = 0
 
-# --- R-016: the four that fail ----------------------------------------------
+# --- F-008: the four that fail ----------------------------------------------
 
 [[case]]
 id = "backup.container.chd"
-description = "R-016: CHD is the default output of `convert`, and cannot be backed up. Fails with 'cannot read first sector'."
+description = "F-008: CHD is the default output of `convert`, and cannot be backed up. Fails with 'cannot read first sector'."
 [[case.step]]
 args = ["new", "hd", "mbr", "{scratch}/disk.img", "--size", "64M",
         "--partition", "16M:0b", "--partition", "16M:0b"]
@@ -69,7 +70,7 @@ expect_exit = 0
 
 [[case]]
 id = "backup.container.vhd-dynamic"
-description = "R-016: dynamic VHD has a non-flat block layout, so the raw bytes at offset 0 are not the disk"
+description = "F-008: dynamic VHD has a non-flat block layout, so the raw bytes at offset 0 are not the disk"
 [[case.step]]
 args = ["new", "hd", "mbr", "{scratch}/disk.img", "--size", "64M",
         "--partition", "16M:0b", "--partition", "16M:0b"]
@@ -83,7 +84,7 @@ expect_exit = 0
 
 [[case]]
 id = "backup.container.qcow2"
-description = "R-016: QCOW2 fails with 'failed to detect partition table' — header bytes read as a bad MBR"
+description = "F-008: QCOW2 fails with 'failed to detect partition table' — header bytes read as a bad MBR"
 [[case.step]]
 args = ["new", "hd", "mbr", "{scratch}/disk.img", "--size", "64M",
         "--partition", "16M:0b", "--partition", "16M:0b"]
@@ -97,7 +98,7 @@ expect_exit = 0
 
 [[case]]
 id = "backup.container.vmdk-sparse"
-description = "R-016: VMDK sparse, same shape as QCOW2"
+description = "F-008: VMDK sparse, same shape as QCOW2"
 [[case.step]]
 args = ["new", "hd", "mbr", "{scratch}/disk.img", "--size", "64M",
         "--partition", "16M:0b", "--partition", "16M:0b"]
@@ -113,7 +114,7 @@ expect_exit = 0
 
 [[case]]
 id = "backup.container.inspect-reads-what-backup-cannot"
-description = "Pins the asymmetry at the heart of R-016: inspect reads CHD fine, so the backup failure is a gap rather than an unsupported format"
+description = "Pins the asymmetry at the heart of F-008: inspect reads CHD fine, so the backup failure is a gap rather than an unsupported format"
 [[case.step]]
 args = ["new", "hd", "mbr", "{scratch}/disk.img", "--size", "64M",
         "--partition", "16M:0b", "--partition", "16M:0b"]
