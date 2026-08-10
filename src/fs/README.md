@@ -13,14 +13,25 @@ Trait-based filesystem abstraction for browsing, compaction, resize, and validat
 
 ## Supported Partition Types
 
-| Type Byte(s)                         | Filesystem | Browsing | Compaction | Resize |
-|--------------------------------------|-----------|----------|------------|--------|
-| `0x01`                               | FAT12     | Yes      | Yes        | Yes    |
-| `0x04`, `0x06`, `0x0E`, `0x14`, `0x16`, `0x1E` | FAT16 | Yes | Yes | Yes |
-| `0x0B`, `0x0C`, `0x1B`, `0x1C`      | FAT32     | Yes      | Yes        | Yes    |
-| `0x07`                               | NTFS      | Yes      | Yes        | Yes (VBR patch) |
-| `0x07`                               | exFAT     | Yes      | Yes        | Yes (full bitmap resize) |
-| `0x83`                               | ext2/3/4  | No (planned) | No | No |
+**There is deliberately no capability table here.** One lived at this spot and
+went stale: it listed five filesystems and six type bytes while the engine had
+grown to around forty drivers, and still called ext "planned" years after
+`ext.rs`, `ext_format.rs`, `ext_fsck.rs` and `ext_csum.rs` shipped. A hand-kept
+table two levels down from the code it describes loses that race every time.
+
+Two live sources instead, neither of which can drift:
+
+- **What a filesystem can do** — the Filesystems table in the top-level
+  [`README.md`](../../README.md), which is the user-facing list and is covered
+  by the pre-commit documentation sync in CLAUDE.md.
+- **Which type byte or DosType routes where** — the dispatch itself in
+  [`mod.rs`](mod.rs): `open_filesystem`, `open_editable_filesystem`,
+  `compact_partition_reader`, `effective_partition_size`, and the
+  `partition_type_string` matchers beside them.
+
+The one routing fact that is not obvious from either and belongs here: type
+byte `0x07` covers **both** NTFS and exFAT, and `open_filesystem` disambiguates
+by reading the OEM ID magic (`"NTFS    "` vs `"EXFAT   "`) rather than the byte.
 
 ## How to Add a New Filesystem
 

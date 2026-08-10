@@ -53,8 +53,8 @@ finding depends on a fixture, the fixture is named.
 | ~~R-006~~ | ~~Medium~~ **FIXED** | `src/cli/verbs/new.rs` | ~~`new volume prodos` always fails with default arguments~~ — per-filesystem default, 2026-08-08 |
 | ~~R-004~~ | ~~Low~~ **FIXED** | `src/cli/exit.rs` | ~~CSV/TSV rejection exits 1, documented as 2~~ — errors carry their exit code now, 2026-08-08 |
 | [R-011](#r-011) | Unknown | `src/rbformats/` | G64 decoding fails on copy-protected / patched dumps |
-| [R-001](#r-001) | Doc | `README.md` | Partition-table list missing AHDI and X68000 |
-| [R-002](#r-002) | Doc | `src/fs/README.md` | Capability table stale — ext listed as "planned" |
+| ~~R-001~~ | ~~Doc~~ **FIXED** | `README.md` | ~~Partition-table list missing AHDI and X68000~~ — X68k and DSD rows added, guarded by a parity test, 2026-08-09 |
+| ~~R-002~~ | ~~Doc~~ **FIXED** | `src/fs/README.md` | ~~Capability table stale — ext listed as "planned"~~ — table deleted for a pointer at the live dispatch, 2026-08-09 |
 
 ---
 
@@ -1194,6 +1194,25 @@ limitation rather than an acceptable boundary. `.d64` and `.g71` unaffected.
 
 ### R-001 — README partition-table list missing two schemes {#r-001}
 
+**FIXED 2026-08-09**, and the report had aged in both directions by the time it
+was picked up. AHDI had been added incidentally on 2026-08-04 by
+`e0c9bf6` ("write Atari AHDI root sectors"), two days after this was filed —
+so that half was already closed. Meanwhile a tenth variant, `Dsd`, had been
+added and was missing too. The same drift, still drifting, which is the
+argument for the test rather than the edit.
+
+README § Partition tables now has a row for **X68k** and for **DSD**.
+
+`tests/doc_parity.rs::readme_documents_every_partition_table_scheme` reads
+`PartitionTable::ALL_TYPE_NAMES` and requires a row per scheme, so this cannot
+recur silently. Two guards make that list trustworthy: `type_name`'s match is
+exhaustive, so a new variant is a compile error, and a `#[cfg(test)]`
+exhaustiveness guard in `src/partition/mod.rs` pins the variant count against
+`ALL_TYPE_NAMES.len()`, so extending one without the other fails to build or
+fails the test. Verified by deleting the X68k row and watching the test name it.
+
+---
+
 `src/partition/mod.rs` defines nine `PartitionTable` variants: `Mbr`, `Gpt`,
 `Apm`, `Rdb`, `Sgi`, `Sun`, `Ahdi`, `X68k`, `None`. README § Partition tables
 lists only MBR, GPT, APM, RDB, SGI, Sun and "None (superfloppy)" — **Atari
@@ -1205,6 +1224,22 @@ Exactly the drift class CLAUDE.md's pre-commit documentation-sync section
 warns about.
 
 ### R-002 — `src/fs/README.md` capability table is stale {#r-002}
+
+**FIXED 2026-08-09 — by deleting the table, which was the second of the two
+options this report offered.** Regenerating it from the `fs/mod.rs` dispatch
+would have produced a forty-row table two directory levels below the code it
+describes, i.e. the same race with a longer starting line. The file now points
+at the two live sources instead: the top-level README's Filesystems table for
+capabilities, and the dispatch functions in `mod.rs` for routing.
+
+One routing fact was worth keeping rather than deleting, and stayed: type byte
+`0x07` covers both NTFS and exFAT, and `open_filesystem` disambiguates on the
+OEM ID magic rather than the byte.
+
+`tests/doc_parity.rs::fs_readme_has_no_hand_kept_capability_table` fails if a
+`(planned)` claim or a capability table grows back there.
+
+---
 
 Still lists ext2/3/4 as "No (planned)" for browsing, compaction and resize,
 and covers only six partition type bytes. The engine implements ext fully
@@ -1235,6 +1270,9 @@ Run `rb-regress run --tiers 0-4` to check them all.
 | R-013 | `fs.detect.ufs-{solaris-entry-types,no-absurd-sizes}` | red |
 | R-015 | `optical.cue.unpadded-track-number` | red — blocked upstream |
 | F-008 | `backup.container.{chd,vhd-dynamic,qcow2,vmdk-sparse}` | red — a feature gap, was R-016 |
+| R-001 | `doc_parity::readme_documents_every_partition_table_scheme` | **green — fixed** |
+| R-002 | `doc_parity::fs_readme_has_no_hand_kept_capability_table` | **green — fixed** |
+| R-018 | `doc_parity::contributing_vintage_features_match_ci` | **green — fixed** |
 | R-017 | `fs.detect.sfs-bare-volume` | **green — fixed** |
 | R-025 | `subcmd.squashfs.put-rebuilds`, `meta.xattr.set-list-rm` | red — Windows only |
 | R-026 | `subcmd.show.partmap` | **green — fixed** |
@@ -1254,16 +1292,17 @@ already works.
 
 **Not covered:**
 
-- **R-001, R-002** — documentation drift. Not expressible as a CLI case; they
-  need a source-parity test comparing the README tables against the
-  `PartitionTable` enum and the `fs/mod.rs` dispatch.
+- ~~**R-001, R-002**~~ — **now covered.** `tests/doc_parity.rs` is the
+  source-parity test this entry asked for. It is a `cargo test`, not an
+  `rb-regress` case, because the claim is *about* the binary rather than
+  something the binary does — the suite runs `rb-cli` and cannot see a stale
+  markdown table. R-018 is covered by the same file.
 - **R-011** — only the working half is pinned. No case asserts that
   copy-protected G64 dumps open, because whether they should is undecided;
   asserting either way would prejudge it.
-- **R-018** — a documentation failure, not runtime behaviour, and the suite
-  runs the modern binary. A docs-parity test comparing CONTRIBUTING.md's
-  feature list against the workflow's would guard it; that is the same
-  source-parity test R-001 / R-002 need, so it belongs with them.
+- ~~**R-018**~~ — **now covered**, by exactly the test that entry predicted:
+  `doc_parity::contributing_vintage_features_match_ci` asserts CONTRIBUTING.md's
+  vintage feature list appears verbatim in `.github/workflows/release.yml`.
 - **R-014** — a lint failure, not runtime behaviour. The pre-commit hook is
   itself the regression guard: it runs `clippy --all-targets -- -D warnings`
   on every commit, so a reintroduction cannot be committed.
@@ -1282,5 +1321,6 @@ already works.
 5. **R-005**, **R-004**, **R-003** — the CLI contract group; cheap, and the
    regression harness depends on that contract being true.
 6. **R-006** — a one-line default change.
-7. **R-001**, **R-002** — fold into the next docs commit.
+7. ~~**R-001**, **R-002**~~ — done; both fixed and both now guarded by
+   `tests/doc_parity.rs`, along with R-018.
 8. **R-011** — decide scope first.

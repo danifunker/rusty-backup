@@ -1353,6 +1353,14 @@ impl PartitionTable {
         }
     }
 
+    /// Every value [`PartitionTable::type_name`] can return, in variant order.
+    ///
+    /// Exists so `tests/doc_parity.rs` can require a README row per scheme;
+    /// the `#[cfg(test)]` guard below keeps it honest when a variant is added.
+    pub const ALL_TYPE_NAMES: &'static [&'static str] = &[
+        "MBR", "GPT", "APM", "RDB", "SGI", "Sun", "AHDI", "X68k", "None", "DSD",
+    ];
+
     /// Get a human-readable name for the partition table type.
     pub fn type_name(&self) -> &'static str {
         match self {
@@ -2428,5 +2436,38 @@ mod native_slot_tests {
         assert_eq!(parts.len(), 2, "map + driver are not data partitions");
         assert_eq!(table.native_slot(&parts[0]), Some(3));
         assert_eq!(table.native_slot(&parts[1]), Some(4));
+    }
+}
+
+#[cfg(test)]
+mod type_name_parity {
+    use super::*;
+
+    /// Never called — it exists so that adding a `PartitionTable` variant is a
+    /// compile error here, which is the cue to extend `ALL_TYPE_NAMES` too.
+    #[allow(dead_code)]
+    fn every_variant_has_an_index(t: &PartitionTable) -> usize {
+        match t {
+            PartitionTable::Mbr(_) => 0,
+            PartitionTable::Gpt { .. } => 1,
+            PartitionTable::Apm(_) => 2,
+            PartitionTable::Rdb(_) => 3,
+            PartitionTable::Sgi(_) => 4,
+            PartitionTable::Sun(_) => 5,
+            PartitionTable::Ahdi(_) => 6,
+            PartitionTable::X68k { .. } => 7,
+            PartitionTable::None { .. } => 8,
+            PartitionTable::Dsd { .. } => 9,
+        }
+    }
+
+    #[test]
+    fn all_type_names_covers_every_variant() {
+        assert_eq!(
+            PartitionTable::ALL_TYPE_NAMES.len(),
+            10,
+            "a PartitionTable variant was added or removed: update ALL_TYPE_NAMES, \
+             every_variant_has_an_index, and the README table tests/doc_parity.rs checks"
+        );
     }
 }
