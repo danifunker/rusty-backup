@@ -226,14 +226,23 @@ stderr_contains = ["editing not yet supported", "Unknown"]
 
 [[case]]
 id = "edit.real.efs-small"
+description = """A truncated EFS capture: it lists and reads, and cannot be
+edited or fsck'd.
+
+Corrected 2026-08-10. This asserted a put/get round-trip plus a clean fsck, and
+R-029 was filed when both failed at byte offsets far outside the image. The
+engine was right and the fixture is broken: its superblock declares 7,486,242
+blocks across 78 cylinder groups (3.8 GB) while the file is 8,192 blocks (4 MB).
+It was minimised by truncation — the catalogue still says `synthetic-minimal` —
+leaving a superblock that describes a volume which is not there.
+
+Reads inside the surviving prefix work, so that is what this case pins. Editing
+EFS on a real volume needs an internally consistent fixture; see R-029."""
 fixture = "fs.efs.small.hd"
 [[case.step]]
-args = ["put", "{fixture_copy}", "{cases}/tier3/payload.bin", "/payload.bin"]
+args = ["ls", "{fixture_copy}", "/"]
 expect_exit = 0
+stdout_contains = ["lost+found"]
 [[case.step]]
-args = ["get", "{fixture_copy}", "/payload.bin", "{scratch}/out.bin"]
-expect_exit = 0
-files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
-[[case.step]]
-args = ["fsck", "{fixture_copy}", "--checkonly"]
+args = ["get", "{fixture_copy}", "/.bash_profile", "{scratch}/out.txt"]
 expect_exit = 0

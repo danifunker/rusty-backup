@@ -1361,6 +1361,21 @@ impl<R: Read + Seek> Read for CompactSfsReader<R> {
 const FS_EXTENTBNODE_SIZE: usize = 14;
 const FS_OBJECTNODE_SIZE: usize = 10;
 
+/// The SFS editor's ceiling, reported as `Unsupported` rather than `Parse`.
+///
+/// A `Parse` error blamed the disk and exited 1, indistinguishable from a
+/// corrupt image — R-034's shape. The volume is intact and reads fine; only
+/// writing is refused. `Unsupported` routes through `write_open_error` to
+/// PERMISSION_DENIED (4). Tracked as F-009.
+fn multi_leaf_unsupported() -> FilesystemError {
+    FilesystemError::Unsupported(
+        "SFS extent b-tree has interior nodes; this editor writes single-leaf trees only, \
+         which any volume of real size outgrows. The volume is intact and readable — only \
+         writing is refused."
+            .to_string(),
+    )
+}
+
 impl SfsRootBlock {
     /// Write the rootblock fields into the first portion of the block
     /// buffer. The `ownblock` field is left intact (callers stamp it).
@@ -1627,9 +1642,7 @@ impl<R: Read + Seek> SfsFilesystem<R> {
         let isleaf = buf[14];
         let nodesize = buf[15] as usize;
         if isleaf == 0 {
-            return Err(parse_err(
-                "extent_btree_insert: only single-leaf BNDC supported",
-            ));
+            return Err(multi_leaf_unsupported());
         }
         if nodesize != FS_EXTENTBNODE_SIZE {
             return Err(parse_err(format!(
@@ -1680,9 +1693,7 @@ impl<R: Read + Seek> SfsFilesystem<R> {
         let isleaf = buf[14];
         let nodesize = buf[15] as usize;
         if isleaf == 0 {
-            return Err(parse_err(
-                "extent_btree_remove: only single-leaf BNDC supported",
-            ));
+            return Err(multi_leaf_unsupported());
         }
         let entries_off = 16;
         let mut found: Option<usize> = None;

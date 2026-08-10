@@ -386,7 +386,11 @@ pub fn run_with_budget(
                 preserve_meta: !args.no_preserve_meta,
             },
         )
-        .map_err(|e| anyhow!("create_file: {e}"))?;
+        // Through write_open_error so an `Unsupported` from the driver — "this
+        // filesystem is readable and this build will not write it" — exits 4
+        // rather than the catch-all 1. The write-open path has done this since
+        // R-034; create_file can refuse for the same reason and did not.
+        .map_err(|e| crate::cli::resolve::write_open_error("create_file", e))?;
         if outcome.unsafe_fallback {
             log_stderr(
                 "Note: this filesystem cannot stage a replace (no rename), so the original \

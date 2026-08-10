@@ -495,6 +495,23 @@ impl<R: Read + Seek> EfsFilesystem<R> {
             &mut sector,
         )?;
         let sb = EfsSuperblock::parse(&sector)?;
+        // A volume whose superblock describes more blocks than the image holds
+        // is a truncated capture, not a filesystem. Reads of anything in the
+        // surviving prefix still work, so this warns rather than refuses — but
+        // without it the first allocation or fsck walk fails as an
+        // uninterpretable short read at a byte offset far past the end (R-029).
+        let available = reader
+            .seek(SeekFrom::End(0))?
+            .saturating_sub(partition_offset);
+        let declared = (sb.fs_size as u64).saturating_mul(EFS_BLOCKSIZE);
+        if declared > available {
+            log::warn!(
+                "EFS superblock declares {} blocks ({declared} bytes) but only {available} bytes \
+                 are present: this image is truncated. Reads inside the surviving prefix work; \
+                 anything that walks the whole volume (fsck, allocation) will run off the end.",
+                sb.fs_size,
+            );
+        }
         let label = sb.label();
         Ok(EfsFilesystem {
             reader,

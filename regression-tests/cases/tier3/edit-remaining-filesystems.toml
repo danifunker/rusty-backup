@@ -153,28 +153,28 @@ expect_exit = 0
 
 [[case]]
 id = "edit.sfs.put-get"
-description = """SFS edit round-trip. This is the case the FS-UAE oracle work was
-aiming at: rb-cli cannot WRITE an SFS volume from scratch, so the only way to
-exercise the SFS editor is to edit the reference volume and check the result."""
+description = """F-009 (filed as R-032 until 2026-08-10): the SFS editor writes
+single-leaf extent b-trees only, so any volume of real size — including this
+reference disk — refuses a write, cleanly.
+
+Reclassified rather than fixed: the driver has documented this ceiling all
+along (CLAUDE.md: "single-leaf btree only"), so hitting it is the limit working
+as described, not code disagreeing with itself. What was wrong is how it
+refused — a Parse error, which blames the disk, exiting 1. The disk is fine and
+reads perfectly.
+
+This case now pins the refusal: Unsupported, exit 4, and the volume still
+readable afterwards. When multi-leaf insert lands it becomes an XPASS and the
+case flips back to asserting the round-trip."""
 fixture = "fs.sfs.workbench-dh0.hd"
 timeout_ms = 600000
 [[case.step]]
 args = ["put", "{fixture_copy}", "{cases}/tier3/payload.bin", "/payload.bin", "--fs-type", "SFS\\0"]
-expect_exit = 0
+expect_exit = 4
+stderr_contains = ["single-leaf"]
 [[case.step]]
-args = ["get", "{fixture_copy}", "/payload.bin", "{scratch}/out.bin", "--fs-type", "SFS\\0"]
+args = ["ls", "{fixture_copy}", "/", "--fs-type", "SFS\\0"]
 expect_exit = 0
-files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
-[[case.step]]
-args = ["fsck", "{fixture_copy}", "--checkonly", "--fs-type", "SFS\\0"]
-expect_exit = 0
-
-# --- PFS3 ---------------------------------------------------------------------
-# `fs.pfs3.rdb-cd32saves.hd` (80 MB, RDB-partitioned) is catalogued and was
-# simply unused. An earlier draft of this file claimed no PFS3 fixture existed;
-# that came from reading the case files rather than the catalogue, which is the
-# wrong direction to check in.
-
 [[case]]
 id = "edit.pfs3.put-get"
 description = "PFS3 edit round-trip against the catalogued RDB volume"

@@ -59,9 +59,3 @@ finding = "F-008"
 # --- Found 2026-08-08, first execution of the tier-3 sweep -------------------
 # None of these had ever run: the last full Windows run predates the tier-2 and
 # tier-3 authoring commits, so it covered 134 of 256 cases and reported green.
-[[known]]
-id = "edit.real.efs-small"
-finding = "R-029"
-[[known]]
-id = "edit.sfs.put-get"
-finding = "R-032"

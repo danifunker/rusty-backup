@@ -19,6 +19,7 @@ concrete reason to.
 | [F-006](#f-006) | IRIX support-disk building / browsing is thin | `src/cli/verbs/new_sgi_cdrom.rs` | bootable IRIX disc work — **needs scope** |
 | [F-007](#f-007) | No optical fixture with nested directories | `regression-tests/` | verifying `--path DIR --recursive` |
 | [F-008](#f-008) | `backup` reads only flat-layout sources | `src/cli/verbs/backup.rs` | backing up CHD / dynamic VHD / QCOW2 / VMDK — **four red cases** |
+| [F-009](#f-009) | SFS editor writes single-leaf extent b-trees only | `src/fs/sfs.rs` | editing any real-sized SFS volume |
 | ~~F-004~~ | ~~`show partmap` is APM-only~~ — **SHIPPED** 2026-08-08, same gap as R-026 | `src/cli/verbs/show.rs` | — |
 
 ---
@@ -289,3 +290,42 @@ an artifact of how the synthetic containers were built.
 2. `--format raw` writes `partition-N.img` files, so a `find` over several
    directories can pick up an unrelated `.img` and attribute the wrong result
    to the wrong container. Use explicit paths per case.
+
+## F-009 — the SFS editor writes single-leaf extent b-trees only {#f-009}
+
+Filed as defect [R-032](Regression_Bugs.md#r-032) until 2026-08-10.
+**Reclassified**: the driver has always documented this ceiling — CLAUDE.md
+says "SFS (`src/fs/sfs.rs`) — read + edit (single-leaf btree only)" — so hitting
+it is the documented limit, not code disagreeing with itself. That is the same
+line R-016 was moved across.
+
+SFS keeps its free-space extents in a b-tree. `extent_btree_insert` and
+`extent_btree_remove` handle a tree that is a single leaf node; a volume large
+enough to need interior nodes — which is any volume of real size, including the
+Workbench reference disk — cannot be written.
+
+```
+rb-cli put fs.sfs.workbench-dh0.hd.img payload.bin /payload.bin
+  -> error: create_file: unsupported: SFS extent b-tree has interior nodes;
+     this editor writes single-leaf trees only ...
+  -> exit 4
+```
+
+**Two things were fixed while reclassifying it**, because how it refused was
+wrong even if the refusal was right:
+
+- It raised a **`Parse`** error, which says the *disk* is malformed. The disk is
+  fine and reads perfectly. It is now `Unsupported` — the volume is readable and
+  this build will not write it — which is precisely what
+  `exit.rs` reserves `PERMISSION_DENIED` for.
+- `put` mapped every `create_file` failure to the catch-all 1. It now routes
+  through `write_open_error`, the R-034 machinery, so the refusal exits **4**.
+  The write-*open* path had done this since R-034; `create_file` can refuse for
+  the same reason and did not.
+
+**What implementing it needs.** Node splitting, root promotion and parent
+updates against the on-disk `BNDC` format. The hard part is not the code but
+the validation: writes to a real Amiga filesystem cannot be confirmed from here
+— see [R-020](Regression_Bugs.md#r-020), where every emulator and MiSTer-core
+oracle resolves to `skip-manual`. Teaching `verify` to drive FS-UAE unblocks
+this and R-020 together.

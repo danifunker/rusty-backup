@@ -28,10 +28,10 @@ finding depends on a fixture, the fixture is named.
 | ~~R-026~~ | ~~Low~~ **FIXED** | `src/cli/verbs/show.rs` | ~~`show partmap` cannot read an SGI disk that `inspect` reads fine~~ — detects the table first, 2026-08-08 |
 | ~~R-027~~ | ~~Medium~~ **FIXED** | `src/rbformats/zip_disk.rs` | ~~A Finder-made `.zip` holding one `.dmg` is rejected as ambiguous~~ — extension list derived from the canonical one, 2026-08-08 |
 | ~~R-030~~ | ~~**High**~~ **FIXED** | `src/fs/affs.rs` | ~~A real Workbench 1.3 AFFS volume cannot be opened at all~~ — the root block was located from the end of the file, not the partition, 2026-08-10 |
-| [R-029](#r-029) | **High** | `src/fs/efs.rs` | EFS computes block addresses far outside the image; `fsck` fails on an unmodified volume |
+| ~~R-029~~ | ~~**High**~~ **FIXTURE DEFECT** | — | ~~EFS computes block addresses far outside the image~~ — the fixture is a truncated capture; the engine was following its superblock, 2026-08-10 |
 | [R-031](#r-031) | Medium | `src/partition/mod.rs` | A real Apple DOS 3.3 disk is detected as `unknown`, though our own output is not |
 | ~~R-028~~ | ~~Medium~~ **FIXED** | `src/fs/apple_dos.rs` | ~~Apple DOS 3.3 reports three different sizes for one file~~ — length stored in a type-B header; all three now agree, 2026-08-10 |
-| [R-032](#r-032) | Low | `src/fs/sfs.rs` | SFS `put` fails on any volume with a multi-leaf extent btree — i.e. any real one |
+| ~~R-032~~ | ~~Low~~ **RECLASSIFIED** | `src/fs/sfs.rs` | ~~SFS `put` fails on any volume with a multi-leaf extent btree~~ — the documented ceiling; moved to [F-009](missing_features_from_regression.md#f-009), 2026-08-10 |
 | ~~R-033~~ | ~~High~~ **FIXED** | `src/partition/mod.rs` | ~~A QL Microdrive `.mdv` fails at MBR detection, though its own probe matches it exactly~~ — probe added beside the HPFS one, 2026-08-10 |
 | ~~R-034~~ | ~~Medium~~ **FIXED** | `src/fs/mod.rs` | ~~Refusing a write to a read-only filesystem says `unknown` and exits 1, not 4~~ — names the filesystem, exits 4, 2026-08-08 |
 | ~~R-035~~ | ~~Medium~~ **FIXED** | `src/backup/` | ~~`.cbk` embeds the producing host's absolute path, so it can never be byte-identical across machines~~ — path normalised to a leaf, 2026-08-09 |
@@ -1016,6 +1016,41 @@ share a fix. Cases `edit.real.affs-workbench13`.
 
 ### R-029 — EFS computes block addresses far outside the image {#r-029}
 
+**NOT AN ENGINE DEFECT — closed 2026-08-10.** The addresses are outside the
+image because the *superblock says so*. `fs.efs.small.hd` is a truncated
+capture:
+
+```
+superblock: fs_size 7,486,242 blocks, 78 cylinder groups, cgfsize 95,954
+            = 3.8 GB
+image file: 8,192 blocks = 4 MB
+```
+
+The engine was reading exactly where a 3.8 GB EFS volume keeps its cylinder
+groups. `ls` and `get` work because the directory and the sampled files survive
+in the first 4 MB; `fsck` walks all 78 groups and `put` allocates against a
+bitmap spanning the declared size, so both run off the end — at byte 50,065,408
+and byte 344,826,880 respectively, which is what the entry recorded as the
+symptom.
+
+The catalogue still marks the fixture `synthetic-minimal`: it was minimised by
+truncation, and truncating a filesystem does not shrink it, it breaks it.
+
+**Two things did change.** `EfsFilesystem::open` now compares the declared size
+against what is actually present and warns when the image is short, naming both
+numbers — an uninterpretable "short read at byte 344826880" was most of why this
+sat in Tranche C. And the case, which asserted a put/get round-trip plus a clean
+fsck on a volume that cannot support either, now pins what the surviving prefix
+does support: listing and reading.
+
+**To test EFS editing on a real volume**, the corpus needs an internally
+consistent capture — a whole small EFS filesystem, not the first 4 MB of a large
+one. `edit.efs.put-get` covers the write path on a volume we build ourselves and
+is green.
+
+---
+
+
 ```
 rb-cli ls    fs.efs.small.hd.img /            -> lists the tree fine
 rb-cli fsck  fs.efs.small.hd.img --checkonly
@@ -1169,6 +1204,23 @@ and geometry. The error message is about editing, which is misleading — the
 volume was never identified. Case `edit.real.apple-dos-invaders`.
 
 ### R-032 — SFS `put` fails on any volume with a multi-leaf extent btree {#r-032}
+
+**RECLASSIFIED 2026-08-10 — not a defect.** The driver has documented this
+ceiling all along (CLAUDE.md: "SFS — read + edit (single-leaf btree only)"), so
+hitting it is the limit working as described. Moved to
+[F-009](missing_features_from_regression.md#f-009); this entry's own text said
+as much ("the known ceiling being hit, not a surprise").
+
+**How it refused was wrong, though, and that is fixed.** It raised a `Parse`
+error — which says the *disk* is malformed, when the disk is fine and reads
+perfectly — and `put` mapped it to the catch-all 1. It is now `Unsupported`,
+routed through `write_open_error`, exiting **4**: readable volume, refused
+write. That is R-034's shape, and it turned up a second instance of the same
+gap — the write-*open* path had been fixed, but `create_file` had not, so every
+driver that refuses at creation time exited 1. That mapping is now shared.
+
+---
+
 
 ```
 rb-cli ls  fs.sfs.workbench-dh0.hd.img /    -> lists the tree fine
@@ -1814,6 +1866,8 @@ Run `rb-regress run --tiers 0-4` to check them all.
 | R-008b | `fs.new-volume.affs.{4m,32m}` | **green — fixed** |
 | R-009 | `fs.read.{jfs,reiserfs,ufs1,ufs2}` | **green — fixed** |
 | R-010 | `cli.flags.inspect-accepts-fs-type` | **green — fixed** |
+| F-009 | `edit.sfs.put-get` | red — the documented ceiling, was R-032 |
+| R-029 | `edit.real.efs-small` | **green — fixture defect, case corrected** |
 | R-013 | `fs.detect.ufs-{solaris-entry-types,no-absurd-sizes}` | **green — fixed** |
 | R-028 | `edit.apple-dos.put-get` | **green — fixed** |
 | R-031 | `edit.real.apple-dos-invaders` | **green — not a defect** |
