@@ -49,12 +49,12 @@ finding depends on a fixture, the fixture is named.
 | [R-013](#r-013) | **High** | `src/fs/ufs.rs` | Solaris UFS directories reported as files, one with a garbage size |
 | ~~R-005~~ | ~~Medium~~ **FIXED** | `src/cli/output.rs` | ~~No error envelope emitted under `--format json`~~ — format recorded before dispatch, envelope emitted from `main`, 2026-08-09 |
 | [R-008a](#r-008a) | Medium | `src/fs/affs.rs` | AFFS volumes above 4066 blocks have uncovered tail blocks |
-| [R-012](#r-012) | Medium | `src/optical/` | `optical info` rejects any disc with no data track (pure CD-DA) |
+| ~~R-012~~ | ~~Medium~~ **FIXED** | upstream `opticaldiscs` | ~~`optical info` rejects any disc with no data track (pure CD-DA)~~ — fixed upstream, pin bumped to 0.15.0, 2026-08-10 |
 | ~~R-003~~ | ~~Medium~~ **FIXED** | `src/cli/output.rs` | ~~Docs claim `ls` supports `--format`; it does not~~ — flag implemented, all five formats, 2026-08-09 |
 | ~~R-010~~ | ~~Medium~~ **FIXED** | `src/cli/verbs/inspect.rs` | ~~`inspect` has no `--fs-type`, so CP/M images cannot be inspected~~ — flag added and honoured, 2026-08-08 |
 | ~~R-006~~ | ~~Medium~~ **FIXED** | `src/cli/verbs/new.rs` | ~~`new volume prodos` always fails with default arguments~~ — per-filesystem default, 2026-08-08 |
 | ~~R-004~~ | ~~Low~~ **FIXED** | `src/cli/exit.rs` | ~~CSV/TSV rejection exits 1, documented as 2~~ — errors carry their exit code now, 2026-08-08 |
-| [R-011](#r-011) | Unknown | `src/rbformats/` | G64 decoding fails on copy-protected / patched dumps |
+| [R-011](#r-011) | **Partial** | `src/rbformats/containers/g64.rs` | Copy-protected G64 dumps: read-only refusal fixed; decode of non-standard GCR unverified (no fixture) |
 | ~~R-001~~ | ~~Doc~~ **FIXED** | `README.md` | ~~Partition-table list missing AHDI and X68000~~ — X68k and DSD rows added, guarded by a parity test, 2026-08-09 |
 | ~~R-002~~ | ~~Doc~~ **FIXED** | `src/fs/README.md` | ~~Capability table stale — ext listed as "planned"~~ — table deleted for a pointer at the live dispatch, 2026-08-09 |
 
@@ -1026,6 +1026,12 @@ unqualified. Read is unaffected. Case `edit.sfs.put-get`.
 
 ### R-015 — cue sheets with unpadded track numbers are rejected {#r-015}
 
+**FIXED 2026-08-10, upstream.** Fixed in `opticaldiscs` 0.15.0; bumping the
+pin from 0.13.0 was the whole change on our side.
+
+---
+
+
 **Blocked upstream, confirmed 2026-08-08.** The cue parser is in the
 `opticaldiscs` crate, not this repository. Bumping 0.13.0 -> 0.14.0 builds
 without any API change and does **not** fix it, so the bump was reverted
@@ -1143,6 +1149,17 @@ volume requires, chained through the root block's `bm_pages` slots, with the
 marking loop bounded.
 
 ### R-012 — `optical info` rejects discs with no data track {#r-012}
+
+**FIXED 2026-08-10, upstream.** `opticaldiscs` 0.15.0 adds
+`FilesystemType::None`: a disc carrying no data track now reports that instead
+of being refused. It is deliberately distinct from `Unknown`, which means
+"there is a filesystem here and we did not recognise it". Our side was one
+match arm in `fs_token` — the new variant made the match non-exhaustive, so the
+compiler pointed at the exact place the fix had to land.
+`optical.cdda.mixed-mode-still-opens`, the working-half case, stays green.
+
+---
+
 
 **Blocked upstream, confirmed 2026-08-08.** Same crate as [R-015](#r-015) and
 same result on 0.14.0: still `No data track found`.
@@ -1346,6 +1363,42 @@ rejection has to carry the code, not the message alone. Case
 `shrink.rejects-non-chd-output`.
 
 ### R-011 — G64 fails on copy-protected / patched dumps {#r-011}
+
+**DECIDED 2026-08-10:** copy-protected dumps *should* open — preserving those
+disks is the reason G64 exists rather than D64 — and should be **un-editable**.
+
+**Half of that shipped, and the investigation corrected the report.** G64 was
+already un-editable: `is_editable_container_path` never listed it. But the
+write path then fell through to opening the *undecoded container bytes*, which
+reported `Invalid MBR: invalid boot signature` — the same error this report
+attributes to copy protection. It reproduces on the **working** dump:
+
+```
+rb-cli ls  fmt.g64.gcr.floppy.g64   -> lists CEST LA VIE, CLV.O, CLV
+rb-cli put fmt.g64.gcr.floppy.g64 f /HI
+  -> error: detecting partition table: Invalid MBR: invalid boot signature
+```
+
+So that error was never evidence of a GCR problem. Any verb that took the write
+path produced it on any G64. Now the whole class — G64/G71, MSA, EDSK,
+Apple-II `.dsk`: containers the read path decodes and the write path cannot
+re-encode — is refused with `PERMISSION_DENIED` (4) and a message naming the
+reason and the conversion that gets you an editable copy. Same shape as
+[R-034](#r-034). Cases `fmt.g64.{standard-dump-opens,is-read-only}`.
+
+**What is still open, and why it cannot be closed here.** Whether the two named
+dumps *decode* is unverified: neither is in the corpus or the dropbox, only the
+working one is. `decode_g64_1541` already tolerates partial decode — it bails
+only when *no* track yields sectors — so a protected disk with a readable
+directory track should open today. Confirming that needs the files.
+
+**To close this:** drop `Protector II (must be write protected).g64` and
+`American Express (Magic Disk 64 1989-09 Side 2) [patched].g64` into the fixture
+dropbox. The decision above says what the answer must be; only the evidence is
+missing.
+
+---
+
 
 Of three real G64 files, one opened and two failed:
 
@@ -1566,9 +1619,9 @@ Run `rb-regress run --tiers 0-4` to check them all.
 | R-009 | `fs.read.{jfs,reiserfs,ufs1,ufs2}` | **green — fixed** |
 | R-010 | `cli.flags.inspect-accepts-fs-type` | **green — fixed** |
 | R-011 | `fmt.g64.standard-dump-opens` | green — **pins the working half only** |
-| R-012 | `optical.cdda.no-data-track-opens` | red — blocked upstream |
+| R-012 | `optical.cdda.no-data-track-opens` | **green — fixed upstream** |
 | R-013 | `fs.detect.ufs-{solaris-entry-types,no-absurd-sizes}` | red |
-| R-015 | `optical.cue.unpadded-track-number` | red — blocked upstream |
+| R-015 | `optical.cue.unpadded-track-number` | **green — fixed upstream** |
 | F-008 | `backup.container.{chd,vhd-dynamic,qcow2,vmdk-sparse}` | red — a feature gap, was R-016 |
 | R-001 | `doc_parity::readme_documents_every_partition_table_scheme` | **green — fixed** |
 | R-002 | `doc_parity::fs_readme_has_no_hand_kept_capability_table` | **green — fixed** |
@@ -1577,6 +1630,7 @@ Run `rb-regress run --tiers 0-4` to check them all.
 | R-023 | `resize.repack.{keeps-data,refuses-plain-fat}` | **green — fixed** |
 | R-022 | `roundtrip.hpfs.raw`, `fs.detect.hpfs-{bare-volume,backup-is-not-empty}` | **green — fixed** |
 | R-036 | `cli.exit.{ls,du,fsck,show-fs-info,locate,tar}-missing-image-is-not-found` | **green — fixed** |
+| R-011 | `fmt.g64.{standard-dump-opens,is-read-only}` | **green — read-only half fixed** |
 | R-037 | `resize.shrink.{refuses-cutting-live-data,needs-confirmation,keeps-data-and-truncates}` | **green — fixed** |
 | R-017 | `fs.detect.sfs-bare-volume` | **green — fixed** |
 | R-025 | `subcmd.squashfs.put-rebuilds`, `meta.xattr.set-list-rm` | red — Windows only |

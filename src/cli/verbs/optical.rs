@@ -806,6 +806,11 @@ fn fs_token(ft: opticaldiscs::FilesystemType) -> String {
         F::Cdi => "cdi",
         F::Opera => "opera",
         F::Xdvdfs => "xdvdfs",
+        // opticaldiscs 0.15 reports a disc that carries no data track at all —
+        // a pure CD-DA audio disc — rather than refusing to open it (R-012).
+        // Distinct from `Unknown`, which means "there is a filesystem here and
+        // we did not recognise it".
+        F::None => "none",
         F::Unknown => "unknown",
     }
     .to_string()

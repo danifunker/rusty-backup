@@ -67,27 +67,43 @@ expect_exit = 0
 stdout_not_contains = ["14989422569311248440"]
 
 # --- R-011 ------------------------------------------------------------------
+# Decided 2026-08-10: a copy-protected or patched G64 SHOULD open — preserving
+# those disks is the reason G64 exists rather than D64 — and must be
+# un-editable, because the write path cannot re-encode raw GCR.
 
 [[case]]
 id = "fmt.g64.standard-dump-opens"
-description = "The working half of R-011. Two of three real G64s failed (both copy-protected or patched); this pins the one that works so a decoder change cannot quietly lose it too."
+description = "A standard G64 dump decodes and lists its files."
 fixture = "fmt.g64.gcr.floppy"
 [[case.step]]
 args = ["inspect", "{fixture}"]
 expect_exit = 0
+[[case.step]]
+args = ["ls", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["CEST LA VIE"]
 
-# NOTE: no case asserts that protected/patched G64 dumps open. R-011 is
-# recorded as Unknown severity pending a decision on whether non-standard GCR
-# is in scope — preserving copy-protected disks is the reason G64 exists
-# rather than D64, so it may be a real limitation rather than an acceptable
-# boundary. Asserting either outcome now would prejudge that call.
+[[case]]
+id = "fmt.g64.is-read-only"
+description = """R-011: a G64 opens for reading and refuses writes with
+PERMISSION_DENIED, naming the reason.
 
-# --- R-022 ------------------------------------------------------------------
-# Filed as "HPFS does not survive a sector-by-sector round-trip". The round
-# trip was the symptom; detection was the cause, and the real damage was worse
-# than the finding recorded — `backup` wrote no partition file at all. These
-# two pin the mechanism rather than the symptom, so a detection regression is
-# named as one instead of surfacing as a mysterious fidelity failure.
+It was already un-editable — is_editable_container_path never listed G64 — but
+the write path fell through to opening the undecoded container bytes and
+reported "Invalid MBR: invalid boot signature". That reads as a corrupt disk a
+moment after `ls` listed its files, which is R-034's shape exactly. Note this
+reproduced on the *working* dump, so the misleading error was never about copy
+protection at all."""
+fixture = "fmt.g64.gcr.floppy"
+[[case.step]]
+args = ["put", "{fixture}", "{cases}/tier3/payload.bin", "/PAYLOAD"]
+expect_exit = 4
+stderr_contains = ["read-only"]
+# The refusal must not have touched the image: it still reads.
+[[case.step]]
+args = ["ls", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["CEST LA VIE"]
 
 [[case]]
 id = "fs.detect.hpfs-bare-volume"

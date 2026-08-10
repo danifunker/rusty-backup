@@ -454,6 +454,22 @@ pub fn resolve_image_rw(path: &std::path::Path) -> Result<(BoxRwSeek, RwCommit, 
         }
         return Ok((Box::new(reader), RwCommit::None, HandleShape::Wrapped));
     }
+    // A container the read path decodes but the write path cannot re-encode:
+    // G64/G71 raw GCR, MSA, EDSK, Apple-II .dsk. Refusing here says so; falling
+    // through opened the undecoded container bytes and reported "Invalid MBR:
+    // invalid boot signature", which reads as a corrupt disk a moment after
+    // `ls` listed its files (R-011, same shape as R-034).
+    if source_reader::is_flat_floppy_container_path(path)
+        && !source_reader::is_editable_container_path(path)
+    {
+        return Err(crate::cli::exit::permission_denied(format!(
+            "{}: this container is read-only — it decodes for reading but cannot be \
+             re-encoded, so edits would have nowhere to go. Convert it first: \
+             `rb-cli convert {} OUT.d64 --format raw`.",
+            path.display(),
+            path.display(),
+        )));
+    }
     if source_reader::is_editable_container_path(path) {
         // Floppy / gzip / WOZ container: decode to a temp flat, edit that,
         // re-encode on commit. open_image_rw on the temp gives the same File

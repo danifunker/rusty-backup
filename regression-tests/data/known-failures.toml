@@ -73,14 +73,6 @@ finding = "R-013"
 id = "fs.detect.ufs-no-absurd-sizes"
 finding = "R-013"
 
-# --- Optical -----------------------------------------------------------------
-[[known]]
-id = "optical.cdda.no-data-track-opens"
-finding = "R-012"
-[[known]]
-id = "optical.cue.unpadded-track-number"
-finding = "R-015"
-
 # --- Found by the tier-3 sweep, 2026-08-08 -----------------------------------
 [[known]]
 id = "edit.affs.put-get"
