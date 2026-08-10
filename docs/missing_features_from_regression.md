@@ -274,7 +274,12 @@ through the same container-aware path `inspect` uses is the whole feature.
 `backup.container.inspect-reads-what-backup-cannot` is green and pins that
 asymmetry, so it is the case to read first.
 
-Reproduces on a 64 MB synthetic image; no fixture required.
+Reproduces on a 64 MB synthetic image; no fixture required. **It also
+reproduces on a real one** as of 2026-08-09: `fs.hpfs.os2-warp45.hd` is a
+monolithicSparse VMDK holding an OS/2 Warp 4.52 install, and `backup` refuses
+it with the same `invalid boot signature: expected 0xAA55, got 0x0000` while
+`inspect` reads all 4722 files. Useful when implementing this — the gap is not
+an artifact of how the synthetic containers were built.
 
 **Two traps when verifying this**, both of which caught the original reporter:
 

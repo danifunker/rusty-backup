@@ -9,9 +9,11 @@ pushed and verified on all three hosts at `c6e66fd`).
 
 ## STATE
 
-- Suite: **254 pass / 19 xfail / 0 fail**, zero XPASS, on Windows, macOS and
-  Linux — all three at `c6e66fd`.
-- 19 findings fixed, 14 open. `data/known-failures.toml` holds 19 entries.
+- Suite: **259 pass / 19 xfail / 0 fail** on Windows. macOS and Linux last ran
+  at `c6e66fd` (254/19/0, zero XPASS) and have not run since — R-037 and the
+  OS/2 fixture are Windows-only so far.
+- 21 findings fixed, 14 open (R-036 and R-037 were filed 2026-08-09; R-037 is
+  already fixed). `data/known-failures.toml` holds 19 entries.
 - R-016 is no longer a defect: it was reclassified as
   [F-008](missing_features_from_regression.md#f-008), and `rb-regress validate`
   now accepts an `F-nnn` citation as well as an `R-nnn` one.
@@ -31,7 +33,7 @@ Do not re-ask the first three.
 
 ## USE THE TOOLS, NOT THE MARKDOWN
 
-    rb-regress fixtures     # corpus: 90 catalogued, all sha256-verified
+    rb-regress fixtures     # corpus: 91 catalogued, all sha256-verified
     rb-regress validate     # manifests + bug list consistency
     rb-regress run          # the matrix
     rb-regress consolidate  # across hosts
@@ -76,14 +78,24 @@ is left needs investigation before it needs a fix:
 - MiSTer's `rb-cli` is from 2026-07-27 and must be redeployed before its 12
   core oracles mean anything.
 
-## FIXTURE GAP WORTH CLOSING
+## FIXTURE ADMITTED 2026-08-09
 
-There is **no HPFS fixture**. R-022 turned out to be a detection bug that made
-`backup` write nothing at all for a bare HPFS volume, and the control that
-mattered — a *partitioned* HPFS disk, the ao486 shape graded **Yes** in
-`full_MiSTer_support_status.md`, must not be hijacked by the new probe — had to
-be synthesized by hand and cannot be asserted by the suite. An MBR disk with a
-type-0x07 HPFS partition would close that.
+`fs.hpfs.os2-warp45.hd` — a real OS/2 Warp 4.52 install, monolithicSparse VMDK,
+MBR type-0x07 HPFS at LBA 63, 136 MB zstd in the annex. It closes the HPFS gap
+R-022 left and carries two things nothing else in the corpus does:
+
+- **A partitioned HPFS volume.** R-022's control (the probe must not hijack an
+  ao486-shaped disk) was a hand-synthesized MBR; it is now
+  `fs.detect.hpfs-partitioned-stays-mbr`.
+- **A real non-flat container.** `backup` refuses it exactly as F-008
+  describes, so that gap is not an artifact of how the synthetic containers
+  were built.
+
+`read.hpfs.os2-warp45` reads it end to end — 4722 files, 471 dirs, long names
+with spaces, fsck clean.
+
+Note the original drop is still at `new/OS2 Warp 4.52.zip` on the NAS; the
+annex copy is independent, so the drop can be deleted whenever.
 
 ## FEATURE WORK QUEUED
 

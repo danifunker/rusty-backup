@@ -319,12 +319,17 @@ from "backed up slightly wrong".
 **The control that mattered** was the other direction: a *partitioned* HPFS
 disk — the ao486 shape, graded **Yes** in
 [full_MiSTer_support_status.md](full_MiSTer_support_status.md) — must not be
-hijacked by the new probe. The corpus has no HPFS fixture, so one was
-synthesized: an MBR with a single type-0x07 entry at LBA 2048 holding the same
-2 MB volume. It still reports `Partition table: MBR` with the partition at
-2048, because the probe reads absolute sectors 16 and 17, which on a
-partitioned disk are in the pre-partition gap. Worth a fixture so the suite can
-assert this rather than a person having to remember to.
+hijacked by the new probe. The probe reads absolute sectors 16 and 17, which on
+a partitioned disk sit in the pre-partition gap, so it should not fire. It was
+first checked against a synthesized MBR holding the same 2 MB volume.
+
+**That control is now a real fixture and a real case.** `fs.hpfs.os2-warp45.hd`
+— an OS/2 Warp 4.52 install, MBR type-0x07 HPFS at LBA 63 — was admitted
+2026-08-09, and `fs.detect.hpfs-partitioned-stays-mbr` asserts the disk still
+reports MBR with its partition at 63. `read.hpfs.os2-warp45` reads the same
+volume end to end: 4722 files across 471 directories, long names with spaces,
+fsck clean. A synthetic `new volume hpfs` is empty and 2 MB and can exercise
+none of that.
 
 ---
 
