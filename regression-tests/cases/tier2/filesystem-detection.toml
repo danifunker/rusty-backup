@@ -81,3 +81,48 @@ expect_exit = 0
 # is in scope — preserving copy-protected disks is the reason G64 exists
 # rather than D64, so it may be a real limitation rather than an acceptable
 # boundary. Asserting either outcome now would prejudge that call.
+
+# --- R-022 ------------------------------------------------------------------
+# Filed as "HPFS does not survive a sector-by-sector round-trip". The round
+# trip was the symptom; detection was the cause, and the real damage was worse
+# than the finding recorded — `backup` wrote no partition file at all. These
+# two pin the mechanism rather than the symptom, so a detection regression is
+# named as one instead of surfacing as a mysterious fidelity failure.
+
+[[case]]
+id = "fs.detect.hpfs-bare-volume"
+description = """R-022: a bare HPFS volume must detect as a superfloppy, not as
+an empty MBR. Its boot sector is an x86 VBR with a BPB and an 0xAA55 signature,
+but num_fats and reserved_sectors are both 0, so the FAT probe rejects it and
+it fell through to the MBR parse — which claimed it and found no partitions."""
+[[case.step]]
+args = ["new", "volume", "hpfs", "--size", "2M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/v.img", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+[[case.step.json_equals]]
+path = "partition_table"
+value = "None"
+[[case.step.json_equals]]
+path = "partitions.0.type_name"
+value = "HPFS"
+
+[[case]]
+id = "fs.detect.hpfs-backup-is-not-empty"
+description = """R-022: the damage detection caused. `backup` iterates the
+partition list, so "MBR with no partitions" meant a backup containing only the
+boot sector — exit 0, no partition file, the whole volume gone. This asserts a
+partition file is produced at all, which the round-trip case cannot distinguish
+from a fidelity bug."""
+[[case.step]]
+args = ["new", "volume", "hpfs", "--size", "2M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["backup", "{scratch}/v.img", "{scratch}/bk", "--name", "job", "--format", "raw", "--sector-by-sector"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/bk/job/partition-0.img"]
+expect_exit = 0
+stdout_contains = ["HPFS"]

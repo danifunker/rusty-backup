@@ -21,7 +21,7 @@ finding depends on a fixture, the fixture is named.
 |----|----------|------|---------|
 | [R-019](#r-019) | Low — **accepted** | `src/rbformats/vhd.rs` | VHD Creator Host OS makes output non-reproducible across platforms; behaviour kept, parity declares it |
 | ~~R-023~~ | ~~**High**~~ **FIXED** | `src/cli/verbs/repack.rs` | ~~`repack` loses every file in the volume~~ — scope guard; nothing was lost, a FAT long filename was dropped, 2026-08-09 |
-| [R-022](#r-022) | **High** | `src/fs/hpfs.rs` | HPFS sector-by-sector backup -> restore is not byte-identical |
+| ~~R-022~~ | ~~**High**~~ **FIXED** | `src/partition/mod.rs` | ~~HPFS sector-by-sector backup -> restore is not byte-identical~~ — detection, not fidelity: a bare HPFS volume backed up to nothing at all. Probe added, 2026-08-09 |
 | ~~R-021~~ | ~~**High**~~ **FIXED** | `src/cli/verbs/resize.rs` | ~~`resize --size` reports success and changes nothing~~ — grows the file when the volume is the file, refuses otherwise, 2026-08-09 |
 | [R-024](#r-024) | Medium | `src/fs/affs.rs` | AFFS `put` leaves the volume failing its own fsck |
 | ~~R-025~~ | ~~Medium~~ **FIXED** | `src/fs/squashfs_edit.rs` | ~~`squashfs put` fails to replace the image on Windows~~ — handle released before the rename, 2026-08-08 |
@@ -273,6 +273,57 @@ the worst shape of bug in a tool whose job is moving data: nothing downstream
 has any reason to check. Case `resize.to-explicit-size`.
 
 ### R-022 — HPFS does not survive a sector-by-sector round-trip {#r-022}
+
+**FIXED 2026-08-09, and the finding understated it by a lot.** This was not a
+fidelity bug. The restored 2 MB image held **44 non-zero bytes against the
+source's 604** — the boot sector and nothing else. Superblock, spareblock,
+bitmaps, root fnode: gone. `backup` wrote no partition file at all, and exited
+0.
+
+The backup folder contained `metadata.json`, `mbr.bin`, `mbr.json` and no
+`partition-*`. Its metadata says why:
+
+```json
+"partition_table_type": "MBR",
+"partitions": []
+```
+
+**Cause is detection, not the round-trip.** An HPFS boot sector is an x86 VBR:
+`EB 3C 90`, OEM `IBM 4.50`, a BPB, and an 0xAA55 signature. `detect_superfloppy`
+had no HPFS probe, and HPFS fails the FAT probe because `reserved_sectors` and
+`num_fats` are both 0 — HPFS has no FATs. So it fell through to the MBR parse,
+which took the 0xAA55 at face value, read an all-zero partition array, and
+reported "MBR, no partitions". `backup` iterates that list, so it had nothing
+to copy. Nothing anywhere in the chain was wrong about its own job.
+
+`ls` and `inspect` masked it: both fall back to "raw filesystem @ byte 0" and
+read the volume fine, so the disk looked healthy right up until it was backed
+up.
+
+The fix is a probe in `detect_superfloppy`, beside the NTFS / exFAT pair HPFS
+shares MBR type 0x07 with. `fs::hpfs::looks_like_hpfs` already existed and
+wants both the superblock magic at sector 16 and the spareblock magic at
+sector 17, so a chance match needs 64 bits to line up. A bare HPFS volume now
+reports `Partition table: None` with one HPFS partition, and the round trip is
+byte-identical.
+
+Two new cases pin the mechanism rather than the symptom, so a detection
+regression is named as one instead of resurfacing as a mysterious fidelity
+failure: `fs.detect.hpfs-bare-volume` and `fs.detect.hpfs-backup-is-not-empty`.
+The second exists because `roundtrip.hpfs.raw` cannot tell "backed up nothing"
+from "backed up slightly wrong".
+
+**The control that mattered** was the other direction: a *partitioned* HPFS
+disk — the ao486 shape, graded **Yes** in
+[full_MiSTer_support_status.md](full_MiSTer_support_status.md) — must not be
+hijacked by the new probe. The corpus has no HPFS fixture, so one was
+synthesized: an MBR with a single type-0x07 entry at LBA 2048 holding the same
+2 MB volume. It still reports `Partition table: MBR` with the partition at
+2048, because the probe reads absolute sectors 16 and 17, which on a
+partitioned disk are in the pre-partition gap. Worth a fixture so the suite can
+assert this rather than a person having to remember to.
+
+---
 
 `backup --sector-by-sector` then `restore` returns bytes that differ from the
 source. Every other filesystem tested — FAT, NTFS, ext4, HFS, minix3, EFS,
@@ -1369,6 +1420,7 @@ Run `rb-regress run --tiers 0-4` to check them all.
 | R-018 | `doc_parity::contributing_vintage_features_match_ci` | **green — fixed** |
 | R-021 | `resize.to-explicit-size` | **green — fixed** |
 | R-023 | `resize.repack.{keeps-data,refuses-plain-fat}` | **green — fixed** |
+| R-022 | `roundtrip.hpfs.raw`, `fs.detect.hpfs-{bare-volume,backup-is-not-empty}` | **green — fixed** |
 | R-017 | `fs.detect.sfs-bare-volume` | **green — fixed** |
 | R-025 | `subcmd.squashfs.put-rebuilds`, `meta.xattr.set-list-rm` | red — Windows only |
 | R-026 | `subcmd.show.partmap` | **green — fixed** |

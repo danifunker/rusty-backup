@@ -349,6 +349,20 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
         }
     }
 
+    // HPFS, the third filesystem behind MBR type 0x07. Its boot sector is an
+    // x86 VBR with a BPB and an 0xAA55 signature, but `num_fats` is 0 and
+    // `reserved_sectors` is 0, so the FAT probe below rejects it and it used to
+    // fall through to the MBR parse — which claimed it, found no partition
+    // entries, and reported "MBR, no partitions". `backup` then backed up
+    // nothing at all and exited 0 (R-022). `looks_like_hpfs` wants both the
+    // superblock magic at sector 16 and the spareblock magic at sector 17, so a
+    // chance match needs 64 bits to line up.
+    if crate::fs::hpfs::looks_like_hpfs(reader, 0) {
+        let _ = reader.seek(SeekFrom::Start(0));
+        return Some("HPFS".to_string());
+    }
+    let _ = reader.seek(SeekFrom::Start(0));
+
     if first_sector[0] == 0xEB || first_sector[0] == 0xE9 {
         let bytes_per_sector = u16::from_le_bytes([first_sector[11], first_sector[12]]);
         let sectors_per_cluster = first_sector[13];

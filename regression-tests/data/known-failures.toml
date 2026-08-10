@@ -83,9 +83,6 @@ finding = "R-015"
 
 # --- Found by the tier-3 sweep, 2026-08-08 -----------------------------------
 [[known]]
-id = "roundtrip.hpfs.raw"
-finding = "R-022"
-[[known]]
 id = "edit.affs.put-get"
 finding = "R-024"
 
