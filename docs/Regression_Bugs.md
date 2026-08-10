@@ -29,7 +29,7 @@ finding depends on a fixture, the fixture is named.
 | ~~R-027~~ | ~~Medium~~ **FIXED** | `src/rbformats/zip_disk.rs` | ~~A Finder-made `.zip` holding one `.dmg` is rejected as ambiguous~~ — extension list derived from the canonical one, 2026-08-08 |
 | ~~R-030~~ | ~~**High**~~ **FIXED** | `src/fs/affs.rs` | ~~A real Workbench 1.3 AFFS volume cannot be opened at all~~ — the root block was located from the end of the file, not the partition, 2026-08-10 |
 | ~~R-029~~ | ~~**High**~~ **FIXTURE DEFECT** | — | ~~EFS computes block addresses far outside the image~~ — the fixture is a truncated capture; the engine was following its superblock, 2026-08-10 |
-| [R-031](#r-031) | Medium | `src/partition/mod.rs` | A real Apple DOS 3.3 disk is detected as `unknown`, though our own output is not |
+| ~~R-031~~ | ~~Medium~~ **NOT A DEFECT** | — | ~~A real Apple DOS 3.3 disk is detected as `unknown`~~ — the disk carries no filesystem at all; `Unknown` is correct, 2026-08-10 |
 | ~~R-028~~ | ~~Medium~~ **FIXED** | `src/fs/apple_dos.rs` | ~~Apple DOS 3.3 reports three different sizes for one file~~ — length stored in a type-B header; all three now agree, 2026-08-10 |
 | ~~R-032~~ | ~~Low~~ **RECLASSIFIED** | `src/fs/sfs.rs` | ~~SFS `put` fails on any volume with a multi-leaf extent btree~~ — the documented ceiling; moved to [F-009](missing_features_from_regression.md#f-009), 2026-08-10 |
 | ~~R-033~~ | ~~High~~ **FIXED** | `src/partition/mod.rs` | ~~A QL Microdrive `.mdv` fails at MBR detection, though its own probe matches it exactly~~ — probe added beside the HPFS one, 2026-08-10 |
@@ -41,7 +41,7 @@ finding depends on a fixture, the fixture is named.
 | ~~R-016~~ | ~~**High**~~ **RECLASSIFIED** | `src/cli/verbs/backup.rs` | ~~`backup` accepts only flat-layout sources: CHD, dynamic VHD, QCOW2 and VMDK all fail~~ — not a defect; moved to [F-008](missing_features_from_regression.md#f-008), 2026-08-09 |
 | ~~R-018~~ | ~~Blocker~~ **FIXED** | `CONTRIBUTING.md` | ~~The documented Rust-1.73 verification build does not compile on Windows~~ — missing `windows-legacy` feature, 2026-08-07 |
 | ~~R-017~~ | ~~High~~ **FIXED** | `src/partition/mod.rs` | ~~Superfloppy detection also misses SFS (extends R-009)~~ — probe added 2026-08-07 |
-| [R-015](#r-015) | Medium | `src/optical/` (cue parser) | A `.cue` with unpadded track numbers (`TRACK 1`) is rejected |
+| ~~R-015~~ | ~~Medium~~ **FIXED** | upstream `opticaldiscs` | ~~A `.cue` with unpadded track numbers (`TRACK 1`) is rejected~~ — fixed upstream, pin bumped to 0.15.0, 2026-08-10 |
 | ~~R-014~~ | ~~Blocker~~ **FIXED** | `src/cli/verbs/squashfs.rs` | ~~Pre-existing clippy failure blocks every commit via the pre-commit hook~~ — boxed 2026-08-07 |
 | ~~R-008b~~ | ~~**High**~~ **FIXED** | `src/fs/affs.rs` | ~~`new volume affs --size 4M` panics; no file produced, exit 101~~ — the formatter writes as many bitmap pages as the volume needs, 2026-08-10 |
 | ~~R-007~~ | ~~High~~ **FIXED** | `src/fs/ntfs_format.rs` | ~~Freshly formatted NTFS fails its own fsck~~ — verified clean 2026-08-07 |
