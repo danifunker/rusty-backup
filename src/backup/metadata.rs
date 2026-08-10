@@ -1,5 +1,35 @@
 use serde::{Deserialize, Serialize};
 
+/// Reduce a backup source to a label that names the source without naming the
+/// machine that produced the backup.
+///
+/// `source_device` used to hold whatever path the caller passed, absolute paths
+/// included, so the same image backed up on two machines produced two different
+/// `metadata.json` files and each one published the operator's directory layout
+/// (R-035). Three shapes, because they are not all paths:
+///
+/// - **Device paths** (`\\.\PhysicalDrive2`, `/dev/sda`, `/dev/disk2`) are kept
+///   verbatim. A device node is already a leaf and it is the useful provenance.
+/// - **`rb://` sources** are kept verbatim. The host in a remote backup's label
+///   is the source, deliberately named by the user, not local layout.
+/// - **Everything else** is a path to an image file, and keeps only its file
+///   name.
+pub fn normalize_source_device(source: &str) -> String {
+    let is_device = source.starts_with("/dev/")
+        || source.starts_with(r"\\.\")
+        || source.starts_with(r"\\?\")
+        || source.starts_with("rb://");
+    if is_device {
+        return source.to_string();
+    }
+    std::path::Path::new(source)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        // A path with no file name (a bare root, or a trailing separator) has
+        // nothing to reduce to; keeping it is better than an empty field.
+        .unwrap_or_else(|| source.to_string())
+}
+
 /// Backup folder layout. Selects how partition data is stored on disk.
 ///
 /// `PerPartition` is the layout used by Zstd / Raw / per-partition VHD
@@ -223,6 +253,41 @@ pub fn update_partition_checksum(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_source_device_drops_the_producing_hosts_directories() {
+        // The point of R-035: two machines holding the same image must record
+        // the same thing, and neither publishes where it keeps its files.
+        assert_eq!(
+            normalize_source_device(r"C:\Users\someone\images\disk.img"),
+            "disk.img"
+        );
+        assert_eq!(
+            normalize_source_device("/home/someone/images/disk.img"),
+            "disk.img"
+        );
+        assert_eq!(normalize_source_device("disk.img"), "disk.img");
+    }
+
+    #[test]
+    fn normalize_source_device_keeps_devices_and_remotes_verbatim() {
+        // A device node is already a leaf, and it is the useful provenance.
+        for dev in [r"\\.\PhysicalDrive2", "/dev/sda", "/dev/disk2"] {
+            assert_eq!(normalize_source_device(dev), dev, "{dev} must survive");
+        }
+        // A remote label names the *source* host, which the user chose; it is
+        // not the producing host's directory layout.
+        for r in ["rb://nas:7341/disk.img", "rb://nas:7341/dev/sda"] {
+            assert_eq!(normalize_source_device(r), r, "{r} must survive");
+        }
+    }
+
+    #[test]
+    fn normalize_source_device_leaves_a_pathless_string_alone() {
+        // Nothing to reduce to — keeping it beats emptying the field.
+        assert_eq!(normalize_source_device("/"), "/");
+        assert_eq!(normalize_source_device(""), "");
+    }
 
     #[test]
     fn byte_offset_prefers_start_byte_then_falls_back_to_floored_lba() {

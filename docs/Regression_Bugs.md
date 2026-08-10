@@ -34,7 +34,7 @@ finding depends on a fixture, the fixture is named.
 | [R-032](#r-032) | Low | `src/fs/sfs.rs` | SFS `put` fails on any volume with a multi-leaf extent btree — i.e. any real one |
 | [R-033](#r-033) | **High** | `src/partition/mod.rs` | A QL Microdrive `.mdv` fails at MBR detection, though its own probe matches it exactly |
 | ~~R-034~~ | ~~Medium~~ **FIXED** | `src/fs/mod.rs` | ~~Refusing a write to a read-only filesystem says `unknown` and exits 1, not 4~~ — names the filesystem, exits 4, 2026-08-08 |
-| [R-035](#r-035) | Medium | `src/backup/` | `.cbk` embeds the producing host's absolute path, so it can never be byte-identical across machines |
+| ~~R-035~~ | ~~Medium~~ **FIXED** | `src/backup/` | ~~`.cbk` embeds the producing host's absolute path, so it can never be byte-identical across machines~~ — path normalised to a leaf, 2026-08-09 |
 | [R-020](#r-020) | **High** | `src/fs/affs.rs` | `new volume affs` output is "Not a DOS disk" on a real Amiga, at every size |
 | ~~R-016~~ | ~~**High**~~ **RECLASSIFIED** | `src/cli/verbs/backup.rs` | ~~`backup` accepts only flat-layout sources: CHD, dynamic VHD, QCOW2 and VMDK all fail~~ — not a defect; moved to [F-008](missing_features_from_regression.md#f-008), 2026-08-09 |
 | ~~R-018~~ | ~~Blocker~~ **FIXED** | `CONTRIBUTING.md` | ~~The documented Rust-1.73 verification build does not compile on Windows~~ — missing `windows-legacy` feature, 2026-08-07 |
@@ -727,6 +727,36 @@ exists but is not consulted on the path the user takes. Case
 `read.qdos.microdrive`.
 
 ### R-035 — `.cbk` embeds the producing host's absolute path {#r-035}
+
+**FIXED 2026-08-09. Decision: normalise the path**, rather than keep it or
+replace it with a device identity. A device identity would have to be
+synthesised for the common case (an image file, which has no serial number),
+and inventing one is a bigger change than the finding asks for.
+
+`backup::metadata::normalize_source_device` reduces the source to a label that
+names it without naming the machine. Three shapes, because they are not all
+paths:
+
+- **Device paths** (`\.\PhysicalDrive2`, `/dev/sda`, `/dev/disk2`) are kept
+  verbatim — a device node is already a leaf, and it is the useful provenance.
+- **`rb://` sources** are kept verbatim — the host in a remote backup's label
+  is the *source*, chosen by the user, not the producing host's layout.
+- **Everything else** is a path to an image file and keeps only its file name.
+
+Both production write sites in `src/backup/mod.rs` go through it. The four
+other assignments are test fixtures and were left alone.
+
+This resolves the finding rather than masking it, which matters because the
+report is explicit that masking was not available: `expect_divergence` covers
+byte *ranges*, and a shorter string changes the file's *length*. Two hosts
+backing up the same image now write the same `source_device`, so the `.cbk`
+lengths agree and there is nothing for `parity` to align. The information leak
+goes with it.
+
+Verified end to end: backing up `C:\Temp\...	arget\sc35\disk.img` records
+`disk.img`.
+
+---
 
 Found 2026-08-08 by the first three-way `parity` run over all 53 produced
 formats. 157 comparisons matched; this was the only real divergence.

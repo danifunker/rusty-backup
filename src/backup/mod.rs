@@ -2013,7 +2013,7 @@ fn run_backup_inner(
     let metadata = BackupMetadata {
         version: 1,
         created: Utc::now().to_rfc3339(),
-        source_device: source_display,
+        source_device: metadata::normalize_source_device(&source_display),
         source_size_bytes: source_size,
         partition_table_type: table.type_name().to_string(),
         checksum_type: config.checksum.as_str().to_string(),
@@ -2344,7 +2344,7 @@ fn run_single_file_chd_path(
     let metadata = BackupMetadata {
         version: 1,
         created: Utc::now().to_rfc3339(),
-        source_device: config.source_path.display().to_string(),
+        source_device: metadata::normalize_source_device(&config.source_path.display().to_string()),
         source_size_bytes: source_size,
         partition_table_type: table.type_name().to_string(),
         checksum_type: config.checksum.as_str().to_string(),
