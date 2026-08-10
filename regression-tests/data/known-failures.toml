@@ -48,14 +48,6 @@ finding = "F-008"
 
 
 
-# --- R-013 — Solaris UFS entry types and sizes -------------------------------
-[[known]]
-id = "fs.detect.ufs-solaris-entry-types"
-finding = "R-013"
-[[known]]
-id = "fs.detect.ufs-no-absurd-sizes"
-finding = "R-013"
-
 
 
 # `read.optical.chdcd.audio-test` was listed here as a second R-012 case. It

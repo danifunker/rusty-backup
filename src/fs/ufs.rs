@@ -87,6 +87,8 @@ pub(crate) const OFF_SBLKNO: usize = 0x008; // fs_sblkno      i32 — SB address
 pub(crate) const OFF_CBLKNO: usize = 0x00C; // fs_cblkno      i32 — CG block addr in frags
 pub(crate) const OFF_IBLKNO: usize = 0x010; // fs_iblkno      i32 — inode-block addr in frags
 pub(crate) const OFF_OLD_SIZE: usize = 0x024; // fs_old_size    i32 — UFS1 total fragments
+pub(crate) const OFF_CGOFFSET: usize = 0x018; // fs_cgoffset    i32 — UFS1 rotational CG offset
+pub(crate) const OFF_CGMASK: usize = 0x01C; // fs_cgmask      i32 — mask selecting the CG index bits
 pub(crate) const OFF_NCG: usize = 0x02C; // fs_ncg         u32 — # cylinder groups
 pub(crate) const OFF_BSIZE: usize = 0x030; // fs_bsize       i32 — block size in bytes
 pub(crate) const OFF_FSIZE: usize = 0x034; // fs_fsize       i32 — fragment size in bytes
@@ -248,6 +250,14 @@ pub struct UfsFilesystem<R> {
     pub(crate) ncg: u32,   // number of cylinder groups
     pub(crate) fpg: u32,   // fragments per cylinder group
     pub(crate) ipg: u32,   // inodes per cylinder group
+    /// `fs_cgoffset` / `fs_cgmask`: UFS1's rotational cylinder-group offset.
+    /// Each CG's *metadata* starts at `cgbase(c) + cgoffset * (c & !cgmask)`,
+    /// not at `cgbase(c)`. The term is 0 for CG 0 whatever the values, which is
+    /// why ignoring it read CG 0 correctly and every later CG as garbage
+    /// (R-013). Zero on UFS1 images written after the rotational tables were
+    /// dropped, and always unused on UFS2.
+    pub(crate) cgoffset: u32,
+    pub(crate) cgmask: u32,
     /// `fs_cblkno`: fragment offset of the cylinder-group header inside
     /// each CG region. CG `i`'s header lives at fragment `i * fpg + cblkno`.
     pub(crate) cblkno: u32,
@@ -336,6 +346,8 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
         let ncg = read_u32(&sb, OFF_NCG, endian);
         let fpg = read_i32(&sb, OFF_FPG, endian);
         let ipg = read_u32(&sb, OFF_IPG, endian);
+        let cgoffset = read_u32(&sb, OFF_CGOFFSET, endian);
+        let cgmask = read_u32(&sb, OFF_CGMASK, endian);
         let cblkno = read_i32(&sb, OFF_CBLKNO, endian);
         let iblkno = read_i32(&sb, OFF_IBLKNO, endian);
         let sblkno = read_i32(&sb, OFF_SBLKNO, endian);
@@ -455,6 +467,8 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
             ncg,
             fpg: fpg as u32,
             ipg,
+            cgoffset,
+            cgmask,
             cblkno: cblkno as u32,
             iblkno: iblkno as u32,
             sblkno: sblkno as u32,
@@ -469,7 +483,7 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
     /// modern UFS layout, post-rotational-table removal); the CG header
     /// then lives at `cgbase + cblkno` fragments.
     pub(crate) fn cg_header_offset(&self, i: u32) -> u64 {
-        ((i as u64) * (self.fpg as u64) + self.cblkno as u64) * self.fsize
+        (self.cgstart_frag(i) + self.cblkno as u64) * self.fsize
     }
 
     /// Starting absolute fragment of CG `i`.
@@ -554,6 +568,23 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
         self.ipg as u64 * self.ncg as u64
     }
 
+    /// First fragment of CG `i`'s **metadata** — the kernel's `cgstart(fs, c)`.
+    ///
+    /// `cgbase(c)` is where the CG's data area begins; the superblock replica,
+    /// CG header and inode table sit at `cgbase(c) + fs_cgoffset * (c &
+    /// !fs_cgmask)`. UFS2 always has `cgstart == cgbase`, and so does a UFS1
+    /// image written after the rotational tables were dropped — both carry
+    /// `fs_cgoffset = 0`, so this is a no-op there. A real Solaris UFS1 does
+    /// not: it uses `cgoffset = 32`, `cgmask = 0xffffff00` (R-013).
+    pub(crate) fn cgstart_frag(&self, i: u32) -> u64 {
+        let skew = if matches!(self.version, UfsVersion::Ufs2) {
+            0
+        } else {
+            self.cgoffset as u64 * (i & !self.cgmask) as u64
+        };
+        (i as u64) * (self.fpg as u64) + skew
+    }
+
     /// Byte offset (relative to the partition start) of the replica
     /// superblock inside CG `cg`. Mirrors the kernel's `cgsblock(fs, c)`
     /// macro for layouts where `cgstart == cgbase` (UFS2 always; UFS1
@@ -562,7 +593,7 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
         if cg >= self.ncg {
             return None;
         }
-        Some((cg as u64 * self.fpg as u64 + self.sblkno as u64) * self.fsize)
+        Some((self.cgstart_frag(cg) + self.sblkno as u64) * self.fsize)
     }
 
     /// Read the SB-sized prefix (`SB_READ_SIZE` bytes) at CG `cg`'s replica
@@ -745,7 +776,7 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
         let ipg = self.ipg as u64;
         let cg = inum as u64 / ipg;
         let in_cg = inum as u64 % ipg;
-        (cg * self.fpg as u64 + self.iblkno as u64) * self.fsize + in_cg * dsize
+        (self.cgstart_frag(cg as u32) + self.iblkno as u64) * self.fsize + in_cg * dsize
     }
 
     fn dinode_size(&self) -> u64 {

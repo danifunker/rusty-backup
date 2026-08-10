@@ -46,7 +46,7 @@ finding depends on a fixture, the fixture is named.
 | ~~R-008b~~ | ~~**High**~~ **FIXED** | `src/fs/affs.rs` | ~~`new volume affs --size 4M` panics; no file produced, exit 101~~ — the formatter writes as many bitmap pages as the volume needs, 2026-08-10 |
 | ~~R-007~~ | ~~High~~ **FIXED** | `src/fs/ntfs_format.rs` | ~~Freshly formatted NTFS fails its own fsck~~ — verified clean 2026-08-07 |
 | ~~R-009~~ | ~~High~~ **FIXED** | `src/partition/mod.rs` | ~~Bare JFS / UFS1 / UFS2 / ReiserFS images cannot be opened at all~~ — probes added 2026-08-07 |
-| [R-013](#r-013) | **High** | `src/fs/ufs.rs` | Solaris UFS directories reported as files, one with a garbage size |
+| ~~R-013~~ | ~~**High**~~ **FIXED** | `src/fs/ufs.rs` | ~~Solaris UFS directories reported as files, one with a garbage size~~ — UFS1's rotational cylinder-group offset was ignored, 2026-08-10 |
 | ~~R-005~~ | ~~Medium~~ **FIXED** | `src/cli/output.rs` | ~~No error envelope emitted under `--format json`~~ — format recorded before dispatch, envelope emitted from `main`, 2026-08-09 |
 | ~~R-008a~~ | ~~Medium~~ **FIXED** | `src/fs/affs.rs` | ~~AFFS volumes above 4066 blocks have uncovered tail blocks~~ — same fix as R-008b, 2026-08-10 |
 | ~~R-012~~ | ~~Medium~~ **FIXED** | upstream `opticaldiscs` | ~~`optical info` rejects any disc with no data track (pure CD-DA)~~ — fixed upstream, pin bumped to 0.15.0, 2026-08-10 |
@@ -757,6 +757,46 @@ User impact: anyone who dumps a raw JFS/UFS/ReiserFS partition and points
 rb-cli at it gets an MBR error, with no hint the filesystem is supported.
 
 ### R-013 — UFS directories reported as files, with a garbage size {#r-013}
+
+**FIXED 2026-08-10. Cylinder-group layout, as the entry guessed — not
+endianness.**
+
+The tell was in the symptom: `lost+found` was the only correct entry, and it is
+the only one whose inode lives in cylinder group 0.
+
+UFS1 places each CG's *metadata* — superblock replica, CG header, inode table —
+at `cgbase(c) + fs_cgoffset * (c & !fs_cgmask)`, a rotational skew from the days
+when it mattered which track a cylinder group's tables landed on. `cgbase(c)` is
+only where the CG's *data* begins. Our addressing used `cgbase` throughout, and
+that term is **zero for c = 0 whatever the values** — so CG 0 read perfectly and
+every later CG read garbage.
+
+Confirmed by probing the disk rather than reasoning about it:
+
+```
+fs_cgoffset = 32   fs_cgmask = 0xffffff00
+
+ino     2  cg 0:  plain 0o040755   with-cgoffset 0o040755   (same)
+ino 18816  cg 1:  plain 0o100242   with-cgoffset 0o040755   DIFFER
+ino 37632  cg 2:  plain 0o027056   with-cgoffset 0o040755   DIFFER
+```
+
+`cgstart_frag()` now applies the skew, and the superblock replica, CG header and
+inode table all address through it. It is inert where it should be: UFS2 never
+has the term, and a UFS1 image written after the rotational tables were dropped
+carries `fs_cgoffset = 0`. The existing UFS1/UFS2/NeXTSTEP read and edit cases
+stayed green, which is the check that matters for a change to inode addressing.
+
+`bin` and `lib` still list as 9-byte files — correct: they are Solaris symlinks
+to `./usr/bin` and `./usr/lib`, both 9 characters.
+
+**One symptom did not clear**, and is not covered by either case: `show fs-info`
+reports `Free: 0 B` on this volume. That comes from the cylinder-group summary,
+not from inode addressing, so it is a separate defect on the same filesystem —
+worth its own finding rather than being folded in here silently.
+
+---
+
 
 Reading the root of an installed Solaris disk (Sun label, UFS slice):
 
@@ -1774,6 +1814,7 @@ Run `rb-regress run --tiers 0-4` to check them all.
 | R-008b | `fs.new-volume.affs.{4m,32m}` | **green — fixed** |
 | R-009 | `fs.read.{jfs,reiserfs,ufs1,ufs2}` | **green — fixed** |
 | R-010 | `cli.flags.inspect-accepts-fs-type` | **green — fixed** |
+| R-013 | `fs.detect.ufs-{solaris-entry-types,no-absurd-sizes}` | **green — fixed** |
 | R-028 | `edit.apple-dos.put-get` | **green — fixed** |
 | R-031 | `edit.real.apple-dos-invaders` | **green — not a defect** |
 | R-030 | `edit.real.affs-workbench13` | **green — fixed** |
