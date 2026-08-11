@@ -3790,6 +3790,15 @@ pub fn fs_name_matches(type_name: &str, expected: &str) -> bool {
     if want.is_empty() {
         return false;
     }
+    // Whole name first: a caller who asks for exactly what `inspect` printed
+    // must always be satisfied. Splitting alone broke that — an ambiguous
+    // type-byte name like `NTFS/HPFS/exFAT` stopped matching itself, which the
+    // corpus identity check found the first time it ran.
+    if norm(type_name) == want {
+        return true;
+    }
+    // Then each alternative, so `HPFS` satisfies `NTFS/HPFS/exFAT`: type byte
+    // 0x07 names three filesystems and the table cannot say which.
     type_name.split('/').any(|alt| norm(alt) == want)
 }
 
@@ -3811,6 +3820,28 @@ mod identification_tests {
         assert!(fs_name_matches("DOS 3.3", "dos3.3"));
         assert!(fs_name_matches("DOS 3.3", "DOS 3.3"));
         assert!(fs_name_matches("Apple DOS 3.3", "appledos33"));
+    }
+
+    #[test]
+    fn a_name_always_matches_itself() {
+        // Regression: `NTFS/HPFS/exFAT` did not match itself, because only the
+        // `/`-alternatives were compared.
+        for n in [
+            "NTFS/HPFS/exFAT",
+            "DOS 3.3",
+            "HPFS",
+            "Amiga NDOS (no filesystem)",
+        ] {
+            assert!(fs_name_matches(n, n), "{n} must match itself");
+        }
+    }
+
+    #[test]
+    fn an_alternative_satisfies_an_ambiguous_type_byte() {
+        // Type byte 0x07 names three filesystems; the table cannot say which.
+        assert!(fs_name_matches("NTFS/HPFS/exFAT", "HPFS"));
+        assert!(fs_name_matches("NTFS/HPFS/exFAT", "ntfs"));
+        assert!(!fs_name_matches("NTFS/HPFS/exFAT", "ext4"));
     }
 
     #[test]

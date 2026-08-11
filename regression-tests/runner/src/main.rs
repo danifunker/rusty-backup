@@ -36,6 +36,7 @@ struct Args {
     command: Command,
     cases_dir: PathBuf,
     rb_cli: PathBuf,
+    identify: bool,
     fixture_root: Option<PathBuf>,
     sync_from: Option<PathBuf>,
     sync: bool,
@@ -122,6 +123,7 @@ fn parse_args() -> Result<Args, String> {
         command: Command::Help,
         cases_dir: base.join("cases"),
         rb_cli: default_rb_cli(&base),
+        identify: false,
         fixture_root: None,
         sync_from: None,
         sync: false,
@@ -174,6 +176,7 @@ fn parse_args() -> Result<Args, String> {
             "--allow-hardware" => args.allow_hardware = true,
             "--keep-scratch" => args.keep_scratch = true,
             "--sync" => args.sync = true,
+            "--identify" => args.identify = true,
             "--require-clean" => args.require_clean = true,
             "--check" => args.check = true,
             "--verbose" | "-v" => args.verbose = true,
@@ -308,6 +311,10 @@ OPTIONS:
                            `corpus_source` into the fixture root first. Runs
                            read local disk; the source is touched only here.
     --sync-from <DIR>      (fixtures) same, from an explicit directory
+    --identify             (fixtures) confirm each fixture really holds what
+                           its catalogue row claims, via rb-cli inspect
+                           --expect-fs / --expect-layout. Rows that declare
+                           nothing are skipped. Exits 1 on any mismatch.
     --verbose, -v          (fixtures) list every blocked case and unused fixture
     --report-root <DIR>    Where bundles are written[default: regression-tests/runs]
     --scratch-root <DIR>   Working directory root   [default: regression-tests/scratch]
@@ -435,6 +442,32 @@ inventory: {}", out.display());
         Err(e) => eprintln!("warning: could not serialise inventory: {}", e),
     }
 
+    // Identity: does each fixture actually hold what its row claims? Opt-in,
+    // because it opens every declaring fixture and some are hundreds of MB.
+    let mut identity_failures = 0usize;
+    if args.identify {
+        let cache = args.scratch_root.join("_fixture-cache");
+        let checks = fixtures::check_identities(&catalog, &args.rb_cli, &cache);
+        if checks.is_empty() {
+            println!(
+                "
+identity: no fixture declares expect_fs / expect_layout yet -                  nothing to check"
+            );
+        } else {
+            let bad: Vec<_> = checks.iter().filter(|c| !c.ok).collect();
+            println!(
+                "
+identity: {} of {} declaring fixture(s) confirmed",
+                checks.len() - bad.len(),
+                checks.len()
+            );
+            for c in &bad {
+                println!("  MISMATCH  {:<44} {}", c.id, c.detail);
+            }
+            identity_failures = bad.len();
+        }
+    }
+
     let corrupt = inv
         .fixtures
         .iter()
@@ -445,7 +478,7 @@ inventory: {}", out.display());
     // against a fixture we intend to source is a legitimate way to record the
     // want — the IMZ password cases exist exactly so that requirement stops
     // being invisible in a formats.toml notes field.
-    if corrupt > 0 {
+    if corrupt > 0 || identity_failures > 0 {
         1
     } else {
         0

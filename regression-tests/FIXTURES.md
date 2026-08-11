@@ -257,6 +257,36 @@ structure under test rather than storing a whole game or install disc.
 
 Track the total in the catalogue; the run report prints it.
 
+### Declaring what a fixture is
+
+The catalogue's last three columns let a row state its own identity, and
+`rb-regress fixtures --identify` enforces it by running `rb-cli inspect`:
+
+| column | meaning |
+|--------|---------|
+| `expect_fs` | the filesystem it must identify as (`HPFS`, `DOS 3.3`, …) |
+| `expect_layout` | `superfloppy`, `partitioned`, or a scheme name (`mbr`, `rdb`, …) |
+| `fs_type` | a `--fs-type` preset the fixture needs to be identifiable at all — CP/M disks carry no signature |
+
+**Why this exists.** `origin = harvested-verified` used to mean "`rb-cli inspect`
+opened it", which a universal reader says about *anything*: an Apple DOS fixture
+that was really a bare bootloader with no VTOC passed that bar and sat in the
+corpus for weeks (R-031). "It opened" is not identification.
+
+Rows that declare nothing are skipped, so populating is incremental. Three
+groups are deliberately left undeclared:
+
+- **optical discs** — `inspect` is the wrong verb for them; `optical info` reads
+  them. A separate check could cover those.
+- **encrypted images** (`fmt.gho.password`, `fmt.imz.encrypted`) — identifying
+  them needs a password the catalogue does not carry.
+- **`fs.apple-dos.invaders.floppy`** — it would fail, correctly. Its ID claims a
+  filesystem it does not have. The honest fix is renaming the fixture, not
+  weakening the check.
+
+An `--identify` run is slower than a plain inventory: it opens every declaring
+fixture, expanding compressed ones through the same per-run cache a case uses.
+
 ### Hosts that cannot reach the share
 
 `--sync` assumes the host can see `corpus_source`. Not all of them can: on the

@@ -24,6 +24,16 @@ pub struct FixtureRow {
     pub origin: String,
     pub redistributable: String,
     pub notes: String,
+    /// Optional: the filesystem this fixture must identify as, checked by
+    /// `rb-regress fixtures --identify` via `rb-cli inspect --expect-fs`.
+    /// Empty means the row makes no claim.
+    pub expect_fs: String,
+    /// Optional: the disk shape this fixture must have — `superfloppy`,
+    /// `partitioned`, or a scheme name. Checked via `--expect-layout`.
+    pub expect_layout: String,
+    /// Optional: a `--fs-type` preset the fixture needs to be identifiable at
+    /// all (CP/M disks carry no signature).
+    pub fs_type: String,
 }
 
 #[derive(Debug, Default)]
@@ -142,6 +152,9 @@ impl Catalog {
                 origin: get(5),
                 redistributable: get(6),
                 notes: get(8),
+                expect_fs: get(9),
+                expect_layout: get(10),
+                fs_type: get(11),
             };
             if row.id.is_empty() {
                 continue;
@@ -302,3 +315,88 @@ fn sanitise(id: &str) -> String {
         .collect()
 }
 
+
+/// One fixture's identity check.
+pub struct IdentityCheck {
+    pub id: String,
+    pub ok: bool,
+    /// Empty when the row declared nothing to check.
+    pub detail: String,
+}
+
+/// Ask `rb-cli inspect` to confirm each fixture is what its catalogue row says.
+///
+/// This exists because `harvested-verified` used to mean "`inspect` opened it",
+/// which a universal reader says about anything — an Apple DOS fixture that was
+/// really a bare bootloader passed that bar and sat in the corpus for weeks
+/// (R-031). A row that names `expect_fs` / `expect_layout` states its intent,
+/// and the check enforces it.
+///
+/// Rows that declare nothing are skipped, so populating the columns is
+/// incremental rather than a flag day.
+pub fn check_identities(cat: &Catalog, rb_cli: &Path, cache_dir: &Path) -> Vec<IdentityCheck> {
+    let mut out = Vec::new();
+    for row in cat.rows() {
+        if row.expect_fs.is_empty() && row.expect_layout.is_empty() {
+            continue;
+        }
+        // materialise, not resolve: a `.zst` row must be expanded first —
+        // rb-cli does not read compressed images, the harness decompresses them.
+        let path = match cat.materialise(&row.id, cache_dir) {
+            Ok(p) => p,
+            Err(e) => {
+                out.push(IdentityCheck {
+                    id: row.id.clone(),
+                    ok: false,
+                    detail: format!("unresolved: {e}"),
+                });
+                continue;
+            }
+        };
+        let mut cmd = std::process::Command::new(rb_cli);
+        cmd.arg("inspect").arg(&path);
+        if !row.expect_fs.is_empty() {
+            cmd.arg("--expect-fs").arg(&row.expect_fs);
+        }
+        if !row.expect_layout.is_empty() {
+            cmd.arg("--expect-layout").arg(&row.expect_layout);
+        }
+        if !row.fs_type.is_empty() {
+            cmd.arg("--fs-type").arg(&row.fs_type);
+        }
+        let claim = [
+            (!row.expect_fs.is_empty()).then(|| format!("fs={}", row.expect_fs)),
+            (!row.expect_layout.is_empty()).then(|| format!("layout={}", row.expect_layout)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ");
+        match cmd.output() {
+            Ok(o) if o.status.success() => out.push(IdentityCheck {
+                id: row.id.clone(),
+                ok: true,
+                detail: claim,
+            }),
+            Ok(o) => {
+                let err = String::from_utf8_lossy(&o.stderr);
+                let line = err
+                    .lines()
+                    .find(|l| l.starts_with("error:"))
+                    .unwrap_or("(no error line)")
+                    .to_string();
+                out.push(IdentityCheck {
+                    id: row.id.clone(),
+                    ok: false,
+                    detail: format!("{claim} -> {line}"),
+                });
+            }
+            Err(e) => out.push(IdentityCheck {
+                id: row.id.clone(),
+                ok: false,
+                detail: format!("{claim} -> could not run rb-cli: {e}"),
+            }),
+        }
+    }
+    out
+}
