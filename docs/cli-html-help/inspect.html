@@ -31,6 +31,8 @@
 <dd>Assert the disk carries this filesystem, e.g. `--expect-fs &quot;DOS 3.3&quot;`. Exits non-zero when no partition matches. Case, spacing and punctuation are ignored; the comparison is exact after that, so `FAT` does not satisfy `exFAT`</dd>
 <dt><code>--require-known</code></dt>
 <dd>Assert every partition was identified — no `Unknown`. `inspect` opens anything, so on its own a clean exit only means the disk could be read, not that a filesystem was recognised</dd>
+<dt><code>--expect-layout</code></dt>
+<dd>Assert the disk's shape: `superfloppy` (a filesystem at sector 0, no table), `partitioned` (any table), or a scheme by name — `mbr`, `gpt`, `apm`, `rdb`, `sgi`, `sun`, `ahdi`, `x68k`, `dsd`, `none`. An unrecognised word is a usage error, not a failed assertion</dd>
 </dl>
 <footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_docs</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
 </body></html>

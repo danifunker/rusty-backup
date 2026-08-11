@@ -733,6 +733,42 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
     None
 }
 
+/// Lowercase, alphanumerics only — so `X68k`, `x68k` and `X-68K` agree.
+fn normalise_layout(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// Whether `expected` names a layout at all, so a typo is a usage error rather
+/// than a silent assertion failure. Returns the accepted vocabulary for the
+/// error message.
+pub fn layout_vocabulary() -> Vec<String> {
+    let mut v: Vec<String> = PartitionTable::ALL_TYPE_NAMES
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    v.extend(
+        PartitionTable::LAYOUT_ALIASES
+            .iter()
+            .map(|(a, _)| a.to_string()),
+    );
+    v
+}
+
+/// True when `expected` is a scheme name or a known alias.
+pub fn is_known_layout(expected: &str) -> bool {
+    let want = normalise_layout(expected);
+    !want.is_empty()
+        && (PartitionTable::ALL_TYPE_NAMES
+            .iter()
+            .any(|n| normalise_layout(n) == want)
+            || PartitionTable::LAYOUT_ALIASES
+                .iter()
+                .any(|(a, _)| normalise_layout(a) == want))
+}
+
 impl PartitionTable {
     /// Detect and parse the partition table from a readable+seekable source.
     pub fn detect(reader: &mut (impl Read + Seek)) -> Result<Self, RustyBackupError> {
@@ -1392,6 +1428,41 @@ impl PartitionTable {
     pub const ALL_TYPE_NAMES: &'static [&'static str] = &[
         "MBR", "GPT", "APM", "RDB", "SGI", "Sun", "AHDI", "X68k", "None", "DSD",
     ];
+
+    /// Whether this disk carries a partition table at all.
+    ///
+    /// `None` is a superfloppy — a filesystem starting at sector 0 with no
+    /// table. `Dsd` is the odd one: no table exists on the disk either, but the
+    /// reader de-interleaves the two sides into two addressable volumes, so it
+    /// answers like a partitioned disk for every purpose a caller has.
+    pub fn is_partitioned(&self) -> bool {
+        !matches!(self, PartitionTable::None { .. })
+    }
+
+    /// Layout words a caller may ask for beyond the scheme names themselves.
+    pub const LAYOUT_ALIASES: &'static [(&'static str, &'static str)] = &[
+        (
+            "superfloppy",
+            "a filesystem at sector 0, no partition table",
+        ),
+        ("flat", "alias for superfloppy"),
+        ("partitioned", "any partition table"),
+        ("hd", "alias for partitioned"),
+    ];
+
+    /// Does this disk's layout satisfy `expected`?
+    ///
+    /// Accepts a scheme name from [`Self::ALL_TYPE_NAMES`] (`mbr`, `gpt`,
+    /// `rdb`, …) or one of [`Self::LAYOUT_ALIASES`]. Case and punctuation are
+    /// ignored, matching `--expect-fs`.
+    pub fn layout_matches(&self, expected: &str) -> bool {
+        let want = normalise_layout(expected);
+        match want.as_str() {
+            "superfloppy" | "flat" => !self.is_partitioned(),
+            "partitioned" | "hd" => self.is_partitioned(),
+            other => normalise_layout(self.type_name()) == other,
+        }
+    }
 
     /// Get a human-readable name for the partition table type.
     pub fn type_name(&self) -> &'static str {
@@ -2549,5 +2620,65 @@ mod type_name_parity {
             "a PartitionTable variant was added or removed: update ALL_TYPE_NAMES, \
              every_variant_has_an_index, and the README table tests/doc_parity.rs checks"
         );
+    }
+}
+
+#[cfg(test)]
+mod layout_expectation_tests {
+    use super::*;
+
+    fn superfloppy() -> PartitionTable {
+        PartitionTable::None {
+            size_bytes: 1_474_560,
+            fs_hint: "FAT".into(),
+        }
+    }
+
+    #[test]
+    fn superfloppy_is_not_partitioned() {
+        let pt = superfloppy();
+        assert!(!pt.is_partitioned());
+        assert!(pt.layout_matches("superfloppy"));
+        assert!(pt.layout_matches("FLAT"));
+        assert!(pt.layout_matches("none"));
+        assert!(!pt.layout_matches("partitioned"));
+        assert!(!pt.layout_matches("mbr"));
+    }
+
+    #[test]
+    fn a_scheme_name_matches_only_itself() {
+        let pt = PartitionTable::Dsd {
+            size_bytes: 409_600,
+        };
+        assert!(pt.layout_matches("dsd"));
+        assert!(!pt.layout_matches("mbr"));
+        // Dsd has no on-disk table but yields two addressable volumes, so it
+        // answers "partitioned" — that is what a caller is actually asking.
+        assert!(pt.layout_matches("partitioned"));
+        assert!(!pt.layout_matches("superfloppy"));
+    }
+
+    #[test]
+    fn punctuation_and_case_are_ignored() {
+        let pt = PartitionTable::Dsd {
+            size_bytes: 409_600,
+        };
+        assert!(pt.layout_matches("D-S-D"));
+        assert!(pt.layout_matches("dsd "));
+    }
+
+    #[test]
+    fn the_vocabulary_covers_every_scheme_and_alias() {
+        // A new PartitionTable variant must become askable, not silently
+        // unaskable; ALL_TYPE_NAMES is pinned against the variant count by
+        // type_name_parity, so this inherits that guard.
+        for n in PartitionTable::ALL_TYPE_NAMES {
+            assert!(is_known_layout(n), "{n} should be askable");
+        }
+        for (a, _) in PartitionTable::LAYOUT_ALIASES {
+            assert!(is_known_layout(a), "{a} should be askable");
+        }
+        assert!(!is_known_layout("mbrr"));
+        assert!(!is_known_layout(""));
     }
 }

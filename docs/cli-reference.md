@@ -851,6 +851,7 @@ Usage: inspect [OPTIONS] <IMAGE>
 - `--carve-full` — Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga "NDOS" disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem
 - `--expect-fs` — Assert the disk carries this filesystem, e.g. `--expect-fs "DOS 3.3"`. Exits non-zero when no partition matches. Case, spacing and punctuation are ignored; the comparison is exact after that, so `FAT` does not satisfy `exFAT`
 - `--require-known` — Assert every partition was identified — no `Unknown`. `inspect` opens anything, so on its own a clean exit only means the disk could be read, not that a filesystem was recognised
+- `--expect-layout` — Assert the disk's shape: `superfloppy` (a filesystem at sector 0, no table), `partitioned` (any table), or a scheme by name — `mbr`, `gpt`, `apm`, `rdb`, `sgi`, `sun`, `ahdi`, `x68k`, `dsd`, `none`. An unrecognised word is a usage error, not a failed assertion
 
 ### `install-completions`
 

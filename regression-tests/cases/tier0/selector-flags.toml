@@ -99,3 +99,54 @@ expect_exit = 0
 [[case.step]]
 args = ["put", "{scratch}/v.img", "--zero", "1024", "--dst", "/x"]
 expect_exit = 0
+
+[[case]]
+id = "cli.flags.inspect-expect-layout-superfloppy"
+description = "--expect-layout tells a bare volume from a partitioned disk"
+[[case.step]]
+args = ["new", "volume", "fat", "--size", "2M", "{scratch}/sf.img"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/sf.img", "--expect-layout", "superfloppy"]
+expect_exit = 0
+# The scheme name for "no table" works too, for callers who think in schemes.
+[[case.step]]
+args = ["inspect", "{scratch}/sf.img", "--expect-layout", "none"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/sf.img", "--expect-layout", "partitioned"]
+expect_exit = 1
+stderr_contains = ["this disk is None"]
+
+[[case]]
+id = "cli.flags.inspect-expect-layout-partitioned"
+description = "--expect-layout matches a scheme by name, and rejects the wrong scheme"
+[[case.step]]
+args = ["new", "hd", "x68k", "--size", "16M", "{scratch}/hd.img"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/hd.img", "--expect-layout", "partitioned"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/hd.img", "--expect-layout", "x68k"]
+expect_exit = 0
+# A different scheme must not satisfy it — that is the whole point.
+[[case.step]]
+args = ["inspect", "{scratch}/hd.img", "--expect-layout", "mbr"]
+expect_exit = 1
+[[case.step]]
+args = ["inspect", "{scratch}/hd.img", "--expect-layout", "superfloppy"]
+expect_exit = 1
+
+[[case]]
+id = "cli.flags.inspect-expect-layout-typo-is-a-usage-error"
+description = """A word that names no layout exits 2, not 1. Otherwise a typo
+reads as "the disk is the wrong shape", which is the most misleading answer
+available — the script would blame the disk."""
+[[case.step]]
+args = ["new", "volume", "fat", "--size", "2M", "{scratch}/sf.img"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/sf.img", "--expect-layout", "mbrr"]
+expect_exit = 2
+stderr_contains = ["is not a layout", "superfloppy"]

@@ -60,6 +60,13 @@ pub struct InspectArgs {
     /// not that a filesystem was recognised.
     #[arg(long = "require-known")]
     pub require_known: bool,
+
+    /// Assert the disk's shape: `superfloppy` (a filesystem at sector 0, no
+    /// table), `partitioned` (any table), or a scheme by name — `mbr`, `gpt`,
+    /// `apm`, `rdb`, `sgi`, `sun`, `ahdi`, `x68k`, `dsd`, `none`. An
+    /// unrecognised word is a usage error, not a failed assertion.
+    #[arg(long = "expect-layout", value_name = "KIND")]
+    pub expect_layout: Option<String>,
 }
 
 pub fn run(args: InspectArgs) -> Result<()> {
@@ -165,7 +172,7 @@ pub fn run(args: InspectArgs) -> Result<()> {
     }?;
     // Assertions run last, so the report is on stdout either way: a failing
     // check should show what it found, not just that it failed.
-    check_expectations(&args, &partitions)
+    check_expectations(&args, &pt, &partitions)
 }
 
 /// Apply `--expect-fs` / `--require-known`.
@@ -177,8 +184,30 @@ pub fn run(args: InspectArgs) -> Result<()> {
 /// (R-031). These flags let a caller ask the stronger question.
 fn check_expectations(
     args: &InspectArgs,
+    pt: &PartitionTable,
     partitions: &[crate::partition::PartitionInfo],
 ) -> Result<()> {
+    if let Some(want) = args.expect_layout.as_deref() {
+        // A typo must not read as "the disk is the wrong shape". Reject the
+        // word first, with the vocabulary, and exit 2 like any bad argument.
+        if !crate::partition::is_known_layout(want) {
+            return Err(crate::cli::exit::usage(format!(
+                "--expect-layout {want:?} is not a layout. Valid: {}.",
+                crate::partition::layout_vocabulary().join(", ")
+            )));
+        }
+        if !pt.layout_matches(want) {
+            anyhow::bail!(
+                "--expect-layout {want:?}: this disk is {}{}.",
+                pt.type_name(),
+                if pt.is_partitioned() {
+                    format!(" ({} partition(s))", partitions.len())
+                } else {
+                    " (superfloppy: a filesystem at sector 0, no partition table)".to_string()
+                }
+            );
+        }
+    }
     if args.require_known {
         let unknown: Vec<String> = partitions
             .iter()

@@ -304,6 +304,7 @@ fn run_action(disk: &DiskDevice, action: Action) -> Result<()> {
                 // scripted callers.
                 expect_fs: None,
                 require_known: false,
+                expect_layout: None,
             });
             report(r, "inspect");
         }
