@@ -55,12 +55,6 @@ pub struct InspectArgs {
     #[arg(long = "expect-fs", value_name = "NAME")]
     pub expect_fs: Option<String>,
 
-    /// Assert every partition was identified — no `Unknown`. `inspect` opens
-    /// anything, so on its own a clean exit only means the disk could be read,
-    /// not that a filesystem was recognised.
-    #[arg(long = "require-known")]
-    pub require_known: bool,
-
     /// Assert the disk's shape: `superfloppy` (a filesystem at sector 0, no
     /// table), `partitioned` (any table), or a scheme by name — `mbr`, `gpt`,
     /// `apm`, `rdb`, `sgi`, `sun`, `ahdi`, `x68k`, `dsd`, `none`. An
@@ -175,7 +169,7 @@ pub fn run(args: InspectArgs) -> Result<()> {
     check_expectations(&args, &pt, &partitions)
 }
 
-/// Apply `--expect-fs` / `--require-known`.
+/// Apply `--expect-layout` / `--expect-fs`.
 ///
 /// `inspect` opens anything — that is what a universal tool is for, and a disk
 /// with no recognisable filesystem still yields a carve view. The cost is that
@@ -205,23 +199,6 @@ fn check_expectations(
                 } else {
                     " (superfloppy: a filesystem at sector 0, no partition table)".to_string()
                 }
-            );
-        }
-    }
-    if args.require_known {
-        let unknown: Vec<String> = partitions
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| !crate::fs::is_identified_fs(&p.type_name))
-            .map(|(i, p)| format!("@{} ({})", i + 1, p.type_name))
-            .collect();
-        if !unknown.is_empty() {
-            anyhow::bail!(
-                "--require-known: {} of {} partition(s) were not identified: {}. \
-                 The disk was read, but no filesystem was recognised there.",
-                unknown.len(),
-                partitions.len(),
-                unknown.join(", ")
             );
         }
     }

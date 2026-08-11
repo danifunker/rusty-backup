@@ -303,7 +303,6 @@ fn run_action(disk: &DiskDevice, action: Action) -> Result<()> {
                 // The appliance screen reports what it finds; asserting is for
                 // scripted callers.
                 expect_fs: None,
-                require_known: false,
                 expect_layout: None,
             });
             report(r, "inspect");

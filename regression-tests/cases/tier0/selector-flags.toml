@@ -78,16 +78,6 @@ args = ["inspect", "{scratch}/v.img", "--expect-fs", "exFAT"]
 expect_exit = 1
 
 [[case]]
-id = "cli.flags.inspect-require-known-passes-on-a-real-volume"
-description = "--require-known is satisfied when every partition was identified"
-[[case.step]]
-args = ["new", "volume", "fat", "--size", "2M", "{scratch}/v.img"]
-expect_exit = 0
-[[case.step]]
-args = ["inspect", "{scratch}/v.img", "--require-known"]
-expect_exit = 0
-
-[[case]]
 id = "cli.flags.inspect-still-opens-what-it-cannot-identify"
 description = """Universality is the default: with no assertion flag, a disk
 carrying no recognisable filesystem still opens and still exits 0. The flags are
