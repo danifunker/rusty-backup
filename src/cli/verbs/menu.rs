@@ -300,6 +300,10 @@ fn run_action(disk: &DiskDevice, action: Action) -> Result<()> {
                 password: None,
                 inside: None,
                 fs_override: Default::default(),
+                // The appliance screen reports what it finds; asserting is for
+                // scripted callers.
+                expect_fs: None,
+                require_known: false,
             });
             report(r, "inspect");
         }

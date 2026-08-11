@@ -47,6 +47,19 @@ pub struct InspectArgs {
     /// report one at all (R-010).
     #[command(flatten)]
     pub fs_override: crate::cli::resolve::FsDispatchOverride,
+
+    /// Assert the disk carries this filesystem, e.g. `--expect-fs "DOS 3.3"`.
+    /// Exits non-zero when no partition matches. Case, spacing and punctuation
+    /// are ignored; the comparison is exact after that, so `FAT` does not
+    /// satisfy `exFAT`.
+    #[arg(long = "expect-fs", value_name = "NAME")]
+    pub expect_fs: Option<String>,
+
+    /// Assert every partition was identified — no `Unknown`. `inspect` opens
+    /// anything, so on its own a clean exit only means the disk could be read,
+    /// not that a filesystem was recognised.
+    #[arg(long = "require-known")]
+    pub require_known: bool,
 }
 
 pub fn run(args: InspectArgs) -> Result<()> {
@@ -149,7 +162,57 @@ pub fn run(args: InspectArgs) -> Result<()> {
             extra_report.as_deref(),
         ),
         _ => unreachable!(),
+    }?;
+    // Assertions run last, so the report is on stdout either way: a failing
+    // check should show what it found, not just that it failed.
+    check_expectations(&args, &partitions)
+}
+
+/// Apply `--expect-fs` / `--require-known`.
+///
+/// `inspect` opens anything — that is what a universal tool is for, and a disk
+/// with no recognisable filesystem still yields a carve view. The cost is that
+/// a clean exit means "readable", not "identified", so "`inspect` opened it"
+/// was accepted as verification for a fixture that had no filesystem at all
+/// (R-031). These flags let a caller ask the stronger question.
+fn check_expectations(
+    args: &InspectArgs,
+    partitions: &[crate::partition::PartitionInfo],
+) -> Result<()> {
+    if args.require_known {
+        let unknown: Vec<String> = partitions
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| !crate::fs::is_identified_fs(&p.type_name))
+            .map(|(i, p)| format!("@{} ({})", i + 1, p.type_name))
+            .collect();
+        if !unknown.is_empty() {
+            anyhow::bail!(
+                "--require-known: {} of {} partition(s) were not identified: {}. \
+                 The disk was read, but no filesystem was recognised there.",
+                unknown.len(),
+                partitions.len(),
+                unknown.join(", ")
+            );
+        }
     }
+    if let Some(want) = args.expect_fs.as_deref() {
+        if !partitions
+            .iter()
+            .any(|p| crate::fs::fs_name_matches(&p.type_name, want))
+        {
+            let found: Vec<&str> = partitions.iter().map(|p| p.type_name.as_str()).collect();
+            anyhow::bail!(
+                "--expect-fs {want:?}: no partition carries that filesystem. Found: {}.",
+                if found.is_empty() {
+                    "nothing".to_string()
+                } else {
+                    found.join(", ")
+                }
+            );
+        }
+    }
+    Ok(())
 }
 
 fn emit_text(
@@ -298,6 +361,7 @@ fn emit_structured(
             .map(|(pos, p)| PartitionRow {
                 index: pos + 1,
                 type_name: p.type_name.clone(),
+                identified: crate::fs::is_identified_fs(&p.type_name),
                 partition_type_byte: p.partition_type_byte,
                 partition_type_string: p.partition_type_string.clone(),
                 start_lba: p.start_lba,
@@ -334,6 +398,10 @@ struct PartitionRow {
     /// slot — see the note in `emit_text`.
     index: usize,
     type_name: String,
+    /// Whether `type_name` is a filesystem we recognised, or the engine saying
+    /// it did not. `inspect` opens anything, so a clean exit alone does not
+    /// mean a filesystem was found (R-031).
+    identified: bool,
     partition_type_byte: u8,
     #[serde(skip_serializing_if = "Option::is_none")]
     partition_type_string: Option<String>,

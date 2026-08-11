@@ -3741,3 +3741,105 @@ mod tests {
         }
     }
 }
+
+/// Whether `type_name` names an actual filesystem, or is the engine admitting
+/// it did not recognise one.
+///
+/// `inspect` opens anything — a disk with no recognisable filesystem still
+/// yields a carve view, which is the point of a universal tool. That made
+/// "`inspect` opened it" useless as a verification: an Apple DOS fixture that
+/// was really a bare bootloader passed it and sat in the corpus for weeks
+/// (R-031). The distinction has to be legible, so it lives here rather than in
+/// any one caller.
+pub fn is_identified_fs(type_name: &str) -> bool {
+    !matches!(
+        type_name.trim(),
+        "" | "Unknown" | "unknown" | "Unformatted" | "Free space" | "Empty"
+    )
+}
+
+/// Compare a filesystem name to a caller's expectation.
+///
+/// Normalises case, spacing and punctuation, then compares **exactly** — a
+/// substring rule would let `FAT` satisfy `exFAT`, which would make the flag
+/// worse than no flag.
+///
+/// Two wrinkles the type names force:
+///
+/// - `+` becomes `plus`, so `HFS+` and `hfsplus` are the same answer and
+///   neither is `HFS`. Stripping `+` as punctuation instead would collapse
+///   `HFS+` onto `HFS` and quietly accept the wrong volume.
+/// - A type byte shared by several filesystems is named for all of them
+///   (`NTFS/HPFS/exFAT`, `HFS/HFS+`). Each alternative is matched separately,
+///   so `--expect-fs HPFS` is satisfied by an `NTFS/HPFS/exFAT` partition.
+///   Numeric shorthands like `ext2/3/4` only match their first alternative;
+///   that misses rather than over-matches, which is the safe direction.
+pub fn fs_name_matches(type_name: &str, expected: &str) -> bool {
+    fn norm(s: &str) -> String {
+        let mut out = String::new();
+        for c in s.chars() {
+            if c == '+' {
+                out.push_str("plus");
+            } else if c.is_ascii_alphanumeric() {
+                out.push(c.to_ascii_lowercase());
+            }
+        }
+        out
+    }
+    let want = norm(expected);
+    if want.is_empty() {
+        return false;
+    }
+    type_name.split('/').any(|alt| norm(alt) == want)
+}
+
+#[cfg(test)]
+mod identification_tests {
+    use super::*;
+
+    #[test]
+    fn unknown_is_not_an_identification() {
+        assert!(!is_identified_fs("Unknown"));
+        assert!(!is_identified_fs(""));
+        assert!(!is_identified_fs("  "));
+        assert!(is_identified_fs("DOS 3.3"));
+        assert!(is_identified_fs("HPFS"));
+    }
+
+    #[test]
+    fn expectations_ignore_case_and_punctuation() {
+        assert!(fs_name_matches("DOS 3.3", "dos3.3"));
+        assert!(fs_name_matches("DOS 3.3", "DOS 3.3"));
+        assert!(fs_name_matches("Apple DOS 3.3", "appledos33"));
+    }
+
+    #[test]
+    fn a_substring_is_not_a_match() {
+        // The reason this is an exact compare: FAT must not satisfy exFAT.
+        assert!(!fs_name_matches("exFAT", "FAT"));
+        assert!(!fs_name_matches("FAT", "exFAT"));
+        assert!(!fs_name_matches("DOS 3.3", ""));
+    }
+
+    #[test]
+    fn plus_is_a_letter_not_punctuation() {
+        // The first version stripped `+` as punctuation, which collapsed HFS+
+        // onto HFS — so `--expect-fs HFS` accepted an HFS+ volume, the exact
+        // false positive the exact-match rule exists to prevent.
+        assert!(fs_name_matches("HFS+", "hfsplus"));
+        assert!(fs_name_matches("HFS+", "HFS+"));
+        assert!(!fs_name_matches("HFS+", "HFS"));
+        assert!(!fs_name_matches("HFS", "HFS+"));
+    }
+
+    #[test]
+    fn a_shared_type_byte_matches_any_of_its_names() {
+        // MBR 0x07 is named for everything it can be; asking for one of them
+        // is a fair question. This is what the OS/2 HPFS fixture reports.
+        assert!(fs_name_matches("NTFS/HPFS/exFAT", "HPFS"));
+        assert!(fs_name_matches("NTFS/HPFS/exFAT", "ntfs"));
+        assert!(fs_name_matches("HFS/HFS+", "HFS"));
+        assert!(fs_name_matches("HFS/HFS+", "hfsplus"));
+        assert!(!fs_name_matches("NTFS/HPFS/exFAT", "FAT"));
+    }
+}

@@ -32,3 +32,70 @@ fixture = "fs.cpc.amsdos.floppy"
 args = ["ls", "{fixture}", "--fs-type", "cpm:amstrad_data"]
 expect_exit = 0
 stdout_contains = ["MANIC.BAS", "MANIC.BIN"]
+
+# --- inspect verification flags ----------------------------------------------
+# `inspect` opens anything — that is the point of a universal tool, and a disk
+# with no recognisable filesystem still yields a carve view. The cost is that a
+# clean exit means "readable", not "identified", which is how a fixture with no
+# filesystem at all was admitted on the strength of "inspect opens it" (R-031).
+# These flags let a caller ask the stronger question.
+
+[[case]]
+id = "cli.flags.inspect-expect-fs-matches"
+description = "--expect-fs succeeds when the filesystem is the one named"
+[[case.step]]
+args = ["new", "floppy", "apple-dos", "--size", "140K", "{scratch}/d.dsk"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/d.dsk", "--expect-fs", "DOS 3.3"]
+expect_exit = 0
+# Case, spacing and punctuation are normalised away before comparing.
+[[case.step]]
+args = ["inspect", "{scratch}/d.dsk", "--expect-fs", "dos3.3"]
+expect_exit = 0
+
+[[case]]
+id = "cli.flags.inspect-expect-fs-rejects-a-mismatch"
+description = "--expect-fs fails when the disk carries something else, and says what it found"
+[[case.step]]
+args = ["new", "floppy", "apple-dos", "--size", "140K", "{scratch}/d.dsk"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/d.dsk", "--expect-fs", "FAT"]
+expect_exit = 1
+stderr_contains = ["Found: DOS 3.3"]
+
+[[case]]
+id = "cli.flags.inspect-expect-fs-is-not-a-substring-match"
+description = """FAT must not satisfy exFAT. The comparison normalises case and
+punctuation, then compares exactly — a substring rule would make the flag worse
+than useless on the FAT family."""
+[[case.step]]
+args = ["new", "volume", "fat", "--size", "2M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/v.img", "--expect-fs", "exFAT"]
+expect_exit = 1
+
+[[case]]
+id = "cli.flags.inspect-require-known-passes-on-a-real-volume"
+description = "--require-known is satisfied when every partition was identified"
+[[case.step]]
+args = ["new", "volume", "fat", "--size", "2M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/v.img", "--require-known"]
+expect_exit = 0
+
+[[case]]
+id = "cli.flags.inspect-still-opens-what-it-cannot-identify"
+description = """Universality is the default: with no assertion flag, a disk
+carrying no recognisable filesystem still opens and still exits 0. The flags are
+opt-in precisely so this stays true."""
+[[case.step]]
+args = ["new", "volume", "fat", "--size", "2M", "{scratch}/v.img"]
+expect_exit = 0
+# Wipe the boot sector: still a readable disk, no longer an identifiable FS.
+[[case.step]]
+args = ["put", "{scratch}/v.img", "--zero", "1024", "--dst", "/x"]
+expect_exit = 0
