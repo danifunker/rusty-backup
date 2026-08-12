@@ -243,6 +243,7 @@ verifies = [{ format = "fmt.zip-disk", direction = "write", strength = "structur
 id = "iris"
 tool = "Iris"
 kind = "emulator"
+program = "iris"
 notes = "SGI emulator written in Rust; in-house, so blockers are fixable at source. Replaces MAME for IRIX."
 availability = [
   { platform = "windows", status = "install" },
@@ -260,6 +261,7 @@ verifies = [
 id = "fs-uae"
 tool = "FS-UAE"
 kind = "emulator"
+program = "fs-uae"
 notes = """Portable Amiga emulator; the cross-platform half of the WinUAE pair.
 
 Assets located 2026-08-07, all already owned — nothing needs downloading:
@@ -302,6 +304,7 @@ verifies = [
 id = "86box-os2"
 tool = "86Box + OS/2"
 kind = "emulator"
+program = "86Box"
 notes = "OS/2's own CHKDSK is the only real HPFS oracle; the Linux hpfs module is read-only and absent from WSL."
 availability = [
   { platform = "windows", status = "install" },
@@ -380,6 +383,7 @@ verifies = [
 id = "snow"
 tool = "Snow"
 kind = "emulator"
+program = "Snow"
 notes = """Modern Macintosh emulator written in Rust. Emulating a Mac Plus gives
 a real MFS implementation — the only realistic judge of MFS, which otherwise
 has no oracle anywhere.
@@ -536,6 +540,7 @@ verifies = [
 id = "mame-pc98"
 tool = "MAME pc9801"
 kind = "emulator"
+program = "mame"
 notes = "No PC-98 core exists on the MiSTer, so MAME's pc9801 drivers are the route for HDM and DIM."
 availability = [
   { platform = "windows", status = "install" },

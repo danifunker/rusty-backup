@@ -50,10 +50,15 @@ run "Rust 1.73 floor (vintage manifest)" \
 run "doc parity (README / CONTRIBUTING vs source)" \
     cargo test --test doc_parity
 
-# The harness is its own crate, so nothing above compiles or tests it. The
-# pre-commit hook clippies it; this runs its tests.
+# The harness is its own crate, so nothing above compiles or tests it.
 run "rb-regress (the harness's own tests)" \
     cargo test --manifest-path regression-tests/runner/Cargo.toml
+
+# And its clippy, because the pre-commit hook runs it. Without this, preflight
+# says "all checks passed" and the commit is then rejected by the hook — which
+# is exactly what happened when this line was missing.
+run "rb-regress clippy (what the pre-commit hook runs)" \
+    cargo clippy --manifest-path regression-tests/runner/Cargo.toml --all-targets -- -D warnings
 
 printf '\n'
 if [ "$fail" -ne 0 ]; then

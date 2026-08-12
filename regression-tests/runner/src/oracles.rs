@@ -62,6 +62,91 @@ fn resolve_hint(hint: &str, program: &str) -> Option<String> {
     None
 }
 
+/// Directories to search beyond `PATH`, for tools that install as an app
+/// rather than a command — every emulator here is a GUI program that never
+/// lands on `PATH`.
+///
+/// `RB_EMULATOR_DIRS` is checked first and takes the platform separator, so a
+/// machine keeping its emulators somewhere unusual needs no code change and no
+/// hand-edited TOML.
+fn search_roots(platform: &str) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(v) = std::env::var_os("RB_EMULATOR_DIRS") {
+        roots.extend(std::env::split_paths(&v));
+    }
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from);
+    match platform {
+        "windows" => {
+            for v in ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"] {
+                if let Some(p) = std::env::var_os(v) {
+                    roots.push(PathBuf::from(p));
+                }
+            }
+            roots.push(PathBuf::from("C:/Tools"));
+            roots.push(PathBuf::from("C:/Emulators"));
+        }
+        "macos" => {
+            roots.push(PathBuf::from("/Applications"));
+            roots.push(PathBuf::from("/opt/homebrew/bin"));
+            roots.push(PathBuf::from("/usr/local/bin"));
+            if let Some(h) = &home {
+                roots.push(h.join("Applications"));
+            }
+        }
+        _ => {
+            roots.push(PathBuf::from("/usr/bin"));
+            roots.push(PathBuf::from("/usr/local/bin"));
+            roots.push(PathBuf::from("/opt"));
+            if let Some(h) = &home {
+                roots.push(h.join(".local/bin"));
+            }
+        }
+    }
+    roots
+}
+
+/// Look for `program` under each root: directly, one level down (the usual
+/// `Program Files/WinUAE/winuae64.exe` shape), and inside a macOS `.app`.
+fn find_under_roots(program: &str, roots: &[PathBuf]) -> Option<String> {
+    let exts: &[&str] = if cfg!(windows) {
+        &["", ".exe", ".cmd", ".bat"]
+    } else {
+        &[""]
+    };
+    for root in roots {
+        for ext in exts {
+            let direct = root.join(format!("{}{}", program, ext));
+            if direct.is_file() {
+                return Some(direct.display().to_string());
+            }
+        }
+        let entries = match fs::read_dir(root) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for e in entries.flatten() {
+            let d = e.path();
+            if !d.is_dir() {
+                continue;
+            }
+            for ext in exts {
+                let cand = d.join(format!("{}{}", program, ext));
+                if cand.is_file() {
+                    return Some(cand.display().to_string());
+                }
+            }
+            // macOS bundle: Iris.app/Contents/MacOS/Iris
+            let bundled = d.join("Contents").join("MacOS").join(program);
+            if bundled.is_file() {
+                return Some(bundled.display().to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Probe every oracle the registry declares against this machine.
 ///
 /// Kinds that are not a program on PATH are reported as such rather than
@@ -84,11 +169,37 @@ pub fn detect(reg: &Registry, path_hints: &BTreeMap<String, String>, platform: &
             });
             continue;
         }
-        if matches!(o.kind.as_str(), "emulator" | "hardware" | "roundtrip") {
+        // Hardware and round-trip oracles are not programs at all.
+        if matches!(o.kind.as_str(), "hardware" | "roundtrip") {
             out.push(Detected {
                 oracle: o.id.clone(),
                 status: "manual",
                 resolved: None,
+            });
+            continue;
+        }
+        // An emulator IS findable — it just installs as an app, not a command.
+        // Finding the binary does not make the oracle runnable, though: it
+        // still needs a configured guest. `installed` says exactly that, which
+        // `verified` would overclaim and `manual` would hide.
+        if o.kind == "emulator" {
+            let prog = program_for(&o.tool, o.program.as_deref());
+            let found = path_hints
+                .get(&o.id)
+                .and_then(|h| resolve_hint(h, &prog))
+                .or_else(|| exec::tool_available(&prog).then(|| prog.clone()))
+                .or_else(|| find_under_roots(&prog, &search_roots(platform)));
+            out.push(match found {
+                Some(p) => Detected {
+                    oracle: o.id.clone(),
+                    status: "installed",
+                    resolved: Some(p),
+                },
+                None => Detected {
+                    oracle: o.id.clone(),
+                    status: "manual",
+                    resolved: None,
+                },
             });
             continue;
         }
@@ -175,6 +286,58 @@ pub fn overlay_path(regression_dir: &Path) -> PathBuf {
     regression_dir.join("data").join("oracles.local.toml")
 }
 
+/// Record one oracle's path by hand, for a tool `--detect` cannot find.
+///
+/// Rewrites just that oracle's row in the overlay and leaves the rest alone, so
+/// providing a path never costs you the detected ones. The path is checked
+/// here: a hint that points at nothing is the kind of thing you discover three
+/// weeks later when a verify run quietly skips.
+pub fn set_hint(
+    existing: &str,
+    oracle: &str,
+    path: &str,
+    platform: &str,
+    today: &str,
+    status: &str,
+) -> Result<String, String> {
+    if !Path::new(path).exists() {
+        return Err(format!("{path}: no such file or directory"));
+    }
+    let mut kept = String::new();
+    let mut skipping = false;
+    for block in existing.split("[[availability]]") {
+        if block.contains(&format!("oracle = {:?}", oracle)) {
+            skipping = true;
+            continue;
+        }
+        if !skipping && kept.is_empty() {
+            kept.push_str(block);
+        } else {
+            kept.push_str("[[availability]]");
+            kept.push_str(block);
+        }
+        skipping = false;
+    }
+    if kept.is_empty() {
+        kept.push_str(existing);
+    }
+    if !kept.ends_with('\n') {
+        kept.push('\n');
+    }
+    kept.push_str(&format!(
+        "[[availability]]
+oracle = {:?}
+platform = {:?}
+status = {:?}
+path_hint = {:?}
+verified_on = {:?}
+
+",
+        oracle, platform, status, path, today
+    ));
+    Ok(kept)
+}
+
 pub fn write(regression_dir: &Path, body: &str) -> Result<PathBuf, String> {
     let p = overlay_path(regression_dir);
     fs::write(&p, body).map_err(|e| format!("{}: {}", p.display(), e))?;
@@ -231,6 +394,47 @@ mod tests {
     }
 
     #[test]
+    fn setting_a_hint_replaces_only_that_oracle() {
+        let start = concat!(
+            "[[availability]]
+oracle = \"keepme\"
+platform = \"windows\"
+",
+            "status = \"verified\"
+
+",
+            "[[availability]]
+oracle = \"fs-uae\"
+platform = \"windows\"
+",
+            "status = \"manual\"
+
+"
+        );
+        let here = std::env::current_exe().unwrap();
+        let out = set_hint(
+            start,
+            "fs-uae",
+            &here.display().to_string(),
+            "windows",
+            "2026-08-10",
+            "installed",
+        )
+        .expect("path exists");
+        assert!(out.contains("\"keepme\""), "other rows must survive");
+        assert_eq!(out.matches("oracle = \"fs-uae\"").count(), 1, "no duplicate row");
+        assert!(out.contains("status = \"installed\""));
+    }
+
+    #[test]
+    fn setting_a_hint_to_nothing_is_refused() {
+        // A hint pointing at nothing is discovered three weeks later, as a
+        // quiet skip. Fail at the point the mistake is made.
+        let e = set_hint("", "fs-uae", "/definitely/not/here", "windows", "2026-08-10", "installed");
+        assert!(e.is_err());
+    }
+
+    #[test]
     fn manual_oracles_are_recorded_but_carry_no_path() {
         let found = vec![Detected {
             oracle: "fs-uae".into(),
@@ -240,5 +444,153 @@ mod tests {
         let out = render(&found, "windows", "2026-08-10");
         assert!(out.contains("status = \"manual\""));
         assert!(!out.contains("path_hint"));
+    }
+}
+
+/// Ask the user where an emulator lives, for the ones `--detect` could not
+/// find.
+///
+/// Only emulators, and only on a terminal. Those two limits are the whole
+/// design:
+///
+/// - **Only emulators**, because they are the case where the tool *is*
+///   installed and we merely cannot see it. A `package` oracle that came back
+///   absent is genuinely not installed, and prompting for a path to software
+///   you do not have is noise — 18 questions to reach the 5 that matter.
+/// - **Only on a terminal**, because the harness runs in CI and over ssh. A
+///   prompt with no one to answer it is a hang, and a hang in a regression run
+///   looks exactly like a test that never finishes.
+///
+/// A blank answer skips. A path that does not exist is refused and re-asked,
+/// rather than written and discovered later as a silent skip.
+pub fn prompt_for_missing(
+    found: &mut [Detected],
+    reg: &Registry,
+    input: &mut impl std::io::BufRead,
+    out: &mut impl std::io::Write,
+) -> usize {
+    let emulators: std::collections::BTreeSet<&str> = reg
+        .oracles
+        .iter()
+        .filter(|o| o.kind == "emulator")
+        .map(|o| o.id.as_str())
+        .collect();
+
+    let mut filled = 0;
+    for d in found.iter_mut() {
+        if d.status != "manual" || !emulators.contains(d.oracle.as_str()) {
+            continue;
+        }
+        let prog = reg
+            .oracles
+            .iter()
+            .find(|o| o.id == d.oracle)
+            .map(|o| program_for(&o.tool, o.program.as_deref()))
+            .unwrap_or_else(|| d.oracle.clone());
+        loop {
+            let _ = writeln!(
+                out,
+                "\n{} not found (looked for `{}` on PATH and the usual install roots).",
+                d.oracle, prog
+            );
+            let _ = write!(out, "  path to it, or Enter to skip: ");
+            let _ = out.flush();
+            let mut line = String::new();
+            if input.read_line(&mut line).unwrap_or(0) == 0 {
+                return filled; // EOF: stop asking rather than spin.
+            }
+            let ans = line.trim();
+            if ans.is_empty() {
+                break;
+            }
+            if Path::new(ans).exists() {
+                d.status = "installed";
+                d.resolved = Some(ans.to_string());
+                filled += 1;
+                break;
+            }
+            let _ = writeln!(out, "  {ans}: no such file or directory");
+        }
+    }
+    filled
+}
+
+#[cfg(test)]
+mod prompt_tests {
+    use super::*;
+    use crate::registry::{Oracle, Registry};
+
+    fn reg_with(kind: &str, id: &str) -> Registry {
+        let mut r = Registry::default();
+        r.oracles.push(Oracle {
+            id: id.into(),
+            tool: "Thing".into(),
+            kind: kind.into(),
+            program: Some("thing".into()),
+            notes: None,
+        });
+        r
+    }
+
+    #[test]
+    fn a_blank_answer_skips() {
+        let reg = reg_with("emulator", "fs-uae");
+        let mut found = vec![Detected {
+            oracle: "fs-uae".into(),
+            status: "manual",
+            resolved: None,
+        }];
+        let mut input = std::io::Cursor::new(b"\n".to_vec());
+        let mut out = Vec::new();
+        assert_eq!(prompt_for_missing(&mut found, &reg, &mut input, &mut out), 0);
+        assert_eq!(found[0].status, "manual");
+    }
+
+    #[test]
+    fn a_real_path_is_recorded_as_installed() {
+        let reg = reg_with("emulator", "fs-uae");
+        let mut found = vec![Detected {
+            oracle: "fs-uae".into(),
+            status: "manual",
+            resolved: None,
+        }];
+        let here = std::env::current_exe().unwrap();
+        let mut input = std::io::Cursor::new(format!("{}\n", here.display()).into_bytes());
+        let mut out = Vec::new();
+        assert_eq!(prompt_for_missing(&mut found, &reg, &mut input, &mut out), 1);
+        assert_eq!(found[0].status, "installed");
+    }
+
+    #[test]
+    fn a_bad_path_is_refused_then_reasked() {
+        let reg = reg_with("emulator", "fs-uae");
+        let mut found = vec![Detected {
+            oracle: "fs-uae".into(),
+            status: "manual",
+            resolved: None,
+        }];
+        // Wrong once, then blank. The wrong one must not be written.
+        let mut input = std::io::Cursor::new(b"/nope/nowhere\n\n".to_vec());
+        let mut out = Vec::new();
+        assert_eq!(prompt_for_missing(&mut found, &reg, &mut input, &mut out), 0);
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("no such file"), "must say why it was refused");
+        assert_eq!(found[0].status, "manual");
+    }
+
+    #[test]
+    fn package_oracles_are_never_asked_about() {
+        // Absent means not installed. Asking would be 18 questions to reach
+        // the 5 that matter.
+        let reg = reg_with("package", "cpmtools");
+        let mut found = vec![Detected {
+            oracle: "cpmtools".into(),
+            status: "manual",
+            resolved: None,
+        }];
+        let mut input = std::io::Cursor::new(b"".to_vec());
+        let mut out = Vec::new();
+        assert_eq!(prompt_for_missing(&mut found, &reg, &mut input, &mut out), 0);
+        assert!(out.is_empty(), "no prompt should have been printed");
     }
 }

@@ -268,8 +268,37 @@ Same split as the corpus, for the same reason.
 
 ```bash
 rb-regress oracles --detect    # probe this host, rewrite the overlay
+rb-regress oracles --set fs-uae=/path/to/fs-uae    # provide one by hand
 rb-regress oracles --export    # print it, to seed another machine
 ```
+
+**Finding emulators.** They install as apps, not commands, so `PATH` alone
+never finds them. `--detect` also searches the platform's usual roots —
+`%ProgramFiles%`, `C:/Tools`, `C:/Emulators` on Windows; `/Applications` (into
+`.app/Contents/MacOS`) on macOS; `/opt` and `~/.local/bin` on Linux — one level
+deep. Point it somewhere else with `RB_EMULATOR_DIRS`, which takes the
+platform's path separator and needs no edit to anything.
+
+If it still cannot find one, `--detect` **asks**, and writes what you give it.
+Only for emulators, and only on a terminal:
+
+- **Only emulators**, because that is the case where the tool *is* installed and
+  we merely cannot see it. A package oracle that came back absent is genuinely
+  not installed — prompting there would be 18 questions to reach the 5 that matter.
+- **Only on a terminal**, because the harness runs in CI and over ssh, where a
+  prompt nobody answers is indistinguishable from a hang. `--no-prompt` forces
+  the quiet path.
+
+A blank answer skips; a path that does not exist is refused and re-asked rather
+than written and discovered weeks later as a silent skip.
+
+A `--set` hint is sticky: it survives re-detection, which is the point. Note the
+check is only that the path *exists* — nothing verifies it is the program you
+named, so a wrong path stays wrong until you overwrite it.
+
+An emulator whose binary is found records **`installed`**, not `verified`: the
+binary alone does not make the oracle runnable, since it still needs a
+configured guest. `verified` would overclaim and `manual` would hide it.
 
 An overlay row replaces the tracked one for the same `(oracle, platform)`.
 

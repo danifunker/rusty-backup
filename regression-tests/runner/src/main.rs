@@ -39,6 +39,8 @@ struct Args {
     rb_cli: PathBuf,
     identify: bool,
     detect: bool,
+    set_oracle: Option<String>,
+    no_prompt: bool,
     export: bool,
     fixture_root: Option<PathBuf>,
     sync_from: Option<PathBuf>,
@@ -130,6 +132,8 @@ fn parse_args() -> Result<Args, String> {
         rb_cli: default_rb_cli(&base),
         identify: false,
         detect: false,
+        set_oracle: None,
+        no_prompt: false,
         export: false,
         fixture_root: None,
         sync_from: None,
@@ -186,6 +190,7 @@ fn parse_args() -> Result<Args, String> {
             "--sync" => args.sync = true,
             "--identify" => args.identify = true,
             "--detect" => args.detect = true,
+            "--no-prompt" => args.no_prompt = true,
             "--export" => args.export = true,
             "--require-clean" => args.require_clean = true,
             "--check" => args.check = true,
@@ -227,6 +232,10 @@ fn parse_args() -> Result<Args, String> {
                     }
                     "--verifications" => {
                         args.verifications_root = PathBuf::from(value()?);
+                        i += 1;
+                    }
+                    "--set" => {
+                        args.set_oracle = Some(value()?);
                         i += 1;
                     }
                     "--filter" => {
@@ -301,8 +310,9 @@ COMMANDS:
     list         List the cases that would run, without running them
     validate     Parse every manifest and report problems; runs nothing
     fixtures     Inventory the corpus: what is present, verified, and runnable
-    oracles      Detect this host's third-party tools (--detect), or print the
-                 gitignored overlay (--export)
+    oracles      Detect this host's third-party tools (--detect; asks about
+                 emulators it cannot find, --no-prompt to stay quiet), record
+                 one by hand (--set <id>=<path>), or print it (--export)
     plan         Map requirements onto the machines that exist
     produce      Build every artifact rb-cli can write, twice, into <artifacts>/<os>
     parity       Compare artifacts across producer OSes; needs no oracle
@@ -1686,6 +1696,46 @@ fn cmd_oracles(args: &Args) -> i32 {
     let platform = exec::platform_token();
     let path = oracles::overlay_path(&base);
 
+    if let Some(spec) = &args.set_oracle {
+        let (oracle, path) = match spec.split_once('=') {
+            Some(p) => p,
+            None => {
+                eprintln!("--set needs <oracle>=<path>, e.g. --set fs-uae=\"C:/Emulators/FS-UAE/fs-uae.exe\"");
+                return 2;
+            }
+        };
+        if !reg.oracles.iter().any(|o| o.id == oracle) {
+            eprintln!("no oracle named {oracle:?} in data/oracles.toml");
+            return 2;
+        }
+        let kind = reg
+            .oracles
+            .iter()
+            .find(|o| o.id == oracle)
+            .map(|o| o.kind.as_str())
+            .unwrap_or("package");
+        // An emulator with a binary still needs a guest; say `installed`.
+        let status = if kind == "emulator" { "installed" } else { "verified" };
+        let existing = fs::read_to_string(oracles::overlay_path(&base)).unwrap_or_default();
+        match oracles::set_hint(&existing, oracle, path, platform, &today_stamp(), status) {
+            Ok(body) => match oracles::write(&base, &body) {
+                Ok(p) => {
+                    println!("{oracle}: {status}  {path}");
+                    println!("wrote {}", p.display());
+                    return 0;
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return 2;
+                }
+            },
+            Err(e) => {
+                eprintln!("error: {e}");
+                return 2;
+            }
+        }
+    }
+
     if args.export {
         match fs::read_to_string(&path) {
             Ok(t) => {
@@ -1711,7 +1761,24 @@ fn cmd_oracles(args: &Args) -> i32 {
     }
 
     let hints = oracles::hints_for(&reg, platform);
-    let found = oracles::detect(&reg, &hints, platform);
+    let mut found = oracles::detect(&reg, &hints, platform);
+    // Ask about the emulators we could not find, but only on a terminal: the
+    // harness also runs in CI and over ssh, where a prompt nobody answers is
+    // indistinguishable from a hang. --no-prompt forces the quiet path.
+    let interactive = {
+        use std::io::IsTerminal;
+        !args.no_prompt && std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+    };
+    if interactive {
+        let stdin = std::io::stdin();
+        let mut lock = stdin.lock();
+        let mut outv = std::io::stdout();
+        let filled = oracles::prompt_for_missing(&mut found, &reg, &mut lock, &mut outv);
+        if filled > 0 {
+            println!("
+recorded {filled} path(s) you provided");
+        }
+    }
     let today = today_stamp();
     let body = oracles::render(&found, platform, &today);
     match oracles::write(&base, &body) {
