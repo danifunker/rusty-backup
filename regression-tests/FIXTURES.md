@@ -257,6 +257,42 @@ structure under test rather than storing a whole game or install disc.
 
 Track the total in the catalogue; the run report prints it.
 
+### Oracles: what they are vs whether you have them
+
+Same split as the corpus, for the same reason.
+
+| file | tracked? | holds |
+|------|----------|-------|
+| `data/oracles.toml` | **yes** | what an oracle *is* — tool, kind, what it proves, the `check` command |
+| `data/oracles.local.toml` | **no**, gitignored | whether *this* machine has it, and where |
+
+```bash
+rb-regress oracles --detect    # probe this host, rewrite the overlay
+rb-regress oracles --export    # print it, to seed another machine
+```
+
+An overlay row replaces the tracked one for the same `(oracle, platform)`.
+
+**Why the split.** A path like `D:/ROMs/Amiga/Shared/rom` was committed to a
+public repo because availability lived in the tracked file. Machine paths are
+neither portable nor publishable; the tracked registry now carries no
+`path_hint` at all. Re-running `--detect` preserves hints you have already
+recorded, because it reads them back from the merged registry.
+
+**Two things `--detect` deliberately will not do:**
+
+- A `mount` oracle is the *kernel's* opinion, so it is only probed on
+  Linux / WSL / the MiSTer HPS. Probing the program name on Windows found
+  Cygwin's unrelated `mount` and called AFFS "verified" — a confidently wrong
+  answer, which is the worst kind here.
+- An emulator or MiSTer core is recorded `manual`, not `absent`. `which` cannot
+  find a running guest, and "absent" would read as a missing install rather
+  than a different kind of oracle.
+
+A `path_hint` may name the program or the directory holding it — `chdman`'s is
+a directory, and testing it as a file reported the tool missing on a box that
+has it.
+
 ### Declaring what a fixture is
 
 The catalogue's last three columns let a row state its own identity, and

@@ -16,6 +16,7 @@ mod gitinfo;
 mod inventory;
 mod known;
 mod local;
+mod oracles;
 mod manifest;
 mod parity;
 mod plan;
@@ -37,6 +38,8 @@ struct Args {
     cases_dir: PathBuf,
     rb_cli: PathBuf,
     identify: bool,
+    detect: bool,
+    export: bool,
     fixture_root: Option<PathBuf>,
     sync_from: Option<PathBuf>,
     sync: bool,
@@ -66,6 +69,8 @@ enum Command {
     Plan,
     /// Take inventory of the fixture corpus and report which cases it enables.
     Fixtures,
+    /// Detect / export this host's oracle availability.
+    Oracles,
     /// Build every artifact rb-cli can write, on whatever OS is running.
     Produce,
     /// Compare artifacts produced on different OSes. Needs no oracle.
@@ -124,6 +129,8 @@ fn parse_args() -> Result<Args, String> {
         cases_dir: base.join("cases"),
         rb_cli: default_rb_cli(&base),
         identify: false,
+        detect: false,
+        export: false,
         fixture_root: None,
         sync_from: None,
         sync: false,
@@ -150,6 +157,7 @@ fn parse_args() -> Result<Args, String> {
             "validate" => args.command = Command::Validate,
             "plan" => args.command = Command::Plan,
             "fixtures" => args.command = Command::Fixtures,
+            "oracles" => args.command = Command::Oracles,
             "produce" => args.command = Command::Produce,
             "verify" => args.command = Command::Verify,
             "parity" => {
@@ -177,6 +185,8 @@ fn parse_args() -> Result<Args, String> {
             "--keep-scratch" => args.keep_scratch = true,
             "--sync" => args.sync = true,
             "--identify" => args.identify = true,
+            "--detect" => args.detect = true,
+            "--export" => args.export = true,
             "--require-clean" => args.require_clean = true,
             "--check" => args.check = true,
             "--verbose" | "-v" => args.verbose = true,
@@ -291,6 +301,8 @@ COMMANDS:
     list         List the cases that would run, without running them
     validate     Parse every manifest and report problems; runs nothing
     fixtures     Inventory the corpus: what is present, verified, and runnable
+    oracles      Detect this host's third-party tools (--detect), or print the
+                 gitignored overlay (--export)
     plan         Map requirements onto the machines that exist
     produce      Build every artifact rb-cli can write, twice, into <artifacts>/<os>
     parity       Compare artifacts across producer OSes; needs no oracle
@@ -357,6 +369,7 @@ fn main() {
         Command::Query(ref q) => cmd_query(&args, q),
         Command::Plan => cmd_plan(&args),
         Command::Fixtures => cmd_fixtures(&args),
+        Command::Oracles => cmd_oracles(&args),
         Command::Produce => cmd_produce(&args),
         Command::Parity(ref root) => cmd_parity(&args, root),
         Command::Verify => cmd_verify(&args),
@@ -1659,4 +1672,94 @@ fn sanitise_id(id: &str) -> String {
             }
         })
         .collect()
+}
+
+fn cmd_oracles(args: &Args) -> i32 {
+    let base = regression_dir();
+    let reg = match registry::Registry::load(&base) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return 2;
+        }
+    };
+    let platform = exec::platform_token();
+    let path = oracles::overlay_path(&base);
+
+    if args.export {
+        match fs::read_to_string(&path) {
+            Ok(t) => {
+                print!("{}", t);
+                return 0;
+            }
+            Err(_) => {
+                eprintln!(
+                    "no overlay at {} - run `rb-regress oracles --detect` first",
+                    path.display()
+                );
+                return 1;
+            }
+        }
+    }
+
+    if !args.detect {
+        println!("oracles: {} declared in data/oracles.toml", reg.oracles.len());
+        println!("overlay: {}", path.display());
+        println!("  --detect   probe this host and rewrite the overlay");
+        println!("  --export   print it, to seed another machine");
+        return 0;
+    }
+
+    let hints = oracles::hints_for(&reg, platform);
+    let found = oracles::detect(&reg, &hints, platform);
+    let today = today_stamp();
+    let body = oracles::render(&found, platform, &today);
+    match oracles::write(&base, &body) {
+        Ok(p) => {
+            let n = |s: &str| found.iter().filter(|d| d.status == s).count();
+            println!(
+                "detected on {}: {} verified, {} manual, {} absent (of {})",
+                platform,
+                n("verified"),
+                n("manual"),
+                n("absent"),
+                found.len()
+            );
+            for d in found.iter().filter(|d| d.status == "verified") {
+                println!(
+                    "  {:<22} {}",
+                    d.oracle,
+                    d.resolved.as_deref().unwrap_or("")
+                );
+            }
+            println!("\nwrote {}", p.display());
+            0
+        }
+        Err(e) => {
+            eprintln!("error: {}", e);
+            2
+        }
+    }
+}
+
+/// UTC date, for the `verified_on` stamp.
+fn today_stamp() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = secs / 86_400;
+    // Civil-from-days (Howard Hinnant's algorithm), so the stamp needs no
+    // date crate for one field.
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{:04}-{:02}-{:02}", y, m, d)
 }

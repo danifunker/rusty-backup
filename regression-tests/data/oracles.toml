@@ -20,10 +20,10 @@ id = "qemu-img"
 tool = "qemu-img"
 kind = "package"
 availability = [
-  { platform = "windows", status = "verified", path_hint = "C:/Program Files/qemu", verified_on = "2026-08-02" },
-  { platform = "wsl",     status = "verified", path_hint = "/usr/bin/qemu-img",      verified_on = "2026-08-02" },
+  { platform = "windows", status = "verified", verified_on = "2026-08-02" },
+  { platform = "wsl",     status = "verified",      verified_on = "2026-08-02" },
   { platform = "linux",   status = "expected" },
-  { platform = "macos",   status = "install",  path_hint = "brew install qemu" },
+  { platform = "macos",   status = "install" },
 ]
 verifies = [
   { format = "fmt.raw",         direction = "write", strength = "structural", status = "proven", evidence = "qemu-img info -> raw", check = ["info", "{artifact}"], expect_stdout = "file format: raw" },
@@ -40,7 +40,7 @@ tool = "chdman"
 kind = "package"
 notes = "Four versions present locally (0.174/0.189/0.273/0.288); our output verifies on all four, so the version spread is itself a coverage axis."
 availability = [
-  { platform = "windows", status = "verified", path_hint = "C:/Tools/chdman", verified_on = "2026-08-02" },
+  { platform = "windows", status = "verified", verified_on = "2026-08-02" },
   { platform = "linux",   status = "install" },
   { platform = "macos",   status = "install" },
   { platform = "mister-hps", status = "absent" },
@@ -56,10 +56,10 @@ id = "fsck.ext4"
 tool = "fsck.ext4"
 kind = "package"
 availability = [
-  { platform = "wsl",    status = "verified", path_hint = "/usr/sbin/fsck.ext4", verified_on = "2026-08-02" },
-  { platform = "mister-hps", status = "verified", path_hint = "/usr/sbin/fsck.ext4", verified_on = "2026-08-02" },
+  { platform = "wsl",    status = "verified", verified_on = "2026-08-02" },
+  { platform = "mister-hps", status = "verified", verified_on = "2026-08-02" },
   { platform = "linux",  status = "expected" },
-  { platform = "macos",  status = "install", path_hint = "brew install e2fsprogs" },
+  { platform = "macos",  status = "install" },
   { platform = "windows", status = "absent" },
 ]
 verifies = [
@@ -146,7 +146,7 @@ tool = "ghostexp.exe"
 kind = "package"
 notes = "Symantec Ghost Explorer 11.5. Windows only; three copies present locally."
 availability = [
-  { platform = "windows", status = "verified", path_hint = "C:/Temp/pebuilder-isolinux/Programs/ghost11", verified_on = "2026-08-02" },
+  { platform = "windows", status = "verified", verified_on = "2026-08-02" },
   { platform = "linux",   status = "absent" },
   { platform = "macos",   status = "absent" },
 ]
@@ -208,8 +208,8 @@ is ARM Linux with affs built in — but this is a LINUX opinion, not an Amiga
 one, and is worth exactly what the same mount on any Linux box is worth. The
 Amiga's own filesystem code lives in the core; see mister-core-amiga."""
 availability = [
-  { platform = "mister-hps", status = "verified", path_hint = "/proc/filesystems", verified_on = "2026-08-02" },
-  { platform = "linux",      status = "install", path_hint = "linux-modules-extra" },
+  { platform = "mister-hps", status = "verified", verified_on = "2026-08-02" },
+  { platform = "linux",      status = "install" },
   { platform = "wsl",        status = "absent" },
 ]
 verifies = [{ format = "fs.affs", direction = "write", strength = "structural", status = "untested" }]
@@ -231,7 +231,7 @@ id = "7z"
 tool = "7z"
 kind = "package"
 availability = [
-  { platform = "windows", status = "verified", path_hint = "C:/Program Files/7-Zip", verified_on = "2026-08-02" },
+  { platform = "windows", status = "verified", verified_on = "2026-08-02" },
   { platform = "linux",   status = "expected" },
   { platform = "macos",   status = "install" },
 ]
@@ -264,9 +264,10 @@ notes = """Portable Amiga emulator; the cross-platform half of the WinUAE pair.
 
 Assets located 2026-08-07, all already owned — nothing needs downloading:
 
-  * Kickstart ROMs — a full licensed AmigaForever set on the Windows box at
-    D:/ROMs/Amiga/Shared/rom (amiga-os-070 .. 3.x), plus Kickstart 3.2 ROMs on
-    the NAS and five ROMs on linuxbox at ~/kickstarts.
+  * Kickstart ROMs — a full licensed AmigaForever set (amiga-os-070 .. 3.x) on
+    the Windows box, with Kickstart 3.2 ROMs and five more spread across two
+    other hosts. WHERE they live is machine-specific: record that as a
+    path_hint in the gitignored data/oracles.local.toml, never here.
   * A bootable environment — AmigaVision on the MiSTer (9.1 GB HDF, PFS3, with
     an AmigaVision.fs-uae config already written).
   * The results channel — that config's `hard_drive_2 = ./shared` mounts a HOST
@@ -645,7 +646,7 @@ tool = "mount -t ntfs3"
 kind = "mount"
 notes = "In-kernel NTFS driver; absent from WSL, needs a full Linux host."
 availability = [
-  { platform = "linux", status = "install", path_hint = "linux-modules-extra" },
+  { platform = "linux", status = "install" },
   { platform = "wsl",   status = "absent" },
 ]
 verifies = [{ format = "fs.ntfs", direction = "write", strength = "structural", status = "untested" }]
