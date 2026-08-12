@@ -1,4 +1,4 @@
-# Regression Findings (R-001 … R-037)
+# Regression Findings (R-001 … R-038)
 
 Defects and documentation drift turned up while building the regression suite
 (`regression-tests/`), 2026-08-01/02. The suite work was deliberately kept
@@ -37,6 +37,7 @@ finding depends on a fixture, the fixture is named.
 | ~~R-035~~ | ~~Medium~~ **FIXED** | `src/backup/` | ~~`.cbk` embeds the producing host's absolute path, so it can never be byte-identical across machines~~ — path normalised to a leaf, 2026-08-09 |
 | ~~R-036~~ | ~~Medium~~ **FIXED** | `src/cli/resolve.rs` | ~~A missing image gets three different exit codes across the verb surface~~ — one guard in the shared resolver, 2026-08-10 |
 | ~~R-037~~ | ~~**High**~~ **FIXED** | `src/cli/verbs/resize.rs` | ~~Shrinking rewrote the filesystem over live data and returned truncated files~~ — data floor + `--confirm-shrink` + truncation, 2026-08-09 |
+| [R-038](#r-038) | **High** | `src/fs/affs.rs` | A second implementation (amitools) rejects every AFFS volume we write |
 | [R-020](#r-020) | **High** | `src/fs/affs.rs` | `new volume affs` output is "Not a DOS disk" on a real Amiga, at every size |
 | ~~R-016~~ | ~~**High**~~ **RECLASSIFIED** | `src/cli/verbs/backup.rs` | ~~`backup` accepts only flat-layout sources: CHD, dynamic VHD, QCOW2 and VMDK all fail~~ — not a defect; moved to [F-008](missing_features_from_regression.md#f-008), 2026-08-09 |
 | ~~R-018~~ | ~~Blocker~~ **FIXED** | `CONTRIBUTING.md` | ~~The documented Rust-1.73 verification build does not compile on Windows~~ — missing `windows-legacy` feature, 2026-08-07 |
@@ -1860,6 +1861,50 @@ Cases: `resize.shrink.{refuses-cutting-live-data,needs-confirmation,keeps-data-a
   the floor lives in the CLI verb rather than in the shared engine. Per
   CLAUDE.md's shared-logic rule the check belongs in a core module both
   surfaces call; that refactor is larger than this fix.
+
+---
+
+### R-038 — a second implementation rejects every AFFS volume we write {#r-038}
+
+Found 2026-08-12, the first time an AFFS volume of ours was read by code that
+is not ours. amitools' `xdftool` refuses it:
+
+```
+FSError: Bitmap Block Count Mismatch(15): got=2 want=1
+```
+
+**The control is what makes this a finding rather than a tooling problem.** The
+same xdftool reads `fs.affs.workbench13.hd.hdf` — a real Workbench 1.3 disk
+from the corpus — perfectly: full directory tree, 3421 blocks, timestamps from
+1988 and 1992. So xdftool handles AFFS, and it handles multi-bitmap-block
+volumes, because that 3 MB fixture needs two of them.
+
+It fails identically on artifacts produced on **Windows, Linux and macOS**. The
+formatter is deterministic and deterministically disagreed with.
+
+**What it means, stated carefully.** amitools is a reimplementation, so this is
+not proof a real Amiga refuses the volume — that is still
+[R-020](#r-020)'s question, and still needs an emulator or hardware. What it
+*is*: the first independent read of our AFFS output. Every AFFS check before
+this was our own formatter agreeing with our own fsck, which is the condition
+R-020 has been stuck in.
+
+**A live hypothesis, not a conclusion.** For a 2 MB volume — 4096 blocks of 512
+bytes — the bitmap must cover blocks 2..4095, i.e. 4094 bits. One bitmap block
+holds `(512 - 4) * 8 = 4064` bits, so two are needed, and two is what we write.
+amitools computes that one is wanted. Since amitools reads a real two-bitmap
+volume without complaint, the likeliest reading is that our root block declares
+a geometry inconsistent with the bitmap we actually wrote — an internally
+contradictory volume, which is exactly the shape that produces "Not a DOS
+disk". That is a hypothesis; nobody has read our root block against the spec
+yet.
+
+Note this is adjacent to [R-008a](#r-008a), which added the second bitmap block
+for volumes above 4066 blocks. That fix may be correct and the root block not
+updated to match, or the fix may itself be wrong. Do not assume which.
+
+Oracle: `amitools`, check `oracles/amitools_affs.py`. It is `structural`, not
+`authoritative`, for the reason above.
 
 ---
 

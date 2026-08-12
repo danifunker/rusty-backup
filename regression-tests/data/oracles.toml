@@ -301,6 +301,35 @@ verifies = [
 ]
 
 [[oracle]]
+id = "amitools"
+tool = "xdftool"
+kind = "package"
+program = "python3"
+notes = """amitools' xdftool — a pure-Python AmigaDOS filesystem reader, and the
+closest thing to an Amiga opinion that needs no emulator, no ROM and no guest.
+`pip install amitools`.
+
+Not authoritative: it is a reimplementation, so it agreeing does not prove a
+real Amiga will mount the volume, and it disagreeing does not prove one will
+not. What it does give is a second implementation reading the same bytes, which
+is exactly what R-020 lacked — every AFFS check until now was our own code
+agreeing with itself.
+
+Two quirks that cost an afternoon if unknown. It picks its geometry from the
+file EXTENSION: a 2 MB volume named `.adf` is rejected as an invalid floppy
+size, and must be `.hdf` to be read as a hard-disk volume. And it opens
+read-write by default, so a read-only artifact fails with EACCES before it
+parses anything — `-r` does not help, because the open happens first."""
+availability = [
+  { platform = "windows", status = "expected" },
+  { platform = "linux",   status = "expected" },
+  { platform = "macos",   status = "expected" },
+]
+verifies = [
+  { format = "fs.affs", direction = "write", strength = "structural", status = "refuted", evidence = "2026-08-12: xdftool rejects our volume with 'Bitmap Block Count Mismatch: got=2 want=1', and reads a real Workbench 1.3 disk from the corpus perfectly. See R-038.", check = ["{oracles}/amitools_affs.py", "{artifact}"] },
+]
+
+[[oracle]]
 id = "winuae"
 tool = "WinUAE"
 kind = "emulator"
@@ -416,7 +445,7 @@ verifies = [
 id = "snow"
 tool = "Snow"
 kind = "emulator"
-program = "Snow"
+program = "snowemu"
 notes = """Modern Macintosh emulator written in Rust. Emulating a Mac Plus gives
 a real MFS implementation — the only realistic judge of MFS, which otherwise
 has no oracle anywhere.

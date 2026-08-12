@@ -149,7 +149,7 @@ fn resolve_program(
     None
 }
 
-fn expand(args: &[String], artifact: &Path) -> Vec<String> {
+fn expand(args: &[String], artifact: &Path, oracles_dir: &Path) -> Vec<String> {
     let dir = artifact
         .parent()
         .map(|p| p.display().to_string())
@@ -158,6 +158,11 @@ fn expand(args: &[String], artifact: &Path) -> Vec<String> {
         .map(|a| {
             a.replace("{artifact}", &artifact.display().to_string())
                 .replace("{dir}", &dir)
+                // A wrapper script has to be addressed absolutely: checks run
+                // with the artifact's directory as cwd, so a relative
+                // `oracles/foo.py` resolves inside artifacts/<os>/<format>/
+                // and the interpreter reports a missing file.
+                .replace("{oracles}", &oracles_dir.display().to_string())
         })
         .collect()
 }
@@ -278,7 +283,11 @@ pub fn verify(
                         None,
                     ),
                     Some(exe) => {
-                        let argv = expand(claim.check.as_ref().unwrap(), image);
+                        let argv = expand(
+                            claim.check.as_ref().unwrap(),
+                            image,
+                            &regression_dir.join("oracles"),
+                        );
                         let cwd = image.parent().unwrap_or(artifacts_root);
                         match exec::run(&exe, &argv, cwd, VERIFY_TIMEOUT) {
                             Err(e) => (
