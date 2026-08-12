@@ -86,6 +86,12 @@ fn search_roots(platform: &str) -> Vec<PathBuf> {
             }
             roots.push(PathBuf::from("C:/Tools"));
             roots.push(PathBuf::from("C:/Emulators"));
+            // A per-user collection is at least as common as a system-wide
+            // one, and is where this project's own emulators actually live.
+            if let Some(h) = &home {
+                roots.push(h.join("emulators"));
+                roots.push(h.join("Emulators"));
+            }
         }
         "macos" => {
             roots.push(PathBuf::from("/Applications"));

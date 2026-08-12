@@ -301,6 +301,36 @@ verifies = [
 ]
 
 [[oracle]]
+id = "winuae"
+tool = "WinUAE"
+kind = "emulator"
+program = "winuae64"
+notes = """The Windows half of the WinUAE/FS-UAE pair, and the same emulator
+family: real AmigaOS with its own filesystem handlers reading the volume, which
+is the Amiga's opinion rather than a Linux affs mount's.
+
+Registered alongside fs-uae rather than instead of it because a given machine
+tends to have one or the other. Both verify the same three formats and either
+satisfies the pair; whichever is installed is what --detect records.
+
+The results channel is the one FS-UAE documents: mount a host directory as an
+Amiga volume, boot a script that inspects the test volume and writes a report
+there, host reads the file. No screen-scraping.
+
+ROM paths are machine-specific and belong in the gitignored overlay, never
+here."""
+availability = [
+  { platform = "windows", status = "expected" },
+  { platform = "linux",   status = "absent" },
+  { platform = "macos",   status = "absent" },
+]
+verifies = [
+  { format = "fs.affs", direction = "write", strength = "authoritative", status = "plausible" },
+  { format = "fs.pfs3", direction = "write", strength = "authoritative", status = "plausible" },
+  { format = "part.rdb", direction = "write", strength = "authoritative", status = "plausible" },
+]
+
+[[oracle]]
 id = "86box-os2"
 tool = "86Box + OS/2"
 kind = "emulator"

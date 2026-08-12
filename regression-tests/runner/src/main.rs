@@ -1876,17 +1876,24 @@ recorded {filled} path(s) you provided");
         Ok(p) => {
             let n = |s: &str| found.iter().filter(|d| d.status == s).count();
             println!(
-                "detected on {}: {} verified, {} manual, {} absent (of {})",
+                "detected on {}: {} verified, {} installed, {} manual, {} absent (of {})",
                 platform,
                 n("verified"),
+                n("installed"),
                 n("manual"),
                 n("absent"),
                 found.len()
             );
-            for d in found.iter().filter(|d| d.status == "verified") {
+            // `installed` was omitted here, which hid the four emulators the
+            // search had just found — a report that leaves out its best news.
+            for d in found
+                .iter()
+                .filter(|d| d.status == "verified" || d.status == "installed")
+            {
                 println!(
-                    "  {:<22} {}",
+                    "  {:<12} {:<10} {}",
                     d.oracle,
+                    d.status,
                     d.resolved.as_deref().unwrap_or("")
                 );
             }
