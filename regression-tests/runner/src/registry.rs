@@ -55,6 +55,11 @@ pub struct Oracle {
     pub program: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
+    /// For a MiSTer core: the `.rbf` base name, without the build-date suffix.
+    /// A core's name is the same on every board, so it is portable knowledge;
+    /// whether a given board has it is not, and comes from `--scan`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub core: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -152,6 +157,8 @@ struct OracleDef {
     program: Option<String>,
     #[serde(default)]
     notes: Option<String>,
+    #[serde(default)]
+    core: Option<String>,
     #[serde(default)]
     availability: Vec<AvailDef>,
     #[serde(default)]
@@ -271,6 +278,7 @@ impl Registry {
                 kind: o.kind,
                 program: o.program,
                 notes: o.notes,
+                core: o.core,
             });
         }
 

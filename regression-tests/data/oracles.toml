@@ -328,6 +328,7 @@ verifies = [{ format = "fs.hpfs", direction = "write", strength = "authoritative
 id = "mister-core-amiga"
 tool = "MiSTer Minimig core"
 kind = "hardware"
+core = "Minimig"
 notes = """Real AmigaOS reading the volume with its own filesystem handlers.
 Unlike the HPS affs mount, this is the Amiga's opinion. Bootable Workbench
 1.3 / 2.1 RDB+PFS disks are already on the board."""
@@ -343,6 +344,7 @@ verifies = [
 id = "mister-core-x68000"
 tool = "MiSTer X68000 core"
 kind = "hardware"
+core = "X68000"
 availability = [{ platform = "mister-core", status = "expected" }]
 verifies = [
   { format = "fs.human68k", direction = "write", strength = "authoritative", status = "plausible" },
@@ -367,6 +369,7 @@ verifies = [
 id = "mister-core-appleii"
 tool = "MiSTer Apple-II core"
 kind = "hardware"
+core = "Apple-II"
 notes = """Real Apple II reading the disk with ProDOS / DOS 3.3 themselves.
 /media/fat/games/Apple-II is already populated on the board, so this needs no
 new material — it closes two write gaps that had no oracle at all."""
@@ -560,6 +563,7 @@ verifies = [
 id = "mister-core-atari800"
 tool = "MiSTer ATARI800 core"
 kind = "hardware"
+core = "Atari800"
 availability = [{ platform = "mister-core", status = "expected" }]
 verifies = [
   { format = "fs.atari-dos2",   direction = "write", strength = "authoritative", status = "plausible" },
@@ -570,6 +574,7 @@ verifies = [
 id = "mister-core-ti99"
 tool = "MiSTer TI-99_4A core"
 kind = "hardware"
+core = "Ti994a"
 availability = [{ platform = "mister-core", status = "expected" }]
 verifies = [
   { format = "fs.ti99",       direction = "write", strength = "authoritative", status = "plausible" },
@@ -580,6 +585,7 @@ verifies = [
 id = "mister-core-oric"
 tool = "MiSTer Oric core"
 kind = "hardware"
+core = "Oric"
 availability = [{ platform = "mister-core", status = "expected" }]
 verifies = [{ format = "fs.oric", direction = "write", strength = "authoritative", status = "plausible" }]
 
@@ -587,6 +593,7 @@ verifies = [{ format = "fs.oric", direction = "write", strength = "authoritative
 id = "mister-core-spectrum"
 tool = "MiSTer Spectrum core"
 kind = "hardware"
+core = "ZX-Spectrum"
 availability = [{ platform = "mister-core", status = "expected" }]
 verifies = [
   { format = "fs.trdos",       direction = "write", strength = "authoritative", status = "plausible" },
@@ -597,6 +604,7 @@ verifies = [
 id = "mister-core-coco"
 tool = "MiSTer CoCo2 / COCO3 core"
 kind = "hardware"
+core = "CoCo3"
 availability = [{ platform = "mister-core", status = "expected" }]
 verifies = [
   { format = "fs.os9",        direction = "write", strength = "authoritative", status = "plausible" },
@@ -608,6 +616,7 @@ verifies = [
 id = "mister-core-archie"
 tool = "MiSTer ARCHIE core"
 kind = "hardware"
+core = "Archie"
 notes = "Acorn Archimedes; RISC OS reads ADFS with its own FileCore."
 availability = [{ platform = "mister-core", status = "expected" }]
 verifies = [{ format = "fs.adfs", direction = "write", strength = "authoritative", status = "plausible" }]

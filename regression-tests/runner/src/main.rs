@@ -41,6 +41,7 @@ struct Args {
     detect: bool,
     set_oracle: Option<String>,
     no_prompt: bool,
+    scan_host: Option<String>,
     export: bool,
     fixture_root: Option<PathBuf>,
     sync_from: Option<PathBuf>,
@@ -134,6 +135,7 @@ fn parse_args() -> Result<Args, String> {
         detect: false,
         set_oracle: None,
         no_prompt: false,
+        scan_host: None,
         export: false,
         fixture_root: None,
         sync_from: None,
@@ -234,6 +236,10 @@ fn parse_args() -> Result<Args, String> {
                         args.verifications_root = PathBuf::from(value()?);
                         i += 1;
                     }
+                    "--scan" => {
+                        args.scan_host = Some(value()?);
+                        i += 1;
+                    }
                     "--set" => {
                         args.set_oracle = Some(value()?);
                         i += 1;
@@ -311,8 +317,9 @@ COMMANDS:
     validate     Parse every manifest and report problems; runs nothing
     fixtures     Inventory the corpus: what is present, verified, and runnable
     oracles      Detect this host's third-party tools (--detect; asks about
-                 emulators it cannot find, --no-prompt to stay quiet), record
-                 one by hand (--set <id>=<path>), or print it (--export)
+                 emulators it cannot find, --no-prompt to stay quiet), scan a
+                 MiSTer's cores over ssh (--scan <host-id>), record one by hand
+                 (--set <id>=<path>), or print it (--export)
     plan         Map requirements onto the machines that exist
     produce      Build every artifact rb-cli can write, twice, into <artifacts>/<os>
     parity       Compare artifacts across producer OSes; needs no oracle
@@ -1695,6 +1702,90 @@ fn cmd_oracles(args: &Args) -> i32 {
     };
     let platform = exec::platform_token();
     let path = oracles::overlay_path(&base);
+
+    if let Some(host_id) = &args.scan_host {
+        let (cfg, _, _) = local::load(&base);
+        let host = match cfg.hosts.iter().find(|h| &h.id == host_id) {
+            Some(h) => h,
+            None => {
+                eprintln!(
+                    "no host {host_id:?} in local.toml. Known: {}",
+                    cfg.hosts
+                        .iter()
+                        .map(|h| h.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                return 2;
+            }
+        };
+        let target = match &host.ssh {
+            Some(t) => t.clone(),
+            None => {
+                eprintln!("host {host_id:?} has no `ssh` target in local.toml");
+                return 2;
+            }
+        };
+        // One ssh call, listing the cores. The board's IP and key live in
+        // local.toml like every other machine address — nothing new to
+        // configure, and nothing that could reach a public repo.
+        let listing = match exec::ssh_capture(
+            &target,
+            "ls /media/fat/_Computer/*.rbf 2>/dev/null | xargs -n1 basename",
+        ) {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("scan {host_id}: {e}");
+                return 1;
+            }
+        };
+        let present: Vec<String> = listing
+            .lines()
+            .map(|l| oracles::core_base_name(l.trim()))
+            .filter(|l| !l.is_empty())
+            .collect();
+        let scan = oracles::match_cores(&reg, &present);
+        println!(
+            "{host_id}: {} core(s) on the board, {} matched to an oracle",
+            scan.cores.len(),
+            scan.matched.len()
+        );
+        for (o, c) in &scan.matched {
+            println!("  {:<26} {}", o, c);
+        }
+        for (o, c) in &scan.missing {
+            println!("  MISSING  {:<17} needs core {}", o, c);
+        }
+        let body = oracles::render_mister(&scan, &host.platform, &today_stamp());
+        // Merge into the overlay rather than replacing it: the board's cores
+        // and this box's tools are both availability, and a scan must not
+        // discard what --detect found.
+        let existing = fs::read_to_string(oracles::overlay_path(&base)).unwrap_or_default();
+        let mut merged = String::new();
+        for block in existing.split("[[availability]]") {
+            if scan.matched.iter().any(|(o, _)| block.contains(&format!("oracle = {:?}", o))) {
+                continue;
+            }
+            if merged.is_empty() {
+                merged.push_str(block);
+            } else {
+                merged.push_str("[[availability]]");
+                merged.push_str(block);
+            }
+        }
+        merged.push_str(&body);
+        match oracles::write(&base, &merged) {
+            Ok(p) => {
+                println!("
+wrote {}", p.display());
+                return 0;
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                return 2;
+            }
+        }
+    }
 
     if let Some(spec) = &args.set_oracle {
         let (oracle, path) = match spec.split_once('=') {

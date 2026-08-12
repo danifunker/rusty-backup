@@ -528,6 +528,7 @@ mod prompt_tests {
             kind: kind.into(),
             program: Some("thing".into()),
             notes: None,
+            core: None,
         });
         r
     }
@@ -592,5 +593,121 @@ mod prompt_tests {
         let mut out = Vec::new();
         assert_eq!(prompt_for_missing(&mut found, &reg, &mut input, &mut out), 0);
         assert!(out.is_empty(), "no prompt should have been printed");
+    }
+}
+
+/// What a MiSTer scan found on the board.
+pub struct MisterScan {
+    /// `.rbf` base names present, date suffix stripped.
+    pub cores: Vec<String>,
+    /// Oracles matched to a core that is actually installed.
+    pub matched: Vec<(String, String)>,
+    /// Oracles whose core the board does not have.
+    pub missing: Vec<(String, String)>,
+}
+
+/// Strip MiSTer's `_YYYYMMDD` build-date suffix from an `.rbf` filename.
+///
+/// Cores are redistributed as `X68000_20260603.rbf` and the date moves every
+/// time the board is updated, so the bare name is the only stable identifier.
+pub fn core_base_name(filename: &str) -> String {
+    let stem = filename.strip_suffix(".rbf").unwrap_or(filename);
+    match stem.rsplit_once('_') {
+        Some((head, tail)) if tail.len() == 8 && tail.chars().all(|c| c.is_ascii_digit()) => {
+            head.to_string()
+        }
+        _ => stem.to_string(),
+    }
+}
+
+/// Match the board's cores against the oracles that name one.
+pub fn match_cores(reg: &Registry, present: &[String]) -> MisterScan {
+    let have: std::collections::BTreeSet<&str> = present.iter().map(|s| s.as_str()).collect();
+    let mut matched = Vec::new();
+    let mut missing = Vec::new();
+    for o in &reg.oracles {
+        if let Some(core) = &o.core {
+            if have.contains(core.as_str()) {
+                matched.push((o.id.clone(), core.clone()));
+            } else {
+                missing.push((o.id.clone(), core.clone()));
+            }
+        }
+    }
+    MisterScan {
+        cores: present.to_vec(),
+        matched,
+        missing,
+    }
+}
+
+/// Render scan results as overlay rows. A core that is present is `verified`:
+/// unlike an emulator, there is no guest to configure — the core IS the guest.
+/// Running the check is still manual, which the oracle's `kind` already says.
+pub fn render_mister(scan: &MisterScan, platform: &str, today: &str) -> String {
+    let mut s = String::new();
+    s.push_str(
+        "# MiSTer cores found by `rb-regress oracles --scan`. GITIGNORED.\n\
+         # A core present on the board is recorded verified; whether a given\n\
+         # check has been RUN is a separate question the verify tree answers.\n\n",
+    );
+    for (oracle, core) in &scan.matched {
+        s.push_str("[[availability]]\n");
+        s.push_str(&format!("oracle = {:?}\n", oracle));
+        s.push_str(&format!("platform = {:?}\n", platform));
+        s.push_str("status = \"verified\"\n");
+        s.push_str(&format!("path_hint = {:?}\n", core));
+        s.push_str(&format!("verified_on = {:?}\n\n", today));
+    }
+    s
+}
+
+#[cfg(test)]
+mod mister_tests {
+    use super::*;
+    use crate::registry::{Oracle, Registry};
+
+    fn reg() -> Registry {
+        let mut r = Registry::default();
+        for (id, core) in [("mister-core-amiga", "Minimig"), ("mister-core-ti99", "Ti994a")] {
+            r.oracles.push(Oracle {
+                id: id.into(),
+                tool: "core".into(),
+                kind: "hardware".into(),
+                program: None,
+                notes: None,
+                core: Some(core.into()),
+            });
+        }
+        r
+    }
+
+    #[test]
+    fn the_build_date_suffix_is_stripped() {
+        assert_eq!(core_base_name("X68000_20260603.rbf"), "X68000");
+        assert_eq!(core_base_name("ZX-Spectrum_20250930.rbf"), "ZX-Spectrum");
+        // A name with an underscore but no date must survive intact.
+        assert_eq!(core_base_name("Apple-II.rbf"), "Apple-II");
+        assert_eq!(core_base_name("My_Core.rbf"), "My_Core");
+    }
+
+    #[test]
+    fn present_and_absent_cores_are_told_apart() {
+        let present = vec!["Minimig".to_string(), "X68000".to_string()];
+        let scan = match_cores(&reg(), &present);
+        assert_eq!(scan.matched.len(), 1);
+        assert_eq!(scan.matched[0].0, "mister-core-amiga");
+        // Ti994a is not on this imaginary board, and must be reported missing
+        // rather than silently dropped.
+        assert_eq!(scan.missing.len(), 1);
+        assert_eq!(scan.missing[0].1, "Ti994a");
+    }
+
+    #[test]
+    fn only_matched_cores_reach_the_overlay() {
+        let scan = match_cores(&reg(), &["Minimig".to_string()]);
+        let out = render_mister(&scan, "mister-core", "2026-08-12");
+        assert!(out.contains("mister-core-amiga"));
+        assert!(!out.contains("mister-core-ti99"));
     }
 }

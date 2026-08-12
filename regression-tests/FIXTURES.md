@@ -272,6 +272,27 @@ rb-regress oracles --set fs-uae=/path/to/fs-uae    # provide one by hand
 rb-regress oracles --export    # print it, to seed another machine
 ```
 
+**Scanning a MiSTer.** The board is just another host in `local.toml` — give
+that entry an `ssh` target and:
+
+```bash
+rb-regress oracles --scan mister-core
+```
+
+It lists `/media/fat/_Computer/*.rbf`, strips MiSTer's `_YYYYMMDD` build-date
+suffix (which moves on every board update, so the bare name is the only stable
+identifier), and matches what it finds against the `core` field on each
+`mister-core-*` oracle. Cores present are recorded `verified`; cores the
+registry names and the board lacks are reported as **MISSING** rather than
+quietly skipped. Results merge into the overlay, so a scan never discards what
+`--detect` found on this machine.
+
+The core names were read off a real board, not guessed — `Ti994a`, not
+`TI-99_4A`, and `CoCo3` rather than `CoCo2`.
+
+Nothing new to configure: the board's address and key are in `local.toml` with
+every other machine, which is the one file that never reaches the repo.
+
 **Finding emulators.** They install as apps, not commands, so `PATH` alone
 never finds them. `--detect` also searches the platform's usual roots —
 `%ProgramFiles%`, `C:/Tools`, `C:/Emulators` on Windows; `/Applications` (into

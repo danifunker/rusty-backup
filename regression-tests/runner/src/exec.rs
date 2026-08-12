@@ -204,3 +204,39 @@ pub fn platform_token() -> &'static str {
         "other"
     }
 }
+
+/// Run one command on a remote host over ssh and return its stdout.
+///
+/// Deliberately spartan: `BatchMode=yes` so a host missing its key fails fast
+/// instead of blocking on a passphrase prompt nobody is watching, and a short
+/// connect timeout so an unplugged MiSTer is an error rather than a stall. On
+/// Windows the system ssh is named explicitly — Git Bash ships its own, which
+/// does not see the user's keys.
+pub fn ssh_capture(target: &str, command: &str) -> Result<String, String> {
+    let program = if cfg!(windows) {
+        r"C:\Windows\System32\OpenSSH\ssh.exe"
+    } else {
+        "ssh"
+    };
+    let out = std::process::Command::new(program)
+        .args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "IdentitiesOnly=no",
+            "-o",
+            "ConnectTimeout=8",
+            target,
+            command,
+        ])
+        .output()
+        .map_err(|e| format!("cannot run ssh: {e}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(format!(
+            "ssh {target} failed: {}",
+            err.lines().next().unwrap_or("(no message)")
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
