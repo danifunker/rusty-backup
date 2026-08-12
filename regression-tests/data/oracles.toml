@@ -244,6 +244,41 @@ id = "iris"
 tool = "Iris"
 kind = "emulator"
 program = "iris"
+notes = """SGI Indy (MIPS R4400) emulator with a purpose-built CI control
+socket: `iris-ci` has put / run / get / snapshot-rollback, and `run` returns the
+guest's stdout — no screen-scraping at all.
+
+Brought up 2026-08-12, as far as a live IRIX shell:
+
+  IRIS_JIT=1 iris --headless --noaudio --ci \
+      --scsi1 disks/Indy-IRIX65_dev.chd --cdrom4 <any.iso>
+  iris-ci boot && iris-ci login && iris-ci run "uname -aR"
+    -> IRIX IRIS 6.5 6.5.22m 10070055 IP22
+
+Four things that cost time, recorded so they do not again:
+
+  * No PROM needed. It warns about a missing prom.bin and uses an embedded one.
+    Do not go hunting for Indy firmware.
+  * --ci is required for the control socket. Without it iris listens only on
+    the monitor port 8888 and iris-ci cannot reach 19851.
+  * A CD-ROM must be attached even when booting from disk, or startup dies with
+    "could not attach cdrom4.iso". Any ISO will do.
+  * IRIX 6.5 boots; the 5.3 image hangs. Indy-IRIX53_dev.chd reaches "The
+    system is coming up", prints "Find Error: 10" and never reaches a login
+    prompt. Indy-IRIX65_dev.chd reaches one in a few minutes with JIT on.
+
+STILL BLOCKED on getting a file INTO the guest, which is what the oracle needs:
+
+  * `iris-ci put` wants a scratch volume - "scratch volume not configured".
+    iris has no --scratch flag, so the scratch disk is presumably an SGI-VH
+    volume on one of the SCSI IDs; the convention is not in --help.
+  * --nfs-dir exports a host directory and iris reports "in-core NFS server
+    exporting ./share", but the guest cannot mount it: "Port mapper failure -
+    Unable to send", then an NFS v3->v2 retry loop that blocks the shell. The
+    guest network config is the likely cause.
+
+Once a file can cross, the check is IRIX's own fsck/fsstat on our EFS volume -
+an authoritative answer no other oracle here can give."""
 notes = "SGI emulator written in Rust; in-house, so blockers are fixable at source. Replaces MAME for IRIX."
 availability = [
   { platform = "windows", status = "install" },
