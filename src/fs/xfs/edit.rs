@@ -75,6 +75,25 @@ const XFS_DIR3_FT_DIR: u8 = 2;
 /// NULL agino sentinel stored in `di_next_unlinked` for a not-unlinked inode.
 const NULLAGINO: u32 = 0xFFFF_FFFF;
 
+/// Stamp the three v4 dinode time fields (`di_atime` @ 32..40,
+/// `di_mtime` @ 40..48, `di_ctime` @ 48..56) into an inode buffer, each a
+/// pair of BE u32 `(tv_sec, tv_nsec)`. `times`, when set, replaces the
+/// default `now` stamp with the preserved values so a cross-fs import keeps
+/// the source's mtime. `tv_nsec` is written 0 — every source we import from
+/// only carries whole-second precision (tar, EFS, host-stat).
+fn stamp_v4_times(buf: &mut [u8], times: Option<crate::fs::times::UnixTimes>) {
+    let resolved = crate::fs::times::resolve_or_now(times);
+    let atime = resolved.atime_or_now() as u32;
+    let mtime = resolved.mtime_or_now() as u32;
+    let ctime = resolved.ctime_or_now() as u32;
+    BigEndian::write_u32(&mut buf[32..36], atime);
+    // buf[36..40] already zero from the sweep above (tv_nsec).
+    BigEndian::write_u32(&mut buf[40..44], mtime);
+    // buf[44..48] zero.
+    BigEndian::write_u32(&mut buf[48..52], ctime);
+    // buf[52..56] zero.
+}
+
 /// inobt leaf record layout: startino(4) freecount(4) free(8) — same on v4
 /// and v5.
 const INOBT_REC_SIZE: usize = 16;
@@ -681,6 +700,11 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
     /// bumps the generation; writes a clean v4 dinode core + the 6-byte inline
     /// fork (`count=0, i8count=0, parent`). `nlink` is 2 (the new directory's
     /// own `.` plus its entry in the parent); no subdirectories yet.
+    ///
+    /// `times`, when set, replaces the default `now` stamp on the three
+    /// di_atime/di_mtime/di_ctime fields so a cross-fs copy preserves the
+    /// source's mtime end-to-end.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn init_empty_shortform_dir(
         &mut self,
         sb: &super::sb::XfsSuperblock,
@@ -689,6 +713,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         mode: u16,
         uid: u32,
         gid: u32,
+        times: Option<crate::fs::times::UnixTimes>,
     ) -> Result<(), FilesystemError> {
         if parent_ino > u64::from(u32::MAX) || ino > u64::from(u32::MAX) {
             // Inode numbers beyond 32 bits need the 8-byte short-form layout
@@ -718,8 +743,9 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         BigEndian::write_u32(&mut buf[8..12], uid);
         BigEndian::write_u32(&mut buf[12..16], gid);
         for b in buf.iter_mut().take(56).skip(20) {
-            *b = 0; // projid, pad, atime, mtime, ctime
+            *b = 0; // projid, pad, atime, mtime, ctime — stamped below
         }
+        stamp_v4_times(&mut buf, times);
         BigEndian::write_u64(&mut buf[56..64], 6); // di_size = empty sf fork len
         for b in buf.iter_mut().take(92).skip(64) {
             *b = 0; // nblocks, extsize, nextents, anextents, forkoff, aformat, dm*, flags
@@ -962,6 +988,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
     /// as an empty short-form directory, and insert it into `parent_ino`.
     /// Returns the new directory's inode number. The fit check runs before any
     /// write, so a `DiskFull` parent never leaves a dangling allocated inode.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn do_create_directory(
         &mut self,
         parent_ino: u64,
@@ -969,6 +996,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         mode: u16,
         uid: u32,
         gid: u32,
+        times: Option<crate::fs::times::UnixTimes>,
     ) -> Result<u64, FilesystemError> {
         let sb = self.superblock().clone();
 
@@ -978,7 +1006,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         self.dir_can_insert(&sb, parent_ino, name, true)?;
 
         let ino = self.alloc_inode_slot(&sb)?;
-        self.init_empty_shortform_dir(&sb, ino, parent_ino, mode, uid, gid)?;
+        self.init_empty_shortform_dir(&sb, ino, parent_ino, mode, uid, gid, times)?;
         self.dir_insert_entry(&sb, parent_ino, name, ino, true)?;
         self.reader.flush()?;
         Ok(ino)
@@ -1103,6 +1131,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
     /// (`di_format = 2`), and the caller must have bounded the count to the
     /// inline literal area.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn init_file_inode(
         &mut self,
         sb: &super::sb::XfsSuperblock,
@@ -1113,6 +1142,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         size: u64,
         extents: &[(u64, u64, u32)],
         bmbt_leaf_fsblock: Option<u64>,
+        times: Option<crate::fs::times::UnixTimes>,
     ) -> Result<(), FilesystemError> {
         let (_core, mut buf) = self.read_inode_buf(ino)?;
         let version = buf[4];
@@ -1133,9 +1163,16 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         }
         BigEndian::write_u32(&mut buf[8..12], uid);
         BigEndian::write_u32(&mut buf[12..16], gid);
+        // Zero the header slice up through the end of the time fields; the
+        // three di_atime/di_mtime/di_ctime pairs at 32..56 then get real
+        // seconds (preserved from a cross-fs copy or freshly stamped for a
+        // new file). tv_nsec is left at zero — XFS carries nanoseconds on
+        // disk but every producer we import from (tar / EFS / host stat on
+        // second precision) rounds to whole seconds anyway.
         for b in buf.iter_mut().take(56).skip(20) {
             *b = 0;
         }
+        stamp_v4_times(&mut buf, times);
         BigEndian::write_u64(&mut buf[56..64], size);
         // di_nblocks = data extent blocks + (bmbt leaf block, if any).
         let data_nblocks: u64 = extents.iter().map(|&(_, _, c)| c as u64).sum();
@@ -1209,6 +1246,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         mode: u16,
         uid: u32,
         gid: u32,
+        times: Option<crate::fs::times::UnixTimes>,
     ) -> Result<u64, FilesystemError> {
         let sb = self.superblock().clone();
         self.dir_can_insert(&sb, parent_ino, name, false)?;
@@ -1277,6 +1315,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
             data_len,
             &extents,
             bmbt_leaf_fsblock,
+            times,
         )?;
         self.dir_insert_entry(&sb, parent_ino, name, ino, false)?;
         self.reader.flush()?;
@@ -2601,7 +2640,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         // Create it: a fresh empty short-form directory linked into the root.
         self.dir_can_insert(sb, root_ino, "lost+found", true)?;
         let ino = self.alloc_inode_slot(sb)?;
-        self.init_empty_shortform_dir(sb, ino, root_ino, 0o040755, 0, 0)?;
+        self.init_empty_shortform_dir(sb, ino, root_ino, 0o040755, 0, 0, None)?;
         self.dir_insert_entry(sb, root_ino, "lost+found", ino, true)?;
         Ok(ino)
     }

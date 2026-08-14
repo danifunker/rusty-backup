@@ -418,13 +418,21 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
         if matches!(entry_type, EntryType::Directory) {
             size = 0;
         }
+        let modified_unix = if core.mtime > 0 {
+            Some(core.mtime as u64)
+        } else {
+            None
+        };
+        let modified =
+            modified_unix.map(|s| crate::fs::unix_common::inode::format_unix_timestamp(s as i64));
         Ok(FileEntry {
             name,
             path,
             entry_type,
             size,
             location: ino,
-            modified: None,
+            modified,
+            modified_unix,
             type_code: None,
             creator_code: None,
             symlink_target,
@@ -768,13 +776,21 @@ impl<R: Read + Seek + Send> Filesystem for XfsFilesystem<R> {
                 core.mode
             )));
         }
+        let modified_unix = if core.mtime > 0 {
+            Some(core.mtime as u64)
+        } else {
+            None
+        };
+        let modified =
+            modified_unix.map(|s| crate::fs::unix_common::inode::format_unix_timestamp(s as i64));
         Ok(FileEntry {
             name: "/".into(),
             path: "/".into(),
             entry_type: EntryType::Directory,
             size: 0,
             location: rootino,
-            modified: None,
+            modified,
+            modified_unix,
             type_code: None,
             creator_code: None,
             symlink_target: None,

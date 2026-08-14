@@ -129,6 +129,17 @@ pub fn format_mac_date(mac_secs: u32) -> Option<String> {
     Some(super::unix_common::inode::format_unix_timestamp(unix))
 }
 
+/// Convert an HFS/HFS+ Mac-epoch timestamp to seconds since the Unix epoch,
+/// for [`crate::fs::entry::FileEntry::modified_unix`] and `tar_export`.
+/// Returns `None` for zero ("no date set") or Mac dates that would land
+/// before 1970 (the tar oracle would render those as 1969 either way).
+pub fn mac_date_to_unix(mac_secs: u32) -> Option<u64> {
+    if mac_secs == 0 || (mac_secs as u64) < MAC_EPOCH_DELTA {
+        return None;
+    }
+    Some(mac_secs as u64 - MAC_EPOCH_DELTA)
+}
+
 /// Parse a `YYYY-MM-DD HH:MM:SS` string (interpreted as UTC) into Mac-epoch
 /// seconds. The inverse of [`format_mac_date`]; returns `None` when the string
 /// doesn't parse or falls outside the representable range. An empty string (or

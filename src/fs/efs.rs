@@ -1602,13 +1602,26 @@ fn entry_from_inode(name: &str, parent_path: &str, ino: &EfsInode) -> FileEntry 
         format!("{parent_path}/{name}")
     };
     let size = if ino.is_dir() { 0 } else { ino.size as u64 };
+    let modified = if ino.mtime != 0 {
+        Some(crate::fs::unix_common::inode::format_unix_timestamp(
+            ino.mtime as i64,
+        ))
+    } else {
+        None
+    };
+    let modified_unix = if ino.mtime != 0 {
+        Some(ino.mtime as u64)
+    } else {
+        None
+    };
     FileEntry {
         name: name.to_string(),
         path,
         entry_type: ino.entry_type(),
         size,
         location: ino.inum as u64,
-        modified: None,
+        modified,
+        modified_unix,
         type_code: None,
         creator_code: None,
         symlink_target: None,
@@ -1667,26 +1680,33 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Ef
 
         let res = (|| -> Result<FileEntry, FilesystemError> {
             let inum = self.allocate_inode()?;
-            let now = EfsInode::now_u32();
+            // Preserve the source's times when the caller supplied them
+            // (dir_import from a host file, tar_import from an archive,
+            // Commander stage_copy from another image); otherwise stamp now
+            // (a genuinely new file). See src/fs/times.rs.
+            let times = super::times::resolve_or_now(options.unix_times);
+            let now_secs = super::times::now_u32();
             let mut new_ino = EfsInode::empty(inum);
             new_ino.mode = options.mode.unwrap_or(0o100644) as u16;
             new_ino.nlink = 1;
             new_ino.uid = options.uid.unwrap_or(0) as u16;
             new_ino.gid = options.gid.unwrap_or(0) as u16;
-            new_ino.atime = now;
-            new_ino.mtime = now;
-            new_ino.ctime = now;
+            new_ino.atime = times.atime_or_now() as u32;
+            new_ino.mtime = times.mtime_or_now() as u32;
+            new_ino.ctime = times.ctime_or_now() as u32;
 
             self.write_file_data(&mut bm, &mut new_ino, data, data_len)?;
             self.write_inode(&new_ino)?;
 
             // Link into parent. dir_insert may mutate parent_inode
             // (extent growth on overflow), so re-read fresh. Adding an
-            // entry also bumps the parent's dir-contents mtime + ctime.
+            // entry bumps the parent's dir-contents mtime + ctime — that
+            // is a *now* bump (the parent's directory changed just now),
+            // not the child's preserved time.
             let mut parent_ino = self.read_inode(parent_inum)?;
             self.dir_insert(&mut parent_ino, &mut bm, name_bytes, inum)?;
-            parent_ino.mtime = now;
-            parent_ino.ctime = now;
+            parent_ino.mtime = now_secs;
+            parent_ino.ctime = now_secs;
             self.write_inode(&parent_ino)?;
 
             self.sb.tinode = self.sb.tinode.saturating_sub(1);
@@ -1745,7 +1765,8 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Ef
 
         let res = (|| -> Result<FileEntry, FilesystemError> {
             let inum = self.allocate_inode()?;
-            let now = EfsInode::now_u32();
+            let times = super::times::resolve_or_now(options.unix_times);
+            let now_secs = super::times::now_u32();
             let mut new_ino = EfsInode::empty(inum);
             // Symlinks are conventionally 0777 on IRIX. An explicit mode's
             // permission bits are honoured, but the type bits are ours to set
@@ -1754,9 +1775,9 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Ef
             new_ino.nlink = 1;
             new_ino.uid = options.uid.unwrap_or(0) as u16;
             new_ino.gid = options.gid.unwrap_or(0) as u16;
-            new_ino.atime = now;
-            new_ino.mtime = now;
-            new_ino.ctime = now;
+            new_ino.atime = times.atime_or_now() as u32;
+            new_ino.mtime = times.mtime_or_now() as u32;
+            new_ino.ctime = times.ctime_or_now() as u32;
 
             let mut data = target.as_bytes();
             let len = data.len() as u64;
@@ -1765,8 +1786,8 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Ef
 
             let mut parent_ino = self.read_inode(parent_inum)?;
             self.dir_insert(&mut parent_ino, &mut bm, name_bytes, inum)?;
-            parent_ino.mtime = now;
-            parent_ino.ctime = now;
+            parent_ino.mtime = now_secs;
+            parent_ino.ctime = now_secs;
             self.write_inode(&parent_ino)?;
 
             self.sb.tinode = self.sb.tinode.saturating_sub(1);
@@ -1830,7 +1851,8 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Ef
             .expect("./.. always fits in one block");
             self.write_block(ext.bn, &initial)?;
 
-            let now = EfsInode::now_u32();
+            let times = super::times::resolve_or_now(options.unix_times);
+            let now_secs = super::times::now_u32();
             let mut new_dir = EfsInode::empty(inum);
             new_dir.mode = options.mode.unwrap_or(0o040755) as u16;
             new_dir.nlink = 2; // `.` is the second link
@@ -1839,18 +1861,19 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Ef
             new_dir.size = EFS_BLOCKSIZE as u32;
             new_dir.numextents = 1;
             new_dir.extents[0] = ext;
-            new_dir.atime = now;
-            new_dir.mtime = now;
-            new_dir.ctime = now;
+            new_dir.atime = times.atime_or_now() as u32;
+            new_dir.mtime = times.mtime_or_now() as u32;
+            new_dir.ctime = times.ctime_or_now() as u32;
             self.write_inode(&new_dir)?;
 
             // Link into parent. Parent's dir-contents changed → bump
-            // mtime + ctime, and nlink += 1 for the new dir's ".." back-link.
+            // mtime + ctime (a *now* bump — the parent changed just now),
+            // and nlink += 1 for the new dir's ".." back-link.
             let mut parent_inode = self.read_inode(parent_inum)?;
             self.dir_insert(&mut parent_inode, &mut bm, name_bytes, inum)?;
             parent_inode.nlink = parent_inode.nlink.saturating_add(1);
-            parent_inode.mtime = now;
-            parent_inode.ctime = now;
+            parent_inode.mtime = now_secs;
+            parent_inode.ctime = now_secs;
             self.write_inode(&parent_inode)?;
 
             self.sb.tinode = self.sb.tinode.saturating_sub(1);
@@ -2207,6 +2230,7 @@ fn adopt_orphans_into_lost_found<R: Read + Write + Seek + Send>(
                 size: 0,
                 location: 2,
                 modified: None,
+                modified_unix: None,
                 type_code: None,
                 creator_code: None,
                 symlink_target: None,
@@ -2415,6 +2439,7 @@ impl<R: Read + Seek + Send> Filesystem for EfsFilesystem<R> {
             size: ino.size as u64,
             location: EFS_ROOT_INODE as u64,
             modified: None,
+            modified_unix: None,
             type_code: None,
             creator_code: None,
             symlink_target: None,
@@ -2506,34 +2531,13 @@ impl<R: Read + Seek + Send> Filesystem for EfsFilesystem<R> {
                             } else {
                                 None
                             };
-                            let mut e = FileEntry {
-                                name,
-                                path,
-                                entry_type: child.entry_type(),
-                                size: child.size as u64,
-                                location: child_inum as u64,
-                                modified: None,
-                                type_code: None,
-                                creator_code: None,
-                                symlink_target,
-                                special_type: child.special_type(),
-                                mode: Some(child.mode as u32),
-                                uid: Some(child.uid as u32),
-                                gid: Some(child.gid as u32),
-                                resource_fork_size: None,
-                                aux_type: None,
-                                link_target_cnid: None,
-                                amiga_protection: None,
-                                amiga_comment: None,
-                                amiga_date: None,
-                                dos_attributes: None,
-                                finder_flags: None,
-                                prodos_file_type: None,
-                                mac_dates: None,
-                            };
-                            if matches!(e.entry_type, EntryType::Directory) {
-                                e.size = 0;
-                            }
+                            // Route through `entry_from_inode` so mtime/
+                            // modified_unix + special_type + mode/uid/gid land
+                            // consistently between the create_file return path
+                            // and the browse path.
+                            let mut e = entry_from_inode(&name, parent_path, &child);
+                            e.path = path;
+                            e.symlink_target = symlink_target;
                             entries.push(e);
                         }
                         Err(_) => {
@@ -3671,6 +3675,58 @@ mod tests {
         assert!(
             root_after.mtime >= before && root_after.ctime >= before,
             "root mtime/ctime must be bumped by the inserts: {root_after:?}",
+        );
+    }
+
+    /// The preservation path: when `CreateFileOptions.unix_times` is set (the
+    /// dir_import / tar_import / stage_copy cases), the driver must record
+    /// exactly those times, not stamp `now`. This is the write half of the
+    /// "extracting existing files should keep the source date" rule.
+    #[test]
+    fn create_file_preserves_unix_times_when_supplied() {
+        use crate::fs::filesystem::{CreateFileOptions, EditableFilesystem};
+        use crate::fs::times::UnixTimes;
+        let img = create_blank_efs(1024 * 1024, "rb-efs").expect("format 1M EFS");
+        let mut fs = EfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let root = fs.root().unwrap();
+
+        // 2020-01-01 00:00:00 UTC — a fixed non-now date the driver must
+        // record verbatim; the on-disk `mtime` field being ==  this value
+        // (not "close to now") is the whole point of the preservation path.
+        let src_mtime: u64 = 1_577_836_800;
+
+        let file = fs
+            .create_file(
+                &root,
+                "OLD",
+                &mut &b"hi"[..],
+                2,
+                &CreateFileOptions {
+                    unix_times: Some(UnixTimes::all(src_mtime)),
+                    ..Default::default()
+                },
+            )
+            .expect("create with preserved times");
+        let ino = fs.read_inode(file.location as u32).expect("file inode");
+        assert_eq!(
+            (ino.atime as u64, ino.mtime as u64, ino.ctime as u64),
+            (src_mtime, src_mtime, src_mtime),
+            "preserved unix_times must land verbatim on disk"
+        );
+
+        // Read back through the browse path: modified_unix carries the same
+        // seconds, so a subsequent tar_export / stage_copy carries the date
+        // end-to-end.
+        let listed = fs
+            .list_directory(&root)
+            .expect("list")
+            .into_iter()
+            .find(|e| e.name == "OLD")
+            .expect("browse OLD");
+        assert_eq!(
+            listed.modified_unix,
+            Some(src_mtime),
+            "list_directory must expose the preserved mtime as modified_unix"
         );
     }
 

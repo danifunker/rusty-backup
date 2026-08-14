@@ -747,6 +747,7 @@ impl<R: Read + Seek> SquashfsFilesystem<R> {
             fe.modified = Some(super::unix_common::inode::format_unix_timestamp(
                 inode.mtime as i64,
             ));
+            fe.modified_unix = Some(inode.mtime as u64);
         }
         if let Some(label) = inode.special_label() {
             fe.special_type = Some(match inode.kind {

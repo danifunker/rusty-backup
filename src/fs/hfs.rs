@@ -2712,6 +2712,7 @@ impl<R: Read + Seek + Send> Filesystem for HfsFilesystem<R> {
             size: 0,
             location: 2, // HFS root directory CNID
             modified: None,
+            modified_unix: None,
             type_code: None,
             creator_code: None,
             symlink_target: None,
@@ -2752,6 +2753,7 @@ impl<R: Read + Seek + Send> Filesystem for HfsFilesystem<R> {
                     };
                     let mut fe = FileEntry::new_directory(name, path, dir_id as u64);
                     fe.modified = hfs_common::format_mac_date(dates.1);
+                    fe.modified_unix = hfs_common::mac_date_to_unix(dates.1);
                     fe.mac_dates = Some(dates);
                     entries.push(fe);
                 }
@@ -2777,6 +2779,7 @@ impl<R: Read + Seek + Send> Filesystem for HfsFilesystem<R> {
                     fe.creator_code = Some(creator_code);
                     fe.finder_flags = Some(finder_flags);
                     fe.modified = hfs_common::format_mac_date(dates.1);
+                    fe.modified_unix = hfs_common::mac_date_to_unix(dates.1);
                     fe.mac_dates = Some(dates);
                     if rsrc_size > 0 {
                         fe.resource_fork_size = Some(rsrc_size as u64);

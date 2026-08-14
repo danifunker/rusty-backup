@@ -251,6 +251,10 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 # produces the standard LZ4 frame, interoperable with the DOS tool's liblz4.
 lz4_flex = "0.13"
 tar = "0.4"
+# Set an extracted file's mtime/atime after we write it (the plain host-fs
+# export path). Already a transitive dep via `tar` in every lockfile — this
+# just promotes it so we can call `set_file_mtime` directly.
+filetime = "0.2"
 bzip2 = "0.6"
 zip = { version = "8", default-features = false, features = ["deflate", "aes-crypto"] }
 base64 = "0.22"

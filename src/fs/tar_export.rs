@@ -345,8 +345,11 @@ fn base_header(entry: &FileEntry, default_mode: u32) -> tar::Header {
     h.set_mode(mode);
     h.set_uid(entry.uid.unwrap_or(0) as u64);
     h.set_gid(entry.gid.unwrap_or(0) as u64);
-    // v1: mtimes aren't uniformly available across FS families; stamp 0.
-    h.set_mtime(0);
+    // Every fs driver populates `modified_unix` when its on-disk format
+    // carries a per-second date (Unix / Amiga / classic-Mac / DOS). `0` is
+    // the "unknown" case (Apple DOS 3.3, TRS-80, MFS, …) and lands as the
+    // Unix epoch — that's what tar's `set_mtime(0)` produced before too.
+    h.set_mtime(entry.modified_unix.unwrap_or(0));
     h
 }
 

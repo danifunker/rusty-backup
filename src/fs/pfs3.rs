@@ -1007,6 +1007,11 @@ impl<R: Read + Seek + Send> Filesystem for Pfs3Filesystem<R> {
                 }
             };
             fe.modified = datestamp_string(de.cd as i32, de.cm as i32, de.ct as i32);
+            let unix =
+                super::affs_common::datestamp_to_unix(de.cd as i32, de.cm as i32, de.ct as i32);
+            if unix > 0 {
+                fe.modified_unix = Some(unix as u64);
+            }
             fe.amiga_protection = Some(de.protection as u32);
             if !de.comment.is_empty() {
                 fe.amiga_comment = Some(de.comment.clone());

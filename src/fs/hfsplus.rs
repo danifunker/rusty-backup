@@ -479,6 +479,9 @@ enum CatalogEntry {
     Folder {
         folder_id: u32,
         name: String,
+        /// Mac-epoch seconds — the "modification date" the browser and
+        /// `tar_export` surface.
+        content_mod_date: u32,
         bsd: HfsPlusBsdInfo,
     },
     File {
@@ -505,6 +508,9 @@ enum CatalogEntry {
         /// `.HFS+ Private Directory Data\r` directory and replaces the
         /// stub when surfaced through `list_directory`.
         dir_link_inode_num: Option<u32>,
+        /// Mac-epoch seconds — the "modification date" the browser and
+        /// `tar_export` surface.
+        content_mod_date: u32,
         bsd: HfsPlusBsdInfo,
     },
 }
@@ -1472,9 +1478,14 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
                             continue;
                         }
                         let folder_id = BigEndian::read_u32(&rec[8..12]);
+                        // Content modification date lives at record offset
+                        // 20 (Mac-epoch u32); the write path uses the same
+                        // offset (see set_catalog_dates around line 4413).
+                        let content_mod_date = BigEndian::read_u32(&rec[20..24]);
                         results.push(CatalogEntry::Folder {
                             folder_id,
                             name,
+                            content_mod_date,
                             bsd: HfsPlusBsdInfo::parse(rec),
                         });
                     }
@@ -1509,6 +1520,9 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
                         let data_fork = ForkData::parse(&rec[88..168]);
                         // Resource fork at offset 168 (80 bytes)
                         let rsrc_fork = ForkData::parse(&rec[168..248]);
+                        // HFS+ file record content-mod-date at offset 20
+                        // (Mac-epoch u32) — same slot the folder record uses.
+                        let content_mod_date = BigEndian::read_u32(&rec[20..24]);
                         results.push(CatalogEntry::File {
                             file_id,
                             name,
@@ -1521,6 +1535,7 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
                             finder_flags,
                             link_inode_num,
                             dir_link_inode_num,
+                            content_mod_date,
                             bsd: HfsPlusBsdInfo::parse(rec),
                         });
                     }
@@ -3044,6 +3059,7 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
             size: 0,
             location: 2, // HFS+ root directory CNID
             modified: None,
+            modified_unix: None,
             type_code: None,
             creator_code: None,
             symlink_target: None,
@@ -3082,6 +3098,7 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
                 CatalogEntry::Folder {
                     folder_id,
                     name,
+                    content_mod_date,
                     bsd,
                 } => {
                     let path = if entry.path == "/" {
@@ -3091,6 +3108,8 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
                     };
                     let mut fe = FileEntry::new_directory(name, path, folder_id as u64);
                     bsd.apply_to(&mut fe);
+                    fe.modified = super::hfs_common::format_mac_date(content_mod_date);
+                    fe.modified_unix = super::hfs_common::mac_date_to_unix(content_mod_date);
                     entries.push(fe);
                 }
                 CatalogEntry::File {
@@ -3105,6 +3124,7 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
                     finder_flags,
                     link_inode_num,
                     dir_link_inode_num,
+                    content_mod_date,
                     bsd,
                 } => {
                     let path = if entry.path == "/" {
@@ -3148,6 +3168,8 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
                     fe.creator_code = Some(creator_code);
                     fe.finder_flags = Some(finder_flags);
                     bsd.apply_to(&mut fe);
+                    fe.modified = super::hfs_common::format_mac_date(content_mod_date);
+                    fe.modified_unix = super::hfs_common::mac_date_to_unix(content_mod_date);
                     if display_rsrc > 0 {
                         fe.resource_fork_size = Some(display_rsrc);
                     }

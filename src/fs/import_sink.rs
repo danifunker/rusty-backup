@@ -340,6 +340,7 @@ impl Importer {
                     mode: Some(attrs.mode & 0o7777),
                     uid: Some(attrs.uid),
                     gid: Some(attrs.gid),
+                    unix_times: overrides.unix_times,
                     ..Default::default()
                 };
                 match efs.create_symlink(&parent, name, &target, &link_opts) {
@@ -372,6 +373,10 @@ impl Importer {
                     uid: Some(attrs.uid),
                     gid: Some(attrs.gid),
                     xattrs: inherited_xattrs,
+                    // Preserve source mtime end-to-end (host stat / tar Header
+                    // / stage_copy source inode); the driver falls back to now
+                    // when this is None (new blank file from rb-cli).
+                    unix_times: overrides.unix_times,
                     ..Default::default()
                 };
                 efs.create_file(&parent, name, data, size, &create_opts)
@@ -450,6 +455,7 @@ impl Importer {
                         mode: Some(attrs.dir_mode()),
                         uid: Some(attrs.uid),
                         gid: Some(attrs.gid),
+                        unix_times: overrides.unix_times,
                         ..Default::default()
                     };
                     let e = efs

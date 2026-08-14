@@ -700,13 +700,21 @@ impl<R: Read + Seek> MinixFilesystem<R> {
                 None,
             )
         };
+        let modified_unix = if inode.mtime != 0 {
+            Some(inode.mtime as u64)
+        } else {
+            None
+        };
+        let modified =
+            modified_unix.map(|s| crate::fs::unix_common::inode::format_unix_timestamp(s as i64));
         FileEntry {
             name: name.to_string(),
             path,
             entry_type,
             size: inode.size as u64,
             location: inode.ino as u64,
-            modified: None,
+            modified,
+            modified_unix,
             type_code: None,
             creator_code: None,
             symlink_target,
@@ -1452,6 +1460,8 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for MinixFilesystem<R> {
         ino.nlinks = 1;
         ino.uid = options.uid.unwrap_or(0) as u16;
         ino.gid = options.gid.unwrap_or(0) as u16;
+        // Preserve source mtime on cross-fs copies; else stamp now.
+        ino.mtime = super::times::resolve_or_now(options.unix_times).mtime_or_now() as u32;
         if options.skip_data_write {
             ino.size = data_len as u32;
         } else {
@@ -1518,6 +1528,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for MinixFilesystem<R> {
         ino.nlinks = 1;
         ino.uid = options.uid.unwrap_or(0) as u16;
         ino.gid = options.gid.unwrap_or(0) as u16;
+        ino.mtime = super::times::resolve_or_now(options.unix_times).mtime_or_now() as u32;
         let mut data = target.as_bytes();
         let len = data.len() as u64;
         self.write_file_data(&mut ino, &mut data, len)?;
@@ -1561,6 +1572,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for MinixFilesystem<R> {
         dir.nlinks = 2; // "." plus the parent's link
         dir.uid = options.uid.unwrap_or(0) as u16;
         dir.gid = options.gid.unwrap_or(0) as u16;
+        dir.mtime = super::times::resolve_or_now(options.unix_times).mtime_or_now() as u32;
         dir.size = (stride * 2) as u32;
         dir.zones[0] = zone;
         self.write_inode(&dir)?;

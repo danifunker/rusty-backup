@@ -323,6 +323,7 @@ pub fn run_with_budget(
             mode: args.mode,
             uid: args.uid,
             gid: args.gid,
+            unix_times: None,
         },
         // `--no-preserve-meta` has to be withheld here too, not just from
         // `preserved` above. These are two independent inheritance paths and

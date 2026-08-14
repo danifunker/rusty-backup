@@ -26,6 +26,15 @@ pub struct FileEntry {
     pub location: u64,
     /// Human-readable modification date string.
     pub modified: Option<String>,
+    /// Modification time in seconds since UNIX epoch 1970-01-01. The numeric
+    /// twin of `modified` — the display string is for the browser/`ls`, this
+    /// is what `tar_export` writes into its headers and what a `stage_copy`
+    /// passes into `CreateFileOptions.unix_times` so a cross-image copy
+    /// preserves the source's date instead of stamping the current time.
+    /// Populated by every filesystem driver whose on-disk format carries a
+    /// per-file mtime (all Unix / Amiga / classic-Mac / DOS families);
+    /// `None` on formats that don't (Apple DOS 3.3, TRS-80, etc.).
+    pub modified_unix: Option<u64>,
     /// HFS/HFS+/MFS file type as the raw 4-byte Mac `OSType`, exactly as
     /// stored on disk (e.g. `*b"APPL"`, `*b"PICT"`). Kept as bytes — not text —
     /// because an `OSType` may hold non-ASCII bytes (e.g. Prince of Persia's
@@ -127,6 +136,7 @@ impl FileEntry {
             size: 0,
             location: 0,
             modified: None,
+            modified_unix: None,
             type_code: None,
             creator_code: None,
             finder_flags: None,
@@ -155,6 +165,7 @@ impl FileEntry {
             size: 0,
             location,
             modified: None,
+            modified_unix: None,
             type_code: None,
             creator_code: None,
             finder_flags: None,
@@ -183,6 +194,7 @@ impl FileEntry {
             size,
             location,
             modified: None,
+            modified_unix: None,
             type_code: None,
             creator_code: None,
             finder_flags: None,
@@ -217,6 +229,7 @@ impl FileEntry {
             size,
             location,
             modified: None,
+            modified_unix: None,
             type_code: None,
             creator_code: None,
             finder_flags: None,
@@ -250,6 +263,7 @@ impl FileEntry {
             size: 0,
             location,
             modified: None,
+            modified_unix: None,
             type_code: None,
             creator_code: None,
             finder_flags: None,

@@ -948,8 +948,16 @@ impl<R: Read + Seek + Send> Filesystem for SfsFilesystem<R> {
             // re-derive first-data via lookup_object_block at read time.
             let _ = obj.data_or_hashtable;
             let _ = obj.protection;
-            let _ = obj.datemodified;
             let _ = obj.comment;
+            // SFS `datemodified` is 32-bit seconds since 1978-01-01. Shift
+            // into the Unix epoch for `modified_unix` + tar_export.
+            if obj.datemodified > 0 {
+                const AMIGA_EPOCH_SECS: u64 = 252_460_800; // 1978-01-01 UTC
+                fe.modified_unix = Some(AMIGA_EPOCH_SECS + obj.datemodified as u64);
+                fe.modified = Some(super::unix_common::inode::format_unix_timestamp(
+                    fe.modified_unix.unwrap() as i64,
+                ));
+            }
             if obj.is_link() {
                 // Mark with size 0; we don't follow softlinks yet.
                 fe.size = 0;

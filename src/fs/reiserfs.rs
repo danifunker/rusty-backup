@@ -693,6 +693,9 @@ impl<R: Read + Seek + Send> Filesystem for ReiserFsFilesystem<R> {
                 child.uid = Some(child_sd.uid);
                 child.gid = Some(child_sd.gid);
                 child.modified = Some(format_unix_timestamp(child_sd.mtime as i64));
+                if child_sd.mtime > 0 {
+                    child.modified_unix = Some(child_sd.mtime as u64);
+                }
                 children.push(child);
             }
         }

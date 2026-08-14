@@ -98,6 +98,7 @@ pub mod squashfs_write;
 pub mod tar_export;
 pub mod tar_import;
 pub mod ti99;
+pub mod times;
 pub mod trdos;
 pub mod tree;
 pub mod ucsd;

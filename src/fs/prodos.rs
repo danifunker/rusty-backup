@@ -53,6 +53,7 @@ impl<R: Read + Seek + Send> Filesystem for ProDosFilesystem<R> {
             size: 0,
             location: 2, // Volume Directory Key Block is always at block 2
             modified: None,
+            modified_unix: None,
             type_code: None,
             creator_code: None,
             symlink_target: None,

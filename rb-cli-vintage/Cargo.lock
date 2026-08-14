@@ -1368,6 +1368,7 @@ dependencies = [
  "dirs",
  "encoding_rs",
  "env_logger",
+ "filetime",
  "flate2",
  "globset",
  "hashbrown 0.14.5",

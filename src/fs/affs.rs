@@ -806,6 +806,14 @@ impl<R: Read + Seek> AffsFilesystem<R> {
             ),
         };
         fe.modified = datestamp_string(entry.modify_days, entry.modify_mins, entry.modify_ticks);
+        let unix = super::affs_common::datestamp_to_unix(
+            entry.modify_days,
+            entry.modify_mins,
+            entry.modify_ticks,
+        );
+        if unix > 0 {
+            fe.modified_unix = Some(unix as u64);
+        }
         fe.amiga_protection = Some(entry.access);
         if !entry.comment.is_empty() {
             fe.amiga_comment = Some(entry.comment.clone());

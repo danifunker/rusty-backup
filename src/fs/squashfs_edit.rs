@@ -574,6 +574,7 @@ impl<RW: Read + Write + Seek> SquashfsEditor<RW> {
             fe.modified = Some(super::unix_common::inode::format_unix_timestamp(
                 node.mtime as i64,
             ));
+            fe.modified_unix = Some(node.mtime as u64);
         }
         if let BuildKind::BlockDev { major, minor } | BuildKind::CharDev { major, minor } =
             &node.kind
@@ -729,6 +730,7 @@ impl<RW: Read + Write + Seek + Send> EditableFilesystem for SquashfsEditor<RW> {
                 mode: options.mode.map(|m| m & 0o7777),
                 uid: options.uid,
                 gid: options.gid,
+                unix_times: None,
             },
             None,
             parent_entry.as_ref(),
@@ -751,7 +753,7 @@ impl<RW: Read + Write + Seek + Send> EditableFilesystem for SquashfsEditor<RW> {
             mode: attrs.mode as u16,
             uid: attrs.uid,
             gid: attrs.gid,
-            mtime: 0,
+            mtime: super::times::resolve_or_now(options.unix_times).mtime_or_now() as u32,
             // Carried from the file being replaced, when the caller captured
             // them (D4) — otherwise a replaced binary loses its
             // `security.capability` and quietly stops working.
@@ -779,6 +781,7 @@ impl<RW: Read + Write + Seek + Send> EditableFilesystem for SquashfsEditor<RW> {
                 mode: options.mode.map(|m| m & 0o7777),
                 uid: options.uid,
                 gid: options.gid,
+                unix_times: None,
             },
             None,
             parent_entry.as_ref(),
@@ -796,7 +799,7 @@ impl<RW: Read + Write + Seek + Send> EditableFilesystem for SquashfsEditor<RW> {
             mode: attrs.mode as u16,
             uid: attrs.uid,
             gid: attrs.gid,
-            mtime: 0,
+            mtime: super::times::resolve_or_now(options.unix_times).mtime_or_now() as u32,
             xattrs: Vec::new(),
             kind: BuildKind::Dir(Vec::new()),
         });
@@ -878,7 +881,7 @@ impl<RW: Read + Write + Seek + Send> EditableFilesystem for SquashfsEditor<RW> {
             mode: 0o777,
             uid,
             gid,
-            mtime: 0,
+            mtime: super::times::resolve_or_now(options.unix_times).mtime_or_now() as u32,
             xattrs: Vec::new(),
             kind: BuildKind::Symlink(target.to_string()),
         });

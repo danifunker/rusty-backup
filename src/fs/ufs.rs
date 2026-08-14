@@ -1061,6 +1061,9 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
         entry.gid = Some(child_inode.gid);
         if child_inode.mtime != 0 {
             entry.modified = Some(format_unix_timestamp(child_inode.mtime));
+            if child_inode.mtime > 0 {
+                entry.modified_unix = Some(child_inode.mtime as u64);
+            }
         }
         Ok(entry)
     }
@@ -1993,6 +1996,8 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Uf
         // it back. Inum allocation is sticky across the create.
         let new_inum = self.alloc_inode(parent_inum / self.ipg)?;
         let mode = options.mode.unwrap_or(0o100644);
+        // Preserve source mtime on cross-fs copies; else stamp now.
+        let mtime = super::times::resolve_or_now(options.unix_times).mtime_or_now() as i64;
         let mut new_inode = UfsInode {
             inum: new_inum,
             mode,
@@ -2000,7 +2005,7 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Uf
             uid: options.uid.unwrap_or(0),
             gid: options.gid.unwrap_or(0),
             size: 0,
-            mtime: 0,
+            mtime,
             direct: [0; UFS_NDADDR],
             indirect: [0; UFS_NIADDR],
             inline_payload: Vec::new(),
@@ -2087,6 +2092,7 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Uf
         // 0777 by convention; an explicit mode contributes permission bits
         // only, never the type.
         let mode = 0o120_000 | (options.mode.unwrap_or(0o777) & 0o7777);
+        let mtime = super::times::resolve_or_now(options.unix_times).mtime_or_now() as i64;
         let mut new_inode = UfsInode {
             inum: new_inum,
             mode,
@@ -2094,7 +2100,7 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Uf
             uid: options.uid.unwrap_or(0),
             gid: options.gid.unwrap_or(0),
             size: 0,
-            mtime: 0,
+            mtime,
             direct: [0; UFS_NDADDR],
             indirect: [0; UFS_NIADDR],
             inline_payload: Vec::new(),
@@ -2200,6 +2206,7 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Uf
             self.write_frag_run(start_frag, &block)?;
 
             let mode = options.mode.unwrap_or(0o040755);
+            let mtime = super::times::resolve_or_now(options.unix_times).mtime_or_now() as i64;
             let mut new_dir = UfsInode {
                 inum: new_inum,
                 mode,
@@ -2207,7 +2214,7 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Uf
                 uid: options.uid.unwrap_or(0),
                 gid: options.gid.unwrap_or(0),
                 size: DIRBLKSIZ as u64,
-                mtime: 0,
+                mtime,
                 direct: [0; UFS_NDADDR],
                 indirect: [0; UFS_NIADDR],
                 inline_payload: Vec::new(),
@@ -2610,6 +2617,7 @@ fn adopt_orphans_into_lost_found_ufs<R: Read + Write + Seek + Send>(
                 size: 0,
                 location: ROOT_INODE as u64,
                 modified: None,
+                modified_unix: None,
                 type_code: None,
                 creator_code: None,
                 symlink_target: None,
@@ -2648,6 +2656,7 @@ fn adopt_orphans_into_lost_found_ufs<R: Read + Write + Seek + Send>(
                 size: 0,
                 location: ROOT_INODE as u64,
                 modified: None,
+                modified_unix: None,
                 type_code: None,
                 creator_code: None,
                 symlink_target: None,
@@ -2861,6 +2870,9 @@ impl<R: Read + Seek + Send> Filesystem for UfsFilesystem<R> {
         entry.gid = Some(inode.gid);
         if inode.mtime != 0 {
             entry.modified = Some(format_unix_timestamp(inode.mtime));
+            if inode.mtime > 0 {
+                entry.modified_unix = Some(inode.mtime as u64);
+            }
         }
         Ok(entry)
     }

@@ -104,6 +104,13 @@ pub fn export_file_with_fork(
         .write_file_to(entry, &mut f)
         .with_context(|| format!("extracting '{}'", entry.name))?;
     drop(f);
+    // Preserve the source's mtime on the extracted host file when the
+    // source recorded one — a plain image->host extract now round-trips
+    // the date the same way tar's `-p` flag does. Best-effort: a
+    // filesystem that doesn't record dates leaves this None and the OS
+    // stamps the current time as before. Errors are non-fatal (some
+    // network filesystems / SMB shares reject setting mtime).
+    apply_host_mtime(&out, entry);
 
     // ...plus a resource-fork sidecar for the fork-carrying "beside the data
     // fork" modes. MacBinary-without-rsrc and DataForkOnly land here as a plain
@@ -137,4 +144,16 @@ pub fn export_file_with_fork(
     }
 
     Ok(written + extra)
+}
+
+/// Stamp the extracted host file's mtime/atime from `entry.modified_unix`.
+/// A best-effort call: filesystems that can't set times (network mounts,
+/// some FUSE-backed FSes) just leave the OS default, they don't fail the
+/// export.
+fn apply_host_mtime(path: &Path, entry: &FileEntry) {
+    let Some(secs) = entry.modified_unix else {
+        return;
+    };
+    let ft = filetime::FileTime::from_unix_time(secs as i64, 0);
+    let _ = filetime::set_file_times(path, ft, ft);
 }
