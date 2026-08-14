@@ -23,12 +23,13 @@
 //!
 //! Fidelity notes (Human68k is FAT-derived — much simpler than PFS3):
 //! - There are no symlinks or hardlinks to replay.
-//! - The `EditableFilesystem` write path stamps a fresh ARCHIVE attribute
-//!   and a zero timestamp, so file **modification dates** and the
-//!   **read-only** attribute are not carried across (the same limitation
-//!   the interactive edit path already has). A single summary warning is
-//!   emitted when read-only entries are dropped to ARCHIVE so the user
-//!   knows.
+//! - The `EditableFilesystem` write path stamps a fresh ARCHIVE attribute,
+//!   so the **read-only** flag is dropped to ARCHIVE. A single summary
+//!   warning is emitted when read-only entries are dropped so the user
+//!   knows. Modification **dates** ARE carried across: each entry's
+//!   `modified_unix` is passed into `CreateFileOptions.unix_times` /
+//!   `CreateDirectoryOptions.unix_times`, and the target driver stamps
+//!   the DOS date/time verbatim.
 //!
 //! Memory / scope notes:
 //! - File contents are spooled through a `Vec<u8>` per file, then written
@@ -154,9 +155,15 @@ where
         if k.special_type.as_deref() == Some("R/O") {
             *readonly_dropped += 1;
         }
+        // Carry the source's modification date through so the target
+        // records it verbatim instead of stamping `now`.
+        let src_times = k.modified_unix.map(super::times::UnixTimes::mtime_only);
         if k.is_directory() {
-            let new_dir =
-                target.create_directory(tgt_dir, &k.name, &CreateDirectoryOptions::default())?;
+            let dir_opts = CreateDirectoryOptions {
+                unix_times: src_times,
+                ..Default::default()
+            };
+            let new_dir = target.create_directory(tgt_dir, &k.name, &dir_opts)?;
             report.dirs_copied += 1;
             progress.tick(report, false);
             walk(
@@ -172,13 +179,11 @@ where
             // Spool the file body through a Vec. Peak RAM is one file.
             let body = source.read_file(&k, usize::MAX)?;
             let mut cur = Cursor::new(&body);
-            target.create_file(
-                tgt_dir,
-                &k.name,
-                &mut cur,
-                body.len() as u64,
-                &CreateFileOptions::default(),
-            )?;
+            let file_opts = CreateFileOptions {
+                unix_times: src_times,
+                ..Default::default()
+            };
+            target.create_file(tgt_dir, &k.name, &mut cur, body.len() as u64, &file_opts)?;
             report.files_copied += 1;
             report.bytes_copied += body.len() as u64;
             progress.tick(report, false);

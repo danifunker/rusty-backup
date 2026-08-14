@@ -780,6 +780,7 @@ impl<R: Read + Seek + Send> Filesystem for Human68kFilesystem<R> {
             if de.attr & attr::READ_ONLY != 0 {
                 fe.special_type = Some("R/O".to_string());
             }
+            fe.modified_unix = super::times::dos_datetime_to_unix(de.date, de.time);
             out.push(fe);
         }
         out.sort_by_key(|a| a.name.to_lowercase());
@@ -1233,7 +1234,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for Human68kFilesystem<R>
         name: &str,
         data: &mut dyn std::io::Read,
         data_len: u64,
-        _options: &CreateFileOptions,
+        options: &CreateFileOptions,
     ) -> Result<FileEntry, FilesystemError> {
         let (parent_cluster, parent_path) = Self::parent_cluster_and_path(parent);
         let (n8, ne10, e3) = encode_human68k_name(name)?;
@@ -1279,6 +1280,14 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for Human68kFilesystem<R>
         entry[8..11].copy_from_slice(&e3);
         entry[11] = attr::ARCHIVE;
         entry[12..22].copy_from_slice(&ne10);
+        // Human68k shares FAT's 16-bit DOS packed date + time at bytes 22..26.
+        let mtime_secs = options
+            .unix_times
+            .map(|t| t.mtime_or_now())
+            .unwrap_or_else(super::times::now);
+        let (date, time) = super::times::unix_to_dos_datetime(mtime_secs);
+        LittleEndian::write_u16(&mut entry[22..24], time);
+        LittleEndian::write_u16(&mut entry[24..26], date);
         LittleEndian::write_u16(&mut entry[26..28], first_cluster);
         LittleEndian::write_u32(&mut entry[28..32], payload.len() as u32);
         self.reader.seek(SeekFrom::Start(slot_off))?;
@@ -1286,19 +1295,21 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for Human68kFilesystem<R>
 
         self.fat_write_back()?;
         self.reader.flush()?;
-        Ok(FileEntry::new_file(
+        let mut fe = FileEntry::new_file(
             name.to_string(),
             format!("{parent_path}/{name}"),
             payload.len() as u64,
             first_cluster as u64,
-        ))
+        );
+        fe.modified_unix = super::times::dos_datetime_to_unix(date, time);
+        Ok(fe)
     }
 
     fn create_directory(
         &mut self,
         parent: &FileEntry,
         name: &str,
-        _options: &CreateDirectoryOptions,
+        options: &CreateDirectoryOptions,
     ) -> Result<FileEntry, FilesystemError> {
         let (parent_cluster, parent_path) = Self::parent_cluster_and_path(parent);
         let (n8, ne10, e3) = encode_human68k_name(name)?;
@@ -1330,6 +1341,13 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for Human68kFilesystem<R>
         entry[8..11].copy_from_slice(&e3);
         entry[11] = attr::DIRECTORY;
         entry[12..22].copy_from_slice(&ne10);
+        let mtime_secs = options
+            .unix_times
+            .map(|t| t.mtime_or_now())
+            .unwrap_or_else(super::times::now);
+        let (date, time) = super::times::unix_to_dos_datetime(mtime_secs);
+        LittleEndian::write_u16(&mut entry[22..24], time);
+        LittleEndian::write_u16(&mut entry[24..26], date);
         LittleEndian::write_u16(&mut entry[26..28], dir_cluster);
         // Directories report size 0 in the entry; the chain is authoritative.
         LittleEndian::write_u32(&mut entry[28..32], 0);
@@ -1338,11 +1356,13 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for Human68kFilesystem<R>
 
         self.fat_write_back()?;
         self.reader.flush()?;
-        Ok(FileEntry::new_directory(
+        let mut fe = FileEntry::new_directory(
             name.to_string(),
             format!("{parent_path}/{name}"),
             dir_cluster as u64,
-        ))
+        );
+        fe.modified_unix = super::times::dos_datetime_to_unix(date, time);
+        Ok(fe)
     }
 
     fn delete_entry(

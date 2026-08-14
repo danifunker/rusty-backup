@@ -680,6 +680,7 @@ impl<R: Read + Seek> FatFilesystem<R> {
                 FileEntry::new_file(display_name, path, size, cluster as u64)
             };
             entry.modified = Some(modified);
+            entry.modified_unix = super::times::dos_datetime_to_unix(date_val, time_val);
             // Carry RO/HID/SYS/ARC so the cross-image copy engine can
             // preserve them on FAT/exFAT destinations (drop the directory /
             // volume-id bits — those are structural, not user attributes).
@@ -1292,14 +1293,22 @@ impl<R: Read + Write + Seek> FatFilesystem<R> {
 
     /// Build LFN + SFN directory entries for a new file/directory.
     /// Returns the raw bytes (multiple of 32) to write into the directory.
+    ///
+    /// `mtime_secs = Some(secs)` stamps that Unix time into the DOS date/time
+    /// fields (from an import that carried the source's mtime through); `None`
+    /// stamps `now` (a fresh new file, or a rename which keeps its behaviour).
     fn build_dir_entries(
         name: &str,
         sfn: &[u8; 11],
         attr: u8,
         first_cluster: u32,
         file_size: u32,
+        mtime_secs: Option<u64>,
     ) -> Vec<u8> {
-        let (date, time) = current_fat_datetime();
+        let (date, time) = match mtime_secs {
+            Some(s) => super::times::unix_to_dos_datetime(s),
+            None => current_fat_datetime(),
+        };
         let checksum = lfn_checksum(sfn);
 
         // Determine if LFN is needed
@@ -1815,7 +1824,9 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for FatFilesystem<R> {
             .dos_attributes
             .map(|a| (a as u8) & 0x27)
             .unwrap_or(ATTR_ARCHIVE);
-        let entry_bytes = Self::build_dir_entries(name, &sfn, attr, first_cluster, data_len as u32);
+        let mtime = options.unix_times.map(|t| t.mtime_or_now());
+        let entry_bytes =
+            Self::build_dir_entries(name, &sfn, attr, first_cluster, data_len as u32, mtime);
 
         self.add_to_directory(parent, &entry_bytes)?;
         if !options.skip_fsinfo_update {
@@ -1830,8 +1841,12 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for FatFilesystem<R> {
 
         let mut file_entry =
             FileEntry::new_file(name.to_string(), path, data_len, first_cluster as u64);
-        let (date, time) = current_fat_datetime();
+        let (date, time) = match mtime {
+            Some(s) => super::times::unix_to_dos_datetime(s),
+            None => current_fat_datetime(),
+        };
         file_entry.modified = Some(format_fat_datetime(date, time));
+        file_entry.modified_unix = super::times::dos_datetime_to_unix(date, time);
 
         Ok(file_entry)
     }
@@ -1840,7 +1855,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for FatFilesystem<R> {
         &mut self,
         parent: &FileEntry,
         name: &str,
-        _options: &CreateDirectoryOptions,
+        options: &CreateDirectoryOptions,
     ) -> Result<FileEntry, FilesystemError> {
         validate_fat_name(name)?;
 
@@ -1860,7 +1875,11 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for FatFilesystem<R> {
         // Initialize directory with . and .. entries
         let cluster_size = self.cluster_size() as usize;
         let mut new_dir = vec![0u8; cluster_size];
-        let (date, time) = current_fat_datetime();
+        let mtime = options.unix_times.map(|t| t.mtime_or_now());
+        let (date, time) = match mtime {
+            Some(s) => super::times::unix_to_dos_datetime(s),
+            None => current_fat_datetime(),
+        };
 
         // . entry
         new_dir[0..11].copy_from_slice(b".          ");
@@ -1904,7 +1923,8 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for FatFilesystem<R> {
         // Add entry in parent directory
         let existing_sfns = self.collect_existing_sfns(&dir_data);
         let sfn = Self::generate_short_name(name, &existing_sfns);
-        let entry_bytes = Self::build_dir_entries(name, &sfn, ATTR_DIRECTORY, new_cluster, 0);
+        let entry_bytes =
+            Self::build_dir_entries(name, &sfn, ATTR_DIRECTORY, new_cluster, 0, mtime);
 
         self.add_to_directory(parent, &entry_bytes)?;
         self.update_fsinfo()?;
@@ -1917,6 +1937,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for FatFilesystem<R> {
 
         let mut dir_entry = FileEntry::new_directory(name.to_string(), path, new_cluster as u64);
         dir_entry.modified = Some(format_fat_datetime(date, time));
+        dir_entry.modified_unix = super::times::dos_datetime_to_unix(date, time);
 
         Ok(dir_entry)
     }
@@ -1994,7 +2015,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for FatFilesystem<R> {
 
         let existing_sfns = self.collect_existing_sfns(&dir_data);
         let sfn = Self::generate_short_name(new_name, &existing_sfns);
-        let entry_bytes = Self::build_dir_entries(new_name, &sfn, attr, cluster, size);
+        let entry_bytes = Self::build_dir_entries(new_name, &sfn, attr, cluster, size, None);
 
         // Add the new name first, then remove the old (matched by old name +
         // cluster, so the just-added new entry is never the one removed).

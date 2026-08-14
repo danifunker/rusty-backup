@@ -489,6 +489,15 @@ impl<R: Read + Seek> ExfatFilesystem<R> {
             if entry_type == ENTRY_TYPE_FILE {
                 let secondary_count = dir_data[pos + 1] as usize;
                 let file_attrs = u16::from_le_bytes([dir_data[pos + 4], dir_data[pos + 5]]);
+                // LastModifiedTimestamp (u32 LE at offset 12..16) — DOS packed:
+                // upper 16 bits = date, lower 16 bits = time.
+                let modify_ts = u32::from_le_bytes([
+                    dir_data[pos + 12],
+                    dir_data[pos + 13],
+                    dir_data[pos + 14],
+                    dir_data[pos + 15],
+                ]);
+                let modified_unix = super::times::exfat_timestamp_to_unix(modify_ts);
 
                 // Next entry should be stream extension (0xC0)
                 let stream_pos = pos + 32;
@@ -563,7 +572,7 @@ impl<R: Read + Seek> ExfatFilesystem<R> {
                         size: 0,
                         location: first_cluster as u64,
                         modified: None,
-                        modified_unix: None,
+                        modified_unix,
                         type_code: None,
                         creator_code: None,
                         symlink_target: None,
@@ -592,7 +601,7 @@ impl<R: Read + Seek> ExfatFilesystem<R> {
                         size: data_length,
                         location: first_cluster as u64,
                         modified: None,
-                        modified_unix: None,
+                        modified_unix,
                         type_code: None,
                         creator_code: None,
                         symlink_target: None,
@@ -761,19 +770,13 @@ impl<R: Read + Seek + Send> Filesystem for ExfatFilesystem<R> {
 // Editing support
 // =============================================================================
 
-/// Get current timestamp as exFAT format (DOS-style u32: date in upper 16 bits, time in lower 16).
+/// Current wall-clock time as an exFAT timestamp (DOS-style u32: date in
+/// upper 16 bits, time in lower 16). Falls back to 2024-01-01 midnight on
+/// the (impossible) pre-1970 system clock. Used only when the caller left
+/// `CreateFileOptions.unix_times = None` — a genuinely new file. Copies /
+/// imports carry a real source mtime through [`super::times::unix_to_exfat_timestamp`].
 fn current_exfat_timestamp() -> u32 {
-    // Use same approach as FAT: encode current UTC time
-    // For simplicity in an embedded context, use a fixed recent timestamp
-    // Date: bits 31-25=year(0-127 from 1980), 24-21=month, 20-16=day
-    // Time: bits 15-11=hour, 10-5=minute, 4-0=second/2
-    // 2024-01-01 00:00:00
-    let year = 2024 - 1980; // 44
-    let month = 1u32;
-    let day = 1u32;
-    let date = (year << 9) | (month << 5) | day;
-    let time = 0u32; // midnight
-    (date << 16) | time
+    super::times::unix_to_exfat_timestamp(super::times::now())
 }
 
 impl<R: Read + Write + Seek> ExfatFilesystem<R> {
@@ -972,14 +975,27 @@ impl<R: Read + Write + Seek> ExfatFilesystem<R> {
     // -- Directory Entry Sets --
 
     /// Build a complete entry set (File + Stream + FileName entries).
-    fn build_entry_set(name: &str, attrs: u16, first_cluster: u32, data_len: u64) -> Vec<u8> {
+    ///
+    /// `mtime_secs = Some(secs)` stamps that Unix time into the three DOS
+    /// timestamp fields (import that carried a source mtime through); `None`
+    /// stamps `now` (a genuinely new file or a rename).
+    fn build_entry_set(
+        name: &str,
+        attrs: u16,
+        first_cluster: u32,
+        data_len: u64,
+        mtime_secs: Option<u64>,
+    ) -> Vec<u8> {
         let name_utf16: Vec<u16> = name.encode_utf16().collect();
         let name_entry_count = name_utf16.len().div_ceil(15); // ceil(len/15)
         let secondary_count = 1 + name_entry_count; // stream + name entries
         let total_entries = 1 + secondary_count; // file + secondaries
         let mut entries = vec![0u8; total_entries * 32];
 
-        let ts = current_exfat_timestamp();
+        let ts = match mtime_secs {
+            Some(s) => super::times::unix_to_exfat_timestamp(s),
+            None => current_exfat_timestamp(),
+        };
 
         // File Entry (0x85)
         entries[0] = ENTRY_TYPE_FILE;
@@ -1404,7 +1420,8 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExfatFilesystem<R> {
         // caller (e.g. the cross-image copy engine) when provided; default to
         // Archive for brand-new files.
         let attrs = options.dos_attributes.map(|a| a & 0x27).unwrap_or(0x20);
-        let entry_bytes = Self::build_entry_set(name, attrs, first_cluster, data_len);
+        let mtime = options.unix_times.map(|t| t.mtime_or_now());
+        let entry_bytes = Self::build_entry_set(name, attrs, first_cluster, data_len, mtime);
         self.add_entry_to_directory(parent, &entry_bytes)?;
 
         let path = if parent.path == "/" {
@@ -1413,19 +1430,16 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExfatFilesystem<R> {
             format!("{}/{name}", parent.path)
         };
 
-        Ok(FileEntry::new_file(
-            name.to_string(),
-            path,
-            data_len,
-            first_cluster as u64,
-        ))
+        let mut fe = FileEntry::new_file(name.to_string(), path, data_len, first_cluster as u64);
+        fe.modified_unix = Some(mtime.unwrap_or_else(super::times::now));
+        Ok(fe)
     }
 
     fn create_directory(
         &mut self,
         parent: &FileEntry,
         name: &str,
-        _options: &CreateDirectoryOptions,
+        options: &CreateDirectoryOptions,
     ) -> Result<FileEntry, FilesystemError> {
         validate_exfat_name(name)?;
 
@@ -1445,7 +1459,8 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExfatFilesystem<R> {
         self.write_cluster_data(new_cluster, &zeroed)?;
 
         // Build entry set with directory attribute
-        let entry_bytes = Self::build_entry_set(name, ATTR_DIRECTORY, new_cluster, 0);
+        let mtime = options.unix_times.map(|t| t.mtime_or_now());
+        let entry_bytes = Self::build_entry_set(name, ATTR_DIRECTORY, new_cluster, 0, mtime);
         self.add_entry_to_directory(parent, &entry_bytes)?;
 
         let path = if parent.path == "/" {
@@ -1454,11 +1469,9 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExfatFilesystem<R> {
             format!("{}/{name}", parent.path)
         };
 
-        Ok(FileEntry::new_directory(
-            name.to_string(),
-            path,
-            new_cluster as u64,
-        ))
+        let mut fe = FileEntry::new_directory(name.to_string(), path, new_cluster as u64);
+        fe.modified_unix = Some(mtime.unwrap_or_else(super::times::now));
+        Ok(fe)
     }
 
     fn delete_entry(
@@ -1521,7 +1534,8 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExfatFilesystem<R> {
         } else {
             entry.dos_attributes.map(|a| a & 0x27).unwrap_or(0x20)
         };
-        let entry_bytes = Self::build_entry_set(new_name, attrs, entry.location as u32, entry.size);
+        let entry_bytes =
+            Self::build_entry_set(new_name, attrs, entry.location as u32, entry.size, None);
 
         // remove_entry_from_directory matches names case-insensitively
         // and does not consult the cluster. For the normal case (names
@@ -2809,7 +2823,7 @@ mod tests {
     fn test_exfat_entry_set_checksum() {
         // Build an entry set and verify the checksum is non-zero and consistent
         let entries =
-            ExfatFilesystem::<Cursor<Vec<u8>>>::build_entry_set("hello.txt", 0x20, 5, 100);
+            ExfatFilesystem::<Cursor<Vec<u8>>>::build_entry_set("hello.txt", 0x20, 5, 100, None);
         assert!(entries.len() >= 96); // At least 3 entries (file + stream + 1 name)
         let stored_cs = u16::from_le_bytes([entries[2], entries[3]]);
         assert_ne!(stored_cs, 0);
