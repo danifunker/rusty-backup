@@ -509,18 +509,20 @@ impl<R: Read + Seek> AffsFilesystem<R> {
     }
 
     /// Synthesize a new directory header block in the cache.
+    /// `dates = Some(...)` stamps that Amiga DateStamp; `None` stamps `now`.
     fn build_dir_block(
         &mut self,
         block: u32,
         parent: u32,
         name: &str,
+        dates: Option<(i32, i32, i32)>,
     ) -> Result<(), FilesystemError> {
         let mut buf = [0u8; BSIZE];
         buf[0..4].copy_from_slice(&T_HEADER.to_be_bytes());
         buf[4..8].copy_from_slice(&block.to_be_bytes());
         // bytes 8..0x14 are the rest of the header prefix — left zero.
         // Hash table at 0x18..0x138 — already zero from buf initialization.
-        let (days, mins, ticks) = Self::now_datestamp();
+        let (days, mins, ticks) = dates.unwrap_or_else(Self::now_datestamp);
         buf[0x1A4..0x1A8].copy_from_slice(&days.to_be_bytes());
         buf[0x1A8..0x1AC].copy_from_slice(&mins.to_be_bytes());
         buf[0x1AC..0x1B0].copy_from_slice(&ticks.to_be_bytes());
@@ -1337,6 +1339,15 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AffsFilesystem<R> {
         let first_data = data_blocks.first().copied().unwrap_or(0);
         let access = options.amiga_protection.unwrap_or(0);
         let comment_str = options.amiga_comment.as_deref().unwrap_or("");
+        // Explicit amiga_dates always win; otherwise convert a supplied
+        // unix_times mtime to the (days, mins, ticks) triple so a cross-fs
+        // copy from a non-Amiga source (HFS+/ext/tar) still records the
+        // source date on AFFS.
+        let dates = options.amiga_dates.or_else(|| {
+            options
+                .unix_times
+                .map(|t| super::affs_common::unix_to_datestamp(t.mtime_or_now()))
+        });
         self.build_file_header_block(
             header_block,
             parent_block,
@@ -1347,7 +1358,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AffsFilesystem<R> {
             header_extension,
             access,
             comment_str,
-            options.amiga_dates,
+            dates,
         )?;
         self.hash_chain_insert(parent_block, header_block, name)?;
 
@@ -1357,19 +1368,22 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AffsFilesystem<R> {
         } else {
             format!("{}/{}", parent.path, name)
         };
-        Ok(FileEntry::new_file(
-            name.to_string(),
-            path,
-            data_len,
-            header_block as u64,
-        ))
+        let mut fe = FileEntry::new_file(name.to_string(), path, data_len, header_block as u64);
+        if let Some(dts) = dates {
+            fe.amiga_date = Some(dts);
+            let unix = super::affs_common::datestamp_to_unix(dts.0, dts.1, dts.2);
+            if unix > 0 {
+                fe.modified_unix = Some(unix as u64);
+            }
+        }
+        Ok(fe)
     }
 
     fn create_directory(
         &mut self,
         parent: &FileEntry,
         name: &str,
-        _options: &CreateDirectoryOptions,
+        options: &CreateDirectoryOptions,
     ) -> Result<FileEntry, FilesystemError> {
         self.validate_name(name)?;
         let parent_block = if parent.location == 0 {
@@ -1382,18 +1396,27 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AffsFilesystem<R> {
             return Err(FilesystemError::AlreadyExists(name.to_string()));
         }
         let block = self.alloc_block()?;
-        self.build_dir_block(block, parent_block, name)?;
+        let dates = options.amiga_dates.or_else(|| {
+            options
+                .unix_times
+                .map(|t| super::affs_common::unix_to_datestamp(t.mtime_or_now()))
+        });
+        self.build_dir_block(block, parent_block, name, dates)?;
         self.hash_chain_insert(parent_block, block, name)?;
         let path = if parent.path == "/" {
             format!("/{name}")
         } else {
             format!("{}/{}", parent.path, name)
         };
-        Ok(FileEntry::new_directory(
-            name.to_string(),
-            path,
-            block as u64,
-        ))
+        let mut fe = FileEntry::new_directory(name.to_string(), path, block as u64);
+        if let Some(dts) = dates {
+            fe.amiga_date = Some(dts);
+            let unix = super::affs_common::datestamp_to_unix(dts.0, dts.1, dts.2);
+            if unix > 0 {
+                fe.modified_unix = Some(unix as u64);
+            }
+        }
+        Ok(fe)
     }
 
     fn delete_entry(

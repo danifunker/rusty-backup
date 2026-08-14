@@ -165,6 +165,22 @@ pub fn datestamp_to_unix(days: i32, mins: i32, ticks: i32) -> i64 {
     total_days * SECS_PER_DAY + mins as i64 * 60 + ticks as i64 / 50
 }
 
+/// Inverse of [`datestamp_to_unix`] — pack Unix seconds into an AmigaDOS
+/// DateStamp `(days, mins, ticks)`. Pre-1978 clamps to (0, 0, 0). Ticks are
+/// zero on the output (Unix seconds are 1-second granular; the tick field
+/// would round-trip to zero anyway).
+pub fn unix_to_datestamp(unix_secs: u64) -> (i32, i32, i32) {
+    let days_since_1970 = unix_secs as i64 / SECS_PER_DAY;
+    let days = days_since_1970 - AMIGA_EPOCH_DAYS;
+    if days < 0 {
+        return (0, 0, 0);
+    }
+    let tod = unix_secs as i64 - days_since_1970 * SECS_PER_DAY;
+    let mins = (tod / 60) as i32;
+    let ticks = ((tod % 60) * 50) as i32;
+    (days as i32, mins, ticks)
+}
+
 /// Render `(days, mins, ticks)` as a human-readable UTC string.
 pub fn datestamp_string(days: i32, mins: i32, ticks: i32) -> Option<String> {
     let unix = datestamp_to_unix(days, mins, ticks);

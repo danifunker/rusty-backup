@@ -317,3 +317,189 @@ fn genuinely_new_file_stamps_now() {
     );
     let _ = entry;
 }
+
+// ---------------------------------------------------------------------------
+// Cross-filesystem coverage — every driver that Phase 2..5 taught to honour
+// `CreateFileOptions.unix_times` gets one test that puts a 2020-dated byte
+// stream through `create_file` and reads the mtime back via `list_directory`.
+// The point is not to re-verify each format encoder (those have unit tests in
+// `fs::times`) — it's the plumbing between `create_file` and `list_directory`
+// that's easy to let drift; one test per driver catches a driver forgetting
+// to thread `options.unix_times` through, or forgetting to populate
+// `modified_unix` on read.
+// ---------------------------------------------------------------------------
+
+use rusty_backup::fs::adfs::{create_blank_adfs, AdfsFilesystem};
+use rusty_backup::fs::exfat::{create_blank_exfat, ExfatFilesystem, ExfatFormatTemplate};
+use rusty_backup::fs::fat::{create_blank_fat, FatFilesystem};
+use rusty_backup::fs::hfs::{create_blank_hfs, HfsFilesystem};
+use rusty_backup::fs::hfsplus::{create_blank_hfsplus, HfsPlusFilesystem};
+use rusty_backup::fs::hpfs::{create_blank_hpfs, HpfsFilesystem};
+use rusty_backup::fs::mfs::{create_blank_mfs, MfsFilesystem};
+use rusty_backup::fs::ntfs::NtfsFilesystem;
+use rusty_backup::fs::ntfs_format::create_blank_ntfs;
+use rusty_backup::fs::os9::{create_blank_os9, Os9Filesystem};
+use rusty_backup::fs::prodos::{create_blank_prodos, ProDosFilesystem};
+use rusty_backup::fs::ucsd::{create_blank_ucsd, UcsdFilesystem};
+
+/// One-shot helper: create a file on `fs` at `/name` with mtime = YEAR_2020,
+/// re-list the root, and return the entry's `modified_unix`.
+fn put_and_readback_mtime<F: EditableFilesystem>(fs: &mut F, name: &str) -> Option<u64> {
+    let root = fs.root().unwrap();
+    fs.create_file(
+        &root,
+        name,
+        &mut &b"hello"[..],
+        5,
+        &CreateFileOptions {
+            unix_times: Some(UnixTimes::mtime_only(YEAR_2020)),
+            ..Default::default()
+        },
+    )
+    .expect("create_file");
+    fs.sync_metadata().expect("sync_metadata");
+    let root = fs.root().unwrap();
+    fs.list_directory(&root)
+        .unwrap()
+        .into_iter()
+        .find(|e| e.name == name)
+        .expect("listed entry")
+        .modified_unix
+}
+
+/// The DOS-packed date is 2-second granular; a round-trip loses the odd
+/// low bit but the whole-minute value must survive.
+fn assert_within_dos_granularity(actual: Option<u64>, expected: u64) {
+    let a = actual.expect("modified_unix must be populated");
+    assert!(
+        a >= expected && a - expected <= 1,
+        "expected ~{expected}, got {a} (DOS is 2-second granular)"
+    );
+}
+
+#[test]
+fn fat_preserves_mtime_across_create_and_list() {
+    let img = create_blank_fat(4 * 1024 * 1024, Some("TIMES")).unwrap();
+    let mut fs = FatFilesystem::open(Cursor::new(img), 0).unwrap();
+    assert_within_dos_granularity(put_and_readback_mtime(&mut fs, "TIMES.TXT"), YEAR_2020);
+}
+
+#[test]
+fn exfat_preserves_mtime_across_create_and_list() {
+    let template = ExfatFormatTemplate {
+        bytes_per_sector: 512,
+        sectors_per_cluster: 8,
+        label: Some("TIMES".to_string()),
+    };
+    let size = 16 * 1024 * 1024u64;
+    let mut cur = Cursor::new(Vec::<u8>::new());
+    create_blank_exfat(&mut cur, &template, size).unwrap();
+    let mut fs = ExfatFilesystem::open(cur, 0).unwrap();
+    assert_within_dos_granularity(put_and_readback_mtime(&mut fs, "times.txt"), YEAR_2020);
+}
+
+#[test]
+fn ntfs_preserves_mtime_across_create_and_list() {
+    let mut cur = Cursor::new(Vec::<u8>::new());
+    create_blank_ntfs(&mut cur, 16 * 1024 * 1024, 128, Some("TIMES")).unwrap();
+    let mut fs = NtfsFilesystem::open(cur, 0).unwrap();
+    let mtime = put_and_readback_mtime(&mut fs, "times.txt").expect("modified_unix set");
+    assert_eq!(mtime, YEAR_2020, "NTFS FILETIME is second-granular");
+}
+
+#[test]
+fn hfs_preserves_mtime_across_create_and_list() {
+    let img = create_blank_hfs(4 * 1024 * 1024, 512, "TIMES").unwrap();
+    let mut fs = HfsFilesystem::open(Cursor::new(img), 0).unwrap();
+    let mtime = put_and_readback_mtime(&mut fs, "times.txt").expect("modified_unix set");
+    assert_eq!(mtime, YEAR_2020);
+}
+
+#[test]
+fn hfsplus_preserves_mtime_across_create_and_list() {
+    let img = create_blank_hfsplus(16 * 1024 * 1024, 4096, "TIMES", false);
+    let mut fs = HfsPlusFilesystem::open(Cursor::new(img), 0).unwrap();
+    let mtime = put_and_readback_mtime(&mut fs, "times.txt").expect("modified_unix set");
+    assert_eq!(mtime, YEAR_2020);
+}
+
+#[test]
+fn mfs_preserves_mtime_across_create_and_list() {
+    let img = create_blank_mfs(400 * 1024, "TIMES").unwrap();
+    let mut fs = MfsFilesystem::open(Cursor::new(img), 0).unwrap();
+    let mtime = put_and_readback_mtime(&mut fs, "times.txt").expect("modified_unix set");
+    assert_eq!(mtime, YEAR_2020);
+}
+
+#[test]
+fn prodos_preserves_mtime_across_create_and_list() {
+    let img = create_blank_prodos(400 * 1024, "TIMES").unwrap();
+    let mut fs = ProDosFilesystem::open(Cursor::new(img), 0).unwrap();
+    let mtime = put_and_readback_mtime(&mut fs, "TIMES.TXT").expect("modified_unix set");
+    // ProDOS is minute-granular; YEAR_2020 lands on a minute boundary.
+    assert_eq!(mtime, YEAR_2020);
+}
+
+#[test]
+fn hpfs_preserves_mtime_across_create_and_list() {
+    let img = create_blank_hpfs(4 * 1024 * 1024, "TIMES").unwrap();
+    let mut fs = HpfsFilesystem::open(Cursor::new(img), 0).unwrap();
+    let mtime = put_and_readback_mtime(&mut fs, "times.txt").expect("modified_unix set");
+    assert_eq!(mtime, YEAR_2020);
+}
+
+// Human68k needs a captured `Human68kFormatTemplate` (BPB + reserved region)
+// to format, which needs a source volume to hand — the driver's own unit
+// tests cover the roundtrip. Extending it into this file would duplicate
+// that scaffolding.
+
+#[test]
+fn os9_preserves_mtime_across_create_and_list() {
+    let img = create_blank_os9("TIMES").unwrap();
+    let mut fs = Os9Filesystem::open(Cursor::new(img), 0).unwrap();
+    let mtime = put_and_readback_mtime(&mut fs, "times").expect("modified_unix set");
+    // OS-9 FD.DAT is minute-granular; YEAR_2020 lands on a minute boundary.
+    assert_eq!(mtime, YEAR_2020);
+}
+
+#[test]
+fn ucsd_preserves_mtime_across_create_and_list() {
+    // UCSD's year field is 0..99 -> 1900..1999, so 2020 would clamp to 1999.
+    // Test with a UCSD-representable year instead.
+    const YEAR_1990: u64 = 631_152_000; // 1990-01-01 00:00:00 UTC
+    let img = create_blank_ucsd(400 * 1024, "TIMES").unwrap();
+    let mut fs = UcsdFilesystem::open(Cursor::new(img), 0).unwrap();
+    let root = fs.root().unwrap();
+    fs.create_file(
+        &root,
+        "TIMES",
+        &mut &b"hello"[..],
+        5,
+        &CreateFileOptions {
+            unix_times: Some(UnixTimes::mtime_only(YEAR_1990)),
+            ..Default::default()
+        },
+    )
+    .expect("create_file");
+    fs.sync_metadata().expect("sync");
+    let root = fs.root().unwrap();
+    let mtime = fs
+        .list_directory(&root)
+        .unwrap()
+        .into_iter()
+        .find(|e| e.name == "TIMES")
+        .expect("listed entry")
+        .modified_unix
+        .expect("modified_unix set");
+    // UCSD stores day-granularity only, so 1990-01-01 00:00:00 round-trips exact.
+    assert_eq!(mtime, YEAR_1990);
+}
+
+#[test]
+fn adfs_preserves_mtime_across_create_and_list() {
+    let img = create_blank_adfs("TIMES");
+    let mut fs = AdfsFilesystem::open(Cursor::new(img), 0).unwrap();
+    let mtime = put_and_readback_mtime(&mut fs, "times").expect("modified_unix set");
+    // ADFS is centisecond-granular; whole seconds round-trip exactly.
+    assert_eq!(mtime, YEAR_2020);
+}
