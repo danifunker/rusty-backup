@@ -2926,15 +2926,23 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
     }
 
     /// Build a complete HFS+ file catalog record (248 bytes).
-    fn build_file_record(
+    /// `mtime_secs = Some(secs)` stamps that Unix time into all four date
+    /// fields (a cross-fs copy carrying the source mtime through); `None`
+    /// stamps `now`. The after-create `set_dates` Commander path still
+    /// overrides all four.
+    fn build_file_record_with_dates(
         file_id: u32,
         data_fork: &ForkData,
         rsrc_fork: &ForkData,
         type_code: &[u8; 4],
         creator_code: &[u8; 4],
+        mtime_secs: Option<u64>,
     ) -> [u8; 248] {
         let mut rec = [0u8; 248];
-        let now = hfs_common::hfs_now();
+        let now = match mtime_secs {
+            Some(s) => super::times::unix_to_mac_epoch(s),
+            None => hfs_common::hfs_now(),
+        };
         BigEndian::write_i16(&mut rec[0..2], CATALOG_FILE);
         BigEndian::write_u32(&mut rec[8..12], file_id);
         BigEndian::write_u32(&mut rec[12..16], now); // createDate
@@ -2979,9 +2987,16 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
     }
 
     /// Build a complete HFS+ folder catalog record (88 bytes).
-    fn build_folder_record(folder_id: u32) -> [u8; 88] {
+    /// `mtime_secs = Some(secs)` stamps that Unix time into the four date
+    /// fields (a cross-fs copy carrying the source mtime through); `None`
+    /// stamps `now`. The after-create Commander `set_dates` path still
+    /// overrides.
+    fn build_folder_record_with_dates(folder_id: u32, mtime_secs: Option<u64>) -> [u8; 88] {
         let mut rec = [0u8; 88];
-        let now = hfs_common::hfs_now();
+        let now = match mtime_secs {
+            Some(s) => super::times::unix_to_mac_epoch(s),
+            None => hfs_common::hfs_now(),
+        };
         BigEndian::write_i16(&mut rec[0..2], CATALOG_FOLDER);
         // valence = 0 (offset 4)
         BigEndian::write_u32(&mut rec[8..12], folder_id);
@@ -4832,9 +4847,18 @@ impl<R: Read + Write + Seek + Send> HfsPlusFilesystem<R> {
             ForkData::empty()
         };
 
-        // Build file record
-        let file_rec =
-            Self::build_file_record(file_id, &data_fork, &rsrc_fork, &type_code, &creator_code);
+        // Build file record. A cross-fs copy passes the source mtime through
+        // options.unix_times; a genuinely-new file leaves it None and takes
+        // `now`. The after-create Commander `set_dates` path still overrides.
+        let mtime = options.unix_times.map(|t| t.mtime_or_now());
+        let file_rec = Self::build_file_record_with_dates(
+            file_id,
+            &data_fork,
+            &rsrc_fork,
+            &type_code,
+            &creator_code,
+            mtime,
+        );
 
         // Build key + record for catalog insertion
         let key = Self::build_catalog_key(parent_cnid, name);
@@ -4885,6 +4909,8 @@ impl<R: Read + Write + Seek + Send> HfsPlusFilesystem<R> {
         if rsrc_fork.logical_size > 0 {
             fe.resource_fork_size = Some(rsrc_fork.logical_size);
         }
+        let stamped = mtime.unwrap_or_else(super::times::now);
+        fe.modified_unix = Some(stamped);
         Ok(fe)
     }
 
@@ -4892,7 +4918,7 @@ impl<R: Read + Write + Seek + Send> HfsPlusFilesystem<R> {
         &mut self,
         parent: &FileEntry,
         name: &str,
-        _options: &CreateDirectoryOptions,
+        options: &CreateDirectoryOptions,
     ) -> Result<FileEntry, FilesystemError> {
         let parent_cnid = parent.location as u32;
 
@@ -4942,7 +4968,9 @@ impl<R: Read + Write + Seek + Send> HfsPlusFilesystem<R> {
         self.vh.next_catalog_id += 1;
 
         // Build folder record
-        let folder_rec = Self::build_folder_record(folder_id);
+        // See build_file_record_with_dates for the mtime semantics.
+        let mtime = options.unix_times.map(|t| t.mtime_or_now());
+        let folder_rec = Self::build_folder_record_with_dates(folder_id, mtime);
 
         // Build key + record
         let key = Self::build_catalog_key(parent_cnid, name);
@@ -4976,11 +5004,10 @@ impl<R: Read + Write + Seek + Send> HfsPlusFilesystem<R> {
         } else {
             format!("{}/{name}", parent.path)
         };
-        Ok(FileEntry::new_directory(
-            name.to_string(),
-            path,
-            folder_id as u64,
-        ))
+        let mut fe = FileEntry::new_directory(name.to_string(), path, folder_id as u64);
+        let stamped = mtime.unwrap_or_else(super::times::now);
+        fe.modified_unix = Some(stamped);
+        Ok(fe)
     }
 
     fn delete_entry_inner(
@@ -8744,12 +8771,13 @@ mod tests {
             if !kr.len().is_multiple_of(2) {
                 kr.push(0);
             }
-            kr.extend_from_slice(&Fs::build_file_record(
+            kr.extend_from_slice(&Fs::build_file_record_with_dates(
                 base_cnid + i,
                 &empty_fork,
                 &empty_fork,
                 &[0u8; 4],
                 &[0u8; 4],
+                None,
             ));
             fs.insert_catalog_record(&kr)
                 .unwrap_or_else(|e| panic!("insert #{i} into dir{d}: {e}"));
@@ -9003,12 +9031,13 @@ mod tests {
             if !kr.len().is_multiple_of(2) {
                 kr.push(0);
             }
-            kr.extend_from_slice(&Fs::build_file_record(
+            kr.extend_from_slice(&Fs::build_file_record_with_dates(
                 base_cnid + i,
                 &empty_fork,
                 &empty_fork,
                 &[0u8; 4],
                 &[0u8; 4],
+                None,
             ));
             fs.insert_catalog_record(&kr)
                 .unwrap_or_else(|e| panic!("insert #{i} into dir{d} (grow should cover it): {e}"));

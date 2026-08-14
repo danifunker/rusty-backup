@@ -1048,6 +1048,14 @@ impl<R: Read + Seek + Send> Filesystem for MfsFilesystem<R> {
             if de.rsrc_logical_length > 0 {
                 fe.resource_fork_size = Some(de.rsrc_logical_length as u64);
             }
+            // MFS dates share HFS's Mac-epoch encoding.
+            fe.modified_unix = super::times::mac_epoch_to_unix(de.modify_date);
+            if de.modify_date != 0 || de.create_date != 0 {
+                fe.mac_dates = Some((de.create_date, de.modify_date, 0));
+                if let Some(s) = super::hfs_common::format_mac_date(de.modify_date) {
+                    fe.modified = Some(s);
+                }
+            }
             out.push(fe);
         }
         out.sort_by_key(|a| a.name.to_lowercase());
@@ -1210,6 +1218,15 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for MfsFilesystem<R> {
         finder_info[0..4].copy_from_slice(&type_code);
         finder_info[4..8].copy_from_slice(&creator_code);
 
+        // Cross-fs import passes the source mtime through options.unix_times;
+        // a genuinely new file leaves it None and we stamp `now`. MFS's dir
+        // entry carries create + modify dates in Mac-epoch seconds — the same
+        // encoding HFS/HFS+ use.
+        let mtime_secs = options
+            .unix_times
+            .map(|t| t.mtime_or_now())
+            .unwrap_or_else(super::times::now);
+        let stamp = super::times::unix_to_mac_epoch(mtime_secs);
         let entry = MfsDirEntry {
             flags: 0x80, // in use, not locked
             finder_info,
@@ -1218,8 +1235,8 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for MfsFilesystem<R> {
             data_logical_length: bytes.len() as u32,
             rsrc_first_block,
             rsrc_logical_length,
-            create_date: 0,
-            modify_date: 0,
+            create_date: stamp,
+            modify_date: stamp,
             name: name.to_string(),
         };
         self.entries.push(entry);
@@ -1236,6 +1253,8 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for MfsFilesystem<R> {
         if rsrc_logical_length > 0 {
             fe.resource_fork_size = Some(rsrc_logical_length as u64);
         }
+        fe.modified_unix = Some(mtime_secs);
+        fe.mac_dates = Some((stamp, stamp, 0));
         Ok(fe)
     }
 
