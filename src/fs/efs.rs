@@ -437,6 +437,19 @@ impl EfsInode {
         }
     }
 
+    /// Current UNIX time in seconds, clamped into EFS's `u32` field. Used
+    /// wherever a new inode is stamped or an existing one is mutated
+    /// (`create_file` / `create_directory` / `create_symlink` / mkfs root /
+    /// parent-directory bumps on insert-delete-rename / `set_permissions` /
+    /// `set_owner`). Keeps the SystemTime dance in one place instead of
+    /// scattered across every write site.
+    pub(crate) fn now_u32() -> u32 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0) as u32
+    }
+
     /// Construct an empty/free inode (mode=0). Used when initializing
     /// freshly-allocated CG inode-table regions or zeroing an inode
     /// on delete.
@@ -1208,6 +1221,9 @@ impl<R: Read + Write + Seek> EfsFilesystem<R> {
         let res = (|| -> Result<(), FilesystemError> {
             let mut parent_inode = self.read_inode(parent_inum)?;
             self.dir_insert(&mut parent_inode, &mut bm, new_name, child_inum)?;
+            let now = EfsInode::now_u32();
+            parent_inode.mtime = now;
+            parent_inode.ctime = now;
             self.write_inode(&parent_inode)?;
             self.sb_dirty = true;
             Ok(())
@@ -1651,19 +1667,26 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Ef
 
         let res = (|| -> Result<FileEntry, FilesystemError> {
             let inum = self.allocate_inode()?;
+            let now = EfsInode::now_u32();
             let mut new_ino = EfsInode::empty(inum);
             new_ino.mode = options.mode.unwrap_or(0o100644) as u16;
             new_ino.nlink = 1;
             new_ino.uid = options.uid.unwrap_or(0) as u16;
             new_ino.gid = options.gid.unwrap_or(0) as u16;
+            new_ino.atime = now;
+            new_ino.mtime = now;
+            new_ino.ctime = now;
 
             self.write_file_data(&mut bm, &mut new_ino, data, data_len)?;
             self.write_inode(&new_ino)?;
 
             // Link into parent. dir_insert may mutate parent_inode
-            // (extent growth on overflow), so re-read fresh.
+            // (extent growth on overflow), so re-read fresh. Adding an
+            // entry also bumps the parent's dir-contents mtime + ctime.
             let mut parent_ino = self.read_inode(parent_inum)?;
             self.dir_insert(&mut parent_ino, &mut bm, name_bytes, inum)?;
+            parent_ino.mtime = now;
+            parent_ino.ctime = now;
             self.write_inode(&parent_ino)?;
 
             self.sb.tinode = self.sb.tinode.saturating_sub(1);
@@ -1722,6 +1745,7 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Ef
 
         let res = (|| -> Result<FileEntry, FilesystemError> {
             let inum = self.allocate_inode()?;
+            let now = EfsInode::now_u32();
             let mut new_ino = EfsInode::empty(inum);
             // Symlinks are conventionally 0777 on IRIX. An explicit mode's
             // permission bits are honoured, but the type bits are ours to set
@@ -1730,6 +1754,9 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Ef
             new_ino.nlink = 1;
             new_ino.uid = options.uid.unwrap_or(0) as u16;
             new_ino.gid = options.gid.unwrap_or(0) as u16;
+            new_ino.atime = now;
+            new_ino.mtime = now;
+            new_ino.ctime = now;
 
             let mut data = target.as_bytes();
             let len = data.len() as u64;
@@ -1738,6 +1765,8 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Ef
 
             let mut parent_ino = self.read_inode(parent_inum)?;
             self.dir_insert(&mut parent_ino, &mut bm, name_bytes, inum)?;
+            parent_ino.mtime = now;
+            parent_ino.ctime = now;
             self.write_inode(&parent_ino)?;
 
             self.sb.tinode = self.sb.tinode.saturating_sub(1);
@@ -1801,6 +1830,7 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Ef
             .expect("./.. always fits in one block");
             self.write_block(ext.bn, &initial)?;
 
+            let now = EfsInode::now_u32();
             let mut new_dir = EfsInode::empty(inum);
             new_dir.mode = options.mode.unwrap_or(0o040755) as u16;
             new_dir.nlink = 2; // `.` is the second link
@@ -1809,13 +1839,18 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Ef
             new_dir.size = EFS_BLOCKSIZE as u32;
             new_dir.numextents = 1;
             new_dir.extents[0] = ext;
+            new_dir.atime = now;
+            new_dir.mtime = now;
+            new_dir.ctime = now;
             self.write_inode(&new_dir)?;
 
-            // Link into parent.
+            // Link into parent. Parent's dir-contents changed → bump
+            // mtime + ctime, and nlink += 1 for the new dir's ".." back-link.
             let mut parent_inode = self.read_inode(parent_inum)?;
             self.dir_insert(&mut parent_inode, &mut bm, name_bytes, inum)?;
-            // Parent's nlink increases by 1 (the new dir's ".." back-link).
             parent_inode.nlink = parent_inode.nlink.saturating_add(1);
+            parent_inode.mtime = now;
+            parent_inode.ctime = now;
             self.write_inode(&parent_inode)?;
 
             self.sb.tinode = self.sb.tinode.saturating_sub(1);
@@ -1903,12 +1938,17 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Ef
             let zero = EfsInode::empty(entry_inum);
             self.write_inode(&zero)?;
 
-            // Directory parent's nlink decreases when we delete a
-            // child directory (its ".." back-link goes away).
+            // Parent dir-contents changed → mtime + ctime bump. If the target
+            // was a directory, its ".." back-link goes away too (parent nlink
+            // decreases). Always re-write the parent so file deletes also
+            // record the mtime bump (dir_remove only touched dir blocks).
+            let now = EfsInode::now_u32();
+            parent_inode.mtime = now;
+            parent_inode.ctime = now;
             if entry.is_directory() {
                 parent_inode.nlink = parent_inode.nlink.saturating_sub(1);
-                self.write_inode(&parent_inode)?;
             }
+            self.write_inode(&parent_inode)?;
 
             self.sb.tinode = self.sb.tinode.saturating_add(1);
             self.sb_dirty = true;
@@ -1975,8 +2015,15 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Ef
                     }
                     entries[slot].name = new_name_bytes.to_vec();
                     if let Some(new_block) = serialize_dir_block(&entries) {
-                        // Fits — commit the single-block rewrite.
+                        // Fits — commit the single-block rewrite, then bump
+                        // the parent's dir-contents mtime + ctime so a rename
+                        // doesn't leave the parent looking untouched.
                         self.write_block(bn, &new_block)?;
+                        let mut parent_ino = self.read_inode(parent_inum)?;
+                        let now = EfsInode::now_u32();
+                        parent_ino.mtime = now;
+                        parent_ino.ctime = now;
+                        self.write_inode(&parent_ino)?;
                         return Ok(());
                     }
                     // The longer name overflows this block. Fall back to
@@ -1999,6 +2046,8 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Ef
     fn set_permissions(&mut self, entry: &FileEntry, mode: u32) -> Result<(), FilesystemError> {
         let mut ino = self.read_inode(entry.location as u32)?;
         ino.mode = super::unix_common::inode::with_permission_bits(ino.mode as u32, mode) as u16;
+        // POSIX ctime bumps on metadata-only changes; atime/mtime untouched.
+        ino.ctime = EfsInode::now_u32();
         self.write_inode(&ino)
     }
 
@@ -2009,6 +2058,7 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Ef
         let mut ino = self.read_inode(entry.location as u32)?;
         ino.uid = uid as u16;
         ino.gid = gid as u16;
+        ino.ctime = EfsInode::now_u32();
         self.write_inode(&ino)
     }
 
@@ -3052,6 +3102,12 @@ pub fn write_blank_efs<W: Write + Seek>(
     root.nlink = 2; // . and ..
     root.size = EFS_BLOCKSIZE as u32;
     root.numextents = 1;
+    // Stamp real timestamps so IRIX / tar / ls don't show "Dec 31 1969" for
+    // the volume root (R-039); the child-creation paths carry the same stamp.
+    let now = EfsInode::now_u32();
+    root.atime = now;
+    root.mtime = now;
+    root.ctime = now;
     root.extents[0] = EfsExtent {
         magic: 0,
         bn: root_dirblock,
@@ -3555,6 +3611,67 @@ mod tests {
         assert_eq!(n as usize, direct.len());
         assert_eq!(streamed, direct);
         assert_eq!(streamed.len(), entry.size as usize);
+    }
+
+    /// Newly-created files and directories must carry real timestamps, not
+    /// the epoch-zero the old empty()-then-mutate path left behind (R-039
+    /// / IRIX "Dec 31 1969" bug). The parent's mtime/ctime bumps too so a
+    /// tar of the volume reflects when the entry was actually added.
+    #[test]
+    fn create_file_stamps_timestamps_and_bumps_parent() {
+        use crate::fs::filesystem::{
+            CreateDirectoryOptions, CreateFileOptions, EditableFilesystem,
+        };
+        let img = create_blank_efs(1024 * 1024, "rb-efs").expect("format 1M EFS");
+        let mut fs = EfsFilesystem::open(Cursor::new(img), 0).expect("open");
+
+        // Capture wall clock *before* the writes; we compare it to the
+        // stamped seconds and allow a small forward drift for the second
+        // rollover between now and the write.
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("post-epoch")
+            .as_secs() as u32;
+
+        let root = fs.root().expect("root");
+        // Root inode (mkfs) must itself be non-zero — this is the case
+        // `tar -tvzf` displays for the volume root.
+        let root_ino_before = fs.read_inode(2).expect("root inode");
+        assert!(
+            root_ino_before.mtime > 0 && root_ino_before.ctime > 0 && root_ino_before.atime > 0,
+            "mkfs root inode times must not be zero: {root_ino_before:?}",
+        );
+
+        let file = fs
+            .create_file(
+                &root,
+                "HELLO",
+                &mut &b"hi"[..],
+                2,
+                &CreateFileOptions::default(),
+            )
+            .expect("create file");
+        let f_ino = fs.read_inode(file.location as u32).expect("file inode");
+        assert!(
+            f_ino.atime >= before && f_ino.mtime >= before && f_ino.ctime >= before,
+            "created file times must be >= before ({before}): {f_ino:?}",
+        );
+
+        let dir = fs
+            .create_directory(&root, "DIR", &CreateDirectoryOptions::default())
+            .expect("create dir");
+        let d_ino = fs.read_inode(dir.location as u32).expect("dir inode");
+        assert!(
+            d_ino.atime >= before && d_ino.mtime >= before && d_ino.ctime >= before,
+            "created dir times must be >= before ({before}): {d_ino:?}",
+        );
+
+        // Parent (root) picks up the mtime/ctime bump from both inserts.
+        let root_after = fs.read_inode(2).expect("root inode");
+        assert!(
+            root_after.mtime >= before && root_after.ctime >= before,
+            "root mtime/ctime must be bumped by the inserts: {root_after:?}",
+        );
     }
 
     #[test]
@@ -4197,6 +4314,7 @@ mod tests {
 
         // Root inode (2) at byte (firstcg=18)*512 + 2*128.
         let ino2_off = 18 * 512 + 2 * 128;
+        let now = EfsInode::now_u32();
         let root = EfsInode {
             inum: 2,
             mode: 0o040755,
@@ -4204,9 +4322,9 @@ mod tests {
             uid: 0,
             gid: 0,
             size: 512,
-            atime: 0,
-            mtime: 0,
-            ctime: 0,
+            atime: now,
+            mtime: now,
+            ctime: now,
             gen: 0,
             numextents: 1,
             version: 0,
