@@ -385,6 +385,9 @@ pub fn prodos_datetime_to_unix(date: u16, time: u16) -> Option<u64> {
     } else {
         1900 + raw_year
     };
+    if year < 1970 {
+        return None;
+    }
     let minute = (time & 0x3F) as u32;
     let hour = ((time >> 8) & 0x1F) as u32;
     if month == 0 || month > 12 || day == 0 || day > days_in_month(year, month) {
@@ -415,7 +418,9 @@ pub fn unix_to_ucsd_date(secs: u64) -> u16 {
 }
 
 /// Decode a UCSD Pascal packed date to Unix seconds (00:00:00 of that day).
-/// Returns `None` for zero.
+/// Returns `None` for zero, and for pre-1970 dates (which would round-trip
+/// through tar as 1969 anyway; the year field's 1900..1999 range means any
+/// UCSD-native date can be pre-1970, so this guard matters).
 pub fn ucsd_date_to_unix(word: u16) -> Option<u64> {
     if word == 0 {
         return None;
@@ -423,6 +428,9 @@ pub fn ucsd_date_to_unix(word: u16) -> Option<u64> {
     let day = (word & 0x1F) as u32;
     let month = ((word >> 5) & 0x0F) as u32;
     let year = 1900 + ((word >> 9) & 0x7F) as i64;
+    if year < 1970 {
+        return None;
+    }
     if month == 0 || month > 12 || day == 0 || day > days_in_month(year, month) {
         return None;
     }
@@ -505,6 +513,9 @@ pub fn os9_dat_to_unix(dat: &[u8; 5]) -> Option<u64> {
         return None;
     }
     let year = 1900i64 + dat[0] as i64;
+    if year < 1970 {
+        return None;
+    }
     let month = dat[1] as u32;
     let day = dat[2] as u32;
     let hour = dat[3] as u32;
@@ -519,12 +530,15 @@ pub fn os9_dat_to_unix(dat: &[u8; 5]) -> Option<u64> {
 }
 
 /// Decode an OS-9 FD.DCR (creation date only) to Unix seconds. Returns
-/// `None` for all-zero.
+/// `None` for all-zero or pre-1970 dates.
 pub fn os9_dcr_to_unix(dcr: &[u8; 3]) -> Option<u64> {
     if dcr == &[0u8; 3] {
         return None;
     }
     let year = 1900i64 + dcr[0] as i64;
+    if year < 1970 {
+        return None;
+    }
     let month = dcr[1] as u32;
     let day = dcr[2] as u32;
     if month == 0 || month > 12 || day == 0 || day > days_in_month(year, month) {
