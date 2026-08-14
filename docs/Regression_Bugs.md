@@ -1,4 +1,4 @@
-# Regression Findings (R-001 … R-038)
+# Regression Findings (R-001 … R-039)
 
 Defects and documentation drift turned up while building the regression suite
 (`regression-tests/`), 2026-08-01/02. The suite work was deliberately kept
@@ -38,6 +38,7 @@ finding depends on a fixture, the fixture is named.
 | ~~R-036~~ | ~~Medium~~ **FIXED** | `src/cli/resolve.rs` | ~~A missing image gets three different exit codes across the verb surface~~ — one guard in the shared resolver, 2026-08-10 |
 | ~~R-037~~ | ~~**High**~~ **FIXED** | `src/cli/verbs/resize.rs` | ~~Shrinking rewrote the filesystem over live data and returned truncated files~~ — data floor + `--confirm-shrink` + truncation, 2026-08-09 |
 | [R-038](#r-038) | **High** | `src/fs/affs.rs` | A second implementation (amitools) rejects every AFFS volume we write |
+| [R-039](#r-039) | **High** | `src/fs/efs*.rs` | IRIX's own fsck reports BAD FREE LIST on every EFS volume we write |
 | [R-020](#r-020) | **High** | `src/fs/affs.rs` | `new volume affs` output is "Not a DOS disk" on a real Amiga, at every size |
 | ~~R-016~~ | ~~**High**~~ **RECLASSIFIED** | `src/cli/verbs/backup.rs` | ~~`backup` accepts only flat-layout sources: CHD, dynamic VHD, QCOW2 and VMDK all fail~~ — not a defect; moved to [F-008](missing_features_from_regression.md#f-008), 2026-08-09 |
 | ~~R-018~~ | ~~Blocker~~ **FIXED** | `CONTRIBUTING.md` | ~~The documented Rust-1.73 verification build does not compile on Windows~~ — missing `windows-legacy` feature, 2026-08-07 |
@@ -1905,6 +1906,62 @@ updated to match, or the fix may itself be wrong. Do not assume which.
 
 Oracle: `amitools`, check `oracles/amitools_affs.py`. It is `structural`, not
 `authoritative`, for the reason above.
+
+---
+
+### R-039 — IRIX's own fsck reports BAD FREE LIST on every EFS volume we write {#r-039}
+
+Found 2026-08-13, the first authoritative oracle result this project has ever
+had: IRIX 6.5.22 running under the Iris emulator, checking our EFS volume with
+its own `/sbin/fsck`.
+
+```
+fsck: checking /dev/rdsk/dks0d2s0 (NO WRITE). Name: rusty- Volume: rusty-
+** Phase 1 - Check Blocks and Sizes
+** Phase 2 - Check Pathnames
+** Phase 3 - Check Connectivity
+** Phase 4 - Check Reference Counts
+** Phase 5 - Check Free List
+BAD FREE LIST
+1 files 1 blocks 3964 free
+```
+
+Phases 1 through 4 pass. The structure is sound — IRIX walks our blocks,
+pathnames, connectivity and reference counts without complaint, and reads the
+volume name. Only the **free list** is wrong.
+
+**The control makes it a defect rather than an artifact.** `mkfs_efs` was run on
+the same device, in the same guest, through the same scratch path, and the
+resulting volume passes the identical check:
+
+```
+** Phase 5 - Check Free List
+2 files 22 blocks 126332 free
+```
+
+No BAD FREE LIST. Same device node, same fsck, same session — the only variable
+is who wrote the filesystem.
+
+**Why this one is different from every EFS check we had.** `edit.efs.put-get`,
+`fs.new-volume.efs` and `roundtrip.efs.raw` are all green, and all of them are
+our code checked by our code. This is the vendor's own tool, which is what
+`strength = "authoritative"` means in the registry. It is the EFS equivalent of
+what [R-038](#r-038) did for AFFS, one level stronger: amitools is a
+reimplementation, IRIX is the implementation.
+
+**Not yet investigated:** where our free list diverges. EFS keeps free extents
+per cylinder group; `mkfs_efs` on the same 64 MB device reported `ncg=6`,
+`bitmap blocks=32`, `cgfsize=21838`, which is a useful reference geometry to
+compare ours against.
+
+**A second observation, unconfirmed as a separate defect:** fsck shows the
+volume name as `rusty-`, truncated from our default `rusty-backup`. EFS volume
+names are short, so this may be correct truncation rather than a bug — but
+nothing has checked what the limit is or whether we truncate the same way IRIX
+does.
+
+Reproduce: see the `iris` oracle's notes in `data/oracles.toml` for the working
+invocation, config and scratch-volume setup.
 
 ---
 

@@ -267,19 +267,45 @@ Four things that cost time, recorded so they do not again:
     system is coming up", prints "Find Error: 10" and never reaches a login
     prompt. Indy-IRIX65_dev.chd reaches one in a few minutes with JIT on.
 
-STILL BLOCKED on getting a file INTO the guest, which is what the oracle needs:
+SOLVED 2026-08-13. The scratch volume is configured in iris.toml, not on the
+command line — --help never mentions it, but the binary does: "set
+`scratch = true` on a SCSI device in iris.toml". `scsi` is a MAP keyed by id,
+not an array of tables, and every device needs `cdrom`. iris creates the
+scratch volume itself, SGI volume header and all:
 
-  * `iris-ci put` wants a scratch volume - "scratch volume not configured".
-    iris has no --scratch flag, so the scratch disk is presumably an SGI-VH
-    volume on one of the SCSI IDs; the convention is not in --help.
-  * --nfs-dir exports a host directory and iris reports "in-core NFS server
-    exporting ./share", but the guest cannot mount it: "Port mapper failure -
-    Unable to send", then an NFS v3->v2 retry loop that blocks the shell. The
-    guest network config is the likely cause.
+  [scsi.1]
+  path = "disks/Indy-IRIX65_dev.chd"
+  cdrom = false
 
-Once a file can cross, the check is IRIX's own fsck/fsstat on our EFS volume -
-an authoritative answer no other oracle here can give."""
-notes = "SGI emulator written in Rust; in-house, so blockers are fixable at source. Replaces MAME for IRIX."
+  [scsi.2]
+  path = "disks/scratch.img"
+  cdrom = false
+  scratch = true
+  size_mb = 64
+
+Then `iris-ci put <file> --to /tmp/x` stages through it and works.
+
+fsck needs one step more. IRIX refuses a plain file — "Can't find equivalent
+raw device" — exactly as macOS fsck_hfs does. But the scratch volume IS a real
+SCSI disk in the guest, so write the image straight into it and check the
+device node:
+
+  iris-ci scratch write ./volume.img
+  iris-ci run "/sbin/fsck -t efs -n /dev/rdsk/dks0d2s0 < /dev/null"
+
+SCSI id 2 is dks0d2, s0 is the payload partition. The `< /dev/null` matters:
+without it fsck waits on a SALVAGE prompt forever.
+
+First result: our EFS volume passes phases 1-4 and fails phase 5 with BAD FREE
+LIST, while a volume mkfs_efs writes on the same device passes. That is R-039,
+the first authoritative finding this project has had.
+
+--nfs-dir was tried first and abandoned. iris exports the directory fine but
+the guest cannot mount it ("Port mapper failure"), then loops retrying and
+blocks the shell. The scratch path is better regardless — no guest networking.
+
+Written in Rust and in-house, so blockers here are fixable at source. Replaces
+MAME for IRIX."""
 availability = [
   { platform = "windows", status = "install" },
   { platform = "linux",   status = "install" },
