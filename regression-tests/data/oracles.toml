@@ -342,10 +342,19 @@ Assets located 2026-08-07, all already owned — nothing needs downloading:
     Neither AmigaVision nor AmigaForever carries an SFS handler; the volume
     under test turned out to carry its own.
 
-Not yet built: the config that attaches an artifact, the guest-side script
-that writes a verdict to the shared volume, and the host-side parser. AFFS is
-the one to prove it on — Kickstart mounts FFS with no extra handler, and we
-already produce fs.affs.
+Built 2026-08-14 as `oracles/fsuae/affs_mount.py`: it unpacks the Workbench
+fixture to a host directory for DH0, writes the probe into its
+S/Startup-Sequence, generates the config, launches FS-UAE, polls for the
+sentinel and parses the guest's `Info`. Verified from FS-UAE's log to load the
+ROM, attach all three drives at boot priority 0 and present the artifact to
+Kickstart 3.1.
+
+What does not work yet is the guest end: S/Startup-Sequence never executes,
+RESULTS: stays empty, and the script reports exit 3 — a harness result, not a
+verdict — rather than inventing an answer. Ruled out already: the fixture's
+own Amiga Forever startup chain (the probe now replaces that file outright) and
+missing c: commands (Info/List/Echo are all present). Diagnosing further needs
+someone to watch the emulator window once; see the README's Status section.
 
 Cross-platform Amiga; WinUAE is Windows-only, so this is the portable choice.
 Installed on the Windows box (FS-UAE 3.0.5, a per-user install under
