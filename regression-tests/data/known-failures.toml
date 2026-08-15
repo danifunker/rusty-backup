@@ -28,23 +28,13 @@
 # finding id present in neither of those two documents, is reported as a
 # problem.
 
-# --- F-008 — backup accepts only flat-layout sources -------------------------
-# Filed as defect R-016 until 2026-08-09, when it was reclassified: `backup`
-# never claimed to decode containers, so this is a capability the engine does
-# not have rather than code disagreeing with itself. The cases stay exactly as
-# written — they assert the behaviour we want — and now cite the feature.
-[[known]]
-id = "backup.container.chd"
-finding = "F-008"
-[[known]]
-id = "backup.container.vhd-dynamic"
-finding = "F-008"
-[[known]]
-id = "backup.container.qcow2"
-finding = "F-008"
-[[known]]
-id = "backup.container.vmdk-sparse"
-finding = "F-008"
+# --- F-008 — backup accepts only flat-layout sources — SHIPPED 2026-08-15 ----
+# All four entries removed, and the section kept as the note that they were.
+# `backup` now decodes a container source to a scratch file before running the
+# ordinary local pipeline on it, so CHD / dynamic VHD / QCOW2 / sparse VMDK all
+# back up and produce partition images byte-identical to the raw baseline.
+# The four cases are unchanged — they always asserted the behaviour we wanted,
+# and XPASS is what said so.
 
 
 

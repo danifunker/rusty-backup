@@ -18,7 +18,7 @@ concrete reason to.
 | [F-005](#f-005) | Optical extract is CLI-only; the GUI cannot pull one file | `src/optical/browse_view.rs` | GUI parity with `optical extract` |
 | [F-006](#f-006) | IRIX support-disk building / browsing is thin | `src/cli/verbs/new_sgi_cdrom.rs` | bootable IRIX disc work — **needs scope** |
 | [F-007](#f-007) | No optical fixture with nested directories | `regression-tests/` | verifying `--path DIR --recursive` |
-| [F-008](#f-008) | `backup` reads only flat-layout sources | `src/cli/verbs/backup.rs` | backing up CHD / dynamic VHD / QCOW2 / VMDK — **four red cases** |
+| ~~F-008~~ | ~~`backup` reads only flat-layout sources~~ — **SHIPPED** 2026-08-15 | `src/cli/verbs/backup.rs` | — |
 | [F-009](#f-009) | SFS editor writes single-leaf extent b-trees only | `src/fs/sfs.rs` | editing any real-sized SFS volume |
 | ~~F-004~~ | ~~`show partmap` is APM-only~~ — **SHIPPED** 2026-08-08, same gap as R-026 | `src/cli/verbs/show.rs` | — |
 
@@ -229,6 +229,50 @@ are already catalogued — only the case is missing. It belongs in
 `cases/tier3/optical-extract.toml` beside the nine that exist.
 
 ## F-008 — `backup` reads only flat-layout sources {#f-008}
+
+**SHIPPED 2026-08-15.** `backup` now decodes a container source before the
+engine sees it, so all four formats in the table below work. The four cases
+went XPASS on the first run after the change and their `known-failures.toml`
+entries are gone — which leaves that file with **no entries at all**.
+
+The fix is the one this entry predicted: route through the decoding that
+already existed. It is done by mirroring the *remote* arm of
+`run_backup_from`, which had already solved the identical problem — the byte
+source is not a `File`, but two engine paths (single-file CHD output and the
+defrag-clone) are typed on one. So a container is decoded once to a scratch
+file in the destination directory, under a delete-guard, and the ordinary
+local pipeline runs on that.
+
+Two things that had to be right beyond "it exits 0":
+
+* **Block devices must not be probed.** Container detection is gated on
+  `path.is_file()` first. Probing `\.\PhysicalDrive0` would open it without
+  the elevation prompt the real path performs, and report a length of zero.
+* **The recorded size must be the virtual one.** `metadata.source_size_bytes`
+  is what `restore` reads back to size its target, so writing a QCOW2's
+  compressed file length there would mis-size every restore from that backup.
+  Decoding to a temp makes `total_size()` the virtual size for free; all six
+  sources now record 67108864 for the same 64 MB disk.
+
+Verified beyond exit codes: the partition images produced from CHD, dynamic
+VHD, QCOW2 and sparse VMDK are **byte-identical** (sha256) to those from the
+raw baseline, and `--format chd` — the default, and the path that needs a
+concrete `File` — works from a QCOW2 source.
+
+**Not yet verified on a real-world container.** `fs.hpfs.os2-warp45.hd`, the
+monolithicSparse VMDK named below, is not in the local corpus and needs a
+sync; only synthetic containers have been exercised.
+
+**A follow-up worth taking:** the decode is unconditional for containers, so
+`--format raw|zstd|gzip|lz4|vhd` pays a full disk copy it does not need. Those
+paths consume `Box<dyn ReadSeek>` already, so a `SourceFactory::Container`
+variant could stream them, leaving the temp only for CHD output and
+shrink-to-minimum. Filed as a note here rather than a new F-entry because the
+capability is present either way.
+
+---
+
+### The original report
 
 Filed as defect [R-016](Regression_Bugs.md#r-016) until 2026-08-09.
 **Reclassified**: `backup` has never claimed to decode containers, so this is
