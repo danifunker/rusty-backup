@@ -1007,6 +1007,11 @@ impl<R: Read + Seek + Send> Filesystem for Pfs3Filesystem<R> {
                 }
             };
             fe.modified = datestamp_string(de.cd as i32, de.cm as i32, de.ct as i32);
+            let unix =
+                super::affs_common::datestamp_to_unix(de.cd as i32, de.cm as i32, de.ct as i32);
+            if unix > 0 {
+                fe.modified_unix = Some(unix as u64);
+            }
             fe.amiga_protection = Some(de.protection as u32);
             if !de.comment.is_empty() {
                 fe.amiga_comment = Some(de.comment.clone());
@@ -3129,7 +3134,14 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Pf
     ) -> Result<FileEntry, FilesystemError> {
         let comment = options.amiga_comment.as_deref().unwrap_or("");
         let protection = options.amiga_protection.unwrap_or(0) as u8;
-        let dates = options.amiga_dates;
+        // Explicit amiga_dates always win; otherwise convert unix_times mtime
+        // so a cross-fs copy from a non-Amiga source (HFS+/ext/tar) still
+        // records the source date on PFS3.
+        let dates = options.amiga_dates.or_else(|| {
+            options
+                .unix_times
+                .map(|t| super::affs_common::unix_to_datestamp(t.mtime_or_now()))
+        });
         let snap = self.snapshot();
         match self.do_create_file(parent, name, data, data_len, comment, protection, dates) {
             Ok(fe) => Ok(fe),
@@ -3148,7 +3160,11 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Pf
     ) -> Result<FileEntry, FilesystemError> {
         let comment = options.amiga_comment.as_deref().unwrap_or("");
         let protection = options.amiga_protection.unwrap_or(0) as u8;
-        let dates = options.amiga_dates;
+        let dates = options.amiga_dates.or_else(|| {
+            options
+                .unix_times
+                .map(|t| super::affs_common::unix_to_datestamp(t.mtime_or_now()))
+        });
         let snap = self.snapshot();
         match self.do_create_directory(parent, name, comment, protection, dates) {
             Ok(fe) => Ok(fe),
@@ -3172,7 +3188,11 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Pf
     ) -> Result<FileEntry, FilesystemError> {
         let comment = options.amiga_comment.as_deref().unwrap_or("");
         let protection = options.amiga_protection.unwrap_or(0) as u8;
-        let dates = options.amiga_dates;
+        let dates = options.amiga_dates.or_else(|| {
+            options
+                .unix_times
+                .map(|t| super::affs_common::unix_to_datestamp(t.mtime_or_now()))
+        });
         let snap = self.snapshot();
         match self.do_create_symlink(parent, name, target, comment, protection, dates) {
             Ok(fe) => Ok(fe),
@@ -3192,7 +3212,11 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Pf
     ) -> Result<FileEntry, FilesystemError> {
         let comment = options.amiga_comment.as_deref().unwrap_or("");
         let protection = options.amiga_protection.unwrap_or(0) as u8;
-        let dates = options.amiga_dates;
+        let dates = options.amiga_dates.or_else(|| {
+            options
+                .unix_times
+                .map(|t| super::affs_common::unix_to_datestamp(t.mtime_or_now()))
+        });
         let snap = self.snapshot();
         match self.do_create_hardlink(parent, name, target, comment, protection, dates) {
             Ok(fe) => Ok(fe),

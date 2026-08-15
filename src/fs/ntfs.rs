@@ -1171,6 +1171,12 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
         let real_size = u64::from_le_bytes([
             data[48], data[49], data[50], data[51], data[52], data[53], data[54], data[55],
         ]);
+        // $FILE_NAME's LastModifiedTime lives at offset 16..24 — 8-byte FILETIME
+        // (100-ns intervals since 1601-01-01 UTC).
+        let modify_ft = u64::from_le_bytes([
+            data[16], data[17], data[18], data[19], data[20], data[21], data[22], data[23],
+        ]);
+        let modified_unix = super::times::filetime_to_unix(modify_ft);
         let name_length = data[64] as usize;
         let name_type = data[65]; // 0=POSIX, 1=Win32, 2=DOS, 3=Win32+DOS
 
@@ -1201,11 +1207,13 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
             format!("{parent_path}/{name}")
         };
 
-        if is_dir {
-            Some(FileEntry::new_directory(name, path, file_mft_ref))
+        let mut fe = if is_dir {
+            FileEntry::new_directory(name, path, file_mft_ref)
         } else {
-            Some(FileEntry::new_file(name, path, real_size, file_mft_ref))
-        }
+            FileEntry::new_file(name, path, real_size, file_mft_ref)
+        };
+        fe.modified_unix = modified_unix;
+        Some(fe)
     }
 
     // ---- fsck helpers (see ntfs_fsck.rs) ----
@@ -1364,6 +1372,7 @@ impl<R: Read + Seek + Send> Filesystem for NtfsFilesystem<R> {
             size: 0,
             location: MFT_RECORD_ROOT,
             modified: None,
+            modified_unix: None,
             type_code: None,
             creator_code: None,
             symlink_target: None,
@@ -3894,7 +3903,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
         name: &str,
         data: &mut dyn std::io::Read,
         data_len: u64,
-        _options: &CreateFileOptions,
+        options: &CreateFileOptions,
     ) -> Result<FileEntry, FilesystemError> {
         validate_ntfs_name(name)?;
 
@@ -3966,13 +3975,18 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
             }
         });
         // One stamp for both structures: Windows writes them equal at creation.
-        let now = now_ntfs_timestamp();
+        // `options.unix_times` (when set) is a source mtime from an import /
+        // cross-fs copy; fall back to wall-clock `now` for a genuinely new file.
+        let stamp = options
+            .unix_times
+            .map(|t| super::times::unix_to_filetime(t.mtime_or_now()))
+            .unwrap_or_else(now_ntfs_timestamp);
         let std_info = build_resident_attr(
             ATTR_STANDARD_INFORMATION,
-            &build_standard_information(FILE_ATTR_ARCHIVE, sec_id, now),
+            &build_standard_information(FILE_ATTR_ARCHIVE, sec_id, stamp),
         );
         let parent_ref = self.file_reference(parent_record_num);
-        let file_name_value = build_file_name_attr(parent_ref, name, false, data_len, now);
+        let file_name_value = build_file_name_attr(parent_ref, name, false, data_len, stamp);
         let file_name_attr = build_resident_attr(ATTR_FILE_NAME, &file_name_value);
 
         // 3.x resolves the ACL through $Secure by the inherited id; a per-file
@@ -4004,19 +4018,16 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
             format!("{}/{name}", parent.path)
         };
 
-        Ok(FileEntry::new_file(
-            name.to_string(),
-            path,
-            data_len,
-            record_num,
-        ))
+        let mut fe = FileEntry::new_file(name.to_string(), path, data_len, record_num);
+        fe.modified_unix = super::times::filetime_to_unix(stamp);
+        Ok(fe)
     }
 
     fn create_directory(
         &mut self,
         parent: &FileEntry,
         name: &str,
-        _options: &CreateDirectoryOptions,
+        options: &CreateDirectoryOptions,
     ) -> Result<FileEntry, FilesystemError> {
         validate_ntfs_name(name)?;
 
@@ -4043,13 +4054,16 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
             }
         });
         // Directories carry no archive bit; their directory flag lives in $FILE_NAME.
-        let now = now_ntfs_timestamp();
+        let stamp = options
+            .unix_times
+            .map(|t| super::times::unix_to_filetime(t.mtime_or_now()))
+            .unwrap_or_else(now_ntfs_timestamp);
         let std_info = build_resident_attr(
             ATTR_STANDARD_INFORMATION,
-            &build_standard_information(0, sec_id, now),
+            &build_standard_information(0, sec_id, stamp),
         );
         let parent_ref = self.file_reference(parent_record_num);
-        let file_name_value = build_file_name_attr(parent_ref, name, true, 0, now);
+        let file_name_value = build_file_name_attr(parent_ref, name, true, 0, stamp);
         let file_name_attr = build_resident_attr(ATTR_FILE_NAME, &file_name_value);
         let index_root = build_named_resident_attr(
             ATTR_INDEX_ROOT,
@@ -4089,7 +4103,9 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
             format!("{}/{name}", parent.path)
         };
 
-        Ok(FileEntry::new_directory(name.to_string(), path, record_num))
+        let mut fe = FileEntry::new_directory(name.to_string(), path, record_num);
+        fe.modified_unix = super::times::filetime_to_unix(stamp);
+        Ok(fe)
     }
 
     fn delete_entry(

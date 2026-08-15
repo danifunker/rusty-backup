@@ -67,12 +67,17 @@ pub struct AttrOverrides {
     pub mode: Option<u32>,
     pub uid: Option<u32>,
     pub gid: Option<u32>,
+    /// Preserved Unix mtime/atime/ctime from the source (host file,
+    /// tar Header, or source-image inode). Threaded through the shared
+    /// importer so `create_file` records the source's dates instead of
+    /// stamping the current time. See [`crate::fs::times::UnixTimes`].
+    pub unix_times: Option<super::times::UnixTimes>,
 }
 
 impl AttrOverrides {
     /// True when the caller specified nothing at all.
     pub fn is_empty(&self) -> bool {
-        self.mode.is_none() && self.uid.is_none() && self.gid.is_none()
+        self.mode.is_none() && self.uid.is_none() && self.gid.is_none() && self.unix_times.is_none()
     }
 }
 
@@ -511,6 +516,7 @@ mod tests {
                 mode: Some(0o755),
                 uid: Some(1),
                 gid: Some(2),
+                unix_times: None,
             },
             Some(&replaced),
             Some(&parent),
@@ -663,6 +669,7 @@ mod tests {
             mode: Some(0o640),
             uid: Some(0),
             gid: Some(0),
+            unix_times: None,
         };
         let parents = [entry_with(0o040_755, 99, 99), entry_with(0o040_700, 5, 5)];
         for parent in &parents {

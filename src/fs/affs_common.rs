@@ -17,6 +17,15 @@ pub const BSIZE_U64: u64 = BSIZE as u64;
 pub const HT_SIZE: usize = 72;
 /// Number of bitmap-block pointers stored inline in the root block.
 pub const BM_PAGES_ROOT: usize = 25;
+/// Bit words in one bitmap block: 128 longs, less the leading checksum.
+pub const BITMAP_WORDS_PER_BLOCK: usize = 127;
+/// Blocks one bitmap block accounts for. A volume larger than this needs
+/// several, chained through the root's `bm_pages` and then extension blocks —
+/// assuming one covers the whole volume is what R-008a/R-008b were.
+pub const BITMAP_BITS_PER_BLOCK: usize = BITMAP_WORDS_PER_BLOCK * 32;
+/// Bitmap-page pointers in one bitmap extension block: 128 longs, less the
+/// trailing pointer to the next extension block.
+pub const BM_EXT_PAGES: usize = 127;
 /// Number of data-block pointers per file header / extension block.
 pub const MAX_DATA_BLOCKS: usize = 72;
 /// Maximum file/dir name length on AFFS (DOS\0..DOS\5).
@@ -154,6 +163,22 @@ pub fn datestamp_to_unix(days: i32, mins: i32, ticks: i32) -> i64 {
     }
     let total_days = days as i64 + AMIGA_EPOCH_DAYS;
     total_days * SECS_PER_DAY + mins as i64 * 60 + ticks as i64 / 50
+}
+
+/// Inverse of [`datestamp_to_unix`] — pack Unix seconds into an AmigaDOS
+/// DateStamp `(days, mins, ticks)`. Pre-1978 clamps to (0, 0, 0). Ticks are
+/// zero on the output (Unix seconds are 1-second granular; the tick field
+/// would round-trip to zero anyway).
+pub fn unix_to_datestamp(unix_secs: u64) -> (i32, i32, i32) {
+    let days_since_1970 = unix_secs as i64 / SECS_PER_DAY;
+    let days = days_since_1970 - AMIGA_EPOCH_DAYS;
+    if days < 0 {
+        return (0, 0, 0);
+    }
+    let tod = unix_secs as i64 - days_since_1970 * SECS_PER_DAY;
+    let mins = (tod / 60) as i32;
+    let ticks = ((tod % 60) * 50) as i32;
+    (days as i32, mins, ticks)
 }
 
 /// Render `(days, mins, ticks)` as a human-readable UTC string.

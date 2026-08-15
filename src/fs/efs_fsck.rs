@@ -250,7 +250,7 @@ pub fn fsck_efs<R: Read + Seek>(fs: &mut EfsFilesystem<R>) -> Result<FsckResult,
                 );
                 continue;
             }
-            let bit = 7 - (blk % 8);
+            let bit = blk % 8;
             if bm[byte] & (1 << bit) != 0 {
                 b.err(
                     "BitmapMissingAllocation",
@@ -460,7 +460,7 @@ mod tests {
         }
         for b in [0u32, 1, 2, 18, 19, 25, total_blocks - 1] {
             let by = (b / 8) as usize;
-            let bb = 7 - (b % 8);
+            let bb = b % 8;
             img[bm_off + by] &= !(1 << bb);
         }
         // Mirror the primary SB into the replica slot.

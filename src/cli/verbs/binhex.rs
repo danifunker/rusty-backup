@@ -93,7 +93,7 @@ pub fn run_put(args: PutBinHexArgs) -> Result<()> {
     log_stderr(&ctx.label);
     let mut fs = ctx
         .open_editable(file)
-        .map_err(|e| anyhow!("opening filesystem for write: {e}"))?;
+        .map_err(|e| crate::cli::resolve::write_open_error("opening filesystem for write", e))?;
 
     // `--dst-dir` is the destination *directory* (the filename comes from the
     // BinHex header), resolved with the shared escape / colon grammar so a

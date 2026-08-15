@@ -12,6 +12,24 @@
 //! is hijacked to hold `direxts`, the number of inode slots actually used
 //! to point at indirect blocks. See Linux `fs/efs/inode.c::efs_map_block`.
 //!
+//! ## Free-space bitmap bit order
+//!
+//! The bitmap packs blocks **LSB-first** within each byte: block `N` is bit
+//! `N % 8` of byte `N / 8`, counting from the least significant bit. A **set**
+//! bit means FREE.
+//!
+//! This was MSB-first here until 2026-08-15, in the reader and the writer
+//! alike — so our formatter and our fsck agreed with each other and disagreed
+//! with IRIX, which is exactly the shape that hides a bug. IRIX's own fsck
+//! reported `BAD FREE LIST` on every volume we wrote (R-039).
+//!
+//! The order is not a matter of taste, and the evidence is worth keeping.
+//! Decoding a volume `mkfs_efs` wrote, LSB-first yields precisely the geometry
+//! the superblock declares — `firstcg=34` of reserved blocks, then exactly
+//! `cgisize` inode blocks at each of the `ncg` cylinder-group starts, then the
+//! spare tail bits marked allocated. MSB-first yields ragged runs on no
+//! boundary at all.
+//!
 //! References:
 //! - `~/xfs-efs/refs/efs-linux-5.15/efs/` — Linux kernel v5.15 EFS sources.
 //! - `docs/SGI_Filesystems.md` — implementation plan and on-disk notes.
@@ -437,6 +455,19 @@ impl EfsInode {
         }
     }
 
+    /// Current UNIX time in seconds, clamped into EFS's `u32` field. Used
+    /// wherever a new inode is stamped or an existing one is mutated
+    /// (`create_file` / `create_directory` / `create_symlink` / mkfs root /
+    /// parent-directory bumps on insert-delete-rename / `set_permissions` /
+    /// `set_owner`). Keeps the SystemTime dance in one place instead of
+    /// scattered across every write site.
+    pub(crate) fn now_u32() -> u32 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0) as u32
+    }
+
     /// Construct an empty/free inode (mode=0). Used when initializing
     /// freshly-allocated CG inode-table regions or zeroing an inode
     /// on delete.
@@ -495,6 +526,23 @@ impl<R: Read + Seek> EfsFilesystem<R> {
             &mut sector,
         )?;
         let sb = EfsSuperblock::parse(&sector)?;
+        // A volume whose superblock describes more blocks than the image holds
+        // is a truncated capture, not a filesystem. Reads of anything in the
+        // surviving prefix still work, so this warns rather than refuses — but
+        // without it the first allocation or fsck walk fails as an
+        // uninterpretable short read at a byte offset far past the end (R-029).
+        let available = reader
+            .seek(SeekFrom::End(0))?
+            .saturating_sub(partition_offset);
+        let declared = (sb.fs_size as u64).saturating_mul(EFS_BLOCKSIZE);
+        if declared > available {
+            log::warn!(
+                "EFS superblock declares {} blocks ({declared} bytes) but only {available} bytes \
+                 are present: this image is truncated. Reads inside the surviving prefix work; \
+                 anything that walks the whole volume (fsck, allocation) will run off the end.",
+                sb.fs_size,
+            );
+        }
         let label = sb.label();
         Ok(EfsFilesystem {
             reader,
@@ -804,8 +852,9 @@ impl<R: Read + Write + Seek> EfsFilesystem<R> {
             let mut run_len: u32 = 0;
             for bit in lo..hi {
                 let byte = (bit / 8) as usize;
-                let bit_in_byte = 7 - (bit % 8); // big-endian bit order, MSB first
-                                                 // set bit = FREE on real IRIX EFS, so a free block is bit==1.
+                // LSB-first within the byte, and set bit = FREE. See the
+                // module header on bit order — we had this backwards.
+                let bit_in_byte = bit % 8;
                 if (bm[byte] >> bit_in_byte) & 1 == 0 {
                     run_start = None;
                     run_len = 0;
@@ -817,7 +866,7 @@ impl<R: Read + Write + Seek> EfsFilesystem<R> {
                     // Mark bits [start..start+want_blocks) as in-use (clear).
                     for b in start..start + want_blocks {
                         let by = (b / 8) as usize;
-                        let bb = 7 - (b % 8);
+                        let bb = b % 8;
                         bm[by] &= !(1u8 << bb);
                     }
                     return Ok(EfsExtent {
@@ -845,7 +894,7 @@ impl<R: Read + Write + Seek> EfsFilesystem<R> {
             if by >= bm.len() {
                 break;
             }
-            let bb = 7 - (b % 8);
+            let bb = b % 8;
             bm[by] |= 1u8 << bb;
         }
     }
@@ -1107,7 +1156,7 @@ impl<R: Read + Write + Seek> EfsFilesystem<R> {
         if by >= bm.len() {
             return false;
         }
-        let bb = 7 - (bn % 8);
+        let bb = bn % 8;
         if bm[by] & (1u8 << bb) == 0 {
             return false; // already in use (set bit = free)
         }
@@ -1191,6 +1240,9 @@ impl<R: Read + Write + Seek> EfsFilesystem<R> {
         let res = (|| -> Result<(), FilesystemError> {
             let mut parent_inode = self.read_inode(parent_inum)?;
             self.dir_insert(&mut parent_inode, &mut bm, new_name, child_inum)?;
+            let now = EfsInode::now_u32();
+            parent_inode.mtime = now;
+            parent_inode.ctime = now;
             self.write_inode(&parent_inode)?;
             self.sb_dirty = true;
             Ok(())
@@ -1516,7 +1568,7 @@ impl<R: Read + Write + Seek> EfsFilesystem<R> {
         for (lo, hi) in regions.ranges() {
             for blk in lo..hi.min(total_bits) {
                 let by = (blk / 8) as usize;
-                let bb = 7 - (blk % 8);
+                let bb = blk % 8;
                 if bm[by] & (1u8 << bb) != 0 {
                     free += 1;
                 }
@@ -1569,13 +1621,26 @@ fn entry_from_inode(name: &str, parent_path: &str, ino: &EfsInode) -> FileEntry 
         format!("{parent_path}/{name}")
     };
     let size = if ino.is_dir() { 0 } else { ino.size as u64 };
+    let modified = if ino.mtime != 0 {
+        Some(crate::fs::unix_common::inode::format_unix_timestamp(
+            ino.mtime as i64,
+        ))
+    } else {
+        None
+    };
+    let modified_unix = if ino.mtime != 0 {
+        Some(ino.mtime as u64)
+    } else {
+        None
+    };
     FileEntry {
         name: name.to_string(),
         path,
         entry_type: ino.entry_type(),
         size,
         location: ino.inum as u64,
-        modified: None,
+        modified,
+        modified_unix,
         type_code: None,
         creator_code: None,
         symlink_target: None,
@@ -1634,19 +1699,33 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Ef
 
         let res = (|| -> Result<FileEntry, FilesystemError> {
             let inum = self.allocate_inode()?;
+            // Preserve the source's times when the caller supplied them
+            // (dir_import from a host file, tar_import from an archive,
+            // Commander stage_copy from another image); otherwise stamp now
+            // (a genuinely new file). See src/fs/times.rs.
+            let times = super::times::resolve_or_now(options.unix_times);
+            let now_secs = super::times::now_u32();
             let mut new_ino = EfsInode::empty(inum);
             new_ino.mode = options.mode.unwrap_or(0o100644) as u16;
             new_ino.nlink = 1;
             new_ino.uid = options.uid.unwrap_or(0) as u16;
             new_ino.gid = options.gid.unwrap_or(0) as u16;
+            new_ino.atime = times.atime_or_now() as u32;
+            new_ino.mtime = times.mtime_or_now() as u32;
+            new_ino.ctime = times.ctime_or_now() as u32;
 
             self.write_file_data(&mut bm, &mut new_ino, data, data_len)?;
             self.write_inode(&new_ino)?;
 
             // Link into parent. dir_insert may mutate parent_inode
-            // (extent growth on overflow), so re-read fresh.
+            // (extent growth on overflow), so re-read fresh. Adding an
+            // entry bumps the parent's dir-contents mtime + ctime — that
+            // is a *now* bump (the parent's directory changed just now),
+            // not the child's preserved time.
             let mut parent_ino = self.read_inode(parent_inum)?;
             self.dir_insert(&mut parent_ino, &mut bm, name_bytes, inum)?;
+            parent_ino.mtime = now_secs;
+            parent_ino.ctime = now_secs;
             self.write_inode(&parent_ino)?;
 
             self.sb.tinode = self.sb.tinode.saturating_sub(1);
@@ -1705,6 +1784,8 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Ef
 
         let res = (|| -> Result<FileEntry, FilesystemError> {
             let inum = self.allocate_inode()?;
+            let times = super::times::resolve_or_now(options.unix_times);
+            let now_secs = super::times::now_u32();
             let mut new_ino = EfsInode::empty(inum);
             // Symlinks are conventionally 0777 on IRIX. An explicit mode's
             // permission bits are honoured, but the type bits are ours to set
@@ -1713,6 +1794,9 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Ef
             new_ino.nlink = 1;
             new_ino.uid = options.uid.unwrap_or(0) as u16;
             new_ino.gid = options.gid.unwrap_or(0) as u16;
+            new_ino.atime = times.atime_or_now() as u32;
+            new_ino.mtime = times.mtime_or_now() as u32;
+            new_ino.ctime = times.ctime_or_now() as u32;
 
             let mut data = target.as_bytes();
             let len = data.len() as u64;
@@ -1721,6 +1805,8 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Ef
 
             let mut parent_ino = self.read_inode(parent_inum)?;
             self.dir_insert(&mut parent_ino, &mut bm, name_bytes, inum)?;
+            parent_ino.mtime = now_secs;
+            parent_ino.ctime = now_secs;
             self.write_inode(&parent_ino)?;
 
             self.sb.tinode = self.sb.tinode.saturating_sub(1);
@@ -1784,6 +1870,8 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Ef
             .expect("./.. always fits in one block");
             self.write_block(ext.bn, &initial)?;
 
+            let times = super::times::resolve_or_now(options.unix_times);
+            let now_secs = super::times::now_u32();
             let mut new_dir = EfsInode::empty(inum);
             new_dir.mode = options.mode.unwrap_or(0o040755) as u16;
             new_dir.nlink = 2; // `.` is the second link
@@ -1792,13 +1880,19 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Ef
             new_dir.size = EFS_BLOCKSIZE as u32;
             new_dir.numextents = 1;
             new_dir.extents[0] = ext;
+            new_dir.atime = times.atime_or_now() as u32;
+            new_dir.mtime = times.mtime_or_now() as u32;
+            new_dir.ctime = times.ctime_or_now() as u32;
             self.write_inode(&new_dir)?;
 
-            // Link into parent.
+            // Link into parent. Parent's dir-contents changed → bump
+            // mtime + ctime (a *now* bump — the parent changed just now),
+            // and nlink += 1 for the new dir's ".." back-link.
             let mut parent_inode = self.read_inode(parent_inum)?;
             self.dir_insert(&mut parent_inode, &mut bm, name_bytes, inum)?;
-            // Parent's nlink increases by 1 (the new dir's ".." back-link).
             parent_inode.nlink = parent_inode.nlink.saturating_add(1);
+            parent_inode.mtime = now_secs;
+            parent_inode.ctime = now_secs;
             self.write_inode(&parent_inode)?;
 
             self.sb.tinode = self.sb.tinode.saturating_sub(1);
@@ -1886,12 +1980,17 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Ef
             let zero = EfsInode::empty(entry_inum);
             self.write_inode(&zero)?;
 
-            // Directory parent's nlink decreases when we delete a
-            // child directory (its ".." back-link goes away).
+            // Parent dir-contents changed → mtime + ctime bump. If the target
+            // was a directory, its ".." back-link goes away too (parent nlink
+            // decreases). Always re-write the parent so file deletes also
+            // record the mtime bump (dir_remove only touched dir blocks).
+            let now = EfsInode::now_u32();
+            parent_inode.mtime = now;
+            parent_inode.ctime = now;
             if entry.is_directory() {
                 parent_inode.nlink = parent_inode.nlink.saturating_sub(1);
-                self.write_inode(&parent_inode)?;
             }
+            self.write_inode(&parent_inode)?;
 
             self.sb.tinode = self.sb.tinode.saturating_add(1);
             self.sb_dirty = true;
@@ -1958,8 +2057,15 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Ef
                     }
                     entries[slot].name = new_name_bytes.to_vec();
                     if let Some(new_block) = serialize_dir_block(&entries) {
-                        // Fits — commit the single-block rewrite.
+                        // Fits — commit the single-block rewrite, then bump
+                        // the parent's dir-contents mtime + ctime so a rename
+                        // doesn't leave the parent looking untouched.
                         self.write_block(bn, &new_block)?;
+                        let mut parent_ino = self.read_inode(parent_inum)?;
+                        let now = EfsInode::now_u32();
+                        parent_ino.mtime = now;
+                        parent_ino.ctime = now;
+                        self.write_inode(&parent_ino)?;
                         return Ok(());
                     }
                     // The longer name overflows this block. Fall back to
@@ -1982,6 +2088,8 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Ef
     fn set_permissions(&mut self, entry: &FileEntry, mode: u32) -> Result<(), FilesystemError> {
         let mut ino = self.read_inode(entry.location as u32)?;
         ino.mode = super::unix_common::inode::with_permission_bits(ino.mode as u32, mode) as u16;
+        // POSIX ctime bumps on metadata-only changes; atime/mtime untouched.
+        ino.ctime = EfsInode::now_u32();
         self.write_inode(&ino)
     }
 
@@ -1992,6 +2100,7 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Ef
         let mut ino = self.read_inode(entry.location as u32)?;
         ino.uid = uid as u16;
         ino.gid = gid as u16;
+        ino.ctime = EfsInode::now_u32();
         self.write_inode(&ino)
     }
 
@@ -2075,7 +2184,7 @@ fn repair_efs<R: Read + Write + Seek + Send>(
             ));
             continue;
         }
-        let bb = 7 - (blk % 8);
+        let bb = blk % 8;
         // set bit = free; mark as in-use by CLEARING the bit.
         bm[by] &= !(1 << bb);
         bitmap_fixes += 1;
@@ -2140,6 +2249,7 @@ fn adopt_orphans_into_lost_found<R: Read + Write + Seek + Send>(
                 size: 0,
                 location: 2,
                 modified: None,
+                modified_unix: None,
                 type_code: None,
                 creator_code: None,
                 symlink_target: None,
@@ -2348,6 +2458,7 @@ impl<R: Read + Seek + Send> Filesystem for EfsFilesystem<R> {
             size: ino.size as u64,
             location: EFS_ROOT_INODE as u64,
             modified: None,
+            modified_unix: None,
             type_code: None,
             creator_code: None,
             symlink_target: None,
@@ -2439,34 +2550,13 @@ impl<R: Read + Seek + Send> Filesystem for EfsFilesystem<R> {
                             } else {
                                 None
                             };
-                            let mut e = FileEntry {
-                                name,
-                                path,
-                                entry_type: child.entry_type(),
-                                size: child.size as u64,
-                                location: child_inum as u64,
-                                modified: None,
-                                type_code: None,
-                                creator_code: None,
-                                symlink_target,
-                                special_type: child.special_type(),
-                                mode: Some(child.mode as u32),
-                                uid: Some(child.uid as u32),
-                                gid: Some(child.gid as u32),
-                                resource_fork_size: None,
-                                aux_type: None,
-                                link_target_cnid: None,
-                                amiga_protection: None,
-                                amiga_comment: None,
-                                amiga_date: None,
-                                dos_attributes: None,
-                                finder_flags: None,
-                                prodos_file_type: None,
-                                mac_dates: None,
-                            };
-                            if matches!(e.entry_type, EntryType::Directory) {
-                                e.size = 0;
-                            }
+                            // Route through `entry_from_inode` so mtime/
+                            // modified_unix + special_type + mode/uid/gid land
+                            // consistently between the create_file return path
+                            // and the browse path.
+                            let mut e = entry_from_inode(&name, parent_path, &child);
+                            e.path = path;
+                            e.symlink_target = symlink_target;
                             entries.push(e);
                         }
                         Err(_) => {
@@ -3004,7 +3094,7 @@ pub fn write_blank_efs<W: Write + Seek>(
     {
         let mut mark_in_use = |blk: u32| {
             let by = (blk / 8) as usize;
-            let bit = 7 - (blk % 8) as u8;
+            let bit = (blk % 8) as u8;
             bitmap[by] &= !(1u8 << bit);
         };
         mark_in_use(0);
@@ -3035,6 +3125,12 @@ pub fn write_blank_efs<W: Write + Seek>(
     root.nlink = 2; // . and ..
     root.size = EFS_BLOCKSIZE as u32;
     root.numextents = 1;
+    // Stamp real timestamps so IRIX / tar / ls don't show "Dec 31 1969" for
+    // the volume root (R-039); the child-creation paths carry the same stamp.
+    let now = EfsInode::now_u32();
+    root.atime = now;
+    root.mtime = now;
+    root.ctime = now;
     root.extents[0] = EfsExtent {
         magic: 0,
         bn: root_dirblock,
@@ -3540,6 +3636,119 @@ mod tests {
         assert_eq!(streamed.len(), entry.size as usize);
     }
 
+    /// Newly-created files and directories must carry real timestamps, not
+    /// the epoch-zero the old empty()-then-mutate path left behind (R-039
+    /// / IRIX "Dec 31 1969" bug). The parent's mtime/ctime bumps too so a
+    /// tar of the volume reflects when the entry was actually added.
+    #[test]
+    fn create_file_stamps_timestamps_and_bumps_parent() {
+        use crate::fs::filesystem::{
+            CreateDirectoryOptions, CreateFileOptions, EditableFilesystem,
+        };
+        let img = create_blank_efs(1024 * 1024, "rb-efs").expect("format 1M EFS");
+        let mut fs = EfsFilesystem::open(Cursor::new(img), 0).expect("open");
+
+        // Capture wall clock *before* the writes; we compare it to the
+        // stamped seconds and allow a small forward drift for the second
+        // rollover between now and the write.
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("post-epoch")
+            .as_secs() as u32;
+
+        let root = fs.root().expect("root");
+        // Root inode (mkfs) must itself be non-zero — this is the case
+        // `tar -tvzf` displays for the volume root.
+        let root_ino_before = fs.read_inode(2).expect("root inode");
+        assert!(
+            root_ino_before.mtime > 0 && root_ino_before.ctime > 0 && root_ino_before.atime > 0,
+            "mkfs root inode times must not be zero: {root_ino_before:?}",
+        );
+
+        let file = fs
+            .create_file(
+                &root,
+                "HELLO",
+                &mut &b"hi"[..],
+                2,
+                &CreateFileOptions::default(),
+            )
+            .expect("create file");
+        let f_ino = fs.read_inode(file.location as u32).expect("file inode");
+        assert!(
+            f_ino.atime >= before && f_ino.mtime >= before && f_ino.ctime >= before,
+            "created file times must be >= before ({before}): {f_ino:?}",
+        );
+
+        let dir = fs
+            .create_directory(&root, "DIR", &CreateDirectoryOptions::default())
+            .expect("create dir");
+        let d_ino = fs.read_inode(dir.location as u32).expect("dir inode");
+        assert!(
+            d_ino.atime >= before && d_ino.mtime >= before && d_ino.ctime >= before,
+            "created dir times must be >= before ({before}): {d_ino:?}",
+        );
+
+        // Parent (root) picks up the mtime/ctime bump from both inserts.
+        let root_after = fs.read_inode(2).expect("root inode");
+        assert!(
+            root_after.mtime >= before && root_after.ctime >= before,
+            "root mtime/ctime must be bumped by the inserts: {root_after:?}",
+        );
+    }
+
+    /// The preservation path: when `CreateFileOptions.unix_times` is set (the
+    /// dir_import / tar_import / stage_copy cases), the driver must record
+    /// exactly those times, not stamp `now`. This is the write half of the
+    /// "extracting existing files should keep the source date" rule.
+    #[test]
+    fn create_file_preserves_unix_times_when_supplied() {
+        use crate::fs::filesystem::{CreateFileOptions, EditableFilesystem};
+        use crate::fs::times::UnixTimes;
+        let img = create_blank_efs(1024 * 1024, "rb-efs").expect("format 1M EFS");
+        let mut fs = EfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let root = fs.root().unwrap();
+
+        // 2020-01-01 00:00:00 UTC — a fixed non-now date the driver must
+        // record verbatim; the on-disk `mtime` field being ==  this value
+        // (not "close to now") is the whole point of the preservation path.
+        let src_mtime: u64 = 1_577_836_800;
+
+        let file = fs
+            .create_file(
+                &root,
+                "OLD",
+                &mut &b"hi"[..],
+                2,
+                &CreateFileOptions {
+                    unix_times: Some(UnixTimes::all(src_mtime)),
+                    ..Default::default()
+                },
+            )
+            .expect("create with preserved times");
+        let ino = fs.read_inode(file.location as u32).expect("file inode");
+        assert_eq!(
+            (ino.atime as u64, ino.mtime as u64, ino.ctime as u64),
+            (src_mtime, src_mtime, src_mtime),
+            "preserved unix_times must land verbatim on disk"
+        );
+
+        // Read back through the browse path: modified_unix carries the same
+        // seconds, so a subsequent tar_export / stage_copy carries the date
+        // end-to-end.
+        let listed = fs
+            .list_directory(&root)
+            .expect("list")
+            .into_iter()
+            .find(|e| e.name == "OLD")
+            .expect("browse OLD");
+        assert_eq!(
+            listed.modified_unix,
+            Some(src_mtime),
+            "list_directory must expose the preserved mtime as modified_unix"
+        );
+    }
+
     #[test]
     fn list_directory_descends_into_subdirectory() {
         // .desktop-IRIS (inode 22) is a subdirectory whose data block is
@@ -3761,7 +3970,7 @@ mod tests {
         let in_use_blocks = [0u32, 1, 2, 18, 19, total_blocks - 1];
         for b in in_use_blocks {
             let by = (b / 8) as usize;
-            let bb = 7 - (b % 8);
+            let bb = b % 8;
             img[bm_off + by] &= !(1 << bb);
         }
         img
@@ -3773,16 +3982,50 @@ mod tests {
         let mut fs = EfsFilesystem::open(Cursor::new(img), 0).expect("open");
         let bm = fs.read_bitmap().expect("read bitmap");
         assert_eq!(bm.len(), fs.sb.bmsize as usize);
-        // Convention: set bit = free. Block 0 (boot) is in-use so bit
-        // is clear; block 100 (inside free region) has bit set.
-        assert!(bm[0] & 0b1000_0000 == 0, "block 0 must be marked in-use");
-        assert!(bm[100 / 8] & (1 << (7 - (100 % 8))) != 0, "block 100 free");
+        // Convention: set bit = free, LSB-first within the byte. Block 0
+        // (boot) is in-use so bit 0 -- the LOW bit -- is clear; block 100
+        // (inside the free region) has its bit set.
+        assert!(bm[0] & 0b0000_0001 == 0, "block 0 must be marked in-use");
+        assert!(bm[100 / 8] & (1 << (100 % 8)) != 0, "block 100 free");
         // Round-trip: write back and re-read; expect identical bytes.
         let mut bm2 = bm.clone();
         bm2[5] = 0xFF;
         fs.write_bitmap(&bm2).expect("write bitmap");
         let bm3 = fs.read_bitmap().expect("re-read bitmap");
         assert_eq!(bm3, bm2);
+    }
+
+    /// The bitmap is LSB-first, pinned against bytes IRIX itself wrote.
+    ///
+    /// This exists because the driver had it MSB-first in the reader *and* the
+    /// writer, so every test that built its own fixture agreed with itself and
+    /// nothing caught it until IRIX's fsck said `BAD FREE LIST` (R-039). A
+    /// self-consistent convention cannot be tested by self-consistent
+    /// fixtures — so this test hard-codes real numbers off a `mkfs_efs`
+    /// volume instead of deriving them.
+    ///
+    /// Geometry of that volume: `fs_size=131062`, `firstcg=34`, `cgfsize=21838`,
+    /// `cgisize=779`, `ncg=6`, `bmsize=16383` bytes = 131064 bits.
+    #[test]
+    fn bitmap_bit_order_is_lsb_first_per_irix_mkfs() {
+        // 131064 bits cover 131062 blocks, so the top two bits of the final
+        // byte are spare and must read as in-use. IRIX writes 0x3F there:
+        // 0b0011_1111 -- bits 6 and 7 clear, counting from the LSB.
+        let last_byte: u8 = 0x3F;
+        let spare_lo = 131_062 % 8; // = 6
+        let spare_hi = 131_063 % 8; // = 7
+        assert_eq!((spare_lo, spare_hi), (6, 7));
+        assert!(
+            last_byte & (1 << spare_lo) == 0 && last_byte & (1 << spare_hi) == 0,
+            "spare tail bits must be in-use when read LSB-first"
+        );
+        // Read MSB-first the same byte claims those blocks are free, and
+        // marks two real blocks in-use instead. That is the bug this pins.
+        let msb = |bit: u32| 7 - (bit % 8);
+        assert!(
+            last_byte & (1 << msb(131_062)) != 0,
+            "MSB-first would call a nonexistent block free -- wrong order"
+        );
     }
 
     #[test]
@@ -3802,7 +4045,7 @@ mod tests {
         // in-use means bit is cleared).
         for b in 20..24 {
             let by = (b / 8) as usize;
-            let bb = 7 - (b % 8);
+            let bb = b % 8;
             assert!(bm[by] & (1 << bb) == 0, "block {b} not marked");
         }
         // A second alloc starts past the run we just took.
@@ -3819,7 +4062,7 @@ mod tests {
         // set bit = free; start fully in-use (all zeros) then set bit 50.
         let mut bm = vec![0u8; 32];
         let b = 50usize;
-        bm[b / 8] |= 1 << (7 - (b % 8));
+        bm[b / 8] |= 1 << (b % 8);
         let img = build_synthetic_for_bitmap_tests();
         let fs = EfsFilesystem::open(Cursor::new(img), 0).expect("open");
         let regions = EfsDataRegions::from_sb(&fs.sb);
@@ -3851,7 +4094,7 @@ mod tests {
         let first_free_bit = (0..sb.fs_size)
             .find(|blk| {
                 let by = (blk / 8) as usize;
-                by < bm.len() && bm[by] & (1 << (7 - (blk % 8))) != 0
+                by < bm.len() && bm[by] & (1 << (blk % 8)) != 0
             })
             .expect("fixture has free blocks");
         assert!(
@@ -3894,7 +4137,7 @@ mod tests {
         let raw_bits: u32 = (0..sb.fs_size)
             .filter(|blk| {
                 let by = (blk / 8) as usize;
-                by < bm.len() && bm[by] & (1 << (7 - (blk % 8))) != 0
+                by < bm.len() && bm[by] & (1 << (blk % 8)) != 0
             })
             .count() as u32;
 
@@ -3928,7 +4171,7 @@ mod tests {
         EfsFilesystem::<Cursor<Vec<u8>>>::free_extent_in_bitmap(&mut bm, &ext);
         for b in ext.bn..ext.bn + ext.length as u32 {
             let by = (b / 8) as usize;
-            let bb = 7 - (b % 8);
+            let bb = b % 8;
             assert!(bm[by] & (1 << bb) != 0, "block {b} still in-use after free");
         }
     }
@@ -4174,12 +4417,13 @@ mod tests {
         }
         for b in [0u32, 1, 2, 18, 19, 25, total_blocks - 1] {
             let by = (b / 8) as usize;
-            let bb = 7 - (b % 8);
+            let bb = b % 8;
             img[bm_off + by] &= !(1 << bb);
         }
 
         // Root inode (2) at byte (firstcg=18)*512 + 2*128.
         let ino2_off = 18 * 512 + 2 * 128;
+        let now = EfsInode::now_u32();
         let root = EfsInode {
             inum: 2,
             mode: 0o040755,
@@ -4187,9 +4431,9 @@ mod tests {
             uid: 0,
             gid: 0,
             size: 512,
-            atime: 0,
-            mtime: 0,
-            ctime: 0,
+            atime: now,
+            mtime: now,
+            ctime: now,
             gen: 0,
             numextents: 1,
             version: 0,
@@ -4712,7 +4956,7 @@ mod tests {
         let data_blk = file_ino.extents[0].bn;
         let mut bm = fs.read_bitmap().expect("bm");
         let by = (data_blk / 8) as usize;
-        let bb = 7 - (data_blk % 8);
+        let bb = data_blk % 8;
         bm[by] |= 1u8 << bb;
         fs.write_bitmap(&bm).expect("write bm");
 

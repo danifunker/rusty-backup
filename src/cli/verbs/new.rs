@@ -20,6 +20,14 @@ use anyhow::{Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
+/// The `--name` default every `new` subcommand shares.
+pub const DEFAULT_VOLUME_NAME: &str = "rusty-backup";
+
+/// ProDOS allows only letters, digits and `.`, so it cannot take the shared
+/// default and `new volume prodos` always failed with no arguments (R-006).
+/// Kept recognisably the same name rather than something generic.
+pub const PRODOS_DEFAULT_VOLUME_NAME: &str = "RUSTY.BACKUP";
+
 use crate::cli::logging::log_stderr;
 use crate::cli::parse::parse_size;
 use crate::fs::ntfs_format::{create_ntfs, NtfsFormatParams, NtfsGeometry};
@@ -347,7 +355,7 @@ pub struct FloppyArgs {
     pub size: String,
 
     /// Volume label/name. Defaults to `rusty-backup`.
-    #[arg(long, default_value = "rusty-backup")]
+    #[arg(long, default_value = DEFAULT_VOLUME_NAME)]
     pub name: String,
 
     /// HFS allocation block size in bytes (multiple of 512). Auto when unset.
@@ -413,7 +421,7 @@ pub struct VolumeArgs {
     pub size: String,
 
     /// Volume label/name. Defaults to `rusty-backup`.
-    #[arg(long, default_value = "rusty-backup")]
+    #[arg(long, default_value = DEFAULT_VOLUME_NAME)]
     pub name: String,
 
     /// HFS/HFS+ allocation block size in bytes (multiple of 512). Auto when unset.
@@ -550,7 +558,7 @@ pub struct NewArgs {
     /// Volume label/name. Defaults to `rusty-backup`. HFS: up to 27 Mac
     /// Roman bytes. FAT: up to 11 chars (uppercased; non-ASCII → `_`).
     /// EFS: 6-byte fname/fpack. AFFS: up to 30 bytes.
-    #[arg(long, default_value = "rusty-backup")]
+    #[arg(long, default_value = DEFAULT_VOLUME_NAME)]
     pub name: String,
 
     /// HFS allocation block size in bytes. Must be a non-zero multiple of
@@ -763,9 +771,19 @@ fn format_image(args: NewArgs) -> Result<()> {
         FsKind::Ext => write_blank_ext_image(&args.image, &args.size, &args.name, "ext2"),
         FsKind::Ext3 => write_blank_ext_image(&args.image, &args.size, &args.name, "ext3"),
         FsKind::Ext4 => write_blank_ext_image(&args.image, &args.size, &args.name, "ext4"),
-        FsKind::Prodos => format_and_write(&args.image, &args.size, &args.name, |size, name| {
-            crate::fs::prodos::create_blank_prodos(size, name)
-        }),
+        // ProDOS forbids '-', so the shared default is invalid there and the
+        // verb always failed with no arguments (R-006). Only the untouched
+        // default is substituted — an explicit --name still gets a real error.
+        FsKind::Prodos => {
+            let name = if args.name == DEFAULT_VOLUME_NAME {
+                PRODOS_DEFAULT_VOLUME_NAME
+            } else {
+                &args.name
+            };
+            format_and_write(&args.image, &args.size, name, |size, name| {
+                crate::fs::prodos::create_blank_prodos(size, name)
+            })
+        }
         FsKind::Atari => format_and_write(&args.image, &args.size, &args.name, |_size, _name| {
             Ok(crate::fs::atari_dos::create_blank_atari_sd())
         }),

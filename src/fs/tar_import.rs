@@ -365,13 +365,27 @@ pub fn preflight_tar<R: Read>(
 /// `tar` -> `untar` round-trip lose ownership outright and directory
 /// modes with it.
 fn archived_overrides(header: &tar::Header, apply: bool) -> crate::fs::attrs::AttrOverrides {
+    // Header mtime is always harvested (independent of `apply_permissions`)
+    // so a tar extract carries the source date end-to-end. atime/ctime are
+    // not in the tar format, so the driver stamps them the same as mtime
+    // via UnixTimes' `_or_now` accessors. `0` mtime is dropped — that's
+    // the "no date" case tar emits when the source didn't record one.
+    let unix_times = header
+        .mtime()
+        .ok()
+        .filter(|&m| m > 0)
+        .map(super::times::UnixTimes::mtime_only);
     if !apply {
-        return crate::fs::attrs::AttrOverrides::default();
+        return crate::fs::attrs::AttrOverrides {
+            unix_times,
+            ..Default::default()
+        };
     }
     crate::fs::attrs::AttrOverrides {
         mode: header.mode().ok().map(|m| m & 0o7777),
         uid: header.uid().ok().map(|v| v as u32),
         gid: header.gid().ok().map(|v| v as u32),
+        unix_times,
     }
 }
 

@@ -1,0 +1,131 @@
+# Tier 3 — `optical extract` beyond "it extracted something".
+#
+# The optical fixtures were asserted shallowly for a long time: `info` opened
+# and `browse` listed, which proves a disc parses and proves nothing about the
+# bytes coming back off it. These pull files out and check them.
+#
+# `optical.iso9660.joliet.cd` is the workhorse: one file at the root of an ISO
+# 9660 volume, so a single-file extract is unambiguous and the whole-disc form
+# has exactly one entry to produce. Its sha256 is the anchor — a truncated or
+# mis-offset read fails on content rather than on exit code.
+
+[meta]
+tier = 3
+group = "optical.extract"
+description = "Single-file, folder, archive and filesystem-selection extraction."
+
+[[case]]
+id = "optical.extract.whole-disc"
+description = "The existing whole-disc form still works, unchanged by --path"
+fixture = "optical.iso9660.joliet.cd"
+timeout_ms = 300000
+[[case.step]]
+args = ["optical", "extract", "{fixture}", "--to", "{scratch}/all"]
+expect_exit = 0
+[[case.step]]
+args = ["optical", "browse", "{fixture}"]
+expect_exit = 0
+files_exist = ["{scratch}/all/CIV_II_GOLD_111_UPDATE.SIT"]
+
+[[case]]
+id = "optical.extract.single-file-by-path"
+description = "--path pulls one named file, and the bytes match the whole-disc extract"
+fixture = "optical.iso9660.joliet.cd"
+timeout_ms = 300000
+[[case.step]]
+args = [
+  "optical", "extract", "{fixture}",
+  "--to", "{scratch}/one",
+  "--path", "/CIV_II_GOLD_111_UPDATE.SIT",
+]
+expect_exit = 0
+file_sha256 = [
+  { path = "{scratch}/one/CIV_II_GOLD_111_UPDATE.SIT", sha256 = "cb251f01aef8b05198f80b14db9a583258908849181a8ef71ac8880c92b28244" },
+]
+
+[[case]]
+id = "optical.extract.path-is-case-insensitive"
+description = "ISO 9660 upper-cases names; a user reads them off browse and should not have to match case"
+fixture = "optical.iso9660.joliet.cd"
+timeout_ms = 300000
+[[case.step]]
+args = [
+  "optical", "extract", "{fixture}",
+  "--to", "{scratch}/ci",
+  "--path", "/civ_ii_gold_111_update.sit",
+]
+expect_exit = 0
+files_exist = ["{scratch}/ci/CIV_II_GOLD_111_UPDATE.SIT"]
+
+[[case]]
+id = "optical.extract.missing-path-is-not-found"
+description = "A path that is not on the disc exits 3, and leaves no destination behind"
+fixture = "optical.iso9660.joliet.cd"
+timeout_ms = 300000
+[[case.step]]
+args = [
+  "optical", "extract", "{fixture}",
+  "--to", "{scratch}/nope",
+  "--path", "/NO/SUCH/FILE.TXT",
+]
+expect_exit = 3
+
+[[case]]
+id = "optical.extract.tar-archive"
+description = "The archive form writes a readable gzip tarball rather than loose files"
+fixture = "optical.iso9660.joliet.cd"
+timeout_ms = 300000
+[[case.step]]
+args = ["optical", "extract", "{fixture}", "--tar", "{scratch}/disc.tar.gz"]
+expect_exit = 0
+files_exist = ["{scratch}/disc.tar.gz"]
+
+[[case]]
+id = "optical.extract.tar-and-to-are-exclusive"
+description = "Two destinations is a usage error, not a silent preference for one"
+fixture = "optical.iso9660.joliet.cd"
+timeout_ms = 300000
+[[case.step]]
+args = [
+  "optical", "extract", "{fixture}",
+  "--to", "{scratch}/both",
+  "--tar", "{scratch}/both.tar",
+]
+expect_exit = 2
+
+[[case]]
+id = "optical.extract.needs-a-destination"
+description = "Neither --to nor --tar is a usage error rather than a no-op success"
+fixture = "optical.iso9660.joliet.cd"
+timeout_ms = 300000
+[[case.step]]
+args = ["optical", "extract", "{fixture}"]
+expect_exit = 2
+
+[[case]]
+id = "optical.extract.filesystem-index-out-of-range"
+description = "An index past the end names the real limit and points at `optical info`, rather than opening the wrong volume"
+fixture = "optical.iso9660.joliet.cd"
+timeout_ms = 300000
+[[case.step]]
+args = [
+  "optical", "extract", "{fixture}",
+  "--to", "{scratch}/ix",
+  "--filesystem-index", "9",
+]
+expect_exit = 2
+stderr_contains = ["out of range"]
+
+[[case]]
+id = "optical.extract.hfs-refused-on-a-pc-disc"
+description = "Asking for the Mac side of a disc that has none must say so, not silently extract the ISO tree"
+fixture = "optical.iso9660.joliet.cd"
+timeout_ms = 300000
+[[case.step]]
+args = [
+  "optical", "extract", "{fixture}",
+  "--to", "{scratch}/hfs",
+  "--filesystem", "hfs",
+]
+expect_exit = 1
+stderr_contains = ["no HFS filesystem"]

@@ -43,18 +43,21 @@ args = ["inspect", "{scratch}/v.img", "--format", "yaml"]
 expect_exit = 0
 stdout_contains = ["schema_version"]
 
-# --- Known finding R-005 -----------------------------------------------------
+# --- R-005 -------------------------------------------------------------------
 # output.rs documents that on error the envelope is still emitted, with
 # status.error true, status.code carrying the exit code, and result null.
-# Today a failing verb under --format json writes nothing to stdout and a
-# plain-text error to stderr, so a JSON consumer gets nothing parseable on
+# A failing verb under --format json used to write nothing to stdout and a
+# plain-text error to stderr, so a JSON consumer got nothing parseable on
 # exactly the path the envelope exists to serve.
 [[case]]
 id = "cli.envelope.error-envelope-on-failure"
-description = "R-005: a failing verb under --format json should still emit an error envelope"
+description = """R-005: a failing verb under --format json still emits an error
+envelope. expect_exit was 1 until 2026-08-09, which contradicted
+cli.exit.missing-image-file — a missing image is NOT_FOUND, and exit.rs has
+reserved 3 for it all along. Corrected rather than weakened."""
 [[case.step]]
 args = ["inspect", "{scratch}/does-not-exist.img", "--format", "json"]
-expect_exit = 1
+expect_exit = 3
 expect_envelope_ok = false
 
 # --- Known finding R-003 -----------------------------------------------------

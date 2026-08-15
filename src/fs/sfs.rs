@@ -948,8 +948,16 @@ impl<R: Read + Seek + Send> Filesystem for SfsFilesystem<R> {
             // re-derive first-data via lookup_object_block at read time.
             let _ = obj.data_or_hashtable;
             let _ = obj.protection;
-            let _ = obj.datemodified;
             let _ = obj.comment;
+            // SFS `datemodified` is 32-bit seconds since 1978-01-01. Shift
+            // into the Unix epoch for `modified_unix` + tar_export.
+            if obj.datemodified > 0 {
+                const AMIGA_EPOCH_SECS: u64 = 252_460_800; // 1978-01-01 UTC
+                fe.modified_unix = Some(AMIGA_EPOCH_SECS + obj.datemodified as u64);
+                fe.modified = Some(super::unix_common::inode::format_unix_timestamp(
+                    fe.modified_unix.unwrap() as i64,
+                ));
+            }
             if obj.is_link() {
                 // Mark with size 0; we don't follow softlinks yet.
                 fe.size = 0;
@@ -1361,6 +1369,21 @@ impl<R: Read + Seek> Read for CompactSfsReader<R> {
 const FS_EXTENTBNODE_SIZE: usize = 14;
 const FS_OBJECTNODE_SIZE: usize = 10;
 
+/// The SFS editor's ceiling, reported as `Unsupported` rather than `Parse`.
+///
+/// A `Parse` error blamed the disk and exited 1, indistinguishable from a
+/// corrupt image — R-034's shape. The volume is intact and reads fine; only
+/// writing is refused. `Unsupported` routes through `write_open_error` to
+/// PERMISSION_DENIED (4). Tracked as F-009.
+fn multi_leaf_unsupported() -> FilesystemError {
+    FilesystemError::Unsupported(
+        "SFS extent b-tree has interior nodes; this editor writes single-leaf trees only, \
+         which any volume of real size outgrows. The volume is intact and readable — only \
+         writing is refused."
+            .to_string(),
+    )
+}
+
 impl SfsRootBlock {
     /// Write the rootblock fields into the first portion of the block
     /// buffer. The `ownblock` field is left intact (callers stamp it).
@@ -1627,9 +1650,7 @@ impl<R: Read + Seek> SfsFilesystem<R> {
         let isleaf = buf[14];
         let nodesize = buf[15] as usize;
         if isleaf == 0 {
-            return Err(parse_err(
-                "extent_btree_insert: only single-leaf BNDC supported",
-            ));
+            return Err(multi_leaf_unsupported());
         }
         if nodesize != FS_EXTENTBNODE_SIZE {
             return Err(parse_err(format!(
@@ -1680,9 +1701,7 @@ impl<R: Read + Seek> SfsFilesystem<R> {
         let isleaf = buf[14];
         let nodesize = buf[15] as usize;
         if isleaf == 0 {
-            return Err(parse_err(
-                "extent_btree_remove: only single-leaf BNDC supported",
-            ));
+            return Err(multi_leaf_unsupported());
         }
         let entries_off = 16;
         let mut found: Option<usize> = None;
@@ -1854,6 +1873,35 @@ impl<R: Read + Seek> SfsFilesystem<R> {
     }
 }
 
+/// SFS-native datemodified is seconds since 1978-01-01 UTC (the Amiga epoch,
+/// same as `AMIGA_EPOCH_SECS` used on the read side).
+const SFS_AMIGA_EPOCH_SECS: u64 = 252_460_800;
+
+/// Pick the on-disk `datemodified` for a new object. Explicit `amiga_dates`
+/// wins (the Amiga-tools path); otherwise convert `unix_times.mtime_or_now()`;
+/// otherwise zero (matching pre-existing behaviour — SFS creates recorded
+/// `datemodified = 0` for every new file, which SFSFuse renders as 1978-01-01).
+fn sfs_date_from_options(
+    amiga: Option<(i32, i32, i32)>,
+    unix: Option<super::times::UnixTimes>,
+) -> u32 {
+    if let Some((days, mins, ticks)) = amiga {
+        let unix_secs = super::affs_common::datestamp_to_unix(days, mins, ticks).max(0) as u64;
+        return sfs_date_from_unix(unix_secs);
+    }
+    if let Some(t) = unix {
+        return sfs_date_from_unix(t.mtime_or_now());
+    }
+    0
+}
+
+fn sfs_date_from_unix(unix_secs: u64) -> u32 {
+    if unix_secs < SFS_AMIGA_EPOCH_SECS {
+        return 0;
+    }
+    ((unix_secs - SFS_AMIGA_EPOCH_SECS).min(u32::MAX as u64)) as u32
+}
+
 /// Encode an fsObject for write. Returns the encoded bytes (length is even).
 fn build_object(
     objectnode: u32,
@@ -1897,6 +1945,7 @@ impl<R: Read + Write + Seek + Send> SfsFilesystem<R> {
         &mut self,
         parent: &FileEntry,
         name: &str,
+        sfs_date: u32,
     ) -> Result<FileEntry, FilesystemError> {
         check_no_duplicate(self, parent, name)?;
         let parent_node = parent.location as u32;
@@ -1910,7 +1959,7 @@ impl<R: Read + Write + Seek + Send> SfsFilesystem<R> {
             FIBF_READ | FIBF_WRITE | FIBF_EXECUTE | FIBF_DELETE,
             0,
             0,
-            0,
+            sfs_date,
             OTYPE_DIR,
             name,
             "",
@@ -1930,7 +1979,7 @@ impl<R: Read + Write + Seek + Send> SfsFilesystem<R> {
             FIBF_READ | FIBF_WRITE | FIBF_EXECUTE | FIBF_DELETE,
             0,
             0,
-            0,
+            sfs_date,
             OTYPE_DIR,
             name,
             "",
@@ -1942,11 +1991,11 @@ impl<R: Read + Write + Seek + Send> SfsFilesystem<R> {
         } else {
             format!("{}/{}", parent.path, name)
         };
-        Ok(FileEntry::new_directory(
-            name.to_string(),
-            path,
-            new_node as u64,
-        ))
+        let mut fe = FileEntry::new_directory(name.to_string(), path, new_node as u64);
+        if sfs_date > 0 {
+            fe.modified_unix = Some(SFS_AMIGA_EPOCH_SECS + sfs_date as u64);
+        }
+        Ok(fe)
     }
 
     fn do_create_file(
@@ -1955,6 +2004,7 @@ impl<R: Read + Write + Seek + Send> SfsFilesystem<R> {
         name: &str,
         data: &mut dyn std::io::Read,
         data_len: u64,
+        sfs_date: u32,
     ) -> Result<FileEntry, FilesystemError> {
         check_no_duplicate(self, parent, name)?;
         let parent_node = parent.location as u32;
@@ -1991,7 +2041,7 @@ impl<R: Read + Write + Seek + Send> SfsFilesystem<R> {
             FIBF_READ | FIBF_WRITE | FIBF_EXECUTE | FIBF_DELETE,
             first_data,
             data_len as u32,
-            0,
+            sfs_date,
             0,
             name,
             "",
@@ -2008,7 +2058,7 @@ impl<R: Read + Write + Seek + Send> SfsFilesystem<R> {
             FIBF_READ | FIBF_WRITE | FIBF_EXECUTE | FIBF_DELETE,
             first_data,
             data_len as u32,
-            0,
+            sfs_date,
             0,
             name,
             "",
@@ -2020,12 +2070,11 @@ impl<R: Read + Write + Seek + Send> SfsFilesystem<R> {
         } else {
             format!("{}/{}", parent.path, name)
         };
-        Ok(FileEntry::new_file(
-            name.to_string(),
-            path,
-            data_len,
-            new_node as u64,
-        ))
+        let mut fe = FileEntry::new_file(name.to_string(), path, data_len, new_node as u64);
+        if sfs_date > 0 {
+            fe.modified_unix = Some(SFS_AMIGA_EPOCH_SECS + sfs_date as u64);
+        }
+        Ok(fe)
     }
 
     fn do_rename(
@@ -2409,10 +2458,14 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Sf
         name: &str,
         data: &mut dyn std::io::Read,
         data_len: u64,
-        _options: &super::filesystem::CreateFileOptions,
+        options: &super::filesystem::CreateFileOptions,
     ) -> Result<FileEntry, FilesystemError> {
+        // SFS stores its datemodified as seconds since 1978-01-01 (the Amiga
+        // epoch). Cross-fs copy passes source mtime through unix_times, or an
+        // explicit amiga_dates gives (days, mins, ticks) since 1978.
+        let sfs_date = sfs_date_from_options(options.amiga_dates, options.unix_times);
         let snap = self.snapshot();
-        match self.do_create_file(parent, name, data, data_len) {
+        match self.do_create_file(parent, name, data, data_len, sfs_date) {
             Ok(fe) => Ok(fe),
             Err(e) => {
                 self.restore_snapshot(snap);
@@ -2425,10 +2478,11 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Sf
         &mut self,
         parent: &FileEntry,
         name: &str,
-        _options: &super::filesystem::CreateDirectoryOptions,
+        options: &super::filesystem::CreateDirectoryOptions,
     ) -> Result<FileEntry, FilesystemError> {
+        let sfs_date = sfs_date_from_options(options.amiga_dates, options.unix_times);
         let snap = self.snapshot();
-        match self.do_create_directory(parent, name) {
+        match self.do_create_directory(parent, name, sfs_date) {
             Ok(fe) => Ok(fe),
             Err(e) => {
                 self.restore_snapshot(snap);

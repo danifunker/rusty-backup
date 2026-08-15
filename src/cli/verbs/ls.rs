@@ -7,10 +7,12 @@
 
 use anyhow::{anyhow, bail, Result};
 use clap::Args;
+use serde::Serialize;
 
 use crate::cli::glob::{collect_matches, compile_patterns};
 use crate::cli::img_at::ImageRef;
 use crate::cli::logging::{log_stderr, out_stdout};
+use crate::cli::output::{emit_csv_or_tsv, emit_envelope, Envelope, OutputFormat};
 use crate::cli::resolve::{resolve_partition_streaming_forced_inside, FsDispatchOverride};
 use crate::fs::filesystem::Filesystem;
 
@@ -74,8 +76,63 @@ pub struct LsArgs {
     #[arg(long = "inside", value_name = "NAME")]
     pub inside: Option<String>,
 
+    /// Output format. `ls` is flat-tabular, so csv and tsv are in scope
+    /// alongside json and yaml.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text, global = false)]
+    pub format: OutputFormat,
+
     #[command(flatten)]
     pub fs_override: FsDispatchOverride,
+}
+
+/// One listing row. Every field is always present so the CSV header is stable
+/// across volumes; a filesystem that carries none of a column leaves it null.
+#[derive(Debug, Serialize)]
+struct LsRow {
+    kind: &'static str,
+    name: String,
+    size: u64,
+    type_code: Option<String>,
+    creator_code: Option<String>,
+    mode: Option<String>,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    owner: Option<String>,
+}
+
+impl LsRow {
+    fn from_entry(
+        entry: &crate::fs::entry::FileEntry,
+        display_name: &str,
+        id_names: Option<&crate::fs::id_names::IdNameMap>,
+    ) -> Self {
+        Self {
+            kind: if entry.is_directory() { "DIR" } else { "FILE" },
+            name: display_name.to_string(),
+            size: entry.size,
+            type_code: entry.type_code_display(),
+            creator_code: entry.creator_code_display(),
+            mode: entry.mode_string(),
+            uid: entry.uid,
+            gid: entry.gid,
+            // Resolving ids to names needs the image's own passwd/group, which
+            // is only read under `--owner`.
+            owner: match (id_names, entry.uid, entry.gid) {
+                (Some(names), Some(u), Some(g)) => Some(names.format_owner(u, g)),
+                _ => None,
+            },
+        }
+    }
+}
+
+/// Emit collected rows in a structured format. Text never reaches here — it
+/// stays on [`print_entry`] so its column layout is untouched.
+fn emit_rows(format: OutputFormat, rows: &[LsRow]) -> Result<()> {
+    match format {
+        OutputFormat::Json | OutputFormat::Yaml => emit_envelope(format, &Envelope::ok(rows)),
+        OutputFormat::Csv | OutputFormat::Tsv => emit_csv_or_tsv(format, rows),
+        OutputFormat::Text => unreachable!("text is printed as it goes"),
+    }
 }
 
 pub fn run(args: LsArgs) -> Result<()> {
@@ -83,7 +140,7 @@ pub fn run(args: LsArgs) -> Result<()> {
     // the filesystem and returns the listing; we never pull raw blocks.
     #[cfg(feature = "remote")]
     if let Some(rref) = crate::remote::RemoteRef::parse(&args.image.path.to_string_lossy()) {
-        return remote_ls(&rref, args.image.partition, &args.path);
+        return remote_ls(&rref, args.image.partition, &args.path, args.format);
     }
 
     let pw_bytes = args.password.as_deref().map(|s| s.as_bytes());
@@ -156,10 +213,17 @@ pub fn run(args: LsArgs) -> Result<()> {
             excludes.extend(compile_patterns(ex, case_insensitive)?);
         }
         let matches = collect_matches(&mut *fs, &includes, &excludes)?;
-        for (_, entry, full) in matches {
-            print_entry(&entry, &full, args.owner.then_some(&id_names));
+        if args.format == OutputFormat::Text {
+            for (_, entry, full) in matches {
+                print_entry(&entry, &full, args.owner.then_some(&id_names));
+            }
+            return Ok(());
         }
-        return Ok(());
+        let rows: Vec<LsRow> = matches
+            .iter()
+            .map(|(_, entry, full)| LsRow::from_entry(entry, full, args.owner.then_some(&id_names)))
+            .collect();
+        return emit_rows(args.format, &rows);
     }
 
     // Literal path: directory listing.
@@ -170,10 +234,17 @@ pub fn run(args: LsArgs) -> Result<()> {
     let children = fs
         .list_directory(&entry)
         .map_err(|e| anyhow!("list_directory: {e}"))?;
-    for c in children {
-        print_entry(&c, &c.name, args.owner.then_some(&id_names));
+    if args.format == OutputFormat::Text {
+        for c in children {
+            print_entry(&c, &c.name, args.owner.then_some(&id_names));
+        }
+        return Ok(());
     }
-    Ok(())
+    let rows: Vec<LsRow> = children
+        .iter()
+        .map(|c| LsRow::from_entry(c, &c.name, args.owner.then_some(&id_names)))
+        .collect();
+    emit_rows(args.format, &rows)
 }
 
 /// Remote directory listing over an `rb://` reference. Lists either the
@@ -185,6 +256,7 @@ fn remote_ls(
     rref: &crate::remote::RemoteRef,
     partition: Option<crate::cli::img_at::PartSelector>,
     path: &str,
+    format: OutputFormat,
 ) -> Result<()> {
     if has_glob_chars(path) {
         bail!("glob patterns aren't supported over rb:// yet (literal paths only)");
@@ -199,19 +271,52 @@ fn remote_ls(
             bail!("no such path on the remote: {}", rref.path);
         }
         if is_dir {
-            for entry in session.list_host_dir(&rref.path)? {
-                print_wire_entry(&entry);
-            }
-            return Ok(());
+            return emit_wire_entries(format, &session.list_host_dir(&rref.path)?);
         }
     }
 
     let opened = session.open_image(&rref.path, partition)?;
     log_stderr(opened.label);
-    for entry in session.list_dir(opened.handle, path)? {
-        print_wire_entry(&entry);
+    let entries = session.list_dir(opened.handle, path)?;
+    emit_wire_entries(format, &entries)
+}
+
+/// Emit a remote listing in the requested format, matching the local shapes.
+#[cfg(feature = "remote")]
+fn emit_wire_entries(
+    format: OutputFormat,
+    entries: &[crate::remote::protocol::WireEntry],
+) -> Result<()> {
+    if format == OutputFormat::Text {
+        for entry in entries {
+            print_wire_entry(entry);
+        }
+        return Ok(());
     }
-    Ok(())
+    let rows: Vec<LsRow> = entries.iter().map(wire_row).collect();
+    emit_rows(format, &rows)
+}
+
+#[cfg(feature = "remote")]
+fn wire_row(entry: &crate::remote::protocol::WireEntry) -> LsRow {
+    LsRow {
+        kind: if entry.is_dir() { "DIR" } else { "FILE" },
+        name: entry.name.clone(),
+        size: entry.size,
+        type_code: crate::fs::entry::display_file_type(
+            entry.type_code.as_ref(),
+            entry.prodos_file_type,
+        ),
+        creator_code: entry
+            .creator_code
+            .as_ref()
+            .map(crate::fs::hfs_common::decode_ostype),
+        // The wire protocol carries no mode / ownership today.
+        mode: None,
+        uid: None,
+        gid: None,
+        owner: None,
+    }
 }
 
 /// Mirror of [`print_entry`] for a [`crate::remote::protocol::WireEntry`].

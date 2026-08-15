@@ -330,6 +330,16 @@ pub struct CreateFileOptions {
     /// its conventional default (FAT/exFAT use archive). See
     /// [`crate::fs::entry::FileEntry::dos_attributes`].
     pub dos_attributes: Option<u16>,
+    /// Preserve these Unix timestamps (seconds since 1970) on the new
+    /// inode instead of stamping the current time. Set by `dir_import` /
+    /// `tar_import` / Commander `stage_copy` so a copy carries the
+    /// source's mtime through end-to-end; left `None` for a genuinely new
+    /// file (rb-cli `put` from a `-` stdin stream, GUI "new blank file"),
+    /// where the driver stamps `now`. Ignored on filesystems that don't
+    /// carry per-file Unix times (FAT/exFAT/NTFS have their own scheme,
+    /// AmigaDOS uses `amiga_dates`, HFS uses `mac_dates`). See
+    /// [`crate::fs::times::UnixTimes`].
+    pub unix_times: Option<super::times::UnixTimes>,
 }
 
 /// Options for creating a directory on an editable filesystem.
@@ -347,6 +357,9 @@ pub struct CreateDirectoryOptions {
     pub amiga_comment: Option<String>,
     /// AmigaDOS raw datestamp triple. See `CreateFileOptions::amiga_dates`.
     pub amiga_dates: Option<(i32, i32, i32)>,
+    /// Preserve these Unix timestamps on the new directory inode. See
+    /// [`CreateFileOptions::unix_times`] for the full rule.
+    pub unix_times: Option<super::times::UnixTimes>,
 }
 
 /// Source for resource fork data (HFS/HFS+ only).

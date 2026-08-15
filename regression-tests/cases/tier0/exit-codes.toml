@@ -68,6 +68,63 @@ expect_exit = 2
 # documents present behaviour rather than inventing a requirement.
 [[case]]
 id = "cli.exit.missing-image-file"
-description = "inspect on a nonexistent image exits 1 (current documented-free behaviour)"
+description = """inspect on a nonexistent image exits 3. exit.rs reserves
+NOT_FOUND for exactly this ("image file missing"), and cli.flags.inspect-accepts-fs-type
+depends on it to tell "the flag parsed and the file was absent" from "the flag
+was rejected". This case asserted 1 until 2026-08-08, describing itself as
+"current documented-free behaviour" — it pinned the status quo rather than the
+contract, and the two cases contradicted each other once R-010 was fixed."""
 args = ["inspect", "{scratch}/does-not-exist.img"]
-expect_exit = 1
+expect_exit = 3
+
+# --- R-036: one condition, three exit codes ----------------------------------
+# `exit.rs` reserves NOT_FOUND (3) for "image file missing" — its own first
+# example. R-010 made `inspect` obey it (cli.exit.missing-image-file, green).
+# Nothing else does: most verbs exit 1 with a raw platform-specific io::Error,
+# and `locate` / `tar` exit 2, which claims the *command* was malformed when it
+# was well-formed and named a file that is not there.
+#
+# One case per verb, because each is a separate contract a script switches on.
+# All red until R-036 is fixed.
+
+[[case]]
+id = "cli.exit.ls-missing-image-is-not-found"
+description = "R-036: ls on a nonexistent image should exit 3, not 1"
+args = ["ls", "{scratch}/does-not-exist.img"]
+expect_exit = 3
+
+[[case]]
+id = "cli.exit.du-missing-image-is-not-found"
+description = "R-036: du on a nonexistent image should exit 3, not 1"
+args = ["du", "{scratch}/does-not-exist.img"]
+expect_exit = 3
+
+[[case]]
+id = "cli.exit.fsck-missing-image-is-not-found"
+description = "R-036: fsck on a nonexistent image should exit 3, not 1"
+args = ["fsck", "{scratch}/does-not-exist.img", "--checkonly"]
+expect_exit = 3
+
+[[case]]
+id = "cli.exit.show-fs-info-missing-image-is-not-found"
+description = "R-036: show fs-info on a nonexistent image should exit 3, not 1"
+args = ["show", "fs-info", "{scratch}/does-not-exist.img"]
+expect_exit = 3
+
+[[case]]
+id = "cli.exit.locate-missing-image-is-not-found"
+description = "R-036: locate on a nonexistent image exits 3, not 1"
+args = ["locate", "{scratch}/does-not-exist.img", "/anything"]
+expect_exit = 3
+
+[[case]]
+id = "cli.exit.tar-missing-image-is-not-found"
+description = """R-036: tar on a nonexistent image exits 3.
+
+First written with two positionals, which made clap reject it as a usage error
+before the image was ever opened — the case asserted 3 and got a correct 2 for
+the wrong reason. `tar` takes IMAGE, SRC and OUT. Corrected deliberately, and
+the finding's table corrected with it: `tar` was never a real 2, it was a
+malformed command in the survey."""
+args = ["tar", "{scratch}/does-not-exist.img", "/", "{scratch}/out.tar"]
+expect_exit = 3

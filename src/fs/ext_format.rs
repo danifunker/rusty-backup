@@ -515,7 +515,8 @@ fn write_blank_ext<W: Write + Seek>(
         } else {
             0
         };
-        let mut jinode = build_inode_bytes(inode_size, 0o100600, 0, 0, jsize, 1, flags, &j.iblock);
+        let mut jinode =
+            build_inode_bytes(inode_size, 0o100600, 0, 0, jsize, 1, flags, &j.iblock, None);
         if inode_size >= INODE_SIZE_EXT4 {
             le16w(&mut jinode, 0x80, EXTRA_ISIZE); // i_extra_isize
         }
@@ -575,6 +576,7 @@ fn build_dir_inode(l: &Ext2Layout, mode: u32, links: u16, dir_block: u64) -> Vec
         links,
         flags,
         &iblock,
+        None, // fresh mkfs stamp = now
     );
     if l.inode_size >= INODE_SIZE_EXT4 {
         le16w(&mut inode, 0x80, EXTRA_ISIZE); // i_extra_isize

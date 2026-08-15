@@ -495,7 +495,12 @@ pub fn shrink_sgi_disk_to_chd(
         );
     }
     if dst.extension().and_then(|s| s.to_str()) != Some("chd") {
-        anyhow::bail!("output path must end in .chd (got {})", dst.display());
+        // Refusing a wrong output extension is usage-bad-input, so it carries
+        // USAGE_ERROR rather than the catch-all 1 (R-004).
+        return Err(crate::cli::exit::usage(format!(
+            "output path must end in .chd (got {})",
+            dst.display()
+        )));
     }
     if let Some(parent) = dst.parent() {
         if !parent.as_os_str().is_empty() && !parent.exists() {

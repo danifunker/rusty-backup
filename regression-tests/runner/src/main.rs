@@ -16,6 +16,7 @@ mod gitinfo;
 mod inventory;
 mod known;
 mod local;
+mod oracles;
 mod manifest;
 mod parity;
 mod plan;
@@ -36,6 +37,12 @@ struct Args {
     command: Command,
     cases_dir: PathBuf,
     rb_cli: PathBuf,
+    identify: bool,
+    detect: bool,
+    set_oracle: Option<String>,
+    no_prompt: bool,
+    scan_host: Option<String>,
+    export: bool,
     fixture_root: Option<PathBuf>,
     sync_from: Option<PathBuf>,
     sync: bool,
@@ -65,6 +72,8 @@ enum Command {
     Plan,
     /// Take inventory of the fixture corpus and report which cases it enables.
     Fixtures,
+    /// Detect / export this host's oracle availability.
+    Oracles,
     /// Build every artifact rb-cli can write, on whatever OS is running.
     Produce,
     /// Compare artifacts produced on different OSes. Needs no oracle.
@@ -122,6 +131,12 @@ fn parse_args() -> Result<Args, String> {
         command: Command::Help,
         cases_dir: base.join("cases"),
         rb_cli: default_rb_cli(&base),
+        identify: false,
+        detect: false,
+        set_oracle: None,
+        no_prompt: false,
+        scan_host: None,
+        export: false,
         fixture_root: None,
         sync_from: None,
         sync: false,
@@ -148,6 +163,7 @@ fn parse_args() -> Result<Args, String> {
             "validate" => args.command = Command::Validate,
             "plan" => args.command = Command::Plan,
             "fixtures" => args.command = Command::Fixtures,
+            "oracles" => args.command = Command::Oracles,
             "produce" => args.command = Command::Produce,
             "verify" => args.command = Command::Verify,
             "parity" => {
@@ -174,6 +190,10 @@ fn parse_args() -> Result<Args, String> {
             "--allow-hardware" => args.allow_hardware = true,
             "--keep-scratch" => args.keep_scratch = true,
             "--sync" => args.sync = true,
+            "--identify" => args.identify = true,
+            "--detect" => args.detect = true,
+            "--no-prompt" => args.no_prompt = true,
+            "--export" => args.export = true,
             "--require-clean" => args.require_clean = true,
             "--check" => args.check = true,
             "--verbose" | "-v" => args.verbose = true,
@@ -214,6 +234,14 @@ fn parse_args() -> Result<Args, String> {
                     }
                     "--verifications" => {
                         args.verifications_root = PathBuf::from(value()?);
+                        i += 1;
+                    }
+                    "--scan" => {
+                        args.scan_host = Some(value()?);
+                        i += 1;
+                    }
+                    "--set" => {
+                        args.set_oracle = Some(value()?);
                         i += 1;
                     }
                     "--filter" => {
@@ -288,6 +316,10 @@ COMMANDS:
     list         List the cases that would run, without running them
     validate     Parse every manifest and report problems; runs nothing
     fixtures     Inventory the corpus: what is present, verified, and runnable
+    oracles      Detect this host's third-party tools (--detect; asks about
+                 emulators it cannot find, --no-prompt to stay quiet), scan a
+                 MiSTer's cores over ssh (--scan <host-id>), record one by hand
+                 (--set <id>=<path>), or print it (--export)
     plan         Map requirements onto the machines that exist
     produce      Build every artifact rb-cli can write, twice, into <artifacts>/<os>
     parity       Compare artifacts across producer OSes; needs no oracle
@@ -308,6 +340,10 @@ OPTIONS:
                            `corpus_source` into the fixture root first. Runs
                            read local disk; the source is touched only here.
     --sync-from <DIR>      (fixtures) same, from an explicit directory
+    --identify             (fixtures) confirm each fixture really holds what
+                           its catalogue row claims, via rb-cli inspect
+                           --expect-fs / --expect-layout. Rows that declare
+                           nothing are skipped. Exits 1 on any mismatch.
     --verbose, -v          (fixtures) list every blocked case and unused fixture
     --report-root <DIR>    Where bundles are written[default: regression-tests/runs]
     --scratch-root <DIR>   Working directory root   [default: regression-tests/scratch]
@@ -350,6 +386,7 @@ fn main() {
         Command::Query(ref q) => cmd_query(&args, q),
         Command::Plan => cmd_plan(&args),
         Command::Fixtures => cmd_fixtures(&args),
+        Command::Oracles => cmd_oracles(&args),
         Command::Produce => cmd_produce(&args),
         Command::Parity(ref root) => cmd_parity(&args, root),
         Command::Verify => cmd_verify(&args),
@@ -435,6 +472,32 @@ inventory: {}", out.display());
         Err(e) => eprintln!("warning: could not serialise inventory: {}", e),
     }
 
+    // Identity: does each fixture actually hold what its row claims? Opt-in,
+    // because it opens every declaring fixture and some are hundreds of MB.
+    let mut identity_failures = 0usize;
+    if args.identify {
+        let cache = args.scratch_root.join("_fixture-cache");
+        let checks = fixtures::check_identities(&catalog, &args.rb_cli, &cache);
+        if checks.is_empty() {
+            println!(
+                "
+identity: no fixture declares expect_fs / expect_layout yet -                  nothing to check"
+            );
+        } else {
+            let bad: Vec<_> = checks.iter().filter(|c| !c.ok).collect();
+            println!(
+                "
+identity: {} of {} declaring fixture(s) confirmed",
+                checks.len() - bad.len(),
+                checks.len()
+            );
+            for c in &bad {
+                println!("  MISMATCH  {:<44} {}", c.id, c.detail);
+            }
+            identity_failures = bad.len();
+        }
+    }
+
     let corrupt = inv
         .fixtures
         .iter()
@@ -445,7 +508,7 @@ inventory: {}", out.display());
     // against a fixture we intend to source is a legitimate way to record the
     // want — the IMZ password cases exist exactly so that requirement stops
     // being invisible in a formats.toml notes field.
-    if corrupt > 0 {
+    if corrupt > 0 || identity_failures > 0 {
         1
     } else {
         0
@@ -963,14 +1026,21 @@ fn cmd_validate(args: &Args) -> i32 {
                 }
             }
             // Every expected failure must name a recorded cause, or it is just
-            // a disabled test wearing a label.
-            let bugs = fs::read_to_string(base.join("..").join("docs").join("Regression_Bugs.md"))
-                .unwrap_or_default();
+            // a disabled test wearing a label. A cause is either a defect
+            // (Regression_Bugs.md) or a capability the engine has never
+            // claimed (missing_features_from_regression.md) — a case pinned to
+            // an unimplemented feature is red for a reason, just not a bug.
+            let docs = base.join("..").join("docs");
+            let bugs = fs::read_to_string(docs.join("Regression_Bugs.md")).unwrap_or_default();
+            let features =
+                fs::read_to_string(docs.join("missing_features_from_regression.md"))
+                    .unwrap_or_default();
             if !bugs.is_empty() {
                 for (id, f) in k.all_entries() {
-                    if !bugs.contains(f) {
+                    if !bugs.contains(f) && !features.contains(f) {
                         known_problems.push(format!(
-                            "known-failures.toml: '{}' cites finding {}, which is not in docs/Regression_Bugs.md",
+                            "known-failures.toml: '{}' cites {}, which is in neither \
+                             docs/Regression_Bugs.md nor docs/missing_features_from_regression.md",
                             id, f
                         ));
                     }
@@ -1619,4 +1689,242 @@ fn sanitise_id(id: &str) -> String {
             }
         })
         .collect()
+}
+
+fn cmd_oracles(args: &Args) -> i32 {
+    let base = regression_dir();
+    let reg = match registry::Registry::load(&base) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return 2;
+        }
+    };
+    let platform = exec::platform_token();
+    let path = oracles::overlay_path(&base);
+
+    if let Some(host_id) = &args.scan_host {
+        let (cfg, _, _) = local::load(&base);
+        let host = match cfg.hosts.iter().find(|h| &h.id == host_id) {
+            Some(h) => h,
+            None => {
+                eprintln!(
+                    "no host {host_id:?} in local.toml. Known: {}",
+                    cfg.hosts
+                        .iter()
+                        .map(|h| h.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                return 2;
+            }
+        };
+        let target = match &host.ssh {
+            Some(t) => t.clone(),
+            None => {
+                eprintln!("host {host_id:?} has no `ssh` target in local.toml");
+                return 2;
+            }
+        };
+        // One ssh call, listing the cores. The board's IP and key live in
+        // local.toml like every other machine address — nothing new to
+        // configure, and nothing that could reach a public repo.
+        let listing = match exec::ssh_capture(
+            &target,
+            "ls /media/fat/_Computer/*.rbf 2>/dev/null | xargs -n1 basename",
+        ) {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("scan {host_id}: {e}");
+                return 1;
+            }
+        };
+        let present: Vec<String> = listing
+            .lines()
+            .map(|l| oracles::core_base_name(l.trim()))
+            .filter(|l| !l.is_empty())
+            .collect();
+        let scan = oracles::match_cores(&reg, &present);
+        println!(
+            "{host_id}: {} core(s) on the board, {} matched to an oracle",
+            scan.cores.len(),
+            scan.matched.len()
+        );
+        for (o, c) in &scan.matched {
+            println!("  {:<26} {}", o, c);
+        }
+        for (o, c) in &scan.missing {
+            println!("  MISSING  {:<17} needs core {}", o, c);
+        }
+        let body = oracles::render_mister(&scan, &host.platform, &today_stamp());
+        // Merge into the overlay rather than replacing it: the board's cores
+        // and this box's tools are both availability, and a scan must not
+        // discard what --detect found.
+        let existing = fs::read_to_string(oracles::overlay_path(&base)).unwrap_or_default();
+        let mut merged = String::new();
+        for block in existing.split("[[availability]]") {
+            if scan.matched.iter().any(|(o, _)| block.contains(&format!("oracle = {:?}", o))) {
+                continue;
+            }
+            if merged.is_empty() {
+                merged.push_str(block);
+            } else {
+                merged.push_str("[[availability]]");
+                merged.push_str(block);
+            }
+        }
+        merged.push_str(&body);
+        match oracles::write(&base, &merged) {
+            Ok(p) => {
+                println!("
+wrote {}", p.display());
+                return 0;
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                return 2;
+            }
+        }
+    }
+
+    if let Some(spec) = &args.set_oracle {
+        let (oracle, path) = match spec.split_once('=') {
+            Some(p) => p,
+            None => {
+                eprintln!("--set needs <oracle>=<path>, e.g. --set fs-uae=\"C:/Emulators/FS-UAE/fs-uae.exe\"");
+                return 2;
+            }
+        };
+        if !reg.oracles.iter().any(|o| o.id == oracle) {
+            eprintln!("no oracle named {oracle:?} in data/oracles.toml");
+            return 2;
+        }
+        let kind = reg
+            .oracles
+            .iter()
+            .find(|o| o.id == oracle)
+            .map(|o| o.kind.as_str())
+            .unwrap_or("package");
+        // An emulator with a binary still needs a guest; say `installed`.
+        let status = if kind == "emulator" { "installed" } else { "verified" };
+        let existing = fs::read_to_string(oracles::overlay_path(&base)).unwrap_or_default();
+        match oracles::set_hint(&existing, oracle, path, platform, &today_stamp(), status) {
+            Ok(body) => match oracles::write(&base, &body) {
+                Ok(p) => {
+                    println!("{oracle}: {status}  {path}");
+                    println!("wrote {}", p.display());
+                    return 0;
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return 2;
+                }
+            },
+            Err(e) => {
+                eprintln!("error: {e}");
+                return 2;
+            }
+        }
+    }
+
+    if args.export {
+        match fs::read_to_string(&path) {
+            Ok(t) => {
+                print!("{}", t);
+                return 0;
+            }
+            Err(_) => {
+                eprintln!(
+                    "no overlay at {} - run `rb-regress oracles --detect` first",
+                    path.display()
+                );
+                return 1;
+            }
+        }
+    }
+
+    if !args.detect {
+        println!("oracles: {} declared in data/oracles.toml", reg.oracles.len());
+        println!("overlay: {}", path.display());
+        println!("  --detect   probe this host and rewrite the overlay");
+        println!("  --export   print it, to seed another machine");
+        return 0;
+    }
+
+    let hints = oracles::hints_for(&reg, platform);
+    let mut found = oracles::detect(&reg, &hints, platform);
+    // Ask about the emulators we could not find, but only on a terminal: the
+    // harness also runs in CI and over ssh, where a prompt nobody answers is
+    // indistinguishable from a hang. --no-prompt forces the quiet path.
+    let interactive = {
+        use std::io::IsTerminal;
+        !args.no_prompt && std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+    };
+    if interactive {
+        let stdin = std::io::stdin();
+        let mut lock = stdin.lock();
+        let mut outv = std::io::stdout();
+        let filled = oracles::prompt_for_missing(&mut found, &reg, &mut lock, &mut outv);
+        if filled > 0 {
+            println!("
+recorded {filled} path(s) you provided");
+        }
+    }
+    let today = today_stamp();
+    let body = oracles::render(&found, platform, &today);
+    match oracles::write(&base, &body) {
+        Ok(p) => {
+            let n = |s: &str| found.iter().filter(|d| d.status == s).count();
+            println!(
+                "detected on {}: {} verified, {} installed, {} manual, {} absent (of {})",
+                platform,
+                n("verified"),
+                n("installed"),
+                n("manual"),
+                n("absent"),
+                found.len()
+            );
+            // `installed` was omitted here, which hid the four emulators the
+            // search had just found — a report that leaves out its best news.
+            for d in found
+                .iter()
+                .filter(|d| d.status == "verified" || d.status == "installed")
+            {
+                println!(
+                    "  {:<12} {:<10} {}",
+                    d.oracle,
+                    d.status,
+                    d.resolved.as_deref().unwrap_or("")
+                );
+            }
+            println!("\nwrote {}", p.display());
+            0
+        }
+        Err(e) => {
+            eprintln!("error: {}", e);
+            2
+        }
+    }
+}
+
+/// UTC date, for the `verified_on` stamp.
+fn today_stamp() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = secs / 86_400;
+    // Civil-from-days (Howard Hinnant's algorithm), so the stamp needs no
+    // date crate for one field.
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{:04}-{:02}-{:02}", y, m, d)
 }

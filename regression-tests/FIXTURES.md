@@ -257,6 +257,145 @@ structure under test rather than storing a whole game or install disc.
 
 Track the total in the catalogue; the run report prints it.
 
+### Oracles: what they are vs whether you have them
+
+Same split as the corpus, for the same reason.
+
+| file | tracked? | holds |
+|------|----------|-------|
+| `data/oracles.toml` | **yes** | what an oracle *is* — tool, kind, what it proves, the `check` command |
+| `data/oracles.local.toml` | **no**, gitignored | whether *this* machine has it, and where |
+
+```bash
+rb-regress oracles --detect    # probe this host, rewrite the overlay
+rb-regress oracles --set fs-uae=/path/to/fs-uae    # provide one by hand
+rb-regress oracles --export    # print it, to seed another machine
+```
+
+**Scanning a MiSTer.** The board is just another host in `local.toml` — give
+that entry an `ssh` target and:
+
+```bash
+rb-regress oracles --scan mister-core
+```
+
+It lists `/media/fat/_Computer/*.rbf`, strips MiSTer's `_YYYYMMDD` build-date
+suffix (which moves on every board update, so the bare name is the only stable
+identifier), and matches what it finds against the `core` field on each
+`mister-core-*` oracle. Cores present are recorded `verified`; cores the
+registry names and the board lacks are reported as **MISSING** rather than
+quietly skipped. Results merge into the overlay, so a scan never discards what
+`--detect` found on this machine.
+
+The core names were read off a real board, not guessed — `Ti994a`, not
+`TI-99_4A`, and `CoCo3` rather than `CoCo2`.
+
+Nothing new to configure: the board's address and key are in `local.toml` with
+every other machine, which is the one file that never reaches the repo.
+
+**Finding emulators.** They install as apps, not commands, so `PATH` alone
+never finds them. `--detect` also searches the platform's usual roots —
+`%ProgramFiles%`, `C:/Tools`, `C:/Emulators` on Windows; `/Applications` (into
+`.app/Contents/MacOS`) on macOS; `/opt` and `~/.local/bin` on Linux — one level
+deep. Point it somewhere else with `RB_EMULATOR_DIRS`, which takes the
+platform's path separator and needs no edit to anything.
+
+If it still cannot find one, `--detect` **asks**, and writes what you give it.
+Only for emulators, and only on a terminal:
+
+- **Only emulators**, because that is the case where the tool *is* installed and
+  we merely cannot see it. A package oracle that came back absent is genuinely
+  not installed — prompting there would be 18 questions to reach the 5 that matter.
+- **Only on a terminal**, because the harness runs in CI and over ssh, where a
+  prompt nobody answers is indistinguishable from a hang. `--no-prompt` forces
+  the quiet path.
+
+A blank answer skips; a path that does not exist is refused and re-asked rather
+than written and discovered weeks later as a silent skip.
+
+A `--set` hint is sticky: it survives re-detection, which is the point. Note the
+check is only that the path *exists* — nothing verifies it is the program you
+named, so a wrong path stays wrong until you overwrite it.
+
+An emulator whose binary is found records **`installed`**, not `verified`: the
+binary alone does not make the oracle runnable, since it still needs a
+configured guest. `verified` would overclaim and `manual` would hide it.
+
+An overlay row replaces the tracked one for the same `(oracle, platform)`.
+
+**Why the split.** A path like `D:/ROMs/Amiga/Shared/rom` was committed to a
+public repo because availability lived in the tracked file. Machine paths are
+neither portable nor publishable; the tracked registry now carries no
+`path_hint` at all. Re-running `--detect` preserves hints you have already
+recorded, because it reads them back from the merged registry.
+
+**Two things `--detect` deliberately will not do:**
+
+- A `mount` oracle is the *kernel's* opinion, so it is only probed on
+  Linux / WSL / the MiSTer HPS. Probing the program name on Windows found
+  Cygwin's unrelated `mount` and called AFFS "verified" — a confidently wrong
+  answer, which is the worst kind here.
+- An emulator or MiSTer core is recorded `manual`, not `absent`. `which` cannot
+  find a running guest, and "absent" would read as a missing install rather
+  than a different kind of oracle.
+
+A `path_hint` may name the program or the directory holding it — `chdman`'s is
+a directory, and testing it as a file reported the tool missing on a box that
+has it.
+
+### Declaring what a fixture is
+
+The catalogue's last three columns let a row state its own identity, and
+`rb-regress fixtures --identify` enforces it by running `rb-cli inspect`:
+
+| column | meaning |
+|--------|---------|
+| `expect_fs` | the filesystem it must identify as (`HPFS`, `DOS 3.3`, …) |
+| `expect_layout` | `superfloppy`, `partitioned`, or a scheme name (`mbr`, `rdb`, …) |
+| `fs_type` | a `--fs-type` preset the fixture needs to be identifiable at all — CP/M disks carry no signature |
+
+**Why this exists.** `origin = harvested-verified` used to mean "`rb-cli inspect`
+opened it", which a universal reader says about *anything*: an Apple DOS fixture
+that was really a bare bootloader with no VTOC passed that bar and sat in the
+corpus for weeks (R-031). "It opened" is not identification.
+
+Rows that declare nothing are skipped, so populating is incremental. Three
+groups are deliberately left undeclared:
+
+- **optical discs** — `inspect` is the wrong verb for them; `optical info` reads
+  them. A separate check could cover those.
+- **encrypted images** (`fmt.gho.password`, `fmt.imz.encrypted`) — identifying
+  them needs a password the catalogue does not carry.
+- **`fs.apple-dos.invaders.floppy`** — it would fail, correctly. Its ID claims a
+  filesystem it does not have. The honest fix is renaming the fixture, not
+  weakening the check.
+
+An `--identify` run is slower than a plain inventory: it opens every declaring
+fixture, expanding compressed ones through the same per-run cache a case uses.
+
+### Hosts that cannot reach the share
+
+`--sync` assumes the host can see `corpus_source`. Not all of them can: on the
+Linux and macOS oracle hosts `corpus_source` is deliberately **commented out**,
+and their corpus was `scp`'d over from the orchestrating box. Runs there read
+local disk like everywhere else; only the distribution differs.
+
+Admitting a fixture therefore takes three steps per such host:
+
+1. `scp` the file into `fixtures/` (or `fixtures-large/`).
+2. **Append the catalogue row to that host's `fixture-map.tsv`.** It is
+   gitignored, so it does not arrive with `git pull`. Miss this and the file is
+   present, the case still reports `skip-fixture`, and the run stays green with
+   a quietly smaller pass count.
+3. `rb-regress fixtures` on the host — expect `N catalogued - N verified, 0
+   missing, 0 CORRUPT`.
+
+Because a missing fixture degrades to `skip-fixture` rather than a failure, a
+host that never got the sync stays green while covering less than its peers.
+`rb-regress consolidate` reports that directly, as **COVERAGE SKEW** — cases
+that ran on some hosts and skipped on others. Read it rather than eyeballing
+pass counts.
+
 ### The large-fixture annex
 
 Some formats have no small specimen. A UDF DVD-Video is 483 MB and cannot be

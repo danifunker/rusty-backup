@@ -178,6 +178,9 @@ impl Os9Ident {
 struct FileDescriptor {
     attributes: u8,
     size: u64,
+    /// FD.DAT (last-modified) — 5 bytes at offset 3: year-1900, month, day,
+    /// hour, minute. All zero when not recorded.
+    dat: [u8; 5],
     /// Segment list: `(lsn, sector_count)` runs.
     segments: Vec<(u64, u64)>,
 }
@@ -185,6 +188,7 @@ struct FileDescriptor {
 impl FileDescriptor {
     fn parse(fd: &[u8]) -> FileDescriptor {
         let attributes = fd[0];
+        let dat = [fd[3], fd[4], fd[5], fd[6], fd[7]];
         let size = u32::from_be_bytes([fd[9], fd[10], fd[11], fd[12]]) as u64;
         let mut segments = Vec::new();
         let mut off = SEG_LIST_OFFSET;
@@ -203,6 +207,7 @@ impl FileDescriptor {
         FileDescriptor {
             attributes,
             size,
+            dat,
             segments,
         }
     }
@@ -422,11 +427,14 @@ impl<R: Read + Seek + Send> Filesystem for Os9Filesystem<R> {
         for (name, lsn) in children {
             let path = format!("{base}/{name}");
             let child_fd = self.read_fd(lsn)?;
-            if child_fd.is_dir() {
-                out.push(FileEntry::new_directory(name, path, lsn));
+            let modified_unix = crate::fs::times::os9_dat_to_unix(&child_fd.dat);
+            let mut fe = if child_fd.is_dir() {
+                FileEntry::new_directory(name, path, lsn)
             } else {
-                out.push(FileEntry::new_file(name, path, child_fd.size, lsn));
-            }
+                FileEntry::new_file(name, path, child_fd.size, lsn)
+            };
+            fe.modified_unix = modified_unix;
+            out.push(fe);
         }
         Ok(out)
     }
@@ -801,9 +809,23 @@ impl<R: Read + Write + Seek + Send> Os9Filesystem<R> {
     }
 
     /// Build a 256-byte FD image with the given attributes, size and segments.
-    fn build_fd(attributes: u8, size: u64, segments: &[(u64, u64)]) -> [u8; 256] {
+    /// `mtime_secs = Some(secs)` stamps that Unix time into FD.DAT (5-byte
+    /// year-month-day-hour-minute at offset 3) and FD.DCR (3-byte
+    /// year-month-day at offset 13); `None` leaves both fields zero (the
+    /// pre-existing behaviour — OS-9 tools handle a zero timestamp as
+    /// "no date recorded").
+    fn build_fd(
+        attributes: u8,
+        size: u64,
+        segments: &[(u64, u64)],
+        mtime_secs: Option<u64>,
+    ) -> [u8; 256] {
         let mut fd = [0u8; 256];
         fd[0] = attributes;
+        if let Some(s) = mtime_secs {
+            fd[3..8].copy_from_slice(&crate::fs::times::unix_to_os9_dat(s));
+            fd[13..16].copy_from_slice(&crate::fs::times::unix_to_os9_dcr(s));
+        }
         fd[8] = 1; // link count
         fd[9..13].copy_from_slice(&(size as u32).to_be_bytes());
         let mut off = SEG_LIST_OFFSET;
@@ -910,7 +932,7 @@ impl<R: Read + Write + Seek + Send> Os9Filesystem<R> {
         dir_fd.size = new_size;
         self.write_dir_slot(&dir_fd, slot, &entry)?;
         // Persist the updated directory FD (size + possibly new segment).
-        let fd_img = Self::build_fd(dir_fd.attributes, dir_fd.size, &dir_fd.segments);
+        let fd_img = Self::build_fd(dir_fd.attributes, dir_fd.size, &dir_fd.segments, None);
         self.write_sectors(dir_lsn, &fd_img)?;
         Ok(())
     }
@@ -1001,7 +1023,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for Os9Filesystem<R> {
         name: &str,
         data: &mut dyn std::io::Read,
         data_len: u64,
-        _options: &CreateFileOptions,
+        options: &CreateFileOptions,
     ) -> Result<FileEntry, FilesystemError> {
         let dir_lsn = self.dir_fd_lsn(parent);
         let name_raw = encode_os9_name(name)?;
@@ -1049,8 +1071,11 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for Os9Filesystem<R> {
             self.write_sectors(lsn, &buf)?;
         }
 
-        // Write the FD (regular file: owner read+write).
-        let fd_img = Self::build_fd(0x03, payload.len() as u64, &data_segs);
+        // Write the FD (regular file: owner read+write). Cross-fs copy passes
+        // source mtime through options.unix_times; a genuinely new file leaves
+        // it None and the FD's date fields stay zero.
+        let mtime = options.unix_times.map(|t| t.mtime_or_now());
+        let fd_img = Self::build_fd(0x03, payload.len() as u64, &data_segs, mtime);
         self.write_sectors(fd_lsn, &fd_img)?;
 
         // Link it into the parent directory.
@@ -1064,19 +1089,16 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for Os9Filesystem<R> {
         } else {
             format!("{}/{name}", parent.path)
         };
-        Ok(FileEntry::new_file(
-            name.to_string(),
-            path,
-            payload.len() as u64,
-            fd_lsn,
-        ))
+        let mut fe = FileEntry::new_file(name.to_string(), path, payload.len() as u64, fd_lsn);
+        fe.modified_unix = mtime;
+        Ok(fe)
     }
 
     fn create_directory(
         &mut self,
         parent: &FileEntry,
         name: &str,
-        _options: &CreateDirectoryOptions,
+        options: &CreateDirectoryOptions,
     ) -> Result<FileEntry, FilesystemError> {
         let parent_lsn = self.dir_fd_lsn(parent);
         let name_raw = encode_os9_name(name)?;
@@ -1110,7 +1132,8 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for Os9Filesystem<R> {
         self.write_sectors(data_lsn, &dir_data)?;
 
         // Directory FD: directory attribute + full perms, size = 2 entries.
-        let fd_img = Self::build_fd(ATT_DIR | 0x3F, (2 * DIR_ENTRY_LEN) as u64, &data_seg);
+        let mtime = options.unix_times.map(|t| t.mtime_or_now());
+        let fd_img = Self::build_fd(ATT_DIR | 0x3F, (2 * DIR_ENTRY_LEN) as u64, &data_seg, mtime);
         self.write_sectors(fd_lsn, &fd_img)?;
 
         self.dir_add_entry(parent_lsn, &name_raw, fd_lsn)?;
@@ -1123,7 +1146,9 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for Os9Filesystem<R> {
         } else {
             format!("{}/{name}", parent.path)
         };
-        Ok(FileEntry::new_directory(name.to_string(), path, fd_lsn))
+        let mut fe = FileEntry::new_directory(name.to_string(), path, fd_lsn);
+        fe.modified_unix = mtime;
+        Ok(fe)
     }
 
     fn delete_entry(

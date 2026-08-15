@@ -259,7 +259,11 @@ mod tests {
         .expect("create");
         ed.sync_metadata().expect("sync");
 
-        let after = ed.into_backing().into_inner().into_inner();
+        let after = ed
+            .into_backing()
+            .expect("in-place commit keeps the handle")
+            .into_inner()
+            .into_inner();
         assert_eq!(
             &after[..stub_len],
             &stub_before[..],

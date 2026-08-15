@@ -20,10 +20,10 @@ id = "qemu-img"
 tool = "qemu-img"
 kind = "package"
 availability = [
-  { platform = "windows", status = "verified", path_hint = "C:/Program Files/qemu", verified_on = "2026-08-02" },
-  { platform = "wsl",     status = "verified", path_hint = "/usr/bin/qemu-img",      verified_on = "2026-08-02" },
+  { platform = "windows", status = "verified", verified_on = "2026-08-02" },
+  { platform = "wsl",     status = "verified",      verified_on = "2026-08-02" },
   { platform = "linux",   status = "expected" },
-  { platform = "macos",   status = "install",  path_hint = "brew install qemu" },
+  { platform = "macos",   status = "install" },
 ]
 verifies = [
   { format = "fmt.raw",         direction = "write", strength = "structural", status = "proven", evidence = "qemu-img info -> raw", check = ["info", "{artifact}"], expect_stdout = "file format: raw" },
@@ -40,7 +40,7 @@ tool = "chdman"
 kind = "package"
 notes = "Four versions present locally (0.174/0.189/0.273/0.288); our output verifies on all four, so the version spread is itself a coverage axis."
 availability = [
-  { platform = "windows", status = "verified", path_hint = "C:/Tools/chdman", verified_on = "2026-08-02" },
+  { platform = "windows", status = "verified", verified_on = "2026-08-02" },
   { platform = "linux",   status = "install" },
   { platform = "macos",   status = "install" },
   { platform = "mister-hps", status = "absent" },
@@ -56,10 +56,10 @@ id = "fsck.ext4"
 tool = "fsck.ext4"
 kind = "package"
 availability = [
-  { platform = "wsl",    status = "verified", path_hint = "/usr/sbin/fsck.ext4", verified_on = "2026-08-02" },
-  { platform = "mister-hps", status = "verified", path_hint = "/usr/sbin/fsck.ext4", verified_on = "2026-08-02" },
+  { platform = "wsl",    status = "verified", verified_on = "2026-08-02" },
+  { platform = "mister-hps", status = "verified", verified_on = "2026-08-02" },
   { platform = "linux",  status = "expected" },
-  { platform = "macos",  status = "install", path_hint = "brew install e2fsprogs" },
+  { platform = "macos",  status = "install" },
   { platform = "windows", status = "absent" },
 ]
 verifies = [
@@ -146,7 +146,7 @@ tool = "ghostexp.exe"
 kind = "package"
 notes = "Symantec Ghost Explorer 11.5. Windows only; three copies present locally."
 availability = [
-  { platform = "windows", status = "verified", path_hint = "C:/Temp/pebuilder-isolinux/Programs/ghost11", verified_on = "2026-08-02" },
+  { platform = "windows", status = "verified", verified_on = "2026-08-02" },
   { platform = "linux",   status = "absent" },
   { platform = "macos",   status = "absent" },
 ]
@@ -208,8 +208,8 @@ is ARM Linux with affs built in — but this is a LINUX opinion, not an Amiga
 one, and is worth exactly what the same mount on any Linux box is worth. The
 Amiga's own filesystem code lives in the core; see mister-core-amiga."""
 availability = [
-  { platform = "mister-hps", status = "verified", path_hint = "/proc/filesystems", verified_on = "2026-08-02" },
-  { platform = "linux",      status = "install", path_hint = "linux-modules-extra" },
+  { platform = "mister-hps", status = "verified", verified_on = "2026-08-02" },
+  { platform = "linux",      status = "install" },
   { platform = "wsl",        status = "absent" },
 ]
 verifies = [{ format = "fs.affs", direction = "write", strength = "structural", status = "untested" }]
@@ -231,7 +231,7 @@ id = "7z"
 tool = "7z"
 kind = "package"
 availability = [
-  { platform = "windows", status = "verified", path_hint = "C:/Program Files/7-Zip", verified_on = "2026-08-02" },
+  { platform = "windows", status = "verified", verified_on = "2026-08-02" },
   { platform = "linux",   status = "expected" },
   { platform = "macos",   status = "install" },
 ]
@@ -243,14 +243,76 @@ verifies = [{ format = "fmt.zip-disk", direction = "write", strength = "structur
 id = "iris"
 tool = "Iris"
 kind = "emulator"
-notes = "SGI emulator written in Rust; in-house, so blockers are fixable at source. Replaces MAME for IRIX."
+program = "iris"
+notes = """SGI Indy (MIPS R4400) emulator with a purpose-built CI control
+socket: `iris-ci` has put / run / get / snapshot-rollback, and `run` returns the
+guest's stdout — no screen-scraping at all.
+
+Brought up 2026-08-12, as far as a live IRIX shell:
+
+  IRIS_JIT=1 iris --headless --noaudio --ci \
+      --scsi1 disks/Indy-IRIX65_dev.chd --cdrom4 <any.iso>
+  iris-ci boot && iris-ci login && iris-ci run "uname -aR"
+    -> IRIX IRIS 6.5 6.5.22m 10070055 IP22
+
+Four things that cost time, recorded so they do not again:
+
+  * No PROM needed. It warns about a missing prom.bin and uses an embedded one.
+    Do not go hunting for Indy firmware.
+  * --ci is required for the control socket. Without it iris listens only on
+    the monitor port 8888 and iris-ci cannot reach 19851.
+  * A CD-ROM must be attached even when booting from disk, or startup dies with
+    "could not attach cdrom4.iso". Any ISO will do.
+  * IRIX 6.5 boots; the 5.3 image hangs. Indy-IRIX53_dev.chd reaches "The
+    system is coming up", prints "Find Error: 10" and never reaches a login
+    prompt. Indy-IRIX65_dev.chd reaches one in a few minutes with JIT on.
+
+SOLVED 2026-08-13. The scratch volume is configured in iris.toml, not on the
+command line — --help never mentions it, but the binary does: "set
+`scratch = true` on a SCSI device in iris.toml". `scsi` is a MAP keyed by id,
+not an array of tables, and every device needs `cdrom`. iris creates the
+scratch volume itself, SGI volume header and all:
+
+  [scsi.1]
+  path = "disks/Indy-IRIX65_dev.chd"
+  cdrom = false
+
+  [scsi.2]
+  path = "disks/scratch.img"
+  cdrom = false
+  scratch = true
+  size_mb = 64
+
+Then `iris-ci put <file> --to /tmp/x` stages through it and works.
+
+fsck needs one step more. IRIX refuses a plain file — "Can't find equivalent
+raw device" — exactly as macOS fsck_hfs does. But the scratch volume IS a real
+SCSI disk in the guest, so write the image straight into it and check the
+device node:
+
+  iris-ci scratch write ./volume.img
+  iris-ci run "/sbin/fsck -t efs -n /dev/rdsk/dks0d2s0 < /dev/null"
+
+SCSI id 2 is dks0d2, s0 is the payload partition. The `< /dev/null` matters:
+without it fsck waits on a SALVAGE prompt forever.
+
+First result: our EFS volume passes phases 1-4 and fails phase 5 with BAD FREE
+LIST, while a volume mkfs_efs writes on the same device passes. That is R-039,
+the first authoritative finding this project has had.
+
+--nfs-dir was tried first and abandoned. iris exports the directory fine but
+the guest cannot mount it ("Port mapper failure"), then loops retrying and
+blocks the shell. The scratch path is better regardless — no guest networking.
+
+Written in Rust and in-house, so blockers here are fixable at source. Replaces
+MAME for IRIX."""
 availability = [
   { platform = "windows", status = "install" },
   { platform = "linux",   status = "install" },
   { platform = "macos",   status = "install" },
 ]
 verifies = [
-  { format = "fs.efs",  direction = "write", strength = "authoritative", status = "plausible", evidence = "IRIX 6.5 image reads OK; boot not yet wired" },
+  { format = "fs.efs",  direction = "write", strength = "authoritative", status = "proven", evidence = "2026-08-15: IRIX 6.5.22 fsck passes all five phases on our volume, then mounts it, writes a file and a subdir, unmounts, and fscks clean again. Found and closed R-039 (bitmap was MSB-first, is LSB-first). Control: mkfs_efs on the same device." },
   { format = "fs.xfs",  direction = "write", strength = "authoritative", status = "plausible", evidence = "IRIX 6.5 mounts both XFS and EFS" },
   { format = "part.sgi",     direction = "write", strength = "authoritative", status = "plausible" },
   { format = "optical.efs", direction = "write", strength = "authoritative", status = "plausible", evidence = "IRIX mounts an EFS CD natively" },
@@ -260,13 +322,15 @@ verifies = [
 id = "fs-uae"
 tool = "FS-UAE"
 kind = "emulator"
+program = "fs-uae"
 notes = """Portable Amiga emulator; the cross-platform half of the WinUAE pair.
 
 Assets located 2026-08-07, all already owned — nothing needs downloading:
 
-  * Kickstart ROMs — a full licensed AmigaForever set on the Windows box at
-    D:/ROMs/Amiga/Shared/rom (amiga-os-070 .. 3.x), plus Kickstart 3.2 ROMs on
-    the NAS and five ROMs on linuxbox at ~/kickstarts.
+  * Kickstart ROMs — a full licensed AmigaForever set (amiga-os-070 .. 3.x) on
+    the Windows box, with Kickstart 3.2 ROMs and five more spread across two
+    other hosts. WHERE they live is machine-specific: record that as a
+    path_hint in the gitignored data/oracles.local.toml, never here.
   * A bootable environment — AmigaVision on the MiSTer (9.1 GB HDF, PFS3, with
     an AmigaVision.fs-uae config already written).
   * The results channel — that config's `hard_drive_2 = ./shared` mounts a HOST
@@ -278,10 +342,26 @@ Assets located 2026-08-07, all already owned — nothing needs downloading:
     Neither AmigaVision nor AmigaForever carries an SFS handler; the volume
     under test turned out to carry its own.
 
-Not yet built: the config that attaches an artifact, the guest-side script
-that writes a verdict to the shared volume, and the host-side parser. AFFS is
-the one to prove it on — Kickstart mounts FFS with no extra handler, and we
-already produce fs.affs.
+Built 2026-08-14 as `oracles/fsuae/affs_mount.py`: it unpacks the Workbench
+fixture to a host directory for DH0, writes the probe into its
+S/Startup-Sequence, generates the config, launches FS-UAE, polls for the
+sentinel and parses the guest's `Info`. Verified from FS-UAE's log to load the
+ROM, attach all three drives at boot priority 0 and present the artifact to
+Kickstart 3.1.
+
+Working end to end 2026-08-14: it answered R-020. Kickstart 3.1 mounts our AFFS
+volume Read/Write under its own name and lists its contents; 2 MB of noise
+through the identical config produces no DH1: unit at all, so the harness
+discriminates rather than passing whatever it is given.
+
+The one trap, because it cost an afternoon and looks like an emulator fault:
+the guest script must be written with LF endings, in bytes. Python's
+write_text applies the platform newline on Windows, AmigaDOS scripts are
+LF-terminated, and the guest then read a redirect whose target ended in a
+carriage return — an
+illegal filename on the host directory DH2 maps to. Every redirect failed,
+FAILAT 21 stopped the script aborting, and the run booted and silently
+produced nothing.
 
 Cross-platform Amiga; WinUAE is Windows-only, so this is the portable choice.
 Installed on the Windows box (FS-UAE 3.0.5, a per-user install under
@@ -293,7 +373,66 @@ availability = [
 ]
 verifies = [
   { format = "fs.pfs3", direction = "write", strength = "authoritative", status = "plausible", evidence = "Workbench 1.3/2.1 RDB+PFS disks on the MiSTer, 960 MB each" },
+  { format = "fs.affs", direction = "write", strength = "authoritative", status = "proven", evidence = "2026-08-14: Kickstart 3.1 on an A1200 mounts our volume Read/Write as 'rusty-backup' and List DH1: reads the contents back. Controlled against 2 MB of noise, which yields no DH1: unit. Closes R-020.", check = ["{oracles}/fsuae/affs_mount.py", "{artifact}"] },
+  { format = "part.rdb", direction = "write", strength = "authoritative", status = "plausible" },
+]
+
+[[oracle]]
+id = "amitools"
+tool = "xdftool"
+kind = "package"
+program = "python3"
+notes = """amitools' xdftool — a pure-Python AmigaDOS filesystem reader, and the
+closest thing to an Amiga opinion that needs no emulator, no ROM and no guest.
+`pip install amitools`.
+
+Not authoritative: it is a reimplementation, so it agreeing does not prove a
+real Amiga will mount the volume, and it disagreeing does not prove one will
+not. What it does give is a second implementation reading the same bytes, which
+is exactly what R-020 lacked — every AFFS check until now was our own code
+agreeing with itself.
+
+Two quirks that cost an afternoon if unknown. It picks its geometry from the
+file EXTENSION: a 2 MB volume named `.adf` is rejected as an invalid floppy
+size, and must be `.hdf` to be read as a hard-disk volume. And it opens
+read-write by default, so a read-only artifact fails with EACCES before it
+parses anything — `-r` does not help, because the open happens first."""
+availability = [
+  { platform = "windows", status = "expected" },
+  { platform = "linux",   status = "expected" },
+  { platform = "macos",   status = "expected" },
+]
+verifies = [
+  { format = "fs.affs", direction = "write", strength = "structural", status = "proven", evidence = "2026-08-14: xdftool accepts a freshly written volume at 1M..32M and after a put, listing the file back. The 2026-08-12 rejection (R-038) was real but indicted an Aug-8 artifact built before a190182 fixed the bitmap sizing; HEAD passes.", check = ["{oracles}/amitools_affs.py", "{artifact}"] },
+]
+
+[[oracle]]
+id = "winuae"
+tool = "WinUAE"
+kind = "emulator"
+program = "winuae64"
+notes = """The Windows half of the WinUAE/FS-UAE pair, and the same emulator
+family: real AmigaOS with its own filesystem handlers reading the volume, which
+is the Amiga's opinion rather than a Linux affs mount's.
+
+Registered alongside fs-uae rather than instead of it because a given machine
+tends to have one or the other. Both verify the same three formats and either
+satisfies the pair; whichever is installed is what --detect records.
+
+The results channel is the one FS-UAE documents: mount a host directory as an
+Amiga volume, boot a script that inspects the test volume and writes a report
+there, host reads the file. No screen-scraping.
+
+ROM paths are machine-specific and belong in the gitignored overlay, never
+here."""
+availability = [
+  { platform = "windows", status = "expected" },
+  { platform = "linux",   status = "absent" },
+  { platform = "macos",   status = "absent" },
+]
+verifies = [
   { format = "fs.affs", direction = "write", strength = "authoritative", status = "plausible" },
+  { format = "fs.pfs3", direction = "write", strength = "authoritative", status = "plausible" },
   { format = "part.rdb", direction = "write", strength = "authoritative", status = "plausible" },
 ]
 
@@ -301,6 +440,7 @@ verifies = [
 id = "86box-os2"
 tool = "86Box + OS/2"
 kind = "emulator"
+program = "86Box"
 notes = "OS/2's own CHKDSK is the only real HPFS oracle; the Linux hpfs module is read-only and absent from WSL."
 availability = [
   { platform = "windows", status = "install" },
@@ -324,6 +464,7 @@ verifies = [{ format = "fs.hpfs", direction = "write", strength = "authoritative
 id = "mister-core-amiga"
 tool = "MiSTer Minimig core"
 kind = "hardware"
+core = "Minimig"
 notes = """Real AmigaOS reading the volume with its own filesystem handlers.
 Unlike the HPS affs mount, this is the Amiga's opinion. Bootable Workbench
 1.3 / 2.1 RDB+PFS disks are already on the board."""
@@ -339,6 +480,7 @@ verifies = [
 id = "mister-core-x68000"
 tool = "MiSTer X68000 core"
 kind = "hardware"
+core = "X68000"
 availability = [{ platform = "mister-core", status = "expected" }]
 verifies = [
   { format = "fs.human68k", direction = "write", strength = "authoritative", status = "plausible" },
@@ -363,6 +505,7 @@ verifies = [
 id = "mister-core-appleii"
 tool = "MiSTer Apple-II core"
 kind = "hardware"
+core = "Apple-II"
 notes = """Real Apple II reading the disk with ProDOS / DOS 3.3 themselves.
 /media/fat/games/Apple-II is already populated on the board, so this needs no
 new material — it closes two write gaps that had no oracle at all."""
@@ -379,6 +522,7 @@ verifies = [
 id = "snow"
 tool = "Snow"
 kind = "emulator"
+program = "snowemu"
 notes = """Modern Macintosh emulator written in Rust. Emulating a Mac Plus gives
 a real MFS implementation — the only realistic judge of MFS, which otherwise
 has no oracle anywhere.
@@ -535,6 +679,7 @@ verifies = [
 id = "mame-pc98"
 tool = "MAME pc9801"
 kind = "emulator"
+program = "mame"
 notes = "No PC-98 core exists on the MiSTer, so MAME's pc9801 drivers are the route for HDM and DIM."
 availability = [
   { platform = "windows", status = "install" },
@@ -554,6 +699,7 @@ verifies = [
 id = "mister-core-atari800"
 tool = "MiSTer ATARI800 core"
 kind = "hardware"
+core = "Atari800"
 availability = [{ platform = "mister-core", status = "expected" }]
 verifies = [
   { format = "fs.atari-dos2",   direction = "write", strength = "authoritative", status = "plausible" },
@@ -564,6 +710,7 @@ verifies = [
 id = "mister-core-ti99"
 tool = "MiSTer TI-99_4A core"
 kind = "hardware"
+core = "Ti994a"
 availability = [{ platform = "mister-core", status = "expected" }]
 verifies = [
   { format = "fs.ti99",       direction = "write", strength = "authoritative", status = "plausible" },
@@ -574,6 +721,7 @@ verifies = [
 id = "mister-core-oric"
 tool = "MiSTer Oric core"
 kind = "hardware"
+core = "Oric"
 availability = [{ platform = "mister-core", status = "expected" }]
 verifies = [{ format = "fs.oric", direction = "write", strength = "authoritative", status = "plausible" }]
 
@@ -581,6 +729,7 @@ verifies = [{ format = "fs.oric", direction = "write", strength = "authoritative
 id = "mister-core-spectrum"
 tool = "MiSTer Spectrum core"
 kind = "hardware"
+core = "ZX-Spectrum"
 availability = [{ platform = "mister-core", status = "expected" }]
 verifies = [
   { format = "fs.trdos",       direction = "write", strength = "authoritative", status = "plausible" },
@@ -591,6 +740,7 @@ verifies = [
 id = "mister-core-coco"
 tool = "MiSTer CoCo2 / COCO3 core"
 kind = "hardware"
+core = "CoCo3"
 availability = [{ platform = "mister-core", status = "expected" }]
 verifies = [
   { format = "fs.os9",        direction = "write", strength = "authoritative", status = "plausible" },
@@ -602,6 +752,7 @@ verifies = [
 id = "mister-core-archie"
 tool = "MiSTer ARCHIE core"
 kind = "hardware"
+core = "Archie"
 notes = "Acorn Archimedes; RISC OS reads ADFS with its own FileCore."
 availability = [{ platform = "mister-core", status = "expected" }]
 verifies = [{ format = "fs.adfs", direction = "write", strength = "authoritative", status = "plausible" }]
@@ -645,7 +796,7 @@ tool = "mount -t ntfs3"
 kind = "mount"
 notes = "In-kernel NTFS driver; absent from WSL, needs a full Linux host."
 availability = [
-  { platform = "linux", status = "install", path_hint = "linux-modules-extra" },
+  { platform = "linux", status = "install" },
   { platform = "wsl",   status = "absent" },
 ]
 verifies = [{ format = "fs.ntfs", direction = "write", strength = "structural", status = "untested" }]

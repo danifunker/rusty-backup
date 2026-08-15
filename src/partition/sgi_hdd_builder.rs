@@ -465,7 +465,7 @@ mod tests {
     fn streamed_file_matches_in_memory_image() {
         use std::io::{Read, Seek, SeekFrom};
         let opts = SgiHddOptions::new(40 * 1024 * 1024, "STREAM");
-        let (mem, layout) = build_sgi_efs_hdd(&opts).unwrap();
+        let (mut mem, layout) = build_sgi_efs_hdd(&opts).unwrap();
 
         let mut file = tempfile::tempfile().expect("tempfile");
         let streamed_layout = write_sgi_efs_hdd(&mut file, &opts).expect("stream");
@@ -476,6 +476,22 @@ mod tests {
         file.seek(SeekFrom::Start(0)).unwrap();
         file.read_to_end(&mut on_disk).unwrap();
         assert_eq!(on_disk.len() as u64, layout.disk_bytes, "exact size");
+
+        // The EFS root inode's atime/mtime/ctime are stamped from
+        // `SystemTime::now()` and the two builds run microseconds apart, so
+        // a byte-for-byte compare would race on a second boundary. Zero the
+        // 12-byte time window in both copies before comparing — every other
+        // byte still has to match. Root inode 2 lives at slot 2 in the first
+        // CG's inode block; times are at offsets 12..24 of the inode.
+        let efs_off = (layout.efs_first_sector * SECTOR_SIZE) as usize;
+        let firstcg = 2 + (layout.efs_sectors as u32).div_ceil(8).div_ceil(512);
+        let root_off = efs_off + firstcg as usize * 512 + 2 * 128;
+        for b in mem[root_off + 12..root_off + 24].iter_mut() {
+            *b = 0;
+        }
+        for b in on_disk[root_off + 12..root_off + 24].iter_mut() {
+            *b = 0;
+        }
         assert_eq!(on_disk, mem, "streamed bytes match the in-memory image");
     }
 

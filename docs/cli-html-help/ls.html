@@ -33,6 +33,8 @@
 <dd>Password for encrypted containers (WinImage IMZ, password-protected `.zip` disks) or an encrypted filesystem (APFS FileVault — the volume password or personal recovery key)</dd>
 <dt><code>--inside</code></dt>
 <dd>For a `.zip` holding more than one disk image, the archive entry to open (e.g. `--inside backup.img`). Matched by exact name, then case- insensitively, then by basename. Ignored for non-zip sources</dd>
+<dt><code>--format</code></dt>
+<dd>Output format. `ls` is flat-tabular, so csv and tsv are in scope alongside json and yaml</dd>
 <dt><code>--fs-type</code></dt>
 <dd>Force a specific filesystem dispatch. The main use is `cpm:&lt;preset&gt;` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zxplus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch</dd>
 <dt><code>--carve-full</code></dt>

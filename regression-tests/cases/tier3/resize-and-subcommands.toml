@@ -86,11 +86,118 @@ args = ["inspect", "{scratch}/v.img"]
 expect_exit = 0
 stdout_contains = ["16.0 MiB"]
 
+# --- shrink (R-037) -----------------------------------------------------------
+# A shrink used to rewrite the FAT for the smaller volume with live data still
+# beyond it, print "resize complete" and exit 0. `get` then returned a silently
+# truncated file, also exiting 0. These three pin the whole decision: refuse
+# what would cut data, refuse what was not asked for, and keep the data when it
+# does run.
+
+[[case]]
+id = "resize.shrink.refuses-cutting-live-data"
+description = """R-037: a shrink below where the data ends must be refused,
+--confirm-shrink or not.
+
+The volume is filled with a 40M zero-allocation so the data genuinely extends
+past the 16M target. An earlier draft of this case put the 104-byte payload in
+a 64M volume and shrank to 1M, expecting a refusal — the guard allowed it, and
+was right to: the file ends around 150 KB, so 1M is beyond it and the data
+survived. The guard reads `last_data_byte`; the case has to make the data
+actually reach past the target rather than assume it does."""
+[[case.step]]
+args = ["new", "volume", "fat", "--size", "64M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "--zero", "41943040", "--dst", "/BIG.BIN"]
+expect_exit = 0
+[[case.step]]
+args = ["resize", "{scratch}/v.img", "--size", "16M", "--confirm-shrink"]
+expect_exit = 2
+stderr_contains = ["refusing to shrink"]
+# The refusal must be a refusal: the image keeps its length and its file.
+[[case.step]]
+args = ["inspect", "{scratch}/v.img"]
+expect_exit = 0
+stdout_contains = ["64.0 MiB"]
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+
+[[case]]
+id = "resize.shrink.needs-confirmation"
+description = "R-037: a safe shrink still needs --confirm-shrink, because truncation is not reversible"
+[[case.step]]
+args = ["new", "volume", "fat", "--size", "64M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["resize", "{scratch}/v.img", "--size", "40M"]
+expect_exit = 2
+stderr_contains = ["--confirm-shrink"]
+[[case.step]]
+args = ["inspect", "{scratch}/v.img"]
+expect_exit = 0
+stdout_contains = ["64.0 MiB"]
+
+[[case]]
+id = "resize.shrink.keeps-data-and-truncates"
+description = "R-037: a confirmed, safe shrink resizes the filesystem, truncates the image, and keeps every byte"
+[[case.step]]
+args = ["new", "volume", "fat", "--size", "64M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["resize", "{scratch}/v.img", "--size", "40M", "--confirm-shrink"]
+expect_exit = 0
+# The image is truncated, not just the filesystem — a superfloppy's reported
+# size is its file length, so this asserts both.
+[[case.step]]
+args = ["inspect", "{scratch}/v.img"]
+expect_exit = 0
+stdout_contains = ["40.0 MiB"]
+[[case.step]]
+args = ["get", "{scratch}/v.img", "/payload.bin", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+
 # --- repack -------------------------------------------------------------------
 
 [[case]]
 id = "resize.repack.keeps-data"
-description = "repack must not lose a file, and must leave the volume sound"
+description = """repack must not lose a file, and must leave the volume sound.
+
+Rewritten 2026-08-09. This built a plain FAT superfloppy and repacked it, which
+`repack` was never for — it is documented Human68k-only. The volume opened as
+Human68k anyway (the two share a BPB layout, deliberately: X68000 floppies use
+the standard MS-DOS one), so the file was rebuilt through a driver with no
+long-filename concept and `payload.bin` came back `PAYLOAD.BIN`. The finding
+recorded that as "every file is gone"; nothing was lost, the name changed and
+the lowercase `get` then missed. The case now uses a real Human68k volume, and
+resize.repack.refuses-plain-fat below pins the input it used to accept."""
+[[case.step]]
+args = ["new", "hd", "x68k", "--size", "16M", "{scratch}/hd.img"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/hd.img@1", "{cases}/tier3/payload.bin", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["repack", "{scratch}/hd.img@1"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{scratch}/hd.img@1", "/payload.bin", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+[[case.step]]
+args = ["fsck", "{scratch}/hd.img@1", "--checkonly"]
+expect_exit = 0
+
+[[case]]
+id = "resize.repack.refuses-plain-fat"
+description = "repack must refuse a plain FAT volume rather than rebuild it through the Human68k driver"
 [[case.step]]
 args = ["new", "volume", "fat", "--size", "8M", "{scratch}/v.img"]
 expect_exit = 0
@@ -99,14 +206,13 @@ args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/payload.bin"]
 expect_exit = 0
 [[case.step]]
 args = ["repack", "{scratch}/v.img"]
-expect_exit = 0
+expect_exit = 2
+stderr_contains = ["is for Human68k"]
+# The refusal must be a refusal: the volume is untouched, long name and all.
 [[case.step]]
 args = ["get", "{scratch}/v.img", "/payload.bin", "{scratch}/out.bin"]
 expect_exit = 0
 files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
-[[case.step]]
-args = ["fsck", "{scratch}/v.img", "--checkonly"]
-expect_exit = 0
 
 # --- squashfs -----------------------------------------------------------------
 # Five subcommands, none previously exercised — including on the verb whose

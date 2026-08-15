@@ -9,7 +9,7 @@
 <h1><code>rb-cli resize</code></h1>
 <p>Resize the filesystem at IMG@N to a new size (FAT/NTFS/exFAT/HFS+/ ext/btrfs/SFS/PFS3/AFFS/EFS — whichever magic matches)</p>
 <h2>Usage</h2>
-<pre><code>Usage: resize --size &lt;SIZE&gt; &lt;IMAGE&gt;</code></pre>
+<pre><code>Usage: resize [OPTIONS] --size &lt;SIZE&gt; &lt;IMAGE&gt;</code></pre>
 <h2>Arguments</h2>
 <dl class="args">
 <dt><code>&lt;IMAGE&gt;</code></dt>
@@ -19,6 +19,8 @@
 <dl class="args">
 <dt><code>--size</code></dt>
 <dd>New filesystem size in bytes. Accepts suffixes (`K`, `M`, `G`)</dd>
+<dt><code>--confirm-shrink</code></dt>
+<dd>Required to shrink. Growing needs no flag; shrinking truncates the image, which is not reversible, so it has to be asked for. A shrink that would cut into live data is refused with or without this</dd>
 </dl>
 <footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_docs</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
 </body></html>

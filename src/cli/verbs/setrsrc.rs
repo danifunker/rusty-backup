@@ -27,7 +27,7 @@ pub fn run(args: SetRsrcArgs) -> Result<()> {
     log_stderr(&ctx.label);
     let mut fs = ctx
         .open_editable(file)
-        .map_err(|e| anyhow!("opening filesystem for write: {e}"))?;
+        .map_err(|e| crate::cli::resolve::write_open_error("opening filesystem for write", e))?;
 
     let entry = super::ls::resolve_path(fs.as_filesystem_mut(), &args.path)?;
     let meta = std::fs::metadata(&args.from_file)

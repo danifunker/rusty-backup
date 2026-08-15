@@ -21,28 +21,39 @@ use crate::fs::resource_fork::{self, ImportedResourceFork};
 
 /// Original timestamps captured from a source file so a cross-image copy can
 /// reproduce them on the destination instead of stamping the current time.
-/// Each filesystem family uses its own date representation; the unused half is
-/// `None`. Amiga dates are applied via `CreateFileOptions::amiga_date` (honored
-/// by AFFS `create_file`); HFS dates via `set_dates` after creation.
+/// Each filesystem family uses its own date representation; the unused halves
+/// stay `None`. Amiga dates are applied via `CreateFileOptions::amiga_dates`
+/// (honored by AFFS `create_file`); HFS dates via `set_dates` after creation;
+/// Unix mtimes via `CreateFileOptions::unix_times` (honoured by every Unix-
+/// family driver — ext, UFS, EFS, XFS, minix, squashfs, …).
 #[derive(Debug, Clone, Default)]
 pub struct PreservedDates {
     /// AmigaDOS `(days, minutes, ticks)` since 1978-01-01.
     pub amiga: Option<(i32, i32, i32)>,
     /// HFS/HFS+ `(create, modify, backup)` in Mac-epoch seconds.
     pub mac: Option<(u32, u32, u32)>,
+    /// Unix mtime in seconds since 1970-01-01, the numeric `FileEntry.
+    /// modified_unix` captured from any per-second-dated source (Unix
+    /// inode / Mac dates / Amiga datestamp / tar Header / host stat).
+    pub unix_mtime: Option<u64>,
 }
 
 impl PreservedDates {
-    /// Capture whatever raw dates a source `FileEntry` carries (HFS `mac_dates`
-    /// and/or Amiga `amiga_date`). Returns `None` when the entry has neither, so
-    /// the copy just stamps the current time.
+    /// Capture whatever raw dates a source `FileEntry` carries. Returns
+    /// `None` when the entry has no timestamp at all — the copy then just
+    /// stamps the current time. `unix_mtime` is populated whenever the
+    /// entry carries one, so a cross-fs copy from any per-second-dated
+    /// source (ext → EFS, AFFS → ext, tar → xfs, …) preserves the date
+    /// through Unix-family drivers' new `CreateFileOptions.unix_times`.
     pub fn from_entry(entry: &FileEntry) -> Option<Self> {
-        if entry.mac_dates.is_none() && entry.amiga_date.is_none() {
+        if entry.mac_dates.is_none() && entry.amiga_date.is_none() && entry.modified_unix.is_none()
+        {
             return None;
         }
         Some(Self {
             amiga: entry.amiga_date,
             mac: entry.mac_dates,
+            unix_mtime: entry.modified_unix,
         })
     }
 }
@@ -233,8 +244,16 @@ pub fn apply_edit(
                 type_code: prodos_type.map(|t| format!("${:02X}", t)),
                 aux_type: *prodos_aux,
                 // Amiga dates round-trip via create_file (AFFS honors this);
-                // HFS dates are applied with set_dates after creation below.
+                // HFS dates are applied with set_dates after creation below;
+                // Unix mtime rides through every Unix-family driver via
+                // create_file's `unix_times` (falls back to the source's
+                // native scheme when both are set, since the driver picks
+                // whichever it can honour).
                 amiga_dates: dates.as_ref().and_then(|d| d.amiga),
+                unix_times: dates
+                    .as_ref()
+                    .and_then(|d| d.unix_mtime)
+                    .map(crate::fs::times::UnixTimes::mtime_only),
                 ..Default::default()
             };
 
@@ -1388,6 +1407,7 @@ mod tests {
                     dates: Some(PreservedDates {
                         amiga: Some(target),
                         mac: None,
+                        unix_mtime: None,
                     }),
                     on_conflict: crate::fs::replace::OnConflict::Fail,
                 },

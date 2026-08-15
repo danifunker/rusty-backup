@@ -847,6 +847,10 @@ Usage: inspect [OPTIONS] <IMAGE>
 - `--format` — Output format
 - `--password` — Password for encrypted containers (currently: WinImage IMZ, and password-protected `.zip` disks)
 - `--inside` — For a `.zip` holding more than one disk image, the archive entry to open (e.g. `--inside backup.img`). Matched by exact name, then case- insensitively, then by basename. Ignored for non-zip sources
+- `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zxplus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
+- `--carve-full` — Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga "NDOS" disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem
+- `--expect-fs` — Assert the disk carries this filesystem, e.g. `--expect-fs "DOS 3.3"`. Exits non-zero when no partition matches. Case, spacing and punctuation are ignored; the comparison is exact after that, so `FAT` does not satisfy `exFAT`
+- `--expect-layout` — Assert the disk's shape: `superfloppy` (a filesystem at sector 0, no table), `partitioned` (any table), or a scheme by name — `mbr`, `gpt`, `apm`, `rdb`, `sgi`, `sun`, `ahdi`, `x68k`, `dsd`, `none`. An unrecognised word is a usage error, not a failed assertion
 
 ### `install-completions`
 
@@ -903,6 +907,7 @@ Usage: ls [OPTIONS] <IMAGE> [PATH]
 - `-o` / `--owner` — Show each entry's Unix permissions and owner. On a Linux/Unix image the owner ids are resolved to names via the image's own `/etc/passwd` and `/etc/group` (falling back to the raw numbers where there's no entry)
 - `--password` — Password for encrypted containers (WinImage IMZ, password-protected `.zip` disks) or an encrypted filesystem (APFS FileVault — the volume password or personal recovery key)
 - `--inside` — For a `.zip` holding more than one disk image, the archive entry to open (e.g. `--inside backup.img`). Matched by exact name, then case- insensitively, then by basename. Ignored for non-zip sources
+- `--format` — Output format. `ls` is flat-tabular, so csv and tsv are in scope alongside json and yaml
 - `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zxplus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
 - `--carve-full` — Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga "NDOS" disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem
 
@@ -1321,6 +1326,7 @@ Usage: browse [OPTIONS] <SOURCE>
 - `--format` — Output format. `text` (default) prints the human file tree unchanged; `json` / `yaml` emit a machine-readable, deterministically path-sorted listing
 - `--hash` — Per-file content hash to attach to each file entry. Structured output only (`--format json`). Currently only `sha256`
 - `--filesystem` — Which filesystem to browse on a hybrid Mac/PC disc. `auto` (default) opens the primary (ISO 9660); `hfs` opens the Apple HFS side; `iso` forces the ISO 9660 tree. See `optical info` to see what a disc carries
+- `--filesystem-index` — Which filesystem to open when a disc carries more than one of the same kind — Apple shipped CD-ROMs with two HFS volumes. 0-based, indexing the list `optical info` prints. Overrides `--filesystem`
 
 ### `optical convert`
 
@@ -1370,13 +1376,14 @@ Usage: du [OPTIONS] <SOURCE> [PATH]...
 - `--json` — Emit machine-readable JSON. Shorthand for `--format json`
 - `--format` — Output format
 - `--filesystem` — Which filesystem to measure on a hybrid Mac/PC disc. `auto` (default) opens the primary (ISO 9660); `hfs` opens the Apple HFS side — the one carrying resource forks. See `optical info` for what a disc holds
+- `--filesystem-index` — Which filesystem to open when a disc carries more than one of the same kind — Apple shipped CD-ROMs with two HFS volumes. 0-based, indexing the list `optical info` prints. Overrides `--filesystem`
 
 ### `optical extract`
 
 Extract files from an optical disc image into a host folder
 
 ```
-Usage: extract [OPTIONS] --to <TO> <SOURCE>
+Usage: extract [OPTIONS] <SOURCE>
 ```
 
 **Arguments**
@@ -1385,10 +1392,15 @@ Usage: extract [OPTIONS] --to <TO> <SOURCE>
 
 **Options**
 
-- `--to` — Destination folder (created if absent)
+- `--to` — Destination folder (created if absent). Mutually exclusive with `--tar`; exactly one of the two is required
+- `--tar` — Write a `.tar` / `.tar.gz` / `.tar.zst` instead of loose files
+- `--path` — Extract only this path from the disc instead of the whole tree. Disc-relative, e.g. `/DOCS/README.TXT` or `/DOCS`. A file extracts on its own; a directory extracts the files directly inside it, and its subdirectories too when `--recursive` is given
+- `-r` / `--recursive` — Include subdirectories when `--path` names a directory. Whole-disc extraction (no `--path`) always recurses and ignores this
+- `--preserve-permissions` — Apply the POSIX mode a disc records (Rock Ridge, HFS+, EFS) to the extracted files. Unix hosts only — on Windows the bits have nowhere to go, so use `--tar`, which carries them regardless of host
 - `--resource-forks` — How to handle HFS resource forks. Ignored on non-HFS discs. Defaults to `appledouble`, or `[optical] resource-forks` from the config file when set
 - `--on-collision` — What to do when two names on a **case-sensitive** disc (UFS, NeXT, Rock Ridge, …) collide only by case on a **case-insensitive** destination (e.g. macOS). Defaults to `rename`, or `[optical] on-collision` from the config. Ignored when the destination is case-sensitive — everything extracts verbatim there
 - `--filesystem` — Which filesystem to extract from on a hybrid Mac/PC disc. `auto` (default) uses the primary (ISO 9660); `hfs` extracts the Apple HFS side; `iso` forces the ISO 9660 tree. See `optical info`
+- `--filesystem-index` — Which filesystem to open when a disc carries more than one of the same kind — Apple shipped CD-ROMs with two HFS volumes. 0-based, indexing the list `optical info` prints. Overrides `--filesystem`
 
 ### `optical info`
 
@@ -1750,7 +1762,7 @@ Usage: repack [OPTIONS] <IMAGE>
 Resize the filesystem at IMG@N to a new size (FAT/NTFS/exFAT/HFS+/ ext/btrfs/SFS/PFS3/AFFS/EFS — whichever magic matches)
 
 ```
-Usage: resize --size <SIZE> <IMAGE>
+Usage: resize [OPTIONS] --size <SIZE> <IMAGE>
 ```
 
 **Arguments**
@@ -1760,6 +1772,7 @@ Usage: resize --size <SIZE> <IMAGE>
 **Options**
 
 - `--size` — New filesystem size in bytes. Accepts suffixes (`K`, `M`, `G`)
+- `--confirm-shrink` — Required to shrink. Growing needs no flag; shrinking truncates the image, which is not reversible, so it has to be asked for. A shrink that would cut into live data is refused with or without this
 
 ### `restore`
 

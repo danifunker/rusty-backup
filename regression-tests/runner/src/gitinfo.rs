@@ -67,6 +67,44 @@ pub fn is_clean(repo: &Path) -> bool {
     dirty_files(repo).map(|v| v.is_empty()).unwrap_or(false)
 }
 
+/// Whether engine sources changed between `sha` and HEAD.
+///
+/// This is the staleness test an oracle verdict needs. An artifact records the
+/// sha it was produced at; if `src/` has moved since, the bytes on disk are not
+/// what HEAD would write, and any verdict about them describes code that is no
+/// longer in the tree.
+///
+/// That is not hypothetical — R-038 was filed as a High defect against the AFFS
+/// formatter on the strength of an oracle reading artifacts built two days
+/// before the fix that resolved it. Nothing in the run path noticed.
+///
+/// `None` means the question could not be answered (sha absent from this
+/// clone, git unavailable), which callers must report as unknown rather than
+/// treating as fresh.
+pub fn engine_changed_since(repo: &Path, sha: &str, engine_paths: &[&str]) -> Option<bool> {
+    // Reject a sha this clone does not have, so a shallow or unrelated
+    // checkout cannot silently answer "unchanged".
+    git(repo, &["cat-file", "-e", &format!("{sha}^{{commit}}")])?;
+    let mut args = vec!["diff", "--quiet", sha, "HEAD", "--"];
+    args.extend_from_slice(engine_paths);
+    let out = Command::new("git")
+        .args(&args)
+        .current_dir(repo)
+        .output()
+        .ok()?;
+    // `--quiet` exits 0 when there is no diff, 1 when there is.
+    match out.status.code() {
+        Some(0) => Some(false),
+        Some(1) => Some(true),
+        _ => None,
+    }
+}
+
+/// The paths whose contents decide whether a produced artifact is still
+/// representative. `src/` is the engine; `Cargo.toml`/`Cargo.lock` pin the
+/// dependencies that get compiled into it.
+pub const ENGINE_PATHS: &[&str] = &["src", "Cargo.toml", "Cargo.lock"];
+
 /// Human-readable build identity, e.g. `0.1.0+g184c764` or
 /// `0.1.0+g184c764.dirty`.
 pub fn build_label(repo: &Path, version: &str) -> String {

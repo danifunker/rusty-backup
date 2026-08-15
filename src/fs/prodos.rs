@@ -53,6 +53,7 @@ impl<R: Read + Seek + Send> Filesystem for ProDosFilesystem<R> {
             size: 0,
             location: 2, // Volume Directory Key Block is always at block 2
             modified: None,
+            modified_unix: None,
             type_code: None,
             creator_code: None,
             symlink_target: None,
@@ -160,7 +161,7 @@ impl<R: Read + Seek + Send> Filesystem for ProDosFilesystem<R> {
     }
 
     fn validate_name(&self, name: &str) -> Result<(), FilesystemError> {
-        validate_prodos_name(name).map(|_| ())
+        validate_prodos_name(name, "filename").map(|_| ())
     }
 
     fn total_size(&self) -> u64 {
@@ -974,6 +975,12 @@ impl<R: Read + Write + Seek + Send> ProDosFilesystem<R> {
 // ─────────────────────────────── entry builders ─────────────────────────────
 
 /// Build a 39-byte ProDOS file directory entry.
+///
+/// `mtime_secs = Some(secs)` stamps that Unix time (converted via
+/// [`crate::fs::times::unix_to_prodos_datetime`]) into both the creation
+/// and modification date/time fields — what a cross-fs copy carrying the
+/// source mtime through calls for. `None` stamps `now`.
+#[allow(clippy::too_many_arguments)]
 fn build_file_entry_bytes(
     name: &str,
     file_type: u8,
@@ -982,6 +989,7 @@ fn build_file_entry_bytes(
     key_ptr: u16,
     blocks_used: u16,
     eof: u32,
+    mtime_secs: Option<u64>,
 ) -> [u8; 39] {
     let mut e = [0u8; 39];
     let name_bytes = name.as_bytes();
@@ -998,7 +1006,10 @@ fn build_file_entry_bytes(
     e[21] = eof as u8;
     e[22] = (eof >> 8) as u8;
     e[23] = (eof >> 16) as u8;
-    let (date, time) = make_prodos_datetime_now();
+    let (date, time) = match mtime_secs {
+        Some(s) => crate::fs::times::unix_to_prodos_datetime(s),
+        None => make_prodos_datetime_now(),
+    };
     let cd = date.to_le_bytes();
     e[24] = cd[0];
     e[25] = cd[1];
@@ -1021,7 +1032,8 @@ fn build_file_entry_bytes(
 }
 
 /// Build a 39-byte subdirectory entry (type nibble 0xD) for the parent directory.
-fn build_subdir_entry_bytes(name: &str, key_ptr: u16) -> [u8; 39] {
+/// See [`build_file_entry_bytes`] for the mtime semantics.
+fn build_subdir_entry_bytes(name: &str, key_ptr: u16, mtime_secs: Option<u64>) -> [u8; 39] {
     let mut e = [0u8; 39];
     let name_bytes = name.as_bytes();
     let name_len = name_bytes.len().min(15) as u8;
@@ -1034,7 +1046,10 @@ fn build_subdir_entry_bytes(name: &str, key_ptr: u16) -> [u8; 39] {
     // blocks_used = 1 (the key block itself)
     e[19] = 1;
     e[20] = 0;
-    let (date, time) = make_prodos_datetime_now();
+    let (date, time) = match mtime_secs {
+        Some(s) => crate::fs::times::unix_to_prodos_datetime(s),
+        None => make_prodos_datetime_now(),
+    };
     let cd = date.to_le_bytes();
     e[24] = cd[0];
     e[25] = cd[1];
@@ -1050,7 +1065,13 @@ fn build_subdir_entry_bytes(name: &str, key_ptr: u16) -> [u8; 39] {
 }
 
 /// Build a 39-byte subdirectory header entry (type nibble 0xE) for slot 0 of a new dir block.
-fn build_subdir_header_bytes(name: &str, parent_key_block: u16, parent_entry_num: u8) -> [u8; 39] {
+/// See [`build_file_entry_bytes`] for the mtime semantics.
+fn build_subdir_header_bytes(
+    name: &str,
+    parent_key_block: u16,
+    parent_entry_num: u8,
+    mtime_secs: Option<u64>,
+) -> [u8; 39] {
     let mut e = [0u8; 39];
     let name_bytes = name.as_bytes();
     let name_len = name_bytes.len().min(15) as u8;
@@ -1060,7 +1081,10 @@ fn build_subdir_header_bytes(name: &str, parent_key_block: u16, parent_entry_num
     e[16] = 0x75;
     // Bytes 17-23: reserved
     // Bytes 24-25: creation date, 26-27: creation time
-    let (date, time) = make_prodos_datetime_now();
+    let (date, time) = match mtime_secs {
+        Some(s) => crate::fs::times::unix_to_prodos_datetime(s),
+        None => make_prodos_datetime_now(),
+    };
     let cd = date.to_le_bytes();
     e[24] = cd[0];
     e[25] = cd[1];
@@ -1139,26 +1163,30 @@ fn days_to_ymd(days: i64) -> (i32, u32, u32) {
     (year as i32, m, d)
 }
 
-/// Validate a ProDOS filename: 1-15 chars, A-Z/0-9/period, first char must be a letter.
-/// Returns the uppercase name.
-fn validate_prodos_name(name: &str) -> Result<String, FilesystemError> {
+/// Validate a ProDOS name: 1-15 chars, A-Z/0-9/period, first char must be a
+/// letter. Returns the uppercase name.
+///
+/// `what` names the thing being validated — "filename" or "volume name". The
+/// rules govern both, but every message said "rename the file" even when the
+/// offending string was a volume name (R-006).
+fn validate_prodos_name(name: &str, what: &str) -> Result<String, FilesystemError> {
     if name.is_empty() {
-        return Err(FilesystemError::InvalidData(
-            "filename is empty — pick a non-blank name".into(),
-        ));
+        return Err(FilesystemError::InvalidData(format!(
+            "{what} is empty — pick a non-blank name"
+        )));
     }
     let upper = name.to_ascii_uppercase();
     let bytes = upper.as_bytes();
     if bytes.len() > 15 {
         return Err(FilesystemError::InvalidData(format!(
-            "filename is too long ({} chars); ProDOS allows up to 15 — shorten the name",
+            "{what} is too long ({} chars); ProDOS allows up to 15 — shorten it",
             bytes.len()
         )));
     }
     if !bytes[0].is_ascii_alphabetic() {
         return Err(FilesystemError::InvalidData(format!(
-            "filename starts with '{}' — ProDOS requires the first character to be a letter \
-             (A-Z); rename so it begins with a letter",
+            "{what} starts with '{}' — ProDOS requires the first character to be a letter \
+             (A-Z); change it to begin with a letter",
             upper.chars().next().unwrap_or('?')
         )));
     }
@@ -1166,8 +1194,8 @@ fn validate_prodos_name(name: &str) -> Result<String, FilesystemError> {
         if !b.is_ascii_alphanumeric() && b != b'.' {
             let c = upper.chars().nth(i).unwrap_or('?');
             return Err(FilesystemError::InvalidData(format!(
-                "filename contains '{c}' — ProDOS allows only letters (A-Z), digits (0-9), \
-                 and '.'; rename the file (spaces and most punctuation are not allowed)"
+                "{what} contains '{c}' — ProDOS allows only letters (A-Z), digits (0-9), \
+                 and '.' (spaces and most punctuation are not allowed)"
             )));
         }
     }
@@ -1218,7 +1246,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ProDosFilesystem<R> {
         data_len: u64,
         options: &CreateFileOptions,
     ) -> Result<FileEntry, FilesystemError> {
-        let validated_name = validate_prodos_name(name)?;
+        let validated_name = validate_prodos_name(name, "filename")?;
         let dir_key_block = parent.location as u16;
 
         // Check for duplicate
@@ -1256,7 +1284,10 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ProDosFilesystem<R> {
             (kp, bu, 3u8)
         };
 
-        // Build directory entry
+        // Build directory entry. Cross-fs copy passes source mtime through
+        // options.unix_times; a genuinely new file leaves it None and stamps
+        // `now`. ProDOS is minute-granular so sub-minute precision is lost.
+        let mtime = options.unix_times.map(|t| t.mtime_or_now());
         let entry_bytes = build_file_entry_bytes(
             &validated_name,
             file_type,
@@ -1265,6 +1296,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ProDosFilesystem<R> {
             key_ptr,
             blocks_used,
             eof,
+            mtime,
         );
 
         // Find slot and write
@@ -1282,6 +1314,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ProDosFilesystem<R> {
         fe.prodos_file_type = Some(file_type);
         fe.aux_type = Some(aux_type);
         fe.mode = Some(storage_type as u32);
+        fe.modified_unix = mtime.or_else(|| Some(crate::fs::times::now()));
         Ok(fe)
     }
 
@@ -1289,9 +1322,9 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ProDosFilesystem<R> {
         &mut self,
         parent: &FileEntry,
         name: &str,
-        _options: &CreateDirectoryOptions,
+        options: &CreateDirectoryOptions,
     ) -> Result<FileEntry, FilesystemError> {
-        let validated_name = validate_prodos_name(name)?;
+        let validated_name = validate_prodos_name(name, "filename")?;
         let parent_key_block = parent.location as u16;
 
         // Check for duplicate
@@ -1309,7 +1342,9 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ProDosFilesystem<R> {
         let (entry_block, entry_slot) = self.find_free_dir_slot(parent_key_block)?;
 
         // Build subdirectory key block with header at slot 0
-        let header = build_subdir_header_bytes(&validated_name, parent_key_block, entry_slot as u8);
+        let mtime = options.unix_times.map(|t| t.mtime_or_now());
+        let header =
+            build_subdir_header_bytes(&validated_name, parent_key_block, entry_slot as u8, mtime);
         let mut new_block_data = [0u8; 512];
         // prev_block = 0, next_block = 0 (bytes 0-3)
         // Header at slot 0 (offset 4)
@@ -1317,7 +1352,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ProDosFilesystem<R> {
         self.write_block(new_key_block, &new_block_data)?;
 
         // Build parent directory entry (type 0xD)
-        let subdir_entry = build_subdir_entry_bytes(&validated_name, new_key_block);
+        let subdir_entry = build_subdir_entry_bytes(&validated_name, new_key_block, mtime);
         self.write_dir_entry(entry_block, entry_slot, &subdir_entry)?;
         self.update_dir_file_count(parent_key_block, 1)?;
 
@@ -1327,11 +1362,9 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ProDosFilesystem<R> {
             format!("{}/{validated_name}", parent.path)
         };
 
-        Ok(FileEntry::new_directory(
-            validated_name,
-            path,
-            new_key_block as u64,
-        ))
+        let mut fe = FileEntry::new_directory(validated_name, path, new_key_block as u64);
+        fe.modified_unix = mtime.or_else(|| Some(crate::fs::times::now()));
+        Ok(fe)
     }
 
     fn delete_entry(
@@ -1439,7 +1472,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ProDosFilesystem<R> {
             return Ok(());
         }
         // Uppercases and validates (length / first-letter / allowed chars).
-        let validated = validate_prodos_name(new_name)?;
+        let validated = validate_prodos_name(new_name, "filename")?;
         let dir_key_block = parent.location as u16;
 
         // Reject a collision with a *different* entry. ProDOS folds case, so a
@@ -1724,7 +1757,7 @@ pub fn validate_prodos_integrity(
 /// block below is reserved by clearing its bit. The result round-trips through
 /// [`ProDosFilesystem::open`] and passes `fsck` clean.
 pub fn create_blank_prodos(size_bytes: u64, name: &str) -> anyhow::Result<Vec<u8>> {
-    let vname = validate_prodos_name(name).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let vname = validate_prodos_name(name, "volume name").map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // total_blocks is a u16 field: ProDOS tops out at 65535 blocks (~32 MiB).
     // Floor at 16 blocks (8 KiB) so boot + directory + bitmap always fit with
@@ -1948,16 +1981,22 @@ fn list_prodos_directory<R: Read + Seek>(
 
             let modified = parse_prodos_datetime(modified_date, modified_time)
                 .or_else(|| parse_prodos_datetime(creation_date, creation_time));
+            let modified_unix =
+                crate::fs::times::prodos_datetime_to_unix(modified_date, modified_time).or_else(
+                    || crate::fs::times::prodos_datetime_to_unix(creation_date, creation_time),
+                );
 
             if type_nibble == 0xD {
                 // Subdirectory entry: key_pointer is the subdirectory key block.
                 let mut fe = FileEntry::new_directory(name, path, key_pointer as u64);
                 fe.modified = modified;
+                fe.modified_unix = modified_unix;
                 result.push(fe);
             } else {
                 // Regular file: seedling (1), sapling (2), or tree (3).
                 let mut fe = FileEntry::new_file(name, path, eof as u64, key_pointer as u64);
                 fe.modified = modified;
+                fe.modified_unix = modified_unix;
                 fe.prodos_file_type = Some(file_type);
                 fe.aux_type = Some(aux_type);
                 // Store storage type in `mode` so read_file can dispatch correctly.
@@ -2767,21 +2806,21 @@ mod tests {
 
     #[test]
     fn test_name_validation() {
-        assert!(validate_prodos_name("HELLO").is_ok());
-        assert!(validate_prodos_name("A.FILE").is_ok());
-        assert!(validate_prodos_name("hello").is_ok()); // lowercased → OK
-        assert_eq!(validate_prodos_name("hello").unwrap(), "HELLO");
+        assert!(validate_prodos_name("HELLO", "filename").is_ok());
+        assert!(validate_prodos_name("A.FILE", "filename").is_ok());
+        assert!(validate_prodos_name("hello", "filename").is_ok()); // lowercased → OK
+        assert_eq!(validate_prodos_name("hello", "filename").unwrap(), "HELLO");
 
         // Invalid: empty
-        assert!(validate_prodos_name("").is_err());
+        assert!(validate_prodos_name("", "filename").is_err());
         // Invalid: too long (16 chars)
-        assert!(validate_prodos_name("ABCDEFGHIJKLMNOP").is_err());
+        assert!(validate_prodos_name("ABCDEFGHIJKLMNOP", "filename").is_err());
         // Invalid: starts with digit
-        assert!(validate_prodos_name("1FILE").is_err());
+        assert!(validate_prodos_name("1FILE", "filename").is_err());
         // Invalid: contains space
-        assert!(validate_prodos_name("MY FILE").is_err());
+        assert!(validate_prodos_name("MY FILE", "filename").is_err());
         // Invalid: special chars
-        assert!(validate_prodos_name("FILE/NAME").is_err());
+        assert!(validate_prodos_name("FILE/NAME", "filename").is_err());
     }
 
     /// Read the access byte for `path` directly from its on-disk directory

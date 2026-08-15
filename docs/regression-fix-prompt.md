@@ -3,15 +3,23 @@
 A handoff for fixing the defects in [`Regression_Bugs.md`](Regression_Bugs.md).
 Paste a tranche into a fresh session; each is independently shippable.
 
-**Readiness, honestly.** 30 findings are open. 11 are specified well enough to
-fix without further investigation. 9 more have an unambiguous symptom and a
-red case but need real engine work. 8 cannot be turned into a fix prompt yet —
-the symptom is known and the cause is not, so a prompt would be guessing. 2 are
-decisions rather than defects and must not be quietly resolved by whoever
-picks them up.
+**Readiness, honestly.** Written when 30 findings were open. **Two remain as of
+2026-08-14** — R-039 (EFS free list, filed after this document was written) and
+R-011 (blocked on fixtures, not on effort). Everything this document was built
+to hand off has been handed off and done.
 
-One prompt for all 30 would be the wrong shape. The tranches below are sized
-to be reviewable.
+Tranche C — the eight where "the symptom is known and the cause is not", the
+state that does not clear on its own — cleared. Six were fixed, two turned out
+not to be defects, and R-011 is the only row still live. That happened between
+2026-08-10 and 2026-08-14, so if you are reading this expecting work, read
+[`Regression_Bugs.md`](Regression_Bugs.md) first: this file is now mostly a
+record of how the tranche was worked rather than a queue.
+
+Struck-through rows are kept rather than deleted: the "what to do" column
+records what each fix turned on, and two of them turned on the *report being
+wrong*, which is the most reusable thing in this document.
+
+The tranches below are sized to be reviewable.
 
 ---
 
@@ -22,8 +30,8 @@ to be reviewable.
    the wrong thing, say so and change it deliberately; do not weaken it to get
    green.
 2. **Each fix must turn its named case green and leave every other case
-   unchanged.** `rb-regress run` is 226–228 pass / 33–35 xfail / 0 fail on
-   Windows, macOS and Linux at `c3e1984`. A fix that trades one red for
+   unchanged.** `rb-regress run` is **254 pass / 19 xfail / 0 fail** on
+   Windows, macOS and Linux at `c6e66fd`. A fix that trades one red for
    another is not a fix.
 3. **Remove the entry from `regression-tests/data/known-failures.toml`** when a
    finding goes green, and strike the row through in `Regression_Bugs.md`,
@@ -47,28 +55,30 @@ to be reviewable.
 
 ## Tranche A — fully specified, mechanical
 
-Eleven findings. Each has a repro, an expected behaviour, and a red case. No
-investigation needed; the work is deciding the exact wording and doing it.
+**Empty as of 2026-08-09** except the two that are blocked upstream. Eleven
+findings started here; nine are fixed and struck through below, kept because
+the "what to do" column records the decision each one turned on.
 
 | Finding | Case that must go green | What to do |
 |---|---|---|
-| R-006 | `fs.new-volume.prodos-default-name` | Default volume name `rusty-backup` contains `-`, which ProDOS forbids, so the verb always fails with defaults. Change the default (per-fs, or sanitise), and fix the message — it says "rename the file" when the offending string is the *volume* name. |
-| R-004 | `cli.exit.{csv,tsv}-on-nested-verb-is-usage-error`, `shrink.rejects-non-chd-output` | CSV/TSV rejection exits 1; documented as 2. Usage errors are 2. |
-| R-005 | `cli.envelope.error-envelope-on-failure` | No error envelope is emitted under `--format json`. Failures must produce the same envelope shape as successes. |
-| R-003 | `cli.envelope.ls-supports-format` | **Decision.** Docs claim `ls` supports `--format`; it does not. Either implement it or correct the docs. Do not assume — see Decisions below. |
-| R-010 | `cli.flags.inspect-accepts-fs-type` | `inspect` has no `--fs-type`, so CP/M images cannot be inspected. `ls` already accepts it (`cli.flags.ls-accepts-fs-type` is green) — mirror that. |
-| R-026 | `subcmd.show.partmap` | `show partmap` cannot read an SGI disk that `inspect` reads fine. Two code paths disagree; make `show` use the one that works. |
-| R-027 | `read.apfs.apple-gpt` | A Finder-made `.zip` holding one `.dmg` is rejected as ambiguous because `__MACOSX/._*` counts as a second candidate. Ignore the AppleDouble sidecar. Every zip made on a Mac has one. |
-| R-034 | `edit.readonly.{lisa,alto}-refuses-a-write` | Refusing a write to a read-only FS reports the type as `unknown` and exits 1. Refusing is correct; the type should be the one `ls`/`inspect` just reported, and the exit code 4. **Check whether this also fixes R-031** — same shape. |
-| R-015 | `optical.cue.unpadded-track-number` | A `.cue` with `TRACK 1` (unpadded) is rejected. Accept it. |
-| R-012 | `optical.cdda.no-data-track-opens` | `optical info` rejects any disc with no data track (pure CD-DA). `optical.cdda.mixed-mode-still-opens` is the green working-half — keep it green. |
-| R-001, R-002 | none (doc drift) | README partition-table list is missing AHDI and X68000; `src/fs/README.md` still lists ext as "planned". Both would be caught by the source-parity test noted below. |
+| ~~R-006~~ **FIXED** | `fs.new-volume.prodos-default-name` | Default volume name `rusty-backup` contains `-`, which ProDOS forbids, so the verb always fails with defaults. Change the default (per-fs, or sanitise), and fix the message — it says "rename the file" when the offending string is the *volume* name. |
+| ~~R-004~~ **FIXED** | `cli.exit.{csv,tsv}-on-nested-verb-is-usage-error`, `shrink.rejects-non-chd-output` | CSV/TSV rejection exits 1; documented as 2. Usage errors are 2. |
+| ~~R-005~~ **FIXED** | `cli.envelope.error-envelope-on-failure` | No error envelope is emitted under `--format json`. Failures must produce the same envelope shape as successes. |
+| ~~R-003~~ **FIXED** | `cli.envelope.ls-supports-format` | ~~**Decision.**~~ Decided: implement. Docs claim `ls` supports `--format`; it does not. Either implement it or correct the docs. Do not assume — see Decisions below. |
+| ~~R-010~~ **FIXED** | `cli.flags.inspect-accepts-fs-type` | `inspect` has no `--fs-type`, so CP/M images cannot be inspected. `ls` already accepts it (`cli.flags.ls-accepts-fs-type` is green) — mirror that. |
+| ~~R-026~~ **FIXED** | `subcmd.show.partmap` | `show partmap` cannot read an SGI disk that `inspect` reads fine. Two code paths disagree; make `show` use the one that works. |
+| ~~R-027~~ **FIXED** | `read.apfs.apple-gpt` | A Finder-made `.zip` holding one `.dmg` is rejected as ambiguous because `__MACOSX/._*` counts as a second candidate. Ignore the AppleDouble sidecar. Every zip made on a Mac has one. |
+| ~~R-034~~ **FIXED** | `edit.readonly.{lisa,alto}-refuses-a-write` | Refusing a write to a read-only FS reports the type as `unknown` and exits 1. Refusing is correct; the type should be the one `ls`/`inspect` just reported, and the exit code 4. **Check whether this also fixes R-031** — same shape. |
+| R-015 **blocked upstream** | `optical.cue.unpadded-track-number` | A `.cue` with `TRACK 1` (unpadded) is rejected. Accept it. |
+| R-012 **blocked upstream** | `optical.cdda.no-data-track-opens` | `optical info` rejects any disc with no data track (pure CD-DA). `optical.cdda.mixed-mode-still-opens` is the green working-half — keep it green. |
+| ~~R-001, R-002~~ **FIXED** | `tests/doc_parity.rs` (three tests) | README partition-table list is missing AHDI and X68000; `src/fs/README.md` still lists ext as "planned". Both would be caught by the source-parity test noted below. |
 
-**Worth doing while in here:** R-001/R-002/R-018 are all documentation drifting
-from code, and all three were found by hand. A source-parity test — comparing
-the README tables against the `PartitionTable` enum and the `fs/mod.rs`
-dispatch — would guard the whole class. It is currently listed as "Not
-covered" in `Regression_Bugs.md`.
+**That source-parity test now exists.** `tests/doc_parity.rs` covers R-001,
+R-002 and R-018 — the README partition-table list against
+`PartitionTable::ALL_TYPE_NAMES`, `src/fs/README.md` against a capability table
+growing back, and CONTRIBUTING.md's vintage feature list against the workflow's.
+It is a `cargo test`, not an `rb-regress` case, because the claim is *about* the
+binary rather than something the binary does.
 
 ---
 
@@ -77,17 +87,21 @@ covered" in `Regression_Bugs.md`.
 Nine findings. The symptom is unambiguous and reproducible; the fix is not
 mechanical. Take these one at a time.
 
-**Highest value first — these three are silent data loss or silent no-ops,
-the worst failure shape in a tool whose job is moving data:**
+**The three highest-value ones are done (2026-08-09) — and two of the three
+were filed with the wrong cause, which is the lesson worth carrying:**
 
-- **R-021** (`resize.to-explicit-size`) — `resize --size 16M` on an 8M volume
-  prints "resize complete", exits 0, changes nothing. Nothing downstream has
-  any reason to check.
-- **R-023** (`resize.repack.keeps-data`) — `repack` exits 0 and every file in
-  the volume is gone. Human68k.
-- **R-022** (`roundtrip.hpfs.raw`) — `backup --sector-by-sector` then `restore`
-  is not byte-identical for HPFS. FAT, NTFS, ext4, HFS, minix3, EFS and ProDOS
-  all survive the same path, so it is HPFS-specific, not a backup-format bug.
+- ~~**R-021**~~ — fixed. Not a no-op: it warned and proceeded, leaving a
+  filesystem describing twice the blocks its container held. `resize` now grows
+  the file when the volume *is* the file, and refuses otherwise.
+- ~~**R-023**~~ — fixed. **Nothing was lost.** A FAT long filename was dropped
+  because `repack`, documented Human68k-only, accepted a plain FAT volume.
+  Scope guard added.
+- ~~**R-022**~~ — fixed. **Not a fidelity bug.** A bare HPFS volume was
+  detected as an empty MBR, so `backup` wrote no partition file at all and
+  exited 0. A detection probe closed it.
+
+Reproduce and *measure* before fixing. Both wrong diagnoses had a one-command
+control: count the non-zero bytes; list the backup folder.
 
 **Then:**
 
@@ -107,11 +121,14 @@ the worst failure shape in a tool whose job is moving data:**
   single-leaf-only, so this is the known ceiling being hit, not a surprise.
 - **R-033** (`read.qdos.microdrive`) — a QL Microdrive `.mdv` fails at MBR
   detection although its own probe matches it exactly. Detection ordering.
-- **R-016** (`backup.container.{chd,vhd-dynamic,qcow2,vmdk-sparse}`) —
-  **Decision.** `backup` accepts only flat-layout sources.
-  `backup.container.inspect-reads-what-backup-cannot` is green and proves
-  `inspect` opens exactly what `backup` refuses. Is this a defect or an
-  unimplemented feature? See Decisions.
+  **Very likely the same shape as R-022**, which was a bare volume falling
+  through to the MBR parse because no probe in `detect_superfloppy` claimed it.
+  Read that fix first.
+- ~~**R-016**~~ — **decided 2026-08-09: an unimplemented feature, not a
+  defect.** Moved to
+  [F-008](missing_features_from_regression.md#f-008); the four cases keep their
+  assertions and now cite F-008, which `rb-regress validate` accepts as of the
+  same date. No longer in this tranche.
 
 ---
 
@@ -123,39 +140,41 @@ first, and the investigation is the deliverable.
 
 | Finding | Case | What the investigation has to establish |
 |---|---|---|
-| R-020 | none — hand-verified | Every AFFS volume we write is "Not a DOS disk" on a real Amiga, at every size. Working hypothesis: root block `header_key` must be 0 and we write the block number. **Unconfirmed.** The fix must land in **both** the formatter and `affs_fsck`, which currently agree with each other and are both wrong. Needs an emulator or hardware oracle to confirm — see Blocked below. |
-| R-030 | `edit.real.affs-workbench13` | A real Workbench 1.3 AFFS volume cannot be opened at all — read, fsck and write alike. Establish whether this is OFS-vs-FFS, an older root-block layout, or the same root cause as R-020. |
-| R-029 | `edit.real.efs-small` | EFS computes block addresses far outside the image; `fsck` fails on an unmodified volume. Find where the address computation diverges from the on-disk geometry. |
-| R-013 | `fs.detect.ufs-{solaris-entry-types,no-absurd-sizes}` | Solaris UFS directories are reported as files, one with a garbage size. Likely endianness or cylinder-group layout. |
-| R-028 | `edit.apple-dos.put-get` | Apple DOS 3.3 reports three sizes for one file: 104 in, 512 by `ls`, 256 by `get`. Establish which is right and which two are wrong. |
-| R-031 | `edit.real.apple-dos-invaders` | A real Apple DOS 3.3 disk detects as `unknown` although our own output does not. **Try R-034's fix first** — same shape, and one fix may cover both. |
-| R-035 | none — a `parity` finding | `.cbk` embeds `source_device`, the producing host's absolute path, so it is not reproducible across machines and leaks the host's directory layout. **Decision** before any fix: keep the field, normalise it, or record a device identity instead. Note `expect_divergence` masks byte *ranges* and cannot express a divergence that changes the file's *length*. |
+| ~~R-020~~ | `oracles/fsuae/affs_mount.py` | ~~Every AFFS volume we write is "Not a DOS disk" on a real Amiga.~~ **CLOSED 2026-08-14.** The hypothesis was right: `header_key` had to be 0, and the bitmap was a block short of the geometry. Both fixed by a190182; Kickstart 3.1 then mounted the volume Read/Write. The half of the prediction that was *wrong* is worth keeping — the fix did **not** need to land in `affs_fsck`, which never inspected `header_key` at all. |
+| ~~R-030~~ | `edit.real.affs-workbench13` | ~~A real Workbench 1.3 AFFS volume cannot be opened at all.~~ **CLOSED 2026-08-10** — neither OFS-vs-FFS nor a root-block layout difference: the root block was being located from the end of the *file* rather than the partition. Related to R-020 but not the same root cause. |
+| ~~R-029~~ | `edit.real.efs-small` | ~~EFS computes block addresses far outside the image.~~ **NOT A DEFECT, 2026-08-10** — the fixture is a deliberate 4 MB prefix capture, and the case asked it to do what a prefix cannot. |
+| ~~R-013~~ | `fs.detect.ufs-{solaris-entry-types,no-absurd-sizes}` | ~~Solaris UFS directories reported as files.~~ **CLOSED 2026-08-10** — cylinder-group layout, as guessed: UFS1's rotational cylinder-group offset was ignored. Not endianness. |
+| ~~R-028~~ | `edit.apple-dos.put-get` | ~~Apple DOS 3.3 reports three sizes for one file.~~ **CLOSED 2026-08-10** — the length lives in a type-B header and was not being stored; all three now agree. |
+| ~~R-031~~ | `edit.real.apple-dos-invaders` | ~~A real Apple DOS 3.3 disk detects as `unknown`.~~ **NOT A DEFECT, 2026-08-10** — the disk carries no filesystem at all, so `Unknown` is the correct answer. R-034's fix was unrelated. |
+| ~~R-035~~ | none — a `parity` finding | ~~`.cbk` embeds the producing host's absolute path.~~ **CLOSED 2026-08-09** — decided and shipped: the path is normalised to a device leaf. |
 | R-011 | `fmt.g64.standard-dump-opens` (working half only) | G64 decoding fails on copy-protected / patched dumps. **Deliberately undecided** — whether it *should* succeed is an open question, and asserting either way prejudges it. Decide scope before writing anything. |
 
 ---
 
 ## Decisions that must not be quietly resolved
 
-Four. Each changes what the fix is, so they belong to the maintainer, not to
-whoever picks up the ticket.
+Four were open. Three are now answered; each changed what the fix was, which
+is why they belonged to the maintainer rather than to whoever picked up the
+ticket.
 
-1. **R-003** — implement `ls --format`, or correct the docs?
-2. **R-016** — is "backup refuses non-flat containers" a defect or an
-   unimplemented feature? It is currently filed as a defect with four red
-   cases; if it is a feature, it belongs in
-   `missing_features_from_regression.md` and the cases should move to a
-   capability list.
-3. **R-035** — keep, normalise, or replace `source_device`?
-4. **R-011** — should copy-protected G64 dumps open at all?
+1. ~~**R-003**~~ — **decided: implement the flag**, not correct the doc. `ls`
+   is the most script-facing verb in the CLI. Shipped 2026-08-09.
+2. ~~**R-016**~~ — **decided: an unimplemented feature.** Moved to
+   [F-008](missing_features_from_regression.md#f-008), cases retagged,
+   `validate` taught to accept an F-nnn citation. 2026-08-09.
+3. ~~**R-035**~~ — **decided: normalise the path** to a device leaf rather than
+   keeping the absolute path or inventing a device identity.
+4. **R-011** — should copy-protected G64 dumps open at all? **Still open.**
 
 ---
 
 ## Blocked on something other than effort
 
-- **R-020** needs an emulator or hardware oracle. All 62 emulator and
-  MiSTer-core oracles resolve to `skip-manual`: `verify` cannot invoke them,
-  so no automated run can confirm a fix. Either book MiSTer time, or teach
-  `verify` to drive FS-UAE — which is the next harness feature regardless.
+- ~~**R-020** needs an emulator or hardware oracle.~~ **Unblocked 2026-08-14.**
+  The suggested route was the one taken: `verify` was taught to drive FS-UAE,
+  via `oracles/fsuae/affs_mount.py`. No MiSTer time was needed. The other
+  ~60 emulator and MiSTer-core oracles are still `skip-manual` — this
+  unblocked one, not the class.
 - The MiSTer's `rb-cli` is from 2026-07-27 and must be redeployed before its
   12 core oracles mean anything.
 

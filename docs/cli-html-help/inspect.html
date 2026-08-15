@@ -23,6 +23,14 @@
 <dd>Password for encrypted containers (currently: WinImage IMZ, and password-protected `.zip` disks)</dd>
 <dt><code>--inside</code></dt>
 <dd>For a `.zip` holding more than one disk image, the archive entry to open (e.g. `--inside backup.img`). Matched by exact name, then case- insensitively, then by basename. Ignored for non-zip sources</dd>
+<dt><code>--fs-type</code></dt>
+<dd>Force a specific filesystem dispatch. The main use is `cpm:&lt;preset&gt;` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zxplus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch</dd>
+<dt><code>--carve-full</code></dt>
+<dd>Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga &quot;NDOS&quot; disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem</dd>
+<dt><code>--expect-fs</code></dt>
+<dd>Assert the disk carries this filesystem, e.g. `--expect-fs &quot;DOS 3.3&quot;`. Exits non-zero when no partition matches. Case, spacing and punctuation are ignored; the comparison is exact after that, so `FAT` does not satisfy `exFAT`</dd>
+<dt><code>--expect-layout</code></dt>
+<dd>Assert the disk's shape: `superfloppy` (a filesystem at sector 0, no table), `partitioned` (any table), or a scheme by name — `mbr`, `gpt`, `apm`, `rdb`, `sgi`, `sun`, `ahdi`, `x68k`, `dsd`, `none`. An unrecognised word is a usage error, not a failed assertion</dd>
 </dl>
 <footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_docs</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
 </body></html>

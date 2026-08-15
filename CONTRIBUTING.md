@@ -334,6 +334,29 @@ That feature list is exactly what CI's Windows vintage leg builds (`.github/work
 
 The definitive check is an actual `rustup toolchain install 1.73.0` build of that manifest; the command above is the cheap proxy that catches the wiring mistakes (wrong shim path, raw `io::Error::other` left in, unused imports).
 
+### The pipeline builds more than your machine does
+
+A green `cargo test` and a green `rb-regress run` are not a green pipeline.
+Run this before pushing:
+
+```bash
+scripts/preflight.sh
+```
+
+It runs what CI runs: `cargo test --release` (CI's test step is release, not
+debug), the MiSTer feature set (`optical` on, `native-zstd` off — anything
+touching zstd must go through `crate::rbformats::zstd_compat`, never the `zstd`
+crate directly), the Rust 1.73 vintage floor, and the doc-parity tests.
+
+**After pushing, read the job list, not the run conclusion.** Several jobs are
+`continue-on-error: true` — the MiSTer `rb-cli-mini` build among them — so they
+can fail while `gh run list` still reports the run as `success`. That hid a
+compile error for a day.
+
+```bash
+gh run view <run-id>
+```
+
 ### mrustc mis-lowers `leading_zeros` / `leading_ones` on narrow integers
 
 The PowerPC build (`rb-cli-ppc`, via mrustc's C backend — see `scripts/build-ppc.sh`)

@@ -132,7 +132,7 @@ fn reserve_above_fs_size(bm: &mut [u8], fs_size: u32) {
     let total_bits = (bm.len() as u64 * 8).min(u32::MAX as u64) as u32;
     for blk in fs_size..total_bits {
         let by = (blk / 8) as usize;
-        let bb = 7 - (blk % 8);
+        let bb = blk % 8;
         bm[by] &= !(1u8 << bb); // set bit = free, so clear = in use
     }
 }
@@ -275,7 +275,7 @@ pub fn grow_efs<R: Read + Write + Seek>(
                     // and it is already reserved by that very fact.
                     continue;
                 }
-                let bb = 7 - (blk % 8);
+                let bb = blk % 8;
                 // set bit = free, so in-use means the bit is CLEAR.
                 if bm[by] & (1u8 << bb) == 0 {
                     return Err(FilesystemError::InvalidData(format!(
@@ -311,7 +311,7 @@ pub fn grow_efs<R: Read + Write + Seek>(
             if by >= bm.len() {
                 break;
             }
-            let bb = 7 - (blk % 8);
+            let bb = blk % 8;
             bm[by] |= 1u8 << bb;
         }
         // ...then take back everything past the volume, replica included.
@@ -349,7 +349,7 @@ pub fn grow_efs<R: Read + Write + Seek>(
                 if by >= bm.len() {
                     break;
                 }
-                let bb = 7 - (blk % 8);
+                let bb = blk % 8;
                 // set bit = free; mark inode region as in-use by clearing.
                 bm[by] &= !(1u8 << bb);
             }
@@ -461,7 +461,7 @@ fn relocate_bitmap<R: Read + Write + Seek>(
         if by >= bm.len() {
             break;
         }
-        let bb = 7 - (blk % 8);
+        let bb = blk % 8;
         bm[by] |= 1u8 << bb;
     }
 
@@ -961,7 +961,7 @@ mod tests {
         }
         let mark_in_use = |img: &mut Vec<u8>, b: u32| {
             let by = (b / 8) as usize;
-            let bb = 7 - (b % 8);
+            let bb = b % 8;
             img[bm_off + by] &= !(1 << bb);
         };
         for b in 0..T_FIRSTCG {

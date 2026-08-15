@@ -299,6 +299,11 @@ fn run_action(disk: &DiskDevice, action: Action) -> Result<()> {
                 format: OutputFormat::Text,
                 password: None,
                 inside: None,
+                fs_override: Default::default(),
+                // The appliance screen reports what it finds; asserting is for
+                // scripted callers.
+                expect_fs: None,
+                expect_layout: None,
             });
             report(r, "inspect");
         }

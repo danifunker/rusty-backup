@@ -1852,6 +1852,10 @@ impl<R: Read + Write + Seek> HfsFilesystem<R> {
     }
 
     /// Build a classic HFS file record (102 bytes).
+    /// `mtime_secs = Some(secs)` stamps that Unix time as both create and
+    /// modify dates (a cross-fs copy carrying the source mtime through);
+    /// `None` stamps `now` (a genuinely new file). The after-create
+    /// `set_dates` Commander path still overrides both.
     #[allow(clippy::too_many_arguments)]
     fn build_file_record(
         file_id: u32,
@@ -1864,9 +1868,13 @@ impl<R: Read + Write + Seek> HfsFilesystem<R> {
         type_code: &[u8; 4],
         creator_code: &[u8; 4],
         block_size: u32,
+        mtime_secs: Option<u64>,
     ) -> [u8; 102] {
         let mut rec = [0u8; 102];
-        let now = hfs_common::hfs_now();
+        let now = match mtime_secs {
+            Some(s) => super::times::unix_to_mac_epoch(s),
+            None => hfs_common::hfs_now(),
+        };
         rec[0] = CATALOG_FILE as u8; // cdrType
                                      // rec[1] = reserved
                                      // FInfo at offset 4: fdType(4) + fdCreator(4)
@@ -1906,10 +1914,16 @@ impl<R: Read + Write + Seek> HfsFilesystem<R> {
         rec
     }
 
-    /// Build a classic HFS directory record (70 bytes).
-    fn build_dir_record(dir_id: u32) -> [u8; 70] {
+    /// Build a classic HFS directory record (70 bytes). `mtime_secs = Some(secs)`
+    /// stamps that Unix time into the create and modify dates (a cross-fs
+    /// copy carrying the source mtime through); `None` stamps `now`. The
+    /// after-create Commander `set_dates` path still overrides both.
+    fn build_dir_record_with_dates(dir_id: u32, mtime_secs: Option<u64>) -> [u8; 70] {
         let mut rec = [0u8; 70];
-        let now = hfs_common::hfs_now();
+        let now = match mtime_secs {
+            Some(s) => super::times::unix_to_mac_epoch(s),
+            None => hfs_common::hfs_now(),
+        };
         rec[0] = CATALOG_DIR as u8; // cdrType
                                     // dirFlags at offset 2 (u16) = 0
                                     // dirVal at offset 4 (u16) = 0 (child count)
@@ -2712,6 +2726,7 @@ impl<R: Read + Seek + Send> Filesystem for HfsFilesystem<R> {
             size: 0,
             location: 2, // HFS root directory CNID
             modified: None,
+            modified_unix: None,
             type_code: None,
             creator_code: None,
             symlink_target: None,
@@ -2752,6 +2767,7 @@ impl<R: Read + Seek + Send> Filesystem for HfsFilesystem<R> {
                     };
                     let mut fe = FileEntry::new_directory(name, path, dir_id as u64);
                     fe.modified = hfs_common::format_mac_date(dates.1);
+                    fe.modified_unix = hfs_common::mac_date_to_unix(dates.1);
                     fe.mac_dates = Some(dates);
                     entries.push(fe);
                 }
@@ -2777,6 +2793,7 @@ impl<R: Read + Seek + Send> Filesystem for HfsFilesystem<R> {
                     fe.creator_code = Some(creator_code);
                     fe.finder_flags = Some(finder_flags);
                     fe.modified = hfs_common::format_mac_date(dates.1);
+                    fe.modified_unix = hfs_common::mac_date_to_unix(dates.1);
                     fe.mac_dates = Some(dates);
                     if rsrc_size > 0 {
                         fe.resource_fork_size = Some(rsrc_size as u64);
@@ -3034,7 +3051,11 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
                     (0, 0, 0)
                 };
 
-            // Build file record
+            // Build file record. A cross-fs copy passes the source mtime
+            // through `options.unix_times`; a genuinely new file leaves it None
+            // and takes `now`. Commander's `PreservedDates.mac` path still
+            // overrides both via a follow-up `set_dates` when present.
+            let mtime = options.unix_times.map(|t| t.mtime_or_now());
             let file_rec = Self::build_file_record(
                 file_id,
                 data_len as u32,
@@ -3046,6 +3067,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
                 &type_code,
                 &creator_code,
                 self.mdb.block_size,
+                mtime,
             );
 
             // Build key + record for catalog insertion
@@ -3082,6 +3104,13 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
             if rsrc_size > 0 {
                 fe.resource_fork_size = Some(rsrc_size as u64);
             }
+            let stamped = mtime.unwrap_or_else(super::times::now);
+            fe.modified_unix = Some(stamped);
+            fe.mac_dates = Some((
+                super::times::unix_to_mac_epoch(stamped),
+                super::times::unix_to_mac_epoch(stamped),
+                0,
+            ));
             Ok(fe)
         })();
         if result.is_err() {
@@ -3094,7 +3123,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
         &mut self,
         parent: &FileEntry,
         name: &str,
-        _options: &CreateDirectoryOptions,
+        options: &CreateDirectoryOptions,
     ) -> Result<FileEntry, FilesystemError> {
         self.ensure_catalog_initialized()?;
         let snap = self.snapshot();
@@ -3115,8 +3144,10 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
             let folder_id = self.mdb.next_catalog_id;
             self.mdb.next_catalog_id += 1;
 
-            // Build folder record
-            let folder_rec = Self::build_dir_record(folder_id);
+            // Build folder record — see build_file_record's comment on how
+            // options.unix_times threads a source mtime through.
+            let mtime = options.unix_times.map(|t| t.mtime_or_now());
+            let folder_rec = Self::build_dir_record_with_dates(folder_id, mtime);
 
             // Build key + record
             let key = Self::build_catalog_key(parent_id, &name_bytes);
@@ -3144,11 +3175,15 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
             } else {
                 format!("{}/{name}", parent.path)
             };
-            Ok(FileEntry::new_directory(
-                name.to_string(),
-                path,
-                folder_id as u64,
-            ))
+            let mut fe = FileEntry::new_directory(name.to_string(), path, folder_id as u64);
+            let stamped = mtime.unwrap_or_else(super::times::now);
+            fe.modified_unix = Some(stamped);
+            fe.mac_dates = Some((
+                super::times::unix_to_mac_epoch(stamped),
+                super::times::unix_to_mac_epoch(stamped),
+                0,
+            ));
+            Ok(fe)
         })();
         if result.is_err() {
             self.restore_snapshot(snap);
@@ -5003,6 +5038,7 @@ mod tests {
                 &[0u8; 4],
                 &[0u8; 4],
                 block_size,
+                None,
             ));
             fs.insert_catalog_record(&kr).unwrap();
         }
@@ -5130,8 +5166,19 @@ mod tests {
         for i in 0..n {
             let name = format!("f{:05}.txt", i);
             let mut key_record = Fs::build_catalog_key(root_id, name.as_bytes());
-            let file_rec =
-                Fs::build_file_record(16 + i, 0, 0, 0, 0, 0, 0, &[0u8; 4], &[0u8; 4], block_size);
+            let file_rec = Fs::build_file_record(
+                16 + i,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                &[0u8; 4],
+                &[0u8; 4],
+                block_size,
+                None,
+            );
             key_record.extend_from_slice(&file_rec);
             fs.insert_catalog_record(&key_record)
                 .unwrap_or_else(|e| panic!("insert #{i} ({name}): {e}"));
@@ -5244,6 +5291,7 @@ mod tests {
                 &[0u8; 4],
                 &[0u8; 4],
                 block_size,
+                None,
             ));
             fs.insert_catalog_record(&kr)
                 .unwrap_or_else(|e| panic!("insert #{i} into dir{d}: {e}"));
@@ -5315,8 +5363,19 @@ mod tests {
         for i in 0..n {
             let name = format!("f{:05}.txt", i);
             let mut key_record = Fs::build_catalog_key(root_id, name.as_bytes());
-            let file_rec =
-                Fs::build_file_record(16 + i, 0, 0, 0, 0, 0, 0, &[0u8; 4], &[0u8; 4], block_size);
+            let file_rec = Fs::build_file_record(
+                16 + i,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                &[0u8; 4],
+                &[0u8; 4],
+                block_size,
+                None,
+            );
             key_record.extend_from_slice(&file_rec);
             fs.insert_catalog_record(&key_record).unwrap();
         }

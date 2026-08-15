@@ -219,23 +219,52 @@ fn walk_into(dir: &Path, prefix: &mut Vec<String>, out: &mut Vec<HostEntry>) -> 
 /// falls back to the replaced entry then the parent directory.
 ///
 /// Unix-only: on Windows there is no mode to read, so every entry takes the
-/// resolver's inherit-from-parent default.
+/// resolver's inherit-from-parent default. `unix_times` is always populated
+/// (independent of `apply_permissions`) so the imported file carries its
+/// source's mtime end-to-end — that's independent of whether we honour its
+/// mode bits, and is available on every host OS via `SystemTime`.
 #[cfg(unix)]
 fn host_overrides(meta: &std::fs::Metadata, apply: bool) -> AttrOverrides {
     use std::os::unix::fs::MetadataExt;
+    let unix_times = Some(super::times::UnixTimes {
+        mtime: Some(meta.mtime().max(0) as u64),
+        atime: Some(meta.atime().max(0) as u64),
+        ctime: Some(meta.ctime().max(0) as u64),
+    });
     if !apply {
-        return AttrOverrides::default();
+        return AttrOverrides {
+            unix_times,
+            ..Default::default()
+        };
     }
     AttrOverrides {
         mode: Some(meta.mode() & 0o7777),
         uid: Some(meta.uid()),
         gid: Some(meta.gid()),
+        unix_times,
     }
 }
 
 #[cfg(not(unix))]
-fn host_overrides(_meta: &std::fs::Metadata, _apply: bool) -> AttrOverrides {
-    AttrOverrides::default()
+fn host_overrides(meta: &std::fs::Metadata, _apply: bool) -> AttrOverrides {
+    // Windows has no mode/uid/gid to read, but `SystemTime::modified` /
+    // `accessed` / `created` all work — carry the host's mtime so an
+    // rb-cli import from a Windows dir still preserves file dates. On
+    // failure fall through to None (driver stamps now).
+    fn to_secs(t: std::io::Result<std::time::SystemTime>) -> Option<u64> {
+        t.ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs())
+    }
+    AttrOverrides {
+        unix_times: Some(super::times::UnixTimes {
+            mtime: to_secs(meta.modified()),
+            atime: to_secs(meta.accessed()),
+            ctime: to_secs(meta.created()),
+        }),
+        ..Default::default()
+    }
 }
 
 fn overrides_for(host: &Path, apply: bool) -> AttrOverrides {

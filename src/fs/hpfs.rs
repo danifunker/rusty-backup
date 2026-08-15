@@ -472,6 +472,10 @@ impl<R: Read + Seek> HpfsFilesystem<R> {
         }
         e.dos_attributes = Some(dos);
         e.modified = format_hpfs_date(de.write_date);
+        // HPFS stores write_date as u32 Unix seconds directly (no encoding).
+        if de.write_date != 0 {
+            e.modified_unix = Some(de.write_date as u64);
+        }
         e
     }
 
@@ -1642,6 +1646,7 @@ impl<R: Read + Write + Seek> HpfsFilesystem<R> {
         is_dir: bool,
         data: &mut dyn Read,
         size: u64,
+        mtime_secs: Option<u64>,
     ) -> Result<u32, FilesystemError> {
         validate_hpfs_name(name)?;
         let nb = name.as_bytes().to_vec();
@@ -1672,12 +1677,12 @@ impl<R: Read + Write + Seek> HpfsFilesystem<R> {
             let mut d = blank_dnode(dno, fno);
             d[8] |= 1; // root_dnode
             let off = dn_add_de(&mut d, b"\x01\x01", 0);
-            let mut m = de_meta_template(fno, 0, AT_DIRECTORY);
+            let mut m = de_meta_template(fno, 0, AT_DIRECTORY, mtime_secs);
             m[2] = DE_FIRST;
             dn_copy_meta(&mut d, off, &m);
             d.truncate(DNODE_BYTES);
             self.write_sectors(dno, &d)?;
-            let meta = de_meta_template(fno, 0, attrib);
+            let meta = de_meta_template(fno, 0, attrib, mtime_secs);
             self.add_dirent(parent_fnode, &nb, &meta)?;
             Ok(fno)
         } else {
@@ -1692,7 +1697,7 @@ impl<R: Read + Write + Seek> HpfsFilesystem<R> {
                 }
             };
             self.write_file_fnode(fno, parent_fnode, &nb, size as u32, &extents)?;
-            let meta = de_meta_template(fno, size as u32, attrib);
+            let meta = de_meta_template(fno, size as u32, attrib, mtime_secs);
             self.add_dirent(parent_fnode, &nb, &meta)?;
             Ok(fno)
         }
@@ -2021,32 +2026,30 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Hp
         name: &str,
         data: &mut dyn Read,
         data_len: u64,
-        _options: &super::filesystem::CreateFileOptions,
+        options: &super::filesystem::CreateFileOptions,
     ) -> Result<FileEntry, FilesystemError> {
         let parent_fnode = if parent.path == "/" {
             self.root_fnode
         } else {
             parent.location as u32
         };
-        let fno = self.create_entry(parent_fnode, name, false, data, data_len)?;
+        let mtime = options.unix_times.map(|t| t.mtime_or_now());
+        let fno = self.create_entry(parent_fnode, name, false, data, data_len, mtime)?;
         let path = if parent.path == "/" {
             format!("/{name}")
         } else {
             format!("{}/{}", parent.path, name)
         };
-        Ok(FileEntry::new_file(
-            name.to_string(),
-            path,
-            data_len,
-            fno as u64,
-        ))
+        let mut fe = FileEntry::new_file(name.to_string(), path, data_len, fno as u64);
+        fe.modified_unix = mtime;
+        Ok(fe)
     }
 
     fn create_directory(
         &mut self,
         parent: &FileEntry,
         name: &str,
-        _options: &super::filesystem::CreateDirectoryOptions,
+        options: &super::filesystem::CreateDirectoryOptions,
     ) -> Result<FileEntry, FilesystemError> {
         let parent_fnode = if parent.path == "/" {
             self.root_fnode
@@ -2054,13 +2057,16 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Hp
             parent.location as u32
         };
         let mut empty = std::io::empty();
-        let fno = self.create_entry(parent_fnode, name, true, &mut empty, 0)?;
+        let mtime = options.unix_times.map(|t| t.mtime_or_now());
+        let fno = self.create_entry(parent_fnode, name, true, &mut empty, 0, mtime)?;
         let path = if parent.path == "/" {
             format!("/{name}")
         } else {
             format!("{}/{}", parent.path, name)
         };
-        Ok(FileEntry::new_directory(name.to_string(), path, fno as u64))
+        let mut fe = FileEntry::new_directory(name.to_string(), path, fno as u64);
+        fe.modified_unix = mtime;
+        Ok(fe)
     }
 
     fn delete_entry(
@@ -2241,14 +2247,21 @@ fn blank_dnode(dno: u32, up: u32) -> Vec<u8> {
 }
 
 /// Build a 32-byte dirent metadata template for [`dn_copy_meta`].
-fn de_meta_template(fnode: u32, size: u32, attrib: u8) -> [u8; 32] {
+/// `mtime_secs = Some(secs)` stamps that Unix time into the write/read/creation
+/// date fields (HPFS already stores u32 Unix seconds, so no conversion needed);
+/// `None` stamps the reproducible `FIXED_TIME` sentinel — matching the
+/// generator-forbids-clocks convention this format harness uses.
+fn de_meta_template(fnode: u32, size: u32, attrib: u8, mtime_secs: Option<u64>) -> [u8; 32] {
     let mut m = [0u8; 32];
+    let stamp = mtime_secs
+        .map(|s| s.min(u32::MAX as u64) as u32)
+        .unwrap_or(FIXED_TIME);
     m[3] = attrib;
     put_u32(&mut m, 4, fnode);
-    put_u32(&mut m, 8, FIXED_TIME);
+    put_u32(&mut m, 8, stamp);
     put_u32(&mut m, 12, size);
-    put_u32(&mut m, 16, FIXED_TIME);
-    put_u32(&mut m, 20, FIXED_TIME);
+    put_u32(&mut m, 16, stamp);
+    put_u32(&mut m, 20, stamp);
     m
 }
 

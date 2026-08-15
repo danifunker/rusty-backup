@@ -107,6 +107,18 @@ fn show_partmap(
         password.as_deref().map(|s| s.as_bytes()),
         inside.as_deref(),
     )?;
+    // `partmap` predates every non-Apple table and went straight to APM, so an
+    // SGI disk `inspect` reads fine failed with "bad DDR signature: 0x0BE5" —
+    // the leading half of the SGI volume-header magic (R-026). Detect first.
+    // APM keeps its full DDR + driver detail; every other table renders the
+    // generic partition list, which is all those tables have.
+    let table = crate::partition::PartitionTable::detect(&mut file)
+        .map_err(|e| anyhow::anyhow!("detecting partition table: {e}"))?;
+    if !matches!(table, crate::partition::PartitionTable::Apm(_)) {
+        return show_partmap_generic(&table, format);
+    }
+    file.seek(std::io::SeekFrom::Start(0))
+        .map_err(|e| anyhow::anyhow!("rewinding after detection: {e}"))?;
     let apm = Apm::parse(&mut file).map_err(|e| anyhow::anyhow!("parsing APM: {e}"))?;
     let bs = apm.ddr.block_size as u64;
 
@@ -165,6 +177,71 @@ fn show_partmap(
         OutputFormat::Csv | OutputFormat::Tsv => emit_csv_or_tsv(format, &rows),
         OutputFormat::Text => unreachable!(),
     }
+}
+
+/// Render any non-APM partition table: the partition list, which is the part
+/// every table has. APM's DDR and driver-descriptor detail has no counterpart
+/// elsewhere, so it stays on the APM path rather than being faked here.
+fn show_partmap_generic(
+    table: &crate::partition::PartitionTable,
+    format: OutputFormat,
+) -> Result<()> {
+    let parts = table.partitions();
+    if format == OutputFormat::Text {
+        out_stdout(format!("Partition table: {}", table.type_name()));
+        out_stdout(format!(
+            "{:>3}  {:<28}  {:>12}  {:>14}",
+            "idx", "type", "start_lba", "bytes"
+        ));
+        for p in &parts {
+            out_stdout(format!(
+                "{:>3}  {:<28}  {:>12}  {:>14}",
+                p.index + 1,
+                p.type_name,
+                p.start_lba,
+                p.size_bytes
+            ));
+        }
+        return Ok(());
+    }
+    let rows: Vec<GenericPartRow> = parts
+        .iter()
+        .map(|p| GenericPartRow {
+            index: p.index + 1,
+            type_: p.type_name.clone(),
+            type_string: p.partition_type_string.clone(),
+            start_lba: p.start_lba,
+            size_bytes: p.size_bytes,
+        })
+        .collect();
+    match format {
+        OutputFormat::Json | OutputFormat::Yaml => emit_envelope(
+            format,
+            &Envelope::ok(GenericPartmapPayload {
+                kind: table.type_name().to_ascii_lowercase(),
+                entries: rows,
+            }),
+        ),
+        OutputFormat::Csv | OutputFormat::Tsv => emit_csv_or_tsv(format, &rows),
+        OutputFormat::Text => unreachable!(),
+    }
+}
+
+#[derive(serde::Serialize)]
+struct GenericPartmapPayload {
+    kind: String,
+    entries: Vec<GenericPartRow>,
+}
+
+#[derive(serde::Serialize)]
+struct GenericPartRow {
+    index: usize,
+    #[serde(rename = "type")]
+    type_: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    type_string: Option<String>,
+    start_lba: u64,
+    size_bytes: u64,
 }
 
 /// Render the APM as text: DDR + driver descriptor map, then one row per
@@ -444,17 +521,5 @@ struct DeviceRow {
 // ---------------------------------------------------------------------------
 
 fn emit_csv_or_tsv<T: Serialize>(format: OutputFormat, rows: &[T]) -> Result<()> {
-    let delim = if format == OutputFormat::Tsv {
-        b'\t'
-    } else {
-        b','
-    };
-    let mut wtr = csv::WriterBuilder::new()
-        .delimiter(delim)
-        .from_writer(std::io::stdout().lock());
-    for row in rows {
-        wtr.serialize(row)?;
-    }
-    wtr.flush()?;
-    Ok(())
+    crate::cli::output::emit_csv_or_tsv(format, rows)
 }

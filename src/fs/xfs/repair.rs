@@ -274,7 +274,16 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for XfsFilesystem<R> {
         let mode = ((options.mode.unwrap_or(0o644) & 0o7777) | 0o100000) as u16;
         let uid = options.uid.unwrap_or(0);
         let gid = options.gid.unwrap_or(0);
-        let ino = self.do_create_file(parent.location, name, data, data_len, mode, uid, gid)?;
+        let ino = self.do_create_file(
+            parent.location,
+            name,
+            data,
+            data_len,
+            mode,
+            uid,
+            gid,
+            options.unix_times,
+        )?;
         self.child_entry(&parent.path, name.to_string(), ino)
     }
 
@@ -290,7 +299,8 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for XfsFilesystem<R> {
         let mode = ((options.mode.unwrap_or(0o755) & 0o7777) | 0o040000) as u16;
         let uid = options.uid.unwrap_or(0);
         let gid = options.gid.unwrap_or(0);
-        let ino = self.do_create_directory(parent.location, name, mode, uid, gid)?;
+        let ino =
+            self.do_create_directory(parent.location, name, mode, uid, gid, options.unix_times)?;
         self.child_entry(&parent.path, name.to_string(), ino)
     }
 

@@ -84,16 +84,25 @@ fn sparse_copy(mut src: impl Read, dst: &mut File) -> io::Result<u64> {
 /// Whatever we pick is handed to partition detection, which validates it,
 /// so this only has to be good enough to disambiguate the disk from
 /// sidecar files (readme, checksum, ...). Matched case-insensitively.
+/// Derived from [`DISK_IMAGE_EXTS`] rather than kept as a second list, because
+/// the second list drifted: `.dmg` was canonical and missing here, so a
+/// Finder-made zip holding one `.dmg` reported "no obvious disk image" and
+/// demanded `--inside` (R-027). `.adf`, `.2mg`, `.woz` and a dozen others were
+/// missing the same way.
+///
+/// `bin` is the one exclusion: far too common in a mixed archive to identify a
+/// disk image by, and picking the wrong entry is worse than asking.
 fn is_disk_image_entry(name: &str) -> bool {
-    const EXTS: &[&str] = &[
-        ".img", ".raw", ".dd", ".iso", ".hdd", ".hda", ".hdv", ".dsk", ".vhd", ".hdf", ".hds",
-        ".ima", ".vmdk", ".qcow2", ".chd",
-    ];
     if is_apple_double(name) {
         return false;
     }
     let lower = name.to_ascii_lowercase();
-    EXTS.iter().any(|e| lower.ends_with(e))
+    let Some((_, ext)) = lower.rsplit_once('.') else {
+        return false;
+    };
+    crate::model::file_types::DISK_IMAGE_EXTS
+        .iter()
+        .any(|e| !e.eq_ignore_ascii_case("bin") && e.eq_ignore_ascii_case(ext))
 }
 
 /// A macOS resource-fork stub, not content. Zipping `disk.hda` in Finder also
@@ -118,7 +127,10 @@ fn collect_entries<R: Read + Seek>(archive: &mut zip::ZipArchive<R>) -> Vec<Entr
     let mut out = Vec::new();
     for i in 0..archive.len() {
         if let Ok(e) = archive.by_index_raw(i) {
-            if e.is_dir() {
+            // Drop AppleDouble stubs at collection so the single-entry fallback
+            // and the "Entries:" listing both ignore them, not just the
+            // disk-image filter.
+            if e.is_dir() || is_apple_double(e.name()) {
                 continue;
             }
             out.push(EntryInfo {

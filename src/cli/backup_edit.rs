@@ -332,6 +332,10 @@ fn partition_context(part: &PartitionMetadata, size: u64) -> PartitionContext {
         offset: 0,
         type_byte: part.partition_type_byte,
         type_string: part.partition_type_string.clone(),
+        type_name: part
+            .partition_type_string
+            .clone()
+            .unwrap_or_else(|| "raw".to_string()),
         size,
         label: format!(
             "Backup partition {} ({} bytes){}",

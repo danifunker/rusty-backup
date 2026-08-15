@@ -88,7 +88,7 @@ pub fn run_chmod(args: ChmodArgs) -> Result<()> {
     log_stderr(&ctx.label);
     let mut fs = ctx
         .open_editable(file)
-        .map_err(|e| anyhow!("opening filesystem for write: {e}"))?;
+        .map_err(|e| crate::cli::resolve::write_open_error("opening filesystem for write", e))?;
 
     let entry = super::ls::resolve_path(fs.as_filesystem_mut(), &args.path)?;
     fs.set_permissions(&entry, mode)
@@ -119,7 +119,7 @@ pub fn run_chown(args: ChownArgs) -> Result<()> {
     log_stderr(&ctx.label);
     let mut fs = ctx
         .open_editable(file)
-        .map_err(|e| anyhow!("opening filesystem for write: {e}"))?;
+        .map_err(|e| crate::cli::resolve::write_open_error("opening filesystem for write", e))?;
 
     let entry = super::ls::resolve_path(fs.as_filesystem_mut(), &args.path)?;
     let (uid, gid) = parse_owner(&args.owner, entry.uid.unwrap_or(0), entry.gid.unwrap_or(0))?;

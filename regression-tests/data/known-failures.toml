@@ -13,8 +13,10 @@
 #
 # Rules:
 #
-#  * `finding` is mandatory and must name an entry in docs/Regression_Bugs.md.
-#    An expected failure with no recorded cause is just a disabled test.
+#  * `finding` is mandatory and must name an entry in docs/Regression_Bugs.md
+#    (an R-nnn defect) or docs/missing_features_from_regression.md (an F-nnn
+#    capability the engine has never claimed). An expected failure with no
+#    recorded cause is just a disabled test.
 #  * Never edit a case's assertions to make it pass. Cases assert INTENDED
 #    behaviour; that is the whole design. This file is the only sanctioned way
 #    to say "we know, it is on the list".
@@ -23,156 +25,37 @@
 #    in that case.
 #
 # `rb-regress validate` cross-checks: an id here that matches no case, or a
-# finding id not present in Regression_Bugs.md, is reported as a problem.
+# finding id present in neither of those two documents, is reported as a
+# problem.
 
-# --- R-016 — backup accepts only flat-layout sources -------------------------
+# --- F-008 — backup accepts only flat-layout sources -------------------------
+# Filed as defect R-016 until 2026-08-09, when it was reclassified: `backup`
+# never claimed to decode containers, so this is a capability the engine does
+# not have rather than code disagreeing with itself. The cases stay exactly as
+# written — they assert the behaviour we want — and now cite the feature.
 [[known]]
 id = "backup.container.chd"
-finding = "R-016"
+finding = "F-008"
 [[known]]
 id = "backup.container.vhd-dynamic"
-finding = "R-016"
+finding = "F-008"
 [[known]]
 id = "backup.container.qcow2"
-finding = "R-016"
+finding = "F-008"
 [[known]]
 id = "backup.container.vmdk-sparse"
-finding = "R-016"
+finding = "F-008"
 
-# --- R-008a / R-008b — AFFS bitmap and panic ---------------------------------
-# Note R-020 says every AFFS volume we write is unmountable on a real Amiga at
-# any size, so these three are the *visible* part of a deeper problem. They stay
-# separate because they fail for the reasons R-008 describes, which a fix for
-# R-020 alone would not address.
-[[known]]
-id = "fs.new-volume.affs"
-finding = "R-008a"
-[[known]]
-id = "fs.new-volume.affs.4m"
-finding = "R-008b"
-[[known]]
-id = "fs.new-volume.affs.32m"
-finding = "R-008b"
-[[known]]
-id = "fs.new-volume.affs.bitmap-boundary-plus-one"
-finding = "R-008a"
 
-# --- CLI contract group ------------------------------------------------------
-[[known]]
-id = "cli.envelope.error-envelope-on-failure"
-finding = "R-005"
-[[known]]
-id = "cli.envelope.ls-supports-format"
-finding = "R-003"
-[[known]]
-id = "cli.exit.csv-on-nested-verb-is-usage-error"
-finding = "R-004"
-[[known]]
-id = "cli.exit.tsv-on-nested-verb-is-usage-error"
-finding = "R-004"
-[[known]]
-id = "cli.flags.inspect-accepts-fs-type"
-finding = "R-010"
 
-# --- R-006 — new volume prodos fails with default arguments ------------------
-[[known]]
-id = "fs.new-volume.prodos-default-name"
-finding = "R-006"
 
-# --- R-013 — Solaris UFS entry types and sizes -------------------------------
-[[known]]
-id = "fs.detect.ufs-solaris-entry-types"
-finding = "R-013"
-[[known]]
-id = "fs.detect.ufs-no-absurd-sizes"
-finding = "R-013"
-
-# --- Optical -----------------------------------------------------------------
-[[known]]
-id = "optical.cdda.no-data-track-opens"
-finding = "R-012"
-[[known]]
-id = "optical.cue.unpadded-track-number"
-finding = "R-015"
-
-# --- Found by the tier-3 sweep, 2026-08-08 -----------------------------------
-[[known]]
-id = "resize.to-explicit-size"
-finding = "R-021"
-[[known]]
-id = "roundtrip.hpfs.raw"
-finding = "R-022"
-[[known]]
-id = "resize.repack.keeps-data"
-finding = "R-023"
-[[known]]
-id = "edit.affs.put-get"
-finding = "R-024"
-# R-025 is a Windows-only defect (a tempfile persist failure), so scope it.
-# Without `platforms` these two XPASS on macOS and Linux, and XPASS is supposed
-# to mean "fixed, remove the entry" — not "never applied here". Confirmed by
-# the first macOS run, 2026-08-08: both passed there.
-[[known]]
-id = "subcmd.squashfs.put-rebuilds"
-finding = "R-025"
-platforms = ["windows"]
-[[known]]
-id = "subcmd.show.partmap"
-finding = "R-026"
 
 # `read.optical.chdcd.audio-test` was listed here as a second R-012 case. It
 # was not one: the fixture is named for its AUDIOTST volume label and actually
 # carries an ISO 9660 data track, so it never exercised "no data track" at all.
 # XPASS caught it. R-012 is still pinned by optical.cdda.no-data-track-opens.
 
-# --- R-027: the Finder-zipped .dmg ------------------------------------------
-# Catalogued 2026-08-02, first executed 2026-08-08. It has never passed; the
-# case is not a regression, it is the first look at a fixture nothing reached.
-[[known]]
-id = "read.apfs.apple-gpt"
-finding = "R-027"
 
 # --- Found 2026-08-08, first execution of the tier-3 sweep -------------------
 # None of these had ever run: the last full Windows run predates the tier-2 and
 # tier-3 authoring commits, so it covered 134 of 256 cases and reported green.
-[[known]]
-id = "edit.real.affs-workbench13"
-finding = "R-030"
-[[known]]
-id = "edit.real.efs-small"
-finding = "R-029"
-[[known]]
-id = "edit.real.apple-dos-invaders"
-finding = "R-031"
-[[known]]
-id = "edit.apple-dos.put-get"
-finding = "R-028"
-[[known]]
-id = "edit.sfs.put-get"
-finding = "R-032"
-
-# The second instance of R-004: a handler-side usage rejection returning
-# GENERIC_FAILURE where exit.rs reserves USAGE_ERROR.
-[[known]]
-id = "shrink.rejects-non-chd-output"
-finding = "R-004"
-
-# `xattr set` reaches SquashFS's rebuild-and-replace path, which is R-025 —
-# the same Windows persist failure `squashfs put` hits. Nothing xattr-specific.
-[[known]]
-id = "meta.xattr.set-list-rm"
-finding = "R-025"
-platforms = ["windows"]
-
-# The detector matches the fixture byte for byte; inspect never reaches it.
-[[known]]
-id = "read.qdos.microdrive"
-finding = "R-033"
-
-# --- R-034: the read-only write refusal ---------------------------------------
-[[known]]
-id = "edit.readonly.lisa-refuses-a-write"
-finding = "R-034"
-[[known]]
-id = "edit.readonly.alto-refuses-a-write"
-finding = "R-034"

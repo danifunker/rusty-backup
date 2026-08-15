@@ -1618,6 +1618,7 @@ impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
     }
 
     /// Build an inode byte buffer with the given parameters.
+    #[allow(clippy::too_many_arguments)]
     fn build_inode_bytes(
         &self,
         mode: u32,
@@ -1627,6 +1628,7 @@ impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
         links: u16,
         flags: u32,
         block_data: &[u8; 60],
+        times: Option<super::times::UnixTimes>,
     ) -> Vec<u8> {
         build_inode_bytes(
             self.inode_size,
@@ -1637,6 +1639,7 @@ impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
             links,
             flags,
             block_data,
+            times,
         )
     }
 
@@ -2199,7 +2202,16 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExtFilesystem<R> {
         let gid = options.gid.unwrap_or(0);
         let flags = if self.has_extents { EXT4_EXTENTS_FL } else { 0 };
         let iblock = self.set_inode_blocks_for_new_file(new_inode, &data_blocks)?;
-        let mut inode_bytes = self.build_inode_bytes(mode, uid, gid, data_len, 1, flags, &iblock);
+        let mut inode_bytes = self.build_inode_bytes(
+            mode,
+            uid,
+            gid,
+            data_len,
+            1,
+            flags,
+            &iblock,
+            options.unix_times,
+        );
         // i_blocks counts ALLOCATED 512-byte sectors (block_size/512 per fs
         // block), not ceil(size/512): the two differ for a partial final block on
         // block sizes above 512, and the block-based count is the correct one. (No
@@ -2273,8 +2285,16 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExtFilesystem<R> {
         let gid = options.gid.unwrap_or(0);
         let flags = if self.has_extents { EXT4_EXTENTS_FL } else { 0 };
         let iblock = self.set_inode_blocks_for_new_file(new_inode, &dir_blocks)?;
-        let inode_bytes =
-            self.build_inode_bytes(mode, uid, gid, self.block_size, 2, flags, &iblock);
+        let inode_bytes = self.build_inode_bytes(
+            mode,
+            uid,
+            gid,
+            self.block_size,
+            2,
+            flags,
+            &iblock,
+            options.unix_times,
+        );
         self.write_inode_raw(new_inode, &inode_bytes)?;
 
         // Write the directory block now that inode 8's generation is on disk (its
@@ -2485,6 +2505,11 @@ fn is_extent_header(data: &[u8]) -> bool {
 /// so the blank-volume formatter (`ext_format`) can lay down the reserved root
 /// and lost+found inodes before any `ExtFilesystem` exists; the `ExtFilesystem`
 /// method of the same name delegates here.
+///
+/// `times`, when set, replaces the default `now` stamp on atime/mtime/ctime so
+/// a cross-fs import (dir_import / tar_import / stage_copy) preserves the
+/// source's mtime end-to-end. `None` still stamps `now` — the case for a
+/// genuinely new file (rb-cli `put` from stdin, GUI "new blank file").
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_inode_bytes(
     inode_size: u16,
@@ -2495,12 +2520,13 @@ pub(crate) fn build_inode_bytes(
     links: u16,
     flags: u32,
     block_data: &[u8; 60],
+    times: Option<super::times::UnixTimes>,
 ) -> Vec<u8> {
     let mut buf = vec![0u8; inode_size as usize];
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as u32;
+    let resolved = super::times::resolve_or_now(times);
+    let atime = resolved.atime_or_now() as u32;
+    let mtime = resolved.mtime_or_now() as u32;
+    let ctime = resolved.ctime_or_now() as u32;
 
     // i_mode (0x00)
     buf[0x00..0x02].copy_from_slice(&(mode as u16).to_le_bytes());
@@ -2509,11 +2535,11 @@ pub(crate) fn build_inode_bytes(
     // i_size_lo (0x04)
     buf[0x04..0x08].copy_from_slice(&(size as u32).to_le_bytes());
     // i_atime (0x08)
-    buf[0x08..0x0C].copy_from_slice(&now.to_le_bytes());
+    buf[0x08..0x0C].copy_from_slice(&atime.to_le_bytes());
     // i_ctime (0x0C)
-    buf[0x0C..0x10].copy_from_slice(&now.to_le_bytes());
+    buf[0x0C..0x10].copy_from_slice(&ctime.to_le_bytes());
     // i_mtime (0x10)
-    buf[0x10..0x14].copy_from_slice(&now.to_le_bytes());
+    buf[0x10..0x14].copy_from_slice(&mtime.to_le_bytes());
     // i_links_count (0x1A)
     buf[0x1A..0x1C].copy_from_slice(&links.to_le_bytes());
     // i_blocks_lo (0x1C) — number of 512-byte sectors (we compute from size)

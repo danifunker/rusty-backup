@@ -135,9 +135,18 @@ rediscovered.
   and `fmt.bincue` (66-byte `.cue` + sibling `.bin`) are the only two builders
   `produce` still has no recipe for, both for this reason. Keeping half of
   either would read as coverage of a format only half looked at.
-- **Emulator oracles cannot be invoked.** They all resolve to `skip-manual`,
-  so R-020 — the highest-severity Amiga finding — was found by hand and cannot
-  be re-checked by a run. FS-UAE works interactively; `verify` cannot drive it.
+- **Emulator oracles are mostly, no longer entirely, uninvokable.** Two now
+  run from a script: `iris` (IRIX 6.5, which produced R-039) and FS-UAE via
+  `oracles/fsuae/affs_mount.py`, which closed R-020 on 2026-08-14. Both use
+  the same trick — a host directory the guest writes its verdict into, so
+  nothing is screen-scraped. The remaining ~60 emulator and MiSTer-core
+  oracles are still `skip-manual`.
+
+  The AFFS one has a `check` line and `verify` can invoke it, but fs-uae's
+  availability stays `manual`: it wants a GUI session and about a minute per
+  run, so it is on-demand rather than part of an unattended sweep. Making it
+  a first-class row means deciding whether the runner may open a window —
+  a policy call, not a missing feature.
 - **27 package oracles have no runnable check command**, so `verify` skips
   them with `skip-no-check`.
 

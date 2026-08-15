@@ -568,3 +568,59 @@ stdout_contains = ["FAT"]
 [[case.step]]
 args = ["ls", "{fixture}", "/"]
 expect_exit = 0
+
+# --- OS/2 Warp 4.52, the only real HPFS disk in the corpus ---------------------
+# Admitted 2026-08-09. It carries two things nothing else does: a *partitioned*
+# HPFS volume, and a real non-flat container (monolithicSparse VMDK).
+
+[[case]]
+id = "read.hpfs.os2-warp45"
+description = """A real OS/2 Warp 4.52 install reads end to end. Synthetic
+`new volume hpfs` volumes are empty and 2 MB; this one has 4722 files across
+471 directories, long names with spaces, and mixed case — the things a
+hand-built volume cannot exercise."""
+fixture = "fs.hpfs.os2-warp45.hd"
+timeout_ms = 900000
+[[case.step]]
+args = ["show", "fs-info", "{fixture}@1", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+[[case.step.json_equals]]
+path = "filesystem"
+value = "HPFS"
+[[case.step.json_equals]]
+path = "volume_name"
+value = "OS2"
+# A directory whose name has a space, read out of the real Workplace Shell tree.
+[[case.step]]
+args = ["ls", "{fixture}@1", "/Maintenance Desktop"]
+expect_exit = 0
+stdout_contains = ["Assistance Center"]
+# Content, not just exit code: CONFIG.SYS names the HPFS driver that mounts it.
+[[case.step]]
+args = ["get", "{fixture}@1", "/CONFIG.SYS", "{scratch}/CONFIG.SYS"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{fixture}@1", "--checkonly"]
+expect_exit = 0
+
+[[case]]
+id = "fs.detect.hpfs-partitioned-stays-mbr"
+description = """R-022's control, which until this fixture landed had to be
+synthesized by hand. The bare-HPFS probe added for R-022 reads absolute sectors
+16 and 17; on a partitioned disk those are in the pre-partition gap, so a real
+MBR disk with an HPFS partition must still report MBR. Getting this wrong would
+make every ao486-shaped disk — graded Yes in full_MiSTer_support_status.md —
+open as a superfloppy at the wrong offset."""
+fixture = "fs.hpfs.os2-warp45.hd"
+timeout_ms = 900000
+[[case.step]]
+args = ["inspect", "{fixture}", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+[[case.step.json_equals]]
+path = "partition_table"
+value = "MBR"
+[[case.step.json_equals]]
+path = "partitions.0.start_lba"
+value = 63

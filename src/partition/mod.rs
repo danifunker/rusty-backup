@@ -349,6 +349,38 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
         }
     }
 
+    // HPFS, the third filesystem behind MBR type 0x07. Its boot sector is an
+    // x86 VBR with a BPB and an 0xAA55 signature, but `num_fats` is 0 and
+    // `reserved_sectors` is 0, so the FAT probe below rejects it and it used to
+    // fall through to the MBR parse — which claimed it, found no partition
+    // entries, and reported "MBR, no partitions". `backup` then backed up
+    // nothing at all and exited 0 (R-022). `looks_like_hpfs` wants both the
+    // superblock magic at sector 16 and the spareblock magic at sector 17, so a
+    // chance match needs 64 bits to line up.
+    if crate::fs::hpfs::looks_like_hpfs(reader, 0) {
+        let _ = reader.seek(SeekFrom::Start(0));
+        return Some("HPFS".to_string());
+    }
+    let _ = reader.seek(SeekFrom::Start(0));
+
+    // QDOS Microdrive cartridge. Sector 0 is a cartridge header, not a VBR:
+    // ten zero bytes, an `ff ff ff` sync at 0x0A, then the ASCII name. Nothing
+    // there resembles a partition table, but the MBR parse read the sync as a
+    // bad 0xAA55 and refused the whole cartridge — before the probe that
+    // already recognises it could run (R-033). Same shape as R-022: the driver
+    // and the detection both existed; nothing consulted them on this path.
+    // Gated on the exact cartridge length as well as the header, so it cannot
+    // claim anything else.
+    if let Ok(end) = reader.seek(SeekFrom::End(0)) {
+        let _ = reader.seek(SeekFrom::Start(0));
+        if end == crate::fs::qdos_mdv::MDV_CART_BYTES as u64
+            && crate::fs::qdos_mdv::looks_like_mdv_sector_zero(first_sector)
+        {
+            return Some("qdos_mdv".to_string());
+        }
+    }
+    let _ = reader.seek(SeekFrom::Start(0));
+
     if first_sector[0] == 0xEB || first_sector[0] == 0xE9 {
         let bytes_per_sector = u16::from_le_bytes([first_sector[11], first_sector[12]]);
         let sectors_per_cluster = first_sector[13];
@@ -699,6 +731,42 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
     }
 
     None
+}
+
+/// Lowercase, alphanumerics only — so `X68k`, `x68k` and `X-68K` agree.
+fn normalise_layout(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// Whether `expected` names a layout at all, so a typo is a usage error rather
+/// than a silent assertion failure. Returns the accepted vocabulary for the
+/// error message.
+pub fn layout_vocabulary() -> Vec<String> {
+    let mut v: Vec<String> = PartitionTable::ALL_TYPE_NAMES
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    v.extend(
+        PartitionTable::LAYOUT_ALIASES
+            .iter()
+            .map(|(a, _)| a.to_string()),
+    );
+    v
+}
+
+/// True when `expected` is a scheme name or a known alias.
+pub fn is_known_layout(expected: &str) -> bool {
+    let want = normalise_layout(expected);
+    !want.is_empty()
+        && (PartitionTable::ALL_TYPE_NAMES
+            .iter()
+            .any(|n| normalise_layout(n) == want)
+            || PartitionTable::LAYOUT_ALIASES
+                .iter()
+                .any(|(a, _)| normalise_layout(a) == want))
 }
 
 impl PartitionTable {
@@ -1353,6 +1421,49 @@ impl PartitionTable {
         }
     }
 
+    /// Every value [`PartitionTable::type_name`] can return, in variant order.
+    ///
+    /// Exists so `tests/doc_parity.rs` can require a README row per scheme;
+    /// the `#[cfg(test)]` guard below keeps it honest when a variant is added.
+    pub const ALL_TYPE_NAMES: &'static [&'static str] = &[
+        "MBR", "GPT", "APM", "RDB", "SGI", "Sun", "AHDI", "X68k", "None", "DSD",
+    ];
+
+    /// Whether this disk carries a partition table at all.
+    ///
+    /// `None` is a superfloppy — a filesystem starting at sector 0 with no
+    /// table. `Dsd` is the odd one: no table exists on the disk either, but the
+    /// reader de-interleaves the two sides into two addressable volumes, so it
+    /// answers like a partitioned disk for every purpose a caller has.
+    pub fn is_partitioned(&self) -> bool {
+        !matches!(self, PartitionTable::None { .. })
+    }
+
+    /// Layout words a caller may ask for beyond the scheme names themselves.
+    pub const LAYOUT_ALIASES: &'static [(&'static str, &'static str)] = &[
+        (
+            "superfloppy",
+            "a filesystem at sector 0, no partition table",
+        ),
+        ("flat", "alias for superfloppy"),
+        ("partitioned", "any partition table"),
+        ("hd", "alias for partitioned"),
+    ];
+
+    /// Does this disk's layout satisfy `expected`?
+    ///
+    /// Accepts a scheme name from [`Self::ALL_TYPE_NAMES`] (`mbr`, `gpt`,
+    /// `rdb`, …) or one of [`Self::LAYOUT_ALIASES`]. Case and punctuation are
+    /// ignored, matching `--expect-fs`.
+    pub fn layout_matches(&self, expected: &str) -> bool {
+        let want = normalise_layout(expected);
+        match want.as_str() {
+            "superfloppy" | "flat" => !self.is_partitioned(),
+            "partitioned" | "hd" => self.is_partitioned(),
+            other => normalise_layout(self.type_name()) == other,
+        }
+    }
+
     /// Get a human-readable name for the partition table type.
     pub fn type_name(&self) -> &'static str {
         match self {
@@ -1827,6 +1938,54 @@ mod tests {
         assert_eq!(parts[0].start_lba, 0);
         assert_eq!(parts[0].size_bytes, 1474560);
         assert_eq!(parts[0].type_name, "FAT");
+    }
+
+    /// A `.mdv` cartridge header, as it appears on a real MiSTer cartridge:
+    /// ten zero bytes, an `ff ff ff` sync, then the ASCII name.
+    fn mdv_sector_zero() -> [u8; 512] {
+        let mut s = [0u8; 512];
+        s[0x0A] = 0xFF;
+        s[0x0B] = 0xFF;
+        s[0x0C] = 0xFF;
+        s[0x0E..0x18].copy_from_slice(b"Test      ");
+        s
+    }
+
+    #[test]
+    fn an_mdv_cartridge_is_a_superfloppy_not_a_bad_mbr() {
+        let sector0 = mdv_sector_zero();
+        let mut img = vec![0u8; crate::fs::qdos_mdv::MDV_CART_BYTES];
+        img[..512].copy_from_slice(&sector0);
+        let mut cur = std::io::Cursor::new(img);
+        assert_eq!(
+            detect_superfloppy(&sector0, &mut cur).as_deref(),
+            Some("qdos_mdv"),
+            "R-033: the MBR parse used to claim this and refuse the cartridge"
+        );
+    }
+
+    /// The control in the other direction, which is what R-022 taught: a probe
+    /// that fires too eagerly is worse than one that never fires. Both halves
+    /// of the gate have to be required.
+    #[test]
+    fn the_mdv_probe_needs_both_the_size_and_the_header() {
+        // Right header, wrong length.
+        let sector0 = mdv_sector_zero();
+        let mut short = std::io::Cursor::new(vec![0u8; 4096]);
+        assert_ne!(
+            detect_superfloppy(&sector0, &mut short).as_deref(),
+            Some("qdos_mdv"),
+            "a cartridge header at the wrong length must not be claimed"
+        );
+
+        // Right length, wrong header — an all-zero cartridge-sized file.
+        let blank = [0u8; 512];
+        let mut sized = std::io::Cursor::new(vec![0u8; crate::fs::qdos_mdv::MDV_CART_BYTES]);
+        assert_ne!(
+            detect_superfloppy(&blank, &mut sized).as_deref(),
+            Some("qdos_mdv"),
+            "cartridge-sized bytes without the header must not be claimed"
+        );
     }
 
     #[test]
@@ -2428,5 +2587,98 @@ mod native_slot_tests {
         assert_eq!(parts.len(), 2, "map + driver are not data partitions");
         assert_eq!(table.native_slot(&parts[0]), Some(3));
         assert_eq!(table.native_slot(&parts[1]), Some(4));
+    }
+}
+
+#[cfg(test)]
+mod type_name_parity {
+    use super::*;
+
+    /// Never called — it exists so that adding a `PartitionTable` variant is a
+    /// compile error here, which is the cue to extend `ALL_TYPE_NAMES` too.
+    #[allow(dead_code)]
+    fn every_variant_has_an_index(t: &PartitionTable) -> usize {
+        match t {
+            PartitionTable::Mbr(_) => 0,
+            PartitionTable::Gpt { .. } => 1,
+            PartitionTable::Apm(_) => 2,
+            PartitionTable::Rdb(_) => 3,
+            PartitionTable::Sgi(_) => 4,
+            PartitionTable::Sun(_) => 5,
+            PartitionTable::Ahdi(_) => 6,
+            PartitionTable::X68k { .. } => 7,
+            PartitionTable::None { .. } => 8,
+            PartitionTable::Dsd { .. } => 9,
+        }
+    }
+
+    #[test]
+    fn all_type_names_covers_every_variant() {
+        assert_eq!(
+            PartitionTable::ALL_TYPE_NAMES.len(),
+            10,
+            "a PartitionTable variant was added or removed: update ALL_TYPE_NAMES, \
+             every_variant_has_an_index, and the README table tests/doc_parity.rs checks"
+        );
+    }
+}
+
+#[cfg(test)]
+mod layout_expectation_tests {
+    use super::*;
+
+    fn superfloppy() -> PartitionTable {
+        PartitionTable::None {
+            size_bytes: 1_474_560,
+            fs_hint: "FAT".into(),
+        }
+    }
+
+    #[test]
+    fn superfloppy_is_not_partitioned() {
+        let pt = superfloppy();
+        assert!(!pt.is_partitioned());
+        assert!(pt.layout_matches("superfloppy"));
+        assert!(pt.layout_matches("FLAT"));
+        assert!(pt.layout_matches("none"));
+        assert!(!pt.layout_matches("partitioned"));
+        assert!(!pt.layout_matches("mbr"));
+    }
+
+    #[test]
+    fn a_scheme_name_matches_only_itself() {
+        let pt = PartitionTable::Dsd {
+            size_bytes: 409_600,
+        };
+        assert!(pt.layout_matches("dsd"));
+        assert!(!pt.layout_matches("mbr"));
+        // Dsd has no on-disk table but yields two addressable volumes, so it
+        // answers "partitioned" — that is what a caller is actually asking.
+        assert!(pt.layout_matches("partitioned"));
+        assert!(!pt.layout_matches("superfloppy"));
+    }
+
+    #[test]
+    fn punctuation_and_case_are_ignored() {
+        let pt = PartitionTable::Dsd {
+            size_bytes: 409_600,
+        };
+        assert!(pt.layout_matches("D-S-D"));
+        assert!(pt.layout_matches("dsd "));
+    }
+
+    #[test]
+    fn the_vocabulary_covers_every_scheme_and_alias() {
+        // A new PartitionTable variant must become askable, not silently
+        // unaskable; ALL_TYPE_NAMES is pinned against the variant count by
+        // type_name_parity, so this inherits that guard.
+        for n in PartitionTable::ALL_TYPE_NAMES {
+            assert!(is_known_layout(n), "{n} should be askable");
+        }
+        for (a, _) in PartitionTable::LAYOUT_ALIASES {
+            assert!(is_known_layout(a), "{a} should be askable");
+        }
+        assert!(!is_known_layout("mbrr"));
+        assert!(!is_known_layout(""));
     }
 }

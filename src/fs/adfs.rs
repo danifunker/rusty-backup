@@ -1322,6 +1322,7 @@ impl<R: Read + Seek + Send> Filesystem for AdfsFilesystem<R> {
             if de.is_locked() {
                 fe.special_type = Some("Locked".into());
             }
+            fe.modified_unix = crate::fs::times::adfs_time_to_unix(de.load_addr, de.exec_addr);
             out.push(fe);
         }
         out.sort_by_key(|a| a.name.to_lowercase());
@@ -2179,7 +2180,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AdfsFilesystem<R> {
         name: &str,
         data: &mut dyn Read,
         data_len: u64,
-        _options: &CreateFileOptions,
+        options: &CreateFileOptions,
     ) -> Result<FileEntry, FilesystemError> {
         if data_len > u32::MAX as u64 {
             return Err(FilesystemError::Unsupported(
@@ -2191,14 +2192,24 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AdfsFilesystem<R> {
         } else {
             parent.location as u32
         };
+        // ADFS packs the file's RISC OS filetype and timestamp into the
+        // load/exec pair when the load-addr high 12 bits are 0xFFF. A cross-
+        // fs copy passes the source mtime through options.unix_times; a
+        // genuinely-new file leaves it None and we keep the legacy
+        // (0xFFFFFFFF, 0) pair which RISC OS displays as "no date, Data".
+        let mtime = options.unix_times.map(|t| t.mtime_or_now());
+        let (load_addr, exec_addr) = match mtime {
+            Some(s) => crate::fs::times::unix_to_adfs_time(s, 0xFFF),
+            None => (0xFFFFFFFF, 0),
+        };
         // Old-map D-format: contiguous allocation, the disc address IS the
         // directory-entry indaddr (no fragment-id indirection).
         if self.old_map.is_some() {
             let start = self.old_map_alloc_and_write(data, data_len)?;
             let entry = AdfsDirEntry {
                 name: name.to_string(),
-                load_addr: 0xFFFFFFFF,
-                exec_addr: 0,
+                load_addr,
+                exec_addr,
                 file_length: data_len as u32,
                 indirect_disc_addr: start,
                 attrs: 0x03,
@@ -2209,12 +2220,9 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AdfsFilesystem<R> {
             } else {
                 format!("{}/{}", parent.path.trim_end_matches('/'), name)
             };
-            return Ok(FileEntry::new_file(
-                name.to_string(),
-                path,
-                data_len,
-                start as u64,
-            ));
+            let mut fe = FileEntry::new_file(name.to_string(), path, data_len, start as u64);
+            fe.modified_unix = mtime;
+            return Ok(fe);
         }
         // Allocate + write payload first; if the dir insert later
         // fails we leak the fragment but the disc stays consistent.
@@ -2222,8 +2230,8 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AdfsFilesystem<R> {
         let indaddr = build_indaddr(frag_id, 0, self.disc_record.log2sharesize);
         let entry = AdfsDirEntry {
             name: name.to_string(),
-            load_addr: 0xFFFFFFFF,
-            exec_addr: 0,
+            load_addr,
+            exec_addr,
             file_length: data_len as u32,
             indirect_disc_addr: indaddr,
             attrs: 0x03, // R + W
@@ -2234,24 +2242,27 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AdfsFilesystem<R> {
         } else {
             format!("{}/{}", parent.path.trim_end_matches('/'), name)
         };
-        Ok(FileEntry::new_file(
-            name.to_string(),
-            path,
-            data_len,
-            indaddr as u64,
-        ))
+        let mut fe = FileEntry::new_file(name.to_string(), path, data_len, indaddr as u64);
+        fe.modified_unix = mtime;
+        Ok(fe)
     }
 
     fn create_directory(
         &mut self,
         parent: &FileEntry,
         name: &str,
-        _options: &CreateDirectoryOptions,
+        options: &CreateDirectoryOptions,
     ) -> Result<FileEntry, FilesystemError> {
         let parent_indaddr = if parent.path == "/" {
             self.disc_record.root
         } else {
             parent.location as u32
+        };
+        // Same load/exec datestamp packing as create_file.
+        let mtime = options.unix_times.map(|t| t.mtime_or_now());
+        let (load_addr, exec_addr) = match mtime {
+            Some(s) => crate::fs::times::unix_to_adfs_time(s, 0xFFF),
+            None => (0xFFFFFFFF, 0),
         };
         // Build the empty 2-KiB dir block, then write it the same way
         // we'd write file data (alloc + write).
@@ -2262,8 +2273,8 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AdfsFilesystem<R> {
             let start = self.old_map_alloc_and_write(&mut cursor, ADFS_NEWDIR_SIZE)?;
             let entry = AdfsDirEntry {
                 name: name.to_string(),
-                load_addr: 0xFFFFFFFF,
-                exec_addr: 0,
+                load_addr,
+                exec_addr,
                 file_length: ADFS_NEWDIR_SIZE as u32,
                 indirect_disc_addr: start,
                 attrs: 0x0B,
@@ -2274,19 +2285,17 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AdfsFilesystem<R> {
             } else {
                 format!("{}/{}", parent.path.trim_end_matches('/'), name)
             };
-            return Ok(FileEntry::new_directory(
-                name.to_string(),
-                path,
-                start as u64,
-            ));
+            let mut fe = FileEntry::new_directory(name.to_string(), path, start as u64);
+            fe.modified_unix = mtime;
+            return Ok(fe);
         }
         let mut cursor = std::io::Cursor::new(block);
         let (frag_id, _start) = self.alloc_and_write_data(&mut cursor, ADFS_NEWDIR_SIZE)?;
         let indaddr = build_indaddr(frag_id, 0, self.disc_record.log2sharesize);
         let entry = AdfsDirEntry {
             name: name.to_string(),
-            load_addr: 0xFFFFFFFF,
-            exec_addr: 0,
+            load_addr,
+            exec_addr,
             file_length: ADFS_NEWDIR_SIZE as u32,
             indirect_disc_addr: indaddr,
             attrs: 0x0B, // R + W + Directory bit
@@ -2297,11 +2306,9 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AdfsFilesystem<R> {
         } else {
             format!("{}/{}", parent.path.trim_end_matches('/'), name)
         };
-        Ok(FileEntry::new_directory(
-            name.to_string(),
-            path,
-            indaddr as u64,
-        ))
+        let mut fe = FileEntry::new_directory(name.to_string(), path, indaddr as u64);
+        fe.modified_unix = mtime;
+        Ok(fe)
     }
 
     fn delete_entry(

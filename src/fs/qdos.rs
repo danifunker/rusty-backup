@@ -213,6 +213,9 @@ pub struct QdosDirEntry {
     pub file_type: u16,
     pub name: String,
     pub first_block: u16,
+    /// Last-modified timestamp — u32 seconds since QDOS epoch (1961-01-01)
+    /// at directory-entry offset 0x34..0x38. Zero when unset.
+    pub update_date: u32,
 }
 
 pub fn parse_dir_entry(buf: &[u8; DIR_ENTRY_SIZE]) -> Option<QdosDirEntry> {
@@ -228,6 +231,7 @@ pub fn parse_dir_entry(buf: &[u8; DIR_ENTRY_SIZE]) -> Option<QdosDirEntry> {
     let file_type = BigEndian::read_u16(&buf[0x06..0x08]);
     // First cluster of file at offset 0x3A (sQLux QWDE_FNUM).
     let first_block = BigEndian::read_u16(&buf[0x3A..0x3C]);
+    let update_date = BigEndian::read_u32(&buf[0x34..0x38]);
     let name_bytes = &buf[0x10..0x10 + name_len.min(36)];
     let name: String = name_bytes
         .iter()
@@ -245,6 +249,7 @@ pub fn parse_dir_entry(buf: &[u8; DIR_ENTRY_SIZE]) -> Option<QdosDirEntry> {
         file_type,
         name,
         first_block,
+        update_date,
     })
 }
 
@@ -375,6 +380,7 @@ impl<R: Read + Seek + Send> Filesystem for QdosFilesystem<R> {
                 3 => fe.special_type = Some("Dev".into()),
                 _ => {}
             }
+            fe.modified_unix = crate::fs::times::qdos_date_to_unix(de.update_date);
             out.push(fe);
         }
         out.sort_by_key(|a| a.name.to_lowercase());
@@ -663,7 +669,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for QdosFilesystem<R> {
         name: &str,
         data: &mut dyn std::io::Read,
         data_len: u64,
-        _options: &CreateFileOptions,
+        options: &CreateFileOptions,
     ) -> Result<FileEntry, FilesystemError> {
         if parent.path != "/" {
             return Err(FilesystemError::Unsupported(
@@ -708,6 +714,13 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for QdosFilesystem<R> {
         };
         let first_cluster = self.alloc_chain(cluster_count)?;
 
+        // QDOS timestamps are u32 seconds since 1961. Cross-fs copy passes
+        // source mtime through options.unix_times; a genuinely new file leaves
+        // it None and the date field stays zero (matching pre-existing
+        // behaviour — QDOS has no on-disk "now" convention).
+        let mtime = options.unix_times.map(|t| t.mtime_or_now());
+        let qdos_date = mtime.map(crate::fs::times::unix_to_qdos_date).unwrap_or(0);
+
         // Compose the 64-byte file header (mirror of the directory entry)
         // and prepend it to the payload before writing the chain.
         let mut full = Vec::with_capacity(on_disk_len);
@@ -715,6 +728,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for QdosFilesystem<R> {
         BigEndian::write_u32(&mut full[0x00..0x04], on_disk_len as u32);
         BigEndian::write_u16(&mut full[0x0E..0x10], name.len() as u16);
         full[0x10..0x10 + name.len()].copy_from_slice(name.as_bytes());
+        BigEndian::write_u32(&mut full[0x34..0x38], qdos_date);
         BigEndian::write_u16(&mut full[0x3A..0x3C], first_cluster);
         full.extend_from_slice(&payload);
         self.write_chain(first_cluster, &full)?;
@@ -728,6 +742,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for QdosFilesystem<R> {
         // access_keys (0x04..0x06), file_type (0x06..0x08): leave 0 (data).
         BigEndian::write_u16(&mut entry[0x0E..0x10], name.len() as u16);
         entry[0x10..0x10 + name.len()].copy_from_slice(name.as_bytes());
+        BigEndian::write_u32(&mut entry[0x34..0x38], qdos_date);
         BigEndian::write_u16(&mut entry[0x3A..0x3C], first_cluster);
         self.reader.seek(SeekFrom::Start(slot_off))?;
         self.reader.write_all(&entry)?;
@@ -736,12 +751,14 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for QdosFilesystem<R> {
         // caller forgets sync_metadata.
         self.fat_write_back()?;
         self.header_write_back()?;
-        Ok(FileEntry::new_file(
+        let mut fe = FileEntry::new_file(
             name.to_string(),
             format!("/{name}"),
             payload.len() as u64,
             first_cluster as u64,
-        ))
+        );
+        fe.modified_unix = mtime;
+        Ok(fe)
     }
 
     fn create_directory(

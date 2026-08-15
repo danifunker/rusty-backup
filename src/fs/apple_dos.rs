@@ -106,6 +106,9 @@ const MAX_CATALOG_SECTORS: usize = 32;
 /// Maximum T/S list sectors we walk for a single file. With 122 pairs
 /// per list and 256-byte sectors, one full list addresses ~30 KB; a
 /// 140 KB floppy can chain at most a handful. Cap is a runaway guard.
+/// T/S pairs one T/S list sector holds (bytes 0x0C..0xFF, two bytes each).
+const TS_PAIRS_PER_LIST: usize = 122;
+
 const MAX_TS_LISTS: usize = 32;
 
 /// Maximum file entries we surface — sanity bound; a 140 KB DOS disk
@@ -277,6 +280,78 @@ fn decode_apple_text(bytes: &[u8]) -> String {
 /// Map a low-7-bit type code to its DOS letter ("T", "I", "A", "B",
 /// "S", "R"), defaulting to "?" for unknown values. Used to surface the
 /// file kind through `FileEntry::special_type`.
+/// Bytes of load-address + length that precede a type-B file's data.
+const BINARY_HEADER_LEN: usize = 4;
+
+/// Return a type-B file's real contents: strip the 4-byte header and cut to
+/// the length it declares.
+///
+/// DOS 3.3 stores only a sector count, so without this a file comes back
+/// padded to the sector — 104 bytes in, 256 out (R-028). Other types are
+/// returned untouched: only B carries a length.
+fn strip_binary_header(type_code: u8, data: Vec<u8>) -> Vec<u8> {
+    if type_code != TYPE_B || data.len() < BINARY_HEADER_LEN {
+        return data;
+    }
+    let len = u16::from_le_bytes([data[2], data[3]]) as usize;
+    let end = BINARY_HEADER_LEN + len;
+    if end > data.len() {
+        // Declared length runs past what is allocated: trust the sectors, not
+        // the header, rather than panicking on a damaged disk.
+        return data[BINARY_HEADER_LEN..].to_vec();
+    }
+    data[BINARY_HEADER_LEN..end].to_vec()
+}
+
+/// The first data sector of a file, via its T/S list. `None` when the file has
+/// no data sector. Used only to read a type-B length header, so it stops after
+/// the first pair rather than walking the chain.
+fn first_data_sector<R: Read + Seek + Send>(
+    reader: &mut R,
+    partition_offset: u64,
+    e: &AppleDosFileEntry,
+) -> Result<Option<[u8; APPLE_II_SECTOR_BYTES]>, FilesystemError> {
+    if e.first_ts_track == 0 {
+        return Ok(None);
+    }
+    let list = read_sector(
+        reader,
+        partition_offset,
+        e.first_ts_track,
+        e.first_ts_sector,
+    )?;
+    let (dt, ds) = (list[0x0C], list[0x0D]);
+    if dt == 0 {
+        return Ok(None);
+    }
+    Ok(Some(read_sector(reader, partition_offset, dt, ds)?))
+}
+
+/// The logical byte length a type-B file declares, read from its first data
+/// sector. `None` for other types, which carry no length.
+fn declared_binary_len(first_sector: &[u8]) -> Option<usize> {
+    if first_sector.len() < BINARY_HEADER_LEN {
+        return None;
+    }
+    Some(u16::from_le_bytes([first_sector[2], first_sector[3]]) as usize)
+}
+
+/// Data sectors in a file whose catalog entry reports `length_sectors`.
+///
+/// The catalog counts **every** sector a file occupies, including its
+/// track/sector lists. Reporting that figure as the file size counted the T/S
+/// list as data, so a one-sector file listed as 512 bytes while `get` returned
+/// 256 (R-028). One T/S list addresses 122 data sectors, so each group of 123
+/// sectors contains exactly one list.
+fn data_sectors(length_sectors: u16) -> u16 {
+    let n = length_sectors;
+    if n == 0 {
+        return 0;
+    }
+    let lists = n.div_ceil(TS_PAIRS_PER_LIST as u16 + 1);
+    n.saturating_sub(lists)
+}
+
 pub fn type_letter(type_code: u8) -> &'static str {
     match type_code {
         TYPE_T => "T",
@@ -396,7 +471,7 @@ impl<R: Read + Seek + Send> AppleDosFilesystem<R> {
             tslist_track = list_buf[0x01];
             tslist_sector = list_buf[0x02];
         }
-        Ok(data)
+        Ok(strip_binary_header(e.type_code, data))
     }
 
     /// Apple DOS 3.3 stores binary files with a 4-byte header prepended
@@ -452,7 +527,21 @@ impl<R: Read + Seek + Send> Filesystem for AppleDosFilesystem<R> {
             if e.is_unused() || e.is_deleted() {
                 continue;
             }
-            let approx_size = e.length_sectors as u64 * APPLE_II_SECTOR_BYTES as u64;
+            // Allocated bytes, less the T/S list sectors the catalog counts as
+            // part of the file. For a type-B file the real length is in its
+            // own header, so prefer that: it is what `get` returns (R-028).
+            let allocated = data_sectors(e.length_sectors) as u64 * APPLE_II_SECTOR_BYTES as u64;
+            let approx_size = if e.type_code == TYPE_B {
+                first_data_sector(&mut self.reader, self.partition_offset, e)
+                    .ok()
+                    .flatten()
+                    .and_then(|sec| declared_binary_len(&sec))
+                    .map(|n| n as u64)
+                    .filter(|n| *n <= allocated)
+                    .unwrap_or(allocated)
+            } else {
+                allocated
+            };
             // Use the entry index as the FileEntry location so read_file
             // can find this specific catalog slot O(1).
             let mut fe = FileEntry::new_file(
@@ -947,11 +1036,19 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AppleDosFilesystem<R>
             ));
         }
 
-        // Default to type T (text) — caller may overwrite via direct
-        // catalog-slot edit if they need binary; this floor is
-        // conservative and avoids stamping a binary header the
-        // EditableFilesystem trait can't communicate.
-        let type_code = TYPE_T;
+        // Type B with the standard 4-byte header (load address, then length,
+        // both little-endian). DOS 3.3 records only a *sector* count, so a
+        // headerless store loses the byte length for good: the file came back
+        // padded to 256 and `ls`, `get` and the caller each reported a
+        // different number (R-028). B is also what a real Apple II tool writes
+        // for arbitrary bytes, so the length is recoverable by anything that
+        // reads the disk, not just by us.
+        let type_code = TYPE_B;
+        let mut stored = Vec::with_capacity(payload.len() + BINARY_HEADER_LEN);
+        stored.extend_from_slice(&0u16.to_le_bytes()); // load address
+        stored.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+        stored.extend_from_slice(&payload);
+        let payload = stored;
 
         let data_sectors_needed = payload.len().div_ceil(APPLE_II_SECTOR_BYTES).max(1) as u32;
         let pairs_per_list = self.vtoc.max_ts_pairs_per_list as u32;
@@ -1625,7 +1722,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(fe.name, "NEW.TXT");
-        assert_eq!(fe.special_type.as_deref(), Some("T"));
+        // Type B, not T: DOS 3.3 stores only a sector count, so the byte
+        // length has to live in the file's own 4-byte header or it is lost
+        // and the file reads back padded to 256 (R-028).
+        assert_eq!(fe.special_type.as_deref(), Some("B"));
         fs.sync_metadata().unwrap();
 
         let inner = fs.reader.clone();
@@ -1634,10 +1734,12 @@ mod tests {
         let entries = fs2.list_directory(&root2).unwrap();
         let new = entries.iter().find(|e| e.name == "NEW.TXT").unwrap();
         let read_back = fs2.read_file(new, 1024).unwrap();
-        // Type T means no binary-header strip — bytes come back verbatim
-        // padded to the sector boundary; trim the trailing zeros.
-        let trimmed_len = payload.len();
-        assert_eq!(&read_back[..trimmed_len], payload.as_slice());
+        // Exactly the bytes written — no sector padding, no header. This
+        // asserted only a prefix match before, which is why R-028's
+        // 104-in/256-out could not be caught here.
+        assert_eq!(read_back, payload);
+        // And the listed size agrees with what read_file returns.
+        assert_eq!(new.size, payload.len() as u64);
 
         // Free space dropped by 2 sectors (1 data + 1 T/S list).
         let after_free = EditableFilesystem::free_space(&mut fs2).unwrap();

@@ -30,6 +30,10 @@ pub struct XfsDinodeCore {
     pub aformat: u8,
     pub flags: u16,
     pub gen: u32,
+    /// di_mtime.tv_sec — seconds since 1970. Surfaced so `list_directory`
+    /// can populate `FileEntry.modified_unix`, which is what `tar_export`
+    /// writes into its headers.
+    pub mtime: i32,
 }
 
 impl XfsDinodeCore {
@@ -58,7 +62,9 @@ impl XfsDinodeCore {
             gid: BigEndian::read_u32(&buf[12..16]),
             nlink: BigEndian::read_u32(&buf[16..20]),
             // bytes 20..32: projid, v2_pad, flushiter — diagnostic only.
-            // bytes 32..56: atime/mtime/ctime — not surfaced yet.
+            // atime = 32..40, mtime = 40..48, ctime = 48..56 (each = tv_sec i32 + tv_nsec i32);
+            // v1/v2 use `i32` seconds → surfaced as `mtime`, dropping nsec.
+            mtime: BigEndian::read_i32(&buf[40..44]),
             size: BigEndian::read_u64(&buf[56..64]),
             nblocks: BigEndian::read_u64(&buf[64..72]),
             // bytes 72..76: extsize.

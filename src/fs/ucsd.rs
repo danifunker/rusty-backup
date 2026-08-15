@@ -223,6 +223,7 @@ impl<R: Read + Seek> UcsdFilesystem<R> {
             e.first_block as u64,
         );
         fe.modified = decode_date(e.date);
+        fe.modified_unix = crate::fs::times::ucsd_date_to_unix(e.date);
         fe
     }
 }
@@ -501,7 +502,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for UcsdFilesystem<R> {
         name: &str,
         data: &mut dyn Read,
         data_len: u64,
-        _options: &CreateFileOptions,
+        options: &CreateFileOptions,
     ) -> Result<FileEntry, FilesystemError> {
         if !parent.is_directory() || parent.path != "/" {
             return Err(FilesystemError::NotADirectory(parent.path.clone()));
@@ -541,13 +542,22 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for UcsdFilesystem<R> {
         } else {
             (data_len - (need as u64 - 1) * BLOCK) as u16
         };
+        // UCSD packs the date as a single 16-bit word (day | month | year),
+        // year 0..99 -> 1900..1999. Cross-fs copy passes source mtime through
+        // options.unix_times; a genuinely new file leaves it None and stamps
+        // zero (matching pre-existing behaviour — UCSD doesn't have a "now"
+        // convention and generators here forbid wall-clock reads).
+        let date = options
+            .unix_times
+            .map(|t| crate::fs::times::unix_to_ucsd_date(t.mtime_or_now()))
+            .unwrap_or(0);
         let entry = UcsdEntry {
             first_block: start,
             last_block: start + need,
             kind: kind_from_name(&uname),
             name: uname,
             last_byte,
-            date: 0,
+            date,
         };
         let fe = self.entry_to_file(&entry);
         self.entries.push(entry);

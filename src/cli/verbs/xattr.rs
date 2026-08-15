@@ -124,7 +124,7 @@ fn run_set(args: XattrSetArgs) -> Result<()> {
     log_stderr(&ctx.label);
     let mut fs = ctx
         .open_editable(file)
-        .map_err(|e| anyhow!("opening filesystem for write: {e}"))?;
+        .map_err(|e| crate::cli::resolve::write_open_error("opening filesystem for write", e))?;
     if !fs.as_filesystem().supports_xattrs() {
         bail!(
             "{} does not store extended attributes",
@@ -153,7 +153,7 @@ fn run_rm(args: XattrRmArgs) -> Result<()> {
     log_stderr(&ctx.label);
     let mut fs = ctx
         .open_editable(file)
-        .map_err(|e| anyhow!("opening filesystem for write: {e}"))?;
+        .map_err(|e| crate::cli::resolve::write_open_error("opening filesystem for write", e))?;
     if !fs.as_filesystem().supports_xattrs() {
         bail!(
             "{} does not store extended attributes",

@@ -198,29 +198,53 @@ files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
 
 [[case]]
 id = "edit.real.apple-dos-invaders"
-description = "A real Apple II game disk — the listing step guards against editing a volume we cannot even read"
+description = """A real Apple II bootable game disk: it opens, and editing it is
+refused.
+
+Corrected 2026-08-10. This case asserted that `put` then `get` round-trips, on
+the assumption that an Apple II game disk carries a DOS 3.3 filesystem. This one
+does not carry a filesystem at all — R-031 was filed against the resulting
+"Unknown" detection, and that detection is correct. Track 17, where the DOS 3.3
+VTOC lives, is 4096 zero bytes; no VTOC-shaped sector exists anywhere in the
+image; there is no ProDOS volume directory and no Pascal volume name. Tracks 0-3
+are dense and tracks 17+ empty — a bootloader reading raw sectors, which is what
+this class of disk is.
+
+Sector ordering cannot explain it: DOS-order and ProDOS-order .dsk images differ
+in the arrangement of sectors *within* a track, and track 17 is empty either way.
+
+So the case now asserts what is actually true and worth guarding: the image
+opens, and a write is refused rather than silently pretending to succeed."""
 fixture = "fs.apple-dos.invaders.floppy"
 [[case.step]]
 args = ["ls", "{fixture_copy}", "/"]
 expect_exit = 0
 [[case.step]]
 args = ["put", "{fixture_copy}", "{cases}/tier3/payload.bin", "/PAYLOAD"]
-expect_exit = 0
-[[case.step]]
-args = ["get", "{fixture_copy}", "/PAYLOAD", "{scratch}/out.bin"]
-expect_exit = 0
-files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+expect_exit = 4
+stderr_contains = ["editing not yet supported", "Unknown"]
 
 [[case]]
 id = "edit.real.efs-small"
+description = """A truncated EFS capture: it lists and reads, and cannot be
+edited or fsck'd.
+
+Corrected 2026-08-10. This asserted a put/get round-trip plus a clean fsck, and
+R-029 was filed when both failed at byte offsets far outside the image. The
+engine was right and the fixture is broken: its superblock declares 7,486,242
+blocks across 78 cylinder groups (3.8 GB) while the file is 8,192 blocks (4 MB).
+That is deliberate: it is the first 4 MB of a real IRIX 5.3 disk, kept as a
+prefix so `src/fs/efs.rs`'s superblock and read tests have ground truth (15 call
+sites). A prefix cannot support a write or a whole-volume fsck — those need
+every cylinder group present.
+
+Reads inside the surviving prefix work, so that is what this case pins. Editing
+EFS on a real volume needs an internally consistent fixture; see R-029."""
 fixture = "fs.efs.small.hd"
 [[case.step]]
-args = ["put", "{fixture_copy}", "{cases}/tier3/payload.bin", "/payload.bin"]
+args = ["ls", "{fixture_copy}", "/"]
 expect_exit = 0
+stdout_contains = ["lost+found"]
 [[case.step]]
-args = ["get", "{fixture_copy}", "/payload.bin", "{scratch}/out.bin"]
-expect_exit = 0
-files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
-[[case.step]]
-args = ["fsck", "{fixture_copy}", "--checkonly"]
+args = ["get", "{fixture_copy}", "/.bash_profile", "{scratch}/out.txt"]
 expect_exit = 0

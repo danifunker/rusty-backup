@@ -41,6 +41,12 @@ pub struct PartitionContext {
     /// APM / RDB type string (e.g. `"Apple_HFS"`, `"PFS\\3"`). `None`
     /// for MBR / GPT / raw superfloppy.
     pub type_string: Option<String>,
+    /// How the read path names this filesystem, e.g. `"Alto BFS"`. Carried so a
+    /// refusal can say what the volume is: content probing on the write path
+    /// returns "unknown" for filesystems identified by their container, which
+    /// told the user the disk was unreadable a moment after `ls` read it
+    /// (R-034).
+    pub type_name: String,
     /// Partition size in bytes. For raw superfloppies, the image's
     /// total length.
     pub size: u64,
@@ -77,6 +83,16 @@ impl PartitionContext {
         Box<dyn crate::fs::EditableFilesystem>,
         crate::fs::filesystem::FilesystemError,
     > {
+        // Rewrite only the "we could not name it" case; every other
+        // Unsupported message is specific and better than anything here.
+        let name_it = |e: crate::fs::filesystem::FilesystemError| match &e {
+            crate::fs::filesystem::FilesystemError::Unsupported(m) if m.contains("'unknown'") => {
+                crate::fs::filesystem::FilesystemError::Unsupported(
+                    m.replace("'unknown'", &format!("'{}'", self.type_name)),
+                )
+            }
+            _ => e,
+        };
         crate::fs::open_editable_filesystem_with(
             handle,
             self.offset,
@@ -90,7 +106,37 @@ impl PartitionContext {
             self.type_byte,
             self.type_string.as_deref(),
         )
+        .map_err(name_it)
     }
+}
+
+/// Fail with `NOT_FOUND` when the source simply is not there.
+///
+/// `exit.rs` reserves 3 for "image file missing" and `inspect` has honoured it
+/// since R-010 — with a per-verb `exists()` check that never spread. Every
+/// other verb surfaced the raw `io::Error` as the catch-all 1, so a script
+/// could not tell "no disk" from "bad disk", and the message was a
+/// platform-specific syscall error (R-036). Living here means a verb added
+/// later inherits it.
+///
+/// Three things are deliberately exempt, because none of them is a file whose
+/// absence we can judge: a raw device (`\\.\PhysicalDrive0` does not
+/// `exists()`), an `rb://` remote reference, and anything the caller has
+/// already peeled to a temp.
+pub fn require_source_exists(path: &std::path::Path) -> Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    if crate::cli::device_safety::looks_like_device_path(path) {
+        return Ok(());
+    }
+    if path.to_string_lossy().starts_with("rb://") {
+        return Ok(());
+    }
+    Err(crate::cli::exit::not_found(format!(
+        "{}: no such file",
+        path.display()
+    )))
 }
 
 /// Open `path` read-only and resolve which partition to use.
@@ -107,6 +153,7 @@ pub fn resolve_partition_ro(
     path: &std::path::Path,
     selector: Option<PartSelector>,
 ) -> Result<(File, PartitionContext)> {
+    require_source_exists(path)?;
     let mut file = open_image_ro(path)?;
     let ctx = resolve(&mut file, selector)?;
     Ok((file, ctx))
@@ -268,6 +315,7 @@ pub fn resolve_partition_rw_forced(
     // there via the backup-folder path, and repack over the original `.cbk` on
     // commit (the "additional legwork" edit path — cb_dos_network_and_state.md
     // §2e). Read access to a `.cbk` is native (source_reader); editing repacks.
+    require_source_exists(path)?;
     if crate::rbformats::cbk::is_cbk(path) {
         let temp = tempfile::Builder::new()
             .prefix(".rb-cbk-edit-")
@@ -406,6 +454,32 @@ pub fn resolve_image_rw(path: &std::path::Path) -> Result<(BoxRwSeek, RwCommit, 
         }
         return Ok((Box::new(reader), RwCommit::None, HandleShape::Wrapped));
     }
+    // A container the read path decodes but the write path cannot re-encode:
+    // G64/G71 raw GCR, MSA, EDSK, Apple-II .dsk. Refusing here says so; falling
+    // through opened the undecoded container bytes and reported "Invalid MBR:
+    // invalid boot signature", which reads as a corrupt disk a moment after
+    // `ls` listed its files (R-011, same shape as R-034).
+    // Named explicitly rather than derived as "flat-floppy minus editable":
+    // that set also caught Apple-II `.dsk`, which is a plain sector image the
+    // write path handles fine, and refusing it broke `new floppy apple-dos`
+    // round-trips. These three re-encode their bytes on read — GCR bitstream,
+    // MSA run-length, EDSK track records — so there is nowhere for a write to go.
+    if (source_reader::is_g64_path(path)
+        || source_reader::is_msa_path(path)
+        || source_reader::is_edsk_path(path))
+        && !source_reader::is_editable_container_path(path)
+    {
+        // Name a raw target, not a specific vintage extension: this branch
+        // covers G64/G71, MSA, EDSK and Apple-II .dsk, and suggesting `.d64`
+        // for an Apple II disk is worse than suggesting nothing.
+        return Err(crate::cli::exit::permission_denied(format!(
+            "{}: this container is read-only — it decodes for reading but cannot be \
+             re-encoded, so edits would have nowhere to go. Convert it to a raw image \
+             first: `rb-cli convert {} OUT.img --format raw`.",
+            path.display(),
+            path.display(),
+        )));
+    }
     if source_reader::is_editable_container_path(path) {
         // Floppy / gzip / WOZ container: decode to a temp flat, edit that,
         // re-encode on commit. open_image_rw on the temp gives the same File
@@ -528,6 +602,7 @@ pub fn resolve_partition_streaming_forced_inside(
     // A backup folder stores each partition as a compressed file governed by
     // metadata.json; decompress the selected one to a temp flat (read-only) so
     // get / ls / inspect see it like any other raw partition.
+    require_source_exists(path)?;
     if backup_edit::is_backup_folder(path) {
         return backup_edit::open_backup_partition_ro(path, selector);
     }
@@ -589,6 +664,7 @@ fn resolve_with_override<R: Read + Seek>(
                     offset: 0,
                     type_byte: 0x00,
                     type_string: None,
+                    type_name: "raw".to_string(),
                     size: total,
                     label: "Partition: raw filesystem @ byte 0 (forced via --fs-type)".to_string(),
                     // `resolve` works from a reader and doesn't know whether it
@@ -615,6 +691,7 @@ fn resolve_with_override<R: Read + Seek>(
             offset: 0,
             type_byte: 0x00,
             type_string: None,
+            type_name: pt.type_name().to_string(),
             size: total,
             label: format!("Partition: raw filesystem @ byte 0 ({})", pt.type_name()),
             whole_file_path: None,
@@ -631,6 +708,7 @@ fn resolve_with_override<R: Read + Seek>(
         offset: info.byte_offset(),
         type_byte: info.partition_type_byte,
         type_string: info.partition_type_string.clone(),
+        type_name: info.type_name.clone(),
         size: info.size_bytes,
         label: format_label(&pt, &info, &partitions),
         whole_file_path: None,
@@ -857,6 +935,23 @@ impl FsDispatchOverride {
     }
 }
 
+/// Classify a failure to open a filesystem for writing.
+///
+/// `Unsupported` from a write-open means the volume is readable and this build
+/// will not write it — "a read-only filesystem on a write path", which is
+/// exactly what `exit.rs` reserves PERMISSION_DENIED for. It used to exit 1,
+/// indistinguishable from a genuine I/O failure (R-034). The caller's wording
+/// is preserved so each verb keeps its own phrasing.
+pub fn write_open_error(context: &str, e: crate::fs::filesystem::FilesystemError) -> anyhow::Error {
+    let msg = format!("{context}: {e}");
+    match e {
+        crate::fs::filesystem::FilesystemError::Unsupported(_) => {
+            crate::cli::exit::permission_denied(msg)
+        }
+        _ => anyhow!(msg),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -951,5 +1046,48 @@ mod tests {
         ];
         let picked = pick_default_partition(&parts).expect("one real filesystem");
         assert_eq!(picked.type_name, "Apple_HFS (Untitled)");
+    }
+}
+
+#[cfg(test)]
+mod source_exists_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn a_missing_plain_file_is_not_found() {
+        let e = require_source_exists(Path::new("definitely-not-here-9e3f.img"))
+            .expect_err("a missing image must be refused");
+        assert_eq!(crate::cli::exit::code_for(&e), crate::cli::exit::NOT_FOUND);
+        assert!(format!("{e:#}").contains("no such file"));
+    }
+
+    /// The exemption that matters: backing up a raw disk is the app's job, and
+    /// a device node does not `exists()` as a file. Getting this wrong would
+    /// refuse every device before it was ever opened.
+    #[test]
+    fn device_paths_are_exempt() {
+        for p in [
+            r"\\.\PhysicalDrive0",
+            r"\\?\PhysicalDrive1",
+            "/dev/sda",
+            "/dev/disk3",
+        ] {
+            assert!(
+                require_source_exists(Path::new(p)).is_ok(),
+                "{p} must pass the guard and fail (or not) at open time instead"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_refs_are_exempt() {
+        assert!(require_source_exists(Path::new("rb://host:9000/disk.img")).is_ok());
+    }
+
+    #[test]
+    fn an_existing_path_passes() {
+        // A directory counts: a backup folder is a legitimate source.
+        assert!(require_source_exists(Path::new(env!("CARGO_MANIFEST_DIR"))).is_ok());
     }
 }

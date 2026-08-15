@@ -129,6 +129,8 @@ pub fn unix_entry_from_inode(
     } else {
         None
     };
+    // Numeric twin of `modified` for tar_export / cross-image copies.
+    let modified_unix: Option<u64> = if mtime > 0 { Some(mtime as u64) } else { None };
 
     let (entry_type, special_type) = match ft {
         UnixFileType::Regular | UnixFileType::Unknown => (EntryType::File, None),
@@ -152,6 +154,7 @@ pub fn unix_entry_from_inode(
         size: display_size,
         location: inode_num,
         modified,
+        modified_unix,
         type_code: None,
         creator_code: None,
         symlink_target: None,

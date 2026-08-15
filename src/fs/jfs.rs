@@ -1164,6 +1164,9 @@ impl<R: Read + Seek + Send> JfsFilesystem<R> {
             entry.modified = Some(super::unix_common::inode::format_unix_timestamp(
                 child_dinode.mtime_seconds as i64,
             ));
+            if child_dinode.mtime_seconds > 0 {
+                entry.modified_unix = Some(child_dinode.mtime_seconds as u64);
+            }
         }
         Ok(entry)
     }
@@ -2292,6 +2295,9 @@ impl<R: Read + Seek + Send> Filesystem for JfsFilesystem<R> {
             entry.modified = Some(super::unix_common::inode::format_unix_timestamp(
                 root_dinode.mtime_seconds as i64,
             ));
+            if root_dinode.mtime_seconds > 0 {
+                entry.modified_unix = Some(root_dinode.mtime_seconds as u64);
+            }
         }
         Ok(entry)
     }

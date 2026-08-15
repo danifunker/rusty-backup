@@ -12,14 +12,29 @@ concrete reason to.
 
 | # | Feature | Area | Blocks |
 |---|---------|------|--------|
-| [F-001](#f-001) | `optical extract` cannot extract a single path | `src/cli/verbs/optical.rs` | fixture harvesting from ISOs |
+| ~~F-001~~ | ~~`optical extract` cannot extract a single path~~ — **SHIPPED** 2026-08-09 | `src/cli/verbs/optical.rs` | — |
 | ~~F-002~~ | ~~CloneCD not supported~~ — **retracted, it is supported** | — | — |
 | [F-003](#f-003) | PFS3 / SFS builders exist but are not on the CLI | `src/cli/verbs/new.rs` | two Amiga fixture gaps |
-| [F-004](#f-004) | `show partmap` is APM-only | `src/cli/verbs/show.rs` | scripted partition inspection |
+| [F-005](#f-005) | Optical extract is CLI-only; the GUI cannot pull one file | `src/optical/browse_view.rs` | GUI parity with `optical extract` |
+| [F-006](#f-006) | IRIX support-disk building / browsing is thin | `src/cli/verbs/new_sgi_cdrom.rs` | bootable IRIX disc work — **needs scope** |
+| [F-007](#f-007) | No optical fixture with nested directories | `regression-tests/` | verifying `--path DIR --recursive` |
+| [F-008](#f-008) | `backup` reads only flat-layout sources | `src/cli/verbs/backup.rs` | backing up CHD / dynamic VHD / QCOW2 / VMDK — **four red cases** |
+| [F-009](#f-009) | SFS editor writes single-leaf extent b-trees only | `src/fs/sfs.rs` | editing any real-sized SFS volume |
+| ~~F-004~~ | ~~`show partmap` is APM-only~~ — **SHIPPED** 2026-08-08, same gap as R-026 | `src/cli/verbs/show.rs` | — |
 
 ---
 
 ## F-001 — `optical extract` is whole-disc only {#f-001}
+
+**SHIPPED 2026-08-09.** `--path` takes a file or a folder, `--recursive`
+decides whether a named folder descends, `--tar` archives instead of writing
+loose files, and `--preserve-permissions` applies the disc's POSIX mode.
+Nine cases in `cases/tier3/optical-extract.toml`, the single-file one anchored
+on a sha256 so a truncated read fails on content rather than on exit code.
+
+The Windows-illegal-names observation below is largely addressed too: a
+per-path extract sidesteps it for the common case, and `--tar` sidesteps it
+entirely, since a tar entry stores a name NTFS would refuse.
 
 ```
 Usage: rb-cli optical extract [OPTIONS] --to <TO> <SOURCE>
@@ -117,6 +132,13 @@ handlers), which is the actual win. It does not by itself prove anything.
 
 ## F-004 — `show partmap` only understands APM {#f-004}
 
+**SHIPPED 2026-08-08.** It detects the partition table first; APM keeps its
+full DDR and driver-descriptor rendering, every other table gets the generic
+partition list. Tracked twice, here and as
+[R-026](Regression_Bugs.md#r-026) — the defect / missing-feature split is not
+always obvious from a symptom, and this was genuinely both: the verb never
+claimed to read other schemes, and its error blamed the image for it.
+
 `docs/cli-reference.md` is honest about this — "Print the partition table of a
 disk image (APM-only today)" — so it is a scoped feature rather than a defect.
 On anything else it fails:
@@ -141,3 +163,179 @@ Two things would help, in order of cost:
 2. **The feature.** Extend to MBR, GPT, RDB, SGI, Sun, AHDI and X68K, which
    are all already parsed by the engine — `inspect` prints them today, so the
    data is there and only the structured emitter is missing.
+
+---
+
+## F-005 — the GUI cannot extract a single file from a disc {#f-005}
+
+`optical extract` grew `--path`, `--recursive`, `--tar`,
+`--preserve-permissions`, `--filesystem` and `--filesystem-index` (F-001).
+None of it is reachable from the GUI, which can browse an optical disc but
+offers no way to pull anything out of it.
+
+**Why it is small.** The capability is already there:
+`src/optical/browse_view.rs` calls `fs.read_file(entry)` in three places, so
+the GUI can already read one file out of a disc — it just never offers to save
+one. This is wiring, not new engine work.
+
+**What it needs:**
+
+- an extract action on the selected browse entry, and on a selected folder
+- a destination chooser, with the folder-vs-archive choice `--tar` introduced
+- the `--filesystem` / `--filesystem-index` selector surfaced, **without which
+  the GUI can only ever reach one side of a hybrid Mac/PC disc** — the reason
+  this is listed rather than left implicit
+- CLAUDE.md's pre-commit doc sync applies: a new dialog wants a README
+  Inspect-tab bullet
+
+## F-006 — IRIX support-disk building and browsing is thin {#f-006}
+
+`optical new sgi-efs` builds an SGI volume header with EFS in slot 7, and
+takes `--from-dir`, `--expand-archives` and `--flatten-folders`. What it does
+not do is treat the disc as a *bootable* IRIX support disc.
+
+**Needs scope before any work starts.** "Extending the IRIX support disks"
+could reasonably mean any of:
+
+1. **Volume-header executables as first-class entries.** An SGI volume header
+   carries standalone programs (`sash`, `ide`, `/unix`) outside the EFS
+   filesystem. `inspect` reports the header; nothing lists, extracts or
+   replaces those entries.
+2. **Building a disc that actually boots.** Writing the right volume-header
+   entries and boot fields for real hardware or a MiSTer core.
+3. **Richer `--from-dir` ergonomics** for laying out an inst-ready tardist
+   tree.
+
+(1) is self-contained and testable from a fixture. (2) cannot be verified
+without hardware — every SGI oracle is `skip-manual`, so it would ship
+unproven. That used to be Amiga's position too; it no longer is, and the way
+out is worth copying. [R-020](Regression_Bugs.md#r-020) was closed by writing
+one emulator harness (`oracles/fsuae/affs_mount.py`, host directory as the
+verdict channel), and `iris` does the same job for IRIX — so the SGI oracle is
+a harness someone has not written yet rather than a thing that cannot be done.
+(3) is ergonomics on an existing path.
+
+## F-007 — no optical fixture has nested directories {#f-007}
+
+`--path DIR --recursive` is implemented and unverified. The discs in the
+corpus are flat or single-file at the root:
+`optical.iso9660.joliet.cd` holds one file with no directories at all, which
+is why it makes such a clean single-file test and such a poor recursion test.
+
+**What would help:** a case against `optical.hfs.opentransport.cd` or the
+CloneCD Bookshelf set, both of which have real trees, asserting that
+`--recursive` descends and that its absence stops at one level. The fixtures
+are already catalogued — only the case is missing. It belongs in
+`cases/tier3/optical-extract.toml` beside the nine that exist.
+
+## F-008 — `backup` reads only flat-layout sources {#f-008}
+
+Filed as defect [R-016](Regression_Bugs.md#r-016) until 2026-08-09.
+**Reclassified**: `backup` has never claimed to decode containers, so this is
+a capability the engine lacks, not code disagreeing with itself. The four
+cases keep their assertions — they describe the behaviour we want — and now
+cite this entry.
+
+`backup --help` documents SOURCE as "an image file or a block-device path",
+and `inspect` reads every container we write. `backup` reads only the ones
+whose data begins at offset 0:
+
+| source | `inspect` | `backup` |
+|--------|-----------|----------|
+| raw `.img` | `Partition table: MBR` | **ok** |
+| fixed VHD | `Partition table: MBR` | **ok** |
+| **CHD** | `Partition table: MBR` | **fails** |
+| **dynamic VHD** | `Partition table: MBR` | **fails** |
+| **QCOW2** | `Partition table: MBR` | **fails** |
+| **VMDK sparse** | `Partition table: MBR` | **fails** |
+
+Fixed VHD only passes because it *is* raw data with a trailing footer. Every
+container with a non-flat internal layout fails, in one of two ways:
+
+```
+rb-cli backup o-chd/disk.chd ./out --format raw --sector-by-sector
+  -> error: backup failed: cannot read first sector: failed to fill whole buffer
+
+rb-cli backup o-qcow2/disk.qcow2 ./out --format raw --sector-by-sector
+  -> error: backup failed: failed to detect partition table:
+     Invalid MBR: invalid boot signature: expected 0xAA55, got 0x...
+```
+
+Same root cause — the container is not decoded, so raw file bytes are read as
+though they were the disk. Which message appears depends on whether the read
+runs off the end of a small file or lands on header bytes that resemble a bad
+MBR. `--sector-by-sector` does not help; the failure precedes all partition
+logic.
+
+**Why it matters.** These are four of our own output formats, CHD being the
+default for `convert`. A user can convert a disk to any of them and then find
+they cannot back it up — archive to QCOW2, later try to make a working copy,
+and the tool refuses. `inspect` reading them fine makes the gap look arbitrary
+from outside, which is what made it read as a defect for so long.
+
+**What would help.** `inspect` already opens all four, so the decoding exists;
+`backup` takes a different route to the bytes. Routing `backup`'s source open
+through the same container-aware path `inspect` uses is the whole feature.
+`backup.container.inspect-reads-what-backup-cannot` is green and pins that
+asymmetry, so it is the case to read first.
+
+Reproduces on a 64 MB synthetic image; no fixture required. **It also
+reproduces on a real one** as of 2026-08-09: `fs.hpfs.os2-warp45.hd` is a
+monolithicSparse VMDK holding an OS/2 Warp 4.52 install, and `backup` refuses
+it with the same `invalid boot signature: expected 0xAA55, got 0x0000` while
+`inspect` reads all 4722 files. Useful when implementing this — the gap is not
+an artifact of how the synthetic containers were built.
+
+**Two traps when verifying this**, both of which caught the original reporter:
+
+1. `backup` prints `rb-cli backup: SRC -> DEST` *before* doing any work, so a
+   grep for `->` reports success on a run that then fails. **Check the exit
+   code**, not the output.
+2. `--format raw` writes `partition-N.img` files, so a `find` over several
+   directories can pick up an unrelated `.img` and attribute the wrong result
+   to the wrong container. Use explicit paths per case.
+
+## F-009 — the SFS editor writes single-leaf extent b-trees only {#f-009}
+
+Filed as defect [R-032](Regression_Bugs.md#r-032) until 2026-08-10.
+**Reclassified**: the driver has always documented this ceiling — CLAUDE.md
+says "SFS (`src/fs/sfs.rs`) — read + edit (single-leaf btree only)" — so hitting
+it is the documented limit, not code disagreeing with itself. That is the same
+line R-016 was moved across.
+
+SFS keeps its free-space extents in a b-tree. `extent_btree_insert` and
+`extent_btree_remove` handle a tree that is a single leaf node; a volume large
+enough to need interior nodes — which is any volume of real size, including the
+Workbench reference disk — cannot be written.
+
+```
+rb-cli put fs.sfs.workbench-dh0.hd.img payload.bin /payload.bin
+  -> error: create_file: unsupported: SFS extent b-tree has interior nodes;
+     this editor writes single-leaf trees only ...
+  -> exit 4
+```
+
+**Two things were fixed while reclassifying it**, because how it refused was
+wrong even if the refusal was right:
+
+- It raised a **`Parse`** error, which says the *disk* is malformed. The disk is
+  fine and reads perfectly. It is now `Unsupported` — the volume is readable and
+  this build will not write it — which is precisely what
+  `exit.rs` reserves `PERMISSION_DENIED` for.
+- `put` mapped every `create_file` failure to the catch-all 1. It now routes
+  through `write_open_error`, the R-034 machinery, so the refusal exits **4**.
+  The write-*open* path had done this since R-034; `create_file` can refuse for
+  the same reason and did not.
+
+**What implementing it needs.** Node splitting, root promotion and parent
+updates against the on-disk `BNDC` format.
+
+The validation half is no longer the hard part. This entry used to say writes
+to a real Amiga filesystem could not be confirmed from here; that stopped being
+true on 2026-08-14, when `oracles/fsuae/affs_mount.py` drove FS-UAE to a
+verdict and closed [R-020](Regression_Bugs.md#r-020). The same harness serves
+SFS — mount the volume under test as DH1: and have the guest read it — with
+one addition: Kickstart has no SFS handler in ROM, so the guest needs the SFS
+handler staged into `L:` (it is at `rb-fixtures/oracle-assets/amiga`,
+extracted from the SFS reference fixture's own `L:`). So the code is the
+work now, not the proof.

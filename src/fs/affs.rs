@@ -30,6 +30,68 @@ use super::filesystem::{
 use super::CompactResult;
 
 /// Reusable error helper.
+/// Find the root block at or below `candidate`.
+///
+/// AFFS stores its size nowhere: the root block sits at the volume's midpoint,
+/// so its *position* is the size. That makes an over-large `candidate` — which
+/// is what you get from the end of the file when the volume is one partition of
+/// several — unrecoverable by arithmetic alone. The candidate is always an
+/// upper bound though, so step down until a block validates.
+///
+/// Validation is deliberately strict (tag, secType, hash-table size and the
+/// block's own checksum) because a scan that accepts a directory block would
+/// mount the wrong tree.
+fn locate_root_block<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+    block_size: u64,
+    candidate: u32,
+) -> Option<u32> {
+    let mut buf = [0u8; BSIZE];
+    let mut blk = candidate;
+    // Bounded so a non-AFFS partition cannot turn into a whole-disk scan; the
+    // exact case is the first hit for every bare ADF and superfloppy.
+    let floor = candidate.saturating_sub(MAX_ROOT_SEARCH).max(2);
+    while blk >= floor {
+        let off = partition_offset + blk as u64 * block_size;
+        if reader.seek(SeekFrom::Start(off)).is_ok()
+            && reader.read_exact(&mut buf).is_ok()
+            && is_root_block(&buf)
+        {
+            return Some(blk);
+        }
+        if blk == floor {
+            break;
+        }
+        blk -= 1;
+    }
+    None
+}
+
+/// Whether `buf` is a plausible AFFS root block. Checks the block's own
+/// checksum, so a false positive needs a 32-bit coincidence on top of the tags.
+fn is_root_block(buf: &[u8]) -> bool {
+    if buf.len() < BSIZE {
+        return false;
+    }
+    if BigEndian::read_i32(&buf[0..4]) != T_HEADER {
+        return false;
+    }
+    if BigEndian::read_i32(&buf[0x1FC..0x200]) != ST_ROOT {
+        return false;
+    }
+    if BigEndian::read_u32(&buf[12..16]) as usize != HT_SIZE {
+        return false;
+    }
+    let stored = BigEndian::read_u32(&buf[0x14..0x18]);
+    normal_checksum(buf, 5) == stored
+}
+
+/// How far below the computed candidate to look for the root block. A
+/// partition's slack is the gap between its length and the rest of the disk;
+/// 1 MiB of blocks covers real Amiga layouts with room to spare.
+const MAX_ROOT_SEARCH: u32 = 2048;
+
 fn parse_err<S: Into<String>>(msg: S) -> FilesystemError {
     FilesystemError::Parse(msg.into())
 }
@@ -268,7 +330,17 @@ impl<R: Read + Seek> AffsFilesystem<R> {
         // total blocks. For an 880K floppy this is (2 + 1760)/2 = 881.
         // ADFlib uses ((reserved + numBlocks - 1) / 2) which gives 880 for
         // 1760 sectors; that's the canonical value.
-        let root_block = (2 + total_blocks - 1) / 2;
+        //
+        // `total_blocks` comes from the end of the *reader*, which for a bare
+        // ADF is the end of the volume and for a partition inside an RDB disk
+        // is the end of the disk. AFFS is unusual in having no size field of
+        // its own — the root block's position *is* the size — so an
+        // overestimate puts the candidate past the real root and the open
+        // failed outright on every real Amiga hard disk (R-030). The candidate
+        // is always an upper bound, so walk down from it.
+        let candidate = (2 + total_blocks - 1) / 2;
+        let root_block = locate_root_block(&mut reader, partition_offset, block_size, candidate)
+            .ok_or_else(|| parse_err("root block: type != T_HEADER"))?;
 
         let mut root_buf = [0u8; BSIZE];
         reader.seek(SeekFrom::Start(
@@ -276,6 +348,8 @@ impl<R: Read + Seek> AffsFilesystem<R> {
         ))?;
         reader.read_exact(&mut root_buf)?;
         let root = AffsRootBlock::parse(&root_buf, root_block)?;
+        // The volume ends just past its root block; trust that over the reader.
+        let total_blocks = total_blocks.min(root_block * 2);
 
         // Load the bitmap.
         let (bitmap, bitmap_pages) = read_bitmap(
@@ -435,18 +509,20 @@ impl<R: Read + Seek> AffsFilesystem<R> {
     }
 
     /// Synthesize a new directory header block in the cache.
+    /// `dates = Some(...)` stamps that Amiga DateStamp; `None` stamps `now`.
     fn build_dir_block(
         &mut self,
         block: u32,
         parent: u32,
         name: &str,
+        dates: Option<(i32, i32, i32)>,
     ) -> Result<(), FilesystemError> {
         let mut buf = [0u8; BSIZE];
         buf[0..4].copy_from_slice(&T_HEADER.to_be_bytes());
         buf[4..8].copy_from_slice(&block.to_be_bytes());
         // bytes 8..0x14 are the rest of the header prefix — left zero.
         // Hash table at 0x18..0x138 — already zero from buf initialization.
-        let (days, mins, ticks) = Self::now_datestamp();
+        let (days, mins, ticks) = dates.unwrap_or_else(Self::now_datestamp);
         buf[0x1A4..0x1A8].copy_from_slice(&days.to_be_bytes());
         buf[0x1A8..0x1AC].copy_from_slice(&mins.to_be_bytes());
         buf[0x1AC..0x1B0].copy_from_slice(&ticks.to_be_bytes());
@@ -732,6 +808,14 @@ impl<R: Read + Seek> AffsFilesystem<R> {
             ),
         };
         fe.modified = datestamp_string(entry.modify_days, entry.modify_mins, entry.modify_ticks);
+        let unix = super::affs_common::datestamp_to_unix(
+            entry.modify_days,
+            entry.modify_mins,
+            entry.modify_ticks,
+        );
+        if unix > 0 {
+            fe.modified_unix = Some(unix as u64);
+        }
         fe.amiga_protection = Some(entry.access);
         if !entry.comment.is_empty() {
             fe.amiga_comment = Some(entry.comment.clone());
@@ -1255,6 +1339,15 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AffsFilesystem<R> {
         let first_data = data_blocks.first().copied().unwrap_or(0);
         let access = options.amiga_protection.unwrap_or(0);
         let comment_str = options.amiga_comment.as_deref().unwrap_or("");
+        // Explicit amiga_dates always win; otherwise convert a supplied
+        // unix_times mtime to the (days, mins, ticks) triple so a cross-fs
+        // copy from a non-Amiga source (HFS+/ext/tar) still records the
+        // source date on AFFS.
+        let dates = options.amiga_dates.or_else(|| {
+            options
+                .unix_times
+                .map(|t| super::affs_common::unix_to_datestamp(t.mtime_or_now()))
+        });
         self.build_file_header_block(
             header_block,
             parent_block,
@@ -1265,7 +1358,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AffsFilesystem<R> {
             header_extension,
             access,
             comment_str,
-            options.amiga_dates,
+            dates,
         )?;
         self.hash_chain_insert(parent_block, header_block, name)?;
 
@@ -1275,19 +1368,22 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AffsFilesystem<R> {
         } else {
             format!("{}/{}", parent.path, name)
         };
-        Ok(FileEntry::new_file(
-            name.to_string(),
-            path,
-            data_len,
-            header_block as u64,
-        ))
+        let mut fe = FileEntry::new_file(name.to_string(), path, data_len, header_block as u64);
+        if let Some(dts) = dates {
+            fe.amiga_date = Some(dts);
+            let unix = super::affs_common::datestamp_to_unix(dts.0, dts.1, dts.2);
+            if unix > 0 {
+                fe.modified_unix = Some(unix as u64);
+            }
+        }
+        Ok(fe)
     }
 
     fn create_directory(
         &mut self,
         parent: &FileEntry,
         name: &str,
-        _options: &CreateDirectoryOptions,
+        options: &CreateDirectoryOptions,
     ) -> Result<FileEntry, FilesystemError> {
         self.validate_name(name)?;
         let parent_block = if parent.location == 0 {
@@ -1300,18 +1396,27 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AffsFilesystem<R> {
             return Err(FilesystemError::AlreadyExists(name.to_string()));
         }
         let block = self.alloc_block()?;
-        self.build_dir_block(block, parent_block, name)?;
+        let dates = options.amiga_dates.or_else(|| {
+            options
+                .unix_times
+                .map(|t| super::affs_common::unix_to_datestamp(t.mtime_or_now()))
+        });
+        self.build_dir_block(block, parent_block, name, dates)?;
         self.hash_chain_insert(parent_block, block, name)?;
         let path = if parent.path == "/" {
             format!("/{name}")
         } else {
             format!("{}/{}", parent.path, name)
         };
-        Ok(FileEntry::new_directory(
-            name.to_string(),
-            path,
-            block as u64,
-        ))
+        let mut fe = FileEntry::new_directory(name.to_string(), path, block as u64);
+        if let Some(dts) = dates {
+            fe.amiga_date = Some(dts);
+            let unix = super::affs_common::datestamp_to_unix(dts.0, dts.1, dts.2);
+            if unix > 0 {
+                fe.modified_unix = Some(unix as u64);
+            }
+        }
+        Ok(fe)
     }
 
     fn delete_entry(
@@ -2168,10 +2273,25 @@ pub fn create_blank_affs(
     // Root block lives at the middle of the data region (classic AFFS
     // layout). The Amiga formatter picks `(2 + total_blocks - 1) / 2`.
     let root_block: u32 = (2 + total_blocks - 1) / 2;
+
+    // One bitmap block covers BITMAP_BITS_PER_BLOCK blocks, so a volume larger
+    // than that needs several. Writing exactly one regardless is what made a
+    // 4 MB volume panic indexing past the end of its single page (R-008b), and
+    // what left every volume above 4066 blocks with an uncovered tail
+    // (R-008a). The bitmap starts at block 2 (blocks 0/1 are the boot block).
+    let bitmap_bits_needed = total_blocks.saturating_sub(2) as usize;
+    let bitmap_pages = bitmap_bits_needed.div_ceil(BITMAP_BITS_PER_BLOCK).max(1);
+    // Pages past the 25 that fit in the root block live on a chain of bitmap
+    // extension blocks, each holding 127 more page pointers plus a `next`.
+    let ext_blocks = bitmap_pages
+        .saturating_sub(BM_PAGES_ROOT)
+        .div_ceil(BM_EXT_PAGES);
+
     let bitmap_block: u32 = root_block + 1;
-    if bitmap_block >= total_blocks {
+    let last_meta_block = bitmap_block as u64 + bitmap_pages as u64 + ext_blocks as u64 - 1;
+    if last_meta_block >= total_blocks as u64 {
         return Err(anyhow::anyhow!(
-            "AFFS volume too small to fit root + bitmap blocks"
+            "AFFS volume too small to fit root + {bitmap_pages} bitmap block(s)"
         ));
     }
 
@@ -2187,10 +2307,22 @@ pub fn create_blank_affs(
     let root_off = root_block as usize * BSIZE;
     let root = &mut img[root_off..root_off + BSIZE];
     BigEndian::write_i32(&mut root[0..4], T_HEADER);
-    BigEndian::write_u32(&mut root[4..8], root_block); // headerKey = self
+    // header_key is 0 on a root block, not the block's own number. Verified
+    // against a real Workbench 1.3 disk (fs.affs.workbench13.hd.hdf), whose
+    // root reads header_key=0 where ours wrote 4096 — the hypothesis R-020
+    // recorded, now with a disk behind it.
+    BigEndian::write_u32(&mut root[4..8], 0);
     BigEndian::write_u32(&mut root[12..16], HT_SIZE as u32);
     BigEndian::write_i32(&mut root[0x138..0x13C], -1); // bm_flag = valid
-    BigEndian::write_u32(&mut root[0x13C..0x140], bitmap_block); // bm_pages[0]
+    for i in 0..bitmap_pages.min(BM_PAGES_ROOT) {
+        let off = 0x13C + i * 4;
+        BigEndian::write_u32(&mut root[off..off + 4], bitmap_block + i as u32);
+    }
+    if ext_blocks > 0 {
+        // First extension block sits immediately after the bitmap pages.
+        let first_ext = bitmap_block + bitmap_pages as u32;
+        BigEndian::write_u32(&mut root[0x1A0..0x1A4], first_ext);
+    }
     let name_bytes = volume_name.as_bytes();
     let n = name_bytes.len().min(MAX_NAME_LEN);
     root[0x1B0] = n as u8;
@@ -2201,41 +2333,88 @@ pub fn create_blank_affs(
     let sum = normal_checksum(root, 5);
     BigEndian::write_u32(&mut root[0x14..0x18], sum);
 
-    // Bitmap block: all free except blocks 0/1 (boot), root, bitmap, and
-    // any blocks past `total_blocks` within the same 4064-bit page.
-    let bm_off = bitmap_block as usize * BSIZE;
-    let bm = &mut img[bm_off..bm_off + BSIZE];
-    for i in 1..128 {
-        BigEndian::write_u32(&mut bm[i * 4..i * 4 + 4], 0xFFFFFFFF);
-    }
-    // AFFS bitmap addresses blocks starting at block 2. Bit `i` covers
-    // block `i + 2`. Mark in-use: root_block, bitmap_block.
-    for blk in [root_block, bitmap_block] {
-        if blk >= 2 {
-            let bit = (blk - 2) as usize;
-            let word_idx = bit / 32 + 1; // word 0 is the checksum
-            let bit_in_word = bit % 32;
-            let mut w = BigEndian::read_u32(&bm[word_idx * 4..word_idx * 4 + 4]);
-            w &= !(1u32 << bit_in_word);
-            BigEndian::write_u32(&mut bm[word_idx * 4..word_idx * 4 + 4], w);
+    // Bitmap pages: set bit = free (the Amiga convention, opposite of most
+    // filesystems). Start all-free, then clear the blocks the metadata itself
+    // occupies and every bit past the end of the volume, so the allocator can
+    // never hand out a block that does not exist.
+    for page in 0..bitmap_pages {
+        let bm_off = (bitmap_block as usize + page) * BSIZE;
+        let bm = &mut img[bm_off..bm_off + BSIZE];
+        for i in 1..BITMAP_WORDS_PER_BLOCK + 1 {
+            BigEndian::write_u32(&mut bm[i * 4..i * 4 + 4], 0xFFFFFFFF);
         }
     }
-    // Clear bits for blocks past `total_blocks` (the bitmap covers a
-    // full 4064-bit page even if the volume is smaller). Without this,
-    // an allocator could hand out non-existent block numbers.
-    let last_block_idx_in_page = ((total_blocks - 2) as usize).min(4064);
-    for bit in last_block_idx_in_page..4064 {
-        let word_idx = bit / 32 + 1;
-        if word_idx >= 128 {
-            break;
+
+    // Bit `i` of the whole bitmap covers block `i + 2`; page `p` holds bits
+    // `p * BITMAP_BITS_PER_BLOCK ..`. `clear` maps a block number to its page
+    // and word, so a metadata block on any page is marked correctly.
+    let clear_block = |img: &mut [u8], blk: u32| {
+        if blk < 2 {
+            return;
         }
-        let bit_in_word = bit % 32;
-        let mut w = BigEndian::read_u32(&bm[word_idx * 4..word_idx * 4 + 4]);
+        let bit = (blk - 2) as usize;
+        let page = bit / BITMAP_BITS_PER_BLOCK;
+        if page >= bitmap_pages {
+            return;
+        }
+        let bit_in_page = bit % BITMAP_BITS_PER_BLOCK;
+        let word_idx = bit_in_page / 32 + 1; // word 0 is the checksum
+        let bit_in_word = bit_in_page % 32;
+        let off = (bitmap_block as usize + page) * BSIZE + word_idx * 4;
+        let mut w = BigEndian::read_u32(&img[off..off + 4]);
         w &= !(1u32 << bit_in_word);
-        BigEndian::write_u32(&mut bm[word_idx * 4..word_idx * 4 + 4], w);
+        BigEndian::write_u32(&mut img[off..off + 4], w);
+    };
+
+    clear_block(&mut img, root_block);
+    for p in 0..bitmap_pages {
+        clear_block(&mut img, bitmap_block + p as u32);
     }
-    let sum = bitmap_checksum(bm);
-    BigEndian::write_u32(&mut bm[0..4], sum);
+    for e in 0..ext_blocks {
+        clear_block(&mut img, bitmap_block + bitmap_pages as u32 + e as u32);
+    }
+    // Bits past the end of the volume, in the final page.
+    for bit in bitmap_bits_needed..bitmap_pages * BITMAP_BITS_PER_BLOCK {
+        let page = bit / BITMAP_BITS_PER_BLOCK;
+        let bit_in_page = bit % BITMAP_BITS_PER_BLOCK;
+        let word_idx = bit_in_page / 32 + 1;
+        let bit_in_word = bit_in_page % 32;
+        let off = (bitmap_block as usize + page) * BSIZE + word_idx * 4;
+        let mut w = BigEndian::read_u32(&img[off..off + 4]);
+        w &= !(1u32 << bit_in_word);
+        BigEndian::write_u32(&mut img[off..off + 4], w);
+    }
+
+    // Bitmap extension chain for pages beyond the 25 the root block holds.
+    for e in 0..ext_blocks {
+        let ext_blk = bitmap_block as usize + bitmap_pages + e;
+        let ext_off = ext_blk * BSIZE;
+        let first_page = BM_PAGES_ROOT + e * BM_EXT_PAGES;
+        for slot in 0..BM_EXT_PAGES {
+            let page = first_page + slot;
+            if page >= bitmap_pages {
+                break;
+            }
+            let off = ext_off + slot * 4;
+            BigEndian::write_u32(&mut img[off..off + 4], bitmap_block + page as u32);
+        }
+        // Last long of an extension block points at the next one, or 0.
+        let next = if e + 1 < ext_blocks {
+            (ext_blk + 1) as u32
+        } else {
+            0
+        };
+        let nx = ext_off + BM_EXT_PAGES * 4;
+        BigEndian::write_u32(&mut img[nx..nx + 4], next);
+    }
+
+    // Checksums last, over the finished pages.
+    for page in 0..bitmap_pages {
+        let bm_off = (bitmap_block as usize + page) * BSIZE;
+        let bm = &mut img[bm_off..bm_off + BSIZE];
+        let sum = bitmap_checksum(bm);
+        BigEndian::write_u32(&mut bm[0..4], sum);
+    }
 
     Ok(img)
 }
