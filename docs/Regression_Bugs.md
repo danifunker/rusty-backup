@@ -516,7 +516,22 @@ Case `read.apfs.apple-gpt`.
 ### R-020 — every AFFS volume we write is unmountable on a real Amiga {#r-020}
 
 **FIXED — confirmed by a real Kickstart 2026-08-14.** The emulator this entry
-has waited on since 2026-08-07 finally ran, and AmigaOS mounts the volume:
+has waited on since 2026-08-07 finally ran, and AmigaOS mounts the volume.
+
+**Re-run it** (Windows box; needs FS-UAE, a Kickstart 3.1 A1200 ROM and the
+`fs.affs.workbench13.hd.hdf` fixture — all three already present, see the
+oracle's README for what it expects):
+
+```
+rb-cli new volume --size 2M affs ours.hdf
+rb-cli put ours.hdf hello.txt /HELLO
+python regression-tests/oracles/fsuae/affs_mount.py ours.hdf
+```
+
+Exit 0 and a `verdict: mounted` line is the pass. Takes about a minute, most
+of it the guest booting. Pair it with the control below before believing it.
+
+AmigaOS's answer:
 
 ```
 Mounted disks:
@@ -547,6 +562,11 @@ said it needed. The same commit closes [R-038](#r-038).
 `os.urandom` through the identical config produces no DH1: unit at all and
 `Can't examine "DH1:": device (or volume) is not mounted`. The harness
 discriminates; it is not reporting success for anything put in front of it.
+
+```
+python -c "import os,pathlib; pathlib.Path('garbage.hdf').write_bytes(os.urandom(2*1024*1024))"
+python regression-tests/oracles/fsuae/affs_mount.py garbage.hdf     # -> exit 1
+```
 
 Oracle: `oracles/fsuae/affs_mount.py`, strength `authoritative` — this is
 AmigaOS's own filesystem, not a reimplementation.
@@ -1922,8 +1942,20 @@ report unchanged.
 
 At HEAD, `xdftool` accepts a freshly written volume at every size tried —
 1M, 2M, 3M, 4M, 8M, 16M, 32M — and accepts one that has had a `put` applied,
-listing the file back with its date. The three artifacts the finding was
-actually run against still fail, identically, on all three hosts:
+listing the file back with its date.
+
+**Re-run it** (needs `pip install amitools`; no emulator, so this one is
+seconds rather than minutes):
+
+```
+for sz in 1M 2M 4M 8M 16M 32M; do
+  rb-cli new volume --size $sz affs "v$sz.hdf"
+  python regression-tests/oracles/amitools_affs.py "v$sz.hdf" || echo "FAIL $sz"
+done
+```
+
+The three artifacts the finding was actually run against still fail,
+identically, on all three hosts:
 
 ```
 regression-tests/artifacts/{windows,linux,macos}/fs.affs/image.img

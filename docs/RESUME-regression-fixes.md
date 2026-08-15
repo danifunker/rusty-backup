@@ -12,8 +12,13 @@ pushed and verified on all three hosts at `c6e66fd`).
 - Suite: **259 pass / 19 xfail / 0 fail**, zero XPASS, on Windows, macOS and
   Linux — all three measured at `93a6d53`, with the OS/2 fixture present on
   all three.
-- 21 findings fixed, 14 open (R-036 and R-037 were filed 2026-08-09; R-037 is
-  already fixed). `data/known-failures.toml` holds 19 entries.
+- **Counts below this line were last true on 2026-08-09 and are not now.** As
+  of 2026-08-14 the live tally in
+  [`Regression_Bugs.md`](Regression_Bugs.md) is 31 fixed, 2 not-a-defect,
+  2 reclassified as feature gaps, and **two findings open** — R-039 (EFS free
+  list) and R-011 (blocked on fixtures) — plus R-019, accepted. R-020 and
+  R-038 both closed 2026-08-14. `data/known-failures.toml` is down to 4
+  entries, all F-008. Read the table there, not this paragraph.
 - R-016 is no longer a defect: it was reclassified as
   [F-008](missing_features_from_regression.md#f-008), and `rb-regress validate`
   now accepts an `F-nnn` citation as well as an `R-nnn` one.
@@ -54,7 +59,9 @@ is left needs investigation before it needs a fix:
 - **R-024** — one `put` into a fresh 3 MB AFFS volume makes `fsck --checkonly`
   report errors. Data reads back fine, so the damage is to allocation
   structures. Three distinct AFFS bugs — R-008 is the formatter, R-024 the
-  editor, R-020 the root block. Do not conflate them.
+  editor, R-020 the root block. Do not conflate them. (All three closed by
+  2026-08-14; kept here because the "do not conflate" advice is still the
+  right way to read the AFFS entries.)
 - **R-033** — a QL Microdrive `.mdv` fails at MBR detection although its own
   probe matches it exactly. **Very likely the same shape as R-022**, which was
   a bare volume falling through to the MBR parse because no probe claimed it.
@@ -70,10 +77,11 @@ is left needs investigation before it needs a fix:
   re-run `optical.cue.unpadded-track-number` and
   `optical.cdda.no-data-track-opens` — both red on purpose, both will flip to
   XPASS. `docs/opticaldiscs-upstream-prompt.md` has the detail.
-- **R-020** (every AFFS volume we write is unmountable on a real Amiga) needs
-  an emulator or hardware oracle. All 62 emulator / MiSTer-core oracles are
-  `skip-manual`, so no automated run can confirm a fix. Teaching `verify` to
-  drive FS-UAE is the harness feature that unblocks it.
+- ~~**R-020** needs an emulator or hardware oracle.~~ **Unblocked and closed
+  2026-08-14.** The harness feature this asked for exists:
+  `oracles/fsuae/affs_mount.py` drives FS-UAE, and Kickstart 3.1 mounts our
+  volume Read/Write. The remaining 61 emulator / MiSTer-core oracles are still
+  `skip-manual` — this unblocked one of them, not the class.
 - **R-025** is Windows-only and correctly scoped with `platforms = ["windows"]`.
 - MiSTer's `rb-cli` is from 2026-07-27 and must be redeployed before its 12
   core oracles mean anything.
