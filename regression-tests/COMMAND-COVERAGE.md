@@ -69,12 +69,21 @@ Two things fell out of checking:
   shortcut that produced the "no L: directory anywhere" mistake during the
   FS-UAE work.
 * **Two real AFFS volumes were sitting unused** (`fs.affs.workbench13.hd`,
-  `fs.affs.ffs-intl-cd32.hd`). Given R-020 — our AFFS formatter emits volumes
-  no Amiga will mount, and our own fsck agrees with the formatter rather than
-  with reality — an AFFS editor tested only against our own output proves very
-  little. `cases/tier3/edit-real-volumes.toml` now runs the same put/get/fsck
-  round-trip against third-party volumes for AFFS, NTFS, ext2/4, FAT16/32,
-  HFS+, HFS, HFV, ProDOS, CP/M, Human68k, Apple DOS and EFS.
+  `fs.affs.ffs-intl-cd32.hd`). The reasoning at the time was R-020 — our AFFS
+  formatter emitted volumes no Amiga would mount, and our own fsck agreed with
+  the formatter rather than with reality, so an AFFS editor tested only against
+  our own output proved very little. `cases/tier3/edit-real-volumes.toml` now
+  runs the same put/get/fsck round-trip against third-party volumes for AFFS,
+  NTFS, ext2/4, FAT16/32, HFS+, HFS, HFV, ProDOS, CP/M, Human68k, Apple DOS
+  and EFS.
+
+  R-020 was fixed and closed on 2026-08-14 (Kickstart 3.1 mounts our volumes
+  Read/Write), so the premise no longer holds — but the conclusion does, and
+  more strongly for having been tested: third-party volumes are what caught
+  R-030 and R-013, and testing an editor only against its own writer is the
+  circularity that let R-020 stand for a week. `workbench13` earned its keep
+  twice more since, as the R-038 control and as the FS-UAE oracle's boot
+  volume.
 
 43 remain unused, mostly optical discs and the exotic end (Alto, Lisa, Xerox
 D0, 3DO, GameCube, CD-i). Those are read-path fixtures whose cases belong in

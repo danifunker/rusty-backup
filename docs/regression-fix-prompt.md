@@ -3,11 +3,17 @@
 A handoff for fixing the defects in [`Regression_Bugs.md`](Regression_Bugs.md).
 Paste a tranche into a fresh session; each is independently shippable.
 
-**Readiness, honestly.** Written when 30 findings were open. **14 remain as of
-2026-08-09.** Tranche A is empty but for two blocked upstream; Tranche B has
-lost its three highest-value entries and its one decision; Tranche C is
-untouched, because "the symptom is known and the cause is not" is exactly the
-state that does not clear on its own.
+**Readiness, honestly.** Written when 30 findings were open. **Two remain as of
+2026-08-14** — R-039 (EFS free list, filed after this document was written) and
+R-011 (blocked on fixtures, not on effort). Everything this document was built
+to hand off has been handed off and done.
+
+Tranche C — the eight where "the symptom is known and the cause is not", the
+state that does not clear on its own — cleared. Six were fixed, two turned out
+not to be defects, and R-011 is the only row still live. That happened between
+2026-08-10 and 2026-08-14, so if you are reading this expecting work, read
+[`Regression_Bugs.md`](Regression_Bugs.md) first: this file is now mostly a
+record of how the tranche was worked rather than a queue.
 
 Struck-through rows are kept rather than deleted: the "what to do" column
 records what each fix turned on, and two of them turned on the *report being
@@ -134,13 +140,13 @@ first, and the investigation is the deliverable.
 
 | Finding | Case | What the investigation has to establish |
 |---|---|---|
-| R-020 | none — hand-verified | Every AFFS volume we write is "Not a DOS disk" on a real Amiga, at every size. Working hypothesis: root block `header_key` must be 0 and we write the block number. **Unconfirmed.** The fix must land in **both** the formatter and `affs_fsck`, which currently agree with each other and are both wrong. Needs an emulator or hardware oracle to confirm — see Blocked below. |
-| R-030 | `edit.real.affs-workbench13` | A real Workbench 1.3 AFFS volume cannot be opened at all — read, fsck and write alike. Establish whether this is OFS-vs-FFS, an older root-block layout, or the same root cause as R-020. |
-| R-029 | `edit.real.efs-small` | EFS computes block addresses far outside the image; `fsck` fails on an unmodified volume. Find where the address computation diverges from the on-disk geometry. |
-| R-013 | `fs.detect.ufs-{solaris-entry-types,no-absurd-sizes}` | Solaris UFS directories are reported as files, one with a garbage size. Likely endianness or cylinder-group layout. |
-| R-028 | `edit.apple-dos.put-get` | Apple DOS 3.3 reports three sizes for one file: 104 in, 512 by `ls`, 256 by `get`. Establish which is right and which two are wrong. |
-| R-031 | `edit.real.apple-dos-invaders` | A real Apple DOS 3.3 disk detects as `unknown` although our own output does not. **Try R-034's fix first** — same shape, and one fix may cover both. |
-| R-035 | none — a `parity` finding | `.cbk` embeds `source_device`, the producing host's absolute path, so it is not reproducible across machines and leaks the host's directory layout. **Decision** before any fix: keep the field, normalise it, or record a device identity instead. Note `expect_divergence` masks byte *ranges* and cannot express a divergence that changes the file's *length*. |
+| ~~R-020~~ | `oracles/fsuae/affs_mount.py` | ~~Every AFFS volume we write is "Not a DOS disk" on a real Amiga.~~ **CLOSED 2026-08-14.** The hypothesis was right: `header_key` had to be 0, and the bitmap was a block short of the geometry. Both fixed by a190182; Kickstart 3.1 then mounted the volume Read/Write. The half of the prediction that was *wrong* is worth keeping — the fix did **not** need to land in `affs_fsck`, which never inspected `header_key` at all. |
+| ~~R-030~~ | `edit.real.affs-workbench13` | ~~A real Workbench 1.3 AFFS volume cannot be opened at all.~~ **CLOSED 2026-08-10** — neither OFS-vs-FFS nor a root-block layout difference: the root block was being located from the end of the *file* rather than the partition. Related to R-020 but not the same root cause. |
+| ~~R-029~~ | `edit.real.efs-small` | ~~EFS computes block addresses far outside the image.~~ **NOT A DEFECT, 2026-08-10** — the fixture is a deliberate 4 MB prefix capture, and the case asked it to do what a prefix cannot. |
+| ~~R-013~~ | `fs.detect.ufs-{solaris-entry-types,no-absurd-sizes}` | ~~Solaris UFS directories reported as files.~~ **CLOSED 2026-08-10** — cylinder-group layout, as guessed: UFS1's rotational cylinder-group offset was ignored. Not endianness. |
+| ~~R-028~~ | `edit.apple-dos.put-get` | ~~Apple DOS 3.3 reports three sizes for one file.~~ **CLOSED 2026-08-10** — the length lives in a type-B header and was not being stored; all three now agree. |
+| ~~R-031~~ | `edit.real.apple-dos-invaders` | ~~A real Apple DOS 3.3 disk detects as `unknown`.~~ **NOT A DEFECT, 2026-08-10** — the disk carries no filesystem at all, so `Unknown` is the correct answer. R-034's fix was unrelated. |
+| ~~R-035~~ | none — a `parity` finding | ~~`.cbk` embeds the producing host's absolute path.~~ **CLOSED 2026-08-09** — decided and shipped: the path is normalised to a device leaf. |
 | R-011 | `fmt.g64.standard-dump-opens` (working half only) | G64 decoding fails on copy-protected / patched dumps. **Deliberately undecided** — whether it *should* succeed is an open question, and asserting either way prejudges it. Decide scope before writing anything. |
 
 ---
@@ -164,10 +170,11 @@ ticket.
 
 ## Blocked on something other than effort
 
-- **R-020** needs an emulator or hardware oracle. All 62 emulator and
-  MiSTer-core oracles resolve to `skip-manual`: `verify` cannot invoke them,
-  so no automated run can confirm a fix. Either book MiSTer time, or teach
-  `verify` to drive FS-UAE — which is the next harness feature regardless.
+- ~~**R-020** needs an emulator or hardware oracle.~~ **Unblocked 2026-08-14.**
+  The suggested route was the one taken: `verify` was taught to drive FS-UAE,
+  via `oracles/fsuae/affs_mount.py`. No MiSTer time was needed. The other
+  ~60 emulator and MiSTer-core oracles are still `skip-manual` — this
+  unblocked one, not the class.
 - The MiSTer's `rb-cli` is from 2026-07-27 and must be redeployed before its
   12 core oracles mean anything.
 

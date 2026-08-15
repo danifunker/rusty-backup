@@ -1084,6 +1084,10 @@ number in `header_key` where 0 belongs. Both are the reader and the writer
 disagreeing with the real format about the root block; they may or may not
 share a fix. Cases `edit.real.affs-workbench13`.
 
+**Answered:** they shared a commit (a190182) but not a cause — this one was
+the root block being located from the end of the file rather than the
+partition, R-020's was `header_key` plus a short bitmap. Both closed.
+
 ### R-029 — EFS computes block addresses far outside the image {#r-029}
 
 **NOT AN ENGINE DEFECT — closed 2026-08-10.** The addresses are outside the
@@ -1456,6 +1460,12 @@ green — `fs.new-volume.affs{,.4m,.32m,.bitmap-boundary-plus-one}` and
 Note this does **not** address [R-020](#r-020): these volumes are still
 "Not a DOS disk" on a real Amiga, and that needs an emulator or hardware oracle
 to confirm either way.
+
+**Superseded 2026-08-14.** It did address it. The `header_key` half of
+a190182 was what R-020 turned on, and Kickstart 3.1 has since mounted these
+volumes Read/Write — the emulator this paragraph asked for was written and
+answered. Left standing because being wrong about which fix closes which
+finding is the recurring theme of this file.
 
 ---
 
@@ -1999,9 +2009,10 @@ the run path noticed. Artifacts are not regenerated before an oracle runs and
 carry no staleness check, so any oracle can indict a fix that already shipped.
 Tracked as a suite change, not a code one.
 
-**This does not close [R-020](#r-020).** amitools is a reimplementation; that
-it accepts the volume is not proof a real Amiga mounts it. R-020 remains open
-on its own evidence.
+**This did not, by itself, close [R-020](#r-020).** amitools is a
+reimplementation; that it accepts the volume is not proof a real Amiga mounts
+it. R-020 was closed separately later the same day, by AmigaOS itself under
+FS-UAE — which is the evidence this paragraph was holding out for.
 
 ---
 

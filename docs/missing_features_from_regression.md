@@ -208,8 +208,12 @@ could reasonably mean any of:
 
 (1) is self-contained and testable from a fixture. (2) cannot be verified
 without hardware — every SGI oracle is `skip-manual`, so it would ship
-unproven, which is the same position [R-020](Regression_Bugs.md#r-020) is in
-for Amiga. (3) is ergonomics on an existing path.
+unproven. That used to be Amiga's position too; it no longer is, and the way
+out is worth copying. [R-020](Regression_Bugs.md#r-020) was closed by writing
+one emulator harness (`oracles/fsuae/affs_mount.py`, host directory as the
+verdict channel), and `iris` does the same job for IRIX — so the SGI oracle is
+a harness someone has not written yet rather than a thing that cannot be done.
+(3) is ergonomics on an existing path.
 
 ## F-007 — no optical fixture has nested directories {#f-007}
 
@@ -324,8 +328,14 @@ wrong even if the refusal was right:
   the same reason and did not.
 
 **What implementing it needs.** Node splitting, root promotion and parent
-updates against the on-disk `BNDC` format. The hard part is not the code but
-the validation: writes to a real Amiga filesystem cannot be confirmed from here
-— see [R-020](Regression_Bugs.md#r-020), where every emulator and MiSTer-core
-oracle resolves to `skip-manual`. Teaching `verify` to drive FS-UAE unblocks
-this and R-020 together.
+updates against the on-disk `BNDC` format.
+
+The validation half is no longer the hard part. This entry used to say writes
+to a real Amiga filesystem could not be confirmed from here; that stopped being
+true on 2026-08-14, when `oracles/fsuae/affs_mount.py` drove FS-UAE to a
+verdict and closed [R-020](Regression_Bugs.md#r-020). The same harness serves
+SFS — mount the volume under test as DH1: and have the guest read it — with
+one addition: Kickstart has no SFS handler in ROM, so the guest needs the SFS
+handler staged into `L:` (it is at `rb-fixtures/oracle-assets/amiga`,
+extracted from the SFS reference fixture's own `L:`). So the code is the
+work now, not the proof.
