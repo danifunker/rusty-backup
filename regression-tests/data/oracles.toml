@@ -357,7 +357,8 @@ discriminates rather than passing whatever it is given.
 The one trap, because it cost an afternoon and looks like an emulator fault:
 the guest script must be written with LF endings, in bytes. Python's
 write_text applies the platform newline on Windows, AmigaDOS scripts are
-LF-terminated, and the guest then read `Info >RESULTS:info.txt` — an
+LF-terminated, and the guest then read a redirect whose target ended in a
+carriage return — an
 illegal filename on the host directory DH2 maps to. Every redirect failed,
 FAILAT 21 stopped the script aborting, and the run booted and silently
 produced nothing.
