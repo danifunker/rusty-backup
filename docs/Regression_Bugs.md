@@ -37,7 +37,7 @@ finding depends on a fixture, the fixture is named.
 | ~~R-035~~ | ~~Medium~~ **FIXED** | `src/backup/` | ~~`.cbk` embeds the producing host's absolute path, so it can never be byte-identical across machines~~ — path normalised to a leaf, 2026-08-09 |
 | ~~R-036~~ | ~~Medium~~ **FIXED** | `src/cli/resolve.rs` | ~~A missing image gets three different exit codes across the verb surface~~ — one guard in the shared resolver, 2026-08-10 |
 | ~~R-037~~ | ~~**High**~~ **FIXED** | `src/cli/verbs/resize.rs` | ~~Shrinking rewrote the filesystem over live data and returned truncated files~~ — data floor + `--confirm-shrink` + truncation, 2026-08-09 |
-| [R-038](#r-038) | **High** | `src/fs/affs.rs` | A second implementation (amitools) rejects every AFFS volume we write |
+| ~~R-038~~ | ~~**High**~~ **NOT A LIVE DEFECT** | — | ~~A second implementation (amitools) rejects every AFFS volume we write~~ — real, but already fixed by a190182 two days before it was filed; the oracle read an Aug-8 artifact, 2026-08-14 |
 | [R-039](#r-039) | **High** | `src/fs/efs*.rs` | IRIX's own fsck reports BAD FREE LIST on every EFS volume we write |
 | [R-020](#r-020) | **High** | `src/fs/affs.rs` | `new volume affs` output is "Not a DOS disk" on a real Amiga, at every size |
 | ~~R-016~~ | ~~**High**~~ **RECLASSIFIED** | `src/cli/verbs/backup.rs` | ~~`backup` accepts only flat-layout sources: CHD, dynamic VHD, QCOW2 and VMDK all fail~~ — not a defect; moved to [F-008](missing_features_from_regression.md#f-008), 2026-08-09 |
@@ -1866,6 +1866,64 @@ Cases: `resize.shrink.{refuses-cutting-live-data,needs-confirmation,keeps-data-a
 ---
 
 ### R-038 — a second implementation rejects every AFFS volume we write {#r-038}
+
+**NOT A LIVE DEFECT 2026-08-14 — it was already fixed when it was filed, and
+the oracle was reading a stale artifact.** The rejection was real; the code it
+indicted was not the code in the tree. Full evidence below, then the original
+report unchanged.
+
+At HEAD, `xdftool` accepts a freshly written volume at every size tried —
+1M, 2M, 3M, 4M, 8M, 16M, 32M — and accepts one that has had a `put` applied,
+listing the file back with its date. The three artifacts the finding was
+actually run against still fail, identically, on all three hosts:
+
+```
+regression-tests/artifacts/{windows,linux,macos}/fs.affs/image.img
+  -> FSError: Bitmap Block Count Mismatch(15): got=2 want=1
+```
+
+Those artifacts carry their own provenance. `meta.json` records
+`git_sha 0563cb8`, dated 2026-08-08, and
+
+```
+git merge-base --is-ancestor a190182 0563cb8   -> NO
+```
+
+so they were produced **before** [a190182](#r-008a) ("fix(affs): size the
+bitmap, find the root block, zero header_key") landed on 2026-08-10. The
+oracle ran on 2026-08-12 against binaries two days older than the fix.
+
+**What the bytes say**, which also settles the hypothesis the original report
+left open. Reading the root block of each:
+
+| | header_key | bm_pages set | geometry needs |
+|---|---|---|---|
+| Aug-8 artifact | 2048 (wrong) | 1 | 2 |
+| HEAD, fresh | 0 (correct) | 2 | 2 |
+
+amitools' rule is in `ADFSBitmap`: it raises when the count it computes from
+the volume geometry differs from the number of bitmap blocks it can actually
+reach through the root's `bm_pages` and extension chain. The message reads
+`got=<computed> want=<reached>` — so `got=2 want=1` means *geometry needs two,
+the volume supplies one*. That is [R-008a](#r-008a) — "AFFS tail blocks above
+4066 are uncovered" — seen from the outside, and a190182 fixed both halves of
+it at once: the bitmap is now sized to the geometry, and `header_key` is 0.
+
+So the original report's hypothesis — "our root block declares a geometry
+inconsistent with the bitmap we actually wrote" — was **right**, and was
+already fixed two days before it was written down.
+
+**The process defect is the one worth keeping.** An oracle verdict was
+attributed to current code when it was produced by old code, and nothing in
+the run path noticed. Artifacts are not regenerated before an oracle runs and
+carry no staleness check, so any oracle can indict a fix that already shipped.
+Tracked as a suite change, not a code one.
+
+**This does not close [R-020](#r-020).** amitools is a reimplementation; that
+it accepts the volume is not proof a real Amiga mounts it. R-020 remains open
+on its own evidence.
+
+---
 
 Found 2026-08-12, the first time an AFFS volume of ours was read by code that
 is not ours. amitools' `xdftool` refuses it:

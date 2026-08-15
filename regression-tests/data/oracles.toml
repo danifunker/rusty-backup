@@ -387,7 +387,7 @@ availability = [
   { platform = "macos",   status = "expected" },
 ]
 verifies = [
-  { format = "fs.affs", direction = "write", strength = "structural", status = "refuted", evidence = "2026-08-12: xdftool rejects our volume with 'Bitmap Block Count Mismatch: got=2 want=1', and reads a real Workbench 1.3 disk from the corpus perfectly. See R-038.", check = ["{oracles}/amitools_affs.py", "{artifact}"] },
+  { format = "fs.affs", direction = "write", strength = "structural", status = "proven", evidence = "2026-08-14: xdftool accepts a freshly written volume at 1M..32M and after a put, listing the file back. The 2026-08-12 rejection (R-038) was real but indicted an Aug-8 artifact built before a190182 fixed the bitmap sizing; HEAD passes.", check = ["{oracles}/amitools_affs.py", "{artifact}"] },
 ]
 
 [[oracle]]

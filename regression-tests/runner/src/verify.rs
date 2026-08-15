@@ -73,6 +73,14 @@ pub struct Record {
     /// The artifact's sha256 as recorded by `produce`, so a verdict can be tied
     /// to the exact bytes that were checked.
     pub artifact_sha256: String,
+    /// The commit the artifact was produced at, carried onto every verdict so
+    /// a finding can be traced to the code that actually wrote the bytes.
+    pub artifact_git_sha: String,
+    /// `Some(true)` when engine sources moved between `artifact_git_sha` and
+    /// HEAD — the verdict describes code no longer in the tree. `None` when the
+    /// question could not be answered. See [`Report::stale`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_stale: Option<bool>,
     pub argv: Vec<String>,
     pub verdict: Verdict,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -83,6 +91,12 @@ pub struct Report {
     pub records: Vec<Record>,
     /// Formats present in the artifact tree that no oracle claims at all.
     pub unclaimed: Vec<String>,
+    /// Artifacts whose producing commit predates an engine change, as
+    /// `(format, producer_os, short_sha)`. A verdict on one of these is about
+    /// code that is no longer in the tree — the shape that produced R-038,
+    /// where a fixed AFFS formatter was reported as broken because the oracle
+    /// read artifacts built two days before the fix.
+    pub stale: Vec<(String, String, String)>,
 }
 
 /// Resolve an oracle's executable on this host.
@@ -228,11 +242,30 @@ pub fn verify(
 
     let mut records = Vec::new();
     let mut unclaimed = Vec::new();
+    let mut stale = Vec::new();
+    // One git query per distinct producing commit, not per artifact.
+    let mut staleness: BTreeMap<String, Option<bool>> = BTreeMap::new();
 
     for (meta, image) in &artifacts {
         if let Some(f) = filter {
             if !meta.format.contains(f) {
                 continue;
+            }
+        }
+        let artifact_stale = *staleness.entry(meta.git_sha.clone()).or_insert_with(|| {
+            crate::gitinfo::engine_changed_since(
+                regression_dir
+                    .parent()
+                    .unwrap_or(regression_dir),
+                &meta.git_sha,
+                crate::gitinfo::ENGINE_PATHS,
+            )
+        });
+        if artifact_stale == Some(true) {
+            let short: String = meta.git_sha.chars().take(7).collect();
+            let row = (meta.format.clone(), meta.producer_os.clone(), short);
+            if !stale.contains(&row) {
+                stale.push(row);
             }
         }
         // Only write-direction rows: this artifact is something rb-cli wrote,
@@ -322,6 +355,8 @@ pub fn verify(
                 oracle: oracle.id.clone(),
                 strength: claim.strength.clone(),
                 artifact_sha256: meta.sha256.clone(),
+                artifact_git_sha: meta.git_sha.clone(),
+                artifact_stale,
                 argv,
                 verdict,
                 stdout_head,
@@ -343,7 +378,11 @@ pub fn verify(
         fs::write(out_dir.join(format!("{}.json", key)), json).map_err(|e| e.to_string())?;
     }
 
-    Ok(Report { records, unclaimed })
+    Ok(Report {
+        records,
+        unclaimed,
+        stale,
+    })
 }
 
 /// Compare a check's output against what the row said to expect. An expectation
@@ -400,12 +439,19 @@ pub fn render(report: &Report, out_dir: &Path) -> String {
 
     for r in &report.records {
         *counts.entry(r.verdict.label()).or_insert(0) += 1;
+        // A verdict on a stale artifact is marked inline as well as summarised
+        // below, so a FAIL line can never be read without the caveat attached.
+        let stale = if r.artifact_stale == Some(true) {
+            " [STALE ARTIFACT]"
+        } else {
+            ""
+        };
         // Skips are counted, not listed one by one — there are dozens and they
         // are the expected state, not news. Failures always print.
         match &r.verdict {
             Verdict::Fail { reason } => s.push_str(&format!(
-                "FAIL  {:<20} {:<14} via {:<12} {}\n",
-                r.format, r.producer_os, r.oracle, reason
+                "FAIL  {:<20} {:<14} via {:<12} {}{}\n",
+                r.format, r.producer_os, r.oracle, reason, stale
             )),
             Verdict::Error { reason } => s.push_str(&format!(
                 "error {:<20} {:<14} via {:<12} {}\n",
@@ -424,6 +470,21 @@ pub fn render(report: &Report, out_dir: &Path) -> String {
         s.push_str(&format!("{:<18} {}\n", label, n));
     }
     s.push_str(&format!("\nverifications: {}\n", out_dir.display()));
+
+    // Stale artifacts come before the unclaimed list because they invalidate
+    // verdicts that were just printed, rather than merely bounding them.
+    if !report.stale.is_empty() {
+        s.push_str(&format!(
+            "\nWARNING: {} artifact(s) were built before the current engine sources.\n\
+             A verdict on these describes code that is no longer in the tree — this is\n\
+             exactly how R-038 was filed against an AFFS formatter that had already been\n\
+             fixed. Re-run `produce` on the owning host before trusting them.\n",
+            report.stale.len()
+        ));
+        for (format, os, sha) in &report.stale {
+            s.push_str(&format!("  {:<20} {:<10} built at {}\n", format, os, sha));
+        }
+    }
 
     // The ceiling, restated every run: a tree full of passes still says nothing
     // about the formats nobody claims.
@@ -502,5 +563,56 @@ mod tests {
             evaluate(&c, &out(0, "image is corrupt", "")),
             Verdict::Fail { .. }
         ));
+    }
+
+    fn record(stale: Option<bool>) -> Record {
+        Record {
+            format: "fs.affs".into(),
+            producer_os: "windows".into(),
+            producer_host: "H".into(),
+            verifier_os: "windows".into(),
+            verifier_host: "H".into(),
+            oracle: "amitools".into(),
+            strength: "structural".into(),
+            artifact_sha256: "deadbeef".into(),
+            artifact_git_sha: "0563cb807131286f90e28db506f5e72b0a834878".into(),
+            artifact_stale: stale,
+            argv: vec![],
+            verdict: Verdict::Fail {
+                reason: "xdftool rejected the volume".into(),
+            },
+            stdout_head: None,
+        }
+    }
+
+    /// R-038 in miniature: a failing verdict on an artifact older than the
+    /// engine must never read as a plain failure. Both the inline marker and
+    /// the summary have to be present, because the summary alone scrolls off
+    /// on a full run.
+    #[test]
+    fn a_stale_artifact_marks_its_failure_inline_and_in_the_summary() {
+        let report = Report {
+            records: vec![record(Some(true))],
+            unclaimed: vec![],
+            stale: vec![("fs.affs".into(), "windows".into(), "0563cb8".into())],
+        };
+        let text = render(&report, Path::new("out"));
+        assert!(text.contains("[STALE ARTIFACT]"), "{text}");
+        assert!(text.contains("built at 0563cb8"), "{text}");
+        assert!(text.contains("no longer in the tree"), "{text}");
+    }
+
+    /// The inverse, so the warning cannot become permanent furniture that
+    /// everyone learns to ignore: a current artifact says nothing about age.
+    #[test]
+    fn a_current_artifact_carries_no_staleness_noise() {
+        let report = Report {
+            records: vec![record(Some(false))],
+            unclaimed: vec![],
+            stale: vec![],
+        };
+        let text = render(&report, Path::new("out"));
+        assert!(!text.contains("STALE"), "{text}");
+        assert!(text.contains("FAIL"), "{text}");
     }
 }
