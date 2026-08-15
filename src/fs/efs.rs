@@ -12,6 +12,24 @@
 //! is hijacked to hold `direxts`, the number of inode slots actually used
 //! to point at indirect blocks. See Linux `fs/efs/inode.c::efs_map_block`.
 //!
+//! ## Free-space bitmap bit order
+//!
+//! The bitmap packs blocks **LSB-first** within each byte: block `N` is bit
+//! `N % 8` of byte `N / 8`, counting from the least significant bit. A **set**
+//! bit means FREE.
+//!
+//! This was MSB-first here until 2026-08-15, in the reader and the writer
+//! alike — so our formatter and our fsck agreed with each other and disagreed
+//! with IRIX, which is exactly the shape that hides a bug. IRIX's own fsck
+//! reported `BAD FREE LIST` on every volume we wrote (R-039).
+//!
+//! The order is not a matter of taste, and the evidence is worth keeping.
+//! Decoding a volume `mkfs_efs` wrote, LSB-first yields precisely the geometry
+//! the superblock declares — `firstcg=34` of reserved blocks, then exactly
+//! `cgisize` inode blocks at each of the `ncg` cylinder-group starts, then the
+//! spare tail bits marked allocated. MSB-first yields ragged runs on no
+//! boundary at all.
+//!
 //! References:
 //! - `~/xfs-efs/refs/efs-linux-5.15/efs/` — Linux kernel v5.15 EFS sources.
 //! - `docs/SGI_Filesystems.md` — implementation plan and on-disk notes.
@@ -834,8 +852,9 @@ impl<R: Read + Write + Seek> EfsFilesystem<R> {
             let mut run_len: u32 = 0;
             for bit in lo..hi {
                 let byte = (bit / 8) as usize;
-                let bit_in_byte = 7 - (bit % 8); // big-endian bit order, MSB first
-                                                 // set bit = FREE on real IRIX EFS, so a free block is bit==1.
+                // LSB-first within the byte, and set bit = FREE. See the
+                // module header on bit order — we had this backwards.
+                let bit_in_byte = bit % 8;
                 if (bm[byte] >> bit_in_byte) & 1 == 0 {
                     run_start = None;
                     run_len = 0;
@@ -847,7 +866,7 @@ impl<R: Read + Write + Seek> EfsFilesystem<R> {
                     // Mark bits [start..start+want_blocks) as in-use (clear).
                     for b in start..start + want_blocks {
                         let by = (b / 8) as usize;
-                        let bb = 7 - (b % 8);
+                        let bb = b % 8;
                         bm[by] &= !(1u8 << bb);
                     }
                     return Ok(EfsExtent {
@@ -875,7 +894,7 @@ impl<R: Read + Write + Seek> EfsFilesystem<R> {
             if by >= bm.len() {
                 break;
             }
-            let bb = 7 - (b % 8);
+            let bb = b % 8;
             bm[by] |= 1u8 << bb;
         }
     }
@@ -1137,7 +1156,7 @@ impl<R: Read + Write + Seek> EfsFilesystem<R> {
         if by >= bm.len() {
             return false;
         }
-        let bb = 7 - (bn % 8);
+        let bb = bn % 8;
         if bm[by] & (1u8 << bb) == 0 {
             return false; // already in use (set bit = free)
         }
@@ -1549,7 +1568,7 @@ impl<R: Read + Write + Seek> EfsFilesystem<R> {
         for (lo, hi) in regions.ranges() {
             for blk in lo..hi.min(total_bits) {
                 let by = (blk / 8) as usize;
-                let bb = 7 - (blk % 8);
+                let bb = blk % 8;
                 if bm[by] & (1u8 << bb) != 0 {
                     free += 1;
                 }
@@ -2165,7 +2184,7 @@ fn repair_efs<R: Read + Write + Seek + Send>(
             ));
             continue;
         }
-        let bb = 7 - (blk % 8);
+        let bb = blk % 8;
         // set bit = free; mark as in-use by CLEARING the bit.
         bm[by] &= !(1 << bb);
         bitmap_fixes += 1;
@@ -3075,7 +3094,7 @@ pub fn write_blank_efs<W: Write + Seek>(
     {
         let mut mark_in_use = |blk: u32| {
             let by = (blk / 8) as usize;
-            let bit = 7 - (blk % 8) as u8;
+            let bit = (blk % 8) as u8;
             bitmap[by] &= !(1u8 << bit);
         };
         mark_in_use(0);
@@ -3951,7 +3970,7 @@ mod tests {
         let in_use_blocks = [0u32, 1, 2, 18, 19, total_blocks - 1];
         for b in in_use_blocks {
             let by = (b / 8) as usize;
-            let bb = 7 - (b % 8);
+            let bb = b % 8;
             img[bm_off + by] &= !(1 << bb);
         }
         img
@@ -3963,16 +3982,50 @@ mod tests {
         let mut fs = EfsFilesystem::open(Cursor::new(img), 0).expect("open");
         let bm = fs.read_bitmap().expect("read bitmap");
         assert_eq!(bm.len(), fs.sb.bmsize as usize);
-        // Convention: set bit = free. Block 0 (boot) is in-use so bit
-        // is clear; block 100 (inside free region) has bit set.
-        assert!(bm[0] & 0b1000_0000 == 0, "block 0 must be marked in-use");
-        assert!(bm[100 / 8] & (1 << (7 - (100 % 8))) != 0, "block 100 free");
+        // Convention: set bit = free, LSB-first within the byte. Block 0
+        // (boot) is in-use so bit 0 -- the LOW bit -- is clear; block 100
+        // (inside the free region) has its bit set.
+        assert!(bm[0] & 0b0000_0001 == 0, "block 0 must be marked in-use");
+        assert!(bm[100 / 8] & (1 << (100 % 8)) != 0, "block 100 free");
         // Round-trip: write back and re-read; expect identical bytes.
         let mut bm2 = bm.clone();
         bm2[5] = 0xFF;
         fs.write_bitmap(&bm2).expect("write bitmap");
         let bm3 = fs.read_bitmap().expect("re-read bitmap");
         assert_eq!(bm3, bm2);
+    }
+
+    /// The bitmap is LSB-first, pinned against bytes IRIX itself wrote.
+    ///
+    /// This exists because the driver had it MSB-first in the reader *and* the
+    /// writer, so every test that built its own fixture agreed with itself and
+    /// nothing caught it until IRIX's fsck said `BAD FREE LIST` (R-039). A
+    /// self-consistent convention cannot be tested by self-consistent
+    /// fixtures — so this test hard-codes real numbers off a `mkfs_efs`
+    /// volume instead of deriving them.
+    ///
+    /// Geometry of that volume: `fs_size=131062`, `firstcg=34`, `cgfsize=21838`,
+    /// `cgisize=779`, `ncg=6`, `bmsize=16383` bytes = 131064 bits.
+    #[test]
+    fn bitmap_bit_order_is_lsb_first_per_irix_mkfs() {
+        // 131064 bits cover 131062 blocks, so the top two bits of the final
+        // byte are spare and must read as in-use. IRIX writes 0x3F there:
+        // 0b0011_1111 -- bits 6 and 7 clear, counting from the LSB.
+        let last_byte: u8 = 0x3F;
+        let spare_lo = 131_062 % 8; // = 6
+        let spare_hi = 131_063 % 8; // = 7
+        assert_eq!((spare_lo, spare_hi), (6, 7));
+        assert!(
+            last_byte & (1 << spare_lo) == 0 && last_byte & (1 << spare_hi) == 0,
+            "spare tail bits must be in-use when read LSB-first"
+        );
+        // Read MSB-first the same byte claims those blocks are free, and
+        // marks two real blocks in-use instead. That is the bug this pins.
+        let msb = |bit: u32| 7 - (bit % 8);
+        assert!(
+            last_byte & (1 << msb(131_062)) != 0,
+            "MSB-first would call a nonexistent block free -- wrong order"
+        );
     }
 
     #[test]
@@ -3992,7 +4045,7 @@ mod tests {
         // in-use means bit is cleared).
         for b in 20..24 {
             let by = (b / 8) as usize;
-            let bb = 7 - (b % 8);
+            let bb = b % 8;
             assert!(bm[by] & (1 << bb) == 0, "block {b} not marked");
         }
         // A second alloc starts past the run we just took.
@@ -4009,7 +4062,7 @@ mod tests {
         // set bit = free; start fully in-use (all zeros) then set bit 50.
         let mut bm = vec![0u8; 32];
         let b = 50usize;
-        bm[b / 8] |= 1 << (7 - (b % 8));
+        bm[b / 8] |= 1 << (b % 8);
         let img = build_synthetic_for_bitmap_tests();
         let fs = EfsFilesystem::open(Cursor::new(img), 0).expect("open");
         let regions = EfsDataRegions::from_sb(&fs.sb);
@@ -4041,7 +4094,7 @@ mod tests {
         let first_free_bit = (0..sb.fs_size)
             .find(|blk| {
                 let by = (blk / 8) as usize;
-                by < bm.len() && bm[by] & (1 << (7 - (blk % 8))) != 0
+                by < bm.len() && bm[by] & (1 << (blk % 8)) != 0
             })
             .expect("fixture has free blocks");
         assert!(
@@ -4084,7 +4137,7 @@ mod tests {
         let raw_bits: u32 = (0..sb.fs_size)
             .filter(|blk| {
                 let by = (blk / 8) as usize;
-                by < bm.len() && bm[by] & (1 << (7 - (blk % 8))) != 0
+                by < bm.len() && bm[by] & (1 << (blk % 8)) != 0
             })
             .count() as u32;
 
@@ -4118,7 +4171,7 @@ mod tests {
         EfsFilesystem::<Cursor<Vec<u8>>>::free_extent_in_bitmap(&mut bm, &ext);
         for b in ext.bn..ext.bn + ext.length as u32 {
             let by = (b / 8) as usize;
-            let bb = 7 - (b % 8);
+            let bb = b % 8;
             assert!(bm[by] & (1 << bb) != 0, "block {b} still in-use after free");
         }
     }
@@ -4364,7 +4417,7 @@ mod tests {
         }
         for b in [0u32, 1, 2, 18, 19, 25, total_blocks - 1] {
             let by = (b / 8) as usize;
-            let bb = 7 - (b % 8);
+            let bb = b % 8;
             img[bm_off + by] &= !(1 << bb);
         }
 
@@ -4903,7 +4956,7 @@ mod tests {
         let data_blk = file_ino.extents[0].bn;
         let mut bm = fs.read_bitmap().expect("bm");
         let by = (data_blk / 8) as usize;
-        let bb = 7 - (data_blk % 8);
+        let bb = data_blk % 8;
         bm[by] |= 1u8 << bb;
         fs.write_bitmap(&bm).expect("write bm");
 

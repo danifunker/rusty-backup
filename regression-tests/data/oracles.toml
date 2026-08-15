@@ -312,7 +312,7 @@ availability = [
   { platform = "macos",   status = "install" },
 ]
 verifies = [
-  { format = "fs.efs",  direction = "write", strength = "authoritative", status = "plausible", evidence = "IRIX 6.5 image reads OK; boot not yet wired" },
+  { format = "fs.efs",  direction = "write", strength = "authoritative", status = "proven", evidence = "2026-08-15: IRIX 6.5.22 fsck passes all five phases on our volume, then mounts it, writes a file and a subdir, unmounts, and fscks clean again. Found and closed R-039 (bitmap was MSB-first, is LSB-first). Control: mkfs_efs on the same device." },
   { format = "fs.xfs",  direction = "write", strength = "authoritative", status = "plausible", evidence = "IRIX 6.5 mounts both XFS and EFS" },
   { format = "part.sgi",     direction = "write", strength = "authoritative", status = "plausible" },
   { format = "optical.efs", direction = "write", strength = "authoritative", status = "plausible", evidence = "IRIX mounts an EFS CD natively" },

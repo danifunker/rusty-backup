@@ -38,7 +38,7 @@ finding depends on a fixture, the fixture is named.
 | ~~R-036~~ | ~~Medium~~ **FIXED** | `src/cli/resolve.rs` | ~~A missing image gets three different exit codes across the verb surface~~ — one guard in the shared resolver, 2026-08-10 |
 | ~~R-037~~ | ~~**High**~~ **FIXED** | `src/cli/verbs/resize.rs` | ~~Shrinking rewrote the filesystem over live data and returned truncated files~~ — data floor + `--confirm-shrink` + truncation, 2026-08-09 |
 | ~~R-038~~ | ~~**High**~~ **NOT A LIVE DEFECT** | — | ~~A second implementation (amitools) rejects every AFFS volume we write~~ — real, but already fixed by a190182 two days before it was filed; the oracle read an Aug-8 artifact, 2026-08-14 |
-| [R-039](#r-039) | **High** | `src/fs/efs*.rs` | IRIX's own fsck reports BAD FREE LIST on every EFS volume we write |
+| ~~R-039~~ | ~~**High**~~ **FIXED** | `src/fs/efs*.rs` | ~~IRIX's own fsck reports BAD FREE LIST on every EFS volume we write~~ — the bitmap is LSB-first and we had it MSB-first in reader and writer alike; IRIX now mounts, writes to and fscks our volumes clean, 2026-08-15 |
 | ~~R-020~~ | ~~**High**~~ **FIXED** | `src/fs/affs.rs` | ~~`new volume affs` output is "Not a DOS disk" on a real Amiga, at every size~~ — Kickstart 3.1 mounts it Read/Write as `rusty-backup` and lists its contents; fixed by a190182, confirmed 2026-08-14 |
 | ~~R-016~~ | ~~**High**~~ **RECLASSIFIED** | `src/cli/verbs/backup.rs` | ~~`backup` accepts only flat-layout sources: CHD, dynamic VHD, QCOW2 and VMDK all fail~~ — not a defect; moved to [F-008](missing_features_from_regression.md#f-008), 2026-08-09 |
 | ~~R-018~~ | ~~Blocker~~ **FIXED** | `CONTRIBUTING.md` | ~~The documented Rust-1.73 verification build does not compile on Windows~~ — missing `windows-legacy` feature, 2026-08-07 |
@@ -2059,6 +2059,65 @@ Oracle: `amitools`, check `oracles/amitools_affs.py`. It is `structural`, not
 ---
 
 ### R-039 — IRIX's own fsck reports BAD FREE LIST on every EFS volume we write {#r-039}
+
+**FIXED 2026-08-15. The free-space bitmap is LSB-first and we wrote it
+MSB-first — in the reader as well as the writer.**
+
+That symmetry is the whole story. Our formatter and our fsck agreed with each
+other perfectly, because both were wrong in the same direction, and no
+self-built fixture could ever catch it. It took the vendor's tool to see it.
+
+**How the bit order was established**, rather than guessed. `mkfs_efs` was run
+on the same scratch device to produce a reference volume, and that volume was
+pulled back to the host and decoded both ways. Read LSB-first it decomposes
+into exactly the geometry its own superblock declares:
+
+```
+run 0..834 = boot(0) + superblock(1) + bitmap(2..33 = 32 blocks)
+           + inodes(34..812 = cgisize 779) + data(813..834 = the 22 used)
+```
+
+`0..33` is precisely `firstcg=34`, and each of the six cylinder groups
+(21872, 43710, 65548, 87386, 109224) carries exactly `cgisize=779` allocated
+blocks. Read MSB-first the same bytes give 16 ragged runs on no boundary at
+all — 776-block groups, fragments at 22653..22655 and 43704..43705.
+
+The tail confirms it independently: `bmsize` is 16383 bytes = 131064 bits for
+`fs_size` 131062 blocks, so the last two bits are spare and must read as
+in-use. IRIX writes `0x3F` in that byte — bits 6 and 7 clear counting from the
+LSB. We wrote `0xFC`, which is the same statement made backwards.
+
+**The fix** flips the bit computation at all 24 sites across `efs.rs`,
+`efs_fsck.rs` and `efs_resize.rs`, and pins the convention in
+`bitmap_bit_order_is_lsb_first_per_irix_mkfs` — a test that hard-codes real
+numbers off the `mkfs_efs` volume rather than deriving them, because a
+self-consistent convention cannot be tested by self-consistent fixtures.
+
+**Verified end to end against IRIX**, not just against fsck:
+
+```
+** Phase 5 - Check Free List
+1 files 1 blocks 126935 free          <- no BAD FREE LIST
+```
+
+then `mount -t efs` succeeded, `df -k` reported it as a 63468 KB EFS volume,
+IRIX wrote a file and a subdirectory into it, unmounted, and fsck came back
+clean at `4 files 3 blocks 126933 free`. Reading that volume back with rb-cli
+lists both entries and returns the file's contents verbatim.
+
+**This was not only a write bug.** The reader used the same inverted order, so
+free-space accounting on any real IRIX EFS disk was wrong too, and the
+allocator could have handed out blocks IRIX considered in use. Nothing shipped
+had exercised that path against a real volume, but the exposure was there.
+
+**Resolved in passing:** the entry's second observation — that fsck showed the
+volume name as `rusty-`, truncated from `rusty-backup` — is correct behaviour,
+not a defect. `fname` in the EFS superblock is a 6-byte field.
+
+Reproduce with `regression-tests/oracles/iris/` (see the Status note there);
+the whole loop is about a minute once the guest is booted and snapshotted.
+
+---
 
 Found 2026-08-13, the first authoritative oracle result this project has ever
 had: IRIX 6.5.22 running under the Iris emulator, checking our EFS volume with
