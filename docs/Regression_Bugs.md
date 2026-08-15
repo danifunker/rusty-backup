@@ -39,7 +39,7 @@ finding depends on a fixture, the fixture is named.
 | ~~R-037~~ | ~~**High**~~ **FIXED** | `src/cli/verbs/resize.rs` | ~~Shrinking rewrote the filesystem over live data and returned truncated files~~ — data floor + `--confirm-shrink` + truncation, 2026-08-09 |
 | ~~R-038~~ | ~~**High**~~ **NOT A LIVE DEFECT** | — | ~~A second implementation (amitools) rejects every AFFS volume we write~~ — real, but already fixed by a190182 two days before it was filed; the oracle read an Aug-8 artifact, 2026-08-14 |
 | [R-039](#r-039) | **High** | `src/fs/efs*.rs` | IRIX's own fsck reports BAD FREE LIST on every EFS volume we write |
-| [R-020](#r-020) | **High** | `src/fs/affs.rs` | `new volume affs` output is "Not a DOS disk" on a real Amiga, at every size |
+| ~~R-020~~ | ~~**High**~~ **FIXED** | `src/fs/affs.rs` | ~~`new volume affs` output is "Not a DOS disk" on a real Amiga, at every size~~ — Kickstart 3.1 mounts it Read/Write as `rusty-backup` and lists its contents; fixed by a190182, confirmed 2026-08-14 |
 | ~~R-016~~ | ~~**High**~~ **RECLASSIFIED** | `src/cli/verbs/backup.rs` | ~~`backup` accepts only flat-layout sources: CHD, dynamic VHD, QCOW2 and VMDK all fail~~ — not a defect; moved to [F-008](missing_features_from_regression.md#f-008), 2026-08-09 |
 | ~~R-018~~ | ~~Blocker~~ **FIXED** | `CONTRIBUTING.md` | ~~The documented Rust-1.73 verification build does not compile on Windows~~ — missing `windows-legacy` feature, 2026-08-07 |
 | ~~R-017~~ | ~~High~~ **FIXED** | `src/partition/mod.rs` | ~~Superfloppy detection also misses SFS (extends R-009)~~ — probe added 2026-08-07 |
@@ -514,6 +514,54 @@ Case `read.apfs.apple-gpt`.
 ## High
 
 ### R-020 — every AFFS volume we write is unmountable on a real Amiga {#r-020}
+
+**FIXED — confirmed by a real Kickstart 2026-08-14.** The emulator this entry
+has waited on since 2026-08-07 finally ran, and AmigaOS mounts the volume:
+
+```
+Mounted disks:
+Unit      Size    Used    Free Full Errs   Status   Name
+DH0:      4194M 4194304 4194303  50%   0  Read/Write Workbench
+DH1:      2.0M       5    4089   0%   0  Read/Write rusty-backup
+DH2:      4194M 4194304 4194303  50%   0  Read/Write RESULTS
+
+Volumes available:
+rusty-backup [Mounted]
+```
+
+`Read/Write`, under the volume's own name, on an A1200 with Kickstart 3.1 —
+the same machine and ROM the original finding used. `List DH1:` reads the
+contents back:
+
+```
+Directory "DH1:" on Friday 14-Aug-26
+HELLO                         24 ----rwed
+1 file - 2 blocks used
+```
+
+So the fix was [a190182](#r-008a) on 2026-08-10 — bitmap sized to the
+geometry, root `header_key` zeroed — and this is the confirmation the entry
+said it needed. The same commit closes [R-038](#r-038).
+
+**The control, because a pass needs one as much as a failure does.** 2 MB of
+`os.urandom` through the identical config produces no DH1: unit at all and
+`Can't examine "DH1:": device (or volume) is not mounted`. The harness
+discriminates; it is not reporting success for anything put in front of it.
+
+Oracle: `oracles/fsuae/affs_mount.py`, strength `authoritative` — this is
+AmigaOS's own filesystem, not a reimplementation.
+
+Two notes for whoever reads this next:
+
+* The original 2026-08-07 observation was made through AmigaVision on the
+  MiSTer; this one attaches the volume as a bare hardfile under FS-UAE. Both
+  are A1200/KS3.1 and both ask Kickstart the same question, but they are not
+  byte-identical setups, and the MiSTer path has not been re-run.
+* The volume's own creation date still reads as the 1978 epoch —
+  `create_blank_affs` never stamps the root block's datestamp. Cosmetic, does
+  not affect mounting, and not tracked as a defect here.
+
+---
 
 **Hypothesis CONFIRMED 2026-08-10, and the formatter half fixed.** This entry
 recorded "root block `header_key` must be 0 and we write the block number" as

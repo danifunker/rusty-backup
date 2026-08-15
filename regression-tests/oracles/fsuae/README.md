@@ -42,43 +42,36 @@ must be paired with a known-good volume through the *same* config: R-020 was
 only credible because `Mister-3-2.hdf` mounted as `Read/Write Amiga32` under
 byte-identical settings while our own AFFS output did not.
 
-## Status, 2026-08-14 — `affs_mount.py` runs, the guest does not report
+## Status, 2026-08-14 — working; it answered R-020
 
-`affs_mount.py` is the script the notes above describe: it unpacks the
-Workbench fixture to a host directory, writes the probe, generates the config,
-launches FS-UAE, polls for the sentinel and parses `Info`. Everything up to the
-guest works, verified against FS-UAE's own log:
+`affs_mount.py` runs end to end. Kickstart 3.1 on an A1200 mounts our AFFS
+volume `Read/Write` under its own name and `List DH1:` reads the contents
+back, which closes R-020. Run it as:
 
-    hard drive mount: .../System        device DH0, boot priority 0
-    hardfile          .../under-test.hdf device DH1, boot priority 0
-    hard drive mount: .../results       device DH2, boot priority 0
-    FS: mounted virtual unit DH0
-    FS: mounted virtual unit DH2
-    Mounting uaehf.device 1 (0) (size=2097152)
+    python regression-tests/oracles/fsuae/affs_mount.py <image>
 
-So the ROM loads, all three drives attach and the artifact is presented to
-Kickstart 3.1. **What does not happen is the guest executing
-`S/Startup-Sequence`** — `RESULTS:` stays empty, no `done.txt` appears, and the
-script correctly reports exit 3 ("harness result, not a verdict") rather than
-inventing a verdict about the volume.
+    0  mounted        1  not mounted (a verdict)
+    3  no sentinel — harness failure, NOT a verdict        2  setup error
 
-Two things already ruled out:
+### Always pair a pass with a negative control
 
-* **Not the fixture's startup script.** The first attempt appended the probe to
-  the Workbench 1.3 `Startup-Sequence`, whose Amiga Forever chain
-  (`Mount NEWCON:`, `Execute S:AFShared-Startup`, …) never reached it. The
-  probe now *replaces* that file with five lines, and the replacement is
-  confirmed on disk. No change.
-* **Not missing commands.** `c/Info`, `c/List` and `c/Echo` are all present in
-  the unpacked tree.
+A harness that reports success for anything is indistinguishable from a good
+volume. 2 MB of `os.urandom` through the identical config yields no DH1: unit
+and `Can't examine "DH1:"`, exit 1 — so the oracle discriminates.
 
-**The next step needs a screen, not another blind run.** Launch the generated
-config by hand and watch what the Amiga actually does — whether it sits on the
-Kickstart insert-disk hand, throws a Guru, or boots and fails at the redirect:
+### The trap: LF endings, written as bytes
 
-    regression-tests/scratch/fsuae/probe.fs-uae
+The guest script must be LF-terminated and written with `write_bytes`. Python's
+`write_text` applies the platform newline on Windows; AmigaDOS scripts are
+LF-only, so the guest read `Info >RESULTS:info.txt` and tried to create a
+file whose name ended in a carriage return — illegal on the host directory that
+DH2 maps to. Every redirect failed, `FAILAT 21` correctly stopped the script
+aborting, and the run booted and silently produced nothing. It looks exactly
+like an emulator that will not boot. It is not.
 
-Each of those points somewhere different, and one look settles which. Until
-then this oracle answers "harness not ready", and **R-020 stays open on its
-original evidence** — nothing here has yet put a real Kickstart's opinion on
-one of our volumes.
+### The other thing that cost time
+
+The probe *replaces* the fixture's `S/Startup-Sequence` rather than appending to
+it. Workbench 1.3's own startup — `Mount NEWCON:`, `Resident`, then Amiga
+Forever's `Execute S:AFShared-Startup` — never reaches an appended probe under
+Kickstart 3.1. All this test needs is a shell, `Info`, `List` and `Echo`.

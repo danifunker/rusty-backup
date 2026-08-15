@@ -36,9 +36,10 @@ proves nothing about the artifact, and this script says so rather than
 reporting a defect.
 
 Exit status:
-    0  the guest mounted DH1: and reported a name
-    1  the guest booted and refused DH1: (this is the R-020 symptom)
-    3  the guest never reached the sentinel — harness failure, not a verdict
+    0  the guest mounted DH1: and reported a volume name
+    1  the guest ran and did not mount it — either `Not a DOS disk`
+       (R-020's symptom) or no DH1: unit at all. A verdict either way.
+    3  the guest never reached the sentinel — harness failure, NOT a verdict
     2  usage / setup error
 """
 
@@ -113,6 +114,25 @@ def find_kickstart() -> Optional[Path]:
     return None
 
 
+def write_probe(system: Path) -> None:
+    """Write the probe into S/Startup-Sequence with LF endings, in bytes.
+
+    `write_text` is wrong here and cost an afternoon. On Windows it applies the
+    platform newline translation, so every `\\n` became `\\r\\n` — and AmigaDOS
+    scripts are LF-terminated. The guest read `Info >RESULTS:info.txt\\r`,
+    tried to create a file whose name ended in a carriage return, and since
+    DH2 is a *host directory* that is an illegal Windows filename. Every
+    redirect failed, `FAILAT 21` correctly stopped the script aborting, and the
+    result was a run that booted and silently produced nothing.
+
+    Bytes, explicitly, so the host platform cannot express an opinion.
+    """
+    seq = system / "s" / "Startup-Sequence"
+    if not seq.parent.is_dir():
+        raise RuntimeError(f"no S: directory in the unpacked tree at {seq.parent}")
+    seq.write_bytes(PROBE.replace("\r\n", "\n").encode("ascii"))
+
+
 def build_boot_dir(workdir: Path, wb_fixture: Path) -> Path:
     """Unpack the Workbench fixture to a host directory and add the probe.
 
@@ -121,6 +141,10 @@ def build_boot_dir(workdir: Path, wb_fixture: Path) -> Path:
     system = workdir / "System"
     stamp = workdir / ".boot-ready"
     if stamp.is_file():
+        # The tree is cached, but the probe is rewritten every run — it is one
+        # small file and having it silently diverge from the source would be
+        # far more expensive than writing it again.
+        write_probe(system)
         return system
 
     if system.exists():
@@ -138,13 +162,7 @@ def build_boot_dir(workdir: Path, wb_fixture: Path) -> Path:
     if proc.returncode != 0:
         raise RuntimeError(f"xdftool unpack failed: {proc.stderr.strip()}")
 
-    seq = system / "s" / "Startup-Sequence"
-    if not seq.parent.is_dir():
-        raise RuntimeError(f"no S: directory in the unpacked tree at {seq.parent}")
-    # Overwrite, don't append — see the PROBE comment for why the fixture's
-    # own startup cannot be reached under Kickstart 3.1.
-    seq.write_text(PROBE)
-
+    write_probe(system)
     tmp_hdf.unlink(missing_ok=True)
     stamp.write_text("ok\n")
     return system
@@ -182,8 +200,19 @@ def write_config(
 def parse_verdict(info: str) -> Tuple[str, str]:
     """Read the guest's `Info` output for what became of DH1:.
 
-    Amiga `Info` prints one line per mounted unit. An unrecognised volume shows
-    as `DH1:      Not a DOS disk`; a good one carries size/used/free and a name.
+    Three guest-side states, and they are not the same thing:
+
+    * **mounted** — a line with size/used/free and a volume name. The volume
+      is good.
+    * **refused** — `DH1:      Not a DOS disk`. UAE attached the unit and
+      Kickstart declined to mount it. This is R-020's original symptom.
+    * **absent** — no DH1: line at all. UAE could not make a unit of it
+      (2 MB of noise does this), so it never reached Kickstart. Still a
+      refusal of the bytes, just an earlier one — *not* a harness failure,
+      because the guest plainly ran and reported the other two drives.
+
+    Only "the sentinel never appeared" is a harness failure, and that is
+    decided by the caller, not here.
     """
     for line in info.splitlines():
         if not line.strip().startswith("DH1"):
@@ -191,7 +220,7 @@ def parse_verdict(info: str) -> Tuple[str, str]:
         if re.search(r"not a dos disk", line, re.I):
             return "refused", line.strip()
         return "mounted", line.strip()
-    return "absent", "no DH1: line in Info output"
+    return "absent", "UAE presented no DH1: unit at all"
 
 
 def run(args) -> int:
@@ -277,9 +306,9 @@ def run(args) -> int:
     print(f"\nverdict: {verdict}  ({line})")
     if verdict == "mounted":
         return 0
-    if verdict == "refused":
-        return 1
-    return 3
+    # `refused` and `absent` are both the guest declining the bytes; the
+    # sentinel is present, so the harness worked and this is a real verdict.
+    return 1
 
 
 def main() -> int:
