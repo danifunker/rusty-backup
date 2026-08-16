@@ -2700,3 +2700,81 @@ fn sync_apply_edits_to_remote_image_uploads_a_file() {
     rfs.write_file_to(up, &mut got).unwrap();
     assert_eq!(got, b"uploaded-into-image");
 }
+
+/// A failed upload must fail *cleanly* and leave the connection usable.
+///
+/// `stage_upload` used to write the `StageUpload` control frame and only then
+/// open the host file. That frame commits the daemon to reading a chunk stream,
+/// so an open failure returned an error to the caller while the daemon sat
+/// blocked on chunks that never came — and then consumed the *next* control
+/// frame as body bytes. The connection was desynchronised from that moment, and
+/// the user saw the damage somewhere else entirely, most often as
+///
+///   Apply failed: applying the remote edits: reading daemon response:
+///   failed to fill whole buffer
+///
+/// which is a client-side EOF, nowhere near the upload that actually broke.
+/// This drives that exact sequence: a doomed upload, then real work on the same
+/// session, and asserts the session still commits.
+#[test]
+fn a_failed_upload_does_not_desync_the_connection() {
+    use rusty_backup::remote::RemoteSession;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    make_fat_image(&root.join("dest.img"), "DESTVOL", "SEED.BIN", 0x01, 512);
+
+    let staging_tmp = tempfile::tempdir().unwrap();
+    let staging = staging_tmp.path().to_path_buf();
+
+    let host_tmp = tempfile::tempdir().unwrap();
+    let good = host_tmp.path().join("good.bin");
+    std::fs::write(&good, vec![0x5Au8; 2048]).unwrap();
+    // A DIRECTORY, deliberately. A missing path would not reproduce this: the
+    // old code called `metadata()` before announcing, so a stat failure was
+    // already safe. A directory stats fine and then fails at the read — which
+    // in the old ordering happened *after* the frame was on the wire. Windows
+    // fails the open; Unix opens it and fails the copy; both desynced.
+    let doomed = host_tmp.path().join("a-directory");
+    std::fs::create_dir(&doomed).unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let serve_root = root.clone();
+    let serve_staging = staging.clone();
+    std::thread::spawn(move || {
+        let _ = serve_on(listener, serve_root, Some(serve_staging), true);
+    });
+
+    let mut session = RemoteSession::connect(&addr).unwrap();
+    let sid = session.open_session("/dest.img", None).unwrap();
+
+    // The doomed upload: an error is correct, a desync is not.
+    let failed = session.stage_upload(sid, "/", "GHOST.BIN", &doomed, false, None, None);
+    assert!(failed.is_err(), "uploading a directory must fail");
+
+    // The connection has to still work. Before the fix this hung or returned
+    // garbage, because the daemon was mid-chunk-stream.
+    session
+        .stage_upload(sid, "/", "GOOD.BIN", &good, false, None, None)
+        .expect("a good upload after a failed one must still work");
+    let n = session
+        .apply(sid)
+        .expect("apply must reach the daemon and answer");
+    assert_eq!(n, 1, "only the successful upload was staged");
+    session.close_session(sid).unwrap();
+
+    // And it actually landed.
+    let (mut rfs, root_entry, _children) =
+        RemoteFilesystem::open(&addr, "/dest.img", None).unwrap();
+    let listed = rfs.list_directory(&root_entry).unwrap();
+    let names: Vec<&str> = listed.iter().map(|e| e.name.as_str()).collect();
+    assert!(
+        names.iter().any(|n| n.eq_ignore_ascii_case("GOOD.BIN")),
+        "the good upload committed: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n.eq_ignore_ascii_case("GHOST.BIN")),
+        "the failed upload left nothing behind: {names:?}"
+    );
+}

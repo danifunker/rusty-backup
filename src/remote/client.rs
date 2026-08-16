@@ -214,9 +214,19 @@ impl RemoteSession {
         type_code: Option<String>,
         creator_code: Option<String>,
     ) -> Result<()> {
-        let meta = std::fs::metadata(host_file)
-            .with_context(|| format!("stat {}", host_file.display()))?;
-        let size = meta.len();
+        // Open BEFORE announcing the upload. `StageUpload` commits the daemon
+        // to reading a chunk stream, so any failure after that frame is on the
+        // wire desynchronises the connection: the daemon blocks on chunks that
+        // never arrive and then reads the next control frame as body bytes.
+        // The caller's error surfaces much later and somewhere else — the
+        // symptom is "reading daemon response: failed to fill whole buffer" on
+        // whatever request comes next, usually Apply.
+        let mut f = std::fs::File::open(host_file)
+            .with_context(|| format!("open {}", host_file.display()))?;
+        let size = f
+            .metadata()
+            .with_context(|| format!("stat {}", host_file.display()))?
+            .len();
         write_control(
             &mut self.writer,
             &Request::StageUpload {
@@ -229,14 +239,16 @@ impl RemoteSession {
                 creator_code,
             },
         )?;
-        // The body follows immediately as a chunk stream.
-        let mut f = std::fs::File::open(host_file)
-            .with_context(|| format!("open {}", host_file.display()))?;
+        // The body follows immediately as a chunk stream. Past this point the
+        // stream MUST be terminated even on failure, or the desync above is
+        // back: a short read here is reported after `finish()`, not instead of
+        // it, so the daemon sees a well-formed (if truncated) upload and can
+        // answer.
         {
             let mut cw = ChunkWriter::new(&mut self.writer);
-            std::io::copy(&mut f, &mut cw)
-                .with_context(|| format!("uploading {}", host_file.display()))?;
+            let copied = std::io::copy(&mut f, &mut cw);
             cw.finish()?;
+            copied.with_context(|| format!("uploading {}", host_file.display()))?;
         }
         self.expect_ok("StageUpload")
     }
