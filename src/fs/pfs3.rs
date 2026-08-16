@@ -272,6 +272,54 @@ struct Pfs3Snapshot {
 
 const MAX_CACHE_ENTRIES: usize = 128;
 
+/// Cheap identity probe for a bare PFS volume (no RDB), used by
+/// `partition::detect_superfloppy`.
+///
+/// Two different four-byte tags are easy to confuse here. The **boot block**
+/// magic at offset 0 is `PFS\x01` / `PDS\x01` / `muAF` / …, where the last byte
+/// is a *format version*, not a printable character. The **DosType** the
+/// filesystem dispatcher matches on is the RDB partition string `PFS\3`. A bare
+/// volume has no RDB to carry the latter, so detection reads the former and
+/// reports the latter — the same trick `looks_like_sfs` plays.
+///
+/// Four bytes of boot magic would false-positive readily, so the root block at
+/// sector 2 must also parse and carry a sane `reserved_blksize` before we claim
+/// the volume.
+pub fn looks_like_pfs3<R: Read + Seek>(reader: &mut R, partition_offset: u64) -> bool {
+    let mut boot = [0u8; 512];
+    if reader.seek(SeekFrom::Start(partition_offset)).is_err()
+        || reader.read_exact(&mut boot).is_err()
+    {
+        return false;
+    }
+    let mag = &boot[0..4];
+    let known = mag == b"PFS\x01"
+        || mag == b"PDS\x01"
+        || mag == b"muAF"
+        || mag == b"muPF"
+        || mag == b"AFS\x01"
+        || mag == b"PFS\x02";
+    if !known {
+        return false;
+    }
+    let mut root_buf = [0u8; 512];
+    if reader
+        .seek(SeekFrom::Start(
+            partition_offset + ROOTBLOCK_SECTOR as u64 * HW_SECTOR,
+        ))
+        .is_err()
+        || reader.read_exact(&mut root_buf).is_err()
+    {
+        return false;
+    }
+    // Identity, not capability: a structure version we cannot edit still gets
+    // claimed, so the user sees PFS3's own error rather than an MBR one.
+    match Pfs3RootBlock::parse(&root_buf) {
+        Ok(root) => root.reserved_blksize != 0 && root.reserved_blksize.is_multiple_of(512),
+        Err(_) => false,
+    }
+}
+
 impl<R: Read + Seek> Pfs3Filesystem<R> {
     pub fn open(mut reader: R, partition_offset: u64) -> Result<Self, FilesystemError> {
         // Determine an upper-bound partition size from EOF. This is later

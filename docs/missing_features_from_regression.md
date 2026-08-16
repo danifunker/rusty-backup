@@ -14,7 +14,7 @@ concrete reason to.
 |---|---------|------|--------|
 | ~~F-001~~ | ~~`optical extract` cannot extract a single path~~ — **SHIPPED** 2026-08-09 | `src/cli/verbs/optical.rs` | — |
 | ~~F-002~~ | ~~CloneCD not supported~~ — **retracted, it is supported** | — | — |
-| [F-003](#f-003) | PFS3 / SFS builders exist but are not on the CLI | `src/cli/verbs/new.rs` | two Amiga fixture gaps |
+| ~~F-003~~ | ~~PFS3 / SFS builders exist but are not on the CLI~~ — **SHIPPED** 2026-08-15 | `src/cli/verbs/new.rs` | — |
 | [F-005](#f-005) | Optical extract is CLI-only; the GUI cannot pull one file | `src/optical/browse_view.rs` | GUI parity with `optical extract` |
 | [F-006](#f-006) | IRIX support-disk building / browsing is thin | `src/cli/verbs/new_sgi_cdrom.rs` | bootable IRIX disc work — **needs scope** |
 | [F-007](#f-007) | No optical fixture with nested directories | `regression-tests/` | verifying `--path DIR --recursive` |
@@ -113,6 +113,38 @@ byte-identical to the one already held as
 `optical.high-sierra.bookshelf.cd`.
 
 ## F-003 — PFS3 and SFS can be created, but only from inside the engine {#f-003}
+
+**SHIPPED 2026-08-15.** `new volume pfs3` and `new volume sfs` exist, and both
+round-trip: format, `put`, `ls`, `get`, and for SFS `fsck` too.
+
+**Exposing the builder immediately found a second gap, which is the point this
+entry made.** A bare PFS3 image was not detected at all — it fell through to
+the MBR parse and reported `invalid boot signature`, the exact shape of R-017
+(the same omission for SFS). Nothing had ever opened one, because nothing
+could make one outside a unit test.
+
+Fixing it needed the distinction between two four-byte tags that are easy to
+conflate. The **boot block** magic at offset 0 is `PFS` / `PDS` /
+`muAF` / …, where the final byte is a *format version*, not a character. The
+**DosType** the filesystem dispatcher matches on is `PFS`, and a bare volume
+has no RDB to carry it. So `looks_like_pfs3` validates the boot magic *and* the
+root block at sector 2, then `detect_superfloppy` reports the DosType — and the
+hint has to be added to the routing allow-list in `PartitionTable::detect`,
+which is what actually made it dispatch.
+
+Guarded by `detect_superfloppy_bare_pfs3_routes_by_dostype` and a negative
+`..._rejects_bare_magic` twin, matching the SFS pair beside them.
+
+The caveat this entry always carried still stands: a volume rusty-backup builds
+is not a reference fixture for rusty-backup. What this buys is that the write
+paths are now reachable by an external oracle — and since 2026-08-14 that
+oracle exists (`oracles/fsuae/affs_mount.py`), so pointing it at a PFS3 or SFS
+volume is a real next step rather than a hypothetical one. It needs the PFS3 /
+SFS handlers staged into the guest's `L:`; Kickstart has neither in ROM.
+
+---
+
+### The original report
 
 `create_blank_pfs3` and `create_blank_sfs` already exist in `src/fs/` and are
 used by unit tests to build volumes. Neither is reachable from `rb-cli`:

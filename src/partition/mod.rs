@@ -482,6 +482,23 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
     }
     let _ = reader.seek(SeekFrom::Start(0));
 
+    // PFS dumped bare, same shape as SFS above. The boot magic is `PFS\x01` /
+    // `PDS\x01` / the muFS pair, where the last byte is a version rather than a
+    // character — so the tag on disk is NOT the `PFS\3` DosType the dispatcher
+    // matches on, and `looks_like_pfs3` reports the latter after validating the
+    // root block. Without this a `new volume pfs3` image fell through to the
+    // MBR parse and reported "invalid boot signature", which is how the gap was
+    // found: exposing the builder made it reachable.
+    if matches!(
+        &first_sector[0..3],
+        b"PFS" | b"PDS" | b"muA" | b"muP" | b"AFS"
+    ) && crate::fs::pfs3::looks_like_pfs3(reader, 0)
+    {
+        let _ = reader.seek(SeekFrom::Start(0));
+        return Some("PFS\\3".to_string());
+    }
+    let _ = reader.seek(SeekFrom::Start(0));
+
     // Check for HFS / HFS+ / HFSX / ext / ProDOS at offset 1024.
     // Read a full 512-byte sector for raw device compatibility (macOS /dev/rdiskN
     // requires sector-aligned reads).
@@ -1347,6 +1364,10 @@ impl PartitionTable {
                 // same way — `detect_filesystem_type` has no SFS probe, so the
                 // string dispatcher is the only path to the driver.
                 let is_amiga_sfs = fs_hint == "SFS\\0";
+                // PFS3 the same again (F-003). Its boot magic is not its
+                // DosType, so `detect_superfloppy` already translated one to
+                // the other; here the string just has to survive to dispatch.
+                let is_amiga_pfs3 = fs_hint == "PFS\\3";
                 let is_human68k = fs_hint == "human68k";
                 // A custom bootblock Amiga disk with no filesystem. Route the
                 // hint through `partition_type_string` so the dispatcher opens
@@ -1355,7 +1376,7 @@ impl PartitionTable {
                 // Apple Lisa: the tag-bearing DC42/DART container is opened as a
                 // whole by the Lisa driver, so route the hint through the string.
                 let is_lisa = fs_hint == "lisafs";
-                let display_name = if is_amiga_dos || is_amiga_sfs {
+                let display_name = if is_amiga_dos || is_amiga_sfs || is_amiga_pfs3 {
                     let b = fs_hint.as_bytes();
                     let raw = u32::from_be_bytes([b[0], b[1], b[2], b[4] - b'0']);
                     rdb::dos_type_display_name(raw)
@@ -1380,6 +1401,7 @@ impl PartitionTable {
                     is_extended_container: false,
                     partition_type_string: if is_amiga_dos
                         || is_amiga_sfs
+                        || is_amiga_pfs3
                         || is_human68k
                         || is_amiga_ndos
                         || is_lisa
@@ -2108,6 +2130,30 @@ mod tests {
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0].partition_type_string.as_deref(), Some("SFS\\0"));
         assert_eq!(parts[0].type_name, "SFS (Amiga)");
+    }
+
+    #[test]
+    fn detect_superfloppy_bare_pfs3_routes_by_dostype() {
+        // F-003: the same omission as R-017, found by exposing the builder on
+        // `new volume` — a bare PFS3 image fell through to the MBR parse and
+        // reported "invalid boot signature". The boot magic on disk is
+        // `PFS\x01` (last byte a version), while the dispatcher matches the
+        // `PFS\3` DosType, so the probe has to translate.
+        let img = crate::fs::pfs3::create_blank_pfs3(16384, "Test").expect("format PFS3");
+        let table = PartitionTable::detect(&mut Cursor::new(img)).expect("detect");
+        assert_eq!(table.type_name(), "None");
+        let parts = table.partitions();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].partition_type_string.as_deref(), Some("PFS\\3"));
+    }
+
+    #[test]
+    fn detect_superfloppy_pfs3_probe_rejects_bare_magic() {
+        // Four bytes of boot magic with nothing behind them is a bootblock, not
+        // a volume; the rootblock gate must reject it.
+        let mut d = vec![0u8; 1024 * 1024];
+        d[0..4].copy_from_slice(b"PFS\x01");
+        assert!(!crate::fs::pfs3::looks_like_pfs3(&mut Cursor::new(&d), 0));
     }
 
     #[test]

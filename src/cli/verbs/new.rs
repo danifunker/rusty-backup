@@ -55,6 +55,11 @@ pub enum FsKind {
     Xfs,
     /// Amiga FFS / OFS (variant selected via --affs-variant).
     Affs,
+    /// Amiga PFS3 (`PFS\3`). A bare volume; reserved-block size scales with
+    /// the volume (1 KiB below ~1 GB, 4 KiB above).
+    Pfs3,
+    /// Amiga SFS (`SFS\0`). A bare volume, 512-byte blocks, minimum 64 blocks.
+    Sfs,
     /// NTFS (Windows NT / 2000 / XP). Cluster and sector size via
     /// --cluster-size / --sector-size; both auto-selected when unset.
     Ntfs,
@@ -305,6 +310,10 @@ pub enum VolumeFs {
     Ext4,
     /// Amiga FFS / OFS (variant via --affs-variant).
     Affs,
+    /// Amiga PFS3 (`PFS\3`) — a bare volume.
+    Pfs3,
+    /// Amiga SFS (`SFS\0`) — a bare volume, minimum 64 blocks (32 KiB).
+    Sfs,
     /// ProDOS (Apple II / IIgs) — up to ~32 MiB.
     Prodos,
     /// IRIX EFS (single cylinder group) — a bare EFS superfloppy.
@@ -330,6 +339,8 @@ impl VolumeFs {
             VolumeFs::Ext3 => FsKind::Ext3,
             VolumeFs::Ext4 => FsKind::Ext4,
             VolumeFs::Affs => FsKind::Affs,
+            VolumeFs::Pfs3 => FsKind::Pfs3,
+            VolumeFs::Sfs => FsKind::Sfs,
             VolumeFs::Prodos => FsKind::Prodos,
             VolumeFs::Efs => FsKind::Efs,
             VolumeFs::Xfs => FsKind::Xfs,
@@ -732,6 +743,16 @@ fn format_image(args: NewArgs) -> Result<()> {
                 crate::fs::affs::create_blank_affs(size, variant, name)
             })
         }
+        // Both Amiga builders count 512-byte blocks, not bytes, and both
+        // already existed — they were only ever reachable from unit tests.
+        FsKind::Pfs3 => format_and_write(&args.image, &args.size, &args.name, |size, name| {
+            let blocks = blocks_512(size, "PFS3")?;
+            Ok(crate::fs::pfs3::create_blank_pfs3(blocks, name)?)
+        }),
+        FsKind::Sfs => format_and_write(&args.image, &args.size, &args.name, |size, name| {
+            let blocks = blocks_512(size, "SFS")?;
+            Ok(crate::fs::sfs::create_blank_sfs(blocks, name)?)
+        }),
         FsKind::Ntfs => {
             let raw = parse_size(&args.size).context("parsing --size")?;
             let sector = args.sector_size.unwrap_or(512);
@@ -895,6 +916,18 @@ fn write_blank_minix_image(
         version
     ));
     Ok(())
+}
+
+/// Convert a byte size to a 512-byte block count for the builders that take
+/// blocks rather than bytes, refusing a size that would overflow their `u32`
+/// block field (2 TiB) rather than silently wrapping to a tiny volume.
+fn blocks_512(size_bytes: u64, fs: &str) -> anyhow::Result<u32> {
+    let blocks = size_bytes / 512;
+    if blocks == 0 {
+        anyhow::bail!("--size {size_bytes} is smaller than one 512-byte {fs} block");
+    }
+    u32::try_from(blocks)
+        .map_err(|_| anyhow::anyhow!("--size {size_bytes} exceeds the {fs} 2 TiB block limit"))
 }
 
 fn format_and_write(
