@@ -649,7 +649,7 @@ impl InspectTab {
                         "root privileges (sudo)"
                     }
                 ))
-                .color(egui::Color32::YELLOW),
+                .color(super::theme::warning(ui.visuals())),
             );
         }
 
@@ -1017,10 +1017,7 @@ impl InspectTab {
 
         // Show error if any
         if let Some(err) = &self.last_error {
-            ui.colored_label(
-                egui::Color32::from_rgb(255, 100, 100),
-                format!("Error: {err}"),
-            );
+            ui.colored_label(super::theme::danger(ui.visuals()), format!("Error: {err}"));
             ui.add_space(8.0);
         }
 
@@ -1971,7 +1968,7 @@ impl InspectTab {
                                  unrecognized filesystem regions — only smart-compact \
                                  areas of recognized partitions carry over.",
                             )
-                            .color(egui::Color32::from_rgb(220, 160, 70)),
+                            .color(super::theme::warning(ui.visuals())),
                         );
                     }
                     ui.add_space(8.0);
@@ -3878,22 +3875,29 @@ impl InspectTab {
                         .map(|s| s.to_string())
                         .unwrap_or_default();
                     if part.is_extended_container {
-                        ui.label(egui::RichText::new(index_label).color(egui::Color32::GRAY));
+                        ui.label(
+                            egui::RichText::new(index_label)
+                                .color(super::theme::muted(ui.visuals())),
+                        );
                         if has_slots {
                             ui.label(
-                                egui::RichText::new(slot_label.clone()).color(egui::Color32::GRAY),
+                                egui::RichText::new(slot_label.clone())
+                                    .color(super::theme::muted(ui.visuals())),
                             );
                         }
-                        ui.label(egui::RichText::new(&part.type_name).color(egui::Color32::GRAY));
+                        ui.label(
+                            egui::RichText::new(&part.type_name)
+                                .color(super::theme::muted(ui.visuals())),
+                        );
                         // Volume column — extended containers have no filesystem.
                         ui.label("");
                         ui.label(
                             egui::RichText::new(format!("{}", part.start_lba))
-                                .color(egui::Color32::GRAY),
+                                .color(super::theme::muted(ui.visuals())),
                         );
                         ui.label(
                             egui::RichText::new(partition::format_size(part.size_bytes))
-                                .color(egui::Color32::GRAY),
+                                .color(super::theme::muted(ui.visuals())),
                         );
                         if show_min_col {
                             if let Some(meta) = &self.backup_metadata {
@@ -3907,7 +3911,7 @@ impl InspectTab {
                                 if logical_sum > 0 {
                                     ui.label(
                                         egui::RichText::new(partition::format_size(logical_sum))
-                                            .color(egui::Color32::GRAY),
+                                            .color(super::theme::muted(ui.visuals())),
                                     );
                                 } else {
                                     ui.label("");
@@ -4214,7 +4218,7 @@ impl InspectTab {
                          holes left by deleted files.",
                     );
                     ui.colored_label(
-                        egui::Color32::from_rgb(220, 180, 80),
+                        super::theme::warning(ui.visuals()),
                         "The partition is rewritten in place. Back up the image first.",
                     );
                     ui.add_space(6.0);
@@ -4439,12 +4443,12 @@ impl InspectTab {
                 if let Some(result) = &self.fsck_result {
                     if result.is_clean() {
                         ui.colored_label(
-                            egui::Color32::from_rgb(100, 200, 100),
+                            super::theme::success(ui.visuals()),
                             "Filesystem is clean.",
                         );
                     } else {
                         ui.colored_label(
-                            egui::Color32::from_rgb(255, 100, 100),
+                            super::theme::danger(ui.visuals()),
                             format!("{} error(s) found.", result.errors.len()),
                         );
                     }
@@ -4471,7 +4475,7 @@ impl InspectTab {
                             .show(ui, |ui| {
                                 for issue in &result.errors {
                                     ui.colored_label(
-                                        egui::Color32::from_rgb(255, 100, 100),
+                                        super::theme::danger(ui.visuals()),
                                         format!("[{}] {}", issue.code, issue.message),
                                     );
                                 }
@@ -4495,12 +4499,12 @@ impl InspectTab {
                                 for issue in &visible_warnings {
                                     if issue.debug {
                                         ui.colored_label(
-                                            egui::Color32::from_rgb(150, 150, 150),
+                                            super::theme::muted(ui.visuals()),
                                             format!("[DEBUG] {}", issue.message),
                                         );
                                     } else {
                                         ui.colored_label(
-                                            egui::Color32::from_rgb(255, 200, 100),
+                                            super::theme::warning(ui.visuals()),
                                             format!("[{}] {}", issue.code, issue.message),
                                         );
                                     }
@@ -4526,7 +4530,7 @@ impl InspectTab {
                         if !report.fixes_applied.is_empty() {
                             for fix in &report.fixes_applied {
                                 ui.colored_label(
-                                    egui::Color32::from_rgb(100, 200, 100),
+                                    super::theme::success(ui.visuals()),
                                     format!("  {}", fix),
                                 );
                             }
@@ -4534,7 +4538,7 @@ impl InspectTab {
                         if !report.fixes_failed.is_empty() {
                             for fail in &report.fixes_failed {
                                 ui.colored_label(
-                                    egui::Color32::from_rgb(255, 100, 100),
+                                    super::theme::danger(ui.visuals()),
                                     format!("  {}", fail),
                                 );
                             }

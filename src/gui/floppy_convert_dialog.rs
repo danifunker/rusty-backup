@@ -195,7 +195,7 @@ impl FloppyConvertDialog {
                     ui.label(format!("Detected: {}", kind.display_name()));
                 }
                 if let Some(err) = &self.source_error {
-                    ui.colored_label(egui::Color32::from_rgb(255, 100, 100), err.clone());
+                    ui.colored_label(super::theme::danger(ui.visuals()), err.clone());
                 }
                 ui.label(
                     egui::RichText::new(
@@ -261,14 +261,14 @@ impl FloppyConvertDialog {
                         });
                     } else if let Some(err) = &snap.error {
                         ui.colored_label(
-                            egui::Color32::from_rgb(255, 100, 100),
+                            super::theme::danger(ui.visuals()),
                             format!("Failed: {err}"),
                         );
                     } else if let Some(s) = &snap.summary {
-                        ui.colored_label(egui::Color32::from_rgb(100, 200, 100), s.clone());
+                        ui.colored_label(super::theme::success(ui.visuals()), s.clone());
                     } else {
                         ui.colored_label(
-                            egui::Color32::from_rgb(100, 200, 100),
+                            super::theme::success(ui.visuals()),
                             "Conversion complete.",
                         );
                     }

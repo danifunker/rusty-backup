@@ -259,7 +259,7 @@ impl BulkConvertDialog {
                     if src == out {
                         ui.add_space(6.0);
                         ui.colored_label(
-                            egui::Color32::YELLOW,
+                            super::theme::warning(ui.visuals()),
                             "Warning: source and output folders are the same — converted files may overwrite originals.",
                         );
                     }
@@ -267,7 +267,7 @@ impl BulkConvertDialog {
 
                 if let Some(err) = &self.scan_error {
                     ui.add_space(6.0);
-                    ui.colored_label(egui::Color32::from_rgb(255, 100, 100), err);
+                    ui.colored_label(super::theme::danger(ui.visuals()), err);
                 }
 
                 ui.add_space(10.0);

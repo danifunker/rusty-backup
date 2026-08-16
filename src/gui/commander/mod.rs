@@ -988,7 +988,7 @@ impl CommanderMode {
                 };
                 running = !st.finished;
                 if let Some(err) = &st.error {
-                    ui.colored_label(egui::Color32::from_rgb(220, 120, 120), err);
+                    ui.colored_label(super::theme::danger_muted(ui.visuals()), err);
                     return;
                 }
                 if running {
@@ -1036,7 +1036,7 @@ impl CommanderMode {
                             ui.strong(format!("{}  ({})", fc.name, format_size(fc.size)));
                             if let Some(err) = &fc.error {
                                 ui.colored_label(
-                                    egui::Color32::from_rgb(220, 120, 120),
+                                    super::theme::danger_muted(ui.visuals()),
                                     format!("failed: {err}"),
                                 );
                                 continue;
@@ -1233,7 +1233,7 @@ impl CommanderMode {
 
                 if let Some(msg) = &win.result {
                     ui.add_space(4.0);
-                    ui.colored_label(egui::Color32::from_rgb(120, 200, 120), msg);
+                    ui.colored_label(super::theme::success(ui.visuals()), msg);
                 }
 
                 // Preview (read-only).
@@ -1459,7 +1459,10 @@ fn draw_copy_icon(p: &egui::Painter, r: egui::Rect, color: egui::Color32, rightw
 fn draw_delete_icon(p: &egui::Painter, r: egui::Rect, color: egui::Color32) {
     let side = (r.height() * 0.8).min(26.0);
     draw_floppy(p, egui::pos2(r.center().x - 5.0, r.center().y), side, color);
-    let red = egui::Color32::from_rgb(220, 70, 70);
+    // Fixed rather than themed: this is handed to `icon_button` as a function
+    // pointer, so it has no `Visuals` to consult. A mid-red clears the 3:1
+    // WCAG floor for non-text graphics against both backgrounds.
+    let red = egui::Color32::from_rgb(200, 60, 60);
     let stroke = egui::Stroke::new(3.0, red);
     let h = side * 0.55;
     let xc = egui::pos2(r.center().x + 8.0, r.center().y);

@@ -17,6 +17,10 @@ pub mod os;
 pub mod partition;
 pub mod privileged;
 pub mod rbformats;
+/// Theme-aware GUI colours, shared by the desktop app and the optical
+/// browse view (which lives here in the lib rather than in the binary).
+#[cfg(feature = "gui")]
+pub mod theme;
 // Network daemon + client (`rb-cli serve`, `rb://` refs). std::net + serde
 // only — gated so the slim build can drop it, but cheap enough to keep on.
 #[cfg(feature = "remote")]

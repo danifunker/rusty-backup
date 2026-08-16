@@ -28,6 +28,9 @@ mod settings_dialog;
 mod size_mode_row;
 mod source_picker;
 mod squashfs_budget_dialog;
+// The palette lives in the lib so `optical::browse_view` can reach it too;
+// re-exported here so `super::theme::` resolves throughout the GUI.
+pub(crate) use rusty_backup::theme;
 pub mod ui_logger;
 
 use archives_tab::ArchivesTab;
@@ -784,7 +787,8 @@ impl RustyBackupApp {
                     }
                     Some(UpdateRunState::Ready) => {
                         ui.label(
-                            egui::RichText::new("Update installed.").color(egui::Color32::GREEN),
+                            egui::RichText::new("Update installed.")
+                                .color(theme::success(ui.visuals())),
                         );
                         if ui.button("Restart now").clicked() {
                             rusty_backup::update::restart_app();
@@ -793,7 +797,7 @@ impl RustyBackupApp {
                     Some(UpdateRunState::Failed(e)) => {
                         ui.label(
                             egui::RichText::new(format!("Update failed: {e}"))
-                                .color(egui::Color32::LIGHT_RED),
+                                .color(theme::danger(ui.visuals())),
                         );
                         if ui.button("Retry").clicked() {
                             self.update_run = None;
@@ -941,7 +945,7 @@ impl eframe::App for RustyBackupApp {
                             if let Ok(status) = access.check_status() {
                                 if status == rusty_backup::privileged::AccessStatus::NeedsElevation {
                                     if ui
-                                        .button(egui::RichText::new("Request Elevation").color(egui::Color32::YELLOW))
+                                        .button(egui::RichText::new("Request Elevation").color(theme::warning(ui.visuals())))
                                         .on_hover_text("Restart with administrator privileges to access disk devices")
                                         .clicked()
                                     {
@@ -972,7 +976,7 @@ impl eframe::App for RustyBackupApp {
                                 .add(egui::Button::image_and_text(
                                     icon,
                                     egui::RichText::new("Show Physical Devices")
-                                        .color(egui::Color32::YELLOW),
+                                        .color(theme::warning(ui.visuals())),
                                 ))
                                 .on_hover_text(
                                     "Restart with administrator privileges to access \
@@ -1111,7 +1115,7 @@ impl eframe::App for RustyBackupApp {
                     ui.horizontal(|ui| {
                         ui.label(
                             egui::RichText::new("Update")
-                                .color(egui::Color32::YELLOW)
+                                .color(theme::warning(ui.visuals()))
                                 .strong(),
                         );
                         ui.label(format!(

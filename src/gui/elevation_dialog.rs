@@ -27,7 +27,7 @@ impl ElevationDialog {
                     ui.add_space(10.0);
                     ui.label(
                         egui::RichText::new("Warning")
-                            .color(egui::Color32::YELLOW)
+                            .color(super::theme::warning(ui.visuals()))
                             .size(24.0),
                     );
                     ui.add_space(10.0);

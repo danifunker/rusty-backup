@@ -113,20 +113,23 @@ fn show_edit_existing(
                         if deleted {
                             ui.label(
                                 egui::RichText::new(format!("{}", idx))
-                                    .color(egui::Color32::GRAY)
+                                    .color(super::theme::muted(ui.visuals()))
                                     .strikethrough(),
                             );
                             ui.label(
                                 egui::RichText::new(&type_name)
-                                    .color(egui::Color32::GRAY)
+                                    .color(super::theme::muted(ui.visuals()))
                                     .strikethrough(),
                             );
                             ui.label(
                                 egui::RichText::new(format!("{}", start_lba))
-                                    .color(egui::Color32::GRAY),
+                                    .color(super::theme::muted(ui.visuals())),
                             );
                             ui.label("");
-                            ui.label(egui::RichText::new("deleted").color(egui::Color32::GRAY));
+                            ui.label(
+                                egui::RichText::new("deleted")
+                                    .color(super::theme::muted(ui.visuals())),
+                            );
                             ui.label("");
                             if ui.small_button("Undo").clicked() {
                                 editor.entries[i].deleted = false;
@@ -138,18 +141,21 @@ fn show_edit_existing(
                         if is_ext {
                             ui.label(
                                 egui::RichText::new(format!("{} (ext)", idx))
-                                    .color(egui::Color32::GRAY),
+                                    .color(super::theme::muted(ui.visuals())),
                             );
-                            ui.label(egui::RichText::new(&type_name).color(egui::Color32::GRAY));
+                            ui.label(
+                                egui::RichText::new(&type_name)
+                                    .color(super::theme::muted(ui.visuals())),
+                            );
                             ui.label(
                                 egui::RichText::new(format!("{}", start_lba))
-                                    .color(egui::Color32::GRAY),
+                                    .color(super::theme::muted(ui.visuals())),
                             );
                             ui.label("");
                             let size_mib = size_bytes as f64 / (1024.0 * 1024.0);
                             ui.label(
                                 egui::RichText::new(format!("{:.2}", size_mib))
-                                    .color(egui::Color32::GRAY),
+                                    .color(super::theme::muted(ui.visuals())),
                             );
                             ui.label("");
                             ui.label("");
@@ -350,10 +356,10 @@ fn show_edit_existing(
             ui.add_space(8.0);
 
             for err in &editor.errors {
-                ui.colored_label(egui::Color32::from_rgb(255, 100, 100), err);
+                ui.colored_label(super::theme::danger(ui.visuals()), err);
             }
             if let Some(status) = &editor.status {
-                ui.colored_label(egui::Color32::from_rgb(100, 255, 100), status);
+                ui.colored_label(super::theme::success(ui.visuals()), status);
             }
 
             ui.add_space(4.0);
@@ -555,14 +561,14 @@ fn show_build_new(ui: &mut egui::Ui, builder: &mut DiskBuilder, allow_apply: boo
             ui.add_space(8.0);
             for err in &builder.errors {
                 let color = if err.starts_with("Warning:") {
-                    egui::Color32::from_rgb(230, 180, 90)
+                    super::theme::warning(ui.visuals())
                 } else {
-                    egui::Color32::from_rgb(255, 100, 100)
+                    super::theme::danger(ui.visuals())
                 };
                 ui.colored_label(color, err);
             }
             if let Some(status) = &builder.status {
-                ui.colored_label(egui::Color32::from_rgb(100, 255, 100), status);
+                ui.colored_label(super::theme::success(ui.visuals()), status);
             }
 
             ui.add_space(4.0);
@@ -658,10 +664,7 @@ fn show_planned_layout_bar(ui: &mut egui::Ui, builder: &DiskBuilder) {
     let planned = match builder.plan() {
         Ok(p) => p,
         Err(e) => {
-            ui.colored_label(
-                egui::Color32::from_rgb(255, 100, 100),
-                format!("Layout: {e:#}"),
-            );
+            ui.colored_label(super::theme::danger(ui.visuals()), format!("Layout: {e:#}"));
             return;
         }
     };

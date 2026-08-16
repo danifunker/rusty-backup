@@ -44,7 +44,7 @@ impl SettingsDialog {
                             ui.label(
                                 egui::RichText::new("Info:")
                                     .size(14.0)
-                                    .color(egui::Color32::from_rgb(0, 122, 255))
+                                    .color(super::theme::info(ui.visuals()))
                             );
                             ui.vertical(|ui| {
                                 ui.label("Rusty Backup uses sudo to request administrator privileges.");
@@ -111,9 +111,9 @@ impl SettingsDialog {
                     if let Some(ref msg) = self.status_message {
                         ui.colored_label(
                             if msg.starts_with("Error") {
-                                egui::Color32::RED
+                                super::theme::danger(ui.visuals())
                             } else {
-                                egui::Color32::GREEN
+                                super::theme::success(ui.visuals())
                             },
                             msg,
                         );

@@ -170,7 +170,7 @@ impl SquashfsBudgetDialog {
                 };
                 if over_capacity {
                     ui.colored_label(
-                        egui::Color32::from_rgb(200, 80, 80),
+                        super::theme::danger(ui.visuals()),
                         format!(
                             "That is more than the {} available where this image lives.",
                             format_size(self.plan.capacity.unwrap_or(0))

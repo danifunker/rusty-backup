@@ -193,33 +193,18 @@ impl PartitionBar {
     }
 }
 
-/// Fixed palette of partition colors. Cycles for disks with more partitions
-/// than entries.
-const PALETTE: &[egui::Color32] = &[
-    egui::Color32::from_rgb(0x4c, 0x8c, 0xc4), // blue
-    egui::Color32::from_rgb(0x6a, 0xb6, 0x4c), // green
-    egui::Color32::from_rgb(0xc4, 0x88, 0x4c), // orange
-    egui::Color32::from_rgb(0xb0, 0x5a, 0xa0), // magenta
-    egui::Color32::from_rgb(0x4c, 0xb0, 0xb0), // teal
-    egui::Color32::from_rgb(0xc4, 0xb4, 0x4c), // gold
-    egui::Color32::from_rgb(0x8a, 0x6c, 0xc4), // violet
-    egui::Color32::from_rgb(0xc4, 0x6c, 0x6c), // salmon
-];
-
-const FREE_COLOR: egui::Color32 = egui::Color32::from_rgb(0x9a, 0x9a, 0x9a);
-const DIMMED_COLOR: egui::Color32 = egui::Color32::from_rgb(0x66, 0x66, 0x66);
-
-fn segment_color(_visuals: &egui::Visuals, kind: SegmentKind) -> egui::Color32 {
+fn segment_color(visuals: &egui::Visuals, kind: SegmentKind) -> egui::Color32 {
     match kind {
-        SegmentKind::Partition { color_index } => PALETTE[color_index % PALETTE.len()],
-        SegmentKind::Free => FREE_COLOR,
-        SegmentKind::Dimmed => DIMMED_COLOR,
+        SegmentKind::Partition { color_index } => {
+            super::theme::partition_fill(visuals, color_index)
+        }
+        SegmentKind::Free => super::theme::free_space(visuals),
+        SegmentKind::Dimmed => super::theme::dimmed(visuals),
     }
 }
 
-fn inline_text_color(_visuals: &egui::Visuals, _kind: SegmentKind) -> egui::Color32 {
-    // Palette colors are mid-tone; white reads on all of them.
-    egui::Color32::WHITE
+fn inline_text_color(visuals: &egui::Visuals, _kind: SegmentKind) -> egui::Color32 {
+    super::theme::on_partition(visuals)
 }
 
 fn inline_label(segment: &Segment) -> String {

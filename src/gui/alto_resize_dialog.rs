@@ -113,7 +113,7 @@ impl AltoResizeDialog {
                 let fits = self.used_pages <= self.target.pages();
                 if !fits {
                     ui.colored_label(
-                        egui::Color32::from_rgb(200, 90, 70),
+                        super::theme::danger(ui.visuals()),
                         format!(
                             "Warning: {} used pages may not fit the target's {} pages.",
                             self.used_pages,
@@ -125,13 +125,10 @@ impl AltoResizeDialog {
                 ui.separator();
                 match &self.result {
                     Some(Ok(msg)) => {
-                        ui.colored_label(egui::Color32::from_rgb(90, 170, 90), msg.clone());
+                        ui.colored_label(super::theme::success(ui.visuals()), msg.clone());
                     }
                     Some(Err(e)) => {
-                        ui.colored_label(
-                            egui::Color32::from_rgb(200, 90, 70),
-                            format!("Error: {e}"),
-                        );
+                        ui.colored_label(super::theme::danger(ui.visuals()), format!("Error: {e}"));
                     }
                     None => {}
                 }
