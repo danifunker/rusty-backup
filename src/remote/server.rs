@@ -81,6 +81,9 @@ enum StagedEdit {
         /// `--type` is encoded to bytes when staged.
         type_code: Option<[u8; 4]>,
         creator_code: Option<[u8; 4]>,
+        /// Staged Mac resource fork, written after the data fork on apply.
+        /// `None` for a data-only file.
+        fork_blob: Option<PathBuf>,
     },
     Mkdir {
         parent: String,
@@ -969,6 +972,7 @@ fn handle_conn(
                 force,
                 type_code,
                 creator_code,
+                resource_fork_size,
             } => {
                 // The file body follows as a chunk stream and MUST be consumed
                 // regardless of session validity, or the framing desyncs.
@@ -976,7 +980,22 @@ fn handle_conn(
                     Some(sess) => {
                         let blob = sess.staging.path().join(format!("blob-{}", sess.blob_seq));
                         sess.blob_seq += 1;
-                        match stage_blob(&mut reader, &blob) {
+                        // A fork-bearing upload puts a SECOND chunk stream on
+                        // the wire straight after the first. Read it whatever
+                        // happens to the data fork, or the framing desyncs.
+                        let fork_blob = if resource_fork_size.is_some() {
+                            let f = sess.staging.path().join(format!("fork-{}", sess.blob_seq));
+                            sess.blob_seq += 1;
+                            Some(f)
+                        } else {
+                            None
+                        };
+                        let data_res = stage_blob(&mut reader, &blob);
+                        let fork_res = match &fork_blob {
+                            Some(f) => stage_blob(&mut reader, f),
+                            None => Ok(()),
+                        };
+                        match data_res.and(fork_res) {
                             Ok(()) => {
                                 sess.edits.push(StagedEdit::AddFile {
                                     dest_parent,
@@ -992,6 +1011,7 @@ fn handle_conn(
                                     creator_code: creator_code
                                         .as_deref()
                                         .map(crate::fs::hfs_common::encode_fourcc),
+                                    fork_blob,
                                 });
                                 write_control(&mut writer, &Response::Ok)?;
                             }
@@ -1000,7 +1020,11 @@ fn handle_conn(
                     }
                     None => {
                         // Drain the body to keep the stream aligned, then report.
+                        // Both streams, when a fork was announced.
                         let _ = read_chunks(&mut reader, &mut std::io::sink());
+                        if resource_fork_size.is_some() {
+                            let _ = read_chunks(&mut reader, &mut std::io::sink());
+                        }
                         reply_err(&mut writer, format!("no such session {session}"))?;
                     }
                 }
@@ -1274,7 +1298,7 @@ fn handle_conn(
             } => match sessions.get_mut(&session) {
                 Some(sess) => {
                     match stage_copy_local(root, &src_image, src_partition, &src_path, sess) {
-                        Ok((blob, size, type_code, creator_code)) => {
+                        Ok((blob, size, type_code, creator_code, fork_blob)) => {
                             sess.edits.push(StagedEdit::AddFile {
                                 dest_parent,
                                 name,
@@ -1283,6 +1307,7 @@ fn handle_conn(
                                 force,
                                 type_code,
                                 creator_code,
+                                fork_blob,
                             });
                             write_control(&mut writer, &Response::Ok)?;
                         }
@@ -1637,6 +1662,7 @@ fn apply_session(sess: &Session) -> Result<u64> {
                 force,
                 type_code,
                 creator_code,
+                fork_blob,
             } => {
                 let parent = resolve_path(fs.as_filesystem_mut(), dest_parent)?;
                 if !parent.is_directory() {
@@ -1661,8 +1687,24 @@ fn apply_session(sess: &Session) -> Result<u64> {
                 };
                 let mut blobf = std::fs::File::open(blob)
                     .with_context(|| format!("opening staging blob {}", blob.display()))?;
-                fs.create_file(&parent, name, &mut blobf, *size, &options)
+                let created = fs
+                    .create_file(&parent, name, &mut blobf, *size, &options)
                     .map_err(|e| anyhow!("create_file {name}: {e}"))?;
+                // The resource fork is written after the entry exists, the same
+                // order the local editor uses. A filesystem without forks
+                // reports Unsupported, which is only an error if a fork was
+                // actually sent — copying a Mac file onto FAT should say so
+                // rather than silently drop half the file.
+                if let Some(fork) = fork_blob {
+                    let len = std::fs::metadata(fork).map(|m| m.len()).unwrap_or(0);
+                    if len > 0 {
+                        let mut ff = std::fs::File::open(fork).with_context(|| {
+                            format!("opening staged resource fork {}", fork.display())
+                        })?;
+                        fs.write_resource_fork(&created, &mut ff, len)
+                            .map_err(|e| anyhow!("write_resource_fork {name}: {e}"))?;
+                    }
+                }
                 count += 1;
             }
             StagedEdit::Mkdir { parent, name } => {
@@ -1694,7 +1736,16 @@ fn apply_session(sess: &Session) -> Result<u64> {
 
 /// What [`stage_copy_local`] hands back: the staging blob path, the source
 /// file's size, and its raw OSType type/creator (preserved byte-exact).
-type StagedCopy = (PathBuf, u64, Option<[u8; 4]>, Option<[u8; 4]>);
+/// `(data blob, size, type, creator, resource-fork blob)`. The fork is
+/// `None` when the source has none — a 0-byte fork and no fork are the same
+/// thing to every filesystem we write.
+type StagedCopy = (
+    PathBuf,
+    u64,
+    Option<[u8; 4]>,
+    Option<[u8; 4]>,
+    Option<PathBuf>,
+);
 
 /// Stage an on-device copy: extract `src_path` from the source image into a
 /// staging blob in the session's staging dir, returning the blob + the source
@@ -1720,7 +1771,29 @@ fn stage_copy_local(
         .fs
         .write_file_to(&entry, &mut f)
         .map_err(|e| anyhow!("reading {src_path}: {e}"))?;
-    Ok((blob, entry.size, entry.type_code, entry.creator_code))
+    // A Mac source keeps most of the file in its resource fork, so an
+    // image-to-image copy on the daemon has to carry it too — not just the
+    // host-upload path.
+    let fork_blob = if opened.fs.resource_fork_size(&entry) > 0 {
+        let fork = sess.staging.path().join(format!("fork-{}", sess.blob_seq));
+        sess.blob_seq += 1;
+        let mut ff = std::fs::File::create(&fork)
+            .with_context(|| format!("creating staging fork {}", fork.display()))?;
+        opened
+            .fs
+            .write_resource_fork_to(&entry, &mut ff)
+            .map_err(|e| anyhow!("reading resource fork of {src_path}: {e}"))?;
+        Some(fork)
+    } else {
+        None
+    };
+    Ok((
+        blob,
+        entry.size,
+        entry.type_code,
+        entry.creator_code,
+        fork_blob,
+    ))
 }
 
 /// Largest single `ReadBlock` we honour — bounds one block-reader fetch so a

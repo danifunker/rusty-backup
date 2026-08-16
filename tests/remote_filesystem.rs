@@ -2778,3 +2778,87 @@ fn a_failed_upload_does_not_desync_the_connection() {
         "the failed upload left nothing behind: {names:?}"
     );
 }
+
+/// A Mac file copied onto a remote volume must arrive with **both** forks.
+///
+/// `StagedEdit::AddFile` had no fork field, and the Commander read a staged
+/// `resource_fork` only to lift its type/creator codes — the fork bytes were
+/// never put on the wire. Copying classic Mac files to a remote volume
+/// therefore produced data-fork-only files, silently. For an application that
+/// is not a lossy copy, it is an inert one, and nothing failed to say so.
+///
+/// Drives the host-upload path (`stage_upload_with_fork`) onto a remote HFS
+/// volume and compares both forks byte for byte.
+#[test]
+fn remote_upload_carries_the_resource_fork() {
+    use rusty_backup::remote::RemoteSession;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    // Destination: a real HFS volume, the only kind that can hold a fork.
+    std::fs::write(
+        root.join("dest.img"),
+        hfs::create_blank_hfs(4 * 1024 * 1024, 512, "DESTMAC").unwrap(),
+    )
+    .unwrap();
+
+    let staging_tmp = tempfile::tempdir().unwrap();
+    let staging = staging_tmp.path().to_path_buf();
+
+    let host_tmp = tempfile::tempdir().unwrap();
+    let host_file = host_tmp.path().join("app.bin");
+    let data_fork = vec![0x11u8; 1500];
+    // Deliberately larger than the data fork and a different byte, so a
+    // truncated or swapped stream cannot pass by coincidence.
+    let rsrc_fork: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&host_file, &data_fork).unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let serve_root = root.clone();
+    let serve_staging = staging.clone();
+    std::thread::spawn(move || {
+        let _ = serve_on(listener, serve_root, Some(serve_staging), true);
+    });
+
+    {
+        let mut session = RemoteSession::connect(&addr).unwrap();
+        let sid = session.open_session("/dest.img", None).unwrap();
+        session
+            .stage_upload_with_fork(
+                sid,
+                "/",
+                "AppFile",
+                &host_file,
+                false,
+                Some("APPL".to_string()),
+                Some("MACS".to_string()),
+                Some(&rsrc_fork),
+            )
+            .unwrap();
+        assert_eq!(session.apply(sid).unwrap(), 1);
+        session.close_session(sid).unwrap();
+    }
+
+    // Read it back over the wire and compare both forks.
+    let (mut rfs, root_entry, _children) =
+        RemoteFilesystem::open(&addr, "/dest.img", None).unwrap();
+    let listed = rfs.list_directory(&root_entry).unwrap();
+    let got = listed
+        .iter()
+        .find(|e| e.name == "AppFile")
+        .expect("uploaded file present");
+
+    let mut data_back = Vec::new();
+    rfs.write_file_to(got, &mut data_back).unwrap();
+    assert_eq!(data_back, data_fork, "data fork is byte-exact");
+
+    let mut rsrc_back = Vec::new();
+    rfs.write_resource_fork_to(got, &mut rsrc_back).unwrap();
+    assert_eq!(
+        rsrc_back.len(),
+        rsrc_fork.len(),
+        "resource fork length survived the wire"
+    );
+    assert_eq!(rsrc_back, rsrc_fork, "resource fork is byte-exact");
+}

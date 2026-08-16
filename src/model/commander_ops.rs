@@ -1266,8 +1266,13 @@ fn remote_apply(
                         .as_ref()
                         .or_else(|| resource_fork.as_ref().and_then(|r| r.creator_code.as_ref()))
                         .map(os4_to_string);
+                    // The fork bytes, not just the codes lifted off them: a
+                    // classic Mac file with only its data fork is inert, so a
+                    // copy that drops the fork is not a copy. This used to read
+                    // `resource_fork` for type/creator and discard the rest.
+                    let fork_bytes = resource_fork.as_ref().map(|r| r.data.as_slice());
                     session
-                        .stage_upload(
+                        .stage_upload_with_fork(
                             sid,
                             &parent.path,
                             name,
@@ -1275,6 +1280,7 @@ fn remote_apply(
                             false,
                             type_code,
                             creator_code,
+                            fork_bytes,
                         )
                         .with_context(|| format!("uploading {name}"))?;
                 }
