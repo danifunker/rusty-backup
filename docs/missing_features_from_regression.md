@@ -16,7 +16,7 @@ concrete reason to.
 | ~~F-002~~ | ~~CloneCD not supported~~ — **retracted, it is supported** | — | — |
 | ~~F-003~~ | ~~PFS3 / SFS builders exist but are not on the CLI~~ — **SHIPPED** 2026-08-15 | `src/cli/verbs/new.rs` | — |
 | [F-005](#f-005) | Optical extract is CLI-only; the GUI cannot pull one file | `src/optical/browse_view.rs` | GUI parity with `optical extract` |
-| [F-006](#f-006) | IRIX support-disk building / browsing is thin | `src/cli/verbs/new_sgi_cdrom.rs` | bootable IRIX disc work — **needs scope** |
+| [F-006](#f-006) | IRIX support-disk building / browsing is thin | `src/cli/verbs/new_sgi_cdrom.rs` | bootable IRIX discs — **scoped**; step 1 (header validated by IRIX) done, steps 2-3 open |
 | [F-007](#f-007) | No optical fixture with nested directories | `regression-tests/` | verifying `--path DIR --recursive` |
 | ~~F-008~~ | ~~`backup` reads only flat-layout sources~~ — **SHIPPED** 2026-08-15 | `src/cli/verbs/backup.rs` | — |
 | [F-009](#f-009) | SFS editor writes single-leaf extent b-trees only | `src/fs/sfs.rs` | editing any real-sized SFS volume |
@@ -221,6 +221,59 @@ one. This is wiring, not new engine work.
   Inspect-tab bullet
 
 ## F-006 — IRIX support-disk building and browsing is thin {#f-006}
+
+**Scoped 2026-08-15, and step 1 is done.** The ask is a *bootable* IRIX
+CD-ROM, 5.3 and 6.5, for building all-in-one installation discs.
+
+### Step 1 — the existing header is now validated against IRIX (DONE)
+
+`new hd sgi-efs` printed "real IRIX fx/prtvtoc validation is unverified without
+hardware/emulator". It is verified. IRIX 6.5.22's own `fx` 6.5 opens the drive
+and prints our partitions, bootinfo and geometry without complaint, and
+`prtvtoc` agrees field for field:
+
+```
+  0: efs        5040 + 126000         2 + 62
+  8: volhdr        0 + 5040           0 + 2
+ 10: volume        0 + 131040         0 + 64
+ root partition = 0     swap partition = 0    bootfile = /unix
+----- directory entries-----
+```
+
+So **partitioning is solved** — a user does not run `fx` by hand — and the
+empty `directory entries` section is precisely the gap. That directory is what
+ARCS reads to find `sash` / `ide`; we write 15 blank slots. Method and traps
+are in `oracles/iris/README.md`.
+
+Two limits found while proving it: nothing yet tests `fx` *writing* a label or
+the kernel mounting from it, and our label declares 130 cylinders where the
+drive reports 131 (the builder rounds up to whole cylinders and then the size
+is clamped). `fx` did not object, but a bootable disk should match the drive
+exactly, so the rounding wants revisiting first.
+
+### Step 2 — populate the volume directory (NOT STARTED)
+
+The boot files are SGI-copyrighted and cannot ship with rusty-backup, so this
+is "assemble a bootable disc *from* the user's own distribution media", not
+"synthesize one". That shapes the CLI: it needs `--sash` / `--miniroot` inputs
+or a `--from-disc` that harvests them.
+
+### Step 3 — the CD path (NOT STARTED)
+
+`optical new sgi-efs` already writes the CD-shaped volume header — EFS in slot
+7, the 1 head x 32 sectors/track geometry verified against real 5.3 and 6.5
+discs. It needs the directory entries and the miniroot.
+
+**Scope 6.5 first.** 6.5 boots under iris and is verifiable end to end; the 5.3
+image hangs at "The system is coming up" with `Find Error: 10` and never
+reaches a login, so 5.3 cannot be proven here yet. The verification story is
+otherwise unusually good for this feature — "did it boot" has an unambiguous
+answer, the same oracle shape that closed R-039 and R-020.
+
+---
+
+### The original report
+
 
 `optical new sgi-efs` builds an SGI volume header with EFS in slot 7, and
 takes `--from-dir`, `--expand-archives` and `--flatten-folders`. What it does

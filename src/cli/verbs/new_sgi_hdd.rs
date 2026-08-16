@@ -191,8 +191,9 @@ pub fn run(args: NewSgiHddArgs) -> Result<()> {
         ));
     }
     log_stderr(
-        "  note: the header round-trips through rb-cli's SGI parser; real IRIX \
-         fx/prtvtoc validation is unverified without hardware/emulator.",
+        "  note: the header is validated against IRIX 6.5.22 itself (prtvtoc and \
+         fx 6.5 both read it); the volume directory is empty, so this is a data \
+         disk, not a bootable one.",
     );
     Ok(())
 }
