@@ -767,18 +767,17 @@ impl<R: Read + Seek> SfsFilesystem<R> {
         if buf.len() < 36 {
             return Err(parse_err("SFS AdminSpaceContainer too small"));
         }
-        let next = rd_u32(&buf, 12);
-        let region_size = buf[24] as u32; // blocks per adminspace region
+        let next = rd_u32(&buf, ADMC_NEXT);
+        let region_size = buf[ADMC_REGION_SIZE] as u32;
         let mut regions = Vec::new();
-        // adminspace[] entries start at offset 28: space(u32) + bits(u32).
-        let mut o = 28usize;
-        while o + 8 <= buf.len() {
+        let mut o = ADMC_ADMINSPACE;
+        while o + ADMC_ENTRY_SIZE <= buf.len() {
             let space = rd_u32(&buf, o);
             if space == 0 {
                 break;
             }
             regions.push((space, region_size));
-            o += 8;
+            o += ADMC_ENTRY_SIZE;
         }
         Ok((next, regions))
     }
@@ -1369,6 +1368,20 @@ impl<R: Read + Seek> Read for CompactSfsReader<R> {
 const FS_EXTENTBNODE_SIZE: usize = 14;
 const FS_OBJECTNODE_SIZE: usize = 10;
 
+// fsAdminSpaceContainer, verified byte-for-byte against real SFS volumes
+// (R-042): 12B fsBlockHeader, next, previous, the blocks-per-region byte with
+// three pad bytes, then `adminspace[]` as (space, bits) pairs. `bits` is
+// MSB-first over the region: 0x80000000 means the region's first block is in
+// use, which is how a container marks the block it occupies itself.
+const ADMC_NEXT: usize = 12;
+const ADMC_REGION_SIZE: usize = 20;
+const ADMC_ADMINSPACE: usize = 24;
+const ADMC_ENTRY_SIZE: usize = 8;
+/// `bits` is a u32, so a region can never describe more than 32 blocks.
+const ADMC_MAX_REGION: u32 = 32;
+/// Chain-walk bound, so a corrupt `next` cycle cannot hang a mount.
+const ADMC_MAX_CONTAINERS: usize = 4096;
+
 /// The SFS editor's ceiling, reported as `Unsupported` rather than `Parse`.
 ///
 /// A `Parse` error blamed the disk and exited 1, indistinguishable from a
@@ -1523,26 +1536,74 @@ impl<R: Read + Seek> SfsFilesystem<R> {
         Ok(())
     }
 
-    /// Allocate one admin block by scanning the (single) AdminSpaceContainer's
-    /// adminspace[0].bits for a clear bit. Returns the block number.
-    fn alloc_admin_block(&mut self) -> Result<u32, FilesystemError> {
-        let admc = self.root.adminspacecontainer;
-        self.ensure_dirty(admc)?;
-        let buf = self.dirty.get_mut(&admc).unwrap();
-        // adminspace[0] sits at offset 28; bits field at offset 32.
-        let space_start = rd_u32(buf, 28);
-        let mut bits = rd_u32(buf, 32);
-        for i in 0..32u32 {
-            let mask = 1u32 << (31 - i);
-            if bits & mask == 0 {
-                bits |= mask;
-                buf[32..36].copy_from_slice(&bits.to_be_bytes());
-                let blk = space_start + i;
-                // Zero the freshly allocated admin block in memory.
-                let bs = self.root.blocksize as usize;
-                self.dirty.insert(blk, vec![0u8; bs]);
-                return Ok(blk);
+    /// Locate the adminspace entry covering `blk`, as
+    /// `(admc_block, entry_offset, region_start, bit_index)`. Walks the whole
+    /// container chain: a real volume has one container per admin region group,
+    /// not the single one a freshly formatted volume starts with.
+    fn find_admin_entry(
+        &mut self,
+        blk: u32,
+    ) -> Result<Option<(u32, usize, u32, u32)>, FilesystemError> {
+        let mut admc = self.root.adminspacecontainer;
+        let mut seen = 0usize;
+        while admc != 0 && seen < ADMC_MAX_CONTAINERS {
+            let buf = self.read_block(admc)?.to_vec();
+            let region_size = (buf[ADMC_REGION_SIZE] as u32).min(ADMC_MAX_REGION);
+            let mut o = ADMC_ADMINSPACE;
+            while o + ADMC_ENTRY_SIZE <= buf.len() {
+                let space = rd_u32(&buf, o);
+                if space == 0 {
+                    break;
+                }
+                if region_size > 0 && blk >= space && blk < space + region_size {
+                    return Ok(Some((admc, o, space, blk - space)));
+                }
+                o += ADMC_ENTRY_SIZE;
             }
+            admc = rd_u32(&buf, ADMC_NEXT);
+            seen += 1;
+        }
+        Ok(None)
+    }
+
+    /// Allocate one admin block: the first clear bit in any adminspace region,
+    /// across every container in the chain. Metadata blocks (B-tree nodes,
+    /// ObjectContainers) live in admin space rather than the data bitmap.
+    fn alloc_admin_block(&mut self) -> Result<u32, FilesystemError> {
+        let mut admc = self.root.adminspacecontainer;
+        let mut seen = 0usize;
+        while admc != 0 && seen < ADMC_MAX_CONTAINERS {
+            let buf = self.read_block(admc)?.to_vec();
+            let region_size = (buf[ADMC_REGION_SIZE] as u32).min(ADMC_MAX_REGION);
+            let mut o = ADMC_ADMINSPACE;
+            while o + ADMC_ENTRY_SIZE <= buf.len() && region_size > 0 {
+                let space = rd_u32(&buf, o);
+                if space == 0 {
+                    break;
+                }
+                let bits = rd_u32(&buf, o + 4);
+                for i in 0..region_size {
+                    let mask = 1u32 << (31 - i);
+                    if bits & mask != 0 {
+                        continue;
+                    }
+                    let blk = space + i;
+                    // Past the end of the volume the region is only nominal.
+                    if blk >= self.root.totalblocks {
+                        continue;
+                    }
+                    self.ensure_dirty(admc)?;
+                    let dbuf = self.dirty.get_mut(&admc).unwrap();
+                    let updated = rd_u32(dbuf, o + 4) | mask;
+                    write_u32(dbuf, o + 4, updated);
+                    let bs = self.root.blocksize as usize;
+                    self.dirty.insert(blk, vec![0u8; bs]);
+                    return Ok(blk);
+                }
+                o += ADMC_ENTRY_SIZE;
+            }
+            admc = rd_u32(&buf, ADMC_NEXT);
+            seen += 1;
         }
         Err(FilesystemError::DiskFull(
             "SFS: no free admin-space slots".into(),
@@ -1550,23 +1611,16 @@ impl<R: Read + Seek> SfsFilesystem<R> {
     }
 
     fn free_admin_block(&mut self, blk: u32) -> Result<(), FilesystemError> {
-        let admc = self.root.adminspacecontainer;
+        let (admc, o, _space, i) = self.find_admin_entry(blk)?.ok_or_else(|| {
+            parse_err(format!(
+                "free_admin_block: block {} is not inside any admin region",
+                blk
+            ))
+        })?;
         self.ensure_dirty(admc)?;
         let buf = self.dirty.get_mut(&admc).unwrap();
-        let space_start = rd_u32(buf, 28);
-        if blk < space_start || blk >= space_start + 32 {
-            return Err(parse_err(format!(
-                "free_admin_block: block {} outside admin region [{}, {})",
-                blk,
-                space_start,
-                space_start + 32
-            )));
-        }
-        let i = blk - space_start;
-        let mask = 1u32 << (31 - i);
-        let mut bits = rd_u32(buf, 32);
-        bits &= !mask;
-        buf[32..36].copy_from_slice(&bits.to_be_bytes());
+        let bits = rd_u32(buf, o + 4) & !(1u32 << (31 - i));
+        write_u32(buf, o + 4, bits);
         self.dirty.remove(&blk);
         self.cache.remove(&blk);
         Ok(())
@@ -2736,11 +2790,9 @@ pub fn create_blank_sfs(total_blocks: u32, name: &str) -> Result<Vec<u8>, Filesy
         write_u32(blk, 0, u32::from_be_bytes(*b"ADMC"));
         write_u32(blk, 8, block_adminspace); // ownblock
                                              // next/previous BLCK at 12/16: 0
-                                             // bits at 24 = blocks_admin (per filesystemmain.c:874)
-        blk[24] = blocks_admin as u8;
-        // adminspace[0]: space at 28..32, bits at 32..36
-        write_u32(blk, 28, block_adminspace);
-        write_u32(blk, 32, SFS_ADMIN_INITIAL_BITS);
+        blk[ADMC_REGION_SIZE] = blocks_admin as u8;
+        write_u32(blk, ADMC_ADMINSPACE, block_adminspace);
+        write_u32(blk, ADMC_ADMINSPACE + 4, SFS_ADMIN_INITIAL_BITS);
         stamp_checksum(blk);
     }
 
