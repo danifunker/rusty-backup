@@ -17,7 +17,7 @@ concrete reason to.
 | ~~F-003~~ | ~~PFS3 / SFS builders exist but are not on the CLI~~ — **SHIPPED** 2026-08-15 | `src/cli/verbs/new.rs` | — |
 | [F-005](#f-005) | Optical extract is CLI-only; the GUI cannot pull one file | `src/optical/browse_view.rs` | GUI parity with `optical extract` |
 | [F-006](#f-006) | IRIX support-disk building / browsing is thin | `src/cli/verbs/new_sgi_cdrom.rs` | bootable IRIX discs — **scoped**; step 1 (header validated by IRIX) done, steps 2-3 open |
-| [F-007](#f-007) | No optical fixture with nested directories | `regression-tests/` | verifying `--path DIR --recursive` |
+| ~~F-007~~ | ~~No optical fixture with nested directories~~ — **SHIPPED** 2026-08-17 | `regression-tests/` | — |
 | ~~F-008~~ | ~~`backup` reads only flat-layout sources~~ — **SHIPPED** 2026-08-15 | `src/cli/verbs/backup.rs` | — |
 | [F-009](#f-009) | SFS editor writes single-leaf extent b-trees only | `src/fs/sfs.rs` | editing any real-sized SFS volume |
 | ~~F-004~~ | ~~`show partmap` is APM-only~~ — **SHIPPED** 2026-08-08, same gap as R-026 | `src/cli/verbs/show.rs` | — |
@@ -301,6 +301,37 @@ a harness someone has not written yet rather than a thing that cannot be done.
 (3) is ergonomics on an existing path.
 
 ## F-007 — no optical fixture has nested directories {#f-007}
+
+**SHIPPED 2026-08-17.** The fixture was there all along — this was a case gap,
+not a corpus gap. `optical.hfs.opentransport.cd` carries a real tree:
+`/Install 1` holds files *and* a subdirectory (`Open Transport Files`), so the
+flag finally has something to descend into.
+
+Three cases in `cases/tier3/optical-extract.toml`:
+
+| case | asserts |
+|---|---|
+| `path-dir-stops-at-one-level` | `--path "/Install 1"` alone -> 10 entries |
+| `path-dir-recursive-descends` | the same path `--recursive` -> 30 entries |
+| `nested-dir-addressable-directly` | `/Install 1/Open Transport Files` -> 20 entries |
+
+The counts are exact rather than "recursive found more", which would still pass
+if recursion degraded from a subtree to one extra file. Against a sha256-pinned
+fixture an exact count says what each mode actually covers, and a change either
+way earns a failure.
+
+The third case is the one that makes the pair meaningful: it proves the nested
+directory is independently addressable, so the recursive result is a real
+subtree rather than a flattening artifact.
+
+**One trap, recorded because it cost a run:** `extract` prints its count to
+**stderr**, keeping stdout clean for data. A `stdout_contains` assertion
+matches nothing and fails with no visible difference between expected and
+actual — the counts were right the first time, the stream was not.
+
+---
+
+### The original report
 
 `--path DIR --recursive` is implemented and unverified. The discs in the
 corpus are flat or single-file at the root:
