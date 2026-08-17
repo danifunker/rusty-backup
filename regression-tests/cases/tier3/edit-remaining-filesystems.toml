@@ -153,28 +153,36 @@ expect_exit = 0
 
 [[case]]
 id = "edit.sfs.put-get"
-description = """F-009 (filed as R-032 until 2026-08-10): the SFS editor writes
-single-leaf extent b-trees only, so any volume of real size — including this
-reference disk — refuses a write, cleanly.
+description = """F-009: writing to an SFS volume of real size. This case spent
+its first life asserting the refusal — the editor handled a single-leaf extent
+B-tree and this reference disk has three levels, so `put` exited 4 naming the
+ceiling. Its own note said it would flip back to a round-trip when multi-leaf
+insert landed, which it now has.
 
-Reclassified rather than fixed: the driver has documented this ceiling all
-along (CLAUDE.md: "single-leaf btree only"), so hitting it is the limit working
-as described, not code disagreeing with itself. What was wrong is how it
-refused — a Parse error, which blames the disk, exiting 1. The disk is fine and
-reads perfectly.
+Two ceilings had to go, not one. The extent B-tree splits and grows a root; and
+the object-node tree, a different structure entirely, was walked rather than
+assumed to be a single leaf — it refused every write on a real volume the
+moment the first ceiling stopped hiding it.
 
-This case now pins the refusal: Unsupported, exit 4, and the volume still
-readable afterwards. When multi-leaf insert lands it becomes an XPASS and the
-case flips back to asserting the round-trip."""
+No fsck step, unlike the AFFS cases above. This fixture carries one orphan
+block in its pristine state — a block marked allocated that nothing references,
+present before rusty-backup ever opened it — so `fsck --checkonly` exits
+non-zero on the untouched image and a clean-fsck assertion here would be
+asserting something false. What matters is that a write adds nothing to that:
+verified by hand at 300 files imported, where the count stayed at exactly one."""
 fixture = "fs.sfs.workbench-dh0.hd"
 timeout_ms = 600000
 [[case.step]]
 args = ["put", "{fixture_copy}", "{cases}/tier3/payload.bin", "/payload.bin", "--fs-type", "SFS\\0"]
-expect_exit = 4
-stderr_contains = ["single-leaf"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{fixture_copy}", "/payload.bin", "{scratch}/out.bin", "--fs-type", "SFS\\0"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
 [[case.step]]
 args = ["ls", "{fixture_copy}", "/", "--fs-type", "SFS\\0"]
 expect_exit = 0
+stdout_contains = ["payload.bin"]
 [[case]]
 id = "edit.pfs3.put-get"
 description = "PFS3 edit round-trip against the catalogued RDB volume"

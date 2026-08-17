@@ -109,7 +109,7 @@ Amiga images (`.adf`, `.hdf`, `.adz`, `.hdz`, and CHD-wrapped HDFs) and the thre
 - **Filesystems**:
   - **AFFS** (`src/fs/affs.rs`) — DOS\0..DOS\7, read + edit + Disk Validator fsck. Files inherit `amiga_protection` (offset 0x140) and `amiga_comment` (BSTR at 0x148) via `CreateFileOptions`; the same fields surface on `FileEntry` for the browse view.
   - **PFS3** (`src/fs/pfs3.rs`) — PFS\3, PDS\3, muFS. Read + edit (allocator + EditableFilesystem with snapshot/rollback). `create_blank_pfs3` formats a blank volume for tests.
-  - **SFS** (`src/fs/sfs.rs`) — SFS\0, SFS\2. Read + edit (single-leaf btree only); journal blocks (TRST/TRFA) are not maintained — we use sync-boundary atomicity instead. `create_blank_sfs` formats a blank volume.
+  - **SFS** (`src/fs/sfs.rs`) — SFS\0, SFS\2. Read + edit at any B-tree depth: the extent B-tree splits, promotes a new root and prunes emptied nodes, and the object-node tree is walked rather than assumed to be one leaf. *Growing* the object-node tree is still unimplemented, so a volume reports DiskFull once every existing leaf is full. Journal blocks (TRST/TRFA) are not maintained — we use sync-boundary atomicity instead. `create_blank_sfs` formats a blank volume.
 - **Bitmap convention**: All three filesystems use **set bit = free** (opposite of most other FS we deal with). Easy bug source.
 - **Endianness**: every multi-byte field on Amiga disks is big-endian. Easy bug source #2.
 - **`.adz` / `.hdz`**: the GUI helper `gui::materialize_amiga_image_path` decompresses gzip-wrapped images to a tempfile at file-pick time. Each tab keeps a `tempfile::TempDir` guard alive for the lifetime of `image_file_path`.

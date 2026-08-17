@@ -19,7 +19,7 @@ concrete reason to.
 | [F-006](#f-006) | IRIX support-disk building / browsing is thin | `src/cli/verbs/new_sgi_cdrom.rs` | bootable IRIX discs — **scoped**; step 1 (header validated by IRIX) done, steps 2-3 open |
 | ~~F-007~~ | ~~No optical fixture with nested directories~~ — **SHIPPED** 2026-08-17 | `regression-tests/` | — |
 | ~~F-008~~ | ~~`backup` reads only flat-layout sources~~ — **SHIPPED** 2026-08-15 | `src/cli/verbs/backup.rs` | — |
-| [F-009](#f-009) | SFS editor writes single-leaf extent b-trees only | `src/fs/sfs.rs` | editing any real-sized SFS volume |
+| ~~F-009~~ | ~~SFS editor writes single-leaf extent b-trees only~~ — **SHIPPED** 2026-08-17 | `src/fs/sfs.rs` | — |
 | ~~F-004~~ | ~~`show partmap` is APM-only~~ — **SHIPPED** 2026-08-08, same gap as R-026 | `src/cli/verbs/show.rs` | — |
 
 ---
@@ -496,6 +496,45 @@ an artifact of how the synthetic containers were built.
    to the wrong container. Use explicit paths per case.
 
 ## F-009 — the SFS editor writes single-leaf extent b-trees only {#f-009}
+
+**SHIPPED 2026-08-17.** The extent B-tree now descends, splits a full node in
+half, promotes the new sibling's first key, and grows a level when the split
+reaches the root; emptied nodes are unlinked and their blocks freed, and a root
+left with one child collapses into it. `edit.sfs.put-get` flipped from
+asserting the refusal to asserting the round-trip, exactly as its own note
+predicted.
+
+Three things the estimate below did not anticipate, all found by reading the
+reference volume before writing any code:
+
+- **Half the job did not exist.** Separators are only `<=` their subtree's
+  minimum, not equal to it — five interior entries in the reference volume sit
+  below their child's first key, left behind by deletes. So there are no parent
+  updates to maintain on removal, and "node splitting, root promotion and
+  parent updates" reduced to the first two.
+- **A prerequisite was broken.** `alloc_admin_block` could not have worked on
+  any real volume: the AdminSpaceContainer layout was four bytes off in reader,
+  writer and allocator alike. Split needs blocks, so this had to land first —
+  [R-042](Regression_Bugs.md#r-042).
+- **A second ceiling sat behind the first.** Object nodes live in a different
+  structure — a fixed-fan-out index, not a B-tree — and its allocator assumed a
+  single leaf too. It refused every write on a real volume the moment the
+  extent tree stopped refusing first. Now walked; *growing* it remains
+  unimplemented, which is what limits a real volume to ~926 new files rather
+  than unlimited. That is the honest remainder of this entry and is tracked in
+  CLAUDE.md rather than reopened here.
+
+**The emulator proof is still outstanding.** The claim below that validation is
+"no longer the hard part" did not survive contact: `oracles/fsuae/sfs_mount.py`
+is written and discriminates correctly, but on 2026-08-17 the *AFFS* oracle —
+the one that closed R-020 — also stopped reaching its sentinel on the same
+host. Until that environment is working again, no FS-UAE run here is evidence
+about anything, which is precisely what its own control rule says. See that
+script's status note.
+
+---
+
+### Original report
 
 Filed as defect [R-032](Regression_Bugs.md#r-032) until 2026-08-10.
 **Reclassified**: the driver has always documented this ceiling — CLAUDE.md

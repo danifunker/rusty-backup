@@ -75,3 +75,40 @@ The probe *replaces* the fixture's `S/Startup-Sequence` rather than appending to
 it. Workbench 1.3's own startup — `Mount NEWCON:`, `Resident`, then Amiga
 Forever's `Execute S:AFShared-Startup` — never reaches an appended probe under
 Kickstart 3.1. All this test needs is a shell, `Info`, `List` and `Echo`.
+
+## Status, 2026-08-17 — `sfs_mount.py` written; the environment stopped answering
+
+`sfs_mount.py` is the SFS counterpart, built for F-009. It stages the handler
+into the guest's `L:`, generates a MountList whose geometry covers the image
+exactly, mounts with a 3.x `Mount` lifted out of the SFS reference fixture's
+own `C:` (Workbench 1.3's `Mount` builds a device node the handler will not
+start from), and separates its outcomes the same way the AFFS oracle does.
+
+It does not yet produce a verdict, and **the reason is not SFS**. Every SFS run
+reports `absent` with `Can't examine "SFSTEST:": not enough memory available`
+and no DH1: unit in `Info` at all — but running `affs_mount.py` against its own
+documented control on the same host the same afternoon does not even reach the
+sentinel, where on 2026-08-14 it mounted cleanly and closed R-020.
+
+So the emulator environment regressed out from under both scripts, and by this
+directory's own control rule that disqualifies every SFS result taken with it.
+None of them are evidence about our bytes. Fixing that is an environment
+problem — FS-UAE version, kickstart set, or the Amiga Forever profile the boot
+directory is unpacked from — and it has to be settled before either oracle is
+quoted again.
+
+Both staged assets are corpus, not repo. The handler ships with the fixture
+set; the `Mount` is read out of the SFS reference volume with our own tool:
+
+    rb-cli get <sfs-fixture> /C/Mount \
+        regression-tests/fixtures/oracle-assets/amiga/Mount-3x
+
+Routes already eliminated for the SFS mount, so nobody repeats them:
+
+- `Mount SFSTEST: from <file>` — 1.3's `Mount` predates the `from` keyword.
+- `uaehf.device` unit 1 — FS-UAE numbers units across hardfiles only, and the
+  two directory drives do not consume one, so the artifact is unit 0.
+- `hard_drive_1_file_system` in the FS-UAE config — changes nothing.
+- `List` before the sentinel — on an unmounted volume it blocks on AmigaDOS's
+  "please insert volume" requester until the timeout, which is indistinguishable
+  from a guest that never booted. The sentinel is written before it now.
