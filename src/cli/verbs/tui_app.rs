@@ -2617,20 +2617,20 @@ impl CommanderState {
                     return;
                 }
             };
-            with_stderr_suppressed(|| -> Result<(), String> {
-                for e in &entries {
-                    crate::fs::fork_export::export_file_with_fork(
-                        fs,
-                        e,
-                        &dest_dir,
-                        &e.name,
-                        RfMode::AppleDouble,
-                    )
-                    .map_err(|err| format!("Copy failed on {}: {err:#}", e.name))?;
-                }
-                Ok(())
+            // Through the shared recursive walker: a selected folder has to be
+            // rebuilt on the host with its whole subtree, forks included. The
+            // flat loop this replaces wrote a directory as a zero-byte file and
+            // reported success (R-041).
+            with_stderr_suppressed(|| {
+                crate::model::commander_ops::export_fs_entries_to_host(
+                    fs,
+                    &entries,
+                    &dest_dir,
+                    RfMode::AppleDouble,
+                )
             })
-            .map(|()| format!("Copied {label} to the host."))
+            .map(|n| format!("Copied {n} item(s) to the host."))
+            .map_err(|e| format!("Copy failed: {e:#}"))
         } else if src.is_host && dst.is_host {
             let dest_dir = match dst.listing.cwd() {
                 Some(e) => std::path::PathBuf::from(&e.path),

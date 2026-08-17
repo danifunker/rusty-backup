@@ -23,7 +23,8 @@ use eframe::egui;
 
 use rusty_backup::fs::entry::FileEntry;
 use rusty_backup::fs::export_selection::ExportFormat;
-use rusty_backup::fs::fork_export::{export_file_with_fork, safe_name};
+#[allow(unused_imports)] // referenced from a doc comment below
+use rusty_backup::fs::fork_export::export_file_with_fork;
 use rusty_backup::fs::resource_fork::ResourceForkMode;
 use rusty_backup::model::checksum::{self, ChecksumJob, ChecksumStatus};
 use rusty_backup::model::commander_ops::{
@@ -666,12 +667,14 @@ impl CommanderMode {
                 let Some(src_fs) = src.fs_mut() else {
                     return "Source volume is not open.".to_string();
                 };
-                match extract_entries_to_host(src_fs, &entries, &dest_dir, fork_mode) {
+                match commander_ops::export_fs_entries_to_host(
+                    src_fs, &entries, &dest_dir, fork_mode,
+                ) {
                     Ok(n) => {
                         dest.reload_listing();
                         format!("Copied {n} item(s) to the {other} folder.")
                     }
-                    Err(e) => format!("Copy failed: {e}"),
+                    Err(e) => format!("Copy failed: {e:#}"),
                 }
             }
             // host -> host: immediate filesystem copy on a worker thread.
@@ -1325,35 +1328,6 @@ impl CommanderMode {
             self.show_log = false;
         }
     }
-}
-
-/// Local-time `HH:MM:SS` stamp prefixed to each session-log entry.
-/// Recursively extract `entries` from a source filesystem to a host directory.
-/// Used for a remote image -> host copy, where there's no local `BrowseSession`
-/// for the threaded host-copy job — the remote `Filesystem` streams the bytes
-/// over the wire via `write_file_to`.
-fn extract_entries_to_host(
-    src_fs: &mut dyn rusty_backup::fs::filesystem::Filesystem,
-    entries: &[FileEntry],
-    dest_dir: &std::path::Path,
-    fork_mode: ResourceForkMode,
-) -> std::io::Result<usize> {
-    let mut count = 0;
-    for e in entries {
-        if e.is_directory() {
-            let target = dest_dir.join(&e.name);
-            std::fs::create_dir_all(&target)?;
-            let children = src_fs
-                .list_directory(e)
-                .map_err(|err| rusty_backup::compat::io_other(err.to_string()))?;
-            count += extract_entries_to_host(src_fs, &children, &target, fork_mode)?;
-        } else {
-            export_file_with_fork(src_fs, e, dest_dir, &safe_name(e), fork_mode)
-                .map_err(|err| rusty_backup::compat::io_other(format!("{err:#}")))?;
-            count += 1;
-        }
-    }
-    Ok(count)
 }
 
 fn log_timestamp() -> String {

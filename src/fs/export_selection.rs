@@ -238,10 +238,19 @@ fn read_data_fork(fs: &mut dyn Filesystem, e: &FileEntry) -> Result<Vec<u8>> {
 }
 
 /// Read a file's resource fork (empty when it has none).
-fn read_resource_fork(fs: &mut dyn Filesystem, e: &FileEntry) -> Vec<u8> {
+///
+/// Only asked of entries that claim one: the trait default is `Ok(0)`, so an
+/// error here means a fork that exists could not be decoded — an unsupported
+/// StuffIt method, a bad CRC, a truncated archive. Swallowing that wrote a
+/// silently fork-less `.zip` / `.sit` and called it a success (R-041).
+fn read_resource_fork(fs: &mut dyn Filesystem, e: &FileEntry) -> Result<Vec<u8>> {
+    if e.resource_fork_size.unwrap_or(0) == 0 {
+        return Ok(Vec::new());
+    }
     let mut buf = Vec::new();
-    let _ = fs.write_resource_fork_to(e, &mut buf);
-    buf
+    fs.write_resource_fork_to(e, &mut buf)
+        .with_context(|| format!("reading resource fork of '{}'", e.name))?;
+    Ok(buf)
 }
 
 /// Gzip/zstd one file's data fork to `<dest_dir>/<name>.<ext>`.
@@ -392,7 +401,7 @@ fn zip_recurse<W: Write + std::io::Seek>(
                 zw.write_all(&data)?;
                 // Preserve a Mac resource fork / Finder info as the AppleDouble
                 // sidecar macOS' own Archive Utility writes into a zip.
-                let rsrc = read_resource_fork(fs, e);
+                let rsrc = read_resource_fork(fs, e)?;
                 if !rsrc.is_empty() || e.type_code.is_some() {
                     let ad = build_appledouble(
                         &e.type_code.unwrap_or([0; 4]),
@@ -477,7 +486,7 @@ fn sit_nodes(
             }
             EntryType::File => {
                 let data = read_data_fork(fs, e)?;
-                let rsrc = read_resource_fork(fs, e);
+                let rsrc = read_resource_fork(fs, e)?;
                 let (create, modify) = sit_dates(e);
                 summary.files += 1;
                 summary.bytes = summary.bytes.saturating_add(data.len() as u64);
