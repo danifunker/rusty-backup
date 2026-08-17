@@ -524,13 +524,18 @@ reference volume before writing any code:
   than unlimited. That is the honest remainder of this entry and is tracked in
   CLAUDE.md rather than reopened here.
 
-**The emulator proof is still outstanding.** The claim below that validation is
-"no longer the hard part" did not survive contact: `oracles/fsuae/sfs_mount.py`
-is written and discriminates correctly, but on 2026-08-17 the *AFFS* oracle —
-the one that closed R-020 — also stopped reaching its sentinel on the same
-host. Until that environment is working again, no FS-UAE run here is evidence
-about anything, which is precisely what its own control rule says. See that
-script's status note.
+**The emulator proof is still outstanding.** `oracles/fsuae/sfs_mount.py` is
+written and separates its outcomes correctly, but no SFS volume mounts under it
+yet: the guest reports `not enough memory available` when the handler starts.
+
+An earlier version of this paragraph blamed the FS-UAE environment, on the
+evidence that the AFFS oracle had also stopped answering. That was a bad
+control — it was handed the bootable Workbench fixture as its artifact, so the
+guest had two bootable volumes and never ran the probe. Against an ordinary
+AFFS volume it mounts exactly as it did when it closed R-020. The environment
+is fine; the SFS mount is its own problem, and the remaining lead is WinUAE,
+whose `hardfile2` filesystem field FS-UAE strips. See that script's status note
+for the four routes already eliminated.
 
 ---
 

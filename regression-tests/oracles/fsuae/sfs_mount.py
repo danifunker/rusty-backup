@@ -244,7 +244,15 @@ def build_boot_dir(workdir: Path, wb_fixture: Path, handler: Path) -> Path:
 
 
 def write_config(
-    workdir: Path, boot: Path, artifact: Path, results: Path, kickstart: Path
+    workdir: Path,
+    boot: Path,
+    artifact: Path,
+    results: Path,
+    kickstart: Path,
+    handler: Optional[Path] = None,
+    surfaces: int = 0,
+    sectors: int = 0,
+    reserved: int = 0,
 ) -> Path:
     cfg = workdir / "sfs-probe.fs-uae"
     # Forward slashes throughout: FS-UAE's config parser treats a backslash as
@@ -327,7 +335,17 @@ def run(args) -> int:
     under_test = workdir / "under-test.hdf"
     shutil.copyfile(image, under_test)
     under_test.chmod(0o644)
-    cfg = write_config(workdir, boot, under_test, results, kickstart)
+    cfg = write_config(
+        workdir,
+        boot,
+        under_test,
+        results,
+        kickstart,
+        Path(args.handler).resolve() if args.attach else None,
+        geo[0],
+        geo[1],
+        args.reserved,
+    )
 
     print(f"fs-uae     : {fs_uae}")
     print(f"kickstart  : {kickstart.name}")
@@ -400,7 +418,7 @@ def main() -> int:
     ap.add_argument(
         "--unit",
         type=int,
-        default=0,
+        default=1,
         help="uaehf.device unit for the volume. FS-UAE numbers units across "
         "hardfiles only, so the directory drives on hard_drive_0/2 do not "
         "consume one and the artifact is unit 0, not 1",
@@ -408,8 +426,14 @@ def main() -> int:
     ap.add_argument(
         "--reserved",
         type=int,
-        default=0,
+        default=1,
         help="MountList Reserved blocks ahead of the SFS root block",
+    )
+    ap.add_argument(
+        "--attach",
+        action="store_true",
+        help="attach the SFS handler to the hardfile via uae_hardfile2 instead "
+        "of mounting from the guest MountList",
     )
     ap.add_argument("--workdir", default="regression-tests/scratch/fsuae-sfs")
     ap.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
