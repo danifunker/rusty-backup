@@ -18,7 +18,9 @@ A freshly-formatted blank Human68k floppy from the MiSTer X68000
 core distribution. Sharp `.d88` container wrapping a FAT12-derived
 Human68k volume.
 
-**Blocked by:** `.d88` container decoder (parked under
+**Unblocked 2026-08-17 — the `.d88` container decoder shipped** (README documents any-to-any `.d88` / `.xdf` / `.hdm` / `.dim` conversion and in-place edit), so this anchor is consumable now. Original note follows.
+
+**Was blocked by:** `.d88` container decoder (parked under
 `docs/mister_filesystem_implementation_plan.md` §3.2). Once that
 ships, `src/fs/human68k.rs` (already implemented + write-path-ready)
 can validate against this disk byte-for-byte.

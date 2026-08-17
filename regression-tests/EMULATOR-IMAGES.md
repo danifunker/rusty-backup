@@ -56,7 +56,9 @@ Rust, and Dani is on its development team — which makes it both the better
 technical target and the one where a problem can actually get fixed rather
 than worked around. Being Rust, it should also be straightforward to drive
 headlessly from the harness and to build on any host the suite runs on.
-Confirm its scripting/automation surface when building the profile.
+**Confirmed 2026-08-13** — `iris-ci` drives it headlessly (put / run / scratch
+read+write / snapshot rollback, with `run` returning guest stdout). Recipe and
+the traps that cost time: `oracles/iris/README.md`.
 
 What it can verify once booted:
 
@@ -117,7 +119,9 @@ so no gigabytes crossed the network:
 **This closes the PFS3 oracle gap at 960 MB instead of 21 GB.** A booted
 Workbench 1.3 or 2.1 runs PFS3's own tooling against volumes we write.
 
-**SFS is still uncovered.** Every Amiga disk on the board is PFS or AFFS —
+**SFS is not yet *wired*** (it used to be "uncovered", which is no longer the
+same thing — F-003 means we can build a volume, and the FS-UAE harness exists;
+only the guest-side handler is missing). Every Amiga disk on the board is PFS or AFFS —
 nothing uses SFS. It remains the one Amiga filesystem with no oracle
 anywhere.
 

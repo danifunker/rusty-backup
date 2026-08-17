@@ -1,5 +1,11 @@
 # Prompt: two cue-sheet fixes for `opticaldiscs-rs`
 
+> **SUPERSEDED 2026-08-10 — both defects are fixed upstream and our pin is
+> now `opticaldiscs = "0.15.0"` (`Cargo.toml`). R-012 and R-015 are closed.
+> The version numbers below (0.13.0 / 0.14.0) are left as written: this is
+> the report that produced the fix, not a description of today.**
+
+
 Paste into a session working on the `opticaldiscs-rs` checkout. Both defects
 were found by rusty-backup's regression suite against real-world media and are
 tracked there as R-015 and R-012.

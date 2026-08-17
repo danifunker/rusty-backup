@@ -108,7 +108,7 @@ logic in pure functions and test those).
 
 - `rb-cli reformat` (format **in place** into an existing partition) supports
   **HFS only**. It hard-bails on anything else — `verbs/reformat.rs:52`.
-- `rb-cli new volume <fs>` / `new floppy <fs>` create ~17 filesystems, but as
+- `rb-cli new volume <fs>` / `new floppy <fs>` create ~19 filesystems (pfs3 and sfs added by F-003, 2026-08-15), but as
   **standalone bare volume images**, not into a partition.
 - The GUI has **no** blank-volume creation surface at all.
 
