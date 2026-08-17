@@ -2730,11 +2730,20 @@ fn a_failed_upload_does_not_desync_the_connection() {
     let host_tmp = tempfile::tempdir().unwrap();
     let good = host_tmp.path().join("good.bin");
     std::fs::write(&good, vec![0x5Au8; 2048]).unwrap();
-    // A DIRECTORY, deliberately. A missing path would not reproduce this: the
-    // old code called `metadata()` before announcing, so a stat failure was
-    // already safe. A directory stats fine and then fails at the read — which
-    // in the old ordering happened *after* the frame was on the wire. Windows
-    // fails the open; Unix opens it and fails the copy; both desynced.
+    // A DIRECTORY, deliberately, and the choice is load-bearing on two axes.
+    //
+    // A *missing* path would not reproduce anything: the code stats before
+    // announcing, so a stat failure was always safe.
+    //
+    // A directory diverges by platform, which is the whole point. Windows
+    // fails `File::open` outright. Unix opens a directory happily and only
+    // fails at the read — so on Unix the request was already on the wire, the
+    // daemon had already answered, and bailing without reading that answer
+    // left the connection one reply behind. Every later call then read the
+    // previous call's response, and the first visible symptom was `apply`
+    // getting `Ok` instead of `Applied`. CI caught that on macOS and Linux
+    // while Windows stayed green — which is why this assertion set checks the
+    // *reply type*, not just that the connection is alive.
     let doomed = host_tmp.path().join("a-directory");
     std::fs::create_dir(&doomed).unwrap();
 
