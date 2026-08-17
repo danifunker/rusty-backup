@@ -1343,10 +1343,11 @@ impl<R: Read + Seek> Read for CompactSfsReader<R> {
 //     has ~43 slots whose `fsObjectNode.data` field is 0 (free). We mark
 //     a free slot by storing the new object's OBJC block in `data` and
 //     return `nodenumber + slot_idx` as the new objectnode.
-//   - Extent B-tree (BNDC): for a single-leaf btree we insert sorted
-//     `fsExtentBNode` records on `create_file` and remove them on delete.
-//     Splits/rebalance are deferred — the test image's leaf has room for
-//     dozens of entries.
+//   - Extent B-tree (BNDC): sorted `fsExtentBNode` records inserted on
+//     `create_file` and removed on delete, at any depth. A full node splits
+//     in half and promotes the new sibling's first key; a split at the root
+//     grows a level with 0 as the new leftmost separator. An emptied node is
+//     unlinked and its block freed.
 //   - ObjectContainer chain: each directory keeps a singly-linked OBJC
 //     chain via fsObject.dir.firstdirblock → OBJC.next. Inserts splice
 //     into the first OBJC with room, growing the chain by allocating a
@@ -1359,14 +1360,58 @@ impl<R: Read + Seek> Read for CompactSfsReader<R> {
 //     at block 4 is left untouched; we rely on sync-boundary atomicity
 //     by writing dirty buffers followed by both root copies with bumped
 //     sequencenumber.
-//   - B-tree splits (extent btree or object-node tree). DiskFull is
-//     surfaced if the leaf overflows.
+//   - Object-node tree splits. The extent B-tree splits (see above); the
+//     object-node NodeContainer does not, so DiskFull is surfaced when its
+//     leaf runs out of free slots.
+//   - Rebalancing on delete. A node that falls below half full is left
+//     thin, which is what SFS does itself — real volumes carry leaves at
+//     exactly half. Only a fully emptied node is unlinked.
 //   - HashTable maintenance — the dir.hashtable field stays zero on
 //     fresh OBJC chains. Reading code in `walk_directory_chain` only
 //     walks the OBJC chain, so this is functionally invisible.
 
 const FS_EXTENTBNODE_SIZE: usize = 14;
 const FS_OBJECTNODE_SIZE: usize = 10;
+/// An interior BNode is (separator, child block) — half the width of a leaf's
+/// fsExtentBNode, which is why a node's own `nodesize` byte has to be believed
+/// rather than assumed.
+const FS_BNODE_SIZE: usize = 8;
+/// BTreeContainer: nodecount at 12, isleaf at 14, nodesize at 15, entries here.
+const BTREE_ENTRIES_OFF: usize = 16;
+/// Descent bound. A 512-byte block fans out 62 ways, so even three levels index
+/// far more extents than a 32-bit block number can address; anything deeper is
+/// a corrupt `next` loop, not a real tree.
+const SFS_BTREE_MAX_DEPTH: usize = 16;
+/// NodeContainer entries start after nodenumber and nodes.
+const NDC_ENTRIES_OFF: usize = 20;
+/// Node-tree walk bound. The 500 MB reference volume visits ~50 containers, so
+/// this is loop protection, not a real ceiling.
+const SFS_NODE_TREE_MAX_VISITS: usize = 100_000;
+
+/// `(nodecount, isleaf, nodesize)` from a BTreeContainer header.
+fn node_header(buf: &[u8]) -> (usize, bool, usize) {
+    (rd_u16(buf, 12) as usize, buf[14] != 0, buf[15] as usize)
+}
+
+/// How many entries of `nodesize` bytes a block of `block_len` can hold.
+fn node_capacity(block_len: usize, nodesize: usize) -> usize {
+    (block_len - BTREE_ENTRIES_OFF) / nodesize.max(1)
+}
+
+/// Drop entry `idx`, sliding the tail down and clearing the vacated slot so a
+/// stale record can never be read back as live.
+fn node_remove_at(buf: &mut [u8], idx: usize, nodecount: usize, nodesize: usize) {
+    let from = BTREE_ENTRIES_OFF + (idx + 1) * nodesize;
+    let to = BTREE_ENTRIES_OFF + nodecount * nodesize;
+    if from < to {
+        buf.copy_within(from..to, BTREE_ENTRIES_OFF + idx * nodesize);
+    }
+    let last = BTREE_ENTRIES_OFF + (nodecount - 1) * nodesize;
+    for b in &mut buf[last..last + nodesize] {
+        *b = 0;
+    }
+    write_u16(buf, 12, (nodecount - 1) as u16);
+}
 
 // fsAdminSpaceContainer, verified byte-for-byte against real SFS volumes
 // (R-042): 12B fsBlockHeader, next, previous, the blocks-per-region byte with
@@ -1381,21 +1426,6 @@ const ADMC_ENTRY_SIZE: usize = 8;
 const ADMC_MAX_REGION: u32 = 32;
 /// Chain-walk bound, so a corrupt `next` cycle cannot hang a mount.
 const ADMC_MAX_CONTAINERS: usize = 4096;
-
-/// The SFS editor's ceiling, reported as `Unsupported` rather than `Parse`.
-///
-/// A `Parse` error blamed the disk and exited 1, indistinguishable from a
-/// corrupt image — R-034's shape. The volume is intact and reads fine; only
-/// writing is refused. `Unsupported` routes through `write_open_error` to
-/// PERMISSION_DENIED (4). Tracked as F-009.
-fn multi_leaf_unsupported() -> FilesystemError {
-    FilesystemError::Unsupported(
-        "SFS extent b-tree has interior nodes; this editor writes single-leaf trees only, \
-         which any volume of real size outgrows. The volume is intact and readable — only \
-         writing is refused."
-            .to_string(),
-    )
-}
 
 impl SfsRootBlock {
     /// Write the rootblock fields into the first portion of the block
@@ -1629,59 +1659,123 @@ impl<R: Read + Seek> SfsFilesystem<R> {
     /// Allocate a new object-node by finding a free fsObjectNode slot in
     /// the leaf NodeContainer (data==0). Stores `data` = `obj_blk` and
     /// returns the new objectnode number.
+    /// The first free `fsObjectNode` slot anywhere in the node tree, as
+    /// `(leaf, slot, objectnode)`. Unlike the extent B-tree this is a
+    /// fixed-fan-out tree indexed by node number, so there is no key to search
+    /// on — a free slot is wherever one happens to be. Each container records
+    /// its own `nodenumber` base, so the objectnode falls straight out of it.
+    fn find_free_object_node(&mut self) -> Result<Option<(u32, usize, u32)>, FilesystemError> {
+        let shifts = self.root.blocksize.trailing_zeros().saturating_sub(5);
+        let mut stack = vec![self.root.objectnoderoot];
+        let mut visited = 0usize;
+        while let Some(blk) = stack.pop() {
+            if blk == 0 {
+                continue;
+            }
+            visited += 1;
+            if visited > SFS_NODE_TREE_MAX_VISITS {
+                return Err(parse_err("object-node tree walk did not terminate"));
+            }
+            let buf = self.read_block(blk)?.to_vec();
+            validate_block(&buf, NODECONTAINER_ID, blk)?;
+            let nodenumber = rd_u32(&buf, 12);
+            let nodes = rd_u32(&buf, 16);
+            if nodes == 0 {
+                return Err(parse_err("NodeContainer.nodes == 0"));
+            }
+            let stride = if nodes == 1 { FS_OBJECTNODE_SIZE } else { 4 };
+            let slots = (buf.len() - NDC_ENTRIES_OFF) / stride;
+            if nodes == 1 {
+                for slot in 0..slots {
+                    if rd_u32(&buf, NDC_ENTRIES_OFF + slot * stride) == 0 {
+                        return Ok(Some((blk, slot, nodenumber + slot as u32)));
+                    }
+                }
+            } else {
+                // Reverse order so the walk runs left to right, keeping new
+                // object numbers as dense as the Amiga's own allocation does.
+                for slot in (0..slots).rev() {
+                    let entry = rd_u32(&buf, NDC_ENTRIES_OFF + slot * 4);
+                    if entry != 0 {
+                        stack.push(entry >> shifts);
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Claim a free object-node for the object living at `obj_blk`.
+    ///
+    /// The internal entries' low "container is full" flag is deliberately left
+    /// as found: our reader masks it away, and since it is only a search hint,
+    /// a stale one costs a rescan rather than a wrong answer. Setting a bit
+    /// whose exact semantics we cannot check against the reference sources
+    /// would be the riskier choice.
     fn alloc_object_node(&mut self, obj_blk: u32) -> Result<u32, FilesystemError> {
-        let nc_blk = self.root.objectnoderoot;
-        self.ensure_dirty(nc_blk)?;
-        let buf = self.dirty.get_mut(&nc_blk).unwrap();
-        let nodenumber = rd_u32(buf, 12);
-        let nodes = rd_u32(buf, 16);
-        if nodes != 1 {
-            return Err(parse_err(
-                "alloc_object_node: only leaf NodeContainer supported",
-            ));
-        }
-        let bs = buf.len();
-        let max_slots = (bs - 20) / FS_OBJECTNODE_SIZE;
-        for slot in 0..max_slots {
-            let o = 20 + slot * FS_OBJECTNODE_SIZE;
-            if o + 4 > bs {
-                break;
+        let (leaf, slot, objectnode) = self.find_free_object_node()?.ok_or_else(|| {
+            FilesystemError::DiskFull(
+                "SFS: every object-node leaf is full, and growing the node tree is not \
+                 implemented — the volume can hold no further files or directories"
+                    .into(),
+            )
+        })?;
+        self.ensure_dirty(leaf)?;
+        let buf = self.dirty.get_mut(&leaf).unwrap();
+        // next + hash16 stay zero.
+        write_u32(buf, NDC_ENTRIES_OFF + slot * FS_OBJECTNODE_SIZE, obj_blk);
+        Ok(objectnode)
+    }
+
+    /// Descend the node tree to the leaf slot holding `objectnode`, mirroring
+    /// [`Self::lookup_object_block`]'s arithmetic: each level divides the
+    /// offset from the container's base by its per-entry span.
+    fn find_object_node_slot(&mut self, objectnode: u32) -> Result<(u32, usize), FilesystemError> {
+        let shifts = self.root.blocksize.trailing_zeros().saturating_sub(5);
+        let mut blk = self.root.objectnoderoot;
+        for _ in 0..SFS_BTREE_MAX_DEPTH {
+            let buf = self.read_block(blk)?.to_vec();
+            validate_block(&buf, NODECONTAINER_ID, blk)?;
+            let nodenumber = rd_u32(&buf, 12);
+            let nodes = rd_u32(&buf, 16);
+            if nodes == 0 {
+                return Err(parse_err("NodeContainer.nodes == 0"));
             }
-            let data = rd_u32(buf, o);
-            if data == 0 {
-                buf[o..o + 4].copy_from_slice(&obj_blk.to_be_bytes());
-                // next + hash16 stay zero.
-                return Ok(nodenumber + slot as u32);
+            if objectnode < nodenumber {
+                return Err(parse_err(format!(
+                    "object-node {objectnode} is below container base {nodenumber}"
+                )));
             }
+            let idx = ((objectnode - nodenumber) / nodes) as usize;
+            let stride = if nodes == 1 { FS_OBJECTNODE_SIZE } else { 4 };
+            let off = NDC_ENTRIES_OFF + idx * stride;
+            if off + 4 > buf.len() {
+                return Err(parse_err(format!(
+                    "object-node {objectnode} is outside its NodeContainer"
+                )));
+            }
+            if nodes == 1 {
+                return Ok((blk, idx));
+            }
+            let entry = rd_u32(&buf, off);
+            if entry == 0 {
+                return Err(parse_err(format!(
+                    "object-node {objectnode} has no mapping"
+                )));
+            }
+            blk = entry >> shifts;
         }
-        Err(FilesystemError::DiskFull(
-            "SFS: object-node leaf full (tree growth not implemented)".into(),
-        ))
+        Err(parse_err("object-node tree deeper than the depth limit"))
     }
 
     fn free_object_node(&mut self, objectnode: u32) -> Result<(), FilesystemError> {
-        let nc_blk = self.root.objectnoderoot;
-        self.ensure_dirty(nc_blk)?;
-        let buf = self.dirty.get_mut(&nc_blk).unwrap();
-        let nodenumber = rd_u32(buf, 12);
-        let nodes = rd_u32(buf, 16);
-        if nodes != 1 {
-            return Err(parse_err(
-                "free_object_node: only leaf NodeContainer supported",
-            ));
-        }
-        if objectnode < nodenumber {
-            return Err(parse_err(format!(
-                "free_object_node: {} below nodenumber {}",
-                objectnode, nodenumber
-            )));
-        }
-        let slot = (objectnode - nodenumber) as usize;
-        let o = 20 + slot * FS_OBJECTNODE_SIZE;
+        let (leaf, slot) = self.find_object_node_slot(objectnode)?;
+        self.ensure_dirty(leaf)?;
+        let buf = self.dirty.get_mut(&leaf).unwrap();
+        let o = NDC_ENTRIES_OFF + slot * FS_OBJECTNODE_SIZE;
         if o + FS_OBJECTNODE_SIZE > buf.len() {
             return Err(parse_err(format!(
-                "free_object_node: slot {} out of range",
-                slot
+                "free_object_node: slot {slot} out of range"
             )));
         }
         for b in &mut buf[o..o + FS_OBJECTNODE_SIZE] {
@@ -1690,101 +1784,313 @@ impl<R: Read + Seek> SfsFilesystem<R> {
         Ok(())
     }
 
-    /// Insert an extent record `(key=start_block, blocks=count)` into the
-    /// extent B-tree leaf. Records stay sorted by key. next/prev are
-    /// initialized to zero; we don't maintain the doubly-linked chain
-    /// because our reader only consults the btree to look up extents by
-    /// key.
-    fn extent_btree_insert(&mut self, key: u32, blocks: u32) -> Result<(), FilesystemError> {
-        let leaf_blk = self.root.extentbnoderoot;
-        self.ensure_dirty(leaf_blk)?;
-        let buf = self.dirty.get_mut(&leaf_blk).unwrap();
-        let bs = buf.len();
-        let mut nodecount = rd_u16(buf, 12) as usize;
-        let isleaf = buf[14];
-        let nodesize = buf[15] as usize;
-        if isleaf == 0 {
-            return Err(multi_leaf_unsupported());
+    /// Descend from the extent B-tree root to the leaf that should hold `key`,
+    /// returning the leaf plus every interior node visited with the entry index
+    /// taken. The path is what lets a split insert into its parent on the way
+    /// back up without a second search.
+    fn extent_btree_descend(
+        &mut self,
+        key: u32,
+    ) -> Result<(u32, Vec<(u32, usize)>), FilesystemError> {
+        let mut blk = self.root.extentbnoderoot;
+        if blk == 0 {
+            return Err(parse_err("extent B-tree has no root"));
         }
-        if nodesize != FS_EXTENTBNODE_SIZE {
+        let mut path = Vec::new();
+        for _ in 0..SFS_BTREE_MAX_DEPTH {
+            let buf = self.read_block(blk)?.to_vec();
+            validate_block(&buf, BNODECONTAINER_ID, blk)?;
+            let (nodecount, isleaf, nodesize) = node_header(&buf);
+            if isleaf {
+                if nodesize != FS_EXTENTBNODE_SIZE {
+                    return Err(parse_err(format!(
+                        "extent B-tree leaf nodesize {nodesize}, expected {FS_EXTENTBNODE_SIZE}"
+                    )));
+                }
+                return Ok((blk, path));
+            }
+            if nodesize != FS_BNODE_SIZE {
+                return Err(parse_err(format!(
+                    "extent B-tree interior nodesize {nodesize}, expected {FS_BNODE_SIZE}"
+                )));
+            }
+            if nodecount == 0 {
+                return Err(parse_err("extent B-tree interior node is empty"));
+            }
+            // Largest separator <= key, matching `lookup_extent`. A separator is
+            // only guaranteed to be <= its subtree's minimum — SFS leaves it
+            // behind when a delete removes the child's first record — so entry 0
+            // is the floor and never a miss.
+            let mut idx = 0usize;
+            for i in 0..nodecount {
+                if rd_u32(&buf, BTREE_ENTRIES_OFF + i * nodesize) > key {
+                    break;
+                }
+                idx = i;
+            }
+            path.push((blk, idx));
+            blk = rd_u32(&buf, BTREE_ENTRIES_OFF + idx * nodesize + 4);
+        }
+        Err(parse_err("extent B-tree deeper than the depth limit"))
+    }
+
+    /// Insert `record` into node `blk` at its sorted position. `Ok(false)` means
+    /// the node is full and the caller must split; nothing is written in that
+    /// case. `record` must be exactly the node's own `nodesize` bytes.
+    fn node_try_insert(
+        &mut self,
+        blk: u32,
+        key: u32,
+        record: &[u8],
+    ) -> Result<bool, FilesystemError> {
+        self.ensure_dirty(blk)?;
+        let buf = self.dirty.get_mut(&blk).unwrap();
+        let (nodecount, _, nodesize) = node_header(buf);
+        if record.len() != nodesize {
             return Err(parse_err(format!(
-                "extent_btree_insert: unexpected nodesize {}",
-                nodesize
+                "extent B-tree: {}-byte record into a {nodesize}-byte node",
+                record.len()
             )));
         }
-        let entries_off = 16;
-        let max = (bs - entries_off) / nodesize;
-        if nodecount >= max {
-            return Err(FilesystemError::DiskFull(
-                "SFS: extent B-tree leaf full (splits not implemented)".into(),
-            ));
+        if nodecount >= node_capacity(buf.len(), nodesize) {
+            return Ok(false);
         }
-        // Find insertion point (sorted by key).
         let mut idx = nodecount;
         for i in 0..nodecount {
-            let o = entries_off + i * nodesize;
-            let k = rd_u32(buf, o);
-            if key < k {
+            if key < rd_u32(buf, BTREE_ENTRIES_OFF + i * nodesize) {
                 idx = i;
                 break;
             }
         }
-        // Shift later entries right by one nodesize.
-        let shift_from = entries_off + idx * nodesize;
-        let shift_end = entries_off + nodecount * nodesize;
-        if shift_from < shift_end {
-            buf.copy_within(shift_from..shift_end, shift_from + nodesize);
+        let at = BTREE_ENTRIES_OFF + idx * nodesize;
+        let end = BTREE_ENTRIES_OFF + nodecount * nodesize;
+        if at < end {
+            buf.copy_within(at..end, at + nodesize);
         }
-        // Stamp the new record.
-        let o = shift_from;
-        write_u32(buf, o, key);
-        write_u32(buf, o + 4, 0); // next
-        write_u32(buf, o + 8, 0); // prev
-        write_u16(buf, o + 12, blocks as u16);
-        nodecount += 1;
-        write_u16(buf, 12, nodecount as u16);
+        buf[at..at + nodesize].copy_from_slice(record);
+        write_u16(buf, 12, (nodecount + 1) as u16);
+        Ok(true)
+    }
+
+    /// Split full node `blk` in half, moving the upper entries into a freshly
+    /// allocated sibling. Returns `(sibling, first_key_of_sibling)` — the key
+    /// the parent needs as the sibling's separator.
+    fn node_split(&mut self, blk: u32) -> Result<(u32, u32), FilesystemError> {
+        self.ensure_dirty(blk)?;
+        let (nodecount, isleaf, nodesize) = {
+            let buf = self.dirty.get(&blk).unwrap();
+            node_header(buf)
+        };
+        if nodecount < 2 {
+            return Err(parse_err("extent B-tree: cannot split a node of under two"));
+        }
+        let keep = nodecount / 2;
+        let moved: Vec<u8> = {
+            let buf = self.dirty.get(&blk).unwrap();
+            buf[BTREE_ENTRIES_OFF + keep * nodesize..BTREE_ENTRIES_OFF + nodecount * nodesize]
+                .to_vec()
+        };
+        // Allocation can fail; do it before either node is modified so a full
+        // volume leaves the tree exactly as it was.
+        let sibling = self.alloc_admin_block()?;
+        let bs = self.root.blocksize as usize;
+        let mut right = vec![0u8; bs];
+        write_u32(&mut right, 0, BNODECONTAINER_ID);
+        write_u32(&mut right, 8, sibling);
+        write_u16(&mut right, 12, (nodecount - keep) as u16);
+        right[14] = u8::from(isleaf);
+        right[15] = nodesize as u8;
+        right[BTREE_ENTRIES_OFF..BTREE_ENTRIES_OFF + moved.len()].copy_from_slice(&moved);
+        let first_key = rd_u32(&right, BTREE_ENTRIES_OFF);
+        self.dirty.insert(sibling, right);
+
+        let buf = self.dirty.get_mut(&blk).unwrap();
+        for b in
+            &mut buf[BTREE_ENTRIES_OFF + keep * nodesize..BTREE_ENTRIES_OFF + nodecount * nodesize]
+        {
+            *b = 0;
+        }
+        write_u16(buf, 12, keep as u16);
+        Ok((sibling, first_key))
+    }
+
+    /// Publish a freshly split-off `sibling` to its parent, splitting parents
+    /// as far up as needed and promoting a new root when the split reaches the
+    /// top. `path` is the descent from [`extent_btree_descend`], deepest last.
+    fn btree_publish_split(
+        &mut self,
+        mut path: Vec<(u32, usize)>,
+        mut sibling: u32,
+        mut sep: u32,
+    ) -> Result<(), FilesystemError> {
+        loop {
+            let mut entry = [0u8; FS_BNODE_SIZE];
+            write_u32(&mut entry, 0, sep);
+            write_u32(&mut entry, 4, sibling);
+            let Some((parent, _)) = path.pop() else {
+                // The node that split was the root: the tree grows a level. The
+                // new root's leftmost separator is 0, the invariant every level
+                // holds, so any key at all descends somewhere.
+                let old_root = self.root.extentbnoderoot;
+                let new_root = self.alloc_admin_block()?;
+                let bs = self.root.blocksize as usize;
+                let mut buf = vec![0u8; bs];
+                write_u32(&mut buf, 0, BNODECONTAINER_ID);
+                write_u32(&mut buf, 8, new_root);
+                write_u16(&mut buf, 12, 2);
+                buf[14] = 0;
+                buf[15] = FS_BNODE_SIZE as u8;
+                write_u32(&mut buf, BTREE_ENTRIES_OFF, 0);
+                write_u32(&mut buf, BTREE_ENTRIES_OFF + 4, old_root);
+                buf[BTREE_ENTRIES_OFF + FS_BNODE_SIZE..BTREE_ENTRIES_OFF + 2 * FS_BNODE_SIZE]
+                    .copy_from_slice(&entry);
+                self.dirty.insert(new_root, buf);
+                // `do_sync_metadata` rewrites both root copies from `self.root`
+                // on every flush, so moving the field is the whole update.
+                self.root.extentbnoderoot = new_root;
+                return Ok(());
+            };
+            if self.node_try_insert(parent, sep, &entry)? {
+                return Ok(());
+            }
+            let (parent_sibling, parent_sep) = self.node_split(parent)?;
+            let target = if sep < parent_sep {
+                parent
+            } else {
+                parent_sibling
+            };
+            if !self.node_try_insert(target, sep, &entry)? {
+                return Err(parse_err("extent B-tree: split interior node still full"));
+            }
+            sibling = parent_sibling;
+            sep = parent_sep;
+        }
+    }
+
+    /// Insert an extent record `(key=start_block, blocks=count)`, splitting and
+    /// growing the tree as needed. `next`/`prev` are left zero: they chain a
+    /// file's extents together and our reader consults the tree by key.
+    fn extent_btree_insert(&mut self, key: u32, blocks: u32) -> Result<(), FilesystemError> {
+        let (leaf, path) = self.extent_btree_descend(key)?;
+        let mut record = [0u8; FS_EXTENTBNODE_SIZE];
+        write_u32(&mut record, 0, key);
+        write_u16(&mut record, 12, blocks as u16);
+        if self.node_try_insert(leaf, key, &record)? {
+            return Ok(());
+        }
+        let (sibling, sep) = self.node_split(leaf)?;
+        let target = if key < sep { leaf } else { sibling };
+        if !self.node_try_insert(target, key, &record)? {
+            return Err(parse_err("extent B-tree: split leaf still full"));
+        }
+        self.btree_publish_split(path, sibling, sep)
+    }
+
+    /// Remove the extent record keyed `key`. An emptied non-root node is
+    /// unlinked from its parent and its block returned to admin space; parents
+    /// that empty out in turn are unlinked the same way. Nodes that merely fall
+    /// below half are left alone, which is what SFS itself does — a thin node
+    /// costs space, never correctness.
+    fn extent_btree_remove(&mut self, key: u32) -> Result<(), FilesystemError> {
+        let (leaf, path) = self.extent_btree_descend(key)?;
+        self.ensure_dirty(leaf)?;
+        let emptied = {
+            let buf = self.dirty.get_mut(&leaf).unwrap();
+            let (nodecount, _, nodesize) = node_header(buf);
+            let mut found = None;
+            for i in 0..nodecount {
+                if rd_u32(buf, BTREE_ENTRIES_OFF + i * nodesize) == key {
+                    found = Some(i);
+                    break;
+                }
+            }
+            let idx = found.ok_or_else(|| {
+                parse_err(format!("extent_btree_remove: key {key} not in its leaf"))
+            })?;
+            node_remove_at(buf, idx, nodecount, nodesize);
+            nodecount == 1
+        };
+        if emptied {
+            self.btree_prune_empty(leaf, path)?;
+            self.btree_collapse_root()?;
+        }
         Ok(())
     }
 
-    fn extent_btree_remove(&mut self, key: u32) -> Result<(), FilesystemError> {
-        let leaf_blk = self.root.extentbnoderoot;
-        self.ensure_dirty(leaf_blk)?;
-        let buf = self.dirty.get_mut(&leaf_blk).unwrap();
-        let bs = buf.len();
-        let mut nodecount = rd_u16(buf, 12) as usize;
-        let isleaf = buf[14];
-        let nodesize = buf[15] as usize;
-        if isleaf == 0 {
-            return Err(multi_leaf_unsupported());
-        }
-        let entries_off = 16;
-        let mut found: Option<usize> = None;
-        for i in 0..nodecount {
-            let o = entries_off + i * nodesize;
-            if rd_u32(buf, o) == key {
-                found = Some(i);
-                break;
+    /// Shrink the tree from the top after pruning: a root left with a single
+    /// child is replaced by that child, and a root that loses its last child
+    /// becomes an empty leaf again.
+    ///
+    /// Without this an emptied volume keeps a childless interior node as its
+    /// root, which no descent can get past — deleting every file would leave
+    /// the volume unable to accept another one.
+    fn btree_collapse_root(&mut self) -> Result<(), FilesystemError> {
+        for _ in 0..SFS_BTREE_MAX_DEPTH {
+            let root = self.root.extentbnoderoot;
+            let (nodecount, isleaf, nodesize) = {
+                let buf = self.read_block(root)?.to_vec();
+                node_header(&buf)
+            };
+            if isleaf {
+                return Ok(());
             }
+            if nodecount == 1 {
+                let child = {
+                    let buf = self.read_block(root)?.to_vec();
+                    rd_u32(&buf, BTREE_ENTRIES_OFF + 4)
+                };
+                self.root.extentbnoderoot = child;
+                self.free_admin_block(root)?;
+                // The new root inherits the leftmost separator duty.
+                if !node_header(self.read_block(child)?).1 {
+                    self.ensure_dirty(child)?;
+                    let buf = self.dirty.get_mut(&child).unwrap();
+                    write_u32(buf, BTREE_ENTRIES_OFF, 0);
+                }
+                continue;
+            }
+            if nodecount == 0 {
+                self.ensure_dirty(root)?;
+                let buf = self.dirty.get_mut(&root).unwrap();
+                buf[14] = 1;
+                buf[15] = FS_EXTENTBNODE_SIZE as u8;
+                let _ = nodesize;
+                return Ok(());
+            }
+            return Ok(());
         }
-        let idx = found.ok_or_else(|| {
-            parse_err(format!(
-                "extent_btree_remove: key {} not found in leaf",
-                key
-            ))
-        })?;
-        let from = entries_off + (idx + 1) * nodesize;
-        let to = entries_off + nodecount * nodesize;
-        if from < to {
-            buf.copy_within(from..to, entries_off + idx * nodesize);
+        Err(parse_err("extent B-tree root collapse did not terminate"))
+    }
+
+    /// Unlink now-empty node `blk` from its parent, freeing it, and repeat for
+    /// any parent left empty. The root is kept even when empty: an empty tree
+    /// still needs somewhere for the next insert to land.
+    fn btree_prune_empty(
+        &mut self,
+        mut blk: u32,
+        mut path: Vec<(u32, usize)>,
+    ) -> Result<(), FilesystemError> {
+        while let Some((parent, idx)) = path.pop() {
+            self.ensure_dirty(parent)?;
+            let parent_emptied = {
+                let buf = self.dirty.get_mut(&parent).unwrap();
+                let (nodecount, _, nodesize) = node_header(buf);
+                node_remove_at(buf, idx, nodecount, nodesize);
+                // Every level's leftmost separator is 0, so dropping entry 0
+                // hands that duty to whatever is now first. Lowering a separator
+                // is always safe: it can only widen the range that descends into
+                // a subtree, and a key that is not there still reads as absent.
+                if idx == 0 && nodecount > 1 {
+                    write_u32(buf, BTREE_ENTRIES_OFF, 0);
+                }
+                nodecount == 1
+            };
+            self.free_admin_block(blk)?;
+            if !parent_emptied {
+                return Ok(());
+            }
+            blk = parent;
         }
-        // Zero the now-unused trailing slot to keep the tail clean.
-        let last = entries_off + (nodecount - 1) * nodesize;
-        for b in &mut buf[last..last + nodesize] {
-            *b = 0;
-        }
-        nodecount -= 1;
-        write_u16(buf, 12, nodecount as u16);
-        let _ = bs;
         Ok(())
     }
 
@@ -3367,6 +3673,213 @@ mod tests {
         // total - admin(32) - bitmap(N) - reserved_start(1) - reserved_end(1)
         // = 8192 - 32 - 1 - 1 - 1 = 8157 (one BM block covers all 8192 bits).
         assert!(free >= 8000 * 512);
+    }
+
+    /// Node count per level of the extent B-tree, root first.
+    fn btree_shape<R: Read + Seek + Send>(fs: &mut SfsFilesystem<R>) -> Vec<usize> {
+        let mut shape = Vec::new();
+        let mut frontier = vec![fs.root.extentbnoderoot];
+        for _ in 0..SFS_BTREE_MAX_DEPTH {
+            shape.push(frontier.len());
+            let mut next = Vec::new();
+            let mut leaf = false;
+            for blk in &frontier {
+                let buf = fs.read_block(*blk).expect("read node").to_vec();
+                let (nodecount, isleaf, nodesize) = node_header(&buf);
+                if isleaf {
+                    leaf = true;
+                    continue;
+                }
+                for i in 0..nodecount {
+                    next.push(rd_u32(&buf, BTREE_ENTRIES_OFF + i * nodesize + 4));
+                }
+            }
+            if leaf || next.is_empty() {
+                break;
+            }
+            frontier = next;
+        }
+        shape
+    }
+
+    fn subtree_min_key<R: Read + Seek + Send>(fs: &mut SfsFilesystem<R>, blk: u32) -> Option<u32> {
+        let buf = fs.read_block(blk).expect("read node").to_vec();
+        let (nodecount, isleaf, nodesize) = node_header(&buf);
+        if nodecount == 0 {
+            return None;
+        }
+        if isleaf {
+            return Some(rd_u32(&buf, BTREE_ENTRIES_OFF));
+        }
+        (0..nodecount)
+            .filter_map(|i| subtree_min_key(fs, rd_u32(&buf, BTREE_ENTRIES_OFF + i * nodesize + 4)))
+            .min()
+    }
+
+    fn check_node<R: Read + Seek + Send>(fs: &mut SfsFilesystem<R>, blk: u32) {
+        let buf = fs.read_block(blk).expect("read node").to_vec();
+        let (nodecount, isleaf, nodesize) = node_header(&buf);
+        if isleaf {
+            let keys: Vec<u32> = (0..nodecount)
+                .map(|i| rd_u32(&buf, BTREE_ENTRIES_OFF + i * nodesize))
+                .collect();
+            assert!(keys.windows(2).all(|w| w[0] < w[1]), "leaf keys unsorted");
+            return;
+        }
+        assert_eq!(
+            rd_u32(&buf, BTREE_ENTRIES_OFF),
+            0,
+            "leftmost separator of node {blk} must be 0"
+        );
+        for i in 0..nodecount {
+            let o = BTREE_ENTRIES_OFF + i * nodesize;
+            let sep = rd_u32(&buf, o);
+            let child = rd_u32(&buf, o + 4);
+            if let Some(m) = subtree_min_key(fs, child) {
+                assert!(sep <= m, "separator {sep} above subtree min {m} in {blk}");
+            }
+            check_node(fs, child);
+        }
+    }
+
+    /// Every separator must be <= the smallest key beneath it, and each level's
+    /// leftmost must be 0. Those are the two properties `lookup_extent`'s
+    /// "largest separator <= key" descent relies on, and both were confirmed
+    /// against a real 500 MB volume before the split code was written.
+    fn assert_btree_invariants<R: Read + Seek + Send>(fs: &mut SfsFilesystem<R>) {
+        check_node(fs, fs.root.extentbnoderoot);
+    }
+
+    fn put_file<R: Read + Write + Seek + Send>(fs: &mut SfsFilesystem<R>, name: &str, len: usize) {
+        use super::super::filesystem::{CreateFileOptions, EditableFilesystem};
+        let payload = vec![b'x'; len];
+        let mut cur = std::io::Cursor::new(&payload);
+        let root = fs.root().expect("root");
+        EditableFilesystem::create_file(
+            fs,
+            &root,
+            name,
+            &mut cur,
+            payload.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .unwrap_or_else(|e| panic!("create_file {name}: {e}"));
+    }
+
+    /// An overflowing leaf splits and the tree grows a level, where before
+    /// F-009 it returned DiskFull. A blank volume starts as a lone 35-slot
+    /// leaf, so 40 files have to push past it.
+    #[test]
+    fn extent_btree_splits_and_promotes_a_new_root() {
+        use super::super::filesystem::EditableFilesystem;
+        let img = create_blank_sfs(16384, "SplitTest").expect("format");
+        let mut fs = SfsFilesystem::open(std::io::Cursor::new(img), 0).expect("open");
+        assert_eq!(btree_shape(&mut fs), vec![1], "starts as a lone leaf");
+
+        for i in 0..40 {
+            put_file(&mut fs, &format!("f{i:03}.dat"), 300);
+        }
+        EditableFilesystem::sync_metadata(&mut fs).expect("sync");
+
+        let shape = btree_shape(&mut fs);
+        assert_eq!(shape.len(), 2, "tree should have grown a level: {shape:?}");
+        assert!(shape[1] >= 2, "root should have split children: {shape:?}");
+        assert_btree_invariants(&mut fs);
+
+        let root = fs.root().expect("root");
+        let kids = fs.list_directory(&root).expect("list");
+        assert_eq!(kids.len(), 40);
+        for e in &kids {
+            let data = fs.read_file(e, usize::MAX).expect("read back");
+            assert_eq!(data.len(), 300, "{} truncated", e.name);
+        }
+    }
+
+    /// Emptying the volume collapses the tree back to a single leaf and leaves
+    /// it writable. The first cut of the split code kept a childless interior
+    /// node as the root, which no descent could get past: deleting every file
+    /// left the volume unable to accept another one.
+    #[test]
+    fn emptying_the_tree_collapses_the_root_and_stays_writable() {
+        use super::super::filesystem::EditableFilesystem;
+        let img = create_blank_sfs(16384, "CollapseTest").expect("format");
+        let mut fs = SfsFilesystem::open(std::io::Cursor::new(img), 0).expect("open");
+
+        for i in 0..40 {
+            put_file(&mut fs, &format!("f{i:03}.dat"), 300);
+        }
+        assert_eq!(btree_shape(&mut fs).len(), 2, "grew a level");
+
+        let root = fs.root().expect("root");
+        for e in fs.list_directory(&root).expect("list") {
+            EditableFilesystem::delete_entry(&mut fs, &root, &e)
+                .unwrap_or_else(|err| panic!("{}: {err}", e.name));
+        }
+
+        let shape = btree_shape(&mut fs);
+        assert_eq!(shape, vec![1], "tree should be one node again: {shape:?}");
+        let rootblk = fs.root.extentbnoderoot;
+        let buf = fs.read_block(rootblk).expect("read root").to_vec();
+        let (nodecount, isleaf, nodesize) = node_header(&buf);
+        assert!(isleaf, "collapsed root must be a leaf again");
+        assert_eq!(nodecount, 0);
+        assert_eq!(nodesize, FS_EXTENTBNODE_SIZE);
+
+        put_file(&mut fs, "after-empty.dat", 100);
+        EditableFilesystem::sync_metadata(&mut fs).expect("sync");
+        let root = fs.root().expect("root");
+        assert_eq!(fs.list_directory(&root).expect("list").len(), 1);
+    }
+
+    /// Grow and empty repeatedly: split blocks have to return to admin space,
+    /// or each cycle leaks until the region runs dry.
+    #[test]
+    fn split_blocks_are_returned_to_admin_space() {
+        use super::super::filesystem::EditableFilesystem;
+        let img = create_blank_sfs(16384, "LeakTest").expect("format");
+        let mut fs = SfsFilesystem::open(std::io::Cursor::new(img), 0).expect("open");
+
+        for round in 0..4 {
+            for i in 0..40 {
+                put_file(&mut fs, &format!("r{round}f{i:03}.dat"), 300);
+            }
+            let root = fs.root().expect("root");
+            for e in fs.list_directory(&root).expect("list") {
+                EditableFilesystem::delete_entry(&mut fs, &root, &e).expect("delete");
+            }
+            assert_eq!(
+                btree_shape(&mut fs),
+                vec![1],
+                "round {round} left the tree grown"
+            );
+        }
+        EditableFilesystem::sync_metadata(&mut fs).expect("sync");
+    }
+
+    /// The AdminSpaceContainer field offsets, pinned against the layout read
+    /// off a real volume (R-042). Reader and writer agreed with each other
+    /// while both disagreed with the format, so this asserts the bytes.
+    #[test]
+    fn blank_admc_matches_the_on_disk_layout() {
+        let img = create_blank_sfs(8192, "AdmcTest").expect("format");
+        let admc = &img[512..1024];
+        assert_eq!(&admc[0..4], b"ADMC");
+        assert_eq!(rd_u32(admc, 8), 1, "ownblock");
+        assert_eq!(rd_u32(admc, ADMC_NEXT), 0, "single container");
+        assert_eq!(
+            admc[ADMC_REGION_SIZE] as u32, SFS_BLOCKS_ADMIN,
+            "blocks-per-region byte sits at 20, not 24"
+        );
+        assert_eq!(
+            rd_u32(admc, ADMC_ADMINSPACE),
+            1,
+            "adminspace[0].space is the admin region base"
+        );
+        assert_eq!(
+            rd_u32(admc, ADMC_ADMINSPACE + 4),
+            SFS_ADMIN_INITIAL_BITS,
+            "adminspace[0].bits follows space immediately"
+        );
     }
 
     #[test]

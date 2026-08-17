@@ -15,6 +15,10 @@ fn rd_u32(b: &[u8], o: usize) -> u32 {
 }
 
 fn main() {
+    if std::env::var("PROBE_NODES").is_ok() {
+        probe_nodes(&std::env::args().nth(1).expect("usage"));
+        return;
+    }
     if std::env::var("PROBE_ADMIN").is_ok() {
         probe_admin(&std::env::args().nth(1).expect("usage"));
         return;
@@ -194,5 +198,64 @@ fn probe_admin(path: &str) {
         println!("ADMC blk={blk} id={id} next={next} prev={prev} entries={entries} free_slots_total={free_total}");
         blk = next;
         n += 1;
+    }
+}
+
+/// The object-node tree (NDC): fixed fan-out indexed by node number, not a
+/// sorted B-tree. `nodes` is how many object-nodes one entry covers; nodes==1
+/// is a leaf of 10-byte fsObjectNode records.
+#[allow(dead_code)]
+fn probe_nodes(path: &str) {
+    let mut f = File::open(path).unwrap();
+    let mut hdr = vec![0u8; 512];
+    f.read_exact(&mut hdr).unwrap();
+    let bs = rd_u32(&hdr, 52) as usize;
+    // BLCKn = (BLCK << shifts_block32) | flags, shifts_block32 = log2(bs) - 5.
+    let shifts = (bs as u32).trailing_zeros().saturating_sub(5);
+    let mut blk = rd_u32(&hdr, 112);
+    let mut level = 0;
+    println!("objectnoderoot={blk} blocksize={bs} shift={shifts}");
+    loop {
+        let mut buf = vec![0u8; bs];
+        f.seek(SeekFrom::Start(blk as u64 * bs as u64)).unwrap();
+        f.read_exact(&mut buf).unwrap();
+        let nodenumber = rd_u32(&buf, 12);
+        let nodes = rd_u32(&buf, 16);
+        let stride = if nodes == 1 { 10 } else { 4 };
+        let slots = (bs - 20) / stride;
+        let mut used = 0;
+        let mut first_free = None;
+        for i in 0..slots {
+            let e = rd_u32(&buf, 20 + i * stride);
+            if e != 0 {
+                used += 1
+            } else if first_free.is_none() {
+                first_free = Some(i)
+            }
+        }
+        println!(
+            "level {level}: blk={blk} id={} nodenumber={nodenumber} nodes={nodes} stride={stride} slots={slots} used={used} first_free={first_free:?}",
+            String::from_utf8_lossy(&buf[0..4])
+        );
+        if nodes == 1 {
+            break;
+        }
+        // Descend into the first populated child.
+        let mut child = 0;
+        for i in 0..slots {
+            let e = rd_u32(&buf, 20 + i * stride);
+            if e != 0 {
+                child = e >> shifts;
+                break;
+            }
+        }
+        if child == 0 {
+            break;
+        }
+        blk = child;
+        level += 1;
+        if level > 6 {
+            break;
+        }
     }
 }
