@@ -15,7 +15,7 @@ concrete reason to.
 | ~~F-001~~ | ~~`optical extract` cannot extract a single path~~ — **SHIPPED** 2026-08-09 | `src/cli/verbs/optical.rs` | — |
 | ~~F-002~~ | ~~CloneCD not supported~~ — **retracted, it is supported** | — | — |
 | ~~F-003~~ | ~~PFS3 / SFS builders exist but are not on the CLI~~ — **SHIPPED** 2026-08-15 | `src/cli/verbs/new.rs` | — |
-| [F-005](#f-005) | Optical extract is CLI-only; the GUI cannot pull one file | `src/optical/browse_view.rs` | GUI parity with `optical extract` |
+| ~~F-005~~ | ~~Optical extract is CLI-only; the GUI cannot pull one file~~ — **ALREADY SHIPPED**, entry was stale | `src/optical/browse_view.rs` | — |
 | [F-006](#f-006) | IRIX support-disk building / browsing is thin | `src/cli/verbs/new_sgi_cdrom.rs` | bootable IRIX discs — **scoped**; step 1 (header validated by IRIX) done, steps 2-3 open |
 | ~~F-007~~ | ~~No optical fixture with nested directories~~ — **SHIPPED** 2026-08-17 | `regression-tests/` | — |
 | ~~F-008~~ | ~~`backup` reads only flat-layout sources~~ — **SHIPPED** 2026-08-15 | `src/cli/verbs/backup.rs` | — |
@@ -199,6 +199,46 @@ Two things would help, in order of cost:
 ---
 
 ## F-005 — the GUI cannot extract a single file from a disc {#f-005}
+
+**ALREADY SHIPPED — this entry was stale, and closing it needed no code.**
+Checked 2026-08-17 against the four things it asked for; all four were already
+there, landed in July and never reflected here.
+
+| what the entry asked for | where it is |
+|---|---|
+| an extract action on a selected entry **and on a folder** | checkbox column + `render_selection_bar` (called at `browse_view.rs:392`); `marked_export_entries` drops anything under an already-marked directory so a folder's recursive walk is not archived twice |
+| a destination chooser, folder vs archive | `rfd::FileDialog` — `save_file` for single-file formats, `pick_folder` otherwise, branched on `ExportFormat::is_single_file` |
+| the `--filesystem` selector, "without which the GUI can only ever reach one side of a hybrid Mac/PC disc" | `selected_fs` + its ComboBox; `b8cfe77` is literally "filesystem selector for hybrid Mac/PC discs (browse/extract + GUI)" |
+| a README Inspect-tab bullet | present, and it names the Optical disc browser as one of four surfaces on the shared `export_selection` engine |
+
+The commits, none of which updated this file:
+
+```
+61413fe  2026-07-14  export-selection engine for all output formats
+b8cfe77  2026-07-16  filesystem selector for hybrid Mac/PC discs (browse/extract + GUI)
+400f54f  2026-07-21  multi-select export to .mar in the CD browser
+aff45d0  2026-07-21  unify multi-select export as a format pulldown + all archive types
+```
+
+It also overshot the ask. The entry wanted the CLI's `--tar`; the GUI offers ten
+formats — loose files, gzip/zstd per file, BinHex, tar, tar.gz, tar.zst, Zip,
+StuffIt and Mac Archive.
+
+**One real difference from the wording, left alone deliberately.** The entry
+says "an extract action on the *selected* browse entry", and selection here
+means ticking a checkbox rather than single-clicking a row. The capability is
+complete either way, and adding a second redundant path to the same engine is
+not obviously an improvement. Worth doing only if the checkbox proves awkward
+in use.
+
+**Same shape as R-038**: a document confidently describing a state that had
+changed underneath it. Two of the four remaining features in this file turned
+out to be stale on inspection this week, which is an argument for checking the
+code before believing the list.
+
+---
+
+### The original report
 
 `optical extract` grew `--path`, `--recursive`, `--tar`,
 `--preserve-permissions`, `--filesystem` and `--filesystem-index` (F-001).
