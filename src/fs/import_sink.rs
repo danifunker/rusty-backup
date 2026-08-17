@@ -173,6 +173,11 @@ pub enum ImportItem<'a> {
     File {
         size: u64,
         data: &'a mut dyn Read,
+        /// A Mac resource fork + Finder info the source driver resolved from
+        /// the host containers, for targets that can store one. `data` is
+        /// already the *data* fork, so a whole-file wrapper is unwrapped by the
+        /// driver rather than here (see [`crate::fs::dir_import`]).
+        mac_fork: Option<&'a crate::fs::resource_fork::ImportedResourceFork>,
     },
     /// Hardlinks, char/block devices, fifos, sockets — not representable.
     Unsupported,
@@ -355,7 +360,11 @@ impl Importer {
                     Err(e) => return Err(anyhow!("create_symlink {display}: {e}")),
                 }
             }
-            ImportItem::File { size, data } => {
+            ImportItem::File {
+                size,
+                data,
+                mac_fork,
+            } => {
                 // Mode and ownership go in through `create_file`, not a chmod
                 // afterwards: every driver that stores them honours these
                 // fields, while `set_permissions` is implemented by only two,
@@ -368,7 +377,7 @@ impl Importer {
                     None,
                     0o644,
                 );
-                let create_opts = crate::fs::filesystem::CreateFileOptions {
+                let mut create_opts = crate::fs::filesystem::CreateFileOptions {
                     mode: Some(attrs.file_mode()),
                     uid: Some(attrs.uid),
                     gid: Some(attrs.gid),
@@ -379,6 +388,17 @@ impl Importer {
                     unix_times: overrides.unix_times,
                     ..Default::default()
                 };
+                // Raw OSType bytes rather than the text form, so high-bit codes
+                // survive; the extension dictionary still fills an absent one.
+                if let Some(imp) = mac_fork {
+                    if !imp.data.is_empty() {
+                        create_opts.resource_fork = Some(
+                            crate::fs::filesystem::ResourceForkSource::Data(imp.data.clone()),
+                        );
+                    }
+                    create_opts.os_type = imp.type_code;
+                    create_opts.os_creator = imp.creator_code;
+                }
                 efs.create_file(&parent, name, data, size, &create_opts)
                     .map_err(|e| anyhow!("create_file {display}: {e}"))?;
                 self.dir_children

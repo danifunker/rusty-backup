@@ -1,0 +1,357 @@
+# Tier 1 — self-fixturing.
+#
+# One question, asked nine ways: after a Mac archive is extracted to the host
+# and copied back onto an HFS volume, does the resource fork arrive?
+#
+# The fixture pair `forked-file` (32 bytes) + `forked-file.rsrc` (64 bytes) is
+# the smallest thing that can answer it. `archive create` folds the sidecar in,
+# `archive extract` writes it back out in whichever of the four fork containers
+# the user picked, and `du --format json` reports `rsrc_bytes` on the volume —
+# the only place in the CLI surface where a resource fork is observable.
+#
+# Ordinarily a tier-1 round trip against ourselves proves little (README
+# § "Why tier 1 is not coverage"): a bug on both sides cancels out. It does not
+# cancel here, and the control case is why. `put-macbinary` walks the same
+# writer and the same reader and lands `rsrc_bytes = 64`. So when a sibling
+# case reports 0, the reader is not the variable — the copy-in path is.
+#
+# Ground truth for every case: one file on the volume, 32 data bytes and
+# 64 resource bytes. A wrapper imported verbatim shows up as the wrong
+# `data_bytes` (the `.hqx` text or the `.bin` container), a dropped fork as
+# `rsrc_bytes = 0`, and a sidecar landed as its own file as both.
+
+[meta]
+tier = 1
+group = "mac.fork-roundtrip"
+description = "Extract a Mac archive to the host, copy it back onto HFS, and check the resource fork survived."
+
+# --- Control -----------------------------------------------------------------
+# The fork-aware verb. Establishes that the fixture, the archive writer, the
+# extractor and `du`'s reader all work, so a failure in any case below is the
+# copy-in path and nothing else.
+
+[[case]]
+id = "mac.fork-roundtrip.control.put-macbinary"
+description = "put-macbinary lands both forks — the control for every case below"
+[[case.step]]
+args = ["archive", "create", "{scratch}/app.sit", "{cases}/tier1/forked-file"]
+expect_exit = 0
+[[case.step]]
+args = [
+    "archive",
+    "extract",
+    "{scratch}/app.sit",
+    "{scratch}/out",
+    "--format",
+    "macbinary",
+]
+expect_exit = 0
+files_exist = ["{scratch}/out/forked-file.bin"]
+[[case.step]]
+args = ["new", "volume", "hfs", "--size", "4M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["put-macbinary", "{scratch}/v.img", "{scratch}/out/forked-file.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["du", "{scratch}/v.img", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+[[case.step.json_equals]]
+path = "paths.0.data_bytes"
+value = 32
+[[case.step.json_equals]]
+path = "paths.0.rsrc_bytes"
+value = 64
+
+# --- import (bulk copy-in) ---------------------------------------------------
+# `import` walks a host tree into the volume. Each case extracts into a folder
+# in one fork container and imports the folder.
+
+[[case]]
+id = "mac.fork-roundtrip.import.binhex"
+description = "import of a BinHex extract keeps the fork (binhex is the extractor's default)"
+[[case.step]]
+args = ["archive", "create", "{scratch}/app.sit", "{cases}/tier1/forked-file"]
+expect_exit = 0
+[[case.step]]
+args = [
+    "archive",
+    "extract",
+    "{scratch}/app.sit",
+    "{scratch}/out",
+    "--format",
+    "binhex",
+]
+expect_exit = 0
+files_exist = ["{scratch}/out/forked-file.hqx"]
+[[case.step]]
+args = ["new", "volume", "hfs", "--size", "4M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["import", "{scratch}/v.img", "{scratch}/out"]
+expect_exit = 0
+[[case.step]]
+args = ["du", "{scratch}/v.img", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+[[case.step.json_equals]]
+path = "paths.0.data_bytes"
+value = 32
+[[case.step.json_equals]]
+path = "paths.0.rsrc_bytes"
+value = 64
+
+[[case]]
+id = "mac.fork-roundtrip.import.macbinary"
+description = "import of a MacBinary extract keeps the fork"
+[[case.step]]
+args = ["archive", "create", "{scratch}/app.sit", "{cases}/tier1/forked-file"]
+expect_exit = 0
+[[case.step]]
+args = [
+    "archive",
+    "extract",
+    "{scratch}/app.sit",
+    "{scratch}/out",
+    "--format",
+    "macbinary",
+]
+expect_exit = 0
+[[case.step]]
+args = ["new", "volume", "hfs", "--size", "4M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["import", "{scratch}/v.img", "{scratch}/out"]
+expect_exit = 0
+[[case.step]]
+args = ["du", "{scratch}/v.img", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+[[case.step.json_equals]]
+path = "paths.0.data_bytes"
+value = 32
+[[case.step.json_equals]]
+path = "paths.0.rsrc_bytes"
+value = 64
+
+[[case]]
+id = "mac.fork-roundtrip.import.appledouble"
+description = "import of an AppleDouble extract keeps the fork (the sidecar must be consumed, not deleted)"
+[[case.step]]
+args = ["archive", "create", "{scratch}/app.sit", "{cases}/tier1/forked-file"]
+expect_exit = 0
+[[case.step]]
+args = [
+    "archive",
+    "extract",
+    "{scratch}/app.sit",
+    "{scratch}/out",
+    "--format",
+    "appledouble",
+]
+expect_exit = 0
+files_exist = ["{scratch}/out/._forked-file"]
+[[case.step]]
+args = ["new", "volume", "hfs", "--size", "4M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["import", "{scratch}/v.img", "{scratch}/out"]
+expect_exit = 0
+[[case.step]]
+args = ["du", "{scratch}/v.img", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+[[case.step.json_equals]]
+path = "paths.0.data_bytes"
+value = 32
+[[case.step.json_equals]]
+path = "paths.0.rsrc_bytes"
+value = 64
+# One file, not a data fork plus an orphaned sidecar.
+[[case.step.json_equals]]
+path = "paths.0.files"
+value = 1
+
+[[case]]
+id = "mac.fork-roundtrip.import.raw"
+description = "import of a raw + .rsrc extract keeps the fork"
+[[case.step]]
+args = ["archive", "create", "{scratch}/app.sit", "{cases}/tier1/forked-file"]
+expect_exit = 0
+[[case.step]]
+args = [
+    "archive",
+    "extract",
+    "{scratch}/app.sit",
+    "{scratch}/out",
+    "--format",
+    "raw",
+]
+expect_exit = 0
+files_exist = ["{scratch}/out/forked-file.rsrc"]
+[[case.step]]
+args = ["new", "volume", "hfs", "--size", "4M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["import", "{scratch}/v.img", "{scratch}/out"]
+expect_exit = 0
+[[case.step]]
+args = ["du", "{scratch}/v.img", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+[[case.step.json_equals]]
+path = "paths.0.data_bytes"
+value = 32
+[[case.step.json_equals]]
+path = "paths.0.rsrc_bytes"
+value = 64
+[[case.step.json_equals]]
+path = "paths.0.files"
+value = 1
+
+# --- put (single-file copy-in) -----------------------------------------------
+# Same four containers through the single-file verb. `put-macbinary` already
+# proves the volume can hold a fork, so these isolate `put` itself.
+
+[[case]]
+id = "mac.fork-roundtrip.put.binhex"
+description = "put of a BinHex extract keeps the fork"
+[[case.step]]
+args = ["archive", "create", "{scratch}/app.sit", "{cases}/tier1/forked-file"]
+expect_exit = 0
+[[case.step]]
+args = [
+    "archive",
+    "extract",
+    "{scratch}/app.sit",
+    "{scratch}/out",
+    "--format",
+    "binhex",
+]
+expect_exit = 0
+[[case.step]]
+args = ["new", "volume", "hfs", "--size", "4M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = [
+    "put",
+    "{scratch}/v.img",
+    "{scratch}/out/forked-file.hqx",
+    "/forked-file",
+]
+expect_exit = 0
+[[case.step]]
+args = ["du", "{scratch}/v.img", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+[[case.step.json_equals]]
+path = "paths.0.data_bytes"
+value = 32
+[[case.step.json_equals]]
+path = "paths.0.rsrc_bytes"
+value = 64
+
+[[case]]
+id = "mac.fork-roundtrip.put.macbinary"
+description = "put of a MacBinary extract keeps the fork (put-macbinary is not the only verb that should)"
+[[case.step]]
+args = ["archive", "create", "{scratch}/app.sit", "{cases}/tier1/forked-file"]
+expect_exit = 0
+[[case.step]]
+args = [
+    "archive",
+    "extract",
+    "{scratch}/app.sit",
+    "{scratch}/out",
+    "--format",
+    "macbinary",
+]
+expect_exit = 0
+[[case.step]]
+args = ["new", "volume", "hfs", "--size", "4M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = [
+    "put",
+    "{scratch}/v.img",
+    "{scratch}/out/forked-file.bin",
+    "/forked-file",
+]
+expect_exit = 0
+[[case.step]]
+args = ["du", "{scratch}/v.img", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+[[case.step.json_equals]]
+path = "paths.0.data_bytes"
+value = 32
+[[case.step.json_equals]]
+path = "paths.0.rsrc_bytes"
+value = 64
+
+[[case]]
+id = "mac.fork-roundtrip.put.appledouble"
+description = "put of an AppleDouble extract keeps the fork"
+[[case.step]]
+args = ["archive", "create", "{scratch}/app.sit", "{cases}/tier1/forked-file"]
+expect_exit = 0
+[[case.step]]
+args = [
+    "archive",
+    "extract",
+    "{scratch}/app.sit",
+    "{scratch}/out",
+    "--format",
+    "appledouble",
+]
+expect_exit = 0
+[[case.step]]
+args = ["new", "volume", "hfs", "--size", "4M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{scratch}/out/forked-file", "/forked-file"]
+expect_exit = 0
+[[case.step]]
+args = ["du", "{scratch}/v.img", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+[[case.step.json_equals]]
+path = "paths.0.data_bytes"
+value = 32
+[[case.step.json_equals]]
+path = "paths.0.rsrc_bytes"
+value = 64
+
+[[case]]
+id = "mac.fork-roundtrip.put.raw"
+description = "put of a raw + .rsrc extract keeps the fork"
+[[case.step]]
+args = ["archive", "create", "{scratch}/app.sit", "{cases}/tier1/forked-file"]
+expect_exit = 0
+[[case.step]]
+args = [
+    "archive",
+    "extract",
+    "{scratch}/app.sit",
+    "{scratch}/out",
+    "--format",
+    "raw",
+]
+expect_exit = 0
+[[case.step]]
+args = ["new", "volume", "hfs", "--size", "4M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{scratch}/out/forked-file", "/forked-file"]
+expect_exit = 0
+[[case.step]]
+args = ["du", "{scratch}/v.img", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+[[case.step.json_equals]]
+path = "paths.0.data_bytes"
+value = 32
+[[case.step.json_equals]]
+path = "paths.0.rsrc_bytes"
+value = 64

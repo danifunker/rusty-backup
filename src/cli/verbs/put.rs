@@ -33,7 +33,13 @@ pub struct PutArgs {
     /// Image reference (`path` or `path@N` for the 1-based partition index).
     pub image: ImageRef,
 
-    /// Host file to copy. Required when not using `--zero` or `--boot`.
+    /// Host file to copy. Required when not using `--zero` or `--boot`. On a
+    /// filesystem that stores resource forks (HFS / HFS+ / MFS / ProDOS) the
+    /// fork is picked up from whichever host container carries it — a macOS
+    /// native fork, a `._name` / `name.rsrc` sidecar beside the file, or a
+    /// whole-file `.bin` MacBinary / `.hqx` BinHex wrapper, whose data fork is
+    /// unwrapped so the container is not written verbatim. Finder type/creator
+    /// ride along unless `--type` / `--creator` say otherwise.
     pub host_file: Option<PathBuf>,
 
     /// Destination path inside the filesystem (cp-like positional). A literal
@@ -267,6 +273,31 @@ pub fn run_with_budget(
         crate::fs::replace::OnConflict::Fail
     };
 
+    // A Mac file arriving in one of the host containers — a `._name` /
+    // `name.rsrc` sidecar, or a whole-file `.bin` / `.hqx` wrapper. Without
+    // this, `archive extract` followed by `put` dropped every resource fork
+    // (R-040) and only the dedicated `put-macbinary` verb carried one.
+    let rsrc_import = if crate::fs::copy::Capabilities::infer(fs.fs_type()).resource_forks {
+        args.host_file
+            .as_ref()
+            .and_then(|p| crate::fs::resource_fork::detect_resource_fork(p))
+    } else {
+        None
+    };
+    if let Some(imp) = &rsrc_import {
+        log_stderr(format!(
+            "Resource fork: {} bytes{}",
+            imp.data.len(),
+            if imp.data_fork.is_some() {
+                " (unwrapped from the host container)"
+            } else {
+                " (from the host sidecar)"
+            }
+        ));
+    }
+    let container_type = rsrc_import.as_ref().and_then(|i| i.type_code);
+    let container_creator = rsrc_import.as_ref().and_then(|i| i.creator_code);
+
     // An explicit --type / --creator (or the config default) always wins. Failing
     // that, on the classic-Mac filesystems we leave both unset so `create_file`
     // consults the shared extension dictionary -- the same list the GUI's
@@ -291,7 +322,10 @@ pub fn run_with_budget(
                 .and_then(|c| c.get("put", "type"))
                 .map(|s| s.to_string())
         })
-        .or_else(|| (!auto_from_extension && !preserves_type).then(|| "BINA".to_string()));
+        .or_else(|| {
+            (!auto_from_extension && !preserves_type && container_type.is_none())
+                .then(|| "BINA".to_string())
+        });
     let preserves_creator = preserved.os_creator.is_some();
     let creator = args
         .creator
@@ -301,7 +335,10 @@ pub fn run_with_budget(
                 .and_then(|c| c.get("put", "creator"))
                 .map(|s| s.to_string())
         })
-        .or_else(|| (!auto_from_extension && !preserves_creator).then(|| "????".to_string()));
+        .or_else(|| {
+            (!auto_from_extension && !preserves_creator && container_creator.is_none())
+                .then(|| "????".to_string())
+        });
     // POSIX attributes. Every editable Unix filesystem honours these; until now
     // nothing set them, so each driver's `unwrap_or` silently made every added
     // file root:root 0644. Resolution (and its precedence rules) lives in
@@ -368,6 +405,22 @@ pub fn run_with_budget(
         gid: Some(attrs.gid),
         ..Default::default()
     };
+    // Carried as raw `os_type` bytes rather than the text form so high-bit
+    // OSTypes survive; an explicit --type above already won, and preservation
+    // below only fills what is still unset.
+    if let Some(imp) = &rsrc_import {
+        if !imp.data.is_empty() {
+            options.resource_fork = Some(crate::fs::filesystem::ResourceForkSource::Data(
+                imp.data.clone(),
+            ));
+        }
+        if options.type_code.is_none() {
+            options.os_type = container_type;
+        }
+        if options.creator_code.is_none() {
+            options.os_creator = container_creator;
+        }
+    }
     // Fills only what nobody set explicitly, so --type / --mode still win.
     preserved.apply_to_options(&mut options);
 
@@ -410,11 +463,23 @@ pub fn run_with_budget(
                 "host file required (or pass --zero N for zero-fill, --boot FILE for boot blocks)"
             )
         })?;
-        let meta = std::fs::metadata(&host).map_err(|e| anyhow!("stat {}: {e}", host.display()))?;
-        let len = meta.len();
-        let mut hf =
-            std::fs::File::open(&host).map_err(|e| anyhow!("open {}: {e}", host.display()))?;
-        write_through(fs.as_mut(), &mut hf, len)?;
+        // A whole-file container (MacBinary / BinHex) holds the data fork
+        // inside it; writing the wrapper's own bytes would land the container
+        // rather than the file it carries.
+        match rsrc_import.as_ref().and_then(|i| i.data_fork.as_ref()) {
+            Some(df) => {
+                let len = df.len() as u64;
+                write_through(fs.as_mut(), &mut std::io::Cursor::new(df), len)?;
+            }
+            None => {
+                let meta = std::fs::metadata(&host)
+                    .map_err(|e| anyhow!("stat {}: {e}", host.display()))?;
+                let len = meta.len();
+                let mut hf = std::fs::File::open(&host)
+                    .map_err(|e| anyhow!("open {}: {e}", host.display()))?;
+                write_through(fs.as_mut(), &mut hf, len)?;
+            }
+        }
     }
 
     // Timestamps are the one preserved field no filesystem here accepts at

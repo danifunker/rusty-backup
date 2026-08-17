@@ -826,7 +826,7 @@ Usage: import [OPTIONS] <IMAGE> <DIR> [DEST]
 - `--force` — Overwrite entries that already exist at the destination. Mutually exclusive with `--skip-existing`
 - `--skip-existing` — Skip entries that already exist at the destination. Mutually exclusive with `--force`
 - `--no-permissions` — Ignore the host's Unix mode and ownership. Imported entries then inherit uid/gid from the directory they land in and take the filesystem's default mode, the same rule `put` follows
-- `--include-appledouble` — Import macOS AppleDouble sidecars (`._*`) too. By default they are skipped as Mac metadata cruft
+- `--include-appledouble` — Import macOS AppleDouble sidecars (`._*`) as files of their own, on top of the fork they already contribute. Off by default: on a fork-bearing target (HFS / HFS+ / MFS / ProDOS) a `._name` or `name.rsrc` sidecar is consumed into the resource fork of the file it belongs to, which is where it wanted to end up, and elsewhere it is skipped as Mac metadata cruft. Only an orphan with no primary file is ever dropped outright
 - `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zxplus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
 - `--carve-full` — Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga "NDOS" disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem
 
@@ -1661,7 +1661,7 @@ Usage: put [OPTIONS] <IMAGE> [HOST_FILE] [DST]
 **Arguments**
 
 - `<IMAGE>` — Image reference (`path` or `path@N` for the 1-based partition index)
-- `<HOST_FILE>` — Host file to copy. Required when not using `--zero` or `--boot`
+- `<HOST_FILE>` — Host file to copy. Required when not using `--zero` or `--boot`. On a filesystem that stores resource forks (HFS / HFS+ / MFS / ProDOS) the fork is picked up from whichever host container carries it — a macOS native fork, a `._name` / `name.rsrc` sidecar beside the file, or a whole-file `.bin` MacBinary / `.hqx` BinHex wrapper, whose data fork is unwrapped so the container is not written verbatim. Finder type/creator ride along unless `--type` / `--creator` say otherwise
 - `<DST>` — Destination path inside the filesystem (cp-like positional). A literal `/` in the name is written `\/`; on HFS / HFS+ a `:`-separated path also works (so `/` is plain data)
 
 **Options**
@@ -2018,7 +2018,7 @@ Usage: put [OPTIONS] <IMAGE> [HOST_FILE] [DST]
 **Arguments**
 
 - `<IMAGE>` — Image reference (`path` or `path@N` for the 1-based partition index)
-- `<HOST_FILE>` — Host file to copy. Required when not using `--zero` or `--boot`
+- `<HOST_FILE>` — Host file to copy. Required when not using `--zero` or `--boot`. On a filesystem that stores resource forks (HFS / HFS+ / MFS / ProDOS) the fork is picked up from whichever host container carries it — a macOS native fork, a `._name` / `name.rsrc` sidecar beside the file, or a whole-file `.bin` MacBinary / `.hqx` BinHex wrapper, whose data fork is unwrapped so the container is not written verbatim. Finder type/creator ride along unless `--type` / `--creator` say otherwise
 - `<DST>` — Destination path inside the filesystem (cp-like positional). A literal `/` in the name is written `\/`; on HFS / HFS+ a `:`-separated path also works (so `/` is plain data)
 
 **Options**

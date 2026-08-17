@@ -266,6 +266,9 @@ fn import_tar_inner<R: Read>(
                 ImportItem::File {
                     size,
                     data: &mut entry,
+                    // A tar member has no host sidecar to pair with; a `._name`
+                    // inside the tarball is dropped by `skip_appledouble`.
+                    mac_fork: None,
                 },
                 &overrides,
                 opts,

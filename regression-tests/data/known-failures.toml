@@ -49,3 +49,11 @@
 # --- Found 2026-08-08, first execution of the tier-3 sweep -------------------
 # None of these had ever run: the last full Windows run predates the tier-2 and
 # tier-3 authoring commits, so it covered 134 of 256 cases and reported green.
+
+# --- R-040 — put / import never reattach a resource fork — FIXED 2026-08-17 ---
+# All eight entries removed, and the section kept as the note that they were.
+# `detect_resource_fork` learned BinHex, `put` and `dir_import` now consult it,
+# and a consumed sidecar no longer lands as its own file. The nine cases are
+# unchanged — they always asserted the behaviour we wanted, and XPASS is what
+# said so. `mac.fork-roundtrip.control.put-macbinary` was never listed and
+# still passes.
