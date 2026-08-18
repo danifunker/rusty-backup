@@ -319,6 +319,33 @@ verifies = [
 ]
 
 [[oracle]]
+id = "copperline"
+tool = "Copperline"
+kind = "emulator"
+program = "python3"
+path_hint = []
+notes = """A headless, CLI-driven Amiga emulator in Rust, and the first
+emulator oracle `verify` can actually run. FS-UAE and WinUAE are the same
+emulator family and both need a hand-configured guest, so their pairs resolve
+to skip-manual; Copperline runs unthrottled with no window, exits on its own
+via `--screenshot-after`, and takes its whole machine from a config file.
+
+The check covers the container and the boot block, not the filesystem: the
+attach path classifies an image and reads its dostype before any ROM runs, so
+a second implementation confirms the bytes we wrote there. Mounting the volume
+would need a guest OS, which means a licensed Kickstart plus a Workbench; the
+oracle's README has the shape that takes. Scored `smoke` accordingly — it is
+not evidence the filesystem is correct.
+
+It boots Copperline's own AROS ROM rather than a Kickstart, so no host needs a
+licensed ROM to run it. `program` is python3 on the amitools pattern: the
+interpreter is what must exist, and the script finds the emulator (sibling
+checkout, or $COPPERLINE)."""
+verifies = [
+  { format = "fs.affs", direction = "write", strength = "smoke", status = "proven", evidence = "2026-08-18: Copperline classifies our volume as a bare partition hardfile and reads dostype 444f5301 out of its boot block, then wraps it in a synthesized RDB. Controlled against 2 MB of urandom, which it takes as an unclassified raw disk and the check fails, and against a wrong expected dostype, which also fails.", check = ["{oracles}/copperline/attach_check.py", "{artifact}", "444f5301"] },
+]
+
+[[oracle]]
 id = "fs-uae"
 tool = "FS-UAE"
 kind = "emulator"

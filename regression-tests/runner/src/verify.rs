@@ -290,23 +290,15 @@ pub fn verify(
             };
             let program = oracle.program.as_deref().unwrap_or(&oracle.tool);
 
-            let (verdict, argv, stdout_head) = if !matches!(
-                oracle.kind.as_str(),
-                "package" | "mount"
-            ) {
-                (
-                    Verdict::SkipManual {
-                        reason: format!(
-                            "{} is a {} oracle — needs a preconfigured guest or real hardware",
-                            oracle.id, oracle.kind
-                        ),
-                    },
-                    Vec::new(),
-                    None,
-                )
-            } else if claim.check.is_none() {
-                (Verdict::SkipNoCheck, Vec::new(), None)
-            } else {
+            // What decides whether this can be automated is whether somebody
+            // wrote a `check` for it, not what kind of oracle it is. That used
+            // to be gated on `kind`, which auto-skipped every emulator pair
+            // even where a runnable check existed — true when the only Amiga
+            // oracles needed a hand-configured guest, and false since
+            // Copperline, which is headless and scriptable. An oracle that
+            // really does need a guest or real hardware simply has no `check`,
+            // and still reports skip-manual below.
+            let (verdict, argv, stdout_head) = if let Some(check) = &claim.check {
                 match resolve_program(reg, &oracle.id, program, platform, regression_dir) {
                     None => (
                         Verdict::SkipUnavailable {
@@ -317,7 +309,7 @@ pub fn verify(
                     ),
                     Some(exe) => {
                         let argv = expand(
-                            claim.check.as_ref().unwrap(),
+                            check,
                             image,
                             &regression_dir.join("oracles"),
                         );
@@ -344,6 +336,22 @@ pub fn verify(
                         }
                     }
                 }
+            } else {
+                let automatable = matches!(oracle.kind.as_str(), "package" | "mount");
+                (
+                    if automatable {
+                        Verdict::SkipNoCheck
+                    } else {
+                        Verdict::SkipManual {
+                            reason: format!(
+                                "{} is a {} oracle with no check - needs a preconfigured                                  guest or real hardware",
+                                oracle.id, oracle.kind
+                            ),
+                        }
+                    },
+                    Vec::new(),
+                    None,
+                )
             };
 
             records.push(Record {
