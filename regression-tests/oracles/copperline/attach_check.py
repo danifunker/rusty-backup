@@ -29,7 +29,8 @@ because the answer is already in the log by then.
     exit 0  Copperline recognised a bare Amiga volume and read the dostype
             we wrote out of its boot block
     exit 1  it did not recognise one, or read a different dostype  (a verdict)
-    exit 2  setup problem — no Copperline binary  (not a verdict)
+    exit 77 this host has no Copperline build       (not a verdict)
+    exit 2  the image argument is unusable          (not a verdict)
 """
 
 import os
@@ -104,11 +105,11 @@ def main():
     exe = find_copperline()
     if exe is None:
         print(
-            "setup: no Copperline binary (set COPPERLINE, or build the sibling "
-            "checkout with `cargo build --release`)",
+            "unavailable: no Copperline binary (set COPPERLINE, or build the "
+            "sibling checkout with `cargo build --release`)",
             file=sys.stderr,
         )
-        return 2
+        return 77
 
     with tempfile.TemporaryDirectory() as td:
         cfg = Path(td) / "attach.toml"
@@ -117,19 +118,19 @@ def main():
         rom = aros_rom(exe)
         if rom is None:
             print(
-                "setup: no AROS ROM in the Copperline tree "
+                "unavailable: no AROS ROM in the Copperline tree "
                 "(assets/aros/aros-amiga-m68k-rom.bin)",
                 file=sys.stderr,
             )
-            return 2
+            return 77
         rom = aros_rom(exe)
         if rom is None:
             print(
-                "setup: no AROS ROM in the Copperline tree "
+                "unavailable: no AROS ROM in the Copperline tree "
                 "(assets/aros/aros-amiga-m68k-rom.bin)",
                 file=sys.stderr,
             )
-            return 2
+            return 77
         cfg.write_text(
             CONFIG.format(rom=rom.as_posix(), image=image.as_posix()),
             encoding="utf-8",

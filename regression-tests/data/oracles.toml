@@ -349,8 +349,14 @@ verifies = [
 id = "fs-uae"
 tool = "FS-UAE"
 kind = "emulator"
-program = "fs-uae"
-notes = """Portable Amiga emulator; the cross-platform half of the WinUAE pair.
+program = "python3"
+notes = """`program` is python3, not fs-uae: the check is a wrapper script, so
+the interpreter is what must be executable. The script finds the emulator
+itself and exits 77 (skip-unavailable) when it or a Kickstart is missing,
+which is the only way a script-based check can say "not installed here"
+rather than reporting a FAIL against our bytes.
+
+Portable Amiga emulator; the cross-platform half of the WinUAE pair.
 
 Assets located 2026-08-07, all already owned — nothing needs downloading:
 

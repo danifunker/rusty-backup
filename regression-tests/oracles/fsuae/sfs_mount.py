@@ -305,7 +305,7 @@ def parse_verdict(info: str) -> Tuple[str, str]:
 def run(args) -> int:
     fs_uae = find_fs_uae()
     if not fs_uae:
-        print("fs-uae not found (PATH or %LOCALAPPDATA%/Programs/FS-UAE)", file=sys.stderr)
+        print("unavailable: fs-uae not found (PATH or %LOCALAPPDATA%/Programs/FS-UAE)", file=sys.stderr)
         return 2
     kickstart = find_kickstart()
     if not kickstart:
@@ -378,7 +378,7 @@ def run(args) -> int:
             "verdict on the volume",
             file=sys.stderr,
         )
-        return 3
+        return 99
 
     def read(name: str) -> str:
         p = results / name

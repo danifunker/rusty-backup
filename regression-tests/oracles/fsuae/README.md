@@ -51,7 +51,27 @@ back, which closes R-020. Run it as:
     python regression-tests/oracles/fsuae/affs_mount.py <image>
 
     0  mounted        1  not mounted (a verdict)
-    3  no sentinel — harness failure, NOT a verdict        2  setup error
+    99 no sentinel — harness failure, NOT a verdict       2  setup error
+    77 fs-uae or a Kickstart is not on this host — skipped, not a verdict
+
+77 and 99 are the harness-wide reserved codes `verify` maps to
+skip-unavailable and error; every other code is a verdict on the volume.
+
+### One run at a time
+
+`--workdir` defaults to a single fixed path, so two of these running at once
+share a boot volume, a config and a results directory and trample each other.
+The symptom is a Python traceback or a missing sentinel on runs that pass in
+isolation. Within one `verify` the artifacts go through sequentially and are
+fine; the trap is starting a second `verify` while one is still going.
+
+### Never let it write into the artifact tree
+
+`verify` runs a check with the *artifact's* directory as cwd. Both defaults
+here were repo-relative, so run that way they resolved inside
+`artifacts/<os>/<format>/` and built the boot volume into the artifact tree.
+They are anchored to the repo now (`REPO` in the script). Any new path default
+must be absolute for the same reason.
 
 ### Always pair a pass with a negative control
 
