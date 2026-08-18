@@ -5682,6 +5682,7 @@ impl App {
                                 size: size.clone(),
                                 partitions: vec!["rest".to_string()],
                                 fills: Vec::new(),
+                                filesystems: Vec::new(),
                                 align: "1M".to_string(),
                                 force: false,
                             };

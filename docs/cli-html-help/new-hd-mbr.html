@@ -23,6 +23,8 @@
 <dd>A partition, repeatable, in disk order: `SIZE[:TYPE[:NAME]]`. SIZE accepts `K`/`M`/`G`, or `rest` for the remaining space (once). TYPE is a value from `partmap types`; NAME is APM/GPT only</dd>
 <dt><code>--fill</code></dt>
 <dd>Pour an image into a partition as it is created: `N=PATH`, 1-based, repeatable. Any format the engine can read is decoded on the way in</dd>
+<dt><code>--filesystem</code></dt>
+<dd>Embed an Amiga filesystem handler in the RDB, `DOSTYPE=PATH`, repeatable. PATH is the handler's AmigaDOS load file (`L:SmartFilesystem`, `L:PFS3`). A DosType with no ROM handler needs this to mount unaided: the strap loads it from the RDB. RDB only</dd>
 <dt><code>--align</code></dt>
 <dd>Alignment for partition starts. Default 1 MiB; use 63s for DOS-era cylinder alignment on vintage machines</dd>
 <dt><code>--force</code></dt>
