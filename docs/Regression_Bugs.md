@@ -1,4 +1,4 @@
-# Regression Findings (R-001 … R-041)
+# Regression Findings (R-001 … R-042)
 
 Defects and documentation drift turned up while building the regression suite
 (`regression-tests/`), 2026-08-01/02. The suite work was deliberately kept
@@ -19,6 +19,7 @@ finding depends on a fixture, the fixture is named.
 
 | ID | Severity | Area | Finding |
 |----|----------|------|---------|
+| ~~R-042~~ | ~~**High**~~ **FIXED** | `src/fs/affs.rs` | ~~An AFFS partition that is not last on its disk cannot be opened at all~~ — the root-block midpoint was inferred from the end of the *disk*; the read-only opener family now carries the partition length the editable one always had, 2026-08-18 |
 | ~~R-040~~ | ~~**High**~~ **FIXED** | `src/cli/verbs/put.rs`, `src/fs/dir_import.rs` | ~~`put` and `import` never reattach a resource fork, so an extracted Mac archive copied back onto HFS loses every fork~~ — `detect_resource_fork` learned BinHex and both verbs now consult it; all four containers round-trip, 2026-08-17 |
 | ~~R-041~~ | ~~**High**~~ **FIXED** | `src/model/commander_ops.rs`, `src/cli/verbs/tui_app.rs` | ~~Commander drops resource forks: host->image staging hardcoded `resource_fork: None`, and the TUI's image->host copy did not recurse~~ — staging detects forks and skips consumed sidecars; both front ends now share one recursive walker, 2026-08-17 |
 | [R-019](#r-019) | Low — **accepted** | `src/rbformats/vhd.rs` | VHD Creator Host OS makes output non-reproducible across platforms; behaviour kept, parity declares it |
@@ -73,6 +74,59 @@ innocent: the classic and v5 parsers both carry `rsrc`, and the real
 resource fork) round-trips byte-exact through `archive extract` **and** through
 the Commander open path. The forks are lost on the way back **in**, in code
 that has nothing to do with StuffIt.
+
+### R-042 — an AFFS partition that is not last on its disk cannot be opened {#r-042}
+
+**FIXED 2026-08-18, and it was R-030's shape one level up.** R-030 fixed the
+root block being located from the end of the *file*; this is the same mistake
+surviving as a bounded search rather than a wrong constant.
+
+AFFS stores no size anywhere. The root block sits at the volume's midpoint, so
+the root's *position* is the size. `AffsFilesystem::open` took only a reader
+and an offset, so it computed the midpoint of everything from the partition
+start to the end of the reader — which for a partition inside an RDB disk is
+the end of the **disk**. R-030 made that survivable with a 2048-block downward
+scan from the candidate, and that is enough only when the partition sits near
+the end of the disk.
+
+The fixture we had is a single 2 MiB partition on a 3 MiB disk: candidate 3072,
+root 2020, 1052 blocks apart, inside the window. So the case passed and the bug
+sat behind it. The layout every real Amiga uses — DH0 first, DH1/DH2 after —
+does not:
+
+```
+rb-cli ls amiga-base.hdf@1 /        # 2 MiB AFFS at the start of a 32 MiB disk
+  -> error: opening filesystem: parse error: root block: type != T_HEADER
+```
+
+The root block was exactly where it should be. I confirmed the partition's
+bytes were identical to the source volume, and that a valid root block sat at
+partition block 2020 in that image, in the original fixture, and in the carved
+volume alike. The candidate was block 32263 — thirty thousand blocks past the
+search floor.
+
+The message compounded it. `locate_root_block` returning `None` reported
+`root block: type != T_HEADER`, borrowed from the parser, so a search that
+never arrived read as a corrupt disk. It now says what happened and why.
+
+**The fix is to stop inferring.** The editable opener family has always carried
+`EditContext::partition_len`; the read-only side had no way to express it:
+
+- `AffsFilesystem::open_sized(reader, offset, Option<u64>)`, with `open`
+  delegating as `None`
+- `fs::open_filesystem_sized` / `open_filesystem_full` threading it through the
+  dispatch to all four AFFS branches
+- `ResolvedPartition::open_ro`, the counterpart of `open_editable`, so a verb
+  cannot forget the length — 13 verb call sites moved onto it
+- `browse_session`'s ten read paths pass the `partition_size` they already held
+  and already handed the editable path
+
+`None` remains the honest answer for a bare ADF or superfloppy, where the
+reader's end really is the volume's end, so the remaining ~160 call sites are
+unchanged rather than mechanically churned. PFS3, SFS, FAT and the rest record
+their own length and never consulted this.
+
+Case `fs.affs-partition-not-last` in `regression-tests/cases/tier1/`.
 
 ### R-040 — `put` and `import` never reattach a resource fork {#r-040}
 
