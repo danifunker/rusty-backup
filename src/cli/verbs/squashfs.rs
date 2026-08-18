@@ -192,13 +192,9 @@ fn run_verify(args: SquashfsVerifyArgs) -> Result<()> {
     // Open the reader concretely rather than through the trait object, because
     // the verifier drives the SquashFS reader's own traversal.
     let fs_type = {
-        let probe = crate::fs::open_filesystem(
-            reader,
-            ctx.offset,
-            ctx.type_byte,
-            ctx.type_string.as_deref(),
-        )
-        .map_err(|e| anyhow!("opening filesystem: {e}"))?;
+        let probe = ctx
+            .open_ro(reader, None)
+            .map_err(|e| anyhow!("opening filesystem: {e}"))?;
         probe.fs_type().to_string()
     };
     if fs_type != "SquashFS" {
@@ -232,13 +228,9 @@ fn run_plan(args: SquashfsPlanArgs) -> Result<()> {
     let (reader, ctx) =
         resolve_partition_streaming(&args.image.path, args.image.partition.clone())?;
     log_stderr(&ctx.label);
-    let mut fs = crate::fs::open_filesystem(
-        reader,
-        ctx.offset,
-        ctx.type_byte,
-        ctx.type_string.as_deref(),
-    )
-    .map_err(|e| anyhow!("opening filesystem: {e}"))?;
+    let mut fs = ctx
+        .open_ro(reader, None)
+        .map_err(|e| anyhow!("opening filesystem: {e}"))?;
     if fs.fs_type() != "SquashFS" {
         bail!(
             "squashfs plan: {} is a {} volume, not SquashFS",

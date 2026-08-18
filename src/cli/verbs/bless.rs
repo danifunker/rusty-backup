@@ -76,13 +76,9 @@ fn run_show(args: BlessShowArgs) -> Result<()> {
     let (reader, ctx) =
         resolve_partition_streaming(&args.image.path, args.image.partition.clone())?;
     log_stderr(&ctx.label);
-    let mut fs = crate::fs::open_filesystem(
-        reader,
-        ctx.offset,
-        ctx.type_byte,
-        ctx.type_string.as_deref(),
-    )
-    .map_err(|e| anyhow!("opening filesystem: {e}"))?;
+    let mut fs = ctx
+        .open_ro(reader, None)
+        .map_err(|e| anyhow!("opening filesystem: {e}"))?;
 
     match blessed_info(&mut *fs) {
         Some(info) => out_stdout(format_blessed(&info)),

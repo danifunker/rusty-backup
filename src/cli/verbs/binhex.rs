@@ -189,14 +189,9 @@ pub fn run_get(args: GetBinHexArgs) -> Result<()> {
         pw_bytes,
     )?;
     log_stderr(&ctx.label);
-    let mut fs = crate::fs::open_filesystem_with_passphrase(
-        reader,
-        ctx.offset,
-        ctx.type_byte,
-        ctx.type_string.as_deref(),
-        args.password.as_deref(),
-    )
-    .map_err(|e| anyhow!("opening filesystem: {e}"))?;
+    let mut fs = ctx
+        .open_ro(reader, args.password.as_deref())
+        .map_err(|e| anyhow!("opening filesystem: {e}"))?;
 
     let entry = super::ls::resolve_path(&mut *fs, &args.src)?;
     if entry.is_directory() {

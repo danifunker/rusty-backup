@@ -3921,14 +3921,9 @@ impl App {
                 None,
                 None,
             )?;
-            let mut fs = crate::fs::open_filesystem_with_passphrase(
-                reader,
-                ctx.offset,
-                ctx.type_byte,
-                ctx.type_string.as_deref(),
-                None,
-            )
-            .map_err(|e| anyhow::anyhow!("opening filesystem: {e}"))?;
+            let mut fs = ctx
+                .open_ro(reader, None)
+                .map_err(|e| anyhow::anyhow!("opening filesystem: {e}"))?;
             let volume = fs.volume_label().map(|s| s.to_string());
             let blessed = fs.blessed_system_folder();
             let root = fs

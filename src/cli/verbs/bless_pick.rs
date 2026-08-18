@@ -49,13 +49,9 @@ pub fn run(args: BlessPickArgs) -> Result<()> {
     let (reader, ctx) =
         resolve_partition_streaming(&args.image.path, args.image.partition.clone())?;
     log_stderr(&ctx.label);
-    let mut fs = crate::fs::open_filesystem(
-        reader,
-        ctx.offset,
-        ctx.type_byte,
-        ctx.type_string.as_deref(),
-    )
-    .map_err(|e| anyhow!("opening filesystem: {e}"))?;
+    let mut fs = ctx
+        .open_ro(reader, None)
+        .map_err(|e| anyhow!("opening filesystem: {e}"))?;
 
     let root = fs.root().map_err(|e| anyhow!("root: {e}"))?;
     let root_dirs = load_child_dirs(&mut *fs, &root);

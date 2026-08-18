@@ -76,6 +76,28 @@ impl PartitionContext {
     /// no way to know that growing would run into the next partition.
     /// Errors are returned raw so each verb keeps its own wording ("for write",
     /// "for repair", "destination filesystem …").
+    /// Open the resolved partition read-only, telling the driver how long it
+    /// is. The counterpart of [`Self::open_editable`], which has always passed
+    /// `partition_len`; the read side had no way to and so mis-sized every
+    /// AFFS partition that was not last on its disk (R-042).
+    pub fn open_ro<R: Read + Seek + Send + 'static>(
+        &self,
+        handle: R,
+        passphrase: Option<&str>,
+    ) -> Result<Box<dyn crate::fs::filesystem::Filesystem>, crate::fs::filesystem::FilesystemError>
+    {
+        crate::fs::open_filesystem_full(
+            handle,
+            self.offset,
+            // Zero means the resolver had nothing to report, not an empty
+            // partition — the same reading `open_editable` takes.
+            (self.size > 0).then_some(self.size),
+            self.type_byte,
+            self.type_string.as_deref(),
+            passphrase,
+        )
+    }
+
     pub fn open_editable<R: Read + std::io::Write + Seek + Send + 'static>(
         &self,
         handle: R,

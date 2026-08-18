@@ -1533,21 +1533,72 @@ pub fn open_filesystem<R: Read + Seek + Send + 'static>(
     )
 }
 
+/// Like [`open_filesystem`], but tells the driver how long the partition is.
+///
+/// Most filesystems record their own size and ignore this. AFFS does not — its
+/// root block sits at the volume's midpoint, so a driver handed a whole-disk
+/// reader infers the midpoint of the *disk* and fails on any partition that is
+/// not last (R-042). Callers that have a partition table should prefer this;
+/// `None` is the honest answer for a bare image, where the reader's end really
+/// is the volume's end.
+pub fn open_filesystem_sized<R: Read + Seek + Send + 'static>(
+    reader: R,
+    partition_offset: u64,
+    partition_size: Option<u64>,
+    partition_type: u8,
+    partition_type_string: Option<&str>,
+) -> Result<Box<dyn Filesystem>, FilesystemError> {
+    open_filesystem_full(
+        reader,
+        partition_offset,
+        partition_size,
+        partition_type,
+        partition_type_string,
+        None,
+    )
+}
+
 /// Like [`open_filesystem`], but carries an optional filesystem-level
 /// `passphrase` for volumes that encrypt their own contents (APFS FileVault).
 /// The passphrase is ignored by every filesystem that isn't encrypted; on an
 /// encrypted APFS volume, `None` opens it locked (browse then reports
 /// "passphrase required") and a wrong passphrase is an error.
 pub fn open_filesystem_with_passphrase<R: Read + Seek + Send + 'static>(
+    reader: R,
+    partition_offset: u64,
+    partition_type: u8,
+    partition_type_string: Option<&str>,
+    passphrase: Option<&str>,
+) -> Result<Box<dyn Filesystem>, FilesystemError> {
+    open_filesystem_full(
+        reader,
+        partition_offset,
+        None,
+        partition_type,
+        partition_type_string,
+        passphrase,
+    )
+}
+
+/// The dispatch every other opener delegates to. `partition_size` is threaded
+/// to the drivers that cannot derive it themselves; see [`open_filesystem_sized`].
+pub fn open_filesystem_full<R: Read + Seek + Send + 'static>(
     mut reader: R,
     partition_offset: u64,
+    partition_size: Option<u64>,
     partition_type: u8,
     partition_type_string: Option<&str>,
     passphrase: Option<&str>,
 ) -> Result<Box<dyn Filesystem>, FilesystemError> {
     // Check string-based type first (APM partitions)
     if let Some(type_str) = partition_type_string {
-        return open_filesystem_by_string(reader, partition_offset, type_str, passphrase);
+        return open_filesystem_by_string(
+            reader,
+            partition_offset,
+            partition_size,
+            type_str,
+            passphrase,
+        );
     }
     match partition_type {
         // Auto-detect (superfloppy / type byte 0)
@@ -1682,9 +1733,10 @@ pub fn open_filesystem_with_passphrase<R: Read + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
-                "affs" => Ok(Box::new(affs::AffsFilesystem::open(
+                "affs" => Ok(Box::new(affs::AffsFilesystem::open_sized(
                     reader,
                     partition_offset,
+                    partition_size,
                 )?)),
                 "apfs" => Ok(Box::new(apfs::ApfsFilesystem::open_with_passphrase(
                     reader,
@@ -1962,9 +2014,10 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                 )?));
             }
             s if is_amiga_dos_type(s) => {
-                return Ok(Box::new(affs::AffsFilesystem::open(
+                return Ok(Box::new(affs::AffsFilesystem::open_sized(
                     reader,
                     partition_offset,
+                    partition_len,
                 )?));
             }
             s if is_amiga_pfs3_type(s) => {
@@ -2152,9 +2205,10 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
-                "affs" => Ok(Box::new(affs::AffsFilesystem::open(
+                "affs" => Ok(Box::new(affs::AffsFilesystem::open_sized(
                     reader,
                     partition_offset,
+                    partition_len,
                 )?)),
                 "xfs" => Ok(Box::new(xfs::XfsFilesystem::open(
                     reader,
@@ -2340,6 +2394,7 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
 fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
     mut reader: R,
     partition_offset: u64,
+    partition_size: Option<u64>,
     type_str: &str,
     passphrase: Option<&str>,
 ) -> Result<Box<dyn Filesystem>, FilesystemError> {
@@ -2404,9 +2459,10 @@ fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
         // AmigaDOS Fast/Original File System — DosType DOS\0..DOS\7. PFS and
         // SFS share the same string convention via RDB but route to other
         // modules (Phase 5/7); we only claim the DOS\ prefix here.
-        s if is_amiga_dos_type(s) => Ok(Box::new(affs::AffsFilesystem::open(
+        s if is_amiga_dos_type(s) => Ok(Box::new(affs::AffsFilesystem::open_sized(
             reader,
             partition_offset,
+            partition_size,
         )?)),
         // PFS3 family — `PFS\3`, `PDS\3`, `muFS`. Read-only browse +
         // backup (Phase 5); editing arrives in Phase 6.
