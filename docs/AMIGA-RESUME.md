@@ -1,12 +1,27 @@
-# Resume: an SFS mount verdict from Copperline
+# Amiga work — resume here
 
 Written 2026-08-18 at a task switch. Everything below is either committed or
 reproducible from committed code; nothing depends on a live session.
 
+## The prompt
+
+Paste this to pick the work back up:
+
+> Continue the SFS mount oracle in rusty-backup. Read `docs/AMIGA-RESUME.md`
+> first — it has the plan, the geometry, and six gotchas already paid for.
+> Short version: boot a copy of the `fs.sfs.workbench-dh0.hd.img` fixture (a
+> real bootable AmigaOS system carrying the genuine SFS handler in `/L`) as DH0
+> with our `new volume sfs` output as DH1, using 16x63 geometry and
+> `new hd rdb --filesystem` to embed the handler. If Workbench appears, our
+> FSHD chain works; the `DH1:` line is then a verdict on our SFS writer. Model
+> it on `regression-tests/oracles/copperline/affs_mount.py`, which already does
+> the same thing for AFFS end to end.
+
 ## The goal
 
-`fs.affs` has an authoritative mount verdict (`affs_mount.py`). Do the same for
-`fs.sfs`, then `fs.pfs3`. The blocker is that Kickstart has FFS in ROM but no
+`fs.affs` has an authoritative mount verdict, in
+`regression-tests/oracles/copperline/affs_mount.py`. Do the same for `fs.sfs`,
+then `fs.pfs3`. The blocker is that Kickstart has FFS in ROM but no
 SFS handler, so an SFS check has to supply one — and until that is proven to
 load, a `Not a DOS disk` result says nothing about our bytes.
 
@@ -49,7 +64,8 @@ The fixture is read-only corpus, so this works on a ~500 MB copy.
 
 1. Copy the fixture to scratch. Carve nothing — it is already a bare volume.
 2. Extract the handler: `rb-cli get <copy> /L/SmartFileSystemFixed <path>`
-   (it is also staged at `fixtures/oracle-assets/amiga/SmartFileSystemFixed`).
+   (also staged in the corpus at
+   `regression-tests/fixtures/oracle-assets/amiga/SmartFileSystemFixed`).
 3. Build our test volume: `rb-cli new volume sfs --size 8257536` (16 cylinders)
    and put a file in it, so a mounted volume can be shown to list.
 4. `rb-cli new hd rdb --size <sum+slack> --heads 16 --sectors 63
@@ -57,10 +73,11 @@ The fixture is read-only corpus, so this works on a ~500 MB copy.
    --fill 1=<copy> --fill 2=<ours>
    --filesystem 'SFS\0=<handler>' <disk>`
 5. `rb-cli partmap set-bootable <disk> 1 --bootable`  — required; see below.
-6. Replace DH0's startup, exactly as `affs_mount.py` does:
+6. Replace DH0's startup, exactly as the AFFS oracle does:
    `rb-cli put <disk>@1 <probe> /s/Startup-Sequence --force`
-   The probe body and the SER: MountList entry are in `affs_mount.py`; reuse
-   them verbatim. The 3.x `Mount` is at `oracle-assets/amiga/Mount-3x`.
+   The probe body and the SER: MountList entry are in that oracle; reuse
+   them verbatim. The 3.x `Mount` is staged in the corpus at
+   `regression-tests/fixtures/oracle-assets/amiga/Mount-3x`.
 7. Boot headless and read the verdict off stdout:
    `copperline --config <cfg> --noaudio --screenshot-after 40 <png>`
 
