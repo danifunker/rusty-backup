@@ -25,6 +25,8 @@ pub mod efs;
 pub mod efs_fsck;
 pub mod efs_resize;
 pub mod efs_v1;
+pub mod efs_v1_fsck;
+pub mod efs_v1_resize;
 pub mod entry;
 pub mod exfat;
 pub mod exfat_clone;
@@ -186,6 +188,7 @@ pub fn resize_filesystem_for(
     pfs3::resize_pfs3_in_place(file, partition_offset, new_size_bytes, log_cb)?;
     affs::resize_affs_in_place(file, partition_offset, new_size_bytes, log_cb)?;
     efs_resize::resize_efs_in_place(file, partition_offset, new_size_bytes, log_cb)?;
+    efs_v1_resize::resize_efs_v1_in_place(file, partition_offset, new_size_bytes, log_cb)?;
     qdos::resize_qdos_in_place(file, partition_offset, new_size_bytes, log_cb)?;
     prodos::resize_prodos_in_place(file, partition_offset, new_size_bytes, log_cb)?;
     Ok(())
@@ -217,7 +220,8 @@ pub enum InPlaceResize {
 /// magic at the partition offset — they arrive with an RDB type string, which
 /// [`in_place_resize_support`] checks separately.
 const IN_PLACE_RESIZABLE: &[&str] = &[
-    "fat", "ntfs", "exfat", "hfs", "hfsplus", "ext", "btrfs", "efs", "qdos", "affs", "prodos",
+    "fat", "ntfs", "exfat", "hfs", "hfsplus", "ext", "btrfs", "efs", "efs_v1", "qdos", "affs",
+    "prodos",
 ];
 
 /// Classify the filesystem at `partition_offset` for in-place resizing.

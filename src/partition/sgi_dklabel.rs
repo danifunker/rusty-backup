@@ -67,7 +67,9 @@ pub const SGI_DKLABEL_RESERVED_BLOCKS: u64 = 5;
 /// 0xA0 / 0xA1. Only this table produces it.
 pub const SGI_TYPE_BYTE_EFS_V1: u8 = 0xA2;
 
-const OFF_MAP: usize = 0x16;
+pub(crate) const OFF_MAP: usize = 0x16;
+/// `d_bootfs` / `d_swapfs`: slot numbers, one byte each.
+pub(crate) const OFF_BOOTFS: usize = 0x14;
 const OFF_NAME: usize = 0x5C;
 const OFF_SERIAL: usize = 0x8E;
 const NAME_LEN: usize = 50;

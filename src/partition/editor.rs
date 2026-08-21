@@ -205,8 +205,8 @@ pub fn apply_edits(
         PartitionTable::Sun(_) => {
             bail!("Sun disk-label editing is not yet implemented (read / browse / back up only)")
         }
-        PartitionTable::SgiDkLabel(_) => {
-            bail!("SGI disk-label editing is not yet implemented (read / browse / back up only)")
+        PartitionTable::SgiDkLabel(label) => {
+            apply_sgi_dklabel_edits(file, label, edits, disk_size_bytes, log_cb)
         }
         PartitionTable::None { .. } => bail!("cannot edit partition table on a superfloppy"),
         PartitionTable::Dsd { .. } => {
@@ -688,6 +688,175 @@ fn apply_apm_edits(
     Ok(())
 }
 
+/// Edit the eight `{d_base, d_size}` slots. `index` is the raw slot, matching
+/// `PartitionInfo::index` and what `validate_edits` matches on.
+fn apply_sgi_dklabel_edits(
+    file: &mut (impl Read + Write + Seek),
+    label: &crate::partition::sgi_dklabel::SgiDiskLabel,
+    edits: &[PartitionTableEdit],
+    disk_size_bytes: u64,
+    log_cb: &mut impl FnMut(&str),
+) -> Result<()> {
+    use crate::partition::sgi_dklabel::{apply_byte_order, OFF_BOOTFS, OFF_MAP, SGI_DKLABEL_NFS};
+    use byteorder::{BigEndian, ByteOrder};
+
+    file.seek(SeekFrom::Start(0))?;
+    let mut sector = [0u8; 512];
+    file.read_exact(&mut sector)?;
+    apply_byte_order(label.byte_order, &mut sector);
+
+    let mut map = label.map.clone();
+    map.resize(
+        SGI_DKLABEL_NFS,
+        crate::partition::sgi_dklabel::SgiDiskMap { base: 0, size: 0 },
+    );
+    let mut bootfs = sector[OFF_BOOTFS];
+    let total_blocks = (disk_size_bytes / 512) as u32;
+    // Only slots the table actually lists may be edited: an empty or
+    // whole-disk wrapper slot is not a partition the caller can have meant.
+    let resolve = |raw: usize| -> Result<usize> {
+        if label.browsable_slots().any(|(i, _)| i == raw) {
+            Ok(raw)
+        } else {
+            anyhow::bail!(
+                "SGI disk label: slot {raw} is not a listed partition (listed: {})",
+                label
+                    .browsable_slots()
+                    .map(|(i, _)| i.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+    };
+
+    for edit in edits {
+        match edit {
+            PartitionTableEdit::ResizeEntry {
+                index,
+                new_size_bytes,
+            } => {
+                let raw = resolve(*index)?;
+                let slot = slot_mut(&mut map, raw)?;
+                slot.size = (*new_size_bytes / 512) as u32;
+                log_cb(&format!(
+                    "SGI disk label: slot {raw} resized to {} blocks",
+                    slot.size
+                ));
+            }
+            PartitionTableEdit::MoveEntry {
+                index,
+                new_start_lba,
+            } => {
+                let raw = resolve(*index)?;
+                let slot = slot_mut(&mut map, raw)?;
+                slot.base = *new_start_lba as u32;
+                log_cb(&format!(
+                    "SGI disk label: slot {raw} moved to block {}",
+                    slot.base
+                ));
+            }
+            PartitionTableEdit::DeleteEntry { index } => {
+                let raw = resolve(*index)?;
+                let slot = slot_mut(&mut map, raw)?;
+                slot.base = 0;
+                slot.size = 0;
+                log_cb(&format!("SGI disk label: slot {raw} cleared"));
+            }
+            PartitionTableEdit::AddEntry {
+                start_lba,
+                size_bytes,
+                ..
+            } => {
+                let free = map
+                    .iter()
+                    .position(|m| m.size == 0)
+                    .ok_or_else(|| anyhow::anyhow!("SGI disk label: all 8 slots are in use"))?;
+                map[free].base = *start_lba as u32;
+                map[free].size = (*size_bytes / 512) as u32;
+                log_cb(&format!(
+                    "SGI disk label: slot {free} added at block {} for {} blocks",
+                    map[free].base, map[free].size
+                ));
+            }
+            PartitionTableEdit::SetBootable { index, bootable } => {
+                if !*bootable {
+                    anyhow::bail!(
+                        "SGI disk label: d_bootfs always names one slot, so a boot slot can be \
+                         moved but not cleared"
+                    );
+                }
+                let raw = resolve(*index)?;
+                bootfs = raw as u8;
+                log_cb(&format!("SGI disk label: d_bootfs set to slot {raw}"));
+            }
+            PartitionTableEdit::ChangeType { .. } => {
+                anyhow::bail!(
+                    "SGI disk label: slots have no type field — a slot's role comes from \
+                     d_bootfs / d_swapfs / d_rootfs, not from a per-slot type"
+                );
+            }
+        }
+    }
+
+    check_dklabel_layout(&map, total_blocks)?;
+
+    for (i, m) in map.iter().enumerate() {
+        let o = OFF_MAP + i * 8;
+        BigEndian::write_u32(&mut sector[o..o + 4], m.base);
+        BigEndian::write_u32(&mut sector[o + 4..o + 8], m.size);
+    }
+    sector[OFF_BOOTFS] = bootfs;
+    // `d_rootnotboot` / `d_rootfs` are left exactly as found, so a disk that
+    // boots from its root keeps doing so.
+
+    apply_byte_order(label.byte_order, &mut sector);
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(&sector)?;
+    file.flush()?;
+    Ok(())
+}
+
+fn slot_mut(
+    map: &mut [crate::partition::sgi_dklabel::SgiDiskMap],
+    index: usize,
+) -> Result<&mut crate::partition::sgi_dklabel::SgiDiskMap> {
+    map.get_mut(index)
+        .ok_or_else(|| anyhow::anyhow!("SGI disk label: slot {index} out of range (0..7)"))
+}
+
+/// Reject partial overlap or a slot past the disk. Containment is allowed: a
+/// slot wrapping another is how the label spells "the whole drive".
+fn check_dklabel_layout(
+    map: &[crate::partition::sgi_dklabel::SgiDiskMap],
+    total_blocks: u32,
+) -> Result<()> {
+    for (i, m) in map.iter().enumerate() {
+        if m.size == 0 {
+            continue;
+        }
+        let end = m.base as u64 + m.size as u64;
+        if total_blocks > 0 && end > total_blocks as u64 {
+            anyhow::bail!(
+                "SGI disk label: slot {i} runs to block {end}, past the {total_blocks}-block disk"
+            );
+        }
+        for (j, n) in map.iter().enumerate().skip(i + 1) {
+            if n.size == 0 {
+                continue;
+            }
+            let (a0, a1) = (m.base as u64, end);
+            let (b0, b1) = (n.base as u64, n.base as u64 + n.size as u64);
+            let contains = (a0 <= b0 && a1 >= b1) || (b0 <= a0 && b1 >= a1);
+            if !contains && a0 < b1 && b0 < a1 {
+                anyhow::bail!(
+                    "SGI disk label: slots {i} [{a0}..{a1}) and {j} [{b0}..{b1}) overlap"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Map an [`PartitionTableEdit::AddEntry`]/[`PartitionTableEdit::ChangeType`]
 /// type byte/string into the SGI partition-type discriminant. Accepts both
 /// our synthetic MBR-bytes (0xA0 / 0xA1 — what `PartitionTable::partitions`
@@ -1103,5 +1272,200 @@ mod tests {
             updated.partitions[0].partition_type(),
             SgiPartitionType::Efs
         );
+    }
+
+    // ---- SGI disk label ---------------------------------------------------
+
+    /// A minimal but valid label: geometry that parses, one slot at block 119.
+    fn dklabel_disk(swabbed: bool) -> Vec<u8> {
+        use crate::partition::sgi_dklabel::{swab16_in_place, SGI_DKLABEL_MAGIC};
+        use byteorder::{BigEndian, ByteOrder};
+        let mut img = vec![0u8; 4 * 1024 * 1024];
+        BigEndian::write_u32(&mut img[0x00..0x04], SGI_DKLABEL_MAGIC);
+        BigEndian::write_u16(&mut img[0x08..0x0A], 100); // cylinders
+        BigEndian::write_u16(&mut img[0x0A..0x0C], 4); // heads
+        BigEndian::write_u16(&mut img[0x0C..0x0E], 20); // sectors
+                                                        // slot 0: 119 .. 119+1000
+        BigEndian::write_u32(&mut img[0x16..0x1A], 119);
+        BigEndian::write_u32(&mut img[0x1A..0x1E], 1000);
+        if swabbed {
+            let mut head = img[..512].to_vec();
+            swab16_in_place(&mut head);
+            img[..512].copy_from_slice(&head);
+        }
+        img
+    }
+
+    fn dklabel_of(img: &[u8]) -> crate::partition::sgi_dklabel::SgiDiskLabel {
+        crate::partition::sgi_dklabel::SgiDiskLabel::parse(&img[..512]).unwrap()
+    }
+
+    fn edit_dklabel(img: &mut Vec<u8>, edits: &[PartitionTableEdit]) -> Result<()> {
+        let label = dklabel_of(img);
+        let total = img.len() as u64;
+        let mut cur = Cursor::new(std::mem::take(img));
+        let r = apply_sgi_dklabel_edits(&mut cur, &label, edits, total, &mut |_| {});
+        *img = cur.into_inner();
+        r
+    }
+
+    #[test]
+    fn dklabel_resize_updates_the_slot() {
+        let mut img = dklabel_disk(false);
+        edit_dklabel(
+            &mut img,
+            &[PartitionTableEdit::ResizeEntry {
+                index: 0,
+                new_size_bytes: 2000 * 512,
+            }],
+        )
+        .unwrap();
+        assert_eq!(dklabel_of(&img).map[0].size, 2000);
+        assert_eq!(dklabel_of(&img).map[0].base, 119);
+    }
+
+    #[test]
+    fn dklabel_edits_preserve_a_byte_swapped_image() {
+        let mut img = dklabel_disk(true);
+        assert_eq!(
+            dklabel_of(&img).byte_order,
+            crate::partition::sgi_dklabel::SgiLabelByteOrder::Swabbed
+        );
+        edit_dklabel(
+            &mut img,
+            &[PartitionTableEdit::ResizeEntry {
+                index: 0,
+                new_size_bytes: 1500 * 512,
+            }],
+        )
+        .unwrap();
+        let after = dklabel_of(&img);
+        // Still swabbed, and the edit landed: writing must not silently
+        // normalise the medium's word order.
+        assert_eq!(
+            after.byte_order,
+            crate::partition::sgi_dklabel::SgiLabelByteOrder::Swabbed
+        );
+        assert_eq!(after.map[0].size, 1500);
+    }
+
+    #[test]
+    fn dklabel_add_uses_the_first_free_slot() {
+        let mut img = dklabel_disk(false);
+        edit_dklabel(
+            &mut img,
+            &[PartitionTableEdit::AddEntry {
+                start_lba: 2000,
+                size_bytes: 500 * 512,
+                partition_type: 0,
+                type_string: None,
+                bootable: false,
+            }],
+        )
+        .unwrap();
+        let m = dklabel_of(&img).map;
+        assert_eq!((m[1].base, m[1].size), (2000, 500));
+    }
+
+    #[test]
+    fn dklabel_overlap_is_refused() {
+        let mut img = dklabel_disk(false);
+        let before = img.clone();
+        let err = edit_dklabel(
+            &mut img,
+            &[PartitionTableEdit::AddEntry {
+                start_lba: 500,
+                size_bytes: 1000 * 512,
+                partition_type: 0,
+                type_string: None,
+                bootable: false,
+            }],
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("overlap"), "{err}");
+        assert_eq!(img, before, "a refused edit must not write");
+    }
+
+    #[test]
+    fn dklabel_wrapper_slot_containment_is_allowed() {
+        let mut img = dklabel_disk(false);
+        // A slot spanning the whole drive is how the label spells "everything".
+        edit_dklabel(
+            &mut img,
+            &[PartitionTableEdit::AddEntry {
+                start_lba: 0,
+                size_bytes: 8192 * 512,
+                partition_type: 0,
+                type_string: None,
+                bootable: false,
+            }],
+        )
+        .unwrap();
+        assert_eq!(dklabel_of(&img).map[1].size, 8192);
+    }
+
+    #[test]
+    fn dklabel_past_end_is_refused() {
+        let mut img = dklabel_disk(false);
+        let err = edit_dklabel(
+            &mut img,
+            &[PartitionTableEdit::ResizeEntry {
+                index: 0,
+                new_size_bytes: 64 * 1024 * 1024,
+            }],
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("past the"), "{err}");
+    }
+
+    #[test]
+    fn dklabel_change_type_is_refused_with_a_reason() {
+        let mut img = dklabel_disk(false);
+        let err = edit_dklabel(
+            &mut img,
+            &[PartitionTableEdit::ChangeType {
+                index: 0,
+                new_type_byte: 0x83,
+                new_type_string: None,
+            }],
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("no type field"), "{err}");
+    }
+
+    #[test]
+    fn dklabel_set_bootable_moves_d_bootfs() {
+        let mut img = dklabel_disk(false);
+        // Add a second slot, then boot from the partition listed second.
+        edit_dklabel(
+            &mut img,
+            &[PartitionTableEdit::AddEntry {
+                start_lba: 2000,
+                size_bytes: 500 * 512,
+                partition_type: 0,
+                type_string: None,
+                bootable: false,
+            }],
+        )
+        .unwrap();
+        edit_dklabel(
+            &mut img,
+            &[PartitionTableEdit::SetBootable {
+                index: 1,
+                bootable: true,
+            }],
+        )
+        .unwrap();
+        assert_eq!(dklabel_of(&img).bootfs, 1);
+    }
+
+    /// An empty or wrapper slot is not a partition, so editing one must be
+    /// refused rather than landing on a slot the caller never saw.
+    #[test]
+    fn dklabel_editing_an_unlisted_slot_is_refused() {
+        let mut img = dklabel_disk(false);
+        let err =
+            edit_dklabel(&mut img, &[PartitionTableEdit::DeleteEntry { index: 4 }]).unwrap_err();
+        assert!(format!("{err}").contains("not a listed partition"), "{err}");
     }
 }

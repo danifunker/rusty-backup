@@ -9,8 +9,8 @@ The on-disk formats used by Silicon Graphics' first workstations — the IRIS
 - **EFS v1**, the original Extent File System, in each slot
   (`src/fs/efs_v1.rs`).
 
-Support is **read-only**: parse the label, browse / inspect / extract from the
-filesystems. Writing, resize and fsck are not implemented.
+Both are read/write: parse and edit the label, and browse / inspect / extract /
+edit / create / resize / fsck the filesystems.
 
 ## Relationship to IRIX EFS
 
@@ -133,6 +133,47 @@ Adding a file to a copy of the real 60 MB disk, in both orientations, leaves
 every pre-existing file byte-identical (a `diff -r` of the extracted tree is
 clean), leaves the untouched `/usr` volume bit-identical, and leaves a valid
 superblock checksum with `fs_dirty` still zero.
+
+## Checking and repairing
+
+`src/fs/efs_v1_fsck.rs` verifies a volume against itself. IRIX's own `fsck_efs`
+was never public and none of the era's tooling survives, so there is no oracle
+to agree with — the checks are the format's own invariants:
+
+geometry closure, the superblock checksum, every live inode's extents (zero
+`ex_magic`, inside the volume, and covering only cylinder-group data blocks),
+the bitmap in both directions, `fs_tfree` / `fs_tinode` against the counts just
+taken, and a breadth-first walk from inode 2 to find anything live that no
+directory references.
+
+Repair fixes only what a sound structure makes unambiguous: it rebuilds the
+bitmap from the inode table rather than patching single bits, re-derives the
+counters, reseals the checksum, and adopts orphans into `/lost+found`. When any
+*structural* finding stands — an extent over an inode table, two inodes sharing
+a block, broken geometry — repair writes nothing at all and says why. There is
+no journal and no second opinion available, so guessing would destroy data.
+
+Both filesystems on the sample IRIS 3130 disk verify clean: 448 files / 13
+directories on root, 2,580 / 149 on `/usr`.
+
+## Resizing
+
+`src/fs/efs_v1_resize.rs` grows and shrinks in place. `firstcg` and `cgfsize`
+are fixed at format time, so the only free variable is how many whole cylinder
+groups fit, and a request that is not a whole number of groups rounds down.
+
+Two constraints are specific to v1. There is no replica superblock to keep in
+step. And the bitmap sits at a fixed block 2 sized from `fs_size`, so a grow can
+need more bitmap blocks than the gap below `firstcg` — refused rather than
+worked around, since moving `firstcg` would relocate every cylinder group. The
+era's mkfs reserved only the blocks a volume needed, which makes an original
+disk barely growable; `create_blank_efs_v1` reserves room for roughly a
+fourfold grow instead. The gap is unused space either way and `fs_bmsize` still
+declares the true length, so such a volume reads identically on a period system.
+
+A shrink is refused while any live inode sits past the new inode table or any
+extent past the new end. Both directions rebuild the bitmap from the inode
+table and then re-run fsck as a gate before the result is accepted.
 
 ## m68k struct packing
 

@@ -28,8 +28,8 @@ support the disk types (floppy / hard disk / CD-ROM) of the outstanding cores.
   Amiga OFS/FFS (AFFS) / PFS3 / SFS (all three creatable: `new volume affs` /
   `pfs3` / `sfs`; AFFS output mounts Read/Write under a real Kickstart 3.1,
   R-020), IRIX EFS (validated by IRIX 6.5's own fsck, which also mounts and
-  writes to volumes we format, R-039), SGI EFS v1 (read + edit + create,
-  `new volume efs-v1` — the original 1986 Extent File System from the IRIS
+  writes to volumes we format, R-039), SGI EFS v1 (read + edit + create +
+  resize + fsck, `new volume efs-v1` — the original 1986 Extent File System from the IRIS
   2000 / 3000 series, System V directories and all; auto-detects the
   byte-swapped images period SGI disk controllers produce, and writes back in
   whichever orientation the image is already in), CP/M (read + edit + create +

@@ -83,36 +83,36 @@ const OFF_MAGIC: usize = 0x26;
 /// On-volume part of `struct efs`, up to and including `fs_checksum`.
 pub const EFS_V1_SUPERBLOCK_SIZE: usize = 0xA2;
 /// `EFS_SUPERBB` — the superblock's block number.
-const EFS_V1_SUPERBB: u64 = 1;
+pub(crate) const EFS_V1_SUPERBB: u64 = 1;
 /// `EFS_BITMAPBB` — where the free-block bitmap starts.
-const EFS_V1_BITMAPBB: u32 = 2;
+pub(crate) const EFS_V1_BITMAPBB: u32 = 2;
 
 const EFS_V1_INODESIZE: u64 = 128;
 /// `EFS_INOPBB` — inodes per basic block.
 const EFS_V1_INOPBB: u32 = (EFS_V1_BLOCKSIZE / EFS_V1_INODESIZE) as u32;
 /// `EFS_DIRECTEXTENTS` — extents stored inline in an inode.
-const EFS_V1_DIRECTEXTENTS: usize = 12;
+pub(crate) const EFS_V1_DIRECTEXTENTS: usize = 12;
 /// `EFS_MAXEXTENTS` — the hard cap on extents per file.
-const EFS_V1_MAXEXTENTS: usize = 2048;
+pub(crate) const EFS_V1_MAXEXTENTS: usize = 2048;
 /// `EFS_MAXEXTENTLEN` — longest single extent, in blocks.
 const EFS_V1_MAXEXTENTLEN: u32 = 256 - 8;
 /// Extent records packed into one indirect index block.
 const EFS_V1_EXTENTS_PER_BLOCK: usize = (EFS_V1_BLOCKSIZE / 8) as usize;
 
 /// `DIRSIZ` — the fixed name field of a `struct direct`.
-const EFS_V1_DIRSIZ: usize = 14;
+pub(crate) const EFS_V1_DIRSIZ: usize = 14;
 /// `sizeof(struct direct)`: a 16-bit `ino_t` plus `d_name[DIRSIZ]`.
-const EFS_V1_DIRENTSIZE: usize = 2 + EFS_V1_DIRSIZ;
+pub(crate) const EFS_V1_DIRENTSIZE: usize = 2 + EFS_V1_DIRSIZ;
 
 /// The root is inode 2, as in every filesystem of this lineage.
-const EFS_V1_ROOT_INODE: u32 = 2;
+pub(crate) const EFS_V1_ROOT_INODE: u32 = 2;
 
 /// `di_size` is a 32-bit `off_t` the kernel treats as signed.
 const EFS_V1_MAX_FILE_SIZE: u64 = i32::MAX as u64;
 
 /// Ceiling on a single `read_file` / directory allocation, so a corrupt
 /// `di_size` cannot make us reserve gigabytes before the first read.
-const EFS_V1_SANE_ALLOC: usize = 64 * 1024 * 1024;
+pub(crate) const EFS_V1_SANE_ALLOC: usize = 64 * 1024 * 1024;
 
 /// `MAXPATHLEN` — the bound on a symlink target, which is stored as file data.
 const EFS_V1_MAXPATHLEN: usize = 1024;
@@ -233,7 +233,7 @@ impl EfsV1Superblock {
     }
 
     /// Bitmap length in whole blocks.
-    fn bitmap_blocks(&self) -> u32 {
+    pub(crate) fn bitmap_blocks(&self) -> u32 {
         (self.bmsize as u64).div_ceil(EFS_V1_BLOCKSIZE) as u32
     }
 
@@ -449,7 +449,7 @@ impl EfsV1Inode {
         (self.mode & 0o170000) == 0o120000
     }
 
-    fn is_device(&self) -> bool {
+    pub(crate) fn is_device(&self) -> bool {
         matches!(self.mode & 0o170000, 0o020000 | 0o060000)
     }
 
@@ -579,6 +579,32 @@ impl<R: Read + Seek> EfsV1Filesystem<R> {
         })
     }
 
+    /// The raw superblock sector, byte order already corrected. fsck needs it
+    /// to recompute the checksum over the bytes as stored.
+    pub(crate) fn read_superblock_sector(
+        &mut self,
+    ) -> Result<[u8; EFS_V1_BLOCKSIZE as usize], FilesystemError> {
+        let mut sector = [0u8; EFS_V1_BLOCKSIZE as usize];
+        self.read_block(EFS_V1_SUPERBB as u32, &mut sector)?;
+        Ok(sector)
+    }
+
+    /// The free-space bitmap, `bmsize` bytes starting at block 2. Set bit =
+    /// free, LSB-first within each byte.
+    pub(crate) fn read_bitmap(&mut self) -> Result<Vec<u8>, FilesystemError> {
+        let bmsize = self.sb.bmsize as usize;
+        if bmsize == 0 {
+            return Err(FilesystemError::InvalidData(
+                "EFS v1 bitmap size is 0 — superblock cannot support mutation".to_string(),
+            ));
+        }
+        let blocks = self.sb.bitmap_blocks();
+        let mut buf = vec![0u8; blocks as usize * EFS_V1_BLOCKSIZE as usize];
+        self.read_blocks(EFS_V1_BITMAPBB, blocks, &mut buf)?;
+        buf.truncate(bmsize);
+        Ok(buf)
+    }
+
     /// Take the underlying reader back, for callers that need the image bytes
     /// after mutating the volume.
     pub fn reader_into_inner(self) -> R {
@@ -588,6 +614,11 @@ impl<R: Read + Seek> EfsV1Filesystem<R> {
     /// The parsed superblock.
     pub fn superblock(&self) -> &EfsV1Superblock {
         &self.sb
+    }
+
+    /// Mutable superblock, for the resizer. Callers must `sync_superblock`.
+    pub(crate) fn sb_mut(&mut self) -> &mut EfsV1Superblock {
+        &mut self.sb
     }
 
     /// How the image's 16-bit words are ordered.
@@ -773,7 +804,7 @@ impl<R: Read + Seek> EfsV1Filesystem<R> {
     /// Directory entries of `inode` as `(inum, name)`, skipping free slots and
     /// `.` / `..`. Names are the System V `struct direct` shape: a 16-bit
     /// inode number then a NUL-padded 14-byte name.
-    fn read_dir_entries(
+    pub(crate) fn read_dir_entries(
         &mut self,
         inode: &EfsV1Inode,
     ) -> Result<Vec<(u32, String)>, FilesystemError> {
@@ -968,7 +999,7 @@ impl EfsV1DataRegions {
     }
 
     /// Every cylinder group's data range, low block to high.
-    fn ranges(self) -> impl Iterator<Item = (u32, u32)> {
+    pub(crate) fn ranges(self) -> impl Iterator<Item = (u32, u32)> {
         (0..self.ncg).filter_map(move |cg| self.cg_data_range(cg))
     }
 
@@ -978,12 +1009,12 @@ impl EfsV1DataRegions {
     }
 }
 
-/// Write plumbing. Split from the read impl so a read-only source still opens:
-/// only these methods need `R: Write`.
-impl<R: Read + Write + Seek + Send> EfsV1Filesystem<R> {
+/// Write plumbing, split from the read impl so a read-only source still opens.
+/// No `Send` here: that is the trait's requirement, not these methods'.
+impl<R: Read + Write + Seek> EfsV1Filesystem<R> {
     /// Write `buf` starting at block `bn`, applying this image's word order on
     /// the way out so a byte-swapped volume stays internally consistent.
-    fn write_blocks(&mut self, bn: u32, buf: &[u8]) -> Result<(), FilesystemError> {
+    pub(crate) fn write_blocks(&mut self, bn: u32, buf: &[u8]) -> Result<(), FilesystemError> {
         if !buf.len().is_multiple_of(EFS_V1_BLOCKSIZE as usize) {
             return Err(FilesystemError::InvalidData(format!(
                 "EFS v1 write_blocks: {} bytes is not a whole number of blocks",
@@ -1018,22 +1049,6 @@ impl<R: Read + Write + Seek + Send> EfsV1Filesystem<R> {
         sb.recompute_checksum(&mut sector);
         self.sb = sb;
         self.write_block(EFS_V1_SUPERBB as u32, &sector)
-    }
-
-    /// The free-space bitmap, `bmsize` bytes starting at block 2. Set bit =
-    /// free, LSB-first within each byte.
-    pub(crate) fn read_bitmap(&mut self) -> Result<Vec<u8>, FilesystemError> {
-        let bmsize = self.sb.bmsize as usize;
-        if bmsize == 0 {
-            return Err(FilesystemError::InvalidData(
-                "EFS v1 bitmap size is 0 — superblock cannot support mutation".to_string(),
-            ));
-        }
-        let blocks = self.sb.bitmap_blocks();
-        let mut buf = vec![0u8; blocks as usize * EFS_V1_BLOCKSIZE as usize];
-        self.read_blocks(EFS_V1_BITMAPBB, blocks, &mut buf)?;
-        buf.truncate(bmsize);
-        Ok(buf)
     }
 
     /// Write the bitmap back, preserving any bytes past `bmsize` in the final
@@ -1159,6 +1174,59 @@ impl<R: Read + Write + Seek + Send> EfsV1Filesystem<R> {
         inode.write_into(&mut slot);
         sector[offset..offset + EFS_V1_INODESIZE as usize].copy_from_slice(&slot);
         self.write_block(block, &sector)
+    }
+
+    /// Every block `inode` owns: its data extents plus, in indirect mode, the
+    /// index runs the inline slots point at.
+    pub(crate) fn owned_extents(
+        &mut self,
+        inode: &EfsV1Inode,
+    ) -> Result<Vec<EfsV1Extent>, FilesystemError> {
+        if inode.numextents == 0 || inode.is_device() {
+            return Ok(Vec::new());
+        }
+        let mut owned = self.extents_of(inode)?;
+        if inode.numextents as usize > EFS_V1_DIRECTEXTENTS {
+            let direxts = (inode.extents[0].offset as usize).min(EFS_V1_DIRECTEXTENTS);
+            owned.extend_from_slice(&inode.extents[..direxts]);
+        }
+        Ok(owned)
+    }
+
+    /// Recompute the bitmap from the inode table, which is authoritative once
+    /// fsck says the structure is sound. Returns it with the free-inode count.
+    pub(crate) fn rebuild_bitmap(&mut self) -> Result<(Vec<u8>, u32), FilesystemError> {
+        let sb = self.sb.clone();
+        let regions = EfsV1DataRegions::from_sb(&sb);
+        let mut bm = vec![0u8; sb.bmsize as usize];
+        for (lo, hi) in regions.ranges() {
+            for b in lo..hi {
+                let by = (b / 8) as usize;
+                if by < bm.len() {
+                    bm[by] |= 1u8 << (b % 8);
+                }
+            }
+        }
+        let mut free_inodes = 0u32;
+        for inum in 0..sb.total_inodes() {
+            let inode = self.read_inode(inum)?;
+            if inode.is_free() {
+                free_inodes += 1;
+                continue;
+            }
+            for e in self.owned_extents(&inode)? {
+                if e.is_hole() {
+                    continue;
+                }
+                for b in e.bn..e.bn + e.length as u32 {
+                    let by = (b / 8) as usize;
+                    if by < bm.len() {
+                        bm[by] &= !(1u8 << (b % 8));
+                    }
+                }
+            }
+        }
+        Ok((bm, free_inodes))
     }
 
     /// Return every block `inode` holds — data extents plus any indirect index
@@ -1362,7 +1430,7 @@ impl<R: Read + Write + Seek + Send> EfsV1Filesystem<R> {
 
     /// Recount `fs_tfree` from the bitmap. Cheaper than tracking deltas and it
     /// self-corrects, matching the invariant the real disk holds.
-    fn refresh_tfree(&mut self, bm: &[u8]) {
+    pub(crate) fn refresh_tfree(&mut self, bm: &[u8]) {
         let regions = EfsV1DataRegions::from_sb(&self.sb);
         self.sb.tfree = Self::count_free_blocks(bm, &regions);
     }
@@ -1740,6 +1808,10 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Ef
         Ok(e)
     }
 
+    fn repair(&mut self) -> Result<super::fsck::RepairReport, FilesystemError> {
+        repair_efs_v1(self)
+    }
+
     fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
         self.sync_superblock()
     }
@@ -1752,6 +1824,10 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Ef
 }
 
 impl<R: Read + Seek + Send> Filesystem for EfsV1Filesystem<R> {
+    fn fsck(&mut self) -> Option<Result<super::fsck::FsckResult, FilesystemError>> {
+        Some(super::efs_v1_fsck::fsck_efs_v1(self))
+    }
+
     /// `DIRSIZ` is 14 bytes and names are not NUL-terminated when they fill
     /// the field, so anything longer cannot be represented at all.
     fn validate_name(&self, name: &str) -> Result<(), FilesystemError> {
@@ -1883,6 +1959,170 @@ impl<R: Read + Seek + Send> Filesystem for EfsV1Filesystem<R> {
     }
 }
 
+/// Repair what a structurally-sound volume makes unambiguous; structural
+/// damage is reported and nothing is written. See docs/SGI_EFS_v1.md.
+pub(crate) fn repair_efs_v1<R: Read + Write + Seek + Send>(
+    fs: &mut EfsV1Filesystem<R>,
+) -> Result<super::fsck::RepairReport, FilesystemError> {
+    let mut report = super::fsck::RepairReport {
+        fixes_applied: Vec::new(),
+        fixes_failed: Vec::new(),
+        unrepairable_count: 0,
+    };
+    let result = super::efs_v1_fsck::fsck_efs_v1(fs)?;
+    if result.errors.is_empty() {
+        return Ok(report);
+    }
+
+    let structural: Vec<_> = result
+        .errors
+        .iter()
+        .filter(|e| super::efs_v1_fsck::is_structural_code(&e.code))
+        .collect();
+    if !structural.is_empty() {
+        report.unrepairable_count = structural.len();
+        for e in &structural {
+            report.fixes_failed.push(format!(
+                "{}: {} — structural damage, repair will not guess",
+                e.code, e.message
+            ));
+        }
+        return Ok(report);
+    }
+
+    // The inode table is authoritative once the structure checks out, so the
+    // bitmap is rebuilt from it rather than patched block by block.
+    let bitmap_errs = result
+        .errors
+        .iter()
+        .filter(|e| e.code == "BitmapMissingAllocation" || e.code == "BitmapLeakedBlock")
+        .count();
+    let (bm, _) = fs.rebuild_bitmap()?;
+    fs.write_bitmap(&bm)?;
+    if bitmap_errs > 0 {
+        report
+            .fixes_applied
+            .push("Free-space bitmap rebuilt from the inode table".to_string());
+    }
+
+    let orphans: Vec<u32> = result
+        .orphaned_entries
+        .iter()
+        .map(|o| o.id as u32)
+        .collect();
+    if !orphans.is_empty() {
+        match adopt_orphans(fs, &orphans) {
+            Ok(n) => report
+                .fixes_applied
+                .push(format!("Adopted {n} orphaned inode(s) into /lost+found")),
+            Err(e) => report
+                .fixes_failed
+                .push(format!("Adopting orphaned inodes failed: {e}")),
+        }
+    }
+
+    // Counters and checksum last: adoption may have allocated directory blocks.
+    let (bm, free_inodes) = fs.rebuild_bitmap()?;
+    fs.write_bitmap(&bm)?;
+    let regions = EfsV1DataRegions::from_sb(&fs.sb);
+    let tfree = EfsV1Filesystem::<R>::count_free_blocks(&bm, &regions);
+    let tinode = free_inodes.saturating_sub(1);
+    if fs.sb.tfree != tfree || fs.sb.tinode != tinode {
+        report.fixes_applied.push(format!(
+            "Superblock counters corrected: fs_tfree {} -> {tfree}, fs_tinode {} -> {tinode}",
+            fs.sb.tfree, fs.sb.tinode
+        ));
+    }
+    fs.sb.tfree = tfree;
+    fs.sb.tinode = tinode;
+    // sync_superblock always reseals fs_checksum.
+    fs.sync_superblock()?;
+    if result
+        .errors
+        .iter()
+        .any(|e| e.code == "SuperblockChecksumMismatch")
+    {
+        report
+            .fixes_applied
+            .push("Superblock checksum recomputed".to_string());
+    }
+
+    let after = super::efs_v1_fsck::fsck_efs_v1(fs)?;
+    if !after.errors.is_empty() {
+        report.unrepairable_count += after.errors.len();
+        for e in after.errors.iter().take(8) {
+            report.fixes_failed.push(format!(
+                "still reported after repair — {}: {}",
+                e.code, e.message
+            ));
+        }
+    }
+    Ok(report)
+}
+
+/// Link every orphan into `/lost+found`, creating that directory if the
+/// volume has none. Returns how many were adopted.
+fn adopt_orphans<R: Read + Write + Seek + Send>(
+    fs: &mut EfsV1Filesystem<R>,
+    orphans: &[u32],
+) -> Result<usize, FilesystemError> {
+    let mut bm = fs.read_bitmap()?;
+    let now = now_u32();
+    let root = fs.read_inode(EFS_V1_ROOT_INODE)?;
+
+    let lf_inum = match fs.dir_find(&root, "lost+found")? {
+        Some(i) => i,
+        None => {
+            let inum = fs.allocate_inode()?;
+            let mut seed = vec![0u8; EFS_V1_DIRENTSIZE * 2];
+            BigEndian::write_u16(&mut seed[0..2], inum as u16);
+            seed[2] = b'.';
+            BigEndian::write_u16(
+                &mut seed[EFS_V1_DIRENTSIZE..EFS_V1_DIRENTSIZE + 2],
+                EFS_V1_ROOT_INODE as u16,
+            );
+            seed[EFS_V1_DIRENTSIZE + 2] = b'.';
+            seed[EFS_V1_DIRENTSIZE + 3] = b'.';
+            let mut ino = EfsV1Inode::empty(inum);
+            ino.mode = 0o040755;
+            ino.nlink = 2;
+            ino.atime = now;
+            ino.mtime = now;
+            ino.ctime = now;
+            fs.set_inode_data(&mut ino, &seed, &mut bm)?;
+            fs.write_inode(&ino)?;
+
+            let mut root_ino = fs.read_inode(EFS_V1_ROOT_INODE)?;
+            fs.dir_insert(&mut root_ino, "lost+found", inum, &mut bm)?;
+            root_ino.nlink = root_ino.nlink.saturating_add(1);
+            root_ino.mtime = now;
+            root_ino.ctime = now;
+            fs.write_inode(&root_ino)?;
+            inum
+        }
+    };
+
+    let mut adopted = 0usize;
+    let mut lf = fs.read_inode(lf_inum)?;
+    for &inum in orphans {
+        let name = format!("inode_{inum}");
+        if fs.dir_find(&lf, &name)?.is_some() {
+            continue;
+        }
+        fs.dir_insert(&mut lf, &name, inum, &mut bm)?;
+        // A recovered directory's `..` still counts against lost+found.
+        if fs.read_inode(inum)?.is_dir() {
+            lf.nlink = lf.nlink.saturating_add(1);
+        }
+        adopted += 1;
+    }
+    lf.mtime = now;
+    lf.ctime = now;
+    fs.write_inode(&lf)?;
+    fs.write_bitmap(&bm)?;
+    Ok(adopted)
+}
+
 /// Smallest volume worth formatting: the bitmap, one cylinder group with an
 /// inode table, and room for a root directory.
 const EFS_V1_MIN_BLOCKS: u32 = 256;
@@ -1890,6 +2130,10 @@ const EFS_V1_MIN_BLOCKS: u32 = 256;
 /// Blocks per cylinder group to aim for. The IRIS 3130 disk this driver was
 /// written from used 3568 (root) and 3984 (/usr); 3600 sits between them.
 const EFS_V1_TARGET_CGFSIZE: u32 = 3600;
+
+/// Bitmap room a fresh volume reserves below the first cylinder group, as a
+/// multiple of its size, so it can be grown later. See docs/SGI_EFS_v1.md.
+const EFS_V1_GROWTH_HEADROOM: u32 = 4;
 
 /// Fraction of a cylinder group given over to its inode table, as a divisor.
 /// The real disk ran 88/3568 and 96/3984 — both a hair under 1/40.
@@ -1921,9 +2165,13 @@ pub fn create_blank_efs_v1(size_bytes: u64, name: &str) -> anyhow::Result<Vec<u8
         }
         let fs_size = firstcg + ncg * cgfsize;
         let bmsize = fs_size.div_ceil(8);
-        let bmblocks = bmsize.div_ceil(EFS_V1_BLOCKSIZE as u32);
+        // Reserve for a grown volume, but declare only what is in use.
+        let reserve = fs_size
+            .saturating_mul(EFS_V1_GROWTH_HEADROOM)
+            .div_ceil(8)
+            .div_ceil(EFS_V1_BLOCKSIZE as u32);
         // Keep `firstcg` even, the way the period mkfs laid it out.
-        let need = EFS_V1_BITMAPBB + bmblocks;
+        let need = EFS_V1_BITMAPBB + reserve;
         let need = need + (need & 1);
         if firstcg >= need {
             break (fs_size, cgfsize, bmsize);
