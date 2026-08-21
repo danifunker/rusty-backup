@@ -116,31 +116,21 @@ fn main() -> eframe::Result {
         // Defer to the default hook too so existing behavior is preserved.
         default_hook(info);
     }));
-    // Linux: Request elevation at startup if not already running as root
+    // Linux: start unprivileged. Raw devices need root, but image files do not,
+    // so elevation is on demand via the top-bar "Unlock Physical Devices" button.
     #[cfg(target_os = "linux")]
     {
         if !nix::unistd::geteuid().is_root() {
-            // Install AppImage desktop integration *before* elevating, while
-            // we're still the real user — otherwise the .desktop and icon
-            // files would land in ~/.local/share/ owned by root, which
-            // breaks future user-mode runs. Wayland has no per-window icon
-            // protocol; the compositor resolves icons by app_id → installed
-            // .desktop. No-op outside AppImage.
+            // Runs as the real user so the .desktop and icon land in the user's
+            // ~/.local/share rather than root's. No-op outside AppImage.
             rusty_backup::os::linux::install_appimage_desktop_integration(icon_bytes);
-
-            log::info!("Rusty Backup requires administrator privileges for disk access.");
-            log::info!("Requesting elevation...");
-
-            // relaunch_with_elevation() replaces the process on success (never returns).
-            // If it fails (user cancelled, pkexec unavailable), fall through and run
-            // unprivileged — the "Request Elevation" button in the GUI is still available.
-            if let Err(e) = rusty_backup::os::linux::relaunch_with_elevation() {
-                log::warn!("Failed to elevate: {e}");
-                log::warn!("Continuing without elevated privileges...");
-            }
+            log::info!(
+                "Running unprivileged: image files work as-is; physical devices need \
+                 the top-bar \"Unlock Physical Devices\" button"
+            );
         } else {
-            // Already root (elevated relaunch landed here) — set permissive umask
-            // so backup files are created with 666/777 permissions accessible to the real user.
+            // The elevated relaunch lands here: permissive umask so files created
+            // as root stay accessible to the real user.
             rusty_backup::os::linux::set_permissive_umask_if_elevated();
             log::info!("Running with administrator privileges");
         }

@@ -643,16 +643,8 @@ impl InspectTab {
         if !rusty_backup::os::is_elevated() {
             ui.add_space(2.0);
             ui.label(
-                egui::RichText::new(format!(
-                    "Note: physical devices need {}. Without it they may not be \
-                     listed, and Edit Mode will fail. Disk image files are unaffected.",
-                    if cfg!(windows) {
-                        "administrator privileges"
-                    } else {
-                        "root privileges (sudo)"
-                    }
-                ))
-                .color(super::theme::warning(ui.visuals())),
+                egui::RichText::new(super::unelevated_device_note())
+                    .color(super::theme::warning(ui.visuals())),
             );
         }
 

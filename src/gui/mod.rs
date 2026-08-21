@@ -90,6 +90,56 @@ fn no_devices_hint() -> &'static str {
     }
 }
 
+/// Label for the top-bar elevation button. Windows hides physical devices
+/// entirely until elevated; Linux lists them but cannot open them unprivileged.
+fn elevation_button_label() -> &'static str {
+    #[cfg(windows)]
+    {
+        "Show Physical Devices"
+    }
+    #[cfg(not(windows))]
+    {
+        "Unlock Physical Devices"
+    }
+}
+
+/// Hover text for the top-bar elevation button. Both platforms relaunch the
+/// whole process; only the mechanism and the wording differ.
+fn elevation_button_hover() -> &'static str {
+    #[cfg(windows)]
+    {
+        "Restart with administrator privileges to access physical disk devices \
+         (will prompt for elevation)."
+    }
+    #[cfg(not(windows))]
+    {
+        "Restart with root privileges (pkexec) to read and write physical disk \
+         devices. Disk image files do not need this."
+    }
+}
+
+/// Warning shown next to a physical-device picker while unprivileged, naming
+/// the remedy. Windows may not list devices at all; Linux lists but cannot open.
+fn unelevated_device_note() -> &'static str {
+    #[cfg(windows)]
+    {
+        "Note: physical devices need administrator privileges. Without it they may \
+         not be listed, and Edit Mode will fail. Click \"Show Physical Devices\" in \
+         the top bar. Disk image files are unaffected."
+    }
+    #[cfg(target_os = "linux")]
+    {
+        "Note: physical devices need root privileges to open, so Edit Mode and \
+         device backups will fail. Click \"Unlock Physical Devices\" in the top bar \
+         to restart as root. Disk image files are unaffected."
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        "Note: physical devices need root privileges (sudo). Without it they may \
+         not be listed, and Edit Mode will fail. Disk image files are unaffected."
+    }
+}
+
 /// Whether physical-device access is available right now. On Windows this means
 /// the process is elevated (raw disk + SCSI optical access need admin); on other
 /// platforms it is always true. Used to gray out physical-source controls until
@@ -537,29 +587,20 @@ impl Default for RustyBackupApp {
             log.info(format!("Found {} device(s)", devices.len()));
         }
 
-        // Check privilege status
+        // Physical devices are enumerated from /sys/block unprivileged, so the
+        // list is populated either way; only opening them needs root.
         #[cfg(target_os = "linux")]
         let elevation_dialog = {
-            let dialog = ElevationDialog::default();
-            if !devices.is_empty() {
-                // Check if we need elevation
-                if let Ok(access) = rusty_backup::privileged::create_disk_access() {
-                    if let Ok(status) = access.check_status() {
-                        match status {
-                            rusty_backup::privileged::AccessStatus::NeedsElevation => {
-                                log.warn(
-                                    "Running without elevated privileges. Click 'Request Elevation' to access devices.",
-                                );
-                            }
-                            rusty_backup::privileged::AccessStatus::Ready => {
-                                log.info("Running with elevated privileges");
-                            }
-                            _ => {}
-                        }
-                    }
-                }
+            if rusty_backup::os::is_elevated() {
+                log.info("Running with administrator privileges");
+            } else if !devices.is_empty() {
+                log.warn(
+                    "Running unprivileged: physical devices cannot be opened. Click \
+                     'Unlock Physical Devices' in the top bar to restart as root. \
+                     Disk image files are unaffected.",
+                );
             }
-            dialog
+            ElevationDialog::default()
         };
 
         let backup_tab = BackupTab::default();
@@ -662,39 +703,35 @@ impl RustyBackupApp {
 }
 
 /// Whether the physical-device elevation gate applies, and its current state.
-/// `NeedsElevation`/`Elevated` are only constructed on Windows; on other
-/// platforms `elevation_gate()` always returns `NotApplicable`.
+/// `NeedsElevation`/`Elevated` are only constructed on Windows and Linux; on
+/// macOS `elevation_gate()` always returns `NotApplicable`.
 #[derive(Clone, Copy, PartialEq)]
 enum ElevationGate {
-    /// Not a gated platform (Linux/macOS handle elevation their own way) — the
-    /// normal "Refresh Devices" control applies. Only constructed on
-    /// non-Windows builds; the cfg_attr below silences the resulting
-    /// "variant never constructed" warning on Windows.
-    #[cfg_attr(windows, allow(dead_code))]
+    /// Not a gated platform (macOS escalates per operation via authopen) — the
+    /// normal "Refresh Devices" control applies. Constructed only on macOS.
+    #[cfg_attr(any(windows, target_os = "linux"), allow(dead_code))]
     NotApplicable,
-    /// Windows, not elevated — show the shielded "Show Physical Devices" button.
-    /// Constructed only inside `#[cfg(windows)]` paths.
-    #[cfg_attr(not(windows), allow(dead_code))]
+    /// Not elevated — show the shielded elevation button.
+    #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
     NeedsElevation,
-    /// Windows, already elevated — devices are available, show "Refresh Devices".
-    /// Constructed only inside `#[cfg(windows)]` paths.
-    #[cfg_attr(not(windows), allow(dead_code))]
+    /// Already elevated — devices are available, show "Refresh Devices".
+    #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
     Elevated,
 }
 
 impl RustyBackupApp {
-    /// Current Windows elevation-gate state. The button + device-list behavior
-    /// key off this; non-Windows is always `NotApplicable`.
+    /// Current elevation-gate state. The button + device-list behavior key off
+    /// this; macOS is always `NotApplicable`.
     fn elevation_gate(&self) -> ElevationGate {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         {
-            if rusty_backup::os::windows::is_elevated() {
+            if rusty_backup::os::is_elevated() {
                 ElevationGate::Elevated
             } else {
                 ElevationGate::NeedsElevation
             }
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             ElevationGate::NotApplicable
         }
@@ -938,31 +975,8 @@ impl eframe::App for RustyBackupApp {
                     }
                     ui.separator();
 
-                    // Elevation button (Linux only, when not root)
-                    #[cfg(target_os = "linux")]
-                    {
-                        if let Ok(access) = rusty_backup::privileged::create_disk_access() {
-                            if let Ok(status) = access.check_status() {
-                                if status == rusty_backup::privileged::AccessStatus::NeedsElevation {
-                                    if ui
-                                        .button(egui::RichText::new("Request Elevation").color(theme::warning(ui.visuals())))
-                                        .on_hover_text("Restart with administrator privileges to access disk devices")
-                                        .clicked()
-                                    {
-                                        self.elevation_dialog.open();
-                                    }
-                                    ui.separator();
-                                }
-                            }
-                        }
-                    }
-
-                    // Windows: physical-device access needs admin, and the GUI
-                    // launches un-elevated (asInvoker). When not elevated, the
-                    // single global gate is this shielded "Show Physical
-                    // Devices" button, which relaunches the whole process via
-                    // UAC; the elevated instance auto-enumerates on startup.
-                    // Once elevated, it becomes the normal "Refresh Devices".
+                    // The single global gate for physical devices: the GUI always
+                    // launches un-elevated, and this relaunches it via UAC/pkexec.
                     match self.elevation_gate() {
                         ElevationGate::NeedsElevation => {
                             let tint = ui.visuals().widgets.active.fg_stroke.color;
@@ -975,13 +989,10 @@ impl eframe::App for RustyBackupApp {
                             let resp = ui
                                 .add(egui::Button::image_and_text(
                                     icon,
-                                    egui::RichText::new("Show Physical Devices")
+                                    egui::RichText::new(elevation_button_label())
                                         .color(theme::warning(ui.visuals())),
                                 ))
-                                .on_hover_text(
-                                    "Restart with administrator privileges to access \
-                                     physical disk devices (will prompt for elevation).",
-                                );
+                                .on_hover_text(elevation_button_hover());
                             if resp.clicked() {
                                 #[cfg(windows)]
                                 {
@@ -992,6 +1003,12 @@ impl eframe::App for RustyBackupApp {
                                             "Elevation request failed or was cancelled: {e}"
                                         ));
                                     }
+                                }
+                                // Linux confirms first: the relaunch discards any
+                                // unsaved edits, so the dialog says so.
+                                #[cfg(target_os = "linux")]
+                                {
+                                    self.elevation_dialog.open();
                                 }
                             }
                             ui.separator();
@@ -1021,15 +1038,15 @@ impl eframe::App for RustyBackupApp {
                     {
                         self.bulk_convert_dialog = Some(BulkConvertDialog::default());
                     }
-                    if bulk_running
-                        && ui.button("Cancel Bulk").clicked() {
-                            if let Some(ref s) = self.bulk_convert_status {
-                                if let Ok(mut g) = s.lock() {
-                                    g.cancel_requested = true;
-                                }
+                    if bulk_running && ui.button("Cancel Bulk").clicked() {
+                        if let Some(ref s) = self.bulk_convert_status {
+                            if let Ok(mut g) = s.lock() {
+                                g.cancel_requested = true;
                             }
-                            self.log_panel.warn("Bulk convert cancellation requested...");
                         }
+                        self.log_panel
+                            .warn("Bulk convert cancellation requested...");
+                    }
                 });
             });
         });
@@ -1147,8 +1164,10 @@ impl eframe::App for RustyBackupApp {
                     }
                 }
                 ElevationAction::Cancel => {
-                    self.log_panel
-                        .warn("Elevation cancelled. Device operations will fail.");
+                    self.log_panel.warn(
+                        "Elevation cancelled. Physical devices stay unavailable; \
+                         image files are unaffected.",
+                    );
                 }
                 ElevationAction::None => {}
             }
