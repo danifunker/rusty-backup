@@ -1,5 +1,5 @@
 //! SGI EFS v1 — the original Extent File System, as shipped on the IRIS 2000 /
-//! 3000 series (read-only).
+//! 3000 series. Read/write; see `docs/SGI_EFS_v1.md` for the write rules.
 //!
 //! This is the ancestor of the IRIX EFS in [`efs`](super::efs), not a dialect
 //! of it. SGI grew it out of the Bell / System V filesystem by replacing the
@@ -49,8 +49,10 @@
 //! | 0x14 | `fs_dirty` be16 | | 0x3A | `fs_spare[100]` |
 //! | 0x16 | `fs_time` be32 | | 0x9E | `fs_checksum` be32 |
 //!
-//! The checksum is the same rotate-and-XOR IRIX EFS uses, run over offsets
-//! 0..0x9E; [`super::efs::efs_superblock_checksum`] computes it.
+//! The checksum is the same rotate-and-XOR IRIX EFS uses, but run over offsets
+//! 0..0x9E rather than IRIX's 0..0x58, so it needs its own routine:
+//! [`efs_v1_superblock_checksum`]. Verified byte-exact against the stored
+//! `fs_checksum` of both EFS volumes on the IRIS 3130 disk.
 //!
 //! ## Byte order
 //!
@@ -60,6 +62,8 @@
 //! partition image without its disk label still opens. Stored bytes are never
 //! rewritten: a backup of one of these disks must stay byte-identical.
 
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::IntIsMultipleOf as _;
 use std::io::{Read, Seek, SeekFrom, Write};
 
 use byteorder::{BigEndian, ByteOrder};
@@ -246,6 +250,36 @@ impl EfsV1Superblock {
         Some((block, offset))
     }
 
+    /// Write the known fields back into `buf`, leaving every byte this
+    /// driver does not model untouched so an existing volume keeps them.
+    pub fn write_into(&self, buf: &mut [u8]) {
+        BigEndian::write_u32(&mut buf[0x00..0x04], self.fs_size);
+        BigEndian::write_u32(&mut buf[0x04..0x08], self.firstcg);
+        BigEndian::write_u32(&mut buf[0x08..0x0C], self.cgfsize);
+        BigEndian::write_u16(&mut buf[0x0C..0x0E], self.cgisize);
+        BigEndian::write_u16(&mut buf[0x0E..0x10], self.sectors);
+        BigEndian::write_u16(&mut buf[0x10..0x12], self.heads);
+        BigEndian::write_u16(&mut buf[0x12..0x14], self.ncg);
+        BigEndian::write_u16(&mut buf[0x14..0x16], self.dirty);
+        BigEndian::write_u32(&mut buf[0x16..0x1A], self.fs_time);
+        buf[0x1A..0x20].copy_from_slice(&self.fname);
+        buf[0x20..0x26].copy_from_slice(&self.fpack);
+        BigEndian::write_u32(&mut buf[0x26..0x2A], self.magic);
+        BigEndian::write_u32(&mut buf[0x2A..0x2E], self.prealloc);
+        BigEndian::write_u32(&mut buf[0x2E..0x32], self.bmsize);
+        BigEndian::write_u32(&mut buf[0x32..0x36], self.tfree);
+        BigEndian::write_u32(&mut buf[0x36..0x3A], self.tinode);
+        BigEndian::write_u32(&mut buf[0x9E..0xA2], self.checksum);
+    }
+
+    /// Recompute `fs_checksum` over the serialized form of `buf`, which must
+    /// already hold this superblock. Updates both `self` and `buf`.
+    pub fn recompute_checksum(&mut self, buf: &mut [u8]) {
+        BigEndian::write_u32(&mut buf[0x9E..0xA2], 0);
+        self.checksum = efs_v1_superblock_checksum(buf);
+        BigEndian::write_u32(&mut buf[0x9E..0xA2], self.checksum);
+    }
+
     /// Volume name, as `fsname:packname` when both are set.
     fn label(&self) -> String {
         let n = trim_ascii(&self.fname);
@@ -277,6 +311,14 @@ pub struct EfsV1Extent {
     pub offset: u32,
 }
 
+/// The all-zero extent: no blocks, no offset. Used to pad inode slots.
+const EFS_V1_EMPTY_EXTENT: EfsV1Extent = EfsV1Extent {
+    magic: 0,
+    bn: 0,
+    length: 0,
+    offset: 0,
+};
+
 impl EfsV1Extent {
     fn parse(buf: &[u8]) -> Self {
         let w0 = BigEndian::read_u32(&buf[0..4]);
@@ -287,6 +329,13 @@ impl EfsV1Extent {
             length: ((w1 >> 24) & 0xFF) as u8,
             offset: w1 & 0x00FF_FFFF,
         }
+    }
+
+    fn write_into(&self, buf: &mut [u8]) {
+        let w0 = ((self.magic as u32) << 24) | (self.bn & 0x00FF_FFFF);
+        let w1 = ((self.length as u32) << 24) | (self.offset & 0x00FF_FFFF);
+        BigEndian::write_u32(&mut buf[0..4], w0);
+        BigEndian::write_u32(&mut buf[4..8], w1);
     }
 
     /// `ex_bn == 0` marks a range that was never written; it reads as zeros.
@@ -340,6 +389,44 @@ impl EfsV1Inode {
             numextents: BigEndian::read_u16(&buf[0x1C..0x1E]),
             refs: BigEndian::read_u16(&buf[0x1E..0x20]),
             extents,
+        }
+    }
+
+    /// Serialize into a 128-byte inode slot.
+    fn write_into(&self, buf: &mut [u8; EFS_V1_INODESIZE as usize]) {
+        BigEndian::write_u16(&mut buf[0x00..0x02], self.mode);
+        BigEndian::write_u16(&mut buf[0x02..0x04], self.nlink);
+        BigEndian::write_u16(&mut buf[0x04..0x06], self.uid);
+        BigEndian::write_u16(&mut buf[0x06..0x08], self.gid);
+        BigEndian::write_u32(&mut buf[0x08..0x0C], self.size);
+        BigEndian::write_u32(&mut buf[0x0C..0x10], self.atime);
+        BigEndian::write_u32(&mut buf[0x10..0x14], self.mtime);
+        BigEndian::write_u32(&mut buf[0x14..0x18], self.ctime);
+        BigEndian::write_u32(&mut buf[0x18..0x1C], self.gen);
+        BigEndian::write_u16(&mut buf[0x1C..0x1E], self.numextents);
+        BigEndian::write_u16(&mut buf[0x1E..0x20], self.refs);
+        for (i, ext) in self.extents.iter().enumerate() {
+            let off = 0x20 + i * 8;
+            ext.write_into(&mut buf[off..off + 8]);
+        }
+    }
+
+    /// A never-allocated inode: `di_mode` zero and no extents.
+    fn empty(inum: u32) -> Self {
+        EfsV1Inode {
+            inum,
+            mode: 0,
+            nlink: 0,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            atime: 0,
+            mtime: 0,
+            ctime: 0,
+            gen: 0,
+            numextents: 0,
+            refs: 0,
+            extents: [EFS_V1_EMPTY_EXTENT; EFS_V1_DIRECTEXTENTS],
         }
     }
 
@@ -404,7 +491,7 @@ impl EfsV1Inode {
     }
 }
 
-/// Read-only reader for an EFS v1 volume.
+/// An open EFS v1 volume. Reads on any `R`; the write half needs `R: Write`.
 pub struct EfsV1Filesystem<R: Read + Seek> {
     reader: R,
     partition_offset: u64,
@@ -490,6 +577,12 @@ impl<R: Read + Seek> EfsV1Filesystem<R> {
             label,
             highest_block: None,
         })
+    }
+
+    /// Take the underlying reader back, for callers that need the image bytes
+    /// after mutating the volume.
+    pub fn reader_into_inner(self) -> R {
+        self.reader
     }
 
     /// The parsed superblock.
@@ -812,7 +905,878 @@ fn write_zeros(writer: &mut dyn Write, mut n: u64) -> Result<(), FilesystemError
     Ok(())
 }
 
+/// `fs_checksum`: rotate-left-1 and XOR over big-endian 16-bit words across
+/// 0..0x9E, checksum field read as zero. IRIX's 0..0x58 routine does not fit.
+pub fn efs_v1_superblock_checksum(sb: &[u8]) -> u32 {
+    debug_assert!(
+        sb.len() >= 0x9E,
+        "superblock buffer must cover offsets 0..0x9E for the checksum"
+    );
+    let mut c: u32 = 0;
+    let mut i = 0;
+    while i < 0x9E {
+        c ^= ((sb[i] as u32) << 8) | sb[i + 1] as u32;
+        c = c.rotate_left(1);
+        i += 2;
+    }
+    c
+}
+
+/// Current UNIX time, clamped into the 32-bit fields the format uses.
+fn now_u32() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0) as u32
+}
+
+/// The blocks an allocator may hand out: cylinder group data areas only, so a
+/// damaged bitmap cannot yield an inode table. See docs/SGI_EFS_v1.md.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EfsV1DataRegions {
+    firstcg: u32,
+    cgfsize: u32,
+    cgisize: u32,
+    ncg: u32,
+    fs_size: u32,
+}
+
+impl EfsV1DataRegions {
+    pub(crate) fn from_sb(sb: &EfsV1Superblock) -> Self {
+        EfsV1DataRegions {
+            firstcg: sb.firstcg,
+            cgfsize: sb.cgfsize,
+            cgisize: sb.cgisize as u32,
+            ncg: sb.ncg as u32,
+            fs_size: sb.fs_size,
+        }
+    }
+
+    /// The `[start, end)` data-block range of cylinder group `cg`: the group
+    /// minus its leading inode table, clamped to `fs_size`.
+    fn cg_data_range(&self, cg: u32) -> Option<(u32, u32)> {
+        if self.cgfsize == 0 || self.cgisize >= self.cgfsize {
+            return None;
+        }
+        let cg_start = self.firstcg.checked_add(cg.checked_mul(self.cgfsize)?)?;
+        let data_start = cg_start.checked_add(self.cgisize)?;
+        let data_end = cg_start.checked_add(self.cgfsize)?.min(self.fs_size);
+        if data_end <= data_start {
+            return None;
+        }
+        Some((data_start, data_end))
+    }
+
+    /// Every cylinder group's data range, low block to high.
+    fn ranges(self) -> impl Iterator<Item = (u32, u32)> {
+        (0..self.ncg).filter_map(move |cg| self.cg_data_range(cg))
+    }
+
+    /// Whether an extent is allowed to point at `blk`.
+    pub(crate) fn contains(self, blk: u32) -> bool {
+        self.ranges().any(|(lo, hi)| blk >= lo && blk < hi)
+    }
+}
+
+/// Write plumbing. Split from the read impl so a read-only source still opens:
+/// only these methods need `R: Write`.
+impl<R: Read + Write + Seek + Send> EfsV1Filesystem<R> {
+    /// Write `buf` starting at block `bn`, applying this image's word order on
+    /// the way out so a byte-swapped volume stays internally consistent.
+    fn write_blocks(&mut self, bn: u32, buf: &[u8]) -> Result<(), FilesystemError> {
+        if !buf.len().is_multiple_of(EFS_V1_BLOCKSIZE as usize) {
+            return Err(FilesystemError::InvalidData(format!(
+                "EFS v1 write_blocks: {} bytes is not a whole number of blocks",
+                buf.len()
+            )));
+        }
+        let mut tmp = buf.to_vec();
+        apply_byte_order(self.order, &mut tmp);
+        self.reader.seek(SeekFrom::Start(
+            self.partition_offset + bn as u64 * EFS_V1_BLOCKSIZE,
+        ))?;
+        self.reader.write_all(&tmp)?;
+        Ok(())
+    }
+
+    fn write_block(
+        &mut self,
+        bn: u32,
+        buf: &[u8; EFS_V1_BLOCKSIZE as usize],
+    ) -> Result<(), FilesystemError> {
+        self.write_blocks(bn, buf)
+    }
+
+    /// Persist the superblock, recomputing `fs_checksum`. Only the fields this
+    /// driver models are rewritten; the rest of the sector is preserved.
+    pub(crate) fn sync_superblock(&mut self) -> Result<(), FilesystemError> {
+        let mut sector = [0u8; EFS_V1_BLOCKSIZE as usize];
+        self.read_block(EFS_V1_SUPERBB as u32, &mut sector)?;
+        self.sb.fs_time = now_u32();
+        let mut sb = self.sb.clone();
+        sb.write_into(&mut sector);
+        sb.recompute_checksum(&mut sector);
+        self.sb = sb;
+        self.write_block(EFS_V1_SUPERBB as u32, &sector)
+    }
+
+    /// The free-space bitmap, `bmsize` bytes starting at block 2. Set bit =
+    /// free, LSB-first within each byte.
+    pub(crate) fn read_bitmap(&mut self) -> Result<Vec<u8>, FilesystemError> {
+        let bmsize = self.sb.bmsize as usize;
+        if bmsize == 0 {
+            return Err(FilesystemError::InvalidData(
+                "EFS v1 bitmap size is 0 — superblock cannot support mutation".to_string(),
+            ));
+        }
+        let blocks = self.sb.bitmap_blocks();
+        let mut buf = vec![0u8; blocks as usize * EFS_V1_BLOCKSIZE as usize];
+        self.read_blocks(EFS_V1_BITMAPBB, blocks, &mut buf)?;
+        buf.truncate(bmsize);
+        Ok(buf)
+    }
+
+    /// Write the bitmap back, preserving any bytes past `bmsize` in the final
+    /// block rather than zeroing the tail.
+    pub(crate) fn write_bitmap(&mut self, bm: &[u8]) -> Result<(), FilesystemError> {
+        let bmsize = self.sb.bmsize as usize;
+        if bm.len() != bmsize {
+            return Err(FilesystemError::InvalidData(format!(
+                "EFS v1 write_bitmap: buffer is {} bytes, expected {bmsize}",
+                bm.len()
+            )));
+        }
+        let blocks = self.sb.bitmap_blocks();
+        let mut buf = vec![0u8; blocks as usize * EFS_V1_BLOCKSIZE as usize];
+        self.read_blocks(EFS_V1_BITMAPBB, blocks, &mut buf)?;
+        buf[..bmsize].copy_from_slice(bm);
+        self.write_blocks(EFS_V1_BITMAPBB, &buf)
+    }
+
+    /// First-fit a contiguous run of `want` free blocks, confined to cylinder
+    /// group data areas, and mark it in use. The caller persists `bm`.
+    pub(crate) fn alloc_contiguous_in_bitmap(
+        bm: &mut [u8],
+        regions: &EfsV1DataRegions,
+        want: u32,
+    ) -> Result<EfsV1Extent, FilesystemError> {
+        if want == 0 {
+            return Err(FilesystemError::InvalidData(
+                "EFS v1 alloc: want must be > 0".to_string(),
+            ));
+        }
+        let total_bits = ((bm.len() as u64) * 8).min(u32::MAX as u64) as u32;
+        for (lo, hi) in regions.ranges() {
+            let hi = hi.min(total_bits);
+            if hi <= lo {
+                continue;
+            }
+            let mut run_start: Option<u32> = None;
+            let mut run_len: u32 = 0;
+            for bit in lo..hi {
+                if (bm[(bit / 8) as usize] >> (bit % 8)) & 1 == 0 {
+                    run_start = None;
+                    run_len = 0;
+                    continue;
+                }
+                let start = *run_start.get_or_insert(bit);
+                run_len += 1;
+                if run_len >= want {
+                    for b in start..start + want {
+                        bm[(b / 8) as usize] &= !(1u8 << (b % 8));
+                    }
+                    return Ok(EfsV1Extent {
+                        magic: 0,
+                        bn: start,
+                        length: want as u8,
+                        offset: 0,
+                    });
+                }
+            }
+        }
+        Err(FilesystemError::DiskFull(format!(
+            "EFS v1: no contiguous run of {want} free blocks in any cylinder group's data area"
+        )))
+    }
+
+    /// Return an extent's blocks to the free pool. Convention: set bit = free.
+    pub(crate) fn free_extent_in_bitmap(bm: &mut [u8], ext: &EfsV1Extent) {
+        if ext.is_hole() {
+            return;
+        }
+        for b in ext.bn..ext.bn + ext.length as u32 {
+            let by = (b / 8) as usize;
+            if by >= bm.len() {
+                break;
+            }
+            bm[by] |= 1u8 << (b % 8);
+        }
+    }
+
+    /// Free data blocks the bitmap still shows as available, counted only
+    /// inside cylinder group data areas — the same span `fs_tfree` covers.
+    pub(crate) fn count_free_blocks(bm: &[u8], regions: &EfsV1DataRegions) -> u32 {
+        let total_bits = ((bm.len() as u64) * 8).min(u32::MAX as u64) as u32;
+        let mut n = 0u32;
+        for (lo, hi) in regions.ranges() {
+            for bit in lo..hi.min(total_bits) {
+                n += ((bm[(bit / 8) as usize] >> (bit % 8)) & 1) as u32;
+            }
+        }
+        n
+    }
+
+    /// Lowest free inode (`di_mode == 0`). Inums 0 and 1 are reserved.
+    pub(crate) fn allocate_inode(&mut self) -> Result<u32, FilesystemError> {
+        let total = self.sb.total_inodes();
+        for inum in 2..total {
+            if self.read_inode(inum)?.is_free() {
+                return Ok(inum);
+            }
+        }
+        Err(FilesystemError::DiskFull(format!(
+            "EFS v1: no free inodes (total {total})"
+        )))
+    }
+
+    /// Write `inode` into its slot, preserving the three neighbours that share
+    /// the 512-byte inode-table block.
+    pub(crate) fn write_inode(&mut self, inode: &EfsV1Inode) -> Result<(), FilesystemError> {
+        let (block, offset) = self.sb.inode_location(inode.inum).ok_or_else(|| {
+            FilesystemError::InvalidData(format!(
+                "EFS v1 write_inode: inum {} is past the inode table",
+                inode.inum
+            ))
+        })?;
+        if inode.inum < 2 {
+            return Err(FilesystemError::InvalidData(
+                "EFS v1 write_inode: inums 0 and 1 are reserved".to_string(),
+            ));
+        }
+        let mut sector = [0u8; EFS_V1_BLOCKSIZE as usize];
+        self.read_block(block, &mut sector)?;
+        let mut slot = [0u8; EFS_V1_INODESIZE as usize];
+        inode.write_into(&mut slot);
+        sector[offset..offset + EFS_V1_INODESIZE as usize].copy_from_slice(&slot);
+        self.write_block(block, &sector)
+    }
+
+    /// Return every block `inode` holds — data extents plus any indirect index
+    /// blocks — to `bm`.
+    fn free_inode_extents(
+        &mut self,
+        inode: &EfsV1Inode,
+        bm: &mut [u8],
+    ) -> Result<(), FilesystemError> {
+        if inode.numextents == 0 || inode.is_device() {
+            return Ok(());
+        }
+        let regions = EfsV1DataRegions::from_sb(&self.sb);
+        let data_exts = self.extents_of(inode)?;
+        for e in &data_exts {
+            // A damaged inode can point at an inode table; freeing that would
+            // hand live inodes to the allocator.
+            if e.is_hole() {
+                continue;
+            }
+            if !regions.contains(e.bn) || !regions.contains(e.bn + e.length as u32 - 1) {
+                log::warn!(
+                    "EFS v1 inode {}: extent {}+{} is outside every cylinder group's data area; \
+                     not returning it to the free pool",
+                    inode.inum,
+                    e.bn,
+                    e.length
+                );
+                continue;
+            }
+            Self::free_extent_in_bitmap(bm, e);
+        }
+        // In indirect mode the inline slots describe index blocks, which are
+        // allocated space too and would otherwise leak.
+        if inode.numextents as usize > EFS_V1_DIRECTEXTENTS {
+            let direxts = (inode.extents[0].offset as usize).min(EFS_V1_DIRECTEXTENTS);
+            for slot in &inode.extents[..direxts] {
+                Self::free_extent_in_bitmap(bm, slot);
+            }
+        }
+        Ok(())
+    }
+
+    /// Pack `data_extents` into index blocks and point the inline slots at
+    /// them — how EFS describes a file needing more than twelve extents.
+    fn install_indirect_extents(
+        &mut self,
+        bm: &mut [u8],
+        inode: &mut EfsV1Inode,
+        data_extents: &[EfsV1Extent],
+    ) -> Result<(), FilesystemError> {
+        let index_blocks = data_extents.len().div_ceil(EFS_V1_EXTENTS_PER_BLOCK) as u32;
+        let regions = EfsV1DataRegions::from_sb(&self.sb);
+
+        let mut index_exts: Vec<EfsV1Extent> = Vec::new();
+        let mut remaining = index_blocks;
+        while remaining > 0 {
+            if index_exts.len() >= EFS_V1_DIRECTEXTENTS {
+                for ext in &index_exts {
+                    Self::free_extent_in_bitmap(bm, ext);
+                }
+                return Err(FilesystemError::DiskFull(format!(
+                    "EFS v1: the {index_blocks} index blocks for this file need more than \
+                     {EFS_V1_DIRECTEXTENTS} extents to describe (volume too fragmented)"
+                )));
+            }
+            let mut chunk = remaining.min(EFS_V1_MAXEXTENTLEN);
+            let ext = loop {
+                match Self::alloc_contiguous_in_bitmap(bm, &regions, chunk) {
+                    Ok(e) => break e,
+                    Err(FilesystemError::DiskFull(_)) if chunk > 1 => chunk /= 2,
+                    Err(e) => {
+                        for ext in &index_exts {
+                            Self::free_extent_in_bitmap(bm, ext);
+                        }
+                        return Err(e);
+                    }
+                }
+            };
+            remaining -= ext.length as u32;
+            index_exts.push(ext);
+        }
+
+        let mut records = data_extents.iter();
+        let mut block = [0u8; EFS_V1_BLOCKSIZE as usize];
+        for ind in &index_exts {
+            for i in 0..ind.length as u32 {
+                block.fill(0);
+                for slot in 0..EFS_V1_EXTENTS_PER_BLOCK {
+                    let Some(ext) = records.next() else { break };
+                    ext.write_into(&mut block[slot * 8..slot * 8 + 8]);
+                }
+                self.write_block(ind.bn + i, &block)?;
+            }
+        }
+
+        inode.extents = [EFS_V1_EMPTY_EXTENT; EFS_V1_DIRECTEXTENTS];
+        for (i, ext) in index_exts.iter().enumerate() {
+            inode.extents[i] = *ext;
+            inode.extents[i].offset = 0;
+        }
+        // Slot 0's `ex_offset` carries how many inline slots are index runs.
+        inode.extents[0].offset = index_exts.len() as u32;
+        inode.numextents = data_extents.len() as u16;
+        Ok(())
+    }
+
+    /// Replace `inode`'s contents with `data`. In-memory convenience wrapper
+    /// over [`Self::set_inode_stream`]; used for directories and symlinks.
+    fn set_inode_data(
+        &mut self,
+        inode: &mut EfsV1Inode,
+        data: &[u8],
+        bm: &mut [u8],
+    ) -> Result<(), FilesystemError> {
+        let len = data.len() as u64;
+        self.set_inode_stream(inode, &mut std::io::Cursor::new(data), len, bm)
+    }
+
+    /// Replace `inode`'s contents with `len` bytes from `data`, reallocating
+    /// its extents. Old blocks go back to `bm` first, so a rewrite reuses them.
+    fn set_inode_stream(
+        &mut self,
+        inode: &mut EfsV1Inode,
+        data: &mut dyn Read,
+        len: u64,
+        bm: &mut [u8],
+    ) -> Result<(), FilesystemError> {
+        if len > EFS_V1_MAX_FILE_SIZE {
+            return Err(FilesystemError::InvalidData(format!(
+                "EFS v1: {len} bytes exceeds the {EFS_V1_MAX_FILE_SIZE}-byte file ceiling"
+            )));
+        }
+        self.free_inode_extents(inode, bm)?;
+        inode.extents = [EFS_V1_EMPTY_EXTENT; EFS_V1_DIRECTEXTENTS];
+        inode.numextents = 0;
+        inode.size = len as u32;
+        if len == 0 {
+            return Ok(());
+        }
+
+        let regions = EfsV1DataRegions::from_sb(&self.sb);
+        let nblocks = len.div_ceil(EFS_V1_BLOCKSIZE) as u32;
+        let mut exts: Vec<EfsV1Extent> = Vec::new();
+        let mut remaining = nblocks;
+        let mut logical = 0u32;
+        while remaining > 0 {
+            if exts.len() >= EFS_V1_MAXEXTENTS {
+                for e in &exts {
+                    Self::free_extent_in_bitmap(bm, e);
+                }
+                return Err(FilesystemError::DiskFull(format!(
+                    "EFS v1: file needs more than {EFS_V1_MAXEXTENTS} extents"
+                )));
+            }
+            let mut chunk = remaining.min(EFS_V1_MAXEXTENTLEN);
+            let ext = loop {
+                match Self::alloc_contiguous_in_bitmap(bm, &regions, chunk) {
+                    Ok(mut e) => {
+                        e.offset = logical;
+                        break e;
+                    }
+                    Err(FilesystemError::DiskFull(_)) if chunk > 1 => chunk /= 2,
+                    Err(e) => {
+                        for x in &exts {
+                            Self::free_extent_in_bitmap(bm, x);
+                        }
+                        return Err(e);
+                    }
+                }
+            };
+            logical += ext.length as u32;
+            remaining -= ext.length as u32;
+            exts.push(ext);
+        }
+
+        // Push the payload out before the inode points at it, so a failure
+        // here never leaves an inode advertising blocks it does not own.
+        let mut remaining = len;
+        for e in &exts {
+            let cap = e.length as u64 * EFS_V1_BLOCKSIZE;
+            let span = cap.min(remaining) as usize;
+            // One extent at a time — at most EFS_V1_MAXEXTENTLEN blocks, so a
+            // multi-gigabyte file never lands in RAM whole.
+            let mut buf = vec![0u8; cap as usize];
+            data.read_exact(&mut buf[..span])?;
+            self.write_blocks(e.bn, &buf)?;
+            remaining -= span as u64;
+        }
+
+        if exts.len() <= EFS_V1_DIRECTEXTENTS {
+            for (i, e) in exts.iter().enumerate() {
+                inode.extents[i] = *e;
+            }
+            inode.numextents = exts.len() as u16;
+            Ok(())
+        } else {
+            self.install_indirect_extents(bm, inode, &exts)
+        }
+    }
+
+    /// Recount `fs_tfree` from the bitmap. Cheaper than tracking deltas and it
+    /// self-corrects, matching the invariant the real disk holds.
+    fn refresh_tfree(&mut self, bm: &[u8]) {
+        let regions = EfsV1DataRegions::from_sb(&self.sb);
+        self.sb.tfree = Self::count_free_blocks(bm, &regions);
+    }
+
+    /// The inum `name` maps to in `dir`, if present. `.` and `..` are matched
+    /// like any other entry here, unlike the browse listing which hides them.
+    fn dir_find(&mut self, dir: &EfsV1Inode, name: &str) -> Result<Option<u32>, FilesystemError> {
+        let data = self.read_data(dir, EFS_V1_SANE_ALLOC)?;
+        for chunk in data.chunks_exact(EFS_V1_DIRENTSIZE) {
+            let inum = BigEndian::read_u16(&chunk[0..2]) as u32;
+            if inum == 0 {
+                continue;
+            }
+            let raw = &chunk[2..2 + EFS_V1_DIRSIZ];
+            let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+            if raw[..end] == *name.as_bytes() {
+                return Ok(Some(inum));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Add `(inum, name)` to `dir`, reusing a slot vacated by a delete when one
+    /// is free. The caller writes `dir` and the bitmap back.
+    fn dir_insert(
+        &mut self,
+        dir: &mut EfsV1Inode,
+        name: &str,
+        inum: u32,
+        bm: &mut [u8],
+    ) -> Result<(), FilesystemError> {
+        let mut ent = [0u8; EFS_V1_DIRENTSIZE];
+        BigEndian::write_u16(&mut ent[0..2], inum as u16);
+        let nb = name.as_bytes();
+        ent[2..2 + nb.len()].copy_from_slice(nb);
+
+        let mut data = self.read_data(dir, EFS_V1_SANE_ALLOC)?;
+        let mut placed = false;
+        for chunk in data.chunks_exact_mut(EFS_V1_DIRENTSIZE) {
+            if BigEndian::read_u16(&chunk[0..2]) == 0 {
+                chunk.copy_from_slice(&ent);
+                placed = true;
+                break;
+            }
+        }
+        if !placed {
+            data.extend_from_slice(&ent);
+        }
+        self.set_inode_data(dir, &data, bm)
+    }
+
+    /// Clear `name`'s slot in `dir`, System V style: the entry's inum goes to
+    /// zero and the directory keeps its size. Returns the inum that was there.
+    fn dir_remove(
+        &mut self,
+        dir: &mut EfsV1Inode,
+        name: &str,
+        bm: &mut [u8],
+    ) -> Result<Option<u32>, FilesystemError> {
+        let mut data = self.read_data(dir, EFS_V1_SANE_ALLOC)?;
+        let mut found = None;
+        for chunk in data.chunks_exact_mut(EFS_V1_DIRENTSIZE) {
+            let inum = BigEndian::read_u16(&chunk[0..2]) as u32;
+            if inum == 0 {
+                continue;
+            }
+            let raw = &chunk[2..2 + EFS_V1_DIRSIZ];
+            let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+            if raw[..end] == *name.as_bytes() {
+                found = Some(inum);
+                chunk.fill(0);
+                break;
+            }
+        }
+        if found.is_some() {
+            self.set_inode_data(dir, &data, bm)?;
+        }
+        Ok(found)
+    }
+}
+
+impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for EfsV1Filesystem<R> {
+    fn as_filesystem(&self) -> &dyn Filesystem {
+        self
+    }
+
+    fn as_filesystem_mut(&mut self) -> &mut dyn Filesystem {
+        self
+    }
+
+    fn create_file(
+        &mut self,
+        parent: &FileEntry,
+        name: &str,
+        data: &mut dyn Read,
+        data_len: u64,
+        options: &super::filesystem::CreateFileOptions,
+    ) -> Result<FileEntry, FilesystemError> {
+        if !parent.is_directory() {
+            return Err(FilesystemError::NotADirectory(parent.path.clone()));
+        }
+        self.validate_name(name)?;
+        if data_len > EFS_V1_MAX_FILE_SIZE {
+            return Err(FilesystemError::InvalidData(format!(
+                "EFS v1: {data_len} bytes exceeds the {EFS_V1_MAX_FILE_SIZE}-byte file ceiling"
+            )));
+        }
+        let parent_inum = parent.location as u32;
+        let parent_inode = self.read_inode(parent_inum)?;
+        if self.dir_find(&parent_inode, name)?.is_some() {
+            return Err(FilesystemError::AlreadyExists(name.to_string()));
+        }
+
+        let mut bm = self.read_bitmap()?;
+        let inum = self.allocate_inode()?;
+        let times = super::times::resolve_or_now(options.unix_times);
+        let now = now_u32();
+
+        let mut ino = EfsV1Inode::empty(inum);
+        ino.mode = options.mode.unwrap_or(0o100644) as u16;
+        ino.nlink = 1;
+        ino.uid = options.uid.unwrap_or(0) as u16;
+        ino.gid = options.gid.unwrap_or(0) as u16;
+        ino.atime = times.atime_or_now() as u32;
+        ino.mtime = times.mtime_or_now() as u32;
+        ino.ctime = times.ctime_or_now() as u32;
+        self.set_inode_stream(&mut ino, &mut data.take(data_len), data_len, &mut bm)?;
+
+        // dir_insert can reallocate the parent's extents, so re-read it fresh
+        // rather than reusing the copy taken for the duplicate-name check.
+        let mut parent_ino = self.read_inode(parent_inum)?;
+        self.dir_insert(&mut parent_ino, name, inum, &mut bm)?;
+        parent_ino.mtime = now;
+        parent_ino.ctime = now;
+
+        // Bitmap before the inodes that reference those blocks: failing here
+        // leaks free space, whereas the other order hands them out twice.
+        self.refresh_tfree(&bm);
+        self.write_bitmap(&bm)?;
+        self.write_inode(&ino)?;
+        self.write_inode(&parent_ino)?;
+
+        self.sb.tinode = self.sb.tinode.saturating_sub(1);
+        self.sync_superblock()?;
+        self.highest_block = None;
+        Ok(self.entry_from_inode(name, &parent.path, &ino))
+    }
+
+    fn create_directory(
+        &mut self,
+        parent: &FileEntry,
+        name: &str,
+        options: &super::filesystem::CreateDirectoryOptions,
+    ) -> Result<FileEntry, FilesystemError> {
+        if !parent.is_directory() {
+            return Err(FilesystemError::NotADirectory(parent.path.clone()));
+        }
+        self.validate_name(name)?;
+        let parent_inum = parent.location as u32;
+        let parent_inode = self.read_inode(parent_inum)?;
+        if self.dir_find(&parent_inode, name)?.is_some() {
+            return Err(FilesystemError::AlreadyExists(name.to_string()));
+        }
+
+        let mut bm = self.read_bitmap()?;
+        let inum = self.allocate_inode()?;
+        let times = super::times::resolve_or_now(options.unix_times);
+        let now = now_u32();
+
+        // A System V directory starts life holding exactly `.` and `..`.
+        let mut seed = vec![0u8; EFS_V1_DIRENTSIZE * 2];
+        BigEndian::write_u16(&mut seed[0..2], inum as u16);
+        seed[2] = b'.';
+        BigEndian::write_u16(
+            &mut seed[EFS_V1_DIRENTSIZE..EFS_V1_DIRENTSIZE + 2],
+            parent_inum as u16,
+        );
+        seed[EFS_V1_DIRENTSIZE + 2] = b'.';
+        seed[EFS_V1_DIRENTSIZE + 3] = b'.';
+
+        let mut ino = EfsV1Inode::empty(inum);
+        ino.mode = options.mode.unwrap_or(0o040755) as u16;
+        // `.` plus the child link from the parent.
+        ino.nlink = 2;
+        ino.uid = options.uid.unwrap_or(0) as u16;
+        ino.gid = options.gid.unwrap_or(0) as u16;
+        ino.atime = times.atime_or_now() as u32;
+        ino.mtime = times.mtime_or_now() as u32;
+        ino.ctime = times.ctime_or_now() as u32;
+        self.set_inode_data(&mut ino, &seed, &mut bm)?;
+
+        let mut parent_ino = self.read_inode(parent_inum)?;
+        self.dir_insert(&mut parent_ino, name, inum, &mut bm)?;
+        // The new directory's `..` is another link to the parent.
+        parent_ino.nlink = parent_ino.nlink.saturating_add(1);
+        parent_ino.mtime = now;
+        parent_ino.ctime = now;
+
+        // See create_file: allocations reach disk before anything cites them.
+        self.refresh_tfree(&bm);
+        self.write_bitmap(&bm)?;
+        self.write_inode(&ino)?;
+        self.write_inode(&parent_ino)?;
+
+        self.sb.tinode = self.sb.tinode.saturating_sub(1);
+        self.sync_superblock()?;
+        self.highest_block = None;
+        Ok(self.entry_from_inode(name, &parent.path, &ino))
+    }
+
+    fn delete_entry(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+    ) -> Result<(), FilesystemError> {
+        if !parent.is_directory() {
+            return Err(FilesystemError::NotADirectory(parent.path.clone()));
+        }
+        let parent_inum = parent.location as u32;
+        let inum = entry.location as u32;
+        let ino = self.read_inode(inum)?;
+        if ino.is_free() {
+            return Err(FilesystemError::NotFound(entry.path.clone()));
+        }
+        if ino.is_dir() {
+            // Only `.` and `..` may remain.
+            let children = self.read_dir_entries(&ino)?;
+            if !children.is_empty() {
+                return Err(FilesystemError::InvalidData(format!(
+                    "EFS v1: directory {} is not empty ({} entries remain)",
+                    entry.path,
+                    children.len()
+                )));
+            }
+        }
+
+        let mut bm = self.read_bitmap()?;
+        let mut parent_ino = self.read_inode(parent_inum)?;
+        let removed = self.dir_remove(&mut parent_ino, &entry.name, &mut bm)?;
+        if removed.is_none() {
+            return Err(FilesystemError::NotFound(entry.path.clone()));
+        }
+        let now = now_u32();
+        parent_ino.mtime = now;
+        parent_ino.ctime = now;
+        if ino.is_dir() {
+            // The child's `..` is gone.
+            parent_ino.nlink = parent_ino.nlink.saturating_sub(1);
+        }
+        self.write_inode(&parent_ino)?;
+
+        self.free_inode_extents(&ino, &mut bm)?;
+        self.write_inode(&EfsV1Inode::empty(inum))?;
+
+        self.sb.tinode = self.sb.tinode.saturating_add(1);
+        self.refresh_tfree(&bm);
+        self.write_bitmap(&bm)?;
+        self.sync_superblock()?;
+        self.highest_block = None;
+        Ok(())
+    }
+
+    fn rename(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+        new_name: &str,
+    ) -> Result<(), FilesystemError> {
+        if !parent.is_directory() {
+            return Err(FilesystemError::NotADirectory(parent.path.clone()));
+        }
+        self.validate_name(new_name)?;
+        let parent_inum = parent.location as u32;
+        let parent_inode = self.read_inode(parent_inum)?;
+        if self.dir_find(&parent_inode, new_name)?.is_some() {
+            return Err(FilesystemError::AlreadyExists(new_name.to_string()));
+        }
+
+        let mut bm = self.read_bitmap()?;
+        let mut parent_ino = self.read_inode(parent_inum)?;
+        let inum = match self.dir_remove(&mut parent_ino, &entry.name, &mut bm)? {
+            Some(i) => i,
+            None => return Err(FilesystemError::NotFound(entry.path.clone())),
+        };
+        self.dir_insert(&mut parent_ino, new_name, inum, &mut bm)?;
+        let now = now_u32();
+        parent_ino.mtime = now;
+        parent_ino.ctime = now;
+        self.write_inode(&parent_ino)?;
+
+        // The inode itself is untouched: same inum, same extents, same data.
+        let mut ino = self.read_inode(inum)?;
+        ino.ctime = now;
+        self.write_inode(&ino)?;
+
+        self.refresh_tfree(&bm);
+        self.write_bitmap(&bm)?;
+        self.sync_superblock()
+    }
+
+    fn set_permissions(&mut self, entry: &FileEntry, mode: u32) -> Result<(), FilesystemError> {
+        let mut ino = self.read_inode(entry.location as u32)?;
+        ino.mode = super::unix_common::inode::with_permission_bits(ino.mode as u32, mode) as u16;
+        ino.ctime = now_u32();
+        self.write_inode(&ino)
+    }
+
+    fn set_owner(&mut self, entry: &FileEntry, uid: u32, gid: u32) -> Result<(), FilesystemError> {
+        let mut ino = self.read_inode(entry.location as u32)?;
+        ino.uid = uid as u16;
+        ino.gid = gid as u16;
+        ino.ctime = now_u32();
+        self.write_inode(&ino)
+    }
+
+    fn supports_symlinks(&self) -> bool {
+        true
+    }
+
+    /// SGI carried 4.2BSD symlinks into this System V derivative, and stores
+    /// the target as ordinary file data rather than inside the inode.
+    fn create_symlink(
+        &mut self,
+        parent: &FileEntry,
+        name: &str,
+        target: &str,
+        options: &super::filesystem::CreateFileOptions,
+    ) -> Result<FileEntry, FilesystemError> {
+        if !parent.is_directory() {
+            return Err(FilesystemError::NotADirectory(parent.path.clone()));
+        }
+        self.validate_name(name)?;
+        if target.is_empty() || target.len() > EFS_V1_MAXPATHLEN {
+            return Err(FilesystemError::InvalidData(format!(
+                "EFS v1 symlink target must be 1..={EFS_V1_MAXPATHLEN} bytes, got {}",
+                target.len()
+            )));
+        }
+        let parent_inum = parent.location as u32;
+        let parent_inode = self.read_inode(parent_inum)?;
+        if self.dir_find(&parent_inode, name)?.is_some() {
+            return Err(FilesystemError::AlreadyExists(name.to_string()));
+        }
+
+        let mut bm = self.read_bitmap()?;
+        let inum = self.allocate_inode()?;
+        let now = now_u32();
+        let times = super::times::resolve_or_now(options.unix_times);
+        let mut ino = EfsV1Inode::empty(inum);
+        ino.mode = 0o120777;
+        ino.nlink = 1;
+        ino.uid = options.uid.unwrap_or(0) as u16;
+        ino.gid = options.gid.unwrap_or(0) as u16;
+        ino.atime = times.atime_or_now() as u32;
+        ino.mtime = times.mtime_or_now() as u32;
+        ino.ctime = times.ctime_or_now() as u32;
+        self.set_inode_data(&mut ino, target.as_bytes(), &mut bm)?;
+
+        let mut parent_ino = self.read_inode(parent_inum)?;
+        self.dir_insert(&mut parent_ino, name, inum, &mut bm)?;
+        parent_ino.mtime = now;
+        parent_ino.ctime = now;
+
+        // See create_file: allocations reach disk before anything cites them.
+        self.refresh_tfree(&bm);
+        self.write_bitmap(&bm)?;
+        self.write_inode(&ino)?;
+        self.write_inode(&parent_ino)?;
+
+        self.sb.tinode = self.sb.tinode.saturating_sub(1);
+        self.sync_superblock()?;
+        self.highest_block = None;
+        let mut e = self.entry_from_inode(name, &parent.path, &ino);
+        e.symlink_target = Some(target.to_string());
+        Ok(e)
+    }
+
+    fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
+        self.sync_superblock()
+    }
+
+    fn free_space(&mut self) -> Result<u64, FilesystemError> {
+        let bm = self.read_bitmap()?;
+        let regions = EfsV1DataRegions::from_sb(&self.sb);
+        Ok(Self::count_free_blocks(&bm, &regions) as u64 * EFS_V1_BLOCKSIZE)
+    }
+}
+
 impl<R: Read + Seek + Send> Filesystem for EfsV1Filesystem<R> {
+    /// `DIRSIZ` is 14 bytes and names are not NUL-terminated when they fill
+    /// the field, so anything longer cannot be represented at all.
+    fn validate_name(&self, name: &str) -> Result<(), FilesystemError> {
+        if name.is_empty() {
+            return Err(FilesystemError::InvalidData("empty name".to_string()));
+        }
+        if name == "." || name == ".." {
+            return Err(FilesystemError::InvalidData(format!(
+                "'{name}' is reserved"
+            )));
+        }
+        if name.contains('/') || name.contains('\0') {
+            return Err(FilesystemError::InvalidData(format!(
+                "EFS v1 name '{name}' contains a path separator or NUL"
+            )));
+        }
+        if name.len() > EFS_V1_DIRSIZ {
+            return Err(FilesystemError::InvalidData(format!(
+                "EFS v1 name '{name}' is {} bytes; the limit is {EFS_V1_DIRSIZ}",
+                name.len()
+            )));
+        }
+        Ok(())
+    }
+
     fn root(&mut self) -> Result<FileEntry, FilesystemError> {
         let ino = self.read_inode(EFS_V1_ROOT_INODE)?;
         if !ino.is_dir() {
@@ -917,6 +1881,171 @@ impl<R: Read + Seek + Send> Filesystem for EfsV1Filesystem<R> {
     fn last_data_byte(&mut self) -> Result<u64, FilesystemError> {
         Ok(self.scan_highest_block()? as u64 * EFS_V1_BLOCKSIZE)
     }
+}
+
+/// Smallest volume worth formatting: the bitmap, one cylinder group with an
+/// inode table, and room for a root directory.
+const EFS_V1_MIN_BLOCKS: u32 = 256;
+
+/// Blocks per cylinder group to aim for. The IRIS 3130 disk this driver was
+/// written from used 3568 (root) and 3984 (/usr); 3600 sits between them.
+const EFS_V1_TARGET_CGFSIZE: u32 = 3600;
+
+/// Fraction of a cylinder group given over to its inode table, as a divisor.
+/// The real disk ran 88/3568 and 96/3984 — both a hair under 1/40.
+const EFS_V1_INODE_DIVISOR: u32 = 40;
+
+/// Format a blank EFS v1 volume, in **native** byte order (a fresh image has
+/// not been through a word-swapping controller). See docs/SGI_EFS_v1.md.
+pub fn create_blank_efs_v1(size_bytes: u64, name: &str) -> anyhow::Result<Vec<u8>> {
+    let total_blocks = (size_bytes / EFS_V1_BLOCKSIZE) as u32;
+    if total_blocks < EFS_V1_MIN_BLOCKS {
+        anyhow::bail!(
+            "EFS v1 needs at least {} bytes; asked for {size_bytes}",
+            EFS_V1_MIN_BLOCKS as u64 * EFS_V1_BLOCKSIZE
+        );
+    }
+
+    // Geometry closes on `fs_size == firstcg + ncg * cgfsize` while `firstcg`
+    // must clear the bitmap sized from it, so iterate until the two agree.
+    let mut ncg = (total_blocks / EFS_V1_TARGET_CGFSIZE).max(1);
+    while ncg > 1 && total_blocks / ncg < EFS_V1_MIN_BLOCKS {
+        ncg -= 1;
+    }
+    let mut firstcg = EFS_V1_BITMAPBB + 2;
+    let (fs_size, cgfsize, bmsize) = loop {
+        let avail = total_blocks.saturating_sub(firstcg);
+        let cgfsize = avail / ncg;
+        if cgfsize < 8 {
+            anyhow::bail!("EFS v1: {size_bytes} bytes is too small to lay out a cylinder group");
+        }
+        let fs_size = firstcg + ncg * cgfsize;
+        let bmsize = fs_size.div_ceil(8);
+        let bmblocks = bmsize.div_ceil(EFS_V1_BLOCKSIZE as u32);
+        // Keep `firstcg` even, the way the period mkfs laid it out.
+        let need = EFS_V1_BITMAPBB + bmblocks;
+        let need = need + (need & 1);
+        if firstcg >= need {
+            break (fs_size, cgfsize, bmsize);
+        }
+        firstcg = need;
+    };
+    let cgisize = (cgfsize / EFS_V1_INODE_DIVISOR).max(1).min(cgfsize - 1);
+
+    let mut sb = EfsV1Superblock {
+        fs_size,
+        firstcg,
+        cgfsize,
+        cgisize: cgisize as u16,
+        sectors: 17,
+        heads: 7,
+        ncg: ncg as u16,
+        dirty: 0,
+        fs_time: now_u32(),
+        fname: pack_label(name),
+        fpack: pack_label("sgi"),
+        magic: EFS_V1_MAGIC,
+        prealloc: 16,
+        bmsize,
+        tfree: 0,
+        tinode: 0,
+        checksum: 0,
+    };
+    sb.validate()
+        .map_err(|e| anyhow::anyhow!("EFS v1 mkfs produced invalid geometry: {e}"))?;
+
+    let mut img = vec![0u8; (total_blocks as u64 * EFS_V1_BLOCKSIZE) as usize];
+    let regions = EfsV1DataRegions::from_sb(&sb);
+
+    // Bitmap starts all-in-use, then each group's data area is released —
+    // inode tables stay in use, as on a real EFS v1 volume.
+    let mut bm = vec![0u8; bmsize as usize];
+    for (lo, hi) in regions.ranges() {
+        for b in lo..hi {
+            bm[(b / 8) as usize] |= 1u8 << (b % 8);
+        }
+    }
+
+    // The root directory gets the first data block of cylinder group 0.
+    let root_block = firstcg + cgisize;
+    bm[(root_block / 8) as usize] &= !(1u8 << (root_block % 8));
+
+    let mut root_dir = vec![0u8; EFS_V1_DIRENTSIZE * 2];
+    BigEndian::write_u16(&mut root_dir[0..2], EFS_V1_ROOT_INODE as u16);
+    root_dir[2] = b'.';
+    BigEndian::write_u16(
+        &mut root_dir[EFS_V1_DIRENTSIZE..EFS_V1_DIRENTSIZE + 2],
+        EFS_V1_ROOT_INODE as u16,
+    );
+    root_dir[EFS_V1_DIRENTSIZE + 2] = b'.';
+    root_dir[EFS_V1_DIRENTSIZE + 3] = b'.';
+    let root_off = root_block as usize * EFS_V1_BLOCKSIZE as usize;
+    img[root_off..root_off + root_dir.len()].copy_from_slice(&root_dir);
+
+    let now = sb.fs_time;
+    let mut root = EfsV1Inode::empty(EFS_V1_ROOT_INODE);
+    // 0777 is what the era's mkfs stamped on both volumes of the real disk.
+    root.mode = 0o040777;
+    // `.` and the `..` of the root itself.
+    root.nlink = 2;
+    root.size = root_dir.len() as u32;
+    root.atime = now;
+    root.mtime = now;
+    root.ctime = now;
+    root.numextents = 1;
+    root.extents[0] = EfsV1Extent {
+        magic: 0,
+        bn: root_block,
+        length: 1,
+        offset: 0,
+    };
+
+    // `fs_tinode` counts free inodes but leaves one out, verified against both
+    // volumes of the IRIS 3130 disk.
+    sb.tfree = count_free_bits(&bm, &regions);
+    sb.tinode = sb.total_inodes().saturating_sub(2);
+
+    let (iblock, ioff) = sb
+        .inode_location(EFS_V1_ROOT_INODE)
+        .ok_or_else(|| anyhow::anyhow!("EFS v1 mkfs: root inode has no home in the inode table"))?;
+    let mut slot = [0u8; EFS_V1_INODESIZE as usize];
+    root.write_into(&mut slot);
+    let ipos = iblock as usize * EFS_V1_BLOCKSIZE as usize + ioff;
+    img[ipos..ipos + slot.len()].copy_from_slice(&slot);
+
+    let bmpos = EFS_V1_BITMAPBB as usize * EFS_V1_BLOCKSIZE as usize;
+    img[bmpos..bmpos + bm.len()].copy_from_slice(&bm);
+
+    let sbpos = EFS_V1_SUPERBB as usize * EFS_V1_BLOCKSIZE as usize;
+    let sector = &mut img[sbpos..sbpos + EFS_V1_BLOCKSIZE as usize];
+    sb.write_into(sector);
+    sb.recompute_checksum(sector);
+
+    Ok(img)
+}
+
+/// Pack a volume label into one of the superblock's 6-byte name fields.
+fn pack_label(name: &str) -> [u8; 6] {
+    let mut out = [0u8; 6];
+    let bytes: Vec<u8> = name
+        .bytes()
+        .filter(|b| b.is_ascii_graphic())
+        .take(6)
+        .collect();
+    out[..bytes.len()].copy_from_slice(&bytes);
+    out
+}
+
+/// Free bits inside cylinder group data areas — the span `fs_tfree` covers.
+fn count_free_bits(bm: &[u8], regions: &EfsV1DataRegions) -> u32 {
+    let total_bits = ((bm.len() as u64) * 8).min(u32::MAX as u64) as u32;
+    let mut n = 0u32;
+    for (lo, hi) in regions.ranges() {
+        for bit in lo..hi.min(total_bits) {
+            n += ((bm[(bit / 8) as usize] >> (bit % 8)) & 1) as u32;
+        }
+    }
+    n
 }
 
 #[cfg(test)]
@@ -1363,5 +2492,282 @@ mod tests {
         // runs over the right span rather than a specific stored value.
         assert_ne!(c, 0);
         assert_eq!(BigEndian::read_u32(&sb[0x9E..0xA2]), 0);
+    }
+
+    // ---- write side -----------------------------------------------------
+
+    use crate::fs::filesystem::{CreateDirectoryOptions, CreateFileOptions, EditableFilesystem};
+
+    /// A blank volume big enough to exercise the allocator: 4 MiB.
+    fn blank() -> Vec<u8> {
+        create_blank_efs_v1(4 * 1024 * 1024, "test").unwrap()
+    }
+
+    fn put(
+        fs: &mut EfsV1Filesystem<Cursor<Vec<u8>>>,
+        dir: &FileEntry,
+        name: &str,
+        data: &[u8],
+    ) -> FileEntry {
+        fs.create_file(
+            dir,
+            name,
+            &mut Cursor::new(data.to_vec()),
+            data.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .unwrap()
+    }
+
+    fn slurp(fs: &mut EfsV1Filesystem<Cursor<Vec<u8>>>, e: &FileEntry) -> Vec<u8> {
+        fs.read_file(e, usize::MAX).unwrap()
+    }
+
+    #[test]
+    fn blank_volume_round_trips_through_open() {
+        let mut fs = open(blank());
+        let sb = fs.superblock().clone();
+        assert_eq!(sb.magic, EFS_V1_MAGIC);
+        assert_eq!(
+            sb.fs_size,
+            sb.firstcg + sb.ncg as u32 * sb.cgfsize,
+            "geometry must close"
+        );
+        assert!(sb.tfree > 0 && sb.tinode > 0);
+        let root = fs.root().unwrap();
+        assert!(root.is_directory());
+        // `.` and `..` are hidden by the listing, so a fresh root is empty.
+        assert!(fs.list_directory(&root).unwrap().is_empty());
+    }
+
+    #[test]
+    fn blank_volume_checksum_is_valid() {
+        let img = blank();
+        let sector = &img[BS..BS + EFS_V1_BLOCKSIZE as usize];
+        let stored = BigEndian::read_u32(&sector[0x9E..0xA2]);
+        let mut probe = sector.to_vec();
+        BigEndian::write_u32(&mut probe[0x9E..0xA2], 0);
+        assert_eq!(stored, efs_v1_superblock_checksum(&probe));
+        assert_ne!(stored, 0);
+    }
+
+    #[test]
+    fn created_file_reads_back() {
+        let mut fs = open(blank());
+        let root = fs.root().unwrap();
+        let payload = b"hello from an IRIS 3130".to_vec();
+        put(&mut fs, &root, "hello", &payload);
+
+        let mut fs = open(fs.reader_into_inner().into_inner());
+        let root = fs.root().unwrap();
+        assert_eq!(names(&mut fs, &root), vec!["hello"]);
+        let e = fs.list_directory(&root).unwrap().remove(0);
+        assert_eq!(e.size, payload.len() as u64);
+        assert_eq!(slurp(&mut fs, &e), payload);
+    }
+
+    #[test]
+    fn created_directory_nests_and_lists() {
+        let mut fs = open(blank());
+        let root = fs.root().unwrap();
+        let sub = fs
+            .create_directory(&root, "subdir", &CreateDirectoryOptions::default())
+            .unwrap();
+        put(&mut fs, &sub, "inner", b"nested payload");
+
+        let mut fs = open(fs.reader_into_inner().into_inner());
+        let root = fs.root().unwrap();
+        assert_eq!(names(&mut fs, &root), vec!["subdir"]);
+        let sub = fs.list_directory(&root).unwrap().remove(0);
+        assert!(sub.is_directory());
+        assert_eq!(names(&mut fs, &sub), vec!["inner"]);
+        let inner = fs.list_directory(&sub).unwrap().remove(0);
+        assert_eq!(slurp(&mut fs, &inner), b"nested payload".to_vec());
+    }
+
+    #[test]
+    fn delete_returns_blocks_and_the_inode() {
+        let mut fs = open(blank());
+        let root = fs.root().unwrap();
+        let free_before = fs.free_space().unwrap();
+        let tinode_before = fs.superblock().tinode;
+
+        let big = vec![0xA5u8; 40 * 1024];
+        put(&mut fs, &root, "big", &big);
+        assert!(fs.free_space().unwrap() < free_before);
+        assert_eq!(fs.superblock().tinode, tinode_before - 1);
+
+        let e = fs.list_directory(&root).unwrap().remove(0);
+        fs.delete_entry(&root, &e).unwrap();
+        assert_eq!(fs.free_space().unwrap(), free_before);
+        assert_eq!(fs.superblock().tinode, tinode_before);
+        assert!(fs.list_directory(&root).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_non_empty_directory_is_not_deleted() {
+        let mut fs = open(blank());
+        let root = fs.root().unwrap();
+        let sub = fs
+            .create_directory(&root, "keep", &CreateDirectoryOptions::default())
+            .unwrap();
+        put(&mut fs, &sub, "child", b"x");
+        let dir_entry = fs.list_directory(&root).unwrap().remove(0);
+        assert!(fs.delete_entry(&root, &dir_entry).is_err());
+    }
+
+    #[test]
+    fn large_file_round_trips_through_indirect_extents() {
+        let mut fs = open(blank());
+        let root = fs.root().unwrap();
+        // Past 12 extents the inode switches to an indirect index; keep the
+        // content position-dependent so a mis-ordered extent shows up.
+        let payload: Vec<u8> = (0..600_000u32).map(|i| (i % 251) as u8).collect();
+        put(&mut fs, &root, "big", &payload);
+
+        let mut fs = open(fs.reader_into_inner().into_inner());
+        let root = fs.root().unwrap();
+        let e = fs.list_directory(&root).unwrap().remove(0);
+        assert_eq!(e.size, payload.len() as u64);
+        assert_eq!(slurp(&mut fs, &e), payload);
+    }
+
+    #[test]
+    fn writes_are_byte_order_symmetric() {
+        // Write into a byte-swapped volume, then swab back to native: what we
+        // wrote must read identically, or a swapped capture is inconsistent.
+        let mut fs = open(swab(blank()));
+        assert_eq!(fs.byte_order(), SgiLabelByteOrder::Swabbed);
+        let root = fs.root().unwrap();
+        let payload: Vec<u8> = (0..5000u32).map(|i| (i % 97) as u8).collect();
+        put(&mut fs, &root, "swapped", &payload);
+        fs.create_directory(&root, "dir", &CreateDirectoryOptions::default())
+            .unwrap();
+
+        let swapped_img = fs.reader_into_inner().into_inner();
+        let mut native = open(swab(swapped_img));
+        assert_eq!(native.byte_order(), SgiLabelByteOrder::Native);
+        let root = native.root().unwrap();
+        assert_eq!(names(&mut native, &root), vec!["dir", "swapped"]);
+        let e = native
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "swapped")
+            .unwrap();
+        assert_eq!(slurp(&mut native, &e), payload);
+    }
+
+    #[test]
+    fn names_longer_than_dirsiz_are_refused() {
+        let mut fs = open(blank());
+        let root = fs.root().unwrap();
+        assert!(fs.validate_name("0123456789abcd").is_ok()); // exactly 14
+        assert!(fs.validate_name("0123456789abcde").is_err()); // 15
+        assert!(fs.validate_name("has/slash").is_err());
+        assert!(fs.validate_name("").is_err());
+        assert!(fs
+            .create_file(
+                &root,
+                "0123456789abcde",
+                &mut Cursor::new(Vec::new()),
+                0,
+                &CreateFileOptions::default()
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn a_duplicate_name_is_refused() {
+        let mut fs = open(blank());
+        let root = fs.root().unwrap();
+        put(&mut fs, &root, "dup", b"first");
+        assert!(fs
+            .create_file(
+                &root,
+                "dup",
+                &mut Cursor::new(b"second".to_vec()),
+                6,
+                &CreateFileOptions::default()
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn rename_keeps_the_inode_and_contents() {
+        let mut fs = open(blank());
+        let root = fs.root().unwrap();
+        let e = put(&mut fs, &root, "before", b"same bytes");
+        let inum = e.location;
+        fs.rename(&root, &e, "after").unwrap();
+
+        let mut fs = open(fs.reader_into_inner().into_inner());
+        let root = fs.root().unwrap();
+        let e = fs.list_directory(&root).unwrap().remove(0);
+        assert_eq!(e.name, "after");
+        assert_eq!(e.location, inum);
+        assert_eq!(slurp(&mut fs, &e), b"same bytes".to_vec());
+    }
+
+    #[test]
+    fn symlink_target_round_trips() {
+        let mut fs = open(blank());
+        let root = fs.root().unwrap();
+        fs.create_symlink(&root, "link", "/usr/include", &CreateFileOptions::default())
+            .unwrap();
+
+        let mut fs = open(fs.reader_into_inner().into_inner());
+        let root = fs.root().unwrap();
+        let e = fs.list_directory(&root).unwrap().remove(0);
+        assert_eq!(e.entry_type, EntryType::Symlink);
+        assert_eq!(e.symlink_target.as_deref(), Some("/usr/include"));
+    }
+
+    #[test]
+    fn permissions_and_owner_persist() {
+        let mut fs = open(blank());
+        let root = fs.root().unwrap();
+        let e = put(&mut fs, &root, "chmodme", b"x");
+        fs.set_permissions(&e, 0o640).unwrap();
+        fs.set_owner(&e, 100, 200).unwrap();
+
+        let mut fs = open(fs.reader_into_inner().into_inner());
+        let root = fs.root().unwrap();
+        let e = fs.list_directory(&root).unwrap().remove(0);
+        assert_eq!(e.mode.unwrap() & 0o777, 0o640);
+        // The file-type bits must survive a permission change.
+        assert_eq!(e.mode.unwrap() & 0o170000, 0o100000);
+        assert_eq!(e.uid, Some(100));
+        assert_eq!(e.gid, Some(200));
+    }
+
+    #[test]
+    fn many_files_grow_the_root_directory_past_one_block() {
+        let mut fs = open(blank());
+        let root = fs.root().unwrap();
+        // 512/16 = 32 dirents per block, so 60 entries needs a second block.
+        for i in 0..60 {
+            put(&mut fs, &root, &format!("f{i:03}"), b"x");
+        }
+        let mut fs = open(fs.reader_into_inner().into_inner());
+        let root = fs.root().unwrap();
+        assert_eq!(fs.list_directory(&root).unwrap().len(), 60);
+        assert!(root.size > EFS_V1_BLOCKSIZE);
+    }
+
+    #[test]
+    fn allocation_never_lands_in_an_inode_table() {
+        let mut fs = open(blank());
+        let root = fs.root().unwrap();
+        put(&mut fs, &root, "probe", &vec![7u8; 200 * 1024]);
+        let sb = fs.superblock().clone();
+        let regions = EfsV1DataRegions::from_sb(&sb);
+        let e = fs.list_directory(&root).unwrap().remove(0);
+        let ino = fs.read_inode(e.location as u32).unwrap();
+        for ext in fs.extents_of(&ino).unwrap() {
+            for b in ext.bn..ext.bn + ext.length as u32 {
+                assert!(regions.contains(b), "extent block {b} is not a data block");
+            }
+        }
     }
 }

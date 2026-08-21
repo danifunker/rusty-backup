@@ -614,6 +614,15 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
         }
     }
 
+    // SGI EFS v1: a different magic at a different offset, so it cannot collide
+    // with the IRIX probe above. `efs_v1::detect` tries both word orders.
+    let _ = reader.seek(SeekFrom::Start(0));
+    if crate::fs::efs_v1::detect(reader, 0).is_some() {
+        let _ = reader.seek(SeekFrom::Start(0));
+        return Some("SGI EFS v1".to_string());
+    }
+    let _ = reader.seek(SeekFrom::Start(0));
+
     // Acorn ADFS / FileCore Disc Record. Two probe sites match the
     // Linux kernel paths:
     //   * byte 0xDC0 (= 0xC00 + 0x1C0) — boot block, used by HD discs

@@ -236,3 +236,78 @@ fn a_bare_partition_image_is_detected_without_a_label() {
         assert_eq!(fs.list_directory(&root).unwrap().len(), 2, "{label}");
     }
 }
+
+/// A blank volume built by `create_blank_efs_v1`, opened through the public
+/// editable factory and written to — the path `rb-cli put` and the GUI browse
+/// view take. Proves the dispatch wiring, not just the driver internals.
+#[test]
+fn a_blank_volume_is_writable_through_the_public_factory() {
+    use rusty_backup::fs::filesystem::{CreateDirectoryOptions, CreateFileOptions};
+    use rusty_backup::fs::{efs_v1::create_blank_efs_v1, open_editable_filesystem};
+
+    let img = create_blank_efs_v1(4 * 1024 * 1024, "e2e").unwrap();
+
+    // A bare volume has no partition table, so it arrives as a superfloppy:
+    // type byte 0 and no type string, i.e. the auto-detect path.
+    let table = PartitionTable::detect(&mut Cursor::new(img.clone())).unwrap();
+    match &table {
+        PartitionTable::None { fs_hint, .. } => assert_eq!(fs_hint, "SGI EFS v1"),
+        other => panic!("expected a superfloppy, got {other:?}"),
+    }
+
+    let mut fs = open_editable_filesystem(Cursor::new(img), 0, 0, None).unwrap();
+    let root = fs.as_filesystem_mut().root().unwrap();
+    let payload = b"written through the public factory".to_vec();
+    fs.create_file(
+        &root,
+        "note",
+        &mut Cursor::new(payload.clone()),
+        payload.len() as u64,
+        &CreateFileOptions::default(),
+    )
+    .unwrap();
+    fs.create_directory(&root, "sub", &CreateDirectoryOptions::default())
+        .unwrap();
+    fs.sync_metadata().unwrap();
+
+    let listing = fs.as_filesystem_mut().list_directory(&root).unwrap();
+    let mut names: Vec<&str> = listing.iter().map(|e| e.name.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(names, vec!["note", "sub"]);
+
+    let note = listing.iter().find(|e| e.name == "note").unwrap();
+    let got = fs.as_filesystem_mut().read_file(note, usize::MAX).unwrap();
+    assert_eq!(got, payload);
+}
+
+/// The same volume, byte-swapped the way a capture off a period controller is:
+/// the synthetic type byte must still route, and writes must stay symmetric.
+#[test]
+fn a_byte_swapped_blank_volume_is_writable_too() {
+    use rusty_backup::fs::filesystem::CreateFileOptions;
+    use rusty_backup::fs::{efs_v1::create_blank_efs_v1, open_editable_filesystem};
+
+    let mut img = create_blank_efs_v1(4 * 1024 * 1024, "e2e").unwrap();
+    swab16_in_place(&mut img);
+
+    let mut fs = open_editable_filesystem(Cursor::new(img), 0, 0, None).unwrap();
+    let root = fs.as_filesystem_mut().root().unwrap();
+    let payload = b"swapped write".to_vec();
+    fs.create_file(
+        &root,
+        "swapped",
+        &mut Cursor::new(payload.clone()),
+        payload.len() as u64,
+        &CreateFileOptions::default(),
+    )
+    .unwrap();
+    fs.sync_metadata().unwrap();
+
+    let listing = fs.as_filesystem_mut().list_directory(&root).unwrap();
+    assert_eq!(listing.len(), 1);
+    let got = fs
+        .as_filesystem_mut()
+        .read_file(&listing[0], usize::MAX)
+        .unwrap();
+    assert_eq!(got, payload);
+}

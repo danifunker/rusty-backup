@@ -89,6 +89,51 @@ is not something the image can tell us. It does not matter for reading: what
 matters is that the ASCII fields read correctly in exactly one orientation, and
 that is the one the drivers interpret.
 
+## Writing
+
+The driver is read/write. `EditableFilesystem` covers create / delete / rename
+for files and directories, symlinks, `set_permissions` and `set_owner`;
+`create_blank_efs_v1` formats a fresh volume (`rb-cli new volume efs-v1`).
+
+Four things the write path has to get right, each verified against the real
+IRIS 3130 disk rather than assumed:
+
+- **Byte order is symmetric.** `write_blocks` applies the image's word order on
+  the way out exactly as `read_blocks` applies it on the way in. Writing into a
+  byte-swapped volume therefore leaves it byte-swapped and internally
+  consistent; the alternative is a volume that is half one orientation.
+- **The checksum span is 0x9E, not IRIX's 0x58.** `efs_v1_superblock_checksum`
+  runs the same rotate-and-XOR over the longer span. Verified: it reproduces the
+  stored `fs_checksum` of both EFS volumes on the sample disk exactly, and the
+  IRIX-span routine does not.
+- **Inode tables are marked in use in the bitmap.** This is the opposite of
+  IRIX EFS, where `mkfs` leaves those bits set and a bitmap-only first-fit
+  allocator walks into live inodes. On the sample disk every inode-table bit
+  reads as in-use and the free-bit count matches `fs_tfree` exactly, on both
+  volumes. The allocator still refuses to hand out anything outside a cylinder
+  group's data area, so a damaged or foreign bitmap cannot talk it into
+  overwriting an inode table.
+- **`fs_tinode` is one below the free-inode count.** Counting `di_mode == 0`
+  slots and comparing with the stored field gives a delta of exactly 1 on both
+  volumes, so `mkfs` holds one back. `create_blank_efs_v1` reproduces that.
+
+Directories are the System V shape throughout: fixed 16-byte records, a removed
+entry has its inode number zeroed and the directory keeps its size, and a name
+is capped at `DIRSIZ` (14 bytes) because a full-length name is not
+NUL-terminated.
+
+There is no journal, so ordering is the only durability tool available. On
+create the bitmap reaches disk *before* the inodes that cite those blocks, and
+on delete it reaches disk *after* the inode is cleared. Both orders fail toward
+leaked free space, which a future fsck can reclaim, rather than toward two
+inodes sharing a block. File payloads stream one extent at a time (at most
+`EFS_MAXEXTENTLEN` blocks), so a large file never lands in RAM whole.
+
+Adding a file to a copy of the real 60 MB disk, in both orientations, leaves
+every pre-existing file byte-identical (a `diff -r` of the extracted tree is
+clean), leaves the untouched `/usr` volume bit-identical, and leaves a valid
+superblock checksum with `fs_dirty` still zero.
+
 ## m68k struct packing
 
 These headers were compiled for the 68020, where the alignment requirement for

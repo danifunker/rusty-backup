@@ -50,6 +50,10 @@ pub enum FsKind {
     Fat,
     /// IRIX EFS (single cylinder group).
     Efs,
+    /// SGI EFS v1 (IRIS 2000 / 3000). Written in native byte order; run
+    /// `rb-cli swab16` to match a byte-swapped capture.
+    #[value(name = "efs-v1")]
+    EfsV1,
     /// XFS (IRIX 6 / Linux). A v5/CRC volume with 4 KiB blocks, 512-byte
     /// inodes and an internal log; minimum 32 MiB.
     Xfs,
@@ -318,6 +322,9 @@ pub enum VolumeFs {
     Prodos,
     /// IRIX EFS (single cylinder group) — a bare EFS superfloppy.
     Efs,
+    /// SGI EFS v1 (IRIS 2000 / 3000) — a bare superfloppy, native byte order.
+    #[value(name = "efs-v1")]
+    EfsV1,
     /// XFS (IRIX 6 / Linux) — a bare v5/CRC volume, minimum 32 MiB.
     Xfs,
     /// Minix V2 — 32-bit zone pointers, `mkfs.minix -2`.
@@ -343,6 +350,7 @@ impl VolumeFs {
             VolumeFs::Sfs => FsKind::Sfs,
             VolumeFs::Prodos => FsKind::Prodos,
             VolumeFs::Efs => FsKind::Efs,
+            VolumeFs::EfsV1 => FsKind::EfsV1,
             VolumeFs::Xfs => FsKind::Xfs,
             VolumeFs::Minix2 => FsKind::Minix2,
             VolumeFs::Minix3 => FsKind::Minix3,
@@ -736,6 +744,9 @@ fn format_image(args: NewArgs) -> Result<()> {
                 args.bytes_per_inode,
             ),
         ),
+        FsKind::EfsV1 => format_and_write(&args.image, &args.size, &args.name, |size, name| {
+            crate::fs::efs_v1::create_blank_efs_v1(size, name)
+        }),
         FsKind::Xfs => write_blank_xfs_image(&args.image, &args.size, &args.name),
         FsKind::Affs => {
             let variant = args.affs_variant;

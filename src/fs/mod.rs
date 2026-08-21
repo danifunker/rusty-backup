@@ -2209,6 +2209,10 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "efs_v1" => Ok(Box::new(efs_v1::EfsV1Filesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 "minix" => Ok(Box::new(minix::MinixFilesystem::open(
                     reader,
                     partition_offset,
@@ -2363,6 +2367,11 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
         )?)),
         // SGI EFS — synthetic type byte emitted by PartitionTable::Sgi.
         0xA1 => Ok(Box::new(efs::EfsFilesystem::open(
+            reader,
+            partition_offset,
+        )?)),
+        // SGI EFS v1 — synthetic type byte emitted by PartitionTable::SgiDkLabel.
+        0xA2 => Ok(Box::new(efs_v1::EfsV1Filesystem::open(
             reader,
             partition_offset,
         )?)),
