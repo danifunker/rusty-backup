@@ -249,9 +249,9 @@ fn emit_text(
         out_stdout("\nNo partitions detected.");
         return Ok(());
     }
-    // Two selectors, both typeable: `idx` is `IMG@N`, the 1-based position in
-    // this list; `slot` is `IMG@sN`, the table's own numbering (blank for GPT
-    // and friends, which have none). They differ whenever a table hides rows.
+    // Two selectors, both typeable: `idx` is `IMG@N` and `partmap`'s index, the
+    // 1-based position here; `slot` is `IMG@sN`, the table's own numbering.
+    // They differ whenever a table hides rows.
     let has_slots = pt.has_native_slots();
     out_stdout("");
     if has_slots {

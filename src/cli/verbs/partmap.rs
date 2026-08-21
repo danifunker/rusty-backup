@@ -69,7 +69,8 @@ pub struct AddArgs {
 #[derive(Debug, Args)]
 pub struct ResizeArgs {
     pub image: PathBuf,
-    /// 1-based partition index.
+    /// Partition to act on: the 1-based `idx` column `inspect` prints, the
+    /// same number `IMG@N` takes. Not the raw table slot (`@sN`).
     pub index: u32,
     #[arg(long)]
     pub size: String,
@@ -200,21 +201,21 @@ pub fn run(cmd: PartmapCommand) -> Result<()> {
         PartmapCommand::Resize(a) => single_edit(
             &a.image,
             PartitionTableEdit::ResizeEntry {
-                index: idx_1based(a.index)?,
+                index: listed_pos(a.index)?,
                 new_size_bytes: parse_size(&a.size)?,
             },
         ),
         PartmapCommand::Move(a) => single_edit(
             &a.image,
             PartitionTableEdit::MoveEntry {
-                index: idx_1based(a.index)?,
+                index: listed_pos(a.index)?,
                 new_start_lba: a.start_lba,
             },
         ),
         PartmapCommand::Delete(a) => single_edit(
             &a.image,
             PartitionTableEdit::DeleteEntry {
-                index: idx_1based(a.index)?,
+                index: listed_pos(a.index)?,
             },
         ),
         PartmapCommand::SetType(a) => {
@@ -224,7 +225,7 @@ pub fn run(cmd: PartmapCommand) -> Result<()> {
             single_edit(
                 &a.image,
                 PartitionTableEdit::ChangeType {
-                    index: idx_1based(a.index)?,
+                    index: listed_pos(a.index)?,
                     new_type_byte: a.type_byte.unwrap_or(0),
                     new_type_string: a.type_string,
                 },
@@ -233,7 +234,7 @@ pub fn run(cmd: PartmapCommand) -> Result<()> {
         PartmapCommand::SetBootable(a) => single_edit(
             &a.image,
             PartitionTableEdit::SetBootable {
-                index: idx_1based(a.index)?,
+                index: listed_pos(a.index)?,
                 bootable: a.bootable,
             },
         ),
@@ -285,11 +286,78 @@ fn run_types(a: TypesArgs) -> Result<()> {
     Ok(())
 }
 
-fn idx_1based(idx: u32) -> Result<usize> {
+/// The number a user types is the `idx` column `inspect` prints: a 1-based
+/// position in the listed partitions. [`remap_listed_indices`] turns it into
+/// the `PartitionInfo::index` every consumer downstream matches on.
+fn listed_pos(idx: u32) -> Result<usize> {
     if idx == 0 {
         bail!("partition index is 1-based");
     }
     Ok((idx - 1) as usize)
+}
+
+/// Translate each edit's listed position into `PartitionInfo::index`.
+///
+/// The two coincide only while a table's entries are dense. They diverge on an
+/// MBR holding just partitions 1 and 3, or an SGI volume header whose slot 1 is
+/// RAW — `partitions()` hides the gaps, so the third listed partition can be
+/// entry 5. Doing this once, here, is what keeps `partmap`'s argument meaning
+/// the same thing as the `idx` column and the `IMG@N` selector.
+fn remap_listed_indices(
+    table: &PartitionTable,
+    edits: Vec<PartitionTableEdit>,
+) -> Result<Vec<PartitionTableEdit>> {
+    let listed = table.partitions();
+    let at = |pos: usize| -> Result<usize> {
+        listed.get(pos).map(|p| p.index).ok_or_else(|| {
+            anyhow::anyhow!(
+                "partition {} does not exist ({} listed)",
+                pos + 1,
+                listed.len()
+            )
+        })
+    };
+    edits
+        .into_iter()
+        .map(|e| {
+            Ok(match e {
+                PartitionTableEdit::ResizeEntry {
+                    index,
+                    new_size_bytes,
+                } => PartitionTableEdit::ResizeEntry {
+                    index: at(index)?,
+                    new_size_bytes,
+                },
+                PartitionTableEdit::MoveEntry {
+                    index,
+                    new_start_lba,
+                } => PartitionTableEdit::MoveEntry {
+                    index: at(index)?,
+                    new_start_lba,
+                },
+                PartitionTableEdit::ChangeType {
+                    index,
+                    new_type_byte,
+                    new_type_string,
+                } => PartitionTableEdit::ChangeType {
+                    index: at(index)?,
+                    new_type_byte,
+                    new_type_string,
+                },
+                PartitionTableEdit::DeleteEntry { index } => {
+                    PartitionTableEdit::DeleteEntry { index: at(index)? }
+                }
+                PartitionTableEdit::SetBootable { index, bootable } => {
+                    PartitionTableEdit::SetBootable {
+                        index: at(index)?,
+                        bootable,
+                    }
+                }
+                // `AddEntry` names no existing partition.
+                PartitionTableEdit::AddEntry { .. } => e,
+            })
+        })
+        .collect()
 }
 
 fn single_edit(image: &std::path::Path, edit: PartitionTableEdit) -> Result<()> {
@@ -325,27 +393,27 @@ fn json_edit_to_edit(j: JsonEdit) -> Result<PartitionTableEdit> {
             bootable,
         },
         JsonEdit::Resize { index, size } => PartitionTableEdit::ResizeEntry {
-            index: idx_1based(index)?,
+            index: listed_pos(index)?,
             new_size_bytes: parse_size(&size)?,
         },
         JsonEdit::Move { index, start_lba } => PartitionTableEdit::MoveEntry {
-            index: idx_1based(index)?,
+            index: listed_pos(index)?,
             new_start_lba: start_lba,
         },
         JsonEdit::Delete { index } => PartitionTableEdit::DeleteEntry {
-            index: idx_1based(index)?,
+            index: listed_pos(index)?,
         },
         JsonEdit::SetType {
             index,
             type_byte,
             type_string,
         } => PartitionTableEdit::ChangeType {
-            index: idx_1based(index)?,
+            index: listed_pos(index)?,
             new_type_byte: type_byte.unwrap_or(0),
             new_type_string: type_string,
         },
         JsonEdit::SetBootable { index, bootable } => PartitionTableEdit::SetBootable {
-            index: idx_1based(index)?,
+            index: listed_pos(index)?,
             bootable,
         },
     })
@@ -420,6 +488,7 @@ fn apply_batch(
     let disk_size = disk_size_of(image, &mut probe)?;
     drop(probe);
 
+    let edits = remap_listed_indices(&table, edits)?;
     let warnings = validate_edits(&table, &edits, disk_size)
         .map_err(|e| anyhow::anyhow!("validate_edits: {e}"))?;
     for w in &warnings {
@@ -445,4 +514,130 @@ fn apply_batch(
         image.display()
     ));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::partition::mbr::{build_minimal_mbr, Mbr};
+
+    /// An MBR with entries 0 and 2 populated and entry 1 zeroed. `partitions()`
+    /// lists two, but their `index`es are 0 and 2 — the gap the remap exists for.
+    fn sparse_mbr() -> PartitionTable {
+        let mut raw = build_minimal_mbr(
+            0x1234_5678,
+            &[
+                (0x83, 2048, 16384, false),
+                (0x83, 20480, 16384, false),
+                (0x83, 40960, 16384, false),
+            ],
+            255,
+            63,
+        );
+        // Drop the middle entry: 16 bytes at 0x1BE + 1 * 16.
+        raw[0x1CE..0x1CE + 16].fill(0);
+        PartitionTable::Mbr(Mbr::parse(&raw).unwrap())
+    }
+
+    fn resize_index(edits: &[PartitionTableEdit]) -> usize {
+        match &edits[0] {
+            PartitionTableEdit::ResizeEntry { index, .. } => *index,
+            other => panic!("expected a resize, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_listing_is_sparse_so_position_and_entry_index_differ() {
+        let listed = sparse_mbr().partitions();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].index, 0);
+        assert_eq!(
+            listed[1].index, 2,
+            "the second listed entry is table slot 2"
+        );
+    }
+
+    /// Typing `2` means the second partition `inspect` listed, which lives in
+    /// entry 2 — not entry 1, which is the hole.
+    #[test]
+    fn a_listed_position_maps_across_the_gap() {
+        let table = sparse_mbr();
+        let edits = remap_listed_indices(
+            &table,
+            vec![PartitionTableEdit::ResizeEntry {
+                index: listed_pos(2).unwrap(),
+                new_size_bytes: 4096,
+            }],
+        )
+        .unwrap();
+        assert_eq!(resize_index(&edits), 2);
+    }
+
+    #[test]
+    fn the_first_listed_position_still_maps_to_the_first_entry() {
+        let table = sparse_mbr();
+        let edits = remap_listed_indices(
+            &table,
+            vec![PartitionTableEdit::ResizeEntry {
+                index: listed_pos(1).unwrap(),
+                new_size_bytes: 4096,
+            }],
+        )
+        .unwrap();
+        assert_eq!(resize_index(&edits), 0);
+    }
+
+    /// The remapped index must be one `validate_edits` can find, or the edit
+    /// dies later with a confusing "partition index N not found".
+    #[test]
+    fn a_remapped_edit_passes_validation() {
+        let table = sparse_mbr();
+        let edits = remap_listed_indices(
+            &table,
+            vec![PartitionTableEdit::ResizeEntry {
+                index: listed_pos(2).unwrap(),
+                new_size_bytes: 4096,
+            }],
+        )
+        .unwrap();
+        crate::partition::editor::validate_edits(&table, &edits, 64 * 1024 * 1024)
+            .expect("a remapped edit must validate");
+    }
+
+    #[test]
+    fn a_position_past_the_listing_names_what_was_typed() {
+        let table = sparse_mbr();
+        let err = remap_listed_indices(
+            &table,
+            vec![PartitionTableEdit::DeleteEntry {
+                index: listed_pos(5).unwrap(),
+            }],
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("partition 5 does not exist"), "{msg}");
+        assert!(msg.contains("2 listed"), "{msg}");
+    }
+
+    #[test]
+    fn add_entry_carries_no_index_and_is_untouched() {
+        let table = sparse_mbr();
+        let edits = remap_listed_indices(
+            &table,
+            vec![PartitionTableEdit::AddEntry {
+                start_lba: 60000,
+                size_bytes: 4096,
+                partition_type: 0x83,
+                type_string: None,
+                bootable: false,
+            }],
+        )
+        .unwrap();
+        assert!(matches!(edits[0], PartitionTableEdit::AddEntry { .. }));
+    }
+
+    #[test]
+    fn index_zero_is_rejected_as_not_one_based() {
+        assert!(listed_pos(0).is_err());
+    }
 }

@@ -832,7 +832,7 @@ Usage: import [OPTIONS] <IMAGE> <DIR> [DEST]
 
 ### `inspect`
 
-Whole-disk aggregate read-only view (partition table + per-partition summary + CHD metadata when applicable). The `idx` column is the selector: pass it back as `IMG@N`, `--partition N` or `--partitions N`
+Whole-disk aggregate read-only view (partition table + per-partition summary + CHD metadata when applicable). The `idx` column is the selector: pass it back as `IMG@N`, `--partition N`, `--partitions N`, or as the index argument to `partmap`
 
 ```
 Usage: inspect [OPTIONS] <IMAGE>
@@ -1604,7 +1604,7 @@ Usage: resize --size <SIZE> <IMAGE> <INDEX>
 **Arguments**
 
 - `<IMAGE>` — 
-- `<INDEX>` — 1-based partition index
+- `<INDEX>` — Partition to act on: the 1-based `idx` column `inspect` prints, the same number `IMG@N` takes. Not the raw table slot (`@sN`)
 
 **Options**
 
