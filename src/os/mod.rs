@@ -800,6 +800,8 @@ pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
 
 /// Turn a permission-denied raw-device open into an actionable message. The GUI
 /// starts unprivileged, so this is now the ordinary first-time device failure.
+/// macOS never reaches here: it escalates per operation through `authopen`.
+#[cfg(not(target_os = "macos"))]
 pub(crate) fn device_open_error(path: &Path, e: std::io::Error) -> anyhow::Error {
     if is_device_path(path) && e.kind() == std::io::ErrorKind::PermissionDenied {
         #[cfg(target_os = "linux")]
