@@ -113,7 +113,7 @@ impl PartitionBar {
                         egui::pos2(sep_x, rect.top()),
                         egui::pos2(sep_x, rect.bottom()),
                     ],
-                    egui::Stroke::new(1.0, ui.visuals().window_stroke.color),
+                    egui::Stroke::new(1.0_f32, ui.visuals().window_stroke.color),
                 );
             }
 
@@ -145,7 +145,7 @@ impl PartitionBar {
         painter.rect_stroke(
             rect,
             egui::CornerRadius::same(2),
-            egui::Stroke::new(1.0, ui.visuals().window_stroke.color),
+            egui::Stroke::new(1.0_f32, ui.visuals().window_stroke.color),
             egui::StrokeKind::Inside,
         );
 
@@ -171,7 +171,7 @@ impl PartitionBar {
                 ui.painter().rect_stroke(
                     rect,
                     egui::CornerRadius::same(2),
-                    egui::Stroke::new(1.0, ui.visuals().window_stroke.color),
+                    egui::Stroke::new(1.0_f32, ui.visuals().window_stroke.color),
                     egui::StrokeKind::Inside,
                 );
 

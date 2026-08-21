@@ -1413,7 +1413,7 @@ fn draw_copy_icon(p: &egui::Painter, r: egui::Rect, color: egui::Color32, rightw
     let fx = r.left() + side * 0.7;
     draw_floppy(p, egui::pos2(fx - 3.0, cy - 3.0), side, color); // back
     draw_floppy(p, egui::pos2(fx + 3.0, cy + 3.0), side, color); // front
-    let stroke = egui::Stroke::new(2.5, color);
+    let stroke = egui::Stroke::new(2.5_f32, color);
     let ax0 = r.center().x + 8.0;
     let ax1 = r.right() - 2.0;
     let (tail, head) = if rightward { (ax0, ax1) } else { (ax1, ax0) };
@@ -1437,7 +1437,7 @@ fn draw_delete_icon(p: &egui::Painter, r: egui::Rect, color: egui::Color32) {
     // pointer, so it has no `Visuals` to consult. A mid-red clears the 3:1
     // WCAG floor for non-text graphics against both backgrounds.
     let red = egui::Color32::from_rgb(200, 60, 60);
-    let stroke = egui::Stroke::new(3.0, red);
+    let stroke = egui::Stroke::new(3.0_f32, red);
     let h = side * 0.55;
     let xc = egui::pos2(r.center().x + 8.0, r.center().y);
     p.line_segment([xc + egui::vec2(-h, -h), xc + egui::vec2(h, h)], stroke);

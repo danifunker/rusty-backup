@@ -234,19 +234,13 @@ fn parse_object(buf: &[u8], off: usize) -> Option<(SfsObject, usize)> {
     let datemodified = rd_u32(buf, off + 20);
     let bits = buf[off + 24];
     let mut p = off + 25;
-    let name_end = match buf[p..].iter().position(|&b| b == 0) {
-        Some(n) => p + n,
-        None => return None,
-    };
+    let name_end = p + buf[p..].iter().position(|&b| b == 0)?;
     let name = String::from_utf8_lossy(&buf[p..name_end]).to_string();
     p = name_end + 1;
     if p >= buf.len() {
         return None;
     }
-    let comment_end = match buf[p..].iter().position(|&b| b == 0) {
-        Some(n) => p + n,
-        None => return None,
-    };
+    let comment_end = p + buf[p..].iter().position(|&b| b == 0)?;
     let comment = String::from_utf8_lossy(&buf[p..comment_end]).to_string();
     let mut end = comment_end + 1;
     // Align to even boundary.

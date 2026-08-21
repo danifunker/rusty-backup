@@ -437,9 +437,9 @@ impl RemoteBrowsePanel {
     /// Poll an in-flight transition; on completion re-install the browser and
     /// swap the new target into the listing.
     fn poll(&mut self, ctx: &egui::Context) -> Option<String> {
-        let done = match self.pending.as_ref() {
-            Some(s) => s.lock().ok().map(|g| g.done).unwrap_or(false),
-            None => return None,
+        let done = {
+            let s = self.pending.as_ref()?;
+            s.lock().ok().map(|g| g.done).unwrap_or(false)
         };
         if !done {
             ctx.request_repaint();

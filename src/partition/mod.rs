@@ -259,8 +259,7 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
     // `casper/filesystem.squashfs` carved out of a live CD). Probed first: the
     // 4-byte magic is unambiguous, and `detect` additionally parses the whole
     // superblock, so a chance match is never reported as a filesystem.
-    if first_sector[0..4] == [b'h', b's', b'q', b's']
-        && crate::fs::squashfs::SquashfsFilesystem::detect(reader, 0)
+    if first_sector[0..4] == *b"hsqs" && crate::fs::squashfs::SquashfsFilesystem::detect(reader, 0)
     {
         let _ = reader.seek(SeekFrom::Start(0));
         return Some("squashfs".to_string());

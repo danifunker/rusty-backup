@@ -1270,9 +1270,9 @@ impl CommanderPane {
     /// swap the new target (the host file browser, or an opened image) into the
     /// listing.
     fn poll_remote(&mut self, ctx: &egui::Context) -> Option<String> {
-        let done = match self.pending_remote.as_ref() {
-            Some(s) => s.lock().ok().map(|g| g.done).unwrap_or(false),
-            None => return None,
+        let done = {
+            let s = self.pending_remote.as_ref()?;
+            s.lock().ok().map(|g| g.done).unwrap_or(false)
         };
         if !done {
             ctx.request_repaint();
@@ -2888,7 +2888,7 @@ impl CommanderPane {
                 egui::pos2(rect.left(), rect.bottom()),
                 egui::pos2(rect.right(), rect.bottom()),
             ],
-            egui::Stroke::new(1.0, ui.visuals().window_stroke.color),
+            egui::Stroke::new(1.0_f32, ui.visuals().window_stroke.color),
         );
 
         if resp.clicked() {
@@ -3684,7 +3684,7 @@ fn paint_row(ui: &egui::Ui, rect: egui::Rect, row: &DisplayRow) {
     if row.kind == RowKind::PendingDelete {
         ui.painter().line_segment(
             [egui::pos2(c.name_l, mid), egui::pos2(c.name_r, mid)],
-            egui::Stroke::new(1.0, color),
+            egui::Stroke::new(1.0_f32, color),
         );
     }
 }
