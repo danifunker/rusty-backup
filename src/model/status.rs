@@ -115,6 +115,19 @@ pub struct ChdExpandStatus {
     pub log_messages: Vec<String>,
 }
 
+/// Status of a whole-image 16-bit word swap. Fixes up a capture taken through
+/// a controller that reverses words; see `crate::rbformats::swab`.
+#[derive(Default)]
+pub struct SwabStatus {
+    pub finished: bool,
+    pub error: Option<String>,
+    pub current_bytes: u64,
+    pub total_bytes: u64,
+    pub log_messages: Vec<String>,
+    /// Where the converted image landed, once the run succeeded.
+    pub output_path: Option<PathBuf>,
+}
+
 /// Status of an in-place partition resize running on a background thread.
 pub struct ResizeStatus {
     pub finished: bool,

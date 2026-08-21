@@ -872,7 +872,10 @@ fn pick_default_partition(partitions: &[PartitionInfo]) -> Result<PartitionInfo>
 }
 
 fn format_label(pt: &PartitionTable, info: &PartitionInfo, partitions: &[PartitionInfo]) -> String {
-    let pt_name = pt.type_name();
+    let pt_name = match pt.byte_order_name() {
+        Some(order) => format!("{}, {order}", pt.type_name()),
+        None => pt.type_name().to_string(),
+    };
     // Name it the two ways the user can select it, rather than echoing the raw
     // `index` — which matched neither `@N` nor `@sN` and read as a third answer.
     let pos = partitions

@@ -1546,7 +1546,10 @@ impl BackupTab {
                 let table_desc = if matches!(table, PartitionTable::None { .. }) {
                     "No partition table (superfloppy)".to_string()
                 } else {
-                    table.type_name().to_string()
+                    match table.byte_order_name() {
+                        Some(order) => format!("{} ({order})", table.type_name()),
+                        None => table.type_name().to_string(),
+                    }
                 };
                 self.source_partition_table_desc = Some(table_desc.clone());
                 ctx.log.info(format!(

@@ -1564,6 +1564,15 @@ impl PartitionTable {
         }
     }
 
+    /// Word orientation of the medium, for the table types that have one.
+    /// Only the SGI disk label does today; everything else reads one way round.
+    pub fn byte_order_name(&self) -> Option<&'static str> {
+        match self {
+            PartitionTable::SgiDkLabel(label) => Some(label.byte_order.display_name()),
+            _ => None,
+        }
+    }
+
     /// Get the MBR disk signature (available for both MBR and GPT via protective MBR).
     /// APM, SGI, and superfloppy have no disk signature, returns 0.
     pub fn disk_signature(&self) -> u32 {

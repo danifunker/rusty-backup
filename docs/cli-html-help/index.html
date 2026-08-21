@@ -73,6 +73,7 @@
 <li><a href="show.html"><code>show</code></a><span class="desc">Focused read-only queries</span></li>
 <li><a href="shrink.html"><code>shrink</code></a><span class="desc">Re-encode a disk image into a CHD with trailing zero padding dropped (SGI/IRIX today)</span></li>
 <li><a href="squashfs.html"><code>squashfs</code></a><span class="desc">SquashFS edits with an explicit size budget (`plan` / `put` / `rm`). The format has no in-place write, so committing rebuilds the whole image and its final size can only be bounded, never predicted</span></li>
+<li><a href="swab16.html"><code>swab16</code></a><span class="desc">Swap the two bytes of every 16-bit word in a disk image. Fixes up a capture taken through a controller that reverses words (e.g. SGI IRIS disks); the transform is its own inverse</span></li>
 <li><a href="tar.html"><code>tar</code></a><span class="desc">Archive a filesystem (or a subtree) to a single `.tar.gz` / `.tar.zst` / `.tar`. Preserves exact case-sensitive names and real symlinks, so extracting on a case-insensitive host won't clobber files that differ only in case</span></li>
 <li><a href="terminal.html"><code>terminal</code></a><span class="desc">Open an interactive rb-cli shell (rustyline-based REPL)</span></li>
 <li><a href="tui.html"><code>tui</code></a><span class="desc">Launch the full-screen terminal UI (preview): a menu-driven ratatui app that runs anywhere rusty-backup does, including serial consoles and vintage terminals. Needs an interactive terminal</span></li>

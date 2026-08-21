@@ -485,6 +485,26 @@ mod tests {
     }
 
     #[test]
+    fn partition_table_reports_the_word_order() {
+        use crate::partition::PartitionTable;
+        let native = PartitionTable::SgiDkLabel(SgiDiskLabel::parse(&sample_label()).unwrap());
+        let swapped =
+            PartitionTable::SgiDkLabel(SgiDiskLabel::parse(&swabbed(sample_label())).unwrap());
+        assert_eq!(native.byte_order_name(), Some("native"));
+        assert_eq!(swapped.byte_order_name(), Some("byte-swapped"));
+    }
+
+    #[test]
+    fn tables_without_a_word_order_report_none() {
+        use crate::partition::PartitionTable;
+        let sf = PartitionTable::None {
+            size_bytes: 1_474_560,
+            fs_hint: "FAT".to_string(),
+        };
+        assert_eq!(sf.byte_order_name(), None);
+    }
+
+    #[test]
     fn swab_is_its_own_inverse() {
         let orig = sample_label();
         let mut round = orig.clone();

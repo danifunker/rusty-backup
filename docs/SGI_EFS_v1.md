@@ -71,6 +71,24 @@ orientations and fix up every block on the way in. Nothing is normalised at the
 reader level: a backup of one of these disks must stay byte-identical to the
 source, so only the *interpretation* is swapped, never the stored bytes.
 
+Because both orientations read identically, the orientation an image happens to
+be in is invisible unless we say so. `rb-cli inspect` and `rb-cli ls` therefore
+name it (`Partition table: SGI-DkLabel (byte-swapped)`), as does the GUI's
+Inspect tab, and `rb-cli inspect --format json` carries it as `byte_order`.
+
+To move an image between the two, `rb-cli swab16 IN OUT` (or `--in-place`)
+rewrites every 16-bit word; the GUI's Inspect tab exposes the same thing as a
+*Swap Word Order...* button. The transform is an involution, so one command
+converts in either direction, and running it twice returns the original bytes.
+It is deliberately format-agnostic — it knows nothing about SGI and will happily
+fix up any medium captured through a word-swapping controller — but it probes
+the partition table before and after so the flip is visible rather than blind.
+
+Whether the swap happened in the drive, the controller, or the dumping program
+is not something the image can tell us. It does not matter for reading: what
+matters is that the ASCII fields read correctly in exactly one orientation, and
+that is the one the drivers interpret.
+
 ## m68k struct packing
 
 These headers were compiled for the 68020, where the alignment requirement for

@@ -192,6 +192,7 @@ pub(crate) mod qemu_img_test;
 pub mod raw;
 pub mod sparse;
 pub mod sparseimage;
+pub mod swab;
 pub mod twomg;
 pub mod vhd;
 pub mod vmdk;

@@ -2086,6 +2086,24 @@ Usage: verify <IMAGE>
 
 - `<IMAGE>` — Image reference (`path` or `path@N`)
 
+### `swab16`
+
+Swap the two bytes of every 16-bit word in a disk image. Fixes up a capture taken through a controller that reverses words (e.g. SGI IRIS disks); the transform is its own inverse
+
+```
+Usage: swab16 [OPTIONS] <INPUT> [OUTPUT]
+```
+
+**Arguments**
+
+- `<INPUT>` — Image to convert
+- `<OUTPUT>` — Destination image. Omit when passing `--in-place`
+
+**Options**
+
+- `--in-place` — Rewrite INPUT itself instead of writing a separate OUTPUT
+- `--force` — Overwrite OUTPUT when it already exists
+
 ### `tar`
 
 Archive a filesystem (or a subtree) to a single `.tar.gz` / `.tar.zst` / `.tar`. Preserves exact case-sensitive names and real symlinks, so extracting on a case-insensitive host won't clobber files that differ only in case
