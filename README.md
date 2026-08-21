@@ -29,7 +29,9 @@ Rusty Backup ships as a single self-contained binary per platform.
    - **Linux** — `chmod +x rusty-backup-*.AppImage` and launch it.
 3. Raw physical disks require elevated privileges (admin on Windows, root on
    Linux, an authorisation prompt on macOS). Working with image files on disk
-   does not.
+   does not, so the GUI always starts unprivileged. On Windows and Linux the
+   shield button in the top bar ("Show Physical Devices" / "Unlock Physical
+   Devices") restarts it elevated when you actually need a physical disk.
 
 To build from source: `cargo build --release`. See `CLAUDE.md` for the full
 build matrix.

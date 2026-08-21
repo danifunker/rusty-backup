@@ -798,6 +798,28 @@ pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
     }
 }
 
+/// Turn a permission-denied raw-device open into an actionable message. The GUI
+/// starts unprivileged, so this is now the ordinary first-time device failure.
+pub(crate) fn device_open_error(path: &Path, e: std::io::Error) -> anyhow::Error {
+    if is_device_path(path) && e.kind() == std::io::ErrorKind::PermissionDenied {
+        #[cfg(target_os = "linux")]
+        return anyhow::anyhow!(
+            "cannot open {} - permission denied. Raw disks belong to root: click \
+             \"Unlock Physical Devices\" in the GUI top bar to restart elevated, or \
+             run rb-cli under sudo.",
+            path.display()
+        );
+        #[cfg(windows)]
+        return anyhow::anyhow!(
+            "cannot open {} - permission denied. Raw disks need administrator \
+             rights: click \"Show Physical Devices\" in the GUI top bar, or run \
+             rb-cli from an elevated prompt.",
+            path.display()
+        );
+    }
+    anyhow::Error::new(e).context(format!("cannot open {}", path.display()))
+}
+
 /// Open a file or device for read-only inspection.
 ///
 /// On macOS, if a `/dev/disk*` path returns permission denied, this will
@@ -813,7 +835,7 @@ pub fn open_for_inspect(path: &Path) -> Result<File> {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        File::open(path).with_context(|| format!("cannot open {}", path.display()))
+        File::open(path).map_err(|e| device_open_error(path, e))
     }
 }
 
