@@ -1111,6 +1111,21 @@ fn run_backup_inner(
             );
             bail!("backing up Sun-labeled disks is not yet supported (browse only)");
         }
+        PartitionTable::SgiDkLabel(label) => {
+            // Same sidecar shape as the Sun label: record the slot layout in
+            // sgi_dklabel.json and defer the per-slot data backup. Browse /
+            // inspect / extract already work through the EFS v1 reader.
+            let json = serde_json::to_string_pretty(label)
+                .context("failed to serialize SGI disk label to JSON")?;
+            std::fs::write(backup_folder.join("sgi_dklabel.json"), json)
+                .context("failed to write sgi_dklabel.json")?;
+            log(
+                &progress,
+                LogLevel::Info,
+                "Exported SGI disk label (sgi_dklabel.json) — partition data backup not yet supported",
+            );
+            bail!("backing up SGI-disk-label disks is not yet supported (browse only)");
+        }
         PartitionTable::Ahdi(table) => {
             // Mirror the RDB / SGI sidecar shape: emit ahdi.json so a future
             // restore knows the AHDI primary slots, XGM chain, and disk-size

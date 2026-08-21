@@ -9,6 +9,7 @@ pub mod provision;
 pub mod rdb;
 pub mod resize;
 pub mod sgi;
+pub mod sgi_dklabel;
 pub mod sgi_hdd_builder;
 pub mod sun;
 pub mod type_catalog;
@@ -25,6 +26,7 @@ use gpt::Gpt;
 use mbr::Mbr;
 use rdb::{Rdb, RDSK_SIGNATURE};
 use sgi::{SgiVolumeHeader, SGI_TYPE_BYTE_EFS, SGI_TYPE_BYTE_XFS, SGI_VOLHDR_MAGIC};
+use sgi_dklabel::SgiDiskLabel;
 use sun::SunDiskLabel;
 use x68k::X68kPartitionTable;
 
@@ -46,6 +48,10 @@ pub enum PartitionTable {
     /// plus a volume directory of standalone executables (`sash`, `ide`,
     /// `/unix`); see `src/partition/sgi.rs`.
     Sgi(SgiVolumeHeader),
+    /// SGI disk label — IRIS 2000 / 3000 series disks (the pre-IRIX scheme).
+    /// One `struct disk_label` at block 0 with geometry plus 8 `{base, size}`
+    /// slots; may be byte-swapped. See `src/partition/sgi_dklabel.rs`.
+    SgiDkLabel(SgiDiskLabel),
     /// Sun disk label (SMI VTOC) — SPARC Solaris / SunOS disks. 8 slices,
     /// big-endian, magic `0xDABE` at byte 508; see `src/partition/sun.rs`.
     Sun(SunDiskLabel),
@@ -813,6 +819,15 @@ impl PartitionTable {
             return Err(SgiVolumeHeader::parse(&mbr_data).unwrap_err());
         }
 
+        // SGI disk label (IRIS 2000 / 3000, pre-IRIX). `D_MAGIC` 0x00072959 at
+        // byte 0, in either byte order — images off the period disk
+        // controllers come out swapped within every 16-bit word.
+        if let Some(order) = sgi_dklabel::detect(&mbr_data) {
+            return Ok(PartitionTable::SgiDkLabel(SgiDiskLabel::parse_with_order(
+                &mbr_data, order,
+            )?));
+        }
+
         // Sun disk label (SPARC Solaris / SunOS): magic 0xDABE at byte 508 plus
         // a valid XOR checksum. Checked before MBR — the magic sits at a
         // different offset than the MBR 0xAA55 (byte 510) and the checksum
@@ -1040,7 +1055,9 @@ impl PartitionTable {
             // diskutil's `sN` counts map entries from 1.
             PartitionTable::Apm(_) => Some(raw + 1),
             // IRIX `fx` and Sun `format(1M)` both number from 0.
-            PartitionTable::Sgi(_) | PartitionTable::Sun(_) => Some(raw),
+            PartitionTable::Sgi(_) | PartitionTable::SgiDkLabel(_) | PartitionTable::Sun(_) => {
+                Some(raw)
+            }
             // No platform convention; `@DH0` is the identity users know.
             PartitionTable::Rdb(_) => Some(raw),
             _ => None,
@@ -1055,6 +1072,7 @@ impl PartitionTable {
                 | PartitionTable::Ahdi(_)
                 | PartitionTable::Apm(_)
                 | PartitionTable::Sgi(_)
+                | PartitionTable::SgiDkLabel(_)
                 | PartitionTable::Sun(_)
                 | PartitionTable::Rdb(_)
         )
@@ -1202,6 +1220,40 @@ impl PartitionTable {
                     })
                     .collect()
             }
+            PartitionTable::SgiDkLabel(label) => label
+                .browsable_slots()
+                .map(|(i, m)| {
+                    let role = label.slot_role(i);
+                    // The label carries no filesystem type, only roles. Swap
+                    // holds no filesystem, so leave its byte at 0; every other
+                    // slot routes to the EFS v1 driver, which reports honestly
+                    // if the slot turns out to hold something else.
+                    let is_swap = role == "swap";
+                    PartitionInfo {
+                        index: i,
+                        type_name: if is_swap {
+                            "SGI swap".to_string()
+                        } else {
+                            format!("SGI {role} (EFS v1)")
+                        },
+                        partition_type_byte: if is_swap {
+                            0
+                        } else {
+                            sgi_dklabel::SGI_TYPE_BYTE_EFS_V1
+                        },
+                        start_lba: m.base as u64,
+                        start_byte: None,
+                        size_bytes: m.size_bytes(),
+                        bootable: i as u8 == label.bootfs,
+                        is_logical: false,
+                        is_extended_container: false,
+                        partition_type_string: None,
+                        hfs_block_size: None,
+                        rdb_part_block: None,
+                        drv_name: None,
+                    }
+                })
+                .collect(),
             PartitionTable::Sun(label) => label
                 .browsable_slices()
                 .map(|(i, s)| PartitionInfo {
@@ -1448,7 +1500,17 @@ impl PartitionTable {
     /// Exists so `tests/doc_parity.rs` can require a README row per scheme;
     /// the `#[cfg(test)]` guard below keeps it honest when a variant is added.
     pub const ALL_TYPE_NAMES: &'static [&'static str] = &[
-        "MBR", "GPT", "APM", "RDB", "SGI", "Sun", "AHDI", "X68k", "None", "DSD",
+        "MBR",
+        "GPT",
+        "APM",
+        "RDB",
+        "SGI",
+        "SGI-DkLabel",
+        "Sun",
+        "AHDI",
+        "X68k",
+        "None",
+        "DSD",
     ];
 
     /// Whether this disk carries a partition table at all.
@@ -1494,6 +1556,7 @@ impl PartitionTable {
             PartitionTable::Apm(_) => "APM",
             PartitionTable::Rdb(_) => "RDB",
             PartitionTable::Sgi(_) => "SGI",
+            PartitionTable::SgiDkLabel(_) => "SGI-DkLabel",
             PartitionTable::Sun(_) => "Sun",
             PartitionTable::Ahdi(_) => "AHDI",
             PartitionTable::X68k { .. } => "X68k",
@@ -1511,6 +1574,7 @@ impl PartitionTable {
             PartitionTable::Apm(_)
             | PartitionTable::Rdb(_)
             | PartitionTable::Sgi(_)
+            | PartitionTable::SgiDkLabel(_)
             | PartitionTable::Sun(_)
             | PartitionTable::Ahdi(_)
             | PartitionTable::X68k { .. }
@@ -2650,11 +2714,12 @@ mod type_name_parity {
             PartitionTable::Apm(_) => 2,
             PartitionTable::Rdb(_) => 3,
             PartitionTable::Sgi(_) => 4,
-            PartitionTable::Sun(_) => 5,
-            PartitionTable::Ahdi(_) => 6,
-            PartitionTable::X68k { .. } => 7,
-            PartitionTable::None { .. } => 8,
-            PartitionTable::Dsd { .. } => 9,
+            PartitionTable::SgiDkLabel(_) => 5,
+            PartitionTable::Sun(_) => 6,
+            PartitionTable::Ahdi(_) => 7,
+            PartitionTable::X68k { .. } => 8,
+            PartitionTable::None { .. } => 9,
+            PartitionTable::Dsd { .. } => 10,
         }
     }
 
@@ -2662,7 +2727,7 @@ mod type_name_parity {
     fn all_type_names_covers_every_variant() {
         assert_eq!(
             PartitionTable::ALL_TYPE_NAMES.len(),
-            10,
+            11,
             "a PartitionTable variant was added or removed: update ALL_TYPE_NAMES, \
              every_variant_has_an_index, and the README table tests/doc_parity.rs checks"
         );

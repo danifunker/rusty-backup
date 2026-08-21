@@ -24,6 +24,7 @@ pub mod dragondos;
 pub mod efs;
 pub mod efs_fsck;
 pub mod efs_resize;
+pub mod efs_v1;
 pub mod entry;
 pub mod exfat;
 pub mod exfat_clone;
@@ -262,6 +263,7 @@ fn fs_display_name(detected: &str) -> &'static str {
         "ext" => "ext2/3/4",
         "btrfs" => "btrfs",
         "efs" => "SGI EFS",
+        "efs_v1" => "SGI EFS v1",
         "qdos" => "QDOS",
         "affs" => "AFFS",
         "prodos" => "ProDOS",
@@ -432,6 +434,13 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
                 return "efs";
             }
         }
+    }
+
+    // Same sector, different filesystem: the original SGI EFS (IRIS 2000 /
+    // 3000) puts `fs_magic` 0x041755 at offset 0x26 instead, and the image
+    // may be byte-swapped, so the probe tries both orders.
+    if efs_v1::detect(reader, partition_offset).is_some() {
+        return "efs_v1";
     }
 
     // Sector 0 again: AmigaDOS "DOS\x" boot block (variants 0..7).
@@ -1243,6 +1252,7 @@ pub fn fs_name_for(partition_type: u8, partition_type_string: Option<&str>) -> &
         // SGI synthetic type bytes (PartitionTable::Sgi).
         0xA0 => "XFS",
         0xA1 => "SGI EFS",
+        0xA2 => "SGI EFS v1",
         // Minix (0x81) and old Minix (0x80).
         0x80 | 0x81 => "Minix",
         _ => "unknown",
@@ -1357,8 +1367,9 @@ pub fn is_expensive_minimum(partition_type: u8, partition_type_string: Option<&s
         }
         return matches!(s, "Apple_HFS" | "Apple_HFSX" | "Apple_UNIX_SVR2" | "Linux");
     }
-    // 0xA1 (SGI EFS): conservative floor requires an inode-table walk.
-    matches!(partition_type, 0xAF | 0x83 | 0xA8 | 0xA1)
+    // 0xA1 (SGI EFS) and 0xA2 (SGI EFS v1): the conservative floor requires
+    // an inode-table walk.
+    matches!(partition_type, 0xAF | 0x83 | 0xA8 | 0xA1 | 0xA2)
 }
 
 /// Compute the minimum size for a partition, optionally gated behind an
@@ -1717,6 +1728,10 @@ pub fn open_filesystem_full<R: Read + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "efs_v1" => Ok(Box::new(efs_v1::EfsV1Filesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 "minix" => Ok(Box::new(minix::MinixFilesystem::open(
                     reader,
                     partition_offset,
@@ -1855,6 +1870,11 @@ pub fn open_filesystem_full<R: Read + Seek + Send + 'static>(
         )?)),
         // SGI EFS — synthetic type byte emitted by PartitionTable::Sgi.
         0xA1 => Ok(Box::new(efs::EfsFilesystem::open(
+            reader,
+            partition_offset,
+        )?)),
+        // SGI EFS v1 — synthetic byte from PartitionTable::SgiDkLabel.
+        0xA2 => Ok(Box::new(efs_v1::EfsV1Filesystem::open(
             reader,
             partition_offset,
         )?)),
@@ -2755,6 +2775,7 @@ pub fn is_browsable_type(ptype: u8) -> bool {
             | 0x83
             | 0xA0
             | 0xA1
+            | 0xA2
             | 0xA8
             | 0xAF
     )

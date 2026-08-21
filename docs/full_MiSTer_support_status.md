@@ -28,7 +28,10 @@ support the disk types (floppy / hard disk / CD-ROM) of the outstanding cores.
   Amiga OFS/FFS (AFFS) / PFS3 / SFS (all three creatable: `new volume affs` /
   `pfs3` / `sfs`; AFFS output mounts Read/Write under a real Kickstart 3.1,
   R-020), IRIX EFS (validated by IRIX 6.5's own fsck, which also mounts and
-  writes to volumes we format, R-039), CP/M (read + edit + create +
+  writes to volumes we format, R-039), SGI EFS v1 (read-only — the original
+  1986 Extent File System from the IRIS 2000 / 3000 series, System V
+  directories and all; auto-detects the byte-swapped images period SGI disk
+  controllers produce), CP/M (read + edit + create +
   fsck; multi-DPB: amstrad_data / amstrad_sys / amstrad_pcw / einstein /
   svi328_cpm / altair_8in / altair_cf / multicomp / zxplus3), Human68k,
   ADFS (read + edit [new-map + old-map D] + E-format create + new-map fsck),
@@ -78,7 +81,8 @@ support the disk types (floppy / hard disk / CD-ROM) of the outstanding cores.
   below).
 - **Partition tables:** MBR, GPT, APM, Amiga RDB, Atari AHDI, Sun SMI VTOC,
   SGI volume header, Sharp X68000 — every one of them can now be **written**
-  from scratch as well as parsed (`rb-cli new hd <table>`).
+  from scratch as well as parsed (`rb-cli new hd <table>`). The pre-IRIX SGI
+  disk label (IRIS 2000 / 3000) is parsed read-only.
 - **Containers:** CHD, VHD (fixed + dynamic), QCOW2, VMDK, 2MG, WOZ,
   DC42, HFV, IMZ (encrypted ZIP), `.zip` (a RAW disk image inside a plain
   ZIP, inflated sparsely; `--inside` picks among multiple), GHO/GHS (Ghost
