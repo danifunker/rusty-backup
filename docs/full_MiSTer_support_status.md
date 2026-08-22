@@ -25,7 +25,14 @@ support the disk types (floppy / hard disk / CD-ROM) of the outstanding cores.
   Apple DOS 3.3 (read + edit + create + fsck),
   UCSD p-System (read + edit + create + fsck),
   MacPlus MFS (read + edit + create + fsck),
-  Amiga OFS/FFS (AFFS) / PFS3 / SFS, IRIX EFS, CP/M (read + edit + create +
+  Amiga OFS/FFS (AFFS) / PFS3 / SFS (all three creatable: `new volume affs` /
+  `pfs3` / `sfs`; AFFS output mounts Read/Write under a real Kickstart 3.1,
+  R-020), IRIX EFS (validated by IRIX 6.5's own fsck, which also mounts and
+  writes to volumes we format, R-039), SGI EFS v1 (read + edit + create +
+  resize + fsck, `new volume efs-v1` — the original 1986 Extent File System from the IRIS
+  2000 / 3000 series, System V directories and all; auto-detects the
+  byte-swapped images period SGI disk controllers produce, and writes back in
+  whichever orientation the image is already in), CP/M (read + edit + create +
   fsck; multi-DPB: amstrad_data / amstrad_sys / amstrad_pcw / einstein /
   svi328_cpm / altair_8in / altair_cf / multicomp / zxplus3), Human68k,
   ADFS (read + edit [new-map + old-map D] + E-format create + new-map fsck),
@@ -75,7 +82,8 @@ support the disk types (floppy / hard disk / CD-ROM) of the outstanding cores.
   below).
 - **Partition tables:** MBR, GPT, APM, Amiga RDB, Atari AHDI, Sun SMI VTOC,
   SGI volume header, Sharp X68000 — every one of them can now be **written**
-  from scratch as well as parsed (`rb-cli new hd <table>`).
+  from scratch as well as parsed (`rb-cli new hd <table>`). The pre-IRIX SGI
+  disk label (IRIS 2000 / 3000) is parsed read-only.
 - **Containers:** CHD, VHD (fixed + dynamic), QCOW2, VMDK, 2MG, WOZ,
   DC42, HFV, IMZ (encrypted ZIP), `.zip` (a RAW disk image inside a plain
   ZIP, inflated sparsely; `--inside` picks among multiple), GHO/GHS (Ghost
@@ -120,7 +128,7 @@ Legend for the **Support** column:
 | MSX1 | Microsoft MSX1 | Floppy, HDD | FAT12 / FAT12-16 | **Yes** |
 | ZXNext | ZX Spectrum Next | SD/HDD (VHD) | FAT32/16/12 | **Yes** |
 | TSConf | ZX-Evolution | SD/HDD (VHD) | FAT32 (non-MBR) | **Yes** |
-| Minimig-AGA | Commodore Amiga | Floppy, HDD, CD | OFS/FFS, PFS3, SFS (RDB) / ISO9660 | **Yes** |
+| Minimig-AGA | Commodore Amiga | Floppy, HDD, CD | OFS/FFS, PFS3, SFS (RDB) / ISO9660 | **Yes** — AFFS read + edit + `new volume affs`, and volumes we write mount Read/Write under a real Kickstart 3.1 in FS-UAE (R-020, `oracles/fsuae/affs_mount.py`); PFS3 and SFS read + edit + create (`new volume pfs3` / `sfs`, F-003), with a bare RDB-less PFS3 image now detected by superfloppy probe; RDB written by `new hd rdb` and read back clean by amitools `rdbtool` |
 | MacPlus | Macintosh Plus | Floppy, HDD | HFS / MFS (400K floppy) | **Yes** — HFS + MFS both read/edit/create/fsck (400K / 800K MFS floppy) |
 | AtariST | Atari ST/STe | Floppy, HDD | GEMDOS = FAT12 / FAT16 | **Yes** — floppy (`.st` / `.msa` FAT12) and HDD. The AHDI partition table reads and writes: the four primary entries plus XGM extended chains are parsed, and `rb-cli new hd atari` lays down a fresh root sector with the tags you name (GEM / BGM / RAW; a GEM partition over 16 MiB is promoted to BGM as TOS requires). Partitions route to the existing FAT12/16 driver, so browse / extract / edit / fsck / backup / restore all work. Creating an XGM chain and writing a bootable bootstrap into the root sector are the remaining gaps. |
 | Apple-II | Apple IIe | Floppy, HDD | DOS 3.3 / ProDOS | **Yes** — ProDOS (read + edit + create + fsck; `rb-cli new volume prodos`) + Apple DOS 3.3 (read + edit + create + fsck; `rb-cli new floppy apple-dos`, 140 KB `.dsk`/`.do`/`.po`). Sector-order auto-detect via `containers::sector_order`. |
@@ -180,7 +188,7 @@ Legend for the **Support** column:
 | TomyTutor | Tomy Tutor | Cart, Tape | — | **N/A** |
 | UK101 | Compukit UK101 | Tape/program | — | **N/A** |
 
-**Tally:** 7 fully supported, 4 partial, 30 outstanding (No), 23 N/A (tape/cart/ROM-only).
+**Tally (recounted 2026-08-17):** 29 fully supported, 5 partial, 8 outstanding (No), 23 N/A (tape/cart/ROM-only).
 
 ---
 
@@ -196,6 +204,16 @@ only matter for **hard-disk-capable** cores. Most outstanding cores are
 floppy-only with tiny fixed-geometry disks (140 KB-800 KB) where there is
 nothing to resize or compact — the work there is browse / inspect / verify /
 convert only.
+
+> **All of the work planned in the two tables below has shipped.** CP/M
+> (multi-DPB), Human68k, ADFS/FileCore, QDOS, CBM DOS, Acorn DFS, RS-DOS,
+> DragonDOS, OS-9 RBF, Atari DOS and TI-99 are all graded **Yes** in the matrix
+> above and documented in README § Filesystems. The container-format sub-task
+> below ( `.d88` / EDSK / `.g64` / `.msa` / `.dim` / `.vdk` ) has shipped too.
+>
+> The tables are kept as the planning record — they show what was scoped and
+> what it was estimated at — and are **not** a to-do list. Re-read the matrix
+> above for current status.
 
 ### Highest value — hard-disk-capable (resize/compaction pays off)
 

@@ -60,6 +60,7 @@ pub mod setvolname;
 pub mod show;
 pub mod shrink;
 pub mod squashfs;
+pub mod swab16;
 pub mod tar;
 pub mod terminal;
 #[cfg(feature = "tui")]

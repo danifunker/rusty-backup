@@ -228,7 +228,10 @@ fn emit_text(
     chd_report: Option<&str>,
 ) -> Result<()> {
     out_stdout(format!("Image:           {}", image.display()));
-    out_stdout(format!("Partition table: {}", pt.type_name()));
+    match pt.byte_order_name() {
+        Some(order) => out_stdout(format!("Partition table: {} ({order})", pt.type_name())),
+        None => out_stdout(format!("Partition table: {}", pt.type_name())),
+    }
     if let PartitionTable::Apm(apm) = pt {
         if !apm.ddr_present {
             out_stdout(
@@ -246,9 +249,9 @@ fn emit_text(
         out_stdout("\nNo partitions detected.");
         return Ok(());
     }
-    // Two selectors, both typeable: `idx` is `IMG@N`, the 1-based position in
-    // this list; `slot` is `IMG@sN`, the table's own numbering (blank for GPT
-    // and friends, which have none). They differ whenever a table hides rows.
+    // Two selectors, both typeable: `idx` is `IMG@N` and `partmap`'s index, the
+    // 1-based position here; `slot` is `IMG@sN`, the table's own numbering.
+    // They differ whenever a table hides rows.
     let has_slots = pt.has_native_slots();
     out_stdout("");
     if has_slots {
@@ -359,6 +362,7 @@ fn emit_structured(
     let payload = InspectPayload {
         image: image.display().to_string(),
         partition_table: pt.type_name().to_string(),
+        byte_order: pt.byte_order_name().map(|s| s.to_string()),
         ddr_present,
         chd_info: chd_report.map(|s| s.to_string()),
         partitions: partitions
@@ -390,6 +394,10 @@ struct InspectPayload {
     /// non-APM tables.
     #[serde(skip_serializing_if = "Option::is_none")]
     ddr_present: Option<bool>,
+    /// How the medium's 16-bit words are ordered, for tables that carry the
+    /// distinction (the SGI disk label). Absent everywhere else.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    byte_order: Option<String>,
     /// CHD `chdman info`-style report, when the image is a `.chd`.
     /// Structured per-field accessors are planned for a later phase.
     #[serde(skip_serializing_if = "Option::is_none")]

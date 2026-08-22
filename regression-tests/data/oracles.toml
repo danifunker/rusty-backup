@@ -319,11 +319,48 @@ verifies = [
 ]
 
 [[oracle]]
+id = "copperline"
+tool = "Copperline"
+kind = "emulator"
+program = "python3"
+path_hint = []
+notes = """A headless, CLI-driven Amiga emulator in Rust, and the first
+emulator oracle `verify` can actually run. FS-UAE and WinUAE are the same
+emulator family and both need a hand-configured guest, so their pairs resolve
+to skip-manual; Copperline runs unthrottled with no window, exits on its own
+via `--screenshot-after`, and takes its whole machine from a config file.
+
+The AFFS check is a real mount verdict: a Kickstart 3.1 guest mounts the
+artifact as DH1: beside a bootable Workbench on DH0 and reports `Info` over
+the serial line, which Copperline bridges to its own stdout — no results
+volume, no sentinel poll. `attach_check.py` remains for formats with no
+guest-side probe yet; it covers the container and the boot block, not the
+attach path classifies an image and reads its dostype before any ROM runs, so
+a second implementation confirms the bytes we wrote there. Mounting the volume
+would need a guest OS, which means a licensed Kickstart plus a Workbench; the
+oracle's README has the shape that takes. Scored `smoke` accordingly — it is
+not evidence the filesystem is correct.
+
+It boots Copperline's own AROS ROM rather than a Kickstart, so no host needs a
+licensed ROM to run it. `program` is python3 on the amitools pattern: the
+interpreter is what must exist, and the script finds the emulator (sibling
+checkout, or $COPPERLINE)."""
+verifies = [
+  { format = "fs.affs", direction = "write", strength = "authoritative", status = "proven", evidence = "2026-08-18: Kickstart 3.1 on an A1200 profile mounts our volume Read/Write under its own name as DH1:, reported over Paula serial to Copperline stdout. Controlled against 2 MB of urandom, which the same guest reports as 'Not a DOS disk' (exit 1).", check = ["{oracles}/copperline/affs_mount.py", "{artifact}"] },
+]
+
+[[oracle]]
 id = "fs-uae"
 tool = "FS-UAE"
 kind = "emulator"
-program = "fs-uae"
-notes = """Portable Amiga emulator; the cross-platform half of the WinUAE pair.
+program = "python3"
+notes = """`program` is python3, not fs-uae: the check is a wrapper script, so
+the interpreter is what must be executable. The script finds the emulator
+itself and exits 77 (skip-unavailable) when it or a Kickstart is missing,
+which is the only way a script-based check can say "not installed here"
+rather than reporting a FAIL against our bytes.
+
+Portable Amiga emulator; the cross-platform half of the WinUAE pair.
 
 Assets located 2026-08-07, all already owned — nothing needs downloading:
 

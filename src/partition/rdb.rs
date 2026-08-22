@@ -461,9 +461,20 @@ pub fn set_partition_bootable<W: Read + std::io::Write + Seek>(
 /// every long as i32, and store the two's-complement negation so the whole
 /// block sums to zero. RDSK and PART both keep it at long 2.
 pub fn stamp_checksum(buf: &mut [u8; 512]) {
+    stamp_checksum_longs(buf, 128);
+}
+
+/// Stamp the checksum over the first `longs` longs only.
+///
+/// RDSK and PART sum the whole 512-byte block, but `FSHD` declares 64 and
+/// `LSEG` declares however many its payload fills — a partly filled final
+/// LSEG sums only as far as its `SummedLongs` says, leaving the tail outside
+/// the sum. Writing 128 there produces a block real Amiga tools reject.
+pub fn stamp_checksum_longs(buf: &mut [u8; 512], longs: usize) {
+    let longs = longs.min(128);
     BigEndian::write_u32(&mut buf[2 * 4..2 * 4 + 4], 0);
     let mut sum: i32 = 0;
-    for i in 0..128 {
+    for i in 0..longs {
         sum = sum.wrapping_add(BigEndian::read_i32(&buf[i * 4..i * 4 + 4]));
     }
     BigEndian::write_i32(&mut buf[2 * 4..2 * 4 + 4], sum.wrapping_neg());

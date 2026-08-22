@@ -1,4 +1,4 @@
-use egui::{Color32, RichText};
+use egui::RichText;
 
 // The rate/ETA estimator lives in the (non-GUI) model layer so the CLI shares
 // it; re-exported here for the tabs that refer to `progress::RateTracker`.
@@ -97,9 +97,9 @@ impl LogPanel {
                 ui.set_width(ui.available_width());
                 for entry in &self.entries {
                     let color = match entry.level {
-                        LogLevel::Info => Color32::GRAY,
-                        LogLevel::Warning => Color32::YELLOW,
-                        LogLevel::Error => Color32::from_rgb(255, 100, 100),
+                        LogLevel::Info => super::theme::muted(ui.visuals()),
+                        LogLevel::Warning => super::theme::warning(ui.visuals()),
+                        LogLevel::Error => super::theme::danger(ui.visuals()),
                     };
                     let prefix = match entry.level {
                         LogLevel::Info => "INFO",

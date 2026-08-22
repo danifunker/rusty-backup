@@ -431,17 +431,27 @@ fn stage_copy_into(
                     .with_context(|| format!("extracting '{}'", entry.name))?;
                 drop(blob);
 
-                let mut rsrc = Vec::new();
-                let _ = src_fs.write_resource_fork_to(entry, &mut rsrc);
-                let resource_fork = if rsrc.is_empty() {
-                    None
+                // Only ask when the entry claims a fork: the trait default is
+                // `Ok(0)`, so an error here is a real decode / read failure and
+                // must not be swallowed into a silently fork-less copy (R-041).
+                let resource_fork = if entry.resource_fork_size.unwrap_or(0) > 0 {
+                    let mut rsrc = Vec::new();
+                    src_fs
+                        .write_resource_fork_to(entry, &mut rsrc)
+                        .with_context(|| format!("reading resource fork of '{}'", entry.name))?;
+                    if rsrc.is_empty() {
+                        None
+                    } else {
+                        Some(ImportedResourceFork {
+                            data: rsrc,
+                            data_fork: None,
+                            type_code: None,
+                            creator_code: None,
+                            name: None,
+                        })
+                    }
                 } else {
-                    Some(ImportedResourceFork {
-                        data: rsrc,
-                        data_fork: None,
-                        type_code: None,
-                        creator_code: None,
-                    })
+                    None
                 };
 
                 edits.push(StagedEdit::AddFile {
@@ -511,14 +521,36 @@ fn stage_host_into(entries: &[FileEntry], dest_parent: &FileEntry, edits: &mut V
             let children = host_children(&entry.path);
             stage_host_into(&children, &child_parent, edits);
         } else if entry.is_file() {
+            let host_path = PathBuf::from(&entry.path);
+            // A sidecar is consumed as part of its primary file below; staging
+            // it as well would land resource-fork bytes as their own file.
+            if crate::fs::resource_fork::is_resource_fork_sidecar(&host_path) {
+                continue;
+            }
+            // Mac files reach a host folder in one of four containers (native
+            // fork, `._name`, `.bin`, `.hqx`). Reading them here is what makes
+            // a Commander drag from the host pane preserve forks the way the
+            // Inspect tab's import already did (R-041).
+            let resource_fork = crate::fs::resource_fork::detect_resource_fork(&host_path);
+            // A whole-file container carries the real Mac name and the data
+            // fork; `apply_edit` writes those bytes instead of the wrapper.
+            let name = resource_fork
+                .as_ref()
+                .and_then(|i| i.name.clone())
+                .unwrap_or_else(|| entry.name.clone());
+            let size = resource_fork
+                .as_ref()
+                .and_then(|i| i.data_fork.as_ref())
+                .map(|d| d.len() as u64)
+                .unwrap_or(entry.size);
             edits.push(StagedEdit::AddFile {
                 parent: dest_parent.clone(),
-                name: entry.name.clone(),
-                host_path: PathBuf::from(&entry.path),
-                size: entry.size,
+                name,
+                host_path,
+                size,
                 prodos_type: None,
                 prodos_aux: None,
-                resource_fork: None,
+                resource_fork,
                 hfs_type_override: None,
                 hfs_creator_override: None,
                 // Host files carry no Amiga/HFS raw dates to preserve.
@@ -758,6 +790,23 @@ fn run_export(job: ExportJob, status: &Arc<Mutex<HostCopyStatus>>) -> Result<usi
         )?
     };
     Ok(summary.files)
+}
+
+/// Extract image `entries` into the host folder `dest_dir` synchronously,
+/// recursing directories and preserving forks per `fork_mode`.
+///
+/// The blocking form of [`HostCopyJob::ImageToHost`], for callers with no
+/// reopenable source: the TUI's Commander and the GUI's `+`-expanded wrapper
+/// mounts. It exists so those two cannot drift from the threaded path — the TUI
+/// had its own flat loop that wrote a folder as a zero-byte file (R-041).
+pub fn export_fs_entries_to_host(
+    fs: &mut dyn Filesystem,
+    entries: &[FileEntry],
+    dest_dir: &Path,
+    fork_mode: ResourceForkMode,
+) -> Result<usize> {
+    let status = Arc::new(Mutex::new(HostCopyStatus::default()));
+    copy_image_entries_to_host(fs, entries, dest_dir, fork_mode, &status)
 }
 
 /// Export `entries` from an already-open (non-reopenable, e.g. wrapper-mount)
@@ -1266,8 +1315,13 @@ fn remote_apply(
                         .as_ref()
                         .or_else(|| resource_fork.as_ref().and_then(|r| r.creator_code.as_ref()))
                         .map(os4_to_string);
+                    // The fork bytes, not just the codes lifted off them: a
+                    // classic Mac file with only its data fork is inert, so a
+                    // copy that drops the fork is not a copy. This used to read
+                    // `resource_fork` for type/creator and discard the rest.
+                    let fork_bytes = resource_fork.as_ref().map(|r| r.data.as_slice());
                     session
-                        .stage_upload(
+                        .stage_upload_with_fork(
                             sid,
                             &parent.path,
                             name,
@@ -1275,6 +1329,7 @@ fn remote_apply(
                             false,
                             type_code,
                             creator_code,
+                            fork_bytes,
                         )
                         .with_context(|| format!("uploading {name}"))?;
                 }

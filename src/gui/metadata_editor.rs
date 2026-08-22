@@ -61,7 +61,7 @@ pub fn render_hfs_type_row(
                 ui.label(label);
             } else {
                 ui.colored_label(
-                    egui::Color32::from_rgb(120, 160, 220),
+                    super::theme::info(ui.visuals()),
                     "Type: (none)  Creator: (none)",
                 );
             }
@@ -258,7 +258,7 @@ pub fn render_prodos_type_row(
             if cur_known {
                 ui.label(label);
             } else {
-                ui.colored_label(egui::Color32::from_rgb(120, 160, 220), label);
+                ui.colored_label(super::theme::info(ui.visuals()), label);
             }
         });
         return;
@@ -343,7 +343,7 @@ pub fn render_prodos_type_row(
             }
             if !valid {
                 ui.colored_label(
-                    egui::Color32::from_rgb(255, 120, 120),
+                    super::theme::danger(ui.visuals()),
                     "Type must be 2 hex digits, Aux must be 4",
                 );
             }
@@ -478,7 +478,7 @@ pub fn render_hfs_dates_row(
             }
         });
         if let Some(msg) = &field_err {
-            ui.colored_label(egui::Color32::from_rgb(255, 120, 120), msg);
+            ui.colored_label(super::theme::danger(ui.visuals()), msg);
         }
     }
 
@@ -569,7 +569,7 @@ pub fn render_ext_permissions_row(
                 reset_action = true;
             }
             if !valid {
-                ui.colored_label(egui::Color32::from_rgb(255, 120, 120), "1-4 octal digits");
+                ui.colored_label(super::theme::danger(ui.visuals()), "1-4 octal digits");
             }
         });
     }
@@ -666,7 +666,7 @@ pub fn render_owner_row(
                 reset = true;
             }
             if parsed.is_none() {
-                ui.colored_label(egui::Color32::from_rgb(255, 120, 120), "numbers");
+                ui.colored_label(super::theme::danger(ui.visuals()), "numbers");
             }
         });
     }
@@ -812,7 +812,7 @@ pub fn render_xattr_section(
             }
         });
         if let Some(e) = &err {
-            ui.colored_label(egui::Color32::from_rgb(255, 120, 120), e);
+            ui.colored_label(super::theme::danger(ui.visuals()), e);
         }
     }
 

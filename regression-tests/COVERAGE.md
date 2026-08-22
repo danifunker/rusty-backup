@@ -1,7 +1,7 @@
 # Coverage Matrix
 
 The enumerated test surface, derived from the code and the maintained README
-tables on 2026-08-01 — not from memory. Re-derive this whenever a phase in
+tables on 2026-08-01, counts re-derived 2026-08-17 — not from memory. Re-derive this whenever a phase in
 `PLAN.md` closes; drift here is itself a bug.
 
 Sources of truth:
@@ -21,7 +21,7 @@ Sources of truth:
 | Container / image formats|    47 | README § Image / backup formats |
 | Optical filesystems      |    10 | README § Optical disc filesystems |
 | Partition schemes        |     9 | `PartitionTable` enum |
-| CLI verb / subverb entries |  119 | `docs/cli-reference.md` |
+| CLI verb / subverb entries |  131 | `docs/cli-reference.md` (re-derived 2026-08-17; was 119 on 2026-08-01) |
 | Picker extensions        |    69 | `DISK_IMAGE_EXTS` (65 unique, case-folded) |
 
 A naive cross-product is meaningless (nobody converts a Xerox Alto pack to a
@@ -33,6 +33,13 @@ intersections**, described below.
 ## Findings already surfaced
 
 Recorded here as they are found, before the harness even runs.
+
+> **Status, 2026-08-17 — every finding below is closed.** These entries are the
+> *discovery* record and are deliberately left as written; what became of each
+> one lives in [`../docs/Regression_Bugs.md`](../docs/Regression_Bugs.md), which
+> is the live table. As of today no regression defect is open: R-019 is an
+> accepted won't-fix and R-011 waits on two fixture files. Do not read the
+> presence of an entry here as an open bug.
 
 ### R-001 — README partition-table list is missing two schemes
 

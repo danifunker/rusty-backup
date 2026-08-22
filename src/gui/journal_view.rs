@@ -64,7 +64,7 @@ impl JournalView {
         let dirty = h.start != h.end;
         if dirty {
             ui.colored_label(
-                egui::Color32::from_rgb(255, 200, 100),
+                super::theme::warning(ui.visuals()),
                 format!(
                     "Warning: journal is dirty - {} pending transaction(s) not yet \
                      applied to the volume. macOS would replay these on mount.",
@@ -73,7 +73,7 @@ impl JournalView {
             );
         } else {
             ui.colored_label(
-                egui::Color32::from_rgb(100, 200, 100),
+                super::theme::success(ui.visuals()),
                 "Journal is clean (empty) - nothing pending.",
             );
         }
@@ -81,7 +81,7 @@ impl JournalView {
         // ---- Pre-flight findings ------------------------------------------
         if let Some(seq) = self.detail.checksum_mismatch {
             ui.colored_label(
-                egui::Color32::from_rgb(255, 100, 100),
+                super::theme::danger(ui.visuals()),
                 format!(
                     "Warning: transaction sequence {seq} has a bad checksum - \
                      macOS will stop replay here."
@@ -90,7 +90,7 @@ impl JournalView {
         }
         for (from, to) in &self.detail.sequence_jumps {
             ui.colored_label(
-                egui::Color32::from_rgb(255, 100, 100),
+                super::theme::danger(ui.visuals()),
                 format!(
                     "Warning: sequence jumped {from} -> {to} (expected {}).",
                     from.wrapping_add(1)

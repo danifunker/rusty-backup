@@ -19,6 +19,30 @@ in the loop. Each entry lists its confidence: **proven** means we have done
 it, **plausible** means the mechanism exists and needs a feasibility spike
 before we depend on it.
 
+### FS-UAE + Kickstart 3.1 — *proven*
+
+Closed R-020 on 2026-08-14. `oracles/fsuae/affs_mount.py` boots a real
+Kickstart 3.1, mounts the artifact as DH1:, and gets the verdict out through a
+**host directory mounted as an Amiga volume** — the guest writes
+`RESULTS:info.txt` and a `done.txt` sentinel, the host polls for it. No screen
+scraping. Controlled against 2 MB of noise, which yields no DH1: unit at all,
+so the harness demonstrably discriminates.
+
+Covers AFFS today. PFS3 and SFS need their handlers staged into the guest's
+`L:` (Kickstart has neither in ROM); the volumes themselves now come from
+`rb-cli new volume pfs3` / `sfs`.
+
+### Iris / IRIX 6.5 — *proven*
+
+Found R-039 on 2026-08-13 and confirmed the fix on 08-15; also validated our
+SGI volume header against IRIX's own `fx` and `prtvtoc` (F-006 step 1).
+`iris-ci` drives it headlessly — `put` / `run` / `scratch write` / `scratch
+read` / snapshot rollback, with `run` returning guest stdout. Same
+guest-writes-a-result pattern as above. See `oracles/iris/README.md` for the
+recipe and the five traps that cost time.
+
+IRIX 5.3 hangs on boot (`Find Error: 10`), so 6.5 is the authority.
+
 ### QEMU, headless — *plausible, spike first*
 
 The strongest automation target for the mainstream filesystems. Boot the
@@ -87,14 +111,20 @@ emulator is ever launched. These are tier 6; see `PLAN.md` phase 7.
 
 ## Tier 7B — Manual, checklist-driven
 
-Targets where no scriptable assertion exists today. The runner generates a
-per-run checklist into `checklists/`, pre-filled with exactly which artifact
-to load, what to do, and what a pass looks like. A human works through it and
-the results are ingested back into `results.jsonl` with `"source": "manual"`.
+Targets where no scriptable assertion exists **yet**. Two former residents of
+this section have been promoted to 7A — FS-UAE (2026-08-14) and Iris/IRIX
+(2026-08-13) — so the list below is shorter than it was, and the pattern that
+promoted them (a host directory the guest writes its verdict into) is the one
+to try on the rest.
+
+The runner generates a per-run checklist into `checklists/`, pre-filled with
+exactly which artifact to load, what to do, and what a pass looks like. A human
+works through it and the results are ingested back into `results.jsonl` with
+`"source": "manual"`.
 
 | Emulator | Covers |
 |----------|--------|
-| WinUAE / FS-UAE | AFFS (OFS/FFS), PFS3, SFS, RDB, ADF/HDF/ADZ/HDZ |
+| WinUAE (FS-UAE promoted to 7A) | PFS3, SFS and RDB *boot* checks; AFFS is automated in 7A |
 | Basilisk II / SheepShaver | HFV, HFS, HFS+, APM, DC42, DART, resource forks |
 | Mini vMac | MFS, early HFS, 400K/800K floppies |
 | 86Box / PCem | FAT, NTFS, HPFS, real DOS/OS-2/Windows boots |
@@ -135,7 +165,17 @@ completed checklists back into the run bundle.
 ## Promotion path
 
 A 7B target promotes to 7A when someone finds a scriptable assertion for it.
-The order worth attacking, by coverage gained per unit of effort:
+
+**Two have promoted**, and both used the same trick — mount a host directory as
+a guest volume and have the guest write its verdict into it, so nothing is
+screen-scraped:
+
+- **FS-UAE** (2026-08-14) — closed R-020. `oracles/fsuae/affs_mount.py`.
+- **Iris / IRIX** (2026-08-13) — found R-039 and validated the SGI volume
+  header. `oracles/iris/README.md`.
+
+Try that pattern first on anything below. The remaining order worth attacking,
+by coverage gained per unit of effort:
 
 1. QEMU — unlocks the whole mainstream-filesystem axis at once.
 2. VICE — unlocks the entire CBM sub-axis, which is otherwise five drive

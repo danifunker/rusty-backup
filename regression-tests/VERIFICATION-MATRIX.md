@@ -13,7 +13,8 @@ Two rules govern every row:
    volume and the files read back byte-correct, that is about as
    independent as verification gets. Everything else is a fallback.
 
-Verified on this hardware 2026-08-02 unless marked *expected*.
+Verified on this hardware 2026-08-02 unless a row says otherwise (the AFFS and
+SGI EFS rows were re-verified 2026-08-13/15).
 
 ---
 
@@ -116,12 +117,12 @@ either correct or a defect; do not assume either way.
 | Minix V1/2/3 | `fsck.minix` | WSL, Linux | |
 | SquashFS | `unsquashfs -s` + mount | WSL, Linux | |
 | HPFS | mount `hpfs` (ro) | full Linux only | not in WSL; **thin** |
-| AFFS | mount `affs` | **MiSTer**, full Linux | plus WinUAE at tier 7 |
-| PFS3 | **booted Workbench 1.3 / 2.1** (`emu.amigaos.13/21.m68k`, 960 MB on the MiSTer) | MiSTer Minimig, FS-UAE | RDB + PFS, bootable |
-| SFS | none anywhere | — | **still a gap** — no SFS volume found on any source |
+| AFFS | **Kickstart 3.1 under FS-UAE** (`oracles/fsuae/affs_mount.py`) — mounts our volume Read/Write and lists it; plus `mount affs`, plus amitools `xdftool` (structural) | Windows (FS-UAE); **MiSTer**, full Linux | **DONE 2026-08-14** — closed R-020. Scripted, not manual: host directory as the verdict channel, no screen scraping |
+| PFS3 | **booted Workbench 1.3 / 2.1** (`emu.amigaos.13/21.m68k`, 960 MB on the MiSTer); or the scripted FS-UAE harness | MiSTer Minimig, FS-UAE | RDB + PFS, bootable. `rb-cli new volume pfs3` now makes a bare volume to point it at (F-003); like SFS it needs the PFS3 handler staged into the guest's `L:` |
+| SFS | none yet **wired**, but no longer blocked | FS-UAE (needs the SFS handler in the guest's `L:`) | The old blocker ("no SFS volume found on any source") is gone: `rb-cli new volume sfs` makes one (F-003), and the FS-UAE harness exists. Kickstart carries no SFS handler in ROM, so the guest needs the one staged at `rb-fixtures/oracle-assets/amiga` |
 | ProDOS / Apple DOS 3.3 | AppleCommander (Java) | any | candidate, not yet wired |
 | CP/M (9 DPBs) | `cpmtools` (`cpmls`) | install anywhere | largest sub-axis; oracle exists, just install it |
-| SGI EFS | **IRIX 5.3/6.5 native `fsck`** (emulator image); mount `efs` (ro) as fallback | Iris (SGI emulator); full Linux | image reads OK, boot not yet wired |
+| SGI EFS | **IRIX 6.5 native `fsck`** under Iris, scripted via `iris-ci`; mount `efs` (ro) as fallback | Iris (SGI emulator); full Linux | **DONE 2026-08-13/15** — boot wired, and it found R-039 (bitmap bit order). IRIX also mounts our volume and writes to it. 5.3 hangs on boot (`Find Error: 10`), so 6.5 is the authority |
 | CBM DOS | VICE, `cc1541`, DirMaster | any | tier 7 mostly |
 | UFS | mount `ufs` (ro) | full Linux | R-013 lives here |
 | Acorn DFS / ADFS | BeebEm / Arculator | tier 7 | **no structural oracle** |
@@ -141,7 +142,7 @@ either correct or a defect; do not assume either way.
 | APM | `diskutil list`, `gpt` | macOS |
 | Sun disk label | `sfdisk -l` reads SunOS labels | Linux |
 | SGI volume header | `sfdisk`/`parted` partial | Linux |
-| RDB | WinUAE / MiSTer Minimig | tier 7 |
+| RDB | amitools `rdbtool` (structural); WinUAE / MiSTer Minimig / FS-UAE (boot) | rdbtool reads our output clean; the FS-UAE harness exercises the same disks |
 | AHDI / X68000 | Hatari / MiSTer core | tier 7 |
 
 ---
@@ -150,10 +151,13 @@ either correct or a defect; do not assume either way.
 
 Ranked by how much of the matrix they leave unverified.
 
-1. **SFS** — no host tool mounts it and no SFS volume exists in any source
-   we have; every Amiga disk on the MiSTer is PFS or AFFS. The one Amiga
-   filesystem still without an oracle. **PFS3 is now covered** by the
-   bootable Workbench 1.3 / 2.1 disks on the board (960 MB each).
+1. **SFS** — the old blocker is gone. "No SFS volume exists in any source we
+   have" was true until F-003: `rb-cli new volume sfs` now builds one, and the
+   FS-UAE harness that closed R-020 will drive it. What remains is guest-side —
+   Kickstart carries no SFS handler in ROM, so the one staged at
+   `rb-fixtures/oracle-assets/amiga` has to go into the guest's `L:`. **PFS3 is
+   covered** by the bootable Workbench 1.3 / 2.1 disks on the board (960 MB
+   each), and is likewise now creatable.
 2. **cbk (cb-dos container)** — our own format, no third-party reader
    exists. Structurally unverifiable by definition; the honest answer is a
    documented exemption plus a strong self-consistency test, and to say so
@@ -198,7 +202,7 @@ multi-machine:
 | **macOS** | HFS, HFS+, APFS, DMG, sparseimage, NDIF, APM |
 | **Windows** | GHO/GHS (`ghostexp`), NTFS via `chkdsk` |
 | **Full Linux** | hfs/hfsplus/affs/minix/jfs/ntfs3/ufs/efs mounts, xfs, squashfs |
-| **MiSTer core** | AFFS, PFS3, SFS, Human68k, D88, X68K and AHDI — judged by the real guest OS, not by Linux |
+| **MiSTer core** | PFS3, SFS, Human68k, D88, X68K and AHDI — judged by the real guest OS, not by Linux. AFFS left this list on 2026-08-14: FS-UAE now judges it by a real Kickstart on any host |
 | any | qemu-img containers, chdman, 7z, cpmtools |
 
 The runner already models this: a case declares `requires = [...]`, an

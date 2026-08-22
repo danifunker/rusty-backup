@@ -23,7 +23,8 @@ use eframe::egui;
 
 use rusty_backup::fs::entry::FileEntry;
 use rusty_backup::fs::export_selection::ExportFormat;
-use rusty_backup::fs::fork_export::{export_file_with_fork, safe_name};
+#[allow(unused_imports)] // referenced from a doc comment below
+use rusty_backup::fs::fork_export::export_file_with_fork;
 use rusty_backup::fs::resource_fork::ResourceForkMode;
 use rusty_backup::model::checksum::{self, ChecksumJob, ChecksumStatus};
 use rusty_backup::model::commander_ops::{
@@ -666,12 +667,14 @@ impl CommanderMode {
                 let Some(src_fs) = src.fs_mut() else {
                     return "Source volume is not open.".to_string();
                 };
-                match extract_entries_to_host(src_fs, &entries, &dest_dir, fork_mode) {
+                match commander_ops::export_fs_entries_to_host(
+                    src_fs, &entries, &dest_dir, fork_mode,
+                ) {
                     Ok(n) => {
                         dest.reload_listing();
                         format!("Copied {n} item(s) to the {other} folder.")
                     }
-                    Err(e) => format!("Copy failed: {e}"),
+                    Err(e) => format!("Copy failed: {e:#}"),
                 }
             }
             // host -> host: immediate filesystem copy on a worker thread.
@@ -988,7 +991,7 @@ impl CommanderMode {
                 };
                 running = !st.finished;
                 if let Some(err) = &st.error {
-                    ui.colored_label(egui::Color32::from_rgb(220, 120, 120), err);
+                    ui.colored_label(super::theme::danger_muted(ui.visuals()), err);
                     return;
                 }
                 if running {
@@ -1036,7 +1039,7 @@ impl CommanderMode {
                             ui.strong(format!("{}  ({})", fc.name, format_size(fc.size)));
                             if let Some(err) = &fc.error {
                                 ui.colored_label(
-                                    egui::Color32::from_rgb(220, 120, 120),
+                                    super::theme::danger_muted(ui.visuals()),
                                     format!("failed: {err}"),
                                 );
                                 continue;
@@ -1233,7 +1236,7 @@ impl CommanderMode {
 
                 if let Some(msg) = &win.result {
                     ui.add_space(4.0);
-                    ui.colored_label(egui::Color32::from_rgb(120, 200, 120), msg);
+                    ui.colored_label(super::theme::success(ui.visuals()), msg);
                 }
 
                 // Preview (read-only).
@@ -1327,35 +1330,6 @@ impl CommanderMode {
     }
 }
 
-/// Local-time `HH:MM:SS` stamp prefixed to each session-log entry.
-/// Recursively extract `entries` from a source filesystem to a host directory.
-/// Used for a remote image -> host copy, where there's no local `BrowseSession`
-/// for the threaded host-copy job — the remote `Filesystem` streams the bytes
-/// over the wire via `write_file_to`.
-fn extract_entries_to_host(
-    src_fs: &mut dyn rusty_backup::fs::filesystem::Filesystem,
-    entries: &[FileEntry],
-    dest_dir: &std::path::Path,
-    fork_mode: ResourceForkMode,
-) -> std::io::Result<usize> {
-    let mut count = 0;
-    for e in entries {
-        if e.is_directory() {
-            let target = dest_dir.join(&e.name);
-            std::fs::create_dir_all(&target)?;
-            let children = src_fs
-                .list_directory(e)
-                .map_err(|err| rusty_backup::compat::io_other(err.to_string()))?;
-            count += extract_entries_to_host(src_fs, &children, &target, fork_mode)?;
-        } else {
-            export_file_with_fork(src_fs, e, dest_dir, &safe_name(e), fork_mode)
-                .map_err(|err| rusty_backup::compat::io_other(format!("{err:#}")))?;
-            count += 1;
-        }
-    }
-    Ok(count)
-}
-
 fn log_timestamp() -> String {
     chrono::Local::now().format("%H:%M:%S").to_string()
 }
@@ -1439,7 +1413,7 @@ fn draw_copy_icon(p: &egui::Painter, r: egui::Rect, color: egui::Color32, rightw
     let fx = r.left() + side * 0.7;
     draw_floppy(p, egui::pos2(fx - 3.0, cy - 3.0), side, color); // back
     draw_floppy(p, egui::pos2(fx + 3.0, cy + 3.0), side, color); // front
-    let stroke = egui::Stroke::new(2.5, color);
+    let stroke = egui::Stroke::new(2.5_f32, color);
     let ax0 = r.center().x + 8.0;
     let ax1 = r.right() - 2.0;
     let (tail, head) = if rightward { (ax0, ax1) } else { (ax1, ax0) };
@@ -1459,8 +1433,11 @@ fn draw_copy_icon(p: &egui::Painter, r: egui::Rect, color: egui::Color32, rightw
 fn draw_delete_icon(p: &egui::Painter, r: egui::Rect, color: egui::Color32) {
     let side = (r.height() * 0.8).min(26.0);
     draw_floppy(p, egui::pos2(r.center().x - 5.0, r.center().y), side, color);
-    let red = egui::Color32::from_rgb(220, 70, 70);
-    let stroke = egui::Stroke::new(3.0, red);
+    // Fixed rather than themed: this is handed to `icon_button` as a function
+    // pointer, so it has no `Visuals` to consult. A mid-red clears the 3:1
+    // WCAG floor for non-text graphics against both backgrounds.
+    let red = egui::Color32::from_rgb(200, 60, 60);
+    let stroke = egui::Stroke::new(3.0_f32, red);
     let h = side * 0.55;
     let xc = egui::pos2(r.center().x + 8.0, r.center().y);
     p.line_segment([xc + egui::vec2(-h, -h), xc + egui::vec2(h, h)], stroke);

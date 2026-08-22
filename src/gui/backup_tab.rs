@@ -620,7 +620,7 @@ impl BackupTab {
             ui.add_space(4.0);
         }
         if let Some(err) = &self.partition_load_error {
-            ui.colored_label(egui::Color32::from_rgb(200, 150, 100), err);
+            ui.colored_label(super::theme::warning(ui.visuals()), err);
         }
 
         // Keep the UI ticking while background min-size workers run so the
@@ -1546,7 +1546,10 @@ impl BackupTab {
                 let table_desc = if matches!(table, PartitionTable::None { .. }) {
                     "No partition table (superfloppy)".to_string()
                 } else {
-                    table.type_name().to_string()
+                    match table.byte_order_name() {
+                        Some(order) => format!("{} ({order})", table.type_name()),
+                        None => table.type_name().to_string(),
+                    }
                 };
                 self.source_partition_table_desc = Some(table_desc.clone());
                 ctx.log.info(format!(
@@ -2187,7 +2190,7 @@ impl BackupTab {
                     }
                 });
                 if let Some(err) = &self.remote.error {
-                    ui.colored_label(egui::Color32::from_rgb(220, 90, 90), err);
+                    ui.colored_label(super::theme::danger(ui.visuals()), err);
                 }
                 if self.remote.conn.is_some() {
                     ui.separator();

@@ -22,7 +22,7 @@ left" pointer.
 > daemon installer/packaging, §5). Also fixed a CI-red FAT32 over-pad
 > regression (`993d2ac`).
 
-Everything is over the **block tier**: the daemon (`rb-cli serve`, protocol v2)
+Everything is over the **block tier**: the daemon (`rb-cli serve`, protocol v4 as of 2026-08-16)
 keeps a file/device open and serves raw byte ranges (`OpenBlock`/`OpenDevice` →
 `ReadBlock` → `CloseBlock`); the desktop does ALL parsing via `RemoteBlockReader`
 (`Read + Seek`, `src/remote/block_reader.rs`). The `remote` cargo feature is on

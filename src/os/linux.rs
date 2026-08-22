@@ -282,7 +282,7 @@ pub fn open_target_for_writing(path: &Path) -> Result<File> {
         .read(true)
         .write(true)
         .open(path)
-        .with_context(|| format!("cannot open {} for writing", path.display()))
+        .map_err(|e| crate::os::device_open_error(path, e))
 }
 
 /// Derive the parent device name from a partition name.
@@ -340,6 +340,18 @@ pub fn parent_device_name(partition_name: &str) -> String {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn elevation_target_prefers_appimage_over_fuse_mount() {
+        let fuse = PathBuf::from("/tmp/.mount_RustyAb12/usr/bin/rusty-backup");
+        let appimage = PathBuf::from("/home/user/Rusty-Backup-linux-x64.AppImage");
+        assert_eq!(
+            elevation_target_from(Some(appimage.clone()), fuse.clone()),
+            appimage,
+            "pkexec must get the .AppImage path, not the FUSE mount root cannot read"
+        );
+        assert_eq!(elevation_target_from(None, fuse.clone()), fuse);
+    }
 
     #[test]
     fn test_sd_parent_device() {
@@ -567,19 +579,25 @@ impl PrivilegedDiskAccess for LinuxDiskAccess {
     }
 }
 
+/// Pick the binary pkexec should elevate: `$APPIMAGE` when set, because inside
+/// an AppImage `current_exe()` is a /tmp FUSE mount root cannot read.
+fn elevation_target_from(appimage: Option<PathBuf>, current_exe: PathBuf) -> PathBuf {
+    appimage.unwrap_or(current_exe)
+}
+
+/// [`elevation_target_from`] wired to the real environment.
+fn elevation_target_path() -> Result<PathBuf> {
+    Ok(elevation_target_from(
+        std::env::var_os("APPIMAGE").map(PathBuf::from),
+        std::env::current_exe()?,
+    ))
+}
+
 /// Relaunch the application with pkexec for elevated privileges.
 ///
 /// This function never returns on success - the current process is replaced.
 pub fn relaunch_with_elevation() -> Result<()> {
-    // Inside an AppImage, current_exe() points at the user-private FUSE
-    // mount under /tmp/.mount_*, which root cannot read — pkexec fails with
-    // "Permission denied" before the binary loads. The AppImage runtime
-    // exports APPIMAGE with the path of the actual .AppImage file; elevating
-    // that re-bootstraps the squashfs mount as root and works normally.
-    let target = match std::env::var_os("APPIMAGE") {
-        Some(p) => PathBuf::from(p),
-        None => std::env::current_exe()?,
-    };
+    let target = elevation_target_path()?;
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     // Check if pkexec is available

@@ -8,7 +8,7 @@
 //! Physical-Disk-Export flows already use, so a Commander copy reads its
 //! progress the same way the rest of the app does.
 
-use egui::{Align2, Color32};
+use egui::Align2;
 
 use super::super::progress::RateTracker;
 
@@ -139,7 +139,10 @@ impl ProgressWindow {
                 }
 
                 if let Some(err) = &snapshot.error {
-                    ui.colored_label(Color32::from_rgb(220, 70, 70), format!("Error: {err}"));
+                    ui.colored_label(
+                        super::super::theme::danger(ui.visuals()),
+                        format!("Error: {err}"),
+                    );
                 }
 
                 if snapshot.can_cancel && !snapshot.finished {

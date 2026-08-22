@@ -1978,6 +1978,11 @@ fn build_patched_head_segments(
                 "assemble_from_staging: Sun disk-label sources are not supported (browse only)"
             );
         }
+        PartitionTable::SgiDkLabel(_) => {
+            anyhow::bail!(
+                "assemble_from_staging: SGI disk-label sources are not supported (browse only)"
+            );
+        }
         PartitionTable::Ahdi(_) => {
             anyhow::bail!(
                 "assemble_from_staging: AHDI sources are not yet supported by single-file CHD"

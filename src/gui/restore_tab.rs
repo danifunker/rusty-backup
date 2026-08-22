@@ -502,7 +502,7 @@ impl RestoreTab {
             });
         }
         if let Some(err) = &self.metadata_error {
-            ui.colored_label(egui::Color32::from_rgb(200, 150, 100), err);
+            ui.colored_label(super::theme::warning(ui.visuals()), err);
         }
 
         ui.add_space(8.0);
@@ -590,7 +590,7 @@ impl RestoreTab {
                         if let Some(device) = ctx.devices.get(idx) {
                             if device.is_system {
                                 ui.colored_label(
-                                egui::Color32::from_rgb(255, 100, 100),
+                                super::theme::danger(ui.visuals()),
                                 "WARNING: This is a system disk! Restoring will destroy your OS.",
                             );
                             }
@@ -632,9 +632,9 @@ impl RestoreTab {
                 let target_size = self.get_target_size(ctx);
                 if target_size > 0 {
                     let color = if target_size >= source_size {
-                        egui::Color32::GRAY
+                        super::theme::muted(ui.visuals())
                     } else {
-                        egui::Color32::from_rgb(255, 180, 100)
+                        super::theme::warning(ui.visuals())
                     };
                     ui.colored_label(
                         color,
@@ -853,9 +853,9 @@ impl RestoreTab {
                         })
                         .sum();
                     let color = if total <= target_size {
-                        egui::Color32::GRAY
+                        super::theme::muted(ui.visuals())
                     } else {
-                        egui::Color32::from_rgb(255, 100, 100)
+                        super::theme::danger(ui.visuals())
                     };
                     ui.colored_label(
                         color,
@@ -1059,7 +1059,7 @@ impl RestoreTab {
         }
 
         if let Some(err) = &self.metadata_error {
-            ui.colored_label(egui::Color32::from_rgb(200, 150, 100), err);
+            ui.colored_label(super::theme::warning(ui.visuals()), err);
         }
 
         ui.add_space(8.0);
@@ -1117,7 +1117,7 @@ impl RestoreTab {
                 if let Some(device) = ctx.devices.get(idx) {
                     if device.is_system {
                         ui.colored_label(
-                            egui::Color32::from_rgb(255, 100, 100),
+                            super::theme::danger(ui.visuals()),
                             "WARNING: This is a system disk!",
                         );
                     }
@@ -1159,7 +1159,7 @@ impl RestoreTab {
                             if let Some(src_sz) = source_size {
                                 if part.size_bytes < src_sz {
                                     ui.colored_label(
-                                        egui::Color32::from_rgb(255, 100, 100),
+                                        super::theme::danger(ui.visuals()),
                                         "too small",
                                     );
                                 } else {
@@ -1174,7 +1174,7 @@ impl RestoreTab {
             }
 
             if let Some(err) = &self.sp_scan_error {
-                ui.colored_label(egui::Color32::from_rgb(200, 150, 100), err);
+                ui.colored_label(super::theme::warning(ui.visuals()), err);
             }
         });
 
@@ -1584,7 +1584,7 @@ impl RestoreTab {
                         };
 
                         ui.colored_label(
-                            egui::Color32::from_rgb(255, 100, 100),
+                            super::theme::danger(ui.visuals()),
                             format!(
                                 "All data on {} will be permanently overwritten!",
                                 target_name
@@ -1625,7 +1625,7 @@ impl RestoreTab {
                             .unwrap_or_else(|| "Unknown".into());
 
                         ui.colored_label(
-                            egui::Color32::from_rgb(255, 180, 100),
+                            super::theme::warning(ui.visuals()),
                             format!("{} on {} will be overwritten.", part_desc, target_name,),
                         );
                         ui.label("The partition table will NOT be modified.");
@@ -1648,7 +1648,7 @@ impl RestoreTab {
                             NewTableType::Apm => "APM",
                         };
                         ui.colored_label(
-                            egui::Color32::from_rgb(255, 100, 100),
+                            super::theme::danger(ui.visuals()),
                             format!(
                                 "A new {} partition table will be written to {}!",
                                 table_type, target_name,
@@ -1668,7 +1668,7 @@ impl RestoreTab {
                             .map(|b| b.kind.label())
                             .unwrap_or("?");
                         ui.colored_label(
-                            egui::Color32::from_rgb(255, 100, 100),
+                            super::theme::danger(ui.visuals()),
                             format!(
                                 "A new {} partition table will be written to {}, \
                                  destroying everything on it!",
@@ -1698,7 +1698,7 @@ impl RestoreTab {
                             armed,
                             egui::Button::new(
                                 egui::RichText::new("I understand, proceed")
-                                    .color(egui::Color32::from_rgb(255, 100, 100)),
+                                    .color(super::theme::danger(ui.visuals())),
                             ),
                         )
                         .clicked()
@@ -1831,12 +1831,12 @@ impl RestoreTab {
             Ok(o) => o,
             Err(e) => {
                 ui.colored_label(
-                    egui::Color32::from_rgb(255, 100, 100),
+                    super::theme::danger(ui.visuals()),
                     format!("This layout will not fit: {e}"),
                 );
                 if matches!(alignment, RestoreAlignment::Original) {
                     ui.colored_label(
-                        egui::Color32::from_rgb(255, 180, 80),
+                        super::theme::warning(ui.visuals()),
                         "Original alignment keeps every partition at its \
                              original position, so shrinking only leaves gaps. \
                              Choose 1 MB boundaries or Custom to repack them \
@@ -1854,7 +1854,7 @@ impl RestoreTab {
             .unwrap_or(0);
         if end_bytes > target_size {
             ui.colored_label(
-                egui::Color32::from_rgb(255, 100, 100),
+                super::theme::danger(ui.visuals()),
                 format!(
                     "Layout ends at {} but the target holds {}",
                     partition::format_size(end_bytes),
@@ -2085,7 +2085,7 @@ impl RestoreTab {
             }
         });
         if let Some(err) = &self.remote.error {
-            ui.colored_label(egui::Color32::from_rgb(220, 90, 90), err);
+            ui.colored_label(super::theme::danger(ui.visuals()), err);
         }
 
         if connected {
@@ -2154,7 +2154,10 @@ impl RestoreTab {
                 }
             });
             if let Some((_, display, _)) = &self.remote.selected {
-                ui.colored_label(egui::Color32::GRAY, format!("Selected target: {display}"));
+                ui.colored_label(
+                    super::theme::muted(ui.visuals()),
+                    format!("Selected target: {display}"),
+                );
             }
         }
 
@@ -2334,7 +2337,7 @@ impl RestoreTab {
                 }
             } else {
                 ui.colored_label(
-                    egui::Color32::from_rgb(220, 70, 70),
+                    super::theme::danger(ui.visuals()),
                     "That file could not be opened as a disk image.",
                 );
             }
@@ -2400,7 +2403,7 @@ impl RestoreTab {
                 });
                 ui.label(
                     egui::RichText::new("Building erases everything on the selected device.")
-                        .color(egui::Color32::from_rgb(220, 150, 70)),
+                        .color(super::theme::warning(ui.visuals())),
                 );
             } else {
                 ui.horizontal(|ui| {
@@ -2432,10 +2435,7 @@ impl RestoreTab {
                             ui.label(egui::RichText::new(partition::format_size(n)).weak());
                         }
                         Err(e) => {
-                            ui.colored_label(
-                                egui::Color32::from_rgb(220, 70, 70),
-                                format!("{e:#}"),
-                            );
+                            ui.colored_label(super::theme::danger(ui.visuals()), format!("{e:#}"));
                         }
                     }
                 });
@@ -2592,10 +2592,9 @@ impl RestoreTab {
 
         if finished {
             match error {
-                Some(err) => ui.colored_label(
-                    egui::Color32::from_rgb(220, 70, 70),
-                    format!("Error: {err}"),
-                ),
+                Some(err) => {
+                    ui.colored_label(super::theme::danger(ui.visuals()), format!("Error: {err}"))
+                }
                 None => ui.label("Disk build complete."),
             };
         } else if !cancel_requested {
@@ -2767,7 +2766,7 @@ impl RestoreTab {
         }
 
         if let Some(err) = &self.metadata_error {
-            ui.colored_label(egui::Color32::from_rgb(200, 150, 100), err);
+            ui.colored_label(super::theme::warning(ui.visuals()), err);
         }
 
         ui.add_space(8.0);
@@ -2900,7 +2899,7 @@ impl RestoreTab {
                 _ => alignment_sectors,
             };
             ui.colored_label(
-                egui::Color32::GRAY,
+                super::theme::muted(ui.visuals()),
                 format!("Partition will start at LBA {}", start_lba),
             );
         });

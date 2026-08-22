@@ -55,18 +55,33 @@ const ROW_H: f32 = 20.0;
 /// disclosure toggle (names align whether or not a row has one).
 const TREE_INDENT: f32 = 14.0;
 const TOGGLE_W: f32 = 16.0;
-const ADD_COLOR: egui::Color32 = egui::Color32::from_rgb(90, 180, 90);
-const DEL_COLOR: egui::Color32 = egui::Color32::from_rgb(150, 150, 150);
+// These were consts, which is why they could not follow the theme: a const is
+// evaluated once with no `Visuals` to consult. They are functions now, taking
+// the visuals like every other colour in the app.
+fn add_color(v: &egui::Visuals) -> egui::Color32 {
+    super::super::theme::success(v)
+}
+fn del_color(v: &egui::Visuals) -> egui::Color32 {
+    super::super::theme::muted(v)
+}
 /// Tint for an existing entry with staged metadata edits (type/dates/perms).
-const META_COLOR: egui::Color32 = egui::Color32::from_rgb(150, 190, 255);
+fn meta_color(v: &egui::Visuals) -> egui::Color32 {
+    super::super::theme::info(v)
+}
 /// A file in a remote-host listing that looks like a disk image we can open
 /// (a teal, distinct from the folder blue and the gray of plain files).
-const IMAGE_COLOR: egui::Color32 = egui::Color32::from_rgb(110, 210, 190);
+fn image_color(v: &egui::Visuals) -> egui::Color32 {
+    super::super::theme::accent(v)
+}
 /// The "Close Image" affordance — amber, to read as "step back out".
-const CLOSE_IMAGE_COLOR: egui::Color32 = egui::Color32::from_rgb(230, 170, 90);
+fn close_image_color(v: &egui::Visuals) -> egui::Color32 {
+    super::super::theme::warning(v)
+}
 /// The "Read-only" media badge in the volume readout — amber, "look but touch
 /// carefully".
-const READ_ONLY_BADGE_COLOR: egui::Color32 = egui::Color32::from_rgb(230, 170, 90);
+fn read_only_badge_color(v: &egui::Visuals) -> egui::Color32 {
+    super::super::theme::warning(v)
+}
 
 /// What a pane reports back to [`super::CommanderMode`] after a frame.
 #[derive(Default)]
@@ -737,7 +752,7 @@ impl CommanderPane {
             }
         } else if let Some(err) = &self.error {
             ui.add_space(12.0);
-            ui.colored_label(egui::Color32::from_rgb(220, 120, 120), err);
+            ui.colored_label(super::super::theme::danger_muted(ui.visuals()), err);
         } else if self.listing.is_loaded() {
             self.render_header(ui);
             let actions = self.render_rows(ui);
@@ -895,7 +910,7 @@ impl CommanderPane {
                     ui.label(format!("Rename \"{old_name}\" to:"));
                     let resp = ui.text_edit_singleline(input);
                     if let Some(e) = &err {
-                        ui.colored_label(egui::Color32::from_rgb(220, 120, 120), e);
+                        ui.colored_label(super::super::theme::danger_muted(ui.visuals()), e);
                     }
                     let valid = !input.trim().is_empty() && *input != old_name;
                     ui.add_space(6.0);
@@ -993,7 +1008,7 @@ impl CommanderPane {
                     ui.label("Folder name:");
                     let resp = ui.text_edit_singleline(input);
                     if let Some(e) = &err {
-                        ui.colored_label(egui::Color32::from_rgb(220, 120, 120), e);
+                        ui.colored_label(super::super::theme::danger_muted(ui.visuals()), e);
                     }
                     let valid = !input.trim().is_empty();
                     ui.add_space(6.0);
@@ -1101,7 +1116,7 @@ impl CommanderPane {
                             .small(),
                     );
                     if let Some(e) = &d.error {
-                        ui.colored_label(egui::Color32::from_rgb(220, 120, 120), e);
+                        ui.colored_label(super::super::theme::danger_muted(ui.visuals()), e);
                     }
                     let valid = !d.host.trim().is_empty();
                     ui.add_space(6.0);
@@ -1255,9 +1270,9 @@ impl CommanderPane {
     /// swap the new target (the host file browser, or an opened image) into the
     /// listing.
     fn poll_remote(&mut self, ctx: &egui::Context) -> Option<String> {
-        let done = match self.pending_remote.as_ref() {
-            Some(s) => s.lock().ok().map(|g| g.done).unwrap_or(false),
-            None => return None,
+        let done = {
+            let s = self.pending_remote.as_ref()?;
+            s.lock().ok().map(|g| g.done).unwrap_or(false)
         };
         if !done {
             ctx.request_repaint();
@@ -1911,8 +1926,9 @@ impl CommanderPane {
                     ..
                 })
             ) {
-                let btn =
-                    egui::Button::new(egui::RichText::new("Close Image").color(CLOSE_IMAGE_COLOR));
+                let btn = egui::Button::new(
+                    egui::RichText::new("Close Image").color(close_image_color(ui.visuals())),
+                );
                 if ui
                     .add_enabled(self.queue.is_empty(), btn)
                     .on_hover_text("Back to browsing the remote host filesystem")
@@ -2066,7 +2082,7 @@ impl CommanderPane {
                     // aren't attempted.
                     if self.is_read_only() {
                         ui.separator();
-                        ui.colored_label(READ_ONLY_BADGE_COLOR, "Read-only")
+                        ui.colored_label(read_only_badge_color(ui.visuals()), "Read-only")
                             .on_hover_text(
                                 "This source can be browsed and copied out of, but not \
                                  written to — copies into this pane are disabled.",
@@ -2872,7 +2888,7 @@ impl CommanderPane {
                 egui::pos2(rect.left(), rect.bottom()),
                 egui::pos2(rect.right(), rect.bottom()),
             ],
-            egui::Stroke::new(1.0, ui.visuals().window_stroke.color),
+            egui::Stroke::new(1.0_f32, ui.visuals().window_stroke.color),
         );
 
         if resp.clicked() {
@@ -3568,12 +3584,12 @@ fn paint_row(ui: &egui::Ui, rect: egui::Rect, row: &DisplayRow) {
     let base = ui.visuals().text_color();
     let color = match row.kind {
         RowKind::Parent => ui.visuals().weak_text_color(),
-        RowKind::PendingAdd => ADD_COLOR,
-        RowKind::PendingRename => ADD_COLOR,
-        RowKind::PendingDelete => DEL_COLOR,
-        RowKind::Normal if row.meta_changed => META_COLOR,
-        RowKind::Normal if row.is_image => IMAGE_COLOR,
-        RowKind::Normal if row.is_dir => egui::Color32::from_rgb(120, 160, 255),
+        RowKind::PendingAdd => add_color(ui.visuals()),
+        RowKind::PendingRename => add_color(ui.visuals()),
+        RowKind::PendingDelete => del_color(ui.visuals()),
+        RowKind::Normal if row.meta_changed => meta_color(ui.visuals()),
+        RowKind::Normal if row.is_image => image_color(ui.visuals()),
+        RowKind::Normal if row.is_dir => super::super::theme::info(ui.visuals()),
         RowKind::Normal => base,
     };
 
@@ -3668,7 +3684,7 @@ fn paint_row(ui: &egui::Ui, rect: egui::Rect, row: &DisplayRow) {
     if row.kind == RowKind::PendingDelete {
         ui.painter().line_segment(
             [egui::pos2(c.name_l, mid), egui::pos2(c.name_r, mid)],
-            egui::Stroke::new(1.0, color),
+            egui::Stroke::new(1.0_f32, color),
         );
     }
 }

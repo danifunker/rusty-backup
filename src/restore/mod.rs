@@ -628,7 +628,8 @@ pub fn build_restore_ebr_chain(
             .find(|o| o.index == ext.mbr_index)
             .map(|o| o.effective_start_lba())
             .unwrap_or(ext.start_lba) as u32
-    } else if let Some(mbr) = mbr_bytes {
+    } else {
+        let mbr = mbr_bytes?;
         // Old backup format without extended_container: parse the MBR to find
         // the extended partition entry's start LBA.
         let mbr_parsed = Mbr::parse(mbr).ok()?;
@@ -637,8 +638,6 @@ pub fn build_restore_ebr_chain(
             .iter()
             .find(|e| e.is_extended() && !e.is_empty())?;
         ext_entry.start_lba
-    } else {
-        return None;
     };
 
     // Collect logical partitions sorted by original start_lba.

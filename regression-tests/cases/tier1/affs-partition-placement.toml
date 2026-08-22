@@ -1,0 +1,54 @@
+# Tier 1 — self-fixturing.
+#
+# R-042: AFFS stores no size, so its root block's *position* is the size. A
+# driver that infers the midpoint from the end of the reader gets the midpoint
+# of the disk rather than of the partition, and any AFFS partition that is not
+# last becomes unopenable.
+#
+# The fixture corpus hid this for months: fs.affs.workbench13.hd is a single
+# partition filling almost its whole disk, so the inferred candidate landed
+# close enough for the bounded search to recover. This case builds the layout
+# every real Amiga uses instead — a small AFFS partition at the *start* of a
+# much larger disk — which is the arrangement that fails.
+#
+# `new volume affs` builds its own input, so nothing here needs the corpus.
+# Geometry is 16x32 (a 256 KiB cylinder) so a 2 MiB partition is exactly eight
+# cylinders and the poured volume fills it precisely; AFFS is unforgiving about
+# that for the same reason it is unforgiving about placement.
+
+[meta]
+tier = 1
+group = "fs.affs-placement"
+description = "An AFFS partition away from the end of its disk still opens (R-042)."
+
+[[case]]
+id = "fs.affs-partition-not-last"
+description = "2 MiB AFFS at the start of a 32 MiB RDB disk opens and lists"
+[[case.step]]
+args = ["new", "volume", "affs", "--size", "2M", "{scratch}/v.affs"]
+expect_exit = 0
+[[case.step]]
+args = [
+    "new", "hd", "rdb", "--size", "32M", "--heads", "16", "--sectors", "32",
+    '--partition', '2M:DOS\1:DH0',
+    "--fill", "1={scratch}/v.affs",
+    "{scratch}/d.hdf",
+]
+expect_exit = 0
+# The partition must sit far from the end of the disk, or the case is not
+# testing what it claims: 2 MiB used of 32 MiB.
+[[case.step]]
+args = ["inspect", "{scratch}/d.hdf", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+[[case.step.json_equals]]
+path = "partitions.0.type_name"
+value = "AmigaDOS FFS (DH0)"
+# The whole point: this exited non-zero before the fix.
+[[case.step]]
+args = ["ls", "{scratch}/d.hdf@1", "/", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+[[case.step]]
+args = ["fsck", "{scratch}/d.hdf@1", "--checkonly"]
+expect_exit = 0

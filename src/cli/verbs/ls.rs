@@ -154,14 +154,7 @@ pub fn run(args: LsArgs) -> Result<()> {
     .map_err(|e| crate::cli::optical_hint::with_optical_hint(e, &args.image.path))?;
     args.fs_override.apply(&mut ctx);
     log_stderr(&ctx.label);
-    let mut fs = crate::fs::open_filesystem_with_passphrase(
-        reader,
-        ctx.offset,
-        ctx.type_byte,
-        ctx.type_string.as_deref(),
-        args.password.as_deref(),
-    )
-    .map_err(|e| {
+    let mut fs = ctx.open_ro(reader, args.password.as_deref()).map_err(|e| {
         crate::cli::optical_hint::with_optical_hint(
             anyhow!("opening filesystem: {e}"),
             &args.image.path,

@@ -256,12 +256,16 @@ pub fn macbinary_crc16(data: &[u8]) -> u16 {
 pub struct ImportedResourceFork {
     /// Raw resource fork bytes.
     pub data: Vec<u8>,
-    /// The data fork bytes (only set for MacBinary, where the container wraps both forks).
+    /// The data fork bytes (set for the whole-file containers — MacBinary and
+    /// BinHex — where the wrapper carries both forks).
     pub data_fork: Option<Vec<u8>>,
     /// 4-byte type code (e.g. `TEXT`), if found in the container.
     pub type_code: Option<[u8; 4]>,
     /// 4-byte creator code (e.g. `ttxt`), if found in the container.
     pub creator_code: Option<[u8; 4]>,
+    /// The Mac filename recorded inside a whole-file container, so an import
+    /// lands `Foo` rather than the host's `Foo.bin` / `Foo.hqx` wrapper name.
+    pub name: Option<String>,
 }
 
 /// Detect and read a resource fork associated with `host_path` by probing
@@ -286,6 +290,7 @@ pub fn detect_resource_fork(host_path: &std::path::Path) -> Option<ImportedResou
                     data_fork: None,
                     type_code,
                     creator_code,
+                    name: None,
                 });
             }
         }
@@ -326,7 +331,23 @@ pub fn detect_resource_fork(host_path: &std::path::Path) -> Option<ImportedResou
         }
     }
 
-    // 4. Separate .rsrc sidecar
+    // 4. BinHex — the file itself is a `.hqx` container.
+    //
+    // Same header peek as MacBinary, for the same reason: never read an
+    // arbitrary path whole just to classify it.
+    if is_regular_file(host_path) {
+        if let Some(head) = read_header_128(host_path) {
+            if looks_like_binhex(&head) {
+                if let Ok(hqx) = std::fs::read(host_path) {
+                    if let Some(parsed) = parse_binhex_fork(&hqx) {
+                        return Some(parsed);
+                    }
+                }
+            }
+        }
+    }
+
+    // 5. Separate .rsrc sidecar
     let rsrc_path = parent.join(format!("{file_name}.rsrc"));
     if rsrc_path.is_file() {
         if let Ok(data) = std::fs::read(&rsrc_path) {
@@ -336,12 +357,47 @@ pub fn detect_resource_fork(host_path: &std::path::Path) -> Option<ImportedResou
                     data_fork: None,
                     type_code: None,
                     creator_code: None,
+                    name: None,
                 });
             }
         }
     }
 
     None
+}
+
+/// Cheap gate for the BinHex banner, which `parse_binhex` searches for anyway.
+/// Only the first 128 bytes are inspected, so a header peek decides whether the
+/// whole file is worth reading.
+fn looks_like_binhex(head: &[u8]) -> bool {
+    head.windows(BINHEX_PREFIX.len())
+        .any(|w| w == BINHEX_PREFIX)
+}
+
+/// The stable part of the BinHex 4.0 banner; the version digits after it vary.
+const BINHEX_PREFIX: &[u8] = b"(This file must be converted with BinHex";
+
+/// Decode a BinHex 4.0 (`.hqx`) container into both forks plus Finder info.
+///
+/// Unlike the sidecar formats this is a whole-file wrapper, so `data_fork` and
+/// `name` are both carried and the caller writes those instead of the `.hqx`
+/// text. Returns `None` when the document does not decode or carries neither a
+/// resource fork nor Finder info, so a plain BinHexed text file still imports
+/// as its own contents rather than as an empty-forked stub.
+pub fn parse_binhex_fork(data: &[u8]) -> Option<ImportedResourceFork> {
+    let bh = crate::fs::binhex::parse_binhex(data).ok()?;
+    let type_code = (bh.type_code != [0; 4]).then_some(bh.type_code);
+    let creator_code = (bh.creator_code != [0; 4]).then_some(bh.creator_code);
+    if bh.resource_fork.is_empty() && type_code.is_none() && creator_code.is_none() {
+        return None;
+    }
+    Some(ImportedResourceFork {
+        data: bh.resource_fork,
+        data_fork: Some(bh.data_fork),
+        type_code,
+        creator_code,
+        name: (!bh.name.is_empty()).then_some(bh.name),
+    })
 }
 
 /// Check if a host file is a resource fork sidecar that should be skipped
@@ -446,6 +502,7 @@ pub fn parse_appledouble(data: &[u8]) -> Option<ImportedResourceFork> {
         data_fork: None,
         type_code,
         creator_code,
+        name: None,
     })
 }
 
@@ -560,6 +617,10 @@ pub fn parse_macbinary(data: &[u8]) -> Option<ImportedResourceFork> {
             Some(creator_code)
         } else {
             None
+        },
+        name: {
+            let n = crate::fs::hfs::decode_mac_filename(&data[2..2 + name_len]);
+            (!n.is_empty()).then_some(n)
         },
     })
 }

@@ -1,4 +1,4 @@
-# Regression Findings (R-001 … R-039)
+# Regression Findings (R-001 … R-042)
 
 Defects and documentation drift turned up while building the regression suite
 (`regression-tests/`), 2026-08-01/02. The suite work was deliberately kept
@@ -19,6 +19,9 @@ finding depends on a fixture, the fixture is named.
 
 | ID | Severity | Area | Finding |
 |----|----------|------|---------|
+| ~~R-042~~ | ~~**High**~~ **FIXED** | `src/fs/affs.rs` | ~~An AFFS partition that is not last on its disk cannot be opened at all~~ — the root-block midpoint was inferred from the end of the *disk*; the read-only opener family now carries the partition length the editable one always had, 2026-08-18 |
+| ~~R-040~~ | ~~**High**~~ **FIXED** | `src/cli/verbs/put.rs`, `src/fs/dir_import.rs` | ~~`put` and `import` never reattach a resource fork, so an extracted Mac archive copied back onto HFS loses every fork~~ — `detect_resource_fork` learned BinHex and both verbs now consult it; all four containers round-trip, 2026-08-17 |
+| ~~R-041~~ | ~~**High**~~ **FIXED** | `src/model/commander_ops.rs`, `src/cli/verbs/tui_app.rs` | ~~Commander drops resource forks: host->image staging hardcoded `resource_fork: None`, and the TUI's image->host copy did not recurse~~ — staging detects forks and skips consumed sidecars; both front ends now share one recursive walker, 2026-08-17 |
 | [R-019](#r-019) | Low — **accepted** | `src/rbformats/vhd.rs` | VHD Creator Host OS makes output non-reproducible across platforms; behaviour kept, parity declares it |
 | ~~R-023~~ | ~~**High**~~ **FIXED** | `src/cli/verbs/repack.rs` | ~~`repack` loses every file in the volume~~ — scope guard; nothing was lost, a FAT long filename was dropped, 2026-08-09 |
 | ~~R-022~~ | ~~**High**~~ **FIXED** | `src/partition/mod.rs` | ~~HPFS sector-by-sector backup -> restore is not byte-identical~~ — detection, not fidelity: a bare HPFS volume backed up to nothing at all. Probe added, 2026-08-09 |
@@ -59,6 +62,206 @@ finding depends on a fixture, the fixture is named.
 | [R-011](#r-011) | **Partial** | `src/rbformats/containers/g64.rs` | Copy-protected G64 dumps: read-only refusal fixed; decode of non-standard GCR unverified (no fixture) |
 | ~~R-001~~ | ~~Doc~~ **FIXED** | `README.md` | ~~Partition-table list missing AHDI and X68000~~ — X68k and DSD rows added, guarded by a parity test, 2026-08-09 |
 | ~~R-002~~ | ~~Doc~~ **FIXED** | `src/fs/README.md` | ~~Capability table stale — ext listed as "planned"~~ — table deleted for a pointer at the live dispatch, 2026-08-09 |
+
+---
+
+## Found while investigating a user report, 2026-08-17
+
+Reported as "sit extraction is losing a lot of resource forks", in the GUI
+Commander and in the Inspect tab's import. The StuffIt side turned out to be
+innocent: the classic and v5 parsers both carry `rsrc`, and the real
+`CIV_II_GOLD_111_UPDATE.SIT` (StuffIt 5, a 217,563-byte Arsenic-compressed
+resource fork) round-trips byte-exact through `archive extract` **and** through
+the Commander open path. The forks are lost on the way back **in**, in code
+that has nothing to do with StuffIt.
+
+### R-042 — an AFFS partition that is not last on its disk cannot be opened {#r-042}
+
+**FIXED 2026-08-18, and it was R-030's shape one level up.** R-030 fixed the
+root block being located from the end of the *file*; this is the same mistake
+surviving as a bounded search rather than a wrong constant.
+
+AFFS stores no size anywhere. The root block sits at the volume's midpoint, so
+the root's *position* is the size. `AffsFilesystem::open` took only a reader
+and an offset, so it computed the midpoint of everything from the partition
+start to the end of the reader — which for a partition inside an RDB disk is
+the end of the **disk**. R-030 made that survivable with a 2048-block downward
+scan from the candidate, and that is enough only when the partition sits near
+the end of the disk.
+
+The fixture we had is a single 2 MiB partition on a 3 MiB disk: candidate 3072,
+root 2020, 1052 blocks apart, inside the window. So the case passed and the bug
+sat behind it. The layout every real Amiga uses — DH0 first, DH1/DH2 after —
+does not:
+
+```
+rb-cli ls amiga-base.hdf@1 /        # 2 MiB AFFS at the start of a 32 MiB disk
+  -> error: opening filesystem: parse error: root block: type != T_HEADER
+```
+
+The root block was exactly where it should be. I confirmed the partition's
+bytes were identical to the source volume, and that a valid root block sat at
+partition block 2020 in that image, in the original fixture, and in the carved
+volume alike. The candidate was block 32263 — thirty thousand blocks past the
+search floor.
+
+The message compounded it. `locate_root_block` returning `None` reported
+`root block: type != T_HEADER`, borrowed from the parser, so a search that
+never arrived read as a corrupt disk. It now says what happened and why.
+
+**The fix is to stop inferring.** The editable opener family has always carried
+`EditContext::partition_len`; the read-only side had no way to express it:
+
+- `AffsFilesystem::open_sized(reader, offset, Option<u64>)`, with `open`
+  delegating as `None`
+- `fs::open_filesystem_sized` / `open_filesystem_full` threading it through the
+  dispatch to all four AFFS branches
+- `ResolvedPartition::open_ro`, the counterpart of `open_editable`, so a verb
+  cannot forget the length — 13 verb call sites moved onto it
+- `browse_session`'s ten read paths pass the `partition_size` they already held
+  and already handed the editable path
+
+`None` remains the honest answer for a bare ADF or superfloppy, where the
+reader's end really is the volume's end, so the remaining ~160 call sites are
+unchanged rather than mechanically churned. PFS3, SFS, FAT and the rest record
+their own length and never consulted this.
+
+Case `fs.affs-partition-not-last` in `regression-tests/cases/tier1/`.
+
+### R-040 — `put` and `import` never reattach a resource fork {#r-040}
+
+**FIXED 2026-08-17.** All three causes, in the one place each belongs.
+
+`detect_resource_fork` gained a fifth probe — BinHex — behind the same 128-byte
+header peek that guards the MacBinary branch, so no path is read whole just to
+classify it. `ImportedResourceFork` now also carries the Mac `name` a whole-file
+wrapper records, which is what lets an import land `Foo` instead of `Foo.hqx`.
+
+`put` consults it whenever the target filesystem can store a fork
+(`copy::Capabilities::infer`, the existing single source of truth), attaches the
+bytes as `CreateFileOptions::resource_fork`, and writes the unwrapped data fork
+rather than the container. Type/creator ride along as raw `os_type` bytes, and
+the generic `BINA`/`????` fallback now yields to them — an explicit `--type`
+still wins.
+
+`dir_import` does the rejoining where the host paths are: a file that *is* a
+consumed sidecar is skipped and counted, a wrapper is unwrapped in place, and
+the fork travels to `import_sink` as a new `ImportItem::File { mac_fork }`
+field. `import_sink` only had to widen `CreateFileOptions`; the blanket
+`skip_appledouble` rule stays for tar members and orphaned `._*`, which is
+still what it is for.
+
+All eight `mac.fork-roundtrip.*` cases XPASSed, and tiers 0-3 came back 271
+pass / 0 fail — `import.host-directory`, `mac.macbinary.put`,
+`mac.binhex.put-get-roundtrip` and `mac.setrsrc.attaches-a-fork` all unchanged.
+
+Extract a Mac archive to the host in any of the four fork containers, copy the
+result back onto an HFS volume, and the resource fork is gone. Eight of eight
+combinations, on Windows, against `target/release/rb-cli`:
+
+```
+expected: data_bytes=32 rsrc_bytes=64
+
+import binhex       data_bytes=139  rsrc_bytes=0     <- the .hqx landed as text
+import macbinary    data_bytes=384  rsrc_bytes=0     <- the .bin landed as a container
+import appledouble  data_bytes=32   rsrc_bytes=0     <- ._sidecar deleted en route
+import raw          data_bytes=96   rsrc_bytes=0     <- .rsrc landed as its own file
+put    binhex       data_bytes=139  rsrc_bytes=0
+put    macbinary    data_bytes=384  rsrc_bytes=0
+put    appledouble  data_bytes=32   rsrc_bytes=0
+put    raw          data_bytes=32   rsrc_bytes=0
+```
+
+`put-macbinary` on the same `.bin`, the same volume and the same reader gives
+`data_bytes=32 rsrc_bytes=64`. So the writer, the filesystem and `du` are all
+fine — only the copy-in path is at fault, and only in the general-purpose verbs.
+
+Three separate causes sit behind those eight rows:
+
+1. **`put` never calls `detect_resource_fork`.** `src/cli/verbs/put.rs` writes
+   the host file's bytes and nothing else. The GUI Inspect tab's equivalent
+   (`browse_view.rs:3995`) does call it, which is why the two surfaces disagree.
+2. **`import` never calls it either, and additionally deletes the evidence.**
+   `ImportOptions::skip_appledouble` defaults to true and
+   `src/fs/import_sink.rs:249` drops every `._*` entry as "resource-fork cruft,
+   almost never wanted in the image". For a tree that came out of
+   `archive extract --format appledouble` that sidecar *is* the payload.
+3. **`detect_resource_fork` has no BinHex branch.** `src/fs/resource_fork.rs:276`
+   knows native forks, AppleDouble, MacBinary and `.rsrc` — not `.hqx`. BinHex
+   is the **default** output of `archive extract` in all three front ends (CLI
+   `src/cli/verbs/archive.rs:67`, GUI `src/gui/archives_tab.rs:98`, TUI
+   `fork_fmt_sel = 0`), so the default extract can never be re-imported by any
+   caller, including the one surface that does detect.
+
+Type and creator go the same way: the `appledouble` and `raw` rows land with
+`????`/`....` because nothing reads the sidecar's FInfo.
+
+Cases `mac.fork-roundtrip.*` in `regression-tests/cases/tier1/`, with
+`mac.fork-roundtrip.control.put-macbinary` as the passing control.
+
+### R-041 — Commander drops resource forks on the way into an image {#r-041}
+
+**FIXED 2026-08-17.** `stage_host_into` now skips a consumed sidecar and runs
+each host file through `detect_resource_fork`, taking the container's Mac name
+and data-fork length when a wrapper is unwrapped. `apply_edit` already knew what
+to do with an `ImportedResourceFork` carrying a `data_fork`, so the staging side
+was the whole gap: the Commander's host pane and the Inspect tab's import now
+behave the same way.
+
+The TUI's flat copy loop is gone. Both front ends call one new shared walker,
+`commander_ops::export_fs_entries_to_host` — the blocking form of the
+`ImageToHost` job — which recurses properly and preserves forks. The GUI's
+private duplicate of that walk was deleted in the same change, since a second
+copy of the recursion is how the two drifted apart to begin with.
+
+Both silent swallows are gone too. `commander_ops` and `export_selection` now
+ask for a resource fork only when the entry claims one — the trait default is
+`Ok(0)`, so an error past that gate is a real decode failure — and propagate it
+with the filename instead of quietly producing a fork-less copy.
+
+Two defects on the Commander surfaces the user was actually driving. Neither is
+reachable from the CLI, so neither has a regression case; both reproduce from a
+unit-test-shaped call today.
+
+**Host pane -> image pane staging never attaches a fork.**
+`stage_host_into` (`src/model/commander_ops.rs:521`) writes
+`resource_fork: None` unconditionally and never consults
+`detect_resource_fork`. It also does not filter sidecars, so they are staged as
+ordinary files. Staging a directory holding `SimpleText` + `SimpleText.rsrc`:
+
+```
+staged AddFile SimpleText           resource_fork = None
+staged AddFile SimpleText.rsrc      resource_fork = None
+```
+
+Two files on the target volume, no fork on either. Contrast the image->image
+direction (`stage_copy_into`, same file, line 435), which does carry the fork —
+so a Commander copy preserves forks or destroys them depending on which pane
+the files came from.
+
+**TUI Commander's image -> host copy does not recurse.**
+`src/cli/verbs/tui_app.rs:2603` iterates `action_entries()` flat and calls
+`export_file_with_fork` on each, directories included. `export_file_with_fork`
+on a directory reaches `write_file_to`, gets `Ok(0)`, and writes a **zero-byte
+file named after the folder**; the status line still reads "Copied ... to the
+host." Against an `ArchiveFilesystem` holding `System Folder/Finder`:
+
+```
+selected: System Folder is_dir=true  ->  Ok(0)
+OUT System Folder len=0 dir=false
+```
+
+Everything under the folder — files, data forks, resource forks — is gone. The
+GUI's counterpart (`src/gui/commander/mod.rs:1335`) recurses correctly, so this
+is TUI-only. That branch also passes `&e.name` where the GUI passes
+`safe_name(e)`, so host-illegal Mac names are not sanitised either.
+
+**Two silent swallows make both of the above quieter than they should be.**
+`src/model/commander_ops.rs:435` and `src/fs/export_selection.rs:241` both read
+the resource fork as `let _ = fs.write_resource_fork_to(...)`. A fork that fails
+to decode — an unsupported StuffIt method (6 / 8 / 14 are unimplemented in
+`src/macarchive/stuffit.rs:381`), a CRC mismatch, a truncated multi-disk
+archive — is dropped with no warning and the copy reports success.
 
 ---
 

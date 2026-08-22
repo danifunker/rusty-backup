@@ -201,7 +201,7 @@ pub fn resolve_hfs_offset(
     if file.read(&mut sig)? < 2 {
         return Ok((0, None));
     }
-    let is_apm = sig == [b'E', b'R'];
+    let is_apm = sig == *b"ER";
     if !is_apm {
         if partition.is_some() {
             bail!("--partition specified but image is not an APM disk");

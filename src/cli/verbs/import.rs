@@ -79,8 +79,12 @@ pub struct ImportArgs {
     #[arg(long = "no-permissions")]
     pub no_permissions: bool,
 
-    /// Import macOS AppleDouble sidecars (`._*`) too. By default they are
-    /// skipped as Mac metadata cruft.
+    /// Import macOS AppleDouble sidecars (`._*`) as files of their own, on top
+    /// of the fork they already contribute. Off by default: on a fork-bearing
+    /// target (HFS / HFS+ / MFS / ProDOS) a `._name` or `name.rsrc` sidecar is
+    /// consumed into the resource fork of the file it belongs to, which is
+    /// where it wanted to end up, and elsewhere it is skipped as Mac metadata
+    /// cruft. Only an orphan with no primary file is ever dropped outright.
     #[arg(long = "include-appledouble")]
     pub include_appledouble: bool,
 

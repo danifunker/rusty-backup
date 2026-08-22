@@ -19,10 +19,16 @@ use rusty_backup::model::remote_browser::{BrowseMode, BrowseTarget, RemoteBrowse
 use rusty_backup::partition::format_size;
 use rusty_backup::remote::RemoteConnection;
 
-/// Folder rows — a blue distinct from plain files.
-const FOLDER_COLOR: egui::Color32 = egui::Color32::from_rgb(120, 170, 255);
-/// A file that looks like a disk image we can open (teal).
-const IMAGE_COLOR: egui::Color32 = egui::Color32::from_rgb(110, 210, 190);
+/// Folder rows — a blue distinct from plain files. A function, not a const,
+/// so it can follow the theme.
+fn folder_color(v: &egui::Visuals) -> egui::Color32 {
+    super::theme::info(v)
+}
+/// A file that looks like a disk image we can open (teal). A function, not a
+/// const, so it can follow the theme.
+fn image_color(v: &egui::Visuals) -> egui::Color32 {
+    super::theme::accent(v)
+}
 
 /// Whether a filename's extension is one of the disk-image containers the engine
 /// can open (so the host picker tints it as openable).
@@ -217,7 +223,7 @@ impl RemoteBrowsePanel {
             });
         } else if let Some(e) = &self.error {
             ui.add_space(8.0);
-            ui.colored_label(egui::Color32::from_rgb(220, 120, 120), e);
+            ui.colored_label(super::theme::danger_muted(ui.visuals()), e);
         } else if self.listing.is_loaded() {
             let hint = if matches!(self.mode, Some(BrowseMode::Host)) {
                 "Double-click a folder to open it, or a disk image to inspect it."
@@ -297,9 +303,9 @@ impl RemoteBrowsePanel {
                                     let is_img =
                                         !e.is_directory() && looks_like_disk_image(&e.name);
                                     let color = if e.is_directory() {
-                                        FOLDER_COLOR
+                                        folder_color(ui.visuals())
                                     } else if host_mode && is_img {
-                                        IMAGE_COLOR
+                                        image_color(ui.visuals())
                                     } else {
                                         ui.visuals().text_color()
                                     };
@@ -354,7 +360,7 @@ impl RemoteBrowsePanel {
                             .small(),
                     );
                     if let Some(e) = &d.error {
-                        ui.colored_label(egui::Color32::from_rgb(220, 120, 120), e);
+                        ui.colored_label(super::theme::danger_muted(ui.visuals()), e);
                     }
                     let valid = !d.host.trim().is_empty();
                     ui.add_space(6.0);
@@ -431,9 +437,9 @@ impl RemoteBrowsePanel {
     /// Poll an in-flight transition; on completion re-install the browser and
     /// swap the new target into the listing.
     fn poll(&mut self, ctx: &egui::Context) -> Option<String> {
-        let done = match self.pending.as_ref() {
-            Some(s) => s.lock().ok().map(|g| g.done).unwrap_or(false),
-            None => return None,
+        let done = {
+            let s = self.pending.as_ref()?;
+            s.lock().ok().map(|g| g.done).unwrap_or(false)
         };
         if !done {
             ctx.request_repaint();

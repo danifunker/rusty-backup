@@ -212,7 +212,7 @@ impl PhysicalDiskExport {
 
                 if let Some(err) = &self.last_error {
                     ui.add_space(4.0);
-                    ui.colored_label(egui::Color32::from_rgb(220, 70, 70), err);
+                    ui.colored_label(super::theme::danger(ui.visuals()), err);
                 }
 
                 ui.separator();
@@ -410,7 +410,7 @@ impl PhysicalDiskExport {
             if let Some(p) = self.target_partitions.iter().find(|p| p.index == idx) {
                 if src.size_bytes > p.size_bytes {
                     ui.colored_label(
-                        egui::Color32::from_rgb(220, 70, 70),
+                        super::theme::danger(ui.visuals()),
                         format!(
                             "Source is {} but the partition holds {}",
                             rusty_backup::partition::format_size(src.size_bytes),
@@ -457,10 +457,7 @@ impl PhysicalDiskExport {
             ui.add(egui::ProgressBar::new(frac).text(text));
             if finished {
                 if let Some(err) = error {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(220, 70, 70),
-                        format!("Error: {err}"),
-                    );
+                    ui.colored_label(super::theme::danger(ui.visuals()), format!("Error: {err}"));
                 } else {
                     ui.label("Write complete.");
                 }

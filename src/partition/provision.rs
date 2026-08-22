@@ -13,7 +13,7 @@
 //! a raw device handle, or an in-memory buffer in tests.
 
 use anyhow::{bail, Context, Result};
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 use crate::partition::type_catalog::{self, TableKind};
 use crate::partition::{apm, format_size, gpt, mbr, parse_size};
@@ -837,6 +837,129 @@ pub fn describe_placed(kind: TableKind, index: usize, p: &Placed) -> String {
         p.start_lba,
         type_catalog::describe(kind, &p.type_text).unwrap_or(&p.type_text),
     )
+}
+
+/// Embed filesystem handlers in an RDB's `FileSystemHeader` chain.
+///
+/// A DosType with no ROM handler — `SFS\0`, `PFS\3` — cannot be mounted from
+/// the partition table alone: the ROM's strap loads the handler out of the RDB
+/// itself. This writes what HDToolBox writes, and what the `PFS\3` and `DOS\1`
+/// chains on real reference disks contain: one `FSHD` per DosType, chained
+/// through `fhb_Next`, each pointing at an `LSEG` chain holding the handler's
+/// AmigaDOS load file verbatim.
+///
+/// Call after [`write_table`] on an RDB disk; blocks land after the `PART`
+/// chain, inside the reserved area the RDSK already declares.
+pub fn write_rdb_filesystems<W: Read + Write + Seek>(
+    out: &mut W,
+    filesystems: &[(u32, Vec<u8>)],
+) -> Result<()> {
+    use crate::partition::rdb::{stamp_checksum, stamp_checksum_longs, NO_BLOCK};
+
+    if filesystems.is_empty() {
+        return Ok(());
+    }
+    let mut rdsk = [0u8; 512];
+    out.seek(SeekFrom::Start(0))?;
+    out.read_exact(&mut rdsk)
+        .context("reading the RDSK block")?;
+    if &rdsk[0..4] != crate::partition::rdb::RDSK_SIGNATURE {
+        bail!("not an RDB disk: no RDSK at block 0");
+    }
+    // The reserved area the RDSK itself declares; anything we add lives there.
+    let rdb_hi = get_long(&rdsk, 33);
+    // Walk the PART chain rather than trusting a count field: the first free
+    // block is one past the highest PART we actually wrote.
+    let mut next_free = 1u32;
+    let mut part = get_long(&rdsk, 7);
+    let mut guard = 0;
+    while part != NO_BLOCK && part != 0 && guard < 64 {
+        next_free = next_free.max(part + 1);
+        let mut buf = [0u8; 512];
+        out.seek(SeekFrom::Start(u64::from(part) * SECTOR))?;
+        out.read_exact(&mut buf)?;
+        part = get_long(&buf, 4);
+        guard += 1;
+    }
+
+    // Lay each handler out as FSHD + LSEG chain, back to front, so every
+    // block's `next` is known before it is written.
+    let data_per_lseg = (SECTOR as usize) - 20;
+    let mut first_fshd = NO_BLOCK;
+    let mut planned: Vec<(u32, u32, u32, &[u8])> = Vec::new(); // fshd, seglist, dostype, image
+    for (dostype, image) in filesystems {
+        if image.is_empty() {
+            bail!("filesystem handler for DosType {dostype:#010x} is empty");
+        }
+        let lsegs = image.len().div_ceil(data_per_lseg) as u32;
+        let fshd_blk = next_free;
+        let seglist = fshd_blk + 1;
+        next_free = seglist + lsegs;
+        if u64::from(next_free) > u64::from(rdb_hi) + 1 {
+            bail!(
+                "the RDB reserved area (blocks 0..{rdb_hi}) has no room for {} bytes of \
+                 filesystem handlers; give the disk a larger geometry so cylinder 0 is bigger",
+                filesystems.iter().map(|(_, i)| i.len()).sum::<usize>()
+            );
+        }
+        if first_fshd == NO_BLOCK {
+            first_fshd = fshd_blk;
+        }
+        planned.push((fshd_blk, seglist, *dostype, image));
+    }
+
+    for (i, (fshd_blk, seglist, dostype, image)) in planned.iter().enumerate() {
+        let next_fshd = planned.get(i + 1).map(|p| p.0).unwrap_or(NO_BLOCK);
+        let mut fshd = [0u8; 512];
+        fshd[0..4].copy_from_slice(b"FSHD");
+        for (long, value) in [
+            (1u32, 64u32),  // fhb_SummedLongs: FSHD sums 64, not the block
+            (3, 7),         // fhb_HostID
+            (4, next_fshd), // fhb_Next
+            (8, *dostype),
+            (10, 0x180), // fhb_PatchFlags: patch dn_SegList + dn_GlobalVec
+            (18, *seglist),
+            (19, NO_BLOCK), // dn_GlobalVec: -1, as both reference disks write
+        ] {
+            put_long(&mut fshd, long as usize, value);
+        }
+        stamp_checksum_longs(&mut fshd, 64);
+        out.seek(SeekFrom::Start(u64::from(*fshd_blk) * SECTOR))?;
+        out.write_all(&fshd).context("writing an FSHD block")?;
+
+        for (n, chunk) in image.chunks(data_per_lseg).enumerate() {
+            let blk = seglist + n as u32;
+            let last = (n + 1) * data_per_lseg >= image.len();
+            let mut lseg = [0u8; 512];
+            lseg[0..4].copy_from_slice(b"LSEG");
+            // SummedLongs carries the payload length: bytes = longs * 4 - 20.
+            let longs = (20 + chunk.len()).div_ceil(4) as u32;
+            put_long(&mut lseg, 1, longs);
+            put_long(&mut lseg, 3, 7);
+            put_long(&mut lseg, 4, if last { NO_BLOCK } else { blk + 1 });
+            lseg[20..20 + chunk.len()].copy_from_slice(chunk);
+            stamp_checksum_longs(&mut lseg, longs as usize);
+            out.seek(SeekFrom::Start(u64::from(blk) * SECTOR))?;
+            out.write_all(&lseg).context("writing an LSEG block")?;
+        }
+    }
+
+    put_long(&mut rdsk, 8, first_fshd); // rdb_FileSysHeaderList
+    stamp_checksum(&mut rdsk);
+    out.seek(SeekFrom::Start(0))?;
+    out.write_all(&rdsk).context("rewriting the RDSK block")?;
+    out.flush()?;
+    Ok(())
+}
+
+/// Read a big-endian long by index, the way [`put_long`] writes one.
+fn get_long(buf: &[u8; 512], long: usize) -> u32 {
+    u32::from_be_bytes([
+        buf[long * 4],
+        buf[long * 4 + 1],
+        buf[long * 4 + 2],
+        buf[long * 4 + 3],
+    ])
 }
 
 #[cfg(test)]

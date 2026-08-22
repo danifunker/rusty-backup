@@ -214,8 +214,58 @@ impl RemoteSession {
         type_code: Option<String>,
         creator_code: Option<String>,
     ) -> Result<()> {
-        let meta = std::fs::metadata(host_file)
+        self.stage_upload_with_fork(
+            session,
+            dest_parent,
+            name,
+            host_file,
+            force,
+            type_code,
+            creator_code,
+            None,
+        )
+    }
+
+    /// As [`stage_upload`](Self::stage_upload), carrying a Mac **resource
+    /// fork** alongside the data fork.
+    ///
+    /// Classic Mac files keep most of what makes them work in the resource
+    /// fork — an application with only its data fork is inert — so a copy that
+    /// drops it is not a copy. The fork travels as a second chunk stream
+    /// immediately after the data fork's, announced by `resource_fork_size` on
+    /// the request so the daemon knows to read it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stage_upload_with_fork(
+        &mut self,
+        session: u64,
+        dest_parent: &str,
+        name: &str,
+        host_file: &Path,
+        force: bool,
+        type_code: Option<String>,
+        creator_code: Option<String>,
+        resource_fork: Option<&[u8]>,
+    ) -> Result<()> {
+        // Open BEFORE announcing the upload. `StageUpload` commits the daemon
+        // to reading a chunk stream, so any failure after that frame is on the
+        // wire desynchronises the connection: the daemon blocks on chunks that
+        // never arrive and then reads the next control frame as body bytes.
+        // The caller's error surfaces much later and somewhere else — the
+        // symptom is "reading daemon response: failed to fill whole buffer" on
+        // whatever request comes next, usually Apply.
+        let mut f = std::fs::File::open(host_file)
+            .with_context(|| format!("open {}", host_file.display()))?;
+        let meta = f
+            .metadata()
             .with_context(|| format!("stat {}", host_file.display()))?;
+        // Unix opens a directory happily and only fails at the read, so an
+        // `open` that succeeded is not proof the source is uploadable. Refuse
+        // it here, before the announcement, or the two platforms diverge:
+        // Windows fails above, Unix would fail mid-copy having already
+        // committed the daemon and staged a phantom empty edit.
+        if !meta.is_file() {
+            bail!("{} is not a regular file", host_file.display());
+        }
         let size = meta.len();
         write_control(
             &mut self.writer,
@@ -227,18 +277,42 @@ impl RemoteSession {
                 force,
                 type_code,
                 creator_code,
+                resource_fork_size: resource_fork.map(|r| r.len() as u64),
             },
         )?;
-        // The body follows immediately as a chunk stream.
-        let mut f = std::fs::File::open(host_file)
-            .with_context(|| format!("open {}", host_file.display()))?;
-        {
+        // The body follows immediately as a chunk stream. Past this point the
+        // stream MUST be terminated even on failure, or the desync above is
+        // back: a short read here is reported after `finish()`, not instead of
+        // it, so the daemon sees a well-formed (if truncated) upload and can
+        // answer.
+        let copied = {
             let mut cw = ChunkWriter::new(&mut self.writer);
-            std::io::copy(&mut f, &mut cw)
-                .with_context(|| format!("uploading {}", host_file.display()))?;
+            let copied = std::io::copy(&mut f, &mut cw);
             cw.finish()?;
-        }
-        self.expect_ok("StageUpload")
+            copied
+        };
+        // The resource fork's stream follows the data fork's, in the same
+        // commit-to-the-stream contract: once announced it is always
+        // terminated, even if writing it fails.
+        let forked = match resource_fork {
+            Some(fork) => {
+                let mut cw = ChunkWriter::new(&mut self.writer);
+                let wrote = std::io::copy(&mut &fork[..], &mut cw);
+                cw.finish()?;
+                wrote
+            }
+            None => Ok(0),
+        };
+        // Read the reply BEFORE reporting our own failure. The request is on
+        // the wire, so the daemon is going to answer whether or not our copy
+        // worked; returning early here leaves that reply unread and the
+        // connection one response behind — every later call then reads the
+        // previous call's answer, and the first visible symptom is a wrong
+        // reply type at Apply. Our error still wins if both went wrong.
+        let reply = self.expect_ok("StageUpload");
+        copied.with_context(|| format!("uploading {}", host_file.display()))?;
+        forked.with_context(|| format!("uploading resource fork of {name}"))?;
+        reply
     }
 
     /// Stage a directory creation under the session.

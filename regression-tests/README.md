@@ -163,9 +163,11 @@ cargo run --release -- consolidate
 Building rb-cli as part of the run is not optional: it is what makes the
 recorded git sha describe the binary rather than merely the checkout.
 
-**Status: tiers 0-2 only, 68 cases, one machine.** Tiers 3-7 have no case
-manifests and the case schema has no oracle step, so no third-party
-verification runs yet. `rb-regress plan` shows the shape it is heading for;
+**Status: tiers 0-3 and 5, 295 cases, zero known failures.** Third-party
+verification runs: `rb-regress verify` executes the oracle `check` lines in
+`data/oracles.toml`, and three oracles have each closed a finding — amitools
+`xdftool` (R-038), Kickstart 3.1 under FS-UAE (R-020), and IRIX 6.5 under Iris
+(R-039). `rb-regress plan` shows the shape it is heading for;
 RUNBOOK.md § The run/verify split explains the gap.
 
 ---

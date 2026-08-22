@@ -1,6 +1,6 @@
 # Runbook — how to run a regression
 
-Accurate as of commit `b87d688`. Everything below has been executed; nothing
+Accurate as of 2026-08-17 (`ff42319`). Everything below has been executed; nothing
 here is aspirational. Where a thing does not exist yet it says so plainly,
 because a runbook that describes unimplemented features is worse than no
 runbook.
@@ -9,12 +9,18 @@ runbook.
 
 ## What exists today, in one line
 
-`rb-regress run` executes **87 cases across tiers 0-2 on one machine**. That
+`rb-regress run` executes **295 cases across tiers 0-3 and 5** (tier 0: 38,
+tier 1: 26, tier 2: 94, tier 3: 112, tier 5: 22; tier 4 has no cases yet). That
 is rb-cli checked against itself and against reference fixtures.
 
-`rb-regress produce` builds **35 artifacts** and `rb-regress parity` compares
-them across producer OSes. Neither needs an oracle. **`verify` does not exist
-yet** — no third-party tool is invoked by anything. See § The run/verify split.
+`rb-regress produce` builds artifacts and `rb-regress parity` compares them
+across producer OSes. Neither needs an oracle.
+
+**`verify` exists and runs third-party tools.** `runner/src/verify.rs` walks the
+artifact tree, matches each format against the oracle registry, and executes the
+`check` line. Three oracles have returned real verdicts and each closed a
+finding: amitools `xdftool` (R-038), FS-UAE + Kickstart 3.1 (R-020), and IRIX
+6.5 under Iris (R-039). See § The run/verify split.
 
 ---
 
@@ -51,8 +57,10 @@ rb-regress fixtures --sync
 `--fixture-root <DIR>` overrides it for a one-off. Never point it at a share —
 see FIXTURES.md § Local first.
 
-Expect roughly: **87 cases, ~69 pass, ~18 fail**, under a minute. Every
-failure maps to a finding in `docs/Regression_Bugs.md` — none are unknown.
+Expect **295 cases, all passing**, in under a minute.
+`data/known-failures.toml` is **empty**: as of 2026-08-17 no regression defect
+is open (R-019 is an accepted won't-fix, R-011 waits on two fixture files), so
+any red is a genuine surprise rather than a known entry.
 
 ---
 
@@ -141,18 +149,23 @@ true by construction. Do not skip the build step.
 invoked by anything yet.**
 
 `run` executes cases. A case is a sequence of rb-cli invocations with
-assertions on exit codes, JSON envelope fields, and produced files. All 87
-current cases are tiers 0-2:
+assertions on exit codes, JSON envelope fields, and produced files. All 295
+current cases span tiers 0-3 and 5:
 
 - **tier 0** — rb-cli runs, exit codes and envelope shape hold
 - **tier 1** — rb-cli builds a volume and reads it back. A smoke test only;
   per `README.md`, this proves nothing about format correctness because a bug
   on both sides cancels out
 - **tier 2** — read third-party reference fixtures
+- **tier 3** — edit, resize and the subcommand sweep, including against real
+  third-party volumes
+- **tier 5** — backup / restore round-trips and container inputs
 
-Tiers 3-7 have **no case manifests**, and the case schema has **no oracle
-step** — there is no `[[case.oracle]]` block in `manifest.rs`. So nothing
-currently hands an artifact to `fsck.ext4`, `chdman` or a MiSTer core.
+Tier 4 has no cases yet. Tiers 6 and 7 do not use the case schema at all:
+oracles are declared in `data/oracles.toml` with a `check` line, and
+`rb-regress verify` executes them against the produced artifacts. Three have
+returned verdicts — amitools, FS-UAE and IRIX — and each closed a finding
+(R-038, R-020, R-039).
 
 ### How the split is designed to work
 
@@ -312,17 +325,17 @@ quieter blind spot.
 
 ## Known limitations, so nothing surprises you
 
-- **Only 11 of rb-cli's 54 verbs are invoked by anything.** Measured
-  2026-08-07; see [COMMAND-COVERAGE.md](COMMAND-COVERAGE.md). The big ones:
-  there is no backup->restore round-trip (`restore` appears once, as
-  `restore --help`), the entire edit surface is untested across ~20
-  filesystems, and `resize`/`shrink`/`grow`/`write`/`serve` are never run.
-- **Tiers 3-7 do not exist.** `--tiers 0-6` selects the same 87 cases as
-  `--tiers 0-2`. This is the structural cause of the line above: tiers 0-2 are
-  about reading and creating, and round-trips, edits, resizes and hardware all
-  live in the tiers that were never written.
-- **`verify` does not exist.** `produce` and `parity` do; nothing runs an
-  oracle.
+- **Verb coverage is no longer the headline gap.** The 2026-08-07 measurement
+  ("only 11 of 54 verbs invoked") is obsolete: tier 3 covers the edit surface
+  and resize, and tier 5 covers backup->restore round-trips.
+  [COMMAND-COVERAGE.md](COMMAND-COVERAGE.md) is the live figure. `serve` and
+  `write` remain genuinely uncovered — `serve` needs a daemon lifecycle the
+  case schema cannot drive (its integration tests live in
+  `tests/remote_filesystem.rs` instead), and `write` needs a hardware
+  allowlist that does not exist.
+- **Tier 4 has no cases**, and tiers 6-7 deliberately do not use the case
+  schema — oracles are declared in `data/oracles.toml` and executed by
+  `rb-regress verify`.
 - **20 builders have no produce recipe** and `fmt.vmdk-flat` cannot get one
   yet — monolithicFlat is a descriptor plus a sibling `-flat.vmdk` extent, and
   comparing the 301-byte descriptor alone would read as coverage. Multi-file

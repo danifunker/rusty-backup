@@ -254,6 +254,8 @@ pub struct InspectTab {
     /// Status of the background Human68k defragment (repack) worker. `None`
     /// when none is running.
     repack_status: Option<Arc<Mutex<rusty_backup::model::status::RepackStatus>>>,
+    /// Running 16-bit word-order swap started from this tab.
+    swab_status: Option<Arc<Mutex<rusty_backup::model::status::SwabStatus>>>,
     /// CHD info popup text. `Some` while the popup is open.
     chd_info_text: Option<String>,
     /// When the user opens a single-file-chd backup folder, the redirect
@@ -338,6 +340,7 @@ impl Default for InspectTab {
             floppy_convert_dialog: None,
             pending_repack: None,
             repack_status: None,
+            swab_status: None,
             chd_info_text: None,
             single_file_chd_backup_folder: None,
             physical_disk_export: PhysicalDiskExport::default(),
@@ -640,16 +643,8 @@ impl InspectTab {
         if !rusty_backup::os::is_elevated() {
             ui.add_space(2.0);
             ui.label(
-                egui::RichText::new(format!(
-                    "Note: physical devices need {}. Without it they may not be \
-                     listed, and Edit Mode will fail. Disk image files are unaffected.",
-                    if cfg!(windows) {
-                        "administrator privileges"
-                    } else {
-                        "root privileges (sudo)"
-                    }
-                ))
-                .color(egui::Color32::YELLOW),
+                egui::RichText::new(super::unelevated_device_note())
+                    .color(super::theme::warning(ui.visuals())),
             );
         }
 
@@ -720,6 +715,7 @@ impl InspectTab {
         self.poll_volume_label_probes(ctx);
         self.poll_chd_expand_status(ctx);
         self.poll_repack_status(ctx);
+        self.poll_swab_status(ctx);
 
         // Background workers (min-size + volume-label probes) finish off the
         // GUI thread; without an explicit repaint request egui only paints
@@ -727,7 +723,10 @@ impl InspectTab {
         // moves. Keep a short poll cadence while anything's pending, and
         // pulse one extra repaint on the frame after a label arrives so
         // the Grid re-measures the now-wider Type column.
-        if !self.pending_min_size_calcs.is_empty() || !self.pending_volume_label_probes.is_empty() {
+        if !self.pending_min_size_calcs.is_empty()
+            || !self.pending_volume_label_probes.is_empty()
+            || self.swab_status.is_some()
+        {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(80));
         }
@@ -1017,10 +1016,7 @@ impl InspectTab {
 
         // Show error if any
         if let Some(err) = &self.last_error {
-            ui.colored_label(
-                egui::Color32::from_rgb(255, 100, 100),
-                format!("Error: {err}"),
-            );
+            ui.colored_label(super::theme::danger(ui.visuals()), format!("Error: {err}"));
             ui.add_space(8.0);
         }
 
@@ -1971,7 +1967,7 @@ impl InspectTab {
                                  unrecognized filesystem regions — only smart-compact \
                                  areas of recognized partitions carry over.",
                             )
-                            .color(egui::Color32::from_rgb(220, 160, 70)),
+                            .color(super::theme::warning(ui.visuals())),
                         );
                     }
                     ui.add_space(8.0);
@@ -3278,8 +3274,12 @@ impl InspectTab {
                             fs_hint
                         ));
                     } else {
+                        let order = table
+                            .byte_order_name()
+                            .map(|o| format!(", {o} 16-bit word order"))
+                            .unwrap_or_default();
                         push_log(format!(
-                            "Detected {} partition table with {} partition(s)",
+                            "Detected {} partition table with {} partition(s){order}",
                             table.type_name(),
                             partitions.len()
                         ));
@@ -3675,15 +3675,17 @@ impl InspectTab {
 
     fn show_results(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext) {
         // Partition table type - extract info before mutable borrow
-        let (type_name, disk_sig, is_superfloppy) = if let Some(table) = &self.partition_table {
-            (
-                table.type_name().to_string(),
-                table.disk_signature(),
-                matches!(table, PartitionTable::None { .. }),
-            )
-        } else {
-            return;
-        };
+        let (type_name, byte_order, disk_sig, is_superfloppy) =
+            if let Some(table) = &self.partition_table {
+                (
+                    table.type_name().to_string(),
+                    table.byte_order_name(),
+                    table.disk_signature(),
+                    matches!(table, PartitionTable::None { .. }),
+                )
+            } else {
+                return;
+            };
 
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Partition Table:").strong());
@@ -3694,6 +3696,33 @@ impl InspectTab {
                 ui.label(format!("(disk signature: 0x{disk_sig:08X})"));
             }
         });
+
+        // Only tables that can be read in either orientation show this row;
+        // today that is the SGI disk label. See partition::byte_order_name.
+        let mut want_swab = false;
+        if let Some(order) = byte_order {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Word order:").strong());
+                ui.label(format!("{order} (16-bit words)"));
+                if self.swab_status.is_some() {
+                    ui.add(egui::Spinner::new());
+                    ui.label("Swapping...");
+                } else if ui
+                    .button("Swap Word Order...")
+                    .on_hover_text(
+                        "Write a copy of this image with the two bytes of every 16-bit word \
+                         exchanged, fixing a capture taken through a controller that reverses \
+                         words. The operation is its own inverse.",
+                    )
+                    .clicked()
+                {
+                    want_swab = true;
+                }
+            });
+        }
+        if want_swab {
+            self.start_swab(ctx);
+        }
 
         // Alignment info
         if let Some(alignment) = &self.alignment {
@@ -3878,22 +3907,29 @@ impl InspectTab {
                         .map(|s| s.to_string())
                         .unwrap_or_default();
                     if part.is_extended_container {
-                        ui.label(egui::RichText::new(index_label).color(egui::Color32::GRAY));
+                        ui.label(
+                            egui::RichText::new(index_label)
+                                .color(super::theme::muted(ui.visuals())),
+                        );
                         if has_slots {
                             ui.label(
-                                egui::RichText::new(slot_label.clone()).color(egui::Color32::GRAY),
+                                egui::RichText::new(slot_label.clone())
+                                    .color(super::theme::muted(ui.visuals())),
                             );
                         }
-                        ui.label(egui::RichText::new(&part.type_name).color(egui::Color32::GRAY));
+                        ui.label(
+                            egui::RichText::new(&part.type_name)
+                                .color(super::theme::muted(ui.visuals())),
+                        );
                         // Volume column — extended containers have no filesystem.
                         ui.label("");
                         ui.label(
                             egui::RichText::new(format!("{}", part.start_lba))
-                                .color(egui::Color32::GRAY),
+                                .color(super::theme::muted(ui.visuals())),
                         );
                         ui.label(
                             egui::RichText::new(partition::format_size(part.size_bytes))
-                                .color(egui::Color32::GRAY),
+                                .color(super::theme::muted(ui.visuals())),
                         );
                         if show_min_col {
                             if let Some(meta) = &self.backup_metadata {
@@ -3907,7 +3943,7 @@ impl InspectTab {
                                 if logical_sum > 0 {
                                     ui.label(
                                         egui::RichText::new(partition::format_size(logical_sum))
-                                            .color(egui::Color32::GRAY),
+                                            .color(super::theme::muted(ui.visuals())),
                                     );
                                 } else {
                                     ui.label("");
@@ -4214,7 +4250,7 @@ impl InspectTab {
                          holes left by deleted files.",
                     );
                     ui.colored_label(
-                        egui::Color32::from_rgb(220, 180, 80),
+                        super::theme::warning(ui.visuals()),
                         "The partition is rewritten in place. Back up the image first.",
                     );
                     ui.add_space(6.0);
@@ -4301,6 +4337,58 @@ impl InspectTab {
                 // Layout inside the partition changed; refresh the view.
                 self.run_inspect(ctx);
             }
+        }
+    }
+
+    /// Write a word-swapped copy of the loaded image. The transform is its own
+    /// inverse, so this both applies and undoes a controller's word swap.
+    fn start_swab(&mut self, ctx: &mut TabContext) {
+        let path = match &self.image_file_path {
+            Some(p) => p.clone(),
+            None => {
+                ctx.log
+                    .error("Word-order swap needs a loaded image file (not a device).");
+                return;
+            }
+        };
+        let default_name = path
+            .file_stem()
+            .map(|s| format!("{}-swab16.img", s.to_string_lossy()))
+            .unwrap_or_else(|| "swab16.img".to_string());
+        let dest = match super::file_dialog()
+            .set_file_name(default_name)
+            .add_filter("Disk image", &["img", "raw", "hd"])
+            .save_file()
+        {
+            Some(p) => p,
+            None => return,
+        };
+        if dest == path {
+            ctx.log
+                .error("Pick a different destination; `rb-cli swab16 --in-place` rewrites a file.");
+            return;
+        }
+        self.swab_status = Some(rusty_backup::model::swab_runner::spawn(path, Some(dest)));
+    }
+
+    /// Drain log lines from the word-swap worker and report completion.
+    fn poll_swab_status(&mut self, ctx: &mut TabContext) {
+        let arc = match &self.swab_status {
+            Some(s) => s.clone(),
+            None => return,
+        };
+        let Ok(mut status) = arc.lock() else { return };
+        for msg in status.log_messages.drain(..) {
+            ctx.log.info(msg);
+        }
+        if status.finished {
+            if let Some(err) = &status.error {
+                ctx.log.error(format!("Word-order swap failed: {err}"));
+            } else {
+                ctx.log.info("Word-order swap complete.");
+            }
+            drop(status);
+            self.swab_status = None;
         }
     }
 
@@ -4439,12 +4527,12 @@ impl InspectTab {
                 if let Some(result) = &self.fsck_result {
                     if result.is_clean() {
                         ui.colored_label(
-                            egui::Color32::from_rgb(100, 200, 100),
+                            super::theme::success(ui.visuals()),
                             "Filesystem is clean.",
                         );
                     } else {
                         ui.colored_label(
-                            egui::Color32::from_rgb(255, 100, 100),
+                            super::theme::danger(ui.visuals()),
                             format!("{} error(s) found.", result.errors.len()),
                         );
                     }
@@ -4471,7 +4559,7 @@ impl InspectTab {
                             .show(ui, |ui| {
                                 for issue in &result.errors {
                                     ui.colored_label(
-                                        egui::Color32::from_rgb(255, 100, 100),
+                                        super::theme::danger(ui.visuals()),
                                         format!("[{}] {}", issue.code, issue.message),
                                     );
                                 }
@@ -4495,12 +4583,12 @@ impl InspectTab {
                                 for issue in &visible_warnings {
                                     if issue.debug {
                                         ui.colored_label(
-                                            egui::Color32::from_rgb(150, 150, 150),
+                                            super::theme::muted(ui.visuals()),
                                             format!("[DEBUG] {}", issue.message),
                                         );
                                     } else {
                                         ui.colored_label(
-                                            egui::Color32::from_rgb(255, 200, 100),
+                                            super::theme::warning(ui.visuals()),
                                             format!("[{}] {}", issue.code, issue.message),
                                         );
                                     }
@@ -4526,7 +4614,7 @@ impl InspectTab {
                         if !report.fixes_applied.is_empty() {
                             for fix in &report.fixes_applied {
                                 ui.colored_label(
-                                    egui::Color32::from_rgb(100, 200, 100),
+                                    super::theme::success(ui.visuals()),
                                     format!("  {}", fix),
                                 );
                             }
@@ -4534,7 +4622,7 @@ impl InspectTab {
                         if !report.fixes_failed.is_empty() {
                             for fail in &report.fixes_failed {
                                 ui.colored_label(
-                                    egui::Color32::from_rgb(255, 100, 100),
+                                    super::theme::danger(ui.visuals()),
                                     format!("  {}", fail),
                                 );
                             }

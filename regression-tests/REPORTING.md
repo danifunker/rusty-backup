@@ -121,7 +121,11 @@ rather than claiming everything is new.
 ## In-emulator and on-hardware results
 
 Tier 7 results arrive out of band — a human runs an emulator, or a MiSTer
-reports back. Those land through a separate ingest step that appends to the
+reports back. Two tier-7 oracles now run **unattended** and should not be tagged `manual` —
+FS-UAE (`oracles/fsuae/affs_mount.py`) and Iris/IRIX (`iris-ci`), both of which
+return a machine-readable verdict through a host directory the guest writes
+into. Genuinely manual results still land through a separate ingest step that
+appends to the
 same `results.jsonl` with `"source": "manual"` or `"source": "mister"`, so
 the summary covers automated and human-verified cases in one sheet. See
 `EMULATORS.md`.

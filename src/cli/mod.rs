@@ -230,7 +230,8 @@ pub enum Command {
 
     /// Whole-disk aggregate read-only view (partition table + per-partition
     /// summary + CHD metadata when applicable). The `idx` column is the
-    /// selector: pass it back as `IMG@N`, `--partition N` or `--partitions N`.
+    /// selector: pass it back as `IMG@N`, `--partition N`, `--partitions N`,
+    /// or as the index argument to `partmap`.
     Inspect(verbs::inspect::InspectArgs),
 
     /// Run the network daemon so a remote `rb-cli` (or the GUI / TUI Commander)
@@ -279,6 +280,11 @@ pub enum Command {
 
     /// Re-encode one or more disk images into a chosen output format.
     Convert(verbs::convert::ConvertArgs),
+
+    /// Swap the two bytes of every 16-bit word in a disk image. Fixes up a
+    /// capture taken through a controller that reverses words (e.g. SGI IRIS
+    /// disks); the transform is its own inverse.
+    Swab16(verbs::swab16::Swab16Args),
 
     /// Apply a JSON-described sequence of FS operations to an image as
     /// one transaction-like batch.
@@ -508,6 +514,7 @@ pub fn dispatch(command: Command) -> Result<()> {
         Command::Menu(args) => verbs::menu::run(args),
         Command::Write(args) => verbs::write::run(args),
         Command::Convert(args) => verbs::convert::run(args),
+        Command::Swab16(args) => verbs::swab16::run(args),
         Command::Batch(args) => verbs::batch::run(args),
         Command::BatchTemplate(args) => verbs::batch_template::run(args),
         Command::Config { cmd } => verbs::config::run(cmd),

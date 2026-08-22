@@ -300,7 +300,7 @@ impl OpticalTab {
                     });
                 }
                 if let Some(err) = &self.add_remote_error {
-                    ui.colored_label(egui::Color32::from_rgb(255, 100, 100), err);
+                    ui.colored_label(super::theme::danger(ui.visuals()), err);
                 }
 
                 if !self.recent_daemons.is_empty() {
@@ -526,9 +526,9 @@ impl OpticalTab {
                     ));
                 }
             } else if let Some(err) = &self.disc_info_error {
-                ui.colored_label(egui::Color32::from_rgb(255, 100, 100), err);
+                ui.colored_label(super::theme::danger(ui.visuals()), err);
             } else {
-                ui.colored_label(egui::Color32::GRAY, "No source selected");
+                ui.colored_label(super::theme::muted(ui.visuals()), "No source selected");
             }
         });
 

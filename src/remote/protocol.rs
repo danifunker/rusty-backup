@@ -45,7 +45,11 @@ pub const RB_HELLO_MAGIC_BYTES: [u8; 4] = RB_HELLO_MAGIC.to_be_bytes();
 /// v3 typed the partition selector (`@N` / `@sN` / `@DH0`). Not additive: a v2
 /// peer reads it as a bare integer and would act on the wrong partition, so both
 /// ends now require an exact match and say which side to update.
-pub const PROTOCOL_VERSION: u16 = 3;
+/// Bumped to 4 for the resource fork on `StageUpload`: a fork-bearing upload
+/// puts a second chunk stream on the wire, and a v3 daemon would read it as
+/// control frames. The handshake compares versions for equality, so the
+/// mismatch is refused with a clear message instead of desyncing.
+pub const PROTOCOL_VERSION: u16 = 4;
 
 /// Default daemon port (mrext owns 8182; we take 7341). Configurable on both
 /// ends via `--bind` / an explicit `rb://host:PORT/...`.
@@ -112,6 +116,16 @@ pub enum Request {
         force: bool,
         type_code: Option<String>,
         creator_code: Option<String>,
+        /// Byte length of a Mac resource fork following the data fork, or
+        /// `None` for a data-only file.
+        ///
+        /// When set, **two** chunk streams follow this frame back to back: the
+        /// data fork, then the resource fork. Both are always terminated, so a
+        /// reader that knows about this field stays in sync either way — but a
+        /// reader that does *not* would stop after the first stream and take
+        /// the second for control frames, which is why v4 exists.
+        #[serde(default)]
+        resource_fork_size: Option<u64>,
     },
     /// Stage a directory creation.
     StageMkdir {

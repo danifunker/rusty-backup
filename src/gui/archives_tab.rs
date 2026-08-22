@@ -322,10 +322,7 @@ impl ArchivesTab {
         }
 
         if let Some(err) = &self.load_error {
-            ui.colored_label(
-                egui::Color32::from_rgb(200, 80, 80),
-                format!("Error: {err}"),
-            );
+            ui.colored_label(super::theme::danger(ui.visuals()), format!("Error: {err}"));
         }
 
         // Lift the mount-button hint out of the `&self.loaded` borrow

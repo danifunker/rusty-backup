@@ -330,7 +330,7 @@ Usage: backup [OPTIONS] <SOURCE> <DEST>
 
 **Arguments**
 
-- `<SOURCE>` — Source: an image file or a block-device path
+- `<SOURCE>` — Source: an image file or a block-device path. A container whose data does not start at offset 0 (CHD, dynamic VHD, QCOW2, sparse VMDK) is decoded to a scratch file in the destination first
 - `<DEST>` — Destination directory. The backup is written under `DEST/<name>/`. The directory is created if it doesn't exist
 
 **Options**
@@ -826,13 +826,13 @@ Usage: import [OPTIONS] <IMAGE> <DIR> [DEST]
 - `--force` — Overwrite entries that already exist at the destination. Mutually exclusive with `--skip-existing`
 - `--skip-existing` — Skip entries that already exist at the destination. Mutually exclusive with `--force`
 - `--no-permissions` — Ignore the host's Unix mode and ownership. Imported entries then inherit uid/gid from the directory they land in and take the filesystem's default mode, the same rule `put` follows
-- `--include-appledouble` — Import macOS AppleDouble sidecars (`._*`) too. By default they are skipped as Mac metadata cruft
+- `--include-appledouble` — Import macOS AppleDouble sidecars (`._*`) as files of their own, on top of the fork they already contribute. Off by default: on a fork-bearing target (HFS / HFS+ / MFS / ProDOS) a `._name` or `name.rsrc` sidecar is consumed into the resource fork of the file it belongs to, which is where it wanted to end up, and elsewhere it is skipped as Mac metadata cruft. Only an orphan with no primary file is ever dropped outright
 - `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zxplus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
 - `--carve-full` — Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga "NDOS" disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem
 
 ### `inspect`
 
-Whole-disk aggregate read-only view (partition table + per-partition summary + CHD metadata when applicable). The `idx` column is the selector: pass it back as `IMG@N`, `--partition N` or `--partitions N`
+Whole-disk aggregate read-only view (partition table + per-partition summary + CHD metadata when applicable). The `idx` column is the selector: pass it back as `IMG@N`, `--partition N`, `--partitions N`, or as the index argument to `partmap`
 
 ```
 Usage: inspect [OPTIONS] <IMAGE>
@@ -1030,6 +1030,7 @@ Usage: apm [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
 - `--size` — Total disk size (accepts `K`/`M`/`G` suffixes)
 - `--partition` — A partition, repeatable, in disk order: `SIZE[:TYPE[:NAME]]`. SIZE accepts `K`/`M`/`G`, or `rest` for the remaining space (once). TYPE is a value from `partmap types`; NAME is APM/GPT only
 - `--fill` — Pour an image into a partition as it is created: `N=PATH`, 1-based, repeatable. Any format the engine can read is decoded on the way in
+- `--filesystem` — Embed an Amiga filesystem handler in the RDB, `DOSTYPE=PATH`, repeatable. PATH is the handler's AmigaDOS load file (`L:SmartFilesystem`, `L:PFS3`). A DosType with no ROM handler needs this to mount unaided: the strap loads it from the RDB. RDB only
 - `--align` — Alignment for partition starts. Default 1 MiB; use 63s for DOS-era cylinder alignment on vintage machines
 - `--force` — Overwrite `image` if it already exists
 
@@ -1050,6 +1051,7 @@ Usage: atari [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
 - `--size` — Total disk size (accepts `K`/`M`/`G` suffixes)
 - `--partition` — A partition, repeatable, in disk order: `SIZE[:TYPE[:NAME]]`. SIZE accepts `K`/`M`/`G`, or `rest` for the remaining space (once). TYPE is a value from `partmap types`; NAME is APM/GPT only
 - `--fill` — Pour an image into a partition as it is created: `N=PATH`, 1-based, repeatable. Any format the engine can read is decoded on the way in
+- `--filesystem` — Embed an Amiga filesystem handler in the RDB, `DOSTYPE=PATH`, repeatable. PATH is the handler's AmigaDOS load file (`L:SmartFilesystem`, `L:PFS3`). A DosType with no ROM handler needs this to mount unaided: the strap loads it from the RDB. RDB only
 - `--align` — Alignment for partition starts. Default 1 MiB; use 63s for DOS-era cylinder alignment on vintage machines
 - `--force` — Overwrite `image` if it already exists
 
@@ -1070,6 +1072,7 @@ Usage: gpt [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
 - `--size` — Total disk size (accepts `K`/`M`/`G` suffixes)
 - `--partition` — A partition, repeatable, in disk order: `SIZE[:TYPE[:NAME]]`. SIZE accepts `K`/`M`/`G`, or `rest` for the remaining space (once). TYPE is a value from `partmap types`; NAME is APM/GPT only
 - `--fill` — Pour an image into a partition as it is created: `N=PATH`, 1-based, repeatable. Any format the engine can read is decoded on the way in
+- `--filesystem` — Embed an Amiga filesystem handler in the RDB, `DOSTYPE=PATH`, repeatable. PATH is the handler's AmigaDOS load file (`L:SmartFilesystem`, `L:PFS3`). A DosType with no ROM handler needs this to mount unaided: the strap loads it from the RDB. RDB only
 - `--align` — Alignment for partition starts. Default 1 MiB; use 63s for DOS-era cylinder alignment on vintage machines
 - `--force` — Overwrite `image` if it already exists
 
@@ -1090,6 +1093,7 @@ Usage: mbr [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
 - `--size` — Total disk size (accepts `K`/`M`/`G` suffixes)
 - `--partition` — A partition, repeatable, in disk order: `SIZE[:TYPE[:NAME]]`. SIZE accepts `K`/`M`/`G`, or `rest` for the remaining space (once). TYPE is a value from `partmap types`; NAME is APM/GPT only
 - `--fill` — Pour an image into a partition as it is created: `N=PATH`, 1-based, repeatable. Any format the engine can read is decoded on the way in
+- `--filesystem` — Embed an Amiga filesystem handler in the RDB, `DOSTYPE=PATH`, repeatable. PATH is the handler's AmigaDOS load file (`L:SmartFilesystem`, `L:PFS3`). A DosType with no ROM handler needs this to mount unaided: the strap loads it from the RDB. RDB only
 - `--align` — Alignment for partition starts. Default 1 MiB; use 63s for DOS-era cylinder alignment on vintage machines
 - `--force` — Overwrite `image` if it already exists
 
@@ -1110,6 +1114,7 @@ Usage: rdb [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
 - `--size` — Total disk size (accepts `K`/`M`/`G` suffixes)
 - `--partition` — A partition, repeatable, in disk order: `SIZE[:TYPE[:NAME]]`. SIZE accepts `K`/`M`/`G`, or `rest` for the remaining space (once). TYPE is a value from `partmap types`; NAME is APM/GPT only
 - `--fill` — Pour an image into a partition as it is created: `N=PATH`, 1-based, repeatable. Any format the engine can read is decoded on the way in
+- `--filesystem` — Embed an Amiga filesystem handler in the RDB, `DOSTYPE=PATH`, repeatable. PATH is the handler's AmigaDOS load file (`L:SmartFilesystem`, `L:PFS3`). A DosType with no ROM handler needs this to mount unaided: the strap loads it from the RDB. RDB only
 - `--align` — Alignment for partition starts. Default 1 MiB; use 63s for DOS-era cylinder alignment on vintage machines
 - `--force` — Overwrite `image` if it already exists
 - `--heads` — Disk geometry: heads. These tables place partitions on cylinder boundaries, so the geometry sets the default alignment
@@ -1132,6 +1137,7 @@ Usage: sgi [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
 - `--size` — Total disk size (accepts `K`/`M`/`G` suffixes)
 - `--partition` — A partition, repeatable, in disk order: `SIZE[:TYPE[:NAME]]`. SIZE accepts `K`/`M`/`G`, or `rest` for the remaining space (once). TYPE is a value from `partmap types`; NAME is APM/GPT only
 - `--fill` — Pour an image into a partition as it is created: `N=PATH`, 1-based, repeatable. Any format the engine can read is decoded on the way in
+- `--filesystem` — Embed an Amiga filesystem handler in the RDB, `DOSTYPE=PATH`, repeatable. PATH is the handler's AmigaDOS load file (`L:SmartFilesystem`, `L:PFS3`). A DosType with no ROM handler needs this to mount unaided: the strap loads it from the RDB. RDB only
 - `--align` — Alignment for partition starts. Default 1 MiB; use 63s for DOS-era cylinder alignment on vintage machines
 - `--force` — Overwrite `image` if it already exists
 - `--heads` — Disk geometry: heads. These tables place partitions on cylinder boundaries, so the geometry sets the default alignment
@@ -1182,6 +1188,7 @@ Usage: sun [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
 - `--size` — Total disk size (accepts `K`/`M`/`G` suffixes)
 - `--partition` — A partition, repeatable, in disk order: `SIZE[:TYPE[:NAME]]`. SIZE accepts `K`/`M`/`G`, or `rest` for the remaining space (once). TYPE is a value from `partmap types`; NAME is APM/GPT only
 - `--fill` — Pour an image into a partition as it is created: `N=PATH`, 1-based, repeatable. Any format the engine can read is decoded on the way in
+- `--filesystem` — Embed an Amiga filesystem handler in the RDB, `DOSTYPE=PATH`, repeatable. PATH is the handler's AmigaDOS load file (`L:SmartFilesystem`, `L:PFS3`). A DosType with no ROM handler needs this to mount unaided: the strap loads it from the RDB. RDB only
 - `--align` — Alignment for partition starts. Default 1 MiB; use 63s for DOS-era cylinder alignment on vintage machines
 - `--force` — Overwrite `image` if it already exists
 - `--heads` — Disk geometry: heads. These tables place partitions on cylinder boundaries, so the geometry sets the default alignment
@@ -1226,6 +1233,7 @@ Usage: x68k-table [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
 - `--size` — Total disk size (accepts `K`/`M`/`G` suffixes)
 - `--partition` — A partition, repeatable, in disk order: `SIZE[:TYPE[:NAME]]`. SIZE accepts `K`/`M`/`G`, or `rest` for the remaining space (once). TYPE is a value from `partmap types`; NAME is APM/GPT only
 - `--fill` — Pour an image into a partition as it is created: `N=PATH`, 1-based, repeatable. Any format the engine can read is decoded on the way in
+- `--filesystem` — Embed an Amiga filesystem handler in the RDB, `DOSTYPE=PATH`, repeatable. PATH is the handler's AmigaDOS load file (`L:SmartFilesystem`, `L:PFS3`). A DosType with no ROM handler needs this to mount unaided: the strap loads it from the RDB. RDB only
 - `--align` — Alignment for partition starts. Default 1 MiB; use 63s for DOS-era cylinder alignment on vintage machines
 - `--force` — Overwrite `image` if it already exists
 
@@ -1596,7 +1604,7 @@ Usage: resize --size <SIZE> <IMAGE> <INDEX>
 **Arguments**
 
 - `<IMAGE>` — 
-- `<INDEX>` — 1-based partition index
+- `<INDEX>` — Partition to act on: the 1-based `idx` column `inspect` prints, the same number `IMG@N` takes. Not the raw table slot (`@sN`)
 
 **Options**
 
@@ -1661,7 +1669,7 @@ Usage: put [OPTIONS] <IMAGE> [HOST_FILE] [DST]
 **Arguments**
 
 - `<IMAGE>` — Image reference (`path` or `path@N` for the 1-based partition index)
-- `<HOST_FILE>` — Host file to copy. Required when not using `--zero` or `--boot`
+- `<HOST_FILE>` — Host file to copy. Required when not using `--zero` or `--boot`. On a filesystem that stores resource forks (HFS / HFS+ / MFS / ProDOS) the fork is picked up from whichever host container carries it — a macOS native fork, a `._name` / `name.rsrc` sidecar beside the file, or a whole-file `.bin` MacBinary / `.hqx` BinHex wrapper, whose data fork is unwrapped so the container is not written verbatim. Finder type/creator ride along unless `--type` / `--creator` say otherwise
 - `<DST>` — Destination path inside the filesystem (cp-like positional). A literal `/` in the name is written `\/`; on HFS / HFS+ a `:`-separated path also works (so `/` is plain data)
 
 **Options**
@@ -2018,7 +2026,7 @@ Usage: put [OPTIONS] <IMAGE> [HOST_FILE] [DST]
 **Arguments**
 
 - `<IMAGE>` — Image reference (`path` or `path@N` for the 1-based partition index)
-- `<HOST_FILE>` — Host file to copy. Required when not using `--zero` or `--boot`
+- `<HOST_FILE>` — Host file to copy. Required when not using `--zero` or `--boot`. On a filesystem that stores resource forks (HFS / HFS+ / MFS / ProDOS) the fork is picked up from whichever host container carries it — a macOS native fork, a `._name` / `name.rsrc` sidecar beside the file, or a whole-file `.bin` MacBinary / `.hqx` BinHex wrapper, whose data fork is unwrapped so the container is not written verbatim. Finder type/creator ride along unless `--type` / `--creator` say otherwise
 - `<DST>` — Destination path inside the filesystem (cp-like positional). A literal `/` in the name is written `\/`; on HFS / HFS+ a `:`-separated path also works (so `/` is plain data)
 
 **Options**
@@ -2077,6 +2085,24 @@ Usage: verify <IMAGE>
 **Arguments**
 
 - `<IMAGE>` — Image reference (`path` or `path@N`)
+
+### `swab16`
+
+Swap the two bytes of every 16-bit word in a disk image. Fixes up a capture taken through a controller that reverses words (e.g. SGI IRIS disks); the transform is its own inverse
+
+```
+Usage: swab16 [OPTIONS] <INPUT> [OUTPUT]
+```
+
+**Arguments**
+
+- `<INPUT>` — Image to convert
+- `<OUTPUT>` — Destination image. Omit when passing `--in-place`
+
+**Options**
+
+- `--in-place` — Rewrite INPUT itself instead of writing a separate OUTPUT
+- `--force` — Overwrite OUTPUT when it already exists
 
 ### `tar`
 

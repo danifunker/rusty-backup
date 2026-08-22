@@ -24,6 +24,9 @@ pub mod dragondos;
 pub mod efs;
 pub mod efs_fsck;
 pub mod efs_resize;
+pub mod efs_v1;
+pub mod efs_v1_fsck;
+pub mod efs_v1_resize;
 pub mod entry;
 pub mod exfat;
 pub mod exfat_clone;
@@ -185,6 +188,7 @@ pub fn resize_filesystem_for(
     pfs3::resize_pfs3_in_place(file, partition_offset, new_size_bytes, log_cb)?;
     affs::resize_affs_in_place(file, partition_offset, new_size_bytes, log_cb)?;
     efs_resize::resize_efs_in_place(file, partition_offset, new_size_bytes, log_cb)?;
+    efs_v1_resize::resize_efs_v1_in_place(file, partition_offset, new_size_bytes, log_cb)?;
     qdos::resize_qdos_in_place(file, partition_offset, new_size_bytes, log_cb)?;
     prodos::resize_prodos_in_place(file, partition_offset, new_size_bytes, log_cb)?;
     Ok(())
@@ -216,7 +220,8 @@ pub enum InPlaceResize {
 /// magic at the partition offset — they arrive with an RDB type string, which
 /// [`in_place_resize_support`] checks separately.
 const IN_PLACE_RESIZABLE: &[&str] = &[
-    "fat", "ntfs", "exfat", "hfs", "hfsplus", "ext", "btrfs", "efs", "qdos", "affs", "prodos",
+    "fat", "ntfs", "exfat", "hfs", "hfsplus", "ext", "btrfs", "efs", "efs_v1", "qdos", "affs",
+    "prodos",
 ];
 
 /// Classify the filesystem at `partition_offset` for in-place resizing.
@@ -262,6 +267,7 @@ fn fs_display_name(detected: &str) -> &'static str {
         "ext" => "ext2/3/4",
         "btrfs" => "btrfs",
         "efs" => "SGI EFS",
+        "efs_v1" => "SGI EFS v1",
         "qdos" => "QDOS",
         "affs" => "AFFS",
         "prodos" => "ProDOS",
@@ -432,6 +438,13 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
                 return "efs";
             }
         }
+    }
+
+    // Same sector, different filesystem: the original SGI EFS (IRIS 2000 /
+    // 3000) puts `fs_magic` 0x041755 at offset 0x26 instead, and the image
+    // may be byte-swapped, so the probe tries both orders.
+    if efs_v1::detect(reader, partition_offset).is_some() {
+        return "efs_v1";
     }
 
     // Sector 0 again: AmigaDOS "DOS\x" boot block (variants 0..7).
@@ -1243,6 +1256,7 @@ pub fn fs_name_for(partition_type: u8, partition_type_string: Option<&str>) -> &
         // SGI synthetic type bytes (PartitionTable::Sgi).
         0xA0 => "XFS",
         0xA1 => "SGI EFS",
+        0xA2 => "SGI EFS v1",
         // Minix (0x81) and old Minix (0x80).
         0x80 | 0x81 => "Minix",
         _ => "unknown",
@@ -1357,8 +1371,9 @@ pub fn is_expensive_minimum(partition_type: u8, partition_type_string: Option<&s
         }
         return matches!(s, "Apple_HFS" | "Apple_HFSX" | "Apple_UNIX_SVR2" | "Linux");
     }
-    // 0xA1 (SGI EFS): conservative floor requires an inode-table walk.
-    matches!(partition_type, 0xAF | 0x83 | 0xA8 | 0xA1)
+    // 0xA1 (SGI EFS) and 0xA2 (SGI EFS v1): the conservative floor requires
+    // an inode-table walk.
+    matches!(partition_type, 0xAF | 0x83 | 0xA8 | 0xA1 | 0xA2)
 }
 
 /// Compute the minimum size for a partition, optionally gated behind an
@@ -1533,21 +1548,72 @@ pub fn open_filesystem<R: Read + Seek + Send + 'static>(
     )
 }
 
+/// Like [`open_filesystem`], but tells the driver how long the partition is.
+///
+/// Most filesystems record their own size and ignore this. AFFS does not — its
+/// root block sits at the volume's midpoint, so a driver handed a whole-disk
+/// reader infers the midpoint of the *disk* and fails on any partition that is
+/// not last (R-042). Callers that have a partition table should prefer this;
+/// `None` is the honest answer for a bare image, where the reader's end really
+/// is the volume's end.
+pub fn open_filesystem_sized<R: Read + Seek + Send + 'static>(
+    reader: R,
+    partition_offset: u64,
+    partition_size: Option<u64>,
+    partition_type: u8,
+    partition_type_string: Option<&str>,
+) -> Result<Box<dyn Filesystem>, FilesystemError> {
+    open_filesystem_full(
+        reader,
+        partition_offset,
+        partition_size,
+        partition_type,
+        partition_type_string,
+        None,
+    )
+}
+
 /// Like [`open_filesystem`], but carries an optional filesystem-level
 /// `passphrase` for volumes that encrypt their own contents (APFS FileVault).
 /// The passphrase is ignored by every filesystem that isn't encrypted; on an
 /// encrypted APFS volume, `None` opens it locked (browse then reports
 /// "passphrase required") and a wrong passphrase is an error.
 pub fn open_filesystem_with_passphrase<R: Read + Seek + Send + 'static>(
+    reader: R,
+    partition_offset: u64,
+    partition_type: u8,
+    partition_type_string: Option<&str>,
+    passphrase: Option<&str>,
+) -> Result<Box<dyn Filesystem>, FilesystemError> {
+    open_filesystem_full(
+        reader,
+        partition_offset,
+        None,
+        partition_type,
+        partition_type_string,
+        passphrase,
+    )
+}
+
+/// The dispatch every other opener delegates to. `partition_size` is threaded
+/// to the drivers that cannot derive it themselves; see [`open_filesystem_sized`].
+pub fn open_filesystem_full<R: Read + Seek + Send + 'static>(
     mut reader: R,
     partition_offset: u64,
+    partition_size: Option<u64>,
     partition_type: u8,
     partition_type_string: Option<&str>,
     passphrase: Option<&str>,
 ) -> Result<Box<dyn Filesystem>, FilesystemError> {
     // Check string-based type first (APM partitions)
     if let Some(type_str) = partition_type_string {
-        return open_filesystem_by_string(reader, partition_offset, type_str, passphrase);
+        return open_filesystem_by_string(
+            reader,
+            partition_offset,
+            partition_size,
+            type_str,
+            passphrase,
+        );
     }
     match partition_type {
         // Auto-detect (superfloppy / type byte 0)
@@ -1666,6 +1732,10 @@ pub fn open_filesystem_with_passphrase<R: Read + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "efs_v1" => Ok(Box::new(efs_v1::EfsV1Filesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 "minix" => Ok(Box::new(minix::MinixFilesystem::open(
                     reader,
                     partition_offset,
@@ -1682,9 +1752,10 @@ pub fn open_filesystem_with_passphrase<R: Read + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
-                "affs" => Ok(Box::new(affs::AffsFilesystem::open(
+                "affs" => Ok(Box::new(affs::AffsFilesystem::open_sized(
                     reader,
                     partition_offset,
+                    partition_size,
                 )?)),
                 "apfs" => Ok(Box::new(apfs::ApfsFilesystem::open_with_passphrase(
                     reader,
@@ -1803,6 +1874,11 @@ pub fn open_filesystem_with_passphrase<R: Read + Seek + Send + 'static>(
         )?)),
         // SGI EFS — synthetic type byte emitted by PartitionTable::Sgi.
         0xA1 => Ok(Box::new(efs::EfsFilesystem::open(
+            reader,
+            partition_offset,
+        )?)),
+        // SGI EFS v1 — synthetic byte from PartitionTable::SgiDkLabel.
+        0xA2 => Ok(Box::new(efs_v1::EfsV1Filesystem::open(
             reader,
             partition_offset,
         )?)),
@@ -1962,9 +2038,10 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                 )?));
             }
             s if is_amiga_dos_type(s) => {
-                return Ok(Box::new(affs::AffsFilesystem::open(
+                return Ok(Box::new(affs::AffsFilesystem::open_sized(
                     reader,
                     partition_offset,
+                    partition_len,
                 )?));
             }
             s if is_amiga_pfs3_type(s) => {
@@ -2136,6 +2213,10 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "efs_v1" => Ok(Box::new(efs_v1::EfsV1Filesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 "minix" => Ok(Box::new(minix::MinixFilesystem::open(
                     reader,
                     partition_offset,
@@ -2152,9 +2233,10 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
-                "affs" => Ok(Box::new(affs::AffsFilesystem::open(
+                "affs" => Ok(Box::new(affs::AffsFilesystem::open_sized(
                     reader,
                     partition_offset,
+                    partition_len,
                 )?)),
                 "xfs" => Ok(Box::new(xfs::XfsFilesystem::open(
                     reader,
@@ -2292,6 +2374,11 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
             reader,
             partition_offset,
         )?)),
+        // SGI EFS v1 — synthetic type byte emitted by PartitionTable::SgiDkLabel.
+        0xA2 => Ok(Box::new(efs_v1::EfsV1Filesystem::open(
+            reader,
+            partition_offset,
+        )?)),
         // SGI XFS — synthetic type byte emitted by PartitionTable::Sgi.
         0xA0 => Ok(Box::new(xfs::XfsFilesystem::open(
             reader,
@@ -2340,6 +2427,7 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
 fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
     mut reader: R,
     partition_offset: u64,
+    partition_size: Option<u64>,
     type_str: &str,
     passphrase: Option<&str>,
 ) -> Result<Box<dyn Filesystem>, FilesystemError> {
@@ -2404,9 +2492,10 @@ fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
         // AmigaDOS Fast/Original File System — DosType DOS\0..DOS\7. PFS and
         // SFS share the same string convention via RDB but route to other
         // modules (Phase 5/7); we only claim the DOS\ prefix here.
-        s if is_amiga_dos_type(s) => Ok(Box::new(affs::AffsFilesystem::open(
+        s if is_amiga_dos_type(s) => Ok(Box::new(affs::AffsFilesystem::open_sized(
             reader,
             partition_offset,
+            partition_size,
         )?)),
         // PFS3 family — `PFS\3`, `PDS\3`, `muFS`. Read-only browse +
         // backup (Phase 5); editing arrives in Phase 6.
@@ -2699,6 +2788,7 @@ pub fn is_browsable_type(ptype: u8) -> bool {
             | 0x83
             | 0xA0
             | 0xA1
+            | 0xA2
             | 0xA8
             | 0xAF
     )

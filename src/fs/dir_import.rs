@@ -267,6 +267,16 @@ fn host_overrides(meta: &std::fs::Metadata, _apply: bool) -> AttrOverrides {
     }
 }
 
+/// `comps` with its last element replaced — the Mac name a whole-file container
+/// records, in place of the host's `Foo.bin` / `Foo.hqx` wrapper name.
+fn rename_leaf(comps: &[String], leaf: &str) -> Vec<String> {
+    let mut out = comps.to_vec();
+    if let Some(last) = out.last_mut() {
+        *last = leaf.to_string();
+    }
+    out
+}
+
 fn overrides_for(host: &Path, apply: bool) -> AttrOverrides {
     match host.symlink_metadata() {
         Ok(m) => host_overrides(&m, apply),
@@ -307,6 +317,9 @@ fn import_dir_inner(
 ) -> Result<ImportStats> {
     let entries = walk(root)?;
     let mut sink = Importer::new(dest);
+    // Rejoining forks is only meaningful where the target can store one; on FAT
+    // a `._name` sidecar stays the cruft `skip_appledouble` already drops.
+    let mac_forks_wanted = crate::fs::copy::Capabilities::infer(efs.fs_type()).resource_forks;
 
     for e in entries {
         let display = e.host.display().to_string();
@@ -343,15 +356,65 @@ fn import_dir_inner(
                         continue;
                     }
                 }
-                let mut f = File::open(&e.host).with_context(|| format!("opening {display}"))?;
-                sink.push(
-                    efs,
-                    &e.comps,
-                    ImportItem::File { size, data: &mut f },
-                    &overrides,
-                    &opts.shared,
-                    &display,
-                )?;
+                // A Mac file in a host folder is one file in up to two pieces:
+                // a data fork plus a `._name` / `.rsrc` sidecar, or a single
+                // `.bin` / `.hqx` wrapper holding both. Rejoin them here, where
+                // the host paths are, so the volume gets one forked file
+                // instead of a fork-less file and a stray sidecar (R-040).
+                // `--include-appledouble` asks for the sidecars as files as
+                // well, so it keeps them; the fork still reaches the primary.
+                if mac_forks_wanted
+                    && opts.shared.skip_appledouble
+                    && crate::fs::resource_fork::is_resource_fork_sidecar(&e.host)
+                {
+                    sink.stats.appledouble_skipped += 1;
+                    progress(&sink.stats);
+                    continue;
+                }
+                let fork = mac_forks_wanted
+                    .then(|| crate::fs::resource_fork::detect_resource_fork(&e.host))
+                    .flatten();
+                // A wrapper's own bytes are not the file: use the data fork it
+                // carries, under the Mac name it records.
+                let unwrapped = fork.as_ref().and_then(|i| i.data_fork.clone());
+                let comps = match (&unwrapped, fork.as_ref().and_then(|i| i.name.as_deref())) {
+                    (Some(_), Some(mac_name)) => rename_leaf(&e.comps, mac_name),
+                    _ => e.comps.clone(),
+                };
+                match unwrapped {
+                    Some(df) => {
+                        let len = df.len() as u64;
+                        let mut cursor = std::io::Cursor::new(df);
+                        sink.push(
+                            efs,
+                            &comps,
+                            ImportItem::File {
+                                size: len,
+                                data: &mut cursor,
+                                mac_fork: fork.as_ref(),
+                            },
+                            &overrides,
+                            &opts.shared,
+                            &display,
+                        )?;
+                    }
+                    None => {
+                        let mut f =
+                            File::open(&e.host).with_context(|| format!("opening {display}"))?;
+                        sink.push(
+                            efs,
+                            &comps,
+                            ImportItem::File {
+                                size,
+                                data: &mut f,
+                                mac_fork: fork.as_ref(),
+                            },
+                            &overrides,
+                            &opts.shared,
+                            &display,
+                        )?;
+                    }
+                }
             }
             HostKind::Other => {
                 sink.push(

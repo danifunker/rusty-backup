@@ -283,9 +283,10 @@ impl BrowseSession {
         if &magic == b"MComprHD" {
             let chd_reader = ChdReader::open(path)
                 .map_err(|e| FilesystemError::Parse(format!("failed to open CHD: {e}")))?;
-            return fs::open_filesystem(
+            return fs::open_filesystem_sized(
                 chd_reader,
                 self.partition_offset,
+                self.partition_size,
                 self.partition_type,
                 self.partition_type_string.as_deref(),
             );
@@ -298,9 +299,10 @@ impl BrowseSession {
             let pw = self.password.as_deref().map(|s| s.as_bytes());
             let gho_reader = crate::rbformats::gho::GhoReader::open_with_password(path, pw)
                 .map_err(|e| FilesystemError::Parse(format!("failed to open GHO: {e:#}")))?;
-            return fs::open_filesystem(
+            return fs::open_filesystem_sized(
                 gho_reader,
                 self.partition_offset,
+                self.partition_size,
                 self.partition_type,
                 self.partition_type_string.as_deref(),
             );
@@ -313,9 +315,10 @@ impl BrowseSession {
                 let pw = self.password.as_deref().map(|s| s.as_bytes());
                 let imz_reader = crate::rbformats::imz::ImzReader::open_with_password(path, pw)
                     .map_err(|e| FilesystemError::Parse(format!("failed to open IMZ: {e:#}")))?;
-                return fs::open_filesystem(
+                return fs::open_filesystem_sized(
                     imz_reader,
                     self.partition_offset,
+                    self.partition_size,
                     self.partition_type,
                     self.partition_type_string.as_deref(),
                 );
@@ -336,9 +339,10 @@ impl BrowseSession {
                 } else {
                     self.partition_offset
                 };
-                return fs::open_filesystem(
+                return fs::open_filesystem_sized(
                     reader,
                     effective_offset,
+                    self.partition_size,
                     self.partition_type,
                     self.partition_type_string.as_deref(),
                 );
@@ -357,9 +361,10 @@ impl BrowseSession {
             } else {
                 self.partition_offset
             };
-            return fs::open_filesystem(
+            return fs::open_filesystem_sized(
                 reader,
                 effective_offset,
+                self.partition_size,
                 self.partition_type,
                 self.partition_type_string.as_deref(),
             );
@@ -376,9 +381,10 @@ impl BrowseSession {
             } else {
                 self.partition_offset
             };
-            return fs::open_filesystem(
+            return fs::open_filesystem_sized(
                 reader,
                 effective_offset,
+                self.partition_size,
                 self.partition_type,
                 self.partition_type_string.as_deref(),
             );
@@ -398,9 +404,10 @@ impl BrowseSession {
             } else {
                 self.partition_offset
             };
-            return fs::open_filesystem(
+            return fs::open_filesystem_sized(
                 reader,
                 effective_offset,
+                self.partition_size,
                 self.partition_type,
                 self.partition_type_string.as_deref(),
             );
@@ -430,9 +437,10 @@ impl BrowseSession {
                         )));
                     }
                 };
-                return fs::open_filesystem(
+                return fs::open_filesystem_sized(
                     decoder,
                     self.partition_offset,
+                    self.partition_size,
                     self.partition_type,
                     self.partition_type_string.as_deref(),
                 );
@@ -456,9 +464,10 @@ impl BrowseSession {
                 }
                 std::io::Seek::seek(&mut tmp, std::io::SeekFrom::Start(0))
                     .map_err(FilesystemError::Io)?;
-                return fs::open_filesystem(
+                return fs::open_filesystem_sized(
                     tmp,
                     self.partition_offset,
+                    self.partition_size,
                     self.partition_type,
                     self.partition_type_string.as_deref(),
                 );
@@ -483,9 +492,10 @@ impl BrowseSession {
                 }
                 std::io::Seek::seek(&mut tmp, std::io::SeekFrom::Start(0))
                     .map_err(FilesystemError::Io)?;
-                return fs::open_filesystem(
+                return fs::open_filesystem_sized(
                     tmp,
                     self.partition_offset,
+                    self.partition_size,
                     self.partition_type,
                     self.partition_type_string.as_deref(),
                 );

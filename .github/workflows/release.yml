@@ -594,13 +594,14 @@ jobs:
 
           ls -lh "$OUTPATH"
 
-      - name: Smoke-test AppImage elevation path
-        # Catches the regression where relaunch_with_elevation() hands pkexec
-        # the user-private FUSE-mounted binary (/tmp/.mount_*/...) instead of
-        # the .AppImage file itself — pkexec then fails with "Permission
-        # denied" before the GUI loads. We install a fake pkexec that records
-        # its argv, run the AppImage as a non-root user, and assert pkexec
-        # was invoked with the .AppImage path (not a FUSE mount path).
+      - name: Smoke-test AppImage launches unprivileged
+        # The GUI must start WITHOUT elevating: image-file work needs no root,
+        # so pkexec is only invoked by the top-bar "Unlock Physical Devices"
+        # button. We install a fake pkexec that records its argv, run the
+        # AppImage as a non-root user, and assert it was never called while the
+        # app still got past the startup privilege decision. The companion
+        # guard for the $APPIMAGE-vs-FUSE-path bug is the unit test
+        # `elevation_target_prefers_appimage_over_fuse_mount` in os/linux.rs.
         # arm64 jobs run on Ubuntu hosts but inside the same Arch container.
         if: matrix.arch == 'x64'
         run: |
@@ -608,8 +609,8 @@ jobs:
           APPIMAGE_PATH="$PWD/dist/Rusty-Backup-linux-${{ matrix.arch }}-${VERSION}.AppImage"
           test -x "$APPIMAGE_PATH"
 
-          # Fake pkexec: log argv to a world-readable file, exit non-zero so
-          # the AppImage falls through to running unprivileged.
+          # Fake pkexec: log argv to a world-readable file, exit non-zero so a
+          # regression that still elevates falls through to running unprivileged.
           LOG=/tmp/pkexec-argv.log
           : > "$LOG" && chmod 666 "$LOG"
           cat > /usr/local/bin/pkexec <<EOF
@@ -619,7 +620,7 @@ jobs:
           EOF
           chmod 755 /usr/local/bin/pkexec
 
-          # Run AppImage as an unprivileged user so the elevation path triggers.
+          # Run the AppImage as an unprivileged user, the way a user launches it.
           useradd -m -s /bin/bash smoketest || true
           chown smoketest:smoketest "$APPIMAGE_PATH"
           runuser -u smoketest -- timeout 10 "$APPIMAGE_PATH" > smoke.out 2>&1 || true
@@ -629,16 +630,19 @@ jobs:
           echo "--- pkexec argv log ---"
           cat "$LOG" || true
 
-          if ! grep -qE '\.AppImage( |$)' "$LOG"; then
-            echo "FAIL: pkexec was not invoked with the .AppImage path"
-            echo "Likely regression: relaunch_with_elevation() is using current_exe() instead of \$APPIMAGE"
+          if [ -s "$LOG" ]; then
+            echo "FAIL: pkexec was invoked at startup"
+            echo "Regression: the Linux GUI must launch unprivileged and elevate"
+            echo "only when the user clicks the top-bar elevation button."
             exit 1
           fi
-          if grep -qE '/tmp/\.mount_[^ ]+/(usr/)?bin/rusty-backup' "$LOG"; then
-            echo "FAIL: pkexec received a FUSE-mounted path — this is the original bug"
+          if ! grep -q "Running unprivileged" smoke.out; then
+            echo "FAIL: the app never reached the startup privilege decision"
+            echo "(no 'Running unprivileged' line), so the empty pkexec log"
+            echo "proves nothing - the binary likely died earlier."
             exit 1
           fi
-          echo "PASS: pkexec received the .AppImage path"
+          echo "PASS: launched unprivileged, pkexec untouched"
 
           rm -f /usr/local/bin/pkexec
 

@@ -126,9 +126,9 @@ fn check_mode(
     )?;
     fs_override.apply(&mut ctx);
     log_stderr(&ctx.label);
-    let mut fs =
-        crate::fs::open_filesystem(file, ctx.offset, ctx.type_byte, ctx.type_string.as_deref())
-            .map_err(|e| anyhow!("opening filesystem: {e}"))?;
+    let mut fs = ctx
+        .open_ro(file, None)
+        .map_err(|e| anyhow!("opening filesystem: {e}"))?;
 
     let report = match fs.fsck() {
         Some(r) => r.map_err(|e| anyhow!("fsck: {e}"))?,

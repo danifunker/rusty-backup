@@ -129,3 +129,65 @@ args = [
 ]
 expect_exit = 1
 stderr_contains = ["no HFS filesystem"]
+
+# --- F-007: recursion, finally testable -------------------------------------
+# `--path DIR --recursive` shipped with F-001 and was never verified, because
+# every optical fixture in the corpus was flat — `optical.iso9660.joliet.cd`
+# holds one file and no directories at all, which makes it a clean single-file
+# test and a useless recursion test.
+#
+# `optical.hfs.opentransport.cd` has a real tree: `/Install 1` holds both files
+# and a subdirectory (`Open Transport Files`), so the flag has something to
+# descend into and the two modes give different answers.
+#
+# The count line goes to STDERR, not stdout — `extract` keeps stdout clean for
+# data. Checking stdout silently matches nothing and the case fails with no
+# visible difference between expected and actual.
+#
+# The counts are exact on purpose. "Recursive found more" would pass if
+# recursion silently degraded from a subtree to one extra file; pinning 10 and
+# 30 against a sha256-pinned fixture says precisely what each mode covers, and
+# a change in either direction is worth a failure.
+
+[[case]]
+id = "optical.extract.path-dir-stops-at-one-level"
+description = "F-007: --path DIR without --recursive extracts that directory's own entries and does not descend"
+fixture = "optical.hfs.opentransport.cd"
+timeout_ms = 300000
+[[case.step]]
+args = [
+  "optical", "extract", "{fixture}",
+  "--to", "{scratch}/flat",
+  "--path", "/Install 1",
+]
+expect_exit = 0
+stderr_contains = ["extracted 10 entry/entries"]
+
+[[case]]
+id = "optical.extract.path-dir-recursive-descends"
+description = "F-007: the same path with --recursive pulls the nested subtree too — 30 entries against the same disc"
+fixture = "optical.hfs.opentransport.cd"
+timeout_ms = 300000
+[[case.step]]
+args = [
+  "optical", "extract", "{fixture}",
+  "--to", "{scratch}/rec",
+  "--path", "/Install 1",
+  "--recursive",
+]
+expect_exit = 0
+stderr_contains = ["extracted 30 entry/entries"]
+
+[[case]]
+id = "optical.extract.nested-dir-addressable-directly"
+description = "F-007: the subdirectory that recursion reaches can also be named on its own, so the tree is genuinely navigable and not a flattening artifact"
+fixture = "optical.hfs.opentransport.cd"
+timeout_ms = 300000
+[[case.step]]
+args = [
+  "optical", "extract", "{fixture}",
+  "--to", "{scratch}/nested",
+  "--path", "/Install 1/Open Transport Files",
+]
+expect_exit = 0
+stderr_contains = ["extracted 20 entry/entries"]

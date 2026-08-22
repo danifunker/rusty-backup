@@ -21,7 +21,7 @@ use std::io::{Read, Seek, SeekFrom};
 
 /// `AI` plus the format generation, at `e_ident[8..11]` — the padding bytes an
 /// ELF leaves free. This is how the AppImage tooling itself identifies one.
-const APPIMAGE_MAGIC: [u8; 2] = [b'A', b'I'];
+const APPIMAGE_MAGIC: [u8; 2] = *b"AI";
 
 /// Which generation of AppImage a file is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

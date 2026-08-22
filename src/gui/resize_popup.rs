@@ -321,7 +321,7 @@ impl ResizePopup {
                 if self.is_device {
                     ui.group(|ui| {
                         ui.colored_label(
-                            egui::Color32::RED,
+                            super::theme::danger(ui.visuals()),
                             "WARNING: This will directly modify the physical device. Data loss is permanent and irreversible!",
                         );
                         ui.checkbox(
@@ -380,18 +380,18 @@ impl ResizePopup {
                         for entry in &mut self.entries {
                             if entry.is_extended_container {
                                 // Show grayed out, not editable
-                                ui.colored_label(egui::Color32::GRAY, format!("{}", entry.index));
+                                ui.colored_label(super::theme::muted(ui.visuals()), format!("{}", entry.index));
                                 ui.colored_label(
-                                    egui::Color32::GRAY,
+                                    super::theme::muted(ui.visuals()),
                                     format!("{} (extended)", entry.type_name),
                                 );
                                 ui.colored_label(
-                                    egui::Color32::GRAY,
+                                    super::theme::muted(ui.visuals()),
                                     partition::format_size(entry.original_size),
                                 );
-                                ui.colored_label(egui::Color32::GRAY, "—");
-                                ui.colored_label(egui::Color32::GRAY, "—");
-                                ui.colored_label(egui::Color32::GRAY, "—");
+                                ui.colored_label(super::theme::muted(ui.visuals()), "—");
+                                ui.colored_label(super::theme::muted(ui.visuals()), "—");
+                                ui.colored_label(super::theme::muted(ui.visuals()), "—");
                                 ui.end_row();
                                 continue;
                             }
@@ -458,7 +458,7 @@ impl ResizePopup {
 
                 // Preview / error
                 if let Some(err) = &self.plan_error {
-                    ui.colored_label(egui::Color32::RED, format!("Error: {err}"));
+                    ui.colored_label(super::theme::danger(ui.visuals()), format!("Error: {err}"));
                 }
 
                 if let Some(preview) = &self.preview {

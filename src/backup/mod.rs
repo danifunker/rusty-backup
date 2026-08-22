@@ -435,6 +435,40 @@ pub fn run_backup_from(
                 LogLevel::Info,
                 "Requesting device access (you may be prompted for administrator credentials)...",
             );
+            // A container whose data does not begin at offset 0 — CHD, dynamic
+            // VHD, QCOW2, sparse VMDK — has to be decoded before the engine
+            // sees it, or the raw file bytes get read as though they were the
+            // disk. Decode it once to a scratch file and run the ordinary
+            // local pipeline on that, exactly as the remote arm below does for
+            // the same reason: two engine paths (single-file CHD output and
+            // the defrag-clone) are typed on a concrete `File`. See F-008.
+            if let Some(kind) = container_needing_decode(&path) {
+                log(
+                    &progress,
+                    LogLevel::Info,
+                    format!(
+                        "Source is a {kind} container; decoding it to a scratch \
+                         file before backing it up..."
+                    ),
+                );
+                let (file, guard, temp_path) = materialize_container_to_temp(
+                    &path,
+                    &config.destination_dir,
+                    &config.backup_name,
+                    &progress,
+                )?;
+                let display = path.display().to_string();
+                return run_backup_inner(
+                    &SourceFactory::Local {
+                        file,
+                        _guard: guard,
+                        path: temp_path,
+                    },
+                    display,
+                    config,
+                    progress,
+                );
+            }
             let elevated = crate::os::open_source_for_reading(&path)
                 .with_context(|| format!("cannot open source: {}", path.display()))?;
             if let Some(tmp) = elevated.temp_path() {
@@ -546,6 +580,106 @@ pub fn run_backup_from(
     };
 
     run_backup_inner(&factory, source_display, config, progress)
+}
+
+/// Name the container wrapping `path`, or `None` when the bytes on disk are
+/// already the disk (raw images, block devices).
+///
+/// `backup` used to read every source as flat bytes, so anything whose data
+/// did not begin at offset 0 failed — CHD, dynamic VHD, QCOW2, sparse VMDK —
+/// while `inspect` read all four. That asymmetry was F-008.
+///
+/// Two things this must not do. It must not touch a **block device**: probing
+/// `\\.\PhysicalDrive0` opens it without the elevation prompt the real path
+/// performs, and reports a length of zero. And it must not decode a **raw**
+/// image, which would copy the whole disk to a scratch file for nothing. Hence
+/// the `is_file` gate first and the `Raw` check last.
+fn container_needing_decode(path: &std::path::Path) -> Option<&'static str> {
+    if !path.is_file() {
+        return None; // a device, or nothing we can stat — leave it alone
+    }
+    if crate::model::source_reader::is_container_path(path) {
+        return Some("wrapped");
+    }
+    let file = File::open(path).ok()?;
+    let format = crate::rbformats::detect_image_format_with_path(file, Some(path)).ok()?;
+    match format {
+        crate::rbformats::ImageFormat::Raw => None,
+        crate::rbformats::ImageFormat::VhdDynamic { .. } => Some("dynamic VHD"),
+        crate::rbformats::ImageFormat::Qcow2 { .. } => Some("QCOW2"),
+        crate::rbformats::ImageFormat::VmdkSparse { .. } => Some("sparse VMDK"),
+        crate::rbformats::ImageFormat::VmdkFlat { .. } => Some("flat VMDK"),
+        _ => Some("wrapped"),
+    }
+}
+
+/// Decode a container source to a local scratch file, so the ordinary local
+/// pipeline runs on the disk the container holds rather than on the container.
+///
+/// A decoded copy rather than a streaming adapter for the same reason the
+/// remote path makes one: single-file CHD output and the defrag-clone read
+/// through a concrete `File` with positioned reads. Writing the temp also
+/// makes `total_size()` the *virtual* size for free, which matters beyond
+/// this function — `metadata.source_size_bytes` is what `restore` later reads
+/// back to size its target, so recording a QCOW2's compressed length there
+/// would mis-size every restore from that backup.
+fn materialize_container_to_temp(
+    src: &std::path::Path,
+    dest_dir: &std::path::Path,
+    backup_name: &str,
+    progress: &Arc<Mutex<BackupProgress>>,
+) -> Result<(File, crate::os::TempFileGuard, PathBuf)> {
+    let mut reader = crate::model::source_reader::open_peeled_read(src, None)
+        .with_context(|| format!("cannot decode container {}", src.display()))?;
+    let total = reader.seek(std::io::SeekFrom::End(0)).unwrap_or(0);
+    reader
+        .seek(std::io::SeekFrom::Start(0))
+        .context("rewinding the decoded container")?;
+
+    std::fs::create_dir_all(dest_dir).ok();
+    let temp_path = dest_dir.join(format!(".{backup_name}.container-decode.tmp"));
+    // Guard before the first write, so a failure or cancel mid-decode still
+    // removes the partial scratch file.
+    let guard = crate::os::TempFileGuard::deleting(temp_path.clone());
+
+    set_operation(progress, "Decoding container...");
+    log(
+        progress,
+        LogLevel::Info,
+        format!(
+            "Decoding {} to a scratch file ({})...",
+            partition::format_size(total),
+            temp_path.display()
+        ),
+    );
+
+    {
+        let out = File::create(&temp_path)
+            .with_context(|| format!("creating scratch file {}", temp_path.display()))?;
+        let mut writer = std::io::BufWriter::new(out);
+        let mut buf = vec![0u8; 4 * 1024 * 1024];
+        let mut done: u64 = 0;
+        loop {
+            let n = reader.read(&mut buf).context("reading the container")?;
+            if n == 0 {
+                break;
+            }
+            std::io::Write::write_all(&mut writer, &buf[..n])
+                .context("writing the scratch file")?;
+            done += n as u64;
+            set_progress_bytes(progress, done, total.max(done));
+        }
+        std::io::Write::flush(&mut writer).context("flushing the scratch file")?;
+    }
+
+    let file = File::open(&temp_path)
+        .with_context(|| format!("reopening scratch file {}", temp_path.display()))?;
+    log(
+        progress,
+        LogLevel::Info,
+        "Container decoded; building the backup from the decoded image...",
+    );
+    Ok((file, guard, temp_path))
 }
 
 /// Stream a whole remote source (image or device) to a local scratch file so
@@ -976,6 +1110,21 @@ fn run_backup_inner(
                 "Exported Sun disk label (sun.json) — partition data backup not yet supported",
             );
             bail!("backing up Sun-labeled disks is not yet supported (browse only)");
+        }
+        PartitionTable::SgiDkLabel(label) => {
+            // Same sidecar shape as the Sun label: record the slot layout in
+            // sgi_dklabel.json and defer the per-slot data backup. Browse /
+            // inspect / extract already work through the EFS v1 reader.
+            let json = serde_json::to_string_pretty(label)
+                .context("failed to serialize SGI disk label to JSON")?;
+            std::fs::write(backup_folder.join("sgi_dklabel.json"), json)
+                .context("failed to write sgi_dklabel.json")?;
+            log(
+                &progress,
+                LogLevel::Info,
+                "Exported SGI disk label (sgi_dklabel.json) — partition data backup not yet supported",
+            );
+            bail!("backing up SGI-disk-label disks is not yet supported (browse only)");
         }
         PartitionTable::Ahdi(table) => {
             // Mirror the RDB / SGI sidecar shape: emit ahdi.json so a future

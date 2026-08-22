@@ -103,3 +103,65 @@ iris-ci scratch read ./mkfs-reference.img
 Reference geometry on the 64 MB scratch: `blocks=131064 inodes=18696
 sectors=128 cgfsize=21838 cgalign=1 ialign=1 ncg=6 firstcg=34 cgisize=779
 bitmap blocks=32`.
+
+## Validating an SGI volume header (F-006 step 1)
+
+`rb-cli new hd sgi-efs` writes an SGI volume header, and until 2026-08-15 the
+verb printed "real IRIX fx/prtvtoc validation is unverified without
+hardware/emulator". It is verified now, and the method is cheap enough to
+repeat whenever the header code changes.
+
+**Do not transfer the whole disk image.** `iris-ci put` of a 64 MB image stages
+it through the scratch device and then copies it guest-side, which took longer
+than the 120 s command timeout and left the shell blocked. The label is 512
+bytes and is all the check needs:
+
+```
+head -c 512 sgihd.img > our-vh.bin          # on the host
+iris-ci scratch write ./our-vh.bin           # lands at payload = device sector 8
+iris-ci run "dd if=/dev/rdsk/dks0d2s0 of=/dev/rdsk/dks0d2vh bs=512 count=1"
+iris-ci run "prtvtoc /dev/rdsk/dks0d2vh"
+```
+
+The `dd` shifts the label from the payload start back to sector 0, where a
+volume header belongs.
+
+For the stricter tool, `fx` is menu-driven and its input must be *piped*, not
+redirected — `< /dev/null` swallows the script and leaves it sitting at a
+prompt:
+
+```
+iris-ci run "printf 'label
+show
+all
+..
+..
+exi
+' | fx -x 'dksc(0,2,0)'"
+```
+
+Size the image to whole cylinders that fit the device: the builder rounds
+*up*, so 65540K yields 132048 sectors and overshoots the 131080-sector scratch;
+65520K yields 130 cylinders / 131040 sectors and fits.
+
+**Result, 2026-08-15.** `fx` 6.5 opens the drive, passes selftest and prints
+our partitions, bootinfo and geometry without complaint. `prtvtoc` agrees
+field for field. The directory section is empty, which is correct for what we
+write and is exactly the gap a bootable disc has to fill:
+
+```
+----- partitions-----
+  0: efs        5040 + 126000         2 + 62
+  8: volhdr        0 + 5040           0 + 2
+ 10: volume        0 + 131040         0 + 64
+----- bootinfo-----
+ root partition = 0     swap partition = 0    bootfile = /unix
+----- directory entries-----
+```
+
+Two limits on that claim. `fx` *read* the label; nothing here tests fx
+rewriting one, or the kernel mounting the filesystem from it (only the 512-byte
+label was written to the device, not the EFS behind it). And the label declares
+130 cylinders while the drive reports 131 — `fx` did not object, but a bootable
+disk should match the drive exactly, so the rounding wants revisiting before
+step 2.

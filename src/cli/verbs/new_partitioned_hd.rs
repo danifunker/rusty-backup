@@ -89,6 +89,13 @@ pub struct PartitionedHdArgs {
     #[arg(long = "fill", value_name = "N=PATH")]
     pub fills: Vec<String>,
 
+    /// Embed an Amiga filesystem handler in the RDB, `DOSTYPE=PATH`,
+    /// repeatable. PATH is the handler's AmigaDOS load file (`L:SmartFilesystem`,
+    /// `L:PFS3`). A DosType with no ROM handler needs this to mount unaided:
+    /// the strap loads it from the RDB. RDB only.
+    #[arg(long = "filesystem", value_name = "DOSTYPE=PATH")]
+    pub filesystems: Vec<String>,
+
     /// Alignment for partition starts. Default 1 MiB; use 63s for
     /// DOS-era cylinder alignment on vintage machines.
     #[arg(long, default_value = "1M")]
@@ -176,6 +183,26 @@ pub fn run(cmd: PartitionedHdCommand) -> Result<()> {
     provision_runner::run_worker(&req, Arc::clone(&status))
         .with_context(|| format!("building {}", args.image.display()))?;
 
+    // After the table, because the FSHD chain lands past the PART blocks the
+    // provisioner has just laid down.
+    let handlers = parse_filesystems(&args.filesystems, kind)?;
+    if !handlers.is_empty() {
+        let mut img = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&args.image)
+            .with_context(|| format!("reopening {}", args.image.display()))?;
+        provision::write_rdb_filesystems(&mut img, &handlers)
+            .context("embedding filesystem handlers in the RDB")?;
+        for (dostype, image) in &handlers {
+            log_stderr(format!(
+                "embedded {} handler ({}) in the RDB FileSystemHeader chain",
+                crate::partition::rdb::format_dos_type(*dostype),
+                format_size(image.len() as u64),
+            ));
+        }
+    }
+
     log_stderr(format!(
         "created {} ({} {}, {} partition(s))",
         args.image.display(),
@@ -218,6 +245,49 @@ fn parse_spec(s: &str) -> Result<PartSpec> {
         type_text,
         name,
     })
+}
+
+/// Turn `--filesystem DOSTYPE=PATH` arguments into `(dostype, load-file)` pairs.
+/// Keyed by DosType rather than partition, because one `FSHD` serves every
+/// partition carrying that type — which is how a real multi-filesystem RDB is
+/// laid out.
+fn parse_filesystems(specs: &[String], kind: TableKind) -> Result<Vec<(u32, Vec<u8>)>> {
+    if specs.is_empty() {
+        return Ok(Vec::new());
+    }
+    if kind != TableKind::Rdb {
+        bail!(
+            "--filesystem is an Amiga RDB feature; this table is {}",
+            kind.label()
+        );
+    }
+    let mut out = Vec::new();
+    let mut seen = Vec::new();
+    for spec in specs {
+        let (type_text, path) = spec
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("--filesystem wants DOSTYPE=PATH, got '{spec}'"))?;
+        let dostype = crate::partition::rdb::parse_dos_type(type_text).ok_or_else(|| {
+            anyhow::anyhow!(
+                "bad Amiga DosType '{type_text}' in --filesystem (try `partmap types --table rdb`)"
+            )
+        })?;
+        if seen.contains(&dostype) {
+            bail!("--filesystem names DosType '{type_text}' more than once");
+        }
+        let image =
+            std::fs::read(path).with_context(|| format!("reading filesystem handler {path}"))?;
+        // An AmigaDOS load file starts with HUNK_HEADER; anything else would
+        // be loaded as code by the strap and hang the machine rather than fail.
+        if image.get(..4) != Some(&[0x00, 0x00, 0x03, 0xF3]) {
+            bail!(
+                "{path} is not an AmigaDOS load file (no HUNK_HEADER);                  --filesystem wants the handler binary, e.g. L:SmartFilesystem"
+            );
+        }
+        seen.push(dostype);
+        out.push((dostype, image));
+    }
+    Ok(out)
 }
 
 /// Turn `--fill N=PATH` arguments into a per-partition source slot list.

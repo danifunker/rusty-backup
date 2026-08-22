@@ -68,7 +68,9 @@ impl From<ChecksumKind> for ChecksumType {
 
 #[derive(Debug, Args)]
 pub struct BackupArgs {
-    /// Source: an image file or a block-device path.
+    /// Source: an image file or a block-device path. A container whose data
+    /// does not start at offset 0 (CHD, dynamic VHD, QCOW2, sparse VMDK) is
+    /// decoded to a scratch file in the destination first.
     pub source: PathBuf,
 
     /// Destination directory. The backup is written under

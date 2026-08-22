@@ -209,14 +209,11 @@ impl ExpandHfsDialog {
                         });
                     } else if let Some(err) = error {
                         ui.colored_label(
-                            egui::Color32::from_rgb(255, 100, 100),
+                            super::theme::danger(ui.visuals()),
                             format!("Failed: {err}"),
                         );
                     } else {
-                        ui.colored_label(
-                            egui::Color32::from_rgb(100, 200, 100),
-                            "Expand complete.",
-                        );
+                        ui.colored_label(super::theme::success(ui.visuals()), "Expand complete.");
                     }
                     if !msgs.is_empty() {
                         egui::ScrollArea::vertical()

@@ -546,7 +546,7 @@ is the human-editable form and the JSON is generated from it.
 | `\\NAS\share` | yes | Richest source. `VintageSystemBackups`, `Old DOS and Windows Stuff`, `Old Mac Stuff`, `SGI-IRIX`, `BlueSCSI Images`, `Operating Systems`, `Recovery Disks`, `winworld-pc`, `SampleFixtures`. |
 | `\\NAS\games` | yes | `Amiga`, `Emulators`, `ROMs`, `HardwareGames`, `Backups`. |
 | `C:\Temp` | yes | Working scratch with a lot of real material already (`.hdf`, `.iso`, `.cue/.bin`, ClassicMacHDDs, BlueSCSI-v2). |
-| MiSTer `/media/fat/games` | host up | `mister.local`. SSH refuses public-key auth; needs a key installed or the documented password channel. Blocked on that. |
+| MiSTer `/media/fat/games` | host up | `mister.local`, reachable over SSH with a dedicated key; host / user / identity live in the gitignored `local.toml`. (The "refuses public-key auth, blocked" note was resolved 2026-08-02.) |
 
 ## Missing fixtures
 

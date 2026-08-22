@@ -351,13 +351,9 @@ fn show_fs_info(image: ImageRef, format: OutputFormat) -> Result<()> {
     let (reader, ctx) =
         crate::cli::resolve::resolve_partition_streaming(&image.path, image.partition)?;
     log_stderr(&ctx.label);
-    let fs = crate::fs::open_filesystem(
-        reader,
-        ctx.offset,
-        ctx.type_byte,
-        ctx.type_string.as_deref(),
-    )
-    .map_err(|e| anyhow::anyhow!("opening filesystem: {e}"))?;
+    let fs = ctx
+        .open_ro(reader, None)
+        .map_err(|e| anyhow::anyhow!("opening filesystem: {e}"))?;
 
     let volume_name = fs.volume_label().map(|s| s.to_string());
     let filesystem = fs.fs_type().to_string();

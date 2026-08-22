@@ -16,7 +16,7 @@ Settled 2026-08-01, at the outset:
 |----------|--------|-----|
 | Runner implementation | Standalone **Rust crate** (`regression-tests/runner`) | One codebase for all platforms, single static binary with no runtime deps on the test host, and it can ride the existing mrustc 1.73 path to the vintage / PPC targets later. Rejected: Python (absent on 10.7 / PPC), per-platform shell scripts (two codebases that drift). |
 | Case definition | Declarative **TOML manifests** under `cases/`, referencing fixtures by **logical ID** | Keeps the matrix as data, not code. Lets the repo describe thousands of cases without committing a single fixture path. |
-| Emulator verification | **Tiered** — automate what is scriptable, generate a manual checklist for the rest | MiSTer (SSH) and headless QEMU/MAME can assert automatically; WinUAE / Basilisk II / 86Box cannot, so they get a per-run checklist with screenshot slots. |
+| Emulator verification | **Tiered** — automate what is scriptable, generate a manual checklist for the rest | MiSTer (SSH), FS-UAE, Iris/IRIX and headless QEMU/MAME can assert automatically — FS-UAE and Iris via a host directory the guest writes its verdict into, no screen scraping; Basilisk II / 86Box cannot, so they get a per-run checklist with screenshot slots. |
 | Hardware backup/restore | **Design now, execute later** | Cases and safety interlocks get authored and committed; execution stays gated behind `--allow-hardware` plus a gitignored device allowlist until scratch media is set aside. |
 | Bug reporting | **Report bundle on the NAS**, no automatic GitHub issues | A first full run may surface hundreds of failures. Triage from the summary, promote to issues by hand. |
 | Fixture hosting | A working copy on local disk (`fixture_root`), synced once from a distribution source (`corpus_source`) | Both live in gitignored `local.toml`. Fixtures and their paths never enter git; see FIXTURES.md § Local first. |
@@ -227,7 +227,10 @@ rusty-backup writes. Full plan in `VERIFICATION-MATRIX.md`.
 - [ ] Tool-presence probing, degrading to `skip-tool`
 - [ ] `fsck_msdos` / `fsck_exfat` / `fsck.ext4` / `xfs_repair` cross-checks
 - [ ] `chdman info` / `qemu-img check` / `7z t` / `unsquashfs -s` / `xorriso` / `cpmtools`
-- [ ] Record oracle disagreements as findings even when our own fsck is clean
+- [x] Record oracle disagreements as findings even when our own fsck is clean —
+      R-038 and R-039 are both exactly this. R-039 is the sharper case: our own
+      fsck was clean because the formatter and the checker shared the same
+      inverted bit order, and only IRIX's fsck disagreed
 
 ---
 
@@ -244,6 +247,12 @@ rusty-backup writes. Full plan in `VERIFICATION-MATRIX.md`.
 ## Phase 9 — Tier 7, emulator verification
 
 - [x] MiSTer SSH access working (key-based, config in `local.toml`)
+- [x] **FS-UAE + Kickstart 3.1, automated** (`oracles/fsuae/affs_mount.py`) —
+      host directory as the verdict channel, no screen scraping. Closed R-020
+      2026-08-14; controlled against noise so it demonstrably discriminates
+- [x] **Iris / IRIX 6.5, automated** (`iris-ci`, `oracles/iris/README.md`) —
+      found R-039 2026-08-13, confirmed the fix 08-15, and validated the SGI
+      volume header against `fx` / `prtvtoc` (F-006 step 1)
 - [ ] MiSTer over SSH: deploy, launch core, capture result (automated)
 - [ ] Headless QEMU with serial-log assertion (automated)
 - [ ] MAME / chdman-backed cores (automated where a scriptable exit exists)

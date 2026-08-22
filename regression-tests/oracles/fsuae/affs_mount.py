@@ -133,6 +133,13 @@ def write_probe(system: Path) -> None:
     seq.write_bytes(PROBE.replace("\r\n", "\n").encode("ascii"))
 
 
+# Both defaults below are repo-relative, and `verify` runs a check with the
+# *artifact's* directory as cwd — so run from there they resolved inside
+# artifacts/<os>/<format>/ and the script built its boot volume into the
+# artifact tree. Anchor them to the repo instead, which is four levels up from
+# this file (regression-tests/oracles/fsuae/affs_mount.py).
+REPO = Path(__file__).resolve().parents[3]
+
 def build_boot_dir(workdir: Path, wb_fixture: Path) -> Path:
     """Unpack the Workbench fixture to a host directory and add the probe.
 
@@ -226,12 +233,18 @@ def parse_verdict(info: str) -> Tuple[str, str]:
 def run(args) -> int:
     fs_uae = find_fs_uae()
     if not fs_uae:
-        print("fs-uae not found (PATH or %LOCALAPPDATA%/Programs/FS-UAE)", file=sys.stderr)
-        return 2
+        print(
+            "unavailable: fs-uae not found (PATH or %LOCALAPPDATA%/Programs/FS-UAE)",
+            file=sys.stderr,
+        )
+        return 77
     kickstart = find_kickstart()
     if not kickstart:
-        print("no Kickstart 3.1 ROM under ~/Documents/FS-UAE/Kickstarts", file=sys.stderr)
-        return 2
+        print(
+            "unavailable: no Kickstart 3.1 ROM under ~/Documents/FS-UAE/Kickstarts",
+            file=sys.stderr,
+        )
+        return 77
 
     workdir = Path(args.workdir).resolve()
     workdir.mkdir(parents=True, exist_ok=True)
@@ -287,7 +300,7 @@ def run(args) -> int:
             "not a verdict on the volume",
             file=sys.stderr,
         )
-        return 3
+        return 99
 
     info = (results / "info.txt").read_text(errors="replace") if (results / "info.txt").is_file() else ""
     listing = (
@@ -316,10 +329,10 @@ def main() -> int:
     ap.add_argument("image", help="the AFFS volume to put in front of AmigaOS")
     ap.add_argument(
         "--workbench",
-        default="regression-tests/fixtures/fs.affs.workbench13.hd.hdf",
+        default=str(REPO / "regression-tests/fixtures/fs.affs.workbench13.hd.hdf"),
         help="bootable Workbench fixture, unpacked to a host dir for DH0",
     )
-    ap.add_argument("--workdir", default="regression-tests/scratch/fsuae")
+    ap.add_argument("--workdir", default=str(REPO / "regression-tests/scratch/fsuae"))
     ap.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
     return run(ap.parse_args())
 

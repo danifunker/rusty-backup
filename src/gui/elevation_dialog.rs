@@ -16,7 +16,7 @@ impl ElevationDialog {
             return action;
         }
 
-        egui::Window::new("Elevated Privileges Required")
+        egui::Window::new("Unlock Physical Devices")
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -27,17 +27,20 @@ impl ElevationDialog {
                     ui.add_space(10.0);
                     ui.label(
                         egui::RichText::new("Warning")
-                            .color(egui::Color32::YELLOW)
+                            .color(super::theme::warning(ui.visuals()))
                             .size(24.0),
                     );
                     ui.add_space(10.0);
                 });
 
-                ui.label("Rusty Backup needs elevated privileges to access disk devices.");
+                ui.label("Physical disk devices can only be opened by root.");
                 ui.add_space(10.0);
-                ui.label("The application will restart with administrator access.");
+                ui.label("Rusty Backup will restart with root privileges via pkexec,");
+                ui.label("and you will be prompted for your password.");
                 ui.add_space(10.0);
-                ui.label("You will be prompted to enter your password.");
+                ui.label("Disk image files do not need this - they work unprivileged.");
+                ui.add_space(10.0);
+                ui.label("Any unsaved changes will be lost on restart.");
 
                 ui.add_space(20.0);
                 ui.separator();
@@ -51,7 +54,7 @@ impl ElevationDialog {
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
-                            .button(egui::RichText::new("Restart with Admin Access").strong())
+                            .button(egui::RichText::new("Restart as Root").strong())
                             .clicked()
                         {
                             action = ElevationAction::Elevate;

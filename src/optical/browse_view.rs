@@ -368,11 +368,11 @@ impl OpticalDiscBrowseView {
         self.render_tree_popup(ui);
 
         if let Some(err) = &self.error {
-            ui.colored_label(egui::Color32::from_rgb(255, 100, 100), err);
+            ui.colored_label(crate::theme::danger(ui.visuals()), err);
         }
 
         if let Some(ref msg) = self.extraction_result {
-            ui.colored_label(egui::Color32::from_rgb(100, 200, 100), msg);
+            ui.colored_label(crate::theme::success(ui.visuals()), msg);
         }
 
         ui.separator();
@@ -729,7 +729,10 @@ impl OpticalDiscBrowseView {
 
         match &self.selected_entry {
             None => {
-                ui.colored_label(egui::Color32::GRAY, "Select a file to view its contents.");
+                ui.colored_label(
+                    crate::theme::muted(ui.visuals()),
+                    "Select a file to view its contents.",
+                );
             }
             Some(entry) => {
                 let entry = entry.clone();

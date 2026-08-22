@@ -15,7 +15,7 @@
 <dt><code>&lt;IMAGE&gt;</code></dt>
 <dd>Image reference (`path` or `path@N` for the 1-based partition index)</dd>
 <dt><code>&lt;HOST_FILE&gt;</code></dt>
-<dd>Host file to copy. Required when not using `--zero` or `--boot`</dd>
+<dd>Host file to copy. Required when not using `--zero` or `--boot`. On a filesystem that stores resource forks (HFS / HFS+ / MFS / ProDOS) the fork is picked up from whichever host container carries it — a macOS native fork, a `._name` / `name.rsrc` sidecar beside the file, or a whole-file `.bin` MacBinary / `.hqx` BinHex wrapper, whose data fork is unwrapped so the container is not written verbatim. Finder type/creator ride along unless `--type` / `--creator` say otherwise</dd>
 <dt><code>&lt;DST&gt;</code></dt>
 <dd>Destination path inside the filesystem (cp-like positional). A literal `/` in the name is written `\/`; on HFS / HFS+ a `:`-separated path also works (so `/` is plain data)</dd>
 </dl>

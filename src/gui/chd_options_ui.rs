@@ -162,7 +162,7 @@ pub fn show(
             ui.label(format!("(unit {unit} bytes)"));
             if !opts.hunk_size.is_multiple_of(unit) {
                 ui.colored_label(
-                    egui::Color32::from_rgb(220, 80, 80),
+                    super::theme::danger(ui.visuals()),
                     format!("hunk must be a multiple of {unit}"),
                 );
             }

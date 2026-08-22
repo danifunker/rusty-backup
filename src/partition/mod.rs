@@ -9,6 +9,7 @@ pub mod provision;
 pub mod rdb;
 pub mod resize;
 pub mod sgi;
+pub mod sgi_dklabel;
 pub mod sgi_hdd_builder;
 pub mod sun;
 pub mod type_catalog;
@@ -25,6 +26,7 @@ use gpt::Gpt;
 use mbr::Mbr;
 use rdb::{Rdb, RDSK_SIGNATURE};
 use sgi::{SgiVolumeHeader, SGI_TYPE_BYTE_EFS, SGI_TYPE_BYTE_XFS, SGI_VOLHDR_MAGIC};
+use sgi_dklabel::SgiDiskLabel;
 use sun::SunDiskLabel;
 use x68k::X68kPartitionTable;
 
@@ -46,6 +48,10 @@ pub enum PartitionTable {
     /// plus a volume directory of standalone executables (`sash`, `ide`,
     /// `/unix`); see `src/partition/sgi.rs`.
     Sgi(SgiVolumeHeader),
+    /// SGI disk label — IRIS 2000 / 3000 series disks (the pre-IRIX scheme).
+    /// One `struct disk_label` at block 0 with geometry plus 8 `{base, size}`
+    /// slots; may be byte-swapped. See `src/partition/sgi_dklabel.rs`.
+    SgiDkLabel(SgiDiskLabel),
     /// Sun disk label (SMI VTOC) — SPARC Solaris / SunOS disks. 8 slices,
     /// big-endian, magic `0xDABE` at byte 508; see `src/partition/sun.rs`.
     Sun(SunDiskLabel),
@@ -253,8 +259,7 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
     // `casper/filesystem.squashfs` carved out of a live CD). Probed first: the
     // 4-byte magic is unambiguous, and `detect` additionally parses the whole
     // superblock, so a chance match is never reported as a filesystem.
-    if first_sector[0..4] == [b'h', b's', b'q', b's']
-        && crate::fs::squashfs::SquashfsFilesystem::detect(reader, 0)
+    if first_sector[0..4] == *b"hsqs" && crate::fs::squashfs::SquashfsFilesystem::detect(reader, 0)
     {
         let _ = reader.seek(SeekFrom::Start(0));
         return Some("squashfs".to_string());
@@ -482,6 +487,23 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
     }
     let _ = reader.seek(SeekFrom::Start(0));
 
+    // PFS dumped bare, same shape as SFS above. The boot magic is `PFS\x01` /
+    // `PDS\x01` / the muFS pair, where the last byte is a version rather than a
+    // character — so the tag on disk is NOT the `PFS\3` DosType the dispatcher
+    // matches on, and `looks_like_pfs3` reports the latter after validating the
+    // root block. Without this a `new volume pfs3` image fell through to the
+    // MBR parse and reported "invalid boot signature", which is how the gap was
+    // found: exposing the builder made it reachable.
+    if matches!(
+        &first_sector[0..3],
+        b"PFS" | b"PDS" | b"muA" | b"muP" | b"AFS"
+    ) && crate::fs::pfs3::looks_like_pfs3(reader, 0)
+    {
+        let _ = reader.seek(SeekFrom::Start(0));
+        return Some("PFS\\3".to_string());
+    }
+    let _ = reader.seek(SeekFrom::Start(0));
+
     // Check for HFS / HFS+ / HFSX / ext / ProDOS at offset 1024.
     // Read a full 512-byte sector for raw device compatibility (macOS /dev/rdiskN
     // requires sector-aligned reads).
@@ -591,6 +613,15 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
             }
         }
     }
+
+    // SGI EFS v1: a different magic at a different offset, so it cannot collide
+    // with the IRIX probe above. `efs_v1::detect` tries both word orders.
+    let _ = reader.seek(SeekFrom::Start(0));
+    if crate::fs::efs_v1::detect(reader, 0).is_some() {
+        let _ = reader.seek(SeekFrom::Start(0));
+        return Some("SGI EFS v1".to_string());
+    }
+    let _ = reader.seek(SeekFrom::Start(0));
 
     // Acorn ADFS / FileCore Disc Record. Two probe sites match the
     // Linux kernel paths:
@@ -794,6 +825,15 @@ impl PartitionTable {
             // the InvalidSgi error path. Re-parsing here rather than caching
             // the prior error keeps the control flow obvious.
             return Err(SgiVolumeHeader::parse(&mbr_data).unwrap_err());
+        }
+
+        // SGI disk label (IRIS 2000 / 3000, pre-IRIX). `D_MAGIC` 0x00072959 at
+        // byte 0, in either byte order — images off the period disk
+        // controllers come out swapped within every 16-bit word.
+        if let Some(order) = sgi_dklabel::detect(&mbr_data) {
+            return Ok(PartitionTable::SgiDkLabel(SgiDiskLabel::parse_with_order(
+                &mbr_data, order,
+            )?));
         }
 
         // Sun disk label (SPARC Solaris / SunOS): magic 0xDABE at byte 508 plus
@@ -1023,7 +1063,9 @@ impl PartitionTable {
             // diskutil's `sN` counts map entries from 1.
             PartitionTable::Apm(_) => Some(raw + 1),
             // IRIX `fx` and Sun `format(1M)` both number from 0.
-            PartitionTable::Sgi(_) | PartitionTable::Sun(_) => Some(raw),
+            PartitionTable::Sgi(_) | PartitionTable::SgiDkLabel(_) | PartitionTable::Sun(_) => {
+                Some(raw)
+            }
             // No platform convention; `@DH0` is the identity users know.
             PartitionTable::Rdb(_) => Some(raw),
             _ => None,
@@ -1038,6 +1080,7 @@ impl PartitionTable {
                 | PartitionTable::Ahdi(_)
                 | PartitionTable::Apm(_)
                 | PartitionTable::Sgi(_)
+                | PartitionTable::SgiDkLabel(_)
                 | PartitionTable::Sun(_)
                 | PartitionTable::Rdb(_)
         )
@@ -1185,6 +1228,40 @@ impl PartitionTable {
                     })
                     .collect()
             }
+            PartitionTable::SgiDkLabel(label) => label
+                .browsable_slots()
+                .map(|(i, m)| {
+                    let role = label.slot_role(i);
+                    // The label carries no filesystem type, only roles. Swap
+                    // holds no filesystem, so leave its byte at 0; every other
+                    // slot routes to the EFS v1 driver, which reports honestly
+                    // if the slot turns out to hold something else.
+                    let is_swap = role == "swap";
+                    PartitionInfo {
+                        index: i,
+                        type_name: if is_swap {
+                            "SGI swap".to_string()
+                        } else {
+                            format!("SGI {role} (EFS v1)")
+                        },
+                        partition_type_byte: if is_swap {
+                            0
+                        } else {
+                            sgi_dklabel::SGI_TYPE_BYTE_EFS_V1
+                        },
+                        start_lba: m.base as u64,
+                        start_byte: None,
+                        size_bytes: m.size_bytes(),
+                        bootable: i as u8 == label.bootfs,
+                        is_logical: false,
+                        is_extended_container: false,
+                        partition_type_string: None,
+                        hfs_block_size: None,
+                        rdb_part_block: None,
+                        drv_name: None,
+                    }
+                })
+                .collect(),
             PartitionTable::Sun(label) => label
                 .browsable_slices()
                 .map(|(i, s)| PartitionInfo {
@@ -1347,6 +1424,10 @@ impl PartitionTable {
                 // same way — `detect_filesystem_type` has no SFS probe, so the
                 // string dispatcher is the only path to the driver.
                 let is_amiga_sfs = fs_hint == "SFS\\0";
+                // PFS3 the same again (F-003). Its boot magic is not its
+                // DosType, so `detect_superfloppy` already translated one to
+                // the other; here the string just has to survive to dispatch.
+                let is_amiga_pfs3 = fs_hint == "PFS\\3";
                 let is_human68k = fs_hint == "human68k";
                 // A custom bootblock Amiga disk with no filesystem. Route the
                 // hint through `partition_type_string` so the dispatcher opens
@@ -1355,7 +1436,7 @@ impl PartitionTable {
                 // Apple Lisa: the tag-bearing DC42/DART container is opened as a
                 // whole by the Lisa driver, so route the hint through the string.
                 let is_lisa = fs_hint == "lisafs";
-                let display_name = if is_amiga_dos || is_amiga_sfs {
+                let display_name = if is_amiga_dos || is_amiga_sfs || is_amiga_pfs3 {
                     let b = fs_hint.as_bytes();
                     let raw = u32::from_be_bytes([b[0], b[1], b[2], b[4] - b'0']);
                     rdb::dos_type_display_name(raw)
@@ -1380,6 +1461,7 @@ impl PartitionTable {
                     is_extended_container: false,
                     partition_type_string: if is_amiga_dos
                         || is_amiga_sfs
+                        || is_amiga_pfs3
                         || is_human68k
                         || is_amiga_ndos
                         || is_lisa
@@ -1426,7 +1508,17 @@ impl PartitionTable {
     /// Exists so `tests/doc_parity.rs` can require a README row per scheme;
     /// the `#[cfg(test)]` guard below keeps it honest when a variant is added.
     pub const ALL_TYPE_NAMES: &'static [&'static str] = &[
-        "MBR", "GPT", "APM", "RDB", "SGI", "Sun", "AHDI", "X68k", "None", "DSD",
+        "MBR",
+        "GPT",
+        "APM",
+        "RDB",
+        "SGI",
+        "SGI-DkLabel",
+        "Sun",
+        "AHDI",
+        "X68k",
+        "None",
+        "DSD",
     ];
 
     /// Whether this disk carries a partition table at all.
@@ -1472,11 +1564,21 @@ impl PartitionTable {
             PartitionTable::Apm(_) => "APM",
             PartitionTable::Rdb(_) => "RDB",
             PartitionTable::Sgi(_) => "SGI",
+            PartitionTable::SgiDkLabel(_) => "SGI-DkLabel",
             PartitionTable::Sun(_) => "Sun",
             PartitionTable::Ahdi(_) => "AHDI",
             PartitionTable::X68k { .. } => "X68k",
             PartitionTable::None { .. } => "None",
             PartitionTable::Dsd { .. } => "DSD",
+        }
+    }
+
+    /// Word orientation of the medium, for the table types that have one.
+    /// Only the SGI disk label does today; everything else reads one way round.
+    pub fn byte_order_name(&self) -> Option<&'static str> {
+        match self {
+            PartitionTable::SgiDkLabel(label) => Some(label.byte_order.display_name()),
+            _ => None,
         }
     }
 
@@ -1489,6 +1591,7 @@ impl PartitionTable {
             PartitionTable::Apm(_)
             | PartitionTable::Rdb(_)
             | PartitionTable::Sgi(_)
+            | PartitionTable::SgiDkLabel(_)
             | PartitionTable::Sun(_)
             | PartitionTable::Ahdi(_)
             | PartitionTable::X68k { .. }
@@ -2111,6 +2214,30 @@ mod tests {
     }
 
     #[test]
+    fn detect_superfloppy_bare_pfs3_routes_by_dostype() {
+        // F-003: the same omission as R-017, found by exposing the builder on
+        // `new volume` — a bare PFS3 image fell through to the MBR parse and
+        // reported "invalid boot signature". The boot magic on disk is
+        // `PFS\x01` (last byte a version), while the dispatcher matches the
+        // `PFS\3` DosType, so the probe has to translate.
+        let img = crate::fs::pfs3::create_blank_pfs3(16384, "Test").expect("format PFS3");
+        let table = PartitionTable::detect(&mut Cursor::new(img)).expect("detect");
+        assert_eq!(table.type_name(), "None");
+        let parts = table.partitions();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].partition_type_string.as_deref(), Some("PFS\\3"));
+    }
+
+    #[test]
+    fn detect_superfloppy_pfs3_probe_rejects_bare_magic() {
+        // Four bytes of boot magic with nothing behind them is a bootblock, not
+        // a volume; the rootblock gate must reject it.
+        let mut d = vec![0u8; 1024 * 1024];
+        d[0..4].copy_from_slice(b"PFS\x01");
+        assert!(!crate::fs::pfs3::looks_like_pfs3(&mut Cursor::new(&d), 0));
+    }
+
+    #[test]
     fn detect_superfloppy_sfs_probe_rejects_bare_magic() {
         // `SFS\0` at byte 0 with nothing behind it is a custom bootblock, not a
         // volume. The ownblock + checksum gate must reject it rather than hand
@@ -2604,11 +2731,12 @@ mod type_name_parity {
             PartitionTable::Apm(_) => 2,
             PartitionTable::Rdb(_) => 3,
             PartitionTable::Sgi(_) => 4,
-            PartitionTable::Sun(_) => 5,
-            PartitionTable::Ahdi(_) => 6,
-            PartitionTable::X68k { .. } => 7,
-            PartitionTable::None { .. } => 8,
-            PartitionTable::Dsd { .. } => 9,
+            PartitionTable::SgiDkLabel(_) => 5,
+            PartitionTable::Sun(_) => 6,
+            PartitionTable::Ahdi(_) => 7,
+            PartitionTable::X68k { .. } => 8,
+            PartitionTable::None { .. } => 9,
+            PartitionTable::Dsd { .. } => 10,
         }
     }
 
@@ -2616,7 +2744,7 @@ mod type_name_parity {
     fn all_type_names_covers_every_variant() {
         assert_eq!(
             PartitionTable::ALL_TYPE_NAMES.len(),
-            10,
+            11,
             "a PartitionTable variant was added or removed: update ALL_TYPE_NAMES, \
              every_variant_has_an_index, and the README table tests/doc_parity.rs checks"
         );

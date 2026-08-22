@@ -385,7 +385,10 @@ impl OpticalAudioPlayer {
             }
 
             if let Some(err) = self.error.as_ref() {
-                ui.colored_label(egui::Color32::RED, format!("Playback failed: {err}"));
+                ui.colored_label(
+                    super::theme::danger(ui.visuals()),
+                    format!("Playback failed: {err}"),
+                );
             }
 
             ui.separator();

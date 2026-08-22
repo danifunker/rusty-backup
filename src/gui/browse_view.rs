@@ -936,7 +936,7 @@ impl BrowseView {
                     Some(false) => {
                         ui.label(
                             egui::RichText::new("Boot blocks: absent")
-                                .color(egui::Color32::from_rgb(0xCC, 0x88, 0x00)),
+                                .color(super::theme::warning(ui.visuals())),
                         )
                         .on_hover_text(
                             "This volume has no boot loader. Use 'Boot Blocks...' to copy \
@@ -1137,16 +1137,16 @@ impl BrowseView {
         });
 
         if let Some(err) = &self.error {
-            ui.colored_label(egui::Color32::from_rgb(255, 100, 100), err);
+            ui.colored_label(super::theme::danger(ui.visuals()), err);
         }
 
         // Edit result message
         if let Some(result) = &self.edit_result.clone() {
             ui.horizontal(|ui| {
                 let color = if result.starts_with("Error") {
-                    egui::Color32::from_rgb(255, 100, 100)
+                    super::theme::danger(ui.visuals())
                 } else {
-                    egui::Color32::from_rgb(100, 200, 100)
+                    super::theme::success(ui.visuals())
                 };
                 ui.colored_label(color, result);
                 if ui.button("OK").clicked() {
@@ -1206,13 +1206,13 @@ impl BrowseView {
         // Info banner while editing an archive
         if self.edit_mode && self.archive_edit_ctx.is_some() {
             ui.colored_label(
-                egui::Color32::from_rgb(100, 160, 255),
+                super::theme::info(ui.visuals()),
                 "Editing temporary copy. Click 'Apply Edits' to write changes.",
             );
         }
         if self.edit_mode && self.chd_edit.is_some() {
             ui.colored_label(
-                egui::Color32::from_rgb(100, 160, 255),
+                super::theme::info(ui.visuals()),
                 "Editing CHD via diff. Click 'Apply Edits' to flush, or exit Edit Mode to merge into the CHD.",
             );
         }
@@ -1229,7 +1229,7 @@ impl BrowseView {
             let hovered = ui.ctx().input(|i| !i.raw.hovered_files.is_empty());
             if hovered {
                 ui.colored_label(
-                    egui::Color32::from_rgb(100, 180, 255),
+                    super::theme::info(ui.visuals()),
                     "Drop files here to add them to the current directory",
                 );
                 ui.separator();
@@ -1324,7 +1324,7 @@ impl BrowseView {
 
     fn render_tree_entry(&mut self, ui: &mut egui::Ui, entry: &FileEntry) {
         let pending_del = self.edit_mode && self.staged_edits.is_pending_delete(&entry.path);
-        let dimmed = egui::Color32::from_rgb(120, 120, 120);
+        let dimmed = super::theme::muted(ui.visuals());
 
         match entry.entry_type {
             EntryType::Directory => {
@@ -1449,8 +1449,7 @@ impl BrowseView {
                     ui.horizontal(|ui| {
                         self.mark_checkbox(ui, entry);
                         let rich = if meta_changed {
-                            egui::RichText::new(&label)
-                                .color(egui::Color32::from_rgb(150, 190, 255))
+                            egui::RichText::new(&label).color(super::theme::info(ui.visuals()))
                         } else {
                             egui::RichText::new(&label)
                         };
@@ -1666,8 +1665,8 @@ impl BrowseView {
 
     /// Render a pending-add entry with green "+" prefix (not selectable for content).
     fn render_pending_add_entry(&mut self, ui: &mut egui::Ui, entry: &FileEntry) {
-        let green = egui::Color32::from_rgb(100, 200, 100);
-        let blue = egui::Color32::from_rgb(120, 160, 220);
+        let green = super::theme::success(ui.visuals());
+        let blue = super::theme::info(ui.visuals());
         // On HFS/HFS+ and ProDOS, surface files that will be added without a
         // resolved type by tinting them blue so the user can fix them before
         // Apply. HFS: no FInfo + no dict match + no override. ProDOS: type byte
@@ -1866,7 +1865,10 @@ impl BrowseView {
 
         match &self.selected_entry {
             None => {
-                ui.colored_label(egui::Color32::GRAY, "Select a file to view its contents.");
+                ui.colored_label(
+                    super::theme::muted(ui.visuals()),
+                    "Select a file to view its contents.",
+                );
             }
             Some(entry) => {
                 let entry = entry.clone();
@@ -1918,7 +1920,7 @@ impl BrowseView {
                         if !rusty_backup::fs::prodos_types::is_known_type(tt) {
                             let aux = entry.aux_type.unwrap_or(0);
                             ui.colored_label(
-                                egui::Color32::from_rgb(220, 200, 120),
+                                super::theme::warning(ui.visuals()),
                                 format!(
                                     "Note: ${:02X} is not in the ProDOS type registry — {}. The type and aux (${:04X}) will be preserved on export via the CiderPress #{:02X}{:04X} filename suffix.",
                                     tt,
@@ -3168,7 +3170,7 @@ impl BrowseView {
             .default_width(520.0)
             .show(ui.ctx(), |ui| {
                 ui.colored_label(
-                    egui::Color32::from_rgb(255, 180, 90),
+                    super::theme::warning(ui.visuals()),
                     format!(
                         "This [{}] volume can't store everything in the archive:",
                         self.fs_type
@@ -3226,7 +3228,7 @@ impl BrowseView {
             };
             ui.label(
                 egui::RichText::new(format!("Editing: /{parent_name}"))
-                    .color(egui::Color32::from_rgb(100, 180, 255)),
+                    .color(super::theme::info(ui.visuals())),
             );
 
             ui.add_space(8.0);
@@ -3402,11 +3404,11 @@ impl BrowseView {
                         let projected =
                             free.saturating_add(delta.freed).saturating_sub(delta.added);
                         let color = if delta.added > free + delta.freed {
-                            egui::Color32::from_rgb(255, 100, 100) // red — won't fit
+                            super::theme::danger(ui.visuals()) // red — won't fit
                         } else if projected < free / 10 {
-                            egui::Color32::from_rgb(255, 200, 100) // yellow — tight
+                            super::theme::warning(ui.visuals()) // yellow — tight
                         } else {
-                            egui::Color32::from_rgb(100, 200, 100) // green — ok
+                            super::theme::success(ui.visuals()) // green — ok
                         };
                         ui.colored_label(
                             color,
@@ -4188,7 +4190,7 @@ impl BrowseView {
                 format!("Delete '{}'?", entry.name)
             };
             ui.horizontal(|ui| {
-                ui.colored_label(egui::Color32::from_rgb(255, 200, 100), &title);
+                ui.colored_label(super::theme::warning(ui.visuals()), &title);
                 if ui.button("Yes, delete").clicked() {
                     self.pending_delete = None;
                     self.perform_delete(&parent, &entry, is_non_empty);
@@ -4286,13 +4288,13 @@ impl BrowseView {
                 });
                 if ed.shape.mixed_endings {
                     ui.colored_label(
-                        egui::Color32::from_rgb(255, 200, 100),
+                        super::theme::warning(ui.visuals()),
                         "This file mixes line-ending styles; saving makes them all the same.",
                     );
                 }
                 if ed.shape.ending != ed.original_ending {
                     ui.colored_label(
-                        egui::Color32::from_rgb(255, 200, 100),
+                        super::theme::warning(ui.visuals()),
                         format!(
                             "Will convert {} -> {}",
                             ed.original_ending.label(),
@@ -4317,7 +4319,7 @@ impl BrowseView {
                     });
 
                 if let Some(msg) = &ed.status {
-                    ui.colored_label(egui::Color32::from_rgb(255, 140, 140), msg);
+                    ui.colored_label(super::theme::danger(ui.visuals()), msg);
                 }
                 ui.horizontal(|ui| {
                     if ui.button("Save").clicked() {
@@ -5230,7 +5232,7 @@ impl BrowseView {
             .default_height(320.0)
             .show(ui.ctx(), |ui| {
                 ui.colored_label(
-                    egui::Color32::from_rgb(255, 150, 100),
+                    super::theme::warning(ui.visuals()),
                     format!(
                         "{} item(s) could not be staged for the [{}] filesystem:",
                         self.staging_errors.len(),
@@ -5251,12 +5253,12 @@ impl BrowseView {
                             ui.horizontal_wrapped(|ui| {
                                 ui.label(egui::RichText::new(label).strong());
                                 ui.label("—");
-                                ui.colored_label(egui::Color32::from_rgb(255, 120, 120), reason);
+                                ui.colored_label(super::theme::danger(ui.visuals()), reason);
                             });
                             ui.label(
                                 egui::RichText::new(path.display().to_string())
                                     .small()
-                                    .color(egui::Color32::from_gray(150)),
+                                    .color(super::theme::muted(ui.visuals())),
                             );
                             ui.add_space(4.0);
                         }
@@ -5317,12 +5319,12 @@ impl BrowseView {
                 if let Some(result) = &self.fsck_result {
                     if result.is_clean() {
                         ui.colored_label(
-                            egui::Color32::from_rgb(100, 200, 100),
+                            super::theme::success(ui.visuals()),
                             "Filesystem is clean.",
                         );
                     } else {
                         ui.colored_label(
-                            egui::Color32::from_rgb(255, 100, 100),
+                            super::theme::danger(ui.visuals()),
                             format!("{} error(s) found.", result.errors.len()),
                         );
                     }
@@ -5350,7 +5352,7 @@ impl BrowseView {
                             .show(ui, |ui| {
                                 for issue in &result.errors {
                                     ui.colored_label(
-                                        egui::Color32::from_rgb(255, 100, 100),
+                                        super::theme::danger(ui.visuals()),
                                         format!("[{}] {}", issue.code, issue.message),
                                     );
                                 }
@@ -5370,7 +5372,7 @@ impl BrowseView {
                                 .push(entry);
                         }
                         ui.colored_label(
-                            egui::Color32::from_rgb(255, 100, 100),
+                            super::theme::danger(ui.visuals()),
                             format!(
                                 "{} file(s)/folder(s) reference {} missing parent director{} — not repairable.",
                                 result.orphaned_entries.len(),
@@ -5386,7 +5388,7 @@ impl BrowseView {
                             .show(ui, |ui| {
                                 for (parent_cnid, entries) in &by_parent {
                                     ui.colored_label(
-                                        egui::Color32::from_rgb(255, 200, 100),
+                                        super::theme::warning(ui.visuals()),
                                         format!("Missing parent ID {}:", parent_cnid),
                                     );
                                     for entry in entries {
@@ -5417,12 +5419,12 @@ impl BrowseView {
                                 for issue in &visible_warnings {
                                     if issue.debug {
                                         ui.colored_label(
-                                            egui::Color32::from_rgb(150, 150, 150),
+                                            super::theme::muted(ui.visuals()),
                                             format!("[DEBUG] {}", issue.message),
                                         );
                                     } else {
                                         ui.colored_label(
-                                            egui::Color32::from_rgb(255, 200, 100),
+                                            super::theme::warning(ui.visuals()),
                                             format!("[{}] {}", issue.code, issue.message),
                                         );
                                     }
@@ -5451,7 +5453,7 @@ impl BrowseView {
                         if !report.fixes_applied.is_empty() {
                             for fix in &report.fixes_applied {
                                 ui.colored_label(
-                                    egui::Color32::from_rgb(100, 200, 100),
+                                    super::theme::success(ui.visuals()),
                                     format!("  {}", fix),
                                 );
                             }
@@ -5459,14 +5461,14 @@ impl BrowseView {
                         if !report.fixes_failed.is_empty() {
                             for fail in &report.fixes_failed {
                                 ui.colored_label(
-                                    egui::Color32::from_rgb(255, 100, 100),
+                                    super::theme::danger(ui.visuals()),
                                     format!("  {}", fail),
                                 );
                             }
                         }
                         if report.unrepairable_count > 0 {
                             ui.colored_label(
-                                egui::Color32::from_rgb(255, 200, 100),
+                                super::theme::warning(ui.visuals()),
                                 format!(
                                     "{} error(s) could not be repaired (missing parent directories).",
                                     report.unrepairable_count

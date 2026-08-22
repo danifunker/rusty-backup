@@ -14,12 +14,12 @@ concrete reason to.
 |---|---------|------|--------|
 | ~~F-001~~ | ~~`optical extract` cannot extract a single path~~ — **SHIPPED** 2026-08-09 | `src/cli/verbs/optical.rs` | — |
 | ~~F-002~~ | ~~CloneCD not supported~~ — **retracted, it is supported** | — | — |
-| [F-003](#f-003) | PFS3 / SFS builders exist but are not on the CLI | `src/cli/verbs/new.rs` | two Amiga fixture gaps |
-| [F-005](#f-005) | Optical extract is CLI-only; the GUI cannot pull one file | `src/optical/browse_view.rs` | GUI parity with `optical extract` |
-| [F-006](#f-006) | IRIX support-disk building / browsing is thin | `src/cli/verbs/new_sgi_cdrom.rs` | bootable IRIX disc work — **needs scope** |
-| [F-007](#f-007) | No optical fixture with nested directories | `regression-tests/` | verifying `--path DIR --recursive` |
-| [F-008](#f-008) | `backup` reads only flat-layout sources | `src/cli/verbs/backup.rs` | backing up CHD / dynamic VHD / QCOW2 / VMDK — **four red cases** |
-| [F-009](#f-009) | SFS editor writes single-leaf extent b-trees only | `src/fs/sfs.rs` | editing any real-sized SFS volume |
+| ~~F-003~~ | ~~PFS3 / SFS builders exist but are not on the CLI~~ — **SHIPPED** 2026-08-15 | `src/cli/verbs/new.rs` | — |
+| ~~F-005~~ | ~~Optical extract is CLI-only; the GUI cannot pull one file~~ — **ALREADY SHIPPED**, entry was stale | `src/optical/browse_view.rs` | — |
+| [F-006](#f-006) | IRIX support-disk building / browsing is thin | `src/cli/verbs/new_sgi_cdrom.rs` | bootable IRIX discs — **scoped**; step 1 (header validated by IRIX) done, steps 2-3 open |
+| ~~F-007~~ | ~~No optical fixture with nested directories~~ — **SHIPPED** 2026-08-17 | `regression-tests/` | — |
+| ~~F-008~~ | ~~`backup` reads only flat-layout sources~~ — **SHIPPED** 2026-08-15 | `src/cli/verbs/backup.rs` | — |
+| ~~F-009~~ | ~~SFS editor writes single-leaf extent b-trees only~~ — **SHIPPED** 2026-08-17 | `src/fs/sfs.rs` | — |
 | ~~F-004~~ | ~~`show partmap` is APM-only~~ — **SHIPPED** 2026-08-08, same gap as R-026 | `src/cli/verbs/show.rs` | — |
 
 ---
@@ -114,6 +114,38 @@ byte-identical to the one already held as
 
 ## F-003 — PFS3 and SFS can be created, but only from inside the engine {#f-003}
 
+**SHIPPED 2026-08-15.** `new volume pfs3` and `new volume sfs` exist, and both
+round-trip: format, `put`, `ls`, `get`, and for SFS `fsck` too.
+
+**Exposing the builder immediately found a second gap, which is the point this
+entry made.** A bare PFS3 image was not detected at all — it fell through to
+the MBR parse and reported `invalid boot signature`, the exact shape of R-017
+(the same omission for SFS). Nothing had ever opened one, because nothing
+could make one outside a unit test.
+
+Fixing it needed the distinction between two four-byte tags that are easy to
+conflate. The **boot block** magic at offset 0 is `PFS` / `PDS` /
+`muAF` / …, where the final byte is a *format version*, not a character. The
+**DosType** the filesystem dispatcher matches on is `PFS`, and a bare volume
+has no RDB to carry it. So `looks_like_pfs3` validates the boot magic *and* the
+root block at sector 2, then `detect_superfloppy` reports the DosType — and the
+hint has to be added to the routing allow-list in `PartitionTable::detect`,
+which is what actually made it dispatch.
+
+Guarded by `detect_superfloppy_bare_pfs3_routes_by_dostype` and a negative
+`..._rejects_bare_magic` twin, matching the SFS pair beside them.
+
+The caveat this entry always carried still stands: a volume rusty-backup builds
+is not a reference fixture for rusty-backup. What this buys is that the write
+paths are now reachable by an external oracle — and since 2026-08-14 that
+oracle exists (`oracles/fsuae/affs_mount.py`), so pointing it at a PFS3 or SFS
+volume is a real next step rather than a hypothetical one. It needs the PFS3 /
+SFS handlers staged into the guest's `L:`; Kickstart has neither in ROM.
+
+---
+
+### The original report
+
 `create_blank_pfs3` and `create_blank_sfs` already exist in `src/fs/` and are
 used by unit tests to build volumes. Neither is reachable from `rb-cli`:
 `new volume` offers hfs, hfsplus, hfv, fat, ntfs, hpfs, ext, ext3, ext4,
@@ -168,6 +200,46 @@ Two things would help, in order of cost:
 
 ## F-005 — the GUI cannot extract a single file from a disc {#f-005}
 
+**ALREADY SHIPPED — this entry was stale, and closing it needed no code.**
+Checked 2026-08-17 against the four things it asked for; all four were already
+there, landed in July and never reflected here.
+
+| what the entry asked for | where it is |
+|---|---|
+| an extract action on a selected entry **and on a folder** | checkbox column + `render_selection_bar` (called at `browse_view.rs:392`); `marked_export_entries` drops anything under an already-marked directory so a folder's recursive walk is not archived twice |
+| a destination chooser, folder vs archive | `rfd::FileDialog` — `save_file` for single-file formats, `pick_folder` otherwise, branched on `ExportFormat::is_single_file` |
+| the `--filesystem` selector, "without which the GUI can only ever reach one side of a hybrid Mac/PC disc" | `selected_fs` + its ComboBox; `b8cfe77` is literally "filesystem selector for hybrid Mac/PC discs (browse/extract + GUI)" |
+| a README Inspect-tab bullet | present, and it names the Optical disc browser as one of four surfaces on the shared `export_selection` engine |
+
+The commits, none of which updated this file:
+
+```
+61413fe  2026-07-14  export-selection engine for all output formats
+b8cfe77  2026-07-16  filesystem selector for hybrid Mac/PC discs (browse/extract + GUI)
+400f54f  2026-07-21  multi-select export to .mar in the CD browser
+aff45d0  2026-07-21  unify multi-select export as a format pulldown + all archive types
+```
+
+It also overshot the ask. The entry wanted the CLI's `--tar`; the GUI offers ten
+formats — loose files, gzip/zstd per file, BinHex, tar, tar.gz, tar.zst, Zip,
+StuffIt and Mac Archive.
+
+**One real difference from the wording, left alone deliberately.** The entry
+says "an extract action on the *selected* browse entry", and selection here
+means ticking a checkbox rather than single-clicking a row. The capability is
+complete either way, and adding a second redundant path to the same engine is
+not obviously an improvement. Worth doing only if the checkbox proves awkward
+in use.
+
+**Same shape as R-038**: a document confidently describing a state that had
+changed underneath it. Two of the four remaining features in this file turned
+out to be stale on inspection this week, which is an argument for checking the
+code before believing the list.
+
+---
+
+### The original report
+
 `optical extract` grew `--path`, `--recursive`, `--tar`,
 `--preserve-permissions`, `--filesystem` and `--filesystem-index` (F-001).
 None of it is reachable from the GUI, which can browse an optical disc but
@@ -189,6 +261,59 @@ one. This is wiring, not new engine work.
   Inspect-tab bullet
 
 ## F-006 — IRIX support-disk building and browsing is thin {#f-006}
+
+**Scoped 2026-08-15, and step 1 is done.** The ask is a *bootable* IRIX
+CD-ROM, 5.3 and 6.5, for building all-in-one installation discs.
+
+### Step 1 — the existing header is now validated against IRIX (DONE)
+
+`new hd sgi-efs` printed "real IRIX fx/prtvtoc validation is unverified without
+hardware/emulator". It is verified. IRIX 6.5.22's own `fx` 6.5 opens the drive
+and prints our partitions, bootinfo and geometry without complaint, and
+`prtvtoc` agrees field for field:
+
+```
+  0: efs        5040 + 126000         2 + 62
+  8: volhdr        0 + 5040           0 + 2
+ 10: volume        0 + 131040         0 + 64
+ root partition = 0     swap partition = 0    bootfile = /unix
+----- directory entries-----
+```
+
+So **partitioning is solved** — a user does not run `fx` by hand — and the
+empty `directory entries` section is precisely the gap. That directory is what
+ARCS reads to find `sash` / `ide`; we write 15 blank slots. Method and traps
+are in `oracles/iris/README.md`.
+
+Two limits found while proving it: nothing yet tests `fx` *writing* a label or
+the kernel mounting from it, and our label declares 130 cylinders where the
+drive reports 131 (the builder rounds up to whole cylinders and then the size
+is clamped). `fx` did not object, but a bootable disk should match the drive
+exactly, so the rounding wants revisiting first.
+
+### Step 2 — populate the volume directory (NOT STARTED)
+
+The boot files are SGI-copyrighted and cannot ship with rusty-backup, so this
+is "assemble a bootable disc *from* the user's own distribution media", not
+"synthesize one". That shapes the CLI: it needs `--sash` / `--miniroot` inputs
+or a `--from-disc` that harvests them.
+
+### Step 3 — the CD path (NOT STARTED)
+
+`optical new sgi-efs` already writes the CD-shaped volume header — EFS in slot
+7, the 1 head x 32 sectors/track geometry verified against real 5.3 and 6.5
+discs. It needs the directory entries and the miniroot.
+
+**Scope 6.5 first.** 6.5 boots under iris and is verifiable end to end; the 5.3
+image hangs at "The system is coming up" with `Find Error: 10` and never
+reaches a login, so 5.3 cannot be proven here yet. The verification story is
+otherwise unusually good for this feature — "did it boot" has an unambiguous
+answer, the same oracle shape that closed R-039 and R-020.
+
+---
+
+### The original report
+
 
 `optical new sgi-efs` builds an SGI volume header with EFS in slot 7, and
 takes `--from-dir`, `--expand-archives` and `--flatten-folders`. What it does
@@ -217,6 +342,37 @@ a harness someone has not written yet rather than a thing that cannot be done.
 
 ## F-007 — no optical fixture has nested directories {#f-007}
 
+**SHIPPED 2026-08-17.** The fixture was there all along — this was a case gap,
+not a corpus gap. `optical.hfs.opentransport.cd` carries a real tree:
+`/Install 1` holds files *and* a subdirectory (`Open Transport Files`), so the
+flag finally has something to descend into.
+
+Three cases in `cases/tier3/optical-extract.toml`:
+
+| case | asserts |
+|---|---|
+| `path-dir-stops-at-one-level` | `--path "/Install 1"` alone -> 10 entries |
+| `path-dir-recursive-descends` | the same path `--recursive` -> 30 entries |
+| `nested-dir-addressable-directly` | `/Install 1/Open Transport Files` -> 20 entries |
+
+The counts are exact rather than "recursive found more", which would still pass
+if recursion degraded from a subtree to one extra file. Against a sha256-pinned
+fixture an exact count says what each mode actually covers, and a change either
+way earns a failure.
+
+The third case is the one that makes the pair meaningful: it proves the nested
+directory is independently addressable, so the recursive result is a real
+subtree rather than a flattening artifact.
+
+**One trap, recorded because it cost a run:** `extract` prints its count to
+**stderr**, keeping stdout clean for data. A `stdout_contains` assertion
+matches nothing and fails with no visible difference between expected and
+actual — the counts were right the first time, the stream was not.
+
+---
+
+### The original report
+
 `--path DIR --recursive` is implemented and unverified. The discs in the
 corpus are flat or single-file at the root:
 `optical.iso9660.joliet.cd` holds one file with no directories at all, which
@@ -229,6 +385,50 @@ are already catalogued — only the case is missing. It belongs in
 `cases/tier3/optical-extract.toml` beside the nine that exist.
 
 ## F-008 — `backup` reads only flat-layout sources {#f-008}
+
+**SHIPPED 2026-08-15.** `backup` now decodes a container source before the
+engine sees it, so all four formats in the table below work. The four cases
+went XPASS on the first run after the change and their `known-failures.toml`
+entries are gone — which leaves that file with **no entries at all**.
+
+The fix is the one this entry predicted: route through the decoding that
+already existed. It is done by mirroring the *remote* arm of
+`run_backup_from`, which had already solved the identical problem — the byte
+source is not a `File`, but two engine paths (single-file CHD output and the
+defrag-clone) are typed on one. So a container is decoded once to a scratch
+file in the destination directory, under a delete-guard, and the ordinary
+local pipeline runs on that.
+
+Two things that had to be right beyond "it exits 0":
+
+* **Block devices must not be probed.** Container detection is gated on
+  `path.is_file()` first. Probing `\.\PhysicalDrive0` would open it without
+  the elevation prompt the real path performs, and report a length of zero.
+* **The recorded size must be the virtual one.** `metadata.source_size_bytes`
+  is what `restore` reads back to size its target, so writing a QCOW2's
+  compressed file length there would mis-size every restore from that backup.
+  Decoding to a temp makes `total_size()` the virtual size for free; all six
+  sources now record 67108864 for the same 64 MB disk.
+
+Verified beyond exit codes: the partition images produced from CHD, dynamic
+VHD, QCOW2 and sparse VMDK are **byte-identical** (sha256) to those from the
+raw baseline, and `--format chd` — the default, and the path that needs a
+concrete `File` — works from a QCOW2 source.
+
+**Not yet verified on a real-world container.** `fs.hpfs.os2-warp45.hd`, the
+monolithicSparse VMDK named below, is not in the local corpus and needs a
+sync; only synthetic containers have been exercised.
+
+**A follow-up worth taking:** the decode is unconditional for containers, so
+`--format raw|zstd|gzip|lz4|vhd` pays a full disk copy it does not need. Those
+paths consume `Box<dyn ReadSeek>` already, so a `SourceFactory::Container`
+variant could stream them, leaving the temp only for CHD output and
+shrink-to-minimum. Filed as a note here rather than a new F-entry because the
+capability is present either way.
+
+---
+
+### The original report
 
 Filed as defect [R-016](Regression_Bugs.md#r-016) until 2026-08-09.
 **Reclassified**: `backup` has never claimed to decode containers, so this is
@@ -296,6 +496,50 @@ an artifact of how the synthetic containers were built.
    to the wrong container. Use explicit paths per case.
 
 ## F-009 — the SFS editor writes single-leaf extent b-trees only {#f-009}
+
+**SHIPPED 2026-08-17.** The extent B-tree now descends, splits a full node in
+half, promotes the new sibling's first key, and grows a level when the split
+reaches the root; emptied nodes are unlinked and their blocks freed, and a root
+left with one child collapses into it. `edit.sfs.put-get` flipped from
+asserting the refusal to asserting the round-trip, exactly as its own note
+predicted.
+
+Three things the estimate below did not anticipate, all found by reading the
+reference volume before writing any code:
+
+- **Half the job did not exist.** Separators are only `<=` their subtree's
+  minimum, not equal to it — five interior entries in the reference volume sit
+  below their child's first key, left behind by deletes. So there are no parent
+  updates to maintain on removal, and "node splitting, root promotion and
+  parent updates" reduced to the first two.
+- **A prerequisite was broken.** `alloc_admin_block` could not have worked on
+  any real volume: the AdminSpaceContainer layout was four bytes off in reader,
+  writer and allocator alike. Split needs blocks, so this had to land first —
+  [R-042](Regression_Bugs.md#r-042).
+- **A second ceiling sat behind the first.** Object nodes live in a different
+  structure — a fixed-fan-out index, not a B-tree — and its allocator assumed a
+  single leaf too. It refused every write on a real volume the moment the
+  extent tree stopped refusing first. Now walked; *growing* it remains
+  unimplemented, which is what limits a real volume to ~926 new files rather
+  than unlimited. That is the honest remainder of this entry and is tracked in
+  CLAUDE.md rather than reopened here.
+
+**The emulator proof is still outstanding.** `oracles/fsuae/sfs_mount.py` is
+written and separates its outcomes correctly, but no SFS volume mounts under it
+yet: the guest reports `not enough memory available` when the handler starts.
+
+An earlier version of this paragraph blamed the FS-UAE environment, on the
+evidence that the AFFS oracle had also stopped answering. That was a bad
+control — it was handed the bootable Workbench fixture as its artifact, so the
+guest had two bootable volumes and never ran the probe. Against an ordinary
+AFFS volume it mounts exactly as it did when it closed R-020. The environment
+is fine; the SFS mount is its own problem, and the remaining lead is WinUAE,
+whose `hardfile2` filesystem field FS-UAE strips. See that script's status note
+for the four routes already eliminated.
+
+---
+
+### Original report
 
 Filed as defect [R-032](Regression_Bugs.md#r-032) until 2026-08-10.
 **Reclassified**: the driver has always documented this ceiling — CLAUDE.md

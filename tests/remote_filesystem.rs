@@ -2700,3 +2700,174 @@ fn sync_apply_edits_to_remote_image_uploads_a_file() {
     rfs.write_file_to(up, &mut got).unwrap();
     assert_eq!(got, b"uploaded-into-image");
 }
+
+/// A failed upload must fail *cleanly* and leave the connection usable.
+///
+/// `stage_upload` used to write the `StageUpload` control frame and only then
+/// open the host file. That frame commits the daemon to reading a chunk stream,
+/// so an open failure returned an error to the caller while the daemon sat
+/// blocked on chunks that never came — and then consumed the *next* control
+/// frame as body bytes. The connection was desynchronised from that moment, and
+/// the user saw the damage somewhere else entirely, most often as
+///
+///   Apply failed: applying the remote edits: reading daemon response:
+///   failed to fill whole buffer
+///
+/// which is a client-side EOF, nowhere near the upload that actually broke.
+/// This drives that exact sequence: a doomed upload, then real work on the same
+/// session, and asserts the session still commits.
+#[test]
+fn a_failed_upload_does_not_desync_the_connection() {
+    use rusty_backup::remote::RemoteSession;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    make_fat_image(&root.join("dest.img"), "DESTVOL", "SEED.BIN", 0x01, 512);
+
+    let staging_tmp = tempfile::tempdir().unwrap();
+    let staging = staging_tmp.path().to_path_buf();
+
+    let host_tmp = tempfile::tempdir().unwrap();
+    let good = host_tmp.path().join("good.bin");
+    std::fs::write(&good, vec![0x5Au8; 2048]).unwrap();
+    // A DIRECTORY, deliberately, and the choice is load-bearing on two axes.
+    //
+    // A *missing* path would not reproduce anything: the code stats before
+    // announcing, so a stat failure was always safe.
+    //
+    // A directory diverges by platform, which is the whole point. Windows
+    // fails `File::open` outright. Unix opens a directory happily and only
+    // fails at the read — so on Unix the request was already on the wire, the
+    // daemon had already answered, and bailing without reading that answer
+    // left the connection one reply behind. Every later call then read the
+    // previous call's response, and the first visible symptom was `apply`
+    // getting `Ok` instead of `Applied`. CI caught that on macOS and Linux
+    // while Windows stayed green — which is why this assertion set checks the
+    // *reply type*, not just that the connection is alive.
+    let doomed = host_tmp.path().join("a-directory");
+    std::fs::create_dir(&doomed).unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let serve_root = root.clone();
+    let serve_staging = staging.clone();
+    std::thread::spawn(move || {
+        let _ = serve_on(listener, serve_root, Some(serve_staging), true);
+    });
+
+    let mut session = RemoteSession::connect(&addr).unwrap();
+    let sid = session.open_session("/dest.img", None).unwrap();
+
+    // The doomed upload: an error is correct, a desync is not.
+    let failed = session.stage_upload(sid, "/", "GHOST.BIN", &doomed, false, None, None);
+    assert!(failed.is_err(), "uploading a directory must fail");
+
+    // The connection has to still work. Before the fix this hung or returned
+    // garbage, because the daemon was mid-chunk-stream.
+    session
+        .stage_upload(sid, "/", "GOOD.BIN", &good, false, None, None)
+        .expect("a good upload after a failed one must still work");
+    let n = session
+        .apply(sid)
+        .expect("apply must reach the daemon and answer");
+    assert_eq!(n, 1, "only the successful upload was staged");
+    session.close_session(sid).unwrap();
+
+    // And it actually landed.
+    let (mut rfs, root_entry, _children) =
+        RemoteFilesystem::open(&addr, "/dest.img", None).unwrap();
+    let listed = rfs.list_directory(&root_entry).unwrap();
+    let names: Vec<&str> = listed.iter().map(|e| e.name.as_str()).collect();
+    assert!(
+        names.iter().any(|n| n.eq_ignore_ascii_case("GOOD.BIN")),
+        "the good upload committed: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n.eq_ignore_ascii_case("GHOST.BIN")),
+        "the failed upload left nothing behind: {names:?}"
+    );
+}
+
+/// A Mac file copied onto a remote volume must arrive with **both** forks.
+///
+/// `StagedEdit::AddFile` had no fork field, and the Commander read a staged
+/// `resource_fork` only to lift its type/creator codes — the fork bytes were
+/// never put on the wire. Copying classic Mac files to a remote volume
+/// therefore produced data-fork-only files, silently. For an application that
+/// is not a lossy copy, it is an inert one, and nothing failed to say so.
+///
+/// Drives the host-upload path (`stage_upload_with_fork`) onto a remote HFS
+/// volume and compares both forks byte for byte.
+#[test]
+fn remote_upload_carries_the_resource_fork() {
+    use rusty_backup::remote::RemoteSession;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    // Destination: a real HFS volume, the only kind that can hold a fork.
+    std::fs::write(
+        root.join("dest.img"),
+        hfs::create_blank_hfs(4 * 1024 * 1024, 512, "DESTMAC").unwrap(),
+    )
+    .unwrap();
+
+    let staging_tmp = tempfile::tempdir().unwrap();
+    let staging = staging_tmp.path().to_path_buf();
+
+    let host_tmp = tempfile::tempdir().unwrap();
+    let host_file = host_tmp.path().join("app.bin");
+    let data_fork = vec![0x11u8; 1500];
+    // Deliberately larger than the data fork and a different byte, so a
+    // truncated or swapped stream cannot pass by coincidence.
+    let rsrc_fork: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&host_file, &data_fork).unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let serve_root = root.clone();
+    let serve_staging = staging.clone();
+    std::thread::spawn(move || {
+        let _ = serve_on(listener, serve_root, Some(serve_staging), true);
+    });
+
+    {
+        let mut session = RemoteSession::connect(&addr).unwrap();
+        let sid = session.open_session("/dest.img", None).unwrap();
+        session
+            .stage_upload_with_fork(
+                sid,
+                "/",
+                "AppFile",
+                &host_file,
+                false,
+                Some("APPL".to_string()),
+                Some("MACS".to_string()),
+                Some(&rsrc_fork),
+            )
+            .unwrap();
+        assert_eq!(session.apply(sid).unwrap(), 1);
+        session.close_session(sid).unwrap();
+    }
+
+    // Read it back over the wire and compare both forks.
+    let (mut rfs, root_entry, _children) =
+        RemoteFilesystem::open(&addr, "/dest.img", None).unwrap();
+    let listed = rfs.list_directory(&root_entry).unwrap();
+    let got = listed
+        .iter()
+        .find(|e| e.name == "AppFile")
+        .expect("uploaded file present");
+
+    let mut data_back = Vec::new();
+    rfs.write_file_to(got, &mut data_back).unwrap();
+    assert_eq!(data_back, data_fork, "data fork is byte-exact");
+
+    let mut rsrc_back = Vec::new();
+    rfs.write_resource_fork_to(got, &mut rsrc_back).unwrap();
+    assert_eq!(
+        rsrc_back.len(),
+        rsrc_fork.len(),
+        "resource fork length survived the wire"
+    );
+    assert_eq!(rsrc_back, rsrc_fork, "resource fork is byte-exact");
+}

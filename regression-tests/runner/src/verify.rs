@@ -290,23 +290,15 @@ pub fn verify(
             };
             let program = oracle.program.as_deref().unwrap_or(&oracle.tool);
 
-            let (verdict, argv, stdout_head) = if !matches!(
-                oracle.kind.as_str(),
-                "package" | "mount"
-            ) {
-                (
-                    Verdict::SkipManual {
-                        reason: format!(
-                            "{} is a {} oracle — needs a preconfigured guest or real hardware",
-                            oracle.id, oracle.kind
-                        ),
-                    },
-                    Vec::new(),
-                    None,
-                )
-            } else if claim.check.is_none() {
-                (Verdict::SkipNoCheck, Vec::new(), None)
-            } else {
+            // What decides whether this can be automated is whether somebody
+            // wrote a `check` for it, not what kind of oracle it is. That used
+            // to be gated on `kind`, which auto-skipped every emulator pair
+            // even where a runnable check existed — true when the only Amiga
+            // oracles needed a hand-configured guest, and false since
+            // Copperline, which is headless and scriptable. An oracle that
+            // really does need a guest or real hardware simply has no `check`,
+            // and still reports skip-manual below.
+            let (verdict, argv, stdout_head) = if let Some(check) = &claim.check {
                 match resolve_program(reg, &oracle.id, program, platform, regression_dir) {
                     None => (
                         Verdict::SkipUnavailable {
@@ -317,7 +309,7 @@ pub fn verify(
                     ),
                     Some(exe) => {
                         let argv = expand(
-                            claim.check.as_ref().unwrap(),
+                            check,
                             image,
                             &regression_dir.join("oracles"),
                         );
@@ -344,6 +336,22 @@ pub fn verify(
                         }
                     }
                 }
+            } else {
+                let automatable = matches!(oracle.kind.as_str(), "package" | "mount");
+                (
+                    if automatable {
+                        Verdict::SkipNoCheck
+                    } else {
+                        Verdict::SkipManual {
+                            reason: format!(
+                                "{} is a {} oracle with no check - needs a preconfigured                                  guest or real hardware",
+                                oracle.id, oracle.kind
+                            ),
+                        }
+                    },
+                    Vec::new(),
+                    None,
+                )
             };
 
             records.push(Record {
@@ -388,7 +396,35 @@ pub fn verify(
 /// Compare a check's output against what the row said to expect. An expectation
 /// that was not stated is not checked — a `check` with no expectations at all
 /// is an exit-code check, which is the common case.
+/// Exit code a check uses to say "this host cannot run me".
+///
+/// A script-based check resolves its *interpreter* as `program`, so the
+/// registry's availability machinery cannot see whether the tool behind it is
+/// installed: python3 exists everywhere, FS-UAE and Copperline do not. Without
+/// this, a host missing the emulator reports FAIL — a finding against our
+/// bytes — when the honest answer is that nothing was verified. 77 is the
+/// autotools convention for exactly this.
+const EXIT_SKIP_UNAVAILABLE: i32 = 77;
+
+/// Exit code a check uses to say "I ran, and could not reach a verdict".
+///
+/// Distinct from a failing verdict: an emulator guest that never boots far
+/// enough to answer says nothing about the volume, and recording that as FAIL
+/// invents a finding. The scripts already drew this line in their own exit
+/// codes and their READMEs; this is the runner honouring it.
+const EXIT_NO_VERDICT: i32 = 99;
+
 fn evaluate(claim: &crate::registry::Verification, r: &exec::Output) -> Verdict {
+    if r.exit_code == Some(EXIT_SKIP_UNAVAILABLE) {
+        return Verdict::SkipUnavailable {
+            reason: first_line(&r.stderr, &r.stdout),
+        };
+    }
+    if r.exit_code == Some(EXIT_NO_VERDICT) {
+        return Verdict::Error {
+            reason: first_line(&r.stderr, &r.stdout),
+        };
+    }
     let want_exit = claim.expect_exit.unwrap_or(0);
     if r.exit_code != Some(want_exit) {
         return Verdict::Fail {

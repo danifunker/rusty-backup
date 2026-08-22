@@ -302,7 +302,23 @@ pub struct AffsFilesystem<R: Read + Seek> {
 
 impl<R: Read + Seek> AffsFilesystem<R> {
     /// Open the filesystem at the given partition offset.
-    pub fn open(mut reader: R, partition_offset: u64) -> Result<Self, FilesystemError> {
+    pub fn open(reader: R, partition_offset: u64) -> Result<Self, FilesystemError> {
+        Self::open_sized(reader, partition_offset, None)
+    }
+
+    /// Open with the partition's true length when the caller knows it.
+    ///
+    /// AFFS stores no size: the root block sits at the volume's midpoint, so
+    /// its *position* is the size. Inferring the midpoint from the reader's end
+    /// is only right when the volume runs to the end of the file, which is true
+    /// of a bare ADF and false of every partition that is not last on its disk
+    /// (R-042). `partition_size` is that length in bytes; `None` keeps the
+    /// reader-end inference and its bounded downward scan.
+    pub fn open_sized(
+        mut reader: R,
+        partition_offset: u64,
+        partition_size: Option<u64>,
+    ) -> Result<Self, FilesystemError> {
         // Boot block: 1024 bytes. Magic "DOS\x".
         let mut boot = [0u8; 1024];
         reader.seek(SeekFrom::Start(partition_offset))?;
@@ -317,9 +333,15 @@ impl<R: Read + Seek> AffsFilesystem<R> {
         let intl = is_intl_variant(variant);
         let ffs = is_ffs_variant(variant);
 
-        // Determine partition size by seeking to end.
-        let end = reader.seek(SeekFrom::End(0))?;
-        let partition_size = end.saturating_sub(partition_offset);
+        // The caller's length when it has one, else everything from here to the
+        // end of the reader.
+        let partition_size = match partition_size {
+            Some(len) => len,
+            None => {
+                let end = reader.seek(SeekFrom::End(0))?;
+                end.saturating_sub(partition_offset)
+            }
+        };
         if partition_size < 4 * BSIZE_U64 {
             return Err(parse_err("partition too small to host AFFS"));
         }
@@ -340,7 +362,11 @@ impl<R: Read + Seek> AffsFilesystem<R> {
         // is always an upper bound, so walk down from it.
         let candidate = (2 + total_blocks - 1) / 2;
         let root_block = locate_root_block(&mut reader, partition_offset, block_size, candidate)
-            .ok_or_else(|| parse_err("root block: type != T_HEADER"))?;
+            .ok_or_else(|| {
+                parse_err(format!(
+                    "no AFFS root block at or below block {candidate}: searched back                      {MAX_ROOT_SEARCH} blocks. AFFS stores no size, so a partition opened                      without its true length has to infer the volume's midpoint from the end                      of the disk; see R-042."
+                ))
+            })?;
 
         let mut root_buf = [0u8; BSIZE];
         reader.seek(SeekFrom::Start(
