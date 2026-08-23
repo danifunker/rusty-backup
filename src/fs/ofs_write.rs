@@ -535,6 +535,55 @@ pub fn location_parts(loc: u64) -> (u64, usize) {
     unpack_location(loc)
 }
 
+/// Format a blank version-1 OFS volume in memory.
+///
+/// Layout is the one the Hobbit BeBox image has: the table of contents in
+/// sector 0, the allocation bitmap from sector 1, and the root directory's
+/// first block immediately after it. `size_bytes` rounds down to a whole
+/// sector. Returns the image bytes.
+pub fn create_blank_ofs(size_bytes: u64, name: &str) -> Result<Vec<u8>, FilesystemError> {
+    let total = size_bytes / SECTOR;
+    if name.len() > 31 {
+        return Err(FilesystemError::InvalidData(
+            "ofs: volume name is capped at 31 bytes".into(),
+        ));
+    }
+    // Version 1 directory blocks are 8 sectors; the bitmap has to cover the
+    // whole volume, and the root block has to fit after it.
+    let bitmap_sectors = total.div_ceil(8).div_ceil(SECTOR).max(1);
+    let first_dir = 1 + bitmap_sectors;
+    let used = first_dir + 8;
+    if total < used + 8 {
+        return Err(FilesystemError::InvalidData(format!(
+            "ofs: {size_bytes} bytes is too small for a table of contents, a bitmap, and a              root directory (needs at least {} bytes)",
+            (used + 8) * SECTOR
+        )));
+    }
+    if total > u32::MAX as u64 {
+        return Err(FilesystemError::InvalidData(
+            "ofs: sector numbers are a 32-bit field; 2 TiB is the ceiling".into(),
+        ));
+    }
+
+    let mut img = vec![0u8; (total * SECTOR) as usize];
+    put_be32(&mut img, 0, 0x0001_0000);
+    put_be32(&mut img, 4, super::times::now() as u32);
+    put_be32(&mut img, 8, 1);
+    put_be32(&mut img, 12, bitmap_sectors as u32);
+    put_be32(&mut img, 16, first_dir as u32);
+    put_be32(&mut img, 20, total as u32);
+    put_be32(&mut img, 24, SECTOR as u32);
+    put_be32(&mut img, 36, used as u32);
+    img[44..44 + name.len()].copy_from_slice(name.as_bytes());
+
+    // Mark the TOC, the bitmap, and the root directory block as allocated.
+    for s in 0..used {
+        let byte = SECTOR as usize + (s / 8) as usize;
+        img[byte] |= 1 << (s % 8);
+    }
+    Ok(img)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -542,32 +591,24 @@ mod tests {
 
     /// A 4 MiB version-1 volume: TOC, bitmap, and an empty root directory.
     fn blank_volume() -> Cursor<Vec<u8>> {
-        let total: u32 = 8192;
-        let bitmap_sectors = ((total as u64).div_ceil(8).div_ceil(SECTOR)) as u32;
-        let first_dir = 1 + bitmap_sectors;
-        let mut img = vec![0u8; total as usize * SECTOR as usize];
-
-        put_be32(&mut img, 0, 0x0001_0000);
-        put_be32(&mut img, 4, 0x2edb_1ed6);
-        put_be32(&mut img, 8, 1);
-        put_be32(&mut img, 12, bitmap_sectors);
-        put_be32(&mut img, 16, first_dir);
-        put_be32(&mut img, 20, total);
-        put_be32(&mut img, 24, SECTOR as u32);
-        img[44..46].copy_from_slice(b"be");
-
-        // Mark the TOC, the bitmap, and the root directory block as allocated.
-        let used = first_dir as u64 + 8;
-        for s in 0..used {
-            let byte = SECTOR as usize + (s / 8) as usize;
-            img[byte] |= 1 << (s % 8);
-        }
-        put_be32(&mut img, 36, used as u32);
-        Cursor::new(img)
+        Cursor::new(create_blank_ofs(4 * 1024 * 1024, "be").expect("format"))
     }
 
     fn open() -> OfsFilesystem<Cursor<Vec<u8>>> {
         OfsFilesystem::open(blank_volume(), 0).expect("blank volume opens")
+    }
+
+    #[test]
+    fn a_volume_too_small_for_its_own_metadata_is_refused() {
+        assert!(create_blank_ofs(4096, "tiny").is_err());
+    }
+
+    #[test]
+    fn a_formatted_volume_opens_with_an_empty_root() {
+        let mut fs = open();
+        assert_eq!(fs.volume_label(), Some("be"));
+        let root = fs.root().unwrap();
+        assert!(fs.list_directory(&root).unwrap().is_empty());
     }
 
     #[test]

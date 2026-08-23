@@ -1254,7 +1254,8 @@ Usage: volume [OPTIONS] <FS> <IMAGE>
 
 - `--size` — Volume size (bytes or `K`/`M`/`G` suffixes). Defaults to 800K
 - `--name` — Volume label/name. Defaults to `rusty-backup`
-- `--block-size` — HFS/HFS+ allocation block size in bytes (multiple of 512). Auto when unset
+- `--block-size` — HFS/HFS+ allocation block size in bytes (multiple of 512). On `--fs bfs` this is the BFS block size (power of two, 1024..=8192). Auto when unset
+- `--big-endian` — BFS only: write a big-endian (BeOS/PPC) volume instead of the little-endian BeOS/Intel default
 - `--catalog-size` — HFS Catalog B-tree initial size in bytes. Auto when unset
 - `--extents-size` — HFS Extents-overflow B-tree initial size in bytes. Auto when unset
 - `--case-sensitive` — HFS+ only: format a case-sensitive (HFSX) volume

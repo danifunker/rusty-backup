@@ -139,6 +139,18 @@ pub enum FsKind {
     /// `--name` sets the 8-char volume name. `--size` is ignored.
     #[value(alias = "jasmin")]
     Oric,
+    /// BFS (BeOS / Haiku). A bare volume with 1 KiB blocks, an allocation
+    /// bitmap, a 2 MiB log, and an empty root directory in allocation group 8
+    /// — which is why the minimum size is 72 MiB. Little-endian by default
+    /// (BeOS/Intel); pass `--big-endian` for the BeOS/PPC byte order.
+    #[value(alias = "befs", alias = "beos")]
+    Bfs,
+    /// BeOS OFS (the pre-BFS filesystem of the Hobbit BeBox and the early
+    /// PowerPC Developer Releases). A version-1 volume: table of contents,
+    /// sector bitmap, and an empty root directory. Big-endian, 512-byte
+    /// sectors. `--name` sets the volume name.
+    #[value(alias = "beos-ofs")]
+    Ofs,
     /// MFS (Macintosh File System — Mac 128K / 512K / Plus). A flat, pre-HFS
     /// 400 KB / 800 KB floppy volume: zeroed boot blocks, an MDB, an all-free
     /// allocation map, and an empty directory. `--name` sets the volume label
@@ -331,6 +343,14 @@ pub enum VolumeFs {
     Minix2,
     /// Minix V3 — 60-char names, `mkfs.minix -3`.
     Minix3,
+    /// BFS (BeOS / Haiku) — a bare volume, minimum 72 MiB. `--big-endian`
+    /// writes the BeOS/PPC byte order.
+    #[value(alias = "befs", alias = "beos")]
+    Bfs,
+    /// BeOS OFS (the pre-BFS Hobbit BeBox filesystem) — big-endian, 512-byte
+    /// sectors.
+    #[value(alias = "beos-ofs")]
+    Ofs,
 }
 
 impl VolumeFs {
@@ -354,6 +374,8 @@ impl VolumeFs {
             VolumeFs::Xfs => FsKind::Xfs,
             VolumeFs::Minix2 => FsKind::Minix2,
             VolumeFs::Minix3 => FsKind::Minix3,
+            VolumeFs::Bfs => FsKind::Bfs,
+            VolumeFs::Ofs => FsKind::Ofs,
         }
     }
 }
@@ -410,6 +432,7 @@ impl FloppyArgs {
             size: self.size,
             name: self.name,
             block_size: self.block_size,
+            big_endian: false,
             catalog_size: self.catalog_size,
             extents_size: self.extents_size,
             case_sensitive: false,
@@ -443,9 +466,15 @@ pub struct VolumeArgs {
     #[arg(long, default_value = DEFAULT_VOLUME_NAME)]
     pub name: String,
 
-    /// HFS/HFS+ allocation block size in bytes (multiple of 512). Auto when unset.
+    /// HFS/HFS+ allocation block size in bytes (multiple of 512). On `--fs bfs`
+    /// this is the BFS block size (power of two, 1024..=8192). Auto when unset.
     #[arg(long = "block-size")]
     pub block_size: Option<u32>,
+
+    /// BFS only: write a big-endian (BeOS/PPC) volume instead of the
+    /// little-endian BeOS/Intel default.
+    #[arg(long = "big-endian")]
+    pub big_endian: bool,
 
     /// HFS Catalog B-tree initial size in bytes. Auto when unset.
     #[arg(long = "catalog-size")]
@@ -501,6 +530,7 @@ impl VolumeArgs {
             size: self.size,
             name: self.name,
             block_size: self.block_size,
+            big_endian: self.big_endian,
             catalog_size: self.catalog_size,
             extents_size: self.extents_size,
             case_sensitive: self.case_sensitive,
@@ -582,9 +612,16 @@ pub struct NewArgs {
 
     /// HFS allocation block size in bytes. Must be a non-zero multiple of
     /// 512. When unset, the smallest size that keeps `total_blocks <=
-    /// 65535` is chosen automatically. Ignored for other filesystems.
+    /// 65535` is chosen automatically. On `--fs bfs` this is the BFS block
+    /// size (a power of two in 1024..=8192, default 1024). Ignored for
+    /// other filesystems.
     #[arg(long = "block-size")]
     pub block_size: Option<u32>,
+
+    /// BFS only: write a big-endian (BeOS/PPC) volume instead of the
+    /// little-endian BeOS/Intel default. Ignored for other filesystems.
+    #[arg(long = "big-endian")]
+    pub big_endian: bool,
 
     /// HFS Catalog B-tree initial size in bytes (rounded up to a whole
     /// allocation block). When unset, scales with volume size like
@@ -862,6 +899,22 @@ fn format_image(args: NewArgs) -> Result<()> {
         FsKind::Ti99 => write_blank_ti99_image(&args.image, &args.size, &args.name),
         FsKind::Oric => format_and_write(&args.image, &args.size, &args.name, |_size, name| {
             Ok(crate::fs::oric::create_blank_oric(false, name))
+        }),
+        FsKind::Bfs => {
+            let endian = if args.big_endian {
+                crate::fs::bfs::BfsEndian::Big
+            } else {
+                crate::fs::bfs::BfsEndian::Little
+            };
+            let block_size = args.block_size.unwrap_or(1024);
+            format_and_write(&args.image, &args.size, &args.name, move |size, name| {
+                Ok(crate::fs::bfs_write::create_blank_bfs(
+                    size, block_size, name, endian,
+                )?)
+            })
+        }
+        FsKind::Ofs => format_and_write(&args.image, &args.size, &args.name, |size, name| {
+            Ok(crate::fs::ofs_write::create_blank_ofs(size, name)?)
         }),
         FsKind::Mfs => format_and_write(&args.image, &args.size, &args.name, |size, name| {
             crate::fs::mfs::create_blank_mfs(size, name).map_err(|e| anyhow::anyhow!("{e}"))

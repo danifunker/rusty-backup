@@ -75,7 +75,16 @@ support the disk types (floppy / hard disk / CD-ROM) of the outstanding cores.
   Oric Jasmin (read + edit + create + fsck, flat 256-byte-sector `.dsk`
   SS 178 KB / DS 356 KB; free map + chained directory + sector-list inodes;
   modeled on MAME's `fs_oric_jasmin` and cross-validated against `floptool`),
-  ANDOS (detect-only scaffold), and the optical-disc filesystems (ISO 9660
+  ANDOS (detect-only scaffold),
+  BFS (the Be File System — BeOS DR9 / PR / R3-R5 and Haiku; read + edit +
+  create in both byte orders, since BeOS/Intel writes little-endian and
+  BeOS/PPC big.
+  B+tree directories with leaf splits on the write path; editing is refused
+  while the journal is non-empty, because we do not maintain the log),
+  BeOS OFS (the pre-BFS filesystem of the 1993-94 Hobbit BeBox and the early
+  PowerPC Developer Releases; read + edit + create, big-endian, no inodes — a file's
+  metadata is its parent directory entry — with Mac-style type/creator codes),
+  and the optical-disc filesystems (ISO 9660
   + Joliet / Rock Ridge, High Sierra, UDF, HFS, HFS+, SGI EFS, UFS/FFS,
   VMS ODS-2, plus the video-game console filesystems Nintendo GameCube / Wii,
   Philips CD-i, and 3DO Opera — browse/extract, see **Optical / CD-ROM**
@@ -83,7 +92,9 @@ support the disk types (floppy / hard disk / CD-ROM) of the outstanding cores.
 - **Partition tables:** MBR, GPT, APM, Amiga RDB, Atari AHDI, Sun SMI VTOC,
   SGI volume header, Sharp X68000 — every one of them can now be **written**
   from scratch as well as parsed (`rb-cli new hd <table>`). The pre-IRIX SGI
-  disk label (IRIS 2000 / 3000) is parsed read-only.
+  disk label (IRIS 2000 / 3000), the NeXT disk label (NeXTSTEP / OPENSTEP on
+  both m68k and Intel), and the Solaris x86 VTOC nested inside an MBR
+  partition are parsed read-only.
 - **Containers:** CHD, VHD (fixed + dynamic), QCOW2, VMDK, 2MG, WOZ,
   DC42, HFV, IMZ (encrypted ZIP), `.zip` (a RAW disk image inside a plain
   ZIP, inflated sparsely; `--inside` picks among multiple), GHO/GHS (Ghost

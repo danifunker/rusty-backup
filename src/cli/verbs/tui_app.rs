@@ -5612,6 +5612,7 @@ impl App {
                 size,
                 name,
                 block_size: None,
+                big_endian: false,
                 catalog_size: None,
                 extents_size: None,
                 case_sensitive: false,

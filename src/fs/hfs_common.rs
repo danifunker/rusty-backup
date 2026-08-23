@@ -332,12 +332,14 @@ pub fn describe_type_creator(type_code: &[u8; 4], creator_code: &[u8; 4]) -> Opt
         .map(|e| e.description.as_str())
 }
 
-/// True for the classic-Mac filesystems whose `create_file` consults the
-/// extension dictionary: HFS, HFS+/HFSX, and MFS. ProDOS carries a file type
-/// too, but in its own `$XX` space, so it is deliberately excluded — handing it
-/// a Finder OSType like `TEXT` would be meaningless.
+/// True for the filesystems whose `create_file` consults the extension
+/// dictionary: HFS, HFS+/HFSX, MFS, and BeOS OFS — the last because early
+/// BeOS typed files with Mac `OSType` pairs, exactly the ones in the
+/// dictionary. ProDOS carries a file type too, but in its own `$XX` space, so
+/// it is deliberately excluded — handing it a Finder OSType like `TEXT` would
+/// be meaningless.
 pub fn uses_hfs_type_dictionary(fs_type: &str) -> bool {
-    fs_type.starts_with("HFS") || fs_type == "MFS"
+    fs_type.starts_with("HFS") || fs_type == "MFS" || fs_type == "BeOS OFS"
 }
 
 /// True when an `OSType` carries no information — all four bytes zero, which is

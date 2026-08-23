@@ -1275,3 +1275,331 @@ mod tests {
         }
     }
 }
+
+/// Format a blank BFS volume in memory.
+///
+/// The layout matches what BeOS's `mkbfs` produces for a small disk: boot
+/// block + superblock in block 0, the allocation bitmap from block 1, a
+/// 2048-block log after it, the index directory next, and the root directory
+/// at the start of allocation group 8 — which is where every real volume we
+/// have puts it, and why `root_dir` is `{ag: 8}` rather than a low block.
+///
+/// `size_bytes` is rounded down to a whole block. Returns the image bytes.
+pub fn create_blank_bfs(
+    size_bytes: u64,
+    block_size: u32,
+    name: &str,
+    endian: BfsEndian,
+) -> Result<Vec<u8>, FilesystemError> {
+    if !block_size.is_power_of_two() || !(1024..=8192).contains(&block_size) {
+        return Err(FilesystemError::InvalidData(format!(
+            "bfs: block size {block_size} must be a power of two in 1024..=8192"
+        )));
+    }
+    let bs = block_size as u64;
+    let block_shift = block_size.trailing_zeros();
+    // One bitmap block covers `block_size * 8` blocks, and BFS sizes an
+    // allocation group to exactly that so `blocks_per_ag` stays 1.
+    let ag_shift = block_shift + 3;
+    let ag_blocks = 1u64 << ag_shift;
+
+    let num_blocks = size_bytes / bs;
+    let num_ags = num_blocks.div_ceil(ag_blocks);
+    // Root lives in AG 8, so the volume has to reach that far.
+    let min_ags = 9u64;
+    if num_ags < min_ags {
+        return Err(FilesystemError::InvalidData(format!(
+            "bfs: {size_bytes} bytes is too small — a {block_size}-byte-block volume needs at \
+             least {} bytes ({min_ags} allocation groups)",
+            min_ags * ag_blocks * bs
+        )));
+    }
+    if name.len() > 31 {
+        return Err(FilesystemError::InvalidData(
+            "bfs: volume name is capped at 31 bytes".into(),
+        ));
+    }
+
+    let bitmap_blocks = num_ags;
+    let log_start_block = 1 + bitmap_blocks;
+    let log_blocks = 2048u64.min(ag_blocks - 1);
+    let indices_block = log_start_block + log_blocks;
+    let root_block = 8 * ag_blocks;
+    // The directory tree is a header block plus one leaf node.
+    let root_tree_block = root_block + 1;
+    let root_tree_blocks = 2u64;
+    let indices_tree_block = indices_block + 1;
+
+    let mut img = vec![0u8; (num_blocks * bs) as usize];
+    let ag_mask = ag_blocks - 1;
+    let run = |block: u64, len: u16| BlockRun {
+        allocation_group: (block >> ag_shift) as u32,
+        start: (block & ag_mask) as u16,
+        len,
+    };
+
+    // ---- superblock ----
+    let sb_at = 512usize;
+    let sb = &mut img[sb_at..sb_at + 164];
+    sb[..name.len()].copy_from_slice(name.as_bytes());
+    endian.put_u32(sb, 32, super::bfs::BFS_MAGIC1);
+    endian.put_u32(sb, 36, super::bfs::BFS_BYTE_ORDER);
+    endian.put_u32(sb, 40, block_size);
+    endian.put_u32(sb, 44, block_shift);
+    endian.put_i64(sb, 48, num_blocks as i64);
+    endian.put_u32(sb, 64, block_size);
+    endian.put_u32(sb, 68, super::bfs::BFS_MAGIC2);
+    endian.put_u32(sb, 72, 1);
+    endian.put_u32(sb, 76, ag_shift);
+    endian.put_u32(sb, 80, num_ags as u32);
+    endian.put_u32(sb, 84, BFS_CLEAN);
+    run(log_start_block, log_blocks as u16).write(endian, sb, 88);
+    endian.put_i64(sb, 96, indices_block as i64);
+    endian.put_i64(sb, 104, indices_block as i64);
+    endian.put_u32(sb, 112, super::bfs::BFS_MAGIC3);
+    run(root_block, 1).write(endian, sb, 116);
+    run(indices_block, 1).write(endian, sb, 124);
+
+    // ---- allocation bitmap: everything laid out above ----
+    let mut used = 0u64;
+    let mut mark = |img: &mut [u8], start: u64, count: u64| {
+        for b in start..start + count {
+            // The bitmap starts at block 1, so its byte 0 is at `bs`.
+            let at = bs as usize + (b / 32) as usize * 4;
+            let mut word = endian.read_u32(img, at);
+            word |= 1 << (b % 32);
+            endian.put_u32(img, at, word);
+        }
+        used += count;
+    };
+    mark(&mut img, 0, 1 + bitmap_blocks);
+    mark(&mut img, log_start_block, log_blocks);
+    mark(&mut img, indices_block, 1 + root_tree_blocks);
+    mark(&mut img, root_block, 1 + root_tree_blocks);
+    endian.put_i64(&mut img[sb_at..sb_at + 164], 56, used as i64);
+
+    // ---- the two directories ----
+    let write_dir =
+        |img: &mut [u8], inode_block: u64, tree_block: u64, parent: u64, dir_name: &str| {
+            let tree = {
+                let node_size = block_size as usize;
+                let mut t = BTree::blank(endian, node_size);
+                t.leaf_insert_raw(node_size as i64, ".", inode_block as i64);
+                t.leaf_insert_raw(node_size as i64, "..", parent as i64);
+                t
+            };
+            let at = (tree_block * bs) as usize;
+            img[at..at + tree.data.len()].copy_from_slice(&tree.data);
+
+            let mut inode = vec![0u8; block_size as usize];
+            endian.put_u32(&mut inode, 0, BFS_INODE_MAGIC);
+            run(inode_block, 1).write(endian, &mut inode, 4);
+            endian.put_u32(&mut inode, 0x14, S_IFDIR | 0o755);
+            endian.put_u32(&mut inode, 0x18, INODE_FLAGS_DEFAULT);
+            run(parent, 1).write(endian, &mut inode, 0x2C);
+            endian.put_u32(&mut inode, 0x40, block_size);
+            let mut ds = DataStream {
+                size: (root_tree_blocks * bs) as i64,
+                ..Default::default()
+            };
+            ds.direct[0] = run(tree_block, root_tree_blocks as u16);
+            ds.max_direct_range = ds.size;
+            ds.max_indirect_range = ds.size;
+            ds.max_double_indirect_range = ds.size;
+            ds.write(endian, &mut inode, INODE_OFF_DATA);
+            let off = INODE_OFF_SMALL_DATA;
+            endian.put_u32(&mut inode, off, FILE_NAME_TYPE);
+            endian.put_u16(&mut inode, off + 4, 1);
+            endian.put_u16(&mut inode, off + 6, dir_name.len() as u16);
+            inode[off + 8] = FILE_NAME_NAME;
+            let name_at = off + 8 + 1 + 3;
+            inode[name_at..name_at + dir_name.len()].copy_from_slice(dir_name.as_bytes());
+            let iat = (inode_block * bs) as usize;
+            img[iat..iat + inode.len()].copy_from_slice(&inode);
+        };
+    write_dir(&mut img, root_block, root_tree_block, root_block, name);
+    write_dir(
+        &mut img,
+        indices_block,
+        indices_tree_block,
+        root_block,
+        "indices",
+    );
+
+    Ok(img)
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::*;
+    use crate::fs::filesystem::CreateFileOptions;
+    use std::io::Cursor;
+
+    fn volume(endian: BfsEndian) -> BfsFilesystem<Cursor<Vec<u8>>> {
+        // 9 allocation groups of 8192 blocks each at 1 KiB = 72 MiB.
+        let img = create_blank_bfs(72 * 1024 * 1024, 1024, "Blank", endian).expect("format");
+        BfsFilesystem::open(Cursor::new(img), 0).expect("open the volume we just formatted")
+    }
+
+    #[test]
+    fn a_formatted_volume_opens_with_an_empty_root() {
+        let mut fs = volume(BfsEndian::Little);
+        assert_eq!(fs.volume_label(), Some("Blank"));
+        let root = fs.root().unwrap();
+        assert!(fs.list_directory(&root).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_volume_too_small_for_allocation_group_eight_is_refused() {
+        assert!(create_blank_bfs(4 * 1024 * 1024, 1024, "Tiny", BfsEndian::Little).is_err());
+    }
+
+    /// Create, read back, delete — through the same public path `rb-cli put`
+    /// uses — on a volume we formatted ourselves, in both byte orders.
+    #[test]
+    fn files_round_trip_on_a_fresh_volume_in_both_orders() {
+        for endian in [BfsEndian::Little, BfsEndian::Big] {
+            let mut fs = volume(endian);
+            let root = fs.root().unwrap();
+            let body = b"round trip".to_vec();
+            fs.create_file(
+                &root,
+                "hello.txt",
+                &mut body.as_slice(),
+                body.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+
+            let listed = fs.list_directory(&root).unwrap();
+            assert_eq!(listed.len(), 1, "{endian:?}");
+            assert_eq!(fs.read_file(&listed[0], usize::MAX).unwrap(), body);
+
+            fs.delete_entry(&root, &listed[0]).unwrap();
+            assert!(fs.list_directory(&root).unwrap().is_empty(), "{endian:?}");
+        }
+    }
+
+    #[test]
+    fn a_directory_created_here_holds_its_own_children() {
+        let mut fs = volume(BfsEndian::Little);
+        let root = fs.root().unwrap();
+        let dir = fs
+            .create_directory(&root, "sub", &CreateDirectoryOptions::default())
+            .unwrap();
+        fs.create_file(
+            &dir,
+            "inner",
+            &mut b"nested".as_slice(),
+            6,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        let inner = fs.list_directory(&dir).unwrap();
+        assert_eq!(inner.len(), 1);
+        assert_eq!(inner[0].name, "inner");
+        assert_eq!(fs.read_file(&inner[0], usize::MAX).unwrap(), b"nested");
+    }
+
+    /// Enough entries to split the root's B+tree several times, then read the
+    /// whole listing back from the leaf chain.
+    #[test]
+    fn a_directory_that_splits_its_btree_still_lists_completely() {
+        let mut fs = volume(BfsEndian::Big);
+        let root = fs.root().unwrap();
+        for i in 0..300 {
+            let name = format!("file-{i:04}.txt");
+            fs.create_file(
+                &root,
+                &name,
+                &mut name.as_bytes(),
+                name.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+        }
+        let listed = fs.list_directory(&root).unwrap();
+        assert_eq!(listed.len(), 300);
+        let mut names: Vec<&str> = listed.iter().map(|e| e.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names[0], "file-0000.txt");
+        assert_eq!(names[299], "file-0299.txt");
+        for e in &listed {
+            assert_eq!(fs.read_file(e, usize::MAX).unwrap(), e.name.as_bytes());
+        }
+    }
+
+    /// A file big enough to need more than the 12 direct runs, so the indirect
+    /// array is exercised end to end.
+    #[test]
+    fn a_file_spanning_many_runs_round_trips() {
+        let mut fs = volume(BfsEndian::Little);
+        let root = fs.root().unwrap();
+        let body: Vec<u8> = (0..600_000u32).map(|i| (i % 251) as u8).collect();
+        fs.create_file(
+            &root,
+            "big.bin",
+            &mut body.as_slice(),
+            body.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        let listed = fs.list_directory(&root).unwrap();
+        assert_eq!(listed[0].size, body.len() as u64);
+        assert_eq!(fs.read_file(&listed[0], usize::MAX).unwrap(), body);
+    }
+
+    #[test]
+    fn delete_returns_every_block_it_took() {
+        let mut fs = volume(BfsEndian::Little);
+        let root = fs.root().unwrap();
+        let before = fs.free_space().unwrap();
+        let body = vec![9u8; 200_000];
+        fs.create_file(
+            &root,
+            "blob",
+            &mut body.as_slice(),
+            body.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        assert!(fs.free_space().unwrap() < before);
+        let listed = fs.list_directory(&root).unwrap();
+        fs.delete_entry(&root, &listed[0]).unwrap();
+        assert_eq!(fs.free_space().unwrap(), before, "blocks leaked on delete");
+    }
+
+    #[test]
+    fn rename_keeps_the_inode_and_its_bytes() {
+        let mut fs = volume(BfsEndian::Little);
+        let root = fs.root().unwrap();
+        fs.create_file(
+            &root,
+            "before",
+            &mut b"payload".as_slice(),
+            7,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        let listed = fs.list_directory(&root).unwrap();
+        let block = listed[0].location;
+        fs.rename(&root, &listed[0], "after").unwrap();
+        let listed = fs.list_directory(&root).unwrap();
+        assert_eq!(listed[0].name, "after");
+        assert_eq!(listed[0].location, block, "rename moved the inode");
+        assert_eq!(fs.read_file(&listed[0], usize::MAX).unwrap(), b"payload");
+        // The inode carries its own name too; a stale one shows in Tracker.
+        let inode = fs.read_inode(block).unwrap();
+        assert_eq!(inode.name().as_deref(), Some("after"));
+    }
+
+    #[test]
+    fn symlinks_store_their_target_inline() {
+        let mut fs = volume(BfsEndian::Big);
+        let root = fs.root().unwrap();
+        fs.create_symlink(&root, "link", "/boot/beos", &CreateFileOptions::default())
+            .unwrap();
+        let listed = fs.list_directory(&root).unwrap();
+        assert_eq!(listed[0].symlink_target.as_deref(), Some("/boot/beos"));
+    }
+}
