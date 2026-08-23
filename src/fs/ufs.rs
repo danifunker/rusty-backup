@@ -2026,10 +2026,12 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
         Ok(())
     }
 
-    /// Write a regular file's data fork. Allocates one full block per
-    /// occupied direct slot (`alloc_frag_run(frag, ...)`). Refuses with
-    /// `Unsupported` if the file needs more than 12 direct blocks
-    /// (indirect-block writes not yet implemented).
+    /// Write a regular file's data fork, one full block per logical block.
+    ///
+    /// Blocks 0..11 go in the direct slots; past those the single- and then
+    /// double-indirect levels are built as needed, which is what lets a file
+    /// exceed the 12-block (96 KiB at 8 KiB blocks) direct cap. Triple
+    /// indirection is refused — it starts at ~32 GiB with 8 KiB blocks.
     fn write_file_data(
         &mut self,
         inode: &mut UfsInode,
@@ -2038,24 +2040,59 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
     ) -> Result<(), FilesystemError> {
         let bs = self.bsize;
         let frags_per_block = self.frag as u64;
-        let max_direct_bytes = bs * UFS_NDADDR as u64;
-        if data_len > max_direct_bytes {
+        let nindir = self.nindir();
+        let ndaddr = UFS_NDADDR as u64;
+        let max_bytes = (ndaddr + nindir + nindir * nindir) * bs;
+        if data_len > max_bytes {
             return Err(FilesystemError::Unsupported(format!(
-                "ufs write_file_data: file size {data_len} > direct cap {max_direct_bytes} \
-                 (indirect-block writes not yet implemented)"
+                "ufs write_file_data: file size {data_len} > {max_bytes}                  (triple-indirect writes not implemented)"
             )));
         }
         let cg_hint = (inode.inum / self.ipg) % self.ncg;
+        let total_blocks = data_len.div_ceil(bs);
+
+        // Allocate the metadata blocks first: an early DiskFull is cleaner
+        // than one that leaves half a file's data written.
+        let mut meta_frags = 0u64;
+        let mut single: u64 = 0;
+        let mut double: u64 = 0;
+        let mut double_children: Vec<u64> = Vec::new();
+        if total_blocks > ndaddr {
+            single = self.alloc_frag_run(frags_per_block, cg_hint)?;
+            meta_frags += frags_per_block;
+        }
+        if total_blocks > ndaddr + nindir {
+            double = self.alloc_frag_run(frags_per_block, cg_hint)?;
+            meta_frags += frags_per_block;
+            let need = (total_blocks - ndaddr - nindir).div_ceil(nindir);
+            for _ in 0..need {
+                double_children.push(self.alloc_frag_run(frags_per_block, cg_hint)?);
+                meta_frags += frags_per_block;
+            }
+        }
+
+        let mut single_ptrs = vec![0u64; nindir as usize];
+        let mut child_ptrs: Vec<Vec<u64>> = double_children
+            .iter()
+            .map(|_| vec![0u64; nindir as usize])
+            .collect();
+
         let mut written: u64 = 0;
         let mut block_buf = vec![0u8; bs as usize];
-        let mut slot = 0;
+        let mut lbn = 0u64;
         while written < data_len {
             let remaining = data_len - written;
-            let chunk = (bs).min(remaining);
-            // Allocate one block (frag fragments) for this slot.
+            let chunk = bs.min(remaining);
             let start = self.alloc_frag_run(frags_per_block, cg_hint)?;
-            inode.direct[slot] = start;
-            // Read the chunk from the source into the block buffer.
+            if lbn < ndaddr {
+                inode.direct[lbn as usize] = start;
+            } else if lbn < ndaddr + nindir {
+                single_ptrs[(lbn - ndaddr) as usize] = start;
+            } else {
+                let rel = lbn - ndaddr - nindir;
+                child_ptrs[(rel / nindir) as usize][(rel % nindir) as usize] = start;
+            }
+
             let mut filled = 0usize;
             while filled < chunk as usize {
                 let n = data.read(&mut block_buf[filled..chunk as usize])?;
@@ -2074,11 +2111,45 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
             }
             self.write_frag_run(start, &block_buf)?;
             written += chunk;
-            slot += 1;
+            lbn += 1;
         }
+
+        if single != 0 {
+            self.write_pointer_block(single, &single_ptrs)?;
+            inode.indirect[0] = single;
+        }
+        if double != 0 {
+            for (child, ptrs) in double_children.iter().zip(child_ptrs.iter()) {
+                self.write_pointer_block(*child, ptrs)?;
+            }
+            let mut outer = vec![0u64; nindir as usize];
+            for (i, child) in double_children.iter().enumerate() {
+                outer[i] = *child;
+            }
+            self.write_pointer_block(double, &outer)?;
+            inode.indirect[1] = double;
+        }
+
         inode.size = data_len;
-        inode.blocks = self.frags_to_device_blocks(slot as u64 * frags_per_block);
+        inode.blocks = self.frags_to_device_blocks(total_blocks * frags_per_block + meta_frags);
         Ok(())
+    }
+
+    /// Fill one block with fragment pointers in the volume's width and order.
+    fn write_pointer_block(
+        &mut self,
+        block_frag: u64,
+        ptrs: &[u64],
+    ) -> Result<(), FilesystemError> {
+        let mut buf = vec![0u8; self.bsize as usize];
+        let endian = self.endian;
+        for (i, &p) in ptrs.iter().enumerate() {
+            match self.version {
+                UfsVersion::Ufs1 => write_i32(&mut buf, i * 4, p as i32, endian),
+                UfsVersion::Ufs2 => write_i64(&mut buf, i * 8, p as i64, endian),
+            }
+        }
+        self.write_frag_run(block_frag, &buf)
     }
 
     /// `di_blocks` counts device blocks of `fsize >> fs_fsbtodb` bytes — 512 on
@@ -4612,6 +4683,73 @@ mod tests {
 
     /// Rename keeps the inode number and file contents, drops the old
     /// name, exposes the new one, and leaves the volume fsck-clean.
+    /// A file bigger than the 12 direct blocks has to build a single-indirect
+    /// block; one bigger still has to build the double-indirect level. Before
+    /// this, `put` on any UFS volume refused anything over 96 KiB.
+    #[test]
+    fn files_past_the_direct_blocks_round_trip_through_the_indirect_levels() {
+        use super::super::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+        let img = load_fixture("test_ufs1.img.zst");
+        let mut backing = img;
+        let mut fs = UfsFilesystem::open(Cursor::new(&mut backing), 0).expect("open");
+        let direct_cap = fs.bsize * UFS_NDADDR as u64;
+        let root = fs.root().expect("root");
+
+        // Just past the direct blocks: one single-indirect block appears.
+        let body: Vec<u8> = (0..direct_cap as usize + 5000)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let created = fs
+            .create_file(
+                &root,
+                "indirect.bin",
+                &mut body.as_slice(),
+                body.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .expect("create_file past the direct cap");
+        assert_eq!(created.size, body.len() as u64);
+
+        let inode = fs.read_inode(created.location as u32).expect("read inode");
+        assert_ne!(inode.indirect[0], 0, "no single-indirect block was built");
+        assert_eq!(inode.indirect[1], 0, "double indirect should not be needed");
+        assert_ne!(inode.blocks, 0, "di_blocks was not stamped");
+
+        let back = fs.read_file(&created, usize::MAX).expect("read back");
+        assert_eq!(back, body, "indirect-block file did not round-trip");
+    }
+
+    #[test]
+    fn a_file_written_past_the_direct_blocks_survives_a_reopen() {
+        use super::super::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+        let img = load_fixture("test_ufs1.img.zst");
+        let mut backing = img;
+        let len = {
+            let mut fs = UfsFilesystem::open(Cursor::new(&mut backing), 0).expect("open");
+            let len = fs.bsize as usize * (UFS_NDADDR + 3);
+            let body: Vec<u8> = (0..len).map(|i| (i % 199) as u8).collect();
+            let root = fs.root().expect("root");
+            fs.create_file(
+                &root,
+                "big.bin",
+                &mut body.as_slice(),
+                body.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .expect("create_file");
+            len
+        };
+
+        let mut fs = UfsFilesystem::open(Cursor::new(&mut backing), 0).expect("re-open");
+        let root = fs.root().expect("root");
+        let kids = fs.list_directory(&root).expect("list");
+        let big = kids.iter().find(|e| e.name == "big.bin").expect("big.bin");
+        assert_eq!(big.size, len as u64);
+        let back = fs.read_file(big, usize::MAX).expect("read back");
+        assert_eq!(back.len(), len);
+        assert!(back.iter().enumerate().all(|(i, b)| *b == (i % 199) as u8));
+    }
+
     #[test]
     fn rename_preserves_inode_and_content_against_ufs1_fixture() {
         use super::super::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
@@ -4803,9 +4941,9 @@ mod tests {
         );
     }
 
-    /// Files larger than 12 × bsize hit the indirect-block gate and
-    /// return Unsupported. Confirms we don't silently accept oversized
-    /// writes that would corrupt the volume.
+    /// Past the double-indirect level a file needs triple indirection, which
+    /// we do not write. Confirms the refusal and, more importantly, that the
+    /// failed create rolls back rather than leaving an orphan inode behind.
     #[test]
     fn create_file_oversize_returns_unsupported() {
         use super::super::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
@@ -4813,15 +4951,16 @@ mod tests {
         let mut backing = img;
         let mut fs = UfsFilesystem::open(Cursor::new(&mut backing), 0).expect("open");
         let root = fs.root().expect("root");
-        let bsize = fs.bsize as usize;
-        let oversize = vec![0u8; bsize * UFS_NDADDR + 1];
-        let mut src = oversize.as_slice();
+        let nindir = fs.nindir();
+        let cap = (UFS_NDADDR as u64 + nindir + nindir * nindir) * fs.bsize;
+        // The size gate runs before any read, so the source can be synthetic.
+        let mut src = std::io::repeat(0u8).take(cap + 1);
         let err = fs
             .create_file(
                 &root,
                 "toobig.bin",
                 &mut src,
-                oversize.len() as u64,
+                cap + 1,
                 &CreateFileOptions::default(),
             )
             .expect_err("must refuse");
