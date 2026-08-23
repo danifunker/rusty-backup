@@ -30,8 +30,10 @@ laying down a fresh one. NeXT and Solaris x86 are editable in place — see
 `partition::editor::apply_next_edits` / `apply_solaris_x86_edits`.
 
 Filesystem creation is separate from table creation. A table writer produces
-empty partitions; `rb-cli reformat --fs <fs>` fills them. See
-[XFS creation](#xfs-creation--done), which has since shipped.
+empty partitions; `rb-cli reformat --fs <fs>` fills them, and `rb-cli new
+volume <fs>` builds one to pour in with `new hd ... --fill N=PATH`. See
+[XFS creation](#xfs-creation--done), which has since shipped, and
+[UFS1 creation](#ufs1-creation--done).
 
 ## How to add a writer
 
@@ -304,3 +306,38 @@ gives an SGI volume header whose first partition is a real XFS filesystem —
 `rb-cli inspect` and `ls` browse it, and `xfs_repair -n` on the slice cut out
 at its declared offset comes back clean. There is still no
 `rb-cli reformat --fs xfs` (reformat remains HFS-only); `--fill` is the path.
+
+## UFS1 creation — done
+
+`rb-cli new volume ufs`, in `src/fs/ufs_format.rs`. Streamed rather than built
+in memory: a blank FFS is almost all zeros and the sizes people format are the
+ones a `Vec` cannot hold. It follows `newfs(8)`'s own `initcg` / `fsinit`
+sequence rather than inventing a layout, which is what makes the result a
+volume a real BSD would have written.
+
+Notes for anyone extending it:
+
+- **`fs_fpg` is solved for, not chosen.** A cylinder group is as large as it
+  can be while its header, inode bitmap, free-fragment bitmap and cluster maps
+  all still fit inside one `fs_bsize` block. That single constraint is why real
+  FFS volumes carry odd-looking group sizes, and a binary search over it
+  reproduces the fixture's 16384-fragment group exactly.
+- **`fs_dsize` is accumulated, not derived.** Group 0 gives up its head to the
+  boot blocks and the primary superblock and its data area to the cylinder
+  summary; every other group only loses its own metadata. Subtracting
+  `ncg * fs_dblkno` from the size is close enough to look right and wrong by
+  the summary area, which is how `geometry_matches_the_makefs_fixture` came to
+  assert `dsize == 16343` rather than 16344.
+- **4.4BSD `struct cg` only.** The pre-4.4BSD generation NeXTSTEP and SunOS 4
+  use is read and edited but not written: its superblock carries `fs_postbl` /
+  `fs_rotbl` / `fs_npsect` rotational-layout tables that feed the old kernel's
+  allocator, `cbtorpos()` divides by `fs_npsect`, and we have no way to test a
+  guess. A wrong table that looks plausible is worse than no create verb.
+- The root directory takes a whole block with `di_size == DIRBLKSIZ`, matching
+  what `ufs::create_directory` writes, so a formatted volume and an edited one
+  are the same shape.
+
+**Validation.** The derived geometry is asserted field-for-field against the
+`makefs`-built UFS1 fixture (`tests/fixtures/test_ufs1.img.zst`) for the same
+inputs; fresh volumes from 1 MiB to 2 GiB open, list, take files and
+directories, and come back clean from our own `fsck_ufs` before and after.

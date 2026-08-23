@@ -112,6 +112,7 @@ pub mod trdos;
 pub mod tree;
 pub mod ucsd;
 pub mod ufs;
+pub mod ufs_format;
 pub mod ufs_fsck;
 pub mod unix_common;
 pub mod xattr;

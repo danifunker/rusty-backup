@@ -20,7 +20,11 @@ support the disk types (floppy / hard disk / CD-ROM) of the outstanding cores.
   way `mksquashfs` does — unchanged files keep their exact bytes, permissions,
   ownership, timestamps and xattrs. No fsck: SquashFS carries no checksums, so
   there is nothing to repair from),
-  JFS, ReiserFS, UFS1/UFS2, btrfs, Minix V1/V2/V3 (read + edit + create + fsck),
+  JFS, ReiserFS, btrfs,
+  UFS1 / UFS2 (read + edit + fsck both, and `new volume ufs` formats a blank
+  UFS1 in either byte order -- `newfs(8)`'s own layout, 4.4BSD `struct cg`;
+  the pre-4.4BSD generation is read and edited but not written),
+  Minix V1/V2/V3 (read + edit + create + fsck),
   ProDOS (read + edit + create + fsck),
   Apple DOS 3.3 (read + edit + create + fsck),
   UCSD p-System (read + edit + create + fsck),

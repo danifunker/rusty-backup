@@ -1,0 +1,271 @@
+# Tier 1 — self-fixturing.
+#
+# The NeXT disk label and the Solaris x86 VTOC, built from scratch and then
+# edited, with no corpus involved: `new volume ufs` supplies the filesystem
+# and `new hd next` / `new hd solaris-x86` supply the tables.
+#
+# Both labels have a unit trap that a table which merely "parses back" will
+# not catch:
+#
+#   * NeXT counts partitions in the label's own 1024-byte sectors, measured
+#     from the end of a 160-sector front porch. An editor that takes the
+#     512-byte LBA at face value puts a partition at half its intended offset
+#     — and the label still checksums, still parses, and still lists.
+#   * Solaris slice offsets are relative to the Solaris MBR partition, not to
+#     the disk, and the label sector is a whole `struct dk_label` whose XOR
+#     checksum Solaris itself validates. A VTOC-only rewrite reads back fine
+#     here and is refused there.
+#
+# So each case builds the disk, fills a partition with a real UFS volume, and
+# then fscks *through* the table — which only succeeds if the byte offset the
+# label describes is the one the filesystem was written at.
+
+[meta]
+tier = 1
+group = "partition.next-solaris"
+description = "Write and edit NeXT disk labels and Solaris x86 VTOCs, filesystem and all."
+
+# --- NeXT --------------------------------------------------------------------
+
+[[case]]
+id = "partition.next.build-fill-and-check"
+description = "A NeXT label written from scratch places its partition where the UFS actually is"
+[[case.step]]
+args = [
+  "new", "volume", "ufs", "--size", "6M", "--big-endian",
+  "--name", "NeXTRoot", "{scratch}/root.ufs",
+]
+expect_exit = 0
+[[case.step]]
+args = [
+  "new", "hd", "next", "--size", "16M", "--partition", "rest:4.3BSD:/",
+  "--fill", "1={scratch}/root.ufs", "{scratch}/next.img",
+]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/next.img", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+[[case.step.json_equals]]
+path = "partition_table"
+value = "NeXT"
+[[case.step.json_equals]]
+path = "partitions.0.type_name"
+value = "NeXT a (4.3BSD)"
+# The partition starts at the first 1 MiB boundary past the 160 KiB front
+# porch, which is p_base 864 in the label's own sectors.
+[[case.step.json_equals]]
+path = "partitions.0.start_lba"
+value = 2048
+[[case.step]]
+args = ["ls", "{scratch}/next.img@1", "/", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+[[case.step]]
+args = ["fsck", "{scratch}/next.img@1", "--checkonly", "--format", "json"]
+expect_exit = 0
+fsck_clean = true
+
+[[case]]
+id = "partition.next.edit-keeps-the-filesystem"
+description = "Adding, retyping and deleting a NeXT partition leaves the root volume intact"
+[[case.step]]
+args = [
+  "new", "volume", "ufs", "--size", "6M", "--big-endian", "{scratch}/root.ufs",
+]
+expect_exit = 0
+[[case.step]]
+args = [
+  "new", "hd", "next", "--size", "16M", "--partition", "8M:4.3BSD:/",
+  "--fill", "1={scratch}/root.ufs", "{scratch}/next.img",
+]
+expect_exit = 0
+# LBA 18432 is 9 MiB — past the root partition and a whole number of the
+# label's 1024-byte sectors, which is the only offset the label can express.
+[[case.step]]
+args = [
+  "partmap", "add", "{scratch}/next.img",
+  "--start-lba", "18432", "--size", "2M", "--type-string", "swap",
+]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/next.img", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+[[case.step.json_equals]]
+path = "partitions.1.type_name"
+value = "NeXT b (swap)"
+[[case.step.json_equals]]
+path = "partitions.1.start_lba"
+value = 18432
+# An offset that is not a whole label sector has to be refused, not rounded:
+# rounding is how a partition ends up half a sector away from its filesystem.
+[[case.step]]
+args = ["partmap", "move", "{scratch}/next.img", "2", "--start-lba", "18433"]
+expect_exit = 1
+stderr_contains = ["1024-byte sectors"]
+[[case.step]]
+args = ["partmap", "delete", "{scratch}/next.img", "2"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/next.img", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+stdout_not_contains = ["swap"]
+# The point of the whole case: six label rewrites later, the filesystem in
+# partition a is still exactly where the label says it is.
+[[case.step]]
+args = ["fsck", "{scratch}/next.img@1", "--checkonly", "--format", "json"]
+expect_exit = 0
+fsck_clean = true
+
+# --- Solaris x86 -------------------------------------------------------------
+
+[[case]]
+id = "partition.solaris-x86.build-fill-and-check"
+description = "An MBR plus a nested VTOC, both written from scratch, with a UFS root inside"
+[[case.step]]
+args = ["new", "volume", "ufs", "--size", "6M", "--name", "SolRoot", "{scratch}/root.ufs"]
+expect_exit = 0
+[[case.step]]
+args = [
+  "new", "hd", "solaris-x86", "--size", "64M", "--heads", "16", "--sectors", "63",
+  "--partition", "16M:root", "--partition", "rest:swap",
+  "--fill", "1={scratch}/root.ufs", "{scratch}/sol.img",
+]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/sol.img", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+[[case.step.json_equals]]
+path = "partition_table"
+value = "Solaris-x86"
+[[case.step.json_equals]]
+path = "partitions.0.type_name"
+value = "Solaris s0 (root)"
+# Slices 8 and 9 are the label's own boot cylinder and alternates pair, which
+# is why a two-slice request lists four entries.
+[[case.step.json_equals]]
+path = "partitions.2.type_name"
+value = "Solaris s8 (boot)"
+[[case.step.json_equals]]
+path = "partitions.3.type_name"
+value = "Solaris s9 (altsctr)"
+[[case.step]]
+args = ["fsck", "{scratch}/sol.img@1", "--checkonly", "--format", "json"]
+expect_exit = 0
+fsck_clean = true
+
+[[case]]
+id = "partition.solaris-x86.edit-keeps-the-filesystem"
+description = "Retagging and adding slices re-stamps the label without moving the root"
+[[case.step]]
+args = ["new", "volume", "ufs", "--size", "6M", "{scratch}/root.ufs"]
+expect_exit = 0
+[[case.step]]
+args = [
+  "new", "hd", "solaris-x86", "--size", "64M", "--heads", "16", "--sectors", "63",
+  "--partition", "16M:root", "--fill", "1={scratch}/root.ufs", "{scratch}/sol.img",
+]
+expect_exit = 0
+[[case.step]]
+args = ["partmap", "set-type", "{scratch}/sol.img", "1", "--type-string", "usr"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/sol.img", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+[[case.step.json_equals]]
+path = "partitions.0.type_name"
+value = "Solaris s0 (usr)"
+# The boot flag lives on the MBR entry hosting the label, so a slice cannot
+# carry one and the refusal has to say why.
+[[case.step]]
+args = ["partmap", "set-bootable", "{scratch}/sol.img", "1", "--bootable"]
+expect_exit = 1
+stderr_contains = ["MBR entry"]
+[[case.step]]
+args = ["fsck", "{scratch}/sol.img@1", "--checkonly", "--format", "json"]
+expect_exit = 0
+fsck_clean = true
+
+# --- The remaining fixture shapes --------------------------------------------
+
+# The BeOS drop is an MBR type 0xEB on Intel and an APM `Be_BFS` on PowerPC.
+# Both type strings only reached the disk once the catalog knew them, so this
+# case is really a catalog test wearing a disk-builder's coat.
+
+[[case]]
+id = "partition.beos.mbr-and-apm-shapes"
+description = "MBR 0xEB and APM Be_BFS both take a BFS volume and fsck through the table"
+[[case.step]]
+args = ["new", "volume", "bfs", "--size", "72M", "--name", "BeIntel", "{scratch}/le.bfs"]
+expect_exit = 0
+[[case.step]]
+args = [
+  "new", "hd", "mbr", "--size", "80M", "--partition", "rest:EB",
+  "--fill", "1={scratch}/le.bfs", "{scratch}/beos-intel.img",
+]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/beos-intel.img", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+[[case.step.json_equals]]
+path = "partitions.0.type_name"
+value = "BeOS BFS"
+[[case.step]]
+args = ["fsck", "{scratch}/beos-intel.img@1", "--checkonly", "--format", "json"]
+expect_exit = 0
+fsck_clean = true
+[[case.step]]
+args = [
+  "new", "volume", "bfs", "--size", "72M", "--big-endian",
+  "--name", "BePPC", "{scratch}/be.bfs",
+]
+expect_exit = 0
+[[case.step]]
+args = [
+  "new", "hd", "apm", "--size", "80M", "--partition", "rest:Be_BFS:BeOS",
+  "--fill", "1={scratch}/be.bfs", "{scratch}/beos-ppc.img",
+]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/beos-ppc.img", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+[[case.step.json_equals]]
+path = "partition_table"
+value = "APM"
+[[case.step]]
+args = ["fsck", "{scratch}/beos-ppc.img@1", "--checkonly", "--format", "json"]
+expect_exit = 0
+fsck_clean = true
+
+# An SGI slot typed `BSD` used to be written as XFS, because the type catalog
+# offered the keyword and the writer's own table did not have it.
+
+[[case]]
+id = "partition.sgi.bsd-slot-keeps-its-type"
+description = "An SGI volume header with a BSD-typed slot holds a UFS root"
+[[case.step]]
+args = ["new", "volume", "ufs", "--size", "6M", "--big-endian", "{scratch}/root.ufs"]
+expect_exit = 0
+[[case.step]]
+args = [
+  "new", "hd", "sgi", "--size", "32M", "--partition", "rest:BSD",
+  "--fill", "1={scratch}/root.ufs", "{scratch}/sgi.img",
+]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/sgi.img", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+[[case.step.json_equals]]
+path = "partitions.0.type_name"
+value = "SGI BSD"
+[[case.step]]
+args = ["fsck", "{scratch}/sgi.img@1", "--checkonly", "--format", "json"]
+expect_exit = 0
+fsck_clean = true

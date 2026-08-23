@@ -585,16 +585,41 @@ fn write_sgi<W: Write + Seek>(
 /// Map a type keyword to the SGI discriminant, falling back to XFS.
 pub fn sgi_type_raw(text: &str) -> u32 {
     use crate::partition::sgi::SgiPartitionType;
-    let t = text.trim().to_ascii_lowercase();
-    match t.as_str() {
-        "efs" => SgiPartitionType::Efs.as_u32(),
-        "raw" => SgiPartitionType::Raw.as_u32(),
-        "volume" => SgiPartitionType::Volume.as_u32(),
-        "volhdr" => SgiPartitionType::VolHdr.as_u32(),
-        "xfslog" => SgiPartitionType::XfsLog.as_u32(),
-        "xlv" => SgiPartitionType::Xlv.as_u32(),
-        "xvm" => SgiPartitionType::Xvm.as_u32(),
-        _ => SgiPartitionType::Xfs.as_u32(),
+    sgi_type_from_text(text).unwrap_or_else(|| SgiPartitionType::Xfs.as_u32())
+}
+
+/// Resolve an SGI slot type — a keyword as `partmap types --table sgi` lists
+/// it, or a raw decimal / `0x` discriminant. `None` when it is neither, which
+/// is what lets a caller decide its own default.
+pub fn sgi_type_from_text(text: &str) -> Option<u32> {
+    use crate::partition::sgi::SgiPartitionType;
+    let trimmed = text.trim();
+    let named = match trimmed.to_ascii_lowercase().as_str() {
+        "volhdr" => Some(SgiPartitionType::VolHdr),
+        "trkrepl" => Some(SgiPartitionType::TrkRepl),
+        "secrepl" => Some(SgiPartitionType::SecRepl),
+        "raw" => Some(SgiPartitionType::Raw),
+        "bsd" => Some(SgiPartitionType::Bsd),
+        "sysv" => Some(SgiPartitionType::SysV),
+        "volume" => Some(SgiPartitionType::Volume),
+        "efs" => Some(SgiPartitionType::Efs),
+        "lvol" => Some(SgiPartitionType::LVol),
+        "rlvol" => Some(SgiPartitionType::RLVol),
+        "xfs" => Some(SgiPartitionType::Xfs),
+        "xfslog" => Some(SgiPartitionType::XfsLog),
+        "xlv" => Some(SgiPartitionType::Xlv),
+        "xvm" => Some(SgiPartitionType::Xvm),
+        _ => None,
+    };
+    if let Some(t) = named {
+        return Some(t.as_u32());
+    }
+    match trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        Some(hex) => u32::from_str_radix(hex, 16).ok(),
+        None => trimmed.parse::<u32>().ok(),
     }
 }
 

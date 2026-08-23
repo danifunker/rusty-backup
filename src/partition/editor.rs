@@ -1279,46 +1279,13 @@ fn check_dklabel_layout(
 }
 
 /// Map an [`PartitionTableEdit::AddEntry`]/[`PartitionTableEdit::ChangeType`]
-/// type byte/string into the SGI partition-type discriminant. Accepts both
-/// our synthetic MBR-bytes (0xA0 / 0xA1 — what `PartitionTable::partitions`
-/// hands out) and case-insensitive SGI type-name strings (e.g. "XFS",
-/// "EFS"). Falls back to `Unknown` when nothing matches so the user can
-/// type a raw decimal/hex value into the type field and we'll round-trip
-/// it through `partition_type_raw`.
+/// type byte/string into the SGI partition-type discriminant. The string form
+/// is shared with `new hd sgi` via `provision::sgi_type_from_text`, which also
+/// takes a raw decimal / hex discriminant; the byte form accepts the synthetic
+/// 0xA0 / 0xA1 `PartitionTable::partitions` hands out.
 fn parse_sgi_type(byte: u8, type_string: Option<&str>) -> SgiPartitionType {
-    if let Some(s) = type_string {
-        let trimmed = s.trim();
-        let lower = trimmed.to_ascii_lowercase();
-        match lower.as_str() {
-            "xfs" => return SgiPartitionType::Xfs,
-            "efs" => return SgiPartitionType::Efs,
-            "raw" => return SgiPartitionType::Raw,
-            "bsd" => return SgiPartitionType::Bsd,
-            "sysv" => return SgiPartitionType::SysV,
-            "volume" => return SgiPartitionType::Volume,
-            "volhdr" => return SgiPartitionType::VolHdr,
-            "xfslog" => return SgiPartitionType::XfsLog,
-            "xlv" => return SgiPartitionType::Xlv,
-            "xvm" => return SgiPartitionType::Xvm,
-            "lvol" => return SgiPartitionType::LVol,
-            "rlvol" => return SgiPartitionType::RLVol,
-            "trkrepl" => return SgiPartitionType::TrkRepl,
-            "secrepl" => return SgiPartitionType::SecRepl,
-            _ => {
-                // Accept "0x07" / "7" / "07" raw values for full fidelity.
-                let parsed = if let Some(hex) = trimmed
-                    .strip_prefix("0x")
-                    .or_else(|| trimmed.strip_prefix("0X"))
-                {
-                    u32::from_str_radix(hex, 16).ok()
-                } else {
-                    trimmed.parse::<u32>().ok()
-                };
-                if let Some(raw) = parsed {
-                    return SgiPartitionType::from_raw(raw);
-                }
-            }
-        }
+    if let Some(raw) = type_string.and_then(crate::partition::provision::sgi_type_from_text) {
+        return SgiPartitionType::from_raw(raw);
     }
     match byte {
         SGI_TYPE_BYTE_XFS => SgiPartitionType::Xfs,

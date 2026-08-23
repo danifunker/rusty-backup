@@ -65,7 +65,7 @@ use crate::fs::CompactResult;
 /// (0) and `SBLOCK_PIGGY` (262144) are intentionally not in the list:
 /// neither shape appears on any disk image we expect to encounter.
 const SB_OFFSET_UFS2: u64 = 65536;
-const SB_OFFSET_UFS1: u64 = 8192;
+pub(crate) const SB_OFFSET_UFS1: u64 = 8192;
 
 /// UFS1 magic — `0x00011954`, encoded little-endian as `54 19 01 00`.
 pub(crate) const MAGIC_UFS1: u32 = 0x0001_1954;
@@ -96,12 +96,12 @@ pub(crate) const OFF_FRAG: usize = 0x038; // fs_frag        i32 — frags per bl
 pub(crate) const OFF_FSBTODB: usize = 0x064; // fs_fsbtodb     i32 — frag -> device-block shift
 pub(crate) const OFF_IPG: usize = 0x0B8; // fs_ipg         u32 — inodes per CG
 pub(crate) const OFF_FPG: usize = 0x0BC; // fs_fpg         i32 — fragments per CG
-const OFF_VOLNAME: usize = 680; // fs_volname[32] — `u_char[MAXVOLLEN]`
+pub(crate) const OFF_VOLNAME: usize = 680; // fs_volname[32] — `u_char[MAXVOLLEN]`
 pub(crate) const OFF_SIZE_UFS2: usize = 1080; // fs_size        i64 — UFS2 64-bit fragments
-const OFF_MAXSYMLINKLEN: usize = 0x528; // fs_maxsymlinklen i32 — inline-symlink cutoff (60 for UFS1, 120 for UFS2)
+pub(crate) const OFF_MAXSYMLINKLEN: usize = 0x528; // fs_maxsymlinklen i32 — inline-symlink cutoff (60 for UFS1, 120 for UFS2)
 const OFF_FLAGS2: usize = 0x35E; // fs_flags2      i32 (relevant journal bits live elsewhere too, but this is the canonical "ENABLED" word in modern UFS2)
 
-const VOLNAME_LEN: usize = 32;
+pub(crate) const VOLNAME_LEN: usize = 32;
 
 // ---- Dinode constants (`struct ufs1_dinode` / `struct ufs2_dinode`) ----
 
@@ -117,20 +117,20 @@ const UFS_NIADDR: usize = 3; // indirect disk-block pointers per inode
 const UFS_MAXPATHLEN: usize = 1024;
 
 /// UFS1 on-disk dinode is exactly 128 bytes.
-const DINODE1_SIZE: u64 = 128;
+pub(crate) const DINODE1_SIZE: u64 = 128;
 /// UFS2 on-disk dinode is exactly 256 bytes.
 const DINODE2_SIZE: u64 = 256;
 
 // UFS1 dinode field offsets (struct ufs1_dinode in FreeBSD `sys/ufs/ufs/dinode.h`).
-const D1_OFF_MODE: usize = 0; // di_mode    u16
-const D1_OFF_NLINK: usize = 2; // di_nlink   i16
-const D1_OFF_SIZE: usize = 8; // di_size    u64
-const D1_OFF_MTIME: usize = 24; // di_mtime   i32 (epoch seconds)
-const D1_OFF_DB: usize = 40; // di_db[12]  i32
+pub(crate) const D1_OFF_MODE: usize = 0; // di_mode    u16
+pub(crate) const D1_OFF_NLINK: usize = 2; // di_nlink   i16
+pub(crate) const D1_OFF_SIZE: usize = 8; // di_size    u64
+pub(crate) const D1_OFF_MTIME: usize = 24; // di_mtime   i32 (epoch seconds)
+pub(crate) const D1_OFF_DB: usize = 40; // di_db[12]  i32
 const D1_OFF_IB: usize = 88; // di_ib[3]   i32
-const D1_OFF_BLOCKS: usize = 104; // di_blocks  i32 — disk blocks actually held
-const D1_OFF_UID: usize = 112; // di_uid     u32
-const D1_OFF_GID: usize = 116; // di_gid     u32
+pub(crate) const D1_OFF_BLOCKS: usize = 104; // di_blocks  i32 — disk blocks actually held
+pub(crate) const D1_OFF_UID: usize = 112; // di_uid     u32
+pub(crate) const D1_OFF_GID: usize = 116; // di_gid     u32
 
 // UFS2 dinode field offsets (struct ufs2_dinode). di_mode + di_nlink
 // share offsets with UFS1 (offsets 0 + 2); only the version-specific
@@ -1709,7 +1709,7 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
 //     need to special-case UFS.
 
 /// UFS directory record d_type values (`sys/ufs/ufs/dirent.h`).
-const DT_DIR: u8 = 4;
+pub(crate) const DT_DIR: u8 = 4;
 const DT_REG: u8 = 8;
 const DT_LNK: u8 = 10;
 
@@ -1719,12 +1719,12 @@ const DIRENT_ALIGN: usize = 4;
 
 /// On-disk directory chunk size (`DIRBLKSIZ` = `DEV_BSIZE` in UFS).
 /// Directory entries never cross a 512-byte boundary.
-const DIRBLKSIZ: usize = 512;
+pub(crate) const DIRBLKSIZ: usize = 512;
 
 /// Compute the minimum d_reclen needed to hold a directory entry with
 /// the given name length. Header (8) + name + NUL pad up to 4-byte
 /// alignment.
-fn dirent_record_size(namlen: usize) -> usize {
+pub(crate) fn dirent_record_size(namlen: usize) -> usize {
     (DIRENT_HDR_LEN + namlen + 1 + (DIRENT_ALIGN - 1)) & !(DIRENT_ALIGN - 1)
 }
 
@@ -3055,7 +3055,7 @@ pub(crate) fn write_dirent_namlen(
     }
 }
 
-fn write_u16(buf: &mut [u8], off: usize, v: u16, endian: UfsEndian) {
+pub(crate) fn write_u16(buf: &mut [u8], off: usize, v: u16, endian: UfsEndian) {
     let bytes = match endian {
         UfsEndian::Little => v.to_le_bytes(),
         UfsEndian::Big => v.to_be_bytes(),
@@ -3063,11 +3063,11 @@ fn write_u16(buf: &mut [u8], off: usize, v: u16, endian: UfsEndian) {
     buf[off..off + 2].copy_from_slice(&bytes);
 }
 
-fn write_i16(buf: &mut [u8], off: usize, v: i16, endian: UfsEndian) {
+pub(crate) fn write_i16(buf: &mut [u8], off: usize, v: i16, endian: UfsEndian) {
     write_u16(buf, off, v as u16, endian);
 }
 
-fn write_u32(buf: &mut [u8], off: usize, v: u32, endian: UfsEndian) {
+pub(crate) fn write_u32(buf: &mut [u8], off: usize, v: u32, endian: UfsEndian) {
     let bytes = match endian {
         UfsEndian::Little => v.to_le_bytes(),
         UfsEndian::Big => v.to_be_bytes(),
@@ -3075,7 +3075,7 @@ fn write_u32(buf: &mut [u8], off: usize, v: u32, endian: UfsEndian) {
     buf[off..off + 4].copy_from_slice(&bytes);
 }
 
-fn write_i32(buf: &mut [u8], off: usize, v: i32, endian: UfsEndian) {
+pub(crate) fn write_i32(buf: &mut [u8], off: usize, v: i32, endian: UfsEndian) {
     write_u32(buf, off, v as u32, endian);
 }
 
@@ -3087,7 +3087,7 @@ fn write_u64(buf: &mut [u8], off: usize, v: u64, endian: UfsEndian) {
     buf[off..off + 8].copy_from_slice(&bytes);
 }
 
-fn write_i64(buf: &mut [u8], off: usize, v: i64, endian: UfsEndian) {
+pub(crate) fn write_i64(buf: &mut [u8], off: usize, v: i64, endian: UfsEndian) {
     write_u64(buf, off, v as u64, endian);
 }
 

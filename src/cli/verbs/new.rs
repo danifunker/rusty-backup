@@ -165,6 +165,14 @@ pub enum FsKind {
     /// `--name` sets the 10-char disc name (space-padded).
     #[value(alias = "acorn")]
     Adfs,
+    /// UFS1 / FFS (4.4BSD, FreeBSD, NetBSD, OpenBSD, Solaris). A `newfs`
+    /// volume with the 4.4BSD `struct cg`: 8 KiB blocks over 1 KiB fragments
+    /// by default, one inode per 4 fragments, and an empty root directory.
+    /// `--block-size` sets `fs_bsize` (fragments are an eighth of it),
+    /// `--bytes-per-inode` the inode density, `--big-endian` the SPARC / m68k
+    /// byte order, and `--name` the volume label.
+    #[value(alias = "ufs1", alias = "ffs")]
+    Ufs,
 }
 
 /// The three media classes `new` creates. CD-ROM images are not here —
@@ -364,6 +372,10 @@ pub enum VolumeFs {
     /// sectors.
     #[value(alias = "beos-ofs")]
     Ofs,
+    /// UFS1 / FFS (4.4BSD, FreeBSD, NetBSD, OpenBSD, Solaris). `--big-endian`
+    /// writes the SPARC / m68k byte order.
+    #[value(alias = "ufs1", alias = "ffs")]
+    Ufs,
 }
 
 impl VolumeFs {
@@ -389,6 +401,7 @@ impl VolumeFs {
             VolumeFs::Minix3 => FsKind::Minix3,
             VolumeFs::Bfs => FsKind::Bfs,
             VolumeFs::Ofs => FsKind::Ofs,
+            VolumeFs::Ufs => FsKind::Ufs,
         }
     }
 }
@@ -941,6 +954,7 @@ fn format_image(args: NewArgs) -> Result<()> {
         FsKind::Adfs => format_and_write(&args.image, &args.size, &args.name, |_size, name| {
             Ok(crate::fs::adfs::create_blank_adfs(name))
         }),
+        FsKind::Ufs => write_blank_ufs_image(&args),
     }
 }
 
@@ -1051,6 +1065,46 @@ fn sanitize_os9_volume_name(name: &str) -> String {
 /// seeks and writes only the populated regions (boot, MFT, metadata, backup
 /// boot at the last sector), so the bulk of the volume stays sparse rather than
 /// being materialized in RAM.
+/// UFS is streamed rather than built in memory: a blank volume is almost all
+/// zeros, and the sizes people format are the ones a `Vec` cannot hold.
+fn write_blank_ufs_image(args: &NewArgs) -> Result<()> {
+    use crate::fs::ufs::UfsEndian;
+    use crate::fs::ufs_format::{write_blank_ufs1, Ufs1FormatParams};
+
+    let size = parse_size(&args.size).context("parsing --size")?;
+    let block_size = u64::from(args.block_size.unwrap_or(8192));
+    let params = Ufs1FormatParams {
+        size_bytes: size,
+        block_size,
+        // FFS puts eight fragments in a block; `newfs` has never shipped
+        // another default and the reader's MAXFRAG gate matches.
+        frag_size: block_size / 8,
+        bytes_per_inode: args.bytes_per_inode.unwrap_or(0),
+        endian: if args.big_endian {
+            UfsEndian::Big
+        } else {
+            UfsEndian::Little
+        },
+        label: Some(args.name.clone()),
+    };
+    let mut file = std::fs::File::create(&args.image)
+        .with_context(|| format!("creating {}", args.image.display()))?;
+    file.set_len(size)
+        .with_context(|| format!("sizing {}", args.image.display()))?;
+    let geo = write_blank_ufs1(&mut file, &params)
+        .with_context(|| format!("formatting UFS1 into {}", args.image.display()))?;
+    log_stderr(format!(
+        "wrote {} ({size} bytes, UFS1 bsize={} fsize={} {} cylinder group(s), {} inodes, volume {:?})",
+        args.image.display(),
+        geo.bsize,
+        geo.fsize,
+        geo.ncg,
+        geo.ncg * geo.ipg,
+        args.name,
+    ));
+    Ok(())
+}
+
 fn write_blank_ntfs_image(
     image: &std::path::Path,
     total_size: u64,
