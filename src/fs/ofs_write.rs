@@ -328,9 +328,14 @@ impl<R: Read + Write + Seek + Send> OfsFilesystem<R> {
 
         // Fragmented: one extent-list sector plus however many runs it takes.
         let runs = self.alloc_extents(sectors)?;
-        let list = self.alloc_contiguous(1).inspect_err(|_| {
-            let _ = self.free_sectors(&runs);
-        })?;
+        // `inspect_err` is 1.76; the engine floor is 1.73.
+        let list = match self.alloc_contiguous(1) {
+            Ok(l) => l,
+            Err(e) => {
+                let _ = self.free_sectors(&runs);
+                return Err(e);
+            }
+        };
         let mut cursor = 0usize;
         for (start, count) in &runs {
             let span = (*count * SECTOR) as usize;
