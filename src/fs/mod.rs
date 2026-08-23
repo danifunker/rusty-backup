@@ -78,6 +78,8 @@ pub mod ntfs_clone;
 pub mod ntfs_format;
 pub mod ntfs_fsck;
 mod ntfs_tables;
+pub mod ofs;
+pub mod ofs_write;
 #[cfg(feature = "optical")]
 pub mod optical_fs;
 pub mod oric;
@@ -464,6 +466,13 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
     // Sector 0 again: AmigaDOS "DOS\x" boot block (variants 0..7).
     if &sector0[0..3] == b"DOS" && sector0[3] <= 7 {
         return "affs";
+    }
+
+    // BeOS OFS (pre-BFS, DR1..DR8): a table of contents at sector 0 whose
+    // bitmap geometry has to cover the volume it claims. No magic number, so
+    // this runs after every format that has one.
+    if ofs::OfsToc::parse(&sector0).is_ok() {
+        return "ofs";
     }
 
     // Sector 128 (offset 65536 = 0x10000): btrfs superblock AND ReiserFS
@@ -1275,6 +1284,7 @@ pub fn fs_name_for(partition_type: u8, partition_type_string: Option<&str>) -> &
         // Minix (0x81) and old Minix (0x80).
         0x80 | 0x81 => "Minix",
         0xEB => "BFS (BeOS)",
+        0xEC => "BeOS OFS",
         _ => "unknown",
     }
 }
@@ -1745,6 +1755,10 @@ pub fn open_filesystem_full<R: Read + Seek + Send + 'static>(
                     partition_offset,
                 )?)),
                 "bfs" => Ok(Box::new(bfs::BfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "ofs" => Ok(Box::new(ofs::OfsFilesystem::open(
                     reader,
                     partition_offset,
                 )?)),
@@ -2297,6 +2311,10 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                 // `set_owner` / `repair`) — create/delete still report
                 // Unsupported, which is the caller's cue.
                 "jfs" => Ok(Box::new(jfs::JfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "ofs" => Ok(Box::new(ofs::OfsFilesystem::open(
                     reader,
                     partition_offset,
                 )?)),

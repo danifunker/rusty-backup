@@ -626,7 +626,20 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
             if magic == 0x0007_2959 || magic == 0x0007_295A {
                 return Some("EFS".to_string());
             }
+            if crate::fs::bfs::BfsSuperBlock::parse(&buf).is_ok() {
+                return Some("BFS".to_string());
+            }
         }
+    }
+
+    // BeOS BFS on a bare volume with no PC boot block (the BeOS/PPC layout),
+    // and the pre-BFS OFS, whose table of contents also lives at sector 0.
+    // OFS has no magic number, so its geometry check is what keeps it honest.
+    if crate::fs::bfs::BfsSuperBlock::parse(first_sector).is_ok() {
+        return Some("BFS".to_string());
+    }
+    if crate::fs::ofs::OfsToc::parse(first_sector).is_ok() {
+        return Some("BeOS OFS".to_string());
     }
 
     // SGI EFS v1: a different magic at a different offset, so it cannot collide
