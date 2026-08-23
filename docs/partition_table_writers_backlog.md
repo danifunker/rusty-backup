@@ -378,3 +378,38 @@ are byte-identical**; a cylinder group's `cg_btot` / `cg_b` sum to its
 `cs_nbfree` exactly as the reference's do. Fresh volumes of both generations,
 from 1 MiB to 2 GiB, open, list, take files and directories, and come back
 clean from our own `fsck_ufs` before and after.
+
+### Validated against a real NeXTSTEP 3.3
+
+Everything above is our own reading of our own bytes. Running the result under
+the **Previous** emulator (NeXTstation, 68040, Rev 2.5 v66 ROM) with a NeXTSTEP
+3.3 disk as SCSI 0 and a `new hd next` disk as SCSI 1 found three defects that
+no amount of self-consistency checking would have:
+
+- **`DIRBLKSIZ` is `DEV_BSIZE`, and NeXT's is 1024, not 512.** Directory
+  records never cross one, so on a NeXT volume they are chunked in 1024 bytes.
+  We hardcoded 512, which meant a created root directory ran `.` + `..` out to
+  512 bytes and then stopped — a NeXTSTEP kernel reads the remaining 512 bytes
+  of the chunk as a corrupt directory. It also truncated `dir_find` /
+  `dir_remove` chunk walks, so entries after a record straddling the assumed
+  boundary were invisible: on the reference disk that hid `/private/etc/fstab`
+  (entry 106 of 110) from every write path while `ls` listed it happily.
+- **The allocator debited the wrong counter.** FFS counts a wholly free block
+  in `cs_nbfree` and only counts fragments in `cs_nffree` while they are *not*
+  part of a free block. Taking a whole block was decrementing `cs_nffree`,
+  which drove it **negative** (-5 after one small write) instead of moving
+  `cs_nbfree`. `cs_delta_for` now derives both deltas by comparing the bitmap
+  either side of the change, which is right for whole-block and sub-block
+  runs alike.
+- **Counter updates never reached the cylinder-summary area.** `update_cg_cs`
+  wrote the group header only, leaving `fs_cs` at `fs_csaddr` and
+  `fs_cstotal` in the superblock stale. A real `fsck` compares them, calls the
+  filesystem dirty and rewrites it — which is why NeXTSTEP dropped to
+  single-user on the next boot of any disk we had written to.
+
+The evidence either side of the fix: the NeXTSTEP kernel prints
+`Disk Label: Disk / Disk Capacity 127MB` for a `new hd next` disk, so it
+parses our label; and a disk our writer has touched now boots NeXTSTEP to its
+login window, where before the fix it always halted at a single-user prompt.
+On the reference disk after a write, 0 of 256 groups disagree with the summary
+area and `fs_cstotal` equals the sum of every group's counters.

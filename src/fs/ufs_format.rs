@@ -31,10 +31,10 @@ use std::io::{Seek, SeekFrom, Write};
 
 use super::filesystem::FilesystemError;
 use super::ufs::{
-    dirent_record_size, write_dirent_namlen, write_i16, write_i32, write_i64, write_u16, write_u32,
-    CgLayout, UfsEndian, CG_MAGIC, D1_OFF_BLOCKS, D1_OFF_DB, D1_OFF_GID, D1_OFF_MODE, D1_OFF_MTIME,
-    D1_OFF_NLINK, D1_OFF_SIZE, D1_OFF_UID, DINODE1_SIZE, DIRBLKSIZ, DT_DIR, MAGIC_OFF, MAGIC_UFS1,
-    OFF_MAXSYMLINKLEN, OFF_VOLNAME, ROOT_INODE, SB_OFFSET_UFS1, VOLNAME_LEN,
+    dev_bsize, dirent_record_size, write_dirent_namlen, write_i16, write_i32, write_i64, write_u16,
+    write_u32, CgLayout, UfsEndian, CG_MAGIC, D1_OFF_BLOCKS, D1_OFF_DB, D1_OFF_GID, D1_OFF_MODE,
+    D1_OFF_MTIME, D1_OFF_NLINK, D1_OFF_SIZE, D1_OFF_UID, DINODE1_SIZE, DT_DIR, MAGIC_OFF,
+    MAGIC_UFS1, OFF_MAXSYMLINKLEN, OFF_VOLNAME, ROOT_INODE, SB_OFFSET_UFS1, VOLNAME_LEN,
 };
 
 /// `SBLOCKSIZE` — the space FFS reserves for a superblock, whatever the
@@ -814,6 +814,10 @@ fn write_root_directory<W: Write + Seek>(
     // `d_type` and an 8-bit length. Writing the wrong one is invisible here
     // and makes the root directory unreadable on the target system.
     let old_fmt = geo.cg_layout == CgLayout::Bsd43;
+    // `DIRBLKSIZ` is the volume's `DEV_BSIZE`, which is 1024 on NeXTSTEP and
+    // 512 on BSD. Getting it wrong leaves a root directory whose records stop
+    // half way through the chunk the kernel reads, which reads as corruption.
+    let dirblksiz = dev_bsize(geo.fsize, geo.fsbtodb);
     let mut block = vec![0u8; geo.bsize as usize];
     let dot = dirent_record_size(1);
     write_u32(&mut block, 0, ROOT_INODE, endian);
@@ -821,7 +825,7 @@ fn write_root_directory<W: Write + Seek>(
     write_dirent_namlen(&mut block, 0, DT_DIR, 1, old_fmt, endian);
     block[8] = b'.';
     write_u32(&mut block, dot, ROOT_INODE, endian);
-    write_u16(&mut block, dot + 4, (DIRBLKSIZ - dot) as u16, endian);
+    write_u16(&mut block, dot + 4, (dirblksiz - dot) as u16, endian);
     write_dirent_namlen(&mut block, dot, DT_DIR, 2, old_fmt, endian);
     block[dot + 8] = b'.';
     block[dot + 9] = b'.';
@@ -831,7 +835,7 @@ fn write_root_directory<W: Write + Seek>(
     let mut dinode = vec![0u8; DINODE1_SIZE as usize];
     write_u16(&mut dinode, D1_OFF_MODE, 0o040755, endian);
     write_i16(&mut dinode, D1_OFF_NLINK, 2, endian);
-    write_i64(&mut dinode, D1_OFF_SIZE, DIRBLKSIZ as i64, endian);
+    write_i64(&mut dinode, D1_OFF_SIZE, dirblksiz as i64, endian);
     write_i32(&mut dinode, D1_OFF_MTIME, 0, endian);
     write_i32(&mut dinode, D1_OFF_DB, root_block as i32, endian);
     // `di_blocks` counts device blocks, which is the fragment itself on a
@@ -1227,6 +1231,71 @@ mod tests {
                 report.warnings,
             );
         }
+    }
+
+    /// `DIRBLKSIZ` is the volume's own `DEV_BSIZE` — 1024 on NeXTSTEP, 512 on
+    /// BSD. A root directory chunked at 512 on a NeXT volume ends its records
+    /// half way through the 1024 bytes the kernel reads, and the kernel calls
+    /// that a corrupt directory. The NeXTSTEP reference disks put 1024 in
+    /// `di_size` for `/` and `/private`.
+    #[test]
+    fn the_root_directory_uses_the_volumes_own_chunk_size() {
+        for (p, want) in [
+            (params(16 * 1024 * 1024), 512u64),
+            (params_43(32 * 1024 * 1024), 1024u64),
+        ] {
+            let geo = plan(&p).expect("plan");
+            let img = create_blank_ufs1(&p).expect("format");
+            let mut fs = UfsFilesystem::open(Cursor::new(img.clone()), 0).expect("open");
+            assert_eq!(fs.dirblksiz as u64, want, "{:?}", p.cg_layout);
+
+            // The root dinode's di_size, straight off the image.
+            let at = (geo.iblkno * geo.fsize + u64::from(ROOT_INODE) * DINODE1_SIZE) as usize;
+            let raw = &img[at + D1_OFF_SIZE..at + D1_OFF_SIZE + 8];
+            let size = match p.endian {
+                UfsEndian::Little => u64::from_le_bytes(raw.try_into().unwrap()),
+                UfsEndian::Big => u64::from_be_bytes(raw.try_into().unwrap()),
+            };
+            assert_eq!(size, want, "root di_size for {:?}", p.cg_layout);
+            let root = fs.root().expect("root");
+            assert!(fs.list_directory(&root).expect("ls").is_empty());
+        }
+    }
+
+    /// The chunk size also decides where a directory walk may stop. With 512
+    /// assumed on a 1024-chunk volume, a record straddling the 512 mark makes
+    /// every later entry invisible to `dir_find` / `dir_remove` — which is how
+    /// a real NeXTSTEP `/private/etc` hid its own `fstab` from us.
+    #[test]
+    fn entries_past_the_first_512_bytes_can_still_be_removed() {
+        let mut backing = create_blank_ufs1(&params_43(32 * 1024 * 1024)).expect("format");
+        let names: Vec<String> = (0..60).map(|i| format!("file{i:03}-padding")).collect();
+        {
+            let mut fs = UfsFilesystem::open(Cursor::new(&mut backing), 0).expect("open");
+            let root = fs.root().expect("root");
+            for n in &names {
+                fs.create_directory(&root, n, &CreateDirectoryOptions::default())
+                    .unwrap_or_else(|e| panic!("mkdir {n}: {e}"));
+            }
+        }
+        let last = names.last().unwrap();
+        let mut fs = UfsFilesystem::open(Cursor::new(&mut backing), 0).expect("re-open");
+        let root = fs.root().expect("root");
+        let kids = fs.list_directory(&root).expect("ls");
+        assert_eq!(kids.len(), names.len());
+        let target = kids.iter().find(|e| &e.name == last).expect("last entry");
+        // Listing it is not enough: removal is what goes through the chunk walk.
+        fs.delete_entry(&root, target).expect("delete a late entry");
+        let after = fs.list_directory(&root).expect("ls again");
+        assert_eq!(after.len(), names.len() - 1);
+        assert!(!after.iter().any(|e| &e.name == last));
+        let report = fsck_ufs(&mut fs).expect("fsck");
+        assert!(
+            report.errors.is_empty() && report.warnings.is_empty(),
+            "{:?} / {:?}",
+            report.errors,
+            report.warnings,
+        );
     }
 
     #[test]
