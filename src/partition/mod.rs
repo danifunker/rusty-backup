@@ -5,12 +5,14 @@ pub mod editor;
 pub mod gpt;
 pub mod mac_cd_builder;
 pub mod mbr;
+pub mod next;
 pub mod provision;
 pub mod rdb;
 pub mod resize;
 pub mod sgi;
 pub mod sgi_dklabel;
 pub mod sgi_hdd_builder;
+pub mod solaris_x86;
 pub mod sun;
 pub mod type_catalog;
 pub mod x68k;
@@ -24,9 +26,11 @@ use apm::Apm;
 use atari::{looks_like_ahdi_root, AhdiPartitionKind, AhdiTable, AHDI_NUM_SLOTS};
 use gpt::Gpt;
 use mbr::Mbr;
+use next::NextDiskLabel;
 use rdb::{Rdb, RDSK_SIGNATURE};
 use sgi::{SgiVolumeHeader, SGI_TYPE_BYTE_EFS, SGI_TYPE_BYTE_XFS, SGI_VOLHDR_MAGIC};
 use sgi_dklabel::SgiDiskLabel;
+use solaris_x86::SolarisX86Label;
 use sun::SunDiskLabel;
 use x68k::X68kPartitionTable;
 
@@ -55,6 +59,17 @@ pub enum PartitionTable {
     /// Sun disk label (SMI VTOC) — SPARC Solaris / SunOS disks. 8 slices,
     /// big-endian, magic `0xDABE` at byte 508; see `src/partition/sun.rs`.
     Sun(SunDiskLabel),
+    /// NeXT disk label — NeXTSTEP / OPENSTEP disks on m68k *and* Intel. Up to
+    /// 8 partitions, big-endian, counted in `d_secsize` (1024-byte) sectors
+    /// past a front porch; see `src/partition/next.rs`.
+    Next(NextDiskLabel),
+    /// Solaris x86 — an ordinary MBR whose Solaris partition (type `0x82` /
+    /// `0xBF`) nests a 16-slice VTOC in its second sector. Slice offsets are
+    /// partition-relative; see `src/partition/solaris_x86.rs`.
+    SolarisX86 {
+        mbr: Mbr,
+        label: SolarisX86Label,
+    },
     /// Atari HD File System Driver — MBR-equivalent for Atari ST / TT / Falcon
     /// hard-disk images. 4 primary slots + XGM extended chains, big-endian,
     /// no boot signature; see `src/partition/atari.rs`.
@@ -844,6 +859,20 @@ impl PartitionTable {
             return Ok(PartitionTable::Sun(SunDiskLabel::parse(&mbr_data)?));
         }
 
+        // NeXT disk label (NeXTSTEP / OPENSTEP). Four checksummed copies at
+        // 512-byte blocks 0/15/30/45. This runs before MBR parsing because a
+        // NeXTSTEP/Intel disk also carries a valid 0xAA55 boot sector with an
+        // empty partition table, which would otherwise win.
+        reader
+            .seek(SeekFrom::Start(0))
+            .map_err(RustyBackupError::Io)?;
+        if let Some(label) = next::detect(reader) {
+            return Ok(PartitionTable::Next(label));
+        }
+        reader
+            .seek(SeekFrom::Start(0))
+            .map_err(RustyBackupError::Io)?;
+
         // Check for APM (Driver Descriptor Record signature 0x4552 at offset 0)
         let ddr_sig = u16::from_be_bytes([mbr_data[0], mbr_data[1]]);
         if ddr_sig == 0x4552 {
@@ -1035,6 +1064,17 @@ impl PartitionTable {
                 }
             }
         } else {
+            // Solaris x86 nests a VTOC inside an MBR partition. Probe before
+            // the EBR walk so a Solaris disk surfaces slices rather than a
+            // single opaque "Linux swap" entry (0x82 is shared with swap, so
+            // the VTOC's own sanity word is what decides).
+            if let Some(label) = solaris_x86::detect(reader, &mbr) {
+                return Ok(PartitionTable::SolarisX86 { mbr, label });
+            }
+            reader
+                .seek(SeekFrom::Start(0))
+                .map_err(RustyBackupError::Io)?;
+
             // Parse EBR chain for any extended partition entries
             for entry in &mbr.entries {
                 if entry.is_extended() && !entry.is_empty() {
@@ -1068,6 +1108,11 @@ impl PartitionTable {
             }
             // No platform convention; `@DH0` is the identity users know.
             PartitionTable::Rdb(_) => Some(raw),
+            // NeXTSTEP names slots by letter; the number behind `a` is 0.
+            PartitionTable::Next(_) => Some(raw),
+            // Solaris `format(1M)` numbers slices from 0; `index` already is
+            // the slice number because the browse list keeps VTOC positions.
+            PartitionTable::SolarisX86 { .. } => Some(raw),
             _ => None,
         }
     }
@@ -1082,6 +1127,8 @@ impl PartitionTable {
                 | PartitionTable::Sgi(_)
                 | PartitionTable::SgiDkLabel(_)
                 | PartitionTable::Sun(_)
+                | PartitionTable::Next(_)
+                | PartitionTable::SolarisX86 { .. }
                 | PartitionTable::Rdb(_)
         )
     }
@@ -1276,6 +1323,57 @@ impl PartitionTable {
                     start_byte: None,
                     size_bytes: s.size_bytes(),
                     bootable: false,
+                    is_logical: false,
+                    is_extended_container: false,
+                    partition_type_string: None,
+                    hfs_block_size: None,
+                    rdb_part_block: None,
+                    drv_name: None,
+                })
+                .collect(),
+            PartitionTable::Next(label) => label
+                .browsable_partitions()
+                .map(|(i, p)| PartitionInfo {
+                    index: i,
+                    // NeXTSTEP partitions are 4.3BSD FFS; leave the type byte
+                    // at 0 so `open_filesystem` finds the big-endian UFS super
+                    // block itself. Swap slots simply won't resolve.
+                    type_name: format!(
+                        "NeXT {} ({})",
+                        next::NextPartition::letter(i),
+                        if p.fs_type.is_empty() {
+                            "unknown".to_string()
+                        } else {
+                            p.fs_type.clone()
+                        }
+                    ),
+                    partition_type_byte: 0,
+                    start_lba: p.start_byte / 512,
+                    // Partitions are counted in 1024-byte sectors, so the
+                    // start is not `start_lba * 512` in general.
+                    start_byte: Some(p.start_byte),
+                    size_bytes: p.size_bytes,
+                    bootable: next::NextPartition::letter(i) == label.root_partition,
+                    is_logical: false,
+                    is_extended_container: false,
+                    partition_type_string: None,
+                    hfs_block_size: None,
+                    rdb_part_block: None,
+                    drv_name: None,
+                })
+                .collect(),
+            PartitionTable::SolarisX86 { label, .. } => label
+                .browsable_slices()
+                .map(|(i, s)| PartitionInfo {
+                    index: i,
+                    // Solaris slices are UFS; leave the type byte at 0 so
+                    // `open_filesystem` finds the superblock itself.
+                    type_name: format!("Solaris s{i} ({})", s.tag_name()),
+                    partition_type_byte: 0,
+                    start_lba: s.start_sector,
+                    start_byte: None,
+                    size_bytes: s.size_bytes(),
+                    bootable: s.tag == 2,
                     is_logical: false,
                     is_extended_container: false,
                     partition_type_string: None,
@@ -1515,6 +1613,8 @@ impl PartitionTable {
         "SGI",
         "SGI-DkLabel",
         "Sun",
+        "NeXT",
+        "Solaris-x86",
         "AHDI",
         "X68k",
         "None",
@@ -1566,6 +1666,8 @@ impl PartitionTable {
             PartitionTable::Sgi(_) => "SGI",
             PartitionTable::SgiDkLabel(_) => "SGI-DkLabel",
             PartitionTable::Sun(_) => "Sun",
+            PartitionTable::Next(_) => "NeXT",
+            PartitionTable::SolarisX86 { .. } => "Solaris-x86",
             PartitionTable::Ahdi(_) => "AHDI",
             PartitionTable::X68k { .. } => "X68k",
             PartitionTable::None { .. } => "None",
@@ -1593,6 +1695,8 @@ impl PartitionTable {
             | PartitionTable::Sgi(_)
             | PartitionTable::SgiDkLabel(_)
             | PartitionTable::Sun(_)
+            | PartitionTable::Next(_)
+            | PartitionTable::SolarisX86 { .. }
             | PartitionTable::Ahdi(_)
             | PartitionTable::X68k { .. }
             | PartitionTable::None { .. }
@@ -2733,10 +2837,12 @@ mod type_name_parity {
             PartitionTable::Sgi(_) => 4,
             PartitionTable::SgiDkLabel(_) => 5,
             PartitionTable::Sun(_) => 6,
-            PartitionTable::Ahdi(_) => 7,
-            PartitionTable::X68k { .. } => 8,
-            PartitionTable::None { .. } => 9,
-            PartitionTable::Dsd { .. } => 10,
+            PartitionTable::Next(_) => 7,
+            PartitionTable::SolarisX86 { .. } => 8,
+            PartitionTable::Ahdi(_) => 9,
+            PartitionTable::X68k { .. } => 10,
+            PartitionTable::None { .. } => 11,
+            PartitionTable::Dsd { .. } => 12,
         }
     }
 
@@ -2744,7 +2850,7 @@ mod type_name_parity {
     fn all_type_names_covers_every_variant() {
         assert_eq!(
             PartitionTable::ALL_TYPE_NAMES.len(),
-            11,
+            13,
             "a PartitionTable variant was added or removed: update ALL_TYPE_NAMES, \
              every_variant_has_an_index, and the README table tests/doc_parity.rs checks"
         );

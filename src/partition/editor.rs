@@ -205,6 +205,12 @@ pub fn apply_edits(
         PartitionTable::Sun(_) => {
             bail!("Sun disk-label editing is not yet implemented (read / browse / back up only)")
         }
+        PartitionTable::Next(_) => {
+            bail!("NeXT disk-label editing is not yet implemented (read / browse / back up only)")
+        }
+        PartitionTable::SolarisX86 { .. } => {
+            bail!("Solaris x86 VTOC editing is not yet implemented (read / browse only)")
+        }
         PartitionTable::SgiDkLabel(label) => {
             apply_sgi_dklabel_edits(file, label, edits, disk_size_bytes, log_cb)
         }

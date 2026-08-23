@@ -1111,6 +1111,35 @@ fn run_backup_inner(
             );
             bail!("backing up Sun-labeled disks is not yet supported (browse only)");
         }
+        PartitionTable::Next(label) => {
+            // Same sidecar shape as the Sun label: record the partition layout
+            // in next.json and defer the per-partition data backup. Browse /
+            // inspect / extract already work through the big-endian UFS reader.
+            let json = serde_json::to_string_pretty(label)
+                .context("failed to serialize NeXT disk label to JSON")?;
+            std::fs::write(backup_folder.join("next.json"), json)
+                .context("failed to write next.json")?;
+            log(
+                &progress,
+                LogLevel::Info,
+                "Exported NeXT disk label (next.json) — partition data backup not yet supported",
+            );
+            bail!("backing up NeXT-labeled disks is not yet supported (browse only)");
+        }
+        PartitionTable::SolarisX86 { label, .. } => {
+            // Same sidecar shape as the Sun label: record the slice layout in
+            // solaris_x86.json and defer the per-slice data backup.
+            let json = serde_json::to_string_pretty(label)
+                .context("failed to serialize Solaris x86 VTOC to JSON")?;
+            std::fs::write(backup_folder.join("solaris_x86.json"), json)
+                .context("failed to write solaris_x86.json")?;
+            log(
+                &progress,
+                LogLevel::Info,
+                "Exported Solaris x86 VTOC (solaris_x86.json) — partition data backup not yet supported",
+            );
+            bail!("backing up Solaris x86 disks is not yet supported (browse only)");
+        }
         PartitionTable::SgiDkLabel(label) => {
             // Same sidecar shape as the Sun label: record the slot layout in
             // sgi_dklabel.json and defer the per-slot data backup. Browse /

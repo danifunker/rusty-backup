@@ -11,6 +11,8 @@ pub mod apple_dos;
 pub mod archive_fs;
 pub mod atari_dos;
 pub mod attrs;
+pub mod bfs;
+pub mod bfs_write;
 pub mod binhex;
 pub mod btrfs;
 pub mod carve;
@@ -429,13 +431,25 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
     }
 
     // Sector 1 (offset 512): EFS superblock. EFS magic is at offset 28
-    // of the sector (0x00072959 / 0x0007295A, big-endian).
+    // of the sector (0x00072959 / 0x0007295A, big-endian). BeOS BFS puts its
+    // superblock in the same sector with `BFS1` at offset 32, in either order.
     if reader.seek(SeekFrom::Start(partition_offset + 512)).is_ok() {
         let mut efs_buf = [0u8; 512];
         if reader.read_exact(&mut efs_buf).is_ok() {
             let magic = u32::from_be_bytes([efs_buf[28], efs_buf[29], efs_buf[30], efs_buf[31]]);
             if magic == 0x0007_2959 || magic == 0x0007_295A {
                 return "efs";
+            }
+            if bfs::BfsSuperBlock::parse(&efs_buf).is_ok() {
+                return "bfs";
+            }
+            // BeOS/PPC has no boot block, so its superblock starts at byte 0.
+            if reader.seek(SeekFrom::Start(partition_offset)).is_ok() {
+                let mut head = [0u8; 512];
+                if reader.read_exact(&mut head).is_ok() && bfs::BfsSuperBlock::parse(&head).is_ok()
+                {
+                    return "bfs";
+                }
             }
         }
     }
@@ -1244,6 +1258,7 @@ pub fn fs_name_for(partition_type: u8, partition_type_string: Option<&str>) -> &
             // the write path called both "unknown" (R-034).
             "lisafs" => "Apple Lisa File System",
             "Alto BFS" => "Alto BFS",
+            "Be_BFS" => "BFS (BeOS)",
             _ => "unknown",
         };
     }
@@ -1259,6 +1274,7 @@ pub fn fs_name_for(partition_type: u8, partition_type_string: Option<&str>) -> &
         0xA2 => "SGI EFS v1",
         // Minix (0x81) and old Minix (0x80).
         0x80 | 0x81 => "Minix",
+        0xEB => "BFS (BeOS)",
         _ => "unknown",
     }
 }
@@ -1728,6 +1744,10 @@ pub fn open_filesystem_full<R: Read + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "bfs" => Ok(Box::new(bfs::BfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 "efs" => Ok(Box::new(efs::EfsFilesystem::open(
                     reader,
                     partition_offset,
@@ -1872,6 +1892,12 @@ pub fn open_filesystem_full<R: Read + Seek + Send + 'static>(
             reader,
             partition_offset,
         )?)),
+        // BeOS BFS (type byte 0xEB). The BeOS installer also writes 0xEB for
+        // its swap partition, so `open` validates the superblock magic.
+        0xEB => Ok(Box::new(bfs::BfsFilesystem::open(
+            reader,
+            partition_offset,
+        )?)),
         // SGI EFS — synthetic type byte emitted by PartitionTable::Sgi.
         0xA1 => Ok(Box::new(efs::EfsFilesystem::open(
             reader,
@@ -2005,6 +2031,13 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                         "unrecognized Apple_HFS variant".into(),
                     )),
                 };
+            }
+            // BeOS/PPC APM volumes.
+            "Be_BFS" => {
+                return Ok(Box::new(bfs::BfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?));
             }
             "Apple_HFSX" => {
                 let mut fs = hfsplus::HfsPlusFilesystem::open(reader, partition_offset)?;
@@ -2267,6 +2300,10 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "bfs" => Ok(Box::new(bfs::BfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 _ => {
                     // Name it the way the read path does. Detection returns
                     // "unknown" for filesystems identified by their container
@@ -2369,6 +2406,11 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
             reader,
             partition_offset,
         )?)),
+        // BeOS BFS
+        0xEB => Ok(Box::new(bfs::BfsFilesystem::open(
+            reader,
+            partition_offset,
+        )?)),
         // SGI EFS — synthetic type byte emitted by PartitionTable::Sgi.
         0xA1 => Ok(Box::new(efs::EfsFilesystem::open(
             reader,
@@ -2450,6 +2492,11 @@ fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
             }
         }
         "Apple_HFSX" | "Apple_HFS+" => Ok(Box::new(hfsplus::HfsPlusFilesystem::open(
+            reader,
+            partition_offset,
+        )?)),
+        // BeOS/PPC writes an APM whose BFS partitions carry "Be_BFS".
+        "Be_BFS" => Ok(Box::new(bfs::BfsFilesystem::open(
             reader,
             partition_offset,
         )?)),

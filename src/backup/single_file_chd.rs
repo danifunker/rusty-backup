@@ -1978,6 +1978,16 @@ fn build_patched_head_segments(
                 "assemble_from_staging: Sun disk-label sources are not supported (browse only)"
             );
         }
+        PartitionTable::Next(_) => {
+            anyhow::bail!(
+                "assemble_from_staging: NeXT disk-label sources are not supported (browse only)"
+            );
+        }
+        PartitionTable::SolarisX86 { .. } => {
+            anyhow::bail!(
+                "assemble_from_staging: Solaris x86 VTOC sources are not supported (browse only)"
+            );
+        }
         PartitionTable::SgiDkLabel(_) => {
             anyhow::bail!(
                 "assemble_from_staging: SGI disk-label sources are not supported (browse only)"
