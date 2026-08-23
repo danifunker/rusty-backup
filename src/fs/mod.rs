@@ -12,6 +12,7 @@ pub mod archive_fs;
 pub mod atari_dos;
 pub mod attrs;
 pub mod bfs;
+pub mod bfs_fsck;
 pub mod bfs_write;
 pub mod binhex;
 pub mod btrfs;
@@ -79,6 +80,7 @@ pub mod ntfs_format;
 pub mod ntfs_fsck;
 mod ntfs_tables;
 pub mod ofs;
+pub mod ofs_fsck;
 pub mod ofs_write;
 #[cfg(feature = "optical")]
 pub mod optical_fs;

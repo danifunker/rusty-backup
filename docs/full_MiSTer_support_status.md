@@ -77,12 +77,13 @@ support the disk types (floppy / hard disk / CD-ROM) of the outstanding cores.
   modeled on MAME's `fs_oric_jasmin` and cross-validated against `floptool`),
   ANDOS (detect-only scaffold),
   BFS (the Be File System — BeOS DR9 / PR / R3-R5 and Haiku; read + edit +
-  create in both byte orders, since BeOS/Intel writes little-endian and
+  create + fsck in both byte orders, since BeOS/Intel writes little-endian and
   BeOS/PPC big.
   B+tree directories with leaf splits on the write path; editing is refused
   while the journal is non-empty, because we do not maintain the log),
   BeOS OFS (the pre-BFS filesystem of the 1993-94 Hobbit BeBox and the early
-  PowerPC Developer Releases; read + edit + create, big-endian, no inodes — a file's
+  PowerPC Developer Releases; read + edit + create + fsck, big-endian, no
+  inodes — a file's
   metadata is its parent directory entry — with Mac-style type/creator codes),
   and the optical-disc filesystems (ISO 9660
   + Joliet / Rock Ridge, High Sierra, UDF, HFS, HFS+, SGI EFS, UFS/FFS,

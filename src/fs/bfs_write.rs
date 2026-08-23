@@ -793,6 +793,10 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for BfsFilesystem<R> {
         let free = (self.sb.num_blocks - self.sb.used_blocks).max(0) as u64;
         Ok(free * self.sb.block_size as u64)
     }
+
+    fn repair(&mut self) -> Result<super::fsck::RepairReport, FilesystemError> {
+        self.repair_bfs()
+    }
 }
 
 // ---- the B+tree ----

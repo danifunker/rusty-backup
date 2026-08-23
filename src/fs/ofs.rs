@@ -316,10 +316,28 @@ impl<R: Read + Seek + Send> OfsFilesystem<R> {
 
     /// Every `(start, count)` extent a file occupies, in file order.
     pub fn file_extents(&mut self, attrs: &OfsAttrs) -> Result<Vec<(u64, u64)>, FilesystemError> {
+        // An empty file records `0xFFFFFFFF` in both alloc-list fields rather
+        // than a zero, so the contiguous flag reads as set on a file that owns
+        // nothing at all.
+        if attrs.first_alloc_list == EXTENT_END || attrs.first_alloc_list == 0 {
+            return Ok(Vec::new());
+        }
+        let total = self.toc.total_sectors as u64;
         if attrs.is_contiguous() {
-            let sectors = attrs.last_alloc_list as u64;
-            let want = (attrs.logical_size as u64).div_ceil(SECTOR);
-            return Ok(vec![(attrs.contiguous_start(), sectors.max(want))]);
+            let start = attrs.contiguous_start();
+            let need = (attrs.logical_size as u64).div_ceil(SECTOR);
+            // `last_alloc_list` is the run's length in sectors here; fall back
+            // to the logical size when it does not fit the volume.
+            let claimed = attrs.last_alloc_list as u64;
+            let sectors = if claimed > 0 && start + claimed <= total {
+                claimed.max(need)
+            } else {
+                need
+            };
+            if sectors == 0 {
+                return Ok(Vec::new());
+            }
+            return Ok(vec![(start, sectors)]);
         }
         let mut out = Vec::new();
         let mut list = attrs.first_alloc_list as u64;
@@ -395,6 +413,12 @@ impl<R: Read + Seek + Send> OfsFilesystem<R> {
         let raw = self.read_sectors(block, self.toc.block_sectors())?;
         self.decode_entry(&raw, block, index)
             .ok_or_else(|| FilesystemError::NotFound(format!("ofs: empty slot {index} at {block}")))
+    }
+
+    /// Decode one slot of an already-read directory block. `None` for a free
+    /// slot (a zero first name byte).
+    pub(crate) fn entry_in_block(&self, raw: &[u8], block: u64, index: usize) -> Option<OfsEntry> {
+        self.decode_entry(raw, block, index)
     }
 
     fn decode_entry(&self, raw: &[u8], block: u64, index: usize) -> Option<OfsEntry> {
@@ -512,6 +536,10 @@ impl<R: Read + Seek + Send> Filesystem for OfsFilesystem<R> {
 
     fn fs_type(&self) -> &str {
         "BeOS OFS"
+    }
+
+    fn fsck(&mut self) -> Option<Result<super::fsck::FsckResult, FilesystemError>> {
+        Some(self.fsck_ofs())
     }
 
     fn total_size(&self) -> u64 {

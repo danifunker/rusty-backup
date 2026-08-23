@@ -281,6 +281,11 @@ impl BfsInode {
     fn is_long_symlink(&self) -> bool {
         self.flags & INODE_LONG_SYMLINK != 0
     }
+    /// True when the target sits in the dinode's union rather than in a data
+    /// stream — in which case those 144 bytes are text, not `block_run`s.
+    pub fn is_inline_symlink(&self) -> bool {
+        self.is_symlink() && !self.is_long_symlink()
+    }
 }
 
 /// A parsed BFS superblock.
@@ -979,6 +984,10 @@ impl<R: Read + Seek + Send> Filesystem for BfsFilesystem<R> {
 
     fn validate_name(&self, name: &str) -> Result<(), FilesystemError> {
         validate_bfs_name(name)
+    }
+
+    fn fsck(&mut self) -> Option<Result<super::fsck::FsckResult, FilesystemError>> {
+        Some(self.fsck_bfs())
     }
 }
 

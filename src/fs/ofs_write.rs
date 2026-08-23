@@ -67,6 +67,15 @@ impl<R: Read + Write + Seek + Send> OfsFilesystem<R> {
         self.write_sectors(start, bitmap)
     }
 
+    /// Bitmap writer for `ofs_fsck`, which takes its own snapshot first.
+    pub(crate) fn write_bitmap_at(
+        &mut self,
+        start: u64,
+        bitmap: &[u8],
+    ) -> Result<(), FilesystemError> {
+        self.write_sectors(start, bitmap)
+    }
+
     fn bit_is_set(bitmap: &[u8], sector: u64) -> bool {
         let byte = (sector / 8) as usize;
         byte < bitmap.len() && bitmap[byte] & (1 << (sector % 8)) != 0
@@ -527,6 +536,10 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for OfsFilesystem<R> {
     fn free_space(&mut self) -> Result<u64, FilesystemError> {
         let free = self.toc.total_sectors.saturating_sub(self.toc.used_sectors) as u64;
         Ok(free * SECTOR)
+    }
+
+    fn repair(&mut self) -> Result<super::fsck::RepairReport, FilesystemError> {
+        self.repair_ofs()
     }
 }
 
