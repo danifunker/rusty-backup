@@ -328,16 +328,53 @@ Notes for anyone extending it:
   `ncg * fs_dblkno` from the size is close enough to look right and wrong by
   the summary area, which is how `geometry_matches_the_makefs_fixture` came to
   assert `dsize == 16343` rather than 16344.
-- **4.4BSD `struct cg` only.** The pre-4.4BSD generation NeXTSTEP and SunOS 4
-  use is read and edited but not written: its superblock carries `fs_postbl` /
-  `fs_rotbl` / `fs_npsect` rotational-layout tables that feed the old kernel's
-  allocator, `cbtorpos()` divides by `fs_npsect`, and we have no way to test a
-  guess. A wrong table that looks plausible is worse than no create verb.
 - The root directory takes a whole block with `di_size == DIRBLKSIZ`, matching
   what `ufs::create_directory` writes, so a formatted volume and an edited one
   are the same shape.
 
-**Validation.** The derived geometry is asserted field-for-field against the
-`makefs`-built UFS1 fixture (`tests/fixtures/test_ufs1.img.zst`) for the same
-inputs; fresh volumes from 1 MiB to 2 GiB open, list, take files and
-directories, and come back clean from our own `fsck_ufs` before and after.
+### The pre-4.4BSD form (`new volume ufs-43bsd`)
+
+A 4.4BSD volume inside a NeXT partition parses here and is unreadable there,
+and **not because of the cylinder group**: a 4.4BSD `struct direct` puts
+`d_type` at byte 6 where a 4.3BSD kernel reads the high byte of a 16-bit
+`d_namlen`, so `.` comes back claiming a 1025-character name and the root
+directory is gone. Three on-disk structures differ, not one:
+
+- **`struct fs` tail.** 4.3BSD has `fs_csmask` / `fs_csshift` at 108/112 and
+  `fs_ntrak` at 164 where 4.4BSD has spares, and everything from byte 860 to
+  the magic at 1372 is `fs_postbl[MAXCPG][NRPOS]` — which is where 4.4BSD
+  keeps `fs_sblockloc`, `fs_cstotal`, `fs_size`, `fs_maxsymlinklen` and
+  `fs_maxfilesize`. There is no `fs_volname`, so `--name` is ignored.
+- **`struct cg`.** `cg_btot[32]`, `cg_b[32][8]` and `cg_iused[2048/8]` are
+  fixed-size arrays compiled into the kernel, which is what puts `cg_magic` at
+  980 and `cg_free` at 984 — and what caps a group at 32 cylinders and 2048
+  inodes. `cg_btot` and `cg_b` are live: on both reference disks they sum to
+  `cg_cs.cs_nbfree`, so we compute them rather than leave them zero.
+- **Geometry.** Groups are staggered by `fs_cgoffset` (one track) cycling over
+  `~fs_cgmask` (the track count), so `fs_sblkno` and friends are relative to
+  `cgstart(c)`, not `cgbase(c)`. `fs_nspf` is 1 and `fs_fsbtodb` 0: a NeXT
+  device block *is* the fragment.
+
+Two things were reverse-engineered from the disks rather than from source:
+
+- **`cbtorpos()`.** Both fixtures record `fs_npsect == 0`, so NeXTSTEP cannot
+  be using the interleave-aware form — it would divide by zero on its own
+  disks. The pre-Tahoe
+  `(bno * nspf % spc % nsect) * NRPOS / nsect` reproduces `fs_postbl` and
+  `fs_rotbl` exactly on both geometries (4x32 and 16x32). `fs_postbl` holds the
+  *first* block of the cycle at each position and `fs_rotbl[b]` the distance to
+  the *next* block sharing it — the opposite direction to the loop in later
+  `newfs` sources.
+- **`fs_ipg`.** NeXT's `newfs` lands one inode block *below* the density
+  figure — 1984 where 8 MiB / 4 KiB says 2048, and 448 where 2 MiB / 4 KiB says
+  512. Matching that is what makes `fs_dblkno`, `fs_csaddr` and `fs_dsize`
+  agree too.
+
+**Validation.** The 4.4BSD geometry is asserted field-for-field against the
+`makefs`-built UFS1 fixture (`tests/fixtures/test_ufs1.img.zst`). The 4.3BSD
+form is compared against the NeXTSTEP/Intel reference disk at the same volume
+size: **all 45 checked superblock fields match, and `fs_postbl` / `fs_rotbl`
+are byte-identical**; a cylinder group's `cg_btot` / `cg_b` sum to its
+`cs_nbfree` exactly as the reference's do. Fresh volumes of both generations,
+from 1 MiB to 2 GiB, open, list, take files and directories, and come back
+clean from our own `fsck_ufs` before and after.

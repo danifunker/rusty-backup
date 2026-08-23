@@ -173,6 +173,16 @@ pub enum FsKind {
     /// byte order, and `--name` the volume label.
     #[value(alias = "ufs1", alias = "ffs")]
     Ufs,
+    /// UFS1 in the pre-4.4BSD on-disk format (NeXTSTEP / OPENSTEP): the
+    /// 4.3BSD `struct cg`, 16-bit `d_namlen` directory entries with no
+    /// `d_type`, device blocks the size of a fragment, cylinder groups
+    /// staggered across tracks, and live rotational-layout tables. This is
+    /// what goes inside a `new hd next` partition; a 4.4BSD volume there
+    /// parses but NeXTSTEP cannot read its directories. Big-endian by
+    /// default, which is the byte order every NeXT disk uses; `--name` is
+    /// ignored because 4.3BSD has no volume-label field.
+    #[value(name = "ufs-43bsd", alias = "ufs43", alias = "nextstep")]
+    Ufs43,
 }
 
 /// The three media classes `new` creates. CD-ROM images are not here —
@@ -241,7 +251,9 @@ pub enum HdCommand {
     /// NeXT disk label (NeXTSTEP / OPENSTEP, black m68k hardware and
     /// NeXTSTEP/Intel), with the partitions you name. Four checksummed copies
     /// at 512-byte blocks 0/15/30/45; partitions are counted in the label's
-    /// own 1024-byte sectors, so `--sectors` is in those units.
+    /// own 1024-byte sectors, so `--sectors` is in those units. Fill a
+    /// partition with a volume from `new volume ufs-43bsd` -- the 4.4BSD
+    /// `new volume ufs` parses but NeXTSTEP cannot read its directories.
     Next(super::new_partitioned_hd::CylinderHdArgs),
 
     /// Solaris x86: an MBR whose one Solaris partition holds a 16-slice VTOC
@@ -376,6 +388,10 @@ pub enum VolumeFs {
     /// writes the SPARC / m68k byte order.
     #[value(alias = "ufs1", alias = "ffs")]
     Ufs,
+    /// UFS1 in the pre-4.4BSD (NeXTSTEP / OPENSTEP) on-disk format, which is
+    /// what a `new hd next` partition needs. Big-endian by default.
+    #[value(name = "ufs-43bsd", alias = "ufs43", alias = "nextstep")]
+    Ufs43,
 }
 
 impl VolumeFs {
@@ -402,6 +418,7 @@ impl VolumeFs {
             VolumeFs::Bfs => FsKind::Bfs,
             VolumeFs::Ofs => FsKind::Ofs,
             VolumeFs::Ufs => FsKind::Ufs,
+            VolumeFs::Ufs43 => FsKind::Ufs43,
         }
     }
 }
@@ -488,7 +505,8 @@ pub struct VolumeArgs {
     #[arg(long, default_value = "800K")]
     pub size: String,
 
-    /// Volume label/name. Defaults to `rusty-backup`.
+    /// Volume label/name. Defaults to `rusty-backup`. Ignored by the
+    /// filesystems with no label field, among them 4.3BSD UFS.
     #[arg(long, default_value = DEFAULT_VOLUME_NAME)]
     pub name: String,
 
@@ -499,7 +517,8 @@ pub struct VolumeArgs {
     pub block_size: Option<u32>,
 
     /// BFS and UFS: write the big-endian byte order (BeOS/PPC; SPARC / m68k /
-    /// MIPS) instead of the little-endian default.
+    /// MIPS) instead of the little-endian default. Implied by `ufs-43bsd`,
+    /// since every NeXT disk is big-endian.
     #[arg(long = "big-endian")]
     pub big_endian: bool,
 
@@ -958,7 +977,8 @@ fn format_image(args: NewArgs) -> Result<()> {
         FsKind::Adfs => format_and_write(&args.image, &args.size, &args.name, |_size, name| {
             Ok(crate::fs::adfs::create_blank_adfs(name))
         }),
-        FsKind::Ufs => write_blank_ufs_image(&args),
+        FsKind::Ufs => write_blank_ufs_image(&args, crate::fs::ufs::CgLayout::Modern),
+        FsKind::Ufs43 => write_blank_ufs_image(&args, crate::fs::ufs::CgLayout::Bsd43),
     }
 }
 
@@ -1071,12 +1091,15 @@ fn sanitize_os9_volume_name(name: &str) -> String {
 /// being materialized in RAM.
 /// UFS is streamed rather than built in memory: a blank volume is almost all
 /// zeros, and the sizes people format are the ones a `Vec` cannot hold.
-fn write_blank_ufs_image(args: &NewArgs) -> Result<()> {
-    use crate::fs::ufs::UfsEndian;
+fn write_blank_ufs_image(args: &NewArgs, cg_layout: crate::fs::ufs::CgLayout) -> Result<()> {
+    use crate::fs::ufs::{CgLayout, UfsEndian};
     use crate::fs::ufs_format::{write_blank_ufs1, Ufs1FormatParams};
 
     let size = parse_size(&args.size).context("parsing --size")?;
     let block_size = u64::from(args.block_size.unwrap_or(8192));
+    // Every NeXT disk is big-endian, so the 4.3BSD format defaults that way
+    // rather than making --big-endian mandatory for the only case it has.
+    let big_endian = args.big_endian || cg_layout == CgLayout::Bsd43;
     let params = Ufs1FormatParams {
         size_bytes: size,
         block_size,
@@ -1084,12 +1107,15 @@ fn write_blank_ufs_image(args: &NewArgs) -> Result<()> {
         // another default and the reader's MAXFRAG gate matches.
         frag_size: block_size / 8,
         bytes_per_inode: args.bytes_per_inode.unwrap_or(0),
-        endian: if args.big_endian {
+        endian: if big_endian {
             UfsEndian::Big
         } else {
             UfsEndian::Little
         },
-        label: Some(args.name.clone()),
+        cg_layout,
+        // 4.3BSD has no `fs_volname`; the bytes 4.4BSD keeps it in are
+        // `fs_fsmnt` there, so a label would land inside the mount point.
+        label: (cg_layout == CgLayout::Modern).then(|| args.name.clone()),
     };
     let mut file = std::fs::File::create(&args.image)
         .with_context(|| format!("creating {}", args.image.display()))?;
@@ -1098,13 +1124,17 @@ fn write_blank_ufs_image(args: &NewArgs) -> Result<()> {
     let geo = write_blank_ufs1(&mut file, &params)
         .with_context(|| format!("formatting UFS1 into {}", args.image.display()))?;
     log_stderr(format!(
-        "wrote {} ({size} bytes, UFS1 bsize={} fsize={} {} cylinder group(s), {} inodes, volume {:?})",
+        "wrote {} ({size} bytes, UFS1 {} bsize={} fsize={} {} cylinder group(s), {} inodes)",
         args.image.display(),
+        if cg_layout == CgLayout::Bsd43 {
+            "4.3BSD"
+        } else {
+            "4.4BSD"
+        },
         geo.bsize,
         geo.fsize,
         geo.ncg,
         geo.ncg * geo.ipg,
-        args.name,
     ));
     Ok(())
 }

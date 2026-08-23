@@ -1099,7 +1099,7 @@ Usage: mbr [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
 
 ### `new hd next`
 
-NeXT disk label (NeXTSTEP / OPENSTEP, black m68k hardware and NeXTSTEP/Intel), with the partitions you name. Four checksummed copies at 512-byte blocks 0/15/30/45; partitions are counted in the label's own 1024-byte sectors, so `--sectors` is in those units
+NeXT disk label (NeXTSTEP / OPENSTEP, black m68k hardware and NeXTSTEP/Intel), with the partitions you name. Four checksummed copies at 512-byte blocks 0/15/30/45; partitions are counted in the label's own 1024-byte sectors, so `--sectors` is in those units. Fill a partition with a volume from `new volume ufs-43bsd` -- the 4.4BSD `new volume ufs` parses but NeXTSTEP cannot read its directories
 
 ```
 Usage: next [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
@@ -1299,9 +1299,9 @@ Usage: volume [OPTIONS] <FS> <IMAGE>
 **Options**
 
 - `--size` — Volume size (bytes or `K`/`M`/`G` suffixes). Defaults to 800K
-- `--name` — Volume label/name. Defaults to `rusty-backup`
+- `--name` — Volume label/name. Defaults to `rusty-backup`. Ignored by the filesystems with no label field, among them 4.3BSD UFS
 - `--block-size` — HFS/HFS+ allocation block size in bytes (multiple of 512). On `--fs bfs` this is the BFS block size (power of two, 1024..=8192); on `--fs ufs` it is `fs_bsize`, and the fragment is an eighth of it. Auto when unset
-- `--big-endian` — BFS and UFS: write the big-endian byte order (BeOS/PPC; SPARC / m68k / MIPS) instead of the little-endian default
+- `--big-endian` — BFS and UFS: write the big-endian byte order (BeOS/PPC; SPARC / m68k / MIPS) instead of the little-endian default. Implied by `ufs-43bsd`, since every NeXT disk is big-endian
 - `--catalog-size` — HFS Catalog B-tree initial size in bytes. Auto when unset
 - `--extents-size` — HFS Extents-overflow B-tree initial size in bytes. Auto when unset
 - `--case-sensitive` — HFS+ only: format a case-sensitive (HFSX) volume

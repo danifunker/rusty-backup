@@ -21,9 +21,10 @@ support the disk types (floppy / hard disk / CD-ROM) of the outstanding cores.
   ownership, timestamps and xattrs. No fsck: SquashFS carries no checksums, so
   there is nothing to repair from),
   JFS, ReiserFS, btrfs,
-  UFS1 / UFS2 (read + edit + fsck both, and `new volume ufs` formats a blank
-  UFS1 in either byte order -- `newfs(8)`'s own layout, 4.4BSD `struct cg`;
-  the pre-4.4BSD generation is read and edited but not written),
+  UFS1 / UFS2 (read + edit + fsck both, and `new volume ufs` /
+  `new volume ufs-43bsd` format a blank UFS1 in either byte order and either
+  `struct cg` generation -- `newfs(8)`'s own layout, with the pre-4.4BSD
+  NeXTSTEP form pinned field-for-field against real NeXTSTEP 3.3 disks),
   Minix V1/V2/V3 (read + edit + create + fsck),
   ProDOS (read + edit + create + fsck),
   Apple DOS 3.3 (read + edit + create + fsck),

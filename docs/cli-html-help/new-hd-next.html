@@ -7,7 +7,7 @@
 <body>
 <nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <a href="new.html">new</a> &raquo; <a href="new-hd.html">hd</a> &raquo; <span>next</span></nav>
 <h1><code>rb-cli new hd next</code></h1>
-<p>NeXT disk label (NeXTSTEP / OPENSTEP, black m68k hardware and NeXTSTEP/Intel), with the partitions you name. Four checksummed copies at 512-byte blocks 0/15/30/45; partitions are counted in the label's own 1024-byte sectors, so `--sectors` is in those units</p>
+<p>NeXT disk label (NeXTSTEP / OPENSTEP, black m68k hardware and NeXTSTEP/Intel), with the partitions you name. Four checksummed copies at 512-byte blocks 0/15/30/45; partitions are counted in the label's own 1024-byte sectors, so `--sectors` is in those units. Fill a partition with a volume from `new volume ufs-43bsd` -- the 4.4BSD `new volume ufs` parses but NeXTSTEP cannot read its directories</p>
 <h2>Usage</h2>
 <pre><code>Usage: next [OPTIONS] --size &lt;SIZE&gt; --partition &lt;PARTITIONS&gt; &lt;IMAGE&gt;</code></pre>
 <h2>Arguments</h2>

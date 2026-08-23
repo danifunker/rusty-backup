@@ -1,8 +1,8 @@
 # Tier 1 — self-fixturing.
 #
 # The NeXT disk label and the Solaris x86 VTOC, built from scratch and then
-# edited, with no corpus involved: `new volume ufs` supplies the filesystem
-# and `new hd next` / `new hd solaris-x86` supply the tables.
+# edited, with no corpus involved: `new volume ufs` / `ufs-43bsd` supply the
+# filesystem and `new hd next` / `new hd solaris-x86` supply the tables.
 #
 # Both labels have a unit trap that a table which merely "parses back" will
 # not catch:
@@ -18,7 +18,9 @@
 #
 # So each case builds the disk, fills a partition with a real UFS volume, and
 # then fscks *through* the table — which only succeeds if the byte offset the
-# label describes is the one the filesystem was written at.
+# label describes is the one the filesystem was written at. The NeXT cases
+# fill with `new volume ufs-43bsd`, the pre-4.4BSD form NeXTSTEP actually
+# reads, because that is the pairing a user building a NeXT disk needs.
 
 [meta]
 tier = 1
@@ -31,10 +33,7 @@ description = "Write and edit NeXT disk labels and Solaris x86 VTOCs, filesystem
 id = "partition.next.build-fill-and-check"
 description = "A NeXT label written from scratch places its partition where the UFS actually is"
 [[case.step]]
-args = [
-  "new", "volume", "ufs", "--size", "6M", "--big-endian",
-  "--name", "NeXTRoot", "{scratch}/root.ufs",
-]
+args = ["new", "volume", "ufs-43bsd", "--size", "6M", "{scratch}/root.ufs"]
 expect_exit = 0
 [[case.step]]
 args = [
@@ -70,9 +69,7 @@ fsck_clean = true
 id = "partition.next.edit-keeps-the-filesystem"
 description = "Adding, retyping and deleting a NeXT partition leaves the root volume intact"
 [[case.step]]
-args = [
-  "new", "volume", "ufs", "--size", "6M", "--big-endian", "{scratch}/root.ufs",
-]
+args = ["new", "volume", "ufs-43bsd", "--size", "6M", "{scratch}/root.ufs"]
 expect_exit = 0
 [[case.step]]
 args = [
