@@ -1,5 +1,5 @@
-//! `rb-cli new hd {mbr|gpt|apm|sgi|x68k-table|rdb|sun|atari} IMG` — a blank disk
-//! image
+//! `rb-cli new hd {mbr|gpt|apm|sgi|x68k-table|rdb|sun|next|solaris-x86|atari}
+//! IMG` — a blank disk image
 //! carrying a real partition table with partitions you size and type yourself.
 //!
 //! This is the CLI grammar only; the layout maths and the table writers
@@ -48,6 +48,13 @@ pub enum PartitionedHdCommand {
     /// Sun disk label / SMI VTOC (SPARC Solaris / SunOS). Slices are
     /// cylinder-aligned.
     Sun(CylinderHdArgs),
+    /// NeXT disk label (NeXTSTEP / OPENSTEP). Up to 8 partitions counted in
+    /// the label's own 1024-byte sectors, so --sectors is in those units too.
+    Next(CylinderHdArgs),
+    /// Solaris x86: an MBR partition holding a 16-slice VTOC. Slices are
+    /// cylinder-aligned and the first three cylinders are the label's own.
+    #[command(name = "solaris-x86")]
+    SolarisX86(CylinderHdArgs),
     /// Sharp X68000 SCSI/SASI table. Up to 8 partitions.
     X68k(PartitionedHdArgs),
     /// Atari ST AHDI root sector. Up to 4 partitions.
@@ -135,6 +142,20 @@ pub fn run(cmd: PartitionedHdCommand) -> Result<()> {
             });
             (TableKind::Sun, a.common)
         }
+        PartitionedHdCommand::Next(a) => {
+            geometry = Some(Geometry {
+                heads: a.heads,
+                sectors_per_track: a.sectors,
+            });
+            (TableKind::Next, a.common)
+        }
+        PartitionedHdCommand::SolarisX86(a) => {
+            geometry = Some(Geometry {
+                heads: a.heads,
+                sectors_per_track: a.sectors,
+            });
+            (TableKind::SolarisX86, a.common)
+        }
     };
     let geometry = geometry.unwrap_or_default();
 
@@ -152,7 +173,7 @@ pub fn run(cmd: PartitionedHdCommand) -> Result<()> {
         .map(|s| parse_spec(s))
         .collect::<Result<Vec<_>>>()?;
 
-    let placed = provision::place(&specs, kind, disk_size, align)?;
+    let placed = provision::place(&specs, kind, disk_size, align, geometry)?;
     let sources = parse_fills(&args.fills, placed.len())?;
 
     if args.image.exists() && !args.force {

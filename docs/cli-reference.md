@@ -1097,6 +1097,29 @@ Usage: mbr [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
 - `--align` — Alignment for partition starts. Default 1 MiB; use 63s for DOS-era cylinder alignment on vintage machines
 - `--force` — Overwrite `image` if it already exists
 
+### `new hd next`
+
+NeXT disk label (NeXTSTEP / OPENSTEP, black m68k hardware and NeXTSTEP/Intel), with the partitions you name. Four checksummed copies at 512-byte blocks 0/15/30/45; partitions are counted in the label's own 1024-byte sectors, so `--sectors` is in those units
+
+```
+Usage: next [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image file to create
+
+**Options**
+
+- `--size` — Total disk size (accepts `K`/`M`/`G` suffixes)
+- `--partition` — A partition, repeatable, in disk order: `SIZE[:TYPE[:NAME]]`. SIZE accepts `K`/`M`/`G`, or `rest` for the remaining space (once). TYPE is a value from `partmap types`; NAME is APM/GPT only
+- `--fill` — Pour an image into a partition as it is created: `N=PATH`, 1-based, repeatable. Any format the engine can read is decoded on the way in
+- `--filesystem` — Embed an Amiga filesystem handler in the RDB, `DOSTYPE=PATH`, repeatable. PATH is the handler's AmigaDOS load file (`L:SmartFilesystem`, `L:PFS3`). A DosType with no ROM handler needs this to mount unaided: the strap loads it from the RDB. RDB only
+- `--align` — Alignment for partition starts. Default 1 MiB; use 63s for DOS-era cylinder alignment on vintage machines
+- `--force` — Overwrite `image` if it already exists
+- `--heads` — Disk geometry: heads. These tables place partitions on cylinder boundaries, so the geometry sets the default alignment
+- `--sectors` — Disk geometry: sectors per track
+
 ### `new hd rdb`
 
 Amiga Rigid Disk Block (RDB) with partitions you size and type yourself. Cylinder-aligned from `--heads` / `--sectors`; types are AmigaDOS DosType tags (`DOS\\3`, `PFS\\3`, `SFS\\0`, ...)
@@ -1170,6 +1193,29 @@ Usage: sgi-efs [OPTIONS] <IMAGE>
 - `--sectors` — Sectors per track (512-byte sectors). Like `--heads`, must match the drive's reported geometry or IRIX `fx` rejects the label. Default 63 (the IRIS emulator's value; 16 × 63 = 1008-sector cylinders)
 - `--inodes` — Approximate total inode count for the EFS root. The formatter scales the cylinder groups to hit roughly this many inodes. Mutually exclusive with `--bytes-per-inode`. When neither is given the density is ~1 inode/4 KiB
 - `--bytes-per-inode` — EFS inode density, in bytes per inode (smaller = more inodes). Floored at one inode per 512-byte block. Mutually exclusive with `--inodes`
+
+### `new hd solaris-x86`
+
+Solaris x86: an MBR whose one Solaris partition holds a 16-slice VTOC in its second sector, with the slice tags you name. Cylinder-aligned; slices 2 / 8 / 9 are the label's own backup, boot and alternates
+
+```
+Usage: solaris-x86 [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image file to create
+
+**Options**
+
+- `--size` — Total disk size (accepts `K`/`M`/`G` suffixes)
+- `--partition` — A partition, repeatable, in disk order: `SIZE[:TYPE[:NAME]]`. SIZE accepts `K`/`M`/`G`, or `rest` for the remaining space (once). TYPE is a value from `partmap types`; NAME is APM/GPT only
+- `--fill` — Pour an image into a partition as it is created: `N=PATH`, 1-based, repeatable. Any format the engine can read is decoded on the way in
+- `--filesystem` — Embed an Amiga filesystem handler in the RDB, `DOSTYPE=PATH`, repeatable. PATH is the handler's AmigaDOS load file (`L:SmartFilesystem`, `L:PFS3`). A DosType with no ROM handler needs this to mount unaided: the strap loads it from the RDB. RDB only
+- `--align` — Alignment for partition starts. Default 1 MiB; use 63s for DOS-era cylinder alignment on vintage machines
+- `--force` — Overwrite `image` if it already exists
+- `--heads` — Disk geometry: heads. These tables place partitions on cylinder boundaries, so the geometry sets the default alignment
+- `--sectors` — Disk geometry: sectors per track
 
 ### `new hd sun`
 

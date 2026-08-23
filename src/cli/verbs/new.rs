@@ -4,7 +4,8 @@
 //!   (the fixed-geometry retro filesystems plus small FAT/HFS).
 //! * `new volume <fs> IMG`  — a bare single-volume image of arbitrary size
 //!   (a "superfloppy": NTFS, ext4, HFS+, EFS, …). No partition table.
-//! * `new hd {x68k|sgi-efs|mbr|gpt|apm|sgi|rdb|sun|atari|x68k-table} IMG` — a
+//! * `new hd {x68k|sgi-efs|mbr|gpt|apm|sgi|rdb|sun|next|solaris-x86|atari|
+//!   x68k-table} IMG` — a
 //!   partition-table-wrapped, bootable
 //!   hard-disk image.
 //!
@@ -228,6 +229,18 @@ pub enum HdCommand {
     /// size and tag yourself. Cylinder-aligned from `--heads` / `--sectors`;
     /// slice 2 is reserved for the whole-disk "backup" alias.
     Sun(super::new_partitioned_hd::CylinderHdArgs),
+
+    /// NeXT disk label (NeXTSTEP / OPENSTEP, black m68k hardware and
+    /// NeXTSTEP/Intel), with the partitions you name. Four checksummed copies
+    /// at 512-byte blocks 0/15/30/45; partitions are counted in the label's
+    /// own 1024-byte sectors, so `--sectors` is in those units.
+    Next(super::new_partitioned_hd::CylinderHdArgs),
+
+    /// Solaris x86: an MBR whose one Solaris partition holds a 16-slice VTOC
+    /// in its second sector, with the slice tags you name. Cylinder-aligned;
+    /// slices 2 / 8 / 9 are the label's own backup, boot and alternates.
+    #[command(name = "solaris-x86")]
+    SolarisX86(super::new_partitioned_hd::CylinderHdArgs),
 
     /// Sharp X68000 SCSI/SASI table with partitions you size yourself.
     /// Unlike `x68k` this writes only the table -- no IPL stub, no Human68k
@@ -571,6 +584,12 @@ pub fn run(cmd: NewCommand) -> Result<()> {
             ),
             HdCommand::Sun(args) => super::new_partitioned_hd::run(
                 super::new_partitioned_hd::PartitionedHdCommand::Sun(args),
+            ),
+            HdCommand::Next(args) => super::new_partitioned_hd::run(
+                super::new_partitioned_hd::PartitionedHdCommand::Next(args),
+            ),
+            HdCommand::SolarisX86(args) => super::new_partitioned_hd::run(
+                super::new_partitioned_hd::PartitionedHdCommand::SolarisX86(args),
             ),
             HdCommand::X68kTable(args) => super::new_partitioned_hd::run(
                 super::new_partitioned_hd::PartitionedHdCommand::X68k(args),

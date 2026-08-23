@@ -125,7 +125,7 @@ pub struct SetBootableArgs {
 #[derive(Debug, Args)]
 pub struct TypesArgs {
     /// Table flavor to list types for. Omit to read it from an image.
-    #[arg(long, value_parser = ["mbr", "gpt", "apm", "rdb", "sgi"])]
+    #[arg(long, value_parser = ["mbr", "gpt", "apm", "rdb", "sgi", "sun", "next", "solaris-x86"])]
     pub table: Option<String>,
     /// Image whose partition table decides which list to print.
     #[arg(long)]
@@ -251,10 +251,15 @@ fn run_types(a: TypesArgs) -> Result<()> {
             "apm" => TableKind::Apm,
             "rdb" => TableKind::Rdb,
             "sgi" => TableKind::Sgi,
+            "sun" => TableKind::Sun,
+            "next" => TableKind::Next,
+            "solaris-x86" => TableKind::SolarisX86,
             other => bail!("unknown table flavor '{}'", other),
         },
         (None, Some(image)) => type_catalog::kind_of(&open_table(image)?),
-        (None, None) => bail!("types: pass --table <mbr|gpt|apm|rdb|sgi> or --image <FILE>"),
+        (None, None) => bail!(
+            "types: pass --table <mbr|gpt|apm|rdb|sgi|sun|next|solaris-x86> or --image <FILE>"
+        ),
     };
 
     let choices = type_catalog::choices(kind);

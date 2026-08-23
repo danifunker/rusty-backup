@@ -12,6 +12,8 @@
 //! The writers take any `Write + Seek`, so the same code fills an image file,
 //! a raw device handle, or an in-memory buffer in tests.
 
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::IntIsMultipleOf as _;
 use anyhow::{bail, Context, Result};
 use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -80,6 +82,8 @@ pub const WRITABLE_TABLES: &[TableKind] = &[
     TableKind::X68k,
     TableKind::Rdb,
     TableKind::Sun,
+    TableKind::Next,
+    TableKind::SolarisX86,
     TableKind::Atari,
 ];
 
@@ -89,6 +93,24 @@ const AHDI_GEM_MAX_BYTES: u64 = 16 * 1024 * 1024;
 /// The slice a Sun label reserves for the whole-disk "backup" alias, which is
 /// conventionally slice 2 and overlaps every real slice.
 const SUN_BACKUP_SLICE: usize = 2;
+
+/// `d_secsize` every NeXTSTEP label we have counts its partitions in.
+const NEXT_SECTOR_SIZE: u64 = 1024;
+
+/// `d_front` — NeXT sectors reserved ahead of partition `a`, which is where
+/// the four label copies and the two boot blocks live.
+const NEXT_FRONT_PORCH: u64 = 160;
+
+/// Cylinders a Solaris x86 disk keeps ahead of the first user slice: the MBR's
+/// own cylinder, then the boot (`s8`) and alternates (`s9`) slices inside the
+/// Solaris partition. See [`write_solaris_x86`].
+const SOLARIS_HEAD_CYLINDERS: u64 = 4;
+
+/// Cylinder the Solaris MBR partition itself starts at.
+const SOLARIS_PART_START_CYLINDER: u64 = 1;
+
+/// Cylinders `format(1M)` leaves past `dkl_ncyl` for alternate-sector remaps.
+const SOLARIS_ALT_CYLINDERS: u64 = 2;
 
 /// How many partitions the table can hold, or `None` when it is unbounded in
 /// any practical sense.
@@ -103,6 +125,9 @@ pub fn slot_limit(kind: TableKind) -> Option<usize> {
         TableKind::Rdb => Some(crate::partition::rdb::RDB_SCAN_BLOCKS as usize - 1),
         // Sun has 8 slices; slice 2 is the whole-disk backup alias.
         TableKind::Sun => Some(7),
+        TableKind::Next => Some(crate::partition::next::N_PARTITIONS),
+        // 16 slices less the backup / boot / alternates trio the label owns.
+        TableKind::SolarisX86 => Some(solaris_user_slices().count()),
         // Four primary slots. XGM extended chains parse, but we don't create
         // them — see docs/partition_table_writers_backlog.md.
         TableKind::Atari => Some(crate::partition::atari::AHDI_NUM_SLOTS),
@@ -120,7 +145,8 @@ pub fn default_type(kind: TableKind) -> &'static str {
         // X68k entries carry a name, not a type code.
         TableKind::X68k => "Human68k",
         TableKind::Rdb => "DOS\\3",
-        TableKind::Sun => "root",
+        TableKind::Sun | TableKind::SolarisX86 => "root",
+        TableKind::Next => "4.3BSD",
         TableKind::Atari => "GEM",
         _ => "83",
     }
@@ -131,6 +157,9 @@ pub fn default_type(kind: TableKind) -> &'static str {
 pub fn default_name(kind: TableKind, index: usize) -> String {
     match kind {
         TableKind::Rdb => format!("DH{index}"),
+        // A NeXT entry's name is its `p_mountpt`, and both reference disks
+        // leave that empty, so an invented one would be worse than none.
+        TableKind::Next => String::new(),
         _ => format!("Partition {}", index + 1),
     }
 }
@@ -153,8 +182,15 @@ fn sun_user_slices() -> impl Iterator<Item = usize> {
     (0..8).filter(|&i| i != SUN_BACKUP_SLICE)
 }
 
-/// Bytes at the head of the disk the table itself needs.
-pub fn reserved_head(kind: TableKind) -> u64 {
+/// Slice numbers a Solaris x86 VTOC offers to user slices: all 16 less the
+/// whole-partition backup alias and the boot / alternates pair.
+fn solaris_user_slices() -> impl Iterator<Item = usize> {
+    (0..crate::partition::solaris_x86::N_SLICES).filter(|&i| !matches!(i, 2 | 8 | 9))
+}
+
+/// Bytes at the head of the disk the table itself needs. `geometry` matters
+/// only where the reserve is counted in cylinders (Solaris x86).
+pub fn reserved_head(kind: TableKind, geometry: Geometry) -> u64 {
     match kind {
         // GPT: protective MBR + header + a 128-entry array.
         TableKind::Gpt => 34 * SECTOR,
@@ -171,6 +207,12 @@ pub fn reserved_head(kind: TableKind) -> u64 {
         // Sun keeps only the 512-byte label at sector 0, but slices start on
         // cylinder boundaries, so alignment pushes slice 0 out to cylinder 1.
         TableKind::Sun => SECTOR,
+        // NeXT counts partitions from the end of the front porch, which is
+        // where the four label copies and the boot blocks live.
+        TableKind::Next => NEXT_FRONT_PORCH * NEXT_SECTOR_SIZE,
+        // MBR cylinder, then the Solaris partition's boot and alternates
+        // slices; the VTOC lives in sector 1 of the first of those.
+        TableKind::SolarisX86 => SOLARIS_HEAD_CYLINDERS * geometry.cylinder_bytes().max(SECTOR),
         // AHDI's root sector is sector 0; TOS tools conventionally leave
         // sector 1 free too.
         TableKind::Atari => 2 * SECTOR,
@@ -178,18 +220,30 @@ pub fn reserved_head(kind: TableKind) -> u64 {
     }
 }
 
-/// Bytes at the tail the table needs (GPT's backup header + array).
-pub fn reserved_tail(kind: TableKind) -> u64 {
+/// Bytes at the tail the table needs: GPT's backup header + array, and the
+/// alternate cylinders a Solaris x86 label keeps past `dkl_ncyl`.
+pub fn reserved_tail(kind: TableKind, geometry: Geometry) -> u64 {
     match kind {
         TableKind::Gpt => 33 * SECTOR,
+        TableKind::SolarisX86 => SOLARIS_ALT_CYLINDERS * geometry.cylinder_bytes().max(SECTOR),
         _ => 0,
     }
 }
 
-/// True for the tables that place partitions on cylinder boundaries, so the
-/// caller must offer a heads / sectors-per-track control. Shared by all UIs.
+/// True for the tables that place partitions on cylinder boundaries, which is
+/// what makes the cylinder size their default alignment.
 pub fn uses_cylinder_geometry(kind: TableKind) -> bool {
-    matches!(kind, TableKind::Sgi | TableKind::Rdb | TableKind::Sun)
+    matches!(
+        kind,
+        TableKind::Sgi | TableKind::Rdb | TableKind::Sun | TableKind::SolarisX86
+    )
+}
+
+/// True for the tables that need a heads / sectors-per-track control, which is
+/// every cylinder-aligned one plus NeXT — its label records the geometry even
+/// though it cuts partitions on its own 1024-byte sectors instead.
+pub fn records_geometry(kind: TableKind) -> bool {
+    uses_cylinder_geometry(kind) || kind == TableKind::Next
 }
 
 /// True for the tables whose entries carry a name the user can set — GPT and
@@ -197,7 +251,7 @@ pub fn uses_cylinder_geometry(kind: TableKind) -> bool {
 pub fn carries_entry_name(kind: TableKind) -> bool {
     matches!(
         kind,
-        TableKind::Gpt | TableKind::Apm | TableKind::X68k | TableKind::Rdb
+        TableKind::Gpt | TableKind::Apm | TableKind::X68k | TableKind::Rdb | TableKind::Next
     )
 }
 
@@ -215,7 +269,9 @@ pub fn default_align(kind: TableKind, geometry: Geometry) -> u64 {
 /// cylinder-based tables cannot express a part-cylinder size.
 fn size_granularity(kind: TableKind, align: u64) -> u64 {
     match kind {
-        TableKind::Rdb | TableKind::Sun => align.max(SECTOR),
+        TableKind::Rdb | TableKind::Sun | TableKind::SolarisX86 => align.max(SECTOR),
+        // `p_size` counts NeXT sectors, so a part-sector size cannot be said.
+        TableKind::Next => NEXT_SECTOR_SIZE,
         _ => SECTOR,
     }
 }
@@ -244,7 +300,9 @@ pub fn place(
     kind: TableKind,
     disk_size: u64,
     align: u64,
+    geometry: Geometry,
 ) -> Result<Vec<Placed>> {
+    let head = reserved_head(kind, geometry);
     if let Some(limit) = slot_limit(kind) {
         if specs.len() > limit {
             bail!(
@@ -259,8 +317,8 @@ pub fn place(
         bail!("only one partition may use `rest`");
     }
     let usable_end = disk_size
-        .checked_sub(reserved_tail(kind))
-        .filter(|e| *e > reserved_head(kind))
+        .checked_sub(reserved_tail(kind, geometry))
+        .filter(|e| *e > head)
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "disk of {} is too small for a {} table",
@@ -275,7 +333,7 @@ pub fn place(
         .filter_map(|s| s.size)
         .map(|n| round_up(n, gran))
         .sum();
-    let mut cursor = round_up(reserved_head(kind).max(align), align);
+    let mut cursor = round_up(head.max(align), align);
     if cursor.saturating_add(fixed) > usable_end {
         bail!(
             "partitions total {} but only {} is usable on a {} disk of {}",
@@ -364,6 +422,8 @@ pub fn write_table<W: Write + Seek>(
         TableKind::Sgi => write_sgi(out, placed, disk_size, geometry),
         TableKind::Rdb => write_rdb(out, placed, disk_size, geometry),
         TableKind::Sun => write_sun(out, placed, disk_size, geometry),
+        TableKind::Next => write_next(out, placed, disk_size, geometry),
+        TableKind::SolarisX86 => write_solaris_x86(out, placed, disk_size, geometry),
         TableKind::Atari => write_ahdi(out, placed, disk_size),
         _ => bail!("no table writer for {}", kind.label()),
     }
@@ -458,7 +518,7 @@ fn write_sgi<W: Write + Seek>(
         bail!("heads and sectors-per-track must both be non-zero");
     }
     let total_sectors = disk_size / SECTOR;
-    let volhdr_sectors = reserved_head(TableKind::Sgi).div_ceil(SECTOR);
+    let volhdr_sectors = reserved_head(TableKind::Sgi, geometry).div_ceil(SECTOR);
 
     let mut partitions: Vec<SgiPartitionEntry> = (0..SGI_NUM_PARTITIONS)
         .map(|_| SgiPartitionEntry {
@@ -778,6 +838,172 @@ fn write_sun<W: Write + Seek>(
     Ok(())
 }
 
+/// NeXT disk label: four checksummed copies at 512-byte blocks 0/15/30/45,
+/// each describing up to 8 partitions counted in the label's own 1024-byte
+/// sectors and measured from the end of the front porch.
+fn write_next<W: Write + Seek>(
+    out: &mut W,
+    placed: &[Placed],
+    disk_size: u64,
+    geometry: Geometry,
+) -> Result<()> {
+    use crate::partition::next::{
+        build_label, write_copies, NextLabelSpec, NextPartitionSpec, LABEL_BLOCKS, N_PARTITIONS,
+    };
+
+    let secsize = NEXT_SECTOR_SIZE;
+    let front = NEXT_FRONT_PORCH;
+    let per_cylinder = u64::from(geometry.heads) * u64::from(geometry.sectors_per_track);
+    if per_cylinder == 0 {
+        bail!("heads and sectors-per-track must both be non-zero");
+    }
+
+    let mut slots: Vec<Option<NextPartitionSpec>> = vec![None; N_PARTITIONS];
+    for (i, p) in placed.iter().enumerate() {
+        let start = p.start_byte();
+        if !start.is_multiple_of(secsize) || !p.size_bytes.is_multiple_of(secsize) {
+            bail!(
+                "NeXT counts partitions in {secsize}-byte sectors; partition {} at {} for {} is \
+                 not a whole number of them (try --align 1M)",
+                i + 1,
+                format_size(start),
+                format_size(p.size_bytes),
+            );
+        }
+        let base = start / secsize;
+        if base < front {
+            bail!(
+                "partition {} starts at {} , inside the {} front porch the label copies live in",
+                i + 1,
+                format_size(start),
+                format_size(front * secsize),
+            );
+        }
+        slots[i] = Some(NextPartitionSpec {
+            base: (base - front) as i32,
+            size: (p.size_bytes / secsize) as i32,
+            mount_point: p.name.clone(),
+            fs_type: p.type_text.trim().to_string(),
+            ..Default::default()
+        });
+    }
+
+    // `d_ntracks` / `d_nsectors` count the label's own sectors, which is why
+    // `new hd next` documents --sectors in 1024-byte units.
+    let spec = NextLabelSpec {
+        ntracks: u32::from(geometry.heads),
+        nsectors: u32::from(geometry.sectors_per_track),
+        ncylinders: (disk_size / secsize / per_cylinder) as u32,
+        sector_size: secsize as u32,
+        front_porch: front as u16,
+        partitions: slots,
+        ..Default::default()
+    };
+
+    let label = build_label(&spec);
+    write_copies(out, &label, &LABEL_BLOCKS).context("writing the NeXT disk label")?;
+    Ok(())
+}
+
+/// Solaris x86: an MBR whose one `0x82` entry holds a 16-slice VTOC in its
+/// sector 1. Cylinder 0 of the disk is the MBR's; the partition then keeps its
+/// own cylinder 0 for the boot slice and cylinders 1-2 for alternates, which
+/// is the layout `format(1M)` lays down and what [`SOLARIS_HEAD_CYLINDERS`]
+/// reserves.
+fn write_solaris_x86<W: Write + Seek>(
+    out: &mut W,
+    placed: &[Placed],
+    disk_size: u64,
+    geometry: Geometry,
+) -> Result<()> {
+    use crate::partition::solaris_x86::{
+        build_label, write_label, SolarisLabelSpec, MBR_TYPE_SUNIXOS, V_UNMNT,
+    };
+    use crate::partition::sun::{tag_from_text, SUN_TAG_WHOLE_DISK};
+
+    let spc = u64::from(geometry.heads) * u64::from(geometry.sectors_per_track);
+    if spc == 0 {
+        bail!("heads and sectors-per-track must both be non-zero");
+    }
+    let part_start = SOLARIS_PART_START_CYLINDER * spc;
+    let disk_sectors = disk_size / SECTOR;
+    let pcyl = disk_sectors
+        .checked_sub(part_start)
+        .map(|s| s / spc)
+        .filter(|c| *c > SOLARIS_ALT_CYLINDERS + SOLARIS_HEAD_CYLINDERS)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "a Solaris x86 disk needs more than {} cylinders of {}; {} is too small",
+                SOLARIS_ALT_CYLINDERS + SOLARIS_HEAD_CYLINDERS,
+                format_size(spc * SECTOR),
+                format_size(disk_size),
+            )
+        })?;
+    let ncyl = pcyl - SOLARIS_ALT_CYLINDERS;
+
+    let mut slices = vec![
+        (2usize, SUN_TAG_WHOLE_DISK, 0u16, 0u32, (ncyl * spc) as u32),
+        (8, 1, V_UNMNT, 0, spc as u32),
+        (9, 9, V_UNMNT, spc as u32, (2 * spc) as u32),
+    ];
+    for (p, slot) in placed.iter().zip(solaris_user_slices()) {
+        let tag = tag_from_text(&p.type_text)
+            .ok_or_else(|| anyhow::anyhow!("bad Solaris slice tag '{}'", p.type_text))?;
+        let start = p.start_lba;
+        if !start.is_multiple_of(spc) || !(p.size_bytes / SECTOR).is_multiple_of(spc) {
+            bail!(
+                "Solaris x86 lays slices out in whole cylinders of {}; slice {slot} at LBA {start} \
+                 for {} is not one (leave --align at the cylinder size)",
+                format_size(spc * SECTOR),
+                format_size(p.size_bytes),
+            );
+        }
+        if start < SOLARIS_HEAD_CYLINDERS * spc {
+            bail!(
+                "slice {slot} at LBA {start} starts inside the boot and alternates cylinders the \
+                 Solaris partition reserves"
+            );
+        }
+        let rel = start - part_start;
+        if rel + p.size_bytes / SECTOR > ncyl * spc {
+            bail!("slice {slot} runs past the {ncyl}-cylinder data area of the Solaris partition");
+        }
+        // `format(1M)` marks swap unmountable; everything else is a filesystem.
+        let flag = if tag == 3 { V_UNMNT } else { 0 };
+        slices.push((slot, tag, flag, rel as u32, (p.size_bytes / SECTOR) as u32));
+    }
+
+    let label = build_label(&SolarisLabelSpec {
+        pcyl: pcyl as u32,
+        ncyl: ncyl as u32,
+        acyl: SOLARIS_ALT_CYLINDERS as u16,
+        nhead: u32::from(geometry.heads),
+        nsect: u32::from(geometry.sectors_per_track),
+        rpm: 3600,
+        ascii_label: format!(
+            "DEFAULT cyl {ncyl} alt {SOLARIS_ALT_CYLINDERS} hd {} sec {}",
+            geometry.heads, geometry.sectors_per_track,
+        ),
+        slices,
+    });
+
+    let mbr = mbr::build_minimal_mbr(
+        0x5253_5459,
+        &[(
+            MBR_TYPE_SUNIXOS,
+            part_start as u32,
+            (pcyl * spc) as u32,
+            true,
+        )],
+        geometry.heads,
+        geometry.sectors_per_track,
+    );
+    out.seek(SeekFrom::Start(0))?;
+    out.write_all(&mbr).context("writing the Solaris MBR")?;
+    write_label(out, part_start, &label).context("writing the Solaris x86 VTOC")?;
+    Ok(())
+}
+
 fn put_long(buf: &mut [u8; 512], long_idx: usize, value: u32) {
     buf[long_idx * 4..long_idx * 4 + 4].copy_from_slice(&value.to_be_bytes());
 }
@@ -968,6 +1194,11 @@ mod tests {
     use std::io::Read;
 
     const DEFAULT_ALIGN: u64 = 1024 * 1024;
+    /// The geometry only the cylinder-based tables consult.
+    const GEOM: Geometry = Geometry {
+        heads: 16,
+        sectors_per_track: 63,
+    };
 
     fn spec(size: Option<u64>) -> PartSpec {
         PartSpec {
@@ -988,7 +1219,14 @@ mod tests {
     #[test]
     fn partitions_are_aligned_and_sequential() {
         let specs = vec![spec(Some(20 * 1024 * 1024)), spec(Some(40 * 1024 * 1024))];
-        let placed = place(&specs, TableKind::Mbr, 128 * 1024 * 1024, DEFAULT_ALIGN).unwrap();
+        let placed = place(
+            &specs,
+            TableKind::Mbr,
+            128 * 1024 * 1024,
+            DEFAULT_ALIGN,
+            GEOM,
+        )
+        .unwrap();
         assert_eq!(placed.len(), 2);
         assert_eq!(placed[0].start_lba, 2048);
         assert_eq!(placed[0].size_bytes, 20 * 1024 * 1024);
@@ -1001,10 +1239,10 @@ mod tests {
     fn rest_claims_what_is_left_and_stays_inside_the_disk() {
         let disk = 128 * 1024 * 1024;
         let specs = vec![spec(Some(20 * 1024 * 1024)), spec(None)];
-        let placed = place(&specs, TableKind::Gpt, disk, DEFAULT_ALIGN).unwrap();
+        let placed = place(&specs, TableKind::Gpt, disk, DEFAULT_ALIGN, GEOM).unwrap();
         // Must not tread on GPT's backup header at the tail.
         assert!(
-            placed[1].end_byte() <= disk - reserved_tail(TableKind::Gpt),
+            placed[1].end_byte() <= disk - reserved_tail(TableKind::Gpt, GEOM),
             "end {} vs disk {disk}",
             placed[1].end_byte(),
         );
@@ -1017,7 +1255,7 @@ mod tests {
     fn a_sub_sector_request_is_still_refused() {
         let specs = vec![spec(Some(300))];
         for kind in [TableKind::Mbr, TableKind::Rdb] {
-            let err = place(&specs, kind, 200 * 1024 * 1024, DEFAULT_ALIGN)
+            let err = place(&specs, kind, 200 * 1024 * 1024, DEFAULT_ALIGN, GEOM)
                 .expect_err("300 bytes is not a partition");
             assert!(format!("{err:#}").contains("one sector"), "{err:#}");
         }
@@ -1026,14 +1264,27 @@ mod tests {
     #[test]
     fn only_one_rest_is_allowed() {
         let specs = vec![spec(None), spec(None)];
-        assert!(place(&specs, TableKind::Mbr, 64 * 1024 * 1024, DEFAULT_ALIGN).is_err());
+        assert!(place(
+            &specs,
+            TableKind::Mbr,
+            64 * 1024 * 1024,
+            DEFAULT_ALIGN,
+            GEOM
+        )
+        .is_err());
     }
 
     #[test]
     fn oversized_partitions_are_refused() {
         let specs = vec![spec(Some(200 * 1024 * 1024))];
-        let err = place(&specs, TableKind::Mbr, 64 * 1024 * 1024, DEFAULT_ALIGN)
-            .expect_err("must refuse");
+        let err = place(
+            &specs,
+            TableKind::Mbr,
+            64 * 1024 * 1024,
+            DEFAULT_ALIGN,
+            GEOM,
+        )
+        .expect_err("must refuse");
         assert!(format!("{err:#}").contains("usable"), "{err:#}");
     }
 
@@ -1042,15 +1293,21 @@ mod tests {
         // The CLI used to check this itself; it belongs with the layout maths
         // so the GUI and TUI get the same refusal.
         let specs: Vec<PartSpec> = (0..5).map(|_| spec(Some(1024 * 1024))).collect();
-        let err = place(&specs, TableKind::Mbr, 128 * 1024 * 1024, DEFAULT_ALIGN)
-            .expect_err("MBR holds 4");
+        let err = place(
+            &specs,
+            TableKind::Mbr,
+            128 * 1024 * 1024,
+            DEFAULT_ALIGN,
+            GEOM,
+        )
+        .expect_err("MBR holds 4");
         assert!(format!("{err:#}").contains("at most 4"), "{err:#}");
     }
 
     #[test]
     fn sgi_reserves_its_volume_header_region() {
         let specs = vec![spec(Some(100 * 1024 * 1024))];
-        let placed = place(&specs, TableKind::Sgi, 512 * 1024 * 1024, 5040 * 512).unwrap();
+        let placed = place(&specs, TableKind::Sgi, 512 * 1024 * 1024, 5040 * 512, GEOM).unwrap();
         // Must start past the 2 MiB volume header, on a cylinder boundary.
         assert!(placed[0].start_byte() >= 2 * 1024 * 1024);
         assert_eq!(placed[0].start_lba % 5040, 0);
@@ -1072,6 +1329,14 @@ mod tests {
                 kind.label(),
             );
         }
+        assert!(
+            records_geometry(TableKind::Next),
+            "NeXT records its geometry"
+        );
+        assert!(
+            !uses_cylinder_geometry(TableKind::Next),
+            "but cuts on sectors"
+        );
         assert!(carries_entry_name(TableKind::Rdb), "RDB drive names");
         assert!(!carries_entry_name(TableKind::Mbr));
         assert!(!carries_entry_name(TableKind::Atari));
@@ -1096,7 +1361,7 @@ mod tests {
 
         // 60 MiB is not a whole number of 504 KiB cylinders.
         let specs = vec![spec(Some(60 * 1024 * 1024)), spec(None)];
-        let placed = place(&specs, TableKind::Rdb, 200 * 1024 * 1024, align).unwrap();
+        let placed = place(&specs, TableKind::Rdb, 200 * 1024 * 1024, align, GEOM).unwrap();
         for p in &placed {
             assert_eq!(p.start_byte() % cyl, 0, "start {p:?}");
             assert_eq!(p.size_bytes % cyl, 0, "size {p:?}");
@@ -1131,6 +1396,7 @@ mod tests {
             TableKind::Rdb,
             disk,
             default_align(TableKind::Rdb, geometry),
+            geometry,
         )
         .unwrap();
         let mut reader = table_on_temp_disk(TableKind::Rdb, &placed, disk, geometry);
@@ -1176,7 +1442,7 @@ mod tests {
             },
         ];
         let align = default_align(TableKind::Sun, geometry);
-        let placed = place(&specs, TableKind::Sun, disk, align).unwrap();
+        let placed = place(&specs, TableKind::Sun, disk, align, geometry).unwrap();
         let sector = first_sector_of(table_on_temp_disk(TableKind::Sun, &placed, disk, geometry));
 
         assert!(SunDiskLabel::detect(&sector), "checksum or magic wrong");
@@ -1215,7 +1481,7 @@ mod tests {
                 name: None,
             },
         ];
-        let placed = place(&specs, TableKind::Atari, disk, DEFAULT_ALIGN).unwrap();
+        let placed = place(&specs, TableKind::Atari, disk, DEFAULT_ALIGN, GEOM).unwrap();
         assert_eq!(placed[0].type_text, "GEM", "8 MiB still fits GEM");
         assert_eq!(placed[1].type_text, "BGM", "24 MiB must be promoted");
         assert_eq!(placed[2].type_text, "RAW", "an explicit tag is left alone");
@@ -1302,6 +1568,69 @@ mod tests {
         sector
     }
 
+    /// The NeXT trap: `p_base` counts 1024-byte sectors from the end of the
+    /// front porch, so an editor that assumes 512-byte LBAs puts a partition
+    /// at half its intended offset.
+    #[test]
+    fn next_partitions_are_measured_from_the_front_porch() {
+        use crate::partition::next::{NextDiskLabel, LABEL_SPAN};
+        use std::io::Read;
+
+        let disk = 660 * 1024 * 1024;
+        let geometry = Geometry::default();
+        let specs = vec![spec(None)];
+        let placed = place(&specs, TableKind::Next, disk, 1024 * 1024, geometry).unwrap();
+        assert_eq!(placed[0].start_lba, 2048, "1 MiB alignment, past the porch");
+
+        let mut file = table_on_temp_disk(TableKind::Next, &placed, disk, geometry);
+        let mut buf = vec![0u8; LABEL_SPAN];
+        file.read_exact(&mut buf).unwrap();
+        let label = NextDiskLabel::parse(&buf, 0).unwrap();
+        assert_eq!(label.sector_size, 1024);
+        assert_eq!(label.front_porch, 160);
+        let (_, p) = label.browsable_partitions().next().expect("one partition");
+        assert_eq!(p.base, (1024 * 1024 / 1024) - 160);
+        assert_eq!(p.start_byte, placed[0].start_byte());
+        assert_eq!(p.size_bytes, placed[0].size_bytes);
+    }
+
+    /// A Solaris x86 slice is relative to the Solaris MBR partition, and the
+    /// label owns the first three cylinders of it plus the disk's cylinder 0.
+    #[test]
+    fn solaris_slices_start_past_the_labels_own_cylinders() {
+        use crate::partition::PartitionTable;
+
+        let geometry = Geometry {
+            heads: 128,
+            sectors_per_track: 63,
+        };
+        let spc = u64::from(geometry.heads) * u64::from(geometry.sectors_per_track);
+        let disk = 3 * 1024 * 1024 * 1024;
+        let align = default_align(TableKind::SolarisX86, geometry);
+        let specs = vec![spec(Some(64 * 1024 * 1024)), spec(None)];
+        let placed = place(&specs, TableKind::SolarisX86, disk, align, geometry).unwrap();
+        assert_eq!(placed[0].start_lba, SOLARIS_HEAD_CYLINDERS * spc);
+
+        let mut reader = table_on_temp_disk(TableKind::SolarisX86, &placed, disk, geometry);
+        let table = PartitionTable::detect(&mut reader).unwrap();
+        let PartitionTable::SolarisX86 { label, mbr } = &table else {
+            panic!("not a Solaris x86 disk: {table:?}");
+        };
+        assert_eq!(label.partition_start_lba, spc, "partition at cylinder 1");
+        assert_eq!(mbr.entries[0].partition_type, 0x82);
+        assert_eq!(
+            u64::from(label.slices[0].relative_start),
+            placed[0].start_lba - spc,
+        );
+        // The backup alias covers ncyl, and the two alternate cylinders past
+        // it are why `rest` must stop short of the end of the disk.
+        assert_eq!(
+            label.slices[2].num_sectors as u64,
+            disk / SECTOR / spc * spc - spc - SOLARIS_ALT_CYLINDERS * spc,
+        );
+        assert!(placed[1].end_byte() <= disk - SOLARIS_ALT_CYLINDERS * spc * SECTOR);
+    }
+
     /// Round-trip every writable table through `write_table` and re-parse it,
     /// which is what proves the GUI's in-memory path matches the CLI's file one.
     #[test]
@@ -1313,7 +1642,7 @@ mod tests {
             let geometry = Geometry::default();
             let align = default_align(kind, geometry);
             let specs = vec![spec(Some(64 * 1024 * 1024)), spec(None)];
-            let placed = place(&specs, kind, disk, align)
+            let placed = place(&specs, kind, disk, align, geometry)
                 .unwrap_or_else(|e| panic!("{} place: {e:#}", kind.label()));
 
             let mut reader = table_on_temp_disk(kind, &placed, disk, geometry);
@@ -1326,7 +1655,9 @@ mod tests {
                 kind.label(),
             );
             let parsed = table.partitions();
-            assert_eq!(parsed.len(), 2, "{} partition count", kind.label());
+            // A Solaris x86 label also lists its own boot and alternates slices.
+            let want = if kind == TableKind::SolarisX86 { 4 } else { 2 };
+            assert_eq!(parsed.len(), want, "{} partition count", kind.label());
             for (want, got) in placed.iter().zip(parsed.iter()) {
                 assert_eq!(got.start_lba, want.start_lba, "{} start", kind.label());
                 assert_eq!(got.size_bytes, want.size_bytes, "{} size", kind.label());
@@ -1356,7 +1687,8 @@ mod tests {
         ] {
             let specs = vec![named(wanted)];
             let geometry = Geometry::default();
-            let placed = place(&specs, kind, disk, default_align(kind, geometry)).unwrap();
+            let placed =
+                place(&specs, kind, disk, default_align(kind, geometry), geometry).unwrap();
             let mut reader = table_on_temp_disk(kind, &placed, disk, geometry);
             let table = PartitionTable::detect(&mut reader).unwrap();
             let names = format!("{:?}", table.partitions());

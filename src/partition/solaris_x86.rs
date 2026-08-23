@@ -22,7 +22,7 @@
 
 use byteorder::{ByteOrder, LittleEndian};
 use serde::{Deserialize, Serialize};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 use super::mbr::Mbr;
 use super::sun::{tag_name, SUN_TAG_WHOLE_DISK};
@@ -49,7 +49,25 @@ const PART_ENTRY_SIZE: usize = 12;
 /// Bytes of the sector we need; a VTOC is 456 bytes and lives in one sector.
 const VTOC_SIZE: usize = 456;
 /// The VTOC lives in sector 1 of the Solaris partition; sector 0 is `mboot`.
-const VTOC_SECTOR: u64 = 1;
+pub const VTOC_SECTOR: u64 = 1;
+
+/// `struct dk_label` continues past the VTOC with the drive geometry, then
+/// closes the sector with a magic word and an XOR checksum.
+const OFF_PCYL: usize = 456;
+const OFF_NCYL: usize = 460;
+const OFF_ACYL: usize = 464;
+const OFF_BCYL: usize = 466;
+const OFF_NHEAD: usize = 468;
+const OFF_NSECT: usize = 472;
+const OFF_INTRLV: usize = 476;
+const OFF_APC: usize = 480;
+const OFF_RPM: usize = 482;
+const OFF_MAGIC: usize = 508;
+const OFF_CKSUM: usize = 510;
+/// `DKL_MAGIC` — the same word the SPARC label ends with.
+pub const DKL_MAGIC: u16 = 0xDABE;
+/// `V_UNMNT` — the slice is not mountable (swap, boot, alternates).
+pub const V_UNMNT: u16 = 0x01;
 
 /// One Solaris x86 slice, resolved to absolute sectors.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -159,6 +177,106 @@ impl SolarisX86Label {
     }
 }
 
+/// Geometry and slices a fresh Solaris x86 label describes. Slice offsets are
+/// relative to the Solaris MBR partition, as they are on disk.
+#[derive(Debug, Clone, Default)]
+pub struct SolarisLabelSpec {
+    /// `dkl_pcyl` — cylinders the Solaris MBR partition spans.
+    pub pcyl: u32,
+    /// `dkl_ncyl` — data cylinders, which is what the backup slice covers.
+    pub ncyl: u32,
+    /// `dkl_acyl` — alternate cylinders past `ncyl`.
+    pub acyl: u16,
+    pub nhead: u32,
+    pub nsect: u32,
+    pub rpm: u16,
+    /// `v_asciilabel` — the geometry line `format(1M)` prints.
+    pub ascii_label: String,
+    /// `(slot, tag, flag, start, size)` per slice, in 512-byte sectors.
+    pub slices: Vec<(usize, u16, u16, u32, u32)>,
+}
+
+/// Serialize a whole `struct dk_label` sector, magic and checksum stamped.
+pub fn build_label(spec: &SolarisLabelSpec) -> [u8; 512] {
+    let mut b = [0u8; 512];
+    LittleEndian::write_u32(&mut b[VTOC_OFF_SANITY..VTOC_OFF_SANITY + 4], VTOC_SANITY);
+    LittleEndian::write_u32(&mut b[VTOC_OFF_VERSION..VTOC_OFF_VERSION + 4], 1);
+    LittleEndian::write_u16(&mut b[VTOC_OFF_SECTORSZ..VTOC_OFF_SECTORSZ + 2], 512);
+    LittleEndian::write_u16(
+        &mut b[VTOC_OFF_NPARTS..VTOC_OFF_NPARTS + 2],
+        N_SLICES as u16,
+    );
+    let n = spec.ascii_label.len().min(127);
+    b[VTOC_OFF_ASCIILABEL..VTOC_OFF_ASCIILABEL + n]
+        .copy_from_slice(&spec.ascii_label.as_bytes()[..n]);
+    for &(slot, tag, flag, start, size) in &spec.slices {
+        set_slice(&mut b, slot, tag, flag, start, size);
+    }
+    LittleEndian::write_u32(&mut b[OFF_PCYL..OFF_PCYL + 4], spec.pcyl);
+    LittleEndian::write_u32(&mut b[OFF_NCYL..OFF_NCYL + 4], spec.ncyl);
+    LittleEndian::write_u16(&mut b[OFF_ACYL..OFF_ACYL + 2], spec.acyl);
+    LittleEndian::write_u16(&mut b[OFF_BCYL..OFF_BCYL + 2], 0);
+    LittleEndian::write_u32(&mut b[OFF_NHEAD..OFF_NHEAD + 4], spec.nhead);
+    LittleEndian::write_u32(&mut b[OFF_NSECT..OFF_NSECT + 4], spec.nsect);
+    LittleEndian::write_u16(&mut b[OFF_INTRLV..OFF_INTRLV + 2], 1);
+    LittleEndian::write_u16(&mut b[OFF_APC..OFF_APC + 2], 0);
+    LittleEndian::write_u16(&mut b[OFF_RPM..OFF_RPM + 2], spec.rpm);
+    stamp_checksum(&mut b);
+    b
+}
+
+/// Overwrite one `v_part` entry in a label sector.
+pub fn set_slice(sector: &mut [u8], slot: usize, tag: u16, flag: u16, start: u32, size: u32) {
+    let base = VTOC_OFF_PART + slot * PART_ENTRY_SIZE;
+    if slot >= N_SLICES || sector.len() < base + PART_ENTRY_SIZE {
+        return;
+    }
+    LittleEndian::write_u16(&mut sector[base..base + 2], tag);
+    LittleEndian::write_u16(&mut sector[base + 2..base + 4], flag);
+    LittleEndian::write_u32(&mut sector[base + 4..base + 8], start);
+    LittleEndian::write_u32(&mut sector[base + 8..base + 12], size);
+}
+
+/// Read one `v_part` entry back as `(tag, flag, start, size)`.
+pub fn get_slice(sector: &[u8], slot: usize) -> Option<(u16, u16, u32, u32)> {
+    let base = VTOC_OFF_PART + slot * PART_ENTRY_SIZE;
+    if slot >= N_SLICES || sector.len() < base + PART_ENTRY_SIZE {
+        return None;
+    }
+    Some((
+        LittleEndian::read_u16(&sector[base..base + 2]),
+        LittleEndian::read_u16(&sector[base + 2..base + 4]),
+        LittleEndian::read_u32(&sector[base + 4..base + 8]),
+        LittleEndian::read_u32(&sector[base + 8..base + 12]),
+    ))
+}
+
+/// Recompute `dkl_cksum` so the XOR of all 256 little-endian words is zero,
+/// which is the test Solaris' own label reader applies.
+pub fn stamp_checksum(sector: &mut [u8]) {
+    if sector.len() < 512 {
+        return;
+    }
+    LittleEndian::write_u16(&mut sector[OFF_MAGIC..OFF_MAGIC + 2], DKL_MAGIC);
+    LittleEndian::write_u16(&mut sector[OFF_CKSUM..OFF_CKSUM + 2], 0);
+    let mut csum = 0u16;
+    for w in sector[..510].chunks_exact(2) {
+        csum ^= LittleEndian::read_u16(w);
+    }
+    LittleEndian::write_u16(&mut sector[OFF_CKSUM..OFF_CKSUM + 2], csum);
+}
+
+/// Write a whole label sector to `lba` + [`VTOC_SECTOR`].
+pub fn write_label<W: Write + Seek>(
+    out: &mut W,
+    partition_start_lba: u64,
+    sector: &[u8],
+) -> std::io::Result<()> {
+    out.seek(SeekFrom::Start((partition_start_lba + VTOC_SECTOR) * 512))?;
+    out.write_all(sector)?;
+    out.flush()
+}
+
 /// Look for a Solaris VTOC inside any Solaris-typed MBR partition.
 pub fn detect<R: Read + Seek>(reader: &mut R, mbr: &Mbr) -> Option<SolarisX86Label> {
     let disk_size = reader.seek(SeekFrom::End(0)).ok()?;
@@ -262,6 +380,50 @@ mod tests {
     fn slices_running_past_the_partition_are_rejected() {
         let label = SolarisX86Label::parse(&synth_vtoc(), 0, 8064, 500).unwrap();
         assert!(!validates(&label));
+    }
+
+    #[test]
+    fn a_built_label_checksums_and_parses_back() {
+        let spec = SolarisLabelSpec {
+            pcyl: 779,
+            ncyl: 777,
+            acyl: 2,
+            nhead: 128,
+            nsect: 63,
+            rpm: 3600,
+            ascii_label: "DEFAULT cyl 777 alt 2 hd 128 sec 63".to_string(),
+            slices: vec![
+                (0, 2, 0, 24192, 4201344),
+                (2, SUN_TAG_WHOLE_DISK, 0, 0, 6265728),
+                (8, 1, V_UNMNT, 0, 8064),
+            ],
+        };
+        let sector = build_label(&spec);
+        assert_eq!(
+            LittleEndian::read_u16(&sector[OFF_MAGIC..OFF_MAGIC + 2]),
+            DKL_MAGIC
+        );
+        // Solaris' own test: the XOR of all 256 words has to come out zero.
+        let mut x = 0u16;
+        for w in sector.chunks_exact(2) {
+            x ^= LittleEndian::read_u16(w);
+        }
+        assert_eq!(x, 0, "dkl_cksum does not close the sector");
+
+        let label = SolarisX86Label::parse(&sector, 0, 8064, 6281856).unwrap();
+        assert!(validates(&label));
+        let live: Vec<_> = label.browsable_slices().collect();
+        assert_eq!(live.len(), 2, "s0 and s8; the backup alias is skipped");
+        assert_eq!(live[0].1.start_sector, 8064 + 24192);
+        assert_eq!(label.ascii_label, "DEFAULT cyl 777 alt 2 hd 128 sec 63");
+    }
+
+    #[test]
+    fn slices_round_trip_through_set_and_get() {
+        let mut sector = build_label(&SolarisLabelSpec::default());
+        set_slice(&mut sector, 5, 4, V_UNMNT, 1234, 5678);
+        assert_eq!(get_slice(&sector, 5), Some((4, V_UNMNT, 1234, 5678)));
+        assert!(get_slice(&sector, N_SLICES).is_none());
     }
 
     #[test]

@@ -34,7 +34,7 @@
 
 use byteorder::{BigEndian, ByteOrder};
 use serde::{Deserialize, Serialize};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 use crate::error::RustyBackupError;
 
@@ -54,8 +54,10 @@ pub const LABEL_SPAN: usize = 15 * 512;
 /// Partition slots in a NeXT label.
 pub const N_PARTITIONS: usize = 8;
 
-const PART_TABLE_OFF: usize = 0xBE;
-const PART_ENTRY_SIZE: usize = 46;
+/// Offset of `d_partitions` inside a label copy.
+pub const PART_TABLE_OFF: usize = 0xBE;
+/// Bytes one `struct partition` occupies, its 2-byte alignment pad included.
+pub const PART_ENTRY_SIZE: usize = 46;
 /// v3 stores its checksum immediately after the partition table.
 const V3_CKSUM_OFF: usize = PART_TABLE_OFF + N_PARTITIONS * PART_ENTRY_SIZE;
 /// v1/v2 interpose `dl_bad[1670]` (int32) before theirs.
@@ -222,6 +224,229 @@ impl NextDiskLabel {
         let sum = checksum(&buf[..off]);
         BigEndian::write_u16(&mut buf[off..off + 2], sum);
     }
+}
+
+/// The `struct partition` fields a writer sets. The rest of the entry is
+/// fixed at what a stock NeXTSTEP `newfs` records, which both reference disks
+/// carry verbatim.
+#[derive(Debug, Clone)]
+pub struct NextPartitionSpec {
+    /// `p_base` — sectors past the front porch, in `d_secsize` units.
+    pub base: i32,
+    /// `p_size` in the same units.
+    pub size: i32,
+    /// `p_bsize` — filesystem block size.
+    pub block_size: u16,
+    /// `p_fsize` — filesystem fragment size.
+    pub frag_size: u16,
+    /// `p_mountpt` — up to 16 bytes.
+    pub mount_point: String,
+    /// `p_type` — up to 8 bytes.
+    pub fs_type: String,
+}
+
+impl Default for NextPartitionSpec {
+    fn default() -> Self {
+        Self {
+            base: 0,
+            size: 0,
+            block_size: 8192,
+            frag_size: 1024,
+            mount_point: String::new(),
+            fs_type: "4.3BSD".to_string(),
+        }
+    }
+}
+
+/// Everything a fresh label carries besides its partitions.
+#[derive(Debug, Clone)]
+pub struct NextLabelSpec {
+    /// `dl_label` — the volume name the NeXTSTEP disk panel shows.
+    pub label: String,
+    /// `d_name` — drive model string.
+    pub drive_name: String,
+    /// `d_type` — drive class.
+    pub drive_type: String,
+    /// `d_secsize` — the unit `p_base` / `p_size` are counted in.
+    pub sector_size: u32,
+    pub ntracks: u32,
+    /// `d_nsectors` — sectors per track, in `sector_size` units.
+    pub nsectors: u32,
+    pub ncylinders: u32,
+    pub rpm: u32,
+    /// `d_front` — sectors reserved ahead of partition `a`.
+    pub front_porch: u16,
+    /// `d_bootfile` — kernel NeXTSTEP boots.
+    pub boot_file: String,
+    pub hostname: String,
+    pub root_partition: char,
+    pub rw_partition: char,
+    /// One entry per slot; `None` writes the unused pattern.
+    pub partitions: Vec<Option<NextPartitionSpec>>,
+}
+
+impl Default for NextLabelSpec {
+    fn default() -> Self {
+        Self {
+            label: "Disk".to_string(),
+            drive_name: "rusty-backup".to_string(),
+            drive_type: "fixed_rw_scsi".to_string(),
+            sector_size: 1024,
+            ntracks: 16,
+            nsectors: 32,
+            ncylinders: 0,
+            rpm: 3600,
+            front_porch: 160,
+            boot_file: "sdmach".to_string(),
+            hostname: "localhost".to_string(),
+            root_partition: 'a',
+            rw_partition: 'b',
+            partitions: Vec::new(),
+        }
+    }
+}
+
+/// `d_boot0_blkno` — the two boot-block copies, in `d_secsize` units. Both
+/// reference disks record 32 and 96, which sit past the four label copies and
+/// still inside a 160-sector front porch.
+pub const BOOT0_BLOCKS: [u32; 2] = [32, 96];
+
+/// Serialize one label copy, checksum stamped, as a [`LABEL_SPAN`] buffer.
+pub fn build_label(spec: &NextLabelSpec) -> Vec<u8> {
+    let mut buf = vec![0u8; LABEL_SPAN];
+    BigEndian::write_u32(&mut buf[0..4], NEXT_LABEL_V3);
+    // `dl_size` is zero on both reference disks; the stamped block number is
+    // written per copy by `write_copies`.
+    put_str(&mut buf[0x0C..0x24], &spec.label);
+    put_str(&mut buf[0x2C..0x44], &spec.drive_name);
+    put_str(&mut buf[0x44..0x5C], &spec.drive_type);
+    BigEndian::write_u32(&mut buf[0x5C..0x60], spec.sector_size);
+    BigEndian::write_u32(&mut buf[0x60..0x64], spec.ntracks);
+    BigEndian::write_u32(&mut buf[0x64..0x68], spec.nsectors);
+    BigEndian::write_u32(&mut buf[0x68..0x6C], spec.ncylinders);
+    BigEndian::write_u32(&mut buf[0x6C..0x70], spec.rpm);
+    BigEndian::write_u16(&mut buf[0x70..0x72], spec.front_porch);
+    BigEndian::write_u32(&mut buf[0x7C..0x80], BOOT0_BLOCKS[0]);
+    BigEndian::write_u32(&mut buf[0x80..0x84], BOOT0_BLOCKS[1]);
+    put_str(&mut buf[0x84..0x9C], &spec.boot_file);
+    put_str(&mut buf[0x9C..0xBC], &spec.hostname);
+    buf[0xBC] = spec.root_partition as u8;
+    buf[0xBD] = spec.rw_partition as u8;
+    for slot in 0..N_PARTITIONS {
+        match spec.partitions.get(slot).and_then(|p| p.as_ref()) {
+            Some(p) => write_partition(&mut buf, slot, p),
+            None => clear_partition(&mut buf, slot),
+        }
+    }
+    NextDiskLabel::stamp_checksum(&mut buf, NEXT_LABEL_V3);
+    buf
+}
+
+/// Fill slot `slot` of a label copy from `spec`.
+pub fn write_partition(buf: &mut [u8], slot: usize, spec: &NextPartitionSpec) {
+    let Some(e) = entry_mut(buf, slot) else {
+        return;
+    };
+    for b in e.iter_mut() {
+        *b = 0;
+    }
+    BigEndian::write_i32(&mut e[0..4], spec.base);
+    BigEndian::write_i32(&mut e[4..8], spec.size);
+    BigEndian::write_u16(&mut e[8..10], spec.block_size);
+    BigEndian::write_u16(&mut e[10..12], spec.frag_size);
+    e[12] = b't';
+    BigEndian::write_u16(&mut e[14..16], 16);
+    BigEndian::write_u16(&mut e[16..18], 4096);
+    e[18] = 10;
+    e[19] = 1;
+    put_str(&mut e[20..36], &spec.mount_point);
+    e[36] = 1;
+    put_str(&mut e[37..45], &spec.fs_type);
+}
+
+/// Stamp slot `slot` as unused, in the all-ones form NeXTSTEP writes.
+pub fn clear_partition(buf: &mut [u8], slot: usize) {
+    let Some(e) = entry_mut(buf, slot) else {
+        return;
+    };
+    for b in e.iter_mut() {
+        *b = 0;
+    }
+    for b in e[0..12].iter_mut() {
+        *b = 0xFF;
+    }
+    for b in e[14..19].iter_mut() {
+        *b = 0xFF;
+    }
+}
+
+/// Move slot `slot` without disturbing the filesystem geometry beside it.
+pub fn set_partition_extent(buf: &mut [u8], slot: usize, base: i32, size: i32) {
+    let Some(e) = entry_mut(buf, slot) else {
+        return;
+    };
+    BigEndian::write_i32(&mut e[0..4], base);
+    BigEndian::write_i32(&mut e[4..8], size);
+}
+
+/// Rewrite slot `slot`'s `p_type`.
+pub fn set_partition_type(buf: &mut [u8], slot: usize, fs_type: &str) {
+    let Some(e) = entry_mut(buf, slot) else {
+        return;
+    };
+    put_str(&mut e[37..45], fs_type);
+}
+
+fn entry_mut(buf: &mut [u8], slot: usize) -> Option<&mut [u8]> {
+    let start = PART_TABLE_OFF + slot * PART_ENTRY_SIZE;
+    buf.get_mut(start..start + PART_ENTRY_SIZE)
+}
+
+/// NUL-padded fixed-width string field.
+fn put_str(field: &mut [u8], text: &str) {
+    for b in field.iter_mut() {
+        *b = 0;
+    }
+    let n = text.len().min(field.len().saturating_sub(1));
+    field[..n].copy_from_slice(&text.as_bytes()[..n]);
+}
+
+/// The 512-byte blocks that already hold a valid copy. NeXTSTEP/Intel has none
+/// at block 0 — the PC boot sector lives there — so a rewrite must land on
+/// exactly the copies the disk was made with.
+pub fn present_copies<R: Read + Seek>(reader: &mut R) -> Vec<u64> {
+    let mut out = Vec::new();
+    let Ok(disk_size) = reader.seek(SeekFrom::End(0)) else {
+        return out;
+    };
+    for block in LABEL_BLOCKS {
+        let offset = block * 512;
+        if offset + LABEL_SPAN as u64 > disk_size || reader.seek(SeekFrom::Start(offset)).is_err() {
+            continue;
+        }
+        let mut buf = vec![0u8; LABEL_SPAN];
+        if reader.read_exact(&mut buf).is_ok() && validates(&buf) {
+            out.push(block);
+        }
+    }
+    out
+}
+
+/// Write `copy` to each of `blocks`, stamping every copy's own
+/// `dl_label_blkno`. The checksum reads that field as zero, so one stamp on
+/// `copy` covers all four.
+pub fn write_copies<W: Write + Seek>(
+    out: &mut W,
+    copy: &[u8],
+    blocks: &[u64],
+) -> std::io::Result<()> {
+    let mut buf = copy.to_vec();
+    for &block in blocks {
+        BigEndian::write_u32(&mut buf[4..8], block as u32);
+        out.seek(SeekFrom::Start(block * 512))?;
+        out.write_all(&buf)?;
+    }
+    out.flush()
 }
 
 /// Probe the four label copies and return the first that validates.
@@ -404,6 +629,65 @@ mod tests {
         img[511] = 0xAA;
         let mut cur = std::io::Cursor::new(img);
         assert!(detect(&mut cur).is_none());
+    }
+
+    #[test]
+    fn a_built_label_parses_back_and_keeps_the_front_porch_offset() {
+        let spec = NextLabelSpec {
+            ncylinders: 670,
+            partitions: vec![Some(NextPartitionSpec {
+                base: 864,
+                size: 674816,
+                mount_point: "/".to_string(),
+                ..Default::default()
+            })],
+            ..Default::default()
+        };
+        let buf = build_label(&spec);
+        assert!(validates(&buf), "a freshly built label must checksum");
+        let label = NextDiskLabel::parse(&buf, 0).unwrap();
+        let live: Vec<_> = label.browsable_partitions().collect();
+        assert_eq!(live.len(), 1, "the other seven slots are unused");
+        assert_eq!(live[0].1.fs_type, "4.3BSD");
+        assert_eq!(live[0].1.mount_point, "/");
+        // (160 + 864) sectors of 1024 — not 864 * 512, the trap this guards.
+        assert_eq!(live[0].1.start_byte, (160 + 864) * 1024);
+        assert_eq!(live[0].1.size_bytes, 674816 * 1024);
+    }
+
+    /// An unused slot has to read back unused, or a fresh label grows seven
+    /// phantom partitions at block -1.
+    #[test]
+    fn empty_slots_are_written_in_the_unused_form() {
+        let buf = build_label(&NextLabelSpec::default());
+        let label = NextDiskLabel::parse(&buf, 0).unwrap();
+        assert!(label.partitions.iter().all(|p| p.is_empty()));
+        let slot = &buf[PART_TABLE_OFF..PART_TABLE_OFF + 12];
+        assert!(slot.iter().all(|&b| b == 0xFF), "got {slot:02x?}");
+    }
+
+    #[test]
+    fn every_copy_carries_its_own_block_number_and_one_checksum() {
+        let mut img = std::io::Cursor::new(vec![0u8; 4 * 1024 * 1024]);
+        let label = build_label(&NextLabelSpec {
+            partitions: vec![Some(NextPartitionSpec {
+                base: 0,
+                size: 1000,
+                ..Default::default()
+            })],
+            ..Default::default()
+        });
+        write_copies(&mut img, &label, &LABEL_BLOCKS).unwrap();
+        assert_eq!(present_copies(&mut img), LABEL_BLOCKS.to_vec());
+        for block in LABEL_BLOCKS {
+            let at = (block * 512) as usize;
+            let copy = &img.get_ref()[at..at + LABEL_SPAN];
+            assert_eq!(BigEndian::read_u32(&copy[4..8]), block as u32);
+            assert_eq!(
+                BigEndian::read_u16(&copy[V3_CKSUM_OFF..V3_CKSUM_OFF + 2]),
+                BigEndian::read_u16(&label[V3_CKSUM_OFF..V3_CKSUM_OFF + 2]),
+            );
+        }
     }
 
     #[test]

@@ -19,6 +19,8 @@ together and what was learned building it.
 | X68000 | Done | `partition::provision::write_x68k` |
 | RDB (Amiga) | Done | `partition::provision::write_rdb` |
 | Sun (SMI VTOC) | Done | `partition::provision::write_sun` |
+| NeXT | Done | `partition::provision::write_next` + `partition::next::build_label` |
+| Solaris x86 | Done | `partition::provision::write_solaris_x86` + `partition::solaris_x86::build_label` |
 | AHDI (Atari ST) | Done | `partition::provision::write_ahdi` |
 
 Every table this project parses can now also be written. What is left is
@@ -32,7 +34,7 @@ empty partitions; `rb-cli reformat --fs <fs>` fills them. See
 
 ## How to add a writer
 
-All eight existing writers follow the same shape, so a new one slots in without
+All ten existing writers follow the same shape, so a new one slots in without
 touching the layout engine:
 
 1. Add the variant to `PartitionedHdCommand` and to `HdCommand` in
@@ -41,7 +43,9 @@ touching the layout engine:
    point at every match arm that needs updating, which is the safety net.
 3. In `partition::provision`, give it `default_type()`, `slot_limit()` and
    `reserved_head()` / `reserved_tail()` entries so the shared `place()` keeps
-   partitions clear of the table's own regions.
+   partitions clear of the table's own regions. Both take the `Geometry`,
+   because a cylinder-counted reserve — Solaris x86's four — cannot be
+   expressed as a fixed byte count.
 4. Write `fn write_<table>(out: &mut impl Write + Seek, placed, disk_size)` and
    dispatch to it from `provision::write_table`.
 5. Add the kind to `provision::WRITABLE_TABLES` — that is the single list the
@@ -91,6 +95,89 @@ util-linux `fdisk -l` / `sfdisk --dump` / `sfdisk --verify` on a Linux box,
 which report our geometry, every slice's start and length, and each tag.
 Booting a real Solaris install is still unproven — the label is right by every
 tool that reads it, but nobody has put an actual SunOS root on one yet.
+
+---
+
+## NeXT disk label — done
+
+Shipped as `partition::provision::write_next`, reached from `rb-cli new hd
+next`. The serialiser itself lives in `partition::next::build_label` /
+`write_copies`, beside the parser, because both read the same offset table in
+that module's `//!` header.
+
+Notes for anyone extending it:
+
+- **Four copies, one checksum.** The label is written at 512-byte blocks 0, 15,
+  30 and 45, each stamping its own `dl_label_blkno`. That field is *read as
+  zero* by the checksum, which is why all four copies carry the same word. A
+  writer that recomputed per copy would still validate, but a reader comparing
+  copies would see them disagree. NeXTSTEP/Intel disks have no copy at block 0
+  — the PC boot sector is there — so `next::present_copies` exists to tell an
+  in-place edit which ones to rewrite.
+- **Units.** `p_base` and `p_size` count `d_secsize` sectors (1024 on every
+  disk we have), and `p_base` is measured **from the end of the front porch**:
+  a partition's byte offset is `(d_front + p_base) * d_secsize`. Getting this
+  wrong puts partitions at half their intended offset, silently. `place()`
+  therefore gives NeXT a 1024-byte `size_granularity` and the writer refuses an
+  alignment that is not a whole number of them.
+- **The front porch** is 160 sectors (160 KiB) on both reference disks, which
+  covers the four label copies (they end at block 60) and the two boot blocks
+  `d_boot0_blkno` names at sectors 32 and 96 — also 1024-byte sectors, not
+  512-byte ones, which is the only reading under which they clear the labels.
+- **Geometry.** `d_ntracks` / `d_nsectors` are in `d_secsize` units too, so
+  `new hd next --sectors` is documented as counting those. NeXT partitions are
+  not cylinder-aligned (both fixtures put partition `a` at `p_base == 0`), so
+  the label records the geometry without it driving alignment — the split
+  between `uses_cylinder_geometry` and `records_geometry`.
+- An unused slot is `0xFF` across `p_base`..`p_fsize` and `p_cpg`..`p_minfree`,
+  with the rest zeroed. `clear_partition` reproduces that byte pattern exactly.
+
+**Validation.** Round-trips through our own parser
+(`next_partitions_are_measured_from_the_front_porch`,
+`a_built_label_parses_back_and_keeps_the_front_porch_offset`), and every field
+was re-derived from the two reference disks — NeXTSTEP 3.3 on m68k (Previous)
+and on Intel (86Box). A written label is byte-identical in shape to those,
+including the `p_opt`/`p_cpg`/`p_density`/`p_minfree` values a stock `newfs`
+records.
+
+---
+
+## Solaris x86 VTOC — done
+
+Shipped as `partition::provision::write_solaris_x86`, reached from `rb-cli new
+hd solaris-x86`. Unlike every other writer it emits **two** structures: the
+MBR, and a nested label inside one of its partitions.
+
+Notes for anyone extending it:
+
+- **The label is a whole `struct dk_label`, not just the 456-byte `struct
+  vtoc`.** Past the VTOC come `dkl_pcyl` / `dkl_ncyl` / `dkl_acyl` / `dkl_bcyl`
+  / `dkl_nhead` / `dkl_nsect` / `dkl_intrlv` / `dkl_skew` / `dkl_apc` /
+  `dkl_rpm`, then `0xDABE` at byte 508 and an XOR checksum at 510 that has to
+  bring all 256 little-endian words to zero. Solaris' own label reader checks
+  the magic and the checksum, so a VTOC-only write would parse here and be
+  rejected there. The parser stays permissive and reads only the VTOC.
+- **Cylinder budget.** Disk cylinder 0 is the MBR's; the Solaris partition
+  starts at cylinder 1 and spans `pcyl` cylinders. Inside it, cylinder 0 is
+  slice 8 (`boot`, and where the VTOC itself lives, in its second sector),
+  cylinders 1-2 are slice 9 (`alternates`), and slice 2 is the whole-partition
+  `backup` alias covering `ncyl == pcyl - 2` cylinders. So user slices start at
+  the *disk's* fourth cylinder — `SOLARIS_HEAD_CYLINDERS` — and `reserved_tail`
+  keeps a `rest` slice off the two alternate cylinders at the end.
+- Slice offsets in `v_part` are **sectors relative to the Solaris partition**,
+  not cylinders (that is the SPARC label) and not absolute (that is everything
+  else here).
+- The MBR entry is written type `0x82` (`SUNIXOS`, Solaris 2.x-9) and bootable,
+  matching the reference disk. Solaris 10+ uses `0xBF`; nothing else about the
+  layout changes.
+- Sector 0 of the Solaris partition is `mboot` on a real install. We leave it
+  zeroed — a freshly provisioned disk has no boot program to point at.
+
+**Validation.** Round-trips through our own parser
+(`solaris_slices_start_past_the_labels_own_cylinders`,
+`a_built_label_checksums_and_parses_back`), with every offset and the checksum
+convention re-derived from a Solaris 2.6/x86 reference disk; a written label's
+geometry tail matches that disk's field for field.
 
 ---
 

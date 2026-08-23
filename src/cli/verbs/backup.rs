@@ -318,7 +318,14 @@ mod tests {
             type_text: Some("0b".into()),
             name: None,
         };
-        let placed = place(&[spec(16), spec(16)], kind, size, 2048 * 512).unwrap();
+        let placed = place(
+            &[spec(16), spec(16)],
+            kind,
+            size,
+            2048 * 512,
+            Default::default(),
+        )
+        .unwrap();
         let mut w = std::fs::OpenOptions::new()
             .read(true)
             .write(true)

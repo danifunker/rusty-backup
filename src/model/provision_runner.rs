@@ -250,7 +250,8 @@ mod tests {
     fn builds_a_two_partition_mbr_disk_and_fills_one() {
         let disk = 64 * MIB;
         let specs = vec![spec(Some(8 * MIB), "0C"), spec(None, "83")];
-        let placed = provision::place(&specs, TableKind::Mbr, disk, MIB).unwrap();
+        let placed =
+            provision::place(&specs, TableKind::Mbr, disk, MIB, Geometry::default()).unwrap();
 
         let src = fat_ish_source(MIB, b"RBTEST01");
         let target = tempfile::NamedTempFile::new().unwrap();
@@ -292,7 +293,8 @@ mod tests {
     fn refuses_a_source_too_big_for_its_partition() {
         let disk = 64 * MIB;
         let specs = vec![spec(Some(2 * MIB), "83")];
-        let placed = provision::place(&specs, TableKind::Mbr, disk, MIB).unwrap();
+        let placed =
+            provision::place(&specs, TableKind::Mbr, disk, MIB, Geometry::default()).unwrap();
 
         let src = fat_ish_source(8 * MIB, b"TOOBIG12");
         let target = tempfile::NamedTempFile::new().unwrap();

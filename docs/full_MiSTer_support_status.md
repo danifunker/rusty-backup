@@ -91,11 +91,11 @@ support the disk types (floppy / hard disk / CD-ROM) of the outstanding cores.
   Philips CD-i, and 3DO Opera — browse/extract, see **Optical / CD-ROM**
   below).
 - **Partition tables:** MBR, GPT, APM, Amiga RDB, Atari AHDI, Sun SMI VTOC,
-  SGI volume header, Sharp X68000 — every one of them can now be **written**
-  from scratch as well as parsed (`rb-cli new hd <table>`). The pre-IRIX SGI
-  disk label (IRIS 2000 / 3000), the NeXT disk label (NeXTSTEP / OPENSTEP on
-  both m68k and Intel), and the Solaris x86 VTOC nested inside an MBR
-  partition are parsed read-only.
+  SGI volume header, Sharp X68000, the NeXT disk label (NeXTSTEP / OPENSTEP on
+  both m68k and Intel) and the Solaris x86 VTOC nested inside an MBR partition
+  — every one of them can now be **written** from scratch as well as parsed
+  (`rb-cli new hd <table>`). The pre-IRIX SGI disk label (IRIS 2000 / 3000) is
+  parsed and its slots edited, but not written from scratch.
 - **Containers:** CHD, VHD (fixed + dynamic), QCOW2, VMDK, 2MG, WOZ,
   DC42, HFV, IMZ (encrypted ZIP), `.zip` (a RAW disk image inside a plain
   ZIP, inflated sparsely; `--inside` picks among multiple), GHO/GHS (Ghost
