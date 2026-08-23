@@ -493,12 +493,13 @@ pub struct VolumeArgs {
     pub name: String,
 
     /// HFS/HFS+ allocation block size in bytes (multiple of 512). On `--fs bfs`
-    /// this is the BFS block size (power of two, 1024..=8192). Auto when unset.
+    /// this is the BFS block size (power of two, 1024..=8192); on `--fs ufs`
+    /// it is `fs_bsize`, and the fragment is an eighth of it. Auto when unset.
     #[arg(long = "block-size")]
     pub block_size: Option<u32>,
 
-    /// BFS only: write a big-endian (BeOS/PPC) volume instead of the
-    /// little-endian BeOS/Intel default.
+    /// BFS and UFS: write the big-endian byte order (BeOS/PPC; SPARC / m68k /
+    /// MIPS) instead of the little-endian default.
     #[arg(long = "big-endian")]
     pub big_endian: bool,
 
@@ -535,7 +536,8 @@ pub struct VolumeArgs {
     #[arg(long, conflicts_with = "bytes_per_inode")]
     pub inodes: Option<u64>,
 
-    /// EFS only: inode density in bytes per inode (smaller = more inodes).
+    /// EFS and UFS: inode density in bytes per inode (smaller = more inodes).
+    /// UFS defaults to one inode per 4 fragments, as `newfs -i` does.
     #[arg(long)]
     pub bytes_per_inode: Option<u64>,
 
@@ -645,13 +647,14 @@ pub struct NewArgs {
     /// HFS allocation block size in bytes. Must be a non-zero multiple of
     /// 512. When unset, the smallest size that keeps `total_blocks <=
     /// 65535` is chosen automatically. On `--fs bfs` this is the BFS block
-    /// size (a power of two in 1024..=8192, default 1024). Ignored for
-    /// other filesystems.
+    /// size (a power of two in 1024..=8192, default 1024); on `--fs ufs` it is
+    /// `fs_bsize` (default 8192) and the fragment is an eighth of it. Ignored
+    /// for other filesystems.
     #[arg(long = "block-size")]
     pub block_size: Option<u32>,
 
-    /// BFS only: write a big-endian (BeOS/PPC) volume instead of the
-    /// little-endian BeOS/Intel default. Ignored for other filesystems.
+    /// BFS and UFS: write the big-endian byte order (BeOS/PPC; SPARC / m68k /
+    /// MIPS) instead of the little-endian default. Ignored elsewhere.
     #[arg(long = "big-endian")]
     pub big_endian: bool,
 
@@ -704,8 +707,9 @@ pub struct NewArgs {
     #[arg(long, conflicts_with = "bytes_per_inode")]
     pub inodes: Option<u64>,
 
-    /// EFS only: inode density in bytes per inode (smaller = more inodes),
-    /// floored at one inode per 512-byte block. Mutually exclusive with
+    /// EFS and UFS: inode density in bytes per inode (smaller = more inodes),
+    /// floored at one inode per 512-byte block on EFS and at one per fragment
+    /// on UFS, which defaults to one per 4 fragments. Mutually exclusive with
     /// `--inodes`.
     #[arg(long)]
     pub bytes_per_inode: Option<u64>,

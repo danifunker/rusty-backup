@@ -1300,8 +1300,8 @@ Usage: volume [OPTIONS] <FS> <IMAGE>
 
 - `--size` — Volume size (bytes or `K`/`M`/`G` suffixes). Defaults to 800K
 - `--name` — Volume label/name. Defaults to `rusty-backup`
-- `--block-size` — HFS/HFS+ allocation block size in bytes (multiple of 512). On `--fs bfs` this is the BFS block size (power of two, 1024..=8192). Auto when unset
-- `--big-endian` — BFS only: write a big-endian (BeOS/PPC) volume instead of the little-endian BeOS/Intel default
+- `--block-size` — HFS/HFS+ allocation block size in bytes (multiple of 512). On `--fs bfs` this is the BFS block size (power of two, 1024..=8192); on `--fs ufs` it is `fs_bsize`, and the fragment is an eighth of it. Auto when unset
+- `--big-endian` — BFS and UFS: write the big-endian byte order (BeOS/PPC; SPARC / m68k / MIPS) instead of the little-endian default
 - `--catalog-size` — HFS Catalog B-tree initial size in bytes. Auto when unset
 - `--extents-size` — HFS Extents-overflow B-tree initial size in bytes. Auto when unset
 - `--case-sensitive` — HFS+ only: format a case-sensitive (HFSX) volume
@@ -1309,7 +1309,7 @@ Usage: volume [OPTIONS] <FS> <IMAGE>
 - `--fat32` — FAT only: format FAT32 regardless of size. Without this the type is picked from the capacity and only reaches FAT32 above 2 GiB, which cannot express an EFI System Partition - FAT32, and usually 100-512 MiB
 - `--affs-variant` — AFFS variant byte (0=OFS, 1=FFS, 2=OFS+intl, 3=FFS+intl, 4=OFS+dircache, 5=FFS+dircache). Defaults to 1 (FFS)
 - `--inodes` — EFS only: approximate total inode count. Mutually exclusive with `--bytes-per-inode`
-- `--bytes-per-inode` — EFS only: inode density in bytes per inode (smaller = more inodes)
+- `--bytes-per-inode` — EFS and UFS: inode density in bytes per inode (smaller = more inodes). UFS defaults to one inode per 4 fragments, as `newfs -i` does
 - `--cluster-size` — NTFS only: cluster (allocation unit) size, e.g. `4K`, `64K`. Auto when unset
 - `--sector-size` — NTFS only: bytes per sector — 512, 1024, 2048 or 4096. Defaults to 512
 
