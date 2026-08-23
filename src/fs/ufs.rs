@@ -173,8 +173,35 @@ pub(crate) const CG_OFF_NEXTFREEOFF: usize = 0x064; // cg_nextfreeoff  u32 — u
 /// portion ends around byte 168, and the trailing free-frag bitmap can
 /// be far larger (1 bit per fragment in the CG). We read the fixed
 /// portion to learn `cg_freeoff` + `cg_ndblk`, then issue a second
-/// targeted read for the bitmap itself.
-const CG_HEADER_FIXED_BYTES: usize = 256;
+/// targeted read for the bitmap itself. 1 KiB rather than 256 bytes so a
+/// 4.3BSD header — whose magic sits at byte 980 — is covered by the same read.
+const CG_HEADER_FIXED_BYTES: usize = 1024;
+
+// ---- 4.3BSD cylinder-group layout ----
+//
+// Pre-4.4BSD `struct cg` has no `cg_magic` at offset 4 and no
+// `cg_iusedoff` / `cg_freeoff` indirection: the arrays sit at offsets fixed by
+// the kernel's compile-time `MAXFRAG` / `MAXCPG` / `NRPOS` / `MAXIPG`. With the
+// classic values (8 / 32 / 8 / 2048) — the ones NeXTSTEP ships — that puts
+// `cg_iused` at 724, `cg_magic` at 980 and `cg_free` at 984. Verified against
+// both NeXTSTEP 3.3 fixtures. `cg_cgx` (12) and `cg_ndblk` (20) happen to sit
+// at the same offsets in both generations.
+
+/// `cg_magic` in a 4.3BSD cylinder-group header.
+pub(crate) const CG43_OFF_MAGIC: usize = 980;
+/// `cg_iused` in a 4.3BSD cylinder-group header.
+pub(crate) const CG43_OFF_IUSED: usize = 724;
+/// `cg_free` in a 4.3BSD cylinder-group header.
+pub(crate) const CG43_OFF_FREE: usize = 984;
+
+/// Which generation of `struct cg` a volume's cylinder groups use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CgLayout {
+    /// 4.4BSD and later: `cg_magic` at 4, array offsets stored in the header.
+    Modern,
+    /// 4.3BSD (NeXTSTEP): `cg_magic` at 980, arrays at compile-time offsets.
+    Bsd43,
+}
 
 /// Block-size sanity limits. Matches FreeBSD `MINBSIZE = 512` / `MAXBSIZE
 /// = 65536`. Any value outside this range is a corrupt or non-UFS image.
@@ -290,6 +317,8 @@ pub struct UfsFilesystem<R> {
     /// True when directory entries use the pre-4.4BSD 16-bit `d_namlen` with no
     /// `d_type` byte. The kernel's own test is `fs_maxsymlinklen <= 0`.
     pub(crate) old_dirent_fmt: bool,
+    /// Which `struct cg` generation this volume's cylinder groups use.
+    pub(crate) cg_layout: CgLayout,
     /// `fs_fsbtodb`: fragment -> device-block shift. `fsize >> fsbtodb` is the
     /// unit `di_blocks` counts in — 512 on BSD, 1024 on NeXTSTEP.
     pub(crate) fsbtodb: u32,
@@ -477,7 +506,7 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
         let label_bytes = &sb[OFF_VOLNAME..OFF_VOLNAME + VOLNAME_LEN];
         let label = parse_label(label_bytes);
 
-        Ok(Self {
+        let mut fs = Self {
             reader,
             partition_offset,
             sb_offset,
@@ -498,9 +527,67 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
             maxsymlinklen,
             maxsymlinklen_raw: raw_msl,
             old_dirent_fmt: raw_msl <= 0,
+            cg_layout: CgLayout::Modern,
             fsbtodb,
             label,
-        })
+        };
+        fs.cg_layout = fs.detect_cg_layout();
+        Ok(fs)
+    }
+
+    /// Decide which `struct cg` generation the volume uses by looking for
+    /// `CG_MAGIC` in CG 0 — first where 4.4BSD puts it, then where 4.3BSD
+    /// does. A volume whose CG 0 is unreadable stays on the modern layout so
+    /// the error surfaces where it is actionable rather than here.
+    fn detect_cg_layout(&mut self) -> CgLayout {
+        let at = self.partition_offset + self.cg_header_offset(0);
+        if self.reader.seek(SeekFrom::Start(at)).is_err() {
+            return CgLayout::Modern;
+        }
+        let mut hdr = vec![0u8; CG_HEADER_FIXED_BYTES];
+        if self.reader.read_exact(&mut hdr).is_err() {
+            return CgLayout::Modern;
+        }
+        if read_u32(&hdr, CG_OFF_MAGIC, self.endian) == CG_MAGIC {
+            return CgLayout::Modern;
+        }
+        if read_u32(&hdr, CG43_OFF_MAGIC, self.endian) == CG_MAGIC {
+            return CgLayout::Bsd43;
+        }
+        CgLayout::Modern
+    }
+
+    /// Offset of `cg_magic` for this volume's CG layout.
+    pub(crate) fn cg_magic_offset(&self) -> usize {
+        match self.cg_layout {
+            CgLayout::Modern => CG_OFF_MAGIC,
+            CgLayout::Bsd43 => CG43_OFF_MAGIC,
+        }
+    }
+
+    /// Offset of `cg_iused` — read from the header on 4.4BSD, fixed on 4.3BSD.
+    pub(crate) fn cg_iused_offset(&self, hdr: &[u8]) -> u64 {
+        match self.cg_layout {
+            CgLayout::Modern => read_u32(hdr, CG_OFF_IUSEDOFF, self.endian) as u64,
+            CgLayout::Bsd43 => CG43_OFF_IUSED as u64,
+        }
+    }
+
+    /// Offset of `cg_free`. See [`Self::cg_iused_offset`].
+    pub(crate) fn cg_free_offset(&self, hdr: &[u8]) -> u64 {
+        match self.cg_layout {
+            CgLayout::Modern => read_u32(hdr, CG_OFF_FREEOFF, self.endian) as u64,
+            CgLayout::Bsd43 => CG43_OFF_FREE as u64,
+        }
+    }
+
+    /// End of the free-frag bitmap. 4.3BSD has no `cg_nextfreeoff`, so it is
+    /// derived from the bitmap's own length.
+    pub(crate) fn cg_nextfree_offset(&self, hdr: &[u8], cg_ndblk: u32) -> u64 {
+        match self.cg_layout {
+            CgLayout::Modern => read_u32(hdr, CG_OFF_NEXTFREEOFF, self.endian) as u64,
+            CgLayout::Bsd43 => CG43_OFF_FREE as u64 + cg_ndblk.div_ceil(8) as u64,
+        }
     }
 
     /// Byte offset (relative to the partition start) of the cylinder-group
@@ -533,7 +620,7 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
         let mut hdr = vec![0u8; CG_HEADER_FIXED_BYTES];
         self.reader.read_exact(&mut hdr)?;
 
-        let magic = read_u32(&hdr, CG_OFF_MAGIC, self.endian);
+        let magic = read_u32(&hdr, self.cg_magic_offset(), self.endian);
         if magic != CG_MAGIC {
             return Err(FilesystemError::Parse(format!(
                 "ufs CG {i}: bad magic 0x{magic:08X} (expected 0x{CG_MAGIC:08X}) at byte {cg_byte}"
@@ -552,9 +639,9 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
                 self.fpg
             )));
         }
-        let freeoff = read_u32(&hdr, CG_OFF_FREEOFF, self.endian) as u64;
-        let nextfreeoff = read_u32(&hdr, CG_OFF_NEXTFREEOFF, self.endian) as u64;
-        let iusedoff = read_u32(&hdr, CG_OFF_IUSEDOFF, self.endian) as u64;
+        let freeoff = self.cg_free_offset(&hdr);
+        let nextfreeoff = self.cg_nextfree_offset(&hdr, cg_ndblk);
+        let iusedoff = self.cg_iused_offset(&hdr);
         if freeoff < (CG_HEADER_FIXED_BYTES as u64).min(iusedoff) {
             // The bitmap can sit inside the first 256 bytes for tiny CG
             // layouts; guard only against the truly nonsensical case
@@ -1281,14 +1368,14 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
         self.reader.seek(SeekFrom::Start(cg_byte))?;
         let mut hdr = vec![0u8; CG_HEADER_FIXED_BYTES];
         self.reader.read_exact(&mut hdr)?;
-        let magic = read_u32(&hdr, CG_OFF_MAGIC, self.endian);
+        let magic = read_u32(&hdr, self.cg_magic_offset(), self.endian);
         if magic != CG_MAGIC {
             return Err(FilesystemError::Parse(format!(
                 "ufs CG {cg}: bad magic 0x{magic:08X} (expected 0x{CG_MAGIC:08X})"
             )));
         }
-        let iusedoff = read_u32(&hdr, CG_OFF_IUSEDOFF, self.endian) as u64;
-        let freeoff = read_u32(&hdr, CG_OFF_FREEOFF, self.endian) as u64;
+        let iusedoff = self.cg_iused_offset(&hdr);
+        let freeoff = self.cg_free_offset(&hdr);
         if iusedoff == 0 || iusedoff >= freeoff {
             return Err(FilesystemError::Parse(format!(
                 "ufs CG {cg}: implausible iusedoff={iusedoff} freeoff={freeoff}"
@@ -1539,32 +1626,25 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
     fn cg_freeoff_byte(&mut self, cg: u32) -> Result<(u64, u64), FilesystemError> {
         let cg_byte = self.partition_offset + self.cg_header_offset(cg);
         self.reader.seek(SeekFrom::Start(cg_byte))?;
-        let mut hdr = [0u8; 8];
+        let mut hdr = vec![0u8; CG_HEADER_FIXED_BYTES];
         self.reader.read_exact(&mut hdr)?;
-        let magic = read_u32(&hdr, CG_OFF_MAGIC, self.endian);
+        let magic = read_u32(&hdr, self.cg_magic_offset(), self.endian);
         if magic != CG_MAGIC {
             return Err(FilesystemError::Parse(format!(
                 "ufs CG {cg}: bad magic on write path"
             )));
         }
-        self.reader
-            .seek(SeekFrom::Start(cg_byte + CG_OFF_FREEOFF as u64))?;
-        let mut buf = [0u8; 4];
-        self.reader.read_exact(&mut buf)?;
-        let freeoff = read_u32(&buf, 0, self.endian) as u64;
-        Ok((cg_byte, freeoff))
+        Ok((cg_byte, self.cg_free_offset(&hdr)))
     }
 
     /// Return `(cg_header_byte, iusedoff)` where the inode-used bitmap of
     /// `cg` lives.
     fn cg_iusedoff_byte(&mut self, cg: u32) -> Result<(u64, u64), FilesystemError> {
         let cg_byte = self.partition_offset + self.cg_header_offset(cg);
-        self.reader
-            .seek(SeekFrom::Start(cg_byte + CG_OFF_IUSEDOFF as u64))?;
-        let mut buf = [0u8; 4];
-        self.reader.read_exact(&mut buf)?;
-        let iusedoff = read_u32(&buf, 0, self.endian) as u64;
-        Ok((cg_byte, iusedoff))
+        self.reader.seek(SeekFrom::Start(cg_byte))?;
+        let mut hdr = vec![0u8; CG_HEADER_FIXED_BYTES];
+        self.reader.read_exact(&mut hdr)?;
+        Ok((cg_byte, self.cg_iused_offset(&hdr)))
     }
 
     /// Read `SB_READ_SIZE` bytes of the primary superblock. Used by the
@@ -3895,6 +3975,36 @@ mod tests {
         let root = fs.root().expect("root");
         let kids = fs.list_directory(&root).expect("list root");
         assert!(!kids.iter().any(|e| e.name == "." || e.name == ".."));
+    }
+
+    /// A 4.3BSD volume (NeXTSTEP) has no `cg_magic` at offset 4 and no
+    /// `cg_iusedoff` / `cg_freeoff` indirection; the arrays sit at compile-time
+    /// offsets and the magic lands at 980. Detecting that wrong meant every
+    /// write and every fsck on a NeXT disk failed with "bad magic".
+    #[test]
+    fn a_43bsd_cylinder_group_header_is_detected_by_its_magic_offset() {
+        // A synthetic CG 0 with the magic only where 4.3BSD puts it.
+        let mut hdr = vec![0u8; CG_HEADER_FIXED_BYTES];
+        write_u32(&mut hdr, CG43_OFF_MAGIC, CG_MAGIC, UfsEndian::Big);
+        assert_eq!(read_u32(&hdr, CG_OFF_MAGIC, UfsEndian::Big), 0);
+        assert_eq!(read_u32(&hdr, CG43_OFF_MAGIC, UfsEndian::Big), CG_MAGIC);
+        // The three fixed array offsets the old layout uses.
+        assert_eq!(CG43_OFF_IUSED, 724);
+        assert_eq!(CG43_OFF_MAGIC, 980);
+        assert_eq!(CG43_OFF_FREE, 984);
+        // And the header read has to reach byte 980 at all.
+        assert_eq!(CG_HEADER_FIXED_BYTES, 1024);
+    }
+
+    /// The modern fixtures must keep answering `Modern`, so the probe cannot
+    /// silently reinterpret a 4.4BSD volume.
+    #[test]
+    fn modern_fixtures_keep_the_modern_cg_layout() {
+        for name in ["test_ufs1.img.zst", "test_ufs2.img.zst"] {
+            let img = load_fixture(name);
+            let fs = UfsFilesystem::open(Cursor::new(img), 0).expect("open");
+            assert_eq!(fs.cg_layout, CgLayout::Modern, "{name}");
+        }
     }
 
     #[test]
