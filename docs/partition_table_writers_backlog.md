@@ -25,8 +25,9 @@ together and what was learned building it.
 
 Every table this project parses can now also be written. What is left is
 narrower: creating an AHDI **XGM extended chain** (only the four primary slots
-are written today), and editing an existing RDB or Sun label rather than
-laying down a fresh one.
+are written today), and editing an existing RDB, Sun or AHDI table rather than
+laying down a fresh one. NeXT and Solaris x86 are editable in place — see
+`partition::editor::apply_next_edits` / `apply_solaris_x86_edits`.
 
 Filesystem creation is separate from table creation. A table writer produces
 empty partitions; `rb-cli reformat --fs <fs>` fills them. See
@@ -131,6 +132,10 @@ Notes for anyone extending it:
   between `uses_cylinder_geometry` and `records_geometry`.
 - An unused slot is `0xFF` across `p_base`..`p_fsize` and `p_cpg`..`p_minfree`,
   with the rest zeroed. `clear_partition` reproduces that byte pattern exactly.
+- **In-place editing** (`editor::apply_next_edits`) rewrites only the copies
+  `present_copies` finds, and patches `p_base` / `p_size` without touching the
+  filesystem geometry beside them, so a `resize` leaves `p_bsize` / `p_fsize` /
+  `p_cpg` as `newfs` set them.
 
 **Validation.** Round-trips through our own parser
 (`next_partitions_are_measured_from_the_front_porch`,
@@ -172,6 +177,11 @@ Notes for anyone extending it:
   layout changes.
 - Sector 0 of the Solaris partition is `mboot` on a real install. We leave it
   zeroed — a freshly provisioned disk has no boot program to point at.
+- **In-place editing** (`editor::apply_solaris_x86_edits`) reads the whole
+  512-byte sector, patches `v_part` entries and re-stamps the checksum, so the
+  geometry tail a real `format(1M)` wrote survives untouched. Slices are
+  bounded by `dkl_ncyl * dkl_nhead * dkl_nsect` when that tail is present and
+  by the MBR entry's length when it is not.
 
 **Validation.** Round-trips through our own parser
 (`solaris_slices_start_past_the_labels_own_cylinders`,

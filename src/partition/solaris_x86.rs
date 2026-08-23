@@ -266,6 +266,21 @@ pub fn stamp_checksum(sector: &mut [u8]) {
     LittleEndian::write_u16(&mut sector[OFF_CKSUM..OFF_CKSUM + 2], csum);
 }
 
+/// Sectors the label's own geometry says are usable — `dkl_ncyl` cylinders,
+/// which stops short of the alternate cylinders at the end of the partition.
+/// `None` when the geometry tail is absent or implausible, as it is on a
+/// label some other tool wrote with only the 456-byte VTOC.
+pub fn data_area_sectors(sector: &[u8]) -> Option<u64> {
+    if sector.len() < 512 {
+        return None;
+    }
+    let ncyl = u64::from(LittleEndian::read_u32(&sector[OFF_NCYL..OFF_NCYL + 4]));
+    let nhead = u64::from(LittleEndian::read_u32(&sector[OFF_NHEAD..OFF_NHEAD + 4]));
+    let nsect = u64::from(LittleEndian::read_u32(&sector[OFF_NSECT..OFF_NSECT + 4]));
+    let total = ncyl.checked_mul(nhead)?.checked_mul(nsect)?;
+    (total > 0).then_some(total)
+}
+
 /// Write a whole label sector to `lba` + [`VTOC_SECTOR`].
 pub fn write_label<W: Write + Seek>(
     out: &mut W,
