@@ -4,8 +4,8 @@
 //!   (the fixed-geometry retro filesystems plus small FAT/HFS).
 //! * `new volume <fs> IMG`  — a bare single-volume image of arbitrary size
 //!   (a "superfloppy": NTFS, ext4, HFS+, EFS, …). No partition table.
-//! * `new hd {x68k|sgi-efs|mbr|gpt|apm|sgi|rdb|sun|next|solaris-x86|atari|
-//!   x68k-table} IMG` — a
+//! * `new hd {x68k|sgi-efs|mbr|gpt|apm|sgi|sgi-dklabel|rdb|sun|next|
+//!   solaris-x86|atari|x68k-table} IMG` — a
 //!   partition-table-wrapped, bootable
 //!   hard-disk image.
 //!
@@ -237,6 +237,14 @@ pub enum HdCommand {
     /// Cylinder-aligned from `--heads` / `--sectors`. Unlike `sgi-efs` the
     /// partitions come out empty rather than EFS-formatted.
     Sgi(super::new_partitioned_hd::CylinderHdArgs),
+
+    /// SGI disk label (IRIS 2000 / 3000) -- the pre-IRIX scheme an IRIS 3130
+    /// boots from, with eight slots you size and give a role (root / swap /
+    /// boot / slice). Cylinder-aligned from `--heads` / `--sectors`; the
+    /// slots come out empty, so format them with `new volume efs-v1` and
+    /// `write --partition N`. IRIX 3.x needs a `swap` slot to boot.
+    #[command(name = "sgi-dklabel")]
+    SgiDklabel(super::new_partitioned_hd::CylinderHdArgs),
 
     /// Amiga Rigid Disk Block (RDB) with partitions you size and type
     /// yourself. Cylinder-aligned from `--heads` / `--sectors`; types are
@@ -612,6 +620,9 @@ pub fn run(cmd: NewCommand) -> Result<()> {
             ),
             HdCommand::Sgi(args) => super::new_partitioned_hd::run(
                 super::new_partitioned_hd::PartitionedHdCommand::Sgi(args),
+            ),
+            HdCommand::SgiDklabel(args) => super::new_partitioned_hd::run(
+                super::new_partitioned_hd::PartitionedHdCommand::SgiDklabel(args),
             ),
             HdCommand::Rdb(args) => super::new_partitioned_hd::run(
                 super::new_partitioned_hd::PartitionedHdCommand::Rdb(args),

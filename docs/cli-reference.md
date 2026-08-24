@@ -1166,6 +1166,29 @@ Usage: sgi [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
 - `--heads` — Disk geometry: heads. These tables place partitions on cylinder boundaries, so the geometry sets the default alignment
 - `--sectors` — Disk geometry: sectors per track
 
+### `new hd sgi-dklabel`
+
+SGI disk label (IRIS 2000 / 3000) -- the pre-IRIX scheme an IRIS 3130 boots from, with eight slots you size and give a role (root / swap / boot / slice). Cylinder-aligned from `--heads` / `--sectors`; the slots come out empty, so format them with `new volume efs-v1` and `write --partition N`. IRIX 3.x needs a `swap` slot to boot
+
+```
+Usage: sgi-dklabel [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image file to create
+
+**Options**
+
+- `--size` — Total disk size (accepts `K`/`M`/`G` suffixes)
+- `--partition` — A partition, repeatable, in disk order: `SIZE[:TYPE[:NAME]]`. SIZE accepts `K`/`M`/`G`, or `rest` for the remaining space (once). TYPE is a value from `partmap types`; NAME is APM/GPT only
+- `--fill` — Pour an image into a partition as it is created: `N=PATH`, 1-based, repeatable. Any format the engine can read is decoded on the way in
+- `--filesystem` — Embed an Amiga filesystem handler in the RDB, `DOSTYPE=PATH`, repeatable. PATH is the handler's AmigaDOS load file (`L:SmartFilesystem`, `L:PFS3`). A DosType with no ROM handler needs this to mount unaided: the strap loads it from the RDB. RDB only
+- `--align` — Alignment for partition starts. Default 1 MiB; use 63s for DOS-era cylinder alignment on vintage machines
+- `--force` — Overwrite `image` if it already exists
+- `--heads` — Disk geometry: heads. These tables place partitions on cylinder boundaries, so the geometry sets the default alignment
+- `--sectors` — Disk geometry: sectors per track
+
 ### `new hd sgi-efs`
 
 dvh-wrapped IRIX HDD: an SGI volume header + partition table wrapping a formatted EFS root partition, mountable by IRIX 5.3-6.5. Pass `--from-dir` to fill the root filesystem from a host folder in the same step; otherwise it comes out blank for `import` / `put`

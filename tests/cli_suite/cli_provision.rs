@@ -1,5 +1,5 @@
 //! End-to-end CLI tests for the from-scratch provisioning verbs: `new hd
-//! {rdb|sun|atari}` and `new volume xfs`.
+//! {rdb|sun|atari|sgi-dklabel}` and `new volume xfs`.
 //!
 //! Each table writer already has unit tests that round-trip through our own
 //! parser; these go through the real binary instead, so a break in the CLI
@@ -127,6 +127,82 @@ fn atari_disk_promotes_oversized_gem_and_reaches_a_filled_partition() {
     run(&["put", &at1, payload.to_str().unwrap(), "/HELLO.TXT"]);
     let listing = run(&["ls", &at1]);
     assert!(listing.contains("HELLO.TXT"), "{listing}");
+}
+
+/// An IRIS 2000 / 3000 disk built from nothing, on the reference 3130's own
+/// geometry, in both the native and the byte-swapped orientation.
+#[test]
+fn sgi_dklabel_disk_carries_efs_v1_slots_in_both_word_orders() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root_vol = dir.path().join("rootvol.img");
+    let img = dir.path().join("iris.img");
+    let swapped = dir.path().join("iris-swab.img");
+    let payload = dir.path().join("hello.txt");
+    let (root_s, img_s) = (root_vol.to_str().unwrap(), img.to_str().unwrap());
+    std::fs::write(&payload, b"IRIS 3130 round trip.").unwrap();
+
+    run(&[
+        "new", "volume", "efs-v1", root_s, "--size", "9139200", // 17850 blocks
+    ]);
+    let fill = format!("1={root_s}");
+    run(&[
+        "new",
+        "hd",
+        "sgi-dklabel",
+        img_s,
+        "--size",
+        "60135936", // 987c x 7h x 17s, the Priam V170's geometry
+        "--heads",
+        "7",
+        "--sectors",
+        "17",
+        "--partition",
+        "9139200:root",
+        "--partition",
+        "9078272:swap",
+        "--partition",
+        "rest:slice",
+        "--fill",
+        &fill,
+    ]);
+
+    let info = run(&["inspect", img_s]);
+    assert!(
+        info.contains("Partition table: SGI-DkLabel (native)"),
+        "{info}"
+    );
+    for (role, lba) in [("root", "119"), ("swap", "17969"), ("slice", "35700")] {
+        let want = format!("SGI {role}");
+        let line = info
+            .lines()
+            .find(|l| l.contains(&want))
+            .unwrap_or_else(|| panic!("no {role} slot listed:\n{info}"));
+        assert!(line.contains(lba), "{role} is not at block {lba}: {line}");
+    }
+    // The whole-disk wrapper slot must not reach the browse list.
+    assert_eq!(info.lines().filter(|l| l.contains("SGI ")).count(), 3);
+
+    let at1 = format!("{img_s}@1");
+    run(&["put", &at1, payload.to_str().unwrap(), "/hello.txt"]);
+    run(&["fsck", &at1]);
+
+    // Both orientations of the medium have to open, and writes made in the
+    // swapped one have to survive being swapped back.
+    let swapped_s = swapped.to_str().unwrap();
+    run(&["swab16", img_s, swapped_s]);
+    let swapped_info = run(&["inspect", swapped_s]);
+    assert!(
+        swapped_info.contains("SGI-DkLabel (byte-swapped)"),
+        "{swapped_info}"
+    );
+    let sw1 = format!("{swapped_s}@1");
+    run(&["mkdir", &sw1, "/etc"]);
+    run(&["fsck", &sw1]);
+    let back = dir.path().join("back.img");
+    run(&["swab16", swapped_s, back.to_str().unwrap()]);
+    let listing = run(&["ls", &format!("{}@1", back.to_str().unwrap())]);
+    assert!(listing.contains("hello.txt"), "{listing}");
+    assert!(listing.contains("etc"), "{listing}");
 }
 
 /// The XFS creator, through the CLI, checked with our own verifier — the real

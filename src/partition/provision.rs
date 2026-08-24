@@ -18,7 +18,7 @@ use anyhow::{bail, Context, Result};
 use std::io::{Read, Seek, SeekFrom, Write};
 
 use crate::partition::type_catalog::{self, TableKind};
-use crate::partition::{apm, format_size, gpt, mbr, parse_size};
+use crate::partition::{apm, format_size, gpt, mbr, parse_size, sgi_dklabel};
 
 const SECTOR: u64 = 512;
 
@@ -79,6 +79,7 @@ pub const WRITABLE_TABLES: &[TableKind] = &[
     TableKind::Gpt,
     TableKind::Apm,
     TableKind::Sgi,
+    TableKind::SgiDkLabel,
     TableKind::X68k,
     TableKind::Rdb,
     TableKind::Sun,
@@ -120,6 +121,9 @@ pub fn slot_limit(kind: TableKind) -> Option<usize> {
         TableKind::X68k => Some(crate::partition::x68k::X68K_MAX_PARTITIONS),
         // SGI has 16 slots but reserves 8 (volhdr) and 10 (whole volume).
         TableKind::Sgi => Some(crate::partition::sgi::SGI_NUM_PARTITIONS - 2),
+        // Eight `d_map` slots; the last is the whole-disk wrapper the era's
+        // labels always carry, so it is not offered.
+        TableKind::SgiDkLabel => Some(sgi_dklabel::SGI_DKLABEL_NFS - 1),
         // RDB is a linked list, but keeping every PART block inside the first
         // 16 sectors is what every Amiga tool scans for.
         TableKind::Rdb => Some(crate::partition::rdb::RDB_SCAN_BLOCKS as usize - 1),
@@ -142,6 +146,7 @@ pub fn default_type(kind: TableKind) -> &'static str {
         TableKind::Gpt => "0FC63DAF-8483-4772-8E79-3D69D8477DE4",
         TableKind::Apm => "Apple_HFS",
         TableKind::Sgi => "XFS",
+        TableKind::SgiDkLabel => "root",
         // X68k entries carry a name, not a type code.
         TableKind::X68k => "Human68k",
         TableKind::Rdb => "DOS\\3",
@@ -199,6 +204,9 @@ pub fn reserved_head(kind: TableKind, geometry: Geometry) -> u64 {
         TableKind::Apm => 64 * SECTOR,
         // SGI reserves a 2 MiB volume-header region at the front (slot 8).
         TableKind::Sgi => 2 * 1024 * 1024,
+        // Block 0 is the disk label and blocks 1-4 the bad-block map;
+        // cylinder alignment then pushes slot 0 out to cylinder 1.
+        TableKind::SgiDkLabel => sgi_dklabel::SGI_DKLABEL_RESERVED_BLOCKS * SECTOR,
         // X68k: table at byte 2048, partitions conventionally from sector 64.
         TableKind::X68k => u64::from(crate::partition::x68k::X68K_FIRST_PARTITION_SECTOR) * SECTOR,
         // RDB: the RDSK plus its PART chain. Cylinder alignment then pushes
@@ -235,7 +243,11 @@ pub fn reserved_tail(kind: TableKind, geometry: Geometry) -> u64 {
 pub fn uses_cylinder_geometry(kind: TableKind) -> bool {
     matches!(
         kind,
-        TableKind::Sgi | TableKind::Rdb | TableKind::Sun | TableKind::SolarisX86
+        TableKind::Sgi
+            | TableKind::SgiDkLabel
+            | TableKind::Rdb
+            | TableKind::Sun
+            | TableKind::SolarisX86
     )
 }
 
@@ -269,7 +281,9 @@ pub fn default_align(kind: TableKind, geometry: Geometry) -> u64 {
 /// cylinder-based tables cannot express a part-cylinder size.
 fn size_granularity(kind: TableKind, align: u64) -> u64 {
     match kind {
-        TableKind::Rdb | TableKind::Sun | TableKind::SolarisX86 => align.max(SECTOR),
+        TableKind::Rdb | TableKind::Sun | TableKind::SolarisX86 | TableKind::SgiDkLabel => {
+            align.max(SECTOR)
+        }
         // `p_size` counts NeXT sectors, so a part-sector size cannot be said.
         TableKind::Next => NEXT_SECTOR_SIZE,
         _ => SECTOR,
@@ -420,6 +434,7 @@ pub fn write_table<W: Write + Seek>(
         TableKind::Apm => write_apm(out, placed, disk_size),
         TableKind::X68k => write_x68k(out, placed, disk_size),
         TableKind::Sgi => write_sgi(out, placed, disk_size, geometry),
+        TableKind::SgiDkLabel => write_sgi_dklabel(out, placed, disk_size, geometry),
         TableKind::Rdb => write_rdb(out, placed, disk_size, geometry),
         TableKind::Sun => write_sun(out, placed, disk_size, geometry),
         TableKind::Next => write_next(out, placed, disk_size, geometry),
@@ -775,6 +790,109 @@ fn write_ahdi<W: Write + Seek>(out: &mut W, placed: &[Placed], disk_size: u64) -
     out.seek(SeekFrom::Start(0))?;
     out.write_all(&table.root_to_bytes())
         .context("writing the AHDI root sector")?;
+    Ok(())
+}
+
+/// One `struct disk_label` at block 0. Slots carry a role, not a type, so
+/// `type_text` is a keyword; see `docs/partition_table_writers_backlog.md`.
+fn write_sgi_dklabel<W: Write + Seek>(
+    out: &mut W,
+    placed: &[Placed],
+    disk_size: u64,
+    geometry: Geometry,
+) -> Result<()> {
+    use crate::partition::sgi_dklabel::{
+        SgiDiskLabel, SgiDiskMap, SgiLabelByteOrder, SGI_DKLABEL_NFS,
+    };
+
+    let spc = u64::from(geometry.heads) * u64::from(geometry.sectors_per_track);
+    if spc == 0 {
+        bail!("heads and sectors-per-track must both be non-zero");
+    }
+    let ncyl = disk_size / SECTOR / spc;
+    if ncyl < 2 {
+        bail!(
+            "an SGI disk label needs at least two cylinders ({} each); {} is too small",
+            format_size(spc * SECTOR),
+            format_size(disk_size),
+        );
+    }
+    if ncyl > u64::from(u16::MAX) {
+        bail!(
+            "the label counts cylinders in 16 bits; {ncyl} is too many - raise --heads/--sectors"
+        );
+    }
+    let total_blocks = ncyl * spc;
+
+    let mut map = vec![SgiDiskMap { base: 0, size: 0 }; SGI_DKLABEL_NFS];
+    let mut boot: Option<u8> = None;
+    let mut root: Option<u8> = None;
+    let mut swap: Option<u8> = None;
+    for (i, p) in placed.iter().enumerate() {
+        let end = p.start_lba + p.size_bytes / SECTOR;
+        if end > total_blocks {
+            bail!(
+                "partition {} ends at block {end}, past the {total_blocks} blocks the \
+                 {ncyl}-cylinder geometry describes",
+                i + 1,
+            );
+        }
+        map[i] = SgiDiskMap {
+            base: p.start_lba as u32,
+            size: (p.size_bytes / SECTOR) as u32,
+        };
+        let slot = i as u8;
+        match p.type_text.trim().to_ascii_lowercase().as_str() {
+            "swap" => swap.get_or_insert(slot),
+            "boot" => boot.get_or_insert(slot),
+            "root" => root.get_or_insert(slot),
+            "slice" | "" => continue,
+            other => {
+                bail!("unknown SGI disk-label slot role '{other}' - use root, swap, boot or slice")
+            }
+        };
+    }
+    // The wrapper slot spans the whole drive and deliberately overlaps the
+    // real ones; `is_wrapper_slot` filters it back out on read.
+    map[SGI_DKLABEL_NFS - 1] = SgiDiskMap {
+        base: 0,
+        size: total_blocks as u32,
+    };
+
+    let bootfs = boot.or(root).unwrap_or(0);
+    let rootfs = root.unwrap_or(bootfs);
+    let label = SgiDiskLabel {
+        // Written the way the 68020 sees it; `rb-cli swab16` produces the
+        // controller's reversed-word order when a period machine needs it.
+        byte_order: SgiLabelByteOrder::Native,
+        drive_type: 1, // DT_V170, the pairing on the reference IRIS 3130
+        controller: 0, // DC_DSD5217
+        cylinders: ncyl as u16,
+        heads: geometry.heads,
+        sectors: geometry.sectors_per_track,
+        // No sparing on a synthetic image, so the alternates region is empty
+        // and starts where the geometry ends.
+        altstart: total_blocks as u32,
+        nalternates: 0,
+        bootfs,
+        // Past `d_map`, so no slot reads back as swap when none was asked for.
+        swapfs: swap.unwrap_or(SGI_DKLABEL_NFS as u8),
+        map,
+        interleave: 1,
+        trackskew: 0,
+        cylskew: 0,
+        badspots: 0,
+        name: "rusty-backup".to_string(),
+        serial: "0000".to_string(),
+        rootnotboot: u8::from(rootfs != bootfs),
+        rootfs,
+    };
+
+    let mut sector = [0u8; SECTOR as usize];
+    label.write_into(&mut sector)?;
+    out.seek(SeekFrom::Start(0))?;
+    out.write_all(&sector)
+        .context("writing the SGI disk label")?;
     Ok(())
 }
 
@@ -1336,6 +1454,144 @@ mod tests {
         // Must start past the 2 MiB volume header, on a cylinder boundary.
         assert!(placed[0].start_byte() >= 2 * 1024 * 1024);
         assert_eq!(placed[0].start_lba % 5040, 0);
+    }
+
+    /// Asking for the reference IRIS 3130's three sizes on its geometry has to
+    /// put the slots on the blocks that disk uses, or it is not that shape.
+    #[test]
+    fn sgi_dklabel_reproduces_the_reference_iris_layout() {
+        use crate::partition::sgi_dklabel::SgiDiskLabel;
+
+        let geom = Geometry {
+            heads: 7,
+            sectors_per_track: 17,
+        };
+        let disk = 987 * 7 * 17 * SECTOR;
+        let role = |bytes: u64, role: &str| PartSpec {
+            size: Some(bytes),
+            type_text: Some(role.to_string()),
+            name: None,
+        };
+        let specs = vec![
+            role(17850 * SECTOR, "root"),
+            role(17731 * SECTOR, "swap"),
+            role(79730 * SECTOR, "slice"),
+        ];
+        let align = default_align(TableKind::SgiDkLabel, geom);
+        let placed = place(&specs, TableKind::SgiDkLabel, disk, align, geom).unwrap();
+        assert_eq!(
+            placed.iter().map(|p| p.start_lba).collect::<Vec<_>>(),
+            vec![119, 17969, 35700],
+        );
+
+        let mut file = table_on_temp_disk(TableKind::SgiDkLabel, &placed, disk, geom);
+        let mut sector = [0u8; 512];
+        file.read_exact(&mut sector).unwrap();
+        let label = SgiDiskLabel::parse(&sector).unwrap();
+        assert_eq!((label.cylinders, label.heads, label.sectors), (987, 7, 17));
+        assert_eq!(label.total_blocks(), 987 * 7 * 17);
+        assert_eq!(label.bootfs, 0, "the root slot is also the boot slot");
+        assert_eq!(label.swapfs, 1);
+        assert_eq!(label.rootnotboot, 0);
+        assert_eq!(label.map[0].base, 119);
+        assert_eq!(label.map[0].size, 17850);
+        // The last slot is the whole-disk wrapper every label of the era
+        // carries, and it must not show up as a browsable partition.
+        assert_eq!(label.map[7].base, 0);
+        assert_eq!(label.map[7].size, 987 * 7 * 17);
+        assert_eq!(label.browsable_slots().count(), 3);
+        assert_eq!(label.slot_role(0), "root");
+        assert_eq!(label.slot_role(1), "swap");
+        assert_eq!(label.slot_role(2), "slice");
+    }
+
+    /// `d_swapfs` names a slot, so leaving it at 0 when no swap slice was asked
+    /// for would make slot 0 read back as swap and lose its type byte.
+    #[test]
+    fn sgi_dklabel_without_a_swap_slot_names_no_slot_as_swap() {
+        use crate::partition::sgi_dklabel::SgiDiskLabel;
+
+        let geom = Geometry {
+            heads: 4,
+            sectors_per_track: 32,
+        };
+        let disk = 64 * 1024 * 1024;
+        let specs = vec![
+            PartSpec {
+                size: Some(8 * 1024 * 1024),
+                type_text: Some("boot".to_string()),
+                name: None,
+            },
+            PartSpec {
+                size: None,
+                type_text: Some("root".to_string()),
+                name: None,
+            },
+        ];
+        let align = default_align(TableKind::SgiDkLabel, geom);
+        let placed = place(&specs, TableKind::SgiDkLabel, disk, align, geom).unwrap();
+        let mut file = table_on_temp_disk(TableKind::SgiDkLabel, &placed, disk, geom);
+        let mut sector = [0u8; 512];
+        file.read_exact(&mut sector).unwrap();
+        let label = SgiDiskLabel::parse(&sector).unwrap();
+        assert_eq!(label.bootfs, 0);
+        assert_eq!(label.rootnotboot, 1, "root is a different slot from boot");
+        assert_eq!(label.rootfs, 1);
+        assert!(
+            (label.swapfs as usize) >= crate::partition::sgi_dklabel::SGI_DKLABEL_NFS,
+            "d_swapfs must not name a real slot when there is no swap slice",
+        );
+        assert!((0..2).all(|i| label.slot_role(i) != "swap"));
+    }
+
+    /// The geometry describes whole cylinders only, so a `rest` slot on a disk
+    /// with a part-cylinder tail must stop short rather than pass `d_altstart`.
+    #[test]
+    fn sgi_dklabel_rest_slot_stops_at_the_last_whole_cylinder() {
+        use crate::partition::sgi_dklabel::SgiDiskLabel;
+
+        let geom = Geometry {
+            heads: 7,
+            sectors_per_track: 17,
+        };
+        let cyl = geom.cylinder_bytes();
+        // Two and a half sectors past a whole number of cylinders.
+        let disk = 400 * cyl + 3 * SECTOR;
+        let placed = place(
+            &[spec(None)],
+            TableKind::SgiDkLabel,
+            disk,
+            default_align(TableKind::SgiDkLabel, geom),
+            geom,
+        )
+        .unwrap();
+        let mut file = table_on_temp_disk(TableKind::SgiDkLabel, &placed, disk, geom);
+        let mut sector = [0u8; 512];
+        file.read_exact(&mut sector).unwrap();
+        let label = SgiDiskLabel::parse(&sector).unwrap();
+        let end = u64::from(label.map[0].base) + u64::from(label.map[0].size);
+        assert_eq!(end, label.total_blocks());
+        assert_eq!(u64::from(label.altstart), label.total_blocks());
+    }
+
+    #[test]
+    fn sgi_dklabel_refuses_an_unknown_slot_role() {
+        let geom = Geometry::default();
+        let disk = 64 * 1024 * 1024;
+        let specs = vec![PartSpec {
+            size: Some(8 * 1024 * 1024),
+            type_text: Some("usr".to_string()),
+            name: None,
+        }];
+        let align = default_align(TableKind::SgiDkLabel, geom);
+        let placed = place(&specs, TableKind::SgiDkLabel, disk, align, geom).unwrap();
+        let mut file = tempfile::tempfile().unwrap();
+        file.set_len(disk).unwrap();
+        let err = write_table(&mut file, TableKind::SgiDkLabel, &placed, disk, geom).unwrap_err();
+        assert!(
+            err.to_string().contains("slot role 'usr'"),
+            "unexpected error: {err:#}"
+        );
     }
 
     /// The GUI hides its geometry controls and Name column behind these, so a

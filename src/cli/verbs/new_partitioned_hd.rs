@@ -1,4 +1,5 @@
-//! `rb-cli new hd {mbr|gpt|apm|sgi|x68k-table|rdb|sun|next|solaris-x86|atari}
+//! `rb-cli new hd
+//! {mbr|gpt|apm|sgi|sgi-dklabel|x68k-table|rdb|sun|next|solaris-x86|atari}
 //! IMG` — a blank disk image
 //! carrying a real partition table with partitions you size and type yourself.
 //!
@@ -43,6 +44,10 @@ pub enum PartitionedHdCommand {
     Apm(PartitionedHdArgs),
     /// SGI volume header (IRIX). Partitions are cylinder-aligned.
     Sgi(CylinderHdArgs),
+    /// SGI disk label (IRIS 2000 / 3000, the pre-IRIX scheme). Eight slots
+    /// carrying a role rather than a type; partitions are cylinder-aligned.
+    #[command(name = "sgi-dklabel")]
+    SgiDklabel(CylinderHdArgs),
     /// Amiga Rigid Disk Block. Partitions are cylinder-aligned.
     Rdb(CylinderHdArgs),
     /// Sun disk label / SMI VTOC (SPARC Solaris / SunOS). Slices are
@@ -127,6 +132,13 @@ pub fn run(cmd: PartitionedHdCommand) -> Result<()> {
                 sectors_per_track: a.sectors,
             });
             (TableKind::Sgi, a.common)
+        }
+        PartitionedHdCommand::SgiDklabel(a) => {
+            geometry = Some(Geometry {
+                heads: a.heads,
+                sectors_per_track: a.sectors,
+            });
+            (TableKind::SgiDkLabel, a.common)
         }
         PartitionedHdCommand::Rdb(a) => {
             geometry = Some(Geometry {

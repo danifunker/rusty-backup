@@ -841,7 +841,7 @@ impl<R: Read + Seek> EfsV1Filesystem<R> {
     fn read_symlink_target(&mut self, inode: &EfsV1Inode) -> Option<String> {
         let bytes = self.read_data(inode, EFS_V1_MAXPATHLEN).ok()?;
         let target = String::from_utf8_lossy(&bytes)
-            .trim_end_matches(' ')
+            .trim_end_matches('\0')
             .to_string();
         if target.is_empty() {
             None

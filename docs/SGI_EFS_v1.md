@@ -59,6 +59,46 @@ which is what makes the field offsets certain rather than merely plausible:
 3. `fs_checksum` reproduces under the same rotate-and-XOR IRIX EFS uses, run
    over offsets `0x00..0x9E`. A field misplaced by even two bytes breaks it.
 
+## The emulation oracle
+
+There is one, and it is the strongest kind: **the period kernel itself**. The
+Motion emulator (`$MOTION_ROOT`, default `~/repos/motion`) runs an IRIS 3130
+well enough to boot this IRIX 3.7 / GL2-W3.6 disk to a shell with the serial
+console on stdout, so a disk we wrote can be handed to the OS that owns the
+format.
+
+`scripts/sgi-efs-v1-oracle.sh prove` does exactly that. It copies the reference
+disk, has `rb-cli` rewrite and **grow** `/etc/rc.s0` (1282 -> 1602 bytes, past
+the three blocks it had, so the writer must allocate), create `/etc/rbnewfile`,
+create the directory `/rbdir` with a file in it, and allocate a fresh 256 KiB
+`/rbbig.dat`; the added `rc.s0` lines then read all of that back. Booting it
+prints, from IRIX's own console:
+
+```
+RBPROOF-BEGIN
+RBPROOF-NEWFILE:
+rusty-backup wrote this file into a real IRIS 3130 root filesystem.
+RBPROOF-NEWDIR:
+and this one lives in a directory rusty-backup created.
+RBPROOF-BIG:
+260 256 /rbbig.dat
+RBPROOF-USR:
+300
+300s
+4014
+RBPROOF-END
+```
+
+Which is to say: `init` executed a script we rewrote and grew, `cat` read a
+file and a directory we created, System V `sum` agreed to the byte on 256 KiB
+we allocated (262144 x 'A' folds to 260), and `/etc/mount` mounted the *second*
+EFS v1 filesystem off `md0c` and listed it. Apart from those lines the console
+is identical to a stock boot — no kernel complaint about either filesystem.
+
+The emulator never writes to the disk (the image is byte-identical afterwards,
+and still `fsck`-clean), so this validates the write side only in the direction
+that matters: what IRIX makes of what we wrote.
+
 ## Byte order
 
 Images taken off these machines' disk controllers are **byte-swapped within
@@ -380,15 +420,33 @@ A record pointing past the inode table is treated as damage and dropped with a
 warning, rather than failing the whole listing — the sample disk's stale swap
 slot contains exactly that.
 
+## Building a disk from scratch
+
+`rb-cli new hd sgi-dklabel IMG --size N --heads H --sectors S --partition
+SIZE:ROLE ...` writes a fresh `struct disk_label`, and `--fill N=PATH` pours a
+volume from `rb-cli new volume efs-v1` into a slot in the same pass. `ROLE` is
+`root` / `swap` / `boot` / `slice`, because the slots carry no type field; the
+writer folds those into `d_bootfs` / `d_swapfs` / `d_rootfs`.
+
+Sizes are cylinder-granular and the last slot is the whole-disk wrapper, so
+asking for the sample disk's three sizes on its 987c/7h/17s geometry puts the
+slots on the same blocks it uses. The label comes out in **native** word order;
+`rb-cli swab16` converts to the reversed-word order a period controller puts on
+the medium. See
+[`docs/partition_table_writers_backlog.md`](partition_table_writers_backlog.md)
+for the writer's shape and what it was validated against.
+
 ## What is not implemented
 
-Write, resize, fsck, and volume creation. The format is fully understood and
-the free-space bitmap decodes correctly, so a writer is tractable; it is simply
-out of scope for read-only support.
+Backing up a labelled disk. `rb-cli backup` refuses it with that reason, and
+`backup` takes no `@N` selector, so today only a *bare* EFS v1 volume — one
+from `new volume efs-v1`, or a slot dumped out on its own — can be backed up.
 
-An emulation oracle would also be welcome and does not currently exist: no
-emulator runs IRIS 3000-series hardware well enough to boot this OS and check
-our work the way FS-UAE, IRIX-on-MAME and the BasiliskII fixtures do elsewhere.
-The three self-consistency invariants listed under **Provenance**, plus the
-file-for-file comparison against an independent decoder, are what stand in for
-one.
+Creating an alternates region: `new hd sgi-dklabel` writes `d_nalternates` 0,
+since a synthetic image has no bad sectors to spare out. Nothing writes the
+bad-block map in blocks 1-4 either; it is left zeroed, which is what
+`d_badspots` 0 says.
+
+The oracle is read-only, and nothing needs it to be otherwise: the emulator
+never writes to the disk, so it can tell us what IRIX makes of our bytes but
+cannot hand us its own to compare against.

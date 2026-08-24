@@ -16,6 +16,7 @@ together and what was learned building it.
 | GPT | Done | `partition::gpt::build_minimal_gpt` + protective MBR + backup header |
 | APM | Done | `partition::apm::build_minimal_apm` |
 | SGI (IRIX) | Done | `partition::provision::write_sgi` |
+| SGI disk label (IRIS 2000/3000) | Done | `partition::provision::write_sgi_dklabel` + `partition::sgi_dklabel::SgiDiskLabel::write_into` |
 | X68000 | Done | `partition::provision::write_x68k` |
 | RDB (Amiga) | Done | `partition::provision::write_rdb` |
 | Sun (SMI VTOC) | Done | `partition::provision::write_sun` |
@@ -26,8 +27,9 @@ together and what was learned building it.
 Every table this project parses can now also be written. What is left is
 narrower: creating an AHDI **XGM extended chain** (only the four primary slots
 are written today), and editing an existing RDB, Sun or AHDI table rather than
-laying down a fresh one. NeXT and Solaris x86 are editable in place — see
-`partition::editor::apply_next_edits` / `apply_solaris_x86_edits`.
+laying down a fresh one. NeXT, Solaris x86 and the SGI disk label are editable
+in place — see `partition::editor::apply_next_edits` /
+`apply_solaris_x86_edits` / `apply_sgi_dklabel_edits`.
 
 Filesystem creation is separate from table creation. A table writer produces
 empty partitions; `rb-cli reformat --fs <fs>` fills them, and `rb-cli new
@@ -37,7 +39,7 @@ volume <fs>` builds one to pour in with `new hd ... --fill N=PATH`. See
 
 ## How to add a writer
 
-All ten existing writers follow the same shape, so a new one slots in without
+All eleven existing writers follow the same shape, so a new one slots in without
 touching the layout engine:
 
 1. Add the variant to `PartitionedHdCommand` and to `HdCommand` in
@@ -259,6 +261,49 @@ real-tool fixture), which agrees on the checksum, both tags and both extents;
 and exercised end to end by pouring a FAT12 volume into partition 1 with
 `--fill`, then `put`-ing and `ls`-ing a file through it. Booting a real TOS
 machine is unproven — there is no bootstrap in the root sector to boot from.
+
+---
+
+## SGI disk label (IRIS 2000 / 3000) — done
+
+Shipped as `partition::provision::write_sgi_dklabel`, reached from
+`rb-cli new hd sgi-dklabel` and the GUI's Build Disk picker. It builds an
+`SgiDiskLabel` and hands it to `SgiDiskLabel::write_into`, which is the new
+serialiser half of the parser that already existed — so the label the builder
+writes and the label the reader accepts are the same code path.
+
+Notes for anyone extending it:
+
+- **The slots carry a role, not a type.** `struct disk_label` has no per-slot
+  type field: `d_bootfs`, `d_swapfs` and `d_rootfs` name slots by number. So
+  `type_text` is one of `root` / `swap` / `boot` / `slice`, the writer folds
+  those into the three fields, and `partmap set-type` stays refused. `root` on
+  a different slot from `boot` is what sets `d_rootnotboot`.
+- **`d_swapfs` defaults to 8** — past `d_map` — when no slot asked to be swap.
+  Leaving it at 0 would make slot 0 read back as swap and lose its EFS v1 type
+  byte, which is exactly the round-trip a builder must not break.
+- **Sizes are cylinder-granular** (`size_granularity`), because the label
+  describes the drive in whole cylinders and `d_altstart` is where they end. A
+  `rest` slot on a disk with a part-cylinder tail therefore stops at the last
+  whole cylinder instead of running past the geometry.
+- The **last slot is the whole-disk wrapper** every label of the era carries
+  (`{0, cyl*heads*sectors}`), so `slot_limit` is 7. `is_wrapper_slot` filters
+  it back out of the browse list, the same way Sun's backup slice is handled.
+- The alternates region is empty (`d_altstart` = the end of the geometry,
+  `d_nalternates` = 0): there is no sector sparing on a synthetic image.
+- The label is written in **native** word order. `rb-cli swab16` produces the
+  reversed-word order period SGI controllers put on the medium; the writer does
+  not guess which one the user wants.
+
+**Validation.** `sgi_dklabel_reproduces_the_reference_iris_layout` asks for the
+real IRIS 3130's three partition sizes on its 987c/7h/17s geometry and asserts
+the slots land on blocks 119 / 17969 / 35700 — the same blocks that disk uses,
+checked field by field against a dump of its block 0. `write_into` round-trips
+the reference label byte for byte in both word orders. End to end,
+`sgi_dklabel_disk_carries_efs_v1_slots_in_both_word_orders` builds the disk,
+pours an EFS v1 volume into slot 0, writes a file, swaps the whole image, writes
+another through the swapped view, and swaps back to find both. Booting a real
+IRIS 3130 is unproven.
 
 ---
 

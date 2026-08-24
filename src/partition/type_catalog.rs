@@ -20,6 +20,8 @@ pub enum TableKind {
     Apm,
     Rdb,
     Sgi,
+    /// SGI disk label (IRIS 2000 / 3000). Slots carry a role, not a type.
+    SgiDkLabel,
     /// Sun disk label (SMI VTOC). Entries carry a numeric VTOC tag.
     Sun,
     /// NeXT disk label. Entries carry a filesystem-name string.
@@ -43,6 +45,7 @@ impl TableKind {
             TableKind::Apm => "APM",
             TableKind::Rdb => "RDB",
             TableKind::Sgi => "SGI",
+            TableKind::SgiDkLabel => "SGI-DkLabel",
             TableKind::Sun => "Sun",
             TableKind::Next => "NeXT",
             TableKind::SolarisX86 => "Solaris-x86",
@@ -60,6 +63,7 @@ impl TableKind {
             TableKind::Apm => "APM partition type string (e.g. Apple_HFS)",
             TableKind::Rdb => "AmigaDOS DosType tag (e.g. DOS\\3, PFS\\3, SFS\\0)",
             TableKind::Sgi => "SGI partition type keyword (e.g. XFS, EFS)",
+            TableKind::SgiDkLabel => "SGI disk-label slot role (root, swap, boot, slice)",
             TableKind::Sun => "Sun VTOC slice tag, by name or number (e.g. root, usr, 4)",
             TableKind::Next => "NeXT partition filesystem name (e.g. 4.3BSD, swap)",
             TableKind::SolarisX86 => {
@@ -89,6 +93,7 @@ pub fn kind_of(table: &PartitionTable) -> TableKind {
         PartitionTable::Apm(_) => TableKind::Apm,
         PartitionTable::Rdb(_) => TableKind::Rdb,
         PartitionTable::Sgi(_) => TableKind::Sgi,
+        PartitionTable::SgiDkLabel(_) => TableKind::SgiDkLabel,
         PartitionTable::Sun(_) => TableKind::Sun,
         PartitionTable::Next(_) => TableKind::Next,
         PartitionTable::SolarisX86 { .. } => TableKind::SolarisX86,
@@ -106,6 +111,7 @@ pub fn choices(kind: TableKind) -> &'static [TypeChoice] {
         TableKind::Apm => APM_TYPES,
         TableKind::Rdb => RDB_TYPES,
         TableKind::Sgi => SGI_TYPES,
+        TableKind::SgiDkLabel => SGI_DKLABEL_ROLES,
         TableKind::Sun => SUN_TYPES,
         // Solaris x86 slices carry the same VTOC tags as the SPARC label.
         TableKind::SolarisX86 => SUN_TYPES,
@@ -157,7 +163,7 @@ fn normalize(kind: TableKind, value: &str) -> String {
             }
         }
         // NeXT `p_type` is a free-form 8-byte name, compared case-insensitively.
-        TableKind::Next => trimmed.to_ascii_uppercase(),
+        TableKind::Next | TableKind::SgiDkLabel => trimmed.to_ascii_uppercase(),
         TableKind::Rdb | TableKind::X68k | TableKind::Other => trimmed.to_string(),
     }
 }
@@ -490,6 +496,27 @@ const RDB_TYPES: &[TypeChoice] = &[
     TypeChoice {
         value: "SFS\\2",
         label: "SmartFilesystem v2",
+    },
+];
+
+/// An SGI disk label has no per-slot type field, only the roles `d_bootfs`,
+/// `d_swapfs` and `d_rootfs` name. See `partition/sgi_dklabel.rs`.
+const SGI_DKLABEL_ROLES: &[TypeChoice] = &[
+    TypeChoice {
+        value: "root",
+        label: "Root filesystem (EFS v1)",
+    },
+    TypeChoice {
+        value: "swap",
+        label: "Swap (no filesystem)",
+    },
+    TypeChoice {
+        value: "boot",
+        label: "Boot filesystem (EFS v1)",
+    },
+    TypeChoice {
+        value: "slice",
+        label: "Plain slice (EFS v1)",
     },
 ];
 

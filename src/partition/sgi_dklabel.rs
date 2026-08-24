@@ -261,6 +261,44 @@ impl SgiDiskLabel {
         })
     }
 
+    /// Serialize into block 0 in this label's own byte order. Rewrites the whole
+    /// 274-byte struct, so `d_misc` — which we do not carry — comes out zero.
+    pub fn write_into(&self, sector0: &mut [u8]) -> Result<(), RustyBackupError> {
+        if sector0.len() < SGI_DKLABEL_SIZE {
+            return Err(RustyBackupError::InvalidMbr(format!(
+                "SGI disk label needs {SGI_DKLABEL_SIZE} bytes, got {}",
+                sector0.len()
+            )));
+        }
+        let buf = &mut sector0[..SGI_DKLABEL_SIZE];
+        buf.fill(0);
+        BigEndian::write_u32(&mut buf[0..4], SGI_DKLABEL_MAGIC);
+        BigEndian::write_u16(&mut buf[0x04..0x06], self.drive_type);
+        BigEndian::write_u16(&mut buf[0x06..0x08], self.controller);
+        BigEndian::write_u16(&mut buf[0x08..0x0A], self.cylinders);
+        BigEndian::write_u16(&mut buf[0x0A..0x0C], self.heads);
+        BigEndian::write_u16(&mut buf[0x0C..0x0E], self.sectors);
+        BigEndian::write_u32(&mut buf[0x0E..0x12], self.altstart);
+        BigEndian::write_u16(&mut buf[0x12..0x14], self.nalternates);
+        buf[OFF_BOOTFS] = self.bootfs;
+        buf[OFF_BOOTFS + 1] = self.swapfs;
+        for (i, m) in self.map.iter().take(SGI_DKLABEL_NFS).enumerate() {
+            let o = OFF_MAP + i * 8;
+            BigEndian::write_u32(&mut buf[o..o + 4], m.base);
+            BigEndian::write_u32(&mut buf[o + 4..o + 8], m.size);
+        }
+        buf[0x56] = self.interleave as u8;
+        buf[0x57] = self.trackskew as u8;
+        buf[0x58] = self.cylskew as u8;
+        BigEndian::write_u16(&mut buf[0x5A..0x5C], self.badspots);
+        put_c_string(&mut buf[OFF_NAME..OFF_NAME + NAME_LEN], &self.name);
+        put_c_string(&mut buf[OFF_SERIAL..OFF_SERIAL + NAME_LEN], &self.serial);
+        buf[0x110] = self.rootnotboot;
+        buf[0x111] = self.rootfs;
+        apply_byte_order(self.byte_order, buf);
+        Ok(())
+    }
+
     /// Total blocks the drive's geometry describes.
     pub fn total_blocks(&self) -> u64 {
         self.cylinders as u64 * self.heads as u64 * self.sectors as u64
@@ -315,6 +353,14 @@ impl SgiDiskLabel {
             .enumerate()
             .filter(move |(i, _)| !self.is_wrapper_slot(*i))
     }
+}
+
+/// Write `text` into a fixed-width NUL-padded C string field, truncating on a
+/// byte boundary so the field always keeps its terminator.
+fn put_c_string(field: &mut [u8], text: &str) {
+    field.fill(0);
+    let n = text.len().min(field.len().saturating_sub(1));
+    field[..n].copy_from_slice(&text.as_bytes()[..n]);
 }
 
 /// Trim a fixed-width C string field to its printable prefix.
@@ -504,6 +550,49 @@ mod tests {
             fs_hint: "FAT".to_string(),
         };
         assert_eq!(sf.byte_order_name(), None);
+    }
+
+    /// Parse -> serialize -> parse must be lossless in both orientations, or a
+    /// label the builder writes reads back as a different one.
+    #[test]
+    fn write_into_round_trips_in_both_word_orders() {
+        for raw in [sample_label(), swabbed(sample_label())] {
+            let label = SgiDiskLabel::parse(&raw).unwrap();
+            let mut out = vec![0u8; 512];
+            label.write_into(&mut out).unwrap();
+            let again = SgiDiskLabel::parse(&out).unwrap();
+            assert_eq!(again.byte_order, label.byte_order);
+            assert_eq!(again.cylinders, label.cylinders);
+            assert_eq!(again.altstart, label.altstart);
+            assert_eq!(again.nalternates, label.nalternates);
+            assert_eq!(again.bootfs, label.bootfs);
+            assert_eq!(again.swapfs, label.swapfs);
+            assert_eq!(again.name, label.name);
+            assert_eq!(again.serial, label.serial);
+            assert_eq!(again.rootfs, label.rootfs);
+            assert_eq!(
+                again
+                    .map
+                    .iter()
+                    .map(|m| (m.base, m.size))
+                    .collect::<Vec<_>>(),
+                label
+                    .map
+                    .iter()
+                    .map(|m| (m.base, m.size))
+                    .collect::<Vec<_>>(),
+            );
+            // The struct is 0x112 bytes; the sample only sets fields inside
+            // it, so the serialized form must match byte for byte.
+            assert_eq!(&out[..SGI_DKLABEL_SIZE], &raw[..SGI_DKLABEL_SIZE]);
+        }
+    }
+
+    #[test]
+    fn write_into_refuses_a_short_buffer() {
+        let label = SgiDiskLabel::parse(&sample_label()).unwrap();
+        let mut tiny = vec![0u8; SGI_DKLABEL_SIZE - 1];
+        assert!(label.write_into(&mut tiny).is_err());
     }
 
     #[test]
