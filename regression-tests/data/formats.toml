@@ -207,6 +207,15 @@ we_write = true
 builder = "new hd sgi-efs"
 
 [[format]]
+id = "fs.efs-v1"
+kind = "fs"
+name = "SGI EFS v1 (IRIS 2000/3000)"
+we_read = true
+we_write = true
+builder = "new volume efs-v1"
+notes = "The pre-IRIX EFS: magic 0x041755, a 68020-packed superblock and System V directories. Shares only the inode and extent layout with fs.efs."
+
+[[format]]
 id = "fs.affs"
 kind = "fs"
 name = "AFFS (OFS/FFS)"
@@ -464,6 +473,15 @@ name = "SGI volume header"
 we_read = true
 we_write = true
 builder = "new hd sgi-efs"
+
+[[format]]
+id = "part.sgi-dklabel"
+kind = "partition"
+name = "SGI disk label (IRIS 2000/3000)"
+we_read = true
+we_write = true
+builder = "new hd sgi-dklabel"
+notes = "One struct disk_label at block 0. Slots carry a role, not a type. Images off period controllers are word-swapped; rb-cli swab16 converts."
 
 [[format]]
 id = "part.sun"

@@ -43,6 +43,20 @@ recipe and the five traps that cost time.
 
 IRIX 5.3 hangs on boot (`Find Error: 10`), so 6.5 is the authority.
 
+### Motion / IRIX 3.7 — *proven*
+
+Wired 2026-08-24, and it is the first oracle this project has had for **EFS
+v1** — the IRIS 2000/3000 filesystem, which no Linux kernel and no third-party
+tool reads. `oracles/motion/efs_v1_mount.sh` drops our volume into the
+reference IRIS 3130's `/usr` slot and boots; the guest's own `/etc/rc.s0`
+mounts it and lists it, and the **serial console on stdout** is the verdict
+channel — no control socket, no screen scraping. Controlled against 8 MB of
+noise, which IRIX refuses with `Invalid argument`.
+
+Weaker than Iris in one respect: the emulator holds the disk read-only and
+attaches drive 0 only, so neither guest writes nor a whole disk we partitioned
+can be checked yet. See `oracles/motion/README.md`.
+
 ### QEMU, headless — *plausible, spike first*
 
 The strongest automation target for the mainstream filesystems. Boot the

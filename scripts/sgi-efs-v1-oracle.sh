@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 # SGI EFS v1 emulation oracle: boot a real IRIX 3.7 on a disk we wrote.
 #
-# The Motion emulator (https://github.com/.../motion, checked out at
-# $MOTION_ROOT) runs an IRIS 3130 well enough to boot IRIX 3.7 / GL2-W3.6 to a
-# shell, with the serial console on stdout. It opens the disk **read-only**, so
-# it is a pure read oracle — which is exactly what our write side needs: the
-# period kernel is the only thing that can say whether what we wrote is what
-# IRIX would have written.
+# The Motion emulator (checked out at $MOTION_ROOT) runs an IRIS 3130 well
+# enough to boot IRIX 3.7 / GL2-W3.6 to a shell, with the serial console on
+# stdout. It opens the disk **read-only**, so it is a pure read oracle — which
+# is exactly what our write side needs: the period kernel is the only thing
+# that can say whether what we wrote is what IRIX would have written.
 #
 # `prove` is the interesting one. It takes the reference IRIS 3130 disk, has
 # rb-cli
@@ -18,10 +17,20 @@
 # directory, `sum`-ed our allocated file to the right checksum, and mounted the
 # second EFS v1 filesystem off md0c.
 #
+# `mount` is the one rb-regress drives. It takes an EFS v1 **volume** we
+# produced, drops it into the reference disk's /usr slot and boots: passing
+# means the IRIX 3.7 kernel mounted the filesystem and read its root directory.
+# The volume must be no larger than that slot (79730 blocks, 38.9 MB) and in
+# native word order, which is what `new volume efs-v1` writes.
+#
 # Usage:
 #   scripts/sgi-efs-v1-oracle.sh baseline        # boot the stock disk, print the console
 #   scripts/sgi-efs-v1-oracle.sh boot <img>      # boot any image, print the console
 #   scripts/sgi-efs-v1-oracle.sh prove           # write with rb-cli, boot, assert
+#   scripts/sgi-efs-v1-oracle.sh mount <vol.img> # let IRIX mount a volume we made
+#
+# Exit codes follow rb-regress's convention: 0 pass, 1 the oracle disagreed,
+# 77 nothing to run it with here, 99 ran but reached no verdict.
 #
 # Environment:
 #   MOTION_ROOT  Motion checkout (default ~/repos/motion)
@@ -34,7 +43,19 @@ MOTION_ROOT=${MOTION_ROOT:-$HOME/repos/motion}
 MOTION_BIN=${MOTION_BIN:-$MOTION_ROOT/build/output/RelWithDebInfo}
 IRIS_DISK=${IRIS_DISK:-$HOME/3130.img}
 BOOT_SECONDS=${BOOT_SECONDS:-120}
-RB=${RB:-$ROOT/target/debug/rb-cli}
+# rb-regress builds release; a developer usually has debug. Prefer whichever
+# exists so the same script serves both callers.
+RB=${RB:-}
+if [ -z "$RB" ]; then
+  for cand in "$ROOT/target/release/rb-cli" "$ROOT/target/debug/rb-cli"; do
+    [ -x "$cand" ] && { RB=$cand; break; }
+  done
+  RB=${RB:-$ROOT/target/debug/rb-cli}
+fi
+# The reference disk's /usr slot: `md0c`, block 35700, 79730 blocks. A volume
+# dropped there is mounted with the disk's own label, which stays untouched.
+USR_SLOT_BLOCK=35700
+USR_SLOT_BLOCKS=79730
 
 need() {
   [ -x "$MOTION_BIN/motion" ] || {
@@ -142,7 +163,69 @@ SH
     fi
     ;;
 
+  mount)
+    need
+    [ -n "${2:-}" ] || { echo "usage: $0 mount <volume.img>" >&2; exit 1; }
+    vol=$2
+    [ -f "$vol" ] || { echo "no such volume: $vol" >&2; exit 1; }
+    blocks=$(( $(stat -c %s "$vol") / 512 ))
+    if [ "$blocks" -gt "$USR_SLOT_BLOCKS" ]; then
+      echo "volume is $blocks blocks; the /usr slot holds $USR_SLOT_BLOCKS" >&2
+      exit 99
+    fi
+    work=$(mktemp -d); trap 'rm -rf "$work"' EXIT
+    img=$work/mount.img
+    cp "$IRIS_DISK" "$img"
+    # The medium is word-swapped; a volume our producer wrote is not, so it has
+    # to be swapped on the way in or the kernel sees noise.
+    "$RB" -q swab16 "$vol" "$work/vol.sw" >/dev/null
+    dd if="$work/vol.sw" of="$img" bs=512 seek="$USR_SLOT_BLOCK" conv=notrunc status=none
+
+    "$RB" -q get "$img@1" /etc/rc.s0 "$work/rcs0" >/dev/null
+    cat >>"$work/rcs0" <<'SH'
+
+# Added by scripts/sgi-efs-v1-oracle.sh: mount the volume under test.
+echo "RBMOUNT-BEGIN"
+/bin/mkdir /mnt
+/etc/mount /dev/md0c /mnt
+/bin/ls -a /mnt
+/etc/umount /mnt
+echo "RBMOUNT-END"
+SH
+    "$RB" -q put "$img@1" "$work/rcs0" /etc/rc.s0 --force >/dev/null
+    "$RB" -q chmod "$img@1" /etc/rc.s0 755 >/dev/null
+
+    # About one boot in six dies at kernel entry before running anything, which
+    # is the emulator, not the volume. Retry once rather than call that a verdict.
+    log=$work/console.log
+    for attempt in 1 2; do
+      boot "$img" "$log"
+      grep -qF RBMOUNT-END "$log" && break
+      [ "$attempt" = 2 ] && {
+        echo "guest never finished the mount block in two boots - no verdict" >&2
+        tail -3 "$log" >&2
+        exit 99
+      }
+    done
+
+    body=$(sed -n '/RBMOUNT-BEGIN/,/RBMOUNT-END/p' "$log")
+    # IRIX 3.7's mount is silent on success. Its refusals are what these match:
+    # "/dev/md0c:Invalid argument" from mount, "not mounted" from the umount.
+    if printf '%s' "$body" | grep -qiE 'invalid argument|not mounted|mount:|giving up|not a directory|block device required'; then
+      echo "IRIX refused the volume:"; printf '%s\n' "$body"; exit 1
+    fi
+    # `.` and `..` are the two entries even an empty EFS root always has, so a
+    # listing without them means the mount silently gave us something else.
+    if ! printf '%s' "$body" | grep -qE '(^|[[:space:]])\.\.([[:space:]]|$)'; then
+      echo "IRIX mounted it but the root directory did not read back:"
+      printf '%s\n' "$body"; exit 1
+    fi
+    echo "IRIX 3.7 mounted the volume and read its root:"
+    printf '%s\n' "$body"
+    echo "MOUNTED-OK"
+    ;;
+
   *)
-    sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,44p' "$0" | sed 's/^# \{0,1\}//'
     ;;
 esac

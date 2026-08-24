@@ -385,7 +385,8 @@ UCSD p-System · Apple Lisa FS · CBM DOS (1541/1571/1581/8050/8250) ·
 Atari DOS 2 (2.0S, 2.5) · RS-DOS · OS-9 / NitrOS-9 RBF · DragonDOS ·
 Acorn DFS · Acorn ADFS / FileCore · TI-99 · TR-DOS · Oric Jasmin ·
 Human68k (FAT12, FAT16) · CP/M 2.2 / 3 / Plus · QDOS (QXL.WIN) ·
-AFFS (OFS, FFS) · PFS3 / PDS3 / muFS · SFS · SGI EFS · SGI XFS v4/v5 ·
+AFFS (OFS, FFS) · PFS3 / PDS3 / muFS · SFS · SGI EFS · SGI EFS v1 ·
+SGI XFS v4/v5 ·
 Alto BFS / TFS · Pilot / Cedar · Carve (raw recovery)
 
 **Sub-variants that need their own cases, not just one per family:**

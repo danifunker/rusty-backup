@@ -99,6 +99,15 @@ The emulator never writes to the disk (the image is byte-identical afterwards,
 and still `fsck`-clean), so this validates the write side only in the direction
 that matters: what IRIX makes of what we wrote.
 
+The regression suite runs a narrower form of the same thing on every `rb-regress
+verify`: `mount` takes the `fs.efs-v1` artifact, drops it into the reference
+disk's `/usr` slot and asserts the guest kernel mounts and lists it. That is
+the `motion` oracle, `strength = authoritative`; see
+`regression-tests/oracles/motion/README.md` for the traps and the noise
+control. `part.sgi-dklabel` is declared there but untested — checking a disk we
+partitioned needs the emulator to attach a second drive, and it opens drive 0
+only.
+
 ## Byte order
 
 Images taken off these machines' disk controllers are **byte-swapped within
