@@ -354,3 +354,59 @@ impl FileEntry {
             .map(crate::fs::hfs_common::decode_ostype)
     }
 }
+
+/// Display order for a directory listing: directories first, then everything
+/// else, each group by name case-insensitively.
+///
+/// Drivers return entries in on-disk order (insertion order on FAT, B-tree
+/// order on HFS, and so on), which is why the browse tree looked unsorted.
+/// This is display-only — `ls` and the archive writers keep the driver's order,
+/// which is what the regression cases assert against.
+pub fn sort_for_display(entries: &mut [FileEntry]) {
+    entries.sort_by_cached_key(|e| (!e.is_directory(), e.name.to_lowercase()));
+}
+
+#[cfg(test)]
+mod sort_tests {
+    use super::*;
+
+    fn e(name: &str, dir: bool) -> FileEntry {
+        let mut x = FileEntry::root();
+        x.name = name.to_string();
+        x.path = format!("/{name}");
+        x.entry_type = if dir {
+            EntryType::Directory
+        } else {
+            EntryType::File
+        };
+        x
+    }
+
+    #[test]
+    fn directories_come_first_then_case_insensitive_name() {
+        let mut v = vec![
+            e("zebra.txt", false),
+            e("Apple", true),
+            e("banana.TXT", false),
+            e("apple.txt", false),
+            e("Zoo", true),
+        ];
+        sort_for_display(&mut v);
+        let got: Vec<&str> = v.iter().map(|x| x.name.as_str()).collect();
+        assert_eq!(
+            got,
+            ["Apple", "Zoo", "apple.txt", "banana.TXT", "zebra.txt"],
+            "folders first, then files, each case-insensitively by name"
+        );
+    }
+
+    /// The bug this fixes: an uppercase name must not sort before every
+    /// lowercase one, which is what a plain byte-order sort does.
+    #[test]
+    fn uppercase_does_not_sort_ahead_of_lowercase() {
+        let mut v = vec![e("beta", false), e("Alpha", false), e("gamma", false)];
+        sort_for_display(&mut v);
+        let got: Vec<&str> = v.iter().map(|x| x.name.as_str()).collect();
+        assert_eq!(got, ["Alpha", "beta", "gamma"]);
+    }
+}

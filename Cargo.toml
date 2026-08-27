@@ -204,7 +204,14 @@ webbrowser = { version = "1.0", optional = true }
 #            cooked sectors, which is what makes DVD and Blu-ray work at all
 #            (the CD-only MMC ioctls fail on that media with ENOTTY).
 opticaldiscs = { version = "0.15.0", features = ["drives"], optional = true }
-cd-da-reader = { git = "https://github.com/danifunker/rust-cd-da-reader", branch = "file-backend-on-1.0", optional = true }
+# Back on the upstream crate as of 1.0.0, which absorbed everything the
+# `danifunker/rust-cd-da-reader` fork carried (PR #58): `CdReader::from_file`
+# for a pre-opened elevated handle, and the streaming reader
+# (`AudioSectorReader` / `open_track_stream_at` / `TrackBounds`) that
+# `src/optical/cd_audio.rs` plays CHD audio through. 1.0.0 also drops
+# `TrackStreamOptions`, which we never used, and adds read-speed control
+# (`ReadSpeed` / `with_read_speed`) that we do not use yet.
+cd-da-reader = { version = "1.0.0", optional = true }
 # In-app CD-DA playback (Optical tab). Pinned <0.20 for the
 # OutputStream::try_default / Sink::try_new API used in gui/optical_audio.rs.
 # Only the `audio` feature (desktop) links this; cpal -> ALSA/WASAPI/CoreAudio.

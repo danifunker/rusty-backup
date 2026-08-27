@@ -211,12 +211,22 @@ fn write_roots<W: Write>(
     stats: &mut TarExportStats,
     progress: &dyn Fn(&TarExportStats),
 ) -> Result<()> {
+    // Members are named relative to the deepest folder holding the whole
+    // selection, so picking across folders keeps them apart instead of
+    // flattening every root onto its bare name.
+    let base = crate::fs::export_selection::common_parent(roots);
     for root in roots {
         // A selected volume root has no member name of its own — its children
         // land at the archive top level. `archive_name` is what decides that;
         // `root.name` would be the literal "/" every driver uses.
-        let prefix = root.archive_name().unwrap_or("");
-        export_into(fs, root, prefix, builder, opts, stats, progress)?;
+        let name = root.archive_name().unwrap_or("");
+        let rel = crate::fs::export_selection::relative_dir(root, &base);
+        let prefix = if rel.is_empty() || name.is_empty() {
+            name.to_string()
+        } else {
+            format!("{rel}/{name}")
+        };
+        export_into(fs, root, &prefix, builder, opts, stats, progress)?;
     }
     Ok(())
 }

@@ -132,19 +132,17 @@ impl SgiPartitionType {
     }
 
     /// True if the partition is non-browse — disk-wide wrappers, swap/raw
-    /// regions, replacement areas, log volumes, and LVM wrappers. Filtered out
-    /// of `PartitionTable::partitions()` per `docs/SGI_Filesystems.md` Step 2.
+    /// regions, log volumes, and logical-volume manager wrappers. These are
+    /// filtered out of `PartitionTable::partitions()` per the plan in
+    /// `docs/SGI_Filesystems.md` Step 2.
+    ///
+    /// TRKREPL / SECREPL are deliberately NOT here: they must stay listed so
+    /// `inspect` shows them and `@N` positions do not shift. The browse gate
+    /// refuses them by role instead (`fs::is_reserved_slice_role`).
     pub fn is_skipped_from_browse(self) -> bool {
         matches!(
             self,
-            Self::VolHdr
-                | Self::Volume
-                | Self::Raw
-                | Self::TrkRepl
-                | Self::SecRepl
-                | Self::XfsLog
-                | Self::Xlv
-                | Self::Xvm
+            Self::VolHdr | Self::Volume | Self::Raw | Self::XfsLog | Self::Xlv | Self::Xvm
         )
     }
 }

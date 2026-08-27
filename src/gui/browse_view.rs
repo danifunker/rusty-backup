@@ -1447,6 +1447,10 @@ impl BrowseView {
                     let meta_changed =
                         self.edit_mode && self.staged_edits.has_pending_metadata(&entry.path);
                     ui.horizontal(|ui| {
+                        // Directory rows spend `spacing().indent` on the collapse
+                        // toggle before their checkbox; files must match or the
+                        // checkbox column zig-zags. See egui show_button_indented.
+                        ui.add_space(ui.spacing().indent);
                         self.mark_checkbox(ui, entry);
                         let rich = if meta_changed {
                             egui::RichText::new(&label).color(super::theme::info(ui.visuals()))
@@ -1760,7 +1764,8 @@ impl BrowseView {
     fn load_directory(&mut self, entry: &FileEntry) {
         if let Some(mut fs) = self.take_or_open_fs() {
             match fs.list_directory(entry) {
-                Ok(entries) => {
+                Ok(mut entries) => {
+                    rusty_backup::fs::entry::sort_for_display(&mut entries);
                     self.directory_cache.insert(entry.path.clone(), entries);
                 }
                 Err(e) => {
@@ -4172,7 +4177,8 @@ impl BrowseView {
         self.invalidate_cached_fs();
         if let Some(mut fs) = self.take_or_open_fs() {
             if let Ok(root) = fs.root() {
-                if let Ok(children) = fs.list_directory(&root) {
+                if let Ok(mut children) = fs.list_directory(&root) {
+                    rusty_backup::fs::entry::sort_for_display(&mut children);
                     self.directory_cache.insert(root.path.clone(), children);
                 }
                 self.root = Some(root);
@@ -5880,7 +5886,8 @@ impl BrowseView {
                     self.volume_used = g.used_size;
                     self.blessed_folder = g.blessed_folder.take();
                     if let Some(root) = g.root.take() {
-                        if let Some(entries) = g.root_entries.take() {
+                        if let Some(mut entries) = g.root_entries.take() {
+                            rusty_backup::fs::entry::sort_for_display(&mut entries);
                             self.directory_cache.insert("/".into(), entries);
                             self.expanded_paths.insert("/".into());
                         }
