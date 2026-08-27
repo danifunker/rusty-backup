@@ -19,6 +19,7 @@ finding depends on a fixture, the fixture is named.
 
 | ID | Severity | Area | Finding |
 |----|----------|------|---------|
+| R-043 | **High** | `src/cli/resolve.rs` | Every edit verb refuses a **dynamic VHD**: `ls` / `get` / `fsck` read it, then `put` / `mkdir` / `rm` / `chmod` / `chown` fail with `Invalid MBR: invalid boot signature`. The writable-open dispatch has branches for CHD, QCOW2 and the floppy containers but none for VHD, so the file is opened raw and the footer copy at offset 0 is read as sector 0. Fixed VHDs are unaffected — they really are raw data with a trailing footer. |
 | ~~R-042~~ | ~~**High**~~ **FIXED** | `src/fs/affs.rs` | ~~An AFFS partition that is not last on its disk cannot be opened at all~~ — the root-block midpoint was inferred from the end of the *disk*; the read-only opener family now carries the partition length the editable one always had, 2026-08-18 |
 | ~~R-040~~ | ~~**High**~~ **FIXED** | `src/cli/verbs/put.rs`, `src/fs/dir_import.rs` | ~~`put` and `import` never reattach a resource fork, so an extracted Mac archive copied back onto HFS loses every fork~~ — `detect_resource_fork` learned BinHex and both verbs now consult it; all four containers round-trip, 2026-08-17 |
 | ~~R-041~~ | ~~**High**~~ **FIXED** | `src/model/commander_ops.rs`, `src/cli/verbs/tui_app.rs` | ~~Commander drops resource forks: host->image staging hardcoded `resource_fork: None`, and the TUI's image->host copy did not recurse~~ — staging detects forks and skips consumed sidecars; both front ends now share one recursive walker, 2026-08-17 |
@@ -2470,3 +2471,81 @@ remains is different from the one that got us here.
 is gone"; nothing was lost) and R-022 ("not byte-identical"; the backup was
 empty). Both had a one-command control that settled it. Reproduce and *measure*
 before fixing anything below.
+
+### R-043 — every edit verb refuses a dynamic VHD {#r-043}
+
+**OPEN, found 2026-08-25** while authoring the tier-3 cases for the new
+fixtures. Three of them are dynamic VHDs, and not one accepted a write.
+
+The tool disagrees with itself, which is what makes it a defect rather than a
+missing capability: the same file that `ls` walks and `fsck` pronounces clean
+is rejected a moment later as a corrupt MBR.
+
+```
+rb-cli ls   part.next.ns33-intel.hd.vhd@1 /      -> lists the NeXTSTEP root
+rb-cli fsck part.next.ns33-intel.hd.vhd@1        -> 14476 files / 3037 dirs checked
+rb-cli put  part.next.ns33-intel.hd.vhd@1 p.bin /p.bin
+  -> error: detecting partition table: Invalid MBR: invalid boot signature:
+     expected 0xAA55, got 0x0000
+```
+
+**Root cause.** `open_rw` in `src/cli/resolve.rs` dispatches on container type
+and has explicit branches for SquashFS-in-ISO (refused), CHD, QCOW2, the
+read-only GCR/MSA/EDSK family (refused), and the editable floppy/gzip/WOZ
+containers (decoded to a temp flat). There is **no VHD branch**, so a VHD falls
+through to the final `else`, which opens the path as a plain file. A dynamic
+VHD begins with a *copy of its footer* — `conectix` — followed by the dynamic
+disk header and the BAT, so byte 510 is `0x00` and partition detection reports
+a bad boot signature.
+
+The QCOW2 branch immediately above carries a comment describing this exact
+failure for its own format:
+
+> Without this branch the raw `File` below would be handed to partition
+> detection, which reads the QCOW2 header as sector 0 and reports a bogus
+> "Invalid MBR".
+
+**Scope**, established by probe rather than assumed:
+
+| container | read | write |
+|-----------|:----:|:-----:|
+| raw `.img` | ok | ok |
+| QCOW2 | ok | ok |
+| CHD | ok | ok |
+| VHD, **fixed** | ok | ok |
+| VHD, **dynamic** | ok | **fails** |
+
+Filesystem-independent — reproduced on 4.3BSD UFS behind a NeXT label, on BFS
+behind an MBR, and on a plain FAT volume built for the purpose. Fixed VHD only
+works because it is raw data with a trailing footer, exactly as
+[F-008](missing_features_from_regression.md#f-008) noted when `backup` had the
+same blind spot.
+
+**Relationship to F-008.** Same root cause, different verb family. F-008 was
+`backup` reading container bytes as though they were the disk, and it shipped
+on 2026-08-15 by decoding the source to a scratch file first. The edit path
+was not part of that fix. A dynamic-VHD branch here would look like either the
+`ContainerEditSession` shape (decode to a temp flat, re-encode on commit) or a
+`Read + Write + Seek` VHD reader in the manner of `Qcow2Reader`.
+
+**Repro with no fixture:**
+
+```sh
+rb-cli new volume fat --size 16M v.img
+rb-cli convert v.img dyn   --format vhd-dynamic
+rb-cli convert v.img fixed --format vhd
+rb-cli put fixed/v.vhd payload.bin /p.bin   # ok
+rb-cli ls  dyn/v.vhd /                      # ok
+rb-cli put dyn/v.vhd payload.bin /p.bin     # Invalid MBR
+```
+
+**Cases:** `edit.new.next-ns33-intel-dynamic-vhd`,
+`edit.new.bfs-r5-dynamic-vhd`, `edit.new.dynamic-vhd-synthetic`. All three
+assert the intended behaviour and are listed in `data/known-failures.toml`
+until this lands.
+
+**Secondary observation, not part of this finding.** A fixed VHD reports its
+volume as 512 bytes larger than the source image (`16777728` for a 16 MiB
+volume), i.e. the footer is counted as part of the filesystem. It did not stop
+the write and has not been chased.
+

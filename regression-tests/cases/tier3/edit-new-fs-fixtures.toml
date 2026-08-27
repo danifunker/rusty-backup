@@ -1,0 +1,271 @@
+# Tier 3 — mutate the BeOS / NeXT / Sun / SGI volumes, and prove nothing else moved.
+#
+# The tier-2 file next door proves we can READ these. This one writes to them.
+# Every case uses {fixture_copy}: a reference volume a test has written to has
+# stopped being a reference.
+#
+# The gamut, per volume, is the one the other tier-3 files use:
+#
+#   put -> ls -> get -> byte-compare -> mkdir -> chmod/chown -> rm -> fsck
+#
+# with the fsck at the end doing the real work. A mutation that returns 0 and
+# leaves an inconsistent volume is the failure mode that matters, and only the
+# fsck sees it.
+#
+# ON THE THREE DAMAGED VOLUMES the fsck assertion is stronger than "clean": it
+# pins the pre-existing error and its exact count. 546 leaked sectors before an
+# edit and 546 after is the assertion that our allocator leaked nothing new.
+# "It was already dirty" is otherwise a place for a real defect to hide.
+#
+# NOT COVERED HERE, and deliberately: the three dynamic-VHD fixtures
+# (part.next.ns33-intel.hd, fs.bfs.r5-intel.hd,
+# part.solaris-x86.solaris26-intel.multipart). Every edit verb refuses them —
+# see R-043 and the cases at the bottom of this file, which assert the intended
+# behaviour and are listed in known-failures.toml until it lands. The same
+# filesystems are edited here through their raw / QCOW2 / CHD siblings, so the
+# filesystem coverage does not depend on that fix.
+
+[meta]
+tier = 3
+group = "edit.new-drop"
+description = "Write to the new BeOS/NeXT/Sun/SGI volumes; assert the volume is sound and unchanged elsewhere."
+
+# --- BeOS OFS ------------------------------------------------------------------
+
+[[case]]
+id = "edit.new.ofs-hobbit"
+description = "BeOS OFS v1, bare volume. Early BeOS typed files the way the Mac Finder did, so a put lands with type/creator columns populated."
+fixture = "fs.ofs.hobbit-1993.hd"
+[[case.step]]
+args = ["put", "{fixture_copy}", "{cases}/tier3/payload.bin", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{fixture_copy}", "/payload.bin", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+[[case.step]]
+args = ["mkdir", "{fixture_copy}", "/rbtest"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{fixture_copy}", "/"]
+expect_exit = 0
+stdout_contains = ["payload.bin", "rbtest"]
+[[case.step]]
+args = ["rm", "{fixture_copy}", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "-r", "{fixture_copy}", "/rbtest"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{fixture_copy}", "/"]
+expect_exit = 0
+stdout_not_contains = ["payload.bin", "rbtest"]
+[[case.step]]
+# STILL exactly 546 — create, mkdir, delete and rmdir leaked nothing new.
+args = ["fsck", "{fixture_copy}", "--checkonly"]
+expect_exit = 1
+stdout_contains = ["LeakedSectors", "546 sector(s)"]
+
+# --- BeOS BFS, big-endian ------------------------------------------------------
+
+[[case]]
+id = "edit.new.bfs-ppc-bigendian"
+description = "Writing into a BIG-ENDIAN BFS volume. The highest-risk edit path we have: every multi-byte field is byte-swapped relative to the R5 volume, and no emulator exists to check the result, so fsck is the only witness."
+fixture = "fs.bfs.ppc-bigendian.multipart"
+[[case.step]]
+args = ["put", "{fixture_copy}@3", "{cases}/tier3/payload.bin", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{fixture_copy}@3", "/payload.bin", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+[[case.step]]
+args = ["mkdir", "{fixture_copy}@3", "/rbtest"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{fixture_copy}@3", "/"]
+expect_exit = 0
+stdout_contains = ["payload.bin", "rbtest"]
+[[case.step]]
+# 4402 files / 450 dirs pristine; +1 each after the put and the mkdir.
+args = ["fsck", "{fixture_copy}@3", "--checkonly"]
+expect_exit = 0
+stdout_contains = ["4403 files", "451 dirs"]
+
+# --- NeXT / pre-4.4BSD UFS -----------------------------------------------------
+
+[[case]]
+id = "edit.new.next-ns33-m68k"
+description = "Big-endian pre-4.4BSD UFS behind a NeXT disk label. Exercises the 4.3BSD struct cg and the 16-bit d_namlen directory entry, both of which a 4.4BSD-shaped writer gets wrong silently."
+fixture = "part.next.ns33-m68k.hd"
+[[case.step]]
+args = ["put", "{fixture_copy}@1", "{cases}/tier3/payload.bin", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{fixture_copy}@1", "/payload.bin", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+[[case.step]]
+args = ["chmod", "{fixture_copy}@1", "/payload.bin", "0640"]
+expect_exit = 0
+[[case.step]]
+args = ["chown", "{fixture_copy}@1", "/payload.bin", "100:20"]
+expect_exit = 0
+[[case.step]]
+args = ["mkdir", "{fixture_copy}@1", "/rbtest"]
+expect_exit = 0
+[[case.step]]
+# Still ONLY the pre-existing orphan. A second error here means our write
+# broke something; a clean result means the orphan stopped being reported,
+# which is equally a change worth failing on.
+args = ["fsck", "{fixture_copy}@1", "--checkonly"]
+expect_exit = 1
+stdout_contains = ["OrphanInode", "20654"]
+
+# --- Sun VTOC / UFS, through a QCOW2 -------------------------------------------
+
+[[case]]
+id = "edit.new.sun-solaris24"
+description = "Editing UFS inside a Sun SMI VTOC, through a QCOW2 container. The QCOW2 write path allocates host clusters on demand, so this also proves a container edit commits."
+fixture = "part.sun.solaris24-sparc.multipart"
+[[case.step]]
+args = ["put", "{fixture_copy}@1", "{cases}/tier3/payload.bin", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{fixture_copy}@1", "/payload.bin", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+[[case.step]]
+args = ["fsck", "{fixture_copy}@1", "--checkonly"]
+expect_exit = 0
+stdout_contains = ["2260 files"]
+
+# --- SGI volume header / UFS, through a CHD ------------------------------------
+
+[[case]]
+id = "edit.new.sgi-riscos"
+description = "Editing UFS behind an SGI volume header, through a CHD. Its slots deliberately overlap, so a writer that trusts slot bounds naively will corrupt a sibling slice."
+fixture = "part.sgi.riscos-mips.multipart"
+[[case.step]]
+args = ["put", "{fixture_copy}@1", "{cases}/tier3/payload.bin", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{fixture_copy}@1", "/payload.bin", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+[[case.step]]
+args = ["fsck", "{fixture_copy}@1", "--checkonly"]
+expect_exit = 0
+stdout_contains = ["1252 files"]
+
+# --- SGI EFS v1, the populated IRIS 3130 disk ----------------------------------
+
+[[case]]
+id = "edit.new.efs-v1-irix37"
+description = "The full gamut against a REAL populated EFS v1 volume — 2754 files, real permission bits, a meaningfully full bitmap. Every previous EFS v1 edit case ran on a volume our own formatter had just created."
+fixture = "fs.efs-v1.populated-irix37.multipart"
+[[case.step]]
+args = ["put", "{fixture_copy}@3", "{cases}/tier3/payload.bin", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{fixture_copy}@3", "/payload.bin", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+[[case.step]]
+args = ["mkdir", "{fixture_copy}@3", "/rbtest"]
+expect_exit = 0
+[[case.step]]
+args = ["chmod", "{fixture_copy}@3", "/payload.bin", "0640"]
+expect_exit = 0
+[[case.step]]
+args = ["chown", "{fixture_copy}@3", "/payload.bin", "100:20"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{fixture_copy}@3", "/"]
+expect_exit = 0
+stdout_contains = ["payload.bin", "rbtest"]
+[[case.step]]
+args = ["rm", "{fixture_copy}@3", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+# 2580 files / 149 dirs pristine; the payload is gone again, the dir remains.
+args = ["fsck", "{fixture_copy}@3", "--checkonly"]
+expect_exit = 0
+stdout_contains = ["2580 files", "150 dirs"]
+
+[[case]]
+id = "edit.new.efs-v1-irix37-root-untouched"
+description = "Editing the /usr slice must not disturb the root slice on the same label. The two EFS v1 volumes share a disk whose slot f aliases slot c, so a write that resolves the wrong slot lands in the wrong filesystem."
+fixture = "fs.efs-v1.populated-irix37.multipart"
+[[case.step]]
+args = ["put", "{fixture_copy}@3", "{cases}/tier3/payload.bin", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{fixture_copy}@1", "/"]
+expect_exit = 0
+stdout_contains = ["vmunix"]
+stdout_not_contains = ["payload.bin"]
+[[case.step]]
+args = ["fsck", "{fixture_copy}@1", "--checkonly"]
+expect_exit = 0
+stdout_contains = ["451 files", "13 dirs"]
+
+# --- R-043 — every edit verb refuses a dynamic VHD -----------------------------
+#
+# These assert the INTENDED behaviour and are listed in known-failures.toml
+# against R-043. Do not soften them to match what the tool does today: that is
+# what the known-failures mechanism is for, and XPASS is how we learn the fix
+# landed.
+
+[[case]]
+id = "edit.new.next-ns33-intel-dynamic-vhd"
+description = "R-043: a dynamic VHD reads fine and refuses every write. Same NeXT/UFS volume as the m68k case, so a pass here is purely about the container."
+fixture = "part.next.ns33-intel.hd"
+[[case.step]]
+# The read path already handles it — this step passes today and is the control.
+args = ["ls", "{fixture_copy}@1", "/"]
+expect_exit = 0
+stdout_contains = ["private", "usr"]
+[[case.step]]
+args = ["put", "{fixture_copy}@1", "{cases}/tier3/payload.bin", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{fixture_copy}@1", "/payload.bin", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+
+[[case]]
+id = "edit.new.bfs-r5-dynamic-vhd"
+description = "R-043 again on a different filesystem, so the finding is pinned as a container defect rather than a BFS one."
+fixture = "fs.bfs.r5-intel.hd"
+[[case.step]]
+args = ["ls", "{fixture_copy}@1", "/"]
+expect_exit = 0
+stdout_contains = ["beos"]
+[[case.step]]
+args = ["put", "{fixture_copy}@1", "{cases}/tier3/payload.bin", "/payload.bin"]
+expect_exit = 0
+
+[[case]]
+id = "edit.new.dynamic-vhd-synthetic"
+description = "R-043 with no fixture at all: build a FAT volume, convert it to a dynamic VHD, write to it. The cheapest repro, and the one that will still exist when the fixtures do not."
+[[case.step]]
+args = ["new", "volume", "fat", "--size", "16M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["convert", "{scratch}/v.img", "{scratch}/dyn", "--format", "vhd-dynamic"]
+expect_exit = 0
+[[case.step]]
+# The control: a FIXED VHD accepts the same write, because it is raw data with
+# a trailing footer. Only the non-flat layout fails.
+args = ["convert", "{scratch}/v.img", "{scratch}/fixed", "--format", "vhd"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/fixed/v.vhd", "{cases}/tier3/payload.bin", "/p.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{scratch}/dyn/v.vhd", "/"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/dyn/v.vhd", "{cases}/tier3/payload.bin", "/p.bin"]
+expect_exit = 0

@@ -489,6 +489,7 @@ Admitted so far:
 |---------|-----:|------------------------------|
 | `fs.hfs.populated-macii.hd` | 20 MB | Real Mac II disk: APM + HFS, blessed `System 7.1.2` folder, type/creator codes on every file (`APPL`/`SITD`/`BTFL`), Desktop DB/DF, nested folders, a 1.5 MB StuffIt archive. Small enough for the core corpus. |
 | `fs.hfv.populated-macos81.hd` | 300 MB | Full Mac OS 8.1 install as a flat HFV. Annex. |
+| `fs.efs-v1.populated-irix37.multipart` | 5.6 MB | Real IRIX 3.7 / GL2-W3.6 on a 60 MB Priam V170, as an IRIS 3130. Byte-swapped SGI-DkLabel over two populated EFS v1 volumes: root and a 2754-file `/usr` with the `mex` window manager, Unix owner/permission bits throughout. Boots unattended under Motion, so the same image is the oracle's reference disk. |
 
 Available on the NAS but **not admitted** — too large to copy, fetch on
 demand if a case needs them: Win98 original disk (3.1 GB CHD), IRIX 5.3
@@ -497,10 +498,12 @@ Amiga 128 GB (21 GB), plus several G3/G4/G5 Mac clones under
 `VintageSystemBackups/`.
 
 **Still wanted in this class**, one per major editable filesystem: a
-populated **FAT32** (Win98-era), **ext**, **NTFS**, **AFFS** and **EFS**
-volume, each small enough to admit. The Win98 and IRIX images above are the
-right *content* at the wrong *size* — shrinking one of each is a better use
-of effort than sourcing new material.
+populated **FAT32** (Win98-era), **ext**, **NTFS** and **AFFS** volume, each
+small enough to admit. The Win98 image above is the right *content* at the
+wrong *size* — shrinking it is a better use of effort than sourcing new
+material. EFS v1 is now covered by `fs.efs-v1.populated-irix37.multipart`;
+IRIX 5.3 / 6.5 would still be the way to a populated **EFS** (the later
+format), which that fixture does not stand in for.
 
 The safety rule still applies: mutation cases always run on a scratch copy
 (`{fixture_copy}`), never on the corpus file.

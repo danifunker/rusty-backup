@@ -2857,8 +2857,15 @@ pub fn is_browsable_type(ptype: u8) -> bool {
             | 0xA0
             | 0xA1
             | 0xA2
+            // BSD / Solaris UFS slices; 0xA8 (Apple UFS) used to be the only one.
+            | 0xA5
+            | 0xA6
             | 0xA8
+            | 0xA9
             | 0xAF
+            | 0xBF
+            // BeOS BFS.
+            | 0xEB
     )
 }
 
@@ -2879,6 +2886,8 @@ pub fn is_browsable_type_string(type_str: Option<&str>) -> bool {
         "Apple_HFS"
             | "Apple_HFSX"
             | "Apple_HFS+"
+            // BeOS/PPC writes an APM whose BFS partitions carry "Be_BFS".
+            | "Be_BFS"
             | "Apple_UNIX_SVR2"
             | "Apple_UNIX_SRVR2"
             | "Apple_PRODOS"
@@ -2942,7 +2951,13 @@ pub fn is_browsable_superfloppy(ptype: u8, type_name: &str) -> bool {
             // table.
             | "squashfs"
             | "EFS"
+            // A bare EFS v1 volume names itself in full; "EFS" above is IRIX 5.3+.
+            | "SGI EFS v1"
             | "MFS"
+            // Bare BeOS and HPFS volumes; all three drivers read, edit and fsck.
+            | "BFS"
+            | "BeOS OFS"
+            | "HPFS"
             // Minix (raw floppy / hard-disk superfloppy); auto-detected at
             // byte 1024 by both detect_superfloppy and detect_filesystem_type.
             | "minix"
@@ -2983,8 +2998,59 @@ fn is_fat_name(name: &str) -> bool {
     name.to_ascii_lowercase().contains("fat")
 }
 
+/// Roles that never hold a filesystem: swap, boot, alternate-sector and
+/// replacement areas, and unassigned slots. Shared by all four disk labels.
+fn is_reserved_slice_role(role: &str) -> bool {
+    matches!(
+        role.trim().to_ascii_lowercase().as_str(),
+        "swap"
+            | "boot"
+            | "altsctr"
+            | "unassigned"
+            | "reserved"
+            | "backup"
+            | "volhdr"
+            | "trkrepl"
+            | "secrepl"
+            | "volume"
+            | "xfslog"
+            | "raw"
+    )
+}
+
+/// True for a slice of a Unix disk label (NeXT, Sun VTOC, Solaris x86 VTOC,
+/// SGI volume header) whose entries carry no type byte and no type string.
+pub fn is_browsable_scheme_slice(type_name: &str) -> bool {
+    // The role sits in the parentheses for NeXT and Solaris.
+    let paren_role = type_name.rfind('(').and_then(|i| {
+        type_name[i + 1..]
+            .find(')')
+            .map(|j| &type_name[i + 1..i + 1 + j])
+    });
+
+    if let Some(rest) = type_name.strip_prefix("Sun ") {
+        // "Sun <tag> (UFS?)" — the tag is before the parenthesis here.
+        let tag = rest.split(" (").next().unwrap_or("");
+        return !is_reserved_slice_role(tag);
+    }
+    if type_name.starts_with("Solaris s") || type_name.starts_with("NeXT ") {
+        return match paren_role {
+            Some(r) => !is_reserved_slice_role(r),
+            None => false,
+        };
+    }
+    if let Some(rest) = type_name.strip_prefix("SGI ") {
+        // "SGI BSD" (volume header) and "SGI swap" (disk label) both lead
+        // with the deciding word.
+        let head = rest.split(" (").next().unwrap_or("");
+        return !is_reserved_slice_role(head);
+    }
+    false
+}
+
 /// The combined "can this partition be opened in the browser?" gate — the OR of
-/// the type-byte, type-string, FAT-name fallback, and superfloppy-hint checks.
+/// the type-byte, type-string, FAT-name fallback, superfloppy-hint and
+/// disk-label-slice checks.
 /// This is the single predicate the Inspect grid and the Commander pane both
 /// call to decide whether to offer Browse (and, for Commander, whether to
 /// auto-open a partition at all).
@@ -2993,6 +3059,7 @@ pub fn partition_is_browsable(ptype: u8, type_string: Option<&str>, type_name: &
         || is_fat_name(type_name)
         || is_browsable_type_string(type_string)
         || is_browsable_superfloppy(ptype, type_name)
+        || is_browsable_scheme_slice(type_name)
 }
 
 /// True when a partition row is a classic-HFS **superfloppy** — a flat,
@@ -3696,6 +3763,97 @@ mod tests {
         // SFS reports its DosType and routes through `partition_type_string`,
         // exactly as an AmigaDOS superfloppy does.
         assert!(partition_is_browsable(0, Some("SFS\\0"), "SFS (Amiga)"));
+    }
+
+    /// Every shape the corpus produces for a filesystem we can open; see
+    /// OUTSTANDINGWORK.md section 8 for how the list was surveyed.
+    #[test]
+    fn every_openable_filesystem_offers_browse() {
+        // Bare volumes: no partition table, identified by name alone.
+        for name in [
+            "HPFS",
+            "BFS",
+            "BeOS OFS",
+            "SGI EFS v1",
+            "UFS",
+            "EFS",
+            "XFS",
+            "JFS",
+            "minix",
+            "ext",
+            "btrfs",
+            "NTFS",
+            "HFS",
+            "HFS+",
+            "APFS",
+            "FAT",
+            "ProDOS",
+            "exFAT",
+            "ReiserFS",
+            "squashfs",
+            "MFS",
+            "ucsd",
+        ] {
+            assert!(
+                partition_is_browsable(0, None, name),
+                "bare volume {name:?} must offer Browse"
+            );
+        }
+
+        // Partition-hosted, identified by type byte.
+        assert!(partition_is_browsable(0xEB, None, "BeOS BFS"));
+        assert!(partition_is_browsable(0xA5, None, "FreeBSD"));
+        assert!(partition_is_browsable(0xA9, None, "NetBSD"));
+        assert!(partition_is_browsable(0xBF, None, "Solaris"));
+
+        // Partition-hosted, identified by APM type string.
+        assert!(partition_is_browsable(
+            0,
+            Some("Be_BFS"),
+            "Be_BFS (untitled 2)"
+        ));
+
+        // Unix disk labels: no type byte, no type string, role in the name.
+        for name in [
+            "NeXT a (4.3BSD)",
+            "Sun root (UFS?)",
+            "Sun usr (UFS?)",
+            "Sun home (UFS?)",
+            "Solaris s0 (root)",
+            "SGI BSD",
+            "SGI root (EFS v1)",
+        ] {
+            assert!(
+                partition_is_browsable(0, None, name),
+                "label slice {name:?} must offer Browse"
+            );
+        }
+    }
+
+    /// The other half: rows that must NOT offer Browse. Swap is load-bearing —
+    /// it yields a carve view or a stale tree, never the volume asked for.
+    #[test]
+    fn reserved_and_container_rows_do_not_offer_browse() {
+        for name in [
+            "Sun swap (UFS?)",
+            "Solaris s1 (swap)",
+            "Solaris s8 (boot)",
+            "Solaris s9 (altsctr)",
+            "SGI swap",
+            "SGI SECREPL",
+            "SGI VOLHDR",
+            "SGI TRKREPL",
+        ] {
+            assert!(
+                !partition_is_browsable(0, None, name),
+                "reserved slice {name:?} must NOT offer Browse"
+            );
+        }
+        // Extended containers hold no filesystem of their own.
+        assert!(!partition_is_browsable(0x0F, None, "Extended (LBA)"));
+        assert!(!partition_is_browsable(0x05, None, "Extended"));
+        // QDOS microdrive has no directory walk yet, so Browse would error.
+        assert!(!partition_is_browsable(0, None, "qdos_mdv"));
     }
 
     #[test]

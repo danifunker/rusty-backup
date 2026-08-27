@@ -132,13 +132,19 @@ impl SgiPartitionType {
     }
 
     /// True if the partition is non-browse — disk-wide wrappers, swap/raw
-    /// regions, log volumes, and logical-volume manager wrappers. These are
-    /// filtered out of `PartitionTable::partitions()` per the plan in
-    /// `docs/SGI_Filesystems.md` Step 2.
+    /// regions, replacement areas, log volumes, and LVM wrappers. Filtered out
+    /// of `PartitionTable::partitions()` per `docs/SGI_Filesystems.md` Step 2.
     pub fn is_skipped_from_browse(self) -> bool {
         matches!(
             self,
-            Self::VolHdr | Self::Volume | Self::Raw | Self::XfsLog | Self::Xlv | Self::Xvm
+            Self::VolHdr
+                | Self::Volume
+                | Self::Raw
+                | Self::TrkRepl
+                | Self::SecRepl
+                | Self::XfsLog
+                | Self::Xlv
+                | Self::Xvm
         )
     }
 }

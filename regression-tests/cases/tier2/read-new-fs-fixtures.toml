@@ -1,0 +1,224 @@
+# Tier 2 — the BeOS / NeXT / Sun / SGI drop, and the IRIS 3130 disk.
+#
+# Nine fixtures landed on the NAS across 2026-08-23..25 and not one of them was
+# referenced by a case. They were extracted, named, checksummed, copied to two
+# machines and catalogued, and nothing looked at them.
+#
+# Same shallow contract as the other tier-2 files: open it, identify it, walk
+# the root, and ask fsck what it thinks. Depth belongs in tier 3, which uses a
+# {fixture_copy} because it mutates.
+#
+# THREE OF THESE VOLUMES ARE GENUINELY DAMAGED, and the cases say so with an
+# exact number rather than looking away:
+#
+#   fs.ofs.hobbit-1993        546 leaked sectors — BeOS deleted files without
+#                             freeing them, and the 1993 Hobbit prototype is
+#                             the only specimen of OFS v1 there is
+#   part.next.ns33-m68k       orphan inode 20654, present in the pristine image
+#   fs.bfs.ppc-bigendian @2   3 leaked blocks
+#
+# These are properties of third-party media, not defects of ours, so they are
+# asserted (exit 1 plus the count) rather than parked in known-failures.toml —
+# that file is for cases failing on a recorded bug of ours. Pinning the number
+# is the point: a reader that miscounts leaks turns the case red.
+#
+# Streams: the `Partition @N ...` banner goes to stderr; the inspect table, the
+# ls entries and the fsck findings go to stdout. Assert on stdout.
+
+[meta]
+tier = 2
+group = "fs.read.new-drop"
+description = "Open, identify, walk and fsck the nine fixtures from the BeOS/NeXT/Sun/SGI drop."
+
+# --- BeOS ----------------------------------------------------------------------
+
+[[case]]
+id = "read.ofs.hobbit-1993"
+description = "BeOS OFS v1 on a bare volume — no partition table at all. The only Hobbit-era specimen we have."
+fixture = "fs.ofs.hobbit-1993.hd"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["Partition table: None", "BeOS OFS"]
+[[case.step]]
+args = ["ls", "{fixture}", "/"]
+expect_exit = 0
+stdout_contains = ["Installer", "system", "apps"]
+[[case.step]]
+# Documented damage, not a regression: 546 sectors BeOS freed from the
+# directory tree but never returned to the bitmap.
+args = ["fsck", "{fixture}", "--checkonly"]
+expect_exit = 1
+stdout_contains = ["LeakedSectors", "546 sector(s)"]
+
+[[case]]
+id = "read.bfs.r5-intel"
+description = "BeOS R5 for Intel: MBR type 0xEB, little-endian BFS."
+fixture = "fs.bfs.r5-intel.hd"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["Partition table: MBR", "BeOS BFS"]
+[[case.step]]
+args = ["ls", "{fixture}@1", "/"]
+expect_exit = 0
+stdout_contains = ["beos", "apps", "develop"]
+[[case.step]]
+args = ["fsck", "{fixture}@1", "--checkonly"]
+expect_exit = 0
+stdout_contains = ["13301 files"]
+
+[[case]]
+id = "read.bfs.ppc-bigendian"
+description = "BeOS for PowerPC: an APM disk carrying HFS plus two BIG-ENDIAN BFS volumes. The only big-endian BFS we have, and no emulator exists that boots it."
+fixture = "fs.bfs.ppc-bigendian.multipart"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["Partition table: APM", "Apple_HFS", "Be_BFS"]
+[[case.step]]
+# The HFS volume on the same disk: proves the APM walk reaches every entry,
+# not just the ones we came for.
+args = ["ls", "{fixture}@1", "/"]
+expect_exit = 0
+stdout_contains = ["Apple Extras", "System Folder"]
+[[case.step]]
+args = ["ls", "{fixture}@2", "/"]
+expect_exit = 0
+stdout_contains = ["develop", "apps", "be"]
+[[case.step]]
+args = ["ls", "{fixture}@3", "/"]
+expect_exit = 0
+stdout_contains = ["beos", "apps", "demos"]
+[[case.step]]
+# Three leaked blocks in the pristine image — a live OS deleting files.
+args = ["fsck", "{fixture}@2", "--checkonly"]
+expect_exit = 1
+stdout_contains = ["LeakedBlocks", "3 block(s)"]
+[[case.step]]
+args = ["fsck", "{fixture}@3", "--checkonly"]
+expect_exit = 0
+stdout_contains = ["4402 files"]
+
+# --- NeXT ----------------------------------------------------------------------
+
+[[case]]
+id = "read.next.ns33-intel"
+description = "NeXTSTEP 3.3 for Intel: a NeXT disk label with NO MBR in front of it, over little-endian pre-4.4BSD UFS."
+fixture = "part.next.ns33-intel.hd"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["Partition table: NeXT", "NeXT a (4.3BSD)"]
+[[case.step]]
+args = ["ls", "{fixture}@1", "/"]
+expect_exit = 0
+stdout_contains = ["private", "usr", "lost+found"]
+[[case.step]]
+args = ["fsck", "{fixture}@1", "--checkonly"]
+expect_exit = 0
+stdout_contains = ["14476 files", "3037 dirs"]
+
+[[case]]
+id = "read.next.ns33-m68k"
+description = "NeXTSTEP 3.3 on m68k: same label scheme, BIG-endian UFS. Carries a pre-existing orphan inode."
+fixture = "part.next.ns33-m68k.hd"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["Partition table: NeXT", "NeXT a (4.3BSD)"]
+[[case.step]]
+args = ["ls", "{fixture}@1", "/"]
+expect_exit = 0
+stdout_contains = ["sdmach", "private", "usr"]
+[[case.step]]
+# Inode 20654 is unreachable in the pristine image. Confirmed against the
+# untouched original, not inferred from a failing run.
+args = ["fsck", "{fixture}@1", "--checkonly"]
+expect_exit = 1
+stdout_contains = ["OrphanInode", "20654"]
+
+# --- Sun / Solaris -------------------------------------------------------------
+
+[[case]]
+id = "read.sun.solaris24-sparc"
+description = "Solaris 2.4 SPARC: Sun SMI VTOC, four slices, big-endian UFS."
+fixture = "part.sun.solaris24-sparc.multipart"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["Partition table: Sun", "Sun root", "Sun usr"]
+[[case.step]]
+args = ["ls", "{fixture}@1", "/"]
+expect_exit = 0
+stdout_contains = ["export", "usr", "kernel"]
+[[case.step]]
+args = ["fsck", "{fixture}@1", "--checkonly"]
+expect_exit = 0
+stdout_contains = ["2259 files"]
+
+[[case]]
+id = "read.solaris-x86.solaris26-intel"
+description = "Solaris 2.6 x86 — the only NESTED table we have: an MBR type 0xBF whose partition contains a Solaris VTOC, over little-endian UFS."
+fixture = "part.solaris-x86.solaris26-intel.multipart"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["Partition table: Solaris-x86", "Solaris s0 (root)"]
+[[case.step]]
+args = ["ls", "{fixture}@1", "/"]
+expect_exit = 0
+stdout_contains = ["export", "usr", "etc"]
+[[case.step]]
+args = ["fsck", "{fixture}@1", "--checkonly"]
+expect_exit = 0
+stdout_contains = ["33559 files"]
+
+# --- SGI -----------------------------------------------------------------------
+
+[[case]]
+id = "read.sgi.riscos-mips"
+description = "MIPS RISC/os in a CHD: SGI volume header with nine populated slots, several of them deliberately overlapping, over UFS."
+fixture = "part.sgi.riscos-mips.multipart"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["Partition table: SGI", "SGI BSD"]
+[[case.step]]
+args = ["ls", "{fixture}@1", "/"]
+expect_exit = 0
+stdout_contains = ["usr", "etc", "lost+found"]
+[[case.step]]
+args = ["fsck", "{fixture}@1", "--checkonly"]
+expect_exit = 0
+stdout_contains = ["1251 files"]
+
+[[case]]
+id = "read.efs-v1.populated-irix37"
+description = "A real IRIX 3.7 / GL2-W3.6 IRIS 3130 disk: byte-swapped SGI-DkLabel over two populated EFS v1 volumes. Slot f repeats slot c's extent (a 3130 mounts /usr as si0f), so the browse list must show three slices, not four."
+fixture = "fs.efs-v1.populated-irix37.multipart"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+stdout_contains = [
+  "SGI-DkLabel (byte-swapped)",
+  "SGI root (EFS v1)",
+  "SGI swap",
+  "SGI slice (EFS v1)",
+]
+[[case.step]]
+args = ["ls", "{fixture}@1", "/"]
+expect_exit = 0
+stdout_contains = ["vmunix", "defaultboot", "kernels"]
+[[case.step]]
+args = ["ls", "{fixture}@3", "/"]
+expect_exit = 0
+stdout_contains = ["people", "games", "include"]
+[[case.step]]
+args = ["fsck", "{fixture}@1", "--checkonly"]
+expect_exit = 0
+stdout_contains = ["451 files"]
+[[case.step]]
+args = ["fsck", "{fixture}@3", "--checkonly"]
+expect_exit = 0
+stdout_contains = ["2580 files"]
