@@ -13,6 +13,12 @@ pub enum RustyBackupError {
     #[error("Cannot read the device: {0}")]
     DeviceRead(String),
 
+    /// Bytes arrived, but they are neither a partition table we know nor a
+    /// filesystem we can identify. Distinct from `InvalidMbr`: blaming the MBR
+    /// for a signatureless disc sends the reader after the wrong thing.
+    #[error("Unrecognized media: {0}")]
+    UnrecognizedMedia(String),
+
     #[error("Invalid GPT: {0}")]
     InvalidGpt(String),
 

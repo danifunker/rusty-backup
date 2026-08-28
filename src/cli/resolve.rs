@@ -15,6 +15,7 @@ use std::io::{Read, Seek};
 use crate::cli::backup_edit;
 use crate::cli::img_at::PartSelector;
 use crate::cli::io::{open_image_ro, open_image_rw};
+use crate::error::RustyBackupError;
 use crate::model::source_reader;
 use crate::partition::{PartitionInfo, PartitionTable};
 use crate::rbformats::{BoxReadSeek, BoxRwSeek};
@@ -696,7 +697,15 @@ fn resolve_with_override<R: Read + Seek>(
                     rebuild_budget: None,
                 });
             }
-            return Err(anyhow!("detecting partition table: {e}"));
+            // `UnrecognizedMedia` and `DeviceRead` already say what happened
+            // and what to do; prefixing them re-asserts the partition-table
+            // framing this error exists to get away from.
+            return Err(match e {
+                RustyBackupError::UnrecognizedMedia(_) | RustyBackupError::DeviceRead(_) => {
+                    anyhow!(e)
+                }
+                other => anyhow!("detecting partition table: {other}"),
+            });
         }
     };
     let partitions = pt.partitions();

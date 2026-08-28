@@ -192,25 +192,41 @@ fn read_first_sector<R: Read + Seek>(
     )))
 }
 
+/// Say what was actually tried when nothing identified the medium.
+///
+/// Every probe above has already declined, so the MBR is the last one standing
+/// and its "invalid boot signature" was being surfaced as the whole diagnosis.
+/// That reads as a corrupt partition table, which sends the reader hunting a
+/// detection regression; for a signatureless format (CP/M, several 8-bit
+/// floppies) there was never a table to be wrong. Name the situation and the
+/// way out — `--fs-type` — and keep the probe detail for anyone who wants it.
+fn unrecognized_media(size_bytes: u64, mbr_err: &RustyBackupError) -> RustyBackupError {
+    RustyBackupError::UnrecognizedMedia(format!(
+        "no partition table, and no filesystem signature at offset 0 ({size_bytes} bytes). \
+         Some formats carry no signature at all (CP/M and several 8-bit floppies) — \
+         open those with `--fs-type <fs>`. Probe detail: {mbr_err}"
+    ))
+}
+
+/// NOTE: keep this list NARROW. It is the escape hatch that turns an
+/// unrecognised floppy-sized image into a superfloppy instead of an MBR error,
+/// which also means any size listed here can be opened as an unidentified
+/// volume. Adding 180K (184320) made the signatureless Amstrad CP/M fixture
+/// open as a carve view, breaking `cli_cpm_floppy::ls_without_fs_type_still_
+/// errors_clearly` — which exists precisely to keep such a disc failing rather
+/// than being silently mis-opened. Widen only with that test in mind.
 fn is_floppy_size(size: u64) -> bool {
     matches!(
         size,
         143_360     // 5.25" 140K (35 tracks × 16 sectors × 256 bytes)
-        | 163_840   // 5.25" 160K SSDD (PC, 40 trk × 8 spt)
-        | 184_320   // 5.25" 180K SSDD (PC, 40 trk × 9 spt)
         | 255_488   // 8" SSSD CP/M data area (Altair `altair_8in` DPB: 2 reserved trk + 243 × 1024 B blocks)
         | 256_256   // 8" SSSD 256K (77 trk × 26 spt × 128 B) — MITS Altair / IBM 3740 CP/M (raw)
-        | 327_680   // 5.25" 320K DSDD (PC, 40 trk × 8 spt × 2)
-        | 368_640   // 5.25" 360K DSDD (PC, 40 trk × 9 spt × 2)
         | 409_600   // 3.5" 400K single-sided GCR
         | 819_200   // 3.5" 800K double-sided GCR
         | 737_280   // 3.5" 720K MFM (PC double-density)
         | 901_120   // 3.5" 880K Amiga DD (.adf)
-        | 1_228_800 // 5.25" 1.2MB MFM (PC high-density, 80 trk × 15 spt × 2)
         | 1_474_560 // 3.5" 1.44MB MFM (PC/Mac high-density)
-        | 1_720_320 // 3.5" 1.68MB DMF (Microsoft distribution media, 21 spt)
         | 1_802_240 // 3.5" 1.76MB Amiga HD (.adf)
-        | 2_949_120 // 3.5" 2.88MB MFM (PC extra-density, 36 spt)
     )
 }
 
@@ -1095,7 +1111,7 @@ impl PartitionTable {
                         fs_hint: "Unknown".to_string(),
                     });
                 }
-                return Err(e);
+                return Err(unrecognized_media(size_bytes, &e));
             }
         };
 
@@ -2965,5 +2981,42 @@ mod layout_expectation_tests {
         }
         assert!(!is_known_layout("mbrr"));
         assert!(!is_known_layout(""));
+    }
+}
+
+#[cfg(test)]
+mod unrecognized_media_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// Nothing identified the medium, so the diagnosis must say that — not
+    /// blame the MBR, which for a signatureless format was never there to be
+    /// wrong. Regression guard for the message that sent a user hunting a
+    /// detection regression that did not exist.
+    #[test]
+    fn unidentified_media_names_itself_and_offers_a_way_out() {
+        let mut img = vec![0x5Au8; 600 * 1024];
+        img[510] = 0x12;
+        img[511] = 0x34;
+        let err = PartitionTable::detect(&mut Cursor::new(img)).unwrap_err();
+        assert!(
+            matches!(err, RustyBackupError::UnrecognizedMedia(_)),
+            "expected UnrecognizedMedia, got {err:?}"
+        );
+        let text = err.to_string();
+        assert!(text.contains("no partition table"), "got: {text}");
+        assert!(text.contains("--fs-type"), "must offer the way out: {text}");
+    }
+
+    /// A whitelisted floppy size keeps its superfloppy fallback. Signatureless
+    /// discs of other sizes must still fail — `cli_cpm_floppy::
+    /// ls_without_fs_type_still_errors_clearly` depends on it.
+    #[test]
+    fn a_whitelisted_floppy_size_still_falls_back_to_superfloppy() {
+        let mut img = vec![0x5Au8; 1_474_560];
+        img[510] = 0x12;
+        img[511] = 0x34;
+        let table = PartitionTable::detect(&mut Cursor::new(img)).unwrap();
+        assert!(matches!(table, PartitionTable::None { .. }));
     }
 }
