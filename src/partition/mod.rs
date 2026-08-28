@@ -163,18 +163,54 @@ impl PartitionInfo {
 /// Images matching one of these sizes that lack both a recognized filesystem
 /// and a valid MBR/GPT signature are treated as superfloppies with an unknown
 /// filesystem rather than producing a confusing partition-table error.
+/// Read sector 0, retrying a transient device error before giving up.
+///
+/// Removable media — USB floppy drives especially — commonly fail the first
+/// read after the medium is inserted or the drive has spun down, and surface it
+/// as `EIO`. One retry costs nothing on a healthy device and turns an inspect
+/// that failed outright into one that succeeds.
+fn read_first_sector<R: Read + Seek>(
+    reader: &mut R,
+    buf: &mut [u8; 512],
+) -> Result<(), RustyBackupError> {
+    let mut last: Option<std::io::Error> = None;
+    for attempt in 0..3 {
+        if attempt > 0 {
+            let _ = reader.seek(SeekFrom::Start(0));
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        }
+        match reader.read_exact(buf) {
+            Ok(()) => return Ok(()),
+            Err(e) => last = Some(e),
+        }
+    }
+    let e = last.expect("loop runs at least once");
+    Err(RustyBackupError::DeviceRead(format!(
+        "cannot read the first sector after 3 attempts: {e}. \
+         The medium or drive refused the read — this is not a partition-table \
+         problem. Check the disk is inserted, readable and not still mounted."
+    )))
+}
+
 fn is_floppy_size(size: u64) -> bool {
     matches!(
         size,
         143_360     // 5.25" 140K (35 tracks × 16 sectors × 256 bytes)
+        | 163_840   // 5.25" 160K SSDD (PC, 40 trk × 8 spt)
+        | 184_320   // 5.25" 180K SSDD (PC, 40 trk × 9 spt)
         | 255_488   // 8" SSSD CP/M data area (Altair `altair_8in` DPB: 2 reserved trk + 243 × 1024 B blocks)
         | 256_256   // 8" SSSD 256K (77 trk × 26 spt × 128 B) — MITS Altair / IBM 3740 CP/M (raw)
+        | 327_680   // 5.25" 320K DSDD (PC, 40 trk × 8 spt × 2)
+        | 368_640   // 5.25" 360K DSDD (PC, 40 trk × 9 spt × 2)
         | 409_600   // 3.5" 400K single-sided GCR
         | 819_200   // 3.5" 800K double-sided GCR
         | 737_280   // 3.5" 720K MFM (PC double-density)
         | 901_120   // 3.5" 880K Amiga DD (.adf)
+        | 1_228_800 // 5.25" 1.2MB MFM (PC high-density, 80 trk × 15 spt × 2)
         | 1_474_560 // 3.5" 1.44MB MFM (PC/Mac high-density)
+        | 1_720_320 // 3.5" 1.68MB DMF (Microsoft distribution media, 21 spt)
         | 1_802_240 // 3.5" 1.76MB Amiga HD (.adf)
+        | 2_949_120 // 3.5" 2.88MB MFM (PC extra-density, 36 spt)
     )
 }
 
@@ -836,9 +872,11 @@ impl PartitionTable {
             .seek(SeekFrom::Start(0))
             .map_err(RustyBackupError::Io)?;
         let mut mbr_data = [0u8; 512];
-        reader
-            .read_exact(&mut mbr_data)
-            .map_err(|e| RustyBackupError::InvalidMbr(format!("cannot read first sector: {e}")))?;
+        // A failure here is the medium refusing to be read, not a bad table.
+        // Reporting it as "Invalid MBR" sent a user hunting a partition-table
+        // regression when the drive had returned EIO. Retry first: slow USB
+        // floppies routinely fail the first access after a spin-up.
+        read_first_sector(reader, &mut mbr_data)?;
 
         // Check for SGI Volume Header (IRIX) before MBR / APM. The 32-bit
         // big-endian magic 0x0BE5A941 at offset 0 is unambiguous — no MBR,

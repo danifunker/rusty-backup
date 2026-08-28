@@ -8,6 +8,11 @@ pub enum RustyBackupError {
     #[error("Invalid MBR: {0}")]
     InvalidMbr(String),
 
+    /// The medium could not be read at all. Distinct from `InvalidMbr`, which
+    /// means bytes arrived and did not parse.
+    #[error("Cannot read the device: {0}")]
+    DeviceRead(String),
+
     #[error("Invalid GPT: {0}")]
     InvalidGpt(String),
 
