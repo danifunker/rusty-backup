@@ -2907,7 +2907,10 @@ impl InspectTab {
                 let elevated = match rusty_backup::os::open_source_for_reading(&path) {
                     Ok(e) => e,
                     Err(e) => {
-                        finish_err(format!("Cannot open {}: {e}", path.display()));
+                        // `{e:#}` — the whole chain. `{e}` printed only the outermost
+                        // context, so "(authopen failed)" arrived with the reason it
+                        // failed discarded.
+                        finish_err(format!("Cannot open {}: {e:#}", path.display()));
                         return;
                     }
                 };

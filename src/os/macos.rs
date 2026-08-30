@@ -1457,9 +1457,30 @@ pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
             if flags == libc::O_RDONLY {
                 log::info!("{raw_device} still has a volume mounted; escalating read-only");
             }
-            let shared = cached_authopen(&raw_device, flags).with_context(|| {
-                format!("cannot open {} for reading (authopen failed)", raw_device)
-            })?;
+            // `busy` is unknowable here: the probe loop breaks on EACCES before
+            // it can learn whether the device is also busy, so a read-write
+            // request can be refused *after* the user has already authenticated
+            // — authopen authorises, then its own open(2) returns EBUSY and it
+            // exits non-zero. Reading is what was asked for, so fall back to
+            // read-only rather than failing outright.
+            let shared = match cached_authopen(&raw_device, flags) {
+                Ok(s) => s,
+                Err(e) if flags != libc::O_RDONLY => {
+                    log::warn!(
+                        "read-write escalation of {raw_device} failed ({e:#});                          retrying read-only"
+                    );
+                    cached_authopen(&raw_device, libc::O_RDONLY).with_context(|| {
+                        format!(
+                            "cannot open {raw_device} for reading: authopen was refused                              read-write and read-only. If a volume on this disk is still                              mounted, eject it in Finder and retry"
+                        )
+                    })?
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("cannot open {raw_device} for reading (authopen failed)")
+                    })
+                }
+            };
             return Ok(ElevatedSource {
                 file: super::SourceHandle::Device(shared),
                 temp_path: None,
