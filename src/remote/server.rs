@@ -1231,11 +1231,23 @@ fn handle_conn(
                 len,
             } => {
                 // The payload follows as a chunk stream and MUST be consumed
-                // regardless of handle validity, or the framing desyncs.
-                let mut payload = Vec::new();
-                let drained = read_chunks(&mut reader, &mut payload);
+                // regardless of handle validity, or the framing desyncs. Keep
+                // only what a legal write can carry; the rest drains and fails.
+                let mut sink = crate::remote::protocol::CappedSink::new(MAX_RANGE_WRITE as usize);
+                let drained = read_chunks(&mut reader, &mut sink);
+                let payload = sink.buf;
                 match drained {
                     Err(e) => return Err(anyhow!("reading WriteBlock payload: {e}")),
+                    Ok(_) if sink.dropped > 0 || len > MAX_RANGE_WRITE => reply_err(
+                        &mut writer,
+                        format!(
+                            "WriteBlock of {} byte(s) exceeds the {} byte limit",
+                            (payload.len() as u64)
+                                .saturating_add(sink.dropped)
+                                .max(len as u64),
+                            MAX_RANGE_WRITE
+                        ),
+                    )?,
                     Ok(_) => match block_handles.get_mut(&handle) {
                         None => reply_err(&mut writer, format!("no such block handle {handle}"))?,
                         Some(bh) if !bh.writable => {
@@ -1532,6 +1544,15 @@ mod optical_server {
             let Some(s) = self.session(handle) else {
                 return reply_err(writer, format!("no such optical handle {handle}"));
             };
+            if count > super::MAX_OPTICAL_SECTORS {
+                return reply_err(
+                    writer,
+                    format!(
+                        "{count} sectors asked at once; the limit is {}",
+                        super::MAX_OPTICAL_SECTORS
+                    ),
+                );
+            }
             match s.reader.read_data_sectors(lba, count, mode.into()) {
                 Ok(data) => {
                     // Commit to the stream: FileBegin{actual len} then the bytes.
@@ -1812,6 +1833,10 @@ fn stage_copy_local(
 /// hostile `len` can't make us allocate unbounded. The reader fetches in windows
 /// well under this; a larger ask is simply clamped.
 const MAX_RANGE_READ: u32 = 4 * 1024 * 1024;
+
+/// Most sectors one `ReadOpticalSectors` may ask for: the daemon reads them
+/// into memory before streaming, and a client batches far below this.
+const MAX_OPTICAL_SECTORS: u32 = 16 * 1024;
 
 /// Largest single `WriteBlock` payload we honour. The block writer splits big
 /// writes into frames well under this; a larger `len` is rejected rather than
