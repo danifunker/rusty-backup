@@ -2777,7 +2777,6 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
                 kind.label()
             )));
         }
-        let blocks_per_node = (node_size as u32 / block_size).max(1);
 
         // Grow by at least 8 nodes, rounded up to the fork's clump, to amortise
         // the work and keep per-`put` workloads from re-entering grow on every
@@ -2810,17 +2809,17 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
             )));
         }
         let add_slots = grow_nodes + u32::from(need_map);
-        let grow_blocks = add_slots * blocks_per_node;
-
+        let grow_blocks = btree_grow_blocks(total_nodes, add_slots, node_size, block_size);
         // Allocate volume blocks, preferring a contiguous tail extension so the
         // fork's last extent just gets longer.
-        let last_block = self.fork_last_inline_block(kind);
-        let new_extents = match self.allocate_contiguous_after(last_block, grow_blocks) {
-            Some(e) => vec![e],
-            None => self.allocate_extents(grow_blocks)?,
-        };
-
-        self.attach_extents_to_fork(kind, &new_extents)?;
+        if grow_blocks > 0 {
+            let last_block = self.fork_last_inline_block(kind);
+            let new_extents = match self.allocate_contiguous_after(last_block, grow_blocks) {
+                Some(e) => vec![e],
+                None => self.allocate_extents(grow_blocks)?,
+            };
+            self.attach_extents_to_fork(kind, &new_extents)?;
+        }
 
         // Extend the in-memory tree buffer and publish the new nodes. The added
         // bytes are zero, so the new node-bitmap bits read as free and
@@ -6194,6 +6193,16 @@ pub fn validate_hfsplus_integrity(
     Ok(())
 }
 
+/// Allocation blocks a B-tree fork of `total_nodes` needs to gain `add_slots`
+/// more nodes. Nodes and blocks need not match one-to-one: several 4 KiB nodes
+/// share an 8 KiB block, and the last block may already have room.
+fn btree_grow_blocks(total_nodes: u32, add_slots: u32, node_size: usize, block_size: u32) -> u32 {
+    let node_bytes = node_size as u64;
+    let cur_blocks = (total_nodes as u64 * node_bytes).div_ceil(block_size as u64);
+    let new_blocks = ((total_nodes + add_slots) as u64 * node_bytes).div_ceil(block_size as u64);
+    (new_blocks - cur_blocks) as u32
+}
+
 #[cfg(test)]
 #[allow(clippy::identity_op)] // `1usize * block_size` keeps offset rows aligned
 mod tests {
@@ -9062,6 +9071,22 @@ mod tests {
             }
         }
         assert_eq!(total as u32, N, "reopen lost files: {total} != {N}");
+    }
+
+    /// H8: with blocks larger than nodes a grow added one block per node,
+    /// twice (or four times) what the nodes occupy, on every grow.
+    #[test]
+    fn a_grow_allocates_the_blocks_the_new_nodes_occupy() {
+        // 4 KiB nodes in 8 KiB blocks: 8 nodes are 4 blocks, not 8.
+        assert_eq!(btree_grow_blocks(10, 8, 4096, 8192), 4);
+        // 1 KiB nodes in 4 KiB blocks: 8 nodes are 2 blocks.
+        assert_eq!(btree_grow_blocks(4, 8, 1024, 4096), 2);
+        // An odd node count leaves half a block of slack that the grow uses first.
+        assert_eq!(btree_grow_blocks(11, 8, 4096, 8192), 4);
+        assert_eq!(btree_grow_blocks(11, 1, 4096, 8192), 0);
+        // Nodes larger than blocks keep the old one-node-many-blocks answer.
+        assert_eq!(btree_grow_blocks(10, 8, 4096, 512), 64);
+        assert_eq!(btree_grow_blocks(10, 8, 4096, 4096), 8);
     }
 
     #[test]
