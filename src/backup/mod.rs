@@ -2028,7 +2028,7 @@ fn run_backup_inner(
             // Trim the stream to stream_size.  For layout-preserving readers this
             // drops the zero-filled free tail; for packed readers stream_size equals
             // the natural end of the stream so take() is a no-op.
-            let mut limited = compact_reader.take(stream_size);
+            let mut limited = LimitedReader::new(compact_reader.take(stream_size));
 
             log(
                 &progress,
@@ -2036,7 +2036,7 @@ fn run_backup_inner(
                 format!("Calling compress_partition for compacted {}", part_label),
             );
             let progress_log = Arc::clone(&progress);
-            crate::rbformats::compress_partition_hashed(
+            let files = crate::rbformats::compress_partition_hashed(
                 &mut limited,
                 &output_base,
                 effective_compression,
@@ -2055,7 +2055,9 @@ fn run_backup_inner(
                 &|| is_cancelled(&progress_clone),
                 &mut |msg| log(&progress_log, LogLevel::Info, msg),
             )
-            .with_context(|| format!("failed to compress {part_label}"))?
+            .with_context(|| format!("failed to compress {part_label}"))?;
+            warn_if_short(&progress, &part_label, stream_size, limited.delivered);
+            files
         } else {
             // Fall back to trim-based read
             log(
@@ -2084,7 +2086,7 @@ fn run_backup_inner(
                 format!("Calling compress_partition for trim-based {}", part_label),
             );
             let progress_log = Arc::clone(&progress);
-            crate::rbformats::compress_partition_hashed(
+            let files = crate::rbformats::compress_partition_hashed(
                 &mut limited,
                 &output_base,
                 effective_compression,
@@ -2103,7 +2105,9 @@ fn run_backup_inner(
                 &|| is_cancelled(&progress_clone),
                 &mut |msg| log(&progress_log, LogLevel::Info, msg),
             )
-            .with_context(|| format!("failed to compress {part_label}"))?
+            .with_context(|| format!("failed to compress {part_label}"))?;
+            warn_if_short(&progress, &part_label, image_size, limited.delivered);
+            files
         };
 
         // Log output file sizes for diagnostics
@@ -2622,20 +2626,45 @@ fn run_single_file_chd_path(
     Ok(())
 }
 
-/// A reader wrapper that limits reads to exactly `limit` bytes.
+/// Counts what the source actually delivered, so a short source is reported
+/// rather than passed off as the zero tail the archive declares.
 struct LimitedReader<R> {
     inner: R,
+    delivered: u64,
 }
-
 impl<R: Read> LimitedReader<R> {
     fn new(inner: R) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            delivered: 0,
+        }
     }
 }
-
 impl<R: Read> Read for LimitedReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.inner.read(buf)
+        let n = self.inner.read(buf)?;
+        self.delivered += n as u64;
+        Ok(n)
+    }
+}
+/// Log when a partition stream ended before its declared length; the archive
+/// still claims `expected` bytes and a restore will zero-fill the difference.
+fn warn_if_short(
+    progress: &Arc<Mutex<BackupProgress>>,
+    label: &str,
+    expected: u64,
+    delivered: u64,
+) {
+    if delivered < expected {
+        log(
+            progress,
+            LogLevel::Warning,
+            format!(
+                "{label}: source delivered {delivered} of {expected} bytes; the missing \
+                 {} bytes are recorded as zeros",
+                expected - delivered
+            ),
+        );
     }
 }
 
