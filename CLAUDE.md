@@ -31,6 +31,9 @@ Debug builds use `debug = "line-tables-only"` and cargo is capped at four jobs
 (`.cargo/config.toml`); a full-debuginfo, all-cores debug build of this tree
 gets the terminal session OOM-killed on a 16 GB machine. Do not override either
 setting, and never run two cargo builds at once. See `docs/build-memory-crashes.md`.
+When a debugger needs locals and types, force full debuginfo for that one run
+only: `CARGO_PROFILE_DEV_DEBUG=2 cargo build` (or `cargo test`). Never put
+`debug = 2` back into Cargo.toml.
 
 ## Build Infrastructure
 
