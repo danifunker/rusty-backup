@@ -1385,6 +1385,14 @@ fn run_single_file_chd_restore_as_is(
         bail!("restore cancelled");
     }
 
+    // The image overwrites LBA 0 onward, but a stale backup GPT at the END of
+    // a larger target would survive and still announce a GPT disk.
+    if metadata.partition_table_type != "GPT" && metadata.partition_table_type != "None" {
+        clear_gpt_structures(&mut target, config.target_size, &mut |msg| {
+            log(&progress, LogLevel::Info, msg);
+        })?;
+    }
+
     // Stream the CHD's logical bytes onto the target. 1 MiB chunks per the
     // I/O sizing guidance in CONTRIBUTING.md.
     set_operation(&progress, "Writing disk image...");
@@ -1565,6 +1573,13 @@ fn run_single_file_chd_restore_resize(
     let is_gpt = metadata.partition_table_type == "GPT";
     let is_apm = metadata.partition_table_type == "APM";
     let is_superfloppy = metadata.partition_table_type == "None";
+    // Same as the per-partition restore: an MBR / APM layout must not leave a
+    // stale GPT, primary or backup, on the target.
+    if !is_gpt && !is_superfloppy {
+        clear_gpt_structures(&mut target, config.target_size, &mut |msg| {
+            log(&progress, LogLevel::Info, msg);
+        })?;
+    }
 
     // Step 1: write the patched partition table at sector 0 (and APM
     // head / GPT primary as appropriate). The backup GPT goes at the
@@ -3041,13 +3056,21 @@ mod tests {
         let meta_path = backup_folder.join("metadata.json");
         std::fs::write(&meta_path, serde_json::to_string_pretty(&metadata).unwrap()).unwrap();
 
-        // Run restore to a target image file.
+        // Run restore to a target image file that is larger than the image and
+        // still carries a GPT from a previous life: primary at LBA 1 and the
+        // backup header in its last 33 sectors (BR10).
         let target_path = tmp.path().join("restored.img");
+        let target_bytes = total_bytes + 64 * 1024;
+        let mut stale = vec![0u8; target_bytes as usize];
+        stale[512..520].copy_from_slice(b"EFI PART");
+        let backup_hdr = (target_bytes - 33 * 512) as usize;
+        stale[backup_hdr..backup_hdr + 8].copy_from_slice(b"EFI PART");
+        std::fs::write(&target_path, &stale).unwrap();
         let cfg = RestoreConfig {
             backup_folder: backup_folder.clone(),
             target_path: target_path.clone(),
             target_is_device: false,
-            target_size: total_bytes,
+            target_size: target_bytes,
             alignment: RestoreAlignment::Original,
             partition_sizes: vec![],
             write_zeros_to_unused: false,
@@ -3057,8 +3080,16 @@ mod tests {
         assert!(progress.lock().unwrap().finished);
 
         let restored = std::fs::read(&target_path).unwrap();
-        assert_eq!(restored.len(), data.len(), "restored length mismatch");
-        assert_eq!(restored, data, "restored bytes must match source");
+        assert!(restored.len() >= data.len(), "restored length mismatch");
+        assert_eq!(
+            &restored[..data.len()],
+            &data[..],
+            "restored bytes must match source"
+        );
+        assert!(
+            restored[backup_hdr..].iter().all(|&b| b == 0),
+            "the stale backup GPT at the end of the target must be cleared"
+        );
     }
 
     /// Stage 5b round-trip: build a 4 MiB MBR-disk single-file CHD backup
