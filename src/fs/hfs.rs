@@ -1824,6 +1824,35 @@ impl<R: Read + Write + Seek> HfsFilesystem<R> {
         }
     }
 
+    /// Free a fork's extents-overflow blocks and drop its records; true if any.
+    fn free_fork_overflow(&mut self, file_id: u32, fork_type: u8) -> Result<bool, FilesystemError> {
+        self.ensure_extents_overflow()?;
+        let Some(data) = self.extents_overflow_data.as_ref() else {
+            return Ok(false);
+        };
+        let extents = collect_fork_overflow_extents(data, file_id, fork_type, 0);
+        for ext in &extents {
+            self.free_blocks(ext.start_block as u32, ext.block_count as u32);
+        }
+        let data = self.extents_overflow_data.as_mut().expect("loaded above");
+        Ok(remove_fork_overflow_records(data, file_id, fork_type) > 0)
+    }
+
+    /// Write the in-memory extents-overflow B-tree back to disk.
+    fn write_extents_overflow_back(&mut self) -> Result<(), FilesystemError> {
+        if let Some(data) = self.extents_overflow_data.as_ref() {
+            if self.mdb.extents_file_size > 0 {
+                write_extents_overflow_data(
+                    &mut self.reader,
+                    self.partition_offset,
+                    &self.mdb,
+                    data,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     /// Write file data to allocated blocks. Returns (start_block, block_count).
     fn write_data_to_blocks(
         &mut self,
@@ -3206,6 +3235,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
         entry: &FileEntry,
     ) -> Result<(), FilesystemError> {
         let snap = self.snapshot();
+        let extents_before = self.extents_overflow_data.clone();
         let result = (|| {
             let parent_id = parent.location as u32;
             let cnid = entry.location as u32;
@@ -3232,10 +3262,14 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
                 })?;
 
             // If it's a file, free its fork blocks
+            let mut overflow_changed = false;
             if !entry.is_directory() {
                 if let Some((_, data_extents, _, rsrc_extents)) = self.find_file_by_id(cnid) {
                     self.free_extent_blocks(&data_extents);
                     self.free_extent_blocks(&rsrc_extents);
+                    // A fork fragmented past three extents keeps the rest in the overflow tree.
+                    overflow_changed |= self.free_fork_overflow(cnid, 0x00)?;
+                    overflow_changed |= self.free_fork_overflow(cnid, 0xFF)?;
                 }
             }
 
@@ -3256,9 +3290,14 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
                 self.mdb.file_count = self.mdb.file_count.saturating_sub(1);
             }
 
+            if overflow_changed {
+                self.write_extents_overflow_back()?;
+            }
+
             Ok(())
         })();
         if result.is_err() {
+            self.extents_overflow_data = extents_before;
             self.restore_snapshot(snap);
         }
         result
@@ -3386,12 +3425,15 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
         len: u64,
     ) -> Result<(), FilesystemError> {
         let snap = self.snapshot();
+        let extents_before = self.extents_overflow_data.clone();
         let result = (|| {
             let cnid = entry.location as u32;
 
-            // Free existing resource fork blocks
+            // Free existing resource fork blocks, overflow records included
+            let mut overflow_changed = false;
             if let Some((_, _, _, rsrc_extents)) = self.find_file_by_id(cnid) {
                 self.free_extent_blocks(&rsrc_extents);
+                overflow_changed = self.free_fork_overflow(cnid, 0xFF)?;
             }
 
             // Allocate and write new resource fork
@@ -3432,9 +3474,14 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
             // Clear remaining rsrc extent slots
             self.catalog_data[frec_start + 90..frec_start + 98].fill(0);
 
+            if overflow_changed {
+                self.write_extents_overflow_back()?;
+            }
+
             Ok(())
         })();
         if result.is_err() {
+            self.extents_overflow_data = extents_before;
             self.restore_snapshot(snap);
         }
         result
@@ -3465,29 +3512,12 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
         // Write back repaired extents overflow B-tree if modified
         if let Some(ref ext_data) = extents_data {
             if self.mdb.extents_file_size > 0 {
-                let alloc_start = self.mdb.first_alloc_block as u64 * 512;
-                for (i, extent) in self.mdb.extents_file_extents.iter().enumerate() {
-                    if extent.block_count == 0 {
-                        break;
-                    }
-                    let block_off = self.partition_offset
-                        + alloc_start
-                        + extent.start_block as u64 * self.mdb.block_size as u64;
-                    let byte_len = extent.block_count as u64 * self.mdb.block_size as u64;
-                    let data_start = if i == 0 {
-                        0
-                    } else {
-                        self.mdb.extents_file_extents[..i]
-                            .iter()
-                            .map(|e| e.block_count as u64 * self.mdb.block_size as u64)
-                            .sum::<u64>() as usize
-                    };
-                    let data_end = (data_start + byte_len as usize).min(ext_data.len());
-                    if data_start < data_end {
-                        self.reader.seek(std::io::SeekFrom::Start(block_off))?;
-                        self.reader.write_all(&ext_data[data_start..data_end])?;
-                    }
-                }
+                write_extents_overflow_data(
+                    &mut self.reader,
+                    self.partition_offset,
+                    &self.mdb,
+                    ext_data,
+                )?;
             }
         }
 
@@ -3657,6 +3687,108 @@ fn read_fork_data<R: Read + Seek>(
 
     data.truncate(size as usize);
     Ok(data)
+}
+
+/// Remove every extents-overflow record of `(file_id, fork_type)`, freeing a
+/// leaf that empties; returns the number of records removed.
+fn remove_fork_overflow_records(extents_data: &mut [u8], file_id: u32, fork_type: u8) -> u32 {
+    use super::hfs_common::{
+        btree_detach_freed_node, btree_free_node, btree_remove_record, walk_leaf_records,
+        BTreeHeader,
+    };
+    if extents_data.len() < 512 {
+        return 0;
+    }
+    let header = BTreeHeader::read(extents_data);
+    let node_size = header.node_size as usize;
+    if node_size == 0 || extents_data.len() < node_size {
+        return 0;
+    }
+    let mut victims: Vec<(u32, usize)> = Vec::new();
+    walk_leaf_records::<(), _>(
+        extents_data,
+        header.first_leaf_node,
+        node_size,
+        |node_idx, rec_idx, _off, rec| {
+            // Key: keyLen(1) = 7, forkType(1), fileID(4), startBlock(2).
+            if rec.len() >= 8
+                && rec[0] >= 7
+                && rec[1] == fork_type
+                && BigEndian::read_u32(&rec[2..6]) == file_id
+            {
+                victims.push((node_idx, rec_idx));
+            }
+            None
+        },
+    );
+    if victims.is_empty() {
+        return 0;
+    }
+    // Highest record index first per node, so earlier indices stay valid.
+    victims.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+    for &(node_idx, rec_idx) in &victims {
+        let off = node_idx as usize * node_size;
+        btree_remove_record(&mut extents_data[off..off + node_size], node_size, rec_idx);
+    }
+    let mut h = BTreeHeader::read(extents_data);
+    h.leaf_records = h.leaf_records.saturating_sub(victims.len() as u32);
+    h.write(extents_data);
+    let mut nodes: Vec<u32> = victims.iter().map(|v| v.0).collect();
+    nodes.dedup();
+    for node_idx in nodes {
+        let off = node_idx as usize * node_size;
+        if BigEndian::read_u16(&extents_data[off + 10..off + 12]) != 0 {
+            continue;
+        }
+        // An emptied leaf leaves the sibling chain and the node map.
+        let flink = BigEndian::read_u32(&extents_data[off..off + 4]);
+        let blink = BigEndian::read_u32(&extents_data[off + 4..off + 8]);
+        if blink != 0 {
+            let b = blink as usize * node_size;
+            BigEndian::write_u32(&mut extents_data[b..b + 4], flink);
+        }
+        if flink != 0 {
+            let f = flink as usize * node_size;
+            BigEndian::write_u32(&mut extents_data[f + 4..f + 8], blink);
+        }
+        let mut h = BTreeHeader::read(extents_data);
+        if h.first_leaf_node == node_idx {
+            h.first_leaf_node = flink;
+        }
+        if h.last_leaf_node == node_idx {
+            h.last_leaf_node = blink;
+        }
+        h.free_nodes += 1;
+        h.write(extents_data);
+        btree_free_node(extents_data, node_size, node_idx);
+        btree_detach_freed_node(extents_data, node_size, node_idx);
+    }
+    victims.len() as u32
+}
+
+/// Write the extents-overflow B-tree back over the extents file's blocks.
+fn write_extents_overflow_data<W: std::io::Write + Seek>(
+    writer: &mut W,
+    partition_offset: u64,
+    mdb: &HfsMasterDirectoryBlock,
+    data: &[u8],
+) -> Result<(), FilesystemError> {
+    let alloc_start = partition_offset + mdb.first_alloc_block as u64 * 512;
+    let mut data_start = 0usize;
+    for extent in mdb.extents_file_extents.iter() {
+        if extent.block_count == 0 {
+            break;
+        }
+        let block_off = alloc_start + extent.start_block as u64 * mdb.block_size as u64;
+        let byte_len = extent.block_count as usize * mdb.block_size as usize;
+        let data_end = (data_start + byte_len).min(data.len());
+        if data_start < data_end {
+            writer.seek(std::io::SeekFrom::Start(block_off))?;
+            writer.write_all(&data[data_start..data_end])?;
+        }
+        data_start += byte_len;
+    }
+    Ok(())
 }
 
 /// Stream fork data through inline extents to a writer. Returns bytes written.
@@ -5776,6 +5908,84 @@ mod tests {
             "fsck errors: {:?}",
             result.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
         );
+    }
+
+    /// A fork fragmented past its three inline extents keeps the rest in the
+    /// extents-overflow tree; delete used to leak those blocks and records.
+    #[test]
+    fn delete_frees_overflow_extents_and_their_records() {
+        use super::hfs_common::{
+            bitmap_test_bit_be, btree_alloc_node, BTreeHeader, BTREE_LEAF_NODE,
+        };
+        // A formatted volume: the hand-built test image has no extents file.
+        let img = create_blank_hfs(8 * 1024 * 1024, 4096, "Overflow").unwrap();
+        let mut fs = HfsFilesystem::open(Cursor::new(img), 0).unwrap();
+        assert!(fs.mdb.extents_file_size > 0);
+        let root = fs.root().unwrap();
+        let free_at_start = fs.mdb.free_blocks;
+        let data = b"inline extent contents";
+        fs.create_file(
+            &root,
+            "frag.bin",
+            &mut Cursor::new(data.as_slice()),
+            data.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        let entry = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "frag.bin")
+            .unwrap();
+        let cnid = entry.location as u32;
+
+        // Give the data fork a fourth extent: two blocks described only by an
+        // overflow record, in a leaf the blank tree does not have yet.
+        let start = fs.allocate_blocks(2).unwrap();
+        fs.ensure_extents_overflow().unwrap();
+        {
+            let tree = fs.extents_overflow_data.as_mut().expect("extents tree");
+            let mut h = BTreeHeader::read(tree);
+            let node_size = h.node_size as usize;
+            let leaf = btree_alloc_node(tree, node_size, h.total_nodes).unwrap();
+            h.root_node = leaf;
+            h.first_leaf_node = leaf;
+            h.last_leaf_node = leaf;
+            h.depth = 1;
+            h.leaf_records = 1;
+            h.free_nodes -= 1;
+            h.write(tree);
+            let off = leaf as usize * node_size;
+            let node = &mut tree[off..off + node_size];
+            node[8] = BTREE_LEAF_NODE as u8;
+            node[9] = 1;
+            BigEndian::write_u16(&mut node[10..12], 1);
+            // Key: keyLen 7, data fork, this file, from its second block.
+            node[14] = 7;
+            node[15] = 0x00;
+            BigEndian::write_u32(&mut node[16..20], cnid);
+            BigEndian::write_u16(&mut node[20..22], 1);
+            BigEndian::write_u16(&mut node[22..24], start as u16);
+            BigEndian::write_u16(&mut node[24..26], 2);
+            BigEndian::write_u16(&mut node[node_size - 2..], 14);
+            BigEndian::write_u16(&mut node[node_size - 4..node_size - 2], 34);
+        }
+        let tree = fs.extents_overflow_data.as_ref().unwrap();
+        assert_eq!(collect_fork_overflow_extents(tree, cnid, 0x00, 0).len(), 1);
+
+        fs.delete_entry(&root, &entry).unwrap();
+
+        let tree = fs.extents_overflow_data.as_ref().unwrap();
+        assert!(collect_fork_overflow_extents(tree, cnid, 0x00, 0).is_empty());
+        let h = BTreeHeader::read(tree);
+        assert_eq!((h.leaf_records, h.root_node, h.depth), (0, 0, 0));
+        let bitmap = fs.bitmap.as_ref().unwrap();
+        assert!(!bitmap_test_bit_be(bitmap, start) && !bitmap_test_bit_be(bitmap, start + 1));
+        assert_eq!(fs.mdb.free_blocks, free_at_start, "every block came back");
+        fs.sync_metadata().unwrap();
+        let report = fs.fsck().unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
     }
 
     /// Synthesize a one-leaf extents-overflow B-tree blob and verify the
