@@ -750,11 +750,15 @@ fn run_per_partition(
                 let new_sectors = (export_size / 512) as u32;
                 let mut rw = OpenOptions::new().read(true).write(true).open(&dest_path)?;
                 let status_log = Arc::clone(status);
-                resize_fat_in_place(&mut rw, 0, new_sectors, &mut |msg| {
+                let patched = resize_fat_in_place(&mut rw, 0, new_sectors, &mut |msg| {
                     if let Ok(mut s) = status_log.lock() {
                         s.log_messages.push(msg.to_string());
                     }
                 })?;
+                if !patched {
+                    drop(rw);
+                    return refuse_unpatched_shrink(&dest_path, pm.index, export_size);
+                }
             }
 
             overall_written += export_size;
@@ -839,11 +843,16 @@ fn run_per_partition(
                 let new_sectors = (export_size / 512) as u32;
                 let fs_offset = if format == ExportFormat::TwoMg { 64 } else { 0 };
                 let status_log = Arc::clone(status);
-                resize_fat_in_place(writer.get_mut(), fs_offset, new_sectors, &mut |msg| {
-                    if let Ok(mut s) = status_log.lock() {
-                        s.log_messages.push(msg.to_string());
-                    }
-                })?;
+                let patched =
+                    resize_fat_in_place(writer.get_mut(), fs_offset, new_sectors, &mut |msg| {
+                        if let Ok(mut s) = status_log.lock() {
+                            s.log_messages.push(msg.to_string());
+                        }
+                    })?;
+                if !patched {
+                    drop(writer);
+                    return refuse_unpatched_shrink(&dest_path, part.index, export_size);
+                }
                 let end = if format == ExportFormat::TwoMg {
                     64 + total
                 } else {
@@ -865,4 +874,20 @@ fn run_per_partition(
     }
 
     Ok(())
+}
+
+/// A per-partition raw export can only shrink FAT in place; any other
+/// filesystem written short is a truncated volume, so remove it and say why.
+fn refuse_unpatched_shrink(
+    dest_path: &std::path::Path,
+    index: usize,
+    export_size: u64,
+) -> anyhow::Result<()> {
+    let _ = std::fs::remove_file(dest_path);
+    anyhow::bail!(
+        "partition-{index} is not a FAT volume: a raw per-partition export can only shrink \
+         FAT in place, so writing it at {} would cut data. Export it at its original size, \
+         or use Backup with shrink-to-minimum, which clones the volume instead.",
+        partition::format_size(export_size)
+    )
 }
