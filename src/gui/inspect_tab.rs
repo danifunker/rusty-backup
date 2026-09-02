@@ -374,6 +374,11 @@ impl InspectTab {
             || self.selected_device_idx.is_some()
     }
 
+    /// True while a remote inspect session owns the tab.
+    pub fn is_remote_session(&self) -> bool {
+        self.remote_inspect.is_some()
+    }
+
     /// Returns and clears the "user clicked Close Backup" signal. The App-level
     /// update loop calls this each frame to know when to clear the cross-tab
     /// `loaded_backup_folder` (which would otherwise re-open the backup via

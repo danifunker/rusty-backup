@@ -919,7 +919,12 @@ impl eframe::App for RustyBackupApp {
                     // open volume while in edit mode) — re-opening here would
                     // clobber the loaded source and make drag-to-add impossible.
                     Tab::Inspect => {
-                        if !self.inspect_tab.has_loaded_source() {
+                        if self.inspect_tab.is_remote_session() {
+                            self.log_panel.warn(format!(
+                                "Ignored dropped file {}: a remote session is open; close it first",
+                                path.display()
+                            ));
+                        } else if !self.inspect_tab.has_loaded_source() {
                             self.open_in_inspect(path);
                         }
                     }
