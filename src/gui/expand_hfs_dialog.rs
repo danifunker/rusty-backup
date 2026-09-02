@@ -92,158 +92,158 @@ impl ExpandHfsDialog {
         let mut pick_output_clicked = false;
 
         let mut window_open = self.open;
-        egui::Window::new("Expand HFS Volume...")
-            .open(&mut window_open)
-            .resizable(true)
-            .default_width(520.0)
-            .show(ctx, |ui| {
-                ui.label(egui::RichText::new("Source").strong());
-                ui.label(format!("Volume: {}", self.source.volume_name));
-                ui.label(format!(
-                    "Size: {} MiB ({} bytes)",
-                    self.source.partition_size / (1024 * 1024),
-                    self.source.partition_size
-                ));
-                ui.label(format!(
-                    "Allocation block size: {} KiB",
-                    self.source.source_block_size / 1024
-                ));
-                ui.label(format!(
-                    "Used: {} MiB across {} file(s) in {} folder(s)",
-                    self.source.used_bytes / (1024 * 1024),
-                    self.source.file_count,
-                    self.source.dir_count
-                ));
+        // No title-bar X while the worker runs: closing would orphan a thread
+        // that is still writing the output file.
+        let busy = status_snapshot
+            .as_ref()
+            .map(|(finished, _, _, _)| !*finished)
+            .unwrap_or(false);
+        let window = egui::Window::new("Expand HFS Volume...");
+        let window = if busy {
+            window
+        } else {
+            window.open(&mut window_open)
+        };
+        window.resizable(true).default_width(520.0).show(ctx, |ui| {
+            ui.label(egui::RichText::new("Source").strong());
+            ui.label(format!("Volume: {}", self.source.volume_name));
+            ui.label(format!(
+                "Size: {} MiB ({} bytes)",
+                self.source.partition_size / (1024 * 1024),
+                self.source.partition_size
+            ));
+            ui.label(format!(
+                "Allocation block size: {} KiB",
+                self.source.source_block_size / 1024
+            ));
+            ui.label(format!(
+                "Used: {} MiB across {} file(s) in {} folder(s)",
+                self.source.used_bytes / (1024 * 1024),
+                self.source.file_count,
+                self.source.dir_count
+            ));
 
-                ui.separator();
-                ui.label(egui::RichText::new("Target").strong());
+            ui.separator();
+            ui.label(egui::RichText::new("Target").strong());
 
-                let busy = status_snapshot
-                    .as_ref()
-                    .map(|(finished, _, _, _)| !*finished)
-                    .unwrap_or(false);
-
-                ui.add_enabled_ui(!busy && !self.completed, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Output format:");
-                        ui.radio_value(&mut self.output_hfv, false, "APM disk (.hda)");
-                        ui.radio_value(&mut self.output_hfv, true, "Bare HFS image (.hfv / .img)");
-                    });
-                    if self.output_hfv {
-                        ui.label(
-                            egui::RichText::new(
-                                "Bare classic-HFS volume with no partition table — mountable in \
+            ui.add_enabled_ui(!busy && !self.completed, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Output format:");
+                    ui.radio_value(&mut self.output_hfv, false, "APM disk (.hda)");
+                    ui.radio_value(&mut self.output_hfv, true, "Bare HFS image (.hfv / .img)");
+                });
+                if self.output_hfv {
+                    ui.label(
+                        egui::RichText::new(
+                            "Bare classic-HFS volume with no partition table — mountable in \
                                  BasiliskII / SheepShaver as `.hfv`, or usable as a raw single- \
                                  partition image. Capped at 2047 MB (classic HFS limit).",
-                            )
-                            .small()
-                            .italics(),
-                        );
-                    }
-
-                    ui.horizontal(|ui| {
-                        ui.label("Allocation block size:");
-                        egui::ComboBox::new("expand_hfs_bs", "")
-                            .selected_text(format!(
-                                "{} KiB (max {} MiB)",
-                                self.target_block_size / 1024,
-                                max_volume_for_block_size(self.target_block_size) / (1024 * 1024)
-                            ))
-                            .show_ui(ui, |ui| {
-                                for &bs in BLOCK_SIZE_CHOICES {
-                                    ui.selectable_value(
-                                        &mut self.target_block_size,
-                                        bs,
-                                        format!(
-                                            "{} KiB (max {} MiB)",
-                                            bs / 1024,
-                                            max_volume_for_block_size(bs) / (1024 * 1024)
-                                        ),
-                                    );
-                                }
-                            });
-                    });
-
-                    let mut max_mib_for_bs =
-                        (max_volume_for_block_size(self.target_block_size) / (1024 * 1024)) as u32;
-                    // A flat HFV must stay under the classic-HFS 2047 MB ceiling.
-                    if self.output_hfv {
-                        max_mib_for_bs = max_mib_for_bs.min(HFV_MAX_MIB);
-                    }
-                    let min_mib = (self.source.used_bytes.div_ceil(1024 * 1024)).max(1) as u32;
-                    if self.target_size_mib > max_mib_for_bs {
-                        self.target_size_mib = max_mib_for_bs;
-                    }
-                    if self.target_size_mib < min_mib {
-                        self.target_size_mib = min_mib;
-                    }
-
-                    ui.horizontal(|ui| {
-                        ui.label("Target size (MiB):");
-                        ui.add(egui::Slider::new(
-                            &mut self.target_size_mib,
-                            min_mib..=max_mib_for_bs,
-                        ));
-                    });
-
-                    ui.horizontal(|ui| {
-                        ui.label("Output file:");
-                        let path_text = self
-                            .output_path
-                            .as_ref()
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_else(|| "(not chosen)".to_string());
-                        ui.label(path_text);
-                        if ui.button("Save As...").clicked() {
-                            pick_output_clicked = true;
-                        }
-                    });
-                });
-
-                ui.separator();
-                if let Some((finished, step, msgs, error)) = &status_snapshot {
-                    if !*finished {
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.label(step);
-                        });
-                    } else if let Some(err) = error {
-                        ui.colored_label(
-                            super::theme::danger(ui.visuals()),
-                            format!("Failed: {err}"),
-                        );
-                    } else {
-                        ui.colored_label(super::theme::success(ui.visuals()), "Expand complete.");
-                    }
-                    if !msgs.is_empty() {
-                        egui::ScrollArea::vertical()
-                            .max_height(140.0)
-                            .id_salt("expand_hfs_log")
-                            .show(ui, |ui| {
-                                for m in msgs {
-                                    ui.label(m);
-                                }
-                            });
-                    }
+                        )
+                        .small()
+                        .italics(),
+                    );
                 }
 
                 ui.horizontal(|ui| {
-                    let can_start = !busy && !self.completed && self.output_path.is_some();
-                    if ui
-                        .add_enabled(can_start, egui::Button::new("Expand"))
-                        .clicked()
-                    {
-                        start_clicked = true;
-                    }
-                    let close_label = if self.completed { "Close" } else { "Cancel" };
-                    if ui
-                        .add_enabled(!busy, egui::Button::new(close_label))
-                        .clicked()
-                    {
-                        close_clicked = true;
+                    ui.label("Allocation block size:");
+                    egui::ComboBox::new("expand_hfs_bs", "")
+                        .selected_text(format!(
+                            "{} KiB (max {} MiB)",
+                            self.target_block_size / 1024,
+                            max_volume_for_block_size(self.target_block_size) / (1024 * 1024)
+                        ))
+                        .show_ui(ui, |ui| {
+                            for &bs in BLOCK_SIZE_CHOICES {
+                                ui.selectable_value(
+                                    &mut self.target_block_size,
+                                    bs,
+                                    format!(
+                                        "{} KiB (max {} MiB)",
+                                        bs / 1024,
+                                        max_volume_for_block_size(bs) / (1024 * 1024)
+                                    ),
+                                );
+                            }
+                        });
+                });
+
+                let mut max_mib_for_bs =
+                    (max_volume_for_block_size(self.target_block_size) / (1024 * 1024)) as u32;
+                // A flat HFV must stay under the classic-HFS 2047 MB ceiling.
+                if self.output_hfv {
+                    max_mib_for_bs = max_mib_for_bs.min(HFV_MAX_MIB);
+                }
+                let min_mib = (self.source.used_bytes.div_ceil(1024 * 1024)).max(1) as u32;
+                if self.target_size_mib > max_mib_for_bs {
+                    self.target_size_mib = max_mib_for_bs;
+                }
+                if self.target_size_mib < min_mib {
+                    self.target_size_mib = min_mib;
+                }
+
+                ui.horizontal(|ui| {
+                    ui.label("Target size (MiB):");
+                    ui.add(egui::Slider::new(
+                        &mut self.target_size_mib,
+                        min_mib..=max_mib_for_bs,
+                    ));
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Output file:");
+                    let path_text = self
+                        .output_path
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "(not chosen)".to_string());
+                    ui.label(path_text);
+                    if ui.button("Save As...").clicked() {
+                        pick_output_clicked = true;
                     }
                 });
             });
+
+            ui.separator();
+            if let Some((finished, step, msgs, error)) = &status_snapshot {
+                if !*finished {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(step);
+                    });
+                } else if let Some(err) = error {
+                    ui.colored_label(super::theme::danger(ui.visuals()), format!("Failed: {err}"));
+                } else {
+                    ui.colored_label(super::theme::success(ui.visuals()), "Expand complete.");
+                }
+                if !msgs.is_empty() {
+                    egui::ScrollArea::vertical()
+                        .max_height(140.0)
+                        .id_salt("expand_hfs_log")
+                        .show(ui, |ui| {
+                            for m in msgs {
+                                ui.label(m);
+                            }
+                        });
+                }
+            }
+
+            ui.horizontal(|ui| {
+                let can_start = !busy && !self.completed && self.output_path.is_some();
+                if ui
+                    .add_enabled(can_start, egui::Button::new("Expand"))
+                    .clicked()
+                {
+                    start_clicked = true;
+                }
+                let close_label = if self.completed { "Close" } else { "Cancel" };
+                if ui
+                    .add_enabled(!busy, egui::Button::new(close_label))
+                    .clicked()
+                {
+                    close_clicked = true;
+                }
+            });
+        });
         self.open = window_open;
 
         if pick_output_clicked {
