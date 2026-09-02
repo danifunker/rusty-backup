@@ -4355,17 +4355,32 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
             new_fn_value[8..40].copy_from_slice(&times);
         }
 
-        // 1) Rewrite the child's $FILE_NAME in place (grow/shrink), preserving
-        //    the record's sequence number, link count, and every other attribute.
+        // 1) Drop every $FILE_NAME this parent knows the entry by, the Win32
+        //    name and any DOS alias, and put the one new name in their place.
         let child_seq = u16::from_le_bytes([record[0x10], record[0x11]]);
+        let names = file_name_attrs(&record);
+        let ours = Self::names_for(&names, parent_record_num, &entry.name);
+        if ours.is_empty() {
+            self.remove_index_entry(parent_record_num, &entry.name)?;
+        }
+        for &i in &ours {
+            self.remove_alias_or_name(parent_record_num, &names[i])?;
+        }
+        let insert_at = ours.first().map(|&i| names[i].pos);
+        for &i in ours.iter().rev() {
+            remove_attr_at(&mut record, names[i].pos)?;
+        }
         let new_attr = build_resident_attr(ATTR_FILE_NAME, &new_fn_value);
-        replace_resident_attr(&mut record, ATTR_FILE_NAME, &new_attr)?;
+        match insert_at {
+            Some(pos) => insert_attr_at(&mut record, pos, &new_attr)?,
+            None => replace_resident_attr(&mut record, ATTR_FILE_NAME, &new_attr)?,
+        }
+        let links = (names.len() - ours.len() + 1) as u16;
+        record[0x12..0x14].copy_from_slice(&links.to_le_bytes());
         self.write_mft_record(record_number, &mut record)?;
 
-        // 2) Re-key the parent index entry (remove old name, insert new). The
-        //    index entry's MFT reference must carry the child's real sequence
-        //    number, not a hardcoded 1.
-        self.remove_index_entry(parent_record_num, &entry.name)?;
+        // 2) Key the parent index by the new name. The entry's MFT reference
+        //    must carry the child's real sequence number, not a hardcoded 1.
         let index_entry = build_index_entry(record_number, child_seq, &new_fn_value);
         self.insert_index_entry(parent_record_num, &index_entry)?;
 
@@ -5365,6 +5380,94 @@ mod tests {
         fs.delete_entry(&root, &dir_entry).unwrap();
         let root = fs.root().unwrap();
         assert!(fs.list_directory(&root).unwrap().is_empty());
+    }
+
+    /// D12: a file Windows gave both a long and a DOS name kept the stale
+    /// alias, attribute and index entry, after a rename.
+    #[test]
+    fn rename_replaces_every_name_the_entry_had() {
+        let cur = format_test_volume(512, 256);
+        let mut fs = NtfsFilesystem::open(cur, 0).unwrap();
+        let root = fs.root().unwrap();
+        put_file(&mut fs, &root, "LongFileName.txt", b"payload");
+        let entry = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "LongFileName.txt")
+            .unwrap();
+
+        // Graft a DOS alias the way Windows stores one: a second $FILE_NAME
+        // (namespace 2) with its own index entry, and a link count of 2.
+        let rec_no = entry.location;
+        let mut record = fs.read_mft_record(rec_no).unwrap();
+        let names = file_name_attrs(&record);
+        assert_eq!(names.len(), 1);
+        let parent_ref = fs.file_reference(MFT_RECORD_ROOT);
+        let mut alias = build_file_name_attr(
+            parent_ref,
+            "LONGFI~1.TXT",
+            false,
+            entry.size,
+            now_ntfs_timestamp(),
+        );
+        alias[0x41] = 2;
+        let p = names[0].pos;
+        let first_len =
+            u32::from_le_bytes([record[p + 4], record[p + 5], record[p + 6], record[p + 7]])
+                as usize;
+        insert_attr_at(
+            &mut record,
+            p + first_len,
+            &build_resident_attr(ATTR_FILE_NAME, &alias),
+        )
+        .unwrap();
+        record[0x12..0x14].copy_from_slice(&2u16.to_le_bytes());
+        let seq = u16::from_le_bytes([record[0x10], record[0x11]]);
+        fs.write_mft_record(rec_no, &mut record).unwrap();
+        fs.insert_index_entry(MFT_RECORD_ROOT, &build_index_entry(rec_no, seq, &alias))
+            .unwrap();
+        assert_eq!(
+            file_name_attrs(&fs.read_mft_record(rec_no).unwrap()).len(),
+            2
+        );
+
+        let root = fs.root().unwrap();
+        fs.rename(&root, &entry, "Renamed.txt").unwrap();
+        verify_directory_index(&mut fs, MFT_RECORD_ROOT);
+
+        let record = fs.read_mft_record(rec_no).unwrap();
+        let names = file_name_attrs(&record);
+        let seen: Vec<(String, u8)> = names
+            .iter()
+            .map(|n| (n.name.clone(), n.namespace))
+            .collect();
+        assert_eq!(names.len(), 1, "one name after rename: {seen:?}");
+        assert_eq!(names[0].name, "Renamed.txt");
+        assert_eq!(
+            u16::from_le_bytes([record[0x12], record[0x13]]),
+            1,
+            "link count"
+        );
+        let listing: Vec<String> = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(listing.iter().any(|n| n == "Renamed.txt"), "{listing:?}");
+        assert!(
+            !listing
+                .iter()
+                .any(|n| n == "LongFileName.txt" || n == "LONGFI~1.TXT"),
+            "{listing:?}"
+        );
+        assert!(!fs
+            .name_exists_in_index(MFT_RECORD_ROOT, "LONGFI~1.TXT")
+            .unwrap());
+        assert!(!fs
+            .name_exists_in_index(MFT_RECORD_ROOT, "LongFileName.txt")
+            .unwrap());
     }
 
     #[test]
