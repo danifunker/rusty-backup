@@ -157,6 +157,16 @@ pub fn run_single_partition_restore(
                 ),
             );
 
+            // The recorded checksum is the only defence against a damaged
+            // member, and the target has not been opened yet.
+            set_operation(&progress, "Verifying backup checksum...");
+            crate::backup::verify::verify_partition_member(
+                folder,
+                &metadata.checksum_type,
+                pm,
+                &mut |m| log(&progress, LogLevel::Info, m),
+            )?;
+
             (
                 pm.imaged_size_bytes,
                 metadata.compression_type.clone(),

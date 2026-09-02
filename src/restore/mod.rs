@@ -847,6 +847,13 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
         }
     }
 
+    // Step 2b: the recorded checksums are the only defence against a damaged
+    // backup, and nothing on the target has been touched yet.
+    set_operation(&progress, "Verifying backup checksums...");
+    crate::backup::verify::verify_partition_files(&config.backup_folder, &metadata, &mut |m| {
+        log(&progress, LogLevel::Info, m)
+    })?;
+
     if is_cancelled(&progress) {
         bail!("restore cancelled");
     }
