@@ -98,12 +98,13 @@ pub(crate) fn parse_vbr(vbr: &[u8; 512]) -> Result<NtfsVbr, FilesystemError> {
     ]);
 
     // Clusters per MFT record: if negative, record size = 2^|value| bytes
-    let clusters_per_mft_raw = vbr[0x40] as i8;
-    let mft_record_size = if clusters_per_mft_raw < 0 {
-        1u32 << ((-clusters_per_mft_raw) as u32)
-    } else {
-        clusters_per_mft_raw as u32 * sectors_per_cluster as u32 * bytes_per_sector as u32
-    };
+    let cluster_bytes = sectors_per_cluster as u32 * bytes_per_sector as u32;
+    let mft_record_size = mft_record_bytes(vbr[0x40] as i8, cluster_bytes).ok_or_else(|| {
+        FilesystemError::Parse(format!(
+            "NTFS: clusters-per-MFT-record byte 0x{:02X} is not a valid record size",
+            vbr[0x40]
+        ))
+    })?;
 
     // Clusters per index record at 0x44: same signed encoding as 0x40.
     let clusters_per_index_raw = vbr[0x44] as i8;
@@ -158,6 +159,22 @@ pub(crate) struct DataRun {
     pub(crate) sparse: bool,
 }
 
+/// MFT record size from the boot sector's clusters-per-record byte: a negative
+/// value is a power-of-two shift, a positive one a cluster count. Anything
+/// outside 256 bytes to 1 MiB is damaged media, not a record size.
+pub(crate) fn mft_record_bytes(raw: i8, cluster_bytes: u32) -> Option<u32> {
+    let size = if raw < 0 {
+        let shift = (-(raw as i32)) as u32;
+        if !(8..=20).contains(&shift) {
+            return None;
+        }
+        1u32 << shift
+    } else {
+        (raw as u32).checked_mul(cluster_bytes)?
+    };
+    ((256..=1 << 20).contains(&size) && size.is_power_of_two()).then_some(size)
+}
+
 /// Decode data runs from an MFT attribute's non-resident data.
 pub(crate) fn decode_data_runs(data: &[u8]) -> Vec<DataRun> {
     let mut runs = Vec::new();
@@ -173,8 +190,11 @@ pub(crate) fn decode_data_runs(data: &[u8]) -> Vec<DataRun> {
 
         let length_size = (header & 0x0F) as usize;
         let offset_size = ((header >> 4) & 0x0F) as usize;
-
-        if length_size == 0 || pos + length_size + offset_size > data.len() {
+        // A nibble above 8 cannot be a real run (the shift below would overflow).
+        if length_size == 0 || length_size > 8 || offset_size > 8 {
+            break;
+        }
+        if pos + length_size + offset_size > data.len() {
             break;
         }
 
@@ -1121,8 +1141,8 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
                 break;
             }
 
-            // Parse $FILE_NAME content if present
-            if content_length >= 66 {
+            // Parse $FILE_NAME content if present; a length past the entry is damage.
+            if content_length >= 66 && 16 + content_length <= entry_length {
                 let content = &data[pos + 16..pos + 16 + content_length];
                 // The file's own MFT reference is at the start of the index entry
                 let mft_ref = u64::from_le_bytes([
@@ -4720,11 +4740,12 @@ pub fn resize_ntfs_in_place(
         vbr[0x30], vbr[0x31], vbr[0x32], vbr[0x33], vbr[0x34], vbr[0x35], vbr[0x36], vbr[0x37],
     ]);
 
-    let clusters_per_mft_raw = vbr[0x40] as i8;
-    let mft_record_size = if clusters_per_mft_raw < 0 {
-        1u32 << ((-clusters_per_mft_raw) as u32)
-    } else {
-        clusters_per_mft_raw as u32 * sectors_per_cluster as u32 * bytes_per_sector as u32
+    let cluster_bytes = sectors_per_cluster as u32 * bytes_per_sector as u32;
+    let Some(mft_record_size) = mft_record_bytes(vbr[0x40] as i8, cluster_bytes) else {
+        anyhow::bail!(
+            "NTFS: clusters-per-MFT-record byte 0x{:02X} is not a valid record size",
+            vbr[0x40]
+        );
     };
 
     // Try to read $Bitmap to check last used cluster
@@ -4859,11 +4880,12 @@ pub fn validate_ntfs_integrity(
         vbr[0x30], vbr[0x31], vbr[0x32], vbr[0x33], vbr[0x34], vbr[0x35], vbr[0x36], vbr[0x37],
     ]);
 
-    let clusters_per_mft_raw = vbr[0x40] as i8;
-    let mft_record_size = if clusters_per_mft_raw < 0 {
-        1u32 << ((-clusters_per_mft_raw) as u32)
-    } else {
-        clusters_per_mft_raw as u32 * sectors_per_cluster as u32 * bytes_per_sector as u32
+    let cluster_bytes = sectors_per_cluster as u32 * bytes_per_sector as u32;
+    let Some(mft_record_size) = mft_record_bytes(vbr[0x40] as i8, cluster_bytes) else {
+        anyhow::bail!(
+            "NTFS: clusters-per-MFT-record byte 0x{:02X} is not a valid record size",
+            vbr[0x40]
+        );
     };
 
     // Verify MFT record #0 ($MFT) is readable
@@ -5001,6 +5023,27 @@ mod tests {
         assert_eq!(parsed.mft_record_size, 1024);
         // 0x44 is zero in this fixture; the parser falls back to 4096.
         assert_eq!(parsed.index_record_size, 4096);
+    }
+
+    /// D17: a zeroed or absurd clusters-per-record byte reached shifts and
+    /// zero-sized buffers and panicked instead of failing to open.
+    #[test]
+    fn damaged_record_size_and_run_headers_fail_cleanly() {
+        for raw in [0x00u8, 0x80, 0x01, 0x7F, 0xFF] {
+            let mut vbr = make_ntfs_vbr();
+            vbr[0x40] = raw;
+            let res = parse_vbr(&vbr);
+            if raw == 0x01 {
+                assert_eq!(res.unwrap().mft_record_size, 4096, "one 4 KiB cluster");
+            } else {
+                assert!(res.is_err(), "byte 0x{raw:02X} must be rejected");
+            }
+        }
+        assert_eq!(mft_record_bytes(-10, 4096), Some(1024));
+        assert_eq!(mft_record_bytes(3, 4096), None, "not a power of two");
+        // A run header whose nibbles claim 15-byte fields.
+        assert!(decode_data_runs(&[0xFF, 1, 2, 3]).is_empty());
+        assert!(decode_data_runs(&[0x9F, 1, 2, 3, 4, 5, 6, 7, 8, 9]).is_empty());
     }
 
     #[test]
