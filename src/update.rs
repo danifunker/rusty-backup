@@ -313,6 +313,31 @@ pub struct UpdateInfo {
     pub cli_asset_url: Option<String>,
 }
 
+/// Whether `latest` (a release tag) is newer than `current` (this build); a
+/// `-dev` build is never outdated, so `update --apply` cannot downgrade it.
+pub fn release_is_newer(latest: &str, current: &str) -> bool {
+    let latest = latest.trim_start_matches('v');
+    let current = current.trim_start_matches('v');
+    if latest == current {
+        return false;
+    }
+    // A development build is ahead of every release by definition.
+    if current.ends_with("-dev") {
+        return false;
+    }
+    let numeric = |s: &str| -> Option<Vec<u64>> {
+        s.split('.')
+            .map(|part| part.parse::<u64>().ok())
+            .collect::<Option<Vec<u64>>>()
+    };
+    match (numeric(latest), numeric(current)) {
+        // Date tags (`YYYYMMDDHHMM`) and dotted versions both order numerically.
+        (Some(l), Some(c)) => l > c,
+        // Unparseable on either side: fall back to "different means newer".
+        _ => true,
+    }
+}
+
 /// Check for updates from GitHub releases.
 ///
 /// Uses reqwest, so it's gated on `gui` / `tui-update`. A plain-`tui` build
@@ -335,7 +360,7 @@ pub fn check_for_updates(
     let latest_version = release.tag_name.trim_start_matches('v').to_string();
     let current = current_version.trim_start_matches('v');
 
-    let is_outdated = latest_version != current;
+    let is_outdated = release_is_newer(&latest_version, current);
 
     // Match the GUI ZIP + CLI asset for this arch so the GUI can offer an
     // in-app update. Naming is set by .github/workflows/release.yml:
@@ -718,6 +743,20 @@ mod cli_update_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_is_newer_orders_tags_and_spares_dev_builds() {
+        // Date tags order numerically, and equal means up to date.
+        assert!(release_is_newer("202609011200", "202608311200"));
+        assert!(!release_is_newer("202608311200", "202609011200"));
+        assert!(!release_is_newer("v202609011200", "202609011200"));
+        // Dotted versions the same way.
+        assert!(release_is_newer("0.2.0", "0.1.9"));
+        assert!(!release_is_newer("0.1.9", "0.2.0"));
+        // A -dev build is never "outdated" (the old check offered a downgrade).
+        assert!(!release_is_newer("202609011200", "0.1.0-dev"));
+        assert!(!release_is_newer("202609011200", "202609020000-dev"));
+    }
 
     #[test]
     fn remember_daemon_is_mru_deduped_capped() {
