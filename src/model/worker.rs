@@ -48,6 +48,24 @@ pub fn spawn_guarded<S: WorkerStatus + Send + 'static>(
     std::thread::spawn(move || run_guarded(&status, what, body))
 }
 
+/// Relay a cancel from one flag to another until `done`: for a step that
+/// runs with its own private progress object the GUI's Cancel never touches.
+pub fn forward_cancel(
+    is_cancelled: impl Fn() -> bool + Send + 'static,
+    done: Arc<std::sync::atomic::AtomicBool>,
+    set_cancel: impl Fn() + Send + 'static,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        while !done.load(std::sync::atomic::Ordering::Relaxed) {
+            if is_cancelled() {
+                set_cancel();
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    })
+}
+
 fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
         (*s).to_string()
