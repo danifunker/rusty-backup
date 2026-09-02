@@ -169,6 +169,8 @@ pub struct BrowseView {
     pending_tree: Option<Arc<Mutex<TreeStatus>>>,
     /// Queued edit operations awaiting "Apply Edits".
     staged_edits: EditQueue,
+    /// Free space of the editable volume: None = not probed, Some(None) = unavailable.
+    edit_free_space: Option<Option<u64>>,
     /// The SquashFS size-budget dialog, open only between clicking Edit Mode on
     /// a SquashFS volume and choosing a ceiling. See
     /// [`super::squashfs_budget_dialog`].
@@ -458,6 +460,7 @@ impl Default for BrowseView {
             tree_show_ids: false,
             show_tree_large_dialog: false,
             staged_edits: EditQueue::new(),
+            edit_free_space: None,
             show_unsaved_dialog: false,
             conflict_review: None,
             text_editor: None,
@@ -697,6 +700,7 @@ impl BrowseView {
 
     pub fn close(&mut self) {
         self.root = None;
+        self.edit_free_space = None;
         self.directory_cache.clear();
         self.expanded_paths.clear();
         self.selected_entry = None;
@@ -2425,6 +2429,7 @@ impl BrowseView {
 
         // Disable edit mode immediately
         self.edit_mode = false;
+        self.edit_free_space = None;
         self.edit_result = None;
         self.show_new_folder_dialog = false;
         self.pending_delete = None;
@@ -2480,6 +2485,7 @@ impl BrowseView {
                 self.session.source_path = Some(temp);
                 self.session.zstd_cache = None;
                 self.edit_mode = true;
+                self.edit_free_space = None;
 
                 // Re-open filesystem from temp file. Invalidate the cache
                 // first because the source bytes have changed.
@@ -2624,6 +2630,7 @@ impl BrowseView {
             diff_path,
         });
         self.edit_mode = true;
+        self.edit_free_space = None;
 
         // Reload the filesystem through the session so any pre-existing
         // diff content is visible.
@@ -2879,6 +2886,7 @@ impl BrowseView {
             // container is left intact).
             Ok((_efs, _commit)) => {
                 self.edit_mode = true;
+                self.edit_free_space = None;
             }
             Err(e) => {
                 self.error = Some(format!("Cannot enter edit mode: {e}"));
@@ -3407,28 +3415,33 @@ impl BrowseView {
 
             ui.add_space(8.0);
 
-            // Free space indicator with projected space after staged edits.
-            // Read-only use — the commit guard is dropped (no re-encode).
-            if let Ok((mut efs, _commit)) = self.session.open_editable() {
-                if let Ok(free) = efs.free_space() {
-                    ui.label(format!("Free: {}", partition::format_size(free)));
+            // Free space, probed once per edit session and again after each write:
+            // opening the editable volume decodes a whole container.
+            if self.edit_free_space.is_none() {
+                self.edit_free_space = Some(
+                    self.session
+                        .open_editable()
+                        .ok()
+                        .and_then(|(mut efs, _commit)| efs.free_space().ok()),
+                );
+            }
+            if let Some(Some(free)) = self.edit_free_space {
+                ui.label(format!("Free: {}", partition::format_size(free)));
 
-                    if !self.staged_edits.is_empty() {
-                        let delta = self.staged_edits.space_delta();
-                        let projected =
-                            free.saturating_add(delta.freed).saturating_sub(delta.added);
-                        let color = if delta.added > free + delta.freed {
-                            super::theme::danger(ui.visuals()) // red — won't fit
-                        } else if projected < free / 10 {
-                            super::theme::warning(ui.visuals()) // yellow — tight
-                        } else {
-                            super::theme::success(ui.visuals()) // green — ok
-                        };
-                        ui.colored_label(
-                            color,
-                            format!("After: {}", partition::format_size(projected)),
-                        );
-                    }
+                if !self.staged_edits.is_empty() {
+                    let delta = self.staged_edits.space_delta();
+                    let projected = free.saturating_add(delta.freed).saturating_sub(delta.added);
+                    let color = if delta.added > free + delta.freed {
+                        super::theme::danger(ui.visuals()) // red — won't fit
+                    } else if projected < free / 10 {
+                        super::theme::warning(ui.visuals()) // yellow — tight
+                    } else {
+                        super::theme::success(ui.visuals()) // green — ok
+                    };
+                    ui.colored_label(
+                        color,
+                        format!("After: {}", partition::format_size(projected)),
+                    );
                 }
             }
         });
@@ -4085,6 +4098,7 @@ impl BrowseView {
     /// Returns false when the batch was deferred to the conflict review; the
     /// callers used to read that as success and dropped the queue.
     fn apply_staged_edits(&mut self) -> bool {
+        self.edit_free_space = None;
         log::info!(
             "Applying {} staged edit(s) to {}",
             self.staged_edits.len(),
@@ -4382,6 +4396,7 @@ impl BrowseView {
 
     /// Encode and write the editor's contents through the shared replace path.
     fn save_text_editor(&mut self, ed: &GuiTextEditor) -> anyhow::Result<usize> {
+        self.edit_free_space = None;
         use rusty_backup::model::text_edit::encode_after_edit;
         let bytes = encode_after_edit(&ed.text, &ed.shape, false)
             .map_err(|e| anyhow::anyhow!("cannot save as {}: {e}", ed.shape.encoding.label()))?;
@@ -5204,6 +5219,7 @@ impl BrowseView {
     /// Exit edit mode, clearing all staged state.
     fn exit_edit_mode(&mut self) {
         self.edit_mode = false;
+        self.edit_free_space = None;
         self.edit_result = None;
         self.show_new_folder_dialog = false;
         self.pending_delete = None;
@@ -5559,6 +5575,7 @@ impl BrowseView {
 
     /// Execute repair on the filesystem and re-run check.
     fn run_repair(&mut self) {
+        self.edit_free_space = None;
         match self.session.open_editable() {
             Ok((mut efs, commit)) => match efs.repair() {
                 Ok(report) => {
