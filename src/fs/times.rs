@@ -227,14 +227,18 @@ const DOS_EPOCH_SECS: u64 = 315_532_800;
 ///
 /// Any Unix time before 1980-01-01 clamps to 1980-01-01 00:00:00 (the
 /// earliest representable DOS date) so a pre-1980 mtime doesn't become
-/// year-2107. Any time past 2107-12-31 is truncated to the year mod 128,
-/// which is the same behaviour as every DOS filesystem tool going back to
-/// MS-DOS 2.0 — the year field is only 7 bits and there is nowhere else
-/// to put a bigger value.
+/// year-2107. Anything past 2107-12-31 23:59:58 pins to that moment: the
+/// year field is only 7 bits and there is nowhere else to put a bigger
+/// value.
 pub fn unix_to_dos_datetime(secs: u64) -> (u16, u16) {
     let secs = secs.max(DOS_EPOCH_SECS);
     let (year, month, day, hour, minute, second) = ymd_hms(secs);
-    let year_since_1980 = ((year - 1980).clamp(0, 127)) as u16;
+    // Past 2107 the whole stamp pins to the last representable moment; a
+    // clamped year with the real month and day produced dates like 2107-02-29.
+    if year > 2107 {
+        return ((127 << 9) | (12 << 5) | 31, (23 << 11) | (59 << 5) | 29);
+    }
+    let year_since_1980 = (year - 1980) as u16;
     let date = (year_since_1980 << 9) | ((month as u16 & 0x0F) << 5) | (day as u16 & 0x1F);
     let time =
         ((hour as u16 & 0x1F) << 11) | ((minute as u16 & 0x3F) << 5) | ((second as u16 / 2) & 0x1F);
@@ -580,6 +584,20 @@ mod tests {
 
     /// 2020-06-15 12:34:56 UTC — a mid-range date every encoder can hold.
     const T_2020: u64 = 1_592_224_496;
+
+    /// D19: 2108-02-29 12:00 used to encode as year 127 (2107) with the leap
+    /// day kept, a date that does not exist and that decoders reject.
+    #[test]
+    fn dos_datetime_past_2107_pins_to_the_last_moment() {
+        let leap_2108 = secs_from_ymd_hms(2108, 2, 29, 12, 0, 0);
+        let (d, t) = unix_to_dos_datetime(leap_2108);
+        assert_eq!(
+            dos_datetime_to_unix(d, t),
+            Some(secs_from_ymd_hms(2107, 12, 31, 23, 59, 58))
+        );
+        let (d, t) = unix_to_dos_datetime(u64::MAX / 4);
+        assert!(dos_datetime_to_unix(d, t).is_some());
+    }
 
     #[test]
     fn dos_datetime_round_trips_and_clamps() {
