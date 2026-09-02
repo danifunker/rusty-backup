@@ -116,7 +116,8 @@ them, both green except where a real defect is pinned:
   103/103.
 * **`cases/tier3/edit-new-fs-fixtures.toml`** — 10 cases. The gamut is
   `put` -> `ls` -> `get` -> byte-compare -> `mkdir` -> `chmod`/`chown` -> `rm`
-  -> `fsck`, all on `{fixture_copy}`. 7 pass, 3 xfail against R-043.
+  -> `fsck`, all on `{fixture_copy}`. 7 passed and 3 were xfail against R-043
+  until 2026-09-01; all 10 pass now.
 
 Two assertions in there are worth more than they look:
 
@@ -127,7 +128,7 @@ Two assertions in there are worth more than they look:
   then asserts the *root* slice is unchanged. That disk's slot `f` aliases slot
   `c`, so a write that resolves the wrong slot lands in the wrong filesystem.
 
-### 1e. R-043 — every edit verb refuses a dynamic VHD
+### 1e. R-043 — every edit verb refuses a dynamic VHD — **fixed 2026-09-01**
 
 Found while authoring §1d, because three of the new fixtures are dynamic VHDs
 and not one accepted a write.
@@ -152,9 +153,10 @@ as F-008, which shipped for `backup` on 2026-08-15 and did not touch the edit
 path; the fix shape is either a `ContainerEditSession` or a `Read + Write + Seek`
 VHD reader in the manner of `Qcow2Reader`.
 
-Filed as **R-043** in `docs/Regression_Bugs.md` with a fixture-free repro; the
-three cases assert intended behaviour and are listed in
-`data/known-failures.toml` until it lands.
+Filed as **R-043** in `docs/Regression_Bugs.md` with a fixture-free repro.
+**Fixed 2026-09-01:** one classifier, `source_reader::open_container_rw`, now
+feeds the CLI resolver, the GUI edit session and the GUI repair path; the three
+cases pass and left `known-failures.toml`.
 
 ---
 
@@ -501,5 +503,5 @@ $R fixtures                                    # 101 rows, 0 missing
 $R oracles --detect                            # should find the Sun oracles after §4
 $R run --tiers 1                               # 48/48 as of 2026-08-24
 $R run --tiers 2                               # 103/103 as of 2026-08-25
-$R run --filter edit.new.                      # 7 pass + 3 xfail (R-043)
+$R run --filter edit.new.                      # 10 pass (R-043 fixed 2026-09-01)
 ```

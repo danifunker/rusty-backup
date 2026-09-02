@@ -22,6 +22,7 @@ mod cli_bk0011m;
 mod cli_cbm;
 mod cli_coco;
 mod cli_coco_os9;
+mod cli_container_rw;
 mod cli_cp;
 mod cli_cpm_floppy;
 mod cli_dragon;

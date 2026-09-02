@@ -58,27 +58,7 @@
 # said so. `mac.fork-roundtrip.control.put-macbinary` was never listed and
 # still passes.
 
-# --- R-043 — every edit verb refuses a dynamic VHD — OPEN 2026-08-25 ---------
-# Found while authoring the tier-3 cases for the new fixture drop. `ls`, `get`
-# and `fsck` read a dynamic VHD; every write verb rejects it as a corrupt MBR,
-# because the writable-open dispatch in src/cli/resolve.rs has no VHD branch
-# and the footer copy at offset 0 gets read as sector 0.
-#
-# The three cases assert the behaviour we want and stay red until it lands.
-# The same filesystems are edited through their raw / QCOW2 / CHD siblings in
-# the same manifest, so filesystem coverage does not wait on this.
-
-[[known]]
-id = "edit.new.next-ns33-intel-dynamic-vhd"
-finding = "R-043"
-note = "put on a dynamic VHD; the ls step above it passes, which is the control"
-
-[[known]]
-id = "edit.new.bfs-r5-dynamic-vhd"
-finding = "R-043"
-note = "same defect on BFS, pinning it as a container issue not a filesystem one"
-
-[[known]]
-id = "edit.new.dynamic-vhd-synthetic"
-finding = "R-043"
-note = "fixture-free repro; the fixed-VHD control in the same case passes"
+# --- R-043 — every edit verb refuses a dynamic VHD — FIXED 2026-09-01 -------
+# The three `edit.new.*-dynamic-vhd` cases were listed here from 2026-08-25
+# until the fix landed; they assert the behaviour we wanted all along and now
+# pass. See docs/Regression_Bugs.md#r-043.

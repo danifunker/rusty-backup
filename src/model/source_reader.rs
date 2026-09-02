@@ -1400,6 +1400,100 @@ pub fn is_editable_container_path(path: &Path) -> bool {
         || is_dsd_path(path)
 }
 
+/// What stands between an editor and the bytes of `path`.
+pub enum ContainerRw {
+    /// The file is the disk: the caller opens it itself.
+    Plain,
+    /// A sparse codec that edits in place (dynamic VHD, sparse VMDK, QCOW2).
+    Handle(crate::rbformats::BoxRwSeek),
+    /// Decoded for reading, but nothing can write it back; says what and why.
+    ReadOnly(String),
+}
+
+/// Classify `path` for a read-write open with the read side's detector (R-043);
+/// callers dispatch CHD and the floppy containers before this runs.
+pub fn open_container_rw(path: &Path) -> Result<ContainerRw> {
+    let probe = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let format = detect_image_format_with_path(probe, Some(path))?;
+    // A ProDOS-ordered Apple II disk is re-interleaved on read, so a write
+    // through its file bytes would land on the wrong sectors.
+    if matches!(format, ImageFormat::Raw | ImageFormat::DosOrder) && is_apple_ii_dsk_path(path) {
+        let bytes = std::fs::read(path)?;
+        let ext = path.extension().and_then(|e| e.to_str());
+        if open_apple_ii_dsk(bytes.clone(), ext).is_ok_and(|decoded| decoded != bytes) {
+            return Ok(ContainerRw::ReadOnly(
+                "this Apple II disk is ProDOS-ordered and is re-interleaved for reading, \
+                 so edits would land on the wrong sectors. Convert it to DOS order first: \
+                 `rb-cli convert <image> OUT.do --format raw`."
+                    .to_string(),
+            ));
+        }
+    }
+    // Decode-only wrappers the image detector cannot see (GHO, IMZ, zip, gzip,
+    // GCR/MSA/EDSK); a DOS-ordered Apple II .dsk is a plain sector image.
+    if matches!(format, ImageFormat::Raw)
+        && is_container_path(path)
+        && !is_editable_container_path(path)
+        && !is_apple_ii_dsk_path(path)
+        && !crate::rbformats::appimage::is_squashfs_appimage(path)
+        && squashfs_bearing_iso_payload(path).is_none()
+    {
+        return Ok(ContainerRw::ReadOnly(
+            "this container decodes for reading but cannot be written back, so edits \
+             would have nowhere to go. Convert it to a raw image first: \
+             `rb-cli convert <image> OUT.img --format raw`."
+                .to_string(),
+        ));
+    }
+    let rw = || {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .with_context(|| format!("opening {} for write", path.display()))
+    };
+    Ok(match format {
+        ImageFormat::Raw | ImageFormat::DosOrder => ContainerRw::Plain,
+        // Raw data with a trailing footer: a window keeps the footer out of the
+        // volume, which the plain file counted as 512 extra bytes to grow into.
+        ImageFormat::Vhd { data_size } => ContainerRw::Handle(Box::new(
+            crate::rbformats::payload_slice::PayloadSlice::bounded(rw()?, 0, data_size),
+        )),
+        ImageFormat::VhdDynamic { .. } => {
+            let reader = crate::rbformats::vhd::DynamicVhdReader::open(rw()?)
+                .with_context(|| format!("opening dynamic VHD {} for edit", path.display()))?;
+            ContainerRw::Handle(Box::new(reader))
+        }
+        ImageFormat::VmdkSparse { .. } => {
+            let reader = crate::rbformats::vmdk_sparse::VmdkSparseReader::open(rw()?)
+                .with_context(|| format!("opening sparse VMDK {} for edit", path.display()))?;
+            ContainerRw::Handle(Box::new(reader))
+        }
+        ImageFormat::Qcow2 { .. } => {
+            let reader = crate::rbformats::qcow2::Qcow2Reader::open(rw()?)
+                .with_context(|| format!("opening QCOW2 {} for edit", path.display()))?;
+            // Shared clusters and no copy-on-write: a snapshot-bearing image
+            // (a UTM suspended VM, typically) would be corrupted by an edit.
+            if reader.is_read_only() {
+                return Ok(ContainerRw::ReadOnly(format!(
+                    "this QCOW2 has {} internal snapshot(s) and opens read-only \
+                     (a UTM suspended-VM state is the usual one). Editing could \
+                     corrupt them. Shut the VM down cleanly in UTM, or drop the \
+                     snapshot (`qemu-img snapshot -d <name> <file>`), then retry.",
+                    reader.snapshot_count()
+                )));
+            }
+            ContainerRw::Handle(Box::new(reader))
+        }
+        other => ContainerRw::ReadOnly(format!(
+            "{}: this container decodes for reading but cannot be written back, \
+             so edits would have nowhere to go. Convert it to a raw image first: \
+             `rb-cli convert <image> OUT.img --format raw`.",
+            other.description()
+        )),
+    })
+}
+
 /// True when [`open_read`] would transparently unwrap `path` into a decoded
 /// flat-sector stream — any CHD / GHO / IMZ streaming reader or flat floppy
 /// container. Callers that build their own reader use this to decide whether

@@ -1,4 +1,4 @@
-# Regression Findings (R-001 … R-042)
+# Regression Findings (R-001 … R-043)
 
 Defects and documentation drift turned up while building the regression suite
 (`regression-tests/`), 2026-08-01/02. The suite work was deliberately kept
@@ -19,7 +19,7 @@ finding depends on a fixture, the fixture is named.
 
 | ID | Severity | Area | Finding |
 |----|----------|------|---------|
-| R-043 | **High** | `src/cli/resolve.rs` | Every edit verb refuses a **dynamic VHD**: `ls` / `get` / `fsck` read it, then `put` / `mkdir` / `rm` / `chmod` / `chown` fail with `Invalid MBR: invalid boot signature`. The writable-open dispatch has branches for CHD, QCOW2 and the floppy containers but none for VHD, so the file is opened raw and the footer copy at offset 0 is read as sector 0. Fixed VHDs are unaffected — they really are raw data with a trailing footer. |
+| ~~R-043~~ | ~~**High**~~ **FIXED** | `src/cli/resolve.rs`, `src/model/browse_session.rs` | ~~Every edit verb refuses a **dynamic VHD**~~ — one classifier (`source_reader::open_container_rw`) now feeds both the CLI resolver and the GUI edit session: dynamic VHD, sparse VMDK and QCOW2 edit in place through their codecs, and decode-only containers are refused with a reason instead of "Invalid MBR", 2026-09-01 |
 | ~~R-042~~ | ~~**High**~~ **FIXED** | `src/fs/affs.rs` | ~~An AFFS partition that is not last on its disk cannot be opened at all~~ — the root-block midpoint was inferred from the end of the *disk*; the read-only opener family now carries the partition length the editable one always had, 2026-08-18 |
 | ~~R-040~~ | ~~**High**~~ **FIXED** | `src/cli/verbs/put.rs`, `src/fs/dir_import.rs` | ~~`put` and `import` never reattach a resource fork, so an extracted Mac archive copied back onto HFS loses every fork~~ — `detect_resource_fork` learned BinHex and both verbs now consult it; all four containers round-trip, 2026-08-17 |
 | ~~R-041~~ | ~~**High**~~ **FIXED** | `src/model/commander_ops.rs`, `src/cli/verbs/tui_app.rs` | ~~Commander drops resource forks: host->image staging hardcoded `resource_fork: None`, and the TUI's image->host copy did not recurse~~ — staging detects forks and skips consumed sidecars; both front ends now share one recursive walker, 2026-08-17 |
@@ -2474,7 +2474,20 @@ before fixing anything below.
 
 ### R-043 — every edit verb refuses a dynamic VHD {#r-043}
 
-**OPEN, found 2026-08-25** while authoring the tier-3 cases for the new
+**FIXED 2026-09-01.** `DynamicVhdReader` already implemented allocate-on-write
+`Write`, and so did `VmdkSparseReader`; neither was reachable from a write
+verb. `src/model/source_reader.rs` gained `open_container_rw`, which classifies
+a path with the same `detect_image_format_with_path` the read side uses and
+returns *Plain* (raw, fixed VHD), *Handle* (dynamic VHD, sparse VMDK, QCOW2 —
+edited in place through the codec) or *ReadOnly* (2MG, DiskCopy 4.2, DMG,
+sparse image, DART, MOOF, flat VMDK, CD CHD — refused with a reason). The CLI
+`resolve_image_rw` and the GUI `BrowseSession::open_editable` both route
+their final branch through it, and `fsck_runner::run_repair` (the GUI's
+repair) does too, so the three cannot drift apart again. Round-trip tests for
+all four container shapes: `tests/cli_suite/cli_container_rw.rs`. The three
+tier-3 cases below now pass and are no longer in `known-failures.toml`.
+
+Found 2026-08-25 while authoring the tier-3 cases for the new
 fixtures. Three of them are dynamic VHDs, and not one accepted a write.
 
 The tool disagrees with itself, which is what makes it a defect rather than a
@@ -2541,8 +2554,8 @@ rb-cli put dyn/v.vhd payload.bin /p.bin     # Invalid MBR
 
 **Cases:** `edit.new.next-ns33-intel-dynamic-vhd`,
 `edit.new.bfs-r5-dynamic-vhd`, `edit.new.dynamic-vhd-synthetic`. All three
-assert the intended behaviour and are listed in `data/known-failures.toml`
-until this lands.
+assert the intended behaviour; they were listed in `data/known-failures.toml`
+until the fix landed.
 
 **Secondary observation, not part of this finding.** A fixed VHD reports its
 volume as 512 bytes larger than the source image (`16777728` for a 16 MiB

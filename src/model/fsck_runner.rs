@@ -58,14 +58,39 @@ pub fn run_repair(
             "repair is not supported for CHD-compressed sources (decompress to a raw image first)"
         ));
     }
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .with_context(|| format!("failed to open {} for repair", path.display()))?;
-    let mut efs = open_editable_filesystem(file, offset, ptype, type_string)
-        .with_context(|| "failed to open editable filesystem")?;
-    efs.repair().with_context(|| "repair failed")
+    // Floppy / gzip / WOZ containers: repair a decoded temp flat, then
+    // re-encode. Repairing the container's own bytes wrote into its framing.
+    if crate::model::source_reader::is_editable_container_path(path) {
+        let session = crate::model::container_edit::ContainerEditSession::open(path)
+            .map_err(|e| anyhow!("opening container for repair: {e:#}"))?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(session.flat_path())
+            .with_context(|| format!("failed to open {} for repair", path.display()))?;
+        let report = run_repair_reader(file, offset, ptype, type_string)?;
+        session
+            .commit()
+            .map_err(|e| anyhow!("re-encoding container after repair: {e:#}"))?;
+        return Ok(report);
+    }
+    // Same classifier as the edit paths, so a volume that edits also repairs.
+    match crate::model::source_reader::open_container_rw(path)? {
+        crate::model::source_reader::ContainerRw::Plain => {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .with_context(|| format!("failed to open {} for repair", path.display()))?;
+            run_repair_reader(file, offset, ptype, type_string)
+        }
+        crate::model::source_reader::ContainerRw::Handle(handle) => {
+            run_repair_reader(handle, offset, ptype, type_string)
+        }
+        crate::model::source_reader::ContainerRw::ReadOnly(why) => {
+            Err(anyhow!("{}: {why}", path.display()))
+        }
+    }
 }
 
 /// Run repair against the partition at `offset` in a **pre-opened read-write

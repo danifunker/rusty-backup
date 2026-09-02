@@ -450,33 +450,6 @@ pub fn resolve_image_rw(path: &std::path::Path) -> Result<(BoxRwSeek, RwCommit, 
     if let Some((handle, commit)) = try_open_chd_rw(path)? {
         return Ok((handle, commit, HandleShape::Wrapped));
     }
-    if source_reader::is_qcow2_path(path) {
-        // QCOW2 edits in place: `Qcow2Reader` is itself `Read + Write + Seek`,
-        // allocating host clusters on demand, so there's nothing to re-encode
-        // on commit. Without this branch the raw `File` below would be handed
-        // to partition detection, which reads the QCOW2 header as sector 0 and
-        // reports a bogus "Invalid MBR".
-        let file = open_image_rw(path)?;
-        let reader = crate::rbformats::qcow2::Qcow2Reader::open(file)
-            .with_context(|| format!("opening QCOW2 {} for edit", path.display()))?;
-        // Fail fast with the root cause: a snapshot-bearing image opens
-        // read-only (shared clusters, no copy-on-write). The common case is a
-        // UTM suspended-VM state, which also leaves the guest filesystem dirty
-        // — so surfacing the snapshot here beats a downstream "dirty journal"
-        // message that names the symptom instead.
-        if reader.is_read_only() {
-            anyhow::bail!(
-                "QCOW2 {} has {} internal snapshot(s) and opens read-only \
-                 (a UTM suspended-VM state is the usual one). Editing could \
-                 corrupt them. Shut the VM down cleanly in UTM, or drop the \
-                 snapshot (`qemu-img snapshot -d <name> {}`), then retry.",
-                path.display(),
-                reader.snapshot_count(),
-                path.display(),
-            );
-        }
-        return Ok((Box::new(reader), RwCommit::None, HandleShape::Wrapped));
-    }
     // A container the read path decodes but the write path cannot re-encode:
     // G64/G71 raw GCR, MSA, EDSK, Apple-II .dsk. Refusing here says so; falling
     // through opened the undecoded container bytes and reported "Invalid MBR:
@@ -516,9 +489,21 @@ pub fn resolve_image_rw(path: &std::path::Path) -> Result<(BoxRwSeek, RwCommit, 
             HandleShape::Wrapped,
         ))
     } else {
-        let file = open_image_rw(path)?;
-        // The only branch where the handle really is the file.
-        Ok((Box::new(file), RwCommit::None, HandleShape::WholeFile))
+        // The read side's detector: sparse codecs edit in place, decode-only
+        // containers are refused with a reason instead of "Invalid MBR" (R-043).
+        match source_reader::open_container_rw(path)? {
+            source_reader::ContainerRw::Plain => {
+                let file = open_image_rw(path)?;
+                // The only branch where the handle really is the file.
+                Ok((Box::new(file), RwCommit::None, HandleShape::WholeFile))
+            }
+            source_reader::ContainerRw::Handle(handle) => {
+                Ok((handle, RwCommit::None, HandleShape::Wrapped))
+            }
+            source_reader::ContainerRw::ReadOnly(why) => Err(crate::cli::exit::permission_denied(
+                format!("{}: {why}", path.display()),
+            )),
+        }
     }
 }
 

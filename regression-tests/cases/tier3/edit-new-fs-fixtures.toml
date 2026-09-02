@@ -17,13 +17,11 @@
 # edit and 546 after is the assertion that our allocator leaked nothing new.
 # "It was already dirty" is otherwise a place for a real defect to hide.
 #
-# NOT COVERED HERE, and deliberately: the three dynamic-VHD fixtures
-# (part.next.ns33-intel.hd, fs.bfs.r5-intel.hd,
-# part.solaris-x86.solaris26-intel.multipart). Every edit verb refuses them —
-# see R-043 and the cases at the bottom of this file, which assert the intended
-# behaviour and are listed in known-failures.toml until it lands. The same
-# filesystems are edited here through their raw / QCOW2 / CHD siblings, so the
-# filesystem coverage does not depend on that fix.
+# The three dynamic-VHD fixtures (part.next.ns33-intel.hd, fs.bfs.r5-intel.hd,
+# part.solaris-x86.solaris26-intel.multipart) are exercised by the R-043 cases
+# at the bottom of this file. Every edit verb refused them until 2026-09-01;
+# the same filesystems are also edited here through their raw / QCOW2 / CHD
+# siblings, so the filesystem coverage never depended on that fix.
 
 [meta]
 tier = 3
@@ -212,10 +210,10 @@ stdout_contains = ["451 files", "13 dirs"]
 
 # --- R-043 — every edit verb refuses a dynamic VHD -----------------------------
 #
-# These assert the INTENDED behaviour and are listed in known-failures.toml
-# against R-043. Do not soften them to match what the tool does today: that is
-# what the known-failures mechanism is for, and XPASS is how we learn the fix
-# landed.
+# These asserted the INTENDED behaviour from known-failures.toml until the fix
+# landed on 2026-09-01; they are ordinary passing cases now, and the fixed-VHD
+# control in the synthetic case still says which half of the container is
+# under test.
 
 [[case]]
 id = "edit.new.next-ns33-intel-dynamic-vhd"
