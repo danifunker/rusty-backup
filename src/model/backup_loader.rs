@@ -379,7 +379,10 @@ fn merge_logical_partitions_from_metadata(
 /// type name (used for old backups that didn't store the byte).
 pub fn infer_fat_type_byte(name: &str) -> u8 {
     let lower = name.to_ascii_lowercase();
-    if lower.contains("fat32") {
+    // "exfat" contains "fat", so the 0x07 pair is checked before the FAT rungs.
+    if lower.contains("ntfs") || lower.contains("exfat") {
+        0x07
+    } else if lower.contains("fat32") {
         0x0C // FAT32 LBA
     } else if lower.contains("fat16") {
         0x06
@@ -387,9 +390,6 @@ pub fn infer_fat_type_byte(name: &str) -> u8 {
         0x01
     } else if lower.contains("fat") {
         0x0C
-    } else if lower.contains("ntfs") || lower.contains("exfat") {
-        // Both NTFS and exFAT share MBR type 0x07.
-        0x07
     } else if lower.contains("linux") || lower.contains("ext") {
         0x83
     } else if lower.contains("hfs") {

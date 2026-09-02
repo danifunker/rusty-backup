@@ -964,6 +964,9 @@ pub fn compact_partition_reader<R: Read + Seek + Send + 'static>(
         0xAF => {
             let (fs_type, hfsplus_offset) = resolve_apple_hfs(&mut reader, partition_offset);
             match fs_type {
+                // A wrapped volume's compact stream starts at the inner HFS+ and
+                // drops the wrapper Mac OS 9 boots from; trim it instead.
+                "hfsplus" if hfsplus_offset != partition_offset => None,
                 "hfsplus" => {
                     let (compact, info) = CompactHfsPlusReader::new(reader, hfsplus_offset).ok()?;
                     Some((Box::new(compact), info))
@@ -1470,9 +1473,10 @@ pub fn partition_minimum_size<R: Read + Seek + Send + 'static>(
         None => progress("No HFS wrapper detected (flat HFS+ or non-HFS)"),
     }
     progress("Opening filesystem...");
-    let mut fs = match open_filesystem(
+    let mut fs = match open_filesystem_sized(
         reader,
         partition_offset,
+        Some(partition_size),
         partition_type,
         partition_type_string,
     ) {
@@ -1673,10 +1677,15 @@ pub fn open_filesystem_full<R: Read + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
-                "hfsplus" => Ok(Box::new(hfsplus::HfsPlusFilesystem::open(
-                    reader,
-                    partition_offset,
-                )?)),
+                // A bare HFS-wrapped HFS+ image (an OS 9 "Extended" volume) keeps
+                // its real volume behind the wrapper; opening at byte 0 saw an MDB.
+                "hfsplus" => {
+                    let (_, hfsplus_offset) = resolve_apple_hfs(&mut reader, partition_offset);
+                    Ok(Box::new(hfsplus::HfsPlusFilesystem::open(
+                        reader,
+                        hfsplus_offset,
+                    )?))
+                }
                 "mfs" => Ok(Box::new(mfs::MfsFilesystem::open(
                     reader,
                     partition_offset,
@@ -1885,9 +1894,15 @@ pub fn open_filesystem_full<R: Read + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
-                _ => Err(FilesystemError::Unsupported(
-                    "type 0x83 partition: unrecognized filesystem".into(),
-                )),
+                // fdisk's default byte hosts Minix, HFS+ and more; the wrong
+                // label is not proof there is nothing here (see the `_` arm).
+                _ => open_filesystem_with_passphrase(
+                    reader,
+                    partition_offset,
+                    0x00,
+                    None,
+                    passphrase,
+                ),
             }
         }
         // Apple HFS/HFS+ on MBR disks
@@ -2076,6 +2091,11 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                         reader,
                         partition_offset,
                     )?)),
+                    // A/UX and NetBSD/mac68k slices: the read arm already opened them.
+                    "ufs" => Ok(Box::new(ufs::UfsFilesystem::open(
+                        reader,
+                        partition_offset,
+                    )?)),
                     _ => Err(FilesystemError::Unsupported(format!(
                         "editing not yet supported for APM Unix filesystem type '{fs_type}'"
                     ))),
@@ -2219,7 +2239,8 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                     partition_offset,
                 )?)),
                 "hfsplus" => {
-                    let mut fs = hfsplus::HfsPlusFilesystem::open(reader, partition_offset)?;
+                    let (_, hfsplus_offset) = resolve_apple_hfs(&mut reader, partition_offset);
+                    let mut fs = hfsplus::HfsPlusFilesystem::open(reader, hfsplus_offset)?;
                     fs.prepare_for_edit()?;
                     Ok(Box::new(fs))
                 }
@@ -2417,9 +2438,7 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
-                _ => Err(FilesystemError::Unsupported(format!(
-                    "editing not yet supported for type 0x83 filesystem '{fs_type}'"
-                ))),
+                _ => open_editable_filesystem_with(reader, partition_offset, edit_ctx, 0x00, None),
             }
         }
         // ProDOS
@@ -2866,6 +2885,9 @@ pub fn is_browsable_type(ptype: u8) -> bool {
             | 0xBF
             // BeOS BFS.
             | 0xEB
+            // Minix; `open_filesystem` has handled both bytes since the driver landed.
+            | 0x80
+            | 0x81
     )
 }
 
@@ -3105,6 +3127,16 @@ pub fn is_checkable_type(ptype: u8, type_str: Option<&str>) -> bool {
     if ptype == 0xAF || matches!(type_str, Some("Apple_HFS")) {
         return true;
     }
+    // Minix (0x80/0x81), the BSD / Solaris UFS bytes, BeOS BFS, and the APM
+    // Unix slices all have fsck drivers the byte-only gate never reached.
+    if matches!(ptype, 0x80 | 0x81 | 0xA5 | 0xA6 | 0xA9 | 0xBF | 0xEB)
+        || matches!(
+            type_str,
+            Some("Apple_UNIX_SVR2") | Some("Apple_UNIX_SRVR2") | Some("Be_BFS")
+        )
+    {
+        return true;
+    }
     // ProDOS (`prodos::fsck`): MBR type byte 0xA8, or the APM DosType strings.
     if ptype == 0xA8 || matches!(type_str, Some("Apple_PRODOS") | Some("Apple_ProDOS")) {
         return true;
@@ -3142,8 +3174,25 @@ pub fn is_checkable_type(ptype: u8, type_str: Option<&str>) -> bool {
 /// (its resolved name is `"NTFS"` / `"NTFS 3.1"`).
 pub fn is_checkable_fs_name(type_name: &str) -> bool {
     let n = type_name.to_ascii_uppercase();
+    // "SOLARIS S0 (ROOT)" rows are UFS; the GPT ESP / basic-data rows hold
+    // FAT, NTFS or exFAT; the rest name drivers that implement `fsck()`.
     [
-        "HFS", "EFS", "UFS", "XFS", "JFS", "FAT", "EXT", "NTFS", "HPFS",
+        "HFS",
+        "EFS",
+        "UFS",
+        "XFS",
+        "JFS",
+        "FAT",
+        "EXT",
+        "NTFS",
+        "HPFS",
+        "MINIX",
+        "UCSD",
+        "BFS",
+        "OFS",
+        "SOLARIS",
+        "EFI SYSTEM",
+        "MICROSOFT BASIC DATA",
     ]
     .iter()
     .any(|tok| n.contains(tok))
