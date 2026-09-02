@@ -436,6 +436,9 @@ impl BackupTab {
             if source_changed {
                 self.prev_device_idx = self.selected_device_idx;
                 self.prev_image_path = self.image_file_path.clone();
+                // A Start Backup waiting on the old source's minimum sizes must
+                // not fire on the new one the moment its (empty) map clears.
+                self.pending_backup_after_min_sizes = false;
                 self.load_partition_preview(ctx);
             }
         }

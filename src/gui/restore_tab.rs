@@ -274,7 +274,7 @@ impl Default for RestoreTab {
 
 impl RestoreTab {
     pub fn is_running(&self) -> bool {
-        self.restore_running || self.build_running()
+        self.restore_running || self.build_running() || self.image_write.is_writing()
     }
 
     /// True while a Build Disk job is writing to the target.

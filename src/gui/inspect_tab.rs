@@ -1000,11 +1000,20 @@ impl InspectTab {
         }
 
         // Resize popup
+        let mut resize_finished = false;
         if let Some(ref mut popup) = self.resize_popup {
+            let was_running = popup.is_running();
             popup.poll_status(ctx.log);
+            resize_finished = was_running && !popup.is_running();
             if !popup.show(ui, ctx.devices, ctx.log) {
                 self.resize_popup = None;
             }
+        }
+        // The table on disk changed; every later edit patched a stale copy of
+        // it until the user re-inspected by hand.
+        if resize_finished {
+            self.prev_image_path = None;
+            self.prev_device_idx = None;
         }
 
         // Physical Disk Export sub-window
@@ -1555,6 +1564,10 @@ impl InspectTab {
                         .to_string(),
                 );
                 self.editor.edits.clear();
+                // Force re-detection: Add Partition and the APM/GPT editors
+                // otherwise work from the pre-edit table.
+                self.prev_image_path = None;
+                self.prev_device_idx = None;
             }
             Err(e) => {
                 ctx.log.error(format!("Failed to apply edits: {:#}", e));
@@ -2690,6 +2703,13 @@ impl InspectTab {
         self.chd_image_path = None;
         self.cached_disk_size = None;
         self.single_file_chd_backup_folder = None;
+        // A Check result belongs to the source it was run on; Repair on it
+        // after a source change wrote fixes into the new image at old offsets.
+        self.fsck_result = None;
+        self.show_fsck_popup = false;
+        self.show_repair_confirm = false;
+        self.repair_context = None;
+        self.pending_repack = None;
     }
 
     /// Give up the escalated descriptor for the device this tab had open, so it
@@ -4798,6 +4818,21 @@ impl InspectTab {
             rusty_backup::model::min_size_runner::MinSizeSource::File {
                 file: file_arc,
                 use_sector_aligned: is_device,
+            }
+        } else if let Some(path) = self.image_file_path.clone().filter(|_| !is_device) {
+            // Only macOS retains the inspect worker's handle; elsewhere an
+            // image file is simply reopened, or Calc min never ran at all.
+            match std::fs::File::open(&path) {
+                Ok(file) => rusty_backup::model::min_size_runner::MinSizeSource::File {
+                    file: Arc::new(file),
+                    use_sector_aligned: false,
+                },
+                Err(e) => {
+                    ctx.log.error(format!(
+                        "Cannot calculate minimum size for partition {part_index}: {e}",
+                    ));
+                    return;
+                }
             }
         } else {
             ctx.log.error(format!(

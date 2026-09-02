@@ -112,6 +112,14 @@ pub enum Action {
 }
 
 impl PhysicalDiskExport {
+    /// A device write is in flight; the restore tab's controls stay locked.
+    pub fn is_writing(&self) -> bool {
+        self.write_status
+            .as_ref()
+            .and_then(|s| s.lock().ok().map(|g| !g.finished))
+            .unwrap_or(false)
+    }
+
     /// Open the sub-window for a given source. Seeds defaults from the
     /// heuristic when the source is a superfloppy.
     pub fn open_for(
@@ -505,7 +513,7 @@ impl PhysicalDiskExport {
                 source: PhysicalWriteSource::Image(source.path.clone()),
                 target_device_path: device.path.clone(),
                 target_size_bytes: target_size,
-                extent: WriteExtent::partition(part.start_lba, part.size_bytes),
+                extent: WriteExtent::partition_at(part.byte_offset(), part.size_bytes),
                 wrap: None,
             };
             self.last_error = None;
