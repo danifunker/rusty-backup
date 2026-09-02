@@ -1757,9 +1757,10 @@ pub fn open_filesystem_full<R: Read + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
-                "hfs" => Ok(Box::new(hfs::HfsFilesystem::open(
+                "hfs" => Ok(Box::new(hfs::HfsFilesystem::open_sized(
                     reader,
                     partition_offset,
+                    partition_size,
                 )?)),
                 // A bare HFS-wrapped HFS+ image (an OS 9 "Extended" volume) keeps
                 // its real volume behind the wrapper; opening at byte 0 saw an MDB.
@@ -1997,9 +1998,10 @@ pub fn open_filesystem_full<R: Read + Seek + Send + 'static>(
                     reader,
                     hfsplus_offset,
                 )?)),
-                _ => Ok(Box::new(hfs::HfsFilesystem::open(
+                _ => Ok(Box::new(hfs::HfsFilesystem::open_sized(
                     reader,
                     partition_offset,
+                    partition_size,
                 )?)),
             }
         }
@@ -2139,9 +2141,10 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                         fs.prepare_for_edit()?;
                         Ok(Box::new(fs))
                     }
-                    "hfs" => Ok(Box::new(hfs::HfsFilesystem::open(
+                    "hfs" => Ok(Box::new(hfs::HfsFilesystem::open_sized(
                         reader,
                         partition_offset,
+                        partition_len,
                     )?)),
                     _ => Err(FilesystemError::Unsupported(
                         "unrecognized Apple_HFS variant".into(),
@@ -2156,7 +2159,11 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                 )?));
             }
             "Apple_HFSX" => {
-                let mut fs = hfsplus::HfsPlusFilesystem::open(reader, partition_offset)?;
+                let mut fs = hfsplus::HfsPlusFilesystem::open_sized(
+                    reader,
+                    partition_offset,
+                    partition_len,
+                )?;
                 fs.prepare_for_edit()?;
                 return Ok(Box::new(fs));
             }
@@ -2318,9 +2325,10 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                         .unwrap_or(squashfs_edit::SizeBudget::Fit),
                     edit_ctx.whole_file_path,
                 )?)),
-                "hfs" => Ok(Box::new(hfs::HfsFilesystem::open(
+                "hfs" => Ok(Box::new(hfs::HfsFilesystem::open_sized(
                     reader,
                     partition_offset,
+                    partition_len,
                 )?)),
                 "hfsplus" => {
                     let (_, hfsplus_offset) = resolve_apple_hfs(&mut reader, partition_offset);
@@ -2564,9 +2572,10 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                     fs.prepare_for_edit()?;
                     Ok(Box::new(fs))
                 }
-                "hfs" => Ok(Box::new(hfs::HfsFilesystem::open(
+                "hfs" => Ok(Box::new(hfs::HfsFilesystem::open_sized(
                     reader,
                     partition_offset,
+                    partition_len,
                 )?)),
                 _ => Err(FilesystemError::Unsupported(
                     "unrecognized HFS variant at type 0xAF".into(),
@@ -2609,9 +2618,10 @@ fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
                     reader,
                     hfsplus_offset,
                 )?)),
-                _ => Ok(Box::new(hfs::HfsFilesystem::open(
+                _ => Ok(Box::new(hfs::HfsFilesystem::open_sized(
                     reader,
                     partition_offset,
+                    partition_size,
                 )?)),
             }
         }

@@ -573,6 +573,9 @@ fn hfsplus_dir_private_dir_name() -> String {
 pub struct HfsPlusFilesystem<R: Read + Seek> {
     reader: R,
     partition_offset: u64,
+    /// Partition length when the caller knows it; the alternate volume header
+    /// sits 1024 bytes before the partition end, not before total_blocks * bs.
+    partition_size: Option<u64>,
     vh: HfsPlusVolumeHeader,
     /// Cached catalog B-tree file data.
     catalog_data: Vec<u8>,
@@ -635,7 +638,17 @@ pub struct HfsPlusSnapshot {
 }
 
 impl<R: Read + Seek> HfsPlusFilesystem<R> {
-    pub fn open(mut reader: R, partition_offset: u64) -> Result<Self, FilesystemError> {
+    pub fn open(reader: R, partition_offset: u64) -> Result<Self, FilesystemError> {
+        Self::open_sized(reader, partition_offset, None)
+    }
+
+    /// [`open`](Self::open) with the partition length, so the alternate volume
+    /// header is written where Apple's tools look for it.
+    pub fn open_sized(
+        mut reader: R,
+        partition_offset: u64,
+        partition_size: Option<u64>,
+    ) -> Result<Self, FilesystemError> {
         // Read volume header at offset + 1024
         reader.seek(SeekFrom::Start(partition_offset + 1024))?;
         let mut vh_buf = [0u8; 512];
@@ -738,6 +751,7 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
         Ok(HfsPlusFilesystem {
             reader,
             partition_offset,
+            partition_size,
             vh,
             catalog_data,
             catalog_header,
@@ -2376,11 +2390,15 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
         self.reader
             .seek(SeekFrom::Start(self.partition_offset + 1024))?;
         self.reader.write_all(&vh_bytes)?;
-        // Backup (last 1024 bytes of volume)
-        let total_size = self.vh.total_blocks as u64 * self.vh.block_size as u64;
-        if total_size > 1024 {
+        // Backup: 1024 bytes before the partition end when the length is
+        // known, else before the end of the last allocation block.
+        let volume_end = self
+            .partition_size
+            .filter(|&s| s >= 2048)
+            .unwrap_or(self.vh.total_blocks as u64 * self.vh.block_size as u64);
+        if volume_end > 1024 {
             self.reader
-                .seek(SeekFrom::Start(self.partition_offset + total_size - 1024))?;
+                .seek(SeekFrom::Start(self.partition_offset + volume_end - 1024))?;
             self.reader.write_all(&vh_bytes)?;
         }
         Ok(())
@@ -9075,6 +9093,35 @@ mod tests {
 
     /// H8: with blocks larger than nodes a grow added one block per node,
     /// twice (or four times) what the nodes occupy, on every grow.
+    /// H7: the alternate volume header went to total_blocks * block_size - 1024;
+    /// fsck_hfs and the Mac read 1024 bytes before the partition end.
+    #[test]
+    fn the_alternate_volume_header_follows_the_partition_end_when_known() {
+        use crate::fs::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+        const VOLUME: u64 = 8 * 1024 * 1024;
+        const PARTITION: u64 = VOLUME + 6 * 1024;
+        let mut img = create_blank_hfsplus(VOLUME, 4096, "Slack", false);
+        img.resize(PARTITION as usize, 0);
+        {
+            let mut fs =
+                HfsPlusFilesystem::open_sized(std::io::Cursor::new(&mut img), 0, Some(PARTITION))
+                    .unwrap();
+            fs.prepare_for_edit().unwrap();
+            let root = fs.root().unwrap();
+            fs.create_file(&root, "a", &mut &b"x"[..], 1, &CreateFileOptions::default())
+                .unwrap();
+            fs.sync_metadata().unwrap();
+        }
+        let primary = &img[1024..1536];
+        let alt = &img[PARTITION as usize - 1024..PARTITION as usize - 512];
+        assert_eq!(
+            &alt[0..2],
+            b"H+",
+            "alternate volume header missing at the partition end"
+        );
+        assert_eq!(primary, alt);
+    }
+
     #[test]
     fn a_grow_allocates_the_blocks_the_new_nodes_occupy() {
         // 4 KiB nodes in 8 KiB blocks: 8 nodes are 4 blocks, not 8.

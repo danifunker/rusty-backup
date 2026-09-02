@@ -454,6 +454,9 @@ enum CatalogRecord {
 pub struct HfsFilesystem<R: Read + Seek> {
     reader: R,
     partition_offset: u64,
+    /// Partition length when the caller knows it; the alternate MDB lives in
+    /// the partition's last kilobyte, which need not follow the last block.
+    partition_size: Option<u64>,
     mdb: HfsMasterDirectoryBlock,
     /// Cached catalog file data.
     catalog_data: Vec<u8>,
@@ -481,7 +484,32 @@ pub struct HfsFilesystem<R: Read + Seek> {
 }
 
 impl<R: Read + Seek> HfsFilesystem<R> {
-    pub fn open(mut reader: R, partition_offset: u64) -> Result<Self, FilesystemError> {
+    /// Where the alternate MDB lives: the partition's next-to-last sector when
+    /// the length is known, else the sector after the last allocation block.
+    fn alt_mdb_offset(&self) -> Option<u64> {
+        if let Some(size) = self.partition_size.filter(|&s| s >= 2048) {
+            return Some(self.partition_offset + size - 1024);
+        }
+        if self.mdb.block_size == 0 || self.mdb.total_blocks == 0 {
+            return None;
+        }
+        let sectors_per_block = self.mdb.block_size as u64 / 512;
+        let alt_sector =
+            self.mdb.first_alloc_block as u64 + self.mdb.total_blocks as u64 * sectors_per_block;
+        Some(self.partition_offset + alt_sector * 512)
+    }
+
+    pub fn open(reader: R, partition_offset: u64) -> Result<Self, FilesystemError> {
+        Self::open_sized(reader, partition_offset, None)
+    }
+
+    /// [`open`](Self::open) with the partition length, so the alternate MDB is
+    /// read and written at the partition end as Mac OS and Disk First Aid expect.
+    pub fn open_sized(
+        mut reader: R,
+        partition_offset: u64,
+        partition_size: Option<u64>,
+    ) -> Result<Self, FilesystemError> {
         // Read MDB at offset + 1024 (sector 2) — full 512-byte sector
         reader.seek(SeekFrom::Start(partition_offset + 1024))?;
         let mut mdb_buf = [0u8; 512];
@@ -506,6 +534,7 @@ impl<R: Read + Seek> HfsFilesystem<R> {
         Ok(HfsFilesystem {
             reader,
             partition_offset,
+            partition_size,
             mdb,
             catalog_data,
             extents_overflow_data: None,
@@ -795,11 +824,7 @@ impl<R: Read + Seek> HfsFilesystem<R> {
         };
         // Read the alternate MDB — located at the sector immediately after
         // the last allocation block on the volume.
-        let alt_mdb_sector = if self.mdb.block_size > 0 && self.mdb.total_blocks > 0 {
-            let sectors_per_block = self.mdb.block_size as u64 / 512;
-            let last_alloc_sector = self.mdb.first_alloc_block as u64
-                + self.mdb.total_blocks as u64 * sectors_per_block;
-            let alt_offset = self.partition_offset + last_alloc_sector * 512;
+        let alt_mdb_sector = if let Some(alt_offset) = self.alt_mdb_offset() {
             let mut alt_buf = [0u8; 512];
             if self
                 .reader
@@ -1744,11 +1769,7 @@ impl<R: Read + Write + Seek> HfsFilesystem<R> {
         // Mirror to the alternate MDB at the sector right after the last
         // allocation block. Mac OS rejects volumes whose primary and alt
         // MDBs disagree, so this must stay in sync with the primary write.
-        if self.mdb.block_size > 0 && self.mdb.total_blocks > 0 {
-            let sectors_per_block = self.mdb.block_size as u64 / 512;
-            let alt_sector = self.mdb.first_alloc_block as u64
-                + self.mdb.total_blocks as u64 * sectors_per_block;
-            let alt_offset = self.partition_offset + alt_sector * 512;
+        if let Some(alt_offset) = self.alt_mdb_offset() {
             self.reader.seek(SeekFrom::Start(alt_offset))?;
             self.reader.write_all(&mdb_bytes)?;
         }
@@ -4452,6 +4473,34 @@ mod tests {
             unix_to_mac_epoch(expected),
             "on disk it is the local wall clock"
         );
+    }
+
+    /// H7: the alternate MDB was mirrored to the sector after the last
+    /// allocation block; Mac OS and Disk First Aid read the partition's
+    /// next-to-last sector, which differs whenever the blocks do not reach it.
+    #[test]
+    fn the_alternate_mdb_follows_the_partition_end_when_the_length_is_known() {
+        use crate::fs::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+        const VOLUME: u64 = 8 * 1024 * 1024;
+        const PARTITION: u64 = VOLUME + 64 * 1024;
+        let mut img = create_blank_hfs(VOLUME, 4096, "Slack").unwrap();
+        img.resize(PARTITION as usize, 0);
+        {
+            let mut fs =
+                HfsFilesystem::open_sized(Cursor::new(&mut img), 0, Some(PARTITION)).unwrap();
+            let root = fs.root().unwrap();
+            fs.create_file(&root, "a", &mut &b"x"[..], 1, &CreateFileOptions::default())
+                .unwrap();
+            fs.sync_metadata().unwrap();
+        }
+        let primary = &img[1024..1536];
+        let alt = &img[PARTITION as usize - 1024..PARTITION as usize - 512];
+        assert_eq!(
+            &alt[0..2],
+            b"BD",
+            "alternate MDB missing at the partition end"
+        );
+        assert_eq!(primary, alt, "the mirror must equal the primary MDB");
     }
 
     #[test]
