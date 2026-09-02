@@ -254,7 +254,7 @@ fn folder_recurse(
                 // discard `dest_dir` entirely and target the host root.
                 let sub = match e.archive_name() {
                     Some(name) => {
-                        let sub = dest_dir.join(name);
+                        let sub = dest_dir.join(crate::fs::resource_fork::sanitize_filename(name));
                         std::fs::create_dir_all(&sub)
                             .with_context(|| format!("creating {}", sub.display()))?;
                         sub

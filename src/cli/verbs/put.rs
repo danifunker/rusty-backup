@@ -261,6 +261,9 @@ pub fn run_with_budget(
     } else {
         crate::fs::attrs::preserved_meta(fs.as_filesystem_mut(), existing.as_ref())
     };
+    if existing.as_ref().is_some_and(|e| e.is_directory()) {
+        bail!("{dst} is a directory; put replaces files only (rm -r it first)");
+    }
     if existing.is_some() && !args.force {
         bail!("{dst} already exists (pass --force to overwrite)");
     }

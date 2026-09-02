@@ -219,13 +219,19 @@ pub fn build_macbinary(
 /// Sanitize a filename for the host OS.
 /// Replaces characters that are invalid on common filesystems.
 pub fn sanitize_filename(name: &str) -> String {
-    name.chars()
+    let safe: String = name
+        .chars()
         .map(|c| match c {
             ':' | '/' | '\\' | '\0' => '_',
             '<' | '>' | '"' | '|' | '?' | '*' => '_',
             _ => c,
         })
-        .collect()
+        .collect();
+    // A catalog name of `..` (or an empty one) must not become a path step.
+    if safe.is_empty() || safe == "." || safe == ".." {
+        return "_".repeat(safe.len().max(1));
+    }
+    safe
 }
 
 /// Round up to the next multiple of 128.

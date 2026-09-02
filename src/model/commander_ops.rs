@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 
 use crate::fs::entry::{EntryType, FileEntry};
 use crate::fs::filesystem::Filesystem;
@@ -916,7 +916,7 @@ fn copy_image_entries_to_host(
             return Err(cancelled_err());
         }
         if entry.is_directory() {
-            let sub = dest_dir.join(&entry.name);
+            let sub = dest_dir.join(crate::fs::resource_fork::sanitize_filename(&entry.name));
             std::fs::create_dir_all(&sub).with_context(|| format!("creating {}", sub.display()))?;
             let children = fs
                 .list_directory(entry)
@@ -945,12 +945,28 @@ fn copy_host_entries_to_host(
     status: &Arc<Mutex<HostCopyStatus>>,
 ) -> Result<usize> {
     let mut count = 0;
+    // A destination inside a source folder recursed without end, and a file
+    // copied onto itself was truncated before it was read.
+    let dest_canon = dest_dir
+        .canonicalize()
+        .unwrap_or_else(|_| dest_dir.to_path_buf());
     for entry in entries {
         if is_cancelled(status) {
             return Err(cancelled_err());
         }
         let src = PathBuf::from(&entry.path);
         let dst = dest_dir.join(&entry.name);
+        let src_canon = src.canonicalize().unwrap_or_else(|_| src.clone());
+        if dest_canon == src_canon.parent().unwrap_or(&src_canon) {
+            bail!("{} is already in {}", entry.name, dest_dir.display());
+        }
+        if entry.is_directory() && dest_canon.starts_with(&src_canon) {
+            bail!(
+                "cannot copy {} into itself ({})",
+                src.display(),
+                dest_dir.display()
+            );
+        }
         if entry.is_directory() {
             copy_host_dir(&src, &dst, &mut count, status)?;
         } else if entry.is_file() {
@@ -1762,6 +1778,38 @@ mod tests {
             std::fs::read(out.path().join("D").join("B.TXT")).unwrap(),
             b"deep"
         );
+    }
+
+    /// A destination inside the source recursed forever; a file copied onto
+    /// itself was truncated before it was read.
+    #[test]
+    fn copy_host_to_host_refuses_to_copy_into_itself() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::create_dir(src.path().join("dir")).unwrap();
+        std::fs::write(src.path().join("dir").join("g.txt"), b"more").unwrap();
+        std::fs::write(src.path().join("f.txt"), b"data").unwrap();
+        let entries = host_children(&src.path().to_string_lossy());
+        let status = Arc::new(Mutex::new(HostCopyStatus::default()));
+
+        let dir_entry: Vec<FileEntry> = entries
+            .iter()
+            .filter(|e| e.name == "dir")
+            .cloned()
+            .collect();
+        let inside = src.path().join("dir");
+        assert!(copy_host_entries_to_host(&dir_entry, &inside, &status).is_err());
+        assert_eq!(
+            std::fs::read(src.path().join("dir").join("g.txt")).unwrap(),
+            b"more"
+        );
+
+        let file_entry: Vec<FileEntry> = entries
+            .iter()
+            .filter(|e| e.name == "f.txt")
+            .cloned()
+            .collect();
+        assert!(copy_host_entries_to_host(&file_entry, src.path(), &status).is_err());
+        assert_eq!(std::fs::read(src.path().join("f.txt")).unwrap(), b"data");
     }
 
     /// host -> host: copy a file and a directory subtree between host folders.

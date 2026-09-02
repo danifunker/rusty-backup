@@ -315,7 +315,7 @@ fn run_glob(
         let host_target = if rel.is_empty() {
             // The glob matched the root itself (rare); fall back to the
             // entry's name under DST.
-            dst.join(&entry.name)
+            dst.join(crate::fs::resource_fork::sanitize_filename(&entry.name))
         } else {
             join_relative(dst, &rel)
         };
@@ -359,7 +359,7 @@ fn extract_directory_recursive(
         .list_directory(dir)
         .map_err(|e| anyhow!("list_directory {}: {e}", dir.path))?;
     for child in children {
-        let host_child = host_target.join(&child.name);
+        let host_child = host_target.join(crate::fs::resource_fork::sanitize_filename(&child.name));
         match child.entry_type {
             crate::fs::entry::EntryType::Directory => {
                 ensure_dir(&host_child)?;
@@ -526,8 +526,9 @@ fn ensure_dir(p: &Path) -> Result<()> {
 /// host paths don't get confused.
 fn join_relative(base: &Path, rel: &str) -> PathBuf {
     let mut out = base.to_path_buf();
+    // Catalog names are data: `..` or an absolute name must stay under `base`.
     for component in rel.split('/').filter(|c| !c.is_empty()) {
-        out.push(component);
+        out.push(crate::fs::resource_fork::sanitize_filename(component));
     }
     out
 }
