@@ -2177,6 +2177,13 @@ impl BackupTab {
         self.partition_defrag_enabled.clear();
         self.partition_defrag_default_applied.clear();
         self.deferred_min_sizes.clear();
+        // The workers hold their own handle on the drive; ask them to stop at
+        // their next phase so Close Drive actually releases it.
+        for status in self.pending_min_size_calcs.values() {
+            if let Ok(mut s) = status.lock() {
+                s.cancel_requested = true;
+            }
+        }
         self.pending_min_size_calcs.clear();
         self.last_logged_min_size_phase.clear();
         self.source_partition_table_desc = None;

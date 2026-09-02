@@ -1461,6 +1461,38 @@ pub fn partition_minimum_size<R: Read + Seek + Send + 'static>(
     wrapper_hint: Option<hfsplus_wrapper_clone::WrappedHfsPlusInfo>,
     progress: &dyn Fn(&str),
 ) -> MinimumResult {
+    partition_minimum_size_cancellable(
+        reader,
+        partition_offset,
+        partition_type,
+        partition_type_string,
+        partition_size,
+        allow_expensive,
+        wrapper_hint,
+        progress,
+        &|| false,
+    )
+}
+
+/// [`partition_minimum_size`] that asks `cancel` between phases and stops with
+/// an empty result, so a closed source does not keep a worker reading it.
+#[allow(clippy::too_many_arguments)] // same dispatcher, plus the cancel probe
+pub fn partition_minimum_size_cancellable<R: Read + Seek + Send + 'static>(
+    reader: R,
+    partition_offset: u64,
+    partition_type: u8,
+    partition_type_string: Option<&str>,
+    partition_size: u64,
+    allow_expensive: bool,
+    wrapper_hint: Option<hfsplus_wrapper_clone::WrappedHfsPlusInfo>,
+    progress: &dyn Fn(&str),
+    cancel: &dyn Fn() -> bool,
+) -> MinimumResult {
+    let cancelled = || MinimumResult::Computed {
+        in_place: None,
+        defragmented: None,
+        fragmentation_percent: None,
+    };
     if !allow_expensive && is_expensive_minimum(partition_type, partition_type_string) {
         return MinimumResult::Deferred {
             fs_name: fs_name_for(partition_type, partition_type_string),
@@ -1485,6 +1517,10 @@ pub fn partition_minimum_size<R: Read + Seek + Send + 'static>(
     let (wrapper_info, wrapper_source) = if let Some(hint) = wrapper_hint {
         (Some(hint), "hint")
     } else {
+        if cancel() {
+            progress("Cancelled");
+            return cancelled();
+        }
         progress("Probing for HFS wrapper...");
         let info =
             hfsplus_wrapper_clone::detect_wrapped_hfsplus(&mut reader, partition_offset, u64::MAX);
@@ -1503,6 +1539,10 @@ pub fn partition_minimum_size<R: Read + Seek + Send + 'static>(
             info.inner_size,
         )),
         None => progress("No HFS wrapper detected (flat HFS+ or non-HFS)"),
+    }
+    if cancel() {
+        progress("Cancelled");
+        return cancelled();
     }
     progress("Opening filesystem...");
     let mut fs = match open_filesystem_sized(
@@ -1528,8 +1568,16 @@ pub fn partition_minimum_size<R: Read + Seek + Send + 'static>(
             };
         }
     };
+    if cancel() {
+        progress("Cancelled");
+        return cancelled();
+    }
     progress("Computing last data byte...");
     let in_place = fs.last_data_byte().ok().map(|m| m.min(partition_size));
+    if cancel() {
+        progress("Cancelled");
+        return cancelled();
+    }
     progress("Computing fragmentation...");
     let fragmentation_percent = match fs.fragmentation_stats() {
         Some(Ok(stats)) => {
@@ -1550,6 +1598,10 @@ pub fn partition_minimum_size<R: Read + Seek + Send + 'static>(
         }
         None => None,
     };
+    if cancel() {
+        progress("Cancelled");
+        return cancelled();
+    }
     progress("Computing defragmented minimum...");
     let inner_defrag = fs.defragmented_minimum_size().ok();
     let defragmented = inner_defrag.and_then(|m| {
@@ -4543,6 +4595,69 @@ mod probe_order_tests {
         minix[1024] = 0x42;
         minix[1025] = 0x44;
         assert_eq!(detect_filesystem_type(&mut Cursor::new(minix), 0), "minix");
+    }
+}
+
+#[cfg(test)]
+mod min_size_cancel_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::io::Cursor;
+
+    /// C11: a closed source used to leave the min-size worker reading it until
+    /// the walk finished; the cancel probe stops it at the next phase.
+    #[test]
+    fn cancel_stops_the_minimum_size_walk_before_it_opens() {
+        let img = crate::fs::fat::create_blank_fat(8 * 1024 * 1024, Some("X")).unwrap();
+        let phases = RefCell::new(Vec::new());
+        let result = partition_minimum_size_cancellable(
+            Cursor::new(img.clone()),
+            0,
+            0x0C,
+            None,
+            img.len() as u64,
+            true,
+            None,
+            &|p| phases.borrow_mut().push(p.to_string()),
+            &|| true,
+        );
+        assert!(matches!(
+            result,
+            MinimumResult::Computed {
+                in_place: None,
+                defragmented: None,
+                ..
+            }
+        ));
+        let phases = phases.into_inner();
+        assert_eq!(
+            phases.last().map(String::as_str),
+            Some("Cancelled"),
+            "{phases:?}"
+        );
+        assert!(
+            !phases.iter().any(|p| p.starts_with("Opening")),
+            "{phases:?}"
+        );
+
+        // Without a cancel the same walk completes.
+        let result = partition_minimum_size(
+            Cursor::new(img.clone()),
+            0,
+            0x0C,
+            None,
+            img.len() as u64,
+            true,
+            None,
+            &|_| {},
+        );
+        assert!(matches!(
+            result,
+            MinimumResult::Computed {
+                in_place: Some(_),
+                ..
+            }
+        ));
     }
 }
 

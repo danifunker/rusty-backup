@@ -38,6 +38,8 @@ pub struct MinSizeStatus {
     /// or when the volume has no files with data forks.
     pub fragmentation_percent: Option<f32>,
     pub error: Option<String>,
+    /// Set by the GUI when the source closes; the walk stops at its next phase.
+    pub cancel_requested: bool,
 }
 
 impl MinSizeStatus {
@@ -51,6 +53,7 @@ impl MinSizeStatus {
             defragmented_min: None,
             fragmentation_percent: None,
             error: None,
+            cancel_requested: false,
         }
     }
 }
@@ -108,6 +111,13 @@ pub fn spawn(req: MinSizeRequest) -> Arc<Mutex<MinSizeStatus>> {
                     s.phase_log.push(phase.to_string());
                 }
             };
+            let cancel_status = Arc::clone(&status_thread);
+            let cancel = move || {
+                cancel_status
+                    .lock()
+                    .map(|s| s.cancel_requested)
+                    .unwrap_or(false)
+            };
 
             let result = match req.source {
                 MinSizeSource::File {
@@ -140,7 +150,7 @@ pub fn spawn(req: MinSizeRequest) -> Arc<Mutex<MinSizeStatus>> {
                         }
                     };
                     if use_sector_aligned {
-                        fs::partition_minimum_size(
+                        fs::partition_minimum_size_cancellable(
                             SectorAlignedReader::new(clone),
                             req.partition_offset,
                             req.partition_type,
@@ -149,9 +159,10 @@ pub fn spawn(req: MinSizeRequest) -> Arc<Mutex<MinSizeStatus>> {
                             true,
                             wrapper_hint,
                             &progress,
+                            &cancel,
                         )
                     } else {
-                        fs::partition_minimum_size(
+                        fs::partition_minimum_size_cancellable(
                             BufReader::new(clone),
                             req.partition_offset,
                             req.partition_type,
@@ -160,6 +171,7 @@ pub fn spawn(req: MinSizeRequest) -> Arc<Mutex<MinSizeStatus>> {
                             true,
                             wrapper_hint,
                             &progress,
+                            &cancel,
                         )
                     }
                 }
@@ -175,7 +187,7 @@ pub fn spawn(req: MinSizeRequest) -> Arc<Mutex<MinSizeStatus>> {
                         crate::remote::RemoteBlockReader::open(conn, &path)
                     };
                     match opened {
-                        Ok(reader) => fs::partition_minimum_size(
+                        Ok(reader) => fs::partition_minimum_size_cancellable(
                             reader,
                             req.partition_offset,
                             req.partition_type,
@@ -184,6 +196,7 @@ pub fn spawn(req: MinSizeRequest) -> Arc<Mutex<MinSizeStatus>> {
                             true,
                             None,
                             &progress,
+                            &cancel,
                         ),
                         Err(e) => {
                             if let Ok(mut s) = status_thread.lock() {
@@ -195,7 +208,7 @@ pub fn spawn(req: MinSizeRequest) -> Arc<Mutex<MinSizeStatus>> {
                     }
                 }
                 MinSizeSource::Chd(path) => match ChdReader::open(&path) {
-                    Ok(reader) => fs::partition_minimum_size(
+                    Ok(reader) => fs::partition_minimum_size_cancellable(
                         reader,
                         req.partition_offset,
                         req.partition_type,
@@ -204,6 +217,7 @@ pub fn spawn(req: MinSizeRequest) -> Arc<Mutex<MinSizeStatus>> {
                         true,
                         None,
                         &progress,
+                        &cancel,
                     ),
                     Err(e) => {
                         if let Ok(mut s) = status_thread.lock() {
@@ -214,7 +228,7 @@ pub fn spawn(req: MinSizeRequest) -> Arc<Mutex<MinSizeStatus>> {
                     }
                 },
                 MinSizeSource::Gho(path) => match GhoReader::open(&path) {
-                    Ok(reader) => fs::partition_minimum_size(
+                    Ok(reader) => fs::partition_minimum_size_cancellable(
                         reader,
                         req.partition_offset,
                         req.partition_type,
@@ -223,6 +237,7 @@ pub fn spawn(req: MinSizeRequest) -> Arc<Mutex<MinSizeStatus>> {
                         true,
                         None,
                         &progress,
+                        &cancel,
                     ),
                     Err(e) => {
                         if let Ok(mut s) = status_thread.lock() {
@@ -235,6 +250,11 @@ pub fn spawn(req: MinSizeRequest) -> Arc<Mutex<MinSizeStatus>> {
             };
 
             if let Ok(mut s) = status_thread.lock() {
+                if s.cancel_requested {
+                    s.error = Some("cancelled: source closed".to_string());
+                    s.finished = true;
+                    return Ok(());
+                }
                 match result {
                     MinimumResult::Computed {
                         in_place,
