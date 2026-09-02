@@ -2611,6 +2611,14 @@ impl InspectTab {
     /// pass loads the new source. Unsaved-edit gating happens at the call site.
     fn apply_source_event(&mut self, ev: super::source_picker::SourceEvent) {
         use super::source_picker::SourceEvent;
+        // A Mac archive is rerouted to the Archives tab and changes nothing
+        // here, so the open browse view must survive it.
+        if let SourceEvent::Image { path, .. } = &ev {
+            if is_mac_archive_path(path) {
+                self.pending_open_archive = Some(path.clone());
+                return;
+            }
+        }
         self.browse_view.close();
         match ev {
             SourceEvent::Device(i) => {
@@ -2622,12 +2630,6 @@ impl InspectTab {
                 self.clear_results();
             }
             SourceEvent::Image { path, tempdir } => {
-                // A Mac archive (.sit/.hqx/...) isn't a disk image — hand it to
-                // the Archives tab instead of failing to parse a partition table.
-                if is_mac_archive_path(&path) {
-                    self.pending_open_archive = Some(path);
-                    return;
-                }
                 self.selected_device_idx = None;
                 self.backup_folder_path = None;
                 self.image_file_path = Some(path);
