@@ -129,6 +129,9 @@ pub(crate) fn stream_with_split(
 
             if current_file_bytes >= split_bytes && written < n {
                 writer.flush()?;
+                // A skipped zero run that ended exactly on the boundary left
+                // the member short; the hole has to exist before it closes.
+                writer.get_mut().set_len(current_file_bytes)?;
                 drop(writer);
                 part_index += 1;
                 current_file_bytes = 0;
@@ -153,4 +156,42 @@ pub(crate) fn stream_with_split(
     }
 
     Ok(files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A skipped zero run ending exactly on the split boundary used to leave
+    /// the member short, and the restore shifted everything after it.
+    #[test]
+    fn split_member_keeps_a_zero_run_that_ends_on_the_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let split: usize = 1024 * 1024;
+        let mut image = vec![0xA5u8; 768 * 1024];
+        image.extend(vec![0u8; 256 * 1024]);
+        image.extend(vec![0x5Au8; 512 * 1024]);
+        let mut reader = std::io::Cursor::new(image.clone());
+        let files = stream_with_split(
+            &mut reader,
+            &dir.path().join("partition-0"),
+            "raw",
+            Some(split as u64),
+            true,
+            None,
+            &mut |_| {},
+            &|| false,
+        )
+        .unwrap();
+        assert_eq!(files.len(), 2, "{files:?}");
+        let mut joined = Vec::new();
+        for f in &files {
+            joined.extend(std::fs::read(dir.path().join(f)).unwrap());
+        }
+        assert_eq!(
+            std::fs::metadata(dir.path().join(&files[0])).unwrap().len(),
+            split as u64
+        );
+        assert_eq!(joined, image);
+    }
 }
