@@ -87,6 +87,7 @@ Each backup is a folder. Two layouts depending on the chosen output:
 **Per-partition** (Zstd / Raw / per-partition VHD):
 - `metadata.json` - partition info, alignment data, checksums, bad sectors
 - `mbr.bin` / `mbr.json` or `gpt.json` - partition table exports
+- `mbr-gap.bin` - the sectors between the MBR and the first partition (GRUB core.img, DDO), only when non-zero; restored after the MBR as far as the new layout has room
 - `partition-N.<ext>` - one compressed file per partition (`.zst`, `.raw`, `.vhd`)
 - Per-file checksum files (`.sha256` or `.crc32`)
 

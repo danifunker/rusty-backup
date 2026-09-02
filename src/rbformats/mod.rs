@@ -478,6 +478,43 @@ pub fn reconstruct_disk_from_backup(
         writer.write_all(&mbr_buf).context("failed to write MBR")?;
         total_written += 512;
 
+        // Put back what lived between the MBR and the first partition (GRUB
+        // core.img, a DDO, Boot Manager), as far as the new layout has room.
+        if let Some(gap) = crate::backup::mbr_gap::load(backup_folder)? {
+            let first_lba = metadata
+                .partitions
+                .iter()
+                .filter(|pm| !pm.is_logical && pm.index < 4)
+                .map(|pm| {
+                    partition_sizes
+                        .iter()
+                        .find(|ps| ps.index == pm.index)
+                        .map(|ps| ps.effective_start_lba())
+                        .unwrap_or(pm.start_lba)
+                })
+                .filter(|&lba| lba > 0)
+                .min()
+                .unwrap_or(0);
+            let fit = crate::backup::mbr_gap::clamp_to_first_partition(&gap, first_lba);
+            if fit.len() < gap.len() {
+                log_cb(&format!(
+                    "Warning: only {} of {} MBR-gap byte(s) fit before the first partition; boot code there may be cut",
+                    fit.len(),
+                    gap.len()
+                ));
+            }
+            if !fit.is_empty() {
+                writer
+                    .write_all(fit)
+                    .context("failed to write the MBR gap")?;
+                total_written += fit.len() as u64;
+                log_cb(&format!(
+                    "Wrote {} byte(s) between the MBR and the first partition",
+                    fit.len()
+                ));
+            }
+        }
+
         // Build EBR chain here so we can pass the actual MBR bytes as a
         // fallback for old backups that lack the `extended_container` field.
         ebr_result =
@@ -2186,5 +2223,119 @@ mod table_sidecar_tests {
             load_table_sidecars(dir.path(), "GPT", &mut |m: &str| log.push(m.to_string())).unwrap();
         assert!(g.is_none() && a.is_none());
         assert!(log.iter().any(|l| l.contains("no gpt.json")), "{log:?}");
+    }
+}
+
+#[cfg(test)]
+mod mbr_gap_restore_tests {
+    use super::*;
+    use crate::backup::metadata::{AlignmentMetadata, BackupLayout, PartitionMetadata};
+
+    /// BR3: only sector 0 was captured, so a restore zero-filled LBA 1 up to
+    /// the first partition and GRUB's core.img / a DDO went with it.
+    #[test]
+    fn the_sectors_after_the_mbr_come_back_on_reconstruction() {
+        const FIRST_LBA: u64 = 2048;
+        const PART_BYTES: u64 = 1024 * 1024;
+        let total = FIRST_LBA * 512 + PART_BYTES;
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path();
+
+        let mut mbr = [0u8; 512];
+        mbr[446 + 4] = 0x0C;
+        mbr[446 + 8..446 + 12].copy_from_slice(&(FIRST_LBA as u32).to_le_bytes());
+        mbr[446 + 12..446 + 16].copy_from_slice(&((PART_BYTES / 512) as u32).to_le_bytes());
+        mbr[510] = 0x55;
+        mbr[511] = 0xAA;
+        std::fs::write(folder.join("mbr.bin"), mbr).unwrap();
+        let mut gap = vec![0u8; 3 * 512];
+        gap[..8].copy_from_slice(b"CORE.IMG");
+        gap[2 * 512 + 100] = 0x5A;
+        crate::backup::mbr_gap::export(folder, &gap).unwrap();
+        let mut body = vec![0u8; PART_BYTES as usize];
+        body[..4].copy_from_slice(b"DATA");
+        std::fs::write(folder.join("partition-0.raw"), &body).unwrap();
+        let checksum = crate::backup::verify::compute_checksum(
+            &folder.join("partition-0.raw"),
+            crate::backup::ChecksumType::Sha256,
+        )
+        .unwrap();
+
+        let metadata = BackupMetadata {
+            version: 1,
+            created: "2026-09-02T00:00:00Z".to_string(),
+            source_device: "synthetic".to_string(),
+            source_size_bytes: total,
+            partition_table_type: "MBR".to_string(),
+            checksum_type: "sha256".to_string(),
+            compression_type: crate::backup::CompressionType::None.as_str().to_string(),
+            split_size_mib: None,
+            sector_by_sector: false,
+            layout: BackupLayout::PerPartition,
+            container: None,
+            container_logical_size: None,
+            container_sha1: None,
+            size_policy: None,
+            alignment: AlignmentMetadata {
+                detected_type: "Modern1MB".to_string(),
+                first_partition_lba: FIRST_LBA,
+                alignment_sectors: 2048,
+                heads: 0,
+                sectors_per_track: 0,
+            },
+            partitions: vec![PartitionMetadata {
+                index: 0,
+                type_name: "FAT32 LBA".to_string(),
+                partition_type_byte: 0x0C,
+                start_lba: FIRST_LBA,
+                start_byte: None,
+                original_size_bytes: PART_BYTES,
+                imaged_size_bytes: PART_BYTES,
+                compressed_files: vec!["partition-0.raw".to_string()],
+                checksum,
+                resized: false,
+                compacted: false,
+                is_logical: false,
+                partition_type_string: None,
+                minimum_size_bytes: None,
+                defragmented_min_size_bytes: None,
+                hfsplus_signature: None,
+                defragmented_clone: false,
+            }],
+            bad_sectors: vec![],
+            extended_container: None,
+        };
+
+        let mut out = std::io::Cursor::new(Vec::new());
+        let mut log: Vec<String> = Vec::new();
+        reconstruct_disk_from_backup(
+            folder,
+            &metadata,
+            None,
+            &[],
+            total,
+            &mut out,
+            false,
+            false,
+            None,
+            None,
+            &mut |_| {},
+            &|| false,
+            &mut |m: &str| log.push(m.to_string()),
+        )
+        .unwrap();
+        let disk = out.into_inner();
+        assert_eq!(&disk[..512], &mbr[..], "MBR intact");
+        assert_eq!(
+            &disk[512..512 + gap.len()],
+            &gap[..],
+            "gap restored at LBA 1"
+        );
+        assert_eq!(&disk[(FIRST_LBA * 512) as usize..][..4], b"DATA");
+        assert!(
+            log.iter()
+                .any(|l| l.contains("between the MBR and the first partition")),
+            "{log:?}"
+        );
     }
 }

@@ -1,5 +1,6 @@
 pub mod disk_image_stream;
 pub mod format;
+pub mod mbr_gap;
 pub mod metadata;
 #[cfg(feature = "chd")]
 pub mod single_file_chd;
@@ -1009,6 +1010,36 @@ fn run_backup_inner(
     ) && !is_superfloppy
         && config.split_size_mib.is_none()
         && single_file_chd::is_supported(&table);
+
+    // Sector 0 alone loses GRUB's core.img, a DDO or Boot Manager living
+    // between the MBR and the first partition; keep that gap as a sidecar.
+    if matches!(
+        table,
+        PartitionTable::Mbr(_) | PartitionTable::SolarisX86 { .. }
+    ) {
+        let gap_sectors = mbr_gap::gap_sectors_before_first_partition(&table.partitions());
+        match mbr_gap::read_gap(&mut source, gap_sectors) {
+            Ok(Some(gap)) => {
+                mbr_gap::export(&backup_folder, &gap)?;
+                log(
+                    &progress,
+                    LogLevel::Info,
+                    format!(
+                        "Exported {} sector(s) between the MBR and the first partition ({})",
+                        gap.len() / 512,
+                        mbr_gap::FILE_NAME
+                    ),
+                );
+            }
+            Ok(None) => {}
+            Err(e) => log(
+                &progress,
+                LogLevel::Warning,
+                format!("Could not read the sectors after the MBR: {e:#}"),
+            ),
+        }
+        source.seek(SeekFrom::Start(0))?;
+    }
 
     set_operation(&progress, "Exporting partition table...");
     match &table {

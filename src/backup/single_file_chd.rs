@@ -912,9 +912,9 @@ pub struct AssembleFromStagingInputs<'a> {
     /// APM only: bytes `[0, first_partition_offset)` from the source disk,
     /// covering the DDR + partition map + any Apple_Driver* partition
     /// bodies. The assembly path overlays patched DDR + entries on top
-    /// of this region before emitting the head segment. MBR and GPT
-    /// sources pass an empty slice — they rebuild the table from
-    /// `source_partition_table_bytes` + `partition_table`.
+    /// of this region before emitting the head segment. MBR sources pass
+    /// the gap after sector 0 (`backup::mbr_gap`), GPT an empty slice; both
+    /// rebuild the table from `source_partition_table_bytes` + `partition_table`.
     pub source_head_region: &'a [u8],
 }
 
@@ -927,8 +927,8 @@ pub struct AssembleFromStagingInputs<'a> {
 ///
 /// **Status:** MBR, GPT, and APM sources supported. APM callers must
 /// pre-populate `source_head_region` with the source's pre-first-partition
-/// bytes (DDR + partition map + Apple_Driver* bodies); MBR / GPT
-/// callers pass an empty slice.
+/// bytes (DDR + partition map + Apple_Driver* bodies); MBR callers pass
+/// the gap after sector 0 (or nothing), GPT callers an empty slice.
 pub fn assemble_from_staging(
     inputs: AssembleFromStagingInputs<'_>,
     progress_cb: &mut dyn FnMut(u64),
@@ -1181,6 +1181,19 @@ fn read_apm_head_region(
     Ok(buf)
 }
 
+/// MBR: the sectors after the MBR up to the first partition, so GRUB's
+/// core.img or a DDO reach the CHD instead of being zero-filled.
+fn read_mbr_gap_region(
+    source_file: &File,
+    partitions: &[PartitionInfo],
+) -> Result<Option<Vec<u8>>> {
+    let sectors = crate::backup::mbr_gap::gap_sectors_before_first_partition(partitions);
+    let mut clone = source_file
+        .try_clone()
+        .context("clone source for MBR gap region")?;
+    crate::backup::mbr_gap::read_gap(&mut clone, sectors)
+}
+
 /// `Read` adapter that produces exactly `target_len` bytes from `inner`,
 /// truncating an over-long source or zero-padding a short one. Used by
 /// the staging path to make each per-partition zstd file decompress to
@@ -1325,6 +1338,8 @@ pub fn run_via_staging(
             inputs.partitions,
             inputs.source_size,
         )?)
+    } else if matches!(inputs.partition_table, PartitionTable::Mbr(_)) {
+        read_mbr_gap_region(inputs.source_file, inputs.partitions)?
     } else {
         None
     };
@@ -1904,7 +1919,6 @@ fn build_patched_head_segments(
     target_size: u64,
     log_cb: &mut dyn FnMut(&str),
 ) -> Result<(Vec<Segment>, Option<Segment>)> {
-    let _ = partitions; // used only by APM today; kept for symmetry.
     match table {
         PartitionTable::Mbr(_) => {
             let mut mbr_buf = [0u8; 512];
@@ -1917,7 +1931,36 @@ fn build_patched_head_segments(
                 mbr_buf.len() as u64,
                 Box::new(std::io::Cursor::new(mbr_buf.to_vec())),
             );
-            Ok((vec![head], None))
+            let mut segments = vec![head];
+            // The gap after sector 0 rides along, cut to what still fits
+            // below the first partition's patched start.
+            let first_lba = partitions
+                .iter()
+                .filter(|p| !p.is_logical)
+                .map(|p| {
+                    overrides
+                        .iter()
+                        .find(|o| o.index == p.index)
+                        .map(|o| o.effective_start_lba())
+                        .unwrap_or(p.start_lba)
+                })
+                .filter(|&lba| lba > 0)
+                .min()
+                .unwrap_or(0);
+            let gap =
+                crate::backup::mbr_gap::clamp_to_first_partition(source_head_region, first_lba);
+            if !gap.is_empty() {
+                log_cb(&format!(
+                    "  head: {} byte(s) between the MBR and the first partition kept",
+                    gap.len()
+                ));
+                segments.push((
+                    512,
+                    gap.len() as u64,
+                    Box::new(std::io::Cursor::new(gap.to_vec())),
+                ));
+            }
+            Ok((segments, None))
         }
         PartitionTable::Gpt { gpt, .. } => {
             let total_sectors = target_size / 512;
