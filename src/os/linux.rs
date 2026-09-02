@@ -27,12 +27,13 @@ fn read_sysfs_attr(path: &Path) -> String {
 /// Returns `true` for block device names that represent real physical devices
 /// (as opposed to loop, ram, device-mapper, etc.).
 fn is_physical_block_device(name: &str) -> bool {
+    // fd0 stays in: the floppy driver is a real drive, and imaging floppies is
+    // half of what this tool is for; optical (sr) and virtual devices are out.
     !name.starts_with("loop")
         && !name.starts_with("ram")
         && !name.starts_with("dm-")
         && !name.starts_with("zram")
         && !name.starts_with("sr")
-        && !name.starts_with("fd")
         && !name.starts_with("nbd")
 }
 
@@ -467,7 +468,9 @@ mod tests {
         assert!(!is_physical_block_device("dm-0"));
         assert!(!is_physical_block_device("zram0"));
         assert!(!is_physical_block_device("sr0"));
-        assert!(!is_physical_block_device("fd0"));
+        // R17: the floppy drive is a physical device the user wants to image.
+        assert!(is_physical_block_device("fd0"));
+        assert!(is_physical_block_device("fd1"));
         assert!(!is_physical_block_device("nbd0"));
     }
 }
