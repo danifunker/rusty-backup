@@ -392,6 +392,113 @@ pub(super) fn check_key_ordering(
             }
         }
     }
+
+    check_leaf_chain_ordering(catalog_data, header, errors);
+    check_index_separators(catalog_data, header, errors);
+}
+
+/// First and last key of a node, if it has any records.
+fn node_first_last_keys(node: &[u8], node_size: usize) -> Option<(&[u8], &[u8])> {
+    let num_records = BigEndian::read_u16(&node[10..12]) as usize;
+    if num_records == 0 {
+        return None;
+    }
+    let (s, e) = btree_record_range(node, node_size, 0);
+    let first = record_key(node, s, e);
+    let (s, e) = btree_record_range(node, node_size, num_records - 1);
+    let last = record_key(node, s, e);
+    if first.is_empty() || last.is_empty() {
+        return None;
+    }
+    Some((first, last))
+}
+
+/// Walk the leaf chain from the header's first leaf: the last key of every
+/// leaf must sort below the first key of the next, or a lookup that descends
+/// correctly still misses records parked in the wrong leaf.
+fn check_leaf_chain_ordering(
+    catalog_data: &[u8],
+    header: &BTreeHeader,
+    errors: &mut Vec<FsckIssue>,
+) {
+    let node_size = header.node_size as usize;
+    let max_nodes = (catalog_data.len() / node_size) as u32;
+    let mut idx = header.first_leaf_node;
+    let mut hops = 0u32;
+    while idx != 0 && idx < max_nodes && hops < max_nodes {
+        hops += 1;
+        let off = idx as usize * node_size;
+        let node = &catalog_data[off..off + node_size];
+        if node[8] as i8 != BTREE_LEAF_NODE {
+            break;
+        }
+        let next = BigEndian::read_u32(&node[0..4]);
+        if next == 0 || next >= max_nodes {
+            break;
+        }
+        let next_node = &catalog_data[next as usize * node_size..(next as usize + 1) * node_size];
+        if let (Some((_, last)), Some((first, _))) = (
+            node_first_last_keys(node, node_size),
+            node_first_last_keys(next_node, node_size),
+        ) {
+            if compare_catalog_keys(last, first) != Ordering::Less {
+                errors.push(hfs_issue(
+                    HfsFsckCode::KeysOutOfOrder,
+                    format!("leaf {idx} ends past the first key of the next leaf {next}"),
+                ));
+            }
+        }
+        idx = next;
+    }
+}
+
+/// Every index record's key must not sort above the first key of the child
+/// it points at, or descents land in the wrong subtree.
+fn check_index_separators(catalog_data: &[u8], header: &BTreeHeader, errors: &mut Vec<FsckIssue>) {
+    let node_size = header.node_size as usize;
+    let max_nodes = catalog_data.len() / node_size;
+    for node_idx in 0..max_nodes as u32 {
+        if !btree_bitmap_test(catalog_data, node_size, node_idx) {
+            continue;
+        }
+        let off = node_idx as usize * node_size;
+        let node = &catalog_data[off..off + node_size];
+        if node[8] as i8 != BTREE_INDEX_NODE {
+            continue;
+        }
+        let num_records = BigEndian::read_u16(&node[10..12]) as usize;
+        for i in 0..num_records {
+            let (s, e) = btree_record_range(node, node_size, i);
+            let key = record_key(node, s, e);
+            if key.is_empty() {
+                continue;
+            }
+            // Classic HFS pads an odd key so the child pointer starts even.
+            let mut data_off = s + key.len();
+            if data_off % 2 == 1 {
+                data_off += 1;
+            }
+            if data_off + 4 > e {
+                continue;
+            }
+            let child = BigEndian::read_u32(&node[data_off..data_off + 4]) as usize;
+            if child == 0 || child >= max_nodes {
+                continue;
+            }
+            let child_node = &catalog_data[child * node_size..(child + 1) * node_size];
+            if let Some((first, _)) = node_first_last_keys(child_node, node_size) {
+                if compare_catalog_keys(key, first) == Ordering::Greater {
+                    errors.push(hfs_issue(
+                        HfsFsckCode::KeysOutOfOrder,
+                        format!(
+                            "index node {node_idx} record {i} sorts above the first key of its child {child}"
+                        ),
+                    ));
+                    break;
+                }
+            }
+        }
+    }
 }
 
 fn check_offset_table(

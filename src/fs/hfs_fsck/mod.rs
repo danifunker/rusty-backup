@@ -1770,6 +1770,84 @@ mod tests {
         data
     }
 
+    /// Add leaf node 2 holding one record with `parent_id`, chained after
+    /// leaf 1 (which the minimal tree fills with parent_id 1).
+    fn chain_second_leaf(data: &mut [u8], node_size: usize, parent_id: u32) {
+        let n1 = node_size;
+        BigEndian::write_u32(&mut data[n1..n1 + 4], 2); // leaf 1 -> leaf 2
+        let n2 = 2 * node_size;
+        data[n2 + 8] = BTREE_LEAF_NODE as u8;
+        data[n2 + 9] = 1;
+        BigEndian::write_u16(&mut data[n2 + 10..n2 + 12], 1);
+        let r0 = n2 + 14;
+        data[r0] = 6;
+        BigEndian::write_u32(&mut data[r0 + 2..r0 + 6], parent_id);
+        data[r0 + 8] = CATALOG_DIR as u8;
+        BigEndian::write_u32(&mut data[r0 + 14..r0 + 18], 9);
+        let lot = n2 + node_size;
+        BigEndian::write_u16(&mut data[lot - 2..lot], 14);
+        BigEndian::write_u16(&mut data[lot - 4..lot - 2], 14 + 78);
+        data[0xf8] |= 0b00100000; // node 2 allocated
+        BigEndian::write_u32(&mut data[14 + 14..14 + 18], 2); // last_leaf = 2
+    }
+
+    /// H5: keys were only compared inside a node, so a leaf whose keys sort
+    /// below the previous leaf's passed fsck.
+    #[test]
+    fn keys_out_of_order_across_leaves_are_detected() {
+        let node_size = 512;
+        let mut data = make_minimal_btree(node_size);
+        chain_second_leaf(&mut data, node_size, 0); // 0 < 1: chain runs backwards
+        let header = BTreeHeader::read(&data);
+        let mut errors = Vec::new();
+        check_key_ordering(&data, &header, &mut errors);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].code, "KeysOutOfOrder");
+        assert!(
+            errors[0].message.contains("next leaf"),
+            "{}",
+            errors[0].message
+        );
+
+        let mut data = make_minimal_btree(node_size);
+        chain_second_leaf(&mut data, node_size, 5); // 1 < 5: fine
+        let header = BTreeHeader::read(&data);
+        let mut errors = Vec::new();
+        check_key_ordering(&data, &header, &mut errors);
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    /// H5: an index record whose key sorts above its child's first key sends
+    /// every lookup for that range into the wrong leaf.
+    #[test]
+    fn index_separator_above_its_child_is_detected() {
+        let node_size = 512;
+        let mut data = make_minimal_btree(node_size);
+        let n3 = 3 * node_size;
+        data[n3 + 8] = crate::fs::hfs_common::BTREE_INDEX_NODE as u8;
+        data[n3 + 9] = 2;
+        BigEndian::write_u16(&mut data[n3 + 10..n3 + 12], 1);
+        let r0 = n3 + 14;
+        data[r0] = 6; // key: reserved + parent 9 + empty name
+        BigEndian::write_u32(&mut data[r0 + 2..r0 + 6], 9);
+        BigEndian::write_u32(&mut data[r0 + 8..r0 + 12], 1); // child = leaf 1 (parent 1)
+        let lot = n3 + node_size;
+        BigEndian::write_u16(&mut data[lot - 2..lot], 14);
+        BigEndian::write_u16(&mut data[lot - 4..lot - 2], 14 + 12);
+        data[0xf8] |= 0b00010000; // node 3 allocated
+        BigEndian::write_u16(&mut data[14..16], 2); // depth 2
+        BigEndian::write_u32(&mut data[14 + 2..14 + 6], 3); // root = 3
+        let header = BTreeHeader::read(&data);
+        let mut errors = Vec::new();
+        check_key_ordering(&data, &header, &mut errors);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].message.contains("index node 3"),
+            "{}",
+            errors[0].message
+        );
+    }
+
     #[test]
     fn test_keys_in_order() {
         let node_size = 512;
