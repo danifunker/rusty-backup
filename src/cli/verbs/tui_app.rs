@@ -4671,10 +4671,14 @@ impl App {
                             .file_extension()
                             .map(|e| format!(".{e}"))
                             .unwrap_or_default();
-                        let out_name = if entries.len() == 1 {
-                            format!("{}{ext}", entries[0].name)
-                        } else {
-                            format!("selection{ext}")
+                        // The root node has no name of its own; "/.tar.gz" at
+                        // the destination's root is not what anyone asked for.
+                        let out_name = match entries.as_slice() {
+                            [only] if !only.name.trim_matches('/').is_empty() => {
+                                format!("{}{ext}", only.name)
+                            }
+                            [_] => format!("volume{ext}"),
+                            _ => format!("selection{ext}"),
                         };
                         let out_path = dest.join(&out_name);
                         let summary = export_to_file(
