@@ -2646,6 +2646,7 @@ impl CommanderState {
                 crate::model::commander_ops::HostCopyJob::HostToHost {
                     entries: entries.clone(),
                     dest_dir,
+                    on_conflict: crate::fs::replace::OnConflict::Replace,
                 },
             );
             loop {

@@ -34,6 +34,22 @@ pub fn safe_name(entry: &FileEntry) -> String {
     resource_fork::sanitize_filename(&entry.name)
 }
 
+/// The host path [`export_file_with_fork`] writes `entry`'s data to under
+/// `mode`, so a caller can see a collision before anything is overwritten.
+pub fn primary_output_path(
+    entry: &FileEntry,
+    dest_dir: &Path,
+    out_name: &str,
+    mode: ResourceForkMode,
+) -> std::path::PathBuf {
+    let has_rsrc = entry.resource_fork_size.map(|s| s > 0).unwrap_or(false);
+    match mode {
+        ResourceForkMode::MacBinary if has_rsrc => dest_dir.join(format!("{out_name}.bin")),
+        ResourceForkMode::BinHex => dest_dir.join(format!("{out_name}.hqx")),
+        _ => dest_dir.join(out_name),
+    }
+}
+
 /// Export one FILE `entry` into `dest_dir` under the base name `out_name`
 /// (already sanitized / suffixed by the caller — e.g. the browse view appends a
 /// ProDOS `#TTAAAA` suffix), using `mode`. Returns the number of bytes written

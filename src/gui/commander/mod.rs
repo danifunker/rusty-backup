@@ -25,6 +25,7 @@ use rusty_backup::fs::entry::FileEntry;
 use rusty_backup::fs::export_selection::ExportFormat;
 #[allow(unused_imports)] // referenced from a doc comment below
 use rusty_backup::fs::fork_export::export_file_with_fork;
+use rusty_backup::fs::replace::OnConflict;
 use rusty_backup::fs::resource_fork::ResourceForkMode;
 use rusty_backup::model::checksum::{self, ChecksumJob, ChecksumStatus};
 use rusty_backup::model::commander_ops::{
@@ -121,6 +122,13 @@ impl Side {
 }
 
 /// Full-page Commander Mode overlay.
+/// A host copy waiting on the "Files already exist" modal.
+struct PendingHostConflict {
+    job: HostCopyJob,
+    dest_side: Option<Side>,
+    names: Vec<String>,
+}
+
 pub struct CommanderMode {
     left: CommanderPane,
     right: CommanderPane,
@@ -137,6 +145,9 @@ pub struct CommanderMode {
     /// "Export to hard drive" write, whose destination is an external folder
     /// not shown in either pane (nothing to re-list).
     pending_host_copy: Option<(Option<Side>, Arc<Mutex<HostCopyStatus>>)>,
+    /// A host copy held back because files it would write already exist;
+    /// the modal lets the user overwrite, skip them, or cancel.
+    pending_host_conflict: Option<PendingHostConflict>,
     /// In-flight off-thread image->image staging copy (see
     /// [`commander_ops::spawn_stage_copy`]), plus the destination side its
     /// finished edits push onto.
@@ -190,6 +201,7 @@ impl CommanderMode {
             temp: None,
             unsaved_close: false,
             pending_host_copy: None,
+            pending_host_conflict: None,
             pending_stage_copy: None,
             progress_window: ProgressWindow::default(),
             checksums: None,
@@ -245,6 +257,7 @@ impl CommanderMode {
         self.poll_host_copy(ui.ctx());
         self.poll_stage_copy(ui.ctx());
         self.render_progress_modal(ui.ctx());
+        self.render_host_conflict_modal(ui.ctx());
 
         egui::Panel::top("commander_top").show_inside(ui, |ui| {
             ui.add_space(2.0);
@@ -651,16 +664,24 @@ impl CommanderMode {
                 // A reopenable source (local session or remote image) extracts on
                 // a worker with the same progress modal as any host copy. The
                 // completion poll re-lists the destination pane.
+                let conflicts =
+                    commander_ops::host_copy_conflicts(&entries, &dest_dir, Some(fork_mode));
                 if let Some(source) = src.copy_stage_source() {
                     let job = HostCopyJob::ImageToHost {
                         source,
                         entries,
                         dest_dir,
                         fork_mode,
+                        on_conflict: OnConflict::Fail,
                     };
-                    self.pending_host_copy =
-                        Some((Some(from.other()), commander_ops::spawn_host_copy(job)));
-                    return format!("Copying to the {other} folder...");
+                    return self.start_host_copy(job, Some(from.other()), conflicts, other);
+                }
+                if !conflicts.is_empty() {
+                    return format!(
+                        "{} item(s) already exist in the {other} folder; this source copies \
+                         synchronously, so remove them or pick an empty folder first.",
+                        conflicts.len()
+                    );
                 }
                 // No reopenable handle: a wrapper-tree mount (small, local) —
                 // extract synchronously over its live fs.
@@ -680,10 +701,13 @@ impl CommanderMode {
             // host -> host: immediate filesystem copy on a worker thread.
             (true, true) => {
                 let dest_dir = PathBuf::from(&dest_parent.path);
-                let job = HostCopyJob::HostToHost { entries, dest_dir };
-                self.pending_host_copy =
-                    Some((Some(from.other()), commander_ops::spawn_host_copy(job)));
-                format!("Copying to the {other} folder...")
+                let conflicts = commander_ops::host_copy_conflicts(&entries, &dest_dir, None);
+                let job = HostCopyJob::HostToHost {
+                    entries,
+                    dest_dir,
+                    on_conflict: OnConflict::Fail,
+                };
+                self.start_host_copy(job, Some(from.other()), conflicts, other)
             }
         }
     }
@@ -739,12 +763,14 @@ impl CommanderMode {
 
         // Host source + loose files: an immediate host-to-host copy.
         if src.is_host_pane() {
+            let conflicts = commander_ops::host_copy_conflicts(&entries, &dest, None);
             let job = HostCopyJob::HostToHost {
                 entries,
                 dest_dir: dest,
+                on_conflict: OnConflict::Fail,
             };
-            self.pending_host_copy = Some((None, commander_ops::spawn_host_copy(job)));
-            return format!("Exporting the {} pane selection...", from.label());
+            let where_to = format!("export folder ({} pane)", from.label());
+            return self.start_host_copy(job, None, conflicts, &where_to);
         }
         // A reopenable image source (local session, remote image, archive, or an
         // inline disk-image/optical wrapper) exports on a worker with progress.
@@ -771,6 +797,85 @@ impl CommanderMode {
             Ok(s) => format!("Exported {} file(s) to {}.", s.files, dest.display()),
             Err(e) => format!("Export failed: {e:#}"),
         }
+    }
+
+    /// Spawn `job` now, or hold it behind the conflict modal when `conflicts`
+    /// names host files it would write over. Returns the status line.
+    fn start_host_copy(
+        &mut self,
+        job: HostCopyJob,
+        dest_side: Option<Side>,
+        conflicts: Vec<String>,
+        where_to: &str,
+    ) -> String {
+        if conflicts.is_empty() {
+            self.pending_host_copy = Some((dest_side, commander_ops::spawn_host_copy(job)));
+            return format!("Copying to the {where_to} folder...");
+        }
+        let n = conflicts.len();
+        self.pending_host_conflict = Some(PendingHostConflict {
+            job,
+            dest_side,
+            names: conflicts,
+        });
+        format!("{n} item(s) already exist in the {where_to} folder; choose what to do.")
+    }
+
+    fn render_host_conflict_modal(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.pending_host_conflict.as_ref() else {
+            return;
+        };
+        let mut decision: Option<Option<OnConflict>> = None;
+        egui::Window::new("Files already exist")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "{} item(s) already exist in the destination folder:",
+                    pending.names.len()
+                ));
+                egui::ScrollArea::vertical()
+                    .max_height(160.0)
+                    .show(ui, |ui| {
+                        for name in pending.names.iter().take(50) {
+                            ui.monospace(name);
+                        }
+                        if pending.names.len() > 50 {
+                            ui.label(format!("... and {} more", pending.names.len() - 50));
+                        }
+                    });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Overwrite").clicked() {
+                        decision = Some(Some(OnConflict::Replace));
+                    }
+                    if ui.button("Skip existing").clicked() {
+                        decision = Some(Some(OnConflict::Skip));
+                    }
+                    if ui.button("Cancel").clicked() {
+                        decision = Some(None);
+                    }
+                });
+            });
+        let Some(decision) = decision else {
+            return;
+        };
+        let Some(pending) = self.pending_host_conflict.take() else {
+            return;
+        };
+        match decision {
+            Some(on) => {
+                let job = pending.job.with_conflict(on);
+                self.pending_host_copy =
+                    Some((pending.dest_side, commander_ops::spawn_host_copy(job)));
+                self.status = "Copying...".to_string();
+            }
+            None => {
+                self.status = "Copy cancelled; nothing was written.".to_string();
+            }
+        }
+        self.record_log(self.status.clone());
     }
 
     /// Poll an in-flight immediate host copy; on completion, re-list the

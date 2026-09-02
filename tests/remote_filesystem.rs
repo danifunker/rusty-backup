@@ -492,6 +492,7 @@ fn remote_source_host_copy_extracts_tree_over_wire() {
         entries,
         dest_dir: dest_dir.clone(),
         fork_mode: ResourceForkMode::DataForkOnly,
+        on_conflict: rusty_backup::fs::replace::OnConflict::Replace,
     });
 
     let mut waited = 0;
