@@ -1187,6 +1187,38 @@ impl<W: Write> Write for ChunkWriter<'_, W> {
     }
 }
 
+/// A sink that keeps the first `cap` bytes and counts the rest, so a stream
+/// that must be drained for framing cannot grow memory without bound.
+pub struct CappedSink {
+    pub buf: Vec<u8>,
+    cap: usize,
+    pub dropped: u64,
+}
+
+impl CappedSink {
+    pub fn new(cap: usize) -> Self {
+        Self {
+            buf: Vec::new(),
+            cap,
+            dropped: 0,
+        }
+    }
+}
+
+impl Write for CappedSink {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        let room = self.cap.saturating_sub(self.buf.len());
+        let keep = data.len().min(room);
+        self.buf.extend_from_slice(&data[..keep]);
+        self.dropped += (data.len() - keep) as u64;
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Read a chunk stream (written by [`ChunkWriter`]) into `sink` until the
 /// zero-length terminator. Returns the total byte count.
 pub fn read_chunks<R: Read, W: Write + ?Sized>(r: &mut R, sink: &mut W) -> io::Result<u64> {

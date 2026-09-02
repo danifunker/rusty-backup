@@ -1078,6 +1078,14 @@ fn handle_conn(
                 Ok(full) if full.is_dir() => {
                     reply_err(&mut writer, format!("{path} is a directory"))?
                 }
+                // A FIFO or device node would block the daemon on open or read.
+                Ok(full)
+                    if !std::fs::metadata(&full)
+                        .map(|m| m.is_file())
+                        .unwrap_or(false) =>
+                {
+                    reply_err(&mut writer, format!("{path} is not a regular file"))?
+                }
                 Ok(full) => match std::fs::File::open(&full) {
                     Err(e) => reply_err(&mut writer, format!("opening {path}: {e}"))?,
                     Ok(mut f) => {

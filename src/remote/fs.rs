@@ -123,16 +123,13 @@ impl Filesystem for RemoteFilesystem {
         entry: &FileEntry,
         max_bytes: usize,
     ) -> Result<Vec<u8>, FilesystemError> {
-        // The wire `ReadFile` streams the whole file (no ranged read yet), so we
-        // collect it all and then cap — fine for previews of modest files.
-        let mut buf = Vec::new();
+        // The wire `ReadFile` streams the whole file (no ranged read yet); keep
+        // the first `max_bytes` and let the rest drain without buffering it.
+        let mut sink = crate::remote::protocol::CappedSink::new(max_bytes);
         lock_conn(&self.conn)?
-            .read_file(self.handle, &entry.path, &mut buf)
+            .read_file(self.handle, &entry.path, &mut sink)
             .map_err(wire_err)?;
-        if buf.len() > max_bytes {
-            buf.truncate(max_bytes);
-        }
-        Ok(buf)
+        Ok(sink.buf)
     }
 
     fn write_file_to(
@@ -274,14 +271,11 @@ impl Filesystem for RemoteHostFilesystem {
         entry: &FileEntry,
         max_bytes: usize,
     ) -> Result<Vec<u8>, FilesystemError> {
-        let mut buf = Vec::new();
+        let mut sink = crate::remote::protocol::CappedSink::new(max_bytes);
         lock_conn(&self.conn)?
-            .read_host_file(&entry.path, &mut buf)
+            .read_host_file(&entry.path, &mut sink)
             .map_err(wire_err)?;
-        if buf.len() > max_bytes {
-            buf.truncate(max_bytes);
-        }
-        Ok(buf)
+        Ok(sink.buf)
     }
 
     fn write_file_to(
