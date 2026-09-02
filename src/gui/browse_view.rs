@@ -4235,6 +4235,9 @@ impl BrowseView {
         self.directory_cache.clear();
         self.selected_entry = None;
         self.content = None;
+        // Checkbox marks hold FileEntry snapshots; after a write they may
+        // name renamed or deleted files, and an export would use them.
+        self.marked.clear();
         self.invalidate_cached_fs();
         if let Some(mut fs) = self.take_or_open_fs() {
             if let Ok(root) = fs.root() {
