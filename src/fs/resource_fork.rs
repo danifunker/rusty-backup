@@ -603,11 +603,9 @@ pub fn parse_macbinary(data: &[u8]) -> Option<ImportedResourceFork> {
     let data_padded = pad_to_128(data_len);
     let rsrc_start = data_start + data_padded;
 
+    // A data-fork-only file is still MacBinary: type, creator and the Mac
+    // name ride in the header, and the 128 bytes are not file content.
     if rsrc_start + rsrc_len > data.len() || data_start + data_len > data.len() {
-        return None;
-    }
-
-    if rsrc_len == 0 {
         return None;
     }
 
@@ -821,9 +819,10 @@ mod tests {
         assert!(parse_appledouble(&ad).is_none());
     }
 
+    /// Rejecting a data-fork-only MacBinary made `put` copy its 128-byte
+    /// header in as file content under the wrapper's host name.
     #[test]
-    fn test_parse_macbinary_no_rsrc() {
-        // Build a MacBinary with no resource fork
+    fn test_parse_macbinary_no_rsrc_still_unwraps() {
         let mb = build_macbinary(
             "test.txt",
             b"TEXT",
@@ -832,7 +831,11 @@ mod tests {
             b"data",
             &[],
         );
-        assert!(parse_macbinary(&mb).is_none());
+        let parsed = parse_macbinary(&mb).expect("a MacBinary with an empty resource fork");
+        assert!(parsed.data.is_empty());
+        assert_eq!(parsed.data_fork.as_deref(), Some(b"data".as_slice()));
+        assert_eq!(parsed.type_code, Some(*b"TEXT"));
+        assert_eq!(parsed.name.as_deref(), Some("test.txt"));
     }
 
     #[test]
