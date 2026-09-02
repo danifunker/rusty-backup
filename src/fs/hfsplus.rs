@@ -3327,10 +3327,13 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
         // last genuine user-data block instead.
         let search_up_to = self.vh.total_blocks.saturating_sub(2);
         let last = find_last_set_bit(&bitmap, search_up_to);
+        // The trim point must leave room for the alternate VH at the new end:
+        // the resizer counts those trailing blocks as used (two at 512 bytes).
+        let trailing: u64 = if self.vh.block_size <= 512 { 2 } else { 1 };
         match last {
             Some(block) => {
-                let byte = (block as u64 + 1) * self.vh.block_size as u64;
-                Ok(byte)
+                let byte = (block as u64 + 1 + trailing) * self.vh.block_size as u64;
+                Ok(byte.min(self.total_size()))
             }
             None => Ok(self.total_size()),
         }
@@ -8466,9 +8469,9 @@ mod tests {
         let defrag = fs.defragmented_minimum_size().unwrap();
 
         assert_eq!(total, 256 * 4096);
-        // Last allocated block is 5 (bits 0..=5 set in bitmap byte 0) →
-        // byte (5+1) * 4096 = 24 KiB.
-        assert_eq!(in_place, 6 * 4096);
+        // Last allocated block is 5 (bits 0..=5 set in bitmap byte 0), plus
+        // one block for the alternate VH at the new end: (5+1+1) * 4096.
+        assert_eq!(in_place, 7 * 4096);
         // Defrag = (used + catalog_total_blocks*3) blocks * block_size +
         // 1024 alt-VH, rounded up. Synthetic image's catalog_total_blocks
         // is 4 → delta is 12 → 6 + 12 = 18 user blocks + alt-VH = 19.
@@ -8504,8 +8507,9 @@ mod tests {
         let in_place = fs.last_data_byte().unwrap();
         let defrag = fs.defragmented_minimum_size().unwrap();
 
-        // In-place trim hugs the new tail allocation: byte (200+1)*4096.
-        assert_eq!(in_place, 201 * 4096);
+        // In-place trim hugs the new tail allocation plus the alternate-VH
+        // block: (200+1+1)*4096.
+        assert_eq!(in_place, 202 * 4096);
         // Defrag: (7 used + 12 catalog-growth) blocks * 4096 + 1024 alt-VH,
         // rounded up = 20 blocks. Still well under in_place (201 blocks).
         assert_eq!(defrag, 20 * 4096);
