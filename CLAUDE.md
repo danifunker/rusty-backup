@@ -27,6 +27,11 @@ cargo fmt                      # Auto-format
 cargo clippy                   # Lint
 ```
 
+Debug builds use `debug = "line-tables-only"` and cargo is capped at four jobs
+(`.cargo/config.toml`); a full-debuginfo, all-cores debug build of this tree
+gets the terminal session OOM-killed on a 16 GB machine. Do not override either
+setting, and never run two cargo builds at once. See `docs/build-memory-crashes.md`.
+
 ## Build Infrastructure
 
 ### Versioning

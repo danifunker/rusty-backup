@@ -359,3 +359,12 @@ openssl = "*"
 # Arch package metadata
 [package.metadata.aur]
 depends = ["gtk3", "openssl"]
+
+# Debug builds carry line tables only. With full debuginfo the lib test binary
+# was 839 MB and each integration test 350-440 MB; linking several of those in
+# parallel drove a 16 GB machine into systemd-oomd, which kills the whole
+# terminal session, not just rustc. `cargo test` inherits this via profile.test.
+# Force full debuginfo for one run with CARGO_PROFILE_DEV_DEBUG=2 when a
+# debugger needs locals. Details: docs/build-memory-crashes.md.
+[profile.dev]
+debug = "line-tables-only"

@@ -1,0 +1,8 @@
+# Cap concurrent rustc / linker jobs. The tree is ~400k lines in one crate and
+# `cargo test` / `--all-targets` builds ~100 binaries against it, so at the
+# default (one job per core) six links of test binaries ran at once and pushed
+# a 16 GB machine into the OOM killer. Four keeps the peak under control on the
+# 16 GB desktops this is developed on; override for one run with `cargo -j N`
+# or CARGO_BUILD_JOBS=N. Details: docs/build-memory-crashes.md.
+[build]
+jobs = 4
