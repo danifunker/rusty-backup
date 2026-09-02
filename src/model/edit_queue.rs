@@ -336,6 +336,18 @@ pub fn apply_edit(
         }
         StagedEdit::CreateDirectory { parent, name } => {
             let resolved_parent = resolve_dir_by_path(efs, &parent.path)?;
+            // A folder that is already there is the outcome asked for; only a
+            // file in the way is a real collision (the pre-scan skips folders).
+            if let Some(existing) = efs
+                .list_directory(&resolved_parent)?
+                .into_iter()
+                .find(|e| &e.name == name)
+            {
+                if existing.is_directory() {
+                    return Ok(());
+                }
+                return Err(FilesystemError::AlreadyExists(name.clone()));
+            }
             efs.create_directory(&resolved_parent, name, &CreateDirectoryOptions::default())?;
             Ok(())
         }
@@ -1196,6 +1208,46 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert!(lines[0].starts_with("Permissions: /d/f -> 600"));
         assert!(lines[1].starts_with("Delete: /d/f"));
+    }
+
+    /// X5: a staged "new folder" whose name already exists as a folder is
+    /// done, not a mid-batch error; a file in the way still is one.
+    #[test]
+    fn creating_a_directory_that_exists_is_a_no_op_but_a_file_in_the_way_fails() {
+        use crate::fs::fat::{create_blank_fat, FatFilesystem};
+        use crate::fs::filesystem::{CreateDirectoryOptions, CreateFileOptions, Filesystem};
+        use std::io::Cursor;
+
+        let img = create_blank_fat(2 * 1024 * 1024, Some("T")).unwrap();
+        let mut fs = FatFilesystem::open(Cursor::new(img), 0).unwrap();
+        let root = fs.root().unwrap();
+        fs.create_directory(&root, "DOCS", &CreateDirectoryOptions::default())
+            .unwrap();
+        let mut d = Cursor::new(b"x".to_vec());
+        fs.create_file(&root, "NOTE", &mut d, 1, &CreateFileOptions::default())
+            .unwrap();
+
+        let again = StagedEdit::CreateDirectory {
+            parent: root.clone(),
+            name: "DOCS".to_string(),
+        };
+        apply_edit(&mut fs, &again).expect("existing folder is a no-op");
+        let dirs = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.name == "DOCS")
+            .count();
+        assert_eq!(dirs, 1, "no duplicate folder");
+
+        let over_file = StagedEdit::CreateDirectory {
+            parent: root.clone(),
+            name: "NOTE".to_string(),
+        };
+        assert!(matches!(
+            apply_edit(&mut fs, &over_file),
+            Err(FilesystemError::AlreadyExists(_))
+        ));
     }
 
     /// Conflicts are found before anything is applied, so the user answers once
