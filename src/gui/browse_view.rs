@@ -3402,10 +3402,17 @@ impl BrowseView {
             ui.separator();
             ui.add_space(8.0);
 
-            // Apply button — only shown when edits are staged
+            // Apply button: only with staged edits, and not while an extraction
+            // or tar export is still reading the volume the apply would rewrite.
             if !self.staged_edits.is_empty() {
                 let label = format!("Apply Edits ({})", self.staged_edits.len());
-                if ui.button(label).clicked() {
+                let reading =
+                    self.extraction_progress.is_some() || self.tar_export_progress.is_some();
+                if ui
+                    .add_enabled(!reading, egui::Button::new(label))
+                    .on_disabled_hover_text("Wait for the running extraction or export to finish")
+                    .clicked()
+                {
                     let applied = self.apply_staged_edits();
                     if applied && self.archive_edit_ctx.is_some() && !self.has_edit_error() {
                         self.start_archive_compress();
