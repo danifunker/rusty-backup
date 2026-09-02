@@ -2869,6 +2869,24 @@ pub fn is_amiga_sfs_type(s: &str) -> bool {
 // `partition_is_browsable` is the combined gate the partition grids actually
 // call; the others gate the more specific Check / Expand actions.
 
+/// The MBR type byte whose gates match a superfloppy's detected filesystem, so
+/// a bare volume is graded like the same filesystem inside a partition table.
+pub fn gate_type_byte_for_hint(fs_hint: &str) -> u8 {
+    match fs_hint {
+        "HFS" | "HFS+" | "HFSX" => 0xAF,
+        "ext" | "btrfs" | "XFS" | "ReiserFS" | "UFS" | "JFS" | "squashfs" => 0x83,
+        "ProDOS" => 0xA8,
+        "FAT" => 0x0C,
+        "NTFS" | "exFAT" | "HPFS" => 0x07,
+        "minix" => 0x81,
+        "BFS" => 0xEB,
+        "BeOS OFS" => 0xEC,
+        "EFS" => 0xA1,
+        "SGI EFS v1" => 0xA2,
+        _ => 0,
+    }
+}
+
 /// True for an MBR partition type byte whose filesystem the browser can open.
 pub fn is_browsable_type(ptype: u8) -> bool {
     matches!(
@@ -4376,6 +4394,62 @@ mod adfs_density_tests {
                 "density {density}: {table:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod superfloppy_gate_tests {
+    use super::*;
+    use crate::partition::{PartitionInfo, PartitionTable};
+    use std::io::Cursor;
+
+    fn superfloppy(img: Vec<u8>) -> PartitionInfo {
+        let table = PartitionTable::detect(&mut Cursor::new(img)).unwrap();
+        assert!(matches!(table, PartitionTable::None { .. }), "{table:?}");
+        let mut parts = table.partitions();
+        assert_eq!(parts.len(), 1);
+        parts.remove(0)
+    }
+
+    /// F12: a bare volume has type byte 0 and no type string, so the gates
+    /// called it packing and pick_shrink_target chose the defragmented size
+    /// for a layout-preserving HFS or ext volume, which drops blocks.
+    #[test]
+    fn a_bare_volume_is_graded_like_the_same_filesystem_in_a_table() {
+        let hfs = crate::fs::hfs::create_blank_hfs(8 * 1024 * 1024, 4096, "Bare").unwrap();
+        let part = superfloppy(hfs);
+        assert_eq!(part.partition_type_byte, 0);
+        assert_eq!(part.gate_type_byte(), 0xAF, "{}", part.type_name);
+        assert!(is_layout_preserving_fs(part.gate_type_byte(), None));
+
+        let ext = crate::fs::ext_format::create_blank_ext2(16 * 1024 * 1024, "bare").unwrap();
+        let part = superfloppy(ext);
+        assert_eq!(part.gate_type_byte(), 0x83, "{}", part.type_name);
+        assert_eq!(
+            pick_shrink_target(part.gate_type_byte(), None, Some(500), Some(100)),
+            Some(500),
+            "a bare ext volume must keep the in-place trim"
+        );
+
+        let fat = crate::fs::fat::create_blank_fat32(64 * 1024 * 1024, Some("BARE")).unwrap();
+        let part = superfloppy(fat);
+        assert_eq!(part.gate_type_byte(), 0x0C, "{}", part.type_name);
+        assert!(!is_layout_preserving_fs(part.gate_type_byte(), None));
+    }
+
+    /// A superfloppy that already routes through its type string (AmigaDOS,
+    /// Human68k) and any real table entry keep their own byte.
+    #[test]
+    fn gate_type_byte_leaves_string_routed_and_table_entries_alone() {
+        let mut amiga =
+            superfloppy(crate::fs::fat::create_blank_fat32(64 * 1024 * 1024, None).unwrap());
+        amiga.partition_type_string = Some("DOS\\1".to_string());
+        amiga.type_name = "HFS".to_string();
+        assert_eq!(amiga.gate_type_byte(), 0);
+        let mut mbr = amiga.clone();
+        mbr.partition_type_string = None;
+        mbr.partition_type_byte = 0x83;
+        assert_eq!(mbr.gate_type_byte(), 0x83);
     }
 }
 

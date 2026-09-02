@@ -223,7 +223,7 @@ pub(super) fn analyze_partitions(
                     .map(|(_, v)| *v)
             });
             let needs_walk = fs::is_expensive_minimum(
-                part.partition_type_byte,
+                part.gate_type_byte(),
                 part.partition_type_string.as_deref(),
             ) && pre.is_none();
             if let Some(v) = pre {

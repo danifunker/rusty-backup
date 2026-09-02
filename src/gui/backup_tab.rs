@@ -588,7 +588,7 @@ impl BackupTab {
                             // or blank.
                             let effective = self.effective_min_size(
                                 part.index,
-                                part.partition_type_byte,
+                                part.gate_type_byte(),
                                 part.partition_type_string.as_deref(),
                             );
                             if let Some(min) = effective.filter(|&sz| sz < part.size_bytes) {
@@ -630,7 +630,7 @@ impl BackupTab {
                             // (with "not implemented" tooltip) when the FS
                             // doesn't have a clone pipeline yet.
                             let is_layout = fs::is_layout_preserving_fs(
-                                part.partition_type_byte,
+                                part.gate_type_byte(),
                                 part.partition_type_string.as_deref(),
                             );
                             // Compact/Defrag is live when the FS has a registered
@@ -639,7 +639,7 @@ impl BackupTab {
                             // trim (exFAT today; NTFS once its packer lands).
                             let available = self.defrag_clone_available(
                                 part.index,
-                                part.partition_type_byte,
+                                part.gate_type_byte(),
                                 part.partition_type_string.as_deref(),
                             );
                             if is_layout || available {
@@ -1248,10 +1248,7 @@ impl BackupTab {
                 .get(&part_index)
                 .copied()
                 .unwrap_or_else(|| {
-                    fs::fs_name_for(
-                        part.partition_type_byte,
-                        part.partition_type_string.as_deref(),
-                    )
+                    fs::fs_name_for(part.gate_type_byte(), part.partition_type_string.as_deref())
                 });
             ctx.log.info(format!(
                 "Calculating minimum size for partition {part_index} ({fs_name}) over the wire...",
@@ -2100,7 +2097,7 @@ impl BackupTab {
                 if part.is_extended_container {
                     continue;
                 }
-                let type_byte = part.partition_type_byte;
+                let type_byte = part.gate_type_byte();
                 let type_str = part.partition_type_string.as_deref();
                 if !is_superfloppy && fs::fs_name_for(type_byte, type_str) == "unknown" {
                     continue;
@@ -2468,7 +2465,7 @@ impl BackupTab {
                     .copied()
                     .unwrap_or(false);
                 let has_clone = fs::has_defragmenting_writer(
-                    part.partition_type_byte,
+                    part.gate_type_byte(),
                     part.partition_type_string.as_deref(),
                 );
                 if defrag_enabled && has_clone {
@@ -2476,7 +2473,7 @@ impl BackupTab {
                 }
                 let effective = self.effective_min_size(
                     part.index,
-                    part.partition_type_byte,
+                    part.gate_type_byte(),
                     part.partition_type_string.as_deref(),
                 );
                 let target = match effective {
@@ -2519,7 +2516,7 @@ impl BackupTab {
                 continue;
             }
             if !fs::has_defragmenting_writer(
-                part.partition_type_byte,
+                part.gate_type_byte(),
                 part.partition_type_string.as_deref(),
             ) {
                 continue;
@@ -2538,7 +2535,7 @@ impl BackupTab {
             .filter_map(|p| {
                 self.effective_min_size(
                     p.index,
-                    p.partition_type_byte,
+                    p.gate_type_byte(),
                     p.partition_type_string.as_deref(),
                 )
                 .map(|sz| (p.index, sz))

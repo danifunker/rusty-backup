@@ -156,6 +156,16 @@ impl PartitionInfo {
     pub fn byte_offset(&self) -> u64 {
         self.start_byte.unwrap_or(self.start_lba * 512)
     }
+
+    /// Type byte for the capability gates. A superfloppy carries byte 0 and no
+    /// type string, so its detected filesystem (kept in `type_name`) stands in.
+    pub fn gate_type_byte(&self) -> u8 {
+        if self.partition_type_byte == 0 && self.partition_type_string.is_none() {
+            crate::fs::gate_type_byte_for_hint(&self.type_name)
+        } else {
+            self.partition_type_byte
+        }
+    }
 }
 
 /// Standard floppy disk image sizes (bytes).

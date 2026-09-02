@@ -117,7 +117,7 @@ pub fn build_partition_configs(
         let live_in_place = partition_min_sizes.get(&part.index).copied();
         let live_defrag = partition_defrag_min_sizes.get(&part.index).copied();
         let live_min = crate::fs::pick_shrink_target(
-            part.partition_type_byte,
+            part.gate_type_byte(),
             part.partition_type_string.as_deref(),
             live_in_place,
             live_defrag,
