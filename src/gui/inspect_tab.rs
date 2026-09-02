@@ -1704,34 +1704,34 @@ impl InspectTab {
                 }
                 if is_chd_format {
                     per_part_resp.on_hover_text(
-                        "Per-partition export is not supported for CHD — each \
+                        "Per-partition export is not supported for CHD - each \
                          partition would be a headless slice with no MBR/GPT, \
                          which no emulator can consume. Use whole-disk export \
                          instead.",
                     );
                 } else if is_dynamic_vhd {
                     per_part_resp.on_hover_text(
-                        "Per-partition export is not supported for dynamic VHD — \
+                        "Per-partition export is not supported for dynamic VHD - \
                          the sparse layout wraps a whole disk and buys nothing on \
                          a single mostly-used partition. Use fixed VHD for \
                          per-partition export.",
                     );
                 } else if is_qcow2 {
                     per_part_resp.on_hover_text(
-                        "Per-partition export is not supported for QCOW2 — \
+                        "Per-partition export is not supported for QCOW2 - \
                          the sparse layout wraps a whole-disk geometry that \
                          QEMU/UTM expect to find an MBR/GPT/APM at sector 0.",
                     );
                 } else if is_vmdk_flat {
                     per_part_resp.on_hover_text(
-                        "Per-partition export is not supported for VMDK flat — \
+                        "Per-partition export is not supported for VMDK flat - \
                          the descriptor wraps a whole-disk geometry that \
                          VMware/qemu-img/VirtualBox expect to find a partition \
                          table at sector 0 of.",
                     );
                 } else if is_vmdk_sparse {
                     per_part_resp.on_hover_text(
-                        "Per-partition export is not supported for VMDK sparse — \
+                        "Per-partition export is not supported for VMDK sparse - \
                          the grain directory wraps a whole-disk geometry that \
                          VMware/qemu-img/VirtualBox expect to find a partition \
                          table at sector 0 of.",
@@ -1750,17 +1750,17 @@ impl InspectTab {
                         "VHD (Dynamic)",
                     )
                     .on_hover_text(
-                        "Sparse VHD — all-zero blocks are omitted. Same .vhd extension; \
+                        "Sparse VHD - all-zero blocks are omitted. Same .vhd extension; \
                          readable by Hyper-V, qemu-img, Disk Management.",
                     );
                     ui.radio_value(&mut self.export_format, ExportFormat::Qcow2, "QCOW2")
                         .on_hover_text(
-                            "QCOW2 v3 — sparse, uncompressed. The container UTM uses \
+                            "QCOW2 v3 - sparse, uncompressed. The container UTM uses \
                              for classic-Mac PPC guests; opens in QEMU, virt-manager.",
                         );
                     ui.radio_value(&mut self.export_format, ExportFormat::VmdkFlat, "VMDK (Flat)")
                         .on_hover_text(
-                            "monolithicFlat VMDK — emits <name>.vmdk descriptor + \
+                            "monolithicFlat VMDK - emits <name>.vmdk descriptor + \
                              <name>-flat.vmdk raw extent. Opens in VMware Workstation/\
                              Fusion, VirtualBox, qemu-img.",
                         );
@@ -1770,7 +1770,7 @@ impl InspectTab {
                         "VMDK (Sparse)",
                     )
                     .on_hover_text(
-                        "monolithicSparse VMDK — single self-contained .vmdk; \
+                        "monolithicSparse VMDK - single self-contained .vmdk; \
                          zero grains omitted. Opens in VMware, VirtualBox, qemu-img.",
                     );
                     ui.radio_value(&mut self.export_format, ExportFormat::Raw, "Raw (.img)");
@@ -1816,7 +1816,7 @@ impl InspectTab {
                         );
                     } else {
                         hd_resp.on_hover_text(
-                            "CHD export needs a raw image or device source — backup \
+                            "CHD export needs a raw image or device source - backup \
                              folders and Clonezilla images aren't supported.",
                         );
                     }
@@ -1918,7 +1918,7 @@ impl InspectTab {
                                 "PFS3's allocator scatters blocks throughout the volume, so \
                                  in-place trim can't free up space. The export pipeline will \
                                  instead walk the source and rebuild a packed copy at the new \
-                                 size — limitations to be aware of:",
+                                 size - limitations to be aware of:",
                             );
                             ui.label(
                                 "  - PFS3 trashcan (deldir) contents are NOT preserved.",
@@ -2018,7 +2018,7 @@ impl InspectTab {
                                 "Warning: the source is a sector-by-sector backup. \
                                  Re-exporting with new partition sizes drops the \
                                  byte-for-byte preservation of free space and \
-                                 unrecognized filesystem regions — only smart-compact \
+                                 unrecognized filesystem regions - only smart-compact \
                                  areas of recognized partitions carry over.",
                             )
                             .color(super::theme::warning(ui.visuals())),
@@ -3934,7 +3934,7 @@ impl InspectTab {
                     ui.label(egui::RichText::new("Slot").strong())
                         .on_hover_text(
                             "The partition table's own slot, as the platform names it \
-                         (diskutil's disk4s6, IRIX slot 0) — the number `IMG@sN` takes",
+                         (diskutil's disk4s6, IRIX slot 0) - the number `IMG@sN` takes",
                         );
                 }
                 ui.label(egui::RichText::new("Type").strong());
@@ -4202,7 +4202,7 @@ impl InspectTab {
                                         .on_hover_text(
                                             "Repack this Human68k volume so its files are stored \
                                          contiguously, reclaiming holes left by deleted files. \
-                                         Rewrites the partition in place — back up first.",
+                                         Rewrites the partition in place - back up first.",
                                         )
                                         .clicked()
                                 {

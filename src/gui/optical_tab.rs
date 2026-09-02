@@ -725,7 +725,7 @@ impl OpticalTab {
                     ui.add_space(60.0);
                     ui.checkbox(&mut self.eject_after, "Eject after ripping")
                         .on_hover_text(
-                            "Ejects the source drive on its own machine — the \
+                            "Ejects the source drive on its own machine - the \
                              remote daemon's drive for a remote source.",
                         );
                 });

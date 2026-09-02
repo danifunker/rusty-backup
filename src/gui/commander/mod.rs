@@ -580,7 +580,7 @@ impl CommanderMode {
             } else {
                 // A '+'-expanded wrapper mount has no reopenable handle; uploading
                 // it over the wire isn't wired yet.
-                return "This source can't be uploaded to a remote folder yet — \
+                return "This source can't be uploaded to a remote folder yet - \
                         copy it to a local folder first."
                     .to_string();
             };

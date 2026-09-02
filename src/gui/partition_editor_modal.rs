@@ -246,7 +246,7 @@ fn show_edit_existing(
                         } else if table_type == "RDB" {
                             ui.horizontal(|ui| {
                                 let tip = "Whether this RDB partition is eligible to boot. \
-                                           Multiple partitions can be set to boot at once — \
+                                           Multiple partitions can be set to boot at once - \
                                            the Amiga ROM picks the one with the highest boot \
                                            priority among them.";
                                 let mut val = editor.entries[i].bootable;

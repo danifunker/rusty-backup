@@ -559,7 +559,7 @@ impl BackupTab {
                             .on_hover_text(
                                 "Compact Space re-emits every allocated fork back-to-back, \
                                  closing the holes between files and producing a smaller backup. \
-                                 Drastically increases backup time — recommended only when the \
+                                 Drastically increases backup time - recommended only when the \
                                  Min Size column shows meaningful savings vs. the in-place trim. \
                                  Available for HFS+/HFSX today; other layout-preserving \
                                  filesystems show the toggle as not implemented.",

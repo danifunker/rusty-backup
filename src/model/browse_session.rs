@@ -909,7 +909,7 @@ mod tests {
         // APFS FileVault: locked (root-listing) and wrong-passphrase (open).
         assert!(looks_like_password_error(
             "Failed to read root directory: APFS volume is encrypted (FileVault) \
-             — a passphrase or personal recovery key is required to browse it"
+             - a passphrase or personal recovery key is required to browse it"
         ));
         assert!(looks_like_password_error(
             "wrong APFS passphrase (KEK unwrap failed)"
