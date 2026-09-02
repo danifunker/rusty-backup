@@ -1240,7 +1240,9 @@ impl eframe::App for RustyBackupApp {
                         self.loaded_backup_folder = Some(new_backup.clone());
                         self.inspect_tab.load_backup(&new_backup);
                     }
-                } else if !self.restore_tab.has_backup() {
+                } else if !self.restore_tab.has_backup() && !self.restore_tab.has_other_source() {
+                    // Only an empty tab adopts the shared folder; a tab the user
+                    // pointed at an image must not have it re-installed each frame.
                     if let Some(folder) = self.loaded_backup_folder.as_ref() {
                         self.restore_tab.load_backup(folder);
                     }
@@ -1268,7 +1270,8 @@ impl eframe::App for RustyBackupApp {
                         self.loaded_backup_folder = Some(new_backup.clone());
                         self.restore_tab.load_backup(&new_backup);
                     }
-                } else if !self.inspect_tab.has_backup() {
+                } else if !self.inspect_tab.has_backup() && !self.inspect_tab.has_loaded_source() {
+                    // Same rule: an image or device open in Inspect stays open.
                     if let Some(folder) = self.loaded_backup_folder.as_ref() {
                         self.inspect_tab.load_backup(folder);
                     }

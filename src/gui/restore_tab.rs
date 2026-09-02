@@ -303,6 +303,17 @@ impl RestoreTab {
         self.backup_metadata.is_some() || self.clonezilla_image.is_some()
     }
 
+    /// A source the user picked instead of a backup folder: an image for
+    /// single-partition / new-disk restore, or the Write Image / Build Disk modes.
+    pub fn has_other_source(&self) -> bool {
+        self.sp_image_file.is_some()
+            || self.nd_image_file_path.is_some()
+            || matches!(
+                self.restore_mode,
+                RestoreMode::WriteImage | RestoreMode::BuildDisk
+            )
+    }
+
     pub fn load_backup(&mut self, path: &PathBuf) {
         if self.backup_folder.as_ref() != Some(path) {
             self.backup_folder = Some(path.clone());
