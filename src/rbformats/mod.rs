@@ -233,6 +233,54 @@ pub(crate) use compress::{
     write_zeros_with_progress, OutputHasherHandle, SplitWriter, CHUNK_SIZE,
 };
 
+/// The parsed GPT / APM sidecar a backup folder carries for its table type.
+/// Without it a GPT export keeps only its protective MBR and an APM export is
+/// patched as if its driver-descriptor block were an MBR.
+pub fn load_table_sidecars(
+    backup_folder: &Path,
+    table_type: &str,
+    log_cb: &mut impl FnMut(&str),
+) -> Result<(Option<Gpt>, Option<Apm>)> {
+    let mut gpt = None;
+    let mut apm = None;
+    match table_type {
+        "GPT" => {
+            let path = backup_folder.join("gpt.json");
+            if path.exists() {
+                let file = std::fs::File::open(&path)
+                    .with_context(|| format!("failed to open {}", path.display()))?;
+                let parsed: Gpt =
+                    serde_json::from_reader(file).context("failed to parse gpt.json")?;
+                log_cb(&format!(
+                    "Loaded GPT: {} partition entries",
+                    parsed.entries.len()
+                ));
+                gpt = Some(parsed);
+            } else {
+                log_cb("GPT backup has no gpt.json; GPT structures will not be written");
+            }
+        }
+        "APM" => {
+            let path = backup_folder.join("apm.json");
+            if path.exists() {
+                let file = std::fs::File::open(&path)
+                    .with_context(|| format!("failed to open {}", path.display()))?;
+                let parsed: Apm =
+                    serde_json::from_reader(file).context("failed to parse apm.json")?;
+                log_cb(&format!(
+                    "Loaded APM: {} partition entries",
+                    parsed.entries.len()
+                ));
+                apm = Some(parsed);
+            } else {
+                log_cb("APM backup has no apm.json; APM structures will not be written");
+            }
+        }
+        _ => {}
+    }
+    Ok((gpt, apm))
+}
+
 /// Reconstruct a disk image from a backup folder, writing to any seekable writer.
 ///
 /// Shared by: VHD export (file writer), restore (device or file writer).
@@ -2089,5 +2137,54 @@ mod tests {
             new_total_blocks, expected_blocks,
             "HFS MDB drNmAlBlks should be updated to reflect new size"
         );
+    }
+}
+
+#[cfg(test)]
+mod table_sidecar_tests {
+    use super::*;
+    use crate::partition::apm::build_minimal_apm;
+    use crate::partition::gpt::{build_minimal_gpt, Guid};
+
+    /// BR6: exports handed the reconstruction no GPT / APM, so a GPT export
+    /// kept only its protective MBR and an APM export was patched as an MBR.
+    #[test]
+    fn gpt_and_apm_sidecars_load_for_their_table_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let guid = Guid::from_string("EBD0A0A2-B9E5-4433-87C0-68B6B72699C7").unwrap();
+        let gpt = build_minimal_gpt(&[(guid, 2048, 65535, "data".into())], 64 * 1024 * 1024);
+        std::fs::write(
+            dir.path().join("gpt.json"),
+            serde_json::to_vec(&gpt).unwrap(),
+        )
+        .unwrap();
+        let apm = build_minimal_apm(&[("Apple_HFS".to_string(), 64, 1024)], 512, 4096);
+        std::fs::write(
+            dir.path().join("apm.json"),
+            serde_json::to_vec(&apm).unwrap(),
+        )
+        .unwrap();
+        let mut log = Vec::new();
+        let mut log_cb = |m: &str| log.push(m.to_string());
+
+        let (g, a) = load_table_sidecars(dir.path(), "GPT", &mut log_cb).unwrap();
+        assert_eq!(g.map(|g| g.entries.len()), Some(gpt.entries.len()));
+        assert!(a.is_none());
+        let (g, a) = load_table_sidecars(dir.path(), "APM", &mut log_cb).unwrap();
+        assert!(g.is_none());
+        assert_eq!(a.map(|a| a.entries.len()), Some(apm.entries.len()));
+        let (g, a) = load_table_sidecars(dir.path(), "MBR", &mut log_cb).unwrap();
+        assert!(g.is_none() && a.is_none());
+        assert!(log.iter().all(|l| l.starts_with("Loaded ")), "{log:?}");
+    }
+
+    #[test]
+    fn a_gpt_backup_without_its_sidecar_warns_instead_of_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = Vec::new();
+        let (g, a) =
+            load_table_sidecars(dir.path(), "GPT", &mut |m: &str| log.push(m.to_string())).unwrap();
+        assert!(g.is_none() && a.is_none());
+        assert!(log.iter().any(|l| l.contains("no gpt.json")), "{log:?}");
     }
 }

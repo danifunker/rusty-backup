@@ -795,6 +795,8 @@ pub fn export_whole_disk_vhd(
             .open(dest_path)
             .with_context(|| format!("failed to create {}", dest_path.display()))?;
 
+        let (gpt_sidecar, apm_sidecar) =
+            super::load_table_sidecars(source_path, &meta.partition_table_type, &mut log_cb)?;
         total_written = reconstruct_disk_from_backup(
             source_path,
             meta,
@@ -804,8 +806,8 @@ pub fn export_whole_disk_vhd(
             &mut file,
             false, // VHD export is to a file
             false, // No need to write zeros for VHD files
-            None,  // VHD export doesn't write GPT structures
-            None,  // VHD export doesn't write APM structures
+            gpt_sidecar.as_ref(),
+            apm_sidecar.as_ref(),
             &mut progress_cb,
             &cancel_check,
             &mut log_cb,
