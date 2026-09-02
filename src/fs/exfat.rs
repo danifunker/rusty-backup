@@ -113,6 +113,9 @@ pub struct ExfatFilesystem<R> {
     bitmap_start_cluster: u32,
     bitmap_size: u64,
     used_bytes: u64,
+    /// First cluster -> DataLength of every NoFatChain entry seen while
+    /// listing; their FAT entries are 0, so a chain walk stops after one cluster.
+    no_fat_chain: std::collections::HashMap<u32, u64>,
 }
 
 /// Immutable geometry snapshot handed to the fsck module (`exfat_fsck`).
@@ -191,6 +194,7 @@ impl<R: Read + Seek> ExfatFilesystem<R> {
             bitmap_start_cluster: 0,
             bitmap_size: 0,
             used_bytes: 0,
+            no_fat_chain: Default::default(),
         };
 
         // Read root directory to find allocation bitmap and volume label
@@ -351,6 +355,19 @@ impl<R: Read + Seek> ExfatFilesystem<R> {
         Ok(data)
     }
 
+    /// Read an entry's data by whichever description it carries: the FAT chain,
+    /// or the contiguous run a NoFatChain entry declares.
+    pub(crate) fn read_entry_data(
+        &mut self,
+        start_cluster: u32,
+        max_bytes: Option<u64>,
+    ) -> Result<Vec<u8>, FilesystemError> {
+        match self.no_fat_chain.get(&start_cluster) {
+            Some(&len) => self.read_contiguous_clusters(start_cluster, len, max_bytes),
+            None => self.read_cluster_chain(start_cluster, max_bytes),
+        }
+    }
+
     /// Read contiguous cluster data (NoFatChain flag set).
     pub(crate) fn read_contiguous_clusters(
         &mut self,
@@ -474,7 +491,7 @@ impl<R: Read + Seek> ExfatFilesystem<R> {
         start_cluster: u32,
         parent_path: &str,
     ) -> Result<Vec<FileEntry>, FilesystemError> {
-        let dir_data = self.read_cluster_chain(start_cluster, None)?;
+        let dir_data = self.read_entry_data(start_cluster, None)?;
         let mut entries = Vec::new();
 
         let mut pos = 0;
@@ -507,7 +524,7 @@ impl<R: Read + Seek> ExfatFilesystem<R> {
                     continue;
                 }
 
-                let _no_fat_chain = (dir_data[stream_pos + 1] & 0x02) != 0;
+                let no_fat_chain = (dir_data[stream_pos + 1] & 0x02) != 0;
                 let name_length = dir_data[stream_pos + 3] as usize;
                 let first_cluster = u32::from_le_bytes([
                     dir_data[stream_pos + 20],
@@ -525,6 +542,13 @@ impl<R: Read + Seek> ExfatFilesystem<R> {
                     dir_data[stream_pos + 30],
                     dir_data[stream_pos + 31],
                 ]);
+                if first_cluster >= 2 {
+                    if no_fat_chain {
+                        self.no_fat_chain.insert(first_cluster, data_length);
+                    } else {
+                        self.no_fat_chain.remove(&first_cluster);
+                    }
+                }
 
                 // Collect filename from 0xC1 entries
                 let mut name_chars = Vec::new();
@@ -696,7 +720,8 @@ impl<R: Read + Seek + Send> Filesystem for ExfatFilesystem<R> {
             return Ok(Vec::new());
         }
 
-        self.read_cluster_chain(cluster, Some(max_bytes as u64))
+        // A chain is whole clusters; the entry says where the file ends.
+        self.read_entry_data(cluster, Some((max_bytes as u64).min(entry.size)))
     }
 
     fn write_file_to(
@@ -710,6 +735,11 @@ impl<R: Read + Seek + Send> Filesystem for ExfatFilesystem<R> {
         let cluster = entry.location as u32;
         if cluster < 2 {
             return Ok(0);
+        }
+        if let Some(&len) = self.no_fat_chain.get(&cluster) {
+            let data = self.read_contiguous_clusters(cluster, len, Some(entry.size))?;
+            writer.write_all(&data)?;
+            return Ok(data.len() as u64);
         }
         self.write_cluster_chain_to(cluster, writer, entry.size)
     }
@@ -902,6 +932,25 @@ impl<R: Read + Write + Seek> ExfatFilesystem<R> {
             }
         }
 
+        self.write_bitmap(&bitmap)?;
+        Ok(())
+    }
+
+    /// Free the contiguous run a NoFatChain entry of `data_length` bytes
+    /// occupies from `start`; the FAT holds nothing for it, only the bitmap does.
+    fn free_contiguous_rw(&mut self, start: u32, data_length: u64) -> Result<(), FilesystemError> {
+        if start < 2 || data_length == 0 {
+            return Ok(());
+        }
+        let mut bitmap = self.read_bitmap()?;
+        let clusters = data_length.div_ceil(self.cluster_size.max(1));
+        let end = (start as u64 + clusters).min(self.cluster_count as u64 + 2);
+        for cluster in start as u64..end {
+            let idx = (cluster - 2) as usize;
+            if idx / 8 < bitmap.len() {
+                bitmap[idx / 8] &= !(1 << (idx % 8));
+            }
+        }
         self.write_bitmap(&bitmap)?;
         Ok(())
     }
@@ -1492,7 +1541,12 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExfatFilesystem<R> {
         self.remove_entry_from_directory(parent, entry)?;
 
         if entry.location >= 2 {
-            self.free_cluster_chain_rw(entry.location as u32)?;
+            let first = entry.location as u32;
+            match self.no_fat_chain.remove(&first) {
+                // A contiguous entry has no chain to follow; free its whole run.
+                Some(len) => self.free_contiguous_rw(first, len)?,
+                None => self.free_cluster_chain_rw(first)?,
+            }
         }
 
         Ok(())
@@ -1534,8 +1588,15 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExfatFilesystem<R> {
         } else {
             entry.dos_attributes.map(|a| a & 0x27).unwrap_or(0x20)
         };
-        let entry_bytes =
+        let mut entry_bytes =
             Self::build_entry_set(new_name, attrs, entry.location as u32, entry.size, None);
+        // A contiguous file has no FAT chain to fall back on; dropping the
+        // flag truncated it to one cluster for every reader, Windows included.
+        if self.no_fat_chain.contains_key(&(entry.location as u32)) {
+            entry_bytes[32 + 1] |= 0x02;
+            let checksum = Self::entry_set_checksum(&entry_bytes);
+            entry_bytes[2..4].copy_from_slice(&checksum.to_le_bytes());
+        }
 
         // remove_entry_from_directory matches names case-insensitively
         // and does not consult the cluster. For the normal case (names
@@ -1878,6 +1939,25 @@ impl<R: Read + Seek> Read for CompactExfatReader<R> {
 // Resize
 // =============================================================================
 
+/// Set one FAT entry through a whole-sector read-modify-write (raw devices).
+fn write_fat_entry_at(
+    file: &mut (impl Read + Write + Seek),
+    fat_offset: u64,
+    cluster: u32,
+    value: u32,
+) -> Result<()> {
+    let byte = fat_offset + cluster as u64 * 4;
+    let sector_off = byte / 512 * 512;
+    let mut sector = [0u8; 512];
+    file.seek(SeekFrom::Start(sector_off))?;
+    file.read_exact(&mut sector)?;
+    let i = (byte - sector_off) as usize;
+    sector[i..i + 4].copy_from_slice(&value.to_le_bytes());
+    file.seek(SeekFrom::Start(sector_off))?;
+    file.write_all(&sector)?;
+    Ok(())
+}
+
 /// Resize an exFAT partition with full bitmap resize.
 ///
 /// This updates the allocation bitmap, FAT, VBR fields, and boot region checksums.
@@ -1916,10 +1996,32 @@ pub fn resize_exfat_in_place(
 
     // Calculate new cluster count
     let data_sectors = new_volume_length_sectors.saturating_sub(cluster_heap_offset as u64);
-    let new_cluster_count = (data_sectors / sectors_per_cluster) as u32;
+    let mut new_cluster_count = (data_sectors / sectors_per_cluster) as u32;
+    let mut new_volume_length_sectors = new_volume_length_sectors;
 
     if new_cluster_count == 0 {
         bail!("exFAT resize: new size too small, no clusters available");
+    }
+
+    // The FAT was sized at format time and sits in front of the heap, so it
+    // caps the clusters; a count past it used to be written anyway.
+    let fat_offset = partition_offset
+        + u32::from_le_bytes([vbr[0x50], vbr[0x51], vbr[0x52], vbr[0x53]]) as u64
+            * bytes_per_sector;
+    let fat_length_sectors =
+        u32::from_le_bytes([vbr[0x54], vbr[0x55], vbr[0x56], vbr[0x57]]) as u64;
+    let fat_capacity = (fat_length_sectors * bytes_per_sector / 4).saturating_sub(2);
+    if new_cluster_count as u64 > fat_capacity {
+        new_cluster_count = fat_capacity as u32;
+        new_volume_length_sectors = cluster_heap_offset as u64 + fat_capacity * sectors_per_cluster;
+        log_cb(&format!(
+            "exFAT resize: the FAT holds {fat_capacity} clusters and cannot grow in place; \
+             the volume stops at {new_volume_length_sectors} sectors"
+        ));
+    }
+    if new_cluster_count == old_cluster_count {
+        log_cb("exFAT resize: no room to change the cluster count; volume left as is");
+        return Ok(false);
     }
 
     // Find allocation bitmap in root directory
@@ -2017,25 +2119,68 @@ pub fn resize_exfat_in_place(
         }
     }
 
+    // A bitmap that outgrows its clusters moves into the clusters just added,
+    // which nothing else owns yet; in place it would run over the up-case table.
+    let old_bitmap_clusters = bitmap_size.div_ceil(cluster_size).max(1) as u32;
+    let new_bitmap_clusters = (new_bitmap_size as u64).div_ceil(cluster_size).max(1) as u32;
+    let mut new_bitmap_cluster = bitmap_cluster;
+    if new_bitmap_clusters > old_bitmap_clusters {
+        let added = new_cluster_count.saturating_sub(old_cluster_count);
+        if added < new_bitmap_clusters {
+            log_cb(&format!(
+                "exFAT resize: the allocation bitmap needs {new_bitmap_clusters} clusters and \
+                 only {added} are being added; volume left as is"
+            ));
+            return Ok(false);
+        }
+        new_bitmap_cluster = old_cluster_count + 2;
+        let set = |bits: &mut [u8], cluster: u32, on: bool| {
+            let i = (cluster - 2) as usize;
+            if on {
+                bits[i / 8] |= 1 << (i % 8);
+            } else {
+                bits[i / 8] &= !(1 << (i % 8));
+            }
+        };
+        for c in bitmap_cluster..bitmap_cluster + old_bitmap_clusters {
+            set(&mut bitmap_data, c, false);
+            write_fat_entry_at(file, fat_offset, c, 0)?;
+        }
+        for (n, c) in (new_bitmap_cluster..new_bitmap_cluster + new_bitmap_clusters).enumerate() {
+            set(&mut bitmap_data, c, true);
+            let next = if n as u32 + 1 == new_bitmap_clusters {
+                0xFFFF_FFFF
+            } else {
+                c + 1
+            };
+            write_fat_entry_at(file, fat_offset, c, next)?;
+        }
+        log_cb(&format!(
+            "exFAT resize: allocation bitmap moved to cluster {new_bitmap_cluster} \
+             ({new_bitmap_clusters} clusters)"
+        ));
+    }
+
     // Write resized bitmap (sector-aligned for raw device compatibility)
     let write_aligned_size = new_bitmap_size.div_ceil(512) * 512;
     bitmap_data.resize(write_aligned_size, 0);
+    let bmp_offset = partition_offset
+        + cluster_heap_offset as u64 * bytes_per_sector
+        + (new_bitmap_cluster as u64 - 2) * cluster_size;
     file.seek(SeekFrom::Start(bmp_offset))?;
     file.write_all(&bitmap_data)?;
 
-    // Update bitmap directory entry with new size
-    let new_bitmap_size_u64 = new_bitmap_size as u64;
+    // Update bitmap directory entry with its place and new size
+    root_buf[bitmap_entry_offset + 20..bitmap_entry_offset + 24]
+        .copy_from_slice(&new_bitmap_cluster.to_le_bytes());
     root_buf[bitmap_entry_offset + 24..bitmap_entry_offset + 32]
-        .copy_from_slice(&new_bitmap_size_u64.to_le_bytes());
+        .copy_from_slice(&(new_bitmap_size as u64).to_le_bytes());
     file.seek(SeekFrom::Start(root_offset))?;
     file.write_all(&root_buf)?;
 
     // Verify FAT has no entries beyond new cluster count (for shrinking)
     // Uses sector-aligned I/O: read/write whole 512-byte sectors at a time
     if new_cluster_count < old_cluster_count {
-        let fat_offset = partition_offset
-            + u32::from_le_bytes([vbr[0x50], vbr[0x51], vbr[0x52], vbr[0x53]]) as u64
-                * bytes_per_sector;
         let first_cluster = new_cluster_count + 2;
         let last_cluster = old_cluster_count + 2; // exclusive
 
@@ -2564,6 +2709,86 @@ pub fn is_exfat(boot_sector: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A grow whose bitmap outgrows its cluster moves it into the new heap
+    /// space, and the FAT's fixed size caps the cluster count.
+    #[test]
+    fn resize_grow_relocates_an_outgrown_bitmap_and_stops_at_the_fat() {
+        let template = ExfatFormatTemplate {
+            bytes_per_sector: 512,
+            sectors_per_cluster: 1,
+            label: None,
+        };
+        // 4152 sectors: 4095 clusters (a one-cluster bitmap) behind a 33-sector
+        // FAT with room for 4222.
+        let small = 4152 * 512u64;
+        let big = 8 * 1024 * 1024u64;
+        let mut cur = std::io::Cursor::new(vec![0u8; big as usize]);
+        create_blank_exfat(&mut cur, &template, small).unwrap();
+        let vbr = cur.get_ref()[..512].to_vec();
+        let old_count = u32::from_le_bytes([vbr[0x5C], vbr[0x5D], vbr[0x5E], vbr[0x5F]]);
+        let fat_len = u32::from_le_bytes([vbr[0x54], vbr[0x55], vbr[0x56], vbr[0x57]]) as u64;
+        let capacity = (fat_len * 512 / 4 - 2) as u32;
+        assert_eq!(
+            (old_count, capacity),
+            (4095, 4222),
+            "formatter geometry moved"
+        );
+        let heap = u32::from_le_bytes([vbr[0x58], vbr[0x59], vbr[0x5A], vbr[0x5B]]) as usize * 512;
+        let root = u32::from_le_bytes([vbr[0x60], vbr[0x61], vbr[0x62], vbr[0x63]]) as usize;
+        let root_off = heap + (root - 2) * 512;
+        // The up-case table follows the one-cluster bitmap directly.
+        let upcase_off = (0..16)
+            .map(|i| root_off + i * 32)
+            .find(|&e| cur.get_ref()[e] == 0x82)
+            .map(|e| {
+                let b = &cur.get_ref()[e + 20..e + 24];
+                heap + (u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize - 2) * 512
+            })
+            .expect("up-case table entry");
+        let upcase_before = cur.get_ref()[upcase_off..upcase_off + 512].to_vec();
+
+        let mut log = Vec::new();
+        assert!(
+            resize_exfat_in_place(&mut cur, 0, big / 512, &mut |m| log.push(m.to_string()))
+                .unwrap()
+        );
+        assert!(
+            log.iter().any(|m| m.contains("cannot grow in place")),
+            "{log:?}"
+        );
+        assert!(log.iter().any(|m| m.contains("bitmap moved")), "{log:?}");
+        assert_eq!(
+            &cur.get_ref()[upcase_off..upcase_off + 512],
+            &upcase_before[..],
+            "up-case table overwritten"
+        );
+
+        let vbr = cur.get_ref()[..512].to_vec();
+        let new_count = u32::from_le_bytes([vbr[0x5C], vbr[0x5D], vbr[0x5E], vbr[0x5F]]);
+        assert_eq!(new_count, capacity);
+        let mut fs = ExfatFilesystem::open(cur, 0).unwrap();
+        assert_eq!(
+            fs.bitmap_start_cluster,
+            old_count + 2,
+            "bitmap moved into the new heap"
+        );
+        let root = fs.root().unwrap();
+        let payload: Vec<u8> = (0..3000u32).map(|i| (i % 251) as u8).collect();
+        let mut src = std::io::Cursor::new(payload.clone());
+        let e = fs
+            .create_file(
+                &root,
+                "moved.bin",
+                &mut src,
+                3000,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(fs.read_file(&e, usize::MAX).unwrap(), payload);
+        let report = super::super::exfat_fsck::fsck_exfat(&mut fs).unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+    }
 
     fn make_exfat_vbr() -> [u8; 512] {
         let mut vbr = [0u8; 512];
