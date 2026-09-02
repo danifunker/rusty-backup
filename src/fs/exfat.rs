@@ -982,11 +982,7 @@ impl<R: Read + Write + Seek> ExfatFilesystem<R> {
 
     /// Uppercase a UTF-16 character (ASCII range only for MVP).
     fn upcase_char(c: u16) -> u16 {
-        if (0x0061..=0x007A).contains(&c) {
-            c - 0x0020
-        } else {
-            c
-        }
+        exfat_upcase_char(c)
     }
 
     /// Compute the exFAT name hash for a filename.
@@ -2379,11 +2375,17 @@ pub struct ExfatFormatTemplate {
 /// the same rule to stay self-consistent. Non-ASCII names are not case-folded
 /// (a known limitation, not a mountability problem — the table + its checksum
 /// are internally valid).
-fn exfat_upcase_char(c: u16) -> u16 {
-    if (0x0061..=0x007A).contains(&c) {
-        c - 0x0020
-    } else {
-        c
+/// Simple (one-to-one) Unicode uppercase for a BMP code unit; letters whose
+/// uppercase expands (German sharp s) or leaves the BMP keep their own value,
+/// which is what the Windows up-case table does with them too.
+pub(crate) fn exfat_upcase_char(c: u16) -> u16 {
+    let Some(ch) = char::from_u32(c as u32) else {
+        return c;
+    };
+    let mut up = ch.to_uppercase();
+    match (up.next(), up.next()) {
+        (Some(u), None) if (u as u32) <= 0xFFFF => u as u16,
+        _ => c,
     }
 }
 
@@ -3105,6 +3107,17 @@ mod tests {
         // Case-insensitive: "TEST.TXT" should hash the same (ASCII uppercase)
         let h3 = ExfatFilesystem::<Cursor<Vec<u8>>>::name_hash("TEST.TXT");
         assert_eq!(h1, h3);
+        // D14: Windows folds non-ASCII letters too; an ASCII-only fold hashed
+        // "caf\u{e9}" and "CAF\u{c9}" apart and Windows then missed the file.
+        let lower = ExfatFilesystem::<Cursor<Vec<u8>>>::name_hash("caf\u{e9}.txt");
+        let upper = ExfatFilesystem::<Cursor<Vec<u8>>>::name_hash("CAF\u{c9}.TXT");
+        assert_eq!(lower, upper);
+        assert_ne!(
+            lower,
+            ExfatFilesystem::<Cursor<Vec<u8>>>::name_hash("cafe.txt")
+        );
+        assert_eq!(exfat_upcase_char(0x00DF), 0x00DF, "sharp s stays itself");
+        assert_eq!(exfat_upcase_char(0x0436), 0x0416, "Cyrillic zhe folds");
     }
 
     #[test]
