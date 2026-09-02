@@ -11697,6 +11697,19 @@ fn import_host_file(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .ok_or_else(|| anyhow::anyhow!("no filename in {}", host.display()))?;
+    // A Mac file reaches the host in one of four containers (native fork,
+    // `._name`, `.bin`, `.hqx`); read it the way the Commander pane does so
+    // the fork, type/creator and real name survive the import.
+    let resource_fork = crate::fs::resource_fork::detect_resource_fork(host);
+    let name = resource_fork
+        .as_ref()
+        .and_then(|i| i.name.clone())
+        .unwrap_or(name);
+    let size = resource_fork
+        .as_ref()
+        .and_then(|i| i.data_fork.as_ref())
+        .map(|d| d.len() as u64)
+        .unwrap_or(meta.len());
     let dst = if cur_dir == "/" {
         format!("/{name}")
     } else {
@@ -11725,25 +11738,24 @@ fn import_host_file(
         return Ok(ImportOutcome::Exists(leaf));
     }
 
-    let len = meta.len();
-    let mut hf = std::fs::File::open(host)?;
-    let options = crate::fs::filesystem::CreateFileOptions::default();
-    let outcome = crate::fs::replace::create_or_replace(
-        fs.as_mut(),
-        &parent,
-        &leaf,
-        &mut hf,
-        len,
-        &options,
-        crate::fs::replace::ReplacePolicy {
-            on_conflict,
-            ..Default::default()
-        },
-    )
-    .map_err(|e| anyhow::anyhow!("create_file: {e}"))?;
-    if outcome.skipped {
+    if exists && on_conflict == crate::fs::replace::OnConflict::Skip {
         return Ok(ImportOutcome::Done(format!("{name} (skipped)")));
     }
+    let edit = crate::model::edit_queue::StagedEdit::AddFile {
+        parent: parent.clone(),
+        name: leaf.clone(),
+        host_path: host.to_path_buf(),
+        size,
+        prodos_type: None,
+        prodos_aux: None,
+        resource_fork,
+        hfs_type_override: None,
+        hfs_creator_override: None,
+        dates: None,
+        on_conflict,
+    };
+    crate::model::edit_queue::apply_edit(fs.as_mut(), &edit)
+        .map_err(|e| anyhow::anyhow!("create_file: {e}"))?;
     fs.sync_metadata()
         .map_err(|e| anyhow::anyhow!("sync_metadata: {e}"))?;
     drop(fs);
