@@ -994,10 +994,12 @@ fn handle_conn(
                         } else {
                             None
                         };
-                        let data_res = stage_blob(&mut reader, &blob);
-                        let fork_res = match &fork_blob {
-                            Some(f) => stage_blob(&mut reader, f),
-                            None => Ok(()),
+                        let data_res = stage_blob(&mut reader, &blob)
+                            .and_then(|got| check_staged_len("data fork", size, got));
+                        let fork_res = match (&fork_blob, resource_fork_size) {
+                            (Some(f), Some(want)) => stage_blob(&mut reader, f)
+                                .and_then(|got| check_staged_len("resource fork", want, got)),
+                            _ => Ok(()),
                         };
                         match data_res.and(fork_res) {
                             Ok(()) => {
@@ -1596,7 +1598,7 @@ mod optical_server {
 }
 
 /// Read a chunk stream from the client into a staging blob file.
-fn stage_blob<R: std::io::Read>(reader: &mut R, blob: &Path) -> Result<()> {
+fn stage_blob<R: std::io::Read>(reader: &mut R, blob: &Path) -> Result<u64> {
     // Whatever goes wrong with the file, the chunk stream is read to its end:
     // a body left on the wire desyncs every request after it.
     let (file, create_err) = match std::fs::File::create(blob) {
@@ -1607,12 +1609,21 @@ fn stage_blob<R: std::io::Read>(reader: &mut R, blob: &Path) -> Result<()> {
         file,
         failure: None,
     };
-    read_chunks(reader, &mut sink).context("reading the upload body")?;
+    let received = read_chunks(reader, &mut sink).context("reading the upload body")?;
     if let Some(e) = create_err {
         return Err(e).with_context(|| format!("creating staging blob {}", blob.display()));
     }
     if let Some(e) = sink.failure {
         return Err(e).with_context(|| format!("writing staging blob {}", blob.display()));
+    }
+    Ok(received)
+}
+
+/// A body shorter or longer than the client declared is a broken transfer,
+/// not a file to stage.
+fn check_staged_len(what: &str, declared: u64, received: u64) -> Result<()> {
+    if declared != received {
+        bail!("{what}: client declared {declared} byte(s) but {received} arrived");
     }
     Ok(())
 }
