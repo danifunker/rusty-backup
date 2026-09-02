@@ -163,6 +163,8 @@ pub struct RestoreTab {
     sp_target_device_idx: Option<usize>,
     /// Scanned target partition table
     sp_target_partitions: Vec<PartitionInfo>,
+    /// Identity of the device `sp_target_partitions` was scanned from.
+    sp_target_identity: Option<rusty_backup::device::DeviceIdentity>,
     /// Which target partition to overwrite
     sp_target_partition_idx: Option<usize>,
     /// Error from scanning target
@@ -246,6 +248,7 @@ impl Default for RestoreTab {
             sp_source_partition_idx: None,
             sp_target_device_idx: None,
             sp_target_partitions: Vec::new(),
+            sp_target_identity: None,
             sp_target_partition_idx: None,
             sp_scan_error: None,
             nd_table_type: NewTableType::Mbr,
@@ -1095,6 +1098,7 @@ impl RestoreTab {
                             {
                                 self.sp_target_partitions.clear();
                                 self.sp_target_partition_idx = None;
+                                self.sp_target_identity = None;
                                 self.sp_scan_error = None;
                             }
                         }
@@ -1122,6 +1126,19 @@ impl RestoreTab {
                         );
                     }
                 }
+            }
+
+            // A refreshed list can put another disk at this index; the old
+            // disk's scan must not pick a partition on the new one.
+            if !self.sp_target_partitions.is_empty()
+                && rusty_backup::device::identity_at(ctx.devices, self.sp_target_device_idx)
+                    != self.sp_target_identity
+            {
+                self.sp_target_partitions.clear();
+                self.sp_target_partition_idx = None;
+                self.sp_target_identity = None;
+                self.sp_scan_error =
+                    Some("The target device changed since it was scanned; scan it again.".into());
             }
 
             // Show scanned target partitions
@@ -1203,6 +1220,7 @@ impl RestoreTab {
     fn scan_target_partitions(&mut self, ctx: &mut TabContext) {
         self.sp_target_partitions.clear();
         self.sp_target_partition_idx = None;
+        self.sp_target_identity = None;
         self.sp_scan_error = None;
 
         let device = match self
@@ -1226,6 +1244,7 @@ impl RestoreTab {
                 match PartitionTable::detect(&mut reader) {
                     Ok(table) => {
                         self.sp_target_partitions = table.partitions();
+                        self.sp_target_identity = Some(device.identity());
                         ctx.log.info(format!(
                             "Found {} partition(s) on target ({})",
                             self.sp_target_partitions.len(),
@@ -2205,6 +2224,11 @@ impl RestoreTab {
                 return;
             }
         };
+        if self.sp_target_identity.as_ref() != Some(&device.identity()) {
+            ctx.log
+                .error("The target device changed since it was scanned; scan it again");
+            return;
+        }
         let target_part = match self
             .sp_target_partition_idx
             .and_then(|idx| self.sp_target_partitions.iter().find(|p| p.index == idx))

@@ -103,6 +103,8 @@ pub struct BackupTab {
     partition_load_error: Option<String>,
     /// Change detection for auto-load
     prev_device_idx: Option<usize>,
+    /// Identity of the device behind `prev_device_idx` when it was loaded.
+    prev_device_identity: Option<rusty_backup::device::DeviceIdentity>,
     prev_image_path: Option<PathBuf>,
     /// VHD backup popup state
     vhd_popup_open: bool,
@@ -235,6 +237,7 @@ impl Default for BackupTab {
             pending_backup_after_min_sizes: false,
             partition_load_error: None,
             prev_device_idx: None,
+            prev_device_identity: None,
             prev_image_path: None,
             vhd_popup_open: false,
             vhd_whole_disk: true,
@@ -431,10 +434,21 @@ impl BackupTab {
         // Auto-load partition info when source changes (local sources only —
         // a remote source loads its own partitions via the device picker).
         if !self.backup_running && !self.remote_active() {
+            // "Refresh Devices" can put another disk, or nothing, at this index.
+            let mut device_identity =
+                rusty_backup::device::identity_at(ctx.devices, self.selected_device_idx);
+            if self.selected_device_idx.is_some() && device_identity.is_none() {
+                ctx.log
+                    .warn("The selected source device is no longer listed; clearing it.");
+                self.selected_device_idx = None;
+                device_identity = None;
+            }
             let source_changed = self.selected_device_idx != self.prev_device_idx
+                || device_identity != self.prev_device_identity
                 || self.image_file_path != self.prev_image_path;
             if source_changed {
                 self.prev_device_idx = self.selected_device_idx;
+                self.prev_device_identity = device_identity;
                 self.prev_image_path = self.image_file_path.clone();
                 // A Start Backup waiting on the old source's minimum sizes must
                 // not fire on the new one the moment its (empty) map clears.
@@ -443,20 +457,28 @@ impl BackupTab {
             }
         }
 
-        // Show partition selection checkboxes
-        // For devices we don't auto-scan (would prompt for elevation on every
-        // dropdown change). Offer a button to load partitions on demand.
+        // Devices are not auto-scanned (that would prompt for elevation on every
+        // dropdown change); the button stays so a swapped card can be re-read.
         if !self.backup_running
-            && self.source_partitions.is_empty()
-            && self.partition_load_error.is_none()
             && self.selected_device_idx.is_some()
             && self.image_file_path.is_none()
         {
+            let populated =
+                !self.source_partitions.is_empty() || self.partition_load_error.is_some();
+            let (label, hint) = if populated {
+                (
+                    "Reload partition info",
+                    "Read the partition table again, e.g. after swapping the card in this reader",
+                )
+            } else {
+                (
+                    "Load partition info",
+                    "Read the partition table from the selected device (may prompt for administrator credentials)",
+                )
+            };
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                if ui.button("Load partition info").on_hover_text(
-                    "Read the partition table from the selected device (may prompt for administrator credentials)",
-                ).clicked() {
+                if ui.button(label).on_hover_text(hint).clicked() {
                     self.scan_source_partitions(ctx);
                 }
             });
@@ -2135,6 +2157,7 @@ impl BackupTab {
         // Keep prev_* in sync with the now-empty selection so the
         // source-changed detector in `show()` doesn't immediately re-fire.
         self.prev_device_idx = None;
+        self.prev_device_identity = None;
         self.prev_image_path = None;
     }
 
