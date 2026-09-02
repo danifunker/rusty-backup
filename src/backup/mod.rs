@@ -846,6 +846,22 @@ fn run_backup_inner(
         }
     }
 
+    // Solaris x86: back up the MBR and its 0x82 partition as one opaque body
+    // (the VTOC rides inside it) and keep the slice layout as a sidecar.
+    let mut solaris_vtoc_json = None;
+    if let PartitionTable::SolarisX86 { mbr, label } = &table {
+        solaris_vtoc_json = Some(
+            serde_json::to_string_pretty(label)
+                .context("failed to serialize Solaris x86 VTOC to JSON")?,
+        );
+        log(
+            &progress,
+            LogLevel::Info,
+            "Solaris x86 VTOC recorded in solaris_x86.json; backing up the disk by its MBR",
+        );
+        table = PartitionTable::Mbr(mbr.clone());
+    }
+
     let alignment = partition::detect_alignment(&table);
     let mut partitions = table.partitions();
     let is_superfloppy = matches!(table, PartitionTable::None { .. });
@@ -971,6 +987,10 @@ fn run_backup_inner(
     // Step 2: Create backup folder
     set_operation(&progress, "Creating backup folder...");
     let backup_folder = format::create_backup_folder(&config.destination_dir, &config.backup_name)?;
+    if let Some(json) = &solaris_vtoc_json {
+        std::fs::write(backup_folder.join("solaris_x86.json"), json)
+            .context("failed to write solaris_x86.json")?;
+    }
     log(
         &progress,
         LogLevel::Info,

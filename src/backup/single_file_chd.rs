@@ -896,6 +896,9 @@ pub struct AssembleFromStagingInputs<'a> {
     /// `partition_table` so only the 512-byte pMBR portion is consulted.
     pub source_partition_table_bytes: &'a [u8],
     pub partition_table: &'a PartitionTable,
+    /// The same subset staging was given; a partition outside it has no
+    /// body file and is emitted as a zero-filled gap.
+    pub partition_filter: Option<&'a [usize]>,
     pub partitions: &'a [PartitionInfo],
     /// Source disk size in bytes. Used as the upper bound for
     /// [`compute_resized_envelope`].
@@ -1010,6 +1013,13 @@ pub fn assemble_from_staging(
             // Containers and protective-MBR entries don't have a body
             // file in staging; they live inside the patched table.
             continue;
+        }
+        // Staging honoured the filter; a filtered-out partition has no body
+        // file and is left as a zero-filled gap rather than a missing file.
+        if let Some(filter) = inputs.partition_filter {
+            if !filter.contains(&part.index) {
+                continue;
+            }
         }
         let part_offset = plan.new_start_lba * 512;
         let part_length = plan.new_size_bytes;
@@ -1338,6 +1348,7 @@ pub fn run_via_staging(
         plans: &plans,
         source_partition_table_bytes: inputs.source_partition_table_bytes,
         partition_table: inputs.partition_table,
+        partition_filter: inputs.partition_filter,
         partitions: inputs.partitions,
         source_size: inputs.source_size,
         output_base: inputs.output_base,
@@ -2837,6 +2848,7 @@ mod tests {
             plans: &plans,
             source_partition_table_bytes: &mbr,
             partition_table: &table,
+            partition_filter: None,
             partitions: &partitions,
             source_size: total_bytes,
             output_base: &output_base,
