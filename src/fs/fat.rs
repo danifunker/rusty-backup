@@ -1768,6 +1768,13 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for FatFilesystem<R> {
         options: &CreateFileOptions,
     ) -> Result<FileEntry, FilesystemError> {
         validate_fat_name(name)?;
+        // The directory entry's size field is 32 bits; past it the entry would
+        // silently describe the low bytes of the length.
+        if data_len > u32::MAX as u64 {
+            return Err(FilesystemError::InvalidData(format!(
+                "'{name}' is {data_len} bytes; a FAT file cannot exceed 4 GiB - 1"
+            )));
+        }
 
         let (existing_sfns, dir_data_for_sfn);
         if options.skip_name_checks {
@@ -6103,6 +6110,30 @@ mod tests {
     /// The read-only / hidden / system / archive bits must be settable and
     /// must survive a re-read, and the structural bits must not be reachable
     /// from a caller.
+    /// D15: a 4 GiB source was accepted and its size stored modulo 2^32.
+    #[test]
+    fn a_file_of_four_gib_or_more_is_refused_up_front() {
+        use crate::fs::filesystem::EditableFilesystem;
+        let img = create_blank_fat(1024 * 1024, Some("BIG")).expect("blank");
+        let mut fs = FatFilesystem::open(std::io::Cursor::new(img), 0).expect("open");
+        let root = fs.root().expect("root");
+        let mut never_read = std::io::repeat(0);
+        let err = fs
+            .create_file(
+                &root,
+                "HUGE.BIN",
+                &mut never_read,
+                1 << 32,
+                &CreateFileOptions::default(),
+            )
+            .unwrap_err();
+        assert!(format!("{err}").contains("4 GiB"), "{err}");
+        assert!(
+            fs.list_directory(&root).unwrap().is_empty(),
+            "nothing must be written"
+        );
+    }
+
     #[test]
     fn dos_attributes_can_be_set_and_read_back() {
         use crate::fs::filesystem::EditableFilesystem;
