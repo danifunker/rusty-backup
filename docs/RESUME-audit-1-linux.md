@@ -135,4 +135,14 @@ never a whole partition or file in RAM. Stream the data run by run.
 Update this file's status line, run `bash scripts/preflight.sh`, push, then
 hand over to `docs/RESUME-audit-2-windows.md`.
 
-Status: not started.
+Status: DONE 2026-09-02 (e815315..4a91e9b, one finding per commit), except the
+two hardware checks in section 7. R5 needs a USB stick plugged in (none was
+attached). The BR3 QEMU boot needs a GRUB-booting image; this box has no
+grub-pc-bin and no sudo to install it, so the mbr-gap.bin round trip was
+verified byte-for-byte with rb-cli instead (backup of an MBR disk with 64
+pattern sectors in the gap -> mbr-gap.bin carries them -> restore reproduces
+the MBR and the whole gap; only the FAT hidden-sectors field is patched).
+Also shipped on the way: the HFS+ trim point reserves the alternate-VH block
+(8d07d64), and H7 asks leg 3 to confirm the header placement with Disk First
+Aid. `bash scripts/preflight.sh` passed all six stages on e2ac069 (2026-09-02);
+its release run caught one fixture the debug runs had hidden behind a pipe.

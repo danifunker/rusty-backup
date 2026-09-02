@@ -65,7 +65,7 @@ Disk Utility's First Aid (or `fsck_hfs -n` in Terminal) is the judge:
   volume; no false "keys out of order" reports.
 - H6 (a1f7558): an MFS image edited by rb-cli opens in Mini vMac or
   Basilisk II and Disk First Aid there is clean.
-- H7 (from leg 1, if it shipped): the alternate volume header location.
+- H7 (shipped in leg 1, 9cb5383): the alternate MDB / volume header is now written 1024 bytes before the partition end when the length is known; confirm Disk First Aid accepts an edited volume.
 
 Record results next to each ID in `docs/Regression_Bugs.md`.
 
