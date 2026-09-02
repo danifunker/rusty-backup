@@ -2033,7 +2033,14 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Hp
         } else {
             parent.location as u32
         };
-        let mtime = options.unix_times.map(|t| t.mtime_or_now());
+        // A new entry carries the wall clock; the FIXED_TIME sentinel is for
+        // the reproducible formatter output only.
+        let mtime = Some(
+            options
+                .unix_times
+                .map(|t| t.mtime_or_now())
+                .unwrap_or_else(crate::fs::times::now),
+        );
         let fno = self.create_entry(parent_fnode, name, false, data, data_len, mtime)?;
         let path = if parent.path == "/" {
             format!("/{name}")
@@ -2057,7 +2064,14 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Hp
             parent.location as u32
         };
         let mut empty = std::io::empty();
-        let mtime = options.unix_times.map(|t| t.mtime_or_now());
+        // A new entry carries the wall clock; the FIXED_TIME sentinel is for
+        // the reproducible formatter output only.
+        let mtime = Some(
+            options
+                .unix_times
+                .map(|t| t.mtime_or_now())
+                .unwrap_or_else(crate::fs::times::now),
+        );
         let fno = self.create_entry(parent_fnode, name, true, &mut empty, 0, mtime)?;
         let path = if parent.path == "/" {
             format!("/{name}")
@@ -2517,6 +2531,29 @@ mod tests {
             &CreateFileOptions::default(),
         )
         .unwrap_or_else(|e| panic!("create {name}: {e}"));
+    }
+
+    /// D18: a file created without explicit times was stamped with the
+    /// formatter's FIXED_TIME sentinel (2004-01-10) instead of now.
+    #[test]
+    fn a_new_file_is_stamped_with_the_current_time() {
+        let mut fs = blank_fs(2, "NOW");
+        let root = fs.root().unwrap();
+        mkfile(&mut fs, &root, "FRESH.TXT", b"hello");
+        fs.sync_metadata().unwrap();
+        let now = crate::fs::times::now();
+        let entry = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "FRESH.TXT")
+            .expect("FRESH.TXT");
+        let stamped = entry.modified_unix.expect("a modification time");
+        assert_ne!(
+            stamped, 0x4000_0000,
+            "FIXED_TIME sentinel leaked into a new file"
+        );
+        assert!(now.abs_diff(stamped) < 120, "stamped {stamped}, now {now}");
     }
 
     /// Run the clean-room oracle over the current image bytes: fsck must pass,
