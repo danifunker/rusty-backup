@@ -2450,6 +2450,40 @@ impl BrowseView {
         self.archive_edit_progress = Some(archive_edit::start_compress(&ctx, temp_path));
     }
 
+    /// Point the session at the extracted temp and enter edit mode; also used
+    /// after a failed recompress so the edits there are saved, not re-extracted over.
+    fn adopt_archive_temp(&mut self, temp: PathBuf) {
+        self.archive_temp_path = Some(temp.clone());
+        self.session.source_path = Some(temp);
+        self.session.zstd_cache = None;
+        self.edit_mode = true;
+        self.edit_free_space = None;
+
+        // Re-open filesystem from temp file. Invalidate the cache
+        // first because the source bytes have changed.
+        self.invalidate_cached_fs();
+        match self.session.open() {
+            Ok(mut fs) => {
+                self.fs_type = fs.fs_type().to_string();
+                self.volume_label = fs.volume_label().unwrap_or("").to_string();
+                self.volume_total = fs.total_size();
+                self.volume_used = fs.used_size();
+                self.blessed_folder = fs.blessed_system_folder();
+                if let Ok(root) = fs.root() {
+                    self.root = Some(root);
+                }
+                self.directory_cache.clear();
+                self.expanded_paths.clear();
+                self.selected_entry = None;
+                self.content = None;
+                self.return_fs(fs);
+            }
+            Err(e) => {
+                self.edit_result = Some(format!("Error opening temp file: {e}"));
+            }
+        }
+    }
+
     /// Poll archive edit background operations for completion.
     fn poll_archive_edit(&mut self, ui: &egui::Ui) {
         let progress_arc = match &self.archive_edit_progress {
@@ -2474,7 +2508,19 @@ impl BrowseView {
         self.archive_edit_progress = None;
 
         if let Some(err) = error {
-            self.edit_result = Some(format!("Error: {err}"));
+            if phase == "Compressing" {
+                // The temp still holds the applied edits: re-adopt it so Close
+                // or Apply Edits can try the save again, not re-extract over it.
+                if let Some(temp) = self.archive_temp_path.clone() {
+                    self.adopt_archive_temp(temp);
+                }
+                self.edit_result = Some(format!(
+                    "Error saving the archive: {err}. Your edits are still in the temporary \
+                     volume; use Close or Apply Edits to try saving again."
+                ));
+            } else {
+                self.edit_result = Some(format!("Error: {err}"));
+            }
             return;
         }
 
@@ -2487,35 +2533,7 @@ impl BrowseView {
             // it to 0 here used to break edits of any non-single-partition
             // container.
             if let Some(temp) = temp_path {
-                self.archive_temp_path = Some(temp.clone());
-                self.session.source_path = Some(temp);
-                self.session.zstd_cache = None;
-                self.edit_mode = true;
-                self.edit_free_space = None;
-
-                // Re-open filesystem from temp file. Invalidate the cache
-                // first because the source bytes have changed.
-                self.invalidate_cached_fs();
-                match self.session.open() {
-                    Ok(mut fs) => {
-                        self.fs_type = fs.fs_type().to_string();
-                        self.volume_label = fs.volume_label().unwrap_or("").to_string();
-                        self.volume_total = fs.total_size();
-                        self.volume_used = fs.used_size();
-                        self.blessed_folder = fs.blessed_system_folder();
-                        if let Ok(root) = fs.root() {
-                            self.root = Some(root);
-                        }
-                        self.directory_cache.clear();
-                        self.expanded_paths.clear();
-                        self.selected_entry = None;
-                        self.content = None;
-                        self.return_fs(fs);
-                    }
-                    Err(e) => {
-                        self.edit_result = Some(format!("Error opening temp file: {e}"));
-                    }
-                }
+                self.adopt_archive_temp(temp);
             }
         } else {
             // Compression done — re-open original archive for browsing.
