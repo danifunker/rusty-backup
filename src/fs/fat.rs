@@ -55,6 +55,9 @@ pub struct FatFilesystem<R> {
     /// allocation on fresh volumes where clusters are filled
     /// sequentially.
     next_free_hint: u32,
+    /// Short names handed out per directory, so `skip_name_checks` creates
+    /// (which never read the directory back) still get unique 8.3 names.
+    sfn_cache: HashMap<String, HashSet<[u8; 11]>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -213,6 +216,7 @@ impl<R: Read + Seek> FatFilesystem<R> {
             total_clusters,
             used_clusters: None,
             next_free_hint: 2,
+            sfn_cache: HashMap::new(),
         };
         // Cache the used-cluster count so used_size() / the browse free-space
         // line are accurate (one FAT scan at open, the same way exFAT computes
@@ -1779,6 +1783,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for FatFilesystem<R> {
                 return Err(FilesystemError::AlreadyExists(name.to_string()));
             }
             let sfns = self.collect_existing_sfns(&dir_data);
+            self.sfn_cache.insert(parent.path.clone(), sfns.clone());
             existing_sfns = sfns;
             dir_data_for_sfn = Some(dir_data);
         }
@@ -1831,7 +1836,19 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for FatFilesystem<R> {
         // the caller (the cross-image copy engine) when present; default to
         // Archive for brand-new files. Mask off structural bits so a stray
         // directory / volume-id bit can never be stamped onto a file.
-        let sfn = Self::generate_short_name(name, &existing_sfns);
+        let sfn = if options.skip_name_checks {
+            let handed_out = self.sfn_cache.entry(parent.path.clone()).or_default();
+            let sfn = Self::generate_short_name(name, handed_out);
+            handed_out.insert(sfn);
+            sfn
+        } else {
+            let sfn = Self::generate_short_name(name, &existing_sfns);
+            self.sfn_cache
+                .entry(parent.path.clone())
+                .or_default()
+                .insert(sfn);
+            sfn
+        };
         let attr = options
             .dos_attributes
             .map(|a| (a as u8) & 0x27)
@@ -1935,6 +1952,10 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for FatFilesystem<R> {
         // Add entry in parent directory
         let existing_sfns = self.collect_existing_sfns(&dir_data);
         let sfn = Self::generate_short_name(name, &existing_sfns);
+        self.sfn_cache
+            .entry(parent.path.clone())
+            .or_default()
+            .insert(sfn);
         let entry_bytes =
             Self::build_dir_entries(name, &sfn, ATTR_DIRECTORY, new_cluster, 0, mtime);
 
@@ -2027,6 +2048,10 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for FatFilesystem<R> {
 
         let existing_sfns = self.collect_existing_sfns(&dir_data);
         let sfn = Self::generate_short_name(new_name, &existing_sfns);
+        self.sfn_cache
+            .entry(parent.path.clone())
+            .or_default()
+            .insert(sfn);
         let entry_bytes = Self::build_dir_entries(new_name, &sfn, attr, cluster, size, None);
 
         // Add the new name first, then remove the old (matched by old name +
@@ -6310,5 +6335,41 @@ mod tests {
                 info.compacted_size,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod sfn_cache_tests {
+    use super::*;
+    use crate::fs::filesystem::{CreateFileOptions, Filesystem};
+    use std::io::Cursor;
+
+    /// D13: `skip_name_checks` creates never read the directory back, so every
+    /// long name that shared a prefix got the same `~1` short name.
+    #[test]
+    fn skip_name_checks_creates_still_get_unique_short_names() {
+        let img = create_blank_fat(4 * 1024 * 1024, Some("T")).unwrap();
+        let mut fs = FatFilesystem::open(Cursor::new(img), 0).unwrap();
+        let root = fs.root().unwrap();
+        let opts = CreateFileOptions {
+            skip_data_write: true,
+            skip_name_checks: true,
+            skip_fsinfo_update: true,
+            ..Default::default()
+        };
+        for name in ["LongName1.txt", "LongName2.txt", "LongName3.txt"] {
+            let mut empty = std::io::empty();
+            fs.create_file(&root, name, &mut empty, 0, &opts).unwrap();
+        }
+        let dir = fs.read_root_directory().unwrap();
+        let sfns = fs.collect_existing_sfns(&dir);
+        assert_eq!(sfns.len(), 3, "three distinct 8.3 names: {sfns:?}");
+        let names: Vec<String> = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names.len(), 3, "{names:?}");
     }
 }
