@@ -505,9 +505,8 @@ impl EditQueue {
     /// leaving a half-applied queue behind if they change their mind at file 7
     /// of 12. Staging exists precisely so the questions can be asked once.
     pub fn conflicting_adds(&self, efs: &mut dyn EditableFilesystem) -> Vec<(String, String)> {
-        // Replay the queue in order over each directory's current names, so a
-        // rename or delete earlier in the batch frees (or takes) a name the
-        // way the apply pass will see it.
+        // Replay the queue in order over each directory's names, so an earlier
+        // rename or delete frees (or takes) a name the way the apply will see it.
         type Occupied = std::collections::HashMap<String, Option<Vec<String>>>;
         fn names_in<'a>(
             occupied: &'a mut Occupied,

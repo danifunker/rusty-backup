@@ -269,9 +269,8 @@ pub fn open_target_for_writing(path: &Path) -> Result<File> {
         let mountinfo_content = fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
         let mounts = parse_mountinfo_from_str(&mountinfo_content);
 
-        // Unmount any mounted partitions belonging to this device. A plain
-        // unmount first; the lazy fallback only detaches the name, and a
-        // filesystem still open somewhere keeps writing back to the device.
+        // Unmount this device's partitions, for real where possible: a lazy
+        // detach leaves an open filesystem writing back under the restore.
         for (dev_path, mi) in &mounts {
             let dev_part_name = dev_path.trim_start_matches("/dev/");
             if parent_device_name(dev_part_name) == parent {
@@ -281,9 +280,8 @@ pub fn open_target_for_writing(path: &Path) -> Result<File> {
         // Whatever the old filesystems still had dirty lands before our first write.
         unsafe { libc::sync() };
 
-        // O_EXCL on a block device fails with EBUSY while it, or any partition
-        // of it, is mounted or held: the guard that keeps a restore from racing
-        // a filesystem that is still live.
+        // O_EXCL on a block device fails with EBUSY while it or any partition
+        // of it is mounted or held; that is what keeps a live filesystem out.
         use std::os::unix::fs::OpenOptionsExt;
         return std::fs::OpenOptions::new()
             .read(true)

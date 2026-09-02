@@ -11697,9 +11697,8 @@ fn import_host_file(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .ok_or_else(|| anyhow::anyhow!("no filename in {}", host.display()))?;
-    // A Mac file reaches the host in one of four containers (native fork,
-    // `._name`, `.bin`, `.hqx`); read it the way the Commander pane does so
-    // the fork, type/creator and real name survive the import.
+    // Read the host file the way the Commander pane does, so a Mac file in
+    // any of its four containers keeps its fork, type/creator and real name.
     let resource_fork = crate::fs::resource_fork::detect_resource_fork(host);
     let name = resource_fork
         .as_ref()

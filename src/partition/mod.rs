@@ -1219,9 +1219,8 @@ impl PartitionTable {
                 }
             }
 
-            // Solaris x86 nests a VTOC inside an MBR partition (0x82 is shared
-            // with swap, so the VTOC's own sanity word decides). The disk keeps
-            // its logicals either way, so the EBR walk came first.
+            // Solaris x86 nests a VTOC inside an MBR partition (0x82 is also swap,
+            // so its sanity word decides); the EBR walk ran first to keep logicals.
             if let Some(label) = solaris_x86::detect(reader, &mbr) {
                 return Ok(PartitionTable::SolarisX86 { mbr, label });
             }

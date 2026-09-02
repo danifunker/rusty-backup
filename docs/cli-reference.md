@@ -1871,7 +1871,7 @@ Usage: restore [OPTIONS] <BACKUP_DIR> <TARGET>
 - `--size` — Per-partition size policy. Defaults to `original`, or `[restore] size` from the config file when set
 - `--alignment` — Partition alignment policy. Defaults to `original`, or `[restore] alignment` from the config file when set
 - `--device` — Treat `TARGET` as a block device (enables sector-aligned writes and the full device-write safety preflight in [`crate::cli::device_safety`])
-- `--yes` — Confirm destructive write to the target (required for device targets, and to replace a remote image file that already exists). For a local file target the flag is a no-op
+- `--yes` — Confirm the destructive write: required for a device target and to replace an existing remote image file; a no-op for a local file
 - `--write-to-system-disk` — Allow writing to the system boot disk (refused by default; only meaningful with `--device`)
 - `--write-zeros-to-unused` — Write zeros to unused filesystem space
 

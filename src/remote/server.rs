@@ -1232,9 +1232,8 @@ fn handle_conn(
                 offset,
                 len,
             } => {
-                // The payload follows as a chunk stream and MUST be consumed
-                // regardless of handle validity, or the framing desyncs. Keep
-                // only what a legal write can carry; the rest drains and fails.
+                // The payload follows as a chunk stream and MUST be drained whatever
+                // happens, or the framing desyncs; only a legal write's worth is kept.
                 let mut sink = crate::remote::protocol::CappedSink::new(MAX_RANGE_WRITE as usize);
                 let drained = read_chunks(&mut reader, &mut sink);
                 let payload = sink.buf;

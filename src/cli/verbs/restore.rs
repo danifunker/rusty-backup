@@ -57,9 +57,8 @@ pub struct RestoreArgs {
     #[arg(long)]
     pub device: bool,
 
-    /// Confirm destructive write to the target (required for device
-    /// targets, and to replace a remote image file that already exists).
-    /// For a local file target the flag is a no-op.
+    /// Confirm the destructive write: required for a device target and to
+    /// replace an existing remote image file; a no-op for a local file.
     #[arg(long)]
     pub yes: bool,
 

@@ -413,9 +413,8 @@ fn node_first_last_keys(node: &[u8], node_size: usize) -> Option<(&[u8], &[u8])>
     Some((first, last))
 }
 
-/// Walk the leaf chain from the header's first leaf: the last key of every
-/// leaf must sort below the first key of the next, or a lookup that descends
-/// correctly still misses records parked in the wrong leaf.
+/// Walk the leaf chain: each leaf must end below the next one's first key, or
+/// a correct descent still misses records parked in the wrong leaf.
 fn check_leaf_chain_ordering(
     catalog_data: &[u8],
     header: &BTreeHeader,

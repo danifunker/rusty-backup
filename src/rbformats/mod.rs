@@ -233,9 +233,8 @@ pub(crate) use compress::{
     write_zeros_with_progress, OutputHasherHandle, SplitWriter, CHUNK_SIZE,
 };
 
-/// The parsed GPT / APM sidecar a backup folder carries for its table type.
-/// Without it a GPT export keeps only its protective MBR and an APM export is
-/// patched as if its driver-descriptor block were an MBR.
+/// The parsed GPT / APM sidecar a backup folder carries for its table type;
+/// without it a GPT export keeps only its protective MBR (BR6).
 pub fn load_table_sidecars(
     backup_folder: &Path,
     table_type: &str,

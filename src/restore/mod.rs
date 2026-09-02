@@ -3056,9 +3056,8 @@ mod tests {
         let meta_path = backup_folder.join("metadata.json");
         std::fs::write(&meta_path, serde_json::to_string_pretty(&metadata).unwrap()).unwrap();
 
-        // Run restore to a target image file that is larger than the image and
-        // still carries a GPT from a previous life: primary at LBA 1 and the
-        // backup header in its last 33 sectors (BR10).
+        // Restore onto a larger target that still carries a GPT from a previous
+        // life: primary at LBA 1, backup header in its last 33 sectors (BR10).
         let target_path = tmp.path().join("restored.img");
         let target_bytes = total_bytes + 64 * 1024;
         let mut stale = vec![0u8; target_bytes as usize];

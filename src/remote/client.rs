@@ -128,7 +128,6 @@ impl RemoteSession {
         }
     }
 
-    /// Stream a single file's bytes into `sink`, returning the byte count.
     /// Drain a `FileBegin` body into `sink` and insist it is the size announced:
     /// a short stream is a cut transfer, not a shorter file.
     fn read_declared(&mut self, size: u64, sink: &mut dyn Write, what: &str) -> Result<u64> {
@@ -139,6 +138,7 @@ impl RemoteSession {
         Ok(got)
     }
 
+    /// Stream a single file's bytes into `sink`, returning the byte count.
     pub fn read_file(&mut self, handle: u64, path: &str, sink: &mut dyn Write) -> Result<u64> {
         write_control(
             &mut self.writer,

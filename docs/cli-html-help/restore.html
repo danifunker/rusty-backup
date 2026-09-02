@@ -28,7 +28,7 @@
 <dt><code>--device</code></dt>
 <dd>Treat `TARGET` as a block device (enables sector-aligned writes and the full device-write safety preflight in [`crate::cli::device_safety`])</dd>
 <dt><code>--yes</code></dt>
-<dd>Confirm destructive write to the target (required for device targets, and to replace a remote image file that already exists). For a local file target the flag is a no-op</dd>
+<dd>Confirm the destructive write: required for a device target and to replace an existing remote image file; a no-op for a local file</dd>
 <dt><code>--write-to-system-disk</code></dt>
 <dd>Allow writing to the system boot disk (refused by default; only meaningful with `--device`)</dd>
 <dt><code>--write-zeros-to-unused</code></dt>
