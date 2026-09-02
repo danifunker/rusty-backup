@@ -469,7 +469,17 @@ impl MfsDirEntry {
     /// even length (the on-disk constraint — entries align to even byte
     /// offsets within a directory sector). Caller stamps the result into
     /// the sector buffer.
-    fn encode(&self) -> Vec<u8> {
+    fn encode(&self, alloc_block_size: u32) -> Vec<u8> {
+        // flPyLen / flRPyLen are the allocated sizes: whole allocation blocks.
+        let physical = |logical: u32| -> u32 {
+            if logical == 0 || alloc_block_size == 0 {
+                0
+            } else {
+                logical
+                    .div_ceil(alloc_block_size)
+                    .saturating_mul(alloc_block_size)
+            }
+        };
         let name_bytes = super::hfs::utf8_to_mac_roman(&self.name).unwrap_or_default();
         let name_len = name_bytes.len().min(MFS_MAX_NAME_LEN) as u8;
         let total = 51 + name_len as usize;
@@ -481,12 +491,10 @@ impl MfsDirEntry {
         BigEndian::write_u32(&mut buf[18..22], self.file_number);
         BigEndian::write_u16(&mut buf[22..24], self.data_first_block);
         BigEndian::write_u32(&mut buf[24..28], self.data_logical_length);
-        // physical length: round logical up to allocation-block boundary.
-        // Caller will overwrite if a more accurate value is known.
-        BigEndian::write_u32(&mut buf[28..32], self.data_logical_length);
+        BigEndian::write_u32(&mut buf[28..32], physical(self.data_logical_length));
         BigEndian::write_u16(&mut buf[32..34], self.rsrc_first_block);
         BigEndian::write_u32(&mut buf[34..38], self.rsrc_logical_length);
-        BigEndian::write_u32(&mut buf[38..42], self.rsrc_logical_length);
+        BigEndian::write_u32(&mut buf[38..42], physical(self.rsrc_logical_length));
         BigEndian::write_u32(&mut buf[42..46], self.create_date);
         BigEndian::write_u32(&mut buf[46..50], self.modify_date);
         buf[50] = name_len;
@@ -670,7 +678,7 @@ impl<R: Read + Write + Seek + Send> MfsFilesystem<R> {
         let mut sector_idx = 0usize;
         let mut byte_off = 0usize;
         for e in self.entries.iter().filter(|e| e.is_in_use()) {
-            let bytes = e.encode();
+            let bytes = e.encode(self.mdb.alloc_block_size);
             // If this entry doesn't fit in the remainder of the current
             // sector (after leaving 1 byte for the terminator), advance.
             if byte_off + bytes.len() + 1 > 512 {
@@ -2324,5 +2332,42 @@ mod tests {
         let hello2 = entries.iter().find(|e| e.name == "Hello").unwrap();
         assert_eq!(hello2.type_code, Some(*b"PICT"));
         assert_eq!(hello2.creator_code, Some(*b"8BIM"));
+    }
+}
+
+#[cfg(test)]
+mod physical_length_tests {
+    use super::*;
+    use crate::fs::filesystem::{CreateFileOptions, Filesystem};
+    use std::io::Cursor;
+
+    /// H6: flPyLen / flRPyLen were written as the logical lengths; Mac OS
+    /// expects the allocated size, whole allocation blocks.
+    #[test]
+    fn physical_lengths_are_whole_allocation_blocks() {
+        let img = create_blank_mfs(400 * 1024, "T").unwrap();
+        let mut fs = MfsFilesystem::open(Cursor::new(img), 0).unwrap();
+        let root = fs.root().unwrap();
+        let mut data = Cursor::new(vec![0x5Au8; 100]);
+        fs.create_file(&root, "tiny", &mut data, 100, &CreateFileOptions::default())
+            .unwrap();
+        fs.sync_metadata().unwrap();
+        let abs = fs.mdb.alloc_block_size;
+        let off = fs.partition_offset + fs.mdb.dir_start_sector as u64 * 512;
+        fs.reader.seek(SeekFrom::Start(off)).unwrap();
+        let mut sector = [0u8; 512];
+        fs.reader.read_exact(&mut sector).unwrap();
+        assert_ne!(sector[0] & 0x80, 0, "first directory entry is in use");
+        assert_eq!(
+            BigEndian::read_u32(&sector[24..28]),
+            100,
+            "logical data length"
+        );
+        assert_eq!(
+            BigEndian::read_u32(&sector[28..32]),
+            abs,
+            "physical data length"
+        );
+        assert_eq!(BigEndian::read_u32(&sector[38..42]), 0, "no resource fork");
     }
 }
