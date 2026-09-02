@@ -2377,6 +2377,62 @@ impl<R: Read + Write + Seek> NtfsFilesystem<R> {
         ))
     }
 
+    /// The `$FILE_NAME`s in `parent` that spell `name`, DOS alias included.
+    fn names_for(names: &[FileNameAttr], parent: u64, name: &str) -> Vec<usize> {
+        let lower = name.to_lowercase();
+        let has_long = names
+            .iter()
+            .any(|n| n.parent == parent && n.namespace != 2 && n.name.to_lowercase() == lower);
+        names
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| {
+                n.parent == parent
+                    && (n.name.to_lowercase() == lower || (has_long && n.namespace == 2))
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Drop only this name when the record has other hard links; true if it did.
+    fn unlink_one_name(
+        &mut self,
+        record_number: u64,
+        parent_record_num: u64,
+        name: &str,
+    ) -> Result<bool, FilesystemError> {
+        let Ok(mut record) = self.read_mft_record(record_number) else {
+            return Ok(false);
+        };
+        let names = file_name_attrs(&record);
+        let ours = Self::names_for(&names, parent_record_num, name);
+        if ours.is_empty() || ours.len() == names.len() {
+            return Ok(false);
+        }
+        for &i in &ours {
+            self.remove_alias_or_name(parent_record_num, &names[i])?;
+        }
+        for &i in ours.iter().rev() {
+            remove_attr_at(&mut record, names[i].pos)?;
+        }
+        let remaining = (names.len() - ours.len()) as u16;
+        record[0x12..0x14].copy_from_slice(&remaining.to_le_bytes());
+        self.write_mft_record(record_number, &mut record)?;
+        Ok(true)
+    }
+
+    /// Remove one name's index entry; a DOS alias with no entry is not an error.
+    fn remove_alias_or_name(
+        &mut self,
+        parent_record_num: u64,
+        name: &FileNameAttr,
+    ) -> Result<(), FilesystemError> {
+        match self.remove_index_entry(parent_record_num, &name.name) {
+            Err(FilesystemError::NotFound(_)) if name.namespace == 2 => Ok(()),
+            other => other,
+        }
+    }
+
     /// Free an MFT record.
     fn free_mft_record(&mut self, record_number: u64) -> Result<(), FilesystemError> {
         let mut bitmap = self.read_mft_bitmap()?;
@@ -3409,6 +3465,88 @@ fn set_record_used_size(record: &mut [u8], used: usize) {
     record[0x18..0x1C].copy_from_slice(&(used as u32).to_le_bytes());
 }
 
+/// One `$FILE_NAME` of an MFT record: where it sits and whom it names.
+struct FileNameAttr {
+    pos: usize,
+    parent: u64,
+    namespace: u8,
+    name: String,
+}
+
+/// Every resident `$FILE_NAME` in `record`, in attribute order.
+fn file_name_attrs(record: &[u8]) -> Vec<FileNameAttr> {
+    let mut out = Vec::new();
+    let mut pos = u16::from_le_bytes([record[0x14], record[0x15]]) as usize;
+    while pos + 24 <= record.len() {
+        let atype = u32::from_le_bytes([
+            record[pos],
+            record[pos + 1],
+            record[pos + 2],
+            record[pos + 3],
+        ]);
+        if atype == ATTR_END || atype == 0 {
+            break;
+        }
+        let alen = u32::from_le_bytes([
+            record[pos + 4],
+            record[pos + 5],
+            record[pos + 6],
+            record[pos + 7],
+        ]) as usize;
+        if alen < 24 || pos + alen > record.len() {
+            break;
+        }
+        if atype == ATTR_FILE_NAME && record[pos + 8] == 0 {
+            let vlen = u32::from_le_bytes([
+                record[pos + 0x10],
+                record[pos + 0x11],
+                record[pos + 0x12],
+                record[pos + 0x13],
+            ]) as usize;
+            let voff = u16::from_le_bytes([record[pos + 0x14], record[pos + 0x15]]) as usize;
+            if voff + vlen <= alen && vlen >= 0x42 {
+                let v = &record[pos + voff..pos + voff + vlen];
+                let name_len = v[0x40] as usize;
+                if 0x42 + name_len * 2 <= vlen {
+                    let units: Vec<u16> = v[0x42..0x42 + name_len * 2]
+                        .chunks_exact(2)
+                        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                        .collect();
+                    out.push(FileNameAttr {
+                        pos,
+                        parent: u64::from_le_bytes([v[0], v[1], v[2], v[3], v[4], v[5], 0, 0]),
+                        namespace: v[0x41],
+                        name: String::from_utf16_lossy(&units),
+                    });
+                }
+            }
+        }
+        pos += alen;
+    }
+    out
+}
+
+/// Remove the attribute at `pos`, closing the gap and shrinking the used size.
+fn remove_attr_at(record: &mut [u8], pos: usize) -> Result<(), FilesystemError> {
+    let used =
+        u32::from_le_bytes([record[0x18], record[0x19], record[0x1A], record[0x1B]]) as usize;
+    let len = u32::from_le_bytes([
+        record[pos + 4],
+        record[pos + 5],
+        record[pos + 6],
+        record[pos + 7],
+    ]) as usize;
+    if len < 16 || pos + len > used || used > record.len() {
+        return Err(FilesystemError::InvalidData(
+            "corrupt MFT record while removing an attribute".into(),
+        ));
+    }
+    record.copy_within(pos + len..used, pos);
+    record[used - len..used].fill(0);
+    record[0x18..0x1C].copy_from_slice(&((used - len) as u32).to_le_bytes());
+    Ok(())
+}
+
 /// First attribute of `attr_type` with the requested residency: (pos, len).
 fn find_attr_pos(record: &[u8], attr_type: u32, resident: bool) -> Option<(usize, usize)> {
     let mut pos = u16::from_le_bytes([record[0x14], record[0x15]]) as usize;
@@ -4128,11 +4266,23 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
             parent.location
         };
 
-        // Remove from parent's index
+        let record_number = entry.location;
+        if self.unlink_one_name(record_number, parent_record_num, &entry.name)? {
+            return Ok(());
+        }
+
+        // Remove from parent's index, the DOS alias's entry included.
         self.remove_index_entry(parent_record_num, &entry.name)?;
+        if let Ok(record) = self.read_mft_record(record_number) {
+            let names = file_name_attrs(&record);
+            for i in Self::names_for(&names, parent_record_num, &entry.name) {
+                if names[i].namespace == 2 && !names[i].name.eq_ignore_ascii_case(&entry.name) {
+                    self.remove_alias_or_name(parent_record_num, &names[i])?;
+                }
+            }
+        }
 
         // Free data and index-allocation clusters if non-resident
-        let record_number = entry.location;
         if let Ok(record) = self.read_mft_record(record_number) {
             let attrs = parse_mft_attributes(&record, self.mft_record_size);
             for attr in &attrs {
@@ -4523,6 +4673,9 @@ pub fn resize_ntfs_in_place(
         vbr[0x28], vbr[0x29], vbr[0x2A], vbr[0x2B], vbr[0x2C], vbr[0x2D], vbr[0x2E], vbr[0x2F],
     ]);
 
+    // The caller passes the partition's sector count; NTFS keeps its backup
+    // boot sector in the last one, so the volume itself is a sector shorter.
+    let new_total_sectors = new_total_sectors.saturating_sub(1);
     if old_total == new_total_sectors {
         return Ok(false);
     }
@@ -4576,8 +4729,8 @@ pub fn resize_ntfs_in_place(
     file.seek(SeekFrom::Start(partition_offset))?;
     file.write_all(&vbr)?;
 
-    // Write backup boot sector at last sector of new partition
-    let backup_offset = partition_offset + (new_total_sectors - 1) * bytes_per_sector;
+    // The backup boot sector is the sector after the volume: the partition's last.
+    let backup_offset = partition_offset + new_total_sectors * bytes_per_sector;
     file.seek(SeekFrom::Start(backup_offset))?;
     file.write_all(&vbr)?;
 
@@ -4732,7 +4885,8 @@ pub fn patch_ntfs_hidden_sectors(
         ]);
         let bytes_per_sector = u16::from_le_bytes([vbr[0x0B], vbr[0x0C]]) as u64;
         if total_sectors > 0 && bytes_per_sector > 0 {
-            let backup_offset = partition_offset + (total_sectors - 1) * bytes_per_sector;
+            // TotalSectors excludes the backup boot sector, which follows it.
+            let backup_offset = partition_offset + total_sectors * bytes_per_sector;
             crate::fs::patch::write_sector_at(file, backup_offset, &vbr)?;
         }
 
@@ -4845,6 +4999,69 @@ mod tests {
         .unwrap();
         cur.seek(SeekFrom::Start(0)).unwrap();
         cur
+    }
+
+    /// A second `$FILE_NAME` on a record is a hard link; deleting one name
+    /// used to free the record and its clusters out from under the other.
+    #[test]
+    fn deleting_one_hard_link_keeps_the_other() {
+        let cur = format_test_volume(4096, 256);
+        let mut fs = NtfsFilesystem::open(cur, 0).unwrap();
+        let root = fs.root().unwrap();
+        let content: Vec<u8> = (0..20_000u32).map(|i| (i % 253) as u8).collect();
+        put_file(&mut fs, &root, "a.txt", &content);
+        let find = |fs: &mut NtfsFilesystem<Cursor<Vec<u8>>>, name: &str| {
+            fs.list_directory(&root)
+                .unwrap()
+                .into_iter()
+                .find(|e| e.name == name)
+        };
+        let a = find(&mut fs, "a.txt").unwrap();
+        let rec = a.location;
+        let mut record = fs.read_mft_record(rec).unwrap();
+        let seq = u16::from_le_bytes([record[0x10], record[0x11]]);
+        let parent_ref = fs.file_reference(MFT_RECORD_ROOT);
+        let link = build_file_name_attr(
+            parent_ref,
+            "b.txt",
+            false,
+            content.len() as u64,
+            now_ntfs_timestamp(),
+        );
+        let (pos, len) = find_attr_pos(&record, ATTR_FILE_NAME, true).unwrap();
+        insert_attr_at(
+            &mut record,
+            pos + len,
+            &build_resident_attr(ATTR_FILE_NAME, &link),
+        )
+        .unwrap();
+        record[0x12..0x14].copy_from_slice(&2u16.to_le_bytes());
+        fs.write_mft_record(rec, &mut record).unwrap();
+        fs.insert_index_entry(MFT_RECORD_ROOT, &build_index_entry(rec, seq, &link))
+            .unwrap();
+
+        let b = find(&mut fs, "b.txt").expect("the link is listed");
+        assert_eq!(b.location, rec);
+        fs.delete_entry(&root, &b).unwrap();
+
+        assert!(find(&mut fs, "b.txt").is_none());
+        let a = find(&mut fs, "a.txt").expect("the other link survives");
+        assert_eq!(fs.read_file(&a, usize::MAX).unwrap(), content);
+        let record = fs.read_mft_record(rec).unwrap();
+        assert_eq!(u16::from_le_bytes([record[0x12], record[0x13]]), 1);
+        let report = super::super::ntfs_fsck::fsck_ntfs(&mut fs).unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+
+        // The last name frees the record for real.
+        fs.delete_entry(&root, &a).unwrap();
+        assert!(find(&mut fs, "a.txt").is_none());
+        let record = fs.read_mft_record(rec).unwrap();
+        assert_eq!(
+            u16::from_le_bytes([record[0x16], record[0x17]]) & MFT_RECORD_IN_USE,
+            0
+        );
+        let report = super::super::ntfs_fsck::fsck_ntfs(&mut fs).unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
     }
 
     /// Deterministic non-sorted creation order covering 0..n (gcd(7, n) == 1).
