@@ -318,12 +318,10 @@ pub fn filetime_to_unix(ft: u64) -> Option<u64> {
 /// HFS/HFS+ modules (MFS uses the same epoch and lives elsewhere).
 const MAC_EPOCH_DELTA: u64 = 2_082_844_800;
 
-/// Encode Unix seconds as a Mac epoch u32. Any time before 1904-01-01
-/// clamps to 1904-01-01, any time past 2040-02-06 (the u32 rollover) is
-/// truncated by u32 wraparound — no Mac filesystem tool guards against
-/// that, and no Mac disk we ship dates a file past 2040.
+/// Encode Unix seconds as a Mac epoch u32, clamping at both ends: a bogus
+/// future mtime on an extracted archive used to wrap into 1904..1970.
 pub fn unix_to_mac_epoch(secs: u64) -> u32 {
-    (secs.saturating_add(MAC_EPOCH_DELTA)) as u32
+    u32::try_from(secs.saturating_add(MAC_EPOCH_DELTA)).unwrap_or(u32::MAX)
 }
 
 /// Decode a Mac epoch u32 back to Unix seconds. Mirrors

@@ -11,7 +11,7 @@ use super::filesystem::{
 };
 use super::hfs_common::{
     self, bitmap_clear_bit_be, bitmap_collect_clear_runs_be, bitmap_set_bit_be, bitmap_test_bit_be,
-    btree_free_node, btree_remove_record, BTreeHeader, BTreeKeyFormat,
+    btree_detach_freed_node, btree_free_node, btree_remove_record, BTreeHeader, BTreeKeyFormat,
 };
 use super::CompactResult;
 
@@ -1995,6 +1995,9 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
                 h.last_leaf_node = prev;
             }
             h.write(&mut self.catalog_data);
+            // The parent still pointed at the freed leaf; a later insert landed
+            // there and the next split zeroed it.
+            btree_detach_freed_node(&mut self.catalog_data, node_size, node_idx);
         }
 
         // Update header leaf_records
@@ -7037,6 +7040,72 @@ mod tests {
             .expect("clean volume should accept edit prep");
         // No xattrs on the synthetic image — the cached set is empty.
         assert!(fs.xattr_cnids.as_ref().unwrap().is_empty());
+    }
+
+    /// Fill many leaves, delete everything, fill again: no index record may
+    /// point at a freed leaf, or the next insert lands in a free node.
+    #[test]
+    fn emptied_leaves_leave_the_index_too() {
+        use crate::fs::hfs_common::{btree_bitmap_test, btree_record_range, BTREE_INDEX_NODE};
+        let img = create_blank_hfsplus(32 * 1024 * 1024, 4096, "Leaves", false);
+        let mut fs = HfsPlusFilesystem::open(std::io::Cursor::new(img), 0).unwrap();
+        fs.prepare_for_edit().unwrap();
+        let root = fs.root().unwrap();
+        let names: Vec<String> = (0..220).map(|i| format!("leaf-file-{i:04}.txt")).collect();
+        let fill = |fs: &mut HfsPlusFilesystem<std::io::Cursor<Vec<u8>>>| {
+            for n in &names {
+                let mut src = std::io::Cursor::new(n.as_bytes().to_vec());
+                fs.create_file(
+                    &root,
+                    n,
+                    &mut src,
+                    n.len() as u64,
+                    &CreateFileOptions::default(),
+                )
+                .unwrap_or_else(|e| panic!("create {n}: {e:?}"));
+            }
+        };
+        fill(&mut fs);
+        assert!(
+            fs.catalog_header.depth > 1,
+            "the test needs a split catalog"
+        );
+
+        for e in fs.list_directory(&root).unwrap() {
+            fs.delete_entry(&root, &e).unwrap();
+        }
+        // No index record may point at a free node.
+        let node_size = fs.catalog_header.node_size as usize;
+        let data = &fs.catalog_data;
+        for idx in 1..(data.len() / node_size) as u32 {
+            if !btree_bitmap_test(data, node_size, idx) {
+                continue;
+            }
+            let off = idx as usize * node_size;
+            let node = &data[off..off + node_size];
+            if node[8] as i8 != BTREE_INDEX_NODE {
+                continue;
+            }
+            let n = BigEndian::read_u16(&node[10..12]) as usize;
+            for r in 0..n {
+                let (_, end) = btree_record_range(node, node_size, r);
+                let child = BigEndian::read_u32(&node[end - 4..end]);
+                assert!(
+                    btree_bitmap_test(data, node_size, child),
+                    "index node {idx} points at free node {child}"
+                );
+            }
+        }
+
+        fill(&mut fs);
+        let listed = fs.list_directory(&root).unwrap();
+        assert_eq!(listed.len(), names.len());
+        for e in &listed {
+            assert_eq!(fs.read_file(e, usize::MAX).unwrap(), e.name.as_bytes());
+        }
+        fs.sync_metadata().unwrap();
+        let report = fs.fsck().unwrap().unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
     }
 
     #[test]

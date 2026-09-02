@@ -1043,6 +1043,11 @@ impl<R: Read + Seek> HfsFilesystem<R> {
             }
             btree_free_node(&mut self.catalog_data, node_size, node_idx);
             h.free_nodes += 1;
+            // The last leaf went with it: an empty tree has no root.
+            if h.root_node == node_idx {
+                h.root_node = 0;
+                h.depth = 0;
+            }
             h.write(&mut self.catalog_data);
 
             // Rebuild index nodes to clean up stale separator keys
@@ -1783,7 +1788,11 @@ impl<R: Read + Write + Seek> HfsFilesystem<R> {
         for i in 0..count {
             bitmap_set_bit_be(bitmap, start + i);
         }
-        self.mdb.free_blocks -= count as u16;
+        // A stale-low drFreeBks (dirty unmount) must not wrap to ~65535.
+        self.mdb.free_blocks = self
+            .mdb
+            .free_blocks
+            .saturating_sub(count.min(u16::MAX as u32) as u16);
         // Advance drAllocPtr (MDB offset 16) past the run so subsequent
         // allocation searches start where the last one ended. hformat
         // maintains this; without it the field stays at 0 and the
