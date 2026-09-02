@@ -1,7 +1,7 @@
 # Build crashes: memory pressure during debug builds
 
-**Status (2026-09-02): root cause identified, mitigations landed, verification
-pending.** Track further findings here.
+**Status (2026-09-02): root cause identified, mitigations landed and verified
+on Linux (see Verification). Windows still unverified.** Track further findings here.
 
 ## Symptom
 
@@ -100,20 +100,56 @@ What was ruled out:
    the separate pass was a second full walk of the crate per commit for no
    extra coverage. Halves hook time and removes one memory peak per commit.
 
-## Verification
+## Verification (m900, 2026-09-02, after `rm -rf target/debug`)
 
-Fill in after rebuilding from a clean `target/debug`:
+`cargo test --no-run` at the committed settings, run in its own transient
+scope (`systemd-run --user --scope`) with a 5-second sampler:
 
-- [ ] Peak memory of `cargo test --no-run` on m900 (measure via a transient
-      scope's `memory.peak` or by sampling `free`).
-- [ ] Size of the lib-test binary and of one integration-test binary after
-      the change, versus 839 MB and ~400 MB before.
-- [ ] `cargo clippy --all-targets -- -D warnings` still green.
-- [ ] No systemd-oomd line in `journalctl --user` during the run.
+| measure | before (Sep 1-2) | after |
+|---|---|---|
+| lib-test binary | 839 MB | 385 MB |
+| `librusty_backup` rlib | 634 MB | 334 MB |
+| `rb-cli` | 461 MB | 216 MB |
+| integration test binaries | 350-440 MB | 144-197 MB |
+| `target/debug/examples` (76 binaries) | 16 GB | 7.0 GB |
+| `target/debug/deps` | 20 GB | 6.0 GB |
+| `target/debug/incremental` | 11 GB | 2.7 GB |
+| `target/debug` total | 46 GB | 17 GB |
+| peak anonymous memory in the build scope | not measured | 1.96 GB |
+| peak system-wide "used" (`free`, incl. ~2.8 GB desktop baseline) | not measured | 4.65 GB |
+| peak page cache charged to the scope | not measured | 7.7 GB |
+| user-slice memory pressure `full avg10` (oomd's trigger, limit 50%) | 95.27% at the kills | 0.07% |
+| systemd-oomd events during the run | one per build | none |
+| wall time, main crate + all test/example targets, `-j4` | not measured | 222 s |
+| compiler warnings | 0 | 0 |
+
+Two things the measurement itself taught:
+
+- **Do not verify with a `MemoryMax` cap on the scope.** The first attempt ran
+  under `MemoryMax=11G` and was oomd-killed at 10.2 GB *while still compiling
+  dependencies*: only ~1.5 GB of that was anonymous memory, the rest was page
+  cache from the artifacts being written, and forcing the cgroup to reclaim
+  that cache produced 84% pressure, which is the exact signal oomd acts on.
+  Uncapped, the same build never exceeded 0.07%.
+- **Reclaim stall is the trigger, not raw allocation.** The original builds
+  wrote tens of GB of debuginfo-laden artifacts while several linkers held
+  hundreds of MB each; the kernel's writeback and cache reclaim stalls are what
+  pushed the user slice over 50% for 20 s. Shrinking every artifact by half or
+  more attacks that directly, which is why the peak came down so far.
+
+Still open:
+
 - [ ] Same build on the Windows machine survives (unverified from here; the
       expected mechanism there is MSVC `link.exe` plus PDB generation for
       800 MB binaries exhausting commit charge, and the debuginfo trim
       shrinks those PDBs too).
+- [x] `cargo clippy --all-targets -- -D warnings` (the hook's pass, same
+      scope and sampler): green, 0 warnings, 158 s. Peak anonymous memory
+      3.9 GB in the scope, system-wide used 6.6 GB, user-slice pressure
+      peaked at 8.8% for one sample, no oomd event. Clippy is the heavier
+      of the two workloads for anonymous memory (3.9 GB vs 2.0 GB for the
+      build), the build is heavier for page cache. Neither is near the
+      killer's threshold any more.
 
 ## If it still happens
 
