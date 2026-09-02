@@ -266,6 +266,29 @@ pub fn in_place_resize_support<R: Read + Seek>(
     InPlaceResize::Unsupported(fs_display_name(detected))
 }
 
+/// ext2/3/4 superblock: the 0xEF53 magic plus the fields no real volume has at
+/// zero, so a stray magic inside another filesystem's block is not enough.
+pub(crate) fn ext_superblock_plausible(sb: &[u8; 512]) -> bool {
+    let inodes = u32::from_le_bytes([sb[0], sb[1], sb[2], sb[3]]);
+    let blocks = u32::from_le_bytes([sb[4], sb[5], sb[6], sb[7]]);
+    let log_block_size = u32::from_le_bytes([sb[0x18], sb[0x19], sb[0x1A], sb[0x1B]]);
+    sb[0x38] == 0x53 && sb[0x39] == 0xEF && inodes != 0 && blocks != 0 && log_block_size <= 6
+}
+
+/// Classic HFS MDB: a non-zero block count and a 512-multiple block size.
+pub(crate) fn hfs_mdb_plausible(sb: &[u8; 512]) -> bool {
+    let nm_al_blks = u16::from_be_bytes([sb[18], sb[19]]);
+    let al_blk_siz = u32::from_be_bytes([sb[20], sb[21], sb[22], sb[23]]);
+    nm_al_blks != 0 && al_blk_siz != 0 && al_blk_siz & 511 == 0
+}
+
+/// HFS+/HFSX volume header: version 4 or 5 and a power-of-two block size >= 512.
+pub(crate) fn hfsplus_header_plausible(sb: &[u8; 512]) -> bool {
+    let version = u16::from_be_bytes([sb[2], sb[3]]);
+    let block_size = u32::from_be_bytes([sb[40], sb[41], sb[42], sb[43]]);
+    (4..=5).contains(&version) && block_size >= 512 && block_size.is_power_of_two()
+}
+
 /// A human-facing name for a `detect_filesystem_type` token, for messages.
 fn fs_display_name(detected: &str) -> &'static str {
     match detected {
@@ -396,25 +419,26 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
     {
         let mut sb_buf = [0u8; 512];
         if reader.read_exact(&mut sb_buf).is_ok() {
+            // ext goes first: its magic sits at +0x38 where an MDB keeps the
+            // volume name, while an ext inode count can forge an HFS signature.
+            if ext_superblock_plausible(&sb_buf) {
+                return "ext";
+            }
             let sig = u16::from_be_bytes([sb_buf[0], sb_buf[1]]);
             match sig {
-                0x4244 => {
-                    // HFS MDB — check for embedded HFS+ (drEmbedSigWord at MDB offset 124)
+                // HFS MDB; drEmbedSigWord at 124 marks a wrapped HFS+ volume.
+                0x4244 if hfs_mdb_plausible(&sb_buf) => {
                     let embed_sig = u16::from_be_bytes([sb_buf[124], sb_buf[125]]);
                     if embed_sig == 0x482B {
                         return "hfsplus";
                     }
                     return "hfs";
                 }
-                0x482B | 0x4858 => return "hfsplus",
-                // MFS — pre-HFS, used by Mac 128K/512K and Mac Plus on 400 KB
+                0x482B | 0x4858 if hfsplus_header_plausible(&sb_buf) => return "hfsplus",
+                // MFS: pre-HFS, used by Mac 128K/512K and Mac Plus on 400 KB
                 // single-sided floppies. Same byte-1024 MDB convention as HFS.
                 0xD2D7 => return "mfs",
                 _ => {}
-            }
-            // ext superblock magic at offset 0x38 (56) within this sector
-            if sb_buf[0x38] == 0x53 && sb_buf[0x39] == 0xEF {
-                return "ext";
             }
             // ProDOS volume directory key block: prev_block==0, storage_type nibble==0xF,
             // entry_length==39, entries_per_block==13.
@@ -4450,6 +4474,73 @@ mod superfloppy_gate_tests {
         mbr.partition_type_string = None;
         mbr.partition_type_byte = 0x83;
         assert_eq!(mbr.gate_type_byte(), 0x83);
+    }
+}
+
+#[cfg(test)]
+mod probe_order_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// F13: the HFS signature at +1024 was matched before the ext magic, so an
+    /// ext volume whose inode count happened to end in 0x4442 ("BD") opened
+    /// as HFS. ext now goes first, and the HFS arms check the MDB is real.
+    #[test]
+    fn an_ext_superblock_wins_over_a_forged_hfs_signature() {
+        let mut img = vec![0u8; 8192];
+        let sb = &mut img[1024..1536];
+        sb[0..4].copy_from_slice(&0x0001_4442u32.to_le_bytes()); // "BD" in big-endian
+        sb[4..8].copy_from_slice(&4096u32.to_le_bytes());
+        sb[0x18..0x1C].copy_from_slice(&0u32.to_le_bytes());
+        sb[0x38] = 0x53;
+        sb[0x39] = 0xEF;
+        // Fields an HFS MDB would need, so ordering alone decides.
+        sb[18..20].copy_from_slice(&16u16.to_be_bytes());
+        sb[20..24].copy_from_slice(&512u32.to_be_bytes());
+        assert_eq!(
+            detect_filesystem_type(&mut Cursor::new(img.clone()), 0),
+            "ext"
+        );
+        let table = crate::partition::PartitionTable::detect(&mut Cursor::new(img)).unwrap();
+        assert!(
+            matches!(&table, crate::partition::PartitionTable::None { fs_hint, .. } if fs_hint == "ext"),
+            "{table:?}"
+        );
+    }
+
+    /// The other direction: an HFS volume whose name carries the two ext magic
+    /// bytes at +0x38 is still HFS, because the rest of the superblock is not.
+    #[test]
+    fn a_real_hfs_volume_is_not_mistaken_for_ext() {
+        let mut img = crate::fs::hfs::create_blank_hfs(8 * 1024 * 1024, 4096, "Vol").unwrap();
+        img[1024 + 36] = 27;
+        img[1024 + 0x38] = 0x53;
+        img[1024 + 0x39] = 0xEF;
+        assert_eq!(detect_filesystem_type(&mut Cursor::new(img), 0), "hfs");
+    }
+
+    #[test]
+    fn genuine_volumes_still_detect_after_the_reorder() {
+        let hfsp = crate::fs::hfsplus::create_blank_hfsplus(8 * 1024 * 1024, 4096, "P", false);
+        assert_eq!(detect_filesystem_type(&mut Cursor::new(hfsp), 0), "hfsplus");
+        let hfsx = crate::fs::hfsplus::create_blank_hfsplus(8 * 1024 * 1024, 4096, "X", true);
+        assert_eq!(detect_filesystem_type(&mut Cursor::new(hfsx), 0), "hfsplus");
+        let ext = crate::fs::ext_format::create_blank_ext2(16 * 1024 * 1024, "e").unwrap();
+        assert_eq!(detect_filesystem_type(&mut Cursor::new(ext), 0), "ext");
+        // A Minix superblock forging the HFS signature falls through to Minix
+        // now that an MDB needs a real block size.
+        let mut minix = crate::fs::minix::create_blank_minix(
+            4 * 1024 * 1024,
+            crate::fs::minix::MinixVersion::V1,
+        )
+        .unwrap();
+        assert_eq!(
+            detect_filesystem_type(&mut Cursor::new(minix.clone()), 0),
+            "minix"
+        );
+        minix[1024] = 0x42;
+        minix[1025] = 0x44;
+        assert_eq!(detect_filesystem_type(&mut Cursor::new(minix), 0), "minix");
     }
 }
 

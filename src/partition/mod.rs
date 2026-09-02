@@ -587,19 +587,21 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
     if reader.seek(SeekFrom::Start(1024)).is_ok() {
         let mut buf = [0u8; 512];
         if reader.read_exact(&mut buf).is_ok() {
+            // ext first and the HFS arms validated: the same order as
+            // `fs::detect_filesystem_type`, so both probes name the same volume.
+            if crate::fs::ext_superblock_plausible(&buf) {
+                return Some("ext".to_string());
+            }
             let sig = u16::from_be_bytes([buf[0], buf[1]]);
             match sig {
-                0x4244 => return Some("HFS".to_string()),
-                0x482B | 0x4858 => return Some("HFS+".to_string()),
-                // MFS — pre-HFS, used by Mac 128K/512K and Mac Plus on 400 KB
+                0x4244 if crate::fs::hfs_mdb_plausible(&buf) => return Some("HFS".to_string()),
+                0x482B | 0x4858 if crate::fs::hfsplus_header_plausible(&buf) => {
+                    return Some("HFS+".to_string())
+                }
+                // MFS: pre-HFS, used by Mac 128K/512K and Mac Plus on 400 KB
                 // single-sided floppies. Same byte-1024 MDB convention as HFS.
                 0xD2D7 => return Some("MFS".to_string()),
                 _ => {}
-            }
-            // ext2/3/4 superblock magic 0xEF53 (LE u16) at byte 0x38 of the
-            // 1024-offset superblock.
-            if buf[0x38] == 0x53 && buf[0x39] == 0xEF {
-                return Some("ext".to_string());
             }
             // ProDOS volume directory key block: prev_block==0, storage_type nibble==0xF,
             // entry_length==39, entries_per_block==13.
@@ -2337,8 +2339,11 @@ mod tests {
                 d
             }),
             ("ext", || {
-                // ext2/3/4 magic 0xEF53 (LE) at 0x38 of the superblock at 1024.
+                // ext2/3/4 magic 0xEF53 (LE) at 0x38 of the superblock at 1024,
+                // with the inode and block counts a real volume never has at zero.
                 let mut d = vec![0u8; 1024 * 1024];
+                d[1024..1028].copy_from_slice(&128u32.to_le_bytes());
+                d[1028..1032].copy_from_slice(&1024u32.to_le_bytes());
                 d[1024 + 0x38] = 0x53;
                 d[1024 + 0x39] = 0xEF;
                 d
@@ -2350,10 +2355,13 @@ mod tests {
                 d
             }),
             ("HFS", || {
-                // MDB signature 0x4244 at offset 1024; no JMP / MBR signature.
+                // MDB signature 0x4244 at offset 1024 with a real block count
+                // and size; no JMP / MBR signature.
                 let mut d = vec![0u8; 819200];
                 d[1024] = 0x42;
                 d[1025] = 0x44;
+                d[1024 + 18..1024 + 20].copy_from_slice(&1594u16.to_be_bytes());
+                d[1024 + 20..1024 + 24].copy_from_slice(&512u32.to_be_bytes());
                 d
             }),
         ];
