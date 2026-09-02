@@ -219,6 +219,13 @@ fn import_tar_inner<R: Read>(
     progress: &dyn Fn(&TarImportStats),
 ) -> Result<TarImportStats> {
     let mut sink = Importer::new(dest);
+    // macOS tar writes `._name` right before `name`; the parsed sidecar waits
+    // here so the primary file lands with its resource fork and type codes.
+    let mut pending_forks: std::collections::HashMap<
+        Vec<String>,
+        crate::fs::resource_fork::ImportedResourceFork,
+    > = std::collections::HashMap::new();
+    const MAX_SIDECAR_BYTES: u64 = 16 * 1024 * 1024;
     let mut ar = tar::Archive::new(archive);
 
     for entry in ar.entries().context("reading tar entries")? {
@@ -241,6 +248,26 @@ fn import_tar_inner<R: Read>(
         // this point — traversal guarding, mkdir -p, conflict policy, attr
         // inheritance — is identical for a host-directory import, so it lives
         // in `import_sink` rather than here.
+        if etype.is_file() && comps.last().map(|c| is_appledouble(c)).unwrap_or(false) {
+            let mut bytes = Vec::new();
+            if entry.size() <= MAX_SIDECAR_BYTES {
+                entry
+                    .read_to_end(&mut bytes)
+                    .with_context(|| format!("reading sidecar {display}"))?;
+            }
+            match crate::fs::resource_fork::parse_appledouble(&bytes) {
+                Some(fork) => {
+                    let mut primary = comps.clone();
+                    if let Some(last) = primary.last_mut() {
+                        *last = last[2..].to_string();
+                    }
+                    pending_forks.insert(primary, fork);
+                }
+                None => sink.stats.appledouble_skipped += 1,
+            }
+            progress(&sink.stats);
+            continue;
+        }
         if etype.is_dir() {
             sink.push(efs, &comps, ImportItem::Dir, &overrides, opts, &display)?;
         } else if etype.is_symlink() {
@@ -260,15 +287,17 @@ fn import_tar_inner<R: Read>(
             )?;
         } else if etype.is_file() {
             let size = entry.size();
+            let fork = pending_forks.remove(&comps);
+            if fork.is_some() {
+                sink.stats.appledouble_paired += 1;
+            }
             sink.push(
                 efs,
                 &comps,
                 ImportItem::File {
                     size,
                     data: &mut entry,
-                    // A tar member has no host sidecar to pair with; a `._name`
-                    // inside the tarball is dropped by `skip_appledouble`.
-                    mac_fork: None,
+                    mac_fork: fork.as_ref(),
                 },
                 &overrides,
                 opts,
@@ -287,6 +316,8 @@ fn import_tar_inner<R: Read>(
         }
         progress(&sink.stats);
     }
+    // A sidecar whose file never came, or came first, has nothing to join.
+    sink.stats.appledouble_skipped += pending_forks.len() as u64;
     Ok(sink.stats)
 }
 
@@ -406,6 +437,89 @@ mod tests {
     /// Round-trip: build a populated FAT volume, export it to a .tar.gz, then
     /// import that archive into a fresh blank FAT volume and confirm the tree
     /// + contents survive.
+    fn sidecar_tar(sidecar_first: bool) -> Vec<u8> {
+        let ad = crate::fs::resource_fork::build_appledouble(
+            b"TEXT",
+            b"ttxt",
+            crate::fs::resource_fork::MacFileDates::default(),
+            b"RSRC",
+        );
+        let mut b = tar::Builder::new(Vec::new());
+        let mut add = |name: &str, bytes: &[u8]| {
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(tar::EntryType::Regular);
+            h.set_size(bytes.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            b.append_data(&mut h, name, bytes).unwrap();
+        };
+        if sidecar_first {
+            add("._HELLO.TXT", &ad);
+            add("HELLO.TXT", b"hello");
+        } else {
+            add("HELLO.TXT", b"hello");
+            add("._HELLO.TXT", &ad);
+        }
+        b.into_inner().unwrap()
+    }
+
+    /// X14: a `._name` member was dropped; macOS tar writes it right before
+    /// `name`, and it carries the file's resource fork and type codes.
+    #[test]
+    fn an_appledouble_member_is_joined_to_its_file() {
+        let img = crate::fs::hfs::create_blank_hfs(4 * 1024 * 1024, 512, "T").unwrap();
+        let mut efs =
+            crate::fs::open_editable_filesystem(std::io::Cursor::new(img), 0, 0, None).unwrap();
+        let root = efs.root().unwrap();
+        let stats = import_tar(
+            &mut *efs,
+            &root,
+            &sidecar_tar(true)[..],
+            &TarImportOptions::default(),
+            &|_| {},
+        )
+        .unwrap();
+        efs.sync_metadata().unwrap();
+        assert_eq!(
+            (
+                stats.files,
+                stats.appledouble_paired,
+                stats.appledouble_skipped
+            ),
+            (1, 1, 0)
+        );
+        let entries = efs.as_filesystem_mut().list_directory(&root).unwrap();
+        let hello = entries
+            .iter()
+            .find(|e| e.name == "HELLO.TXT")
+            .expect("HELLO.TXT");
+        assert_eq!(hello.resource_fork_size, Some(4), "{hello:?}");
+        assert_eq!(hello.type_code, Some(*b"TEXT"));
+        assert_eq!(hello.creator_code, Some(*b"ttxt"));
+
+        // Sidecar after its file: nothing to join, and it is reported as skipped.
+        let img = crate::fs::hfs::create_blank_hfs(4 * 1024 * 1024, 512, "T").unwrap();
+        let mut efs =
+            crate::fs::open_editable_filesystem(std::io::Cursor::new(img), 0, 0, None).unwrap();
+        let root = efs.root().unwrap();
+        let stats = import_tar(
+            &mut *efs,
+            &root,
+            &sidecar_tar(false)[..],
+            &TarImportOptions::default(),
+            &|_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                stats.files,
+                stats.appledouble_paired,
+                stats.appledouble_skipped
+            ),
+            (1, 0, 1)
+        );
+    }
+
     #[test]
     fn round_trip_export_then_import() {
         let dir = tempfile::tempdir().unwrap();

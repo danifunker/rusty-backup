@@ -75,6 +75,8 @@ pub struct ImportStats {
     pub perms_applied: u64,
     /// macOS AppleDouble (`._*`) sidecars skipped.
     pub appledouble_skipped: u64,
+    /// `._name` members joined to their file as its resource fork (tar import).
+    pub appledouble_paired: u64,
     /// Entries whose name the target filesystem can't store (e.g. a
     /// trailing-dot name on FAT).
     pub invalid_names_skipped: u64,

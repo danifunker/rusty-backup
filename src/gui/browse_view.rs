@@ -3122,6 +3122,12 @@ impl BrowseView {
                 stats.appledouble_skipped
             ));
         }
+        if stats.appledouble_paired > 0 {
+            msg.push_str(&format!(
+                "; {} ._ sidecar(s) joined to their file",
+                stats.appledouble_paired
+            ));
+        }
         if stats.invalid_names_skipped > 0 {
             msg.push_str(&format!(
                 "; {} bad-name entr(ies) skipped",
