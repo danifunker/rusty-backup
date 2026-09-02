@@ -2530,6 +2530,42 @@ impl<R: Read + Write + Seek> NtfsFilesystem<R> {
         Ok(allocated)
     }
 
+    /// Copy `data_len` bytes into freshly allocated `runs` 1 MiB at a time; the
+    /// source is never held whole in memory (CONTRIBUTING streaming rule).
+    fn stream_into_runs(
+        &mut self,
+        runs: &[(u64, u64)],
+        data: &mut dyn std::io::Read,
+        data_len: u64,
+    ) -> Result<(), FilesystemError> {
+        let mut buf = vec![0u8; 1024 * 1024];
+        let mut written = 0u64;
+        for &(start_cluster, length) in runs {
+            let offset = self.cluster_offset(start_cluster);
+            self.reader.seek(SeekFrom::Start(offset))?;
+            let run_bytes = length * self.cluster_size;
+            let to_write = run_bytes.min(data_len - written);
+            let mut left = to_write;
+            while left > 0 {
+                let n = (buf.len() as u64).min(left) as usize;
+                data.read_exact(&mut buf[..n])
+                    .map_err(FilesystemError::Io)?;
+                self.reader.write_all(&buf[..n])?;
+                left -= n as u64;
+            }
+            // Zero the slack of the last cluster so stale bytes never sit past EOF.
+            let mut pad = run_bytes - to_write;
+            while pad > 0 {
+                let n = (buf.len() as u64).min(pad) as usize;
+                buf[..n].fill(0);
+                self.reader.write_all(&buf[..n])?;
+                pad -= n as u64;
+            }
+            written += to_write;
+        }
+        Ok(())
+    }
+
     /// Free volume clusters.
     fn free_volume_clusters(&mut self, runs: &[(u64, u64)]) -> Result<(), FilesystemError> {
         let (mut bitmap, bitmap_runs) = self.read_volume_bitmap()?;
@@ -4051,43 +4087,24 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
             return Err(FilesystemError::AlreadyExists(name.to_string()));
         }
 
-        let (record_num, record_seq) = self.allocate_mft_record()?;
-
-        // Read file data
-        let mut file_data = vec![0u8; data_len as usize];
-        if data_len > 0 {
-            data.read_exact(&mut file_data)
-                .map_err(FilesystemError::Io)?;
-        }
-
         // Determine resident vs non-resident threshold
         // Approximate: record_size - header(0x38) - StdInfo(~72) - FileName(~104) - SD(~80) - DATA_header(~24) - end(4)
         let overhead = 0x38 + 72 + 104 + 80 + 24 + 4;
         let resident_threshold = (self.mft_record_size as usize).saturating_sub(overhead);
 
         let data_attr = if data_len as usize <= resident_threshold {
-            // Resident $DATA
+            // Resident $DATA lives inside the 1 KiB record, so buffering it is bounded.
+            let mut file_data = vec![0u8; data_len as usize];
+            data.read_exact(&mut file_data)
+                .map_err(FilesystemError::Io)?;
             build_resident_attr(ATTR_DATA, &file_data)
         } else {
-            // Non-resident: allocate clusters
+            // Non-resident: allocate clusters, then stream the source into them.
             let clusters_needed = data_len.div_ceil(self.cluster_size) as u32;
             let runs = self.allocate_volume_clusters(clusters_needed)?;
-
-            // Write data to allocated clusters
-            let mut written = 0u64;
-            for &(start_cluster, length) in &runs {
-                let offset = self.cluster_offset(start_cluster);
-                self.reader.seek(SeekFrom::Start(offset))?;
-                let run_bytes = length * self.cluster_size;
-                let to_write = run_bytes.min(data_len - written);
-                self.reader
-                    .write_all(&file_data[written as usize..(written + to_write) as usize])?;
-                // Zero-fill remainder of last cluster
-                if to_write < run_bytes {
-                    let zeros = vec![0u8; (run_bytes - to_write) as usize];
-                    self.reader.write_all(&zeros)?;
-                }
-                written += to_write;
+            if let Err(e) = self.stream_into_runs(&runs, data, data_len) {
+                let _ = self.free_volume_clusters(&runs);
+                return Err(e);
             }
 
             let alloc_size = clusters_needed as u64 * self.cluster_size;
@@ -4096,6 +4113,10 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
             attr[0x28..0x30].copy_from_slice(&alloc_size.to_le_bytes());
             attr
         };
+
+        // The record is claimed only once the data is safely on disk, so a
+        // short or failing source leaves no orphan in the $MFT bitmap.
+        let (record_num, record_seq) = self.allocate_mft_record()?;
 
         // Build attributes
         // A parent with its own $SECURITY_DESCRIPTOR (our formatter's root) is
@@ -6153,6 +6174,107 @@ mod tests {
         // Free space should have decreased
         let new_free = fs.free_space().unwrap();
         assert!(new_free < initial_free);
+    }
+
+    /// Hands out at most `step` bytes per `read`, so `read_exact` must loop.
+    struct Trickle {
+        pos: u64,
+        len: u64,
+        step: usize,
+    }
+
+    impl std::io::Read for Trickle {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let left = (self.len - self.pos) as usize;
+            let n = buf.len().min(self.step).min(left);
+            for (i, b) in buf[..n].iter_mut().enumerate() {
+                *b = ((self.pos + i as u64) % 251) as u8;
+            }
+            self.pos += n as u64;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn nonresident_create_streams_across_chunks_and_pads_the_last_cluster() {
+        let mut blank = Cursor::new(Vec::new());
+        crate::fs::ntfs_format::create_blank_ntfs(&mut blank, 32 * 1024 * 1024, 64, Some("S"))
+            .unwrap();
+        let mut img = blank.into_inner();
+        let mut fs = NtfsFilesystem::open(Cursor::new(&mut img), 0).unwrap();
+        let root = fs.root().unwrap();
+
+        // Crosses two 1 MiB chunk boundaries and ends mid-cluster.
+        let len = 2 * 1024 * 1024 + 777;
+        let mut src = Trickle {
+            pos: 0,
+            len,
+            step: 4093,
+        };
+        let file = fs
+            .create_file(
+                &root,
+                "big.bin",
+                &mut src,
+                len,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(file.size, len);
+
+        let back = fs.read_file(&file, len as usize).unwrap();
+        assert_eq!(back.len(), len as usize);
+        assert!(back
+            .iter()
+            .enumerate()
+            .all(|(i, &b)| b == (i as u64 % 251) as u8));
+    }
+
+    #[test]
+    fn nonresident_create_from_short_source_leaks_nothing() {
+        let mut blank = Cursor::new(Vec::new());
+        crate::fs::ntfs_format::create_blank_ntfs(&mut blank, 32 * 1024 * 1024, 64, Some("S"))
+            .unwrap();
+        let mut img = blank.into_inner();
+        let mut fs = NtfsFilesystem::open(Cursor::new(&mut img), 0).unwrap();
+        let root = fs.root().unwrap();
+        let free_before = fs.free_space().unwrap();
+        let mft_before = fs.read_mft_bitmap().unwrap();
+
+        // Declares 1 MiB but only delivers half of it.
+        let mut src = Trickle {
+            pos: 0,
+            len: 512 * 1024,
+            step: 4096,
+        };
+        let err = fs
+            .create_file(
+                &root,
+                "short.bin",
+                &mut src,
+                1024 * 1024,
+                &CreateFileOptions::default(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, FilesystemError::Io(_)), "{err:?}");
+
+        assert_eq!(
+            fs.free_space().unwrap(),
+            free_before,
+            "clusters were not returned"
+        );
+        assert_eq!(
+            fs.read_mft_bitmap().unwrap(),
+            mft_before,
+            "an MFT record was orphaned"
+        );
+        let names: Vec<_> = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(!names.iter().any(|n| n == "short.bin"), "{names:?}");
     }
 
     #[test]
