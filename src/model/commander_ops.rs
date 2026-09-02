@@ -686,6 +686,16 @@ pub struct HostCopyStatus {
     /// When honoured, the worker sets `error` to a cancellation message and
     /// finishes early.
     pub cancel_requested: bool,
+    /// Host paths the copy passed over (symlinks, sockets, devices), for the
+    /// completion message; a silent omission looked like a complete copy.
+    pub skipped: Vec<String>,
+}
+
+/// Record a source entry the copy will not carry over.
+fn note_skipped(status: &Arc<Mutex<HostCopyStatus>>, path: &Path, why: &str) {
+    if let Ok(mut g) = status.lock() {
+        g.skipped.push(format!("{} ({why})", path.display()));
+    }
 }
 
 /// Run a [`HostCopyJob`] on a worker thread (host writes are immediate, not
@@ -1004,6 +1014,8 @@ fn copy_host_entries_to_host(
                 g.copied = count;
                 g.bytes_done = g.bytes_done.saturating_add(bytes);
             }
+        } else {
+            note_skipped(status, &src, "not a regular file or directory");
         }
     }
     Ok(count)
@@ -1047,6 +1059,10 @@ fn copy_host_dir(
                 g.copied = *count;
                 g.bytes_done = g.bytes_done.saturating_add(bytes);
             }
+        } else if ft.is_symlink() {
+            note_skipped(status, &dent.path(), "symlink");
+        } else {
+            note_skipped(status, &dent.path(), "special file");
         }
     }
     Ok(())
@@ -1196,7 +1212,11 @@ fn upload_host_dir_to_remote(
         let ft = meta.file_type();
         let name = dent.file_name().to_string_lossy().into_owned();
         let child_dest = join_remote(dest, &name);
-        if ft.is_dir() {
+        if ft.is_symlink() {
+            note_skipped(status, &dent.path(), "symlink");
+        } else if !ft.is_dir() && !ft.is_file() {
+            note_skipped(status, &dent.path(), "special file");
+        } else if ft.is_dir() {
             conn.mkdir_host(&child_dest)
                 .with_context(|| format!("creating remote directory '{name}'"))?;
             upload_host_dir_to_remote(&dent.path(), &child_dest, conn, count, status)?;

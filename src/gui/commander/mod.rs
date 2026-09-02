@@ -790,6 +790,7 @@ impl CommanderMode {
         self.pending_host_copy = None;
         let err = guard.error.take();
         let copied = guard.copied;
+        let skipped = std::mem::take(&mut guard.skipped);
         drop(guard);
         self.progress_window.reset();
 
@@ -808,9 +809,16 @@ impl CommanderMode {
         };
         self.status = match err {
             Some(e) => format!("Export to {where_to} failed: {e}"),
-            None => format!("Copied {copied} file(s) to {where_to}."),
+            None if skipped.is_empty() => format!("Copied {copied} file(s) to {where_to}."),
+            None => format!(
+                "Copied {copied} file(s) to {where_to}; skipped {} (see log).",
+                skipped.len()
+            ),
         };
         self.record_log(self.status.clone());
+        for s in skipped {
+            self.record_log(format!("Skipped {s}"));
+        }
     }
 
     /// Poll an in-flight image->image stage copy; on completion, push its
