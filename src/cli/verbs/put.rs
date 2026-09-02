@@ -427,6 +427,7 @@ pub fn run_with_budget(
         if options.creator_code.is_none() {
             options.os_creator = container_creator;
         }
+        options.finder_flags = imp.finder_flags;
     }
     // Fills only what nobody set explicitly, so --type / --mode still win.
     preserved.apply_to_options(&mut options);

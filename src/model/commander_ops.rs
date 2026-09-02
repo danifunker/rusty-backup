@@ -473,6 +473,7 @@ fn stage_copy_into(
                             type_code: None,
                             creator_code: None,
                             name: None,
+                            finder_flags: entry.finder_flags,
                         })
                     }
                 } else {

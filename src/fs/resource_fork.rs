@@ -272,6 +272,8 @@ pub struct ImportedResourceFork {
     /// The Mac filename recorded inside a whole-file container, so an import
     /// lands `Foo` rather than the host's `Foo.bin` / `Foo.hqx` wrapper name.
     pub name: Option<String>,
+    /// Finder flags (fdFlags) from the container's Finder info, when present.
+    pub finder_flags: Option<u16>,
 }
 
 /// Detect and read a resource fork associated with `host_path` by probing
@@ -297,6 +299,7 @@ pub fn detect_resource_fork(host_path: &std::path::Path) -> Option<ImportedResou
                     type_code,
                     creator_code,
                     name: None,
+                    finder_flags: None,
                 });
             }
         }
@@ -364,6 +367,7 @@ pub fn detect_resource_fork(host_path: &std::path::Path) -> Option<ImportedResou
                     type_code: None,
                     creator_code: None,
                     name: None,
+                    finder_flags: None,
                 });
             }
         }
@@ -403,6 +407,7 @@ pub fn parse_binhex_fork(data: &[u8]) -> Option<ImportedResourceFork> {
         type_code,
         creator_code,
         name: (!bh.name.is_empty()).then_some(bh.name),
+        finder_flags: Some(bh.flags),
     })
 }
 
@@ -456,6 +461,7 @@ pub fn parse_appledouble(data: &[u8]) -> Option<ImportedResourceFork> {
 
     let num_entries = BigEndian::read_u16(&data[24..26]) as usize;
     let mut rsrc_data: Option<Vec<u8>> = None;
+    let mut finder_flags: Option<u16> = None;
     let mut type_code: Option<[u8; 4]> = None;
     let mut creator_code: Option<[u8; 4]> = None;
 
@@ -478,7 +484,7 @@ pub fn parse_appledouble(data: &[u8]) -> Option<ImportedResourceFork> {
                 rsrc_data = Some(data[offset..offset + length].to_vec());
             }
             9
-                // Finder info — type at +0, creator at +4
+                // Finder info: type at +0, creator at +4, fdFlags at +8
                 if length >= 8 => {
                     let mut tc = [0u8; 4];
                     let mut cc = [0u8; 4];
@@ -489,6 +495,10 @@ pub fn parse_appledouble(data: &[u8]) -> Option<ImportedResourceFork> {
                     }
                     if cc != [0; 4] {
                         creator_code = Some(cc);
+                    }
+                    if length >= 10 {
+                        finder_flags =
+                            Some(BigEndian::read_u16(&data[offset + 8..offset + 10]));
                     }
                 }
             _ => {}
@@ -509,6 +519,7 @@ pub fn parse_appledouble(data: &[u8]) -> Option<ImportedResourceFork> {
         type_code,
         creator_code,
         name: None,
+        finder_flags,
     })
 }
 
@@ -626,6 +637,8 @@ pub fn parse_macbinary(data: &[u8]) -> Option<ImportedResourceFork> {
             let n = crate::fs::hfs::decode_mac_filename(&data[2..2 + name_len]);
             (!n.is_empty()).then_some(n)
         },
+        // MacBinary II splits fdFlags: the high byte at 73, the low byte at 101.
+        finder_flags: Some(((data[73] as u16) << 8) | data[101] as u16),
     })
 }
 
@@ -694,6 +707,24 @@ mod tests {
 
     /// X13: names went out as UTF-8 and were cut at 63 bytes mid-character;
     /// a classic Mac reads the header as Mac Roman.
+    /// H14: fdFlags rode in both containers and were dropped on import.
+    #[test]
+    fn container_parsers_carry_the_finder_flags() {
+        let mut mb = build_macbinary("Flag", b"APPL", b"ttxt", MacFileDates::default(), b"x", b"");
+        mb[73] = 0x01; // fdFlags high byte
+        mb[101] = 0x40; // fdFlags low byte
+        let crc = macbinary_crc16(&mb[0..124]);
+        BigEndian::write_u16(&mut mb[124..126], crc);
+        assert_eq!(parse_macbinary(&mb).unwrap().finder_flags, Some(0x0140));
+
+        let mut ad = build_appledouble(b"APPL", b"ttxt", MacFileDates::default(), b"RSRC");
+        // First entry descriptor at 26: id, offset, length; Finder Info is first.
+        assert_eq!(BigEndian::read_u32(&ad[26..30]), 9);
+        let off = BigEndian::read_u32(&ad[30..34]) as usize;
+        BigEndian::write_u16(&mut ad[off + 8..off + 10], 0x4000);
+        assert_eq!(parse_appledouble(&ad).unwrap().finder_flags, Some(0x4000));
+    }
+
     #[test]
     fn macbinary_names_are_mac_roman_and_cut_on_a_character() {
         let mb = build_macbinary(

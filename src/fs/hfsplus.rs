@@ -2957,6 +2957,7 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
         type_code: &[u8; 4],
         creator_code: &[u8; 4],
         mtime_secs: Option<u64>,
+        finder_flags: u16,
     ) -> [u8; 248] {
         let mut rec = [0u8; 248];
         let now = match mtime_secs {
@@ -2972,7 +2973,8 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
                                                      // FileInfo (userInfo): fdType at offset 48, fdCreator at offset 52
         rec[48..52].copy_from_slice(type_code);
         rec[52..56].copy_from_slice(creator_code);
-        // dataFork at offset 88
+        BigEndian::write_u16(&mut rec[56..58], finder_flags); // fdFlags
+                                                              // dataFork at offset 88
         data_fork.serialize(&mut rec[88..168]);
         // resourceFork at offset 168
         rsrc_fork.serialize(&mut rec[168..248]);
@@ -4881,6 +4883,7 @@ impl<R: Read + Write + Seek + Send> HfsPlusFilesystem<R> {
             &type_code,
             &creator_code,
             mtime,
+            options.finder_flags.unwrap_or(0),
         );
 
         // Build key + record for catalog insertion
@@ -8878,6 +8881,7 @@ mod tests {
                 &[0u8; 4],
                 &[0u8; 4],
                 None,
+                0,
             ));
             fs.insert_catalog_record(&kr)
                 .unwrap_or_else(|e| panic!("insert #{i} into dir{d}: {e}"));
@@ -9122,6 +9126,32 @@ mod tests {
         assert_eq!(primary, alt);
     }
 
+    /// H14: an imported file's Finder flags had no way into create_file.
+    #[test]
+    fn create_file_writes_the_finder_flags_it_is_given() {
+        use crate::fs::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+        let mut img = create_blank_hfsplus(8 * 1024 * 1024, 4096, "Flags", false);
+        let mut fs = HfsPlusFilesystem::open(std::io::Cursor::new(&mut img), 0).unwrap();
+        fs.prepare_for_edit().unwrap();
+        let root = fs.root().unwrap();
+        let opts = CreateFileOptions {
+            os_type: Some(*b"APPL"),
+            os_creator: Some(*b"ttxt"),
+            finder_flags: Some(0x2000),
+            ..Default::default()
+        };
+        fs.create_file(&root, "app", &mut &b"x"[..], 1, &opts)
+            .unwrap();
+        fs.sync_metadata().unwrap();
+        let entry = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "app")
+            .unwrap();
+        assert_eq!(entry.finder_flags, Some(0x2000));
+    }
+
     #[test]
     fn a_grow_allocates_the_blocks_the_new_nodes_occupy() {
         // 4 KiB nodes in 8 KiB blocks: 8 nodes are 4 blocks, not 8.
@@ -9183,6 +9213,7 @@ mod tests {
                 &[0u8; 4],
                 &[0u8; 4],
                 None,
+                0,
             ));
             fs.insert_catalog_record(&kr)
                 .unwrap_or_else(|e| panic!("insert #{i} into dir{d} (grow should cover it): {e}"));

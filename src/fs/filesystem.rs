@@ -277,6 +277,9 @@ pub struct CreateFileOptions {
     pub os_type: Option<[u8; 4]>,
     /// Raw 4-byte Mac `OSType` creator. See [`os_type`](CreateFileOptions::os_type).
     pub os_creator: Option<[u8; 4]>,
+    /// Finder flags (fdFlags) for HFS/HFS+: bundle bit, custom icon, invisible.
+    /// `None` leaves them zero, as a freshly created file has them.
+    pub finder_flags: Option<u16>,
     /// ProDOS auxiliary type (16-bit). Semantics depend on the file type:
     /// $0801 for Applesoft BASIC load address, $2000 for typical BIN,
     /// record length for random-access TXT, etc. Auto-detected from

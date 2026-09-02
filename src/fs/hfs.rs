@@ -1928,6 +1928,7 @@ impl<R: Read + Write + Seek> HfsFilesystem<R> {
         creator_code: &[u8; 4],
         block_size: u32,
         mtime_secs: Option<u64>,
+        finder_flags: u16,
     ) -> [u8; 102] {
         let mut rec = [0u8; 102];
         // Classic HFS stores local wall-clock time, not UTC.
@@ -1940,7 +1941,8 @@ impl<R: Read + Write + Seek> HfsFilesystem<R> {
                                      // FInfo at offset 4: fdType(4) + fdCreator(4)
         rec[4..8].copy_from_slice(type_code);
         rec[8..12].copy_from_slice(creator_code);
-        // filFlNum at offset 20
+        BigEndian::write_u16(&mut rec[12..14], finder_flags); // fdFlags
+                                                              // filFlNum at offset 20
         BigEndian::write_u32(&mut rec[20..24], file_id);
         // filStBlk at offset 24 stays 0: it's the File Manager's in-memory
         // "first allocation block" cache, NOT persisted on disk — the real
@@ -3129,6 +3131,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
                 &creator_code,
                 self.mdb.block_size,
                 mtime,
+                options.finder_flags.unwrap_or(0),
             );
 
             // Build key + record for catalog insertion
@@ -3162,6 +3165,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
                 fe.type_code = Some(type_code);
                 fe.creator_code = Some(creator_code);
             }
+            fe.finder_flags = options.finder_flags;
             if rsrc_size > 0 {
                 fe.resource_fork_size = Some(rsrc_size as u64);
             }
@@ -4503,6 +4507,32 @@ mod tests {
         assert_eq!(primary, alt, "the mirror must equal the primary MDB");
     }
 
+    /// H14: an imported file's Finder flags (invisible, bundle, custom icon)
+    /// had no way into create_file and came out zero.
+    #[test]
+    fn create_file_writes_the_finder_flags_it_is_given() {
+        use crate::fs::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+        let mut img = create_blank_hfs(4 * 1024 * 1024, 4096, "Flags").unwrap();
+        let mut fs = HfsFilesystem::open(Cursor::new(&mut img), 0).unwrap();
+        let root = fs.root().unwrap();
+        let opts = CreateFileOptions {
+            os_type: Some(*b"APPL"),
+            os_creator: Some(*b"ttxt"),
+            finder_flags: Some(0x2000),
+            ..Default::default()
+        };
+        fs.create_file(&root, "app", &mut &b"x"[..], 1, &opts)
+            .unwrap();
+        fs.sync_metadata().unwrap();
+        let entry = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "app")
+            .unwrap();
+        assert_eq!(entry.finder_flags, Some(0x2000));
+    }
+
     #[test]
     fn shrink_is_refused_when_data_sits_past_the_new_end() {
         use crate::fs::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
@@ -5302,6 +5332,7 @@ mod tests {
                 &[0u8; 4],
                 block_size,
                 None,
+                0,
             ));
             fs.insert_catalog_record(&kr).unwrap();
         }
@@ -5441,6 +5472,7 @@ mod tests {
                 &[0u8; 4],
                 block_size,
                 None,
+                0,
             );
             key_record.extend_from_slice(&file_rec);
             fs.insert_catalog_record(&key_record)
@@ -5555,6 +5587,7 @@ mod tests {
                 &[0u8; 4],
                 block_size,
                 None,
+                0,
             ));
             fs.insert_catalog_record(&kr)
                 .unwrap_or_else(|e| panic!("insert #{i} into dir{d}: {e}"));
@@ -5638,6 +5671,7 @@ mod tests {
                 &[0u8; 4],
                 block_size,
                 None,
+                0,
             );
             key_record.extend_from_slice(&file_rec);
             fs.insert_catalog_record(&key_record).unwrap();

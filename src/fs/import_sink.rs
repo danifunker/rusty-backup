@@ -405,6 +405,7 @@ impl Importer {
                     }
                     create_opts.os_type = imp.type_code;
                     create_opts.os_creator = imp.creator_code;
+                    create_opts.finder_flags = imp.finder_flags;
                 }
                 efs.create_file(&parent, name, data, size, &create_opts)
                     .map_err(|e| anyhow!("create_file {display}: {e}"))?;
