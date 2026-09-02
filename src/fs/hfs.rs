@@ -4180,11 +4180,21 @@ pub fn resize_hfs_in_place(
     }
     let new_total = new_total_u64 as u16;
 
-    if new_total < used_blocks {
+    // A count says nothing about position: a volume with free blocks near the
+    // front still has data at its tail, and cutting there loses it.
+    let vbm_bytes = (old_total as usize).div_ceil(8);
+    let mut vbm = vec![0u8; vbm_bytes];
+    device.seek(SeekFrom::Start(partition_offset + vbm_start as u64 * 512))?;
+    device.read_exact(&mut vbm)?;
+    let highest_used = find_last_set_bit(&vbm, old_total as u32).map_or(0, |b| b + 1);
+    if (new_total as u32) < highest_used {
         anyhow::bail!(
-            "HFS resize: new size {} blocks < used {} blocks",
+            "HFS resize: new size {} blocks ends before the last allocated block ({}); \
+             {} of {} blocks are in use",
             new_total,
-            used_blocks
+            highest_used,
+            used_blocks,
+            old_total
         );
     }
 
@@ -4405,6 +4415,34 @@ mod tests {
     fn test_utf8_to_mac_roman_unencodable() {
         let text = "\u{4E2D}"; // Chinese character — not in Mac Roman
         assert!(utf8_to_mac_roman(text).is_err());
+    }
+
+    /// H13: the shrink guard compared block counts, so a volume with free
+    /// space at its front and one file at its tail could be cut through.
+    #[test]
+    fn shrink_is_refused_when_data_sits_past_the_new_end() {
+        use crate::fs::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+        const SIZE: u64 = 8 * 1024 * 1024;
+        let mut img = create_blank_hfs(SIZE, 4096, "Tail").unwrap();
+        {
+            let mut fs = HfsFilesystem::open(Cursor::new(&mut img), 0).unwrap();
+            let root = fs.root().unwrap();
+            fs.create_file(&root, "a", &mut &b"x"[..], 1, &CreateFileOptions::default())
+                .unwrap();
+            fs.sync_metadata().unwrap();
+        }
+        let total = BigEndian::read_u16(&img[1024 + 18..1024 + 20]) as usize;
+        let vbm_start = BigEndian::read_u16(&img[1024 + 14..1024 + 16]) as usize;
+        // Mark the last allocation block used without touching the counts.
+        let tail = total - 1;
+        let byte = vbm_start * 512 + tail / 8;
+        img[byte] |= 0x80 >> (tail % 8);
+        let err = resize_hfs_in_place(&mut Cursor::new(&mut img), 0, SIZE / 2, &mut |_| {})
+            .expect_err("a tail block in use must refuse the shrink");
+        assert!(format!("{err}").contains("last allocated block"), "{err}");
+        img[byte] &= !(0x80 >> (tail % 8));
+        resize_hfs_in_place(&mut Cursor::new(&mut img), 0, SIZE / 2, &mut |_| {})
+            .expect("with the tail free the shrink goes through");
     }
 
     #[test]
