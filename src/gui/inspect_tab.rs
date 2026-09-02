@@ -115,6 +115,8 @@ pub struct InspectTab {
     last_error: Option<String>,
     /// Previous selection state for auto-inspect change detection
     prev_device_idx: Option<usize>,
+    /// Identity of the device behind `prev_device_idx` when it was inspected.
+    prev_device_identity: Option<rusty_backup::device::DeviceIdentity>,
     prev_image_path: Option<PathBuf>,
     prev_backup_path: Option<PathBuf>,
     /// A source open/close held until the user resolves the unsaved-edits
@@ -289,6 +291,7 @@ impl Default for InspectTab {
             backup_metadata: None,
             last_error: None,
             prev_device_idx: None,
+            prev_device_identity: None,
             prev_image_path: None,
             prev_backup_path: None,
             pending_source_change: None,
@@ -671,8 +674,34 @@ impl InspectTab {
             return;
         }
 
+        // "Refresh Devices" replaces the list under us: the same index may now be
+        // a different disk or nothing; neither passes the unsaved-edits gate.
+        let device_identity =
+            rusty_backup::device::identity_at(ctx.devices, self.selected_device_idx);
+        let device_swapped = self.selected_device_idx.is_some()
+            && self.selected_device_idx == self.prev_device_idx
+            && device_identity != self.prev_device_identity;
+        if device_swapped {
+            if self.browse_view.has_unsaved_edits() {
+                ctx.log.warn(
+                    "The device list changed under the open volume; staged edits were discarded.",
+                );
+            }
+            if device_identity.is_none() {
+                ctx.log
+                    .warn("The inspected device is no longer listed; closing it.");
+                self.do_close(ctx);
+                return;
+            }
+            ctx.log
+                .warn("A different device now sits at the selected slot; re-inspecting it.");
+            self.browse_view.close();
+            self.release_open_device();
+        }
+
         // Auto-inspect on selection change
         let selection_changed = self.selected_device_idx != self.prev_device_idx
+            || device_swapped
             || self.image_file_path != self.prev_image_path
             || self.backup_folder_path != self.prev_backup_path;
 
@@ -681,6 +710,7 @@ impl InspectTab {
             // `do_close` (both gated upstream on unsaved edits), so by here the
             // switch is committed — just record it and load.
             self.prev_device_idx = self.selected_device_idx;
+            self.prev_device_identity = device_identity;
             self.prev_image_path = self.image_file_path.clone();
             self.prev_backup_path = self.backup_folder_path.clone();
             // Re-sniff floppy-ness on every source change so the
@@ -2626,6 +2656,7 @@ impl InspectTab {
         self.clear_results();
         self.selected_device_idx = None;
         self.prev_device_idx = None;
+        self.prev_device_identity = None;
         self.image_file_path = None;
         self.amiga_tempdir = None;
         self.prev_image_path = None;
