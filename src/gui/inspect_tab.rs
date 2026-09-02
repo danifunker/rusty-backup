@@ -3909,6 +3909,8 @@ impl InspectTab {
         // re-floors or rewrites the volume (path-based), so it's disabled. Browse,
         // Calc min, and Check (fsck) all work over the block reader.
         let is_remote = self.remote_inspect.is_some();
+        // A running repack rewrites the image under every other action.
+        let repacking = self.repack_status.is_some();
 
         let has_slots = self
             .partition_table
@@ -4127,43 +4129,47 @@ impl InspectTab {
                             ui.label("");
                         }
                         ui.label(if part.bootable { "Yes" } else { "" });
-                        if partition_is_browsable(
-                            part.partition_type_byte,
-                            part.partition_type_string.as_deref(),
-                            &part.type_name,
-                        ) {
-                            let ptype = if part.partition_type_byte != 0 {
-                                part.partition_type_byte
-                            } else {
-                                rusty_backup::model::backup_loader::infer_fat_type_byte(
-                                    &part.type_name,
-                                )
-                            };
-                            if ui.small_button("Browse").clicked() {
-                                browse_request = Some((
-                                    part.index,
-                                    part.byte_offset(),
-                                    ptype,
-                                    part.partition_type_string.clone(),
-                                ));
-                            }
-                            if (is_checkable_type(ptype, part.partition_type_string.as_deref())
-                                || is_checkable_fs_name(&part.type_name)
-                                || is_superfloppy_hfs(part.partition_type_byte, &part.type_name)
-                                || is_checkable_retro_fs(
-                                    part.partition_type_byte,
-                                    part.partition_type_string.as_deref(),
-                                    &part.type_name,
-                                ))
-                                && ui.small_button("Check").clicked()
-                            {
-                                check_request = Some((
-                                    part.byte_offset(),
-                                    ptype,
-                                    part.partition_type_string.clone(),
-                                ));
-                            }
-                            if is_classic_hfs(
+                        ui.add_enabled_ui(!repacking, |ui| {
+                            if partition_is_browsable(
+                                part.partition_type_byte,
+                                part.partition_type_string.as_deref(),
+                                &part.type_name,
+                            ) {
+                                let ptype = if part.partition_type_byte != 0 {
+                                    part.partition_type_byte
+                                } else {
+                                    rusty_backup::model::backup_loader::infer_fat_type_byte(
+                                        &part.type_name,
+                                    )
+                                };
+                                if ui.small_button("Browse").clicked() {
+                                    browse_request = Some((
+                                        part.index,
+                                        part.byte_offset(),
+                                        ptype,
+                                        part.partition_type_string.clone(),
+                                    ));
+                                }
+                                if (is_checkable_type(ptype, part.partition_type_string.as_deref())
+                                    || is_checkable_fs_name(&part.type_name)
+                                    || is_superfloppy_hfs(
+                                        part.partition_type_byte,
+                                        &part.type_name,
+                                    )
+                                    || is_checkable_retro_fs(
+                                        part.partition_type_byte,
+                                        part.partition_type_string.as_deref(),
+                                        &part.type_name,
+                                    ))
+                                    && ui.small_button("Check").clicked()
+                                {
+                                    check_request = Some((
+                                        part.byte_offset(),
+                                        ptype,
+                                        part.partition_type_string.clone(),
+                                    ));
+                                }
+                                if is_classic_hfs(
                                 part.partition_type_byte,
                                 part.partition_type_string.as_deref(),
                                 &part.type_name,
@@ -4178,27 +4184,28 @@ impl InspectTab {
                             {
                                 expand_request = Some((part.byte_offset(), part.size_bytes));
                             }
-                            // Defragment (repack) a Human68k volume in place.
-                            // Image files only — the worker rewrites the
-                            // partition region of the file on disk.
-                            if part.partition_type_string.as_deref() == Some("human68k")
-                                && is_image_source
-                                && self.repack_status.is_none()
-                                && ui
-                                    .small_button("Defragment...")
-                                    .on_hover_text(
-                                        "Repack this Human68k volume so its files are stored \
+                                // Defragment (repack) a Human68k volume in place.
+                                // Image files only — the worker rewrites the
+                                // partition region of the file on disk.
+                                if part.partition_type_string.as_deref() == Some("human68k")
+                                    && is_image_source
+                                    && self.repack_status.is_none()
+                                    && ui
+                                        .small_button("Defragment...")
+                                        .on_hover_text(
+                                            "Repack this Human68k volume so its files are stored \
                                          contiguously, reclaiming holes left by deleted files. \
                                          Rewrites the partition in place — back up first.",
-                                    )
-                                    .clicked()
-                            {
-                                defrag_request = Some((part.byte_offset(), part.type_name.clone()));
-                            }
-                            // Resize an Alto BFS volume onto a new geometry.
-                            // Reads the image and writes a brand-new PDI, so it's
-                            // offered for image-file sources only.
-                            if part.type_name == "Alto BFS"
+                                        )
+                                        .clicked()
+                                {
+                                    defrag_request =
+                                        Some((part.byte_offset(), part.type_name.clone()));
+                                }
+                                // Resize an Alto BFS volume onto a new geometry.
+                                // Reads the image and writes a brand-new PDI, so it's
+                                // offered for image-file sources only.
+                                if part.type_name == "Alto BFS"
                                 && is_image_source
                                 && ui
                                     .small_button("Resize...")
@@ -4210,9 +4217,10 @@ impl InspectTab {
                             {
                                 resize_request = true;
                             }
-                        } else {
-                            ui.label("");
-                        }
+                            } else {
+                                ui.label("");
+                            }
+                        });
                     }
                     ui.end_row();
                 }
