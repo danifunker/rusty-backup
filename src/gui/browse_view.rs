@@ -4144,29 +4144,53 @@ impl BrowseView {
         let edits: Vec<StagedEdit> = self.staged_edits.drain().collect();
         let total = edits.len();
 
+        // Stop at the first failure but keep the failed edit and everything
+        // after it staged: a half-applied batch must not vanish silently.
+        let mut applied = 0usize;
+        let mut failure: Option<String> = None;
         for (i, edit) in edits.iter().enumerate() {
             if let Err(e) = edit_queue::apply_edit(&mut *efs, edit) {
-                self.edit_result = Some(format!("Error on edit {}/{total}: {e}", i + 1));
-                return true;
+                failure = Some(format!("Error on edit {}/{total}: {e}", i + 1));
+                break;
+            }
+            applied += 1;
+        }
+        if failure.is_some() {
+            for edit in edits.into_iter().skip(applied) {
+                self.staged_edits.push(edit);
             }
         }
 
-        if let Err(e) = efs.sync_metadata() {
-            self.edit_result = Some(format!("Error saving to disk: {e}"));
-            return true;
+        // Whatever did land still has to reach the disk and the container.
+        if applied > 0 {
+            if let Err(e) = efs.sync_metadata() {
+                self.edit_result = Some(format!("Error saving to disk: {e}"));
+                return true;
+            }
         }
 
         // Persist: re-encode the temp flat back into the container (no-op for
         // raw images). Drop the editable handle first so its writes are
         // flushed to the temp before the re-encode reads it.
         drop(efs);
-        if let Err(e) = commit.commit() {
-            self.edit_result = Some(format!("Error writing container: {e}"));
-            return true;
+        if applied > 0 {
+            if let Err(e) = commit.commit() {
+                self.edit_result = Some(format!("Error writing container: {e}"));
+                return true;
+            }
+            if self.chd_edit.is_some() {
+                self.chd_diff_dirty = true;
+            }
         }
 
-        if self.chd_edit.is_some() {
-            self.chd_diff_dirty = true;
+        if let Some(failure) = failure {
+            let left = total - applied;
+            self.edit_result = Some(format!(
+                "{failure}. Applied {applied} of {total}; {left} edit(s) remain staged"
+            ));
+            self.invalidate_all_caches();
+            self.invalidate_cached_fs();
+            return true;
         }
 
         self.edit_result = Some(format!("Applied {total} edit(s) successfully"));
