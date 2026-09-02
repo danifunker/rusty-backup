@@ -917,42 +917,27 @@ pub fn export_whole_disk_vhd(
     // there are size overrides, reconstruct with patched APM + per-partition
     // resize; then append the VHD footer. Otherwise fall back to the MBR /
     // straight-stream path using BufWriter.
+    // Decode the source (CHD, dynamic VHD, QCOW2, VMDK, GHO) before anything
+    // reads it; `open_read` also strips a fixed VHD's own footer.
+    let open_decoded = || -> Result<(BufReader<Box<dyn super::ReadSeek>>, u64)> {
+        let mut r = crate::model::source_reader::open_read(source_path)
+            .with_context(|| format!("failed to open {}", source_path.display()))?;
+        let size = r.seek(SeekFrom::End(0))?;
+        r.seek(SeekFrom::Start(0))?;
+        Ok((BufReader::new(r), size))
+    };
     if !partition_sizes.is_empty() {
-        let mut probe_reader = BufReader::new(
-            File::open(source_path)
-                .with_context(|| format!("failed to open {}", source_path.display()))?,
-        );
+        let (mut probe_reader, _) = open_decoded()?;
         let is_apm = super::detect_raw_apm(&mut probe_reader).is_some();
         let is_rdb = if is_apm {
             false
         } else {
             // Re-probe — detect_raw_apm consumed/seeked the reader.
-            let mut probe2 = BufReader::new(
-                File::open(source_path)
-                    .with_context(|| format!("failed to open {}", source_path.display()))?,
-            );
+            let (mut probe2, _) = open_decoded()?;
             super::detect_raw_rdb(&mut probe2).is_some()
         };
         if is_apm || is_rdb {
-            let file_size = std::fs::metadata(source_path)?.len();
-            // Strip trailing VHD footer if source is itself a VHD file.
-            let source_data_size = {
-                let mut f = File::open(source_path)?;
-                if file_size >= 512 {
-                    f.seek(SeekFrom::End(-512))?;
-                    let mut cookie = [0u8; 8];
-                    f.read_exact(&mut cookie)?;
-                    if &cookie == VHD_COOKIE {
-                        file_size - 512
-                    } else {
-                        file_size
-                    }
-                } else {
-                    file_size
-                }
-            };
-
-            let mut reader = BufReader::new(File::open(source_path)?);
+            let (mut reader, source_data_size) = open_decoded()?;
             let mut file = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -1008,25 +993,7 @@ pub fn export_whole_disk_vhd(
 
     // Raw image/device: reconstruct with partition size overrides
     {
-        let file = File::open(source_path)
-            .with_context(|| format!("failed to open {}", source_path.display()))?;
-        let file_size = file.metadata()?.len();
-        let mut reader = BufReader::new(file);
-
-        // Check if this is a VHD file — if so, limit to data portion
-        let source_data_size = if file_size >= 512 {
-            let mut f = File::open(source_path)?;
-            f.seek(SeekFrom::End(-512))?;
-            let mut cookie = [0u8; 8];
-            f.read_exact(&mut cookie)?;
-            if &cookie == VHD_COOKIE {
-                file_size - 512
-            } else {
-                file_size
-            }
-        } else {
-            file_size
-        };
+        let (mut reader, source_data_size) = open_decoded()?;
 
         // A partition-less (superfloppy / HFV) source has no MBR to patch. The
         // APM and RDB tables are reconstructed by the dedicated paths above, so

@@ -791,8 +791,9 @@ fn run_per_partition(
             }
 
             let read_limit = export_size.min(part.size_bytes);
-            let file = File::open(image_path)?;
-            let mut reader = BufReader::new(file);
+            // Decoded, like the HFV branch: the offset is into the disk the
+            // container holds, not into the container file.
+            let mut reader = BufReader::new(crate::model::source_reader::open_read(image_path)?);
             reader.seek(SeekFrom::Start(offset))?;
             let mut limited = reader.take(read_limit);
 
