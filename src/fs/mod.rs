@@ -228,7 +228,7 @@ pub enum InPlaceResize {
 /// [`in_place_resize_support`] checks separately.
 const IN_PLACE_RESIZABLE: &[&str] = &[
     "fat", "ntfs", "exfat", "hfs", "hfsplus", "ext", "btrfs", "efs", "efs_v1", "qdos", "affs",
-    "prodos",
+    "prodos", "human68k",
 ];
 
 /// Classify the filesystem at `partition_offset` for in-place resizing.
@@ -250,6 +250,9 @@ pub fn in_place_resize_support<R: Read + Seek>(
         }
         if is_amiga_sfs_type(s) {
             return InPlaceResize::Supported("SFS");
+        }
+        if s == "human68k" {
+            return InPlaceResize::Supported("Human68k");
         }
     }
     let detected = detect_filesystem_type(reader, partition_offset);
@@ -278,6 +281,7 @@ fn fs_display_name(detected: &str) -> &'static str {
         "qdos" => "QDOS",
         "affs" => "AFFS",
         "prodos" => "ProDOS",
+        "human68k" => "Human68k",
         "xfs" => "XFS",
         "jfs" => "JFS",
         "reiserfs" => "ReiserFS",
@@ -346,6 +350,11 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
     // free-map format markers at block 340. Very specific, so probe early.
     if oric::looks_like_oric_jasmin(reader, partition_offset) {
         return "oric_jasmin";
+    }
+    // X68000 Human68k HDD: BRA.S at byte 0 and a big-endian BPB, which the FAT
+    // heuristic below cannot read; the resizer and min-size paths key off it.
+    if human68k::looks_like_human68k_hdd(&sector0) {
+        return "human68k";
     }
     // FAT boot sectors begin with a JMP (0xEB short or 0xE9 near). But a JMP
     // opcode alone is a weak signal: syslinux/extlinux install their boot code
@@ -1274,6 +1283,7 @@ pub fn fs_name_for(partition_type: u8, partition_type_string: Option<&str>) -> &
             "lisafs" => "Apple Lisa File System",
             "Alto BFS" => "Alto BFS",
             "Be_BFS" => "BFS (BeOS)",
+            "human68k" => "Human68k",
             _ => "unknown",
         };
     }
@@ -4238,5 +4248,42 @@ mod identification_tests {
         assert!(fs_name_matches("HFS/HFS+", "HFS"));
         assert!(fs_name_matches("HFS/HFS+", "hfsplus"));
         assert!(!fs_name_matches("NTFS/HPFS/exFAT", "FAT"));
+    }
+}
+
+#[cfg(test)]
+mod human68k_dispatch_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn human68k_sector() -> Vec<u8> {
+        let mut disk = vec![0u8; 64 * 1024];
+        disk[0] = 0x60; // BRA.S
+        disk[11..13].copy_from_slice(&1024u16.to_be_bytes());
+        disk[13] = 1;
+        disk
+    }
+
+    /// F10: the dispatch helpers called a Human68k volume "unknown" and
+    /// the detector never saw its BRA.S boot sector.
+    #[test]
+    fn human68k_is_named_detected_and_resizable() {
+        assert_eq!(fs_name_for(0, Some("human68k")), "Human68k");
+        assert_eq!(
+            detect_filesystem_type(&mut Cursor::new(human68k_sector()), 0),
+            "human68k"
+        );
+        assert!(matches!(
+            in_place_resize_support(&mut Cursor::new(vec![0u8; 4096]), 0, Some("human68k")),
+            InPlaceResize::Supported("Human68k")
+        ));
+        assert!(matches!(
+            in_place_resize_support(&mut Cursor::new(human68k_sector()), 0, None),
+            InPlaceResize::Supported("Human68k")
+        ));
+        // A PC boot sector is still not mistaken for one.
+        let mut pc = human68k_sector();
+        pc[0] = 0xEB;
+        assert_ne!(detect_filesystem_type(&mut Cursor::new(pc), 0), "human68k");
     }
 }

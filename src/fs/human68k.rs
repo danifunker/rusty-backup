@@ -1565,6 +1565,16 @@ pub(crate) fn patch_sharp_kg_bpb(bpb_buf: &mut [u8], new_total: u32, new_spf: u8
     bpb_buf[0x1D] = new_spf;
 }
 
+/// A SHARP/KG Human68k HDD boot sector: BRA.S at byte 0 with a big-endian
+/// BPB whose sector size and cluster size read as sane values.
+pub fn looks_like_human68k_hdd(sector0: &[u8]) -> bool {
+    if sector0.len() < 14 || sector0[0] != 0x60 {
+        return false;
+    }
+    let bps = u16::from_be_bytes([sector0[11], sector0[12]]);
+    matches!(bps, 256 | 512 | 1024 | 2048) && sector0[13] != 0
+}
+
 /// Resize the Human68k (SHARP / Keisoku Giken big-endian HDD) filesystem at
 /// `partition_offset` so it inhabits `new_size_bytes`.
 ///
