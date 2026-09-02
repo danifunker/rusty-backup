@@ -438,6 +438,14 @@ fn parse_dir_sector(sec: &[u8; 512], out: &mut Vec<MfsDirEntry>) {
 /// field is a 28-byte Pascal string, so 1 length byte + up to 27 chars.
 pub const MFS_MAX_NAME_LEN: usize = 27;
 
+/// MFS name equality as the File Manager sees it: Mac Roman bytes compared
+/// through the HFS case-folding order, so "Doc" and "DOC" are the same file.
+fn mfs_names_equal(a: &str, b: &str) -> bool {
+    let a_bytes = super::hfs::utf8_to_mac_roman(a).unwrap_or_else(|_| a.as_bytes().to_vec());
+    let b_bytes = super::hfs::utf8_to_mac_roman(b).unwrap_or_else(|_| b.as_bytes().to_vec());
+    super::hfs_common::compare_hfs_keys(0, &a_bytes, 0, &b_bytes) == std::cmp::Ordering::Equal
+}
+
 /// Validate a candidate filename for `create_file` / `set_type_creator`.
 /// MFS uses Mac Roman encoding and disallows the path-separator ':' (a
 /// Classic Mac OS convention also enforced by HFS).
@@ -1165,8 +1173,12 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for MfsFilesystem<R> {
             ));
         }
         let _ = validate_mfs_name(name)?;
-        // Reject duplicates.
-        if self.entries.iter().any(|e| e.is_in_use() && e.name == name) {
+        // Reject duplicates; the File Manager compares names without case.
+        if self
+            .entries
+            .iter()
+            .any(|e| e.is_in_use() && mfs_names_equal(&e.name, name))
+        {
             return Err(FilesystemError::InvalidData(format!(
                 "MFS file '{name}' already exists"
             )));
@@ -1414,12 +1426,12 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for MfsFilesystem<R> {
         let _ = validate_mfs_name(new_name)?;
 
         let fnum = entry.location as u32;
-        // Reject a collision with a *different* in-use entry. MFS names are
-        // case-sensitive on disk, so plain equality is the right comparison.
+        // Reject a collision with a *different* in-use entry; the File Manager
+        // compares names without case, so "Doc" and "DOC" are one file.
         if self
             .entries
             .iter()
-            .any(|e| e.is_in_use() && e.file_number != fnum && e.name == new_name)
+            .any(|e| e.is_in_use() && e.file_number != fnum && mfs_names_equal(&e.name, new_name))
         {
             return Err(FilesystemError::AlreadyExists(new_name.to_string()));
         }
@@ -2245,6 +2257,30 @@ mod tests {
         assert_eq!(renamed.resource_fork_size, Some(4));
         assert_eq!(fs2.read_file(renamed, 1024).unwrap(), b"first line\n");
         assert_eq!(fs2.read_resource_fork(renamed).unwrap(), b"RSRC");
+    }
+
+    /// H12: duplicate detection compared bytes, so "hello" could be created
+    /// beside "Hello" and the Finder then saw two files it could not tell apart.
+    #[test]
+    fn names_differing_only_in_case_are_the_same_file() {
+        let mut fs = MfsFilesystem::open(edit_fixture(), 0).unwrap();
+        let root = fs.root().unwrap();
+        let err = fs
+            .create_file(
+                &root,
+                "hello",
+                &mut &b"x"[..],
+                1,
+                &CreateFileOptions::default(),
+            )
+            .unwrap_err();
+        assert!(format!("{err}").contains("already exists"), "{err}");
+        let entries = fs.list_directory(&root).unwrap();
+        let doc = entries.iter().find(|e| e.name == "Doc").unwrap().clone();
+        let err = fs.rename(&root, &doc, "HELLO").unwrap_err();
+        assert!(matches!(err, FilesystemError::AlreadyExists(_)));
+        // A file may still change its own capitalisation.
+        fs.rename(&root, &doc, "DOC").unwrap();
     }
 
     #[test]
