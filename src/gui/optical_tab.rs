@@ -1170,6 +1170,23 @@ fn run_conversion(
     }
 }
 
+/// Relay a Cancel from the GUI's progress to a step's private one, until `done`.
+fn forward_cancel(
+    from: Arc<Mutex<ConvertProgress>>,
+    done: Arc<std::sync::atomic::AtomicBool>,
+    set_cancel: impl Fn() + Send + 'static,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        while !done.load(std::sync::atomic::Ordering::Relaxed) {
+            if from.lock().map(|p| p.cancel_requested).unwrap_or(false) {
+                set_cancel();
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    })
+}
+
 /// Background worker: rip disc (local or remote) to temp BIN/CUE, convert to
 /// CHD locally, clean up. The encode always runs here on the desktop.
 fn rip_to_chd_worker(
@@ -1200,9 +1217,22 @@ fn rip_to_chd_worker(
         p.operation = "Ripping to temporary BIN/CUE...".into();
     }
 
-    // Use a separate RipProgress and drain its messages into our ConvertProgress
+    // Use a separate RipProgress and drain its messages into our ConvertProgress.
+    // The GUI's Cancel lands on `progress`, so forward it to the rip's own flag.
     let rip_progress = Arc::new(Mutex::new(rip::RipProgress::new()));
-    rip::run_rip(rip_config, Arc::clone(&rip_progress))?;
+    let rip_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let forwarder = forward_cancel(Arc::clone(progress), Arc::clone(&rip_done), {
+        let to = Arc::clone(&rip_progress);
+        move || {
+            if let Ok(mut r) = to.lock() {
+                r.cancel_requested = true;
+            }
+        }
+    });
+    let rip_result = rip::run_rip(rip_config, Arc::clone(&rip_progress));
+    rip_done.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = forwarder.join();
+    rip_result?;
 
     // Drain rip log messages
     if let Ok(mut rp) = rip_progress.lock() {
@@ -1222,12 +1252,23 @@ fn rip_to_chd_worker(
     }
 
     let convert_progress = Arc::new(Mutex::new(ConvertProgress::new()));
+    let convert_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let forwarder = forward_cancel(Arc::clone(progress), Arc::clone(&convert_done), {
+        let to = Arc::clone(&convert_progress);
+        move || {
+            if let Ok(mut c) = to.lock() {
+                c.cancel_requested = true;
+            }
+        }
+    });
     let convert_result = convert::to_chd(
         &temp_cue,
         chd_path,
         Some(chd_options),
         Arc::clone(&convert_progress),
     );
+    convert_done.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = forwarder.join();
 
     // Drain convert log messages
     if let Ok(mut cp) = convert_progress.lock() {
