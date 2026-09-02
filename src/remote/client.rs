@@ -129,6 +129,16 @@ impl RemoteSession {
     }
 
     /// Stream a single file's bytes into `sink`, returning the byte count.
+    /// Drain a `FileBegin` body into `sink` and insist it is the size announced:
+    /// a short stream is a cut transfer, not a shorter file.
+    fn read_declared(&mut self, size: u64, sink: &mut dyn Write, what: &str) -> Result<u64> {
+        let got = read_chunks(&mut self.reader, sink).map_err(|e| anyhow!("{what}: {e}"))?;
+        if got != size {
+            bail!("{what}: the daemon announced {size} byte(s) but {got} arrived");
+        }
+        Ok(got)
+    }
+
     pub fn read_file(&mut self, handle: u64, path: &str, sink: &mut dyn Write) -> Result<u64> {
         write_control(
             &mut self.writer,
@@ -138,8 +148,8 @@ impl RemoteSession {
             },
         )?;
         match self.read_response()? {
-            Response::FileBegin { .. } => {
-                read_chunks(&mut self.reader, sink).map_err(|e| anyhow!("reading {path}: {e}"))
+            Response::FileBegin { size } => {
+                self.read_declared(size, sink, &format!("reading {path}"))
             }
             Response::Error { message } => bail!("read {path}: {message}"),
             other => bail!("unexpected reply to ReadFile: {other:?}"),
@@ -163,8 +173,9 @@ impl RemoteSession {
             },
         )?;
         match self.read_response()? {
-            Response::FileBegin { .. } => read_chunks(&mut self.reader, sink)
-                .map_err(|e| anyhow!("reading resource fork of {path}: {e}")),
+            Response::FileBegin { size } => {
+                self.read_declared(size, sink, &format!("reading resource fork of {path}"))
+            }
             Response::Error { message } => bail!("read resource fork of {path}: {message}"),
             other => bail!("unexpected reply to ReadResourceFork: {other:?}"),
         }
@@ -400,8 +411,8 @@ impl RemoteSession {
             },
         )?;
         match self.read_response()? {
-            Response::FileBegin { .. } => {
-                read_chunks(&mut self.reader, sink).map_err(|e| anyhow!("reading {path}: {e}"))
+            Response::FileBegin { size } => {
+                self.read_declared(size, sink, &format!("reading {path}"))
             }
             Response::Error { message } => bail!("read host file {path}: {message}"),
             other => bail!("unexpected reply to ReadHostFile: {other:?}"),
@@ -589,10 +600,9 @@ impl RemoteSession {
             },
         )?;
         match self.read_response()? {
-            Response::FileBegin { .. } => {
+            Response::FileBegin { size } => {
                 let mut buf = Vec::new();
-                read_chunks(&mut self.reader, &mut buf)
-                    .map_err(|e| anyhow!("reading block of handle {handle}: {e}"))?;
+                self.read_declared(size, &mut buf, &format!("reading block of handle {handle}"))?;
                 Ok(buf)
             }
             Response::Error { message } => bail!("read block {handle}: {message}"),
@@ -680,10 +690,9 @@ impl RemoteSession {
             },
         )?;
         match self.read_response()? {
-            Response::FileBegin { .. } => {
+            Response::FileBegin { size } => {
                 let mut buf = Vec::new();
-                read_chunks(&mut self.reader, &mut buf)
-                    .map_err(|e| anyhow!("reading sectors at LBA {lba}: {e}"))?;
+                self.read_declared(size, &mut buf, &format!("reading sectors at LBA {lba}"))?;
                 Ok(buf)
             }
             Response::Error { message } => bail!("read sectors at LBA {lba}: {message}"),
