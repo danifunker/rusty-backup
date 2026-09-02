@@ -4401,7 +4401,16 @@ impl BrowseView {
                     // Drop the cached read so the preview shows what is now on
                     // disk rather than what was there when it was opened.
                     self.content = None;
+                    self.invalidate_all_caches();
                     self.invalidate_cached_fs();
+                    // A save is a write like any applied edit: the CHD diff is
+                    // dirty and an archive session must recompress or lose it.
+                    if self.chd_edit.is_some() {
+                        self.chd_diff_dirty = true;
+                    }
+                    if self.archive_edit_ctx.is_some() {
+                        self.start_archive_compress();
+                    }
                     return; // window closes
                 }
                 Err(e) => {
