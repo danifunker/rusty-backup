@@ -313,6 +313,8 @@ fn fs_display_name(detected: &str) -> &'static str {
         "apfs" => "APFS",
         "squashfs" => "SquashFS",
         "mfs" => "MFS",
+        "minix" => "Minix",
+        "adfs" => "ADFS",
         _ => "an unsupported filesystem",
     }
 }

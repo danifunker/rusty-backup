@@ -19,7 +19,6 @@ use std::sync::{Arc, Mutex};
 
 use crate::backup::metadata::BackupMetadata;
 use crate::clonezilla::metadata::ClonezillaImage;
-use crate::fs::fat::resize_fat_in_place;
 use crate::fs::hfs_max_growable_size;
 use crate::model::size_mode::SizeMode;
 use crate::partition::{self, PartitionInfo, PartitionSizeOverride};
@@ -746,18 +745,28 @@ fn run_per_partition(
                 },
             )?;
 
-            if export_size != pm.original_size_bytes {
-                let new_sectors = (export_size / 512) as u32;
-                let mut rw = OpenOptions::new().read(true).write(true).open(&dest_path)?;
-                let status_log = Arc::clone(status);
-                let patched = resize_fat_in_place(&mut rw, 0, new_sectors, &mut |msg| {
-                    if let Ok(mut s) = status_log.lock() {
-                        s.log_messages.push(msg.to_string());
-                    }
-                })?;
-                if !patched {
+            // A defragmented clone is a complete volume at its imaged size, while a
+            // compacted stream still describes the original size (see restore).
+            if !pm.defragmented_clone {
+                let needs_resize = export_size != pm.original_size_bytes;
+                if needs_resize || pm.compacted {
+                    let mut rw = OpenOptions::new().read(true).write(true).open(&dest_path)?;
+                    let status_log = Arc::clone(status);
+                    let fitted = fit_filesystem_to_export(
+                        &mut rw,
+                        0,
+                        export_size,
+                        needs_resize,
+                        &mut |msg| {
+                            if let Ok(mut s) = status_log.lock() {
+                                s.log_messages.push(msg.to_string());
+                            }
+                        },
+                    );
                     drop(rw);
-                    return refuse_unpatched_shrink(&dest_path, pm.index, export_size);
+                    if let Err(e) = fitted {
+                        return refuse_unpatched_shrink(&dest_path, pm.index, export_size, e);
+                    }
                 }
             }
 
@@ -840,18 +849,22 @@ fn run_per_partition(
             writer.flush()?;
 
             if export_size != part.size_bytes {
-                let new_sectors = (export_size / 512) as u32;
                 let fs_offset = if format == ExportFormat::TwoMg { 64 } else { 0 };
                 let status_log = Arc::clone(status);
-                let patched =
-                    resize_fat_in_place(writer.get_mut(), fs_offset, new_sectors, &mut |msg| {
+                let fitted = fit_filesystem_to_export(
+                    writer.get_mut(),
+                    fs_offset,
+                    export_size,
+                    true,
+                    &mut |msg| {
                         if let Ok(mut s) = status_log.lock() {
                             s.log_messages.push(msg.to_string());
                         }
-                    })?;
-                if !patched {
+                    },
+                );
+                if let Err(e) = fitted {
                     drop(writer);
-                    return refuse_unpatched_shrink(&dest_path, part.index, export_size);
+                    return refuse_unpatched_shrink(&dest_path, part.index, export_size, e);
                 }
                 let end = if format == ExportFormat::TwoMg {
                     64 + total
@@ -878,16 +891,115 @@ fn run_per_partition(
 
 /// A per-partition raw export can only shrink FAT in place; any other
 /// filesystem written short is a truncated volume, so remove it and say why.
+/// Bring the filesystem inside a freshly written export to `export_size`.
+/// `needs_resize` false means the size is unchanged and only a trimmed HFS
+/// volume's alternate header in the zero-filled tail has to be rewritten.
+fn fit_filesystem_to_export(
+    file: &mut (impl Read + Write + Seek),
+    fs_offset: u64,
+    export_size: u64,
+    needs_resize: bool,
+    log: &mut impl FnMut(&str),
+) -> anyhow::Result<()> {
+    if !needs_resize {
+        crate::fs::resize_hfs_in_place(file, fs_offset, export_size, log)?;
+        return crate::fs::resize_hfsplus_in_place(file, fs_offset, export_size, log);
+    }
+    match crate::fs::in_place_resize_support(file, fs_offset, None) {
+        crate::fs::InPlaceResize::Supported(_) => {}
+        crate::fs::InPlaceResize::NoFilesystem => {
+            log("No filesystem recognised in the export; only its length changes");
+            return Ok(());
+        }
+        crate::fs::InPlaceResize::Unsupported(name) => {
+            anyhow::bail!("{name} has no in-place resizer")
+        }
+    }
+    crate::fs::resize_filesystem_for(file, fs_offset, export_size, log)
+}
+
 fn refuse_unpatched_shrink(
     dest_path: &std::path::Path,
     index: usize,
     export_size: u64,
+    reason: anyhow::Error,
 ) -> anyhow::Result<()> {
     let _ = std::fs::remove_file(dest_path);
     anyhow::bail!(
-        "partition-{index} is not a FAT volume: a raw per-partition export can only shrink \
-         FAT in place, so writing it at {} would cut data. Export it at its original size, \
-         or use Backup with shrink-to-minimum, which clones the volume instead.",
+        "partition-{index} cannot be written at {}: {reason:#}. A raw per-partition export \
+         can only trim a volume whose filesystem is resized in place to match. Export it at \
+         its original size, or use Backup with shrink-to-minimum, which clones the volume.",
         partition::format_size(export_size)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs::filesystem::Filesystem;
+    use std::io::Cursor;
+
+    const MIB: u64 = 1024 * 1024;
+
+    fn hfs(size: u64) -> Vec<u8> {
+        crate::fs::hfs::create_blank_hfs(size, 4096, "Trim").unwrap()
+    }
+
+    /// BR9: a compacted HFS backup exported at Minimum was refused as "not a
+    /// FAT volume". The stream is a trim that cuts nothing; only the header
+    /// still has to be told the new size.
+    #[test]
+    fn a_trimmed_hfs_export_is_resized_in_place() {
+        let mut img = hfs(8 * MIB);
+        img.truncate(4 * MIB as usize);
+        let mut file = Cursor::new(img);
+        fit_filesystem_to_export(&mut file, 0, 4 * MIB, true, &mut |_| {}).unwrap();
+        let fs = crate::fs::hfs::HfsFilesystem::open(Cursor::new(file.into_inner()), 0).unwrap();
+        assert!(fs.total_size() <= 4 * MIB, "{}", fs.total_size());
+        assert!(fs.total_size() > 3 * MIB, "{}", fs.total_size());
+    }
+
+    /// Exported at its original size, a compacted HFS stream still needs the
+    /// alternate MDB rewritten into the zero-filled tail.
+    #[test]
+    fn a_compacted_hfs_export_at_original_size_gets_its_alternate_mdb() {
+        let full = hfs(8 * MIB);
+        let size = full.len();
+        let alt = (2..size / 512)
+            .rev()
+            .map(|s| s * 512)
+            .find(|&o| &full[o..o + 2] == b"BD")
+            .expect("blank volume carries an alternate MDB");
+        assert!(alt >= size - 64 * 1024, "alternate MDB at {alt} of {size}");
+        let mut img = full.clone();
+        img[size - 64 * 1024..].fill(0);
+        let mut file = Cursor::new(img);
+        fit_filesystem_to_export(&mut file, 0, size as u64, false, &mut |_| {}).unwrap();
+        let out = file.into_inner();
+        assert_eq!(&out[alt..alt + 2], b"BD", "alternate MDB was not rewritten");
+    }
+
+    /// A filesystem we cannot resize in place is refused by name; bare zeros
+    /// carry no metadata to fall out of step, so only the length changes.
+    #[test]
+    fn a_volume_with_no_resizer_is_refused_and_zeros_are_not() {
+        let minix =
+            crate::fs::minix::create_blank_minix(4 * MIB, crate::fs::minix::MinixVersion::V1)
+                .unwrap();
+        let err = fit_filesystem_to_export(&mut Cursor::new(minix), 0, 2 * MIB, true, &mut |_| {})
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").to_lowercase().contains("minix"),
+            "{err:#}"
+        );
+        let zeros = vec![0u8; MIB as usize];
+        let kind =
+            match crate::fs::in_place_resize_support(&mut Cursor::new(zeros.clone()), 0, None) {
+                crate::fs::InPlaceResize::NoFilesystem => "nothing",
+                crate::fs::InPlaceResize::Supported(n)
+                | crate::fs::InPlaceResize::Unsupported(n) => n,
+            };
+        assert_eq!(kind, "nothing", "zeros were classified as a filesystem");
+        fit_filesystem_to_export(&mut Cursor::new(zeros), 0, MIB / 2, true, &mut |_| {}).unwrap();
+    }
 }

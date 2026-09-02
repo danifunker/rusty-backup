@@ -1831,7 +1831,13 @@ impl InspectTab {
 
                 // Per-partition sizing
                 if !self.export_partition_configs.is_empty() {
-                    ui.label(egui::RichText::new("Partition Sizes:").strong());
+                    ui.label(egui::RichText::new("Partition Sizes:").strong())
+                        .on_hover_text(
+                            "Minimum is the trim point: the imaged size of a compacted backup \
+                             partition, or the last used byte of a live volume. The exported \
+                             volume is resized in place to match. Anything smaller needs a \
+                             Backup with shrink-to-minimum, which clones the volume.",
+                        );
                     egui::Grid::new("export_partition_sizes")
                         .striped(true)
                         .min_col_width(50.0)
