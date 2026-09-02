@@ -711,8 +711,7 @@ fn apply_next_edits(
 ) -> Result<()> {
     use crate::partition::next::{
         clear_partition, present_copies, set_partition_extent, set_partition_type, write_copies,
-        write_partition, NextDiskLabel, NextPartition, NextPartitionSpec, LABEL_SPAN,
-        NEXT_LABEL_V3, N_PARTITIONS,
+        write_partition, NextDiskLabel, NextPartition, NextPartitionSpec, LABEL_SPAN, N_PARTITIONS,
     };
 
     let copies = present_copies(file);
@@ -725,6 +724,12 @@ fn apply_next_edits(
 
     let secsize = u64::from(label.sector_size);
     let front = u64::from(label.front_porch);
+    // Each edit reads its slot from the buffer as edited so far, so a resize
+    // then a move of one slot compose and two adds take two slots.
+    let live = |buf: &[u8]| -> Result<NextDiskLabel> {
+        NextDiskLabel::parse(buf, 0)
+            .map_err(|e| anyhow::anyhow!("NeXT disk label: edited label no longer parses: {e}"))
+    };
     // Only slots the label actually lists may be edited; an unused slot is
     // reached with `add`, which picks the first free one itself.
     let resolve = |raw: usize| -> Result<usize> {
@@ -770,7 +775,7 @@ fn apply_next_edits(
             } => {
                 let slot = resolve(*index)?;
                 let size = to_sectors(*new_size_bytes, "size")?;
-                let base = label.partitions[slot].base;
+                let base = live(&buf)?.partitions[slot].base;
                 set_partition_extent(&mut buf, slot, base, size);
                 log_cb(&format!(
                     "NeXT disk label: slot {slot} ({}) resized to {size} sectors of {secsize}",
@@ -783,7 +788,7 @@ fn apply_next_edits(
             } => {
                 let slot = resolve(*index)?;
                 let base = to_base(*new_start_lba)?;
-                let size = label.partitions[slot].size;
+                let size = live(&buf)?.partitions[slot].size;
                 set_partition_extent(&mut buf, slot, base, size);
                 log_cb(&format!(
                     "NeXT disk label: slot {slot} ({}) moved to p_base {base}",
@@ -810,8 +815,9 @@ fn apply_next_edits(
                 type_string,
                 ..
             } => {
+                let now = live(&buf)?;
                 let free = (0..N_PARTITIONS)
-                    .find(|i| label.partitions.get(*i).is_none_or(|p| p.is_empty()))
+                    .find(|i| now.partitions.get(*i).is_none_or(|p| p.is_empty()))
                     .ok_or_else(|| anyhow::anyhow!("NeXT disk label: all 8 slots are in use"))?;
                 write_partition(
                     &mut buf,
@@ -867,7 +873,9 @@ fn apply_next_edits(
     }
 
     check_next_layout(&buf, secsize, front, disk_size_bytes)?;
-    NextDiskLabel::stamp_checksum(&mut buf, NEXT_LABEL_V3);
+    // v1/v2 labels keep their checksum after dl_bad; stamping v3's offset
+    // there left the real sum stale and every copy unreadable.
+    NextDiskLabel::stamp_checksum(&mut buf, label.version);
     write_copies(file, &buf, &copies)?;
     log_cb(&format!(
         "NeXT disk label: rewrote {} copy/copies at block(s) {}",
@@ -1778,6 +1786,80 @@ mod tests {
         assert_eq!(live.len(), 2);
         assert_eq!(live[1].0, 1, "slot b, the first free one");
         assert_eq!(live[1].1.fs_type, "swap");
+    }
+
+    /// The resize engine emits Resize then Move for one slot; the move used to
+    /// read the slot's size from the label parsed before the resize.
+    #[test]
+    fn next_resize_then_move_keeps_the_new_size() {
+        let mut img = next_disk();
+        let new_size = 6 * 1024 * 1024;
+        edit_next(
+            &mut img,
+            &[
+                PartitionTableEdit::ResizeEntry {
+                    index: 0,
+                    new_size_bytes: new_size,
+                },
+                PartitionTableEdit::MoveEntry {
+                    index: 0,
+                    new_start_lba: 8 * 1024 * 1024 / 512,
+                },
+            ],
+        )
+        .unwrap();
+        let label = next_label_of(&img);
+        let (_, p) = label.browsable_partitions().next().unwrap();
+        assert_eq!(p.size as u64 * 1024, new_size);
+        assert_eq!(p.start_byte, 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn next_two_adds_take_two_slots() {
+        let mut img = next_disk();
+        let add = |mb: u64| PartitionTableEdit::AddEntry {
+            start_lba: mb * 1024 * 1024 / 512,
+            size_bytes: 4 * 1024 * 1024,
+            partition_type: 0,
+            type_string: Some("swap".to_string()),
+            bootable: false,
+        };
+        edit_next(&mut img, &[add(32), add(40)]).unwrap();
+        let label = next_label_of(&img);
+        let live: Vec<_> = label.browsable_partitions().collect();
+        assert_eq!(
+            live.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+    }
+
+    /// A v2 label keeps its checksum after `dl_bad`; stamping v3's offset left
+    /// the real one stale, and every copy stopped validating.
+    #[test]
+    fn next_v2_label_is_still_a_label_after_an_edit() {
+        use crate::partition::next::{NextDiskLabel, LABEL_SPAN, NEXT_LABEL_V2};
+        let mut img = next_disk();
+        for block in [0u64, 15, 30, 45] {
+            let off = (block * 512) as usize;
+            let copy = &mut img[off..off + LABEL_SPAN];
+            copy[0..4].copy_from_slice(&NEXT_LABEL_V2.to_be_bytes());
+            NextDiskLabel::stamp_checksum(copy, NEXT_LABEL_V2);
+        }
+        assert_eq!(next_label_of(&img).version, NEXT_LABEL_V2);
+        edit_next(
+            &mut img,
+            &[PartitionTableEdit::ResizeEntry {
+                index: 0,
+                new_size_bytes: 6 * 1024 * 1024,
+            }],
+        )
+        .unwrap();
+        let label = next_label_of(&img);
+        assert_eq!(label.version, NEXT_LABEL_V2);
+        assert_eq!(
+            label.browsable_partitions().next().unwrap().1.size as u64 * 1024,
+            6 * 1024 * 1024
+        );
     }
 
     /// Every copy the disk carries has to be rewritten, and only those: a
