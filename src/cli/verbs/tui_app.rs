@@ -2640,14 +2640,27 @@ impl CommanderState {
                     return;
                 }
             };
-            (|| -> Result<(), String> {
-                for e in &entries {
-                    std::fs::copy(std::path::PathBuf::from(&e.path), dest_dir.join(&e.name))
-                        .map_err(|err| format!("Copy failed on {}: {err}", e.name))?;
+            // The shared runner recurses folders, refuses a copy into itself
+            // and keeps forks; the flat loop wrote a folder as an empty file.
+            let status = crate::model::commander_ops::spawn_host_copy(
+                crate::model::commander_ops::HostCopyJob::HostToHost {
+                    entries: entries.clone(),
+                    dest_dir,
+                },
+            );
+            loop {
+                let (finished, error, copied) = {
+                    let g = crate::model::worker::lock_status(&status);
+                    (g.finished, g.error.clone(), g.copied)
+                };
+                if finished {
+                    break match error {
+                        Some(e) => Err(format!("Copy failed: {e}")),
+                        None => Ok(format!("Copied {copied} item(s) to {label}.")),
+                    };
                 }
-                Ok(())
-            })()
-            .map(|()| format!("Copied {label}."))
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
         } else {
             // image -> image: extract the entries to a temp dir, stage them as
             // AddFiles on the destination's browse session, then apply. The temp
