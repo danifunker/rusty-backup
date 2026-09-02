@@ -505,19 +505,61 @@ impl EditQueue {
     /// leaving a half-applied queue behind if they change their mind at file 7
     /// of 12. Staging exists precisely so the questions can be asked once.
     pub fn conflicting_adds(&self, efs: &mut dyn EditableFilesystem) -> Vec<(String, String)> {
+        // Replay the queue in order over each directory's current names, so a
+        // rename or delete earlier in the batch frees (or takes) a name the
+        // way the apply pass will see it.
+        type Occupied = std::collections::HashMap<String, Option<Vec<String>>>;
+        fn names_in<'a>(
+            occupied: &'a mut Occupied,
+            parent: &FileEntry,
+            efs: &mut dyn EditableFilesystem,
+        ) -> Option<&'a mut Vec<String>> {
+            occupied
+                .entry(parent.path.clone())
+                .or_insert_with(|| {
+                    let dir = resolve_dir_by_path(efs, &parent.path).ok()?;
+                    let children = efs.list_directory(&dir).ok()?;
+                    Some(children.into_iter().map(|e| e.name).collect())
+                })
+                .as_mut()
+        }
+        let mut occupied = Occupied::new();
         let mut out = Vec::new();
         for edit in &self.edits {
-            let StagedEdit::AddFile { parent, name, .. } = edit else {
-                continue;
-            };
-            let Ok(dir) = resolve_dir_by_path(efs, &parent.path) else {
-                continue;
-            };
-            let Ok(children) = efs.list_directory(&dir) else {
-                continue;
-            };
-            if children.iter().any(|e| &e.name == name) {
-                out.push((Self::pending_path(&parent.path, name), name.clone()));
+            match edit {
+                StagedEdit::AddFile { parent, name, .. } => {
+                    if let Some(names) = names_in(&mut occupied, parent, efs) {
+                        if names.iter().any(|n| n == name) {
+                            out.push((Self::pending_path(&parent.path, name), name.clone()));
+                        } else {
+                            names.push(name.clone());
+                        }
+                    }
+                }
+                StagedEdit::CreateDirectory { parent, name } => {
+                    if let Some(names) = names_in(&mut occupied, parent, efs) {
+                        if !names.iter().any(|n| n == name) {
+                            names.push(name.clone());
+                        }
+                    }
+                }
+                StagedEdit::DeleteEntry { parent, entry }
+                | StagedEdit::DeleteRecursive { parent, entry } => {
+                    if let Some(names) = names_in(&mut occupied, parent, efs) {
+                        names.retain(|n| n != &entry.name);
+                    }
+                }
+                StagedEdit::Rename {
+                    parent,
+                    entry,
+                    new_name,
+                } => {
+                    if let Some(names) = names_in(&mut occupied, parent, efs) {
+                        names.retain(|n| n != &entry.name);
+                        names.push(new_name.clone());
+                    }
+                }
+                _ => {}
             }
         }
         out
@@ -1248,6 +1290,77 @@ mod tests {
             apply_edit(&mut fs, &over_file),
             Err(FilesystemError::AlreadyExists(_))
         ));
+    }
+
+    /// X7: the pre-scan looked at the disk only, so a rename or delete earlier
+    /// in the same batch made it report the wrong conflicts.
+    #[test]
+    fn conflict_scan_replays_pending_renames_and_deletes() {
+        use crate::fs::fat::{create_blank_fat, FatFilesystem};
+        use crate::fs::filesystem::{CreateFileOptions, Filesystem};
+        use crate::fs::replace::OnConflict;
+        use std::io::Cursor;
+
+        let img = create_blank_fat(2 * 1024 * 1024, Some("T")).unwrap();
+        let mut fs = FatFilesystem::open(Cursor::new(img), 0).unwrap();
+        let root = fs.root().unwrap();
+        let mut d = Cursor::new(b"old".to_vec());
+        fs.create_file(&root, "A.TXT", &mut d, 3, &CreateFileOptions::default())
+            .unwrap();
+        let a = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "A.TXT")
+            .unwrap();
+        let host = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(host.path(), b"new").unwrap();
+        let add = |name: &str| StagedEdit::AddFile {
+            parent: root.clone(),
+            name: name.to_string(),
+            host_path: host.path().to_path_buf(),
+            size: 3,
+            prodos_type: None,
+            prodos_aux: None,
+            resource_fork: None,
+            hfs_type_override: None,
+            hfs_creator_override: None,
+            dates: None,
+            on_conflict: OnConflict::Fail,
+        };
+        let names = |q: &EditQueue, fs: &mut FatFilesystem<Cursor<Vec<u8>>>| -> Vec<String> {
+            q.conflicting_adds(fs).into_iter().map(|(_, n)| n).collect()
+        };
+
+        // Rename frees A.TXT and takes B.TXT.
+        let mut q = EditQueue::new();
+        q.push(StagedEdit::Rename {
+            parent: root.clone(),
+            entry: a.clone(),
+            new_name: "B.TXT".to_string(),
+        });
+        q.push(add("A.TXT"));
+        q.push(add("B.TXT"));
+        assert_eq!(names(&q, &mut fs), vec!["B.TXT"]);
+
+        // Delete frees A.TXT.
+        let mut q = EditQueue::new();
+        q.push(StagedEdit::DeleteEntry {
+            parent: root.clone(),
+            entry: a.clone(),
+        });
+        q.push(add("A.TXT"));
+        assert!(names(&q, &mut fs).is_empty());
+
+        // Order matters: an add before the rename still collides on disk.
+        let mut q = EditQueue::new();
+        q.push(add("A.TXT"));
+        q.push(StagedEdit::Rename {
+            parent: root.clone(),
+            entry: a.clone(),
+            new_name: "C.TXT".to_string(),
+        });
+        assert_eq!(names(&q, &mut fs), vec!["A.TXT"]);
     }
 
     /// Conflicts are found before anything is applied, so the user answers once
