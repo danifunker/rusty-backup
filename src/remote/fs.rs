@@ -187,8 +187,25 @@ impl Drop for RemoteFilesystem {
     }
 }
 
+/// A daemon error as a filesystem error. PermissionDenied keeps its own kind so
+/// the callers that offer elevation still recognise it.
 fn wire_err(e: anyhow::Error) -> FilesystemError {
-    FilesystemError::Io(crate::compat::io_other(e.to_string()))
+    let text = format!("{e:#}");
+    let denied = e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>()
+            .map(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+            .unwrap_or(false)
+    }) || {
+        let lower = text.to_ascii_lowercase();
+        lower.contains("permission denied") || lower.contains("eacces") || lower.contains("eperm")
+    };
+    if denied {
+        return FilesystemError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            text,
+        ));
+    }
+    FilesystemError::Io(crate::compat::io_other(text))
 }
 
 /// A [`Filesystem`] over the daemon's **host** filesystem — the remote *file
@@ -338,6 +355,29 @@ fn wire_to_entry(w: WireEntry) -> FileEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R16: every daemon error became Io(Other), so a device the daemon could
+    /// not open for lack of rights never reached the elevation offer.
+    #[test]
+    fn wire_err_keeps_permission_denied_as_its_own_kind() {
+        let kind_of = |e: anyhow::Error| match wire_err(e) {
+            FilesystemError::Io(io) => io.kind(),
+            other => panic!("expected an Io error, got {other:?}"),
+        };
+        let io = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "open /dev/sdb");
+        let nested = anyhow::Error::from(io).context("opening the device on the daemon");
+        assert_eq!(kind_of(nested), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            kind_of(anyhow::anyhow!(
+                "daemon: /dev/sdb: Permission denied (os error 13)"
+            )),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            kind_of(anyhow::anyhow!("daemon: not a disk image")),
+            std::io::ErrorKind::Other
+        );
+    }
 
     #[test]
     fn wire_to_entry_maps_kinds_and_metadata() {
