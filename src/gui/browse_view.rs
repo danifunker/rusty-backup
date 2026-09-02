@@ -253,6 +253,10 @@ pub struct BrowseView {
     /// that mutates the volume (sync_metadata, archive recompress, edit
     /// apply) calls `invalidate_cached_fs` so the next read sees disk truth.
     cached_fs: Option<Box<dyn Filesystem>>,
+    /// Bumped on every invalidation; a worker's handle is only cached if it matches.
+    fs_generation: u64,
+    /// `fs_generation` when the pending tree walk borrowed its filesystem.
+    pending_tree_generation: u64,
 
     /// Queue of Mac archives (`.hqx` / `.sit` / `.sea` / `.sit.hqx` /
     /// `.sea.hqx`) that the user picked via Add File... — each waits on a
@@ -485,6 +489,8 @@ impl Default for BrowseView {
             needs_password: false,
             password_input: String::new(),
             cached_fs: None,
+            fs_generation: 0,
+            pending_tree_generation: 0,
             pending_tree: None,
             pending_archive_imports: Vec::new(),
             archive_import_tempdir: None,
@@ -5691,6 +5697,7 @@ impl BrowseView {
                 g.finished = true;
             }
         });
+        self.pending_tree_generation = self.fs_generation;
         self.pending_tree = Some(status);
     }
 
@@ -5713,7 +5720,10 @@ impl BrowseView {
             if let Some(arc) = self.pending_tree.take() {
                 if let Ok(mut g) = arc.lock() {
                     if let Some(fs) = g.fs.take() {
-                        self.cached_fs = Some(fs);
+                        // A write since the walk began makes this handle stale.
+                        if self.pending_tree_generation == self.fs_generation {
+                            self.cached_fs = Some(fs);
+                        }
                     }
                     if let Some(text) = g.text.take() {
                         let oversized = text.len() > TREE_INLINE_RENDER_LIMIT;
@@ -6016,6 +6026,7 @@ impl BrowseView {
     /// (after sync_metadata, archive recompress, etc.).
     fn invalidate_cached_fs(&mut self) {
         self.cached_fs = None;
+        self.fs_generation = self.fs_generation.wrapping_add(1);
         // Boot-block status is recomputed lazily from the (now possibly
         // changed) backing bytes the next time the header renders.
         self.boot_blocks_present = None;
