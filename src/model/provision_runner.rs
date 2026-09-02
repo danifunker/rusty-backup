@@ -203,6 +203,7 @@ pub fn run_worker(req: &ProvisionRequest, status: Arc<Mutex<PhysicalWriteStatus>
     }
 
     target.flush().context("flushing target after build")?;
+    target.sync_all().context("syncing the target")?;
     log_cb("Disk build complete");
     Ok(())
 }

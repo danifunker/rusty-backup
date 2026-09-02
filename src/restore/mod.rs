@@ -222,6 +222,17 @@ pub fn calculate_restore_layout(
     }
 
     // Determine alignment parameters
+    // DOS and Win9x boot code read the CHS fields, which a zero geometry left
+    // stale after a move; the recorded geometry or the BIOS's 255/63 fills it.
+    let (geo_heads, geo_spt) =
+        if metadata.alignment.heads > 0 && metadata.alignment.sectors_per_track > 0 {
+            (
+                metadata.alignment.heads,
+                metadata.alignment.sectors_per_track,
+            )
+        } else {
+            (255, 63)
+        };
     let (first_partition_lba, alignment_sectors, heads, spt) = match alignment {
         RestoreAlignment::Original => (
             metadata.alignment.first_partition_lba,
@@ -229,8 +240,8 @@ pub fn calculate_restore_layout(
             metadata.alignment.heads,
             metadata.alignment.sectors_per_track,
         ),
-        RestoreAlignment::Modern1MB => (2048, 2048, 0, 0),
-        RestoreAlignment::Custom(n) => (*n, *n, 0, 0),
+        RestoreAlignment::Modern1MB => (2048, 2048, geo_heads, geo_spt),
+        RestoreAlignment::Custom(n) => (*n, *n, geo_heads, geo_spt),
     };
 
     // Separate primary and logical partitions
@@ -273,8 +284,13 @@ pub fn calculate_restore_layout(
             }
         }
 
-        let partition_size =
-            compute_partition_size(size_choice, pm, current_lba, usable_target_size);
+        let partition_size = compute_partition_size(
+            size_choice,
+            pm,
+            current_lba,
+            usable_target_size,
+            restore_size_floor(metadata, pm),
+        );
 
         let new_start_lba = if current_lba != pm.start_lba {
             Some(current_lba)
@@ -336,8 +352,13 @@ pub fn calculate_restore_layout(
                 }
             }
 
-            let partition_size =
-                compute_partition_size(size_choice, pm, current_lba, usable_target_size);
+            let partition_size = compute_partition_size(
+                size_choice,
+                pm,
+                current_lba,
+                usable_target_size,
+                restore_size_floor(metadata, pm),
+            );
 
             let new_start_lba = if current_lba != pm.start_lba {
                 Some(current_lba)
@@ -451,8 +472,13 @@ fn calculate_apm_restore_layout(
                     .map(|s| &s.size_choice)
                     .unwrap_or(&RestoreSizeChoice::Original);
 
-                let partition_size =
-                    compute_partition_size(size_choice, pm, pm.start_lba, usable_target_size);
+                let partition_size = compute_partition_size(
+                    size_choice,
+                    pm,
+                    pm.start_lba,
+                    usable_target_size,
+                    restore_size_floor(metadata, pm),
+                );
 
                 overrides.push(PartitionSizeOverride {
                     index: pm.index,
@@ -498,8 +524,13 @@ fn calculate_apm_restore_layout(
                     }
                 }
 
-                let partition_size =
-                    compute_partition_size(size_choice, pm, current_lba, usable_target_size);
+                let partition_size = compute_partition_size(
+                    size_choice,
+                    pm,
+                    current_lba,
+                    usable_target_size,
+                    restore_size_floor(metadata, pm),
+                );
 
                 let new_start_lba = if current_lba != pm.start_lba {
                     Some(current_lba)
@@ -562,15 +593,13 @@ fn compute_partition_size(
     pm: &crate::backup::metadata::PartitionMetadata,
     current_lba: u64,
     target_size: u64,
+    floor: u64,
 ) -> u64 {
     match size_choice {
         RestoreSizeChoice::Original => pm.original_size_bytes,
         RestoreSizeChoice::Minimum => {
-            // Prefer the defragmented (post-clone) minimum when available —
-            // for filesystems with a defragmenting compaction path (FAT,
-            // HFS+) this can be substantially smaller than the in-place
-            // trim point. Fall back to the in-place minimum, then to the
-            // imaged size, then to the original.
+            // The defragmented minimum needs a defragmenting clone, which restore
+            // does not do; `restore_size_floor` is what this copy can deliver.
             let min = pm
                 .defragmented_min_size_bytes
                 .or(pm.minimum_size_bytes)
@@ -579,7 +608,8 @@ fn compute_partition_size(
                 } else {
                     None
                 })
-                .unwrap_or(pm.original_size_bytes);
+                .unwrap_or(pm.original_size_bytes)
+                .max(floor);
             (min + 511) & !511
         }
         RestoreSizeChoice::Custom(bytes) => (bytes + 511) & !511,
@@ -1233,6 +1263,7 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
     }
 
     target.flush()?;
+    target.sync_all().context("syncing the target")?;
 
     // Close the file to ensure all writes are committed
     drop(target);
@@ -1369,6 +1400,7 @@ fn run_single_file_chd_restore_as_is(
         set_progress_bytes(&progress, written, logical_size);
     }
     target.flush().context("failed to flush target")?;
+    target.sync_all().context("syncing the target")?;
 
     log(
         &progress,
@@ -1822,6 +1854,7 @@ fn run_single_file_chd_restore_resize(
     }
 
     target.flush().context("final flush")?;
+    target.sync_all().context("syncing the target")?;
 
     log(
         &progress,
@@ -2281,6 +2314,7 @@ fn run_clonezilla_restore(
     }
 
     target.flush()?;
+    target.sync_all().context("syncing the target")?;
     drop(target);
 
     log(

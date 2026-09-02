@@ -453,6 +453,7 @@ pub fn run_single_partition_restore(
     }
 
     target.flush()?;
+    target.sync_all()?;
 
     // Step 5: Patch hidden sectors if start LBA changed
     if config.target_start_lba != config.source_start_lba {
@@ -665,6 +666,7 @@ pub fn run_single_partition_restore(
     }
 
     target.flush()?;
+    target.sync_all()?;
     drop(target);
 
     log(

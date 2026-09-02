@@ -522,6 +522,12 @@ impl SectorAlignedWriter {
         Ok(())
     }
 
+    /// Flush, pad, and push everything to the medium before "complete" is said.
+    pub fn sync_all(&mut self) -> io::Result<()> {
+        self.flush_padded()?;
+        self.inner.sync_all()
+    }
+
     /// Flush everything, padding the final partial sector with zeros.
     fn flush_padded(&mut self) -> io::Result<()> {
         if self.buf.is_empty() {
@@ -624,6 +630,12 @@ impl SectorAlignedWriter {
             self.position += aligned_len as u64;
         }
         Ok(())
+    }
+
+    /// Flush, pad, and push everything to the medium before "complete" is said.
+    pub fn sync_all(&mut self) -> io::Result<()> {
+        self.flush_padded()?;
+        self.inner.sync_all()
     }
 
     /// Flush everything, padding the final partial sector with zeros.

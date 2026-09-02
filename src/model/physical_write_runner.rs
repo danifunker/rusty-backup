@@ -78,6 +78,15 @@ impl WriteExtent {
         }
     }
 
+    /// One partition from its byte offset: X68k SASI tables start partitions
+    /// on 256-byte sectors, which `start_lba * 512` lands 256 bytes early.
+    pub fn partition_at(offset: u64, size_bytes: u64) -> Self {
+        Self {
+            offset,
+            capacity: size_bytes,
+        }
+    }
+
     pub fn is_whole_disk(&self) -> bool {
         self.offset == 0
     }
@@ -219,6 +228,7 @@ pub fn run_worker(
     }
 
     target.flush().context("flushing target after write")?;
+    target.sync_all().context("syncing the target")?;
     log_cb("Physical disk export complete");
     Ok(())
 }
