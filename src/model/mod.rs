@@ -52,3 +52,4 @@ pub mod text_edit;
 #[cfg(feature = "gui")]
 pub mod update_runner;
 pub mod volume_label_runner;
+pub mod worker;

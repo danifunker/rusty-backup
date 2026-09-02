@@ -160,6 +160,13 @@ struct RemoteOpStatus {
     loaded: Option<rusty_backup::model::backup_remote::RemoteSourceInfo>,
 }
 
+impl rusty_backup::model::worker::WorkerStatus for RemoteOpStatus {
+    fn fail(&mut self, message: String) {
+        self.error = Some(message);
+        self.finished = true;
+    }
+}
+
 /// Per-partition size config for VHD backup popup.
 #[derive(Debug, Clone)]
 struct VhdPartitionConfig {
@@ -1078,35 +1085,36 @@ impl BackupTab {
             dest_path.display()
         ));
 
-        std::thread::spawn(move || {
-            let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: whole-disk VHD backup");
-            let status2 = Arc::clone(&status);
-            let status3 = Arc::clone(&status);
-            let result = export_whole_disk_vhd(
-                &source_path,
-                None,
-                None,
-                &overrides,
-                &dest_path,
-                move |bytes| {
-                    if let Ok(mut s) = status2.lock() {
-                        s.current_bytes = bytes;
-                    }
-                },
-                move || status3.lock().map(|s| s.cancel_requested).unwrap_or(false),
-                |msg| {
-                    if let Ok(mut s) = status.lock() {
-                        s.log_messages.push(msg.to_string());
-                    }
-                },
-            );
-            if let Ok(mut s) = status.lock() {
-                s.finished = true;
-                if let Err(e) = result {
-                    s.error = Some(format!("{e:#}"));
-                }
-            }
-        });
+        rusty_backup::model::worker::spawn_guarded(
+            Arc::clone(&status),
+            "whole-disk VHD backup",
+            move || {
+                let _wake =
+                    rusty_backup::os::wakelock::acquire("Rusty Backup: whole-disk VHD backup");
+                let status2 = Arc::clone(&status);
+                let status3 = Arc::clone(&status);
+                export_whole_disk_vhd(
+                    &source_path,
+                    None,
+                    None,
+                    &overrides,
+                    &dest_path,
+                    move |bytes| {
+                        if let Ok(mut s) = status2.lock() {
+                            s.current_bytes = bytes;
+                        }
+                    },
+                    move || status3.lock().map(|s| s.cancel_requested).unwrap_or(false),
+                    |msg| {
+                        if let Ok(mut s) = status.lock() {
+                            s.log_messages.push(msg.to_string());
+                        }
+                    },
+                )?;
+                rusty_backup::model::worker::lock_status(&status).finished = true;
+                Ok(())
+            },
+        );
     }
 
     fn poll_vhd_export(&mut self, ctx: &mut TabContext, progress_state: &mut ProgressState) {
@@ -1115,9 +1123,7 @@ impl BackupTab {
             None => return,
         };
 
-        let Ok(mut status) = status_arc.lock() else {
-            return;
-        };
+        let mut status = rusty_backup::model::worker::lock_status(&status_arc);
 
         // Drain log messages
         for msg in status.log_messages.drain(..) {
@@ -1975,15 +1981,14 @@ impl BackupTab {
         self.remote.status = Some(Arc::clone(&status));
         self.remote.error = None;
         self.remote.addr = Some(addr.clone());
-        std::thread::spawn(move || {
-            let result = rusty_backup::model::backup_remote::connect_and_list_devices(&addr);
-            if let Ok(mut s) = status.lock() {
-                match result {
-                    Ok((conn, devices)) => s.connected = Some((conn, devices)),
-                    Err(e) => s.error = Some(format!("{e:#}")),
-                }
-                s.finished = true;
-            }
+        let status_done = Arc::clone(&status);
+        rusty_backup::model::worker::spawn_guarded(status, "remote connect", move || {
+            let (conn, devices) =
+                rusty_backup::model::backup_remote::connect_and_list_devices(&addr)?;
+            let mut s = rusty_backup::model::worker::lock_status(&status_done);
+            s.connected = Some((conn, devices));
+            s.finished = true;
+            Ok(())
         });
     }
 
@@ -1997,16 +2002,14 @@ impl BackupTab {
         let status = Arc::new(Mutex::new(RemoteOpStatus::default()));
         self.remote.status = Some(Arc::clone(&status));
         self.remote.error = None;
-        std::thread::spawn(move || {
-            // Backup targets a physical drive on the daemon → is_device = true.
-            let result = rusty_backup::model::backup_remote::load_remote_source(conn, &path, true);
-            if let Ok(mut s) = status.lock() {
-                match result {
-                    Ok(info) => s.loaded = Some(info),
-                    Err(e) => s.error = Some(format!("{e:#}")),
-                }
-                s.finished = true;
-            }
+        let status_done = Arc::clone(&status);
+        rusty_backup::model::worker::spawn_guarded(status, "remote load", move || {
+            // Backup targets a physical drive on the daemon -> is_device = true.
+            let info = rusty_backup::model::backup_remote::load_remote_source(conn, &path, true)?;
+            let mut s = rusty_backup::model::worker::lock_status(&status_done);
+            s.loaded = Some(info);
+            s.finished = true;
+            Ok(())
         });
     }
 
@@ -2018,7 +2021,7 @@ impl BackupTab {
             None => return,
         };
         let (connected, loaded, error) = {
-            let Ok(mut s) = status.lock() else { return };
+            let mut s = rusty_backup::model::worker::lock_status(&status);
             if !s.finished {
                 return;
             }
@@ -2670,9 +2673,7 @@ impl BackupTab {
             None => return,
         };
 
-        let Ok(mut p) = progress_arc.lock() else {
-            return;
-        };
+        let mut p = rusty_backup::model::worker::lock_status(&progress_arc);
 
         // Drain log messages
         while let Some(msg) = p.log_messages.pop_front() {

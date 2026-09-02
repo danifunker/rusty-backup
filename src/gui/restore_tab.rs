@@ -106,6 +106,13 @@ struct RemoteConnectStatus {
     )>,
 }
 
+impl rusty_backup::model::worker::WorkerStatus for RemoteConnectStatus {
+    fn fail(&mut self, message: String) {
+        self.error = Some(message);
+        self.finished = true;
+    }
+}
+
 /// State for the Restore tab.
 pub struct RestoreTab {
     // Mode
@@ -1820,15 +1827,14 @@ impl RestoreTab {
             ctx.log.info(line);
         }
 
-        std::thread::spawn(move || {
-            let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: disk restore");
-            if let Err(e) = restore::run_restore(config, Arc::clone(&progress_arc)) {
-                if let Ok(mut p) = progress_arc.lock() {
-                    p.error = Some(format!("{e:#}"));
-                    p.finished = true;
-                }
-            }
-        });
+        rusty_backup::model::worker::spawn_guarded(
+            Arc::clone(&progress_arc),
+            "disk restore",
+            move || {
+                let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: disk restore");
+                restore::run_restore(config, progress_arc)
+            },
+        );
     }
 
     /// Resolve the alignment radio into a `RestoreAlignment`.
@@ -1988,22 +1994,21 @@ impl RestoreTab {
         self.restore_running = true;
         ctx.log.info(format!("Starting restore to {display}"));
 
-        std::thread::spawn(move || {
-            let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: remote restore");
-            if let Err(e) = rusty_backup::model::restore_remote::restore_to_remote(
-                config,
-                conn,
-                &path,
-                is_device,
-                Arc::clone(&progress_arc),
-                None,
-            ) {
-                if let Ok(mut p) = progress_arc.lock() {
-                    p.error = Some(format!("{e:#}"));
-                    p.finished = true;
-                }
-            }
-        });
+        rusty_backup::model::worker::spawn_guarded(
+            Arc::clone(&progress_arc),
+            "remote restore",
+            move || {
+                let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: remote restore");
+                rusty_backup::model::restore_remote::restore_to_remote(
+                    config,
+                    conn,
+                    &path,
+                    is_device,
+                    progress_arc,
+                    None,
+                )
+            },
+        );
     }
 
     /// Spawn a worker to connect to `addr` and list the daemon's devices.
@@ -2013,15 +2018,14 @@ impl RestoreTab {
         self.remote.status = Some(Arc::clone(&status));
         self.remote.error = None;
         self.remote.addr = Some(addr.clone());
-        std::thread::spawn(move || {
-            let result = rusty_backup::model::backup_remote::connect_and_list_devices(&addr);
-            if let Ok(mut s) = status.lock() {
-                match result {
-                    Ok((conn, devices)) => s.connected = Some((conn, devices)),
-                    Err(e) => s.error = Some(format!("{e:#}")),
-                }
-                s.finished = true;
-            }
+        let status_done = Arc::clone(&status);
+        rusty_backup::model::worker::spawn_guarded(status, "remote connect", move || {
+            let (conn, devices) =
+                rusty_backup::model::backup_remote::connect_and_list_devices(&addr)?;
+            let mut s = rusty_backup::model::worker::lock_status(&status_done);
+            s.connected = Some((conn, devices));
+            s.finished = true;
+            Ok(())
         });
     }
 
@@ -2033,7 +2037,7 @@ impl RestoreTab {
             None => return,
         };
         let (connected, error) = {
-            let Ok(mut s) = status.lock() else { return };
+            let mut s = rusty_backup::model::worker::lock_status(&status);
             if !s.finished {
                 return;
             }
@@ -2273,18 +2277,14 @@ impl RestoreTab {
             device.path.display(),
         ));
 
-        std::thread::spawn(move || {
-            let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: partition restore");
-            if let Err(e) = rusty_backup::restore::single::run_single_partition_restore(
-                config,
-                Arc::clone(&progress_arc),
-            ) {
-                if let Ok(mut p) = progress_arc.lock() {
-                    p.error = Some(format!("{e:#}"));
-                    p.finished = true;
-                }
-            }
-        });
+        rusty_backup::model::worker::spawn_guarded(
+            Arc::clone(&progress_arc),
+            "partition restore",
+            move || {
+                let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: partition restore");
+                rusty_backup::restore::single::run_single_partition_restore(config, progress_arc)
+            },
+        );
     }
 
     /// Write Image File: pour any readable image onto a device or one of its
@@ -2646,7 +2646,7 @@ impl RestoreTab {
         let Some(status) = self.bd_status.as_ref() else {
             return;
         };
-        let Ok(guard) = status.lock() else { return };
+        let guard = rusty_backup::model::worker::lock_status(status);
         let fresh: Vec<String> = guard
             .log_messages
             .iter()
@@ -3065,18 +3065,14 @@ impl RestoreTab {
             target_path.display(),
         ));
 
-        std::thread::spawn(move || {
-            let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: new-disk restore");
-            if let Err(e) = rusty_backup::restore::single::run_single_partition_restore(
-                config,
-                Arc::clone(&progress_arc),
-            ) {
-                if let Ok(mut p) = progress_arc.lock() {
-                    p.error = Some(format!("{e:#}"));
-                    p.finished = true;
-                }
-            }
-        });
+        rusty_backup::model::worker::spawn_guarded(
+            Arc::clone(&progress_arc),
+            "new-disk restore",
+            move || {
+                let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: new-disk restore");
+                rusty_backup::restore::single::run_single_partition_restore(config, progress_arc)
+            },
+        );
     }
 
     fn poll_progress(&mut self, ctx: &mut TabContext, progress_state: &mut ProgressState) {
@@ -3085,9 +3081,7 @@ impl RestoreTab {
             None => return,
         };
 
-        let Ok(mut p) = progress_arc.lock() else {
-            return;
-        };
+        let mut p = rusty_backup::model::worker::lock_status(&progress_arc);
 
         // Drain log messages
         while let Some(msg) = p.log_messages.pop_front() {

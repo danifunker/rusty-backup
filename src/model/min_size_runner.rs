@@ -99,80 +99,102 @@ pub fn spawn(req: MinSizeRequest) -> Arc<Mutex<MinSizeStatus>> {
     let status = Arc::new(Mutex::new(MinSizeStatus::new(req.partition_index)));
     let status_thread = Arc::clone(&status);
     thread::spawn(move || {
-        let progress_status = Arc::clone(&status_thread);
-        let progress = move |phase: &str| {
-            if let Ok(mut s) = progress_status.lock() {
-                s.phase = phase.to_string();
-                s.phase_log.push(phase.to_string());
-            }
-        };
-
-        let result = match req.source {
-            MinSizeSource::File {
-                file,
-                use_sector_aligned,
-            } => {
-                // Race-safe wrapper probe: `try_clone` on Unix is `dup()`,
-                // which shares the kernel seek offset across workers, so a
-                // concurrent `seek + read` from another partition's worker
-                // can clobber a plain `detect_wrapped_hfsplus` probe and
-                // leak the wrong partition's wrapper params. Read the MDB
-                // here via positioned I/O on the original handle (which
-                // doesn't touch the shared cursor) and pass the parsed
-                // info into `partition_minimum_size` as a hint so it skips
-                // its own probe.
-                progress("Probing for HFS wrapper...");
-                let wrapper_hint = fs::hfsplus_wrapper_clone::detect_wrapped_hfsplus_at(
-                    &file,
-                    req.partition_offset,
-                    u64::MAX,
-                );
-                let clone = match file.try_clone() {
-                    Ok(f) => f,
-                    Err(e) => {
-                        if let Ok(mut s) = status_thread.lock() {
-                            s.error = Some(format!("clone failed: {e}"));
-                            s.finished = true;
-                        }
-                        return;
-                    }
-                };
-                if use_sector_aligned {
-                    fs::partition_minimum_size(
-                        SectorAlignedReader::new(clone),
-                        req.partition_offset,
-                        req.partition_type,
-                        req.partition_type_string.as_deref(),
-                        req.partition_size,
-                        true,
-                        wrapper_hint,
-                        &progress,
-                    )
-                } else {
-                    fs::partition_minimum_size(
-                        BufReader::new(clone),
-                        req.partition_offset,
-                        req.partition_type,
-                        req.partition_type_string.as_deref(),
-                        req.partition_size,
-                        true,
-                        wrapper_hint,
-                        &progress,
-                    )
+        let panic_status = Arc::clone(&status_thread);
+        crate::model::worker::run_guarded(&panic_status, "minimum-size", move || {
+            let progress_status = Arc::clone(&status_thread);
+            let progress = move |phase: &str| {
+                if let Ok(mut s) = progress_status.lock() {
+                    s.phase = phase.to_string();
+                    s.phase_log.push(phase.to_string());
                 }
-            }
-            #[cfg(feature = "remote")]
-            MinSizeSource::Remote {
-                conn,
-                path,
-                is_device,
-            } => {
-                let opened = if is_device {
-                    crate::remote::RemoteBlockReader::open_device(conn, &path)
-                } else {
-                    crate::remote::RemoteBlockReader::open(conn, &path)
-                };
-                match opened {
+            };
+
+            let result = match req.source {
+                MinSizeSource::File {
+                    file,
+                    use_sector_aligned,
+                } => {
+                    // Race-safe wrapper probe: `try_clone` on Unix is `dup()`,
+                    // which shares the kernel seek offset across workers, so a
+                    // concurrent `seek + read` from another partition's worker
+                    // can clobber a plain `detect_wrapped_hfsplus` probe and
+                    // leak the wrong partition's wrapper params. Read the MDB
+                    // here via positioned I/O on the original handle (which
+                    // doesn't touch the shared cursor) and pass the parsed
+                    // info into `partition_minimum_size` as a hint so it skips
+                    // its own probe.
+                    progress("Probing for HFS wrapper...");
+                    let wrapper_hint = fs::hfsplus_wrapper_clone::detect_wrapped_hfsplus_at(
+                        &file,
+                        req.partition_offset,
+                        u64::MAX,
+                    );
+                    let clone = match file.try_clone() {
+                        Ok(f) => f,
+                        Err(e) => {
+                            if let Ok(mut s) = status_thread.lock() {
+                                s.error = Some(format!("clone failed: {e}"));
+                                s.finished = true;
+                            }
+                            return Ok(());
+                        }
+                    };
+                    if use_sector_aligned {
+                        fs::partition_minimum_size(
+                            SectorAlignedReader::new(clone),
+                            req.partition_offset,
+                            req.partition_type,
+                            req.partition_type_string.as_deref(),
+                            req.partition_size,
+                            true,
+                            wrapper_hint,
+                            &progress,
+                        )
+                    } else {
+                        fs::partition_minimum_size(
+                            BufReader::new(clone),
+                            req.partition_offset,
+                            req.partition_type,
+                            req.partition_type_string.as_deref(),
+                            req.partition_size,
+                            true,
+                            wrapper_hint,
+                            &progress,
+                        )
+                    }
+                }
+                #[cfg(feature = "remote")]
+                MinSizeSource::Remote {
+                    conn,
+                    path,
+                    is_device,
+                } => {
+                    let opened = if is_device {
+                        crate::remote::RemoteBlockReader::open_device(conn, &path)
+                    } else {
+                        crate::remote::RemoteBlockReader::open(conn, &path)
+                    };
+                    match opened {
+                        Ok(reader) => fs::partition_minimum_size(
+                            reader,
+                            req.partition_offset,
+                            req.partition_type,
+                            req.partition_type_string.as_deref(),
+                            req.partition_size,
+                            true,
+                            None,
+                            &progress,
+                        ),
+                        Err(e) => {
+                            if let Ok(mut s) = status_thread.lock() {
+                                s.error = Some(format!("{e:#}"));
+                                s.finished = true;
+                            }
+                            return Ok(());
+                        }
+                    }
+                }
+                MinSizeSource::Chd(path) => match ChdReader::open(&path) {
                     Ok(reader) => fs::partition_minimum_size(
                         reader,
                         req.partition_offset,
@@ -185,72 +207,54 @@ pub fn spawn(req: MinSizeRequest) -> Arc<Mutex<MinSizeStatus>> {
                     ),
                     Err(e) => {
                         if let Ok(mut s) = status_thread.lock() {
-                            s.error = Some(format!("{e:#}"));
+                            s.error = Some(format!("open CHD failed: {e}"));
                             s.finished = true;
                         }
-                        return;
+                        return Ok(());
                     }
-                }
-            }
-            MinSizeSource::Chd(path) => match ChdReader::open(&path) {
-                Ok(reader) => fs::partition_minimum_size(
-                    reader,
-                    req.partition_offset,
-                    req.partition_type,
-                    req.partition_type_string.as_deref(),
-                    req.partition_size,
-                    true,
-                    None,
-                    &progress,
-                ),
-                Err(e) => {
-                    if let Ok(mut s) = status_thread.lock() {
-                        s.error = Some(format!("open CHD failed: {e}"));
-                        s.finished = true;
+                },
+                MinSizeSource::Gho(path) => match GhoReader::open(&path) {
+                    Ok(reader) => fs::partition_minimum_size(
+                        reader,
+                        req.partition_offset,
+                        req.partition_type,
+                        req.partition_type_string.as_deref(),
+                        req.partition_size,
+                        true,
+                        None,
+                        &progress,
+                    ),
+                    Err(e) => {
+                        if let Ok(mut s) = status_thread.lock() {
+                            s.error = Some(format!("open GHO failed: {e:#}"));
+                            s.finished = true;
+                        }
+                        return Ok(());
                     }
-                    return;
-                }
-            },
-            MinSizeSource::Gho(path) => match GhoReader::open(&path) {
-                Ok(reader) => fs::partition_minimum_size(
-                    reader,
-                    req.partition_offset,
-                    req.partition_type,
-                    req.partition_type_string.as_deref(),
-                    req.partition_size,
-                    true,
-                    None,
-                    &progress,
-                ),
-                Err(e) => {
-                    if let Ok(mut s) = status_thread.lock() {
-                        s.error = Some(format!("open GHO failed: {e:#}"));
-                        s.finished = true;
-                    }
-                    return;
-                }
-            },
-        };
+                },
+            };
 
-        if let Ok(mut s) = status_thread.lock() {
-            match result {
-                MinimumResult::Computed {
-                    in_place,
-                    defragmented,
-                    fragmentation_percent,
-                } => {
-                    s.result = in_place;
-                    s.defragmented_min = defragmented;
-                    s.fragmentation_percent = fragmentation_percent;
+            if let Ok(mut s) = status_thread.lock() {
+                match result {
+                    MinimumResult::Computed {
+                        in_place,
+                        defragmented,
+                        fragmentation_percent,
+                    } => {
+                        s.result = in_place;
+                        s.defragmented_min = defragmented;
+                        s.fragmentation_percent = fragmentation_percent;
+                    }
+                    MinimumResult::Deferred { fs_name } => {
+                        s.error = Some(format!(
+                            "internal: partition_minimum_size deferred unexpectedly ({fs_name})"
+                        ));
+                    }
                 }
-                MinimumResult::Deferred { fs_name } => {
-                    s.error = Some(format!(
-                        "internal: partition_minimum_size deferred unexpectedly ({fs_name})"
-                    ));
-                }
+                s.finished = true;
             }
-            s.finished = true;
-        }
+            Ok(())
+        });
     });
     status
 }
