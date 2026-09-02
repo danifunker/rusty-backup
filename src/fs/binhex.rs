@@ -166,13 +166,13 @@ fn sixbit_encode(data: &[u8]) -> String {
 
 /// Encode a [`BinHexFile`] into a complete `.hqx` text document.
 pub fn build_binhex(file: &BinHexFile) -> String {
-    let name_bytes = file.name.as_bytes();
-    let name_len = name_bytes.len().min(63);
+    let name_bytes = crate::fs::resource_fork::mac_name_bytes(&file.name);
+    let name_len = name_bytes.len();
 
     // Header: nameLen, name, version(0), type, creator, flags, dataLen, rsrcLen.
     let mut header = Vec::with_capacity(name_len + 20);
     header.push(name_len as u8);
-    header.extend_from_slice(&name_bytes[..name_len]);
+    header.extend_from_slice(&name_bytes);
     header.push(0); // version
     header.extend_from_slice(&file.type_code);
     header.extend_from_slice(&file.creator_code);
@@ -280,7 +280,7 @@ fn parse_decoded(raw: &[u8]) -> Result<BinHexFile> {
         bail!("BinHex: truncated header");
     }
 
-    let name = String::from_utf8_lossy(&raw[1..1 + name_len]).into_owned();
+    let name = crate::fs::hfs::decode_mac_filename(&raw[1..1 + name_len]);
     let mut p = 1 + name_len + 1; // skip version byte
     let type_code: [u8; 4] = raw[p..p + 4].try_into().unwrap();
     p += 4;
@@ -350,6 +350,23 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// X13: the header name is Mac Roman on both sides of the wire.
+    #[test]
+    fn binhex_names_round_trip_through_mac_roman() {
+        let file = BinHexFile {
+            name: "Caf\u{e9} \u{2122}".to_string(),
+            type_code: *b"TEXT",
+            creator_code: *b"ttxt",
+            flags: 0,
+            data_fork: b"hello".to_vec(),
+            resource_fork: Vec::new(),
+        };
+        let text = build_binhex(&file);
+        let back = parse_binhex(text.as_bytes()).unwrap();
+        assert_eq!(back.name, "Caf\u{e9} \u{2122}");
+        assert_eq!(back.data_fork, b"hello");
+    }
 
     #[test]
     fn crc_known_vector() {

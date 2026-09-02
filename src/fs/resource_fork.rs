@@ -177,10 +177,10 @@ pub fn build_macbinary(
 
     // Header byte 0: always 0
     // Header byte 1: filename length (max 63)
-    let name_bytes = filename.as_bytes();
-    let name_len = name_bytes.len().min(63);
+    let name_bytes = mac_name_bytes(filename);
+    let name_len = name_bytes.len();
     buf[1] = name_len as u8;
-    buf[2..2 + name_len].copy_from_slice(&name_bytes[..name_len]);
+    buf[2..2 + name_len].copy_from_slice(&name_bytes);
 
     // Type code at 65-68, creator at 69-72
     buf[65..69].copy_from_slice(type_code);
@@ -672,9 +672,46 @@ fn read_finder_info_xattr(path: &std::path::Path) -> (Option<[u8; 4]>, Option<[u
     (tc, cc)
 }
 
+/// A Mac file name as the classic containers store it: Mac Roman, at most 63
+/// bytes. One byte per character, so the cut never splits a character.
+pub fn mac_name_bytes(name: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(name.len());
+    for ch in name.chars() {
+        let mut one = [0u8; 4];
+        let bytes = crate::fs::hfs::utf8_to_mac_roman(ch.encode_utf8(&mut one))
+            .unwrap_or_else(|_| vec![b'?']);
+        if out.len() + bytes.len() > 63 {
+            break;
+        }
+        out.extend_from_slice(&bytes);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// X13: names went out as UTF-8 and were cut at 63 bytes mid-character;
+    /// a classic Mac reads the header as Mac Roman.
+    #[test]
+    fn macbinary_names_are_mac_roman_and_cut_on_a_character() {
+        let mb = build_macbinary(
+            "Caf\u{e9}",
+            b"TEXT",
+            b"ttxt",
+            MacFileDates::default(),
+            b"x",
+            b"",
+        );
+        assert_eq!(mb[1], 4);
+        assert_eq!(&mb[2..6], &[b'C', b'a', b'f', 0x8E]);
+        let long = "\u{e9}".repeat(70);
+        let bytes = mac_name_bytes(&long);
+        assert_eq!(bytes.len(), 63);
+        assert!(bytes.iter().all(|&b| b == 0x8E));
+        assert_eq!(mac_name_bytes("\u{65e5}"), b"?");
+    }
 
     #[test]
     fn test_sanitize_filename() {
