@@ -299,7 +299,12 @@ impl Importer {
                 .collect();
             self.dir_children.insert(parent_key.clone(), existing);
         }
-        if self.dir_children[&parent_key].contains(name) {
+        let taken = self.dir_children[&parent_key].contains(name)
+            || (efs.case_insensitive_lookup()
+                && self.dir_children[&parent_key]
+                    .iter()
+                    .any(|n| n.eq_ignore_ascii_case(name)));
+        if taken {
             match opts.conflict {
                 ImportConflict::Error => {
                     bail!("{display} already exists in the image (pass --force or --skip-existing)")
@@ -524,8 +529,9 @@ pub fn find_child(
     parent: &FileEntry,
     name: &str,
 ) -> Result<Option<FileEntry>> {
+    let fold_case = efs.case_insensitive_lookup();
     let children = efs
         .list_directory(parent)
         .map_err(|e| anyhow!("list_directory {}: {e}", parent.path))?;
-    Ok(children.into_iter().find(|c| c.name == name))
+    Ok(crate::fs::copy::select_child(&children, fold_case, name).cloned())
 }

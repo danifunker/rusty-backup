@@ -31,6 +31,7 @@ mod cli_literal_paths;
 mod cli_macplus_appleii;
 mod cli_native_slots;
 mod cli_provision;
+mod cli_put_case;
 mod cli_ql;
 mod cli_sgi_hdd;
 mod cli_show_partmap;

@@ -1485,10 +1485,6 @@ impl<R: Read + Seek + Send> Filesystem for NtfsFilesystem<R> {
         self.label.as_deref()
     }
 
-    fn case_insensitive_lookup(&self) -> bool {
-        true
-    }
-
     fn fs_type(&self) -> &str {
         &self.fs_type_string
     }

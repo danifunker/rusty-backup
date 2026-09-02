@@ -246,12 +246,16 @@ pub fn run_with_budget(
         bail!("parent is not a directory: {dst}");
     }
 
-    // Duplicate check so we can honor --force consistently.
-    let existing = fs
-        .list_directory(&parent)
-        .map_err(|e| anyhow!("list_directory: {e}"))?
-        .into_iter()
-        .find(|e| e.name == name);
+    // Duplicate check so we can honor --force consistently, matched the way
+    // the filesystem matches (FAT and friends ignore case).
+    let fold_case = fs.case_insensitive_lookup();
+    let existing = crate::fs::copy::select_child(
+        &fs.list_directory(&parent)
+            .map_err(|e| anyhow!("list_directory: {e}"))?,
+        fold_case,
+        &name,
+    )
+    .cloned();
     // Capture before the delete: afterwards there is nothing left to ask.
     // Everything the replaced file carried, not just its xattrs. A replace
     // writes new *contents*; it is not a request to reset permissions, owner,

@@ -169,11 +169,10 @@ pub trait Filesystem: Send {
         false
     }
 
-    /// Whether name lookup should fall back to case-insensitive matching, the
-    /// way the native OS resolves paths on this filesystem (NTFS today).
-    /// An exact-case match always wins first.
+    /// Whether name lookup falls back to case-insensitive matching, the way the
+    /// native OS resolves paths on this filesystem; an exact match wins first.
     fn case_insensitive_lookup(&self) -> bool {
-        false
+        folds_case(self.fs_type())
     }
 
     /// Whether this filesystem stores POSIX extended attributes (`user.*`,
@@ -750,4 +749,24 @@ pub trait EditableFilesystem: Filesystem {
             "create_hardlink not supported for this filesystem".into(),
         ))
     }
+}
+
+/// The filesystems whose drivers refuse `readme.txt` beside `README.TXT`, so a
+/// lookup that only matched exactly would see no conflict where they see one.
+pub fn folds_case(fs_type: &str) -> bool {
+    let t = fs_type;
+    t.starts_with("FAT")
+        || t == "exFAT"
+        || t.starts_with("NTFS")
+        || (t.starts_with("HFS") && t != "HFSX")
+        || t == "MFS"
+        || t.starts_with("HPFS")
+        || t == "ProDOS"
+        || t.starts_with("Human68k")
+        || t.starts_with("OFS")
+        || t.starts_with("FFS")
+        || t.starts_with("PFS")
+        || t == "AFS"
+        || t == "muPFS"
+        || t == "SFS"
 }
