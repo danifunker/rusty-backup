@@ -322,6 +322,32 @@ pub fn filetime_to_unix(ft: u64) -> Option<u64> {
 /// HFS/HFS+ modules (MFS uses the same epoch and lives elsewhere).
 const MAC_EPOCH_DELTA: u64 = 2_082_844_800;
 
+/// Seconds this host's local time is ahead of UTC, for the filesystems that
+/// store wall-clock time with no zone (classic HFS, MFS).
+pub fn local_utc_offset_secs() -> i64 {
+    chrono::Local::now().offset().local_minus_utc() as i64
+}
+
+/// Unix seconds to a classic-Mac local-time stamp: the wall clock the Mac shows.
+pub fn unix_to_mac_local(secs: u64) -> u32 {
+    let local = (secs as i64).saturating_add(local_utc_offset_secs()).max(0) as u64;
+    unix_to_mac_epoch(local)
+}
+
+/// A classic-Mac local-time stamp back to Unix seconds (UTC).
+pub fn mac_local_to_unix(mac_secs: u32) -> Option<u64> {
+    mac_epoch_to_unix(mac_secs).map(|local| {
+        (local as i64)
+            .saturating_sub(local_utc_offset_secs())
+            .max(0) as u64
+    })
+}
+
+/// The current wall clock as a classic-Mac local-time stamp.
+pub fn mac_local_now() -> u32 {
+    unix_to_mac_local(now())
+}
+
 /// Encode Unix seconds as a Mac epoch u32, clamping at both ends: a bogus
 /// future mtime on an extracted archive used to wrap into 1904..1970.
 pub fn unix_to_mac_epoch(secs: u64) -> u32 {

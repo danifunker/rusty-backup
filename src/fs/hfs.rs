@@ -1909,9 +1909,10 @@ impl<R: Read + Write + Seek> HfsFilesystem<R> {
         mtime_secs: Option<u64>,
     ) -> [u8; 102] {
         let mut rec = [0u8; 102];
+        // Classic HFS stores local wall-clock time, not UTC.
         let now = match mtime_secs {
-            Some(s) => super::times::unix_to_mac_epoch(s),
-            None => hfs_common::hfs_now(),
+            Some(s) => super::times::unix_to_mac_local(s),
+            None => super::times::mac_local_now(),
         };
         rec[0] = CATALOG_FILE as u8; // cdrType
                                      // rec[1] = reserved
@@ -1958,9 +1959,10 @@ impl<R: Read + Write + Seek> HfsFilesystem<R> {
     /// after-create Commander `set_dates` path still overrides both.
     fn build_dir_record_with_dates(dir_id: u32, mtime_secs: Option<u64>) -> [u8; 70] {
         let mut rec = [0u8; 70];
+        // Classic HFS stores local wall-clock time, not UTC.
         let now = match mtime_secs {
-            Some(s) => super::times::unix_to_mac_epoch(s),
-            None => hfs_common::hfs_now(),
+            Some(s) => super::times::unix_to_mac_local(s),
+            None => super::times::mac_local_now(),
         };
         rec[0] = CATALOG_DIR as u8; // cdrType
                                     // dirFlags at offset 2 (u16) = 0
@@ -2010,7 +2012,7 @@ impl<R: Read + Write + Seek> HfsFilesystem<R> {
             BigEndian::write_u32(&mut self.mdb.raw_sector[6..10], modify);
             BigEndian::write_u32(&mut self.mdb.raw_sector[64..68], backup);
         } else {
-            self.mdb.modify_date = hfs_common::hfs_now();
+            self.mdb.modify_date = super::times::mac_local_now();
         }
         if let Some(blocks) = self.pending_boot_blocks.take() {
             self.reader.seek(SeekFrom::Start(self.partition_offset))?;
@@ -2137,7 +2139,7 @@ impl<R: Read + Write + Seek> HfsFilesystem<R> {
         if self.mdb.next_catalog_id < 16 {
             self.mdb.next_catalog_id = 16;
         }
-        self.mdb.modify_date = hfs_common::hfs_now();
+        self.mdb.modify_date = super::times::mac_local_now();
 
         self.write_volume_bitmap()?;
         self.write_mdb()?;
@@ -2805,7 +2807,7 @@ impl<R: Read + Seek + Send> Filesystem for HfsFilesystem<R> {
                     };
                     let mut fe = FileEntry::new_directory(name, path, dir_id as u64);
                     fe.modified = hfs_common::format_mac_date(dates.1);
-                    fe.modified_unix = hfs_common::mac_date_to_unix(dates.1);
+                    fe.modified_unix = super::times::mac_local_to_unix(dates.1);
                     fe.mac_dates = Some(dates);
                     entries.push(fe);
                 }
@@ -2831,7 +2833,7 @@ impl<R: Read + Seek + Send> Filesystem for HfsFilesystem<R> {
                     fe.creator_code = Some(creator_code);
                     fe.finder_flags = Some(finder_flags);
                     fe.modified = hfs_common::format_mac_date(dates.1);
-                    fe.modified_unix = hfs_common::mac_date_to_unix(dates.1);
+                    fe.modified_unix = super::times::mac_local_to_unix(dates.1);
                     fe.mac_dates = Some(dates);
                     if rsrc_size > 0 {
                         fe.resource_fork_size = Some(rsrc_size as u64);
@@ -3145,8 +3147,8 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
             let stamped = mtime.unwrap_or_else(super::times::now);
             fe.modified_unix = Some(stamped);
             fe.mac_dates = Some((
-                super::times::unix_to_mac_epoch(stamped),
-                super::times::unix_to_mac_epoch(stamped),
+                super::times::unix_to_mac_local(stamped),
+                super::times::unix_to_mac_local(stamped),
                 0,
             ));
             Ok(fe)
@@ -3217,8 +3219,8 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
             let stamped = mtime.unwrap_or_else(super::times::now);
             fe.modified_unix = Some(stamped);
             fe.mac_dates = Some((
-                super::times::unix_to_mac_epoch(stamped),
-                super::times::unix_to_mac_epoch(stamped),
+                super::times::unix_to_mac_local(stamped),
+                super::times::unix_to_mac_local(stamped),
                 0,
             ));
             Ok(fe)
@@ -4419,6 +4421,39 @@ mod tests {
 
     /// H13: the shrink guard compared block counts, so a volume with free
     /// space at its front and one file at its tail could be cut through.
+    /// H10: classic HFS keeps wall-clock local time, but stamps went out as
+    /// UTC and came back shifted by the zone offset on every read.
+    #[test]
+    fn classic_hfs_stamps_are_local_time_and_round_trip_to_utc() {
+        use crate::fs::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+        use crate::fs::times::{local_utc_offset_secs, unix_to_mac_epoch, UnixTimes};
+        const T: u64 = 1_700_000_000; // 2023-11-14 22:13:20 UTC
+        let mut img = create_blank_hfs(4 * 1024 * 1024, 4096, "Zone").unwrap();
+        let mut fs = HfsFilesystem::open(Cursor::new(&mut img), 0).unwrap();
+        let root = fs.root().unwrap();
+        let opts = CreateFileOptions {
+            unix_times: Some(UnixTimes::mtime_only(T)),
+            ..Default::default()
+        };
+        fs.create_file(&root, "stamp", &mut &b"x"[..], 1, &opts)
+            .unwrap();
+        fs.sync_metadata().unwrap();
+        let entry = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "stamp")
+            .unwrap();
+        assert_eq!(entry.modified_unix, Some(T), "UTC must round-trip");
+        let raw = entry.mac_dates.expect("raw Mac dates").1;
+        let expected = (T as i64 + local_utc_offset_secs()) as u64;
+        assert_eq!(
+            raw,
+            unix_to_mac_epoch(expected),
+            "on disk it is the local wall clock"
+        );
+    }
+
     #[test]
     fn shrink_is_refused_when_data_sits_past_the_new_end() {
         use crate::fs::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};

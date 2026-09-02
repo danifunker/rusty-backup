@@ -1065,7 +1065,7 @@ impl<R: Read + Seek + Send> Filesystem for MfsFilesystem<R> {
                 fe.resource_fork_size = Some(de.rsrc_logical_length as u64);
             }
             // MFS dates share HFS's Mac-epoch encoding.
-            fe.modified_unix = super::times::mac_epoch_to_unix(de.modify_date);
+            fe.modified_unix = super::times::mac_local_to_unix(de.modify_date);
             if de.modify_date != 0 || de.create_date != 0 {
                 fe.mac_dates = Some((de.create_date, de.modify_date, 0));
                 if let Some(s) = super::hfs_common::format_mac_date(de.modify_date) {
@@ -1246,7 +1246,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for MfsFilesystem<R> {
             .unix_times
             .map(|t| t.mtime_or_now())
             .unwrap_or_else(super::times::now);
-        let stamp = super::times::unix_to_mac_epoch(mtime_secs);
+        let stamp = super::times::unix_to_mac_local(mtime_secs);
         let entry = MfsDirEntry {
             flags: 0x80, // in use, not locked
             finder_info,
