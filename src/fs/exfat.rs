@@ -1159,7 +1159,7 @@ impl<R: Read + Write + Seek> ExfatFilesystem<R> {
             parent.location as u32
         };
 
-        let dir_data = self.read_cluster_chain(parent_cluster, None)?;
+        let dir_data = self.read_entry_data(parent_cluster, None)?;
         let entries_needed = entry_bytes.len() / 32;
 
         // Find a run of free slots (type 0x00 or deleted entries with InUse bit clear)
@@ -1177,10 +1177,8 @@ impl<R: Read + Write + Seek> ExfatFilesystem<R> {
                 } else {
                     run_count += 1;
                 }
-                // If this is end-of-directory (0x00), all remaining slots are free too
+                // End of directory: everything from here on is free.
                 if t == 0x00 {
-                    let remaining_slots = (dir_data.len() - pos) / 32;
-                    run_count = run_count + remaining_slots - 1; // -1 since we already counted this one
                     break;
                 }
                 if run_count >= entries_needed {
@@ -1193,78 +1191,148 @@ impl<R: Read + Write + Seek> ExfatFilesystem<R> {
             pos += 32;
         }
 
-        if run_count >= entries_needed {
-            // Write entry set at run_start position
-            let start = run_start.unwrap();
-            let cluster_offset_in_chain = start / self.cluster_size as usize;
-            let offset_in_cluster = start % self.cluster_size as usize;
-
-            // Walk to the right cluster
-            let mut cluster = parent_cluster;
-            for _ in 0..cluster_offset_in_chain {
-                match self.next_cluster(cluster)? {
-                    Some(next) => cluster = next,
-                    None => {
-                        return Err(FilesystemError::InvalidData(
-                            "directory chain shorter than expected".into(),
-                        ))
-                    }
-                }
-            }
-
-            // Write the entry bytes, potentially spanning clusters
-            let mut written = 0;
-            let mut cur_cluster = cluster;
-            let mut cur_offset = offset_in_cluster;
-            while written < entry_bytes.len() {
-                let avail = self.cluster_size as usize - cur_offset;
-                let to_write = avail.min(entry_bytes.len() - written);
-                let disk_offset = self.cluster_offset(cur_cluster) + cur_offset as u64;
-                self.reader.seek(SeekFrom::Start(disk_offset))?;
-                self.reader
-                    .write_all(&entry_bytes[written..written + to_write])?;
-                written += to_write;
-                cur_offset = 0;
-                if written < entry_bytes.len() {
-                    match self.next_cluster(cur_cluster)? {
-                        Some(next) => cur_cluster = next,
-                        None => {
-                            return Err(FilesystemError::InvalidData(
-                                "directory chain too short for entry".into(),
-                            ))
-                        }
-                    }
-                }
-            }
-
-            // If we overwrote end-of-directory markers, ensure there's a 0x00 terminator after
-            let end_pos = start + entry_bytes.len();
-            if end_pos < dir_data.len() && dir_data[end_pos] != 0x00 {
-                // The next slot should already be 0x00 or another entry; only set if needed
-            }
-        } else {
-            // Need to extend directory: allocate a new cluster
-            let new_cluster = self.allocate_clusters(1)?;
-            // Zero the new cluster
-            let zeroed = vec![0u8; self.cluster_size as usize];
-            self.write_cluster_data(new_cluster, &zeroed)?;
-
-            // Append to chain: walk to last cluster
-            let mut last = parent_cluster;
-            while let Some(next) = self.next_cluster(last)? {
-                last = next;
-            }
-            // Link last -> new_cluster
-            self.write_fat_entry(last, new_cluster)?;
-            self.write_fat_entry(new_cluster, 0xFFFFFFFF)?;
-
-            // Write entry set at the start of the new cluster
-            let disk_offset = self.cluster_offset(new_cluster);
-            self.reader.seek(SeekFrom::Start(disk_offset))?;
-            self.reader.write_all(entry_bytes)?;
+        // The set goes at the free run's start and the directory grows under
+        // it: a set placed past an end-of-directory slot is invisible.
+        let start = run_start.unwrap_or(dir_data.len());
+        let mut have = dir_data.len() - start;
+        while have < entry_bytes.len() {
+            self.grow_directory(parent, parent_cluster)?;
+            have += self.cluster_size as usize;
         }
+        self.write_dir_bytes(parent_cluster, start, entry_bytes)
+    }
 
+    /// Write `bytes` at byte `pos` of a directory, crossing cluster boundaries.
+    fn write_dir_bytes(
+        &mut self,
+        dir_cluster: u32,
+        pos: usize,
+        bytes: &[u8],
+    ) -> Result<(), FilesystemError> {
+        let cs = self.cluster_size as usize;
+        let mut written = 0;
+        while written < bytes.len() {
+            let at = pos + written;
+            let to_write = (cs - at % cs).min(bytes.len() - written);
+            let disk_offset = self.dir_byte_offset(dir_cluster, at)?;
+            self.reader.seek(SeekFrom::Start(disk_offset))?;
+            self.reader.write_all(&bytes[written..written + to_write])?;
+            written += to_write;
+        }
         Ok(())
+    }
+
+    /// Disk offset of byte `pos` of a directory, by contiguous run or FAT chain.
+    fn dir_byte_offset(&mut self, dir_cluster: u32, pos: usize) -> Result<u64, FilesystemError> {
+        let cs = self.cluster_size as usize;
+        let (hop, within) = (pos / cs, pos % cs);
+        if self.no_fat_chain.contains_key(&dir_cluster) {
+            return Ok(self.cluster_offset(dir_cluster + hop as u32) + within as u64);
+        }
+        let mut cluster = dir_cluster;
+        for _ in 0..hop {
+            cluster = self.next_cluster(cluster)?.ok_or_else(|| {
+                FilesystemError::InvalidData("directory chain shorter than expected".into())
+            })?;
+        }
+        Ok(self.cluster_offset(cluster) + within as u64)
+    }
+
+    /// A directory's size in bytes and its last cluster: the contiguous run
+    /// its entry declares, or its FAT chain.
+    fn directory_extent(&mut self, dir_cluster: u32) -> Result<(u64, u32), FilesystemError> {
+        let cs = self.cluster_size;
+        if let Some(&len) = self.no_fat_chain.get(&dir_cluster) {
+            let n = len.div_ceil(cs).max(1);
+            return Ok((n * cs, dir_cluster + n as u32 - 1));
+        }
+        let mut n = 1u64;
+        let mut last = dir_cluster;
+        while let Some(next) = self.next_cluster(last)? {
+            if n > self.cluster_count as u64 {
+                return Err(FilesystemError::InvalidData(
+                    "directory FAT chain loops".into(),
+                ));
+            }
+            last = next;
+            n += 1;
+        }
+        Ok((n * cs, last))
+    }
+
+    /// Add a cluster to a directory: a contiguous run becomes a FAT chain,
+    /// and the directory's own entry learns the size Windows will list to.
+    fn grow_directory(&mut self, dir: &FileEntry, dir_cluster: u32) -> Result<(), FilesystemError> {
+        let cs = self.cluster_size;
+        let (old_len, last) = self.directory_extent(dir_cluster)?;
+        let new_cluster = self.allocate_clusters(1)?;
+        self.write_cluster_data(new_cluster, &vec![0u8; cs as usize])?;
+        if self.no_fat_chain.remove(&dir_cluster).is_some() {
+            // The FAT held nothing for the run; write its chain now.
+            for c in dir_cluster..last {
+                self.write_fat_entry(c, c + 1)?;
+            }
+        }
+        self.write_fat_entry(last, new_cluster)?;
+        if dir.path != "/" {
+            self.set_directory_entry_length(dir, dir_cluster, old_len + cs)?;
+        }
+        Ok(())
+    }
+
+    /// Rewrite a directory's entry in its parent as a FAT chain of `len` bytes.
+    fn set_directory_entry_length(
+        &mut self,
+        dir: &FileEntry,
+        dir_cluster: u32,
+        len: u64,
+    ) -> Result<(), FilesystemError> {
+        let parent_cluster = self.parent_cluster_of(&dir.path)?;
+        let data = self.read_entry_data(parent_cluster, None)?;
+        let mut pos = 0;
+        while pos + 64 <= data.len() && data[pos] != 0x00 {
+            if data[pos] != ENTRY_TYPE_FILE || data[pos + 32] != ENTRY_TYPE_STREAM_EXT {
+                pos += 32;
+                continue;
+            }
+            let set_len = 32 * (1 + data[pos + 1] as usize);
+            let first = u32::from_le_bytes([
+                data[pos + 52],
+                data[pos + 53],
+                data[pos + 54],
+                data[pos + 55],
+            ]);
+            if first != dir_cluster || pos + set_len > data.len() {
+                pos += set_len;
+                continue;
+            }
+            let mut set = data[pos..pos + set_len].to_vec();
+            set[33] &= !0x02;
+            set[40..48].copy_from_slice(&len.to_le_bytes());
+            set[56..64].copy_from_slice(&len.to_le_bytes());
+            let sum = Self::entry_set_checksum(&set);
+            set[2..4].copy_from_slice(&sum.to_le_bytes());
+            return self.write_dir_bytes(parent_cluster, pos, &set[..64]);
+        }
+        Err(FilesystemError::NotFound(dir.path.clone()))
+    }
+
+    /// First cluster of the directory that holds `path`'s own entry.
+    fn parent_cluster_of(&mut self, path: &str) -> Result<u32, FilesystemError> {
+        let mut parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+        parts.pop();
+        let mut cluster = self.root_cluster;
+        let mut here = "/".to_string();
+        for part in parts {
+            let child = self
+                .parse_directory(cluster, &here)?
+                .into_iter()
+                .find(|c| c.is_directory() && c.name == part)
+                .ok_or_else(|| FilesystemError::NotFound(path.to_string()))?;
+            cluster = child.location as u32;
+            here = child.path;
+        }
+        Ok(cluster)
     }
 
     /// Remove an entry set from a directory by clearing InUse bits.
@@ -1279,7 +1347,7 @@ impl<R: Read + Write + Seek> ExfatFilesystem<R> {
             parent.location as u32
         };
 
-        let dir_data = self.read_cluster_chain(parent_cluster, None)?;
+        let dir_data = self.read_entry_data(parent_cluster, None)?;
 
         // Find the entry set by matching name
         let mut pos = 0;
@@ -1321,20 +1389,7 @@ impl<R: Read + Write + Seek> ExfatFilesystem<R> {
                         let total = 1 + secondary_count;
                         for i in 0..total {
                             let entry_pos = pos + i * 32;
-                            // Calculate which cluster and offset
-                            let cluster_idx = entry_pos / self.cluster_size as usize;
-                            let offset_in_cluster = entry_pos % self.cluster_size as usize;
-
-                            let mut cluster = parent_cluster;
-                            for _ in 0..cluster_idx {
-                                match self.next_cluster(cluster)? {
-                                    Some(next) => cluster = next,
-                                    None => break,
-                                }
-                            }
-
-                            let disk_offset =
-                                self.cluster_offset(cluster) + offset_in_cluster as u64;
+                            let disk_offset = self.dir_byte_offset(parent_cluster, entry_pos)?;
                             self.reader.seek(SeekFrom::Start(disk_offset))?;
                             let mut type_byte = [0u8; 1];
                             self.reader.read_exact(&mut type_byte)?;
@@ -1418,7 +1473,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExfatFilesystem<R> {
         } else {
             parent.location as u32
         };
-        let dir_data = self.read_cluster_chain(parent_cluster, None)?;
+        let dir_data = self.read_entry_data(parent_cluster, None)?;
         if Self::name_exists_in_dir(&dir_data, name) {
             return Err(FilesystemError::AlreadyExists(name.to_string()));
         }
@@ -1497,7 +1552,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExfatFilesystem<R> {
         } else {
             parent.location as u32
         };
-        let dir_data = self.read_cluster_chain(parent_cluster, None)?;
+        let dir_data = self.read_entry_data(parent_cluster, None)?;
         if Self::name_exists_in_dir(&dir_data, name) {
             return Err(FilesystemError::AlreadyExists(name.to_string()));
         }
@@ -1509,7 +1564,9 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExfatFilesystem<R> {
 
         // Build entry set with directory attribute
         let mtime = options.unix_times.map(|t| t.mtime_or_now());
-        let entry_bytes = Self::build_entry_set(name, ATTR_DIRECTORY, new_cluster, 0, mtime);
+        // A directory's DataLength is its size; Windows lists only that far.
+        let entry_bytes =
+            Self::build_entry_set(name, ATTR_DIRECTORY, new_cluster, self.cluster_size, mtime);
         self.add_entry_to_directory(parent, &entry_bytes)?;
 
         let path = if parent.path == "/" {
@@ -1568,7 +1625,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExfatFilesystem<R> {
         } else {
             parent.location as u32
         };
-        let dir_data = self.read_cluster_chain(parent_cluster, None)?;
+        let dir_data = self.read_entry_data(parent_cluster, None)?;
 
         // Reject a collision with a *different* entry. exFAT names are
         // case-insensitive, so a case-only self-rename ("readme" ->
@@ -1588,8 +1645,14 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExfatFilesystem<R> {
         } else {
             entry.dos_attributes.map(|a| a & 0x27).unwrap_or(0x20)
         };
+        // The listing says 0 for a directory; its entry must keep the real size.
+        let size = if entry.is_directory() && entry.location >= 2 {
+            self.directory_extent(entry.location as u32)?.0
+        } else {
+            entry.size
+        };
         let mut entry_bytes =
-            Self::build_entry_set(new_name, attrs, entry.location as u32, entry.size, None);
+            Self::build_entry_set(new_name, attrs, entry.location as u32, size, None);
         // A contiguous file has no FAT chain to fall back on; dropping the
         // flag truncated it to one cluster for every reader, Windows included.
         if self.no_fat_chain.contains_key(&(entry.location as u32)) {
@@ -3164,6 +3227,124 @@ mod tests {
         assert!(entries
             .iter()
             .any(|e| e.name == "subdir" && e.is_directory()));
+    }
+
+    /// Windows writes a fresh directory as a contiguous run and lists it only
+    /// as far as its DataLength says, so growth has to write a FAT chain and
+    /// update that entry, and a set must never land past an end marker (D9).
+    #[test]
+    fn exfat_directory_growth_keeps_windows_in_step() {
+        let template = super::ExfatFormatTemplate {
+            bytes_per_sector: 512,
+            sectors_per_cluster: 8,
+            label: Some("D9".to_string()),
+        };
+        let mut cur = Cursor::new(Vec::<u8>::new());
+        super::create_blank_exfat(&mut cur, &template, 16 * 1024 * 1024).unwrap();
+        let mut image = cur.into_inner();
+        let cs = 4096u64;
+        let find_set = |data: &[u8], cluster: u32| {
+            (0..data.len() - 96).step_by(32).find(|&p| {
+                data[p] == ENTRY_TYPE_FILE
+                    && data[p + 32] == ENTRY_TYPE_STREAM_EXT
+                    && u32::from_le_bytes([data[p + 52], data[p + 53], data[p + 54], data[p + 55]])
+                        == cluster
+            })
+        };
+        let (dir_cluster, root_cluster) = {
+            let mut fs = open_test_exfat(&mut image);
+            let root = fs.root().unwrap();
+            let dir = fs
+                .create_directory(&root, "win", &CreateDirectoryOptions::default())
+                .unwrap();
+            (dir.location as u32, fs.root_cluster)
+        };
+        // Reshape "win" the way Windows writes it: NoFatChain, nothing in the FAT.
+        {
+            let mut fs = open_test_exfat(&mut image);
+            let data = fs.read_cluster_chain(root_cluster, None).unwrap();
+            let pos = find_set(&data, dir_cluster).expect("win's entry set");
+            let mut set = data[pos..pos + 96].to_vec();
+            let recorded = u64::from_le_bytes(set[56..64].try_into().unwrap());
+            assert_eq!(recorded, cs, "a new directory records its size");
+            set[33] |= 0x02;
+            let sum = ExfatFilesystem::<Cursor<&mut Vec<u8>>>::entry_set_checksum(&set);
+            set[2..4].copy_from_slice(&sum.to_le_bytes());
+            fs.write_dir_bytes(root_cluster, pos, &set).unwrap();
+            fs.write_fat_entry(dir_cluster, 0).unwrap();
+        }
+        // 45 three-slot sets need 4320 bytes: the 43rd spills past the cluster.
+        {
+            let mut fs = open_test_exfat(&mut image);
+            let root = fs.root().unwrap();
+            let dir = fs
+                .list_directory(&root)
+                .unwrap()
+                .into_iter()
+                .find(|e| e.name == "win")
+                .unwrap();
+            assert_eq!(fs.no_fat_chain.get(&dir_cluster), Some(&cs));
+            for i in 0..45 {
+                fs.create_file(
+                    &dir,
+                    &format!("f{i:02}.txt"),
+                    &mut Cursor::new(Vec::new()),
+                    0,
+                    &CreateFileOptions::default(),
+                )
+                .unwrap();
+            }
+            fs.sync_metadata().unwrap();
+        }
+        let mut fs = open_test_exfat(&mut image);
+        let root = fs.root().unwrap();
+        let dir = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "win")
+            .unwrap();
+        let listed = fs.list_directory(&dir).unwrap();
+        assert_eq!(listed.len(), 45, "every file listed after a reopen");
+        assert!(
+            !fs.no_fat_chain.contains_key(&dir_cluster),
+            "a FAT chain now"
+        );
+        assert_eq!(fs.directory_extent(dir_cluster).unwrap().0, 2 * cs);
+        let data = fs.read_cluster_chain(root_cluster, None).unwrap();
+        let pos = find_set(&data, dir_cluster).unwrap();
+        let recorded = u64::from_le_bytes(data[pos + 56..pos + 64].try_into().unwrap());
+        assert_eq!((recorded, data[pos + 33] & 0x02), (2 * cs, 0));
+        let report = fs.fsck().unwrap().unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+
+        // The tail cluster is a working part of the directory: delete and
+        // rename there, then rename the directory itself without losing its size.
+        let tail = listed.iter().find(|e| e.name == "f44.txt").unwrap();
+        fs.delete_entry(&dir, tail).unwrap();
+        let tail = listed.iter().find(|e| e.name == "f43.txt").unwrap();
+        fs.rename(&dir, tail, "moved.txt").unwrap();
+        fs.rename(&root, &dir, "win2").unwrap();
+        let mut fs = open_test_exfat(&mut image);
+        let root = fs.root().unwrap();
+        let dir = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "win2")
+            .unwrap();
+        let names: Vec<String> = fs
+            .list_directory(&dir)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names.len(), 44, "{names:?}");
+        assert!(names.contains(&"moved.txt".to_string()));
+        assert!(!names.contains(&"f44.txt".to_string()));
+        assert_eq!(fs.directory_extent(dir_cluster).unwrap().0, 2 * cs);
+        let report = fs.fsck().unwrap().unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
     }
 
     #[test]
