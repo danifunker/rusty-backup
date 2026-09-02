@@ -472,6 +472,15 @@ pub fn reconstruct_disk_from_backup(
         if !partition_sizes.is_empty() {
             patch_mbr_entries(&mut mbr_buf, partition_sizes);
             log_cb("Patched MBR partition table with export sizes");
+            for index in crate::partition::mbr::clear_orphan_entries_overlapping(
+                &mut mbr_buf,
+                partition_sizes,
+            ) {
+                log_cb(&format!(
+                    "Warning: MBR entry {index} was not part of this backup and the new layout \
+                     overwrites its sectors; the entry has been removed"
+                ));
+            }
         }
         log_cb("Writing MBR to disk...");
         writer.write_all(&mbr_buf).context("failed to write MBR")?;

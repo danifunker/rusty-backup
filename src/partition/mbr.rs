@@ -256,6 +256,41 @@ pub fn parse_ebr_chain(
 
 use super::PartitionSizeOverride;
 
+/// Zero every primary entry that the backup did not carry and that the new
+/// layout now runs over, returning their indices. An entry left alone is one
+/// the layout does not touch (a subset restored onto its original disk).
+pub fn clear_orphan_entries_overlapping(
+    mbr: &mut [u8; 512],
+    overrides: &[PartitionSizeOverride],
+) -> Vec<usize> {
+    let placed: Vec<(u64, u64)> = overrides
+        .iter()
+        .filter(|ps| ps.index <= 3)
+        .map(|ps| {
+            let start = ps.effective_start_lba();
+            (start, start + ps.export_size / 512)
+        })
+        .collect();
+    let mut cleared = Vec::new();
+    for index in 0..4 {
+        if overrides.iter().any(|ps| ps.index == index) {
+            continue;
+        }
+        let off = PARTITION_TABLE_OFFSET + index * PARTITION_ENTRY_SIZE;
+        let entry = &mbr[off..off + PARTITION_ENTRY_SIZE];
+        if entry[4] == 0 {
+            continue;
+        }
+        let start = u32::from_le_bytes([entry[8], entry[9], entry[10], entry[11]]) as u64;
+        let end = start + u32::from_le_bytes([entry[12], entry[13], entry[14], entry[15]]) as u64;
+        if placed.iter().any(|&(s, e)| start < e && s < end) {
+            mbr[off..off + PARTITION_ENTRY_SIZE].fill(0);
+            cleared.push(index);
+        }
+    }
+    cleared
+}
+
 /// Patch MBR partition table entries with new start_lba, total_sectors, and
 /// optionally CHS values.
 ///

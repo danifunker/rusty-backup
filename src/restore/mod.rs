@@ -1634,6 +1634,16 @@ fn run_single_file_chd_restore_resize(
             .read_exact(&mut mbr)
             .context("failed to read MBR from CHD")?;
         patch_mbr_entries(&mut mbr, &overrides);
+        for index in crate::partition::mbr::clear_orphan_entries_overlapping(&mut mbr, &overrides) {
+            log(
+                &progress,
+                LogLevel::Warning,
+                format!(
+                    "MBR entry {index} was not part of this backup and the new layout \
+                     overwrites its sectors; the entry has been removed"
+                ),
+            );
+        }
 
         // If the source had logical partitions, rebuild the EBR chain so
         // it reflects the new sizes/positions. The CHD only carries each
@@ -2934,6 +2944,74 @@ mod tests {
         assert!(!repack_hint(&RestoreAlignment::Original).is_empty());
         assert!(repack_hint(&RestoreAlignment::Modern1MB).is_empty());
         assert!(repack_hint(&RestoreAlignment::Custom(16)).is_empty());
+    }
+
+    /// BR11: a backup of partitions 0 and 2 restored with 1 MB alignment packs
+    /// them from LBA 2048, straight across the range entry 1 still describes.
+    #[test]
+    fn a_repacked_subset_restore_drops_the_orphan_entry_it_runs_over() {
+        const MIB: u64 = 1024 * 1024;
+        let mut parts = vec![
+            apm_part(0, 63, 100 * MIB, 100 * MIB),
+            apm_part(2, 63 + 300 * MIB / 512, 100 * MIB, 100 * MIB),
+        ];
+        for p in &mut parts {
+            p.partition_type_byte = 0x0C;
+            p.partition_type_string = None;
+            p.compacted = false;
+        }
+        let mut metadata = apm_metadata(parts, 512 * MIB);
+        metadata.partition_table_type = "MBR".to_string();
+        metadata.alignment.first_partition_lba = 63;
+        metadata.alignment.alignment_sectors = 63;
+        let overrides =
+            calculate_restore_layout(&metadata, &RestoreAlignment::Modern1MB, &[], 512 * MIB)
+                .unwrap();
+        let mut mbr = [0u8; 512];
+        mbr[510] = 0x55;
+        mbr[511] = 0xAA;
+        for (slot, (start, sectors)) in [
+            (63u32, (100 * MIB / 512) as u32),
+            (63 + (100 * MIB / 512) as u32, (200 * MIB / 512) as u32),
+            (63 + (300 * MIB / 512) as u32, (100 * MIB / 512) as u32),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let off = 446 + slot * 16;
+            mbr[off + 4] = 0x0C;
+            mbr[off + 8..off + 12].copy_from_slice(&start.to_le_bytes());
+            mbr[off + 12..off + 16].copy_from_slice(&sectors.to_le_bytes());
+        }
+        patch_mbr_entries(&mut mbr, &overrides);
+        let cleared = crate::partition::mbr::clear_orphan_entries_overlapping(&mut mbr, &overrides);
+        assert_eq!(cleared, vec![1]);
+        let entries: Vec<(u64, u64)> = (0..4)
+            .filter(|i| mbr[446 + i * 16 + 4] != 0)
+            .map(|i| {
+                let off = 446 + i * 16;
+                let s = u32::from_le_bytes(mbr[off + 8..off + 12].try_into().unwrap()) as u64;
+                let n = u32::from_le_bytes(mbr[off + 12..off + 16].try_into().unwrap()) as u64;
+                (s, s + n)
+            })
+            .collect();
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        for (i, a) in entries.iter().enumerate() {
+            for b in &entries[i + 1..] {
+                assert!(a.1 <= b.0 || b.1 <= a.0, "overlap: {entries:?}");
+            }
+        }
+        // An entry the layout never reaches is left alone: the same subset put
+        // back on its original disk keeps whatever still lives after it.
+        let mut beyond = [0u8; 512];
+        beyond[446 + 3 * 16 + 4] = 0x0C;
+        beyond[446 + 3 * 16 + 8..446 + 3 * 16 + 12].copy_from_slice(&900_000u32.to_le_bytes());
+        beyond[446 + 3 * 16 + 12..446 + 3 * 16 + 16].copy_from_slice(&100_000u32.to_le_bytes());
+        assert!(
+            crate::partition::mbr::clear_orphan_entries_overlapping(&mut beyond, &overrides)
+                .is_empty()
+        );
+        assert_eq!(beyond[446 + 3 * 16 + 4], 0x0C);
     }
 
     fn build_test_mbr(part_sectors: u32) -> [u8; 512] {
