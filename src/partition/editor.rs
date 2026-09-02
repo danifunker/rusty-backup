@@ -954,6 +954,12 @@ fn apply_solaris_x86_edits(
     let resolve = |raw: usize| -> Result<usize> {
         if label.browsable_slices().any(|(i, _)| i == raw) {
             Ok(raw)
+        } else if raw >= crate::partition::SOLARIS_MBR_INDEX_BASE {
+            // Indexes past the slices are the disk's other MBR entries.
+            anyhow::bail!(
+                "Solaris x86 VTOC: partition {raw} is an MBR entry outside the Solaris \
+                 partition, not a slice; only the VTOC slices are editable here"
+            )
         } else {
             anyhow::bail!("Solaris x86 VTOC: slice {raw} is not a listed slice")
         }

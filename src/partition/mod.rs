@@ -880,6 +880,79 @@ pub fn is_known_layout(expected: &str) -> bool {
                 .any(|(a, _)| normalise_layout(a) == want))
 }
 
+/// The MBR's own entries: primaries at their slot (0-3), EBR logicals from 4.
+fn mbr_partitions(mbr: &Mbr) -> Vec<PartitionInfo> {
+    let mut result: Vec<PartitionInfo> = mbr
+        .entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| !e.is_empty())
+        .map(|(i, e)| PartitionInfo {
+            index: i,
+            type_name: e.partition_type_name().to_string(),
+            partition_type_byte: e.partition_type,
+            start_lba: e.start_lba as u64,
+            start_byte: None,
+            size_bytes: e.size_bytes(),
+            bootable: e.bootable,
+            is_logical: false,
+            is_extended_container: e.is_extended(),
+            partition_type_string: None,
+            hfs_block_size: None,
+            rdb_part_block: None,
+            drv_name: None,
+        })
+        .collect();
+
+    // Append logical partitions from EBR chain (index 4+)
+    for (j, e) in mbr.logical_partitions.iter().enumerate() {
+        result.push(PartitionInfo {
+            index: 4 + j,
+            type_name: e.partition_type_name().to_string(),
+            partition_type_byte: e.partition_type,
+            start_lba: e.start_lba as u64,
+            start_byte: None,
+            size_bytes: e.size_bytes(),
+            bootable: e.bootable,
+            is_logical: true,
+            is_extended_container: false,
+            partition_type_string: None,
+            hfs_block_size: None,
+            rdb_part_block: None,
+            drv_name: None,
+        });
+    }
+
+    result
+}
+
+/// Where the non-Solaris MBR entries index on a Solaris x86 disk (slices own 0-15).
+pub const SOLARIS_MBR_INDEX_BASE: usize = 16;
+
+/// The VTOC slices as partitions; `index` is the slice number.
+fn solaris_slice_partitions(label: &SolarisX86Label) -> Vec<PartitionInfo> {
+    label
+        .browsable_slices()
+        .map(|(i, s)| PartitionInfo {
+            index: i,
+            // Solaris slices are UFS; leave the type byte at 0 so
+            // `open_filesystem` finds the superblock itself.
+            type_name: format!("Solaris s{i} ({})", s.tag_name()),
+            partition_type_byte: 0,
+            start_lba: s.start_sector,
+            start_byte: None,
+            size_bytes: s.size_bytes(),
+            bootable: s.tag == 2,
+            is_logical: false,
+            is_extended_container: false,
+            partition_type_string: None,
+            hfs_block_size: None,
+            rdb_part_block: None,
+            drv_name: None,
+        })
+        .collect()
+}
+
 impl PartitionTable {
     /// Detect and parse the partition table from a readable+seekable source.
     pub fn detect(reader: &mut (impl Read + Seek)) -> Result<Self, RustyBackupError> {
@@ -1131,17 +1204,6 @@ impl PartitionTable {
                 }
             }
         } else {
-            // Solaris x86 nests a VTOC inside an MBR partition. Probe before
-            // the EBR walk so a Solaris disk surfaces slices rather than a
-            // single opaque "Linux swap" entry (0x82 is shared with swap, so
-            // the VTOC's own sanity word is what decides).
-            if let Some(label) = solaris_x86::detect(reader, &mbr) {
-                return Ok(PartitionTable::SolarisX86 { mbr, label });
-            }
-            reader
-                .seek(SeekFrom::Start(0))
-                .map_err(RustyBackupError::Io)?;
-
             // Parse EBR chain for any extended partition entries
             for entry in &mbr.entries {
                 if entry.is_extended() && !entry.is_empty() {
@@ -1155,6 +1217,13 @@ impl PartitionTable {
                     }
                     break; // Only one extended partition is valid per MBR
                 }
+            }
+
+            // Solaris x86 nests a VTOC inside an MBR partition (0x82 is shared
+            // with swap, so the VTOC's own sanity word decides). The disk keeps
+            // its logicals either way, so the EBR walk came first.
+            if let Some(label) = solaris_x86::detect(reader, &mbr) {
+                return Ok(PartitionTable::SolarisX86 { mbr, label });
             }
             Ok(PartitionTable::Mbr(mbr))
         }
@@ -1177,9 +1246,11 @@ impl PartitionTable {
             PartitionTable::Rdb(_) => Some(raw),
             // NeXTSTEP names slots by letter; the number behind `a` is 0.
             PartitionTable::Next(_) => Some(raw),
-            // Solaris `format(1M)` numbers slices from 0; `index` already is
-            // the slice number because the browse list keeps VTOC positions.
-            PartitionTable::SolarisX86 { .. } => Some(raw),
+            // Solaris `format(1M)` numbers slices from 0 and `index` keeps the
+            // VTOC position; the MBR entries listed after them have no `sN`.
+            PartitionTable::SolarisX86 { .. } => {
+                (raw < SOLARIS_MBR_INDEX_BASE as u32).then_some(raw)
+            }
             _ => None,
         }
     }
@@ -1203,50 +1274,7 @@ impl PartitionTable {
     /// Get a unified list of partition info for display.
     pub fn partitions(&self) -> Vec<PartitionInfo> {
         match self {
-            PartitionTable::Mbr(mbr) => {
-                let mut result: Vec<PartitionInfo> = mbr
-                    .entries
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, e)| !e.is_empty())
-                    .map(|(i, e)| PartitionInfo {
-                        index: i,
-                        type_name: e.partition_type_name().to_string(),
-                        partition_type_byte: e.partition_type,
-                        start_lba: e.start_lba as u64,
-                        start_byte: None,
-                        size_bytes: e.size_bytes(),
-                        bootable: e.bootable,
-                        is_logical: false,
-                        is_extended_container: e.is_extended(),
-                        partition_type_string: None,
-                        hfs_block_size: None,
-                        rdb_part_block: None,
-                        drv_name: None,
-                    })
-                    .collect();
-
-                // Append logical partitions from EBR chain (index 4+)
-                for (j, e) in mbr.logical_partitions.iter().enumerate() {
-                    result.push(PartitionInfo {
-                        index: 4 + j,
-                        type_name: e.partition_type_name().to_string(),
-                        partition_type_byte: e.partition_type,
-                        start_lba: e.start_lba as u64,
-                        start_byte: None,
-                        size_bytes: e.size_bytes(),
-                        bootable: e.bootable,
-                        is_logical: true,
-                        is_extended_container: false,
-                        partition_type_string: None,
-                        hfs_block_size: None,
-                        rdb_part_block: None,
-                        drv_name: None,
-                    });
-                }
-
-                result
-            }
+            PartitionTable::Mbr(mbr) => mbr_partitions(mbr),
             PartitionTable::Gpt { gpt, .. } => gpt
                 .entries
                 .iter()
@@ -1429,26 +1457,19 @@ impl PartitionTable {
                     drv_name: None,
                 })
                 .collect(),
-            PartitionTable::SolarisX86 { label, .. } => label
-                .browsable_slices()
-                .map(|(i, s)| PartitionInfo {
-                    index: i,
-                    // Solaris slices are UFS; leave the type byte at 0 so
-                    // `open_filesystem` finds the superblock itself.
-                    type_name: format!("Solaris s{i} ({})", s.tag_name()),
-                    partition_type_byte: 0,
-                    start_lba: s.start_sector,
-                    start_byte: None,
-                    size_bytes: s.size_bytes(),
-                    bootable: s.tag == 2,
-                    is_logical: false,
-                    is_extended_container: false,
-                    partition_type_string: None,
-                    hfs_block_size: None,
-                    rdb_part_block: None,
-                    drv_name: None,
-                })
-                .collect(),
+            PartitionTable::SolarisX86 { mbr, label } => {
+                let mut result: Vec<PartitionInfo> = solaris_slice_partitions(label);
+                // The rest of the MBR is still a disk; its entries list after
+                // the slices, and the Solaris slot is its slices.
+                for mut p in mbr_partitions(mbr) {
+                    if !p.is_logical && p.index == label.mbr_slot {
+                        continue;
+                    }
+                    p.index += SOLARIS_MBR_INDEX_BASE;
+                    result.push(p);
+                }
+                result
+            }
             PartitionTable::Rdb(rdb) => rdb
                 .partitions
                 .iter()
