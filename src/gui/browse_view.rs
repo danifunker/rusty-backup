@@ -4437,6 +4437,16 @@ impl BrowseView {
                     self.content = None;
                     self.invalidate_all_caches();
                     self.invalidate_cached_fs();
+                    // The invalidation dropped the selection; put the saved file
+                    // back so the preview shows what was written, not "Loading...".
+                    if let Some(mut fs) = self.take_or_open_fs() {
+                        let saved =
+                            rusty_backup::cli::verbs::ls::resolve_path(fs.as_mut(), &ed.path).ok();
+                        self.return_fs(fs);
+                        if let Some(entry) = saved {
+                            self.select_file(&entry);
+                        }
+                    }
                     // A save is a write like any applied edit: the CHD diff is
                     // dirty and an archive session must recompress or lose it.
                     if self.chd_edit.is_some() {
