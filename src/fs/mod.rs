@@ -4188,7 +4188,10 @@ mod tests {
         buf[3..11].copy_from_slice(b"SYSLINUX");
         buf[11..13].copy_from_slice(&512u16.to_le_bytes()); // bytes/sector (valid)
         buf[13] = 0; // sectors/cluster == 0 -> not a real FAT BPB
-                     // ext2 superblock magic (0xEF53 LE) at offset 1024 + 0x38.
+                     // ext2 superblock at offset 1024: inode and block counts a
+                     // real volume never has at zero, then the 0xEF53 magic at +0x38.
+        buf[1024..1028].copy_from_slice(&128u32.to_le_bytes());
+        buf[1028..1032].copy_from_slice(&1024u32.to_le_bytes());
         buf[1024 + 0x38] = 0x53;
         buf[1024 + 0x39] = 0xEF;
         buf
