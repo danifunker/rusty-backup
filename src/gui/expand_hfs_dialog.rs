@@ -92,7 +92,7 @@ impl ExpandHfsDialog {
         let mut pick_output_clicked = false;
 
         let mut window_open = self.open;
-        egui::Window::new("Expand HFS Volume…")
+        egui::Window::new("Expand HFS Volume...")
             .open(&mut window_open)
             .resizable(true)
             .default_width(520.0)
@@ -194,7 +194,7 @@ impl ExpandHfsDialog {
                             .map(|p| p.display().to_string())
                             .unwrap_or_else(|| "(not chosen)".to_string());
                         ui.label(path_text);
-                        if ui.button("Save As…").clicked() {
+                        if ui.button("Save As...").clicked() {
                             pick_output_clicked = true;
                         }
                     });

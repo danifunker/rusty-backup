@@ -226,7 +226,7 @@ pub fn looks_binary(bytes: &[u8]) -> Option<String> {
     // 2% of control bytes is already far more than any real text file.
     if odd * 50 > bytes.len() {
         return Some(format!(
-            "{odd} control bytes in {} — {}%",
+            "{odd} control bytes in {} - {}%",
             bytes.len(),
             odd * 100 / bytes.len()
         ));

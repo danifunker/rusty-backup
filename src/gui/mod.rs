@@ -691,7 +691,7 @@ impl RustyBackupApp {
             }
             Err(e) => {
                 self.log_panel.warn(format!(
-                    "Failed to materialize {}: {} — opening raw bytes",
+                    "Failed to materialize {}: {} - opening raw bytes",
                     path.display(),
                     e
                 ));
@@ -1050,7 +1050,7 @@ impl eframe::App for RustyBackupApp {
                     // Bulk Convert — convert every disk image in a folder.
                     let bulk_running = self.bulk_convert_status.is_some();
                     if ui
-                        .add_enabled(!bulk_running, egui::Button::new("Bulk Convert…"))
+                        .add_enabled(!bulk_running, egui::Button::new("Bulk Convert..."))
                         .on_hover_text(
                             "Convert every disk image in a folder to one chosen format, \
                              using the same parameters for every file.",
@@ -1118,7 +1118,7 @@ impl eframe::App for RustyBackupApp {
                     };
                     let text = if s.current_total_bytes > 0 {
                         format!(
-                            "Bulk Convert: [{}/{}] {} — {} / {} ({:.0}%)",
+                            "Bulk Convert: [{}/{}] {} - {} / {} ({:.0}%)",
                             s.current_index,
                             s.total_files,
                             s.current_file,
@@ -1128,7 +1128,7 @@ impl eframe::App for RustyBackupApp {
                         )
                     } else {
                         format!(
-                            "Bulk Convert: [{}/{}] {} — preparing…",
+                            "Bulk Convert: [{}/{}] {} - preparing...",
                             s.current_index, s.total_files, s.current_file,
                         )
                     };

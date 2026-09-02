@@ -417,11 +417,11 @@ impl CommanderMode {
         // greyed button reads as "by design" rather than "broken": read-only
         // media (archive / backup / remote host folder) each give a reason.
         let l_copy_hover = match self.right.readonly_reason() {
-            Some(reason) => format!("Can't copy into the right pane — {reason}"),
+            Some(reason) => format!("Can't copy into the right pane - {reason}"),
             None => "Copy the left pane's selection into the right pane".to_string(),
         };
         let r_copy_hover = match self.left.readonly_reason() {
-            Some(reason) => format!("Can't copy into the left pane — {reason}"),
+            Some(reason) => format!("Can't copy into the left pane - {reason}"),
             None => "Copy the right pane's selection into the left pane".to_string(),
         };
 
@@ -473,7 +473,7 @@ impl CommanderMode {
             ui,
             sz,
             false,
-            "Compare — not implemented yet",
+            "Compare - not implemented yet",
             draw_compare_icon,
         );
         ui.add_space(12.0);

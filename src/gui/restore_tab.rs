@@ -961,11 +961,11 @@ impl RestoreTab {
                     if let Ok(mut p) = progress_arc.lock() {
                         p.cancel_requested = true;
                         p.operation =
-                            "Cancelling — waiting for current write to complete…".to_string();
+                            "Cancelling - waiting for current write to complete...".to_string();
                     }
                 }
                 ctx.log
-                    .warn("Cancellation requested — waiting for current disk write to complete...");
+                    .warn("Cancellation requested - waiting for current disk write to complete...");
             }
         });
     }

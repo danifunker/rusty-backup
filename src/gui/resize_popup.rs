@@ -389,9 +389,9 @@ impl ResizePopup {
                                     super::theme::muted(ui.visuals()),
                                     partition::format_size(entry.original_size),
                                 );
-                                ui.colored_label(super::theme::muted(ui.visuals()), "—");
-                                ui.colored_label(super::theme::muted(ui.visuals()), "—");
-                                ui.colored_label(super::theme::muted(ui.visuals()), "—");
+                                ui.colored_label(super::theme::muted(ui.visuals()), "-");
+                                ui.colored_label(super::theme::muted(ui.visuals()), "-");
+                                ui.colored_label(super::theme::muted(ui.visuals()), "-");
                                 ui.end_row();
                                 continue;
                             }
@@ -402,7 +402,7 @@ impl ResizePopup {
                             ui.label(if entry.minimum_size > 0 {
                                 partition::format_size(entry.minimum_size)
                             } else {
-                                "—".to_string()
+                                "-".to_string()
                             });
 
                             // Size-mode radios. Selecting Original/Minimum
@@ -642,7 +642,7 @@ impl ResizePopup {
                 Some(b) => b,
                 None => {
                     log.error(format!(
-                        "Invalid size for partition {}: '{}' — nothing was written.",
+                        "Invalid size for partition {}: '{}' - nothing was written.",
                         entry.index, entry.new_size_text
                     ));
                     return;

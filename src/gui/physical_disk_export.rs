@@ -214,7 +214,7 @@ impl PhysicalDiskExport {
 
                 ui.add_enabled_ui(!source.has_partition_table, |ui| {
                     let group_label = if source.has_partition_table {
-                        "Synthesize partition table (source already has one — disabled)"
+                        "Synthesize partition table (source already has one - disabled)"
                     } else {
                         "Synthesize partition table"
                     };

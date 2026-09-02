@@ -436,7 +436,7 @@ impl PartitionEditor {
                         self.status = Some("No changes detected.".to_string());
                     } else {
                         self.status = Some(format!(
-                            "Validation OK — {} edit(s) ready to apply.",
+                            "Validation OK - {} edit(s) ready to apply.",
                             self.edits.len()
                         ));
                     }

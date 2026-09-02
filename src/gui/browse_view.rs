@@ -1947,7 +1947,7 @@ impl BrowseView {
                             ui.colored_label(
                                 super::theme::warning(ui.visuals()),
                                 format!(
-                                    "Note: ${:02X} is not in the ProDOS type registry — {}. The type and aux (${:04X}) will be preserved on export via the CiderPress #{:02X}{:04X} filename suffix.",
+                                    "Note: ${:02X} is not in the ProDOS type registry - {}. The type and aux (${:04X}) will be preserved on export via the CiderPress #{:02X}{:04X} filename suffix.",
                                     tt,
                                     rusty_backup::fs::prodos_types::UNKNOWN_TYPE_NOTE,
                                     aux,
@@ -3545,7 +3545,7 @@ impl BrowseView {
             self.staging_errors = errors;
             self.show_staging_errors = true;
             self.edit_result = Some(format!(
-                "Staged {staged_count} item(s); {} failed — see dialog",
+                "Staged {staged_count} item(s); {} failed - see dialog",
                 self.staging_errors.len()
             ));
         } else if staged_count > 0 {
@@ -5361,7 +5361,7 @@ impl BrowseView {
                                 .unwrap_or_else(|| path.to_str().unwrap_or("?"));
                             ui.horizontal_wrapped(|ui| {
                                 ui.label(egui::RichText::new(label).strong());
-                                ui.label("—");
+                                ui.label("-");
                                 ui.colored_label(super::theme::danger(ui.visuals()), reason);
                             });
                             ui.label(
@@ -5483,7 +5483,7 @@ impl BrowseView {
                         ui.colored_label(
                             super::theme::danger(ui.visuals()),
                             format!(
-                                "{} file(s)/folder(s) reference {} missing parent director{} — not repairable.",
+                                "{} file(s)/folder(s) reference {} missing parent director{} - not repairable.",
                                 result.orphaned_entries.len(),
                                 by_parent.len(),
                                 if by_parent.len() == 1 { "y" } else { "ies" },

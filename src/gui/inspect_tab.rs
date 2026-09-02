@@ -890,7 +890,7 @@ impl InspectTab {
                     egui::Button::new("Expand Image..."),
                 )
                 .on_hover_text(if !is_image_file {
-                    "Only image files can be expanded — devices have fixed size.".to_string()
+                    "Only image files can be expanded - devices have fixed size.".to_string()
                 } else if chd_expand_running {
                     "CHD expansion already running.".to_string()
                 } else {
@@ -1295,7 +1295,7 @@ impl InspectTab {
                 let status = rusty_backup::model::chd_expand_runner::spawn(path, add_bytes);
                 self.chd_expand_status = Some(status);
                 ctx.log.info(
-                    "CHD expansion runs in the background — log lines will appear as it progresses.",
+                    "CHD expansion runs in the background - log lines will appear as it progresses.",
                 );
             } else {
                 match rusty_backup::partition::resize::expand_image_file(
@@ -2388,7 +2388,7 @@ impl InspectTab {
                 // Not a partitioned disk but a browsable optical disc — hand it to
                 // the Optical tab (the app switches there on the next frame).
                 ctx.log.info(format!(
-                    "{} is an optical disc — opening the Optical tab.",
+                    "{} is an optical disc - opening the Optical tab.",
                     path.display()
                 ));
                 self.pending_open_optical = Some(path);
@@ -3914,7 +3914,7 @@ impl InspectTab {
             .show(ui, |ui| {
                 // Header
                 ui.label(egui::RichText::new("#").strong())
-                    .on_hover_text("Position in this list — the number `IMG@N` takes");
+                    .on_hover_text("Position in this list - the number `IMG@N` takes");
                 if has_slots {
                     ui.label(egui::RichText::new("Slot").strong())
                         .on_hover_text(
@@ -4163,7 +4163,7 @@ impl InspectTab {
                                 &part.type_name,
                             ) && !is_remote
                                 && ui
-                                    .small_button("Expand/Export…")
+                                    .small_button("Expand/Export...")
                                     .on_hover_text(
                                         "Re-floor this classic-HFS volume to a new size / block \
                                          size (APM .hda) or export it as a flat BasiliskII HFV.",
@@ -4179,7 +4179,7 @@ impl InspectTab {
                                 && is_image_source
                                 && self.repack_status.is_none()
                                 && ui
-                                    .small_button("Defragment…")
+                                    .small_button("Defragment...")
                                     .on_hover_text(
                                         "Repack this Human68k volume so its files are stored \
                                          contiguously, reclaiming holes left by deleted files. \
@@ -4195,7 +4195,7 @@ impl InspectTab {
                             if part.type_name == "Alto BFS"
                                 && is_image_source
                                 && ui
-                                    .small_button("Resize…")
+                                    .small_button("Resize...")
                                     .on_hover_text(
                                         "Re-lay this Alto volume onto a different disk geometry \
                                          (Diablo 31 / 44, grow or shrink) and save it as a PDI.",
@@ -4337,12 +4337,12 @@ impl InspectTab {
                     }
                 })
                 .unwrap_or(0.0);
-            egui::Window::new("Defragmenting…")
+            egui::Window::new("Defragmenting...")
                 .collapsible(false)
                 .resizable(false)
                 .show(ui.ctx(), |ui| {
                     ui.add(egui::ProgressBar::new(frac).show_percentage());
-                    ui.label("Repacking Human68k volume — please wait.");
+                    ui.label("Repacking Human68k volume - please wait.");
                 });
             // Keep the UI repainting so progress + completion are reflected
             // without needing mouse movement.
@@ -5478,7 +5478,7 @@ impl InspectTab {
                 self.cache_status = None;
             } else if let Some(cache_path) = &status.cache_path {
                 ctx.log.info(
-                    "Seekable cache ready — browser upgraded to full seek support.".to_string(),
+                    "Seekable cache ready - browser upgraded to full seek support.".to_string(),
                 );
                 let cache_path = cache_path.clone();
                 self.seekable_cache_files

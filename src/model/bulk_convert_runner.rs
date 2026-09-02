@@ -252,7 +252,7 @@ fn run_bulk_convert(
                 if let Ok(mut s) = log_for_progress.lock() {
                     s.log_messages.push((
                         LogLevel::Info,
-                        format!("    … {} written ({:.1} MB/s)", fmt_bytes(bytes), mbs),
+                        format!("    ... {} written ({:.1} MB/s)", fmt_bytes(bytes), mbs),
                     ));
                 }
             }

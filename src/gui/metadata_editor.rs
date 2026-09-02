@@ -105,11 +105,11 @@ pub fn render_hfs_type_row(
 
             // Pulldown with current FInfo first, then dictionary by name.
             let combo_label = match cur_desc {
-                Some(d) => format!("(current) {cur_t_str}/{cur_c_str} — {d}"),
+                Some(d) => format!("(current) {cur_t_str}/{cur_c_str} - {d}"),
                 None if cur_t != [0; 4] || cur_c != [0; 4] => {
                     format!("(current) {cur_t_str}/{cur_c_str}")
                 }
-                None => "Pick from dictionary…".to_string(),
+                None => "Pick from dictionary...".to_string(),
             };
             let mut picked: Option<([u8; 4], [u8; 4])> = None;
             egui::ComboBox::from_id_salt(("hfs_tc_dict", &entry.path))
@@ -119,7 +119,7 @@ pub fn render_hfs_type_row(
                     if cur_t != [0; 4] || cur_c != [0; 4] {
                         let label = match cur_desc {
                             Some(d) => {
-                                format!("(current) {cur_t_str}/{cur_c_str} — {d}")
+                                format!("(current) {cur_t_str}/{cur_c_str} - {d}")
                             }
                             None => format!("(current) {cur_t_str}/{cur_c_str}"),
                         };
@@ -130,7 +130,7 @@ pub fn render_hfs_type_row(
                     }
                     for e in rusty_backup::fs::hfs_common::known_type_creators() {
                         let label =
-                            format!("{}/{} — {}", e.type_str(), e.creator_str(), e.description);
+                            format!("{}/{} - {}", e.type_str(), e.creator_str(), e.description);
                         if ui.selectable_label(false, label).clicked() {
                             picked = Some((e.type_code, e.creator_code));
                         }
@@ -283,14 +283,14 @@ pub fn render_prodos_type_row(
     if let Some(state) = editor.as_mut() {
         ui.horizontal(|ui| {
             ui.label("Type pulldown:");
-            let combo_label = format!("${cur_t:02X} {cur_abbr} — {cur_desc}");
+            let combo_label = format!("${cur_t:02X} {cur_abbr} - {cur_desc}");
             let mut picked: Option<u8> = None;
             egui::ComboBox::from_id_salt(("prodos_type_combo", &entry.path))
                 .selected_text(combo_label)
                 .width(320.0)
                 .show_ui(ui, |ui| {
                     for (byte, info) in &pt::all_types() {
-                        let label = format!("${:02X} {} — {}", byte, info.abbr, info.description);
+                        let label = format!("${:02X} {} - {}", byte, info.abbr, info.description);
                         if ui.selectable_label(*byte == cur_t, label).clicked() {
                             picked = Some(*byte);
                         }

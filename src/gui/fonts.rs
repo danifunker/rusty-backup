@@ -85,7 +85,7 @@ mod tests {
             assert_ne!(
                 font.glyph_id(ch).0,
                 0,
-                "bundled font is missing a glyph for U+{:04X} '{ch}' — OSType codes / Mac names would tofu",
+                "bundled font is missing a glyph for U+{:04X} '{ch}' - OSType codes / Mac names would tofu",
                 ch as u32
             );
         }

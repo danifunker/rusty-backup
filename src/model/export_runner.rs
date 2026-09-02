@@ -766,7 +766,7 @@ fn run_per_partition(
     } else if let Some(image_path) = &source_image {
         if format.is_floppy_only() {
             anyhow::bail!(
-                "{} per-partition export from a raw disk image is not supported — use Whole Disk export for floppy-only formats",
+                "{} per-partition export from a raw disk image is not supported - use Whole Disk export for floppy-only formats",
                 format.description()
             );
         }
