@@ -217,6 +217,9 @@ pub enum Request {
         path: String,
         is_device: bool,
         size: u64,
+        /// Overwrite an image file that already exists (v3 clients send none: false).
+        #[serde(default)]
+        force: bool,
     },
 
     // --- physical-device backup (v2): the daemon enumerates its own disks ---

@@ -2032,6 +2032,8 @@ impl RestoreTab {
                     is_device,
                     progress_arc,
                     None,
+                    // The picker is the confirmation, as for a local image target.
+                    true,
                 )
             },
         );

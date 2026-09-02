@@ -531,6 +531,7 @@ impl RemoteSession {
         path: &str,
         is_device: bool,
         size: u64,
+        force: bool,
     ) -> Result<(u64, u64)> {
         write_control(
             &mut self.writer,
@@ -538,6 +539,7 @@ impl RemoteSession {
                 path: path.to_string(),
                 is_device,
                 size,
+                force,
             },
         )?;
         match self.read_response()? {

@@ -1288,7 +1288,8 @@ fn handle_conn(
                 path,
                 is_device,
                 size,
-            } => match open_write_target(root, &path, is_device, size) {
+                force,
+            } => match open_write_target(root, &path, is_device, size, force) {
                 Err(e) => reply_err(&mut writer, format!("{e:#}"))?,
                 Ok((file, actual_size)) => {
                     let handle = next_handle;
@@ -1920,6 +1921,7 @@ fn open_write_target(
     path: &str,
     is_device: bool,
     size: u64,
+    force: bool,
 ) -> Result<(std::fs::File, u64)> {
     if is_device {
         // Same validation as the read-side `open_device`: the path must match a
@@ -1965,6 +1967,13 @@ fn open_write_target(
         Ok((handle.file, dev_size))
     } else {
         let full = sandbox_join_create(root, path)?;
+        // A restore truncates its target; an image that is already there is
+        // only replaced when the client said so.
+        if !force && full.exists() {
+            bail!(
+                "{path} already exists on the daemon; confirm the overwrite (--yes) to replace it"
+            );
+        }
         let f = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
