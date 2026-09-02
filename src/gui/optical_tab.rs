@@ -330,7 +330,20 @@ impl OpticalTab {
         self.rip_running || self.convert_running
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, log: &mut LogPanel, progress: &mut ProgressState) {
+    /// Drain the workers while another tab is showing, so a job keeps
+    /// reporting and its completion is not missed after a tab switch.
+    pub fn poll_background(&mut self, log: &mut LogPanel, progress: &mut ProgressState) {
+        self.poll_progress(log, progress);
+        self.poll_add_remote(log);
+    }
+
+    pub fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        log: &mut LogPanel,
+        progress: &mut ProgressState,
+        busy_elsewhere: Option<&'static str>,
+    ) {
         self.poll_progress(log, progress);
         self.poll_add_remote(log);
         self.show_add_remote_dialog(ui.ctx());
@@ -338,7 +351,14 @@ impl OpticalTab {
         ui.heading("Optical Disc");
         ui.add_space(8.0);
 
-        let controls_enabled = !self.rip_running && !self.convert_running;
+        if let Some(tab) = busy_elsewhere {
+            ui.colored_label(
+                super::theme::warning(ui.visuals()),
+                super::context::busy_elsewhere_notice(tab),
+            );
+        }
+        let controls_enabled =
+            !self.rip_running && !self.convert_running && busy_elsewhere.is_none();
 
         // ── Source selection ─────────────────────────────────────────────────
         ui.add_enabled_ui(controls_enabled, |ui| {

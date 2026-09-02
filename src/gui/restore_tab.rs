@@ -355,6 +355,15 @@ impl RestoreTab {
         self.partition_configs.clear();
     }
 
+    /// Drain the workers while another tab is showing, so a job keeps
+    /// reporting and its completion is not missed after a tab switch.
+    pub fn poll_background(&mut self, ctx: &mut TabContext, progress: &mut ProgressState) {
+        self.poll_progress(ctx, progress);
+        #[cfg(feature = "remote")]
+        self.poll_remote(ctx);
+        self.poll_build(ctx);
+    }
+
     pub fn show(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext, progress: &mut ProgressState) {
         // Poll background restore thread
         self.poll_progress(ctx, progress);
@@ -369,7 +378,13 @@ impl RestoreTab {
         ui.heading("Restore Backup");
         ui.add_space(8.0);
 
-        let controls_enabled = !self.is_running();
+        if let Some(tab) = ctx.busy_elsewhere {
+            ui.colored_label(
+                super::theme::warning(ui.visuals()),
+                super::context::busy_elsewhere_notice(tab),
+            );
+        }
+        let controls_enabled = !self.is_running() && ctx.busy_elsewhere.is_none();
 
         // --- Restore Mode Selector ---
         ui.add_enabled_ui(controls_enabled, |ui| {
@@ -895,7 +910,7 @@ impl RestoreTab {
     fn show_action_buttons(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext) {
         ui.add_space(16.0);
         ui.horizontal(|ui| {
-            if !self.restore_running {
+            if !self.restore_running && ctx.busy_elsewhere.is_none() {
                 let can_start = match self.restore_mode {
                     RestoreMode::FullDisk => {
                         (self.backup_metadata.is_some() || self.clonezilla_image.is_some())

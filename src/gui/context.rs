@@ -19,10 +19,26 @@ use super::progress::LogPanel;
 pub struct TabContext<'a> {
     pub devices: &'a [DiskDevice],
     pub log: &'a mut LogPanel,
+    /// Name of another tab with a disk job in flight; start controls lock on it.
+    pub busy_elsewhere: Option<&'static str>,
 }
 
 impl<'a> TabContext<'a> {
     pub fn new(devices: &'a [DiskDevice], log: &'a mut LogPanel) -> Self {
-        Self { devices, log }
+        Self {
+            devices,
+            log,
+            busy_elsewhere: None,
+        }
     }
+
+    pub fn busy_elsewhere(mut self, tab: Option<&'static str>) -> Self {
+        self.busy_elsewhere = tab;
+        self
+    }
+}
+
+/// The one-line notice a tab shows while another tab's job locks its controls.
+pub fn busy_elsewhere_notice(tab: &str) -> String {
+    format!("The {tab} tab has a disk job running; start controls unlock when it finishes.")
 }

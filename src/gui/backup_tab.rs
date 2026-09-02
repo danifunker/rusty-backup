@@ -257,6 +257,21 @@ impl Default for BackupTab {
 }
 
 impl BackupTab {
+    /// A backup or whole-disk VHD export is in flight.
+    pub fn is_running(&self) -> bool {
+        self.backup_running || self.vhd_export_status.is_some()
+    }
+
+    /// Drain the workers while another tab is showing, so a job keeps
+    /// reporting and its completion is not missed after a tab switch.
+    pub fn poll_background(&mut self, ctx: &mut TabContext, progress: &mut ProgressState) {
+        self.poll_progress(ctx, progress);
+        self.poll_vhd_export(ctx, progress);
+        #[cfg(feature = "remote")]
+        self.poll_remote(ctx);
+        self.poll_min_size_calcs(ctx);
+    }
+
     pub fn show(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext, progress: &mut ProgressState) {
         // Poll background backup thread
         self.poll_progress(ctx, progress);
@@ -281,7 +296,13 @@ impl BackupTab {
         ui.heading("Backup Disk");
         ui.add_space(8.0);
 
-        let controls_enabled = !self.backup_running;
+        if let Some(tab) = ctx.busy_elsewhere {
+            ui.colored_label(
+                super::theme::warning(ui.visuals()),
+                super::context::busy_elsewhere_notice(tab),
+            );
+        }
+        let controls_enabled = !self.backup_running && ctx.busy_elsewhere.is_none();
 
         // Source device / image
         ui.horizontal(|ui| {
@@ -832,7 +853,8 @@ impl BackupTab {
                 } else {
                     "Start Backup"
                 };
-                let button_enabled = can_start && !self.pending_backup_after_min_sizes;
+                let button_enabled =
+                    can_start && !self.pending_backup_after_min_sizes && ctx.busy_elsewhere.is_none();
                 if ui
                     .add_enabled(button_enabled, egui::Button::new(button_label))
                     .clicked()
@@ -1016,7 +1038,13 @@ impl BackupTab {
                 ui.add_space(8.0);
 
                 ui.horizontal(|ui| {
-                    if ui.button("Start VHD Backup").clicked() {
+                    if ui
+                        .add_enabled(
+                            ctx.busy_elsewhere.is_none(),
+                            egui::Button::new("Start VHD Backup"),
+                        )
+                        .clicked()
+                    {
                         self.vhd_popup_open = false;
                         if self.vhd_whole_disk {
                             self.start_vhd_whole_disk(ctx);

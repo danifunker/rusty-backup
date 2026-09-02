@@ -854,10 +854,31 @@ impl RustyBackupApp {
     }
 }
 
+impl RustyBackupApp {
+    /// Another tab (not `tab`) with a disk job in flight; one job at a time
+    /// keeps two drives from being hammered and the shared progress bar honest.
+    fn busy_elsewhere(&self, tab: Tab) -> Option<&'static str> {
+        let jobs: [(Tab, bool, &'static str); 3] = [
+            (Tab::Backup, self.backup_tab.is_running(), "Backup"),
+            (Tab::Restore, self.restore_tab.is_running(), "Restore"),
+            (Tab::Optical, self.optical_tab.is_running(), "Optical"),
+        ];
+        jobs.iter()
+            .find(|(owner, running, _)| *running && *owner != tab)
+            .map(|(_, _, name)| *name)
+            .or(if self.bulk_convert_status.is_some() {
+                Some("Bulk Convert")
+            } else {
+                None
+            })
+    }
+}
+
 impl eframe::App for RustyBackupApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Request repaint while backup/restore is running so progress updates are shown
         if self.progress.active
+            || self.backup_tab.is_running()
             || self.restore_tab.is_running()
             || self.optical_tab.is_running()
             || self.bulk_convert_status.is_some()
@@ -1186,10 +1207,30 @@ impl eframe::App for RustyBackupApp {
                 self.log_panel.show(ui);
             });
 
+        // Poll the tabs that are not showing: a job keeps reporting on the
+        // shared progress bar and its completion is not missed after a switch.
+        {
+            let mut ctx = context::TabContext::new(&self.devices, &mut self.log_panel);
+            if !matches!(self.active_tab, Tab::Backup) {
+                self.backup_tab
+                    .poll_background(&mut ctx, &mut self.progress);
+            }
+            if !matches!(self.active_tab, Tab::Restore) {
+                self.restore_tab
+                    .poll_background(&mut ctx, &mut self.progress);
+            }
+        }
+        if !matches!(self.active_tab, Tab::Optical) {
+            self.optical_tab
+                .poll_background(&mut self.log_panel, &mut self.progress);
+        }
+
         // Central panel: active tab content
         egui::CentralPanel::default().show_inside(ctx, |ui| match self.active_tab {
             Tab::Backup => {
-                let mut ctx = context::TabContext::new(&self.devices, &mut self.log_panel);
+                let busy = self.busy_elsewhere(Tab::Backup);
+                let mut ctx = context::TabContext::new(&self.devices, &mut self.log_panel)
+                    .busy_elsewhere(busy);
                 self.backup_tab.show(ui, &mut ctx, &mut self.progress);
             }
             Tab::Restore => {
@@ -1205,7 +1246,9 @@ impl eframe::App for RustyBackupApp {
                     }
                 }
 
-                let mut ctx = context::TabContext::new(&self.devices, &mut self.log_panel);
+                let busy = self.busy_elsewhere(Tab::Restore);
+                let mut ctx = context::TabContext::new(&self.devices, &mut self.log_panel)
+                    .busy_elsewhere(busy);
                 self.restore_tab.show(ui, &mut ctx, &mut self.progress);
             }
             Tab::Inspect => {
@@ -1235,8 +1278,9 @@ impl eframe::App for RustyBackupApp {
                 self.inspect_tab.show(ui, &mut ctx);
             }
             Tab::Optical => {
+                let busy = self.busy_elsewhere(Tab::Optical);
                 self.optical_tab
-                    .show(ui, &mut self.log_panel, &mut self.progress);
+                    .show(ui, &mut self.log_panel, &mut self.progress, busy);
             }
             Tab::Archives => {
                 self.archives_tab.show(ui, &mut self.log_panel);
