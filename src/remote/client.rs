@@ -425,27 +425,34 @@ impl RemoteSession {
     /// write analog of [`RemoteSession::read_host_file`]). `force` overwrites an
     /// existing target. Fails if the daemon runs read-only.
     pub fn write_host_file(&mut self, path: &str, host_file: &Path, force: bool) -> Result<()> {
-        let size = std::fs::metadata(host_file)
-            .with_context(|| format!("stat {}", host_file.display()))?
-            .len();
+        // Open before announcing; always terminate the chunk stream and read
+        // the reply, or a body cut short desyncs the daemon (as StageUpload did).
+        let mut f = std::fs::File::open(host_file)
+            .with_context(|| format!("open {}", host_file.display()))?;
+        let meta = f
+            .metadata()
+            .with_context(|| format!("stat {}", host_file.display()))?;
+        if !meta.is_file() {
+            bail!("{} is not a regular file", host_file.display());
+        }
         write_control(
             &mut self.writer,
             &Request::WriteHostFile {
                 path: path.to_string(),
-                size,
+                size: meta.len(),
                 force,
             },
         )?;
-        // The body follows immediately as a chunk stream.
-        let mut f = std::fs::File::open(host_file)
-            .with_context(|| format!("open {}", host_file.display()))?;
-        {
+        let copied = {
             let mut cw = ChunkWriter::new(&mut self.writer);
-            std::io::copy(&mut f, &mut cw)
-                .with_context(|| format!("uploading {}", host_file.display()))?;
+            let r = std::io::copy(&mut f, &mut cw)
+                .with_context(|| format!("uploading {}", host_file.display()));
             cw.finish()?;
-        }
-        self.expect_ok("WriteHostFile")
+            r
+        };
+        let reply = self.expect_ok("WriteHostFile");
+        copied?;
+        reply
     }
 
     /// Open a host image file as a raw block device on the daemon — it stays

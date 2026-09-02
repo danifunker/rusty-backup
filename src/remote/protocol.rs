@@ -51,6 +51,10 @@ pub const RB_HELLO_MAGIC_BYTES: [u8; 4] = RB_HELLO_MAGIC.to_be_bytes();
 /// mismatch is refused with a clear message instead of desyncing.
 pub const PROTOCOL_VERSION: u16 = 4;
 
+/// Oldest Family-B (binary, cb-dos) version this daemon still speaks. The v4
+/// bump changed only JSON `StageUpload`, so the binary wire format is v3's.
+pub const FAMILY_B_MIN_VERSION: u16 = 3;
+
 /// Default daemon port (mrext owns 8182; we take 7341). Configurable on both
 /// ends via `--bind` / an explicit `rb://host:PORT/...`.
 pub const DEFAULT_PORT: u16 = 7341;

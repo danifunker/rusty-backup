@@ -36,7 +36,8 @@ use crate::remote::protocol::{
     read_member_header, read_member_request, write_binary_hello, write_control,
     write_get_open_reply, write_member_stream, write_put_ack, write_put_result, write_resume_map,
     ChunkWriter, FamilyBOp, Handshake, PutHeader, Request, Response, ResumeEntry, WireEntry,
-    WireKind, CAP_FAMILY_B, CAP_FAMILY_F, MAX_PUT_CHUNK, PROTOCOL_VERSION, RB_HELLO_MAGIC,
+    WireKind, CAP_FAMILY_B, CAP_FAMILY_F, FAMILY_B_MIN_VERSION, MAX_PUT_CHUNK, PROTOCOL_VERSION,
+    RB_HELLO_MAGIC,
 };
 
 /// A block-tier handle: a host image file (or raw device) kept open for ranged
@@ -801,11 +802,14 @@ fn handle_conn(
             version,
             capabilities,
         }) => {
-            if version != PROTOCOL_VERSION {
+            // The v4 bump was JSON-only, and refusing v3 here silenced every
+            // networked cb-dos operation without a reply it could show.
+            if !(FAMILY_B_MIN_VERSION..=PROTOCOL_VERSION).contains(&version) {
                 // No JSON error path to a binary client; log and drop.
                 eprintln!(
                     "rb-cli serve: rejecting Family-B client speaking v{version}; this daemon \
-                     is v{PROTOCOL_VERSION}. Update cb-dos (RB_PROTO_VER in cbnet.c)."
+                     speaks v{FAMILY_B_MIN_VERSION}..v{PROTOCOL_VERSION}. Update cb-dos \
+                     (RB_PROTO_VER in cbnet.c)."
                 );
                 return Ok(());
             }
@@ -1858,6 +1862,14 @@ fn open_write_target(
             .find(|d| d.path.to_string_lossy() == path)
             .ok_or_else(|| anyhow!("{path:?} is not an enumerated device on this machine"))?;
         let dev_path = dev.path.clone();
+        // The disk the daemon boots from is never a restore target; a peer on
+        // the LAN could otherwise overwrite a MiSTer's SD card unprompted.
+        if dev.is_system {
+            bail!(
+                "{} is the system disk of the machine running the daemon; refusing to write it",
+                dev_path.display()
+            );
+        }
         // `open_target_for_writing` does the platform-appropriate prep (unmount /
         // lock); on Linux/MiSTer — the supported daemon target — it returns a
         // plain read-write File. (A Windows/macOS daemon would need to keep the
