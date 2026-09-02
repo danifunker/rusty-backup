@@ -1596,12 +1596,47 @@ mod optical_server {
 
 /// Read a chunk stream from the client into a staging blob file.
 fn stage_blob<R: std::io::Read>(reader: &mut R, blob: &Path) -> Result<()> {
-    let mut f = std::fs::File::create(blob)
-        .with_context(|| format!("creating staging blob {}", blob.display()))?;
-    // std::fs::File is unbuffered, so read_chunks' write_all lands every byte
-    // before it returns — no explicit flush needed.
-    read_chunks(reader, &mut f)?;
+    // Whatever goes wrong with the file, the chunk stream is read to its end:
+    // a body left on the wire desyncs every request after it.
+    let (file, create_err) = match std::fs::File::create(blob) {
+        Ok(f) => (Some(f), None),
+        Err(e) => (None, Some(e)),
+    };
+    let mut sink = StagingSink {
+        file,
+        failure: None,
+    };
+    read_chunks(reader, &mut sink).context("reading the upload body")?;
+    if let Some(e) = create_err {
+        return Err(e).with_context(|| format!("creating staging blob {}", blob.display()));
+    }
+    if let Some(e) = sink.failure {
+        return Err(e).with_context(|| format!("writing staging blob {}", blob.display()));
+    }
     Ok(())
+}
+
+/// Writes an upload body to its blob until the first error, then keeps
+/// accepting (and dropping) bytes so the chunk stream can still be drained.
+struct StagingSink {
+    file: Option<std::fs::File>,
+    failure: Option<std::io::Error>,
+}
+
+impl std::io::Write for StagingSink {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if let Some(f) = self.file.as_mut() {
+            if let Err(e) = f.write_all(data) {
+                self.failure = Some(e);
+                self.file = None;
+            }
+        }
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// An opened filesystem plus the metadata a remote pane displays.
