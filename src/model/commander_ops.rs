@@ -35,8 +35,8 @@ use crate::remote::RemoteConnection;
 /// Opens the filesystem read-write via [`BrowseSession::open_editable`],
 /// replays each edit through [`apply_edit`], calls `sync_metadata`, then commits
 /// the container (a no-op for raw images / devices, a re-encode for floppy
-/// containers). Errors abort the batch — the queue is left intact by the caller
-/// so the user can retry.
+/// containers). A failure stops the batch after syncing and committing what
+/// landed; the error names how many applied so the caller can trim its queue.
 pub fn apply_edits(session: &BrowseSession, edits: &[StagedEdit]) -> Result<()> {
     apply_edits_reporting(session, edits, |_| {})
 }
@@ -52,14 +52,38 @@ pub fn apply_edits_reporting(
     let (mut efs, commit) = session
         .open_editable()
         .context("opening source for editing")?;
+    let mut failure: Option<anyhow::Error> = None;
+    let mut applied = 0usize;
     for (index, edit) in edits.iter().enumerate() {
-        apply_edit(efs.as_mut(), edit).context("applying a staged edit")?;
+        if let Err(e) = apply_edit(efs.as_mut(), edit) {
+            failure = Some(anyhow::Error::new(e).context(format!(
+                "applying edit {} of {} ({})",
+                index + 1,
+                edits.len(),
+                edit_label(edit)
+            )));
+            break;
+        }
+        applied += 1;
         on_progress(EditProgress { index, edit });
     }
-    efs.sync_metadata().context("writing filesystem metadata")?;
+    // What already landed still has to reach the disk and the container,
+    // or a failure at edit 7 leaves edits 1-6 unsynced on a temp flat.
+    if applied > 0 {
+        efs.sync_metadata().context("writing filesystem metadata")?;
+    }
     drop(efs);
-    commit.commit().context("committing container edits")?;
-    Ok(())
+    if applied > 0 {
+        commit.commit().context("committing container edits")?;
+    }
+    match failure {
+        Some(e) => Err(e.context(format!(
+            "{applied} of {} edit(s) were applied and are on the volume; drop them from \
+             the queue before retrying",
+            edits.len()
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// One edit's completion snapshot, handed to the `apply_edits_reporting`
