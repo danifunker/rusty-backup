@@ -1761,8 +1761,9 @@ fn build_file_name_attr(
     data[24..32].copy_from_slice(&ts); // MFT modification
     data[32..40].copy_from_slice(&ts); // access
 
-    // allocated size
-    data[40..48].copy_from_slice(&size.to_le_bytes());
+    // Allocated size as for resident data (quadword-rounded); a caller with
+    // non-resident data overrides it with the cluster-rounded size.
+    data[40..48].copy_from_slice(&((size + 7) & !7).to_le_bytes());
     // real size
     data[48..56].copy_from_slice(&size.to_le_bytes());
 
@@ -2616,10 +2617,8 @@ impl<R: Read + Write + Seek> NtfsFilesystem<R> {
         let cs = self.cluster_size;
         let old_vc = old_total_sectors * bps / cs;
         let new_vc = new_total_sectors * bps / cs;
-        // The bitmap spans every cluster of the partition, backup-boot-sector cluster
-        // included, the way the formatter lays it out.
-        let part_clusters = (new_total_sectors + 1) * bps / cs;
-        let needed = (part_clusters as usize).div_ceil(8).max(1);
+        // Windows sizes the bitmap in whole quadwords and chkdsk holds it to that.
+        let needed = ((new_vc as usize).div_ceil(64) * 8).max(8);
 
         let (old_bitmap, old_runs) = self.read_volume_bitmap()?;
         let mut bitmap = old_bitmap;
@@ -5282,13 +5281,19 @@ mod tests {
             );
             let geom = fs.fsck_geometry();
             let bm = fs.fsck_read_volume_bitmap().unwrap();
-            let part_clusters = new_len / cluster as u64;
-            assert_eq!(bm.len() as u64, part_clusters.div_ceil(8), "bitmap length");
-            let bit = |c: u64| bm[(c / 8) as usize] & (1 << (c % 8)) != 0;
-            assert!(
-                bit(geom.total_clusters),
-                "the cluster past the volume end stays marked"
+            // Windows sizes $Bitmap in whole quadwords; chkdsk rejects anything else.
+            assert_eq!(
+                bm.len() as u64,
+                geom.total_clusters.div_ceil(64) * 8,
+                "bitmap length"
             );
+            let bit = |c: u64| bm[(c / 8) as usize] & (1 << (c % 8)) != 0;
+            if geom.total_clusters < bm.len() as u64 * 8 {
+                assert!(
+                    bit(geom.total_clusters),
+                    "the bits past the volume end stay marked"
+                );
+            }
             assert!(
                 !bit(geom.total_clusters - 1),
                 "the last volume cluster is free"
