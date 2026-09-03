@@ -1,4 +1,4 @@
-# Regression Findings (R-001 … R-043)
+# Regression Findings (R-001 … R-045)
 
 Defects and documentation drift turned up while building the regression suite
 (`regression-tests/`), 2026-08-01/02. The suite work was deliberately kept
@@ -19,6 +19,8 @@ finding depends on a fixture, the fixture is named.
 
 | ID | Severity | Area | Finding |
 |----|----------|------|---------|
+| ~~R-045~~ | ~~**High**~~ **FIXED** | `src/fs/ntfs.rs` | ~~No NTFS volume can be shrunk in place: the trim point is pinned to the volume size by its own backup boot sector~~ — the trim point is the last used cluster plus one sector, and the scans stop at the cluster count, 2026-09-02 |
+| ~~R-044~~ | ~~**High**~~ **FIXED** | `src/fs/ntfs.rs` | ~~An in-place NTFS grow leaves `$Bitmap` at the old size with the formatter's end mark inside the volume; fsck reports a leaked cluster on every grown or Minimum-restored volume~~ — the resize rewrites `$Bitmap`, relocating it when it outgrows its clusters, 2026-09-02 |
 | ~~R-043~~ | ~~**High**~~ **FIXED** | `src/cli/resolve.rs`, `src/model/browse_session.rs` | ~~Every edit verb refuses a **dynamic VHD**~~ — one classifier (`source_reader::open_container_rw`) now feeds both the CLI resolver and the GUI edit session: dynamic VHD, sparse VMDK and QCOW2 edit in place through their codecs, and decode-only containers are refused with a reason instead of "Invalid MBR", 2026-09-01 |
 | ~~R-042~~ | ~~**High**~~ **FIXED** | `src/fs/affs.rs` | ~~An AFFS partition that is not last on its disk cannot be opened at all~~ — the root-block midpoint was inferred from the end of the *disk*; the read-only opener family now carries the partition length the editable one always had, 2026-08-18 |
 | ~~R-040~~ | ~~**High**~~ **FIXED** | `src/cli/verbs/put.rs`, `src/fs/dir_import.rs` | ~~`put` and `import` never reattach a resource fork, so an extracted Mac archive copied back onto HFS loses every fork~~ — `detect_resource_fork` learned BinHex and both verbs now consult it; all four containers round-trip, 2026-08-17 |
@@ -65,6 +67,83 @@ finding depends on a fixture, the fixture is named.
 | ~~R-002~~ | ~~Doc~~ **FIXED** | `src/fs/README.md` | ~~Capability table stale — ext listed as "planned"~~ — table deleted for a pointer at the live dispatch, 2026-08-09 |
 
 ---
+
+## Found during the 2026-09-01 audit, leg 2 (Windows), 2026-09-02
+
+Both turned up while preparing the Windows verification of the NTFS fixes
+below: every image the check needed came out of `rb-cli` with its own fsck
+already complaining.
+
+### R-044 — an in-place NTFS grow leaves `$Bitmap` behind {#r-044}
+
+**FIXED 2026-09-02** (`fix(ntfs): an in-place resize keeps $Bitmap in step
+with the volume`). Kept for the reproduction.
+
+`resize_ntfs_in_place` patched TotalSectors and rewrote the backup boot sector
+in the partition's last sector and did nothing else. The formatter marks the
+cluster that holds the backup boot sector as allocated so the allocator stays
+off it; after a grow that cluster sits inside the volume, owned by nothing,
+and the bitmap is too short to address the clusters the volume gained.
+
+Reproduction, before the fix:
+
+```
+rb-cli new volume ntfs n.img --size 64M
+rb-cli resize n.img --size 70M
+rb-cli fsck --checkonly n.img
+  ERROR  [BitmapLeaked] 1 cluster(s) marked allocated in $Bitmap but referenced by nothing
+```
+
+Same result at 512-byte and 4 KiB clusters, for a grow of one cluster, and
+for a `restore` whose Original size policy grows the filesystem into a
+larger partition. The resize now rewrites `$Bitmap`: the clusters the volume
+gained are cleared, everything past the new end is marked, and when the
+bitmap outgrows its clusters it moves to a fresh first-fit run and the old
+one is released. Unit test `resize_keeps_the_volume_bitmap_in_step`; the
+e2e grow test runs fsck.
+
+### R-045 — no NTFS volume can be shrunk in place {#r-045}
+
+**FIXED 2026-09-02** (`fix(ntfs): the trim point no longer pins every
+in-place shrink to the volume size`). Kept for the reproduction.
+
+`NtfsFilesystem::last_data_byte` returned the larger of the data end and the
+backup boot sector's position, and the latter is the volume size by
+definition. `rb-cli resize --confirm-shrink`, the restore Minimum policy and
+the GUI's in-place minimum all consult it, so every NTFS shrink was refused
+as cutting live data:
+
+```
+rb-cli resize n.img --size 48M --confirm-shrink
+error: refusing to shrink NTFS to 48.0 MiB: its data extends to 64.0 MiB ...
+```
+
+The scan behind it also treated the formatter's end-of-volume mark as data,
+which is what `resize_ntfs_in_place`'s own guard tripped on. The trim point
+is now the last used cluster plus the one sector the resize rewrites the
+backup boot sector into, and both scans stop at the cluster count. Unit test
+`trim_point_leaves_room_to_shrink`.
+
+### Windows verification of the 2026-09-01/02 filesystem fixes
+
+The audit's Windows leg lets Windows itself judge the NTFS / exFAT / FAT
+fixes: a VHD Windows formatted and wrote to, edited with `rb-cli`, attached
+again and checked with a read-only `chkdsk`. The driver is
+`verify-fs-windows.ps1` from the session scratchpad; it runs elevated
+because attaching a VHD does.
+
+| ID | Fix | Check | Result |
+|----|-----|-------|--------|
+| D12 | 251b211, NTFS rename replaces every name | Windows-written long name with a DOS alias, `rb-cli mv`, `chkdsk`, `dir /x` | pending |
+| D8 | 9e083f5, delete respects hard links | `mklink /H` by Windows, `rb-cli rm` of one name, `chkdsk`, other name intact | pending |
+| D10 | 9e083f5, backup boot sector in the last sector | `partmap resize` + `resize`, backup sector compared, `chkdsk` | pending |
+| D1 | e008eff, NoFatChain files survive edits | Windows-written 1 MiB file, `rb-cli mv`, hash compared | pending |
+| D5 | e008eff, contiguous delete frees the run | Windows-written file removed with `rb-cli rm`, `chkdsk` | pending |
+| D7 | e008eff, resize past the bitmap keeps the up-case table | exFAT grown 64 -> 120 MiB, `chkdsk` | pending |
+| D9 | e5266da, directories grow the way Windows reads them | 400 long-named files put into a Windows-made directory, Explorer count | pending |
+| D2 | 33115a8, NTFS boot code survives the hidden-sectors patch | Windows NTFS moved to LBA 63 and restored to LBA 2048, sector 6 compared, `chkdsk` | pending |
+| D13 | eaa6f3d, Ghost reconstruction gets unique 8.3 aliases | needs a Ghost image with prefix-sharing long names; none on this machine (the fixtures and `C:\Temp\JoeBackup` carry 8.3 names only) | not verifiable here; unit test `skip_name_checks_creates_still_get_unique_short_names` covers it |
+| R15 | b060025, letterless volumes are locked | VHD volume with its letter removed, `show devices`, `restore --device` onto its PhysicalDrive, `chkdsk` | pending |
 
 ## Found while investigating a user report, 2026-08-17
 
