@@ -77,4 +77,19 @@ should agree byte for byte with `rb-cli cp`.
 Update the status line below, commit, push, then hand over to
 `docs/RESUME-audit-3-macos.md`.
 
-Status: not started.
+Status: IN PROGRESS 2026-09-02 (6c8a333..6980081). Step 0 done: the debug
+build survives here (395 s, 8.8 GB committed above baseline, measured with
+Defender scanning still on; the exclusion needs an elevated shell). Step 1
+done: R14 (45be254) and R15 (b060025) shipped, and every `DeviceIoControl`
+already passed a real `lpBytesReturned`, so the Win7 trap needed no change.
+Step 2 preparation turned up two NTFS defects, both fixed and logged as
+R-044 / R-045 in `docs/Regression_Bugs.md`, plus two gaps the plan assumed
+away: `rb-cli` had no `mv` (47e1261 adds it) and `new hd` wrote no VHD
+footer under a `.vhd` name (b600bcc). The Windows checks themselves need an
+elevated shell to attach VHDs and run chkdsk; the driver script
+`verify-fs-windows.ps1` (session scratchpad, `fsver/`) covers D12, D8, D10,
+D1, D5, D7, D9, D2 and a live R15. D13 has no Ghost image with long names on
+this machine and stays covered by its unit test. Record the script's results
+in the verification table in `docs/Regression_Bugs.md`, then close out.
+Step 3 (wire) still needs the Linux daemon. Push is blocked from the tool
+shell (no SSH key loaded); push by hand.
