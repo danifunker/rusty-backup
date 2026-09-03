@@ -482,6 +482,17 @@ research or sourced the needed ROMs/disks.
 
 ### 7.0 — Original user-side verification list (pre-2026-06-05)
 
+- **Ghost FAT32 long-name fixture (D13, shelved 2026-09-03)** — the
+  2026-09-01 audit's D13 (eaa6f3d: a Ghost reconstruction gives
+  prefix-sharing long names distinct 8.3 aliases) could not be judged by
+  Windows: every Ghost image at hand is 8.3-only, and a file-aware image
+  with a FAT and an NTFS partition exposes only the FAT one
+  ([F-010](missing_features_from_regression.md#f-010)). Needed: a Ghost
+  11.5 file-aware image, no password, of one FAT32 partition holding
+  `LongFileName1..5.txt`, `LongFileName_extra.txt`, a name with spaces, a
+  two-dot name, and a `LongDirectoryName` with three more, plus a `dir /x`
+  of the source. Then run `scripts/verify-fs-windows.ps1 -Only D13 -Ghost
+  <image>`. The unit test covers the fix meanwhile.
 - **HFV in BasiliskII / MAME** — boot/mount our blank + cloned HFVs
   against the bootable samples (`Mac OS 8.1.HFV`, `Starterdisk.hfv`).
   Our blank/cloned volumes fsck clean and round-trip byte-identically,

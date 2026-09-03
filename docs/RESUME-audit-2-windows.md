@@ -77,29 +77,23 @@ should agree byte for byte with `rb-cli cp`.
 Update the status line below, commit, push, then hand over to
 `docs/RESUME-audit-3-macos.md`.
 
-Status: IN PROGRESS 2026-09-03 (6c8a333..7b80241; four elevated verification runs done, a fifth pending after R-050). Step 0 done: the debug
-build survives here (395 s, 8.8 GB committed above baseline, measured with
-Defender scanning still on; the exclusion needs an elevated shell). Step 1
-done: R14 (45be254) and R15 (b060025) shipped, and every `DeviceIoControl`
-already passed a real `lpBytesReturned`, so the Win7 trap needed no change.
-Step 2 preparation turned up two NTFS defects, both fixed and logged as
-R-044 / R-045 in `docs/Regression_Bugs.md`, plus two gaps the plan assumed
-away: `rb-cli` had no `mv` (47e1261 adds it) and `new hd` wrote no VHD
-footer under a `.vhd` name (b600bcc). The Windows checks themselves need an
-elevated shell to attach VHDs and run chkdsk; the driver script
-`verify-fs-windows.ps1` (session scratchpad, `fsver/`) covers D12, D8, D10,
-D1, D5, D7, D9, D2 and a live R15. D13 has no Ghost image with long names on
-this machine and stays covered by its unit test. Run 1 found R-046 (rename
-instance id) and the exFAT cap that made Windows mount the volume RAW (fixed
-in 4c4816c); run 2 passed D1, D5, D7, D9, D10 and R15 and found R-047
-(`$Bitmap` quadword size) and R-048 (index entry contents). Run 3 passed
-D2 and found R-049 (a long name needs the POSIX namespace, not a lone Win32
-one). Run 4 cleared the rename and found R-050 (assembled records undercount
-the end marker) on the files rb-cli created. Run 5 re-checks D12 and D8 only
-(`-Only D12`); record it in the verification table in
-`docs/Regression_Bugs.md`, then close out. The Ghost fixtures in
-`C:\Temp\Ghost Multiple Partitions Fixtures.rar` and on the NAS share are
-the same 8.3-only synthetic set; D13 needs a Ghost image of a FAT volume
-with prefix-sharing long names, which nobody has yet.
-Step 3 (wire) still needs the Linux daemon. Push is blocked from the tool
-shell (no SSH key loaded); push by hand.
+Status: DONE 2026-09-03 (6c8a333..HEAD, one finding per commit). Step 0:
+the debug build survives here (395 s, 8.8 GB committed above baseline;
+`docs/build-memory-crashes.md`). Step 1: R14 (45be254) and R15 (b060025)
+shipped; every `DeviceIoControl` already passed a real `lpBytesReturned`, so
+the Win7 trap needed no change. Step 2 was the productive part: five
+elevated runs of `scripts/verify-fs-windows.ps1` (diskpart-formatted VHDs,
+Windows writes, rb-cli edits, read-only chkdsk) passed D1, D2, D5, D7, D8,
+D9, D10, D12 and a live R15, and on the way found seven defects our own
+fsck never saw, all fixed and logged as R-044..R-050 in
+`docs/Regression_Bugs.md`: the NTFS resize left `$Bitmap` stale, no NTFS
+volume could shrink, the exFAT grow capped the volume below its partition
+(Windows mounts that as RAW), a renamed name reused instance 0, the index
+entry carried stale times and raw sizes, long names used a lone Win32
+namespace, and assembled records undercounted the end marker. Two gaps the
+plan assumed away were filled too: `rb-cli mv` (47e1261) and a real footer
+for `new hd ... .vhd` (b600bcc). D13 is shelved: every Ghost image at hand
+is 8.3-only and a file-aware image with both a FAT and an NTFS partition
+exposes only the FAT one (F-010); the unit test covers the fix. Step 3
+(wire) was not run; it needs the Linux daemon. Push by hand (no SSH key in
+the tool shell), then hand over to `docs/RESUME-audit-3-macos.md`.

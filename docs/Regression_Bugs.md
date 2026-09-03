@@ -230,20 +230,20 @@ header against the marker.
 The audit's Windows leg lets Windows itself judge the NTFS / exFAT / FAT
 fixes: a VHD Windows formatted and wrote to, edited with `rb-cli`, attached
 again and checked with a read-only `chkdsk`. The driver is
-`verify-fs-windows.ps1` from the session scratchpad; it runs elevated
-because attaching a VHD does.
+`scripts/verify-fs-windows.ps1`; it runs elevated because attaching a VHD
+does, and `-Only` narrows it to one block.
 
 | ID | Fix | Check | Result |
 |----|-----|-------|--------|
-| D12 | 251b211, NTFS rename replaces every name | Windows-written long name with a DOS alias, `rb-cli mv`, `chkdsk`, `dir /x` | runs 1-3: the alias is gone and the new name listed, but chkdsk faulted the renamed record each time, which found R-046, R-048 and R-049 in turn. Run 4: the rename passes stage 2; chkdsk now corrects the header of the three records rb-cli created, which found R-050; run 5 pending |
-| D8 | 9e083f5, delete respects hard links | `mklink /H` by Windows, `rb-cli rm` of one name, `chkdsk`, other name intact | other name and content intact in runs 1-4; chkdsk verdict shares D12's volume, run 5 pending |
+| D12 | 251b211, NTFS rename replaces every name | Windows-written long name with a DOS alias, `rb-cli mv`, `chkdsk`, `dir /x` | **PASS** (run 5): alias gone, one name listed, chkdsk clean, with two long-named `put` files and a `mkdir` on the same volume. Runs 1-4 each faulted something, which found R-046, R-048, R-049 and R-050 in turn |
+| D8 | 9e083f5, delete respects hard links | `mklink /H` by Windows, `rb-cli rm` of one name, `chkdsk`, other name intact | **PASS** (run 5): the other name and its content intact, chkdsk clean |
 | D10 | 9e083f5, backup boot sector in the last sector | `partmap resize` + `resize`, backup sector compared, `chkdsk` | **PASS** (runs 1 and 2): backup sector at LBA start+TotalSectors matches, chkdsk clean, 30719 clusters |
 | D1 | e008eff, NoFatChain files survive edits | Windows-written 1 MiB file, `rb-cli mv`, hash compared | **PASS** (run 2): SHA-256 identical after the rename |
 | D5 | e008eff, contiguous delete frees the run | Windows-written file removed with `rb-cli rm`, `chkdsk` | **PASS** (run 2): chkdsk clean |
 | D7 | e008eff, resize past the bitmap keeps the up-case table | exFAT grown 64 -> 120 MiB, `chkdsk` | run 1: Windows mounted the result as RAW because the resize capped the volume below its partition; fixed in 4c4816c (FAT grows into the heap alignment gap). **PASS** (run 2): mounts as exFAT, chkdsk clean, 30672 clusters |
 | D9 | e5266da, directories grow the way Windows reads them | 400 long-named files put into a Windows-made directory, Explorer count | **PASS** (run 2): Explorer lists 405 of 405, the last file reads back |
 | D2 | 33115a8, NTFS boot code survives the hidden-sectors patch | Windows NTFS moved to LBA 63 and restored to LBA 2048, sector 6 compared, `chkdsk` | **PASS** (run 3): sectors 1-9 byte-identical to Windows' after the move to LBA 2048, hidden sectors patched, chkdsk clean. Run 2's chkdsk fault on the bitmap found R-047 |
-| D13 | eaa6f3d, Ghost reconstruction gets unique 8.3 aliases | needs a Ghost image with prefix-sharing long names; none on this machine (the fixtures and `C:\Temp\JoeBackup` carry 8.3 names only) | not verifiable here; unit test `skip_name_checks_creates_still_get_unique_short_names` covers it |
+| D13 | eaa6f3d, Ghost reconstruction gets unique 8.3 aliases | needs a Ghost image of a FAT volume with prefix-sharing long names; every Ghost image at hand (repo fixtures, the NAS share, the RAR set, and JoeBackup's reachable partition) is 8.3-only | **shelved** 2026-09-03; the unit test `skip_name_checks_creates_still_get_unique_short_names` covers it, see F-010 and the open-work note |
 | R15 | b060025, letterless volumes are locked | VHD volume with its letter removed, `show devices`, `restore --device` onto its PhysicalDrive, `chkdsk` | **PASS** (run 1): PhysicalDrive4 listed with an empty mount point, `Locking and dismounting volume Volume{...}` logged, restore completed, chkdsk clean |
 
 ## Found while investigating a user report, 2026-08-17
