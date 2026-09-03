@@ -1,4 +1,4 @@
-# Regression Findings (R-001 … R-049)
+# Regression Findings (R-001 … R-050)
 
 Defects and documentation drift turned up while building the regression suite
 (`regression-tests/`), 2026-08-01/02. The suite work was deliberately kept
@@ -19,6 +19,7 @@ finding depends on a fixture, the fixture is named.
 
 | ID | Severity | Area | Finding |
 |----|----------|------|---------|
+| ~~R-050~~ | ~~**High**~~ **FIXED** | `src/fs/ntfs.rs` | ~~Every MFT record rb-cli assembles carries a bytes-in-use four bytes short; chkdsk corrects the first free byte of each created file and directory~~ — the end marker counts as eight bytes, 2026-09-03 |
 | ~~R-049~~ | ~~**High**~~ **FIXED** | `src/fs/ntfs.rs` | ~~Every long name rb-cli writes to NTFS is a lone Win32-namespace name, which NTFS allows only beside a DOS alias; chkdsk reports minor file name errors~~ — POSIX namespace, as Windows writes with 8.3 creation off, 2026-09-02 |
 | ~~R-048~~ | ~~**High**~~ **FIXED** | `src/fs/ntfs.rs` | ~~A renamed NTFS entry's index entry carries the old name's creation snapshot and a raw byte count; chkdsk reports minor file name errors and an incorrect `$I30` entry~~ — the copies take the record's live times and the data attribute's real and allocated sizes, 2026-09-02 |
 | ~~R-047~~ | ~~**High**~~ **FIXED** | `src/fs/ntfs.rs` | ~~A resized `$Bitmap` is sized at ceil(clusters/8) bytes; Windows keeps whole quadwords and chkdsk reports the volume bitmap incorrect~~ — quadword rule, 2026-09-02 |
@@ -202,6 +203,28 @@ Windows wrote on the same volume with 8.3 creation off. The builder now
 follows that rule. It serves `create_file` as well, so every long name
 `put` had written to NTFS carried the same flaw.
 
+### R-050 — an assembled MFT record undercounts its end marker {#r-050}
+
+**FIXED 2026-09-03** (`fix(ntfs): an assembled MFT record counts its end
+marker as eight bytes`). Kept for the reproduction.
+
+The fourth Windows run of D12 added two `rb-cli put` files and one `mkdir`
+to the Windows-formatted volume. The rename checks were clean by then, and
+`chkdsk` reported instead:
+
+```
+First free byte offset corrected in file record segment 28.
+First free byte offset corrected in file record segment 29.
+First free byte offset corrected in file record segment 2A.
+```
+
+Those are the three created records. `assemble_mft_record` set the
+record's bytes-in-use to the end marker's offset plus four; Windows counts
+the marker as eight bytes (its own records show used = marker + 8), and
+chkdsk enforces it. Records rb-cli only edited kept the header Windows
+wrote and passed. Unit test creates a file and a directory and checks the
+header against the marker.
+
 ### Windows verification of the 2026-09-01/02 filesystem fixes
 
 The audit's Windows leg lets Windows itself judge the NTFS / exFAT / FAT
@@ -212,8 +235,8 @@ because attaching a VHD does.
 
 | ID | Fix | Check | Result |
 |----|-----|-------|--------|
-| D12 | 251b211, NTFS rename replaces every name | Windows-written long name with a DOS alias, `rb-cli mv`, `chkdsk`, `dir /x` | runs 1-3: the alias is gone and the new name listed, but chkdsk faulted the renamed record each time, which found R-046, R-048 and R-049 in turn; run 4 pending |
-| D8 | 9e083f5, delete respects hard links | `mklink /H` by Windows, `rb-cli rm` of one name, `chkdsk`, other name intact | other name and content intact in runs 1-3; chkdsk verdict shares D12's volume, run 4 pending |
+| D12 | 251b211, NTFS rename replaces every name | Windows-written long name with a DOS alias, `rb-cli mv`, `chkdsk`, `dir /x` | runs 1-3: the alias is gone and the new name listed, but chkdsk faulted the renamed record each time, which found R-046, R-048 and R-049 in turn. Run 4: the rename passes stage 2; chkdsk now corrects the header of the three records rb-cli created, which found R-050; run 5 pending |
+| D8 | 9e083f5, delete respects hard links | `mklink /H` by Windows, `rb-cli rm` of one name, `chkdsk`, other name intact | other name and content intact in runs 1-4; chkdsk verdict shares D12's volume, run 5 pending |
 | D10 | 9e083f5, backup boot sector in the last sector | `partmap resize` + `resize`, backup sector compared, `chkdsk` | **PASS** (runs 1 and 2): backup sector at LBA start+TotalSectors matches, chkdsk clean, 30719 clusters |
 | D1 | e008eff, NoFatChain files survive edits | Windows-written 1 MiB file, `rb-cli mv`, hash compared | **PASS** (run 2): SHA-256 identical after the rename |
 | D5 | e008eff, contiguous delete frees the run | Windows-written file removed with `rb-cli rm`, `chkdsk` | **PASS** (run 2): chkdsk clean |
