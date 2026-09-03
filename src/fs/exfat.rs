@@ -2069,13 +2069,40 @@ pub fn resize_exfat_in_place(
             * bytes_per_sector;
     let fat_length_sectors =
         u32::from_le_bytes([vbr[0x54], vbr[0x55], vbr[0x56], vbr[0x57]]) as u64;
-    let fat_capacity = (fat_length_sectors * bytes_per_sector / 4).saturating_sub(2);
+    let mut fat_length_sectors = fat_length_sectors;
+    let mut fat_capacity = (fat_length_sectors * bytes_per_sector / 4).saturating_sub(2);
+    if new_cluster_count as u64 > fat_capacity {
+        // Formatters align the cluster heap, leaving slack behind the FAT; a
+        // single FAT can grow into it before the volume has to be capped.
+        let fat_offset_sectors = (fat_offset - partition_offset) / bytes_per_sector;
+        let fat_end = fat_offset_sectors + fat_length_sectors;
+        let room = (cluster_heap_offset as u64).saturating_sub(fat_end);
+        let wanted = ((new_cluster_count as u64 + 2) * 4)
+            .div_ceil(bytes_per_sector)
+            .min(fat_length_sectors + room);
+        if vbr[0x6E] == 1 && wanted > fat_length_sectors {
+            let zero = vec![0u8; ((wanted - fat_length_sectors) * bytes_per_sector) as usize];
+            file.seek(SeekFrom::Start(
+                fat_offset + fat_length_sectors * bytes_per_sector,
+            ))?;
+            file.write_all(&zero)?;
+            log_cb(&format!(
+                "exFAT resize: FAT grown from {fat_length_sectors} to {wanted} sectors into the \
+                 gap before the cluster heap"
+            ));
+            fat_length_sectors = wanted;
+            vbr[0x54..0x58].copy_from_slice(&(wanted as u32).to_le_bytes());
+            fat_capacity = (fat_length_sectors * bytes_per_sector / 4).saturating_sub(2);
+        }
+    }
     if new_cluster_count as u64 > fat_capacity {
         new_cluster_count = fat_capacity as u32;
         new_volume_length_sectors = cluster_heap_offset as u64 + fat_capacity * sectors_per_cluster;
         log_cb(&format!(
-            "exFAT resize: the FAT holds {fat_capacity} clusters and cannot grow in place; \
-             the volume stops at {new_volume_length_sectors} sectors"
+            "exFAT resize: WARNING: the FAT holds {fat_capacity} clusters and cannot grow; the \
+             volume stops at {new_volume_length_sectors} sectors. Windows mounts an exFAT volume \
+             shorter than its partition as RAW, so shrink the partition entry to that size \
+             (`partmap resize`) or reformat"
         ));
     }
     if new_cluster_count == old_cluster_count {
@@ -2818,10 +2845,7 @@ mod tests {
             resize_exfat_in_place(&mut cur, 0, big / 512, &mut |m| log.push(m.to_string()))
                 .unwrap()
         );
-        assert!(
-            log.iter().any(|m| m.contains("cannot grow in place")),
-            "{log:?}"
-        );
+        assert!(log.iter().any(|m| m.contains("cannot grow")), "{log:?}");
         assert!(log.iter().any(|m| m.contains("bitmap moved")), "{log:?}");
         assert_eq!(
             &cur.get_ref()[upcase_off..upcase_off + 512],
@@ -2847,6 +2871,62 @@ mod tests {
                 "moved.bin",
                 &mut src,
                 3000,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(fs.read_file(&e, usize::MAX).unwrap(), payload);
+        let report = super::super::exfat_fsck::fsck_exfat(&mut fs).unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+    }
+
+    /// Windows aligns the cluster heap and leaves slack behind the FAT; a
+    /// resize that capped the volume there left Windows mounting it as RAW.
+    #[test]
+    fn resize_grow_extends_the_fat_into_the_heap_alignment_gap() {
+        let template = ExfatFormatTemplate {
+            bytes_per_sector: 512,
+            sectors_per_cluster: 8,
+            label: None,
+        };
+        // 6000 sectors: a 6-sector FAT, heap aligned up to sector 32, two
+        // sectors of slack good for 256 more FAT entries.
+        let small = 6000 * 512u64;
+        let big = 16 * 1024 * 1024u64;
+        let mut cur = std::io::Cursor::new(vec![0u8; big as usize]);
+        create_blank_exfat(&mut cur, &template, small).unwrap();
+        let vbr = cur.get_ref()[..512].to_vec();
+        let fat_len = u32::from_le_bytes([vbr[0x54], vbr[0x55], vbr[0x56], vbr[0x57]]);
+        let heap = u32::from_le_bytes([vbr[0x58], vbr[0x59], vbr[0x5A], vbr[0x5B]]);
+        assert_eq!((fat_len, heap), (6, 32), "formatter geometry moved");
+
+        let mut log = Vec::new();
+        assert!(
+            resize_exfat_in_place(&mut cur, 0, big / 512, &mut |m| log.push(m.to_string()))
+                .unwrap()
+        );
+        assert!(
+            log.iter().any(|m| m.contains("FAT grown from 6 to 8")),
+            "{log:?}"
+        );
+        let vbr = cur.get_ref()[..512].to_vec();
+        let fat_len = u32::from_le_bytes([vbr[0x54], vbr[0x55], vbr[0x56], vbr[0x57]]);
+        let count = u32::from_le_bytes([vbr[0x5C], vbr[0x5D], vbr[0x5E], vbr[0x5F]]);
+        let volume_len = u64::from_le_bytes(vbr[0x48..0x50].try_into().unwrap());
+        assert_eq!(fat_len, 8);
+        assert_eq!(count, 8 * 512 / 4 - 2, "every entry the grown FAT holds");
+        assert_eq!(volume_len, 32 + count as u64 * 8);
+        assert!(log.iter().any(|m| m.contains("WARNING")), "{log:?}");
+
+        let mut fs = ExfatFilesystem::open(cur, 0).unwrap();
+        let root = fs.root().unwrap();
+        let payload: Vec<u8> = (0..20000u32).map(|i| (i % 253) as u8).collect();
+        let mut src = std::io::Cursor::new(payload.clone());
+        let e = fs
+            .create_file(
+                &root,
+                "grown.bin",
+                &mut src,
+                20000,
                 &CreateFileOptions::default(),
             )
             .unwrap();
