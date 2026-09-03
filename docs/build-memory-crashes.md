@@ -139,10 +139,20 @@ Two things the measurement itself taught:
 
 Still open:
 
-- [ ] Same build on the Windows machine survives (unverified from here; the
-      expected mechanism there is MSVC `link.exe` plus PDB generation for
-      800 MB binaries exhausting commit charge, and the debuginfo trim
-      shrinks those PDBs too).
+- [x] Same build on the Windows machine survives (2026-09-02, Windows 11,
+      32 GB RAM, 65 GB commit limit, `target\debug` deleted first, Defender
+      real-time scanning still covering `target` because adding the
+      exclusion needs an elevated shell). `cargo test --no-run` finished in
+      395 s with exit 0. A 2-second sampler saw committed memory peak
+      8.8 GB above the 30.5 GB baseline, and the cargo / rustc / link.exe
+      family peak at 7.4 GB working set and 7.7 GB private bytes, with at
+      most 10 such processes alive. Lib-test binary 97 MB plus a 185 MB
+      PDB (the Linux 385 MB figure carries its DWARF inside the ELF), the
+      bin-test binary 49 MB plus 73 MB, `rb-cli.exe` 79 MB, 27 test
+      executables, 75 example binaries (2.0G), `deps` 4.6G, `incremental` 2.8G,
+      `target\debug` 9.5 GB in all. Nothing was killed and the desktop
+      stayed responsive; the MSVC PDB mechanism above is therefore contained
+      by the same debuginfo trim.
 - [x] `cargo clippy --all-targets -- -D warnings` (the hook's pass, same
       scope and sampler): green, 0 warnings, 158 s. Peak anonymous memory
       3.9 GB in the scope, system-wide used 6.6 GB, user-slice pressure
