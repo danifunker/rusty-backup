@@ -1779,8 +1779,9 @@ fn build_file_name_attr(
 
     // name length
     data[64] = utf16.len() as u8;
-    // Win32+DOS only when the name really is a valid 8.3 name; else Win32.
-    data[65] = if is_valid_dos_name(name) { 0x03 } else { 0x01 };
+    // Win32+DOS when the name is a valid 8.3 name; otherwise POSIX, the namespace
+    // Windows itself uses with 8.3 creation off. A lone Win32 name fails chkdsk.
+    data[65] = if is_valid_dos_name(name) { 0x03 } else { 0x00 };
 
     // UTF-16LE name
     for (i, &ch) in utf16.iter().enumerate() {
@@ -5999,8 +6000,9 @@ mod tests {
         assert!(!is_valid_dos_name("file.text")); // 4-char extension
         let short = build_file_name_attr(5, "ok.txt", false, 0, 0);
         assert_eq!(short[65], 0x03);
+        // A lone Win32 name is invalid without a DOS alias; Windows uses POSIX here.
         let long = build_file_name_attr(5, "Long File Name.textfile", false, 0, 0);
-        assert_eq!(long[65], 0x01);
+        assert_eq!(long[65], 0x00);
     }
 
     #[test]
