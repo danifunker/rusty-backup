@@ -4281,7 +4281,11 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
             &build_standard_information(FILE_ATTR_ARCHIVE, sec_id, stamp),
         );
         let parent_ref = self.file_reference(parent_record_num);
-        let file_name_value = build_file_name_attr(parent_ref, name, false, data_len, stamp);
+        let mut file_name_value = build_file_name_attr(parent_ref, name, false, data_len, stamp);
+        if data_len as usize > resident_threshold {
+            let alloc = data_len.div_ceil(self.cluster_size) * self.cluster_size;
+            file_name_value[40..48].copy_from_slice(&alloc.to_le_bytes());
+        }
         let file_name_attr = build_resident_attr(ATTR_FILE_NAME, &file_name_value);
 
         // 3.x resolves the ACL through $Secure by the inherited id; a per-file
@@ -4492,14 +4496,26 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
         let record_number = entry.location;
         let is_dir = entry.is_directory();
 
-        // A rename is not a creation: Windows keeps the original four timestamps,
-        // so carry them over from the existing $FILE_NAME instead of stamping now.
+        // chkdsk holds the index entry to the record's live times and sizes, so
+        // the copy is built from $STANDARD_INFORMATION and $DATA, not stamped now.
         let mut record = self.read_mft_record(record_number)?;
-        let old_times: Option<[u8; 32]> = parse_mft_attributes(&record, self.mft_record_size)
+        let attrs = parse_mft_attributes(&record, self.mft_record_size);
+        let si_times: Option<[u8; 32]> = attrs
             .iter()
-            .find(|a| a.attr_type == ATTR_FILE_NAME)
-            .and_then(|a| self.read_attribute_data(a, None).ok())
-            .and_then(|v| v.get(8..40).and_then(|s| s.try_into().ok()));
+            .find(|a| a.attr_type == ATTR_STANDARD_INFORMATION)
+            .and_then(|a| a.value.get(0..32).and_then(|s| s.try_into().ok()));
+        let (alloc_size, real_size) = attrs
+            .iter()
+            .find(|a| a.attr_type == ATTR_DATA)
+            .map(|a| {
+                if a.resident {
+                    let len = a.value.len() as u64;
+                    ((len + 7) & !7, len)
+                } else {
+                    (a.allocated_size, a.real_size)
+                }
+            })
+            .unwrap_or((0, 0));
 
         // The new name lives in two places: the child record's $FILE_NAME
         // attribute and the parent directory's $I30 index entry. Both carry a
@@ -4509,10 +4525,11 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
             parent_ref,
             new_name,
             is_dir,
-            entry.size,
+            real_size,
             now_ntfs_timestamp(),
         );
-        if let Some(times) = old_times {
+        new_fn_value[40..48].copy_from_slice(&alloc_size.to_le_bytes());
+        if let Some(times) = si_times {
             new_fn_value[8..40].copy_from_slice(&times);
         }
 
