@@ -139,9 +139,13 @@ Status: DONE 2026-09-02 (e815315..2f0dc50, one finding per commit). BR3 was
 then verified in QEMU after grub-pc-bin was installed: a GRUB disk built by
 hand (recipe in the session memory `grub-mbr-gap-qemu-recipe`) backs up with
 a 245-sector `mbr-gap.bin`, and both the zstd per-partition restore and the
-default single-file CHD restore boot to the GRUB marker. R5 needs root (the
-guard is umount2 plus an O_EXCL open of the device) and is run by the user
-with sudo against the USB stick; result recorded below when done.
+default single-file CHD restore boot to the GRUB marker. R5 was run by the user
+with sudo against a 28.7 GiB SanDisk USB stick: with a partition mounted, the
+CLI's device preflight refuses first ("has mounted partitions; unmount them
+and retry"); with the stick unmounted but claimed O_EXCL by another process,
+the restore refuses with R5's "still in use"; after the release the same
+restore completes (exit 0) and the stick carries the test disk. Both hardware
+checks are therefore done; leg 1 is complete.
 Also shipped on the way: the HFS+ trim point reserves the alternate-VH block
 (8d07d64), and H7 asks leg 3 to confirm the header placement with Disk First
 Aid. `bash scripts/preflight.sh` passed all six stages on e2ac069 (2026-09-02);
