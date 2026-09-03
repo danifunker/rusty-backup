@@ -4532,7 +4532,11 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
         for &i in ours.iter().rev() {
             remove_attr_at(&mut record, names[i].pos)?;
         }
-        let new_attr = build_resident_attr(ATTR_FILE_NAME, &new_fn_value);
+        let mut new_attr = build_resident_attr(ATTR_FILE_NAME, &new_fn_value);
+        // A fresh instance id: chkdsk calls an attribute sharing one corrupt.
+        let instance = u16::from_le_bytes([record[0x28], record[0x29]]);
+        new_attr[0x0E..0x10].copy_from_slice(&instance.to_le_bytes());
+        record[0x28..0x2A].copy_from_slice(&(instance + 1).to_le_bytes());
         match insert_at {
             Some(pos) => insert_attr_at(&mut record, pos, &new_attr)?,
             None => replace_resident_attr(&mut record, ATTR_FILE_NAME, &new_attr)?,
@@ -5741,6 +5745,31 @@ mod tests {
             .collect();
         assert_eq!(names.len(), 1, "one name after rename: {seen:?}");
         assert_eq!(names[0].name, "Renamed.txt");
+        // chkdsk called the renamed record corrupt when the new name reused
+        // $STANDARD_INFORMATION's instance id 0.
+        let mut instances = Vec::new();
+        let mut off = u16::from_le_bytes([record[0x14], record[0x15]]) as usize;
+        loop {
+            let atype = u32::from_le_bytes(record[off..off + 4].try_into().unwrap());
+            if atype == ATTR_END {
+                break;
+            }
+            instances.push(u16::from_le_bytes([record[off + 0x0E], record[off + 0x0F]]));
+            off += u32::from_le_bytes(record[off + 4..off + 8].try_into().unwrap()) as usize;
+        }
+        let mut unique = instances.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            instances.len(),
+            "instance ids clash: {instances:?}"
+        );
+        let next = u16::from_le_bytes([record[0x28], record[0x29]]);
+        assert!(
+            instances.iter().all(|i| *i < next),
+            "next id {next} vs {instances:?}"
+        );
         assert_eq!(
             u16::from_le_bytes([record[0x12], record[0x13]]),
             1,
