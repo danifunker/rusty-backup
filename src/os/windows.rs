@@ -188,6 +188,48 @@ pub fn is_elevated() -> bool {
     }
 }
 
+/// Quote one argument the way `CommandLineToArgvW` undoes it, so the
+/// relaunched process parses the same argv this one received.
+fn quote_cmdline_arg(arg: &str) -> String {
+    let needs_quotes = arg.is_empty() || arg.chars().any(|c| matches!(c, ' ' | '\t' | '\n' | '"'));
+    if !needs_quotes {
+        return arg.to_string();
+    }
+    let mut out = String::with_capacity(arg.len() + 2);
+    out.push('"');
+    let mut backslashes = 0usize;
+    for c in arg.chars() {
+        match c {
+            '\\' => backslashes += 1,
+            '"' => {
+                // Backslashes before a quote are literal only when doubled.
+                out.extend(crate::compat::repeat_n('\\', backslashes * 2 + 1));
+                out.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                out.extend(crate::compat::repeat_n('\\', backslashes));
+                out.push(c);
+                backslashes = 0;
+            }
+        }
+    }
+    // Trailing backslashes precede the closing quote, so they double too.
+    out.extend(crate::compat::repeat_n('\\', backslashes * 2));
+    out.push('"');
+    out
+}
+
+/// Join arguments into a `lpParameters` string; `None` when there are none.
+fn join_cmdline_args<I: IntoIterator<Item = String>>(args: I) -> Option<String> {
+    let joined: Vec<String> = args.into_iter().map(|a| quote_cmdline_arg(&a)).collect();
+    if joined.is_empty() {
+        None
+    } else {
+        Some(joined.join(" "))
+    }
+}
+
 /// Request elevation by relaunching the application with UAC prompt.
 ///
 /// This uses `ShellExecuteW` with the "runas" verb to trigger the UAC dialog.
@@ -196,6 +238,17 @@ pub fn request_elevation() -> Result<()> {
     let exe_path = env::current_exe().context("failed to get executable path")?;
     let exe_path_wide = to_wide(&exe_path.to_string_lossy());
     let verb = to_wide("runas");
+    // A file-association launch carries the image path in argv (R14); the
+    // elevated instance must see it or the double-clicked file is lost.
+    let params = join_cmdline_args(
+        env::args_os()
+            .skip(1)
+            .map(|a| a.to_string_lossy().into_owned()),
+    );
+    let params_wide = params.as_deref().map(to_wide);
+    let params_ptr = params_wide
+        .as_ref()
+        .map_or(PCWSTR::null(), |w| PCWSTR(w.as_ptr()));
 
     let mut exec_info = SHELLEXECUTEINFOW {
         cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
@@ -203,7 +256,7 @@ pub fn request_elevation() -> Result<()> {
         hwnd: HWND::default(),
         lpVerb: PCWSTR(verb.as_ptr()),
         lpFile: PCWSTR(exe_path_wide.as_ptr()),
-        lpParameters: PCWSTR::null(),
+        lpParameters: params_ptr,
         lpDirectory: PCWSTR::null(),
         nShow: SW_SHOW.0,
         hInstApp: Default::default(),
@@ -773,6 +826,25 @@ mod tests {
         assert_eq!(bus_type_to_string(13), "MMC");
         assert_eq!(bus_type_to_string(99), "");
         assert_eq!(bus_type_to_string(0), "");
+    }
+
+    #[test]
+    fn cmdline_args_round_trip_through_windows_quoting() {
+        assert_eq!(quote_cmdline_arg("plain.d88"), "plain.d88");
+        assert_eq!(
+            quote_cmdline_arg(r"C:\Disk Images\game.hdf"),
+            r#""C:\Disk Images\game.hdf""#
+        );
+        assert_eq!(quote_cmdline_arg(""), r#""""#);
+        assert_eq!(quote_cmdline_arg(r#"say "hi""#), r#""say \"hi\"""#);
+        assert_eq!(quote_cmdline_arg(r"dir\"), r"dir\");
+        assert_eq!(quote_cmdline_arg(r"a dir\"), r#""a dir\\""#);
+        assert_eq!(quote_cmdline_arg(r#"x\"y"#), r#""x\\\"y""#);
+        assert_eq!(join_cmdline_args(Vec::<String>::new()), None);
+        assert_eq!(
+            join_cmdline_args(vec!["--flag".to_string(), "a b".to_string()]),
+            Some(r#"--flag "a b""#.to_string())
+        );
     }
 
     #[test]
