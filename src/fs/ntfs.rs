@@ -884,16 +884,14 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
         for attr in &attrs {
             if attr.attr_type == ATTR_DATA {
                 let bitmap = self.read_attribute_data(attr, None)?;
-                // Scan backwards for last set bit
-                for byte_idx in (0..bitmap.len()).rev() {
-                    if bitmap[byte_idx] != 0 {
-                        // Find highest set bit in this byte
-                        let byte = bitmap[byte_idx];
-                        for bit in (0..8).rev() {
-                            if byte & (1 << bit) != 0 {
-                                return Ok(byte_idx as u64 * 8 + bit as u64);
-                            }
-                        }
+                // Bits at or past the cluster count are the end-of-volume mark, not data.
+                let volume_clusters =
+                    self.total_sectors * self.bytes_per_sector / self.cluster_size;
+                let mut c = (bitmap.len() as u64 * 8).min(volume_clusters);
+                while c > 0 {
+                    c -= 1;
+                    if bitmap[(c / 8) as usize] & (1 << (c % 8)) != 0 {
+                        return Ok(c);
                     }
                 }
                 return Ok(0);
@@ -1526,11 +1524,9 @@ impl<R: Read + Seek + Send> Filesystem for NtfsFilesystem<R> {
         if last_cluster == 0 {
             return Ok(self.total_size());
         }
-        // Include the full cluster plus one sector for the backup boot sector
-        let data_end = (last_cluster + 1) * self.cluster_size;
-        // NTFS has a backup boot sector at the last sector
-        let backup_boot = self.total_sectors * self.bytes_per_sector;
-        Ok(data_end.max(backup_boot))
+        // The last used cluster plus the backup boot sector a resize rewrites behind it.
+        let data_end = (last_cluster + 1) * self.cluster_size + self.bytes_per_sector;
+        Ok(data_end.min(self.total_size()))
     }
 
     /// The packed (defragmenting-clone) target size: a fresh NTFS holding only
@@ -5210,6 +5206,42 @@ mod tests {
         .unwrap();
         cur.seek(SeekFrom::Start(0)).unwrap();
         cur
+    }
+
+    /// The trim point was pinned to the volume size by its own backup boot
+    /// sector, so every in-place shrink was refused as cutting live data.
+    #[test]
+    fn trim_point_leaves_room_to_shrink() {
+        let mut img = format_test_volume(4096, 256).into_inner();
+        let (total, floor, cluster) = {
+            let mut fs = NtfsFilesystem::open(Cursor::new(&mut img), 0).unwrap();
+            (
+                fs.total_size(),
+                fs.last_data_byte().unwrap(),
+                fs.cluster_size,
+            )
+        };
+        assert!(
+            floor < total / 2,
+            "fresh volume trim point {floor} of {total}"
+        );
+        assert_eq!(
+            floor % cluster,
+            512,
+            "data end plus one sector for the backup boot"
+        );
+
+        let new_len = floor.div_ceil(1024 * 1024) * 1024 * 1024;
+        let mut cur = Cursor::new(&mut img);
+        assert!(resize_ntfs_in_place(&mut cur, 0, new_len / 512, &mut |_| {}).unwrap());
+        img.truncate(new_len as usize);
+        let mut fs = NtfsFilesystem::open(Cursor::new(&mut img), 0).unwrap();
+        let report = crate::fs::ntfs_fsck::fsck_ntfs(&mut fs).unwrap();
+        assert!(
+            report.errors.is_empty(),
+            "after shrink: {:?}",
+            report.errors
+        );
     }
 
     /// Resize used to patch only the boot sectors, so a grown volume kept the
