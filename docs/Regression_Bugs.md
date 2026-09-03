@@ -1,4 +1,4 @@
-# Regression Findings (R-001 … R-046)
+# Regression Findings (R-001 … R-048)
 
 Defects and documentation drift turned up while building the regression suite
 (`regression-tests/`), 2026-08-01/02. The suite work was deliberately kept
@@ -19,6 +19,8 @@ finding depends on a fixture, the fixture is named.
 
 | ID | Severity | Area | Finding |
 |----|----------|------|---------|
+| ~~R-048~~ | ~~**High**~~ **FIXED** | `src/fs/ntfs.rs` | ~~A renamed NTFS entry's index entry carries the old name's creation snapshot and a raw byte count; chkdsk reports minor file name errors and an incorrect `$I30` entry~~ — the copies take the record's live times and the data attribute's real and allocated sizes, 2026-09-02 |
+| ~~R-047~~ | ~~**High**~~ **FIXED** | `src/fs/ntfs.rs` | ~~A resized `$Bitmap` is sized at ceil(clusters/8) bytes; Windows keeps whole quadwords and chkdsk reports the volume bitmap incorrect~~ — quadword rule, 2026-09-02 |
 | ~~R-046~~ | ~~**High**~~ **FIXED** | `src/fs/ntfs.rs` | ~~A renamed NTFS entry's new `$FILE_NAME` reuses attribute instance 0, and Windows chkdsk calls the record corrupt~~ — the new attribute takes the record's next instance id, 2026-09-02 |
 | ~~R-045~~ | ~~**High**~~ **FIXED** | `src/fs/ntfs.rs` | ~~No NTFS volume can be shrunk in place: the trim point is pinned to the volume size by its own backup boot sector~~ — the trim point is the last used cluster plus one sector, and the scans stop at the cluster count, 2026-09-02 |
 | ~~R-044~~ | ~~**High**~~ **FIXED** | `src/fs/ntfs.rs` | ~~An in-place NTFS grow leaves `$Bitmap` at the old size with the formatter's end mark inside the volume; fsck reports a leaked cluster on every grown or Minimum-restored volume~~ — the resize rewrites `$Bitmap`, relocating it when it outgrows its clusters, 2026-09-02 |
@@ -145,6 +147,44 @@ the counter moves on; the rename unit test asserts every instance in the
 record is unique and below the counter. Our own fsck does not check
 instance ids, which is why it passed.
 
+### R-047 — a resized `$Bitmap` is not sized the way Windows keeps it {#r-047}
+
+**FIXED 2026-09-02** (`fix(ntfs): a resized $Bitmap is sized in whole
+quadwords, as Windows keeps it`). Kept for the reproduction.
+
+Found by the Windows verification of D2: a Windows-formatted NTFS volume,
+backed up, restored into a 66 MiB partition (the restore grows the
+filesystem to the partition) and attached; `chkdsk` ended with
+`The Volume Bitmap is incorrect` while our fsck was clean. R-044's resize
+sized `$Bitmap` at ceil(clusters / 8) bytes. Windows sizes it at
+ceil(clusters / 64) quadwords with every bit past the cluster count set:
+the Windows-made volume has 16111 clusters and a 2016-byte bitmap, the
+restored one 16888 clusters and our 2111 bytes where Windows wants 2112.
+The D10 grow through the same code passed only because 30719 clusters lands
+on a quadword. Quadword rule now; the unit test asserts it.
+
+### R-048 — a renamed entry's index entry disagrees with its record {#r-048}
+
+**FIXED 2026-09-02** (`fix(ntfs): a renamed entry's index entry carries the
+live times and true sizes`). Kept for the reproduction.
+
+The second `chkdsk` complaint behind D12, once R-046 had cleared the first:
+
+```
+Minor file name errors were detected in file 26.
+Index entry Renamed_After_D12_Fix.txt in index $I30 of file 5 is incorrect.
+```
+
+Both `$FILE_NAME` copies (record and `$I30` entry) were built from the old
+name's four creation timestamps and from the byte count alone, so the
+11-byte resident file carried allocated size 11. chkdsk holds the index
+entry to the record's `$STANDARD_INFORMATION` times and to the data
+attribute's real and allocated sizes: quadword-rounded for resident data
+(Windows' own entry for a 16-byte file says 16 / 16), cluster-rounded for
+non-resident. The rename now reads both from the record; the shared name
+builder rounds the allocated size for resident data and `create_file`
+overrides it with the cluster-rounded size for non-resident data.
+
 ### Windows verification of the 2026-09-01/02 filesystem fixes
 
 The audit's Windows leg lets Windows itself judge the NTFS / exFAT / FAT
@@ -155,16 +195,16 @@ because attaching a VHD does.
 
 | ID | Fix | Check | Result |
 |----|-----|-------|--------|
-| D12 | 251b211, NTFS rename replaces every name | Windows-written long name with a DOS alias, `rb-cli mv`, `chkdsk`, `dir /x` | pending |
-| D8 | 9e083f5, delete respects hard links | `mklink /H` by Windows, `rb-cli rm` of one name, `chkdsk`, other name intact | pending |
-| D10 | 9e083f5, backup boot sector in the last sector | `partmap resize` + `resize`, backup sector compared, `chkdsk` | pending |
-| D1 | e008eff, NoFatChain files survive edits | Windows-written 1 MiB file, `rb-cli mv`, hash compared | pending |
-| D5 | e008eff, contiguous delete frees the run | Windows-written file removed with `rb-cli rm`, `chkdsk` | pending |
-| D7 | e008eff, resize past the bitmap keeps the up-case table | exFAT grown 64 -> 120 MiB, `chkdsk` | pending |
-| D9 | e5266da, directories grow the way Windows reads them | 400 long-named files put into a Windows-made directory, Explorer count | pending |
-| D2 | 33115a8, NTFS boot code survives the hidden-sectors patch | Windows NTFS moved to LBA 63 and restored to LBA 2048, sector 6 compared, `chkdsk` | pending |
+| D12 | 251b211, NTFS rename replaces every name | Windows-written long name with a DOS alias, `rb-cli mv`, `chkdsk`, `dir /x` | run 1 and 2: chkdsk faulted the renamed record, which found R-046 and R-048; run 3 pending with 8.3 creation on |
+| D8 | 9e083f5, delete respects hard links | `mklink /H` by Windows, `rb-cli rm` of one name, `chkdsk`, other name intact | other name and content intact in runs 1 and 2; chkdsk verdict shares D12's volume, run 3 pending |
+| D10 | 9e083f5, backup boot sector in the last sector | `partmap resize` + `resize`, backup sector compared, `chkdsk` | **PASS** (runs 1 and 2): backup sector at LBA start+TotalSectors matches, chkdsk clean, 30719 clusters |
+| D1 | e008eff, NoFatChain files survive edits | Windows-written 1 MiB file, `rb-cli mv`, hash compared | **PASS** (run 2): SHA-256 identical after the rename |
+| D5 | e008eff, contiguous delete frees the run | Windows-written file removed with `rb-cli rm`, `chkdsk` | **PASS** (run 2): chkdsk clean |
+| D7 | e008eff, resize past the bitmap keeps the up-case table | exFAT grown 64 -> 120 MiB, `chkdsk` | run 1: Windows mounted the result as RAW because the resize capped the volume below its partition; fixed in 4c4816c (FAT grows into the heap alignment gap). **PASS** (run 2): mounts as exFAT, chkdsk clean, 30672 clusters |
+| D9 | e5266da, directories grow the way Windows reads them | 400 long-named files put into a Windows-made directory, Explorer count | **PASS** (run 2): Explorer lists 405 of 405, the last file reads back |
+| D2 | 33115a8, NTFS boot code survives the hidden-sectors patch | Windows NTFS moved to LBA 63 and restored to LBA 2048, sector 6 compared, `chkdsk` | boot code kept: sectors 1-9 byte-identical to Windows' after the move, hidden sectors 2048 (run 2). chkdsk faulted the bitmap, which found R-047; run 3 pending |
 | D13 | eaa6f3d, Ghost reconstruction gets unique 8.3 aliases | needs a Ghost image with prefix-sharing long names; none on this machine (the fixtures and `C:\Temp\JoeBackup` carry 8.3 names only) | not verifiable here; unit test `skip_name_checks_creates_still_get_unique_short_names` covers it |
-| R15 | b060025, letterless volumes are locked | VHD volume with its letter removed, `show devices`, `restore --device` onto its PhysicalDrive, `chkdsk` | pending |
+| R15 | b060025, letterless volumes are locked | VHD volume with its letter removed, `show devices`, `restore --device` onto its PhysicalDrive, `chkdsk` | **PASS** (run 1): PhysicalDrive4 listed with an empty mount point, `Locking and dismounting volume Volume{...}` logged, restore completed, chkdsk clean |
 
 ## Found while investigating a user report, 2026-08-17
 
