@@ -2609,6 +2609,88 @@ impl<R: Read + Write + Seek> NtfsFilesystem<R> {
         Ok(total_bits - set_bits)
     }
 
+    /// Bring `$Bitmap` in step with a volume that grew or shrank from
+    /// `old_total_sectors` to `new_total_sectors` (both excluding the backup boot sector).
+    fn resize_volume_bitmap(
+        &mut self,
+        old_total_sectors: u64,
+        new_total_sectors: u64,
+    ) -> Result<(), FilesystemError> {
+        let bps = self.bytes_per_sector;
+        let cs = self.cluster_size;
+        let old_vc = old_total_sectors * bps / cs;
+        let new_vc = new_total_sectors * bps / cs;
+        // The bitmap spans every cluster of the partition, backup-boot-sector cluster
+        // included, the way the formatter lays it out.
+        let part_clusters = (new_total_sectors + 1) * bps / cs;
+        let needed = (part_clusters as usize).div_ceil(8).max(1);
+
+        let (old_bitmap, old_runs) = self.read_volume_bitmap()?;
+        let mut bitmap = old_bitmap;
+        bitmap.resize(needed, 0);
+        // Clusters the volume gained are free; everything past its end is off limits.
+        for c in old_vc.min(new_vc)..new_vc {
+            bitmap[(c / 8) as usize] &= !(1 << (c % 8));
+        }
+        for c in new_vc..(needed as u64 * 8) {
+            bitmap[(c / 8) as usize] |= 1 << (c % 8);
+        }
+
+        let mut record = self.read_mft_record(MFT_RECORD_BITMAP)?;
+        let (pos, _) = find_attr_pos(&record, ATTR_DATA, false)
+            .ok_or_else(|| FilesystemError::Parse("$Bitmap $DATA attribute not found".into()))?;
+        let instance = [record[pos + 0x0E], record[pos + 0x0F]];
+        let allocated_clusters: u64 = old_runs
+            .iter()
+            .filter(|r| !r.sparse)
+            .map(|r| r.length)
+            .sum();
+
+        if needed as u64 <= allocated_clusters * cs {
+            // Slack past the real size reads as "in use" should anything ignore the size.
+            let mut padded = bitmap;
+            padded.resize((allocated_clusters * cs) as usize, 0xFF);
+            self.write_volume_bitmap(&padded, &old_runs)?;
+            record[pos + 0x30..pos + 0x38].copy_from_slice(&(needed as u64).to_le_bytes());
+            record[pos + 0x38..pos + 0x40].copy_from_slice(&(needed as u64).to_le_bytes());
+            return self.write_mft_record(MFT_RECORD_BITMAP, &mut record);
+        }
+
+        // The bitmap outgrew its clusters: give it a fresh run, then release the old one.
+        let want = (needed as u64).div_ceil(cs);
+        let new_runs = find_free_cluster_runs(&bitmap, new_vc, want)?;
+        for &(start, len) in &new_runs {
+            for c in start..start + len {
+                bitmap[(c / 8) as usize] |= 1 << (c % 8);
+            }
+        }
+        for run in old_runs
+            .iter()
+            .filter(|r| !r.sparse && r.cluster_offset >= 0)
+        {
+            let start = run.cluster_offset as u64;
+            for c in start..(start + run.length).min(new_vc) {
+                bitmap[(c / 8) as usize] &= !(1 << (c % 8));
+            }
+        }
+        let runs: Vec<DataRun> = new_runs
+            .iter()
+            .map(|&(start, len)| DataRun {
+                cluster_offset: start as i64,
+                length: len,
+                sparse: false,
+            })
+            .collect();
+        let mut padded = bitmap;
+        padded.resize((want * cs) as usize, 0xFF);
+        self.write_volume_bitmap(&padded, &runs)?;
+        let mut attr =
+            build_named_nonresident_attr(ATTR_DATA, "", &new_runs, want * cs, needed as u64);
+        attr[0x0E..0x10].copy_from_slice(&instance);
+        replace_attr_at(&mut record, pos, &attr)?;
+        self.write_mft_record(MFT_RECORD_BITMAP, &mut record)
+    }
+
     /// Read parent directory's security descriptor, or build a default one.
     /// If the parent's SD is too large to fit as a resident attribute, uses a minimal default.
     /// Inherit the parent's `$Secure` entry: its descriptor is already registered, so no new one
@@ -3576,6 +3658,49 @@ fn file_name_attrs(record: &[u8]) -> Vec<FileNameAttr> {
         pos += alen;
     }
     out
+}
+
+/// First-fit `want` free clusters below `limit` as (start, length) runs, one
+/// contiguous run when the volume has one, fragments otherwise.
+fn find_free_cluster_runs(
+    bitmap: &[u8],
+    limit: u64,
+    want: u64,
+) -> Result<Vec<(u64, u64)>, FilesystemError> {
+    let is_free = |c: u64| bitmap[(c / 8) as usize] & (1 << (c % 8)) == 0;
+    let limit = limit.min(bitmap.len() as u64 * 8);
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    let mut c = 0;
+    while c < limit {
+        if !is_free(c) {
+            c += 1;
+            continue;
+        }
+        let start = c;
+        while c < limit && is_free(c) {
+            c += 1;
+        }
+        if c - start >= want {
+            return Ok(vec![(start, want)]);
+        }
+        runs.push((start, c - start));
+    }
+    let mut left = want;
+    let mut picked = Vec::new();
+    for (start, len) in runs {
+        if left == 0 {
+            break;
+        }
+        let take = len.min(left);
+        picked.push((start, take));
+        left -= take;
+    }
+    if left > 0 {
+        return Err(FilesystemError::DiskFull(
+            "not enough free clusters to grow $Bitmap".into(),
+        ));
+    }
+    Ok(picked)
 }
 
 /// Remove the attribute at `pos`, closing the gap and shrinking the used size.
@@ -4752,12 +4877,15 @@ pub fn resize_ntfs_in_place(
     let mft_offset = partition_offset + mft_cluster * cluster_size;
     let bitmap_offset = mft_offset + MFT_RECORD_BITMAP * mft_record_size as u64;
 
+    // Bits at or past the old cluster count are the end-of-volume mark, not data.
+    let old_volume_clusters = old_total * bytes_per_sector / cluster_size;
     if let Ok(last_cluster) = read_last_used_cluster_from_bitmap(
         file,
         bitmap_offset,
         partition_offset,
         mft_record_size,
         cluster_size,
+        old_volume_clusters,
     ) {
         let last_data_byte = (last_cluster + 1) * cluster_size;
         let new_size = new_total_sectors * bytes_per_sector;
@@ -4792,6 +4920,16 @@ pub fn resize_ntfs_in_place(
         new_total_sectors
     ));
 
+    // Without this the gained clusters stay unaddressable and the formatter's
+    // end-of-volume mark turns into a leaked cluster chkdsk objects to.
+    {
+        let mut fs = NtfsFilesystem::open(&mut *file, partition_offset)
+            .map_err(|e| anyhow::anyhow!("NTFS: cannot reopen the resized volume: {e}"))?;
+        fs.resize_volume_bitmap(old_total, new_total_sectors)
+            .map_err(|e| anyhow::anyhow!("NTFS: cannot resize $Bitmap: {e}"))?;
+    }
+    log_cb("NTFS: $Bitmap brought in step with the new cluster count");
+
     Ok(true)
 }
 
@@ -4802,6 +4940,7 @@ fn read_last_used_cluster_from_bitmap(
     partition_offset: u64,
     mft_record_size: u32,
     cluster_size: u64,
+    volume_clusters: u64,
 ) -> Result<u64> {
     file.seek(SeekFrom::Start(bitmap_record_offset))?;
     let mut record = vec![0u8; mft_record_size as usize];
@@ -4835,14 +4974,11 @@ fn read_last_used_cluster_from_bitmap(
                 data
             };
 
-            for byte_idx in (0..bitmap.len()).rev() {
-                if bitmap[byte_idx] != 0 {
-                    let byte = bitmap[byte_idx];
-                    for bit in (0..8).rev() {
-                        if byte & (1 << bit) != 0 {
-                            return Ok(byte_idx as u64 * 8 + bit as u64);
-                        }
-                    }
+            let mut c = (bitmap.len() as u64 * 8).min(volume_clusters);
+            while c > 0 {
+                c -= 1;
+                if bitmap[(c / 8) as usize] & (1 << (c % 8)) != 0 {
+                    return Ok(c);
                 }
             }
             return Ok(0);
@@ -5074,6 +5210,71 @@ mod tests {
         .unwrap();
         cur.seek(SeekFrom::Start(0)).unwrap();
         cur
+    }
+
+    /// Resize used to patch only the boot sectors, so a grown volume kept the
+    /// formatter's end mark as a leaked cluster and a bitmap too short for it.
+    #[test]
+    fn resize_keeps_the_volume_bitmap_in_step() {
+        let cases: [(u32, i64); 4] = [
+            (512, 6 * 1024 * 1024),
+            (4096, 4096),
+            (4096, 6 * 1024 * 1024),
+            (4096, -4 * 1024 * 1024),
+        ];
+        for (cluster, delta) in cases {
+            let mut img = format_test_volume(cluster, 256).into_inner();
+            let new_len = (img.len() as i64 + delta) as u64;
+            img.resize(new_len as usize, 0);
+            let mut cur = Cursor::new(img);
+            let changed = resize_ntfs_in_place(&mut cur, 0, new_len / 512, &mut |_| {}).unwrap();
+            assert!(changed, "cluster {cluster} delta {delta}");
+            let mut img = cur.into_inner();
+
+            let total_sectors = new_len / 512 - 1;
+            assert_eq!(
+                img[(total_sectors * 512) as usize..(total_sectors * 512 + 512) as usize],
+                img[..512],
+                "backup boot sector sits in the last sector"
+            );
+            let mut fs = NtfsFilesystem::open(Cursor::new(&mut img), 0).unwrap();
+            let report = crate::fs::ntfs_fsck::fsck_ntfs(&mut fs).unwrap();
+            assert!(
+                report.errors.is_empty(),
+                "cluster {cluster} delta {delta}: {:?}",
+                report.errors
+            );
+            let geom = fs.fsck_geometry();
+            let bm = fs.fsck_read_volume_bitmap().unwrap();
+            let part_clusters = new_len / cluster as u64;
+            assert_eq!(bm.len() as u64, part_clusters.div_ceil(8), "bitmap length");
+            let bit = |c: u64| bm[(c / 8) as usize] & (1 << (c % 8)) != 0;
+            assert!(
+                bit(geom.total_clusters),
+                "the cluster past the volume end stays marked"
+            );
+            assert!(
+                !bit(geom.total_clusters - 1),
+                "the last volume cluster is free"
+            );
+            // The volume still allocates and lists after the rewrite.
+            let root = fs.root().unwrap();
+            let mut data = std::io::Cursor::new(vec![7u8; 100_000]);
+            fs.create_file(
+                &root,
+                "after.bin",
+                &mut data,
+                100_000,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+            let report = crate::fs::ntfs_fsck::fsck_ntfs(&mut fs).unwrap();
+            assert!(
+                report.errors.is_empty(),
+                "after create: {:?}",
+                report.errors
+            );
+        }
     }
 
     /// A second `$FILE_NAME` on a record is a hard link; deleting one name

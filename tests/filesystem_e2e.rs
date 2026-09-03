@@ -1205,6 +1205,14 @@ fn test_ntfs_resize_grows() {
     let root = fs.root().unwrap();
     let entries = fs.list_directory(&root).unwrap();
     assert!(entries.iter().any(|e| e.name == "hello.txt"));
+
+    // The grown volume's $Bitmap must cover the new clusters with nothing leaked.
+    let report = rusty_backup::fs::ntfs_fsck::fsck_ntfs(&mut fs).unwrap();
+    assert!(
+        report.errors.is_empty(),
+        "fsck after grow: {:?}",
+        report.errors
+    );
 }
 
 // ============================================================================
