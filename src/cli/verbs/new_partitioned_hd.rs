@@ -83,7 +83,8 @@ pub struct CylinderHdArgs {
 
 #[derive(Debug, Args)]
 pub struct PartitionedHdArgs {
-    /// Image file to create.
+    /// Image file to create. A `.vhd` name gets a fixed-VHD footer, so
+    /// Windows Disk Management and Hyper-V attach the file as it is.
     pub image: PathBuf,
 
     /// Total disk size (accepts `K`/`M`/`G` suffixes).
@@ -234,6 +235,25 @@ pub fn run(cmd: PartitionedHdCommand) -> Result<()> {
                 format_size(image.len() as u64),
             ));
         }
+    }
+
+    // A `.vhd` name promises a disk Windows and Hyper-V attach directly; a raw
+    // image under that name is refused by both, so give it the fixed-VHD footer.
+    let is_vhd = args
+        .image
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("vhd"));
+    if is_vhd {
+        let mut img = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&args.image)
+            .with_context(|| format!("reopening {}", args.image.display()))?;
+        std::io::Write::write_all(
+            &mut img,
+            &crate::rbformats::vhd::build_vhd_footer(disk_size),
+        )
+        .context("appending the VHD footer")?;
+        log_stderr("appended a fixed-VHD footer (Disk Management can attach the file)");
     }
 
     log_stderr(format!(

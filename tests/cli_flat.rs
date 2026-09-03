@@ -1598,3 +1598,31 @@ fn mv_renames_in_place_and_refuses_cross_directory_moves() {
     let ls = String::from_utf8(run(&["ls", img_s, "/"]).stdout).unwrap();
     assert!(ls.contains("final.txt") && ls.contains("Sub"), "{ls}");
 }
+
+#[test]
+fn new_hd_with_a_vhd_name_carries_a_fixed_vhd_footer() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let img = dir.path().join("disk.vhd");
+    let img_s = img.to_str().unwrap();
+    run(&[
+        "new",
+        "hd",
+        "mbr",
+        "--size",
+        "8M",
+        "--partition",
+        "rest:06",
+        img_s,
+    ]);
+    let bytes = std::fs::read(&img).unwrap();
+    assert_eq!(
+        bytes.len(),
+        8 * 1024 * 1024 + 512,
+        "disk plus one footer sector"
+    );
+    assert_eq!(&bytes[bytes.len() - 512..][..8], b"conectix");
+    // The container opens as a VHD and still shows the table it wraps.
+    let out = String::from_utf8(run(&["inspect", img_s]).stdout).unwrap();
+    assert!(out.contains("MBR"), "{out}");
+    assert!(out.contains("2048"), "{out}");
+}

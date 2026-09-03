@@ -1043,7 +1043,7 @@ Usage: apm [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
 
 **Arguments**
 
-- `<IMAGE>` — Image file to create
+- `<IMAGE>` — Image file to create. A `.vhd` name gets a fixed-VHD footer, so Windows Disk Management and Hyper-V attach the file as it is
 
 **Options**
 
@@ -1064,7 +1064,7 @@ Usage: atari [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
 
 **Arguments**
 
-- `<IMAGE>` — Image file to create
+- `<IMAGE>` — Image file to create. A `.vhd` name gets a fixed-VHD footer, so Windows Disk Management and Hyper-V attach the file as it is
 
 **Options**
 
@@ -1085,7 +1085,7 @@ Usage: gpt [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
 
 **Arguments**
 
-- `<IMAGE>` — Image file to create
+- `<IMAGE>` — Image file to create. A `.vhd` name gets a fixed-VHD footer, so Windows Disk Management and Hyper-V attach the file as it is
 
 **Options**
 
@@ -1106,7 +1106,7 @@ Usage: mbr [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
 
 **Arguments**
 
-- `<IMAGE>` — Image file to create
+- `<IMAGE>` — Image file to create. A `.vhd` name gets a fixed-VHD footer, so Windows Disk Management and Hyper-V attach the file as it is
 
 **Options**
 
@@ -1127,7 +1127,7 @@ Usage: next [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
 
 **Arguments**
 
-- `<IMAGE>` — Image file to create
+- `<IMAGE>` — Image file to create. A `.vhd` name gets a fixed-VHD footer, so Windows Disk Management and Hyper-V attach the file as it is
 
 **Options**
 
@@ -1150,7 +1150,7 @@ Usage: rdb [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
 
 **Arguments**
 
-- `<IMAGE>` — Image file to create
+- `<IMAGE>` — Image file to create. A `.vhd` name gets a fixed-VHD footer, so Windows Disk Management and Hyper-V attach the file as it is
 
 **Options**
 
@@ -1173,7 +1173,7 @@ Usage: sgi [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
 
 **Arguments**
 
-- `<IMAGE>` — Image file to create
+- `<IMAGE>` — Image file to create. A `.vhd` name gets a fixed-VHD footer, so Windows Disk Management and Hyper-V attach the file as it is
 
 **Options**
 
@@ -1196,7 +1196,7 @@ Usage: sgi-dklabel [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
 
 **Arguments**
 
-- `<IMAGE>` — Image file to create
+- `<IMAGE>` — Image file to create. A `.vhd` name gets a fixed-VHD footer, so Windows Disk Management and Hyper-V attach the file as it is
 
 **Options**
 
@@ -1247,7 +1247,7 @@ Usage: solaris-x86 [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
 
 **Arguments**
 
-- `<IMAGE>` — Image file to create
+- `<IMAGE>` — Image file to create. A `.vhd` name gets a fixed-VHD footer, so Windows Disk Management and Hyper-V attach the file as it is
 
 **Options**
 
@@ -1270,7 +1270,7 @@ Usage: sun [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
 
 **Arguments**
 
-- `<IMAGE>` — Image file to create
+- `<IMAGE>` — Image file to create. A `.vhd` name gets a fixed-VHD footer, so Windows Disk Management and Hyper-V attach the file as it is
 
 **Options**
 
@@ -1315,7 +1315,7 @@ Usage: x68k-table [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
 
 **Arguments**
 
-- `<IMAGE>` — Image file to create
+- `<IMAGE>` — Image file to create. A `.vhd` name gets a fixed-VHD footer, so Windows Disk Management and Hyper-V attach the file as it is
 
 **Options**
 
