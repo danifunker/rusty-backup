@@ -35,6 +35,7 @@ pub mod mac_scsi_bless;
 pub mod make_bootable;
 pub mod menu;
 pub mod mkdir;
+pub mod mv;
 pub mod new;
 pub mod new_mac_cdrom;
 pub mod new_partitioned_hd;

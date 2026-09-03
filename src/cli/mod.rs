@@ -135,6 +135,9 @@ pub enum Command {
     /// Delete a file or directory from a filesystem.
     Rm(verbs::rm::RmArgs),
 
+    /// Rename a file or directory in place inside a filesystem.
+    Mv(verbs::mv::MvArgs),
+
     /// Create a directory inside a filesystem.
     Mkdir(verbs::mkdir::MkdirArgs),
 
@@ -486,6 +489,7 @@ pub fn dispatch(command: Command) -> Result<()> {
         Command::Import(args) => verbs::import::run(args),
         Command::Cp(args) => verbs::cp::run(args),
         Command::Rm(args) => verbs::rm::run(args),
+        Command::Mv(args) => verbs::mv::run(args),
         Command::Mkdir(args) => verbs::mkdir::run(args),
         Command::Fsck(args) => verbs::fsck::run(args),
         Command::Shrink(args) => verbs::shrink::run(args),

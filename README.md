@@ -143,7 +143,7 @@ you don't want to set up the cross toolchain locally.
 
 What's in the MiSTer build:
 - Every filesystem operation (`ls`, `put`, `get`, `tar`, `untar`, `rm`,
-  `mkdir`, `fsck`, `resize`, `expand`, `chmeta`, `bless`, …) on FAT, NTFS,
+  `mv`, `mkdir`, `fsck`, `resize`, `expand`, `chmeta`, `bless`, …) on FAT, NTFS,
   exFAT, HFS, HFS+, ext, AFFS, PFS3, SFS, ProDOS, Human68k, ADFS, etc.
 - `inspect`, `backup`, `restore` for Raw, VHD, QCOW2, VMDK, Zstd, the
   four floppy container formats, **and CHD**.

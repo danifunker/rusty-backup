@@ -41,6 +41,7 @@ fn top_level_verbs_present() {
         "get",
         "cp",
         "rm",
+        "mv",
         "mkdir",
         "fsck",
         "shrink",
