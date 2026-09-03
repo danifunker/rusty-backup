@@ -77,7 +77,7 @@ should agree byte for byte with `rb-cli cp`.
 Update the status line below, commit, push, then hand over to
 `docs/RESUME-audit-3-macos.md`.
 
-Status: IN PROGRESS 2026-09-02 (6c8a333..6980081). Step 0 done: the debug
+Status: IN PROGRESS 2026-09-02 (6c8a333..5e397ab; two elevated verification runs done, a third pending after R-046..R-048). Step 0 done: the debug
 build survives here (395 s, 8.8 GB committed above baseline, measured with
 Defender scanning still on; the exclusion needs an elevated shell). Step 1
 done: R14 (45be254) and R15 (b060025) shipped, and every `DeviceIoControl`
@@ -89,7 +89,11 @@ footer under a `.vhd` name (b600bcc). The Windows checks themselves need an
 elevated shell to attach VHDs and run chkdsk; the driver script
 `verify-fs-windows.ps1` (session scratchpad, `fsver/`) covers D12, D8, D10,
 D1, D5, D7, D9, D2 and a live R15. D13 has no Ghost image with long names on
-this machine and stays covered by its unit test. Record the script's results
+this machine and stays covered by its unit test. Run 1 found R-046 (rename
+instance id) and the exFAT cap that made Windows mount the volume RAW (fixed
+in 4c4816c); run 2 passed D1, D5, D7, D9, D10 and R15 and found R-047
+(`$Bitmap` quadword size) and R-048 (index entry contents). Run 3 must
+re-check D12, D8 and D2, now with 8.3 creation turned on for D12; record it
 in the verification table in `docs/Regression_Bugs.md`, then close out.
 Step 3 (wire) still needs the Linux daemon. Push is blocked from the tool
 shell (no SSH key loaded); push by hand.
