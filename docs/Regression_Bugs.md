@@ -1,4 +1,4 @@
-# Regression Findings (R-001 … R-045)
+# Regression Findings (R-001 … R-046)
 
 Defects and documentation drift turned up while building the regression suite
 (`regression-tests/`), 2026-08-01/02. The suite work was deliberately kept
@@ -19,6 +19,7 @@ finding depends on a fixture, the fixture is named.
 
 | ID | Severity | Area | Finding |
 |----|----------|------|---------|
+| ~~R-046~~ | ~~**High**~~ **FIXED** | `src/fs/ntfs.rs` | ~~A renamed NTFS entry's new `$FILE_NAME` reuses attribute instance 0, and Windows chkdsk calls the record corrupt~~ — the new attribute takes the record's next instance id, 2026-09-02 |
 | ~~R-045~~ | ~~**High**~~ **FIXED** | `src/fs/ntfs.rs` | ~~No NTFS volume can be shrunk in place: the trim point is pinned to the volume size by its own backup boot sector~~ — the trim point is the last used cluster plus one sector, and the scans stop at the cluster count, 2026-09-02 |
 | ~~R-044~~ | ~~**High**~~ **FIXED** | `src/fs/ntfs.rs` | ~~An in-place NTFS grow leaves `$Bitmap` at the old size with the formatter's end mark inside the volume; fsck reports a leaked cluster on every grown or Minimum-restored volume~~ — the resize rewrites `$Bitmap`, relocating it when it outgrows its clusters, 2026-09-02 |
 | ~~R-043~~ | ~~**High**~~ **FIXED** | `src/cli/resolve.rs`, `src/model/browse_session.rs` | ~~Every edit verb refuses a **dynamic VHD**~~ — one classifier (`source_reader::open_container_rw`) now feeds both the CLI resolver and the GUI edit session: dynamic VHD, sparse VMDK and QCOW2 edit in place through their codecs, and decode-only containers are refused with a reason instead of "Invalid MBR", 2026-09-01 |
@@ -123,6 +124,26 @@ which is what `resize_ntfs_in_place`'s own guard tripped on. The trim point
 is now the last used cluster plus the one sector the resize rewrites the
 backup boot sector into, and both scans stop at the cluster count. Unit test
 `trim_point_leaves_room_to_shrink`.
+
+### R-046 — a renamed NTFS entry's new name reuses attribute instance 0 {#r-046}
+
+**FIXED 2026-09-02** (`fix(ntfs): a renamed entry's new name gets its own
+attribute instance id`). Kept for the reproduction.
+
+Found by the Windows verification of D12 (251b211). Windows formatted a
+VHD and wrote `ThisIsALongFileName_for_D12.txt`; `rb-cli mv` renamed it;
+our fsck was clean; Windows `chkdsk` said:
+
+```
+Attribute record (30, "") from file record segment 26 is corrupt.
+```
+
+Record 0x26 is the renamed file. Its new `$FILE_NAME` carried instance id 0,
+the id `$STANDARD_INFORMATION` already holds, and the record's next-instance
+counter was never bumped. The attribute now takes the counter's value and
+the counter moves on; the rename unit test asserts every instance in the
+record is unique and below the counter. Our own fsck does not check
+instance ids, which is why it passed.
 
 ### Windows verification of the 2026-09-01/02 filesystem fixes
 

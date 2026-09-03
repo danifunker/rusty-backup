@@ -21,6 +21,7 @@ concrete reason to.
 | ~~F-008~~ | ~~`backup` reads only flat-layout sources~~ — **SHIPPED** 2026-08-15 | `src/cli/verbs/backup.rs` | — |
 | ~~F-009~~ | ~~SFS editor writes single-leaf extent b-trees only~~ — **SHIPPED** 2026-08-17 | `src/fs/sfs.rs` | — |
 | ~~F-004~~ | ~~`show partmap` is APM-only~~ — **SHIPPED** 2026-08-08, same gap as R-026 | `src/cli/verbs/show.rs` | — |
+| [F-010](#f-010) | A file-aware Ghost image exposes only its FAT record stream; an NTFS partition behind it is unreachable | `src/rbformats/gho.rs` | D13's Windows check (a real multi-partition `.GHO` with long names) |
 
 ---
 
@@ -583,3 +584,26 @@ one addition: Kickstart has no SFS handler in ROM, so the guest needs the SFS
 handler staged into `L:` (it is at `rb-fixtures/oracle-assets/amiga`,
 extracted from the SFS reference fixture's own `L:`). So the code is the
 work now, not the proof.
+
+## F-010 — a file-aware Ghost image exposes only its FAT record stream {#f-010}
+
+Found 2026-09-02 while looking for a Ghost image to verify D13 (eaa6f3d,
+unique 8.3 aliases for prefix-sharing long names) against Windows.
+`C:\Temp\JoeBackup\JoeBa.GHO` is a complete 12-span, 24 GB file-aware
+backup of a Dell machine. `rb-cli inspect` reports one partition: the
+39 MB Dell utility FAT volume, 70 files, all 8.3 names.
+
+`GhoReader::open` dispatches a file-aware image on whether a FAT record
+stream is present: with one, the whole image becomes that single FAT
+partition; without one, it tries the NTFS file-aware path (GHPR metadata
+plus packed cluster runs). An image holding both, which is what every Dell
+or OEM machine of the era produces, never reaches its NTFS partition, so
+the Windows volume with the long names cannot be reconstructed, browsed or
+restored from it.
+
+What it would take: walk the record stream per partition instead of once,
+hand each partition to the FAT or NTFS reconstruction according to its own
+metadata, and emit a multi-partition disk image with the table the header
+describes. The single-partition paths already exist; the missing piece is
+the loop and the disk-level layout. Until then D13 stays covered by its
+unit test only.
