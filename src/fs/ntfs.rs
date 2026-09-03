@@ -2137,10 +2137,11 @@ fn assemble_mft_record(
         pos += attr.len();
     }
 
-    // End marker
-    if pos + 4 <= record_size as usize {
+    // End marker; Windows counts it as eight bytes in the used size, and chkdsk
+    // corrects a record whose first free byte sits four bytes early.
+    if pos + 8 <= record_size as usize {
         record[pos..pos + 4].copy_from_slice(&ATTR_END.to_le_bytes());
-        pos += 4;
+        pos += 8;
     }
 
     // Used size
@@ -5227,6 +5228,37 @@ mod tests {
         .unwrap();
         cur.seek(SeekFrom::Start(0)).unwrap();
         cur
+    }
+
+    /// chkdsk corrected the first free byte of every record we assembled: the
+    /// end marker counts as eight bytes in the used size, not four.
+    #[test]
+    fn assembled_records_count_the_end_marker_as_eight_bytes() {
+        let cur = format_test_volume(4096, 256);
+        let mut fs = NtfsFilesystem::open(cur, 0).unwrap();
+        let root = fs.root().unwrap();
+        let mut data = std::io::Cursor::new(b"resident".to_vec());
+        let file = fs
+            .create_file(
+                &root,
+                "created.txt",
+                &mut data,
+                8,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+        let dir = fs
+            .create_directory(&root, "created-dir", &CreateDirectoryOptions::default())
+            .unwrap();
+        for rec_no in [file.location, dir.location] {
+            let record = fs.read_mft_record(rec_no).unwrap();
+            let used = record_used_size(&record);
+            let mut off = u16::from_le_bytes([record[0x14], record[0x15]]) as usize;
+            while u32::from_le_bytes(record[off..off + 4].try_into().unwrap()) != ATTR_END {
+                off += u32::from_le_bytes(record[off + 4..off + 8].try_into().unwrap()) as usize;
+            }
+            assert_eq!(used, off + 8, "record {rec_no}: used size vs end marker");
+        }
     }
 
     /// The trim point was pinned to the volume size by its own backup boot
