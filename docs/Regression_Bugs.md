@@ -1,4 +1,4 @@
-# Regression Findings (R-001 … R-048)
+# Regression Findings (R-001 … R-049)
 
 Defects and documentation drift turned up while building the regression suite
 (`regression-tests/`), 2026-08-01/02. The suite work was deliberately kept
@@ -19,6 +19,7 @@ finding depends on a fixture, the fixture is named.
 
 | ID | Severity | Area | Finding |
 |----|----------|------|---------|
+| ~~R-049~~ | ~~**High**~~ **FIXED** | `src/fs/ntfs.rs` | ~~Every long name rb-cli writes to NTFS is a lone Win32-namespace name, which NTFS allows only beside a DOS alias; chkdsk reports minor file name errors~~ — POSIX namespace, as Windows writes with 8.3 creation off, 2026-09-02 |
 | ~~R-048~~ | ~~**High**~~ **FIXED** | `src/fs/ntfs.rs` | ~~A renamed NTFS entry's index entry carries the old name's creation snapshot and a raw byte count; chkdsk reports minor file name errors and an incorrect `$I30` entry~~ — the copies take the record's live times and the data attribute's real and allocated sizes, 2026-09-02 |
 | ~~R-047~~ | ~~**High**~~ **FIXED** | `src/fs/ntfs.rs` | ~~A resized `$Bitmap` is sized at ceil(clusters/8) bytes; Windows keeps whole quadwords and chkdsk reports the volume bitmap incorrect~~ — quadword rule, 2026-09-02 |
 | ~~R-046~~ | ~~**High**~~ **FIXED** | `src/fs/ntfs.rs` | ~~A renamed NTFS entry's new `$FILE_NAME` reuses attribute instance 0, and Windows chkdsk calls the record corrupt~~ — the new attribute takes the record's next instance id, 2026-09-02 |
@@ -185,6 +186,22 @@ non-resident. The rename now reads both from the record; the shared name
 builder rounds the allocated size for resident data and `create_file`
 overrides it with the cluster-rounded size for non-resident data.
 
+### R-049 — a long name is written as a lone Win32-namespace name {#r-049}
+
+**FIXED 2026-09-02** (`fix(ntfs): a long name gets the POSIX namespace,
+never a lone Win32 one`). Kept for the reproduction.
+
+The third `chkdsk` complaint behind D12, after R-046 and R-048: with the
+renamed record's instance ids, timestamps and sizes all in order, `chkdsk`
+still said `Minor file name errors were detected in file 26` and called the
+`$I30` entry incorrect. The `$FILE_NAME` builder wrote namespace 1 (Win32)
+for any name that is not a valid 8.3 name. NTFS allows a Win32 name only
+beside a DOS-namespace alias; a file with one name uses Win32-and-DOS (3)
+when the name fits 8.3 and POSIX (0) otherwise, which is exactly what
+Windows wrote on the same volume with 8.3 creation off. The builder now
+follows that rule. It serves `create_file` as well, so every long name
+`put` had written to NTFS carried the same flaw.
+
 ### Windows verification of the 2026-09-01/02 filesystem fixes
 
 The audit's Windows leg lets Windows itself judge the NTFS / exFAT / FAT
@@ -195,14 +212,14 @@ because attaching a VHD does.
 
 | ID | Fix | Check | Result |
 |----|-----|-------|--------|
-| D12 | 251b211, NTFS rename replaces every name | Windows-written long name with a DOS alias, `rb-cli mv`, `chkdsk`, `dir /x` | run 1 and 2: chkdsk faulted the renamed record, which found R-046 and R-048; run 3 pending with 8.3 creation on |
-| D8 | 9e083f5, delete respects hard links | `mklink /H` by Windows, `rb-cli rm` of one name, `chkdsk`, other name intact | other name and content intact in runs 1 and 2; chkdsk verdict shares D12's volume, run 3 pending |
+| D12 | 251b211, NTFS rename replaces every name | Windows-written long name with a DOS alias, `rb-cli mv`, `chkdsk`, `dir /x` | runs 1-3: the alias is gone and the new name listed, but chkdsk faulted the renamed record each time, which found R-046, R-048 and R-049 in turn; run 4 pending |
+| D8 | 9e083f5, delete respects hard links | `mklink /H` by Windows, `rb-cli rm` of one name, `chkdsk`, other name intact | other name and content intact in runs 1-3; chkdsk verdict shares D12's volume, run 4 pending |
 | D10 | 9e083f5, backup boot sector in the last sector | `partmap resize` + `resize`, backup sector compared, `chkdsk` | **PASS** (runs 1 and 2): backup sector at LBA start+TotalSectors matches, chkdsk clean, 30719 clusters |
 | D1 | e008eff, NoFatChain files survive edits | Windows-written 1 MiB file, `rb-cli mv`, hash compared | **PASS** (run 2): SHA-256 identical after the rename |
 | D5 | e008eff, contiguous delete frees the run | Windows-written file removed with `rb-cli rm`, `chkdsk` | **PASS** (run 2): chkdsk clean |
 | D7 | e008eff, resize past the bitmap keeps the up-case table | exFAT grown 64 -> 120 MiB, `chkdsk` | run 1: Windows mounted the result as RAW because the resize capped the volume below its partition; fixed in 4c4816c (FAT grows into the heap alignment gap). **PASS** (run 2): mounts as exFAT, chkdsk clean, 30672 clusters |
 | D9 | e5266da, directories grow the way Windows reads them | 400 long-named files put into a Windows-made directory, Explorer count | **PASS** (run 2): Explorer lists 405 of 405, the last file reads back |
-| D2 | 33115a8, NTFS boot code survives the hidden-sectors patch | Windows NTFS moved to LBA 63 and restored to LBA 2048, sector 6 compared, `chkdsk` | boot code kept: sectors 1-9 byte-identical to Windows' after the move, hidden sectors 2048 (run 2). chkdsk faulted the bitmap, which found R-047; run 3 pending |
+| D2 | 33115a8, NTFS boot code survives the hidden-sectors patch | Windows NTFS moved to LBA 63 and restored to LBA 2048, sector 6 compared, `chkdsk` | **PASS** (run 3): sectors 1-9 byte-identical to Windows' after the move to LBA 2048, hidden sectors patched, chkdsk clean. Run 2's chkdsk fault on the bitmap found R-047 |
 | D13 | eaa6f3d, Ghost reconstruction gets unique 8.3 aliases | needs a Ghost image with prefix-sharing long names; none on this machine (the fixtures and `C:\Temp\JoeBackup` carry 8.3 names only) | not verifiable here; unit test `skip_name_checks_creates_still_get_unique_short_names` covers it |
 | R15 | b060025, letterless volumes are locked | VHD volume with its letter removed, `show devices`, `restore --device` onto its PhysicalDrive, `chkdsk` | **PASS** (run 1): PhysicalDrive4 listed with an empty mount point, `Locking and dismounting volume Volume{...}` logged, restore completed, chkdsk clean |
 
