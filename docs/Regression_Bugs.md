@@ -1,4 +1,4 @@
-# Regression Findings (R-001 … R-050)
+# Regression Findings (R-001 … R-059)
 
 Defects and documentation drift turned up while building the regression suite
 (`regression-tests/`), 2026-08-01/02. The suite work was deliberately kept
@@ -19,6 +19,15 @@ finding depends on a fixture, the fixture is named.
 
 | ID | Severity | Area | Finding |
 |----|----------|------|---------|
+| ~~R-059~~ | ~~**High**~~ **FIXED** | `src/fs/hfs.rs` | ~~An in-place classic HFS grow sizes the allocation area to the partition end, over the alternate MDB and the trailing sector Mac OS reserves~~ — the two sectors are held back and the grown bitmap range is cleared, 2026-09-05 |
+| ~~R-058~~ | ~~Medium~~ **FIXED** | `src/model/provision_runner.rs` | ~~A classic HFS volume poured into a larger partition can never pass Disk First Aid ("Invalid allocation block start"): Mac OS wants the allocation area to end at the partition's alternate MDB~~ — `new hd --fill` grows the volume to the partition when its bitmap has room and warns when it has not, 2026-09-05 |
+| ~~R-057~~ | ~~**High**~~ **FIXED** | `src/fs/mod.rs`, `src/model/provision_runner.rs` | ~~An HFS+ volume edited through an APM or MBR partition, or poured into one by `new hd --fill`, keeps its alternate volume header at the volume end; Disk First Aid reports "Volume header needs minor repair" on every such volume~~ — the partition length reaches the editable open, and a fill mirrors the header at the partition end, 2026-09-05 |
+| ~~R-056~~ | ~~**High**~~ **FIXED** | `src/fs/hfsplus.rs` | ~~An in-place HFS+ grow patches two counts and nothing else: the old alternate-header block stays marked, the new one is not, and the allocation file never grows; Disk First Aid reports orphaned blocks and under-allocation on every grown or Minimum-restored volume~~ — the resize moves the header's blocks, grows or relocates the allocation file and recounts, 2026-09-05 |
+| ~~R-055~~ | ~~Medium~~ **FIXED** | `src/fs/hfsplus.rs`, `src/fs/hfs_common.rs` | ~~Deleting the last fragmented file leaves the HFS+ extents-overflow tree as a root leaf with no records; Disk First Aid stops at "Invalid node structure"~~ — an emptied leaf leaves the tree and the last one retires the root, 2026-09-05 |
+| ~~R-054~~ | ~~**High**~~ **FIXED** | `src/fs/hfs_common.rs`, `src/fs/hfsplus.rs`, `src/fs/hfs.rs` | ~~Deleting a leaf's first record leaves its parent's separator on the old key; Disk First Aid reports "Invalid index key" on every HFS+ volume rb-cli deleted from~~ — separators are refreshed up the tree, fsck checks equality, 2026-09-05 |
+| ~~R-053~~ | ~~**High**~~ **FIXED** | `src/os/mod.rs`, `src/model/source_reader.rs` | ~~`rb-cli inspect` on a raw device reads through a plain `BufReader`: unaligned 8 KiB reads, every device reported as 0 B, and a USB floppy drive fails with EIO at sector 0 (audit R19)~~ — devices go through `SectorAlignedReader`, which drops to one sector per read once a larger read is refused, 2026-09-05; floppy confirmation pending |
+| ~~R-052~~ | ~~Medium~~ **FIXED** | `src/os/macos.rs` | ~~A cancelled authorization dialog is reported as "no ancillary control message" and falls through to a second prompt (audit R11)~~ — authopen's two-byte reply and stderr are decoded; ECANCELED is the user's answer, 2026-09-05 |
+| ~~R-051~~ | ~~Medium~~ **FIXED** | `src/os/macos.rs` | ~~A write-protected card's EACCES is taken for missing privilege: the read path prompts read-write, fails, prompts again; the write path blames sudo (audit R6)~~ — read-only tried directly, DKIOCISWRITABLE / DAMediaWritable name the media, 2026-09-05; lock-switch check on hardware pending |
 | ~~R-050~~ | ~~**High**~~ **FIXED** | `src/fs/ntfs.rs` | ~~Every MFT record rb-cli assembles carries a bytes-in-use four bytes short; chkdsk corrects the first free byte of each created file and directory~~ — the end marker counts as eight bytes, 2026-09-03 |
 | ~~R-049~~ | ~~**High**~~ **FIXED** | `src/fs/ntfs.rs` | ~~Every long name rb-cli writes to NTFS is a lone Win32-namespace name, which NTFS allows only beside a DOS alias; chkdsk reports minor file name errors~~ — POSIX namespace, as Windows writes with 8.3 creation off, 2026-09-02 |
 | ~~R-048~~ | ~~**High**~~ **FIXED** | `src/fs/ntfs.rs` | ~~A renamed NTFS entry's index entry carries the old name's creation snapshot and a raw byte count; chkdsk reports minor file name errors and an incorrect `$I30` entry~~ — the copies take the record's live times and the data attribute's real and allocated sizes, 2026-09-02 |
@@ -72,6 +81,268 @@ finding depends on a fixture, the fixture is named.
 | ~~R-002~~ | ~~Doc~~ **FIXED** | `src/fs/README.md` | ~~Capability table stale — ext listed as "planned"~~ — table deleted for a pointer at the live dispatch, 2026-08-09 |
 
 ---
+
+## Found during the 2026-09-01 audit, leg 3 (macOS), 2026-09-05
+
+The macOS leg's three findings, each with the cause the fix rests on. No
+removable hardware was attached during the run, so the hardware halves of
+R-051 and R-053 (an SD card's lock switch, the USB floppy drive) stay open;
+both fixes were exercised against `hdiutil`-attached raw images instead.
+
+### R-051 — a write-protected card is treated as a privilege problem (audit R6) {#r-051}
+
+**FIXED 2026-09-05** (`fix(macos): write-protected media opens read-only
+instead of prompting (R6)`). Kept for the reproduction.
+
+On macOS a removable disk's device node belongs to the console user, so
+`open_source_for_reading` tries a direct open first: `O_RDWR`, then
+`O_RDONLY`, but only after `EBUSY`. Write-protected media refuses `O_RDWR`
+with `EACCES` for every caller, root included (IOMediaBSDClient answers
+that for a non-writable IOMedia). The probe took the `EACCES` for a
+permission failure, skipped the read-only attempt and escalated through
+`authopen` read-write; authopen prompted, its own root open failed the same
+way, and the fallback from 63e8d3f prompted a second time read-only. The
+write path prompted too and then printed the "run with sudo" hint.
+
+Reproduction without a card: `hdiutil attach -readonly -nomount` a raw
+image, then as the unprivileged user `open(O_RDWR)` is `EACCES`,
+`open(O_RDONLY)` succeeds and `DKIOCISWRITABLE` answers 0.
+
+The probe now always tries `O_RDONLY` after `O_RDWR`; a read-only success
+is logged as write-protected media when `DKIOCISWRITABLE` says so, else as
+"a restore will ask for administrator rights". When both direct opens fail,
+DiskArbitration's `MediaWritable` picks the escalation mode, so a locked
+card is escalated read-only in one prompt. `open_target_for_writing` refuses
+write-protected media before unmounting anything. `rb-cli backup /dev/disk7`
+against the read-only image now logs `is write-protected ... opened
+read-only` and raises no dialog.
+
+### R-052 — a cancelled authorization dialog is reported as a failure (audit R11) {#r-052}
+
+**FIXED 2026-09-05** (`fix(macos): a cancelled authorization dialog is
+reported as cancelled (R11)`). Kept for the protocol, which is otherwise
+undocumented; the full notes are the module header of `src/os/macos.rs`.
+
+`open_device` looked for "cancelled" in our own error text, which never
+said so. What authopen does with `-stdoutpipe`, read from its disassembly
+on macOS 26: one `sendmsg` of two data bytes; on success the descriptor is
+attached as `SCM_RIGHTS`, on failure there is no control message and byte
+1 is the errno of whichever open failed. The authorization status is
+mapped through a table: `errAuthorizationCanceled` becomes `ECANCELED`,
+`errAuthorizationDenied` and `InteractionNotAllowed` become `EACCES`. Our
+receiver read one byte, found no `SCM_RIGHTS` and said "no ancillary
+control message (authopen may have failed)"; a cancel then fell through to
+the direct-open fallback and, on the read path, to a second read-only
+prompt for a dialog the user had just closed.
+
+The receiver reads both bytes, the helper's stderr is piped and drained
+after it exits (`AuthorizationCopyRights failed: ...` against
+`couldn't open <path>: ...` tells the two `EACCES` cases apart), and the
+refusal is a typed `AuthopenRefused`. `is_authorization_cancelled` sees it
+through any context layer; `open_device` stops there and the read path's
+read-only retry is skipped after a cancel. Unit tests cover the decode; the
+live cancel on this machine is pending the user, since raising the dialog
+unattended was not an option during the run.
+
+### R-053 — a raw device fails a large read that dd serves in sectors (audit R19) {#r-053}
+
+**FIXED 2026-09-05** (`fix(os): a raw device reads sector by sector once it
+refuses a larger read (R19)`). Kept for the reproduction; confirmation on
+the USB floppy drive is pending.
+
+Carried over from an earlier session: `rb-cli inspect /dev/rdiskN` on a
+USB floppy drive failed with EIO reading sector 0, while `dd bs=512` read
+the same disk. Two suspects were on the table, `F_NOCACHE` on the handle
+and the size of the first read.
+
+What the CLI did: `open_peeled_read_with_entry` ended a device path in a
+plain `BufReader<File>`, so the device saw 8 KiB reads at whatever offset
+the filesystem asked for, with no sector alignment, and `seek(End)`
+answered 0, which is why `inspect` printed every device as 0 B. Reproduced
+here on an hdiutil-attached raw image: `size 0 B`, `"size_bytes": 0`.
+`F_NOCACHE` is never set on that path, so it is not the cause on the CLI;
+the read size is what differs from dd.
+
+Both CLI device paths now go through `known_len_reader`, which is
+`SectorAlignedReader` over `KnownLen`, and `SectorAlignedReader` learns
+the device's limit: a multi-sector read that fails is retried as one
+sector; if that reads, the reader stays at one sector per read and logs
+it once; if it fails too, the original error comes back, so a bad block is
+still reported at its position. Unit tests model a 512-byte-limit device
+and a bad sector. `open_for_inspect` / `open_device_for_inspect` had no
+callers and are gone.
+
+### R-054 — a deleted first record leaves the parent's separator behind {#r-054}
+
+**FIXED 2026-09-05** (`fix(hfs): a leaf's parent separator follows its
+first record (R-054)`). Found by the macOS verification below; kept for
+the reproduction.
+
+`fsck_hfs -n` on the H1 volume (1500 files, 200 deleted from the middle,
+re-added) said `Invalid index key (4, 57)`; on the H3 volume the same for
+nine leaves. Apple's rule (`SVerify2.c`, E_IKey) is that an index record's
+key equals the first key of the child it points at, compared with the
+tree's own comparator. Ours pointed at leaf 57 with key `(685, "")`, the
+thread record the leaf began with before the delete; its first record was
+now `(715, "")`. A separator that merely sorts below the child still finds
+every record, which is why the kernel driver read all 1500 files back and
+our fsck, which only checked ordering, saw nothing.
+
+`remove_catalog_record` in both drivers, HFS+'s extents-overflow and
+attributes removals, and classic HFS's overflow removal now call
+`btree_refresh_index_keys` when record 0 of a non-empty node went: the
+parent is found by scanning (its separator cannot be trusted to lead
+there), the record is rewritten with the child's first key, and the walk
+continues upward while the node it just fixed was itself its parent's
+first child. A freed leaf takes the same route through
+`btree_detach_freed_node_and_refresh`. Classic HFS only escaped because its
+512-byte leaves empty so often that the full index rebuild ran anyway.
+Both fscks now report `IndexKeyMismatch` for a separator that is not the
+child's first key; the classic one still calls a separator that sorts
+above it `KeysOutOfOrder`.
+
+### R-055 — an emptied HFS+ overflow leaf stays behind as an empty root {#r-055}
+
+**FIXED 2026-09-05** (`fix(hfsplus): an emptied extents or attributes
+leaf leaves the tree (R-055)`). Found by the H3 check; kept for the
+reproduction.
+
+H3 fills an 8 MiB HFS+ volume, frees every other file and adds one whose
+1 MB resource fork has to spread over the holes: 16 extents, eight inline
+and eight in one extents-overflow record. `rb-cli rm` of that file freed
+the record and left the tree's only leaf allocated with zero records,
+still the root at depth 1. `fsck_hfs -n` reports `Invalid node structure
+(3, 1)` and stops: Apple's `BTKeyChk` rejects a leaf with no records
+unless it has siblings, because Apple's own delete retires the tree
+(depth 0, no root, node returned to the map) when the last record goes.
+Classic HFS already did that; the HFS+ extents-overflow and attributes
+removals only subtracted the record.
+
+Both now go through `btree_retire_empty_leaf`: the emptied leaf leaves
+the sibling chain and the header's first/last pointers, its node is
+freed, its separator dropped, and a root that emptied is retired. The
+second run then drew `Unused node is not erased (node = 1)`: Apple zeroes
+a node when it frees it, so `btree_free_node` now erases what it frees,
+for every tree in both drivers. Both fscks report
+`EmptyLeafWithoutSiblings` for a lone empty leaf and `FreeNodeNotErased`
+for a free node that still holds data.
+
+### R-056 — an in-place HFS+ grow leaves the bitmap and allocation file behind {#r-056}
+
+**FIXED 2026-09-05** (`fix(hfsplus): an in-place resize moves the
+alternate header's blocks and grows the allocation file (R-056)`). Found
+by the H7 check; kept for the reproduction. The NTFS twin is R-044.
+
+`rb-cli resize` of a 24 MiB HFS+ volume to its 30 MiB APM partition,
+then `fsck_hfs -n`:
+
+```
+Volume bitmap needs minor repair for orphaned blocks
+Volume bitmap needs repair for under-allocation
+```
+
+`resize_hfsplus_in_place` rewrote `totalBlocks` and `freeBlocks` and the
+two headers, and touched nothing else. The formatter marks the block(s)
+holding the alternate volume header as used, so after the grow block 6143
+(the old tail) stayed marked with nothing at it and block 7679 (the new
+tail, now holding the header) read free: exactly Apple's two messages.
+Our own fsck compared the *count* of set bits with `total - free`, which
+still matched, because the grow had computed `free` from the same stale
+count. A larger grow would also have run past the allocation file, which
+was never extended.
+
+The resize now reads the allocation file, clears the old tail and the
+padding past the old end, extends the file in place when the blocks after
+it are free and moves it to a free run otherwise, marks the new tail,
+recounts `freeBlocks` from the bits, clamps `nextAllocation`, and writes
+the file and both headers. A shrink refuses when the last used block
+would be cut off. The HFS+ fsck now checks that the blocks holding the
+alternate header are marked (`AlternateHeaderBlockFree`), which is the
+position check the count could not give.
+
+### R-057 — the alternate HFS+ header misses the partition end on the put and fill paths {#r-057}
+
+**FIXED 2026-09-05** (`fix(hfsplus): the alternate header reaches the
+partition end through put and new hd --fill (R-057)`). Found by the H7
+check; kept for the reproduction.
+
+H7's premise (9cb5383, leg 1) is that Mac OS reads the alternate volume
+header 1024 bytes before the *partition* end. `rb-cli put img@1` on a
+24 MiB HFS+ volume in a 30 MiB APM partition left sector 61438 all zeros
+and `fsck_hfs -n` said `Volume header needs minor repair`; so did the
+freshly filled disk before any edit. Copying the primary header there by
+hand made the same volume `appear to be OK`, so the placement is all Mac
+OS asks of a volume smaller than its partition.
+
+Two causes. `open_editable_filesystem_by_string` resolved `Apple_HFS`,
+the string form `"hfsplus"` and MBR type `0xAF` through
+`HfsPlusFilesystem::open`, which has no partition length, so the sync
+fell back to the volume end; only `Apple_HFSX` used `open_sized`. All
+four now pass the length (none when the volume is wrapped, where the
+fallback is exact). And `new hd --fill` copied the image and stopped;
+the provisioner now fits an Apple volume to its partition after the
+pour: an HFS+ header is mirrored at the partition end, a classic HFS
+volume is grown (R-058).
+
+### R-058 — a classic HFS volume that does not fill its partition cannot pass Disk First Aid {#r-058}
+
+**FIXED 2026-09-05** for the `--fill` path (same commit as R-057);
+documented for the rest. Found by the H7 check.
+
+A 24 MiB classic HFS volume poured into a 30 MiB APM partition, alternate
+MDB dutifully written at the partition end: `fsck_hfs -n` reports
+`Invalid allocation block start (4294967295, 61438)`, whether or not the
+volume was edited afterwards; the same volume in a 24 MiB partition, or
+bare, is clean. Mac OS reads the alternate MDB two sectors before the
+partition end *and* expects the allocation area to end there
+(`drAlBlSt + drNmAlBlks * blocks per allocation block` = that sector).
+Header placement alone cannot satisfy both, so a classic HFS volume has
+to fill its partition, which is how Mac OS formats one.
+
+`new hd --fill` now grows a classic HFS volume to its partition through
+`resize_hfs_in_place` when the fixed-size volume bitmap has bits to
+spare, and otherwise says so: the bitmap sits in fixed sectors before the
+first allocation block, so a 24 MiB volume formatted at 512-byte blocks
+has exactly 24 MiB of bits and cannot grow at all. The fix for that case
+is to format the volume at the partition size. Editing such a volume in
+place still writes the alternate MDB where Mac OS looks (H7), which is
+right but not sufficient; `fsck` does not yet report the size mismatch.
+
+### R-059 — an in-place classic HFS grow runs the allocation area over the alternate MDB {#r-059}
+
+**FIXED 2026-09-05** (same commit as R-057). Found while making
+`new hd --fill` grow a poured classic HFS volume (R-058).
+
+`resize_hfs_in_place` took the new block count as
+`(new size - first allocation sector * 512) / block size`, so a grown
+volume's allocation blocks reached the partition's last sector: the
+alternate MDB it then wrote 1024 bytes before the end landed inside the
+last allocation block(s), and the sector Mac OS keeps unused after it was
+an allocation block too. Any file that later took those blocks would
+overwrite the alternate MDB; Disk First Aid reports the layout as an
+invalid allocation block start. The block count now stops 1024 bytes
+short, matching how the formatter lays a volume out, and the volume
+bitmap bits for the grown range are cleared rather than trusted.
+
+### macOS verification of the HFS / HFS+ / MFS fixes
+
+The audit's macOS leg lets Mac OS judge the HFS-family fixes from
+2026-09-01/02: images rb-cli formats and edits, attached with `hdiutil`,
+checked with `fsck_hfs -n` and read back through the kernel's HFS+ driver.
+The driver is `scripts/verify-fs-macos.sh`; `-o` narrows it to one block.
+
+| ID | Fix | Check | Result |
+|----|-----|-------|--------|
+| H1 / H2 / H4 / H9 / H11 | ee07cf4, B-tree index consistency, first-child descent, bounds, clamped dates | 1500 files imported, 200 deleted from the middle and re-added; `fsck_hfs -n`; every file read back through the kernel HFS+ driver (classic HFS through `rb-cli get`, since macOS no longer mounts it) | HFS+: run 1 `Invalid index key (4, 57)`, which found R-054; **PASS** (run 2), 1500 of 1500 identical. HFS: **PASS** (run 1) |
+| H3 | 67ab9f2, deleting a spilled resource fork frees the overflow extents | 8 MiB volume filled, every other file removed, a 1 MB resource fork spread over the holes (one overflow record), `rb-cli rm`, `fsck_hfs -n` before and after | HFS+: run 1 clean before and `Invalid node structure (3, 1)` after, which found R-055; run 2 `Unused node is not erased`, same fix; **PASS** (run 3), overflow records 1 -> 0. HFS: **not reproducible** with rb-cli, whose writer allocates a fork contiguously and refuses the fragmented one (F-011); the delete path stays covered by the unit test `delete_frees_overflow_extents_and_their_records` |
+| H5 | 3a53254, key order across leaves and index separators | `rb-cli fsck` on the H1 / H3 volumes and on an `hdiutil create` HFS+ volume that macOS filled with 1500 files and 200 replacements | **PASS**: no "keys out of order" anywhere; the macOS-made volume checks clean at 1503 files / 4 dirs |
+| H6 | a1f7558, MFS fork lengths in whole allocation blocks | `new floppy mfs`, three files put, one removed, one added, `rb-cli fsck` | image built and clean by our own fsck; **Disk First Aid in Mini vMac pending the user** (`h6-mfs.img` in the work directory) |
+| H7 | 9cb5383, alternate header at the partition end | a volume poured into a larger APM partition, edited with `put`, then grown; `fsck_hfs -n` on the slice | HFS+: run 1 `Volume header needs minor repair` before the grow (R-057) and bitmap orphaned / under-allocation after it (R-056); **PASS** (run 3) before and after. HFS: run 1 `Invalid allocation block start` (R-058, R-059); **PASS** (run 2) with a volume whose bitmap has room, which the fill grows to the partition |
+| R6 | 5f1fd54, write-protected media | `hdiutil attach -readonly` raw image, `rb-cli backup /dev/diskN` | **PASS**: logs "is write-protected ... opened read-only", raises no prompt. A card's lock switch is pending hardware |
+| R11 | f2edc77, cancelled dialog | unit tests on the decoded two-byte reply | a live cancel is pending the user (no dialog was raised unattended) |
+| R19 | 0093c49, raw-device reads | raw hdiutil device through `rb-cli inspect`: 0 B before, the real size after; unit tests on a device that refuses large reads | the USB floppy drive itself is pending hardware |
+| Section 3 | 63e8d3f, read-only fallback after a refused read-write escalation | needs a card mounted while Inspect opens it | pending hardware |
+| Section 5 | build sanity | `cargo test --no-run` with no `target/` at all | 152 s wall, 2.35 GB largest resident set, 62 MB lib-test binary; noted in `docs/build-memory-crashes.md` |
 
 ## Found during the 2026-09-01 audit, leg 2 (Windows), 2026-09-02
 

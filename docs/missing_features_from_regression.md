@@ -22,6 +22,7 @@ concrete reason to.
 | ~~F-009~~ | ~~SFS editor writes single-leaf extent b-trees only~~ — **SHIPPED** 2026-08-17 | `src/fs/sfs.rs` | — |
 | ~~F-004~~ | ~~`show partmap` is APM-only~~ — **SHIPPED** 2026-08-08, same gap as R-026 | `src/cli/verbs/show.rs` | — |
 | [F-010](#f-010) | A file-aware Ghost image exposes only its FAT record stream; an NTFS partition behind it is unreachable | `src/rbformats/gho.rs` | D13's Windows check (a real multi-partition `.GHO` with long names) |
+| [F-011](#f-011) | The classic HFS writer allocates a fork as one contiguous run; a fragmented volume reports disk full with room to spare | `src/fs/hfs.rs` | H3's classic-HFS check (a resource fork spilled into the extents-overflow file by rb-cli) |
 
 ---
 
@@ -607,3 +608,31 @@ metadata, and emit a multi-partition disk image with the table the header
 describes. The single-partition paths already exist; the missing piece is
 the loop and the disk-level layout. Until then D13 stays covered by its
 unit test only.
+
+## F-011 — the classic HFS writer allocates a fork as one contiguous run {#f-011}
+
+Found 2026-09-05 by the audit's H3 check on macOS. The check fills an
+8 MiB classic HFS volume with 64 KiB files, deletes every other one and
+adds a file whose 1 MB resource fork must spread over the holes, so that
+its extents spill into the extents-overflow file and the delete that
+follows can be judged by `fsck_hfs`. `rb-cli put` refused:
+
+```
+create_file: disk full: cannot find 196 contiguous free blocks
+```
+
+with 4 MiB free in 63 holes of 128 blocks. `allocate_blocks` in
+`src/fs/hfs.rs` asks the volume bitmap for one run of the fork's whole
+length; the three inline extents and the extents-overflow B-tree that
+the *reader* and the *delete* path handle are never produced by the
+writer. HFS+ (`src/fs/hfsplus.rs`) allocates extent by extent and does
+spill, which is how H3 was verified there.
+
+What it would take: allocate a fork as a list of runs (first fit over
+`bitmap_collect_clear_runs_be`), fill the three inline extents, and
+insert the rest as overflow records through the same
+`btree_insert_full` path the HFS+ driver uses with
+`BTreeKeyFormat::CLASSIC_EXTENTS`. Until then a fragmented classic HFS
+volume fills up early, and H3 on classic HFS stays covered by the unit
+test `delete_frees_overflow_extents_and_their_records`, whose overflow
+record is written by hand.

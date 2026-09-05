@@ -81,4 +81,26 @@ Update the status line below, run `bash scripts/preflight.sh`, commit, push.
 This is the last leg; afterwards the audit's Low items live in the findings
 list only, and `docs/Regression_Bugs.md` is the record.
 
-Status: not started.
+Status: DONE 2026-09-05 (5f1fd54..HEAD, one finding per commit), with
+the hardware halves still open because no removable media was attached.
+Step 1: R6 (5f1fd54) and R11 (f2edc77) shipped; R6 verified against an
+`hdiutil -readonly` image (opened read-only, no prompt) and R11 against
+authopen's two-byte reply protocol read from its disassembly (module
+header of `os/macos.rs`), so a card's lock switch and a live cancel are
+what the user still has to try. Step 2: R19 (0093c49) — the CLI's device
+path was a plain `BufReader` (unaligned 8 KiB reads, every device shown as
+0 B), never `F_NOCACHE`, which the CLI never set; devices now read through
+`SectorAlignedReader`, which drops to one sector per read when a larger
+read is refused. The floppy drive itself is pending. Step 3 needs a card.
+Step 4 was the productive part: `scripts/verify-fs-macos.sh` (fsck_hfs -n
+plus the kernel HFS+ driver) passed H1, H3 (HFS+), H5 and H7, and on the
+way found six defects our own fsck never saw, all fixed with the matching
+fsck checks added: R-054 stale index separators after a delete, R-055 an
+empty root leaf and unerased free nodes, R-056 the HFS+ grow's bitmap and
+allocation file, R-057 the alternate header on the put and fill paths,
+R-058 classic HFS having to fill its partition, R-059 the classic grow
+overlapping the alternate MDB (`docs/Regression_Bugs.md`). H3 on classic
+HFS cannot be built by rb-cli (F-011, contiguous allocator); H6 needs Disk
+First Aid in Mini vMac, the image is built. Step 5: 152 s, 2.35 GB peak
+(`docs/build-memory-crashes.md`). This was the last leg; the audit's Low
+items live in the findings list only.

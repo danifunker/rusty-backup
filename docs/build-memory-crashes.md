@@ -153,6 +153,13 @@ Still open:
       `target\debug` 9.5 GB in all. Nothing was killed and the desktop
       stayed responsive; the MSVC PDB mechanism above is therefore contained
       by the same debuginfo trim.
+- [x] Same build on the Mac (2026-09-05, Apple silicon, macOS 26, no
+      `target/` at all beforehand): `cargo test --no-run` finished in
+      152 s wall / 464 s user under `/usr/bin/time -l`, which reported
+      2.35 GB as the largest resident set of any single child (the lib
+      rustc) and 261 MB for cargo itself. Lib-test binary 62 MB,
+      `target/debug` 7.0 GB. Nothing was killed. Activity Monitor was not
+      watched; the rusage figure is per process, not the sum.
 - [x] `cargo clippy --all-targets -- -D warnings` (the hook's pass, same
       scope and sampler): green, 0 warnings, 158 s. Peak anonymous memory
       3.9 GB in the scope, system-wide used 6.6 GB, user-slice pressure
