@@ -2137,7 +2137,11 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                 let (fs_type, hfsplus_offset) = resolve_apple_hfs(&mut reader, partition_offset);
                 return match fs_type {
                     "hfsplus" => {
-                        let mut fs = hfsplus::HfsPlusFilesystem::open(reader, hfsplus_offset)?;
+                        let mut fs = hfsplus::HfsPlusFilesystem::open_sized(
+                            reader,
+                            hfsplus_offset,
+                            hfsplus_partition_len(partition_offset, hfsplus_offset, partition_len),
+                        )?;
                         fs.prepare_for_edit()?;
                         Ok(Box::new(fs))
                     }
@@ -2332,7 +2336,11 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                 )?)),
                 "hfsplus" => {
                     let (_, hfsplus_offset) = resolve_apple_hfs(&mut reader, partition_offset);
-                    let mut fs = hfsplus::HfsPlusFilesystem::open(reader, hfsplus_offset)?;
+                    let mut fs = hfsplus::HfsPlusFilesystem::open_sized(
+                        reader,
+                        hfsplus_offset,
+                        hfsplus_partition_len(partition_offset, hfsplus_offset, partition_len),
+                    )?;
                     fs.prepare_for_edit()?;
                     Ok(Box::new(fs))
                 }
@@ -2568,7 +2576,11 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
             let (fs_type, hfsplus_offset) = resolve_apple_hfs(&mut reader, partition_offset);
             match fs_type {
                 "hfsplus" => {
-                    let mut fs = hfsplus::HfsPlusFilesystem::open(reader, hfsplus_offset)?;
+                    let mut fs = hfsplus::HfsPlusFilesystem::open_sized(
+                        reader,
+                        hfsplus_offset,
+                        hfsplus_partition_len(partition_offset, hfsplus_offset, partition_len),
+                    )?;
                     fs.prepare_for_edit()?;
                     Ok(Box::new(fs))
                 }
@@ -2614,9 +2626,10 @@ fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
         "Apple_HFS" | "48465300-0000-11AA-AA11-00306543ECAC" => {
             let (fs_type, hfsplus_offset) = resolve_apple_hfs(&mut reader, partition_offset);
             match fs_type {
-                "hfsplus" => Ok(Box::new(hfsplus::HfsPlusFilesystem::open(
+                "hfsplus" => Ok(Box::new(hfsplus::HfsPlusFilesystem::open_sized(
                     reader,
                     hfsplus_offset,
+                    hfsplus_partition_len(partition_offset, hfsplus_offset, partition_size),
                 )?)),
                 _ => Ok(Box::new(hfs::HfsFilesystem::open_sized(
                     reader,
@@ -2625,9 +2638,10 @@ fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
                 )?)),
             }
         }
-        "Apple_HFSX" | "Apple_HFS+" => Ok(Box::new(hfsplus::HfsPlusFilesystem::open(
+        "Apple_HFSX" | "Apple_HFS+" => Ok(Box::new(hfsplus::HfsPlusFilesystem::open_sized(
             reader,
             partition_offset,
+            partition_size,
         )?)),
         // BeOS/PPC writes an APM whose BFS partitions carry "Be_BFS".
         "Be_BFS" => Ok(Box::new(bfs::BfsFilesystem::open(
@@ -3357,6 +3371,47 @@ pub fn is_checkable_retro_fs(ptype: u8, type_string: Option<&str>, type_name: &s
                 | "ADFS"
                 | "Oric Jasmin"
         )
+}
+
+/// After an image is poured into a partition, make an Apple volume fit it:
+/// an HFS+ header is mirrored at the partition end (R-057), a classic HFS
+/// volume is grown to it (R-058). Anything else is left as poured.
+pub fn fit_apple_volume_to_partition(
+    device: &mut (impl Read + Write + Seek),
+    partition_offset: u64,
+    partition_len: u64,
+    log: &mut impl FnMut(&str),
+) -> anyhow::Result<()> {
+    if partition_len < 2048 {
+        return Ok(());
+    }
+    device.seek(SeekFrom::Start(partition_offset + 1024))?;
+    let mut sig = [0u8; 2];
+    device.read_exact(&mut sig)?;
+    match u16::from_be_bytes(sig) {
+        0x482B | 0x4858 => {
+            hfsplus::mirror_alternate_volume_header(device, partition_offset, partition_len, log)?;
+        }
+        0x4244 => {
+            hfs::fit_hfs_volume_to_partition(device, partition_offset, partition_len, log)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// The partition length an HFS+ volume may use for its alternate header: the
+/// partition's own when the volume starts it, none when wrapped (H7).
+fn hfsplus_partition_len(
+    partition_offset: u64,
+    hfsplus_offset: u64,
+    partition_len: Option<u64>,
+) -> Option<u64> {
+    if hfsplus_offset == partition_offset {
+        partition_len
+    } else {
+        None
+    }
 }
 
 /// Resolve the actual HFS filesystem variant for an "Apple_HFS" APM partition.

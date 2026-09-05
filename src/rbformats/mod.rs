@@ -2177,7 +2177,9 @@ mod tests {
         let part_offset = hfs_start_lba as usize * 512;
         let mdb_off = part_offset + 1024;
         let new_total_blocks = BigEndian::read_u16(&dest_buf[mdb_off + 18..mdb_off + 20]);
-        let expected_blocks = ((new_size - 5 * 512) / 4096) as u16;
+        // Five sectors of front overhead, then the alternate MDB and the unused
+        // sector after it stay outside the allocation area (R-059).
+        let expected_blocks = ((new_size - 5 * 512 - 1024) / 4096) as u16;
         assert_eq!(
             new_total_blocks, expected_blocks,
             "HFS MDB drNmAlBlks should be updated to reflect new size"

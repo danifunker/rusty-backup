@@ -6337,6 +6337,38 @@ pub fn resize_hfsplus_in_place(
     Ok(())
 }
 
+/// Mirror the volume header 1024 bytes before the partition end when the
+/// volume is smaller than its partition, where Mac OS looks for it (R-057).
+/// Returns whether a copy was written.
+pub fn mirror_alternate_volume_header(
+    device: &mut (impl Read + Write + Seek),
+    partition_offset: u64,
+    partition_len: u64,
+    log: &mut impl FnMut(&str),
+) -> anyhow::Result<bool> {
+    device.seek(SeekFrom::Start(partition_offset + 1024))?;
+    let mut vh_buf = [0u8; 512];
+    device.read_exact(&mut vh_buf)?;
+    let sig = BigEndian::read_u16(&vh_buf[0..2]);
+    if sig != HFS_PLUS_SIGNATURE && sig != HFSX_SIGNATURE {
+        return Ok(false);
+    }
+    let block_size = BigEndian::read_u32(&vh_buf[40..44]) as u64;
+    let total_blocks = BigEndian::read_u32(&vh_buf[44..48]) as u64;
+    let volume_len = total_blocks * block_size;
+    if partition_len < 2048 || volume_len >= partition_len {
+        return Ok(false);
+    }
+    device.seek(SeekFrom::Start(partition_offset + partition_len - 1024))?;
+    device.write_all(&vh_buf)?;
+    device.flush()?;
+    log(&format!(
+        "HFS+ volume of {volume_len} bytes in a {partition_len}-byte partition: alternate \
+         volume header mirrored at the partition end"
+    ));
+    Ok(true)
+}
+
 /// The blocks that hold a volume's alternate volume header, its last 1024
 /// bytes: one block at 1024 bytes and up, two at 512.
 fn alt_vh_blocks(total_blocks: u32, block_size: u32) -> std::ops::Range<u32> {

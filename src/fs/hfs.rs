@@ -4121,6 +4121,49 @@ impl<R: Read + Seek> Read for CompactHfsReader<R> {
 ///
 /// The ceiling is `min(65535 blocks, VBM bit capacity) * block_size + overhead`.
 /// Growing beyond this requires reformatting with a larger block size.
+/// Grow a classic HFS volume to fill its partition (R-058). Mac OS reads the
+/// alternate MDB two sectors before the partition end and expects the
+/// allocation area to end there, so a smaller volume fails Disk First Aid
+/// however its headers are placed. Returns whether the volume was grown.
+pub fn fit_hfs_volume_to_partition(
+    device: &mut (impl Read + Write + Seek),
+    partition_offset: u64,
+    partition_len: u64,
+    log: &mut impl FnMut(&str),
+) -> anyhow::Result<bool> {
+    device.seek(SeekFrom::Start(partition_offset + 1024))?;
+    let mut sector = [0u8; 512];
+    device.read_exact(&mut sector)?;
+    if BigEndian::read_u16(&sector[0..2]) != HFS_SIGNATURE {
+        return Ok(false);
+    }
+    // A wrapper's embedded HFS+ volume keeps its own headers; leave it alone.
+    if BigEndian::read_u16(&sector[0x7C..0x7E]) == 0x482B {
+        return Ok(false);
+    }
+    let total_blocks = BigEndian::read_u16(&sector[0x12..0x14]) as u64;
+    let block_size = BigEndian::read_u32(&sector[0x14..0x18]) as u64;
+    let first_alloc = BigEndian::read_u16(&sector[0x1C..0x1E]) as u64;
+    let volume_len = first_alloc * 512 + total_blocks * block_size + 1024;
+    if block_size == 0 || volume_len >= partition_len {
+        return Ok(false);
+    }
+    let growable = hfs_max_growable_size(device, partition_offset).unwrap_or(0);
+    if growable < partition_len {
+        log(&format!(
+            "Warning: the HFS volume ({volume_len} bytes) does not fill its {partition_len}-byte \
+             partition and its volume bitmap cannot address more blocks; Disk First Aid will \
+             report an invalid allocation block start. Format the volume at the partition size"
+        ));
+        return Ok(false);
+    }
+    resize_hfs_in_place(device, partition_offset, partition_len, log)?;
+    log(&format!(
+        "HFS volume grown from {volume_len} bytes to fill its {partition_len}-byte partition"
+    ));
+    Ok(true)
+}
+
 pub fn hfs_max_growable_size(
     device: &mut (impl Read + Seek),
     partition_offset: u64,
@@ -4144,7 +4187,8 @@ pub fn hfs_max_growable_size(
 
     let vbm_capacity = (first_alloc - vbm_start) * 512 * 8;
     let max_blocks = vbm_capacity.min(u16::MAX as u64);
-    let overhead = first_alloc * 512;
+    // Plus the alternate MDB and the trailing sector the allocation area stops short of.
+    let overhead = first_alloc * 512 + 1024;
 
     Some(max_blocks * block_size + overhead)
 }
@@ -4184,7 +4228,9 @@ pub fn resize_hfs_in_place(
         0
     };
 
-    let overhead = first_alloc as u64 * 512;
+    // The alternate MDB and the unused sector after it stay outside the
+    // allocation area, as the formatter lays them out (R-059).
+    let overhead = first_alloc as u64 * 512 + 1024;
     if new_size_bytes <= overhead {
         anyhow::bail!(
             "HFS resize: new size {} bytes <= overhead {} bytes",
@@ -4223,8 +4269,8 @@ pub fn resize_hfs_in_place(
 
     // A count says nothing about position: a volume with free blocks near the
     // front still has data at its tail, and cutting there loses it.
-    let vbm_bytes = (old_total as usize).div_ceil(8);
-    let mut vbm = vec![0u8; vbm_bytes];
+    let vbm_len = (first_alloc - vbm_start) as usize * 512;
+    let mut vbm = vec![0u8; vbm_len];
     device.seek(SeekFrom::Start(partition_offset + vbm_start as u64 * 512))?;
     device.read_exact(&mut vbm)?;
     let highest_used = find_last_set_bit(&vbm, old_total as u32).map_or(0, |b| b + 1);
@@ -4238,6 +4284,13 @@ pub fn resize_hfs_in_place(
             old_total
         );
     }
+    // Blocks the volume gains, or gives up, read as free rather than as
+    // whatever the bits past the old count held.
+    for b in old_total.min(new_total) as u32..old_total.max(new_total) as u32 {
+        bitmap_clear_bit_be(&mut vbm, b);
+    }
+    device.seek(SeekFrom::Start(partition_offset + vbm_start as u64 * 512))?;
+    device.write_all(&vbm)?;
 
     let new_free = new_total - used_blocks;
 

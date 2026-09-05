@@ -199,6 +199,16 @@ pub fn run_worker(req: &ProvisionRequest, status: Arc<Mutex<PhysicalWriteStatus>
             &mut log_cb,
         )
         .with_context(|| format!("filling partition {}", i + 1))?;
+        // A Mac volume smaller than its partition keeps its alternate header
+        // where Mac OS will not look; fit it now rather than after a first edit.
+        let file = target.inner_mut().context("flushing before the fit")?;
+        crate::fs::fit_apple_volume_to_partition(
+            file,
+            placed.start_byte(),
+            placed.size_bytes,
+            &mut log_cb,
+        )
+        .with_context(|| format!("fitting the volume to partition {}", i + 1))?;
         progress_cb(done);
     }
 
@@ -213,6 +223,7 @@ mod tests {
     use super::*;
     use crate::partition::provision::PartSpec;
     use crate::partition::PartitionTable;
+    use byteorder::{BigEndian, ByteOrder};
     use std::io::{Read, Seek, SeekFrom, Write};
 
     const MIB: u64 = 1024 * 1024;
@@ -288,6 +299,65 @@ mod tests {
         assert_eq!(&filled[3..11], b"RBTEST01");
         let empty = read_at(&target_path, placed[1].start_byte(), 512);
         assert!(empty.iter().all(|b| *b == 0));
+    }
+
+    /// Pour `image` into the first of two partitions and return the target path.
+    fn build_with_source(image: Vec<u8>, part_mib: u64) -> (std::path::PathBuf, Vec<Placed>) {
+        let disk = 64 * MIB;
+        let specs = vec![spec(Some(part_mib * MIB), "AF"), spec(None, "83")];
+        let placed =
+            provision::place(&specs, TableKind::Mbr, disk, MIB, Geometry::default()).unwrap();
+        let src = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(src.path(), image).unwrap();
+        let target = tempfile::NamedTempFile::new().unwrap();
+        let target_path = target.path().to_path_buf();
+        drop(target);
+        let req = ProvisionRequest {
+            target_path: target_path.clone(),
+            target_size_bytes: disk,
+            kind: TableKind::Mbr,
+            geometry: Geometry::default(),
+            partitions: placed.clone(),
+            sources: vec![Some(src.path().to_path_buf()), None],
+        };
+        run_worker(&req, new_status(0)).expect("worker");
+        (target_path, placed)
+    }
+
+    #[test]
+    fn a_poured_hfsplus_volume_gets_its_alternate_header_at_the_partition_end() {
+        // R-057: fsck_hfs read zeros where Mac OS keeps the alternate header.
+        let image = crate::fs::hfsplus::create_blank_hfsplus(4 * MIB, 4096, "Fit", false);
+        let (target, placed) = build_with_source(image, 8);
+        let start = placed[0].start_byte();
+        let primary = read_at(&target, start + 1024, 512);
+        let alternate = read_at(&target, start + 8 * MIB - 1024, 512);
+        assert_eq!(&primary[0..2], b"H+");
+        assert_eq!(
+            primary, alternate,
+            "alternate header must mirror the primary"
+        );
+    }
+
+    #[test]
+    fn a_poured_hfs_volume_is_grown_to_its_partition() {
+        // R-058: Mac OS expects the allocation area to end at the partition's
+        // alternate MDB; a 3 MiB volume's bitmap can address 4 MiB.
+        let image = crate::fs::hfs::create_blank_hfs(3 * MIB, 512, "Fit").unwrap();
+        let before = BigEndian::read_u16(&image[1024 + 0x12..1024 + 0x14]);
+        let (target, placed) = build_with_source(image, 4);
+        let start = placed[0].start_byte();
+        let mdb = read_at(&target, start + 1024, 512);
+        let after = BigEndian::read_u16(&mdb[0x12..0x14]);
+        assert!(after > before, "volume grew: {before} -> {after} blocks");
+        let first_alloc = BigEndian::read_u16(&mdb[0x1C..0x1E]) as u64;
+        assert_eq!(
+            first_alloc * 512 + after as u64 * 512,
+            4 * MIB - 1024,
+            "allocation area ends at the alternate MDB"
+        );
+        let alternate = read_at(&target, start + 4 * MIB - 1024, 512);
+        assert_eq!(&alternate[0..2], b"BD");
     }
 
     #[test]
