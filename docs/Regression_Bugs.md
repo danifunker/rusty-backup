@@ -1,4 +1,4 @@
-# Regression Findings (R-001 … R-059)
+# Regression Findings (R-001 … R-060)
 
 Defects and documentation drift turned up while building the regression suite
 (`regression-tests/`), 2026-08-01/02. The suite work was deliberately kept
@@ -19,6 +19,7 @@ finding depends on a fixture, the fixture is named.
 
 | ID | Severity | Area | Finding |
 |----|----------|------|---------|
+| ~~R-060~~ | ~~**High**~~ **FIXED** | `src/fs/hfs.rs` | ~~A blank classic HFS volume built with the default B-tree sizes (`rb-cli batch` format, `create_blank_hfs`) gets a four-block catalog whatever its size, and refuses its 94th file at 4 KiB blocks: rb-cli cannot grow a classic catalog~~ — a zero request now takes the volume-scaled hformat sizing `new volume hfs` already used, 2026-09-05 |
 | ~~R-059~~ | ~~**High**~~ **FIXED** | `src/fs/hfs.rs` | ~~An in-place classic HFS grow sizes the allocation area to the partition end, over the alternate MDB and the trailing sector Mac OS reserves~~ — the two sectors are held back and the grown bitmap range is cleared, 2026-09-05 |
 | ~~R-058~~ | ~~Medium~~ **FIXED** | `src/model/provision_runner.rs` | ~~A classic HFS volume poured into a larger partition can never pass Disk First Aid ("Invalid allocation block start"): Mac OS wants the allocation area to end at the partition's alternate MDB~~ — `new hd --fill` grows the volume to the partition when its bitmap has room and warns when it has not, 2026-09-05 |
 | ~~R-057~~ | ~~**High**~~ **FIXED** | `src/fs/mod.rs`, `src/model/provision_runner.rs` | ~~An HFS+ volume edited through an APM or MBR partition, or poured into one by `new hd --fill`, keeps its alternate volume header at the volume end; Disk First Aid reports "Volume header needs minor repair" on every such volume~~ — the partition length reaches the editable open, and a fill mirrors the header at the partition end, 2026-09-05 |
@@ -81,6 +82,25 @@ finding depends on a fixture, the fixture is named.
 | ~~R-002~~ | ~~Doc~~ **FIXED** | `src/fs/README.md` | ~~Capability table stale — ext listed as "planned"~~ — table deleted for a pointer at the live dispatch, 2026-08-09 |
 
 ---
+
+## Found while adding the 1000-file churn test, 2026-09-05
+
+### R-060 — a blank classic HFS volume gets a four-block catalog whatever its size {#r-060}
+
+**FIXED 2026-09-05.** Found by the new unit test
+`thousand_file_churn_keeps_the_catalog_clean`, which creates 1000 files on
+a 64 MiB `create_blank_hfs` volume: the 94th `create_file` failed with
+`disk full: no free B-tree nodes`.
+
+`build_blank_hfs_front` treated a zero catalog / extents request as "4
+allocation blocks" (16 KiB at 4 KiB blocks, 32 catalog nodes; 2 KiB at
+512-byte blocks). `new volume hfs` never noticed because
+`cli::api::hfs::cmd_new` passes `default_btree_sizes` (0.5 % of the volume,
+hformat's rule) explicitly; `rb-cli batch`'s `format` op and every
+`create_blank_hfs` caller took the stub. Mac OS would extend the catalog
+file on demand; rb-cli's classic HFS writer cannot, so such a volume simply
+stops taking files. A zero request now means the volume-scaled default,
+and callers that ask for a size still get it (4-block floor).
 
 ## Found during the 2026-09-01 audit, leg 3 (macOS), 2026-09-05
 

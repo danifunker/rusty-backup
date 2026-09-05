@@ -2700,9 +2700,10 @@ pub fn pick_block_size(volume_bytes: u64) -> u32 {
 
 /// Variant of [`create_blank_hfs`] that lets the caller request minimum
 /// extents-overflow and catalog B-tree sizes (in bytes). Each is rounded up
-/// to a whole allocation block; values smaller than the 4-block default are
-/// raised to that floor. Used by the expand-block-size pipeline so the new
-/// volume's catalog can hold every record from a fragmented source.
+/// to a whole allocation block with a 4-block floor; zero means the
+/// volume-scaled [`default_btree_sizes`]. Used by the expand-block-size
+/// pipeline so the new volume's catalog can hold every record from a
+/// fragmented source.
 pub fn create_blank_hfs_sized(
     target_size_bytes: u64,
     block_size: u32,
@@ -2809,14 +2810,16 @@ fn build_blank_hfs_front(
     }
 
     // B-trees consume contiguous allocation blocks at the start of the
-    // partition. Default 4+4; callers can request larger via
-    // min_*_bytes. Each is rounded up to a whole allocation block.
-    let blocks_for = |bytes: u32| -> u16 {
+    // partition; rb-cli cannot grow a classic catalog later, so a zero request
+    // takes the volume-scaled hformat default rather than a 4-block stub (R-060).
+    let (default_catalog, default_extents) = default_btree_sizes(target_size_bytes, block_size);
+    let blocks_for = |bytes: u32, default: u32| -> u16 {
+        let bytes = if bytes == 0 { default } else { bytes };
         let n = (bytes as u64).div_ceil(block_size as u64).max(4);
         n.min(u16::MAX as u64) as u16
     };
-    let extents_blocks = blocks_for(min_extents_bytes);
-    let catalog_blocks = blocks_for(min_catalog_bytes);
+    let extents_blocks = blocks_for(min_extents_bytes, default_extents);
+    let catalog_blocks = blocks_for(min_catalog_bytes, default_catalog);
     let extents_start: u16 = 0;
     let catalog_start: u16 = extents_blocks;
     let btree_blocks: u16 = extents_blocks + catalog_blocks;
@@ -6357,14 +6360,73 @@ mod tests {
         );
     }
 
+    /// A thousand files in, one more in and out, the thousand out, one in:
+    /// the catalog must stay clean through every split, merge and retire.
+    #[test]
+    fn thousand_file_churn_keeps_the_catalog_clean() {
+        let img = create_blank_hfs(64 * 1024 * 1024, 4096, "Churn").unwrap();
+        let mut fs = HfsFilesystem::open(Cursor::new(img), 0).unwrap();
+        let root = fs.root().unwrap();
+        let clean = |fs: &mut HfsFilesystem<Cursor<Vec<u8>>>, stage: &str| {
+            fs.sync_metadata().unwrap();
+            let r = fs.fsck().unwrap();
+            assert!(r.errors.is_empty(), "{stage}: {:?}", r.errors);
+        };
+        let put = |fs: &mut HfsFilesystem<Cursor<Vec<u8>>>, name: &str, data: &[u8]| {
+            fs.create_file(
+                &root,
+                name,
+                &mut Cursor::new(data),
+                data.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .unwrap_or_else(|e| panic!("creating {name}: {e}"))
+        };
+        let free0 = fs.mdb.free_blocks;
+        for i in 0..1000 {
+            put(
+                &mut fs,
+                &format!("f{i:04}.txt"),
+                format!("file {i:04}").as_bytes(),
+            );
+        }
+        clean(&mut fs, "after 1000 creates");
+        let extra = put(&mut fs, "extra.bin", &[7u8; 5000]);
+        clean(&mut fs, "after one more");
+        fs.delete_entry(&root, &extra).unwrap();
+        clean(&mut fs, "after deleting it");
+        for e in fs.list_directory(&root).unwrap() {
+            fs.delete_entry(&root, &e).unwrap();
+        }
+        assert_eq!(fs.mdb.free_blocks, free0, "every block came back");
+        clean(&mut fs, "after deleting the 1000");
+        put(&mut fs, "last.bin", &[9u8; 100]);
+        clean(&mut fs, "after the last create");
+        let names: Vec<String> = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names, ["last.bin"]);
+    }
+
     /// R-058: with the partition length known, fsck reports a classic HFS
     /// volume whose allocation area stops short of the partition's alternate MDB.
     #[test]
     fn fsck_reports_a_volume_that_does_not_fill_its_partition() {
-        let img = create_blank_hfs(4 * 1024 * 1024, 512, "Short").unwrap();
+        let img = create_blank_hfs(4 * 1024 * 1024, 2048, "Short").unwrap();
         let exact = img.len() as u64;
         let mut fs = HfsFilesystem::open_sized(Cursor::new(img.clone()), 0, Some(exact)).unwrap();
         assert!(fs.partition_shortfall().is_none());
+        let report = fs.fsck().unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+
+        // A remainder shorter than one allocation block is what Mac OS's own
+        // formatter leaves behind; fsck_hfs accepts it, and so does this check.
+        let mut fs =
+            HfsFilesystem::open_sized(Cursor::new(img.clone()), 0, Some(exact + 512)).unwrap();
+        assert_eq!(fs.partition_shortfall(), Some(512));
         let report = fs.fsck().unwrap();
         assert!(report.errors.is_empty(), "{:?}", report.errors);
 

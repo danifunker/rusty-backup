@@ -6452,6 +6452,66 @@ fn btree_grow_blocks(total_nodes: u32, add_slots: u32, node_size: usize, block_s
 mod tests {
     use super::*;
 
+    /// A thousand files in, one more in and out, the thousand out, one in:
+    /// the catalog must stay clean through every split, merge and retire.
+    #[test]
+    fn thousand_file_churn_keeps_the_catalog_clean() {
+        use std::io::Cursor;
+        let img = create_blank_hfsplus(64 * 1024 * 1024, 4096, "Churn", false);
+        let mut fs = HfsPlusFilesystem::open(Cursor::new(img), 0).unwrap();
+        fs.prepare_for_edit().unwrap();
+        let root = fs.root().unwrap();
+        let clean = |fs: &mut HfsPlusFilesystem<Cursor<Vec<u8>>>, stage: &str| {
+            fs.sync_metadata().unwrap();
+            let r = fs.fsck().expect("hfsplus has fsck").unwrap();
+            assert!(r.errors.is_empty(), "{stage}: {:?}", r.errors);
+        };
+        let put = |fs: &mut HfsPlusFilesystem<Cursor<Vec<u8>>>, name: &str, data: &[u8]| {
+            fs.create_file(
+                &root,
+                name,
+                &mut Cursor::new(data),
+                data.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .unwrap_or_else(|e| panic!("creating {name}: {e}"))
+        };
+        let free0 = fs.vh.free_blocks;
+        let trees0 = fs.vh.catalog_file.total_blocks + fs.vh.extents_file.total_blocks;
+        for i in 0..1000 {
+            put(
+                &mut fs,
+                &format!("f{i:04}.txt"),
+                format!("file {i:04}").as_bytes(),
+            );
+        }
+        clean(&mut fs, "after 1000 creates");
+        let extra = put(&mut fs, "extra.bin", &[7u8; 5000]);
+        clean(&mut fs, "after one more");
+        fs.delete_entry(&root, &extra).unwrap();
+        clean(&mut fs, "after deleting it");
+        for e in fs.list_directory(&root).unwrap() {
+            fs.delete_entry(&root, &e).unwrap();
+        }
+        // The B-trees keep what they grew by; every other block comes back.
+        let trees = fs.vh.catalog_file.total_blocks + fs.vh.extents_file.total_blocks;
+        assert_eq!(
+            fs.vh.free_blocks + (trees - trees0),
+            free0,
+            "every block came back"
+        );
+        clean(&mut fs, "after deleting the 1000");
+        put(&mut fs, "last.bin", &[9u8; 100]);
+        clean(&mut fs, "after the last create");
+        let names: Vec<String> = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names, ["last.bin"]);
+    }
+
     /// Apple stamps kBTBigKeysMask on every HFS+ tree and adds
     /// kBTVariableIndexKeysMask on the catalog and attributes trees; so do we.
     #[test]
