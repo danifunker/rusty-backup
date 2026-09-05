@@ -19,7 +19,10 @@ done
 mkdir -p "$WORK"
 LOG="$WORK/results.log"
 : > "$LOG"
-ATTACHED=()
+# Devices attached so far, in a file: the attach helpers run inside $(...)
+# subshells, where a shell array would never reach the exit trap.
+ATTACHED_LIST="$WORK/attached.txt"
+: > "$ATTACHED_LIST"
 
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$LOG"; }
 # rb-cli with its output logged; returns its exit code.
@@ -36,7 +39,7 @@ attach_raw() {
     local dev
     dev=$(hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "$1" 2>>"$LOG" | awk 'NR==1{print $1}')
     [ -n "$dev" ] || { log "  attach failed for $1"; return 1; }
-    ATTACHED+=("$dev")
+    echo "$dev" >> "$ATTACHED_LIST"
     echo "$dev"
 }
 # Attach and mount read-only through the kernel driver; prints the mount point.
@@ -46,13 +49,16 @@ attach_mount() {
     dev=$(echo "$line" | awk '{print $1}')
     mnt=$(echo "$line" | awk -F'\t' '{print $3}' | sed 's/^ *//;s/ *$//')
     [ -d "$mnt" ] || { log "  mount failed for $1: $line"; return 1; }
-    ATTACHED+=("${dev%s[0-9]*}")
+    echo "${dev%s[0-9]*}" >> "$ATTACHED_LIST"
     echo "$mnt"
 }
 detach() {
     hdiutil detach "$1" >>"$LOG" 2>&1 || hdiutil detach -force "$1" >>"$LOG" 2>&1
 }
-detach_all() { for d in "${ATTACHED[@]:-}"; do [ -n "$d" ] && detach "$d"; done; ATTACHED=(); }
+detach_all() {
+    while read -r d; do [ -n "$d" ] && detach "$d"; done < "$ATTACHED_LIST"
+    : > "$ATTACHED_LIST"
+}
 trap detach_all EXIT
 # fsck_hfs -n on a raw device; passes only on "appears to be OK".
 mac_fsck() {
