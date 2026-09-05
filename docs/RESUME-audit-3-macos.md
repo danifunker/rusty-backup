@@ -103,4 +103,5 @@ overlapping the alternate MDB (`docs/Regression_Bugs.md`). H3 on classic
 HFS cannot be built by rb-cli (F-011, contiguous allocator); H6 needs Disk
 First Aid in Mini vMac, the image is built. Step 5: 152 s, 2.35 GB peak
 (`docs/build-memory-crashes.md`). This was the last leg; the audit's Low
-items live in the findings list only.
+items live in the findings list only. The HFS follow-ups and the hardware
+checks continue in `docs/RESUME-hfs-snow.md`.
