@@ -29,7 +29,7 @@ use btree::{
     repair_node_bitmap,
 };
 use catalog::{check_catalog_consistency, repair_catalog_consistency};
-use mdb::{check_alternate_mdb, check_embedded_hfs_plus, check_mdb};
+use mdb::{check_allocation_area_end, check_alternate_mdb, check_embedded_hfs_plus, check_mdb};
 
 // Re-export for external callers (hfs.rs uses `super::hfs_fsck::rebuild_index_nodes`).
 pub(crate) use btree::rebuild_index_nodes;
@@ -44,6 +44,9 @@ pub(super) enum HfsFsckCode {
     // MDB issues
     BadSignature,
     AlternateMdbMismatch,
+    /// The allocation area does not end at the partition's next-to-last
+    /// sector, where Mac OS keeps the alternate MDB (fsck_hfs E_ABlkSt, R-058).
+    AllocationAreaEnd,
     EmbeddedHfsPlusInvalid,
     BadBlockSize,
     BlockSizeUpperBound,
@@ -109,6 +112,7 @@ fn is_repairable(code: HfsFsckCode) -> bool {
     !matches!(
         code,
         HfsFsckCode::BadBlockSize
+            | HfsFsckCode::AllocationAreaEnd
             | HfsFsckCode::BlockSizeUpperBound
             | HfsFsckCode::VbmDataAreaCollision
             | HfsFsckCode::MdbVBMStTooLow
@@ -145,12 +149,14 @@ pub(super) fn hfs_issue(code: HfsFsckCode, message: impl Into<String>) -> FsckIs
 /// `bitmap` — volume allocation bitmap bytes.
 /// `extents_data` — optional extents overflow B-tree file content (for files with >3 extents).
 /// `alt_mdb_sector` — optional raw 512-byte alternate MDB sector (last sector of volume).
+/// `partition_len` — the partition's length when known; the allocation area must end at its next-to-last sector.
 pub(crate) fn check_hfs_integrity(
     mdb: &HfsMasterDirectoryBlock,
     catalog_data: &[u8],
     bitmap: &[u8],
     extents_data: Option<&[u8]>,
     alt_mdb_sector: Option<&[u8; 512]>,
+    partition_len: Option<u64>,
 ) -> FsckResult {
     let mut errors = Vec::new();
     let mut warnings = Vec::new();
@@ -161,6 +167,7 @@ pub(crate) fn check_hfs_integrity(
 
     // Phase 1: MDB sanity
     check_mdb(mdb, &mut errors);
+    check_allocation_area_end(mdb, partition_len, &mut errors);
 
     // If signature is bad, the rest of the check is meaningless
     if errors.iter().any(|e| e.code == "BadSignature") {
@@ -322,6 +329,7 @@ pub(crate) fn repair_hfs(
         bitmap,
         extents_data.as_deref().map(|v| v.as_slice()),
         None, // alt MDB not available during repair
+        None, // the partition length is not either; the fit is not repairable anyway
     );
     let unrepairable_count = check_result.errors.iter().filter(|e| !e.repairable).count();
 
@@ -1941,7 +1949,7 @@ mod tests {
         let mdb = make_test_mdb(); // file_count=0, folder_count=0
         let bitmap = vec![0u8; 16];
         let catalog_data: &[u8] = &[];
-        let result = check_hfs_integrity(&mdb, catalog_data, &bitmap, None, None);
+        let result = check_hfs_integrity(&mdb, catalog_data, &bitmap, None, None, None);
         assert!(
             result.is_clean(),
             "blank volume with empty catalog should be clean, got errors: {:?}",
@@ -1956,7 +1964,7 @@ mod tests {
         let mdb = make_test_mdb();
         let bitmap = vec![0u8; 16];
         let catalog_data = vec![0u8; 512];
-        let result = check_hfs_integrity(&mdb, &catalog_data, &bitmap, None, None);
+        let result = check_hfs_integrity(&mdb, &catalog_data, &bitmap, None, None, None);
         assert!(
             result.is_clean(),
             "blank volume with zeroed catalog should be clean, got errors: {:?}",
@@ -1971,7 +1979,7 @@ mod tests {
         mdb.file_count = 5;
         let bitmap = vec![0u8; 16];
         let catalog_data = vec![0u8; 512];
-        let result = check_hfs_integrity(&mdb, &catalog_data, &bitmap, None, None);
+        let result = check_hfs_integrity(&mdb, &catalog_data, &bitmap, None, None, None);
         assert!(
             !result.is_clean(),
             "non-empty volume with zeroed catalog should have errors"

@@ -184,4 +184,6 @@ it declines MFS, so H6 is judged by the Finder copy + TeachText. Evidence in
 `docs/evidence/`. Section 3 done too: `verify-hfs-snow.sh h3-real` lets the
 System 7.1 Finder copy a 1 MB file onto the rb-cli-fragmented H3 volume
 (Mac OS writes 5 overflow records), `rb-cli rm` deletes it, both judges
-pass before and after. Next: section 4 (classic HFS must fill its partition).
+pass before and after. Section 4 done: fsck `AllocationAreaEnd`, `resize`
+reaches the classic-HFS grow and explains a bitmap-bound refusal, editable
+opens warn. Next: section 5 (B-tree header attributes).

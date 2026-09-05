@@ -49,6 +49,45 @@ pub(super) fn unusual_hfs_name(name: &[u8]) -> Option<String> {
     None
 }
 
+/// Mac OS reads the alternate MDB from the partition's next-to-last sector and
+/// expects the allocation area to end right there (fsck_hfs E_ABlkSt, R-058).
+pub(super) fn check_allocation_area_end(
+    mdb: &HfsMasterDirectoryBlock,
+    partition_len: Option<u64>,
+    errors: &mut Vec<FsckIssue>,
+) {
+    let Some(len) = partition_len.filter(|&l| l >= 2048) else {
+        return;
+    };
+    #[allow(clippy::manual_is_multiple_of)]
+    if mdb.block_size == 0 || mdb.block_size % 512 != 0 || mdb.total_blocks == 0 {
+        return;
+    }
+    let area_end =
+        mdb.first_alloc_block as u64 + mdb.total_blocks as u64 * (mdb.block_size as u64 / 512);
+    let expected = len / 512 - 2;
+    if area_end == expected {
+        return;
+    }
+    let volume_len = area_end * 512 + 1024;
+    let what = if area_end < expected {
+        format!(
+            "the volume ({volume_len} bytes) does not fill its {len}-byte partition; grow it \
+             with `resize --size {len}` (or format one at the partition size when its volume \
+             bitmap has no room)"
+        )
+    } else {
+        format!("the volume ({volume_len} bytes) overruns its {len}-byte partition")
+    };
+    errors.push(hfs_issue(
+        HfsFsckCode::AllocationAreaEnd,
+        format!(
+            "allocation area ends at sector {area_end}, Mac OS expects the partition's \
+             next-to-last sector {expected}: {what}"
+        ),
+    ));
+}
+
 /// Validate the alternate MDB against the primary MDB.
 pub(super) fn check_alternate_mdb(
     mdb: &HfsMasterDirectoryBlock,

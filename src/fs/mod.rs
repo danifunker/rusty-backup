@@ -2145,7 +2145,7 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                         fs.prepare_for_edit()?;
                         Ok(Box::new(fs))
                     }
-                    "hfs" => Ok(Box::new(hfs::HfsFilesystem::open_sized(
+                    "hfs" => Ok(Box::new(hfs::HfsFilesystem::open_for_edit(
                         reader,
                         partition_offset,
                         partition_len,
@@ -2329,7 +2329,7 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                         .unwrap_or(squashfs_edit::SizeBudget::Fit),
                     edit_ctx.whole_file_path,
                 )?)),
-                "hfs" => Ok(Box::new(hfs::HfsFilesystem::open_sized(
+                "hfs" => Ok(Box::new(hfs::HfsFilesystem::open_for_edit(
                     reader,
                     partition_offset,
                     partition_len,
@@ -2584,7 +2584,7 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                     fs.prepare_for_edit()?;
                     Ok(Box::new(fs))
                 }
-                "hfs" => Ok(Box::new(hfs::HfsFilesystem::open_sized(
+                "hfs" => Ok(Box::new(hfs::HfsFilesystem::open_for_edit(
                     reader,
                     partition_offset,
                     partition_len,

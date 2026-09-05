@@ -307,6 +307,10 @@ has exactly 24 MiB of bits and cannot grow at all. The fix for that case
 is to format the volume at the partition size. Editing such a volume in
 place still writes the alternate MDB where Mac OS looks (H7), which is
 right but not sufficient.
+**The rest of it, 2026-09-05:** `rb-cli fsck` applies the check `fsck_hfs`
+does (`AllocationAreaEnd`): with the partition length known, the
+allocation area must end at the partition's next-to-last sector, and the
+error names the shortfall and `resize`.
  `rb-cli resize IMG@N --size` does
 reach `resize_hfs_in_place` and grows the volume when its bitmap has room;
 when it has not, the refusal now says how far the volume can grow and that

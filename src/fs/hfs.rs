@@ -504,6 +504,41 @@ impl<R: Read + Seek> HfsFilesystem<R> {
         Self::open_sized(reader, partition_offset, None)
     }
 
+    /// [`open_sized`](Self::open_sized) for an edit: a volume smaller than its
+    /// partition is warned about once, since Mac OS will refuse it (R-058).
+    pub fn open_for_edit(
+        reader: R,
+        partition_offset: u64,
+        partition_size: Option<u64>,
+    ) -> Result<Self, FilesystemError> {
+        let fs = Self::open_sized(reader, partition_offset, partition_size)?;
+        if let Some(short) = fs.partition_shortfall() {
+            log::warn!(
+                "the HFS volume is {short} bytes smaller than its partition; Mac OS and Disk \
+                 First Aid expect a classic HFS volume to fill its partition. Grow it with \
+                 `rb-cli resize IMG@N --size <partition size>` (R-058)"
+            );
+        }
+        Ok(fs)
+    }
+
+    /// Bytes by which the volume falls short of its partition, when the
+    /// partition length is known and the volume does not fill it.
+    pub fn partition_shortfall(&self) -> Option<u64> {
+        let size = self.partition_size.filter(|&s| s >= 2048)?;
+        if self.mdb.block_size == 0 {
+            return None;
+        }
+        let volume_len = self.mdb.first_alloc_block as u64 * 512
+            + self.mdb.total_blocks as u64 * self.mdb.block_size as u64
+            + 1024;
+        if volume_len < size {
+            Some(size - volume_len)
+        } else {
+            None
+        }
+    }
+
     /// [`open`](Self::open) with the partition length, so the alternate MDB is
     /// read and written at the partition end as Mac OS and Disk First Aid expect.
     pub fn open_sized(
@@ -846,6 +881,7 @@ impl<R: Read + Seek> HfsFilesystem<R> {
             self.bitmap.as_ref().unwrap(),
             extents_data.as_deref(),
             alt_mdb_sector.as_ref(),
+            self.partition_size,
         ))
     }
 
@@ -4374,11 +4410,14 @@ pub fn resize_hfs_in_place(
         anyhow::bail!(
             "HFS resize: requested {} allocation blocks exceeds the Volume Bitmap capacity \
              ({} blocks) for this volume. The VBM lives in fixed sectors [{}..{}) and cannot \
-             be grown without reformatting.",
+             be grown without reformatting: the most this volume can grow to is {} bytes. \
+             Mac OS wants a classic HFS volume to fill its partition, so format one at the \
+             partition size instead (`new volume hfs --size`, then `new hd --fill`).",
             new_total_u64,
             vbm_capacity_blocks,
             vbm_start,
             first_alloc,
+            vbm_capacity_blocks.min(u16::MAX as u64) * block_size as u64 + overhead,
         );
     }
     let new_total = new_total_u64 as u16;
@@ -6316,6 +6355,26 @@ mod tests {
             "fsck errors: {:?}",
             result.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
         );
+    }
+
+    /// R-058: with the partition length known, fsck reports a classic HFS
+    /// volume whose allocation area stops short of the partition's alternate MDB.
+    #[test]
+    fn fsck_reports_a_volume_that_does_not_fill_its_partition() {
+        let img = create_blank_hfs(4 * 1024 * 1024, 512, "Short").unwrap();
+        let exact = img.len() as u64;
+        let mut fs = HfsFilesystem::open_sized(Cursor::new(img.clone()), 0, Some(exact)).unwrap();
+        assert!(fs.partition_shortfall().is_none());
+        let report = fs.fsck().unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+
+        let mut fs =
+            HfsFilesystem::open_sized(Cursor::new(img), 0, Some(exact + 1024 * 1024)).unwrap();
+        assert_eq!(fs.partition_shortfall(), Some(1024 * 1024));
+        let report = fs.fsck().unwrap();
+        let codes: Vec<&str> = report.errors.iter().map(|e| e.code.as_str()).collect();
+        assert_eq!(codes, ["AllocationAreaEnd"], "{:?}", report.errors);
+        assert!(report.errors[0].message.contains("resize --size"));
     }
 
     /// F-011: a fork no single free run can hold spreads over the holes, its
