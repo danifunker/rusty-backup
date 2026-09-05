@@ -1486,7 +1486,75 @@ where
     stale
 }
 
-/// Free a node in the B-tree node bitmap. Clears the bit.
+/// Take an emptied leaf out of the tree: unlink it from its siblings and the
+/// header, free its node, drop its separator and, when it was the last leaf,
+/// retire the root. Apple's fsck calls a lone empty leaf "Invalid node
+/// structure"; an empty tree is depth 0 with no root. Returns nodes freed.
+pub fn btree_retire_empty_leaf<F>(
+    data: &mut [u8],
+    node_size: usize,
+    node_idx: u32,
+    kf: &BTreeKeyFormat,
+    cmp: &F,
+) -> Result<u32, FilesystemError>
+where
+    F: Fn(&[u8], &[u8]) -> Ordering,
+{
+    let off = node_idx as usize * node_size;
+    if off + node_size > data.len() || BigEndian::read_u16(&data[off + 10..off + 12]) != 0 {
+        return Ok(0);
+    }
+    let flink = BigEndian::read_u32(&data[off..off + 4]);
+    let blink = BigEndian::read_u32(&data[off + 4..off + 8]);
+    if blink != 0 {
+        let b = blink as usize * node_size;
+        BigEndian::write_u32(&mut data[b..b + 4], flink);
+    }
+    if flink != 0 {
+        let f = flink as usize * node_size;
+        BigEndian::write_u32(&mut data[f + 4..f + 8], blink);
+    }
+    let mut h = BTreeHeader::read(data);
+    if h.first_leaf_node == node_idx {
+        h.first_leaf_node = flink;
+    }
+    if h.last_leaf_node == node_idx {
+        h.last_leaf_node = blink;
+    }
+    h.free_nodes += 1;
+    h.write(data);
+    btree_free_node(data, node_size, node_idx);
+    let freed = btree_detach_freed_node_and_refresh(data, node_size, node_idx, kf, cmp)?;
+    Ok(freed + 1)
+}
+
+/// Leaves with no records and no siblings. Apple retires such a tree instead,
+/// and fsck_hfs reports one as "Invalid node structure".
+pub fn btree_lonely_empty_leaves(data: &[u8], node_size: usize) -> Vec<u32> {
+    let mut lonely = Vec::new();
+    if node_size == 0 || data.len() < node_size {
+        return lonely;
+    }
+    let max_nodes = (data.len() / node_size) as u32;
+    for idx in 1..max_nodes {
+        if !btree_bitmap_test(data, node_size, idx) {
+            continue;
+        }
+        let off = idx as usize * node_size;
+        let node = &data[off..off + node_size];
+        if node[8] as i8 == BTREE_LEAF_NODE
+            && BigEndian::read_u16(&node[10..12]) == 0
+            && BigEndian::read_u32(&node[0..4]) == 0
+            && BigEndian::read_u32(&node[4..8]) == 0
+        {
+            lonely.push(idx);
+        }
+    }
+    lonely
+}
+
+/// Free a node in the B-tree node bitmap: clears the bit and erases the node,
+/// as fsck_hfs demands of every unused node ("Unused node is not erased").
 pub fn btree_free_node(catalog_data: &mut [u8], node_size: usize, node_idx: u32) {
     let segs = btree_bitmap_segments(catalog_data, node_size);
     let Some((idx, local)) = locate_bit_in_segments(&segs, node_idx) else {
@@ -1497,6 +1565,30 @@ pub fn btree_free_node(catalog_data: &mut [u8], node_size: usize, node_idx: u32)
         &mut catalog_data[seg.byte_off..seg.byte_off + seg.len],
         local,
     );
+    let off = node_idx as usize * node_size;
+    if node_idx != 0 && off + node_size <= catalog_data.len() {
+        catalog_data[off..off + node_size].fill(0);
+    }
+}
+
+/// Free nodes that still hold data; Apple erases a node when it frees it and
+/// fsck_hfs reports one that is not ("Unused node is not erased").
+pub fn btree_unerased_free_nodes(data: &[u8], node_size: usize) -> Vec<u32> {
+    let mut dirty = Vec::new();
+    if node_size == 0 || data.len() < node_size {
+        return dirty;
+    }
+    let max_nodes = (data.len() / node_size) as u32;
+    for idx in 1..max_nodes {
+        if btree_bitmap_test(data, node_size, idx) {
+            continue;
+        }
+        let off = idx as usize * node_size;
+        if data[off..off + node_size].iter().any(|&b| b != 0) {
+            dirty.push(idx);
+        }
+    }
+    dirty
 }
 
 /// Clear a node's bit in the bitmap. Segment-aware (handles map nodes).

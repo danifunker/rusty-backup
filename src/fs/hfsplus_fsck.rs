@@ -25,7 +25,10 @@ use byteorder::{BigEndian, ByteOrder};
 
 use super::filesystem::FilesystemError;
 use super::fsck::{FsckIssue, FsckResult, FsckStats, OrphanedEntry};
-use super::hfs_common::{btree_stale_index_keys, walk_leaf_records, BTreeHeader, BTreeKeyFormat};
+use super::hfs_common::{
+    btree_lonely_empty_leaves, btree_stale_index_keys, btree_unerased_free_nodes,
+    walk_leaf_records, BTreeHeader, BTreeKeyFormat,
+};
 use super::hfsplus::{catalog_compare_keys, HfsPlusFilesystem};
 
 const HFS_PLUS_SIGNATURE: u16 = 0x482B; // "H+"
@@ -53,6 +56,8 @@ enum HfsPlusFsckCode {
     DuplicateCatalogKey,
     KeyOutOfOrder,
     IndexKeyMismatch,
+    EmptyLeafWithoutSiblings,
+    FreeNodeNotErased,
     ParentValenceMismatch,
     BitmapAllocCountMismatch,
     BitmapTooShort,
@@ -74,6 +79,8 @@ impl HfsPlusFsckCode {
             HfsPlusFsckCode::DuplicateCatalogKey => "DuplicateCatalogKey",
             HfsPlusFsckCode::KeyOutOfOrder => "KeyOutOfOrder",
             HfsPlusFsckCode::IndexKeyMismatch => "IndexKeyMismatch",
+            HfsPlusFsckCode::EmptyLeafWithoutSiblings => "EmptyLeafWithoutSiblings",
+            HfsPlusFsckCode::FreeNodeNotErased => "FreeNodeNotErased",
             HfsPlusFsckCode::ParentValenceMismatch => "ParentValenceMismatch",
             HfsPlusFsckCode::BitmapAllocCountMismatch => "BitmapAllocCountMismatch",
             HfsPlusFsckCode::BitmapTooShort => "BitmapTooShort",
@@ -350,6 +357,58 @@ pub(super) fn check<R: Read + Seek>(
                         "attributes index node {idx} record {rec} does not carry the first \
                          key of its child {child}"
                     ),
+                ));
+            }
+        }
+    }
+
+    // ---- Phase 2c: empty leaves ---------------------------------------------
+    // A leaf with no records and no siblings is what Apple retires the whole
+    // tree for; fsck_hfs reports one as "Invalid node structure" (E_BadNode).
+    {
+        let mut trees: Vec<(&str, Vec<u32>)> = Vec::new();
+        trees.push((
+            "catalog",
+            btree_lonely_empty_leaves(fs.catalog_data(), fs.catalog_node_size()),
+        ));
+        if let Some(data) = fs.extents_overflow_data().filter(|d| d.len() >= 512) {
+            let node_size = BTreeHeader::read(data).node_size as usize;
+            trees.push(("extents", btree_lonely_empty_leaves(data, node_size)));
+        }
+        if let Some(data) = fs.attributes_data_for_fsck()?.filter(|d| d.len() >= 512) {
+            let node_size = BTreeHeader::read(data).node_size as usize;
+            trees.push(("attributes", btree_lonely_empty_leaves(data, node_size)));
+        }
+        for (tree, leaves) in trees {
+            for idx in leaves {
+                errors.push(issue(
+                    HfsPlusFsckCode::EmptyLeafWithoutSiblings,
+                    format!(
+                        "{tree} leaf node {idx} has no records and no siblings; an empty \
+                         tree has no root at all"
+                    ),
+                ));
+            }
+        }
+        // Apple erases a node when it frees it; fsck_hfs checks that too.
+        let mut dirty: Vec<(&str, Vec<u32>)> = Vec::new();
+        dirty.push((
+            "catalog",
+            btree_unerased_free_nodes(fs.catalog_data(), fs.catalog_node_size()),
+        ));
+        if let Some(data) = fs.extents_overflow_data().filter(|d| d.len() >= 512) {
+            let node_size = BTreeHeader::read(data).node_size as usize;
+            dirty.push(("extents", btree_unerased_free_nodes(data, node_size)));
+        }
+        if let Some(data) = fs.attributes_data_for_fsck()?.filter(|d| d.len() >= 512) {
+            let node_size = BTreeHeader::read(data).node_size as usize;
+            dirty.push(("attributes", btree_unerased_free_nodes(data, node_size)));
+        }
+        for (tree, nodes) in dirty {
+            for idx in nodes {
+                errors.push(issue(
+                    HfsPlusFsckCode::FreeNodeNotErased,
+                    format!("{tree} node {idx} is free in the node map but not erased"),
                 ));
             }
         }

@@ -19,9 +19,9 @@ use super::{hfs_issue, HfsFsckCode};
 use crate::fs::fsck::{FsckIssue, RepairReport};
 use crate::fs::hfs_common::{
     bitmap_test_bit_be, btree_alloc_node, btree_bitmap_clear, btree_bitmap_set, btree_bitmap_test,
-    btree_node_bitmap_range, btree_record_range, btree_stale_index_keys,
-    compare_classic_extents_keys, init_node, BTreeHeader, BTreeKeyFormat, BTREE_HEADER_NODE,
-    BTREE_INDEX_NODE, BTREE_LEAF_NODE, BTREE_MAP_NODE,
+    btree_lonely_empty_leaves, btree_node_bitmap_range, btree_record_range, btree_stale_index_keys,
+    btree_unerased_free_nodes, compare_classic_extents_keys, init_node, BTreeHeader,
+    BTreeKeyFormat, BTREE_HEADER_NODE, BTREE_INDEX_NODE, BTREE_LEAF_NODE, BTREE_MAP_NODE,
 };
 
 fn compare_extents_keys(a: &[u8], b: &[u8]) -> Ordering {
@@ -181,6 +181,24 @@ pub(super) fn check_extents_btree_structure(extents_data: &[u8], errors: &mut Ve
 
     // Key ordering
     check_extents_key_ordering(extents_data, &header, errors);
+
+    for idx in btree_unerased_free_nodes(extents_data, node_size) {
+        errors.push(hfs_issue(
+            HfsFsckCode::ExtentsBtreeStructure,
+            format!("extents node {idx} is free in the node map but not erased"),
+        ));
+    }
+
+    // A lone empty leaf is a tree Apple would have retired (fsck_hfs E_BadNode).
+    for idx in btree_lonely_empty_leaves(extents_data, node_size) {
+        errors.push(hfs_issue(
+            HfsFsckCode::ExtentsBtreeStructure,
+            format!(
+                "extents leaf node {idx} has no records and no siblings; an empty tree has \
+                 no root"
+            ),
+        ));
+    }
 
     // Each separator must be its child's first key (fsck_hfs E_IKey).
     for (idx, rec, child, _) in btree_stale_index_keys(

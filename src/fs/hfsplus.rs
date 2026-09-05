@@ -12,7 +12,7 @@ use super::filesystem::{
 use super::hfs_common::{
     self, bitmap_clear_bit_be, bitmap_collect_clear_runs_be, bitmap_set_bit_be, bitmap_test_bit_be,
     btree_detach_freed_node_and_refresh, btree_free_node, btree_refresh_index_keys,
-    btree_remove_record, BTreeHeader, BTreeKeyFormat,
+    btree_remove_record, btree_retire_empty_leaf, BTreeHeader, BTreeKeyFormat,
 };
 use super::CompactResult;
 
@@ -2211,19 +2211,17 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
         let mut h = BTreeHeader::read(data);
         h.leaf_records = h.leaf_records.saturating_sub(removed);
         h.write(data);
-        // A leaf whose first key changed needs the separators above it redone.
-        let mut nodes: Vec<u32> = victims.iter().filter(|v| v.1 == 0).map(|v| v.0).collect();
+        // An emptied leaf leaves the tree; one whose first key changed needs
+        // the separators above it redone.
+        let mut nodes: Vec<u32> = victims.iter().map(|v| v.0).collect();
         nodes.dedup();
         for node_idx in nodes {
             let off = node_idx as usize * node_size;
-            if BigEndian::read_u16(&data[off + 10..off + 12]) > 0 {
-                btree_refresh_index_keys(
-                    data,
-                    node_size,
-                    node_idx,
-                    &BTreeKeyFormat::HFSPLUS_EXTENTS,
-                    &Self::extents_compare,
-                )?;
+            let kf = BTreeKeyFormat::HFSPLUS_EXTENTS;
+            if BigEndian::read_u16(&data[off + 10..off + 12]) == 0 {
+                btree_retire_empty_leaf(data, node_size, node_idx, &kf, &Self::extents_compare)?;
+            } else if victims.iter().any(|&(n, r)| n == node_idx && r == 0) {
+                btree_refresh_index_keys(data, node_size, node_idx, &kf, &Self::extents_compare)?;
             }
         }
         Ok(())
@@ -2427,19 +2425,17 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
         let mut h = BTreeHeader::read(data);
         h.leaf_records = h.leaf_records.saturating_sub(removed);
         h.write(data);
-        // A leaf whose first key changed needs the separators above it redone.
-        let mut nodes: Vec<u32> = victims.iter().filter(|v| v.1 == 0).map(|v| v.0).collect();
+        // An emptied leaf leaves the tree; one whose first key changed needs
+        // the separators above it redone.
+        let mut nodes: Vec<u32> = victims.iter().map(|v| v.0).collect();
         nodes.dedup();
         for node_idx in nodes {
             let off = node_idx as usize * node_size;
-            if BigEndian::read_u16(&data[off + 10..off + 12]) > 0 {
-                btree_refresh_index_keys(
-                    data,
-                    node_size,
-                    node_idx,
-                    &BTreeKeyFormat::HFSPLUS_ATTRIBUTES,
-                    &Self::attr_compare,
-                )?;
+            let kf = BTreeKeyFormat::HFSPLUS_ATTRIBUTES;
+            if BigEndian::read_u16(&data[off + 10..off + 12]) == 0 {
+                btree_retire_empty_leaf(data, node_size, node_idx, &kf, &Self::attr_compare)?;
+            } else if victims.iter().any(|&(n, r)| n == node_idx && r == 0) {
+                btree_refresh_index_keys(data, node_size, node_idx, &kf, &Self::attr_compare)?;
             }
         }
         Ok(removed)
@@ -9659,6 +9655,69 @@ mod tests {
             got, payload,
             "fragmented read-back mismatch through split overflow tree"
         );
+    }
+
+    #[test]
+    fn deleting_the_last_overflow_record_retires_the_extents_tree() {
+        // fsck_hfs E_BadNode: the audit's H3 delete left the extents tree as a
+        // depth-1 root leaf with no records, which Apple never writes.
+        use super::hfs_common::{btree_lonely_empty_leaves, BTreeHeader};
+        type Fs = HfsPlusFilesystem<std::io::Cursor<Vec<u8>>>;
+        let img = create_blank_hfsplus_sized(32 << 20, 4096, "Retire", false, 0, 256 << 10);
+        let mut fs = Fs::open(std::io::Cursor::new(img), 0).unwrap();
+        fs.prepare_for_edit().unwrap();
+
+        // Free singleton blocks only, so the file fragments into the overflow tree.
+        fs.ensure_bitmap().unwrap();
+        let block_size = fs.vh.block_size as usize;
+        let n_blocks: u32 = 520;
+        let first_free = fs.vh.next_allocation;
+        {
+            let bitmap = fs.bitmap.as_mut().unwrap();
+            for b in bitmap.iter_mut() {
+                *b = 0xFF;
+            }
+            let mut blk = first_free + 1;
+            for _ in 0..n_blocks {
+                bitmap_clear_bit_be(bitmap, blk);
+                blk += 2;
+            }
+        }
+        fs.vh.free_blocks = n_blocks;
+        let payload: Vec<u8> = (0..(n_blocks as usize * block_size))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let root = fs.root().unwrap();
+        let entry = fs
+            .create_file(
+                &root,
+                "frag.bin",
+                &mut std::io::Cursor::new(payload.clone()),
+                payload.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+        let before = BTreeHeader::read(fs.extents_overflow_data.as_ref().unwrap());
+        assert!(
+            before.depth >= 2 && before.leaf_records > 0,
+            "depth {} leaf_records {}",
+            before.depth,
+            before.leaf_records
+        );
+
+        fs.delete_entry(&root, &entry).unwrap();
+
+        let tree = fs.extents_overflow_data.as_ref().unwrap();
+        let h = BTreeHeader::read(tree);
+        assert_eq!((h.leaf_records, h.root_node, h.depth), (0, 0, 0));
+        assert_eq!(
+            h.free_nodes,
+            h.total_nodes - 1,
+            "only the header node stays"
+        );
+        // The hand-made bitmap above never reaches disk, so no fsck here; the
+        // audit's verify-fs-macos.sh runs fsck_hfs on the real image instead.
+        assert!(btree_lonely_empty_leaves(tree, h.node_size as usize).is_empty());
     }
 
     #[test]

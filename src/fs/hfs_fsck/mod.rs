@@ -61,6 +61,10 @@ pub(super) enum HfsFsckCode {
     KeysOutOfOrder,
     /// An index separator that is not its child's first key (fsck_hfs E_IKey).
     IndexKeyMismatch,
+    /// A leaf with no records and no siblings (fsck_hfs E_BadNode).
+    EmptyLeafWithoutSiblings,
+    /// A free node still holding data (fsck_hfs "Unused node is not erased").
+    FreeNodeNotErased,
     OffsetTableNotMonotonic,
     OffsetTableOutOfBounds,
     LeafChainBroken,

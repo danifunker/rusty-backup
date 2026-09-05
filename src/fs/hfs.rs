@@ -3739,8 +3739,8 @@ fn remove_fork_overflow_records(
     fork_type: u8,
 ) -> Result<u32, FilesystemError> {
     use super::hfs_common::{
-        btree_detach_freed_node_and_refresh, btree_free_node, btree_remove_record,
-        compare_classic_extents_keys, walk_leaf_records, BTreeHeader,
+        btree_remove_record, btree_retire_empty_leaf, compare_classic_extents_keys,
+        walk_leaf_records, BTreeHeader,
     };
     let kf = BTreeKeyFormat::CLASSIC_EXTENTS;
     if extents_data.len() < 512 {
@@ -3784,47 +3784,25 @@ fn remove_fork_overflow_records(
     nodes.dedup();
     for node_idx in nodes {
         let off = node_idx as usize * node_size;
-        if BigEndian::read_u16(&extents_data[off + 10..off + 12]) != 0 {
+        if BigEndian::read_u16(&extents_data[off + 10..off + 12]) == 0 {
+            // An emptied leaf leaves the chain, the node map and the index.
+            btree_retire_empty_leaf(
+                extents_data,
+                node_size,
+                node_idx,
+                &kf,
+                &compare_classic_extents_keys,
+            )?;
+        } else if victims.iter().any(|&(n, r)| n == node_idx && r == 0) {
             // The leaf's first key changed: the separators above must match it.
-            if victims.iter().any(|&(n, r)| n == node_idx && r == 0) {
-                btree_refresh_index_keys(
-                    extents_data,
-                    node_size,
-                    node_idx,
-                    &kf,
-                    &compare_classic_extents_keys,
-                )?;
-            }
-            continue;
+            btree_refresh_index_keys(
+                extents_data,
+                node_size,
+                node_idx,
+                &kf,
+                &compare_classic_extents_keys,
+            )?;
         }
-        // An emptied leaf leaves the sibling chain and the node map.
-        let flink = BigEndian::read_u32(&extents_data[off..off + 4]);
-        let blink = BigEndian::read_u32(&extents_data[off + 4..off + 8]);
-        if blink != 0 {
-            let b = blink as usize * node_size;
-            BigEndian::write_u32(&mut extents_data[b..b + 4], flink);
-        }
-        if flink != 0 {
-            let f = flink as usize * node_size;
-            BigEndian::write_u32(&mut extents_data[f + 4..f + 8], blink);
-        }
-        let mut h = BTreeHeader::read(extents_data);
-        if h.first_leaf_node == node_idx {
-            h.first_leaf_node = flink;
-        }
-        if h.last_leaf_node == node_idx {
-            h.last_leaf_node = blink;
-        }
-        h.free_nodes += 1;
-        h.write(extents_data);
-        btree_free_node(extents_data, node_size, node_idx);
-        btree_detach_freed_node_and_refresh(
-            extents_data,
-            node_size,
-            node_idx,
-            &kf,
-            &compare_classic_extents_keys,
-        )?;
     }
     Ok(victims.len() as u32)
 }
@@ -6241,6 +6219,10 @@ mod tests {
         assert!(collect_fork_overflow_extents(tree, cnid, 0x00, 0).is_empty());
         let h = BTreeHeader::read(tree);
         assert_eq!((h.leaf_records, h.root_node, h.depth), (0, 0, 0));
+        // Apple's fsck rejects a lone empty leaf; the retired tree has none.
+        assert!(
+            super::hfs_common::btree_lonely_empty_leaves(tree, h.node_size as usize).is_empty()
+        );
         let bitmap = fs.bitmap.as_ref().unwrap();
         assert!(!bitmap_test_bit_be(bitmap, start) && !bitmap_test_bit_be(bitmap, start + 1));
         assert_eq!(fs.mdb.free_blocks, free_at_start, "every block came back");

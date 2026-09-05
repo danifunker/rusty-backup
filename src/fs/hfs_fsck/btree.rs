@@ -17,9 +17,10 @@ use byteorder::{BigEndian, ByteOrder};
 
 use super::super::fsck::{FsckIssue, RepairReport};
 use super::super::hfs_common::{
-    btree_bitmap_set, btree_bitmap_test, btree_insert_record, btree_node_bitmap_range,
-    btree_record_range, btree_stale_index_keys, normalize_catalog_index_key, BTreeHeader,
-    BTreeKeyFormat, BTREE_HEADER_NODE, BTREE_INDEX_NODE, BTREE_LEAF_NODE, BTREE_MAP_NODE,
+    btree_bitmap_set, btree_bitmap_test, btree_insert_record, btree_lonely_empty_leaves,
+    btree_node_bitmap_range, btree_record_range, btree_stale_index_keys, btree_unerased_free_nodes,
+    normalize_catalog_index_key, BTreeHeader, BTreeKeyFormat, BTREE_HEADER_NODE, BTREE_INDEX_NODE,
+    BTREE_LEAF_NODE, BTREE_MAP_NODE,
 };
 use super::{hfs_issue, HfsFsckCode};
 
@@ -395,6 +396,18 @@ pub(super) fn check_key_ordering(
 
     check_leaf_chain_ordering(catalog_data, header, errors);
     check_index_separators(catalog_data, header, errors);
+    for idx in btree_lonely_empty_leaves(catalog_data, node_size) {
+        errors.push(hfs_issue(
+            HfsFsckCode::EmptyLeafWithoutSiblings,
+            format!("leaf node {idx} has no records and no siblings; an empty tree has no root"),
+        ));
+    }
+    for idx in btree_unerased_free_nodes(catalog_data, node_size) {
+        errors.push(hfs_issue(
+            HfsFsckCode::FreeNodeNotErased,
+            format!("node {idx} is free in the node map but not erased"),
+        ));
+    }
 }
 
 /// First and last key of a node, if it has any records.
