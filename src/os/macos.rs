@@ -44,6 +44,8 @@ use crate::device::{DiskDevice, MountedPartition};
 // DKIOCGETBLOCKCOUNT = _IOR('d', 25, u64) = 0x40086419
 const DKIOCGETBLOCKSIZE: libc::c_ulong = 0x40046418;
 const DKIOCGETBLOCKCOUNT: libc::c_ulong = 0x40086419;
+// DKIOCISWRITABLE = _IOR('d', 29, u32) = 0x4004641d
+const DKIOCISWRITABLE: libc::c_ulong = 0x4004641d;
 
 /// macOS fcntl command to bypass the buffer cache (equivalent to O_DIRECT on Linux).
 const F_NOCACHE: libc::c_int = 48;
@@ -92,6 +94,18 @@ pub fn get_device_size(file: &std::fs::File) -> Option<u64> {
     }
 
     Some(block_count * block_size as u64)
+}
+
+/// Whether the kernel will accept writes to the media behind `file`; `None`
+/// for anything that is not a disk device. A locked SD card answers `false`.
+pub fn media_is_writable(file: &File) -> Option<bool> {
+    use std::os::unix::io::AsRawFd;
+    let mut writable: u32 = 0;
+    let r = unsafe { libc::ioctl(file.as_raw_fd(), DKIOCISWRITABLE, &mut writable) };
+    if r != 0 {
+        return None;
+    }
+    Some(writable != 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -282,6 +296,13 @@ fn da_disk_description(session: &DASession, bsd_name: &str) -> Option<DiskDescri
             volume_path,
         })
     }
+}
+
+/// Whether DiskArbitration says the media accepts writes, without opening it;
+/// `None` when it has no answer (no session, or not a disk it knows).
+fn da_media_writable(bsd_name: &str) -> Option<bool> {
+    let session = unsafe { DASession::new(None) }?;
+    da_disk_description(&session, bsd_name).map(|d| d.is_writable)
 }
 
 struct DiskDescription {
@@ -863,12 +884,29 @@ fn cached_authopen(path: &str, flags: libc::c_int) -> Result<SharedDevice> {
 }
 
 /// Access mode to escalate a read with: `O_RDWR`, so one prompt also covers a
-/// later restore — unless a volume is still mounted, which refuses it (EBUSY).
-fn read_escalation_flags(unmounted: bool, saw_busy: bool) -> libc::c_int {
-    if unmounted && !saw_busy {
+/// later restore — unless a volume is still mounted (EBUSY) or the media is
+/// write-protected, which refuse it for root too (R6).
+fn read_escalation_flags(unmounted: bool, saw_busy: bool, writable: bool) -> libc::c_int {
+    if unmounted && !saw_busy && writable {
         libc::O_RDWR
     } else {
         libc::O_RDONLY
+    }
+}
+
+/// Why a device opened read-only after refusing read-write (R6): write-protected
+/// media is reported as such, never as a privilege problem.
+fn log_read_only_open(path: &str, file: &File, rw_errno: i32) {
+    match media_is_writable(file) {
+        Some(false) => log::warn!(
+            "{path} is write-protected (lock switch or read-only image); opened \
+             read-only, a restore to it cannot work"
+        ),
+        _ => log::info!(
+            "{path} opened read-only (read-write open failed: {}); a restore will \
+             ask for administrator rights",
+            std::io::Error::from_raw_os_error(rw_errno)
+        ),
     }
 }
 
@@ -1349,6 +1387,16 @@ pub(crate) fn open_target_for_writing(path: &Path) -> Result<(File, Option<DiskC
     let path_str = path.to_string_lossy();
     let disk_name = bsd_name_from_path(path);
 
+    // Write-protected media refuses O_RDWR for root as well (R6): say so before
+    // unmounting anything or raising a prompt that cannot help.
+    if da_media_writable(disk_name) == Some(false) {
+        bail!(
+            "{} is write-protected (media lock switch or read-only image); it cannot \
+             be written to",
+            path.display()
+        );
+    }
+
     // Unmount all volumes before claiming/opening
     if let Err(e) = da_unmount_disk(disk_name) {
         // Not fatal — the disk might not be mounted
@@ -1423,28 +1471,33 @@ pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
         let c_path = CString::new(raw_device.as_str()).context("invalid device path")?;
 
         // 2. Direct open — we may be root already, or the media may need no
-        //    privilege. O_RDWR first so the handle also covers a later write.
+        //    privilege. O_RDWR first so the handle also covers a later write,
+        //    then O_RDONLY regardless of why: write-protected media refuses
+        //    O_RDWR with EACCES for root as well (R6), so a read-only success
+        //    is the answer, not a reason to prompt.
         let mut busy = false;
+        let mut rw_errno = None;
         let mut last_err = None;
         for flags in [libc::O_RDWR, libc::O_RDONLY] {
             let fd = unsafe { libc::open(c_path.as_ptr(), flags) };
             if fd >= 0 {
                 unsafe { libc::fcntl(fd, F_NOCACHE, 1) };
+                let file = unsafe { File::from_raw_fd(fd) };
+                if let Some(rw_errno) = rw_errno {
+                    log_read_only_open(&raw_device, &file, rw_errno);
+                }
                 return Ok(ElevatedSource {
-                    file: super::SourceHandle::File(unsafe { File::from_raw_fd(fd) }),
+                    file: super::SourceHandle::File(file),
                     temp_path: None,
                     disk_claim,
                 });
             }
             let err = std::io::Error::last_os_error();
-            let is_busy = err.raw_os_error() == Some(libc::EBUSY);
-            busy |= is_busy;
-            last_err = Some(err);
-            // Only EBUSY is worth retrying read-only; a permission failure is
-            // about privilege, not access mode, and goes to authopen below.
-            if !is_busy {
-                break;
+            busy |= err.raw_os_error() == Some(libc::EBUSY);
+            if flags == libc::O_RDWR {
+                rw_errno = Some(err.raw_os_error().unwrap_or(0));
             }
+            last_err = Some(err);
         }
 
         let err = last_err.expect("the probe loop always records its last error");
@@ -1453,8 +1506,14 @@ pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
         // 3. On EPERM or EACCES, escalate via authopen and cache the result, in
         //    the widest mode this disk can give ([`read_escalation_flags`]).
         if raw == libc::EPERM || raw == libc::EACCES {
-            let flags = read_escalation_flags(unmounted, busy);
-            if flags == libc::O_RDONLY {
+            let writable = da_media_writable(disk_name).unwrap_or(true);
+            let flags = read_escalation_flags(unmounted, busy, writable);
+            if !writable {
+                log::warn!(
+                    "{raw_device} is write-protected; escalating read-only, a restore to \
+                     it cannot work"
+                );
+            } else if flags == libc::O_RDONLY {
                 log::info!("{raw_device} still has a volume mounted; escalating read-only");
             }
             // `busy` is unknowable here: the probe loop breaks on EACCES before
@@ -1755,13 +1814,31 @@ mod shared_device_tests {
     fn a_read_escalates_read_write_unless_a_volume_is_still_mounted() {
         // One prompt for the whole session: the read path escalates read-write
         // so a later restore reuses the descriptor instead of prompting again.
-        assert_eq!(read_escalation_flags(true, false), libc::O_RDWR);
+        assert_eq!(read_escalation_flags(true, false, true), libc::O_RDWR);
 
         // ...except on a disk that would not unmount, where the kernel refuses
         // O_RDWR outright (EBUSY) and read-only is the only mode that works.
-        assert_eq!(read_escalation_flags(false, false), libc::O_RDONLY);
-        assert_eq!(read_escalation_flags(true, true), libc::O_RDONLY);
-        assert_eq!(read_escalation_flags(false, true), libc::O_RDONLY);
+        assert_eq!(read_escalation_flags(false, false, true), libc::O_RDONLY);
+        assert_eq!(read_escalation_flags(true, true, true), libc::O_RDONLY);
+        assert_eq!(read_escalation_flags(false, true, true), libc::O_RDONLY);
+    }
+
+    #[test]
+    fn write_protected_media_is_never_escalated_read_write() {
+        // R6: a locked SD card refuses O_RDWR with EACCES for root too, so a
+        // read-write prompt would authenticate the user for nothing and then
+        // fail. Read-only is the only mode that can succeed.
+        assert_eq!(read_escalation_flags(true, false, false), libc::O_RDONLY);
+        assert_eq!(read_escalation_flags(false, true, false), libc::O_RDONLY);
+    }
+
+    #[test]
+    fn a_regular_file_has_no_writability_verdict() {
+        // DKIOCISWRITABLE only answers for disk devices; a plain file must give
+        // None so the caller falls back to the plain "opened read-only" wording.
+        let tmp = tempfile::NamedTempFile::new().expect("temp file");
+        let file = std::fs::File::open(tmp.path()).expect("open");
+        assert_eq!(media_is_writable(&file), None);
     }
 
     #[test]
