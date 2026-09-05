@@ -192,6 +192,16 @@ volume and its grow-back both pass `fsck_hfs -n` (noted under R-056).
 Section 7 done: `verify-hfs-snow.sh mac-formatted` has the System 7.1 Finder
 initialize a partition, rb-cli edits it, both judges and the Finder pass.
 Section 8 (hardware) is prepared below; nothing else is open.
+Added later on 2026-09-05, at the user's request: the 1000-file churn. H12
+in `verify-fs-macos.sh` (macOS's kernel driver takes the middle turn on
+HFS+) and `verify-hfs-snow.sh os-churn` (the System 7.1 Finder takes it on
+classic HFS, then shuts down so the MDB is flushed), both PASS; the rb-cli
+only churn runs on every filesystem that can hold a thousand files in
+`regression-tests/cases/tier3/churn.toml` (15 pass; 9 expected failures on
+the bug list: R-061 UFS, R-062 ProDOS, R-063 XFS, F-012 .. F-015 NTFS /
+ext4 / SFS / Minix limits) and it found R-060 (a blank classic HFS catalog
+of four blocks). Unit tests `thousand_file_churn_keeps_the_catalog_clean`
+cover HFS and HFS+ in `cargo test`.
 
 Section 8, the commands to run with the hardware attached (from the repo
 root, debug build; `diskutil list` gives N):

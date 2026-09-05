@@ -17,6 +17,7 @@
 #   bash scripts/verify-hfs-snow.sh h3-real -w DIR     # the Finder fragments a fork on h3-hfs.img; rb-cli rm; both judges
 #   bash scripts/verify-hfs-snow.sh mac-formatted -w DIR
 #                                                      # System 7.1 formats a partition; rb-cli edits it; both judges + the Finder
+#   bash scripts/verify-hfs-snow.sh os-churn -w DIR    # the Finder adds, deletes, deletes 1000 files on h12-hfs.img; rb-cli adds one
 #   bash scripts/verify-hfs-snow.sh wrap VOL.img OUT.hda [SIZE]
 #                                                      # bare HFS volume -> APM disk with an Apple SCSI driver
 #
@@ -353,6 +354,52 @@ cmd_mac_formatted() {
     [ $ok = 1 ]
 }
 
+# os-churn -w DIR: the System 7.1 Finder takes the middle turn on a catalog
+# rb-cli filled (h12-hfs.img from verify-fs-macos.sh -o H12-hfs: 1000 files).
+# It copies a file in, drags it to the Trash, selects everything and trashes
+# that too, empties the Trash, and shuts down so the MDB is flushed; then
+# rb-cli puts one more file. fsck_hfs -n, rb-cli fsck and Disk First Aid
+# judge the volume after the Finder's turn and after rb-cli's.
+cmd_os_churn() {
+    local work="" out
+    local OPTIND=1
+    while getopts "w:" opt; do case $opt in w) work=$OPTARG;; *) die "usage";; esac; done
+    [ -n "$work" ] || die "os-churn: -w DIR required"
+    local img="$work/h12-hfs.img"; need "$img" "h12-hfs.img (run verify-fs-macos.sh -o H12-hfs first)"
+    out="$work/snow/os-churn"; rm -rf "$out"; mkdir -p "$out"
+    cmd_wrap "$img" "$out/disk.hda"
+    local bytes; bytes=$(( ( $(stat -f %z "$img") + 1048575 ) / 1048576 * 1048576 ))
+    make_boot "$out/boot.hda" 0 || die "boot disk"
+    head -c 1000000 /dev/urandom > "$out/big.bin"
+    { "$RB" mkdir "$out/boot.hda" /Frag && "$RB" put "$out/boot.hda" "$out/big.bin" /Frag/big.bin; } >/dev/null 2>&1 || die "put big.bin on the boot disk"
+    # Open the volume (600,105), View by Name (the list view puts the first
+    # row at 35,74); Find the Frag folder, open it, drag big.bin (38,95) onto
+    # the volume icon; close the two Finder windows the Find opened; drag the
+    # first row (big.bin) to the Trash (591,440); Special > Empty Trash (232,43)
+    # and confirm; select all and drag the first row to the Trash (1000 moves,
+    # ~2 G); Empty Trash again (1000 deletes, ~3 G); Special > Shut Down (232,139).
+    local keys="2600000000:click@600,105;2800000000:cmd-o;5000000000:drag@131,9,131,59"
+    keys+=";6500000000:cmd-f;6800000000:type@frag;7200000000:return;7700000000:cmd-o;8200000000:drag@38,95,600,105"
+    keys+=";9500000000:cmd-w;9800000000:cmd-w;10500000000:drag@35,74,591,440;11500000000:drag@232,9,232,43;12000000000:return"
+    keys+=";13000000000:click@200,36;13300000000:cmd-a;13600000000:drag@35,74,591,440"
+    keys+=";20000000000:drag@232,9,232,43;20500000000:return;25000000000:drag@232,9,232,139"
+    harness "$out/churn" "$out/boot.hda" 27000000000 "$keys" --disk2 "$out/disk.hda" --snap-every 1000000000
+    local ok=1 left f1 f2
+    left=$("$RB" ls "$out/disk.hda@1" 2>/dev/null | grep -c '^FILE .* f[0-9]*\.txt$')
+    "$RB" ls "$out/disk.hda@1" 2>/dev/null | grep -q "big.bin" && { log "  big.bin survived the Trash"; ok=0; }
+    log "  after the Finder's turn: $left of the 1000 files left"
+    [ "$left" -eq 0 ] || ok=0
+    "$RB" fsck --checkonly "$out/disk.hda@1" >>"$out/fsck.log" 2>&1 || { log "  rb-cli fsck not clean after the Finder's turn, see $out/fsck.log"; ok=0; }
+    f1=$(fsck_hfs_wrapped "$out/disk.hda" "$bytes"); log "  fsck_hfs after the Finder's turn: $f1"; echo "$f1" | grep -q OK || ok=0
+    cmd_dfa "$out/disk.hda" -i 0 -o "$out/dfa-finder" || ok=0
+    "$RB" put "$out/disk.hda@1" "$out/big.bin" last.bin >>"$out/fsck.log" 2>&1 || { log "  rb-cli put after the churn failed"; ok=0; }
+    "$RB" fsck --checkonly "$out/disk.hda@1" >>"$out/fsck.log" 2>&1 || { log "  rb-cli fsck not clean after the put, see $out/fsck.log"; ok=0; }
+    f2=$(fsck_hfs_wrapped "$out/disk.hda" "$bytes"); log "  fsck_hfs after rb-cli's put: $f2"; echo "$f2" | grep -q OK || ok=0
+    cmd_dfa "$out/disk.hda" -i 0 -o "$out/dfa-after" || ok=0
+    [ $ok = 1 ] && log "os-churn PASS" || log "os-churn FAIL"
+    [ $ok = 1 ]
+}
+
 # leg3 -w DIR: the classic-HFS and MFS volumes verify-fs-macos.sh -w DIR built.
 cmd_leg3() {
     local work=""
@@ -388,6 +435,9 @@ cmd_leg3() {
         cmd_finder_copy "$work/h6-mfs.img" -o "$snow/h6" && results+=("H6 Finder copy PASS") || results+=("H6 Finder copy FAIL")
     fi
     cmd_mac_formatted -w "$work" && results+=("mac-formatted PASS") || results+=("mac-formatted FAIL")
+    if [ -f "$work/h12-hfs.img" ]; then
+        cmd_os_churn -w "$work" && results+=("H12-hfs os-churn PASS") || results+=("H12-hfs os-churn FAIL")
+    fi
     log "---- summary ----"
     for r in "${results[@]}"; do log "$r"; done
 }
@@ -401,6 +451,7 @@ case "${1:-}" in
     leg3) shift; cmd_leg3 "$@" ;;
     h3-real) shift; cmd_h3_real "$@" ;;
     mac-formatted) shift; cmd_mac_formatted "$@" ;;
+    os-churn) shift; cmd_os_churn "$@" ;;
     crop) shift; crop_pbm "$@" ;;
     verdict) shift; dfa_verdict "$@" ;;
     *) sed -n '2,20p' "$0"; exit 2 ;;

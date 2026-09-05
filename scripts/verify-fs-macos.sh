@@ -52,6 +52,16 @@ attach_mount() {
     echo "${dev%s[0-9]*}" >> "$ATTACHED_LIST"
     echo "$mnt"
 }
+# Attach and mount read-write through the kernel driver; prints the mount point.
+attach_mount_rw() {
+    local line dev mnt
+    line=$(hdiutil attach -imagekey diskimage-class=CRawDiskImage "$1" 2>>"$LOG" | tail -1)
+    dev=$(echo "$line" | awk '{print $1}')
+    mnt=$(echo "$line" | awk -F'\t' '{print $3}' | sed 's/^ *//;s/ *$//')
+    [ -d "$mnt" ] || { log "  read-write mount failed for $1: $line"; return 1; }
+    echo "${dev%s[0-9]*}" >> "$ATTACHED_LIST"
+    echo "$mnt"
+}
 detach() {
     hdiutil detach "$1" >>"$LOG" 2>&1 || hdiutil detach -force "$1" >>"$LOG" 2>&1
 }
@@ -103,9 +113,9 @@ wanted() { [ -z "$ONLY" ] || echo ",$ONLY," | grep -q ",$1,"; }
 # A tree of 1500 small unique files: enough catalog records to split a 4 KiB
 # HFS+ node dozens of times and a 512-byte HFS node hundreds of times.
 make_tree() {
-    local dir=$1
+    local dir=$1 n=${2:-1500}
     rm -rf "$dir"; mkdir -p "$dir"
-    for i in $(seq -w 1 1500); do printf 'file %s %s\n' "$i" "$(printf 'x%.0s' $(seq 1 $((10#$i % 37 + 1))))" > "$dir/f$i.txt"; done
+    for i in $(seq -w 1 "$n"); do printf 'file %s %s\n' "$i" "$(printf 'x%.0s' $(seq 1 $((10#$i % 37 + 1))))" > "$dir/f$i.txt"; done
 }
 # Every file under $2 must read back byte-identical from $1 (a mount point).
 compare_tree() {
@@ -256,6 +266,52 @@ for fs in hfs hfsplus; do
     dev=$(attach_raw "$img") && mac_fsck "${dev}s2" "$id at the partition size" || ok=0
     detach_all
     result "$id" $ok "alternate header accepted before and after the grow, rb_fsck_clean=$rbok"
+done
+
+# ---------------------------------------------------------------- H12
+# rb-cli and the OS take turns on one catalog: rb-cli imports 1000 files, the
+# OS adds a file, deletes it, deletes the 1000, and rb-cli adds one more; the
+# B-trees must stay clean through every split and merge. HFS+: macOS's kernel
+# driver through a read-write mount. Classic HFS: macOS cannot mount it, so
+# the image is left for verify-hfs-snow.sh os-churn, where the System 7.1
+# Finder does the OS half.
+for fs in hfsplus hfs; do
+    id="H12-$fs"; wanted "$id" || continue
+    img="$WORK/h12-$fs.img"
+    ok=1
+    make_tree "$WORK/tree1000" 1000
+    head -c 12345 /dev/urandom > "$WORK/extra.bin"
+    rb new volume "$fs" "$img" --size 64M --name "H12$fs" || ok=0
+    rb import "$img" "$WORK/tree1000" || ok=0
+    rbok=1; rb fsck --checkonly "$img" || rbok=0
+    dev=$(attach_raw "$img") && mac_fsck "$dev" "$id after rb-cli imported 1000 files" || ok=0
+    detach_all
+    if [ "$fs" = hfs ]; then
+        result "$id" $ok "1000 files imported, rb_fsck_clean=$rbok; the OS half is verify-hfs-snow.sh os-churn"
+        continue
+    fi
+    mnt=$(attach_mount_rw "$img") || ok=0
+    if [ -n "$mnt" ]; then
+        { cp "$WORK/extra.bin" "$mnt/extra.bin" && sync && rm "$mnt/extra.bin" && sync; } || { log "  macOS add / delete of one file failed"; ok=0; }
+        { rm "$mnt"/f*.txt && sync; } || { log "  macOS delete of the 1000 files failed"; ok=0; }
+        left=$(ls "$mnt" | grep -c '^f[0-9]*\.txt$')
+        log "  macOS added and deleted extra.bin, then deleted the 1000 files ($left left)"
+        detach_all
+    fi
+    dev=$(attach_raw "$img") && mac_fsck "$dev" "$id after macOS's turn" || ok=0
+    detach_all
+    rb fsck --checkonly "$img" || rbok=0
+    rb put "$img" "$WORK/extra.bin" extra2.bin || ok=0
+    rb fsck --checkonly "$img" || rbok=0
+    dev=$(attach_raw "$img") && mac_fsck "$dev" "$id after rb-cli put one more" || ok=0
+    detach_all
+    if mnt=$(attach_mount "$img"); then
+        cmp -s "$WORK/extra.bin" "$mnt/extra2.bin" && log "  extra2.bin reads back through the kernel driver" || { log "  extra2.bin differs or is missing"; ok=0; }
+        detach_all
+    else
+        ok=0
+    fi
+    result "$id" $ok "rb-cli 1000 in; macOS 1 in, 1 out, 1000 out; rb-cli 1 in; rb_fsck_clean=$rbok"
 done
 
 log "---- summary ----"
