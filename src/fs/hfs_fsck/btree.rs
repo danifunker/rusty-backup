@@ -18,8 +18,8 @@ use byteorder::{BigEndian, ByteOrder};
 use super::super::fsck::{FsckIssue, RepairReport};
 use super::super::hfs_common::{
     btree_bitmap_set, btree_bitmap_test, btree_insert_record, btree_node_bitmap_range,
-    btree_record_range, normalize_catalog_index_key, BTreeHeader, BTREE_HEADER_NODE,
-    BTREE_INDEX_NODE, BTREE_LEAF_NODE, BTREE_MAP_NODE,
+    btree_record_range, btree_stale_index_keys, normalize_catalog_index_key, BTreeHeader,
+    BTreeKeyFormat, BTREE_HEADER_NODE, BTREE_INDEX_NODE, BTREE_LEAF_NODE, BTREE_MAP_NODE,
 };
 use super::{hfs_issue, HfsFsckCode};
 
@@ -453,49 +453,31 @@ fn check_leaf_chain_ordering(
 
 /// Every index record's key must not sort above the first key of the child
 /// it points at, or descents land in the wrong subtree.
+/// Every separator must be its child's first key (fsck_hfs E_IKey). One that
+/// sorts above it is worse: a descent misses the child's leading records.
 fn check_index_separators(catalog_data: &[u8], header: &BTreeHeader, errors: &mut Vec<FsckIssue>) {
     let node_size = header.node_size as usize;
-    let max_nodes = catalog_data.len() / node_size;
-    for node_idx in 0..max_nodes as u32 {
-        if !btree_bitmap_test(catalog_data, node_size, node_idx) {
-            continue;
-        }
-        let off = node_idx as usize * node_size;
-        let node = &catalog_data[off..off + node_size];
-        if node[8] as i8 != BTREE_INDEX_NODE {
-            continue;
-        }
-        let num_records = BigEndian::read_u16(&node[10..12]) as usize;
-        for i in 0..num_records {
-            let (s, e) = btree_record_range(node, node_size, i);
-            let key = record_key(node, s, e);
-            if key.is_empty() {
-                continue;
-            }
-            // Classic HFS pads an odd key so the child pointer starts even.
-            let mut data_off = s + key.len();
-            if data_off % 2 == 1 {
-                data_off += 1;
-            }
-            if data_off + 4 > e {
-                continue;
-            }
-            let child = BigEndian::read_u32(&node[data_off..data_off + 4]) as usize;
-            if child == 0 || child >= max_nodes {
-                continue;
-            }
-            let child_node = &catalog_data[child * node_size..(child + 1) * node_size];
-            if let Some((first, _)) = node_first_last_keys(child_node, node_size) {
-                if compare_catalog_keys(key, first) == Ordering::Greater {
-                    errors.push(hfs_issue(
-                        HfsFsckCode::KeysOutOfOrder,
-                        format!(
-                            "index node {node_idx} record {i} sorts above the first key of its child {child}"
-                        ),
-                    ));
-                    break;
-                }
-            }
+    for (node_idx, i, child, order) in btree_stale_index_keys(
+        catalog_data,
+        node_size,
+        &BTreeKeyFormat::CLASSIC_CATALOG,
+        &compare_catalog_keys,
+    ) {
+        if order == Ordering::Greater {
+            errors.push(hfs_issue(
+                HfsFsckCode::KeysOutOfOrder,
+                format!(
+                    "index node {node_idx} record {i} sorts above the first key of its child {child}"
+                ),
+            ));
+        } else {
+            errors.push(hfs_issue(
+                HfsFsckCode::IndexKeyMismatch,
+                format!(
+                    "index node {node_idx} record {i} does not carry the first key of its \
+                     child {child}"
+                ),
+            ));
         }
     }
 }

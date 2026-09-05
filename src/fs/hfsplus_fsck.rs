@@ -25,8 +25,8 @@ use byteorder::{BigEndian, ByteOrder};
 
 use super::filesystem::FilesystemError;
 use super::fsck::{FsckIssue, FsckResult, FsckStats, OrphanedEntry};
-use super::hfs_common::walk_leaf_records;
-use super::hfsplus::HfsPlusFilesystem;
+use super::hfs_common::{btree_stale_index_keys, walk_leaf_records, BTreeHeader, BTreeKeyFormat};
+use super::hfsplus::{catalog_compare_keys, HfsPlusFilesystem};
 
 const HFS_PLUS_SIGNATURE: u16 = 0x482B; // "H+"
 const HFSX_SIGNATURE: u16 = 0x4858; // "HX"
@@ -52,6 +52,7 @@ enum HfsPlusFsckCode {
     DuplicateCnid,
     DuplicateCatalogKey,
     KeyOutOfOrder,
+    IndexKeyMismatch,
     ParentValenceMismatch,
     BitmapAllocCountMismatch,
     BitmapTooShort,
@@ -72,6 +73,7 @@ impl HfsPlusFsckCode {
             HfsPlusFsckCode::DuplicateCnid => "DuplicateCnid",
             HfsPlusFsckCode::DuplicateCatalogKey => "DuplicateCatalogKey",
             HfsPlusFsckCode::KeyOutOfOrder => "KeyOutOfOrder",
+            HfsPlusFsckCode::IndexKeyMismatch => "IndexKeyMismatch",
             HfsPlusFsckCode::ParentValenceMismatch => "ParentValenceMismatch",
             HfsPlusFsckCode::BitmapAllocCountMismatch => "BitmapAllocCountMismatch",
             HfsPlusFsckCode::BitmapTooShort => "BitmapTooShort",
@@ -294,6 +296,63 @@ pub(super) fn check<R: Read + Seek>(
                 sample
             ),
         ));
+    }
+
+    // ---- Phase 2b: index separators ---------------------------------------
+    // Every separator must be its child's first key; fsck_hfs calls anything
+    // else "Invalid index key" (E_IKey), even when descents still work.
+    {
+        let cs = fs.case_sensitive_catalog();
+        let cmp = |a: &[u8], b: &[u8]| catalog_compare_keys(a, b, cs);
+        let node_size = fs.catalog_node_size();
+        for (idx, rec, child, _) in btree_stale_index_keys(
+            fs.catalog_data(),
+            node_size,
+            &BTreeKeyFormat::HFSPLUS_CATALOG,
+            &cmp,
+        ) {
+            errors.push(issue(
+                HfsPlusFsckCode::IndexKeyMismatch,
+                format!(
+                    "catalog index node {idx} record {rec} does not carry the first key of \
+                     its child {child}"
+                ),
+            ));
+        }
+        if let Some(data) = fs.extents_overflow_data().filter(|d| d.len() >= 512) {
+            let node_size = BTreeHeader::read(data).node_size as usize;
+            for (idx, rec, child, _) in btree_stale_index_keys(
+                data,
+                node_size,
+                &BTreeKeyFormat::HFSPLUS_EXTENTS,
+                &HfsPlusFilesystem::<R>::extents_compare,
+            ) {
+                errors.push(issue(
+                    HfsPlusFsckCode::IndexKeyMismatch,
+                    format!(
+                        "extents index node {idx} record {rec} does not carry the first key \
+                         of its child {child}"
+                    ),
+                ));
+            }
+        }
+        if let Some(data) = fs.attributes_data_for_fsck()?.filter(|d| d.len() >= 512) {
+            let node_size = BTreeHeader::read(data).node_size as usize;
+            for (idx, rec, child, _) in btree_stale_index_keys(
+                data,
+                node_size,
+                &BTreeKeyFormat::HFSPLUS_ATTRIBUTES,
+                &HfsPlusFilesystem::<R>::attr_compare,
+            ) {
+                errors.push(issue(
+                    HfsPlusFsckCode::IndexKeyMismatch,
+                    format!(
+                        "attributes index node {idx} record {rec} does not carry the first \
+                         key of its child {child}"
+                    ),
+                ));
+            }
+        }
     }
 
     // ---- Phase 3: Bitmap consistency ----------------------------------

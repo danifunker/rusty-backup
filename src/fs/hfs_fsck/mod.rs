@@ -59,6 +59,8 @@ pub(super) enum HfsFsckCode {
     MapNodeBadStructure,
     NodeBitmapMissing,
     KeysOutOfOrder,
+    /// An index separator that is not its child's first key (fsck_hfs E_IKey).
+    IndexKeyMismatch,
     OffsetTableNotMonotonic,
     OffsetTableOutOfBounds,
     LeafChainBroken,

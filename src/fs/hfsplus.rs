@@ -11,7 +11,8 @@ use super::filesystem::{
 };
 use super::hfs_common::{
     self, bitmap_clear_bit_be, bitmap_collect_clear_runs_be, bitmap_set_bit_be, bitmap_test_bit_be,
-    btree_detach_freed_node, btree_free_node, btree_remove_record, BTreeHeader, BTreeKeyFormat,
+    btree_detach_freed_node_and_refresh, btree_free_node, btree_refresh_index_keys,
+    btree_remove_record, BTreeHeader, BTreeKeyFormat,
 };
 use super::CompactResult;
 
@@ -1031,6 +1032,20 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
         self.catalog_header.first_leaf_node
     }
 
+    /// The extents-overflow B-tree as read from disk, for fsck.
+    pub(crate) fn extents_overflow_data(&self) -> Option<&[u8]> {
+        self.extents_overflow_data.as_deref()
+    }
+
+    /// The attributes B-tree, loaded on first use, for fsck.
+    pub(crate) fn attributes_data_for_fsck(&mut self) -> Result<Option<&[u8]>, FilesystemError> {
+        if self.vh.attributes_file.logical_size == 0 {
+            return Ok(None);
+        }
+        self.ensure_attributes_loaded()?;
+        Ok(self.attributes_data.as_deref())
+    }
+
     pub(crate) fn case_sensitive_catalog(&self) -> bool {
         self.case_sensitive()
     }
@@ -1975,9 +1990,15 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
     }
 
     /// Remove a catalog record by (node_idx, rec_idx).
-    fn remove_catalog_record(&mut self, node_idx: u32, rec_idx: usize) {
+    fn remove_catalog_record(
+        &mut self,
+        node_idx: u32,
+        rec_idx: usize,
+    ) -> Result<(), FilesystemError> {
         let node_size = self.catalog_header.node_size as usize;
         let offset = node_idx as usize * node_size;
+        let cs = self.case_sensitive();
+        let cmp = |a: &[u8], b: &[u8]| Self::catalog_compare(a, b, cs);
         btree_remove_record(
             &mut self.catalog_data[offset..offset + node_size],
             node_size,
@@ -1986,6 +2007,17 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
 
         // Check if leaf is now empty
         let num = BigEndian::read_u16(&self.catalog_data[offset + 10..offset + 12]);
+        if num > 0 && rec_idx == 0 {
+            // The leaf's first key changed: Disk First Aid wants the separators
+            // above it to say so exactly (E_IKey).
+            btree_refresh_index_keys(
+                &mut self.catalog_data,
+                node_size,
+                node_idx,
+                &BTreeKeyFormat::HFSPLUS_CATALOG,
+                &cmp,
+            )?;
+        }
         if num == 0 {
             // Free the node and update prev/next links
             let prev = BigEndian::read_u32(&self.catalog_data[offset + 4..offset + 8]);
@@ -2011,7 +2043,13 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
             h.write(&mut self.catalog_data);
             // The parent still pointed at the freed leaf; a later insert landed
             // there and the next split zeroed it.
-            btree_detach_freed_node(&mut self.catalog_data, node_size, node_idx);
+            btree_detach_freed_node_and_refresh(
+                &mut self.catalog_data,
+                node_size,
+                node_idx,
+                &BTreeKeyFormat::HFSPLUS_CATALOG,
+                &cmp,
+            )?;
         }
 
         // Update header leaf_records
@@ -2019,6 +2057,7 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
         h.leaf_records = h.leaf_records.saturating_sub(1);
         h.write(&mut self.catalog_data);
         self.catalog_header = BTreeHeaderRecord::parse(&self.catalog_data[14..14 + 106]);
+        Ok(())
     }
 }
 
@@ -2031,7 +2070,7 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
     ///
     /// Both arguments are full record bytes (or trimmed index records); the
     /// 2-byte key_len prefix lives at offset 0..2 and the key body at 2..12.
-    fn extents_compare(a: &[u8], b: &[u8]) -> Ordering {
+    pub(crate) fn extents_compare(a: &[u8], b: &[u8]) -> Ordering {
         if a.len() < 12 || b.len() < 12 {
             return a.len().cmp(&b.len());
         }
@@ -2118,14 +2157,18 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
     /// Remove every overflow record belonging to `(file_id, fork_type)`.
     /// Used by `delete_entry_inner` to clean up overflow records before the
     /// catalog row is removed.
-    fn remove_extents_overflow_records_for(&mut self, file_id: u32, fork_type: u8) {
+    fn remove_extents_overflow_records_for(
+        &mut self,
+        file_id: u32,
+        fork_type: u8,
+    ) -> Result<(), FilesystemError> {
         let Some(ref data) = self.extents_overflow_data else {
-            return;
+            return Ok(());
         };
         let header = BTreeHeader::read(data);
         let node_size = header.node_size as usize;
         if node_size == 0 {
-            return;
+            return Ok(());
         }
 
         // Collect (node_idx, rec_idx) pairs first — mutating during a walk
@@ -2152,7 +2195,7 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
             },
         );
         if victims.is_empty() {
-            return;
+            return Ok(());
         }
 
         // Remove highest rec_idx first per node so earlier indices stay
@@ -2160,7 +2203,7 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
         let data = self.extents_overflow_data.as_mut().unwrap();
         victims.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
         let mut removed: u32 = 0;
-        for (node_idx, rec_idx) in victims {
+        for &(node_idx, rec_idx) in &victims {
             let off = node_idx as usize * node_size;
             btree_remove_record(&mut data[off..off + node_size], node_size, rec_idx);
             removed += 1;
@@ -2168,6 +2211,22 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
         let mut h = BTreeHeader::read(data);
         h.leaf_records = h.leaf_records.saturating_sub(removed);
         h.write(data);
+        // A leaf whose first key changed needs the separators above it redone.
+        let mut nodes: Vec<u32> = victims.iter().filter(|v| v.1 == 0).map(|v| v.0).collect();
+        nodes.dedup();
+        for node_idx in nodes {
+            let off = node_idx as usize * node_size;
+            if BigEndian::read_u16(&data[off + 10..off + 12]) > 0 {
+                btree_refresh_index_keys(
+                    data,
+                    node_size,
+                    node_idx,
+                    &BTreeKeyFormat::HFSPLUS_EXTENTS,
+                    &Self::extents_compare,
+                )?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -2368,6 +2427,21 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
         let mut h = BTreeHeader::read(data);
         h.leaf_records = h.leaf_records.saturating_sub(removed);
         h.write(data);
+        // A leaf whose first key changed needs the separators above it redone.
+        let mut nodes: Vec<u32> = victims.iter().filter(|v| v.1 == 0).map(|v| v.0).collect();
+        nodes.dedup();
+        for node_idx in nodes {
+            let off = node_idx as usize * node_size;
+            if BigEndian::read_u16(&data[off + 10..off + 12]) > 0 {
+                btree_refresh_index_keys(
+                    data,
+                    node_size,
+                    node_idx,
+                    &BTreeKeyFormat::HFSPLUS_ATTRIBUTES,
+                    &Self::attr_compare,
+                )?;
+            }
+        }
         Ok(removed)
     }
 }
@@ -5093,18 +5167,18 @@ impl<R: Read + Write + Seek + Send> HfsPlusFilesystem<R> {
             if let Some((data_fork, rsrc_fork)) = self.find_file_by_id(cnid) {
                 self.free_fork_overflow_extents(cnid, HFSPLUS_FORK_DATA, &data_fork);
                 self.free_fork_overflow_extents(cnid, HFSPLUS_FORK_RESOURCE, &rsrc_fork);
-                self.remove_extents_overflow_records_for(cnid, HFSPLUS_FORK_DATA);
-                self.remove_extents_overflow_records_for(cnid, HFSPLUS_FORK_RESOURCE);
+                self.remove_extents_overflow_records_for(cnid, HFSPLUS_FORK_DATA)?;
+                self.remove_extents_overflow_records_for(cnid, HFSPLUS_FORK_RESOURCE)?;
                 self.free_fork_blocks(&data_fork);
                 self.free_fork_blocks(&rsrc_fork);
             }
         }
 
-        self.remove_catalog_record(node_idx, rec_idx);
+        self.remove_catalog_record(node_idx, rec_idx)?;
 
         // Find and remove the thread record
         if let Some((t_node, t_rec, _)) = self.find_catalog_record_by_cnid(cnid) {
-            self.remove_catalog_record(t_node, t_rec);
+            self.remove_catalog_record(t_node, t_rec)?;
         }
 
         // Update parent valence
@@ -5163,7 +5237,7 @@ impl<R: Read + Write + Seek + Send> HfsPlusFilesystem<R> {
         }
         new_record.extend_from_slice(&data_bytes);
 
-        self.remove_catalog_record(node_idx, rec_idx);
+        self.remove_catalog_record(node_idx, rec_idx)?;
         self.insert_catalog_record(&new_record)?;
 
         // The thread record's name is a variable-length UTF-16 string, so its
@@ -5171,7 +5245,7 @@ impl<R: Read + Write + Seek + Send> HfsPlusFilesystem<R> {
         // rather than patching in place. Folders always have a thread; files
         // generally do.
         if let Some((t_node, t_rec, _)) = self.find_catalog_record_by_cnid(cnid) {
-            self.remove_catalog_record(t_node, t_rec);
+            self.remove_catalog_record(t_node, t_rec)?;
             let thread_type = if entry.is_directory() {
                 CATALOG_FOLDER_THREAD
             } else {
@@ -5249,8 +5323,8 @@ impl<R: Read + Write + Seek + Send> HfsPlusFilesystem<R> {
         if let Some((data_fork, rsrc_fork)) = self.find_file_by_id(inode_cnid) {
             self.free_fork_overflow_extents(inode_cnid, HFSPLUS_FORK_DATA, &data_fork);
             self.free_fork_overflow_extents(inode_cnid, HFSPLUS_FORK_RESOURCE, &rsrc_fork);
-            self.remove_extents_overflow_records_for(inode_cnid, HFSPLUS_FORK_DATA);
-            self.remove_extents_overflow_records_for(inode_cnid, HFSPLUS_FORK_RESOURCE);
+            self.remove_extents_overflow_records_for(inode_cnid, HFSPLUS_FORK_DATA)?;
+            self.remove_extents_overflow_records_for(inode_cnid, HFSPLUS_FORK_RESOURCE)?;
             self.free_fork_blocks(&data_fork);
             self.free_fork_blocks(&rsrc_fork);
         }
@@ -5264,10 +5338,10 @@ impl<R: Read + Write + Seek + Send> HfsPlusFilesystem<R> {
 
         let inode_name = format!("iNode{inode_num}");
         if let Some((n, r, _)) = self.find_catalog_record(private_cnid, &inode_name) {
-            self.remove_catalog_record(n, r);
+            self.remove_catalog_record(n, r)?;
         }
         if let Some((tn, tr, _)) = self.find_catalog_record_by_cnid(inode_cnid) {
-            self.remove_catalog_record(tn, tr);
+            self.remove_catalog_record(tn, tr)?;
         }
         self.update_parent_valence(private_cnid, -1)?;
         self.vh.file_count = self.vh.file_count.saturating_sub(1);
@@ -5346,7 +5420,7 @@ impl<R: Read + Write + Seek + Send> HfsPlusFilesystem<R> {
         // Free existing resource fork blocks (inline + any overflow extents).
         if let Some((_data_fork, rsrc_fork)) = self.find_file_by_id(cnid) {
             self.free_fork_overflow_extents(cnid, HFSPLUS_FORK_RESOURCE, &rsrc_fork);
-            self.remove_extents_overflow_records_for(cnid, HFSPLUS_FORK_RESOURCE);
+            self.remove_extents_overflow_records_for(cnid, HFSPLUS_FORK_RESOURCE)?;
             self.free_fork_blocks(&rsrc_fork);
         }
 
@@ -7077,6 +7151,80 @@ mod tests {
 
     /// Fill many leaves, delete everything, fill again: no index record may
     /// point at a freed leaf, or the next insert lands in a free node.
+    #[test]
+    fn deleting_a_leafs_first_record_refreshes_the_separators() {
+        // fsck_hfs E_IKey: after the audit's fill-and-delete run the parent
+        // still carried the first key the leaf had before the delete.
+        use super::hfs_common::{
+            btree_record_range, btree_stale_index_keys, BTreeHeader, BTreeKeyFormat,
+        };
+        type Fs = HfsPlusFilesystem<std::io::Cursor<Vec<u8>>>;
+        let img = create_blank_hfsplus_sized(64 * 1024 * 1024, 4096, "IKey", false, 16 << 20, 0);
+        let mut fs = Fs::open(std::io::Cursor::new(img), 0).unwrap();
+        fs.prepare_for_edit().unwrap();
+        let root = fs.root().unwrap();
+        let options = CreateFileOptions::default();
+        for i in 0..1200 {
+            let mut empty = std::io::Cursor::new(Vec::new());
+            fs.create_file(&root, &format!("f{i:04}.txt"), &mut empty, 0, &options)
+                .unwrap();
+        }
+        let node_size = fs.catalog_node_size();
+        let header = BTreeHeader::read(fs.catalog_data());
+        assert!(
+            header.depth >= 2,
+            "need an index level, depth {}",
+            header.depth
+        );
+
+        // The first record of the second leaf is a file record: deleting that
+        // file changes the key its parent's separator must carry.
+        let first = header.first_leaf_node as usize;
+        let second =
+            BigEndian::read_u32(&fs.catalog_data()[first * node_size..first * node_size + 4])
+                as usize;
+        let name = {
+            let node = &fs.catalog_data()[second * node_size..(second + 1) * node_size];
+            let (s, e) = btree_record_range(node, node_size, 0);
+            let rec = &node[s..e];
+            let name_len = BigEndian::read_u16(&rec[6..8]) as usize;
+            (0..name_len)
+                .map(|i| BigEndian::read_u16(&rec[8 + 2 * i..10 + 2 * i]) as u8 as char)
+                .collect::<String>()
+        };
+        assert!(
+            name.starts_with('f'),
+            "expected a file record first, got {name:?}"
+        );
+        let victim = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == name)
+            .expect("victim listed");
+        fs.delete_entry(&root, &victim).unwrap();
+
+        let cmp = |a: &[u8], b: &[u8]| Fs::catalog_compare(a, b, false);
+        let stale = btree_stale_index_keys(
+            fs.catalog_data(),
+            node_size,
+            &BTreeKeyFormat::HFSPLUS_CATALOG,
+            &cmp,
+        );
+        assert!(stale.is_empty(), "separators still stale: {stale:?}");
+        let report = fs.fsck().unwrap().unwrap();
+        assert!(
+            report.errors.is_empty(),
+            "{:?}",
+            report
+                .errors
+                .iter()
+                .map(|e| &e.message)
+                .take(4)
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn emptied_leaves_leave_the_index_too() {
         use crate::fs::hfs_common::{btree_bitmap_test, btree_record_range, BTREE_INDEX_NODE};

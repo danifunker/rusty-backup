@@ -19,27 +19,13 @@ use super::{hfs_issue, HfsFsckCode};
 use crate::fs::fsck::{FsckIssue, RepairReport};
 use crate::fs::hfs_common::{
     bitmap_test_bit_be, btree_alloc_node, btree_bitmap_clear, btree_bitmap_set, btree_bitmap_test,
-    btree_node_bitmap_range, btree_record_range, init_node, BTreeHeader, BTREE_HEADER_NODE,
+    btree_node_bitmap_range, btree_record_range, btree_stale_index_keys,
+    compare_classic_extents_keys, init_node, BTreeHeader, BTreeKeyFormat, BTREE_HEADER_NODE,
     BTREE_INDEX_NODE, BTREE_LEAF_NODE, BTREE_MAP_NODE,
 };
 
 fn compare_extents_keys(a: &[u8], b: &[u8]) -> Ordering {
-    if a.len() < 8 || b.len() < 8 {
-        return a.len().cmp(&b.len());
-    }
-    let file_a = BigEndian::read_u32(&a[2..6]);
-    let file_b = BigEndian::read_u32(&b[2..6]);
-    match file_a.cmp(&file_b) {
-        Ordering::Equal => {}
-        other => return other,
-    }
-    match a[1].cmp(&b[1]) {
-        Ordering::Equal => {}
-        other => return other,
-    }
-    let start_a = BigEndian::read_u16(&a[6..8]);
-    let start_b = BigEndian::read_u16(&b[6..8]);
-    start_a.cmp(&start_b)
+    compare_classic_extents_keys(a, b)
 }
 
 /// Check extents overflow B-tree structure (same structural checks as catalog).
@@ -195,6 +181,22 @@ pub(super) fn check_extents_btree_structure(extents_data: &[u8], errors: &mut Ve
 
     // Key ordering
     check_extents_key_ordering(extents_data, &header, errors);
+
+    // Each separator must be its child's first key (fsck_hfs E_IKey).
+    for (idx, rec, child, _) in btree_stale_index_keys(
+        extents_data,
+        node_size,
+        &BTreeKeyFormat::CLASSIC_EXTENTS,
+        &compare_extents_keys,
+    ) {
+        errors.push(hfs_issue(
+            HfsFsckCode::ExtentsBtreeStructure,
+            format!(
+                "extents index node {idx} record {rec} does not carry the first key of its \
+                 child {child}"
+            ),
+        ));
+    }
 }
 
 fn check_extents_map_nodes(extents_data: &[u8], node_size: usize, errors: &mut Vec<FsckIssue>) {

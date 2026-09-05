@@ -10,7 +10,7 @@ use super::filesystem::{
 };
 use super::hfs_common::{
     self, bitmap_clear_bit_be, bitmap_find_clear_run_be, bitmap_set_bit_be, btree_free_node,
-    btree_remove_record, BTreeHeader,
+    btree_refresh_index_keys, btree_remove_record, BTreeHeader, BTreeKeyFormat,
 };
 use super::CompactResult;
 
@@ -1019,14 +1019,18 @@ impl<R: Read + Seek> HfsFilesystem<R> {
     }
 
     /// Remove a catalog record from a leaf node.
-    fn remove_catalog_record(&mut self, node_idx: u32, rec_idx: usize) {
+    fn remove_catalog_record(
+        &mut self,
+        node_idx: u32,
+        rec_idx: usize,
+    ) -> Result<(), FilesystemError> {
         let node_size = BigEndian::read_u16(&self.catalog_data[32..34]) as usize;
         if node_size == 0 {
-            return;
+            return Ok(());
         }
         let offset = node_idx as usize * node_size;
         if offset + node_size > self.catalog_data.len() {
-            return;
+            return Ok(());
         }
 
         let num_before = {
@@ -1089,12 +1093,23 @@ impl<R: Read + Seek> HfsFilesystem<R> {
                     &mut dummy_report,
                 );
             }
+        } else if rec_idx == 0 && num_after > 0 {
+            // The leaf's first key changed: Disk First Aid wants the separators
+            // above it to say so exactly (E_IKey).
+            btree_refresh_index_keys(
+                &mut self.catalog_data,
+                node_size,
+                node_idx,
+                &BTreeKeyFormat::CLASSIC_CATALOG,
+                &Self::catalog_compare,
+            )?;
         }
 
         // Update leaf_records count
         let mut h = BTreeHeader::read(&self.catalog_data);
         h.leaf_records = h.leaf_records.saturating_sub(1);
         h.write(&mut self.catalog_data);
+        Ok(())
     }
 
     /// Capture a snapshot of all mutable in-memory state for rollback.
@@ -1672,7 +1687,7 @@ impl<R: Read + Seek> HfsFilesystem<R> {
                 new_record.push(0);
             }
 
-            self.remove_catalog_record(node_idx, rec_idx);
+            self.remove_catalog_record(node_idx, rec_idx)?;
             self.insert_catalog_record(&new_record)?;
 
             // Rewrite the root thread record's `thdCName` (Str31 at +14).
@@ -1856,7 +1871,7 @@ impl<R: Read + Write + Seek> HfsFilesystem<R> {
             self.free_blocks(ext.start_block as u32, ext.block_count as u32);
         }
         let data = self.extents_overflow_data.as_mut().expect("loaded above");
-        Ok(remove_fork_overflow_records(data, file_id, fork_type) > 0)
+        Ok(remove_fork_overflow_records(data, file_id, fork_type)? > 0)
     }
 
     /// Write the in-memory extents-overflow B-tree back to disk.
@@ -3300,11 +3315,11 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
                 }
             }
 
-            self.remove_catalog_record(node_idx, rec_idx);
+            self.remove_catalog_record(node_idx, rec_idx)?;
 
             // Find and remove the thread record
             if let Some((t_node, t_rec, _)) = self.find_catalog_record_by_cnid(cnid) {
-                self.remove_catalog_record(t_node, t_rec);
+                self.remove_catalog_record(t_node, t_rec)?;
             }
 
             // Update parent valence
@@ -3386,7 +3401,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
                 new_record.push(0);
             }
 
-            self.remove_catalog_record(node_idx, rec_idx);
+            self.remove_catalog_record(node_idx, rec_idx)?;
             self.insert_catalog_record(&new_record)?;
 
             // Rewrite the thread record's `thdCName` (fixed Str31 at data +14, so
@@ -3718,18 +3733,23 @@ fn read_fork_data<R: Read + Seek>(
 
 /// Remove every extents-overflow record of `(file_id, fork_type)`, freeing a
 /// leaf that empties; returns the number of records removed.
-fn remove_fork_overflow_records(extents_data: &mut [u8], file_id: u32, fork_type: u8) -> u32 {
+fn remove_fork_overflow_records(
+    extents_data: &mut [u8],
+    file_id: u32,
+    fork_type: u8,
+) -> Result<u32, FilesystemError> {
     use super::hfs_common::{
-        btree_detach_freed_node, btree_free_node, btree_remove_record, walk_leaf_records,
-        BTreeHeader,
+        btree_detach_freed_node_and_refresh, btree_free_node, btree_remove_record,
+        compare_classic_extents_keys, walk_leaf_records, BTreeHeader,
     };
+    let kf = BTreeKeyFormat::CLASSIC_EXTENTS;
     if extents_data.len() < 512 {
-        return 0;
+        return Ok(0);
     }
     let header = BTreeHeader::read(extents_data);
     let node_size = header.node_size as usize;
     if node_size == 0 || extents_data.len() < node_size {
-        return 0;
+        return Ok(0);
     }
     let mut victims: Vec<(u32, usize)> = Vec::new();
     walk_leaf_records::<(), _>(
@@ -3749,7 +3769,7 @@ fn remove_fork_overflow_records(extents_data: &mut [u8], file_id: u32, fork_type
         },
     );
     if victims.is_empty() {
-        return 0;
+        return Ok(0);
     }
     // Highest record index first per node, so earlier indices stay valid.
     victims.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
@@ -3765,6 +3785,16 @@ fn remove_fork_overflow_records(extents_data: &mut [u8], file_id: u32, fork_type
     for node_idx in nodes {
         let off = node_idx as usize * node_size;
         if BigEndian::read_u16(&extents_data[off + 10..off + 12]) != 0 {
+            // The leaf's first key changed: the separators above must match it.
+            if victims.iter().any(|&(n, r)| n == node_idx && r == 0) {
+                btree_refresh_index_keys(
+                    extents_data,
+                    node_size,
+                    node_idx,
+                    &kf,
+                    &compare_classic_extents_keys,
+                )?;
+            }
             continue;
         }
         // An emptied leaf leaves the sibling chain and the node map.
@@ -3788,9 +3818,15 @@ fn remove_fork_overflow_records(extents_data: &mut [u8], file_id: u32, fork_type
         h.free_nodes += 1;
         h.write(extents_data);
         btree_free_node(extents_data, node_size, node_idx);
-        btree_detach_freed_node(extents_data, node_size, node_idx);
+        btree_detach_freed_node_and_refresh(
+            extents_data,
+            node_size,
+            node_idx,
+            &kf,
+            &compare_classic_extents_keys,
+        )?;
     }
-    victims.len() as u32
+    Ok(victims.len() as u32)
 }
 
 /// Write the extents-overflow B-tree back over the extents file's blocks.
@@ -5762,6 +5798,75 @@ mod tests {
     /// title that triggered the related JSON-escaping bug downstream). Mac
     /// Roman maps bytes < 0x80 straight through, so create then list must
     /// preserve them byte-for-byte.
+    #[test]
+    fn deleting_a_leafs_first_record_refreshes_the_separators() {
+        // fsck_hfs E_IKey: a separator must be its child's first key, not the
+        // key that record had before a delete took it.
+        use super::hfs_common::{
+            btree_record_range, btree_stale_index_keys, BTreeHeader, BTreeKeyFormat,
+        };
+        let block_size = 32 * 1024u32;
+        let img = create_blank_hfs_sized(32 * 1024 * 1024, block_size, "IKey", 0, 4 * 1024 * 1024)
+            .expect("create blank volume");
+        let mut fs = HfsFilesystem::open(Cursor::new(img), 0).unwrap();
+        let root = fs.root().unwrap();
+        let options = CreateFileOptions::default();
+        for i in 0..2000 {
+            let mut empty = Cursor::new(Vec::new());
+            fs.create_file(&root, &format!("f{i:05}.txt"), &mut empty, 0, &options)
+                .unwrap();
+        }
+        let node_size = BigEndian::read_u16(&fs.catalog_data()[32..34]) as usize;
+        let header = BTreeHeader::read(fs.catalog_data());
+        assert!(
+            header.depth >= 2,
+            "need an index level, depth {}",
+            header.depth
+        );
+
+        let first = header.first_leaf_node as usize;
+        let second =
+            BigEndian::read_u32(&fs.catalog_data()[first * node_size..first * node_size + 4])
+                as usize;
+        let name = {
+            let node = &fs.catalog_data()[second * node_size..(second + 1) * node_size];
+            let (s, e) = btree_record_range(node, node_size, 0);
+            let rec = &node[s..e];
+            let name_len = rec[6] as usize;
+            String::from_utf8_lossy(&rec[7..7 + name_len]).into_owned()
+        };
+        assert!(
+            name.starts_with('f'),
+            "expected a file record first, got {name:?}"
+        );
+        let victim = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == name)
+            .expect("victim listed");
+        fs.delete_entry(&root, &victim).unwrap();
+
+        let stale = btree_stale_index_keys(
+            fs.catalog_data(),
+            node_size,
+            &BTreeKeyFormat::CLASSIC_CATALOG,
+            &HfsFilesystem::<Cursor<Vec<u8>>>::catalog_compare,
+        );
+        assert!(stale.is_empty(), "separators still stale: {stale:?}");
+        let result = fs.fsck().unwrap();
+        assert!(
+            result.errors.is_empty(),
+            "{:?}",
+            result
+                .errors
+                .iter()
+                .map(|e| &e.message)
+                .take(4)
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn test_hfs_control_char_filename_roundtrip() {
         let img = make_editable_hfs_image();
