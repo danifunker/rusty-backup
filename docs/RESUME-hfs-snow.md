@@ -174,4 +174,11 @@ Update the status line below, add the Disk First Aid column to the
 verification table in `docs/Regression_Bugs.md`, run
 `bash scripts/preflight.sh`, commit, push.
 
-Status: not started.
+Status: sections 0-2 done 2026-09-05. Snow is scripted:
+`scripts/verify-hfs-snow.sh leg3 -w DIR` (harness source in
+`scripts/snow/macatrium_harness.rs`, now with `--floppy`, digits and
+`type@`, 1-bit PNG + PBM frames; the verdict is read off the frame against
+`scripts/snow/dfa-*.pbm`). Disk First Aid passes H1-hfs, H7-hfs and, after
+F-011 shipped the run-list allocator, H3-hfs before and after the delete;
+it declines MFS, so H6 is judged by the Finder copy + TeachText. Evidence in
+`docs/evidence/`. Next: section 3 (a fork a real Mac fragmented).
