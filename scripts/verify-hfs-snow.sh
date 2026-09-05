@@ -15,6 +15,8 @@
 #   bash scripts/verify-hfs-snow.sh open DISK.hda NAME... -o OUT
 #                                                      # Find + Open: TeachText shows the named files
 #   bash scripts/verify-hfs-snow.sh h3-real -w DIR     # the Finder fragments a fork on h3-hfs.img; rb-cli rm; both judges
+#   bash scripts/verify-hfs-snow.sh mac-formatted -w DIR
+#                                                      # System 7.1 formats a partition; rb-cli edits it; both judges + the Finder
 #   bash scripts/verify-hfs-snow.sh wrap VOL.img OUT.hda [SIZE]
 #                                                      # bare HFS volume -> APM disk with an Apple SCSI driver
 #
@@ -261,11 +263,11 @@ f.seek(base + alst * 512 + start * albs); node = f.read(512)
 print(struct.unpack('>I', node[20:24])[0])
 EOF
 }
-# fsck_hfs -n on the volume `wrap` put at LBA 2048 of DISK.hda; prints its last line.
+# fsck_hfs -n on the BYTES-long volume at LBA 2048 of DISK.hda; prints its last line.
 fsck_hfs_wrapped() {
-    local disk=$1 vol=$2 tmp dev line
+    local disk=$1 bytes=$2 tmp dev line
     tmp="${disk%.hda}-vol.img"
-    dd if="$disk" of="$tmp" bs=512 skip=2048 count=$(( $(stat -f %z "$vol") / 512 )) 2>/dev/null
+    dd if="$disk" of="$tmp" bs=512 skip=2048 count=$(( bytes / 512 )) 2>/dev/null
     dev=$(hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "$tmp" | awk 'NR==1{print $1}')
     line=$(fsck_hfs -n "${dev/disk/rdisk}" 2>&1 | tail -1)
     hdiutil detach "$dev" >/dev/null 2>&1
@@ -297,18 +299,57 @@ cmd_h3_real() {
     local ok=1 before after f1 f2
     before=$(xt_leaf_records_at "$out/disk.hda" 1048576)
     [ "$before" -gt 0 ] || { log "  Mac OS wrote no overflow records; the copy did not fragment"; ok=0; }
-    f1=$(fsck_hfs_wrapped "$out/disk.hda" "$img")
+    f1=$(fsck_hfs_wrapped "$out/disk.hda" "$(stat -f %z "$img")")
     cp "$out/disk.hda" "$out/disk-before.hda"
     "$RB" rm "$out/disk.hda@1" big.bin >/dev/null 2>&1 || { log "  rb-cli rm failed"; ok=0; }
     after=$(xt_leaf_records_at "$out/disk.hda" 1048576)
     [ "$after" -eq 0 ] || ok=0
-    f2=$(fsck_hfs_wrapped "$out/disk.hda" "$img")
+    f2=$(fsck_hfs_wrapped "$out/disk.hda" "$(stat -f %z "$img")")
     log "  overflow records written by Mac OS: $before, after rb-cli rm: $after"
     log "  fsck_hfs before: $f1"; log "  fsck_hfs after:  $f2"
     echo "$f1$f2" | grep -q "OK.*OK" || ok=0
     cmd_dfa "$out/disk-before.hda" -i 0 -o "$out/dfa-before" || ok=0
     cmd_dfa "$out/disk.hda" -i 0 -o "$out/dfa-after" || ok=0
     [ $ok = 1 ] && log "H3-real PASS" || log "H3-real FAIL"
+    [ $ok = 1 ]
+}
+
+# mac-formatted -w DIR: a volume Mac OS itself formatted, edited by rb-cli.
+# A blank 5 MiB Apple_HFS partition goes in over SCSI, the System 7.1 Finder
+# offers to initialize it (Initialize, Erase, a name), and rb-cli then edits
+# the result: put, mkdir, mv, rm, setrsrc, put-binhex. fsck_hfs -n and Disk
+# First Aid judge it; the Finder opens the text file in TeachText and
+# launches the Disk First Aid copy rb-cli wrote (its resource fork intact).
+cmd_mac_formatted() {
+    local work="" out
+    local OPTIND=1
+    while getopts "w:" opt; do case $opt in w) work=$OPTARG;; *) die "usage";; esac; done
+    [ -n "$work" ] || die "mac-formatted: -w DIR required"
+    out="$work/snow/mac-formatted"; rm -rf "$out"; mkdir -p "$out"
+    { "$RB" new hd apm "$out/disk.hda" --size 6M --partition 5M:Apple_HFS:Blank && "$RB" mac-scsi-bless "$out/disk.hda" --driver-from "$DRIVER_HDA"; } >/dev/null 2>&1 || die "building the blank disk"
+    make_boot "$out/boot.hda" 0 || die "boot disk"
+    # "This is not a Macintosh disk" -> Initialize (410,176); "will erase all
+    # information" -> Erase (same spot); "Please name this disk" -> a name, OK.
+    local keys="2300000000:click@410,176;2700000000:click@410,176;3400000000:type@snow71;3800000000:return"
+    harness "$out/format" "$out/boot.hda" 6000000000 "$keys" --disk2 "$out/disk.hda"
+    "$RB" ls "$out/disk.hda@1" >/dev/null 2>&1 || die "Mac OS did not format the partition (see $out/format/final.png)"
+    local ok=1 d="$out/disk.hda@1" f0 f1
+    f0=$(fsck_hfs_wrapped "$out/disk.hda" 5242880); log "  fsck_hfs on the Mac-formatted volume: $f0"
+    printf 'Hello from rb-cli on a volume System 7.1 formatted.\r' > "$out/hello.txt"
+    head -c 100000 /dev/urandom > "$out/blob.bin"; head -c 20000 /dev/urandom > "$out/fake.rsrc"
+    "$RB" get-binhex "$BOOT_HDA" "$DFA_PATH" "$out/dfa.hqx" >/dev/null 2>&1 || die "get-binhex Disk First Aid"
+    { "$RB" put "$d" "$out/hello.txt" Hello.txt && "$RB" put "$d" "$out/blob.bin" blob.bin \
+        && "$RB" put "$d" "$out/blob.bin" gone.bin && "$RB" mkdir "$d" /Folder \
+        && "$RB" put "$d" "$out/blob.bin" /Folder/inner.bin && "$RB" mv "$d" /Hello.txt /Hi.txt \
+        && "$RB" rm "$d" gone.bin && "$RB" setrsrc "$d" /blob.bin --from-file "$out/fake.rsrc" \
+        && "$RB" put-binhex "$d" "$out/dfa.hqx" && "$RB" mv "$d" "/Disk First Aid" "/DFA from rb-cli"; } >>"$out/edits.log" 2>&1 \
+        || { log "  an rb-cli edit failed, see $out/edits.log"; ok=0; }
+    "$RB" fsck --checkonly "$d" >>"$out/edits.log" 2>&1 || { log "  rb-cli fsck not clean, see $out/edits.log"; ok=0; }
+    f1=$(fsck_hfs_wrapped "$out/disk.hda" 5242880); log "  fsck_hfs after the rb-cli edits: $f1"
+    echo "$f1" | grep -q "OK" || ok=0
+    cmd_dfa "$out/disk.hda" -i 0 -o "$out/dfa" || ok=0
+    cmd_open "$out/disk.hda" Hi.txt "DFA from rb-cli" -o "$out/open"
+    [ $ok = 1 ] && log "mac-formatted PASS" || log "mac-formatted FAIL"
     [ $ok = 1 ]
 }
 
@@ -346,6 +387,7 @@ cmd_leg3() {
         results+=("H6 Disk First Aid: $(dfa_verdict "$snow/h6-dfa/run/final.pbm") (MFS: it declines; the Finder check is the judge)")
         cmd_finder_copy "$work/h6-mfs.img" -o "$snow/h6" && results+=("H6 Finder copy PASS") || results+=("H6 Finder copy FAIL")
     fi
+    cmd_mac_formatted -w "$work" && results+=("mac-formatted PASS") || results+=("mac-formatted FAIL")
     log "---- summary ----"
     for r in "${results[@]}"; do log "$r"; done
 }
@@ -358,6 +400,7 @@ case "${1:-}" in
     open) shift; cmd_open "$@" ;;
     leg3) shift; cmd_leg3 "$@" ;;
     h3-real) shift; cmd_h3_real "$@" ;;
+    mac-formatted) shift; cmd_mac_formatted "$@" ;;
     crop) shift; crop_pbm "$@" ;;
     verdict) shift; dfa_verdict "$@" ;;
     *) sed -n '2,20p' "$0"; exit 2 ;;

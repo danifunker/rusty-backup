@@ -189,4 +189,31 @@ reaches the classic-HFS grow and explains a bitmap-bound refusal, editable
 opens warn. Section 5 done: blank HFS+ trees carry Apple's attribute bits
 (6 / 2 / 6), re-judged clean. Section 6 done: the Minimum-restored HFS+
 volume and its grow-back both pass `fsck_hfs -n` (noted under R-056).
-Next: section 7.
+Section 7 done: `verify-hfs-snow.sh mac-formatted` has the System 7.1 Finder
+initialize a partition, rb-cli edits it, both judges and the Finder pass.
+Section 8 (hardware) is prepared below; nothing else is open.
+
+Section 8, the commands to run with the hardware attached (from the repo
+root, debug build; `diskutil list` gives N):
+
+```bash
+# R6: the SD card with its lock switch ON. Expect "is write-protected ...
+# opened read-only" in the log, no authorization prompt, and a restore that
+# refuses before anything is unmounted.
+./target/debug/rb-cli inspect /dev/diskN
+./target/debug/rb-cli backup /dev/diskN /tmp/rb-r6 --name r6 --format zstd --progress never
+./target/debug/rb-cli restore /tmp/rb-r6/r6 /dev/diskN        # must refuse
+# R11: any device that needs authorization; press Cancel once in the
+# dialog. Expect "administrator authorization was cancelled" and no second
+# prompt.
+./target/debug/rb-cli inspect /dev/diskN
+# R19: the USB floppy drive with a disk in it. Expect a correct listing and,
+# if the drive refuses large reads, the one-time "continuing one sector at
+# a time" warning.
+./target/debug/rb-cli inspect /dev/rdiskN
+# Section 3 of leg 3: the card mounted (do not eject), opened in the GUI's
+# Inspect tab. Expect "read-write escalation ... failed; retrying read-only".
+cargo run --release
+# Afterwards, remove the diagnostic logging that was kept for this:
+grep -rn TEMP-DIAG src/
+```
