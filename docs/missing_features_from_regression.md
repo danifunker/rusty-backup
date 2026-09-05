@@ -22,7 +22,7 @@ concrete reason to.
 | ~~F-009~~ | ~~SFS editor writes single-leaf extent b-trees only~~ — **SHIPPED** 2026-08-17 | `src/fs/sfs.rs` | — |
 | ~~F-004~~ | ~~`show partmap` is APM-only~~ — **SHIPPED** 2026-08-08, same gap as R-026 | `src/cli/verbs/show.rs` | — |
 | [F-010](#f-010) | A file-aware Ghost image exposes only its FAT record stream; an NTFS partition behind it is unreachable | `src/rbformats/gho.rs` | D13's Windows check (a real multi-partition `.GHO` with long names) |
-| [F-011](#f-011) | The classic HFS writer allocates a fork as one contiguous run; a fragmented volume reports disk full with room to spare | `src/fs/hfs.rs` | H3's classic-HFS check (a resource fork spilled into the extents-overflow file by rb-cli) |
+| ~~[F-011](#f-011)~~ | **SHIPPED 2026-09-05.** ~~The classic HFS writer allocates a fork as one contiguous run; a fragmented volume reports disk full with room to spare~~ | `src/fs/hfs.rs` | H3's classic-HFS check: a resource fork spilled into the extents-overflow file by rb-cli, clean under `fsck_hfs -n` and Disk First Aid before and after the delete |
 
 ---
 
@@ -610,6 +610,20 @@ the loop and the disk-level layout. Until then D13 stays covered by its
 unit test only.
 
 ## F-011 — the classic HFS writer allocates a fork as one contiguous run {#f-011}
+
+**SHIPPED 2026-09-05.** `allocate_extents` in `src/fs/hfs.rs` still asks for
+one run first (a contiguous fork when the volume has room for it, the way
+Mac OS allocates) and otherwise gathers the free runs first-fit in address
+order; the first three go into the catalog record's inline extents and the
+rest into the extents-overflow B-tree, three per record, through the same
+`btree_insert_full` the HFS+ driver uses (`BTreeKeyFormat::CLASSIC_EXTENTS`).
+`create_file` and `write_resource_fork` (so `put`, `import`, `setrsrc`,
+Commander) all take that path; the read and delete sides already handled
+overflow records. The H3 classic-HFS check now builds: a 1 MB resource fork
+over 126 one-block holes spills five overflow records, `fsck_hfs -n` and Disk
+First Aid 7.2 (System 7.1 in Snow) both pass before and after `rb-cli rm`
+(`docs/Regression_Bugs.md`, macOS verification table; unit test
+`create_file_spreads_a_fork_over_free_runs`).
 
 Found 2026-09-05 by the audit's H3 check on macOS. The check fills an
 8 MiB classic HFS volume with 64 KiB files, deletes every other one and

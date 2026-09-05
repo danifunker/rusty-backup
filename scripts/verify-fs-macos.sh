@@ -182,6 +182,8 @@ for fs in hfsplus hfs; do
     [ "$before" -gt 0 ] || ok=0
     dev=$(attach_raw "$img") && mac_fsck "$dev" "$id before delete" || ok=0
     detach_all
+    # Kept for verify-hfs-snow.sh, which judges the fork before and after the delete.
+    cp "$img" "${img%.img}-before.img"
     rb rm "$img" big.bin || ok=0
     after=$(xt_leaf_records "$img" "$fs")
     log "  extents-overflow leaf records after the delete: $after"

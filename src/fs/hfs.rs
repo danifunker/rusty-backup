@@ -9,8 +9,9 @@ use super::filesystem::{
     CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem, FilesystemError,
 };
 use super::hfs_common::{
-    self, bitmap_clear_bit_be, bitmap_find_clear_run_be, bitmap_set_bit_be, btree_free_node,
-    btree_refresh_index_keys, btree_remove_record, BTreeHeader, BTreeKeyFormat,
+    self, bitmap_clear_bit_be, bitmap_collect_clear_runs_be, bitmap_find_clear_run_be,
+    bitmap_set_bit_be, btree_free_node, btree_refresh_index_keys, btree_remove_record, BTreeHeader,
+    BTreeKeyFormat,
 };
 use super::CompactResult;
 
@@ -1812,8 +1813,8 @@ impl<R: Read + Write + Seek> HfsFilesystem<R> {
         Ok(())
     }
 
-    /// Allocate `count` contiguous blocks from the volume bitmap.
-    /// Returns the start block index.
+    /// Allocate `count` contiguous blocks from the volume bitmap and return the
+    /// start block; `allocate_extents` is the fallback when no run is long enough.
     fn allocate_blocks(&mut self, count: u32) -> Result<u32, FilesystemError> {
         self.ensure_bitmap()?;
         let bitmap = self.bitmap.as_mut().unwrap();
@@ -1837,6 +1838,62 @@ impl<R: Read + Write + Seek> HfsFilesystem<R> {
         let next = (start + count) % self.mdb.total_blocks.max(1) as u32;
         BigEndian::write_u16(&mut self.mdb.raw_sector[16..18], next as u16);
         Ok(start)
+    }
+
+    /// Allocate `count` blocks as a list of runs: one contiguous run when the
+    /// volume has it, else first fit over the free runs in address order (F-011).
+    fn allocate_extents(&mut self, count: u32) -> Result<Vec<HfsExtDescriptor>, FilesystemError> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        if count > u16::MAX as u32 {
+            return Err(FilesystemError::InvalidData(
+                "file too large for classic HFS (>65535 blocks)".into(),
+            ));
+        }
+        if let Ok(start) = self.allocate_blocks(count) {
+            return Ok(vec![HfsExtDescriptor {
+                start_block: start as u16,
+                block_count: count as u16,
+            }]);
+        }
+        self.ensure_bitmap()?;
+        let total_blocks = self.mdb.total_blocks as u32;
+        let free = self.mdb.free_blocks as u32;
+        if free < count {
+            return Err(FilesystemError::DiskFull(format!(
+                "{free} blocks free, {count} requested"
+            )));
+        }
+        let bitmap = self.bitmap.as_mut().unwrap();
+        let mut extents = Vec::new();
+        let mut remaining = count;
+        for (start, len) in bitmap_collect_clear_runs_be(bitmap, total_blocks) {
+            if remaining == 0 {
+                break;
+            }
+            let take = len.min(remaining);
+            extents.push(HfsExtDescriptor {
+                start_block: start as u16,
+                block_count: take as u16,
+            });
+            remaining -= take;
+        }
+        if remaining > 0 {
+            return Err(FilesystemError::DiskFull(format!(
+                "needed {count} blocks, short by {remaining} after gathering every free run"
+            )));
+        }
+        for ext in &extents {
+            for i in 0..ext.block_count as u32 {
+                bitmap_set_bit_be(bitmap, ext.start_block as u32 + i);
+            }
+        }
+        self.mdb.free_blocks = self.mdb.free_blocks.saturating_sub(count as u16);
+        let last = extents.last().unwrap();
+        let next = (last.start_block as u32 + last.block_count as u32) % total_blocks.max(1);
+        BigEndian::write_u16(&mut self.mdb.raw_sector[16..18], next as u16);
+        Ok(extents)
     }
 
     /// Free `count` blocks starting at `start`.
@@ -1889,40 +1946,95 @@ impl<R: Read + Write + Seek> HfsFilesystem<R> {
         Ok(())
     }
 
-    /// Write file data to allocated blocks. Returns (start_block, block_count).
+    /// Write file data to freshly allocated blocks; returns the fork's extents
+    /// in fork order (the first three go inline, the rest into the overflow tree).
     fn write_data_to_blocks(
         &mut self,
         data: &mut dyn std::io::Read,
         data_len: u64,
-    ) -> Result<(u16, u16), FilesystemError> {
+    ) -> Result<Vec<HfsExtDescriptor>, FilesystemError> {
         if data_len == 0 {
-            return Ok((0, 0));
+            return Ok(Vec::new());
         }
         let block_size = self.mdb.block_size as u64;
         let blocks_needed = data_len.div_ceil(block_size) as u32;
-        if blocks_needed > u16::MAX as u32 {
-            return Err(FilesystemError::InvalidData(
-                "file too large for classic HFS (>65535 blocks)".into(),
-            ));
-        }
-        let start_block = self.allocate_blocks(blocks_needed)?;
+        let extents = self.allocate_extents(blocks_needed)?;
 
         let mut buf = vec![0u8; block_size as usize];
         let mut remaining = data_len;
-        for i in 0..blocks_needed {
-            let to_read = remaining.min(block_size) as usize;
-            buf.fill(0);
-            data.read_exact(&mut buf[..to_read]).map_err(|e| {
-                FilesystemError::Io(std::io::Error::new(
-                    e.kind(),
-                    format!("reading file data: {e}"),
-                ))
-            })?;
-            self.write_block(start_block + i, &buf)?;
-            remaining -= to_read as u64;
+        for ext in &extents {
+            for i in 0..ext.block_count as u32 {
+                let to_read = remaining.min(block_size) as usize;
+                buf.fill(0);
+                data.read_exact(&mut buf[..to_read]).map_err(|e| {
+                    FilesystemError::Io(std::io::Error::new(
+                        e.kind(),
+                        format!("reading file data: {e}"),
+                    ))
+                })?;
+                self.write_block(ext.start_block as u32 + i, &buf)?;
+                remaining -= to_read as u64;
+            }
         }
 
-        Ok((start_block as u16, blocks_needed as u16))
+        Ok(extents)
+    }
+
+    /// Total blocks of an extent list; `u16` because that is what filPyLen holds.
+    fn extents_block_total(extents: &[HfsExtDescriptor]) -> u16 {
+        extents.iter().map(|e| e.block_count).sum()
+    }
+
+    /// Fill a file record's three inline extent slots at `base` (74 data, 86 rsrc).
+    fn set_inline_extents(rec: &mut [u8], base: usize, extents: &[HfsExtDescriptor]) {
+        rec[base..base + 12].fill(0);
+        for (i, ext) in extents.iter().take(3).enumerate() {
+            let off = base + i * 4;
+            BigEndian::write_u16(&mut rec[off..off + 2], ext.start_block);
+            BigEndian::write_u16(&mut rec[off + 2..off + 4], ext.block_count);
+        }
+    }
+
+    /// Record the fourth extent on into the extents-overflow tree, three per
+    /// record keyed by fork block; true if a record was written (F-011).
+    fn insert_fork_overflow(
+        &mut self,
+        file_id: u32,
+        fork_type: u8,
+        extents: &[HfsExtDescriptor],
+    ) -> Result<bool, FilesystemError> {
+        use super::hfs_common::compare_classic_extents_keys;
+        if extents.len() <= 3 {
+            return Ok(false);
+        }
+        self.ensure_extents_overflow()?;
+        let data = self.extents_overflow_data.as_mut().ok_or_else(|| {
+            FilesystemError::Unsupported(
+                "volume has no extents-overflow B-tree; a fragmented fork cannot be created".into(),
+            )
+        })?;
+        let mut fork_block: u32 = extents.iter().take(3).map(|e| e.block_count as u32).sum();
+        for chunk in extents[3..].chunks(3) {
+            // Key: keyLen(1) = 7, forkType(1), fileID(4), startBlock(2); 3 extents follow.
+            let mut rec = vec![7u8, fork_type];
+            rec.extend_from_slice(&file_id.to_be_bytes());
+            rec.extend_from_slice(&(fork_block as u16).to_be_bytes());
+            for i in 0..3 {
+                let (start, count) = chunk
+                    .get(i)
+                    .map_or((0, 0), |e| (e.start_block, e.block_count));
+                rec.extend_from_slice(&start.to_be_bytes());
+                rec.extend_from_slice(&count.to_be_bytes());
+            }
+            hfs_common::btree_insert_full(
+                data,
+                &rec,
+                &BTreeKeyFormat::CLASSIC_EXTENTS,
+                &compare_classic_extents_keys,
+            )?;
+            fork_block += chunk.iter().map(|e| e.block_count as u32).sum::<u32>();
+        }
+        Ok(true)
     }
 
     /// Build a classic HFS file record (102 bytes).
@@ -3077,6 +3189,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
     ) -> Result<FileEntry, FilesystemError> {
         self.ensure_catalog_initialized()?;
         let snap = self.snapshot();
+        let extents_before = self.extents_overflow_data.clone();
         let result = (|| {
             let parent_id = parent.location as u32;
 
@@ -3106,48 +3219,48 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
             );
 
             // Allocate blocks and write data
-            let (data_start, data_blocks) = self.write_data_to_blocks(data, data_len)?;
+            let data_extents = self.write_data_to_blocks(data, data_len)?;
 
             // Handle resource fork
-            let (rsrc_start, rsrc_blocks, rsrc_size) =
-                if let Some(ref rsrc_src) = options.resource_fork {
-                    match rsrc_src {
-                        super::filesystem::ResourceForkSource::Data(rsrc_data) => {
-                            let mut cursor = std::io::Cursor::new(rsrc_data);
-                            let (rs, rb) =
-                                self.write_data_to_blocks(&mut cursor, rsrc_data.len() as u64)?;
-                            (rs, rb, rsrc_data.len() as u32)
-                        }
-                        super::filesystem::ResourceForkSource::File(path) => {
-                            let mut f = std::fs::File::open(path)?;
-                            let len = f.metadata()?.len();
-                            let (rs, rb) = self.write_data_to_blocks(&mut f, len)?;
-                            (rs, rb, len as u32)
-                        }
+            let (rsrc_extents, rsrc_size) = if let Some(ref rsrc_src) = options.resource_fork {
+                match rsrc_src {
+                    super::filesystem::ResourceForkSource::Data(rsrc_data) => {
+                        let mut cursor = std::io::Cursor::new(rsrc_data);
+                        let ext = self.write_data_to_blocks(&mut cursor, rsrc_data.len() as u64)?;
+                        (ext, rsrc_data.len() as u32)
                     }
-                } else {
-                    (0, 0, 0)
-                };
+                    super::filesystem::ResourceForkSource::File(path) => {
+                        let mut f = std::fs::File::open(path)?;
+                        let len = f.metadata()?.len();
+                        let ext = self.write_data_to_blocks(&mut f, len)?;
+                        (ext, len as u32)
+                    }
+                }
+            } else {
+                (Vec::new(), 0)
+            };
 
             // Build file record. A cross-fs copy passes the source mtime
             // through `options.unix_times`; a genuinely new file leaves it None
             // and takes `now`. Commander's `PreservedDates.mac` path still
             // overrides both via a follow-up `set_dates` when present.
             let mtime = options.unix_times.map(|t| t.mtime_or_now());
-            let file_rec = Self::build_file_record(
+            let mut file_rec = Self::build_file_record(
                 file_id,
                 data_len as u32,
-                data_start,
-                data_blocks,
+                data_extents.first().map_or(0, |e| e.start_block),
+                Self::extents_block_total(&data_extents),
                 rsrc_size,
-                rsrc_start,
-                rsrc_blocks,
+                rsrc_extents.first().map_or(0, |e| e.start_block),
+                Self::extents_block_total(&rsrc_extents),
                 &type_code,
                 &creator_code,
                 self.mdb.block_size,
                 mtime,
                 options.finder_flags.unwrap_or(0),
             );
+            Self::set_inline_extents(&mut file_rec, 74, &data_extents);
+            Self::set_inline_extents(&mut file_rec, 86, &rsrc_extents);
 
             // Build key + record for catalog insertion
             let key = Self::build_catalog_key(parent_id, &name_bytes);
@@ -3169,6 +3282,12 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
 
             // Update MDB counts
             self.mdb.file_count += 1;
+
+            let mut overflow_changed = self.insert_fork_overflow(file_id, 0x00, &data_extents)?;
+            overflow_changed |= self.insert_fork_overflow(file_id, 0xFF, &rsrc_extents)?;
+            if overflow_changed {
+                self.write_extents_overflow_back()?;
+            }
 
             let path = if parent.path == "/" {
                 format!("/{name}")
@@ -3194,6 +3313,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
             Ok(fe)
         })();
         if result.is_err() {
+            self.extents_overflow_data = extents_before;
             self.restore_snapshot(snap);
         }
         result
@@ -3479,7 +3599,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
             }
 
             // Allocate and write new resource fork
-            let (rsrc_start, rsrc_blocks) = self.write_data_to_blocks(data, len)?;
+            let rsrc_extents = self.write_data_to_blocks(data, len)?;
 
             let frec_start = self.locate_record_data(cnid)?;
             if self.catalog_data[frec_start] as i8 != CATALOG_FILE {
@@ -3502,19 +3622,15 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
             // filRPyLen at offset 40
             BigEndian::write_u32(
                 &mut self.catalog_data[frec_start + 40..frec_start + 44],
-                rsrc_blocks as u32 * self.mdb.block_size,
+                Self::extents_block_total(&rsrc_extents) as u32 * self.mdb.block_size,
             );
-            // Rsrc extents at offset 86
-            BigEndian::write_u16(
-                &mut self.catalog_data[frec_start + 86..frec_start + 88],
-                rsrc_start,
+            // Rsrc extents at offset 86; a fourth extent on goes to the overflow tree.
+            Self::set_inline_extents(
+                &mut self.catalog_data[frec_start..frec_start + 102],
+                86,
+                &rsrc_extents,
             );
-            BigEndian::write_u16(
-                &mut self.catalog_data[frec_start + 88..frec_start + 90],
-                rsrc_blocks,
-            );
-            // Clear remaining rsrc extent slots
-            self.catalog_data[frec_start + 90..frec_start + 98].fill(0);
+            overflow_changed |= self.insert_fork_overflow(cnid, 0xFF, &rsrc_extents)?;
 
             if overflow_changed {
                 self.write_extents_overflow_back()?;
@@ -6200,6 +6316,117 @@ mod tests {
             "fsck errors: {:?}",
             result.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
         );
+    }
+
+    /// F-011: a fork no single free run can hold spreads over the holes, its
+    /// fourth extent on lands in the overflow tree, and both forks read back.
+    #[test]
+    fn create_file_spreads_a_fork_over_free_runs() {
+        let img = create_blank_hfs(8 * 1024 * 1024, 4096, "Runs").unwrap();
+        let mut fs = HfsFilesystem::open(Cursor::new(img), 0).unwrap();
+        let root = fs.root().unwrap();
+        let block = vec![0xA5u8; 4096];
+        for i in 0..40 {
+            fs.create_file(
+                &root,
+                &format!("f{i:02}"),
+                &mut Cursor::new(block.as_slice()),
+                4096,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+        }
+        // Every other one-block file goes: 20 one-block holes.
+        for e in fs.list_directory(&root).unwrap() {
+            if e.name[1..].parse::<u32>().unwrap() % 2 == 1 {
+                fs.delete_entry(&root, &e).unwrap();
+            }
+        }
+        // The contiguous tail goes to one file, so only the holes are left.
+        let tail = (fs.mdb.free_blocks - 20) as usize;
+        let tail_data = vec![0x5Au8; tail * 4096];
+        fs.create_file(
+            &root,
+            "tail",
+            &mut Cursor::new(tail_data.as_slice()),
+            tail_data.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(fs.mdb.free_blocks, 20);
+        let free_before = fs.mdb.free_blocks;
+
+        // Seven blocks of data over seven holes: three inline, four in overflow.
+        let data: Vec<u8> = (0..7 * 4096).map(|i| (i / 4096) as u8 + 1).collect();
+        let rsrc: Vec<u8> = (0..5 * 4096).map(|i| 0x80 | (i / 4096) as u8).collect();
+        let opts = CreateFileOptions {
+            resource_fork: Some(super::super::filesystem::ResourceForkSource::Data(
+                rsrc.clone(),
+            )),
+            ..Default::default()
+        };
+        let entry = fs
+            .create_file(
+                &root,
+                "frag",
+                &mut Cursor::new(data.as_slice()),
+                data.len() as u64,
+                &opts,
+            )
+            .unwrap();
+        let cnid = entry.location as u32;
+        assert_eq!(fs.mdb.free_blocks, free_before - 12);
+        let (dsize, dext, rsize, rext) = fs.find_file_by_id(cnid).unwrap();
+        assert_eq!((dsize as usize, rsize as usize), (data.len(), rsrc.len()));
+        assert!(dext.iter().all(|e| e.block_count == 1) && rext.iter().all(|e| e.block_count == 1));
+        let tree = fs
+            .extents_overflow_data
+            .as_ref()
+            .expect("overflow tree loaded");
+        assert_eq!(collect_fork_overflow_extents(tree, cnid, 0x00, 0).len(), 4);
+        assert_eq!(collect_fork_overflow_extents(tree, cnid, 0xFF, 0).len(), 2);
+        assert_eq!(fs.read_file(&entry, usize::MAX).unwrap(), data);
+        let mut got = Vec::new();
+        fs.write_resource_fork_to(&entry, &mut got).unwrap();
+        assert_eq!(got, rsrc);
+
+        // setrsrc over it: the old runs come back, the new fork spreads again.
+        let rsrc2: Vec<u8> = (0..4 * 4096).map(|i| 0xC0 | (i / 4096) as u8).collect();
+        fs.write_resource_fork(
+            &entry,
+            &mut Cursor::new(rsrc2.as_slice()),
+            rsrc2.len() as u64,
+        )
+        .unwrap();
+        assert_eq!(fs.mdb.free_blocks, free_before - 11);
+        let tree = fs.extents_overflow_data.as_ref().unwrap();
+        assert_eq!(collect_fork_overflow_extents(tree, cnid, 0xFF, 0).len(), 1);
+        let mut got = Vec::new();
+        fs.write_resource_fork_to(&entry, &mut got).unwrap();
+        assert_eq!(got, rsrc2);
+
+        fs.sync_metadata().unwrap();
+        let report = fs.fsck().unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+
+        // Reopen from disk: the overflow records were written back.
+        let img = fs.reader.get_ref().clone();
+        let mut fs = HfsFilesystem::open(Cursor::new(img), 0).unwrap();
+        let root = fs.root().unwrap();
+        let entry = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "frag")
+            .unwrap();
+        assert_eq!(fs.read_file(&entry, usize::MAX).unwrap(), data);
+        fs.delete_entry(&root, &entry).unwrap();
+        assert_eq!(fs.mdb.free_blocks, free_before);
+        let tree = fs.extents_overflow_data.as_ref().unwrap();
+        assert!(collect_fork_overflow_extents(tree, cnid, 0x00, 0).is_empty());
+        fs.sync_metadata().unwrap();
+        let report = fs.fsck().unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
     }
 
     /// A fork fragmented past its three inline extents keeps the rest in the
