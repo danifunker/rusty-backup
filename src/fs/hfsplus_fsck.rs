@@ -61,6 +61,7 @@ enum HfsPlusFsckCode {
     ParentValenceMismatch,
     BitmapAllocCountMismatch,
     BitmapTooShort,
+    AlternateHeaderBlockFree,
     JournalChecksumMismatch,
     JournalSequenceJump,
 }
@@ -84,6 +85,7 @@ impl HfsPlusFsckCode {
             HfsPlusFsckCode::ParentValenceMismatch => "ParentValenceMismatch",
             HfsPlusFsckCode::BitmapAllocCountMismatch => "BitmapAllocCountMismatch",
             HfsPlusFsckCode::BitmapTooShort => "BitmapTooShort",
+            HfsPlusFsckCode::AlternateHeaderBlockFree => "AlternateHeaderBlockFree",
             HfsPlusFsckCode::JournalChecksumMismatch => "JournalChecksumMismatch",
             HfsPlusFsckCode::JournalSequenceJump => "JournalSequenceJump",
         }
@@ -447,6 +449,26 @@ pub(super) fn check<R: Read + Seek>(
                      total_blocks - free_blocks = {expected_alloc}"
                 ),
             ));
+        }
+    }
+
+    // The alternate volume header's block(s) count as used. A resize that
+    // forgot to move them is what fsck_hfs reports as orphaned blocks at the
+    // old end and under-allocation at the new one.
+    if bitmap_bits >= total_blocks as u64 && total_blocks > 0 {
+        let bs = block_size as u64;
+        let end = fs
+            .partition_size()
+            .filter(|&s| s >= 2048)
+            .unwrap_or(total_blocks as u64 * bs);
+        let first = ((end - 1024) / bs).min(total_blocks as u64) as u32;
+        for block in first..total_blocks {
+            if bitmap[(block / 8) as usize] & (1 << (7 - block % 8)) == 0 {
+                errors.push(issue(
+                    HfsPlusFsckCode::AlternateHeaderBlockFree,
+                    format!("block {block} holds the alternate volume header but is marked free"),
+                ));
+            }
         }
     }
 

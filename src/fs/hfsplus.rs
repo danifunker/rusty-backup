@@ -1037,6 +1037,11 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
         self.extents_overflow_data.as_deref()
     }
 
+    /// Partition length when the opener knew it; where the alternate header lives.
+    pub(crate) fn partition_size(&self) -> Option<u64> {
+        self.partition_size
+    }
+
     /// The attributes B-tree, loaded on first use, for fsck.
     pub(crate) fn attributes_data_for_fsck(&mut self) -> Result<Option<&[u8]>, FilesystemError> {
         if self.vh.attributes_file.logical_size == 0 {
@@ -6212,44 +6217,152 @@ pub fn resize_hfsplus_in_place(
         log("HFS+ resize: not an HFS+ volume, skipping");
         return Ok(());
     }
-
-    let block_size = BigEndian::read_u32(&vh_buf[40..44]);
-    let old_total = BigEndian::read_u32(&vh_buf[44..48]);
-    let old_free = BigEndian::read_u32(&vh_buf[48..52]);
-    let used_blocks = old_total - old_free;
-
-    let new_total = (new_size_bytes / block_size as u64) as u32;
-    if new_total < used_blocks {
-        anyhow::bail!(
-            "HFS+ resize: new size {} blocks < used {} blocks",
-            new_total,
-            used_blocks
-        );
+    let mut vh = HfsPlusVolumeHeader::parse(&vh_buf)?;
+    let bs = vh.block_size;
+    let old_total = vh.total_blocks;
+    let new_total = (new_size_bytes / bs as u64) as u32;
+    if new_total < 8 {
+        anyhow::bail!("HFS+ resize: {new_size_bytes} bytes is too small for a volume");
     }
 
-    let new_free = new_total - used_blocks;
+    // The allocation file is one extent on every volume Apple or we format.
+    let af = &vh.allocation_file;
+    if af.extents[0].block_count == 0 || af.extents[1].block_count != 0 {
+        anyhow::bail!("HFS+ resize: the allocation file is not a single extent; refusing");
+    }
+    let (mut af_start, mut af_blocks) = (af.extents[0].start_block, af.extents[0].block_count);
+    let mut bitmap = vec![0u8; af_blocks as usize * bs as usize];
+    device.seek(SeekFrom::Start(
+        partition_offset + af_start as u64 * bs as u64,
+    ))?;
+    device.read_exact(&mut bitmap)?;
 
+    let old_tail = alt_vh_blocks(old_total, bs);
+    let new_tail = alt_vh_blocks(new_total, bs);
+    if new_total < old_total {
+        // A count says nothing about position: the last used block must fit.
+        let highest = find_last_set_bit(&bitmap, old_tail.start).map_or(0, |b| b + 1);
+        if highest > new_tail.start {
+            anyhow::bail!(
+                "HFS+ resize: new size {} blocks ends before the last allocated block ({})",
+                new_total,
+                highest
+            );
+        }
+    }
+
+    // The alternate header's blocks move with the end of the volume (R-056);
+    // bits past the old end were padding and the grown area starts free.
+    let cap_bits = (bitmap.len() as u64 * 8).min(u32::MAX as u64) as u32;
+    for b in old_tail.start..old_total.min(cap_bits) {
+        bitmap_clear_bit_be(&mut bitmap, b);
+    }
+    for b in old_total..new_total.min(cap_bits) {
+        bitmap_clear_bit_be(&mut bitmap, b);
+    }
+
+    // A bigger volume may need a bigger allocation file: extend it in place
+    // when the blocks after it are free, else move it to a free run.
+    let needed_blocks = (new_total as u64).div_ceil(8).div_ceil(bs as u64) as u32;
+    if needed_blocks > af_blocks {
+        let mut grown = bitmap.clone();
+        grown.resize(needed_blocks as usize * bs as usize, 0);
+        let usable = new_tail.start;
+        let extend_ok = (af_start + af_blocks..af_start + needed_blocks)
+            .all(|b| b < usable && !bitmap_test_bit_be(&grown, b));
+        let new_start = if extend_ok {
+            af_start
+        } else {
+            hfs_common::bitmap_find_clear_run_be(&grown, usable, needed_blocks).ok_or_else(
+                || {
+                    anyhow::anyhow!(
+                        "HFS+ resize: no free run of {needed_blocks} blocks for the allocation file"
+                    )
+                },
+            )?
+        };
+        if new_start != af_start {
+            for b in af_start..af_start + af_blocks {
+                bitmap_clear_bit_be(&mut grown, b);
+            }
+        }
+        for b in new_start..new_start + needed_blocks {
+            bitmap_set_bit_be(&mut grown, b);
+        }
+        log(&format!(
+            "HFS+ resize: allocation file grows from {af_blocks} to {needed_blocks} blocks at \
+             block {new_start}"
+        ));
+        bitmap = grown;
+        af_start = new_start;
+        af_blocks = needed_blocks;
+        vh.allocation_file.extents[0] = ExtentDescriptor {
+            start_block: af_start,
+            block_count: af_blocks,
+        };
+        vh.allocation_file.total_blocks = af_blocks;
+        vh.allocation_file.logical_size = af_blocks as u64 * bs as u64;
+    }
+    for b in new_tail.clone() {
+        bitmap_set_bit_be(&mut bitmap, b);
+    }
+    let cap_bits = (bitmap.len() as u64 * 8).min(u32::MAX as u64) as u32;
+    for b in new_total..cap_bits {
+        bitmap_clear_bit_be(&mut bitmap, b);
+    }
+
+    let used = count_used_blocks(&bitmap, new_total);
+    vh.total_blocks = new_total;
+    vh.free_blocks = new_total - used;
+    if vh.next_allocation >= new_tail.start {
+        vh.next_allocation = 0;
+    }
     log(&format!(
         "HFS+ resize: {} -> {} blocks ({} free)",
-        old_total, new_total, new_free
+        old_total, new_total, vh.free_blocks
     ));
 
-    // Update volume header fields
-    BigEndian::write_u32(&mut vh_buf[44..48], new_total);
-    BigEndian::write_u32(&mut vh_buf[48..52], new_free);
-
-    // Write primary volume header at offset + 1024
+    device.seek(SeekFrom::Start(
+        partition_offset + af_start as u64 * bs as u64,
+    ))?;
+    device.write_all(&bitmap)?;
+    let out = vh.serialize();
     device.seek(SeekFrom::Start(partition_offset + 1024))?;
-    device.write_all(&vh_buf)?;
-
-    // Write backup volume header at offset + new_size - 1024
+    device.write_all(&out)?;
     if new_size_bytes > 1024 {
         device.seek(SeekFrom::Start(partition_offset + new_size_bytes - 1024))?;
-        device.write_all(&vh_buf)?;
+        device.write_all(&out)?;
     }
-
     device.flush()?;
     Ok(())
+}
+
+/// The blocks that hold a volume's alternate volume header, its last 1024
+/// bytes: one block at 1024 bytes and up, two at 512.
+fn alt_vh_blocks(total_blocks: u32, block_size: u32) -> std::ops::Range<u32> {
+    if total_blocks == 0 {
+        return 0..0;
+    }
+    let bytes = total_blocks as u64 * block_size as u64;
+    let start = (bytes.saturating_sub(1024) / block_size as u64) as u32;
+    start..total_blocks
+}
+
+/// Set bits among the first `total_blocks` of the allocation bitmap.
+fn count_used_blocks(bitmap: &[u8], total_blocks: u32) -> u32 {
+    let full = (total_blocks / 8) as usize;
+    let mut used: u32 = bitmap[..full.min(bitmap.len())]
+        .iter()
+        .map(|b| b.count_ones())
+        .sum();
+    let keep = total_blocks % 8;
+    if keep > 0 {
+        if let Some(&last) = bitmap.get(full) {
+            let mask = 0xFFu8 << (8 - keep);
+            used += (last & mask).count_ones();
+        }
+    }
+    used
 }
 
 /// Validate HFS+ filesystem integrity.
@@ -9718,6 +9831,58 @@ mod tests {
         // The hand-made bitmap above never reaches disk, so no fsck here; the
         // audit's verify-fs-macos.sh runs fsck_hfs on the real image instead.
         assert!(btree_lonely_empty_leaves(tree, h.node_size as usize).is_empty());
+    }
+
+    #[test]
+    fn a_grow_moves_the_alternate_header_blocks_and_the_bitmap() {
+        // fsck_hfs on the audit's H7 grow: "orphaned blocks" at the old tail,
+        // "under-allocation" at the new one. The 2 KiB case also outgrows its
+        // one-block allocation file, which has to move.
+        type Fs = HfsPlusFilesystem<std::io::Cursor<Vec<u8>>>;
+        for (bs, old_mib, new_mib) in [(4096u32, 24u64, 30u64), (2048u32, 32u64, 64u64)] {
+            let mut img = create_blank_hfsplus(old_mib << 20, bs, "Grow", false);
+            img.resize((new_mib << 20) as usize, 0);
+            let mut cur = std::io::Cursor::new(img);
+            let mut log = |_: &str| {};
+            resize_hfsplus_in_place(&mut cur, 0, new_mib << 20, &mut log).unwrap();
+
+            let mut fs = Fs::open_sized(cur, 0, Some(new_mib << 20)).unwrap();
+            let total = fs.vh.total_blocks;
+            assert_eq!(total as u64, (new_mib << 20) / bs as u64, "bs {bs}");
+            let bitmap = fs.read_allocation_bitmap_for_fsck().unwrap();
+            let old_total = ((old_mib << 20) / bs as u64) as u32;
+            for b in alt_vh_blocks(old_total, bs) {
+                assert!(
+                    !bitmap_test_bit_be(&bitmap, b),
+                    "bs {bs}: old tail block {b} still marked"
+                );
+            }
+            for b in alt_vh_blocks(total, bs) {
+                assert!(
+                    bitmap_test_bit_be(&bitmap, b),
+                    "bs {bs}: new tail block {b} is free"
+                );
+            }
+            let used = (0..total)
+                .filter(|&b| bitmap_test_bit_be(&bitmap, b))
+                .count() as u32;
+            assert_eq!(fs.vh.free_blocks, total - used, "bs {bs}");
+            assert!(
+                fs.vh.allocation_file.total_blocks as u64 * bs as u64 * 8 >= total as u64,
+                "bs {bs}: allocation file too small for {total} blocks"
+            );
+            let report = fs.fsck().unwrap().unwrap();
+            assert!(
+                report.errors.is_empty(),
+                "bs {bs}: {:?}",
+                report
+                    .errors
+                    .iter()
+                    .map(|e| &e.message)
+                    .take(4)
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]
