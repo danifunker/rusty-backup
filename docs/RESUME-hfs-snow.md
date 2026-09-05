@@ -181,4 +181,7 @@ Status: sections 0-2 done 2026-09-05. Snow is scripted:
 `scripts/snow/dfa-*.pbm`). Disk First Aid passes H1-hfs, H7-hfs and, after
 F-011 shipped the run-list allocator, H3-hfs before and after the delete;
 it declines MFS, so H6 is judged by the Finder copy + TeachText. Evidence in
-`docs/evidence/`. Next: section 3 (a fork a real Mac fragmented).
+`docs/evidence/`. Section 3 done too: `verify-hfs-snow.sh h3-real` lets the
+System 7.1 Finder copy a 1 MB file onto the rb-cli-fragmented H3 volume
+(Mac OS writes 5 overflow records), `rb-cli rm` deletes it, both judges
+pass before and after. Next: section 4 (classic HFS must fill its partition).

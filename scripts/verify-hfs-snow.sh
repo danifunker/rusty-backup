@@ -14,6 +14,7 @@
 #                                                      # the Finder copies every root file of a floppy to the boot disk
 #   bash scripts/verify-hfs-snow.sh open DISK.hda NAME... -o OUT
 #                                                      # Find + Open: TeachText shows the named files
+#   bash scripts/verify-hfs-snow.sh h3-real -w DIR     # the Finder fragments a fork on h3-hfs.img; rb-cli rm; both judges
 #   bash scripts/verify-hfs-snow.sh wrap VOL.img OUT.hda [SIZE]
 #                                                      # bare HFS volume -> APM disk with an Apple SCSI driver
 #
@@ -249,6 +250,68 @@ cmd_open() {
     log "opened ${names[*]} from $(basename "$disk"); TeachText frames: the snapshots ~2.7 G after each Find, and $out/run/final.png"
 }
 
+# Leaf record count of a classic HFS extents-overflow tree at byte OFFSET of IMG.
+xt_leaf_records_at() {
+    python3 - "$1" "$2" <<'EOF'
+import struct, sys
+f = open(sys.argv[1], 'rb'); base = int(sys.argv[2]); f.seek(base + 1024); hdr = f.read(512)
+albs = struct.unpack('>I', hdr[0x14:0x18])[0]; alst = struct.unpack('>H', hdr[0x1c:0x1e])[0]
+start = struct.unpack('>H', hdr[0x86:0x88])[0]
+f.seek(base + alst * 512 + start * albs); node = f.read(512)
+print(struct.unpack('>I', node[20:24])[0])
+EOF
+}
+# fsck_hfs -n on the volume `wrap` put at LBA 2048 of DISK.hda; prints its last line.
+fsck_hfs_wrapped() {
+    local disk=$1 vol=$2 tmp dev line
+    tmp="${disk%.hda}-vol.img"
+    dd if="$disk" of="$tmp" bs=512 skip=2048 count=$(( $(stat -f %z "$vol") / 512 )) 2>/dev/null
+    dev=$(hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "$tmp" | awk 'NR==1{print $1}')
+    line=$(fsck_hfs -n "${dev/disk/rdisk}" 2>&1 | tail -1)
+    hdiutil detach "$dev" >/dev/null 2>&1
+    rm -f "$tmp"
+    echo "$line"
+}
+
+# h3-real -w DIR: Mac OS itself fragments a fork. The h3-hfs.img that
+# verify-fs-macos.sh -o H3-hfs leaves (every other 64 KiB file deleted) goes
+# in over SCSI, the Finder copies a 1 MB file onto it, so System 7's File
+# Manager spreads that fork over the holes and writes the overflow records;
+# then rb-cli rm removes the file and both judges look before and after.
+cmd_h3_real() {
+    local work="" out
+    local OPTIND=1
+    while getopts "w:" opt; do case $opt in w) work=$OPTARG;; *) die "usage";; esac; done
+    [ -n "$work" ] || die "h3-real: -w DIR (the verify-fs-macos.sh work dir) required"
+    local img="$work/h3-hfs.img"; need "$img" "h3-hfs.img (run verify-fs-macos.sh -o H3-hfs first)"
+    out="$work/snow/h3-real"; rm -rf "$out"; mkdir -p "$out"
+    cmd_wrap "$img" "$out/disk.hda"
+    make_boot "$out/boot.hda" 0 || die "boot disk"
+    head -c 1000000 /dev/urandom > "$out/big.bin"
+    { "$RB" mkdir "$out/boot.hda" /Frag && "$RB" put "$out/boot.hda" "$out/big.bin" /Frag/big.bin; } >/dev/null 2>&1 || die "put big.bin on the boot disk"
+    # Find the Frag folder and open it (its one icon lands at 38,95), then drag
+    # that icon onto the second disk's desktop icon (600,105); the copy takes ~2 G.
+    local keys="2600000000:cmd-f;2900000000:type@frag;3300000000:return;3800000000:cmd-o;4300000000:drag@38,95,600,105"
+    harness "$out/copy" "$out/boot.hda" 7500000000 "$keys" --disk2 "$out/disk.hda"
+    "$RB" ls "$out/disk.hda@1" 2>/dev/null | grep -q "big.bin" || die "the Finder did not copy big.bin (see $out/copy/final.png)"
+    local ok=1 before after f1 f2
+    before=$(xt_leaf_records_at "$out/disk.hda" 1048576)
+    [ "$before" -gt 0 ] || { log "  Mac OS wrote no overflow records; the copy did not fragment"; ok=0; }
+    f1=$(fsck_hfs_wrapped "$out/disk.hda" "$img")
+    cp "$out/disk.hda" "$out/disk-before.hda"
+    "$RB" rm "$out/disk.hda@1" big.bin >/dev/null 2>&1 || { log "  rb-cli rm failed"; ok=0; }
+    after=$(xt_leaf_records_at "$out/disk.hda" 1048576)
+    [ "$after" -eq 0 ] || ok=0
+    f2=$(fsck_hfs_wrapped "$out/disk.hda" "$img")
+    log "  overflow records written by Mac OS: $before, after rb-cli rm: $after"
+    log "  fsck_hfs before: $f1"; log "  fsck_hfs after:  $f2"
+    echo "$f1$f2" | grep -q "OK.*OK" || ok=0
+    cmd_dfa "$out/disk-before.hda" -i 0 -o "$out/dfa-before" || ok=0
+    cmd_dfa "$out/disk.hda" -i 0 -o "$out/dfa-after" || ok=0
+    [ $ok = 1 ] && log "H3-real PASS" || log "H3-real FAIL"
+    [ $ok = 1 ]
+}
+
 # leg3 -w DIR: the classic-HFS and MFS volumes verify-fs-macos.sh -w DIR built.
 cmd_leg3() {
     local work=""
@@ -269,6 +332,9 @@ cmd_leg3() {
         cmd_wrap "$img" "$snow/h3-$stage.hda"
         cmd_dfa "$snow/h3-$stage.hda" -i 0 -o "$snow/h3-$stage" && results+=("H3-hfs $stage delete PASS") || results+=("H3-hfs $stage delete FAIL")
     done
+    if [ -f "$work/h3-hfs.img" ]; then
+        cmd_h3_real -w "$work" && results+=("H3-real PASS") || results+=("H3-real FAIL")
+    fi
     if [ -f "$work/h7-hfs.img" ]; then
         cp "$work/h7-hfs.img" "$snow/h7.hda"
         "$RB" mac-scsi-bless "$snow/h7.hda" --driver-from "$DRIVER_HDA" >/dev/null || die "mac-scsi-bless h7"
@@ -291,6 +357,7 @@ case "${1:-}" in
     finder-copy) shift; cmd_finder_copy "$@" ;;
     open) shift; cmd_open "$@" ;;
     leg3) shift; cmd_leg3 "$@" ;;
+    h3-real) shift; cmd_h3_real "$@" ;;
     crop) shift; crop_pbm "$@" ;;
     verdict) shift; dfa_verdict "$@" ;;
     *) sed -n '2,20p' "$0"; exit 2 ;;

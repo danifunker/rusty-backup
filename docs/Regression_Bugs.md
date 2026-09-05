@@ -306,7 +306,13 @@ first allocation block, so a 24 MiB volume formatted at 512-byte blocks
 has exactly 24 MiB of bits and cannot grow at all. The fix for that case
 is to format the volume at the partition size. Editing such a volume in
 place still writes the alternate MDB where Mac OS looks (H7), which is
-right but not sufficient; `fsck` does not yet report the size mismatch.
+right but not sufficient.
+ `rb-cli resize IMG@N --size` does
+reach `resize_hfs_in_place` and grows the volume when its bitmap has room;
+when it has not, the refusal now says how far the volume can grow and that
+one formatted at the partition size is the fix. An editable open of a
+classic HFS volume smaller than its partition logs one warning naming
+`resize`.
 
 ### R-059 — an in-place classic HFS grow runs the allocation area over the alternate MDB {#r-059}
 
@@ -341,6 +347,7 @@ PNGs under `docs/evidence/`.
 |----|-----|-------|--------|--------|
 | H1 / H2 / H4 / H9 / H11 | ee07cf4, B-tree index consistency, first-child descent, bounds, clamped dates | 1500 files imported, 200 deleted from the middle and re-added; `fsck_hfs -n`; every file read back through the kernel HFS+ driver (classic HFS through `rb-cli get`, since macOS no longer mounts it) | HFS+: run 1 `Invalid index key (4, 57)`, which found R-054; **PASS** (run 2), 1500 of 1500 identical. HFS: **PASS** (run 1) | HFS: **PASS**, "The volume H1hfs appears to be OK." (`docs/evidence/dfa-h1-hfs.png`); the Finder finds and TeachText opens f0550.txt (a re-added file) and f1500.txt (`docs/evidence/finder-h1-f1500.png`). HFS+: out of scope |
 | H3 | 67ab9f2, deleting a spilled resource fork frees the overflow extents | 8 MiB volume filled, every other file removed, a 1 MB resource fork spread over the holes (one overflow record), `rb-cli rm`, `fsck_hfs -n` before and after | HFS+: run 1 clean before and `Invalid node structure (3, 1)` after, which found R-055; run 2 `Unused node is not erased`, same fix; **PASS** (run 3), overflow records 1 -> 0. HFS: run 1 **not reproducible**, the writer allocated a fork contiguously and refused the fragmented one (F-011, shipped 2026-09-05); **PASS** (run 2) before and after, overflow records 5 -> 0 | HFS: **PASS** before and after the delete, "The volume H3hfs appears to be OK." both times (`docs/evidence/dfa-h3-hfs-before.png`, `dfa-h3-hfs-after.png`). HFS+: out of scope |
+| H3-real | 67ab9f2 again, against a fork a real Mac fragmented | the H3 classic-HFS volume (63 holes of 64 KiB) over SCSI; the System 7.1 Finder copies a 1 MB file onto it, so Mac OS's own File Manager spreads the fork and writes the overflow records; `rb-cli rm` deletes it; `fsck_hfs -n` and Disk First Aid before and after (`scripts/verify-hfs-snow.sh h3-real`) | **PASS**: Mac OS wrote 5 overflow records, 0 after the delete, "appears to be OK" before and after | **PASS** before and after (`docs/evidence/dfa-h3-real-before.png`, `dfa-h3-real-after.png`; the copy in `finder-h3-real-copy.png`) |
 | H5 | 3a53254, key order across leaves and index separators | `rb-cli fsck` on the H1 / H3 volumes and on an `hdiutil create` HFS+ volume that macOS filled with 1500 files and 200 replacements | **PASS**: no "keys out of order" anywhere; the macOS-made volume checks clean at 1503 files / 4 dirs | out of scope (HFS+) |
 | H6 | a1f7558, MFS fork lengths in whole allocation blocks | `new floppy mfs`, three files put, one removed, one added, `rb-cli fsck` | image built and clean by our own fsck (macOS cannot mount MFS; see the next column) | Disk First Aid declines MFS: "This is not an HFS disk." (`docs/evidence/dfa-h6-mfs.png`), so the check is the Finder: it mounts the floppy, copies all three root files to the boot disk byte-identical with `rb-cli get` (`docs/evidence/finder-h6-copy.png`), and TeachText opens f0001.txt. **PASS** |
 | H7 | 9cb5383, alternate header at the partition end | a volume poured into a larger APM partition, edited with `put`, then grown; `fsck_hfs -n` on the slice | HFS+: run 1 `Volume header needs minor repair` before the grow (R-057) and bitmap orphaned / under-allocation after it (R-056); **PASS** (run 3) before and after. HFS: run 1 `Invalid allocation block start` (R-058, R-059); **PASS** (run 2) with a volume whose bitmap has room, which the fill grows to the partition | HFS: **PASS** on the APM disk once `mac-scsi-bless` gave it a driver, "The volume H7hfs appears to be OK." (`docs/evidence/dfa-h7-hfs.png`); the unformatted second partition draws "This is not a Macintosh disk", cancelled by the script. HFS+: out of scope |
