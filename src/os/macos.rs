@@ -75,7 +75,7 @@ const F_NOCACHE: libc::c_int = 48;
 
 /// Re-enable the buffer cache on a previously-opened raw device fd.
 ///
-/// `open_device_for_inspect` and friends set `F_NOCACHE` so backup/restore
+/// `open_source_for_reading` and friends set `F_NOCACHE` so backup/restore
 /// linear passes don't pollute the page cache. For B-tree-style filesystems
 /// (HFS+ on heavily-used volumes) the catalog is read in many small chunks
 /// scattered across the disk, and `F_NOCACHE` makes every read a synchronous
@@ -1448,50 +1448,6 @@ fn bsd_name_from_path(path: &Path) -> &str {
         stripped
     } else {
         path_str
-    }
-}
-
-/// Open a device for read-only inspection without unmounting or claiming.
-///
-/// Used by the Inspect tab, which runs on the GUI thread and cannot afford
-/// the DA unmount/claim latency. Since inspect is non-destructive, exclusive
-/// access is not required.
-///
-/// Tries a direct `O_RDONLY` open first; on `EPERM` or `EACCES`, escalates
-/// via `authopen` so the user is prompted for administrator credentials once.
-pub(crate) fn open_device_for_inspect(path: &Path) -> Result<File> {
-    let path_str = path.to_string_lossy();
-    let is_device = path_str.starts_with("/dev/disk") || path_str.starts_with("/dev/rdisk");
-
-    if is_device {
-        let raw_device = if path_str.starts_with("/dev/disk") {
-            format!("/dev/r{}", &path_str[5..])
-        } else {
-            path_str.to_string()
-        };
-
-        let c_path = CString::new(raw_device.as_str()).context("invalid device path")?;
-        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY) };
-        if fd >= 0 {
-            unsafe { libc::fcntl(fd, F_NOCACHE, 1) };
-            return Ok(unsafe { File::from_raw_fd(fd) });
-        }
-
-        let err = std::io::Error::last_os_error();
-        // The unprivileged open failed. Escalate via authopen (the native admin
-        // prompt, opening as root) for ANY errno — not just EPERM/EACCES. A
-        // still-mounted or DiskArbitration-claimed disk returns EBUSY here,
-        // which the old EPERM/EACCES-only gate let fall straight through to the
-        // error below with no prompt at all (the reported symptom). Inspect is
-        // read-only, so request O_RDONLY: root can open a mounted disk's raw
-        // device read-only even when an O_RDWR open would be refused with EBUSY.
-        // (Device *writes* go through open_target_for_writing, which unmounts
-        // and opens O_RDWR separately.)
-        log::warn!("direct open of {raw_device} failed ({err}); escalating via authopen");
-        authopen_device(&raw_device, libc::O_RDONLY)
-            .with_context(|| format!("cannot open {raw_device} for reading"))
-    } else {
-        File::open(path).with_context(|| format!("cannot open {}", path.display()))
     }
 }
 

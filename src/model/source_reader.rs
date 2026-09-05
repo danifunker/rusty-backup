@@ -1301,6 +1301,11 @@ pub fn open_peeled_read_with_entry(
         return Ok(Box::new(std::io::Cursor::new(image)));
     }
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    // A raw device is never a container, cannot answer seek(End) and, on macOS,
+    // takes only sector-sized reads: a plain BufReader gave inspect 0 bytes (R19).
+    if crate::cli::device_safety::looks_like_device_path(path) {
+        return Ok(Box::new(crate::os::known_len_reader(file, path)));
+    }
     match detect_image_format_with_path(file, Some(path)) {
         Ok(format) if !matches!(format, ImageFormat::Raw) => {
             let file2 = File::open(path).with_context(|| format!("open {}", path.display()))?;

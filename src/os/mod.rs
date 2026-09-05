@@ -85,10 +85,11 @@ impl<R: Seek> Seek for KnownLen<R> {
     }
 }
 
-/// Wrap a source so `SeekFrom::End` works even when the OS will not report a device's length.
-pub fn known_len_reader(file: File, path: &Path) -> KnownLen<File> {
+/// Wrap a raw source so `SeekFrom::End` works even when the OS will not report a
+/// device's length, and every read reaches the device sector-sized (R19).
+pub fn known_len_reader(file: File, path: &Path) -> SectorAlignedReader<KnownLen<File>> {
     let len = get_file_size(&file, path).unwrap_or(0);
-    KnownLen::new(file, len)
+    SectorAlignedReader::new(KnownLen::new(file, len))
 }
 
 /// [`known_len_reader`] for an elevated handle, which on macOS may be a shared
@@ -242,6 +243,9 @@ pub struct SectorAlignedReader<R> {
     buf_sector_start: u64,
     /// Number of valid bytes in `buf` (may be < SECTOR_SIZE at EOF).
     buf_valid: usize,
+    /// Largest read the device has accepted; one sector once a bigger read
+    /// failed and its first sector alone read fine (R19).
+    max_read: usize,
 }
 
 impl<R: Read + Seek> SectorAlignedReader<R> {
@@ -252,6 +256,29 @@ impl<R: Read + Seek> SectorAlignedReader<R> {
             buf: [0u8; SECTOR_SIZE],
             buf_sector_start: u64::MAX, // invalid — forces first read to fill
             buf_valid: 0,
+            max_read: usize::MAX,
+        }
+    }
+
+    /// A multi-sector read the device refused, retried one sector at a time.
+    ///
+    /// A USB floppy drive serves 512-byte reads and fails larger ones with
+    /// EIO; a bad sector fails both ways and keeps its original error.
+    fn read_after_refusal(&mut self, out: &mut [u8], refusal: io::Error) -> io::Result<usize> {
+        self.inner.seek(SeekFrom::Start(self.pos))?;
+        match self.inner.read(&mut out[..SECTOR_SIZE]) {
+            Ok(n) => {
+                if self.max_read != SECTOR_SIZE {
+                    log::warn!(
+                        "a {}-byte read failed ({refusal}) but one sector reads fine; \
+                         continuing one sector at a time",
+                        out.len()
+                    );
+                    self.max_read = SECTOR_SIZE;
+                }
+                Ok(n)
+            }
+            Err(_) => Err(refusal),
         }
     }
 
@@ -291,9 +318,14 @@ impl<R: Read + Seek> Read for SectorAlignedReader<R> {
         // (e.g. HFS+ catalog at ~200 MB) into hundreds of thousands of
         // per-sector syscalls on `/dev/rdisk*`.
         if self.pos.is_multiple_of(SECTOR_SIZE as u64) && out.len() >= SECTOR_SIZE {
-            let aligned_len = out.len() - (out.len() % SECTOR_SIZE);
+            let aligned_len = (out.len() - (out.len() % SECTOR_SIZE)).min(self.max_read);
             self.inner.seek(SeekFrom::Start(self.pos))?;
-            let n = self.inner.read(&mut out[..aligned_len])?;
+            let n = match self.inner.read(&mut out[..aligned_len]) {
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => return Err(e),
+                Err(e) if aligned_len > SECTOR_SIZE => self.read_after_refusal(out, e)?,
+                Err(e) => return Err(e),
+            };
             // The kernel may return a short read; only the part that landed
             // on a sector boundary is safe to surface to the caller. Round
             // down so the next call still starts sector-aligned.
@@ -834,25 +866,6 @@ pub(crate) fn device_open_error(path: &Path, e: std::io::Error) -> anyhow::Error
     anyhow::Error::new(e).context(format!("cannot open {}", path.display()))
 }
 
-/// Open a file or device for read-only inspection.
-///
-/// On macOS, if a `/dev/disk*` path returns permission denied, this will
-/// prompt the user for administrator credentials via the native macOS
-/// authentication dialog. Unlike [`open_source_for_reading`], this does NOT
-/// unmount or claim the device, making it safe to call from the GUI thread.
-///
-/// On other platforms, opens the file normally.
-pub fn open_for_inspect(path: &Path) -> Result<File> {
-    #[cfg(target_os = "macos")]
-    {
-        macos::open_device_for_inspect(path)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        File::open(path).map_err(|e| device_open_error(path, e))
-    }
-}
-
 /// Open a target device or image file for writing (restore).
 ///
 /// For regular files (`.img`): creates/truncates the file.
@@ -1182,6 +1195,100 @@ mod tests {
     use std::fs::OpenOptions;
     // Read/Seek/SeekFrom/Write come in via the parent module's
     // `use std::io::{self, Read, Seek, SeekFrom, Write}` at the top of the file.
+
+    /// A device that fails any read larger than `limit` with EIO, the way a
+    /// USB floppy drive does, and fails `bad_sector` at any size (R19).
+    struct SmallTransfers {
+        data: Vec<u8>,
+        pos: u64,
+        limit: usize,
+        bad_sector: Option<u64>,
+    }
+
+    impl SmallTransfers {
+        fn new(len: usize, limit: usize, bad_sector: Option<u64>) -> Self {
+            let data = (0..len).map(|i| (i / 7) as u8).collect();
+            Self {
+                data,
+                pos: 0,
+                limit,
+                bad_sector,
+            }
+        }
+    }
+
+    impl Read for SmallTransfers {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if buf.len() > self.limit {
+                return Err(crate::compat::io_other("Input/output error"));
+            }
+            let start = self.pos as usize;
+            let end = (start + buf.len()).min(self.data.len());
+            if let Some(bad) = self.bad_sector {
+                let first = start as u64 / SECTOR_SIZE as u64;
+                let last = (end.max(start + 1) - 1) as u64 / SECTOR_SIZE as u64;
+                if (first..=last).contains(&bad) {
+                    return Err(crate::compat::io_other("Input/output error"));
+                }
+            }
+            buf[..end - start].copy_from_slice(&self.data[start..end]);
+            self.pos = end as u64;
+            Ok(end - start)
+        }
+    }
+
+    impl Seek for SmallTransfers {
+        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+            self.pos = match pos {
+                SeekFrom::Start(n) => n,
+                SeekFrom::End(n) => (self.data.len() as i64 + n) as u64,
+                SeekFrom::Current(n) => (self.pos as i64 + n) as u64,
+            };
+            Ok(self.pos)
+        }
+    }
+
+    #[test]
+    fn a_read_the_device_refuses_falls_back_to_one_sector_at_a_time() {
+        // R19: the floppy served dd's 512-byte reads and failed ours.
+        let device = SmallTransfers::new(8192, SECTOR_SIZE, None);
+        let mut reader = SectorAlignedReader::new(device);
+        let mut out = vec![0u8; 4096];
+        reader.read_exact(&mut out).expect("falls back to sectors");
+        assert_eq!(out, reader.inner.data[..4096]);
+        assert_eq!(reader.max_read, SECTOR_SIZE, "remembers the device's limit");
+        // And stays there: the next large read never trips the device again.
+        reader.read_exact(&mut out).expect("second read");
+        assert_eq!(out, reader.inner.data[4096..8192]);
+    }
+
+    #[test]
+    fn a_healthy_device_keeps_its_large_reads() {
+        let device = SmallTransfers::new(8192, usize::MAX, None);
+        let mut reader = SectorAlignedReader::new(device);
+        let mut out = vec![0u8; 4096];
+        reader.read_exact(&mut out).unwrap();
+        assert_eq!(reader.max_read, usize::MAX);
+    }
+
+    #[test]
+    fn a_bad_sector_keeps_its_error_instead_of_a_downshift() {
+        // The first sector of the request is the bad one: the retry fails too,
+        // the original error comes back and the limit is left alone.
+        let device = SmallTransfers::new(8192, usize::MAX, Some(0));
+        let mut reader = SectorAlignedReader::new(device);
+        let mut out = vec![0u8; 4096];
+        assert!(reader.read_exact(&mut out).is_err());
+        assert_eq!(reader.max_read, usize::MAX);
+
+        // A bad sector further in: the downshift happens, then the per-sector
+        // reads surface the error at exactly that sector.
+        let device = SmallTransfers::new(8192, usize::MAX, Some(3));
+        let mut reader = SectorAlignedReader::new(device);
+        let mut out = vec![0u8; 4096];
+        assert!(reader.read_exact(&mut out).is_err());
+        assert_eq!(reader.stream_position().unwrap(), 3 * SECTOR_SIZE as u64);
+    }
 
     /// Regression: `SectorAlignedWriter::new` must start writing at the current
     /// cursor (offset 0 for a fresh handle), NOT at `metadata().len()`. The
