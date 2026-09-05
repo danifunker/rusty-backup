@@ -1,0 +1,1046 @@
+# Tier 3 — the thousand-file churn, on every filesystem that can hold it.
+#
+# One directory takes 1000 files; then one more file goes in and comes out;
+# then the 1000 go; then one more goes in. Every step ends with a clean fsck.
+# The point is the directory / B-tree / inode machinery under a full cycle:
+# node splits on the way up, merges, retired leaves and reused inodes on the
+# way down, and a first insert into a tree that has emptied. On classic HFS
+# this is what found R-060 (a catalog that could not take a 94th file).
+#
+# `{cases}/tier3/tree1000.tar.gz` is committed: `d/f0001.txt` .. `d/f1000.txt`,
+# each a one-line text file, so the cases run on a bare clone. `untar` puts
+# them in; a glob `rm` takes them out again in one process.
+#
+# The files live in a subdirectory because FAT12/16 and ProDOS cap their root
+# directories (512 and 51 entries); the others do not care. Classic HFS and
+# HFV get 64 MiB: their catalog is sized at format time (0.5 % of the volume,
+# hformat's rule) and rb-cli cannot grow it later (F-016), so a 16 MiB volume
+# stops at about 600 files.
+#
+# The same churn with an operating system taking the middle turn (add one,
+# delete it, delete the thousand) lives outside this harness, because it needs
+# a Mac: `scripts/verify-fs-macos.sh -o H12-hfsplus` (macOS's kernel driver)
+# and `scripts/verify-hfs-snow.sh os-churn` (System 7.1's Finder).
+#
+# Not here: Apple DOS 3.3 (105 catalog entries), CP/M (a fixed directory),
+# MFS (a floppy), CBM and Atari DOS (144 / 64 entries), SquashFS (edits are
+# rebuilds), Human68k and exFAT (no `new volume` builder; exFAT runs on its
+# mandatory fixture at the end).
+
+[meta]
+tier = 3
+group = "churn"
+description = "1000 files in, one in and out, 1000 out, one in; fsck clean after each step."
+
+# --- FAT12 (4 MiB) ------------------------------------------------------------
+
+[[case]]
+id = "churn.fat12"
+description = "FAT12: 1000 files churn in a subdirectory, fsck clean throughout"
+[[case.step]]
+args = ["new", "volume", "fat", "--size", "4M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["untar", "{scratch}/v.img", "{cases}/tier3/tree1000.tar.gz"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/d/extra.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{scratch}/v.img", "/d/extra.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{scratch}/v.img", "/d/f*.txt"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/d/last.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{scratch}/v.img", "/d"]
+expect_exit = 0
+stdout_contains = ["last.bin"]
+stdout_not_contains = ["f0001.txt", "f1000.txt", "extra.bin"]
+
+[[case]]
+id = "churn.fat16"
+description = "FAT16: 1000 files churn in a subdirectory, fsck clean throughout"
+[[case.step]]
+args = ["new", "volume", "fat", "--size", "16M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["untar", "{scratch}/v.img", "{cases}/tier3/tree1000.tar.gz"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/d/extra.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{scratch}/v.img", "/d/extra.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{scratch}/v.img", "/d/f*.txt"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/d/last.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{scratch}/v.img", "/d"]
+expect_exit = 0
+stdout_contains = ["last.bin"]
+stdout_not_contains = ["f0001.txt", "f1000.txt", "extra.bin"]
+
+[[case]]
+id = "churn.ntfs"
+description = "NTFS: 1000 files churn in a subdirectory, fsck clean throughout"
+[[case.step]]
+args = ["new", "volume", "ntfs", "--size", "16M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["untar", "{scratch}/v.img", "{cases}/tier3/tree1000.tar.gz"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/d/extra.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{scratch}/v.img", "/d/extra.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{scratch}/v.img", "/d/f*.txt"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/d/last.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{scratch}/v.img", "/d"]
+expect_exit = 0
+stdout_contains = ["last.bin"]
+stdout_not_contains = ["f0001.txt", "f1000.txt", "extra.bin"]
+
+[[case]]
+id = "churn.hpfs"
+description = "HPFS: 1000 files churn in a subdirectory, fsck clean throughout"
+[[case.step]]
+args = ["new", "volume", "hpfs", "--size", "16M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["untar", "{scratch}/v.img", "{cases}/tier3/tree1000.tar.gz"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/d/extra.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{scratch}/v.img", "/d/extra.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{scratch}/v.img", "/d/f*.txt"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/d/last.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{scratch}/v.img", "/d"]
+expect_exit = 0
+stdout_contains = ["last.bin"]
+stdout_not_contains = ["f0001.txt", "f1000.txt", "extra.bin"]
+
+[[case]]
+id = "churn.ext2"
+description = "ext2: 1000 files churn in a subdirectory, fsck clean throughout"
+[[case.step]]
+args = ["new", "volume", "ext", "--size", "16M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["untar", "{scratch}/v.img", "{cases}/tier3/tree1000.tar.gz"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/d/extra.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{scratch}/v.img", "/d/extra.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{scratch}/v.img", "/d/f*.txt"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/d/last.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{scratch}/v.img", "/d"]
+expect_exit = 0
+stdout_contains = ["last.bin"]
+stdout_not_contains = ["f0001.txt", "f1000.txt", "extra.bin"]
+
+[[case]]
+id = "churn.ext3"
+description = "ext3: 1000 files churn in a subdirectory, fsck clean throughout"
+[[case.step]]
+args = ["new", "volume", "ext3", "--size", "16M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["untar", "{scratch}/v.img", "{cases}/tier3/tree1000.tar.gz"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/d/extra.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{scratch}/v.img", "/d/extra.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{scratch}/v.img", "/d/f*.txt"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/d/last.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{scratch}/v.img", "/d"]
+expect_exit = 0
+stdout_contains = ["last.bin"]
+stdout_not_contains = ["f0001.txt", "f1000.txt", "extra.bin"]
+
+[[case]]
+id = "churn.ext4"
+description = "ext4: 1000 files churn in a subdirectory, fsck clean throughout"
+[[case.step]]
+args = ["new", "volume", "ext4", "--size", "16M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["untar", "{scratch}/v.img", "{cases}/tier3/tree1000.tar.gz"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/d/extra.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{scratch}/v.img", "/d/extra.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{scratch}/v.img", "/d/f*.txt"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/d/last.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{scratch}/v.img", "/d"]
+expect_exit = 0
+stdout_contains = ["last.bin"]
+stdout_not_contains = ["f0001.txt", "f1000.txt", "extra.bin"]
+
+[[case]]
+id = "churn.hfs"
+description = "classic HFS: 1000 files churn in a subdirectory, fsck clean throughout"
+[[case.step]]
+args = ["new", "volume", "hfs", "--size", "64M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["untar", "{scratch}/v.img", "{cases}/tier3/tree1000.tar.gz"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/d/extra.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{scratch}/v.img", "/d/extra.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{scratch}/v.img", "/d/f*.txt"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/d/last.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{scratch}/v.img", "/d"]
+expect_exit = 0
+stdout_contains = ["last.bin"]
+stdout_not_contains = ["f0001.txt", "f1000.txt", "extra.bin"]
+
+[[case]]
+id = "churn.hfsplus"
+description = "HFS+: 1000 files churn in a subdirectory, fsck clean throughout"
+[[case.step]]
+args = ["new", "volume", "hfsplus", "--size", "16M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["untar", "{scratch}/v.img", "{cases}/tier3/tree1000.tar.gz"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/d/extra.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{scratch}/v.img", "/d/extra.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{scratch}/v.img", "/d/f*.txt"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/d/last.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{scratch}/v.img", "/d"]
+expect_exit = 0
+stdout_contains = ["last.bin"]
+stdout_not_contains = ["f0001.txt", "f1000.txt", "extra.bin"]
+
+[[case]]
+id = "churn.hfv"
+description = "BasiliskII HFV: 1000 files churn in a subdirectory, fsck clean throughout"
+[[case.step]]
+args = ["new", "volume", "hfv", "--size", "64M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["untar", "{scratch}/v.img", "{cases}/tier3/tree1000.tar.gz"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/d/extra.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{scratch}/v.img", "/d/extra.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{scratch}/v.img", "/d/f*.txt"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/d/last.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{scratch}/v.img", "/d"]
+expect_exit = 0
+stdout_contains = ["last.bin"]
+stdout_not_contains = ["f0001.txt", "f1000.txt", "extra.bin"]
+
+[[case]]
+id = "churn.affs"
+description = "Amiga FFS: 1000 files churn in a subdirectory, fsck clean throughout"
+[[case.step]]
+args = ["new", "volume", "affs", "--size", "16M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["untar", "{scratch}/v.img", "{cases}/tier3/tree1000.tar.gz"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/d/extra.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{scratch}/v.img", "/d/extra.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{scratch}/v.img", "/d/f*.txt"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/d/last.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{scratch}/v.img", "/d"]
+expect_exit = 0
+stdout_contains = ["last.bin"]
+stdout_not_contains = ["f0001.txt", "f1000.txt", "extra.bin"]
+
+[[case]]
+id = "churn.ofs"
+description = "BeOS OFS: 1000 files churn in a subdirectory, fsck clean throughout"
+[[case.step]]
+args = ["new", "volume", "ofs", "--size", "16M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["untar", "{scratch}/v.img", "{cases}/tier3/tree1000.tar.gz"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/d/extra.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{scratch}/v.img", "/d/extra.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{scratch}/v.img", "/d/f*.txt"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/d/last.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{scratch}/v.img", "/d"]
+expect_exit = 0
+stdout_contains = ["last.bin"]
+stdout_not_contains = ["f0001.txt", "f1000.txt", "extra.bin"]
+
+[[case]]
+id = "churn.pfs3"
+description = "PFS3: 1000 files churn in a subdirectory, fsck clean throughout"
+[[case.step]]
+args = ["new", "volume", "pfs3", "--size", "16M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["untar", "{scratch}/v.img", "{cases}/tier3/tree1000.tar.gz"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/d/extra.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{scratch}/v.img", "/d/extra.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{scratch}/v.img", "/d/f*.txt"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/d/last.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{scratch}/v.img", "/d"]
+expect_exit = 0
+stdout_contains = ["last.bin"]
+stdout_not_contains = ["f0001.txt", "f1000.txt", "extra.bin"]
+
+[[case]]
+id = "churn.sfs"
+description = "SFS: 1000 files churn in a subdirectory, fsck clean throughout"
+[[case.step]]
+args = ["new", "volume", "sfs", "--size", "16M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["untar", "{scratch}/v.img", "{cases}/tier3/tree1000.tar.gz"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/d/extra.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{scratch}/v.img", "/d/extra.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{scratch}/v.img", "/d/f*.txt"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/d/last.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{scratch}/v.img", "/d"]
+expect_exit = 0
+stdout_contains = ["last.bin"]
+stdout_not_contains = ["f0001.txt", "f1000.txt", "extra.bin"]
+
+[[case]]
+id = "churn.prodos"
+description = "ProDOS: 1000 files churn in a subdirectory, fsck clean throughout"
+[[case.step]]
+args = ["new", "volume", "prodos", "--size", "16M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["untar", "{scratch}/v.img", "{cases}/tier3/tree1000.tar.gz"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/d/extra.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{scratch}/v.img", "/d/extra.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{scratch}/v.img", "/d/f*.txt"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/d/last.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{scratch}/v.img", "/d"]
+expect_exit = 0
+stdout_contains = ["last.bin"]
+stdout_not_contains = ["f0001.txt", "f1000.txt", "extra.bin"]
+
+[[case]]
+id = "churn.efs"
+description = "IRIX EFS: 1000 files churn in a subdirectory, fsck clean throughout"
+[[case.step]]
+args = ["new", "volume", "efs", "--size", "16M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["untar", "{scratch}/v.img", "{cases}/tier3/tree1000.tar.gz"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/d/extra.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{scratch}/v.img", "/d/extra.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{scratch}/v.img", "/d/f*.txt"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/d/last.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{scratch}/v.img", "/d"]
+expect_exit = 0
+stdout_contains = ["last.bin"]
+stdout_not_contains = ["f0001.txt", "f1000.txt", "extra.bin"]
+
+[[case]]
+id = "churn.efs-v1"
+description = "EFS v1: 1000 files churn in a subdirectory, fsck clean throughout"
+[[case.step]]
+args = ["new", "volume", "efs-v1", "--size", "16M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["untar", "{scratch}/v.img", "{cases}/tier3/tree1000.tar.gz"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/d/extra.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{scratch}/v.img", "/d/extra.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{scratch}/v.img", "/d/f*.txt"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/d/last.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{scratch}/v.img", "/d"]
+expect_exit = 0
+stdout_contains = ["last.bin"]
+stdout_not_contains = ["f0001.txt", "f1000.txt", "extra.bin"]
+
+[[case]]
+id = "churn.xfs"
+description = "XFS: 1000 files churn in a subdirectory, fsck clean throughout"
+[[case.step]]
+args = ["new", "volume", "xfs", "--size", "32M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["untar", "{scratch}/v.img", "{cases}/tier3/tree1000.tar.gz"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/d/extra.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{scratch}/v.img", "/d/extra.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{scratch}/v.img", "/d/f*.txt"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/d/last.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{scratch}/v.img", "/d"]
+expect_exit = 0
+stdout_contains = ["last.bin"]
+stdout_not_contains = ["f0001.txt", "f1000.txt", "extra.bin"]
+
+[[case]]
+id = "churn.minix2"
+description = "Minix V2: 1000 files churn in a subdirectory, fsck clean throughout"
+[[case.step]]
+args = ["new", "volume", "minix2", "--size", "16M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["untar", "{scratch}/v.img", "{cases}/tier3/tree1000.tar.gz"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/d/extra.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{scratch}/v.img", "/d/extra.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{scratch}/v.img", "/d/f*.txt"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/d/last.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{scratch}/v.img", "/d"]
+expect_exit = 0
+stdout_contains = ["last.bin"]
+stdout_not_contains = ["f0001.txt", "f1000.txt", "extra.bin"]
+
+[[case]]
+id = "churn.minix3"
+description = "Minix V3: 1000 files churn in a subdirectory, fsck clean throughout"
+[[case.step]]
+args = ["new", "volume", "minix3", "--size", "16M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["untar", "{scratch}/v.img", "{cases}/tier3/tree1000.tar.gz"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/d/extra.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{scratch}/v.img", "/d/extra.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{scratch}/v.img", "/d/f*.txt"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/d/last.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{scratch}/v.img", "/d"]
+expect_exit = 0
+stdout_contains = ["last.bin"]
+stdout_not_contains = ["f0001.txt", "f1000.txt", "extra.bin"]
+
+[[case]]
+id = "churn.bfs"
+description = "BeOS BFS: 1000 files churn in a subdirectory, fsck clean throughout"
+[[case.step]]
+args = ["new", "volume", "bfs", "--size", "72M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["untar", "{scratch}/v.img", "{cases}/tier3/tree1000.tar.gz"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/d/extra.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{scratch}/v.img", "/d/extra.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{scratch}/v.img", "/d/f*.txt"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/d/last.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{scratch}/v.img", "/d"]
+expect_exit = 0
+stdout_contains = ["last.bin"]
+stdout_not_contains = ["f0001.txt", "f1000.txt", "extra.bin"]
+
+[[case]]
+id = "churn.ufs"
+description = "UFS1: 1000 files churn in a subdirectory, fsck clean throughout"
+[[case.step]]
+args = ["new", "volume", "ufs", "--size", "16M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["untar", "{scratch}/v.img", "{cases}/tier3/tree1000.tar.gz"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/d/extra.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{scratch}/v.img", "/d/extra.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{scratch}/v.img", "/d/f*.txt"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/d/last.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{scratch}/v.img", "/d"]
+expect_exit = 0
+stdout_contains = ["last.bin"]
+stdout_not_contains = ["f0001.txt", "f1000.txt", "extra.bin"]
+
+[[case]]
+id = "churn.ufs-43bsd"
+description = "UFS1 (4.3BSD / NeXT): 1000 files churn in a subdirectory, fsck clean throughout"
+[[case.step]]
+args = ["new", "volume", "ufs-43bsd", "--size", "16M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["untar", "{scratch}/v.img", "{cases}/tier3/tree1000.tar.gz"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/d/extra.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{scratch}/v.img", "/d/extra.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{scratch}/v.img", "/d/f*.txt"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/d/last.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{scratch}/v.img", "/d"]
+expect_exit = 0
+stdout_contains = ["last.bin"]
+stdout_not_contains = ["f0001.txt", "f1000.txt", "extra.bin"]
+
+[[case]]
+id = "churn.exfat"
+description = "exFAT (no builder; the mandatory base fixture): 1000 files churn, fsck clean throughout"
+fixture = "fs.exfat.base.hd"
+# The base fixture is 4 MiB, a thousand one-cluster files fill it at the
+# 961st; grow it in place first (the image is the whole volume).
+[[case.step]]
+args = ["resize", "{fixture_copy}", "--size", "32M"]
+expect_exit = 0
+[[case.step]]
+args = ["untar", "{fixture_copy}", "{cases}/tier3/tree1000.tar.gz"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{fixture_copy}", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{fixture_copy}", "{cases}/tier3/payload.bin", "/d/extra.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{fixture_copy}", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{fixture_copy}", "/d/extra.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{fixture_copy}", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{fixture_copy}", "/d/f*.txt"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{fixture_copy}", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{fixture_copy}", "{cases}/tier3/payload.bin", "/d/last.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{fixture_copy}", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{fixture_copy}", "/d"]
+expect_exit = 0
+stdout_contains = ["last.bin"]
+stdout_not_contains = ["f0001.txt", "f1000.txt", "extra.bin"]

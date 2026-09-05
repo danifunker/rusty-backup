@@ -62,3 +62,51 @@
 # The three `edit.new.*-dynamic-vhd` cases were listed here from 2026-08-25
 # until the fix landed; they assert the behaviour we wanted all along and now
 # pass. See docs/Regression_Bugs.md#r-043.
+
+# --- the 1000-file churn (cases/tier3/churn.toml), 2026-09-05 ----------------
+# Documented capacity gaps: the writer refuses, cleanly, before the thousand.
+[[known]]
+id = "churn.ntfs"
+finding = "F-012"
+note = "the directory index cannot grow past its resident root: the 79th file is refused"
+
+[[known]]
+id = "churn.ext4"
+finding = "F-013"
+note = "directory extent-tree splitting is unimplemented: refused at about the 816th file"
+
+[[known]]
+id = "churn.sfs"
+finding = "F-014"
+note = "the object-node tree never grows: refused at the 43rd file"
+
+[[known]]
+id = "churn.minix2"
+finding = "F-015"
+note = "directories stop at their direct zones: refused at the 223rd file"
+
+[[known]]
+id = "churn.minix3"
+finding = "F-015"
+note = "directories stop at their direct zones: refused at the 111th file"
+
+# Defects: the writer does not refuse, it corrupts or loses.
+[[known]]
+id = "churn.ufs"
+finding = "R-061"
+note = "the directory is corrupt once it outgrows its first 8 KiB block (the 401st file)"
+
+[[known]]
+id = "churn.ufs-43bsd"
+finding = "R-061"
+note = "same as churn.ufs, in the 4.3BSD on-disk format"
+
+[[known]]
+id = "churn.prodos"
+finding = "R-062"
+note = "rm /d/extra.bin cannot find the EXTRA.BIN that put just wrote: paths are matched case-sensitively"
+
+[[known]]
+id = "churn.xfs"
+finding = "R-063"
+note = "after 1000 files the directory lists one entry and fsck reports 999 orphaned inodes"

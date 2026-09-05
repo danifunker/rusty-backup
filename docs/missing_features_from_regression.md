@@ -22,6 +22,11 @@ concrete reason to.
 | ~~F-009~~ | ~~SFS editor writes single-leaf extent b-trees only~~ — **SHIPPED** 2026-08-17 | `src/fs/sfs.rs` | — |
 | ~~F-004~~ | ~~`show partmap` is APM-only~~ — **SHIPPED** 2026-08-08, same gap as R-026 | `src/cli/verbs/show.rs` | — |
 | [F-010](#f-010) | A file-aware Ghost image exposes only its FAT record stream; an NTFS partition behind it is unreachable | `src/rbformats/gho.rs` | D13's Windows check (a real multi-partition `.GHO` with long names) |
+| [F-012](#f-012) | An NTFS directory cannot grow past its resident index root: the 79th file in a directory is refused | `src/fs/ntfs.rs` | the 1000-file churn (`churn.ntfs`) |
+| [F-013](#f-013) | An ext4 directory whose extent tree must split cannot take more files (about 800 in one directory) | `src/fs/ext.rs` | the 1000-file churn (`churn.ext4`) |
+| [F-014](#f-014) | An SFS volume takes about 43 files: the object-node tree never grows | `src/fs/sfs.rs` | the 1000-file churn (`churn.sfs`) |
+| [F-015](#f-015) | A Minix directory stops at its direct blocks (about 110 V3 / 220 V2 files) | `src/fs/minix.rs` | the 1000-file churn (`churn.minix2`, `churn.minix3`) |
+| [F-016](#f-016) | A classic HFS catalog is sized at format time (0.5 % of the volume) and never grows, so a 16 MiB volume stops at about 600 files | `src/fs/hfs.rs` | the 1000-file churn (`churn.hfs` runs at 64 MiB) |
 | ~~[F-011](#f-011)~~ | **SHIPPED 2026-09-05.** ~~The classic HFS writer allocates a fork as one contiguous run; a fragmented volume reports disk full with room to spare~~ | `src/fs/hfs.rs` | H3's classic-HFS check: a resource fork spilled into the extents-overflow file by rb-cli, clean under `fsck_hfs -n` and Disk First Aid before and after the delete |
 
 ---
@@ -650,4 +655,47 @@ insert the rest as overflow records through the same
 volume fills up early, and H3 on classic HFS stays covered by the unit
 test `delete_frees_overflow_extents_and_their_records`, whose overflow
 record is written by hand.
+## F-012 — an NTFS directory cannot grow past its resident index root {#f-012}
 
+Found 2026-09-05 by the 1000-file churn (`regression-tests/cases/tier3/churn.toml`,
+`churn.ntfs`): the 79th `create_file` in one directory fails with
+`disk full: directory index root is full; cannot grow this directory
+further`. The writer fills the `$INDEX_ROOT` attribute and has no path to
+create an `$INDEX_ALLOCATION` + `$BITMAP` pair and move the entries into
+index blocks, which is what Windows does at that point. Reading such
+directories works. Until then a directory holds ~78 short-named files.
+
+## F-013 — an ext4 directory cannot split its extent tree {#f-013}
+
+Found by `churn.ext4`: the 816th file fails with `ext4: extent tree
+splitting not yet supported for editing`. The directory inode's inline
+extent header (four extents) is exhausted once the directory outgrows the
+blocks those extents can describe; growing the tree into an index block is
+unimplemented. ext2 / ext3 (block-mapped directories) take the full
+thousand.
+
+## F-014 — an SFS volume takes about 43 files {#f-014}
+
+Found by `churn.sfs`: the 43rd file fails with `SFS: every object-node leaf
+is full, and growing the node tree is not implemented`. Known since the SFS
+editor shipped (CLAUDE.md, "Amiga support"); the churn puts a number on it.
+
+## F-015 — a Minix directory stops at its direct blocks {#f-015}
+
+Found by `churn.minix2` / `churn.minix3`: `Minix directory too large
+(indirect directory growth unsupported)` at the 223rd (V2) / 111th (V3)
+file. Directory data past the inode's seven direct zones needs the single
+indirect zone, which the writer does not allocate for directories.
+
+## F-016 — a classic HFS catalog never grows {#f-016}
+
+Found by `churn.hfs` at 16 MiB: `no free B-tree nodes` at the 570th file.
+`new volume hfs` sizes the catalog like hformat does, 0.5 % of the volume
+(after R-060 every blank-volume path does), and Mac OS extends the catalog
+file on demand when that runs out; rb-cli has no catalog-grow path for
+classic HFS, so the volume's file count is fixed at format time (roughly
+four records per 512-byte node: ~600 files at 16 MiB, ~2400 at 64 MiB).
+What it would take: allocate more blocks for CNID 4 (inline extents, then
+records in the extents-overflow tree), extend the header node's node count
+and map, and rewrite drCTFlSize / drCTExtRec; the HFS+ `grow_btree_fork`
+is the model.

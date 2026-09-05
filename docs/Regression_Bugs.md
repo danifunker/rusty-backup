@@ -1,4 +1,4 @@
-# Regression Findings (R-001 … R-060)
+# Regression Findings (R-001 … R-063)
 
 Defects and documentation drift turned up while building the regression suite
 (`regression-tests/`), 2026-08-01/02. The suite work was deliberately kept
@@ -19,6 +19,9 @@ finding depends on a fixture, the fixture is named.
 
 | ID | Severity | Area | Finding |
 |----|----------|------|---------|
+| R-063 | **High** | `src/fs/xfs/` | After 1000 files in one XFS directory, `fsck` reports 999 inodes allocated but unreachable from the root and `ls` of that directory lists one file: the directory's leaf / node form is written or read wrongly | found by the 1000-file churn (`churn.xfs`), 2026-09-05 |
+| R-062 | Medium | `src/fs/prodos.rs` | ProDOS path lookup is case-sensitive while ProDOS itself is not: `rm /d/extra.bin` cannot find the `EXTRA.BIN` that `put /d/extra.bin` just created | found by the 1000-file churn (`churn.prodos`), 2026-09-05 |
+| R-061 | **High** | `src/fs/ufs.rs` | A UFS directory that grows past its first 8 KiB block is corrupt: the 401st file fails with `corrupt d_reclen 0 at off 8192` and the directory cannot be listed afterwards | found by the 1000-file churn (`churn.ufs`, `churn.ufs-43bsd`), 2026-09-05 |
 | ~~R-060~~ | ~~**High**~~ **FIXED** | `src/fs/hfs.rs` | ~~A blank classic HFS volume built with the default B-tree sizes (`rb-cli batch` format, `create_blank_hfs`) gets a four-block catalog whatever its size, and refuses its 94th file at 4 KiB blocks: rb-cli cannot grow a classic catalog~~ — a zero request now takes the volume-scaled hformat sizing `new volume hfs` already used, 2026-09-05 |
 | ~~R-059~~ | ~~**High**~~ **FIXED** | `src/fs/hfs.rs` | ~~An in-place classic HFS grow sizes the allocation area to the partition end, over the alternate MDB and the trailing sector Mac OS reserves~~ — the two sectors are held back and the grown bitmap range is cleared, 2026-09-05 |
 | ~~R-058~~ | ~~Medium~~ **FIXED** | `src/model/provision_runner.rs` | ~~A classic HFS volume poured into a larger partition can never pass Disk First Aid ("Invalid allocation block start"): Mac OS wants the allocation area to end at the partition's alternate MDB~~ — `new hd --fill` grows the volume to the partition when its bitmap has room and warns when it has not, 2026-09-05 |
@@ -84,6 +87,42 @@ finding depends on a fixture, the fixture is named.
 ---
 
 ## Found while adding the 1000-file churn test, 2026-09-05
+
+### R-061 — a UFS directory that grows past its first block is corrupt {#r-061}
+
+**OPEN.** Found 2026-09-05 by the 1000-file churn
+(`regression-tests/cases/tier3/churn.toml`, `churn.ufs` and
+`churn.ufs-43bsd`): the 401st (4.4BSD) / 409th (4.3BSD) `create_file` in
+one directory fails with `ufs dir_find: corrupt d_reclen 0 at off 8192`,
+and `ls` of the directory afterwards fails the same way (`directory 3 has
+zero d_reclen at offset 8192`), so the 400 files already written are
+unreachable; `fsck` sees an orphaned inode. The directory writer appends past
+the first 8 KiB block without allocating and initialising the next one
+(UFS keeps directory entries in 512-byte chunks whose last entry's
+`d_reclen` must reach the chunk end), so the reader meets a zero record
+length at the block boundary. Both byte orders and both on-disk formats
+fail the same way.
+
+### R-062 — ProDOS path lookup is case-sensitive {#r-062}
+
+**OPEN.** Found by `churn.prodos`: `put v.img payload /d/extra.bin` stores
+`EXTRA.BIN` (ProDOS keeps names upper-case, with lowercase flags on
+ProDOS 8), and `rm v.img /d/extra.bin` then answers `not found`;
+`rm /d/EXTRA.BIN` works, and the root behaves the same (`put /rootx.bin`,
+`rm /rootx.bin`: not found). ProDOS compares names case-insensitively, so
+every path verb (`rm`, `get`, `mv`, `ls PATH`, `cp`) should fold case the
+way the volume does.
+
+### R-063 — a thousand-file XFS directory loses most of its entries {#r-063}
+
+**OPEN.** Found by `churn.xfs` on a 32 MiB `new volume xfs`: after `untar`
+puts 1000 files into one directory, `rb-cli fsck` counts 1002 files yet
+reports 999 `OrphanInode` errors ("allocated but unreachable from the root
+directory"), and `ls` of the directory lists a single file. The inodes and
+data were written; the directory itself, once it outgrew the short-form
+and block-form layouts, was not (or is not read back) — the leaf / node
+directory formats are the suspect on both sides. Small directories are
+unaffected (`edit.xfs.put-get`).
 
 ### R-060 — a blank classic HFS volume gets a four-block catalog whatever its size {#r-060}
 
