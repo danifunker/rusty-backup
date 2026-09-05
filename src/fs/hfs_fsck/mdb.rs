@@ -63,27 +63,36 @@ pub(super) fn check_allocation_area_end(
     if mdb.block_size == 0 || mdb.block_size % 512 != 0 || mdb.total_blocks == 0 {
         return;
     }
-    let area_end =
-        mdb.first_alloc_block as u64 + mdb.total_blocks as u64 * (mdb.block_size as u64 / 512);
-    let expected = len / 512 - 2;
-    if area_end == expected {
+    // fsck_hfs derives the block count from the partition: whole blocks between
+    // drAlBlSt and the alternate MDB; a remainder shorter than a block is fine.
+    let spb = mdb.block_size as u64 / 512;
+    let last = len / 512 - 2;
+    if mdb.first_alloc_block as u64 >= last {
         return;
     }
-    let volume_len = area_end * 512 + 1024;
-    let what = if area_end < expected {
+    let expected = (last - mdb.first_alloc_block as u64) / spb;
+    let have = mdb.total_blocks as u64;
+    if have == expected {
+        return;
+    }
+    let what = if have < expected {
         format!(
-            "the volume ({volume_len} bytes) does not fill its {len}-byte partition; grow it \
-             with `resize --size {len}` (or format one at the partition size when its volume \
-             bitmap has no room)"
+            "the volume stops {} bytes short of its {len}-byte partition; grow it with \
+             `resize --size {len}` (or format one at the partition size when its volume \
+             bitmap has no room)",
+            (expected - have) * mdb.block_size as u64
         )
     } else {
-        format!("the volume ({volume_len} bytes) overruns its {len}-byte partition")
+        format!(
+            "the volume overruns its {len}-byte partition by {} bytes",
+            (have - expected) * mdb.block_size as u64
+        )
     };
     errors.push(hfs_issue(
         HfsFsckCode::AllocationAreaEnd,
         format!(
-            "allocation area ends at sector {area_end}, Mac OS expects the partition's \
-             next-to-last sector {expected}: {what}"
+            "{have} allocation blocks, but the partition holds {expected} between drAlBlSt \
+             and its alternate MDB: {what}"
         ),
     ));
 }
