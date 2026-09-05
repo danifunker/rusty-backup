@@ -6095,6 +6095,14 @@ pub(crate) fn write_blank_btree_header_node(
     // BTHeaderRec offset 36 = btreeType (0=control); offset 37 = keyCompareType
     node[hr + 36] = 0; // kBTHFSTreeType
     node[hr + 37] = key_compare_type;
+    // Offset 38 = attributes: Apple sets kBTBigKeysMask on every HFS+ tree and
+    // kBTVariableIndexKeysMask on the catalog and attributes trees (not extents).
+    let attributes = if max_key_len == 10 {
+        hfs_common::KBT_BIG_KEYS_MASK
+    } else {
+        hfs_common::KBT_BIG_KEYS_MASK | hfs_common::KBT_VARIABLE_INDEX_KEYS_MASK
+    };
+    BigEndian::write_u32(&mut node[hr + 38..hr + 42], attributes);
 
     // Canonical TN1150 B-tree header node layout. The BTHeaderRec (record 0)
     // is *exactly* 106 bytes — Apple's `fsck_hfs` rejects any other length
@@ -6443,6 +6451,25 @@ fn btree_grow_blocks(total_nodes: u32, add_slots: u32, node_size: usize, block_s
 #[allow(clippy::identity_op)] // `1usize * block_size` keeps offset rows aligned
 mod tests {
     use super::*;
+
+    /// Apple stamps kBTBigKeysMask on every HFS+ tree and adds
+    /// kBTVariableIndexKeysMask on the catalog and attributes trees; so do we.
+    #[test]
+    fn blank_btree_headers_carry_apples_attribute_bits() {
+        let img = create_blank_hfsplus(16 * 1024 * 1024, 4096, "Attrs", false);
+        let vh = &img[1024..1536];
+        let block_size = BigEndian::read_u32(&vh[0x28..0x2c]) as usize;
+        // BTHeaderRec.attributes sits at node offset 14 + 38; a fork's first
+        // extent start is 16 bytes into its HFSPlusForkData (extents file at
+        // 0xC0, catalog at 0x110 in the volume header).
+        let attrs = |fork: usize| {
+            let start = BigEndian::read_u32(&vh[fork + 0x10..fork + 0x14]) as usize;
+            BigEndian::read_u32(&img[start * block_size + 52..start * block_size + 56])
+        };
+        assert_eq!(attrs(0xC0), hfs_common::KBT_BIG_KEYS_MASK, "extents");
+        let variable = hfs_common::KBT_BIG_KEYS_MASK | hfs_common::KBT_VARIABLE_INDEX_KEYS_MASK;
+        assert_eq!(attrs(0x110), variable, "catalog");
+    }
 
     #[test]
     fn test_volume_header_parse() {

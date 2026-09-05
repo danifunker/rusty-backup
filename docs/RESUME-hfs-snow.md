@@ -186,4 +186,5 @@ System 7.1 Finder copy a 1 MB file onto the rb-cli-fragmented H3 volume
 (Mac OS writes 5 overflow records), `rb-cli rm` deletes it, both judges
 pass before and after. Section 4 done: fsck `AllocationAreaEnd`, `resize`
 reaches the classic-HFS grow and explains a bitmap-bound refusal, editable
-opens warn. Next: section 5 (B-tree header attributes).
+opens warn. Section 5 done: blank HFS+ trees carry Apple's attribute bits
+(6 / 2 / 6), re-judged clean. Next: sections 6 and 7.
