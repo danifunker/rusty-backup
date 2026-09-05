@@ -260,6 +260,13 @@ would be cut off. The HFS+ fsck now checks that the blocks holding the
 alternate header are marked (`AlternateHeaderBlockFree`), which is the
 position check the count could not give.
 
+**The shrink half, judged 2026-09-05:** a 24 MiB HFS+ partition holding
+four 1 MB files at its tail (twenty put, the first sixteen removed), backed
+up with `rb-cli backup` and restored with `--size minimum`, comes back as a
+19.3 MiB partition (the trim point from `last_data_byte`) that `fsck_hfs -n`
+calls OK; `partmap resize` + `resize --size 24M` grow it back, and it is OK
+again.
+
 ### R-057 — the alternate HFS+ header misses the partition end on the put and fill paths {#r-057}
 
 **FIXED 2026-09-05** (`fix(hfsplus): the alternate header reaches the
