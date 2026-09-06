@@ -1,4 +1,4 @@
-# Regression Findings (R-001 … R-063)
+# Regression Findings (R-001 … R-064)
 
 Defects and documentation drift turned up while building the regression suite
 (`regression-tests/`), 2026-08-01/02. The suite work was deliberately kept
@@ -19,6 +19,7 @@ finding depends on a fixture, the fixture is named.
 
 | ID | Severity | Area | Finding |
 |----|----------|------|---------|
+| ~~R-064~~ | ~~**High**~~ **FIXED** | `src/fs/xfs/edit.rs`, `src/fs/xfs/mod.rs` | ~~A v5 XFS directory converted to leaf form fails `xfs_repair -n`: the leaf index sat at file offset 2^32 instead of `XFS_DIR2_LEAF_OFFSET` (2^35), the leaf1 block lacked the dir3 header pad and the `bestcount` tail, and short-form offset cookies assumed the 16-byte v4 data header~~ — found under the Docker `xfs_repair` oracle while shipping F-017, 2026-09-06 |
 | ~~R-063~~ | ~~**High**~~ **FIXED** | `src/fs/xfs/edit.rs` | ~~After 1000 files in one XFS directory, `fsck` reports 999 inodes allocated but unreachable from the root and `ls` of that directory lists one file~~ — the editor re-read a v5 block directory past a 16-byte header where the dir3 header is 64 bytes, so every insert into a block-form directory rebuilt it from nothing; the remaining growth past 125 entries is F-017, 2026-09-06 |
 | ~~R-062~~ | ~~Medium~~ **FIXED** | `src/cli/verbs/rm.rs` and friends | ~~ProDOS path lookup is case-sensitive while ProDOS itself is not: `rm /d/extra.bin` cannot find the `EXTRA.BIN` that `put /d/extra.bin` just created~~ — every leaf lookup now goes through `find_child`, exact first and then the filesystem's own folding, 2026-09-05 |
 | ~~R-061~~ | ~~**High**~~ **FIXED** | `src/fs/ufs.rs` | ~~A UFS directory that grows past its first 8 KiB block is corrupt: the 401st file fails with `corrupt d_reclen 0 at off 8192` and the directory cannot be listed afterwards~~ — `write_inode` copied the stale pointer area it had read back over a changed `direct[]`; the copy is now applied to fast symlinks only, 2026-09-05 |
@@ -127,6 +128,26 @@ ProDOS 8), and `rm v.img /d/extra.bin` then answers `not found`;
 `rm /rootx.bin`: not found). ProDOS compares names case-insensitively, so
 every path verb (`rm`, `get`, `mv`, `ls PATH`, `cp`) should fold case the
 way the volume does.
+
+### R-064 — a v5 XFS leaf-form directory failed `xfs_repair` on three counts {#r-064}
+
+**FIXED 2026-09-06.** Found under the Docker `xfs_repair 4.9.0` oracle
+while shipping F-017, on the directory that R-063's fix let grow to 126
+entries; `rb-cli fsck` saw none of it, since it lists data blocks and never
+reads the index, and `xfs_repair -n` is the judge that matters for XFS.
+The block-to-leaf conversion put the leaf1 index at file offset
+2^32 / blocksize, where `XFS_DIR2_LEAF_OFFSET` is `XFS_DIR2_SPACE_SIZE` =
+`1 << (32 + XFS_DIR2_DATA_ALIGN_LOG)` = 2^35 (each dir2 address space is
+32 GiB, not 4 GiB), so the reader's walk cap and the checker disagreed
+about which block was the index. The leaf1 block packed its entries from
+byte 60, where the v5 `xfs_dir3_leaf_hdr` pads to 64, and wrote the
+`bests` array flush against the end of the block with no `bestcount`
+tail, so the checker read a bestcount in the hundreds of millions and
+declared the block corrupt ("bad CRC" in 4.9.0's wording; the checksum
+itself was right). Short-form offset cookies on a v5 volume were based on
+the 16-byte v4 data header where the dir3 header is 64 bytes. The leaf
+offset, the leaf1 layout (`build_leaf1_block`) and the cookie base now
+follow `xfs_da_format.h`, and the reader's cap moved with the offset.
 
 ### R-063 — a thousand-file XFS directory loses most of its entries {#r-063}
 
@@ -449,7 +470,7 @@ PNGs under `docs/evidence/`.
 | H7 | 9cb5383, alternate header at the partition end | a volume poured into a larger APM partition, edited with `put`, then grown; `fsck_hfs -n` on the slice | HFS+: run 1 `Volume header needs minor repair` before the grow (R-057) and bitmap orphaned / under-allocation after it (R-056); **PASS** (run 3) before and after. HFS: run 1 `Invalid allocation block start` (R-058, R-059); **PASS** (run 2) with a volume whose bitmap has room, which the fill grows to the partition | HFS: **PASS** on the APM disk once `mac-scsi-bless` gave it a driver, "The volume H7hfs appears to be OK." (`docs/evidence/dfa-h7-hfs.png`); the unformatted second partition draws "This is not a Macintosh disk", cancelled by the script. HFS+: out of scope |
 | Section 5 of `docs/RESUME-hfs-snow.md` | B-tree header attributes | our HFS+ trees carried `attributes = 0`; Apple writes `kBTBigKeysMask \| kBTVariableIndexKeysMask` (6) on the catalog and attributes trees and `kBTBigKeysMask` (2) on the extents tree. `write_blank_btree_header_node` (blank volumes and the defragmenting clone) now does the same; H1 / H3 / H5 / H7-hfsplus re-run | **PASS** (2026-09-05): `fsck_hfs -n` clean on all, 1500 of 1500 files identical through the kernel driver; the bits read back 2 / 6 / 6 | out of scope (HFS+) |
 | Section 7 of `docs/RESUME-hfs-snow.md` | a real-Mac-formatted volume edited by rb-cli | the System 7.1 Finder initializes a blank 5 MiB Apple_HFS partition inside Snow (`scripts/verify-hfs-snow.sh mac-formatted`); rb-cli then `put`s a text file and a binary, `mkdir`s, `mv`s, `rm`s, `setrsrc`s, and `put-binhex`es Disk First Aid; `rb-cli fsck`, `fsck_hfs -n`, Disk First Aid, and the Finder judge it | **PASS** (2026-09-05): `fsck_hfs -n` OK before and after the edits (Mac OS laid the volume out at 512-byte blocks, `drAlBlSt` 6, filling the partition, which our new `AllocationAreaEnd` check accepts) | **PASS**: "The volume snow71 appears to be OK." (`docs/evidence/dfa-mac-formatted.png`); TeachText shows the text file (`finder-mac-formatted-hi.png`) and the Finder launches the rb-cli-written Disk First Aid from that volume, resource fork intact (`finder-mac-formatted-dfa-launch.png`) |
-| H12 | the 1000-file churn with the OS taking the middle turn | rb-cli imports 1000 files; the OS adds one file, deletes it, deletes the 1000; rb-cli adds one more; `fsck_hfs -n` and `rb-cli fsck` after every turn. HFS+: macOS's kernel driver through a read-write mount (`verify-fs-macos.sh -o H12-hfsplus`). Classic HFS: the System 7.1 Finder in Snow, ending with Shut Down so the MDB is flushed (`verify-hfs-snow.sh os-churn`) | HFS+: **PASS** (2026-09-05), OK after each of the three turns, the last file reads back through the kernel driver. HFS: **PASS** after the Finder's turn and after rb-cli's put | HFS: **PASS** both times (`docs/evidence/dfa-h12-finder.png`, `dfa-h12-after.png`). A first run judged the volume before Mac OS had flushed its MDB and drew "needs to be repaired" with stale counts; that frame is the `scripts/snow/dfa-problem.pbm` reference. The same churn with rb-cli alone runs on every filesystem that can hold it: `regression-tests/cases/tier3/churn.toml` (it found R-060 .. R-063 and F-012 .. F-016) |
+| H12 | the 1000-file churn with the OS taking the middle turn | rb-cli imports 1000 files; the OS adds one file, deletes it, deletes the 1000; rb-cli adds one more; `fsck_hfs -n` and `rb-cli fsck` after every turn. HFS+: macOS's kernel driver through a read-write mount (`verify-fs-macos.sh -o H12-hfsplus`). Classic HFS: the System 7.1 Finder in Snow, ending with Shut Down so the MDB is flushed (`verify-hfs-snow.sh os-churn`) | HFS+: **PASS** (2026-09-05), OK after each of the three turns, the last file reads back through the kernel driver. HFS: **PASS** after the Finder's turn and after rb-cli's put | HFS: **PASS** both times (`docs/evidence/dfa-h12-finder.png`, `dfa-h12-after.png`). A first run judged the volume before Mac OS had flushed its MDB and drew "needs to be repaired" with stale counts; that frame is the `scripts/snow/dfa-problem.pbm` reference. The same churn with rb-cli alone runs on every filesystem that can hold it: `regression-tests/cases/tier3/churn.toml` (it found R-060 .. R-064 and F-012 .. F-017) |
 | R6 | 5f1fd54, write-protected media | `hdiutil attach -readonly` raw image, `rb-cli backup /dev/diskN` | **PASS**: logs "is write-protected ... opened read-only", raises no prompt. A card's lock switch is pending hardware | - |
 | R11 | f2edc77, cancelled dialog | unit tests on the decoded two-byte reply | a live cancel is pending the user (no dialog was raised unattended) | - |
 | R19 | 0093c49, raw-device reads | raw hdiutil device through `rb-cli inspect`: 0 B before, the real size after; unit tests on a device that refuses large reads | the USB floppy drive itself is pending hardware | - |

@@ -810,7 +810,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         if entries.iter().any(|e| e.name == name) {
             return Err(FilesystemError::AlreadyExists(name.to_string()));
         }
-        let new_off = self.sf_next_offset(&buf[fs..fork_end], has_ftype)?;
+        let new_off = self.sf_next_offset(&buf[fs..fork_end], has_ftype, sb.is_v5())?;
 
         // Build the new entry: namelen(1) offset(2) name[namelen] [ftype] ino(4).
         let ino_width = 4usize; // i8count == 0 path only
@@ -871,10 +871,20 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
     /// maximum of (each existing entry's cookie + its data-block size) and the
     /// post-`.`/`..` base. Walks the raw fork so gaps left by removals are
     /// respected.
-    fn sf_next_offset(&self, fork: &[u8], has_ftype: bool) -> Result<u32, FilesystemError> {
-        let mut next = (XFS_DIR2_DATA_HDR_LEN
-            + data_entsize(1, has_ftype)
-            + data_entsize(2, has_ftype)) as u32;
+    fn sf_next_offset(
+        &self,
+        fork: &[u8],
+        has_ftype: bool,
+        is_v5: bool,
+    ) -> Result<u32, FilesystemError> {
+        // The cookies mirror a block-form layout: past the dir2 / dir3 data
+        // header and the `.` / `..` entries (xfs_repair checks the order).
+        let hdr = if is_v5 {
+            super::dir2::XFS_DIR3_DATA_HDR_LEN
+        } else {
+            XFS_DIR2_DATA_HDR_LEN
+        };
+        let mut next = (hdr + data_entsize(1, has_ftype) + data_entsize(2, has_ftype)) as u32;
         if fork.len() < 6 {
             return Err(FilesystemError::Parse("short-form fork too small".into()));
         }
@@ -2898,10 +2908,10 @@ const XFS_DIR2_LEAF1_MAGIC: u16 = 0xD2F1;
 /// directory). Same byte position as v4 (offset 8..10 of the block).
 const XFS_DIR3_LEAF1_MAGIC: u16 = 0x3DF1;
 
-/// dir2 leaf address space starts at byte 32 GiB in the inode's file offset
-/// stream (`XFS_DIR2_LEAF_OFFSET`). Converted to fsblocks: `2^32 / blocksize`.
+/// dir2 leaf address space starts at `XFS_DIR2_LEAF_OFFSET` = `XFS_DIR2_SPACE_SIZE`
+/// = `1 << (32 + XFS_DIR2_DATA_ALIGN_LOG)`, 32 GiB into the file; in fsblocks.
 fn dir2_leaf_offset_fb(blocksize: u32) -> u64 {
-    (1u64 << 32) / (blocksize as u64)
+    (1u64 << 35) / (blocksize as u64)
 }
 
 /// A built dir2 XD2D data block paired with its leaf-index contributions:
@@ -3042,11 +3052,12 @@ fn build_leaf1_block(
     dirblksize: usize,
     is_v5: bool,
 ) -> Result<Vec<u8>, FilesystemError> {
-    let bests_bytes = bests.len() * 2;
-    // Header = blkinfo + ldlh. v4: 12+4=16. v5: 56+4=60.
+    // bests[] then the u32 bestcount tail (`xfs_dir2_leaf_tail`).
+    let tail_bytes = bests.len() * 2 + 4;
+    // Header = blkinfo + count/stale, padded to 64 on v5 (`xfs_dir3_leaf_hdr`).
     let blkinfo_bytes = if is_v5 { 56 } else { 12 };
-    let header_bytes = blkinfo_bytes + 4;
-    let used = header_bytes + entries.len() * 8 + bests_bytes;
+    let header_bytes = if is_v5 { 64 } else { 16 };
+    let used = header_bytes + entries.len() * 8 + tail_bytes;
     if used > dirblksize {
         return Err(FilesystemError::DiskFull(format!(
             "leaf1 block overflow: needed {used} bytes, have {dirblksize}"
@@ -3076,11 +3087,12 @@ fn build_leaf1_block(
         BigEndian::write_u32(&mut buf[off..off + 4], *h);
         BigEndian::write_u32(&mut buf[off + 4..off + 8], *a);
     }
-    // Bests array at the very end of the block, in data-block index order.
-    let bests_off = dirblksize - bests_bytes;
+    // Bests in data-block order, then bestcount as the block's last u32.
+    let bests_off = dirblksize - tail_bytes;
     for (i, &b) in bests.iter().enumerate() {
         BigEndian::write_u16(&mut buf[bests_off + i * 2..bests_off + i * 2 + 2], b);
     }
+    BigEndian::write_u32(&mut buf[dirblksize - 4..dirblksize], bests.len() as u32);
     Ok(buf)
 }
 
@@ -3422,8 +3434,14 @@ mod tests {
     fn build_leaf1_block_v5_stamps_at_da3_offset() {
         let sb = fake_v5_sb(0x99);
         let entries = vec![(0x1111, 0x100), (0x2222, 0x200), (0x3333, 0x300)];
-        let bests = [256u16, 256u16];
+        let bests = [256u16, 512u16];
         let mut buf = build_leaf1_block(entries, &bests, 4096, true).unwrap();
+        // Entries start after the 64-byte xfs_dir3_leaf_hdr (pad included);
+        // bests sit before the u32 bestcount tail, in data-block order.
+        assert_eq!(BigEndian::read_u32(&buf[64..68]), 0x1111);
+        assert_eq!(BigEndian::read_u32(&buf[4096 - 4..]), 2, "bestcount");
+        assert_eq!(BigEndian::read_u16(&buf[4096 - 8..4096 - 6]), 256);
+        assert_eq!(BigEndian::read_u16(&buf[4096 - 6..4096 - 4]), 512);
 
         // Magic at offset 8..10 = XFS_DIR3_LEAF1_MAGIC.
         assert_eq!(

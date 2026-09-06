@@ -524,10 +524,9 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
                 max_data_fb = end;
             }
         }
-        // dir2 leaf/free address spaces start at 32 GiB / blocksize. We
-        // cap the walk there so a malformed extent list with a leaf-space
-        // entry doesn't make us read garbage.
-        let leaf_first_fb = (1u64 << 32) / bs;
+        // Leaf/free address spaces start at XFS_DIR2_SPACE_SIZE (32 GiB, 1 << 35)
+        // / blocksize; cap the walk there so a leaf-space extent isn't read as data.
+        let leaf_first_fb = (1u64 << 35) / bs;
         let walk_end_fb = max_data_fb.min(leaf_first_fb);
 
         let has_ftype = self.sb.has_ftype();
