@@ -80,16 +80,6 @@ id = "churn.sfs"
 finding = "F-014"
 note = "the object-node tree never grows: refused at the 43rd file"
 
-[[known]]
-id = "churn.minix2"
-finding = "F-015"
-note = "directories stop at their direct zones: refused at the 223rd file"
-
-[[known]]
-id = "churn.minix3"
-finding = "F-015"
-note = "directories stop at their direct zones: refused at the 111th file"
-
 # Defects: the writer does not refuse, it corrupts or loses.
 [[known]]
 id = "churn.xfs"

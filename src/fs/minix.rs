@@ -1137,33 +1137,59 @@ impl<R: Read + Write + Seek> MinixFilesystem<R> {
         Ok(None)
     }
 
-    /// Physical zone backing logical zone `lz` of a directory (direct slots
-    /// only). Allocates and zeroes a new zone when `alloc` and the slot is
-    /// empty; refuses beyond the 7 direct slots (indirect dir growth is out of
-    /// scope — realistic directories stay well under 7 zones).
+    /// Physical zone backing logical zone `lz` of a directory, through the
+    /// direct slots and then the single / double / triple indirect zones.
+    /// Allocates and zeroes what is missing on the way when `alloc` (F-015).
     fn dir_zone(
         &mut self,
         dir: &mut MinixInode,
         lz: usize,
         alloc: bool,
     ) -> Result<u32, FilesystemError> {
-        if lz >= DIRECT_ZONES {
-            return Err(FilesystemError::Unsupported(
-                "Minix directory too large (indirect directory growth unsupported)".into(),
+        let zs = self.sb.zone_size() as usize;
+        let per = self.sb.ptrs_per_zone() as usize;
+        // (inode slot, index at each indirect level) for this logical zone.
+        let (slot, path): (usize, Vec<usize>) = if lz < DIRECT_ZONES {
+            (lz, Vec::new())
+        } else if lz - DIRECT_ZONES < per {
+            (7, vec![lz - DIRECT_ZONES])
+        } else if lz - DIRECT_ZONES - per < per * per {
+            let r = lz - DIRECT_ZONES - per;
+            (8, vec![r / per, r % per])
+        } else {
+            let r = lz - DIRECT_ZONES - per - per * per;
+            (9, vec![r / (per * per), (r / per) % per, r % per])
+        };
+        if slot >= self.sb.zones_per_inode() {
+            return Err(FilesystemError::DiskFull(
+                "Minix directory too large for this inode format".into(),
             ));
         }
-        if dir.zones[lz] != 0 {
-            return Ok(dir.zones[lz]);
+        let missing = || FilesystemError::InvalidData("missing directory zone".into());
+        let mut zone = dir.zones[slot];
+        if zone == 0 {
+            if !alloc {
+                return Err(missing());
+            }
+            zone = self.alloc_zone()?;
+            self.write_zone(zone, &vec![0u8; zs])?;
+            dir.zones[slot] = zone;
         }
-        if !alloc {
-            return Err(FilesystemError::InvalidData(
-                "missing directory zone".into(),
-            ));
+        for &i in &path {
+            let mut block = self.read_zone(zone)?;
+            let mut next = self.read_ptr(&block, i);
+            if next == 0 {
+                if !alloc {
+                    return Err(missing());
+                }
+                next = self.alloc_zone()?;
+                self.write_zone(next, &vec![0u8; zs])?;
+                self.write_ptr(&mut block, i, next);
+                self.write_zone(zone, &block)?;
+            }
+            zone = next;
         }
-        let z = self.alloc_zone()?;
-        self.write_zone(z, &vec![0u8; self.sb.zone_size() as usize])?;
-        dir.zones[lz] = z;
-        Ok(z)
+        Ok(zone)
     }
 
     /// Insert `name -> child` into `dir`, reusing a free slot or appending
@@ -1223,9 +1249,9 @@ impl<R: Read + Write + Seek> MinixFilesystem<R> {
                 let nb = &data[off + ino_field..off + stride];
                 let end = nb.iter().position(|&b| b == 0).unwrap_or(nb.len());
                 if &nb[..end] == name {
-                    // Directory data lives in direct zones, so the backing zone
-                    // is simply dir.zones[logical]. Zero the inode field.
-                    let phys = dir.zones[off / zs];
+                    // The slot's backing zone may sit behind an indirect zone.
+                    let mut walk = dir.clone();
+                    let phys = self.dir_zone(&mut walk, off / zs, false)?;
                     let zero = vec![0u8; ino_field];
                     self.write_at(phys as u64 * zs as u64 + (off % zs) as u64, &zero)?;
                     return Ok(ino);
@@ -2284,6 +2310,43 @@ mod tests {
     }
 
     // ---- Create-blank ----
+
+    /// F-015: a directory grows through the single indirect zone and back.
+    /// V1 fits 64 entries per zone, V2 32, V3 16; seven direct zones hold
+    /// 448 / 224 / 112, so 1100 files reach the indirect zone on all three.
+    #[test]
+    fn directory_grows_through_the_indirect_zone() {
+        use super::super::filesystem::{CreateFileOptions, EditableFilesystem};
+        for mver in [MinixVersion::V1, MinixVersion::V2, MinixVersion::V3] {
+            let img = create_blank_minix(16 * 1024 * 1024, mver).expect("blank");
+            let mut fs = MinixFilesystem::open(Cursor::new(img), 0).expect("open blank");
+            let root = fs.root().expect("root");
+            for i in 0..1100 {
+                let name = format!("f{i:04}");
+                fs.create_file(
+                    &root,
+                    &name,
+                    &mut &b"x"[..],
+                    1,
+                    &CreateFileOptions::default(),
+                )
+                .unwrap_or_else(|e| panic!("{mver:?}: creating {name}: {e}"));
+            }
+            let dir = fs.read_inode(root.location as u32).unwrap();
+            assert!(dir.zones[7] != 0, "{mver:?}: no single indirect zone");
+            let kids = fs.list_directory(&root).unwrap();
+            assert_eq!(kids.len(), 1100, "{mver:?}");
+            assert!(kids.iter().any(|e| e.name == "f1099"));
+            for e in &kids {
+                fs.delete_entry(&root, e)
+                    .unwrap_or_else(|e2| panic!("{mver:?}: rm {}: {e2}", e.name));
+            }
+            assert!(fs.list_directory(&root).unwrap().is_empty(), "{mver:?}");
+            fs.sync_metadata().unwrap();
+            let report = fs.fsck().expect("minix has fsck").unwrap();
+            assert!(report.errors.is_empty(), "{mver:?}: {:?}", report.errors);
+        }
+    }
 
     #[test]
     fn create_blank_opens_as_empty_volume() {
