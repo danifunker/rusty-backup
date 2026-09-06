@@ -27,6 +27,7 @@ concrete reason to.
 | ~~[F-014](#f-014)~~ | **SHIPPED 2026-09-06.** ~~An SFS volume takes about 43 files: the object-node tree never grows~~ | `src/fs/sfs.rs` | the 1000-file churn (`churn.sfs`) |
 | ~~[F-015](#f-015)~~ | **SHIPPED 2026-09-05.** ~~A Minix directory stops at its direct blocks (about 110 V3 / 220 V2 files)~~ | `src/fs/minix.rs` | the 1000-file churn (`churn.minix2`, `churn.minix3`) |
 | ~~[F-017](#f-017)~~ | **SHIPPED 2026-09-06.** ~~An XFS directory in leaf or node form takes no inserts or removes: 125 entries per directory, then `unsupported`~~ | `src/fs/xfs/edit.rs` | the 1000-file churn (`churn.xfs`), after R-063 |
+| [F-018](#f-018) | XFS inode allocation stops when the AG holding the new chunk cannot grow its inobt, with the other AGs empty: a 256 MiB volume takes about 107500 files | `src/fs/xfs/edit.rs` | the deep XFS churn (`churn.xfs-deep` uses a 1 GiB volume) |
 | ~~[F-016](#f-016)~~ | **SHIPPED 2026-09-06.** ~~A classic HFS catalog is sized at format time (0.5 % of the volume) and never grows, so a 16 MiB volume stops at about 600 files~~ | `src/fs/hfs.rs` | the 1000-file churn (`churn.hfs`, `churn.hfv` at 16 MiB) |
 | ~~[F-011](#f-011)~~ | **SHIPPED 2026-09-05.** ~~The classic HFS writer allocates a fork as one contiguous run; a fragmented volume reports disk full with room to spare~~ | `src/fs/hfs.rs` | H3's classic-HFS check: a resource fork spilled into the extents-overflow file by rb-cli, clean under `fsck_hfs -n` and Disk First Aid before and after the delete |
 
@@ -750,25 +751,51 @@ is the model.
 
 ## F-017 — an XFS directory in leaf or node form takes no inserts or removes {#f-017}
 
-**SHIPPED 2026-09-06.** Block, leaf and node-form directories are rebuilt
-from their complete entry list on every insert and remove:
-`plan_dir_layout` picks the smallest form that holds the entries (one
-block; data blocks in hash order plus a leaf1 index; or data blocks plus a
-leafN da btree -- a lone leafN root, or a level-1 node over balanced leafN
-siblings -- and a freeindex block), and `write_dir_layout` lays it down,
-keeping each address-space region's blocks when its size is unchanged and
-otherwise taking a fresh run and freeing the old one. Removal shrinks the
-same way, down to short-form (`xfs_dir2_block_to_sf`) once the survivors
-fit the inode. A rebuild is linear in the directory's size, a dozen 4 KiB
-blocks per operation at a thousand entries. Judged by the Docker
-`xfs_repair 4.9.0` oracle at 125 (leaf1), 503 (a leafN root), 600 (a node
-over two leaves) and 1000 entries, and after each stage of the churn;
-`churn.xfs` passes. `dir_grows_to_node_form_and_shrinks_back_to_short_form`
-covers the v5 node form in `cargo test`, the older
-`dir_overflow_converts_block_to_leaf_form` the v4 leaf form. The v5
-leaf-form defects met on the way are R-064. Still `unsupported`: a
-directory needing a second freeindex block (over 2016 data blocks at
-4 KiB) or a two-level da btree (over 504 leafN blocks).
+**SHIPPED 2026-09-06.** Leaf and node-form directories are edited in place
+by `src/fs/xfs/edit/dir2_tree.rs`, after `xfs_dir2_leaf.c`,
+`xfs_dir2_node.c` and `xfs_da_btree.c`. An insert descends the da btree by
+hash, takes room from the first data block whose `bests` entry admits the
+entry (appending a data block, and a freeindex block once a table holds
+2016, when none does), places it from that block's `bestfree[0]` and adds
+the hash to the leaf, reusing a stale slot; a full leafN splits, the
+sibling is keyed into the parent, a full parent splits, and a full root is
+copied down a level first (`xfs_da3_root_split`), which is how a second
+btree level appears. A remove returns the entry's bytes to the block's
+free space (coalescing neighbours), marks the leaf slot stale, frees a data
+block that emptied, drops a leaf with no live entries from its parent and
+collapses a root left with one child (`xfs_da3_root_join`). Every
+operation runs against a cached block set and lands as one transaction,
+with created blocks allocated next to their predecessors
+(`alloc_blocks_at`, `alloc_blocks_from_head`) so a directory stays in a few
+extents. The full rebuild (`plan_dir_layout` / `write_dir_layout`, the
+smallest form that fits) remains for block form, for a full leaf1 index
+(which becomes node form) and for shrinking back to leaf, block or
+short-form after removes, which the incremental path signals. Half-empty
+siblings are not merged (`xfs_dir2_leafn_toosmall`); the kernel accepts
+sparse leaves.
+
+Judged by the Docker `xfs_repair 4.9.0` oracle after import, after an extra
+add and remove, after removing everything and after one more file: 1000
+and 5000 short names on 32 MiB and 96 MiB volumes, 30000 and 32000
+251-byte names on 96 MiB (the latter's 2134 data blocks need a second
+freeindex block), all clean. `churn.xfs` passes; `churn-deep.toml` adds
+`churn.xfs-freeindex` (32000 long names) and `churn.xfs-deep` (300000
+names on 1 GiB, a two-level da btree; 200000 still fit 450 leaves under one node), seeded by `put --zero 0 --dst
+"/d/f{A..B}"` so no fixture is needed. In `cargo test`,
+`edit::dir2_tree::tests` runs the same code against an in-memory store
+with 512-byte dir blocks, where a two-level tree and a second freeindex
+block are a few thousand entries away, and re-derives every invariant
+`xfs_repair` checks after each batch of operations;
+`dir_grows_to_node_form_and_shrinks_back_to_short_form` and
+`dir_overflow_converts_block_to_leaf_form` cover the on-disk path. Met on
+the way: R-064 (the v5 leaf-form layout), R-065 (v5 `blkno` stamps in AG 1
+and beyond), F-018 (inode chunks stop at one AG's inobt) and R-066 (`sb_fdblocks`
+omitted the free-space btrees' blocks).
+
+The first cut the same morning rebuilt the whole directory from its entry
+list on every insert and remove, which is linear per operation and was
+enough for the thousand-file churn; it survives as the fallback described
+above.
 
 Found 2026-09-06 by `churn.xfs` once R-063 was fixed: the 126th entry of a
 directory converts it from a single block to leaf form (two data blocks
@@ -780,3 +807,19 @@ hash index and `bests` in step; and past what one leaf block indexes
 (about 500 entries at 4 KiB), the node form -- leafN blocks under a
 da-btree root and a freeindex block -- as `xfs_dir2_leaf_addname` and
 `xfs_dir2_leaf_to_node` do. Reads of both forms already work.
+
+## F-018 — XFS inode allocation stops at one AG's inobt {#f-018}
+
+Found 2026-09-06 by the deep directory churn: `put --zero 0 --dst
+"/d/f{000001..200000}"` on a 256 MiB `new volume xfs` fails at the 107518th
+file with `disk full: AG 0: no free extent large enough for 8-block inobt
+growth` while AGs 1 to 3 are untouched. `alloc_new_inode_chunk` places the
+64-inode chunk with `alloc_blocks_aligned`, which takes the first AG with an
+aligned run, and then grows that AG's inode btree; when the AG still had an
+8-block run for the chunk but has none for the tree, the error surfaces
+instead of the next AG being tried. What it would take: choose the AG with
+room for both, or retry the chunk in the next AG when the inobt growth
+fails, the way `xfs_dialloc` walks AGs. Until then the deep churn uses a
+1 GiB volume, whose 256 MiB AG 0 holds the 200000 inodes. The failure also
+leaves `sb_fdblocks` four blocks short, which turned out to be R-066, a
+counter term missing everywhere, not a leak of this path.

@@ -35,13 +35,14 @@
 //!     (reusing the R2 rebuild) + resyncing `sb_fdblocks`.
 //!   * **Directory insert** ([`dir_insert_entry`]) / remove ([`dir_remove_entry`]):
 //!     short-form inline add/remove with automatic conversion to a single
-//!     block on overflow. Block, leaf and node-form directories are rebuilt
-//!     from their full entry list: [`plan_dir_layout`] picks the smallest
-//!     form that fits (one block; data blocks + a leaf1 index; or data
-//!     blocks + a one-level leafN da btree + a freeindex block) and
-//!     [`write_dir_layout`] lays it down, reusing each address-space region's
-//!     blocks when its size is unchanged. Removal shrinks back to short-form
-//!     when the survivors fit (`xfs_dir2_block_to_sf`).
+//!     block on overflow. Leaf and node-form directories are edited in
+//!     place by [`dir2_tree`] (the kernel's leaf/node algorithms: data-block
+//!     free space, stale leaf slots, leaf and node splits, root push-down,
+//!     freeindex blocks, root join). The full rebuild — [`plan_dir_layout`]
+//!     picks the smallest form that fits and [`write_dir_layout`] lays it
+//!     down — remains the path for block form, for a full leaf1 index
+//!     (which converts to node form) and for shrinking a directory back
+//!     down to leaf, block or short-form after removes.
 //!
 //! On top of these: `create_directory`, `create_file` (single contiguous
 //! extent), and `delete_entry` (empty short-form dirs / single-or-no-extent
@@ -61,6 +62,8 @@ use super::types::{XFS_DINODE_MAGIC, XFS_INODES_PER_CHUNK};
 use super::{read_at_aligned, XfsFilesystem};
 use crate::fs::filesystem::{Filesystem, FilesystemError};
 use crate::fs::fsck::RepairReport;
+
+mod dir2_tree;
 
 /// Largest single-extent file we write: the on-disk blockcount field is 21 bits.
 const MAX_SINGLE_EXTENT_BLOCKS: u64 = (1 << 21) - 1;
@@ -1074,6 +1077,95 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         ))
     }
 
+    /// Allocate exactly `[want, want + n)` when those blocks are free, so a
+    /// directory grows contiguously; `None` when they are not.
+    fn alloc_blocks_at(
+        &mut self,
+        sb: &super::sb::XfsSuperblock,
+        want: u64,
+        n: u32,
+    ) -> Result<Option<u64>, FilesystemError> {
+        let agno = want >> sb.agblklog;
+        let agbno = (want & ((1u64 << sb.agblklog) - 1)) as u32;
+        if agno >= sb.agcount as u64 || n == 0 {
+            return Ok(None);
+        }
+        let agblocks = sb.agblocks as u64;
+        let expected_len = if agno == sb.agcount as u64 - 1 {
+            sb.dblocks - agno * agblocks
+        } else {
+            agblocks
+        };
+        if u64::from(agbno) + u64::from(n) > expected_len {
+            return Ok(None);
+        }
+        let Ok(full_free) = self.current_full_free(sb, agno, expected_len) else {
+            return Ok(None);
+        };
+        let Some(idx) = full_free
+            .iter()
+            .position(|e| e.startblock <= agbno && agbno + n <= e.startblock + e.blockcount)
+        else {
+            return Ok(None);
+        };
+        let host = full_free[idx];
+        let mut reduced = full_free.clone();
+        reduced.remove(idx);
+        if agbno > host.startblock {
+            reduced.push(FreeExtent {
+                startblock: host.startblock,
+                blockcount: agbno - host.startblock,
+            });
+        }
+        let host_end = host.startblock + host.blockcount;
+        if agbno + n < host_end {
+            reduced.push(FreeExtent {
+                startblock: agbno + n,
+                blockcount: host_end - (agbno + n),
+            });
+        }
+        let reduced = coalesce(reduced);
+        if self
+            .rebuild_ag_freespace(sb, agno, expected_len, &reduced)
+            .is_err()
+        {
+            return Ok(None);
+        }
+        self.resync_sb_fdblocks(sb)?;
+        Ok(Some(want))
+    }
+
+    /// Allocate `n` blocks from the *head* of the largest free extent, leaving
+    /// the blocks after them free for `alloc_blocks_at` (a tail carve would fragment).
+    fn alloc_blocks_from_head(
+        &mut self,
+        sb: &super::sb::XfsSuperblock,
+        n: u32,
+    ) -> Result<u64, FilesystemError> {
+        let agblocks = sb.agblocks as u64;
+        for agno in 0..sb.agcount as u64 {
+            let expected_len = if agno == sb.agcount as u64 - 1 {
+                sb.dblocks - agno * agblocks
+            } else {
+                agblocks
+            };
+            let Ok(full_free) = self.current_full_free(sb, agno, expected_len) else {
+                continue;
+            };
+            let Some(host) = full_free.iter().max_by_key(|e| e.blockcount).copied() else {
+                continue;
+            };
+            if host.blockcount <= n {
+                continue;
+            }
+            let start = (agno << sb.agblklog) | u64::from(host.startblock);
+            if self.alloc_blocks_at(sb, start, n)?.is_some() {
+                return Ok(start);
+            }
+        }
+        self.alloc_blocks(sb, n)
+    }
+
     /// The AG's complete free-block set (AG-relative extents): the bnobt's free
     /// records plus the blocks both space btrees themselves occupy (which a
     /// rebuild reclaims), coalesced — the same reconstruction R2 uses.
@@ -1733,6 +1825,28 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                 "parent is not a directory".into(),
             ));
         }
+        // Leaf/node form: a hash lookup for the duplicate check, and room
+        // for the couple of dir blocks an insert can add.
+        if core.format == super::types::DiFormat::Extents {
+            let dup = match DiskDirStore::open(self, sb, parent_ino)? {
+                Some(mut store) => {
+                    Some(dir2_tree::Dir2Op::new(&mut store).contains(name.as_bytes())?)
+                }
+                None => None,
+            };
+            if let Some(dup) = dup {
+                if dup {
+                    return Err(FilesystemError::AlreadyExists(name.into()));
+                }
+                let bpd = blocks_per_dir_block(sb);
+                if !self.can_alloc_run(sb, bpd)? {
+                    return Err(FilesystemError::DiskFull(format!(
+                        "no free run of {bpd} blocks for a directory block"
+                    )));
+                }
+                return Ok(());
+            }
+        }
         let (dotdot, mut entries) = self.gather_dir_entries(sb, &core, &buf, parent_ino)?;
         if entries.iter().any(|(n, _, _)| n == name) {
             return Err(FilesystemError::AlreadyExists(name.into()));
@@ -1891,20 +2005,32 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         child_ino: u64,
         is_dir: bool,
     ) -> Result<(), FilesystemError> {
-        let (core, buf) = self.read_inode_buf(parent_ino)?;
-        let extents = self.decode_data_extents(&core, &buf)?;
-        let (dotdot, mut entries) = self.read_multi_dir_entries(sb, &extents)?;
-        if entries.iter().any(|(n, _, _)| n == name) {
-            return Err(FilesystemError::AlreadyExists(name.into()));
-        }
         let ft = if is_dir {
             XFS_DIR3_FT_DIR
         } else {
             XFS_DIR3_FT_REG_FILE
         };
-        entries.push((name.to_string(), child_ino, ft));
-        let layout = plan_dir_layout(&entries, parent_ino, dotdot, sb, None)?;
-        self.write_dir_layout(sb, parent_ino, &layout, &extents)?;
+        let handled = match DiskDirStore::open(self, sb, parent_ino)? {
+            Some(mut store) => {
+                let mut op = dir2_tree::Dir2Op::new(&mut store);
+                match op.insert(name.as_bytes(), child_ino, ft)? {
+                    dir2_tree::Outcome::Done { .. } => op.commit()?,
+                    dir2_tree::Outcome::Fallback => false,
+                }
+            }
+            None => false,
+        };
+        if !handled {
+            let (core, buf) = self.read_inode_buf(parent_ino)?;
+            let extents = self.decode_data_extents(&core, &buf)?;
+            let (dotdot, mut entries) = self.read_multi_dir_entries(sb, &extents)?;
+            if entries.iter().any(|(n, _, _)| n == name) {
+                return Err(FilesystemError::AlreadyExists(name.into()));
+            }
+            entries.push((name.to_string(), child_ino, ft));
+            let layout = plan_dir_layout(&entries, parent_ino, dotdot, sb, None)?;
+            self.write_dir_layout(sb, parent_ino, &layout, &extents)?;
+        }
         if is_dir {
             self.bump_dir_nlink(sb, parent_ino, 1)?;
         }
@@ -1920,21 +2046,48 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         name: &str,
         child_was_dir: bool,
     ) -> Result<(), FilesystemError> {
-        let (core, buf) = self.read_inode_buf(parent_ino)?;
-        let extents = self.decode_data_extents(&core, &buf)?;
-        let (dotdot, mut entries) = self.read_multi_dir_entries(sb, &extents)?;
-        let before = entries.len();
-        entries.retain(|(n, _, _)| n != name);
-        if entries.len() == before {
-            return Err(FilesystemError::NotFound(name.into()));
+        let handled = match DiskDirStore::open(self, sb, parent_ino)? {
+            Some(mut store) => {
+                let mut op = dir2_tree::Dir2Op::new(&mut store);
+                match op.remove(name.as_bytes())? {
+                    dir2_tree::Outcome::Done { shrink } => op.commit()?.then_some(shrink),
+                    dir2_tree::Outcome::Fallback => None,
+                }
+            }
+            None => None,
+        };
+        match handled {
+            Some(true) => self.rebuild_dir_without(sb, parent_ino, None)?,
+            Some(false) => {}
+            None => self.rebuild_dir_without(sb, parent_ino, Some(name))?,
         }
-        let sf_room = data_fork_end(sb, &core, buf.len()) - sb.fork_offset();
-        let layout = plan_dir_layout(&entries, parent_ino, dotdot, sb, Some(sf_room))?;
-        self.write_dir_layout(sb, parent_ino, &layout, &extents)?;
         if child_was_dir {
             self.bump_dir_nlink(sb, parent_ino, -1)?;
         }
         Ok(())
+    }
+
+    /// Rebuild a multi-block directory from its entries, minus `drop` when
+    /// given, into the smallest form that fits (down to short-form).
+    fn rebuild_dir_without(
+        &mut self,
+        sb: &super::sb::XfsSuperblock,
+        ino: u64,
+        drop: Option<&str>,
+    ) -> Result<(), FilesystemError> {
+        let (core, buf) = self.read_inode_buf(ino)?;
+        let extents = self.decode_data_extents(&core, &buf)?;
+        let (dotdot, mut entries) = self.read_multi_dir_entries(sb, &extents)?;
+        if let Some(name) = drop {
+            let before = entries.len();
+            entries.retain(|(n, _, _)| n != name);
+            if entries.len() == before {
+                return Err(FilesystemError::NotFound(name.into()));
+            }
+        }
+        let sf_room = data_fork_end(sb, &core, buf.len()) - sb.fork_offset();
+        let layout = plan_dir_layout(&entries, ino, dotdot, sb, Some(sf_room))?;
+        self.write_dir_layout(sb, ino, &layout, &extents)
     }
 
     /// Every entry of a multi-block directory as `(dotdot, entries)`, read
@@ -2704,6 +2857,181 @@ fn write_bmbt_root_to_leaf(fork: &mut [u8], first_startoff: u64, leaf_fsblock: u
     BigEndian::write_u64(&mut fork[4..12], first_startoff);
     let ptrs_off = 4 + maxrecs * 8;
     BigEndian::write_u64(&mut fork[ptrs_off..ptrs_off + 8], leaf_fsblock);
+}
+
+/// [`dir2_tree::Dir2Store`] over a leaf/node-form directory inode on disk:
+/// reads via the extent map; `apply` allocates, stamps, writes, remaps, frees.
+struct DiskDirStore<'a, R: Read + Write + Seek + Send> {
+    fs: &'a mut XfsFilesystem<R>,
+    sb: &'a super::sb::XfsSuperblock,
+    ino: u64,
+    geo: dir2_tree::Geo,
+    extents: Vec<super::bmap::XfsBmbtIrec>,
+    mapped: std::collections::BTreeSet<u64>,
+    size: u64,
+    fork_room: usize,
+}
+
+impl<'a, R: Read + Write + Seek + Send> DiskDirStore<'a, R> {
+    /// `None` when `ino` is not a leaf/node-form directory (no root block).
+    fn open(
+        fs: &'a mut XfsFilesystem<R>,
+        sb: &'a super::sb::XfsSuperblock,
+        ino: u64,
+    ) -> Result<Option<Self>, FilesystemError> {
+        let (core, buf) = fs.read_inode_buf(ino)?;
+        if core.format != super::types::DiFormat::Extents {
+            return Ok(None);
+        }
+        let extents = fs.decode_data_extents(&core, &buf)?;
+        let geo = dir2_tree::Geo::of(sb);
+        let regions = dir_regions(&extents, sb);
+        let mut mapped = std::collections::BTreeSet::new();
+        for (base, region) in [
+            (0u64, &regions.data),
+            (geo.leaf_off, &regions.leaf),
+            (geo.free_off, &regions.free),
+        ] {
+            for (i, b) in region.iter().enumerate() {
+                if b.is_some() {
+                    mapped.insert(base + i as u64 * geo.bpd);
+                }
+            }
+        }
+        if !mapped.contains(&geo.leaf_off) {
+            return Ok(None);
+        }
+        let fork_room = data_fork_end(sb, &core, buf.len()) - sb.fork_offset();
+        Ok(Some(DiskDirStore {
+            fs,
+            sb,
+            ino,
+            geo,
+            extents,
+            mapped,
+            size: core.size,
+            fork_room,
+        }))
+    }
+}
+
+impl<R: Read + Write + Seek + Send> dir2_tree::Dir2Store for DiskDirStore<'_, R> {
+    fn geo(&self) -> dir2_tree::Geo {
+        self.geo
+    }
+
+    fn read_block(&mut self, dablk: u64) -> Result<Option<Vec<u8>>, FilesystemError> {
+        if !self.mapped.contains(&dablk) {
+            return Ok(None);
+        }
+        self.fs.read_mapped_dir_block(self.sb, &self.extents, dablk)
+    }
+
+    fn is_mapped(&self, dablk: u64) -> bool {
+        self.mapped.contains(&dablk)
+    }
+
+    fn size(&self) -> u64 {
+        self.size
+    }
+
+    fn apply(&mut self, txn: dir2_tree::Dir2Txn) -> Result<bool, FilesystemError> {
+        let sb = self.sb;
+        let bpd = self.geo.bpd;
+        // Allocate every created block, next to the block before it when
+        // that run is free, so the directory stays in few extents.
+        let mut fresh: Vec<(u64, u64)> = Vec::new();
+        for &d in &txn.created {
+            let prev = fresh
+                .iter()
+                .find(|(fd, _)| *fd + bpd == d)
+                .map(|(_, f)| *f)
+                .or_else(|| {
+                    d.checked_sub(bpd)
+                        .and_then(|p| super::fb_to_disk(&self.extents, p).map(|(f, _)| f))
+                });
+            let mut got = None;
+            if let Some(p) = prev {
+                got = self.fs.alloc_blocks_at(sb, p + bpd, bpd as u32)?;
+            }
+            let fsb = match got {
+                Some(f) => f,
+                None => match self.fs.alloc_blocks_from_head(sb, bpd as u32) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        let runs: Vec<(u64, u32)> =
+                            fresh.iter().map(|(_, f)| (*f, bpd as u32)).collect();
+                        if !runs.is_empty() {
+                            self.fs.free_blocks(sb, &runs)?;
+                        }
+                        return Err(e);
+                    }
+                },
+            };
+            fresh.push((d, fsb));
+        }
+        // The new map: every mapped fsblock minus the freed dir blocks, plus
+        // the created ones, coalesced into extent records.
+        let mut map: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
+        for e in &self.extents {
+            for i in 0..e.blockcount {
+                let fb = e.startoff + i;
+                if !txn.freed.contains(&(fb - fb % bpd)) {
+                    map.insert(fb, e.startblock + i);
+                }
+            }
+        }
+        for &(d, fsb) in &fresh {
+            for i in 0..bpd {
+                map.insert(d + i, fsb + i);
+            }
+        }
+        let mut runs: Vec<(u64, u64, u32)> = Vec::new();
+        for (&fb, &fsb) in &map {
+            match runs.last_mut() {
+                Some((s, b, c)) if *s + u64::from(*c) == fb && *b + u64::from(*c) == fsb => *c += 1,
+                _ => runs.push((fb, fsb, 1)),
+            }
+        }
+        if runs.len() * BMBT_REC_SIZE > self.fork_room {
+            let back: Vec<(u64, u32)> = fresh.iter().map(|(_, f)| (*f, bpd as u32)).collect();
+            if !back.is_empty() {
+                self.fs.free_blocks(sb, &back)?;
+            }
+            return Ok(false);
+        }
+        for (d, bytes) in &txn.dirty {
+            let Some(&fsb) = map.get(d) else {
+                return Err(FilesystemError::Parse(format!(
+                    "directory block {d} written without a mapping"
+                )));
+            };
+            let mut block = bytes.clone();
+            if sb.is_v5() {
+                let daddr = super::v5_crc::fsblock_to_daddr(fsb, sb);
+                if self.geo.is_leaf_space(*d) {
+                    super::v5_crc::stamp_da3_blkinfo(&mut block, daddr, self.ino, sb);
+                } else {
+                    super::v5_crc::stamp_dir3_blk_hdr(&mut block, daddr, self.ino, sb);
+                }
+            }
+            self.fs.write_dir_block(sb, fsb, &block)?;
+        }
+        self.fs
+            .write_dir_inode_multi_extent(sb, self.ino, &runs, txn.size, map.len() as u64)?;
+        let mut gone: Vec<(u64, u32)> = Vec::new();
+        for &d in &txn.freed {
+            for i in 0..bpd {
+                if let Some((f, _)) = super::fb_to_disk(&self.extents, d + i) {
+                    gone.push((f, 1));
+                }
+            }
+        }
+        if !gone.is_empty() {
+            self.fs.free_blocks(sb, &gone)?;
+        }
+        Ok(true)
+    }
 }
 
 /// dir2 leaf-block magics (`xfs_da_blkinfo.magic`, big-endian u16 at byte 8):

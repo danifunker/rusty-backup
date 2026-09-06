@@ -1,0 +1,104 @@
+# Tier 3 — the deep XFS directory churn: the structures a thousand files never reach.
+#
+# `churn.xfs` (churn.toml) takes a directory through leaf form into node form,
+# a level-1 da btree over a few leafN blocks and one freeindex block. Two
+# more shapes exist at 4 KiB blocks, and each needs tens of thousands of
+# entries: a second freeindex block once the data blocks pass 2016, and a
+# second btree level once the leafN blocks pass 504 (about 230000 entries). `put --zero 0 --dst
+# "/d/f{A..B}"` seeds the entries in one process, so no fixture is needed;
+# the volume sizes give AG 0 room for the inodes. The first case takes about
+# a minute and the second about ten.
+#
+# The same volumes judged by `xfs_repair -n` (the Docker oracle) are recorded
+# under F-017 in docs/missing_features_from_regression.md.
+
+[meta]
+tier = 3
+group = "churn"
+description = "XFS directories past a thousand entries: a second freeindex block, a two-level da btree; fsck clean after each step."
+
+[[case]]
+id = "churn.xfs-freeindex"
+description = "XFS: 32000 long names in one directory need a second freeindex block; churn clean throughout"
+timeout_ms = 900000
+[[case.step]]
+args = ["new", "volume", "xfs", "--size", "96M", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["mkdir", "{scratch}/v.img", "/d"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "--zero", "0", "--dst", "/d/f{00001..32000}-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.txt"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/d/extra.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{scratch}/v.img", "/d/extra.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{scratch}/v.img", "/d/f*"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/d/last.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{scratch}/v.img", "/d"]
+expect_exit = 0
+stdout_contains = ["last.bin"]
+stdout_not_contains = ["f00001", "f32000", "extra.bin"]
+
+[[case]]
+id = "churn.xfs-deep"
+description = "XFS: 300000 entries in one directory need a two-level da btree; churn clean throughout"
+timeout_ms = 3600000
+[[case.step]]
+args = ["new", "volume", "xfs", "--size", "1G", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["mkdir", "{scratch}/v.img", "/d"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "--zero", "0", "--dst", "/d/f{000001..300000}"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/d/extra.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{scratch}/v.img", "/d/extra.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{scratch}/v.img", "/d/f*"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/d/last.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{scratch}/v.img", "/d"]
+expect_exit = 0
+stdout_contains = ["last.bin"]
+stdout_not_contains = ["f000001", "f300000", "extra.bin"]

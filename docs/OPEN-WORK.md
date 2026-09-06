@@ -59,13 +59,15 @@ Open holes in v4 edit (suggested order — easiest/most reusable first):
   (see §10).
 
 - **(C) leaf/node (multi-block) directories** — **shipped 2026-09-06**
-  (F-017 in `docs/missing_features_from_regression.md`): every insert and
-  remove on a block/leaf/node-form directory rebuilds it from its full
-  entry list into the smallest form that fits — block, leaf1, or a
-  one-level leafN da btree with a freeindex block — and removal shrinks
-  back down to short-form. Judged by `xfs_repair -n`. Still parked: a
-  second freeindex block and a two-level da btree (hundreds of thousands
-  of entries in one directory).
+  (F-017 in `docs/missing_features_from_regression.md`): leaf and
+  node-form directories are edited in place by `edit/dir2_tree.rs` — the
+  kernel's data-block free space, stale leaf slots, leaf and node splits,
+  root push-down and join, freeindex blocks — with the full rebuild kept
+  for block form, a full leaf1 index and shrinking after removes. Judged
+  by `xfs_repair -n` up to 32000 long names (a second freeindex block);
+  `churn.xfs-deep` takes 300000 names through a two-level da btree. Still
+  parked: merging half-empty sibling leaves (`xfs_dir2_leafn_toosmall`),
+  and F-018 (inode chunks stop at one AG's inobt).
 
 - **(D) bmap-btree file forks** — **shipped 2026-06-02** (single-leaf
   bmbt — multi-leaf parked for follow-up; see §10). The R2 abort-on-btree

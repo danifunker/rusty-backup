@@ -201,8 +201,13 @@ only churn runs on every filesystem that can hold a thousand files in
 F-012 .. F-017 (UFS, ProDOS, XFS, NTFS, ext4, SFS, Minix and classic HFS
 limits or defects), each fixed in its own commit on 2026-09-06; all 24
 cases pass and the known-failures list is empty again. The XFS one took
-leaf and node-form directories (rebuilt per operation, judged by the
-Docker `xfs_repair` oracle). Unit tests
+leaf and node-form directories, first rebuilt per operation and then, at
+the user's request, edited in place the way the kernel does
+(`src/fs/xfs/edit/dir2_tree.rs`, judged by the Docker `xfs_repair` oracle up
+to 32000 long names; `cases/tier3/churn-deep.toml` runs 32000 and 300000
+entries). That work found R-065 (v5 `blkno` stamps past AG 0, fixed) and
+F-018 (inode chunks stop at one AG's inobt; open) and R-066
+(`sb_fdblocks` omitted the free-space btrees' blocks; fixed). Unit tests
 `thousand_file_churn_keeps_the_catalog_clean` (HFS, HFS+) and
 `dir_grows_to_node_form_and_shrinks_back_to_short_form` (XFS) cover the
 churn in `cargo test`.

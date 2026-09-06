@@ -24,7 +24,7 @@
 <dt><code>-L / --literal</code></dt>
 <dd>Accepted for consistency with `ls`/`get`/`rm`; `put` always treats the destination as an exact literal path (it never globs), so glob metacharacters in a name are used verbatim with or without it</dd>
 <dt><code>--zero</code></dt>
-<dd>Pre-allocate N zero bytes instead of copying a host file. Pair with `--dst`</dd>
+<dd>Pre-allocate N zero bytes instead of copying a host file. Pair with `--dst`; a `{A..B}` range in its last component makes one file per number</dd>
 <dt><code>--dst</code></dt>
 <dd>Explicit destination flag; use this with `--zero` where the positional `DST` slot is awkward</dd>
 <dt><code>--boot</code></dt>

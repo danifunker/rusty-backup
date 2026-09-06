@@ -1765,7 +1765,7 @@ Usage: put [OPTIONS] <IMAGE> [HOST_FILE] [DST]
 **Options**
 
 - `-L` / `--literal` — Accepted for consistency with `ls`/`get`/`rm`; `put` always treats the destination as an exact literal path (it never globs), so glob metacharacters in a name are used verbatim with or without it
-- `--zero` — Pre-allocate N zero bytes instead of copying a host file. Pair with `--dst`
+- `--zero` — Pre-allocate N zero bytes instead of copying a host file. Pair with `--dst`; a `{A..B}` range in its last component makes one file per number
 - `--dst` — Explicit destination flag; use this with `--zero` where the positional `DST` slot is awkward
 - `--boot` — Write the 1024-byte boot-block region of the image verbatim. HFS-only today
 - `--boot-from` — Copy the 1024-byte boot-block region from a donor disk that already boots (`path` or `path@N`), instead of from a raw file. The donor's classic-HFS volume is auto-located (flat `.hfv`/`.dsk` at byte 0, or an `Apple_HFS` partition) and its `'LK'` signature validated. The region is written to the *target partition's* first sector, so this works on a flat HFV and on the HFS partition of a full (APM) disk alike — target the HFS partition with `IMG@N` (the DDR / partition map / drivers ahead of it are never touched). Use it to make a bare HFS volume (e.g. an edited infinite-mac disk) bootable. HFS-only today
@@ -2122,7 +2122,7 @@ Usage: put [OPTIONS] <IMAGE> [HOST_FILE] [DST]
 **Options**
 
 - `-L` / `--literal` — Accepted for consistency with `ls`/`get`/`rm`; `put` always treats the destination as an exact literal path (it never globs), so glob metacharacters in a name are used verbatim with or without it
-- `--zero` — Pre-allocate N zero bytes instead of copying a host file. Pair with `--dst`
+- `--zero` — Pre-allocate N zero bytes instead of copying a host file. Pair with `--dst`; a `{A..B}` range in its last component makes one file per number
 - `--dst` — Explicit destination flag; use this with `--zero` where the positional `DST` slot is awkward
 - `--boot` — Write the 1024-byte boot-block region of the image verbatim. HFS-only today
 - `--boot-from` — Copy the 1024-byte boot-block region from a donor disk that already boots (`path` or `path@N`), instead of from a raw file. The donor's classic-HFS volume is auto-located (flat `.hfv`/`.dsk` at byte 0, or an `Apple_HFS` partition) and its `'LK'` signature validated. The region is written to the *target partition's* first sector, so this works on a flat HFV and on the HFS partition of a full (APM) disk alike — target the HFS partition with `IMG@N` (the DDR / partition map / drivers ahead of it are never touched). Use it to make a bare HFS volume (e.g. an edited infinite-mac disk) bootable. HFS-only today
