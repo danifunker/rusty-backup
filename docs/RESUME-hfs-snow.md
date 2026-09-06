@@ -206,8 +206,10 @@ the user's request, edited in place the way the kernel does
 (`src/fs/xfs/edit/dir2_tree.rs`, judged by the Docker `xfs_repair` oracle up
 to 32000 long names; `cases/tier3/churn-deep.toml` runs 32000 and 300000
 entries). That work found R-065 (v5 `blkno` stamps past AG 0, fixed) and
-F-018 (inode chunks stop at one AG's inobt; open) and R-066
-(`sb_fdblocks` omitted the free-space btrees' blocks; fixed). Unit tests
+F-018 (inode chunks stopped at one AG's inobt; the allocator now walks
+the AGs, and a directory past the inline extent cap gets bmbt leaves),
+R-066 (`sb_fdblocks` omitted the free-space btrees' blocks) and R-067
+(fsck counted bmbt leaves as leaked), all fixed. Unit tests
 `thousand_file_churn_keeps_the_catalog_clean` (HFS, HFS+) and
 `dir_grows_to_node_form_and_shrinks_back_to_short_form` (XFS) cover the
 churn in `cargo test`.

@@ -479,14 +479,10 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
                 let (_parent, entries) = dir2::parse_shortform(fork, self.sb.has_ftype())?;
                 Ok(entries)
             }
-            DiFormat::Extents => {
-                let fork = self.data_fork(core, inode_buf);
-                let recs = self.decode_inline_extents(fork, core.nextents as usize)?;
+            DiFormat::Extents | DiFormat::Btree => {
+                let recs = self.decode_data_extents(core, inode_buf)?;
                 self.walk_dir2_data_blocks(&recs, dirblksize, core.size)
             }
-            DiFormat::Btree => Err(FilesystemError::Unsupported(
-                "XFS btree-format directory extent map (deferred)".into(),
-            )),
             DiFormat::Other(v) => Err(FilesystemError::Parse(format!(
                 "unknown XFS di_format {v} on directory inode {}",
                 core.ino

@@ -5,9 +5,10 @@
 # more shapes exist at 4 KiB blocks, and each needs tens of thousands of
 # entries: a second freeindex block once the data blocks pass 2016, and a
 # second btree level once the leafN blocks pass 504 (about 230000 entries). `put --zero 0 --dst
-# "/d/f{A..B}"` seeds the entries in one process, so no fixture is needed;
-# the volume sizes give AG 0 room for the inodes. The first case takes about
-# a minute and the second about fifteen.
+# "/d/f{A..B}"` seeds the entries in one process, so no fixture is needed.
+# The 300000 inodes of the second case do not fit one AG of its 256 MiB
+# volume, which pins F-018 (chunks continue in the next AG). The first case
+# takes about a minute and the second about 41 (on an otherwise idle machine).
 #
 # The same volumes judged by `xfs_repair -n` (the Docker oracle) are recorded
 # under F-017 in docs/missing_features_from_regression.md.
@@ -65,7 +66,7 @@ id = "churn.xfs-deep"
 description = "XFS: 300000 entries in one directory need a two-level da btree; churn clean throughout"
 timeout_ms = 3600000
 [[case.step]]
-args = ["new", "volume", "xfs", "--size", "1G", "{scratch}/v.img"]
+args = ["new", "volume", "xfs", "--size", "256M", "{scratch}/v.img"]
 expect_exit = 0
 [[case.step]]
 args = ["mkdir", "{scratch}/v.img", "/d"]

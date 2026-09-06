@@ -21,7 +21,7 @@
 //!     ([`free_inode`]): claim/release an inode in an existing inode-btree
 //!     chunk (flip `ir_free`, adjust the record freecount + AGI freecount +
 //!     `sb_ifree`). When every existing chunk is full, `alloc_new_inode_chunk`
-//!     carves a fresh 64-inode chunk via [`alloc_blocks_aligned`], writes 64
+//!     carves a fresh 64-inode chunk via [`alloc_blocks_aligned_in_ag`], writes 64
 //!     free dinodes, then splices a new record into the AG's inobt and bumps
 //!     the AGI + superblock inode counters; the slot search then runs again
 //!     and claims slot 0 of the new chunk. Two splice strategies pick
@@ -234,7 +234,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
 
     /// Extend an AG's inobt with a brand-new 64-inode chunk. Carves
     /// `blocks_per_chunk` aligned contiguous blocks via
-    /// [`alloc_blocks_aligned`], writes 64 free dinodes there, then splices a
+    /// [`alloc_blocks_aligned_in_ag`], writes 64 free dinodes there, then splices a
     /// fresh inobt record (all 64 bits set ⇒ all free) into the AG's inobt.
     /// Updates AGI `count`/`freecount` and superblock `sb_icount`/`sb_ifree`
     /// by `+64` each — the caller's slot claim later rebalances `freecount`/
@@ -258,7 +258,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         sb: &super::sb::XfsSuperblock,
     ) -> Result<(), FilesystemError> {
         // §2.1 (E.5b): v5 lifted. `init_free_inode_chunk` stamps each v3
-        // inode core (E.2), `alloc_blocks_aligned` rebuilds the host AG's
+        // inode core (E.2), `alloc_blocks_aligned_in_ag` rebuilds the host AG's
         // freespace btrees through the v5-aware `build_alloc_btree` (E.4),
         // and the splice / grow paths both stamp the AGI sector + the
         // inobt leaf or fresh tree blocks on v5 (this slice + E.4).
@@ -284,12 +284,42 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         let (_root_core, root_buf) = self.read_inode_buf(sb.rootino)?;
         let di_version = root_buf[4];
 
-        // Carve the chunk's contiguous aligned blocks. alloc_blocks_aligned
-        // also rebuilds the host AG's freespace btrees + resyncs sb_fdblocks,
-        // so on success the volume's free-space accounting is already correct
-        // for the consumed run.
-        let chunk_fsblock = self.alloc_blocks_aligned(sb, blocks_per_chunk, alignment)?;
-        let agno = chunk_fsblock >> sb.agblklog;
+        // The chunk and its inobt record must share an AG, so try each AG in
+        // turn and let a failed inobt growth hand the chunk back (F-018).
+        for agno in 0..sb.agcount as u64 {
+            match self.alloc_inode_chunk_in_ag(
+                sb,
+                agno,
+                blocks_per_chunk,
+                alignment,
+                max_leaf,
+                di_version,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(FilesystemError::DiskFull(_)) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(FilesystemError::DiskFull(
+            "no allocation group has room for an inode chunk and its inobt growth".into(),
+        ))
+    }
+
+    /// One AG's attempt at [`alloc_new_inode_chunk`]: carve the chunk there,
+    /// initialise it, splice or grow the AG's inobt; on `DiskFull` the chunk goes back.
+    fn alloc_inode_chunk_in_ag(
+        &mut self,
+        sb: &super::sb::XfsSuperblock,
+        agno: u64,
+        blocks_per_chunk: u32,
+        alignment: u32,
+        max_leaf: usize,
+        di_version: u8,
+    ) -> Result<(), FilesystemError> {
+        let bs = sb.blocksize as u64;
+        let bs_usize = bs as usize;
+        let chunk_fsblock =
+            self.alloc_blocks_aligned_in_ag(sb, agno, blocks_per_chunk, alignment)?;
         let chunk_agbno = (chunk_fsblock & ((1u64 << sb.agblklog) - 1)) as u32;
         let start_agino = ((chunk_agbno as u64) << sb.inopblog) as u32;
 
@@ -323,13 +353,20 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
             false
         };
 
-        if single_leaf_fits {
-            self.splice_inobt_single_leaf_record(sb, agno, agi.root, start_agino, max_leaf)?;
+        let recorded = if single_leaf_fits {
+            self.splice_inobt_single_leaf_record(sb, agno, agi.root, start_agino, max_leaf)
         } else {
-            self.grow_inobt_with_new_record(sb, agno, agi.root, start_agino)?;
-            // grow_inobt_with_new_record rewrote AGI root + level; refresh.
-            read_at_aligned(&mut self.reader, agi_byte, sectsize, &mut agi_sec)?;
+            self.grow_inobt_with_new_record(sb, agno, agi.root, start_agino)
+        };
+        if let Err(e) = recorded {
+            if matches!(e, FilesystemError::DiskFull(_)) {
+                self.free_blocks(sb, &[(chunk_fsblock, blocks_per_chunk)])?;
+            }
+            return Err(e);
         }
+        // Either path may have rewritten the AGI root and level; refresh.
+        read_at_aligned(&mut self.reader, agi_byte, sectsize, &mut agi_sec)?;
+        let agi = XfsAgi::parse(&agi_sec)?;
 
         // AGI count += 64, freecount += 64. The single-leaf path leaves AGI
         // root/level untouched; the multi-level grow already wrote new values
@@ -572,51 +609,40 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         Ok(carved[0])
     }
 
-    /// Carve `n` contiguous blocks whose start agbno is a multiple of
-    /// `alignment`, returning the starting fsblock. Walks every AG, picks the
-    /// first whose largest free extent admits an aligned `n`-block run, then
-    /// rebuilds that AG's bno/cnt over the remainder and resyncs
-    /// `sb_fdblocks` — same shape as [`alloc_blocks`].
-    fn alloc_blocks_aligned(
+    /// Carve `n` contiguous blocks in AG `agno` starting on a multiple of
+    /// `alignment` (the inode-chunk stride); `DiskFull` when the AG cannot.
+    fn alloc_blocks_aligned_in_ag(
         &mut self,
         sb: &super::sb::XfsSuperblock,
+        agno: u64,
         n: u32,
         alignment: u32,
     ) -> Result<u64, FilesystemError> {
         if n == 0 || alignment == 0 {
             return Err(FilesystemError::InvalidData(
-                "alloc_blocks_aligned: zero n or alignment".into(),
+                "alloc_blocks_aligned_in_ag: zero n or alignment".into(),
             ));
         }
         let agblocks = sb.agblocks as u64;
-        for agno in 0..sb.agcount as u64 {
-            let expected_len = if agno == sb.agcount as u64 - 1 {
-                sb.dblocks - agno * agblocks
-            } else {
-                agblocks
-            };
-            let full_free = match self.current_full_free(sb, agno, expected_len) {
-                Ok(f) => f,
-                Err(_) => continue,
-            };
-            let Some((carved_start, free_after)) =
-                carve_aligned_from_largest(&full_free, n, alignment)
-            else {
-                continue;
-            };
-            if self
-                .rebuild_ag_freespace(sb, agno, expected_len, &free_after)
-                .is_err()
-            {
-                continue;
-            }
-            self.resync_sb_fdblocks(sb)?;
-            return Ok((agno << sb.agblklog) | carved_start as u64);
-        }
-        Err(FilesystemError::DiskFull(format!(
-            "no allocation group has a free extent admitting a {n}-block run \
-             aligned to {alignment}"
-        )))
+        let expected_len = if agno == sb.agcount as u64 - 1 {
+            sb.dblocks - agno * agblocks
+        } else {
+            agblocks
+        };
+        let no_room = || {
+            FilesystemError::DiskFull(format!(
+                "AG {agno} has no free extent admitting a {n}-block run aligned to {alignment}"
+            ))
+        };
+        let full_free = self
+            .current_full_free(sb, agno, expected_len)
+            .map_err(|_| no_room())?;
+        let (carved_start, free_after) =
+            carve_aligned_from_largest(&full_free, n, alignment).ok_or_else(no_room)?;
+        self.rebuild_ag_freespace(sb, agno, expected_len, &free_after)
+            .map_err(|_| no_room())?;
+        self.resync_sb_fdblocks(sb)?;
+        Ok((agno << sb.agblklog) | carved_start as u64)
     }
 
     /// Initialize a fresh inode chunk: write 64 free dinodes at the chunk's
@@ -951,7 +977,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
     /// Stamp v5 AGFL CRC tuple (uuid/lsn/crc) and write the sector. v4 just
     /// writes through. No current edit path mutates the AGFL contents, so
     /// this helper isn't called yet — kept here so when E.5b's
-    /// `alloc_blocks_aligned` path needs to touch the AGFL (e.g. when an
+    /// `alloc_blocks_aligned_in_ag` path needs to touch the AGFL (e.g. when an
     /// allocation drains the AGFL reserve and a refill becomes necessary)
     /// the stamping site is already wired.
     #[allow(dead_code)]
@@ -1827,7 +1853,10 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         }
         // Leaf/node form: a hash lookup for the duplicate check, and room
         // for the couple of dir blocks an insert can add.
-        if core.format == super::types::DiFormat::Extents {
+        if matches!(
+            core.format,
+            super::types::DiFormat::Extents | super::types::DiFormat::Btree
+        ) {
             let dup = match DiskDirStore::open(self, sb, parent_ino)? {
                 Some(mut store) => {
                     Some(dir2_tree::Dir2Op::new(&mut store).contains(name.as_bytes())?)
@@ -1937,7 +1966,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                     other => other,
                 }
             }
-            super::types::DiFormat::Extents => {
+            super::types::DiFormat::Extents | super::types::DiFormat::Btree => {
                 self.extents_insert_entry(sb, parent_ino, name, child_ino, is_dir)
             }
             _ => Err(FilesystemError::Unsupported(
@@ -2220,12 +2249,12 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         }
         let (core, ibuf) = self.read_inode_buf(ino)?;
         let fork_room = data_fork_end(sb, &core, ibuf.len()) - sb.fork_offset();
-        if new_extents.len() * BMBT_REC_SIZE > fork_room {
+        if new_extents.len() > bmbt_root_max(fork_room) * bmbt_leaf_max(sb) {
             if !fresh.is_empty() {
                 self.free_blocks(sb, &fresh)?;
             }
             return Err(FilesystemError::Unsupported(
-                "directory inline fork can't hold this many extents".into(),
+                "directory extent list needs a two-level bmap btree".into(),
             ));
         }
         // Stamp (v5) and write every block now that its fsblock is known.
@@ -2266,6 +2295,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         sf_fork: &[u8],
     ) -> Result<(), FilesystemError> {
         let (core, mut ibuf) = self.read_inode_buf(ino)?;
+        let old_leaves = self.dir_bmbt_leaves(sb, &core, &ibuf)?;
         let fs = sb.fork_offset();
         let end = data_fork_end(sb, &core, ibuf.len());
         ibuf[5] = 1; // di_format = local
@@ -2276,7 +2306,12 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
             *b = 0;
         }
         ibuf[fs..fs + sf_fork.len()].copy_from_slice(sf_fork);
-        self.write_inode_region(sb, ino, &ibuf)
+        self.write_inode_region(sb, ino, &ibuf)?;
+        if !old_leaves.is_empty() {
+            let runs: Vec<(u64, u32)> = old_leaves.iter().map(|&l| (l, 1)).collect();
+            self.free_blocks(sb, &runs)?;
+        }
+        Ok(())
     }
 
     /// Whether some AG has one free run of `n` blocks (read-only probe).
@@ -2313,25 +2348,91 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         nblocks: u64,
     ) -> Result<(), FilesystemError> {
         let (core, mut buf) = self.read_inode_buf(ino)?;
-        buf[5] = 2; // di_format = extents
-        BigEndian::write_u64(&mut buf[56..64], size); // di_size
-        BigEndian::write_u64(&mut buf[64..72], nblocks); // di_nblocks
-        BigEndian::write_u32(&mut buf[76..80], extents.len() as u32); // di_nextents
         let fs = sb.fork_offset();
         let isz = data_fork_end(sb, &core, buf.len());
+        let mut leaves = self.dir_bmbt_leaves(sb, &core, &buf)?;
+        // Past the literal area the records go to bmap-btree leaves under an
+        // in-inode root, reusing the directory's own (`xfs_bmap_extents_to_btree`).
+        let per_leaf = bmbt_leaf_max(sb);
+        let needed = if fs + extents.len() * BMBT_REC_SIZE <= isz {
+            0
+        } else {
+            extents.len().div_ceil(per_leaf)
+        };
+        if needed > bmbt_root_max(isz - fs) {
+            return Err(FilesystemError::Unsupported(
+                "directory extent list needs a two-level bmap btree".into(),
+            ));
+        }
+        while leaves.len() < needed {
+            leaves.push(self.alloc_blocks(sb, 1)?);
+        }
+        let surplus = leaves.split_off(needed);
+        buf[5] = if needed > 0 { 3 } else { 2 }; // di_format
+        BigEndian::write_u64(&mut buf[56..64], size); // di_size
+        BigEndian::write_u64(&mut buf[64..72], nblocks + needed as u64); // di_nblocks
+        BigEndian::write_u32(&mut buf[76..80], extents.len() as u32); // di_nextents
         for b in buf.iter_mut().take(isz).skip(fs) {
             *b = 0;
         }
-        if fs + extents.len() * 16 > isz {
+        if needed > 0 {
+            let mut root: Vec<(u64, u64)> = Vec::with_capacity(needed);
+            for (i, chunk) in extents.chunks(per_leaf).enumerate() {
+                let mut leaf_bytes = build_bmbt_leaf(chunk, sb);
+                let left = if i == 0 { NULLFSBLOCK } else { leaves[i - 1] };
+                let right = leaves.get(i + 1).copied().unwrap_or(NULLFSBLOCK);
+                BigEndian::write_u64(&mut leaf_bytes[8..16], left);
+                BigEndian::write_u64(&mut leaf_bytes[16..24], right);
+                if sb.is_v5() {
+                    let blkno = super::v5_crc::fsblock_to_daddr(leaves[i], sb);
+                    super::v5_crc::stamp_lblock_crc_header(&mut leaf_bytes, blkno, ino, sb);
+                }
+                self.write_fsblock(sb, leaves[i], &leaf_bytes)?;
+                root.push((chunk[0].0, leaves[i]));
+            }
+            write_bmbt_root(&mut buf[fs..isz], &root);
+        } else {
+            for (i, &(startoff, fsblock, count)) in extents.iter().enumerate() {
+                let rec = encode_extent(false, startoff, fsblock, count as u64);
+                buf[fs + i * 16..fs + (i + 1) * 16].copy_from_slice(&rec);
+            }
+        }
+        self.write_inode_region(sb, ino, &buf)?;
+        if !surplus.is_empty() {
+            let runs: Vec<(u64, u32)> = surplus.iter().map(|&l| (l, 1)).collect();
+            self.free_blocks(sb, &runs)?;
+        }
+        Ok(())
+    }
+
+    /// The bmap-btree leaves of a btree-format directory fork, left to right;
+    /// a tree deeper than root-over-leaves is refused.
+    fn dir_bmbt_leaves(
+        &mut self,
+        sb: &super::sb::XfsSuperblock,
+        core: &super::inode::XfsDinodeCore,
+        buf: &[u8],
+    ) -> Result<Vec<u64>, FilesystemError> {
+        if core.format != super::types::DiFormat::Btree {
+            return Ok(Vec::new());
+        }
+        let fork = &buf[sb.fork_offset()..data_fork_end(sb, core, buf.len())];
+        let (level, first) = super::parse_bmbt_root(fork, fork.len())?;
+        if level != 1 {
             return Err(FilesystemError::Unsupported(
-                "directory inline fork can't hold this many extents".into(),
+                "directory with a two-level bmap btree is not editable".into(),
             ));
         }
-        for (i, &(startoff, fsblock, count)) in extents.iter().enumerate() {
-            let rec = encode_extent(false, startoff, fsblock, count as u64);
-            buf[fs + i * 16..fs + (i + 1) * 16].copy_from_slice(&rec);
+        let mut leaves = vec![first];
+        let mut block = vec![0u8; sb.blocksize as usize];
+        loop {
+            self.read_fsblock(*leaves.last().unwrap_or(&first), &mut block)?;
+            let right = BigEndian::read_u64(&block[16..24]);
+            if right == NULLFSBLOCK || leaves.len() > 64 {
+                return Ok(leaves);
+            }
+            leaves.push(right);
         }
-        self.write_inode_region(sb, ino, &buf)
     }
 
     /// Remove `name` from directory `parent_ino`, dispatching by format:
@@ -2349,7 +2450,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
             super::types::DiFormat::Local => {
                 self.sf_remove_entry(sb, parent_ino, name, child_was_dir)
             }
-            super::types::DiFormat::Extents => {
+            super::types::DiFormat::Extents | super::types::DiFormat::Btree => {
                 self.extents_remove_entry(sb, parent_ino, name, child_was_dir)
             }
             _ => Err(FilesystemError::Unsupported(
@@ -2374,7 +2475,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                 let fork = &buf[fs..fs + core.size as usize];
                 Ok(sf_entries_with_ftype(fork, has_ftype)?)
             }
-            super::types::DiFormat::Extents => {
+            super::types::DiFormat::Extents | super::types::DiFormat::Btree => {
                 let extents = self.decode_data_extents(core, buf)?;
                 self.read_multi_dir_entries(sb, &extents)
             }
@@ -2851,12 +2952,25 @@ fn build_bmbt_leaf(extents: &[(u64, u64, u32)], sb: &super::sb::XfsSuperblock) -
 /// case with `numrecs=1` is in scope. `maxrecs = (fork_len - 4) / 16` matches
 /// the read-side `parse_bmbt_root`.
 fn write_bmbt_root_to_leaf(fork: &mut [u8], first_startoff: u64, leaf_fsblock: u64) {
+    write_bmbt_root(fork, &[(first_startoff, leaf_fsblock)]);
+}
+
+/// Leaves an in-inode bmbt root of `fork_len` bytes can point at.
+fn bmbt_root_max(fork_len: usize) -> usize {
+    fork_len.saturating_sub(4) / 16
+}
+
+/// Write a level-1 in-inode bmbt root: `(first startoff, leaf fsblock)` per
+/// leaf, keys packed first and pointers after the key area (`xfs_bmdr_block`).
+fn write_bmbt_root(fork: &mut [u8], leaves: &[(u64, u64)]) {
     BigEndian::write_u16(&mut fork[0..2], 1); // level 1 (above leaves)
-    BigEndian::write_u16(&mut fork[2..4], 1); // numrecs
-    let maxrecs = (fork.len().saturating_sub(4)) / 16;
-    BigEndian::write_u64(&mut fork[4..12], first_startoff);
+    BigEndian::write_u16(&mut fork[2..4], leaves.len() as u16); // numrecs
+    let maxrecs = bmbt_root_max(fork.len());
     let ptrs_off = 4 + maxrecs * 8;
-    BigEndian::write_u64(&mut fork[ptrs_off..ptrs_off + 8], leaf_fsblock);
+    for (i, &(startoff, fsblock)) in leaves.iter().enumerate() {
+        BigEndian::write_u64(&mut fork[4 + i * 8..12 + i * 8], startoff);
+        BigEndian::write_u64(&mut fork[ptrs_off + i * 8..ptrs_off + i * 8 + 8], fsblock);
+    }
 }
 
 /// [`dir2_tree::Dir2Store`] over a leaf/node-form directory inode on disk:
@@ -2869,7 +2983,8 @@ struct DiskDirStore<'a, R: Read + Write + Seek + Send> {
     extents: Vec<super::bmap::XfsBmbtIrec>,
     mapped: std::collections::BTreeSet<u64>,
     size: u64,
-    fork_room: usize,
+    /// Extent records the inode can address: inline, or bmbt leaves under its root.
+    extent_cap: usize,
 }
 
 impl<'a, R: Read + Write + Seek + Send> DiskDirStore<'a, R> {
@@ -2880,7 +2995,10 @@ impl<'a, R: Read + Write + Seek + Send> DiskDirStore<'a, R> {
         ino: u64,
     ) -> Result<Option<Self>, FilesystemError> {
         let (core, buf) = fs.read_inode_buf(ino)?;
-        if core.format != super::types::DiFormat::Extents {
+        if !matches!(
+            core.format,
+            super::types::DiFormat::Extents | super::types::DiFormat::Btree
+        ) {
             return Ok(None);
         }
         let extents = fs.decode_data_extents(&core, &buf)?;
@@ -2910,7 +3028,7 @@ impl<'a, R: Read + Write + Seek + Send> DiskDirStore<'a, R> {
             extents,
             mapped,
             size: core.size,
-            fork_room,
+            extent_cap: bmbt_root_max(fork_room) * bmbt_leaf_max(sb),
         }))
     }
 }
@@ -2993,7 +3111,7 @@ impl<R: Read + Write + Seek + Send> dir2_tree::Dir2Store for DiskDirStore<'_, R>
                 _ => runs.push((fb, fsb, 1)),
             }
         }
-        if runs.len() * BMBT_REC_SIZE > self.fork_room {
+        if runs.len() > self.extent_cap {
             let back: Vec<(u64, u32)> = fresh.iter().map(|(_, f)| (*f, bpd as u32)).collect();
             if !back.is_empty() {
                 self.fs.free_blocks(sb, &back)?;
@@ -3959,6 +4077,72 @@ mod tests {
         assert!(
             crate::fs::xfs::v5_crc::crc_valid(&buf, crate::fs::xfs::v5_crc::DA3_CRC_OFF),
             "da3_blkinfo CRC mismatch after stamp"
+        );
+    }
+
+    /// F-018's deep run hit the 21-extent inline cap: the directory's extent
+    /// list now moves to a bmap-btree leaf and comes back inline, leaf freed.
+    #[test]
+    fn directory_extent_list_moves_to_a_bmbt_leaf_and_back() {
+        use crate::fs::filesystem::{CreateDirectoryOptions, EditableFilesystem, Filesystem};
+        let img = crate::fs::xfs::format::create_blank_xfs(32 << 20, "bmbt").unwrap();
+        let mut fs = XfsFilesystem::open(std::io::Cursor::new(img), 0).unwrap();
+        let root = fs.root().unwrap();
+        let dir = fs
+            .create_directory(&root, "d", &CreateDirectoryOptions::default())
+            .unwrap();
+        let sb = fs.sb.clone();
+        let fdblocks = |fs: &mut XfsFilesystem<std::io::Cursor<Vec<u8>>>| -> u64 {
+            let mut primary = vec![0u8; sb.sectsize as usize];
+            read_at_aligned(
+                &mut fs.reader,
+                fs.partition_offset,
+                sb.sectsize as u64,
+                &mut primary,
+            )
+            .unwrap();
+            BigEndian::read_u64(&primary[144..152]) // sb_fdblocks
+        };
+        // Single-block runs allocated so no two coalesce: more than one
+        // 4 KiB leaf holds (251 records), so the root points at two leaves.
+        let n = bmbt_leaf_max(&sb) as u64 + 40;
+        let mut extents: Vec<(u64, u64, u32)> = Vec::new();
+        for i in 0..n {
+            let b = fs.alloc_blocks(&sb, 1).unwrap();
+            extents.push((i, b, 1));
+        }
+        let free_with_runs = fdblocks(&mut fs);
+        let size = n * u64::from(sb.dirblksize());
+        fs.write_dir_inode_multi_extent(&sb, dir.location, &extents, size, n)
+            .unwrap();
+        let (core, buf) = fs.read_inode_buf(dir.location).unwrap();
+        assert_eq!(core.format, super::super::types::DiFormat::Btree);
+        assert_eq!(core.nextents as u64, n);
+        assert_eq!(core.nblocks, n + 2, "both bmbt leaves count in di_nblocks");
+        assert_eq!(fs.dir_bmbt_leaves(&sb, &core, &buf).unwrap().len(), 2);
+        let back: Vec<(u64, u64, u32)> = fs
+            .decode_data_extents(&core, &buf)
+            .unwrap()
+            .iter()
+            .map(|e| (e.startoff, e.startblock, e.blockcount as u32))
+            .collect();
+        assert_eq!(back, extents, "records round-trip through the leaf");
+        assert_eq!(
+            fdblocks(&mut fs),
+            free_with_runs - 2,
+            "two blocks went to leaves"
+        );
+        // Shrinking to three extents goes back inline and returns the leaf.
+        fs.write_dir_inode_multi_extent(&sb, dir.location, &extents[..3], size, 3)
+            .unwrap();
+        let (core, buf) = fs.read_inode_buf(dir.location).unwrap();
+        assert_eq!(core.format, super::super::types::DiFormat::Extents);
+        assert_eq!(core.nblocks, 3);
+        assert_eq!(fs.decode_data_extents(&core, &buf).unwrap().len(), 3);
+        assert_eq!(
+            fdblocks(&mut fs),
+            free_with_runs,
+            "the leaf blocks are free again"
         );
     }
 }

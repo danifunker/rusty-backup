@@ -66,8 +66,7 @@ Open holes in v4 edit (suggested order — easiest/most reusable first):
   for block form, a full leaf1 index and shrinking after removes. Judged
   by `xfs_repair -n` up to 32000 long names (a second freeindex block);
   `churn.xfs-deep` takes 300000 names through a two-level da btree. Still
-  parked: merging half-empty sibling leaves (`xfs_dir2_leafn_toosmall`),
-  and F-018 (inode chunks stop at one AG's inobt).
+  parked: merging half-empty sibling leaves (`xfs_dir2_leafn_toosmall`).
 
 - **(D) bmap-btree file forks** — **shipped 2026-06-02** (single-leaf
   bmbt — multi-leaf parked for follow-up; see §10). The R2 abort-on-btree
