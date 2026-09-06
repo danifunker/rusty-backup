@@ -1629,9 +1629,91 @@ impl<R: Read + Seek> SfsFilesystem<R> {
             admc = rd_u32(&buf, ADMC_NEXT);
             seen += 1;
         }
+        // Every region is full: take a fresh one and try once more (F-014).
+        self.grow_admin_space()?;
+        self.alloc_admin_block_no_grow()
+    }
+
+    /// One pass over the admin regions with no growth; DiskFull when full.
+    fn alloc_admin_block_no_grow(&mut self) -> Result<u32, FilesystemError> {
+        let mut admc = self.root.adminspacecontainer;
+        let mut seen = 0usize;
+        while admc != 0 && seen < ADMC_MAX_CONTAINERS {
+            let buf = self.read_block(admc)?.to_vec();
+            let region_size = (buf[ADMC_REGION_SIZE] as u32).min(ADMC_MAX_REGION);
+            let mut o = ADMC_ADMINSPACE;
+            while o + ADMC_ENTRY_SIZE <= buf.len() && region_size > 0 {
+                let space = rd_u32(&buf, o);
+                if space == 0 {
+                    break;
+                }
+                let bits = rd_u32(&buf, o + 4);
+                for i in 0..region_size {
+                    let mask = 1u32 << (31 - i);
+                    if bits & mask != 0 || space + i >= self.root.totalblocks {
+                        continue;
+                    }
+                    self.ensure_dirty(admc)?;
+                    let dbuf = self.dirty.get_mut(&admc).unwrap();
+                    let updated = rd_u32(dbuf, o + 4) | mask;
+                    write_u32(dbuf, o + 4, updated);
+                    let bs = self.root.blocksize as usize;
+                    self.dirty.insert(space + i, vec![0u8; bs]);
+                    return Ok(space + i);
+                }
+                o += ADMC_ENTRY_SIZE;
+            }
+            admc = rd_u32(&buf, ADMC_NEXT);
+            seen += 1;
+        }
         Err(FilesystemError::DiskFull(
             "SFS: no free admin-space slots".into(),
         ))
+    }
+
+    /// `allocadminspace`'s growth: a fresh 32-block region from the bitmap,
+    /// entered in the first container with an unused slot, else as a new
+    /// container linked at the end of the chain (the region's own first block).
+    fn grow_admin_space(&mut self) -> Result<(), FilesystemError> {
+        let region = ADMC_MAX_REGION;
+        let start = self.alloc_data_blocks(region)?;
+        let mut admc = self.root.adminspacecontainer;
+        let mut seen = 0usize;
+        loop {
+            let buf = self.read_block(admc)?.to_vec();
+            validate_block(&buf, ADMINSPACECONTAINER_ID, admc)?;
+            let mut o = ADMC_ADMINSPACE;
+            while o + ADMC_ENTRY_SIZE <= buf.len() {
+                if rd_u32(&buf, o) == 0 {
+                    self.ensure_dirty(admc)?;
+                    let dbuf = self.dirty.get_mut(&admc).unwrap();
+                    write_u32(dbuf, o, start);
+                    write_u32(dbuf, o + 4, 0);
+                    return Ok(());
+                }
+                o += ADMC_ENTRY_SIZE;
+            }
+            let next = rd_u32(&buf, ADMC_NEXT);
+            seen += 1;
+            if next != 0 && seen < ADMC_MAX_CONTAINERS {
+                admc = next;
+                continue;
+            }
+            // No slot anywhere: the new region opens with its own container.
+            self.ensure_dirty(admc)?;
+            let dbuf = self.dirty.get_mut(&admc).unwrap();
+            write_u32(dbuf, ADMC_NEXT, start);
+            let bs = self.root.blocksize as usize;
+            let mut nb = vec![0u8; bs];
+            write_u32(&mut nb, 0, ADMINSPACECONTAINER_ID);
+            write_u32(&mut nb, 8, start);
+            write_u32(&mut nb, 16, admc); // previous
+            nb[ADMC_REGION_SIZE] = region as u8;
+            write_u32(&mut nb, ADMC_ADMINSPACE, start);
+            write_u32(&mut nb, ADMC_ADMINSPACE + 4, 0x8000_0000);
+            self.dirty.insert(start, nb);
+            return Ok(());
+        }
     }
 
     fn free_admin_block(&mut self, blk: u32) -> Result<(), FilesystemError> {
@@ -1707,18 +1789,168 @@ impl<R: Read + Seek> SfsFilesystem<R> {
     /// whose exact semantics we cannot check against the reference sources
     /// would be the riskier choice.
     fn alloc_object_node(&mut self, obj_blk: u32) -> Result<u32, FilesystemError> {
-        let (leaf, slot, objectnode) = self.find_free_object_node()?.ok_or_else(|| {
-            FilesystemError::DiskFull(
-                "SFS: every object-node leaf is full, and growing the node tree is not \
-                 implemented — the volume can hold no further files or directories"
-                    .into(),
-            )
-        })?;
+        let (leaf, slot, objectnode) = match self.find_free_object_node()? {
+            Some(found) => found,
+            None => {
+                // Every leaf is full: grow the tree as SFS's createnode does (F-014).
+                self.grow_object_node_tree()?;
+                self.find_free_object_node()?.ok_or_else(|| {
+                    FilesystemError::DiskFull("SFS: the object-node tree cannot grow".into())
+                })?
+            }
+        };
         self.ensure_dirty(leaf)?;
         let buf = self.dirty.get_mut(&leaf).unwrap();
         // next + hash16 stay zero.
         write_u32(buf, NDC_ENTRIES_OFF + slot * FS_OBJECTNODE_SIZE, obj_blk);
+        let slots = (buf.len() - NDC_ENTRIES_OFF) / FS_OBJECTNODE_SIZE;
+        let full = (0..slots).all(|i| rd_u32(buf, NDC_ENTRIES_OFF + i * FS_OBJECTNODE_SIZE) != 0);
+        if full {
+            self.set_container_full_flag(leaf, true)?;
+        }
         Ok(objectnode)
+    }
+
+    /// The object-node tree with every leaf full: hang a fresh container off
+    /// the first unused pointer, adding a level first when there is none.
+    fn grow_object_node_tree(&mut self) -> Result<(), FilesystemError> {
+        let root = self.root.objectnoderoot;
+        if self.grow_object_node_subtree(root)? {
+            return Ok(());
+        }
+        self.add_object_node_level()?;
+        if self.grow_object_node_subtree(root)? {
+            return Ok(());
+        }
+        Err(FilesystemError::DiskFull(
+            "SFS: the object-node tree cannot grow".into(),
+        ))
+    }
+
+    /// A new container under the first unused pointer beneath `blk`: leftmost
+    /// and deepest first, as `createnode` descends; false when none is free.
+    fn grow_object_node_subtree(&mut self, blk: u32) -> Result<bool, FilesystemError> {
+        let bs = self.root.blocksize as usize;
+        let shifts = self.root.blocksize.trailing_zeros().saturating_sub(5);
+        let buf = self.read_block(blk)?.to_vec();
+        validate_block(&buf, NODECONTAINER_ID, blk)?;
+        let nodenumber = rd_u32(&buf, 12);
+        let nodes = rd_u32(&buf, 16);
+        if nodes == 1 {
+            return Ok(false);
+        }
+        let node_containers = (bs - NDC_ENTRIES_OFF) / 4;
+        let leaf_slots = ((bs - NDC_ENTRIES_OFF) / FS_OBJECTNODE_SIZE) as u32;
+        for i in 0..node_containers {
+            let e = rd_u32(&buf, NDC_ENTRIES_OFF + i * 4);
+            if e != 0 && e & 1 == 0 && self.grow_object_node_subtree(e >> shifts)? {
+                return Ok(true);
+            }
+        }
+        let Some(i) = (0..node_containers).find(|&i| rd_u32(&buf, NDC_ENTRIES_OFF + i * 4) == 0)
+        else {
+            return Ok(false);
+        };
+        // A child spans `nodes` object numbers: a leaf when that is one leaf's
+        // worth, else an index a level down.
+        let child_nodes = if nodes == leaf_slots {
+            1
+        } else {
+            nodes / node_containers as u32
+        };
+        let child = self.alloc_admin_block()?;
+        let mut nb = vec![0u8; bs];
+        write_u32(&mut nb, 0, NODECONTAINER_ID);
+        write_u32(&mut nb, 8, child);
+        write_u32(&mut nb, 12, nodenumber + i as u32 * nodes);
+        write_u32(&mut nb, 16, child_nodes);
+        self.dirty.insert(child, nb);
+        self.ensure_dirty(blk)?;
+        let pb = self.dirty.get_mut(&blk).unwrap();
+        write_u32(pb, NDC_ENTRIES_OFF + i * 4, child << shifts);
+        Ok(true)
+    }
+
+    /// `addnewnodelevel`: the root's contents move to a new block and the root
+    /// becomes an index over it, so `objectnoderoot` never changes.
+    fn add_object_node_level(&mut self) -> Result<(), FilesystemError> {
+        let root = self.root.objectnoderoot;
+        let bs = self.root.blocksize as usize;
+        let shifts = self.root.blocksize.trailing_zeros().saturating_sub(5);
+        let old = self.read_block(root)?.to_vec();
+        validate_block(&old, NODECONTAINER_ID, root)?;
+        let nodes = rd_u32(&old, 16);
+        let node_containers = (bs - NDC_ENTRIES_OFF) as u32 / 4;
+        let leaf_slots = ((bs - NDC_ENTRIES_OFF) / FS_OBJECTNODE_SIZE) as u32;
+        let copy = self.alloc_admin_block()?;
+        let mut nb = old;
+        write_u32(&mut nb, 8, copy);
+        self.dirty.insert(copy, nb);
+        self.ensure_dirty(root)?;
+        let rb = self.dirty.get_mut(&root).unwrap();
+        let new_nodes = if nodes == 1 {
+            leaf_slots
+        } else {
+            nodes * node_containers
+        };
+        write_u32(rb, 16, new_nodes);
+        for b in &mut rb[NDC_ENTRIES_OFF..] {
+            *b = 0;
+        }
+        // The moved container is full, or the level would not be needed.
+        write_u32(rb, NDC_ENTRIES_OFF, (copy << shifts) | 1);
+        Ok(())
+    }
+
+    /// `markparentfull` / `markparentempty`: the pointer to `container` in its
+    /// parent carries a full bit SFS trusts when it creates nodes; keep it exact
+    /// and let a change ripple upward.
+    fn set_container_full_flag(
+        &mut self,
+        container: u32,
+        full: bool,
+    ) -> Result<(), FilesystemError> {
+        let bs = self.root.blocksize as usize;
+        let shifts = self.root.blocksize.trailing_zeros().saturating_sub(5);
+        let node_containers = (bs - NDC_ENTRIES_OFF) / 4;
+        let target = rd_u32(self.read_block(container)?, 12);
+        let mut blk = self.root.objectnoderoot;
+        for _ in 0..SFS_BTREE_MAX_DEPTH {
+            if blk == container {
+                return Ok(()); // the root has no parent
+            }
+            let buf = self.read_block(blk)?.to_vec();
+            let base = rd_u32(&buf, 12);
+            let nodes = rd_u32(&buf, 16);
+            if nodes == 1 || target < base {
+                return Ok(());
+            }
+            let idx = ((target - base) / nodes) as usize;
+            let off = NDC_ENTRIES_OFF + idx * 4;
+            if off + 4 > buf.len() {
+                return Ok(());
+            }
+            let entry = rd_u32(&buf, off);
+            if entry >> shifts != container {
+                blk = entry >> shifts;
+                continue;
+            }
+            self.ensure_dirty(blk)?;
+            let pb = self.dirty.get_mut(&blk).unwrap();
+            let flagged = if full { entry | 1 } else { entry & !1 };
+            write_u32(pb, off, flagged);
+            let all_full = (0..node_containers).all(|i| {
+                let e = rd_u32(pb, NDC_ENTRIES_OFF + i * 4);
+                e != 0 && e & 1 == 1
+            });
+            // Full: the parent is full only when every child is. Emptied: the
+            // parent has room again either way.
+            if (full && all_full) || !full {
+                return self.set_container_full_flag(blk, full);
+            }
+            return Ok(());
+        }
+        Err(parse_err("object-node tree deeper than the depth limit"))
     }
 
     /// Descend the node tree to the leaf slot holding `objectnode`, mirroring
@@ -1772,8 +2004,14 @@ impl<R: Read + Seek> SfsFilesystem<R> {
                 "free_object_node: slot {slot} out of range"
             )));
         }
+        let slots = (buf.len() - NDC_ENTRIES_OFF) / FS_OBJECTNODE_SIZE;
+        let was_full =
+            (0..slots).all(|i| rd_u32(buf, NDC_ENTRIES_OFF + i * FS_OBJECTNODE_SIZE) != 0);
         for b in &mut buf[o..o + FS_OBJECTNODE_SIZE] {
             *b = 0;
+        }
+        if was_full {
+            self.set_container_full_flag(leaf, false)?;
         }
         Ok(())
     }
@@ -3639,6 +3877,52 @@ fn set_bitmap_bit_on_disk(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F-014: past the 43 slots of the blank volume's one leaf, the
+    /// object-node tree grows a level and new leaves; six hundred files go
+    /// in, list, and come out again, and the volume stays sound.
+    #[test]
+    fn object_node_tree_grows_past_its_first_leaf() {
+        use super::super::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+        use std::io::Cursor;
+        let img = create_blank_sfs(32768, "Grow").expect("format");
+        let mut fs = SfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let root = fs.root().expect("root");
+        for i in 0..600 {
+            let name = format!("f{i:03}");
+            fs.create_file(
+                &root,
+                &name,
+                &mut &b"x"[..],
+                1,
+                &CreateFileOptions::default(),
+            )
+            .unwrap_or_else(|e| panic!("creating {name}: {e}"));
+        }
+        let top = fs.read_block(fs.root.objectnoderoot).unwrap().to_vec();
+        assert!(rd_u32(&top, 16) > 1, "the root container is still a leaf");
+        let kids = fs.list_directory(&root).unwrap();
+        assert_eq!(kids.len(), 600);
+        fs.sync_metadata().unwrap();
+        let report = fs.fsck().expect("sfs has fsck").unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        for e in &kids {
+            fs.delete_entry(&root, e)
+                .unwrap_or_else(|e2| panic!("rm {}: {e2}", e.name));
+        }
+        assert!(fs.list_directory(&root).unwrap().is_empty());
+        fs.create_file(
+            &root,
+            "last",
+            &mut &b"y"[..],
+            1,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        fs.sync_metadata().unwrap();
+        let report = fs.fsck().expect("sfs has fsck").unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+    }
 
     #[test]
     fn id_constants_are_correct() {

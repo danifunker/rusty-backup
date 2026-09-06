@@ -70,11 +70,6 @@ id = "churn.ntfs"
 finding = "F-012"
 note = "the directory index cannot grow past its resident root: the 79th file is refused"
 
-[[known]]
-id = "churn.sfs"
-finding = "F-014"
-note = "the object-node tree never grows: refused at the 43rd file"
-
 # Defects: the writer does not refuse, it corrupts or loses.
 [[known]]
 id = "churn.xfs"

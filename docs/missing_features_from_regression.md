@@ -24,7 +24,7 @@ concrete reason to.
 | [F-010](#f-010) | A file-aware Ghost image exposes only its FAT record stream; an NTFS partition behind it is unreachable | `src/rbformats/gho.rs` | D13's Windows check (a real multi-partition `.GHO` with long names) |
 | [F-012](#f-012) | An NTFS directory cannot grow past its resident index root: the 79th file in a directory is refused | `src/fs/ntfs.rs` | the 1000-file churn (`churn.ntfs`) |
 | ~~[F-013](#f-013)~~ | **SHIPPED 2026-09-06.** ~~An ext4 directory whose extent tree must split cannot take more files (about 800 in one directory)~~ | `src/fs/ext.rs` | the 1000-file churn (`churn.ext4`) |
-| [F-014](#f-014) | An SFS volume takes about 43 files: the object-node tree never grows | `src/fs/sfs.rs` | the 1000-file churn (`churn.sfs`) |
+| ~~[F-014](#f-014)~~ | **SHIPPED 2026-09-06.** ~~An SFS volume takes about 43 files: the object-node tree never grows~~ | `src/fs/sfs.rs` | the 1000-file churn (`churn.sfs`) |
 | ~~[F-015](#f-015)~~ | **SHIPPED 2026-09-05.** ~~A Minix directory stops at its direct blocks (about 110 V3 / 220 V2 files)~~ | `src/fs/minix.rs` | the 1000-file churn (`churn.minix2`, `churn.minix3`) |
 | [F-017](#f-017) | An XFS directory in leaf or node form takes no inserts or removes: 125 entries per directory, then `unsupported` | `src/fs/xfs/edit.rs` | the 1000-file churn (`churn.xfs`), after R-063 |
 | ~~[F-016](#f-016)~~ | **SHIPPED 2026-09-06.** ~~A classic HFS catalog is sized at format time (0.5 % of the volume) and never grows, so a 16 MiB volume stops at about 600 files~~ | `src/fs/hfs.rs` | the 1000-file churn (`churn.hfs`, `churn.hfv` at 16 MiB) |
@@ -686,7 +686,18 @@ thousand.
 
 ## F-014 — an SFS volume takes about 43 files {#f-014}
 
-Found by `churn.sfs`: the 43rd file fails with `SFS: every object-node leaf
+**SHIPPED 2026-09-06.** The object-node tree grows the way SFS's own
+`createnode` grows it: a fresh container under the first unused pointer,
+and when there is none a new level (`addnewnodelevel`: the root's contents
+move to a new block and the root becomes an index over it, so the root
+block number never changes). The "container full" bits in the parents'
+pointers, which SFS trusts when it creates a node, are set when a
+container fills and cleared when a node is freed, rippling upward. Admin
+space grows too (`allocadminspace`): a fresh 32-block region from the
+bitmap, entered in a container with an unused slot or opened with its own
+container linked at the end of the chain. A unit test puts 600 files on a
+blank volume (tree at two levels, four new admin regions), lists, empties
+and fscks it. Found by `churn.sfs`: the 43rd file fails with `SFS: every object-node leaf
 is full, and growing the node tree is not implemented`. Known since the SFS
 editor shipped (CLAUDE.md, "Amiga support"); the churn puts a number on it.
 
