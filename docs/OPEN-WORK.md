@@ -58,12 +58,14 @@ Open holes in v4 edit (suggested order — easiest/most reusable first):
 - **(B) block → short-form dir re-compaction** — **shipped 2026-06-02**
   (see §10).
 
-- **(C) leaf/node (multi-block) directories** — **block→leaf conversion
-  shipped 2026-06-02** (v1: 2-data-block leaf form on overflow; see §10).
-  Follow-ups still open: leaf-form INSERT (grow beyond 2 data blocks),
-  leaf-form REMOVE, leaf→block recompaction, node form for very large
-  dirs. v1 is enough to take a single-block dir past 127 entries; further
-  inserts return `Unsupported` with a clear message.
+- **(C) leaf/node (multi-block) directories** — **shipped 2026-09-06**
+  (F-017 in `docs/missing_features_from_regression.md`): every insert and
+  remove on a block/leaf/node-form directory rebuilds it from its full
+  entry list into the smallest form that fits — block, leaf1, or a
+  one-level leafN da btree with a freeindex block — and removal shrinks
+  back down to short-form. Judged by `xfs_repair -n`. Still parked: a
+  second freeindex block and a two-level da btree (hundreds of thousands
+  of entries in one directory).
 
 - **(D) bmap-btree file forks** — **shipped 2026-06-02** (single-leaf
   bmbt — multi-leaf parked for follow-up; see §10). The R2 abort-on-btree

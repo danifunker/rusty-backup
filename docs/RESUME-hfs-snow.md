@@ -197,11 +197,15 @@ in `verify-fs-macos.sh` (macOS's kernel driver takes the middle turn on
 HFS+) and `verify-hfs-snow.sh os-churn` (the System 7.1 Finder takes it on
 classic HFS, then shuts down so the MDB is flushed), both PASS; the rb-cli
 only churn runs on every filesystem that can hold a thousand files in
-`regression-tests/cases/tier3/churn.toml` (15 pass; 9 expected failures on
-the bug list: R-061 UFS, R-062 ProDOS, R-063 XFS, F-012 .. F-015 NTFS /
-ext4 / SFS / Minix limits) and it found R-060 (a blank classic HFS catalog
-of four blocks). Unit tests `thousand_file_churn_keeps_the_catalog_clean`
-cover HFS and HFS+ in `cargo test`.
+`regression-tests/cases/tier3/churn.toml`. It found R-060 .. R-064 and
+F-012 .. F-017 (UFS, ProDOS, XFS, NTFS, ext4, SFS, Minix and classic HFS
+limits or defects), each fixed in its own commit on 2026-09-06; all 24
+cases pass and the known-failures list is empty again. The XFS one took
+leaf and node-form directories (rebuilt per operation, judged by the
+Docker `xfs_repair` oracle). Unit tests
+`thousand_file_churn_keeps_the_catalog_clean` (HFS, HFS+) and
+`dir_grows_to_node_form_and_shrinks_back_to_short_form` (XFS) cover the
+churn in `cargo test`.
 
 Section 8, the commands to run with the hardware attached (from the repo
 root, debug build; `diskutil list` gives N):

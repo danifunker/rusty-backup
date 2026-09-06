@@ -26,7 +26,7 @@ concrete reason to.
 | ~~[F-013](#f-013)~~ | **SHIPPED 2026-09-06.** ~~An ext4 directory whose extent tree must split cannot take more files (about 800 in one directory)~~ | `src/fs/ext.rs` | the 1000-file churn (`churn.ext4`) |
 | ~~[F-014](#f-014)~~ | **SHIPPED 2026-09-06.** ~~An SFS volume takes about 43 files: the object-node tree never grows~~ | `src/fs/sfs.rs` | the 1000-file churn (`churn.sfs`) |
 | ~~[F-015](#f-015)~~ | **SHIPPED 2026-09-05.** ~~A Minix directory stops at its direct blocks (about 110 V3 / 220 V2 files)~~ | `src/fs/minix.rs` | the 1000-file churn (`churn.minix2`, `churn.minix3`) |
-| [F-017](#f-017) | An XFS directory in leaf or node form takes no inserts or removes: 125 entries per directory, then `unsupported` | `src/fs/xfs/edit.rs` | the 1000-file churn (`churn.xfs`), after R-063 |
+| ~~[F-017](#f-017)~~ | **SHIPPED 2026-09-06.** ~~An XFS directory in leaf or node form takes no inserts or removes: 125 entries per directory, then `unsupported`~~ | `src/fs/xfs/edit.rs` | the 1000-file churn (`churn.xfs`), after R-063 |
 | ~~[F-016](#f-016)~~ | **SHIPPED 2026-09-06.** ~~A classic HFS catalog is sized at format time (0.5 % of the volume) and never grows, so a 16 MiB volume stops at about 600 files~~ | `src/fs/hfs.rs` | the 1000-file churn (`churn.hfs`, `churn.hfv` at 16 MiB) |
 | ~~[F-011](#f-011)~~ | **SHIPPED 2026-09-05.** ~~The classic HFS writer allocates a fork as one contiguous run; a fragmented volume reports disk full with room to spare~~ | `src/fs/hfs.rs` | H3's classic-HFS check: a resource fork spilled into the extents-overflow file by rb-cli, clean under `fsck_hfs -n` and Disk First Aid before and after the delete |
 
@@ -749,6 +749,26 @@ and map, and rewrite drCTFlSize / drCTExtRec; the HFS+ `grow_btree_fork`
 is the model.
 
 ## F-017 — an XFS directory in leaf or node form takes no inserts or removes {#f-017}
+
+**SHIPPED 2026-09-06.** Block, leaf and node-form directories are rebuilt
+from their complete entry list on every insert and remove:
+`plan_dir_layout` picks the smallest form that holds the entries (one
+block; data blocks in hash order plus a leaf1 index; or data blocks plus a
+leafN da btree -- a lone leafN root, or a level-1 node over balanced leafN
+siblings -- and a freeindex block), and `write_dir_layout` lays it down,
+keeping each address-space region's blocks when its size is unchanged and
+otherwise taking a fresh run and freeing the old one. Removal shrinks the
+same way, down to short-form (`xfs_dir2_block_to_sf`) once the survivors
+fit the inode. A rebuild is linear in the directory's size, a dozen 4 KiB
+blocks per operation at a thousand entries. Judged by the Docker
+`xfs_repair 4.9.0` oracle at 125 (leaf1), 503 (a leafN root), 600 (a node
+over two leaves) and 1000 entries, and after each stage of the churn;
+`churn.xfs` passes. `dir_grows_to_node_form_and_shrinks_back_to_short_form`
+covers the v5 node form in `cargo test`, the older
+`dir_overflow_converts_block_to_leaf_form` the v4 leaf form. The v5
+leaf-form defects met on the way are R-064. Still `unsupported`: a
+directory needing a second freeindex block (over 2016 data blocks at
+4 KiB) or a two-level da btree (over 504 leafN blocks).
 
 Found 2026-09-06 by `churn.xfs` once R-063 was fixed: the 126th entry of a
 directory converts it from a single block to leaf form (two data blocks
