@@ -30,6 +30,8 @@ pub struct XfsAgf {
     pub fllast: u32,
     pub flcount: u32,
     pub freeblks: u32,
+    /// Blocks held by the AG's free-space btrees beyond their roots; `sb_fdblocks` counts them free.
+    pub btreeblks: u32,
 }
 
 impl XfsAgf {
@@ -77,6 +79,7 @@ impl XfsAgf {
             fllast: BigEndian::read_u32(&buf[44..48]),
             flcount: BigEndian::read_u32(&buf[48..52]),
             freeblks: BigEndian::read_u32(&buf[52..56]),
+            btreeblks: BigEndian::read_u32(&buf[60..64]),
         })
     }
 }
