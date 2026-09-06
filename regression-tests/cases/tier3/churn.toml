@@ -12,10 +12,10 @@
 # them in; a glob `rm` takes them out again in one process.
 #
 # The files live in a subdirectory because FAT12/16 and ProDOS cap their root
-# directories (512 and 51 entries); the others do not care. Classic HFS and
-# HFV get 64 MiB: their catalog is sized at format time (0.5 % of the volume,
-# hformat's rule) and rb-cli cannot grow it later (F-016), so a 16 MiB volume
-# stops at about 600 files.
+# directories (512 and 51 entries); the others do not care. On classic HFS and
+# HFV a 16 MiB volume's catalog (0.5 % of the volume at format time) holds
+# about 600 files, so the thousand make it grow, spill past its three inline
+# extents into the overflow tree, and shrink back to one file (F-016).
 #
 # The same churn with an operating system taking the middle turn (add one,
 # delete it, delete the thousand) lives outside this harness, because it needs
@@ -332,7 +332,7 @@ stdout_not_contains = ["f0001.txt", "f1000.txt", "extra.bin"]
 id = "churn.hfs"
 description = "classic HFS: 1000 files churn in a subdirectory, fsck clean throughout"
 [[case.step]]
-args = ["new", "volume", "hfs", "--size", "64M", "{scratch}/v.img"]
+args = ["new", "volume", "hfs", "--size", "16M", "{scratch}/v.img"]
 expect_exit = 0
 [[case.step]]
 args = ["untar", "{scratch}/v.img", "{cases}/tier3/tree1000.tar.gz"]
@@ -416,7 +416,7 @@ stdout_not_contains = ["f0001.txt", "f1000.txt", "extra.bin"]
 id = "churn.hfv"
 description = "BasiliskII HFV: 1000 files churn in a subdirectory, fsck clean throughout"
 [[case.step]]
-args = ["new", "volume", "hfv", "--size", "64M", "{scratch}/v.img"]
+args = ["new", "volume", "hfv", "--size", "16M", "{scratch}/v.img"]
 expect_exit = 0
 [[case.step]]
 args = ["untar", "{scratch}/v.img", "{cases}/tier3/tree1000.tar.gz"]

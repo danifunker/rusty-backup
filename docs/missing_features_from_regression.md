@@ -26,7 +26,7 @@ concrete reason to.
 | [F-013](#f-013) | An ext4 directory whose extent tree must split cannot take more files (about 800 in one directory) | `src/fs/ext.rs` | the 1000-file churn (`churn.ext4`) |
 | [F-014](#f-014) | An SFS volume takes about 43 files: the object-node tree never grows | `src/fs/sfs.rs` | the 1000-file churn (`churn.sfs`) |
 | ~~[F-015](#f-015)~~ | **SHIPPED 2026-09-05.** ~~A Minix directory stops at its direct blocks (about 110 V3 / 220 V2 files)~~ | `src/fs/minix.rs` | the 1000-file churn (`churn.minix2`, `churn.minix3`) |
-| [F-016](#f-016) | A classic HFS catalog is sized at format time (0.5 % of the volume) and never grows, so a 16 MiB volume stops at about 600 files | `src/fs/hfs.rs` | the 1000-file churn (`churn.hfs` runs at 64 MiB) |
+| ~~[F-016](#f-016)~~ | **SHIPPED 2026-09-06.** ~~A classic HFS catalog is sized at format time (0.5 % of the volume) and never grows, so a 16 MiB volume stops at about 600 files~~ | `src/fs/hfs.rs` | the 1000-file churn (`churn.hfs`, `churn.hfv` at 16 MiB) |
 | ~~[F-011](#f-011)~~ | **SHIPPED 2026-09-05.** ~~The classic HFS writer allocates a fork as one contiguous run; a fragmented volume reports disk full with room to spare~~ | `src/fs/hfs.rs` | H3's classic-HFS check: a resource fork spilled into the extents-overflow file by rb-cli, clean under `fsck_hfs -n` and Disk First Aid before and after the delete |
 
 ---
@@ -693,6 +693,15 @@ indirect zone, which the writer does not allocate for directories.
 
 ## F-016 — a classic HFS catalog never grows {#f-016}
 
+**SHIPPED 2026-09-06.** `grow_btree` extends the catalog or the
+extents-overflow file by its MDB clump when an insert runs out of nodes,
+the way Mac OS does: the last extent gets longer when the blocks after it
+are free, otherwise a fresh extent that doubles the file (the three inline
+slots, then CNID 4 records in the overflow tree for the catalog, which
+`open` and `write_catalog` now follow); a map node is linked in past the
+2048 nodes the header bitmap addresses. Unit tests grow a 32-node catalog
+under 1000 files and reopen it, grow a four-node extents tree under a
+fork spread over 200 holes, and reach a map node with 9000 files.
 Found by `churn.hfs` at 16 MiB: `no free B-tree nodes` at the 570th file.
 `new volume hfs` sizes the catalog like hformat does, 0.5 % of the volume
 (after R-060 every blank-volume path does), and Mac OS extends the catalog

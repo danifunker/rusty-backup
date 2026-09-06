@@ -1618,6 +1618,40 @@ pub fn btree_bitmap_set(catalog_data: &mut [u8], node_size: usize, node_idx: u32
     );
 }
 
+/// Index of the last node in a B-tree's map-node chain (`header.fLink` →
+/// mapNode → … → 0), or 0 when the chain is empty (so the caller links the
+/// first map node via the header node at index 0). Cycle-guarded.
+pub fn btree_map_chain_tail(buf: &[u8], node_size: usize) -> u32 {
+    let mut next = BigEndian::read_u32(&buf[0..4]); // header.fLink
+    let mut last = 0u32;
+    let mut guard = 0;
+    while next != 0 && guard < 1_000_000 {
+        last = next;
+        let off = next as usize * node_size;
+        if off + 4 > buf.len() {
+            break;
+        }
+        next = BigEndian::read_u32(&buf[off..off + 4]);
+        guard += 1;
+    }
+    last
+}
+
+/// Allocation blocks a B-tree fork of `total_nodes` needs to gain `add_slots`
+/// more nodes. Nodes and blocks need not match one-to-one: several 4 KiB nodes
+/// share an 8 KiB block, and the last block may already have room.
+pub fn btree_grow_blocks(
+    total_nodes: u32,
+    add_slots: u32,
+    node_size: usize,
+    block_size: u32,
+) -> u32 {
+    let node_bytes = node_size as u64;
+    let cur_blocks = (total_nodes as u64 * node_bytes).div_ceil(block_size as u64);
+    let new_blocks = ((total_nodes + add_slots) as u64 * node_bytes).div_ceil(block_size as u64);
+    (new_blocks - cur_blocks) as u32
+}
+
 /// Initialize a node as a map node (BTNodeKind=2): descriptor + one record
 /// holding `bitmap_bytes` of zeros + offset table.
 pub fn init_map_node(

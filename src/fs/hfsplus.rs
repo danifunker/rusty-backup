@@ -11,8 +11,9 @@ use super::filesystem::{
 };
 use super::hfs_common::{
     self, bitmap_clear_bit_be, bitmap_collect_clear_runs_be, bitmap_set_bit_be, bitmap_test_bit_be,
-    btree_detach_freed_node_and_refresh, btree_free_node, btree_refresh_index_keys,
-    btree_remove_record, btree_retire_empty_leaf, BTreeHeader, BTreeKeyFormat,
+    btree_detach_freed_node_and_refresh, btree_free_node, btree_grow_blocks, btree_map_chain_tail,
+    btree_refresh_index_keys, btree_remove_record, btree_retire_empty_leaf, BTreeHeader,
+    BTreeKeyFormat,
 };
 use super::CompactResult;
 
@@ -4041,25 +4042,6 @@ fn write_fork_data_with_overflow<R: Write + Seek>(
     Ok(())
 }
 
-/// Index of the last node in a B-tree's map-node chain (`header.fLink` →
-/// mapNode → … → 0), or 0 when the chain is empty (so the caller links the
-/// first map node via the header node at index 0). Cycle-guarded.
-fn btree_map_chain_tail(buf: &[u8], node_size: usize) -> u32 {
-    let mut next = BigEndian::read_u32(&buf[0..4]); // header.fLink
-    let mut last = 0u32;
-    let mut guard = 0;
-    while next != 0 && guard < 1_000_000 {
-        last = next;
-        let off = next as usize * node_size;
-        if off + 4 > buf.len() {
-            break;
-        }
-        next = BigEndian::read_u32(&buf[off..off + 4]);
-        guard += 1;
-    }
-    last
-}
-
 /// Decode a UTF-16BE byte slice to a String.
 fn decode_utf16be(data: &[u8]) -> String {
     let chars: Vec<u16> = data.chunks_exact(2).map(BigEndian::read_u16).collect();
@@ -6435,16 +6417,6 @@ pub fn validate_hfsplus_integrity(
         "HFS+ validate: OK ({total_blocks} blocks, {block_size} block size)"
     ));
     Ok(())
-}
-
-/// Allocation blocks a B-tree fork of `total_nodes` needs to gain `add_slots`
-/// more nodes. Nodes and blocks need not match one-to-one: several 4 KiB nodes
-/// share an 8 KiB block, and the last block may already have room.
-fn btree_grow_blocks(total_nodes: u32, add_slots: u32, node_size: usize, block_size: u32) -> u32 {
-    let node_bytes = node_size as u64;
-    let cur_blocks = (total_nodes as u64 * node_bytes).div_ceil(block_size as u64);
-    let new_blocks = ((total_nodes + add_slots) as u64 * node_bytes).div_ceil(block_size as u64);
-    (new_blocks - cur_blocks) as u32
 }
 
 #[cfg(test)]

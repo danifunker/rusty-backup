@@ -10,7 +10,8 @@ use super::filesystem::{
 };
 use super::hfs_common::{
     self, bitmap_clear_bit_be, bitmap_collect_clear_runs_be, bitmap_find_clear_run_be,
-    bitmap_set_bit_be, btree_free_node, btree_refresh_index_keys, btree_remove_record, BTreeHeader,
+    bitmap_set_bit_be, bitmap_test_bit_be, btree_free_node, btree_grow_blocks,
+    btree_map_chain_tail, btree_refresh_index_keys, btree_remove_record, BTreeHeader,
     BTreeKeyFormat,
 };
 use super::CompactResult;
@@ -234,6 +235,22 @@ fn is_catalog_uninitialized(catalog_data: &[u8]) -> bool {
     BigEndian::read_u16(&catalog_data[32..34]) == 0
 }
 
+/// The two B-tree files a classic HFS volume keeps in its MDB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HfsTree {
+    Catalog,
+    Extents,
+}
+
+impl HfsTree {
+    fn label(self) -> &'static str {
+        match self {
+            HfsTree::Catalog => "catalog",
+            HfsTree::Extents => "extents-overflow",
+        }
+    }
+}
+
 /// HFS extent descriptor: start_block (u16) + block_count (u16).
 #[derive(Debug, Clone, Copy)]
 pub struct HfsExtDescriptor {
@@ -402,6 +419,10 @@ impl HfsMasterDirectoryBlock {
         for i in 0..8 {
             BigEndian::write_u32(&mut out[92 + i * 4..96 + i * 4], self.finder_info[i]);
         }
+        BigEndian::write_u32(&mut out[130..134], self.extents_file_size);
+        for i in 0..3 {
+            self.extents_file_extents[i].serialize(&mut out[134 + i * 4..138 + i * 4]);
+        }
         BigEndian::write_u32(&mut out[146..150], self.catalog_file_size);
         for i in 0..3 {
             self.catalog_file_extents[i].serialize(&mut out[150 + i * 4..154 + i * 4]);
@@ -417,6 +438,8 @@ impl HfsMasterDirectoryBlock {
 
 /// Catalog record types.
 pub(crate) const CATALOG_DIR: i8 = 1;
+/// The catalog file's own CNID; extents past the MDB's three sit in the overflow tree.
+const CNID_CATALOG: u32 = 4;
 pub(crate) const CATALOG_FILE: i8 = 2;
 
 /// Decode a 4-byte Mac OS type/creator code to a string.
@@ -567,7 +590,7 @@ impl<R: Read + Seek> HfsFilesystem<R> {
             mdb.catalog_file_size as u64,
         )?;
 
-        Ok(HfsFilesystem {
+        let mut fs = HfsFilesystem {
             reader,
             partition_offset,
             partition_size,
@@ -579,7 +602,15 @@ impl<R: Read + Seek> HfsFilesystem<R> {
             pending_volume_dates: None,
             bulk_mode: false,
             btrees_initialized: false,
-        })
+        };
+        // A catalog grown past its three inline extents continues in the
+        // extents-overflow tree under CNID 4, the way Mac OS extends it.
+        if (fs.catalog_data.len() as u64) < fs.mdb.catalog_file_size as u64 {
+            let inline = fs.mdb.catalog_file_extents;
+            let size = fs.mdb.catalog_file_size as u64;
+            fs.catalog_data = fs.read_fork_with_overflow(CNID_CATALOG, 0x00, &inline, size)?;
+        }
+        Ok(fs)
     }
 
     /// List all catalog records with a given parent_id.
@@ -1046,13 +1077,197 @@ impl<R: Read + Seek> HfsFilesystem<R> {
     /// nodes until a rebuild ran out mid-flight and left the index with broken
     /// sibling links — surfacing as the spurious "disk full: no free B-tree
     /// nodes" / `IndexSiblingLinkBroken` failure at ~7.4k catalog records.
-    fn insert_catalog_record(&mut self, key_record: &[u8]) -> Result<(), FilesystemError> {
-        hfs_common::btree_insert_full(
-            &mut self.catalog_data,
-            key_record,
-            &hfs_common::BTreeKeyFormat::CLASSIC_CATALOG,
-            &Self::catalog_compare,
-        )
+    fn insert_catalog_record(&mut self, key_record: &[u8]) -> Result<(), FilesystemError>
+    where
+        R: Write,
+    {
+        // Out of nodes: grow the catalog file by a clump and retry once, as
+        // Mac OS does (F-016). The failed insert left the tree untouched.
+        let mut grown = false;
+        loop {
+            match hfs_common::btree_insert_full(
+                &mut self.catalog_data,
+                key_record,
+                &hfs_common::BTreeKeyFormat::CLASSIC_CATALOG,
+                &Self::catalog_compare,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(FilesystemError::DiskFull(_)) if !grown => {
+                    self.grow_btree(HfsTree::Catalog)?;
+                    grown = true;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Grow the catalog or extents-overflow file by a clump of nodes: extend
+    /// its last extent when the blocks after it are free, else take a fresh
+    /// inline extent slot; publish the nodes (and a map node when the bitmap
+    /// runs out) and the new file size in the MDB (F-016).
+    fn grow_btree(&mut self, tree: HfsTree) -> Result<(), FilesystemError>
+    where
+        R: Write,
+    {
+        let block_size = self.mdb.block_size;
+        if tree == HfsTree::Extents {
+            self.ensure_extents_overflow()?;
+        }
+        let (node_size, total_nodes, existing_map) = {
+            let buf = self.tree_buf(tree)?;
+            let h = BTreeHeader::read(buf);
+            let segs = hfs_common::btree_bitmap_segments(buf, h.node_size as usize);
+            (
+                h.node_size as usize,
+                h.total_nodes,
+                (segs.len() as u32).saturating_sub(1),
+            )
+        };
+        if node_size < 256 || block_size == 0 {
+            return Err(FilesystemError::InvalidData(format!(
+                "{} B-tree has node size {node_size}",
+                tree.label()
+            )));
+        }
+        // drXTClpSiz / drCTClpSiz: the clump Mac OS itself extends the file by.
+        let clump_off = if tree == HfsTree::Catalog { 78 } else { 74 };
+        let clump = BigEndian::read_u32(&self.mdb.raw_sector[clump_off..clump_off + 4]) as usize;
+        let grow_nodes = (clump.div_ceil(node_size).max(1) as u32).max(8);
+        let header_cap = ((node_size - 256) * 8) as u32;
+        let per_map = (hfs_common::map_node_bitmap_bytes(node_size) * 8) as u32;
+        let need_map = total_nodes + grow_nodes > header_cap + existing_map * per_map;
+        let add_slots = grow_nodes + u32::from(need_map);
+        let grow_blocks = btree_grow_blocks(total_nodes, add_slots, node_size, block_size);
+        let mut add_slots = add_slots;
+        if grow_blocks > 0 {
+            let mut inline = match tree {
+                HfsTree::Catalog => self.mdb.catalog_file_extents,
+                HfsTree::Extents => self.mdb.extents_file_extents,
+            };
+            // Every extent of the file, inline first, then the overflow records.
+            let mut all: Vec<HfsExtDescriptor> = inline
+                .iter()
+                .copied()
+                .filter(|e| e.block_count > 0)
+                .collect();
+            let inline_blocks: u32 = all.iter().map(|e| e.block_count as u32).sum();
+            if tree == HfsTree::Catalog && all.len() == 3 {
+                self.ensure_extents_overflow()?;
+                if let Some(x) = self.extents_overflow_data.as_ref() {
+                    all.extend(collect_fork_overflow_extents(
+                        x,
+                        CNID_CATALOG,
+                        0x00,
+                        inline_blocks,
+                    ));
+                }
+            }
+            let tail = all
+                .last()
+                .map(|e| e.start_block as u32 + e.block_count as u32);
+            match tail {
+                Some(t) if self.allocate_blocks_at(t, grow_blocks)? => {
+                    all.last_mut().unwrap().block_count += grow_blocks as u16;
+                }
+                _ => {
+                    // A fresh extent doubles the file, so the inline slots and
+                    // the overflow records are not spent one clump at a time.
+                    let want_nodes = (total_nodes + add_slots).max(grow_nodes + 8);
+                    let more = btree_grow_blocks(
+                        total_nodes,
+                        want_nodes - total_nodes,
+                        node_size,
+                        block_size,
+                    )
+                    .max(grow_blocks);
+                    add_slots = want_nodes.max(total_nodes + add_slots) - total_nodes;
+                    if tree == HfsTree::Extents && all.len() >= 3 {
+                        return Err(FilesystemError::DiskFull(
+                            "extents-overflow file has no free extent slot to grow into".into(),
+                        ));
+                    }
+                    // No run that long: settle for the clump and grow again later.
+                    let (start, more) = match self.allocate_blocks(more) {
+                        Ok(start) => (start, more),
+                        Err(_) => {
+                            add_slots = grow_nodes + u32::from(need_map);
+                            (self.allocate_blocks(grow_blocks)?, grow_blocks)
+                        }
+                    };
+                    all.push(HfsExtDescriptor {
+                        start_block: start as u16,
+                        block_count: more as u16,
+                    });
+                }
+            }
+            inline = [HfsExtDescriptor {
+                start_block: 0,
+                block_count: 0,
+            }; 3];
+            for (i, e) in all.iter().take(3).enumerate() {
+                inline[i] = *e;
+            }
+            match tree {
+                HfsTree::Catalog => {
+                    self.mdb.catalog_file_extents = inline;
+                    if all.len() > 3 {
+                        // Re-key the overflow records from the full list.
+                        let data = self.extents_overflow_data.as_mut().expect("loaded above");
+                        remove_fork_overflow_records(data, CNID_CATALOG, 0x00)?;
+                        self.insert_fork_overflow(CNID_CATALOG, 0x00, &all)?;
+                        self.write_extents_overflow_back()?;
+                    }
+                }
+                HfsTree::Extents => self.mdb.extents_file_extents = inline,
+            }
+        }
+        let buf = self.tree_buf(tree)?;
+        buf.resize(buf.len() + add_slots as usize * node_size, 0);
+        if need_map {
+            // The new map node takes the first new slot; its own bit is still
+            // inside the bitmap the tree has, and the header or last map node links to it.
+            let map_idx = total_nodes;
+            let tail = btree_map_chain_tail(buf, node_size);
+            hfs_common::init_map_node(buf, node_size, map_idx, tail, 0);
+            let linker = tail as usize * node_size;
+            BigEndian::write_u32(&mut buf[linker..linker + 4], map_idx);
+            hfs_common::btree_bitmap_set(buf, node_size, map_idx);
+        }
+        let mut h = BTreeHeader::read(buf);
+        h.total_nodes += add_slots;
+        h.free_nodes += add_slots - u32::from(need_map);
+        h.write(buf);
+        let added = add_slots * node_size as u32;
+        match tree {
+            HfsTree::Catalog => self.mdb.catalog_file_size += added,
+            HfsTree::Extents => self.mdb.extents_file_size += added,
+        }
+        Ok(())
+    }
+
+    /// The in-memory bytes of a B-tree file; the extents tree must be loaded.
+    fn tree_buf(&mut self, tree: HfsTree) -> Result<&mut Vec<u8>, FilesystemError> {
+        match tree {
+            HfsTree::Catalog => Ok(&mut self.catalog_data),
+            HfsTree::Extents => self.extents_overflow_data.as_mut().ok_or_else(|| {
+                FilesystemError::Unsupported("volume has no extents-overflow B-tree".into())
+            }),
+        }
+    }
+
+    /// Take `count` blocks starting exactly at `start` when every one is free.
+    fn allocate_blocks_at(&mut self, start: u32, count: u32) -> Result<bool, FilesystemError> {
+        self.ensure_bitmap()?;
+        let total = self.mdb.total_blocks as u32;
+        let bitmap = self.bitmap.as_mut().unwrap();
+        if start + count > total || (start..start + count).any(|b| bitmap_test_bit_be(bitmap, b)) {
+            return Ok(false);
+        }
+        for b in start..start + count {
+            bitmap_set_bit_be(bitmap, b);
+        }
+        self.mdb.free_blocks = self.mdb.free_blocks.saturating_sub(count as u16);
+        Ok(true)
     }
 
     /// Remove a catalog record from a leaf node.
@@ -1670,7 +1885,10 @@ impl<R: Read + Seek> HfsFilesystem<R> {
     /// root by `(parent=1, drVN)` at mount time), and the root thread
     /// record's `thdCName`. Caller must `sync_metadata` to flush. New
     /// name must be 1..=27 Mac Roman bytes.
-    pub fn set_volume_name(&mut self, new_name: &str) -> Result<(), FilesystemError> {
+    pub fn set_volume_name(&mut self, new_name: &str) -> Result<(), FilesystemError>
+    where
+        R: Write,
+    {
         let new_name_raw = utf8_to_mac_roman(new_name)?;
         if new_name_raw.is_empty() {
             return Err(FilesystemError::InvalidData(
@@ -1836,7 +2054,47 @@ impl<R: Read + Write + Seek> HfsFilesystem<R> {
             &self.mdb,
             &self.mdb.catalog_file_extents,
             &self.catalog_data,
-        )
+        )?;
+        // The part past the inline extents lives where the CNID 4 overflow
+        // records say (F-016).
+        let inline_blocks: u32 = self
+            .mdb
+            .catalog_file_extents
+            .iter()
+            .map(|e| e.block_count as u32)
+            .sum();
+        let inline_bytes = inline_blocks as usize * self.mdb.block_size as usize;
+        if self.catalog_data.len() <= inline_bytes {
+            return Ok(());
+        }
+        self.ensure_extents_overflow()?;
+        let Some(ext_data) = self.extents_overflow_data.as_ref() else {
+            return Err(FilesystemError::InvalidData(
+                "catalog file runs past its inline extents and the volume has no extents-overflow tree".into(),
+            ));
+        };
+        let overflow = collect_fork_overflow_extents(ext_data, CNID_CATALOG, 0x00, inline_blocks);
+        let first_alloc = self.partition_offset + self.mdb.first_alloc_block as u64 * 512;
+        let mut written = inline_bytes;
+        for ext in overflow {
+            if written >= self.catalog_data.len() {
+                break;
+            }
+            let off = first_alloc + ext.start_block as u64 * self.mdb.block_size as u64;
+            let len = (ext.block_count as usize * self.mdb.block_size as usize)
+                .min(self.catalog_data.len() - written);
+            self.reader.seek(SeekFrom::Start(off))?;
+            self.reader
+                .write_all(&self.catalog_data[written..written + len])?;
+            written += len;
+        }
+        if written < self.catalog_data.len() {
+            return Err(FilesystemError::InvalidData(format!(
+                "catalog file: extents cover {written} of {} bytes",
+                self.catalog_data.len()
+            )));
+        }
+        Ok(())
     }
 
     /// Write the volume bitmap back to disk.
@@ -2044,11 +2302,11 @@ impl<R: Read + Write + Seek> HfsFilesystem<R> {
             return Ok(false);
         }
         self.ensure_extents_overflow()?;
-        let data = self.extents_overflow_data.as_mut().ok_or_else(|| {
-            FilesystemError::Unsupported(
+        if self.extents_overflow_data.is_none() {
+            return Err(FilesystemError::Unsupported(
                 "volume has no extents-overflow B-tree; a fragmented fork cannot be created".into(),
-            )
-        })?;
+            ));
+        }
         let mut fork_block: u32 = extents.iter().take(3).map(|e| e.block_count as u32).sum();
         for chunk in extents[3..].chunks(3) {
             // Key: keyLen(1) = 7, forkType(1), fileID(4), startBlock(2); 3 extents follow.
@@ -2062,12 +2320,23 @@ impl<R: Read + Write + Seek> HfsFilesystem<R> {
                 rec.extend_from_slice(&start.to_be_bytes());
                 rec.extend_from_slice(&count.to_be_bytes());
             }
-            hfs_common::btree_insert_full(
-                data,
-                &rec,
-                &BTreeKeyFormat::CLASSIC_EXTENTS,
-                &compare_classic_extents_keys,
-            )?;
+            let mut grown = false;
+            loop {
+                let data = self.extents_overflow_data.as_mut().expect("loaded above");
+                match hfs_common::btree_insert_full(
+                    data,
+                    &rec,
+                    &BTreeKeyFormat::CLASSIC_EXTENTS,
+                    &compare_classic_extents_keys,
+                ) {
+                    Ok(()) => break,
+                    Err(FilesystemError::DiskFull(_)) if !grown => {
+                        self.grow_btree(HfsTree::Extents)?;
+                        grown = true;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
             fork_block += chunk.iter().map(|e| e.block_count as u32).sum::<u32>();
         }
         Ok(true)
@@ -6358,6 +6627,182 @@ mod tests {
             "fsck errors: {:?}",
             result.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
         );
+    }
+
+    /// F-016: a catalog formatted with 32 nodes takes a thousand files by
+    /// growing in clumps; the grown file survives a reopen, and every judge
+    /// sees a clean tree before and after the files go again.
+    #[test]
+    fn catalog_grows_when_its_nodes_run_out() {
+        let img = create_blank_hfs_sized(16 * 1024 * 1024, 4096, "Grow", 0, 16384).unwrap();
+        let mut fs = HfsFilesystem::open(Cursor::new(img), 0).unwrap();
+        let size0 = fs.mdb.catalog_file_size;
+        assert_eq!(size0, 16384);
+        let root = fs.root().unwrap();
+        for i in 0..1000 {
+            let name = format!("f{i:04}.txt");
+            fs.create_file(
+                &root,
+                &name,
+                &mut &b"x"[..],
+                1,
+                &CreateFileOptions::default(),
+            )
+            .unwrap_or_else(|e| panic!("creating {name}: {e}"));
+        }
+        assert!(fs.mdb.catalog_file_size > size0, "the catalog never grew");
+        // Files sit right behind the catalog, so the growth had to take fresh
+        // extents: three inline, the rest as CNID 4 records in the overflow tree.
+        let inline: u32 = fs
+            .mdb
+            .catalog_file_extents
+            .iter()
+            .map(|e| e.block_count as u32)
+            .sum();
+        let spilled: u32 = collect_fork_overflow_extents(
+            fs.extents_overflow_data
+                .as_ref()
+                .expect("overflow tree loaded"),
+            CNID_CATALOG,
+            0x00,
+            inline,
+        )
+        .iter()
+        .map(|e| e.block_count as u32)
+        .sum();
+        assert!(spilled > 0, "no CNID 4 overflow records");
+        assert_eq!(
+            (inline + spilled) * 4096,
+            fs.mdb.catalog_file_size,
+            "extents cover the file"
+        );
+        fs.sync_metadata().unwrap();
+        let report = fs.fsck().unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+
+        let img = fs.reader.get_ref().clone();
+        let mut fs = HfsFilesystem::open(Cursor::new(img), 0).unwrap();
+        let root = fs.root().unwrap();
+        let kids = fs.list_directory(&root).unwrap();
+        assert_eq!(kids.len(), 1000);
+        for e in &kids {
+            fs.delete_entry(&root, e).unwrap();
+        }
+        fs.create_file(
+            &root,
+            "last.txt",
+            &mut &b"y"[..],
+            1,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        fs.sync_metadata().unwrap();
+        let report = fs.fsck().unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+    }
+
+    /// F-016: the extents-overflow tree grows too, once a fork spread over
+    /// enough holes needs more records than its four nodes hold.
+    #[test]
+    fn extents_tree_grows_when_its_nodes_run_out() {
+        let img = create_blank_hfs_sized(4 * 1024 * 1024, 512, "Frag", 2048, 0).unwrap();
+        let mut fs = HfsFilesystem::open(Cursor::new(img), 0).unwrap();
+        let xt0 = fs.mdb.extents_file_size;
+        assert_eq!(xt0, 2048);
+        let root = fs.root().unwrap();
+        let block = vec![0x5Au8; 512];
+        for i in 0..400 {
+            fs.create_file(
+                &root,
+                &format!("h{i:03}"),
+                &mut Cursor::new(&block),
+                512,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+        }
+        for e in fs.list_directory(&root).unwrap() {
+            if e.name[1..].parse::<u32>().unwrap() % 2 == 1 {
+                fs.delete_entry(&root, &e).unwrap();
+            }
+        }
+        // The free tail goes to one file but for 64 blocks the trees may grow
+        // into; a 200-block fork then spreads over the one-block holes.
+        let tail = (fs.mdb.free_blocks - 264) as usize * 512;
+        fs.create_file(
+            &root,
+            "tail",
+            &mut Cursor::new(vec![0u8; tail]),
+            tail as u64,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        let data: Vec<u8> = (0..200 * 512).map(|i| (i / 512) as u8).collect();
+        let entry = fs
+            .create_file(
+                &root,
+                "spread",
+                &mut Cursor::new(&data),
+                data.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+        assert!(
+            fs.mdb.extents_file_size > xt0,
+            "the extents tree never grew"
+        );
+        assert_eq!(fs.read_file(&entry, usize::MAX).unwrap(), data);
+        fs.sync_metadata().unwrap();
+        let report = fs.fsck().unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+
+        let img = fs.reader.get_ref().clone();
+        let mut fs = HfsFilesystem::open(Cursor::new(img), 0).unwrap();
+        let root = fs.root().unwrap();
+        let entry = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "spread")
+            .unwrap();
+        assert_eq!(fs.read_file(&entry, usize::MAX).unwrap(), data);
+        fs.delete_entry(&root, &entry).unwrap();
+        fs.sync_metadata().unwrap();
+        let report = fs.fsck().unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+    }
+
+    /// F-016: past the 2048 nodes the header node's bitmap addresses, a grow
+    /// links in a map node; 9000 files at 512-byte blocks get there.
+    #[test]
+    fn catalog_growth_adds_a_map_node_past_the_header_bitmap() {
+        let img = create_blank_hfs_sized(24 * 1024 * 1024, 512, "Map", 0, 16384).unwrap();
+        let mut fs = HfsFilesystem::open(Cursor::new(img), 0).unwrap();
+        let root = fs.root().unwrap();
+        for i in 0..9000 {
+            let name = format!("f{i:04}");
+            fs.create_file(
+                &root,
+                &name,
+                &mut &b"x"[..],
+                1,
+                &CreateFileOptions::default(),
+            )
+            .unwrap_or_else(|e| panic!("creating {name}: {e}"));
+        }
+        let h = BTreeHeader::read(&fs.catalog_data);
+        assert!(h.total_nodes > 2048, "{} nodes", h.total_nodes);
+        assert!(
+            hfs_common::btree_bitmap_segments(&fs.catalog_data, 512).len() > 1,
+            "no map node"
+        );
+        fs.sync_metadata().unwrap();
+        let report = fs.fsck().unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let img = fs.reader.get_ref().clone();
+        let mut fs = HfsFilesystem::open(Cursor::new(img), 0).unwrap();
+        let root = fs.root().unwrap();
+        assert_eq!(fs.list_directory(&root).unwrap().len(), 9000);
     }
 
     /// A thousand files in, one more in and out, the thousand out, one in:
