@@ -21,7 +21,7 @@ finding depends on a fixture, the fixture is named.
 |----|----------|------|---------|
 | R-063 | **High** | `src/fs/xfs/` | After 1000 files in one XFS directory, `fsck` reports 999 inodes allocated but unreachable from the root and `ls` of that directory lists one file: the directory's leaf / node form is written or read wrongly | found by the 1000-file churn (`churn.xfs`), 2026-09-05 |
 | ~~R-062~~ | ~~Medium~~ **FIXED** | `src/cli/verbs/rm.rs` and friends | ~~ProDOS path lookup is case-sensitive while ProDOS itself is not: `rm /d/extra.bin` cannot find the `EXTRA.BIN` that `put /d/extra.bin` just created~~ — every leaf lookup now goes through `find_child`, exact first and then the filesystem's own folding, 2026-09-05 |
-| R-061 | **High** | `src/fs/ufs.rs` | A UFS directory that grows past its first 8 KiB block is corrupt: the 401st file fails with `corrupt d_reclen 0 at off 8192` and the directory cannot be listed afterwards | found by the 1000-file churn (`churn.ufs`, `churn.ufs-43bsd`), 2026-09-05 |
+| ~~R-061~~ | ~~**High**~~ **FIXED** | `src/fs/ufs.rs` | ~~A UFS directory that grows past its first 8 KiB block is corrupt: the 401st file fails with `corrupt d_reclen 0 at off 8192` and the directory cannot be listed afterwards~~ — `write_inode` copied the stale pointer area it had read back over a changed `direct[]`; the copy is now applied to fast symlinks only, 2026-09-05 |
 | ~~R-060~~ | ~~**High**~~ **FIXED** | `src/fs/hfs.rs` | ~~A blank classic HFS volume built with the default B-tree sizes (`rb-cli batch` format, `create_blank_hfs`) gets a four-block catalog whatever its size, and refuses its 94th file at 4 KiB blocks: rb-cli cannot grow a classic catalog~~ — a zero request now takes the volume-scaled hformat sizing `new volume hfs` already used, 2026-09-05 |
 | ~~R-059~~ | ~~**High**~~ **FIXED** | `src/fs/hfs.rs` | ~~An in-place classic HFS grow sizes the allocation area to the partition end, over the alternate MDB and the trailing sector Mac OS reserves~~ — the two sectors are held back and the grown bitmap range is cleared, 2026-09-05 |
 | ~~R-058~~ | ~~Medium~~ **FIXED** | `src/model/provision_runner.rs` | ~~A classic HFS volume poured into a larger partition can never pass Disk First Aid ("Invalid allocation block start"): Mac OS wants the allocation area to end at the partition's alternate MDB~~ — `new hd --fill` grows the volume to the partition when its bitmap has room and warns when it has not, 2026-09-05 |
@@ -90,7 +90,15 @@ finding depends on a fixture, the fixture is named.
 
 ### R-061 — a UFS directory that grows past its first block is corrupt {#r-061}
 
-**OPEN.** Found 2026-09-05 by the 1000-file churn
+**FIXED 2026-09-05.** Not the directory writer at all: `read_inode` keeps
+a raw copy of the dinode's pointer area (`inline_payload`, the fast-symlink
+target) for every inode, and `write_inode` copied it back over `direct[]`
+and `indirect[]` unconditionally, so the block `dir_insert` had just
+allocated for the directory was undone at write-back while the new size
+stayed. Any path that changes an existing inode's block pointers was
+affected. The overlay now applies to fast symlinks only (symlink mode, no
+blocks); a unit test grows a root directory across two block boundaries,
+lists it, empties it and fscks it. Found 2026-09-05 by the 1000-file churn
 (`regression-tests/cases/tier3/churn.toml`, `churn.ufs` and
 `churn.ufs-43bsd`): the 401st (4.4BSD) / 409th (4.3BSD) `create_file` in
 one directory fails with `ufs dir_find: corrupt d_reclen 0 at off 8192`,

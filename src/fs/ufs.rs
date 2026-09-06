@@ -1361,6 +1361,11 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
         let dsize = self.dinode_size() as usize;
         let mut buf = vec![0u8; dsize];
         let endian = self.endian;
+        // read_inode keeps a copy of the pointer area in `inline_payload` for
+        // every inode; writing it back over a changed direct[] undid the change.
+        let inline = !inode.inline_payload.is_empty()
+            && unix_file_type(inode.mode) == UnixFileType::Symlink
+            && inode.blocks == 0;
 
         // di_mode + di_nlink share offsets across versions.
         write_u16(&mut buf, D1_OFF_MODE, inode.mode as u16, endian);
@@ -1379,11 +1384,9 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
                 for (i, &slot) in inode.indirect.iter().enumerate() {
                     write_i32(&mut buf, D1_OFF_IB + i * 4, slot as i32, endian);
                 }
-                // Inline payload (fast symlink target, etc.) overlays the
-                // direct/indirect pointer area. Callers that want to write
-                // an inline symlink should populate `inline_payload` AND
-                // leave direct/indirect zero; the inline bytes win.
-                if !inode.inline_payload.is_empty() {
+                // The pointer area carries a payload only for a fast symlink;
+                // for every other inode direct/indirect are the truth (R-061).
+                if inline {
                     let len = inode.inline_payload.len().min(60);
                     buf[D1_OFF_DB..D1_OFF_DB + len].copy_from_slice(&inode.inline_payload[..len]);
                 }
@@ -1400,7 +1403,7 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
                 for (i, &slot) in inode.indirect.iter().enumerate() {
                     write_i64(&mut buf, D2_OFF_IB + i * 8, slot as i64, endian);
                 }
-                if !inode.inline_payload.is_empty() {
+                if inline {
                     let len = inode.inline_payload.len().min(120);
                     buf[D2_OFF_DB..D2_OFF_DB + len].copy_from_slice(&inode.inline_payload[..len]);
                 }
@@ -5659,5 +5662,52 @@ mod tests {
         let bytes = fs.read_inode_data(&inode, size, 4096).expect("read");
         assert_eq!(bytes.len(), 4096);
         assert!(bytes.iter().all(|&b| b == 0));
+    }
+}
+
+#[cfg(test)]
+mod dir_growth_tests {
+    use super::*;
+    use crate::fs::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+    use std::io::Cursor;
+
+    /// R-061: a directory that outgrows its first block must still list.
+    #[test]
+    fn directory_grows_past_its_first_block() {
+        let params = crate::fs::ufs_format::Ufs1FormatParams {
+            size_bytes: 16 * 1024 * 1024,
+            ..Default::default()
+        };
+        let img = crate::fs::ufs_format::create_blank_ufs1(&params).unwrap();
+        let mut fs = UfsFilesystem::open(Cursor::new(img), 0).unwrap();
+        let root = fs.root().unwrap();
+        // 8 KiB blocks hold 25 twenty-byte records per 512-byte chunk: the
+        // 400th file needs a second block, the 800th a third.
+        for i in 0..850 {
+            let name = format!("f{i:04}.txt");
+            fs.create_file(
+                &root,
+                &name,
+                &mut &b"x"[..],
+                1,
+                &CreateFileOptions::default(),
+            )
+            .unwrap_or_else(|e| panic!("creating {name}: {e}"));
+        }
+        let ino = fs.read_inode(root.location as u32).unwrap();
+        assert!(
+            ino.direct[1] != 0 && ino.direct[2] != 0,
+            "{:?}",
+            &ino.direct[..3]
+        );
+        let kids = fs.list_directory(&root).unwrap();
+        assert_eq!(kids.len(), 850);
+        for e in kids.iter().filter(|e| e.name.starts_with('f')) {
+            fs.delete_entry(&root, e).unwrap();
+        }
+        fs.sync_metadata().unwrap();
+        assert!(fs.list_directory(&root).unwrap().is_empty());
+        let report = fs.fsck().expect("ufs has fsck").unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
     }
 }

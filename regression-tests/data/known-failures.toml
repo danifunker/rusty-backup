@@ -92,16 +92,6 @@ note = "directories stop at their direct zones: refused at the 111th file"
 
 # Defects: the writer does not refuse, it corrupts or loses.
 [[known]]
-id = "churn.ufs"
-finding = "R-061"
-note = "the directory is corrupt once it outgrows its first 8 KiB block (the 401st file)"
-
-[[known]]
-id = "churn.ufs-43bsd"
-finding = "R-061"
-note = "same as churn.ufs, in the 4.3BSD on-disk format"
-
-[[known]]
 id = "churn.xfs"
 finding = "R-063"
 note = "after 1000 files the directory lists one entry and fsck reports 999 orphaned inodes"
