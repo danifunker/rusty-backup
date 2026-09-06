@@ -8,7 +8,9 @@
 # "/d/f{A..B}"` seeds the entries in one process, so no fixture is needed.
 # The 300000 inodes of the second case do not fit one AG of its 256 MiB
 # volume, which pins F-018 (chunks continue in the next AG). The first case
-# takes about a minute and the second about 41 (on an otherwise idle machine).
+# takes about a minute; the second's file creation alone takes ten, and the
+# whole case about twenty when nothing else is running (41 measured while
+# sharing the CPU with another 300000-entry run).
 #
 # The same volumes judged by `xfs_repair -n` (the Docker oracle) are recorded
 # under F-017 in docs/missing_features_from_regression.md.
