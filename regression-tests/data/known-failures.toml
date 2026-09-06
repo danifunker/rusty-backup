@@ -71,11 +71,6 @@ finding = "F-012"
 note = "the directory index cannot grow past its resident root: the 79th file is refused"
 
 [[known]]
-id = "churn.ext4"
-finding = "F-013"
-note = "directory extent-tree splitting is unimplemented: refused at about the 816th file"
-
-[[known]]
 id = "churn.sfs"
 finding = "F-014"
 note = "the object-node tree never grows: refused at the 43rd file"

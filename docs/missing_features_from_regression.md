@@ -23,7 +23,7 @@ concrete reason to.
 | ~~F-004~~ | ~~`show partmap` is APM-only~~ — **SHIPPED** 2026-08-08, same gap as R-026 | `src/cli/verbs/show.rs` | — |
 | [F-010](#f-010) | A file-aware Ghost image exposes only its FAT record stream; an NTFS partition behind it is unreachable | `src/rbformats/gho.rs` | D13's Windows check (a real multi-partition `.GHO` with long names) |
 | [F-012](#f-012) | An NTFS directory cannot grow past its resident index root: the 79th file in a directory is refused | `src/fs/ntfs.rs` | the 1000-file churn (`churn.ntfs`) |
-| [F-013](#f-013) | An ext4 directory whose extent tree must split cannot take more files (about 800 in one directory) | `src/fs/ext.rs` | the 1000-file churn (`churn.ext4`) |
+| ~~[F-013](#f-013)~~ | **SHIPPED 2026-09-06.** ~~An ext4 directory whose extent tree must split cannot take more files (about 800 in one directory)~~ | `src/fs/ext.rs` | the 1000-file churn (`churn.ext4`) |
 | [F-014](#f-014) | An SFS volume takes about 43 files: the object-node tree never grows | `src/fs/sfs.rs` | the 1000-file churn (`churn.sfs`) |
 | ~~[F-015](#f-015)~~ | **SHIPPED 2026-09-05.** ~~A Minix directory stops at its direct blocks (about 110 V3 / 220 V2 files)~~ | `src/fs/minix.rs` | the 1000-file churn (`churn.minix2`, `churn.minix3`) |
 | [F-017](#f-017) | An XFS directory in leaf or node form takes no inserts or removes: 125 entries per directory, then `unsupported` | `src/fs/xfs/edit.rs` | the 1000-file churn (`churn.xfs`), after R-063 |
@@ -668,6 +668,15 @@ directories works. Until then a directory holds ~78 short-named files.
 
 ## F-013 — an ext4 directory cannot split its extent tree {#f-013}
 
+**SHIPPED 2026-09-06.** A directory first tries the block right after its
+last one, so growth rarely costs an extent at all; when the four inline
+extents are nonetheless full, they move to a leaf block (up to 340
+extents, checksum tail sealed on metadata_csum volumes) and the inode
+keeps one index entry, depth 1, as the kernel lays it out; later blocks
+extend that leaf, and a full leaf gets a sibling under the next inline
+index slot. Deleting an inode frees its index blocks with its data. A
+unit test interleaves a thousand files with the directory's growth,
+checks the tree reached depth 1, lists, empties and fscks the volume.
 Found by `churn.ext4`: the 816th file fails with `ext4: extent tree
 splitting not yet supported for editing`. The directory inode's inline
 extent header (four extents) is exhausted once the directory outgrows the
