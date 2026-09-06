@@ -7,7 +7,7 @@
 # second btree level once the leafN blocks pass 504 (about 230000 entries). `put --zero 0 --dst
 # "/d/f{A..B}"` seeds the entries in one process, so no fixture is needed;
 # the volume sizes give AG 0 room for the inodes. The first case takes about
-# a minute and the second about ten.
+# a minute and the second about fifteen.
 #
 # The same volumes judged by `xfs_repair -n` (the Docker oracle) are recorded
 # under F-017 in docs/missing_features_from_regression.md.
