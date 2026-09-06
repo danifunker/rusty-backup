@@ -661,8 +661,9 @@ expect_exit = 0
 [[case.step]]
 args = ["ls", "{scratch}/v.img", "/d"]
 expect_exit = 0
-stdout_contains = ["last.bin"]
-stdout_not_contains = ["f0001.txt", "f1000.txt", "extra.bin"]
+# ProDOS stores names upper-case; this is how the volume lists them.
+stdout_contains = ["LAST.BIN"]
+stdout_not_contains = ["F0001.TXT", "F1000.TXT", "EXTRA.BIN"]
 
 [[case]]
 id = "churn.efs"

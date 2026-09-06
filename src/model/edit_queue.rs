@@ -338,10 +338,10 @@ pub fn apply_edit(
             let resolved_parent = resolve_dir_by_path(efs, &parent.path)?;
             // A folder that is already there is the outcome asked for; only a
             // file in the way is a real collision (the pre-scan skips folders).
-            if let Some(existing) = efs
-                .list_directory(&resolved_parent)?
-                .into_iter()
-                .find(|e| &e.name == name)
+            let fold = efs.case_insensitive_lookup();
+            let children = efs.list_directory(&resolved_parent)?;
+            if let Some(existing) =
+                crate::fs::filesystem::find_child(fold, &children, name).cloned()
             {
                 if existing.is_directory() {
                     return Ok(());

@@ -20,7 +20,7 @@ finding depends on a fixture, the fixture is named.
 | ID | Severity | Area | Finding |
 |----|----------|------|---------|
 | R-063 | **High** | `src/fs/xfs/` | After 1000 files in one XFS directory, `fsck` reports 999 inodes allocated but unreachable from the root and `ls` of that directory lists one file: the directory's leaf / node form is written or read wrongly | found by the 1000-file churn (`churn.xfs`), 2026-09-05 |
-| R-062 | Medium | `src/fs/prodos.rs` | ProDOS path lookup is case-sensitive while ProDOS itself is not: `rm /d/extra.bin` cannot find the `EXTRA.BIN` that `put /d/extra.bin` just created | found by the 1000-file churn (`churn.prodos`), 2026-09-05 |
+| ~~R-062~~ | ~~Medium~~ **FIXED** | `src/cli/verbs/rm.rs` and friends | ~~ProDOS path lookup is case-sensitive while ProDOS itself is not: `rm /d/extra.bin` cannot find the `EXTRA.BIN` that `put /d/extra.bin` just created~~ — every leaf lookup now goes through `find_child`, exact first and then the filesystem's own folding, 2026-09-05 |
 | R-061 | **High** | `src/fs/ufs.rs` | A UFS directory that grows past its first 8 KiB block is corrupt: the 401st file fails with `corrupt d_reclen 0 at off 8192` and the directory cannot be listed afterwards | found by the 1000-file churn (`churn.ufs`, `churn.ufs-43bsd`), 2026-09-05 |
 | ~~R-060~~ | ~~**High**~~ **FIXED** | `src/fs/hfs.rs` | ~~A blank classic HFS volume built with the default B-tree sizes (`rb-cli batch` format, `create_blank_hfs`) gets a four-block catalog whatever its size, and refuses its 94th file at 4 KiB blocks: rb-cli cannot grow a classic catalog~~ — a zero request now takes the volume-scaled hformat sizing `new volume hfs` already used, 2026-09-05 |
 | ~~R-059~~ | ~~**High**~~ **FIXED** | `src/fs/hfs.rs` | ~~An in-place classic HFS grow sizes the allocation area to the partition end, over the alternate MDB and the trailing sector Mac OS reserves~~ — the two sectors are held back and the grown bitmap range is cleared, 2026-09-05 |
@@ -105,7 +105,14 @@ fail the same way.
 
 ### R-062 — ProDOS path lookup is case-sensitive {#r-062}
 
-**OPEN.** Found by `churn.prodos`: `put v.img payload /d/extra.bin` stores
+**FIXED 2026-09-05.** The ProDOS driver already folded case in its own
+lookups; the CLI verbs compared the leaf name literally after
+`list_directory` (`rm`, `mkdir`, `mv`, `batch`, `locate`, the HFS API
+verbs, the TUI import and the staged-edit queue), even though the path
+walk above them (`resolve_components`) already honoured
+`case_insensitive_lookup`. They all use one helper now,
+`fs::filesystem::find_child`: an exact match first, then the filesystem's
+folding. Found by `churn.prodos`: `put v.img payload /d/extra.bin` stores
 `EXTRA.BIN` (ProDOS keeps names upper-case, with lowercase flags on
 ProDOS 8), and `rm v.img /d/extra.bin` then answers `not found`;
 `rm /d/EXTRA.BIN` works, and the root behaves the same (`put /rootx.bin`,

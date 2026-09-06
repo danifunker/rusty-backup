@@ -133,12 +133,12 @@ pub fn run_with_budget(
     if name.is_empty() {
         bail!("path has no basename");
     }
+    let fold = fs.case_insensitive_lookup();
     let children = fs
         .list_directory(&parent)
         .map_err(|e| anyhow!("list_directory: {e}"))?;
-    let entry = children
-        .into_iter()
-        .find(|c| c.name == name)
+    let entry = crate::fs::filesystem::find_child(fold, &children, &name)
+        .cloned()
         .ok_or_else(|| anyhow!("not found: {}", args.path))?;
 
     if entry.is_directory() {

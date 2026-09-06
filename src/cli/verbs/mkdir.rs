@@ -62,11 +62,11 @@ pub fn run(args: MkdirArgs) -> Result<()> {
     }
 
     // Early duplicate check so the user-facing message names the path.
-    let already = fs
+    let fold = fs.case_insensitive_lookup();
+    let children = fs
         .list_directory(&parent)
-        .map_err(|e| anyhow!("list_directory: {e}"))?
-        .into_iter()
-        .any(|e| e.name == name);
+        .map_err(|e| anyhow!("list_directory: {e}"))?;
+    let already = crate::fs::filesystem::find_child(fold, &children, &name).is_some();
     if already {
         bail!("{} already exists", args.path);
     }

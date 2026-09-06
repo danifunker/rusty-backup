@@ -11742,11 +11742,11 @@ fn import_host_file(
     // Ask before overwriting rather than refusing outright, which is what this
     // did before: a name collision was a dead end, so the only way to correct a
     // file in an image was to delete it first and remember what it carried.
-    let exists = fs
+    let fold = fs.case_insensitive_lookup();
+    let children = fs
         .list_directory(&parent)
-        .map_err(|e| anyhow::anyhow!("list_directory: {e}"))?
-        .into_iter()
-        .any(|e| e.name == leaf);
+        .map_err(|e| anyhow::anyhow!("list_directory: {e}"))?;
+    let exists = crate::fs::filesystem::find_child(fold, &children, &leaf).is_some();
     if exists && on_conflict == crate::fs::replace::OnConflict::Fail {
         return Ok(ImportOutcome::Exists(leaf));
     }

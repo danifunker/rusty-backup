@@ -828,11 +828,11 @@ fn apply_put(
     let parent = super::ls::resolve_path(fs.as_filesystem_mut(), &parent_path)?;
     let force = op.force || defaults.force.unwrap_or(false);
 
-    let existing = fs
+    let fold = fs.case_insensitive_lookup();
+    let children = fs
         .list_directory(&parent)
-        .map_err(|e| anyhow!("list_directory: {e}"))?
-        .into_iter()
-        .find(|e| e.name == name);
+        .map_err(|e| anyhow!("list_directory: {e}"))?;
+    let existing = crate::fs::filesystem::find_child(fold, &children, &name).cloned();
     if let Some(ref e) = existing {
         if !force {
             bail!("{} already exists (set \"force\": true)", op.dst);
@@ -880,11 +880,12 @@ fn apply_rm(
 ) -> Result<()> {
     let (parent_path, name) = split_mac_path(path)?;
     let parent = super::ls::resolve_path(fs.as_filesystem_mut(), &parent_path)?;
-    let entry = fs
+    let fold = fs.case_insensitive_lookup();
+    let children = fs
         .list_directory(&parent)
-        .map_err(|e| anyhow!("list_directory: {e}"))?
-        .into_iter()
-        .find(|c| c.name == name)
+        .map_err(|e| anyhow!("list_directory: {e}"))?;
+    let entry = crate::fs::filesystem::find_child(fold, &children, &name)
+        .cloned()
         .ok_or_else(|| anyhow!("not found: {path}"))?;
     if entry.is_directory() {
         if !recursive {

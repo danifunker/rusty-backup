@@ -102,11 +102,6 @@ finding = "R-061"
 note = "same as churn.ufs, in the 4.3BSD on-disk format"
 
 [[known]]
-id = "churn.prodos"
-finding = "R-062"
-note = "rm /d/extra.bin cannot find the EXTRA.BIN that put just wrote: paths are matched case-sensitively"
-
-[[known]]
 id = "churn.xfs"
 finding = "R-063"
 note = "after 1000 files the directory lists one entry and fsck reports 999 orphaned inodes"

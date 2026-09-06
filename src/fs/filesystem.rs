@@ -754,6 +754,20 @@ pub trait EditableFilesystem: Filesystem {
     }
 }
 
+/// The child of a listing that `name` addresses: an exact match first, then,
+/// when the filesystem folds case, the way its native OS would match (R-062).
+pub fn find_child<'a>(
+    fold_case: bool,
+    children: &'a [FileEntry],
+    name: &str,
+) -> Option<&'a FileEntry> {
+    children.iter().find(|c| c.name == name).or_else(|| {
+        fold_case
+            .then(|| children.iter().find(|c| c.name.eq_ignore_ascii_case(name)))
+            .flatten()
+    })
+}
+
 /// The filesystems whose drivers refuse `readme.txt` beside `README.TXT`, so a
 /// lookup that only matched exactly would see no conflict where they see one.
 pub fn folds_case(fs_type: &str) -> bool {
@@ -772,4 +786,28 @@ pub fn folds_case(fs_type: &str) -> bool {
         || t == "AFS"
         || t == "muPFS"
         || t == "SFS"
+}
+
+#[cfg(test)]
+mod find_child_tests {
+    use super::*;
+
+    #[test]
+    fn find_child_prefers_exact_and_folds_only_when_asked() {
+        let kids = vec![
+            FileEntry::new_file("README.TXT".into(), "/README.TXT".into(), 1, 1),
+            FileEntry::new_file("readme.txt".into(), "/readme.txt".into(), 2, 2),
+            FileEntry::new_file("EXTRA.BIN".into(), "/EXTRA.BIN".into(), 3, 3),
+        ];
+        assert_eq!(
+            find_child(true, &kids, "readme.txt").map(|e| e.location),
+            Some(2)
+        );
+        assert_eq!(
+            find_child(true, &kids, "extra.bin").map(|e| e.location),
+            Some(3)
+        );
+        assert!(find_child(false, &kids, "extra.bin").is_none());
+        assert!(find_child(true, &kids, "missing").is_none());
+    }
 }

@@ -70,15 +70,13 @@ pub fn run(args: MvArgs) -> Result<()> {
     let children = fs
         .list_directory(&parent)
         .map_err(|e| anyhow!("list_directory: {e}"))?;
-    let entry = children
-        .iter()
-        .find(|c| c.name == old_name)
+    let fold = fs.case_insensitive_lookup();
+    let entry = crate::fs::filesystem::find_child(fold, &children, &old_name)
         .cloned()
         .ok_or_else(|| anyhow!("not found: {}", args.src))?;
     // A case-only rename on a case-folding volume is the entry itself, not a clash.
-    let fold = fs.case_insensitive_lookup();
     let taken = children.iter().any(|c| {
-        c.name != old_name
+        c.name != entry.name
             && (c.name == new_name || (fold && c.name.eq_ignore_ascii_case(&new_name)))
     });
     if taken {

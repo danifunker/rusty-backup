@@ -472,11 +472,11 @@ pub(crate) fn cmd_put(
     }
 
     // Duplicate check (so we can honor --force consistently).
-    let existing = fs
+    let fold = fs.case_insensitive_lookup();
+    let children = fs
         .list_directory(&parent)
-        .map_err(|e| anyhow!("list_directory: {e}"))?
-        .into_iter()
-        .find(|e| e.name == name);
+        .map_err(|e| anyhow!("list_directory: {e}"))?;
+    let existing = crate::fs::filesystem::find_child(fold, &children, &name).cloned();
     if let Some(ref e) = existing {
         if !force {
             bail!("{mac_path} already exists (pass --force to overwrite)");
@@ -556,12 +556,12 @@ pub(crate) fn cmd_rm(image: PathBuf, mac_path: &str, partition: Option<u32>) -> 
     }
     let mut fs = HfsFilesystem::open(file, offset).map_err(|e| anyhow!("opening HFS: {e}"))?;
     let parent = resolve_path(&mut fs, &parent_path)?;
+    let fold = fs.case_insensitive_lookup();
     let children = fs
         .list_directory(&parent)
         .map_err(|e| anyhow!("list_directory: {e}"))?;
-    let entry = children
-        .into_iter()
-        .find(|c| c.name == name)
+    let entry = crate::fs::filesystem::find_child(fold, &children, &name)
+        .cloned()
         .ok_or_else(|| anyhow!("not found: {mac_path}"))?;
     fs.delete_entry(&parent, &entry)
         .map_err(|e| anyhow!("delete_entry: {e}"))?;
@@ -617,13 +617,13 @@ pub fn resolve_path<R: Read + Seek + Send>(
     // slash. See `crate::cli::parse::split_image_path`.
     let components = crate::cli::parse::split_image_path(path, path.contains(':'));
     let mut current = fs.root().map_err(|e| anyhow!("root: {e}"))?;
+    let fold = fs.case_insensitive_lookup();
     for component in &components {
         let children = fs
             .list_directory(&current)
             .map_err(|e| anyhow!("list_directory: {e}"))?;
-        let next = children
-            .into_iter()
-            .find(|c| &c.name == component)
+        let next = crate::fs::filesystem::find_child(fold, &children, component)
+            .cloned()
             .ok_or_else(|| anyhow!("path component not found: {component}"))?;
         current = next;
     }
