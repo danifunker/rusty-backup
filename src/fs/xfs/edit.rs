@@ -1808,8 +1808,13 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                             any = true;
                             split_at = i + 1;
                         }
-                        let block0_bytes = XFS_DIR2_DATA_HDR_LEN + dotdot_bytes + block0_payload;
-                        let block1_bytes = XFS_DIR2_DATA_HDR_LEN + (total - block0_payload);
+                        let hdr = if sb.is_v5() {
+                            super::dir2::XFS_DIR3_DATA_HDR_LEN
+                        } else {
+                            XFS_DIR2_DATA_HDR_LEN
+                        };
+                        let block0_bytes = hdr + dotdot_bytes + block0_payload;
+                        let block1_bytes = hdr + (total - block0_payload);
                         if block0_bytes > dirblksize || block1_bytes > dirblksize {
                             return Err(FilesystemError::DiskFull(format!(
                                 "leaf-form conversion split block 0={block0_bytes} block 1={block1_bytes} \
@@ -2260,7 +2265,12 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         sf_fork[1] = 0; // i8count
         BigEndian::write_u32(&mut sf_fork[2..6], dotdot as u32);
 
-        let mut data_off = XFS_DIR2_DATA_HDR_LEN
+        let hdr = if sb.is_v5() {
+            super::dir2::XFS_DIR3_DATA_HDR_LEN
+        } else {
+            XFS_DIR2_DATA_HDR_LEN
+        };
+        let mut data_off = hdr
             + dir2_data_entsize(1, has_ftype)  // "."
             + dir2_data_entsize(2, has_ftype); // ".."
         let mut pos = header;
@@ -2692,7 +2702,10 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                 let tail = block_end - 8;
                 let leaf_count = BigEndian::read_u32(&block[tail..tail + 4]) as usize;
                 let data_end = block_end - (leaf_count * 8 + 8);
-                let mut pos = XFS_DIR2_DATA_HDR_LEN;
+                let mut pos = match BigEndian::read_u32(&block[0..4]) {
+                    super::dir2::XFS_DIR3_BLOCK_MAGIC => super::dir2::XFS_DIR3_DATA_HDR_LEN,
+                    _ => XFS_DIR2_DATA_HDR_LEN,
+                };
                 let mut done = false;
                 while pos + 4 <= data_end {
                     if BigEndian::read_u16(&block[pos..pos + 2]) == 0xFFFF {
@@ -3232,7 +3245,14 @@ fn block_entries_with_ftype(
     let data_end = block_end - (leaf_count * 8 + 8);
     let mut out = Vec::new();
     let mut dotdot = 0u64;
-    let mut pos = XFS_DIR2_DATA_HDR_LEN;
+    // A v5 block (XDB3) carries the 64-byte dir3 header; a v4 one 16 bytes.
+    // Starting at 16 on v5 read the header as entries and found none (R-063).
+    let mut pos = match BigEndian::read_u32(&block[0..4]) {
+        super::dir2::XFS_DIR3_BLOCK_MAGIC | super::dir2::XFS_DIR3_DATA_MAGIC => {
+            super::dir2::XFS_DIR3_DATA_HDR_LEN
+        }
+        _ => XFS_DIR2_DATA_HDR_LEN,
+    };
     while pos + 4 <= data_end {
         let freetag = BigEndian::read_u16(&block[pos..pos + 2]);
         if freetag == 0xFFFF {

@@ -26,6 +26,7 @@ concrete reason to.
 | [F-013](#f-013) | An ext4 directory whose extent tree must split cannot take more files (about 800 in one directory) | `src/fs/ext.rs` | the 1000-file churn (`churn.ext4`) |
 | [F-014](#f-014) | An SFS volume takes about 43 files: the object-node tree never grows | `src/fs/sfs.rs` | the 1000-file churn (`churn.sfs`) |
 | ~~[F-015](#f-015)~~ | **SHIPPED 2026-09-05.** ~~A Minix directory stops at its direct blocks (about 110 V3 / 220 V2 files)~~ | `src/fs/minix.rs` | the 1000-file churn (`churn.minix2`, `churn.minix3`) |
+| [F-017](#f-017) | An XFS directory in leaf or node form takes no inserts or removes: 125 entries per directory, then `unsupported` | `src/fs/xfs/edit.rs` | the 1000-file churn (`churn.xfs`), after R-063 |
 | ~~[F-016](#f-016)~~ | **SHIPPED 2026-09-06.** ~~A classic HFS catalog is sized at format time (0.5 % of the volume) and never grows, so a 16 MiB volume stops at about 600 files~~ | `src/fs/hfs.rs` | the 1000-file churn (`churn.hfs`, `churn.hfv` at 16 MiB) |
 | ~~[F-011](#f-011)~~ | **SHIPPED 2026-09-05.** ~~The classic HFS writer allocates a fork as one contiguous run; a fragmented volume reports disk full with room to spare~~ | `src/fs/hfs.rs` | H3's classic-HFS check: a resource fork spilled into the extents-overflow file by rb-cli, clean under `fsck_hfs -n` and Disk First Aid before and after the delete |
 
@@ -712,3 +713,16 @@ What it would take: allocate more blocks for CNID 4 (inline extents, then
 records in the extents-overflow tree), extend the header node's node count
 and map, and rewrite drCTFlSize / drCTExtRec; the HFS+ `grow_btree_fork`
 is the model.
+
+## F-017 — an XFS directory in leaf or node form takes no inserts or removes {#f-017}
+
+Found 2026-09-06 by `churn.xfs` once R-063 was fixed: the 126th entry of a
+directory converts it from a single block to leaf form (two data blocks
+and a leaf1 index), and the next `create_file` answers `insert into
+leaf/node-form directory not yet implemented`; `rm` answers the same for a
+remove. What it would take: place the entry in a data block with room
+(the `bests` array says which), or append a data block; keep the leaf1
+hash index and `bests` in step; and past what one leaf block indexes
+(about 500 entries at 4 KiB), the node form -- leafN blocks under a
+da-btree root and a freeindex block -- as `xfs_dir2_leaf_addname` and
+`xfs_dir2_leaf_to_node` do. Reads of both forms already work.

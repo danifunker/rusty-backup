@@ -19,7 +19,7 @@ finding depends on a fixture, the fixture is named.
 
 | ID | Severity | Area | Finding |
 |----|----------|------|---------|
-| R-063 | **High** | `src/fs/xfs/` | After 1000 files in one XFS directory, `fsck` reports 999 inodes allocated but unreachable from the root and `ls` of that directory lists one file: the directory's leaf / node form is written or read wrongly | found by the 1000-file churn (`churn.xfs`), 2026-09-05 |
+| ~~R-063~~ | ~~**High**~~ **FIXED** | `src/fs/xfs/edit.rs` | ~~After 1000 files in one XFS directory, `fsck` reports 999 inodes allocated but unreachable from the root and `ls` of that directory lists one file~~ — the editor re-read a v5 block directory past a 16-byte header where the dir3 header is 64 bytes, so every insert into a block-form directory rebuilt it from nothing; the remaining growth past 125 entries is F-017, 2026-09-06 |
 | ~~R-062~~ | ~~Medium~~ **FIXED** | `src/cli/verbs/rm.rs` and friends | ~~ProDOS path lookup is case-sensitive while ProDOS itself is not: `rm /d/extra.bin` cannot find the `EXTRA.BIN` that `put /d/extra.bin` just created~~ — every leaf lookup now goes through `find_child`, exact first and then the filesystem's own folding, 2026-09-05 |
 | ~~R-061~~ | ~~**High**~~ **FIXED** | `src/fs/ufs.rs` | ~~A UFS directory that grows past its first 8 KiB block is corrupt: the 401st file fails with `corrupt d_reclen 0 at off 8192` and the directory cannot be listed afterwards~~ — `write_inode` copied the stale pointer area it had read back over a changed `direct[]`; the copy is now applied to fast symlinks only, 2026-09-05 |
 | ~~R-060~~ | ~~**High**~~ **FIXED** | `src/fs/hfs.rs` | ~~A blank classic HFS volume built with the default B-tree sizes (`rb-cli batch` format, `create_blank_hfs`) gets a four-block catalog whatever its size, and refuses its 94th file at 4 KiB blocks: rb-cli cannot grow a classic catalog~~ — a zero request now takes the volume-scaled hformat sizing `new volume hfs` already used, 2026-09-05 |
@@ -130,7 +130,18 @@ way the volume does.
 
 ### R-063 — a thousand-file XFS directory loses most of its entries {#r-063}
 
-**OPEN.** Found by `churn.xfs` on a 32 MiB `new volume xfs`: after `untar`
+**FIXED 2026-09-06.** Not the leaf form: the 21st entry converts a
+short-form directory to a single block correctly, and the 22nd insert
+rebuilds that block from what `block_entries_with_ftype` reads back --
+which on a v5 volume started parsing at the 16-byte dir2 header instead of
+the 64-byte dir3 one, found no entries, and wrote a block holding only the
+new name. Every insert from then on kept one entry; the directory lost
+its contents one file at a time, which is why `fsck` counted 999 orphans.
+The gatherer, the shrink-to-short-form rewriter and the block remover now
+pick the header by the block's magic, as the reader always did. A
+directory takes 125 entries before it converts to leaf form, where
+inserts and removes are still unimplemented (F-017). Found by
+`churn.xfs` on a 32 MiB `new volume xfs`: after `untar`
 puts 1000 files into one directory, `rb-cli fsck` counts 1002 files yet
 reports 999 `OrphanInode` errors ("allocated but unreachable from the root
 directory"), and `ls` of the directory lists a single file. The inodes and

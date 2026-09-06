@@ -83,5 +83,5 @@ note = "the object-node tree never grows: refused at the 43rd file"
 # Defects: the writer does not refuse, it corrupts or loses.
 [[known]]
 id = "churn.xfs"
-finding = "R-063"
-note = "after 1000 files the directory lists one entry and fsck reports 999 orphaned inodes"
+finding = "F-017"
+note = "the 126th entry converts the directory to leaf form, which takes no further inserts"
