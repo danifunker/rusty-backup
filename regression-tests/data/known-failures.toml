@@ -65,11 +65,6 @@
 
 # --- the 1000-file churn (cases/tier3/churn.toml), 2026-09-05 ----------------
 # Documented capacity gaps: the writer refuses, cleanly, before the thousand.
-[[known]]
-id = "churn.ntfs"
-finding = "F-012"
-note = "the directory index cannot grow past its resident root: the 79th file is refused"
-
 # Defects: the writer does not refuse, it corrupts or loses.
 [[known]]
 id = "churn.xfs"

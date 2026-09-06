@@ -22,7 +22,7 @@ concrete reason to.
 | ~~F-009~~ | ~~SFS editor writes single-leaf extent b-trees only~~ — **SHIPPED** 2026-08-17 | `src/fs/sfs.rs` | — |
 | ~~F-004~~ | ~~`show partmap` is APM-only~~ — **SHIPPED** 2026-08-08, same gap as R-026 | `src/cli/verbs/show.rs` | — |
 | [F-010](#f-010) | A file-aware Ghost image exposes only its FAT record stream; an NTFS partition behind it is unreachable | `src/rbformats/gho.rs` | D13's Windows check (a real multi-partition `.GHO` with long names) |
-| [F-012](#f-012) | An NTFS directory cannot grow past its resident index root: the 79th file in a directory is refused | `src/fs/ntfs.rs` | the 1000-file churn (`churn.ntfs`) |
+| ~~[F-012](#f-012)~~ | **SHIPPED 2026-09-06.** ~~An NTFS directory cannot grow past its resident index root: the 79th file in a directory is refused~~ | `src/fs/ntfs.rs` | the 1000-file churn (`churn.ntfs`) |
 | ~~[F-013](#f-013)~~ | **SHIPPED 2026-09-06.** ~~An ext4 directory whose extent tree must split cannot take more files (about 800 in one directory)~~ | `src/fs/ext.rs` | the 1000-file churn (`churn.ext4`) |
 | ~~[F-014](#f-014)~~ | **SHIPPED 2026-09-06.** ~~An SFS volume takes about 43 files: the object-node tree never grows~~ | `src/fs/sfs.rs` | the 1000-file churn (`churn.sfs`) |
 | ~~[F-015](#f-015)~~ | **SHIPPED 2026-09-05.** ~~A Minix directory stops at its direct blocks (about 110 V3 / 220 V2 files)~~ | `src/fs/minix.rs` | the 1000-file churn (`churn.minix2`, `churn.minix3`) |
@@ -658,6 +658,20 @@ test `delete_frees_overflow_extents_and_their_records`, whose overflow
 record is written by hand.
 ## F-012 — an NTFS directory cannot grow past its resident index root {#f-012}
 
+**SHIPPED 2026-09-06.** The writer already moved a full root into
+`$INDEX_ALLOCATION` blocks and split full INDX nodes; what it could not do
+was take the median a split pushes up once the resident root itself was
+full. The root's entries now move down into a fresh INDX node and the
+root keeps one sentinel pointing there, so the tree gains a level (and
+again as often as needed). Removing a separator whose left subtree's
+rightmost leaf has emptied (nothing rebalances on delete) now pulls the
+predecessor from the nearest ancestor with an entry and frees the emptied
+blocks, where it used to refuse past one level. The MFT grows too:
+`$MFT`'s `$DATA` gains whole clusters, its `$BITMAP` widens with the
+padding bits marked in use as Windows keeps them, every new record is
+formatted blank, and `$MFTMirr` is resynchronised -- a 16 MiB volume is
+formatted with 128 records. A unit test takes a 64-record volume to 1000
+entries in one directory, lists, empties, adds one and fscks clean.
 Found 2026-09-05 by the 1000-file churn (`regression-tests/cases/tier3/churn.toml`,
 `churn.ntfs`): the 79th `create_file` in one directory fails with
 `disk full: directory index root is full; cannot grow this directory
