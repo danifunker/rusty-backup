@@ -1,4 +1,4 @@
-# Regression Findings (R-001 … R-064)
+# Regression Findings (R-001 … R-065)
 
 Defects and documentation drift turned up while building the regression suite
 (`regression-tests/`), 2026-08-01/02. The suite work was deliberately kept
@@ -19,6 +19,7 @@ finding depends on a fixture, the fixture is named.
 
 | ID | Severity | Area | Finding |
 |----|----------|------|---------|
+| ~~R-065~~ | ~~**High**~~ **FIXED** | `src/fs/xfs/v5_crc.rs` | ~~Every v5 CRC header rb-cli stamps on a file or directory block in AG 1 or later carries the wrong `blkno` when an AG is not a power of two of blocks, so `xfs_repair -n` reports every such block as corrupt~~ — `fsblock_to_daddr` shifted the raw fsblock instead of decoding its AG; found on a 96 MiB volume (6144-block AGs), 2026-09-06 |
 | ~~R-064~~ | ~~**High**~~ **FIXED** | `src/fs/xfs/edit.rs`, `src/fs/xfs/mod.rs` | ~~A v5 XFS directory converted to leaf form fails `xfs_repair -n`: the leaf index sat at file offset 2^32 instead of `XFS_DIR2_LEAF_OFFSET` (2^35), the leaf1 block lacked the dir3 header pad and the `bestcount` tail, and short-form offset cookies assumed the 16-byte v4 data header~~ — found under the Docker `xfs_repair` oracle while shipping F-017, 2026-09-06 |
 | ~~R-063~~ | ~~**High**~~ **FIXED** | `src/fs/xfs/edit.rs` | ~~After 1000 files in one XFS directory, `fsck` reports 999 inodes allocated but unreachable from the root and `ls` of that directory lists one file~~ — the editor re-read a v5 block directory past a 16-byte header where the dir3 header is 64 bytes, so every insert into a block-form directory rebuilt it from nothing; the remaining growth past 125 entries is F-017, 2026-09-06 |
 | ~~R-062~~ | ~~Medium~~ **FIXED** | `src/cli/verbs/rm.rs` and friends | ~~ProDOS path lookup is case-sensitive while ProDOS itself is not: `rm /d/extra.bin` cannot find the `EXTRA.BIN` that `put /d/extra.bin` just created~~ — every leaf lookup now goes through `find_child`, exact first and then the filesystem's own folding, 2026-09-05 |
@@ -128,6 +129,25 @@ ProDOS 8), and `rm v.img /d/extra.bin` then answers `not found`;
 `rm /rootx.bin`: not found). ProDOS compares names case-insensitively, so
 every path verb (`rm`, `get`, `mv`, `ls PATH`, `cp`) should fold case the
 way the volume does.
+
+### R-065 — v5 CRC headers in AG 1 and beyond carried the wrong `blkno` {#r-065}
+
+**FIXED 2026-09-06.** An XFS fsblock number is `agno << sb_agblklog | agbno`,
+and `sb_agblklog` rounds the AG size up to a power of two, so the encoding
+has gaps unless `sb_agblocks` is itself a power of two. `fsblock_to_daddr`
+shifted that raw number by `blocklog - 9` to produce the disk address it
+stamps into every v5 CRC header (`xfs_dir3_blk_hdr`, `xfs_da3_blkinfo`,
+bmbt blocks, inode cores are unaffected, they carry the inode number). On
+the 32 MiB volumes the churn had used, 2048-block AGs made the two agree; on
+a 96 MiB volume with 6144-block AGs, every directory block placed in AG 1
+or later was stamped 2048 blocks too far, and `xfs_repair -n` reported
+"Metadata corruption detected at xfs_dir3_data block" for each of them
+while `rb-cli fsck`, which does not check `blkno`, saw nothing. The helper
+now mirrors `XFS_FSB_TO_DADDR` (`agno * sb_agblocks + agbno`, then the
+shift); the AG-relative btree stamper already computed the physical block
+itself and no longer round-trips it through the helper. Found by the
+long-name directory churn under the Docker oracle while shipping F-017's
+incremental writer.
 
 ### R-064 — a v5 XFS leaf-form directory failed `xfs_repair` on three counts {#r-064}
 
