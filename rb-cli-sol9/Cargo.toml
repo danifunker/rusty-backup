@@ -1,0 +1,156 @@
+# rb-cli-sol9 — the mrustc / Solaris 9 SPARC manifest. A FOURTH self-contained
+# top-level package (sibling of rb-cli-vintage and rb-cli-ppc) that reuses the
+# shared engine under ../src but carries the dependency deviations mrustc's C
+# backend forces, plus the ones Solaris 9 itself forces.
+#
+# This package is built with mrustc, NOT cargo — see scripts/build-sol9.sh and
+# docs/build-sol9-mrustc.md. It resolves with its own lockfile
+# (rb-cli-sol9/Cargo.lock) and its own vendored sources (rb-cli-sol9/vendor,
+# gitignored by the existing `rb-cli-*/vendor/` rule).
+#
+# Target: sparcv9-sun-solaris2.9, 64-bit big-endian SPARC V9. Unlike the
+# PowerPC build there is no two-machine model: a cross gcc 4.9.4 targeting
+# Solaris 9 exists (mrustc's docker/sol9-cross, or ~/sol9-toolchain), so the C
+# is compiled here and only the finished binary goes to the Blade.
+#
+# DEVIATIONS FROM rb-cli-ppc — Solaris-specific, on top of the shared mrustc set:
+#   - libc: the cfg table is widened to include Solaris. rb-cli-vintage and
+#       rb-cli-ppc both gate libc on `any(target_os = "linux", target_os =
+#       "macos")`, which does not select here — and libc is NOT optional for
+#       this build: `remote/service.rs` and `cli/verbs/tui_app.rs` both call it
+#       under plain `#[cfg(unix)]`, and both are features we want. The pin
+#       (=0.2.155) and the reason for it are unchanged from rb-cli-ppc.
+#   - NO `os-stub`. That feature exists because powerpc-apple-darwin reports
+#       target_os = "macos", so the real objc2 device layer would be compiled
+#       for a 2005 Mac. Solaris is an unknown target_os to this codebase, so
+#       os/mod.rs's own `cfg(not(any(macos, linux, windows)))` arms select
+#       automatically: enumerate_devices returns empty, device writes bail, and
+#       disk *images* work normally. Nothing to stub.
+#   - The objc2-* and windows tables are absent for the same reason they are in
+#       rb-cli-ppc — nothing on this target can reach them.
+#
+# INHERITED FROM rb-cli-ppc (each is an mrustc limitation, not a Solaris one —
+# see that manifest's header for the full diagnosis of each):
+#   zip deflate-flate2 (not `deflate`: zopfli -> bumpalo), env_logger 0.10 (0.11
+#   pulls jiff), serde_json < 1.0.147 (zmij), hashbrown default-features = false
+#   (ahash -> zerocopy), rustyline default-features = false (radix_trie),
+#   serde_yml optional and OFF (libyml), libc = "=0.2.155" (src/new/linux).
+#
+# The empty [workspace] table makes this its own workspace root, so it resolves
+# independently and is not pulled into the parent package's build.
+[workspace]
+
+[package]
+name = "rb-cli-sol9"
+version = "0.1.0"
+edition = "2021"
+# See rb-cli-vintage: drives the MSRV-aware resolver toward <=1.73 crate
+# versions. mrustc bootstraps rustc 1.74, one minor above, so the same pins hold.
+rust-version = "1.73"
+license = "AGPL-3.0"
+build = "../build.rs"
+
+# Reuse the shared engine as a library, exactly like rb-cli-vintage.
+[lib]
+name = "rusty_backup"
+path = "../src/lib.rs"
+
+[[bin]]
+name = "rb-cli"
+path = "../src/bin/rb_cli.rs"
+
+[features]
+default = []
+native-zstd = ["dep:zstd"]
+remote = []
+tui = ["dep:ratatui", "ratatui-legacy"]
+ratatui-legacy = []
+rust173-polyfill = []
+windows-legacy = []
+# Declared so the shared source's `#[cfg(feature = "yaml")]` resolves, but
+# deliberately NOT in this build's feature list — see the serde_yml note below.
+yaml = ["dep:serde_yml"]
+
+[dependencies]
+# --- TUI (pinned to the last 1.73-buildable line) ---
+ratatui = { version = "0.29", default-features = false, features = ["crossterm"], optional = true }
+
+# --- zstd backend (C, from source) ---
+zstd = { version = "0.13", optional = true }
+
+# --- always-on engine deps (mirror of rb-cli-ppc) ---
+anyhow = "1"
+thiserror = "2"
+clap = { version = ">=4.4, <4.5", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+# DEVIATION (inherited): held below 1.0.147, the version that swapped its float
+# formatter from `ryu` to `zmij`. zmij aborts mrustc. Same JSON.
+serde_json = ">=1, <1.0.147"
+byteorder = "1"
+encoding_rs = "0.8"
+log = "0.4"
+env_logger = "=0.10.2"  # DEVIATION (inherited): 0.11 pulls jiff
+sha2 = "0.10"
+md-5 = "0.10"
+sha1 = "0.10"
+crc32c = "0.6"
+crc32fast = "1"
+chrono = "0.4"
+tempfile = ">=3, <3.13"
+dirs = "6"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+lz4_flex = ">=0.10, <0.11"
+tar = "0.4"
+# Named directly by fs/fork_export.rs. It is also a transitive dep of `tar`,
+# but minicargo only passes --extern for direct deps, so the engine cannot see
+# it unless it is declared here. rb-cli-ppc is missing this and will hit the
+# same error on its next build.
+filetime = "0.2"
+bzip2 = "=0.5.2"
+# DEVIATION (inherited): deflate-flate2, NOT `deflate` — zopfli -> bumpalo.
+zip = { version = "=2.4.2", default-features = false, features = ["deflate-flate2", "flate2", "aes-crypto"] }
+base64 = "0.22"
+# DEVIATION (inherited): optional and left OFF — libyml hits an mrustc
+# macro-expansion gap. JSON carries the same schema.
+serde_yml = { version = "=0.0.12", optional = true }
+csv = "1"
+clap_complete = ">=4.4, <4.5"
+globset = ">=0.4, <0.4.17"
+# DEVIATION (inherited): default-features = false drops `custom-bindings`,
+# the only thing pulling `radix_trie`.
+rustyline = { version = ">=12, <15", default-features = false, features = ["with-file-history", "with-dirs"] }
+# RESOLVED 2026-09-07: mio WAS the problem. The TUI renders on the Blade -- alt
+# screen, cursor hide, menu bar -- then crossterm aborts with "Failed to
+# initialize input reader" because its default event source waits with mio.
+# `use-dev-tty` swaps that for poll(2) via `filedescriptor`, and Solaris' poll
+# on a tty is native and correct. Costs one crate, as predicted.
+crossterm = { version = "0.28", features = ["use-dev-tty"] }
+shell-words = "1.1.1"
+lzma-rs = "0.3.0"
+lzfse_rust = "0.2.1"
+
+# --- Transitive pins (mirror of rb-cli-ppc) ---
+indexmap = "=2.5.0"
+# DEVIATION (inherited): default-features = false — ahash pulls zerocopy.
+hashbrown = { version = "=0.14.5", default-features = false }
+zeroize = "=1.8.1"
+home = "=0.5.9"
+zeroize_derive = "=1.4.2"
+jobserver = "=0.1.31"
+crc = "=3.3.0"
+
+# DEVIATION (Solaris): `solaris` added to the cfg. rb-cli-vintage and rb-cli-ppc
+# gate this on linux+macos only, which would leave libc out of the graph here and
+# break remote/service.rs and cli/verbs/tui_app.rs, both of which call it under
+# plain `#[cfg(unix)]`. The `=0.2.155` pin is inherited (0.2.186+ grows a
+# `src/new/` tree mrustc cannot resolve); `nix` stays dropped for the same reason
+# rb-cli-ppc drops it — it is linux-only, but a lockfile is target-agnostic, so
+# nix 0.31's `libc >= 0.2.186` would undo the pin. Dropping it as a *direct* dep
+# is what protects the pin; nix 0.28 still arrives through rustyline and shows up
+# at the final link wanting Solaris 10 symbols (docs/build-sol9-mrustc.md #7).
+[target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "solaris"))'.dependencies]
+libc = "=0.2.155"
+
+[build-dependencies]
+# Only used under cfg(windows) in build.rs; harmless (and ancient) elsewhere.
+winres = "0.1"

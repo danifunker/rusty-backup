@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# ppc-newcode-smoke.sh -- does the PowerPC build agree with the desktop build on
+# ppc-newcode-smoke.sh -- does a vintage build agree with the desktop build on
 # the *write* verbs added since the last PPC binary?
 #
 # ppc-smoke.sh covers the read side and whole-image backup. This covers the
@@ -19,23 +19,35 @@
 #
 # Usage:
 #   PPC_HOST=admin@g5.local scripts/ppc-newcode-smoke.sh [remote-rb-cli]
+#   SOL9_HOST=user@192.168.99.176 RB_SMOKE_SSH_AUTH_SOCK=/run/user/$(id -u)/gcr/ssh \
+#     scripts/ppc-newcode-smoke.sh ./rb-cli
 #
 # Exit status is the number of mismatches, so this can gate a build.
 
 set -uo pipefail
 
-PPC_HOST="${PPC_HOST:-}"
-REMOTE_BIN="${1:-/Users/admin/rb-cli-dev}"
+# The target host is named by whichever variable fits the machine: PPC_HOST for
+# the PowerPC Macs, SOL9_HOST for the Sun Blade, RB_SMOKE_HOST for anything
+# else. Nothing below this line is target-specific -- every assertion is on
+# bytes the two hosts produce, and the remote side is plain POSIX sh.
+SMOKE_HOST="${RB_SMOKE_HOST:-${PPC_HOST:-${SOL9_HOST:-}}}"
+REMOTE_BIN="${1:-${RB_SMOKE_BIN:-/Users/admin/rb-cli-dev}}"
 LOCAL_BIN="${LOCAL_BIN:-target/release/rb-cli}"
 REMOTE_DIR="/tmp/rb-newcode.$$"
 
-[ -n "$PPC_HOST" ] || { echo "PPC_HOST is not set (e.g. PPC_HOST=admin@g5.local)" >&2; exit 2; }
+# SunSSH on the Blade wants a SHA-1 RSA signature the inherited gnome-keyring
+# agent refuses to make, and fails as "Permission denied (publickey)" -- which
+# reads like a missing key and is not. Point at the gcr agent instead:
+#   RB_SMOKE_SSH_AUTH_SOCK=/run/user/$(id -u)/gcr/ssh
+[ -n "${RB_SMOKE_SSH_AUTH_SOCK:-}" ] && export SSH_AUTH_SOCK="$RB_SMOKE_SSH_AUTH_SOCK"
+
+[ -n "$SMOKE_HOST" ] || { echo "no target host: set PPC_HOST, SOL9_HOST or RB_SMOKE_HOST" >&2; exit 2; }
 [ -x "$LOCAL_BIN" ] || { echo "$LOCAL_BIN missing - cargo build --release --bin rb-cli" >&2; exit 2; }
 
 LOCAL_BIN="$(cd "$(dirname "$LOCAL_BIN")" && pwd)/$(basename "$LOCAL_BIN")"
 IMGDIFF="$(cd "$(dirname "$0")" && pwd)/imgdiff.py"
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"; ssh "$PPC_HOST" "rm -rf $REMOTE_DIR" 2>/dev/null' EXIT
+trap 'rm -rf "$WORK"; ssh "$SMOKE_HOST" "rm -rf $REMOTE_DIR" 2>/dev/null' EXIT
 
 fails=0
 pass() { printf '  \033[32mOK\033[0m    %s\n' "$1"; }
@@ -92,10 +104,10 @@ echo "  fat.img affs.img hfs.img ext.img"
 # Pristine copies both sides; every test resets from these.
 for i in fat affs hfs ext; do cp "$WORK/$i.img" "$WORK/$i.pristine"; done
 
-echo "== shipping to $PPC_HOST =="
-ssh "$PPC_HOST" "mkdir -p $REMOTE_DIR" || exit 2
-scp -q "$WORK"/*.img "$WORK"/*.txt "$WORK"/ed-*.sh "$PPC_HOST:$REMOTE_DIR/" || exit 2
-ssh "$PPC_HOST" "cd $REMOTE_DIR && chmod +x ed-*.sh && chmod 644 *.txt && for i in fat affs hfs ext; do cp \$i.img \$i.pristine; done" || exit 2
+echo "== shipping to $SMOKE_HOST =="
+ssh "$SMOKE_HOST" "mkdir -p $REMOTE_DIR" || exit 2
+scp -q "$WORK"/*.img "$WORK"/*.txt "$WORK"/ed-*.sh "$SMOKE_HOST:$REMOTE_DIR/" || exit 2
+ssh "$SMOKE_HOST" "cd $REMOTE_DIR && chmod +x ed-*.sh && chmod 644 *.txt && for i in fat affs hfs ext; do cp \$i.img \$i.pristine; done" || exit 2
 
 # run_both NAME IMG CMD...
 #   Resets IMG from its pristine copy on both hosts, runs the same command on
@@ -106,17 +118,17 @@ run_both() {
   local cmd="$*"
 
   cp "$WORK/$img.pristine" "$WORK/$img.img"
-  ssh "$PPC_HOST" "cd $REMOTE_DIR && cp $img.pristine $img.img" 2>/dev/null
+  ssh "$SMOKE_HOST" "cd $REMOTE_DIR && cp $img.pristine $img.img" 2>/dev/null
 
   local lout lrc rout rrc
   lout="$(cd "$WORK" && eval "\"$LOCAL_BIN\" $cmd" 2>&1)"; lrc=$?
-  rout="$(ssh "$PPC_HOST" "cd $REMOTE_DIR && $REMOTE_BIN $cmd" 2>&1)"; rrc=$?
+  rout="$(ssh "$SMOKE_HOST" "cd $REMOTE_DIR && $REMOTE_BIN $cmd" 2>&1)"; rrc=$?
 
-  scp -q "$PPC_HOST:$REMOTE_DIR/$img.img" "$WORK/$img-remote.img" 2>/dev/null
+  scp -q "$SMOKE_HOST:$REMOTE_DIR/$img.img" "$WORK/$img-remote.img" 2>/dev/null
 
   # A second local run, deliberately at a different instant, so the two can be
   # differenced to learn which bytes are clocks rather than data. Without this
-  # every write verb "fails": the local and PowerPC runs are seconds apart, and
+  # every write verb "fails": the local and remote runs are seconds apart, and
   # an ext inode's three timestamps, HFS's drLsMod and a FAT dirent's
   # creation-time tenths all differ by exactly that gap.
   #
@@ -181,7 +193,7 @@ if run_both edit-roundtrip fat "edit fat.img /DOSTEXT.TXT --editor ./ed-ascii.sh
     if cmp -s "$WORK/edit-roundtrip.rfile" "$WORK/dostext.expected"; then
       pass "edit re-encoded to CP437 + CRLF byte-for-byte (0xB3 intact)"
     else
-      fail "edit round trip altered the file on PowerPC"
+      fail "edit round trip altered the file on $SMOKE_HOST"
       info "want: $(od -An -tx1 "$WORK/dostext.expected"      | head -3 | tr -s ' ')"
       info "got : $(od -An -tx1 "$WORK/edit-roundtrip.rfile"  | head -3 | tr -s ' ')"
     fi
@@ -194,7 +206,7 @@ if run_both edit-noop fat "edit fat.img /DOSTEXT.TXT --editor ./ed-noop.sh"; the
   if [ "$(head -1 "$WORK/edit-noop.rdiff")" = "IDENTICAL" ]; then
     pass "no-op edit left the image untouched"
   else
-    fail "no-op edit rewrote the image on PowerPC"
+    fail "no-op edit rewrote the image on $SMOKE_HOST"
     head -4 "$WORK/edit-noop.rdiff" | sed 's/^/        /'
   fi
 fi
@@ -237,7 +249,7 @@ if run_both edit-crlf fat "edit fat.img /MIXED.TXT --line-endings crlf --no-edit
     if [ "$lf" -eq 5 ] && [ "$cr" -eq 5 ]; then
       pass "all five lines converted to CRLF (5x 0d, 5x 0a)"
     else
-      fail "line-ending conversion wrong on PowerPC: ${cr}x 0d, ${lf}x 0a (want 5 and 5)"
+      fail "line-ending conversion wrong on $SMOKE_HOST: ${cr}x 0d, ${lf}x 0a (want 5 and 5)"
     fi
   fi
 fi
@@ -276,14 +288,14 @@ if run_both put-preserve-ext ext "put ext.img replace.txt /meta.txt --force"; th
   if printf '%s' "$lo" | grep -q '1234:5678' && printf '%s' "$lo" | grep -q 'rwxr-x---'; then
     pass "put --force preserved mode 750 and owner 1234:5678"
   else
-    fail "put --force did not preserve mode/owner on PowerPC"
+    fail "put --force did not preserve mode/owner on $SMOKE_HOST"
     info "$(printf '%s' "$lo" | head -3 | tr '\n' ' ')"
   fi
 fi
 # NOTE: on a Unix filesystem this currently does NOT reset mode/owner - see
 # `put.rs`, which hands `resolve_attrs` the replaced entry regardless of
 # --no-preserve-meta, so AttrSource::Replaced still wins. That is a desktop bug,
-# not a PowerPC one, so this checks *agreement* (the parity question) and only
+# not a vintage-target one, so this checks *agreement* (the parity question) and only
 # reports the wrong-but-identical result rather than counting it as a mismatch.
 if run_both put-fresh-ext ext "put ext.img replace.txt /meta.txt --force --no-preserve-meta"; then
   ll="$(cd "$WORK" && "$LOCAL_BIN" ls ext.img    / -o 2>&1 | grep meta)"
@@ -291,7 +303,7 @@ if run_both put-fresh-ext ext "put ext.img replace.txt /meta.txt --force --no-pr
   if [ "$ll" = "$lr" ]; then
     pass "put --no-preserve-meta agrees on both builds"
     printf '%s' "$lr" | grep -q '1234:5678' && \
-      info "both builds keep owner 1234:5678 here - known desktop bug, not a PowerPC regression"
+      info "both builds keep owner 1234:5678 here - known desktop bug, not a port regression"
   else
     fail "put --no-preserve-meta differs between builds"
     info "local: $ll"
@@ -303,7 +315,7 @@ if run_both put-preserve-hfs hfs "put hfs.img replace.txt /meta.txt --force"; th
   if printf '%s' "$lo" | grep -q 'TEXT' && printf '%s' "$lo" | grep -q 'MSWD'; then
     pass "put --force preserved type/creator TEXT/MSWD"
   else
-    fail "put --force lost type/creator on PowerPC (the BINA bug's shape)"
+    fail "put --force lost type/creator on $SMOKE_HOST (the BINA bug's shape)"
     info "$(printf '%s' "$lo" | head -4 | tr '\n' ' ')"
   fi
 fi
@@ -321,7 +333,7 @@ fi
 
 echo
 if [ $fails -eq 0 ]; then
-  printf '\033[32mPowerPC build agrees with the desktop build on every write verb.\033[0m\n'
+  printf '\033[32m%s agrees with the desktop build on every write verb.\033[0m\n' "$SMOKE_HOST"
 else
   printf '\033[31m%d mismatch(es).\033[0m\n' "$fails"
 fi

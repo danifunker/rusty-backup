@@ -827,6 +827,11 @@ first and then ingested as a `.woz` / `.dc42` / `.2mg` image.
   (which cards work, and how to add more in Buildroot).
 - [`docs/build-ppc-mrustc.md`](docs/build-ppc-mrustc.md) — building `rb-cli` for
   PowerPC Mac OS X 10.4/10.5 through the mrustc fork (`scripts/build-ppc.sh`).
+- [`docs/build-sol9-mrustc.md`](docs/build-sol9-mrustc.md) — building `rb-cli`
+  for **Solaris 9 on SPARC** (`scripts/build-sol9.sh`), also via mrustc. Unlike
+  the PowerPC build this one cross-compiles end to end on Linux, so it needs no
+  second machine. Verified on a Sun Blade 2500: both parity gates agree with the
+  desktop build, byte for byte.
 
 ## Donations
 

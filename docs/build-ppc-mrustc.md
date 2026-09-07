@@ -928,11 +928,25 @@ How the split works, and the two traps in it:
   the engine's symbols against the other 138 objects on the link line found
   **1,290** such names, so the first error was one of many.
 
-  Every promoted name is therefore renamed with a `__rbsplit` suffix. The
+  Every promoted name is therefore renamed with a `__rbsplit_<tu>` suffix. The
   rename is done by the preprocessor, not by rewriting 800 MB of text:
-  `promoted.h` holds one `#define NAME NAME__rbsplit` per name (57,603 of them
-  for the engine) and each unit includes it ahead of `tu.h`, so the definition
-  and every reference move together for free.
+  `promoted.h` holds one `#define NAME NAME__rbsplit_<tu>` per name (57,603 of
+  them for the engine) and each unit includes it ahead of `tu.h`, so the
+  definition and every reference move together for free.
+
+  **`<tu>` is a digest of the source file name, and it has to be.** A constant
+  suffix separates a promoted copy from the owning crate's global definition,
+  which is what the rename was written for - but it does not separate two
+  *split* crates from each other. When protobuf and the agent crate were both
+  large enough to split, each promoted its own copy of the same `alloc`
+  monomorphisation and the two renamed names were identical:
+
+      ld: duplicate symbol _ZRG2cF10alloc0_0_05alloc_B0g__rbsplit in
+          librustdesk_ppc_agent-...rlib.o and libprotobuf-...rlib.split/u2.o
+
+  Keying the suffix to the file name makes each unit's promotions its own. The
+  suffix is part of the split's stamp, so a tree split by an older copy of the
+  script is re-split rather than silently kept.
 - **One name cannot be renamed**, and it is worth knowing why. mrustc points
   `core::panicking::panic_fmt` at the real handler with `#define ...panic_fmt0g
   rust_begin_unwind`, *and* emits a local definition of it - which that macro

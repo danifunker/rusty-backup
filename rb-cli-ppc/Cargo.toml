@@ -144,6 +144,10 @@ dirs = "6"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 lz4_flex = ">=0.10, <0.11"
 tar = "0.4"
+# fs/fork_export.rs names filetime directly. It reaches the graph via `tar`,
+# but minicargo passes --extern only for direct deps, so the engine cannot see
+# it unless it is declared here. rb-cli-vintage and rb-cli-sol9 both do.
+filetime = "0.2"
 bzip2 = "=0.5.2"
 # DEVIATION (see header): deflate-flate2, NOT `deflate` — `deflate` pulls
 # zopfli -> bumpalo, which mrustc cannot transpile.
