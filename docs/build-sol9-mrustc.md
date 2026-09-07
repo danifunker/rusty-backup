@@ -679,6 +679,88 @@ are **done** as of 2026-09-07; 8 (doc sync) is the remainder.
 8. **Docs sync.** README's platform/build sections, and this file promoted from
    scope to build guide.
 
+## Putting it in the pipeline
+
+The build is already containerised - `docker/sol9.Dockerfile` clones mrustc,
+builds it, fetches the rustc source, builds the host and target stdlibs and
+runs `scripts/build-sol9.sh`. Everything in that chain is fetched from source
+at build time **except one file**, and there is one blocker.
+
+### What it needs
+
+| Component | Where | Reproducible? |
+|---|---|---|
+| `rb-cli-sol9/` manifest + `shim/sol9-compat.c` | this repo | yes, committed |
+| `scripts/build-sol9.sh`, vendor patches | this repo | yes, committed |
+| `docker/sol9.Dockerfile` | this repo | yes, committed |
+| mrustc fork, branch `sparc-solaris-10` | `danifunker/mrustc` | **blocked - see below** |
+| Base image `mrustc-sol9-cross` | mrustc's `docker/sol9-cross/` | all but the sysroot |
+| binutils 2.35.2, gcc 4.9.4 | ftp.gnu.org, at build time | yes |
+| rustc 1.74.0 source | fetched by `make RUSTCSRC` | yes |
+| Crate sources | `cargo vendor`, at build time | yes (needs crates.io) |
+| **Solaris 9 sysroot** (`sysroot.tar.gz`, 109 MB) | `docker/sol9-cross/`, **gitignored** | **no - not redistributable** |
+
+Two things on this machine are *not* needed and should not be mistaken for
+dependencies: `~/sol9-deps/prefix` (nothing references it - zstd and zlib are
+compiled from source by cc-rs for the target), and the Blade itself, which is
+needed only for the parity gates, never for the build.
+
+### The blocker
+
+**The five mrustc commits are local-only.** `origin/sparc-solaris-10` is at
+`109ddad1`, the base commit, so `docker/sol9.Dockerfile`'s
+`git clone --branch sparc-solaris-10` fetches a branch with no Solaris target
+and the image build fails at `make -f minicargo.mk LIBS MRUSTC_TARGET=...`.
+Pushing that branch is the single prerequisite for the container building
+anywhere but here.
+
+### The sysroot
+
+Sun does not permit redistributing Solaris 9, so `sysroot.tar.gz` cannot go in
+a public image or the repo (it is gitignored for that reason). For CI it has to
+arrive out of band - a private registry holding the pre-built
+`mrustc-sol9-cross`, or the tarball as a secret artifact restored before
+`docker build`. Building the base image is a one-off; only the layer above it
+needs to re-run per commit.
+
+### Cost
+
+The engine transpile dominates: a from-scratch container build is tens of
+minutes and wants ~25 GB of disk (mrustc's tree plus the rustc source plus the
+generated C). Cache the base image and the `output-1.74.0-<target>` stdlib and
+a normal commit rebuilds only the engine and the link. Cap parallelism at 4 -
+see `docs/build-memory-crashes.md`, which applies to this build too.
+
+### Gating a release on the hardware
+
+`scripts/ppc-smoke.sh` and `scripts/ppc-newcode-smoke.sh` both take
+`SOL9_HOST`, so a self-hosted runner that can reach a Solaris 9 SPARC box can
+gate on them; both exit with the mismatch count. They need the ssh setup in
+finding 12. Without such a runner the container can still build and package -
+it just cannot prove parity, which is exactly the gap that let the PowerPC
+size bug ship once.
+
+## mrustc: what needs upstreaming
+
+Five commits exist on `sparc-solaris-10`; a sixth is not yet written. Grouped
+as they should be proposed, smallest and most general first - three of the four
+are not Solaris-specific at all.
+
+| PR | Commits | Scope |
+|---|---|---|
+| **1. Signed overflow helpers** | `64551250` | Pure correctness, no new target. The emitted `__builtin_mul_overflow_i*` reported overflow for almost any negative operand; fuzzing found 561,004 mismatches against GCC's own builtins, plus reachable UB (`INT_MIN/-1`, signed wrapping). Stands alone and is worth landing regardless of Solaris. |
+| **2. `emulate-overflow-intrinsics`** | `73c570f3` | Lifts MSVC's existing type-suffixed stand-ins into a target flag so the GNU backend can use them, for compilers older than GCC 5. MSVC output unchanged. Depends on PR 1. |
+| **3. `CC_${TRIPLE}` sanitisation** | `71910c7c` | One-line class of bug: the variable name replaced only `-`, so a triple with a `.` produced a name no shell can export. Unnoticed because no triple had a dot before. Fully general. |
+| **4. The Solaris 9 target** | `6421bfef`, `b3aa8ae6` | `sparcv9-sun-solaris2.9` plus `emulate-c99-math` / `emulate-posix2001`, and the `docker/sol9-cross` toolchain container (including Solaris 9's empty `INTPTR_MAX`/`UINTPTR_MAX`, which breaks any C99 `#if` test). The one genuinely target-specific PR. |
+| **5. Fieldless enums across FFI** | **not yet written** | Finding 10. mrustc lowers a fieldless `#[repr(u32)]` enum to a one-field struct and passes it **by value** in `extern "C"` signatures; the callee expects a scalar. On any 64-bit big-endian target the value lands in the wrong half of the register. Should emit the underlying integer type in extern signatures and at call sites. |
+
+PR 5 is the most valuable and the only one still to write. It is a real
+codegen bug rather than a missing feature, it affects every `extern "C"` fn
+taking such an enum, and it is structurally invisible on 32-bit big-endian -
+so mrustc's existing PowerPC users cannot have hit it. A regression test wants
+a 64-bit big-endian target, which PR 4 supplies.
+
+
 ## Open questions - decisions to make, not tasks
 
 - **Is `rb-cli serve` in scope?** It decides finding 1. Networked backup is the
