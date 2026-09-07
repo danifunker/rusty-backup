@@ -40,8 +40,7 @@ def runs(a: bytes, b: bytes, gap: int = 4):
             start = i
             last = i
             j = i + 1
-            # Merge nearby differences so a changed u32 reads as one run
-            # rather than four, even when a middle byte happens to match.
+            # Merge nearby differences so a changed u32 reads as one run, not four.
             while j < n and (j - last) <= gap:
                 if a[j] != b[j]:
                     last = j
@@ -63,7 +62,13 @@ def volatile_set(a: bytes, b: bytes) -> set:
     n = max(len(a), len(b))
     a = a.ljust(n, b"\0")
     b = b.ljust(n, b"\0")
-    return {i for i in range(n) if a[i] != b[i]}
+    seen = {i for i in range(n) if a[i] != b[i]}
+    # Widen to the containing 4-byte word: the other host's clock is offset, not merely later.
+    out = set(seen)
+    for i in seen:
+        base = i - (i % 4)
+        out.update(range(base, min(base + 4, n)))
+    return out
 
 
 def render(buf: bytes, off: int, length: int, volatile: set) -> str:
@@ -94,9 +99,7 @@ def main() -> int:
         print(f"SIZE {len(before)} -> {len(after)}")
 
     changed = runs(before, after)
-    # A run whose every byte is time-varying is dropped rather than masked: its
-    # start and length move with the values, so keeping it would reintroduce
-    # exactly the cross-host noise the mask exists to remove.
+    # A wholly time-varying run is dropped, not masked: its bounds move with the values.
     changed = [
         (off, length)
         for off, length in changed

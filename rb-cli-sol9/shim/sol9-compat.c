@@ -28,28 +28,9 @@
 #include <dlfcn.h>
 #include <stdarg.h>
 
-/*
- * `getifaddrs` / `freeifaddrs` -- referenced by remote/service.rs's
- * local_ipv4_addrs(), which is gated on `cfg(unix)` and so is compiled for
- * this target.
- *
- * Both arrived in Solaris 11; nothing in Solaris 9's libc, libsocket or libnsl
- * defines them. The libc *crate* declares them for solarish all the same
- * (libc/src/unix/solarish/mod.rs), so without this file the engine compiles
- * clean and dies at the final link -- after the whole transpile.
- *
- * SIOCGLIFNUM / SIOCGLIFCONF is what Solaris used before getifaddrs existed,
- * and is still the documented way to enumerate interfaces here.
- *
- * IPv4 only: the caller filters on AF_INET and reads a sockaddr_in, so
- * enumerating AF_INET6 would only build nodes it discards.
- */
+/* getifaddrs/freeifaddrs: Solaris 11 only, and IPv4-only here because the caller filters AF_INET. */
 
-/*
- * Solaris' <net/if.h> defines `ifa_dstaddr` as a macro for its own kernel-side
- * `struct ifaddr`, which rewrites our field name into `ifa_ifu.ifu_dstaddr`
- * and will not compile. Nothing here wants the macro.
- */
+/* Solaris' <net/if.h> defines ifa_dstaddr as a macro that rewrites our field name. */
 #undef ifa_dstaddr
 #undef ifa_broadaddr
 
@@ -64,19 +45,10 @@ struct ifaddrs {
 	void *ifa_data;
 };
 
-/*
- * The layout is the contract with the libc crate, and a disagreement would be
- * silent -- the caller would read ifa_addr from the wrong offset. Seven
- * pointer-sized fields on LP64: 56 bytes. Measured, not assumed (the PowerPC
- * port's lesson).
- */
+/* Seven pointer-sized fields on LP64: 56 bytes. Measured, not assumed. */
 typedef char rb_assert_ifaddrs[(sizeof(struct ifaddrs) == 56) ? 1 : -1];
 
-/*
- * One allocation per interface, with the strings and sockaddrs it points at
- * inside it, so freeifaddrs is a plain walk-and-free. `ifa` is first so the
- * node address and the struct address are the same pointer.
- */
+/* One allocation per interface, so freeifaddrs is a plain walk-and-free. */
 struct rb_ifa_node {
 	struct ifaddrs ifa;
 	char name[LIFNAMSIZ];
@@ -126,10 +98,7 @@ int getifaddrs(struct ifaddrs **ifap)
 		return 0;
 	}
 
-	/*
-	 * The count can grow between the two ioctls (an interface plumbed in
-	 * the gap), so ask for headroom; SIOCGLIFCONF reports what it filled.
-	 */
+	/* The count can grow between the two ioctls, so ask for headroom. */
 	bufsize = (size_t)(ln.lifn_count + 4) * sizeof(struct lifreq);
 	buf = malloc(bufsize);
 	if (buf == NULL)
@@ -162,11 +131,7 @@ int getifaddrs(struct ifaddrs **ifap)
 		node->ifa.ifa_name = node->name;
 		node->ifa.ifa_addr = (struct sockaddr *)&node->addr;
 
-		/*
-		 * Flags and netmask each need their own ioctl, keyed by name.
-		 * A failure here is not fatal: the address is the part the
-		 * caller uses, so leave the field zeroed and keep the entry.
-		 */
+		/* Flags and netmask need their own ioctls; a failure leaves the field zeroed. */
 		memset(&req, 0, sizeof(req));
 		(void)strncpy(req.lifr_name, lifr[i].lifr_name, LIFNAMSIZ - 1);
 		if (ioctl(s, SIOCGLIFFLAGS, &req) == 0)
@@ -202,24 +167,7 @@ fail:
 	return -1;
 }
 
-/*
- * ===========================================================================
- * Part 2: the openat(2) family, getrandom(2), and the flag-taking fd calls.
- *
- * Fourteen more entry points the final link asked for, every one of them
- * probed absent from this sysroot's libc rather than assumed. They arrive
- * from four directions:
- *
- *   filetime    utimensat            fs/fork_export.rs -- LIVE
- *   mio         pipe2                crossterm's event source -- LIVE
- *   getrandom   getrandom            tempfile names, zip AES salt -- LIVE
- *   nix/rustix  everything else      paths rusty-backup never runs
- *
- * The dead ones still have to resolve. A stub that lies would be worse than
- * the link error it replaces, so each is either a faithful emulation or an
- * honest ENOSYS -- nothing here quietly does the wrong thing.
- * ===========================================================================
- */
+/* Part 2: fourteen more entry points, each probed absent from this sysroot's libc. */
 
 /* Solaris 9 has none of these; the values are Solaris 11's, and the libc crate's. */
 #ifndef O_CLOEXEC
@@ -244,25 +192,10 @@ fail:
 #define GRND_RANDOM	0x0002
 #endif
 
-/*
- * Solaris spells AT_FDCWD 0xffd19553, which the preprocessor types as unsigned;
- * comparing it against an int fd is correct by conversion but warns. Name the
- * int form once -- it is what the caller passes (libc's AT_FDCWD is a c_int).
- */
+/* Solaris types AT_FDCWD unsigned; name the int form once to avoid a sign-compare warning. */
 #define RB_AT_FDCWD	((int)AT_FDCWD)
 
-/*
- * The *at() calls take a directory fd Solaris 9 cannot honour. Its only
- * at-family primitive is openat(2) -- present since 9 for extended attributes,
- * and the one symbol of this set the sysroot does define -- and openat alone
- * cannot express a directory-relative mkdir, link, chmod or stat. The
- * alternative is a save-cwd/fchdir/restore dance that races every other thread
- * in the process, which is not worth doing silently for code paths that never
- * run here.
- *
- * So resolve the two cases that need no directory fd at all -- AT_FDCWD, and
- * an absolute path, which ignores the fd by definition -- and refuse the rest.
- */
+/* Solaris 9's only at-family primitive is openat(2); resolve AT_FDCWD and absolute paths, refuse the rest. */
 static int rb_at_plain(int fd, const char *path)
 {
 	if (path == NULL) {
@@ -293,15 +226,7 @@ static int rb_set_fd_flags(int fd, int flags)
 	return 0;
 }
 
-/*
- * `getrandom` -- Solaris 11.3. Nine has only the CPRNG devices, which it does
- * have: <sys/random.h> is in this sysroot, and /dev/random and /dev/urandom
- * have been standard since 9 (8 needed the SUNWski patch).
- *
- * The fd is opened per call rather than cached. Caching it safely would need
- * pthread_once, and both call sites are cold -- a temp-file name and an AES
- * salt, not a stream cipher.
- */
+/* getrandom: Solaris 11.3; nine has only /dev/urandom. Opened per call, both call sites are cold. */
 ssize_t getrandom(void *buf, size_t buflen, unsigned int flags)
 {
 	const char *dev;
@@ -351,19 +276,7 @@ ssize_t getrandom(void *buf, size_t buflen, unsigned int flags)
 	return (ssize_t)got;
 }
 
-/*
- * `utimensat` -- Solaris 10, and the one live *at() call here: filetime routes
- * solaris through utimensat(AT_FDCWD, ...) and fs/fork_export.rs calls it.
- *
- * utimes(2) is the Solaris 9 equivalent and takes microseconds, so the
- * nanosecond field is truncated -- which costs nothing, because the caller
- * builds its stamps with FileTime::from_unix_time(secs, 0).
- *
- * UTIME_OMIT means "leave this one alone" and utimes() cannot say that, so the
- * existing value is read back with stat() and rewritten. AT_SYMLINK_NOFOLLOW
- * has no answer at all -- Solaris 9 has no lutimes(3C) -- so it is refused
- * rather than quietly stamping the link's target instead.
- */
+/* utimensat: Solaris 10. utimes(2) takes microseconds; UTIME_OMIT needs a stat, AT_SYMLINK_NOFOLLOW has no answer. */
 int utimensat(int dirfd, const char *path, const struct timespec times[2],
     int flag)
 {
@@ -409,12 +322,7 @@ int utimensat(int dirfd, const char *path, const struct timespec times[2],
 	return utimes((char *)path, tv);
 }
 
-/*
- * `dirfd` -- Solaris 10. Nine's DIR is a plain struct whose first member is the
- * descriptor under either definition <dirent.h> selects (dd_fd bare, d_fd
- * under _POSIX_C_SOURCE); this file compiles as the former. Asserted rather
- * than trusted, because a wrong offset returns a plausible-looking integer.
- */
+/* dirfd: Solaris 10. Nine's DIR starts with the descriptor; asserted, not trusted. */
 typedef char rb_assert_dirfd[(offsetof(DIR, dd_fd) == 0) ? 1 : -1];
 
 int dirfd(DIR *dirp)
@@ -452,11 +360,7 @@ int fchmodat(int fd, const char *path, mode_t mode, int flag)
 	return chmod(path, mode);
 }
 
-/*
- * Solaris 9's link(2) follows a symbolic link in path1, so it can express
- * AT_SYMLINK_FOLLOW and cannot express its absence. Refusing flag 0 rather
- * than silently giving it follow semantics is the whole point of this file.
- */
+/* Solaris 9's link(2) follows symlinks, so it can express AT_SYMLINK_FOLLOW and not its absence. */
 int linkat(int ofd, const char *opath, int nfd, const char *npath, int flag)
 {
 	if (!rb_at_plain(ofd, opath) || !rb_at_plain(nfd, npath))
@@ -522,10 +426,7 @@ int accept4(int fd, struct sockaddr *addr, socklen_t *addrlen, int flags)
 	return s;
 }
 
-/*
- * dup3 differs from dup2 in exactly two ways, and both matter: equal fds are
- * an error rather than a no-op, and O_CLOEXEC is the only flag it accepts.
- */
+/* dup3 differs from dup2: equal fds are an error, and O_CLOEXEC is the only accepted flag. */
 int dup3(int src, int dst, int flags)
 {
 	int cur, saved_errno;
@@ -548,10 +449,7 @@ int dup3(int src, int dst, int flags)
 	return dst;
 }
 
-/*
- * `pipe2` -- live on every TUI wake-up. mio's Waker is a self-pipe wherever
- * there is no eventfd, and crossterm 0.28's event source is built on mio.
- */
+/* pipe2: live on every TUI wake -- mio's Waker is a self-pipe where there is no eventfd. */
 int pipe2(int fildes[2], int flags)
 {
 	int saved_errno;
@@ -573,26 +471,7 @@ int pipe2(int fildes[2], int flags)
 	return 0;
 }
 
-/*
- * `fcntl` interposer, for F_DUPFD_CLOEXEC only.
- *
- * Rust's File::try_clone() is fcntl(fd, F_DUPFD_CLOEXEC, 0). libc spells that
- * 47 for solaris, but the command arrived in Solaris 10 -- nine's fcntl knows
- * only F_DUPFD (0) and answers EINVAL. The call lives inside libstd, which
- * mrustc built from rustc's own vendored libc, so it cannot be reached by
- * patching this crate's dependencies; interposing here is what is left.
- *
- * Found by running `rb-cli backup` on the Blade: every backup failed with
- * "failed to clone local source handle: Invalid argument (os error 22)".
- * Nothing at link time hints at it -- the symbol exists, only the command is
- * too new -- so this is a runtime-only gap of exactly the kind the parity
- * gates exist to catch.
- *
- * Everything other than F_DUPFD_CLOEXEC is delegated to the real fcntl. The
- * third argument is read as a void* and passed through: fcntl's variants take
- * an int or a pointer, both of which arrive in the same argument register on
- * SPARC V9, and commands taking no third argument ignore it.
- */
+/* fcntl interposer: F_DUPFD_CLOEXEC is Solaris 10, and File::try_clone() uses it from inside libstd. */
 #define RB_F_DUPFD_CLOEXEC 47
 
 int fcntl(int fd, int cmd, ...)
@@ -618,9 +497,7 @@ int fcntl(int fd, int cmd, ...)
 		return real_fcntl(fd, cmd, arg);
 	}
 
-	/* Duplicate, then set the close-on-exec flag the atomic command would
-	 * have set. Not atomic against a concurrent exec, which is the price
-	 * of the command not existing. */
+	/* Duplicate then set FD_CLOEXEC; not atomic against a concurrent exec. */
 	rc = real_fcntl(fd, F_DUPFD, arg);
 	if (rc < 0) {
 		return -1;

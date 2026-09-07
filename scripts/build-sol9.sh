@@ -36,9 +36,7 @@ set -euo pipefail
 # ---- config -----------------------------------------------------------------
 MRUSTC_DIR="${MRUSTC_DIR:-$HOME/repos/mrustc}"
 RB_DIR="${RB_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
-# rb-cli-sol9 is the mrustc/Solaris manifest (sibling of rb-cli-vintage and
-# rb-cli-ppc). It reuses ../src but carries the dep deviations mrustc's C
-# backend and Solaris 9 force, so nothing modern has to change.
+# rb-cli-sol9 reuses ../src but carries the dep deviations mrustc and Solaris 9 force.
 CRATE_DIR="$RB_DIR/rb-cli-sol9"
 VENDOR_DIR="$CRATE_DIR/vendor"
 
@@ -46,25 +44,16 @@ RUSTC_VERSION="${RUSTC_VERSION:-1.74.0}"
 export MRUSTC_TARGET_VER="${MRUSTC_TARGET_VER:-1.74}"
 SOL9_TARGET="${SOL9_TARGET:-sparcv9-sun-solaris2.9}"
 
-# No `os-stub`: Solaris is an unknown target_os to the engine, so os/mod.rs's own
-# cfg(not(any(macos, linux, windows))) arms already select. No `yaml`: serde_yml's
-# libyml backend hits an mrustc macro-expansion gap. Both explained in
-# rb-cli-sol9/Cargo.toml.
+# No os-stub (os/mod.rs's fallback arms already select) and no yaml; see rb-cli-sol9/Cargo.toml.
 FEATURES="${FEATURES:-native-zstd,remote,tui,rust173-polyfill}"
 
 SOL9_TOOLCHAIN="${SOL9_TOOLCHAIN:-$HOME/sol9-toolchain}"
 SOL9_BIN="${SOL9_BIN:-$SOL9_TOOLCHAIN/opt/bin}"
 SOL9_SYSROOT="${SOL9_SYSROOT:-$SOL9_TOOLCHAIN/sysroot}"
-# The C shim: entry points the engine references that Solaris 9 does not export
-# (getifaddrs/freeifaddrs). It MUST reach the final link line -- default it here
-# rather than leave it to the environment, which is the omission that cost the
-# PowerPC build a confusing late link failure.
+# The C shim must reach the final link line, so default it here rather than in the environment.
 SOL9_SHIM="${SOL9_SHIM:-$CRATE_DIR/shim/sol9-compat.c}"
 
-# Solaris 9 has no libgcc_s.so.1 of its own, and Rust's `unwind` crate names it
-# in a #[link] attribute, which defeats -static-libgcc. Rather than ask users to
-# drop a GCC runtime into /usr/lib/sparcv9, ship it beside the binary and let the
-# runtime linker find it there ($ORIGIN, on the link line below).
+# Rust's unwind crate names libgcc_s.so.1 in a #[link], defeating -static-libgcc; ship it alongside.
 SOL9_LIBGCC="${SOL9_LIBGCC:-$SOL9_TOOLCHAIN/opt/$SOL9_TARGET/lib/sparcv9/libgcc_s.so.1}"
 
 SOL9_LIBS="${SOL9_LIBS:-$MRUSTC_DIR/output-$RUSTC_VERSION-$SOL9_TARGET}"
@@ -72,35 +61,26 @@ SOL9_OUT="${SOL9_OUT:-$MRUSTC_DIR/output-rb-sol9}"
 HOST_LIBS="${HOST_LIBS:-$MRUSTC_DIR/output-$RUSTC_VERSION}"
 HOSTC_OUT="${HOSTC_OUT:-$MRUSTC_DIR/output-rb-sol9-hostc}"
 
-# OVERRIDE_SUFFIX is chosen from the *host* OS by minicargo.mk, so a cross build
-# from Linux picks -linux. Name the Solaris set explicitly, and the arch with it.
+# minicargo.mk picks OVERRIDE_SUFFIX from the host OS, so name the Solaris set explicitly.
 SOL9_OVERRIDE_SUFFIX="${SOL9_OVERRIDE_SUFFIX:--solaris}"
 SOL9_STD_ENV_ARCH="${SOL9_STD_ENV_ARCH:-sparc64}"
 
-# mrustc transpile units are large (the engine is hundreds of MB of C), and a
-# debug build of this tree has OOM-killed the terminal scope before. Four is the
-# same cap .cargo/config.toml sets. See docs/build-memory-crashes.md.
+# Four jobs, the cap .cargo/config.toml sets; see docs/build-memory-crashes.md.
 JOBS="${JOBS:-4}"
 
 # Where the finished binary is run. Only `smoke` and `dist --push` need it.
 SOL9_HOST="${SOL9_HOST:-}"
 
-# Pin RUSTC absolute: the argv[0]-derived path is relative when invoked as
-# `bin/minicargo` and fails to spawn from a crate cwd.
+# Absolute path: the argv[0]-derived one is relative and fails to spawn from a crate cwd.
 export MRUSTC_PATH="${MRUSTC_PATH:-$MRUSTC_DIR/bin/mrustc}"
 
-# The triple has dots, and mrustc sanitises the WHOLE triple into the variable
-# name (mrustc commit 71910c7c) -- so `.` becomes `_` as well as `-`.
+# mrustc sanitises the whole triple into the variable name, so '.' becomes '_' too.
 CC_VAR="CC_$(echo "$SOL9_TARGET" | tr '.-' '__')"
 AR_VAR="AR_$(echo "$SOL9_TARGET" | tr '.-' '__')"
 CFLAGS_VAR="CFLAGS_$(echo "$SOL9_TARGET" | tr '.-' '__')"
 
 # ---- version stamp -----------------------------------------------------------
-# minicargo never re-runs a current-looking build script (it honours no
-# rerun-if-env-changed), so APP_VERSION lives in a marker file and the build
-# script's cached output is dropped only when the version actually changes --
-# dropping it re-transpiles the whole engine. Setting RELEASE_VERSION is the ONLY
-# way to bake a new version in; deleting the marker does NOT re-stamp.
+# APP_VERSION lives in a marker file; only RELEASE_VERSION bakes a new one in.
 stamp_version() {
   local marker="$SOL9_OUT/.release-version"
   local prev=""
@@ -115,8 +95,7 @@ stamp_version() {
     note "APP_VERSION=$RELEASE_VERSION (unchanged)"
     return
   fi
-  # First stamp on a markerless tree: adopt the version without invalidating
-  # anything, because nothing recorded a version before and nothing is stale.
+  # First stamp on a markerless tree: adopt it without invalidating anything.
   if [ -z "$prev" ]; then
     printf '%s' "$RELEASE_VERSION" > "$marker"
     note "APP_VERSION=$RELEASE_VERSION (first stamp - existing objects left alone)"
@@ -132,9 +111,7 @@ note()   { printf '\033[33m%s\033[0m\n' "$*"; }
 die()    { printf '\033[1;31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
 
 # ---- the C compiler mrustc and cc-rs both see ------------------------------
-# mrustc has no hook for per-application link flags, and the shim has to be on
-# the link line, so a wrapper owns it: pass compiles through untouched, append
-# the shim object and the link flags to everything else.
+# mrustc has no per-application link-flag hook, so a wrapper appends the shim and flags.
 make_cc_wrapper() {
   mkdir -p "$SOL9_OUT"
   local shim_o="$SOL9_OUT/sol9-compat.o"
@@ -144,10 +121,7 @@ make_cc_wrapper() {
       -Wall -Wextra -c "$SOL9_SHIM" -o "$shim_o" \
       || die "the compat shim does not compile -- fix it before anything else"
   fi
-  # minicargo decides staleness from Rust inputs only, so a rebuilt shim does
-  # NOT trigger a relink -- it will happily ship the previous binary with the
-  # old shim in it. Drop the executable so the final link runs again. Cost a
-  # confusing round of "the fix didn't work" on the Solaris 9 fcntl gap.
+  # A rebuilt shim does not make minicargo relink, so drop the binary to force it.
   if [ "$SOL9_SHIM" -nt "$SOL9_OUT/rb-cli" ] 2>/dev/null; then
     rm -f "$SOL9_OUT/rb-cli"
   fi
@@ -163,10 +137,7 @@ WRAP
   chmod +x "$wrap"
   export "$CC_VAR=$wrap"
   export "$AR_VAR=$SOL9_BIN/$SOL9_TARGET-ar"
-  # cc-rs builds the -sys crates (zstd-sys, bzip2-sys). It runs on the host, so
-  # it has to be told the target compiler explicitly. -D__EXTENSIONS__ because
-  # Solaris hides fd_set and much of POSIX behind it whenever __STDC__ is 1,
-  # which -std=gnu11 makes it.
+  # cc-rs runs on the host, so name the target compiler; __EXTENSIONS__ unhides POSIX.
   export TARGET_CC="$SOL9_BIN/$SOL9_TARGET-gcc"
   export TARGET_AR="$SOL9_BIN/$SOL9_TARGET-ar"
   export TARGET_CFLAGS="-std=gnu11 -m64 -mcpu=v9 -fPIC -D__EXTENSIONS__"
@@ -202,18 +173,13 @@ stage_vendor() {
   apply_vendor_patches
 }
 
-# The mrustc-workaround patch set is shared with the PowerPC build: every entry
-# is an mrustc gap, not a PowerPC one, so rb-cli-ppc/patches applies unchanged.
-# The runner is idempotent, mtime-safe, and fails loudly if a crate version bump
-# breaks a pattern -- so re-running before every transpile is cheap insurance.
+# The patch set is shared with the PowerPC build; every entry is an mrustc gap, not a PPC one.
 apply_vendor_patches() {
   "$RB_DIR/scripts/apply-vendor-patches.py" --vendor-dir "$VENDOR_DIR"
 }
 
 # ---- stage: sol9libs --------------------------------------------------------
-# Already built as of 2026-09-03. Needed again only after a change to mrustc's
-# target.cpp or codegen_c.cpp: minicargo.mk LIBS does NOT self-rebuild, so the
-# target stdlib silently stays stale. Delete $SOL9_LIBS first when that happens.
+# minicargo.mk LIBS does not self-rebuild: delete $SOL9_LIBS after an mrustc codegen change.
 stage_sol9libs() {
   banner "2. build the Solaris 9 stdlib -> $SOL9_LIBS"
   cd "$MRUSTC_DIR"
@@ -228,14 +194,7 @@ stage_sol9libs() {
 }
 
 # ---- stage: hostc -----------------------------------------------------------
-# The PowerPC build's fastest transpile proof, and it does NOT transfer here.
-# It builds for the *host*, which on this machine is Linux -- so os/linux.rs
-# compiles, and that needs `nix`, which this manifest deliberately drops (see
-# rb-cli-sol9/Cargo.toml). Solaris never compiles os/linux.rs, so adding nix
-# back just to make this stage work would be dependency churn for nothing.
-#
-# There is no cheap-proxy stage on this port and none is needed: the target
-# stdlib already exists, so `sol9` builds the real thing directly.
+# Does not transfer here: it builds for the host, whose os/linux.rs needs the nix this manifest drops.
 stage_hostc() {
   banner "3. emit host C for the whole engine (deferred codegen) -> $HOSTC_OUT"
   case "$(uname -s)" in
@@ -273,8 +232,7 @@ stage_sol9() {
     --target "$SOL9_TARGET" \
     --no-default-features --features "$FEATURES" \
     -j "$JOBS"
-  # minicargo can exit 0 while deadlocked, without linking, so check for the
-  # binary rather than trusting the exit code (docs/build-ppc-mrustc.md, Traps).
+  # minicargo can exit 0 while deadlocked, so check for the binary, not the exit code.
   [ -e "$SOL9_OUT/rb-cli" ] || die "minicargo exited 0 but produced no $SOL9_OUT/rb-cli -- grep the log for 'BUG:' and for a deadlock listing"
   note "built: $(file "$SOL9_OUT/rb-cli" | cut -c1-120)"
 }
@@ -310,9 +268,7 @@ TXT
 }
 
 # ---- stage: smoke -----------------------------------------------------------
-# ssh to the Blade needs the gcr agent socket; the inherited gnome-keyring agent
-# holds the key but refuses the SHA-1 RSA signature SunSSH wants, and fails as
-# "Permission denied (publickey)" -- which reads like a missing key and is not.
+# SunSSH wants a SHA-1 RSA signature; a locked key fails as "Permission denied (publickey)".
 stage_smoke() {
   banner "6. run it on $SOL9_HOST"
   [ -n "$SOL9_HOST" ] || die "SOL9_HOST is not set (e.g. SOL9_HOST=user@192.168.99.176)"

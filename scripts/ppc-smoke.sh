@@ -22,19 +22,13 @@
 
 set -uo pipefail
 
-# The target host is named by whichever variable fits the machine: PPC_HOST for
-# the PowerPC Macs, SOL9_HOST for the Sun Blade, RB_SMOKE_HOST for anything
-# else. Nothing below this line is target-specific -- every assertion is on
-# bytes the two hosts produce, and the remote side is plain POSIX sh.
+# Target host: PPC_HOST, SOL9_HOST or RB_SMOKE_HOST. Nothing below is target-specific.
 SMOKE_HOST="${RB_SMOKE_HOST:-${PPC_HOST:-${SOL9_HOST:-}}}"
 REMOTE_BIN="${1:-${RB_SMOKE_BIN:-/Users/admin/rb-cli-dev}}"
 LOCAL_BIN="${LOCAL_BIN:-target/release/rb-cli}"
 REMOTE_DIR="/tmp/rb-smoke.$$"
 
-# SunSSH on the Blade wants a SHA-1 RSA signature the inherited gnome-keyring
-# agent refuses to make, and fails as "Permission denied (publickey)" -- which
-# reads like a missing key and is not. Point at the gcr agent instead:
-#   RB_SMOKE_SSH_AUTH_SOCK=/run/user/$(id -u)/gcr/ssh
+# SunSSH needs a SHA-1 RSA signature; RB_SMOKE_SSH_AUTH_SOCK picks an agent that will make one.
 [ -n "${RB_SMOKE_SSH_AUTH_SOCK:-}" ] && export SSH_AUTH_SOCK="$RB_SMOKE_SSH_AUTH_SOCK"
 
 [ -n "$SMOKE_HOST" ] || { echo "no target host: set PPC_HOST, SOL9_HOST or RB_SMOKE_HOST" >&2; exit 2; }
@@ -49,9 +43,7 @@ pass() { printf '  \033[32mOK\033[0m    %s\n' "$1"; }
 fail() { printf '  \033[31mFAIL\033[0m  %s\n' "$1"; fails=$((fails + 1)); }
 
 echo "== building subjects =="
-# One per filesystem family the engine treats differently: FAT (cluster chains),
-# HFS (classic Mac B-trees), ext (Unix inodes). Small: the point is agreement,
-# not throughput.
+# One per filesystem family the engine treats differently: FAT, HFS, ext.
 "$LOCAL_BIN" new floppy fat "$WORK/fat.img" >/dev/null 2>&1 || { echo "new fat failed" >&2; exit 2; }
 "$LOCAL_BIN" new floppy hfs "$WORK/hfs.img" >/dev/null 2>&1 || { echo "new hfs failed" >&2; exit 2; }
 "$LOCAL_BIN" new volume ext3 "$WORK/ext.img" --size 32M >/dev/null 2>&1 || { echo "new ext failed" >&2; exit 2; }
@@ -68,11 +60,7 @@ scp -q "$WORK"/*.img "$SMOKE_HOST:$REMOTE_DIR/" || exit 2
 echo "== read-only verbs must agree =="
 for img in fat hfs ext; do
   for verb in "inspect $img.img" "ls $img.img /" "fsck $img.img"; do
-    # Capture the two streams separately and label them. Merging with 2>&1
-    # compares nothing useful over ssh: the remote merge interleaves stdout and
-    # stderr on one channel with different buffering than a local pipe, so
-    # byte-identical output reports as a diff (a lost newline between the
-    # stderr banner and the stdout body). Cost a real debugging session once.
+    # Capture the streams separately: an ssh 2>&1 merge buffers differently than a local pipe.
     local_out="$(cd "$WORK" && { "$LOCAL_BIN" $verb >"$WORK/.o" 2>"$WORK/.e"; \
         printf '<<<out>>>\n'; cat "$WORK/.o"; printf '<<<err>>>\n'; cat "$WORK/.e"; })"
     remote_out="$(ssh "$SMOKE_HOST" "cd $REMOTE_DIR && { $REMOTE_BIN $verb >.o 2>.e; \

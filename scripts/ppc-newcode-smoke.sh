@@ -26,19 +26,13 @@
 
 set -uo pipefail
 
-# The target host is named by whichever variable fits the machine: PPC_HOST for
-# the PowerPC Macs, SOL9_HOST for the Sun Blade, RB_SMOKE_HOST for anything
-# else. Nothing below this line is target-specific -- every assertion is on
-# bytes the two hosts produce, and the remote side is plain POSIX sh.
+# Target host: PPC_HOST, SOL9_HOST or RB_SMOKE_HOST. Nothing below is target-specific.
 SMOKE_HOST="${RB_SMOKE_HOST:-${PPC_HOST:-${SOL9_HOST:-}}}"
 REMOTE_BIN="${1:-${RB_SMOKE_BIN:-/Users/admin/rb-cli-dev}}"
 LOCAL_BIN="${LOCAL_BIN:-target/release/rb-cli}"
 REMOTE_DIR="/tmp/rb-newcode.$$"
 
-# SunSSH on the Blade wants a SHA-1 RSA signature the inherited gnome-keyring
-# agent refuses to make, and fails as "Permission denied (publickey)" -- which
-# reads like a missing key and is not. Point at the gcr agent instead:
-#   RB_SMOKE_SSH_AUTH_SOCK=/run/user/$(id -u)/gcr/ssh
+# SunSSH needs a SHA-1 RSA signature; RB_SMOKE_SSH_AUTH_SOCK picks an agent that will make one.
 [ -n "${RB_SMOKE_SSH_AUTH_SOCK:-}" ] && export SSH_AUTH_SOCK="$RB_SMOKE_SSH_AUTH_SOCK"
 
 [ -n "$SMOKE_HOST" ] || { echo "no target host: set PPC_HOST, SOL9_HOST or RB_SMOKE_HOST" >&2; exit 2; }
@@ -55,8 +49,7 @@ fail() { printf '  \033[31mFAIL\033[0m  %s\n' "$1"; fails=$((fails + 1)); }
 info() { printf '        %s\n' "$1"; }
 
 # ---------------------------------------------------------------- fixtures --
-# perl, not printf: /bin/sh's printf has no \xNN escape, so a hex fixture built
-# with it silently becomes the literal text "\xB3" and the test proves nothing.
+# perl, not printf: /bin/sh's printf has no \xNN escape and would write the literal text.
 echo "== building subjects =="
 perl -e 'print "REM \xB3 box drawing\r\nSET X=1\r\n\xB3\xB3\xB3\r\n"' > "$WORK/dostext.txt"
 perl -e 'print "alpha\nbeta\r\ngamma\ndelta\r\nomega\n"'              > "$WORK/mixed.txt"
@@ -64,15 +57,10 @@ printf 'attribute subject\n'  > "$WORK/attr.txt"
 printf 'protection subject\n' > "$WORK/prot.txt"
 printf 'metadata subject\n'   > "$WORK/meta.txt"
 printf 'replacement bytes\n'  > "$WORK/replace.txt"
-# Pin the fixtures' permissions on both hosts. With `--no-preserve-meta` a new
-# file correctly inherits the *host file's* mode, and the two machines have
-# different umasks (0002 here, 0022 on the Mac), so an unpinned fixture makes
-# the two builds disagree by 0664 vs 0644 - a difference in the test rig that
-# reads exactly like an engine bug.
+# Pin fixture permissions: the two hosts have different umasks, which reads like an engine bug.
 chmod 644 "$WORK"/*.txt
 
-# Editors, as shell scripts taking the temp file as $1. Octal escapes only:
-# \nnn is POSIX printf, \xNN is not.
+# Editors as shell scripts taking the temp file as $1; octal escapes only, \xNN is not POSIX.
 cat > "$WORK/ed-noop.sh" <<'EOF'
 #!/bin/sh
 exit 0
@@ -109,10 +97,7 @@ ssh "$SMOKE_HOST" "mkdir -p $REMOTE_DIR" || exit 2
 scp -q "$WORK"/*.img "$WORK"/*.txt "$WORK"/ed-*.sh "$SMOKE_HOST:$REMOTE_DIR/" || exit 2
 ssh "$SMOKE_HOST" "cd $REMOTE_DIR && chmod +x ed-*.sh && chmod 644 *.txt && for i in fat affs hfs ext; do cp \$i.img \$i.pristine; done" || exit 2
 
-# run_both NAME IMG CMD...
-#   Resets IMG from its pristine copy on both hosts, runs the same command on
-#   each, then compares exit status, the changed-offset report, and (if the
-#   caller set EXTRACT) the extracted file's bytes.
+# run_both NAME IMG CMD...: same command both hosts, compares status, changed offsets and bytes.
 run_both() {
   local name="$1" img="$2"; shift 2
   local cmd="$*"
@@ -126,17 +111,8 @@ run_both() {
 
   scp -q "$SMOKE_HOST:$REMOTE_DIR/$img.img" "$WORK/$img-remote.img" 2>/dev/null
 
-  # A second local run, deliberately at a different instant, so the two can be
-  # differenced to learn which bytes are clocks rather than data. Without this
-  # every write verb "fails": the local and remote runs are seconds apart, and
-  # an ext inode's three timestamps, HFS's drLsMod and a FAT dirent's
-  # creation-time tenths all differ by exactly that gap.
-  #
-  # The sleep is load-bearing. ext and HFS timestamps have one-second
-  # granularity, so two back-to-back local runs would usually record the *same*
-  # time, the mask would come back empty, and the noise it exists to remove
-  # would sail straight through. Sleeping over a second boundary guarantees the
-  # clock bytes actually move.
+  # A second local run at a different instant, so differencing the two identifies the clock bytes.
+  # The sleep is load-bearing: one-second granularity means back-to-back runs record the same time.
   sleep 2
   cp "$WORK/$img.pristine" "$WORK/$img-local2.img"
   (cd "$WORK" && eval "\"$LOCAL_BIN\" ${cmd/$img.img/$img-local2.img}" >/dev/null 2>&1)
@@ -181,10 +157,7 @@ extract_both() {
 
 echo
 echo "== edit: CP437 + CRLF must survive a round trip =="
-# Deliberately the *appending* editor, not a no-op one. With a no-op editor
-# `edit` notices nothing changed and skips the write entirely ("No changes;
-# nothing written"), so the encode path - the half that can corrupt 0xB3 or
-# flatten CRLF - never runs and the test passes vacuously.
+# The appending editor, not a no-op one: a no-op skips the write and the encode path never runs.
 if run_both edit-roundtrip fat "edit fat.img /DOSTEXT.TXT --editor ./ed-ascii.sh"; then
   if extract_both edit-roundtrip fat /DOSTEXT.TXT; then
     # The original bytes, with one ASCII line appended in the file's own form.
@@ -216,9 +189,7 @@ echo "== edit: an em-dash must be refused by position, with nothing written =="
 if run_both edit-emdash fat "edit fat.img /DOSTEXT.TXT --editor ./ed-emdash.sh"; then
   if [ "$LAST_LRC" -eq 0 ]; then
     fail "edit accepted an em-dash into a CP437 file (expected refusal)"
-  # Specifically `line N, col N`, not merely any of the words "line"/"byte":
-  # the informational first line ("33 bytes, CRLF endings, CP437") contains
-  # those anyway, so a loose pattern passes even when no position is reported.
+  # Match `line N, col N` exactly: the informational first line contains those words anyway.
   elif ! printf '%s' "$LAST_ROUT" | grep -qiE 'line [0-9]+, col(umn)? [0-9]+'; then
     fail "edit refused the em-dash but did not name a position"
     info "ppc: $(printf '%s' "$LAST_ROUT" | tail -3 | tr '\n' ' ')"
@@ -266,12 +237,7 @@ fi
 echo
 echo "== chmeta --protection rwd on AFFS (active-low: rwd must land as 00000002) =="
 if run_both chmeta-prot affs "chmeta affs.img /prot.txt --protection rwd"; then
-  # Big-endian canary. `rwd` means execute-denied, and the RWED nibble is
-  # active-low, so the access longword must read 00 00 00 02: the 0x02 lands in
-  # the *last* byte. A byte-swapped u32 puts it in the first, three bytes
-  # earlier, which shows up here as a different changed offset. run_both has
-  # already compared the two hosts' reports; this pins down the absolute value
-  # so a matched pair of wrong answers cannot pass quietly.
+  # Big-endian canary: active-low RWED means rwd must land as 00 00 00 02, the 0x02 in the last byte.
   if grep -qE 'new=02$' "$WORK/chmeta-prot.rdiff"; then
     pass "protection longword written big-endian as 00000002 (E denied)"
     info "$(grep -E 'new=' "$WORK/chmeta-prot.rdiff" | tr '\n' ' ')"
@@ -292,11 +258,7 @@ if run_both put-preserve-ext ext "put ext.img replace.txt /meta.txt --force"; th
     info "$(printf '%s' "$lo" | head -3 | tr '\n' ' ')"
   fi
 fi
-# NOTE: on a Unix filesystem this currently does NOT reset mode/owner - see
-# `put.rs`, which hands `resolve_attrs` the replaced entry regardless of
-# --no-preserve-meta, so AttrSource::Replaced still wins. That is a desktop bug,
-# not a vintage-target one, so this checks *agreement* (the parity question) and only
-# reports the wrong-but-identical result rather than counting it as a mismatch.
+# On Unix this does not reset mode/owner (a desktop bug in put.rs), so only agreement is checked.
 if run_both put-fresh-ext ext "put ext.img replace.txt /meta.txt --force --no-preserve-meta"; then
   ll="$(cd "$WORK" && "$LOCAL_BIN" ls ext.img    / -o 2>&1 | grep meta)"
   lr="$(cd "$WORK" && "$LOCAL_BIN" ls ext-remote.img / -o 2>&1 | grep meta)"
@@ -319,8 +281,7 @@ if run_both put-preserve-hfs hfs "put hfs.img replace.txt /meta.txt --force"; th
     info "$(printf '%s' "$lo" | head -4 | tr '\n' ' ')"
   fi
 fi
-# type/creator *does* go through the preserved-meta path, so the opt-out works
-# here even though the POSIX triple above ignores it.
+# type/creator does go through the preserved-meta path, so the opt-out works here.
 if run_both put-fresh-hfs hfs "put hfs.img replace.txt /meta.txt --force --no-preserve-meta"; then
   lo="$(cd "$WORK" && "$LOCAL_BIN" ls hfs-remote.img / 2>&1)"
   if printf '%s' "$lo" | grep -q 'MSWD'; then
