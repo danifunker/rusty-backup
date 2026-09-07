@@ -123,7 +123,8 @@ rustyline = { version = ">=12, <15", default-features = false, features = ["with
 # screen, cursor hide, menu bar -- then crossterm aborts with "Failed to
 # initialize input reader" because its default event source waits with mio.
 # `use-dev-tty` swaps that for poll(2) via `filedescriptor`, and Solaris' poll
-# on a tty is native and correct. Costs one crate, as predicted.
+# on a tty is native and correct. VERIFIED on the Blade: arrow keys move the tab
+# selection and `q` exits 0. Costs one crate, as predicted.
 crossterm = { version = "0.28", features = ["use-dev-tty"] }
 shell-words = "1.1.1"
 lzma-rs = "0.3.0"

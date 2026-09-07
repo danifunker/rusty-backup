@@ -5,8 +5,8 @@ Adding `sparcv9-sun-solaris2.9` to the vintage-style builds, alongside
 (PowerPC Mac OS X, mrustc). Scope is the **CLI and the ratatui TUI** - the same
 surface `rb-cli-ppc` ships. No GUI, no CHD.
 
-This is a scope document turning into a build guide. It records what has been
-verified, what has not, and what the work actually is. The companion manifest is
+This is the build guide for the target, grown out of the original scope
+notes. It records what has been verified, what has not, and how to rebuild it. The companion manifest is
 [`../rb-cli-sol9/Cargo.toml`](../rb-cli-sol9/Cargo.toml); the PowerPC build guide
 [`build-ppc-mrustc.md`](build-ppc-mrustc.md) is the template for everything here
 and should be read first - most of its traps are mrustc traps, not PowerPC ones,
@@ -20,8 +20,8 @@ backup payloads and checksums, and `ppc-newcode-smoke.sh` agrees on every write
 verb, including the big-endian-sensitive AFFS protection longword. Getting there
 cost two real runtime bugs, both in finding 10 - a Solaris 10-only `fcntl`
 command behind `File::try_clone`, and an **mrustc codegen bug that only appears
-on 64-bit big-endian**. What is left is the TUI (phase 7) and the doc sync
-(phase 8).
+on 64-bit big-endian**. The TUI works too, once crossterm is
+built with `use-dev-tty` (finding 4).
 
 ## What already exists, and is verified
 
@@ -179,10 +179,23 @@ is a self-pipe built on `pipe2`, a symbol Solaris 9 does not have (finding 7).
 That is implemented in the shim rather than stubbed, so the event loop has a
 working waker.
 
-What remains is purely *runtime* - whether mio's event source actually wakes on
-a Solaris terminal - and that needs a real terminal on the Blade. If `rb-cli
-tui` fails to start there, `use-dev-tty` is the known escape hatch and costs one
-crate; the manifest carries a comment saying so.
+**RESOLVED on the hardware, 2026-09-07: mio was indeed the problem, and
+`use-dev-tty` is indeed the fix.** With the default event source the TUI
+renders correctly - alternate screen, cursor hidden, the menu bar painted -
+and then aborts with `Failed to initialize input reader`. So Solaris' terminal
+handling and ratatui's output were never at fault; only the input side was.
+
+`crossterm = { features = ["use-dev-tty"] }` swaps mio for `poll(2)` through
+the `filedescriptor` crate, and the TUI then works completely: three
+right-arrows walk the selection Inspect -> New Disk -> Optical -> Archives,
+each keypress produces its own repaint, and `q` exits 0. Cost one crate, as
+the manifest predicted.
+
+Worth noting for anyone testing a TUI over ssh: drive it with `ssh -tt` and
+count *repaint batches* (splitting the capture on the cursor-hide sequence)
+rather than trusting the exit code. A TUI that dies on startup and one that
+quits on your keypress both exit when stdin closes, and reading that as
+success was a wrong call made once here already.
 
 ### 5. A latent bug in the engine: a fallback arm nothing had ever compiled
 
@@ -400,8 +413,8 @@ captured separately; the gate now labels and compares them apart.
 
 ## What the work is
 
-Phased, in dependency order. Each phase is verifiable on its own. Phases 1-6
-are **done**; 7 (TUI) and 8 (doc sync) are in progress as of 2026-09-07.
+Phased, in dependency order. Each phase is verifiable on its own. Phases 1-7
+are **done** as of 2026-09-07; 8 (doc sync) is the remainder.
 
 1. **Manifest and vendor.** DONE. `rb-cli-sol9/Cargo.toml`, then `cargo vendor`
    into `rb-cli-sol9/vendor/` (gitignored by the `rb-cli-*/vendor/` rule). The
@@ -660,10 +673,9 @@ are **done**; 7 (TUI) and 8 (doc sync) are in progress as of 2026-09-07.
    `pipe2` over `pipe`+`fcntl`, `getrandom` over `/dev/urandom` - is exercised
    as written, because the executable's own definitions win over libc's.
 
-7. **TUI verification** (finding 4), which needs a real terminal on the Blade.
-   The compile-side risk is gone and `pipe2` - mio's waker, and the one shim
-   entry point the event loop touches on every keystroke - is implemented rather
-   than stubbed, so this is now a genuine runtime question and not a guess.
+7. **TUI verification.** DONE - see finding 4. The default mio event source
+   fails at `Failed to initialize input reader`; `use-dev-tty` fixes it and the
+   TUI navigates and exits cleanly on the Blade.
 8. **Docs sync.** README's platform/build sections, and this file promoted from
    scope to build guide.
 
