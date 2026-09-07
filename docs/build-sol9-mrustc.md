@@ -705,14 +705,14 @@ dependencies: `~/sol9-deps/prefix` (nothing references it - zstd and zlib are
 compiled from source by cc-rs for the target), and the Blade itself, which is
 needed only for the parity gates, never for the build.
 
-### The blocker
+### The mrustc branch
 
-**The five mrustc commits are local-only.** `origin/sparc-solaris-10` is at
-`109ddad1`, the base commit, so `docker/sol9.Dockerfile`'s
-`git clone --branch sparc-solaris-10` fetches a branch with no Solaris target
-and the image build fails at `make -f minicargo.mk LIBS MRUSTC_TARGET=...`.
-Pushing that branch is the single prerequisite for the container building
-anywhere but here.
+`docker/sol9.Dockerfile` clones `danifunker/mrustc` at branch
+`sparc-solaris-10`, so that branch must carry the Solaris target for the image
+to build. **It does, as of 2026-09-07** (`71910c7c`) - the branch was pushed
+that day. If a container build ever fails at
+`make -f minicargo.mk LIBS MRUSTC_TARGET=...` with an unknown target, check
+that ref first; the whole image depends on it.
 
 ### The sysroot
 
@@ -742,24 +742,41 @@ size bug ship once.
 
 ## mrustc: what needs upstreaming
 
-Five commits exist on `sparc-solaris-10`; a sixth is not yet written. Grouped
-as they should be proposed, smallest and most general first - three of the four
-are not Solaris-specific at all.
+`sparc-solaris-10` carries **eleven commits** over `upstream/master`
+(`d0fffe5b`), not just the Solaris 9 five - the branch accumulated earlier
+work that never went up. Upstream has merged this fork's targets before (its
+tip *is* the PowerPC PR, #418), so the path is established.
 
-| PR | Commits | Scope |
+Six of the eleven are portable fixes with no Solaris content at all, and those
+are the easiest to land:
+
+| | Commit | Why it stands alone |
 |---|---|---|
-| **1. Signed overflow helpers** | `64551250` | Pure correctness, no new target. The emitted `__builtin_mul_overflow_i*` reported overflow for almost any negative operand; fuzzing found 561,004 mismatches against GCC's own builtins, plus reachable UB (`INT_MIN/-1`, signed wrapping). Stands alone and is worth landing regardless of Solaris. |
-| **2. `emulate-overflow-intrinsics`** | `73c570f3` | Lifts MSVC's existing type-suffixed stand-ins into a target flag so the GNU backend can use them, for compilers older than GCC 5. MSVC output unchanged. Depends on PR 1. |
-| **3. `CC_${TRIPLE}` sanitisation** | `71910c7c` | One-line class of bug: the variable name replaced only `-`, so a triple with a `.` produced a name no shell can export. Unnoticed because no triple had a dot before. Fully general. |
-| **4. The Solaris 9 target** | `6421bfef`, `b3aa8ae6` | `sparcv9-sun-solaris2.9` plus `emulate-c99-math` / `emulate-posix2001`, and the `docker/sol9-cross` toolchain container (including Solaris 9's empty `INTPTR_MAX`/`UINTPTR_MAX`, which breaks any C99 `#if` test). The one genuinely target-specific PR. |
-| **5. Fieldless enums across FFI** | **not yet written** | Finding 10. mrustc lowers a fieldless `#[repr(u32)]` enum to a one-field struct and passes it **by value** in `extern "C"` signatures; the callee expects a scalar. On any 64-bit big-endian target the value lands in the wrong half of the register. Should emit the underlying integer type in extern signatures and at call sites. |
+| a | `0ef4515c` | minicargo dropped the semver pre-release suffix from `CARGO_PKG_VERSION` |
+| b | `24e0ed0a` | `#[repr(align(N))]` on unions was unsupported in HIR |
+| c | `3587bd55` | `STD_ENV_ARCH` could not be overridden |
+| d | `109ddad1` | `{:02x?}` left a literal `"?}"` in formatted output |
+| e | `64551250` | The emitted signed-overflow helpers were wrong for almost any negative operand - 561,004 fuzz mismatches against GCC's own builtins, plus reachable UB. The strongest standalone PR here |
+| f | `71910c7c` | `CC_${TRIPLE}` replaced only `-`, so any triple containing `.` produced a name no shell can export |
 
-PR 5 is the most valuable and the only one still to write. It is a real
-codegen bug rather than a missing feature, it affects every `extern "C"` fn
-taking such an enum, and it is structurally invisible on 32-bit big-endian -
-so mrustc's existing PowerPC users cannot have hit it. A regression test wants
-a 64-bit big-endian target, which PR 4 supplies.
+The remaining five are the target work, and want landing in order because each
+depends on the last:
 
+| | Commit(s) | |
+|---|---|---|
+| g | `73c570f3` | `emulate-overflow-intrinsics`, so a pre-GCC-5 compiler can build mrustc's output. Needs (e) |
+| h | `400e373a` | The `sparcv9-sun-solaris` target (Solaris 10) |
+| i | `6421bfef`, `b3aa8ae6` | `sparcv9-sun-solaris2.9`, `emulate-c99-math`, `emulate-posix2001`, and the `docker/sol9-cross` toolchain container |
+| j | **not yet written** | Finding 10: mrustc lowers a fieldless `#[repr(u32)]` enum to a one-field struct and passes it **by value** in `extern "C"` signatures, where the callee expects a scalar. On any 64-bit big-endian target the value lands in the wrong half of the register. Should emit the underlying integer in extern signatures and at call sites |
+
+Two practical notes. The branch is **not linear** - it contains a merge commit
+(`1d552cad`, this fork's own PR #420) - so a PR series wants rebasing onto
+`upstream/master` rather than being proposed as-is. And (j) is the most
+valuable of the set: a genuine codegen bug rather than a missing feature,
+affecting every `extern "C"` fn taking such an enum, and structurally
+invisible on 32-bit big-endian - so upstream's existing PowerPC users cannot
+have hit it. Its regression test needs a 64-bit big-endian target, which (i)
+supplies.
 
 ## Open questions - decisions to make, not tasks
 
