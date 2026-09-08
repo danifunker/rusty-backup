@@ -5,9 +5,10 @@
 # public source: it is a copy of a licensed Solaris 9 install's headers and libraries, and
 # Solaris 9 predates OpenSolaris by three years so no free substitute exists. Supply one of:
 #
-#   SOL9_SYSROOT_URL=https://...    download a prepared tarball (what CI uses; keep it private)
-#   SOL9_HOST=user@host             pull one off a live Solaris 9 SPARC install
-#   ./sysroot.tar.gz                drop your own next to this script
+#   ./mksysroot-from-iso.sh DVD.iso  build one from the install DVD -- no Solaris box needed
+#   SOL9_SYSROOT_URL=https://...     download a prepared tarball (what CI uses; keep it private)
+#   SOL9_HOST=user@host              pull one off a live Solaris 9 SPARC install
+#   ./sysroot.tar.gz                 drop your own next to this script
 #
 # Building one from scratch: Notes/SolarisSysroot.md in the mrustc tree.
 # The tarball is rooted at /, holding usr/include, usr/ccs/lib and usr/lib.
