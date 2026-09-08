@@ -1158,11 +1158,11 @@ fn open_read_dispatch(
                 }
             }
         }
-        let f = File::open(path).with_context(|| format!("open {}", path.display()))?;
         // A device cannot answer seek(End); carry the length the OS reports instead.
         if crate::cli::device_safety::looks_like_device_path(path) {
-            return Ok(Box::new(crate::os::known_len_reader(f, path)));
+            return open_device_read(path);
         }
+        let f = File::open(path).with_context(|| format!("open {}", path.display()))?;
         Ok(Box::new(BufReader::new(f)))
     }
 }
@@ -1257,6 +1257,20 @@ pub fn open_peeled_read(path: &Path, password: Option<&[u8]>) -> Result<Box<dyn 
     open_peeled_read_with_entry(path, password, None)
 }
 
+/// Open a raw device through the platform's elevation path.
+///
+/// The CLI used to reach a device with a plain `File::open`, so on macOS —
+/// where the GUI escalates per operation through `authopen` — an unprivileged
+/// `rb-cli inspect /dev/rdiskN` died with a bare EACCES and no way forward
+/// (R-068). The handle is wrapped so the disk claim outlives the reader.
+fn open_device_read(path: &Path) -> Result<Box<dyn ReadSeek>> {
+    let elevated = crate::os::open_source_for_reading(path)
+        .with_context(|| format!("open {}", path.display()))?;
+    let (handle, guard) = elevated.into_parts();
+    let reader = crate::os::SectorAlignedReader::new(crate::os::known_len_source(handle, path));
+    Ok(Box::new(crate::os::GuardedReader::new(reader, guard)))
+}
+
 /// As [`open_peeled_read`], but `inside` names a specific entry to open when
 /// `path` is a `.zip` holding more than one disk image (the CLI `--inside`
 /// flag). Ignored for every non-zip source.
@@ -1300,12 +1314,12 @@ pub fn open_peeled_read_with_entry(
     if let Some(image) = try_open_ndif_carrier(path) {
         return Ok(Box::new(std::io::Cursor::new(image)));
     }
-    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
     // A raw device is never a container, cannot answer seek(End) and, on macOS,
     // takes only sector-sized reads: a plain BufReader gave inspect 0 bytes (R19).
     if crate::cli::device_safety::looks_like_device_path(path) {
-        return Ok(Box::new(crate::os::known_len_reader(file, path)));
+        return open_device_read(path);
     }
+    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
     match detect_image_format_with_path(file, Some(path)) {
         Ok(format) if !matches!(format, ImageFormat::Raw) => {
             let file2 = File::open(path).with_context(|| format!("open {}", path.display()))?;

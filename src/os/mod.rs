@@ -834,7 +834,8 @@ pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        let file = File::open(path)?;
+        // Names the elevation the caller needs; the CLI reaches this now too.
+        let file = File::open(path).map_err(|e| device_open_error(path, e))?;
         Ok(ElevatedSource {
             file: SourceHandle::File(file),
             temp_path: None,
@@ -1011,6 +1012,34 @@ impl Drop for TempFileGuard {
         if let Some(ref path) = self.temp_path {
             let _ = fs::remove_file(path);
         }
+    }
+}
+
+/// A reader that keeps its source's [`TempFileGuard`] — the macOS disk claim and
+/// any temp file — alive exactly as long as the reader that reads through it.
+pub struct GuardedReader<R> {
+    inner: R,
+    _guard: TempFileGuard,
+}
+
+impl<R> GuardedReader<R> {
+    pub fn new(inner: R, guard: TempFileGuard) -> Self {
+        Self {
+            inner,
+            _guard: guard,
+        }
+    }
+}
+
+impl<R: Read> Read for GuardedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl<R: Seek> Seek for GuardedReader<R> {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.inner.seek(pos)
     }
 }
 

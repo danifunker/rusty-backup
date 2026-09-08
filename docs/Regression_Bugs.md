@@ -19,6 +19,7 @@ finding depends on a fixture, the fixture is named.
 
 | ID | Severity | Area | Finding |
 |----|----------|------|---------|
+| ~~[R-068](#r-068)~~ | ~~**High**~~ **FIXED** | `src/model/source_reader.rs`, `src/os/mod.rs` | ~~The CLI opens a raw device with a plain `File::open` and never elevates, so on macOS — where privilege is escalated per operation through `authopen`, not inherited from the process — every unprivileged `rb-cli` device verb dies with a bare `Permission denied` and no way forward~~ — the CLI device path goes through `open_source_for_reading` like the GUI's, holding the disk claim for the reader's lifetime, 2026-09-08 |
 | ~~R-067~~ | ~~Medium~~ **FIXED** | `src/fs/xfs/fsck.rs` | ~~`rb-cli fsck` reports the bmap-btree blocks of a btree-format inode as leaked (`UnaccountedBlocks`) on a volume `xfs_repair -n` accepts~~ — the block census claimed the fork's extents but not the tree's own blocks, 2026-09-06 |
 | ~~R-066~~ | ~~Medium~~ **FIXED** | `src/fs/xfs/freespace_rebuild.rs` | ~~`sb_fdblocks` falls below the free count `xfs_repair` derives once a volume's free-space btrees grow past their roots (`sb_fdblocks 232894, counted 232904` after 200000 files)~~ — the resync omitted `agf_btreeblks`, 2026-09-06 |
 | ~~R-065~~ | ~~**High**~~ **FIXED** | `src/fs/xfs/v5_crc.rs` | ~~Every v5 CRC header rb-cli stamps on a file or directory block in AG 1 or later carries the wrong `blkno` when an AG is not a power of two of blocks, so `xfs_repair -n` reports every such block as corrupt~~ — `fsblock_to_daddr` shifted the raw fsblock instead of decoding its AG; found on a 96 MiB volume (6144-block AGs), 2026-09-06 |
@@ -296,6 +297,39 @@ through any context layer; `open_device` stops there and the read path's
 read-only retry is skipped after a cancel. Unit tests cover the decode; the
 live cancel on this machine is pending the user, since raising the dialog
 unattended was not an option during the run.
+
+### R-068 — the CLI never elevates for a raw device {#r-068}
+
+**FIXED 2026-09-08** (`fix(cli): a raw device opens through the platform's
+elevation path`). Found while trying to run the R-053 floppy check below.
+
+`rb-cli inspect /dev/rdisk5` on an unprivileged shell answered
+
+```
+error: open /dev/rdisk5: Permission denied (os error 13)
+```
+
+and stopped. `open_source_for_reading` — the function that escalates through
+`authopen`, recognises write-protected media (R-051) and a cancelled dialog
+(R-052) — had four callers, all of them in `src/gui/` or `src/backup/`. The
+CLI's two device sites in `src/model/source_reader.rs` (`open_read` and
+`open_peeled_read_with_entry`) both reached the device with a plain
+`File::open`, so on macOS, where privilege is escalated per operation and
+never inherited by the process, the CLI could only ever touch a raw device
+under `sudo`. The comment on `device_open_error` recorded the assumption that
+broke: "macOS never reaches here: it escalates per operation through
+`authopen`" — true of the GUI, false of the CLI.
+
+Both sites now call `open_source_for_reading` and wrap its handle in a
+`GuardedReader`, which holds the `TempFileGuard` — and so the macOS disk claim
+— alive for exactly as long as the reader. The device check also moved *above*
+the `File::open` that used to precede it, which is what actually raised the
+error. On Linux and Windows the same call adds the elevation hint
+`device_open_error` already wrote and, on Windows, the raw-device open flags;
+the generic branch now routes its error through `device_open_error` too.
+
+This is why the R-053 floppy confirmation never ran on 2026-09-05: the
+documented reproduction command cannot work unprivileged on macOS.
 
 ### R-053 — a raw device fails a large read that dd serves in sectors (audit R19) {#r-053}
 
