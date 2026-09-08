@@ -27,7 +27,7 @@ on:
         type: boolean
         default: true
       sol9:
-        description: 'Build rb-cli for Solaris 9 SPARC (needs the SOL9_SPARC64_SYSROOT_URL secret)'
+        description: 'Build rb-cli for Solaris 9 SPARC (SOL9_SPARC64_SYSROOT_URL: a sysroot or a saved toolchain image)'
         type: boolean
         default: true
       runner_image:
@@ -1535,7 +1535,6 @@ jobs:
     env:
       VER: ${{ needs.generate-version.outputs.version }}
       SOL9_SPARC64_SYSROOT_URL: ${{ secrets.SOL9_SPARC64_SYSROOT_URL }}
-      SOL9_SPARC64_TOOLCHAIN_URL: ${{ secrets.SOL9_SPARC64_TOOLCHAIN_URL }}
       SOL9_TARGET: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@v6
@@ -1543,8 +1542,8 @@ jobs:
       - name: Check the sysroot secret is configured
         id: gate
         run: |
-          if [ -z "$SOL9_SPARC64_SYSROOT_URL" ] && [ -z "$SOL9_SPARC64_TOOLCHAIN_URL" ]; then
-            echo "Neither SOL9_SPARC64_SYSROOT_URL nor SOL9_SPARC64_TOOLCHAIN_URL is set; skipping." >&2
+          if [ -z "$SOL9_SPARC64_SYSROOT_URL" ]; then
+            echo "SOL9_SPARC64_SYSROOT_URL is not set; skipping the Solaris 9 build." >&2
             echo "run=false" >> "$GITHUB_OUTPUT"
           else
             echo "run=true" >> "$GITHUB_OUTPUT"
@@ -1560,25 +1559,34 @@ jobs:
           path: /tmp/mrustc-sol9-cross.tar
           key: sol9-cross-${{ hashFiles('docker/sol9-cross/Dockerfile') }}
 
-      # A prebuilt image is worth hosting next to the sysroot: it already contains that
-      # sysroot, so it is no more publishable and no harder to host, and it turns a
-      # ~40 minute GCC 4.9.4 build into a download. Building stays the fallback.
-      - name: Fetch the prebuilt cross-toolchain image
-        id: toolchain-fetch
-        if: steps.gate.outputs.run == 'true' && steps.toolchain-cache.outputs.cache-hit != 'true' && env.SOL9_SPARC64_TOOLCHAIN_URL != ''
+      # The URL may hold either artifact, and both are equally unpublishable because both
+      # carry Sun's headers. A prebuilt image skips a ~40 minute GCC build, so prefer it;
+      # a sysroot is the fallback that builds one. Sniff the download rather than making
+      # its shape a second secret to keep straight.
+      - name: Provide the cross-toolchain image
+        if: steps.gate.outputs.run == 'true' && steps.toolchain-cache.outputs.cache-hit != 'true'
         run: |
-          curl -fsSL "$SOL9_SPARC64_TOOLCHAIN_URL" -o /tmp/toolchain.tar.gz
-          gzip -t /tmp/toolchain.tar.gz || { echo "toolchain download is not valid gzip" >&2; exit 1; }
-          gunzip -c /tmp/toolchain.tar.gz > /tmp/mrustc-sol9-cross.tar
-          docker load -i /tmp/mrustc-sol9-cross.tar
-          docker image inspect mrustc-sol9-cross >/dev/null
-          echo "fetched=true" >> "$GITHUB_OUTPUT"
-
-      - name: Build the cross-toolchain image
-        if: steps.gate.outputs.run == 'true' && steps.toolchain-cache.outputs.cache-hit != 'true' && steps.toolchain-fetch.outputs.fetched != 'true'
-        run: |
-          sh docker/sol9-cross/build.sh
-          docker save mrustc-sol9-cross -o /tmp/mrustc-sol9-cross.tar
+          curl -fsSL "$SOL9_SPARC64_SYSROOT_URL" -o /tmp/sol9-artifact.tar.gz
+          gzip -t /tmp/sol9-artifact.tar.gz \
+            || { echo "the SOL9_SPARC64_SYSROOT_URL download is not valid gzip" >&2; exit 1; }
+          listing="$(tar tzf /tmp/sol9-artifact.tar.gz)"
+          if printf '%s\n' "$listing" | grep -qE '^(\./)?manifest\.json$'; then
+            echo "==> Artifact is a saved Docker image; loading it"
+            gunzip -c /tmp/sol9-artifact.tar.gz > /tmp/mrustc-sol9-cross.tar
+            docker load -i /tmp/mrustc-sol9-cross.tar
+            docker image inspect mrustc-sol9-cross >/dev/null \
+              || { echo "that image does not provide the mrustc-sol9-cross tag" >&2; exit 1; }
+          elif printf '%s\n' "$listing" | grep -qE '^(\./)?usr/include/stdio\.h$'; then
+            echo "==> Artifact is a sysroot; building the toolchain from it (~40 min)"
+            cp /tmp/sol9-artifact.tar.gz docker/sol9-cross/sysroot.tar.gz
+            sh docker/sol9-cross/build.sh
+            docker save mrustc-sol9-cross -o /tmp/mrustc-sol9-cross.tar
+          else
+            echo "error: the artifact is neither a saved Docker image nor a sysroot." >&2
+            echo "       its top-level entries are:" >&2
+            printf '%s\n' "$listing" | sed 's|^\./||' | awk -F/ '{print $1}' | sort -u | head -10 >&2
+            exit 1
+          fi
 
       - name: Load the cached toolchain image
         if: steps.gate.outputs.run == 'true' && steps.toolchain-cache.outputs.cache-hit == 'true'
