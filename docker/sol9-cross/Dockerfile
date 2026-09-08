@@ -5,7 +5,10 @@
 #   the port in the next release, which shipped as GCC 5. So 4.9.4 is the newest GCC
 #   that can target Solaris 9 at all. GCC 4.9's own sources predate C++11-strict compilers
 #   and need -std=gnu++98 -fpermissive; with those it does build under a current host GCC
-#   (verified on 13.3), so the Debian 11 (GCC 10) pin is for reproducibility, not necessity.
+#   (verified on 13.3), so the base image pin is for reproducibility, not necessity. It was
+#   Debian 11 until bullseye went EOL: apt then rejected the expired security Release file,
+#   and the packages behind it 404'd while archive.debian.org had no bullseye-security to
+#   fall back to, so there was no version of that pin left to hold.
 #
 #   GCC 4.9 has <stdatomic.h> but not __builtin_{add,sub,mul}_overflow, which arrived in
 #   GCC 5. mrustc covers that gap by emitting its own helpers -- see the
@@ -14,7 +17,7 @@
 # The sysroot is not downloadable: Sun's headers and libraries are not redistributable.
 # Supply sysroot.tar.gz in the build context, as ./build.sh does. See README.md.
 
-ARG BASE=debian:11-slim
+ARG BASE=debian:12-slim
 
 FROM ${BASE} AS builder
 
