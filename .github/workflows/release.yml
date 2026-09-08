@@ -27,7 +27,7 @@ on:
         type: boolean
         default: true
       sol9:
-        description: 'Build rb-cli for Solaris 9 SPARC (needs the SOL9_SYSROOT_URL secret)'
+        description: 'Build rb-cli for Solaris 9 SPARC (needs the SOL9_SPARC64_SYSROOT_URL secret)'
         type: boolean
         default: true
       runner_image:
@@ -1516,7 +1516,7 @@ jobs:
     name: Build rb-cli for Solaris 9 (SPARC)
     # Only runs where the sysroot secret exists. A Solaris 9 sysroot is a copy of a
     # licensed install's headers and libraries, so it cannot live in the repo or a
-    # public registry -- SOL9_SYSROOT_URL points at a private copy. Without it the
+    # public registry -- SOL9_SPARC64_SYSROOT_URL points at a private copy. Without it the
     # job skips rather than failing, so forks still get a green pipeline.
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.sol9 }}
     needs: generate-version
@@ -1526,15 +1526,15 @@ jobs:
     continue-on-error: true
     env:
       VER: ${{ needs.generate-version.outputs.version }}
-      SOL9_SYSROOT_URL: ${{ secrets.SOL9_SYSROOT_URL }}
+      SOL9_SPARC64_SYSROOT_URL: ${{ secrets.SOL9_SPARC64_SYSROOT_URL }}
     steps:
       - uses: actions/checkout@v6
 
       - name: Check the sysroot secret is configured
         id: gate
         run: |
-          if [ -z "$SOL9_SYSROOT_URL" ]; then
-            echo "SOL9_SYSROOT_URL is not set; skipping the Solaris 9 build." >&2
+          if [ -z "$SOL9_SPARC64_SYSROOT_URL" ]; then
+            echo "SOL9_SPARC64_SYSROOT_URL is not set; skipping the Solaris 9 build." >&2
             echo "run=false" >> "$GITHUB_OUTPUT"
           else
             echo "run=true" >> "$GITHUB_OUTPUT"

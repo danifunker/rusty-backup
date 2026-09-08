@@ -63,10 +63,13 @@ RUN make -f minicargo.mk LIBS \
 
 # scripts/build-sol9.sh reads every path from the environment, so the image only
 # has to say where things ended up.
+# SOL9_LIBGCC is explicit because its default is under $SOL9_TOOLCHAIN, which does not
+# exist in this image -- the `dist` stage would refuse to package without it.
 ENV MRUSTC_DIR=/opt/mrustc \
     RB_DIR=/src \
     SOL9_BIN=/opt/sol9/bin \
     SOL9_SYSROOT=/opt/sol9/sysroot \
+    SOL9_LIBGCC=/opt/sol9/${TARGET}/lib/sparcv9/libgcc_s.so.1 \
     RUSTC_VERSION=1.74.0
 
 WORKDIR /src

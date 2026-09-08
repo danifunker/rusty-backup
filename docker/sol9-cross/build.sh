@@ -6,7 +6,7 @@
 # Solaris 9 predates OpenSolaris by three years so no free substitute exists. Supply one of:
 #
 #   ./mksysroot-from-iso.sh DVD.iso  build one from the install DVD -- no Solaris box needed
-#   SOL9_SYSROOT_URL=https://...     download a prepared tarball (what CI uses; keep it private)
+#   SOL9_SPARC64_SYSROOT_URL=https://...     download a prepared tarball (what CI uses; keep it private)
 #   SOL9_HOST=user@host              pull one off a live Solaris 9 SPARC install
 #   ./sysroot.tar.gz                 drop your own next to this script
 #
@@ -15,15 +15,15 @@
 set -eu
 
 SOL9_HOST="${SOL9_HOST:-}"
-SOL9_SYSROOT_URL="${SOL9_SYSROOT_URL:-}"
+SOL9_SPARC64_SYSROOT_URL="${SOL9_SPARC64_SYSROOT_URL:-}"
 IMAGE="${IMAGE:-mrustc-sol9-cross}"
 TAR="${TAR:-/opt/csw/bin/gtar}"
 cd "$(dirname "$0")"
 
 if [ ! -f sysroot.tar.gz ]; then
-    if [ -n "$SOL9_SYSROOT_URL" ]; then
+    if [ -n "$SOL9_SPARC64_SYSROOT_URL" ]; then
         echo "==> Downloading sysroot"
-        curl -fsSL "$SOL9_SYSROOT_URL" -o sysroot.tar.gz.tmp
+        curl -fsSL "$SOL9_SPARC64_SYSROOT_URL" -o sysroot.tar.gz.tmp
         mv sysroot.tar.gz.tmp sysroot.tar.gz
     elif [ -n "$SOL9_HOST" ]; then
         echo "==> Pulling sysroot from $SOL9_HOST"
@@ -31,7 +31,7 @@ if [ ! -f sysroot.tar.gz ]; then
         ssh "$SOL9_HOST" "sudo $TAR czf - -C / usr/include usr/ccs/lib usr/lib" > sysroot.tar.gz.tmp
         mv sysroot.tar.gz.tmp sysroot.tar.gz
     else
-        echo "error: no sysroot.tar.gz, and neither SOL9_SYSROOT_URL nor SOL9_HOST is set." >&2
+        echo "error: no sysroot.tar.gz, and neither SOL9_SPARC64_SYSROOT_URL nor SOL9_HOST is set." >&2
         exit 1
     fi
 fi
