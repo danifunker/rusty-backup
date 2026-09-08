@@ -1535,6 +1535,7 @@ jobs:
     env:
       VER: ${{ needs.generate-version.outputs.version }}
       SOL9_SPARC64_SYSROOT_URL: ${{ secrets.SOL9_SPARC64_SYSROOT_URL }}
+      SOL9_SPARC64_TOOLCHAIN_URL: ${{ secrets.SOL9_SPARC64_TOOLCHAIN_URL }}
       SOL9_TARGET: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@v6
@@ -1542,8 +1543,8 @@ jobs:
       - name: Check the sysroot secret is configured
         id: gate
         run: |
-          if [ -z "$SOL9_SPARC64_SYSROOT_URL" ]; then
-            echo "SOL9_SPARC64_SYSROOT_URL is not set; skipping the Solaris 9 build." >&2
+          if [ -z "$SOL9_SPARC64_SYSROOT_URL" ] && [ -z "$SOL9_SPARC64_TOOLCHAIN_URL" ]; then
+            echo "Neither SOL9_SPARC64_SYSROOT_URL nor SOL9_SPARC64_TOOLCHAIN_URL is set; skipping." >&2
             echo "run=false" >> "$GITHUB_OUTPUT"
           else
             echo "run=true" >> "$GITHUB_OUTPUT"
@@ -1559,8 +1560,22 @@ jobs:
           path: /tmp/mrustc-sol9-cross.tar
           key: sol9-cross-${{ hashFiles('docker/sol9-cross/Dockerfile') }}
 
+      # A prebuilt image is worth hosting next to the sysroot: it already contains that
+      # sysroot, so it is no more publishable and no harder to host, and it turns a
+      # ~40 minute GCC 4.9.4 build into a download. Building stays the fallback.
+      - name: Fetch the prebuilt cross-toolchain image
+        id: toolchain-fetch
+        if: steps.gate.outputs.run == 'true' && steps.toolchain-cache.outputs.cache-hit != 'true' && env.SOL9_SPARC64_TOOLCHAIN_URL != ''
+        run: |
+          curl -fsSL "$SOL9_SPARC64_TOOLCHAIN_URL" -o /tmp/toolchain.tar.gz
+          gzip -t /tmp/toolchain.tar.gz || { echo "toolchain download is not valid gzip" >&2; exit 1; }
+          gunzip -c /tmp/toolchain.tar.gz > /tmp/mrustc-sol9-cross.tar
+          docker load -i /tmp/mrustc-sol9-cross.tar
+          docker image inspect mrustc-sol9-cross >/dev/null
+          echo "fetched=true" >> "$GITHUB_OUTPUT"
+
       - name: Build the cross-toolchain image
-        if: steps.gate.outputs.run == 'true' && steps.toolchain-cache.outputs.cache-hit != 'true'
+        if: steps.gate.outputs.run == 'true' && steps.toolchain-cache.outputs.cache-hit != 'true' && steps.toolchain-fetch.outputs.fetched != 'true'
         run: |
           sh docker/sol9-cross/build.sh
           docker save mrustc-sol9-cross -o /tmp/mrustc-sol9-cross.tar
