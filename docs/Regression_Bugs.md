@@ -19,6 +19,7 @@ finding depends on a fixture, the fixture is named.
 
 | ID | Severity | Area | Finding |
 |----|----------|------|---------|
+| ~~[R-069](#r-069)~~ | ~~**High**~~ **FIXED** | `src/model/source_reader.rs` | ~~The encrypted-DMG probe opens the source with a plain `File::open` before the raw-device check is reached, so on macOS an unprivileged `rb-cli` device verb still dies with a bare `Permission denied` and R-068's fix never runs~~ — the device check now precedes every content probe, 2026-09-08 |
 | ~~[R-068](#r-068)~~ | ~~**High**~~ **FIXED** | `src/model/source_reader.rs`, `src/os/mod.rs` | ~~The CLI opens a raw device with a plain `File::open` and never elevates, so on macOS — where privilege is escalated per operation through `authopen`, not inherited from the process — every unprivileged `rb-cli` device verb dies with a bare `Permission denied` and no way forward~~ — the CLI device path goes through `open_source_for_reading` like the GUI's, holding the disk claim for the reader's lifetime, 2026-09-08 |
 | ~~R-067~~ | ~~Medium~~ **FIXED** | `src/fs/xfs/fsck.rs` | ~~`rb-cli fsck` reports the bmap-btree blocks of a btree-format inode as leaked (`UnaccountedBlocks`) on a volume `xfs_repair -n` accepts~~ — the block census claimed the fork's extents but not the tree's own blocks, 2026-09-06 |
 | ~~R-066~~ | ~~Medium~~ **FIXED** | `src/fs/xfs/freespace_rebuild.rs` | ~~`sb_fdblocks` falls below the free count `xfs_repair` derives once a volume's free-space btrees grow past their roots (`sb_fdblocks 232894, counted 232904` after 200000 files)~~ — the resync omitted `agf_btreeblks`, 2026-09-06 |
@@ -297,6 +298,44 @@ through any context layer; `open_device` stops there and the read path's
 read-only retry is skipped after a cancel. Unit tests cover the decode; the
 live cancel on this machine is pending the user, since raising the dialog
 unattended was not an option during the run.
+
+### R-069 — a content probe opens a raw device before the elevation path {#r-069}
+
+**FIXED 2026-09-08** (`fix(cli): the raw-device check precedes every content
+probe`). Found on the first run of the R-053 floppy check, against a binary
+that already carried R-068's fix.
+
+`rb-cli --log-level debug inspect /dev/rdisk5` on an unprivileged shell still
+answered
+
+```
+error: open /dev/rdisk5: Permission denied (os error 13)
+```
+
+with no authorization dialog and no log output at all — the same symptom
+R-068 was supposed to have retired hours earlier.
+
+R-068 moved the raw-device check above the `File::open` that had preceded it,
+but only the one at the *end* of `open_peeled_read_with_entry`. The
+encrypted-DMG probe sits earlier in that same function, inside
+`#[cfg(feature = "crypto")]` — on by default — and opens the source
+unconditionally:
+
+```rust
+let mut probe = File::open(path).with_context(|| format!("open {}", path.display()))?;
+```
+
+That `?` fires on a root-owned device node and returns before the device check
+is reached, so `open_source_for_reading` never runs. The total absence of log
+output was the tell: the failure landed before the first `log::` call on the
+device path, which is why the error carried no `authopen` context.
+
+The check now sits immediately after `is_container_path`, above every content
+probe — a raw device is never a container, an encrypted DMG or an NDIF fork
+carrier, so none of those probes has anything to say about one.
+`try_decode_dart` escaped the same bug only by accident: it reads
+`metadata(path).len()`, which is 0 for a character device, so it returns early
+under its own 84-byte floor.
 
 ### R-068 — the CLI never elevates for a raw device {#r-068}
 
