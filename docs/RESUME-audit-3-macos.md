@@ -105,3 +105,18 @@ First Aid in Mini vMac, the image is built. Step 5: 152 s, 2.35 GB peak
 (`docs/build-memory-crashes.md`). This was the last leg; the audit's Low
 items live in the findings list only. The HFS follow-ups and the hardware
 checks continue in `docs/RESUME-hfs-snow.md`.
+
+Hardware close-out, 2026-09-08: all four remaining checks PASS — R6 against
+an SD card held read-only by its lock switch (read path escalates read-only
+and says why; `restore --device --yes` refuses with the write-path message
+before touching the device), R11 against a live cancel on the USB floppy
+(one dialog, no read-only retry, and on the `O_RDWR` path where the
+`!is_authorization_cancelled` guard actually runs), R19 against the floppy
+itself (1474560 bytes and an HFS superfloppy, not `0 B`), and section 3's
+read-only fallback via an authopen timeout rather than the predicted
+mounted-card EBUSY. Getting there needed two new fixes: R-068 (the CLI
+never elevated for a raw device) and R-069 (a content probe opened the
+device before the elevation path could run, which made R-068's fix
+unreachable). The TEMP-DIAG instrumentation was gated on R6 and is now
+removed. Details and exact log lines are in the verification table in
+`docs/Regression_Bugs.md`.

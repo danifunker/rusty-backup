@@ -101,6 +101,15 @@ pub fn run(args: RestoreArgs) -> Result<()> {
             None
         };
 
+    if device_target_needs_flag(&args.target, args.device) {
+        bail!(
+            "{} is a device path, but --device was not given, so it would be written \
+             as if it were an image file — skipping the safety preflight, the unmount \
+             and the write-protect check. Pass --device --yes to restore to it, or \
+             give an image-file path.",
+            args.target.display()
+        );
+    }
     if args.device && !args.yes {
         bail!(
             "--device target requires --yes (this will overwrite {}).",
@@ -346,5 +355,41 @@ fn parse_alignment_mode(s: &str) -> Option<AlignmentMode> {
         "original" => Some(AlignmentMode::Original),
         "modern1mb" | "modern-1mb" => Some(AlignmentMode::Modern1mb),
         _ => None,
+    }
+}
+
+/// Whether a restore target must be refused for want of `--device`.
+///
+/// Without the flag `run_restore` takes its image-file arm and create/truncates
+/// the target, which on a device node skips the safety preflight, the unmount,
+/// the disk claim and the write-protect bail while still writing (R-070).
+fn device_target_needs_flag(target: &std::path::Path, device_flag: bool) -> bool {
+    !device_flag && crate::cli::device_safety::looks_like_device_path(target)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn a_device_target_without_the_flag_is_refused() {
+        for p in [
+            "/dev/disk4",
+            "/dev/rdisk4",
+            "/dev/sda",
+            r"\\.\PhysicalDrive0",
+        ] {
+            assert!(
+                device_target_needs_flag(Path::new(p), false),
+                "{p} should need --device"
+            );
+        }
+    }
+
+    #[test]
+    fn the_flag_and_ordinary_image_paths_are_allowed() {
+        assert!(!device_target_needs_flag(Path::new("/dev/disk4"), true));
+        assert!(!device_target_needs_flag(Path::new("/tmp/out.img"), false));
     }
 }

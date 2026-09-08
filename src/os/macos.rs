@@ -933,63 +933,6 @@ fn log_read_only_open(path: &str, file: &File, rw_errno: i32) {
     }
 }
 
-/// TEMP-DIAG: report what access we hold on `path` right now, without
-/// escalating. Tracking down a macOS restore that fails with EACCES at the very
-/// end after an earlier authopen succeeded. Remove with the rest of TEMP-DIAG
-/// once that's understood — grep the tag.
-pub fn probe_device_access(path: &str) -> Vec<String> {
-    let raw = raw_device_path(path);
-    let mut out = Vec::new();
-
-    out.push(format!(
-        "[perm] euid={} ({}), can show an auth prompt: {}",
-        unsafe { libc::geteuid() },
-        if running_as_root() {
-            "root"
-        } else {
-            "not elevated"
-        },
-        if session_can_prompt() { "yes" } else { "no" },
-    ));
-
-    // Plain open(2) only — probing must never raise a dialog of its own, or it
-    // would change the very thing it is measuring.
-    for (label, flags) in [("O_RDONLY", libc::O_RDONLY), ("O_RDWR", libc::O_RDWR)] {
-        let Ok(c_path) = CString::new(raw.as_str()) else {
-            continue;
-        };
-        let fd = unsafe { libc::open(c_path.as_ptr(), flags) };
-        if fd >= 0 {
-            unsafe { libc::close(fd) };
-            out.push(format!("[perm] {raw}: {label} ok"));
-        } else {
-            let err = std::io::Error::last_os_error();
-            out.push(format!(
-                "[perm] {raw}: {label} failed - {} (errno {})",
-                err,
-                err.raw_os_error().unwrap_or(0),
-            ));
-        }
-    }
-
-    let cached = ELEVATED_DEVICES
-        .lock()
-        .map(|c| {
-            c.iter()
-                .filter(|(p, _, _)| p == &raw)
-                .map(|(_, w, _)| if *w { "read-write" } else { "read-only" })
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
-        .unwrap_or_else(|_| "<cache lock poisoned>".to_string());
-    out.push(format!(
-        "[perm] {raw}: cached elevated descriptor: {}",
-        if cached.is_empty() { "none" } else { &cached },
-    ));
-
-    out
-}
-
 /// Drop cached descriptors for `path` (all of them when `path` is `None`).
 ///
 /// A held descriptor keeps the raw device open, which blocks a clean eject, so
@@ -1602,11 +1545,14 @@ pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
                 Ok(s) => s,
                 Err(e) if flags != libc::O_RDONLY && !is_authorization_cancelled(&e) => {
                     log::warn!(
-                        "read-write escalation of {raw_device} failed ({e:#});                          retrying read-only"
+                        "read-write escalation of {raw_device} failed ({e:#}); \
+                         retrying read-only"
                     );
                     cached_authopen(&raw_device, libc::O_RDONLY).with_context(|| {
                         format!(
-                            "cannot open {raw_device} for reading: authopen was refused                              read-write and read-only. If a volume on this disk is still                              mounted, eject it in Finder and retry"
+                            "cannot open {raw_device} for reading: authopen was refused \
+                             read-write and read-only. If a volume on this disk is still \
+                             mounted, eject it in Finder and retry"
                         )
                     })?
                 }

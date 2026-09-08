@@ -2588,11 +2588,6 @@ impl BackupTab {
             }
         };
 
-        // TEMP-DIAG: log the access we hold before touching the device.
-        for line in rusty_backup::os::describe_device_access(&source_path) {
-            ctx.log.info(line);
-        }
-
         let partition_filter = if self.selected_partitions.len()
             < self
                 .source_partitions

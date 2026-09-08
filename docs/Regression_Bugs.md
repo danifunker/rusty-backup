@@ -19,6 +19,7 @@ finding depends on a fixture, the fixture is named.
 
 | ID | Severity | Area | Finding |
 |----|----------|------|---------|
+| ~~[R-070](#r-070)~~ | ~~**High**~~ **FIXED** | `src/cli/verbs/restore.rs` | ~~`rb-cli restore` without `--device` treats a `/dev/...` target as an image file and create/truncates it, so a writable device is written raw with no safety preflight, no system-disk guard, no unmount, no disk claim and no write-protect check~~ — a device-shaped target without `--device` is now refused, 2026-09-08 |
 | ~~[R-069](#r-069)~~ | ~~**High**~~ **FIXED** | `src/model/source_reader.rs` | ~~The encrypted-DMG probe opens the source with a plain `File::open` before the raw-device check is reached, so on macOS an unprivileged `rb-cli` device verb still dies with a bare `Permission denied` and R-068's fix never runs~~ — the device check now precedes every content probe, 2026-09-08 |
 | ~~[R-068](#r-068)~~ | ~~**High**~~ **FIXED** | `src/model/source_reader.rs`, `src/os/mod.rs` | ~~The CLI opens a raw device with a plain `File::open` and never elevates, so on macOS — where privilege is escalated per operation through `authopen`, not inherited from the process — every unprivileged `rb-cli` device verb dies with a bare `Permission denied` and no way forward~~ — the CLI device path goes through `open_source_for_reading` like the GUI's, holding the disk claim for the reader's lifetime, 2026-09-08 |
 | ~~R-067~~ | ~~Medium~~ **FIXED** | `src/fs/xfs/fsck.rs` | ~~`rb-cli fsck` reports the bmap-btree blocks of a btree-format inode as leaked (`UnaccountedBlocks`) on a volume `xfs_repair -n` accepts~~ — the block census claimed the fork's extents but not the tree's own blocks, 2026-09-06 |
@@ -35,9 +36,9 @@ finding depends on a fixture, the fixture is named.
 | ~~R-056~~ | ~~**High**~~ **FIXED** | `src/fs/hfsplus.rs` | ~~An in-place HFS+ grow patches two counts and nothing else: the old alternate-header block stays marked, the new one is not, and the allocation file never grows; Disk First Aid reports orphaned blocks and under-allocation on every grown or Minimum-restored volume~~ — the resize moves the header's blocks, grows or relocates the allocation file and recounts, 2026-09-05 |
 | ~~R-055~~ | ~~Medium~~ **FIXED** | `src/fs/hfsplus.rs`, `src/fs/hfs_common.rs` | ~~Deleting the last fragmented file leaves the HFS+ extents-overflow tree as a root leaf with no records; Disk First Aid stops at "Invalid node structure"~~ — an emptied leaf leaves the tree and the last one retires the root, 2026-09-05 |
 | ~~R-054~~ | ~~**High**~~ **FIXED** | `src/fs/hfs_common.rs`, `src/fs/hfsplus.rs`, `src/fs/hfs.rs` | ~~Deleting a leaf's first record leaves its parent's separator on the old key; Disk First Aid reports "Invalid index key" on every HFS+ volume rb-cli deleted from~~ — separators are refreshed up the tree, fsck checks equality, 2026-09-05 |
-| ~~R-053~~ | ~~**High**~~ **FIXED** | `src/os/mod.rs`, `src/model/source_reader.rs` | ~~`rb-cli inspect` on a raw device reads through a plain `BufReader`: unaligned 8 KiB reads, every device reported as 0 B, and a USB floppy drive fails with EIO at sector 0 (audit R19)~~ — devices go through `SectorAlignedReader`, which drops to one sector per read once a larger read is refused, 2026-09-05; floppy confirmation pending |
+| ~~R-053~~ | ~~**High**~~ **FIXED** | `src/os/mod.rs`, `src/model/source_reader.rs` | ~~`rb-cli inspect` on a raw device reads through a plain `BufReader`: unaligned 8 KiB reads, every device reported as 0 B, and a USB floppy drive fails with EIO at sector 0 (audit R19)~~ — devices go through `SectorAlignedReader`, which drops to one sector per read once a larger read is refused, 2026-09-05; confirmed on the USB floppy drive 2026-09-08 |
 | ~~R-052~~ | ~~Medium~~ **FIXED** | `src/os/macos.rs` | ~~A cancelled authorization dialog is reported as "no ancillary control message" and falls through to a second prompt (audit R11)~~ — authopen's two-byte reply and stderr are decoded; ECANCELED is the user's answer, 2026-09-05 |
-| ~~R-051~~ | ~~Medium~~ **FIXED** | `src/os/macos.rs` | ~~A write-protected card's EACCES is taken for missing privilege: the read path prompts read-write, fails, prompts again; the write path blames sudo (audit R6)~~ — read-only tried directly, DKIOCISWRITABLE / DAMediaWritable name the media, 2026-09-05; lock-switch check on hardware pending |
+| ~~R-051~~ | ~~Medium~~ **FIXED** | `src/os/macos.rs` | ~~A write-protected card's EACCES is taken for missing privilege: the read path prompts read-write, fails, prompts again; the write path blames sudo (audit R6)~~ — read-only tried directly, DKIOCISWRITABLE / DAMediaWritable name the media, 2026-09-05; confirmed on a lock-switched SD card 2026-09-08 |
 | ~~R-050~~ | ~~**High**~~ **FIXED** | `src/fs/ntfs.rs` | ~~Every MFT record rb-cli assembles carries a bytes-in-use four bytes short; chkdsk corrects the first free byte of each created file and directory~~ — the end marker counts as eight bytes, 2026-09-03 |
 | ~~R-049~~ | ~~**High**~~ **FIXED** | `src/fs/ntfs.rs` | ~~Every long name rb-cli writes to NTFS is a lone Win32-namespace name, which NTFS allows only beside a DOS alias; chkdsk reports minor file name errors~~ — POSIX namespace, as Windows writes with 8.3 creation off, 2026-09-02 |
 | ~~R-048~~ | ~~**High**~~ **FIXED** | `src/fs/ntfs.rs` | ~~A renamed NTFS entry's index entry carries the old name's creation snapshot and a raw byte count; chkdsk reports minor file name errors and an incorrect `$I30` entry~~ — the copies take the record's live times and the data attribute's real and allocated sizes, 2026-09-02 |
@@ -240,9 +241,11 @@ and callers that ask for a size still get it (4-block floor).
 ## Found during the 2026-09-01 audit, leg 3 (macOS), 2026-09-05
 
 The macOS leg's three findings, each with the cause the fix rests on. No
-removable hardware was attached during the run, so the hardware halves of
-R-051 and R-053 (an SD card's lock switch, the USB floppy drive) stay open;
-both fixes were exercised against `hdiutil`-attached raw images instead.
+removable hardware was attached during the run, so both fixes were exercised
+against `hdiutil`-attached raw images at the time. The hardware halves of
+R-051 and R-053 closed on 2026-09-08 against a lock-switched SD card and the
+USB floppy drive; getting there took two further fixes, R-068 and R-069,
+because the CLI could not reach a raw device unprivileged at all.
 
 ### R-051 — a write-protected card is treated as a privilege problem (audit R6) {#r-051}
 
@@ -298,6 +301,38 @@ through any context layer; `open_device` stops there and the read path's
 read-only retry is skipped after a cancel. Unit tests cover the decode; the
 live cancel on this machine is pending the user, since raising the dialog
 unattended was not an option during the run.
+
+### R-070 — a restore without `--device` writes a device as if it were a file {#r-070}
+
+**FIXED 2026-09-08** (`fix(cli): a device-shaped restore target requires
+--device`). Found while running the R6 write-path check on hardware.
+
+`rb-cli restore <backup> /dev/disk4` — no `--device` — answered
+
+```
+error: restore failed: failed to create /dev/disk4: Permission denied (os error 13)
+```
+
+rather than the write-protect message R6 expects. The bare EACCES, and the
+absence of the device branch's `cannot open ... for writing` context, place the
+failure in `run_restore`'s *image-file* arm: `RestoreConfig::target_is_device`
+comes straight from the `--device` flag, so a `/dev/...` path without it is
+opened with `OpenOptions::create(true).truncate(true)`.
+
+The card was write-protected, which is the only reason this stopped. On a
+writable device — or under `sudo`, where the node's permissions do not bite —
+that arm opens the raw device and writes to it, while `O_TRUNC` is silently
+ignored on a device node. Everything the device path exists to do is skipped:
+`device_safety::preflight` and its system-disk guard, the DiskArbitration
+unmount, the exclusive disk claim, the sector-aligned writer, and
+`open_target_for_writing`'s write-protect bail. `--device`'s own help text
+advertises exactly those as what the flag enables, so omitting it disables
+them while still performing the write.
+
+`is_device_path` already existed to recognise the shape. A restore whose target
+matches it but that was not given `--device` is now refused, naming the flag.
+Auto-enabling device mode was rejected: it would turn a typo into a
+whole-disk overwrite.
 
 ### R-069 — a content probe opens a raw device before the elevation path {#r-069}
 
@@ -591,10 +626,10 @@ PNGs under `docs/evidence/`.
 | Section 5 of `docs/RESUME-hfs-snow.md` | B-tree header attributes | our HFS+ trees carried `attributes = 0`; Apple writes `kBTBigKeysMask \| kBTVariableIndexKeysMask` (6) on the catalog and attributes trees and `kBTBigKeysMask` (2) on the extents tree. `write_blank_btree_header_node` (blank volumes and the defragmenting clone) now does the same; H1 / H3 / H5 / H7-hfsplus re-run | **PASS** (2026-09-05): `fsck_hfs -n` clean on all, 1500 of 1500 files identical through the kernel driver; the bits read back 2 / 6 / 6 | out of scope (HFS+) |
 | Section 7 of `docs/RESUME-hfs-snow.md` | a real-Mac-formatted volume edited by rb-cli | the System 7.1 Finder initializes a blank 5 MiB Apple_HFS partition inside Snow (`scripts/verify-hfs-snow.sh mac-formatted`); rb-cli then `put`s a text file and a binary, `mkdir`s, `mv`s, `rm`s, `setrsrc`s, and `put-binhex`es Disk First Aid; `rb-cli fsck`, `fsck_hfs -n`, Disk First Aid, and the Finder judge it | **PASS** (2026-09-05): `fsck_hfs -n` OK before and after the edits (Mac OS laid the volume out at 512-byte blocks, `drAlBlSt` 6, filling the partition, which our new `AllocationAreaEnd` check accepts) | **PASS**: "The volume snow71 appears to be OK." (`docs/evidence/dfa-mac-formatted.png`); TeachText shows the text file (`finder-mac-formatted-hi.png`) and the Finder launches the rb-cli-written Disk First Aid from that volume, resource fork intact (`finder-mac-formatted-dfa-launch.png`) |
 | H12 | the 1000-file churn with the OS taking the middle turn | rb-cli imports 1000 files; the OS adds one file, deletes it, deletes the 1000; rb-cli adds one more; `fsck_hfs -n` and `rb-cli fsck` after every turn. HFS+: macOS's kernel driver through a read-write mount (`verify-fs-macos.sh -o H12-hfsplus`). Classic HFS: the System 7.1 Finder in Snow, ending with Shut Down so the MDB is flushed (`verify-hfs-snow.sh os-churn`) | HFS+: **PASS** (2026-09-05), OK after each of the three turns, the last file reads back through the kernel driver. HFS: **PASS** after the Finder's turn and after rb-cli's put | HFS: **PASS** both times (`docs/evidence/dfa-h12-finder.png`, `dfa-h12-after.png`). A first run judged the volume before Mac OS had flushed its MDB and drew "needs to be repaired" with stale counts; that frame is the `scripts/snow/dfa-problem.pbm` reference. The same churn with rb-cli alone runs on every filesystem that can hold it: `regression-tests/cases/tier3/churn.toml` (it found R-060 .. R-067 and F-012 .. F-018) |
-| R6 | 5f1fd54, write-protected media | `hdiutil attach -readonly` raw image, `rb-cli backup /dev/diskN` | **PASS**: logs "is write-protected ... opened read-only", raises no prompt. A card's lock switch is pending hardware | - |
-| R11 | f2edc77, cancelled dialog | unit tests on the decoded two-byte reply | a live cancel is pending the user (no dialog was raised unattended) | - |
-| R19 | 0093c49, raw-device reads | raw hdiutil device through `rb-cli inspect`: 0 B before, the real size after; unit tests on a device that refuses large reads | the USB floppy drive itself is pending hardware | - |
-| Section 3 | 63e8d3f, read-only fallback after a refused read-write escalation | needs a card mounted while Inspect opens it | pending hardware | - |
+| R6 | 5f1fd54, write-protected media | `hdiutil attach -readonly` raw image, `rb-cli backup /dev/diskN`; then an SD card held read-only by its lock switch (`Media Read-Only: Yes`, node published `cr--r-----`) through `rb-cli inspect` and `rb-cli restore --device --yes` | **PASS** (hardware, 2026-09-08): the read path logs `/dev/rdisk4 is write-protected; escalating read-only, a restore to it cannot work`, escalates read-only and parses the MBR, raising no second prompt; the write path refuses with `/dev/disk4 is write-protected (media lock switch or read-only image); it cannot be written to` without touching the device. It is the escalation-path message that fires, not `log_read_only_open`'s, because a root-owned node escalates before any direct open can succeed — the doc's quoted wording belongs to the direct-open case | - |
+| R11 | f2edc77, cancelled dialog | unit tests on the decoded two-byte reply; then a live cancel against the USB floppy's raw device | **PASS** (hardware, 2026-09-08): one dialog only, `authopen refused /dev/rdisk5: administrator authorization was cancelled`, and no second prompt. The media was writable, so `read_escalation_flags` asked for `O_RDWR` and the fallback arm's `!is_authorization_cancelled` guard is what suppressed the read-only retry — the weaker read-only path would have skipped that guard entirely | - |
+| R19 | 0093c49, raw-device reads | raw hdiutil device through `rb-cli inspect`: 0 B before, the real size after; unit tests on a device that refuses large reads; then the USB floppy drive itself | **PASS** (hardware, 2026-09-08): `inspect /dev/rdisk5` reports 1.4 MiB (1474560 bytes), not `0 B`, and detects the HFS superfloppy; `ls` lists the volume's real contents. `read_after_refusal` never fired — this drive serves large reads, which the check allows for | - |
+| Section 3 | 63e8d3f, read-only fallback after a refused read-write escalation | a read-write escalation that fails for any non-cancel reason | **PASS** (hardware, 2026-09-08): `authopen did not respond within 120s`, so the guard took the fallback arm — `read-write escalation of /dev/rdisk5 failed (...); retrying read-only` — and the read-only retry succeeded, listing the volume. The trigger was an authopen timeout rather than the mounted-card EBUSY originally predicted; the same guard and the same fallback | - |
 | Section 5 | build sanity | `cargo test --no-run` with no `target/` at all | 152 s wall, 2.35 GB largest resident set, 62 MB lib-test binary; noted in `docs/build-memory-crashes.md` | - |
 
 ## Found during the 2026-09-01 audit, leg 2 (Windows), 2026-09-02

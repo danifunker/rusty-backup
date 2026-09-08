@@ -1847,12 +1847,6 @@ impl RestoreTab {
         ctx.log
             .info(format!("Starting restore to {}", target_path.display(),));
 
-        // TEMP-DIAG: log the access we hold before touching the device, so a
-        // late "Permission denied" can be traced back to the starting state.
-        for line in rusty_backup::os::describe_device_access(&target_path) {
-            ctx.log.info(line);
-        }
-
         rusty_backup::model::worker::spawn_guarded(
             Arc::clone(&progress_arc),
             "disk restore",

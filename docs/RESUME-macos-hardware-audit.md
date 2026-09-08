@@ -1,5 +1,17 @@
 # RESUME: close the four macOS hardware checks
 
+> **DONE 2026-09-08. All four checks PASS.** Kept for the reproductions and
+> the hardware notes; nothing here is outstanding. Results and the exact log
+> lines are in the verification table in `docs/Regression_Bugs.md`, and the
+> narrative is in the status block at the end of `docs/RESUME-audit-3-macos.md`.
+>
+> Two fixes were needed before any check could run: **R-068** (the CLI never
+> elevated for a raw device) and **R-069** (the encrypted-DMG probe opened the
+> device with a plain `File::open` before the raw-device check, so R-068's fix
+> never ran). The floppy turned out to be readable after all — the 800K disk
+> below could not be read, but a 1.44MB Mac-formatted one was. TEMP-DIAG has
+> been removed.
+
 Everything in the 2026-09-01 audit is shipped and merged. Four verification
 checks remain, and every one of them needs removable media and a human at the
 keyboard — they cannot be run unattended, which is why they have survived two
@@ -56,7 +68,12 @@ condition, so note it now.
   returned nothing at all. A read then fails with **ENXIO (os error 6),
   "Device not configured"** — which reads like a driver refusing the transfer
   but is really "there is no device". Re-seat the drive and re-check
-  `diskutil list external` before believing any read failure.
+  `diskutil list external` before believing any read failure. It did this four
+  more times across the 2026-09-08 session, twice while rusty-backup held the
+  DA claim and once between a `diskutil list` and the `diskutil info` a second
+  later; ENOENT (os error 2) is the same event caught at open() instead. We
+  issue no eject — only DA unmount and claim — so treat it as the drive, but
+  expect any single hardware run to be interrupted by it.
 - **ENXIO is not EIO.** R-053's original note recorded EIO at sector 0. If you
   get ENXIO instead, suspect the bus, not the read path.
 - **800K Mac floppies cannot be read at all** by a PC USB floppy drive: they
