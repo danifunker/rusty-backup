@@ -23,7 +23,7 @@ so unlike the PowerPC Mac build it can run unattended in the release pipeline.
 Its base image is the exception to the one-liner above: it needs a Solaris 9
 sysroot, which Sun does not permit redistributing, so the image cannot be
 published and has to be built once from a Solaris 9 sysroot (`docker/sol9-cross/`,
-which CI fetches via the `SOL9_SYSROOT_URL` secret; `Notes/SolarisSysroot.md` in the
+which CI fetches via the `SOL9_SPARC64_SYSROOT_URL` secret; `Notes/SolarisSysroot.md` in the
 mrustc tree builds one from scratch). Full recipe in
 `docker/sol9.Dockerfile` and [`docs/build-sol9-mrustc.md`](../docs/build-sol9-mrustc.md).
 Verified on a Sun Blade 2500 (SunOS 5.9, sun4u): both parity gates agree with
