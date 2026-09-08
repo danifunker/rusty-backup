@@ -798,11 +798,25 @@ fn find_child(
     parent: &FileEntry,
     name: &str,
 ) -> Result<Option<FileEntry>> {
-    Ok(dst
+    let fold_case = dst.case_insensitive_lookup();
+    let children = dst
         .list_directory(parent)
-        .map_err(|e| anyhow!("list_directory {}: {e}", parent.path))?
-        .into_iter()
-        .find(|e| e.name == name))
+        .map_err(|e| anyhow!("list_directory {}: {e}", parent.path))?;
+    Ok(select_child(&children, fold_case, name).cloned())
+}
+
+/// The child called `name`, matched the way the filesystem itself would
+/// (`fold_case` is its `case_insensitive_lookup`); an exact match wins first.
+pub fn select_child<'a>(
+    children: &'a [FileEntry],
+    fold_case: bool,
+    name: &str,
+) -> Option<&'a FileEntry> {
+    children.iter().find(|c| c.name == name).or_else(|| {
+        fold_case
+            .then(|| children.iter().find(|c| c.name.eq_ignore_ascii_case(name)))
+            .flatten()
+    })
 }
 
 fn list_children(src: &mut dyn Filesystem, dir: &FileEntry) -> Result<Vec<FileEntry>> {
@@ -813,6 +827,33 @@ fn list_children(src: &mut dyn Filesystem, dir: &FileEntry) -> Result<Vec<FileEn
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A FAT driver refuses `readme.txt` next to `README.TXT`, so a lookup that
+    /// only matched exactly told `--force` there was nothing to replace.
+    #[test]
+    fn select_child_follows_the_filesystem_case_rules() {
+        let children = vec![
+            FileEntry::new_file("README.TXT".to_string(), "/README.TXT".to_string(), 0, 3),
+            FileEntry::new_file("notes".to_string(), "/notes".to_string(), 0, 4),
+        ];
+        assert!(crate::fs::filesystem::folds_case("FAT16"));
+        assert!(crate::fs::filesystem::folds_case("HFS+"));
+        assert!(!crate::fs::filesystem::folds_case("HFSX"));
+        assert!(!crate::fs::filesystem::folds_case("ext4"));
+        assert_eq!(
+            select_child(&children, true, "readme.txt").map(|e| e.name.as_str()),
+            Some("README.TXT")
+        );
+        assert_eq!(
+            select_child(&children, true, "Notes").map(|e| e.name.as_str()),
+            Some("notes")
+        );
+        assert!(select_child(&children, false, "readme.txt").is_none());
+        assert_eq!(
+            select_child(&children, false, "notes").map(|e| e.name.as_str()),
+            Some("notes")
+        );
+    }
 
     /// Disk-to-disk copy of a Mac file must preserve its Finder flags
     /// (`fdFlags`), so harvested apps keep their hasBundle/custom-icon bits.

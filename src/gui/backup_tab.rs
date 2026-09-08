@@ -103,6 +103,8 @@ pub struct BackupTab {
     partition_load_error: Option<String>,
     /// Change detection for auto-load
     prev_device_idx: Option<usize>,
+    /// Identity of the device behind `prev_device_idx` when it was loaded.
+    prev_device_identity: Option<rusty_backup::device::DeviceIdentity>,
     prev_image_path: Option<PathBuf>,
     /// VHD backup popup state
     vhd_popup_open: bool,
@@ -156,6 +158,13 @@ struct RemoteOpStatus {
     )>,
     /// load-source result.
     loaded: Option<rusty_backup::model::backup_remote::RemoteSourceInfo>,
+}
+
+impl rusty_backup::model::worker::WorkerStatus for RemoteOpStatus {
+    fn fail(&mut self, message: String) {
+        self.error = Some(message);
+        self.finished = true;
+    }
 }
 
 /// Per-partition size config for VHD backup popup.
@@ -235,6 +244,7 @@ impl Default for BackupTab {
             pending_backup_after_min_sizes: false,
             partition_load_error: None,
             prev_device_idx: None,
+            prev_device_identity: None,
             prev_image_path: None,
             vhd_popup_open: false,
             vhd_whole_disk: true,
@@ -247,6 +257,21 @@ impl Default for BackupTab {
 }
 
 impl BackupTab {
+    /// A backup or whole-disk VHD export is in flight.
+    pub fn is_running(&self) -> bool {
+        self.backup_running || self.vhd_export_status.is_some()
+    }
+
+    /// Drain the workers while another tab is showing, so a job keeps
+    /// reporting and its completion is not missed after a tab switch.
+    pub fn poll_background(&mut self, ctx: &mut TabContext, progress: &mut ProgressState) {
+        self.poll_progress(ctx, progress);
+        self.poll_vhd_export(ctx, progress);
+        #[cfg(feature = "remote")]
+        self.poll_remote(ctx);
+        self.poll_min_size_calcs(ctx);
+    }
+
     pub fn show(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext, progress: &mut ProgressState) {
         // Poll background backup thread
         self.poll_progress(ctx, progress);
@@ -271,7 +296,13 @@ impl BackupTab {
         ui.heading("Backup Disk");
         ui.add_space(8.0);
 
-        let controls_enabled = !self.backup_running;
+        if let Some(tab) = ctx.busy_elsewhere {
+            ui.colored_label(
+                super::theme::warning(ui.visuals()),
+                super::context::busy_elsewhere_notice(tab),
+            );
+        }
+        let controls_enabled = !self.backup_running && ctx.busy_elsewhere.is_none();
 
         // Source device / image
         ui.horizontal(|ui| {
@@ -431,29 +462,51 @@ impl BackupTab {
         // Auto-load partition info when source changes (local sources only —
         // a remote source loads its own partitions via the device picker).
         if !self.backup_running && !self.remote_active() {
+            // "Refresh Devices" can put another disk, or nothing, at this index.
+            let mut device_identity =
+                rusty_backup::device::identity_at(ctx.devices, self.selected_device_idx);
+            if self.selected_device_idx.is_some() && device_identity.is_none() {
+                ctx.log
+                    .warn("The selected source device is no longer listed; clearing it.");
+                self.selected_device_idx = None;
+                device_identity = None;
+            }
             let source_changed = self.selected_device_idx != self.prev_device_idx
+                || device_identity != self.prev_device_identity
                 || self.image_file_path != self.prev_image_path;
             if source_changed {
                 self.prev_device_idx = self.selected_device_idx;
+                self.prev_device_identity = device_identity;
                 self.prev_image_path = self.image_file_path.clone();
+                // A Start Backup waiting on the old source's minimum sizes must
+                // not fire on the new one the moment its (empty) map clears.
+                self.pending_backup_after_min_sizes = false;
                 self.load_partition_preview(ctx);
             }
         }
 
-        // Show partition selection checkboxes
-        // For devices we don't auto-scan (would prompt for elevation on every
-        // dropdown change). Offer a button to load partitions on demand.
+        // Devices are not auto-scanned (that would prompt for elevation on every
+        // dropdown change); the button stays so a swapped card can be re-read.
         if !self.backup_running
-            && self.source_partitions.is_empty()
-            && self.partition_load_error.is_none()
             && self.selected_device_idx.is_some()
             && self.image_file_path.is_none()
         {
+            let populated =
+                !self.source_partitions.is_empty() || self.partition_load_error.is_some();
+            let (label, hint) = if populated {
+                (
+                    "Reload partition info",
+                    "Read the partition table again, e.g. after swapping the card in this reader",
+                )
+            } else {
+                (
+                    "Load partition info",
+                    "Read the partition table from the selected device (may prompt for administrator credentials)",
+                )
+            };
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                if ui.button("Load partition info").on_hover_text(
-                    "Read the partition table from the selected device (may prompt for administrator credentials)",
-                ).clicked() {
+                if ui.button(label).on_hover_text(hint).clicked() {
                     self.scan_source_partitions(ctx);
                 }
             });
@@ -506,7 +559,7 @@ impl BackupTab {
                             .on_hover_text(
                                 "Compact Space re-emits every allocated fork back-to-back, \
                                  closing the holes between files and producing a smaller backup. \
-                                 Drastically increases backup time — recommended only when the \
+                                 Drastically increases backup time - recommended only when the \
                                  Min Size column shows meaningful savings vs. the in-place trim. \
                                  Available for HFS+/HFSX today; other layout-preserving \
                                  filesystems show the toggle as not implemented.",
@@ -535,7 +588,7 @@ impl BackupTab {
                             // or blank.
                             let effective = self.effective_min_size(
                                 part.index,
-                                part.partition_type_byte,
+                                part.gate_type_byte(),
                                 part.partition_type_string.as_deref(),
                             );
                             if let Some(min) = effective.filter(|&sz| sz < part.size_bytes) {
@@ -577,7 +630,7 @@ impl BackupTab {
                             // (with "not implemented" tooltip) when the FS
                             // doesn't have a clone pipeline yet.
                             let is_layout = fs::is_layout_preserving_fs(
-                                part.partition_type_byte,
+                                part.gate_type_byte(),
                                 part.partition_type_string.as_deref(),
                             );
                             // Compact/Defrag is live when the FS has a registered
@@ -586,7 +639,7 @@ impl BackupTab {
                             // trim (exFAT today; NTFS once its packer lands).
                             let available = self.defrag_clone_available(
                                 part.index,
-                                part.partition_type_byte,
+                                part.gate_type_byte(),
                                 part.partition_type_string.as_deref(),
                             );
                             if is_layout || available {
@@ -800,7 +853,8 @@ impl BackupTab {
                 } else {
                     "Start Backup"
                 };
-                let button_enabled = can_start && !self.pending_backup_after_min_sizes;
+                let button_enabled =
+                    can_start && !self.pending_backup_after_min_sizes && ctx.busy_elsewhere.is_none();
                 if ui
                     .add_enabled(button_enabled, egui::Button::new(button_label))
                     .clicked()
@@ -984,7 +1038,13 @@ impl BackupTab {
                 ui.add_space(8.0);
 
                 ui.horizontal(|ui| {
-                    if ui.button("Start VHD Backup").clicked() {
+                    if ui
+                        .add_enabled(
+                            ctx.busy_elsewhere.is_none(),
+                            egui::Button::new("Start VHD Backup"),
+                        )
+                        .clicked()
+                    {
                         self.vhd_popup_open = false;
                         if self.vhd_whole_disk {
                             self.start_vhd_whole_disk(ctx);
@@ -1053,35 +1113,36 @@ impl BackupTab {
             dest_path.display()
         ));
 
-        std::thread::spawn(move || {
-            let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: whole-disk VHD backup");
-            let status2 = Arc::clone(&status);
-            let status3 = Arc::clone(&status);
-            let result = export_whole_disk_vhd(
-                &source_path,
-                None,
-                None,
-                &overrides,
-                &dest_path,
-                move |bytes| {
-                    if let Ok(mut s) = status2.lock() {
-                        s.current_bytes = bytes;
-                    }
-                },
-                move || status3.lock().map(|s| s.cancel_requested).unwrap_or(false),
-                |msg| {
-                    if let Ok(mut s) = status.lock() {
-                        s.log_messages.push(msg.to_string());
-                    }
-                },
-            );
-            if let Ok(mut s) = status.lock() {
-                s.finished = true;
-                if let Err(e) = result {
-                    s.error = Some(format!("{e:#}"));
-                }
-            }
-        });
+        rusty_backup::model::worker::spawn_guarded(
+            Arc::clone(&status),
+            "whole-disk VHD backup",
+            move || {
+                let _wake =
+                    rusty_backup::os::wakelock::acquire("Rusty Backup: whole-disk VHD backup");
+                let status2 = Arc::clone(&status);
+                let status3 = Arc::clone(&status);
+                export_whole_disk_vhd(
+                    &source_path,
+                    None,
+                    None,
+                    &overrides,
+                    &dest_path,
+                    move |bytes| {
+                        if let Ok(mut s) = status2.lock() {
+                            s.current_bytes = bytes;
+                        }
+                    },
+                    move || status3.lock().map(|s| s.cancel_requested).unwrap_or(false),
+                    |msg| {
+                        if let Ok(mut s) = status.lock() {
+                            s.log_messages.push(msg.to_string());
+                        }
+                    },
+                )?;
+                rusty_backup::model::worker::lock_status(&status).finished = true;
+                Ok(())
+            },
+        );
     }
 
     fn poll_vhd_export(&mut self, ctx: &mut TabContext, progress_state: &mut ProgressState) {
@@ -1090,9 +1151,7 @@ impl BackupTab {
             None => return,
         };
 
-        let Ok(mut status) = status_arc.lock() else {
-            return;
-        };
+        let mut status = rusty_backup::model::worker::lock_status(&status_arc);
 
         // Drain log messages
         for msg in status.log_messages.drain(..) {
@@ -1189,10 +1248,7 @@ impl BackupTab {
                 .get(&part_index)
                 .copied()
                 .unwrap_or_else(|| {
-                    fs::fs_name_for(
-                        part.partition_type_byte,
-                        part.partition_type_string.as_deref(),
-                    )
+                    fs::fs_name_for(part.gate_type_byte(), part.partition_type_string.as_deref())
                 });
             ctx.log.info(format!(
                 "Calculating minimum size for partition {part_index} ({fs_name}) over the wire...",
@@ -1950,15 +2006,14 @@ impl BackupTab {
         self.remote.status = Some(Arc::clone(&status));
         self.remote.error = None;
         self.remote.addr = Some(addr.clone());
-        std::thread::spawn(move || {
-            let result = rusty_backup::model::backup_remote::connect_and_list_devices(&addr);
-            if let Ok(mut s) = status.lock() {
-                match result {
-                    Ok((conn, devices)) => s.connected = Some((conn, devices)),
-                    Err(e) => s.error = Some(format!("{e:#}")),
-                }
-                s.finished = true;
-            }
+        let status_done = Arc::clone(&status);
+        rusty_backup::model::worker::spawn_guarded(status, "remote connect", move || {
+            let (conn, devices) =
+                rusty_backup::model::backup_remote::connect_and_list_devices(&addr)?;
+            let mut s = rusty_backup::model::worker::lock_status(&status_done);
+            s.connected = Some((conn, devices));
+            s.finished = true;
+            Ok(())
         });
     }
 
@@ -1972,16 +2027,14 @@ impl BackupTab {
         let status = Arc::new(Mutex::new(RemoteOpStatus::default()));
         self.remote.status = Some(Arc::clone(&status));
         self.remote.error = None;
-        std::thread::spawn(move || {
-            // Backup targets a physical drive on the daemon → is_device = true.
-            let result = rusty_backup::model::backup_remote::load_remote_source(conn, &path, true);
-            if let Ok(mut s) = status.lock() {
-                match result {
-                    Ok(info) => s.loaded = Some(info),
-                    Err(e) => s.error = Some(format!("{e:#}")),
-                }
-                s.finished = true;
-            }
+        let status_done = Arc::clone(&status);
+        rusty_backup::model::worker::spawn_guarded(status, "remote load", move || {
+            // Backup targets a physical drive on the daemon -> is_device = true.
+            let info = rusty_backup::model::backup_remote::load_remote_source(conn, &path, true)?;
+            let mut s = rusty_backup::model::worker::lock_status(&status_done);
+            s.loaded = Some(info);
+            s.finished = true;
+            Ok(())
         });
     }
 
@@ -1993,7 +2046,7 @@ impl BackupTab {
             None => return,
         };
         let (connected, loaded, error) = {
-            let Ok(mut s) = status.lock() else { return };
+            let mut s = rusty_backup::model::worker::lock_status(&status);
             if !s.finished {
                 return;
             }
@@ -2044,7 +2097,7 @@ impl BackupTab {
                 if part.is_extended_container {
                     continue;
                 }
-                let type_byte = part.partition_type_byte;
+                let type_byte = part.gate_type_byte();
                 let type_str = part.partition_type_string.as_deref();
                 if !is_superfloppy && fs::fs_name_for(type_byte, type_str) == "unknown" {
                     continue;
@@ -2124,6 +2177,13 @@ impl BackupTab {
         self.partition_defrag_enabled.clear();
         self.partition_defrag_default_applied.clear();
         self.deferred_min_sizes.clear();
+        // The workers hold their own handle on the drive; ask them to stop at
+        // their next phase so Close Drive actually releases it.
+        for status in self.pending_min_size_calcs.values() {
+            if let Ok(mut s) = status.lock() {
+                s.cancel_requested = true;
+            }
+        }
         self.pending_min_size_calcs.clear();
         self.last_logged_min_size_phase.clear();
         self.source_partition_table_desc = None;
@@ -2132,6 +2192,7 @@ impl BackupTab {
         // Keep prev_* in sync with the now-empty selection so the
         // source-changed detector in `show()` doesn't immediately re-fire.
         self.prev_device_idx = None;
+        self.prev_device_identity = None;
         self.prev_image_path = None;
     }
 
@@ -2411,7 +2472,7 @@ impl BackupTab {
                     .copied()
                     .unwrap_or(false);
                 let has_clone = fs::has_defragmenting_writer(
-                    part.partition_type_byte,
+                    part.gate_type_byte(),
                     part.partition_type_string.as_deref(),
                 );
                 if defrag_enabled && has_clone {
@@ -2419,7 +2480,7 @@ impl BackupTab {
                 }
                 let effective = self.effective_min_size(
                     part.index,
-                    part.partition_type_byte,
+                    part.gate_type_byte(),
                     part.partition_type_string.as_deref(),
                 );
                 let target = match effective {
@@ -2462,7 +2523,7 @@ impl BackupTab {
                 continue;
             }
             if !fs::has_defragmenting_writer(
-                part.partition_type_byte,
+                part.gate_type_byte(),
                 part.partition_type_string.as_deref(),
             ) {
                 continue;
@@ -2481,7 +2542,7 @@ impl BackupTab {
             .filter_map(|p| {
                 self.effective_min_size(
                     p.index,
-                    p.partition_type_byte,
+                    p.gate_type_byte(),
                     p.partition_type_string.as_deref(),
                 )
                 .map(|sz| (p.index, sz))
@@ -2644,9 +2705,7 @@ impl BackupTab {
             None => return,
         };
 
-        let Ok(mut p) = progress_arc.lock() else {
-            return;
-        };
+        let mut p = rusty_backup::model::worker::lock_status(&progress_arc);
 
         // Drain log messages
         while let Some(msg) = p.log_messages.pop_front() {

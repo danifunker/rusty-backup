@@ -12,7 +12,8 @@ use windows::Win32::Security::{
     CheckTokenMembership, CreateWellKnownSid, WinBuiltinAdministratorsSid, PSID,
 };
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, GetDiskFreeSpaceExW, GetLogicalDriveStringsW, GetVolumeInformationW,
+    CreateFileW, FindFirstVolumeW, FindNextVolumeW, FindVolumeClose, GetDiskFreeSpaceExW,
+    GetVolumeInformationW, GetVolumePathNamesForVolumeNameW, QueryDosDeviceW,
     FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows::Win32::System::IO::DeviceIoControl;
@@ -75,19 +76,24 @@ fn lock_and_dismount_volumes(drive_num: u32) -> Result<VolumeLockSet> {
     let volumes = enumerate_volumes();
     let target_volumes: Vec<_> = volumes
         .iter()
-        .filter(|v| v.disk_number == drive_num)
+        .filter(|v| v.disk_numbers.contains(&drive_num))
         .collect();
 
     if target_volumes.is_empty() {
-        log::info!("No mounted volumes found on PhysicalDrive{}", drive_num);
+        log::info!("No volumes found on PhysicalDrive{}", drive_num);
         return Ok(VolumeLockSet::empty());
     }
 
     let mut locked = Vec::new();
 
     for vol in &target_volumes {
-        let volume_path = format!(r"\\.\{}:", vol.drive_letter);
-        log::info!("Locking and dismounting volume {}...", volume_path);
+        // The GUID device name reaches volumes with no drive letter too (R15).
+        let volume_path = vol.device_path();
+        log::info!(
+            "Locking and dismounting volume {} ({})...",
+            vol.display_name(),
+            volume_path
+        );
 
         let handle = match open_device(&volume_path, GENERIC_READ_ACCESS | GENERIC_WRITE_ACCESS) {
             Some(h) => h,
@@ -188,6 +194,48 @@ pub fn is_elevated() -> bool {
     }
 }
 
+/// Quote one argument the way `CommandLineToArgvW` undoes it, so the
+/// relaunched process parses the same argv this one received.
+fn quote_cmdline_arg(arg: &str) -> String {
+    let needs_quotes = arg.is_empty() || arg.chars().any(|c| matches!(c, ' ' | '\t' | '\n' | '"'));
+    if !needs_quotes {
+        return arg.to_string();
+    }
+    let mut out = String::with_capacity(arg.len() + 2);
+    out.push('"');
+    let mut backslashes = 0usize;
+    for c in arg.chars() {
+        match c {
+            '\\' => backslashes += 1,
+            '"' => {
+                // Backslashes before a quote are literal only when doubled.
+                out.extend(crate::compat::repeat_n('\\', backslashes * 2 + 1));
+                out.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                out.extend(crate::compat::repeat_n('\\', backslashes));
+                out.push(c);
+                backslashes = 0;
+            }
+        }
+    }
+    // Trailing backslashes precede the closing quote, so they double too.
+    out.extend(crate::compat::repeat_n('\\', backslashes * 2));
+    out.push('"');
+    out
+}
+
+/// Join arguments into a `lpParameters` string; `None` when there are none.
+fn join_cmdline_args<I: IntoIterator<Item = String>>(args: I) -> Option<String> {
+    let joined: Vec<String> = args.into_iter().map(|a| quote_cmdline_arg(&a)).collect();
+    if joined.is_empty() {
+        None
+    } else {
+        Some(joined.join(" "))
+    }
+}
+
 /// Request elevation by relaunching the application with UAC prompt.
 ///
 /// This uses `ShellExecuteW` with the "runas" verb to trigger the UAC dialog.
@@ -196,6 +244,17 @@ pub fn request_elevation() -> Result<()> {
     let exe_path = env::current_exe().context("failed to get executable path")?;
     let exe_path_wide = to_wide(&exe_path.to_string_lossy());
     let verb = to_wide("runas");
+    // A file-association launch carries the image path in argv (R14); the
+    // elevated instance must see it or the double-clicked file is lost.
+    let params = join_cmdline_args(
+        env::args_os()
+            .skip(1)
+            .map(|a| a.to_string_lossy().into_owned()),
+    );
+    let params_wide = params.as_deref().map(to_wide);
+    let params_ptr = params_wide
+        .as_ref()
+        .map_or(PCWSTR::null(), |w| PCWSTR(w.as_ptr()));
 
     let mut exec_info = SHELLEXECUTEINFOW {
         cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
@@ -203,7 +262,7 @@ pub fn request_elevation() -> Result<()> {
         hwnd: HWND::default(),
         lpVerb: PCWSTR(verb.as_ptr()),
         lpFile: PCWSTR(exe_path_wide.as_ptr()),
-        lpParameters: PCWSTR::null(),
+        lpParameters: params_ptr,
         lpDirectory: PCWSTR::null(),
         nShow: SW_SHOW.0,
         hInstApp: Default::default(),
@@ -396,124 +455,247 @@ fn is_disk_writable(handle: HANDLE) -> bool {
     }
 }
 
-/// Information about a mounted volume (drive letter).
+/// A volume the mount manager knows, lettered or not.
 struct VolumeInfo {
-    drive_letter: char,
-    disk_number: u32,
+    /// `\\?\Volume{GUID}\`, the name every volume query accepts.
+    guid_path: String,
+    /// Drive-letter roots and folder mount points; empty when unmounted.
+    mount_paths: Vec<String>,
+    /// Every physical drive the volume has an extent on (spanned volumes have several).
+    disk_numbers: Vec<u32>,
     filesystem: String,
     total_bytes: u64,
     available_bytes: u64,
 }
 
-/// Enumerate all drive-letter volumes and map each to its physical drive number.
-fn enumerate_volumes() -> Vec<VolumeInfo> {
-    let mut volumes = Vec::new();
-
-    let mut buf = vec![0u16; 512];
-    let len = unsafe { GetLogicalDriveStringsW(Some(&mut buf)) };
-    if len == 0 {
-        return volumes;
+impl VolumeInfo {
+    /// `\\.\Volume{GUID}`: the form `CreateFileW` opens for locking.
+    fn device_path(&self) -> String {
+        volume_device_path(&self.guid_path)
     }
 
-    // Buffer contains null-separated root paths like "C:\", "D:\", ...
-    let drive_roots: Vec<String> = buf[..len as usize]
+    fn drive_letter(&self) -> Option<char> {
+        self.mount_paths
+            .iter()
+            .find_map(|p| drive_letter_of_root(p))
+    }
+
+    /// `X:` when lettered, else the folder mount point, else the GUID name.
+    fn display_name(&self) -> String {
+        if let Some(letter) = self.drive_letter() {
+            return format!("{letter}:");
+        }
+        match self.mount_paths.first() {
+            Some(path) => path.clone(),
+            None => self
+                .guid_path
+                .trim_start_matches(r"\\?\")
+                .trim_end_matches('\\')
+                .to_string(),
+        }
+    }
+}
+
+/// `\\?\Volume{GUID}\` -> `\\.\Volume{GUID}`.
+fn volume_device_path(guid_path: &str) -> String {
+    format!(
+        r"\\.\{}",
+        guid_path.trim_start_matches(r"\\?\").trim_end_matches('\\')
+    )
+}
+
+/// The letter of a `X:\` root; `None` for folder mount points.
+fn drive_letter_of_root(root: &str) -> Option<char> {
+    let mut chars = root.chars();
+    let letter = chars.next()?;
+    let is_root = letter.is_ascii_alphabetic()
+        && chars.next() == Some(':')
+        && chars.next() == Some('\\')
+        && chars.next().is_none();
+    is_root.then(|| letter.to_ascii_uppercase())
+}
+
+/// Decode a NUL-terminated UTF-16 buffer.
+fn wide_to_string(buf: &[u16]) -> String {
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    String::from_utf16_lossy(&buf[..end])
+}
+
+/// Every physical drive the volume at `device_path` has an extent on.
+fn volume_disk_numbers(device_path: &str) -> Vec<u32> {
+    // Desired access 0 is enough for the extents query and needs no admin.
+    let handle = match open_device(device_path, 0) {
+        Some(h) => h,
+        None => return Vec::new(),
+    };
+    let mut ext_buf = vec![0u8; 4096];
+    let mut returned = 0u32;
+    let result = unsafe {
+        DeviceIoControl(
+            handle.0,
+            IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
+            None,
+            0,
+            Some(ext_buf.as_mut_ptr() as *mut c_void),
+            ext_buf.len() as u32,
+            Some(&mut returned),
+            None,
+        )
+    };
+    if result.is_err() || returned < 8 {
+        return Vec::new();
+    }
+    parse_disk_extent_numbers(&ext_buf[..returned as usize])
+}
+
+/// Disk numbers from a VOLUME_DISK_EXTENTS buffer: count at 0, 24-byte extents from 8.
+fn parse_disk_extent_numbers(buf: &[u8]) -> Vec<u32> {
+    let count = u32::from_ne_bytes(buf[0..4].try_into().unwrap_or([0; 4])) as usize;
+    let fit = buf.len().saturating_sub(8) / 24;
+    let mut numbers: Vec<u32> = (0..count.min(fit))
+        .map(|i| {
+            let at = 8 + i * 24;
+            u32::from_ne_bytes(buf[at..at + 4].try_into().unwrap_or([0; 4]))
+        })
+        .collect();
+    numbers.sort_unstable();
+    numbers.dedup();
+    numbers
+}
+
+/// Drive-letter roots and folder mount points of a volume, in mount-manager order.
+fn volume_mount_paths(guid_path: &str) -> Vec<String> {
+    let name = to_wide(guid_path);
+    let mut buf = vec![0u16; 1024];
+    let mut needed = 0u32;
+    let mut ok = unsafe {
+        GetVolumePathNamesForVolumeNameW(PCWSTR(name.as_ptr()), Some(&mut buf), &mut needed)
+    }
+    .is_ok();
+    if !ok && needed as usize > buf.len() {
+        buf = vec![0u16; needed as usize];
+        ok = unsafe {
+            GetVolumePathNamesForVolumeNameW(PCWSTR(name.as_ptr()), Some(&mut buf), &mut needed)
+        }
+        .is_ok();
+    }
+    if !ok {
+        return Vec::new();
+    }
+    buf.split(|&c| c == 0)
+        .filter(|s| !s.is_empty())
+        .map(String::from_utf16_lossy)
+        .collect()
+}
+
+/// Enumerate every mount-manager volume and map each to its physical drives.
+fn enumerate_volumes() -> Vec<VolumeInfo> {
+    let mut volumes = Vec::new();
+    let mut name = [0u16; 64];
+    let find = match unsafe { FindFirstVolumeW(&mut name) } {
+        Ok(h) => h,
+        Err(_) => return volumes,
+    };
+    loop {
+        let guid_path = wide_to_string(&name);
+        if let Some(v) = query_volume(&guid_path) {
+            volumes.push(v);
+        }
+        if unsafe { FindNextVolumeW(find, &mut name) }.is_err() {
+            break;
+        }
+    }
+    unsafe {
+        let _ = FindVolumeClose(find);
+    }
+    volumes
+}
+
+/// Describe one volume; `None` when it has no extent on a physical drive (optical, RAM disk).
+fn query_volume(guid_path: &str) -> Option<VolumeInfo> {
+    let disk_numbers = volume_disk_numbers(&volume_device_path(guid_path));
+    if disk_numbers.is_empty() {
+        return None;
+    }
+    let mount_paths = volume_mount_paths(guid_path);
+
+    let root_wide = to_wide(guid_path);
+    let mut fs_name_buf = vec![0u16; 64];
+    let filesystem = unsafe {
+        if GetVolumeInformationW(
+            PCWSTR(root_wide.as_ptr()),
+            None,
+            None,
+            None,
+            None,
+            Some(&mut fs_name_buf),
+        )
+        .is_ok()
+        {
+            wide_to_string(&fs_name_buf)
+        } else {
+            String::new()
+        }
+    };
+
+    let mut free_to_caller: u64 = 0;
+    let mut total_bytes: u64 = 0;
+    unsafe {
+        let _ = GetDiskFreeSpaceExW(
+            PCWSTR(root_wide.as_ptr()),
+            Some(&mut free_to_caller),
+            Some(&mut total_bytes),
+            None,
+        );
+    }
+
+    Some(VolumeInfo {
+        guid_path: guid_path.to_string(),
+        mount_paths,
+        disk_numbers,
+        filesystem,
+        total_bytes,
+        available_bytes: free_to_caller,
+    })
+}
+
+/// Every `PhysicalDriveN` the MS-DOS device namespace lists, in numeric order.
+fn physical_drive_numbers() -> Vec<u32> {
+    let mut buf = vec![0u16; 64 * 1024];
+    loop {
+        let len = unsafe { QueryDosDeviceW(PCWSTR::null(), Some(&mut buf)) };
+        if len > 0 {
+            return physical_drive_numbers_from_names(&buf[..len as usize]);
+        }
+        // ERROR_INSUFFICIENT_BUFFER is the only retryable failure; cap the growth.
+        if buf.len() >= 8 * 1024 * 1024 {
+            break;
+        }
+        let grown = buf.len() * 4;
+        buf = vec![0u16; grown];
+    }
+    log::warn!("QueryDosDevice failed; probing PhysicalDrive0..15 instead");
+    (0..16).collect()
+}
+
+/// Pick the `PhysicalDriveN` entries out of a NUL-separated device-name list.
+fn physical_drive_numbers_from_names(names: &[u16]) -> Vec<u32> {
+    let mut numbers: Vec<u32> = names
         .split(|&c| c == 0)
         .filter(|s| !s.is_empty())
         .map(String::from_utf16_lossy)
+        .filter_map(|n| drive_number_from_path(&format!(r"\\.\{n}")))
         .collect();
-
-    for root in &drive_roots {
-        let letter = match root.chars().next() {
-            Some(c) if c.is_ascii_alphabetic() => c,
-            _ => continue,
-        };
-
-        // Open \\.\X: to query which physical drive this volume lives on
-        let volume_path = format!(r"\\.\{}:", letter);
-        let disk_number = match open_device(&volume_path, GENERIC_READ_ACCESS) {
-            Some(vol_handle) => {
-                let mut ext_buf = [0u8; 256];
-                let mut returned = 0u32;
-                let result = unsafe {
-                    DeviceIoControl(
-                        vol_handle.0,
-                        IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
-                        None,
-                        0,
-                        Some(ext_buf.as_mut_ptr() as *mut c_void),
-                        ext_buf.len() as u32,
-                        Some(&mut returned),
-                        None,
-                    )
-                };
-                if result.is_err() || returned < 12 {
-                    continue;
-                }
-                // VOLUME_DISK_EXTENTS layout:
-                //   offset 0: NumberOfDiskExtents (u32)
-                //   offset 8: first DISK_EXTENT.DiskNumber (u32, after alignment padding)
-                let num = u32::from_ne_bytes(ext_buf[0..4].try_into().unwrap_or([0; 4]));
-                if num == 0 {
-                    continue;
-                }
-                u32::from_ne_bytes(ext_buf[8..12].try_into().unwrap_or([0; 4]))
-            }
-            None => continue,
-        };
-
-        // Query filesystem name
-        let root_wide = to_wide(root);
-        let mut fs_name_buf = vec![0u16; 64];
-        let fs_name = unsafe {
-            if GetVolumeInformationW(
-                PCWSTR(root_wide.as_ptr()),
-                None,
-                None,
-                None,
-                None,
-                Some(&mut fs_name_buf),
-            )
-            .is_ok()
-            {
-                let end = fs_name_buf
-                    .iter()
-                    .position(|&c| c == 0)
-                    .unwrap_or(fs_name_buf.len());
-                String::from_utf16_lossy(&fs_name_buf[..end])
-            } else {
-                String::new()
-            }
-        };
-
-        // Query disk space
-        let mut free_to_caller: u64 = 0;
-        let mut total_bytes: u64 = 0;
-        unsafe {
-            let _ = GetDiskFreeSpaceExW(
-                PCWSTR(root_wide.as_ptr()),
-                Some(&mut free_to_caller),
-                Some(&mut total_bytes),
-                None,
-            );
-        }
-
-        volumes.push(VolumeInfo {
-            drive_letter: letter,
-            disk_number,
-            filesystem: fs_name,
-            total_bytes,
-            available_bytes: free_to_caller,
-        });
-    }
-
-    volumes
+    numbers.sort_unstable();
+    numbers.dedup();
+    numbers
 }
 
 /// Enumerate physical disk devices on Windows.
 ///
-/// Probes `\\.\PhysicalDrive0` through `\\.\PhysicalDrive15` using
-/// `CreateFileW` and `DeviceIoControl`, then maps mounted volumes
-/// (drive letters) to their parent physical drives.
+/// Opens every `\\.\PhysicalDriveN` the MS-DOS device namespace lists,
+/// queries it with `DeviceIoControl`, then maps each mount-manager volume,
+/// lettered or not, to the physical drives it has extents on.
 ///
 /// In debug builds, if not elevated, automatically requests elevation via UAC.
 pub fn enumerate_devices() -> Vec<DiskDevice> {
@@ -535,20 +717,29 @@ pub fn enumerate_devices() -> Vec<DiskDevice> {
 
     let volumes = enumerate_volumes();
 
-    // Group volumes by physical drive number
+    // Group volumes by physical drive number; a spanned volume lands in several.
     let mut vol_map: HashMap<u32, Vec<&VolumeInfo>> = HashMap::new();
     for vol in &volumes {
-        vol_map.entry(vol.disk_number).or_default().push(vol);
+        for disk in &vol.disk_numbers {
+            vol_map.entry(*disk).or_default().push(vol);
+        }
     }
 
-    let c_drive_disk = volumes
+    // The system disk is whichever carries the Windows drive, usually C:.
+    let system_letter = env::var("SystemDrive")
+        .ok()
+        .and_then(|d| d.chars().next())
+        .map(|c| c.to_ascii_uppercase())
+        .unwrap_or('C');
+    let system_disks: Vec<u32> = volumes
         .iter()
-        .find(|v| v.drive_letter == 'C')
-        .map(|v| v.disk_number);
+        .filter(|v| v.drive_letter() == Some(system_letter))
+        .flat_map(|v| v.disk_numbers.iter().copied())
+        .collect();
 
     let mut devices = Vec::new();
 
-    for i in 0..16u32 {
+    for i in physical_drive_numbers() {
         let drive_path = format!(r"\\.\PhysicalDrive{i}");
         let handle = match open_device(&drive_path, GENERIC_READ_ACCESS) {
             Some(h) => h,
@@ -558,15 +749,15 @@ pub fn enumerate_devices() -> Vec<DiskDevice> {
         let size_bytes = query_disk_size(handle.0).unwrap_or(0);
         let (is_removable, bus_protocol, media_name) = query_device_properties(handle.0);
         let is_read_only = !is_disk_writable(handle.0);
-        let is_system = c_drive_disk == Some(i);
+        let is_system = system_disks.contains(&i);
 
         let partitions = vol_map
             .get(&i)
             .map(|vols| {
                 vols.iter()
                     .map(|v| MountedPartition {
-                        name: format!("{}:", v.drive_letter),
-                        mount_point: PathBuf::from(format!("{}:\\", v.drive_letter)),
+                        name: v.display_name(),
+                        mount_point: v.mount_paths.first().map(PathBuf::from).unwrap_or_default(),
                         filesystem: v.filesystem.clone(),
                         total_space: v.total_bytes,
                         available_space: v.available_bytes,
@@ -773,6 +964,77 @@ mod tests {
         assert_eq!(bus_type_to_string(13), "MMC");
         assert_eq!(bus_type_to_string(99), "");
         assert_eq!(bus_type_to_string(0), "");
+    }
+
+    #[test]
+    fn physical_drives_come_from_the_dos_device_list_in_order() {
+        let names = "Volume{1}\0PhysicalDrive3\0C:\0PhysicalDrive0\0PhysicalDrive21\0CdRom0\0\0";
+        let wide: Vec<u16> = names.encode_utf16().collect();
+        assert_eq!(physical_drive_numbers_from_names(&wide), vec![0, 3, 21]);
+        assert!(physical_drive_numbers_from_names(&[0u16]).is_empty());
+    }
+
+    #[test]
+    fn volume_names_map_to_device_paths_and_letters() {
+        let guid = r"\\?\Volume{6f3b1c2e-0000-0000-0000-100000000000}\";
+        assert_eq!(
+            volume_device_path(guid),
+            r"\\.\Volume{6f3b1c2e-0000-0000-0000-100000000000}"
+        );
+        assert_eq!(drive_letter_of_root(r"d:\"), Some('D'));
+        assert_eq!(drive_letter_of_root(r"C:\mnt\data\"), None);
+        assert_eq!(drive_letter_of_root(""), None);
+
+        let lettered = VolumeInfo {
+            guid_path: guid.to_string(),
+            mount_paths: vec![r"C:\mnt\data\".to_string(), r"E:\".to_string()],
+            disk_numbers: vec![2],
+            filesystem: "NTFS".to_string(),
+            total_bytes: 0,
+            available_bytes: 0,
+        };
+        assert_eq!(lettered.display_name(), "E:");
+        let bare = VolumeInfo {
+            mount_paths: Vec::new(),
+            ..lettered
+        };
+        assert_eq!(
+            bare.display_name(),
+            "Volume{6f3b1c2e-0000-0000-0000-100000000000}"
+        );
+    }
+
+    #[test]
+    fn disk_extents_yield_every_disk_once() {
+        let mut buf = vec![0u8; 8 + 3 * 24];
+        buf[0..4].copy_from_slice(&3u32.to_ne_bytes());
+        for (i, disk) in [5u32, 1, 5].iter().enumerate() {
+            let at = 8 + i * 24;
+            buf[at..at + 4].copy_from_slice(&disk.to_ne_bytes());
+        }
+        assert_eq!(parse_disk_extent_numbers(&buf), vec![1, 5]);
+        // A count larger than the buffer holds is clamped, not trusted.
+        buf[0..4].copy_from_slice(&50u32.to_ne_bytes());
+        assert_eq!(parse_disk_extent_numbers(&buf), vec![1, 5]);
+    }
+
+    #[test]
+    fn cmdline_args_round_trip_through_windows_quoting() {
+        assert_eq!(quote_cmdline_arg("plain.d88"), "plain.d88");
+        assert_eq!(
+            quote_cmdline_arg(r"C:\Disk Images\game.hdf"),
+            r#""C:\Disk Images\game.hdf""#
+        );
+        assert_eq!(quote_cmdline_arg(""), r#""""#);
+        assert_eq!(quote_cmdline_arg(r#"say "hi""#), r#""say \"hi\"""#);
+        assert_eq!(quote_cmdline_arg(r"dir\"), r"dir\");
+        assert_eq!(quote_cmdline_arg(r"a dir\"), r#""a dir\\""#);
+        assert_eq!(quote_cmdline_arg(r#"x\"y"#), r#""x\\\"y""#);
+        assert_eq!(join_cmdline_args(Vec::<String>::new()), None);
+        assert_eq!(
+            join_cmdline_args(vec!["--flag".to_string(), "a b".to_string()]),
+            Some(r#"--flag "a b""#.to_string())
+        );
     }
 
     #[test]

@@ -1548,3 +1548,81 @@ fn edit_round_trips_a_dos_file_through_an_editor() {
         "the file must still be CP437, not re-encoded as UTF-8"
     );
 }
+
+#[test]
+fn mv_renames_in_place_and_refuses_cross_directory_moves() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let img = dir.path().join("disk.img");
+    let img_s = img.to_str().unwrap();
+    run(&[
+        "new", "volume", "fat", img_s, "--size", "4M", "--name", "MVTEST",
+    ]);
+    let host = dir.path().join("host.txt");
+    std::fs::write(&host, b"rename me").unwrap();
+    run(&[
+        "put",
+        img_s,
+        host.to_str().unwrap(),
+        "/A Long Original Name.txt",
+    ]);
+    run(&["mkdir", img_s, "/Sub"]);
+
+    run(&[
+        "mv",
+        img_s,
+        "/A Long Original Name.txt",
+        "Renamed Long Name.txt",
+    ]);
+    let ls = String::from_utf8(run(&["ls", img_s, "/"]).stdout).unwrap();
+    assert!(ls.contains("Renamed Long Name.txt"), "{ls}");
+    assert!(!ls.contains("A Long Original Name.txt"), "{ls}");
+    let back = dir.path().join("back.txt");
+    run(&[
+        "get",
+        img_s,
+        "/Renamed Long Name.txt",
+        back.to_str().unwrap(),
+    ]);
+    assert_eq!(std::fs::read(&back).unwrap(), b"rename me");
+
+    // A full path in the same directory is a rename too; another directory is not.
+    run(&["mv", img_s, "/Renamed Long Name.txt", "/final.txt"]);
+    let out = run_expect_fail(&["mv", img_s, "/final.txt", "/Sub/final.txt"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("within one directory"), "{err}");
+
+    // A name already in use is reported, never overwritten.
+    let out = run_expect_fail(&["mv", img_s, "/final.txt", "Sub"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("already exists"), "{err}");
+    let ls = String::from_utf8(run(&["ls", img_s, "/"]).stdout).unwrap();
+    assert!(ls.contains("final.txt") && ls.contains("Sub"), "{ls}");
+}
+
+#[test]
+fn new_hd_with_a_vhd_name_carries_a_fixed_vhd_footer() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let img = dir.path().join("disk.vhd");
+    let img_s = img.to_str().unwrap();
+    run(&[
+        "new",
+        "hd",
+        "mbr",
+        "--size",
+        "8M",
+        "--partition",
+        "rest:06",
+        img_s,
+    ]);
+    let bytes = std::fs::read(&img).unwrap();
+    assert_eq!(
+        bytes.len(),
+        8 * 1024 * 1024 + 512,
+        "disk plus one footer sector"
+    );
+    assert_eq!(&bytes[bytes.len() - 512..][..8], b"conectix");
+    // The container opens as a VHD and still shows the table it wraps.
+    let out = String::from_utf8(run(&["inspect", img_s]).stdout).unwrap();
+    assert!(out.contains("MBR"), "{out}");
+    assert!(out.contains("2048"), "{out}");
+}

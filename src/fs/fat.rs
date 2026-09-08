@@ -55,6 +55,9 @@ pub struct FatFilesystem<R> {
     /// allocation on fresh volumes where clusters are filled
     /// sequentially.
     next_free_hint: u32,
+    /// Short names handed out per directory, so `skip_name_checks` creates
+    /// (which never read the directory back) still get unique 8.3 names.
+    sfn_cache: HashMap<String, HashSet<[u8; 11]>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -213,6 +216,7 @@ impl<R: Read + Seek> FatFilesystem<R> {
             total_clusters,
             used_clusters: None,
             next_free_hint: 2,
+            sfn_cache: HashMap::new(),
         };
         // Cache the used-cluster count so used_size() / the browse free-space
         // line are accurate (one FAT scan at open, the same way exFAT computes
@@ -1202,12 +1206,24 @@ impl<R: Read + Write + Seek> FatFilesystem<R> {
         let base_part: String = clean_base.chars().take(8).collect();
         let mut sfn = [b' '; 11];
 
-        let fill_sfn = |sfn: &mut [u8; 11], name: &str, ext: &str| {
-            for (i, b) in name.bytes().take(8).enumerate() {
-                sfn[i] = b;
+        // The alias is an OEM-code-page name: raw UTF-8 bytes put CJK names
+        // behind the 0xE5 deleted marker and showed garbage under DOS.
+        let oem = |c: char| -> u8 {
+            if c.is_ascii() {
+                c as u8
+            } else {
+                b'_'
             }
-            for (i, b) in ext.bytes().take(3).enumerate() {
-                sfn[8 + i] = b;
+        };
+        let fill_sfn = |sfn: &mut [u8; 11], name: &str, ext: &str| {
+            for (i, c) in name.chars().take(8).enumerate() {
+                sfn[i] = oem(c);
+            }
+            for (i, c) in ext.chars().take(3).enumerate() {
+                sfn[8 + i] = oem(c);
+            }
+            if sfn[0] == 0xE5 {
+                sfn[0] = 0x05;
             }
         };
 
@@ -1597,7 +1613,7 @@ impl<R: Read + Write + Seek> FatFilesystem<R> {
                 &short_name
             };
 
-            let cluster_hi = u16::from_le_bytes([dir_data[off + 20], dir_data[off + 21]]) as u32;
+            let cluster_hi = dirent_hi_word(dir_data[off + 20], dir_data[off + 21], self.fat_type);
             let cluster_lo = u16::from_le_bytes([dir_data[off + 26], dir_data[off + 27]]) as u32;
             let cluster = (cluster_hi << 16) | cluster_lo;
 
@@ -1752,6 +1768,13 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for FatFilesystem<R> {
         options: &CreateFileOptions,
     ) -> Result<FileEntry, FilesystemError> {
         validate_fat_name(name)?;
+        // The directory entry's size field is 32 bits; past it the entry would
+        // silently describe the low bytes of the length.
+        if data_len > u32::MAX as u64 {
+            return Err(FilesystemError::InvalidData(format!(
+                "'{name}' is {data_len} bytes; a FAT file cannot exceed 4 GiB - 1"
+            )));
+        }
 
         let (existing_sfns, dir_data_for_sfn);
         if options.skip_name_checks {
@@ -1767,6 +1790,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for FatFilesystem<R> {
                 return Err(FilesystemError::AlreadyExists(name.to_string()));
             }
             let sfns = self.collect_existing_sfns(&dir_data);
+            self.sfn_cache.insert(parent.path.clone(), sfns.clone());
             existing_sfns = sfns;
             dir_data_for_sfn = Some(dir_data);
         }
@@ -1819,7 +1843,19 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for FatFilesystem<R> {
         // the caller (the cross-image copy engine) when present; default to
         // Archive for brand-new files. Mask off structural bits so a stray
         // directory / volume-id bit can never be stamped onto a file.
-        let sfn = Self::generate_short_name(name, &existing_sfns);
+        let sfn = if options.skip_name_checks {
+            let handed_out = self.sfn_cache.entry(parent.path.clone()).or_default();
+            let sfn = Self::generate_short_name(name, handed_out);
+            handed_out.insert(sfn);
+            sfn
+        } else {
+            let sfn = Self::generate_short_name(name, &existing_sfns);
+            self.sfn_cache
+                .entry(parent.path.clone())
+                .or_default()
+                .insert(sfn);
+            sfn
+        };
         let attr = options
             .dos_attributes
             .map(|a| (a as u8) & 0x27)
@@ -1923,6 +1959,10 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for FatFilesystem<R> {
         // Add entry in parent directory
         let existing_sfns = self.collect_existing_sfns(&dir_data);
         let sfn = Self::generate_short_name(name, &existing_sfns);
+        self.sfn_cache
+            .entry(parent.path.clone())
+            .or_default()
+            .insert(sfn);
         let entry_bytes =
             Self::build_dir_entries(name, &sfn, ATTR_DIRECTORY, new_cluster, 0, mtime);
 
@@ -2015,6 +2055,10 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for FatFilesystem<R> {
 
         let existing_sfns = self.collect_existing_sfns(&dir_data);
         let sfn = Self::generate_short_name(new_name, &existing_sfns);
+        self.sfn_cache
+            .entry(parent.path.clone())
+            .or_default()
+            .insert(sfn);
         let entry_bytes = Self::build_dir_entries(new_name, &sfn, attr, cluster, size, None);
 
         // Add the new name first, then remove the old (matched by old name +
@@ -2067,7 +2111,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for FatFilesystem<R> {
                 continue;
             }
             let lo = u16::from_le_bytes([dir_data[off + 26], dir_data[off + 27]]) as u32;
-            let hi = u16::from_le_bytes([dir_data[off + 20], dir_data[off + 21]]) as u32;
+            let hi = dirent_hi_word(dir_data[off + 20], dir_data[off + 21], self.fat_type);
             let cluster = (hi << 16) | lo;
             let size = u32::from_le_bytes([
                 dir_data[off + 28],
@@ -3192,6 +3236,15 @@ fn chain_clusters(fat_data: &[u8], fat_type: FatType, start: u32, max_entries: u
     out
 }
 
+/// The high cluster word of a directory entry; FAT12/16 keep an OS/2 EA index there.
+fn dirent_hi_word(b20: u8, b21: u8, fat_type: FatType) -> u32 {
+    if matches!(fat_type, FatType::Fat32) {
+        u16::from_le_bytes([b20, b21]) as u32
+    } else {
+        0
+    }
+}
+
 /// Append `start`'s chain to `order`, skipping clusters already placed.
 fn push_chain(
     order: &mut Vec<u32>,
@@ -3201,6 +3254,11 @@ fn push_chain(
     start: u32,
     max_entries: u32,
 ) {
+    // A dangling entry (its first cluster is free) owns nothing; placing it
+    // over-counted the allocation and dropped the last file's final cluster.
+    if start >= max_entries || read_fat_entry(fat_data, start, fat_type) == 0 {
+        return;
+    }
     for c in chain_clusters(fat_data, fat_type, start, max_entries) {
         if placed.insert(c) {
             order.push(c);
@@ -3210,7 +3268,12 @@ fn push_chain(
 
 /// Find a root-level entry by raw 8.3 name; returns its first cluster (or None).
 /// `want_dir` selects a directory vs a file entry.
-fn find_entry_cluster(dir_data: &[u8], name11: &[u8; 11], want_dir: bool) -> Option<u32> {
+fn find_entry_cluster(
+    dir_data: &[u8],
+    fat_type: FatType,
+    name11: &[u8; 11],
+    want_dir: bool,
+) -> Option<u32> {
     let n = dir_data.len() / DIR_ENTRY_SIZE;
     for i in 0..n {
         let off = i * DIR_ENTRY_SIZE;
@@ -3229,7 +3292,7 @@ fn find_entry_cluster(dir_data: &[u8], name11: &[u8; 11], want_dir: bool) -> Opt
             continue;
         }
         if &e[0..11] == name11 {
-            let hi = u16::from_le_bytes([e[20], e[21]]) as u32;
+            let hi = dirent_hi_word(e[20], e[21], fat_type);
             let lo = u16::from_le_bytes([e[26], e[27]]) as u32;
             return Some((hi << 16) | lo);
         }
@@ -3333,7 +3396,7 @@ fn scan_dir_for_swap(
         if !entry_is_swap(e, in_root, in_win, in_os2) {
             continue;
         }
-        let hi = u16::from_le_bytes([e[20], e[21]]) as u32;
+        let hi = dirent_hi_word(e[20], e[21], fat_type);
         let lo = u16::from_le_bytes([e[26], e[27]]) as u32;
         let fc = (hi << 16) | lo;
         if fc >= 2 {
@@ -3418,7 +3481,7 @@ fn collect_swap_clusters<R: Read + Seek>(
     );
 
     // \WINDOWS\WIN386.SWP
-    if let Some(win_fc) = find_entry_cluster(&root_data, b"WINDOWS    ", true) {
+    if let Some(win_fc) = find_entry_cluster(&root_data, fat_type, b"WINDOWS    ", true) {
         if win_fc >= 2 {
             let win_data = read_subdir(source, win_fc)?;
             scan_dir_for_swap(
@@ -3435,10 +3498,10 @@ fn collect_swap_clusters<R: Read + Seek>(
     }
 
     // \OS2\SYSTEM\SWAPPER.DAT
-    if let Some(os2_fc) = find_entry_cluster(&root_data, b"OS2        ", true) {
+    if let Some(os2_fc) = find_entry_cluster(&root_data, fat_type, b"OS2        ", true) {
         if os2_fc >= 2 {
             let os2_data = read_subdir(source, os2_fc)?;
-            if let Some(sys_fc) = find_entry_cluster(&os2_data, b"SYSTEM     ", true) {
+            if let Some(sys_fc) = find_entry_cluster(&os2_data, fat_type, b"SYSTEM     ", true) {
                 if sys_fc >= 2 {
                     let sys_data = read_subdir(source, sys_fc)?;
                     scan_dir_for_swap(
@@ -3521,7 +3584,7 @@ fn build_defrag_order<R: Read + Seek>(
 
     // Boot files pinned first (root-level files matching a boot 8.3 name).
     for boot in DEFRAG_BOOT_FILES {
-        if let Some(fc) = find_entry_cluster(&root_data, boot, false) {
+        if let Some(fc) = find_entry_cluster(&root_data, fat_type, boot, false) {
             if fc >= 2 {
                 push_chain(
                     &mut order,
@@ -3558,7 +3621,7 @@ fn build_defrag_order<R: Read + Seek>(
             if attr == ATTR_LONG_NAME || (attr & ATTR_VOLUME_ID) != 0 {
                 continue;
             }
-            let hi = u16::from_le_bytes([e[20], e[21]]) as u32;
+            let hi = dirent_hi_word(e[20], e[21], fat_type);
             let lo = u16::from_le_bytes([e[26], e[27]]) as u32;
             let fc = (hi << 16) | lo;
             if (attr & ATTR_DIRECTORY) != 0 {
@@ -3644,7 +3707,7 @@ fn find_subdirectories_in_data(
         }
 
         if (attr & ATTR_DIRECTORY) != 0 {
-            let cluster_hi = u16::from_le_bytes([entry_bytes[20], entry_bytes[21]]) as u32;
+            let cluster_hi = dirent_hi_word(entry_bytes[20], entry_bytes[21], fat_type);
             let cluster_lo = u16::from_le_bytes([entry_bytes[26], entry_bytes[27]]) as u32;
             let sub_cluster = (cluster_hi << 16) | cluster_lo;
 
@@ -4430,9 +4493,12 @@ pub fn patch_bpb_hidden_sectors(
     if let Some(old_hidden) =
         crate::fs::patch::patch_u32_le_in_buf(&mut bpb, 0x1C, start_lba as u32)
     {
+        // NTFS and HPFS keep hidden sectors here too and need the patch, but
+        // they have no FAT: zero FATs is what tells them apart from FAT32.
+        let num_fats = bpb[16];
         let spf16 = u16::from_le_bytes([bpb[22], bpb[23]]);
         let root_entry_count = u16::from_le_bytes([bpb[17], bpb[18]]);
-        let is_fat32 = spf16 == 0 && root_entry_count == 0;
+        let is_fat32 = (1..=2).contains(&num_fats) && spf16 == 0 && root_entry_count == 0;
 
         write_bpb(file, partition_offset, &bpb, is_fat32, bytes_per_sector)?;
         log_cb(&format!(
@@ -4465,8 +4531,12 @@ fn write_bpb(
 ) -> Result<()> {
     file.seek(SeekFrom::Start(partition_offset))?;
     file.write_all(bpb)?;
-    if is_fat32 {
-        let backup = partition_offset + 6 * bytes_per_sector as u64;
+    // BkBootSec says where the copy lives; a value outside the reserved area
+    // (NTFS reserves 0 sectors, HPFS 1) means there is none to update.
+    let backup_sector = u16::from_le_bytes([bpb[0x32], bpb[0x33]]);
+    let reserved = u16::from_le_bytes([bpb[0x0E], bpb[0x0F]]);
+    if is_fat32 && backup_sector > 0 && backup_sector < reserved {
+        let backup = partition_offset + backup_sector as u64 * bytes_per_sector as u64;
         file.seek(SeekFrom::Start(backup))?;
         file.write_all(bpb)?;
     }
@@ -5126,6 +5196,60 @@ fn fat_label_bytes(label: Option<&str>) -> [u8; 11] {
 mod tests {
     use super::*;
 
+    /// NTFS takes the hidden-sectors patch but has no FAT32 backup sector;
+    /// its boot code at sector 6 must stay untouched.
+    #[test]
+    fn hidden_sectors_patch_leaves_ntfs_boot_code_alone() {
+        let mut img = vec![0u8; 8 * 512];
+        img[0] = 0xEB;
+        img[1] = 0x52;
+        img[2] = 0x90;
+        img[3..11].copy_from_slice(b"NTFS    ");
+        img[11..13].copy_from_slice(&512u16.to_le_bytes());
+        // Reserved sectors, FATs, root entries and sectors/FAT all 0: NTFS.
+        img[0x1C..0x20].copy_from_slice(&63u32.to_le_bytes());
+        for b in &mut img[6 * 512..7 * 512] {
+            *b = 0xCC;
+        }
+        let mut cur = std::io::Cursor::new(img);
+        patch_bpb_hidden_sectors(&mut cur, 0, 2048, &mut |_| {}).unwrap();
+        let img = cur.into_inner();
+        assert_eq!(
+            u32::from_le_bytes([img[0x1C], img[0x1D], img[0x1E], img[0x1F]]),
+            2048
+        );
+        assert!(
+            img[6 * 512..7 * 512].iter().all(|&b| b == 0xCC),
+            "sector 6 was overwritten"
+        );
+    }
+
+    #[test]
+    fn hidden_sectors_patch_updates_the_fat32_backup_where_bkbootsec_says() {
+        let mut img = vec![0u8; 40 * 512];
+        img[0] = 0xEB;
+        img[1] = 0x58;
+        img[2] = 0x90;
+        img[3..11].copy_from_slice(b"MSWIN4.1");
+        img[11..13].copy_from_slice(&512u16.to_le_bytes());
+        img[13] = 8;
+        img[0x0E..0x10].copy_from_slice(&32u16.to_le_bytes());
+        img[16] = 2;
+        // Root entries 0 and sectors/FAT16 0: FAT32.
+        img[0x24..0x28].copy_from_slice(&1024u32.to_le_bytes());
+        img[0x32..0x34].copy_from_slice(&6u16.to_le_bytes());
+        img[0x52..0x5A].copy_from_slice(b"FAT32   ");
+        let mut cur = std::io::Cursor::new(img);
+        patch_bpb_hidden_sectors(&mut cur, 0, 2048, &mut |_| {}).unwrap();
+        let img = cur.into_inner();
+        let backup = &img[6 * 512..7 * 512];
+        assert_eq!(backup, &img[..512]);
+        assert_eq!(
+            u32::from_le_bytes([backup[0x1C], backup[0x1D], backup[0x1E], backup[0x1F]]),
+            2048
+        );
+    }
+
     /// A multi-cluster file must survive `CompactFatReader` packing: the packed
     /// volume has to keep the *source* FAT type, because a compliant driver (and
     /// `FatFilesystem::open`) derives the type from the cluster count alone. If
@@ -5210,7 +5334,7 @@ mod tests {
                     break;
                 }
                 if &e[0..11] == b"D       BIN" {
-                    first = ((u16::from_le_bytes([e[20], e[21]]) as u32) << 16)
+                    first = ((dirent_hi_word(e[20], e[21], fat_type)) << 16)
                         | (u16::from_le_bytes([e[26], e[27]]) as u32);
                     break;
                 }
@@ -5986,6 +6110,30 @@ mod tests {
     /// The read-only / hidden / system / archive bits must be settable and
     /// must survive a re-read, and the structural bits must not be reachable
     /// from a caller.
+    /// D15: a 4 GiB source was accepted and its size stored modulo 2^32.
+    #[test]
+    fn a_file_of_four_gib_or_more_is_refused_up_front() {
+        use crate::fs::filesystem::EditableFilesystem;
+        let img = create_blank_fat(1024 * 1024, Some("BIG")).expect("blank");
+        let mut fs = FatFilesystem::open(std::io::Cursor::new(img), 0).expect("open");
+        let root = fs.root().expect("root");
+        let mut never_read = std::io::repeat(0);
+        let err = fs
+            .create_file(
+                &root,
+                "HUGE.BIN",
+                &mut never_read,
+                1 << 32,
+                &CreateFileOptions::default(),
+            )
+            .unwrap_err();
+        assert!(format!("{err}").contains("4 GiB"), "{err}");
+        assert!(
+            fs.list_directory(&root).unwrap().is_empty(),
+            "nothing must be written"
+        );
+    }
+
     #[test]
     fn dos_attributes_can_be_set_and_read_back() {
         use crate::fs::filesystem::EditableFilesystem;
@@ -6218,5 +6366,41 @@ mod tests {
                 info.compacted_size,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod sfn_cache_tests {
+    use super::*;
+    use crate::fs::filesystem::{CreateFileOptions, Filesystem};
+    use std::io::Cursor;
+
+    /// D13: `skip_name_checks` creates never read the directory back, so every
+    /// long name that shared a prefix got the same `~1` short name.
+    #[test]
+    fn skip_name_checks_creates_still_get_unique_short_names() {
+        let img = create_blank_fat(4 * 1024 * 1024, Some("T")).unwrap();
+        let mut fs = FatFilesystem::open(Cursor::new(img), 0).unwrap();
+        let root = fs.root().unwrap();
+        let opts = CreateFileOptions {
+            skip_data_write: true,
+            skip_name_checks: true,
+            skip_fsinfo_update: true,
+            ..Default::default()
+        };
+        for name in ["LongName1.txt", "LongName2.txt", "LongName3.txt"] {
+            let mut empty = std::io::empty();
+            fs.create_file(&root, name, &mut empty, 0, &opts).unwrap();
+        }
+        let dir = fs.read_root_directory().unwrap();
+        let sfns = fs.collect_existing_sfns(&dir);
+        assert_eq!(sfns.len(), 3, "three distinct 8.3 names: {sfns:?}");
+        let names: Vec<String> = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names.len(), 3, "{names:?}");
     }
 }

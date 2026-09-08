@@ -2640,14 +2640,28 @@ impl CommanderState {
                     return;
                 }
             };
-            (|| -> Result<(), String> {
-                for e in &entries {
-                    std::fs::copy(std::path::PathBuf::from(&e.path), dest_dir.join(&e.name))
-                        .map_err(|err| format!("Copy failed on {}: {err}", e.name))?;
+            // The shared runner recurses folders, refuses a copy into itself
+            // and keeps forks; the flat loop wrote a folder as an empty file.
+            let status = crate::model::commander_ops::spawn_host_copy(
+                crate::model::commander_ops::HostCopyJob::HostToHost {
+                    entries: entries.clone(),
+                    dest_dir,
+                    on_conflict: crate::fs::replace::OnConflict::Replace,
+                },
+            );
+            loop {
+                let (finished, error, copied) = {
+                    let g = crate::model::worker::lock_status(&status);
+                    (g.finished, g.error.clone(), g.copied)
+                };
+                if finished {
+                    break match error {
+                        Some(e) => Err(format!("Copy failed: {e}")),
+                        None => Ok(format!("Copied {copied} item(s) to {label}.")),
+                    };
                 }
-                Ok(())
-            })()
-            .map(|()| format!("Copied {label}."))
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
         } else {
             // image -> image: extract the entries to a temp dir, stage them as
             // AddFiles on the destination's browse session, then apply. The temp
@@ -4671,10 +4685,14 @@ impl App {
                             .file_extension()
                             .map(|e| format!(".{e}"))
                             .unwrap_or_default();
-                        let out_name = if entries.len() == 1 {
-                            format!("{}{ext}", entries[0].name)
-                        } else {
-                            format!("selection{ext}")
+                        // The root node has no name of its own; "/.tar.gz" at
+                        // the destination's root is not what anyone asked for.
+                        let out_name = match entries.as_slice() {
+                            [only] if !only.name.trim_matches('/').is_empty() => {
+                                format!("{}{ext}", only.name)
+                            }
+                            [_] => format!("volume{ext}"),
+                            _ => format!("selection{ext}"),
                         };
                         let out_path = dest.join(&out_name);
                         let summary = export_to_file(
@@ -5612,6 +5630,7 @@ impl App {
                 size,
                 name,
                 block_size: None,
+                big_endian: false,
                 catalog_size: None,
                 extents_size: None,
                 case_sensitive: false,
@@ -11692,6 +11711,18 @@ fn import_host_file(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .ok_or_else(|| anyhow::anyhow!("no filename in {}", host.display()))?;
+    // Read the host file the way the Commander pane does, so a Mac file in
+    // any of its four containers keeps its fork, type/creator and real name.
+    let resource_fork = crate::fs::resource_fork::detect_resource_fork(host);
+    let name = resource_fork
+        .as_ref()
+        .and_then(|i| i.name.clone())
+        .unwrap_or(name);
+    let size = resource_fork
+        .as_ref()
+        .and_then(|i| i.data_fork.as_ref())
+        .map(|d| d.len() as u64)
+        .unwrap_or(meta.len());
     let dst = if cur_dir == "/" {
         format!("/{name}")
     } else {
@@ -11711,34 +11742,33 @@ fn import_host_file(
     // Ask before overwriting rather than refusing outright, which is what this
     // did before: a name collision was a dead end, so the only way to correct a
     // file in an image was to delete it first and remember what it carried.
-    let exists = fs
+    let fold = fs.case_insensitive_lookup();
+    let children = fs
         .list_directory(&parent)
-        .map_err(|e| anyhow::anyhow!("list_directory: {e}"))?
-        .into_iter()
-        .any(|e| e.name == leaf);
+        .map_err(|e| anyhow::anyhow!("list_directory: {e}"))?;
+    let exists = crate::fs::filesystem::find_child(fold, &children, &leaf).is_some();
     if exists && on_conflict == crate::fs::replace::OnConflict::Fail {
         return Ok(ImportOutcome::Exists(leaf));
     }
 
-    let len = meta.len();
-    let mut hf = std::fs::File::open(host)?;
-    let options = crate::fs::filesystem::CreateFileOptions::default();
-    let outcome = crate::fs::replace::create_or_replace(
-        fs.as_mut(),
-        &parent,
-        &leaf,
-        &mut hf,
-        len,
-        &options,
-        crate::fs::replace::ReplacePolicy {
-            on_conflict,
-            ..Default::default()
-        },
-    )
-    .map_err(|e| anyhow::anyhow!("create_file: {e}"))?;
-    if outcome.skipped {
+    if exists && on_conflict == crate::fs::replace::OnConflict::Skip {
         return Ok(ImportOutcome::Done(format!("{name} (skipped)")));
     }
+    let edit = crate::model::edit_queue::StagedEdit::AddFile {
+        parent: parent.clone(),
+        name: leaf.clone(),
+        host_path: host.to_path_buf(),
+        size,
+        prodos_type: None,
+        prodos_aux: None,
+        resource_fork,
+        hfs_type_override: None,
+        hfs_creator_override: None,
+        dates: None,
+        on_conflict,
+    };
+    crate::model::edit_queue::apply_edit(fs.as_mut(), &edit)
+        .map_err(|e| anyhow::anyhow!("create_file: {e}"))?;
     fs.sync_metadata()
         .map_err(|e| anyhow::anyhow!("sync_metadata: {e}"))?;
     drop(fs);

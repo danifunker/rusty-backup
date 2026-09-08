@@ -25,8 +25,11 @@ use byteorder::{BigEndian, ByteOrder};
 
 use super::filesystem::FilesystemError;
 use super::fsck::{FsckIssue, FsckResult, FsckStats, OrphanedEntry};
-use super::hfs_common::walk_leaf_records;
-use super::hfsplus::HfsPlusFilesystem;
+use super::hfs_common::{
+    btree_lonely_empty_leaves, btree_stale_index_keys, btree_unerased_free_nodes,
+    walk_leaf_records, BTreeHeader, BTreeKeyFormat,
+};
+use super::hfsplus::{catalog_compare_keys, HfsPlusFilesystem};
 
 const HFS_PLUS_SIGNATURE: u16 = 0x482B; // "H+"
 const HFSX_SIGNATURE: u16 = 0x4858; // "HX"
@@ -52,9 +55,13 @@ enum HfsPlusFsckCode {
     DuplicateCnid,
     DuplicateCatalogKey,
     KeyOutOfOrder,
+    IndexKeyMismatch,
+    EmptyLeafWithoutSiblings,
+    FreeNodeNotErased,
     ParentValenceMismatch,
     BitmapAllocCountMismatch,
     BitmapTooShort,
+    AlternateHeaderBlockFree,
     JournalChecksumMismatch,
     JournalSequenceJump,
 }
@@ -72,9 +79,13 @@ impl HfsPlusFsckCode {
             HfsPlusFsckCode::DuplicateCnid => "DuplicateCnid",
             HfsPlusFsckCode::DuplicateCatalogKey => "DuplicateCatalogKey",
             HfsPlusFsckCode::KeyOutOfOrder => "KeyOutOfOrder",
+            HfsPlusFsckCode::IndexKeyMismatch => "IndexKeyMismatch",
+            HfsPlusFsckCode::EmptyLeafWithoutSiblings => "EmptyLeafWithoutSiblings",
+            HfsPlusFsckCode::FreeNodeNotErased => "FreeNodeNotErased",
             HfsPlusFsckCode::ParentValenceMismatch => "ParentValenceMismatch",
             HfsPlusFsckCode::BitmapAllocCountMismatch => "BitmapAllocCountMismatch",
             HfsPlusFsckCode::BitmapTooShort => "BitmapTooShort",
+            HfsPlusFsckCode::AlternateHeaderBlockFree => "AlternateHeaderBlockFree",
             HfsPlusFsckCode::JournalChecksumMismatch => "JournalChecksumMismatch",
             HfsPlusFsckCode::JournalSequenceJump => "JournalSequenceJump",
         }
@@ -296,6 +307,115 @@ pub(super) fn check<R: Read + Seek>(
         ));
     }
 
+    // ---- Phase 2b: index separators ---------------------------------------
+    // Every separator must be its child's first key; fsck_hfs calls anything
+    // else "Invalid index key" (E_IKey), even when descents still work.
+    {
+        let cs = fs.case_sensitive_catalog();
+        let cmp = |a: &[u8], b: &[u8]| catalog_compare_keys(a, b, cs);
+        let node_size = fs.catalog_node_size();
+        for (idx, rec, child, _) in btree_stale_index_keys(
+            fs.catalog_data(),
+            node_size,
+            &BTreeKeyFormat::HFSPLUS_CATALOG,
+            &cmp,
+        ) {
+            errors.push(issue(
+                HfsPlusFsckCode::IndexKeyMismatch,
+                format!(
+                    "catalog index node {idx} record {rec} does not carry the first key of \
+                     its child {child}"
+                ),
+            ));
+        }
+        if let Some(data) = fs.extents_overflow_data().filter(|d| d.len() >= 512) {
+            let node_size = BTreeHeader::read(data).node_size as usize;
+            for (idx, rec, child, _) in btree_stale_index_keys(
+                data,
+                node_size,
+                &BTreeKeyFormat::HFSPLUS_EXTENTS,
+                &HfsPlusFilesystem::<R>::extents_compare,
+            ) {
+                errors.push(issue(
+                    HfsPlusFsckCode::IndexKeyMismatch,
+                    format!(
+                        "extents index node {idx} record {rec} does not carry the first key \
+                         of its child {child}"
+                    ),
+                ));
+            }
+        }
+        if let Some(data) = fs.attributes_data_for_fsck()?.filter(|d| d.len() >= 512) {
+            let node_size = BTreeHeader::read(data).node_size as usize;
+            for (idx, rec, child, _) in btree_stale_index_keys(
+                data,
+                node_size,
+                &BTreeKeyFormat::HFSPLUS_ATTRIBUTES,
+                &HfsPlusFilesystem::<R>::attr_compare,
+            ) {
+                errors.push(issue(
+                    HfsPlusFsckCode::IndexKeyMismatch,
+                    format!(
+                        "attributes index node {idx} record {rec} does not carry the first \
+                         key of its child {child}"
+                    ),
+                ));
+            }
+        }
+    }
+
+    // ---- Phase 2c: empty leaves ---------------------------------------------
+    // A leaf with no records and no siblings is what Apple retires the whole
+    // tree for; fsck_hfs reports one as "Invalid node structure" (E_BadNode).
+    {
+        let mut trees: Vec<(&str, Vec<u32>)> = Vec::new();
+        trees.push((
+            "catalog",
+            btree_lonely_empty_leaves(fs.catalog_data(), fs.catalog_node_size()),
+        ));
+        if let Some(data) = fs.extents_overflow_data().filter(|d| d.len() >= 512) {
+            let node_size = BTreeHeader::read(data).node_size as usize;
+            trees.push(("extents", btree_lonely_empty_leaves(data, node_size)));
+        }
+        if let Some(data) = fs.attributes_data_for_fsck()?.filter(|d| d.len() >= 512) {
+            let node_size = BTreeHeader::read(data).node_size as usize;
+            trees.push(("attributes", btree_lonely_empty_leaves(data, node_size)));
+        }
+        for (tree, leaves) in trees {
+            for idx in leaves {
+                errors.push(issue(
+                    HfsPlusFsckCode::EmptyLeafWithoutSiblings,
+                    format!(
+                        "{tree} leaf node {idx} has no records and no siblings; an empty \
+                         tree has no root at all"
+                    ),
+                ));
+            }
+        }
+        // Apple erases a node when it frees it; fsck_hfs checks that too.
+        let mut dirty: Vec<(&str, Vec<u32>)> = Vec::new();
+        dirty.push((
+            "catalog",
+            btree_unerased_free_nodes(fs.catalog_data(), fs.catalog_node_size()),
+        ));
+        if let Some(data) = fs.extents_overflow_data().filter(|d| d.len() >= 512) {
+            let node_size = BTreeHeader::read(data).node_size as usize;
+            dirty.push(("extents", btree_unerased_free_nodes(data, node_size)));
+        }
+        if let Some(data) = fs.attributes_data_for_fsck()?.filter(|d| d.len() >= 512) {
+            let node_size = BTreeHeader::read(data).node_size as usize;
+            dirty.push(("attributes", btree_unerased_free_nodes(data, node_size)));
+        }
+        for (tree, nodes) in dirty {
+            for idx in nodes {
+                errors.push(issue(
+                    HfsPlusFsckCode::FreeNodeNotErased,
+                    format!("{tree} node {idx} is free in the node map but not erased"),
+                ));
+            }
+        }
+    }
+
     // ---- Phase 3: Bitmap consistency ----------------------------------
     let total_blocks = fs.total_blocks();
     let free_blocks = fs.vh_free_blocks();
@@ -329,6 +449,26 @@ pub(super) fn check<R: Read + Seek>(
                      total_blocks - free_blocks = {expected_alloc}"
                 ),
             ));
+        }
+    }
+
+    // The alternate volume header's block(s) count as used. A resize that
+    // forgot to move them is what fsck_hfs reports as orphaned blocks at the
+    // old end and under-allocation at the new one.
+    if bitmap_bits >= total_blocks as u64 && total_blocks > 0 {
+        let bs = block_size as u64;
+        let end = fs
+            .partition_size()
+            .filter(|&s| s >= 2048)
+            .unwrap_or(total_blocks as u64 * bs);
+        let first = ((end - 1024) / bs).min(total_blocks as u64) as u32;
+        for block in first..total_blocks {
+            if bitmap[(block / 8) as usize] & (1 << (7 - block % 8)) == 0 {
+                errors.push(issue(
+                    HfsPlusFsckCode::AlternateHeaderBlockFree,
+                    format!("block {block} holds the alternate volume header but is marked free"),
+                ));
+            }
         }
     }
 

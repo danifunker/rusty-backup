@@ -438,6 +438,14 @@ fn parse_dir_sector(sec: &[u8; 512], out: &mut Vec<MfsDirEntry>) {
 /// field is a 28-byte Pascal string, so 1 length byte + up to 27 chars.
 pub const MFS_MAX_NAME_LEN: usize = 27;
 
+/// MFS name equality as the File Manager sees it: Mac Roman bytes compared
+/// through the HFS case-folding order, so "Doc" and "DOC" are the same file.
+fn mfs_names_equal(a: &str, b: &str) -> bool {
+    let a_bytes = super::hfs::utf8_to_mac_roman(a).unwrap_or_else(|_| a.as_bytes().to_vec());
+    let b_bytes = super::hfs::utf8_to_mac_roman(b).unwrap_or_else(|_| b.as_bytes().to_vec());
+    super::hfs_common::compare_hfs_keys(0, &a_bytes, 0, &b_bytes) == std::cmp::Ordering::Equal
+}
+
 /// Validate a candidate filename for `create_file` / `set_type_creator`.
 /// MFS uses Mac Roman encoding and disallows the path-separator ':' (a
 /// Classic Mac OS convention also enforced by HFS).
@@ -469,7 +477,17 @@ impl MfsDirEntry {
     /// even length (the on-disk constraint — entries align to even byte
     /// offsets within a directory sector). Caller stamps the result into
     /// the sector buffer.
-    fn encode(&self) -> Vec<u8> {
+    fn encode(&self, alloc_block_size: u32) -> Vec<u8> {
+        // flPyLen / flRPyLen are the allocated sizes: whole allocation blocks.
+        let physical = |logical: u32| -> u32 {
+            if logical == 0 || alloc_block_size == 0 {
+                0
+            } else {
+                logical
+                    .div_ceil(alloc_block_size)
+                    .saturating_mul(alloc_block_size)
+            }
+        };
         let name_bytes = super::hfs::utf8_to_mac_roman(&self.name).unwrap_or_default();
         let name_len = name_bytes.len().min(MFS_MAX_NAME_LEN) as u8;
         let total = 51 + name_len as usize;
@@ -481,12 +499,10 @@ impl MfsDirEntry {
         BigEndian::write_u32(&mut buf[18..22], self.file_number);
         BigEndian::write_u16(&mut buf[22..24], self.data_first_block);
         BigEndian::write_u32(&mut buf[24..28], self.data_logical_length);
-        // physical length: round logical up to allocation-block boundary.
-        // Caller will overwrite if a more accurate value is known.
-        BigEndian::write_u32(&mut buf[28..32], self.data_logical_length);
+        BigEndian::write_u32(&mut buf[28..32], physical(self.data_logical_length));
         BigEndian::write_u16(&mut buf[32..34], self.rsrc_first_block);
         BigEndian::write_u32(&mut buf[34..38], self.rsrc_logical_length);
-        BigEndian::write_u32(&mut buf[38..42], self.rsrc_logical_length);
+        BigEndian::write_u32(&mut buf[38..42], physical(self.rsrc_logical_length));
         BigEndian::write_u32(&mut buf[42..46], self.create_date);
         BigEndian::write_u32(&mut buf[46..50], self.modify_date);
         buf[50] = name_len;
@@ -670,7 +686,7 @@ impl<R: Read + Write + Seek + Send> MfsFilesystem<R> {
         let mut sector_idx = 0usize;
         let mut byte_off = 0usize;
         for e in self.entries.iter().filter(|e| e.is_in_use()) {
-            let bytes = e.encode();
+            let bytes = e.encode(self.mdb.alloc_block_size);
             // If this entry doesn't fit in the remainder of the current
             // sector (after leaving 1 byte for the terminator), advance.
             if byte_off + bytes.len() + 1 > 512 {
@@ -1049,7 +1065,7 @@ impl<R: Read + Seek + Send> Filesystem for MfsFilesystem<R> {
                 fe.resource_fork_size = Some(de.rsrc_logical_length as u64);
             }
             // MFS dates share HFS's Mac-epoch encoding.
-            fe.modified_unix = super::times::mac_epoch_to_unix(de.modify_date);
+            fe.modified_unix = super::times::mac_local_to_unix(de.modify_date);
             if de.modify_date != 0 || de.create_date != 0 {
                 fe.mac_dates = Some((de.create_date, de.modify_date, 0));
                 if let Some(s) = super::hfs_common::format_mac_date(de.modify_date) {
@@ -1157,8 +1173,12 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for MfsFilesystem<R> {
             ));
         }
         let _ = validate_mfs_name(name)?;
-        // Reject duplicates.
-        if self.entries.iter().any(|e| e.is_in_use() && e.name == name) {
+        // Reject duplicates; the File Manager compares names without case.
+        if self
+            .entries
+            .iter()
+            .any(|e| e.is_in_use() && mfs_names_equal(&e.name, name))
+        {
             return Err(FilesystemError::InvalidData(format!(
                 "MFS file '{name}' already exists"
             )));
@@ -1226,7 +1246,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for MfsFilesystem<R> {
             .unix_times
             .map(|t| t.mtime_or_now())
             .unwrap_or_else(super::times::now);
-        let stamp = super::times::unix_to_mac_epoch(mtime_secs);
+        let stamp = super::times::unix_to_mac_local(mtime_secs);
         let entry = MfsDirEntry {
             flags: 0x80, // in use, not locked
             finder_info,
@@ -1406,12 +1426,12 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for MfsFilesystem<R> {
         let _ = validate_mfs_name(new_name)?;
 
         let fnum = entry.location as u32;
-        // Reject a collision with a *different* in-use entry. MFS names are
-        // case-sensitive on disk, so plain equality is the right comparison.
+        // Reject a collision with a *different* in-use entry; the File Manager
+        // compares names without case, so "Doc" and "DOC" are one file.
         if self
             .entries
             .iter()
-            .any(|e| e.is_in_use() && e.file_number != fnum && e.name == new_name)
+            .any(|e| e.is_in_use() && e.file_number != fnum && mfs_names_equal(&e.name, new_name))
         {
             return Err(FilesystemError::AlreadyExists(new_name.to_string()));
         }
@@ -2239,6 +2259,30 @@ mod tests {
         assert_eq!(fs2.read_resource_fork(renamed).unwrap(), b"RSRC");
     }
 
+    /// H12: duplicate detection compared bytes, so "hello" could be created
+    /// beside "Hello" and the Finder then saw two files it could not tell apart.
+    #[test]
+    fn names_differing_only_in_case_are_the_same_file() {
+        let mut fs = MfsFilesystem::open(edit_fixture(), 0).unwrap();
+        let root = fs.root().unwrap();
+        let err = fs
+            .create_file(
+                &root,
+                "hello",
+                &mut &b"x"[..],
+                1,
+                &CreateFileOptions::default(),
+            )
+            .unwrap_err();
+        assert!(format!("{err}").contains("already exists"), "{err}");
+        let entries = fs.list_directory(&root).unwrap();
+        let doc = entries.iter().find(|e| e.name == "Doc").unwrap().clone();
+        let err = fs.rename(&root, &doc, "HELLO").unwrap_err();
+        assert!(matches!(err, FilesystemError::AlreadyExists(_)));
+        // A file may still change its own capitalisation.
+        fs.rename(&root, &doc, "DOC").unwrap();
+    }
+
     #[test]
     fn rename_rejects_collision() {
         let mut fs = MfsFilesystem::open(edit_fixture(), 0).unwrap();
@@ -2324,5 +2368,42 @@ mod tests {
         let hello2 = entries.iter().find(|e| e.name == "Hello").unwrap();
         assert_eq!(hello2.type_code, Some(*b"PICT"));
         assert_eq!(hello2.creator_code, Some(*b"8BIM"));
+    }
+}
+
+#[cfg(test)]
+mod physical_length_tests {
+    use super::*;
+    use crate::fs::filesystem::{CreateFileOptions, Filesystem};
+    use std::io::Cursor;
+
+    /// H6: flPyLen / flRPyLen were written as the logical lengths; Mac OS
+    /// expects the allocated size, whole allocation blocks.
+    #[test]
+    fn physical_lengths_are_whole_allocation_blocks() {
+        let img = create_blank_mfs(400 * 1024, "T").unwrap();
+        let mut fs = MfsFilesystem::open(Cursor::new(img), 0).unwrap();
+        let root = fs.root().unwrap();
+        let mut data = Cursor::new(vec![0x5Au8; 100]);
+        fs.create_file(&root, "tiny", &mut data, 100, &CreateFileOptions::default())
+            .unwrap();
+        fs.sync_metadata().unwrap();
+        let abs = fs.mdb.alloc_block_size;
+        let off = fs.partition_offset + fs.mdb.dir_start_sector as u64 * 512;
+        fs.reader.seek(SeekFrom::Start(off)).unwrap();
+        let mut sector = [0u8; 512];
+        fs.reader.read_exact(&mut sector).unwrap();
+        assert_ne!(sector[0] & 0x80, 0, "first directory entry is in use");
+        assert_eq!(
+            BigEndian::read_u32(&sector[24..28]),
+            100,
+            "logical data length"
+        );
+        assert_eq!(
+            BigEndian::read_u32(&sector[28..32]),
+            abs,
+            "physical data length"
+        );
+        assert_eq!(BigEndian::read_u32(&sector[38..42]), 0, "no resource fork");
     }
 }

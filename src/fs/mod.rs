@@ -11,6 +11,9 @@ pub mod apple_dos;
 pub mod archive_fs;
 pub mod atari_dos;
 pub mod attrs;
+pub mod bfs;
+pub mod bfs_fsck;
+pub mod bfs_write;
 pub mod binhex;
 pub mod btrfs;
 pub mod carve;
@@ -76,6 +79,9 @@ pub mod ntfs_clone;
 pub mod ntfs_format;
 pub mod ntfs_fsck;
 mod ntfs_tables;
+pub mod ofs;
+pub mod ofs_fsck;
+pub mod ofs_write;
 #[cfg(feature = "optical")]
 pub mod optical_fs;
 pub mod oric;
@@ -106,6 +112,7 @@ pub mod trdos;
 pub mod tree;
 pub mod ucsd;
 pub mod ufs;
+pub mod ufs_format;
 pub mod ufs_fsck;
 pub mod unix_common;
 pub mod xattr;
@@ -221,7 +228,7 @@ pub enum InPlaceResize {
 /// [`in_place_resize_support`] checks separately.
 const IN_PLACE_RESIZABLE: &[&str] = &[
     "fat", "ntfs", "exfat", "hfs", "hfsplus", "ext", "btrfs", "efs", "efs_v1", "qdos", "affs",
-    "prodos",
+    "prodos", "human68k",
 ];
 
 /// Classify the filesystem at `partition_offset` for in-place resizing.
@@ -244,6 +251,9 @@ pub fn in_place_resize_support<R: Read + Seek>(
         if is_amiga_sfs_type(s) {
             return InPlaceResize::Supported("SFS");
         }
+        if s == "human68k" {
+            return InPlaceResize::Supported("Human68k");
+        }
     }
     let detected = detect_filesystem_type(reader, partition_offset);
     if detected == "unknown" {
@@ -254,6 +264,29 @@ pub fn in_place_resize_support<R: Read + Seek>(
         return InPlaceResize::Supported(fs_display_name(detected));
     }
     InPlaceResize::Unsupported(fs_display_name(detected))
+}
+
+/// ext2/3/4 superblock: the 0xEF53 magic plus the fields no real volume has at
+/// zero, so a stray magic inside another filesystem's block is not enough.
+pub(crate) fn ext_superblock_plausible(sb: &[u8; 512]) -> bool {
+    let inodes = u32::from_le_bytes([sb[0], sb[1], sb[2], sb[3]]);
+    let blocks = u32::from_le_bytes([sb[4], sb[5], sb[6], sb[7]]);
+    let log_block_size = u32::from_le_bytes([sb[0x18], sb[0x19], sb[0x1A], sb[0x1B]]);
+    sb[0x38] == 0x53 && sb[0x39] == 0xEF && inodes != 0 && blocks != 0 && log_block_size <= 6
+}
+
+/// Classic HFS MDB: a non-zero block count and a 512-multiple block size.
+pub(crate) fn hfs_mdb_plausible(sb: &[u8; 512]) -> bool {
+    let nm_al_blks = u16::from_be_bytes([sb[18], sb[19]]);
+    let al_blk_siz = u32::from_be_bytes([sb[20], sb[21], sb[22], sb[23]]);
+    nm_al_blks != 0 && al_blk_siz != 0 && al_blk_siz & 511 == 0
+}
+
+/// HFS+/HFSX volume header: version 4 or 5 and a power-of-two block size >= 512.
+pub(crate) fn hfsplus_header_plausible(sb: &[u8; 512]) -> bool {
+    let version = u16::from_be_bytes([sb[2], sb[3]]);
+    let block_size = u32::from_be_bytes([sb[40], sb[41], sb[42], sb[43]]);
+    (4..=5).contains(&version) && block_size >= 512 && block_size.is_power_of_two()
 }
 
 /// A human-facing name for a `detect_filesystem_type` token, for messages.
@@ -271,6 +304,7 @@ fn fs_display_name(detected: &str) -> &'static str {
         "qdos" => "QDOS",
         "affs" => "AFFS",
         "prodos" => "ProDOS",
+        "human68k" => "Human68k",
         "xfs" => "XFS",
         "jfs" => "JFS",
         "reiserfs" => "ReiserFS",
@@ -279,6 +313,8 @@ fn fs_display_name(detected: &str) -> &'static str {
         "apfs" => "APFS",
         "squashfs" => "SquashFS",
         "mfs" => "MFS",
+        "minix" => "Minix",
+        "adfs" => "ADFS",
         _ => "an unsupported filesystem",
     }
 }
@@ -340,6 +376,11 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
     if oric::looks_like_oric_jasmin(reader, partition_offset) {
         return "oric_jasmin";
     }
+    // X68000 Human68k HDD: BRA.S at byte 0 and a big-endian BPB, which the FAT
+    // heuristic below cannot read; the resizer and min-size paths key off it.
+    if human68k::looks_like_human68k_hdd(&sector0) {
+        return "human68k";
+    }
     // FAT boot sectors begin with a JMP (0xEB short or 0xE9 near). But a JMP
     // opcode alone is a weak signal: syslinux/extlinux install their boot code
     // into the reserved first 1024 bytes of an ext2/3/4 volume, and that code
@@ -380,25 +421,26 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
     {
         let mut sb_buf = [0u8; 512];
         if reader.read_exact(&mut sb_buf).is_ok() {
+            // ext goes first: its magic sits at +0x38 where an MDB keeps the
+            // volume name, while an ext inode count can forge an HFS signature.
+            if ext_superblock_plausible(&sb_buf) {
+                return "ext";
+            }
             let sig = u16::from_be_bytes([sb_buf[0], sb_buf[1]]);
             match sig {
-                0x4244 => {
-                    // HFS MDB — check for embedded HFS+ (drEmbedSigWord at MDB offset 124)
+                // HFS MDB; drEmbedSigWord at 124 marks a wrapped HFS+ volume.
+                0x4244 if hfs_mdb_plausible(&sb_buf) => {
                     let embed_sig = u16::from_be_bytes([sb_buf[124], sb_buf[125]]);
                     if embed_sig == 0x482B {
                         return "hfsplus";
                     }
                     return "hfs";
                 }
-                0x482B | 0x4858 => return "hfsplus",
-                // MFS — pre-HFS, used by Mac 128K/512K and Mac Plus on 400 KB
+                0x482B | 0x4858 if hfsplus_header_plausible(&sb_buf) => return "hfsplus",
+                // MFS: pre-HFS, used by Mac 128K/512K and Mac Plus on 400 KB
                 // single-sided floppies. Same byte-1024 MDB convention as HFS.
                 0xD2D7 => return "mfs",
                 _ => {}
-            }
-            // ext superblock magic at offset 0x38 (56) within this sector
-            if sb_buf[0x38] == 0x53 && sb_buf[0x39] == 0xEF {
-                return "ext";
             }
             // ProDOS volume directory key block: prev_block==0, storage_type nibble==0xF,
             // entry_length==39, entries_per_block==13.
@@ -429,13 +471,25 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
     }
 
     // Sector 1 (offset 512): EFS superblock. EFS magic is at offset 28
-    // of the sector (0x00072959 / 0x0007295A, big-endian).
+    // of the sector (0x00072959 / 0x0007295A, big-endian). BeOS BFS puts its
+    // superblock in the same sector with `BFS1` at offset 32, in either order.
     if reader.seek(SeekFrom::Start(partition_offset + 512)).is_ok() {
         let mut efs_buf = [0u8; 512];
         if reader.read_exact(&mut efs_buf).is_ok() {
             let magic = u32::from_be_bytes([efs_buf[28], efs_buf[29], efs_buf[30], efs_buf[31]]);
             if magic == 0x0007_2959 || magic == 0x0007_295A {
                 return "efs";
+            }
+            if bfs::BfsSuperBlock::parse(&efs_buf).is_ok() {
+                return "bfs";
+            }
+            // BeOS/PPC has no boot block, so its superblock starts at byte 0.
+            if reader.seek(SeekFrom::Start(partition_offset)).is_ok() {
+                let mut head = [0u8; 512];
+                if reader.read_exact(&mut head).is_ok() && bfs::BfsSuperBlock::parse(&head).is_ok()
+                {
+                    return "bfs";
+                }
             }
         }
     }
@@ -450,6 +504,13 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
     // Sector 0 again: AmigaDOS "DOS\x" boot block (variants 0..7).
     if &sector0[0..3] == b"DOS" && sector0[3] <= 7 {
         return "affs";
+    }
+
+    // BeOS OFS (pre-BFS, DR1..DR8): a table of contents at sector 0 whose
+    // bitmap geometry has to cover the volume it claims. No magic number, so
+    // this runs after every format that has one.
+    if ofs::OfsToc::parse(&sector0).is_ok() {
+        return "ofs";
     }
 
     // Sector 128 (offset 65536 = 0x10000): btrfs superblock AND ReiserFS
@@ -617,9 +678,10 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
     // legacy floppy bblk path) or byte 0x04 (single-zone E-format
     // floppy dr0 path). Probe just enough to discriminate from random
     // data: log2(sec_size) in 8..=11, heads >= 1 (HD discs report up
-    // to 9+; the field is u8), density 0..=3, nzones >= 1. Matches the
-    // looser superfloppy probe in `partition::detect_superfloppy` —
-    // every disc that surfaces as "ADFS" there must also route here.
+    // to 9+; the field is u8), nzones >= 1. Density is a data-rate code
+    // (F-format is 4, G-format 8) and is not a validity test. Matches the
+    // superfloppy probe in `partition::detect_superfloppy` — every disc
+    // that surfaces as "ADFS" there must also route here.
     for cand in [0xDC0u64, 0x004u64] {
         if reader
             .seek(SeekFrom::Start(partition_offset + cand))
@@ -630,7 +692,6 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
                 let log2_sz = dr[0];
                 let secs_per_track = dr[1];
                 let heads = dr[2];
-                let density = dr[3];
                 let idlen = dr[4];
                 let nzones = dr[9];
                 // Bytes 52..60 (`unused52` in the kernel struct) must
@@ -639,7 +700,6 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
                 if (8..=11).contains(&log2_sz)
                     && secs_per_track >= 1
                     && heads >= 1
-                    && density <= 3
                     && nzones >= 1
                     && idlen >= log2_sz + 3
                     && reserved_zero
@@ -748,13 +808,12 @@ pub fn try_compact_partition_reader<R: Read + Seek + Send + 'static>(
     partition_type_string: Option<&str>,
 ) -> Result<(Box<dyn Read + Send>, CompactResult), String> {
     if let Some(type_str) = partition_type_string {
-        return compact_partition_reader_by_string(reader, partition_offset, type_str).and_then(
-            |opt| {
+        return compact_partition_reader_by_string(reader, partition_offset, type_str, true)
+            .and_then(|opt| {
                 opt.ok_or_else(|| {
                     format!("unsupported: APM type '{type_str}' has no compact reader")
                 })
-            },
-        );
+            });
     }
     // Used for size estimation; swap content doesn't affect the packed size, so
     // keep_swap=true (no need to walk for swap files here).
@@ -843,7 +902,7 @@ fn fat_compact_reader<R: Read + Seek + Send + 'static>(
 /// Returns `None` for unsupported filesystem types. On success, returns a
 /// boxed `Read` implementation and a `CompactResult` with sizing information.
 pub fn compact_partition_reader<R: Read + Seek + Send + 'static>(
-    mut reader: R,
+    reader: R,
     partition_offset: u64,
     partition_type: u8,
     partition_type_string: Option<&str>,
@@ -851,109 +910,81 @@ pub fn compact_partition_reader<R: Read + Seek + Send + 'static>(
 ) -> Option<(Box<dyn Read + Send>, CompactResult)> {
     // Check string-based type first (APM partitions)
     if let Some(type_str) = partition_type_string {
-        return compact_partition_reader_by_string(reader, partition_offset, type_str)
+        return compact_partition_reader_by_string(reader, partition_offset, type_str, keep_swap)
             .unwrap_or(None);
     }
     match partition_type {
-        // Auto-detect (superfloppy / type byte 0)
-        0x00 => {
-            let fs_type = detect_filesystem_type(&mut reader, partition_offset);
-            match fs_type {
-                "fat" => fat_compact_reader(reader, partition_offset, keep_swap),
-                "ntfs" => ntfs_compact_reader(reader, partition_offset),
-                "exfat" => exfat_compact_reader(reader, partition_offset),
-                "ext" => {
-                    let (reader, info) = CompactExtReader::new(reader, partition_offset).ok()?;
-                    Some((Box::new(reader), info))
-                }
-                "btrfs" => {
-                    let (reader, info) = CompactBtrfsReader::new(reader, partition_offset).ok()?;
-                    Some((Box::new(reader), info))
-                }
-                "reiserfs" => {
-                    let (reader, info) =
-                        CompactReiserFsReader::new(reader, partition_offset).ok()?;
-                    Some((Box::new(reader), info))
-                }
-                "ufs" => {
-                    let (reader, info) = CompactUfsReader::new(reader, partition_offset).ok()?;
-                    Some((Box::new(reader), info))
-                }
-                "jfs" => {
-                    let (reader, info) = CompactJfsReader::new(reader, partition_offset).ok()?;
-                    Some((Box::new(reader), info))
-                }
-                "prodos" => {
-                    let (reader, info) = CompactProDosReader::new(reader, partition_offset).ok()?;
-                    Some((Box::new(reader), info))
-                }
-                _ => None,
-            }
-        }
-        // FAT types
-        0x01 | 0x04 | 0x06 | 0x0E | 0x14 | 0x16 | 0x1E | 0x0B | 0x0C | 0x1B | 0x1C => {
+        0x01 | 0x04 | 0x06 | 0x0E | 0x11 | 0x14 | 0x16 | 0x1E | 0x0B | 0x0C | 0x1B | 0x1C => {
             fat_compact_reader(reader, partition_offset, keep_swap)
         }
-        // NTFS / exFAT
-        0x07 => {
-            let fs_type = detect_0x07_type(&mut reader, partition_offset);
-            match fs_type {
-                "ntfs" => ntfs_compact_reader(reader, partition_offset),
-                "exfat" => exfat_compact_reader(reader, partition_offset),
-                _ => None,
-            }
-        }
-        // Linux (ext2/3/4, btrfs, reiserfs). Also FAT for MSX HDDs that
-        // mis-stamp the type byte (Nextor / similar write 0x83 for FAT
-        // partitions).
-        0x83 => {
-            let fs_type = detect_filesystem_type(&mut reader, partition_offset);
-            match fs_type {
-                "ext" => {
-                    let (reader, info) = CompactExtReader::new(reader, partition_offset).ok()?;
-                    Some((Box::new(reader), info))
-                }
-                "btrfs" => {
-                    let (reader, info) = CompactBtrfsReader::new(reader, partition_offset).ok()?;
-                    Some((Box::new(reader), info))
-                }
-                "reiserfs" => {
-                    let (reader, info) =
-                        CompactReiserFsReader::new(reader, partition_offset).ok()?;
-                    Some((Box::new(reader), info))
-                }
-                "ufs" => {
-                    let (reader, info) = CompactUfsReader::new(reader, partition_offset).ok()?;
-                    Some((Box::new(reader), info))
-                }
-                "jfs" => {
-                    let (reader, info) = CompactJfsReader::new(reader, partition_offset).ok()?;
-                    Some((Box::new(reader), info))
-                }
-                "fat" => fat_compact_reader(reader, partition_offset, keep_swap),
-                _ => None,
-            }
-        }
-        // Apple HFS/HFS+ on MBR disks
-        0xAF => {
-            let (fs_type, hfsplus_offset) = resolve_apple_hfs(&mut reader, partition_offset);
-            match fs_type {
-                "hfsplus" => {
-                    let (compact, info) = CompactHfsPlusReader::new(reader, hfsplus_offset).ok()?;
-                    Some((Box::new(compact), info))
-                }
-                _ => {
-                    let (compact, info) = CompactHfsReader::new(reader, partition_offset).ok()?;
-                    Some((Box::new(compact), info))
-                }
-            }
-        }
-        // ProDOS on MBR disks
+        0xAF => apple_hfs_compact_reader(reader, partition_offset),
         0xA8 => {
             let (compact, info) = CompactProDosReader::new(reader, partition_offset).ok()?;
             Some((Box::new(compact), info))
         }
+        // Type byte 0 (superfloppy), 0x07 and 0x83 each name several
+        // filesystems, and any other byte is a wrong label: the content decides.
+        _ => compact_reader_for_detected(reader, partition_offset, keep_swap),
+    }
+}
+
+/// Compact reader for whatever `detect_filesystem_type` finds at the offset;
+/// the type byte or GUID was only a label, and the bytes on disk get packed.
+fn compact_reader_for_detected<R: Read + Seek + Send + 'static>(
+    mut reader: R,
+    partition_offset: u64,
+    keep_swap: bool,
+) -> Option<(Box<dyn Read + Send>, CompactResult)> {
+    match detect_filesystem_type(&mut reader, partition_offset) {
+        "fat" => fat_compact_reader(reader, partition_offset, keep_swap),
+        "ntfs" => ntfs_compact_reader(reader, partition_offset),
+        "exfat" => exfat_compact_reader(reader, partition_offset),
+        "ext" => {
+            let (reader, info) = CompactExtReader::new(reader, partition_offset).ok()?;
+            Some((Box::new(reader), info))
+        }
+        "btrfs" => {
+            let (reader, info) = CompactBtrfsReader::new(reader, partition_offset).ok()?;
+            Some((Box::new(reader), info))
+        }
+        "reiserfs" => {
+            let (reader, info) = CompactReiserFsReader::new(reader, partition_offset).ok()?;
+            Some((Box::new(reader), info))
+        }
+        "ufs" => {
+            let (reader, info) = CompactUfsReader::new(reader, partition_offset).ok()?;
+            Some((Box::new(reader), info))
+        }
+        "jfs" => {
+            let (reader, info) = CompactJfsReader::new(reader, partition_offset).ok()?;
+            Some((Box::new(reader), info))
+        }
+        "prodos" => {
+            let (reader, info) = CompactProDosReader::new(reader, partition_offset).ok()?;
+            Some((Box::new(reader), info))
+        }
+        "hfs" | "hfsplus" => apple_hfs_compact_reader(reader, partition_offset),
         _ => None,
+    }
+}
+
+/// HFS or HFS+ at the offset, as MBR type 0xAF and the Apple HFS GUID carry it.
+/// A wrapped HFS+ volume is left to the wrapper-aware clone path (`None`).
+fn apple_hfs_compact_reader<R: Read + Seek + Send + 'static>(
+    mut reader: R,
+    partition_offset: u64,
+) -> Option<(Box<dyn Read + Send>, CompactResult)> {
+    let (fs_type, hfsplus_offset) = resolve_apple_hfs(&mut reader, partition_offset);
+    match fs_type {
+        "hfsplus" if hfsplus_offset != partition_offset => None,
+        "hfsplus" => {
+            let (compact, info) = CompactHfsPlusReader::new(reader, hfsplus_offset).ok()?;
+            Some((Box::new(compact), info))
+        }
+        _ => {
+            let (compact, info) = CompactHfsReader::new(reader, partition_offset).ok()?;
+            Some((Box::new(compact), info))
+        }
     }
 }
 
@@ -1237,6 +1268,15 @@ pub fn fs_name_for(partition_type: u8, partition_type_string: Option<&str>) -> &
             "7C3457EF-0000-11AA-AA11-00306543ECAC" => "APFS",
             "Apple_UNIX_SVR2" => "ext/btrfs/xfs/reiserfs/UFS/JFS",
             "Linux" => "ext/btrfs/xfs/reiserfs/UFS/JFS",
+            // GPT Linux Filesystem / Linux Home GUIDs.
+            "0FC63DAF-8483-4772-8E79-3D69D8477DE4" | "933AC7E1-2EB4-4F13-B844-0E14E2AEF915" => {
+                "ext/btrfs/xfs/reiserfs/UFS/JFS"
+            }
+            // GPT EFI System Partition: FAT by specification.
+            "C12A7328-F81F-11D2-BA4B-00A0C93EC93B" => "FAT",
+            // GPT Microsoft Basic Data and Windows Recovery.
+            "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7" => "NTFS/exFAT/FAT",
+            "DE94BBA4-06D1-4D40-A16A-BFD50179D6AC" => "NTFS",
             // Amiga boot block present, no AmigaDOS filesystem (custom
             // bootblock / diagnostic disk). Browsable via the carve view.
             "Amiga-NDOS" => "Amiga NDOS (no filesystem)",
@@ -1244,6 +1284,8 @@ pub fn fs_name_for(partition_type: u8, partition_type_string: Option<&str>) -> &
             // the write path called both "unknown" (R-034).
             "lisafs" => "Apple Lisa File System",
             "Alto BFS" => "Alto BFS",
+            "Be_BFS" => "BFS (BeOS)",
+            "human68k" => "Human68k",
             _ => "unknown",
         };
     }
@@ -1252,13 +1294,19 @@ pub fn fs_name_for(partition_type: u8, partition_type_string: Option<&str>) -> &
         0x83 => "ext/btrfs/xfs/reiserfs/UFS/JFS",
         0xA8 => "ProDOS",
         0x07 => "NTFS/exFAT/HPFS",
-        0x01 | 0x04 | 0x06 | 0x0E | 0x14 | 0x16 | 0x1E | 0x0B | 0x0C | 0x1B | 0x1C => "FAT",
+        // 0x11 is hidden FAT12; 0xEF is an EFI System Partition on an MBR disk.
+        0x01 | 0x04 | 0x06 | 0x0E | 0x11 | 0x14 | 0x16 | 0x1E | 0x0B | 0x0C | 0x1B | 0x1C
+        | 0xEF => "FAT",
+        // Windows Recovery Environment.
+        0x27 => "NTFS",
         // SGI synthetic type bytes (PartitionTable::Sgi).
         0xA0 => "XFS",
         0xA1 => "SGI EFS",
         0xA2 => "SGI EFS v1",
         // Minix (0x81) and old Minix (0x80).
         0x80 | 0x81 => "Minix",
+        0xEB => "BFS (BeOS)",
+        0xEC => "BeOS OFS",
         _ => "unknown",
     }
 }
@@ -1294,7 +1342,11 @@ pub fn is_layout_preserving_fs(partition_type: u8, partition_type_string: Option
                 | "Apple_UNIX_SRVR2"
                 | "Apple_PRODOS"
                 | "Apple_ProDOS"
-                | "Linux",
+                | "Linux"
+                // GPT Apple HFS/HFS+, Linux Filesystem and Linux Home GUIDs.
+                | "48465300-0000-11AA-AA11-00306543ECAC"
+                | "0FC63DAF-8483-4772-8E79-3D69D8477DE4"
+                | "933AC7E1-2EB4-4F13-B844-0E14E2AEF915",
         );
     }
     // 0xA1 is our synthetic byte for SGI EFS (PartitionTable::Sgi).
@@ -1316,7 +1368,10 @@ pub fn has_defragmenting_writer(partition_type: u8, partition_type_string: Optio
         if is_amiga_pfs3_type(s) {
             return true;
         }
-        return matches!(s, "Apple_HFS" | "Apple_HFSX" | "Apple_HFS+");
+        return matches!(
+            s,
+            "Apple_HFS" | "Apple_HFSX" | "Apple_HFS+" | "48465300-0000-11AA-AA11-00306543ECAC"
+        );
     }
     matches!(partition_type, 0xAF)
 }
@@ -1369,7 +1424,16 @@ pub fn is_expensive_minimum(partition_type: u8, partition_type_string: Option<&s
             // SFS last_data_byte is a bitmap walk — cheap.
             return false;
         }
-        return matches!(s, "Apple_HFS" | "Apple_HFSX" | "Apple_UNIX_SVR2" | "Linux");
+        return matches!(
+            s,
+            "Apple_HFS"
+                | "Apple_HFSX"
+                | "Apple_UNIX_SVR2"
+                | "Linux"
+                | "48465300-0000-11AA-AA11-00306543ECAC"
+                | "0FC63DAF-8483-4772-8E79-3D69D8477DE4"
+                | "933AC7E1-2EB4-4F13-B844-0E14E2AEF915"
+        );
     }
     // 0xA1 (SGI EFS) and 0xA2 (SGI EFS v1): the conservative floor requires
     // an inode-table walk.
@@ -1397,6 +1461,38 @@ pub fn partition_minimum_size<R: Read + Seek + Send + 'static>(
     wrapper_hint: Option<hfsplus_wrapper_clone::WrappedHfsPlusInfo>,
     progress: &dyn Fn(&str),
 ) -> MinimumResult {
+    partition_minimum_size_cancellable(
+        reader,
+        partition_offset,
+        partition_type,
+        partition_type_string,
+        partition_size,
+        allow_expensive,
+        wrapper_hint,
+        progress,
+        &|| false,
+    )
+}
+
+/// [`partition_minimum_size`] that asks `cancel` between phases and stops with
+/// an empty result, so a closed source does not keep a worker reading it.
+#[allow(clippy::too_many_arguments)] // same dispatcher, plus the cancel probe
+pub fn partition_minimum_size_cancellable<R: Read + Seek + Send + 'static>(
+    reader: R,
+    partition_offset: u64,
+    partition_type: u8,
+    partition_type_string: Option<&str>,
+    partition_size: u64,
+    allow_expensive: bool,
+    wrapper_hint: Option<hfsplus_wrapper_clone::WrappedHfsPlusInfo>,
+    progress: &dyn Fn(&str),
+    cancel: &dyn Fn() -> bool,
+) -> MinimumResult {
+    let cancelled = || MinimumResult::Computed {
+        in_place: None,
+        defragmented: None,
+        fragmentation_percent: None,
+    };
     if !allow_expensive && is_expensive_minimum(partition_type, partition_type_string) {
         return MinimumResult::Deferred {
             fs_name: fs_name_for(partition_type, partition_type_string),
@@ -1421,6 +1517,10 @@ pub fn partition_minimum_size<R: Read + Seek + Send + 'static>(
     let (wrapper_info, wrapper_source) = if let Some(hint) = wrapper_hint {
         (Some(hint), "hint")
     } else {
+        if cancel() {
+            progress("Cancelled");
+            return cancelled();
+        }
         progress("Probing for HFS wrapper...");
         let info =
             hfsplus_wrapper_clone::detect_wrapped_hfsplus(&mut reader, partition_offset, u64::MAX);
@@ -1440,10 +1540,15 @@ pub fn partition_minimum_size<R: Read + Seek + Send + 'static>(
         )),
         None => progress("No HFS wrapper detected (flat HFS+ or non-HFS)"),
     }
+    if cancel() {
+        progress("Cancelled");
+        return cancelled();
+    }
     progress("Opening filesystem...");
-    let mut fs = match open_filesystem(
+    let mut fs = match open_filesystem_sized(
         reader,
         partition_offset,
+        Some(partition_size),
         partition_type,
         partition_type_string,
     ) {
@@ -1463,8 +1568,16 @@ pub fn partition_minimum_size<R: Read + Seek + Send + 'static>(
             };
         }
     };
+    if cancel() {
+        progress("Cancelled");
+        return cancelled();
+    }
     progress("Computing last data byte...");
     let in_place = fs.last_data_byte().ok().map(|m| m.min(partition_size));
+    if cancel() {
+        progress("Cancelled");
+        return cancelled();
+    }
     progress("Computing fragmentation...");
     let fragmentation_percent = match fs.fragmentation_stats() {
         Some(Ok(stats)) => {
@@ -1485,6 +1598,10 @@ pub fn partition_minimum_size<R: Read + Seek + Send + 'static>(
         }
         None => None,
     };
+    if cancel() {
+        progress("Cancelled");
+        return cancelled();
+    }
     progress("Computing defragmented minimum...");
     let inner_defrag = fs.defragmented_minimum_size().ok();
     let defragmented = inner_defrag.and_then(|m| {
@@ -1640,14 +1757,20 @@ pub fn open_filesystem_full<R: Read + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
-                "hfs" => Ok(Box::new(hfs::HfsFilesystem::open(
+                "hfs" => Ok(Box::new(hfs::HfsFilesystem::open_sized(
                     reader,
                     partition_offset,
+                    partition_size,
                 )?)),
-                "hfsplus" => Ok(Box::new(hfsplus::HfsPlusFilesystem::open(
-                    reader,
-                    partition_offset,
-                )?)),
+                // A bare HFS-wrapped HFS+ image (an OS 9 "Extended" volume) keeps
+                // its real volume behind the wrapper; opening at byte 0 saw an MDB.
+                "hfsplus" => {
+                    let (_, hfsplus_offset) = resolve_apple_hfs(&mut reader, partition_offset);
+                    Ok(Box::new(hfsplus::HfsPlusFilesystem::open(
+                        reader,
+                        hfsplus_offset,
+                    )?))
+                }
                 "mfs" => Ok(Box::new(mfs::MfsFilesystem::open(
                     reader,
                     partition_offset,
@@ -1725,6 +1848,14 @@ pub fn open_filesystem_full<R: Read + Seek + Send + 'static>(
                     partition_offset,
                 )?)),
                 "jfs" => Ok(Box::new(jfs::JfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "bfs" => Ok(Box::new(bfs::BfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "ofs" => Ok(Box::new(ofs::OfsFilesystem::open(
                     reader,
                     partition_offset,
                 )?)),
@@ -1848,9 +1979,15 @@ pub fn open_filesystem_full<R: Read + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
-                _ => Err(FilesystemError::Unsupported(
-                    "type 0x83 partition: unrecognized filesystem".into(),
-                )),
+                // fdisk's default byte hosts Minix, HFS+ and more; the wrong
+                // label is not proof there is nothing here (see the `_` arm).
+                _ => open_filesystem_with_passphrase(
+                    reader,
+                    partition_offset,
+                    0x00,
+                    None,
+                    passphrase,
+                ),
             }
         }
         // Apple HFS/HFS+ on MBR disks
@@ -1861,14 +1998,21 @@ pub fn open_filesystem_full<R: Read + Seek + Send + 'static>(
                     reader,
                     hfsplus_offset,
                 )?)),
-                _ => Ok(Box::new(hfs::HfsFilesystem::open(
+                _ => Ok(Box::new(hfs::HfsFilesystem::open_sized(
                     reader,
                     partition_offset,
+                    partition_size,
                 )?)),
             }
         }
         // ProDOS on MBR disks (type byte 0xA8)
         0xA8 => Ok(Box::new(prodos::ProDosFilesystem::open(
+            reader,
+            partition_offset,
+        )?)),
+        // BeOS BFS (type byte 0xEB). The BeOS installer also writes 0xEB for
+        // its swap partition, so `open` validates the superblock magic.
+        0xEB => Ok(Box::new(bfs::BfsFilesystem::open(
             reader,
             partition_offset,
         )?)),
@@ -1993,21 +2137,37 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                 let (fs_type, hfsplus_offset) = resolve_apple_hfs(&mut reader, partition_offset);
                 return match fs_type {
                     "hfsplus" => {
-                        let mut fs = hfsplus::HfsPlusFilesystem::open(reader, hfsplus_offset)?;
+                        let mut fs = hfsplus::HfsPlusFilesystem::open_sized(
+                            reader,
+                            hfsplus_offset,
+                            hfsplus_partition_len(partition_offset, hfsplus_offset, partition_len),
+                        )?;
                         fs.prepare_for_edit()?;
                         Ok(Box::new(fs))
                     }
-                    "hfs" => Ok(Box::new(hfs::HfsFilesystem::open(
+                    "hfs" => Ok(Box::new(hfs::HfsFilesystem::open_for_edit(
                         reader,
                         partition_offset,
+                        partition_len,
                     )?)),
                     _ => Err(FilesystemError::Unsupported(
                         "unrecognized Apple_HFS variant".into(),
                     )),
                 };
             }
+            // BeOS/PPC APM volumes.
+            "Be_BFS" => {
+                return Ok(Box::new(bfs::BfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?));
+            }
             "Apple_HFSX" => {
-                let mut fs = hfsplus::HfsPlusFilesystem::open(reader, partition_offset)?;
+                let mut fs = hfsplus::HfsPlusFilesystem::open_sized(
+                    reader,
+                    partition_offset,
+                    partition_len,
+                )?;
                 fs.prepare_for_edit()?;
                 return Ok(Box::new(fs));
             }
@@ -2023,6 +2183,11 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                         partition_offset,
                     )?)),
                     "jfs" => Ok(Box::new(jfs::JfsFilesystem::open(
+                        reader,
+                        partition_offset,
+                    )?)),
+                    // A/UX and NetBSD/mac68k slices: the read arm already opened them.
+                    "ufs" => Ok(Box::new(ufs::UfsFilesystem::open(
                         reader,
                         partition_offset,
                     )?)),
@@ -2164,12 +2329,18 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                         .unwrap_or(squashfs_edit::SizeBudget::Fit),
                     edit_ctx.whole_file_path,
                 )?)),
-                "hfs" => Ok(Box::new(hfs::HfsFilesystem::open(
+                "hfs" => Ok(Box::new(hfs::HfsFilesystem::open_for_edit(
                     reader,
                     partition_offset,
+                    partition_len,
                 )?)),
                 "hfsplus" => {
-                    let mut fs = hfsplus::HfsPlusFilesystem::open(reader, partition_offset)?;
+                    let (_, hfsplus_offset) = resolve_apple_hfs(&mut reader, partition_offset);
+                    let mut fs = hfsplus::HfsPlusFilesystem::open_sized(
+                        reader,
+                        hfsplus_offset,
+                        hfsplus_partition_len(partition_offset, hfsplus_offset, partition_len),
+                    )?;
                     fs.prepare_for_edit()?;
                     Ok(Box::new(fs))
                 }
@@ -2267,6 +2438,14 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "ofs" => Ok(Box::new(ofs::OfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "bfs" => Ok(Box::new(bfs::BfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 _ => {
                     // Name it the way the read path does. Detection returns
                     // "unknown" for filesystems identified by their container
@@ -2359,13 +2538,16 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
-                _ => Err(FilesystemError::Unsupported(format!(
-                    "editing not yet supported for type 0x83 filesystem '{fs_type}'"
-                ))),
+                _ => open_editable_filesystem_with(reader, partition_offset, edit_ctx, 0x00, None),
             }
         }
         // ProDOS
         0xA8 => Ok(Box::new(prodos::ProDosFilesystem::open(
+            reader,
+            partition_offset,
+        )?)),
+        // BeOS BFS
+        0xEB => Ok(Box::new(bfs::BfsFilesystem::open(
             reader,
             partition_offset,
         )?)),
@@ -2394,13 +2576,18 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
             let (fs_type, hfsplus_offset) = resolve_apple_hfs(&mut reader, partition_offset);
             match fs_type {
                 "hfsplus" => {
-                    let mut fs = hfsplus::HfsPlusFilesystem::open(reader, hfsplus_offset)?;
+                    let mut fs = hfsplus::HfsPlusFilesystem::open_sized(
+                        reader,
+                        hfsplus_offset,
+                        hfsplus_partition_len(partition_offset, hfsplus_offset, partition_len),
+                    )?;
                     fs.prepare_for_edit()?;
                     Ok(Box::new(fs))
                 }
-                "hfs" => Ok(Box::new(hfs::HfsFilesystem::open(
+                "hfs" => Ok(Box::new(hfs::HfsFilesystem::open_for_edit(
                     reader,
                     partition_offset,
+                    partition_len,
                 )?)),
                 _ => Err(FilesystemError::Unsupported(
                     "unrecognized HFS variant at type 0xAF".into(),
@@ -2439,17 +2626,25 @@ fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
         "Apple_HFS" | "48465300-0000-11AA-AA11-00306543ECAC" => {
             let (fs_type, hfsplus_offset) = resolve_apple_hfs(&mut reader, partition_offset);
             match fs_type {
-                "hfsplus" => Ok(Box::new(hfsplus::HfsPlusFilesystem::open(
+                "hfsplus" => Ok(Box::new(hfsplus::HfsPlusFilesystem::open_sized(
                     reader,
                     hfsplus_offset,
+                    hfsplus_partition_len(partition_offset, hfsplus_offset, partition_size),
                 )?)),
-                _ => Ok(Box::new(hfs::HfsFilesystem::open(
+                _ => Ok(Box::new(hfs::HfsFilesystem::open_sized(
                     reader,
                     partition_offset,
+                    partition_size,
                 )?)),
             }
         }
-        "Apple_HFSX" | "Apple_HFS+" => Ok(Box::new(hfsplus::HfsPlusFilesystem::open(
+        "Apple_HFSX" | "Apple_HFS+" => Ok(Box::new(hfsplus::HfsPlusFilesystem::open_sized(
+            reader,
+            partition_offset,
+            partition_size,
+        )?)),
+        // BeOS/PPC writes an APM whose BFS partitions carry "Be_BFS".
+        "Be_BFS" => Ok(Box::new(bfs::BfsFilesystem::open(
             reader,
             partition_offset,
         )?)),
@@ -2651,9 +2846,10 @@ fn compact_partition_reader_by_string<R: Read + Seek + Send + 'static>(
     mut reader: R,
     partition_offset: u64,
     type_str: &str,
+    keep_swap: bool,
 ) -> Result<Option<(Box<dyn Read + Send>, CompactResult)>, String> {
     match type_str {
-        "Apple_HFS" => {
+        "Apple_HFS" | "48465300-0000-11AA-AA11-00306543ECAC" => {
             let (fs_type, hfsplus_offset) = resolve_apple_hfs(&mut reader, partition_offset);
             match fs_type {
                 "hfsplus" => {
@@ -2735,7 +2931,13 @@ fn compact_partition_reader_by_string<R: Read + Seek + Send + 'static>(
                 })?;
             Ok(Some((Box::new(compact), info)))
         }
-        _ => Ok(None),
+        // A GPT GUID says what a partition is for, not what is in it (the ESP
+        // is FAT, Basic Data is NTFS/exFAT/FAT): ask the superblock, as reads do.
+        _ => Ok(compact_reader_for_detected(
+            reader,
+            partition_offset,
+            keep_swap,
+        )),
     }
 }
 
@@ -2769,6 +2971,24 @@ pub fn is_amiga_sfs_type(s: &str) -> bool {
 // `partition_is_browsable` is the combined gate the partition grids actually
 // call; the others gate the more specific Check / Expand actions.
 
+/// The MBR type byte whose gates match a superfloppy's detected filesystem, so
+/// a bare volume is graded like the same filesystem inside a partition table.
+pub fn gate_type_byte_for_hint(fs_hint: &str) -> u8 {
+    match fs_hint {
+        "HFS" | "HFS+" | "HFSX" => 0xAF,
+        "ext" | "btrfs" | "XFS" | "ReiserFS" | "UFS" | "JFS" | "squashfs" => 0x83,
+        "ProDOS" => 0xA8,
+        "FAT" => 0x0C,
+        "NTFS" | "exFAT" | "HPFS" => 0x07,
+        "minix" => 0x81,
+        "BFS" => 0xEB,
+        "BeOS OFS" => 0xEC,
+        "EFS" => 0xA1,
+        "SGI EFS v1" => 0xA2,
+        _ => 0,
+    }
+}
+
 /// True for an MBR partition type byte whose filesystem the browser can open.
 pub fn is_browsable_type(ptype: u8) -> bool {
     matches!(
@@ -2789,8 +3009,18 @@ pub fn is_browsable_type(ptype: u8) -> bool {
             | 0xA0
             | 0xA1
             | 0xA2
+            // BSD / Solaris UFS slices; 0xA8 (Apple UFS) used to be the only one.
+            | 0xA5
+            | 0xA6
             | 0xA8
+            | 0xA9
             | 0xAF
+            | 0xBF
+            // BeOS BFS.
+            | 0xEB
+            // Minix; `open_filesystem` has handled both bytes since the driver landed.
+            | 0x80
+            | 0x81
     )
 }
 
@@ -2811,6 +3041,8 @@ pub fn is_browsable_type_string(type_str: Option<&str>) -> bool {
         "Apple_HFS"
             | "Apple_HFSX"
             | "Apple_HFS+"
+            // BeOS/PPC writes an APM whose BFS partitions carry "Be_BFS".
+            | "Be_BFS"
             | "Apple_UNIX_SVR2"
             | "Apple_UNIX_SRVR2"
             | "Apple_PRODOS"
@@ -2874,7 +3106,13 @@ pub fn is_browsable_superfloppy(ptype: u8, type_name: &str) -> bool {
             // table.
             | "squashfs"
             | "EFS"
+            // A bare EFS v1 volume names itself in full; "EFS" above is IRIX 5.3+.
+            | "SGI EFS v1"
             | "MFS"
+            // Bare BeOS and HPFS volumes; all three drivers read, edit and fsck.
+            | "BFS"
+            | "BeOS OFS"
+            | "HPFS"
             // Minix (raw floppy / hard-disk superfloppy); auto-detected at
             // byte 1024 by both detect_superfloppy and detect_filesystem_type.
             | "minix"
@@ -2915,8 +3153,59 @@ fn is_fat_name(name: &str) -> bool {
     name.to_ascii_lowercase().contains("fat")
 }
 
+/// Roles that never hold a filesystem: swap, boot, alternate-sector and
+/// replacement areas, and unassigned slots. Shared by all four disk labels.
+fn is_reserved_slice_role(role: &str) -> bool {
+    matches!(
+        role.trim().to_ascii_lowercase().as_str(),
+        "swap"
+            | "boot"
+            | "altsctr"
+            | "unassigned"
+            | "reserved"
+            | "backup"
+            | "volhdr"
+            | "trkrepl"
+            | "secrepl"
+            | "volume"
+            | "xfslog"
+            | "raw"
+    )
+}
+
+/// True for a slice of a Unix disk label (NeXT, Sun VTOC, Solaris x86 VTOC,
+/// SGI volume header) whose entries carry no type byte and no type string.
+pub fn is_browsable_scheme_slice(type_name: &str) -> bool {
+    // The role sits in the parentheses for NeXT and Solaris.
+    let paren_role = type_name.rfind('(').and_then(|i| {
+        type_name[i + 1..]
+            .find(')')
+            .map(|j| &type_name[i + 1..i + 1 + j])
+    });
+
+    if let Some(rest) = type_name.strip_prefix("Sun ") {
+        // "Sun <tag> (UFS?)" — the tag is before the parenthesis here.
+        let tag = rest.split(" (").next().unwrap_or("");
+        return !is_reserved_slice_role(tag);
+    }
+    if type_name.starts_with("Solaris s") || type_name.starts_with("NeXT ") {
+        return match paren_role {
+            Some(r) => !is_reserved_slice_role(r),
+            None => false,
+        };
+    }
+    if let Some(rest) = type_name.strip_prefix("SGI ") {
+        // "SGI BSD" (volume header) and "SGI swap" (disk label) both lead
+        // with the deciding word.
+        let head = rest.split(" (").next().unwrap_or("");
+        return !is_reserved_slice_role(head);
+    }
+    false
+}
+
 /// The combined "can this partition be opened in the browser?" gate — the OR of
-/// the type-byte, type-string, FAT-name fallback, and superfloppy-hint checks.
+/// the type-byte, type-string, FAT-name fallback, superfloppy-hint and
+/// disk-label-slice checks.
 /// This is the single predicate the Inspect grid and the Commander pane both
 /// call to decide whether to offer Browse (and, for Commander, whether to
 /// auto-open a partition at all).
@@ -2925,6 +3214,7 @@ pub fn partition_is_browsable(ptype: u8, type_string: Option<&str>, type_name: &
         || is_fat_name(type_name)
         || is_browsable_type_string(type_string)
         || is_browsable_superfloppy(ptype, type_name)
+        || is_browsable_scheme_slice(type_name)
 }
 
 /// True when a partition row is a classic-HFS **superfloppy** — a flat,
@@ -2970,6 +3260,16 @@ pub fn is_checkable_type(ptype: u8, type_str: Option<&str>) -> bool {
     if ptype == 0xAF || matches!(type_str, Some("Apple_HFS")) {
         return true;
     }
+    // Minix (0x80/0x81), the BSD / Solaris UFS bytes, BeOS BFS, and the APM
+    // Unix slices all have fsck drivers the byte-only gate never reached.
+    if matches!(ptype, 0x80 | 0x81 | 0xA5 | 0xA6 | 0xA9 | 0xBF | 0xEB)
+        || matches!(
+            type_str,
+            Some("Apple_UNIX_SVR2") | Some("Apple_UNIX_SRVR2") | Some("Be_BFS")
+        )
+    {
+        return true;
+    }
     // ProDOS (`prodos::fsck`): MBR type byte 0xA8, or the APM DosType strings.
     if ptype == 0xA8 || matches!(type_str, Some("Apple_PRODOS") | Some("Apple_ProDOS")) {
         return true;
@@ -3007,8 +3307,25 @@ pub fn is_checkable_type(ptype: u8, type_str: Option<&str>) -> bool {
 /// (its resolved name is `"NTFS"` / `"NTFS 3.1"`).
 pub fn is_checkable_fs_name(type_name: &str) -> bool {
     let n = type_name.to_ascii_uppercase();
+    // "SOLARIS S0 (ROOT)" rows are UFS; the GPT ESP / basic-data rows hold
+    // FAT, NTFS or exFAT; the rest name drivers that implement `fsck()`.
     [
-        "HFS", "EFS", "UFS", "XFS", "JFS", "FAT", "EXT", "NTFS", "HPFS",
+        "HFS",
+        "EFS",
+        "UFS",
+        "XFS",
+        "JFS",
+        "FAT",
+        "EXT",
+        "NTFS",
+        "HPFS",
+        "MINIX",
+        "UCSD",
+        "BFS",
+        "OFS",
+        "SOLARIS",
+        "EFI SYSTEM",
+        "MICROSOFT BASIC DATA",
     ]
     .iter()
     .any(|tok| n.contains(tok))
@@ -3054,6 +3371,47 @@ pub fn is_checkable_retro_fs(ptype: u8, type_string: Option<&str>, type_name: &s
                 | "ADFS"
                 | "Oric Jasmin"
         )
+}
+
+/// After an image is poured into a partition, make an Apple volume fit it:
+/// an HFS+ header is mirrored at the partition end (R-057), a classic HFS
+/// volume is grown to it (R-058). Anything else is left as poured.
+pub fn fit_apple_volume_to_partition(
+    device: &mut (impl Read + Write + Seek),
+    partition_offset: u64,
+    partition_len: u64,
+    log: &mut impl FnMut(&str),
+) -> anyhow::Result<()> {
+    if partition_len < 2048 {
+        return Ok(());
+    }
+    device.seek(SeekFrom::Start(partition_offset + 1024))?;
+    let mut sig = [0u8; 2];
+    device.read_exact(&mut sig)?;
+    match u16::from_be_bytes(sig) {
+        0x482B | 0x4858 => {
+            hfsplus::mirror_alternate_volume_header(device, partition_offset, partition_len, log)?;
+        }
+        0x4244 => {
+            hfs::fit_hfs_volume_to_partition(device, partition_offset, partition_len, log)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// The partition length an HFS+ volume may use for its alternate header: the
+/// partition's own when the volume starts it, none when wrapped (H7).
+fn hfsplus_partition_len(
+    partition_offset: u64,
+    hfsplus_offset: u64,
+    partition_len: Option<u64>,
+) -> Option<u64> {
+    if hfsplus_offset == partition_offset {
+        partition_len
+    } else {
+        None
+    }
 }
 
 /// Resolve the actual HFS filesystem variant for an "Apple_HFS" APM partition.
@@ -3630,6 +3988,97 @@ mod tests {
         assert!(partition_is_browsable(0, Some("SFS\\0"), "SFS (Amiga)"));
     }
 
+    /// Every shape the corpus produces for a filesystem we can open; see
+    /// OUTSTANDINGWORK.md section 8 for how the list was surveyed.
+    #[test]
+    fn every_openable_filesystem_offers_browse() {
+        // Bare volumes: no partition table, identified by name alone.
+        for name in [
+            "HPFS",
+            "BFS",
+            "BeOS OFS",
+            "SGI EFS v1",
+            "UFS",
+            "EFS",
+            "XFS",
+            "JFS",
+            "minix",
+            "ext",
+            "btrfs",
+            "NTFS",
+            "HFS",
+            "HFS+",
+            "APFS",
+            "FAT",
+            "ProDOS",
+            "exFAT",
+            "ReiserFS",
+            "squashfs",
+            "MFS",
+            "ucsd",
+        ] {
+            assert!(
+                partition_is_browsable(0, None, name),
+                "bare volume {name:?} must offer Browse"
+            );
+        }
+
+        // Partition-hosted, identified by type byte.
+        assert!(partition_is_browsable(0xEB, None, "BeOS BFS"));
+        assert!(partition_is_browsable(0xA5, None, "FreeBSD"));
+        assert!(partition_is_browsable(0xA9, None, "NetBSD"));
+        assert!(partition_is_browsable(0xBF, None, "Solaris"));
+
+        // Partition-hosted, identified by APM type string.
+        assert!(partition_is_browsable(
+            0,
+            Some("Be_BFS"),
+            "Be_BFS (untitled 2)"
+        ));
+
+        // Unix disk labels: no type byte, no type string, role in the name.
+        for name in [
+            "NeXT a (4.3BSD)",
+            "Sun root (UFS?)",
+            "Sun usr (UFS?)",
+            "Sun home (UFS?)",
+            "Solaris s0 (root)",
+            "SGI BSD",
+            "SGI root (EFS v1)",
+        ] {
+            assert!(
+                partition_is_browsable(0, None, name),
+                "label slice {name:?} must offer Browse"
+            );
+        }
+    }
+
+    /// The other half: rows that must NOT offer Browse. Swap is load-bearing —
+    /// it yields a carve view or a stale tree, never the volume asked for.
+    #[test]
+    fn reserved_and_container_rows_do_not_offer_browse() {
+        for name in [
+            "Sun swap (UFS?)",
+            "Solaris s1 (swap)",
+            "Solaris s8 (boot)",
+            "Solaris s9 (altsctr)",
+            "SGI swap",
+            "SGI SECREPL",
+            "SGI VOLHDR",
+            "SGI TRKREPL",
+        ] {
+            assert!(
+                !partition_is_browsable(0, None, name),
+                "reserved slice {name:?} must NOT offer Browse"
+            );
+        }
+        // Extended containers hold no filesystem of their own.
+        assert!(!partition_is_browsable(0x0F, None, "Extended (LBA)"));
+        assert!(!partition_is_browsable(0x05, None, "Extended"));
+        // QDOS microdrive has no directory walk yet, so Browse would error.
+        assert!(!partition_is_browsable(0, None, "qdos_mdv"));
+    }
+
     #[test]
     fn checkable_retro_fs_gate() {
         // Factory-reachable retro filesystems that implement fsck().
@@ -3794,7 +4243,10 @@ mod tests {
         buf[3..11].copy_from_slice(b"SYSLINUX");
         buf[11..13].copy_from_slice(&512u16.to_le_bytes()); // bytes/sector (valid)
         buf[13] = 0; // sectors/cluster == 0 -> not a real FAT BPB
-                     // ext2 superblock magic (0xEF53 LE) at offset 1024 + 0x38.
+                     // ext2 superblock at offset 1024: inode and block counts a
+                     // real volume never has at zero, then the 0xEF53 magic at +0x38.
+        buf[1024..1028].copy_from_slice(&128u32.to_le_bytes());
+        buf[1028..1032].copy_from_slice(&1024u32.to_le_bytes());
         buf[1024 + 0x38] = 0x53;
         buf[1024 + 0x39] = 0xEF;
         buf
@@ -3963,5 +4415,353 @@ mod identification_tests {
         assert!(fs_name_matches("HFS/HFS+", "HFS"));
         assert!(fs_name_matches("HFS/HFS+", "hfsplus"));
         assert!(!fs_name_matches("NTFS/HPFS/exFAT", "FAT"));
+    }
+}
+
+#[cfg(test)]
+mod gpt_guid_dispatch_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    const HFS_GUID: &str = "48465300-0000-11AA-AA11-00306543ECAC";
+    const LINUX_FS_GUID: &str = "0FC63DAF-8483-4772-8E79-3D69D8477DE4";
+    const LINUX_HOME_GUID: &str = "933AC7E1-2EB4-4F13-B844-0E14E2AEF915";
+    const ESP_GUID: &str = "C12A7328-F81F-11D2-BA4B-00A0C93EC93B";
+    const MS_BASIC_DATA_GUID: &str = "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7";
+    const WIN_RE_GUID: &str = "DE94BBA4-06D1-4D40-A16A-BFD50179D6AC";
+
+    /// F7: the four gates graded a GPT disk's partitions as "unknown" and
+    /// therefore packing, so an ext or HFS+ partition got the wrong minimum.
+    #[test]
+    fn gpt_guids_are_named_and_graded_like_their_mbr_bytes() {
+        for guid in [LINUX_FS_GUID, LINUX_HOME_GUID] {
+            assert_eq!(fs_name_for(0, Some(guid)), fs_name_for(0x83, None));
+            assert!(is_layout_preserving_fs(0, Some(guid)));
+            assert!(is_expensive_minimum(0, Some(guid)));
+            assert!(!has_defragmenting_writer(0, Some(guid)));
+            assert_eq!(
+                pick_shrink_target(0, Some(guid), Some(500), Some(100)),
+                Some(500),
+                "a layout-preserving GPT partition must keep the in-place trim"
+            );
+        }
+        assert_eq!(fs_name_for(0, Some(HFS_GUID)), "HFS/HFS+");
+        assert!(is_layout_preserving_fs(0, Some(HFS_GUID)));
+        assert!(is_expensive_minimum(0, Some(HFS_GUID)));
+        assert!(has_defragmenting_writer(0, Some(HFS_GUID)));
+        assert_eq!(fs_name_for(0, Some(ESP_GUID)), "FAT");
+        assert_eq!(fs_name_for(0, Some(MS_BASIC_DATA_GUID)), "NTFS/exFAT/FAT");
+        assert_eq!(fs_name_for(0, Some(WIN_RE_GUID)), "NTFS");
+        for guid in [ESP_GUID, MS_BASIC_DATA_GUID, WIN_RE_GUID] {
+            assert!(!is_layout_preserving_fs(0, Some(guid)));
+            assert!(!is_expensive_minimum(0, Some(guid)));
+        }
+    }
+
+    #[test]
+    fn hidden_and_esp_type_bytes_are_named() {
+        assert_eq!(fs_name_for(0x11, None), "FAT");
+        assert_eq!(fs_name_for(0xEF, None), "FAT");
+        assert_eq!(fs_name_for(0x27, None), "NTFS");
+        for ty in [0x11u8, 0x27, 0xEF] {
+            assert!(!is_layout_preserving_fs(ty, None));
+            assert!(!is_expensive_minimum(ty, None));
+        }
+    }
+
+    /// The compact path used to hand back "unsupported" for every one of these,
+    /// so a backup of an ESP or a Basic Data partition was stored unpacked.
+    #[test]
+    fn fat32_compacts_behind_every_label_that_carries_it() {
+        let img = crate::fs::fat::create_blank_fat32(64 * 1024 * 1024, Some("DATA")).unwrap();
+        for ty in [0x07u8, 0x11, 0x27, 0xEF] {
+            try_compact_partition_reader(Cursor::new(img.clone()), 0, ty, None)
+                .unwrap_or_else(|e| panic!("MBR type 0x{ty:02X} must compact FAT32: {e}"));
+        }
+        for guid in [ESP_GUID, MS_BASIC_DATA_GUID, WIN_RE_GUID, LINUX_FS_GUID] {
+            try_compact_partition_reader(Cursor::new(img.clone()), 0, 0, Some(guid))
+                .unwrap_or_else(|e| panic!("GPT {guid} must compact FAT32: {e}"));
+        }
+        // An APM driver slot has no filesystem, and the probe must say so.
+        let err = try_compact_partition_reader(
+            Cursor::new(vec![0u8; 1024 * 1024]),
+            0,
+            0,
+            Some("Apple_Driver43"),
+        )
+        .err()
+        .expect("random zeros must not compact");
+        assert!(err.starts_with("unsupported"), "{err}");
+    }
+
+    #[test]
+    fn ext2_and_hfsplus_compact_behind_their_gpt_guids() {
+        let ext = crate::fs::ext_format::create_blank_ext2(32 * 1024 * 1024, "T").unwrap();
+        for guid in [LINUX_FS_GUID, LINUX_HOME_GUID] {
+            try_compact_partition_reader(Cursor::new(ext.clone()), 0, 0, Some(guid))
+                .unwrap_or_else(|e| panic!("GPT {guid} must compact ext2: {e}"));
+        }
+        let hfsp = crate::fs::hfsplus::create_blank_hfsplus(32 * 1024 * 1024, 4096, "T", false);
+        try_compact_partition_reader(Cursor::new(hfsp.clone()), 0, 0, Some(HFS_GUID))
+            .unwrap_or_else(|e| panic!("GPT Apple HFS must compact HFS+: {e}"));
+        // A bare (superfloppy) HFS+ volume is the same bytes under type byte 0.
+        try_compact_partition_reader(Cursor::new(hfsp), 0, 0, None)
+            .unwrap_or_else(|e| panic!("type byte 0 must compact HFS+: {e}"));
+    }
+}
+
+#[cfg(test)]
+mod adfs_density_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// F11: the detector required density <= 3, but the disc record's density
+    /// is a data-rate code: F-format (1.6 MB) is 4 and G-format is 8. The
+    /// superfloppy probe never checked it, so those discs surfaced as ADFS in
+    /// the partition list and then failed to open.
+    #[test]
+    fn quad_and_octal_density_disc_records_still_detect_as_adfs() {
+        let blank = crate::fs::adfs::create_blank_adfs("F");
+        assert_eq!(
+            detect_filesystem_type(&mut Cursor::new(blank.clone()), 0),
+            "adfs"
+        );
+        for density in [4u8, 8] {
+            let mut disk = blank.clone();
+            disk[0x04 + 0x03] = density;
+            assert_eq!(
+                detect_filesystem_type(&mut Cursor::new(disk.clone()), 0),
+                "adfs",
+                "density {density}"
+            );
+            let table = crate::partition::PartitionTable::detect(&mut Cursor::new(disk)).unwrap();
+            assert!(
+                matches!(&table, crate::partition::PartitionTable::None { fs_hint, .. } if fs_hint == "ADFS"),
+                "density {density}: {table:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod superfloppy_gate_tests {
+    use super::*;
+    use crate::partition::{PartitionInfo, PartitionTable};
+    use std::io::Cursor;
+
+    fn superfloppy(img: Vec<u8>) -> PartitionInfo {
+        let table = PartitionTable::detect(&mut Cursor::new(img)).unwrap();
+        assert!(matches!(table, PartitionTable::None { .. }), "{table:?}");
+        let mut parts = table.partitions();
+        assert_eq!(parts.len(), 1);
+        parts.remove(0)
+    }
+
+    /// F12: a bare volume has type byte 0 and no type string, so the gates
+    /// called it packing and pick_shrink_target chose the defragmented size
+    /// for a layout-preserving HFS or ext volume, which drops blocks.
+    #[test]
+    fn a_bare_volume_is_graded_like_the_same_filesystem_in_a_table() {
+        let hfs = crate::fs::hfs::create_blank_hfs(8 * 1024 * 1024, 4096, "Bare").unwrap();
+        let part = superfloppy(hfs);
+        assert_eq!(part.partition_type_byte, 0);
+        assert_eq!(part.gate_type_byte(), 0xAF, "{}", part.type_name);
+        assert!(is_layout_preserving_fs(part.gate_type_byte(), None));
+
+        let ext = crate::fs::ext_format::create_blank_ext2(16 * 1024 * 1024, "bare").unwrap();
+        let part = superfloppy(ext);
+        assert_eq!(part.gate_type_byte(), 0x83, "{}", part.type_name);
+        assert_eq!(
+            pick_shrink_target(part.gate_type_byte(), None, Some(500), Some(100)),
+            Some(500),
+            "a bare ext volume must keep the in-place trim"
+        );
+
+        let fat = crate::fs::fat::create_blank_fat32(64 * 1024 * 1024, Some("BARE")).unwrap();
+        let part = superfloppy(fat);
+        assert_eq!(part.gate_type_byte(), 0x0C, "{}", part.type_name);
+        assert!(!is_layout_preserving_fs(part.gate_type_byte(), None));
+    }
+
+    /// A superfloppy that already routes through its type string (AmigaDOS,
+    /// Human68k) and any real table entry keep their own byte.
+    #[test]
+    fn gate_type_byte_leaves_string_routed_and_table_entries_alone() {
+        let mut amiga =
+            superfloppy(crate::fs::fat::create_blank_fat32(64 * 1024 * 1024, None).unwrap());
+        amiga.partition_type_string = Some("DOS\\1".to_string());
+        amiga.type_name = "HFS".to_string();
+        assert_eq!(amiga.gate_type_byte(), 0);
+        let mut mbr = amiga.clone();
+        mbr.partition_type_string = None;
+        mbr.partition_type_byte = 0x83;
+        assert_eq!(mbr.gate_type_byte(), 0x83);
+    }
+}
+
+#[cfg(test)]
+mod probe_order_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// F13: the HFS signature at +1024 was matched before the ext magic, so an
+    /// ext volume whose inode count happened to end in 0x4442 ("BD") opened
+    /// as HFS. ext now goes first, and the HFS arms check the MDB is real.
+    #[test]
+    fn an_ext_superblock_wins_over_a_forged_hfs_signature() {
+        let mut img = vec![0u8; 8192];
+        let sb = &mut img[1024..1536];
+        sb[0..4].copy_from_slice(&0x0001_4442u32.to_le_bytes()); // "BD" in big-endian
+        sb[4..8].copy_from_slice(&4096u32.to_le_bytes());
+        sb[0x18..0x1C].copy_from_slice(&0u32.to_le_bytes());
+        sb[0x38] = 0x53;
+        sb[0x39] = 0xEF;
+        // Fields an HFS MDB would need, so ordering alone decides.
+        sb[18..20].copy_from_slice(&16u16.to_be_bytes());
+        sb[20..24].copy_from_slice(&512u32.to_be_bytes());
+        assert_eq!(
+            detect_filesystem_type(&mut Cursor::new(img.clone()), 0),
+            "ext"
+        );
+        let table = crate::partition::PartitionTable::detect(&mut Cursor::new(img)).unwrap();
+        assert!(
+            matches!(&table, crate::partition::PartitionTable::None { fs_hint, .. } if fs_hint == "ext"),
+            "{table:?}"
+        );
+    }
+
+    /// The other direction: an HFS volume whose name carries the two ext magic
+    /// bytes at +0x38 is still HFS, because the rest of the superblock is not.
+    #[test]
+    fn a_real_hfs_volume_is_not_mistaken_for_ext() {
+        let mut img = crate::fs::hfs::create_blank_hfs(8 * 1024 * 1024, 4096, "Vol").unwrap();
+        img[1024 + 36] = 27;
+        img[1024 + 0x38] = 0x53;
+        img[1024 + 0x39] = 0xEF;
+        assert_eq!(detect_filesystem_type(&mut Cursor::new(img), 0), "hfs");
+    }
+
+    #[test]
+    fn genuine_volumes_still_detect_after_the_reorder() {
+        let hfsp = crate::fs::hfsplus::create_blank_hfsplus(8 * 1024 * 1024, 4096, "P", false);
+        assert_eq!(detect_filesystem_type(&mut Cursor::new(hfsp), 0), "hfsplus");
+        let hfsx = crate::fs::hfsplus::create_blank_hfsplus(8 * 1024 * 1024, 4096, "X", true);
+        assert_eq!(detect_filesystem_type(&mut Cursor::new(hfsx), 0), "hfsplus");
+        let ext = crate::fs::ext_format::create_blank_ext2(16 * 1024 * 1024, "e").unwrap();
+        assert_eq!(detect_filesystem_type(&mut Cursor::new(ext), 0), "ext");
+        // A Minix superblock forging the HFS signature falls through to Minix
+        // now that an MDB needs a real block size.
+        let mut minix = crate::fs::minix::create_blank_minix(
+            4 * 1024 * 1024,
+            crate::fs::minix::MinixVersion::V1,
+        )
+        .unwrap();
+        assert_eq!(
+            detect_filesystem_type(&mut Cursor::new(minix.clone()), 0),
+            "minix"
+        );
+        minix[1024] = 0x42;
+        minix[1025] = 0x44;
+        assert_eq!(detect_filesystem_type(&mut Cursor::new(minix), 0), "minix");
+    }
+}
+
+#[cfg(test)]
+mod min_size_cancel_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::io::Cursor;
+
+    /// C11: a closed source used to leave the min-size worker reading it until
+    /// the walk finished; the cancel probe stops it at the next phase.
+    #[test]
+    fn cancel_stops_the_minimum_size_walk_before_it_opens() {
+        let img = crate::fs::fat::create_blank_fat(8 * 1024 * 1024, Some("X")).unwrap();
+        let phases = RefCell::new(Vec::new());
+        let result = partition_minimum_size_cancellable(
+            Cursor::new(img.clone()),
+            0,
+            0x0C,
+            None,
+            img.len() as u64,
+            true,
+            None,
+            &|p| phases.borrow_mut().push(p.to_string()),
+            &|| true,
+        );
+        assert!(matches!(
+            result,
+            MinimumResult::Computed {
+                in_place: None,
+                defragmented: None,
+                ..
+            }
+        ));
+        let phases = phases.into_inner();
+        assert_eq!(
+            phases.last().map(String::as_str),
+            Some("Cancelled"),
+            "{phases:?}"
+        );
+        assert!(
+            !phases.iter().any(|p| p.starts_with("Opening")),
+            "{phases:?}"
+        );
+
+        // Without a cancel the same walk completes.
+        let result = partition_minimum_size(
+            Cursor::new(img.clone()),
+            0,
+            0x0C,
+            None,
+            img.len() as u64,
+            true,
+            None,
+            &|_| {},
+        );
+        assert!(matches!(
+            result,
+            MinimumResult::Computed {
+                in_place: Some(_),
+                ..
+            }
+        ));
+    }
+}
+
+#[cfg(test)]
+mod human68k_dispatch_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn human68k_sector() -> Vec<u8> {
+        let mut disk = vec![0u8; 64 * 1024];
+        disk[0] = 0x60; // BRA.S
+        disk[11..13].copy_from_slice(&1024u16.to_be_bytes());
+        disk[13] = 1;
+        disk
+    }
+
+    /// F10: the dispatch helpers called a Human68k volume "unknown" and
+    /// the detector never saw its BRA.S boot sector.
+    #[test]
+    fn human68k_is_named_detected_and_resizable() {
+        assert_eq!(fs_name_for(0, Some("human68k")), "Human68k");
+        assert_eq!(
+            detect_filesystem_type(&mut Cursor::new(human68k_sector()), 0),
+            "human68k"
+        );
+        assert!(matches!(
+            in_place_resize_support(&mut Cursor::new(vec![0u8; 4096]), 0, Some("human68k")),
+            InPlaceResize::Supported("Human68k")
+        ));
+        assert!(matches!(
+            in_place_resize_support(&mut Cursor::new(human68k_sector()), 0, None),
+            InPlaceResize::Supported("Human68k")
+        ));
+        // A PC boot sector is still not mistaken for one.
+        let mut pc = human68k_sector();
+        pc[0] = 0xEB;
+        assert_ne!(detect_filesystem_type(&mut Cursor::new(pc), 0), "human68k");
     }
 }

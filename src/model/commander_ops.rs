@@ -17,11 +17,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 
 use crate::fs::entry::{EntryType, FileEntry};
 use crate::fs::filesystem::Filesystem;
-use crate::fs::fork_export::{export_file_with_fork, safe_name};
+use crate::fs::fork_export::{export_file_with_fork, primary_output_path, safe_name};
+use crate::fs::replace::OnConflict;
 use crate::fs::resource_fork::{ImportedResourceFork, ResourceForkMode};
 use crate::model::browse_session::BrowseSession;
 use crate::model::commander_descend::DescendKind;
@@ -35,8 +36,8 @@ use crate::remote::RemoteConnection;
 /// Opens the filesystem read-write via [`BrowseSession::open_editable`],
 /// replays each edit through [`apply_edit`], calls `sync_metadata`, then commits
 /// the container (a no-op for raw images / devices, a re-encode for floppy
-/// containers). Errors abort the batch — the queue is left intact by the caller
-/// so the user can retry.
+/// containers). A failure stops the batch after syncing and committing what
+/// landed; the error names how many applied so the caller can trim its queue.
 pub fn apply_edits(session: &BrowseSession, edits: &[StagedEdit]) -> Result<()> {
     apply_edits_reporting(session, edits, |_| {})
 }
@@ -52,14 +53,38 @@ pub fn apply_edits_reporting(
     let (mut efs, commit) = session
         .open_editable()
         .context("opening source for editing")?;
+    let mut failure: Option<anyhow::Error> = None;
+    let mut applied = 0usize;
     for (index, edit) in edits.iter().enumerate() {
-        apply_edit(efs.as_mut(), edit).context("applying a staged edit")?;
+        if let Err(e) = apply_edit(efs.as_mut(), edit) {
+            failure = Some(anyhow::Error::new(e).context(format!(
+                "applying edit {} of {} ({})",
+                index + 1,
+                edits.len(),
+                edit_label(edit)
+            )));
+            break;
+        }
+        applied += 1;
         on_progress(EditProgress { index, edit });
     }
-    efs.sync_metadata().context("writing filesystem metadata")?;
+    // What already landed still has to reach the disk and the container,
+    // or a failure at edit 7 leaves edits 1-6 unsynced on a temp flat.
+    if applied > 0 {
+        efs.sync_metadata().context("writing filesystem metadata")?;
+    }
     drop(efs);
-    commit.commit().context("committing container edits")?;
-    Ok(())
+    if applied > 0 {
+        commit.commit().context("committing container edits")?;
+    }
+    match failure {
+        Some(e) => Err(e.context(format!(
+            "{applied} of {} edit(s) were applied and are on the volume; drop them from \
+             the queue before retrying",
+            edits.len()
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// One edit's completion snapshot, handed to the `apply_edits_reporting`
@@ -448,6 +473,7 @@ fn stage_copy_into(
                             type_code: None,
                             creator_code: None,
                             name: None,
+                            finder_flags: entry.finder_flags,
                         })
                     }
                 } else {
@@ -595,11 +621,13 @@ pub enum HostCopyJob {
         entries: Vec<FileEntry>,
         dest_dir: PathBuf,
         fork_mode: ResourceForkMode,
+        on_conflict: OnConflict,
     },
     /// Copy host `entries` into the host directory `dest_dir`.
     HostToHost {
         entries: Vec<FileEntry>,
         dest_dir: PathBuf,
+        on_conflict: OnConflict,
     },
     /// Upload image-volume `entries` onto a remote daemon's host filesystem
     /// under `dest_parent`, preserving resource forks per `fork_mode`. `source`
@@ -662,6 +690,28 @@ pub struct HostCopyStatus {
     /// When honoured, the worker sets `error` to a cancellation message and
     /// finishes early.
     pub cancel_requested: bool,
+    /// Host paths the copy passed over (symlinks, sockets, devices), for the
+    /// completion message; a silent omission looked like a complete copy.
+    pub skipped: Vec<String>,
+}
+
+/// Record a source entry the copy will not carry over.
+fn note_skipped(status: &Arc<Mutex<HostCopyStatus>>, path: &Path, why: &str) {
+    if let Ok(mut g) = status.lock() {
+        g.skipped.push(format!("{} ({why})", path.display()));
+    }
+}
+
+impl HostCopyJob {
+    /// The same job with its answer to an existing host file decided.
+    pub fn with_conflict(mut self, on: OnConflict) -> Self {
+        match &mut self {
+            HostCopyJob::ImageToHost { on_conflict, .. }
+            | HostCopyJob::HostToHost { on_conflict, .. } => *on_conflict = on,
+            _ => {}
+        }
+        self
+    }
 }
 
 /// Run a [`HostCopyJob`] on a worker thread (host writes are immediate, not
@@ -690,6 +740,7 @@ fn run_host_copy(job: HostCopyJob, status: &Arc<Mutex<HostCopyStatus>>) -> Resul
             entries,
             dest_dir,
             fork_mode,
+            on_conflict,
         } => {
             let mut fs = source.open()?;
             let (files_total, bytes_total) = scan_image_entries(fs.as_mut(), &entries)?;
@@ -697,15 +748,26 @@ fn run_host_copy(job: HostCopyJob, status: &Arc<Mutex<HostCopyStatus>>) -> Resul
                 g.files_total = files_total;
                 g.bytes_total = bytes_total;
             }
-            copy_image_entries_to_host(fs.as_mut(), &entries, &dest_dir, fork_mode, status)
+            copy_image_entries_to_host(
+                fs.as_mut(),
+                &entries,
+                &dest_dir,
+                fork_mode,
+                on_conflict,
+                status,
+            )
         }
-        HostCopyJob::HostToHost { entries, dest_dir } => {
+        HostCopyJob::HostToHost {
+            entries,
+            dest_dir,
+            on_conflict,
+        } => {
             let (files_total, bytes_total) = scan_host_entries(&entries);
             if let Ok(mut g) = status.lock() {
                 g.files_total = files_total;
                 g.bytes_total = bytes_total;
             }
-            copy_host_entries_to_host(&entries, &dest_dir, status)
+            copy_host_entries_to_host(&entries, &dest_dir, on_conflict, status)
         }
         #[cfg(feature = "remote")]
         HostCopyJob::ImageToRemoteHost {
@@ -806,7 +868,67 @@ pub fn export_fs_entries_to_host(
     fork_mode: ResourceForkMode,
 ) -> Result<usize> {
     let status = Arc::new(Mutex::new(HostCopyStatus::default()));
-    copy_image_entries_to_host(fs, entries, dest_dir, fork_mode, &status)
+    copy_image_entries_to_host(
+        fs,
+        entries,
+        dest_dir,
+        fork_mode,
+        OnConflict::Replace,
+        &status,
+    )
+}
+
+/// Host files a copy would write over: the top-level names of `entries` that
+/// already exist in `dest_dir` (a directory merging into a directory is not
+/// one). `fork_mode` is the image-to-host container choice, `None` for a
+/// host-to-host copy.
+pub fn host_copy_conflicts(
+    entries: &[FileEntry],
+    dest_dir: &Path,
+    fork_mode: Option<ResourceForkMode>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for entry in entries {
+        let target = match fork_mode {
+            Some(mode) if entry.is_file() => {
+                primary_output_path(entry, dest_dir, &safe_name(entry), mode)
+            }
+            Some(_) => dest_dir.join(safe_name(entry)),
+            None => dest_dir.join(&entry.name),
+        };
+        let Ok(meta) = target.symlink_metadata() else {
+            continue;
+        };
+        if entry.is_directory() && meta.is_dir() {
+            continue;
+        }
+        out.push(
+            target
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| entry.name.clone()),
+        );
+    }
+    out
+}
+
+/// What to do about an existing host file: `Ok(true)` writes over it.
+fn resolve_host_conflict(
+    target: &Path,
+    on_conflict: OnConflict,
+    status: &Arc<Mutex<HostCopyStatus>>,
+) -> Result<bool> {
+    if !target.exists() {
+        return Ok(true);
+    }
+    match on_conflict {
+        OnConflict::Replace => Ok(true),
+        OnConflict::Skip => {
+            note_skipped(status, target, "already exists");
+            Ok(false)
+        }
+        OnConflict::Fail => bail!("{} already exists", target.display()),
+    }
 }
 
 /// Export `entries` from an already-open (non-reopenable, e.g. wrapper-mount)
@@ -908,6 +1030,7 @@ fn copy_image_entries_to_host(
     entries: &[FileEntry],
     dest_dir: &Path,
     fork_mode: ResourceForkMode,
+    on_conflict: OnConflict,
     status: &Arc<Mutex<HostCopyStatus>>,
 ) -> Result<usize> {
     let mut count = 0;
@@ -916,17 +1039,23 @@ fn copy_image_entries_to_host(
             return Err(cancelled_err());
         }
         if entry.is_directory() {
-            let sub = dest_dir.join(&entry.name);
+            let sub = dest_dir.join(crate::fs::resource_fork::sanitize_filename(&entry.name));
             std::fs::create_dir_all(&sub).with_context(|| format!("creating {}", sub.display()))?;
             let children = fs
                 .list_directory(entry)
                 .with_context(|| format!("listing '{}'", entry.name))?;
-            count += copy_image_entries_to_host(fs, &children, &sub, fork_mode, status)?;
+            count +=
+                copy_image_entries_to_host(fs, &children, &sub, fork_mode, on_conflict, status)?;
         } else if entry.is_file() {
+            let name = safe_name(entry);
+            let target = primary_output_path(entry, dest_dir, &name, fork_mode);
+            if !resolve_host_conflict(&target, on_conflict, status)? {
+                continue;
+            }
             if let Ok(mut g) = status.lock() {
                 g.current_file = entry.path.clone();
             }
-            export_file_with_fork(fs, entry, dest_dir, &safe_name(entry), fork_mode)
+            export_file_with_fork(fs, entry, dest_dir, &name, fork_mode)
                 .with_context(|| format!("extracting '{}'", entry.name))?;
             count += 1;
             if let Ok(mut g) = status.lock() {
@@ -942,18 +1071,38 @@ fn copy_image_entries_to_host(
 fn copy_host_entries_to_host(
     entries: &[FileEntry],
     dest_dir: &Path,
+    on_conflict: OnConflict,
     status: &Arc<Mutex<HostCopyStatus>>,
 ) -> Result<usize> {
     let mut count = 0;
+    // A destination inside a source folder recursed without end, and a file
+    // copied onto itself was truncated before it was read.
+    let dest_canon = dest_dir
+        .canonicalize()
+        .unwrap_or_else(|_| dest_dir.to_path_buf());
     for entry in entries {
         if is_cancelled(status) {
             return Err(cancelled_err());
         }
         let src = PathBuf::from(&entry.path);
         let dst = dest_dir.join(&entry.name);
+        let src_canon = src.canonicalize().unwrap_or_else(|_| src.clone());
+        if dest_canon == src_canon.parent().unwrap_or(&src_canon) {
+            bail!("{} is already in {}", entry.name, dest_dir.display());
+        }
+        if entry.is_directory() && dest_canon.starts_with(&src_canon) {
+            bail!(
+                "cannot copy {} into itself ({})",
+                src.display(),
+                dest_dir.display()
+            );
+        }
         if entry.is_directory() {
-            copy_host_dir(&src, &dst, &mut count, status)?;
+            copy_host_dir(&src, &dst, on_conflict, &mut count, status)?;
         } else if entry.is_file() {
+            if !resolve_host_conflict(&dst, on_conflict, status)? {
+                continue;
+            }
             if let Ok(mut g) = status.lock() {
                 g.current_file = entry.path.clone();
             }
@@ -964,6 +1113,8 @@ fn copy_host_entries_to_host(
                 g.copied = count;
                 g.bytes_done = g.bytes_done.saturating_add(bytes);
             }
+        } else {
+            note_skipped(status, &src, "not a regular file or directory");
         }
     }
     Ok(count)
@@ -977,6 +1128,7 @@ fn copy_host_entries_to_host(
 fn copy_host_dir(
     src: &Path,
     dst: &Path,
+    on_conflict: OnConflict,
     count: &mut usize,
     status: &Arc<Mutex<HostCopyStatus>>,
 ) -> Result<()> {
@@ -995,8 +1147,11 @@ fn copy_host_dir(
         let ft = meta.file_type();
         let child_dst = dst.join(dent.file_name());
         if ft.is_dir() {
-            copy_host_dir(&dent.path(), &child_dst, count, status)?;
+            copy_host_dir(&dent.path(), &child_dst, on_conflict, count, status)?;
         } else if ft.is_file() {
+            if !resolve_host_conflict(&child_dst, on_conflict, status)? {
+                continue;
+            }
             if let Ok(mut g) = status.lock() {
                 g.current_file = dent.path().display().to_string();
             }
@@ -1007,6 +1162,10 @@ fn copy_host_dir(
                 g.copied = *count;
                 g.bytes_done = g.bytes_done.saturating_add(bytes);
             }
+        } else if ft.is_symlink() {
+            note_skipped(status, &dent.path(), "symlink");
+        } else {
+            note_skipped(status, &dent.path(), "special file");
         }
     }
     Ok(())
@@ -1156,7 +1315,11 @@ fn upload_host_dir_to_remote(
         let ft = meta.file_type();
         let name = dent.file_name().to_string_lossy().into_owned();
         let child_dest = join_remote(dest, &name);
-        if ft.is_dir() {
+        if ft.is_symlink() {
+            note_skipped(status, &dent.path(), "symlink");
+        } else if !ft.is_dir() && !ft.is_file() {
+            note_skipped(status, &dent.path(), "special file");
+        } else if ft.is_dir() {
             conn.mkdir_host(&child_dest)
                 .with_context(|| format!("creating remote directory '{name}'"))?;
             upload_host_dir_to_remote(&dent.path(), &child_dest, conn, count, status)?;
@@ -1409,6 +1572,57 @@ pub fn spawn_remote_apply(
 mod tests {
     use super::*;
     use crate::fs::entry::FileEntry;
+
+    /// X12: a host copy wrote over existing files without asking. The
+    /// preflight names them and the copy honours Skip and Overwrite.
+    #[test]
+    fn host_copy_sees_existing_files_and_honours_the_choice() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(dst.join("sub")).unwrap();
+        std::fs::write(src.join("a.txt"), b"new").unwrap();
+        std::fs::write(src.join("b.txt"), b"fresh").unwrap();
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(dst.join("a.txt"), b"old").unwrap();
+
+        let entries = vec![
+            FileEntry::new_file(
+                "a.txt".into(),
+                src.join("a.txt").display().to_string(),
+                3,
+                0,
+            ),
+            FileEntry::new_file(
+                "b.txt".into(),
+                src.join("b.txt").display().to_string(),
+                5,
+                0,
+            ),
+            FileEntry::new_directory("sub".into(), src.join("sub").display().to_string(), 0),
+        ];
+        // Only a.txt collides; a directory merging into a directory does not.
+        assert_eq!(
+            host_copy_conflicts(&entries, &dst, None),
+            vec!["a.txt".to_string()]
+        );
+
+        let status = Arc::new(Mutex::new(HostCopyStatus::default()));
+        let n = copy_host_entries_to_host(&entries, &dst, OnConflict::Skip, &status).unwrap();
+        assert_eq!(n, 1, "only b.txt is written");
+        assert_eq!(std::fs::read(dst.join("a.txt")).unwrap(), b"old");
+        assert_eq!(std::fs::read(dst.join("b.txt")).unwrap(), b"fresh");
+        assert_eq!(status.lock().unwrap().skipped.len(), 1);
+
+        let status = Arc::new(Mutex::new(HostCopyStatus::default()));
+        copy_host_entries_to_host(&entries, &dst, OnConflict::Replace, &status).unwrap();
+        assert_eq!(std::fs::read(dst.join("a.txt")).unwrap(), b"new");
+        assert!(status.lock().unwrap().skipped.is_empty());
+
+        let err = copy_host_entries_to_host(&entries, &dst, OnConflict::Fail, &status).unwrap_err();
+        assert!(format!("{err:#}").contains("already exists"), "{err:#}");
+    }
 
     /// Build a blank FAT12 floppy on disk with one file, then apply a staged
     /// delete-plus-add batch through `apply_edits` and confirm the result lands.
@@ -1753,6 +1967,7 @@ mod tests {
             &entries,
             out.path(),
             ResourceForkMode::DataForkOnly,
+            OnConflict::Replace,
             &status,
         )
         .expect("extract");
@@ -1762,6 +1977,43 @@ mod tests {
             std::fs::read(out.path().join("D").join("B.TXT")).unwrap(),
             b"deep"
         );
+    }
+
+    /// A destination inside the source recursed forever; a file copied onto
+    /// itself was truncated before it was read.
+    #[test]
+    fn copy_host_to_host_refuses_to_copy_into_itself() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::create_dir(src.path().join("dir")).unwrap();
+        std::fs::write(src.path().join("dir").join("g.txt"), b"more").unwrap();
+        std::fs::write(src.path().join("f.txt"), b"data").unwrap();
+        let entries = host_children(&src.path().to_string_lossy());
+        let status = Arc::new(Mutex::new(HostCopyStatus::default()));
+
+        let dir_entry: Vec<FileEntry> = entries
+            .iter()
+            .filter(|e| e.name == "dir")
+            .cloned()
+            .collect();
+        let inside = src.path().join("dir");
+        assert!(
+            copy_host_entries_to_host(&dir_entry, &inside, OnConflict::Replace, &status).is_err()
+        );
+        assert_eq!(
+            std::fs::read(src.path().join("dir").join("g.txt")).unwrap(),
+            b"more"
+        );
+
+        let file_entry: Vec<FileEntry> = entries
+            .iter()
+            .filter(|e| e.name == "f.txt")
+            .cloned()
+            .collect();
+        assert!(
+            copy_host_entries_to_host(&file_entry, src.path(), OnConflict::Replace, &status)
+                .is_err()
+        );
+        assert_eq!(std::fs::read(src.path().join("f.txt")).unwrap(), b"data");
     }
 
     /// host -> host: copy a file and a directory subtree between host folders.
@@ -1775,7 +2027,8 @@ mod tests {
         let entries = host_children(&src.path().to_string_lossy());
         let dest = tempfile::tempdir().unwrap();
         let status = Arc::new(Mutex::new(HostCopyStatus::default()));
-        let n = copy_host_entries_to_host(&entries, dest.path(), &status).expect("copy");
+        let n = copy_host_entries_to_host(&entries, dest.path(), OnConflict::Replace, &status)
+            .expect("copy");
         assert_eq!(n, 2);
         assert_eq!(std::fs::read(dest.path().join("f.txt")).unwrap(), b"data");
         assert_eq!(

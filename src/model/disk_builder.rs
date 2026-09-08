@@ -207,6 +207,7 @@ impl DiskBuilder {
             self.kind,
             self.disk_size,
             self.align_bytes(),
+            self.geometry,
         )
     }
 

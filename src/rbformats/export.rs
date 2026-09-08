@@ -669,6 +669,8 @@ pub fn export_whole_disk(
     if format == ExportFormat::Woz || format == ExportFormat::Moof || format == ExportFormat::Dc42 {
         let buf = if let Some(meta) = backup_metadata {
             let mut buf: Vec<u8> = Vec::new();
+            let (gpt_sidecar, apm_sidecar) =
+                super::load_table_sidecars(source_path, &meta.partition_table_type, &mut log_cb)?;
             reconstruct_disk_from_backup(
                 source_path,
                 meta,
@@ -678,8 +680,8 @@ pub fn export_whole_disk(
                 &mut std::io::Cursor::new(&mut buf),
                 false,
                 false,
-                None,
-                None,
+                gpt_sidecar.as_ref(),
+                apm_sidecar.as_ref(),
                 &mut progress_cb,
                 &cancel_check,
                 &mut log_cb,
@@ -727,6 +729,8 @@ pub fn export_whole_disk(
             0u64
         };
 
+        let (gpt_sidecar, apm_sidecar) =
+            super::load_table_sidecars(source_path, &meta.partition_table_type, &mut log_cb)?;
         total_written = reconstruct_disk_from_backup(
             source_path,
             meta,
@@ -736,8 +740,8 @@ pub fn export_whole_disk(
             &mut file,
             false,
             false,
-            None,
-            None,
+            gpt_sidecar.as_ref(),
+            apm_sidecar.as_ref(),
             &mut progress_cb,
             &cancel_check,
             &mut log_cb,
@@ -1218,6 +1222,8 @@ fn export_whole_disk_vhd_dynamic(
         // Reconstruct the flat disk into a tempfile, then convert to dynamic VHD.
         let mut tmp =
             tempfile::tempfile().context("create tempfile for dynamic VHD reconstruction")?;
+        let (gpt_sidecar, apm_sidecar) =
+            super::load_table_sidecars(source_path, &meta.partition_table_type, &mut log_cb)?;
         let written = reconstruct_disk_from_backup(
             source_path,
             meta,
@@ -1227,8 +1233,8 @@ fn export_whole_disk_vhd_dynamic(
             &mut tmp,
             false,
             false,
-            None,
-            None,
+            gpt_sidecar.as_ref(),
+            apm_sidecar.as_ref(),
             &mut progress_cb,
             &cancel_check,
             &mut log_cb,
@@ -1295,6 +1301,8 @@ fn export_whole_disk_qcow2(
 
     let disk_size = if let Some(meta) = backup_metadata {
         let mut tmp = tempfile::tempfile().context("create tempfile for QCOW2 reconstruction")?;
+        let (gpt_sidecar, apm_sidecar) =
+            super::load_table_sidecars(source_path, &meta.partition_table_type, &mut log_cb)?;
         let written = reconstruct_disk_from_backup(
             source_path,
             meta,
@@ -1304,8 +1312,8 @@ fn export_whole_disk_qcow2(
             &mut tmp,
             false,
             false,
-            None,
-            None,
+            gpt_sidecar.as_ref(),
+            apm_sidecar.as_ref(),
             &mut progress_cb,
             &cancel_check,
             &mut log_cb,
@@ -1361,6 +1369,8 @@ fn export_whole_disk_vmdk_flat(
     let disk_size = if let Some(meta) = backup_metadata {
         let mut tmp =
             tempfile::tempfile().context("create tempfile for VMDK flat reconstruction")?;
+        let (gpt_sidecar, apm_sidecar) =
+            super::load_table_sidecars(source_path, &meta.partition_table_type, &mut log_cb)?;
         let written = reconstruct_disk_from_backup(
             source_path,
             meta,
@@ -1370,8 +1380,8 @@ fn export_whole_disk_vmdk_flat(
             &mut tmp,
             false,
             false,
-            None,
-            None,
+            gpt_sidecar.as_ref(),
+            apm_sidecar.as_ref(),
             &mut progress_cb,
             &cancel_check,
             &mut log_cb,
@@ -1433,6 +1443,8 @@ fn export_whole_disk_vmdk_sparse(
     let disk_size = if let Some(meta) = backup_metadata {
         let mut tmp =
             tempfile::tempfile().context("create tempfile for VMDK sparse reconstruction")?;
+        let (gpt_sidecar, apm_sidecar) =
+            super::load_table_sidecars(source_path, &meta.partition_table_type, &mut log_cb)?;
         let written = reconstruct_disk_from_backup(
             source_path,
             meta,
@@ -1442,8 +1454,8 @@ fn export_whole_disk_vmdk_sparse(
             &mut tmp,
             false,
             false,
-            None,
-            None,
+            gpt_sidecar.as_ref(),
+            apm_sidecar.as_ref(),
             &mut progress_cb,
             &cancel_check,
             &mut log_cb,

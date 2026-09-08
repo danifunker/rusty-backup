@@ -173,14 +173,14 @@ fn resolve_hfs_path<R: std::io::Read + std::io::Seek + Send>(
     // grammar) and `/` is plain data; a plain `/`-path uses `\/` for a literal
     // slash. See `crate::cli::parse::split_image_path`.
     let components = crate::cli::parse::split_image_path(path, path.contains(':'));
+    let fold = fs.case_insensitive_lookup();
     let mut current = fs.root().map_err(|e| anyhow!("root: {e}"))?;
     for component in &components {
         let children = fs
             .list_directory(&current)
             .map_err(|e| anyhow!("list_directory: {e}"))?;
-        let next = children
-            .into_iter()
-            .find(|c| &c.name == component)
+        let next = crate::fs::filesystem::find_child(fold, &children, component)
+            .cloned()
             .ok_or_else(|| anyhow!("path component not found: {component}"))?;
         current = next;
     }

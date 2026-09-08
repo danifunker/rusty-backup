@@ -111,12 +111,12 @@ pub const SB_LSN_OFF: usize = 240;
 /// sentinel that compares greater than every real lsn.
 pub const XFS_LSN_NULL: u64 = u64::MAX;
 
-/// Translate a filesystem block number to the **disk address** stamped into
-/// per-block `blkno` CRC-header fields — XFS always counts these in
-/// 512-byte basic blocks (`BBSIZE`), independent of `sb_sectsize`. Mirrors
-/// the kernel's `XFS_FSB_TO_BB(mp, fsbno) = fsbno << (blocklog - 9)`.
+/// `XFS_FSB_TO_DADDR`: the fsblock's AG times `sb_agblocks` plus its AG-relative
+/// block, in 512-byte units. Shifting the raw fsblock only works for power-of-two AGs (R-065).
 pub fn fsblock_to_daddr(fsblock: u64, sb: &XfsSuperblock) -> u64 {
-    fsblock << (sb.blocklog - 9)
+    let agno = fsblock >> sb.agblklog;
+    let agbno = fsblock & ((1u64 << sb.agblklog) - 1);
+    (agno * u64::from(sb.agblocks) + agbno) << (sb.blocklog - 9)
 }
 
 /// Convenience wrapper around [`stamp_sblock_crc_header`] for AG-relative
@@ -130,7 +130,7 @@ pub fn fsblock_to_daddr(fsblock: u64, sb: &XfsSuperblock) -> u64 {
 /// encoding, which only coincides when `sb_agblocks` is a power of two.
 pub fn stamp_sblock_hdr_for_ag(buf: &mut [u8], sb: &XfsSuperblock, agno: u64, agbno: u32) {
     let physical = agno * sb.agblocks as u64 + agbno as u64;
-    let blkno = fsblock_to_daddr(physical, sb);
+    let blkno = physical << (sb.blocklog - 9);
     stamp_sblock_crc_header(buf, blkno, agno as u32, sb);
 }
 

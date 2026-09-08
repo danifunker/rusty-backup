@@ -32,7 +32,7 @@
 //! 0x00  log2_secsize             (8 = 256 B, 9 = 512 B, 10 = 1024 B)
 //! 0x01  secs_per_track
 //! 0x02  heads
-//! 0x03  density                  (1 = single, 2 = double, 3 = high)
+//! 0x03  density                  (0 = hard disc; floppy data rate 1..4 or 8, F-format is 4)
 //! 0x04  idlen                    (fragment-id bit width)
 //! 0x05  log2bpmb                 (log2 bytes per map bit)
 //! 0x06  skew

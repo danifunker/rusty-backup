@@ -222,6 +222,17 @@ pub fn calculate_restore_layout(
     }
 
     // Determine alignment parameters
+    // DOS and Win9x boot code read the CHS fields, which a zero geometry left
+    // stale after a move; the recorded geometry or the BIOS's 255/63 fills it.
+    let (geo_heads, geo_spt) =
+        if metadata.alignment.heads > 0 && metadata.alignment.sectors_per_track > 0 {
+            (
+                metadata.alignment.heads,
+                metadata.alignment.sectors_per_track,
+            )
+        } else {
+            (255, 63)
+        };
     let (first_partition_lba, alignment_sectors, heads, spt) = match alignment {
         RestoreAlignment::Original => (
             metadata.alignment.first_partition_lba,
@@ -229,8 +240,8 @@ pub fn calculate_restore_layout(
             metadata.alignment.heads,
             metadata.alignment.sectors_per_track,
         ),
-        RestoreAlignment::Modern1MB => (2048, 2048, 0, 0),
-        RestoreAlignment::Custom(n) => (*n, *n, 0, 0),
+        RestoreAlignment::Modern1MB => (2048, 2048, geo_heads, geo_spt),
+        RestoreAlignment::Custom(n) => (*n, *n, geo_heads, geo_spt),
     };
 
     // Separate primary and logical partitions
@@ -273,8 +284,13 @@ pub fn calculate_restore_layout(
             }
         }
 
-        let partition_size =
-            compute_partition_size(size_choice, pm, current_lba, usable_target_size);
+        let partition_size = compute_partition_size(
+            size_choice,
+            pm,
+            current_lba,
+            usable_target_size,
+            restore_size_floor(metadata, pm),
+        );
 
         let new_start_lba = if current_lba != pm.start_lba {
             Some(current_lba)
@@ -336,8 +352,13 @@ pub fn calculate_restore_layout(
                 }
             }
 
-            let partition_size =
-                compute_partition_size(size_choice, pm, current_lba, usable_target_size);
+            let partition_size = compute_partition_size(
+                size_choice,
+                pm,
+                current_lba,
+                usable_target_size,
+                restore_size_floor(metadata, pm),
+            );
 
             let new_start_lba = if current_lba != pm.start_lba {
                 Some(current_lba)
@@ -451,8 +472,13 @@ fn calculate_apm_restore_layout(
                     .map(|s| &s.size_choice)
                     .unwrap_or(&RestoreSizeChoice::Original);
 
-                let partition_size =
-                    compute_partition_size(size_choice, pm, pm.start_lba, usable_target_size);
+                let partition_size = compute_partition_size(
+                    size_choice,
+                    pm,
+                    pm.start_lba,
+                    usable_target_size,
+                    restore_size_floor(metadata, pm),
+                );
 
                 overrides.push(PartitionSizeOverride {
                     index: pm.index,
@@ -498,8 +524,13 @@ fn calculate_apm_restore_layout(
                     }
                 }
 
-                let partition_size =
-                    compute_partition_size(size_choice, pm, current_lba, usable_target_size);
+                let partition_size = compute_partition_size(
+                    size_choice,
+                    pm,
+                    current_lba,
+                    usable_target_size,
+                    restore_size_floor(metadata, pm),
+                );
 
                 let new_start_lba = if current_lba != pm.start_lba {
                     Some(current_lba)
@@ -562,15 +593,13 @@ fn compute_partition_size(
     pm: &crate::backup::metadata::PartitionMetadata,
     current_lba: u64,
     target_size: u64,
+    floor: u64,
 ) -> u64 {
     match size_choice {
         RestoreSizeChoice::Original => pm.original_size_bytes,
         RestoreSizeChoice::Minimum => {
-            // Prefer the defragmented (post-clone) minimum when available —
-            // for filesystems with a defragmenting compaction path (FAT,
-            // HFS+) this can be substantially smaller than the in-place
-            // trim point. Fall back to the in-place minimum, then to the
-            // imaged size, then to the original.
+            // The defragmented minimum needs a defragmenting clone, which restore
+            // does not do; `restore_size_floor` is what this copy can deliver.
             let min = pm
                 .defragmented_min_size_bytes
                 .or(pm.minimum_size_bytes)
@@ -579,7 +608,8 @@ fn compute_partition_size(
                 } else {
                     None
                 })
-                .unwrap_or(pm.original_size_bytes);
+                .unwrap_or(pm.original_size_bytes)
+                .max(floor);
             (min + 511) & !511
         }
         RestoreSizeChoice::Custom(bytes) => (bytes + 511) & !511,
@@ -816,6 +846,13 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
             }
         }
     }
+
+    // Step 2b: the recorded checksums are the only defence against a damaged
+    // backup, and nothing on the target has been touched yet.
+    set_operation(&progress, "Verifying backup checksums...");
+    crate::backup::verify::verify_partition_files(&config.backup_folder, &metadata, &mut |m| {
+        log(&progress, LogLevel::Info, m)
+    })?;
 
     if is_cancelled(&progress) {
         bail!("restore cancelled");
@@ -1233,6 +1270,7 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
     }
 
     target.flush()?;
+    target.sync_all().context("syncing the target")?;
 
     // Close the file to ensure all writes are committed
     drop(target);
@@ -1347,6 +1385,14 @@ fn run_single_file_chd_restore_as_is(
         bail!("restore cancelled");
     }
 
+    // The image overwrites LBA 0 onward, but a stale backup GPT at the END of
+    // a larger target would survive and still announce a GPT disk.
+    if metadata.partition_table_type != "GPT" && metadata.partition_table_type != "None" {
+        clear_gpt_structures(&mut target, config.target_size, &mut |msg| {
+            log(&progress, LogLevel::Info, msg);
+        })?;
+    }
+
     // Stream the CHD's logical bytes onto the target. 1 MiB chunks per the
     // I/O sizing guidance in CONTRIBUTING.md.
     set_operation(&progress, "Writing disk image...");
@@ -1369,6 +1415,7 @@ fn run_single_file_chd_restore_as_is(
         set_progress_bytes(&progress, written, logical_size);
     }
     target.flush().context("failed to flush target")?;
+    target.sync_all().context("syncing the target")?;
 
     log(
         &progress,
@@ -1526,6 +1573,13 @@ fn run_single_file_chd_restore_resize(
     let is_gpt = metadata.partition_table_type == "GPT";
     let is_apm = metadata.partition_table_type == "APM";
     let is_superfloppy = metadata.partition_table_type == "None";
+    // Same as the per-partition restore: an MBR / APM layout must not leave a
+    // stale GPT, primary or backup, on the target.
+    if !is_gpt && !is_superfloppy {
+        clear_gpt_structures(&mut target, config.target_size, &mut |msg| {
+            log(&progress, LogLevel::Info, msg);
+        })?;
+    }
 
     // Step 1: write the patched partition table at sector 0 (and APM
     // head / GPT primary as appropriate). The backup GPT goes at the
@@ -1580,6 +1634,16 @@ fn run_single_file_chd_restore_resize(
             .read_exact(&mut mbr)
             .context("failed to read MBR from CHD")?;
         patch_mbr_entries(&mut mbr, &overrides);
+        for index in crate::partition::mbr::clear_orphan_entries_overlapping(&mut mbr, &overrides) {
+            log(
+                &progress,
+                LogLevel::Warning,
+                format!(
+                    "MBR entry {index} was not part of this backup and the new layout \
+                     overwrites its sectors; the entry has been removed"
+                ),
+            );
+        }
 
         // If the source had logical partitions, rebuild the EBR chain so
         // it reflects the new sizes/positions. The CHD only carries each
@@ -1822,6 +1886,7 @@ fn run_single_file_chd_restore_resize(
     }
 
     target.flush().context("final flush")?;
+    target.sync_all().context("syncing the target")?;
 
     log(
         &progress,
@@ -2281,6 +2346,7 @@ fn run_clonezilla_restore(
     }
 
     target.flush()?;
+    target.sync_all().context("syncing the target")?;
     drop(target);
 
     log(
@@ -2880,6 +2946,74 @@ mod tests {
         assert!(repack_hint(&RestoreAlignment::Custom(16)).is_empty());
     }
 
+    /// BR11: a backup of partitions 0 and 2 restored with 1 MB alignment packs
+    /// them from LBA 2048, straight across the range entry 1 still describes.
+    #[test]
+    fn a_repacked_subset_restore_drops_the_orphan_entry_it_runs_over() {
+        const MIB: u64 = 1024 * 1024;
+        let mut parts = vec![
+            apm_part(0, 63, 100 * MIB, 100 * MIB),
+            apm_part(2, 63 + 300 * MIB / 512, 100 * MIB, 100 * MIB),
+        ];
+        for p in &mut parts {
+            p.partition_type_byte = 0x0C;
+            p.partition_type_string = None;
+            p.compacted = false;
+        }
+        let mut metadata = apm_metadata(parts, 512 * MIB);
+        metadata.partition_table_type = "MBR".to_string();
+        metadata.alignment.first_partition_lba = 63;
+        metadata.alignment.alignment_sectors = 63;
+        let overrides =
+            calculate_restore_layout(&metadata, &RestoreAlignment::Modern1MB, &[], 512 * MIB)
+                .unwrap();
+        let mut mbr = [0u8; 512];
+        mbr[510] = 0x55;
+        mbr[511] = 0xAA;
+        for (slot, (start, sectors)) in [
+            (63u32, (100 * MIB / 512) as u32),
+            (63 + (100 * MIB / 512) as u32, (200 * MIB / 512) as u32),
+            (63 + (300 * MIB / 512) as u32, (100 * MIB / 512) as u32),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let off = 446 + slot * 16;
+            mbr[off + 4] = 0x0C;
+            mbr[off + 8..off + 12].copy_from_slice(&start.to_le_bytes());
+            mbr[off + 12..off + 16].copy_from_slice(&sectors.to_le_bytes());
+        }
+        patch_mbr_entries(&mut mbr, &overrides);
+        let cleared = crate::partition::mbr::clear_orphan_entries_overlapping(&mut mbr, &overrides);
+        assert_eq!(cleared, vec![1]);
+        let entries: Vec<(u64, u64)> = (0..4)
+            .filter(|i| mbr[446 + i * 16 + 4] != 0)
+            .map(|i| {
+                let off = 446 + i * 16;
+                let s = u32::from_le_bytes(mbr[off + 8..off + 12].try_into().unwrap()) as u64;
+                let n = u32::from_le_bytes(mbr[off + 12..off + 16].try_into().unwrap()) as u64;
+                (s, s + n)
+            })
+            .collect();
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        for (i, a) in entries.iter().enumerate() {
+            for b in &entries[i + 1..] {
+                assert!(a.1 <= b.0 || b.1 <= a.0, "overlap: {entries:?}");
+            }
+        }
+        // An entry the layout never reaches is left alone: the same subset put
+        // back on its original disk keeps whatever still lives after it.
+        let mut beyond = [0u8; 512];
+        beyond[446 + 3 * 16 + 4] = 0x0C;
+        beyond[446 + 3 * 16 + 8..446 + 3 * 16 + 12].copy_from_slice(&900_000u32.to_le_bytes());
+        beyond[446 + 3 * 16 + 12..446 + 3 * 16 + 16].copy_from_slice(&100_000u32.to_le_bytes());
+        assert!(
+            crate::partition::mbr::clear_orphan_entries_overlapping(&mut beyond, &overrides)
+                .is_empty()
+        );
+        assert_eq!(beyond[446 + 3 * 16 + 4], 0x0C);
+    }
+
     fn build_test_mbr(part_sectors: u32) -> [u8; 512] {
         let mut mbr = [0u8; 512];
         mbr[510] = 0x55;
@@ -3000,13 +3134,20 @@ mod tests {
         let meta_path = backup_folder.join("metadata.json");
         std::fs::write(&meta_path, serde_json::to_string_pretty(&metadata).unwrap()).unwrap();
 
-        // Run restore to a target image file.
+        // Restore onto a larger target that still carries a GPT from a previous
+        // life: primary at LBA 1, backup header in its last 33 sectors (BR10).
         let target_path = tmp.path().join("restored.img");
+        let target_bytes = total_bytes + 64 * 1024;
+        let mut stale = vec![0u8; target_bytes as usize];
+        stale[512..520].copy_from_slice(b"EFI PART");
+        let backup_hdr = (target_bytes - 33 * 512) as usize;
+        stale[backup_hdr..backup_hdr + 8].copy_from_slice(b"EFI PART");
+        std::fs::write(&target_path, &stale).unwrap();
         let cfg = RestoreConfig {
             backup_folder: backup_folder.clone(),
             target_path: target_path.clone(),
             target_is_device: false,
-            target_size: total_bytes,
+            target_size: target_bytes,
             alignment: RestoreAlignment::Original,
             partition_sizes: vec![],
             write_zeros_to_unused: false,
@@ -3016,8 +3157,16 @@ mod tests {
         assert!(progress.lock().unwrap().finished);
 
         let restored = std::fs::read(&target_path).unwrap();
-        assert_eq!(restored.len(), data.len(), "restored length mismatch");
-        assert_eq!(restored, data, "restored bytes must match source");
+        assert!(restored.len() >= data.len(), "restored length mismatch");
+        assert_eq!(
+            &restored[..data.len()],
+            &data[..],
+            "restored bytes must match source"
+        );
+        assert!(
+            restored[backup_hdr..].iter().all(|&b| b == 0),
+            "the stale backup GPT at the end of the target must be cleared"
+        );
     }
 
     /// Stage 5b round-trip: build a 4 MiB MBR-disk single-file CHD backup

@@ -128,7 +128,7 @@ impl BulkConvertDialog {
                         .unwrap_or_else(|| "(not selected)".to_string());
                     ui.label(label);
                 });
-                if ui.button("Choose Source Folder…").clicked() {
+                if ui.button("Choose Source Folder...").clicked() {
                     if let Some(p) = super::file_dialog().pick_folder() {
                         self.source_folder = Some(p);
                     }
@@ -145,7 +145,7 @@ impl BulkConvertDialog {
                         .unwrap_or_else(|| "(not selected)".to_string());
                     ui.label(label);
                 });
-                if ui.button("Choose Output Folder…").clicked() {
+                if ui.button("Choose Output Folder...").clicked() {
                     if let Some(p) = super::file_dialog().pick_folder() {
                         self.output_folder = Some(p);
                     }
@@ -158,22 +158,22 @@ impl BulkConvertDialog {
                     ui.radio_value(&mut self.format, ExportFormat::Vhd, "VHD");
                     ui.radio_value(&mut self.format, ExportFormat::VhdDynamic, "VHD (Dynamic)")
                         .on_hover_text(
-                            "Sparse VHD — all-zero blocks are omitted. Same .vhd extension; \
+                            "Sparse VHD - all-zero blocks are omitted. Same .vhd extension; \
                              readable by Hyper-V, qemu-img, Disk Management.",
                         );
                     ui.radio_value(&mut self.format, ExportFormat::Qcow2, "QCOW2")
                         .on_hover_text(
-                            "QCOW2 v3 — sparse, uncompressed. The format UTM uses for \
+                            "QCOW2 v3 - sparse, uncompressed. The format UTM uses for \
                              classic-Mac PPC guests; opens in QEMU, qemu-img, virt-manager.",
                         );
                     ui.radio_value(&mut self.format, ExportFormat::VmdkFlat, "VMDK (Flat)")
                         .on_hover_text(
-                            "monolithicFlat VMDK — descriptor + <name>-flat.vmdk pair. \
+                            "monolithicFlat VMDK - descriptor + <name>-flat.vmdk pair. \
                              Opens in VMware, VirtualBox, qemu-img.",
                         );
                     ui.radio_value(&mut self.format, ExportFormat::VmdkSparse, "VMDK (Sparse)")
                         .on_hover_text(
-                            "monolithicSparse VMDK — single self-contained .vmdk; \
+                            "monolithicSparse VMDK - single self-contained .vmdk; \
                              zero grains omitted. Opens in VMware, VirtualBox, qemu-img.",
                         );
                     ui.radio_value(&mut self.format, ExportFormat::Raw, "Raw (.img)");
@@ -189,7 +189,7 @@ impl BulkConvertDialog {
                     ui.radio_value(&mut self.format, ExportFormat::ChdDvd, "DVD CHD")
                         .on_hover_text("MAME DVD CHD (2048-byte unit, MAME 0.287+)");
                     ui.radio_value(&mut self.format, ExportFormat::ChdCd, "CD CHD")
-                        .on_hover_text("MAME CD CHD — input must be .iso or .cue");
+                        .on_hover_text("MAME CD CHD - input must be .iso or .cue");
                     ui.radio_value(&mut self.format, ExportFormat::BinCue, "BIN/CUE")
                         .on_hover_text("Extract a CD CHD into a BIN/CUE pair");
                     ui.radio_value(&mut self.format, ExportFormat::Xdf, "XDF (.xdf)")
@@ -260,7 +260,7 @@ impl BulkConvertDialog {
                         ui.add_space(6.0);
                         ui.colored_label(
                             super::theme::warning(ui.visuals()),
-                            "Warning: source and output folders are the same — converted files may overwrite originals.",
+                            "Warning: source and output folders are the same - converted files may overwrite originals.",
                         );
                     }
                 }
@@ -275,7 +275,7 @@ impl BulkConvertDialog {
                     let ready =
                         self.source_folder.is_some() && self.output_folder.is_some();
                     if ui
-                        .add_enabled(ready, egui::Button::new("Scan…"))
+                        .add_enabled(ready, egui::Button::new("Scan..."))
                         .on_hover_text("Read the source folder and review the file list before converting.")
                         .clicked()
                     {
@@ -334,7 +334,7 @@ impl BulkConvertDialog {
             return action;
         };
 
-        egui::Window::new("Bulk Convert — Review")
+        egui::Window::new("Bulk Convert - Review")
             .collapsible(false)
             .resizable(true)
             .default_width(640.0)

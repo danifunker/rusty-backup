@@ -4,7 +4,8 @@
 //!   (the fixed-geometry retro filesystems plus small FAT/HFS).
 //! * `new volume <fs> IMG`  — a bare single-volume image of arbitrary size
 //!   (a "superfloppy": NTFS, ext4, HFS+, EFS, …). No partition table.
-//! * `new hd {x68k|sgi-efs|mbr|gpt|apm|sgi|rdb|sun|atari|x68k-table} IMG` — a
+//! * `new hd {x68k|sgi-efs|mbr|gpt|apm|sgi|sgi-dklabel|rdb|sun|next|
+//!   solaris-x86|atari|x68k-table} IMG` — a
 //!   partition-table-wrapped, bootable
 //!   hard-disk image.
 //!
@@ -139,6 +140,18 @@ pub enum FsKind {
     /// `--name` sets the 8-char volume name. `--size` is ignored.
     #[value(alias = "jasmin")]
     Oric,
+    /// BFS (BeOS / Haiku). A bare volume with 1 KiB blocks, an allocation
+    /// bitmap, a 2 MiB log, and an empty root directory in allocation group 8
+    /// — which is why the minimum size is 72 MiB. Little-endian by default
+    /// (BeOS/Intel); pass `--big-endian` for the BeOS/PPC byte order.
+    #[value(alias = "befs", alias = "beos")]
+    Bfs,
+    /// BeOS OFS (the pre-BFS filesystem of the Hobbit BeBox and the early
+    /// PowerPC Developer Releases). A version-1 volume: table of contents,
+    /// sector bitmap, and an empty root directory. Big-endian, 512-byte
+    /// sectors. `--name` sets the volume name.
+    #[value(alias = "beos-ofs")]
+    Ofs,
     /// MFS (Macintosh File System — Mac 128K / 512K / Plus). A flat, pre-HFS
     /// 400 KB / 800 KB floppy volume: zeroed boot blocks, an MDB, an all-free
     /// allocation map, and an empty directory. `--name` sets the volume label
@@ -152,6 +165,24 @@ pub enum FsKind {
     /// `--name` sets the 10-char disc name (space-padded).
     #[value(alias = "acorn")]
     Adfs,
+    /// UFS1 / FFS (4.4BSD, FreeBSD, NetBSD, OpenBSD, Solaris). A `newfs`
+    /// volume with the 4.4BSD `struct cg`: 8 KiB blocks over 1 KiB fragments
+    /// by default, one inode per 4 fragments, and an empty root directory.
+    /// `--block-size` sets `fs_bsize` (fragments are an eighth of it),
+    /// `--bytes-per-inode` the inode density, `--big-endian` the SPARC / m68k
+    /// byte order, and `--name` the volume label.
+    #[value(alias = "ufs1", alias = "ffs")]
+    Ufs,
+    /// UFS1 in the pre-4.4BSD on-disk format (NeXTSTEP / OPENSTEP): the
+    /// 4.3BSD `struct cg`, 16-bit `d_namlen` directory entries with no
+    /// `d_type`, device blocks the size of a fragment, cylinder groups
+    /// staggered across tracks, and live rotational-layout tables. This is
+    /// what goes inside a `new hd next` partition; a 4.4BSD volume there
+    /// parses but NeXTSTEP cannot read its directories. Big-endian by
+    /// default, which is the byte order every NeXT disk uses; `--name` is
+    /// ignored because 4.3BSD has no volume-label field.
+    #[value(name = "ufs-43bsd", alias = "ufs43", alias = "nextstep")]
+    Ufs43,
 }
 
 /// The three media classes `new` creates. CD-ROM images are not here —
@@ -207,6 +238,14 @@ pub enum HdCommand {
     /// partitions come out empty rather than EFS-formatted.
     Sgi(super::new_partitioned_hd::CylinderHdArgs),
 
+    /// SGI disk label (IRIS 2000 / 3000) -- the pre-IRIX scheme an IRIS 3130
+    /// boots from, with eight slots you size and give a role (root / swap /
+    /// boot / slice). Cylinder-aligned from `--heads` / `--sectors`; the
+    /// slots come out empty, so format them with `new volume efs-v1` and
+    /// `write --partition N`. IRIX 3.x needs a `swap` slot to boot.
+    #[command(name = "sgi-dklabel")]
+    SgiDklabel(super::new_partitioned_hd::CylinderHdArgs),
+
     /// Amiga Rigid Disk Block (RDB) with partitions you size and type
     /// yourself. Cylinder-aligned from `--heads` / `--sectors`; types are
     /// AmigaDOS DosType tags (`DOS\\3`, `PFS\\3`, `SFS\\0`, ...).
@@ -216,6 +255,20 @@ pub enum HdCommand {
     /// size and tag yourself. Cylinder-aligned from `--heads` / `--sectors`;
     /// slice 2 is reserved for the whole-disk "backup" alias.
     Sun(super::new_partitioned_hd::CylinderHdArgs),
+
+    /// NeXT disk label (NeXTSTEP / OPENSTEP, black m68k hardware and
+    /// NeXTSTEP/Intel), with the partitions you name. Four checksummed copies
+    /// at 512-byte blocks 0/15/30/45; partitions are counted in the label's
+    /// own 1024-byte sectors, so `--sectors` is in those units. Fill a
+    /// partition with a volume from `new volume ufs-43bsd` -- the 4.4BSD
+    /// `new volume ufs` parses but NeXTSTEP cannot read its directories.
+    Next(super::new_partitioned_hd::CylinderHdArgs),
+
+    /// Solaris x86: an MBR whose one Solaris partition holds a 16-slice VTOC
+    /// in its second sector, with the slice tags you name. Cylinder-aligned;
+    /// slices 2 / 8 / 9 are the label's own backup, boot and alternates.
+    #[command(name = "solaris-x86")]
+    SolarisX86(super::new_partitioned_hd::CylinderHdArgs),
 
     /// Sharp X68000 SCSI/SASI table with partitions you size yourself.
     /// Unlike `x68k` this writes only the table -- no IPL stub, no Human68k
@@ -331,6 +384,22 @@ pub enum VolumeFs {
     Minix2,
     /// Minix V3 — 60-char names, `mkfs.minix -3`.
     Minix3,
+    /// BFS (BeOS / Haiku) — a bare volume, minimum 72 MiB. `--big-endian`
+    /// writes the BeOS/PPC byte order.
+    #[value(alias = "befs", alias = "beos")]
+    Bfs,
+    /// BeOS OFS (the pre-BFS Hobbit BeBox filesystem) — big-endian, 512-byte
+    /// sectors.
+    #[value(alias = "beos-ofs")]
+    Ofs,
+    /// UFS1 / FFS (4.4BSD, FreeBSD, NetBSD, OpenBSD, Solaris). `--big-endian`
+    /// writes the SPARC / m68k byte order.
+    #[value(alias = "ufs1", alias = "ffs")]
+    Ufs,
+    /// UFS1 in the pre-4.4BSD (NeXTSTEP / OPENSTEP) on-disk format, which is
+    /// what a `new hd next` partition needs. Big-endian by default.
+    #[value(name = "ufs-43bsd", alias = "ufs43", alias = "nextstep")]
+    Ufs43,
 }
 
 impl VolumeFs {
@@ -354,6 +423,10 @@ impl VolumeFs {
             VolumeFs::Xfs => FsKind::Xfs,
             VolumeFs::Minix2 => FsKind::Minix2,
             VolumeFs::Minix3 => FsKind::Minix3,
+            VolumeFs::Bfs => FsKind::Bfs,
+            VolumeFs::Ofs => FsKind::Ofs,
+            VolumeFs::Ufs => FsKind::Ufs,
+            VolumeFs::Ufs43 => FsKind::Ufs43,
         }
     }
 }
@@ -410,6 +483,7 @@ impl FloppyArgs {
             size: self.size,
             name: self.name,
             block_size: self.block_size,
+            big_endian: false,
             catalog_size: self.catalog_size,
             extents_size: self.extents_size,
             case_sensitive: false,
@@ -439,13 +513,22 @@ pub struct VolumeArgs {
     #[arg(long, default_value = "800K")]
     pub size: String,
 
-    /// Volume label/name. Defaults to `rusty-backup`.
+    /// Volume label/name. Defaults to `rusty-backup`. Ignored by the
+    /// filesystems with no label field, among them 4.3BSD UFS.
     #[arg(long, default_value = DEFAULT_VOLUME_NAME)]
     pub name: String,
 
-    /// HFS/HFS+ allocation block size in bytes (multiple of 512). Auto when unset.
+    /// HFS/HFS+ allocation block size in bytes (multiple of 512). On `--fs bfs`
+    /// this is the BFS block size (power of two, 1024..=8192); on `--fs ufs`
+    /// it is `fs_bsize`, and the fragment is an eighth of it. Auto when unset.
     #[arg(long = "block-size")]
     pub block_size: Option<u32>,
+
+    /// BFS and UFS: write the big-endian byte order (BeOS/PPC; SPARC / m68k /
+    /// MIPS) instead of the little-endian default. Implied by `ufs-43bsd`,
+    /// since every NeXT disk is big-endian.
+    #[arg(long = "big-endian")]
+    pub big_endian: bool,
 
     /// HFS Catalog B-tree initial size in bytes. Auto when unset.
     #[arg(long = "catalog-size")]
@@ -480,7 +563,8 @@ pub struct VolumeArgs {
     #[arg(long, conflicts_with = "bytes_per_inode")]
     pub inodes: Option<u64>,
 
-    /// EFS only: inode density in bytes per inode (smaller = more inodes).
+    /// EFS and UFS: inode density in bytes per inode (smaller = more inodes).
+    /// UFS defaults to one inode per 4 fragments, as `newfs -i` does.
     #[arg(long)]
     pub bytes_per_inode: Option<u64>,
 
@@ -501,6 +585,7 @@ impl VolumeArgs {
             size: self.size,
             name: self.name,
             block_size: self.block_size,
+            big_endian: self.big_endian,
             catalog_size: self.catalog_size,
             extents_size: self.extents_size,
             case_sensitive: self.case_sensitive,
@@ -536,11 +621,20 @@ pub fn run(cmd: NewCommand) -> Result<()> {
             HdCommand::Sgi(args) => super::new_partitioned_hd::run(
                 super::new_partitioned_hd::PartitionedHdCommand::Sgi(args),
             ),
+            HdCommand::SgiDklabel(args) => super::new_partitioned_hd::run(
+                super::new_partitioned_hd::PartitionedHdCommand::SgiDklabel(args),
+            ),
             HdCommand::Rdb(args) => super::new_partitioned_hd::run(
                 super::new_partitioned_hd::PartitionedHdCommand::Rdb(args),
             ),
             HdCommand::Sun(args) => super::new_partitioned_hd::run(
                 super::new_partitioned_hd::PartitionedHdCommand::Sun(args),
+            ),
+            HdCommand::Next(args) => super::new_partitioned_hd::run(
+                super::new_partitioned_hd::PartitionedHdCommand::Next(args),
+            ),
+            HdCommand::SolarisX86(args) => super::new_partitioned_hd::run(
+                super::new_partitioned_hd::PartitionedHdCommand::SolarisX86(args),
             ),
             HdCommand::X68kTable(args) => super::new_partitioned_hd::run(
                 super::new_partitioned_hd::PartitionedHdCommand::X68k(args),
@@ -582,9 +676,17 @@ pub struct NewArgs {
 
     /// HFS allocation block size in bytes. Must be a non-zero multiple of
     /// 512. When unset, the smallest size that keeps `total_blocks <=
-    /// 65535` is chosen automatically. Ignored for other filesystems.
+    /// 65535` is chosen automatically. On `--fs bfs` this is the BFS block
+    /// size (a power of two in 1024..=8192, default 1024); on `--fs ufs` it is
+    /// `fs_bsize` (default 8192) and the fragment is an eighth of it. Ignored
+    /// for other filesystems.
     #[arg(long = "block-size")]
     pub block_size: Option<u32>,
+
+    /// BFS and UFS: write the big-endian byte order (BeOS/PPC; SPARC / m68k /
+    /// MIPS) instead of the little-endian default. Ignored elsewhere.
+    #[arg(long = "big-endian")]
+    pub big_endian: bool,
 
     /// HFS Catalog B-tree initial size in bytes (rounded up to a whole
     /// allocation block). When unset, scales with volume size like
@@ -635,8 +737,9 @@ pub struct NewArgs {
     #[arg(long, conflicts_with = "bytes_per_inode")]
     pub inodes: Option<u64>,
 
-    /// EFS only: inode density in bytes per inode (smaller = more inodes),
-    /// floored at one inode per 512-byte block. Mutually exclusive with
+    /// EFS and UFS: inode density in bytes per inode (smaller = more inodes),
+    /// floored at one inode per 512-byte block on EFS and at one per fragment
+    /// on UFS, which defaults to one per 4 fragments. Mutually exclusive with
     /// `--inodes`.
     #[arg(long)]
     pub bytes_per_inode: Option<u64>,
@@ -863,12 +966,30 @@ fn format_image(args: NewArgs) -> Result<()> {
         FsKind::Oric => format_and_write(&args.image, &args.size, &args.name, |_size, name| {
             Ok(crate::fs::oric::create_blank_oric(false, name))
         }),
+        FsKind::Bfs => {
+            let endian = if args.big_endian {
+                crate::fs::bfs::BfsEndian::Big
+            } else {
+                crate::fs::bfs::BfsEndian::Little
+            };
+            let block_size = args.block_size.unwrap_or(1024);
+            format_and_write(&args.image, &args.size, &args.name, move |size, name| {
+                Ok(crate::fs::bfs_write::create_blank_bfs(
+                    size, block_size, name, endian,
+                )?)
+            })
+        }
+        FsKind::Ofs => format_and_write(&args.image, &args.size, &args.name, |size, name| {
+            Ok(crate::fs::ofs_write::create_blank_ofs(size, name)?)
+        }),
         FsKind::Mfs => format_and_write(&args.image, &args.size, &args.name, |size, name| {
             crate::fs::mfs::create_blank_mfs(size, name).map_err(|e| anyhow::anyhow!("{e}"))
         }),
         FsKind::Adfs => format_and_write(&args.image, &args.size, &args.name, |_size, name| {
             Ok(crate::fs::adfs::create_blank_adfs(name))
         }),
+        FsKind::Ufs => write_blank_ufs_image(&args, crate::fs::ufs::CgLayout::Modern),
+        FsKind::Ufs43 => write_blank_ufs_image(&args, crate::fs::ufs::CgLayout::Bsd43),
     }
 }
 
@@ -979,6 +1100,56 @@ fn sanitize_os9_volume_name(name: &str) -> String {
 /// seeks and writes only the populated regions (boot, MFT, metadata, backup
 /// boot at the last sector), so the bulk of the volume stays sparse rather than
 /// being materialized in RAM.
+/// UFS is streamed rather than built in memory: a blank volume is almost all
+/// zeros, and the sizes people format are the ones a `Vec` cannot hold.
+fn write_blank_ufs_image(args: &NewArgs, cg_layout: crate::fs::ufs::CgLayout) -> Result<()> {
+    use crate::fs::ufs::{CgLayout, UfsEndian};
+    use crate::fs::ufs_format::{write_blank_ufs1, Ufs1FormatParams};
+
+    let size = parse_size(&args.size).context("parsing --size")?;
+    let block_size = u64::from(args.block_size.unwrap_or(8192));
+    // Every NeXT disk is big-endian, so the 4.3BSD format defaults that way
+    // rather than making --big-endian mandatory for the only case it has.
+    let big_endian = args.big_endian || cg_layout == CgLayout::Bsd43;
+    let params = Ufs1FormatParams {
+        size_bytes: size,
+        block_size,
+        // FFS puts eight fragments in a block; `newfs` has never shipped
+        // another default and the reader's MAXFRAG gate matches.
+        frag_size: block_size / 8,
+        bytes_per_inode: args.bytes_per_inode.unwrap_or(0),
+        endian: if big_endian {
+            UfsEndian::Big
+        } else {
+            UfsEndian::Little
+        },
+        cg_layout,
+        // 4.3BSD has no `fs_volname`; the bytes 4.4BSD keeps it in are
+        // `fs_fsmnt` there, so a label would land inside the mount point.
+        label: (cg_layout == CgLayout::Modern).then(|| args.name.clone()),
+    };
+    let mut file = std::fs::File::create(&args.image)
+        .with_context(|| format!("creating {}", args.image.display()))?;
+    file.set_len(size)
+        .with_context(|| format!("sizing {}", args.image.display()))?;
+    let geo = write_blank_ufs1(&mut file, &params)
+        .with_context(|| format!("formatting UFS1 into {}", args.image.display()))?;
+    log_stderr(format!(
+        "wrote {} ({size} bytes, UFS1 {} bsize={} fsize={} {} cylinder group(s), {} inodes)",
+        args.image.display(),
+        if cg_layout == CgLayout::Bsd43 {
+            "4.3BSD"
+        } else {
+            "4.4BSD"
+        },
+        geo.bsize,
+        geo.fsize,
+        geo.ncg,
+        geo.ncg * geo.ipg,
+    ));
+    Ok(())
+}
+
 fn write_blank_ntfs_image(
     image: &std::path::Path,
     total_size: u64,

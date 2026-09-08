@@ -61,7 +61,10 @@ fn partition_extent(
     // `--partition 2` silently wrote to the first partition.
     let part = crate::cli::resolve::select_partition(&table, &partitions, index)
         .with_context(|| format!("selecting a partition on {}", device.display()))?;
-    Ok(WriteExtent::partition(part.start_lba, part.size_bytes))
+    Ok(WriteExtent::partition_at(
+        part.byte_offset(),
+        part.size_bytes,
+    ))
 }
 
 pub fn run(args: WriteArgs) -> Result<()> {

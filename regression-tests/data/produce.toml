@@ -84,6 +84,14 @@ ext = "img"
 args = ["new", "volume", "efs", "--size", "2M", "{out}"]
 
 [[recipe]]
+id = "fs.efs-v1"
+ext = "img"
+# 8M, not the 2M its siblings use: the Motion oracle drops this straight into
+# the reference IRIS 3130's /usr slot, and a volume that small leaves the
+# kernel almost nothing to mount.
+args = ["new", "volume", "efs-v1", "--size", "8M", "{out}"]
+
+[[recipe]]
 id = "fs.affs"
 ext = "img"
 # 2M, not the 4M the other volumes use: R-008b panics at 4 MB and above, and a
@@ -178,6 +186,14 @@ args = ["new", "hd", "x68k", "--size", "16M", "{out}"]
 id = "part.sgi"
 ext = "img"
 args = ["new", "hd", "sgi-efs", "--size", "16M", "{out}"]
+
+[[recipe]]
+id = "part.sgi-dklabel"
+ext = "img"
+# The reference IRIS 3130's own geometry (987c x 7h x 17s), so the slots land
+# on the blocks that disk uses and the layout is checkable against it.
+args = ["new", "hd", "sgi-dklabel", "--size", "60135936", "--heads", "7", "--sectors", "17",
+        "--partition", "9139200:root", "--partition", "9078272:swap", "--partition", "rest:slice", "{out}"]
 
 # --- Containers --------------------------------------------------------------
 #

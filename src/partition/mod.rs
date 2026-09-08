@@ -5,12 +5,14 @@ pub mod editor;
 pub mod gpt;
 pub mod mac_cd_builder;
 pub mod mbr;
+pub mod next;
 pub mod provision;
 pub mod rdb;
 pub mod resize;
 pub mod sgi;
 pub mod sgi_dklabel;
 pub mod sgi_hdd_builder;
+pub mod solaris_x86;
 pub mod sun;
 pub mod type_catalog;
 pub mod x68k;
@@ -24,9 +26,11 @@ use apm::Apm;
 use atari::{looks_like_ahdi_root, AhdiPartitionKind, AhdiTable, AHDI_NUM_SLOTS};
 use gpt::Gpt;
 use mbr::Mbr;
+use next::NextDiskLabel;
 use rdb::{Rdb, RDSK_SIGNATURE};
 use sgi::{SgiVolumeHeader, SGI_TYPE_BYTE_EFS, SGI_TYPE_BYTE_XFS, SGI_VOLHDR_MAGIC};
 use sgi_dklabel::SgiDiskLabel;
+use solaris_x86::SolarisX86Label;
 use sun::SunDiskLabel;
 use x68k::X68kPartitionTable;
 
@@ -55,6 +59,17 @@ pub enum PartitionTable {
     /// Sun disk label (SMI VTOC) — SPARC Solaris / SunOS disks. 8 slices,
     /// big-endian, magic `0xDABE` at byte 508; see `src/partition/sun.rs`.
     Sun(SunDiskLabel),
+    /// NeXT disk label — NeXTSTEP / OPENSTEP disks on m68k *and* Intel. Up to
+    /// 8 partitions, big-endian, counted in `d_secsize` (1024-byte) sectors
+    /// past a front porch; see `src/partition/next.rs`.
+    Next(NextDiskLabel),
+    /// Solaris x86 — an ordinary MBR whose Solaris partition (type `0x82` /
+    /// `0xBF`) nests a 16-slice VTOC in its second sector. Slice offsets are
+    /// partition-relative; see `src/partition/solaris_x86.rs`.
+    SolarisX86 {
+        mbr: Mbr,
+        label: SolarisX86Label,
+    },
     /// Atari HD File System Driver — MBR-equivalent for Atari ST / TT / Falcon
     /// hard-disk images. 4 primary slots + XGM extended chains, big-endian,
     /// no boot signature; see `src/partition/atari.rs`.
@@ -141,6 +156,16 @@ impl PartitionInfo {
     pub fn byte_offset(&self) -> u64 {
         self.start_byte.unwrap_or(self.start_lba * 512)
     }
+
+    /// Type byte for the capability gates. A superfloppy carries byte 0 and no
+    /// type string, so its detected filesystem (kept in `type_name`) stands in.
+    pub fn gate_type_byte(&self) -> u8 {
+        if self.partition_type_byte == 0 && self.partition_type_string.is_none() {
+            crate::fs::gate_type_byte_for_hint(&self.type_name)
+        } else {
+            self.partition_type_byte
+        }
+    }
 }
 
 /// Standard floppy disk image sizes (bytes).
@@ -148,6 +173,58 @@ impl PartitionInfo {
 /// Images matching one of these sizes that lack both a recognized filesystem
 /// and a valid MBR/GPT signature are treated as superfloppies with an unknown
 /// filesystem rather than producing a confusing partition-table error.
+/// Read sector 0, retrying a transient device error before giving up.
+///
+/// Removable media — USB floppy drives especially — commonly fail the first
+/// read after the medium is inserted or the drive has spun down, and surface it
+/// as `EIO`. One retry costs nothing on a healthy device and turns an inspect
+/// that failed outright into one that succeeds.
+fn read_first_sector<R: Read + Seek>(
+    reader: &mut R,
+    buf: &mut [u8; 512],
+) -> Result<(), RustyBackupError> {
+    let mut last: Option<std::io::Error> = None;
+    for attempt in 0..3 {
+        if attempt > 0 {
+            let _ = reader.seek(SeekFrom::Start(0));
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        }
+        match reader.read_exact(buf) {
+            Ok(()) => return Ok(()),
+            Err(e) => last = Some(e),
+        }
+    }
+    let e = last.expect("loop runs at least once");
+    Err(RustyBackupError::DeviceRead(format!(
+        "cannot read the first sector after 3 attempts: {e}. \
+         The medium or drive refused the read — this is not a partition-table \
+         problem. Check the disk is inserted, readable and not still mounted."
+    )))
+}
+
+/// Say what was actually tried when nothing identified the medium.
+///
+/// Every probe above has already declined, so the MBR is the last one standing
+/// and its "invalid boot signature" was being surfaced as the whole diagnosis.
+/// That reads as a corrupt partition table, which sends the reader hunting a
+/// detection regression; for a signatureless format (CP/M, several 8-bit
+/// floppies) there was never a table to be wrong. Name the situation and the
+/// way out — `--fs-type` — and keep the probe detail for anyone who wants it.
+fn unrecognized_media(size_bytes: u64, mbr_err: &RustyBackupError) -> RustyBackupError {
+    RustyBackupError::UnrecognizedMedia(format!(
+        "no partition table, and no filesystem signature at offset 0 ({size_bytes} bytes). \
+         Some formats carry no signature at all (CP/M and several 8-bit floppies) — \
+         open those with `--fs-type <fs>`. Probe detail: {mbr_err}"
+    ))
+}
+
+/// NOTE: keep this list NARROW. It is the escape hatch that turns an
+/// unrecognised floppy-sized image into a superfloppy instead of an MBR error,
+/// which also means any size listed here can be opened as an unidentified
+/// volume. Adding 180K (184320) made the signatureless Amstrad CP/M fixture
+/// open as a carve view, breaking `cli_cpm_floppy::ls_without_fs_type_still_
+/// errors_clearly` — which exists precisely to keep such a disc failing rather
+/// than being silently mis-opened. Widen only with that test in mind.
 fn is_floppy_size(size: u64) -> bool {
     matches!(
         size,
@@ -510,19 +587,21 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
     if reader.seek(SeekFrom::Start(1024)).is_ok() {
         let mut buf = [0u8; 512];
         if reader.read_exact(&mut buf).is_ok() {
+            // ext first and the HFS arms validated: the same order as
+            // `fs::detect_filesystem_type`, so both probes name the same volume.
+            if crate::fs::ext_superblock_plausible(&buf) {
+                return Some("ext".to_string());
+            }
             let sig = u16::from_be_bytes([buf[0], buf[1]]);
             match sig {
-                0x4244 => return Some("HFS".to_string()),
-                0x482B | 0x4858 => return Some("HFS+".to_string()),
-                // MFS — pre-HFS, used by Mac 128K/512K and Mac Plus on 400 KB
+                0x4244 if crate::fs::hfs_mdb_plausible(&buf) => return Some("HFS".to_string()),
+                0x482B | 0x4858 if crate::fs::hfsplus_header_plausible(&buf) => {
+                    return Some("HFS+".to_string())
+                }
+                // MFS: pre-HFS, used by Mac 128K/512K and Mac Plus on 400 KB
                 // single-sided floppies. Same byte-1024 MDB convention as HFS.
                 0xD2D7 => return Some("MFS".to_string()),
                 _ => {}
-            }
-            // ext2/3/4 superblock magic 0xEF53 (LE u16) at byte 0x38 of the
-            // 1024-offset superblock.
-            if buf[0x38] == 0x53 && buf[0x39] == 0xEF {
-                return Some("ext".to_string());
             }
             // ProDOS volume directory key block: prev_block==0, storage_type nibble==0xF,
             // entry_length==39, entries_per_block==13.
@@ -611,7 +690,20 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
             if magic == 0x0007_2959 || magic == 0x0007_295A {
                 return Some("EFS".to_string());
             }
+            if crate::fs::bfs::BfsSuperBlock::parse(&buf).is_ok() {
+                return Some("BFS".to_string());
+            }
         }
+    }
+
+    // BeOS BFS on a bare volume with no PC boot block (the BeOS/PPC layout),
+    // and the pre-BFS OFS, whose table of contents also lives at sector 0.
+    // OFS has no magic number, so its geometry check is what keeps it honest.
+    if crate::fs::bfs::BfsSuperBlock::parse(first_sector).is_ok() {
+        return Some("BFS".to_string());
+    }
+    if crate::fs::ofs::OfsToc::parse(first_sector).is_ok() {
+        return Some("BeOS OFS".to_string());
     }
 
     // SGI EFS v1: a different magic at a different offset, so it cannot collide
@@ -800,6 +892,79 @@ pub fn is_known_layout(expected: &str) -> bool {
                 .any(|(a, _)| normalise_layout(a) == want))
 }
 
+/// The MBR's own entries: primaries at their slot (0-3), EBR logicals from 4.
+fn mbr_partitions(mbr: &Mbr) -> Vec<PartitionInfo> {
+    let mut result: Vec<PartitionInfo> = mbr
+        .entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| !e.is_empty())
+        .map(|(i, e)| PartitionInfo {
+            index: i,
+            type_name: e.partition_type_name().to_string(),
+            partition_type_byte: e.partition_type,
+            start_lba: e.start_lba as u64,
+            start_byte: None,
+            size_bytes: e.size_bytes(),
+            bootable: e.bootable,
+            is_logical: false,
+            is_extended_container: e.is_extended(),
+            partition_type_string: None,
+            hfs_block_size: None,
+            rdb_part_block: None,
+            drv_name: None,
+        })
+        .collect();
+
+    // Append logical partitions from EBR chain (index 4+)
+    for (j, e) in mbr.logical_partitions.iter().enumerate() {
+        result.push(PartitionInfo {
+            index: 4 + j,
+            type_name: e.partition_type_name().to_string(),
+            partition_type_byte: e.partition_type,
+            start_lba: e.start_lba as u64,
+            start_byte: None,
+            size_bytes: e.size_bytes(),
+            bootable: e.bootable,
+            is_logical: true,
+            is_extended_container: false,
+            partition_type_string: None,
+            hfs_block_size: None,
+            rdb_part_block: None,
+            drv_name: None,
+        });
+    }
+
+    result
+}
+
+/// Where the non-Solaris MBR entries index on a Solaris x86 disk (slices own 0-15).
+pub const SOLARIS_MBR_INDEX_BASE: usize = 16;
+
+/// The VTOC slices as partitions; `index` is the slice number.
+fn solaris_slice_partitions(label: &SolarisX86Label) -> Vec<PartitionInfo> {
+    label
+        .browsable_slices()
+        .map(|(i, s)| PartitionInfo {
+            index: i,
+            // Solaris slices are UFS; leave the type byte at 0 so
+            // `open_filesystem` finds the superblock itself.
+            type_name: format!("Solaris s{i} ({})", s.tag_name()),
+            partition_type_byte: 0,
+            start_lba: s.start_sector,
+            start_byte: None,
+            size_bytes: s.size_bytes(),
+            bootable: s.tag == 2,
+            is_logical: false,
+            is_extended_container: false,
+            partition_type_string: None,
+            hfs_block_size: None,
+            rdb_part_block: None,
+            drv_name: None,
+        })
+        .collect()
+}
+
 impl PartitionTable {
     /// Detect and parse the partition table from a readable+seekable source.
     pub fn detect(reader: &mut (impl Read + Seek)) -> Result<Self, RustyBackupError> {
@@ -808,9 +973,11 @@ impl PartitionTable {
             .seek(SeekFrom::Start(0))
             .map_err(RustyBackupError::Io)?;
         let mut mbr_data = [0u8; 512];
-        reader
-            .read_exact(&mut mbr_data)
-            .map_err(|e| RustyBackupError::InvalidMbr(format!("cannot read first sector: {e}")))?;
+        // A failure here is the medium refusing to be read, not a bad table.
+        // Reporting it as "Invalid MBR" sent a user hunting a partition-table
+        // regression when the drive had returned EIO. Retry first: slow USB
+        // floppies routinely fail the first access after a spin-up.
+        read_first_sector(reader, &mut mbr_data)?;
 
         // Check for SGI Volume Header (IRIX) before MBR / APM. The 32-bit
         // big-endian magic 0x0BE5A941 at offset 0 is unambiguous — no MBR,
@@ -843,6 +1010,20 @@ impl PartitionTable {
         if SunDiskLabel::detect(&mbr_data) {
             return Ok(PartitionTable::Sun(SunDiskLabel::parse(&mbr_data)?));
         }
+
+        // NeXT disk label (NeXTSTEP / OPENSTEP). Four checksummed copies at
+        // 512-byte blocks 0/15/30/45. This runs before MBR parsing because a
+        // NeXTSTEP/Intel disk also carries a valid 0xAA55 boot sector with an
+        // empty partition table, which would otherwise win.
+        reader
+            .seek(SeekFrom::Start(0))
+            .map_err(RustyBackupError::Io)?;
+        if let Some(label) = next::detect(reader) {
+            return Ok(PartitionTable::Next(label));
+        }
+        reader
+            .seek(SeekFrom::Start(0))
+            .map_err(RustyBackupError::Io)?;
 
         // Check for APM (Driver Descriptor Record signature 0x4552 at offset 0)
         let ddr_sig = u16::from_be_bytes([mbr_data[0], mbr_data[1]]);
@@ -1015,7 +1196,7 @@ impl PartitionTable {
                         fs_hint: "Unknown".to_string(),
                     });
                 }
-                return Err(e);
+                return Err(unrecognized_media(size_bytes, &e));
             }
         };
 
@@ -1049,6 +1230,12 @@ impl PartitionTable {
                     break; // Only one extended partition is valid per MBR
                 }
             }
+
+            // Solaris x86 nests a VTOC inside an MBR partition (0x82 is also swap,
+            // so its sanity word decides); the EBR walk ran first to keep logicals.
+            if let Some(label) = solaris_x86::detect(reader, &mbr) {
+                return Ok(PartitionTable::SolarisX86 { mbr, label });
+            }
             Ok(PartitionTable::Mbr(mbr))
         }
     }
@@ -1068,6 +1255,13 @@ impl PartitionTable {
             }
             // No platform convention; `@DH0` is the identity users know.
             PartitionTable::Rdb(_) => Some(raw),
+            // NeXTSTEP names slots by letter; the number behind `a` is 0.
+            PartitionTable::Next(_) => Some(raw),
+            // Solaris `format(1M)` numbers slices from 0 and `index` keeps the
+            // VTOC position; the MBR entries listed after them have no `sN`.
+            PartitionTable::SolarisX86 { .. } => {
+                (raw < SOLARIS_MBR_INDEX_BASE as u32).then_some(raw)
+            }
             _ => None,
         }
     }
@@ -1082,6 +1276,8 @@ impl PartitionTable {
                 | PartitionTable::Sgi(_)
                 | PartitionTable::SgiDkLabel(_)
                 | PartitionTable::Sun(_)
+                | PartitionTable::Next(_)
+                | PartitionTable::SolarisX86 { .. }
                 | PartitionTable::Rdb(_)
         )
     }
@@ -1089,50 +1285,7 @@ impl PartitionTable {
     /// Get a unified list of partition info for display.
     pub fn partitions(&self) -> Vec<PartitionInfo> {
         match self {
-            PartitionTable::Mbr(mbr) => {
-                let mut result: Vec<PartitionInfo> = mbr
-                    .entries
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, e)| !e.is_empty())
-                    .map(|(i, e)| PartitionInfo {
-                        index: i,
-                        type_name: e.partition_type_name().to_string(),
-                        partition_type_byte: e.partition_type,
-                        start_lba: e.start_lba as u64,
-                        start_byte: None,
-                        size_bytes: e.size_bytes(),
-                        bootable: e.bootable,
-                        is_logical: false,
-                        is_extended_container: e.is_extended(),
-                        partition_type_string: None,
-                        hfs_block_size: None,
-                        rdb_part_block: None,
-                        drv_name: None,
-                    })
-                    .collect();
-
-                // Append logical partitions from EBR chain (index 4+)
-                for (j, e) in mbr.logical_partitions.iter().enumerate() {
-                    result.push(PartitionInfo {
-                        index: 4 + j,
-                        type_name: e.partition_type_name().to_string(),
-                        partition_type_byte: e.partition_type,
-                        start_lba: e.start_lba as u64,
-                        start_byte: None,
-                        size_bytes: e.size_bytes(),
-                        bootable: e.bootable,
-                        is_logical: true,
-                        is_extended_container: false,
-                        partition_type_string: None,
-                        hfs_block_size: None,
-                        rdb_part_block: None,
-                        drv_name: None,
-                    });
-                }
-
-                result
-            }
+            PartitionTable::Mbr(mbr) => mbr_partitions(mbr),
             PartitionTable::Gpt { gpt, .. } => gpt
                 .entries
                 .iter()
@@ -1284,6 +1437,50 @@ impl PartitionTable {
                     drv_name: None,
                 })
                 .collect(),
+            PartitionTable::Next(label) => label
+                .browsable_partitions()
+                .map(|(i, p)| PartitionInfo {
+                    index: i,
+                    // NeXTSTEP partitions are 4.3BSD FFS; leave the type byte
+                    // at 0 so `open_filesystem` finds the big-endian UFS super
+                    // block itself. Swap slots simply won't resolve.
+                    type_name: format!(
+                        "NeXT {} ({})",
+                        next::NextPartition::letter(i),
+                        if p.fs_type.is_empty() {
+                            "unknown".to_string()
+                        } else {
+                            p.fs_type.clone()
+                        }
+                    ),
+                    partition_type_byte: 0,
+                    start_lba: p.start_byte / 512,
+                    // Partitions are counted in 1024-byte sectors, so the
+                    // start is not `start_lba * 512` in general.
+                    start_byte: Some(p.start_byte),
+                    size_bytes: p.size_bytes,
+                    bootable: next::NextPartition::letter(i) == label.root_partition,
+                    is_logical: false,
+                    is_extended_container: false,
+                    partition_type_string: None,
+                    hfs_block_size: None,
+                    rdb_part_block: None,
+                    drv_name: None,
+                })
+                .collect(),
+            PartitionTable::SolarisX86 { mbr, label } => {
+                let mut result: Vec<PartitionInfo> = solaris_slice_partitions(label);
+                // The rest of the MBR is still a disk; its entries list after
+                // the slices, and the Solaris slot is its slices.
+                for mut p in mbr_partitions(mbr) {
+                    if !p.is_logical && p.index == label.mbr_slot {
+                        continue;
+                    }
+                    p.index += SOLARIS_MBR_INDEX_BASE;
+                    result.push(p);
+                }
+                result
+            }
             PartitionTable::Rdb(rdb) => rdb
                 .partitions
                 .iter()
@@ -1515,6 +1712,8 @@ impl PartitionTable {
         "SGI",
         "SGI-DkLabel",
         "Sun",
+        "NeXT",
+        "Solaris-x86",
         "AHDI",
         "X68k",
         "None",
@@ -1566,6 +1765,8 @@ impl PartitionTable {
             PartitionTable::Sgi(_) => "SGI",
             PartitionTable::SgiDkLabel(_) => "SGI-DkLabel",
             PartitionTable::Sun(_) => "Sun",
+            PartitionTable::Next(_) => "NeXT",
+            PartitionTable::SolarisX86 { .. } => "Solaris-x86",
             PartitionTable::Ahdi(_) => "AHDI",
             PartitionTable::X68k { .. } => "X68k",
             PartitionTable::None { .. } => "None",
@@ -1593,6 +1794,8 @@ impl PartitionTable {
             | PartitionTable::Sgi(_)
             | PartitionTable::SgiDkLabel(_)
             | PartitionTable::Sun(_)
+            | PartitionTable::Next(_)
+            | PartitionTable::SolarisX86 { .. }
             | PartitionTable::Ahdi(_)
             | PartitionTable::X68k { .. }
             | PartitionTable::None { .. }
@@ -2136,8 +2339,11 @@ mod tests {
                 d
             }),
             ("ext", || {
-                // ext2/3/4 magic 0xEF53 (LE) at 0x38 of the superblock at 1024.
+                // ext2/3/4 magic 0xEF53 (LE) at 0x38 of the superblock at 1024,
+                // with the inode and block counts a real volume never has at zero.
                 let mut d = vec![0u8; 1024 * 1024];
+                d[1024..1028].copy_from_slice(&128u32.to_le_bytes());
+                d[1028..1032].copy_from_slice(&1024u32.to_le_bytes());
                 d[1024 + 0x38] = 0x53;
                 d[1024 + 0x39] = 0xEF;
                 d
@@ -2149,10 +2355,13 @@ mod tests {
                 d
             }),
             ("HFS", || {
-                // MDB signature 0x4244 at offset 1024; no JMP / MBR signature.
+                // MDB signature 0x4244 at offset 1024 with a real block count
+                // and size; no JMP / MBR signature.
                 let mut d = vec![0u8; 819200];
                 d[1024] = 0x42;
                 d[1025] = 0x44;
+                d[1024 + 18..1024 + 20].copy_from_slice(&1594u16.to_be_bytes());
+                d[1024 + 20..1024 + 24].copy_from_slice(&512u32.to_be_bytes());
                 d
             }),
         ];
@@ -2733,10 +2942,12 @@ mod type_name_parity {
             PartitionTable::Sgi(_) => 4,
             PartitionTable::SgiDkLabel(_) => 5,
             PartitionTable::Sun(_) => 6,
-            PartitionTable::Ahdi(_) => 7,
-            PartitionTable::X68k { .. } => 8,
-            PartitionTable::None { .. } => 9,
-            PartitionTable::Dsd { .. } => 10,
+            PartitionTable::Next(_) => 7,
+            PartitionTable::SolarisX86 { .. } => 8,
+            PartitionTable::Ahdi(_) => 9,
+            PartitionTable::X68k { .. } => 10,
+            PartitionTable::None { .. } => 11,
+            PartitionTable::Dsd { .. } => 12,
         }
     }
 
@@ -2744,7 +2955,7 @@ mod type_name_parity {
     fn all_type_names_covers_every_variant() {
         assert_eq!(
             PartitionTable::ALL_TYPE_NAMES.len(),
-            11,
+            13,
             "a PartitionTable variant was added or removed: update ALL_TYPE_NAMES, \
              every_variant_has_an_index, and the README table tests/doc_parity.rs checks"
         );
@@ -2808,5 +3019,42 @@ mod layout_expectation_tests {
         }
         assert!(!is_known_layout("mbrr"));
         assert!(!is_known_layout(""));
+    }
+}
+
+#[cfg(test)]
+mod unrecognized_media_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// Nothing identified the medium, so the diagnosis must say that — not
+    /// blame the MBR, which for a signatureless format was never there to be
+    /// wrong. Regression guard for the message that sent a user hunting a
+    /// detection regression that did not exist.
+    #[test]
+    fn unidentified_media_names_itself_and_offers_a_way_out() {
+        let mut img = vec![0x5Au8; 600 * 1024];
+        img[510] = 0x12;
+        img[511] = 0x34;
+        let err = PartitionTable::detect(&mut Cursor::new(img)).unwrap_err();
+        assert!(
+            matches!(err, RustyBackupError::UnrecognizedMedia(_)),
+            "expected UnrecognizedMedia, got {err:?}"
+        );
+        let text = err.to_string();
+        assert!(text.contains("no partition table"), "got: {text}");
+        assert!(text.contains("--fs-type"), "must offer the way out: {text}");
+    }
+
+    /// A whitelisted floppy size keeps its superfloppy fallback. Signatureless
+    /// discs of other sizes must still fail — `cli_cpm_floppy::
+    /// ls_without_fs_type_still_errors_clearly` depends on it.
+    #[test]
+    fn a_whitelisted_floppy_size_still_falls_back_to_superfloppy() {
+        let mut img = vec![0x5Au8; 1_474_560];
+        img[510] = 0x12;
+        img[511] = 0x34;
+        let table = PartitionTable::detect(&mut Cursor::new(img)).unwrap();
+        assert!(matches!(table, PartitionTable::None { .. }));
     }
 }

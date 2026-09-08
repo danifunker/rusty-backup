@@ -9,6 +9,8 @@ use super::sgi::{
     SgiPartitionEntry, SgiPartitionType, SgiVolumeHeader, SGI_TYPE_BYTE_EFS, SGI_TYPE_BYTE_XFS,
 };
 use super::PartitionTable;
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::{IntIsMultipleOf as _, OptionIsNoneOr as _};
 
 /// A single edit operation on a partition table.
 #[derive(Debug, Clone)]
@@ -204,6 +206,12 @@ pub fn apply_edits(
         }
         PartitionTable::Sun(_) => {
             bail!("Sun disk-label editing is not yet implemented (read / browse / back up only)")
+        }
+        PartitionTable::Next(label) => {
+            apply_next_edits(file, label, edits, disk_size_bytes, log_cb)
+        }
+        PartitionTable::SolarisX86 { mbr, label } => {
+            apply_solaris_x86_edits(file, mbr, label, edits, log_cb)
         }
         PartitionTable::SgiDkLabel(label) => {
             apply_sgi_dklabel_edits(file, label, edits, disk_size_bytes, log_cb)
@@ -690,6 +698,433 @@ fn apply_apm_edits(
 
 /// Edit the eight `{d_base, d_size}` slots. `index` is the raw slot, matching
 /// `PartitionInfo::index` and what `validate_edits` matches on.
+/// NeXT disk label. Every offset here is in the label's own `d_secsize`
+/// sectors measured from the end of the front porch, and every copy the disk
+/// carries is rewritten — see the module header of
+/// [`crate::partition::next`].
+fn apply_next_edits(
+    file: &mut (impl Read + Write + Seek),
+    label: &crate::partition::next::NextDiskLabel,
+    edits: &[PartitionTableEdit],
+    disk_size_bytes: u64,
+    log_cb: &mut impl FnMut(&str),
+) -> Result<()> {
+    use crate::partition::next::{
+        clear_partition, present_copies, set_partition_extent, set_partition_type, write_copies,
+        write_partition, NextDiskLabel, NextPartition, NextPartitionSpec, LABEL_SPAN, N_PARTITIONS,
+    };
+
+    let copies = present_copies(file);
+    if copies.is_empty() {
+        anyhow::bail!("NeXT disk label: no valid label copy to rewrite");
+    }
+    file.seek(SeekFrom::Start(label.label_offset))?;
+    let mut buf = vec![0u8; LABEL_SPAN];
+    file.read_exact(&mut buf)?;
+
+    let secsize = u64::from(label.sector_size);
+    let front = u64::from(label.front_porch);
+    // Each edit reads its slot from the buffer as edited so far, so a resize
+    // then a move of one slot compose and two adds take two slots.
+    let live = |buf: &[u8]| -> Result<NextDiskLabel> {
+        NextDiskLabel::parse(buf, 0)
+            .map_err(|e| anyhow::anyhow!("NeXT disk label: edited label no longer parses: {e}"))
+    };
+    // Only slots the label actually lists may be edited; an unused slot is
+    // reached with `add`, which picks the first free one itself.
+    let resolve = |raw: usize| -> Result<usize> {
+        if label.browsable_partitions().any(|(i, _)| i == raw) {
+            Ok(raw)
+        } else {
+            anyhow::bail!(
+                "NeXT disk label: slot {raw} ({}) is not a listed partition",
+                NextPartition::letter(raw),
+            )
+        }
+    };
+    let to_sectors = |bytes: u64, what: &str| -> Result<i32> {
+        if !bytes.is_multiple_of(secsize) {
+            anyhow::bail!(
+                "NeXT disk label: {what} of {bytes} bytes is not a whole number of the label's \
+                 {secsize}-byte sectors"
+            );
+        }
+        Ok((bytes / secsize) as i32)
+    };
+    let to_base = |start_lba: u64| -> Result<i32> {
+        let byte = start_lba.saturating_mul(512);
+        let sector = to_sectors(byte, "start")?;
+        (sector as i64 - front as i64)
+            .try_into()
+            .ok()
+            .filter(|_| byte >= front * secsize)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "NeXT disk label: LBA {start_lba} is inside the {}-byte front porch the label \
+                     copies live in",
+                    front * secsize,
+                )
+            })
+    };
+
+    for edit in edits {
+        match edit {
+            PartitionTableEdit::ResizeEntry {
+                index,
+                new_size_bytes,
+            } => {
+                let slot = resolve(*index)?;
+                let size = to_sectors(*new_size_bytes, "size")?;
+                let base = live(&buf)?.partitions[slot].base;
+                set_partition_extent(&mut buf, slot, base, size);
+                log_cb(&format!(
+                    "NeXT disk label: slot {slot} ({}) resized to {size} sectors of {secsize}",
+                    NextPartition::letter(slot),
+                ));
+            }
+            PartitionTableEdit::MoveEntry {
+                index,
+                new_start_lba,
+            } => {
+                let slot = resolve(*index)?;
+                let base = to_base(*new_start_lba)?;
+                let size = live(&buf)?.partitions[slot].size;
+                set_partition_extent(&mut buf, slot, base, size);
+                log_cb(&format!(
+                    "NeXT disk label: slot {slot} ({}) moved to p_base {base}",
+                    NextPartition::letter(slot),
+                ));
+            }
+            PartitionTableEdit::DeleteEntry { index } => {
+                let slot = resolve(*index)?;
+                clear_partition(&mut buf, slot);
+                log_cb(&format!(
+                    "NeXT disk label: slot {slot} ({}) cleared",
+                    NextPartition::letter(slot),
+                ));
+                if buf[0xBC] == NextPartition::letter(slot) as u8 {
+                    log_cb(
+                        "NeXT disk label: warning - d_rootpartition still names that slot; \
+                         point it at a live one with `partmap set-bootable`",
+                    );
+                }
+            }
+            PartitionTableEdit::AddEntry {
+                start_lba,
+                size_bytes,
+                type_string,
+                ..
+            } => {
+                let now = live(&buf)?;
+                let free = (0..N_PARTITIONS)
+                    .find(|i| now.partitions.get(*i).is_none_or(|p| p.is_empty()))
+                    .ok_or_else(|| anyhow::anyhow!("NeXT disk label: all 8 slots are in use"))?;
+                write_partition(
+                    &mut buf,
+                    free,
+                    &NextPartitionSpec {
+                        base: to_base(*start_lba)?,
+                        size: to_sectors(*size_bytes, "size")?,
+                        fs_type: type_string
+                            .clone()
+                            .filter(|t| !t.trim().is_empty())
+                            .unwrap_or_else(|| "4.3BSD".to_string()),
+                        ..Default::default()
+                    },
+                );
+                log_cb(&format!(
+                    "NeXT disk label: slot {free} ({}) added",
+                    NextPartition::letter(free),
+                ));
+            }
+            PartitionTableEdit::ChangeType {
+                index,
+                new_type_string,
+                ..
+            } => {
+                let slot = resolve(*index)?;
+                let text = new_type_string.as_deref().map(str::trim).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "NeXT disk label: p_type is an 8-byte name, not a number -- pass \
+                         --type-string (try `partmap types --table next`)"
+                    )
+                })?;
+                if text.len() > 7 {
+                    anyhow::bail!("NeXT disk label: p_type holds 7 characters, '{text}' is longer");
+                }
+                set_partition_type(&mut buf, slot, text);
+                log_cb(&format!("NeXT disk label: slot {slot} typed '{text}'"));
+            }
+            PartitionTableEdit::SetBootable { index, bootable } => {
+                if !*bootable {
+                    anyhow::bail!(
+                        "NeXT disk label: d_rootpartition always names one slot, so a root slot \
+                         can be moved but not cleared"
+                    );
+                }
+                let slot = resolve(*index)?;
+                buf[0xBC] = NextPartition::letter(slot) as u8;
+                log_cb(&format!(
+                    "NeXT disk label: d_rootpartition set to '{}'",
+                    NextPartition::letter(slot),
+                ));
+            }
+        }
+    }
+
+    check_next_layout(&buf, secsize, front, disk_size_bytes)?;
+    // v1/v2 labels keep their checksum after dl_bad; stamping v3's offset
+    // there left the real sum stale and every copy unreadable.
+    NextDiskLabel::stamp_checksum(&mut buf, label.version);
+    write_copies(file, &buf, &copies)?;
+    log_cb(&format!(
+        "NeXT disk label: rewrote {} copy/copies at block(s) {}",
+        copies.len(),
+        copies
+            .iter()
+            .map(|b| b.to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
+    ));
+    Ok(())
+}
+
+/// Reject overlap or a partition running past the medium, reading the edited
+/// buffer back through the parser so the check sees what a reader will.
+fn check_next_layout(buf: &[u8], secsize: u64, front: u64, disk_size: u64) -> Result<()> {
+    let label = crate::partition::next::NextDiskLabel::parse(buf, 0)
+        .map_err(|e| anyhow::anyhow!("NeXT disk label: edited label no longer parses: {e}"))?;
+    let live: Vec<_> = label.browsable_partitions().collect();
+    for (i, p) in &live {
+        let end = p.start_byte.saturating_add(p.size_bytes);
+        if disk_size > 0 && end > disk_size {
+            anyhow::bail!(
+                "NeXT disk label: partition {} ends at byte {end}, past the {disk_size}-byte disk",
+                crate::partition::next::NextPartition::letter(*i),
+            );
+        }
+        if p.start_byte < front * secsize {
+            anyhow::bail!(
+                "NeXT disk label: partition {} starts inside the front porch",
+                crate::partition::next::NextPartition::letter(*i),
+            );
+        }
+        for (j, q) in &live {
+            if j <= i {
+                continue;
+            }
+            let qend = q.start_byte.saturating_add(q.size_bytes);
+            if p.start_byte < qend && q.start_byte < end {
+                anyhow::bail!(
+                    "NeXT disk label: partitions {} and {} overlap",
+                    crate::partition::next::NextPartition::letter(*i),
+                    crate::partition::next::NextPartition::letter(*j),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Solaris x86 VTOC. Slice offsets are sectors *relative to the Solaris MBR
+/// partition*, so every edit is translated from the absolute LBA the caller
+/// speaks and checked against that partition's extent.
+fn apply_solaris_x86_edits(
+    file: &mut (impl Read + Write + Seek),
+    mbr: &Mbr,
+    label: &crate::partition::solaris_x86::SolarisX86Label,
+    edits: &[PartitionTableEdit],
+    log_cb: &mut impl FnMut(&str),
+) -> Result<()> {
+    use crate::partition::solaris_x86::{
+        data_area_sectors, get_slice, set_slice, stamp_checksum, write_label, N_SLICES, VTOC_SECTOR,
+    };
+    use crate::partition::sun::{tag_from_text, tag_name};
+
+    let start = label.partition_start_lba;
+    file.seek(SeekFrom::Start((start + VTOC_SECTOR) * 512))?;
+    let mut sector = [0u8; 512];
+    file.read_exact(&mut sector)?;
+
+    // The label's own `dkl_ncyl` stops short of the alternate cylinders, so it
+    // is the tighter bound; fall back to what the MBR entry says.
+    let bound = data_area_sectors(&sector)
+        .filter(|n| *n <= label.partition_sectors)
+        .unwrap_or(label.partition_sectors);
+    let resolve = |raw: usize| -> Result<usize> {
+        if label.browsable_slices().any(|(i, _)| i == raw) {
+            Ok(raw)
+        } else if raw >= crate::partition::SOLARIS_MBR_INDEX_BASE {
+            // Indexes past the slices are the disk's other MBR entries.
+            anyhow::bail!(
+                "Solaris x86 VTOC: partition {raw} is an MBR entry outside the Solaris \
+                 partition, not a slice; only the VTOC slices are editable here"
+            )
+        } else {
+            anyhow::bail!("Solaris x86 VTOC: slice {raw} is not a listed slice")
+        }
+    };
+    let to_relative = |lba: u64| -> Result<u32> {
+        lba.checked_sub(start)
+            .and_then(|r| u32::try_from(r).ok())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Solaris x86 VTOC: LBA {lba} is outside the Solaris partition, which starts \
+                     at LBA {start}"
+                )
+            })
+    };
+    let to_sectors = |bytes: u64| -> Result<u32> {
+        u32::try_from(bytes / 512).map_err(|_| {
+            anyhow::anyhow!(
+                "Solaris x86 VTOC: {bytes} bytes is more slice than a \
+                                          32-bit sector count can hold"
+            )
+        })
+    };
+    let tag_of = |string: &Option<String>, byte: u8| -> Result<u16> {
+        if let Some(text) = string.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+            return tag_from_text(text).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Solaris x86 VTOC: '{text}' is not a slice tag (try \
+                     `partmap types --table solaris-x86`)"
+                )
+            });
+        }
+        Ok(u16::from(byte))
+    };
+
+    for edit in edits {
+        match edit {
+            PartitionTableEdit::ResizeEntry {
+                index,
+                new_size_bytes,
+            } => {
+                let slot = resolve(*index)?;
+                let (tag, flag, rel, _) = get_slice(&sector, slot).unwrap_or_default();
+                set_slice(
+                    &mut sector,
+                    slot,
+                    tag,
+                    flag,
+                    rel,
+                    to_sectors(*new_size_bytes)?,
+                );
+                log_cb(&format!("Solaris x86 VTOC: slice {slot} resized"));
+            }
+            PartitionTableEdit::MoveEntry {
+                index,
+                new_start_lba,
+            } => {
+                let slot = resolve(*index)?;
+                let (tag, flag, _, size) = get_slice(&sector, slot).unwrap_or_default();
+                let rel = to_relative(*new_start_lba)?;
+                set_slice(&mut sector, slot, tag, flag, rel, size);
+                log_cb(&format!(
+                    "Solaris x86 VTOC: slice {slot} moved to partition-relative sector {rel}"
+                ));
+            }
+            PartitionTableEdit::DeleteEntry { index } => {
+                let slot = resolve(*index)?;
+                set_slice(&mut sector, slot, 0, 0, 0, 0);
+                log_cb(&format!("Solaris x86 VTOC: slice {slot} cleared"));
+            }
+            PartitionTableEdit::AddEntry {
+                start_lba,
+                size_bytes,
+                partition_type,
+                type_string,
+                ..
+            } => {
+                // Slices 2, 8 and 9 are the label's own backup, boot and
+                // alternates, so a new slice never lands in one.
+                let free = (0..N_SLICES)
+                    .filter(|i| !matches!(i, 2 | 8 | 9))
+                    .find(|i| get_slice(&sector, *i).is_none_or(|(_, _, _, size)| size == 0))
+                    .ok_or_else(|| anyhow::anyhow!("Solaris x86 VTOC: every slice is in use"))?;
+                let tag = tag_of(type_string, *partition_type)?;
+                set_slice(
+                    &mut sector,
+                    free,
+                    tag,
+                    0,
+                    to_relative(*start_lba)?,
+                    to_sectors(*size_bytes)?,
+                );
+                log_cb(&format!(
+                    "Solaris x86 VTOC: slice {free} added as {}",
+                    tag_name(tag),
+                ));
+            }
+            PartitionTableEdit::ChangeType {
+                index,
+                new_type_byte,
+                new_type_string,
+            } => {
+                let slot = resolve(*index)?;
+                let (_, flag, rel, size) = get_slice(&sector, slot).unwrap_or_default();
+                let tag = tag_of(new_type_string, *new_type_byte)?;
+                set_slice(&mut sector, slot, tag, flag, rel, size);
+                log_cb(&format!(
+                    "Solaris x86 VTOC: slice {slot} tagged {}",
+                    tag_name(tag),
+                ));
+            }
+            PartitionTableEdit::SetBootable { .. } => {
+                anyhow::bail!(
+                    "Solaris x86 VTOC: a slice has no boot flag -- the bootable bit lives on the \
+                     MBR entry that hosts the label, not on the slices inside it"
+                );
+            }
+        }
+    }
+
+    check_solaris_layout(&sector, bound)?;
+    if mbr.entries.get(label.mbr_slot).is_none_or(|e| e.is_empty()) {
+        anyhow::bail!("Solaris x86 VTOC: the MBR entry hosting the label has gone");
+    }
+    stamp_checksum(&mut sector);
+    write_label(file, start, &sector)?;
+    log_cb(&format!(
+        "Solaris x86 VTOC: rewrote the label in sector {} of the Solaris partition",
+        VTOC_SECTOR,
+    ));
+    Ok(())
+}
+
+/// Reject a slice past the label's data area, or partially overlapping
+/// another. Containment is allowed: the backup alias wraps every real slice,
+/// which is how the label spells "the whole partition".
+fn check_solaris_layout(sector: &[u8; 512], bound: u64) -> Result<()> {
+    use crate::partition::solaris_x86::{get_slice, N_SLICES};
+
+    let live: Vec<(usize, u64, u64)> = (0..N_SLICES)
+        .filter_map(|i| get_slice(sector, i).map(|s| (i, s)))
+        .filter(|(_, (_, _, _, size))| *size > 0)
+        .map(|(i, (_, _, start, size))| (i, u64::from(start), u64::from(start) + u64::from(size)))
+        .collect();
+    for (i, a0, a1) in &live {
+        if *a1 > bound {
+            anyhow::bail!(
+                "Solaris x86 VTOC: slice {i} ends at partition-relative sector {a1}, past the \
+                 {bound}-sector data area"
+            );
+        }
+        for (j, b0, b1) in &live {
+            if j <= i {
+                continue;
+            }
+            let contains = (a0 <= b0 && a1 >= b1) || (b0 <= a0 && b1 >= a1);
+            if !contains && a0 < b1 && b0 < a1 {
+                anyhow::bail!(
+                    "Solaris x86 VTOC: slices {i} [{a0}..{a1}) and {j} [{b0}..{b1}) overlap"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn apply_sgi_dklabel_edits(
     file: &mut (impl Read + Write + Seek),
     label: &crate::partition::sgi_dklabel::SgiDiskLabel,
@@ -858,46 +1293,13 @@ fn check_dklabel_layout(
 }
 
 /// Map an [`PartitionTableEdit::AddEntry`]/[`PartitionTableEdit::ChangeType`]
-/// type byte/string into the SGI partition-type discriminant. Accepts both
-/// our synthetic MBR-bytes (0xA0 / 0xA1 — what `PartitionTable::partitions`
-/// hands out) and case-insensitive SGI type-name strings (e.g. "XFS",
-/// "EFS"). Falls back to `Unknown` when nothing matches so the user can
-/// type a raw decimal/hex value into the type field and we'll round-trip
-/// it through `partition_type_raw`.
+/// type byte/string into the SGI partition-type discriminant. The string form
+/// is shared with `new hd sgi` via `provision::sgi_type_from_text`, which also
+/// takes a raw decimal / hex discriminant; the byte form accepts the synthetic
+/// 0xA0 / 0xA1 `PartitionTable::partitions` hands out.
 fn parse_sgi_type(byte: u8, type_string: Option<&str>) -> SgiPartitionType {
-    if let Some(s) = type_string {
-        let trimmed = s.trim();
-        let lower = trimmed.to_ascii_lowercase();
-        match lower.as_str() {
-            "xfs" => return SgiPartitionType::Xfs,
-            "efs" => return SgiPartitionType::Efs,
-            "raw" => return SgiPartitionType::Raw,
-            "bsd" => return SgiPartitionType::Bsd,
-            "sysv" => return SgiPartitionType::SysV,
-            "volume" => return SgiPartitionType::Volume,
-            "volhdr" => return SgiPartitionType::VolHdr,
-            "xfslog" => return SgiPartitionType::XfsLog,
-            "xlv" => return SgiPartitionType::Xlv,
-            "xvm" => return SgiPartitionType::Xvm,
-            "lvol" => return SgiPartitionType::LVol,
-            "rlvol" => return SgiPartitionType::RLVol,
-            "trkrepl" => return SgiPartitionType::TrkRepl,
-            "secrepl" => return SgiPartitionType::SecRepl,
-            _ => {
-                // Accept "0x07" / "7" / "07" raw values for full fidelity.
-                let parsed = if let Some(hex) = trimmed
-                    .strip_prefix("0x")
-                    .or_else(|| trimmed.strip_prefix("0X"))
-                {
-                    u32::from_str_radix(hex, 16).ok()
-                } else {
-                    trimmed.parse::<u32>().ok()
-                };
-                if let Some(raw) = parsed {
-                    return SgiPartitionType::from_raw(raw);
-                }
-            }
-        }
+    if let Some(raw) = type_string.and_then(crate::partition::provision::sgi_type_from_text) {
+        return SgiPartitionType::from_raw(raw);
     }
     match byte {
         SGI_TYPE_BYTE_XFS => SgiPartitionType::Xfs,
@@ -1307,6 +1709,369 @@ mod tests {
         let r = apply_sgi_dklabel_edits(&mut cur, &label, edits, total, &mut |_| {});
         *img = cur.into_inner();
         r
+    }
+
+    /// Build a disk with one of the two new tables on it, through the same
+    /// writer `rb-cli new hd` uses, so the tests edit what a user would have.
+    fn provisioned_disk(kind: crate::partition::type_catalog::TableKind, disk: u64) -> Vec<u8> {
+        use crate::partition::provision::{place, Geometry, PartSpec};
+
+        let geometry = Geometry {
+            heads: 16,
+            sectors_per_track: 63,
+        };
+        let align = crate::partition::provision::default_align(kind, geometry);
+        let specs = vec![PartSpec {
+            size: Some(disk / 4),
+            type_text: None,
+            name: None,
+        }];
+        let placed = place(&specs, kind, disk, align, geometry).unwrap();
+        let mut cur = Cursor::new(vec![0u8; disk as usize]);
+        crate::partition::provision::write_table(&mut cur, kind, &placed, disk, geometry).unwrap();
+        cur.into_inner()
+    }
+
+    fn next_disk() -> Vec<u8> {
+        provisioned_disk(
+            crate::partition::type_catalog::TableKind::Next,
+            64 * 1024 * 1024,
+        )
+    }
+
+    fn next_label_of(img: &[u8]) -> crate::partition::next::NextDiskLabel {
+        let mut cur = Cursor::new(img.to_vec());
+        crate::partition::next::detect(&mut cur).expect("a NeXT label")
+    }
+
+    fn edit_next(img: &mut Vec<u8>, edits: &[PartitionTableEdit]) -> Result<()> {
+        let label = next_label_of(img);
+        let total = img.len() as u64;
+        let mut cur = Cursor::new(std::mem::take(img));
+        let r = apply_next_edits(&mut cur, &label, edits, total, &mut |_| {});
+        *img = cur.into_inner();
+        r
+    }
+
+    /// `p_base` is in 1024-byte sectors past the front porch. An editor that
+    /// took the LBA at face value would put the partition at half its offset.
+    #[test]
+    fn next_move_converts_the_lba_into_porch_relative_sectors() {
+        let mut img = next_disk();
+        let lba = 8 * 1024 * 1024 / 512;
+        edit_next(
+            &mut img,
+            &[PartitionTableEdit::MoveEntry {
+                index: 0,
+                new_start_lba: lba,
+            }],
+        )
+        .unwrap();
+        let label = next_label_of(&img);
+        let (_, p) = label.browsable_partitions().next().unwrap();
+        assert_eq!(p.base, (8 * 1024 * 1024 / 1024) - 160);
+        assert_eq!(p.start_byte, 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn next_add_fills_the_first_free_slot_and_types_it() {
+        let mut img = next_disk();
+        edit_next(
+            &mut img,
+            &[PartitionTableEdit::AddEntry {
+                start_lba: 32 * 1024 * 1024 / 512,
+                size_bytes: 4 * 1024 * 1024,
+                partition_type: 0,
+                type_string: Some("swap".to_string()),
+                bootable: false,
+            }],
+        )
+        .unwrap();
+        let label = next_label_of(&img);
+        let live: Vec<_> = label.browsable_partitions().collect();
+        assert_eq!(live.len(), 2);
+        assert_eq!(live[1].0, 1, "slot b, the first free one");
+        assert_eq!(live[1].1.fs_type, "swap");
+    }
+
+    /// The resize engine emits Resize then Move for one slot; the move used to
+    /// read the slot's size from the label parsed before the resize.
+    #[test]
+    fn next_resize_then_move_keeps_the_new_size() {
+        let mut img = next_disk();
+        let new_size = 6 * 1024 * 1024;
+        edit_next(
+            &mut img,
+            &[
+                PartitionTableEdit::ResizeEntry {
+                    index: 0,
+                    new_size_bytes: new_size,
+                },
+                PartitionTableEdit::MoveEntry {
+                    index: 0,
+                    new_start_lba: 8 * 1024 * 1024 / 512,
+                },
+            ],
+        )
+        .unwrap();
+        let label = next_label_of(&img);
+        let (_, p) = label.browsable_partitions().next().unwrap();
+        assert_eq!(p.size as u64 * 1024, new_size);
+        assert_eq!(p.start_byte, 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn next_two_adds_take_two_slots() {
+        let mut img = next_disk();
+        let add = |mb: u64| PartitionTableEdit::AddEntry {
+            start_lba: mb * 1024 * 1024 / 512,
+            size_bytes: 4 * 1024 * 1024,
+            partition_type: 0,
+            type_string: Some("swap".to_string()),
+            bootable: false,
+        };
+        edit_next(&mut img, &[add(32), add(40)]).unwrap();
+        let label = next_label_of(&img);
+        let live: Vec<_> = label.browsable_partitions().collect();
+        assert_eq!(
+            live.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+    }
+
+    /// A v2 label keeps its checksum after `dl_bad`; stamping v3's offset left
+    /// the real one stale, and every copy stopped validating.
+    #[test]
+    fn next_v2_label_is_still_a_label_after_an_edit() {
+        use crate::partition::next::{NextDiskLabel, LABEL_SPAN, NEXT_LABEL_V2};
+        let mut img = next_disk();
+        for block in [0u64, 15, 30, 45] {
+            let off = (block * 512) as usize;
+            let copy = &mut img[off..off + LABEL_SPAN];
+            copy[0..4].copy_from_slice(&NEXT_LABEL_V2.to_be_bytes());
+            NextDiskLabel::stamp_checksum(copy, NEXT_LABEL_V2);
+        }
+        assert_eq!(next_label_of(&img).version, NEXT_LABEL_V2);
+        edit_next(
+            &mut img,
+            &[PartitionTableEdit::ResizeEntry {
+                index: 0,
+                new_size_bytes: 6 * 1024 * 1024,
+            }],
+        )
+        .unwrap();
+        let label = next_label_of(&img);
+        assert_eq!(label.version, NEXT_LABEL_V2);
+        assert_eq!(
+            label.browsable_partitions().next().unwrap().1.size as u64 * 1024,
+            6 * 1024 * 1024
+        );
+    }
+
+    /// Every copy the disk carries has to be rewritten, and only those: a
+    /// NeXTSTEP/Intel disk has no copy at block 0.
+    #[test]
+    fn next_edits_rewrite_only_the_copies_that_exist() {
+        use crate::partition::next::LABEL_SPAN;
+
+        let mut img = next_disk();
+        // Stamp a PC boot sector over the copy at block 0, as NeXTSTEP/Intel does.
+        for b in img[..LABEL_SPAN].iter_mut() {
+            *b = 0;
+        }
+        img[510] = 0x55;
+        img[511] = 0xAA;
+        edit_next(
+            &mut img,
+            &[PartitionTableEdit::ResizeEntry {
+                index: 0,
+                new_size_bytes: 8 * 1024 * 1024,
+            }],
+        )
+        .unwrap();
+        assert_eq!(&img[510..512], &[0x55, 0xAA], "block 0 was overwritten");
+        for block in [15u64, 30, 45] {
+            let at = (block * 512) as usize;
+            let label =
+                crate::partition::next::NextDiskLabel::parse(&img[at..at + LABEL_SPAN], 0).unwrap();
+            let (_, p) = label.browsable_partitions().next().unwrap();
+            assert_eq!(p.size_bytes, 8 * 1024 * 1024, "copy at block {block}");
+        }
+    }
+
+    #[test]
+    fn next_refuses_a_size_that_is_not_whole_label_sectors() {
+        let mut img = next_disk();
+        let err = edit_next(
+            &mut img,
+            &[PartitionTableEdit::ResizeEntry {
+                index: 0,
+                new_size_bytes: 1536,
+            }],
+        )
+        .expect_err("1.5 KiB is not a whole number of 1024-byte sectors");
+        assert!(format!("{err:#}").contains("1024-byte sectors"), "{err:#}");
+    }
+
+    #[test]
+    fn next_set_type_needs_a_string_and_refuses_clearing_the_root() {
+        let mut img = next_disk();
+        let err = edit_next(
+            &mut img,
+            &[PartitionTableEdit::ChangeType {
+                index: 0,
+                new_type_byte: 0x83,
+                new_type_string: None,
+            }],
+        )
+        .expect_err("p_type is a name, not a byte");
+        assert!(format!("{err:#}").contains("--type-string"), "{err:#}");
+
+        let err = edit_next(
+            &mut img,
+            &[PartitionTableEdit::SetBootable {
+                index: 0,
+                bootable: false,
+            }],
+        )
+        .expect_err("d_rootpartition always names a slot");
+        assert!(format!("{err:#}").contains("d_rootpartition"), "{err:#}");
+    }
+
+    #[test]
+    fn next_overlap_is_refused() {
+        let mut img = next_disk();
+        let err = edit_next(
+            &mut img,
+            &[PartitionTableEdit::AddEntry {
+                start_lba: 2 * 1024 * 1024 / 512,
+                size_bytes: 8 * 1024 * 1024,
+                partition_type: 0,
+                type_string: None,
+                bootable: false,
+            }],
+        )
+        .expect_err("lands on top of partition a");
+        assert!(format!("{err:#}").contains("overlap"), "{err:#}");
+    }
+
+    fn solaris_disk() -> Vec<u8> {
+        provisioned_disk(
+            crate::partition::type_catalog::TableKind::SolarisX86,
+            256 * 1024 * 1024,
+        )
+    }
+
+    fn solaris_parts(img: &[u8]) -> crate::partition::PartitionTable {
+        let mut cur = Cursor::new(img.to_vec());
+        crate::partition::PartitionTable::detect(&mut cur).expect("a Solaris x86 disk")
+    }
+
+    fn edit_solaris(img: &mut Vec<u8>, edits: &[PartitionTableEdit]) -> Result<()> {
+        let table = solaris_parts(img);
+        let crate::partition::PartitionTable::SolarisX86 { mbr, label } = &table else {
+            panic!("not a Solaris x86 disk");
+        };
+        let mut cur = Cursor::new(std::mem::take(img));
+        let r = apply_solaris_x86_edits(&mut cur, mbr, label, edits, &mut |_| {});
+        *img = cur.into_inner();
+        r
+    }
+
+    /// The label sector is a whole `struct dk_label`, so an edit that does not
+    /// re-stamp the checksum leaves something Solaris itself would refuse.
+    #[test]
+    fn solaris_resize_keeps_the_tag_and_restamps_the_checksum() {
+        use byteorder::{ByteOrder, LittleEndian};
+
+        let mut img = solaris_disk();
+        let before = solaris_parts(&img);
+        let crate::partition::PartitionTable::SolarisX86 { label, .. } = &before else {
+            unreachable!()
+        };
+        let (start, tag) = (label.partition_start_lba, label.slices[0].tag);
+
+        edit_solaris(
+            &mut img,
+            &[PartitionTableEdit::ResizeEntry {
+                index: 0,
+                new_size_bytes: 16 * 1024 * 1024,
+            }],
+        )
+        .unwrap();
+
+        let at = ((start + 1) * 512) as usize;
+        let sector = &img[at..at + 512];
+        let mut x = 0u16;
+        for w in sector.chunks_exact(2) {
+            x ^= LittleEndian::read_u16(w);
+        }
+        assert_eq!(x, 0, "dkl_cksum no longer closes the sector");
+        let after = solaris_parts(&img);
+        let crate::partition::PartitionTable::SolarisX86 { label, .. } = &after else {
+            unreachable!()
+        };
+        assert_eq!(label.slices[0].tag, tag, "the tag survived the resize");
+        assert_eq!(label.slices[0].size_bytes(), 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn solaris_refuses_set_bootable_and_a_slice_past_the_data_area() {
+        let mut img = solaris_disk();
+        let err = edit_solaris(
+            &mut img,
+            &[PartitionTableEdit::SetBootable {
+                index: 0,
+                bootable: true,
+            }],
+        )
+        .expect_err("slices carry no boot flag");
+        assert!(format!("{err:#}").contains("MBR entry"), "{err:#}");
+
+        let err = edit_solaris(
+            &mut img,
+            &[PartitionTableEdit::ResizeEntry {
+                index: 0,
+                new_size_bytes: 1024 * 1024 * 1024,
+            }],
+        )
+        .expect_err("1 GiB does not fit a 256 MiB disk");
+        assert!(format!("{err:#}").contains("data area"), "{err:#}");
+    }
+
+    /// A slice tag is a name or a number, and the two must resolve the same.
+    #[test]
+    fn solaris_set_type_accepts_a_name_or_a_number() {
+        let mut img = solaris_disk();
+        edit_solaris(
+            &mut img,
+            &[PartitionTableEdit::ChangeType {
+                index: 0,
+                new_type_byte: 0,
+                new_type_string: Some("usr".to_string()),
+            }],
+        )
+        .unwrap();
+        let table = solaris_parts(&img);
+        let crate::partition::PartitionTable::SolarisX86 { label, .. } = &table else {
+            unreachable!()
+        };
+        assert_eq!(label.slices[0].tag_name(), "usr");
+
+        edit_solaris(
+            &mut img,
+            &[PartitionTableEdit::ChangeType {
+                index: 0,
+                new_type_byte: 7,
+                new_type_string: None,
+            }],
+        )
+        .unwrap();
+        let table = solaris_parts(&img);
+        let crate::partition::PartitionTable::SolarisX86 { label, .. } = &table else {
+            unreachable!()
+        };
+        assert_eq!(label.slices[0].tag_name(), "var");
     }
 
     #[test]

@@ -110,8 +110,9 @@ pub fn create_or_replace(
         on_conflict,
         preserve_meta,
     } = policy;
+    let fold_case = efs.case_insensitive_lookup();
     let siblings = efs.list_directory(parent)?;
-    let existing = siblings.iter().find(|e| e.name == name).cloned();
+    let existing = crate::fs::copy::select_child(&siblings, fold_case, name).cloned();
 
     let Some(existing) = existing else {
         let created = efs.create_file(parent, name, data, data_len, opts)?;

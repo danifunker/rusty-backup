@@ -691,7 +691,7 @@ impl RustyBackupApp {
             }
             Err(e) => {
                 self.log_panel.warn(format!(
-                    "Failed to materialize {}: {} — opening raw bytes",
+                    "Failed to materialize {}: {} - opening raw bytes",
                     path.display(),
                     e
                 ));
@@ -854,10 +854,31 @@ impl RustyBackupApp {
     }
 }
 
+impl RustyBackupApp {
+    /// Another tab (not `tab`) with a disk job in flight; one job at a time
+    /// keeps two drives from being hammered and the shared progress bar honest.
+    fn busy_elsewhere(&self, tab: Tab) -> Option<&'static str> {
+        let jobs: [(Tab, bool, &'static str); 3] = [
+            (Tab::Backup, self.backup_tab.is_running(), "Backup"),
+            (Tab::Restore, self.restore_tab.is_running(), "Restore"),
+            (Tab::Optical, self.optical_tab.is_running(), "Optical"),
+        ];
+        jobs.iter()
+            .find(|(owner, running, _)| *running && *owner != tab)
+            .map(|(_, _, name)| *name)
+            .or(if self.bulk_convert_status.is_some() {
+                Some("Bulk Convert")
+            } else {
+                None
+            })
+    }
+}
+
 impl eframe::App for RustyBackupApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Request repaint while backup/restore is running so progress updates are shown
         if self.progress.active
+            || self.backup_tab.is_running()
             || self.restore_tab.is_running()
             || self.optical_tab.is_running()
             || self.bulk_convert_status.is_some()
@@ -898,7 +919,12 @@ impl eframe::App for RustyBackupApp {
                     // open volume while in edit mode) — re-opening here would
                     // clobber the loaded source and make drag-to-add impossible.
                     Tab::Inspect => {
-                        if !self.inspect_tab.has_loaded_source() {
+                        if self.inspect_tab.is_remote_session() {
+                            self.log_panel.warn(format!(
+                                "Ignored dropped file {}: a remote session is open; close it first",
+                                path.display()
+                            ));
+                        } else if !self.inspect_tab.has_loaded_source() {
                             self.open_in_inspect(path);
                         }
                     }
@@ -1029,7 +1055,7 @@ impl eframe::App for RustyBackupApp {
                     // Bulk Convert — convert every disk image in a folder.
                     let bulk_running = self.bulk_convert_status.is_some();
                     if ui
-                        .add_enabled(!bulk_running, egui::Button::new("Bulk Convert…"))
+                        .add_enabled(!bulk_running, egui::Button::new("Bulk Convert..."))
                         .on_hover_text(
                             "Convert every disk image in a folder to one chosen format, \
                              using the same parameters for every file.",
@@ -1097,7 +1123,7 @@ impl eframe::App for RustyBackupApp {
                     };
                     let text = if s.current_total_bytes > 0 {
                         format!(
-                            "Bulk Convert: [{}/{}] {} — {} / {} ({:.0}%)",
+                            "Bulk Convert: [{}/{}] {} - {} / {} ({:.0}%)",
                             s.current_index,
                             s.total_files,
                             s.current_file,
@@ -1107,7 +1133,7 @@ impl eframe::App for RustyBackupApp {
                         )
                     } else {
                         format!(
-                            "Bulk Convert: [{}/{}] {} — preparing…",
+                            "Bulk Convert: [{}/{}] {} - preparing...",
                             s.current_index, s.total_files, s.current_file,
                         )
                     };
@@ -1186,10 +1212,30 @@ impl eframe::App for RustyBackupApp {
                 self.log_panel.show(ui);
             });
 
+        // Poll the tabs that are not showing: a job keeps reporting on the
+        // shared progress bar and its completion is not missed after a switch.
+        {
+            let mut ctx = context::TabContext::new(&self.devices, &mut self.log_panel);
+            if !matches!(self.active_tab, Tab::Backup) {
+                self.backup_tab
+                    .poll_background(&mut ctx, &mut self.progress);
+            }
+            if !matches!(self.active_tab, Tab::Restore) {
+                self.restore_tab
+                    .poll_background(&mut ctx, &mut self.progress);
+            }
+        }
+        if !matches!(self.active_tab, Tab::Optical) {
+            self.optical_tab
+                .poll_background(&mut self.log_panel, &mut self.progress);
+        }
+
         // Central panel: active tab content
         egui::CentralPanel::default().show_inside(ctx, |ui| match self.active_tab {
             Tab::Backup => {
-                let mut ctx = context::TabContext::new(&self.devices, &mut self.log_panel);
+                let busy = self.busy_elsewhere(Tab::Backup);
+                let mut ctx = context::TabContext::new(&self.devices, &mut self.log_panel)
+                    .busy_elsewhere(busy);
                 self.backup_tab.show(ui, &mut ctx, &mut self.progress);
             }
             Tab::Restore => {
@@ -1199,13 +1245,17 @@ impl eframe::App for RustyBackupApp {
                         self.loaded_backup_folder = Some(new_backup.clone());
                         self.inspect_tab.load_backup(&new_backup);
                     }
-                } else if !self.restore_tab.has_backup() {
+                } else if !self.restore_tab.has_backup() && !self.restore_tab.has_other_source() {
+                    // Only an empty tab adopts the shared folder; a tab the user
+                    // pointed at an image must not have it re-installed each frame.
                     if let Some(folder) = self.loaded_backup_folder.as_ref() {
                         self.restore_tab.load_backup(folder);
                     }
                 }
 
-                let mut ctx = context::TabContext::new(&self.devices, &mut self.log_panel);
+                let busy = self.busy_elsewhere(Tab::Restore);
+                let mut ctx = context::TabContext::new(&self.devices, &mut self.log_panel)
+                    .busy_elsewhere(busy);
                 self.restore_tab.show(ui, &mut ctx, &mut self.progress);
             }
             Tab::Inspect => {
@@ -1225,7 +1275,8 @@ impl eframe::App for RustyBackupApp {
                         self.loaded_backup_folder = Some(new_backup.clone());
                         self.restore_tab.load_backup(&new_backup);
                     }
-                } else if !self.inspect_tab.has_backup() {
+                } else if !self.inspect_tab.has_backup() && !self.inspect_tab.has_loaded_source() {
+                    // Same rule: an image or device open in Inspect stays open.
                     if let Some(folder) = self.loaded_backup_folder.as_ref() {
                         self.inspect_tab.load_backup(folder);
                     }
@@ -1235,8 +1286,9 @@ impl eframe::App for RustyBackupApp {
                 self.inspect_tab.show(ui, &mut ctx);
             }
             Tab::Optical => {
+                let busy = self.busy_elsewhere(Tab::Optical);
                 self.optical_tab
-                    .show(ui, &mut self.log_panel, &mut self.progress);
+                    .show(ui, &mut self.log_panel, &mut self.progress, busy);
             }
             Tab::Archives => {
                 self.archives_tab.show(ui, &mut self.log_panel);

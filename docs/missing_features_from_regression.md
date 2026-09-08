@@ -21,6 +21,15 @@ concrete reason to.
 | ~~F-008~~ | ~~`backup` reads only flat-layout sources~~ — **SHIPPED** 2026-08-15 | `src/cli/verbs/backup.rs` | — |
 | ~~F-009~~ | ~~SFS editor writes single-leaf extent b-trees only~~ — **SHIPPED** 2026-08-17 | `src/fs/sfs.rs` | — |
 | ~~F-004~~ | ~~`show partmap` is APM-only~~ — **SHIPPED** 2026-08-08, same gap as R-026 | `src/cli/verbs/show.rs` | — |
+| [F-010](#f-010) | A file-aware Ghost image exposes only its FAT record stream; an NTFS partition behind it is unreachable | `src/rbformats/gho.rs` | D13's Windows check (a real multi-partition `.GHO` with long names) |
+| ~~[F-012](#f-012)~~ | **SHIPPED 2026-09-06.** ~~An NTFS directory cannot grow past its resident index root: the 79th file in a directory is refused~~ | `src/fs/ntfs.rs` | the 1000-file churn (`churn.ntfs`) |
+| ~~[F-013](#f-013)~~ | **SHIPPED 2026-09-06.** ~~An ext4 directory whose extent tree must split cannot take more files (about 800 in one directory)~~ | `src/fs/ext.rs` | the 1000-file churn (`churn.ext4`) |
+| ~~[F-014](#f-014)~~ | **SHIPPED 2026-09-06.** ~~An SFS volume takes about 43 files: the object-node tree never grows~~ | `src/fs/sfs.rs` | the 1000-file churn (`churn.sfs`) |
+| ~~[F-015](#f-015)~~ | **SHIPPED 2026-09-05.** ~~A Minix directory stops at its direct blocks (about 110 V3 / 220 V2 files)~~ | `src/fs/minix.rs` | the 1000-file churn (`churn.minix2`, `churn.minix3`) |
+| ~~[F-017](#f-017)~~ | **SHIPPED 2026-09-06.** ~~An XFS directory in leaf or node form takes no inserts or removes: 125 entries per directory, then `unsupported`~~ | `src/fs/xfs/edit.rs` | the 1000-file churn (`churn.xfs`), after R-063 |
+| ~~[F-018](#f-018)~~ | **SHIPPED 2026-09-06.** ~~XFS inode allocation stops when the AG holding the new chunk cannot grow its inobt, with the other AGs empty: a 256 MiB volume takes about 107500 files~~ | `src/fs/xfs/edit.rs` | the deep XFS churn (`churn.xfs-deep`, 300000 inodes on 256 MiB) |
+| ~~[F-016](#f-016)~~ | **SHIPPED 2026-09-06.** ~~A classic HFS catalog is sized at format time (0.5 % of the volume) and never grows, so a 16 MiB volume stops at about 600 files~~ | `src/fs/hfs.rs` | the 1000-file churn (`churn.hfs`, `churn.hfv` at 16 MiB) |
+| ~~[F-011](#f-011)~~ | **SHIPPED 2026-09-05.** ~~The classic HFS writer allocates a fork as one contiguous run; a fragmented volume reports disk full with room to spare~~ | `src/fs/hfs.rs` | H3's classic-HFS check: a resource fork spilled into the extents-overflow file by rb-cli, clean under `fsck_hfs -n` and Disk First Aid before and after the delete |
 
 ---
 
@@ -583,3 +592,255 @@ one addition: Kickstart has no SFS handler in ROM, so the guest needs the SFS
 handler staged into `L:` (it is at `rb-fixtures/oracle-assets/amiga`,
 extracted from the SFS reference fixture's own `L:`). So the code is the
 work now, not the proof.
+
+## F-010 — a file-aware Ghost image exposes only its FAT record stream {#f-010}
+
+Found 2026-09-02 while looking for a Ghost image to verify D13 (eaa6f3d,
+unique 8.3 aliases for prefix-sharing long names) against Windows.
+`C:\Temp\JoeBackup\JoeBa.GHO` is a complete 12-span, 24 GB file-aware
+backup of a Dell machine. `rb-cli inspect` reports one partition: the
+39 MB Dell utility FAT volume, 70 files, all 8.3 names.
+
+`GhoReader::open` dispatches a file-aware image on whether a FAT record
+stream is present: with one, the whole image becomes that single FAT
+partition; without one, it tries the NTFS file-aware path (GHPR metadata
+plus packed cluster runs). An image holding both, which is what every Dell
+or OEM machine of the era produces, never reaches its NTFS partition, so
+the Windows volume with the long names cannot be reconstructed, browsed or
+restored from it.
+
+What it would take: walk the record stream per partition instead of once,
+hand each partition to the FAT or NTFS reconstruction according to its own
+metadata, and emit a multi-partition disk image with the table the header
+describes. The single-partition paths already exist; the missing piece is
+the loop and the disk-level layout. Until then D13 stays covered by its
+unit test only.
+
+## F-011 — the classic HFS writer allocates a fork as one contiguous run {#f-011}
+
+**SHIPPED 2026-09-05.** `allocate_extents` in `src/fs/hfs.rs` still asks for
+one run first (a contiguous fork when the volume has room for it, the way
+Mac OS allocates) and otherwise gathers the free runs first-fit in address
+order; the first three go into the catalog record's inline extents and the
+rest into the extents-overflow B-tree, three per record, through the same
+`btree_insert_full` the HFS+ driver uses (`BTreeKeyFormat::CLASSIC_EXTENTS`).
+`create_file` and `write_resource_fork` (so `put`, `import`, `setrsrc`,
+Commander) all take that path; the read and delete sides already handled
+overflow records. The H3 classic-HFS check now builds: a 1 MB resource fork
+over 126 one-block holes spills five overflow records, `fsck_hfs -n` and Disk
+First Aid 7.2 (System 7.1 in Snow) both pass before and after `rb-cli rm`
+(`docs/Regression_Bugs.md`, macOS verification table; unit test
+`create_file_spreads_a_fork_over_free_runs`).
+
+Found 2026-09-05 by the audit's H3 check on macOS. The check fills an
+8 MiB classic HFS volume with 64 KiB files, deletes every other one and
+adds a file whose 1 MB resource fork must spread over the holes, so that
+its extents spill into the extents-overflow file and the delete that
+follows can be judged by `fsck_hfs`. `rb-cli put` refused:
+
+```
+create_file: disk full: cannot find 196 contiguous free blocks
+```
+
+with 4 MiB free in 63 holes of 128 blocks. `allocate_blocks` in
+`src/fs/hfs.rs` asks the volume bitmap for one run of the fork's whole
+length; the three inline extents and the extents-overflow B-tree that
+the *reader* and the *delete* path handle are never produced by the
+writer. HFS+ (`src/fs/hfsplus.rs`) allocates extent by extent and does
+spill, which is how H3 was verified there.
+
+What it would take: allocate a fork as a list of runs (first fit over
+`bitmap_collect_clear_runs_be`), fill the three inline extents, and
+insert the rest as overflow records through the same
+`btree_insert_full` path the HFS+ driver uses with
+`BTreeKeyFormat::CLASSIC_EXTENTS`. Until then a fragmented classic HFS
+volume fills up early, and H3 on classic HFS stays covered by the unit
+test `delete_frees_overflow_extents_and_their_records`, whose overflow
+record is written by hand.
+## F-012 — an NTFS directory cannot grow past its resident index root {#f-012}
+
+**SHIPPED 2026-09-06.** The writer already moved a full root into
+`$INDEX_ALLOCATION` blocks and split full INDX nodes; what it could not do
+was take the median a split pushes up once the resident root itself was
+full. The root's entries now move down into a fresh INDX node and the
+root keeps one sentinel pointing there, so the tree gains a level (and
+again as often as needed). Removing a separator whose left subtree's
+rightmost leaf has emptied (nothing rebalances on delete) now pulls the
+predecessor from the nearest ancestor with an entry and frees the emptied
+blocks, where it used to refuse past one level. The MFT grows too:
+`$MFT`'s `$DATA` gains whole clusters, its `$BITMAP` widens with the
+padding bits marked in use as Windows keeps them, every new record is
+formatted blank, and `$MFTMirr` is resynchronised -- a 16 MiB volume is
+formatted with 128 records. A unit test takes a 64-record volume to 1000
+entries in one directory, lists, empties, adds one and fscks clean.
+Found 2026-09-05 by the 1000-file churn (`regression-tests/cases/tier3/churn.toml`,
+`churn.ntfs`): the 79th `create_file` in one directory fails with
+`disk full: directory index root is full; cannot grow this directory
+further`. The writer fills the `$INDEX_ROOT` attribute and has no path to
+create an `$INDEX_ALLOCATION` + `$BITMAP` pair and move the entries into
+index blocks, which is what Windows does at that point. Reading such
+directories works. Until then a directory holds ~78 short-named files.
+
+## F-013 — an ext4 directory cannot split its extent tree {#f-013}
+
+**SHIPPED 2026-09-06.** A directory first tries the block right after its
+last one, so growth rarely costs an extent at all; when the four inline
+extents are nonetheless full, they move to a leaf block (up to 340
+extents, checksum tail sealed on metadata_csum volumes) and the inode
+keeps one index entry, depth 1, as the kernel lays it out; later blocks
+extend that leaf, and a full leaf gets a sibling under the next inline
+index slot. Deleting an inode frees its index blocks with its data. A
+unit test interleaves a thousand files with the directory's growth,
+checks the tree reached depth 1, lists, empties and fscks the volume.
+Found by `churn.ext4`: the 816th file fails with `ext4: extent tree
+splitting not yet supported for editing`. The directory inode's inline
+extent header (four extents) is exhausted once the directory outgrows the
+blocks those extents can describe; growing the tree into an index block is
+unimplemented. ext2 / ext3 (block-mapped directories) take the full
+thousand.
+
+## F-014 — an SFS volume takes about 43 files {#f-014}
+
+**SHIPPED 2026-09-06.** The object-node tree grows the way SFS's own
+`createnode` grows it: a fresh container under the first unused pointer,
+and when there is none a new level (`addnewnodelevel`: the root's contents
+move to a new block and the root becomes an index over it, so the root
+block number never changes). The "container full" bits in the parents'
+pointers, which SFS trusts when it creates a node, are set when a
+container fills and cleared when a node is freed, rippling upward. Admin
+space grows too (`allocadminspace`): a fresh 32-block region from the
+bitmap, entered in a container with an unused slot or opened with its own
+container linked at the end of the chain. A unit test puts 600 files on a
+blank volume (tree at two levels, four new admin regions), lists, empties
+and fscks it. Found by `churn.sfs`: the 43rd file fails with `SFS: every object-node leaf
+is full, and growing the node tree is not implemented`. Known since the SFS
+editor shipped (CLAUDE.md, "Amiga support"); the churn puts a number on it.
+
+## F-015 — a Minix directory stops at its direct blocks {#f-015}
+
+**SHIPPED 2026-09-05.** `dir_zone` walks and allocates through the
+single, double and triple indirect zones the way the file writer already
+laid them out, and `dir_remove` resolves a slot's zone the same way; a
+unit test grows a root directory to 1100 entries on V1, V2 and V3, lists
+it, empties it and fscks it. Found by `churn.minix2` / `churn.minix3`: `Minix directory too large
+(indirect directory growth unsupported)` at the 223rd (V2) / 111th (V3)
+file. Directory data past the inode's seven direct zones needs the single
+indirect zone, which the writer does not allocate for directories.
+
+## F-016 — a classic HFS catalog never grows {#f-016}
+
+**SHIPPED 2026-09-06.** `grow_btree` extends the catalog or the
+extents-overflow file by its MDB clump when an insert runs out of nodes,
+the way Mac OS does: the last extent gets longer when the blocks after it
+are free, otherwise a fresh extent that doubles the file (the three inline
+slots, then CNID 4 records in the overflow tree for the catalog, which
+`open` and `write_catalog` now follow); a map node is linked in past the
+2048 nodes the header bitmap addresses. Unit tests grow a 32-node catalog
+under 1000 files and reopen it, grow a four-node extents tree under a
+fork spread over 200 holes, and reach a map node with 9000 files.
+Found by `churn.hfs` at 16 MiB: `no free B-tree nodes` at the 570th file.
+`new volume hfs` sizes the catalog like hformat does, 0.5 % of the volume
+(after R-060 every blank-volume path does), and Mac OS extends the catalog
+file on demand when that runs out; rb-cli has no catalog-grow path for
+classic HFS, so the volume's file count is fixed at format time (roughly
+four records per 512-byte node: ~600 files at 16 MiB, ~2400 at 64 MiB).
+What it would take: allocate more blocks for CNID 4 (inline extents, then
+records in the extents-overflow tree), extend the header node's node count
+and map, and rewrite drCTFlSize / drCTExtRec; the HFS+ `grow_btree_fork`
+is the model.
+
+## F-017 — an XFS directory in leaf or node form takes no inserts or removes {#f-017}
+
+**SHIPPED 2026-09-06.** Leaf and node-form directories are edited in place
+by `src/fs/xfs/edit/dir2_tree.rs`, after `xfs_dir2_leaf.c`,
+`xfs_dir2_node.c` and `xfs_da_btree.c`. An insert descends the da btree by
+hash, takes room from the first data block whose `bests` entry admits the
+entry (appending a data block, and a freeindex block once a table holds
+2016, when none does), places it from that block's `bestfree[0]` and adds
+the hash to the leaf, reusing a stale slot; a full leafN splits, the
+sibling is keyed into the parent, a full parent splits, and a full root is
+copied down a level first (`xfs_da3_root_split`), which is how a second
+btree level appears. A remove returns the entry's bytes to the block's
+free space (coalescing neighbours), marks the leaf slot stale, frees a data
+block that emptied, drops a leaf with no live entries from its parent and
+collapses a root left with one child (`xfs_da3_root_join`). Every
+operation runs against a cached block set and lands as one transaction,
+with created blocks allocated next to their predecessors
+(`alloc_blocks_at`, `alloc_blocks_from_head`) so a directory stays in a few
+extents, and past the inline cap the extent list lives in bmap-btree
+leaves (F-018). The full rebuild (`plan_dir_layout` / `write_dir_layout`, the
+smallest form that fits) remains for block form, for a full leaf1 index
+(which becomes node form) and for shrinking back to leaf, block or
+short-form after removes, which the incremental path signals. Half-empty
+siblings are not merged (`xfs_dir2_leafn_toosmall`); the kernel accepts
+sparse leaves.
+
+Judged by the Docker `xfs_repair 4.9.0` oracle after import, after an extra
+add and remove, after removing everything and after one more file: 1000
+and 5000 short names on 32 MiB and 96 MiB volumes, 30000 and 32000
+251-byte names on 96 MiB (the latter's 2134 data blocks need a second
+freeindex block), all clean. `churn.xfs` passes; `churn-deep.toml` adds
+`churn.xfs-freeindex` (32000 long names) and `churn.xfs-deep` (300000
+names on 256 MiB, a two-level da btree; 200000 still fit 450 leaves under one node), seeded by `put --zero 0 --dst
+"/d/f{A..B}"` so no fixture is needed. In `cargo test`,
+`edit::dir2_tree::tests` runs the same code against an in-memory store
+with 512-byte dir blocks, where a two-level tree and a second freeindex
+block are a few thousand entries away, and re-derives every invariant
+`xfs_repair` checks after each batch of operations;
+`dir_grows_to_node_form_and_shrinks_back_to_short_form` and
+`dir_overflow_converts_block_to_leaf_form` cover the on-disk path. Met on
+the way: R-064 (the v5 leaf-form layout), R-065 (v5 `blkno` stamps in AG 1
+and beyond), F-018 (inode chunks stopped at one AG's inobt) and R-066 (`sb_fdblocks`
+omitted the free-space btrees' blocks).
+
+The first cut the same morning rebuilt the whole directory from its entry
+list on every insert and remove, which is linear per operation and was
+enough for the thousand-file churn; it survives as the fallback described
+above.
+
+Found 2026-09-06 by `churn.xfs` once R-063 was fixed: the 126th entry of a
+directory converts it from a single block to leaf form (two data blocks
+and a leaf1 index), and the next `create_file` answers `insert into
+leaf/node-form directory not yet implemented`; `rm` answers the same for a
+remove. What it would take: place the entry in a data block with room
+(the `bests` array says which), or append a data block; keep the leaf1
+hash index and `bests` in step; and past what one leaf block indexes
+(about 500 entries at 4 KiB), the node form -- leafN blocks under a
+da-btree root and a freeindex block -- as `xfs_dir2_leaf_addname` and
+`xfs_dir2_leaf_to_node` do. Reads of both forms already work.
+
+## F-018 — XFS inode allocation stops at one AG's inobt {#f-018}
+
+**SHIPPED 2026-09-06.** `alloc_new_inode_chunk` now tries each AG in turn
+the way `xfs_dialloc` does: `alloc_inode_chunk_in_ag` carves the aligned
+chunk in that AG (`alloc_blocks_aligned_in_ag`), initialises it, and
+splices or grows the AG's inobt; when the growth answers `DiskFull`, the
+chunk's blocks go back through `free_blocks` and the next AG is tried, so
+the error only surfaces once no AG has room for both. The 200000-file
+`put` that failed at 107518 on a 256 MiB volume now completes with the
+chunks spread over the AGs, `xfs_repair -n` clean; `churn.xfs-deep` runs
+its 300000 inodes on 256 MiB rather than 1 GiB so the case pins this. On
+that volume the directory's blocks, interleaved with inode chunks, reach
+the inline extent cap (21 records in a 512-byte inode), so
+`write_dir_inode_multi_extent` now moves the list to bmap-btree leaves
+under the in-inode root (251 records each, up to 20 leaves) past the cap
+and brings it back inline, freeing the leaves, when it shrinks
+(`xfs_bmap_extents_to_btree` and its inverse); btree-format directories
+are listed and edited like extents-format ones. The 300000-entry
+directory reached a two-level da btree (root level 2) over some 900
+extents in four bmbt leaves, `xfs_repair -n` silent; our own fsck then
+counted those leaves as leaked, which was R-067.
+
+Found 2026-09-06 by the deep directory churn: `put --zero 0 --dst
+"/d/f{000001..200000}"` on a 256 MiB `new volume xfs` fails at the 107518th
+file with `disk full: AG 0: no free extent large enough for 8-block inobt
+growth` while AGs 1 to 3 are untouched. `alloc_new_inode_chunk` places the
+64-inode chunk with `alloc_blocks_aligned`, which takes the first AG with an
+aligned run, and then grows that AG's inode btree; when the AG still had an
+8-block run for the chunk but has none for the tree, the error surfaces
+instead of the next AG being tried. What it would take: choose the AG with
+room for both, or retry the chunk in the next AG when the inobt growth
+fails, the way `xfs_dialloc` walks AGs. Until then the deep churn uses a
+1 GiB volume, whose 256 MiB AG 0 holds the 200000 inodes. The failure also
+left `sb_fdblocks` four blocks short, which turned out to be R-066, a
+counter term missing everywhere, not a leak of this path.

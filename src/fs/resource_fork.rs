@@ -177,10 +177,10 @@ pub fn build_macbinary(
 
     // Header byte 0: always 0
     // Header byte 1: filename length (max 63)
-    let name_bytes = filename.as_bytes();
-    let name_len = name_bytes.len().min(63);
+    let name_bytes = mac_name_bytes(filename);
+    let name_len = name_bytes.len();
     buf[1] = name_len as u8;
-    buf[2..2 + name_len].copy_from_slice(&name_bytes[..name_len]);
+    buf[2..2 + name_len].copy_from_slice(&name_bytes);
 
     // Type code at 65-68, creator at 69-72
     buf[65..69].copy_from_slice(type_code);
@@ -219,13 +219,19 @@ pub fn build_macbinary(
 /// Sanitize a filename for the host OS.
 /// Replaces characters that are invalid on common filesystems.
 pub fn sanitize_filename(name: &str) -> String {
-    name.chars()
+    let safe: String = name
+        .chars()
         .map(|c| match c {
             ':' | '/' | '\\' | '\0' => '_',
             '<' | '>' | '"' | '|' | '?' | '*' => '_',
             _ => c,
         })
-        .collect()
+        .collect();
+    // A catalog name of `..` (or an empty one) must not become a path step.
+    if safe.is_empty() || safe == "." || safe == ".." {
+        return "_".repeat(safe.len().max(1));
+    }
+    safe
 }
 
 /// Round up to the next multiple of 128.
@@ -266,6 +272,8 @@ pub struct ImportedResourceFork {
     /// The Mac filename recorded inside a whole-file container, so an import
     /// lands `Foo` rather than the host's `Foo.bin` / `Foo.hqx` wrapper name.
     pub name: Option<String>,
+    /// Finder flags (fdFlags) from the container's Finder info, when present.
+    pub finder_flags: Option<u16>,
 }
 
 /// Detect and read a resource fork associated with `host_path` by probing
@@ -291,6 +299,7 @@ pub fn detect_resource_fork(host_path: &std::path::Path) -> Option<ImportedResou
                     type_code,
                     creator_code,
                     name: None,
+                    finder_flags: None,
                 });
             }
         }
@@ -358,6 +367,7 @@ pub fn detect_resource_fork(host_path: &std::path::Path) -> Option<ImportedResou
                     type_code: None,
                     creator_code: None,
                     name: None,
+                    finder_flags: None,
                 });
             }
         }
@@ -397,6 +407,7 @@ pub fn parse_binhex_fork(data: &[u8]) -> Option<ImportedResourceFork> {
         type_code,
         creator_code,
         name: (!bh.name.is_empty()).then_some(bh.name),
+        finder_flags: Some(bh.flags),
     })
 }
 
@@ -450,6 +461,7 @@ pub fn parse_appledouble(data: &[u8]) -> Option<ImportedResourceFork> {
 
     let num_entries = BigEndian::read_u16(&data[24..26]) as usize;
     let mut rsrc_data: Option<Vec<u8>> = None;
+    let mut finder_flags: Option<u16> = None;
     let mut type_code: Option<[u8; 4]> = None;
     let mut creator_code: Option<[u8; 4]> = None;
 
@@ -472,7 +484,7 @@ pub fn parse_appledouble(data: &[u8]) -> Option<ImportedResourceFork> {
                 rsrc_data = Some(data[offset..offset + length].to_vec());
             }
             9
-                // Finder info — type at +0, creator at +4
+                // Finder info: type at +0, creator at +4, fdFlags at +8
                 if length >= 8 => {
                     let mut tc = [0u8; 4];
                     let mut cc = [0u8; 4];
@@ -483,6 +495,10 @@ pub fn parse_appledouble(data: &[u8]) -> Option<ImportedResourceFork> {
                     }
                     if cc != [0; 4] {
                         creator_code = Some(cc);
+                    }
+                    if length >= 10 {
+                        finder_flags =
+                            Some(BigEndian::read_u16(&data[offset + 8..offset + 10]));
                     }
                 }
             _ => {}
@@ -503,6 +519,7 @@ pub fn parse_appledouble(data: &[u8]) -> Option<ImportedResourceFork> {
         type_code,
         creator_code,
         name: None,
+        finder_flags,
     })
 }
 
@@ -597,11 +614,9 @@ pub fn parse_macbinary(data: &[u8]) -> Option<ImportedResourceFork> {
     let data_padded = pad_to_128(data_len);
     let rsrc_start = data_start + data_padded;
 
+    // A data-fork-only file is still MacBinary: type, creator and the Mac
+    // name ride in the header, and the 128 bytes are not file content.
     if rsrc_start + rsrc_len > data.len() || data_start + data_len > data.len() {
-        return None;
-    }
-
-    if rsrc_len == 0 {
         return None;
     }
 
@@ -622,6 +637,8 @@ pub fn parse_macbinary(data: &[u8]) -> Option<ImportedResourceFork> {
             let n = crate::fs::hfs::decode_mac_filename(&data[2..2 + name_len]);
             (!n.is_empty()).then_some(n)
         },
+        // MacBinary II splits fdFlags: the high byte at 73, the low byte at 101.
+        finder_flags: Some(((data[73] as u16) << 8) | data[101] as u16),
     })
 }
 
@@ -668,9 +685,64 @@ fn read_finder_info_xattr(path: &std::path::Path) -> (Option<[u8; 4]>, Option<[u
     (tc, cc)
 }
 
+/// A Mac file name as the classic containers store it: Mac Roman, at most 63
+/// bytes. One byte per character, so the cut never splits a character.
+pub fn mac_name_bytes(name: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(name.len());
+    for ch in name.chars() {
+        let mut one = [0u8; 4];
+        let bytes = crate::fs::hfs::utf8_to_mac_roman(ch.encode_utf8(&mut one))
+            .unwrap_or_else(|_| vec![b'?']);
+        if out.len() + bytes.len() > 63 {
+            break;
+        }
+        out.extend_from_slice(&bytes);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// X13: names went out as UTF-8 and were cut at 63 bytes mid-character;
+    /// a classic Mac reads the header as Mac Roman.
+    /// H14: fdFlags rode in both containers and were dropped on import.
+    #[test]
+    fn container_parsers_carry_the_finder_flags() {
+        let mut mb = build_macbinary("Flag", b"APPL", b"ttxt", MacFileDates::default(), b"x", b"");
+        mb[73] = 0x01; // fdFlags high byte
+        mb[101] = 0x40; // fdFlags low byte
+        let crc = macbinary_crc16(&mb[0..124]);
+        BigEndian::write_u16(&mut mb[124..126], crc);
+        assert_eq!(parse_macbinary(&mb).unwrap().finder_flags, Some(0x0140));
+
+        let mut ad = build_appledouble(b"APPL", b"ttxt", MacFileDates::default(), b"RSRC");
+        // First entry descriptor at 26: id, offset, length; Finder Info is first.
+        assert_eq!(BigEndian::read_u32(&ad[26..30]), 9);
+        let off = BigEndian::read_u32(&ad[30..34]) as usize;
+        BigEndian::write_u16(&mut ad[off + 8..off + 10], 0x4000);
+        assert_eq!(parse_appledouble(&ad).unwrap().finder_flags, Some(0x4000));
+    }
+
+    #[test]
+    fn macbinary_names_are_mac_roman_and_cut_on_a_character() {
+        let mb = build_macbinary(
+            "Caf\u{e9}",
+            b"TEXT",
+            b"ttxt",
+            MacFileDates::default(),
+            b"x",
+            b"",
+        );
+        assert_eq!(mb[1], 4);
+        assert_eq!(&mb[2..6], &[b'C', b'a', b'f', 0x8E]);
+        let long = "\u{e9}".repeat(70);
+        let bytes = mac_name_bytes(&long);
+        assert_eq!(bytes.len(), 63);
+        assert!(bytes.iter().all(|&b| b == 0x8E));
+        assert_eq!(mac_name_bytes("\u{65e5}"), b"?");
+    }
 
     #[test]
     fn test_sanitize_filename() {
@@ -815,9 +887,10 @@ mod tests {
         assert!(parse_appledouble(&ad).is_none());
     }
 
+    /// Rejecting a data-fork-only MacBinary made `put` copy its 128-byte
+    /// header in as file content under the wrapper's host name.
     #[test]
-    fn test_parse_macbinary_no_rsrc() {
-        // Build a MacBinary with no resource fork
+    fn test_parse_macbinary_no_rsrc_still_unwraps() {
         let mb = build_macbinary(
             "test.txt",
             b"TEXT",
@@ -826,7 +899,11 @@ mod tests {
             b"data",
             &[],
         );
-        assert!(parse_macbinary(&mb).is_none());
+        let parsed = parse_macbinary(&mb).expect("a MacBinary with an empty resource fork");
+        assert!(parsed.data.is_empty());
+        assert_eq!(parsed.data_fork.as_deref(), Some(b"data".as_slice()));
+        assert_eq!(parsed.type_code, Some(*b"TEXT"));
+        assert_eq!(parsed.name.as_deref(), Some("test.txt"));
     }
 
     #[test]

@@ -330,7 +330,20 @@ impl OpticalTab {
         self.rip_running || self.convert_running
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, log: &mut LogPanel, progress: &mut ProgressState) {
+    /// Drain the workers while another tab is showing, so a job keeps
+    /// reporting and its completion is not missed after a tab switch.
+    pub fn poll_background(&mut self, log: &mut LogPanel, progress: &mut ProgressState) {
+        self.poll_progress(log, progress);
+        self.poll_add_remote(log);
+    }
+
+    pub fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        log: &mut LogPanel,
+        progress: &mut ProgressState,
+        busy_elsewhere: Option<&'static str>,
+    ) {
         self.poll_progress(log, progress);
         self.poll_add_remote(log);
         self.show_add_remote_dialog(ui.ctx());
@@ -338,7 +351,14 @@ impl OpticalTab {
         ui.heading("Optical Disc");
         ui.add_space(8.0);
 
-        let controls_enabled = !self.rip_running && !self.convert_running;
+        if let Some(tab) = busy_elsewhere {
+            ui.colored_label(
+                super::theme::warning(ui.visuals()),
+                super::context::busy_elsewhere_notice(tab),
+            );
+        }
+        let controls_enabled =
+            !self.rip_running && !self.convert_running && busy_elsewhere.is_none();
 
         // ── Source selection ─────────────────────────────────────────────────
         ui.add_enabled_ui(controls_enabled, |ui| {
@@ -705,7 +725,7 @@ impl OpticalTab {
                     ui.add_space(60.0);
                     ui.checkbox(&mut self.eject_after, "Eject after ripping")
                         .on_hover_text(
-                            "Ejects the source drive on its own machine — the \
+                            "Ejects the source drive on its own machine - the \
                              remote daemon's drive for a remote source.",
                         );
                 });
@@ -1150,6 +1170,12 @@ fn run_conversion(
     }
 }
 
+/// The GUI's Cancel flag as a probe the model's relay can poll.
+fn cancel_probe(progress: &Arc<Mutex<ConvertProgress>>) -> impl Fn() -> bool + Send + 'static {
+    let from = Arc::clone(progress);
+    move || from.lock().map(|p| p.cancel_requested).unwrap_or(false)
+}
+
 /// Background worker: rip disc (local or remote) to temp BIN/CUE, convert to
 /// CHD locally, clean up. The encode always runs here on the desktop.
 fn rip_to_chd_worker(
@@ -1180,9 +1206,26 @@ fn rip_to_chd_worker(
         p.operation = "Ripping to temporary BIN/CUE...".into();
     }
 
-    // Use a separate RipProgress and drain its messages into our ConvertProgress
+    // Use a separate RipProgress and drain its messages into our ConvertProgress.
+    // The GUI's Cancel lands on `progress`, so forward it to the rip's own flag.
     let rip_progress = Arc::new(Mutex::new(rip::RipProgress::new()));
-    rip::run_rip(rip_config, Arc::clone(&rip_progress))?;
+    let rip_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let forwarder = rusty_backup::model::worker::forward_cancel(
+        cancel_probe(progress),
+        Arc::clone(&rip_done),
+        {
+            let to = Arc::clone(&rip_progress);
+            move || {
+                if let Ok(mut r) = to.lock() {
+                    r.cancel_requested = true;
+                }
+            }
+        },
+    );
+    let rip_result = rip::run_rip(rip_config, Arc::clone(&rip_progress));
+    rip_done.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = forwarder.join();
+    rip_result?;
 
     // Drain rip log messages
     if let Ok(mut rp) = rip_progress.lock() {
@@ -1202,12 +1245,27 @@ fn rip_to_chd_worker(
     }
 
     let convert_progress = Arc::new(Mutex::new(ConvertProgress::new()));
+    let convert_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let forwarder = rusty_backup::model::worker::forward_cancel(
+        cancel_probe(progress),
+        Arc::clone(&convert_done),
+        {
+            let to = Arc::clone(&convert_progress);
+            move || {
+                if let Ok(mut c) = to.lock() {
+                    c.cancel_requested = true;
+                }
+            }
+        },
+    );
     let convert_result = convert::to_chd(
         &temp_cue,
         chd_path,
         Some(chd_options),
         Arc::clone(&convert_progress),
     );
+    convert_done.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = forwarder.join();
 
     // Drain convert log messages
     if let Ok(mut cp) = convert_progress.lock() {

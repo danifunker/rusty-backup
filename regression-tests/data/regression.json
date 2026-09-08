@@ -199,6 +199,15 @@
       "builder": "new hd sgi-efs"
     },
     {
+      "id": "fs.efs-v1",
+      "kind": "fs",
+      "name": "SGI EFS v1 (IRIS 2000/3000)",
+      "we_read": true,
+      "we_write": true,
+      "builder": "new volume efs-v1",
+      "notes": "The pre-IRIX EFS: magic 0x041755, a 68020-packed superblock and System V directories. Shares only the inode and extent layout with fs.efs."
+    },
+    {
       "id": "fs.affs",
       "kind": "fs",
       "name": "AFFS (OFS/FFS)",
@@ -450,6 +459,15 @@
       "we_read": true,
       "we_write": true,
       "builder": "new hd sgi-efs"
+    },
+    {
+      "id": "part.sgi-dklabel",
+      "kind": "partition",
+      "name": "SGI disk label (IRIS 2000/3000)",
+      "we_read": true,
+      "we_write": true,
+      "builder": "new hd sgi-dklabel",
+      "notes": "One struct disk_label at block 0. Slots carry a role, not a type. Images off period controllers are word-swapped; rb-cli swab16 converts."
     },
     {
       "id": "part.sun",
@@ -772,7 +790,7 @@
       "builder": "new hd x68k"
     },
     {
-      "id": "fmt.winimage",
+      "id": "fmt.ima",
       "kind": "container",
       "name": "WinImage (IMA)",
       "we_read": true,
@@ -793,6 +811,21 @@
       "we_read": true,
       "we_write": false,
       "notes": "ELF stub with an appended SquashFS; the payload opens in place"
+    },
+    {
+      "id": "optical.cue",
+      "kind": "optical",
+      "name": "CUE sheet",
+      "we_read": true,
+      "we_write": false,
+      "notes": "R-015: a cue with unpadded track numbers (`TRACK 1`) is rejected"
+    },
+    {
+      "id": "optical.clonecd",
+      "kind": "optical",
+      "name": "CloneCD (.ccd / .img / .sub)",
+      "we_read": true,
+      "we_write": false
     },
     {
       "id": "fmt.bincue",
@@ -954,7 +987,8 @@
       "id": "fsck_hfs",
       "tool": "fsck_hfs",
       "kind": "package",
-      "notes": "macOS only. Nothing equivalent exists elsewhere, which is what makes a Mac non-optional."
+      "program": "oracles/fsck_hfs_image.sh",
+      "notes": "macOS only. Nothing equivalent exists elsewhere, which is what makes a\nMac non-optional.\n\nfsck_hfs will not read a plain file — \"not a character device / Can't get\ndevice block size\" — so the oracle runs through oracles/fsck_hfs_image.sh,\nwhich attaches the image read-only and no-mount, checks it, and always\ndetaches.\n\nMeasured 2026-08-07 on macOS 26.5.2 (fsck_hfs hfs-715.120.4): it still checks\n**classic HFS**, announcing \"Checking HFS volume\", as well as \"Checking\nnon-journaled HFS Plus Volume\". macOS dropped HFS Standard *mounting* years\nago, so the assumption that fsck_hfs went with it is easy to make and wrong.\nBoth were also confirmed against Mac OS X 10.5.8 on a PowerMac G5, which\nagrees — a period-authentic second opinion for the classic-HFS rows."
     },
     {
       "id": "fsck_apfs",
@@ -1011,33 +1045,66 @@
       "kind": "package"
     },
     {
+      "id": "motion",
+      "tool": "Motion",
+      "kind": "emulator",
+      "program": "oracles/motion/efs_v1_mount.sh",
+      "notes": "SGI IRIS 3130 (68020) emulator, booting the real IRIX 3.7 / GL2-W3.6\ndisk to a shell. The counterpart to `iris`, one machine generation earlier: iris\nchecks IRIX EFS on an Indy, motion checks EFS **v1** on the hardware that\nformat was written for.\n\nIts serial console goes to stdout, one line per `[Emulation - Serial] ... [line\n1] <text>`, so a whole boot is greppable with no X, no xdotool and no screen\nscraping. Run it WITHOUT `+set enableGF2 1`; the graphics console needs XTEST\ntyping and is useless for CI. It needs assets/ roms/ profile/ beside the\nbinary — symlinks are fine — and reads the disk from `profile/3130.img`.\n\nThe check drives a guest script instead of a control socket: the volume under\ntest is dropped into the reference disk's /usr slot, /etc/rc.s0 is patched to\nmount /dev/md0c and list it, and the console is the verdict. Word order is\nload-bearing — the medium is swapped within every 16-bit word, so the check\nswab16s a natively-written volume on the way in.\n\nFour things that cost time:\n\n  * It opens the disk READ-ONLY and only ever attaches drive 0 (dsd5217.cpp\n    calls Profile::OpenDisk(0) and nothing else). `profileDisk1Path` exists but\n    is unwired, so \"attach our whole disk as md1\" does not work yet — hence the\n    splice into an existing slot.\n  * About one boot in six dies at kernel entry before running anything. That is\n    the emulator, not the volume, so the check retries once and reports exit 99\n    (no verdict) rather than inventing a finding.\n  * `/mnt` does not exist on the reference disk. Without `mkdir` the mount\n    fails in a way that reads like a filesystem fault.\n  * IRIX 3.7's mount is silent on success. Its refusal is\n    \"/dev/md0c:Invalid argument\", not anything with \"mount:\" in it — matching\n    the wrong string is how a broken volume passes.\n\nControl, run 2026-08-24: 8 MB of urandom in the same slot yields\n\"/dev/md0c:Invalid argument\" and exit 1, so a pass is not the check passing\neverything.\n\n`scripts/sgi-efs-v1-oracle.sh prove` is the deeper, standalone form: it has\nrb-cli rewrite-and-grow /etc/rc.s0, create a file and a directory and allocate\na 256 KiB file on the reference disk itself, then boots and confirms IRIX runs\nthe script, reads them back and `sum`s to the right checksum. Not wired to an\nartifact, so it is not a `check`; it is what a person runs after touching the\nwrite path."
+    },
+    {
       "id": "iris",
       "tool": "Iris",
       "kind": "emulator",
-      "notes": "SGI emulator written in Rust; in-house, so blockers are fixable at source. Replaces MAME for IRIX."
+      "program": "iris",
+      "notes": "SGI Indy (MIPS R4400) emulator with a purpose-built CI control\nsocket: `iris-ci` has put / run / get / snapshot-rollback, and `run` returns the\nguest's stdout — no screen-scraping at all.\n\nBrought up 2026-08-12, as far as a live IRIX shell:\n\n  IRIS_JIT=1 iris --headless --noaudio --ci --scsi1 disks/Indy-IRIX65_dev.chd --cdrom4 <any.iso>\n  iris-ci boot && iris-ci login && iris-ci run \"uname -aR\"\n    -> IRIX IRIS 6.5 6.5.22m 10070055 IP22\n\nFour things that cost time, recorded so they do not again:\n\n  * No PROM needed. It warns about a missing prom.bin and uses an embedded one.\n    Do not go hunting for Indy firmware.\n  * --ci is required for the control socket. Without it iris listens only on\n    the monitor port 8888 and iris-ci cannot reach 19851.\n  * A CD-ROM must be attached even when booting from disk, or startup dies with\n    \"could not attach cdrom4.iso\". Any ISO will do.\n  * IRIX 6.5 boots; the 5.3 image hangs. Indy-IRIX53_dev.chd reaches \"The\n    system is coming up\", prints \"Find Error: 10\" and never reaches a login\n    prompt. Indy-IRIX65_dev.chd reaches one in a few minutes with JIT on.\n\nSOLVED 2026-08-13. The scratch volume is configured in iris.toml, not on the\ncommand line — --help never mentions it, but the binary does: \"set\n`scratch = true` on a SCSI device in iris.toml\". `scsi` is a MAP keyed by id,\nnot an array of tables, and every device needs `cdrom`. iris creates the\nscratch volume itself, SGI volume header and all:\n\n  [scsi.1]\n  path = \"disks/Indy-IRIX65_dev.chd\"\n  cdrom = false\n\n  [scsi.2]\n  path = \"disks/scratch.img\"\n  cdrom = false\n  scratch = true\n  size_mb = 64\n\nThen `iris-ci put <file> --to /tmp/x` stages through it and works.\n\nfsck needs one step more. IRIX refuses a plain file — \"Can't find equivalent\nraw device\" — exactly as macOS fsck_hfs does. But the scratch volume IS a real\nSCSI disk in the guest, so write the image straight into it and check the\ndevice node:\n\n  iris-ci scratch write ./volume.img\n  iris-ci run \"/sbin/fsck -t efs -n /dev/rdsk/dks0d2s0 < /dev/null\"\n\nSCSI id 2 is dks0d2, s0 is the payload partition. The `< /dev/null` matters:\nwithout it fsck waits on a SALVAGE prompt forever.\n\nFirst result: our EFS volume passes phases 1-4 and fails phase 5 with BAD FREE\nLIST, while a volume mkfs_efs writes on the same device passes. That is R-039,\nthe first authoritative finding this project has had.\n\n--nfs-dir was tried first and abandoned. iris exports the directory fine but\nthe guest cannot mount it (\"Port mapper failure\"), then loops retrying and\nblocks the shell. The scratch path is better regardless — no guest networking.\n\nWritten in Rust and in-house, so blockers here are fixable at source. Replaces\nMAME for IRIX."
+    },
+    {
+      "id": "copperline",
+      "tool": "Copperline",
+      "kind": "emulator",
+      "program": "python3",
+      "notes": "A headless, CLI-driven Amiga emulator in Rust, and the first\nemulator oracle `verify` can actually run. FS-UAE and WinUAE are the same\nemulator family and both need a hand-configured guest, so their pairs resolve\nto skip-manual; Copperline runs unthrottled with no window, exits on its own\nvia `--screenshot-after`, and takes its whole machine from a config file.\n\nThe AFFS check is a real mount verdict: a Kickstart 3.1 guest mounts the\nartifact as DH1: beside a bootable Workbench on DH0 and reports `Info` over\nthe serial line, which Copperline bridges to its own stdout — no results\nvolume, no sentinel poll. `attach_check.py` remains for formats with no\nguest-side probe yet; it covers the container and the boot block, not the\nattach path classifies an image and reads its dostype before any ROM runs, so\na second implementation confirms the bytes we wrote there. Mounting the volume\nwould need a guest OS, which means a licensed Kickstart plus a Workbench; the\noracle's README has the shape that takes. Scored `smoke` accordingly — it is\nnot evidence the filesystem is correct.\n\nIt boots Copperline's own AROS ROM rather than a Kickstart, so no host needs a\nlicensed ROM to run it. `program` is python3 on the amitools pattern: the\ninterpreter is what must exist, and the script finds the emulator (sibling\ncheckout, or $COPPERLINE)."
     },
     {
       "id": "fs-uae",
       "tool": "FS-UAE",
       "kind": "emulator",
-      "notes": "Cross-platform Amiga. WinUAE is Windows-only, so this is the portable choice."
+      "program": "python3",
+      "notes": "`program` is python3, not fs-uae: the check is a wrapper script, so\nthe interpreter is what must be executable. The script finds the emulator\nitself and exits 77 (skip-unavailable) when it or a Kickstart is missing,\nwhich is the only way a script-based check can say \"not installed here\"\nrather than reporting a FAIL against our bytes.\n\nPortable Amiga emulator; the cross-platform half of the WinUAE pair.\n\nAssets located 2026-08-07, all already owned — nothing needs downloading:\n\n  * Kickstart ROMs — a full licensed AmigaForever set (amiga-os-070 .. 3.x) on\n    the Windows box, with Kickstart 3.2 ROMs and five more spread across two\n    other hosts. WHERE they live is machine-specific: record that as a\n    path_hint in the gitignored data/oracles.local.toml, never here.\n  * A bootable environment — AmigaVision on the MiSTer (9.1 GB HDF, PFS3, with\n    an AmigaVision.fs-uae config already written).\n  * The results channel — that config's `hard_drive_2 = ./shared` mounts a HOST\n    DIRECTORY as an Amiga volume, so the guest writes a file and the host reads\n    it. No screen-scraping, unlike Snow.\n  * Filesystem handlers — SmartFilesystem 1.280 (02.06.2017, m68k, J.\n    Strohmayer) and PFS3AIO, extracted from the L: directory of the SFS\n    reference fixture itself and staged at rb-fixtures/oracle-assets/amiga.\n    Neither AmigaVision nor AmigaForever carries an SFS handler; the volume\n    under test turned out to carry its own.\n\nBuilt 2026-08-14 as `oracles/fsuae/affs_mount.py`: it unpacks the Workbench\nfixture to a host directory for DH0, writes the probe into its\nS/Startup-Sequence, generates the config, launches FS-UAE, polls for the\nsentinel and parses the guest's `Info`. Verified from FS-UAE's log to load the\nROM, attach all three drives at boot priority 0 and present the artifact to\nKickstart 3.1.\n\nWorking end to end 2026-08-14: it answered R-020. Kickstart 3.1 mounts our AFFS\nvolume Read/Write under its own name and lists its contents; 2 MB of noise\nthrough the identical config produces no DH1: unit at all, so the harness\ndiscriminates rather than passing whatever it is given.\n\nThe one trap, because it cost an afternoon and looks like an emulator fault:\nthe guest script must be written with LF endings, in bytes. Python's\nwrite_text applies the platform newline on Windows, AmigaDOS scripts are\nLF-terminated, and the guest then read a redirect whose target ended in a\ncarriage return — an\nillegal filename on the host directory DH2 maps to. Every redirect failed,\nFAILAT 21 stopped the script aborting, and the run booted and silently\nproduced nothing.\n\nCross-platform Amiga; WinUAE is Windows-only, so this is the portable choice.\nInstalled on the Windows box (FS-UAE 3.0.5, a per-user install under\n%LOCALAPPDATA%/Programs) and on linuxbox (3.1.66)."
+    },
+    {
+      "id": "amitools",
+      "tool": "xdftool",
+      "kind": "package",
+      "program": "python3",
+      "notes": "amitools' xdftool — a pure-Python AmigaDOS filesystem reader, and the\nclosest thing to an Amiga opinion that needs no emulator, no ROM and no guest.\n`pip install amitools`.\n\nNot authoritative: it is a reimplementation, so it agreeing does not prove a\nreal Amiga will mount the volume, and it disagreeing does not prove one will\nnot. What it does give is a second implementation reading the same bytes, which\nis exactly what R-020 lacked — every AFFS check until now was our own code\nagreeing with itself.\n\nTwo quirks that cost an afternoon if unknown. It picks its geometry from the\nfile EXTENSION: a 2 MB volume named `.adf` is rejected as an invalid floppy\nsize, and must be `.hdf` to be read as a hard-disk volume. And it opens\nread-write by default, so a read-only artifact fails with EACCES before it\nparses anything — `-r` does not help, because the open happens first."
+    },
+    {
+      "id": "winuae",
+      "tool": "WinUAE",
+      "kind": "emulator",
+      "program": "winuae64",
+      "notes": "The Windows half of the WinUAE/FS-UAE pair, and the same emulator\nfamily: real AmigaOS with its own filesystem handlers reading the volume, which\nis the Amiga's opinion rather than a Linux affs mount's.\n\nRegistered alongside fs-uae rather than instead of it because a given machine\ntends to have one or the other. Both verify the same three formats and either\nsatisfies the pair; whichever is installed is what --detect records.\n\nThe results channel is the one FS-UAE documents: mount a host directory as an\nAmiga volume, boot a script that inspects the test volume and writes a report\nthere, host reads the file. No screen-scraping.\n\nROM paths are machine-specific and belong in the gitignored overlay, never\nhere."
     },
     {
       "id": "86box-os2",
       "tool": "86Box + OS/2",
       "kind": "emulator",
+      "program": "86Box",
       "notes": "OS/2's own CHKDSK is the only real HPFS oracle; the Linux hpfs module is read-only and absent from WSL."
     },
     {
       "id": "mister-core-amiga",
       "tool": "MiSTer Minimig core",
       "kind": "hardware",
-      "notes": "Real AmigaOS reading the volume with its own filesystem handlers.\nUnlike the HPS affs mount, this is the Amiga's opinion. Bootable Workbench\n1.3 / 2.1 RDB+PFS disks are already on the board."
+      "notes": "Real AmigaOS reading the volume with its own filesystem handlers.\nUnlike the HPS affs mount, this is the Amiga's opinion. Bootable Workbench\n1.3 / 2.1 RDB+PFS disks are already on the board.",
+      "core": "Minimig"
     },
     {
       "id": "mister-core-x68000",
       "tool": "MiSTer X68000 core",
-      "kind": "hardware"
+      "kind": "hardware",
+      "core": "X68000"
     },
     {
       "id": "mister-core-atarist",
@@ -1048,13 +1115,15 @@
       "id": "mister-core-appleii",
       "tool": "MiSTer Apple-II core",
       "kind": "hardware",
-      "notes": "Real Apple II reading the disk with ProDOS / DOS 3.3 themselves.\n/media/fat/games/Apple-II is already populated on the board, so this needs no\nnew material — it closes two write gaps that had no oracle at all."
+      "notes": "Real Apple II reading the disk with ProDOS / DOS 3.3 themselves.\n/media/fat/games/Apple-II is already populated on the board, so this needs no\nnew material — it closes two write gaps that had no oracle at all.",
+      "core": "Apple-II"
     },
     {
       "id": "snow",
       "tool": "Snow",
       "kind": "emulator",
-      "notes": "Modern Macintosh emulator written in Rust. Emulating a Mac Plus gives\na real MFS implementation — the only realistic judge of MFS, which otherwise\nhas no oracle anywhere. NB: snowemu.com returned HTTP 403 when checked on\n2026-08-02, so confirm the project and its automation surface before the\nmatrix leans on it."
+      "program": "snowemu",
+      "notes": "Modern Macintosh emulator written in Rust. Emulating a Mac Plus gives\na real MFS implementation — the only realistic judge of MFS, which otherwise\nhas no oracle anywhere.\n\nConfirmed 2026-08-07. The project is real and active: github.com/twvd/snow,\nMIT, Linux/macOS/Windows, hardware-level 68000/020/030 emulation of the 128K\nthrough SE/30, with SCSI hard disk and CD support. The 2026-08-02 HTTP 403 was\nsnowemu.com blocking the fetch, not a dead project.\n\nIts automation surface is the open question, and the answer is \"not directly\".\nThere is no CLI frontend — `frontend_egui` is the only one. The `testrunner`\ncrate IS headless (clap, PNG/GIF output, parallel), but it is built for Snow's\nown emulation-accuracy suite: `single` takes a ROM, a floppy image, a recorded\ninput replay and a control *frame*, boots, and image-diffs the framebuffer.\nRepurposing that as a format oracle means authoring an input replay and a\nknown-good screenshot per format, and supplying Mac ROMs. Possible, but a\nproject rather than a check command, and brittle in a way a fsck is not.\n\nSo: keep it registered as the emulator oracle of record for MFS, but do not\nplan on automating it soon. For classic HFS an older macOS with a real\nHFS-Standard-capable fsck_hfs is far cheaper and equally authoritative."
     },
     {
       "id": "full-cycle-boot",
@@ -1093,38 +1162,45 @@
       "id": "mame-pc98",
       "tool": "MAME pc9801",
       "kind": "emulator",
+      "program": "mame",
       "notes": "No PC-98 core exists on the MiSTer, so MAME's pc9801 drivers are the route for HDM and DIM."
     },
     {
       "id": "mister-core-atari800",
       "tool": "MiSTer ATARI800 core",
-      "kind": "hardware"
+      "kind": "hardware",
+      "core": "Atari800"
     },
     {
       "id": "mister-core-ti99",
       "tool": "MiSTer TI-99_4A core",
-      "kind": "hardware"
+      "kind": "hardware",
+      "core": "Ti994a"
     },
     {
       "id": "mister-core-oric",
       "tool": "MiSTer Oric core",
-      "kind": "hardware"
+      "kind": "hardware",
+      "core": "Oric"
     },
     {
       "id": "mister-core-spectrum",
       "tool": "MiSTer Spectrum core",
-      "kind": "hardware"
+      "kind": "hardware",
+      "core": "ZX-Spectrum"
     },
     {
       "id": "mister-core-coco",
       "tool": "MiSTer CoCo2 / COCO3 core",
-      "kind": "hardware"
+      "kind": "hardware",
+      "core": "CoCo3"
     },
     {
       "id": "mister-core-archie",
       "tool": "MiSTer ARCHIE core",
       "kind": "hardware",
-      "notes": "Acorn Archimedes; RISC OS reads ADFS with its own FileCore."
+      "notes": "Acorn Archimedes; RISC OS reads ADFS with its own FileCore.",
+      "core": "Archie"
     },
     {
       "id": "mister-core-bbcmicro",
@@ -1167,14 +1243,12 @@
       "oracle": "qemu-img",
       "platform": "windows",
       "status": "verified",
-      "path_hint": "C:/Program Files/qemu",
       "verified_on": "2026-08-02"
     },
     {
       "oracle": "qemu-img",
       "platform": "wsl",
       "status": "verified",
-      "path_hint": "/usr/bin/qemu-img",
       "verified_on": "2026-08-02"
     },
     {
@@ -1185,14 +1259,12 @@
     {
       "oracle": "qemu-img",
       "platform": "macos",
-      "status": "install",
-      "path_hint": "brew install qemu"
+      "status": "install"
     },
     {
       "oracle": "chdman",
       "platform": "windows",
       "status": "verified",
-      "path_hint": "C:/Tools/chdman (0.288)",
       "verified_on": "2026-08-02"
     },
     {
@@ -1214,14 +1286,12 @@
       "oracle": "fsck.ext4",
       "platform": "wsl",
       "status": "verified",
-      "path_hint": "/usr/sbin/fsck.ext4",
       "verified_on": "2026-08-02"
     },
     {
       "oracle": "fsck.ext4",
       "platform": "mister-hps",
       "status": "verified",
-      "path_hint": "/usr/sbin/fsck.ext4",
       "verified_on": "2026-08-02"
     },
     {
@@ -1232,8 +1302,7 @@
     {
       "oracle": "fsck.ext4",
       "platform": "macos",
-      "status": "install",
-      "path_hint": "brew install e2fsprogs"
+      "status": "install"
     },
     {
       "oracle": "fsck.ext4",
@@ -1265,7 +1334,8 @@
     {
       "oracle": "fsck_hfs",
       "platform": "macos",
-      "status": "expected"
+      "status": "verified",
+      "verified_on": "2026-08-07"
     },
     {
       "oracle": "fsck_hfs",
@@ -1311,7 +1381,6 @@
       "oracle": "ghostexp",
       "platform": "windows",
       "status": "verified",
-      "path_hint": "C:/Temp/pebuilder-isolinux/Programs/ghost11",
       "verified_on": "2026-08-02"
     },
     {
@@ -1382,14 +1451,12 @@
       "oracle": "mount-affs",
       "platform": "mister-hps",
       "status": "verified",
-      "path_hint": "/proc/filesystems",
       "verified_on": "2026-08-02"
     },
     {
       "oracle": "mount-affs",
       "platform": "linux",
-      "status": "install",
-      "path_hint": "linux-modules-extra"
+      "status": "install"
     },
     {
       "oracle": "mount-affs",
@@ -1415,7 +1482,6 @@
       "oracle": "7z",
       "platform": "windows",
       "status": "verified",
-      "path_hint": "C:/Program Files/7-Zip",
       "verified_on": "2026-08-02"
     },
     {
@@ -1429,6 +1495,22 @@
       "status": "install"
     },
     {
+      "oracle": "motion",
+      "platform": "linux",
+      "status": "verified",
+      "verified_on": "2026-08-24"
+    },
+    {
+      "oracle": "motion",
+      "platform": "windows",
+      "status": "install"
+    },
+    {
+      "oracle": "motion",
+      "platform": "macos",
+      "status": "install"
+    },
+    {
       "oracle": "iris",
       "platform": "windows",
       "status": "install"
@@ -1457,6 +1539,36 @@
       "oracle": "fs-uae",
       "platform": "macos",
       "status": "install"
+    },
+    {
+      "oracle": "amitools",
+      "platform": "windows",
+      "status": "expected"
+    },
+    {
+      "oracle": "amitools",
+      "platform": "linux",
+      "status": "expected"
+    },
+    {
+      "oracle": "amitools",
+      "platform": "macos",
+      "status": "expected"
+    },
+    {
+      "oracle": "winuae",
+      "platform": "windows",
+      "status": "expected"
+    },
+    {
+      "oracle": "winuae",
+      "platform": "linux",
+      "status": "absent"
+    },
+    {
+      "oracle": "winuae",
+      "platform": "macos",
+      "status": "absent"
     },
     {
       "oracle": "86box-os2",
@@ -1686,8 +1798,7 @@
     {
       "oracle": "mount-ntfs3",
       "platform": "linux",
-      "status": "install",
-      "path_hint": "linux-modules-extra"
+      "status": "install"
     },
     {
       "oracle": "mount-ntfs3",
@@ -1732,7 +1843,12 @@
       "direction": "write",
       "strength": "structural",
       "status": "proven",
-      "evidence": "qemu-img info -> raw"
+      "evidence": "qemu-img info -> raw",
+      "check": [
+        "info",
+        "{artifact}"
+      ],
+      "expect_stdout": "file format: raw"
     },
     {
       "oracle": "qemu-img",
@@ -1740,7 +1856,12 @@
       "direction": "write",
       "strength": "structural",
       "status": "proven",
-      "evidence": "qemu-img check -> clean"
+      "evidence": "qemu-img check -> clean",
+      "check": [
+        "check",
+        "{artifact}"
+      ],
+      "expect_stdout": "No errors were found"
     },
     {
       "oracle": "qemu-img",
@@ -1748,7 +1869,12 @@
       "direction": "write",
       "strength": "structural",
       "status": "proven",
-      "evidence": "qemu-img info -> vpc"
+      "evidence": "qemu-img info -> vpc",
+      "check": [
+        "info",
+        "{artifact}"
+      ],
+      "expect_stdout": "file format: vpc"
     },
     {
       "oracle": "qemu-img",
@@ -1756,7 +1882,12 @@
       "direction": "write",
       "strength": "smoke",
       "status": "proven",
-      "evidence": "qemu-img info -> raw; vpc prober scores below raw, unresolved"
+      "evidence": "qemu-img info -> raw; vpc prober scores below raw, unresolved",
+      "check": [
+        "info",
+        "{artifact}"
+      ],
+      "expect_stdout": "file format: raw"
     },
     {
       "oracle": "qemu-img",
@@ -1772,7 +1903,12 @@
       "direction": "write",
       "strength": "structural",
       "status": "proven",
-      "evidence": "qemu-img check -> No errors were found"
+      "evidence": "qemu-img check -> No errors were found",
+      "check": [
+        "check",
+        "{artifact}"
+      ],
+      "expect_stdout": "No errors were found"
     },
     {
       "oracle": "chdman",
@@ -1780,7 +1916,13 @@
       "direction": "write",
       "strength": "structural",
       "status": "proven",
-      "evidence": "chdman verify -> Raw SHA1 + Overall SHA1 successful, chdman 0.174 through 0.288"
+      "evidence": "chdman verify -> Raw SHA1 + Overall SHA1 successful, chdman 0.174 through 0.288",
+      "check": [
+        "verify",
+        "-i",
+        "{artifact}"
+      ],
+      "expect_stdout": "Overall SHA1 verification successful"
     },
     {
       "oracle": "chdman",
@@ -1802,63 +1944,102 @@
       "format": "fs.ext2",
       "direction": "write",
       "strength": "authoritative",
-      "status": "untested"
+      "status": "untested",
+      "check": [
+        "-fn",
+        "{artifact}"
+      ]
     },
     {
       "oracle": "fsck.ext4",
       "format": "fs.ext3",
       "direction": "write",
       "strength": "authoritative",
-      "status": "untested"
+      "status": "untested",
+      "check": [
+        "-fn",
+        "{artifact}"
+      ]
     },
     {
       "oracle": "fsck.ext4",
       "format": "fs.ext4",
       "direction": "write",
       "strength": "authoritative",
-      "status": "untested"
+      "status": "untested",
+      "check": [
+        "-fn",
+        "{artifact}"
+      ]
     },
     {
       "oracle": "fsck.vfat",
       "format": "fs.fat12",
       "direction": "write",
       "strength": "structural",
-      "status": "untested"
+      "status": "untested",
+      "check": [
+        "-n",
+        "{artifact}"
+      ]
     },
     {
       "oracle": "fsck.vfat",
       "format": "fs.fat16",
       "direction": "write",
       "strength": "structural",
-      "status": "untested"
+      "status": "untested",
+      "check": [
+        "-n",
+        "{artifact}"
+      ]
     },
     {
       "oracle": "fsck.vfat",
       "format": "fs.fat32",
       "direction": "write",
       "strength": "structural",
-      "status": "untested"
+      "status": "untested",
+      "check": [
+        "-n",
+        "{artifact}"
+      ]
     },
     {
       "oracle": "fsck_hfs",
       "format": "fs.hfs",
       "direction": "write",
       "strength": "authoritative",
-      "status": "untested"
+      "status": "proven",
+      "evidence": "fsck_hfs -> 'Checking HFS volume' + 'appears to be OK', macOS 26.5.2 and 10.5.8",
+      "check": [
+        "{artifact}"
+      ],
+      "expect_stdout": "appears to be OK"
     },
     {
       "oracle": "fsck_hfs",
       "format": "fs.hfsplus",
       "direction": "write",
       "strength": "authoritative",
-      "status": "untested"
+      "status": "proven",
+      "evidence": "fsck_hfs -> 'Checking non-journaled HFS Plus Volume' + 'appears to be OK'",
+      "check": [
+        "{artifact}"
+      ],
+      "expect_stdout": "appears to be OK"
     },
     {
       "oracle": "fsck_hfs",
       "format": "fs.hfv",
       "direction": "write",
       "strength": "authoritative",
-      "status": "untested"
+      "status": "proven",
+      "evidence": "flat classic-HFS volume; same path as fs.hfs",
+      "check": [
+        "{artifact}"
+      ],
+      "expect_stdout": "appears to be OK"
     },
     {
       "oracle": "fsck_apfs",
@@ -1907,7 +2088,11 @@
       "format": "fs.xfs",
       "direction": "write",
       "strength": "structural",
-      "status": "untested"
+      "status": "untested",
+      "check": [
+        "-n",
+        "{artifact}"
+      ]
     },
     {
       "oracle": "jfs_fsck",
@@ -1921,21 +2106,30 @@
       "format": "fs.minix1",
       "direction": "write",
       "strength": "authoritative",
-      "status": "untested"
+      "status": "untested",
+      "check": [
+        "{artifact}"
+      ]
     },
     {
       "oracle": "fsck.minix",
       "format": "fs.minix2",
       "direction": "write",
       "strength": "authoritative",
-      "status": "untested"
+      "status": "untested",
+      "check": [
+        "{artifact}"
+      ]
     },
     {
       "oracle": "fsck.minix",
       "format": "fs.minix3",
       "direction": "write",
       "strength": "authoritative",
-      "status": "untested"
+      "status": "untested",
+      "check": [
+        "{artifact}"
+      ]
     },
     {
       "oracle": "mount-affs",
@@ -1959,12 +2153,32 @@
       "status": "untested"
     },
     {
+      "oracle": "motion",
+      "format": "fs.efs-v1",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "proven",
+      "evidence": "2026-08-24: IRIX 3.7 mounts a volume from `new volume efs-v1` off md0c and reads its root directory, including a file and a subdirectory rb-cli put there. Controlled against 8 MB of noise, which IRIX refuses with Invalid argument.",
+      "check": [
+        "{artifact}"
+      ],
+      "expect_stdout": "MOUNTED-OK"
+    },
+    {
+      "oracle": "motion",
+      "format": "part.sgi-dklabel",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "untested",
+      "evidence": "Needs the emulator to attach a second drive; dsd5217.cpp opens drive 0 only, so a whole disk we built cannot be presented to the guest yet."
+    },
+    {
       "oracle": "iris",
       "format": "fs.efs",
       "direction": "write",
       "strength": "authoritative",
-      "status": "plausible",
-      "evidence": "IRIX 6.5 image reads OK; boot not yet wired"
+      "status": "proven",
+      "evidence": "2026-08-15: IRIX 6.5.22 fsck passes all five phases on our volume, then mounts it, writes a file and a subdir, unmounts, and fscks clean again. Found and closed R-039 (bitmap was MSB-first, is LSB-first). Control: mkfs_efs on the same device."
     },
     {
       "oracle": "iris",
@@ -1990,6 +2204,18 @@
       "evidence": "IRIX mounts an EFS CD natively"
     },
     {
+      "oracle": "copperline",
+      "format": "fs.affs",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "proven",
+      "evidence": "2026-08-18: Kickstart 3.1 on an A1200 profile mounts our volume Read/Write under its own name as DH1:, reported over Paula serial to Copperline stdout. Controlled against 2 MB of urandom, which the same guest reports as 'Not a DOS disk' (exit 1).",
+      "check": [
+        "{oracles}/copperline/affs_mount.py",
+        "{artifact}"
+      ]
+    },
+    {
       "oracle": "fs-uae",
       "format": "fs.pfs3",
       "direction": "write",
@@ -2002,10 +2228,48 @@
       "format": "fs.affs",
       "direction": "write",
       "strength": "authoritative",
-      "status": "plausible"
+      "status": "proven",
+      "evidence": "2026-08-14: Kickstart 3.1 on an A1200 mounts our volume Read/Write as 'rusty-backup' and List DH1: reads the contents back. Controlled against 2 MB of noise, which yields no DH1: unit. Closes R-020.",
+      "check": [
+        "{oracles}/fsuae/affs_mount.py",
+        "{artifact}"
+      ]
     },
     {
       "oracle": "fs-uae",
+      "format": "part.rdb",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "plausible"
+    },
+    {
+      "oracle": "amitools",
+      "format": "fs.affs",
+      "direction": "write",
+      "strength": "structural",
+      "status": "proven",
+      "evidence": "2026-08-14: xdftool accepts a freshly written volume at 1M..32M and after a put, listing the file back. The 2026-08-12 rejection (R-038) was real but indicted an Aug-8 artifact built before a190182 fixed the bitmap sizing; HEAD passes.",
+      "check": [
+        "{oracles}/amitools_affs.py",
+        "{artifact}"
+      ]
+    },
+    {
+      "oracle": "winuae",
+      "format": "fs.affs",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "plausible"
+    },
+    {
+      "oracle": "winuae",
+      "format": "fs.pfs3",
+      "direction": "write",
+      "strength": "authoritative",
+      "status": "plausible"
+    },
+    {
+      "oracle": "winuae",
       "format": "part.rdb",
       "direction": "write",
       "strength": "authoritative",
@@ -2394,56 +2658,7 @@
       "status": "untested"
     }
   ],
-  "hosts": [
-    {
-      "id": "local",
-      "platform": "windows",
-      "transport": "local",
-      "can_produce": true,
-      "can_verify": true,
-      "notes": "Development box. Uniquely holds ghostexp (GHO) and chkdsk."
-    },
-    {
-      "id": "wsl",
-      "platform": "wsl",
-      "transport": "wsl",
-      "can_produce": false,
-      "can_verify": true,
-      "notes": "Ubuntu 24.04. Lighter than a real Linux box - no hfs, affs, minix, jfs or ntfs3 mounts."
-    },
-    {
-      "id": "linuxbox",
-      "platform": "linux",
-      "transport": "ssh",
-      "can_produce": true,
-      "can_verify": true,
-      "notes": "Needs linux-modules-extra for the hfs/hfsplus/affs/minix/jfs/ntfs3/ufs/efs mounts."
-    },
-    {
-      "id": "mac",
-      "platform": "macos",
-      "transport": "ssh",
-      "can_produce": true,
-      "can_verify": true,
-      "notes": "Not optional: fsck_hfs, fsck_apfs and hdiutil exist nowhere else."
-    },
-    {
-      "id": "mister-hps",
-      "platform": "mister-hps",
-      "transport": "ssh",
-      "can_produce": true,
-      "can_verify": true,
-      "notes": "ARM Linux side. rb-cli already deployed at /media/fat/Scripts/rb-cli. Also the transport for core-side jobs."
-    },
-    {
-      "id": "mister-core",
-      "platform": "mister-core",
-      "transport": "ssh",
-      "can_produce": false,
-      "can_verify": true,
-      "notes": "The FPGA cores. Reached via the HPS. Authoritative for Amiga, X68000 and Atari ST formats."
-    }
-  ],
+  "hosts": [],
   "fixtures": [
     {
       "id": "fmt.adf.amiga-dd.floppy",
@@ -2535,6 +2750,58 @@
       ]
     },
     {
+      "id": "fmt.ima.transferdisk.floppy",
+      "relpath": "fmt.ima.transferdisk.floppy.ima",
+      "bytes": 1474560,
+      "sha256": "b215a575bc542fa7b3cf56dbb638b1cddb034268d0ac5b6b62742a8a63aa7913",
+      "origin": "harvested",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "fmt.ima"
+      ],
+      "notes": "Raw 1.44 MB FAT12 floppy (WinImage .IMA). The plaintext behind both IMZ fixtures - all three hold the same volume, so an IMZ that decodes to anything else is wrong."
+    },
+    {
+      "id": "fmt.imz.encrypted.floppy",
+      "relpath": "fmt.imz.encrypted.floppy.imz",
+      "bytes": 159652,
+      "sha256": "d486a982675651315013b7e607e9f312049fdea55032fe71f95c7272e3fa12a5",
+      "origin": "harvested",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "fmt.imz"
+      ],
+      "notes": "WinImage IMZ, password-protected. Password is `password` per the convention. Decrypts to the same volume as the plain pair, so a decrypt returning plausible-but-wrong bytes is detectable."
+    },
+    {
+      "id": "fmt.imz.plain.floppy",
+      "relpath": "fmt.imz.plain.floppy.imz",
+      "bytes": 2025,
+      "sha256": "becdf12c8f4b91b6ff57f7be0b01d7c21a61841d1ae0c769e4e2617feeb000f2",
+      "origin": "harvested",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "fmt.imz"
+      ],
+      "notes": "WinImage IMZ (ZIP-wrapped) decoding to a 1.44 MB FAT floppy. 2 KB on disk - the cheapest fixture in the corpus. Unencrypted; the encrypted variant is still wanted."
+    },
+    {
+      "id": "fmt.imz.transferdisk.floppy",
+      "relpath": "fmt.imz.transferdisk.floppy.imz",
+      "bytes": 159576,
+      "sha256": "c8d97fbb309d66686392d9dce074e79a5f947790b74ae520d3f68fded55e7549",
+      "origin": "harvested",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "fmt.imz"
+      ],
+      "notes": "WinImage IMZ, unencrypted. Same volume as fmt.ima.transferdisk.floppy."
+    },
+    {
       "id": "fmt.msa.base.floppy",
       "relpath": "fmt.msa.base.floppy.msa.zst",
       "bytes": 364,
@@ -2545,6 +2812,32 @@
       "formats": [
         "fmt.msa"
       ]
+    },
+    {
+      "id": "fmt.sparseimage.apm.hd",
+      "relpath": "fmt.sparseimage.apm.hd.sparseimage",
+      "bytes": 5246976,
+      "sha256": "27dcf4e26643b148c74ba5129afe538afe508a69c0b524d45961917508e4c8c7",
+      "origin": "hdiutil-10.5-leopard",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "fmt.sparseimage"
+      ],
+      "notes": "Apple hdiutil on a PowerMac G5. Mac-native payload: resource fork, type/creator (APPL/RBcl, TEXT/ttxt), decomposed UTF-8, colon-in-name, 250-char name, symlink"
+    },
+    {
+      "id": "fmt.sparseimage.superfloppy.hd",
+      "relpath": "fmt.sparseimage.superfloppy.hd.sparseimage",
+      "bytes": 5246976,
+      "sha256": "e0ef6605dfad13856550adfd28f19b4b9a7cb0f8d384d6cc30adb4ed1467fd15",
+      "origin": "hdiutil-10.5-leopard",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "fmt.sparseimage"
+      ],
+      "notes": "Apple hdiutil on a PowerMac G5. Mac-native payload: resource fork, type/creator (APPL/RBcl, TEXT/ttxt), decomposed UTF-8, colon-in-name, 250-char name, symlink"
     },
     {
       "id": "fmt.woz.blank-140k.floppy",
@@ -2648,6 +2941,32 @@
       "formats": [
         "fs.apfs"
       ]
+    },
+    {
+      "id": "fs.apfs.encrypted-bare.hd",
+      "relpath": "fs.apfs.encrypted-bare.hd.img.zst",
+      "bytes": 266847,
+      "sha256": "ef0befc60d904d86fd3997b0ed08e55f454e462e4eb3d2a9e93d2c7926511abf",
+      "origin": "hdiutil-macos26",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "fs.apfs"
+      ],
+      "notes": "Bare FileVault-encrypted APFS container, APFS at LBA 0, passphrase `password`. Carved with dd from the Apple_APFS extent gpt show reports. Same tree and same file bytes as fs.apfs.encrypted.hd and fs.apfs.encrypted-gpt.hd - that three-way agreement is the assertion."
+    },
+    {
+      "id": "fs.apfs.encrypted-gpt.hd",
+      "relpath": "fs.apfs.encrypted-gpt.hd.img.zst",
+      "bytes": 267128,
+      "sha256": "08686ac1d8693558a9a74c70cd37694751b0965e07f14908be197b7fb981f92b",
+      "origin": "hdiutil-macos26",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "fs.apfs"
+      ],
+      "notes": "GPT-wrapped FileVault-encrypted APFS, Apple_APFS at LBA 40, passphrase `password`. Encryption is volume-level (diskutil apfs encryptVolume), NOT an hdiutil -encryption image wrapper - the wrapper is a different mechanism rb-cli --password does not unwrap."
     },
     {
       "id": "fs.apfs.encrypted.hd",
@@ -3013,6 +3332,19 @@
       "notes": "populated real system disk for edit testing"
     },
     {
+      "id": "fs.hpfs.os2-warp45.hd",
+      "relpath": "../fixtures-large/fs.hpfs.os2-warp45.hd.vmdk.zst",
+      "bytes": 135904539,
+      "sha256": "34c0fd66420942e488dad7671b270a25f6772431d43335b0c16551c382c609c7",
+      "origin": "harvested-verified",
+      "redistributable": "unknown",
+      "location": "annex",
+      "formats": [
+        "fs.hpfs"
+      ],
+      "notes": "real OS/2 Warp 4.52 install, monolithicSparse VMDK, MBR type-0x07 HPFS at LBA 63; fsck clean 4722 files / 471 dirs. Only partitioned-HPFS fixture (R-022 control) and the only real non-flat container (F-008)."
+    },
+    {
       "id": "fs.human68k.2dd.floppy",
       "relpath": "fs.human68k.2dd.floppy.d88.zst",
       "bytes": 3500,
@@ -3161,6 +3493,19 @@
       ]
     },
     {
+      "id": "fs.sfs.workbench-dh0.hd",
+      "relpath": "../fixtures-large/fs.sfs.workbench-dh0.hd.img",
+      "bytes": 522805248,
+      "sha256": "9d1bf5cfc165a0934f30dae2cfc48f45c8afa2b37f889b6ace0ed86df0b7c4c4",
+      "origin": "extracted-from-amiga128gb-chd",
+      "redistributable": "unknown",
+      "location": "annex",
+      "formats": [
+        "fs.sfs"
+      ],
+      "notes": "SFS DH0 from a real bootable Amiga disk, carved verbatim with chdman -isb 1032192 -ib 522805248 (9s, vs a 117 GB whole-disk convert). Magic SFS\u0000 at offset 0; reads with --fs-type \"SFS\u0000\" showing a real Workbench tree. NOT auto-detected as a bare volume - see R-017."
+    },
+    {
       "id": "fs.ufs1.base.hd",
       "relpath": "fs.ufs1.base.hd.img.zst",
       "bytes": 1349,
@@ -3235,6 +3580,19 @@
       "notes": "verified via rb-cli"
     },
     {
+      "id": "optical.cdda.no-data-track.cd",
+      "relpath": "optical.cdda.no-data-track.cd/cdda-noaudiodata.cue",
+      "bytes": 1881718,
+      "sha256": "3307ca1100628530a0954c3e5b49b1fb7075376cf64847adec84c6a47b6ce28d",
+      "origin": "synthetic-dd-printf",
+      "redistributable": "yes",
+      "location": "corpus",
+      "formats": [
+        "optical.cdda"
+      ],
+      "notes": "Two 400-sector AUDIO tracks of silence, no data track. The minimal R-012 repro: optical info rejects any disc with no data track. Built with dd/printf, never rb-cli."
+    },
+    {
       "id": "optical.cdi.hieroglyph.cd",
       "relpath": "optical.cdi.hieroglyph.cd.chd",
       "bytes": 3743092,
@@ -3259,6 +3617,32 @@
         "optical.chdcd"
       ],
       "notes": "verified via rb-cli"
+    },
+    {
+      "id": "optical.clonecd.bookshelf.cd",
+      "relpath": "../fixtures-large/optical.clonecd.bookshelf.cd/BOOKSHELF.ccd",
+      "bytes": 398633165,
+      "sha256": "511da44cd19c24a6c57fb150dcfb0c94706b1686e8ce7b28b6c06a4b256fcffb",
+      "origin": "harvested-dropbox",
+      "redistributable": "unknown",
+      "location": "annex",
+      "formats": [
+        "optical.clonecd"
+      ],
+      "notes": "CloneCD set: .ccd descriptor + .img (2352 B/sector) + .sub (96 B/sector subchannel) + .cue. Opens via the .ccd as container=clonecd, filesystems=high_sierra. All three payloads describe exactly 162840 sectors. Its .cue is the R-015 unpadded-track repro."
+    },
+    {
+      "id": "optical.cue.unpadded-track.cd",
+      "relpath": "../fixtures-large/optical.clonecd.bookshelf.cd/BOOKSHELF.cue",
+      "bytes": 73,
+      "sha256": "90ee11eb5000c002bdeb9e04c7683d50a1a3e5b9be3e7f82a89a91acaaeba70d",
+      "origin": "harvested-dropbox",
+      "redistributable": "unknown",
+      "location": "annex",
+      "formats": [
+        "optical.cue"
+      ],
+      "notes": "The .cue sibling of the CloneCD set, carrying an unpadded `TRACK 1`. Same disc as optical.clonecd.bookshelf.cd, different entry point - that pairing is the R-015 assertion."
     },
     {
       "id": "optical.efs.irix-scsitb.cd",
@@ -3388,6 +3772,19 @@
       "formats": [
         "part.ahdi"
       ]
+    },
+    {
+      "id": "part.sun.minimal-slot6.hd",
+      "relpath": "part.sun.minimal-slot6.hd.qcow2",
+      "bytes": 458824,
+      "sha256": "45123a296c3b49c4b860be4ad89affa046fe9a8785c200527647fb0e4fb1f2f5",
+      "origin": "harvested-dropbox",
+      "redistributable": "unknown",
+      "location": "corpus",
+      "formats": [
+        "part.sun"
+      ],
+      "notes": "458 KB Sun label with its only partition at slot 6 - position 1 diverges from slot 6, so it exercises native_slot at 1/3500th the size of the full Solaris disk"
     },
     {
       "id": "part.sun.solaris-disk.multipart",

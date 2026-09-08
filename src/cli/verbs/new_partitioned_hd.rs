@@ -1,5 +1,6 @@
-//! `rb-cli new hd {mbr|gpt|apm|sgi|x68k-table|rdb|sun|atari} IMG` — a blank disk
-//! image
+//! `rb-cli new hd
+//! {mbr|gpt|apm|sgi|sgi-dklabel|x68k-table|rdb|sun|next|solaris-x86|atari}
+//! IMG` — a blank disk image
 //! carrying a real partition table with partitions you size and type yourself.
 //!
 //! This is the CLI grammar only; the layout maths and the table writers
@@ -43,11 +44,22 @@ pub enum PartitionedHdCommand {
     Apm(PartitionedHdArgs),
     /// SGI volume header (IRIX). Partitions are cylinder-aligned.
     Sgi(CylinderHdArgs),
+    /// SGI disk label (IRIS 2000 / 3000, the pre-IRIX scheme). Eight slots
+    /// carrying a role rather than a type; partitions are cylinder-aligned.
+    #[command(name = "sgi-dklabel")]
+    SgiDklabel(CylinderHdArgs),
     /// Amiga Rigid Disk Block. Partitions are cylinder-aligned.
     Rdb(CylinderHdArgs),
     /// Sun disk label / SMI VTOC (SPARC Solaris / SunOS). Slices are
     /// cylinder-aligned.
     Sun(CylinderHdArgs),
+    /// NeXT disk label (NeXTSTEP / OPENSTEP). Up to 8 partitions counted in
+    /// the label's own 1024-byte sectors, so --sectors is in those units too.
+    Next(CylinderHdArgs),
+    /// Solaris x86: an MBR partition holding a 16-slice VTOC. Slices are
+    /// cylinder-aligned and the first three cylinders are the label's own.
+    #[command(name = "solaris-x86")]
+    SolarisX86(CylinderHdArgs),
     /// Sharp X68000 SCSI/SASI table. Up to 8 partitions.
     X68k(PartitionedHdArgs),
     /// Atari ST AHDI root sector. Up to 4 partitions.
@@ -71,7 +83,8 @@ pub struct CylinderHdArgs {
 
 #[derive(Debug, Args)]
 pub struct PartitionedHdArgs {
-    /// Image file to create.
+    /// Image file to create. A `.vhd` name gets a fixed-VHD footer, so
+    /// Windows Disk Management and Hyper-V attach the file as it is.
     pub image: PathBuf,
 
     /// Total disk size (accepts `K`/`M`/`G` suffixes).
@@ -121,6 +134,13 @@ pub fn run(cmd: PartitionedHdCommand) -> Result<()> {
             });
             (TableKind::Sgi, a.common)
         }
+        PartitionedHdCommand::SgiDklabel(a) => {
+            geometry = Some(Geometry {
+                heads: a.heads,
+                sectors_per_track: a.sectors,
+            });
+            (TableKind::SgiDkLabel, a.common)
+        }
         PartitionedHdCommand::Rdb(a) => {
             geometry = Some(Geometry {
                 heads: a.heads,
@@ -134,6 +154,20 @@ pub fn run(cmd: PartitionedHdCommand) -> Result<()> {
                 sectors_per_track: a.sectors,
             });
             (TableKind::Sun, a.common)
+        }
+        PartitionedHdCommand::Next(a) => {
+            geometry = Some(Geometry {
+                heads: a.heads,
+                sectors_per_track: a.sectors,
+            });
+            (TableKind::Next, a.common)
+        }
+        PartitionedHdCommand::SolarisX86(a) => {
+            geometry = Some(Geometry {
+                heads: a.heads,
+                sectors_per_track: a.sectors,
+            });
+            (TableKind::SolarisX86, a.common)
         }
     };
     let geometry = geometry.unwrap_or_default();
@@ -152,7 +186,7 @@ pub fn run(cmd: PartitionedHdCommand) -> Result<()> {
         .map(|s| parse_spec(s))
         .collect::<Result<Vec<_>>>()?;
 
-    let placed = provision::place(&specs, kind, disk_size, align)?;
+    let placed = provision::place(&specs, kind, disk_size, align, geometry)?;
     let sources = parse_fills(&args.fills, placed.len())?;
 
     if args.image.exists() && !args.force {
@@ -201,6 +235,25 @@ pub fn run(cmd: PartitionedHdCommand) -> Result<()> {
                 format_size(image.len() as u64),
             ));
         }
+    }
+
+    // A `.vhd` name promises a disk Windows and Hyper-V attach directly; a raw
+    // image under that name is refused by both, so give it the fixed-VHD footer.
+    let is_vhd = args
+        .image
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("vhd"));
+    if is_vhd {
+        let mut img = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&args.image)
+            .with_context(|| format!("reopening {}", args.image.display()))?;
+        std::io::Write::write_all(
+            &mut img,
+            &crate::rbformats::vhd::build_vhd_footer(disk_size),
+        )
+        .context("appending the VHD footer")?;
+        log_stderr("appended a fixed-VHD footer (Disk Management can attach the file)");
     }
 
     log_stderr(format!(

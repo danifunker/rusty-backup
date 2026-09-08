@@ -492,6 +492,7 @@ fn remote_source_host_copy_extracts_tree_over_wire() {
         entries,
         dest_dir: dest_dir.clone(),
         fork_mode: ResourceForkMode::DataForkOnly,
+        on_conflict: rusty_backup::fs::replace::OnConflict::Replace,
     });
 
     let mut waited = 0;
@@ -861,8 +862,44 @@ fn restore_to_remote_image_round_trips() {
         false,
         progress,
         None,
+        false,
     )
     .expect("remote restore");
+
+    // R12: an image already on the daemon is not replaced without saying so.
+    let again = || RestoreConfig {
+        backup_folder: backups.join("rst"),
+        target_path: std::path::PathBuf::new(),
+        target_is_device: false,
+        target_size: disk_size,
+        alignment: RestoreAlignment::Original,
+        partition_sizes: Vec::new(),
+        write_zeros_to_unused: false,
+    };
+    let refused = restore_to_remote(
+        again(),
+        Arc::clone(&conn),
+        "/restored.img",
+        false,
+        Arc::new(Mutex::new(RestoreProgress::default())),
+        None,
+        false,
+    )
+    .expect_err("an existing remote image is refused without confirmation");
+    assert!(
+        format!("{refused:#}").contains("already exists"),
+        "{refused:#}"
+    );
+    restore_to_remote(
+        again(),
+        Arc::clone(&conn),
+        "/restored.img",
+        false,
+        Arc::new(Mutex::new(RestoreProgress::default())),
+        None,
+        true,
+    )
+    .expect("confirmed overwrite of the remote image");
 
     // --- the landed remote image is a full, parseable disk ---
     let restored = serve_root.join("restored.img");

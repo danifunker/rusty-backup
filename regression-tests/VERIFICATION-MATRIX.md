@@ -123,6 +123,7 @@ either correct or a defect; do not assume either way.
 | ProDOS / Apple DOS 3.3 | AppleCommander (Java) | any | candidate, not yet wired |
 | CP/M (9 DPBs) | `cpmtools` (`cpmls`) | install anywhere | largest sub-axis; oracle exists, just install it |
 | SGI EFS | **IRIX 6.5 native `fsck`** under Iris, scripted via `iris-ci`; mount `efs` (ro) as fallback | Iris (SGI emulator); full Linux | **DONE 2026-08-13/15** — boot wired, and it found R-039 (bitmap bit order). IRIX also mounts our volume and writes to it. 5.3 hangs on boot (`Find Error: 10`), so 6.5 is the authority |
+| SGI EFS v1 | **IRIX 3.7 native `mount`** under Motion (`oracles/motion/efs_v1_mount.sh`) — the volume goes into the reference IRIS 3130's `/usr` slot and the guest's own kernel mounts and lists it | Motion (IRIS 3130 emulator) | **DONE 2026-08-24** — wired into `rb-regress verify`. Controlled against 8 MB of noise, which IRIX refuses with `Invalid argument`. The emulator holds the disk read-only, so guest *writes* — the step that closed R-039 next door — are not available |
 | CBM DOS | VICE, `cc1541`, DirMaster | any | tier 7 mostly |
 | UFS | mount `ufs` (ro) | full Linux | R-013 lives here |
 | Acorn DFS / ADFS | BeebEm / Arculator | tier 7 | **no structural oracle** |
@@ -142,6 +143,7 @@ either correct or a defect; do not assume either way.
 | APM | `diskutil list`, `gpt` | macOS |
 | Sun disk label | `sfdisk -l` reads SunOS labels | Linux |
 | SGI volume header | `sfdisk`/`parted` partial | Linux |
+| SGI disk label | none wired. IRIX 3.7 under Motion would be authoritative, but the emulator attaches drive 0 only, so a disk we built cannot be presented to the guest | — |
 | RDB | amitools `rdbtool` (structural); WinUAE / MiSTer Minimig / FS-UAE (boot) | rdbtool reads our output clean; the FS-UAE harness exercises the same disks |
 | AHDI / X68000 | Hatari / MiSTer core | tier 7 |
 

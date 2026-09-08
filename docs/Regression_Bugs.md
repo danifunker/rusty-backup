@@ -1,4 +1,4 @@
-# Regression Findings (R-001 … R-042)
+# Regression Findings (R-001 … R-067)
 
 Defects and documentation drift turned up while building the regression suite
 (`regression-tests/`), 2026-08-01/02. The suite work was deliberately kept
@@ -19,6 +19,32 @@ finding depends on a fixture, the fixture is named.
 
 | ID | Severity | Area | Finding |
 |----|----------|------|---------|
+| ~~[R-068](#r-068)~~ | ~~**High**~~ **FIXED** | `src/model/source_reader.rs`, `src/os/mod.rs` | ~~The CLI opens a raw device with a plain `File::open` and never elevates, so on macOS — where privilege is escalated per operation through `authopen`, not inherited from the process — every unprivileged `rb-cli` device verb dies with a bare `Permission denied` and no way forward~~ — the CLI device path goes through `open_source_for_reading` like the GUI's, holding the disk claim for the reader's lifetime, 2026-09-08 |
+| ~~R-067~~ | ~~Medium~~ **FIXED** | `src/fs/xfs/fsck.rs` | ~~`rb-cli fsck` reports the bmap-btree blocks of a btree-format inode as leaked (`UnaccountedBlocks`) on a volume `xfs_repair -n` accepts~~ — the block census claimed the fork's extents but not the tree's own blocks, 2026-09-06 |
+| ~~R-066~~ | ~~Medium~~ **FIXED** | `src/fs/xfs/freespace_rebuild.rs` | ~~`sb_fdblocks` falls below the free count `xfs_repair` derives once a volume's free-space btrees grow past their roots (`sb_fdblocks 232894, counted 232904` after 200000 files)~~ — the resync omitted `agf_btreeblks`, 2026-09-06 |
+| ~~R-065~~ | ~~**High**~~ **FIXED** | `src/fs/xfs/v5_crc.rs` | ~~Every v5 CRC header rb-cli stamps on a file or directory block in AG 1 or later carries the wrong `blkno` when an AG is not a power of two of blocks, so `xfs_repair -n` reports every such block as corrupt~~ — `fsblock_to_daddr` shifted the raw fsblock instead of decoding its AG; found on a 96 MiB volume (6144-block AGs), 2026-09-06 |
+| ~~R-064~~ | ~~**High**~~ **FIXED** | `src/fs/xfs/edit.rs`, `src/fs/xfs/mod.rs` | ~~A v5 XFS directory converted to leaf form fails `xfs_repair -n`: the leaf index sat at file offset 2^32 instead of `XFS_DIR2_LEAF_OFFSET` (2^35), the leaf1 block lacked the dir3 header pad and the `bestcount` tail, and short-form offset cookies assumed the 16-byte v4 data header~~ — found under the Docker `xfs_repair` oracle while shipping F-017, 2026-09-06 |
+| ~~R-063~~ | ~~**High**~~ **FIXED** | `src/fs/xfs/edit.rs` | ~~After 1000 files in one XFS directory, `fsck` reports 999 inodes allocated but unreachable from the root and `ls` of that directory lists one file~~ — the editor re-read a v5 block directory past a 16-byte header where the dir3 header is 64 bytes, so every insert into a block-form directory rebuilt it from nothing; the remaining growth past 125 entries is F-017, 2026-09-06 |
+| ~~R-062~~ | ~~Medium~~ **FIXED** | `src/cli/verbs/rm.rs` and friends | ~~ProDOS path lookup is case-sensitive while ProDOS itself is not: `rm /d/extra.bin` cannot find the `EXTRA.BIN` that `put /d/extra.bin` just created~~ — every leaf lookup now goes through `find_child`, exact first and then the filesystem's own folding, 2026-09-05 |
+| ~~R-061~~ | ~~**High**~~ **FIXED** | `src/fs/ufs.rs` | ~~A UFS directory that grows past its first 8 KiB block is corrupt: the 401st file fails with `corrupt d_reclen 0 at off 8192` and the directory cannot be listed afterwards~~ — `write_inode` copied the stale pointer area it had read back over a changed `direct[]`; the copy is now applied to fast symlinks only, 2026-09-05 |
+| ~~R-060~~ | ~~**High**~~ **FIXED** | `src/fs/hfs.rs` | ~~A blank classic HFS volume built with the default B-tree sizes (`rb-cli batch` format, `create_blank_hfs`) gets a four-block catalog whatever its size, and refuses its 94th file at 4 KiB blocks: rb-cli cannot grow a classic catalog~~ — a zero request now takes the volume-scaled hformat sizing `new volume hfs` already used, 2026-09-05 |
+| ~~R-059~~ | ~~**High**~~ **FIXED** | `src/fs/hfs.rs` | ~~An in-place classic HFS grow sizes the allocation area to the partition end, over the alternate MDB and the trailing sector Mac OS reserves~~ — the two sectors are held back and the grown bitmap range is cleared, 2026-09-05 |
+| ~~R-058~~ | ~~Medium~~ **FIXED** | `src/model/provision_runner.rs` | ~~A classic HFS volume poured into a larger partition can never pass Disk First Aid ("Invalid allocation block start"): Mac OS wants the allocation area to end at the partition's alternate MDB~~ — `new hd --fill` grows the volume to the partition when its bitmap has room and warns when it has not, 2026-09-05 |
+| ~~R-057~~ | ~~**High**~~ **FIXED** | `src/fs/mod.rs`, `src/model/provision_runner.rs` | ~~An HFS+ volume edited through an APM or MBR partition, or poured into one by `new hd --fill`, keeps its alternate volume header at the volume end; Disk First Aid reports "Volume header needs minor repair" on every such volume~~ — the partition length reaches the editable open, and a fill mirrors the header at the partition end, 2026-09-05 |
+| ~~R-056~~ | ~~**High**~~ **FIXED** | `src/fs/hfsplus.rs` | ~~An in-place HFS+ grow patches two counts and nothing else: the old alternate-header block stays marked, the new one is not, and the allocation file never grows; Disk First Aid reports orphaned blocks and under-allocation on every grown or Minimum-restored volume~~ — the resize moves the header's blocks, grows or relocates the allocation file and recounts, 2026-09-05 |
+| ~~R-055~~ | ~~Medium~~ **FIXED** | `src/fs/hfsplus.rs`, `src/fs/hfs_common.rs` | ~~Deleting the last fragmented file leaves the HFS+ extents-overflow tree as a root leaf with no records; Disk First Aid stops at "Invalid node structure"~~ — an emptied leaf leaves the tree and the last one retires the root, 2026-09-05 |
+| ~~R-054~~ | ~~**High**~~ **FIXED** | `src/fs/hfs_common.rs`, `src/fs/hfsplus.rs`, `src/fs/hfs.rs` | ~~Deleting a leaf's first record leaves its parent's separator on the old key; Disk First Aid reports "Invalid index key" on every HFS+ volume rb-cli deleted from~~ — separators are refreshed up the tree, fsck checks equality, 2026-09-05 |
+| ~~R-053~~ | ~~**High**~~ **FIXED** | `src/os/mod.rs`, `src/model/source_reader.rs` | ~~`rb-cli inspect` on a raw device reads through a plain `BufReader`: unaligned 8 KiB reads, every device reported as 0 B, and a USB floppy drive fails with EIO at sector 0 (audit R19)~~ — devices go through `SectorAlignedReader`, which drops to one sector per read once a larger read is refused, 2026-09-05; floppy confirmation pending |
+| ~~R-052~~ | ~~Medium~~ **FIXED** | `src/os/macos.rs` | ~~A cancelled authorization dialog is reported as "no ancillary control message" and falls through to a second prompt (audit R11)~~ — authopen's two-byte reply and stderr are decoded; ECANCELED is the user's answer, 2026-09-05 |
+| ~~R-051~~ | ~~Medium~~ **FIXED** | `src/os/macos.rs` | ~~A write-protected card's EACCES is taken for missing privilege: the read path prompts read-write, fails, prompts again; the write path blames sudo (audit R6)~~ — read-only tried directly, DKIOCISWRITABLE / DAMediaWritable name the media, 2026-09-05; lock-switch check on hardware pending |
+| ~~R-050~~ | ~~**High**~~ **FIXED** | `src/fs/ntfs.rs` | ~~Every MFT record rb-cli assembles carries a bytes-in-use four bytes short; chkdsk corrects the first free byte of each created file and directory~~ — the end marker counts as eight bytes, 2026-09-03 |
+| ~~R-049~~ | ~~**High**~~ **FIXED** | `src/fs/ntfs.rs` | ~~Every long name rb-cli writes to NTFS is a lone Win32-namespace name, which NTFS allows only beside a DOS alias; chkdsk reports minor file name errors~~ — POSIX namespace, as Windows writes with 8.3 creation off, 2026-09-02 |
+| ~~R-048~~ | ~~**High**~~ **FIXED** | `src/fs/ntfs.rs` | ~~A renamed NTFS entry's index entry carries the old name's creation snapshot and a raw byte count; chkdsk reports minor file name errors and an incorrect `$I30` entry~~ — the copies take the record's live times and the data attribute's real and allocated sizes, 2026-09-02 |
+| ~~R-047~~ | ~~**High**~~ **FIXED** | `src/fs/ntfs.rs` | ~~A resized `$Bitmap` is sized at ceil(clusters/8) bytes; Windows keeps whole quadwords and chkdsk reports the volume bitmap incorrect~~ — quadword rule, 2026-09-02 |
+| ~~R-046~~ | ~~**High**~~ **FIXED** | `src/fs/ntfs.rs` | ~~A renamed NTFS entry's new `$FILE_NAME` reuses attribute instance 0, and Windows chkdsk calls the record corrupt~~ — the new attribute takes the record's next instance id, 2026-09-02 |
+| ~~R-045~~ | ~~**High**~~ **FIXED** | `src/fs/ntfs.rs` | ~~No NTFS volume can be shrunk in place: the trim point is pinned to the volume size by its own backup boot sector~~ — the trim point is the last used cluster plus one sector, and the scans stop at the cluster count, 2026-09-02 |
+| ~~R-044~~ | ~~**High**~~ **FIXED** | `src/fs/ntfs.rs` | ~~An in-place NTFS grow leaves `$Bitmap` at the old size with the formatter's end mark inside the volume; fsck reports a leaked cluster on every grown or Minimum-restored volume~~ — the resize rewrites `$Bitmap`, relocating it when it outgrows its clusters, 2026-09-02 |
+| ~~R-043~~ | ~~**High**~~ **FIXED** | `src/cli/resolve.rs`, `src/model/browse_session.rs` | ~~Every edit verb refuses a **dynamic VHD**~~ — one classifier (`source_reader::open_container_rw`) now feeds both the CLI resolver and the GUI edit session: dynamic VHD, sparse VMDK and QCOW2 edit in place through their codecs, and decode-only containers are refused with a reason instead of "Invalid MBR", 2026-09-01 |
 | ~~R-042~~ | ~~**High**~~ **FIXED** | `src/fs/affs.rs` | ~~An AFFS partition that is not last on its disk cannot be opened at all~~ — the root-block midpoint was inferred from the end of the *disk*; the read-only opener family now carries the partition length the editable one always had, 2026-08-18 |
 | ~~R-040~~ | ~~**High**~~ **FIXED** | `src/cli/verbs/put.rs`, `src/fs/dir_import.rs` | ~~`put` and `import` never reattach a resource fork, so an extracted Mac archive copied back onto HFS loses every fork~~ — `detect_resource_fork` learned BinHex and both verbs now consult it; all four containers round-trip, 2026-08-17 |
 | ~~R-041~~ | ~~**High**~~ **FIXED** | `src/model/commander_ops.rs`, `src/cli/verbs/tui_app.rs` | ~~Commander drops resource forks: host->image staging hardcoded `resource_fork: None`, and the TUI's image->host copy did not recurse~~ — staging detects forks and skips consumed sidecars; both front ends now share one recursive walker, 2026-08-17 |
@@ -64,6 +90,646 @@ finding depends on a fixture, the fixture is named.
 | ~~R-002~~ | ~~Doc~~ **FIXED** | `src/fs/README.md` | ~~Capability table stale — ext listed as "planned"~~ — table deleted for a pointer at the live dispatch, 2026-08-09 |
 
 ---
+
+## Found while adding the 1000-file churn test, 2026-09-05
+
+### R-061 — a UFS directory that grows past its first block is corrupt {#r-061}
+
+**FIXED 2026-09-05.** Not the directory writer at all: `read_inode` keeps
+a raw copy of the dinode's pointer area (`inline_payload`, the fast-symlink
+target) for every inode, and `write_inode` copied it back over `direct[]`
+and `indirect[]` unconditionally, so the block `dir_insert` had just
+allocated for the directory was undone at write-back while the new size
+stayed. Any path that changes an existing inode's block pointers was
+affected. The overlay now applies to fast symlinks only (symlink mode, no
+blocks); a unit test grows a root directory across two block boundaries,
+lists it, empties it and fscks it. Found 2026-09-05 by the 1000-file churn
+(`regression-tests/cases/tier3/churn.toml`, `churn.ufs` and
+`churn.ufs-43bsd`): the 401st (4.4BSD) / 409th (4.3BSD) `create_file` in
+one directory fails with `ufs dir_find: corrupt d_reclen 0 at off 8192`,
+and `ls` of the directory afterwards fails the same way (`directory 3 has
+zero d_reclen at offset 8192`), so the 400 files already written are
+unreachable; `fsck` sees an orphaned inode. The directory writer appends past
+the first 8 KiB block without allocating and initialising the next one
+(UFS keeps directory entries in 512-byte chunks whose last entry's
+`d_reclen` must reach the chunk end), so the reader meets a zero record
+length at the block boundary. Both byte orders and both on-disk formats
+fail the same way.
+
+### R-062 — ProDOS path lookup is case-sensitive {#r-062}
+
+**FIXED 2026-09-05.** The ProDOS driver already folded case in its own
+lookups; the CLI verbs compared the leaf name literally after
+`list_directory` (`rm`, `mkdir`, `mv`, `batch`, `locate`, the HFS API
+verbs, the TUI import and the staged-edit queue), even though the path
+walk above them (`resolve_components`) already honoured
+`case_insensitive_lookup`. They all use one helper now,
+`fs::filesystem::find_child`: an exact match first, then the filesystem's
+folding. Found by `churn.prodos`: `put v.img payload /d/extra.bin` stores
+`EXTRA.BIN` (ProDOS keeps names upper-case, with lowercase flags on
+ProDOS 8), and `rm v.img /d/extra.bin` then answers `not found`;
+`rm /d/EXTRA.BIN` works, and the root behaves the same (`put /rootx.bin`,
+`rm /rootx.bin`: not found). ProDOS compares names case-insensitively, so
+every path verb (`rm`, `get`, `mv`, `ls PATH`, `cp`) should fold case the
+way the volume does.
+
+### R-067 — fsck counted a btree-format fork's own blocks as leaked {#r-067}
+
+**FIXED 2026-09-06.** The block census in `scan_inode_blocks` claimed every
+extent an inode maps but, for a `di_format` of btree, not the bmap-btree
+nodes and leaves that hold those extents, so they were left unowned and
+reported as `UnaccountedBlocks` (four of them for the 913-extent
+directory the deep churn produced on 256 MiB) while `xfs_repair -n` was
+silent. The R2 freespace rebuild already walked them (`mark_inode_blocks`);
+the census now does the same through `collect_bmbt_blocks`. Found by
+`churn.xfs-deep` once F-018 let the directory reach the inline extent cap.
+
+### R-066 — `sb_fdblocks` omitted the free-space btrees' own blocks {#r-066}
+
+**FIXED 2026-09-06.** `resync_sb_fdblocks`, which every allocation and free
+runs, summed `agf_freeblks + agf_flcount` over the AGs. The kernel's
+`xfs_initialize_perag_data` also adds `agf_btreeblks`, the blocks the
+bnobt and cntbt occupy beyond their root, because those are carved from
+the free pool and stay counted as free in the superblock. On the small
+churn volumes both trees fit their roots and the term was zero; after
+200000 files on a 1 GiB volume the fragmented free space had grown ten
+btree blocks and `xfs_repair -n` reported `sb_fdblocks 232894, counted
+232904` on a volume that was otherwise clean (the four-block gap seen
+after F-018's failure was the same term). The AGF parser now carries
+`btreeblks` and the resync adds it.
+
+### R-065 — v5 CRC headers in AG 1 and beyond carried the wrong `blkno` {#r-065}
+
+**FIXED 2026-09-06.** An XFS fsblock number is `agno << sb_agblklog | agbno`,
+and `sb_agblklog` rounds the AG size up to a power of two, so the encoding
+has gaps unless `sb_agblocks` is itself a power of two. `fsblock_to_daddr`
+shifted that raw number by `blocklog - 9` to produce the disk address it
+stamps into every v5 CRC header (`xfs_dir3_blk_hdr`, `xfs_da3_blkinfo`,
+bmbt blocks, inode cores are unaffected, they carry the inode number). On
+the 32 MiB volumes the churn had used, 2048-block AGs made the two agree; on
+a 96 MiB volume with 6144-block AGs, every directory block placed in AG 1
+or later was stamped 2048 blocks too far, and `xfs_repair -n` reported
+"Metadata corruption detected at xfs_dir3_data block" for each of them
+while `rb-cli fsck`, which does not check `blkno`, saw nothing. The helper
+now mirrors `XFS_FSB_TO_DADDR` (`agno * sb_agblocks + agbno`, then the
+shift); the AG-relative btree stamper already computed the physical block
+itself and no longer round-trips it through the helper. Found by the
+long-name directory churn under the Docker oracle while shipping F-017's
+incremental writer.
+
+### R-064 — a v5 XFS leaf-form directory failed `xfs_repair` on three counts {#r-064}
+
+**FIXED 2026-09-06.** Found under the Docker `xfs_repair 4.9.0` oracle
+while shipping F-017, on the directory that R-063's fix let grow to 126
+entries; `rb-cli fsck` saw none of it, since it lists data blocks and never
+reads the index, and `xfs_repair -n` is the judge that matters for XFS.
+The block-to-leaf conversion put the leaf1 index at file offset
+2^32 / blocksize, where `XFS_DIR2_LEAF_OFFSET` is `XFS_DIR2_SPACE_SIZE` =
+`1 << (32 + XFS_DIR2_DATA_ALIGN_LOG)` = 2^35 (each dir2 address space is
+32 GiB, not 4 GiB), so the reader's walk cap and the checker disagreed
+about which block was the index. The leaf1 block packed its entries from
+byte 60, where the v5 `xfs_dir3_leaf_hdr` pads to 64, and wrote the
+`bests` array flush against the end of the block with no `bestcount`
+tail, so the checker read a bestcount in the hundreds of millions and
+declared the block corrupt ("bad CRC" in 4.9.0's wording; the checksum
+itself was right). Short-form offset cookies on a v5 volume were based on
+the 16-byte v4 data header where the dir3 header is 64 bytes. The leaf
+offset, the leaf1 layout (`build_leaf1_block`) and the cookie base now
+follow `xfs_da_format.h`, and the reader's cap moved with the offset.
+
+### R-063 — a thousand-file XFS directory loses most of its entries {#r-063}
+
+**FIXED 2026-09-06.** Not the leaf form: the 21st entry converts a
+short-form directory to a single block correctly, and the 22nd insert
+rebuilds that block from what `block_entries_with_ftype` reads back --
+which on a v5 volume started parsing at the 16-byte dir2 header instead of
+the 64-byte dir3 one, found no entries, and wrote a block holding only the
+new name. Every insert from then on kept one entry; the directory lost
+its contents one file at a time, which is why `fsck` counted 999 orphans.
+The gatherer, the shrink-to-short-form rewriter and the block remover now
+pick the header by the block's magic, as the reader always did. A
+directory takes 125 entries before it converts to leaf form, where
+inserts and removes are still unimplemented (F-017). Found by
+`churn.xfs` on a 32 MiB `new volume xfs`: after `untar`
+puts 1000 files into one directory, `rb-cli fsck` counts 1002 files yet
+reports 999 `OrphanInode` errors ("allocated but unreachable from the root
+directory"), and `ls` of the directory lists a single file. The inodes and
+data were written; the directory itself, once it outgrew the short-form
+and block-form layouts, was not (or is not read back) — the leaf / node
+directory formats are the suspect on both sides. Small directories are
+unaffected (`edit.xfs.put-get`).
+
+### R-060 — a blank classic HFS volume gets a four-block catalog whatever its size {#r-060}
+
+**FIXED 2026-09-05.** Found by the new unit test
+`thousand_file_churn_keeps_the_catalog_clean`, which creates 1000 files on
+a 64 MiB `create_blank_hfs` volume: the 94th `create_file` failed with
+`disk full: no free B-tree nodes`.
+
+`build_blank_hfs_front` treated a zero catalog / extents request as "4
+allocation blocks" (16 KiB at 4 KiB blocks, 32 catalog nodes; 2 KiB at
+512-byte blocks). `new volume hfs` never noticed because
+`cli::api::hfs::cmd_new` passes `default_btree_sizes` (0.5 % of the volume,
+hformat's rule) explicitly; `rb-cli batch`'s `format` op and every
+`create_blank_hfs` caller took the stub. Mac OS would extend the catalog
+file on demand; rb-cli's classic HFS writer cannot, so such a volume simply
+stops taking files. A zero request now means the volume-scaled default,
+and callers that ask for a size still get it (4-block floor).
+
+## Found during the 2026-09-01 audit, leg 3 (macOS), 2026-09-05
+
+The macOS leg's three findings, each with the cause the fix rests on. No
+removable hardware was attached during the run, so the hardware halves of
+R-051 and R-053 (an SD card's lock switch, the USB floppy drive) stay open;
+both fixes were exercised against `hdiutil`-attached raw images instead.
+
+### R-051 — a write-protected card is treated as a privilege problem (audit R6) {#r-051}
+
+**FIXED 2026-09-05** (`fix(macos): write-protected media opens read-only
+instead of prompting (R6)`). Kept for the reproduction.
+
+On macOS a removable disk's device node belongs to the console user, so
+`open_source_for_reading` tries a direct open first: `O_RDWR`, then
+`O_RDONLY`, but only after `EBUSY`. Write-protected media refuses `O_RDWR`
+with `EACCES` for every caller, root included (IOMediaBSDClient answers
+that for a non-writable IOMedia). The probe took the `EACCES` for a
+permission failure, skipped the read-only attempt and escalated through
+`authopen` read-write; authopen prompted, its own root open failed the same
+way, and the fallback from 63e8d3f prompted a second time read-only. The
+write path prompted too and then printed the "run with sudo" hint.
+
+Reproduction without a card: `hdiutil attach -readonly -nomount` a raw
+image, then as the unprivileged user `open(O_RDWR)` is `EACCES`,
+`open(O_RDONLY)` succeeds and `DKIOCISWRITABLE` answers 0.
+
+The probe now always tries `O_RDONLY` after `O_RDWR`; a read-only success
+is logged as write-protected media when `DKIOCISWRITABLE` says so, else as
+"a restore will ask for administrator rights". When both direct opens fail,
+DiskArbitration's `MediaWritable` picks the escalation mode, so a locked
+card is escalated read-only in one prompt. `open_target_for_writing` refuses
+write-protected media before unmounting anything. `rb-cli backup /dev/disk7`
+against the read-only image now logs `is write-protected ... opened
+read-only` and raises no dialog.
+
+### R-052 — a cancelled authorization dialog is reported as a failure (audit R11) {#r-052}
+
+**FIXED 2026-09-05** (`fix(macos): a cancelled authorization dialog is
+reported as cancelled (R11)`). Kept for the protocol, which is otherwise
+undocumented; the full notes are the module header of `src/os/macos.rs`.
+
+`open_device` looked for "cancelled" in our own error text, which never
+said so. What authopen does with `-stdoutpipe`, read from its disassembly
+on macOS 26: one `sendmsg` of two data bytes; on success the descriptor is
+attached as `SCM_RIGHTS`, on failure there is no control message and byte
+1 is the errno of whichever open failed. The authorization status is
+mapped through a table: `errAuthorizationCanceled` becomes `ECANCELED`,
+`errAuthorizationDenied` and `InteractionNotAllowed` become `EACCES`. Our
+receiver read one byte, found no `SCM_RIGHTS` and said "no ancillary
+control message (authopen may have failed)"; a cancel then fell through to
+the direct-open fallback and, on the read path, to a second read-only
+prompt for a dialog the user had just closed.
+
+The receiver reads both bytes, the helper's stderr is piped and drained
+after it exits (`AuthorizationCopyRights failed: ...` against
+`couldn't open <path>: ...` tells the two `EACCES` cases apart), and the
+refusal is a typed `AuthopenRefused`. `is_authorization_cancelled` sees it
+through any context layer; `open_device` stops there and the read path's
+read-only retry is skipped after a cancel. Unit tests cover the decode; the
+live cancel on this machine is pending the user, since raising the dialog
+unattended was not an option during the run.
+
+### R-068 — the CLI never elevates for a raw device {#r-068}
+
+**FIXED 2026-09-08** (`fix(cli): a raw device opens through the platform's
+elevation path`). Found while trying to run the R-053 floppy check below.
+
+`rb-cli inspect /dev/rdisk5` on an unprivileged shell answered
+
+```
+error: open /dev/rdisk5: Permission denied (os error 13)
+```
+
+and stopped. `open_source_for_reading` — the function that escalates through
+`authopen`, recognises write-protected media (R-051) and a cancelled dialog
+(R-052) — had four callers, all of them in `src/gui/` or `src/backup/`. The
+CLI's two device sites in `src/model/source_reader.rs` (`open_read` and
+`open_peeled_read_with_entry`) both reached the device with a plain
+`File::open`, so on macOS, where privilege is escalated per operation and
+never inherited by the process, the CLI could only ever touch a raw device
+under `sudo`. The comment on `device_open_error` recorded the assumption that
+broke: "macOS never reaches here: it escalates per operation through
+`authopen`" — true of the GUI, false of the CLI.
+
+Both sites now call `open_source_for_reading` and wrap its handle in a
+`GuardedReader`, which holds the `TempFileGuard` — and so the macOS disk claim
+— alive for exactly as long as the reader. The device check also moved *above*
+the `File::open` that used to precede it, which is what actually raised the
+error. On Linux and Windows the same call adds the elevation hint
+`device_open_error` already wrote and, on Windows, the raw-device open flags;
+the generic branch now routes its error through `device_open_error` too.
+
+This is why the R-053 floppy confirmation never ran on 2026-09-05: the
+documented reproduction command cannot work unprivileged on macOS.
+
+### R-053 — a raw device fails a large read that dd serves in sectors (audit R19) {#r-053}
+
+**FIXED 2026-09-05** (`fix(os): a raw device reads sector by sector once it
+refuses a larger read (R19)`). Kept for the reproduction; confirmation on
+the USB floppy drive is pending.
+
+Carried over from an earlier session: `rb-cli inspect /dev/rdiskN` on a
+USB floppy drive failed with EIO reading sector 0, while `dd bs=512` read
+the same disk. Two suspects were on the table, `F_NOCACHE` on the handle
+and the size of the first read.
+
+What the CLI did: `open_peeled_read_with_entry` ended a device path in a
+plain `BufReader<File>`, so the device saw 8 KiB reads at whatever offset
+the filesystem asked for, with no sector alignment, and `seek(End)`
+answered 0, which is why `inspect` printed every device as 0 B. Reproduced
+here on an hdiutil-attached raw image: `size 0 B`, `"size_bytes": 0`.
+`F_NOCACHE` is never set on that path, so it is not the cause on the CLI;
+the read size is what differs from dd.
+
+Both CLI device paths now go through `known_len_reader`, which is
+`SectorAlignedReader` over `KnownLen`, and `SectorAlignedReader` learns
+the device's limit: a multi-sector read that fails is retried as one
+sector; if that reads, the reader stays at one sector per read and logs
+it once; if it fails too, the original error comes back, so a bad block is
+still reported at its position. Unit tests model a 512-byte-limit device
+and a bad sector. `open_for_inspect` / `open_device_for_inspect` had no
+callers and are gone.
+
+### R-054 — a deleted first record leaves the parent's separator behind {#r-054}
+
+**FIXED 2026-09-05** (`fix(hfs): a leaf's parent separator follows its
+first record (R-054)`). Found by the macOS verification below; kept for
+the reproduction.
+
+`fsck_hfs -n` on the H1 volume (1500 files, 200 deleted from the middle,
+re-added) said `Invalid index key (4, 57)`; on the H3 volume the same for
+nine leaves. Apple's rule (`SVerify2.c`, E_IKey) is that an index record's
+key equals the first key of the child it points at, compared with the
+tree's own comparator. Ours pointed at leaf 57 with key `(685, "")`, the
+thread record the leaf began with before the delete; its first record was
+now `(715, "")`. A separator that merely sorts below the child still finds
+every record, which is why the kernel driver read all 1500 files back and
+our fsck, which only checked ordering, saw nothing.
+
+`remove_catalog_record` in both drivers, HFS+'s extents-overflow and
+attributes removals, and classic HFS's overflow removal now call
+`btree_refresh_index_keys` when record 0 of a non-empty node went: the
+parent is found by scanning (its separator cannot be trusted to lead
+there), the record is rewritten with the child's first key, and the walk
+continues upward while the node it just fixed was itself its parent's
+first child. A freed leaf takes the same route through
+`btree_detach_freed_node_and_refresh`. Classic HFS only escaped because its
+512-byte leaves empty so often that the full index rebuild ran anyway.
+Both fscks now report `IndexKeyMismatch` for a separator that is not the
+child's first key; the classic one still calls a separator that sorts
+above it `KeysOutOfOrder`.
+
+### R-055 — an emptied HFS+ overflow leaf stays behind as an empty root {#r-055}
+
+**FIXED 2026-09-05** (`fix(hfsplus): an emptied extents or attributes
+leaf leaves the tree (R-055)`). Found by the H3 check; kept for the
+reproduction.
+
+H3 fills an 8 MiB HFS+ volume, frees every other file and adds one whose
+1 MB resource fork has to spread over the holes: 16 extents, eight inline
+and eight in one extents-overflow record. `rb-cli rm` of that file freed
+the record and left the tree's only leaf allocated with zero records,
+still the root at depth 1. `fsck_hfs -n` reports `Invalid node structure
+(3, 1)` and stops: Apple's `BTKeyChk` rejects a leaf with no records
+unless it has siblings, because Apple's own delete retires the tree
+(depth 0, no root, node returned to the map) when the last record goes.
+Classic HFS already did that; the HFS+ extents-overflow and attributes
+removals only subtracted the record.
+
+Both now go through `btree_retire_empty_leaf`: the emptied leaf leaves
+the sibling chain and the header's first/last pointers, its node is
+freed, its separator dropped, and a root that emptied is retired. The
+second run then drew `Unused node is not erased (node = 1)`: Apple zeroes
+a node when it frees it, so `btree_free_node` now erases what it frees,
+for every tree in both drivers. Both fscks report
+`EmptyLeafWithoutSiblings` for a lone empty leaf and `FreeNodeNotErased`
+for a free node that still holds data.
+
+### R-056 — an in-place HFS+ grow leaves the bitmap and allocation file behind {#r-056}
+
+**FIXED 2026-09-05** (`fix(hfsplus): an in-place resize moves the
+alternate header's blocks and grows the allocation file (R-056)`). Found
+by the H7 check; kept for the reproduction. The NTFS twin is R-044.
+
+`rb-cli resize` of a 24 MiB HFS+ volume to its 30 MiB APM partition,
+then `fsck_hfs -n`:
+
+```
+Volume bitmap needs minor repair for orphaned blocks
+Volume bitmap needs repair for under-allocation
+```
+
+`resize_hfsplus_in_place` rewrote `totalBlocks` and `freeBlocks` and the
+two headers, and touched nothing else. The formatter marks the block(s)
+holding the alternate volume header as used, so after the grow block 6143
+(the old tail) stayed marked with nothing at it and block 7679 (the new
+tail, now holding the header) read free: exactly Apple's two messages.
+Our own fsck compared the *count* of set bits with `total - free`, which
+still matched, because the grow had computed `free` from the same stale
+count. A larger grow would also have run past the allocation file, which
+was never extended.
+
+The resize now reads the allocation file, clears the old tail and the
+padding past the old end, extends the file in place when the blocks after
+it are free and moves it to a free run otherwise, marks the new tail,
+recounts `freeBlocks` from the bits, clamps `nextAllocation`, and writes
+the file and both headers. A shrink refuses when the last used block
+would be cut off. The HFS+ fsck now checks that the blocks holding the
+alternate header are marked (`AlternateHeaderBlockFree`), which is the
+position check the count could not give.
+
+**The shrink half, judged 2026-09-05:** a 24 MiB HFS+ partition holding
+four 1 MB files at its tail (twenty put, the first sixteen removed), backed
+up with `rb-cli backup` and restored with `--size minimum`, comes back as a
+19.3 MiB partition (the trim point from `last_data_byte`) that `fsck_hfs -n`
+calls OK; `partmap resize` + `resize --size 24M` grow it back, and it is OK
+again.
+
+### R-057 — the alternate HFS+ header misses the partition end on the put and fill paths {#r-057}
+
+**FIXED 2026-09-05** (`fix(hfsplus): the alternate header reaches the
+partition end through put and new hd --fill (R-057)`). Found by the H7
+check; kept for the reproduction.
+
+H7's premise (9cb5383, leg 1) is that Mac OS reads the alternate volume
+header 1024 bytes before the *partition* end. `rb-cli put img@1` on a
+24 MiB HFS+ volume in a 30 MiB APM partition left sector 61438 all zeros
+and `fsck_hfs -n` said `Volume header needs minor repair`; so did the
+freshly filled disk before any edit. Copying the primary header there by
+hand made the same volume `appear to be OK`, so the placement is all Mac
+OS asks of a volume smaller than its partition.
+
+Two causes. `open_editable_filesystem_by_string` resolved `Apple_HFS`,
+the string form `"hfsplus"` and MBR type `0xAF` through
+`HfsPlusFilesystem::open`, which has no partition length, so the sync
+fell back to the volume end; only `Apple_HFSX` used `open_sized`. All
+four now pass the length (none when the volume is wrapped, where the
+fallback is exact). And `new hd --fill` copied the image and stopped;
+the provisioner now fits an Apple volume to its partition after the
+pour: an HFS+ header is mirrored at the partition end, a classic HFS
+volume is grown (R-058).
+
+### R-058 — a classic HFS volume that does not fill its partition cannot pass Disk First Aid {#r-058}
+
+**FIXED 2026-09-05** for the `--fill` path (same commit as R-057);
+documented for the rest. Found by the H7 check.
+
+A 24 MiB classic HFS volume poured into a 30 MiB APM partition, alternate
+MDB dutifully written at the partition end: `fsck_hfs -n` reports
+`Invalid allocation block start (4294967295, 61438)`, whether or not the
+volume was edited afterwards; the same volume in a 24 MiB partition, or
+bare, is clean. Mac OS reads the alternate MDB two sectors before the
+partition end *and* expects the allocation area to end there
+(`drAlBlSt + drNmAlBlks * blocks per allocation block` = that sector).
+Header placement alone cannot satisfy both, so a classic HFS volume has
+to fill its partition, which is how Mac OS formats one.
+
+`new hd --fill` now grows a classic HFS volume to its partition through
+`resize_hfs_in_place` when the fixed-size volume bitmap has bits to
+spare, and otherwise says so: the bitmap sits in fixed sectors before the
+first allocation block, so a 24 MiB volume formatted at 512-byte blocks
+has exactly 24 MiB of bits and cannot grow at all. The fix for that case
+is to format the volume at the partition size. Editing such a volume in
+place still writes the alternate MDB where Mac OS looks (H7), which is
+right but not sufficient.
+**The rest of it, 2026-09-05:** `rb-cli fsck` applies the check `fsck_hfs`
+does (`AllocationAreaEnd`): with the partition length known, the
+allocation area must end at the partition's next-to-last sector, and the
+error names the shortfall and `resize`.
+ `rb-cli resize IMG@N --size` does
+reach `resize_hfs_in_place` and grows the volume when its bitmap has room;
+when it has not, the refusal now says how far the volume can grow and that
+one formatted at the partition size is the fix. An editable open of a
+classic HFS volume smaller than its partition logs one warning naming
+`resize`.
+
+### R-059 — an in-place classic HFS grow runs the allocation area over the alternate MDB {#r-059}
+
+**FIXED 2026-09-05** (same commit as R-057). Found while making
+`new hd --fill` grow a poured classic HFS volume (R-058).
+
+`resize_hfs_in_place` took the new block count as
+`(new size - first allocation sector * 512) / block size`, so a grown
+volume's allocation blocks reached the partition's last sector: the
+alternate MDB it then wrote 1024 bytes before the end landed inside the
+last allocation block(s), and the sector Mac OS keeps unused after it was
+an allocation block too. Any file that later took those blocks would
+overwrite the alternate MDB; Disk First Aid reports the layout as an
+invalid allocation block start. The block count now stops 1024 bytes
+short, matching how the formatter lays a volume out, and the volume
+bitmap bits for the grown range are cleared rather than trusted.
+
+### macOS verification of the HFS / HFS+ / MFS fixes
+
+The audit's macOS leg lets Mac OS judge the HFS-family fixes from
+2026-09-01/02: images rb-cli formats and edits, attached with `hdiutil`,
+checked with `fsck_hfs -n` and read back through the kernel's HFS+ driver.
+The driver is `scripts/verify-fs-macos.sh`; `-o` narrows it to one block.
+The second judge, added 2026-09-05, is Disk First Aid 7.2 on System 7.1
+inside the Snow emulator (a headless Macintosh II driven by
+`scripts/verify-hfs-snow.sh leg3 -w DIR` over the same work directory); it
+judges classic HFS only, since Disk First Aid 7.x does not know HFS+ and
+the Mac OS 8.1 that does needs a 68040. Its verdict frames are the small
+PNGs under `docs/evidence/`.
+
+| ID | Fix | Check | Result (`fsck_hfs -n`) | Disk First Aid (System 7.1 in Snow) |
+|----|-----|-------|--------|--------|
+| H1 / H2 / H4 / H9 / H11 | ee07cf4, B-tree index consistency, first-child descent, bounds, clamped dates | 1500 files imported, 200 deleted from the middle and re-added; `fsck_hfs -n`; every file read back through the kernel HFS+ driver (classic HFS through `rb-cli get`, since macOS no longer mounts it) | HFS+: run 1 `Invalid index key (4, 57)`, which found R-054; **PASS** (run 2), 1500 of 1500 identical. HFS: **PASS** (run 1) | HFS: **PASS**, "The volume H1hfs appears to be OK." (`docs/evidence/dfa-h1-hfs.png`); the Finder finds and TeachText opens f0550.txt (a re-added file) and f1500.txt (`docs/evidence/finder-h1-f1500.png`). HFS+: out of scope |
+| H3 | 67ab9f2, deleting a spilled resource fork frees the overflow extents | 8 MiB volume filled, every other file removed, a 1 MB resource fork spread over the holes (one overflow record), `rb-cli rm`, `fsck_hfs -n` before and after | HFS+: run 1 clean before and `Invalid node structure (3, 1)` after, which found R-055; run 2 `Unused node is not erased`, same fix; **PASS** (run 3), overflow records 1 -> 0. HFS: run 1 **not reproducible**, the writer allocated a fork contiguously and refused the fragmented one (F-011, shipped 2026-09-05); **PASS** (run 2) before and after, overflow records 5 -> 0 | HFS: **PASS** before and after the delete, "The volume H3hfs appears to be OK." both times (`docs/evidence/dfa-h3-hfs-before.png`, `dfa-h3-hfs-after.png`). HFS+: out of scope |
+| H3-real | 67ab9f2 again, against a fork a real Mac fragmented | the H3 classic-HFS volume (63 holes of 64 KiB) over SCSI; the System 7.1 Finder copies a 1 MB file onto it, so Mac OS's own File Manager spreads the fork and writes the overflow records; `rb-cli rm` deletes it; `fsck_hfs -n` and Disk First Aid before and after (`scripts/verify-hfs-snow.sh h3-real`) | **PASS**: Mac OS wrote 5 overflow records, 0 after the delete, "appears to be OK" before and after | **PASS** before and after (`docs/evidence/dfa-h3-real-before.png`, `dfa-h3-real-after.png`; the copy in `finder-h3-real-copy.png`) |
+| H5 | 3a53254, key order across leaves and index separators | `rb-cli fsck` on the H1 / H3 volumes and on an `hdiutil create` HFS+ volume that macOS filled with 1500 files and 200 replacements | **PASS**: no "keys out of order" anywhere; the macOS-made volume checks clean at 1503 files / 4 dirs | out of scope (HFS+) |
+| H6 | a1f7558, MFS fork lengths in whole allocation blocks | `new floppy mfs`, three files put, one removed, one added, `rb-cli fsck` | image built and clean by our own fsck (macOS cannot mount MFS; see the next column) | Disk First Aid declines MFS: "This is not an HFS disk." (`docs/evidence/dfa-h6-mfs.png`), so the check is the Finder: it mounts the floppy, copies all three root files to the boot disk byte-identical with `rb-cli get` (`docs/evidence/finder-h6-copy.png`), and TeachText opens f0001.txt. **PASS** |
+| H7 | 9cb5383, alternate header at the partition end | a volume poured into a larger APM partition, edited with `put`, then grown; `fsck_hfs -n` on the slice | HFS+: run 1 `Volume header needs minor repair` before the grow (R-057) and bitmap orphaned / under-allocation after it (R-056); **PASS** (run 3) before and after. HFS: run 1 `Invalid allocation block start` (R-058, R-059); **PASS** (run 2) with a volume whose bitmap has room, which the fill grows to the partition | HFS: **PASS** on the APM disk once `mac-scsi-bless` gave it a driver, "The volume H7hfs appears to be OK." (`docs/evidence/dfa-h7-hfs.png`); the unformatted second partition draws "This is not a Macintosh disk", cancelled by the script. HFS+: out of scope |
+| Section 5 of `docs/RESUME-hfs-snow.md` | B-tree header attributes | our HFS+ trees carried `attributes = 0`; Apple writes `kBTBigKeysMask \| kBTVariableIndexKeysMask` (6) on the catalog and attributes trees and `kBTBigKeysMask` (2) on the extents tree. `write_blank_btree_header_node` (blank volumes and the defragmenting clone) now does the same; H1 / H3 / H5 / H7-hfsplus re-run | **PASS** (2026-09-05): `fsck_hfs -n` clean on all, 1500 of 1500 files identical through the kernel driver; the bits read back 2 / 6 / 6 | out of scope (HFS+) |
+| Section 7 of `docs/RESUME-hfs-snow.md` | a real-Mac-formatted volume edited by rb-cli | the System 7.1 Finder initializes a blank 5 MiB Apple_HFS partition inside Snow (`scripts/verify-hfs-snow.sh mac-formatted`); rb-cli then `put`s a text file and a binary, `mkdir`s, `mv`s, `rm`s, `setrsrc`s, and `put-binhex`es Disk First Aid; `rb-cli fsck`, `fsck_hfs -n`, Disk First Aid, and the Finder judge it | **PASS** (2026-09-05): `fsck_hfs -n` OK before and after the edits (Mac OS laid the volume out at 512-byte blocks, `drAlBlSt` 6, filling the partition, which our new `AllocationAreaEnd` check accepts) | **PASS**: "The volume snow71 appears to be OK." (`docs/evidence/dfa-mac-formatted.png`); TeachText shows the text file (`finder-mac-formatted-hi.png`) and the Finder launches the rb-cli-written Disk First Aid from that volume, resource fork intact (`finder-mac-formatted-dfa-launch.png`) |
+| H12 | the 1000-file churn with the OS taking the middle turn | rb-cli imports 1000 files; the OS adds one file, deletes it, deletes the 1000; rb-cli adds one more; `fsck_hfs -n` and `rb-cli fsck` after every turn. HFS+: macOS's kernel driver through a read-write mount (`verify-fs-macos.sh -o H12-hfsplus`). Classic HFS: the System 7.1 Finder in Snow, ending with Shut Down so the MDB is flushed (`verify-hfs-snow.sh os-churn`) | HFS+: **PASS** (2026-09-05), OK after each of the three turns, the last file reads back through the kernel driver. HFS: **PASS** after the Finder's turn and after rb-cli's put | HFS: **PASS** both times (`docs/evidence/dfa-h12-finder.png`, `dfa-h12-after.png`). A first run judged the volume before Mac OS had flushed its MDB and drew "needs to be repaired" with stale counts; that frame is the `scripts/snow/dfa-problem.pbm` reference. The same churn with rb-cli alone runs on every filesystem that can hold it: `regression-tests/cases/tier3/churn.toml` (it found R-060 .. R-067 and F-012 .. F-018) |
+| R6 | 5f1fd54, write-protected media | `hdiutil attach -readonly` raw image, `rb-cli backup /dev/diskN` | **PASS**: logs "is write-protected ... opened read-only", raises no prompt. A card's lock switch is pending hardware | - |
+| R11 | f2edc77, cancelled dialog | unit tests on the decoded two-byte reply | a live cancel is pending the user (no dialog was raised unattended) | - |
+| R19 | 0093c49, raw-device reads | raw hdiutil device through `rb-cli inspect`: 0 B before, the real size after; unit tests on a device that refuses large reads | the USB floppy drive itself is pending hardware | - |
+| Section 3 | 63e8d3f, read-only fallback after a refused read-write escalation | needs a card mounted while Inspect opens it | pending hardware | - |
+| Section 5 | build sanity | `cargo test --no-run` with no `target/` at all | 152 s wall, 2.35 GB largest resident set, 62 MB lib-test binary; noted in `docs/build-memory-crashes.md` | - |
+
+## Found during the 2026-09-01 audit, leg 2 (Windows), 2026-09-02
+
+Both turned up while preparing the Windows verification of the NTFS fixes
+below: every image the check needed came out of `rb-cli` with its own fsck
+already complaining.
+
+### R-044 — an in-place NTFS grow leaves `$Bitmap` behind {#r-044}
+
+**FIXED 2026-09-02** (`fix(ntfs): an in-place resize keeps $Bitmap in step
+with the volume`). Kept for the reproduction.
+
+`resize_ntfs_in_place` patched TotalSectors and rewrote the backup boot sector
+in the partition's last sector and did nothing else. The formatter marks the
+cluster that holds the backup boot sector as allocated so the allocator stays
+off it; after a grow that cluster sits inside the volume, owned by nothing,
+and the bitmap is too short to address the clusters the volume gained.
+
+Reproduction, before the fix:
+
+```
+rb-cli new volume ntfs n.img --size 64M
+rb-cli resize n.img --size 70M
+rb-cli fsck --checkonly n.img
+  ERROR  [BitmapLeaked] 1 cluster(s) marked allocated in $Bitmap but referenced by nothing
+```
+
+Same result at 512-byte and 4 KiB clusters, for a grow of one cluster, and
+for a `restore` whose Original size policy grows the filesystem into a
+larger partition. The resize now rewrites `$Bitmap`: the clusters the volume
+gained are cleared, everything past the new end is marked, and when the
+bitmap outgrows its clusters it moves to a fresh first-fit run and the old
+one is released. Unit test `resize_keeps_the_volume_bitmap_in_step`; the
+e2e grow test runs fsck.
+
+### R-045 — no NTFS volume can be shrunk in place {#r-045}
+
+**FIXED 2026-09-02** (`fix(ntfs): the trim point no longer pins every
+in-place shrink to the volume size`). Kept for the reproduction.
+
+`NtfsFilesystem::last_data_byte` returned the larger of the data end and the
+backup boot sector's position, and the latter is the volume size by
+definition. `rb-cli resize --confirm-shrink`, the restore Minimum policy and
+the GUI's in-place minimum all consult it, so every NTFS shrink was refused
+as cutting live data:
+
+```
+rb-cli resize n.img --size 48M --confirm-shrink
+error: refusing to shrink NTFS to 48.0 MiB: its data extends to 64.0 MiB ...
+```
+
+The scan behind it also treated the formatter's end-of-volume mark as data,
+which is what `resize_ntfs_in_place`'s own guard tripped on. The trim point
+is now the last used cluster plus the one sector the resize rewrites the
+backup boot sector into, and both scans stop at the cluster count. Unit test
+`trim_point_leaves_room_to_shrink`.
+
+### R-046 — a renamed NTFS entry's new name reuses attribute instance 0 {#r-046}
+
+**FIXED 2026-09-02** (`fix(ntfs): a renamed entry's new name gets its own
+attribute instance id`). Kept for the reproduction.
+
+Found by the Windows verification of D12 (251b211). Windows formatted a
+VHD and wrote `ThisIsALongFileName_for_D12.txt`; `rb-cli mv` renamed it;
+our fsck was clean; Windows `chkdsk` said:
+
+```
+Attribute record (30, "") from file record segment 26 is corrupt.
+```
+
+Record 0x26 is the renamed file. Its new `$FILE_NAME` carried instance id 0,
+the id `$STANDARD_INFORMATION` already holds, and the record's next-instance
+counter was never bumped. The attribute now takes the counter's value and
+the counter moves on; the rename unit test asserts every instance in the
+record is unique and below the counter. Our own fsck does not check
+instance ids, which is why it passed.
+
+### R-047 — a resized `$Bitmap` is not sized the way Windows keeps it {#r-047}
+
+**FIXED 2026-09-02** (`fix(ntfs): a resized $Bitmap is sized in whole
+quadwords, as Windows keeps it`). Kept for the reproduction.
+
+Found by the Windows verification of D2: a Windows-formatted NTFS volume,
+backed up, restored into a 66 MiB partition (the restore grows the
+filesystem to the partition) and attached; `chkdsk` ended with
+`The Volume Bitmap is incorrect` while our fsck was clean. R-044's resize
+sized `$Bitmap` at ceil(clusters / 8) bytes. Windows sizes it at
+ceil(clusters / 64) quadwords with every bit past the cluster count set:
+the Windows-made volume has 16111 clusters and a 2016-byte bitmap, the
+restored one 16888 clusters and our 2111 bytes where Windows wants 2112.
+The D10 grow through the same code passed only because 30719 clusters lands
+on a quadword. Quadword rule now; the unit test asserts it.
+
+### R-048 — a renamed entry's index entry disagrees with its record {#r-048}
+
+**FIXED 2026-09-02** (`fix(ntfs): a renamed entry's index entry carries the
+live times and true sizes`). Kept for the reproduction.
+
+The second `chkdsk` complaint behind D12, once R-046 had cleared the first:
+
+```
+Minor file name errors were detected in file 26.
+Index entry Renamed_After_D12_Fix.txt in index $I30 of file 5 is incorrect.
+```
+
+Both `$FILE_NAME` copies (record and `$I30` entry) were built from the old
+name's four creation timestamps and from the byte count alone, so the
+11-byte resident file carried allocated size 11. chkdsk holds the index
+entry to the record's `$STANDARD_INFORMATION` times and to the data
+attribute's real and allocated sizes: quadword-rounded for resident data
+(Windows' own entry for a 16-byte file says 16 / 16), cluster-rounded for
+non-resident. The rename now reads both from the record; the shared name
+builder rounds the allocated size for resident data and `create_file`
+overrides it with the cluster-rounded size for non-resident data.
+
+### R-049 — a long name is written as a lone Win32-namespace name {#r-049}
+
+**FIXED 2026-09-02** (`fix(ntfs): a long name gets the POSIX namespace,
+never a lone Win32 one`). Kept for the reproduction.
+
+The third `chkdsk` complaint behind D12, after R-046 and R-048: with the
+renamed record's instance ids, timestamps and sizes all in order, `chkdsk`
+still said `Minor file name errors were detected in file 26` and called the
+`$I30` entry incorrect. The `$FILE_NAME` builder wrote namespace 1 (Win32)
+for any name that is not a valid 8.3 name. NTFS allows a Win32 name only
+beside a DOS-namespace alias; a file with one name uses Win32-and-DOS (3)
+when the name fits 8.3 and POSIX (0) otherwise, which is exactly what
+Windows wrote on the same volume with 8.3 creation off. The builder now
+follows that rule. It serves `create_file` as well, so every long name
+`put` had written to NTFS carried the same flaw.
+
+### R-050 — an assembled MFT record undercounts its end marker {#r-050}
+
+**FIXED 2026-09-03** (`fix(ntfs): an assembled MFT record counts its end
+marker as eight bytes`). Kept for the reproduction.
+
+The fourth Windows run of D12 added two `rb-cli put` files and one `mkdir`
+to the Windows-formatted volume. The rename checks were clean by then, and
+`chkdsk` reported instead:
+
+```
+First free byte offset corrected in file record segment 28.
+First free byte offset corrected in file record segment 29.
+First free byte offset corrected in file record segment 2A.
+```
+
+Those are the three created records. `assemble_mft_record` set the
+record's bytes-in-use to the end marker's offset plus four; Windows counts
+the marker as eight bytes (its own records show used = marker + 8), and
+chkdsk enforces it. Records rb-cli only edited kept the header Windows
+wrote and passed. Unit test creates a file and a directory and checks the
+header against the marker.
+
+### Windows verification of the 2026-09-01/02 filesystem fixes
+
+The audit's Windows leg lets Windows itself judge the NTFS / exFAT / FAT
+fixes: a VHD Windows formatted and wrote to, edited with `rb-cli`, attached
+again and checked with a read-only `chkdsk`. The driver is
+`scripts/verify-fs-windows.ps1`; it runs elevated because attaching a VHD
+does, and `-Only` narrows it to one block.
+
+| ID | Fix | Check | Result |
+|----|-----|-------|--------|
+| D12 | 251b211, NTFS rename replaces every name | Windows-written long name with a DOS alias, `rb-cli mv`, `chkdsk`, `dir /x` | **PASS** (run 5): alias gone, one name listed, chkdsk clean, with two long-named `put` files and a `mkdir` on the same volume. Runs 1-4 each faulted something, which found R-046, R-048, R-049 and R-050 in turn |
+| D8 | 9e083f5, delete respects hard links | `mklink /H` by Windows, `rb-cli rm` of one name, `chkdsk`, other name intact | **PASS** (run 5): the other name and its content intact, chkdsk clean |
+| D10 | 9e083f5, backup boot sector in the last sector | `partmap resize` + `resize`, backup sector compared, `chkdsk` | **PASS** (runs 1 and 2): backup sector at LBA start+TotalSectors matches, chkdsk clean, 30719 clusters |
+| D1 | e008eff, NoFatChain files survive edits | Windows-written 1 MiB file, `rb-cli mv`, hash compared | **PASS** (run 2): SHA-256 identical after the rename |
+| D5 | e008eff, contiguous delete frees the run | Windows-written file removed with `rb-cli rm`, `chkdsk` | **PASS** (run 2): chkdsk clean |
+| D7 | e008eff, resize past the bitmap keeps the up-case table | exFAT grown 64 -> 120 MiB, `chkdsk` | run 1: Windows mounted the result as RAW because the resize capped the volume below its partition; fixed in 4c4816c (FAT grows into the heap alignment gap). **PASS** (run 2): mounts as exFAT, chkdsk clean, 30672 clusters |
+| D9 | e5266da, directories grow the way Windows reads them | 400 long-named files put into a Windows-made directory, Explorer count | **PASS** (run 2): Explorer lists 405 of 405, the last file reads back |
+| D2 | 33115a8, NTFS boot code survives the hidden-sectors patch | Windows NTFS moved to LBA 63 and restored to LBA 2048, sector 6 compared, `chkdsk` | **PASS** (run 3): sectors 1-9 byte-identical to Windows' after the move to LBA 2048, hidden sectors patched, chkdsk clean. Run 2's chkdsk fault on the bitmap found R-047 |
+| D13 | eaa6f3d, Ghost reconstruction gets unique 8.3 aliases | needs a Ghost image of a FAT volume with prefix-sharing long names; every Ghost image at hand (repo fixtures, the NAS share, the RAR set, and JoeBackup's reachable partition) is 8.3-only | **shelved** 2026-09-03; the unit test `skip_name_checks_creates_still_get_unique_short_names` covers it, see F-010 and the open-work note |
+| R15 | b060025, letterless volumes are locked | VHD volume with its letter removed, `show devices`, `restore --device` onto its PhysicalDrive, `chkdsk` | **PASS** (run 1): PhysicalDrive4 listed with an empty mount point, `Locking and dismounting volume Volume{...}` logged, restore completed, chkdsk clean |
 
 ## Found while investigating a user report, 2026-08-17
 
@@ -2470,3 +3136,94 @@ remains is different from the one that got us here.
 is gone"; nothing was lost) and R-022 ("not byte-identical"; the backup was
 empty). Both had a one-command control that settled it. Reproduce and *measure*
 before fixing anything below.
+
+### R-043 — every edit verb refuses a dynamic VHD {#r-043}
+
+**FIXED 2026-09-01.** `DynamicVhdReader` already implemented allocate-on-write
+`Write`, and so did `VmdkSparseReader`; neither was reachable from a write
+verb. `src/model/source_reader.rs` gained `open_container_rw`, which classifies
+a path with the same `detect_image_format_with_path` the read side uses and
+returns *Plain* (raw, fixed VHD), *Handle* (dynamic VHD, sparse VMDK, QCOW2 —
+edited in place through the codec) or *ReadOnly* (2MG, DiskCopy 4.2, DMG,
+sparse image, DART, MOOF, flat VMDK, CD CHD — refused with a reason). The CLI
+`resolve_image_rw` and the GUI `BrowseSession::open_editable` both route
+their final branch through it, and `fsck_runner::run_repair` (the GUI's
+repair) does too, so the three cannot drift apart again. Round-trip tests for
+all four container shapes: `tests/cli_suite/cli_container_rw.rs`. The three
+tier-3 cases below now pass and are no longer in `known-failures.toml`.
+
+Found 2026-08-25 while authoring the tier-3 cases for the new
+fixtures. Three of them are dynamic VHDs, and not one accepted a write.
+
+The tool disagrees with itself, which is what makes it a defect rather than a
+missing capability: the same file that `ls` walks and `fsck` pronounces clean
+is rejected a moment later as a corrupt MBR.
+
+```
+rb-cli ls   part.next.ns33-intel.hd.vhd@1 /      -> lists the NeXTSTEP root
+rb-cli fsck part.next.ns33-intel.hd.vhd@1        -> 14476 files / 3037 dirs checked
+rb-cli put  part.next.ns33-intel.hd.vhd@1 p.bin /p.bin
+  -> error: detecting partition table: Invalid MBR: invalid boot signature:
+     expected 0xAA55, got 0x0000
+```
+
+**Root cause.** `open_rw` in `src/cli/resolve.rs` dispatches on container type
+and has explicit branches for SquashFS-in-ISO (refused), CHD, QCOW2, the
+read-only GCR/MSA/EDSK family (refused), and the editable floppy/gzip/WOZ
+containers (decoded to a temp flat). There is **no VHD branch**, so a VHD falls
+through to the final `else`, which opens the path as a plain file. A dynamic
+VHD begins with a *copy of its footer* — `conectix` — followed by the dynamic
+disk header and the BAT, so byte 510 is `0x00` and partition detection reports
+a bad boot signature.
+
+The QCOW2 branch immediately above carries a comment describing this exact
+failure for its own format:
+
+> Without this branch the raw `File` below would be handed to partition
+> detection, which reads the QCOW2 header as sector 0 and reports a bogus
+> "Invalid MBR".
+
+**Scope**, established by probe rather than assumed:
+
+| container | read | write |
+|-----------|:----:|:-----:|
+| raw `.img` | ok | ok |
+| QCOW2 | ok | ok |
+| CHD | ok | ok |
+| VHD, **fixed** | ok | ok |
+| VHD, **dynamic** | ok | **fails** |
+
+Filesystem-independent — reproduced on 4.3BSD UFS behind a NeXT label, on BFS
+behind an MBR, and on a plain FAT volume built for the purpose. Fixed VHD only
+works because it is raw data with a trailing footer, exactly as
+[F-008](missing_features_from_regression.md#f-008) noted when `backup` had the
+same blind spot.
+
+**Relationship to F-008.** Same root cause, different verb family. F-008 was
+`backup` reading container bytes as though they were the disk, and it shipped
+on 2026-08-15 by decoding the source to a scratch file first. The edit path
+was not part of that fix. A dynamic-VHD branch here would look like either the
+`ContainerEditSession` shape (decode to a temp flat, re-encode on commit) or a
+`Read + Write + Seek` VHD reader in the manner of `Qcow2Reader`.
+
+**Repro with no fixture:**
+
+```sh
+rb-cli new volume fat --size 16M v.img
+rb-cli convert v.img dyn   --format vhd-dynamic
+rb-cli convert v.img fixed --format vhd
+rb-cli put fixed/v.vhd payload.bin /p.bin   # ok
+rb-cli ls  dyn/v.vhd /                      # ok
+rb-cli put dyn/v.vhd payload.bin /p.bin     # Invalid MBR
+```
+
+**Cases:** `edit.new.next-ns33-intel-dynamic-vhd`,
+`edit.new.bfs-r5-dynamic-vhd`, `edit.new.dynamic-vhd-synthetic`. All three
+assert the intended behaviour; they were listed in `data/known-failures.toml`
+until the fix landed.
+
+**Secondary observation, not part of this finding.** A fixed VHD reports its
+volume as 512 bytes larger than the source image (`16777728` for a 16 MiB
+volume), i.e. the footer is counted as part of the filesystem. It did not stop
+the write and has not been chased.
+

@@ -136,6 +136,60 @@ fn cancelled_err() -> anyhow::Error {
     anyhow::anyhow!("export cancelled")
 }
 
+/// The directory part of an absolute entry path, "" for a top-level entry.
+fn parent_dir(path: &str) -> &str {
+    match path.trim_end_matches('/').rsplit_once('/') {
+        Some((dir, _)) => dir,
+        None => "",
+    }
+}
+
+/// The deepest directory containing every selected entry, "" at the volume root.
+///
+/// Selections are named relative to this, so picking several files out of one
+/// folder still yields bare names (what it always did) while a selection that
+/// spans folders keeps enough path to stay unique. Without it every root was
+/// named by `archive_name()` alone, so `/a/notes.txt` and `/b/notes.txt` both
+/// became `notes.txt` and the second silently replaced the first.
+pub fn common_parent(entries: &[FileEntry]) -> String {
+    let mut it = entries.iter();
+    let Some(first) = it.next() else {
+        return String::new();
+    };
+    let mut base: Vec<&str> = parent_dir(&first.path)
+        .split('/')
+        .filter(|c| !c.is_empty())
+        .collect();
+    for e in it {
+        let these: Vec<&str> = parent_dir(&e.path)
+            .split('/')
+            .filter(|c| !c.is_empty())
+            .collect();
+        let keep = base
+            .iter()
+            .zip(these.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        base.truncate(keep);
+        if base.is_empty() {
+            break;
+        }
+    }
+    if base.is_empty() {
+        String::new()
+    } else {
+        format!("/{}", base.join("/"))
+    }
+}
+
+/// `entry`'s own directory relative to `base`; "" when it sits directly in it.
+/// Always uses `/` separators — callers targeting the host filesystem convert.
+pub fn relative_dir(entry: &FileEntry, base: &str) -> String {
+    let dir = parent_dir(&entry.path);
+    let rel = dir.strip_prefix(base).unwrap_or(dir);
+    rel.trim_matches('/').to_string()
+}
+
 /// Export `entries` from `fs` as loose outputs into the directory `dest_dir`.
 /// Only [`ExportFormat::LooseFiles`] / [`GzipPerFile`](ExportFormat::GzipPerFile)
 /// / [`ZstdPerFile`](ExportFormat::ZstdPerFile) are valid here.
@@ -149,16 +203,29 @@ pub fn export_to_folder(
     cancelled: &Cancelled,
 ) -> Result<ExportSummary> {
     let mut summary = ExportSummary::default();
-    folder_recurse(
-        fs,
-        entries,
-        dest_dir,
-        format,
-        fork_mode,
-        progress,
-        cancelled,
-        &mut summary,
-    )?;
+    let base = common_parent(entries);
+    for e in entries {
+        // Re-create the entry's own folder under `dest_dir` so two same-named
+        // files picked from different folders no longer overwrite each other.
+        let rel = relative_dir(e, &base);
+        let target = if rel.is_empty() {
+            dest_dir.to_path_buf()
+        } else {
+            let t = dest_dir.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
+            std::fs::create_dir_all(&t).with_context(|| format!("creating {}", t.display()))?;
+            t
+        };
+        folder_recurse(
+            fs,
+            std::slice::from_ref(e),
+            &target,
+            format,
+            fork_mode,
+            progress,
+            cancelled,
+            &mut summary,
+        )?;
+    }
     Ok(summary)
 }
 
@@ -187,7 +254,7 @@ fn folder_recurse(
                 // discard `dest_dir` entirely and target the host root.
                 let sub = match e.archive_name() {
                     Some(name) => {
-                        let sub = dest_dir.join(name);
+                        let sub = dest_dir.join(crate::fs::resource_fork::sanitize_filename(name));
                         std::fs::create_dir_all(&sub)
                             .with_context(|| format!("creating {}", sub.display()))?;
                         sub
@@ -346,16 +413,22 @@ fn export_zip_file(
     let opts: zip::write::FileOptions<'_, ()> =
         zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
     let mut summary = ExportSummary::default();
-    zip_recurse(
-        fs,
-        entries,
-        "",
-        &mut zw,
-        opts,
-        progress,
-        cancelled,
-        &mut summary,
-    )?;
+    let base = common_parent(entries);
+    for e in entries {
+        // Each root keeps its folder relative to the common parent, so a
+        // cross-folder selection cannot collide on a bare name.
+        let rel = relative_dir(e, &base);
+        zip_recurse(
+            fs,
+            std::slice::from_ref(e),
+            &rel,
+            &mut zw,
+            opts,
+            progress,
+            cancelled,
+            &mut summary,
+        )?;
+    }
     zw.finish().context("finishing zip archive")?;
     Ok(summary)
 }
@@ -438,7 +511,21 @@ fn export_mac_archive_file(
     cancelled: &Cancelled,
 ) -> Result<ExportSummary> {
     let mut summary = ExportSummary::default();
-    let nodes = sit_nodes(fs, entries, progress, cancelled, &mut summary)?;
+    let base = common_parent(entries);
+    let mut nodes: Vec<StuffItInputNode> = Vec::new();
+    for e in entries {
+        let produced = sit_nodes(
+            fs,
+            std::slice::from_ref(e),
+            progress,
+            cancelled,
+            &mut summary,
+        )?;
+        // Rebuild the entry's folders inside the archive, merging into any
+        // folder an earlier root already created at the same path.
+        let rel = relative_dir(e, &base);
+        sit_insert(&mut nodes, &rel, produced);
+    }
     let bytes = if format == ExportFormat::MacArchive {
         let root = out_path
             .file_stem()
@@ -450,6 +537,34 @@ fn export_mac_archive_file(
     };
     std::fs::write(out_path, &bytes).with_context(|| format!("writing {}", out_path.display()))?;
     Ok(summary)
+}
+
+/// Splice `produced` into `nodes` under `rel`, reusing a folder node that is
+/// already there so two roots from the same source folder share one entry.
+fn sit_insert(nodes: &mut Vec<StuffItInputNode>, rel: &str, produced: Vec<StuffItInputNode>) {
+    let Some((head, tail)) = rel.trim_matches('/').split_once('/').or_else(|| {
+        let t = rel.trim_matches('/');
+        (!t.is_empty()).then_some((t, ""))
+    }) else {
+        nodes.extend(produced);
+        return;
+    };
+    if let Some(StuffItInputNode::Folder { children, .. }) = nodes
+        .iter_mut()
+        .find(|n| matches!(n, StuffItInputNode::Folder { name, .. } if name == head))
+    {
+        sit_insert(children, tail, produced);
+        return;
+    }
+    let mut children = Vec::new();
+    sit_insert(&mut children, tail, produced);
+    nodes.push(StuffItInputNode::Folder {
+        name: head.to_string(),
+        finder_flags: 0,
+        create_date: 0,
+        mod_date: 0,
+        children,
+    });
 }
 
 fn sit_nodes(
@@ -894,5 +1009,70 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("cancelled"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod selection_path_tests {
+    use super::*;
+    use crate::fs::entry::EntryType;
+
+    fn f(path: &str) -> FileEntry {
+        let mut e = FileEntry::root();
+        e.name = path.rsplit('/').next().unwrap_or(path).to_string();
+        e.path = path.to_string();
+        e.entry_type = EntryType::File;
+        e
+    }
+
+    #[test]
+    fn one_folder_selection_keeps_bare_names() {
+        // The common case, and the behaviour that must not change.
+        let v = vec![f("/docs/a.txt"), f("/docs/b.txt")];
+        let base = common_parent(&v);
+        assert_eq!(base, "/docs");
+        assert_eq!(relative_dir(&v[0], &base), "");
+        assert_eq!(relative_dir(&v[1], &base), "");
+    }
+
+    #[test]
+    fn cross_folder_selection_keeps_the_folders_apart() {
+        // The bug: both were named "notes.txt" and one overwrote the other.
+        let v = vec![f("/docs/notes.txt"), f("/backup/notes.txt")];
+        let base = common_parent(&v);
+        assert_eq!(base, "");
+        assert_eq!(relative_dir(&v[0], &base), "docs");
+        assert_eq!(relative_dir(&v[1], &base), "backup");
+    }
+
+    #[test]
+    fn common_parent_is_the_deepest_shared_folder() {
+        let v = vec![f("/a/b/x.txt"), f("/a/c/y.txt")];
+        let base = common_parent(&v);
+        assert_eq!(base, "/a");
+        assert_eq!(relative_dir(&v[0], &base), "b");
+        assert_eq!(relative_dir(&v[1], &base), "c");
+    }
+
+    #[test]
+    fn mixed_depth_under_one_root() {
+        let v = vec![f("/a/x.txt"), f("/a/b/y.txt")];
+        let base = common_parent(&v);
+        assert_eq!(base, "/a");
+        assert_eq!(relative_dir(&v[0], &base), "");
+        assert_eq!(relative_dir(&v[1], &base), "b");
+    }
+
+    #[test]
+    fn volume_root_files_stay_flat() {
+        let v = vec![f("/x.txt"), f("/y.txt")];
+        let base = common_parent(&v);
+        assert_eq!(base, "");
+        assert_eq!(relative_dir(&v[0], &base), "");
+    }
+
+    #[test]
+    fn empty_selection_is_not_a_panic() {
+        assert_eq!(common_parent(&[]), "");
     }
 }

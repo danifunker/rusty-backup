@@ -186,6 +186,109 @@ expect_envelope_ok = true
 args = ["fsck", "{scratch}/v.img", "--checkonly"]
 expect_exit = 0
 
+# --- Unix (BSD) --------------------------------------------------------------
+
+# UFS needs a real cylinder group before it is a filesystem, so 2 MB is the
+# floor here rather than the 2 MB coincidence everything above lands on.
+# Both byte orders run: a big-endian FFS is what SPARC, m68k and MIPS wrote,
+# and it is a separate path through every read the check then does.
+
+[[case]]
+id = "fs.new-volume.ufs"
+description = "UFS1 formats, inspects and fscks clean"
+[[case.step]]
+args = ["new", "volume", "ufs", "--size", "2M", "--name", "RBUFS", "{scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/v.img", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+[[case.step.json_equals]]
+path = "partitions.0.type_name"
+value = "UFS"
+[[case.step]]
+args = ["fsck", "{scratch}/v.img", "--checkonly"]
+expect_exit = 0
+
+# The pre-4.4BSD form is a different `struct fs` tail, a different `struct cg`
+# and a different `struct direct` — a 4.4BSD volume in a NeXT partition parses
+# and then hands back a root directory with a 1025-character name, because
+# `d_type` sits where a 4.3BSD kernel reads half a name length.
+
+[[case]]
+id = "fs.new-volume.ufs-43bsd"
+description = "The NeXTSTEP-format UFS1 formats, is detected as 4.3BSD, and fscks clean"
+[[case.step]]
+args = ["new", "volume", "ufs-43bsd", "--size", "8M", "{scratch}/next.ufs"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/next.ufs", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+[[case.step.json_equals]]
+path = "partitions.0.type_name"
+value = "UFS"
+[[case.step]]
+args = ["mkdir", "{scratch}/next.ufs", "/private"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/next.ufs", "{cases}/tier1/forked-file", "/private/hello.txt"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{scratch}/next.ufs", "/private", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+[[case.step.json_equals]]
+path = "0.name"
+value = "hello.txt"
+[[case.step]]
+args = ["fsck", "{scratch}/next.ufs", "--checkonly", "--format", "json"]
+expect_exit = 0
+fsck_clean = true
+[[case.step]]
+args = ["rm", "-r", "{scratch}/next.ufs", "/private"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/next.ufs", "--checkonly", "--format", "json"]
+expect_exit = 0
+fsck_clean = true
+
+[[case]]
+id = "fs.new-volume.ufs-big-endian"
+description = "A big-endian UFS1 takes a file and still fscks clean"
+[[case.step]]
+args = [
+  "new", "volume", "ufs", "--size", "8M", "--big-endian",
+  "--name", "SPARCROOT", "{scratch}/be.ufs",
+]
+expect_exit = 0
+[[case.step]]
+args = ["mkdir", "{scratch}/be.ufs", "/docs"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/be.ufs", "{cases}/tier1/forked-file", "/docs/hello.txt"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{scratch}/be.ufs", "/docs", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+[[case.step.json_equals]]
+path = "0.name"
+value = "hello.txt"
+# The free maps and the per-group counters only disagree after a write, which
+# is why the check comes after the put rather than instead of it.
+[[case.step]]
+args = ["fsck", "{scratch}/be.ufs", "--checkonly", "--format", "json"]
+expect_exit = 0
+fsck_clean = true
+[[case.step]]
+args = ["rm", "-r", "{scratch}/be.ufs", "/docs"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/be.ufs", "--checkonly", "--format", "json"]
+expect_exit = 0
+fsck_clean = true
+
 # --- Vintage -----------------------------------------------------------------
 
 [[case]]

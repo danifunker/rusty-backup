@@ -20,8 +20,14 @@ pub enum TableKind {
     Apm,
     Rdb,
     Sgi,
+    /// SGI disk label (IRIS 2000 / 3000). Slots carry a role, not a type.
+    SgiDkLabel,
     /// Sun disk label (SMI VTOC). Entries carry a numeric VTOC tag.
     Sun,
+    /// NeXT disk label. Entries carry a filesystem-name string.
+    Next,
+    /// Solaris x86 VTOC, nested in an MBR partition. Slices carry a VTOC tag.
+    SolarisX86,
     /// Atari ST AHDI. Entries carry a 3-character ASCII type tag.
     Atari,
     /// Sharp X68000. Entries carry a name, not a type code.
@@ -39,7 +45,10 @@ impl TableKind {
             TableKind::Apm => "APM",
             TableKind::Rdb => "RDB",
             TableKind::Sgi => "SGI",
+            TableKind::SgiDkLabel => "SGI-DkLabel",
             TableKind::Sun => "Sun",
+            TableKind::Next => "NeXT",
+            TableKind::SolarisX86 => "Solaris-x86",
             TableKind::Atari => "AHDI",
             TableKind::X68k => "X68000",
             TableKind::Other => "Unknown",
@@ -54,7 +63,12 @@ impl TableKind {
             TableKind::Apm => "APM partition type string (e.g. Apple_HFS)",
             TableKind::Rdb => "AmigaDOS DosType tag (e.g. DOS\\3, PFS\\3, SFS\\0)",
             TableKind::Sgi => "SGI partition type keyword (e.g. XFS, EFS)",
+            TableKind::SgiDkLabel => "SGI disk-label slot role (root, swap, boot, slice)",
             TableKind::Sun => "Sun VTOC slice tag, by name or number (e.g. root, usr, 4)",
+            TableKind::Next => "NeXT partition filesystem name (e.g. 4.3BSD, swap)",
+            TableKind::SolarisX86 => {
+                "Solaris VTOC slice tag, by name or number (e.g. root, usr, 4)"
+            }
             TableKind::Atari => "AHDI 3-character type tag (GEM, BGM, XGM, RAW)",
             TableKind::X68k => "X68000 partition name (e.g. Human68k)",
             TableKind::Other => "Partition type value",
@@ -79,7 +93,10 @@ pub fn kind_of(table: &PartitionTable) -> TableKind {
         PartitionTable::Apm(_) => TableKind::Apm,
         PartitionTable::Rdb(_) => TableKind::Rdb,
         PartitionTable::Sgi(_) => TableKind::Sgi,
+        PartitionTable::SgiDkLabel(_) => TableKind::SgiDkLabel,
         PartitionTable::Sun(_) => TableKind::Sun,
+        PartitionTable::Next(_) => TableKind::Next,
+        PartitionTable::SolarisX86 { .. } => TableKind::SolarisX86,
         PartitionTable::Ahdi(_) => TableKind::Atari,
         PartitionTable::X68k { .. } => TableKind::X68k,
         _ => TableKind::Other,
@@ -94,7 +111,11 @@ pub fn choices(kind: TableKind) -> &'static [TypeChoice] {
         TableKind::Apm => APM_TYPES,
         TableKind::Rdb => RDB_TYPES,
         TableKind::Sgi => SGI_TYPES,
+        TableKind::SgiDkLabel => SGI_DKLABEL_ROLES,
         TableKind::Sun => SUN_TYPES,
+        // Solaris x86 slices carry the same VTOC tags as the SPARC label.
+        TableKind::SolarisX86 => SUN_TYPES,
+        TableKind::Next => NEXT_TYPES,
         TableKind::Atari => ATARI_TYPES,
         // X68k entries are named, not typed, so there is nothing to offer.
         TableKind::X68k => &[],
@@ -135,10 +156,14 @@ fn normalize(kind: TableKind, value: &str) -> String {
             trimmed.to_ascii_uppercase()
         }
         // A Sun slice tag is a number; the names are just aliases for one.
-        TableKind::Sun => match crate::partition::sun::tag_from_text(trimmed) {
-            Some(tag) => tag.to_string(),
-            None => String::new(),
-        },
+        TableKind::Sun | TableKind::SolarisX86 => {
+            match crate::partition::sun::tag_from_text(trimmed) {
+                Some(tag) => tag.to_string(),
+                None => String::new(),
+            }
+        }
+        // NeXT `p_type` is a free-form 8-byte name, compared case-insensitively.
+        TableKind::Next | TableKind::SgiDkLabel => trimmed.to_ascii_uppercase(),
         TableKind::Rdb | TableKind::X68k | TableKind::Other => trimmed.to_string(),
     }
 }
@@ -182,7 +207,7 @@ const MBR_TYPES: &[TypeChoice] = &[
     },
     TypeChoice {
         value: "82",
-        label: "Linux swap",
+        label: "Linux swap / Solaris x86",
     },
     TypeChoice {
         value: "83",
@@ -203,6 +228,14 @@ const MBR_TYPES: &[TypeChoice] = &[
     TypeChoice {
         value: "AF",
         label: "Apple HFS / HFS+",
+    },
+    TypeChoice {
+        value: "BF",
+        label: "Solaris x86 (Solaris 10+)",
+    },
+    TypeChoice {
+        value: "EB",
+        label: "BeOS BFS",
     },
     TypeChoice {
         value: "EE",
@@ -334,6 +367,10 @@ const APM_TYPES: &[TypeChoice] = &[
         value: "Apple_Scratch",
         label: "Empty / scratch",
     },
+    TypeChoice {
+        value: "Be_BFS",
+        label: "BeOS BFS (BeOS/PPC)",
+    },
 ];
 
 /// AHDI type tags. `GEM` is the FAT12 / small-FAT16 partition every TOS
@@ -398,6 +435,19 @@ const SUN_TYPES: &[TypeChoice] = &[
     },
 ];
 
+/// NeXT `p_type` values. The field is an 8-byte free-form filesystem name;
+/// every NeXTSTEP disk we have carries `4.3BSD` on its one real partition.
+const NEXT_TYPES: &[TypeChoice] = &[
+    TypeChoice {
+        value: "4.3BSD",
+        label: "NeXTSTEP UFS (big-endian 4.3BSD FFS)",
+    },
+    TypeChoice {
+        value: "swap",
+        label: "Swap",
+    },
+];
+
 const RDB_TYPES: &[TypeChoice] = &[
     TypeChoice {
         value: "DOS\\0",
@@ -446,6 +496,27 @@ const RDB_TYPES: &[TypeChoice] = &[
     TypeChoice {
         value: "SFS\\2",
         label: "SmartFilesystem v2",
+    },
+];
+
+/// An SGI disk label has no per-slot type field, only the roles `d_bootfs`,
+/// `d_swapfs` and `d_rootfs` name. See `partition/sgi_dklabel.rs`.
+const SGI_DKLABEL_ROLES: &[TypeChoice] = &[
+    TypeChoice {
+        value: "root",
+        label: "Root filesystem (EFS v1)",
+    },
+    TypeChoice {
+        value: "swap",
+        label: "Swap (no filesystem)",
+    },
+    TypeChoice {
+        value: "boot",
+        label: "Boot filesystem (EFS v1)",
+    },
+    TypeChoice {
+        value: "slice",
+        label: "Plain slice (EFS v1)",
     },
 ];
 

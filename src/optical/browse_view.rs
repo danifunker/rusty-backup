@@ -11,6 +11,13 @@ use opticaldiscs::formats::FilesystemType;
 
 use crate::fs::resource_fork::{self, ResourceForkMode};
 
+/// Display order for a disc listing: directories first, then files, each
+/// case-insensitive by name. `opticaldiscs` has its own `FileEntry`, so this
+/// mirrors `fs::entry::sort_for_display` rather than sharing it.
+fn sort_for_display(entries: &mut [FileEntry]) {
+    entries.sort_by_cached_key(|e| (!e.is_directory(), e.name.to_lowercase()));
+}
+
 const MAX_PREVIEW_SIZE: usize = 1024 * 1024; // 1 MB
 
 /// Shared extraction progress state between UI and background thread.
@@ -145,7 +152,8 @@ impl OpticalDiscBrowseView {
                         match fs.root() {
                             Ok(root) => {
                                 match fs.list_directory(&root) {
-                                    Ok(entries) => {
+                                    Ok(mut entries) => {
+                                        sort_for_display(&mut entries);
                                         self.directory_cache.insert("/".into(), entries);
                                         self.expanded_paths.insert("/".into());
                                     }
@@ -272,7 +280,8 @@ impl OpticalDiscBrowseView {
             Ok(mut fs) => match fs.root() {
                 Ok(root) => {
                     match fs.list_directory(&root) {
-                        Ok(entries) => {
+                        Ok(mut entries) => {
+                            sort_for_display(&mut entries);
                             self.directory_cache.insert("/".into(), entries);
                             self.expanded_paths.insert("/".into());
                         }
@@ -481,6 +490,9 @@ impl OpticalDiscBrowseView {
                 };
 
                 ui.horizontal(|ui| {
+                    // Match the `spacing().indent` a directory row spends on its
+                    // collapse toggle, so every checkbox lines up in one column.
+                    ui.add_space(ui.spacing().indent);
                     self.mark_checkbox(ui, entry);
                     if ui.selectable_label(is_selected, &label).clicked() {
                         self.select_file(entry);
@@ -501,7 +513,8 @@ impl OpticalDiscBrowseView {
             }
         };
         match fs.list_directory(entry) {
-            Ok(entries) => {
+            Ok(mut entries) => {
+                sort_for_display(&mut entries);
                 self.directory_cache.insert(entry.path.clone(), entries);
             }
             Err(e) => {

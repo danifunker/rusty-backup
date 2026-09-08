@@ -673,10 +673,8 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
 
     /// Recompute `sb_fdblocks` and write it into the primary superblock.
     ///
-    /// `sb_fdblocks` counts both the free blocks described by the bnobt
-    /// (`agf_freeblks`) *and* the AGFL's pre-reserved blocks (`agf_flcount`),
-    /// which the bnobt deliberately excludes. Omitting the AGFL term leaves
-    /// `xfs_repair -n` reporting `sb_fdblocks N, counted M` (off by Σ flcount).
+    /// `sb_fdblocks` = Σ `agf_freeblks + agf_flcount + agf_btreeblks` over the
+    /// AGs (`xfs_initialize_perag_data`); a missing term shows up in `xfs_repair -n` (R-066).
     pub(crate) fn resync_sb_fdblocks(&mut self, sb: &XfsSuperblock) -> Result<(), FilesystemError> {
         let sectsize = sb.sectsize as u64;
         let agblocks = sb.agblocks as u64;
@@ -687,7 +685,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
             let agf_byte = self.partition_offset + agno * agblocks * blocksize + sectsize;
             read_at_aligned(&mut self.reader, agf_byte, sectsize, &mut agf)?;
             let parsed = XfsAgf::parse(&agf)?;
-            total += parsed.freeblks as u64 + parsed.flcount as u64;
+            total += parsed.freeblks as u64 + parsed.flcount as u64 + parsed.btreeblks as u64;
         }
         let mut primary = vec![0u8; sectsize as usize];
         read_at_aligned(

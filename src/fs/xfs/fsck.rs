@@ -825,6 +825,20 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
         for ext in &extents {
             self.claim_extent(sb, ino, ext.startblock, ext.blockcount, map, b);
         }
+        // A btree-format fork also owns its bmbt nodes and leaves (R-067).
+        if core.format == DiFormat::Btree {
+            let fork = self.data_fork(&core, &inode_buf).to_vec();
+            let walked = super::parse_bmbt_root(&fork, fork.len())
+                .and_then(|(level, first)| self.collect_bmbt_blocks(level, first));
+            match walked {
+                Ok(blocks) => {
+                    for fsb in blocks {
+                        self.claim_extent(sb, ino, fsb, 1, map, b);
+                    }
+                }
+                Err(e) => b.err("BmbtWalkFailed", format!("inode {ino}: {e}")),
+            }
+        }
     }
 
     /// Claim `[startblock, startblock+count)` (XFS fsblocks) for `ino`,

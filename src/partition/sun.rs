@@ -66,21 +66,27 @@ impl SunSlice {
     }
     /// Plain-ASCII name for the VTOC tag (no Unicode glyphs).
     pub fn tag_name(&self) -> &'static str {
-        match self.tag {
-            0 => "unassigned",
-            1 => "boot",
-            2 => "root",
-            3 => "swap",
-            4 => "usr",
-            5 => "backup",
-            6 => "stand",
-            7 => "var",
-            8 => "home",
-            9 => "altsctr",
-            10 => "cache",
-            11 => "reserved",
-            _ => "slice",
-        }
+        tag_name(self.tag)
+    }
+}
+
+/// Plain-ASCII name for a VTOC partition tag. Shared with the Solaris x86
+/// VTOC (`src/partition/solaris_x86.rs`), which uses the same vocabulary.
+pub fn tag_name(tag: u16) -> &'static str {
+    match tag {
+        0 => "unassigned",
+        1 => "boot",
+        2 => "root",
+        3 => "swap",
+        4 => "usr",
+        5 => "backup",
+        6 => "stand",
+        7 => "var",
+        8 => "home",
+        9 => "altsctr",
+        10 => "cache",
+        11 => "reserved",
+        _ => "slice",
     }
 }
 

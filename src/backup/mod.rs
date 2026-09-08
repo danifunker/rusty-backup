@@ -1,5 +1,6 @@
 pub mod disk_image_stream;
 pub mod format;
+pub mod mbr_gap;
 pub mod metadata;
 #[cfg(feature = "chd")]
 pub mod single_file_chd;
@@ -846,6 +847,22 @@ fn run_backup_inner(
         }
     }
 
+    // Solaris x86: back up the MBR and its 0x82 partition as one opaque body
+    // (the VTOC rides inside it) and keep the slice layout as a sidecar.
+    let mut solaris_vtoc_json = None;
+    if let PartitionTable::SolarisX86 { mbr, label } = &table {
+        solaris_vtoc_json = Some(
+            serde_json::to_string_pretty(label)
+                .context("failed to serialize Solaris x86 VTOC to JSON")?,
+        );
+        log(
+            &progress,
+            LogLevel::Info,
+            "Solaris x86 VTOC recorded in solaris_x86.json; backing up the disk by its MBR",
+        );
+        table = PartitionTable::Mbr(mbr.clone());
+    }
+
     let alignment = partition::detect_alignment(&table);
     let mut partitions = table.partitions();
     let is_superfloppy = matches!(table, PartitionTable::None { .. });
@@ -971,6 +988,10 @@ fn run_backup_inner(
     // Step 2: Create backup folder
     set_operation(&progress, "Creating backup folder...");
     let backup_folder = format::create_backup_folder(&config.destination_dir, &config.backup_name)?;
+    if let Some(json) = &solaris_vtoc_json {
+        std::fs::write(backup_folder.join("solaris_x86.json"), json)
+            .context("failed to write solaris_x86.json")?;
+    }
     log(
         &progress,
         LogLevel::Info,
@@ -989,6 +1010,36 @@ fn run_backup_inner(
     ) && !is_superfloppy
         && config.split_size_mib.is_none()
         && single_file_chd::is_supported(&table);
+
+    // Sector 0 alone loses GRUB's core.img, a DDO or Boot Manager living
+    // between the MBR and the first partition; keep that gap as a sidecar.
+    if matches!(
+        table,
+        PartitionTable::Mbr(_) | PartitionTable::SolarisX86 { .. }
+    ) {
+        let gap_sectors = mbr_gap::gap_sectors_before_first_partition(&table.partitions());
+        match mbr_gap::read_gap(&mut source, gap_sectors) {
+            Ok(Some(gap)) => {
+                mbr_gap::export(&backup_folder, &gap)?;
+                log(
+                    &progress,
+                    LogLevel::Info,
+                    format!(
+                        "Exported {} sector(s) between the MBR and the first partition ({})",
+                        gap.len() / 512,
+                        mbr_gap::FILE_NAME
+                    ),
+                );
+            }
+            Ok(None) => {}
+            Err(e) => log(
+                &progress,
+                LogLevel::Warning,
+                format!("Could not read the sectors after the MBR: {e:#}"),
+            ),
+        }
+        source.seek(SeekFrom::Start(0))?;
+    }
 
     set_operation(&progress, "Exporting partition table...");
     match &table {
@@ -1110,6 +1161,35 @@ fn run_backup_inner(
                 "Exported Sun disk label (sun.json) — partition data backup not yet supported",
             );
             bail!("backing up Sun-labeled disks is not yet supported (browse only)");
+        }
+        PartitionTable::Next(label) => {
+            // Same sidecar shape as the Sun label: record the partition layout
+            // in next.json and defer the per-partition data backup. Browse /
+            // inspect / extract already work through the big-endian UFS reader.
+            let json = serde_json::to_string_pretty(label)
+                .context("failed to serialize NeXT disk label to JSON")?;
+            std::fs::write(backup_folder.join("next.json"), json)
+                .context("failed to write next.json")?;
+            log(
+                &progress,
+                LogLevel::Info,
+                "Exported NeXT disk label (next.json) — partition data backup not yet supported",
+            );
+            bail!("backing up NeXT-labeled disks is not yet supported (browse only)");
+        }
+        PartitionTable::SolarisX86 { label, .. } => {
+            // Same sidecar shape as the Sun label: record the slice layout in
+            // solaris_x86.json and defer the per-slice data backup.
+            let json = serde_json::to_string_pretty(label)
+                .context("failed to serialize Solaris x86 VTOC to JSON")?;
+            std::fs::write(backup_folder.join("solaris_x86.json"), json)
+                .context("failed to write solaris_x86.json")?;
+            log(
+                &progress,
+                LogLevel::Info,
+                "Exported Solaris x86 VTOC (solaris_x86.json) — partition data backup not yet supported",
+            );
+            bail!("backing up Solaris x86 disks is not yet supported (browse only)");
         }
         PartitionTable::SgiDkLabel(label) => {
             // Same sidecar shape as the Sun label: record the slot layout in
@@ -1948,7 +2028,7 @@ fn run_backup_inner(
             // Trim the stream to stream_size.  For layout-preserving readers this
             // drops the zero-filled free tail; for packed readers stream_size equals
             // the natural end of the stream so take() is a no-op.
-            let mut limited = compact_reader.take(stream_size);
+            let mut limited = LimitedReader::new(compact_reader.take(stream_size));
 
             log(
                 &progress,
@@ -1956,7 +2036,7 @@ fn run_backup_inner(
                 format!("Calling compress_partition for compacted {}", part_label),
             );
             let progress_log = Arc::clone(&progress);
-            crate::rbformats::compress_partition_hashed(
+            let files = crate::rbformats::compress_partition_hashed(
                 &mut limited,
                 &output_base,
                 effective_compression,
@@ -1975,7 +2055,9 @@ fn run_backup_inner(
                 &|| is_cancelled(&progress_clone),
                 &mut |msg| log(&progress_log, LogLevel::Info, msg),
             )
-            .with_context(|| format!("failed to compress {part_label}"))?
+            .with_context(|| format!("failed to compress {part_label}"))?;
+            warn_if_short(&progress, &part_label, stream_size, limited.delivered);
+            files
         } else {
             // Fall back to trim-based read
             log(
@@ -2004,7 +2086,7 @@ fn run_backup_inner(
                 format!("Calling compress_partition for trim-based {}", part_label),
             );
             let progress_log = Arc::clone(&progress);
-            crate::rbformats::compress_partition_hashed(
+            let files = crate::rbformats::compress_partition_hashed(
                 &mut limited,
                 &output_base,
                 effective_compression,
@@ -2023,7 +2105,9 @@ fn run_backup_inner(
                 &|| is_cancelled(&progress_clone),
                 &mut |msg| log(&progress_log, LogLevel::Info, msg),
             )
-            .with_context(|| format!("failed to compress {part_label}"))?
+            .with_context(|| format!("failed to compress {part_label}"))?;
+            warn_if_short(&progress, &part_label, image_size, limited.delivered);
+            files
         };
 
         // Log output file sizes for diagnostics
@@ -2542,20 +2626,45 @@ fn run_single_file_chd_path(
     Ok(())
 }
 
-/// A reader wrapper that limits reads to exactly `limit` bytes.
+/// Counts what the source actually delivered, so a short source is reported
+/// rather than passed off as the zero tail the archive declares.
 struct LimitedReader<R> {
     inner: R,
+    delivered: u64,
 }
-
 impl<R: Read> LimitedReader<R> {
     fn new(inner: R) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            delivered: 0,
+        }
     }
 }
-
 impl<R: Read> Read for LimitedReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.inner.read(buf)
+        let n = self.inner.read(buf)?;
+        self.delivered += n as u64;
+        Ok(n)
+    }
+}
+/// Log when a partition stream ended before its declared length; the archive
+/// still claims `expected` bytes and a restore will zero-fill the difference.
+fn warn_if_short(
+    progress: &Arc<Mutex<BackupProgress>>,
+    label: &str,
+    expected: u64,
+    delivered: u64,
+) {
+    if delivered < expected {
+        log(
+            progress,
+            LogLevel::Warning,
+            format!(
+                "{label}: source delivered {delivered} of {expected} bytes; the missing \
+                 {} bytes are recorded as zeros",
+                expected - delivered
+            ),
+        );
     }
 }
 

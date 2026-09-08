@@ -240,6 +240,63 @@ verifies = [{ format = "fmt.zip-disk", direction = "write", strength = "structur
 # --- Emulator oracles --------------------------------------------------------
 
 [[oracle]]
+id = "motion"
+tool = "Motion"
+kind = "emulator"
+program = "oracles/motion/efs_v1_mount.sh"
+notes = """SGI IRIS 3130 (68020) emulator, booting the real IRIX 3.7 / GL2-W3.6
+disk to a shell. The counterpart to `iris`, one machine generation earlier: iris
+checks IRIX EFS on an Indy, motion checks EFS **v1** on the hardware that
+format was written for.
+
+Its serial console goes to stdout, one line per `[Emulation - Serial] ... [line
+1] <text>`, so a whole boot is greppable with no X, no xdotool and no screen
+scraping. Run it WITHOUT `+set enableGF2 1`; the graphics console needs XTEST
+typing and is useless for CI. It needs assets/ roms/ profile/ beside the
+binary — symlinks are fine — and reads the disk from `profile/3130.img`.
+
+The check drives a guest script instead of a control socket: the volume under
+test is dropped into the reference disk's /usr slot, /etc/rc.s0 is patched to
+mount /dev/md0c and list it, and the console is the verdict. Word order is
+load-bearing — the medium is swapped within every 16-bit word, so the check
+swab16s a natively-written volume on the way in.
+
+Four things that cost time:
+
+  * It opens the disk READ-ONLY and only ever attaches drive 0 (dsd5217.cpp
+    calls Profile::OpenDisk(0) and nothing else). `profileDisk1Path` exists but
+    is unwired, so "attach our whole disk as md1" does not work yet — hence the
+    splice into an existing slot.
+  * About one boot in six dies at kernel entry before running anything. That is
+    the emulator, not the volume, so the check retries once and reports exit 99
+    (no verdict) rather than inventing a finding.
+  * `/mnt` does not exist on the reference disk. Without `mkdir` the mount
+    fails in a way that reads like a filesystem fault.
+  * IRIX 3.7's mount is silent on success. Its refusal is
+    "/dev/md0c:Invalid argument", not anything with "mount:" in it — matching
+    the wrong string is how a broken volume passes.
+
+Control, run 2026-08-24: 8 MB of urandom in the same slot yields
+"/dev/md0c:Invalid argument" and exit 1, so a pass is not the check passing
+everything.
+
+`scripts/sgi-efs-v1-oracle.sh prove` is the deeper, standalone form: it has
+rb-cli rewrite-and-grow /etc/rc.s0, create a file and a directory and allocate
+a 256 KiB file on the reference disk itself, then boots and confirms IRIX runs
+the script, reads them back and `sum`s to the right checksum. Not wired to an
+artifact, so it is not a `check`; it is what a person runs after touching the
+write path."""
+availability = [
+  { platform = "linux",   status = "verified", verified_on = "2026-08-24" },
+  { platform = "windows", status = "install" },
+  { platform = "macos",   status = "install" },
+]
+verifies = [
+  { format = "fs.efs-v1", direction = "write", strength = "authoritative", status = "proven", evidence = "2026-08-24: IRIX 3.7 mounts a volume from `new volume efs-v1` off md0c and reads its root directory, including a file and a subdirectory rb-cli put there. Controlled against 8 MB of noise, which IRIX refuses with Invalid argument.", check = ["{artifact}"], expect_stdout = "MOUNTED-OK" },
+  { format = "part.sgi-dklabel", direction = "write", strength = "authoritative", status = "untested", evidence = "Needs the emulator to attach a second drive; dsd5217.cpp opens drive 0 only, so a whole disk we built cannot be presented to the guest yet." },
+]
+
+[[oracle]]
 id = "iris"
 tool = "Iris"
 kind = "emulator"

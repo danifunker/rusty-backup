@@ -75,6 +75,8 @@ pub struct ImportStats {
     pub perms_applied: u64,
     /// macOS AppleDouble (`._*`) sidecars skipped.
     pub appledouble_skipped: u64,
+    /// `._name` members joined to their file as its resource fork (tar import).
+    pub appledouble_paired: u64,
     /// Entries whose name the target filesystem can't store (e.g. a
     /// trailing-dot name on FAT).
     pub invalid_names_skipped: u64,
@@ -299,7 +301,12 @@ impl Importer {
                 .collect();
             self.dir_children.insert(parent_key.clone(), existing);
         }
-        if self.dir_children[&parent_key].contains(name) {
+        let taken = self.dir_children[&parent_key].contains(name)
+            || (efs.case_insensitive_lookup()
+                && self.dir_children[&parent_key]
+                    .iter()
+                    .any(|n| n.eq_ignore_ascii_case(name)));
+        if taken {
             match opts.conflict {
                 ImportConflict::Error => {
                     bail!("{display} already exists in the image (pass --force or --skip-existing)")
@@ -398,6 +405,7 @@ impl Importer {
                     }
                     create_opts.os_type = imp.type_code;
                     create_opts.os_creator = imp.creator_code;
+                    create_opts.finder_flags = imp.finder_flags;
                 }
                 efs.create_file(&parent, name, data, size, &create_opts)
                     .map_err(|e| anyhow!("create_file {display}: {e}"))?;
@@ -524,8 +532,9 @@ pub fn find_child(
     parent: &FileEntry,
     name: &str,
 ) -> Result<Option<FileEntry>> {
+    let fold_case = efs.case_insensitive_lookup();
     let children = efs
         .list_directory(parent)
         .map_err(|e| anyhow!("list_directory {}: {e}", parent.path))?;
-    Ok(children.into_iter().find(|c| c.name == name))
+    Ok(crate::fs::copy::select_child(&children, fold_case, name).cloned())
 }

@@ -53,8 +53,8 @@ pub struct PutArgs {
     #[arg(short = 'L', long = "literal", alias = "no-glob")]
     pub literal: bool,
 
-    /// Pre-allocate N zero bytes instead of copying a host file. Pair
-    /// with `--dst`.
+    /// Pre-allocate N zero bytes instead of copying a host file. Pair with
+    /// `--dst`; a `{A..B}` range in its last component makes one file per number.
     #[arg(long, conflicts_with_all = ["host_file", "boot"])]
     pub zero: Option<u64>,
 
@@ -246,12 +246,16 @@ pub fn run_with_budget(
         bail!("parent is not a directory: {dst}");
     }
 
-    // Duplicate check so we can honor --force consistently.
-    let existing = fs
-        .list_directory(&parent)
-        .map_err(|e| anyhow!("list_directory: {e}"))?
-        .into_iter()
-        .find(|e| e.name == name);
+    // Duplicate check so we can honor --force consistently, matched the way
+    // the filesystem matches (FAT and friends ignore case).
+    let fold_case = fs.case_insensitive_lookup();
+    let existing = crate::fs::copy::select_child(
+        &fs.list_directory(&parent)
+            .map_err(|e| anyhow!("list_directory: {e}"))?,
+        fold_case,
+        &name,
+    )
+    .cloned();
     // Capture before the delete: afterwards there is nothing left to ask.
     // Everything the replaced file carried, not just its xattrs. A replace
     // writes new *contents*; it is not a request to reset permissions, owner,
@@ -261,6 +265,9 @@ pub fn run_with_budget(
     } else {
         crate::fs::attrs::preserved_meta(fs.as_filesystem_mut(), existing.as_ref())
     };
+    if existing.as_ref().is_some_and(|e| e.is_directory()) {
+        bail!("{dst} is a directory; put replaces files only (rm -r it first)");
+    }
     if existing.is_some() && !args.force {
         bail!("{dst} already exists (pass --force to overwrite)");
     }
@@ -420,6 +427,7 @@ pub fn run_with_budget(
         if options.creator_code.is_none() {
             options.os_creator = container_creator;
         }
+        options.finder_flags = imp.finder_flags;
     }
     // Fills only what nobody set explicitly, so --type / --mode still win.
     preserved.apply_to_options(&mut options);
@@ -454,7 +462,20 @@ pub fn run_with_budget(
         Ok(())
     };
 
-    if let Some(n) = args.zero {
+    if let Some(names) = expand_brace_range(&name) {
+        let n = args
+            .zero
+            .ok_or_else(|| anyhow!("a {{A..B}} destination range needs --zero N"))?;
+        if args.force {
+            bail!("--force does not apply to a {{A..B}} destination range");
+        }
+        for nm in &names {
+            let mut zr = ZeroReader { remaining: n };
+            fs.create_file(&parent, nm, &mut zr, n, &options)
+                .map_err(|e| crate::cli::resolve::write_open_error("create_file", e))?;
+        }
+        log_stderr(format!("Created {} files", names.len()));
+    } else if let Some(n) = args.zero {
         let mut zr = ZeroReader { remaining: n };
         write_through(fs.as_mut(), &mut zr, n)?;
     } else {
@@ -667,6 +688,31 @@ fn write_boot_region(
     Ok(())
 }
 
+/// Expand a `{A..B}` range (decimal, ascending, zero-padded to A's width
+/// when A has a leading zero) in `name`; `None` when there is no range.
+fn expand_brace_range(name: &str) -> Option<Vec<String>> {
+    let open = name.find('{')?;
+    let close = name[open..].find('}')? + open;
+    let (lo, hi) = name[open + 1..close].split_once("..")?;
+    if lo.is_empty()
+        || !lo.bytes().all(|b| b.is_ascii_digit())
+        || !hi.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let (a, b): (u64, u64) = (lo.parse().ok()?, hi.parse().ok()?);
+    if b < a || b - a > 10_000_000 {
+        return None;
+    }
+    let width = if lo.starts_with('0') { lo.len() } else { 0 };
+    let (prefix, suffix) = (&name[..open], &name[close + 1..]);
+    Some(
+        (a..=b)
+            .map(|i| format!("{prefix}{i:0width$}{suffix}"))
+            .collect(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::is_boot_block_target;
@@ -693,5 +739,20 @@ mod tests {
         assert!(!is_boot_block_target(0x00, Some("Apple_HFSX")));
         // And a non-HFS MBR partition (e.g. FAT) is rejected.
         assert!(!is_boot_block_target(0x0c, None));
+    }
+
+    #[test]
+    fn brace_range_expands_zero_padded_runs() {
+        assert_eq!(
+            super::expand_brace_range("f{0008..0010}.txt").unwrap(),
+            ["f0008.txt", "f0009.txt", "f0010.txt"]
+        );
+        assert_eq!(
+            super::expand_brace_range("f{9..11}").unwrap(),
+            ["f9", "f10", "f11"]
+        );
+        assert!(super::expand_brace_range("plain.txt").is_none());
+        assert!(super::expand_brace_range("f{5..3}").is_none());
+        assert!(super::expand_brace_range("f{a..b}").is_none());
     }
 }

@@ -134,6 +134,41 @@ pub fn compute_resize_plan(
     Ok(plans)
 }
 
+/// Name the container when `file`'s bytes are not the disk (dynamic VHD, QCOW2,
+/// sparse VMDK, CHD); `None` for raw and for a fixed VHD, whose cookie is the same.
+fn unexpandable_container(
+    file: &mut (impl Read + Seek),
+    size: u64,
+) -> std::io::Result<Option<&'static str>> {
+    let mut head = [0u8; 8];
+    file.seek(SeekFrom::Start(0))?;
+    let n = file.read(&mut head)?;
+    if n >= 8 && &head == b"MComprHD" {
+        return Ok(Some("CHD"));
+    }
+    if n >= 4 && &head[..4] == crate::rbformats::qcow2::QCOW2_MAGIC {
+        return Ok(Some("QCOW2"));
+    }
+    if n >= 4 && &head[..4] == b"KDMV" {
+        return Ok(Some("sparse VMDK"));
+    }
+    if size >= 512 {
+        let mut footer = [0u8; 512];
+        file.seek(SeekFrom::Start(size - 512))?;
+        file.read_exact(&mut footer)?;
+        if &footer[..8] == crate::rbformats::vhd::VHD_COOKIE {
+            let disk_type = u32::from_be_bytes([footer[60], footer[61], footer[62], footer[63]]);
+            if disk_type == crate::rbformats::vhd::VHD_TYPE_DYNAMIC {
+                return Ok(Some("dynamic VHD"));
+            }
+            if disk_type == crate::rbformats::vhd::VHD_TYPE_DIFFERENCING {
+                return Ok(Some("differencing VHD"));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Check if a file is a VHD by looking for the "conectix" cookie at end - 512.
 pub fn detect_vhd(file: &mut (impl Read + Seek), file_size: u64) -> bool {
     if file_size < 512 {
@@ -531,6 +566,16 @@ pub fn expand_image_file(
 
     let mut file = OpenOptions::new().read(true).write(true).open(path)?;
     let old_size = file.seek(SeekFrom::End(0))?;
+    if let Some(kind) = unexpandable_container(&mut file, old_size)? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "a {kind} cannot be grown in place: its bytes are not the disk, so \
+                 appending zeros would corrupt it. Convert it to a raw or fixed-VHD \
+                 image first (rb-cli convert IMG OUT --format raw)"
+            ),
+        ));
+    }
     let is_vhd = detect_vhd(&mut file, old_size);
 
     if is_vhd {
@@ -881,5 +926,34 @@ mod tests {
         let mut file = std::fs::File::open(&path).unwrap();
         let total = std::fs::metadata(&path).unwrap().len();
         assert!(detect_vhd(&mut file, total));
+    }
+
+    #[test]
+    fn expand_image_file_refuses_containers_whose_bytes_are_not_the_disk() {
+        // A dynamic VHD ends in the same cookie as a fixed one; appending zeros
+        // in front of its footer used to leave a "fixed" footer on sparse data.
+        let dynamic = tempfile::NamedTempFile::new().unwrap();
+        let mut buf = vec![0u8; 4096];
+        buf.extend_from_slice(&crate::rbformats::vhd::build_vhd_footer_with_type(
+            1024 * 1024,
+            crate::rbformats::vhd::VHD_TYPE_DYNAMIC,
+            512,
+        ));
+        std::fs::write(dynamic.path(), &buf).unwrap();
+        let before = std::fs::read(dynamic.path()).unwrap();
+        let err = expand_image_file(dynamic.path(), 4096, &mut |_| {}).unwrap_err();
+        assert!(err.to_string().contains("dynamic VHD"), "{err}");
+        assert_eq!(
+            std::fs::read(dynamic.path()).unwrap(),
+            before,
+            "refusal must not write"
+        );
+
+        let qcow2 = tempfile::NamedTempFile::new().unwrap();
+        let mut head = crate::rbformats::qcow2::QCOW2_MAGIC.to_vec();
+        head.resize(4096, 0);
+        std::fs::write(qcow2.path(), &head).unwrap();
+        let err = expand_image_file(qcow2.path(), 4096, &mut |_| {}).unwrap_err();
+        assert!(err.to_string().contains("QCOW2"), "{err}");
     }
 }

@@ -38,6 +38,31 @@ impl DiskDevice {
     }
 }
 
+/// What still identifies a device after the list is re-enumerated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceIdentity {
+    pub path: PathBuf,
+    pub size_bytes: u64,
+    pub media_name: String,
+}
+
+impl DiskDevice {
+    /// The identity a tab records so a later "Refresh Devices" cannot put a
+    /// different disk behind the same list index unnoticed.
+    pub fn identity(&self) -> DeviceIdentity {
+        DeviceIdentity {
+            path: self.path.clone(),
+            size_bytes: self.size_bytes,
+            media_name: self.media_name.clone(),
+        }
+    }
+}
+
+/// Identity of the device at `idx`, or None when the index no longer resolves.
+pub fn identity_at(devices: &[DiskDevice], idx: Option<usize>) -> Option<DeviceIdentity> {
+    idx.and_then(|i| devices.get(i)).map(DiskDevice::identity)
+}
+
 /// A mounted partition (volume) on a disk device.
 #[derive(Debug, Clone)]
 pub struct MountedPartition {

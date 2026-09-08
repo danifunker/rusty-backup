@@ -51,6 +51,10 @@ pub const RB_HELLO_MAGIC_BYTES: [u8; 4] = RB_HELLO_MAGIC.to_be_bytes();
 /// mismatch is refused with a clear message instead of desyncing.
 pub const PROTOCOL_VERSION: u16 = 4;
 
+/// Oldest Family-B (binary, cb-dos) version this daemon still speaks. The v4
+/// bump changed only JSON `StageUpload`, so the binary wire format is v3's.
+pub const FAMILY_B_MIN_VERSION: u16 = 3;
+
 /// Default daemon port (mrext owns 8182; we take 7341). Configurable on both
 /// ends via `--bind` / an explicit `rb://host:PORT/...`.
 pub const DEFAULT_PORT: u16 = 7341;
@@ -213,6 +217,9 @@ pub enum Request {
         path: String,
         is_device: bool,
         size: u64,
+        /// Overwrite an image file that already exists (v3 clients send none: false).
+        #[serde(default)]
+        force: bool,
     },
 
     // --- physical-device backup (v2): the daemon enumerates its own disks ---
@@ -1180,6 +1187,38 @@ impl<W: Write> Write for ChunkWriter<'_, W> {
 
     fn flush(&mut self) -> io::Result<()> {
         self.inner.flush()
+    }
+}
+
+/// A sink that keeps the first `cap` bytes and counts the rest, so a stream
+/// that must be drained for framing cannot grow memory without bound.
+pub struct CappedSink {
+    pub buf: Vec<u8>,
+    cap: usize,
+    pub dropped: u64,
+}
+
+impl CappedSink {
+    pub fn new(cap: usize) -> Self {
+        Self {
+            buf: Vec::new(),
+            cap,
+            dropped: 0,
+        }
+    }
+}
+
+impl Write for CappedSink {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        let room = self.cap.saturating_sub(self.buf.len());
+        let keep = data.len().min(room);
+        self.buf.extend_from_slice(&data[..keep]);
+        self.dropped += (data.len() - keep) as u64;
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 

@@ -1,3 +1,26 @@
+//! macOS device access: enumeration (IOKit + DiskArbitration), unmounting and
+//! claiming, and privilege escalation through `/usr/libexec/authopen`.
+//!
+//! # authopen's reply protocol
+//!
+//! Undocumented; read from the helper's disassembly on macOS 26 (R11). With
+//! `-stdoutpipe` it answers with exactly one `sendmsg` carrying two data bytes.
+//! On success the descriptor rides along as `SCM_RIGHTS` and both bytes are 0.
+//! On failure there is no control message and byte 1 is the errno of whichever
+//! open failed (1 when that errno's low byte is 0); the helper then exits 1.
+//!
+//! The helper first opens the path as the calling user. On EACCES it asks for
+//! the right `sys.openfile.readonly|readwrite|readwritecreate.<path>` and maps
+//! the authorization status to an errno: `errAuthorizationCanceled` (-60006)
+//! becomes `ECANCELED`, `errAuthorizationDenied` (-60005) and
+//! `errAuthorizationInteractionNotAllowed` (-60007) become `EACCES`, the
+//! invalid-argument statuses `EINVAL`, anything else `EACCES`. Once authorized
+//! it opens the path as root, and that open's errno is what comes back for a
+//! write-protected card (EACCES) or a mounted disk (EBUSY). Its stderr names
+//! the failing step: `AuthorizationCopyRights failed: <text>` for the dialog,
+//! `couldn't open <path>: <text>` for the root open. The earlier cancel check
+//! compared our own error text against "cancelled" and never matched.
+
 mod sudo;
 
 use std::ffi::{c_void, CString};
@@ -44,13 +67,15 @@ use crate::device::{DiskDevice, MountedPartition};
 // DKIOCGETBLOCKCOUNT = _IOR('d', 25, u64) = 0x40086419
 const DKIOCGETBLOCKSIZE: libc::c_ulong = 0x40046418;
 const DKIOCGETBLOCKCOUNT: libc::c_ulong = 0x40086419;
+// DKIOCISWRITABLE = _IOR('d', 29, u32) = 0x4004641d
+const DKIOCISWRITABLE: libc::c_ulong = 0x4004641d;
 
 /// macOS fcntl command to bypass the buffer cache (equivalent to O_DIRECT on Linux).
 const F_NOCACHE: libc::c_int = 48;
 
 /// Re-enable the buffer cache on a previously-opened raw device fd.
 ///
-/// `open_device_for_inspect` and friends set `F_NOCACHE` so backup/restore
+/// `open_source_for_reading` and friends set `F_NOCACHE` so backup/restore
 /// linear passes don't pollute the page cache. For B-tree-style filesystems
 /// (HFS+ on heavily-used volumes) the catalog is read in many small chunks
 /// scattered across the disk, and `F_NOCACHE` makes every read a synchronous
@@ -92,6 +117,18 @@ pub fn get_device_size(file: &std::fs::File) -> Option<u64> {
     }
 
     Some(block_count * block_size as u64)
+}
+
+/// Whether the kernel will accept writes to the media behind `file`; `None`
+/// for anything that is not a disk device. A locked SD card answers `false`.
+pub fn media_is_writable(file: &File) -> Option<bool> {
+    use std::os::unix::io::AsRawFd;
+    let mut writable: u32 = 0;
+    let r = unsafe { libc::ioctl(file.as_raw_fd(), DKIOCISWRITABLE, &mut writable) };
+    if r != 0 {
+        return None;
+    }
+    Some(writable != 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -282,6 +319,13 @@ fn da_disk_description(session: &DASession, bsd_name: &str) -> Option<DiskDescri
             volume_path,
         })
     }
+}
+
+/// Whether DiskArbitration says the media accepts writes, without opening it;
+/// `None` when it has no answer (no session, or not a disk it knows).
+fn da_media_writable(bsd_name: &str) -> Option<bool> {
+    let session = unsafe { DASession::new(None) }?;
+    da_disk_description(&session, bsd_name).map(|d| d.is_writable)
 }
 
 struct DiskDescription {
@@ -863,12 +907,29 @@ fn cached_authopen(path: &str, flags: libc::c_int) -> Result<SharedDevice> {
 }
 
 /// Access mode to escalate a read with: `O_RDWR`, so one prompt also covers a
-/// later restore — unless a volume is still mounted, which refuses it (EBUSY).
-fn read_escalation_flags(unmounted: bool, saw_busy: bool) -> libc::c_int {
-    if unmounted && !saw_busy {
+/// later restore — unless a volume is still mounted (EBUSY) or the media is
+/// write-protected, which refuse it for root too (R6).
+fn read_escalation_flags(unmounted: bool, saw_busy: bool, writable: bool) -> libc::c_int {
+    if unmounted && !saw_busy && writable {
         libc::O_RDWR
     } else {
         libc::O_RDONLY
+    }
+}
+
+/// Why a device opened read-only after refusing read-write (R6): write-protected
+/// media is reported as such, never as a privilege problem.
+fn log_read_only_open(path: &str, file: &File, rw_errno: i32) {
+    match media_is_writable(file) {
+        Some(false) => log::warn!(
+            "{path} is write-protected (lock switch or read-only image); opened \
+             read-only, a restore to it cannot work"
+        ),
+        _ => log::info!(
+            "{path} opened read-only (read-write open failed: {}); a restore will \
+             ask for administrator rights",
+            std::io::Error::from_raw_os_error(rw_errno)
+        ),
     }
 }
 
@@ -1005,14 +1066,79 @@ fn authopen_blocked_reason() -> Option<String> {
 /// only that a wedged helper eventually becomes an error instead of a hang.
 const AUTHOPEN_TIMEOUT: libc::time_t = 120;
 
-/// Receive a file descriptor sent via `SCM_RIGHTS` ancillary data on a Unix socket.
-fn receive_fd_from_socket(sock: libc::c_int) -> Result<libc::c_int> {
+/// `authopen` answered but handed back no descriptor (R11).
+#[derive(Debug)]
+pub struct AuthopenRefused {
+    /// errno the helper reported; `ECANCELED` when the user dismissed the dialog.
+    errno: i32,
+    /// What the helper printed to stderr, if anything.
+    stderr: String,
+}
+
+impl AuthopenRefused {
+    /// The user dismissed the authorization dialog.
+    pub fn cancelled(&self) -> bool {
+        self.errno == libc::ECANCELED
+    }
+}
+
+impl std::fmt::Display for AuthopenRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.cancelled() {
+            return write!(f, "administrator authorization was cancelled");
+        }
+        // authopen's own stderr says which of its two opens failed (see the
+        // module header); the errno alone cannot, both sides use EACCES.
+        let detail = self.stderr.trim();
+        let why = if detail.contains("AuthorizationCopyRights") {
+            "administrator authorization was denied"
+        } else if detail.contains("couldn't open") {
+            "authopen could not open the device even as root"
+        } else {
+            "authopen returned no descriptor"
+        };
+        write!(
+            f,
+            "{why}: {}",
+            std::io::Error::from_raw_os_error(self.errno)
+        )?;
+        if !detail.is_empty() {
+            write!(f, " ({detail})")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for AuthopenRefused {}
+
+/// Whether an escalation error is the user cancelling the dialog, through any
+/// context layers the callers added.
+pub fn is_authorization_cancelled(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<AuthopenRefused>()
+        .is_some_and(AuthopenRefused::cancelled)
+}
+
+/// Decode the two bytes authopen sends in place of a descriptor.
+fn authopen_refusal(reply: &[u8], stderr: String) -> AuthopenRefused {
+    // Byte 1 is the errno of the failed open, or 1 when the helper had none.
+    let errno = reply.get(1).copied().unwrap_or(0) as i32;
+    AuthopenRefused { errno, stderr }
+}
+
+/// One reply from authopen: the descriptor, or the two bytes it sent instead.
+enum AuthopenReply {
+    Fd(libc::c_int),
+    Refused([u8; 2]),
+}
+
+/// Receive authopen's reply: a descriptor via `SCM_RIGHTS`, or its refusal.
+fn receive_authopen_reply(sock: libc::c_int) -> Result<AuthopenReply> {
     use std::mem;
 
-    let mut data = 0u8;
+    let mut data = [0u8; 2];
     let mut iov = libc::iovec {
-        iov_base: &mut data as *mut u8 as *mut c_void,
-        iov_len: 1,
+        iov_base: data.as_mut_ptr() as *mut c_void,
+        iov_len: data.len(),
     };
 
     // Allocate a buffer large enough for one cmsghdr + one int (the fd)
@@ -1047,12 +1173,12 @@ fn receive_fd_from_socket(sock: libc::c_int) -> Result<libc::c_int> {
     };
 
     if ret <= 0 {
-        bail!("recvmsg: authopen did not send a file descriptor");
+        bail!("recvmsg: authopen exited without answering");
     }
 
     let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
     if cmsg.is_null() {
-        bail!("recvmsg: no ancillary control message (authopen may have failed)");
+        return Ok(AuthopenReply::Refused(data));
     }
 
     let (cmsg_level, cmsg_type) = unsafe { ((*cmsg).cmsg_level, (*cmsg).cmsg_type) };
@@ -1069,7 +1195,16 @@ fn receive_fd_from_socket(sock: libc::c_int) -> Result<libc::c_int> {
         std::ptr::read_unaligned(data_ptr)
     };
 
-    Ok(fd)
+    Ok(AuthopenReply::Fd(fd))
+}
+
+/// Everything the helper wrote to the stderr pipe, once it has exited.
+fn drain_stderr_pipe(fd: libc::c_int) -> String {
+    use std::io::Read as _;
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    let mut out = Vec::new();
+    let _ = file.read_to_end(&mut out);
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Open a device using `/usr/libexec/authopen`.
@@ -1093,6 +1228,18 @@ fn authopen_device(path: &str, flags: libc::c_int) -> Result<File> {
 
     if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) } != 0 {
         bail!("socketpair failed: {}", std::io::Error::last_os_error());
+    }
+
+    // The helper's stderr says why it refused (R11); it writes a line or two,
+    // far below the pipe buffer, so it is drained after the exit.
+    let mut errp = [-1i32; 2];
+    if unsafe { libc::pipe(errp.as_mut_ptr()) } != 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe {
+            libc::close(sv[0]);
+            libc::close(sv[1]);
+        }
+        bail!("pipe failed: {err}");
     }
 
     // Bound the parent's wait so a helper that never answers surfaces as an
@@ -1138,18 +1285,23 @@ fn authopen_device(path: &str, flags: libc::c_int) -> Result<File> {
             unsafe {
                 libc::close(sv[0]);
                 libc::close(sv[1]);
+                libc::close(errp[0]);
+                libc::close(errp[1]);
             }
             bail!("fork failed: {}", std::io::Error::last_os_error());
         }
         0 => {
             // Child process — only async-signal-safe calls between fork and exec
             unsafe {
-                // Close parent-side end
+                // Close parent-side ends
                 libc::close(sv[0]);
+                libc::close(errp[0]);
 
                 // Wire socket to stdout (authopen sends fd via -stdoutpipe on stdout)
                 libc::dup2(sv[1], libc::STDOUT_FILENO);
                 libc::close(sv[1]);
+                libc::dup2(errp[1], libc::STDERR_FILENO);
+                libc::close(errp[1]);
 
                 libc::execv(authopen_path.as_ptr(), argv.as_ptr());
                 libc::exit(-1); // exec failed
@@ -1158,29 +1310,24 @@ fn authopen_device(path: &str, flags: libc::c_int) -> Result<File> {
         child_pid => {
             // Parent process
             unsafe {
-                // Close child-side end
+                // Close child-side ends
                 libc::close(sv[1]);
+                libc::close(errp[1]);
             }
 
-            // 3. Receive the file descriptor via SCM_RIGHTS (retry on EINTR)
-            let received_fd = match receive_fd_from_socket(sv[0]) {
-                Ok(fd) => {
-                    unsafe { libc::close(sv[0]) };
-                    fd
+            // 3. Receive the reply: a descriptor via SCM_RIGHTS, or a refusal
+            let reply = receive_authopen_reply(sv[0]);
+            unsafe { libc::close(sv[0]) };
+            if reply.is_err() {
+                unsafe {
+                    // Kill before reaping: on the timeout path the helper is
+                    // still sitting on a prompt, so a plain waitpid would
+                    // block for exactly as long as we just refused to.
+                    libc::kill(child_pid, libc::SIGKILL);
+                    let mut wstatus = 0i32;
+                    libc::waitpid(child_pid, &mut wstatus, 0);
                 }
-                Err(e) => {
-                    unsafe {
-                        libc::close(sv[0]);
-                        // Kill before reaping: on the timeout path the helper is
-                        // still sitting on a prompt, so a plain waitpid would
-                        // block for exactly as long as we just refused to.
-                        libc::kill(child_pid, libc::SIGKILL);
-                        let mut wstatus = 0i32;
-                        libc::waitpid(child_pid, &mut wstatus, 0);
-                    }
-                    return Err(e);
-                }
-            };
+            }
 
             // 4. Wait for authopen to exit (retry on EINTR)
             let mut wstatus = 0i32;
@@ -1191,12 +1338,23 @@ fn authopen_device(path: &str, flags: libc::c_int) -> Result<File> {
                 }
                 break;
             }
+            let stderr = drain_stderr_pipe(errp[0]);
+
+            let received_fd = match reply? {
+                AuthopenReply::Fd(fd) => fd,
+                AuthopenReply::Refused(bytes) => {
+                    let refused = authopen_refusal(&bytes, stderr);
+                    log::info!("authopen refused {path}: {refused}");
+                    return Err(refused.into());
+                }
+            };
 
             if libc::WIFEXITED(wstatus) && libc::WEXITSTATUS(wstatus) != 0 {
                 unsafe { libc::close(received_fd) };
                 bail!(
-                    "authopen exited with error code {}",
-                    libc::WEXITSTATUS(wstatus)
+                    "authopen exited with error code {} ({})",
+                    libc::WEXITSTATUS(wstatus),
+                    stderr.trim()
                 );
             }
 
@@ -1211,8 +1369,8 @@ fn authopen_device(path: &str, flags: libc::c_int) -> Result<File> {
 /// Open a device path with privilege escalation via authopen when needed.
 ///
 /// Tries `authopen` first (shows the native macOS auth dialog if not root).
-/// If authopen fails for a reason other than user cancellation, falls back
-/// to a direct `open(2)` — which works when the app is already root via sudo.
+/// A cancelled dialog is the user's answer and is returned as such (R11); any
+/// other refusal falls back to a direct `open(2)`, which works under sudo.
 ///
 /// Never uses `O_EXLOCK`, which is unreliable on raw character devices and
 /// causes intermittent `EBUSY` errors even after a successful unmount.
@@ -1229,8 +1387,7 @@ fn open_device(path: &str, flags: libc::c_int) -> Result<File> {
         None => match cached_authopen(path, flags).and_then(|d| Ok(d.dup_as_file()?)) {
             Ok(file) => return Ok(file),
             Err(e) => {
-                let msg = e.to_string().to_lowercase();
-                if msg.contains("cancelled") || msg.contains("canceled") {
+                if is_authorization_cancelled(&e) {
                     return Err(e);
                 }
                 log::warn!("authopen warning: {} — falling back to direct open", e);
@@ -1294,50 +1451,6 @@ fn bsd_name_from_path(path: &Path) -> &str {
     }
 }
 
-/// Open a device for read-only inspection without unmounting or claiming.
-///
-/// Used by the Inspect tab, which runs on the GUI thread and cannot afford
-/// the DA unmount/claim latency. Since inspect is non-destructive, exclusive
-/// access is not required.
-///
-/// Tries a direct `O_RDONLY` open first; on `EPERM` or `EACCES`, escalates
-/// via `authopen` so the user is prompted for administrator credentials once.
-pub(crate) fn open_device_for_inspect(path: &Path) -> Result<File> {
-    let path_str = path.to_string_lossy();
-    let is_device = path_str.starts_with("/dev/disk") || path_str.starts_with("/dev/rdisk");
-
-    if is_device {
-        let raw_device = if path_str.starts_with("/dev/disk") {
-            format!("/dev/r{}", &path_str[5..])
-        } else {
-            path_str.to_string()
-        };
-
-        let c_path = CString::new(raw_device.as_str()).context("invalid device path")?;
-        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY) };
-        if fd >= 0 {
-            unsafe { libc::fcntl(fd, F_NOCACHE, 1) };
-            return Ok(unsafe { File::from_raw_fd(fd) });
-        }
-
-        let err = std::io::Error::last_os_error();
-        // The unprivileged open failed. Escalate via authopen (the native admin
-        // prompt, opening as root) for ANY errno — not just EPERM/EACCES. A
-        // still-mounted or DiskArbitration-claimed disk returns EBUSY here,
-        // which the old EPERM/EACCES-only gate let fall straight through to the
-        // error below with no prompt at all (the reported symptom). Inspect is
-        // read-only, so request O_RDONLY: root can open a mounted disk's raw
-        // device read-only even when an O_RDWR open would be refused with EBUSY.
-        // (Device *writes* go through open_target_for_writing, which unmounts
-        // and opens O_RDWR separately.)
-        log::warn!("direct open of {raw_device} failed ({err}); escalating via authopen");
-        authopen_device(&raw_device, libc::O_RDONLY)
-            .with_context(|| format!("cannot open {raw_device} for reading"))
-    } else {
-        File::open(path).with_context(|| format!("cannot open {}", path.display()))
-    }
-}
-
 /// Open a target device for writing with exclusive access.
 ///
 /// Strategy:
@@ -1348,6 +1461,16 @@ pub(crate) fn open_device_for_inspect(path: &Path) -> Result<File> {
 pub(crate) fn open_target_for_writing(path: &Path) -> Result<(File, Option<DiskClaim>)> {
     let path_str = path.to_string_lossy();
     let disk_name = bsd_name_from_path(path);
+
+    // Write-protected media refuses O_RDWR for root as well (R6): say so before
+    // unmounting anything or raising a prompt that cannot help.
+    if da_media_writable(disk_name) == Some(false) {
+        bail!(
+            "{} is write-protected (media lock switch or read-only image); it cannot \
+             be written to",
+            path.display()
+        );
+    }
 
     // Unmount all volumes before claiming/opening
     if let Err(e) = da_unmount_disk(disk_name) {
@@ -1423,28 +1546,33 @@ pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
         let c_path = CString::new(raw_device.as_str()).context("invalid device path")?;
 
         // 2. Direct open — we may be root already, or the media may need no
-        //    privilege. O_RDWR first so the handle also covers a later write.
+        //    privilege. O_RDWR first so the handle also covers a later write,
+        //    then O_RDONLY regardless of why: write-protected media refuses
+        //    O_RDWR with EACCES for root as well (R6), so a read-only success
+        //    is the answer, not a reason to prompt.
         let mut busy = false;
+        let mut rw_errno = None;
         let mut last_err = None;
         for flags in [libc::O_RDWR, libc::O_RDONLY] {
             let fd = unsafe { libc::open(c_path.as_ptr(), flags) };
             if fd >= 0 {
                 unsafe { libc::fcntl(fd, F_NOCACHE, 1) };
+                let file = unsafe { File::from_raw_fd(fd) };
+                if let Some(rw_errno) = rw_errno {
+                    log_read_only_open(&raw_device, &file, rw_errno);
+                }
                 return Ok(ElevatedSource {
-                    file: super::SourceHandle::File(unsafe { File::from_raw_fd(fd) }),
+                    file: super::SourceHandle::File(file),
                     temp_path: None,
                     disk_claim,
                 });
             }
             let err = std::io::Error::last_os_error();
-            let is_busy = err.raw_os_error() == Some(libc::EBUSY);
-            busy |= is_busy;
-            last_err = Some(err);
-            // Only EBUSY is worth retrying read-only; a permission failure is
-            // about privilege, not access mode, and goes to authopen below.
-            if !is_busy {
-                break;
+            busy |= err.raw_os_error() == Some(libc::EBUSY);
+            if flags == libc::O_RDWR {
+                rw_errno = Some(err.raw_os_error().unwrap_or(0));
             }
+            last_err = Some(err);
         }
 
         let err = last_err.expect("the probe loop always records its last error");
@@ -1453,13 +1581,41 @@ pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
         // 3. On EPERM or EACCES, escalate via authopen and cache the result, in
         //    the widest mode this disk can give ([`read_escalation_flags`]).
         if raw == libc::EPERM || raw == libc::EACCES {
-            let flags = read_escalation_flags(unmounted, busy);
-            if flags == libc::O_RDONLY {
+            let writable = da_media_writable(disk_name).unwrap_or(true);
+            let flags = read_escalation_flags(unmounted, busy, writable);
+            if !writable {
+                log::warn!(
+                    "{raw_device} is write-protected; escalating read-only, a restore to \
+                     it cannot work"
+                );
+            } else if flags == libc::O_RDONLY {
                 log::info!("{raw_device} still has a volume mounted; escalating read-only");
             }
-            let shared = cached_authopen(&raw_device, flags).with_context(|| {
-                format!("cannot open {} for reading (authopen failed)", raw_device)
-            })?;
+            // `busy` is unknowable here: the probe loop breaks on EACCES before
+            // it can learn whether the device is also busy, so a read-write
+            // request can be refused *after* the user has already authenticated
+            // — authopen authorises, then its own open(2) returns EBUSY and it
+            // exits non-zero. Reading is what was asked for, so fall back to
+            // read-only rather than failing outright. A cancelled dialog is
+            // the user's answer, though: no second prompt for it (R11).
+            let shared = match cached_authopen(&raw_device, flags) {
+                Ok(s) => s,
+                Err(e) if flags != libc::O_RDONLY && !is_authorization_cancelled(&e) => {
+                    log::warn!(
+                        "read-write escalation of {raw_device} failed ({e:#});                          retrying read-only"
+                    );
+                    cached_authopen(&raw_device, libc::O_RDONLY).with_context(|| {
+                        format!(
+                            "cannot open {raw_device} for reading: authopen was refused                              read-write and read-only. If a volume on this disk is still                              mounted, eject it in Finder and retry"
+                        )
+                    })?
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("cannot open {raw_device} for reading (authopen failed)")
+                    })
+                }
+            };
             return Ok(ElevatedSource {
                 file: super::SourceHandle::Device(shared),
                 temp_path: None,
@@ -1555,6 +1711,71 @@ pub fn authopen_optical_device(device_path: &str) -> Result<File> {
         &raw_device_path(device_path),
         libc::O_RDONLY | libc::O_NONBLOCK,
     )
+}
+
+#[cfg(test)]
+mod authopen_reply_tests {
+    use super::*;
+
+    // Byte pairs are what the helper sends in place of a descriptor: byte 1 is
+    // the errno its authorization-status table produced (see the module header).
+
+    #[test]
+    fn a_cancelled_dialog_is_named_as_such() {
+        let r = authopen_refusal(
+            &[0, libc::ECANCELED as u8],
+            "AuthorizationCopyRights failed: The authorization was canceled by the user.\n"
+                .to_string(),
+        );
+        assert!(r.cancelled());
+        assert!(r.to_string().contains("cancelled"), "{r}");
+        let err: anyhow::Error = r.into();
+        let wrapped = err.context("cannot open /dev/rdisk5 for reading");
+        assert!(
+            is_authorization_cancelled(&wrapped),
+            "must see through context"
+        );
+    }
+
+    #[test]
+    fn a_denied_dialog_is_not_a_cancel() {
+        // Three wrong passwords: the same EACCES a write-protected card gives,
+        // told apart by which of authopen's two opens complained.
+        let r = authopen_refusal(
+            &[0, libc::EACCES as u8],
+            "AuthorizationCopyRights failed: The authorization was denied.\n".to_string(),
+        );
+        assert!(!r.cancelled());
+        let text = r.to_string();
+        assert!(text.contains("denied"), "{text}");
+        assert!(!is_authorization_cancelled(&r.into()));
+    }
+
+    #[test]
+    fn a_device_root_cannot_open_reports_the_errno() {
+        let r = authopen_refusal(
+            &[0, libc::EACCES as u8],
+            "couldn't open /dev/rdisk7: Permission denied\n".to_string(),
+        );
+        let text = r.to_string();
+        assert!(text.contains("even as root"), "{text}");
+        assert!(text.contains("Permission denied"), "{text}");
+    }
+
+    #[test]
+    fn a_busy_device_after_authorization_keeps_ebusy() {
+        // What the read-only retry in open_source_for_reading keys on.
+        let r = authopen_refusal(&[0, libc::EBUSY as u8], String::new());
+        assert_eq!(r.errno, libc::EBUSY);
+        assert!(!r.cancelled());
+        assert!(r.to_string().contains("busy"), "{r}");
+    }
+
+    #[test]
+    fn a_truncated_reply_is_not_a_cancel() {
+        let r = authopen_refusal(&[0], String::new());
+        assert!(!r.cancelled());
+    }
 }
 
 #[cfg(test)]
@@ -1734,13 +1955,31 @@ mod shared_device_tests {
     fn a_read_escalates_read_write_unless_a_volume_is_still_mounted() {
         // One prompt for the whole session: the read path escalates read-write
         // so a later restore reuses the descriptor instead of prompting again.
-        assert_eq!(read_escalation_flags(true, false), libc::O_RDWR);
+        assert_eq!(read_escalation_flags(true, false, true), libc::O_RDWR);
 
         // ...except on a disk that would not unmount, where the kernel refuses
         // O_RDWR outright (EBUSY) and read-only is the only mode that works.
-        assert_eq!(read_escalation_flags(false, false), libc::O_RDONLY);
-        assert_eq!(read_escalation_flags(true, true), libc::O_RDONLY);
-        assert_eq!(read_escalation_flags(false, true), libc::O_RDONLY);
+        assert_eq!(read_escalation_flags(false, false, true), libc::O_RDONLY);
+        assert_eq!(read_escalation_flags(true, true, true), libc::O_RDONLY);
+        assert_eq!(read_escalation_flags(false, true, true), libc::O_RDONLY);
+    }
+
+    #[test]
+    fn write_protected_media_is_never_escalated_read_write() {
+        // R6: a locked SD card refuses O_RDWR with EACCES for root too, so a
+        // read-write prompt would authenticate the user for nothing and then
+        // fail. Read-only is the only mode that can succeed.
+        assert_eq!(read_escalation_flags(true, false, false), libc::O_RDONLY);
+        assert_eq!(read_escalation_flags(false, true, false), libc::O_RDONLY);
+    }
+
+    #[test]
+    fn a_regular_file_has_no_writability_verdict() {
+        // DKIOCISWRITABLE only answers for disk devices; a plain file must give
+        // None so the caller falls back to the plain "opened read-only" wording.
+        let tmp = tempfile::NamedTempFile::new().expect("temp file");
+        let file = std::fs::File::open(tmp.path()).expect("open");
+        assert_eq!(media_is_writable(&file), None);
     }
 
     #[test]

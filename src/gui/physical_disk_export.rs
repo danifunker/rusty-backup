@@ -76,8 +76,8 @@ pub struct PhysicalDiskExport {
     target_partition: Option<usize>,
     /// Partitions on the selected device, re-read when the selection changes.
     target_partitions: Vec<rusty_backup::partition::PartitionInfo>,
-    /// Device index `target_partitions` was read from.
-    scanned_device: Option<usize>,
+    /// Identity of the device `target_partitions` was read from.
+    scanned_device: Option<rusty_backup::device::DeviceIdentity>,
 }
 
 impl Default for PhysicalDiskExport {
@@ -112,6 +112,14 @@ pub enum Action {
 }
 
 impl PhysicalDiskExport {
+    /// A device write is in flight; the restore tab's controls stay locked.
+    pub fn is_writing(&self) -> bool {
+        self.write_status
+            .as_ref()
+            .and_then(|s| s.lock().ok().map(|g| !g.finished))
+            .unwrap_or(false)
+    }
+
     /// Open the sub-window for a given source. Seeds defaults from the
     /// heuristic when the source is a superfloppy.
     pub fn open_for(
@@ -159,6 +167,12 @@ impl PhysicalDiskExport {
         self.size_mode = SizeMode::Original;
         self.custom_size_mib = (source.size_bytes / (1024 * 1024)).max(1) as u32;
         self.source = Some(source);
+        // A new source starts with no target: the last dialog's device index
+        // may name another disk by now.
+        self.selected_device = None;
+        self.target_partition = None;
+        self.target_partitions.clear();
+        self.scanned_device = None;
         self.confirm_text.clear();
         self.write_status = None;
         self.last_error = None;
@@ -200,7 +214,7 @@ impl PhysicalDiskExport {
 
                 ui.add_enabled_ui(!source.has_partition_table, |ui| {
                     let group_label = if source.has_partition_table {
-                        "Synthesize partition table (source already has one — disabled)"
+                        "Synthesize partition table (source already has one - disabled)"
                     } else {
                         "Synthesize partition table"
                     };
@@ -366,9 +380,10 @@ impl PhysicalDiskExport {
     fn render_target_region(&mut self, ui: &mut egui::Ui, device: Option<&DiskDevice>) {
         let Some(dev) = device else { return };
 
-        if self.scanned_device != self.selected_device {
+        let identity = dev.identity();
+        if self.scanned_device.as_ref() != Some(&identity) {
             self.target_partitions = read_device_partitions(&dev.path);
-            self.scanned_device = self.selected_device;
+            self.scanned_device = Some(identity);
             self.target_partition = None;
         }
 
@@ -505,7 +520,7 @@ impl PhysicalDiskExport {
                 source: PhysicalWriteSource::Image(source.path.clone()),
                 target_device_path: device.path.clone(),
                 target_size_bytes: target_size,
-                extent: WriteExtent::partition(part.start_lba, part.size_bytes),
+                extent: WriteExtent::partition_at(part.byte_offset(), part.size_bytes),
                 wrap: None,
             };
             self.last_error = None;

@@ -29,7 +29,7 @@ use btree::{
     repair_node_bitmap,
 };
 use catalog::{check_catalog_consistency, repair_catalog_consistency};
-use mdb::{check_alternate_mdb, check_embedded_hfs_plus, check_mdb};
+use mdb::{check_allocation_area_end, check_alternate_mdb, check_embedded_hfs_plus, check_mdb};
 
 // Re-export for external callers (hfs.rs uses `super::hfs_fsck::rebuild_index_nodes`).
 pub(crate) use btree::rebuild_index_nodes;
@@ -44,6 +44,9 @@ pub(super) enum HfsFsckCode {
     // MDB issues
     BadSignature,
     AlternateMdbMismatch,
+    /// The allocation area does not end at the partition's next-to-last
+    /// sector, where Mac OS keeps the alternate MDB (fsck_hfs E_ABlkSt, R-058).
+    AllocationAreaEnd,
     EmbeddedHfsPlusInvalid,
     BadBlockSize,
     BlockSizeUpperBound,
@@ -59,6 +62,12 @@ pub(super) enum HfsFsckCode {
     MapNodeBadStructure,
     NodeBitmapMissing,
     KeysOutOfOrder,
+    /// An index separator that is not its child's first key (fsck_hfs E_IKey).
+    IndexKeyMismatch,
+    /// A leaf with no records and no siblings (fsck_hfs E_BadNode).
+    EmptyLeafWithoutSiblings,
+    /// A free node still holding data (fsck_hfs "Unused node is not erased").
+    FreeNodeNotErased,
     OffsetTableNotMonotonic,
     OffsetTableOutOfBounds,
     LeafChainBroken,
@@ -103,6 +112,7 @@ fn is_repairable(code: HfsFsckCode) -> bool {
     !matches!(
         code,
         HfsFsckCode::BadBlockSize
+            | HfsFsckCode::AllocationAreaEnd
             | HfsFsckCode::BlockSizeUpperBound
             | HfsFsckCode::VbmDataAreaCollision
             | HfsFsckCode::MdbVBMStTooLow
@@ -139,12 +149,14 @@ pub(super) fn hfs_issue(code: HfsFsckCode, message: impl Into<String>) -> FsckIs
 /// `bitmap` — volume allocation bitmap bytes.
 /// `extents_data` — optional extents overflow B-tree file content (for files with >3 extents).
 /// `alt_mdb_sector` — optional raw 512-byte alternate MDB sector (last sector of volume).
+/// `partition_len` — the partition's length when known; the allocation area must end at its next-to-last sector.
 pub(crate) fn check_hfs_integrity(
     mdb: &HfsMasterDirectoryBlock,
     catalog_data: &[u8],
     bitmap: &[u8],
     extents_data: Option<&[u8]>,
     alt_mdb_sector: Option<&[u8; 512]>,
+    partition_len: Option<u64>,
 ) -> FsckResult {
     let mut errors = Vec::new();
     let mut warnings = Vec::new();
@@ -155,6 +167,7 @@ pub(crate) fn check_hfs_integrity(
 
     // Phase 1: MDB sanity
     check_mdb(mdb, &mut errors);
+    check_allocation_area_end(mdb, partition_len, &mut errors);
 
     // If signature is bad, the rest of the check is meaningless
     if errors.iter().any(|e| e.code == "BadSignature") {
@@ -316,6 +329,7 @@ pub(crate) fn repair_hfs(
         bitmap,
         extents_data.as_deref().map(|v| v.as_slice()),
         None, // alt MDB not available during repair
+        None, // the partition length is not either; the fit is not repairable anyway
     );
     let unrepairable_count = check_result.errors.iter().filter(|e| !e.repairable).count();
 
@@ -1770,6 +1784,84 @@ mod tests {
         data
     }
 
+    /// Add leaf node 2 holding one record with `parent_id`, chained after
+    /// leaf 1 (which the minimal tree fills with parent_id 1).
+    fn chain_second_leaf(data: &mut [u8], node_size: usize, parent_id: u32) {
+        let n1 = node_size;
+        BigEndian::write_u32(&mut data[n1..n1 + 4], 2); // leaf 1 -> leaf 2
+        let n2 = 2 * node_size;
+        data[n2 + 8] = BTREE_LEAF_NODE as u8;
+        data[n2 + 9] = 1;
+        BigEndian::write_u16(&mut data[n2 + 10..n2 + 12], 1);
+        let r0 = n2 + 14;
+        data[r0] = 6;
+        BigEndian::write_u32(&mut data[r0 + 2..r0 + 6], parent_id);
+        data[r0 + 8] = CATALOG_DIR as u8;
+        BigEndian::write_u32(&mut data[r0 + 14..r0 + 18], 9);
+        let lot = n2 + node_size;
+        BigEndian::write_u16(&mut data[lot - 2..lot], 14);
+        BigEndian::write_u16(&mut data[lot - 4..lot - 2], 14 + 78);
+        data[0xf8] |= 0b00100000; // node 2 allocated
+        BigEndian::write_u32(&mut data[14 + 14..14 + 18], 2); // last_leaf = 2
+    }
+
+    /// H5: keys were only compared inside a node, so a leaf whose keys sort
+    /// below the previous leaf's passed fsck.
+    #[test]
+    fn keys_out_of_order_across_leaves_are_detected() {
+        let node_size = 512;
+        let mut data = make_minimal_btree(node_size);
+        chain_second_leaf(&mut data, node_size, 0); // 0 < 1: chain runs backwards
+        let header = BTreeHeader::read(&data);
+        let mut errors = Vec::new();
+        check_key_ordering(&data, &header, &mut errors);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].code, "KeysOutOfOrder");
+        assert!(
+            errors[0].message.contains("next leaf"),
+            "{}",
+            errors[0].message
+        );
+
+        let mut data = make_minimal_btree(node_size);
+        chain_second_leaf(&mut data, node_size, 5); // 1 < 5: fine
+        let header = BTreeHeader::read(&data);
+        let mut errors = Vec::new();
+        check_key_ordering(&data, &header, &mut errors);
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    /// H5: an index record whose key sorts above its child's first key sends
+    /// every lookup for that range into the wrong leaf.
+    #[test]
+    fn index_separator_above_its_child_is_detected() {
+        let node_size = 512;
+        let mut data = make_minimal_btree(node_size);
+        let n3 = 3 * node_size;
+        data[n3 + 8] = crate::fs::hfs_common::BTREE_INDEX_NODE as u8;
+        data[n3 + 9] = 2;
+        BigEndian::write_u16(&mut data[n3 + 10..n3 + 12], 1);
+        let r0 = n3 + 14;
+        data[r0] = 6; // key: reserved + parent 9 + empty name
+        BigEndian::write_u32(&mut data[r0 + 2..r0 + 6], 9);
+        BigEndian::write_u32(&mut data[r0 + 8..r0 + 12], 1); // child = leaf 1 (parent 1)
+        let lot = n3 + node_size;
+        BigEndian::write_u16(&mut data[lot - 2..lot], 14);
+        BigEndian::write_u16(&mut data[lot - 4..lot - 2], 14 + 12);
+        data[0xf8] |= 0b00010000; // node 3 allocated
+        BigEndian::write_u16(&mut data[14..16], 2); // depth 2
+        BigEndian::write_u32(&mut data[14 + 2..14 + 6], 3); // root = 3
+        let header = BTreeHeader::read(&data);
+        let mut errors = Vec::new();
+        check_key_ordering(&data, &header, &mut errors);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].message.contains("index node 3"),
+            "{}",
+            errors[0].message
+        );
+    }
+
     #[test]
     fn test_keys_in_order() {
         let node_size = 512;
@@ -1857,7 +1949,7 @@ mod tests {
         let mdb = make_test_mdb(); // file_count=0, folder_count=0
         let bitmap = vec![0u8; 16];
         let catalog_data: &[u8] = &[];
-        let result = check_hfs_integrity(&mdb, catalog_data, &bitmap, None, None);
+        let result = check_hfs_integrity(&mdb, catalog_data, &bitmap, None, None, None);
         assert!(
             result.is_clean(),
             "blank volume with empty catalog should be clean, got errors: {:?}",
@@ -1872,7 +1964,7 @@ mod tests {
         let mdb = make_test_mdb();
         let bitmap = vec![0u8; 16];
         let catalog_data = vec![0u8; 512];
-        let result = check_hfs_integrity(&mdb, &catalog_data, &bitmap, None, None);
+        let result = check_hfs_integrity(&mdb, &catalog_data, &bitmap, None, None, None);
         assert!(
             result.is_clean(),
             "blank volume with zeroed catalog should be clean, got errors: {:?}",
@@ -1887,7 +1979,7 @@ mod tests {
         mdb.file_count = 5;
         let bitmap = vec![0u8; 16];
         let catalog_data = vec![0u8; 512];
-        let result = check_hfs_integrity(&mdb, &catalog_data, &bitmap, None, None);
+        let result = check_hfs_integrity(&mdb, &catalog_data, &bitmap, None, None, None);
         assert!(
             !result.is_clean(),
             "non-empty volume with zeroed catalog should have errors"

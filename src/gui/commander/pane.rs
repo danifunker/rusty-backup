@@ -2085,7 +2085,7 @@ impl CommanderPane {
                         ui.colored_label(read_only_badge_color(ui.visuals()), "Read-only")
                             .on_hover_text(
                                 "This source can be browsed and copied out of, but not \
-                                 written to — copies into this pane are disabled.",
+                                 written to - copies into this pane are disabled.",
                             );
                     }
                 }

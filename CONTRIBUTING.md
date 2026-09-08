@@ -21,7 +21,7 @@ cd rusty-backup
 cargo build      # also installs the cargo-husky pre-commit hook
 ```
 
-The first `cargo build` installs a git pre-commit hook that runs `cargo fmt --all` automatically. The hook lives in `.cargo-husky/hooks/pre-commit`.
+The first `cargo build` installs a git pre-commit hook that runs `cargo fmt --all` automatically, then `cargo clippy --all-targets -- -D warnings` when Rust sources are staged. The hook lives in `.cargo-husky/hooks/pre-commit`.
 
 ### Build / run / test
 
@@ -41,6 +41,13 @@ cargo fmt                      # Auto-format
 cargo clippy                   # Lint
 cargo build --all-targets      # Must produce zero warnings
 ```
+
+Debug builds are memory-heavy: the crate is ~400k lines in one library and
+`cargo test` links ~100 binaries against it. `Cargo.toml` therefore builds
+debug targets with line tables only and `.cargo/config.toml` caps cargo at
+four jobs. Do not raise either on a 16 GB machine; on Linux the userspace OOM
+killer takes the whole terminal session, not just rustc. Background and the
+numbers: [docs/build-memory-crashes.md](docs/build-memory-crashes.md).
 
 ### Hard rules for every PR
 

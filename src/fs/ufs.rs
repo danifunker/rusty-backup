@@ -65,7 +65,7 @@ use crate::fs::CompactResult;
 /// (0) and `SBLOCK_PIGGY` (262144) are intentionally not in the list:
 /// neither shape appears on any disk image we expect to encounter.
 const SB_OFFSET_UFS2: u64 = 65536;
-const SB_OFFSET_UFS1: u64 = 8192;
+pub(crate) const SB_OFFSET_UFS1: u64 = 8192;
 
 /// UFS1 magic — `0x00011954`, encoded little-endian as `54 19 01 00`.
 pub(crate) const MAGIC_UFS1: u32 = 0x0001_1954;
@@ -93,14 +93,23 @@ pub(crate) const OFF_NCG: usize = 0x02C; // fs_ncg         u32 — # cylinder gr
 pub(crate) const OFF_BSIZE: usize = 0x030; // fs_bsize       i32 — block size in bytes
 pub(crate) const OFF_FSIZE: usize = 0x034; // fs_fsize       i32 — fragment size in bytes
 pub(crate) const OFF_FRAG: usize = 0x038; // fs_frag        i32 — frags per block
+pub(crate) const OFF_FSBTODB: usize = 0x064; // fs_fsbtodb     i32 — frag -> device-block shift
 pub(crate) const OFF_IPG: usize = 0x0B8; // fs_ipg         u32 — inodes per CG
 pub(crate) const OFF_FPG: usize = 0x0BC; // fs_fpg         i32 — fragments per CG
-const OFF_VOLNAME: usize = 680; // fs_volname[32] — `u_char[MAXVOLLEN]`
-pub(crate) const OFF_SIZE_UFS2: usize = 1080; // fs_size        i64 — UFS2 64-bit fragments
-const OFF_MAXSYMLINKLEN: usize = 0x528; // fs_maxsymlinklen i32 — inline-symlink cutoff (60 for UFS1, 120 for UFS2)
+pub(crate) const OFF_VOLNAME: usize = 680; // fs_volname[32] — `u_char[MAXVOLLEN]`
+pub(crate) const OFF_SIZE_UFS2: usize = 1080;
+/// `fs_old_csaddr` — first fragment of the cylinder-summary area (UFS1).
+pub(crate) const OFF_CSADDR_UFS1: usize = 0x098;
+/// `fs_csaddr` — the 64-bit UFS2 spelling of the same.
+pub(crate) const OFF_CSADDR_UFS2: usize = 1096;
+/// `fs_old_cstotal` — the volume-wide {ndir, nbfree, nifree, nffree} totals.
+pub(crate) const OFF_CSTOTAL_OLD: usize = 0x0C0;
+/// `fs_cstotal` — the 64-bit mirror a 4.4BSD superblock also keeps.
+pub(crate) const OFF_CSTOTAL64: usize = 1008; // fs_size        i64 — UFS2 64-bit fragments
+pub(crate) const OFF_MAXSYMLINKLEN: usize = 0x528; // fs_maxsymlinklen i32 — inline-symlink cutoff (60 for UFS1, 120 for UFS2)
 const OFF_FLAGS2: usize = 0x35E; // fs_flags2      i32 (relevant journal bits live elsewhere too, but this is the canonical "ENABLED" word in modern UFS2)
 
-const VOLNAME_LEN: usize = 32;
+pub(crate) const VOLNAME_LEN: usize = 32;
 
 // ---- Dinode constants (`struct ufs1_dinode` / `struct ufs2_dinode`) ----
 
@@ -116,19 +125,20 @@ const UFS_NIADDR: usize = 3; // indirect disk-block pointers per inode
 const UFS_MAXPATHLEN: usize = 1024;
 
 /// UFS1 on-disk dinode is exactly 128 bytes.
-const DINODE1_SIZE: u64 = 128;
+pub(crate) const DINODE1_SIZE: u64 = 128;
 /// UFS2 on-disk dinode is exactly 256 bytes.
 const DINODE2_SIZE: u64 = 256;
 
 // UFS1 dinode field offsets (struct ufs1_dinode in FreeBSD `sys/ufs/ufs/dinode.h`).
-const D1_OFF_MODE: usize = 0; // di_mode    u16
-const D1_OFF_NLINK: usize = 2; // di_nlink   i16
-const D1_OFF_SIZE: usize = 8; // di_size    u64
-const D1_OFF_MTIME: usize = 24; // di_mtime   i32 (epoch seconds)
-const D1_OFF_DB: usize = 40; // di_db[12]  i32
+pub(crate) const D1_OFF_MODE: usize = 0; // di_mode    u16
+pub(crate) const D1_OFF_NLINK: usize = 2; // di_nlink   i16
+pub(crate) const D1_OFF_SIZE: usize = 8; // di_size    u64
+pub(crate) const D1_OFF_MTIME: usize = 24; // di_mtime   i32 (epoch seconds)
+pub(crate) const D1_OFF_DB: usize = 40; // di_db[12]  i32
 const D1_OFF_IB: usize = 88; // di_ib[3]   i32
-const D1_OFF_UID: usize = 112; // di_uid     u32
-const D1_OFF_GID: usize = 116; // di_gid     u32
+pub(crate) const D1_OFF_BLOCKS: usize = 104; // di_blocks  i32 — disk blocks actually held
+pub(crate) const D1_OFF_UID: usize = 112; // di_uid     u32
+pub(crate) const D1_OFF_GID: usize = 116; // di_gid     u32
 
 // UFS2 dinode field offsets (struct ufs2_dinode). di_mode + di_nlink
 // share offsets with UFS1 (offsets 0 + 2); only the version-specific
@@ -136,6 +146,7 @@ const D1_OFF_GID: usize = 116; // di_gid     u32
 const D2_OFF_UID: usize = 4; // di_uid     u32
 const D2_OFF_GID: usize = 8; // di_gid     u32
 const D2_OFF_SIZE: usize = 16; // di_size    u64
+const D2_OFF_BLOCKS: usize = 24; // di_blocks  u64 — disk blocks actually held
 const D2_OFF_MTIME: usize = 40; // di_mtime   i64
 const D2_OFF_DB: usize = 112; // di_db[12]  i64
 const D2_OFF_IB: usize = 208; // di_ib[3]   i64
@@ -159,6 +170,39 @@ pub(crate) const DIRENT_HDR_LEN: usize = 8;
 /// Magic number at offset 4 of every cylinder-group header. Matches
 /// `CG_MAGIC` from FreeBSD `sys/ufs/ffs/fs.h`.
 pub(crate) const CG_MAGIC: u32 = 0x0009_0255;
+/// Bytes one `struct csum` occupies in the cylinder-summary area.
+const CSUM_ENTRY_SIZE: u64 = 16;
+
+/// FFS counts a *free block* in `nbfree` and only counts fragments in
+/// `nffree` while they are **not** part of a wholly free block. So carving a
+/// fragment out of a free block moves `frag - n` fragments into `nffree` and
+/// takes one off `nbfree` — it never simply debits `nffree`. Comparing the
+/// bitmap either side of a change gets this right for any run.
+fn cs_delta_for(before: &[u8], after: &[u8], frag: u64, start: u64, count: u64) -> (i32, i32) {
+    let free = |bm: &[u8], b: u64| {
+        bm.get((b / 8) as usize)
+            .is_some_and(|byte| byte & (1u8 << (b % 8)) != 0)
+    };
+    let (mut d_nbfree, mut d_nffree) = (0i32, 0i32);
+    let first = start / frag;
+    let last = (start + count - 1) / frag;
+    for blk in first..=last {
+        let base = blk * frag;
+        let was_free = (0..frag).filter(|i| free(before, base + i)).count() as i32;
+        let now_free = (0..frag).filter(|i| free(after, base + i)).count() as i32;
+        let was_whole = was_free == frag as i32;
+        let now_whole = now_free == frag as i32;
+        if was_whole && !now_whole {
+            d_nbfree -= 1;
+        } else if !was_whole && now_whole {
+            d_nbfree += 1;
+        }
+        let was_loose = if was_whole { 0 } else { was_free };
+        let now_loose = if now_whole { 0 } else { now_free };
+        d_nffree += now_loose - was_loose;
+    }
+    (d_nbfree, d_nffree)
+}
 pub(crate) const CG_OFF_MAGIC: usize = 0x004;
 pub(crate) const CG_OFF_CGX: usize = 0x00C; // cg_cgx          u32 — CG index
 pub(crate) const CG_OFF_NDBLK: usize = 0x014; // cg_ndblk        u32 — # data frags in CG
@@ -170,8 +214,35 @@ pub(crate) const CG_OFF_NEXTFREEOFF: usize = 0x064; // cg_nextfreeoff  u32 — u
 /// portion ends around byte 168, and the trailing free-frag bitmap can
 /// be far larger (1 bit per fragment in the CG). We read the fixed
 /// portion to learn `cg_freeoff` + `cg_ndblk`, then issue a second
-/// targeted read for the bitmap itself.
-const CG_HEADER_FIXED_BYTES: usize = 256;
+/// targeted read for the bitmap itself. 1 KiB rather than 256 bytes so a
+/// 4.3BSD header — whose magic sits at byte 980 — is covered by the same read.
+const CG_HEADER_FIXED_BYTES: usize = 1024;
+
+// ---- 4.3BSD cylinder-group layout ----
+//
+// Pre-4.4BSD `struct cg` has no `cg_magic` at offset 4 and no
+// `cg_iusedoff` / `cg_freeoff` indirection: the arrays sit at offsets fixed by
+// the kernel's compile-time `MAXFRAG` / `MAXCPG` / `NRPOS` / `MAXIPG`. With the
+// classic values (8 / 32 / 8 / 2048) — the ones NeXTSTEP ships — that puts
+// `cg_iused` at 724, `cg_magic` at 980 and `cg_free` at 984. Verified against
+// both NeXTSTEP 3.3 fixtures. `cg_cgx` (12) and `cg_ndblk` (20) happen to sit
+// at the same offsets in both generations.
+
+/// `cg_magic` in a 4.3BSD cylinder-group header.
+pub(crate) const CG43_OFF_MAGIC: usize = 980;
+/// `cg_iused` in a 4.3BSD cylinder-group header.
+pub(crate) const CG43_OFF_IUSED: usize = 724;
+/// `cg_free` in a 4.3BSD cylinder-group header.
+pub(crate) const CG43_OFF_FREE: usize = 984;
+
+/// Which generation of `struct cg` a volume's cylinder groups use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CgLayout {
+    /// 4.4BSD and later: `cg_magic` at 4, array offsets stored in the header.
+    Modern,
+    /// 4.3BSD (NeXTSTEP): `cg_magic` at 980, arrays at compile-time offsets.
+    Bsd43,
+}
 
 /// Block-size sanity limits. Matches FreeBSD `MINBSIZE = 512` / `MAXBSIZE
 /// = 65536`. Any value outside this range is a corrupt or non-UFS image.
@@ -229,6 +300,10 @@ pub struct UfsInode {
     /// and 120 bytes on UFS2 — exactly the slice the kernel uses for
     /// fast symlinks (`di_size <= maxsymlinklen`).
     pub inline_payload: Vec<u8>,
+    /// `di_blocks` — device blocks the inode actually owns. Zero for an
+    /// inline (fast) symlink, which is how one is recognised on a 4.3BSD
+    /// superblock that never set `fs_maxsymlinklen`.
+    pub blocks: u64,
 }
 
 // ---- Filesystem ----
@@ -276,6 +351,25 @@ pub struct UfsFilesystem<R> {
     /// targets live in the first data block. 60 on UFS1, 120 on UFS2 by
     /// convention; 0 (legacy 4.2BSD) means "no inline symlinks ever."
     pub(crate) maxsymlinklen: u32,
+    /// `fs_maxsymlinklen` exactly as stored. A 4.3BSD superblock leaves it
+    /// -1 (never set), which is a different thing from the 0 a genuine
+    /// 4.2BSD volume writes to say "this volume has no fast symlinks".
+    pub(crate) maxsymlinklen_raw: i32,
+    /// True when directory entries use the pre-4.4BSD 16-bit `d_namlen` with no
+    /// `d_type` byte. The kernel's own test is `fs_maxsymlinklen <= 0`.
+    pub(crate) old_dirent_fmt: bool,
+    /// Which `struct cg` generation this volume's cylinder groups use.
+    pub(crate) cg_layout: CgLayout,
+    /// `fs_fsbtodb`: fragment -> device-block shift. `fsize >> fsbtodb` is the
+    /// unit `di_blocks` counts in — 512 on BSD, 1024 on NeXTSTEP.
+    pub(crate) fsbtodb: u32,
+    /// `DIRBLKSIZ` for this volume, i.e. its `DEV_BSIZE`. Directory records
+    /// never cross one, so every chunk walk and every new chunk uses it.
+    pub(crate) dirblksiz: usize,
+    /// `fs_csaddr` — first fragment of the cylinder-summary area. Counter
+    /// updates have to land there as well as in the group header, or a real
+    /// `fsck` reports "SUMMARY INFORMATION BAD" and forces a repair.
+    pub(crate) csaddr_frag: u64,
     label: Option<String>,
 }
 
@@ -356,6 +450,7 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
         // upper clamp matches the kernel — a value larger than the inline
         // payload area would let the kernel scribble past `di_db`.
         let raw_msl = read_i32(&sb, OFF_MAXSYMLINKLEN, endian);
+        let fsbtodb = read_i32(&sb, OFF_FSBTODB, endian).clamp(0, 16) as u32;
         let inline_cap = match version {
             UfsVersion::Ufs1 => 60u32,  // (12+3) * 4
             UfsVersion::Ufs2 => 120u32, // (12+3) * 8
@@ -439,7 +534,11 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
         // `FS_GJOURNAL` / `FS_SUJ` bits live in `fs_flags2` at offset
         // 0x35E; for Tier A we surface only the SU+J + dirty combination.
         // (`fs_clean` at byte 213 is the cheap is-dirty hint.)
-        let su_j_enabled = (read_u32(&sb, OFF_FLAGS2, endian) & FS_SUJ) != 0;
+        // `fs_flags2` only exists on UFS2. On a UFS1 superblock byte 0x35E is
+        // inside the 4.3BSD rotational tables, whose 0xFF fill read as SU+J and
+        // locked every Solaris / NeXTSTEP / SunOS volume out.
+        let su_j_enabled = matches!(version, UfsVersion::Ufs2)
+            && (read_u32(&sb, OFF_FLAGS2, endian) & FS_SUJ) != 0;
         let fs_clean_byte = sb[213];
         if su_j_enabled && fs_clean_byte == FS_DIRTY {
             return Err(FilesystemError::Unsupported(
@@ -455,7 +554,7 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
         let label_bytes = &sb[OFF_VOLNAME..OFF_VOLNAME + VOLNAME_LEN];
         let label = parse_label(label_bytes);
 
-        Ok(Self {
+        let mut fs = Self {
             reader,
             partition_offset,
             sb_offset,
@@ -474,8 +573,74 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
             sblkno: sblkno as u32,
             total_frags,
             maxsymlinklen,
+            maxsymlinklen_raw: raw_msl,
+            old_dirent_fmt: raw_msl <= 0,
+            cg_layout: CgLayout::Modern,
+            fsbtodb,
+            dirblksiz: dev_bsize(fsize, fsbtodb),
+            csaddr_frag: match version {
+                UfsVersion::Ufs1 => read_i32(&sb, OFF_CSADDR_UFS1, endian).max(0) as u64,
+                UfsVersion::Ufs2 => read_i64(&sb, OFF_CSADDR_UFS2, endian).max(0) as u64,
+            },
             label,
-        })
+        };
+        fs.cg_layout = fs.detect_cg_layout();
+        Ok(fs)
+    }
+
+    /// Decide which `struct cg` generation the volume uses by looking for
+    /// `CG_MAGIC` in CG 0 — first where 4.4BSD puts it, then where 4.3BSD
+    /// does. A volume whose CG 0 is unreadable stays on the modern layout so
+    /// the error surfaces where it is actionable rather than here.
+    fn detect_cg_layout(&mut self) -> CgLayout {
+        let at = self.partition_offset + self.cg_header_offset(0);
+        if self.reader.seek(SeekFrom::Start(at)).is_err() {
+            return CgLayout::Modern;
+        }
+        let mut hdr = vec![0u8; CG_HEADER_FIXED_BYTES];
+        if self.reader.read_exact(&mut hdr).is_err() {
+            return CgLayout::Modern;
+        }
+        if read_u32(&hdr, CG_OFF_MAGIC, self.endian) == CG_MAGIC {
+            return CgLayout::Modern;
+        }
+        if read_u32(&hdr, CG43_OFF_MAGIC, self.endian) == CG_MAGIC {
+            return CgLayout::Bsd43;
+        }
+        CgLayout::Modern
+    }
+
+    /// Offset of `cg_magic` for this volume's CG layout.
+    pub(crate) fn cg_magic_offset(&self) -> usize {
+        match self.cg_layout {
+            CgLayout::Modern => CG_OFF_MAGIC,
+            CgLayout::Bsd43 => CG43_OFF_MAGIC,
+        }
+    }
+
+    /// Offset of `cg_iused` — read from the header on 4.4BSD, fixed on 4.3BSD.
+    pub(crate) fn cg_iused_offset(&self, hdr: &[u8]) -> u64 {
+        match self.cg_layout {
+            CgLayout::Modern => read_u32(hdr, CG_OFF_IUSEDOFF, self.endian) as u64,
+            CgLayout::Bsd43 => CG43_OFF_IUSED as u64,
+        }
+    }
+
+    /// Offset of `cg_free`. See [`Self::cg_iused_offset`].
+    pub(crate) fn cg_free_offset(&self, hdr: &[u8]) -> u64 {
+        match self.cg_layout {
+            CgLayout::Modern => read_u32(hdr, CG_OFF_FREEOFF, self.endian) as u64,
+            CgLayout::Bsd43 => CG43_OFF_FREE as u64,
+        }
+    }
+
+    /// End of the free-frag bitmap. 4.3BSD has no `cg_nextfreeoff`, so it is
+    /// derived from the bitmap's own length.
+    pub(crate) fn cg_nextfree_offset(&self, hdr: &[u8], cg_ndblk: u32) -> u64 {
+        match self.cg_layout {
+            CgLayout::Modern => read_u32(hdr, CG_OFF_NEXTFREEOFF, self.endian) as u64,
+            CgLayout::Bsd43 => CG43_OFF_FREE as u64 + cg_ndblk.div_ceil(8) as u64,
+        }
     }
 
     /// Byte offset (relative to the partition start) of the cylinder-group
@@ -508,7 +673,7 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
         let mut hdr = vec![0u8; CG_HEADER_FIXED_BYTES];
         self.reader.read_exact(&mut hdr)?;
 
-        let magic = read_u32(&hdr, CG_OFF_MAGIC, self.endian);
+        let magic = read_u32(&hdr, self.cg_magic_offset(), self.endian);
         if magic != CG_MAGIC {
             return Err(FilesystemError::Parse(format!(
                 "ufs CG {i}: bad magic 0x{magic:08X} (expected 0x{CG_MAGIC:08X}) at byte {cg_byte}"
@@ -527,9 +692,9 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
                 self.fpg
             )));
         }
-        let freeoff = read_u32(&hdr, CG_OFF_FREEOFF, self.endian) as u64;
-        let nextfreeoff = read_u32(&hdr, CG_OFF_NEXTFREEOFF, self.endian) as u64;
-        let iusedoff = read_u32(&hdr, CG_OFF_IUSEDOFF, self.endian) as u64;
+        let freeoff = self.cg_free_offset(&hdr);
+        let nextfreeoff = self.cg_nextfree_offset(&hdr, cg_ndblk);
+        let iusedoff = self.cg_iused_offset(&hdr);
         if freeoff < (CG_HEADER_FIXED_BYTES as u64).min(iusedoff) {
             // The bitmap can sit inside the first 256 bytes for tiny CG
             // layouts; guard only against the truly nonsensical case
@@ -635,8 +800,7 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
         // Inline symlinks live in the dinode payload area — no disk blocks
         // beyond the dinode itself, which the bitmap already accounts for.
         if matches!(unix_file_type(inode.mode), UnixFileType::Symlink)
-            && self.maxsymlinklen > 0
-            && (inode.size as u32) <= self.maxsymlinklen
+            && self.is_inline_symlink(inode)
         {
             return Ok((data, indirect));
         }
@@ -766,6 +930,11 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
         self.endian
     }
 
+    /// Whether directory entries use the pre-4.4BSD 16-bit `d_namlen`.
+    pub(crate) fn old_dirent_fmt(&self) -> bool {
+        self.old_dirent_fmt
+    }
+
     // ---- U.3: dinode + directory + file walk ----
 
     /// On-disk byte offset (relative to the partition start) of inode
@@ -823,6 +992,11 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
         let mode = read_u16(&buf, D1_OFF_MODE, endian) as u32;
         let nlink = read_i16(&buf, D1_OFF_NLINK, endian) as i32 as u32;
 
+        let blocks = match self.version {
+            UfsVersion::Ufs1 => read_i32(&buf, D1_OFF_BLOCKS, endian).max(0) as u64,
+            UfsVersion::Ufs2 => read_u64(&buf, D2_OFF_BLOCKS, endian),
+        };
+
         let (uid, gid, size, mtime, direct, indirect, inline_payload) = match self.version {
             UfsVersion::Ufs1 => {
                 let size = read_u64(&buf, D1_OFF_SIZE, endian);
@@ -871,6 +1045,7 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
             direct,
             indirect,
             inline_payload,
+            blocks,
         })
     }
 
@@ -996,6 +1171,30 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
         Ok(out)
     }
 
+    /// Bytes a fast symlink may occupy inline. `fs_maxsymlinklen` is the
+    /// answer when the superblock actually set it; a 4.3BSD superblock
+    /// (NeXTSTEP) leaves it -1, and those volumes inline up to the full
+    /// pointer area. A genuine 4.2BSD volume stores 0 and has none.
+    pub(crate) fn inline_symlink_cap(&self) -> u32 {
+        let payload_cap = match self.version {
+            UfsVersion::Ufs1 => 60,
+            UfsVersion::Ufs2 => 120,
+        };
+        match self.maxsymlinklen_raw {
+            0 => 0,
+            n if n > 0 => (n as u32).min(payload_cap),
+            _ => payload_cap,
+        }
+    }
+
+    /// Whether this symlink's target sits in the dinode rather than a data
+    /// block. `di_blocks == 0` is the signal every FFS generation agrees on,
+    /// and the only one available when `fs_maxsymlinklen` is unset.
+    pub(crate) fn is_inline_symlink(&self, inode: &UfsInode) -> bool {
+        let size = inode.size as usize;
+        size > 0 && size <= inode.inline_payload.len() && inode.blocks == 0
+    }
+
     /// Decode a symlink's target. Inline (fast) symlinks live in the
     /// dinode's pointer area; non-inline symlinks live in the first
     /// data block.
@@ -1004,10 +1203,7 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
         if size == 0 {
             return Ok(String::new());
         }
-        let bytes = if (inode.size as u32) <= self.maxsymlinklen
-            && self.maxsymlinklen > 0
-            && size <= inode.inline_payload.len()
-        {
+        let bytes = if self.is_inline_symlink(inode) {
             inode.inline_payload[..size].to_vec()
         } else {
             self.read_inode_data(inode, inode.size, size)?
@@ -1165,6 +1361,11 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
         let dsize = self.dinode_size() as usize;
         let mut buf = vec![0u8; dsize];
         let endian = self.endian;
+        // read_inode keeps a copy of the pointer area in `inline_payload` for
+        // every inode; writing it back over a changed direct[] undid the change.
+        let inline = !inode.inline_payload.is_empty()
+            && unix_file_type(inode.mode) == UnixFileType::Symlink
+            && inode.blocks == 0;
 
         // di_mode + di_nlink share offsets across versions.
         write_u16(&mut buf, D1_OFF_MODE, inode.mode as u16, endian);
@@ -1176,17 +1377,16 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
                 write_i32(&mut buf, D1_OFF_MTIME, inode.mtime as i32, endian);
                 write_u32(&mut buf, D1_OFF_UID, inode.uid, endian);
                 write_u32(&mut buf, D1_OFF_GID, inode.gid, endian);
+                write_i32(&mut buf, D1_OFF_BLOCKS, inode.blocks as i32, endian);
                 for (i, &slot) in inode.direct.iter().enumerate() {
                     write_i32(&mut buf, D1_OFF_DB + i * 4, slot as i32, endian);
                 }
                 for (i, &slot) in inode.indirect.iter().enumerate() {
                     write_i32(&mut buf, D1_OFF_IB + i * 4, slot as i32, endian);
                 }
-                // Inline payload (fast symlink target, etc.) overlays the
-                // direct/indirect pointer area. Callers that want to write
-                // an inline symlink should populate `inline_payload` AND
-                // leave direct/indirect zero; the inline bytes win.
-                if !inode.inline_payload.is_empty() {
+                // The pointer area carries a payload only for a fast symlink;
+                // for every other inode direct/indirect are the truth (R-061).
+                if inline {
                     let len = inode.inline_payload.len().min(60);
                     buf[D1_OFF_DB..D1_OFF_DB + len].copy_from_slice(&inode.inline_payload[..len]);
                 }
@@ -1195,6 +1395,7 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
                 write_u32(&mut buf, D2_OFF_UID, inode.uid, endian);
                 write_u32(&mut buf, D2_OFF_GID, inode.gid, endian);
                 write_u64(&mut buf, D2_OFF_SIZE, inode.size, endian);
+                write_u64(&mut buf, D2_OFF_BLOCKS, inode.blocks, endian);
                 write_i64(&mut buf, D2_OFF_MTIME, inode.mtime, endian);
                 for (i, &slot) in inode.direct.iter().enumerate() {
                     write_i64(&mut buf, D2_OFF_DB + i * 8, slot as i64, endian);
@@ -1202,7 +1403,7 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
                 for (i, &slot) in inode.indirect.iter().enumerate() {
                     write_i64(&mut buf, D2_OFF_IB + i * 8, slot as i64, endian);
                 }
-                if !inode.inline_payload.is_empty() {
+                if inline {
                     let len = inode.inline_payload.len().min(120);
                     buf[D2_OFF_DB..D2_OFF_DB + len].copy_from_slice(&inode.inline_payload[..len]);
                 }
@@ -1223,14 +1424,14 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
         self.reader.seek(SeekFrom::Start(cg_byte))?;
         let mut hdr = vec![0u8; CG_HEADER_FIXED_BYTES];
         self.reader.read_exact(&mut hdr)?;
-        let magic = read_u32(&hdr, CG_OFF_MAGIC, self.endian);
+        let magic = read_u32(&hdr, self.cg_magic_offset(), self.endian);
         if magic != CG_MAGIC {
             return Err(FilesystemError::Parse(format!(
                 "ufs CG {cg}: bad magic 0x{magic:08X} (expected 0x{CG_MAGIC:08X})"
             )));
         }
-        let iusedoff = read_u32(&hdr, CG_OFF_IUSEDOFF, self.endian) as u64;
-        let freeoff = read_u32(&hdr, CG_OFF_FREEOFF, self.endian) as u64;
+        let iusedoff = self.cg_iused_offset(&hdr);
+        let freeoff = self.cg_free_offset(&hdr);
         if iusedoff == 0 || iusedoff >= freeoff {
             return Err(FilesystemError::Parse(format!(
                 "ufs CG {cg}: implausible iusedoff={iusedoff} freeoff={freeoff}"
@@ -1318,6 +1519,48 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
         let cg_byte = self.partition_offset + self.cg_header_offset(cg);
         self.reader.seek(SeekFrom::Start(cg_byte + 24))?;
         self.reader.write_all(&buf)?;
+        self.propagate_cs(cg, &buf, d_ndir, d_nbfree, d_nifree, d_nffree)?;
+        Ok(())
+    }
+
+    /// Mirror a per-group counter change into the cylinder-summary area and
+    /// the superblock totals. The kernel keeps all three in step; a `fsck`
+    /// that finds them disagreeing rewrites the filesystem, which on
+    /// NeXTSTEP means the machine drops to single-user on the next boot.
+    fn propagate_cs(
+        &mut self,
+        cg: u32,
+        entry: &[u8; 16],
+        d_ndir: i32,
+        d_nbfree: i32,
+        d_nifree: i32,
+        d_nffree: i32,
+    ) -> Result<(), FilesystemError> {
+        if self.csaddr_frag > 0 && (cg as u64) < self.ncg as u64 {
+            let at = self.partition_offset
+                + self.csaddr_frag * self.fsize
+                + u64::from(cg) * CSUM_ENTRY_SIZE;
+            self.reader.seek(SeekFrom::Start(at))?;
+            self.reader.write_all(entry)?;
+        }
+        let endian = self.endian;
+        let sb_at = self.partition_offset + self.sb_offset;
+        self.reader.seek(SeekFrom::Start(sb_at))?;
+        let mut sb = vec![0u8; SB_READ_SIZE];
+        self.reader.read_exact(&mut sb)?;
+        let deltas = [d_ndir, d_nbfree, d_nifree, d_nffree];
+        for (i, d) in deltas.iter().enumerate() {
+            let off = OFF_CSTOTAL_OLD + i * 4;
+            let cur = read_i32(&sb, off, endian);
+            write_i32(&mut sb, off, cur.wrapping_add(*d), endian);
+            if self.cg_layout == CgLayout::Modern {
+                let off64 = OFF_CSTOTAL64 + i * 8;
+                let cur64 = read_i64(&sb, off64, endian);
+                write_i64(&mut sb, off64, cur64.wrapping_add(i64::from(*d)), endian);
+            }
+        }
+        self.reader.seek(SeekFrom::Start(sb_at))?;
+        self.reader.write_all(&sb)?;
         Ok(())
     }
 
@@ -1428,16 +1671,14 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
                 }
             }
             if let Some(in_cg) = found {
+                let before = bm.clone();
                 for i in 0..count {
                     bitmap_clear_bit(&mut bm, in_cg + i);
                 }
                 self.write_cg_free_bitmap(cg, &bm)?;
-                // `nffree` tracks free fragments — drop by `count`. `nbfree`
-                // (free *blocks*) would only change when a whole-block worth
-                // of frags transitions; we leave it alone for sub-block
-                // allocations (matches FreeBSD's `ffs_clusteracct` behavior
-                // for the common case our edit path hits).
-                self.update_cg_cs(cg, 0, 0, 0, -(count as i32))?;
+                let (d_nbfree, d_nffree) =
+                    cs_delta_for(&before, &bm, self.frag as u64, in_cg, count);
+                self.update_cg_cs(cg, 0, d_nbfree, 0, d_nffree)?;
                 return Ok(cg as u64 * self.fpg as u64 + in_cg);
             }
         }
@@ -1466,11 +1707,13 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
             )));
         }
         let (mut bm, _ndblk) = self.read_cg_free_bitmap(cg as u32)?;
+        let before = bm.clone();
         for i in 0..count {
             bitmap_set_bit(&mut bm, in_cg + i);
         }
         self.write_cg_free_bitmap(cg as u32, &bm)?;
-        self.update_cg_cs(cg as u32, 0, 0, 0, count as i32)?;
+        let (d_nbfree, d_nffree) = cs_delta_for(&before, &bm, self.frag as u64, in_cg, count);
+        self.update_cg_cs(cg as u32, 0, d_nbfree, 0, d_nffree)?;
         Ok(())
     }
 
@@ -1481,32 +1724,25 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
     fn cg_freeoff_byte(&mut self, cg: u32) -> Result<(u64, u64), FilesystemError> {
         let cg_byte = self.partition_offset + self.cg_header_offset(cg);
         self.reader.seek(SeekFrom::Start(cg_byte))?;
-        let mut hdr = [0u8; 8];
+        let mut hdr = vec![0u8; CG_HEADER_FIXED_BYTES];
         self.reader.read_exact(&mut hdr)?;
-        let magic = read_u32(&hdr, CG_OFF_MAGIC, self.endian);
+        let magic = read_u32(&hdr, self.cg_magic_offset(), self.endian);
         if magic != CG_MAGIC {
             return Err(FilesystemError::Parse(format!(
                 "ufs CG {cg}: bad magic on write path"
             )));
         }
-        self.reader
-            .seek(SeekFrom::Start(cg_byte + CG_OFF_FREEOFF as u64))?;
-        let mut buf = [0u8; 4];
-        self.reader.read_exact(&mut buf)?;
-        let freeoff = read_u32(&buf, 0, self.endian) as u64;
-        Ok((cg_byte, freeoff))
+        Ok((cg_byte, self.cg_free_offset(&hdr)))
     }
 
     /// Return `(cg_header_byte, iusedoff)` where the inode-used bitmap of
     /// `cg` lives.
     fn cg_iusedoff_byte(&mut self, cg: u32) -> Result<(u64, u64), FilesystemError> {
         let cg_byte = self.partition_offset + self.cg_header_offset(cg);
-        self.reader
-            .seek(SeekFrom::Start(cg_byte + CG_OFF_IUSEDOFF as u64))?;
-        let mut buf = [0u8; 4];
-        self.reader.read_exact(&mut buf)?;
-        let iusedoff = read_u32(&buf, 0, self.endian) as u64;
-        Ok((cg_byte, iusedoff))
+        self.reader.seek(SeekFrom::Start(cg_byte))?;
+        let mut hdr = vec![0u8; CG_HEADER_FIXED_BYTES];
+        self.reader.read_exact(&mut hdr)?;
+        Ok((cg_byte, self.cg_iused_offset(&hdr)))
     }
 
     /// Read `SB_READ_SIZE` bytes of the primary superblock. Used by the
@@ -1571,7 +1807,7 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
 //     need to special-case UFS.
 
 /// UFS directory record d_type values (`sys/ufs/ufs/dirent.h`).
-const DT_DIR: u8 = 4;
+pub(crate) const DT_DIR: u8 = 4;
 const DT_REG: u8 = 8;
 const DT_LNK: u8 = 10;
 
@@ -1579,14 +1815,27 @@ const DT_LNK: u8 = 10;
 /// FreeBSD `DIRSIZ(fmt, dp)` rounding (`(8 + namlen + 1 + 3) & ~3`).
 const DIRENT_ALIGN: usize = 4;
 
-/// On-disk directory chunk size (`DIRBLKSIZ` = `DEV_BSIZE` in UFS).
-/// Directory entries never cross a 512-byte boundary.
-const DIRBLKSIZ: usize = 512;
+/// Default on-disk directory chunk size. `DIRBLKSIZ` is `DEV_BSIZE`, which is
+/// 512 on BSD but 1024 on NeXTSTEP — read it off the volume with
+/// [`UfsFilesystem::dirblksiz`] rather than assuming this.
+pub(crate) const DIRBLKSIZ: usize = 512;
+
+/// A volume's `DEV_BSIZE`, which is what `DIRBLKSIZ` really is. NeXTSTEP
+/// formats with `fs_fsbtodb == 0`, making its device block the fragment
+/// itself, so its directories are chunked in 1024 bytes rather than 512.
+pub(crate) fn dev_bsize(fsize: u64, fsbtodb: u32) -> usize {
+    let v = (fsize >> fsbtodb) as usize;
+    if v.is_power_of_two() && (512..=8192).contains(&v) {
+        v
+    } else {
+        DIRBLKSIZ
+    }
+}
 
 /// Compute the minimum d_reclen needed to hold a directory entry with
 /// the given name length. Header (8) + name + NUL pad up to 4-byte
 /// alignment.
-fn dirent_record_size(namlen: usize) -> usize {
+pub(crate) fn dirent_record_size(namlen: usize) -> usize {
     (DIRENT_HDR_LEN + namlen + 1 + (DIRENT_ALIGN - 1)) & !(DIRENT_ALIGN - 1)
 }
 
@@ -1630,11 +1879,12 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
     ) -> Result<Option<(usize, usize)>, FilesystemError> {
         let bytes = self.read_dir_bytes_raw(parent)?;
         let endian = self.endian;
+        let old_fmt = self.old_dirent_fmt;
         let mut off = 0;
         while off + DIRENT_HDR_LEN <= bytes.len() {
             let d_ino = read_u32(&bytes, off, endian);
             let d_reclen = read_u16(&bytes, off + 4, endian) as usize;
-            let d_namlen = bytes[off + 7] as usize;
+            let (_, d_namlen) = read_dirent_namlen(&bytes, off, old_fmt, endian);
             if d_reclen == 0 || !d_reclen.is_multiple_of(DIRENT_ALIGN) {
                 return Err(FilesystemError::Parse(format!(
                     "ufs dir_find: corrupt d_reclen {d_reclen} at off {off}"
@@ -1665,6 +1915,7 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
         child_d_type: u8,
     ) -> Result<(), FilesystemError> {
         let bsize = self.bsize as usize;
+        let dirblksiz = self.dirblksiz;
         let frags_per_block = self.frag as u64;
         let dir_bytes = self.read_dir_bytes_raw(parent)?;
         let need = dirent_record_size(name.len());
@@ -1675,13 +1926,14 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
         // an insert lands as close to the front as possible — matches
         // the kernel's `ufs_direnter` behavior.
         let endian = self.endian;
-        for chunk_start in (0..dir_bytes.len()).step_by(DIRBLKSIZ) {
-            let chunk_end = (chunk_start + DIRBLKSIZ).min(dir_bytes.len());
+        let old_fmt = self.old_dirent_fmt;
+        for chunk_start in (0..dir_bytes.len()).step_by(dirblksiz) {
+            let chunk_end = (chunk_start + dirblksiz).min(dir_bytes.len());
             let mut last_off: Option<usize> = None;
             let mut off = chunk_start;
             while off + DIRENT_HDR_LEN <= chunk_end {
                 let d_reclen = read_u16(&dir_bytes, off + 4, endian) as usize;
-                let d_namlen = dir_bytes[off + 7] as usize;
+                let (_, d_namlen) = read_dirent_namlen(&dir_bytes, off, old_fmt, endian);
                 if d_reclen == 0 || off + d_reclen > chunk_end {
                     break;
                 }
@@ -1695,8 +1947,14 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
                     let new_off = off + actual;
                     write_u32(&mut updated, new_off, child_inum, endian);
                     write_u16(&mut updated, new_off + 4, slack as u16, endian);
-                    updated[new_off + 6] = child_d_type;
-                    updated[new_off + 7] = name.len() as u8;
+                    write_dirent_namlen(
+                        &mut updated,
+                        new_off,
+                        child_d_type,
+                        name.len(),
+                        old_fmt,
+                        endian,
+                    );
                     let name_end = new_off + DIRENT_HDR_LEN + name.len();
                     updated[new_off + DIRENT_HDR_LEN..name_end].copy_from_slice(name);
                     // Pad to record length with zeros.
@@ -1716,22 +1974,21 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
         // at the current end of the dir. Grow within the current dir
         // block if there's still room; else allocate a new direct block.
         let cur_size = dir_bytes.len();
-        if cur_size + DIRBLKSIZ > 12 * bsize {
+        if cur_size + dirblksiz > 12 * bsize {
             return Err(FilesystemError::Unsupported(format!(
                 "ufs dir_insert: directory would exceed v1 cap of {} bytes (12 × bsize); \
                  indirect-block dir growth not yet implemented",
                 12 * bsize
             )));
         }
-        let new_size = cur_size + DIRBLKSIZ;
+        let new_size = cur_size + dirblksiz;
 
         // Build the new chunk holding just the new entry, padded out to
         // DIRBLKSIZ via a single trailing-slack record.
-        let mut new_chunk = vec![0u8; DIRBLKSIZ];
+        let mut new_chunk = vec![0u8; dirblksiz];
         write_u32(&mut new_chunk, 0, child_inum, endian);
-        write_u16(&mut new_chunk, 4, DIRBLKSIZ as u16, endian);
-        new_chunk[6] = child_d_type;
-        new_chunk[7] = name.len() as u8;
+        write_u16(&mut new_chunk, 4, dirblksiz as u16, endian);
+        write_dirent_namlen(&mut new_chunk, 0, child_d_type, name.len(), old_fmt, endian);
         new_chunk[DIRENT_HDR_LEN..DIRENT_HDR_LEN + name.len()].copy_from_slice(name);
 
         // Does cur_size already end on a bsize boundary? If yes, we need
@@ -1752,7 +2009,7 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
             // Write the new chunk at the new block start, zero-pad the
             // rest of the bsize block.
             let mut full_block = vec![0u8; bsize];
-            full_block[..DIRBLKSIZ].copy_from_slice(&new_chunk);
+            full_block[..dirblksiz].copy_from_slice(&new_chunk);
             self.write_frag_run(start_frag, &full_block)?;
         } else {
             // Append to the current trailing partial block. Read it,
@@ -1767,7 +2024,7 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
             let mut block = vec![0u8; bsize];
             self.reader.read_exact(&mut block)?;
             let in_block = cur_size % bsize;
-            block[in_block..in_block + DIRBLKSIZ].copy_from_slice(&new_chunk);
+            block[in_block..in_block + dirblksiz].copy_from_slice(&new_chunk);
             self.write_frag_run(last_frag, &block)?;
         }
         parent.size = new_size as u64;
@@ -1782,18 +2039,20 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
     fn dir_remove(&mut self, parent: &UfsInode, name: &[u8]) -> Result<u32, FilesystemError> {
         let mut dir_bytes = self.read_dir_bytes_raw(parent)?;
         let endian = self.endian;
+        let dirblksiz = self.dirblksiz;
         // Find the target and the previous record within its chunk.
         let mut found_off: Option<usize> = None;
         let mut found_reclen: usize = 0;
         let mut prev_off: Option<usize> = None;
-        for chunk_start in (0..dir_bytes.len()).step_by(DIRBLKSIZ) {
-            let chunk_end = (chunk_start + DIRBLKSIZ).min(dir_bytes.len());
+        let old_fmt = self.old_dirent_fmt;
+        for chunk_start in (0..dir_bytes.len()).step_by(dirblksiz) {
+            let chunk_end = (chunk_start + dirblksiz).min(dir_bytes.len());
             let mut off = chunk_start;
             let mut prev_in_chunk: Option<usize> = None;
             while off + DIRENT_HDR_LEN <= chunk_end {
                 let d_ino = read_u32(&dir_bytes, off, endian);
                 let d_reclen = read_u16(&dir_bytes, off + 4, endian) as usize;
-                let d_namlen = dir_bytes[off + 7] as usize;
+                let (_, d_namlen) = read_dirent_namlen(&dir_bytes, off, old_fmt, endian);
                 if d_reclen == 0 || off + d_reclen > chunk_end {
                     break;
                 }
@@ -1880,10 +2139,12 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
         Ok(())
     }
 
-    /// Write a regular file's data fork. Allocates one full block per
-    /// occupied direct slot (`alloc_frag_run(frag, ...)`). Refuses with
-    /// `Unsupported` if the file needs more than 12 direct blocks
-    /// (indirect-block writes not yet implemented).
+    /// Write a regular file's data fork, one full block per logical block.
+    ///
+    /// Blocks 0..11 go in the direct slots; past those the single- and then
+    /// double-indirect levels are built as needed, which is what lets a file
+    /// exceed the 12-block (96 KiB at 8 KiB blocks) direct cap. Triple
+    /// indirection is refused — it starts at ~32 GiB with 8 KiB blocks.
     fn write_file_data(
         &mut self,
         inode: &mut UfsInode,
@@ -1892,24 +2153,59 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
     ) -> Result<(), FilesystemError> {
         let bs = self.bsize;
         let frags_per_block = self.frag as u64;
-        let max_direct_bytes = bs * UFS_NDADDR as u64;
-        if data_len > max_direct_bytes {
+        let nindir = self.nindir();
+        let ndaddr = UFS_NDADDR as u64;
+        let max_bytes = (ndaddr + nindir + nindir * nindir) * bs;
+        if data_len > max_bytes {
             return Err(FilesystemError::Unsupported(format!(
-                "ufs write_file_data: file size {data_len} > direct cap {max_direct_bytes} \
-                 (indirect-block writes not yet implemented)"
+                "ufs write_file_data: file size {data_len} > {max_bytes}                  (triple-indirect writes not implemented)"
             )));
         }
         let cg_hint = (inode.inum / self.ipg) % self.ncg;
+        let total_blocks = data_len.div_ceil(bs);
+
+        // Allocate the metadata blocks first: an early DiskFull is cleaner
+        // than one that leaves half a file's data written.
+        let mut meta_frags = 0u64;
+        let mut single: u64 = 0;
+        let mut double: u64 = 0;
+        let mut double_children: Vec<u64> = Vec::new();
+        if total_blocks > ndaddr {
+            single = self.alloc_frag_run(frags_per_block, cg_hint)?;
+            meta_frags += frags_per_block;
+        }
+        if total_blocks > ndaddr + nindir {
+            double = self.alloc_frag_run(frags_per_block, cg_hint)?;
+            meta_frags += frags_per_block;
+            let need = (total_blocks - ndaddr - nindir).div_ceil(nindir);
+            for _ in 0..need {
+                double_children.push(self.alloc_frag_run(frags_per_block, cg_hint)?);
+                meta_frags += frags_per_block;
+            }
+        }
+
+        let mut single_ptrs = vec![0u64; nindir as usize];
+        let mut child_ptrs: Vec<Vec<u64>> = double_children
+            .iter()
+            .map(|_| vec![0u64; nindir as usize])
+            .collect();
+
         let mut written: u64 = 0;
         let mut block_buf = vec![0u8; bs as usize];
-        let mut slot = 0;
+        let mut lbn = 0u64;
         while written < data_len {
             let remaining = data_len - written;
-            let chunk = (bs).min(remaining);
-            // Allocate one block (frag fragments) for this slot.
+            let chunk = bs.min(remaining);
             let start = self.alloc_frag_run(frags_per_block, cg_hint)?;
-            inode.direct[slot] = start;
-            // Read the chunk from the source into the block buffer.
+            if lbn < ndaddr {
+                inode.direct[lbn as usize] = start;
+            } else if lbn < ndaddr + nindir {
+                single_ptrs[(lbn - ndaddr) as usize] = start;
+            } else {
+                let rel = lbn - ndaddr - nindir;
+                child_ptrs[(rel / nindir) as usize][(rel % nindir) as usize] = start;
+            }
+
             let mut filled = 0usize;
             while filled < chunk as usize {
                 let n = data.read(&mut block_buf[filled..chunk as usize])?;
@@ -1928,10 +2224,52 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
             }
             self.write_frag_run(start, &block_buf)?;
             written += chunk;
-            slot += 1;
+            lbn += 1;
         }
+
+        if single != 0 {
+            self.write_pointer_block(single, &single_ptrs)?;
+            inode.indirect[0] = single;
+        }
+        if double != 0 {
+            for (child, ptrs) in double_children.iter().zip(child_ptrs.iter()) {
+                self.write_pointer_block(*child, ptrs)?;
+            }
+            let mut outer = vec![0u64; nindir as usize];
+            for (i, child) in double_children.iter().enumerate() {
+                outer[i] = *child;
+            }
+            self.write_pointer_block(double, &outer)?;
+            inode.indirect[1] = double;
+        }
+
         inode.size = data_len;
+        inode.blocks = self.frags_to_device_blocks(total_blocks * frags_per_block + meta_frags);
         Ok(())
+    }
+
+    /// Fill one block with fragment pointers in the volume's width and order.
+    fn write_pointer_block(
+        &mut self,
+        block_frag: u64,
+        ptrs: &[u64],
+    ) -> Result<(), FilesystemError> {
+        let mut buf = vec![0u8; self.bsize as usize];
+        let endian = self.endian;
+        for (i, &p) in ptrs.iter().enumerate() {
+            match self.version {
+                UfsVersion::Ufs1 => write_i32(&mut buf, i * 4, p as i32, endian),
+                UfsVersion::Ufs2 => write_i64(&mut buf, i * 8, p as i64, endian),
+            }
+        }
+        self.write_frag_run(block_frag, &buf)
+    }
+
+    /// `di_blocks` counts device blocks of `fsize >> fs_fsbtodb` bytes — 512 on
+    /// BSD, 1024 on NeXTSTEP. Getting the unit wrong makes a real `fsck_ffs`
+    /// report every file we create as having an incorrect block count.
+    pub(crate) fn frags_to_device_blocks(&self, frags: u64) -> u64 {
+        frags << self.fsbtodb
     }
 
     /// Free every disk fragment an inode owns (data + indirect blocks).
@@ -2009,6 +2347,7 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Uf
             direct: [0; UFS_NDADDR],
             indirect: [0; UFS_NIADDR],
             inline_payload: Vec::new(),
+            blocks: 0,
         };
         let create_result = (|| -> Result<FileEntry, FilesystemError> {
             self.write_file_data(&mut new_inode, data, data_len)?;
@@ -2104,11 +2443,13 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Uf
             direct: [0; UFS_NDADDR],
             indirect: [0; UFS_NIADDR],
             inline_payload: Vec::new(),
+            blocks: 0,
         };
 
         let create_result = (|| -> Result<FileEntry, FilesystemError> {
             let bytes = target.as_bytes();
-            if self.maxsymlinklen > 0 && bytes.len() as u32 <= self.maxsymlinklen {
+            let cap = self.inline_symlink_cap();
+            if cap > 0 && bytes.len() as u32 <= cap {
                 // Fast symlink: the target overlays the pointer area, and the
                 // pointers stay zero so nothing thinks it owns a block.
                 new_inode.inline_payload = bytes.to_vec();
@@ -2172,6 +2513,7 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Uf
         }
 
         let bsize = self.bsize as usize;
+        let dirblksiz = self.dirblksiz;
         let frags_per_block = self.frag as u64;
         let new_inum = self.alloc_inode(parent_inum / self.ipg)?;
 
@@ -2183,23 +2525,22 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Uf
             let cg_hint = parent_inum / self.ipg;
             let start_frag = self.alloc_frag_run(frags_per_block, cg_hint)?;
             let endian = self.endian;
+            let old_fmt = self.old_dirent_fmt;
             let mut block = vec![0u8; bsize];
 
             // `.` record: 12 bytes (8 hdr + 1 name + 3 pad).
             let dot_reclen = dirent_record_size(1);
             write_u32(&mut block, 0, new_inum, endian);
             write_u16(&mut block, 4, dot_reclen as u16, endian);
-            block[6] = DT_DIR;
-            block[7] = 1;
+            write_dirent_namlen(&mut block, 0, DT_DIR, 1, old_fmt, endian);
             block[DIRENT_HDR_LEN] = b'.';
 
             // `..` record: takes the rest of the first DIRBLKSIZ chunk.
             let dotdot_off = dot_reclen;
-            let dotdot_reclen = DIRBLKSIZ - dot_reclen;
+            let dotdot_reclen = dirblksiz - dot_reclen;
             write_u32(&mut block, dotdot_off, parent_inum, endian);
             write_u16(&mut block, dotdot_off + 4, dotdot_reclen as u16, endian);
-            block[dotdot_off + 6] = DT_DIR;
-            block[dotdot_off + 7] = 2;
+            write_dirent_namlen(&mut block, dotdot_off, DT_DIR, 2, old_fmt, endian);
             block[dotdot_off + DIRENT_HDR_LEN] = b'.';
             block[dotdot_off + DIRENT_HDR_LEN + 1] = b'.';
 
@@ -2213,13 +2554,15 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Uf
                 nlink: 2, // `.` is the second link
                 uid: options.uid.unwrap_or(0),
                 gid: options.gid.unwrap_or(0),
-                size: DIRBLKSIZ as u64,
+                size: dirblksiz as u64,
                 mtime,
                 direct: [0; UFS_NDADDR],
                 indirect: [0; UFS_NIADDR],
                 inline_payload: Vec::new(),
+                blocks: 0,
             };
             new_dir.direct[0] = start_frag;
+            new_dir.blocks = self.frags_to_device_blocks(frags_per_block);
             self.write_inode(new_inum, &new_dir)?;
             // Tracking: the new directory bumps the per-CG ndir counter.
             self.update_cg_cs(new_inum / self.ipg, 1, 0, 0, 0)?;
@@ -2274,11 +2617,12 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Uf
             // outside `.` / `..` references a non-zero inum.
             let bytes = self.read_dir_bytes_raw(&target)?;
             let endian = self.endian;
+            let old_fmt = self.old_dirent_fmt;
             let mut off = 0;
             while off + DIRENT_HDR_LEN <= bytes.len() {
                 let d_ino = read_u32(&bytes, off, endian);
                 let d_reclen = read_u16(&bytes, off + 4, endian) as usize;
-                let d_namlen = bytes[off + 7] as usize;
+                let (_, d_namlen) = read_dirent_namlen(&bytes, off, old_fmt, endian);
                 if d_reclen == 0 || off + d_reclen > bytes.len() {
                     break;
                 }
@@ -2789,7 +3133,43 @@ pub(crate) fn read_u64(buf: &[u8], off: usize, endian: UfsEndian) -> u64 {
     }
 }
 
-fn write_u16(buf: &mut [u8], off: usize, v: u16, endian: UfsEndian) {
+/// Split a directory entry's byte 6/7 pair into `(d_type, d_namlen)`.
+///
+/// 4.4BSD carved a `d_type` byte out of what used to be a 16-bit `d_namlen`.
+/// Pre-4.4 volumes — Solaris, SunOS, NeXTSTEP — still store the 16-bit form, so
+/// on a little-endian one the length sits in byte 6 and reading byte 7 yields 0,
+/// which silently empties every directory. See [`UfsFilesystem::old_dirent_fmt`].
+pub(crate) fn read_dirent_namlen(
+    buf: &[u8],
+    off: usize,
+    old_fmt: bool,
+    endian: UfsEndian,
+) -> (u8, usize) {
+    if old_fmt {
+        (0, read_u16(buf, off + 6, endian) as usize)
+    } else {
+        (buf[off + 6], buf[off + 7] as usize)
+    }
+}
+
+/// Inverse of [`read_dirent_namlen`].
+pub(crate) fn write_dirent_namlen(
+    buf: &mut [u8],
+    off: usize,
+    d_type: u8,
+    namlen: usize,
+    old_fmt: bool,
+    endian: UfsEndian,
+) {
+    if old_fmt {
+        write_u16(buf, off + 6, namlen as u16, endian);
+    } else {
+        buf[off + 6] = d_type;
+        buf[off + 7] = namlen as u8;
+    }
+}
+
+pub(crate) fn write_u16(buf: &mut [u8], off: usize, v: u16, endian: UfsEndian) {
     let bytes = match endian {
         UfsEndian::Little => v.to_le_bytes(),
         UfsEndian::Big => v.to_be_bytes(),
@@ -2797,11 +3177,11 @@ fn write_u16(buf: &mut [u8], off: usize, v: u16, endian: UfsEndian) {
     buf[off..off + 2].copy_from_slice(&bytes);
 }
 
-fn write_i16(buf: &mut [u8], off: usize, v: i16, endian: UfsEndian) {
+pub(crate) fn write_i16(buf: &mut [u8], off: usize, v: i16, endian: UfsEndian) {
     write_u16(buf, off, v as u16, endian);
 }
 
-fn write_u32(buf: &mut [u8], off: usize, v: u32, endian: UfsEndian) {
+pub(crate) fn write_u32(buf: &mut [u8], off: usize, v: u32, endian: UfsEndian) {
     let bytes = match endian {
         UfsEndian::Little => v.to_le_bytes(),
         UfsEndian::Big => v.to_be_bytes(),
@@ -2809,7 +3189,7 @@ fn write_u32(buf: &mut [u8], off: usize, v: u32, endian: UfsEndian) {
     buf[off..off + 4].copy_from_slice(&bytes);
 }
 
-fn write_i32(buf: &mut [u8], off: usize, v: i32, endian: UfsEndian) {
+pub(crate) fn write_i32(buf: &mut [u8], off: usize, v: i32, endian: UfsEndian) {
     write_u32(buf, off, v as u32, endian);
 }
 
@@ -2821,7 +3201,7 @@ fn write_u64(buf: &mut [u8], off: usize, v: u64, endian: UfsEndian) {
     buf[off..off + 8].copy_from_slice(&bytes);
 }
 
-fn write_i64(buf: &mut [u8], off: usize, v: i64, endian: UfsEndian) {
+pub(crate) fn write_i64(buf: &mut [u8], off: usize, v: i64, endian: UfsEndian) {
     write_u64(buf, off, v as u64, endian);
 }
 
@@ -2894,13 +3274,13 @@ impl<R: Read + Seek + Send> Filesystem for UfsFilesystem<R> {
         }
         let dir_bytes = self.read_inode_data(&inode, inode.size, inode.size as usize)?;
         let endian = self.endian;
+        let old_fmt = self.old_dirent_fmt;
         let mut children: Vec<FileEntry> = Vec::new();
         let mut off = 0usize;
         while off + DIRENT_HDR_LEN <= dir_bytes.len() {
             let d_ino = read_u32(&dir_bytes, off, endian);
             let d_reclen = read_u16(&dir_bytes, off + 4, endian) as usize;
-            let _d_type = dir_bytes[off + 6];
-            let d_namlen = dir_bytes[off + 7] as usize;
+            let (_d_type, d_namlen) = read_dirent_namlen(&dir_bytes, off, old_fmt, endian);
 
             if d_reclen == 0 {
                 return Err(FilesystemError::Parse(format!(
@@ -3782,6 +4162,36 @@ mod tests {
         assert!(!kids.iter().any(|e| e.name == "." || e.name == ".."));
     }
 
+    /// A 4.3BSD volume (NeXTSTEP) has no `cg_magic` at offset 4 and no
+    /// `cg_iusedoff` / `cg_freeoff` indirection; the arrays sit at compile-time
+    /// offsets and the magic lands at 980. Detecting that wrong meant every
+    /// write and every fsck on a NeXT disk failed with "bad magic".
+    #[test]
+    fn a_43bsd_cylinder_group_header_is_detected_by_its_magic_offset() {
+        // A synthetic CG 0 with the magic only where 4.3BSD puts it.
+        let mut hdr = vec![0u8; CG_HEADER_FIXED_BYTES];
+        write_u32(&mut hdr, CG43_OFF_MAGIC, CG_MAGIC, UfsEndian::Big);
+        assert_eq!(read_u32(&hdr, CG_OFF_MAGIC, UfsEndian::Big), 0);
+        assert_eq!(read_u32(&hdr, CG43_OFF_MAGIC, UfsEndian::Big), CG_MAGIC);
+        // The three fixed array offsets the old layout uses.
+        assert_eq!(CG43_OFF_IUSED, 724);
+        assert_eq!(CG43_OFF_MAGIC, 980);
+        assert_eq!(CG43_OFF_FREE, 984);
+        // And the header read has to reach byte 980 at all.
+        assert_eq!(CG_HEADER_FIXED_BYTES, 1024);
+    }
+
+    /// The modern fixtures must keep answering `Modern`, so the probe cannot
+    /// silently reinterpret a 4.4BSD volume.
+    #[test]
+    fn modern_fixtures_keep_the_modern_cg_layout() {
+        for name in ["test_ufs1.img.zst", "test_ufs2.img.zst"] {
+            let img = load_fixture(name);
+            let fs = UfsFilesystem::open(Cursor::new(img), 0).expect("open");
+            assert_eq!(fs.cg_layout, CgLayout::Modern, "{name}");
+        }
+    }
+
     #[test]
     fn fixture_ufs1_descends_subdir() {
         let img = load_fixture("test_ufs1.img.zst");
@@ -4085,6 +4495,7 @@ mod tests {
             direct: [0; UFS_NDADDR],
             indirect: [0; UFS_NIADDR],
             inline_payload: Vec::new(),
+            blocks: 0,
         };
         inode.direct[0] = 64;
         inode.direct[1] = 72;
@@ -4138,15 +4549,20 @@ mod tests {
         let img = build_writable_fixture();
         let mut backing = img;
         let mut fs = UfsFilesystem::open(Cursor::new(&mut backing), 0).expect("open");
-        let (_, _, _, nffree_before) = fs.read_cg_cs(0).expect("cs before");
+        let (_, nbfree_before, _, nffree_before) = fs.read_cg_cs(0).expect("cs before");
         let start = fs.alloc_frag_run(8, 0).expect("alloc 8 frags");
         // First clear-bit run starts at bit 0 (all 256 frags are free).
         assert_eq!(start, 0);
         let (bm, _) = fs.read_cg_free_bitmap(0).expect("re-read free bitmap");
         // Frags 0..8 must now be CLEAR (= allocated). Byte 0 should be 0.
         assert_eq!(bm[0], 0);
-        let (_, _, _, nffree_after) = fs.read_cg_cs(0).expect("cs after");
-        assert_eq!(nffree_after, nffree_before - 8);
+        // FFS counts a wholly free block in `nbfree`, and only counts loose
+        // fragments in `nffree`. Taking a whole block therefore moves
+        // `nbfree`, not `nffree` — debiting `nffree` here drove it negative
+        // on a real NeXTSTEP volume and made its fsck reject the filesystem.
+        let (_, nbfree_after, _, nffree_after) = fs.read_cg_cs(0).expect("cs after");
+        assert_eq!(nbfree_after, nbfree_before - 1, "one free block consumed");
+        assert_eq!(nffree_after, nffree_before, "no loose fragments created");
     }
 
     #[test]
@@ -4155,13 +4571,33 @@ mod tests {
         let mut backing = img;
         let mut fs = UfsFilesystem::open(Cursor::new(&mut backing), 0).expect("open");
         let start = fs.alloc_frag_run(8, 0).expect("alloc");
-        let (_, _, _, nffree_after_alloc) = fs.read_cg_cs(0).expect("cs alloc");
+        let (_, nbfree_alloc, _, nffree_alloc) = fs.read_cg_cs(0).expect("cs alloc");
         fs.free_frag_run(start, 8).expect("free");
         let (bm, _) = fs.read_cg_free_bitmap(0).expect("re-read");
         // First 8 bits must be SET again (all free).
         assert_eq!(bm[0], 0xFF);
-        let (_, _, _, nffree_after_free) = fs.read_cg_cs(0).expect("cs free");
-        assert_eq!(nffree_after_free, nffree_after_alloc + 8);
+        let (_, nbfree_free, _, nffree_free) = fs.read_cg_cs(0).expect("cs free");
+        assert_eq!(nbfree_free, nbfree_alloc + 1, "the block is whole again");
+        assert_eq!(nffree_free, nffree_alloc, "and left no loose fragments");
+    }
+
+    /// A sub-block allocation is the case that separates the two counters:
+    /// FFS carves a free *block* into loose fragments, so `nbfree` drops by
+    /// one and `nffree` gains whatever the allocation did not use.
+    #[test]
+    fn partial_allocation_converts_a_block_into_loose_fragments() {
+        let img = build_writable_fixture();
+        let mut backing = img;
+        let mut fs = UfsFilesystem::open(Cursor::new(&mut backing), 0).expect("open");
+        let (_, nbfree_before, _, nffree_before) = fs.read_cg_cs(0).expect("cs before");
+        fs.alloc_frag_run(3, 0).expect("alloc 3 frags");
+        let (_, nbfree_after, _, nffree_after) = fs.read_cg_cs(0).expect("cs after");
+        assert_eq!(nbfree_after, nbfree_before - 1);
+        assert_eq!(
+            nffree_after,
+            nffree_before + 5,
+            "8 - 3 fragments left loose"
+        );
     }
 
     #[test]
@@ -4386,6 +4822,73 @@ mod tests {
 
     /// Rename keeps the inode number and file contents, drops the old
     /// name, exposes the new one, and leaves the volume fsck-clean.
+    /// A file bigger than the 12 direct blocks has to build a single-indirect
+    /// block; one bigger still has to build the double-indirect level. Before
+    /// this, `put` on any UFS volume refused anything over 96 KiB.
+    #[test]
+    fn files_past_the_direct_blocks_round_trip_through_the_indirect_levels() {
+        use super::super::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+        let img = load_fixture("test_ufs1.img.zst");
+        let mut backing = img;
+        let mut fs = UfsFilesystem::open(Cursor::new(&mut backing), 0).expect("open");
+        let direct_cap = fs.bsize * UFS_NDADDR as u64;
+        let root = fs.root().expect("root");
+
+        // Just past the direct blocks: one single-indirect block appears.
+        let body: Vec<u8> = (0..direct_cap as usize + 5000)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let created = fs
+            .create_file(
+                &root,
+                "indirect.bin",
+                &mut body.as_slice(),
+                body.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .expect("create_file past the direct cap");
+        assert_eq!(created.size, body.len() as u64);
+
+        let inode = fs.read_inode(created.location as u32).expect("read inode");
+        assert_ne!(inode.indirect[0], 0, "no single-indirect block was built");
+        assert_eq!(inode.indirect[1], 0, "double indirect should not be needed");
+        assert_ne!(inode.blocks, 0, "di_blocks was not stamped");
+
+        let back = fs.read_file(&created, usize::MAX).expect("read back");
+        assert_eq!(back, body, "indirect-block file did not round-trip");
+    }
+
+    #[test]
+    fn a_file_written_past_the_direct_blocks_survives_a_reopen() {
+        use super::super::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+        let img = load_fixture("test_ufs1.img.zst");
+        let mut backing = img;
+        let len = {
+            let mut fs = UfsFilesystem::open(Cursor::new(&mut backing), 0).expect("open");
+            let len = fs.bsize as usize * (UFS_NDADDR + 3);
+            let body: Vec<u8> = (0..len).map(|i| (i % 199) as u8).collect();
+            let root = fs.root().expect("root");
+            fs.create_file(
+                &root,
+                "big.bin",
+                &mut body.as_slice(),
+                body.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .expect("create_file");
+            len
+        };
+
+        let mut fs = UfsFilesystem::open(Cursor::new(&mut backing), 0).expect("re-open");
+        let root = fs.root().expect("root");
+        let kids = fs.list_directory(&root).expect("list");
+        let big = kids.iter().find(|e| e.name == "big.bin").expect("big.bin");
+        assert_eq!(big.size, len as u64);
+        let back = fs.read_file(big, usize::MAX).expect("read back");
+        assert_eq!(back.len(), len);
+        assert!(back.iter().enumerate().all(|(i, b)| *b == (i % 199) as u8));
+    }
+
     #[test]
     fn rename_preserves_inode_and_content_against_ufs1_fixture() {
         use super::super::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
@@ -4577,9 +5080,9 @@ mod tests {
         );
     }
 
-    /// Files larger than 12 × bsize hit the indirect-block gate and
-    /// return Unsupported. Confirms we don't silently accept oversized
-    /// writes that would corrupt the volume.
+    /// Past the double-indirect level a file needs triple indirection, which
+    /// we do not write. Confirms the refusal and, more importantly, that the
+    /// failed create rolls back rather than leaving an orphan inode behind.
     #[test]
     fn create_file_oversize_returns_unsupported() {
         use super::super::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
@@ -4587,15 +5090,16 @@ mod tests {
         let mut backing = img;
         let mut fs = UfsFilesystem::open(Cursor::new(&mut backing), 0).expect("open");
         let root = fs.root().expect("root");
-        let bsize = fs.bsize as usize;
-        let oversize = vec![0u8; bsize * UFS_NDADDR + 1];
-        let mut src = oversize.as_slice();
+        let nindir = fs.nindir();
+        let cap = (UFS_NDADDR as u64 + nindir + nindir * nindir) * fs.bsize;
+        // The size gate runs before any read, so the source can be synthetic.
+        let mut src = std::io::repeat(0u8).take(cap + 1);
         let err = fs
             .create_file(
                 &root,
                 "toobig.bin",
                 &mut src,
-                oversize.len() as u64,
+                cap + 1,
                 &CreateFileOptions::default(),
             )
             .expect_err("must refuse");
@@ -4978,6 +5482,7 @@ mod tests {
             direct: [0; UFS_NDADDR],
             indirect: [0; UFS_NIADDR],
             inline_payload: Vec::new(),
+            blocks: 0,
         };
         fs.write_inode(orphan_inum, &orphan).expect("write inode");
 
@@ -5157,5 +5662,52 @@ mod tests {
         let bytes = fs.read_inode_data(&inode, size, 4096).expect("read");
         assert_eq!(bytes.len(), 4096);
         assert!(bytes.iter().all(|&b| b == 0));
+    }
+}
+
+#[cfg(test)]
+mod dir_growth_tests {
+    use super::*;
+    use crate::fs::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+    use std::io::Cursor;
+
+    /// R-061: a directory that outgrows its first block must still list.
+    #[test]
+    fn directory_grows_past_its_first_block() {
+        let params = crate::fs::ufs_format::Ufs1FormatParams {
+            size_bytes: 16 * 1024 * 1024,
+            ..Default::default()
+        };
+        let img = crate::fs::ufs_format::create_blank_ufs1(&params).unwrap();
+        let mut fs = UfsFilesystem::open(Cursor::new(img), 0).unwrap();
+        let root = fs.root().unwrap();
+        // 8 KiB blocks hold 25 twenty-byte records per 512-byte chunk: the
+        // 400th file needs a second block, the 800th a third.
+        for i in 0..850 {
+            let name = format!("f{i:04}.txt");
+            fs.create_file(
+                &root,
+                &name,
+                &mut &b"x"[..],
+                1,
+                &CreateFileOptions::default(),
+            )
+            .unwrap_or_else(|e| panic!("creating {name}: {e}"));
+        }
+        let ino = fs.read_inode(root.location as u32).unwrap();
+        assert!(
+            ino.direct[1] != 0 && ino.direct[2] != 0,
+            "{:?}",
+            &ino.direct[..3]
+        );
+        let kids = fs.list_directory(&root).unwrap();
+        assert_eq!(kids.len(), 850);
+        for e in kids.iter().filter(|e| e.name.starts_with('f')) {
+            fs.delete_entry(&root, e).unwrap();
+        }
+        fs.sync_metadata().unwrap();
+        assert!(fs.list_directory(&root).unwrap().is_empty());
+        let report = fs.fsck().expect("ufs has fsck").unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
     }
 }

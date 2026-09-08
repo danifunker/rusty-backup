@@ -27,12 +27,13 @@ fn read_sysfs_attr(path: &Path) -> String {
 /// Returns `true` for block device names that represent real physical devices
 /// (as opposed to loop, ram, device-mapper, etc.).
 fn is_physical_block_device(name: &str) -> bool {
+    // fd0 stays in: the floppy driver is a real drive, and imaging floppies is
+    // half of what this tool is for; optical (sr) and virtual devices are out.
     !name.starts_with("loop")
         && !name.starts_with("ram")
         && !name.starts_with("dm-")
         && !name.starts_with("zram")
         && !name.starts_with("sr")
-        && !name.starts_with("fd")
         && !name.starts_with("nbd")
 }
 
@@ -269,13 +270,36 @@ pub fn open_target_for_writing(path: &Path) -> Result<File> {
         let mountinfo_content = fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
         let mounts = parse_mountinfo_from_str(&mountinfo_content);
 
-        // Unmount any mounted partitions belonging to this device
+        // Unmount this device's partitions, for real where possible: a lazy
+        // detach leaves an open filesystem writing back under the restore.
         for (dev_path, mi) in &mounts {
             let dev_part_name = dev_path.trim_start_matches("/dev/");
             if parent_device_name(dev_part_name) == parent {
-                let _ = umount2(mi.mount_point.as_str(), MntFlags::MNT_DETACH);
+                unmount_now_or_lazily(mi.mount_point.as_str());
             }
         }
+        // Whatever the old filesystems still had dirty lands before our first write.
+        unsafe { libc::sync() };
+
+        // O_EXCL on a block device fails with EBUSY while it or any partition
+        // of it is mounted or held; that is what keeps a live filesystem out.
+        use std::os::unix::fs::OpenOptionsExt;
+        return std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_EXCL)
+            .open(path)
+            .map_err(|e| {
+                if e.raw_os_error() == Some(libc::EBUSY) {
+                    anyhow::anyhow!(
+                        "{} is still in use: a filesystem on it is mounted or held open by \
+                         another process. Close what uses it (or unmount it) and try again.",
+                        path.display()
+                    )
+                } else {
+                    crate::os::device_open_error(path, e)
+                }
+            });
     }
 
     std::fs::OpenOptions::new()
@@ -283,6 +307,14 @@ pub fn open_target_for_writing(path: &Path) -> Result<File> {
         .write(true)
         .open(path)
         .map_err(|e| crate::os::device_open_error(path, e))
+}
+
+/// Unmount `mount_point` for real; fall back to a lazy detach only when it
+/// is busy, so at least new opens stop landing on the old filesystem.
+fn unmount_now_or_lazily(mount_point: &str) {
+    if umount2(mount_point, MntFlags::empty()).is_err() {
+        let _ = umount2(mount_point, MntFlags::MNT_DETACH);
+    }
 }
 
 /// Derive the parent device name from a partition name.
@@ -436,7 +468,9 @@ mod tests {
         assert!(!is_physical_block_device("dm-0"));
         assert!(!is_physical_block_device("zram0"));
         assert!(!is_physical_block_device("sr0"));
-        assert!(!is_physical_block_device("fd0"));
+        // R17: the floppy drive is a physical device the user wants to image.
+        assert!(is_physical_block_device("fd0"));
+        assert!(is_physical_block_device("fd1"));
         assert!(!is_physical_block_device("nbd0"));
     }
 }
@@ -511,18 +545,33 @@ impl PrivilegedDiskAccess for LinuxDiskAccess {
             for (dev_path, mi) in &mounts {
                 let dev_part_name = dev_path.trim_start_matches("/dev/");
                 if parent_device_name(dev_part_name) == parent {
-                    let _ = umount2(mi.mount_point.as_str(), MntFlags::MNT_DETACH);
+                    unmount_now_or_lazily(mi.mount_point.as_str());
                 }
             }
+            unsafe { libc::sync() };
         }
 
-        // Open for writing
-        match OpenOptions::new().read(true).write(true).open(path) {
+        // Open for writing; a block device is claimed exclusively so a
+        // filesystem still live on it makes this fail instead of racing us.
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(true);
+        if path_str.starts_with("/dev/") {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(libc::O_EXCL);
+        }
+        match opts.open(path) {
             Ok(file) => {
                 let handle = self.next_handle;
                 self.next_handle += 1;
                 self.open_handles.insert(handle, file);
                 Ok(DiskHandle(handle))
+            }
+            Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {
+                anyhow::bail!(
+                    "{} is still in use: a filesystem on it is mounted or held open by \
+                     another process. Close what uses it (or unmount it) and try again.",
+                    path.display()
+                )
             }
             Err(e) if e.kind() == ErrorKind::PermissionDenied => {
                 anyhow::bail!(

@@ -98,12 +98,13 @@ pub(crate) fn parse_vbr(vbr: &[u8; 512]) -> Result<NtfsVbr, FilesystemError> {
     ]);
 
     // Clusters per MFT record: if negative, record size = 2^|value| bytes
-    let clusters_per_mft_raw = vbr[0x40] as i8;
-    let mft_record_size = if clusters_per_mft_raw < 0 {
-        1u32 << ((-clusters_per_mft_raw) as u32)
-    } else {
-        clusters_per_mft_raw as u32 * sectors_per_cluster as u32 * bytes_per_sector as u32
-    };
+    let cluster_bytes = sectors_per_cluster as u32 * bytes_per_sector as u32;
+    let mft_record_size = mft_record_bytes(vbr[0x40] as i8, cluster_bytes).ok_or_else(|| {
+        FilesystemError::Parse(format!(
+            "NTFS: clusters-per-MFT-record byte 0x{:02X} is not a valid record size",
+            vbr[0x40]
+        ))
+    })?;
 
     // Clusters per index record at 0x44: same signed encoding as 0x40.
     let clusters_per_index_raw = vbr[0x44] as i8;
@@ -158,6 +159,22 @@ pub(crate) struct DataRun {
     pub(crate) sparse: bool,
 }
 
+/// MFT record size from the boot sector's clusters-per-record byte: a negative
+/// value is a power-of-two shift, a positive one a cluster count. Anything
+/// outside 256 bytes to 1 MiB is damaged media, not a record size.
+pub(crate) fn mft_record_bytes(raw: i8, cluster_bytes: u32) -> Option<u32> {
+    let size = if raw < 0 {
+        let shift = (-(raw as i32)) as u32;
+        if !(8..=20).contains(&shift) {
+            return None;
+        }
+        1u32 << shift
+    } else {
+        (raw as u32).checked_mul(cluster_bytes)?
+    };
+    ((256..=1 << 20).contains(&size) && size.is_power_of_two()).then_some(size)
+}
+
 /// Decode data runs from an MFT attribute's non-resident data.
 pub(crate) fn decode_data_runs(data: &[u8]) -> Vec<DataRun> {
     let mut runs = Vec::new();
@@ -173,8 +190,11 @@ pub(crate) fn decode_data_runs(data: &[u8]) -> Vec<DataRun> {
 
         let length_size = (header & 0x0F) as usize;
         let offset_size = ((header >> 4) & 0x0F) as usize;
-
-        if length_size == 0 || pos + length_size + offset_size > data.len() {
+        // A nibble above 8 cannot be a real run (the shift below would overflow).
+        if length_size == 0 || length_size > 8 || offset_size > 8 {
+            break;
+        }
+        if pos + length_size + offset_size > data.len() {
             break;
         }
 
@@ -864,16 +884,14 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
         for attr in &attrs {
             if attr.attr_type == ATTR_DATA {
                 let bitmap = self.read_attribute_data(attr, None)?;
-                // Scan backwards for last set bit
-                for byte_idx in (0..bitmap.len()).rev() {
-                    if bitmap[byte_idx] != 0 {
-                        // Find highest set bit in this byte
-                        let byte = bitmap[byte_idx];
-                        for bit in (0..8).rev() {
-                            if byte & (1 << bit) != 0 {
-                                return Ok(byte_idx as u64 * 8 + bit as u64);
-                            }
-                        }
+                // Bits at or past the cluster count are the end-of-volume mark, not data.
+                let volume_clusters =
+                    self.total_sectors * self.bytes_per_sector / self.cluster_size;
+                let mut c = (bitmap.len() as u64 * 8).min(volume_clusters);
+                while c > 0 {
+                    c -= 1;
+                    if bitmap[(c / 8) as usize] & (1 << (c % 8)) != 0 {
+                        return Ok(c);
                     }
                 }
                 return Ok(0);
@@ -1121,8 +1139,8 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
                 break;
             }
 
-            // Parse $FILE_NAME content if present
-            if content_length >= 66 {
+            // Parse $FILE_NAME content if present; a length past the entry is damage.
+            if content_length >= 66 && 16 + content_length <= entry_length {
                 let content = &data[pos + 16..pos + 16 + content_length];
                 // The file's own MFT reference is at the start of the index entry
                 let mft_ref = u64::from_le_bytes([
@@ -1485,10 +1503,6 @@ impl<R: Read + Seek + Send> Filesystem for NtfsFilesystem<R> {
         self.label.as_deref()
     }
 
-    fn case_insensitive_lookup(&self) -> bool {
-        true
-    }
-
     fn fs_type(&self) -> &str {
         &self.fs_type_string
     }
@@ -1510,11 +1524,9 @@ impl<R: Read + Seek + Send> Filesystem for NtfsFilesystem<R> {
         if last_cluster == 0 {
             return Ok(self.total_size());
         }
-        // Include the full cluster plus one sector for the backup boot sector
-        let data_end = (last_cluster + 1) * self.cluster_size;
-        // NTFS has a backup boot sector at the last sector
-        let backup_boot = self.total_sectors * self.bytes_per_sector;
-        Ok(data_end.max(backup_boot))
+        // The last used cluster plus the backup boot sector a resize rewrites behind it.
+        let data_end = (last_cluster + 1) * self.cluster_size + self.bytes_per_sector;
+        Ok(data_end.min(self.total_size()))
     }
 
     /// The packed (defragmenting-clone) target size: a fresh NTFS holding only
@@ -1749,8 +1761,9 @@ fn build_file_name_attr(
     data[24..32].copy_from_slice(&ts); // MFT modification
     data[32..40].copy_from_slice(&ts); // access
 
-    // allocated size
-    data[40..48].copy_from_slice(&size.to_le_bytes());
+    // Allocated size as for resident data (quadword-rounded); a caller with
+    // non-resident data overrides it with the cluster-rounded size.
+    data[40..48].copy_from_slice(&((size + 7) & !7).to_le_bytes());
     // real size
     data[48..56].copy_from_slice(&size.to_le_bytes());
 
@@ -1766,8 +1779,9 @@ fn build_file_name_attr(
 
     // name length
     data[64] = utf16.len() as u8;
-    // Win32+DOS only when the name really is a valid 8.3 name; else Win32.
-    data[65] = if is_valid_dos_name(name) { 0x03 } else { 0x01 };
+    // Win32+DOS when the name is a valid 8.3 name; otherwise POSIX, the namespace
+    // Windows itself uses with 8.3 creation off. A lone Win32 name fails chkdsk.
+    data[65] = if is_valid_dos_name(name) { 0x03 } else { 0x00 };
 
     // UTF-16LE name
     for (i, &ch) in utf16.iter().enumerate() {
@@ -2123,10 +2137,11 @@ fn assemble_mft_record(
         pos += attr.len();
     }
 
-    // End marker
-    if pos + 4 <= record_size as usize {
+    // End marker; Windows counts it as eight bytes in the used size, and chkdsk
+    // corrects a record whose first free byte sits four bytes early.
+    if pos + 8 <= record_size as usize {
         record[pos..pos + 4].copy_from_slice(&ATTR_END.to_le_bytes());
-        pos += 4;
+        pos += 8;
     }
 
     // Used size
@@ -2372,9 +2387,199 @@ impl<R: Read + Write + Seek> NtfsFilesystem<R> {
             }
         }
 
+        // The MFT is full: grow it and hand out the first new record (F-012).
+        self.grow_mft()?;
+        let mut bitmap = self.read_mft_bitmap()?;
+        for byte_idx in 3..bitmap.len() {
+            if bitmap[byte_idx] == 0xFF {
+                continue;
+            }
+            let bit = bitmap[byte_idx].trailing_ones();
+            let record_num = byte_idx as u64 * 8 + bit as u64;
+            bitmap[byte_idx] |= 1 << bit;
+            self.write_mft_bitmap(&bitmap)?;
+            let mut blank = self.blank_mft_record(1);
+            self.write_mft_record(record_num, &mut blank)?;
+            return Ok((record_num, 1));
+        }
         Err(FilesystemError::DiskFull(
             "no free MFT records available".into(),
         ))
+    }
+
+    /// A fresh FILE record with sequence `seq`, not in use, holding only the end marker.
+    fn blank_mft_record(&self, seq: u16) -> Vec<u8> {
+        let mut blank = vec![0u8; self.mft_record_size as usize];
+        blank[0..4].copy_from_slice(b"FILE");
+        blank[0x04..0x06].copy_from_slice(&0x0030u16.to_le_bytes());
+        let fixup_count = (self.mft_record_size / NTFS_BLOCK_SIZE as u32 + 1) as u16;
+        blank[0x06..0x08].copy_from_slice(&fixup_count.to_le_bytes());
+        blank[0x10..0x12].copy_from_slice(&seq.to_le_bytes());
+        let first_attr = (0x30 + fixup_count as usize * 2 + 7) & !7;
+        blank[0x14..0x16].copy_from_slice(&(first_attr as u16).to_le_bytes());
+        blank[0x18..0x1C].copy_from_slice(&((first_attr + 4) as u32).to_le_bytes());
+        blank[0x1C..0x20].copy_from_slice(&self.mft_record_size.to_le_bytes());
+        blank[first_attr..first_attr + 4].copy_from_slice(&ATTR_END.to_le_bytes());
+        blank
+    }
+
+    /// Give `$MFT` more records: whole clusters appended to its `$DATA`, its
+    /// `$BITMAP` widened to match, and every new record formatted blank (F-012).
+    fn grow_mft(&mut self) -> Result<(), FilesystemError> {
+        let record_size = self.mft_record_size as u64;
+        let mut record = self.read_mft_record(0)?;
+        let attrs = parse_mft_attributes(&record, self.mft_record_size);
+        let data = attrs
+            .iter()
+            .find(|a| a.attr_type == ATTR_DATA && !a.resident)
+            .ok_or_else(|| FilesystemError::Parse("$MFT has no non-resident $DATA".into()))?
+            .clone();
+        let old_records = data.real_size / record_size;
+        // A quarter more, at least 64 records, in whole clusters.
+        let want = (old_records / 4).max(64) * record_size;
+        let clusters = want.div_ceil(self.cluster_size).max(1);
+        let grow_bytes = clusters * self.cluster_size;
+        let new_records = (data.real_size + grow_bytes) / record_size;
+        let new_runs = self.allocate_volume_clusters(clusters as u32)?;
+
+        let (data_pos, _) = find_attr_pos(&record, ATTR_DATA, false)
+            .ok_or_else(|| FilesystemError::Parse("$MFT has no non-resident $DATA".into()))?;
+        let instance = u16::from_le_bytes([record[data_pos + 0x0E], record[data_pos + 0x0F]]);
+        let mut all_runs: Vec<(u64, u64)> = data
+            .data_runs
+            .iter()
+            .filter(|r| !r.sparse && r.cluster_offset >= 0)
+            .map(|r| (r.cluster_offset as u64, r.length))
+            .collect();
+        all_runs.extend_from_slice(&new_runs);
+        let mut new_attr = build_named_nonresident_attr(
+            ATTR_DATA,
+            "",
+            &all_runs,
+            data.allocated_size + grow_bytes,
+            data.real_size + grow_bytes,
+        );
+        new_attr[0x0E..0x10].copy_from_slice(&instance.to_le_bytes());
+        replace_attr_at(&mut record, data_pos, &new_attr)?;
+
+        // The bitmap keeps a multiple of eight bytes, as Windows writes it.
+        let mut bitmap = self.read_mft_bitmap()?;
+        let need = (new_records.div_ceil(8) as usize).div_ceil(8) * 8;
+        if bitmap.len() < need {
+            bitmap.resize(need, 0);
+        }
+        // The new records are free; the padding past the last one stays
+        // marked in use, as Windows keeps it, so nothing is handed out there.
+        for bit in old_records..(bitmap.len() as u64 * 8) {
+            let (byte, mask) = ((bit / 8) as usize, 1u8 << (bit % 8));
+            if bit < new_records {
+                bitmap[byte] &= !mask;
+            } else {
+                bitmap[byte] |= mask;
+            }
+        }
+        let bm = attrs
+            .iter()
+            .find(|a| a.attr_type == ATTR_BITMAP)
+            .ok_or_else(|| FilesystemError::Parse("$MFT $BITMAP attribute not found".into()))?
+            .clone();
+        let (bm_pos, _) = find_attr_pos(&record, ATTR_BITMAP, bm.resident)
+            .ok_or_else(|| FilesystemError::Parse("$MFT $BITMAP attribute not found".into()))?;
+        let bm_instance = u16::from_le_bytes([record[bm_pos + 0x0E], record[bm_pos + 0x0F]]);
+        if bm.resident {
+            let mut new_bm = build_resident_attr(ATTR_BITMAP, &bitmap);
+            new_bm[0x0E..0x10].copy_from_slice(&bm_instance.to_le_bytes());
+            replace_attr_at(&mut record, bm_pos, &new_bm)?;
+        } else {
+            let mut runs: Vec<(u64, u64)> = bm
+                .data_runs
+                .iter()
+                .filter(|r| !r.sparse && r.cluster_offset >= 0)
+                .map(|r| (r.cluster_offset as u64, r.length))
+                .collect();
+            let mut alloc = bm.allocated_size;
+            if (bitmap.len() as u64) > alloc {
+                let extra = (bitmap.len() as u64 - alloc).div_ceil(self.cluster_size);
+                runs.extend(self.allocate_volume_clusters(extra as u32)?);
+                alloc += extra * self.cluster_size;
+            }
+            let mut new_bm =
+                build_named_nonresident_attr(ATTR_BITMAP, "", &runs, alloc, bitmap.len() as u64);
+            new_bm[0x0E..0x10].copy_from_slice(&bm_instance.to_le_bytes());
+            replace_attr_at(&mut record, bm_pos, &new_bm)?;
+            let bm_runs = Self::runs_to_data_runs(&runs);
+            self.write_data_to_runs(&bm_runs, &bitmap)?;
+        }
+        self.write_mft_record(0, &mut record)?;
+        self.mft_data_runs = self.read_mft_self_data_runs()?;
+        if bm.resident {
+            self.write_mft_bitmap(&bitmap)?;
+        }
+        for n in old_records..new_records {
+            let mut blank = self.blank_mft_record(1);
+            blank[0x16..0x18].copy_from_slice(&0u16.to_le_bytes()); // not in use
+            self.write_mft_record(n, &mut blank)?;
+        }
+        // $MFTMirr carries the first four records; record 0 just changed.
+        let first4 = self.fsck_read_first_mft_records()?;
+        let mirror = self.fsck_mftmirr_offset();
+        self.fsck_write_raw(mirror, &first4)
+    }
+
+    /// The `$FILE_NAME`s in `parent` that spell `name`, DOS alias included.
+    fn names_for(names: &[FileNameAttr], parent: u64, name: &str) -> Vec<usize> {
+        let lower = name.to_lowercase();
+        let has_long = names
+            .iter()
+            .any(|n| n.parent == parent && n.namespace != 2 && n.name.to_lowercase() == lower);
+        names
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| {
+                n.parent == parent
+                    && (n.name.to_lowercase() == lower || (has_long && n.namespace == 2))
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Drop only this name when the record has other hard links; true if it did.
+    fn unlink_one_name(
+        &mut self,
+        record_number: u64,
+        parent_record_num: u64,
+        name: &str,
+    ) -> Result<bool, FilesystemError> {
+        let Ok(mut record) = self.read_mft_record(record_number) else {
+            return Ok(false);
+        };
+        let names = file_name_attrs(&record);
+        let ours = Self::names_for(&names, parent_record_num, name);
+        if ours.is_empty() || ours.len() == names.len() {
+            return Ok(false);
+        }
+        for &i in &ours {
+            self.remove_alias_or_name(parent_record_num, &names[i])?;
+        }
+        for &i in ours.iter().rev() {
+            remove_attr_at(&mut record, names[i].pos)?;
+        }
+        let remaining = (names.len() - ours.len()) as u16;
+        record[0x12..0x14].copy_from_slice(&remaining.to_le_bytes());
+        self.write_mft_record(record_number, &mut record)?;
+        Ok(true)
+    }
+
+    /// Remove one name's index entry; a DOS alias with no entry is not an error.
+    fn remove_alias_or_name(
+        &mut self,
+        parent_record_num: u64,
+        name: &FileNameAttr,
+    ) -> Result<(), FilesystemError> {
+        match self.remove_index_entry(parent_record_num, &name.name) {
+            Err(FilesystemError::NotFound(_)) if name.namespace == 2 => Ok(()),
+            other => other,
+        }
     }
 
     /// Free an MFT record.
@@ -2478,6 +2683,42 @@ impl<R: Read + Write + Seek> NtfsFilesystem<R> {
         Ok(allocated)
     }
 
+    /// Copy `data_len` bytes into freshly allocated `runs` 1 MiB at a time; the
+    /// source is never held whole in memory (CONTRIBUTING streaming rule).
+    fn stream_into_runs(
+        &mut self,
+        runs: &[(u64, u64)],
+        data: &mut dyn std::io::Read,
+        data_len: u64,
+    ) -> Result<(), FilesystemError> {
+        let mut buf = vec![0u8; 1024 * 1024];
+        let mut written = 0u64;
+        for &(start_cluster, length) in runs {
+            let offset = self.cluster_offset(start_cluster);
+            self.reader.seek(SeekFrom::Start(offset))?;
+            let run_bytes = length * self.cluster_size;
+            let to_write = run_bytes.min(data_len - written);
+            let mut left = to_write;
+            while left > 0 {
+                let n = (buf.len() as u64).min(left) as usize;
+                data.read_exact(&mut buf[..n])
+                    .map_err(FilesystemError::Io)?;
+                self.reader.write_all(&buf[..n])?;
+                left -= n as u64;
+            }
+            // Zero the slack of the last cluster so stale bytes never sit past EOF.
+            let mut pad = run_bytes - to_write;
+            while pad > 0 {
+                let n = (buf.len() as u64).min(pad) as usize;
+                buf[..n].fill(0);
+                self.reader.write_all(&buf[..n])?;
+                pad -= n as u64;
+            }
+            written += to_write;
+        }
+        Ok(())
+    }
+
     /// Free volume clusters.
     fn free_volume_clusters(&mut self, runs: &[(u64, u64)]) -> Result<(), FilesystemError> {
         let (mut bitmap, bitmap_runs) = self.read_volume_bitmap()?;
@@ -2499,6 +2740,86 @@ impl<R: Read + Write + Seek> NtfsFilesystem<R> {
         let total_bits = bitmap.len() as u64 * 8;
         let set_bits = count_set_bits(&bitmap);
         Ok(total_bits - set_bits)
+    }
+
+    /// Bring `$Bitmap` in step with a volume that grew or shrank from
+    /// `old_total_sectors` to `new_total_sectors` (both excluding the backup boot sector).
+    fn resize_volume_bitmap(
+        &mut self,
+        old_total_sectors: u64,
+        new_total_sectors: u64,
+    ) -> Result<(), FilesystemError> {
+        let bps = self.bytes_per_sector;
+        let cs = self.cluster_size;
+        let old_vc = old_total_sectors * bps / cs;
+        let new_vc = new_total_sectors * bps / cs;
+        // Windows sizes the bitmap in whole quadwords and chkdsk holds it to that.
+        let needed = ((new_vc as usize).div_ceil(64) * 8).max(8);
+
+        let (old_bitmap, old_runs) = self.read_volume_bitmap()?;
+        let mut bitmap = old_bitmap;
+        bitmap.resize(needed, 0);
+        // Clusters the volume gained are free; everything past its end is off limits.
+        for c in old_vc.min(new_vc)..new_vc {
+            bitmap[(c / 8) as usize] &= !(1 << (c % 8));
+        }
+        for c in new_vc..(needed as u64 * 8) {
+            bitmap[(c / 8) as usize] |= 1 << (c % 8);
+        }
+
+        let mut record = self.read_mft_record(MFT_RECORD_BITMAP)?;
+        let (pos, _) = find_attr_pos(&record, ATTR_DATA, false)
+            .ok_or_else(|| FilesystemError::Parse("$Bitmap $DATA attribute not found".into()))?;
+        let instance = [record[pos + 0x0E], record[pos + 0x0F]];
+        let allocated_clusters: u64 = old_runs
+            .iter()
+            .filter(|r| !r.sparse)
+            .map(|r| r.length)
+            .sum();
+
+        if needed as u64 <= allocated_clusters * cs {
+            // Slack past the real size reads as "in use" should anything ignore the size.
+            let mut padded = bitmap;
+            padded.resize((allocated_clusters * cs) as usize, 0xFF);
+            self.write_volume_bitmap(&padded, &old_runs)?;
+            record[pos + 0x30..pos + 0x38].copy_from_slice(&(needed as u64).to_le_bytes());
+            record[pos + 0x38..pos + 0x40].copy_from_slice(&(needed as u64).to_le_bytes());
+            return self.write_mft_record(MFT_RECORD_BITMAP, &mut record);
+        }
+
+        // The bitmap outgrew its clusters: give it a fresh run, then release the old one.
+        let want = (needed as u64).div_ceil(cs);
+        let new_runs = find_free_cluster_runs(&bitmap, new_vc, want)?;
+        for &(start, len) in &new_runs {
+            for c in start..start + len {
+                bitmap[(c / 8) as usize] |= 1 << (c % 8);
+            }
+        }
+        for run in old_runs
+            .iter()
+            .filter(|r| !r.sparse && r.cluster_offset >= 0)
+        {
+            let start = run.cluster_offset as u64;
+            for c in start..(start + run.length).min(new_vc) {
+                bitmap[(c / 8) as usize] &= !(1 << (c % 8));
+            }
+        }
+        let runs: Vec<DataRun> = new_runs
+            .iter()
+            .map(|&(start, len)| DataRun {
+                cluster_offset: start as i64,
+                length: len,
+                sparse: false,
+            })
+            .collect();
+        let mut padded = bitmap;
+        padded.resize((want * cs) as usize, 0xFF);
+        self.write_volume_bitmap(&padded, &runs)?;
+        let mut attr =
+            build_named_nonresident_attr(ATTR_DATA, "", &new_runs, want * cs, needed as u64);
+        attr[0x0E..0x10].copy_from_slice(&instance);
+        replace_attr_at(&mut record, pos, &attr)?;
+        self.write_mft_record(MFT_RECORD_BITMAP, &mut record)
     }
 
     /// Read parent directory's security descriptor, or build a default one.
@@ -3037,9 +3358,32 @@ impl<R: Read + Write + Seek> NtfsFilesystem<R> {
                     if self.try_splice_into_root(record, &pending, record_size)? {
                         break;
                     }
-                    return Err(FilesystemError::DiskFull(
-                        "directory index root is full; cannot grow this directory further".into(),
-                    ));
+                    // The root is full: its entries move down into a fresh INDX
+                    // node and the root keeps one sentinel pointing there, so the
+                    // tree gains a level and the median goes into that node (F-012).
+                    let new_i = self.append_index_block(record, &mut stream, block_size)?;
+                    let new_vcn = self.block_index_to_vcn(new_i, block_size);
+                    let r = parse_root_node(record, self.index_record_size).ok_or_else(|| {
+                        FilesystemError::Parse(
+                            "directory record has no resident $INDEX_ROOT".into(),
+                        )
+                    })?;
+                    let entries = record[r.entries_start..r.entries_end].to_vec();
+                    let (body, end) = split_end_sentinel(&entries)?;
+                    let mut node = build_indx_block(block_size, new_vcn, &body, &end)?;
+                    put_indx_block(&mut stream, new_i, block_size, &mut node)?;
+                    self.splice_out_of_root(record, r.entries_start, entries.len());
+                    if !self.try_splice_into_root(
+                        record,
+                        &internal_end_sentinel(new_vcn),
+                        record_size,
+                    )? {
+                        return Err(FilesystemError::Parse(
+                            "emptied index root cannot hold its one sentinel".into(),
+                        ));
+                    }
+                    path.push((None, 0));
+                    target = Some(new_i);
                 }
             }
         }
@@ -3174,9 +3518,11 @@ impl<R: Read + Write + Seek> NtfsFilesystem<R> {
         let record_size = self.mft_record_size;
         let mut stream = self.read_i30_allocation(record)?;
 
-        // Rightmost leaf of the left subtree.
+        // Rightmost leaf of the left subtree, remembering the internal nodes on
+        // the way: an empty leaf hands the job to the nearest ancestor with an entry.
         let direct_child = self.vcn_to_block_index(left_vcn, block_size)?;
         let mut leaf_i = direct_child;
+        let mut chain: Vec<u64> = Vec::new();
         loop {
             let block = get_indx_block(&stream, leaf_i, block_size)?;
             if !indx_is_internal(&block) {
@@ -3190,6 +3536,7 @@ impl<R: Read + Write + Seek> NtfsFilesystem<R> {
             let vcn = entry_sub_vcn(end_entry).ok_or_else(|| {
                 FilesystemError::Parse("internal index node's end entry has no sub-node".into())
             })?;
+            chain.push(leaf_i);
             leaf_i = self.vcn_to_block_index(vcn, block_size)?;
         }
 
@@ -3198,18 +3545,56 @@ impl<R: Read + Write + Seek> NtfsFilesystem<R> {
             FilesystemError::Parse(format!("INDX block {leaf_i} has a bad node header"))
         })?;
         let region = leaf[es..ee].to_vec();
-        let pred = last_real_entry(&region);
-
         let name = extract_name_from_index_entry(old_entry);
-        match pred {
+
+        // The replacement separator, the leaf entry it came from (if any),
+        // and the emptied blocks that leave the tree.
+        let mut leaf_removal: Option<(usize, usize)> = None;
+        let mut freed: Vec<u64> = Vec::new();
+        let new_sep: Option<Vec<u8>> = match last_real_entry(&region) {
+            Some((pred_off, pred_len)) => {
+                leaf_removal = Some((pred_off, pred_len));
+                Some(entry_with_sub_vcn(
+                    &region[pred_off..pred_off + pred_len],
+                    left_vcn,
+                ))
+            }
             None => {
-                // Empty left subtree: only handled when it is a single leaf —
-                // then dropping the separator orphans nothing but that block.
-                if leaf_i != direct_child {
-                    return Err(FilesystemError::InvalidData(format!(
-                        "cannot remove '{name}': its left index subtree is deeper than one level and empty"
-                    )));
+                // The leaf is empty (nothing rebalances on delete). The last
+                // entry of the nearest ancestor is the predecessor instead; that
+                // ancestor's end sentinel takes over the entry's left subtree,
+                // and ancestors holding nothing but their sentinel go too.
+                freed.push(leaf_i);
+                let mut pulled = None;
+                while let Some(p) = chain.pop() {
+                    let mut pblock = get_indx_block(&stream, p, block_size)?;
+                    let (pes, pee, _) = indx_entry_bounds(&pblock).ok_or_else(|| {
+                        FilesystemError::Parse(format!("INDX block {p} has a bad node header"))
+                    })?;
+                    let pregion = pblock[pes..pee].to_vec();
+                    if let Some((off, len)) = last_real_entry(&pregion) {
+                        let e = pregion[off..off + len].to_vec();
+                        let e_sub = entry_sub_vcn(&e).ok_or_else(|| {
+                            FilesystemError::Parse("internal index entry has no sub-node".into())
+                        })?;
+                        splice_out_of_indx(&mut pblock, pes + off, len);
+                        set_entry_sub_vcn_at(&mut pblock, pes + off, e_sub)?;
+                        put_indx_block(&mut stream, p, block_size, &mut pblock)?;
+                        let mut sep = e;
+                        set_entry_sub_vcn_at(&mut sep, 0, left_vcn)?;
+                        pulled = Some(sep);
+                        break;
+                    }
+                    freed.push(p);
                 }
+                pulled
+            }
+        };
+
+        match new_sep {
+            None => {
+                // The whole left subtree is empty: dropping the separator
+                // orphans nothing but the blocks freed below.
                 match node {
                     None => {
                         let r =
@@ -3237,12 +3622,8 @@ impl<R: Read + Write + Seek> NtfsFilesystem<R> {
                         put_indx_block(&mut stream, p, block_size, &mut pblock)?;
                     }
                 }
-                self.set_i30_bitmap_bit_value(record, leaf_i, false)?;
             }
-            Some((pred_off, pred_len)) => {
-                let pred_entry = region[pred_off..pred_off + pred_len].to_vec();
-                let new_sep = entry_with_sub_vcn(&pred_entry, left_vcn);
-
+            Some(new_sep) => {
                 // Pre-check room so a failed swap cannot lose the old entry.
                 match node {
                     None => {
@@ -3300,11 +3681,15 @@ impl<R: Read + Write + Seek> NtfsFilesystem<R> {
                         put_indx_block(&mut stream, p, block_size, &mut pblock)?;
                     }
                 }
-
                 // Finally drop the predecessor from its leaf.
-                splice_out_of_indx(&mut leaf, es + pred_off, pred_len);
-                put_indx_block(&mut stream, leaf_i, block_size, &mut leaf)?;
+                if let Some((pred_off, pred_len)) = leaf_removal {
+                    splice_out_of_indx(&mut leaf, es + pred_off, pred_len);
+                    put_indx_block(&mut stream, leaf_i, block_size, &mut leaf)?;
+                }
             }
+        }
+        for b in freed {
+            self.set_i30_bitmap_bit_value(record, b, false)?;
         }
 
         self.write_i30_allocation(record, &stream)?;
@@ -3407,6 +3792,131 @@ fn record_used_size(record: &[u8]) -> usize {
 
 fn set_record_used_size(record: &mut [u8], used: usize) {
     record[0x18..0x1C].copy_from_slice(&(used as u32).to_le_bytes());
+}
+
+/// One `$FILE_NAME` of an MFT record: where it sits and whom it names.
+struct FileNameAttr {
+    pos: usize,
+    parent: u64,
+    namespace: u8,
+    name: String,
+}
+
+/// Every resident `$FILE_NAME` in `record`, in attribute order.
+fn file_name_attrs(record: &[u8]) -> Vec<FileNameAttr> {
+    let mut out = Vec::new();
+    let mut pos = u16::from_le_bytes([record[0x14], record[0x15]]) as usize;
+    while pos + 24 <= record.len() {
+        let atype = u32::from_le_bytes([
+            record[pos],
+            record[pos + 1],
+            record[pos + 2],
+            record[pos + 3],
+        ]);
+        if atype == ATTR_END || atype == 0 {
+            break;
+        }
+        let alen = u32::from_le_bytes([
+            record[pos + 4],
+            record[pos + 5],
+            record[pos + 6],
+            record[pos + 7],
+        ]) as usize;
+        if alen < 24 || pos + alen > record.len() {
+            break;
+        }
+        if atype == ATTR_FILE_NAME && record[pos + 8] == 0 {
+            let vlen = u32::from_le_bytes([
+                record[pos + 0x10],
+                record[pos + 0x11],
+                record[pos + 0x12],
+                record[pos + 0x13],
+            ]) as usize;
+            let voff = u16::from_le_bytes([record[pos + 0x14], record[pos + 0x15]]) as usize;
+            if voff + vlen <= alen && vlen >= 0x42 {
+                let v = &record[pos + voff..pos + voff + vlen];
+                let name_len = v[0x40] as usize;
+                if 0x42 + name_len * 2 <= vlen {
+                    let units: Vec<u16> = v[0x42..0x42 + name_len * 2]
+                        .chunks_exact(2)
+                        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                        .collect();
+                    out.push(FileNameAttr {
+                        pos,
+                        parent: u64::from_le_bytes([v[0], v[1], v[2], v[3], v[4], v[5], 0, 0]),
+                        namespace: v[0x41],
+                        name: String::from_utf16_lossy(&units),
+                    });
+                }
+            }
+        }
+        pos += alen;
+    }
+    out
+}
+
+/// First-fit `want` free clusters below `limit` as (start, length) runs, one
+/// contiguous run when the volume has one, fragments otherwise.
+fn find_free_cluster_runs(
+    bitmap: &[u8],
+    limit: u64,
+    want: u64,
+) -> Result<Vec<(u64, u64)>, FilesystemError> {
+    let is_free = |c: u64| bitmap[(c / 8) as usize] & (1 << (c % 8)) == 0;
+    let limit = limit.min(bitmap.len() as u64 * 8);
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    let mut c = 0;
+    while c < limit {
+        if !is_free(c) {
+            c += 1;
+            continue;
+        }
+        let start = c;
+        while c < limit && is_free(c) {
+            c += 1;
+        }
+        if c - start >= want {
+            return Ok(vec![(start, want)]);
+        }
+        runs.push((start, c - start));
+    }
+    let mut left = want;
+    let mut picked = Vec::new();
+    for (start, len) in runs {
+        if left == 0 {
+            break;
+        }
+        let take = len.min(left);
+        picked.push((start, take));
+        left -= take;
+    }
+    if left > 0 {
+        return Err(FilesystemError::DiskFull(
+            "not enough free clusters to grow $Bitmap".into(),
+        ));
+    }
+    Ok(picked)
+}
+
+/// Remove the attribute at `pos`, closing the gap and shrinking the used size.
+fn remove_attr_at(record: &mut [u8], pos: usize) -> Result<(), FilesystemError> {
+    let used =
+        u32::from_le_bytes([record[0x18], record[0x19], record[0x1A], record[0x1B]]) as usize;
+    let len = u32::from_le_bytes([
+        record[pos + 4],
+        record[pos + 5],
+        record[pos + 6],
+        record[pos + 7],
+    ]) as usize;
+    if len < 16 || pos + len > used || used > record.len() {
+        return Err(FilesystemError::InvalidData(
+            "corrupt MFT record while removing an attribute".into(),
+        ));
+    }
+    record.copy_within(pos + len..used, pos);
+    record[used - len..used].fill(0);
+    record[0x18..0x1C].copy_from_slice(&((used - len) as u32).to_le_bytes());
+    Ok(())
 }
 
 /// First attribute of `attr_type` with the requested residency: (pos, len).
@@ -3691,6 +4201,30 @@ fn route_in_entries(region: &[u8], name_upper: &str) -> Result<(usize, u64), Fil
 }
 
 /// A 16-byte leaf end sentinel.
+/// An entry list as (everything before the end sentinel, the end sentinel).
+fn split_end_sentinel(entries: &[u8]) -> Result<(Vec<u8>, Vec<u8>), FilesystemError> {
+    let mut pos = 0;
+    while pos + 16 <= entries.len() {
+        let len = u16::from_le_bytes([entries[pos + 8], entries[pos + 9]]) as usize;
+        let flags = u32::from_le_bytes([
+            entries[pos + 12],
+            entries[pos + 13],
+            entries[pos + 14],
+            entries[pos + 15],
+        ]);
+        if len < 16 || pos + len > entries.len() {
+            break;
+        }
+        if flags & INDEX_ENTRY_END != 0 {
+            return Ok((entries[..pos].to_vec(), entries[pos..pos + len].to_vec()));
+        }
+        pos += len;
+    }
+    Err(FilesystemError::Parse(
+        "index node has no end sentinel".into(),
+    ))
+}
+
 fn leaf_end_sentinel() -> Vec<u8> {
     let mut e = vec![0u8; 16];
     e[8..10].copy_from_slice(&16u16.to_le_bytes());
@@ -3917,43 +4451,24 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
             return Err(FilesystemError::AlreadyExists(name.to_string()));
         }
 
-        let (record_num, record_seq) = self.allocate_mft_record()?;
-
-        // Read file data
-        let mut file_data = vec![0u8; data_len as usize];
-        if data_len > 0 {
-            data.read_exact(&mut file_data)
-                .map_err(FilesystemError::Io)?;
-        }
-
         // Determine resident vs non-resident threshold
         // Approximate: record_size - header(0x38) - StdInfo(~72) - FileName(~104) - SD(~80) - DATA_header(~24) - end(4)
         let overhead = 0x38 + 72 + 104 + 80 + 24 + 4;
         let resident_threshold = (self.mft_record_size as usize).saturating_sub(overhead);
 
         let data_attr = if data_len as usize <= resident_threshold {
-            // Resident $DATA
+            // Resident $DATA lives inside the 1 KiB record, so buffering it is bounded.
+            let mut file_data = vec![0u8; data_len as usize];
+            data.read_exact(&mut file_data)
+                .map_err(FilesystemError::Io)?;
             build_resident_attr(ATTR_DATA, &file_data)
         } else {
-            // Non-resident: allocate clusters
+            // Non-resident: allocate clusters, then stream the source into them.
             let clusters_needed = data_len.div_ceil(self.cluster_size) as u32;
             let runs = self.allocate_volume_clusters(clusters_needed)?;
-
-            // Write data to allocated clusters
-            let mut written = 0u64;
-            for &(start_cluster, length) in &runs {
-                let offset = self.cluster_offset(start_cluster);
-                self.reader.seek(SeekFrom::Start(offset))?;
-                let run_bytes = length * self.cluster_size;
-                let to_write = run_bytes.min(data_len - written);
-                self.reader
-                    .write_all(&file_data[written as usize..(written + to_write) as usize])?;
-                // Zero-fill remainder of last cluster
-                if to_write < run_bytes {
-                    let zeros = vec![0u8; (run_bytes - to_write) as usize];
-                    self.reader.write_all(&zeros)?;
-                }
-                written += to_write;
+            if let Err(e) = self.stream_into_runs(&runs, data, data_len) {
+                let _ = self.free_volume_clusters(&runs);
+                return Err(e);
             }
 
             let alloc_size = clusters_needed as u64 * self.cluster_size;
@@ -3962,6 +4477,10 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
             attr[0x28..0x30].copy_from_slice(&alloc_size.to_le_bytes());
             attr
         };
+
+        // The record is claimed only once the data is safely on disk, so a
+        // short or failing source leaves no orphan in the $MFT bitmap.
+        let (record_num, record_seq) = self.allocate_mft_record()?;
 
         // Build attributes
         // A parent with its own $SECURITY_DESCRIPTOR (our formatter's root) is
@@ -3986,7 +4505,11 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
             &build_standard_information(FILE_ATTR_ARCHIVE, sec_id, stamp),
         );
         let parent_ref = self.file_reference(parent_record_num);
-        let file_name_value = build_file_name_attr(parent_ref, name, false, data_len, stamp);
+        let mut file_name_value = build_file_name_attr(parent_ref, name, false, data_len, stamp);
+        if data_len as usize > resident_threshold {
+            let alloc = data_len.div_ceil(self.cluster_size) * self.cluster_size;
+            file_name_value[40..48].copy_from_slice(&alloc.to_le_bytes());
+        }
         let file_name_attr = build_resident_attr(ATTR_FILE_NAME, &file_name_value);
 
         // 3.x resolves the ACL through $Secure by the inherited id; a per-file
@@ -4128,11 +4651,23 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
             parent.location
         };
 
-        // Remove from parent's index
+        let record_number = entry.location;
+        if self.unlink_one_name(record_number, parent_record_num, &entry.name)? {
+            return Ok(());
+        }
+
+        // Remove from parent's index, the DOS alias's entry included.
         self.remove_index_entry(parent_record_num, &entry.name)?;
+        if let Ok(record) = self.read_mft_record(record_number) {
+            let names = file_name_attrs(&record);
+            for i in Self::names_for(&names, parent_record_num, &entry.name) {
+                if names[i].namespace == 2 && !names[i].name.eq_ignore_ascii_case(&entry.name) {
+                    self.remove_alias_or_name(parent_record_num, &names[i])?;
+                }
+            }
+        }
 
         // Free data and index-allocation clusters if non-resident
-        let record_number = entry.location;
         if let Ok(record) = self.read_mft_record(record_number) {
             let attrs = parse_mft_attributes(&record, self.mft_record_size);
             for attr in &attrs {
@@ -4185,14 +4720,26 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
         let record_number = entry.location;
         let is_dir = entry.is_directory();
 
-        // A rename is not a creation: Windows keeps the original four timestamps,
-        // so carry them over from the existing $FILE_NAME instead of stamping now.
+        // chkdsk holds the index entry to the record's live times and sizes, so
+        // the copy is built from $STANDARD_INFORMATION and $DATA, not stamped now.
         let mut record = self.read_mft_record(record_number)?;
-        let old_times: Option<[u8; 32]> = parse_mft_attributes(&record, self.mft_record_size)
+        let attrs = parse_mft_attributes(&record, self.mft_record_size);
+        let si_times: Option<[u8; 32]> = attrs
             .iter()
-            .find(|a| a.attr_type == ATTR_FILE_NAME)
-            .and_then(|a| self.read_attribute_data(a, None).ok())
-            .and_then(|v| v.get(8..40).and_then(|s| s.try_into().ok()));
+            .find(|a| a.attr_type == ATTR_STANDARD_INFORMATION)
+            .and_then(|a| a.value.get(0..32).and_then(|s| s.try_into().ok()));
+        let (alloc_size, real_size) = attrs
+            .iter()
+            .find(|a| a.attr_type == ATTR_DATA)
+            .map(|a| {
+                if a.resident {
+                    let len = a.value.len() as u64;
+                    ((len + 7) & !7, len)
+                } else {
+                    (a.allocated_size, a.real_size)
+                }
+            })
+            .unwrap_or((0, 0));
 
         // The new name lives in two places: the child record's $FILE_NAME
         // attribute and the parent directory's $I30 index entry. Both carry a
@@ -4202,24 +4749,44 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
             parent_ref,
             new_name,
             is_dir,
-            entry.size,
+            real_size,
             now_ntfs_timestamp(),
         );
-        if let Some(times) = old_times {
+        new_fn_value[40..48].copy_from_slice(&alloc_size.to_le_bytes());
+        if let Some(times) = si_times {
             new_fn_value[8..40].copy_from_slice(&times);
         }
 
-        // 1) Rewrite the child's $FILE_NAME in place (grow/shrink), preserving
-        //    the record's sequence number, link count, and every other attribute.
+        // 1) Drop every $FILE_NAME this parent knows the entry by, the Win32
+        //    name and any DOS alias, and put the one new name in their place.
         let child_seq = u16::from_le_bytes([record[0x10], record[0x11]]);
-        let new_attr = build_resident_attr(ATTR_FILE_NAME, &new_fn_value);
-        replace_resident_attr(&mut record, ATTR_FILE_NAME, &new_attr)?;
+        let names = file_name_attrs(&record);
+        let ours = Self::names_for(&names, parent_record_num, &entry.name);
+        if ours.is_empty() {
+            self.remove_index_entry(parent_record_num, &entry.name)?;
+        }
+        for &i in &ours {
+            self.remove_alias_or_name(parent_record_num, &names[i])?;
+        }
+        let insert_at = ours.first().map(|&i| names[i].pos);
+        for &i in ours.iter().rev() {
+            remove_attr_at(&mut record, names[i].pos)?;
+        }
+        let mut new_attr = build_resident_attr(ATTR_FILE_NAME, &new_fn_value);
+        // A fresh instance id: chkdsk calls an attribute sharing one corrupt.
+        let instance = u16::from_le_bytes([record[0x28], record[0x29]]);
+        new_attr[0x0E..0x10].copy_from_slice(&instance.to_le_bytes());
+        record[0x28..0x2A].copy_from_slice(&(instance + 1).to_le_bytes());
+        match insert_at {
+            Some(pos) => insert_attr_at(&mut record, pos, &new_attr)?,
+            None => replace_resident_attr(&mut record, ATTR_FILE_NAME, &new_attr)?,
+        }
+        let links = (names.len() - ours.len() + 1) as u16;
+        record[0x12..0x14].copy_from_slice(&links.to_le_bytes());
         self.write_mft_record(record_number, &mut record)?;
 
-        // 2) Re-key the parent index entry (remove old name, insert new). The
-        //    index entry's MFT reference must carry the child's real sequence
-        //    number, not a hardcoded 1.
-        self.remove_index_entry(parent_record_num, &entry.name)?;
+        // 2) Key the parent index by the new name. The entry's MFT reference
+        //    must carry the child's real sequence number, not a hardcoded 1.
         let index_entry = build_index_entry(record_number, child_seq, &new_fn_value);
         self.insert_index_entry(parent_record_num, &index_entry)?;
 
@@ -4523,6 +5090,9 @@ pub fn resize_ntfs_in_place(
         vbr[0x28], vbr[0x29], vbr[0x2A], vbr[0x2B], vbr[0x2C], vbr[0x2D], vbr[0x2E], vbr[0x2F],
     ]);
 
+    // The caller passes the partition's sector count; NTFS keeps its backup
+    // boot sector in the last one, so the volume itself is a sector shorter.
+    let new_total_sectors = new_total_sectors.saturating_sub(1);
     if old_total == new_total_sectors {
         return Ok(false);
     }
@@ -4535,23 +5105,27 @@ pub fn resize_ntfs_in_place(
         vbr[0x30], vbr[0x31], vbr[0x32], vbr[0x33], vbr[0x34], vbr[0x35], vbr[0x36], vbr[0x37],
     ]);
 
-    let clusters_per_mft_raw = vbr[0x40] as i8;
-    let mft_record_size = if clusters_per_mft_raw < 0 {
-        1u32 << ((-clusters_per_mft_raw) as u32)
-    } else {
-        clusters_per_mft_raw as u32 * sectors_per_cluster as u32 * bytes_per_sector as u32
+    let cluster_bytes = sectors_per_cluster as u32 * bytes_per_sector as u32;
+    let Some(mft_record_size) = mft_record_bytes(vbr[0x40] as i8, cluster_bytes) else {
+        anyhow::bail!(
+            "NTFS: clusters-per-MFT-record byte 0x{:02X} is not a valid record size",
+            vbr[0x40]
+        );
     };
 
     // Try to read $Bitmap to check last used cluster
     let mft_offset = partition_offset + mft_cluster * cluster_size;
     let bitmap_offset = mft_offset + MFT_RECORD_BITMAP * mft_record_size as u64;
 
+    // Bits at or past the old cluster count are the end-of-volume mark, not data.
+    let old_volume_clusters = old_total * bytes_per_sector / cluster_size;
     if let Ok(last_cluster) = read_last_used_cluster_from_bitmap(
         file,
         bitmap_offset,
         partition_offset,
         mft_record_size,
         cluster_size,
+        old_volume_clusters,
     ) {
         let last_data_byte = (last_cluster + 1) * cluster_size;
         let new_size = new_total_sectors * bytes_per_sector;
@@ -4576,8 +5150,8 @@ pub fn resize_ntfs_in_place(
     file.seek(SeekFrom::Start(partition_offset))?;
     file.write_all(&vbr)?;
 
-    // Write backup boot sector at last sector of new partition
-    let backup_offset = partition_offset + (new_total_sectors - 1) * bytes_per_sector;
+    // The backup boot sector is the sector after the volume: the partition's last.
+    let backup_offset = partition_offset + new_total_sectors * bytes_per_sector;
     file.seek(SeekFrom::Start(backup_offset))?;
     file.write_all(&vbr)?;
 
@@ -4585,6 +5159,16 @@ pub fn resize_ntfs_in_place(
         "NTFS: patched VBR and backup boot sector (total sectors: {})",
         new_total_sectors
     ));
+
+    // Without this the gained clusters stay unaddressable and the formatter's
+    // end-of-volume mark turns into a leaked cluster chkdsk objects to.
+    {
+        let mut fs = NtfsFilesystem::open(&mut *file, partition_offset)
+            .map_err(|e| anyhow::anyhow!("NTFS: cannot reopen the resized volume: {e}"))?;
+        fs.resize_volume_bitmap(old_total, new_total_sectors)
+            .map_err(|e| anyhow::anyhow!("NTFS: cannot resize $Bitmap: {e}"))?;
+    }
+    log_cb("NTFS: $Bitmap brought in step with the new cluster count");
 
     Ok(true)
 }
@@ -4596,6 +5180,7 @@ fn read_last_used_cluster_from_bitmap(
     partition_offset: u64,
     mft_record_size: u32,
     cluster_size: u64,
+    volume_clusters: u64,
 ) -> Result<u64> {
     file.seek(SeekFrom::Start(bitmap_record_offset))?;
     let mut record = vec![0u8; mft_record_size as usize];
@@ -4629,14 +5214,11 @@ fn read_last_used_cluster_from_bitmap(
                 data
             };
 
-            for byte_idx in (0..bitmap.len()).rev() {
-                if bitmap[byte_idx] != 0 {
-                    let byte = bitmap[byte_idx];
-                    for bit in (0..8).rev() {
-                        if byte & (1 << bit) != 0 {
-                            return Ok(byte_idx as u64 * 8 + bit as u64);
-                        }
-                    }
+            let mut c = (bitmap.len() as u64 * 8).min(volume_clusters);
+            while c > 0 {
+                c -= 1;
+                if bitmap[(c / 8) as usize] & (1 << (c % 8)) != 0 {
+                    return Ok(c);
                 }
             }
             return Ok(0);
@@ -4674,11 +5256,12 @@ pub fn validate_ntfs_integrity(
         vbr[0x30], vbr[0x31], vbr[0x32], vbr[0x33], vbr[0x34], vbr[0x35], vbr[0x36], vbr[0x37],
     ]);
 
-    let clusters_per_mft_raw = vbr[0x40] as i8;
-    let mft_record_size = if clusters_per_mft_raw < 0 {
-        1u32 << ((-clusters_per_mft_raw) as u32)
-    } else {
-        clusters_per_mft_raw as u32 * sectors_per_cluster as u32 * bytes_per_sector as u32
+    let cluster_bytes = sectors_per_cluster as u32 * bytes_per_sector as u32;
+    let Some(mft_record_size) = mft_record_bytes(vbr[0x40] as i8, cluster_bytes) else {
+        anyhow::bail!(
+            "NTFS: clusters-per-MFT-record byte 0x{:02X} is not a valid record size",
+            vbr[0x40]
+        );
     };
 
     // Verify MFT record #0 ($MFT) is readable
@@ -4732,7 +5315,8 @@ pub fn patch_ntfs_hidden_sectors(
         ]);
         let bytes_per_sector = u16::from_le_bytes([vbr[0x0B], vbr[0x0C]]) as u64;
         if total_sectors > 0 && bytes_per_sector > 0 {
-            let backup_offset = partition_offset + (total_sectors - 1) * bytes_per_sector;
+            // TotalSectors excludes the backup boot sector, which follows it.
+            let backup_offset = partition_offset + total_sectors * bytes_per_sector;
             crate::fs::patch::write_sector_at(file, backup_offset, &vbr)?;
         }
 
@@ -4759,6 +5343,54 @@ mod tests {
     use super::super::filesystem::{CreateDirectoryOptions, CreateFileOptions, EditableFilesystem};
     use super::*;
     use std::io::Cursor;
+
+    /// F-012: a thousand entries push the index root down a level (and then
+    /// some); the directory lists them all, empties, takes one more, and the
+    /// volume fscks clean at every step.
+    #[test]
+    fn index_root_pushes_down_when_full() {
+        let mut blank = Cursor::new(Vec::new());
+        crate::fs::ntfs_format::create_blank_ntfs(&mut blank, 32 * 1024 * 1024, 64, Some("Churn"))
+            .unwrap();
+        let mut img = blank.into_inner();
+        let mut fs = NtfsFilesystem::open(Cursor::new(&mut img), 0).unwrap();
+        let root = fs.root().unwrap();
+        let dir = fs
+            .create_directory(&root, "d", &CreateDirectoryOptions::default())
+            .unwrap();
+        for i in 0..1000 {
+            let name = format!("f{i:04}.txt");
+            fs.create_file(
+                &dir,
+                &name,
+                &mut &b"x"[..],
+                1,
+                &CreateFileOptions::default(),
+            )
+            .unwrap_or_else(|e| panic!("creating {name}: {e}"));
+        }
+        let kids = fs.list_directory(&dir).unwrap();
+        assert_eq!(kids.len(), 1000);
+        fs.sync_metadata().unwrap();
+        let report = fs.fsck().expect("ntfs has fsck").unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        for e in &kids {
+            fs.delete_entry(&dir, e)
+                .unwrap_or_else(|e2| panic!("rm {}: {e2}", e.name));
+        }
+        assert!(fs.list_directory(&dir).unwrap().is_empty());
+        fs.create_file(
+            &dir,
+            "last.bin",
+            &mut &b"y"[..],
+            1,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        fs.sync_metadata().unwrap();
+        let report = fs.fsck().expect("ntfs has fsck").unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+    }
 
     fn make_ntfs_vbr() -> [u8; 512] {
         let mut vbr = [0u8; 512];
@@ -4817,6 +5449,27 @@ mod tests {
         assert_eq!(parsed.index_record_size, 4096);
     }
 
+    /// D17: a zeroed or absurd clusters-per-record byte reached shifts and
+    /// zero-sized buffers and panicked instead of failing to open.
+    #[test]
+    fn damaged_record_size_and_run_headers_fail_cleanly() {
+        for raw in [0x00u8, 0x80, 0x01, 0x7F, 0xFF] {
+            let mut vbr = make_ntfs_vbr();
+            vbr[0x40] = raw;
+            let res = parse_vbr(&vbr);
+            if raw == 0x01 {
+                assert_eq!(res.unwrap().mft_record_size, 4096, "one 4 KiB cluster");
+            } else {
+                assert!(res.is_err(), "byte 0x{raw:02X} must be rejected");
+            }
+        }
+        assert_eq!(mft_record_bytes(-10, 4096), Some(1024));
+        assert_eq!(mft_record_bytes(3, 4096), None, "not a power of two");
+        // A run header whose nibbles claim 15-byte fields.
+        assert!(decode_data_runs(&[0xFF, 1, 2, 3]).is_empty());
+        assert!(decode_data_runs(&[0x9F, 1, 2, 3, 4, 5, 6, 7, 8, 9]).is_empty());
+    }
+
     #[test]
     fn test_parse_vbr_index_record_size_encodings() {
         let mut vbr = make_ntfs_vbr();
@@ -4845,6 +5498,207 @@ mod tests {
         .unwrap();
         cur.seek(SeekFrom::Start(0)).unwrap();
         cur
+    }
+
+    /// chkdsk corrected the first free byte of every record we assembled: the
+    /// end marker counts as eight bytes in the used size, not four.
+    #[test]
+    fn assembled_records_count_the_end_marker_as_eight_bytes() {
+        let cur = format_test_volume(4096, 256);
+        let mut fs = NtfsFilesystem::open(cur, 0).unwrap();
+        let root = fs.root().unwrap();
+        let mut data = std::io::Cursor::new(b"resident".to_vec());
+        let file = fs
+            .create_file(
+                &root,
+                "created.txt",
+                &mut data,
+                8,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+        let dir = fs
+            .create_directory(&root, "created-dir", &CreateDirectoryOptions::default())
+            .unwrap();
+        for rec_no in [file.location, dir.location] {
+            let record = fs.read_mft_record(rec_no).unwrap();
+            let used = record_used_size(&record);
+            let mut off = u16::from_le_bytes([record[0x14], record[0x15]]) as usize;
+            while u32::from_le_bytes(record[off..off + 4].try_into().unwrap()) != ATTR_END {
+                off += u32::from_le_bytes(record[off + 4..off + 8].try_into().unwrap()) as usize;
+            }
+            assert_eq!(used, off + 8, "record {rec_no}: used size vs end marker");
+        }
+    }
+
+    /// The trim point was pinned to the volume size by its own backup boot
+    /// sector, so every in-place shrink was refused as cutting live data.
+    #[test]
+    fn trim_point_leaves_room_to_shrink() {
+        let mut img = format_test_volume(4096, 256).into_inner();
+        let (total, floor, cluster) = {
+            let mut fs = NtfsFilesystem::open(Cursor::new(&mut img), 0).unwrap();
+            (
+                fs.total_size(),
+                fs.last_data_byte().unwrap(),
+                fs.cluster_size,
+            )
+        };
+        assert!(
+            floor < total / 2,
+            "fresh volume trim point {floor} of {total}"
+        );
+        assert_eq!(
+            floor % cluster,
+            512,
+            "data end plus one sector for the backup boot"
+        );
+
+        let new_len = floor.div_ceil(1024 * 1024) * 1024 * 1024;
+        let mut cur = Cursor::new(&mut img);
+        assert!(resize_ntfs_in_place(&mut cur, 0, new_len / 512, &mut |_| {}).unwrap());
+        img.truncate(new_len as usize);
+        let mut fs = NtfsFilesystem::open(Cursor::new(&mut img), 0).unwrap();
+        let report = crate::fs::ntfs_fsck::fsck_ntfs(&mut fs).unwrap();
+        assert!(
+            report.errors.is_empty(),
+            "after shrink: {:?}",
+            report.errors
+        );
+    }
+
+    /// Resize used to patch only the boot sectors, so a grown volume kept the
+    /// formatter's end mark as a leaked cluster and a bitmap too short for it.
+    #[test]
+    fn resize_keeps_the_volume_bitmap_in_step() {
+        let cases: [(u32, i64); 4] = [
+            (512, 6 * 1024 * 1024),
+            (4096, 4096),
+            (4096, 6 * 1024 * 1024),
+            (4096, -4 * 1024 * 1024),
+        ];
+        for (cluster, delta) in cases {
+            let mut img = format_test_volume(cluster, 256).into_inner();
+            let new_len = (img.len() as i64 + delta) as u64;
+            img.resize(new_len as usize, 0);
+            let mut cur = Cursor::new(img);
+            let changed = resize_ntfs_in_place(&mut cur, 0, new_len / 512, &mut |_| {}).unwrap();
+            assert!(changed, "cluster {cluster} delta {delta}");
+            let mut img = cur.into_inner();
+
+            let total_sectors = new_len / 512 - 1;
+            assert_eq!(
+                img[(total_sectors * 512) as usize..(total_sectors * 512 + 512) as usize],
+                img[..512],
+                "backup boot sector sits in the last sector"
+            );
+            let mut fs = NtfsFilesystem::open(Cursor::new(&mut img), 0).unwrap();
+            let report = crate::fs::ntfs_fsck::fsck_ntfs(&mut fs).unwrap();
+            assert!(
+                report.errors.is_empty(),
+                "cluster {cluster} delta {delta}: {:?}",
+                report.errors
+            );
+            let geom = fs.fsck_geometry();
+            let bm = fs.fsck_read_volume_bitmap().unwrap();
+            // Windows sizes $Bitmap in whole quadwords; chkdsk rejects anything else.
+            assert_eq!(
+                bm.len() as u64,
+                geom.total_clusters.div_ceil(64) * 8,
+                "bitmap length"
+            );
+            let bit = |c: u64| bm[(c / 8) as usize] & (1 << (c % 8)) != 0;
+            if geom.total_clusters < bm.len() as u64 * 8 {
+                assert!(
+                    bit(geom.total_clusters),
+                    "the bits past the volume end stay marked"
+                );
+            }
+            assert!(
+                !bit(geom.total_clusters - 1),
+                "the last volume cluster is free"
+            );
+            // The volume still allocates and lists after the rewrite.
+            let root = fs.root().unwrap();
+            let mut data = std::io::Cursor::new(vec![7u8; 100_000]);
+            fs.create_file(
+                &root,
+                "after.bin",
+                &mut data,
+                100_000,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+            let report = crate::fs::ntfs_fsck::fsck_ntfs(&mut fs).unwrap();
+            assert!(
+                report.errors.is_empty(),
+                "after create: {:?}",
+                report.errors
+            );
+        }
+    }
+
+    /// A second `$FILE_NAME` on a record is a hard link; deleting one name
+    /// used to free the record and its clusters out from under the other.
+    #[test]
+    fn deleting_one_hard_link_keeps_the_other() {
+        let cur = format_test_volume(4096, 256);
+        let mut fs = NtfsFilesystem::open(cur, 0).unwrap();
+        let root = fs.root().unwrap();
+        let content: Vec<u8> = (0..20_000u32).map(|i| (i % 253) as u8).collect();
+        put_file(&mut fs, &root, "a.txt", &content);
+        let find = |fs: &mut NtfsFilesystem<Cursor<Vec<u8>>>, name: &str| {
+            fs.list_directory(&root)
+                .unwrap()
+                .into_iter()
+                .find(|e| e.name == name)
+        };
+        let a = find(&mut fs, "a.txt").unwrap();
+        let rec = a.location;
+        let mut record = fs.read_mft_record(rec).unwrap();
+        let seq = u16::from_le_bytes([record[0x10], record[0x11]]);
+        let parent_ref = fs.file_reference(MFT_RECORD_ROOT);
+        let link = build_file_name_attr(
+            parent_ref,
+            "b.txt",
+            false,
+            content.len() as u64,
+            now_ntfs_timestamp(),
+        );
+        let (pos, len) = find_attr_pos(&record, ATTR_FILE_NAME, true).unwrap();
+        insert_attr_at(
+            &mut record,
+            pos + len,
+            &build_resident_attr(ATTR_FILE_NAME, &link),
+        )
+        .unwrap();
+        record[0x12..0x14].copy_from_slice(&2u16.to_le_bytes());
+        fs.write_mft_record(rec, &mut record).unwrap();
+        fs.insert_index_entry(MFT_RECORD_ROOT, &build_index_entry(rec, seq, &link))
+            .unwrap();
+
+        let b = find(&mut fs, "b.txt").expect("the link is listed");
+        assert_eq!(b.location, rec);
+        fs.delete_entry(&root, &b).unwrap();
+
+        assert!(find(&mut fs, "b.txt").is_none());
+        let a = find(&mut fs, "a.txt").expect("the other link survives");
+        assert_eq!(fs.read_file(&a, usize::MAX).unwrap(), content);
+        let record = fs.read_mft_record(rec).unwrap();
+        assert_eq!(u16::from_le_bytes([record[0x12], record[0x13]]), 1);
+        let report = super::super::ntfs_fsck::fsck_ntfs(&mut fs).unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+
+        // The last name frees the record for real.
+        fs.delete_entry(&root, &a).unwrap();
+        assert!(find(&mut fs, "a.txt").is_none());
+        let record = fs.read_mft_record(rec).unwrap();
+        assert_eq!(
+            u16::from_le_bytes([record[0x16], record[0x17]]) & MFT_RECORD_IN_USE,
+            0
+        );
+        let report = super::super::ntfs_fsck::fsck_ntfs(&mut fs).unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
     }
 
     /// Deterministic non-sorted creation order covering 0..n (gcd(7, n) == 1).
@@ -5154,6 +6008,119 @@ mod tests {
         assert!(fs.list_directory(&root).unwrap().is_empty());
     }
 
+    /// D12: a file Windows gave both a long and a DOS name kept the stale
+    /// alias, attribute and index entry, after a rename.
+    #[test]
+    fn rename_replaces_every_name_the_entry_had() {
+        let cur = format_test_volume(512, 256);
+        let mut fs = NtfsFilesystem::open(cur, 0).unwrap();
+        let root = fs.root().unwrap();
+        put_file(&mut fs, &root, "LongFileName.txt", b"payload");
+        let entry = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "LongFileName.txt")
+            .unwrap();
+
+        // Graft a DOS alias the way Windows stores one: a second $FILE_NAME
+        // (namespace 2) with its own index entry, and a link count of 2.
+        let rec_no = entry.location;
+        let mut record = fs.read_mft_record(rec_no).unwrap();
+        let names = file_name_attrs(&record);
+        assert_eq!(names.len(), 1);
+        let parent_ref = fs.file_reference(MFT_RECORD_ROOT);
+        let mut alias = build_file_name_attr(
+            parent_ref,
+            "LONGFI~1.TXT",
+            false,
+            entry.size,
+            now_ntfs_timestamp(),
+        );
+        alias[0x41] = 2;
+        let p = names[0].pos;
+        let first_len =
+            u32::from_le_bytes([record[p + 4], record[p + 5], record[p + 6], record[p + 7]])
+                as usize;
+        insert_attr_at(
+            &mut record,
+            p + first_len,
+            &build_resident_attr(ATTR_FILE_NAME, &alias),
+        )
+        .unwrap();
+        record[0x12..0x14].copy_from_slice(&2u16.to_le_bytes());
+        let seq = u16::from_le_bytes([record[0x10], record[0x11]]);
+        fs.write_mft_record(rec_no, &mut record).unwrap();
+        fs.insert_index_entry(MFT_RECORD_ROOT, &build_index_entry(rec_no, seq, &alias))
+            .unwrap();
+        assert_eq!(
+            file_name_attrs(&fs.read_mft_record(rec_no).unwrap()).len(),
+            2
+        );
+
+        let root = fs.root().unwrap();
+        fs.rename(&root, &entry, "Renamed.txt").unwrap();
+        verify_directory_index(&mut fs, MFT_RECORD_ROOT);
+
+        let record = fs.read_mft_record(rec_no).unwrap();
+        let names = file_name_attrs(&record);
+        let seen: Vec<(String, u8)> = names
+            .iter()
+            .map(|n| (n.name.clone(), n.namespace))
+            .collect();
+        assert_eq!(names.len(), 1, "one name after rename: {seen:?}");
+        assert_eq!(names[0].name, "Renamed.txt");
+        // chkdsk called the renamed record corrupt when the new name reused
+        // $STANDARD_INFORMATION's instance id 0.
+        let mut instances = Vec::new();
+        let mut off = u16::from_le_bytes([record[0x14], record[0x15]]) as usize;
+        loop {
+            let atype = u32::from_le_bytes(record[off..off + 4].try_into().unwrap());
+            if atype == ATTR_END {
+                break;
+            }
+            instances.push(u16::from_le_bytes([record[off + 0x0E], record[off + 0x0F]]));
+            off += u32::from_le_bytes(record[off + 4..off + 8].try_into().unwrap()) as usize;
+        }
+        let mut unique = instances.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            instances.len(),
+            "instance ids clash: {instances:?}"
+        );
+        let next = u16::from_le_bytes([record[0x28], record[0x29]]);
+        assert!(
+            instances.iter().all(|i| *i < next),
+            "next id {next} vs {instances:?}"
+        );
+        assert_eq!(
+            u16::from_le_bytes([record[0x12], record[0x13]]),
+            1,
+            "link count"
+        );
+        let listing: Vec<String> = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(listing.iter().any(|n| n == "Renamed.txt"), "{listing:?}");
+        assert!(
+            !listing
+                .iter()
+                .any(|n| n == "LongFileName.txt" || n == "LONGFI~1.TXT"),
+            "{listing:?}"
+        );
+        assert!(!fs
+            .name_exists_in_index(MFT_RECORD_ROOT, "LONGFI~1.TXT")
+            .unwrap());
+        assert!(!fs
+            .name_exists_in_index(MFT_RECORD_ROOT, "LongFileName.txt")
+            .unwrap());
+    }
+
     #[test]
     fn rename_moves_entries_between_index_nodes() {
         let cur = format_test_volume(512, 256);
@@ -5335,8 +6302,9 @@ mod tests {
         assert!(!is_valid_dos_name("file.text")); // 4-char extension
         let short = build_file_name_attr(5, "ok.txt", false, 0, 0);
         assert_eq!(short[65], 0x03);
+        // A lone Win32 name is invalid without a DOS alias; Windows uses POSIX here.
         let long = build_file_name_attr(5, "Long File Name.textfile", false, 0, 0);
-        assert_eq!(long[65], 0x01);
+        assert_eq!(long[65], 0x00);
     }
 
     #[test]
@@ -5837,6 +6805,107 @@ mod tests {
         // Free space should have decreased
         let new_free = fs.free_space().unwrap();
         assert!(new_free < initial_free);
+    }
+
+    /// Hands out at most `step` bytes per `read`, so `read_exact` must loop.
+    struct Trickle {
+        pos: u64,
+        len: u64,
+        step: usize,
+    }
+
+    impl std::io::Read for Trickle {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let left = (self.len - self.pos) as usize;
+            let n = buf.len().min(self.step).min(left);
+            for (i, b) in buf[..n].iter_mut().enumerate() {
+                *b = ((self.pos + i as u64) % 251) as u8;
+            }
+            self.pos += n as u64;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn nonresident_create_streams_across_chunks_and_pads_the_last_cluster() {
+        let mut blank = Cursor::new(Vec::new());
+        crate::fs::ntfs_format::create_blank_ntfs(&mut blank, 32 * 1024 * 1024, 64, Some("S"))
+            .unwrap();
+        let mut img = blank.into_inner();
+        let mut fs = NtfsFilesystem::open(Cursor::new(&mut img), 0).unwrap();
+        let root = fs.root().unwrap();
+
+        // Crosses two 1 MiB chunk boundaries and ends mid-cluster.
+        let len = 2 * 1024 * 1024 + 777;
+        let mut src = Trickle {
+            pos: 0,
+            len,
+            step: 4093,
+        };
+        let file = fs
+            .create_file(
+                &root,
+                "big.bin",
+                &mut src,
+                len,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(file.size, len);
+
+        let back = fs.read_file(&file, len as usize).unwrap();
+        assert_eq!(back.len(), len as usize);
+        assert!(back
+            .iter()
+            .enumerate()
+            .all(|(i, &b)| b == (i as u64 % 251) as u8));
+    }
+
+    #[test]
+    fn nonresident_create_from_short_source_leaks_nothing() {
+        let mut blank = Cursor::new(Vec::new());
+        crate::fs::ntfs_format::create_blank_ntfs(&mut blank, 32 * 1024 * 1024, 64, Some("S"))
+            .unwrap();
+        let mut img = blank.into_inner();
+        let mut fs = NtfsFilesystem::open(Cursor::new(&mut img), 0).unwrap();
+        let root = fs.root().unwrap();
+        let free_before = fs.free_space().unwrap();
+        let mft_before = fs.read_mft_bitmap().unwrap();
+
+        // Declares 1 MiB but only delivers half of it.
+        let mut src = Trickle {
+            pos: 0,
+            len: 512 * 1024,
+            step: 4096,
+        };
+        let err = fs
+            .create_file(
+                &root,
+                "short.bin",
+                &mut src,
+                1024 * 1024,
+                &CreateFileOptions::default(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, FilesystemError::Io(_)), "{err:?}");
+
+        assert_eq!(
+            fs.free_space().unwrap(),
+            free_before,
+            "clusters were not returned"
+        );
+        assert_eq!(
+            fs.read_mft_bitmap().unwrap(),
+            mft_before,
+            "an MFT record was orphaned"
+        );
+        let names: Vec<_> = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(!names.iter().any(|n| n == "short.bin"), "{names:?}");
     }
 
     #[test]

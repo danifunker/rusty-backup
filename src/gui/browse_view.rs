@@ -65,6 +65,9 @@ pub struct BrowseView {
     /// so export can read it without re-walking the tree. Fed to the shared
     /// `export_selection` engine by the "Export selected..." bar.
     marked: std::collections::BTreeMap<String, FileEntry>,
+    /// Edits applied into a compressed CHD's diff that no flatten has
+    /// committed yet; closing on an empty queue deleted that diff silently.
+    chd_diff_dirty: bool,
     /// Chosen output format for the "Export selected" pulldown.
     export_format: rusty_backup::fs::export_selection::ExportFormat,
     /// Cached content of the selected file.
@@ -166,6 +169,8 @@ pub struct BrowseView {
     pending_tree: Option<Arc<Mutex<TreeStatus>>>,
     /// Queued edit operations awaiting "Apply Edits".
     staged_edits: EditQueue,
+    /// Free space of the editable volume: None = not probed, Some(None) = unavailable.
+    edit_free_space: Option<Option<u64>>,
     /// The SquashFS size-budget dialog, open only between clicking Edit Mode on
     /// a SquashFS volume and choosing a ceiling. See
     /// [`super::squashfs_budget_dialog`].
@@ -248,6 +253,10 @@ pub struct BrowseView {
     /// that mutates the volume (sync_metadata, archive recompress, edit
     /// apply) calls `invalidate_cached_fs` so the next read sees disk truth.
     cached_fs: Option<Box<dyn Filesystem>>,
+    /// Bumped on every invalidation; a worker's handle is only cached if it matches.
+    fs_generation: u64,
+    /// `fs_generation` when the pending tree walk borrowed its filesystem.
+    pending_tree_generation: u64,
 
     /// Queue of Mac archives (`.hqx` / `.sit` / `.sea` / `.sit.hqx` /
     /// `.sea.hqx`) that the user picked via Add File... — each waits on a
@@ -414,6 +423,7 @@ impl Default for BrowseView {
             expanded_paths: HashSet::new(),
             selected_entry: None,
             marked: std::collections::BTreeMap::new(),
+            chd_diff_dirty: false,
             export_format: rusty_backup::fs::export_selection::ExportFormat::MacArchive,
             content: None,
             view_mode: ViewMode::Auto,
@@ -454,6 +464,7 @@ impl Default for BrowseView {
             tree_show_ids: false,
             show_tree_large_dialog: false,
             staged_edits: EditQueue::new(),
+            edit_free_space: None,
             show_unsaved_dialog: false,
             conflict_review: None,
             text_editor: None,
@@ -478,6 +489,8 @@ impl Default for BrowseView {
             needs_password: false,
             password_input: String::new(),
             cached_fs: None,
+            fs_generation: 0,
+            pending_tree_generation: 0,
             pending_tree: None,
             pending_archive_imports: Vec::new(),
             archive_import_tempdir: None,
@@ -693,6 +706,7 @@ impl BrowseView {
 
     pub fn close(&mut self) {
         self.root = None;
+        self.edit_free_space = None;
         self.directory_cache.clear();
         self.expanded_paths.clear();
         self.selected_entry = None;
@@ -755,6 +769,11 @@ impl BrowseView {
         self.pending_tar_import = None;
         self.pending_tar_add = None;
         self.single_file_chd_backup_folder = None;
+        // Dialogs and editors that name a file on the volume being closed;
+        // left open, their Save/Overwrite acted on the next volume.
+        self.text_editor = None;
+        self.pending_extraction = None;
+        self.boot_blocks_present = None;
     }
 
     pub fn is_active(&self) -> bool {
@@ -766,7 +785,7 @@ impl BrowseView {
     /// a source switch behind its own confirm dialog (see Inspect's deferred
     /// source-switch guard) before calling [`close`](Self::close).
     pub fn has_unsaved_edits(&self) -> bool {
-        self.active && self.edit_mode && !self.staged_edits.is_empty()
+        self.active && self.edit_mode && (!self.staged_edits.is_empty() || self.chd_diff_dirty)
     }
 
     /// Returns true if the current filesystem is HFS or HFS+.
@@ -1010,7 +1029,8 @@ impl BrowseView {
                         }
                     } else {
                         // Direct editing (raw image / device)
-                        if self.edit_mode && !self.staged_edits.is_empty() {
+                        if self.edit_mode && (!self.staged_edits.is_empty() || self.chd_diff_dirty)
+                        {
                             self.show_unsaved_dialog = true;
                         } else if !self.edit_mode {
                             // SquashFS has to declare a size budget before any
@@ -1128,7 +1148,7 @@ impl BrowseView {
             }
 
             if ui.button("Close").clicked() {
-                if self.edit_mode && !self.staged_edits.is_empty() {
+                if self.edit_mode && (!self.staged_edits.is_empty() || self.chd_diff_dirty) {
                     self.show_unsaved_dialog = true;
                 } else {
                     self.close();
@@ -1447,6 +1467,10 @@ impl BrowseView {
                     let meta_changed =
                         self.edit_mode && self.staged_edits.has_pending_metadata(&entry.path);
                     ui.horizontal(|ui| {
+                        // Directory rows spend `spacing().indent` on the collapse
+                        // toggle before their checkbox; files must match or the
+                        // checkbox column zig-zags. See egui show_button_indented.
+                        ui.add_space(ui.spacing().indent);
                         self.mark_checkbox(ui, entry);
                         let rich = if meta_changed {
                             egui::RichText::new(&label).color(super::theme::info(ui.visuals()))
@@ -1760,7 +1784,8 @@ impl BrowseView {
     fn load_directory(&mut self, entry: &FileEntry) {
         if let Some(mut fs) = self.take_or_open_fs() {
             match fs.list_directory(entry) {
-                Ok(entries) => {
+                Ok(mut entries) => {
+                    rusty_backup::fs::entry::sort_for_display(&mut entries);
                     self.directory_cache.insert(entry.path.clone(), entries);
                 }
                 Err(e) => {
@@ -1922,7 +1947,7 @@ impl BrowseView {
                             ui.colored_label(
                                 super::theme::warning(ui.visuals()),
                                 format!(
-                                    "Note: ${:02X} is not in the ProDOS type registry — {}. The type and aux (${:04X}) will be preserved on export via the CiderPress #{:02X}{:04X} filename suffix.",
+                                    "Note: ${:02X} is not in the ProDOS type registry - {}. The type and aux (${:04X}) will be preserved on export via the CiderPress #{:02X}{:04X} filename suffix.",
                                     tt,
                                     rusty_backup::fs::prodos_types::UNKNOWN_TYPE_NOTE,
                                     aux,
@@ -2057,7 +2082,10 @@ impl BrowseView {
                             "Export File to .tgz..."
                         };
                         if ui
-                            .button(tgz_label)
+                            .add_enabled(
+                                self.tar_export_progress.is_none(),
+                                egui::Button::new(tgz_label),
+                            )
                             .on_hover_text(
                                 "Save the selection as a single .tar.gz / .tar.zst / .tar \
                                  (preserves exact case + symlinks; pick the extension in \
@@ -2348,41 +2376,30 @@ impl BrowseView {
             if sel.is_directory() {
                 return sel.clone();
             }
-            // If a file is selected, use the parent directory
-            if let Some(parent_path) =
-                sel.path
-                    .rsplit_once('/')
-                    .map(|(p, _)| if p.is_empty() { "/" } else { p })
-            {
-                // Find the parent entry from cache
-                if parent_path == "/" {
-                    if let Some(ref root) = self.root {
-                        return root.clone();
-                    }
-                }
-                // Search expanded directories for one matching parent_path
-                for (path, entries) in &self.directory_cache {
-                    for entry in entries {
-                        if entry.path == parent_path && entry.is_directory() {
-                            return entry.clone();
-                        }
-                    }
-                    // Also check if the cache key itself matches
-                    if path == parent_path {
-                        // We need the entry for this path, find it
-                        for siblings in self.directory_cache.values() {
-                            for e in siblings {
-                                if e.path == *path && e.is_directory() {
-                                    return e.clone();
-                                }
-                            }
-                        }
-                    }
-                }
+            if let Some(parent) = self.parent_entry_of_path(&sel.path) {
+                return parent;
             }
         }
         // Default to root
         self.root.clone().unwrap_or_else(FileEntry::root)
+    }
+
+    /// The directory entry holding `path`, from the expanded-directory cache.
+    fn parent_entry_of_path(&self, path: &str) -> Option<FileEntry> {
+        let parent_path = path
+            .rsplit_once('/')
+            .map(|(p, _)| if p.is_empty() { "/" } else { p })?;
+        if parent_path == "/" {
+            return self.root.clone();
+        }
+        for entries in self.directory_cache.values() {
+            for entry in entries {
+                if entry.path == parent_path && entry.is_directory() {
+                    return Some(entry.clone());
+                }
+            }
+        }
+        None
     }
 
     /// Start background extraction of an archive to a temp file for editing.
@@ -2418,6 +2435,7 @@ impl BrowseView {
 
         // Disable edit mode immediately
         self.edit_mode = false;
+        self.edit_free_space = None;
         self.edit_result = None;
         self.show_new_folder_dialog = false;
         self.pending_delete = None;
@@ -2430,6 +2448,40 @@ impl BrowseView {
         self.content = None;
 
         self.archive_edit_progress = Some(archive_edit::start_compress(&ctx, temp_path));
+    }
+
+    /// Point the session at the extracted temp and enter edit mode; also used
+    /// after a failed recompress so the edits there are saved, not re-extracted over.
+    fn adopt_archive_temp(&mut self, temp: PathBuf) {
+        self.archive_temp_path = Some(temp.clone());
+        self.session.source_path = Some(temp);
+        self.session.zstd_cache = None;
+        self.edit_mode = true;
+        self.edit_free_space = None;
+
+        // Re-open filesystem from temp file. Invalidate the cache
+        // first because the source bytes have changed.
+        self.invalidate_cached_fs();
+        match self.session.open() {
+            Ok(mut fs) => {
+                self.fs_type = fs.fs_type().to_string();
+                self.volume_label = fs.volume_label().unwrap_or("").to_string();
+                self.volume_total = fs.total_size();
+                self.volume_used = fs.used_size();
+                self.blessed_folder = fs.blessed_system_folder();
+                if let Ok(root) = fs.root() {
+                    self.root = Some(root);
+                }
+                self.directory_cache.clear();
+                self.expanded_paths.clear();
+                self.selected_entry = None;
+                self.content = None;
+                self.return_fs(fs);
+            }
+            Err(e) => {
+                self.edit_result = Some(format!("Error opening temp file: {e}"));
+            }
+        }
     }
 
     /// Poll archive edit background operations for completion.
@@ -2456,7 +2508,19 @@ impl BrowseView {
         self.archive_edit_progress = None;
 
         if let Some(err) = error {
-            self.edit_result = Some(format!("Error: {err}"));
+            if phase == "Compressing" {
+                // The temp still holds the applied edits: re-adopt it so Close
+                // or Apply Edits can try the save again, not re-extract over it.
+                if let Some(temp) = self.archive_temp_path.clone() {
+                    self.adopt_archive_temp(temp);
+                }
+                self.edit_result = Some(format!(
+                    "Error saving the archive: {err}. Your edits are still in the temporary \
+                     volume; use Close or Apply Edits to try saving again."
+                ));
+            } else {
+                self.edit_result = Some(format!("Error: {err}"));
+            }
             return;
         }
 
@@ -2469,34 +2533,7 @@ impl BrowseView {
             // it to 0 here used to break edits of any non-single-partition
             // container.
             if let Some(temp) = temp_path {
-                self.archive_temp_path = Some(temp.clone());
-                self.session.source_path = Some(temp);
-                self.session.zstd_cache = None;
-                self.edit_mode = true;
-
-                // Re-open filesystem from temp file. Invalidate the cache
-                // first because the source bytes have changed.
-                self.invalidate_cached_fs();
-                match self.session.open() {
-                    Ok(mut fs) => {
-                        self.fs_type = fs.fs_type().to_string();
-                        self.volume_label = fs.volume_label().unwrap_or("").to_string();
-                        self.volume_total = fs.total_size();
-                        self.volume_used = fs.used_size();
-                        self.blessed_folder = fs.blessed_system_folder();
-                        if let Ok(root) = fs.root() {
-                            self.root = Some(root);
-                        }
-                        self.directory_cache.clear();
-                        self.expanded_paths.clear();
-                        self.selected_entry = None;
-                        self.content = None;
-                        self.return_fs(fs);
-                    }
-                    Err(e) => {
-                        self.edit_result = Some(format!("Error opening temp file: {e}"));
-                    }
-                }
+                self.adopt_archive_temp(temp);
             }
         } else {
             // Compression done — re-open original archive for browsing.
@@ -2617,6 +2654,7 @@ impl BrowseView {
             diff_path,
         });
         self.edit_mode = true;
+        self.edit_free_space = None;
 
         // Reload the filesystem through the session so any pre-existing
         // diff content is visible.
@@ -2635,6 +2673,7 @@ impl BrowseView {
     /// parent CHD is left untouched. Caller is responsible for any UI state
     /// transitions (clearing `edit_mode`, etc.).
     fn discard_chd_edit_session(&mut self) {
+        self.chd_diff_dirty = false;
         self.session.chd_edit_session = None;
         if let Some(state) = self.chd_edit.take() {
             if let Some(diff) = state.diff_path {
@@ -2651,6 +2690,8 @@ impl BrowseView {
     /// Compressed CHDs spawn a background worker that calls
     /// `flatten_to_parent`; progress is polled by `poll_chd_flatten`.
     fn start_chd_flatten(&mut self) {
+        // The diff is being committed to the parent; nothing is unsaved now.
+        self.chd_diff_dirty = false;
         let Some(state) = self.chd_edit.take() else {
             return;
         };
@@ -2869,6 +2910,7 @@ impl BrowseView {
             // container is left intact).
             Ok((_efs, _commit)) => {
                 self.edit_mode = true;
+                self.edit_free_space = None;
             }
             Err(e) => {
                 self.error = Some(format!("Cannot enter edit mode: {e}"));
@@ -3080,6 +3122,12 @@ impl BrowseView {
                 stats.appledouble_skipped
             ));
         }
+        if stats.appledouble_paired > 0 {
+            msg.push_str(&format!(
+                "; {} ._ sidecar(s) joined to their file",
+                stats.appledouble_paired
+            ));
+        }
         if stats.invalid_names_skipped > 0 {
             msg.push_str(&format!(
                 "; {} bad-name entr(ies) skipped",
@@ -3284,7 +3332,11 @@ impl BrowseView {
                         self.selected_entry = None;
                         self.content = None;
                     } else {
-                        let parent = self.current_parent_entry();
+                        // The selection's own parent: a selected directory is
+                        // not its own parent.
+                        let parent = self
+                            .parent_entry_of_path(&sel.path)
+                            .unwrap_or_else(|| self.root.clone().unwrap_or_else(FileEntry::root));
                         let is_non_empty_dir = sel.is_directory()
                             && self
                                 .directory_cache
@@ -3380,12 +3432,19 @@ impl BrowseView {
             ui.separator();
             ui.add_space(8.0);
 
-            // Apply button — only shown when edits are staged
+            // Apply button: only with staged edits, and not while an extraction
+            // or tar export is still reading the volume the apply would rewrite.
             if !self.staged_edits.is_empty() {
                 let label = format!("Apply Edits ({})", self.staged_edits.len());
-                if ui.button(label).clicked() {
-                    self.apply_staged_edits();
-                    if self.archive_edit_ctx.is_some() && !self.has_edit_error() {
+                let reading =
+                    self.extraction_progress.is_some() || self.tar_export_progress.is_some();
+                if ui
+                    .add_enabled(!reading, egui::Button::new(label))
+                    .on_disabled_hover_text("Wait for the running extraction or export to finish")
+                    .clicked()
+                {
+                    let applied = self.apply_staged_edits();
+                    if applied && self.archive_edit_ctx.is_some() && !self.has_edit_error() {
                         self.start_archive_compress();
                     }
                 }
@@ -3393,28 +3452,33 @@ impl BrowseView {
 
             ui.add_space(8.0);
 
-            // Free space indicator with projected space after staged edits.
-            // Read-only use — the commit guard is dropped (no re-encode).
-            if let Ok((mut efs, _commit)) = self.session.open_editable() {
-                if let Ok(free) = efs.free_space() {
-                    ui.label(format!("Free: {}", partition::format_size(free)));
+            // Free space, probed once per edit session and again after each write:
+            // opening the editable volume decodes a whole container.
+            if self.edit_free_space.is_none() {
+                self.edit_free_space = Some(
+                    self.session
+                        .open_editable()
+                        .ok()
+                        .and_then(|(mut efs, _commit)| efs.free_space().ok()),
+                );
+            }
+            if let Some(Some(free)) = self.edit_free_space {
+                ui.label(format!("Free: {}", partition::format_size(free)));
 
-                    if !self.staged_edits.is_empty() {
-                        let delta = self.staged_edits.space_delta();
-                        let projected =
-                            free.saturating_add(delta.freed).saturating_sub(delta.added);
-                        let color = if delta.added > free + delta.freed {
-                            super::theme::danger(ui.visuals()) // red — won't fit
-                        } else if projected < free / 10 {
-                            super::theme::warning(ui.visuals()) // yellow — tight
-                        } else {
-                            super::theme::success(ui.visuals()) // green — ok
-                        };
-                        ui.colored_label(
-                            color,
-                            format!("After: {}", partition::format_size(projected)),
-                        );
-                    }
+                if !self.staged_edits.is_empty() {
+                    let delta = self.staged_edits.space_delta();
+                    let projected = free.saturating_add(delta.freed).saturating_sub(delta.added);
+                    let color = if delta.added > free + delta.freed {
+                        super::theme::danger(ui.visuals()) // red — won't fit
+                    } else if projected < free / 10 {
+                        super::theme::warning(ui.visuals()) // yellow — tight
+                    } else {
+                        super::theme::success(ui.visuals()) // green — ok
+                    };
+                    ui.colored_label(
+                        color,
+                        format!("After: {}", partition::format_size(projected)),
+                    );
                 }
             }
         });
@@ -3487,7 +3551,7 @@ impl BrowseView {
             self.staging_errors = errors;
             self.show_staging_errors = true;
             self.edit_result = Some(format!(
-                "Staged {staged_count} item(s); {} failed — see dialog",
+                "Staged {staged_count} item(s); {} failed - see dialog",
                 self.staging_errors.len()
             ));
         } else if staged_count > 0 {
@@ -4068,7 +4132,10 @@ impl BrowseView {
     }
 
     /// Apply all staged edits to the filesystem in a single batch.
-    fn apply_staged_edits(&mut self) {
+    /// Returns false when the batch was deferred to the conflict review; the
+    /// callers used to read that as success and dropped the queue.
+    fn apply_staged_edits(&mut self) -> bool {
+        self.edit_free_space = None;
         log::info!(
             "Applying {} staged edit(s) to {}",
             self.staged_edits.len(),
@@ -4083,7 +4150,7 @@ impl BrowseView {
             Err(e) => {
                 log::error!("Failed to open editable filesystem: {e}");
                 self.edit_result = Some(format!("Error opening filesystem: {e}"));
-                return;
+                return true;
             }
         };
 
@@ -4107,32 +4174,60 @@ impl BrowseView {
                         })
                         .collect(),
                 );
-                return;
+                return false;
             }
         }
 
         let edits: Vec<StagedEdit> = self.staged_edits.drain().collect();
         let total = edits.len();
 
+        // Stop at the first failure but keep the failed edit and everything
+        // after it staged: a half-applied batch must not vanish silently.
+        let mut applied = 0usize;
+        let mut failure: Option<String> = None;
         for (i, edit) in edits.iter().enumerate() {
             if let Err(e) = edit_queue::apply_edit(&mut *efs, edit) {
-                self.edit_result = Some(format!("Error on edit {}/{total}: {e}", i + 1));
-                return;
+                failure = Some(format!("Error on edit {}/{total}: {e}", i + 1));
+                break;
+            }
+            applied += 1;
+        }
+        if failure.is_some() {
+            for edit in edits.into_iter().skip(applied) {
+                self.staged_edits.push(edit);
             }
         }
 
-        if let Err(e) = efs.sync_metadata() {
-            self.edit_result = Some(format!("Error saving to disk: {e}"));
-            return;
+        // Whatever did land still has to reach the disk and the container.
+        if applied > 0 {
+            if let Err(e) = efs.sync_metadata() {
+                self.edit_result = Some(format!("Error saving to disk: {e}"));
+                return true;
+            }
         }
 
         // Persist: re-encode the temp flat back into the container (no-op for
         // raw images). Drop the editable handle first so its writes are
         // flushed to the temp before the re-encode reads it.
         drop(efs);
-        if let Err(e) = commit.commit() {
-            self.edit_result = Some(format!("Error writing container: {e}"));
-            return;
+        if applied > 0 {
+            if let Err(e) = commit.commit() {
+                self.edit_result = Some(format!("Error writing container: {e}"));
+                return true;
+            }
+            if self.chd_edit.is_some() {
+                self.chd_diff_dirty = true;
+            }
+        }
+
+        if let Some(failure) = failure {
+            let left = total - applied;
+            self.edit_result = Some(format!(
+                "{failure}. Applied {applied} of {total}; {left} edit(s) remain staged"
+            ));
+            self.invalidate_all_caches();
+            self.invalidate_cached_fs();
+            return true;
         }
 
         self.edit_result = Some(format!("Applied {total} edit(s) successfully"));
@@ -4151,6 +4246,7 @@ impl BrowseView {
             self.volume_used = fs.used_size();
             self.return_fs(fs);
         }
+        true
     }
 
     fn has_edit_error(&self) -> bool {
@@ -4169,10 +4265,14 @@ impl BrowseView {
         self.directory_cache.clear();
         self.selected_entry = None;
         self.content = None;
+        // Checkbox marks hold FileEntry snapshots; after a write they may
+        // name renamed or deleted files, and an export would use them.
+        self.marked.clear();
         self.invalidate_cached_fs();
         if let Some(mut fs) = self.take_or_open_fs() {
             if let Ok(root) = fs.root() {
-                if let Ok(children) = fs.list_directory(&root) {
+                if let Ok(mut children) = fs.list_directory(&root) {
+                    rusty_backup::fs::entry::sort_for_display(&mut children);
                     self.directory_cache.insert(root.path.clone(), children);
                 }
                 self.root = Some(root);
@@ -4341,7 +4441,26 @@ impl BrowseView {
                     // Drop the cached read so the preview shows what is now on
                     // disk rather than what was there when it was opened.
                     self.content = None;
+                    self.invalidate_all_caches();
                     self.invalidate_cached_fs();
+                    // The invalidation dropped the selection; put the saved file
+                    // back so the preview shows what was written, not "Loading...".
+                    if let Some(mut fs) = self.take_or_open_fs() {
+                        let saved =
+                            rusty_backup::cli::verbs::ls::resolve_path(fs.as_mut(), &ed.path).ok();
+                        self.return_fs(fs);
+                        if let Some(entry) = saved {
+                            self.select_file(&entry);
+                        }
+                    }
+                    // A save is a write like any applied edit: the CHD diff is
+                    // dirty and an archive session must recompress or lose it.
+                    if self.chd_edit.is_some() {
+                        self.chd_diff_dirty = true;
+                    }
+                    if self.archive_edit_ctx.is_some() {
+                        self.start_archive_compress();
+                    }
                     return; // window closes
                 }
                 Err(e) => {
@@ -4360,6 +4479,7 @@ impl BrowseView {
 
     /// Encode and write the editor's contents through the shared replace path.
     fn save_text_editor(&mut self, ed: &GuiTextEditor) -> anyhow::Result<usize> {
+        self.edit_free_space = None;
         use rusty_backup::model::text_edit::encode_after_edit;
         let bytes = encode_after_edit(&ed.text, &ed.shape, false)
             .map_err(|e| anyhow::anyhow!("cannot save as {}: {e}", ed.shape.encoding.label()))?;
@@ -4467,8 +4587,11 @@ impl BrowseView {
             // Keep the review non-None so the re-entry does not ask again;
             // apply_staged_edits clears it when it finishes.
             self.conflict_review = Some(rows);
-            self.apply_staged_edits();
+            let applied = self.apply_staged_edits();
             self.conflict_review = None;
+            if applied && self.archive_edit_ctx.is_some() && !self.has_edit_error() {
+                self.start_archive_compress();
+            }
             return;
         }
         self.conflict_review = Some(rows);
@@ -4550,12 +4673,13 @@ impl BrowseView {
                     }
                     if ui.button("Apply Edits").clicked() {
                         self.show_unsaved_dialog = false;
-                        self.apply_staged_edits();
-                        let ok = self
-                            .edit_result
-                            .as_ref()
-                            .map(|r| !r.starts_with("Error"))
-                            .unwrap_or(true);
+                        let applied = self.apply_staged_edits();
+                        let ok = applied
+                            && self
+                                .edit_result
+                                .as_ref()
+                                .map(|r| !r.starts_with("Error"))
+                                .unwrap_or(true);
                         if ok {
                             if self.pending_close {
                                 self.close();
@@ -5178,6 +5302,7 @@ impl BrowseView {
     /// Exit edit mode, clearing all staged state.
     fn exit_edit_mode(&mut self) {
         self.edit_mode = false;
+        self.edit_free_space = None;
         self.edit_result = None;
         self.show_new_folder_dialog = false;
         self.pending_delete = None;
@@ -5252,7 +5377,7 @@ impl BrowseView {
                                 .unwrap_or_else(|| path.to_str().unwrap_or("?"));
                             ui.horizontal_wrapped(|ui| {
                                 ui.label(egui::RichText::new(label).strong());
-                                ui.label("—");
+                                ui.label("-");
                                 ui.colored_label(super::theme::danger(ui.visuals()), reason);
                             });
                             ui.label(
@@ -5374,7 +5499,7 @@ impl BrowseView {
                         ui.colored_label(
                             super::theme::danger(ui.visuals()),
                             format!(
-                                "{} file(s)/folder(s) reference {} missing parent director{} — not repairable.",
+                                "{} file(s)/folder(s) reference {} missing parent director{} - not repairable.",
                                 result.orphaned_entries.len(),
                                 by_parent.len(),
                                 if by_parent.len() == 1 { "y" } else { "ies" },
@@ -5533,6 +5658,7 @@ impl BrowseView {
 
     /// Execute repair on the filesystem and re-run check.
     fn run_repair(&mut self) {
+        self.edit_free_space = None;
         match self.session.open_editable() {
             Ok((mut efs, commit)) => match efs.repair() {
                 Ok(report) => {
@@ -5605,6 +5731,7 @@ impl BrowseView {
                 g.finished = true;
             }
         });
+        self.pending_tree_generation = self.fs_generation;
         self.pending_tree = Some(status);
     }
 
@@ -5627,7 +5754,10 @@ impl BrowseView {
             if let Some(arc) = self.pending_tree.take() {
                 if let Ok(mut g) = arc.lock() {
                     if let Some(fs) = g.fs.take() {
-                        self.cached_fs = Some(fs);
+                        // A write since the walk began makes this handle stale.
+                        if self.pending_tree_generation == self.fs_generation {
+                            self.cached_fs = Some(fs);
+                        }
                     }
                     if let Some(text) = g.text.take() {
                         let oversized = text.len() > TREE_INLINE_RENDER_LIMIT;
@@ -5880,7 +6010,8 @@ impl BrowseView {
                     self.volume_used = g.used_size;
                     self.blessed_folder = g.blessed_folder.take();
                     if let Some(root) = g.root.take() {
-                        if let Some(entries) = g.root_entries.take() {
+                        if let Some(mut entries) = g.root_entries.take() {
+                            rusty_backup::fs::entry::sort_for_display(&mut entries);
                             self.directory_cache.insert("/".into(), entries);
                             self.expanded_paths.insert("/".into());
                         }
@@ -5929,6 +6060,7 @@ impl BrowseView {
     /// (after sync_metadata, archive recompress, etc.).
     fn invalidate_cached_fs(&mut self) {
         self.cached_fs = None;
+        self.fs_generation = self.fs_generation.wrapping_add(1);
         // Boot-block status is recomputed lazily from the (now possibly
         // changed) backing bytes the next time the header renders.
         self.boot_blocks_present = None;

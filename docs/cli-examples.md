@@ -234,6 +234,15 @@ rb-cli get-binhex --literal disk.hda '/Games/Foo/Bar [data].rsrc' out.hqx
 rb-cli rm --literal disk.hda '/Apps/Maze Wars+ {old}'
 ```
 
+Rename in place with `mv` — the entry keeps its contents and dates, only the
+name changes. The destination is a bare name or a path in the same directory;
+moving between directories is not supported:
+
+```bash
+rb-cli mv disk.hda '/Apps/Maze Wars+ {old}' 'Maze Wars+ 1.0'
+rb-cli mv c.img@1 /AUTOEXEC.BAK /AUTOEXEC.BAT
+```
+
 ## Drive everything from a batch JSON script
 
 `script.json`:

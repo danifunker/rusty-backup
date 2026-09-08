@@ -15,42 +15,54 @@ const READ_BUF_SIZE: usize = 1024 * 1024; // 1 MB
 /// consumer like a stream builder) can update the hash while the
 /// orchestrator retains a handle to extract the final digest at the
 /// end of the operation.
-pub enum RunningHasher {
+pub struct RunningHasher {
+    state: HasherState,
+    bytes: u64,
+}
+
+enum HasherState {
     Sha256(sha2::Sha256),
     Crc32(crc32fast::Hasher),
 }
 
 impl RunningHasher {
     pub fn new(checksum_type: ChecksumType) -> Self {
-        match checksum_type {
+        let state = match checksum_type {
             ChecksumType::Sha256 => {
                 use sha2::Digest;
-                RunningHasher::Sha256(sha2::Sha256::new())
+                HasherState::Sha256(sha2::Sha256::new())
             }
-            ChecksumType::Crc32 => RunningHasher::Crc32(crc32fast::Hasher::new()),
-        }
+            ChecksumType::Crc32 => HasherState::Crc32(crc32fast::Hasher::new()),
+        };
+        Self { state, bytes: 0 }
     }
 
     pub fn update(&mut self, data: &[u8]) {
-        match self {
-            RunningHasher::Sha256(h) => {
+        self.bytes += data.len() as u64;
+        match &mut self.state {
+            HasherState::Sha256(h) => {
                 use sha2::Digest;
                 h.update(data);
             }
-            RunningHasher::Crc32(h) => h.update(data),
+            HasherState::Crc32(h) => h.update(data),
         }
+    }
+
+    /// Bytes fed so far; zero means no consumer ever honoured the tee.
+    pub fn bytes_fed(&self) -> u64 {
+        self.bytes
     }
 
     /// Consume the hasher and return the hex-encoded digest. After
     /// calling this the hasher must be replaced before further use;
     /// the caller usually drops it.
     pub fn finalize_hex(self) -> String {
-        match self {
-            RunningHasher::Sha256(h) => {
+        match self.state {
+            HasherState::Sha256(h) => {
                 use sha2::Digest;
                 h.finalize().iter().map(|b| format!("{:02x}", b)).collect()
             }
-            RunningHasher::Crc32(h) => format!("{:08x}", h.finalize()),
+            HasherState::Crc32(h) => format!("{:08x}", h.finalize()),
         }
     }
 }
@@ -91,17 +103,19 @@ impl<R: Read> Read for ChecksumReader<R> {
 }
 
 /// Finalise a shared hasher and return its hex digest. The hasher slot
-/// is emptied; calling this twice on the same handle returns an empty
-/// string the second time (so missing-tee bugs show up loudly in
-/// tests). Used after the consumer that owned the corresponding
+/// is emptied; calling this twice on the same handle, or on a handle no
+/// consumer ever fed, returns an empty string (so missing-tee bugs show
+/// up loudly in tests). Used after the consumer that owned the corresponding
 /// [`ChecksumReader`] / [`ChecksumWriter`] has been dropped or returned.
 pub fn finalize_shared_hasher(handle: &Arc<Mutex<Option<RunningHasher>>>) -> String {
     let Ok(mut guard) = handle.lock() else {
         return String::new();
     };
     match guard.take() {
-        Some(h) => h.finalize_hex(),
-        None => String::new(),
+        // A consumer that ignored the tee leaves the hasher unfed; the
+        // empty-input digest it would yield is not this file's checksum.
+        Some(h) if h.bytes_fed() > 0 => h.finalize_hex(),
+        _ => String::new(),
     }
 }
 
@@ -382,5 +396,189 @@ mod tests {
                 }
             );
         }
+    }
+}
+
+/// Recompute each partition member's checksum and compare it with the recorded
+/// one (members joined by `,`); a layout that records none passes.
+pub fn verify_partition_files(
+    backup_folder: &Path,
+    metadata: &crate::backup::metadata::BackupMetadata,
+    log_cb: &mut dyn FnMut(&str),
+) -> Result<()> {
+    for pm in &metadata.partitions {
+        verify_partition_member(backup_folder, &metadata.checksum_type, pm, log_cb)?;
+    }
+    Ok(())
+}
+
+/// One partition's members against its recorded checksum; nothing recorded,
+/// or a placeholder that is not a digest, passes with a log line.
+pub fn verify_partition_member(
+    backup_folder: &Path,
+    checksum_type: &str,
+    pm: &crate::backup::metadata::PartitionMetadata,
+    log_cb: &mut dyn FnMut(&str),
+) -> Result<()> {
+    let checksum_type = match checksum_type.to_ascii_lowercase().as_str() {
+        "sha256" => ChecksumType::Sha256,
+        "crc32" => ChecksumType::Crc32,
+        _ => return Ok(()),
+    };
+    let short = |s: &str| s.get(..16).unwrap_or(s).to_string();
+    let digest_len = match checksum_type {
+        ChecksumType::Sha256 => 64,
+        ChecksumType::Crc32 => 8,
+    };
+    if pm.checksum.is_empty() || pm.compressed_files.is_empty() {
+        return Ok(());
+    }
+    // A writer that records a placeholder (cb-dos test fixtures write "0")
+    // has nothing to compare against; say so rather than refuse the restore.
+    let recorded: Vec<&str> = pm.checksum.split(',').collect();
+    let plausible = recorded.len() == pm.compressed_files.len()
+        && recorded
+            .iter()
+            .all(|r| r.len() == digest_len && r.chars().all(|c| c.is_ascii_hexdigit()));
+    if !plausible {
+        log_cb(&format!(
+            "partition-{}: recorded checksum is not a {} digest; not verified",
+            pm.index,
+            checksum_type.as_str()
+        ));
+        return Ok(());
+    }
+    let mut computed = Vec::with_capacity(pm.compressed_files.len());
+    for name in &pm.compressed_files {
+        let path = backup_folder.join(name);
+        computed.push(
+            compute_checksum(&path, checksum_type)
+                .with_context(|| format!("checksumming {}", path.display()))?,
+        );
+    }
+    let computed = computed.join(",");
+    if !computed.eq_ignore_ascii_case(&pm.checksum) {
+        anyhow::bail!(
+            "partition-{}: {} checksum mismatch (recorded {}, on disk {}); the backup \
+             is damaged and nothing was written to the target",
+            pm.index,
+            checksum_type.as_str(),
+            short(&pm.checksum),
+            short(&computed)
+        );
+    }
+    log_cb(&format!(
+        "partition-{}: {} checksum verified ({} file(s))",
+        pm.index,
+        checksum_type.as_str(),
+        pm.compressed_files.len()
+    ));
+    Ok(())
+}
+
+#[cfg(test)]
+mod partition_file_tests {
+    use super::*;
+    use crate::backup::metadata::{
+        AlignmentMetadata, BackupLayout, BackupMetadata, PartitionMetadata,
+    };
+
+    fn metadata(files: Vec<String>, checksum: String) -> BackupMetadata {
+        BackupMetadata {
+            version: 1,
+            created: String::new(),
+            source_device: String::new(),
+            source_size_bytes: 0,
+            partition_table_type: "MBR".to_string(),
+            checksum_type: "sha256".to_string(),
+            compression_type: "raw".to_string(),
+            split_size_mib: None,
+            sector_by_sector: false,
+            layout: BackupLayout::PerPartition,
+            container: None,
+            container_logical_size: None,
+            container_sha1: None,
+            size_policy: None,
+            bad_sectors: Vec::new(),
+            extended_container: None,
+            alignment: AlignmentMetadata {
+                detected_type: String::new(),
+                first_partition_lba: 0,
+                alignment_sectors: 0,
+                heads: 0,
+                sectors_per_track: 0,
+            },
+            partitions: vec![PartitionMetadata {
+                index: 0,
+                type_name: "FAT16".to_string(),
+                partition_type_byte: 0x06,
+                start_lba: 63,
+                start_byte: None,
+                original_size_bytes: 8192,
+                imaged_size_bytes: 8192,
+                compressed_files: files,
+                checksum,
+                resized: false,
+                compacted: false,
+                is_logical: false,
+                partition_type_string: None,
+                minimum_size_bytes: None,
+                defragmented_min_size_bytes: None,
+                hfsplus_signature: None,
+                defragmented_clone: false,
+            }],
+        }
+    }
+
+    /// A damaged member must stop the restore before anything is written; the
+    /// recorded string is the members' checksums joined in order.
+    #[test]
+    fn verify_partition_files_catches_a_flipped_byte_in_a_split_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = vec![
+            "partition-0.raw".to_string(),
+            "partition-0.raw.001".to_string(),
+        ];
+        std::fs::write(dir.path().join(&names[0]), vec![0xA5u8; 4096]).unwrap();
+        std::fs::write(dir.path().join(&names[1]), vec![0x5Au8; 4096]).unwrap();
+        let recorded = names
+            .iter()
+            .map(|n| compute_checksum(&dir.path().join(n), ChecksumType::Sha256).unwrap())
+            .collect::<Vec<_>>()
+            .join(",");
+        let md = metadata(names.clone(), recorded);
+        let mut lines = Vec::new();
+        verify_partition_files(dir.path(), &md, &mut |m| lines.push(m.to_string())).unwrap();
+        assert!(lines.iter().any(|l| l.contains("verified")), "{lines:?}");
+
+        let mut bytes = std::fs::read(dir.path().join(&names[1])).unwrap();
+        bytes[100] ^= 0x01;
+        std::fs::write(dir.path().join(&names[1]), bytes).unwrap();
+        let err = verify_partition_files(dir.path(), &md, &mut |_| {}).unwrap_err();
+        assert!(err.to_string().contains("checksum mismatch"), "{err}");
+
+        // Nothing recorded, or a placeholder: nothing to compare, nothing to fail.
+        let none = metadata(names.clone(), String::new());
+        verify_partition_files(dir.path(), &none, &mut |_| {}).unwrap();
+        let placeholder = metadata(names, "0".to_string());
+        let mut lines = Vec::new();
+        verify_partition_files(dir.path(), &placeholder, &mut |m| lines.push(m.to_string()))
+            .unwrap();
+        assert!(
+            lines.iter().any(|l| l.contains("not verified")),
+            "{lines:?}"
+        );
+    }
+
+    /// A compressor that ignores the tee (CHD) must not leave the
+    /// empty-input digest behind as the member's recorded checksum.
+    #[test]
+    fn an_unfed_shared_hasher_yields_no_digest() {
+        let unfed = Arc::new(Mutex::new(Some(RunningHasher::new(ChecksumType::Sha256))));
+        assert_eq!(finalize_shared_hasher(&unfed), "");
+        let fed = Arc::new(Mutex::new(Some(RunningHasher::new(ChecksumType::Sha256))));
+        fed.lock().unwrap().as_mut().unwrap().update(b"x");
+        assert_eq!(finalize_shared_hasher(&fed).len(), 64);
+        assert_eq!(finalize_shared_hasher(&fed), "", "second call is empty");
     }
 }

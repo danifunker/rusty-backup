@@ -334,11 +334,9 @@ impl BrowseSession {
                     .map_err(|e| {
                         FilesystemError::Parse(format!("failed to open ZIP disk: {e:#}"))
                     })?;
-                let effective_offset = if self.partition_type == 0 {
-                    0
-                } else {
-                    self.partition_offset
-                };
+                // Type byte 0 is every APM / RDB / GPT / label row, not just
+                // a superfloppy (whose offset is 0 anyway).
+                let effective_offset = self.partition_offset;
                 return fs::open_filesystem_sized(
                     reader,
                     effective_offset,
@@ -356,11 +354,9 @@ impl BrowseSession {
         if magic[0] == 0x1f && magic[1] == 0x8b {
             let reader = crate::model::source_reader::open_read(path)
                 .map_err(|e| FilesystemError::Parse(format!("failed to open gzip image: {e:#}")))?;
-            let effective_offset = if self.partition_type == 0 {
-                0
-            } else {
-                self.partition_offset
-            };
+            // Type byte 0 is every APM / RDB / GPT / label row, not just a
+            // superfloppy (whose offset is 0 anyway).
+            let effective_offset = self.partition_offset;
             return fs::open_filesystem_sized(
                 reader,
                 effective_offset,
@@ -376,11 +372,9 @@ impl BrowseSession {
         if crate::rbformats::cbk::is_cbk(path) {
             let reader = crate::model::source_reader::open_read(path)
                 .map_err(|e| FilesystemError::Parse(format!("failed to open .cbk: {e:#}")))?;
-            let effective_offset = if self.partition_type == 0 {
-                0
-            } else {
-                self.partition_offset
-            };
+            // Type byte 0 is every APM / RDB / GPT / label row, not just a
+            // superfloppy (whose offset is 0 anyway).
+            let effective_offset = self.partition_offset;
             return fs::open_filesystem_sized(
                 reader,
                 effective_offset,
@@ -399,11 +393,9 @@ impl BrowseSession {
         if crate::model::source_reader::is_flat_floppy_container_path(path) {
             let reader = crate::model::source_reader::open_read(path)
                 .map_err(|e| FilesystemError::Parse(format!("failed to open container: {e:#}")))?;
-            let effective_offset = if self.partition_type == 0 {
-                0
-            } else {
-                self.partition_offset
-            };
+            // Type byte 0 is every APM / RDB / GPT / label row, not just a
+            // superfloppy (whose offset is 0 anyway).
+            let effective_offset = self.partition_offset;
             return fs::open_filesystem_sized(
                 reader,
                 effective_offset,
@@ -511,13 +503,9 @@ impl BrowseSession {
                 let file2 = File::open(path).map_err(FilesystemError::Io)?;
                 let (reader, _size) = crate::rbformats::wrap_image_reader(file2, format)
                     .map_err(|e| FilesystemError::Parse(format!("failed to unwrap image: {e}")))?;
-                // Container formats present unwrapped data starting at offset
-                // 0; use partition_offset=0 for superfloppies.
-                let effective_offset = if self.partition_type == 0 {
-                    0
-                } else {
-                    self.partition_offset
-                };
+                // Type byte 0 is every APM / RDB / GPT / label row, not just
+                // a superfloppy (whose offset is 0 anyway).
+                let effective_offset = self.partition_offset;
                 fs::open_filesystem_with_passphrase(
                     reader,
                     effective_offset,
@@ -772,49 +760,29 @@ impl BrowseSession {
             ));
         }
 
-        // QCOW2: the reader is itself `Read + Write + Seek`, allocating host
-        // clusters on demand, so edits land in place with no re-encode on
-        // commit — mirror the CLI's `resolve_image_rw`. Without this branch the
-        // raw file below is handed to the partition/FS resolver, which reads the
-        // QCOW2 header as sector 0 and fails with a misleading error (e.g.
-        // "unrecognized Apple_HFS variant" on a Mac disk). `self.partition_offset`
-        // was computed against the decoded virtual disk, so it applies directly
-        // to the wrapped reader.
-        if crate::model::source_reader::is_qcow2_path(path) {
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(path)
-                .map_err(FilesystemError::Io)?;
-            let reader = crate::rbformats::qcow2::Qcow2Reader::open(file)
-                .map_err(|e| FilesystemError::Parse(format!("opening QCOW2 for edit: {e:#}")))?;
-            // Surface the root cause up front. A snapshot-bearing QCOW2 opens
-            // read-only (its clusters are shared, and we do no copy-on-write) —
-            // and this is the common UTM case, where a *suspended* VM leaves
-            // both a "suspend" snapshot and a dirty guest journal. Without this
-            // the user would instead hit the downstream "dirty journaled HFS+"
-            // message, which points at the symptom, not the cause.
-            if reader.is_read_only() {
-                return Err(FilesystemError::Unsupported(format!(
-                    "this QCOW2 has {} internal snapshot(s) and opens read-only \
-                     (a UTM suspended-VM state is the usual one). Editing could \
-                     corrupt them. Shut the VM down cleanly in UTM, or drop the \
-                     snapshot (`qemu-img snapshot -d <name> <file>`), then retry.",
-                    reader.snapshot_count()
-                )));
+        // The CLI's classifier (R-043): sparse codecs edit in place, decode-only
+        // containers are refused; `partition_offset` is into the decoded disk.
+        match crate::model::source_reader::open_container_rw(path)
+            .map_err(|e| FilesystemError::Parse(format!("opening for edit: {e:#}")))?
+        {
+            crate::model::source_reader::ContainerRw::Plain => {}
+            crate::model::source_reader::ContainerRw::Handle(handle) => {
+                let fs = fs::open_editable_filesystem_with(
+                    handle,
+                    self.partition_offset,
+                    fs::EditContext {
+                        partition_len: self.partition_size,
+                        rebuild_budget: self.rebuild_budget,
+                        ..Default::default()
+                    },
+                    self.partition_type,
+                    self.partition_type_string.as_deref(),
+                )?;
+                return Ok((fs, ContainerEditCommit { session: None }));
             }
-            let fs = fs::open_editable_filesystem_with(
-                reader,
-                self.partition_offset,
-                fs::EditContext {
-                    partition_len: self.partition_size,
-                    rebuild_budget: self.rebuild_budget,
-                    ..Default::default()
-                },
-                self.partition_type,
-                self.partition_type_string.as_deref(),
-            )?;
-            return Ok((fs, ContainerEditCommit { session: None }));
+            crate::model::source_reader::ContainerRw::ReadOnly(why) => {
+                return Err(FilesystemError::Unsupported(why));
+            }
         }
 
         let file = OpenOptions::new()
@@ -941,7 +909,7 @@ mod tests {
         // APFS FileVault: locked (root-listing) and wrong-passphrase (open).
         assert!(looks_like_password_error(
             "Failed to read root directory: APFS volume is encrypted (FileVault) \
-             — a passphrase or personal recovery key is required to browse it"
+             - a passphrase or personal recovery key is required to browse it"
         ));
         assert!(looks_like_password_error(
             "wrong APFS passphrase (KEK unwrap failed)"

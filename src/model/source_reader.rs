@@ -1158,11 +1158,11 @@ fn open_read_dispatch(
                 }
             }
         }
-        let f = File::open(path).with_context(|| format!("open {}", path.display()))?;
         // A device cannot answer seek(End); carry the length the OS reports instead.
         if crate::cli::device_safety::looks_like_device_path(path) {
-            return Ok(Box::new(crate::os::known_len_reader(f, path)));
+            return open_device_read(path);
         }
+        let f = File::open(path).with_context(|| format!("open {}", path.display()))?;
         Ok(Box::new(BufReader::new(f)))
     }
 }
@@ -1257,6 +1257,20 @@ pub fn open_peeled_read(path: &Path, password: Option<&[u8]>) -> Result<Box<dyn 
     open_peeled_read_with_entry(path, password, None)
 }
 
+/// Open a raw device through the platform's elevation path.
+///
+/// The CLI used to reach a device with a plain `File::open`, so on macOS —
+/// where the GUI escalates per operation through `authopen` — an unprivileged
+/// `rb-cli inspect /dev/rdiskN` died with a bare EACCES and no way forward
+/// (R-068). The handle is wrapped so the disk claim outlives the reader.
+fn open_device_read(path: &Path) -> Result<Box<dyn ReadSeek>> {
+    let elevated = crate::os::open_source_for_reading(path)
+        .with_context(|| format!("open {}", path.display()))?;
+    let (handle, guard) = elevated.into_parts();
+    let reader = crate::os::SectorAlignedReader::new(crate::os::known_len_source(handle, path));
+    Ok(Box::new(crate::os::GuardedReader::new(reader, guard)))
+}
+
 /// As [`open_peeled_read`], but `inside` names a specific entry to open when
 /// `path` is a `.zip` holding more than one disk image (the CLI `--inside`
 /// flag). Ignored for every non-zip source.
@@ -1299,6 +1313,11 @@ pub fn open_peeled_read_with_entry(
     // a `bcem` resource, so a plain `.bin` raw image is never affected.
     if let Some(image) = try_open_ndif_carrier(path) {
         return Ok(Box::new(std::io::Cursor::new(image)));
+    }
+    // A raw device is never a container, cannot answer seek(End) and, on macOS,
+    // takes only sector-sized reads: a plain BufReader gave inspect 0 bytes (R19).
+    if crate::cli::device_safety::looks_like_device_path(path) {
+        return open_device_read(path);
     }
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
     match detect_image_format_with_path(file, Some(path)) {
@@ -1398,6 +1417,100 @@ pub fn is_editable_container_path(path: &Path) -> bool {
         || is_gzip_image_path(path)
         || is_woz_path(path)
         || is_dsd_path(path)
+}
+
+/// What stands between an editor and the bytes of `path`.
+pub enum ContainerRw {
+    /// The file is the disk: the caller opens it itself.
+    Plain,
+    /// A sparse codec that edits in place (dynamic VHD, sparse VMDK, QCOW2).
+    Handle(crate::rbformats::BoxRwSeek),
+    /// Decoded for reading, but nothing can write it back; says what and why.
+    ReadOnly(String),
+}
+
+/// Classify `path` for a read-write open with the read side's detector (R-043);
+/// callers dispatch CHD and the floppy containers before this runs.
+pub fn open_container_rw(path: &Path) -> Result<ContainerRw> {
+    let probe = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let format = detect_image_format_with_path(probe, Some(path))?;
+    // A ProDOS-ordered Apple II disk is re-interleaved on read, so a write
+    // through its file bytes would land on the wrong sectors.
+    if matches!(format, ImageFormat::Raw | ImageFormat::DosOrder) && is_apple_ii_dsk_path(path) {
+        let bytes = std::fs::read(path)?;
+        let ext = path.extension().and_then(|e| e.to_str());
+        if open_apple_ii_dsk(bytes.clone(), ext).is_ok_and(|decoded| decoded != bytes) {
+            return Ok(ContainerRw::ReadOnly(
+                "this Apple II disk is ProDOS-ordered and is re-interleaved for reading, \
+                 so edits would land on the wrong sectors. Convert it to DOS order first: \
+                 `rb-cli convert <image> OUT.do --format raw`."
+                    .to_string(),
+            ));
+        }
+    }
+    // Decode-only wrappers the image detector cannot see (GHO, IMZ, zip, gzip,
+    // GCR/MSA/EDSK); a DOS-ordered Apple II .dsk is a plain sector image.
+    if matches!(format, ImageFormat::Raw)
+        && is_container_path(path)
+        && !is_editable_container_path(path)
+        && !is_apple_ii_dsk_path(path)
+        && !crate::rbformats::appimage::is_squashfs_appimage(path)
+        && squashfs_bearing_iso_payload(path).is_none()
+    {
+        return Ok(ContainerRw::ReadOnly(
+            "this container decodes for reading but cannot be written back, so edits \
+             would have nowhere to go. Convert it to a raw image first: \
+             `rb-cli convert <image> OUT.img --format raw`."
+                .to_string(),
+        ));
+    }
+    let rw = || {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .with_context(|| format!("opening {} for write", path.display()))
+    };
+    Ok(match format {
+        ImageFormat::Raw | ImageFormat::DosOrder => ContainerRw::Plain,
+        // Raw data with a trailing footer: a window keeps the footer out of the
+        // volume, which the plain file counted as 512 extra bytes to grow into.
+        ImageFormat::Vhd { data_size } => ContainerRw::Handle(Box::new(
+            crate::rbformats::payload_slice::PayloadSlice::bounded(rw()?, 0, data_size),
+        )),
+        ImageFormat::VhdDynamic { .. } => {
+            let reader = crate::rbformats::vhd::DynamicVhdReader::open(rw()?)
+                .with_context(|| format!("opening dynamic VHD {} for edit", path.display()))?;
+            ContainerRw::Handle(Box::new(reader))
+        }
+        ImageFormat::VmdkSparse { .. } => {
+            let reader = crate::rbformats::vmdk_sparse::VmdkSparseReader::open(rw()?)
+                .with_context(|| format!("opening sparse VMDK {} for edit", path.display()))?;
+            ContainerRw::Handle(Box::new(reader))
+        }
+        ImageFormat::Qcow2 { .. } => {
+            let reader = crate::rbformats::qcow2::Qcow2Reader::open(rw()?)
+                .with_context(|| format!("opening QCOW2 {} for edit", path.display()))?;
+            // Shared clusters and no copy-on-write: a snapshot-bearing image
+            // (a UTM suspended VM, typically) would be corrupted by an edit.
+            if reader.is_read_only() {
+                return Ok(ContainerRw::ReadOnly(format!(
+                    "this QCOW2 has {} internal snapshot(s) and opens read-only \
+                     (a UTM suspended-VM state is the usual one). Editing could \
+                     corrupt them. Shut the VM down cleanly in UTM, or drop the \
+                     snapshot (`qemu-img snapshot -d <name> <file>`), then retry.",
+                    reader.snapshot_count()
+                )));
+            }
+            ContainerRw::Handle(Box::new(reader))
+        }
+        other => ContainerRw::ReadOnly(format!(
+            "{}: this container decodes for reading but cannot be written back, \
+             so edits would have nowhere to go. Convert it to a raw image first: \
+             `rb-cli convert <image> OUT.img --format raw`.",
+            other.description()
+        )),
+    })
 }
 
 /// True when [`open_read`] would transparently unwrap `path` into a decoded

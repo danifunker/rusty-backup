@@ -39,10 +39,10 @@ use std::io::{Read, Seek};
 use super::filesystem::FilesystemError;
 use super::fsck::{FsckIssue, FsckResult, FsckStats, OrphanedEntry};
 use super::ufs::{
-    read_i32, read_i64, read_u32, read_u64, UfsFilesystem, UfsVersion, CG_MAGIC, CG_OFF_CGX,
-    CG_OFF_FREEOFF, CG_OFF_MAGIC, CG_OFF_NDBLK, CG_OFF_NEXTFREEOFF, DIRENT_HDR_LEN, MAGIC_OFF,
-    MAGIC_UFS1, MAGIC_UFS2, OFF_BSIZE, OFF_CBLKNO, OFF_FPG, OFF_FRAG, OFF_FSIZE, OFF_IBLKNO,
-    OFF_IPG, OFF_NCG, OFF_OLD_SIZE, OFF_SBLKNO, OFF_SIZE_UFS2, ROOT_INODE,
+    read_dirent_namlen, read_i32, read_i64, read_u32, read_u64, UfsFilesystem, UfsVersion,
+    CG_MAGIC, CG_OFF_CGX, CG_OFF_FREEOFF, CG_OFF_MAGIC, CG_OFF_NDBLK, CG_OFF_NEXTFREEOFF,
+    DIRENT_HDR_LEN, MAGIC_OFF, MAGIC_UFS1, MAGIC_UFS2, OFF_BSIZE, OFF_CBLKNO, OFF_FPG, OFF_FRAG,
+    OFF_FSIZE, OFF_IBLKNO, OFF_IPG, OFF_NCG, OFF_OLD_SIZE, OFF_SBLKNO, OFF_SIZE_UFS2, ROOT_INODE,
 };
 use super::unix_common::bitmap::BitmapReader;
 use super::unix_common::inode::{unix_file_type, UnixFileType};
@@ -492,6 +492,7 @@ fn check_connectivity<R: Read + Seek + Send>(
     queue.push_back(ROOT_INODE);
 
     let endian = fs.endian_value();
+    let old_fmt = fs.old_dirent_fmt();
     while let Some(dir_inum) = queue.pop_front() {
         let dir = match fs.read_inode(dir_inum) {
             Ok(d) => d,
@@ -508,7 +509,7 @@ fn check_connectivity<R: Read + Seek + Send>(
         while off + DIRENT_HDR_LEN <= bytes.len() {
             let d_ino = read_u32(&bytes, off, endian);
             let d_reclen = read_u16(&bytes, off + 4, endian) as usize;
-            let d_namlen = bytes[off + 7] as usize;
+            let (_, d_namlen) = read_dirent_namlen(&bytes, off, old_fmt, endian);
             if d_reclen == 0 || !d_reclen.is_multiple_of(4) || off + d_reclen > bytes.len() {
                 break;
             }

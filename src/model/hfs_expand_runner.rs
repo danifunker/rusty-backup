@@ -87,7 +87,7 @@ pub fn start_hfs_expand(
         finished: false,
         error: None,
         log_messages: Vec::new(),
-        current_step: "Starting…".to_string(),
+        current_step: "Starting...".to_string(),
         clone_report: None,
         emit_report: None,
     }));
@@ -147,7 +147,7 @@ fn run_expand(
             .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
 
-    step("Building blank target volume…");
+    step("Building blank target volume...");
     // Floor the target B-trees at the blank-format default for `target_size`,
     // not just 1.5x the source: a densely-packed source catalog can otherwise
     // undersize the target and exhaust it mid-clone ("no free B-tree nodes").
@@ -166,7 +166,7 @@ fn run_expand(
     )
     .map_err(|e| anyhow::anyhow!("create_blank_hfs failed: {e}"))?;
     push(&format!(
-        "Target B-trees sized: catalog ≥ {} KiB (source {} KiB), extents-overflow ≥ {} KiB (source {} KiB)",
+        "Target B-trees sized: catalog >= {} KiB (source {} KiB), extents-overflow >= {} KiB (source {} KiB)",
         catalog_min / 1024,
         source.source_catalog_size / 1024,
         extents_min / 1024,
@@ -178,7 +178,7 @@ fn run_expand(
         target_block_size / 1024
     ));
 
-    step("Reading source catalog…");
+    step("Reading source catalog...");
     let mut source_buffered =
         open_read(&source.source_path).map_err(|e| anyhow::anyhow!("open source: {e}"))?;
     let source_disk_size = source_buffered
@@ -202,7 +202,7 @@ fn run_expand(
         ));
     }
 
-    step("Cloning files…");
+    step("Cloning files...");
     let target_cursor = Cursor::new(&mut target_buf);
     let mut target_fs = HfsFilesystem::open(target_cursor, 0)
         .map_err(|e| anyhow::anyhow!("open target HFS: {e}"))?;
@@ -216,7 +216,7 @@ fn run_expand(
         clone_report.rsrc_bytes_copied
     ));
 
-    step("Verifying target with fsck…");
+    step("Verifying target with fsck...");
     {
         let mut verify_fs = HfsFilesystem::open(Cursor::new(&target_buf), 0)
             .map_err(|e| anyhow::anyhow!("reopen target for fsck: {e}"))?;
@@ -251,7 +251,7 @@ fn run_expand(
             // An HFV is the bare cloned volume: write target_buf verbatim, no
             // APM/driver wrapper. The source's boot blocks were copied by the
             // clone, so a bootable source stays bootable under BasiliskII.
-            step("Writing flat HFV image…");
+            step("Writing flat HFV image...");
             std::fs::write(&output_path, &target_buf)
                 .map_err(|e| anyhow::anyhow!("write HFV: {e}"))?;
             push(&format!(
@@ -261,7 +261,7 @@ fn run_expand(
             Ok((clone_report, None))
         }
         ExpandOutput::ApmDisk => {
-            step("Writing new APM disk image…");
+            step("Writing new APM disk image...");
             let output_file = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)

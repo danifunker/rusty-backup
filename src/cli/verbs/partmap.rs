@@ -125,7 +125,7 @@ pub struct SetBootableArgs {
 #[derive(Debug, Args)]
 pub struct TypesArgs {
     /// Table flavor to list types for. Omit to read it from an image.
-    #[arg(long, value_parser = ["mbr", "gpt", "apm", "rdb", "sgi"])]
+    #[arg(long, value_parser = ["mbr", "gpt", "apm", "rdb", "sgi", "sgi-dklabel", "sun", "next", "solaris-x86"])]
     pub table: Option<String>,
     /// Image whose partition table decides which list to print.
     #[arg(long)]
@@ -251,10 +251,17 @@ fn run_types(a: TypesArgs) -> Result<()> {
             "apm" => TableKind::Apm,
             "rdb" => TableKind::Rdb,
             "sgi" => TableKind::Sgi,
+            "sgi-dklabel" => TableKind::SgiDkLabel,
+            "sun" => TableKind::Sun,
+            "next" => TableKind::Next,
+            "solaris-x86" => TableKind::SolarisX86,
             other => bail!("unknown table flavor '{}'", other),
         },
         (None, Some(image)) => type_catalog::kind_of(&open_table(image)?),
-        (None, None) => bail!("types: pass --table <mbr|gpt|apm|rdb|sgi> or --image <FILE>"),
+        (None, None) => bail!(
+            "types: pass --table <mbr|gpt|apm|rdb|sgi|sgi-dklabel|sun|next|solaris-x86> or \
+             --image <FILE>"
+        ),
     };
 
     let choices = type_catalog::choices(kind);
@@ -280,6 +287,16 @@ fn run_types(a: TypesArgs) -> Result<()> {
     let width = values.iter().map(|v| v.len()).max().unwrap_or(0);
     for (value, choice) in values.iter().zip(choices) {
         println!("  {:<width$}  {}", value, choice.label, width = width);
+    }
+    if kind == TableKind::SgiDkLabel {
+        // The label has no per-slot type field, so `partmap` refuses
+        // set-type; these roles are only read when the table is created.
+        println!(
+            "\nPass one to `new hd sgi-dklabel --partition SIZE:ROLE`. The label stores the \
+             role in d_bootfs / d_swapfs / d_rootfs, not per slot, so `partmap set-type` \
+             cannot change it later."
+        );
+        return Ok(());
     }
     println!("\nPass one to `partmap add {} <VALUE>`.", flag);
     println!("Any other value is accepted verbatim -- the list is not exhaustive.");

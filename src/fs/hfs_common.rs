@@ -114,7 +114,8 @@ pub fn hfs_now() -> u32 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    (unix_secs + MAC_EPOCH_DELTA) as u32
+    // Past 2040-02-06 the field is full; a wrap would stamp 1904.
+    u32::try_from(unix_secs.saturating_add(MAC_EPOCH_DELTA)).unwrap_or(u32::MAX)
 }
 
 /// Format an HFS/HFS+ Mac-epoch timestamp (seconds since 1904-01-01 UTC) as a
@@ -332,12 +333,14 @@ pub fn describe_type_creator(type_code: &[u8; 4], creator_code: &[u8; 4]) -> Opt
         .map(|e| e.description.as_str())
 }
 
-/// True for the classic-Mac filesystems whose `create_file` consults the
-/// extension dictionary: HFS, HFS+/HFSX, and MFS. ProDOS carries a file type
-/// too, but in its own `$XX` space, so it is deliberately excluded — handing it
-/// a Finder OSType like `TEXT` would be meaningless.
+/// True for the filesystems whose `create_file` consults the extension
+/// dictionary: HFS, HFS+/HFSX, MFS, and BeOS OFS — the last because early
+/// BeOS typed files with Mac `OSType` pairs, exactly the ones in the
+/// dictionary. ProDOS carries a file type too, but in its own `$XX` space, so
+/// it is deliberately excluded — handing it a Finder OSType like `TEXT` would
+/// be meaningless.
 pub fn uses_hfs_type_dictionary(fs_type: &str) -> bool {
-    fs_type.starts_with("HFS") || fs_type == "MFS"
+    fs_type.starts_with("HFS") || fs_type == "MFS" || fs_type == "BeOS OFS"
 }
 
 /// True when an `OSType` carries no information — all four bytes zero, which is
@@ -543,6 +546,27 @@ static HFS_CHARORDER: [u8; 256] = [
 /// numerically; names compare through [`HFS_CHARORDER`] byte-by-byte, with the
 /// shorter name sorting first on a common prefix (matching hfsutils
 /// `d_relstring` / the Linux kernel `hfs_strcmp`).
+/// Classic HFS extents-overflow key order: file ID, then fork type, then start
+/// block. Keys are `len(1) forkType(1) fileID(4) startBlock(2)`.
+pub fn compare_classic_extents_keys(a: &[u8], b: &[u8]) -> Ordering {
+    if a.len() < 8 || b.len() < 8 {
+        return a.len().cmp(&b.len());
+    }
+    let file_a = BigEndian::read_u32(&a[2..6]);
+    let file_b = BigEndian::read_u32(&b[2..6]);
+    match file_a.cmp(&file_b) {
+        Ordering::Equal => {}
+        other => return other,
+    }
+    match a[1].cmp(&b[1]) {
+        Ordering::Equal => {}
+        other => return other,
+    }
+    let start_a = BigEndian::read_u16(&a[6..8]);
+    let start_b = BigEndian::read_u16(&b[6..8]);
+    start_a.cmp(&start_b)
+}
+
 pub fn compare_hfs_keys(parent_a: u32, name_a: &[u8], parent_b: u32, name_b: &[u8]) -> Ordering {
     match parent_a.cmp(&parent_b) {
         Ordering::Equal => {}
@@ -661,6 +685,13 @@ impl BTreeKeyFormat {
         max_key_len: 264,
     };
 
+    /// Classic HFS extents-overflow: 1-byte key length, fixed 7-byte keys.
+    pub const CLASSIC_EXTENTS: BTreeKeyFormat = BTreeKeyFormat {
+        big_keys: false,
+        variable_index_keys: false,
+        max_key_len: 7,
+    };
+
     /// Build a descriptor from a BTHeaderRec `attributes` bitfield and
     /// `maxKeyLength`. The `attributes` field on hand-built volumes can be 0
     /// (no flags) even for HFS+ trees, so callers that know the tree's identity
@@ -731,7 +762,16 @@ impl BTreeKeyFormat {
     ///   `max_key_len`, length field forced to `max_key_len`.
     pub fn make_index_key(&self, first_key: &[u8]) -> Vec<u8> {
         if !self.big_keys {
-            return normalize_catalog_index_key(first_key);
+            if self.max_key_len == HFS_CAT_MAX_KEY_LEN as u16 {
+                return normalize_catalog_index_key(first_key);
+            }
+            // Classic extents-overflow: a fixed 7-byte key behind a 1-byte length.
+            let max = self.max_key_len as usize;
+            let mut result = vec![0u8; 1 + max];
+            result[0] = max as u8;
+            let copy = first_key.len().saturating_sub(1).min(max);
+            result[1..1 + copy].copy_from_slice(&first_key[1..1 + copy]);
+            return result;
         }
         if self.variable_index_keys {
             return first_key.to_vec();
@@ -817,14 +857,30 @@ pub fn btree_node_free_space(node: &[u8], node_size: usize) -> usize {
     table_start - last_rec_end - 2
 }
 
+/// The child pointer an index record ends with; 0 (never a real node) when
+/// a clamped range from a corrupt node is too short to hold one.
+fn index_child_ptr(node: &[u8], end: usize) -> u32 {
+    if end < 4 || end > node.len() {
+        return 0;
+    }
+    BigEndian::read_u32(&node[end - 4..end])
+}
+
 /// Get the offset and data of record `rec_idx` in a node.
 /// Returns (rec_offset, rec_end) — the byte range within the node.
 pub fn btree_record_range(node: &[u8], node_size: usize, rec_idx: usize) -> (usize, usize) {
-    let offset_pos = node_size - 2 * (rec_idx + 1);
-    let start = BigEndian::read_u16(&node[offset_pos..offset_pos + 2]) as usize;
-    let next_pos = node_size - 2 * (rec_idx + 2);
-    let end = BigEndian::read_u16(&node[next_pos..next_pos + 2]) as usize;
-    (start, end)
+    // A corrupt numRecords used to walk the offset table off the node and
+    // panic; an empty, in-bounds range lets fsck report it instead.
+    let node_size = node_size.min(node.len());
+    let (Some(offset_pos), Some(next_pos)) = (
+        node_size.checked_sub(2 * (rec_idx + 1)),
+        node_size.checked_sub(2 * (rec_idx + 2)),
+    ) else {
+        return (0, 0);
+    };
+    let start = (BigEndian::read_u16(&node[offset_pos..offset_pos + 2]) as usize).min(node_size);
+    let end = (BigEndian::read_u16(&node[next_pos..next_pos + 2]) as usize).min(node_size);
+    (start, start.max(end))
 }
 
 /// Visit every record in the catalog's leaf-node chain, skipping non-leaf
@@ -1173,7 +1229,332 @@ pub fn btree_alloc_node(
     Err(FilesystemError::DiskFull("no free B-tree nodes".into()))
 }
 
-/// Free a node in the B-tree node bitmap. Clears the bit.
+/// Drop the index records pointing at freed leaf `freed`, freeing index nodes
+/// that empty in turn and collapsing a one-child root; returns nodes freed.
+pub fn btree_detach_freed_node(data: &mut [u8], node_size: usize, freed: u32) -> u32 {
+    let mut header = BTreeHeader::read(data);
+    let max_nodes = (data.len() / node_size) as u32;
+    let mut freed_count = 0u32;
+    if header.root_node == freed {
+        // The last leaf went with it: an empty tree has no root.
+        header.root_node = 0;
+        header.depth = 0;
+        header.write(data);
+        return 0;
+    }
+    let mut target = freed;
+    loop {
+        let mut found = None;
+        'scan: for idx in 1..max_nodes {
+            if idx == target || !btree_bitmap_test(data, node_size, idx) {
+                continue;
+            }
+            let off = idx as usize * node_size;
+            let node = &data[off..off + node_size];
+            if node[8] as i8 != BTREE_INDEX_NODE {
+                continue;
+            }
+            let n = BigEndian::read_u16(&node[10..12]) as usize;
+            for r in 0..n {
+                let (_, end) = btree_record_range(node, node_size, r);
+                if index_child_ptr(node, end) == target {
+                    found = Some((idx, r));
+                    break 'scan;
+                }
+            }
+        }
+        let Some((idx, r)) = found else {
+            break;
+        };
+        let off = idx as usize * node_size;
+        btree_remove_record(&mut data[off..off + node_size], node_size, r);
+        if BigEndian::read_u16(&data[off + 10..off + 12]) > 0 {
+            break;
+        }
+        btree_free_node(data, node_size, idx);
+        freed_count += 1;
+        if header.root_node == idx {
+            header.root_node = 0;
+            header.depth = 0;
+            header.free_nodes += freed_count;
+            header.write(data);
+            return freed_count;
+        }
+        target = idx;
+    }
+    // A root with a single record only points at the real root.
+    while header.depth > 1 && header.root_node != 0 {
+        let off = header.root_node as usize * node_size;
+        let node = &data[off..off + node_size];
+        if node[8] as i8 != BTREE_INDEX_NODE || BigEndian::read_u16(&node[10..12]) != 1 {
+            break;
+        }
+        let (_, end) = btree_record_range(node, node_size, 0);
+        let child = index_child_ptr(node, end);
+        if child == 0 {
+            break;
+        }
+        btree_free_node(data, node_size, header.root_node);
+        freed_count += 1;
+        header.root_node = child;
+        header.depth -= 1;
+    }
+    header.free_nodes += freed_count;
+    header.write(data);
+    freed_count
+}
+
+/// The index node and record pointing at `child`, found by scanning: the
+/// separators cannot be trusted to lead there while one of them is stale.
+pub fn btree_find_parent(data: &[u8], node_size: usize, child: u32) -> Option<(u32, usize)> {
+    let max_nodes = (data.len() / node_size) as u32;
+    for idx in 1..max_nodes {
+        if idx == child || !btree_bitmap_test(data, node_size, idx) {
+            continue;
+        }
+        let off = idx as usize * node_size;
+        let node = &data[off..off + node_size];
+        if node[8] as i8 != BTREE_INDEX_NODE {
+            continue;
+        }
+        let n = BigEndian::read_u16(&node[10..12]) as usize;
+        for r in 0..n {
+            let (_, end) = btree_record_range(node, node_size, r);
+            if index_child_ptr(node, end) == child {
+                return Some((idx, r));
+            }
+        }
+    }
+    None
+}
+
+/// `(node, parent)` pairs from the root down to `node`, the shape
+/// [`btree_insert_into_index`] expects.
+fn btree_parent_chain(data: &[u8], node_size: usize, node: u32) -> Vec<(u32, u32)> {
+    let mut chain = Vec::new();
+    let mut cur = node;
+    while cur != 0 && chain.len() < 64 {
+        let parent = btree_find_parent(data, node_size, cur).map_or(0, |(p, _)| p);
+        chain.push((cur, parent));
+        cur = parent;
+    }
+    chain.reverse();
+    chain
+}
+
+/// Make every separator above `node_idx` equal its child's first key again
+/// after that child's first record changed (fsck_hfs "Invalid index key").
+///
+/// A separator that merely sorts below the child still finds the records, which
+/// is why nothing noticed; Disk First Aid insists on equality.
+pub fn btree_refresh_index_keys<F>(
+    data: &mut [u8],
+    node_size: usize,
+    mut node_idx: u32,
+    kf: &BTreeKeyFormat,
+    cmp: &F,
+) -> Result<(), FilesystemError>
+where
+    F: Fn(&[u8], &[u8]) -> Ordering,
+{
+    let max_nodes = (data.len() / node_size) as u32;
+    // Bounded by the tree height; the scan-based parent lookup cannot loop.
+    for _ in 0..64 {
+        if node_idx == 0 || node_idx >= max_nodes {
+            return Ok(());
+        }
+        let first_key = {
+            let off = node_idx as usize * node_size;
+            let node = &data[off..off + node_size];
+            if BigEndian::read_u16(&node[10..12]) == 0 {
+                return Ok(());
+            }
+            let (s, e) = btree_record_range(node, node_size, 0);
+            kf.key_portion(&node[s..e])
+        };
+        let Some((parent, rec_idx)) = btree_find_parent(data, node_size, node_idx) else {
+            return Ok(());
+        };
+        let mut wanted = kf.make_index_key(&first_key);
+        let mut ptr = [0u8; 4];
+        BigEndian::write_u32(&mut ptr, node_idx);
+        wanted.extend_from_slice(&ptr);
+
+        let parent_off = parent as usize * node_size;
+        let replaced = {
+            let pnode = &mut data[parent_off..parent_off + node_size];
+            let (s, e) = btree_record_range(pnode, node_size, rec_idx);
+            if pnode[s..e] == wanted[..] {
+                return Ok(());
+            }
+            btree_remove_record(pnode, node_size, rec_idx);
+            btree_insert_record(pnode, node_size, &wanted, cmp).is_ok()
+        };
+        if !replaced {
+            // A longer key with no room left: the general index insert splits.
+            let mut header = BTreeHeader::read(data);
+            let chain = btree_parent_chain(data, node_size, parent);
+            btree_insert_into_index(
+                data,
+                node_size,
+                parent,
+                node_idx,
+                &first_key,
+                &mut header,
+                kf,
+                cmp,
+                &chain,
+            )?;
+            header.write(data);
+        }
+        node_idx = parent;
+    }
+    Ok(())
+}
+
+/// [`btree_detach_freed_node`], then repair the separators above the parent
+/// whose first record went with the freed leaf.
+pub fn btree_detach_freed_node_and_refresh<F>(
+    data: &mut [u8],
+    node_size: usize,
+    freed: u32,
+    kf: &BTreeKeyFormat,
+    cmp: &F,
+) -> Result<u32, FilesystemError>
+where
+    F: Fn(&[u8], &[u8]) -> Ordering,
+{
+    let parent = btree_find_parent(data, node_size, freed);
+    let freed_count = btree_detach_freed_node(data, node_size, freed);
+    if let Some((parent, 0)) = parent {
+        if btree_bitmap_test(data, node_size, parent) {
+            btree_refresh_index_keys(data, node_size, parent, kf, cmp)?;
+        }
+    }
+    Ok(freed_count)
+}
+
+/// Every index separator that does not compare equal to its child's first key,
+/// as `(index node, record, child, how the separator compares)`; what
+/// fsck_hfs reports as E_IKey.
+pub fn btree_stale_index_keys<F>(
+    data: &[u8],
+    node_size: usize,
+    kf: &BTreeKeyFormat,
+    cmp: &F,
+) -> Vec<(u32, usize, u32, Ordering)>
+where
+    F: Fn(&[u8], &[u8]) -> Ordering,
+{
+    let mut stale = Vec::new();
+    if node_size == 0 || data.len() < node_size {
+        return stale;
+    }
+    let max_nodes = (data.len() / node_size) as u32;
+    for idx in 1..max_nodes {
+        if !btree_bitmap_test(data, node_size, idx) {
+            continue;
+        }
+        let off = idx as usize * node_size;
+        let node = &data[off..off + node_size];
+        if node[8] as i8 != BTREE_INDEX_NODE {
+            continue;
+        }
+        let n = BigEndian::read_u16(&node[10..12]) as usize;
+        for r in 0..n {
+            let (s, e) = btree_record_range(node, node_size, r);
+            if e < s + 4 || e > node_size {
+                continue;
+            }
+            let child = index_child_ptr(node, e);
+            if child == 0 || child >= max_nodes || !btree_bitmap_test(data, node_size, child) {
+                continue;
+            }
+            let coff = child as usize * node_size;
+            let cnode = &data[coff..coff + node_size];
+            if BigEndian::read_u16(&cnode[10..12]) == 0 {
+                continue;
+            }
+            let (cs, ce) = btree_record_range(cnode, node_size, 0);
+            let wanted = kf.make_index_key(&kf.key_portion(&cnode[cs..ce]));
+            let order = cmp(&node[s..e - 4], &wanted);
+            if order != Ordering::Equal {
+                stale.push((idx, r, child, order));
+            }
+        }
+    }
+    stale
+}
+
+/// Take an emptied leaf out of the tree: unlink it from its siblings and the
+/// header, free its node, drop its separator and, when it was the last leaf,
+/// retire the root. Apple's fsck calls a lone empty leaf "Invalid node
+/// structure"; an empty tree is depth 0 with no root. Returns nodes freed.
+pub fn btree_retire_empty_leaf<F>(
+    data: &mut [u8],
+    node_size: usize,
+    node_idx: u32,
+    kf: &BTreeKeyFormat,
+    cmp: &F,
+) -> Result<u32, FilesystemError>
+where
+    F: Fn(&[u8], &[u8]) -> Ordering,
+{
+    let off = node_idx as usize * node_size;
+    if off + node_size > data.len() || BigEndian::read_u16(&data[off + 10..off + 12]) != 0 {
+        return Ok(0);
+    }
+    let flink = BigEndian::read_u32(&data[off..off + 4]);
+    let blink = BigEndian::read_u32(&data[off + 4..off + 8]);
+    if blink != 0 {
+        let b = blink as usize * node_size;
+        BigEndian::write_u32(&mut data[b..b + 4], flink);
+    }
+    if flink != 0 {
+        let f = flink as usize * node_size;
+        BigEndian::write_u32(&mut data[f + 4..f + 8], blink);
+    }
+    let mut h = BTreeHeader::read(data);
+    if h.first_leaf_node == node_idx {
+        h.first_leaf_node = flink;
+    }
+    if h.last_leaf_node == node_idx {
+        h.last_leaf_node = blink;
+    }
+    h.free_nodes += 1;
+    h.write(data);
+    btree_free_node(data, node_size, node_idx);
+    let freed = btree_detach_freed_node_and_refresh(data, node_size, node_idx, kf, cmp)?;
+    Ok(freed + 1)
+}
+
+/// Leaves with no records and no siblings. Apple retires such a tree instead,
+/// and fsck_hfs reports one as "Invalid node structure".
+pub fn btree_lonely_empty_leaves(data: &[u8], node_size: usize) -> Vec<u32> {
+    let mut lonely = Vec::new();
+    if node_size == 0 || data.len() < node_size {
+        return lonely;
+    }
+    let max_nodes = (data.len() / node_size) as u32;
+    for idx in 1..max_nodes {
+        if !btree_bitmap_test(data, node_size, idx) {
+            continue;
+        }
+        let off = idx as usize * node_size;
+        let node = &data[off..off + node_size];
+        if node[8] as i8 == BTREE_LEAF_NODE
+            && BigEndian::read_u16(&node[10..12]) == 0
+            && BigEndian::read_u32(&node[0..4]) == 0
+            && BigEndian::read_u32(&node[4..8]) == 0
+        {
+            lonely.push(idx);
+        }
+    }
+    lonely
+}
+
+/// Free a node in the B-tree node bitmap: clears the bit and erases the node,
+/// as fsck_hfs demands of every unused node ("Unused node is not erased").
 pub fn btree_free_node(catalog_data: &mut [u8], node_size: usize, node_idx: u32) {
     let segs = btree_bitmap_segments(catalog_data, node_size);
     let Some((idx, local)) = locate_bit_in_segments(&segs, node_idx) else {
@@ -1184,6 +1565,30 @@ pub fn btree_free_node(catalog_data: &mut [u8], node_size: usize, node_idx: u32)
         &mut catalog_data[seg.byte_off..seg.byte_off + seg.len],
         local,
     );
+    let off = node_idx as usize * node_size;
+    if node_idx != 0 && off + node_size <= catalog_data.len() {
+        catalog_data[off..off + node_size].fill(0);
+    }
+}
+
+/// Free nodes that still hold data; Apple erases a node when it frees it and
+/// fsck_hfs reports one that is not ("Unused node is not erased").
+pub fn btree_unerased_free_nodes(data: &[u8], node_size: usize) -> Vec<u32> {
+    let mut dirty = Vec::new();
+    if node_size == 0 || data.len() < node_size {
+        return dirty;
+    }
+    let max_nodes = (data.len() / node_size) as u32;
+    for idx in 1..max_nodes {
+        if btree_bitmap_test(data, node_size, idx) {
+            continue;
+        }
+        let off = idx as usize * node_size;
+        if data[off..off + node_size].iter().any(|&b| b != 0) {
+            dirty.push(idx);
+        }
+    }
+    dirty
 }
 
 /// Clear a node's bit in the bitmap. Segment-aware (handles map nodes).
@@ -1211,6 +1616,40 @@ pub fn btree_bitmap_set(catalog_data: &mut [u8], node_size: usize, node_idx: u32
         &mut catalog_data[seg.byte_off..seg.byte_off + seg.len],
         local,
     );
+}
+
+/// Index of the last node in a B-tree's map-node chain (`header.fLink` →
+/// mapNode → … → 0), or 0 when the chain is empty (so the caller links the
+/// first map node via the header node at index 0). Cycle-guarded.
+pub fn btree_map_chain_tail(buf: &[u8], node_size: usize) -> u32 {
+    let mut next = BigEndian::read_u32(&buf[0..4]); // header.fLink
+    let mut last = 0u32;
+    let mut guard = 0;
+    while next != 0 && guard < 1_000_000 {
+        last = next;
+        let off = next as usize * node_size;
+        if off + 4 > buf.len() {
+            break;
+        }
+        next = BigEndian::read_u32(&buf[off..off + 4]);
+        guard += 1;
+    }
+    last
+}
+
+/// Allocation blocks a B-tree fork of `total_nodes` needs to gain `add_slots`
+/// more nodes. Nodes and blocks need not match one-to-one: several 4 KiB nodes
+/// share an 8 KiB block, and the last block may already have room.
+pub fn btree_grow_blocks(
+    total_nodes: u32,
+    add_slots: u32,
+    node_size: usize,
+    block_size: u32,
+) -> u32 {
+    let node_bytes = node_size as u64;
+    let cur_blocks = (total_nodes as u64 * node_bytes).div_ceil(block_size as u64);
+    let new_blocks = ((total_nodes + add_slots) as u64 * node_bytes).div_ceil(block_size as u64);
+    (new_blocks - cur_blocks) as u32
 }
 
 /// Initialize a node as a map node (BTNodeKind=2): descriptor + one record
@@ -2091,7 +2530,7 @@ where
                 let rec_bytes = &node[start..end];
                 let key = key_extract_fn(rec_bytes);
                 // Child pointer is last 4 bytes of the record
-                let child_ptr = BigEndian::read_u32(&node[end - 4..end]);
+                let child_ptr = index_child_ptr(node, end);
 
                 match compare_fn(key, search_key) {
                     Ordering::Greater => {
@@ -2104,9 +2543,10 @@ where
                 }
             }
             if next_child == 0 && num_records > 0 {
-                // Use the last child
-                let (_, end) = btree_record_range(node, node_size, num_records - 1);
-                next_child = BigEndian::read_u32(&node[end - 4..end]);
+                // Below every separator: the first child, where Mac OS looks.
+                // Descending the last child scattered records out of key order.
+                let (_, end) = btree_record_range(node, node_size, 0);
+                next_child = index_child_ptr(node, end);
             }
             parent_node = current_node;
             current_node = next_child;
@@ -2161,7 +2601,7 @@ where
             }
             // For HFS+ catalog keys, the key is everything up to the last 4 bytes
             let key_portion = &node[start..end - 4];
-            let child_ptr = BigEndian::read_u32(&node[end - 4..end]);
+            let child_ptr = index_child_ptr(node, end);
 
             if compare_fn(key_portion, search_key) != Ordering::Greater {
                 next_child = child_ptr;
@@ -2170,8 +2610,9 @@ where
             }
         }
         if next_child == 0 && num_records > 0 {
-            let (_, end) = btree_record_range(node, node_size, num_records - 1);
-            next_child = BigEndian::read_u32(&node[end - 4..end]);
+            // Same rule as `btree_find_record`: below every separator, first child.
+            let (_, end) = btree_record_range(node, node_size, 0);
+            next_child = index_child_ptr(node, end);
         }
 
         parent_node = current_node;

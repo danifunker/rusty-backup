@@ -57,3 +57,15 @@
 # unchanged — they always asserted the behaviour we wanted, and XPASS is what
 # said so. `mac.fork-roundtrip.control.put-macbinary` was never listed and
 # still passes.
+
+# --- R-043 — every edit verb refuses a dynamic VHD — FIXED 2026-09-01 -------
+# The three `edit.new.*-dynamic-vhd` cases were listed here from 2026-08-25
+# until the fix landed; they assert the behaviour we wanted all along and now
+# pass. See docs/Regression_Bugs.md#r-043.
+
+# --- the 1000-file churn (cases/tier3/churn.toml), 2026-09-05 ----------------
+# Nine entries were listed here on 2026-09-05 (R-061 UFS, R-062 ProDOS,
+# R-063 XFS, F-012 .. F-017 NTFS / ext4 / SFS / Minix / HFS / XFS limits) and
+# every one was fixed or shipped by 2026-09-06, the last being F-017 (XFS
+# leaf and node-form directories). The 24 cases are unchanged — they always
+# asserted the behaviour we wanted, and XPASS is what said so.

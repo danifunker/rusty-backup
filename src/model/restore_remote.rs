@@ -49,6 +49,7 @@ pub fn restore_to_remote(
     is_device: bool,
     progress: Arc<Mutex<RestoreProgress>>,
     scratch_dir: Option<&Path>,
+    overwrite_existing: bool,
 ) -> Result<()> {
     let target_size = config.target_size;
 
@@ -92,7 +93,7 @@ pub fn restore_to_remote(
     set_operation(&progress, "Opening remote target...");
     let (handle, remote_size) = {
         let mut c = lock(&conn)?;
-        c.open_write_target(remote_path, is_device, target_size)?
+        c.open_write_target(remote_path, is_device, target_size, overwrite_existing)?
     };
     if push_len > remote_size {
         let _ = close_block(&conn, handle);

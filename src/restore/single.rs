@@ -9,11 +9,10 @@ use crate::backup::metadata::BackupMetadata;
 use crate::backup::LogLevel;
 use crate::fs::patch_hidden_sectors_for;
 use crate::fs::{
-    resize_btrfs_in_place, resize_exfat_in_place, resize_ext_in_place, resize_fat_in_place,
-    resize_hfs_in_place, resize_hfsplus_in_place, resize_ntfs_in_place, resize_prodos_in_place,
-    validate_btrfs_integrity, validate_exfat_integrity, validate_ext_integrity,
-    validate_fat_integrity, validate_hfs_integrity, validate_hfsplus_integrity,
-    validate_ntfs_integrity, validate_prodos_integrity,
+    resize_hfs_in_place, resize_hfsplus_in_place, validate_btrfs_integrity,
+    validate_exfat_integrity, validate_ext_integrity, validate_fat_integrity,
+    validate_hfs_integrity, validate_hfsplus_integrity, validate_ntfs_integrity,
+    validate_prodos_integrity,
 };
 use crate::os::SectorAlignedWriter;
 use crate::partition::apm::build_minimal_apm;
@@ -125,8 +124,16 @@ pub fn run_single_partition_restore(
 
     // Step 1: Resolve source — determine data size and prepare reader
     set_operation(&progress, "Resolving source...");
-    let (source_data_size, compression_type, compressed_files, backup_folder) = match &config.source
-    {
+    // `header_size` is what the filesystem inside the stream believes it is: a
+    // compacted stream is trimmed but still describes the original volume.
+    let (
+        source_data_size,
+        header_size,
+        verbatim,
+        compression_type,
+        compressed_files,
+        backup_folder,
+    ) = match &config.source {
         SinglePartitionSource::Backup {
             folder,
             partition_index,
@@ -157,8 +164,26 @@ pub fn run_single_partition_restore(
                 ),
             );
 
+            // The recorded checksum is the only defence against a damaged
+            // member, and the target has not been opened yet.
+            set_operation(&progress, "Verifying backup checksum...");
+            crate::backup::verify::verify_partition_member(
+                folder,
+                &metadata.checksum_type,
+                pm,
+                &mut |m| log(&progress, LogLevel::Info, m),
+            )?;
+
+            let header_size = if pm.compacted && !pm.defragmented_clone && pm.imaged_size_bytes > 0
+            {
+                pm.original_size_bytes
+            } else {
+                pm.imaged_size_bytes
+            };
             (
                 pm.imaged_size_bytes,
+                header_size,
+                pm.defragmented_clone,
                 metadata.compression_type.clone(),
                 pm.compressed_files.clone(),
                 Some(folder.clone()),
@@ -189,7 +214,14 @@ pub fn run_single_partition_restore(
             );
 
             // For standalone image files, we treat them as raw data
-            (data_size, "none".to_string(), vec![], None)
+            (
+                data_size,
+                data_size,
+                false,
+                "none".to_string(),
+                vec![],
+                None,
+            )
         }
     };
 
@@ -453,6 +485,7 @@ pub fn run_single_partition_restore(
     }
 
     target.flush()?;
+    target.sync_all()?;
 
     // Step 5: Patch hidden sectors if start LBA changed
     if config.target_start_lba != config.source_start_lba {
@@ -490,12 +523,15 @@ pub fn run_single_partition_restore(
     }
 
     // Step 6: Resize filesystem if target is larger than source
-    if write_size != source_data_size {
+    // A defragmented clone is a complete volume at its imaged size; resizing
+    // it would corrupt it, so a larger window is left zero-padded (as restore does).
+    let needs_resize = !verbatim && write_size != header_size;
+    let alt_header_fixup = !verbatim && !needs_resize && write_size != source_data_size;
+    if needs_resize || alt_header_fixup {
         set_operation(&progress, "Resizing filesystem...");
         let inner_file = target
             .inner_mut()
             .context("failed to access device for resize")?;
-
         let fs_type = detect_partition_fs_type(inner_file, config.target_offset_bytes);
         log(
             &progress,
@@ -503,81 +539,40 @@ pub fn run_single_partition_restore(
             format!(
                 "Resizing {:?} filesystem from {} to {}",
                 fs_type,
-                crate::partition::format_size(source_data_size),
+                crate::partition::format_size(header_size),
                 crate::partition::format_size(write_size),
             ),
         );
-
-        match fs_type {
-            PartitionFsType::Fat => {
-                let new_sectors = (write_size / 512) as u32;
-                resize_fat_in_place(
-                    inner_file,
-                    config.target_offset_bytes,
-                    new_sectors,
-                    &mut |msg| log(&progress, LogLevel::Info, msg),
-                )?;
-            }
-            PartitionFsType::Ntfs => {
-                let new_sectors = write_size / 512;
-                resize_ntfs_in_place(
-                    inner_file,
-                    config.target_offset_bytes,
-                    new_sectors,
-                    &mut |msg| log(&progress, LogLevel::Info, msg),
-                )?;
-            }
-            PartitionFsType::Exfat => {
-                let new_sectors = write_size / 512;
-                resize_exfat_in_place(
-                    inner_file,
-                    config.target_offset_bytes,
-                    new_sectors,
-                    &mut |msg| log(&progress, LogLevel::Info, msg),
-                )?;
-            }
-            PartitionFsType::Hfs => {
-                resize_hfs_in_place(
-                    inner_file,
-                    config.target_offset_bytes,
-                    write_size,
-                    &mut |msg| log(&progress, LogLevel::Info, msg),
-                )?;
-            }
-            PartitionFsType::HfsPlus => {
-                resize_hfsplus_in_place(
-                    inner_file,
-                    config.target_offset_bytes,
-                    write_size,
-                    &mut |msg| log(&progress, LogLevel::Info, msg),
-                )?;
-            }
-            PartitionFsType::Ext => {
-                resize_ext_in_place(
-                    inner_file,
-                    config.target_offset_bytes,
-                    write_size,
-                    &mut |msg| log(&progress, LogLevel::Info, msg),
-                )?;
-            }
-            PartitionFsType::Btrfs => {
-                resize_btrfs_in_place(
-                    inner_file,
-                    config.target_offset_bytes,
-                    write_size,
-                    &mut |msg| log(&progress, LogLevel::Info, msg),
-                )?;
-            }
-            PartitionFsType::ProDos => {
-                resize_prodos_in_place(
-                    inner_file,
-                    config.target_offset_bytes,
-                    write_size,
-                    &mut |msg| log(&progress, LogLevel::Info, msg),
-                )?;
-            }
-            PartitionFsType::Unknown => {}
+        let mut log_cb = |msg: &str| log(&progress, LogLevel::Info, msg);
+        if needs_resize {
+            crate::fs::resize_filesystem_for(
+                inner_file,
+                config.target_offset_bytes,
+                write_size,
+                &mut log_cb,
+            )?;
+        } else {
+            // Trimmed HFS at its original size: only the alternate header in
+            // the zero-filled tail is missing.
+            resize_hfs_in_place(
+                inner_file,
+                config.target_offset_bytes,
+                write_size,
+                &mut log_cb,
+            )?;
+            resize_hfsplus_in_place(
+                inner_file,
+                config.target_offset_bytes,
+                write_size,
+                &mut log_cb,
+            )?;
         }
+    } else if verbatim && write_size != source_data_size {
+        log(
+            &progress,
+            LogLevel::Info,
+            "Defragmented clone: volume bytes left verbatim, tail zero-padded",
+        );
     }
 
     // Step 7: Validate filesystem integrity
@@ -665,6 +660,7 @@ pub fn run_single_partition_restore(
     }
 
     target.flush()?;
+    target.sync_all()?;
     drop(target);
 
     log(
@@ -684,4 +680,180 @@ pub fn run_single_partition_restore(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backup::metadata::{AlignmentMetadata, BackupLayout, PartitionMetadata};
+    use crate::fs::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+    use crate::fs::hfsplus::{create_blank_hfsplus, CompactHfsPlusReader, HfsPlusFilesystem};
+    use std::io::Cursor;
+
+    const MIB: u64 = 1024 * 1024;
+    const ORIGINAL: u64 = 8 * MIB;
+
+    /// A per-partition backup folder holding one compacted (trimmed) HFS+
+    /// partition, exactly as run_backup writes it. Returns the trimmed length.
+    fn compacted_hfsplus_backup(folder: &std::path::Path) -> u64 {
+        let mut img = create_blank_hfsplus(ORIGINAL, 4096, "Trim", false);
+        {
+            let mut hfs = HfsPlusFilesystem::open(Cursor::new(&mut img), 0).unwrap();
+            hfs.prepare_for_edit().unwrap();
+            let root = hfs.root().unwrap();
+            let mut b = Cursor::new(b"beta\n".as_ref());
+            hfs.create_file(&root, "beta.txt", &mut b, 5, &CreateFileOptions::default())
+                .unwrap();
+            hfs.sync_metadata().unwrap();
+        }
+        // The backup trims the layout-preserving stream at the last data byte.
+        let trimmed =
+            crate::fs::effective_partition_size(Cursor::new(img.clone()), 0, 0xAF, None).unwrap();
+        assert!(trimmed < ORIGINAL, "the blank volume must trim: {trimmed}");
+        let (reader, _) = CompactHfsPlusReader::new(Cursor::new(img), 0).unwrap();
+        let mut stream = Vec::new();
+        reader.take(trimmed).read_to_end(&mut stream).unwrap();
+        assert_eq!(stream.len() as u64, trimmed);
+
+        std::fs::create_dir_all(folder).unwrap();
+        let part_path = folder.join("partition-0.raw");
+        std::fs::write(&part_path, &stream).unwrap();
+        let checksum = crate::backup::verify::compute_checksum(
+            &part_path,
+            crate::backup::ChecksumType::Sha256,
+        )
+        .unwrap();
+        std::fs::write(
+            folder.join("partition-0.raw.sha256"),
+            format!("{checksum}  partition-0.raw\n"),
+        )
+        .unwrap();
+        let metadata = BackupMetadata {
+            version: 1,
+            created: "2026-09-02T00:00:00Z".to_string(),
+            source_device: "synthetic".to_string(),
+            source_size_bytes: ORIGINAL + 512,
+            partition_table_type: "MBR".to_string(),
+            checksum_type: "sha256".to_string(),
+            compression_type: "none".to_string(),
+            split_size_mib: None,
+            sector_by_sector: false,
+            layout: BackupLayout::PerPartition,
+            container: None,
+            container_logical_size: None,
+            container_sha1: None,
+            size_policy: None,
+            alignment: AlignmentMetadata {
+                detected_type: "None detected".to_string(),
+                first_partition_lba: 1,
+                alignment_sectors: 1,
+                heads: 0,
+                sectors_per_track: 0,
+            },
+            partitions: vec![PartitionMetadata {
+                index: 0,
+                type_name: "HFS+".to_string(),
+                partition_type_byte: 0xAF,
+                start_lba: 1,
+                start_byte: None,
+                original_size_bytes: ORIGINAL,
+                imaged_size_bytes: trimmed,
+                compressed_files: vec!["partition-0.raw".to_string()],
+                checksum,
+                resized: false,
+                compacted: true,
+                is_logical: false,
+                partition_type_string: None,
+                minimum_size_bytes: Some(trimmed),
+                defragmented_min_size_bytes: None,
+                hfsplus_signature: None,
+                defragmented_clone: false,
+            }],
+            bad_sectors: vec![],
+            extended_container: None,
+        };
+        std::fs::write(
+            folder.join("metadata.json"),
+            serde_json::to_string_pretty(&metadata).unwrap(),
+        )
+        .unwrap();
+        trimmed
+    }
+
+    fn restore_to(folder: &std::path::Path, target: &std::path::Path, size: Option<u64>) {
+        let config = SinglePartitionRestoreConfig {
+            source: SinglePartitionSource::Backup {
+                folder: folder.to_path_buf(),
+                partition_index: 0,
+            },
+            target_path: target.to_path_buf(),
+            target_is_device: false,
+            target_offset_bytes: 0,
+            target_size_bytes: size,
+            target_start_lba: 0,
+            source_start_lba: 1,
+            new_disk: None,
+        };
+        let progress = Arc::new(Mutex::new(RestoreProgress::new()));
+        run_single_partition_restore(config, Arc::clone(&progress)).unwrap_or_else(|e| {
+            let lines: Vec<String> = progress
+                .lock()
+                .unwrap()
+                .log_messages
+                .iter()
+                .map(|m| m.message.clone())
+                .collect();
+            panic!("{e:#}\n{}", lines.join("\n"))
+        });
+    }
+
+    /// BR12: with no target size the trimmed stream was written as-is, so the
+    /// volume header still claimed the original 8 MiB inside a smaller file.
+    #[test]
+    fn a_compacted_hfsplus_partition_restored_at_its_trimmed_size_is_resized() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("backup");
+        let trimmed = compacted_hfsplus_backup(&folder);
+        let target = tmp.path().join("target.img");
+        std::fs::write(&target, vec![0u8; trimmed as usize]).unwrap();
+        restore_to(&folder, &target, None);
+
+        let out = std::fs::read(&target).unwrap();
+        assert_eq!(out.len() as u64, trimmed);
+        let mut hfs = HfsPlusFilesystem::open(Cursor::new(out), 0).unwrap();
+        assert!(
+            hfs.total_size() <= trimmed,
+            "{} > {trimmed}",
+            hfs.total_size()
+        );
+        assert!(
+            hfs.total_size() > trimmed - 64 * 1024,
+            "{}",
+            hfs.total_size()
+        );
+        let root = hfs.root().unwrap();
+        assert!(hfs
+            .list_directory(&root)
+            .unwrap()
+            .iter()
+            .any(|e| e.name == "beta.txt"));
+    }
+
+    /// Restored back at its original size, the trimmed stream is zero-padded
+    /// and needs the alternate volume header rewritten into that tail.
+    #[test]
+    fn a_compacted_hfsplus_partition_restored_at_original_size_gets_its_alternate_header() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("backup");
+        compacted_hfsplus_backup(&folder);
+        let target = tmp.path().join("target.img");
+        std::fs::write(&target, vec![0u8; ORIGINAL as usize]).unwrap();
+        restore_to(&folder, &target, Some(ORIGINAL));
+
+        let out = std::fs::read(&target).unwrap();
+        let alt = ORIGINAL as usize - 1024;
+        assert_eq!(&out[alt..alt + 2], b"H+", "alternate volume header missing");
+        let hfs = HfsPlusFilesystem::open(Cursor::new(out), 0).unwrap();
+        assert_eq!(hfs.total_size(), ORIGINAL);
+    }
 }

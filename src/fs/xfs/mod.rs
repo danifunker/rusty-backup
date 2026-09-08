@@ -479,14 +479,10 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
                 let (_parent, entries) = dir2::parse_shortform(fork, self.sb.has_ftype())?;
                 Ok(entries)
             }
-            DiFormat::Extents => {
-                let fork = self.data_fork(core, inode_buf);
-                let recs = self.decode_inline_extents(fork, core.nextents as usize)?;
+            DiFormat::Extents | DiFormat::Btree => {
+                let recs = self.decode_data_extents(core, inode_buf)?;
                 self.walk_dir2_data_blocks(&recs, dirblksize, core.size)
             }
-            DiFormat::Btree => Err(FilesystemError::Unsupported(
-                "XFS btree-format directory extent map (deferred)".into(),
-            )),
             DiFormat::Other(v) => Err(FilesystemError::Parse(format!(
                 "unknown XFS di_format {v} on directory inode {}",
                 core.ino
@@ -524,10 +520,9 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
                 max_data_fb = end;
             }
         }
-        // dir2 leaf/free address spaces start at 32 GiB / blocksize. We
-        // cap the walk there so a malformed extent list with a leaf-space
-        // entry doesn't make us read garbage.
-        let leaf_first_fb = (1u64 << 32) / bs;
+        // Leaf/free address spaces start at XFS_DIR2_SPACE_SIZE (32 GiB, 1 << 35)
+        // / blocksize; cap the walk there so a leaf-space extent isn't read as data.
+        let leaf_first_fb = (1u64 << 35) / bs;
         let walk_end_fb = max_data_fb.min(leaf_first_fb);
 
         let has_ftype = self.sb.has_ftype();
@@ -1920,14 +1915,8 @@ mod tests {
         ignore = "512 MiB SGI fixture (.to_vec) exhausts the 32-bit address space; runs on 64-bit targets only"
     )]
     fn dir_overflow_converts_block_to_leaf_form() {
-        // §2.1 hole (C): when a single-block directory would overflow on the
-        // next insert, convert it to leaf form — two XD2D data blocks plus an
-        // XD2F leaf1 index block at file offset XFS_DIR2_LEAF_OFFSET. Adding
-        // 150 files (~32 bytes per entry × 150 = ~4800 bytes data + ~1200
-        // bytes leaf = > 4 KiB) to the 4-entry fixture root forces the
-        // conversion mid-sequence. After: di_format is still Extents (leaf
-        // form lives in extents, not bmbt), the inode has 3 extents, all
-        // entries enumerate, originals survive, the volume stays fsck-clean.
+        // Hole (C): 150 files overflow one block (data + leaf tail > 4 KiB), so
+        // the fixture root moves to leaf form and every later insert lands there.
         use crate::fs::filesystem::{CreateFileOptions, EditableFilesystem};
         use std::io::Cursor as IoCursor;
 
@@ -1949,35 +1938,17 @@ mod tests {
                 DiFormat::Local,
                 "root starts short-form"
             );
-            // Add files one at a time until the inserter rejects with the
-            // post-conversion "leaf-form insert not implemented" message
-            // (v1 only supports block→leaf conversion, not further growth).
-            // Stop there — the conversion succeeded and the directory is
-            // now in leaf form holding everything written so far.
-            let mut added = 0u32;
             for i in 0..150u32 {
                 let mut data = IoCursor::new(Vec::<u8>::new());
-                match fs.create_file(
+                fs.create_file(
                     &root,
                     &format!("f{i:04}.b"),
                     &mut data,
                     0,
                     &CreateFileOptions::default(),
-                ) {
-                    Ok(_) => added += 1,
-                    Err(FilesystemError::Unsupported(msg))
-                        if msg.contains("leaf/node-form directory") =>
-                    {
-                        break;
-                    }
-                    Err(e) => panic!("create_file {i}: {e}"),
-                }
+                )
+                .unwrap_or_else(|e| panic!("create_file {i}: {e}"));
             }
-            assert!(
-                added > 100,
-                "expected the block→leaf conversion to absorb at least 100 adds before \
-                 hitting the (not-yet-implemented) leaf-form insert path; got {added}"
-            );
             fs.sync_metadata().expect("sync");
         }
 
@@ -1990,10 +1961,24 @@ mod tests {
             DiFormat::Extents,
             "root should be in extents (leaf or block) form"
         );
+        // Leaf form: the data block run (154 short entries fit one block)
+        // plus the leaf1 block far above it, which di_size does not count.
         assert!(
-            core.nextents >= 3,
-            "leaf-form root should have at least 3 extents (data0, data1, leaf1); got {}",
+            core.nextents >= 2,
+            "leaf-form root should have at least 2 extents (data run, leaf1); got {}",
             core.nextents
+        );
+        let dirblksize = u64::from(fs.sb.dirblksize());
+        let data_blocks = core.size / dirblksize;
+        assert!(
+            data_blocks >= 1 && data_blocks * dirblksize == core.size,
+            "leaf-form di_size is whole data blocks; got {}",
+            core.size
+        );
+        assert!(
+            core.nblocks > core.size / u64::from(fs.sb.blocksize),
+            "di_nblocks counts the leaf1 block on top of the data blocks; got {}",
+            core.nblocks
         );
         let entries = fs.list_directory(&root).expect("list root");
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
@@ -2004,15 +1989,12 @@ mod tests {
                 names.len()
             );
         }
-        // Every file that was successfully created must list back. Count
-        // how many we expect by re-running the same admission loop in dry
-        // form (any name f0000.b..f0149.b that's actually present counts).
         let added_present: usize = (0..150u32)
             .filter(|i| names.contains(&format!("f{i:04}.b").as_str()))
             .count();
-        assert!(
-            added_present > 100,
-            "expected > 100 added files listable from leaf-form dir, got {added_present}"
+        assert_eq!(
+            added_present, 150,
+            "every added file must list back from the leaf-form dir"
         );
         // The volume must remain fsck-clean: data blocks + leaf1 block must
         // form a coherent leaf-form directory.
@@ -2022,6 +2004,80 @@ mod tests {
             "expected clean after leaf-form conversion, got: {:?}",
             res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
         );
+    }
+
+    /// F-017: 600 entries outgrow one leaf1 block (about 500 at 4 KiB) into
+    /// node form; deleting everything shrinks the directory back to short-form.
+    #[test]
+    fn dir_grows_to_node_form_and_shrinks_back_to_short_form() {
+        use crate::fs::filesystem::{
+            CreateDirectoryOptions, CreateFileOptions, EditableFilesystem,
+        };
+        use std::io::Cursor as IoCursor;
+
+        let img = format::create_blank_xfs(32 << 20, "churn").expect("blank v5 volume");
+        let mut cursor = Cursor::new(img);
+        let mut fs = XfsFilesystem::open(&mut cursor, 0).expect("open editable");
+        let root = fs.root().expect("root");
+        let dir = fs
+            .create_directory(&root, "d", &CreateDirectoryOptions::default())
+            .expect("mkdir d");
+        let dirblksize = u64::from(fs.sb.dirblksize());
+        let names: Vec<String> = (1..=600u32).map(|i| format!("f{i:04}.txt")).collect();
+        for name in &names {
+            let mut data = IoCursor::new(name.as_bytes().to_vec());
+            fs.create_file(
+                &dir,
+                name,
+                &mut data,
+                name.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .unwrap_or_else(|e| panic!("create {name}: {e}"));
+        }
+        let core = fs.read_inode(dir.location).expect("dir core");
+        assert_eq!(core.format, DiFormat::Extents);
+        // 602 hash entries need two leafN blocks under a node; 4 data
+        // blocks hold the 24-byte entries; one freeindex block.
+        assert_eq!(core.size, 4 * dirblksize, "di_size = data blocks only");
+        assert_eq!(core.nblocks, 8, "4 data + node + 2 leafN + 1 free");
+        let listed = fs.list_directory(&dir).expect("list");
+        assert_eq!(listed.len(), 600);
+        for name in &names {
+            let entry = listed.iter().find(|e| &e.name == name).expect("listed");
+            let got = fs.read_file(entry, 64).expect("read");
+            assert_eq!(got, name.as_bytes(), "content of {name}");
+        }
+        let res = fs.run_fsck().expect("fsck");
+        assert!(res.errors.is_empty(), "node form: {:?}", res.errors);
+
+        // Delete everything: the rebuild picks the smallest form each time,
+        // ending in a short-form directory with no blocks.
+        for entry in listed {
+            fs.delete_entry(&dir, &entry)
+                .unwrap_or_else(|e| panic!("delete {}: {e}", entry.name));
+        }
+        let core = fs.read_inode(dir.location).expect("dir core");
+        assert_eq!(
+            core.format,
+            DiFormat::Local,
+            "empty dir is short-form again"
+        );
+        assert_eq!(core.nblocks, 0);
+        assert!(fs.list_directory(&dir).expect("list").is_empty());
+        let mut data = IoCursor::new(b"last".to_vec());
+        fs.create_file(
+            &dir,
+            "last.bin",
+            &mut data,
+            4,
+            &CreateFileOptions::default(),
+        )
+        .expect("create last.bin");
+        fs.sync_metadata().expect("sync");
+        let res = fs.run_fsck().expect("fsck");
+        assert!(res.errors.is_empty(), "after churn: {:?}", res.errors);
+        assert_eq!(fs.list_directory(&dir).expect("list").len(), 1);
     }
 
     #[test]

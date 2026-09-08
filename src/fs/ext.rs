@@ -143,7 +143,7 @@ pub(crate) struct FsckInode {
     pub(crate) block: [u8; 60],
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 struct InodeData {
     mode: u32,
     uid: u32,
@@ -1503,6 +1503,35 @@ impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
     }
 
     /// Free a list of blocks back to the filesystem.
+    /// Take block `blk` when it is free; false when it is in use or off the volume.
+    fn allocate_block_at(&mut self, blk: u64) -> Result<bool, FilesystemError> {
+        if blk < self.first_data_block as u64 || blk >= self.total_blocks {
+            return Ok(false);
+        }
+        let blocks_per_group =
+            (self.total_blocks - self.first_data_block as u64).div_ceil(self.group_count as u64);
+        let group = ((blk - self.first_data_block as u64) / blocks_per_group) as u32;
+        if group >= self.group_count || self.group_descriptors[group as usize].free_blocks == 0 {
+            return Ok(false);
+        }
+        let group_start = self.first_data_block as u64 + group as u64 * blocks_per_group;
+        let bit = blk - group_start;
+        let mut bitmap = self.read_block_bitmap(group as usize)?;
+        if bit / 8 >= bitmap.len() as u64 || bitmap[(bit / 8) as usize] & (1 << (bit % 8)) != 0 {
+            return Ok(false);
+        }
+        bitmap_set_bit(&mut bitmap, bit);
+        self.group_descriptors[group as usize].free_blocks -= 1;
+        self.free_blocks -= 1;
+        self.write_block(self.group_descriptors[group as usize].block_bitmap, &bitmap)?;
+        self.group_descriptors[group as usize].flags &= !0x0002; // ~BLOCK_UNINIT
+        self.write_group_descriptor(
+            group as usize,
+            &self.group_descriptors[group as usize].clone(),
+        )?;
+        Ok(true)
+    }
+
     fn free_blocks_list(&mut self, blocks: &[u64]) -> Result<(), FilesystemError> {
         if blocks.is_empty() {
             return Ok(());
@@ -1689,10 +1718,14 @@ impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
             }
         }
 
-        // No space found — allocate a new block for the directory
+        // No space found — allocate a new block for the directory, next to its
+        // last one when that block is free so the directory stays one extent.
         let parent_group = (parent_inode - 1) / self.inodes_per_group;
-        let new_blocks = self.allocate_blocks(1, parent_group)?;
-        let new_block = new_blocks[0];
+        let after = data_blocks.iter().rev().find(|&&b| b != 0).map(|&b| b + 1);
+        let new_block = match after {
+            Some(b) if self.allocate_block_at(b)? => b,
+            _ => self.allocate_blocks(1, parent_group)?[0],
+        };
 
         // Initialize new directory block with a single entry spanning the usable
         // area (all but the metadata_csum tail).
@@ -1994,14 +2027,154 @@ impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
                 return Ok(());
             }
 
-            return Err(FilesystemError::Unsupported(
-                "ext4: extent tree splitting not yet supported for editing".into(),
-            ));
+            // Inline slots full: the four extents move to a leaf block and the
+            // inode keeps one index entry (depth 1), as the kernel does (F-013).
+            let group = (inode_num - 1) / self.inodes_per_group;
+            let leaf_block = self.allocate_blocks(1, group)?[0];
+            let mut leaf = vec![0u8; self.block_size as usize];
+            let max = ((self.block_size as usize - 12) / 12) as u16;
+            leaf[0..2].copy_from_slice(&EXT4_EXT_MAGIC.to_le_bytes());
+            leaf[2..4].copy_from_slice(&header.entries.to_le_bytes());
+            leaf[4..6].copy_from_slice(&max.to_le_bytes());
+            let used = 12 + header.entries as usize * 12;
+            leaf[12..used].copy_from_slice(&inode.block[12..used]);
+            self.write_extent_leaf(inode_num, leaf_block, &mut leaf)?;
+            let mut new_iblock = [0u8; 60];
+            new_iblock[0..2].copy_from_slice(&EXT4_EXT_MAGIC.to_le_bytes());
+            new_iblock[2..4].copy_from_slice(&1u16.to_le_bytes());
+            new_iblock[4..6].copy_from_slice(&4u16.to_le_bytes());
+            new_iblock[6..8].copy_from_slice(&1u16.to_le_bytes());
+            new_iblock[12..16].copy_from_slice(&le32(&inode.block, 12).to_le_bytes());
+            new_iblock[16..20].copy_from_slice(&(leaf_block as u32).to_le_bytes());
+            new_iblock[20..22].copy_from_slice(&((leaf_block >> 32) as u16).to_le_bytes());
+            self.patch_inode_block_field(inode_num, &new_iblock)?;
+            self.adjust_inode_sectors(inode_num, (self.block_size / 512) as i64)?;
+            let moved = InodeData {
+                block: new_iblock,
+                ..*inode
+            };
+            return self.add_block_to_extent_inode(inode_num, new_block, &moved);
         }
 
-        Err(FilesystemError::Unsupported(
-            "ext4: deep extent tree editing not yet supported".into(),
-        ))
+        if header.depth != 1 {
+            return Err(FilesystemError::Unsupported(
+                "ext4: deep extent tree editing not yet supported".into(),
+            ));
+        }
+        // Depth 1: the last leaf takes the block, or a new leaf does.
+        let indices = parse_extent_indices(&inode.block, header.entries);
+        let last = indices.last().ok_or_else(|| {
+            FilesystemError::InvalidData("ext4: depth-1 extent tree with no index".into())
+        })?;
+        let mut leaf = self.read_block(last.child_block)?;
+        let lh = parse_extent_header(&leaf)?;
+        let max = u16::from_le_bytes([leaf[4], leaf[5]]);
+        if lh.entries > 0 {
+            let off = 12 + (lh.entries as usize - 1) * 12;
+            let ext_logical = le32(&leaf, off);
+            let ext_len = u16::from_le_bytes([leaf[off + 4], leaf[off + 5]]);
+            let ext_phys = (u16::from_le_bytes([leaf[off + 6], leaf[off + 7]]) as u64) << 32
+                | le32(&leaf, off + 8) as u64;
+            if ext_logical + ext_len as u32 == logical_block
+                && ext_phys + ext_len as u64 == new_block
+                && ext_len < 32768
+            {
+                leaf[off + 4..off + 6].copy_from_slice(&(ext_len + 1).to_le_bytes());
+                return self.write_extent_leaf(inode_num, last.child_block, &mut leaf);
+            }
+        }
+        if lh.entries < max {
+            let off = 12 + lh.entries as usize * 12;
+            write_extent(&mut leaf[off..off + 12], logical_block, new_block);
+            leaf[2..4].copy_from_slice(&(lh.entries + 1).to_le_bytes());
+            return self.write_extent_leaf(inode_num, last.child_block, &mut leaf);
+        }
+        // This leaf is full: a fresh one under the next inline index slot.
+        if header.entries >= 4 {
+            return Err(FilesystemError::Unsupported(
+                "ext4: extent tree needs a second index level, which is not yet supported".into(),
+            ));
+        }
+        let group = (inode_num - 1) / self.inodes_per_group;
+        let leaf_block = self.allocate_blocks(1, group)?[0];
+        let mut fresh = vec![0u8; self.block_size as usize];
+        fresh[0..2].copy_from_slice(&EXT4_EXT_MAGIC.to_le_bytes());
+        fresh[2..4].copy_from_slice(&1u16.to_le_bytes());
+        fresh[4..6].copy_from_slice(&max.to_le_bytes());
+        write_extent(&mut fresh[12..24], logical_block, new_block);
+        self.write_extent_leaf(inode_num, leaf_block, &mut fresh)?;
+        let mut new_iblock = inode.block;
+        let off = 12 + header.entries as usize * 12;
+        new_iblock[off..off + 4].copy_from_slice(&logical_block.to_le_bytes());
+        new_iblock[off + 4..off + 8].copy_from_slice(&(leaf_block as u32).to_le_bytes());
+        new_iblock[off + 8..off + 10].copy_from_slice(&((leaf_block >> 32) as u16).to_le_bytes());
+        new_iblock[2..4].copy_from_slice(&(header.entries + 1).to_le_bytes());
+        self.patch_inode_block_field(inode_num, &new_iblock)?;
+        self.adjust_inode_sectors(inode_num, (self.block_size / 512) as i64)
+    }
+
+    /// Write an extent leaf / index block, sealing its checksum tail on
+    /// metadata_csum volumes.
+    fn write_extent_leaf(
+        &mut self,
+        inode_num: u32,
+        block: u64,
+        data: &mut [u8],
+    ) -> Result<(), FilesystemError> {
+        if self.metadata_csum {
+            let generation = self.inode_generation(inode_num)?;
+            let seed = super::ext_csum::inode_seed(self.csum_seed, inode_num, generation);
+            super::ext_csum::stamp_extent_block_csum(seed, data);
+        }
+        self.write_block(block, data)
+    }
+
+    /// Add `delta` 512-byte sectors to an inode's `i_blocks` (an index block
+    /// counts, the way the kernel counts it).
+    fn adjust_inode_sectors(&mut self, inode_num: u32, delta: i64) -> Result<(), FilesystemError> {
+        let group = (inode_num - 1) / self.inodes_per_group;
+        let index = (inode_num - 1) % self.inodes_per_group;
+        let gd = &self.group_descriptors[group as usize];
+        let offset = self.partition_offset
+            + gd.inode_table * self.block_size
+            + index as u64 * self.inode_size as u64
+            + 0x1C;
+        let mut lo = [0u8; 4];
+        self.reader.seek(SeekFrom::Start(offset))?;
+        self.reader.read_exact(&mut lo)?;
+        let sectors = (u32::from_le_bytes(lo) as i64 + delta).max(0) as u32;
+        self.reader.seek(SeekFrom::Start(offset))?;
+        self.reader.write_all(&sectors.to_le_bytes())?;
+        self.reseal_inode_csum(inode_num)
+    }
+
+    /// The index blocks of an inode's extent tree (none at depth 0).
+    fn extent_index_blocks(&mut self, inode: &InodeData) -> Result<Vec<u64>, FilesystemError> {
+        let mut out = Vec::new();
+        if inode.flags & EXT4_EXTENTS_FL == 0 || !is_extent_header(&inode.block) {
+            return Ok(out);
+        }
+        let header = parse_extent_header(&inode.block)?;
+        if header.depth == 0 {
+            return Ok(out);
+        }
+        let mut pending: Vec<u64> = parse_extent_indices(&inode.block, header.entries)
+            .into_iter()
+            .map(|i| i.child_block)
+            .collect();
+        while let Some(b) = pending.pop() {
+            out.push(b);
+            let data = self.read_block(b)?;
+            let h = parse_extent_header(&data)?;
+            if h.depth > 0 {
+                pending.extend(
+                    parse_extent_indices(&data, h.entries)
+                        .into_iter()
+                        .map(|i| i.child_block),
+                );
+            }
+        }
+        Ok(out)
     }
 
     /// Patch just the i_block field (60 bytes at offset 0x28) in an on-disk inode.
@@ -2123,12 +2296,6 @@ impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
         }
 
         Ok(iblock)
-    }
-
-    /// Get all data block numbers for an inode (for freeing on delete).
-    fn get_inode_data_blocks(&mut self, inode_num: u32) -> Result<Vec<u64>, FilesystemError> {
-        let inode = self.read_inode(inode_num)?;
-        self.inode_data_blocks(&inode)
     }
 }
 
@@ -2345,9 +2512,11 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExtFilesystem<R> {
         // Remove directory entry from parent
         self.remove_dir_entry(parent_inode, &entry.name)?;
 
-        // Free data blocks
-        let data_blocks = self.get_inode_data_blocks(entry_inode)?;
-        let non_zero: Vec<u64> = data_blocks.into_iter().filter(|&b| b != 0).collect();
+        // Free data blocks, and the extent tree's own index blocks with them.
+        let victim = self.read_inode(entry_inode)?;
+        let data_blocks = self.inode_data_blocks(&victim)?;
+        let mut non_zero: Vec<u64> = data_blocks.into_iter().filter(|&b| b != 0).collect();
+        non_zero.extend(self.extent_index_blocks(&victim)?);
         self.free_blocks_list(&non_zero)?;
 
         // If directory, decrement parent's link count and the group's dir count.
@@ -2580,6 +2749,14 @@ fn parse_extent_header(data: &[u8]) -> Result<ExtentHeader, FilesystemError> {
     let entries = u16::from_le_bytes([data[2], data[3]]);
     let depth = u16::from_le_bytes([data[6], data[7]]);
     Ok(ExtentHeader { entries, depth })
+}
+
+/// Write one `ext4_extent` (12 bytes) describing a single block.
+fn write_extent(slot: &mut [u8], logical: u32, physical: u64) {
+    slot[0..4].copy_from_slice(&logical.to_le_bytes());
+    slot[4..6].copy_from_slice(&1u16.to_le_bytes());
+    slot[6..8].copy_from_slice(&((physical >> 32) as u16).to_le_bytes());
+    slot[8..12].copy_from_slice(&(physical as u32).to_le_bytes());
 }
 
 fn parse_extent_leaves(data: &[u8], count: u16) -> Vec<u64> {
@@ -5151,6 +5328,55 @@ impl<R: Read + Seek> Read for CompactExtReader<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F-013: files allocated between a directory's blocks keep it from
+    /// staying one extent; past four extents the tree gains a level, the
+    /// directory still lists, and emptying it gives every block back.
+    #[test]
+    fn directory_extent_tree_grows_a_level_and_frees_it() {
+        use super::super::filesystem::{
+            CreateDirectoryOptions, CreateFileOptions, EditableFilesystem,
+        };
+        let img = crate::fs::ext_format::create_blank_ext4(64 * 1024 * 1024, "Churn").unwrap();
+        let mut fs = ExtFilesystem::open(Cursor::new(img), 0).unwrap();
+        let root = fs.root().unwrap();
+        let free0 = fs.free_blocks;
+        let dir = fs
+            .create_directory(&root, "d", &CreateDirectoryOptions::default())
+            .unwrap();
+        for i in 0..1000 {
+            let name = format!("f{i:04}.txt");
+            fs.create_file(
+                &dir,
+                &name,
+                &mut &b"x"[..],
+                1,
+                &CreateFileOptions::default(),
+            )
+            .unwrap_or_else(|e| panic!("creating {name}: {e}"));
+        }
+        let ino = fs.read_inode(dir.location as u32).unwrap();
+        let header = parse_extent_header(&ino.block).unwrap();
+        assert_eq!(
+            header.depth, 1,
+            "the directory's extent tree never grew a level"
+        );
+        let kids = fs.list_directory(&dir).unwrap();
+        assert_eq!(kids.len(), 1000);
+        for e in &kids {
+            fs.delete_entry(&dir, e)
+                .unwrap_or_else(|e2| panic!("rm {}: {e2}", e.name));
+        }
+        assert!(fs.list_directory(&dir).unwrap().is_empty());
+        fs.delete_entry(&root, &dir).unwrap();
+        fs.sync_metadata().unwrap();
+        assert_eq!(
+            fs.free_blocks, free0,
+            "the directory's blocks and index block came back"
+        );
+        let report = fs.fsck().expect("ext has fsck").unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+    }
     use std::io::Cursor;
 
     /// Build a minimal ext2 superblock for testing.

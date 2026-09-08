@@ -974,6 +974,26 @@ Usage: mkdir [OPTIONS] <IMAGE> <PATH>
 
 - `-L` / `--literal` — Accepted for consistency with `ls`/`get`/`rm`; `mkdir` always treats the path as an exact literal path (it never globs), so glob metacharacters in a name are used verbatim with or without it
 
+### `mv`
+
+Rename a file or directory in place inside a filesystem
+
+```
+Usage: mv [OPTIONS] <IMAGE> <SRC> <DST>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image reference (`path` or `path@N` for the 1-based partition index)
+- `<SRC>` — Path of the entry to rename. Always literal (never a glob). A literal `/` in a name is written `\/`; on HFS / HFS+ a `:`-separated path also works
+- `<DST>` — The new name, or a full path inside the same directory as SRC. The entry keeps its contents, dates and attributes; only its name changes. Moving between directories is not supported
+
+**Options**
+
+- `-L` / `--literal` — Accepted for consistency with `ls`/`get`/`rm`; `mv` always treats both paths as exact literal paths (it never globs)
+- `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zxplus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
+- `--carve-full` — Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga "NDOS" disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem
+
 ### `new`
 
 Create a blank image, grouped by media class: `new floppy <fs>`, `new volume <fs>` (bare superfloppy), or `new hd {x68k|sgi-efs}` (partition-table-wrapped, bootable). CD-ROM images are under `optical new`; multi-partition images go through `batch`
@@ -1023,7 +1043,7 @@ Usage: apm [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
 
 **Arguments**
 
-- `<IMAGE>` — Image file to create
+- `<IMAGE>` — Image file to create. A `.vhd` name gets a fixed-VHD footer, so Windows Disk Management and Hyper-V attach the file as it is
 
 **Options**
 
@@ -1044,7 +1064,7 @@ Usage: atari [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
 
 **Arguments**
 
-- `<IMAGE>` — Image file to create
+- `<IMAGE>` — Image file to create. A `.vhd` name gets a fixed-VHD footer, so Windows Disk Management and Hyper-V attach the file as it is
 
 **Options**
 
@@ -1065,7 +1085,7 @@ Usage: gpt [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
 
 **Arguments**
 
-- `<IMAGE>` — Image file to create
+- `<IMAGE>` — Image file to create. A `.vhd` name gets a fixed-VHD footer, so Windows Disk Management and Hyper-V attach the file as it is
 
 **Options**
 
@@ -1086,7 +1106,7 @@ Usage: mbr [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
 
 **Arguments**
 
-- `<IMAGE>` — Image file to create
+- `<IMAGE>` — Image file to create. A `.vhd` name gets a fixed-VHD footer, so Windows Disk Management and Hyper-V attach the file as it is
 
 **Options**
 
@@ -1096,6 +1116,29 @@ Usage: mbr [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
 - `--filesystem` — Embed an Amiga filesystem handler in the RDB, `DOSTYPE=PATH`, repeatable. PATH is the handler's AmigaDOS load file (`L:SmartFilesystem`, `L:PFS3`). A DosType with no ROM handler needs this to mount unaided: the strap loads it from the RDB. RDB only
 - `--align` — Alignment for partition starts. Default 1 MiB; use 63s for DOS-era cylinder alignment on vintage machines
 - `--force` — Overwrite `image` if it already exists
+
+### `new hd next`
+
+NeXT disk label (NeXTSTEP / OPENSTEP, black m68k hardware and NeXTSTEP/Intel), with the partitions you name. Four checksummed copies at 512-byte blocks 0/15/30/45; partitions are counted in the label's own 1024-byte sectors, so `--sectors` is in those units. Fill a partition with a volume from `new volume ufs-43bsd` -- the 4.4BSD `new volume ufs` parses but NeXTSTEP cannot read its directories
+
+```
+Usage: next [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image file to create. A `.vhd` name gets a fixed-VHD footer, so Windows Disk Management and Hyper-V attach the file as it is
+
+**Options**
+
+- `--size` — Total disk size (accepts `K`/`M`/`G` suffixes)
+- `--partition` — A partition, repeatable, in disk order: `SIZE[:TYPE[:NAME]]`. SIZE accepts `K`/`M`/`G`, or `rest` for the remaining space (once). TYPE is a value from `partmap types`; NAME is APM/GPT only
+- `--fill` — Pour an image into a partition as it is created: `N=PATH`, 1-based, repeatable. Any format the engine can read is decoded on the way in
+- `--filesystem` — Embed an Amiga filesystem handler in the RDB, `DOSTYPE=PATH`, repeatable. PATH is the handler's AmigaDOS load file (`L:SmartFilesystem`, `L:PFS3`). A DosType with no ROM handler needs this to mount unaided: the strap loads it from the RDB. RDB only
+- `--align` — Alignment for partition starts. Default 1 MiB; use 63s for DOS-era cylinder alignment on vintage machines
+- `--force` — Overwrite `image` if it already exists
+- `--heads` — Disk geometry: heads. These tables place partitions on cylinder boundaries, so the geometry sets the default alignment
+- `--sectors` — Disk geometry: sectors per track
 
 ### `new hd rdb`
 
@@ -1107,7 +1150,7 @@ Usage: rdb [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
 
 **Arguments**
 
-- `<IMAGE>` — Image file to create
+- `<IMAGE>` — Image file to create. A `.vhd` name gets a fixed-VHD footer, so Windows Disk Management and Hyper-V attach the file as it is
 
 **Options**
 
@@ -1130,7 +1173,30 @@ Usage: sgi [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
 
 **Arguments**
 
-- `<IMAGE>` — Image file to create
+- `<IMAGE>` — Image file to create. A `.vhd` name gets a fixed-VHD footer, so Windows Disk Management and Hyper-V attach the file as it is
+
+**Options**
+
+- `--size` — Total disk size (accepts `K`/`M`/`G` suffixes)
+- `--partition` — A partition, repeatable, in disk order: `SIZE[:TYPE[:NAME]]`. SIZE accepts `K`/`M`/`G`, or `rest` for the remaining space (once). TYPE is a value from `partmap types`; NAME is APM/GPT only
+- `--fill` — Pour an image into a partition as it is created: `N=PATH`, 1-based, repeatable. Any format the engine can read is decoded on the way in
+- `--filesystem` — Embed an Amiga filesystem handler in the RDB, `DOSTYPE=PATH`, repeatable. PATH is the handler's AmigaDOS load file (`L:SmartFilesystem`, `L:PFS3`). A DosType with no ROM handler needs this to mount unaided: the strap loads it from the RDB. RDB only
+- `--align` — Alignment for partition starts. Default 1 MiB; use 63s for DOS-era cylinder alignment on vintage machines
+- `--force` — Overwrite `image` if it already exists
+- `--heads` — Disk geometry: heads. These tables place partitions on cylinder boundaries, so the geometry sets the default alignment
+- `--sectors` — Disk geometry: sectors per track
+
+### `new hd sgi-dklabel`
+
+SGI disk label (IRIS 2000 / 3000) -- the pre-IRIX scheme an IRIS 3130 boots from, with eight slots you size and give a role (root / swap / boot / slice). Cylinder-aligned from `--heads` / `--sectors`; the slots come out empty, so format them with `new volume efs-v1` and `write --partition N`. IRIX 3.x needs a `swap` slot to boot
+
+```
+Usage: sgi-dklabel [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image file to create. A `.vhd` name gets a fixed-VHD footer, so Windows Disk Management and Hyper-V attach the file as it is
 
 **Options**
 
@@ -1171,6 +1237,29 @@ Usage: sgi-efs [OPTIONS] <IMAGE>
 - `--inodes` — Approximate total inode count for the EFS root. The formatter scales the cylinder groups to hit roughly this many inodes. Mutually exclusive with `--bytes-per-inode`. When neither is given the density is ~1 inode/4 KiB
 - `--bytes-per-inode` — EFS inode density, in bytes per inode (smaller = more inodes). Floored at one inode per 512-byte block. Mutually exclusive with `--inodes`
 
+### `new hd solaris-x86`
+
+Solaris x86: an MBR whose one Solaris partition holds a 16-slice VTOC in its second sector, with the slice tags you name. Cylinder-aligned; slices 2 / 8 / 9 are the label's own backup, boot and alternates
+
+```
+Usage: solaris-x86 [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image file to create. A `.vhd` name gets a fixed-VHD footer, so Windows Disk Management and Hyper-V attach the file as it is
+
+**Options**
+
+- `--size` — Total disk size (accepts `K`/`M`/`G` suffixes)
+- `--partition` — A partition, repeatable, in disk order: `SIZE[:TYPE[:NAME]]`. SIZE accepts `K`/`M`/`G`, or `rest` for the remaining space (once). TYPE is a value from `partmap types`; NAME is APM/GPT only
+- `--fill` — Pour an image into a partition as it is created: `N=PATH`, 1-based, repeatable. Any format the engine can read is decoded on the way in
+- `--filesystem` — Embed an Amiga filesystem handler in the RDB, `DOSTYPE=PATH`, repeatable. PATH is the handler's AmigaDOS load file (`L:SmartFilesystem`, `L:PFS3`). A DosType with no ROM handler needs this to mount unaided: the strap loads it from the RDB. RDB only
+- `--align` — Alignment for partition starts. Default 1 MiB; use 63s for DOS-era cylinder alignment on vintage machines
+- `--force` — Overwrite `image` if it already exists
+- `--heads` — Disk geometry: heads. These tables place partitions on cylinder boundaries, so the geometry sets the default alignment
+- `--sectors` — Disk geometry: sectors per track
+
 ### `new hd sun`
 
 Sun disk label (SMI VTOC) for SPARC Solaris / SunOS, with slices you size and tag yourself. Cylinder-aligned from `--heads` / `--sectors`; slice 2 is reserved for the whole-disk "backup" alias
@@ -1181,7 +1270,7 @@ Usage: sun [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
 
 **Arguments**
 
-- `<IMAGE>` — Image file to create
+- `<IMAGE>` — Image file to create. A `.vhd` name gets a fixed-VHD footer, so Windows Disk Management and Hyper-V attach the file as it is
 
 **Options**
 
@@ -1226,7 +1315,7 @@ Usage: x68k-table [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
 
 **Arguments**
 
-- `<IMAGE>` — Image file to create
+- `<IMAGE>` — Image file to create. A `.vhd` name gets a fixed-VHD footer, so Windows Disk Management and Hyper-V attach the file as it is
 
 **Options**
 
@@ -1253,8 +1342,9 @@ Usage: volume [OPTIONS] <FS> <IMAGE>
 **Options**
 
 - `--size` — Volume size (bytes or `K`/`M`/`G` suffixes). Defaults to 800K
-- `--name` — Volume label/name. Defaults to `rusty-backup`
-- `--block-size` — HFS/HFS+ allocation block size in bytes (multiple of 512). Auto when unset
+- `--name` — Volume label/name. Defaults to `rusty-backup`. Ignored by the filesystems with no label field, among them 4.3BSD UFS
+- `--block-size` — HFS/HFS+ allocation block size in bytes (multiple of 512). On `--fs bfs` this is the BFS block size (power of two, 1024..=8192); on `--fs ufs` it is `fs_bsize`, and the fragment is an eighth of it. Auto when unset
+- `--big-endian` — BFS and UFS: write the big-endian byte order (BeOS/PPC; SPARC / m68k / MIPS) instead of the little-endian default. Implied by `ufs-43bsd`, since every NeXT disk is big-endian
 - `--catalog-size` — HFS Catalog B-tree initial size in bytes. Auto when unset
 - `--extents-size` — HFS Extents-overflow B-tree initial size in bytes. Auto when unset
 - `--case-sensitive` — HFS+ only: format a case-sensitive (HFSX) volume
@@ -1262,7 +1352,7 @@ Usage: volume [OPTIONS] <FS> <IMAGE>
 - `--fat32` — FAT only: format FAT32 regardless of size. Without this the type is picked from the capacity and only reaches FAT32 above 2 GiB, which cannot express an EFI System Partition - FAT32, and usually 100-512 MiB
 - `--affs-variant` — AFFS variant byte (0=OFS, 1=FFS, 2=OFS+intl, 3=FFS+intl, 4=OFS+dircache, 5=FFS+dircache). Defaults to 1 (FFS)
 - `--inodes` — EFS only: approximate total inode count. Mutually exclusive with `--bytes-per-inode`
-- `--bytes-per-inode` — EFS only: inode density in bytes per inode (smaller = more inodes)
+- `--bytes-per-inode` — EFS and UFS: inode density in bytes per inode (smaller = more inodes). UFS defaults to one inode per 4 fragments, as `newfs -i` does
 - `--cluster-size` — NTFS only: cluster (allocation unit) size, e.g. `4K`, `64K`. Auto when unset
 - `--sector-size` — NTFS only: bytes per sector — 512, 1024, 2048 or 4096. Defaults to 512
 
@@ -1675,7 +1765,7 @@ Usage: put [OPTIONS] <IMAGE> [HOST_FILE] [DST]
 **Options**
 
 - `-L` / `--literal` — Accepted for consistency with `ls`/`get`/`rm`; `put` always treats the destination as an exact literal path (it never globs), so glob metacharacters in a name are used verbatim with or without it
-- `--zero` — Pre-allocate N zero bytes instead of copying a host file. Pair with `--dst`
+- `--zero` — Pre-allocate N zero bytes instead of copying a host file. Pair with `--dst`; a `{A..B}` range in its last component makes one file per number
 - `--dst` — Explicit destination flag; use this with `--zero` where the positional `DST` slot is awkward
 - `--boot` — Write the 1024-byte boot-block region of the image verbatim. HFS-only today
 - `--boot-from` — Copy the 1024-byte boot-block region from a donor disk that already boots (`path` or `path@N`), instead of from a raw file. The donor's classic-HFS volume is auto-located (flat `.hfv`/`.dsk` at byte 0, or an `Apple_HFS` partition) and its `'LK'` signature validated. The region is written to the *target partition's* first sector, so this works on a flat HFV and on the HFS partition of a full (APM) disk alike — target the HFS partition with `IMG@N` (the DDR / partition map / drivers ahead of it are never touched). Use it to make a bare HFS volume (e.g. an edited infinite-mac disk) bootable. HFS-only today
@@ -1801,7 +1891,7 @@ Usage: restore [OPTIONS] <BACKUP_DIR> <TARGET>
 - `--size` — Per-partition size policy. Defaults to `original`, or `[restore] size` from the config file when set
 - `--alignment` — Partition alignment policy. Defaults to `original`, or `[restore] alignment` from the config file when set
 - `--device` — Treat `TARGET` as a block device (enables sector-aligned writes and the full device-write safety preflight in [`crate::cli::device_safety`])
-- `--yes` — Confirm destructive write to the target (required for device targets). For file targets the flag is a no-op
+- `--yes` — Confirm the destructive write: required for a device target and to replace an existing remote image file; a no-op for a local file
 - `--write-to-system-disk` — Allow writing to the system boot disk (refused by default; only meaningful with `--device`)
 - `--write-zeros-to-unused` — Write zeros to unused filesystem space
 
@@ -2032,7 +2122,7 @@ Usage: put [OPTIONS] <IMAGE> [HOST_FILE] [DST]
 **Options**
 
 - `-L` / `--literal` — Accepted for consistency with `ls`/`get`/`rm`; `put` always treats the destination as an exact literal path (it never globs), so glob metacharacters in a name are used verbatim with or without it
-- `--zero` — Pre-allocate N zero bytes instead of copying a host file. Pair with `--dst`
+- `--zero` — Pre-allocate N zero bytes instead of copying a host file. Pair with `--dst`; a `{A..B}` range in its last component makes one file per number
 - `--dst` — Explicit destination flag; use this with `--zero` where the positional `DST` slot is awkward
 - `--boot` — Write the 1024-byte boot-block region of the image verbatim. HFS-only today
 - `--boot-from` — Copy the 1024-byte boot-block region from a donor disk that already boots (`path` or `path@N`), instead of from a raw file. The donor's classic-HFS volume is auto-located (flat `.hfv`/`.dsk` at byte 0, or an `Apple_HFS` partition) and its `'LK'` signature validated. The region is written to the *target partition's* first sector, so this works on a flat HFV and on the HFS partition of a full (APM) disk alike — target the HFS partition with `IMG@N` (the DDR / partition map / drivers ahead of it are never touched). Use it to make a bare HFS volume (e.g. an edited infinite-mac disk) bootable. HFS-only today

@@ -167,8 +167,9 @@ impl RemoteConnection {
         path: &str,
         is_device: bool,
         size: u64,
+        force: bool,
     ) -> Result<(u64, u64)> {
-        self.session.open_write_target(path, is_device, size)
+        self.session.open_write_target(path, is_device, size, force)
     }
 
     /// List the daemon machine's physical disk devices.

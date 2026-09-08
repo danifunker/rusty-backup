@@ -57,8 +57,8 @@ pub struct RestoreArgs {
     #[arg(long)]
     pub device: bool,
 
-    /// Confirm destructive write to the target (required for device
-    /// targets). For file targets the flag is a no-op.
+    /// Confirm the destructive write: required for a device target and to
+    /// replace an existing remote image file; a no-op for a local file.
     #[arg(long)]
     pub yes: bool,
 
@@ -219,8 +219,16 @@ fn run_remote(args: RestoreArgs, remote: crate::remote::RemoteRef) -> Result<()>
 
     let conn = RemoteConnection::connect_shared(&remote.addr())
         .with_context(|| format!("connecting to {}", remote.addr()))?;
-    restore_to_remote(config, conn, &remote.path, args.device, progress, None)
-        .context("remote restore failed")
+    restore_to_remote(
+        config,
+        conn,
+        &remote.path,
+        args.device,
+        progress,
+        None,
+        args.yes,
+    )
+    .context("remote restore failed")
 }
 
 /// Expand the uniform `--size` policy across every partition in the backup.

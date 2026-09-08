@@ -128,6 +128,16 @@ impl RemoteSession {
         }
     }
 
+    /// Drain a `FileBegin` body into `sink` and insist it is the size announced:
+    /// a short stream is a cut transfer, not a shorter file.
+    fn read_declared(&mut self, size: u64, sink: &mut dyn Write, what: &str) -> Result<u64> {
+        let got = read_chunks(&mut self.reader, sink).map_err(|e| anyhow!("{what}: {e}"))?;
+        if got != size {
+            bail!("{what}: the daemon announced {size} byte(s) but {got} arrived");
+        }
+        Ok(got)
+    }
+
     /// Stream a single file's bytes into `sink`, returning the byte count.
     pub fn read_file(&mut self, handle: u64, path: &str, sink: &mut dyn Write) -> Result<u64> {
         write_control(
@@ -138,8 +148,8 @@ impl RemoteSession {
             },
         )?;
         match self.read_response()? {
-            Response::FileBegin { .. } => {
-                read_chunks(&mut self.reader, sink).map_err(|e| anyhow!("reading {path}: {e}"))
+            Response::FileBegin { size } => {
+                self.read_declared(size, sink, &format!("reading {path}"))
             }
             Response::Error { message } => bail!("read {path}: {message}"),
             other => bail!("unexpected reply to ReadFile: {other:?}"),
@@ -163,8 +173,9 @@ impl RemoteSession {
             },
         )?;
         match self.read_response()? {
-            Response::FileBegin { .. } => read_chunks(&mut self.reader, sink)
-                .map_err(|e| anyhow!("reading resource fork of {path}: {e}")),
+            Response::FileBegin { size } => {
+                self.read_declared(size, sink, &format!("reading resource fork of {path}"))
+            }
             Response::Error { message } => bail!("read resource fork of {path}: {message}"),
             other => bail!("unexpected reply to ReadResourceFork: {other:?}"),
         }
@@ -400,8 +411,8 @@ impl RemoteSession {
             },
         )?;
         match self.read_response()? {
-            Response::FileBegin { .. } => {
-                read_chunks(&mut self.reader, sink).map_err(|e| anyhow!("reading {path}: {e}"))
+            Response::FileBegin { size } => {
+                self.read_declared(size, sink, &format!("reading {path}"))
             }
             Response::Error { message } => bail!("read host file {path}: {message}"),
             other => bail!("unexpected reply to ReadHostFile: {other:?}"),
@@ -425,27 +436,34 @@ impl RemoteSession {
     /// write analog of [`RemoteSession::read_host_file`]). `force` overwrites an
     /// existing target. Fails if the daemon runs read-only.
     pub fn write_host_file(&mut self, path: &str, host_file: &Path, force: bool) -> Result<()> {
-        let size = std::fs::metadata(host_file)
-            .with_context(|| format!("stat {}", host_file.display()))?
-            .len();
+        // Open before announcing; always terminate the chunk stream and read
+        // the reply, or a body cut short desyncs the daemon (as StageUpload did).
+        let mut f = std::fs::File::open(host_file)
+            .with_context(|| format!("open {}", host_file.display()))?;
+        let meta = f
+            .metadata()
+            .with_context(|| format!("stat {}", host_file.display()))?;
+        if !meta.is_file() {
+            bail!("{} is not a regular file", host_file.display());
+        }
         write_control(
             &mut self.writer,
             &Request::WriteHostFile {
                 path: path.to_string(),
-                size,
+                size: meta.len(),
                 force,
             },
         )?;
-        // The body follows immediately as a chunk stream.
-        let mut f = std::fs::File::open(host_file)
-            .with_context(|| format!("open {}", host_file.display()))?;
-        {
+        let copied = {
             let mut cw = ChunkWriter::new(&mut self.writer);
-            std::io::copy(&mut f, &mut cw)
-                .with_context(|| format!("uploading {}", host_file.display()))?;
+            let r = std::io::copy(&mut f, &mut cw)
+                .with_context(|| format!("uploading {}", host_file.display()));
             cw.finish()?;
-        }
-        self.expect_ok("WriteHostFile")
+            r
+        };
+        let reply = self.expect_ok("WriteHostFile");
+        copied?;
+        reply
     }
 
     /// Open a host image file as a raw block device on the daemon — it stays
@@ -524,6 +542,7 @@ impl RemoteSession {
         path: &str,
         is_device: bool,
         size: u64,
+        force: bool,
     ) -> Result<(u64, u64)> {
         write_control(
             &mut self.writer,
@@ -531,6 +550,7 @@ impl RemoteSession {
                 path: path.to_string(),
                 is_device,
                 size,
+                force,
             },
         )?;
         match self.read_response()? {
@@ -580,10 +600,9 @@ impl RemoteSession {
             },
         )?;
         match self.read_response()? {
-            Response::FileBegin { .. } => {
+            Response::FileBegin { size } => {
                 let mut buf = Vec::new();
-                read_chunks(&mut self.reader, &mut buf)
-                    .map_err(|e| anyhow!("reading block of handle {handle}: {e}"))?;
+                self.read_declared(size, &mut buf, &format!("reading block of handle {handle}"))?;
                 Ok(buf)
             }
             Response::Error { message } => bail!("read block {handle}: {message}"),
@@ -671,10 +690,9 @@ impl RemoteSession {
             },
         )?;
         match self.read_response()? {
-            Response::FileBegin { .. } => {
+            Response::FileBegin { size } => {
                 let mut buf = Vec::new();
-                read_chunks(&mut self.reader, &mut buf)
-                    .map_err(|e| anyhow!("reading sectors at LBA {lba}: {e}"))?;
+                self.read_declared(size, &mut buf, &format!("reading sectors at LBA {lba}"))?;
                 Ok(buf)
             }
             Response::Error { message } => bail!("read sectors at LBA {lba}: {message}"),

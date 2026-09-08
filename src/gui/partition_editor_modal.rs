@@ -246,7 +246,7 @@ fn show_edit_existing(
                         } else if table_type == "RDB" {
                             ui.horizontal(|ui| {
                                 let tip = "Whether this RDB partition is eligible to boot. \
-                                           Multiple partitions can be set to boot at once — \
+                                           Multiple partitions can be set to boot at once - \
                                            the Amiga ROM picks the one with the highest boot \
                                            priority among them.";
                                 let mut val = editor.entries[i].bootable;
@@ -438,7 +438,7 @@ fn show_build_new(ui: &mut egui::Ui, builder: &mut DiskBuilder, allow_apply: boo
                      table default -- 1 MiB, or one cylinder on SGI / RDB / \
                      Sun. Accepts 1M / 63s (sectors).",
                 );
-                if provision::uses_cylinder_geometry(builder.kind) {
+                if provision::records_geometry(builder.kind) {
                     ui.label("Heads:");
                     ui.add(egui::DragValue::new(&mut builder.geometry.heads).range(1..=255));
                     ui.label("Sectors/track:");

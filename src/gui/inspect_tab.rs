@@ -115,6 +115,8 @@ pub struct InspectTab {
     last_error: Option<String>,
     /// Previous selection state for auto-inspect change detection
     prev_device_idx: Option<usize>,
+    /// Identity of the device behind `prev_device_idx` when it was inspected.
+    prev_device_identity: Option<rusty_backup::device::DeviceIdentity>,
     prev_image_path: Option<PathBuf>,
     prev_backup_path: Option<PathBuf>,
     /// A source open/close held until the user resolves the unsaved-edits
@@ -289,6 +291,7 @@ impl Default for InspectTab {
             backup_metadata: None,
             last_error: None,
             prev_device_idx: None,
+            prev_device_identity: None,
             prev_image_path: None,
             prev_backup_path: None,
             pending_source_change: None,
@@ -369,6 +372,11 @@ impl InspectTab {
         self.image_file_path.is_some()
             || self.backup_folder_path.is_some()
             || self.selected_device_idx.is_some()
+    }
+
+    /// True while a remote inspect session owns the tab.
+    pub fn is_remote_session(&self) -> bool {
+        self.remote_inspect.is_some()
     }
 
     /// Returns and clears the "user clicked Close Backup" signal. The App-level
@@ -671,8 +679,34 @@ impl InspectTab {
             return;
         }
 
+        // "Refresh Devices" replaces the list under us: the same index may now be
+        // a different disk or nothing; neither passes the unsaved-edits gate.
+        let device_identity =
+            rusty_backup::device::identity_at(ctx.devices, self.selected_device_idx);
+        let device_swapped = self.selected_device_idx.is_some()
+            && self.selected_device_idx == self.prev_device_idx
+            && device_identity != self.prev_device_identity;
+        if device_swapped {
+            if self.browse_view.has_unsaved_edits() {
+                ctx.log.warn(
+                    "The device list changed under the open volume; staged edits were discarded.",
+                );
+            }
+            if device_identity.is_none() {
+                ctx.log
+                    .warn("The inspected device is no longer listed; closing it.");
+                self.do_close(ctx);
+                return;
+            }
+            ctx.log
+                .warn("A different device now sits at the selected slot; re-inspecting it.");
+            self.browse_view.close();
+            self.release_open_device();
+        }
+
         // Auto-inspect on selection change
         let selection_changed = self.selected_device_idx != self.prev_device_idx
+            || device_swapped
             || self.image_file_path != self.prev_image_path
             || self.backup_folder_path != self.prev_backup_path;
 
@@ -681,6 +715,7 @@ impl InspectTab {
             // `do_close` (both gated upstream on unsaved edits), so by here the
             // switch is committed — just record it and load.
             self.prev_device_idx = self.selected_device_idx;
+            self.prev_device_identity = device_identity;
             self.prev_image_path = self.image_file_path.clone();
             self.prev_backup_path = self.backup_folder_path.clone();
             // Re-sniff floppy-ness on every source change so the
@@ -860,7 +895,7 @@ impl InspectTab {
                     egui::Button::new("Expand Image..."),
                 )
                 .on_hover_text(if !is_image_file {
-                    "Only image files can be expanded — devices have fixed size.".to_string()
+                    "Only image files can be expanded - devices have fixed size.".to_string()
                 } else if chd_expand_running {
                     "CHD expansion already running.".to_string()
                 } else {
@@ -1000,11 +1035,20 @@ impl InspectTab {
         }
 
         // Resize popup
+        let mut resize_finished = false;
         if let Some(ref mut popup) = self.resize_popup {
+            let was_running = popup.is_running();
             popup.poll_status(ctx.log);
+            resize_finished = was_running && !popup.is_running();
             if !popup.show(ui, ctx.devices, ctx.log) {
                 self.resize_popup = None;
             }
+        }
+        // The table on disk changed; every later edit patched a stale copy of
+        // it until the user re-inspected by hand.
+        if resize_finished {
+            self.prev_image_path = None;
+            self.prev_device_idx = None;
         }
 
         // Physical Disk Export sub-window
@@ -1256,7 +1300,7 @@ impl InspectTab {
                 let status = rusty_backup::model::chd_expand_runner::spawn(path, add_bytes);
                 self.chd_expand_status = Some(status);
                 ctx.log.info(
-                    "CHD expansion runs in the background — log lines will appear as it progresses.",
+                    "CHD expansion runs in the background - log lines will appear as it progresses.",
                 );
             } else {
                 match rusty_backup::partition::resize::expand_image_file(
@@ -1555,6 +1599,10 @@ impl InspectTab {
                         .to_string(),
                 );
                 self.editor.edits.clear();
+                // Force re-detection: Add Partition and the APM/GPT editors
+                // otherwise work from the pre-edit table.
+                self.prev_image_path = None;
+                self.prev_device_idx = None;
             }
             Err(e) => {
                 ctx.log.error(format!("Failed to apply edits: {:#}", e));
@@ -1656,34 +1704,34 @@ impl InspectTab {
                 }
                 if is_chd_format {
                     per_part_resp.on_hover_text(
-                        "Per-partition export is not supported for CHD — each \
+                        "Per-partition export is not supported for CHD - each \
                          partition would be a headless slice with no MBR/GPT, \
                          which no emulator can consume. Use whole-disk export \
                          instead.",
                     );
                 } else if is_dynamic_vhd {
                     per_part_resp.on_hover_text(
-                        "Per-partition export is not supported for dynamic VHD — \
+                        "Per-partition export is not supported for dynamic VHD - \
                          the sparse layout wraps a whole disk and buys nothing on \
                          a single mostly-used partition. Use fixed VHD for \
                          per-partition export.",
                     );
                 } else if is_qcow2 {
                     per_part_resp.on_hover_text(
-                        "Per-partition export is not supported for QCOW2 — \
+                        "Per-partition export is not supported for QCOW2 - \
                          the sparse layout wraps a whole-disk geometry that \
                          QEMU/UTM expect to find an MBR/GPT/APM at sector 0.",
                     );
                 } else if is_vmdk_flat {
                     per_part_resp.on_hover_text(
-                        "Per-partition export is not supported for VMDK flat — \
+                        "Per-partition export is not supported for VMDK flat - \
                          the descriptor wraps a whole-disk geometry that \
                          VMware/qemu-img/VirtualBox expect to find a partition \
                          table at sector 0 of.",
                     );
                 } else if is_vmdk_sparse {
                     per_part_resp.on_hover_text(
-                        "Per-partition export is not supported for VMDK sparse — \
+                        "Per-partition export is not supported for VMDK sparse - \
                          the grain directory wraps a whole-disk geometry that \
                          VMware/qemu-img/VirtualBox expect to find a partition \
                          table at sector 0 of.",
@@ -1702,17 +1750,17 @@ impl InspectTab {
                         "VHD (Dynamic)",
                     )
                     .on_hover_text(
-                        "Sparse VHD — all-zero blocks are omitted. Same .vhd extension; \
+                        "Sparse VHD - all-zero blocks are omitted. Same .vhd extension; \
                          readable by Hyper-V, qemu-img, Disk Management.",
                     );
                     ui.radio_value(&mut self.export_format, ExportFormat::Qcow2, "QCOW2")
                         .on_hover_text(
-                            "QCOW2 v3 — sparse, uncompressed. The container UTM uses \
+                            "QCOW2 v3 - sparse, uncompressed. The container UTM uses \
                              for classic-Mac PPC guests; opens in QEMU, virt-manager.",
                         );
                     ui.radio_value(&mut self.export_format, ExportFormat::VmdkFlat, "VMDK (Flat)")
                         .on_hover_text(
-                            "monolithicFlat VMDK — emits <name>.vmdk descriptor + \
+                            "monolithicFlat VMDK - emits <name>.vmdk descriptor + \
                              <name>-flat.vmdk raw extent. Opens in VMware Workstation/\
                              Fusion, VirtualBox, qemu-img.",
                         );
@@ -1722,7 +1770,7 @@ impl InspectTab {
                         "VMDK (Sparse)",
                     )
                     .on_hover_text(
-                        "monolithicSparse VMDK — single self-contained .vmdk; \
+                        "monolithicSparse VMDK - single self-contained .vmdk; \
                          zero grains omitted. Opens in VMware, VirtualBox, qemu-img.",
                     );
                     ui.radio_value(&mut self.export_format, ExportFormat::Raw, "Raw (.img)");
@@ -1768,7 +1816,7 @@ impl InspectTab {
                         );
                     } else {
                         hd_resp.on_hover_text(
-                            "CHD export needs a raw image or device source — backup \
+                            "CHD export needs a raw image or device source - backup \
                              folders and Clonezilla images aren't supported.",
                         );
                     }
@@ -1788,7 +1836,13 @@ impl InspectTab {
 
                 // Per-partition sizing
                 if !self.export_partition_configs.is_empty() {
-                    ui.label(egui::RichText::new("Partition Sizes:").strong());
+                    ui.label(egui::RichText::new("Partition Sizes:").strong())
+                        .on_hover_text(
+                            "Minimum is the trim point: the imaged size of a compacted backup \
+                             partition, or the last used byte of a live volume. The exported \
+                             volume is resized in place to match. Anything smaller needs a \
+                             Backup with shrink-to-minimum, which clones the volume.",
+                        );
                     egui::Grid::new("export_partition_sizes")
                         .striped(true)
                         .min_col_width(50.0)
@@ -1864,7 +1918,7 @@ impl InspectTab {
                                 "PFS3's allocator scatters blocks throughout the volume, so \
                                  in-place trim can't free up space. The export pipeline will \
                                  instead walk the source and rebuild a packed copy at the new \
-                                 size — limitations to be aware of:",
+                                 size - limitations to be aware of:",
                             );
                             ui.label(
                                 "  - PFS3 trashcan (deldir) contents are NOT preserved.",
@@ -1964,7 +2018,7 @@ impl InspectTab {
                                 "Warning: the source is a sector-by-sector backup. \
                                  Re-exporting with new partition sizes drops the \
                                  byte-for-byte preservation of free space and \
-                                 unrecognized filesystem regions — only smart-compact \
+                                 unrecognized filesystem regions - only smart-compact \
                                  areas of recognized partitions carry over.",
                             )
                             .color(super::theme::warning(ui.visuals())),
@@ -2345,7 +2399,7 @@ impl InspectTab {
                 // Not a partitioned disk but a browsable optical disc — hand it to
                 // the Optical tab (the app switches there on the next frame).
                 ctx.log.info(format!(
-                    "{} is an optical disc — opening the Optical tab.",
+                    "{} is an optical disc - opening the Optical tab.",
                     path.display()
                 ));
                 self.pending_open_optical = Some(path);
@@ -2562,6 +2616,14 @@ impl InspectTab {
     /// pass loads the new source. Unsaved-edit gating happens at the call site.
     fn apply_source_event(&mut self, ev: super::source_picker::SourceEvent) {
         use super::source_picker::SourceEvent;
+        // A Mac archive is rerouted to the Archives tab and changes nothing
+        // here, so the open browse view must survive it.
+        if let SourceEvent::Image { path, .. } = &ev {
+            if is_mac_archive_path(path) {
+                self.pending_open_archive = Some(path.clone());
+                return;
+            }
+        }
         self.browse_view.close();
         match ev {
             SourceEvent::Device(i) => {
@@ -2573,12 +2635,6 @@ impl InspectTab {
                 self.clear_results();
             }
             SourceEvent::Image { path, tempdir } => {
-                // A Mac archive (.sit/.hqx/...) isn't a disk image — hand it to
-                // the Archives tab instead of failing to parse a partition table.
-                if is_mac_archive_path(&path) {
-                    self.pending_open_archive = Some(path);
-                    return;
-                }
                 self.selected_device_idx = None;
                 self.backup_folder_path = None;
                 self.image_file_path = Some(path);
@@ -2613,6 +2669,7 @@ impl InspectTab {
         self.clear_results();
         self.selected_device_idx = None;
         self.prev_device_idx = None;
+        self.prev_device_identity = None;
         self.image_file_path = None;
         self.amiga_tempdir = None;
         self.prev_image_path = None;
@@ -2690,6 +2747,13 @@ impl InspectTab {
         self.chd_image_path = None;
         self.cached_disk_size = None;
         self.single_file_chd_backup_folder = None;
+        // A Check result belongs to the source it was run on; Repair on it
+        // after a source change wrote fixes into the new image at old offsets.
+        self.fsck_result = None;
+        self.show_fsck_popup = false;
+        self.show_repair_confirm = false;
+        self.repair_context = None;
+        self.pending_repack = None;
     }
 
     /// Give up the escalated descriptor for the device this tab had open, so it
@@ -2907,7 +2971,10 @@ impl InspectTab {
                 let elevated = match rusty_backup::os::open_source_for_reading(&path) {
                     Ok(e) => e,
                     Err(e) => {
-                        finish_err(format!("Cannot open {}: {e}", path.display()));
+                        // `{e:#}` — the whole chain. `{e}` printed only the outermost
+                        // context, so "(authopen failed)" arrived with the reason it
+                        // failed discarded.
+                        finish_err(format!("Cannot open {}: {e:#}", path.display()));
                         return;
                     }
                 };
@@ -3849,6 +3916,8 @@ impl InspectTab {
         // re-floors or rewrites the volume (path-based), so it's disabled. Browse,
         // Calc min, and Check (fsck) all work over the block reader.
         let is_remote = self.remote_inspect.is_some();
+        // A running repack rewrites the image under every other action.
+        let repacking = self.repack_status.is_some();
 
         let has_slots = self
             .partition_table
@@ -3860,12 +3929,12 @@ impl InspectTab {
             .show(ui, |ui| {
                 // Header
                 ui.label(egui::RichText::new("#").strong())
-                    .on_hover_text("Position in this list — the number `IMG@N` takes");
+                    .on_hover_text("Position in this list - the number `IMG@N` takes");
                 if has_slots {
                     ui.label(egui::RichText::new("Slot").strong())
                         .on_hover_text(
                             "The partition table's own slot, as the platform names it \
-                         (diskutil's disk4s6, IRIX slot 0) — the number `IMG@sN` takes",
+                         (diskutil's disk4s6, IRIX slot 0) - the number `IMG@sN` takes",
                         );
                 }
                 ui.label(egui::RichText::new("Type").strong());
@@ -4067,49 +4136,53 @@ impl InspectTab {
                             ui.label("");
                         }
                         ui.label(if part.bootable { "Yes" } else { "" });
-                        if partition_is_browsable(
-                            part.partition_type_byte,
-                            part.partition_type_string.as_deref(),
-                            &part.type_name,
-                        ) {
-                            let ptype = if part.partition_type_byte != 0 {
-                                part.partition_type_byte
-                            } else {
-                                rusty_backup::model::backup_loader::infer_fat_type_byte(
-                                    &part.type_name,
-                                )
-                            };
-                            if ui.small_button("Browse").clicked() {
-                                browse_request = Some((
-                                    part.index,
-                                    part.byte_offset(),
-                                    ptype,
-                                    part.partition_type_string.clone(),
-                                ));
-                            }
-                            if (is_checkable_type(ptype, part.partition_type_string.as_deref())
-                                || is_checkable_fs_name(&part.type_name)
-                                || is_superfloppy_hfs(part.partition_type_byte, &part.type_name)
-                                || is_checkable_retro_fs(
-                                    part.partition_type_byte,
-                                    part.partition_type_string.as_deref(),
-                                    &part.type_name,
-                                ))
-                                && ui.small_button("Check").clicked()
-                            {
-                                check_request = Some((
-                                    part.byte_offset(),
-                                    ptype,
-                                    part.partition_type_string.clone(),
-                                ));
-                            }
-                            if is_classic_hfs(
+                        ui.add_enabled_ui(!repacking, |ui| {
+                            if partition_is_browsable(
+                                part.partition_type_byte,
+                                part.partition_type_string.as_deref(),
+                                &part.type_name,
+                            ) {
+                                let ptype = if part.partition_type_byte != 0 {
+                                    part.partition_type_byte
+                                } else {
+                                    rusty_backup::model::backup_loader::infer_fat_type_byte(
+                                        &part.type_name,
+                                    )
+                                };
+                                if ui.small_button("Browse").clicked() {
+                                    browse_request = Some((
+                                        part.index,
+                                        part.byte_offset(),
+                                        ptype,
+                                        part.partition_type_string.clone(),
+                                    ));
+                                }
+                                if (is_checkable_type(ptype, part.partition_type_string.as_deref())
+                                    || is_checkable_fs_name(&part.type_name)
+                                    || is_superfloppy_hfs(
+                                        part.partition_type_byte,
+                                        &part.type_name,
+                                    )
+                                    || is_checkable_retro_fs(
+                                        part.partition_type_byte,
+                                        part.partition_type_string.as_deref(),
+                                        &part.type_name,
+                                    ))
+                                    && ui.small_button("Check").clicked()
+                                {
+                                    check_request = Some((
+                                        part.byte_offset(),
+                                        ptype,
+                                        part.partition_type_string.clone(),
+                                    ));
+                                }
+                                if is_classic_hfs(
                                 part.partition_type_byte,
                                 part.partition_type_string.as_deref(),
                                 &part.type_name,
                             ) && !is_remote
                                 && ui
-                                    .small_button("Expand/Export…")
+                                    .small_button("Expand/Export...")
                                     .on_hover_text(
                                         "Re-floor this classic-HFS volume to a new size / block \
                                          size (APM .hda) or export it as a flat BasiliskII HFV.",
@@ -4118,30 +4191,31 @@ impl InspectTab {
                             {
                                 expand_request = Some((part.byte_offset(), part.size_bytes));
                             }
-                            // Defragment (repack) a Human68k volume in place.
-                            // Image files only — the worker rewrites the
-                            // partition region of the file on disk.
-                            if part.partition_type_string.as_deref() == Some("human68k")
-                                && is_image_source
-                                && self.repack_status.is_none()
-                                && ui
-                                    .small_button("Defragment…")
-                                    .on_hover_text(
-                                        "Repack this Human68k volume so its files are stored \
+                                // Defragment (repack) a Human68k volume in place.
+                                // Image files only — the worker rewrites the
+                                // partition region of the file on disk.
+                                if part.partition_type_string.as_deref() == Some("human68k")
+                                    && is_image_source
+                                    && self.repack_status.is_none()
+                                    && ui
+                                        .small_button("Defragment...")
+                                        .on_hover_text(
+                                            "Repack this Human68k volume so its files are stored \
                                          contiguously, reclaiming holes left by deleted files. \
-                                         Rewrites the partition in place — back up first.",
-                                    )
-                                    .clicked()
-                            {
-                                defrag_request = Some((part.byte_offset(), part.type_name.clone()));
-                            }
-                            // Resize an Alto BFS volume onto a new geometry.
-                            // Reads the image and writes a brand-new PDI, so it's
-                            // offered for image-file sources only.
-                            if part.type_name == "Alto BFS"
+                                         Rewrites the partition in place - back up first.",
+                                        )
+                                        .clicked()
+                                {
+                                    defrag_request =
+                                        Some((part.byte_offset(), part.type_name.clone()));
+                                }
+                                // Resize an Alto BFS volume onto a new geometry.
+                                // Reads the image and writes a brand-new PDI, so it's
+                                // offered for image-file sources only.
+                                if part.type_name == "Alto BFS"
                                 && is_image_source
                                 && ui
-                                    .small_button("Resize…")
+                                    .small_button("Resize...")
                                     .on_hover_text(
                                         "Re-lay this Alto volume onto a different disk geometry \
                                          (Diablo 31 / 44, grow or shrink) and save it as a PDI.",
@@ -4150,9 +4224,10 @@ impl InspectTab {
                             {
                                 resize_request = true;
                             }
-                        } else {
-                            ui.label("");
-                        }
+                            } else {
+                                ui.label("");
+                            }
+                        });
                     }
                     ui.end_row();
                 }
@@ -4283,12 +4358,12 @@ impl InspectTab {
                     }
                 })
                 .unwrap_or(0.0);
-            egui::Window::new("Defragmenting…")
+            egui::Window::new("Defragmenting...")
                 .collapsible(false)
                 .resizable(false)
                 .show(ui.ctx(), |ui| {
                     ui.add(egui::ProgressBar::new(frac).show_percentage());
-                    ui.label("Repacking Human68k volume — please wait.");
+                    ui.label("Repacking Human68k volume - please wait.");
                 });
             // Keep the UI repainting so progress + completion are reflected
             // without needing mouse movement.
@@ -4795,6 +4870,21 @@ impl InspectTab {
             rusty_backup::model::min_size_runner::MinSizeSource::File {
                 file: file_arc,
                 use_sector_aligned: is_device,
+            }
+        } else if let Some(path) = self.image_file_path.clone().filter(|_| !is_device) {
+            // Only macOS retains the inspect worker's handle; elsewhere an
+            // image file is simply reopened, or Calc min never ran at all.
+            match std::fs::File::open(&path) {
+                Ok(file) => rusty_backup::model::min_size_runner::MinSizeSource::File {
+                    file: Arc::new(file),
+                    use_sector_aligned: false,
+                },
+                Err(e) => {
+                    ctx.log.error(format!(
+                        "Cannot calculate minimum size for partition {part_index}: {e}",
+                    ));
+                    return;
+                }
             }
         } else {
             ctx.log.error(format!(
@@ -5409,7 +5499,7 @@ impl InspectTab {
                 self.cache_status = None;
             } else if let Some(cache_path) = &status.cache_path {
                 ctx.log.info(
-                    "Seekable cache ready — browser upgraded to full seek support.".to_string(),
+                    "Seekable cache ready - browser upgraded to full seek support.".to_string(),
                 );
                 let cache_path = cache_path.clone();
                 self.seekable_cache_files

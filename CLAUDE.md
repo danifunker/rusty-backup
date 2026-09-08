@@ -27,6 +27,14 @@ cargo fmt                      # Auto-format
 cargo clippy                   # Lint
 ```
 
+Debug builds use `debug = "line-tables-only"` and cargo is capped at four jobs
+(`.cargo/config.toml`); a full-debuginfo, all-cores debug build of this tree
+gets the terminal session OOM-killed on a 16 GB machine. Do not override either
+setting, and never run two cargo builds at once. See `docs/build-memory-crashes.md`.
+When a debugger needs locals and types, force full debuginfo for that one run
+only: `CARGO_PROFILE_DEV_DEBUG=2 cargo build` (or `cargo test`). Never put
+`debug = 2` back into Cargo.toml.
+
 ## Build Infrastructure
 
 ### Versioning
@@ -79,6 +87,7 @@ Each backup is a folder. Two layouts depending on the chosen output:
 **Per-partition** (Zstd / Raw / per-partition VHD):
 - `metadata.json` - partition info, alignment data, checksums, bad sectors
 - `mbr.bin` / `mbr.json` or `gpt.json` - partition table exports
+- `mbr-gap.bin` - the sectors between the MBR and the first partition (GRUB core.img, DDO), only when non-zero; restored after the MBR as far as the new layout has room
 - `partition-N.<ext>` - one compressed file per partition (`.zst`, `.raw`, `.vhd`)
 - Per-file checksum files (`.sha256` or `.crc32`)
 

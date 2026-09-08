@@ -138,6 +138,12 @@ fn summarize(archive: &std::path::Path, dest: &str, stats: &TarImportStats) {
             stats.appledouble_skipped
         ));
     }
+    if stats.appledouble_paired > 0 {
+        log_stderr(format!(
+            "  {} macOS AppleDouble (._*) sidecar(s) joined to their file",
+            stats.appledouble_paired
+        ));
+    }
     if stats.invalid_names_skipped > 0 {
         log_stderr(format!(
             "  {} entr(ies) skipped (name not valid on this filesystem, e.g. macOS ._ cruft)",

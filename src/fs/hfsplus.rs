@@ -11,7 +11,9 @@ use super::filesystem::{
 };
 use super::hfs_common::{
     self, bitmap_clear_bit_be, bitmap_collect_clear_runs_be, bitmap_set_bit_be, bitmap_test_bit_be,
-    btree_free_node, btree_remove_record, BTreeHeader, BTreeKeyFormat,
+    btree_detach_freed_node_and_refresh, btree_free_node, btree_grow_blocks, btree_map_chain_tail,
+    btree_refresh_index_keys, btree_remove_record, btree_retire_empty_leaf, BTreeHeader,
+    BTreeKeyFormat,
 };
 use super::CompactResult;
 
@@ -573,6 +575,9 @@ fn hfsplus_dir_private_dir_name() -> String {
 pub struct HfsPlusFilesystem<R: Read + Seek> {
     reader: R,
     partition_offset: u64,
+    /// Partition length when the caller knows it; the alternate volume header
+    /// sits 1024 bytes before the partition end, not before total_blocks * bs.
+    partition_size: Option<u64>,
     vh: HfsPlusVolumeHeader,
     /// Cached catalog B-tree file data.
     catalog_data: Vec<u8>,
@@ -635,7 +640,17 @@ pub struct HfsPlusSnapshot {
 }
 
 impl<R: Read + Seek> HfsPlusFilesystem<R> {
-    pub fn open(mut reader: R, partition_offset: u64) -> Result<Self, FilesystemError> {
+    pub fn open(reader: R, partition_offset: u64) -> Result<Self, FilesystemError> {
+        Self::open_sized(reader, partition_offset, None)
+    }
+
+    /// [`open`](Self::open) with the partition length, so the alternate volume
+    /// header is written where Apple's tools look for it.
+    pub fn open_sized(
+        mut reader: R,
+        partition_offset: u64,
+        partition_size: Option<u64>,
+    ) -> Result<Self, FilesystemError> {
         // Read volume header at offset + 1024
         reader.seek(SeekFrom::Start(partition_offset + 1024))?;
         let mut vh_buf = [0u8; 512];
@@ -738,6 +753,7 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
         Ok(HfsPlusFilesystem {
             reader,
             partition_offset,
+            partition_size,
             vh,
             catalog_data,
             catalog_header,
@@ -1015,6 +1031,25 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
 
     pub(crate) fn catalog_first_leaf(&self) -> u32 {
         self.catalog_header.first_leaf_node
+    }
+
+    /// The extents-overflow B-tree as read from disk, for fsck.
+    pub(crate) fn extents_overflow_data(&self) -> Option<&[u8]> {
+        self.extents_overflow_data.as_deref()
+    }
+
+    /// Partition length when the opener knew it; where the alternate header lives.
+    pub(crate) fn partition_size(&self) -> Option<u64> {
+        self.partition_size
+    }
+
+    /// The attributes B-tree, loaded on first use, for fsck.
+    pub(crate) fn attributes_data_for_fsck(&mut self) -> Result<Option<&[u8]>, FilesystemError> {
+        if self.vh.attributes_file.logical_size == 0 {
+            return Ok(None);
+        }
+        self.ensure_attributes_loaded()?;
+        Ok(self.attributes_data.as_deref())
     }
 
     pub(crate) fn case_sensitive_catalog(&self) -> bool {
@@ -1961,9 +1996,15 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
     }
 
     /// Remove a catalog record by (node_idx, rec_idx).
-    fn remove_catalog_record(&mut self, node_idx: u32, rec_idx: usize) {
+    fn remove_catalog_record(
+        &mut self,
+        node_idx: u32,
+        rec_idx: usize,
+    ) -> Result<(), FilesystemError> {
         let node_size = self.catalog_header.node_size as usize;
         let offset = node_idx as usize * node_size;
+        let cs = self.case_sensitive();
+        let cmp = |a: &[u8], b: &[u8]| Self::catalog_compare(a, b, cs);
         btree_remove_record(
             &mut self.catalog_data[offset..offset + node_size],
             node_size,
@@ -1972,6 +2013,17 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
 
         // Check if leaf is now empty
         let num = BigEndian::read_u16(&self.catalog_data[offset + 10..offset + 12]);
+        if num > 0 && rec_idx == 0 {
+            // The leaf's first key changed: Disk First Aid wants the separators
+            // above it to say so exactly (E_IKey).
+            btree_refresh_index_keys(
+                &mut self.catalog_data,
+                node_size,
+                node_idx,
+                &BTreeKeyFormat::HFSPLUS_CATALOG,
+                &cmp,
+            )?;
+        }
         if num == 0 {
             // Free the node and update prev/next links
             let prev = BigEndian::read_u32(&self.catalog_data[offset + 4..offset + 8]);
@@ -1995,6 +2047,15 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
                 h.last_leaf_node = prev;
             }
             h.write(&mut self.catalog_data);
+            // The parent still pointed at the freed leaf; a later insert landed
+            // there and the next split zeroed it.
+            btree_detach_freed_node_and_refresh(
+                &mut self.catalog_data,
+                node_size,
+                node_idx,
+                &BTreeKeyFormat::HFSPLUS_CATALOG,
+                &cmp,
+            )?;
         }
 
         // Update header leaf_records
@@ -2002,6 +2063,7 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
         h.leaf_records = h.leaf_records.saturating_sub(1);
         h.write(&mut self.catalog_data);
         self.catalog_header = BTreeHeaderRecord::parse(&self.catalog_data[14..14 + 106]);
+        Ok(())
     }
 }
 
@@ -2014,7 +2076,7 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
     ///
     /// Both arguments are full record bytes (or trimmed index records); the
     /// 2-byte key_len prefix lives at offset 0..2 and the key body at 2..12.
-    fn extents_compare(a: &[u8], b: &[u8]) -> Ordering {
+    pub(crate) fn extents_compare(a: &[u8], b: &[u8]) -> Ordering {
         if a.len() < 12 || b.len() < 12 {
             return a.len().cmp(&b.len());
         }
@@ -2101,14 +2163,18 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
     /// Remove every overflow record belonging to `(file_id, fork_type)`.
     /// Used by `delete_entry_inner` to clean up overflow records before the
     /// catalog row is removed.
-    fn remove_extents_overflow_records_for(&mut self, file_id: u32, fork_type: u8) {
+    fn remove_extents_overflow_records_for(
+        &mut self,
+        file_id: u32,
+        fork_type: u8,
+    ) -> Result<(), FilesystemError> {
         let Some(ref data) = self.extents_overflow_data else {
-            return;
+            return Ok(());
         };
         let header = BTreeHeader::read(data);
         let node_size = header.node_size as usize;
         if node_size == 0 {
-            return;
+            return Ok(());
         }
 
         // Collect (node_idx, rec_idx) pairs first — mutating during a walk
@@ -2135,7 +2201,7 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
             },
         );
         if victims.is_empty() {
-            return;
+            return Ok(());
         }
 
         // Remove highest rec_idx first per node so earlier indices stay
@@ -2143,7 +2209,7 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
         let data = self.extents_overflow_data.as_mut().unwrap();
         victims.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
         let mut removed: u32 = 0;
-        for (node_idx, rec_idx) in victims {
+        for &(node_idx, rec_idx) in &victims {
             let off = node_idx as usize * node_size;
             btree_remove_record(&mut data[off..off + node_size], node_size, rec_idx);
             removed += 1;
@@ -2151,6 +2217,20 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
         let mut h = BTreeHeader::read(data);
         h.leaf_records = h.leaf_records.saturating_sub(removed);
         h.write(data);
+        // An emptied leaf leaves the tree; one whose first key changed needs
+        // the separators above it redone.
+        let mut nodes: Vec<u32> = victims.iter().map(|v| v.0).collect();
+        nodes.dedup();
+        for node_idx in nodes {
+            let off = node_idx as usize * node_size;
+            let kf = BTreeKeyFormat::HFSPLUS_EXTENTS;
+            if BigEndian::read_u16(&data[off + 10..off + 12]) == 0 {
+                btree_retire_empty_leaf(data, node_size, node_idx, &kf, &Self::extents_compare)?;
+            } else if victims.iter().any(|&(n, r)| n == node_idx && r == 0) {
+                btree_refresh_index_keys(data, node_size, node_idx, &kf, &Self::extents_compare)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -2351,6 +2431,19 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
         let mut h = BTreeHeader::read(data);
         h.leaf_records = h.leaf_records.saturating_sub(removed);
         h.write(data);
+        // An emptied leaf leaves the tree; one whose first key changed needs
+        // the separators above it redone.
+        let mut nodes: Vec<u32> = victims.iter().map(|v| v.0).collect();
+        nodes.dedup();
+        for node_idx in nodes {
+            let off = node_idx as usize * node_size;
+            let kf = BTreeKeyFormat::HFSPLUS_ATTRIBUTES;
+            if BigEndian::read_u16(&data[off + 10..off + 12]) == 0 {
+                btree_retire_empty_leaf(data, node_size, node_idx, &kf, &Self::attr_compare)?;
+            } else if victims.iter().any(|&(n, r)| n == node_idx && r == 0) {
+                btree_refresh_index_keys(data, node_size, node_idx, &kf, &Self::attr_compare)?;
+            }
+        }
         Ok(removed)
     }
 }
@@ -2373,11 +2466,15 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
         self.reader
             .seek(SeekFrom::Start(self.partition_offset + 1024))?;
         self.reader.write_all(&vh_bytes)?;
-        // Backup (last 1024 bytes of volume)
-        let total_size = self.vh.total_blocks as u64 * self.vh.block_size as u64;
-        if total_size > 1024 {
+        // Backup: 1024 bytes before the partition end when the length is
+        // known, else before the end of the last allocation block.
+        let volume_end = self
+            .partition_size
+            .filter(|&s| s >= 2048)
+            .unwrap_or(self.vh.total_blocks as u64 * self.vh.block_size as u64);
+        if volume_end > 1024 {
             self.reader
-                .seek(SeekFrom::Start(self.partition_offset + total_size - 1024))?;
+                .seek(SeekFrom::Start(self.partition_offset + volume_end - 1024))?;
             self.reader.write_all(&vh_bytes)?;
         }
         Ok(())
@@ -2774,7 +2871,6 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
                 kind.label()
             )));
         }
-        let blocks_per_node = (node_size as u32 / block_size).max(1);
 
         // Grow by at least 8 nodes, rounded up to the fork's clump, to amortise
         // the work and keep per-`put` workloads from re-entering grow on every
@@ -2807,17 +2903,17 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
             )));
         }
         let add_slots = grow_nodes + u32::from(need_map);
-        let grow_blocks = add_slots * blocks_per_node;
-
+        let grow_blocks = btree_grow_blocks(total_nodes, add_slots, node_size, block_size);
         // Allocate volume blocks, preferring a contiguous tail extension so the
         // fork's last extent just gets longer.
-        let last_block = self.fork_last_inline_block(kind);
-        let new_extents = match self.allocate_contiguous_after(last_block, grow_blocks) {
-            Some(e) => vec![e],
-            None => self.allocate_extents(grow_blocks)?,
-        };
-
-        self.attach_extents_to_fork(kind, &new_extents)?;
+        if grow_blocks > 0 {
+            let last_block = self.fork_last_inline_block(kind);
+            let new_extents = match self.allocate_contiguous_after(last_block, grow_blocks) {
+                Some(e) => vec![e],
+                None => self.allocate_extents(grow_blocks)?,
+            };
+            self.attach_extents_to_fork(kind, &new_extents)?;
+        }
 
         // Extend the in-memory tree buffer and publish the new nodes. The added
         // bytes are zero, so the new node-bitmap bits read as free and
@@ -2937,6 +3033,7 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
         type_code: &[u8; 4],
         creator_code: &[u8; 4],
         mtime_secs: Option<u64>,
+        finder_flags: u16,
     ) -> [u8; 248] {
         let mut rec = [0u8; 248];
         let now = match mtime_secs {
@@ -2952,7 +3049,8 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
                                                      // FileInfo (userInfo): fdType at offset 48, fdCreator at offset 52
         rec[48..52].copy_from_slice(type_code);
         rec[52..56].copy_from_slice(creator_code);
-        // dataFork at offset 88
+        BigEndian::write_u16(&mut rec[56..58], finder_flags); // fdFlags
+                                                              // dataFork at offset 88
         data_fork.serialize(&mut rec[88..168]);
         // resourceFork at offset 168
         rsrc_fork.serialize(&mut rec[168..248]);
@@ -3324,10 +3422,13 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
         // last genuine user-data block instead.
         let search_up_to = self.vh.total_blocks.saturating_sub(2);
         let last = find_last_set_bit(&bitmap, search_up_to);
+        // The trim point must leave room for the alternate VH at the new end:
+        // the resizer counts those trailing blocks as used (two at 512 bytes).
+        let trailing: u64 = if self.vh.block_size <= 512 { 2 } else { 1 };
         match last {
             Some(block) => {
-                let byte = (block as u64 + 1) * self.vh.block_size as u64;
-                Ok(byte)
+                let byte = (block as u64 + 1 + trailing) * self.vh.block_size as u64;
+                Ok(byte.min(self.total_size()))
             }
             None => Ok(self.total_size()),
         }
@@ -3939,25 +4040,6 @@ fn write_fork_data_with_overflow<R: Write + Seek>(
         )));
     }
     Ok(())
-}
-
-/// Index of the last node in a B-tree's map-node chain (`header.fLink` →
-/// mapNode → … → 0), or 0 when the chain is empty (so the caller links the
-/// first map node via the header node at index 0). Cycle-guarded.
-fn btree_map_chain_tail(buf: &[u8], node_size: usize) -> u32 {
-    let mut next = BigEndian::read_u32(&buf[0..4]); // header.fLink
-    let mut last = 0u32;
-    let mut guard = 0;
-    while next != 0 && guard < 1_000_000 {
-        last = next;
-        let off = next as usize * node_size;
-        if off + 4 > buf.len() {
-            break;
-        }
-        next = BigEndian::read_u32(&buf[off..off + 4]);
-        guard += 1;
-    }
-    last
 }
 
 /// Decode a UTF-16BE byte slice to a String.
@@ -4858,6 +4940,7 @@ impl<R: Read + Write + Seek + Send> HfsPlusFilesystem<R> {
             &type_code,
             &creator_code,
             mtime,
+            options.finder_flags.unwrap_or(0),
         );
 
         // Build key + record for catalog insertion
@@ -5067,18 +5150,18 @@ impl<R: Read + Write + Seek + Send> HfsPlusFilesystem<R> {
             if let Some((data_fork, rsrc_fork)) = self.find_file_by_id(cnid) {
                 self.free_fork_overflow_extents(cnid, HFSPLUS_FORK_DATA, &data_fork);
                 self.free_fork_overflow_extents(cnid, HFSPLUS_FORK_RESOURCE, &rsrc_fork);
-                self.remove_extents_overflow_records_for(cnid, HFSPLUS_FORK_DATA);
-                self.remove_extents_overflow_records_for(cnid, HFSPLUS_FORK_RESOURCE);
+                self.remove_extents_overflow_records_for(cnid, HFSPLUS_FORK_DATA)?;
+                self.remove_extents_overflow_records_for(cnid, HFSPLUS_FORK_RESOURCE)?;
                 self.free_fork_blocks(&data_fork);
                 self.free_fork_blocks(&rsrc_fork);
             }
         }
 
-        self.remove_catalog_record(node_idx, rec_idx);
+        self.remove_catalog_record(node_idx, rec_idx)?;
 
         // Find and remove the thread record
         if let Some((t_node, t_rec, _)) = self.find_catalog_record_by_cnid(cnid) {
-            self.remove_catalog_record(t_node, t_rec);
+            self.remove_catalog_record(t_node, t_rec)?;
         }
 
         // Update parent valence
@@ -5137,7 +5220,7 @@ impl<R: Read + Write + Seek + Send> HfsPlusFilesystem<R> {
         }
         new_record.extend_from_slice(&data_bytes);
 
-        self.remove_catalog_record(node_idx, rec_idx);
+        self.remove_catalog_record(node_idx, rec_idx)?;
         self.insert_catalog_record(&new_record)?;
 
         // The thread record's name is a variable-length UTF-16 string, so its
@@ -5145,7 +5228,7 @@ impl<R: Read + Write + Seek + Send> HfsPlusFilesystem<R> {
         // rather than patching in place. Folders always have a thread; files
         // generally do.
         if let Some((t_node, t_rec, _)) = self.find_catalog_record_by_cnid(cnid) {
-            self.remove_catalog_record(t_node, t_rec);
+            self.remove_catalog_record(t_node, t_rec)?;
             let thread_type = if entry.is_directory() {
                 CATALOG_FOLDER_THREAD
             } else {
@@ -5223,8 +5306,8 @@ impl<R: Read + Write + Seek + Send> HfsPlusFilesystem<R> {
         if let Some((data_fork, rsrc_fork)) = self.find_file_by_id(inode_cnid) {
             self.free_fork_overflow_extents(inode_cnid, HFSPLUS_FORK_DATA, &data_fork);
             self.free_fork_overflow_extents(inode_cnid, HFSPLUS_FORK_RESOURCE, &rsrc_fork);
-            self.remove_extents_overflow_records_for(inode_cnid, HFSPLUS_FORK_DATA);
-            self.remove_extents_overflow_records_for(inode_cnid, HFSPLUS_FORK_RESOURCE);
+            self.remove_extents_overflow_records_for(inode_cnid, HFSPLUS_FORK_DATA)?;
+            self.remove_extents_overflow_records_for(inode_cnid, HFSPLUS_FORK_RESOURCE)?;
             self.free_fork_blocks(&data_fork);
             self.free_fork_blocks(&rsrc_fork);
         }
@@ -5238,10 +5321,10 @@ impl<R: Read + Write + Seek + Send> HfsPlusFilesystem<R> {
 
         let inode_name = format!("iNode{inode_num}");
         if let Some((n, r, _)) = self.find_catalog_record(private_cnid, &inode_name) {
-            self.remove_catalog_record(n, r);
+            self.remove_catalog_record(n, r)?;
         }
         if let Some((tn, tr, _)) = self.find_catalog_record_by_cnid(inode_cnid) {
-            self.remove_catalog_record(tn, tr);
+            self.remove_catalog_record(tn, tr)?;
         }
         self.update_parent_valence(private_cnid, -1)?;
         self.vh.file_count = self.vh.file_count.saturating_sub(1);
@@ -5320,7 +5403,7 @@ impl<R: Read + Write + Seek + Send> HfsPlusFilesystem<R> {
         // Free existing resource fork blocks (inline + any overflow extents).
         if let Some((_data_fork, rsrc_fork)) = self.find_file_by_id(cnid) {
             self.free_fork_overflow_extents(cnid, HFSPLUS_FORK_RESOURCE, &rsrc_fork);
-            self.remove_extents_overflow_records_for(cnid, HFSPLUS_FORK_RESOURCE);
+            self.remove_extents_overflow_records_for(cnid, HFSPLUS_FORK_RESOURCE)?;
             self.free_fork_blocks(&rsrc_fork);
         }
 
@@ -5994,6 +6077,14 @@ pub(crate) fn write_blank_btree_header_node(
     // BTHeaderRec offset 36 = btreeType (0=control); offset 37 = keyCompareType
     node[hr + 36] = 0; // kBTHFSTreeType
     node[hr + 37] = key_compare_type;
+    // Offset 38 = attributes: Apple sets kBTBigKeysMask on every HFS+ tree and
+    // kBTVariableIndexKeysMask on the catalog and attributes trees (not extents).
+    let attributes = if max_key_len == 10 {
+        hfs_common::KBT_BIG_KEYS_MASK
+    } else {
+        hfs_common::KBT_BIG_KEYS_MASK | hfs_common::KBT_VARIABLE_INDEX_KEYS_MASK
+    };
+    BigEndian::write_u32(&mut node[hr + 38..hr + 42], attributes);
 
     // Canonical TN1150 B-tree header node layout. The BTHeaderRec (record 0)
     // is *exactly* 106 bytes — Apple's `fsck_hfs` rejects any other length
@@ -6116,44 +6207,184 @@ pub fn resize_hfsplus_in_place(
         log("HFS+ resize: not an HFS+ volume, skipping");
         return Ok(());
     }
-
-    let block_size = BigEndian::read_u32(&vh_buf[40..44]);
-    let old_total = BigEndian::read_u32(&vh_buf[44..48]);
-    let old_free = BigEndian::read_u32(&vh_buf[48..52]);
-    let used_blocks = old_total - old_free;
-
-    let new_total = (new_size_bytes / block_size as u64) as u32;
-    if new_total < used_blocks {
-        anyhow::bail!(
-            "HFS+ resize: new size {} blocks < used {} blocks",
-            new_total,
-            used_blocks
-        );
+    let mut vh = HfsPlusVolumeHeader::parse(&vh_buf)?;
+    let bs = vh.block_size;
+    let old_total = vh.total_blocks;
+    let new_total = (new_size_bytes / bs as u64) as u32;
+    if new_total < 8 {
+        anyhow::bail!("HFS+ resize: {new_size_bytes} bytes is too small for a volume");
     }
 
-    let new_free = new_total - used_blocks;
+    // The allocation file is one extent on every volume Apple or we format.
+    let af = &vh.allocation_file;
+    if af.extents[0].block_count == 0 || af.extents[1].block_count != 0 {
+        anyhow::bail!("HFS+ resize: the allocation file is not a single extent; refusing");
+    }
+    let (mut af_start, mut af_blocks) = (af.extents[0].start_block, af.extents[0].block_count);
+    let mut bitmap = vec![0u8; af_blocks as usize * bs as usize];
+    device.seek(SeekFrom::Start(
+        partition_offset + af_start as u64 * bs as u64,
+    ))?;
+    device.read_exact(&mut bitmap)?;
 
+    let old_tail = alt_vh_blocks(old_total, bs);
+    let new_tail = alt_vh_blocks(new_total, bs);
+    if new_total < old_total {
+        // A count says nothing about position: the last used block must fit.
+        let highest = find_last_set_bit(&bitmap, old_tail.start).map_or(0, |b| b + 1);
+        if highest > new_tail.start {
+            anyhow::bail!(
+                "HFS+ resize: new size {} blocks ends before the last allocated block ({})",
+                new_total,
+                highest
+            );
+        }
+    }
+
+    // The alternate header's blocks move with the end of the volume (R-056);
+    // bits past the old end were padding and the grown area starts free.
+    let cap_bits = (bitmap.len() as u64 * 8).min(u32::MAX as u64) as u32;
+    for b in old_tail.start..old_total.min(cap_bits) {
+        bitmap_clear_bit_be(&mut bitmap, b);
+    }
+    for b in old_total..new_total.min(cap_bits) {
+        bitmap_clear_bit_be(&mut bitmap, b);
+    }
+
+    // A bigger volume may need a bigger allocation file: extend it in place
+    // when the blocks after it are free, else move it to a free run.
+    let needed_blocks = (new_total as u64).div_ceil(8).div_ceil(bs as u64) as u32;
+    if needed_blocks > af_blocks {
+        let mut grown = bitmap.clone();
+        grown.resize(needed_blocks as usize * bs as usize, 0);
+        let usable = new_tail.start;
+        let extend_ok = (af_start + af_blocks..af_start + needed_blocks)
+            .all(|b| b < usable && !bitmap_test_bit_be(&grown, b));
+        let new_start = if extend_ok {
+            af_start
+        } else {
+            hfs_common::bitmap_find_clear_run_be(&grown, usable, needed_blocks).ok_or_else(
+                || {
+                    anyhow::anyhow!(
+                        "HFS+ resize: no free run of {needed_blocks} blocks for the allocation file"
+                    )
+                },
+            )?
+        };
+        if new_start != af_start {
+            for b in af_start..af_start + af_blocks {
+                bitmap_clear_bit_be(&mut grown, b);
+            }
+        }
+        for b in new_start..new_start + needed_blocks {
+            bitmap_set_bit_be(&mut grown, b);
+        }
+        log(&format!(
+            "HFS+ resize: allocation file grows from {af_blocks} to {needed_blocks} blocks at \
+             block {new_start}"
+        ));
+        bitmap = grown;
+        af_start = new_start;
+        af_blocks = needed_blocks;
+        vh.allocation_file.extents[0] = ExtentDescriptor {
+            start_block: af_start,
+            block_count: af_blocks,
+        };
+        vh.allocation_file.total_blocks = af_blocks;
+        vh.allocation_file.logical_size = af_blocks as u64 * bs as u64;
+    }
+    for b in new_tail.clone() {
+        bitmap_set_bit_be(&mut bitmap, b);
+    }
+    let cap_bits = (bitmap.len() as u64 * 8).min(u32::MAX as u64) as u32;
+    for b in new_total..cap_bits {
+        bitmap_clear_bit_be(&mut bitmap, b);
+    }
+
+    let used = count_used_blocks(&bitmap, new_total);
+    vh.total_blocks = new_total;
+    vh.free_blocks = new_total - used;
+    if vh.next_allocation >= new_tail.start {
+        vh.next_allocation = 0;
+    }
     log(&format!(
         "HFS+ resize: {} -> {} blocks ({} free)",
-        old_total, new_total, new_free
+        old_total, new_total, vh.free_blocks
     ));
 
-    // Update volume header fields
-    BigEndian::write_u32(&mut vh_buf[44..48], new_total);
-    BigEndian::write_u32(&mut vh_buf[48..52], new_free);
-
-    // Write primary volume header at offset + 1024
+    device.seek(SeekFrom::Start(
+        partition_offset + af_start as u64 * bs as u64,
+    ))?;
+    device.write_all(&bitmap)?;
+    let out = vh.serialize();
     device.seek(SeekFrom::Start(partition_offset + 1024))?;
-    device.write_all(&vh_buf)?;
-
-    // Write backup volume header at offset + new_size - 1024
+    device.write_all(&out)?;
     if new_size_bytes > 1024 {
         device.seek(SeekFrom::Start(partition_offset + new_size_bytes - 1024))?;
-        device.write_all(&vh_buf)?;
+        device.write_all(&out)?;
     }
-
     device.flush()?;
     Ok(())
+}
+
+/// Mirror the volume header 1024 bytes before the partition end when the
+/// volume is smaller than its partition, where Mac OS looks for it (R-057).
+/// Returns whether a copy was written.
+pub fn mirror_alternate_volume_header(
+    device: &mut (impl Read + Write + Seek),
+    partition_offset: u64,
+    partition_len: u64,
+    log: &mut impl FnMut(&str),
+) -> anyhow::Result<bool> {
+    device.seek(SeekFrom::Start(partition_offset + 1024))?;
+    let mut vh_buf = [0u8; 512];
+    device.read_exact(&mut vh_buf)?;
+    let sig = BigEndian::read_u16(&vh_buf[0..2]);
+    if sig != HFS_PLUS_SIGNATURE && sig != HFSX_SIGNATURE {
+        return Ok(false);
+    }
+    let block_size = BigEndian::read_u32(&vh_buf[40..44]) as u64;
+    let total_blocks = BigEndian::read_u32(&vh_buf[44..48]) as u64;
+    let volume_len = total_blocks * block_size;
+    if partition_len < 2048 || volume_len >= partition_len {
+        return Ok(false);
+    }
+    device.seek(SeekFrom::Start(partition_offset + partition_len - 1024))?;
+    device.write_all(&vh_buf)?;
+    device.flush()?;
+    log(&format!(
+        "HFS+ volume of {volume_len} bytes in a {partition_len}-byte partition: alternate \
+         volume header mirrored at the partition end"
+    ));
+    Ok(true)
+}
+
+/// The blocks that hold a volume's alternate volume header, its last 1024
+/// bytes: one block at 1024 bytes and up, two at 512.
+fn alt_vh_blocks(total_blocks: u32, block_size: u32) -> std::ops::Range<u32> {
+    if total_blocks == 0 {
+        return 0..0;
+    }
+    let bytes = total_blocks as u64 * block_size as u64;
+    let start = (bytes.saturating_sub(1024) / block_size as u64) as u32;
+    start..total_blocks
+}
+
+/// Set bits among the first `total_blocks` of the allocation bitmap.
+fn count_used_blocks(bitmap: &[u8], total_blocks: u32) -> u32 {
+    let full = (total_blocks / 8) as usize;
+    let mut used: u32 = bitmap[..full.min(bitmap.len())]
+        .iter()
+        .map(|b| b.count_ones())
+        .sum();
+    let keep = total_blocks % 8;
+    if keep > 0 {
+        if let Some(&last) = bitmap.get(full) {
+            let mask = 0xFFu8 << (8 - keep);
+            used += (last & mask).count_ones();
+        }
+    }
+    used
 }
 
 /// Validate HFS+ filesystem integrity.
@@ -6192,6 +6423,85 @@ pub fn validate_hfsplus_integrity(
 #[allow(clippy::identity_op)] // `1usize * block_size` keeps offset rows aligned
 mod tests {
     use super::*;
+
+    /// A thousand files in, one more in and out, the thousand out, one in:
+    /// the catalog must stay clean through every split, merge and retire.
+    #[test]
+    fn thousand_file_churn_keeps_the_catalog_clean() {
+        use std::io::Cursor;
+        let img = create_blank_hfsplus(64 * 1024 * 1024, 4096, "Churn", false);
+        let mut fs = HfsPlusFilesystem::open(Cursor::new(img), 0).unwrap();
+        fs.prepare_for_edit().unwrap();
+        let root = fs.root().unwrap();
+        let clean = |fs: &mut HfsPlusFilesystem<Cursor<Vec<u8>>>, stage: &str| {
+            fs.sync_metadata().unwrap();
+            let r = fs.fsck().expect("hfsplus has fsck").unwrap();
+            assert!(r.errors.is_empty(), "{stage}: {:?}", r.errors);
+        };
+        let put = |fs: &mut HfsPlusFilesystem<Cursor<Vec<u8>>>, name: &str, data: &[u8]| {
+            fs.create_file(
+                &root,
+                name,
+                &mut Cursor::new(data),
+                data.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .unwrap_or_else(|e| panic!("creating {name}: {e}"))
+        };
+        let free0 = fs.vh.free_blocks;
+        let trees0 = fs.vh.catalog_file.total_blocks + fs.vh.extents_file.total_blocks;
+        for i in 0..1000 {
+            put(
+                &mut fs,
+                &format!("f{i:04}.txt"),
+                format!("file {i:04}").as_bytes(),
+            );
+        }
+        clean(&mut fs, "after 1000 creates");
+        let extra = put(&mut fs, "extra.bin", &[7u8; 5000]);
+        clean(&mut fs, "after one more");
+        fs.delete_entry(&root, &extra).unwrap();
+        clean(&mut fs, "after deleting it");
+        for e in fs.list_directory(&root).unwrap() {
+            fs.delete_entry(&root, &e).unwrap();
+        }
+        // The B-trees keep what they grew by; every other block comes back.
+        let trees = fs.vh.catalog_file.total_blocks + fs.vh.extents_file.total_blocks;
+        assert_eq!(
+            fs.vh.free_blocks + (trees - trees0),
+            free0,
+            "every block came back"
+        );
+        clean(&mut fs, "after deleting the 1000");
+        put(&mut fs, "last.bin", &[9u8; 100]);
+        clean(&mut fs, "after the last create");
+        let names: Vec<String> = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names, ["last.bin"]);
+    }
+
+    /// Apple stamps kBTBigKeysMask on every HFS+ tree and adds
+    /// kBTVariableIndexKeysMask on the catalog and attributes trees; so do we.
+    #[test]
+    fn blank_btree_headers_carry_apples_attribute_bits() {
+        let img = create_blank_hfsplus(16 * 1024 * 1024, 4096, "Attrs", false);
+        let vh = &img[1024..1536];
+        let block_size = BigEndian::read_u32(&vh[0x28..0x2c]) as usize;
+        // BTHeaderRec.attributes sits at node offset 14 + 38; a fork's first
+        // extent start is 16 bytes into its HFSPlusForkData (extents file at
+        // 0xC0, catalog at 0x110 in the volume header).
+        let attrs = |fork: usize| {
+            let start = BigEndian::read_u32(&vh[fork + 0x10..fork + 0x14]) as usize;
+            BigEndian::read_u32(&img[start * block_size + 52..start * block_size + 56])
+        };
+        assert_eq!(attrs(0xC0), hfs_common::KBT_BIG_KEYS_MASK, "extents");
+        let variable = hfs_common::KBT_BIG_KEYS_MASK | hfs_common::KBT_VARIABLE_INDEX_KEYS_MASK;
+        assert_eq!(attrs(0x110), variable, "catalog");
+    }
 
     #[test]
     fn test_volume_header_parse() {
@@ -7037,6 +7347,146 @@ mod tests {
             .expect("clean volume should accept edit prep");
         // No xattrs on the synthetic image — the cached set is empty.
         assert!(fs.xattr_cnids.as_ref().unwrap().is_empty());
+    }
+
+    /// Fill many leaves, delete everything, fill again: no index record may
+    /// point at a freed leaf, or the next insert lands in a free node.
+    #[test]
+    fn deleting_a_leafs_first_record_refreshes_the_separators() {
+        // fsck_hfs E_IKey: after the audit's fill-and-delete run the parent
+        // still carried the first key the leaf had before the delete.
+        use super::hfs_common::{
+            btree_record_range, btree_stale_index_keys, BTreeHeader, BTreeKeyFormat,
+        };
+        type Fs = HfsPlusFilesystem<std::io::Cursor<Vec<u8>>>;
+        let img = create_blank_hfsplus_sized(64 * 1024 * 1024, 4096, "IKey", false, 16 << 20, 0);
+        let mut fs = Fs::open(std::io::Cursor::new(img), 0).unwrap();
+        fs.prepare_for_edit().unwrap();
+        let root = fs.root().unwrap();
+        let options = CreateFileOptions::default();
+        for i in 0..1200 {
+            let mut empty = std::io::Cursor::new(Vec::new());
+            fs.create_file(&root, &format!("f{i:04}.txt"), &mut empty, 0, &options)
+                .unwrap();
+        }
+        let node_size = fs.catalog_node_size();
+        let header = BTreeHeader::read(fs.catalog_data());
+        assert!(
+            header.depth >= 2,
+            "need an index level, depth {}",
+            header.depth
+        );
+
+        // The first record of the second leaf is a file record: deleting that
+        // file changes the key its parent's separator must carry.
+        let first = header.first_leaf_node as usize;
+        let second =
+            BigEndian::read_u32(&fs.catalog_data()[first * node_size..first * node_size + 4])
+                as usize;
+        let name = {
+            let node = &fs.catalog_data()[second * node_size..(second + 1) * node_size];
+            let (s, e) = btree_record_range(node, node_size, 0);
+            let rec = &node[s..e];
+            let name_len = BigEndian::read_u16(&rec[6..8]) as usize;
+            (0..name_len)
+                .map(|i| BigEndian::read_u16(&rec[8 + 2 * i..10 + 2 * i]) as u8 as char)
+                .collect::<String>()
+        };
+        assert!(
+            name.starts_with('f'),
+            "expected a file record first, got {name:?}"
+        );
+        let victim = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == name)
+            .expect("victim listed");
+        fs.delete_entry(&root, &victim).unwrap();
+
+        let cmp = |a: &[u8], b: &[u8]| Fs::catalog_compare(a, b, false);
+        let stale = btree_stale_index_keys(
+            fs.catalog_data(),
+            node_size,
+            &BTreeKeyFormat::HFSPLUS_CATALOG,
+            &cmp,
+        );
+        assert!(stale.is_empty(), "separators still stale: {stale:?}");
+        let report = fs.fsck().unwrap().unwrap();
+        assert!(
+            report.errors.is_empty(),
+            "{:?}",
+            report
+                .errors
+                .iter()
+                .map(|e| &e.message)
+                .take(4)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn emptied_leaves_leave_the_index_too() {
+        use crate::fs::hfs_common::{btree_bitmap_test, btree_record_range, BTREE_INDEX_NODE};
+        let img = create_blank_hfsplus(32 * 1024 * 1024, 4096, "Leaves", false);
+        let mut fs = HfsPlusFilesystem::open(std::io::Cursor::new(img), 0).unwrap();
+        fs.prepare_for_edit().unwrap();
+        let root = fs.root().unwrap();
+        let names: Vec<String> = (0..220).map(|i| format!("leaf-file-{i:04}.txt")).collect();
+        let fill = |fs: &mut HfsPlusFilesystem<std::io::Cursor<Vec<u8>>>| {
+            for n in &names {
+                let mut src = std::io::Cursor::new(n.as_bytes().to_vec());
+                fs.create_file(
+                    &root,
+                    n,
+                    &mut src,
+                    n.len() as u64,
+                    &CreateFileOptions::default(),
+                )
+                .unwrap_or_else(|e| panic!("create {n}: {e:?}"));
+            }
+        };
+        fill(&mut fs);
+        assert!(
+            fs.catalog_header.depth > 1,
+            "the test needs a split catalog"
+        );
+
+        for e in fs.list_directory(&root).unwrap() {
+            fs.delete_entry(&root, &e).unwrap();
+        }
+        // No index record may point at a free node.
+        let node_size = fs.catalog_header.node_size as usize;
+        let data = &fs.catalog_data;
+        for idx in 1..(data.len() / node_size) as u32 {
+            if !btree_bitmap_test(data, node_size, idx) {
+                continue;
+            }
+            let off = idx as usize * node_size;
+            let node = &data[off..off + node_size];
+            if node[8] as i8 != BTREE_INDEX_NODE {
+                continue;
+            }
+            let n = BigEndian::read_u16(&node[10..12]) as usize;
+            for r in 0..n {
+                let (_, end) = btree_record_range(node, node_size, r);
+                let child = BigEndian::read_u32(&node[end - 4..end]);
+                assert!(
+                    btree_bitmap_test(data, node_size, child),
+                    "index node {idx} points at free node {child}"
+                );
+            }
+        }
+
+        fill(&mut fs);
+        let listed = fs.list_directory(&root).unwrap();
+        assert_eq!(listed.len(), names.len());
+        for e in &listed {
+            assert_eq!(fs.read_file(e, usize::MAX).unwrap(), e.name.as_bytes());
+        }
+        fs.sync_metadata().unwrap();
+        let report = fs.fsck().unwrap().unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
     }
 
     #[test]
@@ -8397,9 +8847,9 @@ mod tests {
         let defrag = fs.defragmented_minimum_size().unwrap();
 
         assert_eq!(total, 256 * 4096);
-        // Last allocated block is 5 (bits 0..=5 set in bitmap byte 0) →
-        // byte (5+1) * 4096 = 24 KiB.
-        assert_eq!(in_place, 6 * 4096);
+        // Last allocated block is 5 (bits 0..=5 set in bitmap byte 0), plus
+        // one block for the alternate VH at the new end: (5+1+1) * 4096.
+        assert_eq!(in_place, 7 * 4096);
         // Defrag = (used + catalog_total_blocks*3) blocks * block_size +
         // 1024 alt-VH, rounded up. Synthetic image's catalog_total_blocks
         // is 4 → delta is 12 → 6 + 12 = 18 user blocks + alt-VH = 19.
@@ -8435,8 +8885,9 @@ mod tests {
         let in_place = fs.last_data_byte().unwrap();
         let defrag = fs.defragmented_minimum_size().unwrap();
 
-        // In-place trim hugs the new tail allocation: byte (200+1)*4096.
-        assert_eq!(in_place, 201 * 4096);
+        // In-place trim hugs the new tail allocation plus the alternate-VH
+        // block: (200+1+1)*4096.
+        assert_eq!(in_place, 202 * 4096);
         // Defrag: (7 used + 12 catalog-growth) blocks * 4096 + 1024 alt-VH,
         // rounded up = 20 blocks. Still well under in_place (201 blocks).
         assert_eq!(defrag, 20 * 4096);
@@ -8778,6 +9229,7 @@ mod tests {
                 &[0u8; 4],
                 &[0u8; 4],
                 None,
+                0,
             ));
             fs.insert_catalog_record(&kr)
                 .unwrap_or_else(|e| panic!("insert #{i} into dir{d}: {e}"));
@@ -8991,6 +9443,77 @@ mod tests {
         assert_eq!(total as u32, N, "reopen lost files: {total} != {N}");
     }
 
+    /// H8: with blocks larger than nodes a grow added one block per node,
+    /// twice (or four times) what the nodes occupy, on every grow.
+    /// H7: the alternate volume header went to total_blocks * block_size - 1024;
+    /// fsck_hfs and the Mac read 1024 bytes before the partition end.
+    #[test]
+    fn the_alternate_volume_header_follows_the_partition_end_when_known() {
+        use crate::fs::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+        const VOLUME: u64 = 8 * 1024 * 1024;
+        const PARTITION: u64 = VOLUME + 6 * 1024;
+        let mut img = create_blank_hfsplus(VOLUME, 4096, "Slack", false);
+        img.resize(PARTITION as usize, 0);
+        {
+            let mut fs =
+                HfsPlusFilesystem::open_sized(std::io::Cursor::new(&mut img), 0, Some(PARTITION))
+                    .unwrap();
+            fs.prepare_for_edit().unwrap();
+            let root = fs.root().unwrap();
+            fs.create_file(&root, "a", &mut &b"x"[..], 1, &CreateFileOptions::default())
+                .unwrap();
+            fs.sync_metadata().unwrap();
+        }
+        let primary = &img[1024..1536];
+        let alt = &img[PARTITION as usize - 1024..PARTITION as usize - 512];
+        assert_eq!(
+            &alt[0..2],
+            b"H+",
+            "alternate volume header missing at the partition end"
+        );
+        assert_eq!(primary, alt);
+    }
+
+    /// H14: an imported file's Finder flags had no way into create_file.
+    #[test]
+    fn create_file_writes_the_finder_flags_it_is_given() {
+        use crate::fs::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+        let mut img = create_blank_hfsplus(8 * 1024 * 1024, 4096, "Flags", false);
+        let mut fs = HfsPlusFilesystem::open(std::io::Cursor::new(&mut img), 0).unwrap();
+        fs.prepare_for_edit().unwrap();
+        let root = fs.root().unwrap();
+        let opts = CreateFileOptions {
+            os_type: Some(*b"APPL"),
+            os_creator: Some(*b"ttxt"),
+            finder_flags: Some(0x2000),
+            ..Default::default()
+        };
+        fs.create_file(&root, "app", &mut &b"x"[..], 1, &opts)
+            .unwrap();
+        fs.sync_metadata().unwrap();
+        let entry = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "app")
+            .unwrap();
+        assert_eq!(entry.finder_flags, Some(0x2000));
+    }
+
+    #[test]
+    fn a_grow_allocates_the_blocks_the_new_nodes_occupy() {
+        // 4 KiB nodes in 8 KiB blocks: 8 nodes are 4 blocks, not 8.
+        assert_eq!(btree_grow_blocks(10, 8, 4096, 8192), 4);
+        // 1 KiB nodes in 4 KiB blocks: 8 nodes are 2 blocks.
+        assert_eq!(btree_grow_blocks(4, 8, 1024, 4096), 2);
+        // An odd node count leaves half a block of slack that the grow uses first.
+        assert_eq!(btree_grow_blocks(11, 8, 4096, 8192), 4);
+        assert_eq!(btree_grow_blocks(11, 1, 4096, 8192), 0);
+        // Nodes larger than blocks keep the old one-node-many-blocks answer.
+        assert_eq!(btree_grow_blocks(10, 8, 4096, 512), 64);
+        assert_eq!(btree_grow_blocks(10, 8, 4096, 4096), 8);
+    }
+
     #[test]
     fn test_hfsplus_catalog_grows_fork_on_full_phase_a() {
         // §4b Phase A (docs/todo_hfsplus_fork_growth.md): a volume whose catalog
@@ -9038,6 +9561,7 @@ mod tests {
                 &[0u8; 4],
                 &[0u8; 4],
                 None,
+                0,
             ));
             fs.insert_catalog_record(&kr)
                 .unwrap_or_else(|e| panic!("insert #{i} into dir{d} (grow should cover it): {e}"));
@@ -9335,6 +9859,121 @@ mod tests {
             got, payload,
             "fragmented read-back mismatch through split overflow tree"
         );
+    }
+
+    #[test]
+    fn deleting_the_last_overflow_record_retires_the_extents_tree() {
+        // fsck_hfs E_BadNode: the audit's H3 delete left the extents tree as a
+        // depth-1 root leaf with no records, which Apple never writes.
+        use super::hfs_common::{btree_lonely_empty_leaves, BTreeHeader};
+        type Fs = HfsPlusFilesystem<std::io::Cursor<Vec<u8>>>;
+        let img = create_blank_hfsplus_sized(32 << 20, 4096, "Retire", false, 0, 256 << 10);
+        let mut fs = Fs::open(std::io::Cursor::new(img), 0).unwrap();
+        fs.prepare_for_edit().unwrap();
+
+        // Free singleton blocks only, so the file fragments into the overflow tree.
+        fs.ensure_bitmap().unwrap();
+        let block_size = fs.vh.block_size as usize;
+        let n_blocks: u32 = 520;
+        let first_free = fs.vh.next_allocation;
+        {
+            let bitmap = fs.bitmap.as_mut().unwrap();
+            for b in bitmap.iter_mut() {
+                *b = 0xFF;
+            }
+            let mut blk = first_free + 1;
+            for _ in 0..n_blocks {
+                bitmap_clear_bit_be(bitmap, blk);
+                blk += 2;
+            }
+        }
+        fs.vh.free_blocks = n_blocks;
+        let payload: Vec<u8> = (0..(n_blocks as usize * block_size))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let root = fs.root().unwrap();
+        let entry = fs
+            .create_file(
+                &root,
+                "frag.bin",
+                &mut std::io::Cursor::new(payload.clone()),
+                payload.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+        let before = BTreeHeader::read(fs.extents_overflow_data.as_ref().unwrap());
+        assert!(
+            before.depth >= 2 && before.leaf_records > 0,
+            "depth {} leaf_records {}",
+            before.depth,
+            before.leaf_records
+        );
+
+        fs.delete_entry(&root, &entry).unwrap();
+
+        let tree = fs.extents_overflow_data.as_ref().unwrap();
+        let h = BTreeHeader::read(tree);
+        assert_eq!((h.leaf_records, h.root_node, h.depth), (0, 0, 0));
+        assert_eq!(
+            h.free_nodes,
+            h.total_nodes - 1,
+            "only the header node stays"
+        );
+        // The hand-made bitmap above never reaches disk, so no fsck here; the
+        // audit's verify-fs-macos.sh runs fsck_hfs on the real image instead.
+        assert!(btree_lonely_empty_leaves(tree, h.node_size as usize).is_empty());
+    }
+
+    #[test]
+    fn a_grow_moves_the_alternate_header_blocks_and_the_bitmap() {
+        // fsck_hfs on the audit's H7 grow: "orphaned blocks" at the old tail,
+        // "under-allocation" at the new one. The 2 KiB case also outgrows its
+        // one-block allocation file, which has to move.
+        type Fs = HfsPlusFilesystem<std::io::Cursor<Vec<u8>>>;
+        for (bs, old_mib, new_mib) in [(4096u32, 24u64, 30u64), (2048u32, 32u64, 64u64)] {
+            let mut img = create_blank_hfsplus(old_mib << 20, bs, "Grow", false);
+            img.resize((new_mib << 20) as usize, 0);
+            let mut cur = std::io::Cursor::new(img);
+            let mut log = |_: &str| {};
+            resize_hfsplus_in_place(&mut cur, 0, new_mib << 20, &mut log).unwrap();
+
+            let mut fs = Fs::open_sized(cur, 0, Some(new_mib << 20)).unwrap();
+            let total = fs.vh.total_blocks;
+            assert_eq!(total as u64, (new_mib << 20) / bs as u64, "bs {bs}");
+            let bitmap = fs.read_allocation_bitmap_for_fsck().unwrap();
+            let old_total = ((old_mib << 20) / bs as u64) as u32;
+            for b in alt_vh_blocks(old_total, bs) {
+                assert!(
+                    !bitmap_test_bit_be(&bitmap, b),
+                    "bs {bs}: old tail block {b} still marked"
+                );
+            }
+            for b in alt_vh_blocks(total, bs) {
+                assert!(
+                    bitmap_test_bit_be(&bitmap, b),
+                    "bs {bs}: new tail block {b} is free"
+                );
+            }
+            let used = (0..total)
+                .filter(|&b| bitmap_test_bit_be(&bitmap, b))
+                .count() as u32;
+            assert_eq!(fs.vh.free_blocks, total - used, "bs {bs}");
+            assert!(
+                fs.vh.allocation_file.total_blocks as u64 * bs as u64 * 8 >= total as u64,
+                "bs {bs}: allocation file too small for {total} blocks"
+            );
+            let report = fs.fsck().unwrap().unwrap();
+            assert!(
+                report.errors.is_empty(),
+                "bs {bs}: {:?}",
+                report
+                    .errors
+                    .iter()
+                    .map(|e| &e.message)
+                    .take(4)
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]

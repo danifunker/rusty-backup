@@ -73,29 +73,13 @@ pub fn run(args: GrowArgs) -> Result<()> {
             args.image.display()
         );
     } else {
-        let mut f = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&args.image)
-            .with_context(|| format!("opening {}", args.image.display()))?;
-        use std::io::{Seek, SeekFrom, Write};
-        let cur = f.seek(SeekFrom::End(0))?;
-        log_stderr(format!(
-            "rb-cli grow: appending {} of zeros to {} (current size {})",
-            format_size(add),
-            args.image.display(),
-            format_size(cur)
-        ));
-        // Write in 1-MiB chunks so very large grows don't allocate huge buffers.
-        let chunk = vec![0u8; 1024 * 1024];
-        let mut remaining = add;
-        while remaining > 0 {
-            let n = remaining.min(chunk.len() as u64) as usize;
-            f.write_all(&chunk[..n])?;
-            remaining -= n as u64;
-        }
-        f.flush()?;
-        log_stderr(format!("grown: new size {}", format_size(cur + add)));
+        // The GUI's Expand Image helper: a fixed VHD keeps its footer at the
+        // end, and a container whose bytes are not the disk is refused.
+        let new_total = crate::partition::resize::expand_image_file(&args.image, add, &mut |m| {
+            log_stderr(format!("rb-cli grow: {m}"))
+        })
+        .with_context(|| format!("growing {}", args.image.display()))?;
+        log_stderr(format!("grown: new size {}", format_size(new_total)));
         Ok(())
     }
 }

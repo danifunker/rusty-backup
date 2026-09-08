@@ -58,12 +58,15 @@ Open holes in v4 edit (suggested order — easiest/most reusable first):
 - **(B) block → short-form dir re-compaction** — **shipped 2026-06-02**
   (see §10).
 
-- **(C) leaf/node (multi-block) directories** — **block→leaf conversion
-  shipped 2026-06-02** (v1: 2-data-block leaf form on overflow; see §10).
-  Follow-ups still open: leaf-form INSERT (grow beyond 2 data blocks),
-  leaf-form REMOVE, leaf→block recompaction, node form for very large
-  dirs. v1 is enough to take a single-block dir past 127 entries; further
-  inserts return `Unsupported` with a clear message.
+- **(C) leaf/node (multi-block) directories** — **shipped 2026-09-06**
+  (F-017 in `docs/missing_features_from_regression.md`): leaf and
+  node-form directories are edited in place by `edit/dir2_tree.rs` — the
+  kernel's data-block free space, stale leaf slots, leaf and node splits,
+  root push-down and join, freeindex blocks — with the full rebuild kept
+  for block form, a full leaf1 index and shrinking after removes. Judged
+  by `xfs_repair -n` up to 32000 long names (a second freeindex block);
+  `churn.xfs-deep` takes 300000 names through a two-level da btree. Still
+  parked: merging half-empty sibling leaves (`xfs_dir2_leafn_toosmall`).
 
 - **(D) bmap-btree file forks** — **shipped 2026-06-02** (single-leaf
   bmbt — multi-leaf parked for follow-up; see §10). The R2 abort-on-btree
@@ -482,6 +485,17 @@ research or sourced the needed ROMs/disks.
 
 ### 7.0 — Original user-side verification list (pre-2026-06-05)
 
+- **Ghost FAT32 long-name fixture (D13, shelved 2026-09-03)** — the
+  2026-09-01 audit's D13 (eaa6f3d: a Ghost reconstruction gives
+  prefix-sharing long names distinct 8.3 aliases) could not be judged by
+  Windows: every Ghost image at hand is 8.3-only, and a file-aware image
+  with a FAT and an NTFS partition exposes only the FAT one
+  ([F-010](missing_features_from_regression.md#f-010)). Needed: a Ghost
+  11.5 file-aware image, no password, of one FAT32 partition holding
+  `LongFileName1..5.txt`, `LongFileName_extra.txt`, a name with spaces, a
+  two-dot name, and a `LongDirectoryName` with three more, plus a `dir /x`
+  of the source. Then run `scripts/verify-fs-windows.ps1 -Only D13 -Ghost
+  <image>`. The unit test covers the fix meanwhile.
 - **HFV in BasiliskII / MAME** — boot/mount our blank + cloned HFVs
   against the bootable samples (`Mac OS 8.1.HFV`, `Starterdisk.hfv`).
   Our blank/cloned volumes fsck clean and round-trip byte-identically,

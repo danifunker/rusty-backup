@@ -1,0 +1,158 @@
+# Tier 1 — self-fixturing.
+#
+# The two Be filesystems, exercised end to end without touching the corpus:
+# format a blank volume, write into it, read it back, check it, empty it.
+#
+# BFS is run in **both byte orders** because they are not the same code path
+# in any meaningful sense — BeOS/Intel writes little-endian with the
+# superblock at byte 512, BeOS/PPC writes big-endian with it at byte 0 — and a
+# driver that only ever sees one of them will pass every test right up to the
+# day someone opens a real BeBox disk.
+#
+# The `put`/`fsck`/`rm` sequence is the point. A create that leaks blocks or
+# corrupts the directory B+tree still lists correctly; only reconciling the
+# tree against the allocation bitmap catches it, which is what `fsck` after a
+# write does here. The final `ls` proves the delete gave the space back to the
+# namespace as well as to the bitmap.
+#
+# BFS needs 72 MiB minimum: a real volume puts its root directory in
+# allocation group 8, and we match that rather than inventing a layout BeOS
+# has never seen.
+
+[meta]
+tier = 1
+group = "fs.beos"
+description = "BFS (both byte orders) and BeOS OFS: format, write, check, delete."
+
+# --- BFS, little-endian (BeOS/Intel) -----------------------------------------
+
+[[case]]
+id = "fs.bfs.le.write-check-delete"
+description = "A little-endian BFS volume takes a file, fscks clean, and gives the space back"
+[[case.step]]
+args = ["new", "volume", "bfs", "--size", "72M", "--name", "BeTest", "{scratch}/le.bfs"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/le.bfs", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+[[case.step.json_equals]]
+path = "partitions.0.type_name"
+value = "BFS"
+[[case.step]]
+args = ["mkdir", "{scratch}/le.bfs", "/docs"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/le.bfs", "{cases}/tier1/forked-file", "/docs/hello.txt"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{scratch}/le.bfs", "/docs", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+[[case.step.json_equals]]
+path = "0.name"
+value = "hello.txt"
+# The whole reason this case exists: a write that leaks blocks or breaks the
+# B+tree still lists fine. Only the bitmap reconciliation catches it.
+[[case.step]]
+args = ["fsck", "{scratch}/le.bfs", "--checkonly", "--format", "json"]
+expect_exit = 0
+fsck_clean = true
+[[case.step]]
+args = ["rm", "-r", "{scratch}/le.bfs", "/docs"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{scratch}/le.bfs", "/", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+stdout_not_contains = ["docs", "hello.txt"]
+[[case.step]]
+args = ["fsck", "{scratch}/le.bfs", "--checkonly", "--format", "json"]
+expect_exit = 0
+fsck_clean = true
+
+# --- BFS, big-endian (BeOS/PPC) ----------------------------------------------
+
+[[case]]
+id = "fs.bfs.be.write-check-delete"
+description = "The same sequence on a big-endian BFS volume, which is where the PPC fixtures live"
+[[case.step]]
+args = [
+    "new", "volume", "bfs", "--size", "72M", "--name", "BePPC",
+    "--big-endian", "{scratch}/be.bfs",
+]
+expect_exit = 0
+[[case.step]]
+args = ["mkdir", "{scratch}/be.bfs", "/docs"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/be.bfs", "{cases}/tier1/forked-file", "/docs/hello.txt"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{scratch}/be.bfs", "/docs", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+[[case.step.json_equals]]
+path = "0.name"
+value = "hello.txt"
+[[case.step]]
+args = ["fsck", "{scratch}/be.bfs", "--checkonly", "--format", "json"]
+expect_exit = 0
+fsck_clean = true
+[[case.step]]
+args = ["rm", "-r", "{scratch}/be.bfs", "/docs"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/be.bfs", "--checkonly", "--format", "json"]
+expect_exit = 0
+fsck_clean = true
+
+# --- BeOS OFS ----------------------------------------------------------------
+
+[[case]]
+id = "fs.ofs.write-check-delete"
+description = "The pre-BFS Be filesystem: format, write, check, delete"
+[[case.step]]
+args = ["new", "volume", "ofs", "--size", "8M", "--name", "hobbit", "{scratch}/v.ofs"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/v.ofs", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+[[case.step.json_equals]]
+path = "partitions.0.type_name"
+value = "BeOS OFS"
+[[case.step]]
+args = ["mkdir", "{scratch}/v.ofs", "/docs"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.ofs", "{cases}/tier1/forked-file", "/docs/hello.txt"]
+expect_exit = 0
+# Early BeOS typed files the way the Mac Finder did, so a `.txt` has to land
+# as TEXT rather than as a generic BINA blob.
+[[case.step]]
+args = ["ls", "{scratch}/v.ofs", "/docs", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+[[case.step.json_equals]]
+path = "0.name"
+value = "hello.txt"
+[[case.step.json_equals]]
+path = "0.type_code"
+value = "TEXT"
+[[case.step]]
+args = ["fsck", "{scratch}/v.ofs", "--checkonly", "--format", "json"]
+expect_exit = 0
+fsck_clean = true
+[[case.step]]
+args = ["rm", "-r", "{scratch}/v.ofs", "/docs"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{scratch}/v.ofs", "/", "--format", "json"]
+expect_exit = 0
+expect_envelope_ok = true
+stdout_not_contains = ["docs", "hello.txt"]
+[[case.step]]
+args = ["fsck", "{scratch}/v.ofs", "--checkonly", "--format", "json"]
+expect_exit = 0
+fsck_clean = true

@@ -36,7 +36,8 @@ use crate::remote::protocol::{
     read_member_header, read_member_request, write_binary_hello, write_control,
     write_get_open_reply, write_member_stream, write_put_ack, write_put_result, write_resume_map,
     ChunkWriter, FamilyBOp, Handshake, PutHeader, Request, Response, ResumeEntry, WireEntry,
-    WireKind, CAP_FAMILY_B, CAP_FAMILY_F, MAX_PUT_CHUNK, PROTOCOL_VERSION, RB_HELLO_MAGIC,
+    WireKind, CAP_FAMILY_B, CAP_FAMILY_F, FAMILY_B_MIN_VERSION, MAX_PUT_CHUNK, PROTOCOL_VERSION,
+    RB_HELLO_MAGIC,
 };
 
 /// A block-tier handle: a host image file (or raw device) kept open for ranged
@@ -801,11 +802,14 @@ fn handle_conn(
             version,
             capabilities,
         }) => {
-            if version != PROTOCOL_VERSION {
+            // The v4 bump was JSON-only, and refusing v3 here silenced every
+            // networked cb-dos operation without a reply it could show.
+            if !(FAMILY_B_MIN_VERSION..=PROTOCOL_VERSION).contains(&version) {
                 // No JSON error path to a binary client; log and drop.
                 eprintln!(
                     "rb-cli serve: rejecting Family-B client speaking v{version}; this daemon \
-                     is v{PROTOCOL_VERSION}. Update cb-dos (RB_PROTO_VER in cbnet.c)."
+                     speaks v{FAMILY_B_MIN_VERSION}..v{PROTOCOL_VERSION}. Update cb-dos \
+                     (RB_PROTO_VER in cbnet.c)."
                 );
                 return Ok(());
             }
@@ -990,10 +994,12 @@ fn handle_conn(
                         } else {
                             None
                         };
-                        let data_res = stage_blob(&mut reader, &blob);
-                        let fork_res = match &fork_blob {
-                            Some(f) => stage_blob(&mut reader, f),
-                            None => Ok(()),
+                        let data_res = stage_blob(&mut reader, &blob)
+                            .and_then(|got| check_staged_len("data fork", size, got));
+                        let fork_res = match (&fork_blob, resource_fork_size) {
+                            (Some(f), Some(want)) => stage_blob(&mut reader, f)
+                                .and_then(|got| check_staged_len("resource fork", want, got)),
+                            _ => Ok(()),
                         };
                         match data_res.and(fork_res) {
                             Ok(()) => {
@@ -1073,6 +1079,14 @@ fn handle_conn(
                 Err(e) => reply_err(&mut writer, format!("{e:#}"))?,
                 Ok(full) if full.is_dir() => {
                     reply_err(&mut writer, format!("{path} is a directory"))?
+                }
+                // A FIFO or device node would block the daemon on open or read.
+                Ok(full)
+                    if !std::fs::metadata(&full)
+                        .map(|m| m.is_file())
+                        .unwrap_or(false) =>
+                {
+                    reply_err(&mut writer, format!("{path} is not a regular file"))?
                 }
                 Ok(full) => match std::fs::File::open(&full) {
                     Err(e) => reply_err(&mut writer, format!("opening {path}: {e}"))?,
@@ -1218,12 +1232,23 @@ fn handle_conn(
                 offset,
                 len,
             } => {
-                // The payload follows as a chunk stream and MUST be consumed
-                // regardless of handle validity, or the framing desyncs.
-                let mut payload = Vec::new();
-                let drained = read_chunks(&mut reader, &mut payload);
+                // The payload follows as a chunk stream and MUST be drained whatever
+                // happens, or the framing desyncs; only a legal write's worth is kept.
+                let mut sink = crate::remote::protocol::CappedSink::new(MAX_RANGE_WRITE as usize);
+                let drained = read_chunks(&mut reader, &mut sink);
+                let payload = sink.buf;
                 match drained {
                     Err(e) => return Err(anyhow!("reading WriteBlock payload: {e}")),
+                    Ok(_) if sink.dropped > 0 || len > MAX_RANGE_WRITE => reply_err(
+                        &mut writer,
+                        format!(
+                            "WriteBlock of {} byte(s) exceeds the {} byte limit",
+                            (payload.len() as u64)
+                                .saturating_add(sink.dropped)
+                                .max(len as u64),
+                            MAX_RANGE_WRITE
+                        ),
+                    )?,
                     Ok(_) => match block_handles.get_mut(&handle) {
                         None => reply_err(&mut writer, format!("no such block handle {handle}"))?,
                         Some(bh) if !bh.writable => {
@@ -1264,7 +1289,8 @@ fn handle_conn(
                 path,
                 is_device,
                 size,
-            } => match open_write_target(root, &path, is_device, size) {
+                force,
+            } => match open_write_target(root, &path, is_device, size, force) {
                 Err(e) => reply_err(&mut writer, format!("{e:#}"))?,
                 Ok((file, actual_size)) => {
                     let handle = next_handle;
@@ -1520,6 +1546,15 @@ mod optical_server {
             let Some(s) = self.session(handle) else {
                 return reply_err(writer, format!("no such optical handle {handle}"));
             };
+            if count > super::MAX_OPTICAL_SECTORS {
+                return reply_err(
+                    writer,
+                    format!(
+                        "{count} sectors asked at once; the limit is {}",
+                        super::MAX_OPTICAL_SECTORS
+                    ),
+                );
+            }
             match s.reader.read_data_sectors(lba, count, mode.into()) {
                 Ok(data) => {
                     // Commit to the stream: FileBegin{actual len} then the bytes.
@@ -1562,13 +1597,57 @@ mod optical_server {
 }
 
 /// Read a chunk stream from the client into a staging blob file.
-fn stage_blob<R: std::io::Read>(reader: &mut R, blob: &Path) -> Result<()> {
-    let mut f = std::fs::File::create(blob)
-        .with_context(|| format!("creating staging blob {}", blob.display()))?;
-    // std::fs::File is unbuffered, so read_chunks' write_all lands every byte
-    // before it returns — no explicit flush needed.
-    read_chunks(reader, &mut f)?;
+fn stage_blob<R: std::io::Read>(reader: &mut R, blob: &Path) -> Result<u64> {
+    // Whatever goes wrong with the file, the chunk stream is read to its end:
+    // a body left on the wire desyncs every request after it.
+    let (file, create_err) = match std::fs::File::create(blob) {
+        Ok(f) => (Some(f), None),
+        Err(e) => (None, Some(e)),
+    };
+    let mut sink = StagingSink {
+        file,
+        failure: None,
+    };
+    let received = read_chunks(reader, &mut sink).context("reading the upload body")?;
+    if let Some(e) = create_err {
+        return Err(e).with_context(|| format!("creating staging blob {}", blob.display()));
+    }
+    if let Some(e) = sink.failure {
+        return Err(e).with_context(|| format!("writing staging blob {}", blob.display()));
+    }
+    Ok(received)
+}
+
+/// A body shorter or longer than the client declared is a broken transfer,
+/// not a file to stage.
+fn check_staged_len(what: &str, declared: u64, received: u64) -> Result<()> {
+    if declared != received {
+        bail!("{what}: client declared {declared} byte(s) but {received} arrived");
+    }
     Ok(())
+}
+
+/// Writes an upload body to its blob until the first error, then keeps
+/// accepting (and dropping) bytes so the chunk stream can still be drained.
+struct StagingSink {
+    file: Option<std::fs::File>,
+    failure: Option<std::io::Error>,
+}
+
+impl std::io::Write for StagingSink {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if let Some(f) = self.file.as_mut() {
+            if let Err(e) = f.write_all(data) {
+                self.failure = Some(e);
+                self.file = None;
+            }
+        }
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// An opened filesystem plus the metadata a remote pane displays.
@@ -1801,6 +1880,10 @@ fn stage_copy_local(
 /// well under this; a larger ask is simply clamped.
 const MAX_RANGE_READ: u32 = 4 * 1024 * 1024;
 
+/// Most sectors one `ReadOpticalSectors` may ask for: the daemon reads them
+/// into memory before streaming, and a client batches far below this.
+const MAX_OPTICAL_SECTORS: u32 = 16 * 1024;
+
 /// Largest single `WriteBlock` payload we honour. The block writer splits big
 /// writes into frames well under this; a larger `len` is rejected rather than
 /// silently truncated, so a desync can't corrupt the image.
@@ -1848,6 +1931,7 @@ fn open_write_target(
     path: &str,
     is_device: bool,
     size: u64,
+    force: bool,
 ) -> Result<(std::fs::File, u64)> {
     if is_device {
         // Same validation as the read-side `open_device`: the path must match a
@@ -1858,6 +1942,14 @@ fn open_write_target(
             .find(|d| d.path.to_string_lossy() == path)
             .ok_or_else(|| anyhow!("{path:?} is not an enumerated device on this machine"))?;
         let dev_path = dev.path.clone();
+        // The disk the daemon boots from is never a restore target; a peer on
+        // the LAN could otherwise overwrite a MiSTer's SD card unprompted.
+        if dev.is_system {
+            bail!(
+                "{} is the system disk of the machine running the daemon; refusing to write it",
+                dev_path.display()
+            );
+        }
         // `open_target_for_writing` does the platform-appropriate prep (unmount /
         // lock); on Linux/MiSTer — the supported daemon target — it returns a
         // plain read-write File. (A Windows/macOS daemon would need to keep the
@@ -1885,6 +1977,13 @@ fn open_write_target(
         Ok((handle.file, dev_size))
     } else {
         let full = sandbox_join_create(root, path)?;
+        // A restore truncates its target; an image that is already there is
+        // only replaced when the client said so.
+        if !force && full.exists() {
+            bail!(
+                "{path} already exists on the daemon; confirm the overwrite (--yes) to replace it"
+            );
+        }
         let f = std::fs::OpenOptions::new()
             .read(true)
             .write(true)

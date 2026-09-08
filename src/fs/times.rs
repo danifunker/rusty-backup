@@ -227,14 +227,18 @@ const DOS_EPOCH_SECS: u64 = 315_532_800;
 ///
 /// Any Unix time before 1980-01-01 clamps to 1980-01-01 00:00:00 (the
 /// earliest representable DOS date) so a pre-1980 mtime doesn't become
-/// year-2107. Any time past 2107-12-31 is truncated to the year mod 128,
-/// which is the same behaviour as every DOS filesystem tool going back to
-/// MS-DOS 2.0 — the year field is only 7 bits and there is nowhere else
-/// to put a bigger value.
+/// year-2107. Anything past 2107-12-31 23:59:58 pins to that moment: the
+/// year field is only 7 bits and there is nowhere else to put a bigger
+/// value.
 pub fn unix_to_dos_datetime(secs: u64) -> (u16, u16) {
     let secs = secs.max(DOS_EPOCH_SECS);
     let (year, month, day, hour, minute, second) = ymd_hms(secs);
-    let year_since_1980 = ((year - 1980).clamp(0, 127)) as u16;
+    // Past 2107 the whole stamp pins to the last representable moment; a
+    // clamped year with the real month and day produced dates like 2107-02-29.
+    if year > 2107 {
+        return ((127 << 9) | (12 << 5) | 31, (23 << 11) | (59 << 5) | 29);
+    }
+    let year_since_1980 = (year - 1980) as u16;
     let date = (year_since_1980 << 9) | ((month as u16 & 0x0F) << 5) | (day as u16 & 0x1F);
     let time =
         ((hour as u16 & 0x1F) << 11) | ((minute as u16 & 0x3F) << 5) | ((second as u16 / 2) & 0x1F);
@@ -318,12 +322,36 @@ pub fn filetime_to_unix(ft: u64) -> Option<u64> {
 /// HFS/HFS+ modules (MFS uses the same epoch and lives elsewhere).
 const MAC_EPOCH_DELTA: u64 = 2_082_844_800;
 
-/// Encode Unix seconds as a Mac epoch u32. Any time before 1904-01-01
-/// clamps to 1904-01-01, any time past 2040-02-06 (the u32 rollover) is
-/// truncated by u32 wraparound — no Mac filesystem tool guards against
-/// that, and no Mac disk we ship dates a file past 2040.
+/// Seconds this host's local time is ahead of UTC, for the filesystems that
+/// store wall-clock time with no zone (classic HFS, MFS).
+pub fn local_utc_offset_secs() -> i64 {
+    chrono::Local::now().offset().local_minus_utc() as i64
+}
+
+/// Unix seconds to a classic-Mac local-time stamp: the wall clock the Mac shows.
+pub fn unix_to_mac_local(secs: u64) -> u32 {
+    let local = (secs as i64).saturating_add(local_utc_offset_secs()).max(0) as u64;
+    unix_to_mac_epoch(local)
+}
+
+/// A classic-Mac local-time stamp back to Unix seconds (UTC).
+pub fn mac_local_to_unix(mac_secs: u32) -> Option<u64> {
+    mac_epoch_to_unix(mac_secs).map(|local| {
+        (local as i64)
+            .saturating_sub(local_utc_offset_secs())
+            .max(0) as u64
+    })
+}
+
+/// The current wall clock as a classic-Mac local-time stamp.
+pub fn mac_local_now() -> u32 {
+    unix_to_mac_local(now())
+}
+
+/// Encode Unix seconds as a Mac epoch u32, clamping at both ends: a bogus
+/// future mtime on an extracted archive used to wrap into 1904..1970.
 pub fn unix_to_mac_epoch(secs: u64) -> u32 {
-    (secs.saturating_add(MAC_EPOCH_DELTA)) as u32
+    u32::try_from(secs.saturating_add(MAC_EPOCH_DELTA)).unwrap_or(u32::MAX)
 }
 
 /// Decode a Mac epoch u32 back to Unix seconds. Mirrors
@@ -582,6 +610,20 @@ mod tests {
 
     /// 2020-06-15 12:34:56 UTC — a mid-range date every encoder can hold.
     const T_2020: u64 = 1_592_224_496;
+
+    /// D19: 2108-02-29 12:00 used to encode as year 127 (2107) with the leap
+    /// day kept, a date that does not exist and that decoders reject.
+    #[test]
+    fn dos_datetime_past_2107_pins_to_the_last_moment() {
+        let leap_2108 = secs_from_ymd_hms(2108, 2, 29, 12, 0, 0);
+        let (d, t) = unix_to_dos_datetime(leap_2108);
+        assert_eq!(
+            dos_datetime_to_unix(d, t),
+            Some(secs_from_ymd_hms(2107, 12, 31, 23, 59, 58))
+        );
+        let (d, t) = unix_to_dos_datetime(u64::MAX / 4);
+        assert!(dos_datetime_to_unix(d, t).is_some());
+    }
 
     #[test]
     fn dos_datetime_round_trips_and_clamps() {

@@ -427,6 +427,14 @@ impl Gpt {
                 RustyBackupError::InvalidGpt(format!("cannot seek to partition entries: {e}"))
             })?;
 
+        // A corrupt header claiming billions of entries used to be read to the
+        // end of the device before failing; 64 Ki entries is 8 MiB of table.
+        if header.num_partition_entries > 65_536 {
+            return Err(RustyBackupError::InvalidGpt(format!(
+                "implausible partition entry count {}",
+                header.num_partition_entries
+            )));
+        }
         let mut entries = Vec::new();
         let entry_size = header.partition_entry_size as usize;
         let mut entry_buf = vec![0u8; entry_size];
