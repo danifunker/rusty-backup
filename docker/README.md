@@ -12,10 +12,22 @@ builds**, so a build is a one-liner. Linux cross artifacts land in
 | `cross-i586-musl.Dockerfile` | `rb-cli` i586 | **static** (musl) | Pentium+ Linux | ✅ runs |
 | `cross-i486.Dockerfile` | `rb-cli` i486 | dynamic (glibc) | 486+ Linux¹ | ✅ builds |
 | `cb-dos.Dockerfile` | DOS `.exe`s | — | DOS (486+) | ✅ runs (DOSBox-X) |
+| `sol9.Dockerfile` | `rb-cli` sparcv9 | dynamic (Solaris) | Solaris 9+ SPARC² | ✅ runs (Blade 2500) |
 
 ¹ i486 *codegen* (no CMPXCHG8B), but Debian's 32-bit glibc is i686-baseline, so
 the binary needs an **i486 rootfs** (Buildroot/musl) to actually run on bare 486
 hardware — see below.
+
+² Solaris 9 is the one **vintage** target that cross-builds end to end on Linux,
+so unlike the PowerPC Mac build it can run unattended in the release pipeline.
+Its base image is the exception to the one-liner above: it needs a Solaris 9
+sysroot, which Sun does not permit redistributing, so the image cannot be
+published and has to be built once from a Solaris 9 sysroot (`docker/sol9-cross/`,
+which CI fetches via the `SOL9_SYSROOT_URL` secret; `Notes/SolarisSysroot.md` in the
+mrustc tree builds one from scratch). Full recipe in
+`docker/sol9.Dockerfile` and [`docs/build-sol9-mrustc.md`](../docs/build-sol9-mrustc.md).
+Verified on a Sun Blade 2500 (SunOS 5.9, sun4u): both parity gates agree with
+the desktop build byte for byte, and the ratatui TUI runs.
 
 ```sh
 # build the toolchain image, then build the artifact (default CMD):

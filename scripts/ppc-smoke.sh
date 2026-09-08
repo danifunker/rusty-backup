@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
-# ppc-smoke.sh -- does the PowerPC build agree with the desktop build?
+# ppc-smoke.sh -- does a vintage build agree with the desktop build?
 #
-# The bar for the PowerPC port is not "it runs" but "it produces the same
+# The bar for a vintage port is not "it runs" but "it produces the same
 # answers": identical `inspect` / `ls` / `fsck` output on the same images, and a
 # backup whose payload and checksum are byte-identical, with `metadata.json`
 # differing only in its `created` timestamp. That comparison had been run by
@@ -11,6 +11,8 @@
 #
 # Usage:
 #   PPC_HOST=admin@g5.local scripts/ppc-smoke.sh [remote-rb-cli]
+#   SOL9_HOST=user@192.168.99.176 RB_SMOKE_SSH_AUTH_SOCK=/run/user/$(id -u)/gcr/ssh \
+#     scripts/ppc-smoke.sh ./rb-cli
 #
 # `remote-rb-cli` defaults to /Users/admin/rb-cli-dev. The local binary is
 # target/release/rb-cli; build it first. Nothing here needs privileges: every
@@ -20,26 +22,28 @@
 
 set -uo pipefail
 
-PPC_HOST="${PPC_HOST:-}"
-REMOTE_BIN="${1:-/Users/admin/rb-cli-dev}"
+# Target host: PPC_HOST, SOL9_HOST or RB_SMOKE_HOST. Nothing below is target-specific.
+SMOKE_HOST="${RB_SMOKE_HOST:-${PPC_HOST:-${SOL9_HOST:-}}}"
+REMOTE_BIN="${1:-${RB_SMOKE_BIN:-/Users/admin/rb-cli-dev}}"
 LOCAL_BIN="${LOCAL_BIN:-target/release/rb-cli}"
 REMOTE_DIR="/tmp/rb-smoke.$$"
 
-[ -n "$PPC_HOST" ] || { echo "PPC_HOST is not set (e.g. PPC_HOST=admin@g5.local)" >&2; exit 2; }
+# SunSSH needs a SHA-1 RSA signature; RB_SMOKE_SSH_AUTH_SOCK picks an agent that will make one.
+[ -n "${RB_SMOKE_SSH_AUTH_SOCK:-}" ] && export SSH_AUTH_SOCK="$RB_SMOKE_SSH_AUTH_SOCK"
+
+[ -n "$SMOKE_HOST" ] || { echo "no target host: set PPC_HOST, SOL9_HOST or RB_SMOKE_HOST" >&2; exit 2; }
 [ -x "$LOCAL_BIN" ] || { echo "$LOCAL_BIN missing - cargo build --release --bin rb-cli" >&2; exit 2; }
 
 LOCAL_BIN="$(cd "$(dirname "$LOCAL_BIN")" && pwd)/$(basename "$LOCAL_BIN")"
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"; ssh "$PPC_HOST" "rm -rf $REMOTE_DIR" 2>/dev/null' EXIT
+trap 'rm -rf "$WORK"; ssh "$SMOKE_HOST" "rm -rf $REMOTE_DIR" 2>/dev/null' EXIT
 
 fails=0
 pass() { printf '  \033[32mOK\033[0m    %s\n' "$1"; }
 fail() { printf '  \033[31mFAIL\033[0m  %s\n' "$1"; fails=$((fails + 1)); }
 
 echo "== building subjects =="
-# One per filesystem family the engine treats differently: FAT (cluster chains),
-# HFS (classic Mac B-trees), ext (Unix inodes). Small: the point is agreement,
-# not throughput.
+# One per filesystem family the engine treats differently: FAT, HFS, ext.
 "$LOCAL_BIN" new floppy fat "$WORK/fat.img" >/dev/null 2>&1 || { echo "new fat failed" >&2; exit 2; }
 "$LOCAL_BIN" new floppy hfs "$WORK/hfs.img" >/dev/null 2>&1 || { echo "new hfs failed" >&2; exit 2; }
 "$LOCAL_BIN" new volume ext3 "$WORK/ext.img" --size 32M >/dev/null 2>&1 || { echo "new ext failed" >&2; exit 2; }
@@ -49,15 +53,18 @@ printf 'rusty-backup smoke subject\n' > "$WORK/payload.txt"
 "$LOCAL_BIN" put "$WORK/ext.img" "$WORK/payload.txt" /hello.txt >/dev/null 2>&1
 echo "  fat.img hfs.img ext.img"
 
-echo "== shipping to $PPC_HOST =="
-ssh "$PPC_HOST" "mkdir -p $REMOTE_DIR" || exit 2
-scp -q "$WORK"/*.img "$PPC_HOST:$REMOTE_DIR/" || exit 2
+echo "== shipping to $SMOKE_HOST =="
+ssh "$SMOKE_HOST" "mkdir -p $REMOTE_DIR" || exit 2
+scp -q "$WORK"/*.img "$SMOKE_HOST:$REMOTE_DIR/" || exit 2
 
 echo "== read-only verbs must agree =="
 for img in fat hfs ext; do
   for verb in "inspect $img.img" "ls $img.img /" "fsck $img.img"; do
-    local_out="$(cd "$WORK" && "$LOCAL_BIN" $verb 2>&1)"
-    remote_out="$(ssh "$PPC_HOST" "cd $REMOTE_DIR && $REMOTE_BIN $verb" 2>&1)"
+    # Capture the streams separately: an ssh 2>&1 merge buffers differently than a local pipe.
+    local_out="$(cd "$WORK" && { "$LOCAL_BIN" $verb >"$WORK/.o" 2>"$WORK/.e"; \
+        printf '<<<out>>>\n'; cat "$WORK/.o"; printf '<<<err>>>\n'; cat "$WORK/.e"; })"
+    remote_out="$(ssh "$SMOKE_HOST" "cd $REMOTE_DIR && { $REMOTE_BIN $verb >.o 2>.e; \
+        printf '<<<out>>>\\n'; cat .o; printf '<<<err>>>\\n'; cat .e; }")"
     if [ "$local_out" = "$remote_out" ]; then
       pass "rb-cli $verb"
     else
@@ -70,10 +77,10 @@ done
 echo "== backup must be byte-identical (payload + checksum) =="
 for img in fat hfs ext; do
   (cd "$WORK" && "$LOCAL_BIN" backup "$img.img" "local-$img" --format zstd --checksum sha256 >/dev/null 2>&1)
-  ssh "$PPC_HOST" "cd $REMOTE_DIR && $REMOTE_BIN backup $img.img remote-$img --format zstd --checksum sha256" >/dev/null 2>&1
+  ssh "$SMOKE_HOST" "cd $REMOTE_DIR && $REMOTE_BIN backup $img.img remote-$img --format zstd --checksum sha256" >/dev/null 2>&1
 
   local_dir="$(find "$WORK/local-$img" -mindepth 1 -maxdepth 1 -type d | head -1)"
-  remote_name="$(ssh "$PPC_HOST" "ls $REMOTE_DIR/remote-$img | head -1")"
+  remote_name="$(ssh "$SMOKE_HOST" "ls $REMOTE_DIR/remote-$img | head -1")"
   [ -n "$local_dir" ] && [ -n "$remote_name" ] || { fail "backup $img produced nothing"; continue; }
 
   mismatch=0
@@ -81,7 +88,7 @@ for img in fat hfs ext; do
     case "$f" in
       metadata.json) continue ;;   # `created` differs by construction
     esac
-    scp -q "$PPC_HOST:$REMOTE_DIR/remote-$img/$remote_name/$f" "$WORK/fetched" 2>/dev/null
+    scp -q "$SMOKE_HOST:$REMOTE_DIR/remote-$img/$remote_name/$f" "$WORK/fetched" 2>/dev/null
     if cmp -s "$local_dir/$f" "$WORK/fetched"; then
       :
     else
@@ -91,7 +98,7 @@ for img in fat hfs ext; do
   done
 
   # metadata.json must differ *only* in `created`.
-  ssh "$PPC_HOST" "cat $REMOTE_DIR/remote-$img/$remote_name/metadata.json" > "$WORK/remote-meta-$img.json" 2>/dev/null
+  ssh "$SMOKE_HOST" "cat $REMOTE_DIR/remote-$img/$remote_name/metadata.json" > "$WORK/remote-meta-$img.json" 2>/dev/null
   if diff <(grep -v '"created"' "$local_dir/metadata.json") \
           <(grep -v '"created"' "$WORK/remote-meta-$img.json") >/dev/null 2>&1; then
     [ $mismatch -eq 0 ] && pass "backup $img (payload, checksum, metadata)"
@@ -104,7 +111,7 @@ done
 
 echo
 if [ $fails -eq 0 ]; then
-  printf '\033[32mPowerPC build agrees with the desktop build on every subject.\033[0m\n'
+  printf '\033[32m%s agrees with the desktop build on every subject.\033[0m\n' "$SMOKE_HOST"
 else
   printf '\033[31m%d mismatch(es).\033[0m\n' "$fails"
 fi

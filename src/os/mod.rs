@@ -944,7 +944,7 @@ fn open_target_for_writing_inner(path: &Path, truncate: bool) -> Result<DeviceWr
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
-        bail!("device write access not supported on this platform")
+        anyhow::bail!("device write access not supported on this platform")
     }
 }
 
