@@ -40,10 +40,11 @@ fi
 gzip -t sysroot.tar.gz || { echo "error: sysroot.tar.gz is not a valid gzip file" >&2; exit 1; }
 # Accept both `usr/...` and `./usr/...`: `tar -C / -c usr` gives the first, `tar -c .` the
 # second, and both unpack identically. Naming the member exactly would reject the second.
-if ! tar tzf sysroot.tar.gz | grep -qE '^(\./)?usr/include/stdio\.h$'; then
+listing="$(tar tzf sysroot.tar.gz)"
+if ! printf '%s\n' "$listing" | grep -qE '^(\./)?usr/include/stdio\.h$'; then
     echo "error: sysroot.tar.gz has no usr/include/stdio.h; is it rooted at / ?" >&2
     echo "       its top-level entries are:" >&2
-    tar tzf sysroot.tar.gz | sed 's|^\./||' | awk -F/ 'NF>1{print $1"/"$2}' | sort -u | head -10 >&2
+    printf '%s\n' "$listing" | sed 's|^\./||' | awk -F/ 'NF>1{print $1"/"$2}' | sort -u | head -10 >&2
     exit 1
 fi
 
