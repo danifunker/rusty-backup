@@ -1513,7 +1513,7 @@ jobs:
         run: sudo chmod -R a+rX buildroot/dl buildroot/ccache 2>/dev/null || true
 
   build-sol9-sparc:
-    name: Build rb-cli for Solaris 9 (SPARC)
+    name: Build rb-cli for Solaris 9 (${{ matrix.arch }})
     # Only runs where the sysroot secret exists. A Solaris 9 sysroot is a copy of a
     # licensed install's headers and libraries, so it cannot live in the repo or a
     # public registry -- SOL9_SPARC64_SYSROOT_URL points at a private copy. Without it the
@@ -1524,9 +1524,18 @@ jobs:
     # Non-fatal like the other vintage-media jobs: this one also depends on a
     # self-hosted download and a ~40 minute toolchain build.
     continue-on-error: true
+    strategy:
+      # One entry today. Solaris also ran on x86, and the sysroot secret is already named
+      # per-arch, so a second leg is a matrix row rather than a second job.
+      fail-fast: false
+      matrix:
+        include:
+          - arch: sparc64
+            target: sparcv9-sun-solaris2.9
     env:
       VER: ${{ needs.generate-version.outputs.version }}
       SOL9_SPARC64_SYSROOT_URL: ${{ secrets.SOL9_SPARC64_SYSROOT_URL }}
+      SOL9_TARGET: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@v6
 
@@ -1560,23 +1569,23 @@ jobs:
         if: steps.gate.outputs.run == 'true' && steps.toolchain-cache.outputs.cache-hit == 'true'
         run: docker load -i /tmp/mrustc-sol9-cross.tar
 
-      - name: Build rb-cli for sparcv9-sun-solaris2.9
+      - name: Build rb-cli for ${{ matrix.target }}
         if: steps.gate.outputs.run == 'true'
         run: |
-          docker build -t rb-sol9 - < docker/sol9.Dockerfile
-          docker run --rm -v "$PWD":/src -e RELEASE_VERSION="$VER" rb-sol9
+          docker build -t rb-sol9 --build-arg "TARGET=$SOL9_TARGET" - < docker/sol9.Dockerfile
+          docker run --rm -v "$PWD":/src -e RELEASE_VERSION="$VER" -e SOL9_TARGET rb-sol9
           ls -lh dist/rb-cli-sol9.tar.gz
 
       - name: Name the artifact for the release
         if: steps.gate.outputs.run == 'true'
-        run: cp dist/rb-cli-sol9.tar.gz "dist/rb-cli-sol9-${VER}.tar.gz"
+        run: cp dist/rb-cli-sol9.tar.gz "dist/rb-cli-solaris9-${{ matrix.arch }}-${VER}.tar.gz"
 
       - name: Upload the Solaris 9 artifact
         if: steps.gate.outputs.run == 'true'
         uses: actions/upload-artifact@v7
         with:
-          name: rb-cli-sol9
-          path: dist/rb-cli-sol9-*.tar.gz
+          name: rb-cli-solaris9-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: dist/rb-cli-solaris9-${{ matrix.arch }}-*.tar.gz
 
   build-cb-dos:
     name: Build cb-dos media (FreeDOS floppy + CD)
