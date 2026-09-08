@@ -334,7 +334,8 @@ fn parse_filesystems(specs: &[String], kind: TableKind) -> Result<Vec<(u32, Vec<
         // be loaded as code by the strap and hang the machine rather than fail.
         if image.get(..4) != Some(&[0x00, 0x00, 0x03, 0xF3]) {
             bail!(
-                "{path} is not an AmigaDOS load file (no HUNK_HEADER);                  --filesystem wants the handler binary, e.g. L:SmartFilesystem"
+                "{path} is not an AmigaDOS load file (no HUNK_HEADER); \
+                 --filesystem wants the handler binary, e.g. L:SmartFilesystem"
             );
         }
         seen.push(dostype);
