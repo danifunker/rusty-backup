@@ -50,6 +50,8 @@ FEATURES="${FEATURES:-native-zstd,remote,tui,rust173-polyfill}"
 SOL9_TOOLCHAIN="${SOL9_TOOLCHAIN:-$HOME/sol9-toolchain}"
 SOL9_BIN="${SOL9_BIN:-$SOL9_TOOLCHAIN/opt/bin}"
 SOL9_SYSROOT="${SOL9_SYSROOT:-$SOL9_TOOLCHAIN/sysroot}"
+# mrustc spawns $SOL9_TARGET-gcc by name, so the cross toolchain has to be on PATH for sol9libs.
+if [ -d "$SOL9_BIN" ]; then export PATH="$SOL9_BIN:$PATH"; fi
 # The C shim must reach the final link line, so default it here rather than in the environment.
 SOL9_SHIM="${SOL9_SHIM:-$CRATE_DIR/shim/sol9-compat.c}"
 
