@@ -4,7 +4,7 @@
 # mrustc and cross-compile it to a Solaris 9 SPARC `rb-cli` + TUI.
 #
 # Unlike scripts/build-ppc.sh this is a ONE-machine pipeline. A cross gcc
-# targeting Solaris 9 exists (mrustc's docker/sol9-cross, or ~/sol9-toolchain),
+# targeting Solaris 9 exists (scripts/build-sol9-toolchain.sh, or the CI seed at /opt/sol9),
 # so there is no remote compiler, no remote archiver and no split-TU step:
 #
 #     This machine: Rust --mrustc--> C99 --sparcv9-...-gcc--> SPARC ELF

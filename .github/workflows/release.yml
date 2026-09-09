@@ -27,7 +27,7 @@ on:
         type: boolean
         default: true
       sol9:
-        description: 'Build rb-cli for Solaris 9 SPARC (SOL9_SPARC64_SYSROOT_URL: a sysroot or a saved toolchain image)'
+        description: 'Build rb-cli for Solaris 9 SPARC (needs the SOL9_SPARC64_SYSROOT_URL seed secret)'
         type: boolean
         default: true
       runner_image:
@@ -1514,19 +1514,18 @@ jobs:
 
   build-sol9-sparc:
     name: Build rb-cli for Solaris 9 (${{ matrix.arch }})
-    # Only runs where the sysroot secret exists. A Solaris 9 sysroot is a copy of a
-    # licensed install's headers and libraries, so it cannot live in the repo or a
-    # public registry -- SOL9_SPARC64_SYSROOT_URL points at a private copy. Without it the
-    # job skips rather than failing, so forks still get a green pipeline.
+    # Only runs where the seed secret exists. The seed carries Sun's headers and libraries,
+    # so it cannot live in the repo or a public registry -- SOL9_SPARC64_SYSROOT_URL points
+    # at a private copy. Without it the job skips rather than failing, so forks still get a
+    # green pipeline.
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.sol9 }}
     needs: generate-version
     runs-on: ubuntu-latest
-    # Non-fatal like the other vintage-media jobs: this one also depends on a
-    # self-hosted download and a ~40 minute toolchain build.
+    # Non-fatal like the other vintage-media jobs: it depends on a self-hosted download.
     continue-on-error: true
     strategy:
-      # One entry today. Solaris also ran on x86, and the sysroot secret is already named
-      # per-arch, so a second leg is a matrix row rather than a second job.
+      # One entry today. Solaris also ran on x86, and the secret is already named per-arch,
+      # so a second target is a matrix row rather than a second job.
       fail-fast: false
       matrix:
         include:
@@ -1536,10 +1535,21 @@ jobs:
       VER: ${{ needs.generate-version.outputs.version }}
       SOL9_SPARC64_SYSROOT_URL: ${{ secrets.SOL9_SPARC64_SYSROOT_URL }}
       SOL9_TARGET: ${{ matrix.target }}
+      # Where scripts/pack-sol9-seed.sh stages things. GCC bakes its sysroot path at
+      # configure time, so the tree has to land where it was configured.
+      SOL9_BIN: /opt/sol9/bin
+      SOL9_SYSROOT: /opt/sol9/sysroot
+      SOL9_LIBGCC: /opt/sol9/${{ matrix.target }}/lib/sparcv9/libgcc_s.so.1
+      MRUSTC_DIR: /opt/mrustc
     steps:
       - uses: actions/checkout@v6
 
-      - name: Check the sysroot secret is configured
+      # `cargo vendor` only. Nothing here is built with it -- mrustc compiles the engine,
+      # and its language mode is pinned to 1.74. Ubuntu's packaged cargo is too old: a
+      # dependency in the graph needs edition2024.
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Check the seed secret is configured
         id: gate
         run: |
           if [ -z "$SOL9_SPARC64_SYSROOT_URL" ]; then
@@ -1549,54 +1559,41 @@ jobs:
             echo "run=true" >> "$GITHUB_OUTPUT"
           fi
 
-      # GCC 4.9.4 + binutils 2.35.2 against the sysroot. Cache it: the toolchain
-      # only changes when docker/sol9-cross does, and rebuilding costs ~40 minutes.
-      - name: Restore the cross-toolchain image
+      # libgmp/libmpfr/libmpc/zlib are what GCC 4.9.4 links; python3 runs
+      # apply-vendor-patches.py, and patch/make/file/rsync are used by build-sol9.sh.
+      # Everything else it needs is in the seed. Building the toolchain here instead would
+      # cost ~40 minutes and put us at the mercy of whichever Debian release just went EOL.
+      - name: Install what the cross GCC links against
         if: steps.gate.outputs.run == 'true'
-        id: toolchain-cache
-        uses: actions/cache@v4
-        with:
-          path: /tmp/mrustc-sol9-cross.tar
-          key: sol9-cross-${{ hashFiles('docker/sol9-cross/Dockerfile') }}
-
-      # The URL may hold either artifact, and both are equally unpublishable because both
-      # carry Sun's headers. A prebuilt image skips a ~40 minute GCC build, so prefer it;
-      # a sysroot is the fallback that builds one. Sniff the download rather than making
-      # its shape a second secret to keep straight.
-      - name: Provide the cross-toolchain image
-        if: steps.gate.outputs.run == 'true' && steps.toolchain-cache.outputs.cache-hit != 'true'
         run: |
-          curl -fsSL "$SOL9_SPARC64_SYSROOT_URL" -o /tmp/sol9-artifact.tar.gz
-          gzip -t /tmp/sol9-artifact.tar.gz \
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            libgmp10 libmpfr6 libmpc3 zlib1g file rsync python3 patch make
+
+      # The seed is the cross toolchain, its sysroot, mrustc and both prebuilt standard
+      # libraries -- about 43 MB, against 7 GB for the equivalent container image.
+      - name: Fetch and unpack the build seed
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          curl -fsSL "$SOL9_SPARC64_SYSROOT_URL" -o /tmp/sol9-seed.tar.gz
+          gzip -t /tmp/sol9-seed.tar.gz \
             || { echo "the SOL9_SPARC64_SYSROOT_URL download is not valid gzip" >&2; exit 1; }
-          listing="$(tar tzf /tmp/sol9-artifact.tar.gz)"
-          if printf '%s\n' "$listing" | grep -qE '^(\./)?manifest\.json$'; then
-            echo "==> Artifact is a saved Docker image; loading it"
-            gunzip -c /tmp/sol9-artifact.tar.gz > /tmp/mrustc-sol9-cross.tar
-            docker load -i /tmp/mrustc-sol9-cross.tar
-            docker image inspect mrustc-sol9-cross >/dev/null \
-              || { echo "that image does not provide the mrustc-sol9-cross tag" >&2; exit 1; }
-          elif printf '%s\n' "$listing" | grep -qE '^(\./)?usr/include/stdio\.h$'; then
-            echo "==> Artifact is a sysroot; building the toolchain from it (~40 min)"
-            cp /tmp/sol9-artifact.tar.gz docker/sol9-cross/sysroot.tar.gz
-            sh docker/sol9-cross/build.sh
-            docker save mrustc-sol9-cross -o /tmp/mrustc-sol9-cross.tar
-          else
-            echo "error: the artifact is neither a saved Docker image nor a sysroot." >&2
+          listing="$(tar tzf /tmp/sol9-seed.tar.gz)"
+          if ! printf '%s\n' "$listing" | grep -qE '^(\./)?opt/sol9/bin/'; then
+            echo "error: that artifact is not a seed built by scripts/pack-sol9-seed.sh." >&2
             echo "       its top-level entries are:" >&2
-            printf '%s\n' "$listing" | sed 's|^\./||' | awk -F/ '{print $1}' | sort -u | head -10 >&2
+            printf '%s\n' "$listing" | sed 's|^\./||' | awk -F/ '{print $1"/"$2}' | sort -u | head -10 >&2
             exit 1
           fi
-
-      - name: Load the cached toolchain image
-        if: steps.gate.outputs.run == 'true' && steps.toolchain-cache.outputs.cache-hit == 'true'
-        run: docker load -i /tmp/mrustc-sol9-cross.tar
+          sudo tar xzf /tmp/sol9-seed.tar.gz -C /
+          "$SOL9_BIN/$SOL9_TARGET-gcc" --version | head -1
 
       - name: Build rb-cli for ${{ matrix.target }}
         if: steps.gate.outputs.run == 'true'
         run: |
-          docker build -t rb-sol9 --build-arg "TARGET=$SOL9_TARGET" - < docker/sol9.Dockerfile
-          docker run --rm -v "$PWD":/src -e RELEASE_VERSION="$VER" -e SOL9_TARGET rb-sol9
+          RELEASE_VERSION="$VER" scripts/build-sol9.sh vendor
+          RELEASE_VERSION="$VER" scripts/build-sol9.sh sol9
+          RELEASE_VERSION="$VER" scripts/build-sol9.sh dist
           ls -lh dist/rb-cli-sol9.tar.gz
 
       - name: Name the artifact for the release

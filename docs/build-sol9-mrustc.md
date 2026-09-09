@@ -681,10 +681,17 @@ are **done** as of 2026-09-07; 8 (doc sync) is the remainder.
 
 ## Putting it in the pipeline
 
-The build is already containerised - `docker/sol9.Dockerfile` clones mrustc,
-builds it, fetches the rustc source, builds the host and target stdlibs and
-runs `scripts/build-sol9.sh`. Everything in that chain is fetched from source
-at build time **except one file**, and there is one blocker.
+CI does not build a toolchain. It downloads a **seed** -- the cross toolchain, its
+sysroot, mrustc and both prebuilt standard libraries, about 47 MB -- unpacks it at `/`,
+and runs `scripts/build-sol9.sh`. No container, no compiler build, no package repo beyond
+eight Ubuntu packages.
+
+That is a deliberate reversal. The pipeline used to build GCC 4.9.4 from source in a
+Debian image on every cache miss, roughly 40 minutes, and then rebuild mrustc and both
+standard libraries on *every* run, roughly 40 more. All of it reproduced work that already
+existed on a developer machine. It also broke twice in one evening for reasons that had
+nothing to do with this project: Debian 11 reached EOL mid-flight, first through an
+expired `Release` file and then through its security packages 404ing out of the pool.
 
 ### What it needs
 
@@ -692,44 +699,46 @@ at build time **except one file**, and there is one blocker.
 |---|---|---|
 | `rb-cli-sol9/` manifest + `shim/sol9-compat.c` | this repo | yes, committed |
 | `scripts/build-sol9.sh`, vendor patches | this repo | yes, committed |
-| `docker/sol9.Dockerfile` | this repo | yes, committed |
-| mrustc fork, branch `sparc-solaris-10` | `danifunker/mrustc` | **blocked - see below** |
-| Base image `mrustc-sol9-cross` | mrustc's `docker/sol9-cross/` | all but the sysroot |
-| binutils 2.35.2, gcc 4.9.4 | ftp.gnu.org, at build time | yes |
-| rustc 1.74.0 source | fetched by `make RUSTCSRC` | yes |
+| `scripts/build-sol9-toolchain.sh` (builds the toolchain natively) | this repo | yes, committed |
+| `scripts/pack-sol9-seed.sh` (packs the seed) | this repo | yes, committed |
+| binutils 2.35.2, gcc 4.9.4 | ftp.gnu.org, when building a toolchain | yes |
+| rustc 1.74.0 source | `make RUSTCSRC`, when building stdlibs | yes |
 | Crate sources | `cargo vendor`, at build time | yes (needs crates.io) |
-| **Solaris 9 sysroot** (`sysroot.tar.gz`, 109 MB) | `docker/sol9-cross/`, **gitignored** | **no - not redistributable** |
+| **The seed** (toolchain + sysroot + mrustc + stdlibs) | `SOL9_SPARC64_SYSROOT_URL` | **no - carries Sun's files** |
 
-Two things on this machine are *not* needed and should not be mistaken for
-dependencies: `~/sol9-deps/prefix` (nothing references it - zstd and zlib are
-compiled from source by cc-rs for the target), and the Blade itself, which is
-needed only for the parity gates, never for the build.
+### Building the toolchain, and packing a seed
 
-### The mrustc branch
+    scripts/mksysroot-solaris.sh disk DISK.img          # sysroot from a Solaris disk image
+    scripts/build-sol9-toolchain.sh sysroot.tar.gz      # binutils + gcc 4.9.4, ~40 min
+    scripts/build-sol9.sh sol9libs                      # the Solaris standard library
+    scripts/pack-sol9-seed.sh sol9-seed.tar.gz          # -> 47 MB, host this privately
 
-`docker/sol9.Dockerfile` clones `danifunker/mrustc` at branch
-`sparc-solaris-10`, so that branch must carry the Solaris target for the image
-to build. **It does, as of 2026-09-07** (`71910c7c`) - the branch was pushed
-that day. If a container build ever fails at
-`make -f minicargo.mk LIBS MRUSTC_TARGET=...` with an unknown target, check
-that ref first; the whole image depends on it.
+GCC bakes its sysroot path in at configure time, so the seed stages absolute paths at
+`/opt/sol9` and `/opt/mrustc` and unpacks with `sudo tar xzf sol9-seed.tar.gz -C /`. Build
+the toolchain with `--prefix=/opt/sol9` if you intend to pack one.
 
-### The sysroot
+The toolchain is built on the same OS that consumes it -- GitHub's `ubuntu-latest` and a
+current desktop are both Ubuntu 24.04 with GCC 13.3, and GCC 4.9.4 builds under that given
+`-std=gnu++98 -fpermissive`. A GCC 4.9.4 built on Debian 12 also runs unmodified on Ubuntu
+24.04; glibc is forward compatible.
 
-Sun does not permit redistributing Solaris 9, so `sysroot.tar.gz` cannot go in
-a public image or the repo (it is gitignored for that reason). For CI it has to
-arrive out of band - a private registry holding the pre-built
-`mrustc-sol9-cross`, or the tarball as a secret artifact restored before
-`docker build`. Building the base image is a one-off; only the layer above it
-needs to re-run per commit.
+### Two traps in the seed
+
+`libstd.rlib` is a **0-byte marker**. mrustc keeps the crate metadata in `libstd.rlib.hir`
+and the code in `libstd.rlib.o`, so a packer that strips `*.hir` as an intermediate
+produces a seed where every dependent crate dies with "Unable to deserialise crate
+metadata". The emitted `*.rlib.c` really is regenerable, and dropping it is most of the
+size win.
+
+Ubuntu's packaged `cargo` is too old for `cargo vendor` here: a crate in the graph needs
+`edition2024`. The job uses `dtolnay/rust-toolchain@stable`, as the rest of the workflow
+does.
 
 ### Cost
 
-The engine transpile dominates: a from-scratch container build is tens of
-minutes and wants ~25 GB of disk (mrustc's tree plus the rustc source plus the
-generated C). Cache the base image and the `output-1.74.0-<target>` stdlib and
-a normal commit rebuilds only the engine and the link. Cap parallelism at 4 -
-see `docs/build-memory-crashes.md`, which applies to this build too.
+About 20-25 minutes: 30 s of apt, 10 s for the seed, 2 min to vendor 217 crates, and
+15-20 min to transpile, cross-compile and link 219. Cap parallelism at 4 - see
+`docs/build-memory-crashes.md`, which applies to this build too.
 
 ### Gating a release on the hardware
 
@@ -766,7 +775,7 @@ depends on the last:
 |---|---|---|
 | g | `73c570f3` | `emulate-overflow-intrinsics`, so a pre-GCC-5 compiler can build mrustc's output. Needs (e) |
 | h | `400e373a` | The `sparcv9-sun-solaris` target (Solaris 10) |
-| i | `6421bfef`, `b3aa8ae6` | `sparcv9-sun-solaris2.9`, `emulate-c99-math`, `emulate-posix2001`, and the `docker/sol9-cross` toolchain container |
+| i | `6421bfef`, `b3aa8ae6` | `sparcv9-sun-solaris2.9`, `emulate-c99-math`, `emulate-posix2001`, and the toolchain container that later became `scripts/build-sol9-toolchain.sh` |
 | j | **not yet written** | Finding 10: mrustc lowers a fieldless `#[repr(u32)]` enum to a one-field struct and passes it **by value** in `extern "C"` signatures, where the callee expects a scalar. On any 64-bit big-endian target the value lands in the wrong half of the register. Should emit the underlying integer in extern signatures and at call sites |
 
 Two practical notes. The branch is **not linear** - it contains a merge commit
