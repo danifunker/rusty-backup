@@ -262,8 +262,17 @@ libgcc_s.so.1 ships alongside because Solaris 9 has none of its own and Rust's
 unwinder needs it. rb-cli finds it next to itself, so keep the two together;
 nothing has to be installed system-wide.
 
-Built with mrustc against a Solaris 9 sysroot. Raw device access is not
-available on this platform; disk *images* work normally.
+Built with mrustc against a Solaris 9 sysroot.
+
+Raw devices: `rb-cli show devices` lists local disks, reading what the drivers
+publish rather than opening them, so a disk that has stopped answering is
+skipped instead of hanging the tool. Run it as root -- /dev/rdsk nodes are not
+readable by an ordinary user.
+
+USB mass storage is BETA. Solaris' scsa2usb driver wedges on devices that do
+not implement the full SCSI command set, and once wedged such a device cannot
+be recovered without unplugging it. scripts/solaris-usb-unblock.sh diagnoses
+that state, and docs/solaris-raw-devices.md explains it.
 TXT
   ( cd "$SOL9_OUT/dist" && tar czf "$RB_DIR/dist/rb-cli-sol9.tar.gz" rb-cli-sol9 )
   note "bundle at $RB_DIR/dist/rb-cli-sol9.tar.gz ($(du -h "$RB_DIR/dist/rb-cli-sol9.tar.gz" | cut -f1))"

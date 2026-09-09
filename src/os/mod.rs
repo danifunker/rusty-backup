@@ -24,6 +24,11 @@ pub mod darwin_devices;
 #[cfg(target_os = "linux")]
 pub mod linux;
 
+// Compiled under `test` on any unix as well, so the iostat and slice parsers -- pure string
+// handling, and the part most likely to regress -- are covered by the normal test run.
+#[cfg(any(target_os = "solaris", all(test, unix)))]
+pub mod solaris;
+
 #[cfg(target_os = "windows")]
 pub mod windows;
 
@@ -788,7 +793,16 @@ pub fn enumerate_devices() -> Vec<DiskDevice> {
     {
         windows::enumerate_devices()
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    #[cfg(target_os = "solaris")]
+    {
+        solaris::enumerate_devices()
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "linux",
+        target_os = "windows",
+        target_os = "solaris"
+    )))]
     {
         Vec::new()
     }
