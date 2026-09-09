@@ -517,6 +517,48 @@ mod aligned_buffer {
 ///
 /// `Read` and `Seek` flush the write buffer before delegating to the inner file.
 #[cfg(not(target_os = "windows"))]
+/// Commit a target to stable storage, tolerating descriptors that cannot be told to.
+///
+/// macOS implements `File::sync_all` as `fcntl(F_FULLFSYNC)`, which a raw `/dev/rdiskN`
+/// answers with ENOTTY -- surfacing as "Inappropriate ioctl for device (os error 25)" at the
+/// end of an otherwise complete restore. Writes to a raw device are already unbuffered, so
+/// there is nothing left to push; fall back to `fsync`, and only treat the sync as done if
+/// that is refused the same way. A regular file always accepts `fsync`, so this cannot
+/// silently skip flushing one.
+fn sync_committed(file: &File) -> io::Result<()> {
+    const ENOTTY: i32 = 25;
+
+    match file.sync_all() {
+        Ok(()) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(ENOTTY) => sync_fallback(file, e),
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(unix)]
+fn sync_fallback(file: &File, original: io::Error) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    const ENOTTY: i32 = 25;
+
+    // SAFETY: the descriptor is owned by `file` and stays open for the call.
+    let rc = unsafe { libc::fsync(file.as_raw_fd()) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    // A device that refuses both has nothing buffered to lose.
+    if err.raw_os_error() == Some(ENOTTY) {
+        return Ok(());
+    }
+    let _ = original;
+    Err(err)
+}
+
+#[cfg(not(unix))]
+fn sync_fallback(_file: &File, original: io::Error) -> io::Result<()> {
+    Err(original)
+}
+
 pub struct SectorAlignedWriter {
     inner: File,
     buf: Vec<u8>,
@@ -544,7 +586,7 @@ impl SectorAlignedWriter {
     /// Flush, pad, and push everything to the medium before "complete" is said.
     pub fn sync_all(&mut self) -> io::Result<()> {
         self.flush_padded()?;
-        self.inner.sync_all()
+        sync_committed(&self.inner)
     }
 
     /// Flush everything, padding the final partial sector with zeros.
@@ -654,7 +696,7 @@ impl SectorAlignedWriter {
     /// Flush, pad, and push everything to the medium before "complete" is said.
     pub fn sync_all(&mut self) -> io::Result<()> {
         self.flush_padded()?;
-        self.inner.sync_all()
+        sync_committed(&self.inner)
     }
 
     /// Flush everything, padding the final partial sector with zeros.
@@ -1467,5 +1509,23 @@ mod tests {
             r.seek(SeekFrom::End(-8192)).is_err(),
             "negative target must error"
         );
+    }
+}
+
+#[cfg(test)]
+mod sync_tests {
+    use super::sync_committed;
+    use std::io::Write;
+
+    /// A regular file must still be flushed for real -- the ENOTTY tolerance is only meant
+    /// to cover raw devices, and must never quietly skip a sync that would have worked.
+    #[test]
+    fn a_regular_file_syncs_normally() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("f");
+        let mut f = std::fs::File::create(&path).expect("create");
+        f.write_all(b"payload").expect("write");
+        sync_committed(&f).expect("a regular file must sync");
+        assert_eq!(std::fs::read(&path).expect("read"), b"payload");
     }
 }
