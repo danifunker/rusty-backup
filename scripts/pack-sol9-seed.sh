@@ -57,8 +57,11 @@ cp -a "$MRUSTC_DIR/output-$RUSTC_VERSION-$TARGET" "$STAGE/opt/mrustc/"
 say "Dropping regenerable intermediates"
 find "$STAGE/opt/mrustc" \( -name '*_dbg.txt' -o -name '*.rlib.c' \) -delete
 
+# Store root ownership rather than whoever packed it: the seed unpacks at / on another
+# machine, and preserving a local uid hands /opt/mrustc to whichever user happens to hold
+# that number there.
 say "Writing $OUT"
-tar czf "$OUT" -C "$STAGE" opt
+tar czf "$OUT" --owner=0 --group=0 --numeric-owner -C "$STAGE" opt
 say "Seed ready: $(du -h "$OUT" | cut -f1)"
 cat <<TXT
     Unpack on the runner with:  sudo tar xzf $(basename "$OUT") -C /

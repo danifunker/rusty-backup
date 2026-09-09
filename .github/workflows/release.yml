@@ -1588,11 +1588,21 @@ jobs:
           sudo tar xzf /tmp/sol9-seed.tar.gz -C /
           "$SOL9_BIN/$SOL9_TARGET-gcc" --version | head -1
 
+      # minicargo can schedule one crate's build script twice at once -- seen as
+      # `serde_core (build)` listed twice in its own progress line -- and the second worker
+      # then execs the binary while the first is still linking it, before the linker has
+      # set the executable bit. That surfaces as "Unable to run process ... Permission
+      # denied" partway through the graph. The build is incremental, so a retry resumes
+      # from the completed crates and gets past it. This is a mitigation, not a cure: the
+      # race is upstream, and docs/solaris9-open-items.md tracks it.
       - name: Build rb-cli for ${{ matrix.target }}
         if: steps.gate.outputs.run == 'true'
         run: |
           RELEASE_VERSION="$VER" scripts/build-sol9.sh vendor
-          RELEASE_VERSION="$VER" scripts/build-sol9.sh sol9
+          if ! RELEASE_VERSION="$VER" scripts/build-sol9.sh sol9; then
+            echo "::warning::sol9 stage failed; retrying once (minicargo build-script race)"
+            RELEASE_VERSION="$VER" scripts/build-sol9.sh sol9
+          fi
           RELEASE_VERSION="$VER" scripts/build-sol9.sh dist
           ls -lh dist/rb-cli-sol9.tar.gz
 

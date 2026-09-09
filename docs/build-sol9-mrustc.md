@@ -715,7 +715,10 @@ expired `Release` file and then through its security packages 404ing out of the 
 
 GCC bakes its sysroot path in at configure time, so the seed stages absolute paths at
 `/opt/sol9` and `/opt/mrustc` and unpacks with `sudo tar xzf sol9-seed.tar.gz -C /`. Build
-the toolchain with `--prefix=/opt/sol9` if you intend to pack one.
+the toolchain with `--prefix=/opt/sol9` if you intend to pack one. The tarball stores root
+ownership rather than whoever packed it -- it unpacks at `/` on another machine, and
+preserving a local uid hands `/opt/mrustc` to whichever user happens to hold that number
+there.
 
 The toolchain is built on the same OS that consumes it -- GitHub's `ubuntu-latest` and a
 current desktop are both Ubuntu 24.04 with GCC 13.3, and GCC 4.9.4 builds under that given

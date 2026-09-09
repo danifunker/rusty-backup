@@ -50,6 +50,14 @@ the TUI, and read-only device enumeration. See `docs/build-sol9-mrustc.md` for t
 
 ## Build and pipeline
 
+- [ ] **minicargo races on build scripts.** It can schedule one crate's build script twice
+      concurrently -- visible as `serde_core (build)` listed twice in its own progress line
+      -- and the second worker then execs the binary while the first is still linking it,
+      before the linker has set the executable bit. It surfaces as `Unable to run process
+      ... Permission denied` partway through the graph, and is intermittent: the same
+      commit and seed failed once and passed on re-run. The CI job retries the stage once,
+      which works because the build is incremental, but the race is upstream in minicargo
+      and that retry is a mitigation rather than a fix.
 - [ ] **The seed pins an mrustc commit implicitly.** `scripts/pack-sol9-seed.sh` packs
       whatever `bin/mrustc` and the stdlib outputs happen to be, with nothing recording which
       commit built them. Stamping that into the seed would make a stale one obvious.
