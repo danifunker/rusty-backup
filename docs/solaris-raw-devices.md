@@ -75,3 +75,8 @@ false.
 
 Once wedged, the only reliable recovery is to unplug the device; the stuck processes clear
 when it goes away.
+
+## What is still open
+
+`docs/solaris9-open-items.md` tracks the rest: raw-device writing, free-space reporting, the
+CD-ROM removable flag, and whether Solaris 10 needs a build of its own.
