@@ -1423,7 +1423,7 @@ impl PartitionTable {
                     // so `open_filesystem` auto-detects (finds the UFS super
                     // block, big-endian SPARC variant included). Swap / other
                     // slices simply won't resolve to a browsable filesystem.
-                    type_name: format!("Sun {} (UFS?)", s.tag_name()),
+                    type_name: format!("Sun {} (UFS?)", label.slice_type_name(i)),
                     partition_type_byte: 0,
                     start_lba: s.start_sector,
                     start_byte: None,
