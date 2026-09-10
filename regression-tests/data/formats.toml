@@ -192,6 +192,24 @@ we_write = false
 notes = "Superblock offset differs: NetBSD makefs 8192, FreeBSD newfs 65536"
 
 [[format]]
+id = "fs.bfs"
+kind = "fs"
+name = "BFS (BeOS)"
+we_read = true
+we_write = true
+builder = "new volume bfs"
+notes = "Both byte orders. The union at inode offset 0x48 and the index B+trees are where it goes wrong."
+
+[[format]]
+id = "fs.ofs"
+kind = "fs"
+name = "OFS (BeOS, pre-R3)"
+we_read = true
+we_write = true
+builder = "new volume ofs"
+notes = "The 1993 Hobbit prototype is the only specimen there is; Steve White's ofs-extractor.c is the only published description."
+
+[[format]]
 id = "fs.xfs"
 kind = "fs"
 name = "SGI XFS v4/v5"
@@ -310,6 +328,18 @@ name = "CHD (MAME)"
 we_read = true
 we_write = true
 builder = "convert --format chd"
+
+[[format]]
+id = "fmt.od"
+kind = "container"
+name = "NeXT magneto-optical media"
+we_read = true
+we_write = false
+notes = """The raw MO cartridge, not the drive's user data: 1296-byte sectors
+carrying 1024 data bytes plus a cross-interleaved RS(36,32) code, an origin 848
+sectors in, and driver-side spare-sector skipping from the NeXT label's own
+alternate-group fields. Read + in-place edit; there is no writer that creates
+one from scratch, which is why we_write is false."""
 
 [[format]]
 id = "fmt.vhd-fixed"
@@ -994,6 +1024,27 @@ we_write = true
 builder = "convert --format chd-cd"
 
 # --- Partition ---------------------------------------------------------------
+
+[[format]]
+id = "part.next"
+kind = "partition"
+name = "NeXT disk label"
+we_read = true
+we_write = true
+builder = "new hd next"
+notes = """Big-endian on m68k and Intel alike, four checksummed copies at
+512-byte blocks 0/15/30/45 sharing one checksum. Partition offsets count the
+label's own d_secsize (1024) from the end of a front porch. Rhapsody nests one
+of these inside an Apple_Rhapsody_UFS APM slice."""
+
+[[format]]
+id = "part.solaris-x86"
+kind = "partition"
+name = "Solaris x86 VTOC"
+we_read = true
+we_write = true
+builder = "new hd solaris-x86"
+notes = "A 16-slice VTOC in sector 1 of an MBR partition, not a replacement for the MBR."
 
 [[format]]
 id = "part.none"
