@@ -1543,6 +1543,11 @@ jobs:
       SOL9_SYSROOT: /opt/sol9/sysroot
       SOL9_LIBGCC: /opt/sol9/${{ matrix.target }}/lib/sparcv9/libgcc_s.so.1
       MRUSTC_DIR: /opt/mrustc
+      # The seed unpacks at / as root, so /opt/mrustc is not writable by the job user.
+      # Only the two output directories are ever written; the stdlibs there are read-only.
+      # Send them to the workspace instead of trying to write inside the seed's tree.
+      SOL9_OUT: ${{ github.workspace }}/.sol9-out
+      HOSTC_OUT: ${{ github.workspace }}/.sol9-hostc
     steps:
       - uses: actions/checkout@v6
 
