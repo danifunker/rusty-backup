@@ -515,8 +515,6 @@ mod aligned_buffer {
 /// buffer addresses and sizes must be sector-aligned. This wrapper accumulates
 /// writes and only flushes complete sectors to the device.
 ///
-/// `Read` and `Seek` flush the write buffer before delegating to the inner file.
-#[cfg(not(target_os = "windows"))]
 /// Commit a target to stable storage, tolerating descriptors that cannot be told to.
 ///
 /// macOS implements `File::sync_all` as `fcntl(F_FULLFSYNC)`, which a raw `/dev/rdiskN`
@@ -559,6 +557,8 @@ fn sync_fallback(_file: &File, original: io::Error) -> io::Result<()> {
     Err(original)
 }
 
+/// `Read` and `Seek` flush the write buffer before delegating to the inner file.
+#[cfg(not(target_os = "windows"))]
 pub struct SectorAlignedWriter {
     inner: File,
     buf: Vec<u8>,
