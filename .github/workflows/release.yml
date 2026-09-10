@@ -1521,8 +1521,10 @@ jobs:
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.sol9 }}
     needs: generate-version
     runs-on: ubuntu-latest
-    # Non-fatal like the other vintage-media jobs: it depends on a self-hosted download.
-    continue-on-error: true
+    # Deliberately NOT continue-on-error. It was, back when this job built GCC from source
+    # and a mirror hiccup could redden a release for reasons unrelated to the code. It now
+    # downloads a prebuilt seed, and a missing secret already skips the job -- so a failure
+    # here means the Solaris build is genuinely broken, and saying so is the point.
     strategy:
       # One entry today. Solaris also ran on x86, and the secret is already named per-arch,
       # so a second target is a matrix row rather than a second job.
