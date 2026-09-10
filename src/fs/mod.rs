@@ -1267,6 +1267,8 @@ pub fn fs_name_for(partition_type: u8, partition_type_string: Option<&str>) -> &
             // Apple APFS GPT partition GUID.
             "7C3457EF-0000-11AA-AA11-00306543ECAC" => "APFS",
             "Apple_UNIX_SVR2" => "ext/btrfs/xfs/reiserfs/UFS/JFS",
+            // Mac OS X Server 1.x / Rhapsody, behind a NeXT disk label.
+            "Apple_Rhapsody_UFS" => "UFS",
             "Linux" => "ext/btrfs/xfs/reiserfs/UFS/JFS",
             // GPT Linux Filesystem / Linux Home GUIDs.
             "0FC63DAF-8483-4772-8E79-3D69D8477DE4" | "933AC7E1-2EB4-4F13-B844-0E14E2AEF915" => {
@@ -2196,6 +2198,11 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                     ))),
                 };
             }
+            // Rhapsody's NeXT label fronts the UFS; see the read path's arm.
+            "Apple_Rhapsody_UFS" => {
+                let fs_offset = resolve_next_label(&mut reader, partition_offset);
+                return Ok(Box::new(ufs::UfsFilesystem::open(reader, fs_offset)?));
+            }
             "Apple_PRODOS" | "Apple_ProDOS" => {
                 return Ok(Box::new(prodos::ProDosFilesystem::open(
                     reader,
@@ -2680,6 +2687,12 @@ fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
                 ))),
             }
         }
+        // Mac OS X Server 1.x / Rhapsody: a NeXT disk label fronts the UFS, so
+        // the filesystem starts past the label's front porch, not at LBA 0.
+        "Apple_Rhapsody_UFS" => {
+            let fs_offset = resolve_next_label(&mut reader, partition_offset);
+            open_filesystem_with_passphrase(reader, fs_offset, 0x00, None, passphrase)
+        }
         "Apple_PRODOS" | "Apple_ProDOS" => Ok(Box::new(prodos::ProDosFilesystem::open(
             reader,
             partition_offset,
@@ -3045,6 +3058,8 @@ pub fn is_browsable_type_string(type_str: Option<&str>) -> bool {
             | "Be_BFS"
             | "Apple_UNIX_SVR2"
             | "Apple_UNIX_SRVR2"
+            // Mac OS X Server 1.x / Rhapsody UFS, behind a NeXT disk label.
+            | "Apple_Rhapsody_UFS"
             | "Apple_PRODOS"
             | "Apple_ProDOS"
             // GPT "Linux Filesystem" GUID — ext, btrfs, or xfs at runtime.
@@ -3265,7 +3280,10 @@ pub fn is_checkable_type(ptype: u8, type_str: Option<&str>) -> bool {
     if matches!(ptype, 0x80 | 0x81 | 0xA5 | 0xA6 | 0xA9 | 0xBF | 0xEB)
         || matches!(
             type_str,
-            Some("Apple_UNIX_SVR2") | Some("Apple_UNIX_SRVR2") | Some("Be_BFS")
+            Some("Apple_UNIX_SVR2")
+                | Some("Apple_UNIX_SRVR2")
+                | Some("Be_BFS")
+                | Some("Apple_Rhapsody_UFS")
         )
     {
         return true;
@@ -3412,6 +3430,14 @@ fn hfsplus_partition_len(
     } else {
         None
     }
+}
+
+/// Where a partition that opens with a NeXT disk label keeps its filesystem;
+/// `partition_offset` unchanged when there is none. See `src/partition/next.rs`.
+pub fn resolve_next_label(reader: &mut (impl Read + Seek), partition_offset: u64) -> u64 {
+    crate::partition::next::detect_at(reader, partition_offset)
+        .and_then(|l| crate::partition::next::embedded_fs_offset(&l, partition_offset))
+        .unwrap_or(partition_offset)
 }
 
 /// Resolve the actual HFS filesystem variant for an "Apple_HFS" APM partition.

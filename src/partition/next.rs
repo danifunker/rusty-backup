@@ -31,6 +31,15 @@
 //! stamps its own `dl_label_blkno` but they otherwise share one checksum,
 //! because the checksum is computed with `dl_label_blkno` read as zero. See
 //! [`checksum`].
+//!
+//! **Nested labels.** Mac OS X Server 1.x / Rhapsody is an APM disk that keeps
+//! this label anyway: its `Apple_Rhapsody_UFS` slice opens with a `dlV3` copy,
+//! and the UFS begins past that label's front porch rather than at the slice's
+//! first byte. [`detect_at`] probes a label at a given base and
+//! [`embedded_fs_offset`] resolves the filesystem behind it. Rhapsody records
+//! `p_base` from the **disk** origin even for a nested label, so the label's own
+//! answer is already absolute; a whole-disk NeXTSTEP label counts from its own
+//! block 0 with a zero container offset, which is why one expression covers both.
 
 use byteorder::{BigEndian, ByteOrder};
 use serde::{Deserialize, Serialize};
@@ -451,9 +460,15 @@ pub fn write_copies<W: Write + Seek>(
 
 /// Probe the four label copies and return the first that validates.
 pub fn detect<R: Read + Seek>(reader: &mut R) -> Option<NextDiskLabel> {
+    detect_at(reader, 0)
+}
+
+/// [`detect`], but for a label written `base` bytes into the source rather
+/// than at block 0 — Mac OS X Server 1.x nests one inside an APM slice.
+pub fn detect_at<R: Read + Seek>(reader: &mut R, base: u64) -> Option<NextDiskLabel> {
     let disk_size = reader.seek(SeekFrom::End(0)).ok()?;
     for block in LABEL_BLOCKS {
-        let offset = block * 512;
+        let offset = base + block * 512;
         if offset + LABEL_SPAN as u64 > disk_size {
             continue;
         }
@@ -474,6 +489,17 @@ pub fn detect<R: Read + Seek>(reader: &mut R) -> Option<NextDiskLabel> {
         }
     }
     None
+}
+
+/// Byte offset of the filesystem a label found at `container_offset` fronts;
+/// `None` when no slot is in use. See this module's header for the two forms.
+pub fn embedded_fs_offset(label: &NextDiskLabel, container_offset: u64) -> Option<u64> {
+    let (_, p) = label.browsable_partitions().next()?;
+    Some(if p.start_byte >= container_offset {
+        p.start_byte
+    } else {
+        container_offset + p.start_byte
+    })
 }
 
 /// Signature, sector size, and checksum all have to agree before we claim a
@@ -620,6 +646,39 @@ mod tests {
         let mut buf = synth_label();
         buf[0x0C] ^= 0xFF;
         assert!(!validates(&buf));
+    }
+
+    /// Mac OS X Server 1.x nests its label in an APM slice, and records
+    /// `p_base` from the disk origin — so the label's own answer is absolute.
+    #[test]
+    fn detect_at_finds_a_label_nested_in_a_partition() {
+        const SLICE: u64 = 18952 * 512;
+        let mut img = vec![0u8; SLICE as usize + 4 * 1024 * 1024];
+        let mut buf = synth_label();
+        // p_base counts 1024-byte sectors from the disk origin, as Rhapsody writes it.
+        BigEndian::write_i32(
+            &mut buf[PART_TABLE_OFF..PART_TABLE_OFF + 4],
+            (SLICE / 1024) as i32,
+        );
+        NextDiskLabel::stamp_checksum(&mut buf, NEXT_LABEL_V3);
+        img[SLICE as usize..SLICE as usize + LABEL_SPAN].copy_from_slice(&buf);
+        let mut cur = std::io::Cursor::new(img);
+
+        assert!(detect(&mut cur).is_none(), "no label at the disk's block 0");
+        let label = detect_at(&mut cur, SLICE).expect("label at the slice's block 0");
+        assert_eq!(
+            embedded_fs_offset(&label, SLICE),
+            Some(SLICE + 160 * 1024),
+            "filesystem starts past the front porch"
+        );
+    }
+
+    /// A whole-disk label counts from its own block 0, so the same call with a
+    /// zero container offset must not double-count.
+    #[test]
+    fn embedded_fs_offset_of_a_whole_disk_label_is_the_front_porch() {
+        let label = NextDiskLabel::parse(&synth_label(), 0).unwrap();
+        assert_eq!(embedded_fs_offset(&label, 0), Some(160 * 1024));
     }
 
     #[test]
