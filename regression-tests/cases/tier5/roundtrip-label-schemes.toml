@@ -250,3 +250,30 @@ files_identical = [["{fixture}", "{scratch}/out.img"]]
 args = ["ls", "{scratch}/out.img@1", "/"]
 expect_exit = 0
 stdout_contains = ["WHDSaves"]
+
+# --- Atari AHDI ---------------------------------------------------------------
+
+[[case]]
+id = "roundtrip.label.ahdi-base"
+description = "Atari AHDI: the root sector at LBA 0 with two primaries. Backed up fine before this and then failed at restore with \"no MBR data available\"."
+fixture = "part.ahdi.base.multipart"
+[[case.step]]
+args = ["backup", "{fixture}", "{scratch}/bk", "--name", "job", "--format", "chd", "--sector-by-sector"]
+expect_exit = 0
+[[case.step]]
+args = ["restore", "{scratch}/bk/job", "{scratch}/out.img"]
+expect_exit = 0
+files_identical = [["{fixture}", "{scratch}/out.img"]]
+[[case.step]]
+args = ["inspect", "{scratch}/out.img"]
+expect_exit = 0
+stdout_contains = ["Partition table: AHDI", "AHDI GEM", "AHDI BGM"]
+
+[[case]]
+id = "roundtrip.label.ahdi-refuses-per-partition"
+description = "The per-partition layout is refused up front rather than producing a folder restore turns away."
+fixture = "part.ahdi.base.multipart"
+[[case.step]]
+args = ["backup", "{fixture}", "{scratch}/bk", "--name", "job", "--format", "zstd"]
+expect_exit = 1
+stderr_contains = ["single-file CHD"]

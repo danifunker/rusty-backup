@@ -184,8 +184,29 @@ pub fn partitions_overlap(parts: &[PartitionInfo]) -> bool {
     extents.windows(2).any(|w| w[1].0 < w[0].1)
 }
 
-/// One synthetic partition covering the whole drive, for a table whose slots
-/// overlap. Its body carries the label, so a restore puts that back too.
+/// Why a table cannot be split into per-partition bodies for a whole-disk
+/// backup, or `None` when it can. The text is shown to the user.
+///
+/// Two shapes cannot: slots that overlap (an SGI `fx` disk describes several
+/// alternative layouts at once), and an AHDI XGM chain, whose follow-up
+/// sectors sit in the gaps between logicals with no writer to rebuild them —
+/// MBR gets away with the same shape only because `build_ebr_chain` exists.
+pub fn whole_disk_body_reason(
+    table: &PartitionTable,
+    parts: &[PartitionInfo],
+) -> Option<&'static str> {
+    if partitions_overlap(parts) {
+        return Some("its slots overlap");
+    }
+    if matches!(table, PartitionTable::Ahdi(_)) && parts.iter().any(|p| p.is_logical) {
+        return Some("its XGM extended chain has no writer");
+    }
+    None
+}
+
+/// One synthetic partition covering the whole drive, for a table that
+/// [`whole_disk_body_reason`] rejects. Its body carries the table, so a
+/// restore puts that back too.
 pub fn whole_disk_partition(table: &PartitionTable, size_bytes: u64) -> PartitionInfo {
     PartitionInfo {
         index: 0,
@@ -3114,6 +3135,44 @@ mod overlap_tests {
     fn a_zero_length_slot_cannot_overlap_anything() {
         let parts = [part(0, 2_520, 0), part(1, 2_520, 512)];
         assert!(!partitions_overlap(&parts));
+    }
+
+    /// MBR gets away with the same shape because `build_ebr_chain` rebuilds
+    /// its EBRs on restore; nothing rebuilds an AHDI XGM chain, so those disks
+    /// have to be imaged whole.
+    #[test]
+    fn an_ahdi_xgm_chain_forces_a_whole_disk_body() {
+        let mut logical = part(1, 2_048, 1024);
+        logical.is_logical = true;
+        let parts = [part(0, 2, 1024), logical];
+        let ahdi = ahdi_table();
+        assert_eq!(
+            whole_disk_body_reason(&ahdi, &parts),
+            Some("its XGM extended chain has no writer")
+        );
+        // Primaries only: the per-partition split is fine.
+        assert_eq!(whole_disk_body_reason(&ahdi, &parts[..1]), None);
+    }
+
+    /// A real two-primary AHDI root sector, built by the provisioner.
+    fn ahdi_table() -> PartitionTable {
+        use crate::partition::provision::{self, Geometry, PartSpec};
+        use crate::partition::type_catalog::TableKind;
+        const TOTAL: u64 = 8 * 1024 * 1024;
+        let geometry = Geometry::default();
+        let specs = vec![PartSpec {
+            size: Some(2 * 1024 * 1024),
+            type_text: Some("GEM".to_string()),
+            name: None,
+        }];
+        let align = provision::default_align(TableKind::Atari, geometry);
+        let placed =
+            provision::place(&specs, TableKind::Atari, TOTAL, align, geometry).expect("place");
+        let mut img = std::io::Cursor::new(vec![0u8; TOTAL as usize]);
+        provision::write_table(&mut img, TableKind::Atari, &placed, TOTAL, geometry)
+            .expect("write an AHDI root sector");
+        img.set_position(0);
+        PartitionTable::detect(&mut img).expect("detect AHDI")
     }
 
     #[test]

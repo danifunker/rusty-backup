@@ -220,6 +220,7 @@ pub fn is_supported(inputs_table: &PartitionTable) -> bool {
             | PartitionTable::Sgi(_)
             | PartitionTable::SgiDkLabel(_)
             | PartitionTable::Rdb(_)
+            | PartitionTable::Ahdi(_)
     )
 }
 
@@ -234,6 +235,7 @@ fn is_verbatim_head_scheme(table: &PartitionTable) -> bool {
             | PartitionTable::Sgi(_)
             | PartitionTable::SgiDkLabel(_)
             | PartitionTable::Rdb(_)
+            | PartitionTable::Ahdi(_)
     )
 }
 
@@ -2111,7 +2113,8 @@ fn build_patched_head_segments(
         | PartitionTable::Next(_)
         | PartitionTable::Sgi(_)
         | PartitionTable::SgiDkLabel(_)
-        | PartitionTable::Rdb(_) => {
+        | PartitionTable::Rdb(_)
+        | PartitionTable::Ahdi(_) => {
             // No writer patches these labels for a resize, so the caller has
             // already been refused one; the head goes out byte for byte.
             for o in overrides {
@@ -2144,11 +2147,6 @@ fn build_patched_head_segments(
         PartitionTable::SolarisX86 { .. } => {
             anyhow::bail!(
                 "assemble_from_staging: Solaris x86 VTOC sources are not supported (browse only)"
-            );
-        }
-        PartitionTable::Ahdi(_) => {
-            anyhow::bail!(
-                "assemble_from_staging: AHDI sources are not yet supported by single-file CHD"
             );
         }
         PartitionTable::X68k { .. } => {

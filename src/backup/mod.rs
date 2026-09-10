@@ -52,9 +52,9 @@ use metadata::{
 /// Disk-label schemes back up only through the single-file-CHD layout, which
 /// copies the head region verbatim. See `docs/backup_partition_schemes.md`.
 const LABEL_BACKUP_NEEDS_CHD: &str =
-    "disk-label sources (Sun / NeXT / SGI / Amiga RDB) back up as a single-file \
-     CHD only: re-run with CHD output. The per-partition layout would have to \
-     rewrite the label on restore, which is not implemented.";
+    "disk-label sources (Sun / NeXT / SGI / Amiga RDB / Atari AHDI) back up as a \
+     single-file CHD only: re-run with CHD output. The per-partition layout \
+     would have to rewrite the table on restore, which is not implemented.";
 
 /// Compression type for backup output.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -992,17 +992,16 @@ fn run_backup_inner(
         format!("Source size: {} bytes", source_size),
     );
 
-    // An SGI volume header carries several alternative layouts at once, so its
-    // slots overlap by design and there is no per-partition split to make.
-    // Image the drive as one body; the slot table rides in its JSON sidecar.
-    if partition::partitions_overlap(&partitions) {
+    // Some tables cannot be split into per-partition bodies at all. Image the
+    // drive as one body instead; the table rides in its JSON sidecar and, more
+    // to the point, inside the body itself.
+    if let Some(why) = partition::whole_disk_body_reason(&table, &partitions) {
         log(
             &progress,
             LogLevel::Info,
             format!(
-                "{} reports {} overlapping slots; imaging the drive as one body",
+                "{} cannot be split per-partition ({why}); imaging the drive as one body",
                 table.type_name(),
-                partitions.len(),
             ),
         );
         partitions = vec![partition::whole_disk_partition(&table, source_size)];
@@ -1213,16 +1212,14 @@ fn run_backup_inner(
             }
         }
         PartitionTable::Ahdi(table) => {
-            // Mirror the RDB / SGI sidecar shape: emit ahdi.json so a future
-            // restore knows the AHDI primary slots, XGM chain, and disk-size
-            // / bad-sector fields. Per-partition FAT data backup rides the
-            // standard layout-preserving path through the existing FAT
-            // pipeline.
             let json = serde_json::to_string_pretty(table)
                 .context("failed to serialize AHDI table to JSON")?;
             std::fs::write(backup_folder.join("ahdi.json"), json)
                 .context("failed to write ahdi.json")?;
             log(&progress, LogLevel::Info, "Exported AHDI (ahdi.json)");
+            if !single_file_chd_planned {
+                bail!("{}", LABEL_BACKUP_NEEDS_CHD);
+            }
         }
         PartitionTable::X68k { table, .. } => {
             // Mirror the AHDI sidecar shape: emit x68k.json so restore
