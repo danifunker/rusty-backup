@@ -390,6 +390,7 @@ pub fn detect<R: Read + Seek>(inner: &mut R) -> Option<MoGeometry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use byteorder::{BigEndian, ByteOrder};
 
     /// The four generator coefficients are what Previous's `t_rem` table holds;
     /// three entries pin the whole table without transcribing 256 constants.
@@ -496,6 +497,79 @@ mod tests {
                 &want[..]
             );
         }
+    }
+
+    /// Build a synthetic MO image — erased lead-in, then an ECC-coded NeXT
+    /// label at the origin — and check `detect` reads the geometry back off it.
+    fn synthetic_mo(origin: u64, front: u16, groups: (u16, u16, u16)) -> Vec<u8> {
+        use crate::partition::next::{build_label, NextLabelSpec, NextPartitionSpec};
+        let (size, alts, off) = groups;
+        let mut spec = NextLabelSpec {
+            front_porch: front,
+            ..Default::default()
+        };
+        spec.partitions = vec![
+            Some(NextPartitionSpec {
+                base: 0,
+                size: 512,
+                ..Default::default()
+            }),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ];
+        let mut label = build_label(&spec);
+        BigEndian::write_u16(&mut label[0x74..0x76], 1);
+        BigEndian::write_u16(&mut label[0x76..0x78], size);
+        BigEndian::write_u16(&mut label[0x78..0x7A], alts);
+        BigEndian::write_u16(&mut label[0x7A..0x7C], off);
+        crate::partition::next::NextDiskLabel::stamp_checksum(
+            &mut label,
+            crate::partition::next::NEXT_LABEL_V3,
+        );
+
+        // One copy at block 0, which is the one a sector-aligned scan sees.
+        let span = next::LABEL_SPAN.div_ceil(DATA_SECTOR);
+        let mut logical = vec![0u8; span * DATA_SECTOR];
+        logical[..label.len()].copy_from_slice(&label);
+
+        let phys = origin + 2048;
+        let mut media = vec![0xFFu8; phys as usize * RAW_SECTOR];
+        for i in 0..span {
+            let p = (origin as usize + i) * RAW_SECTOR;
+            encode_sector(
+                &logical[i * DATA_SECTOR..(i + 1) * DATA_SECTOR],
+                &mut media[p..p + RAW_SECTOR],
+            );
+        }
+        media
+    }
+
+    #[test]
+    fn detect_reads_the_geometry_off_the_label() {
+        let media = synthetic_mo(848, 256, (1600, 8, 784));
+        let geo = detect(&mut std::io::Cursor::new(media)).expect("a NeXT MO image");
+        assert_eq!(geo.origin, DEFAULT_ORIGIN_SECTOR);
+        assert_eq!(geo.front, 256);
+        assert_eq!(geo.group_size, 1600);
+        assert_eq!(geo.group_alts, 8);
+        assert_eq!(geo.group_off, 784);
+        // One group of 1600 with 8 spares, plus the porch, bounded by the media.
+        assert_eq!(geo.logical_sectors, 256 + 1592);
+    }
+
+    /// The size test is the cheap gate; 1296 = 16 * 81, so an ordinary image
+    /// never reaches the label scan at all.
+    #[test]
+    fn detect_declines_anything_without_a_label() {
+        let mut plain = std::io::Cursor::new(vec![0u8; 4096 * RAW_SECTOR]);
+        assert!(detect(&mut plain).is_none());
+        let mut odd = std::io::Cursor::new(vec![0u8; 1024 * 512]);
+        assert!(detect(&mut odd).is_none());
     }
 
     #[test]

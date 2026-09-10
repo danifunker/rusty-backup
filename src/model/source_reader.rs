@@ -1504,6 +1504,11 @@ pub fn open_container_rw(path: &Path) -> Result<ContainerRw> {
             }
             ContainerRw::Handle(Box::new(reader))
         }
+        // The MO reader re-encodes both ECC passes on write, so an edited
+        // sector goes back the way the drive expects. See `rbformats::next_mo`.
+        ImageFormat::NextMo(geo) => ContainerRw::Handle(Box::new(
+            crate::rbformats::next_mo::NextMoReader::new(rw()?, geo),
+        )),
         other => ContainerRw::ReadOnly(format!(
             "{}: this container decodes for reading but cannot be written back, \
              so edits would have nowhere to go. Convert it to a raw image first: \
