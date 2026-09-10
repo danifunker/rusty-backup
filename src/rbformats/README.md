@@ -101,6 +101,32 @@ through the normal partition / filesystem detection.
   clear per-codec error — they await real sample images that use them (KenCode
   is undocumented and needs reverse-engineering).
 
+- **`next_mo.rs` — NeXT magneto-optical media (`.od`).** The 256 MB Canon MO
+  cartridge of the NeXT Computer, as Previous stores it: the **raw media**, not
+  the drive's user data. Each 1296-byte physical sector is a 36 x 36 byte array
+  — rows 0..31 carry 32 data bytes each in columns 0..31, columns 32..35 hold
+  each row's cross-interleaved Reed-Solomon(36,32) code and rows 32..35 hold
+  each column's — so the user data is `raw[i*36 .. i*36+32]` for `i` in 0..32.
+  Two further offsets separate the file from a NeXT disk label:
+
+  - **Origin.** The image begins at the drive's track 4096; the kernel's
+    logical block 0 is at track 4149, 848 sectors in. Everything before that is
+    erased media (`0xFF`).
+  - **Alternate groups.** The `od` *driver*, not the drive, does the bad-block
+    sparing, from the label's own `d_ag_size` / `d_ag_alts` / `d_ag_off`: the
+    data area past the front porch is cut into `d_ag_size`-sector groups and
+    the `d_ag_alts` sectors at `d_ag_off` into each are spares that logical
+    addressing skips. This one is a trap — read the image linearly and the
+    label, the primary superblock and the root directory are all still correct,
+    so the volume *lists*; only the cylinder groups past the first drift by 8
+    sectors, and `fsck` reports tens of thousands of orphan inodes.
+
+  Writing regenerates both ECC passes; the encoder is verified byte-for-byte
+  against real NeXTSTEP 0.8 media (473 of 473 ECC-bearing sectors in a random
+  sample; the rest were erased). Media written with the controller's ECC
+  disabled carries `0xFF` in the ECC bytes and is read back unchanged, since
+  reads never consult the code.
+
 ## How to Add a New Output Format
 
 1. Create `src/rbformats/myformat.rs` with a compression function:

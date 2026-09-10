@@ -127,6 +127,18 @@ pub struct NextDiskLabel {
     pub front_porch: u16,
     /// `d_back` — sectors reserved after the last partition.
     pub back_porch: u16,
+    /// `d_ngroups` — alternate (spare) groups on the media; 0 means no sparing.
+    #[serde(default)]
+    pub group_count: u16,
+    /// `d_ag_size` — sectors per alternate group.
+    #[serde(default)]
+    pub group_size: u16,
+    /// `d_ag_alts` — spare sectors inside each group.
+    #[serde(default)]
+    pub group_alts: u16,
+    /// `d_ag_off` — where in a group the spares sit. See `rbformats::next_mo`.
+    #[serde(default)]
+    pub group_off: u16,
     /// `d_bootfile` — kernel NeXTSTEP boots (`mach_kernel`, `sdmach`).
     pub boot_file: String,
     pub hostname: String,
@@ -215,6 +227,10 @@ impl NextDiskLabel {
             rpm: BigEndian::read_u32(&buf[0x6C..0x70]),
             front_porch,
             back_porch: BigEndian::read_u16(&buf[0x72..0x74]),
+            group_count: BigEndian::read_u16(&buf[0x74..0x76]),
+            group_size: BigEndian::read_u16(&buf[0x76..0x78]),
+            group_alts: BigEndian::read_u16(&buf[0x78..0x7A]),
+            group_off: BigEndian::read_u16(&buf[0x7A..0x7C]),
             boot_file: c_string(&buf[0x84..0x9C]),
             hostname: c_string(&buf[0x9C..0xBC]),
             root_partition: printable_letter(buf[0xBC]),
@@ -505,7 +521,7 @@ pub fn embedded_fs_offset(label: &NextDiskLabel, container_offset: u64) -> Optio
 /// Signature, sector size, and checksum all have to agree before we claim a
 /// disk — a NeXTSTEP/Intel disk also carries a valid `0xAA55` boot sector, so
 /// this probe runs ahead of MBR parsing and must never fire on a PC disk.
-fn validates(buf: &[u8]) -> bool {
+pub fn validates(buf: &[u8]) -> bool {
     if buf.len() < 8 {
         return false;
     }

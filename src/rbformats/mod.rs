@@ -185,6 +185,7 @@ pub mod lz4;
 pub mod lzhuf;
 pub mod moof;
 pub mod ndif;
+pub mod next_mo;
 pub mod payload_slice;
 pub mod qcow2;
 #[cfg(test)]
@@ -1424,6 +1425,9 @@ pub enum ImageFormat {
     /// MAME CD CHD — single-track MODE1, browsed via the cooked 2048-byte adapter.
     /// `logical_size` is `frames * 2048`.
     ChdCdCooked { path: PathBuf, logical_size: u64 },
+    /// NeXT magneto-optical media (`.od`) — 1296-byte ECC-coded sectors with a
+    /// spare-sector map. See [`next_mo`] for both.
+    NextMo(next_mo::MoGeometry),
 }
 
 impl ImageFormat {
@@ -1500,6 +1504,10 @@ impl ImageFormat {
             ImageFormat::ChdCdCooked { logical_size, .. } => {
                 format!("MAME CD CHD ({} bytes cooked MODE1)", logical_size)
             }
+            ImageFormat::NextMo(geo) => format!(
+                "NeXT magneto-optical media ({} bytes decoded)",
+                geo.logical_sectors * next_mo::DATA_SECTOR as u64
+            ),
         }
     }
 }
@@ -1554,6 +1562,16 @@ pub fn detect_image_format_with_path(file: File, path: Option<&Path>) -> Result<
                     });
                 }
             }
+        }
+    }
+
+    // 0a. NeXT magneto-optical media: 1296-byte ECC-coded sectors. The size
+    //     test is the cheap gate — 1296 = 16 * 81, so an ordinary power-of-two
+    //     image never divides by it — and a validating NeXT label in the
+    //     decoded stream is the confirmation.
+    if file_size % next_mo::RAW_SECTOR as u64 == 0 {
+        if let Some(geo) = next_mo::detect(&mut file) {
+            return Ok(ImageFormat::NextMo(geo));
         }
     }
 
@@ -1997,6 +2015,11 @@ pub fn wrap_image_reader(file: File, format: ImageFormat) -> Result<(BoxReadSeek
             drop(file);
             let reader = chd::CdCookedReader::open_path(&path)?;
             Ok((Box::new(reader), logical_size))
+        }
+        ImageFormat::NextMo(geo) => {
+            let reader = next_mo::NextMoReader::new(BufReader::new(file), geo);
+            let size = reader.len();
+            Ok((Box::new(reader), size))
         }
     }
 }
