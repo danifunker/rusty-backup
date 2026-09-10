@@ -49,10 +49,10 @@ use metadata::{
     SizePolicy,
 };
 
-/// Sun and NeXT labels back up only through the single-file-CHD layout, which
+/// Disk-label schemes back up only through the single-file-CHD layout, which
 /// copies the head region verbatim. See `docs/backup_partition_schemes.md`.
 const LABEL_BACKUP_NEEDS_CHD: &str =
-    "disk-label sources (Sun / NeXT) back up as a single-file CHD only: \
+    "disk-label sources (Sun / NeXT / SGI) back up as a single-file CHD only: \
      re-run with CHD output. The per-partition layout would have to rewrite \
      the label on restore, which is not implemented.";
 
@@ -992,6 +992,22 @@ fn run_backup_inner(
         format!("Source size: {} bytes", source_size),
     );
 
+    // An SGI volume header carries several alternative layouts at once, so its
+    // slots overlap by design and there is no per-partition split to make.
+    // Image the drive as one body; the slot table rides in its JSON sidecar.
+    if partition::partitions_overlap(&partitions) {
+        log(
+            &progress,
+            LogLevel::Info,
+            format!(
+                "{} reports {} overlapping slots; imaging the drive as one body",
+                table.type_name(),
+                partitions.len(),
+            ),
+        );
+        partitions = vec![partition::whole_disk_partition(&table, source_size)];
+    }
+
     // Step 2: Create backup folder
     set_operation(&progress, "Creating backup folder...");
     let backup_folder = format::create_backup_folder(&config.destination_dir, &config.backup_name)?;
@@ -1136,12 +1152,6 @@ fn run_backup_inner(
             log(&progress, LogLevel::Info, "Exported RDB (rdb.json)");
         }
         PartitionTable::Sgi(vh) => {
-            // Step 2 surfaces SGI partitions in the inspect tab; backup of
-            // SGI disks is a separate workflow (deferred). Emit a JSON
-            // sidecar so the partition layout is recorded if a future
-            // session does want to round-trip it, but bail before any
-            // per-partition data write — the data path needs SGI-aware
-            // sizing and the EFS/XFS readers to land first.
             let json = serde_json::to_string_pretty(vh)
                 .context("failed to serialize SGI volume header to JSON")?;
             std::fs::write(backup_folder.join("sgi.json"), json)
@@ -1149,9 +1159,11 @@ fn run_backup_inner(
             log(
                 &progress,
                 LogLevel::Info,
-                "Exported SGI volume header (sgi.json) — partition data backup not yet supported",
+                "Exported SGI volume header (sgi.json)",
             );
-            bail!("backing up SGI disks is not yet supported (browse only)");
+            if !single_file_chd_planned {
+                bail!("{}", LABEL_BACKUP_NEEDS_CHD);
+            }
         }
         PartitionTable::Sun(label) => {
             let json = serde_json::to_string_pretty(label)
@@ -1196,9 +1208,6 @@ fn run_backup_inner(
             bail!("backing up Solaris x86 disks is not yet supported (browse only)");
         }
         PartitionTable::SgiDkLabel(label) => {
-            // Same sidecar shape as the Sun label: record the slot layout in
-            // sgi_dklabel.json and defer the per-slot data backup. Browse /
-            // inspect / extract already work through the EFS v1 reader.
             let json = serde_json::to_string_pretty(label)
                 .context("failed to serialize SGI disk label to JSON")?;
             std::fs::write(backup_folder.join("sgi_dklabel.json"), json)
@@ -1206,9 +1215,11 @@ fn run_backup_inner(
             log(
                 &progress,
                 LogLevel::Info,
-                "Exported SGI disk label (sgi_dklabel.json) — partition data backup not yet supported",
+                "Exported SGI disk label (sgi_dklabel.json)",
             );
-            bail!("backing up SGI-disk-label disks is not yet supported (browse only)");
+            if !single_file_chd_planned {
+                bail!("{}", LABEL_BACKUP_NEEDS_CHD);
+            }
         }
         PartitionTable::Ahdi(table) => {
             // Mirror the RDB / SGI sidecar shape: emit ahdi.json so a future

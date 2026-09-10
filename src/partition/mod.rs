@@ -168,6 +168,42 @@ impl PartitionInfo {
     }
 }
 
+/// True when any two of `parts` claim the same byte, ignoring the extended
+/// container (which contains its logicals by definition).
+///
+/// SGI volume headers describe several alternative layouts at once — an `fx`
+/// disk's slots overlap by design — so a whole-disk backup cannot split such a
+/// table into per-partition bodies. See `docs/backup_partition_schemes.md`.
+pub fn partitions_overlap(parts: &[PartitionInfo]) -> bool {
+    let mut extents: Vec<(u64, u64)> = parts
+        .iter()
+        .filter(|p| !p.is_extended_container && p.size_bytes > 0)
+        .map(|p| (p.byte_offset(), p.byte_offset() + p.size_bytes))
+        .collect();
+    extents.sort_unstable();
+    extents.windows(2).any(|w| w[1].0 < w[0].1)
+}
+
+/// One synthetic partition covering the whole drive, for a table whose slots
+/// overlap. Its body carries the label, so a restore puts that back too.
+pub fn whole_disk_partition(table: &PartitionTable, size_bytes: u64) -> PartitionInfo {
+    PartitionInfo {
+        index: 0,
+        type_name: format!("{} whole disk", table.type_name()),
+        partition_type_byte: 0,
+        start_lba: 0,
+        start_byte: Some(0),
+        size_bytes,
+        bootable: false,
+        is_logical: false,
+        is_extended_container: false,
+        partition_type_string: None,
+        hfs_block_size: None,
+        rdb_part_block: None,
+        drv_name: None,
+    }
+}
+
 /// Standard floppy disk image sizes (bytes).
 ///
 /// Images matching one of these sizes that lack both a recognized filesystem
@@ -3019,6 +3055,76 @@ mod layout_expectation_tests {
         }
         assert!(!is_known_layout("mbrr"));
         assert!(!is_known_layout(""));
+    }
+}
+
+#[cfg(test)]
+mod overlap_tests {
+    use super::*;
+
+    fn part(index: usize, start_lba: u64, size_bytes: u64) -> PartitionInfo {
+        PartitionInfo {
+            index,
+            type_name: "test".into(),
+            partition_type_byte: 0,
+            start_lba,
+            start_byte: None,
+            size_bytes,
+            bootable: false,
+            is_logical: false,
+            is_extended_container: false,
+            partition_type_string: None,
+            hfs_block_size: None,
+            rdb_part_block: None,
+            drv_name: None,
+        }
+    }
+
+    #[test]
+    fn adjacent_partitions_do_not_overlap() {
+        // 119..17969, 17969..35700, 35700..115430 — the SGI-DkLabel fixture.
+        let parts = [
+            part(0, 119, 17_850 * 512),
+            part(1, 17_969, 17_731 * 512),
+            part(2, 35_700, 79_730 * 512),
+        ];
+        assert!(!partitions_overlap(&parts));
+    }
+
+    /// An `fx` disk describes several alternative layouts at once, so two of
+    /// its slots really do claim the same sectors.
+    #[test]
+    fn sgi_alternative_layouts_overlap() {
+        let parts = [
+            part(0, 2_520, 39_480 * 512),
+            part(1, 1_533_000, 39_480 * 512),
+            part(2, 2_520, 1_569_960 * 512),
+        ];
+        assert!(partitions_overlap(&parts));
+    }
+
+    /// Order of the input must not matter — the SGI slot list is not sorted.
+    #[test]
+    fn overlap_is_found_whatever_the_slot_order() {
+        let parts = [part(0, 1_000, 512), part(1, 0, 2_000 * 512)];
+        assert!(partitions_overlap(&parts));
+    }
+
+    #[test]
+    fn a_zero_length_slot_cannot_overlap_anything() {
+        let parts = [part(0, 2_520, 0), part(1, 2_520, 512)];
+        assert!(!partitions_overlap(&parts));
+    }
+
+    #[test]
+    fn the_whole_disk_stand_in_starts_at_zero_and_spans_the_drive() {
+        let table = PartitionTable::None {
+            size_bytes: 4096,
+            fs_hint: "Unknown".into(),
+        };
+        let p = whole_disk_partition(&table, 4096);
+        assert_eq!(p.byte_offset(), 0, "its body has to carry the label");
+        assert_eq!(p.size_bytes, 4096);
     }
 }
 
