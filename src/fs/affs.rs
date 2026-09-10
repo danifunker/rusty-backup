@@ -364,7 +364,10 @@ impl<R: Read + Seek> AffsFilesystem<R> {
         let root_block = locate_root_block(&mut reader, partition_offset, block_size, candidate)
             .ok_or_else(|| {
                 parse_err(format!(
-                    "no AFFS root block at or below block {candidate}: searched back                      {MAX_ROOT_SEARCH} blocks. AFFS stores no size, so a partition opened                      without its true length has to infer the volume's midpoint from the end                      of the disk; see R-042."
+                    "no AFFS root block at or below block {candidate}: searched back \
+                     {MAX_ROOT_SEARCH} blocks. AFFS stores no size, so a partition opened \
+                     without its true length has to infer the volume's midpoint from the end \
+                     of the disk; see R-042."
                 ))
             })?;
 

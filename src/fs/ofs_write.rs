@@ -573,7 +573,8 @@ pub fn create_blank_ofs(size_bytes: u64, name: &str) -> Result<Vec<u8>, Filesyst
     let used = first_dir + 8;
     if total < used + 8 {
         return Err(FilesystemError::InvalidData(format!(
-            "ofs: {size_bytes} bytes is too small for a table of contents, a bitmap, and a              root directory (needs at least {} bytes)",
+            "ofs: {size_bytes} bytes is too small for a table of contents, a bitmap, and a \
+             root directory (needs at least {} bytes)",
             (used + 8) * SECTOR
         )));
     }

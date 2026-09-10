@@ -343,20 +343,6 @@ impl std::io::Seek for SharedDevice {
 /// Nothing is cached without `authopen`, so releasing is a no-op.
 pub fn release_elevated_devices(_path: Option<&str>) {}
 
-/// TEMP-DIAG counterpart. Reports the plain-`open(2)` outcome; there is no
-/// escalation path here to describe.
-pub fn probe_device_access(path: &str) -> Vec<String> {
-    let mut out = vec![format!(
-        "[perm] euid={} (no authopen on this build)",
-        unsafe { libc::geteuid() },
-    )];
-    match std::fs::OpenOptions::new().read(true).open(path) {
-        Ok(_) => out.push(format!("[perm] {path}: O_RDONLY ok")),
-        Err(e) => out.push(format!("[perm] {path}: O_RDONLY failed - {e}")),
-    }
-    out
-}
-
 /// No optical drive to claim without DiskArbitration.
 pub(crate) fn claim_optical_disc(_device_path: &str) -> Option<DiskClaim> {
     None

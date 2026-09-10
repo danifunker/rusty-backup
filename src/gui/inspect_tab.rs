@@ -2882,10 +2882,6 @@ impl InspectTab {
                 .info(format!("Inspecting remote image {}...", path.display()));
         } else {
             ctx.log.info(format!("Inspecting {}...", path.display()));
-            // TEMP-DIAG: log the access we hold before touching the device.
-            for line in rusty_backup::os::describe_device_access(&path) {
-                ctx.log.info(line);
-            }
         }
 
         // Cache CHD path: subsequent per-partition probes (HFS variant probe,

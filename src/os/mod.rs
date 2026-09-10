@@ -192,24 +192,6 @@ impl Seek for SourceHandle {
     }
 }
 
-/// TEMP-DIAG: describe the access we currently hold on `path`, for the GUI log.
-///
-/// Non-escalating and read-only in effect, so it is safe to call before any
-/// operation. Added to diagnose a macOS restore failing with `Permission
-/// denied` at the very end of an otherwise successful run; delete this and its
-/// call sites (grep `TEMP-DIAG`) once that is resolved.
-#[allow(unused_variables)]
-pub fn describe_device_access(path: &Path) -> Vec<String> {
-    #[cfg(target_os = "macos")]
-    {
-        let s = path.to_string_lossy();
-        if s.starts_with("/dev/") {
-            return macos::probe_device_access(&s);
-        }
-    }
-    Vec::new()
-}
-
 /// Release cached privileged device descriptors so the disk can be ejected.
 ///
 /// Pass `None` to release every cached device. A no-op off macOS, which has no

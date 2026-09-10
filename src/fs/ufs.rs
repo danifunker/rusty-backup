@@ -2158,7 +2158,8 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
         let max_bytes = (ndaddr + nindir + nindir * nindir) * bs;
         if data_len > max_bytes {
             return Err(FilesystemError::Unsupported(format!(
-                "ufs write_file_data: file size {data_len} > {max_bytes}                  (triple-indirect writes not implemented)"
+                "ufs write_file_data: file size {data_len} > {max_bytes} \
+                 (triple-indirect writes not implemented)"
             )));
         }
         let cg_hint = (inode.inum / self.ipg) % self.ncg;

@@ -1282,6 +1282,11 @@ pub fn open_peeled_read_with_entry(
     if is_container_path(path) {
         return open_read_dispatch(path, password, inside);
     }
+    // Checked before the content probes below: their plain opens would fail a
+    // root-owned device node with a bare EACCES, denying elevation (R19, R-068).
+    if crate::cli::device_safety::looks_like_device_path(path) {
+        return open_device_read(path);
+    }
     // Encrypted DMG (encrcdsa v2): the `koly`/partition table only appears after
     // decryption, so peel the encryption here — this is the layer that carries
     // the password. The decrypted stream is a plaintext disk image that then
@@ -1313,11 +1318,6 @@ pub fn open_peeled_read_with_entry(
     // a `bcem` resource, so a plain `.bin` raw image is never affected.
     if let Some(image) = try_open_ndif_carrier(path) {
         return Ok(Box::new(std::io::Cursor::new(image)));
-    }
-    // A raw device is never a container, cannot answer seek(End) and, on macOS,
-    // takes only sector-sized reads: a plain BufReader gave inspect 0 bytes (R19).
-    if crate::cli::device_safety::looks_like_device_path(path) {
-        return open_device_read(path);
     }
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
     match detect_image_format_with_path(file, Some(path)) {
