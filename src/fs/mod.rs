@@ -1164,6 +1164,19 @@ pub fn packed_partition_reader_padded<R: Read + Seek + Send + 'static>(
 ///
 /// Returns `None` if the filesystem type is unsupported or cannot be parsed,
 /// in which case the caller should fall back to the full partition size.
+/// Bytes a partition-embedded disk label stands ahead of the filesystem. Every
+/// partition-level size has to carry them; zero for every other partition type.
+fn embedded_label_bytes<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+    partition_type_string: Option<&str>,
+) -> u64 {
+    if partition_type_string != Some("Apple_Rhapsody_UFS") {
+        return 0;
+    }
+    resolve_next_label(reader, partition_offset).saturating_sub(partition_offset)
+}
+
 pub fn effective_partition_size<R: Read + Seek + Send + 'static>(
     reader: R,
     partition_offset: u64,
@@ -1189,11 +1202,12 @@ pub fn effective_partition_size<R: Read + Seek + Send + 'static>(
 /// missing from the metadata entirely, with nothing anywhere saying why. Give
 /// callers that can log a way to say what went wrong.
 pub fn effective_partition_size_reported<R: Read + Seek + Send + 'static>(
-    reader: R,
+    mut reader: R,
     partition_offset: u64,
     partition_type: u8,
     partition_type_string: Option<&str>,
 ) -> Result<u64, String> {
+    let head = embedded_label_bytes(&mut reader, partition_offset, partition_type_string);
     let mut fs = open_filesystem(
         reader,
         partition_offset,
@@ -1202,6 +1216,7 @@ pub fn effective_partition_size_reported<R: Read + Seek + Send + 'static>(
     )
     .map_err(|e| format!("cannot open filesystem: {e}"))?;
     fs.last_data_byte()
+        .map(|m| m + head)
         .map_err(|e| format!("last_data_byte failed: {e}"))
 }
 
@@ -1233,6 +1248,7 @@ pub fn defragmented_partition_size<R: Read + Seek + Send + 'static>(
     // real bound is enforced by the eventual resize plan.
     let wrapper_info =
         hfsplus_wrapper_clone::detect_wrapped_hfsplus(&mut reader, partition_offset, u64::MAX);
+    let head = embedded_label_bytes(&mut reader, partition_offset, partition_type_string);
     let mut fs = open_filesystem(
         reader,
         partition_offset,
@@ -1245,7 +1261,7 @@ pub fn defragmented_partition_size<R: Read + Seek + Send + 'static>(
         let plan = hfsplus_wrapper_clone::plan_wrapped_clone(&info, inner_min).ok()?;
         Some(plan.new_partition_size)
     } else {
-        Some(inner_min)
+        Some(inner_min + head)
     }
 }
 
@@ -1464,6 +1480,8 @@ pub fn is_expensive_minimum(partition_type: u8, partition_type_string: Option<&s
             "Apple_HFS"
                 | "Apple_HFSX"
                 | "Apple_UNIX_SVR2"
+                // Rhapsody: a UFS bitmap walk, same cost as the SVR2 slices.
+                | "Apple_Rhapsody_UFS"
                 | "Linux"
                 | "48465300-0000-11AA-AA11-00306543ECAC"
                 | "0FC63DAF-8483-4772-8E79-3D69D8477DE4"
@@ -1579,6 +1597,7 @@ pub fn partition_minimum_size_cancellable<R: Read + Seek + Send + 'static>(
         progress("Cancelled");
         return cancelled();
     }
+    let label_head = embedded_label_bytes(&mut reader, partition_offset, partition_type_string);
     progress("Opening filesystem...");
     let mut fs = match open_filesystem_sized(
         reader,
@@ -1608,7 +1627,10 @@ pub fn partition_minimum_size_cancellable<R: Read + Seek + Send + 'static>(
         return cancelled();
     }
     progress("Computing last data byte...");
-    let in_place = fs.last_data_byte().ok().map(|m| m.min(partition_size));
+    let in_place = fs
+        .last_data_byte()
+        .ok()
+        .map(|m| (m + label_head).min(partition_size));
     if cancel() {
         progress("Cancelled");
         return cancelled();
@@ -1664,7 +1686,7 @@ pub fn partition_minimum_size_cancellable<R: Read + Seek + Send + 'static>(
                     return None;
                 }
             },
-            None => m,
+            None => m + label_head,
         };
         let clamped = partition_level.min(partition_size);
         progress(&format!(
@@ -4892,6 +4914,35 @@ mod rhapsody_dispatch_tests {
         assert!(is_layout_preserving_fs(0, Some("Apple_Rhapsody_UFS")));
         assert_eq!(fs_name_for(0, Some("Apple_Rhapsody_UFS")), "UFS");
         assert!(is_checkable_type(0, Some("Apple_Rhapsody_UFS")));
+    }
+
+    /// The minimum is a partition-level size, so it has to include the label
+    /// the filesystem sits behind — shrink to the filesystem's own answer and
+    /// the last 160 KiB of it falls off the end of the slice.
+    #[test]
+    fn rhapsody_minimum_counts_the_label_head() {
+        let slice_offset = 18952 * 512;
+        let disk = rhapsody_slice(slice_offset);
+        let slice_len = FRONT * SECTOR + UFS_BYTES;
+        let result = partition_minimum_size(
+            Cursor::new(disk),
+            slice_offset,
+            0,
+            Some("Apple_Rhapsody_UFS"),
+            slice_len,
+            true,
+            None,
+            &|_| {},
+        );
+        let MinimumResult::Computed { in_place, .. } = result else {
+            panic!("expected a computed minimum");
+        };
+        let min = in_place.expect("UFS reports a last data byte");
+        assert!(
+            min > FRONT * SECTOR,
+            "minimum {min} must clear the {} byte label head",
+            FRONT * SECTOR
+        );
     }
 }
 

@@ -216,11 +216,17 @@ impl MoGeometry {
         };
         // The media is the other bound: a label may describe more groups than
         // the file holds, and the last physical sector must stay addressable.
-        let mut by_media = phys_sectors.saturating_sub(origin);
-        while by_media > 0 && geo.physical_sector(by_media - 1) >= phys_sectors {
-            by_media -= 1;
+        // `physical_sector` is monotonic, so bisect rather than walk back.
+        let (mut lo, mut hi) = (0u64, phys_sectors.saturating_sub(origin));
+        while lo < hi {
+            let mid = lo + (hi - lo).div_ceil(2);
+            if geo.physical_sector(mid - 1) < phys_sectors {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
         }
-        geo.logical_sectors = by_label.min(by_media);
+        geo.logical_sectors = by_label.min(lo);
         geo
     }
 }

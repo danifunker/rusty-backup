@@ -963,6 +963,18 @@ pub fn assemble_from_staging(
              caller did not populate it"
         );
     }
+    // A disk label that stands ahead of the first partition IS the head region;
+    // assembling without it would drop it and still produce a plausible CHD.
+    if is_verbatim_head_scheme(inputs.partition_table)
+        && inputs.source_head_region.is_empty()
+        && inputs.partitions.iter().all(|p| p.byte_offset() > 0)
+    {
+        anyhow::bail!(
+            "assemble_from_staging: {} source requires source_head_region — \
+             caller did not populate it",
+            inputs.partition_table.type_name(),
+        );
+    }
     if inputs.plans.is_empty() {
         anyhow::bail!("assemble_from_staging: empty resize plan");
     }
