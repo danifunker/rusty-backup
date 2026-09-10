@@ -1193,19 +1193,11 @@ fn run_backup_inner(
                 bail!("{}", LABEL_BACKUP_NEEDS_CHD);
             }
         }
-        PartitionTable::SolarisX86 { label, .. } => {
-            // Same sidecar shape as the Sun label: record the slice layout in
-            // solaris_x86.json and defer the per-slice data backup.
-            let json = serde_json::to_string_pretty(label)
-                .context("failed to serialize Solaris x86 VTOC to JSON")?;
-            std::fs::write(backup_folder.join("solaris_x86.json"), json)
-                .context("failed to write solaris_x86.json")?;
-            log(
-                &progress,
-                LogLevel::Info,
-                "Exported Solaris x86 VTOC (solaris_x86.json) — partition data backup not yet supported",
-            );
-            bail!("backing up Solaris x86 disks is not yet supported (browse only)");
+        PartitionTable::SolarisX86 { .. } => {
+            // Unreachable: the table was rewritten to its host MBR far above,
+            // with the VTOC already written to solaris_x86.json. Kept so the
+            // match stays exhaustive, and honest about why it cannot fire.
+            bail!("internal: a Solaris x86 table reached the sidecar match unrewritten");
         }
         PartitionTable::SgiDkLabel(label) => {
             let json = serde_json::to_string_pretty(label)

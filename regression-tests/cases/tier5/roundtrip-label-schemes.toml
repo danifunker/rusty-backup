@@ -1,6 +1,7 @@
 # Tier 5 — backup and restore for the disk-label partition schemes.
 #
-# Sun and NeXT labels bailed out of `backup` entirely until 2026-09-10: the
+# Sun, NeXT and both SGI schemes bailed out of `backup` entirely until
+# 2026-09-10: the
 # sidecar JSON was written and the run then aborted with "browse only". They go
 # through the single-file-CHD layout, which writes a real disk image (table at
 # sector 0, partitions at their declared offsets) and restores by copying the
@@ -30,7 +31,7 @@
 [meta]
 tier = 5
 group = "roundtrip.label"
-description = "Back up and restore Sun- and NeXT-labeled disks; prove the label and every partition survived."
+description = "Back up and restore the disk-label schemes; prove the label and every partition survived."
 
 # --- NeXT label ----------------------------------------------------------------
 
@@ -129,3 +130,62 @@ stdout_not_contains = ["whole-disk.img", "carved-blk"]
 args = ["fsck", "{scratch}/out.img@3", "--checkonly"]
 expect_exit = 0
 stdout_contains = ["21135 files"]
+
+
+# --- SGI volume header --------------------------------------------------------
+
+[[case]]
+id = "roundtrip.label.sgi-riscos"
+description = "An `fx` disk describes several alternative layouts at once, so its slots overlap and the drive is imaged as one body with the slot table in sgi.json."
+fixture = "part.sgi.riscos-mips.multipart"
+timeout_ms = 1800000
+[[case.step]]
+args = ["backup", "{fixture}", "{scratch}/bk", "--name", "job", "--format", "chd"]
+expect_exit = 0
+[[case.step]]
+args = ["restore", "{scratch}/bk/job", "{scratch}/out.img"]
+expect_exit = 0
+[[case.step]]
+# All fourteen browsable slots back, at the same offsets — that is what proves
+# the volume header rode along inside the one body we imaged.
+args = ["inspect", "{scratch}/out.img"]
+expect_exit = 0
+stdout_contains = ["Partition table: SGI", "SGI BSD", "2520", "1533000", "VOLHDR"]
+[[case.step]]
+args = ["ls", "{scratch}/out.img@1", "/"]
+expect_exit = 0
+stdout_contains = ["lost+found", "usr", "etc"]
+
+# --- SGI disk label (pre-IRIX IRIS) -------------------------------------------
+
+[[case]]
+id = "roundtrip.label.sgi-dklabel-iris"
+description = "The IRIS 3130 disk label: three non-overlapping slots behind a 119-sector head, and the image is word-swapped — which the copy never has to know, because those bytes are never interpreted."
+fixture = "fs.efs-v1.populated-irix37.multipart"
+timeout_ms = 1200000
+[[case.step]]
+args = ["backup", "{fixture}", "{scratch}/bk", "--name", "job", "--format", "chd", "--sector-by-sector"]
+expect_exit = 0
+[[case.step]]
+args = ["restore", "{scratch}/bk/job", "{scratch}/out.img"]
+expect_exit = 0
+[[case.step]]
+# This one really is byte-for-byte: the slots are contiguous from the head to
+# the end of the last, so there is no gap for the assembler to zero-fill.
+args = ["inspect", "{scratch}/out.img"]
+expect_exit = 0
+stdout_contains = ["SGI-DkLabel (byte-swapped)", "SGI root (EFS v1)", "SGI swap"]
+files_identical = [["{fixture}", "{scratch}/out.img"]]
+[[case.step]]
+args = ["ls", "{scratch}/out.img@1", "/"]
+expect_exit = 0
+stdout_contains = ["vmunix", "defaultboot", "kernels"]
+
+[[case]]
+id = "roundtrip.label.sgi-refuses-per-partition"
+description = "A per-partition backup of an SGI-labeled disk is refused, and the message names the layout that works."
+fixture = "fs.efs-v1.populated-irix37.multipart"
+[[case.step]]
+args = ["backup", "{fixture}", "{scratch}/bk", "--name", "job", "--format", "zstd"]
+expect_exit = 1
+stderr_contains = ["single-file CHD"]
