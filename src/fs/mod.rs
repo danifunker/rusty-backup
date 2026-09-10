@@ -968,6 +968,38 @@ fn compact_reader_for_detected<R: Read + Seek + Send + 'static>(
     }
 }
 
+/// Longest NeXT front porch we will carry verbatim in a compact stream. Real
+/// labels reserve 160-256 sectors; anything larger means the label is wrong.
+const MAX_NEXT_HEAD_BYTES: u64 = 1 << 20;
+
+/// A Rhapsody slice compacts as the NeXT label's head region verbatim followed
+/// by the layout-preserving UFS stream; every byte keeps its original offset.
+fn next_label_compact_reader<R: Read + Seek + Send + 'static>(
+    mut reader: R,
+    partition_offset: u64,
+) -> Option<(Box<dyn Read + Send>, CompactResult)> {
+    let fs_offset = resolve_next_label(&mut reader, partition_offset);
+    let head_len = fs_offset.checked_sub(partition_offset)?;
+    if head_len > MAX_NEXT_HEAD_BYTES {
+        return None;
+    }
+    let mut head = vec![0u8; head_len as usize];
+    if head_len > 0 {
+        reader.seek(SeekFrom::Start(partition_offset)).ok()?;
+        reader.read_exact(&mut head).ok()?;
+    }
+    let (compact, info) = CompactUfsReader::new(reader, fs_offset).ok()?;
+    Some((
+        Box::new(std::io::Cursor::new(head).chain(compact)),
+        CompactResult {
+            original_size: info.original_size + head_len,
+            compacted_size: info.compacted_size + head_len,
+            data_size: info.data_size + head_len,
+            clusters_used: info.clusters_used,
+        },
+    ))
+}
+
 /// HFS or HFS+ at the offset, as MBR type 0xAF and the Apple HFS GUID carry it.
 /// A wrapped HFS+ volume is left to the wrapper-aware clone path (`None`).
 fn apple_hfs_compact_reader<R: Read + Seek + Send + 'static>(
@@ -1342,6 +1374,7 @@ pub fn is_layout_preserving_fs(partition_type: u8, partition_type_string: Option
                 | "Apple_HFS+"
                 | "Apple_UNIX_SVR2"
                 | "Apple_UNIX_SRVR2"
+                | "Apple_Rhapsody_UFS"
                 | "Apple_PRODOS"
                 | "Apple_ProDOS"
                 | "Linux"
@@ -2916,6 +2949,8 @@ fn compact_partition_reader_by_string<R: Read + Seek + Send + 'static>(
                 _ => Ok(None),
             }
         }
+        // Rhapsody's NeXT label rides in front of the UFS; see the read path's arm.
+        "Apple_Rhapsody_UFS" => Ok(next_label_compact_reader(reader, partition_offset)),
         "Apple_PRODOS" | "Apple_ProDOS" => {
             let (compact, info) =
                 CompactProDosReader::new(reader, partition_offset).map_err(|e| {
@@ -4752,6 +4787,111 @@ mod min_size_cancel_tests {
                 ..
             }
         ));
+    }
+}
+
+#[cfg(test)]
+mod rhapsody_dispatch_tests {
+    use super::*;
+    use crate::fs::ufs::UfsEndian;
+    use crate::fs::ufs_format::{create_blank_ufs1, Ufs1FormatParams};
+    use crate::partition::next::{build_label, NextLabelSpec, NextPartitionSpec, LABEL_BLOCKS};
+    use std::io::Cursor;
+
+    const SECTOR: u64 = 1024;
+    const FRONT: u64 = 160;
+    const UFS_BYTES: u64 = 8 * 1024 * 1024;
+
+    /// A Rhapsody slice: a NeXT label in its first sectors, then the UFS.
+    /// `p_base` is recorded from the disk origin, as Rhapsody writes it.
+    fn rhapsody_slice(slice_offset: u64) -> Vec<u8> {
+        let mut spec = NextLabelSpec {
+            front_porch: FRONT as u16,
+            ..Default::default()
+        };
+        spec.partitions = vec![
+            Some(NextPartitionSpec {
+                base: (slice_offset / SECTOR) as i32,
+                size: (UFS_BYTES / SECTOR) as i32,
+                block_size: 4096,
+                fs_type: "4.4BSD".to_string(),
+                ..Default::default()
+            }),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ];
+        let label = build_label(&spec);
+        let mut disk = vec![0u8; (slice_offset + FRONT * SECTOR + UFS_BYTES) as usize];
+        for &block in LABEL_BLOCKS.iter() {
+            let at = (slice_offset + block * 512) as usize;
+            disk[at..at + label.len()].copy_from_slice(&label);
+        }
+        let ufs = create_blank_ufs1(&Ufs1FormatParams {
+            size_bytes: UFS_BYTES,
+            block_size: 4096,
+            endian: UfsEndian::Big,
+            ..Default::default()
+        })
+        .expect("format a blank UFS1");
+        let at = (slice_offset + FRONT * SECTOR) as usize;
+        disk[at..at + ufs.len()].copy_from_slice(&ufs);
+        disk
+    }
+
+    #[test]
+    fn rhapsody_slice_opens_past_the_nested_label() {
+        let slice_offset = 18952 * 512;
+        let disk = rhapsody_slice(slice_offset);
+        let fs = open_filesystem(
+            Cursor::new(disk),
+            slice_offset,
+            0,
+            Some("Apple_Rhapsody_UFS"),
+        )
+        .expect("open the UFS behind the label");
+        assert_eq!(fs.fs_type(), "UFS1");
+    }
+
+    /// Compaction has to start at the slice, not at the filesystem: the head
+    /// region is what the NeXT label lives in, and dropping it loses the label.
+    #[test]
+    fn rhapsody_compaction_keeps_the_label_and_spans_the_whole_slice() {
+        let slice_offset = 18952 * 512;
+        let disk = rhapsody_slice(slice_offset);
+        let head: Vec<u8> =
+            disk[slice_offset as usize..(slice_offset + FRONT * SECTOR) as usize].to_vec();
+        let (mut reader, info) = compact_partition_reader(
+            Cursor::new(disk),
+            slice_offset,
+            0,
+            Some("Apple_Rhapsody_UFS"),
+            true,
+        )
+        .expect("a compact reader for the slice");
+        assert_eq!(
+            info.compacted_size,
+            FRONT * SECTOR + UFS_BYTES,
+            "layout-preserving: the stream is the whole slice"
+        );
+        assert!(
+            info.data_size < info.compacted_size,
+            "free blocks are zeros"
+        );
+        let mut got = vec![0u8; head.len()];
+        reader.read_exact(&mut got).unwrap();
+        assert_eq!(got, head, "the label rides at the front of the stream");
+    }
+
+    #[test]
+    fn rhapsody_is_layout_preserving() {
+        assert!(is_layout_preserving_fs(0, Some("Apple_Rhapsody_UFS")));
+        assert_eq!(fs_name_for(0, Some("Apple_Rhapsody_UFS")), "UFS");
+        assert!(is_checkable_type(0, Some("Apple_Rhapsody_UFS")));
     }
 }
 
