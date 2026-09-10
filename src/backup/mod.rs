@@ -49,6 +49,13 @@ use metadata::{
     SizePolicy,
 };
 
+/// Sun and NeXT labels back up only through the single-file-CHD layout, which
+/// copies the head region verbatim. See `docs/backup_partition_schemes.md`.
+const LABEL_BACKUP_NEEDS_CHD: &str =
+    "disk-label sources (Sun / NeXT) back up as a single-file CHD only: \
+     re-run with CHD output. The per-partition layout would have to rewrite \
+     the label on restore, which is not implemented.";
+
 /// Compression type for backup output.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum CompressionType {
@@ -1147,10 +1154,6 @@ fn run_backup_inner(
             bail!("backing up SGI disks is not yet supported (browse only)");
         }
         PartitionTable::Sun(label) => {
-            // Mirror the SGI sidecar: record the slice layout in sun.json, but
-            // defer the per-slice data backup (the data path needs Sun-label
-            // sizing). Browse / inspect / extract already work via the slice
-            // list + the existing UFS reader.
             let json = serde_json::to_string_pretty(label)
                 .context("failed to serialize Sun disk label to JSON")?;
             std::fs::write(backup_folder.join("sun.json"), json)
@@ -1158,14 +1161,13 @@ fn run_backup_inner(
             log(
                 &progress,
                 LogLevel::Info,
-                "Exported Sun disk label (sun.json) — partition data backup not yet supported",
+                "Exported Sun disk label (sun.json)",
             );
-            bail!("backing up Sun-labeled disks is not yet supported (browse only)");
+            if !single_file_chd_planned {
+                bail!("{}", LABEL_BACKUP_NEEDS_CHD);
+            }
         }
         PartitionTable::Next(label) => {
-            // Same sidecar shape as the Sun label: record the partition layout
-            // in next.json and defer the per-partition data backup. Browse /
-            // inspect / extract already work through the big-endian UFS reader.
             let json = serde_json::to_string_pretty(label)
                 .context("failed to serialize NeXT disk label to JSON")?;
             std::fs::write(backup_folder.join("next.json"), json)
@@ -1173,9 +1175,11 @@ fn run_backup_inner(
             log(
                 &progress,
                 LogLevel::Info,
-                "Exported NeXT disk label (next.json) — partition data backup not yet supported",
+                "Exported NeXT disk label (next.json)",
             );
-            bail!("backing up NeXT-labeled disks is not yet supported (browse only)");
+            if !single_file_chd_planned {
+                bail!("{}", LABEL_BACKUP_NEEDS_CHD);
+            }
         }
         PartitionTable::SolarisX86 { label, .. } => {
             // Same sidecar shape as the Sun label: record the slice layout in
