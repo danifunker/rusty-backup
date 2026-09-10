@@ -4,7 +4,7 @@
 # mrustc and cross-compile it to a Solaris 9 SPARC `rb-cli` + TUI.
 #
 # Unlike scripts/build-ppc.sh this is a ONE-machine pipeline. A cross gcc
-# targeting Solaris 9 exists (mrustc's docker/sol9-cross, or ~/sol9-toolchain),
+# targeting Solaris 9 exists (scripts/build-sol9-toolchain.sh, or the CI seed at /opt/sol9),
 # so there is no remote compiler, no remote archiver and no split-TU step:
 #
 #     This machine: Rust --mrustc--> C99 --sparcv9-...-gcc--> SPARC ELF
@@ -50,6 +50,8 @@ FEATURES="${FEATURES:-native-zstd,remote,tui,rust173-polyfill}"
 SOL9_TOOLCHAIN="${SOL9_TOOLCHAIN:-$HOME/sol9-toolchain}"
 SOL9_BIN="${SOL9_BIN:-$SOL9_TOOLCHAIN/opt/bin}"
 SOL9_SYSROOT="${SOL9_SYSROOT:-$SOL9_TOOLCHAIN/sysroot}"
+# mrustc spawns $SOL9_TARGET-gcc by name, so the cross toolchain has to be on PATH for sol9libs.
+if [ -d "$SOL9_BIN" ]; then export PATH="$SOL9_BIN:$PATH"; fi
 # The C shim must reach the final link line, so default it here rather than in the environment.
 SOL9_SHIM="${SOL9_SHIM:-$CRATE_DIR/shim/sol9-compat.c}"
 
@@ -260,8 +262,17 @@ libgcc_s.so.1 ships alongside because Solaris 9 has none of its own and Rust's
 unwinder needs it. rb-cli finds it next to itself, so keep the two together;
 nothing has to be installed system-wide.
 
-Built with mrustc against a Solaris 9 sysroot. Raw device access is not
-available on this platform; disk *images* work normally.
+Built with mrustc against a Solaris 9 sysroot.
+
+Raw devices: `rb-cli show devices` lists local disks, reading what the drivers
+publish rather than opening them, so a disk that has stopped answering is
+skipped instead of hanging the tool. Run it as root -- /dev/rdsk nodes are not
+readable by an ordinary user.
+
+USB mass storage is BETA. Solaris' scsa2usb driver wedges on devices that do
+not implement the full SCSI command set, and once wedged such a device cannot
+be recovered without unplugging it. scripts/solaris-usb-unblock.sh diagnoses
+that state, and docs/solaris-raw-devices.md explains it.
 TXT
   ( cd "$SOL9_OUT/dist" && tar czf "$RB_DIR/dist/rb-cli-sol9.tar.gz" rb-cli-sol9 )
   note "bundle at $RB_DIR/dist/rb-cli-sol9.tar.gz ($(du -h "$RB_DIR/dist/rb-cli-sol9.tar.gz" | cut -f1))"

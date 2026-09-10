@@ -33,12 +33,30 @@ disk)
     # /lib matters on Solaris 10, where the core libraries live there and /usr/lib holds
     # symlinks pointing back; on Solaris 9 /lib is itself a symlink to usr/lib and this
     # copy finds nothing. Take both and let the trailing check decide which happened.
+    # `get -r` lays a directory source out *under* the destination, so pass the parent:
+    # naming the directory itself would give usr/include/include.
+    ERR="$OUT/sysroot-build/get.err"; LINKS="$OUT/sysroot-build/symlinks.tsv"; : > "$LINKS"
     for d in usr/include usr/lib usr/ccs/lib lib; do
         echo "    $d"
-        mkdir -p "$ROOT/$(dirname "$d")"
-        "$RB" get "$SRC@$SLICE" "/$d" "$ROOT/$d" -r >/dev/null 2>&1 || \
+        parent="$ROOT/$(dirname "$d")"
+        mkdir -p "$parent"
+        "$RB" get "$SRC@$SLICE" "/$d" "$parent" -r >/dev/null 2>"$ERR" || \
             echo "    (skipped $d -- not present on this install)" >&2
+        # rb-cli writes a symlink as a text file holding its target, and names each one it
+        # did that to; collect them so they can be turned back into links below.
+        sed -n 's/^  symlink as text: \(.*\) -> \(.*\) (use platform tools.*$/\1\t\2/p' \
+            "$ERR" >> "$LINKS"
     done
+
+    # Without this every symlink is a plain file, so `-lc` finds a 12-byte text libc.so
+    # and the link fails far from the cause.
+    if [ -s "$LINKS" ]; then
+        echo "==> Recreating $(wc -l < "$LINKS" | tr -d " ") symlinks"
+        while IFS="$(printf "\t")" read -r dst target; do
+            [ -n "$dst" ] && [ -n "$target" ] || continue
+            rm -f "$dst" && ln -s "$target" "$dst"
+        done < "$LINKS"
+    fi
     ;;
 media9)
     command -v xorriso >/dev/null || { echo "error: xorriso is required" >&2; exit 1; }

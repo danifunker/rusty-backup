@@ -277,7 +277,9 @@ lzma-rs = "0.3.0"
 lzfse_rust = "0.2.1"
 des = { version = "0.9.0", optional = true }
 
-[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+# Solaris is built through rb-cli-sol9, which declares libc itself; naming it here too lets
+# `cargo check --target sparcv9-sun-solaris` type-check src/os/solaris.rs without mrustc.
+[target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "solaris"))'.dependencies]
 libc = "0.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]

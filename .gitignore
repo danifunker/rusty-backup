@@ -99,5 +99,7 @@ regression-tests/**/*.local.toml
 # tree means a coverage change shows up in a diff. Regenerate rather than edit.
 
 # Solaris 9 sysroot: a licensed install's headers and libraries, never committed.
-docker/sol9-cross/sysroot.tar.gz
+# Licensed Sun headers and libraries, and the CI seed built from them; never commit one.
+sol9-seed.tar.gz
+sol9-sysroot.tar.gz
 docker/sol9-cross/sysroot.tar.gz.tmp

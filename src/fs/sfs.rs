@@ -1945,7 +1945,7 @@ impl<R: Read + Seek> SfsFilesystem<R> {
             });
             // Full: the parent is full only when every child is. Emptied: the
             // parent has room again either way.
-            if (full && all_full) || !full {
+            if !full || all_full {
                 return self.set_container_full_flag(blk, full);
             }
             return Ok(());

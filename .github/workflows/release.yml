@@ -27,7 +27,7 @@ on:
         type: boolean
         default: true
       sol9:
-        description: 'Build rb-cli for Solaris 9 SPARC (needs the SOL9_SYSROOT_URL secret)'
+        description: 'Build rb-cli for Solaris 9 SPARC (needs the SOL9_SPARC64_SYSROOT_URL seed secret)'
         type: boolean
         default: true
       runner_image:
@@ -1513,70 +1513,116 @@ jobs:
         run: sudo chmod -R a+rX buildroot/dl buildroot/ccache 2>/dev/null || true
 
   build-sol9-sparc:
-    name: Build rb-cli for Solaris 9 (SPARC)
-    # Only runs where the sysroot secret exists. A Solaris 9 sysroot is a copy of a
-    # licensed install's headers and libraries, so it cannot live in the repo or a
-    # public registry -- SOL9_SYSROOT_URL points at a private copy. Without it the
-    # job skips rather than failing, so forks still get a green pipeline.
+    name: Build rb-cli for Solaris 9 (${{ matrix.arch }})
+    # Only runs where the seed secret exists. The seed carries Sun's headers and libraries,
+    # so it cannot live in the repo or a public registry -- SOL9_SPARC64_SYSROOT_URL points
+    # at a private copy. Without it the job skips rather than failing, so forks still get a
+    # green pipeline.
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.sol9 }}
     needs: generate-version
     runs-on: ubuntu-latest
-    # Non-fatal like the other vintage-media jobs: this one also depends on a
-    # self-hosted download and a ~40 minute toolchain build.
-    continue-on-error: true
+    # Deliberately NOT continue-on-error. It was, back when this job built GCC from source
+    # and a mirror hiccup could redden a release for reasons unrelated to the code. It now
+    # downloads a prebuilt seed, and a missing secret already skips the job -- so a failure
+    # here means the Solaris build is genuinely broken, and saying so is the point.
+    strategy:
+      # One entry today. Solaris also ran on x86, and the secret is already named per-arch,
+      # so a second target is a matrix row rather than a second job.
+      fail-fast: false
+      matrix:
+        include:
+          - arch: sparc64
+            target: sparcv9-sun-solaris2.9
     env:
       VER: ${{ needs.generate-version.outputs.version }}
-      SOL9_SYSROOT_URL: ${{ secrets.SOL9_SYSROOT_URL }}
+      SOL9_SPARC64_SYSROOT_URL: ${{ secrets.SOL9_SPARC64_SYSROOT_URL }}
+      SOL9_TARGET: ${{ matrix.target }}
+      # Where scripts/pack-sol9-seed.sh stages things. GCC bakes its sysroot path at
+      # configure time, so the tree has to land where it was configured.
+      SOL9_BIN: /opt/sol9/bin
+      SOL9_SYSROOT: /opt/sol9/sysroot
+      SOL9_LIBGCC: /opt/sol9/${{ matrix.target }}/lib/sparcv9/libgcc_s.so.1
+      MRUSTC_DIR: /opt/mrustc
+      # The seed unpacks at / as root, so /opt/mrustc is not writable by the job user.
+      # Only the two output directories are ever written; the stdlibs there are read-only.
+      # Send them to the workspace instead of trying to write inside the seed's tree.
+      SOL9_OUT: ${{ github.workspace }}/.sol9-out
+      HOSTC_OUT: ${{ github.workspace }}/.sol9-hostc
     steps:
       - uses: actions/checkout@v6
 
-      - name: Check the sysroot secret is configured
+      # `cargo vendor` only. Nothing here is built with it -- mrustc compiles the engine,
+      # and its language mode is pinned to 1.74. Ubuntu's packaged cargo is too old: a
+      # dependency in the graph needs edition2024.
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Check the seed secret is configured
         id: gate
         run: |
-          if [ -z "$SOL9_SYSROOT_URL" ]; then
-            echo "SOL9_SYSROOT_URL is not set; skipping the Solaris 9 build." >&2
+          if [ -z "$SOL9_SPARC64_SYSROOT_URL" ]; then
+            echo "SOL9_SPARC64_SYSROOT_URL is not set; skipping the Solaris 9 build." >&2
             echo "run=false" >> "$GITHUB_OUTPUT"
           else
             echo "run=true" >> "$GITHUB_OUTPUT"
           fi
 
-      # GCC 4.9.4 + binutils 2.35.2 against the sysroot. Cache it: the toolchain
-      # only changes when docker/sol9-cross does, and rebuilding costs ~40 minutes.
-      - name: Restore the cross-toolchain image
-        if: steps.gate.outputs.run == 'true'
-        id: toolchain-cache
-        uses: actions/cache@v4
-        with:
-          path: /tmp/mrustc-sol9-cross.tar
-          key: sol9-cross-${{ hashFiles('docker/sol9-cross/Dockerfile') }}
-
-      - name: Build the cross-toolchain image
-        if: steps.gate.outputs.run == 'true' && steps.toolchain-cache.outputs.cache-hit != 'true'
-        run: |
-          sh docker/sol9-cross/build.sh
-          docker save mrustc-sol9-cross -o /tmp/mrustc-sol9-cross.tar
-
-      - name: Load the cached toolchain image
-        if: steps.gate.outputs.run == 'true' && steps.toolchain-cache.outputs.cache-hit == 'true'
-        run: docker load -i /tmp/mrustc-sol9-cross.tar
-
-      - name: Build rb-cli for sparcv9-sun-solaris2.9
+      # libgmp/libmpfr/libmpc/zlib are what GCC 4.9.4 links; python3 runs
+      # apply-vendor-patches.py, and patch/make/file/rsync are used by build-sol9.sh.
+      # Everything else it needs is in the seed. Building the toolchain here instead would
+      # cost ~40 minutes and put us at the mercy of whichever Debian release just went EOL.
+      - name: Install what the cross GCC links against
         if: steps.gate.outputs.run == 'true'
         run: |
-          docker build -t rb-sol9 - < docker/sol9.Dockerfile
-          docker run --rm -v "$PWD":/src -e RELEASE_VERSION="$VER" rb-sol9
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            libgmp10 libmpfr6 libmpc3 zlib1g file rsync python3 patch make
+
+      # The seed is the cross toolchain, its sysroot, mrustc and both prebuilt standard
+      # libraries -- about 43 MB, against 7 GB for the equivalent container image.
+      - name: Fetch and unpack the build seed
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          curl -fsSL "$SOL9_SPARC64_SYSROOT_URL" -o /tmp/sol9-seed.tar.gz
+          gzip -t /tmp/sol9-seed.tar.gz \
+            || { echo "the SOL9_SPARC64_SYSROOT_URL download is not valid gzip" >&2; exit 1; }
+          listing="$(tar tzf /tmp/sol9-seed.tar.gz)"
+          if ! printf '%s\n' "$listing" | grep -qE '^(\./)?opt/sol9/bin/'; then
+            echo "error: that artifact is not a seed built by scripts/pack-sol9-seed.sh." >&2
+            echo "       its top-level entries are:" >&2
+            printf '%s\n' "$listing" | sed 's|^\./||' | awk -F/ '{print $1"/"$2}' | sort -u | head -10 >&2
+            exit 1
+          fi
+          sudo tar xzf /tmp/sol9-seed.tar.gz -C /
+          "$SOL9_BIN/$SOL9_TARGET-gcc" --version | head -1
+
+      # minicargo can schedule one crate's build script twice at once -- seen as
+      # `serde_core (build)` listed twice in its own progress line -- and the second worker
+      # then execs the binary while the first is still linking it, before the linker has
+      # set the executable bit. That surfaces as "Unable to run process ... Permission
+      # denied" partway through the graph. The build is incremental, so a retry resumes
+      # from the completed crates and gets past it. This is a mitigation, not a cure: the
+      # race is upstream, and docs/solaris9-open-items.md tracks it.
+      - name: Build rb-cli for ${{ matrix.target }}
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          RELEASE_VERSION="$VER" scripts/build-sol9.sh vendor
+          if ! RELEASE_VERSION="$VER" scripts/build-sol9.sh sol9; then
+            echo "::warning::sol9 stage failed; retrying once (minicargo build-script race)"
+            RELEASE_VERSION="$VER" scripts/build-sol9.sh sol9
+          fi
+          RELEASE_VERSION="$VER" scripts/build-sol9.sh dist
           ls -lh dist/rb-cli-sol9.tar.gz
 
       - name: Name the artifact for the release
         if: steps.gate.outputs.run == 'true'
-        run: cp dist/rb-cli-sol9.tar.gz "dist/rb-cli-sol9-${VER}.tar.gz"
+        run: cp dist/rb-cli-sol9.tar.gz "dist/rb-cli-solaris9-${{ matrix.arch }}-${VER}.tar.gz"
 
       - name: Upload the Solaris 9 artifact
         if: steps.gate.outputs.run == 'true'
         uses: actions/upload-artifact@v7
         with:
-          name: rb-cli-sol9
-          path: dist/rb-cli-sol9-*.tar.gz
+          name: rb-cli-solaris9-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: dist/rb-cli-solaris9-${{ matrix.arch }}-*.tar.gz
 
   build-cb-dos:
     name: Build cb-dos media (FreeDOS floppy + CD)

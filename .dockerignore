@@ -1,0 +1,11 @@
+# The build context is sent to the daemon in full before anything runs, and this repo is
+# ~20 GB of test corpora and vendored trees. Only docker/sol9-cross/ ships a file (the
+# sysroot), and it builds from its own directory, so exclude the heavy trees for anyone
+# who builds with `.` as the context.
+regression-tests/
+rb-cli-vintage/
+rb-cli-ppc/
+rb-cli-sol9/vendor/
+target/
+dist/
+.git/
