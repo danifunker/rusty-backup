@@ -15,7 +15,8 @@
 //!   no writer that could patch them for a resize, so their head region goes
 //!   out byte for byte and a resize is refused; a SunOS root slice starts at
 //!   cylinder 0 and carries the label in its own first sector, so there the
-//!   head is empty already.
+//!   head is empty already. An Amiga RDB rides the same path — its RDSK, PART,
+//!   FSHD and LSEG blocks are exactly what a re-serialized table would lose.
 //! - **Backup-time resize supported.** When the caller passes
 //!   `resize_targets`, partitions get their new sizes via the same
 //!   `PartitionResizePlan` + `PartitionSizeOverride` machinery the restore
@@ -218,12 +219,13 @@ pub fn is_supported(inputs_table: &PartitionTable) -> bool {
             | PartitionTable::Next(_)
             | PartitionTable::Sgi(_)
             | PartitionTable::SgiDkLabel(_)
+            | PartitionTable::Rdb(_)
     )
 }
 
 /// Schemes whose whole head region (label, boot blocks, front porch, SGI
-/// volume header) is copied through verbatim because we have no writer that
-/// could patch it for a resize.
+/// volume header, Amiga RDSK/PART/FSHD chain) is copied through verbatim
+/// because we have no writer that could patch it for a resize.
 fn is_verbatim_head_scheme(table: &PartitionTable) -> bool {
     matches!(
         table,
@@ -231,7 +233,25 @@ fn is_verbatim_head_scheme(table: &PartitionTable) -> bool {
             | PartitionTable::Next(_)
             | PartitionTable::Sgi(_)
             | PartitionTable::SgiDkLabel(_)
+            | PartitionTable::Rdb(_)
     )
+}
+
+/// An RDB's RDSK / PART / FSHD / LSEG chain has to sit inside the head region:
+/// a compacted partition body zero-fills free blocks, so anything past it goes.
+fn verify_head_covers_label(table: &PartitionTable, head_len: u64) -> Result<()> {
+    if let PartitionTable::Rdb(rdb) = table {
+        let need = (rdb.header.rdb_blk_hi as u64 + 1) * 512;
+        if need > head_len {
+            anyhow::bail!(
+                "the RDB reserves blocks through {} but the first partition starts at \
+                 byte {head_len}; backing this disk up would drop part of the \
+                 RDSK/PART/FSHD chain",
+                rdb.header.rdb_blk_hi,
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Inputs for re-exporting an existing disk image (raw or `.chd`) to a
@@ -1406,11 +1426,10 @@ pub fn run_via_staging(
     } else if matches!(inputs.partition_table, PartitionTable::Mbr(_)) {
         read_mbr_gap_region(inputs.source_file, inputs.partitions)?
     } else if is_verbatim_head_scheme(inputs.partition_table) {
-        Some(read_label_head_region(
-            inputs.source_file,
-            inputs.partitions,
-            inputs.source_size,
-        )?)
+        let head =
+            read_label_head_region(inputs.source_file, inputs.partitions, inputs.source_size)?;
+        verify_head_covers_label(inputs.partition_table, head.len() as u64)?;
+        Some(head)
     } else {
         None
     };
@@ -2088,15 +2107,11 @@ fn build_patched_head_segments(
             let head: Segment = (0, head_end, Box::new(std::io::Cursor::new(head_buf)));
             Ok((vec![head], None))
         }
-        PartitionTable::Rdb(_) => {
-            anyhow::bail!(
-                "assemble_from_staging: Amiga RDB sources are not yet supported by single-file CHD"
-            );
-        }
         PartitionTable::Sun(_)
         | PartitionTable::Next(_)
         | PartitionTable::Sgi(_)
-        | PartitionTable::SgiDkLabel(_) => {
+        | PartitionTable::SgiDkLabel(_)
+        | PartitionTable::Rdb(_) => {
             // No writer patches these labels for a resize, so the caller has
             // already been refused one; the head goes out byte for byte.
             for o in overrides {
@@ -2352,6 +2367,155 @@ mod tests {
             matches!(detected, PartitionTable::Next(_)),
             "round-tripped CHD should still parse as a NeXT label, got: {}",
             detected.type_name(),
+        );
+    }
+
+    /// The RDSK block and its PART / FSHD / LSEG chain live in the reserved
+    /// area ahead of the first partition, which is exactly what a re-serialized
+    /// table would lose — so the head region has to arrive byte for byte.
+    #[test]
+    fn end_to_end_round_trip_amiga_rdb() {
+        use crate::partition::provision::{self, Geometry, PartSpec};
+        use crate::partition::type_catalog::TableKind;
+
+        const TOTAL: u64 = 16 * 1024 * 1024;
+        let geometry = Geometry::default();
+        let specs = vec![
+            PartSpec {
+                size: Some(4 * 1024 * 1024),
+                type_text: Some("DOS\\3".to_string()),
+                name: Some("DH0".to_string()),
+            },
+            PartSpec {
+                size: Some(4 * 1024 * 1024),
+                type_text: Some("PFS\\3".to_string()),
+                name: Some("DH1".to_string()),
+            },
+        ];
+        let align = provision::default_align(TableKind::Rdb, geometry);
+        let placed = provision::place(&specs, TableKind::Rdb, TOTAL, align, geometry)
+            .expect("place two RDB partitions");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source_path = tmp.path().join("source.img");
+        {
+            let mut f = File::create(&source_path).unwrap();
+            f.set_len(TOTAL).unwrap();
+            provision::write_table(&mut f, TableKind::Rdb, &placed, TOTAL, geometry)
+                .expect("write the RDB");
+            // Recognisable bytes in each body, so a shifted segment shows up.
+            for (i, p) in placed.iter().enumerate() {
+                f.seek(SeekFrom::Start(p.start_lba * 512)).unwrap();
+                let body: Vec<u8> = (0..4096u32).map(|b| (b as u8) ^ (i as u8 + 1)).collect();
+                f.write_all(&body).unwrap();
+            }
+            f.flush().unwrap();
+        }
+        let source_file = File::open(&source_path).unwrap();
+        let data = std::fs::read(&source_path).unwrap();
+
+        let mut br = BufReader::new(source_file.try_clone().unwrap());
+        let table = PartitionTable::detect(&mut br).expect("detect the RDB");
+        assert!(matches!(table, PartitionTable::Rdb(_)));
+        assert!(is_supported(&table));
+        assert!(is_verbatim_head_scheme(&table));
+        let partitions = table.partitions();
+        assert_eq!(partitions.len(), 2);
+        let head_len = partitions[0].byte_offset() as usize;
+        assert!(head_len > 0, "the RDB reserved area stands ahead of DH0");
+
+        let output_base = tmp.path().join("disk");
+        let head_bytes: [u8; 512] = data[..512].try_into().unwrap();
+        let result = run_via_staging(
+            SingleFileChdInputs {
+                keep_swap: true,
+                source_file: &source_file,
+                source_size: TOTAL,
+                source_partition_table_bytes: &head_bytes,
+                partition_table: &table,
+                partitions: &partitions,
+                partition_filter: None,
+                sector_by_sector: true,
+                chd_options: None,
+                is_dvd: false,
+                output_base: &output_base,
+                resize_targets: None,
+                hfsplus_clone_targets: None,
+                alignment_sectors: 0,
+                checksum_type: crate::backup::ChecksumType::Sha256,
+            },
+            &mut |_: u64| {},
+            &|| false,
+            &mut |_: &str| {},
+            &mut |_, _| {},
+            &mut |_| {},
+            None,
+        )
+        .expect("RDB single-file CHD backup");
+        assert_eq!(result.container_logical_size, TOTAL);
+
+        let chd_path = tmp.path().join("disk.chd");
+        let mut reader = ChdReader::open(&chd_path).unwrap();
+        let mut back = vec![0u8; TOTAL as usize];
+        reader.seek(SeekFrom::Start(0)).unwrap();
+        reader.read_exact(&mut back).unwrap();
+        assert_eq!(
+            &back[..head_len],
+            &data[..head_len],
+            "RDSK, PART and FSHD blocks copied verbatim"
+        );
+        for p in &partitions {
+            let (a, b) = (p.byte_offset() as usize, p.size_bytes as usize);
+            assert_eq!(&back[a..a + b], &data[a..a + b], "{} body", p.type_name);
+        }
+
+        let mut br = BufReader::new(ChdReader::open(&chd_path).unwrap());
+        let detected = PartitionTable::detect(&mut br).expect("detect after round-trip");
+        assert!(
+            matches!(detected, PartitionTable::Rdb(_)),
+            "round-tripped CHD should still parse as an RDB, got: {}",
+            detected.type_name(),
+        );
+    }
+
+    /// The reserved area is where the driver chain lives, and a compacted body
+    /// zero-fills free blocks — so an RDB claiming blocks past the first
+    /// partition has to be refused, not quietly truncated.
+    #[test]
+    fn an_rdb_reaching_past_the_head_is_refused() {
+        use crate::partition::provision::{self, Geometry, PartSpec};
+        use crate::partition::type_catalog::TableKind;
+
+        const TOTAL: u64 = 8 * 1024 * 1024;
+        let geometry = Geometry::default();
+        let specs = vec![PartSpec {
+            size: Some(2 * 1024 * 1024),
+            type_text: Some("DOS\\3".to_string()),
+            name: Some("DH0".to_string()),
+        }];
+        let align = provision::default_align(TableKind::Rdb, geometry);
+        let placed =
+            provision::place(&specs, TableKind::Rdb, TOTAL, align, geometry).expect("place");
+        let mut img = std::io::Cursor::new(vec![0u8; TOTAL as usize]);
+        provision::write_table(&mut img, TableKind::Rdb, &placed, TOTAL, geometry).expect("write");
+        img.seek(SeekFrom::Start(0)).unwrap();
+        let table = PartitionTable::detect(&mut img).expect("detect");
+        let PartitionTable::Rdb(rdb) = table else {
+            panic!("expected an RDB");
+        };
+
+        let head = placed[0].start_lba * 512;
+        assert!(
+            verify_head_covers_label(&PartitionTable::Rdb(rdb.clone()), head).is_ok(),
+            "the reserved area ends where the first partition starts"
+        );
+
+        let mut greedy = rdb;
+        greedy.header.rdb_blk_hi = (head / 512) as u32 + 8;
+        let err = verify_head_covers_label(&PartitionTable::Rdb(greedy), head).unwrap_err();
+        assert!(
+            err.to_string().contains("RDSK/PART/FSHD"),
+            "the error has to name what would be lost: {err}"
         );
     }
 

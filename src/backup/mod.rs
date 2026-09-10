@@ -52,9 +52,9 @@ use metadata::{
 /// Disk-label schemes back up only through the single-file-CHD layout, which
 /// copies the head region verbatim. See `docs/backup_partition_schemes.md`.
 const LABEL_BACKUP_NEEDS_CHD: &str =
-    "disk-label sources (Sun / NeXT / SGI) back up as a single-file CHD only: \
-     re-run with CHD output. The per-partition layout would have to rewrite \
-     the label on restore, which is not implemented.";
+    "disk-label sources (Sun / NeXT / SGI / Amiga RDB) back up as a single-file \
+     CHD only: re-run with CHD output. The per-partition layout would have to \
+     rewrite the label on restore, which is not implemented.";
 
 /// Compression type for backup output.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -1141,15 +1141,14 @@ fn run_backup_inner(
             }
         }
         PartitionTable::Rdb(rdb) => {
-            // Emit a JSON sidecar of the RDB layout so inspect tools and
-            // future round-trip restores can read it. Per-partition data
-            // backup follows the standard layout-preserving path once the
-            // AFFS/PFS/SFS readers land.
             let json =
                 serde_json::to_string_pretty(rdb).context("failed to serialize RDB to JSON")?;
             std::fs::write(backup_folder.join("rdb.json"), json)
                 .context("failed to write rdb.json")?;
             log(&progress, LogLevel::Info, "Exported RDB (rdb.json)");
+            if !single_file_chd_planned {
+                bail!("{}", LABEL_BACKUP_NEEDS_CHD);
+            }
         }
         PartitionTable::Sgi(vh) => {
             let json = serde_json::to_string_pretty(vh)

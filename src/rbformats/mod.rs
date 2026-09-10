@@ -335,19 +335,17 @@ pub fn reconstruct_disk_from_backup(
     let is_x68k = metadata.partition_table_type == "X68k";
 
     if is_rdb {
-        // Backup-folder restore for RDB-based Amiga disks is not yet wired
-        // up: backups save a parsed `rdb.json` sidecar but not the raw
-        // 512-byte RDSK/PART blocks, and re-serializing the parsed form
-        // without losing FSHD/LSEG driver chains and BADB lists needs a
-        // full RDB encoder we haven't written yet. For resize-aware
-        // export of an Amiga disk today, point the user at the
-        // direct-from-source path (Inspect tab -> Export raw/VHD), which
-        // routes through `reconstruct_raw_rdb_disk` and works end-to-end.
+        // Only a per-partition RDB backup reaches here, and one cannot be made
+        // any more: re-serializing `rdb.json` would lose the FSHD/LSEG driver
+        // chain and the BADB list, which needs an RDB encoder we have not
+        // written. A single-file-CHD backup keeps those blocks verbatim and
+        // restores through its own path, never this one.
         bail!(
-            "RDB-based Amiga disks cannot yet be restored from a backup folder. \
-             To resize an Amiga disk, export directly from the source image \
-             (Inspect tab -> Export to Raw or VHD with size overrides) — that \
-             path is RDB-aware and patches the partition table for you."
+            "this RDB-based Amiga backup is a per-partition one and cannot be \
+             restored: re-take it with CHD output, which keeps the RDSK/PART/FSHD \
+             blocks verbatim. To resize an Amiga disk, export directly from the \
+             source image (Inspect tab -> Export to Raw or VHD with size \
+             overrides) — that path is RDB-aware and patches the table for you."
         );
     } else if is_superfloppy {
         // Superfloppy: no partition table to write — data starts at offset 0

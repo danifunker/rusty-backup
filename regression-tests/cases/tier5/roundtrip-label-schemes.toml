@@ -1,7 +1,9 @@
 # Tier 5 — backup and restore for the disk-label partition schemes.
 #
 # Sun, NeXT and both SGI schemes bailed out of `backup` entirely until
-# 2026-09-10: the
+# 2026-09-10, and an Amiga RDB did something worse — it backed up fine and
+# then could not be restored, because the sidecar keeps a *parsed* table and
+# re-serializing it loses the FSHD/LSEG driver chain. In every case the
 # sidecar JSON was written and the run then aborted with "browse only". They go
 # through the single-file-CHD layout, which writes a real disk image (table at
 # sector 0, partitions at their declared offsets) and restores by copying the
@@ -189,3 +191,62 @@ fixture = "fs.efs-v1.populated-irix37.multipart"
 args = ["backup", "{fixture}", "{scratch}/bk", "--name", "job", "--format", "zstd"]
 expect_exit = 1
 stderr_contains = ["single-file CHD"]
+
+
+# --- Amiga RDB ----------------------------------------------------------------
+
+[[case]]
+id = "roundtrip.label.rdb-workbench13"
+description = "AmigaDOS FFS behind an RDB. The reserved area holds RDSK, the PART chain and the FSHD/LSEG driver blocks — the exact thing a re-serialized table loses."
+fixture = "fs.affs.workbench13.hd"
+[[case.step]]
+args = ["backup", "{fixture}", "{scratch}/bk", "--name", "job", "--format", "chd", "--sector-by-sector"]
+expect_exit = 0
+[[case.step]]
+args = ["restore", "{scratch}/bk/job", "{scratch}/out.img"]
+expect_exit = 0
+files_identical = [["{fixture}", "{scratch}/out.img"]]
+[[case.step]]
+args = ["inspect", "{scratch}/out.img"]
+expect_exit = 0
+stdout_contains = ["Partition table: RDB", "AmigaDOS FFS (DH0)", "2020"]
+[[case.step]]
+args = ["ls", "{scratch}/out.img@1", "/"]
+expect_exit = 0
+stdout_contains = ["AmigaBASIC", "BasicDemos"]
+
+[[case]]
+id = "roundtrip.label.rdb-pfs3-compacted"
+description = "The same disk without --sector-by-sector: the body is compacted, so equality is not the expectation — a clean fsck is."
+fixture = "fs.affs.workbench13.hd"
+[[case.step]]
+args = ["backup", "{fixture}", "{scratch}/bk", "--name", "job", "--format", "chd"]
+expect_exit = 0
+[[case.step]]
+args = ["restore", "{scratch}/bk/job", "{scratch}/out.img"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/out.img@1", "--checkonly"]
+expect_exit = 0
+stdout_contains = ["337 files"]
+
+[[case]]
+id = "roundtrip.label.rdb-refuses-per-partition"
+description = "A per-partition RDB backup used to succeed and then fail to restore. It is refused up front now."
+fixture = "fs.pfs3.rdb-cd32saves.hd"
+[[case.step]]
+args = ["backup", "{fixture}", "{scratch}/bk", "--name", "job", "--format", "zstd"]
+expect_exit = 1
+stderr_contains = ["single-file CHD"]
+[[case.step]]
+# And the CHD one it points at does work, on a PFS3 volume this time.
+args = ["backup", "{fixture}", "{scratch}/bk2", "--name", "job", "--format", "chd", "--sector-by-sector"]
+expect_exit = 0
+[[case.step]]
+args = ["restore", "{scratch}/bk2/job", "{scratch}/out.img"]
+expect_exit = 0
+files_identical = [["{fixture}", "{scratch}/out.img"]]
+[[case.step]]
+args = ["ls", "{scratch}/out.img@1", "/"]
+expect_exit = 0
+stdout_contains = ["WHDSaves"]
