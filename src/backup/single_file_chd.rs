@@ -583,6 +583,32 @@ fn plans_to_overrides(plans: &[PartitionResizePlan]) -> Vec<PartitionSizeOverrid
         .collect()
 }
 
+/// The plans a patcher's adjusted overrides describe: same partitions, the
+/// starts and sizes the label was rewritten with.
+fn plans_from_overrides(
+    plans: &[PartitionResizePlan],
+    overrides: &[PartitionSizeOverride],
+) -> Vec<PartitionResizePlan> {
+    plans
+        .iter()
+        .map(|p| {
+            let Some(o) = overrides.iter().find(|o| o.index == p.index) else {
+                return p.clone();
+            };
+            let new_start_lba = o.effective_start_lba();
+            PartitionResizePlan {
+                index: p.index,
+                old_start_lba: p.old_start_lba,
+                old_size_bytes: p.old_size_bytes,
+                new_start_lba,
+                new_size_bytes: o.export_size,
+                needs_data_move: new_start_lba != p.old_start_lba,
+                move_delta_bytes: new_start_lba as i64 * 512 - p.old_start_lba as i64 * 512,
+            }
+        })
+        .collect()
+}
+
 /// Compute the shrunken disk envelope for a resize-active backup. The
 /// envelope is the byte just past the last partition's new extent, rounded
 /// up to the disk's alignment sector (and with a GPT trailer reservation
@@ -606,7 +632,8 @@ pub fn compute_resized_envelope(
     let any_resize = plans
         .iter()
         .any(|p| p.new_size_bytes != p.old_size_bytes || p.new_start_lba != p.old_start_lba);
-    if !any_resize {
+    // A disk label describes the whole drive, so its image keeps the drive's size.
+    if !any_resize || is_verbatim_head_scheme(partition_table) {
         return source_size;
     }
     let alignment_bytes = (alignment_sectors.max(1) * 512).max(512);
@@ -980,6 +1007,8 @@ pub struct AssembleFromStagingInputs<'a> {
     /// the gap after sector 0 (`backup::mbr_gap`), GPT an empty slice; both
     /// rebuild the table from `source_partition_table_bytes` + `partition_table`.
     pub source_head_region: &'a [u8],
+    /// The head already describes `plans` (patched before staging); skip the resize check.
+    pub head_is_patched: bool,
 }
 
 /// Assemble a single-file CHD by streaming per-partition zstd-compressed
@@ -1051,6 +1080,7 @@ pub fn assemble_from_staging(
         inputs.partitions,
         &overrides,
         target_size,
+        inputs.head_is_patched,
         log_cb,
     )?;
 
@@ -1407,7 +1437,7 @@ pub fn run_via_staging(
             inputs.partition_table.type_name(),
         );
     }
-    let plans = match build_resize_plans(&inputs)? {
+    let mut plans = match build_resize_plans(&inputs)? {
         Some(p) => p,
         None => synthesize_noop_plans(inputs.partitions),
     };
@@ -1438,7 +1468,7 @@ pub fn run_via_staging(
     // DDR + partition map + any Apple_Driver* partition bodies and
     // must reach the assembler intact so patched DDR + entries can be
     // overlaid on top of it.
-    let source_head_region = if matches!(inputs.partition_table, PartitionTable::Apm(_)) {
+    let mut source_head_region = if matches!(inputs.partition_table, PartitionTable::Apm(_)) {
         Some(read_apm_head_region(
             inputs.source_file,
             inputs.partitions,
@@ -1454,6 +1484,49 @@ pub fn run_via_staging(
     } else {
         None
     };
+
+    // A verbatim head that has to describe a resize is rewritten now, before
+    // staging, so the bodies are staged to the layout the label will carry.
+    let mut head_is_patched = false;
+    let any_resize = plans
+        .iter()
+        .any(|p| p.needs_data_move || p.new_size_bytes != p.old_size_bytes);
+    if any_resize && is_verbatim_head_scheme(inputs.partition_table) {
+        for plan in &plans {
+            if plan.new_size_bytes == plan.old_size_bytes {
+                continue;
+            }
+            let Some(part) = inputs.partitions.iter().find(|p| p.index == plan.index) else {
+                continue;
+            };
+            let mut probe = inputs
+                .source_file
+                .try_clone()
+                .context("clone source for the resize probe")?;
+            if let crate::fs::InPlaceResize::Unsupported(name) = crate::fs::in_place_resize_support(
+                &mut probe,
+                part.byte_offset(),
+                part.partition_type_string.as_deref(),
+            ) {
+                anyhow::bail!(
+                    "partition-{} holds {name}, which cannot be resized in place",
+                    part.index
+                );
+            }
+        }
+        let head = source_head_region.clone().unwrap_or_default();
+        let overrides = plans_to_overrides(&plans);
+        let patched = crate::partition::restore_patch::patch_head_for_restore(
+            inputs.partition_table.type_name(),
+            &head,
+            &overrides,
+            inputs.source_size,
+            log_cb,
+        )?;
+        plans = plans_from_overrides(&plans, &patched.overrides);
+        source_head_region = Some(patched.head);
+        head_is_patched = true;
+    }
 
     // Phase 1: stage each partition's body as zstd.
     stage_partitions_to_zst(
@@ -1483,6 +1556,7 @@ pub fn run_via_staging(
         alignment_sectors: inputs.alignment_sectors,
         checksum_type: inputs.checksum_type,
         source_head_region: head_region_slice,
+        head_is_patched,
     };
     phase_cb("Assembling CHD container from staged partitions");
     let result = assemble_from_staging(
@@ -2021,6 +2095,7 @@ fn stage_partitions_to_zst(
 /// tail) as `DiskImageStreamBuilder` segments. Used by
 /// [`assemble_from_staging`]
 /// to avoid materialising a scratch disk image just to host the table.
+#[allow(clippy::too_many_arguments)] // the head, the table, the plan and the flag are all needed
 fn build_patched_head_segments(
     source_partition_table_bytes: &[u8],
     source_head_region: &[u8],
@@ -2028,6 +2103,7 @@ fn build_patched_head_segments(
     partitions: &[PartitionInfo],
     overrides: &[PartitionSizeOverride],
     target_size: u64,
+    head_is_patched: bool,
     log_cb: &mut dyn FnMut(&str),
 ) -> Result<(Vec<Segment>, Option<Segment>)> {
     match table {
@@ -2135,18 +2211,19 @@ fn build_patched_head_segments(
         | PartitionTable::Rdb(_)
         | PartitionTable::Ahdi(_)
         | PartitionTable::X68k { .. } => {
-            // The head goes out byte for byte; a resize is applied on restore,
-            // where `partition::restore_patch` rewrites the label.
-            for o in overrides {
-                let Some(p) = partitions.iter().find(|p| p.index == o.index) else {
-                    continue;
-                };
-                if o.export_size != p.size_bytes || o.effective_start_lba() != p.start_lba {
-                    anyhow::bail!(
-                        "resizing a {} disk at backup time is not supported: back it up \
-                         whole and pick the new sizes on restore",
-                        table.type_name(),
-                    );
+            // The head goes out byte for byte; `run_via_staging` has already
+            // rewritten it for a resize, or there was none to apply.
+            if !head_is_patched {
+                for o in overrides {
+                    let Some(p) = partitions.iter().find(|p| p.index == o.index) else {
+                        continue;
+                    };
+                    if o.export_size != p.size_bytes || o.effective_start_lba() != p.start_lba {
+                        anyhow::bail!(
+                            "assemble_from_staging: a {} head must be patched before staging",
+                            table.type_name(),
+                        );
+                    }
                 }
             }
             if source_head_region.is_empty() {
@@ -3431,6 +3508,7 @@ mod tests {
             is_dvd: false,
             alignment_sectors: 0,
             source_head_region: &[],
+            head_is_patched: false,
             checksum_type: crate::backup::ChecksumType::Sha256,
         };
 
@@ -3552,6 +3630,98 @@ mod tests {
             joined.contains("partitionless volume"),
             "log must say no table was written; got: {joined}",
         );
+    }
+
+    /// A resize on a verbatim-head scheme is applied before staging: the CHD
+    /// carries the rewritten label, the bodies where it says, and the drive's size.
+    #[test]
+    fn run_export_with_resize_rewrites_a_verbatim_label() {
+        use crate::partition::provision::{self, Geometry, PartSpec};
+        use crate::partition::type_catalog::TableKind;
+        const DISK: u64 = 64 * 1024 * 1024;
+        for kind in [
+            TableKind::Sun,
+            TableKind::Next,
+            TableKind::Sgi,
+            TableKind::SgiDkLabel,
+            TableKind::Atari,
+            TableKind::X68k,
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let source_path = tmp.path().join("disk.img");
+            let geometry = Geometry::default();
+            let align = provision::default_align(kind, geometry);
+            let specs = vec![
+                PartSpec {
+                    size: Some(16 * 1024 * 1024),
+                    ..Default::default()
+                },
+                PartSpec {
+                    size: None,
+                    ..Default::default()
+                },
+            ];
+            let placed = provision::place(&specs, kind, DISK, align, geometry).unwrap();
+            {
+                let mut file = File::create(&source_path).unwrap();
+                file.set_len(DISK).unwrap();
+                provision::write_table(&mut file, kind, &placed, DISK, geometry).unwrap();
+            }
+            let mut br = BufReader::new(File::open(&source_path).unwrap());
+            let table = PartitionTable::detect(&mut br).unwrap();
+            let name = table.type_name();
+            let partitions = table.partitions();
+            assert_eq!(partitions.len(), 2, "{name}");
+            let mut sector0 = [0u8; 512];
+            br.seek(SeekFrom::Start(0)).unwrap();
+            br.read_exact(&mut sector0).unwrap();
+
+            let dest_path = tmp.path().join("export.chd");
+            let targets = vec![(partitions[0].index, 4 * 1024 * 1024u64)];
+            let mut log_buf: Vec<String> = Vec::new();
+            let mut log_cb = |s: &str| log_buf.push(s.to_string());
+            run_export(
+                SingleFileChdExportInputs {
+                    source_path: &source_path,
+                    partition_table: &table,
+                    partitions: &partitions,
+                    source_partition_table_bytes: &sector0,
+                    alignment_sectors: 0,
+                    dest_path: &dest_path,
+                    chd_options: None,
+                    is_dvd: false,
+                    resize_targets: Some(&targets),
+                },
+                &mut |_| {},
+                &|| false,
+                &mut log_cb,
+            )
+            .unwrap_or_else(|e| panic!("{name}: {e:#}"));
+
+            let mut reader = ChdReader::open(&dest_path).unwrap();
+            assert_eq!(
+                reader.logical_size(),
+                DISK,
+                "{name}: the image keeps the drive's size"
+            );
+            let mut image = vec![0u8; DISK as usize];
+            reader.read_exact(&mut image).unwrap();
+            let again = PartitionTable::detect(&mut std::io::Cursor::new(image)).unwrap();
+            let after = again.partitions();
+            assert_eq!(after.len(), 2, "{name}");
+            assert!(
+                after[0].size_bytes < partitions[0].size_bytes,
+                "{name}: the first partition must have shrunk"
+            );
+            assert!(
+                after[1].start_lba < partitions[1].start_lba,
+                "{name}: the second partition must have moved down"
+            );
+            assert!(
+                log_buf.iter().any(|l| l.contains("rewritten")),
+                "{name}: the label rewrite must be logged: {log_buf:?}"
+            );
+        }
     }
 
     /// Commit 1b: `run_via_staging` (no resize, MBR, raw passthrough)

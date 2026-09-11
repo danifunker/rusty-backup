@@ -21,6 +21,7 @@ assemble is **refused**, never downgraded to `partition-N.chd`.
 | Label rewrite on restore (Sun / NeXT / SGI / SGI-DkLabel / RDB / AHDI / X68k) | **Shipped** (this branch): `src/partition/restore_patch.rs`, wired into `run_single_file_chd_restore_resize`. The silent corruption is closed. |
 | X68k as a single-file CHD | **Shipped.** The as-is restore carries the IPL region back byte for byte; `--size minimum` rewrites the table. An unaligned SASI partition is refused for CHD. |
 | The three loose ends (0x83 / type-string packed padding, the clock-flaky HFS test, the orphaned floppy-sizes comment) | **Shipped.** |
+| Stage 4: resize on CHD backup / export patches the head before staging; raw and VHD exports rewrite the label; the Inspect tab says so when a table cannot be resized | **Shipped.** |
 
 **Nothing is left open on this track.** `docs/backup_partition_schemes.md`
 is the durable description of the design; this file is the record of how it
@@ -207,7 +208,7 @@ the pattern.
   moving a body it cannot shrink. The min-size runner probes the filesystem,
   so the GUI "Minimum" for such a slice must collapse to Original.
 
-### Stage 3 — wire it in (shipped: restore-time only; backup-time resize stays refused by design)
+### Stage 3 — wire it in (shipped)
 
 - `run_single_file_chd_restore_resize`: read the **head region** from the
   CHD (bytes before the first partition, same rule as
@@ -228,7 +229,7 @@ the pattern.
   shows the shrunk layout, fsck clean, an extracted file byte-identical.
   Stage 0c's refusal cases flip to success one scheme at a time.
 
-### Stage 4 — exports and GUI (not done; the GUI restore tab works through the same path, the export dialogs still drop overrides for these schemes)
+### Stage 4 — exports and GUI (shipped)
 
 - `export_whole_disk` / `export_whole_disk_vhd` route through the patcher or
   refuse; today they drop overrides silently for non-MBR/APM/RDB.

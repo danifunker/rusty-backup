@@ -20,15 +20,15 @@ copies, the RDSK/PART/FSHD/LSEG chain, the IPL and its table, boot blocks)
 rides verbatim inside the CHD. Nothing on the restore side has to understand
 the label to put the disk back.
 
-| Scheme | Per-partition layouts | Resize at backup time | Resize on restore | Unit the patcher rounds to |
-|---|---|---|---|---|
-| Sun | refused | refused | slices rewritten, XOR checksum restamped | cylinder (`ntrks * nsect`) |
-| NeXT | refused | refused | all four label copies rewritten | `d_secsize` (1024) past the front porch |
-| SGI volume header | refused | refused | slots rewritten, checksum recomputed | 512-byte block |
-| SGI disk label | refused | refused | eight slots rewritten in the label's own word order | 512-byte block |
-| Amiga RDB | refused | refused | RDSK + PART blocks overlaid, driver chain untouched | cylinder, per partition |
-| Atari AHDI | refused | refused | root-sector entries rewritten, 0x1234 word-sum restamped | 512-byte sector |
-| Sharp X68k | allowed (`zstd` etc.) | refused | table entries rewritten, sector-size aware | logical sector (256 / 512 / 1024) |
+| Scheme | Per-partition layouts | Label rewrite (restore, backup-time resize, raw / VHD export) | Unit the patcher rounds to |
+|---|---|---|---|
+| Sun | refused | slices rewritten, XOR checksum restamped | cylinder (`ntrks * nsect`) |
+| NeXT | refused | all four label copies rewritten | `d_secsize` (1024) past the front porch |
+| SGI volume header | refused | slots rewritten, checksum recomputed | 512-byte block |
+| SGI disk label | refused | eight slots rewritten in the label's own word order | 512-byte block |
+| Amiga RDB | refused | RDSK + PART blocks overlaid, driver chain untouched (raw / VHD export has its own older path) | cylinder, per partition |
+| Atari AHDI | refused | root-sector entries rewritten, 0x1234 word-sum restamped | 512-byte sector |
+| Sharp X68k | allowed (`zstd` etc.) | table entries rewritten, sector-size aware | logical sector (256 / 512 / 1024) |
 
 The per-partition layouts are refused for the label schemes because their
 sidecar is a *parsed* table, and re-serializing it loses what the head
@@ -38,18 +38,19 @@ zero-fills the IPL region, which is fine for a MiSTer data disk and wrong for
 a real SCSI disk whose `X68SCSI1` signature selects the sector size. Use CHD
 for a faithful copy.
 
-**Resize on restore** is `partition::restore_patch`. The restore reads the
-head region out of the CHD, rewrites the start/size fields and checksums in
-those bytes, and copies the bodies to wherever the label now says. Because
-each scheme counts in its own unit, the patcher may round a partition up and
-shift the ones after it; it returns the layout it actually wrote, and the body
-copy and filesystem resize follow that. A filesystem `resize_filesystem_for`
-cannot shrink (UFS on a real Sun or NeXT disk) is refused before anything is
-written. The head is written *after* the bodies, so a label that lives inside
-its first slice (SunOS at cylinder 0) still lands.
-
-**Resize at backup time** stays refused for these schemes: the backup is the
-faithful whole-disk image, and the resize happens on the way out.
+**The rewrite** is `partition::restore_patch`, and every path that changes a
+size goes through it. On restore, the head region is read out of the CHD,
+rewritten, and the bodies are copied to wherever the label now says. A CHD
+backup or export with a resize rewrites the head *before* the bodies are
+staged, so the CHD carries the new layout and keeps the drive's size. A raw or
+VHD export with size overrides copies the bodies to the new layout and writes
+the rewritten head after them. Because each scheme counts in its own unit,
+the patcher may round a partition up and shift the ones after it; it returns
+the layout it actually wrote, and the body copy and filesystem resize follow
+that. A filesystem `resize_filesystem_for` cannot shrink (UFS on a real Sun or
+NeXT disk) is refused before anything is written. The head is written *after*
+the bodies, so a label that lives inside its first slice (SunOS at cylinder 0)
+still lands.
 
 ## What cannot be backed up
 

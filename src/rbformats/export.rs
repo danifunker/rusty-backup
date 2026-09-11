@@ -831,6 +831,18 @@ pub fn export_whole_disk(
             None
         };
 
+        // The other disk labels (Sun, NeXT, SGI, AHDI, X68k): the head is
+        // rewritten in place and the bodies copied to match.
+        let label = if format == ExportFormat::Raw
+            && apm.is_none()
+            && rdb.is_none()
+            && !partition_sizes.is_empty()
+        {
+            super::detect_raw_label(&mut reader)
+        } else {
+            None
+        };
+
         if apm.is_some() {
             // Open destination with Read+Write+Seek for the APM reconstruction.
             let mut file = std::fs::OpenOptions::new()
@@ -886,6 +898,30 @@ pub fn export_whole_disk(
 
             log_cb(&format!(
                 "{} export complete: {} ({} data bytes, RDB reconstructed)",
+                format.description(),
+                dest_path.display(),
+                total_written,
+            ));
+        } else if let Some(kind) = label {
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(dest_path)
+                .with_context(|| format!("failed to create {}", dest_path.display()))?;
+            total_written = super::reconstruct_raw_label_disk(
+                &mut reader,
+                source_data_size,
+                &mut file,
+                partition_sizes,
+                &mut progress_cb,
+                &cancel_check,
+                &mut log_cb,
+            )?;
+            file.flush()?;
+            log_cb(&format!(
+                "{} export complete: {} ({} data bytes, {kind} label rewritten)",
                 format.description(),
                 dest_path.display(),
                 total_written,
