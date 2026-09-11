@@ -152,3 +152,60 @@ fn rb_cli_put_then_get_round_trips_a_new_file_on_flat() {
     let got = std::fs::read(&dst).unwrap();
     assert_eq!(&got, payload);
 }
+
+/// A CHD is a whole disk and the single-file layout cannot assemble an X68k
+/// table yet, so CHD is refused naming zstd, which still resizes on restore.
+#[test]
+fn rb_cli_backup_chd_of_an_x68k_hdd_is_refused_and_zstd_still_resizes() {
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("x.img");
+    run(&["new", "hd", "x68k", img.to_str().unwrap(), "--size", "32M"]);
+    let dest = dir.path().join("bk");
+
+    let out = Command::new(cli_bin())
+        .args([
+            "backup",
+            img.to_str().unwrap(),
+            dest.to_str().unwrap(),
+            "--name",
+            "chd",
+            "--format",
+            "chd",
+        ])
+        .output()
+        .expect("spawn rb-cli");
+    assert!(!out.status.success(), "CHD of an X68k disk must be refused");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--format zstd"),
+        "the refusal must name the format that works: {stderr}"
+    );
+    assert!(
+        !dest.join("chd").exists(),
+        "a refused backup must not leave a folder behind"
+    );
+
+    run(&[
+        "backup",
+        img.to_str().unwrap(),
+        dest.to_str().unwrap(),
+        "--name",
+        "job",
+        "--format",
+        "zstd",
+    ]);
+    let restored = dir.path().join("out.img");
+    run(&[
+        "restore",
+        dest.join("job").to_str().unwrap(),
+        restored.to_str().unwrap(),
+        "--size",
+        "minimum",
+    ]);
+    let out = run(&["inspect", restored.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Partition table: X68k") && stdout.contains("16.1 MiB"),
+        "zstd + --size minimum must still shrink the Human68k partition:\n{stdout}"
+    );
+}

@@ -142,3 +142,39 @@ fn put_on_side_one_reinterleaves_and_leaves_side_two_intact() {
     run(&["get", &side2, "DATA", data_back.to_str().unwrap()]);
     assert_eq!(sha256_hex(&std::fs::read(&data_back).unwrap()), DATA_SHA);
 }
+
+/// A backup of a `.dsd` has never been restorable, so it is refused up front
+/// in every format and leaves no folder behind.
+#[test]
+fn backup_of_a_dsd_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let img = fixture_to(tmp.path());
+    let dest = tmp.path().join("bk");
+    for format in ["zstd", "chd", "raw"] {
+        let out = Command::new(cli_bin())
+            .args([
+                "backup",
+                img.to_str().unwrap(),
+                dest.to_str().unwrap(),
+                "--name",
+                "job",
+                "--format",
+                format,
+            ])
+            .output()
+            .expect("spawn rb-cli");
+        assert!(
+            !out.status.success(),
+            "backup --format {format} of a .dsd must be refused"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("cannot be backed up"),
+            "{format}: stderr should say why: {stderr}"
+        );
+        assert!(
+            !dest.join("job").exists(),
+            "{format}: a refused backup must not leave a folder behind"
+        );
+    }
+}

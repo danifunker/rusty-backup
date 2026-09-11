@@ -15,6 +15,7 @@ use crate::clonezilla;
 use crate::clonezilla::metadata::ClonezillaImage;
 use crate::clonezilla::partclone::open_partclone_reader;
 use crate::fs::human68k::resize_human68k_in_place;
+use crate::fs::ntfs::ensure_backup_boot_sector;
 use crate::fs::patch_hidden_sectors_for;
 use crate::fs::{
     resize_btrfs_in_place, resize_exfat_in_place, resize_ext_in_place, resize_fat_in_place,
@@ -177,6 +178,15 @@ fn restore_size_floor(
     } else {
         pm.original_size_bytes
     }
+}
+
+/// Tables whose head region (label copies, RDSK/PART chain, boot blocks) lives
+/// in the LBAs a GPT clear would zero; their restore never leaves a GPT behind.
+fn is_disk_label_scheme(table_type: &str) -> bool {
+    matches!(
+        table_type,
+        "Sun" | "NeXT" | "SGI" | "SGI-DkLabel" | "RDB" | "AHDI"
+    )
 }
 
 /// Extra guidance for an overrun, when the alignment choice is the cause.
@@ -1039,7 +1049,7 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
 
     // Step 6b: Clear any residual GPT structures from the target disk.
     // Only needed for MBR restores — GPT restores and superfloppies write these areas directly.
-    if !is_gpt && !is_superfloppy {
+    if !is_gpt && !is_superfloppy && !is_disk_label_scheme(&metadata.partition_table_type) {
         clear_gpt_structures(&mut target, config.target_size, &mut |msg| {
             log(&progress, LogLevel::Info, msg);
         })?;
@@ -1176,6 +1186,9 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
                 PartitionFsType::Ntfs if needs_resize => {
                     let new_sectors = export_size / 512;
                     resize_ntfs_in_place(inner_file, part_offset, new_sectors, &mut |msg| {
+                        log(&progress, LogLevel::Info, msg)
+                    })?;
+                    ensure_backup_boot_sector(inner_file, part_offset, &mut |msg| {
                         log(&progress, LogLevel::Info, msg)
                     })?;
                 }
@@ -1387,7 +1400,10 @@ fn run_single_file_chd_restore_as_is(
 
     // The image overwrites LBA 0 onward, but a stale backup GPT at the END of
     // a larger target would survive and still announce a GPT disk.
-    if metadata.partition_table_type != "GPT" && metadata.partition_table_type != "None" {
+    if metadata.partition_table_type != "GPT"
+        && metadata.partition_table_type != "None"
+        && !is_disk_label_scheme(&metadata.partition_table_type)
+    {
         clear_gpt_structures(&mut target, config.target_size, &mut |msg| {
             log(&progress, LogLevel::Info, msg);
         })?;
@@ -1417,34 +1433,44 @@ fn run_single_file_chd_restore_as_is(
     target.flush().context("failed to flush target")?;
 
     // A packed FAT/NTFS/exFAT body sits shrunk inside its full extent in the
-    // CHD; grow a partitionless volume back, as the per-partition restore does.
-    if metadata.partition_table_type == "None" {
-        if let Some(pm) = metadata.partitions.first().filter(|pm| pm.compacted) {
-            set_operation(&progress, "Finalizing filesystem...");
-            let inner_file = target
-                .inner_mut()
-                .context("failed to access target file for filesystem fixups")?;
+    // CHD; grow it back to the extent, as the per-partition restore does.
+    let compacted: Vec<&crate::backup::metadata::PartitionMetadata> = metadata
+        .partitions
+        .iter()
+        .filter(|pm| pm.compacted && !pm.defragmented_clone)
+        .collect();
+    if !compacted.is_empty() {
+        set_operation(&progress, "Finalizing filesystems...");
+        let inner_file = target
+            .inner_mut()
+            .context("failed to access target file for filesystem fixups")?;
+        for pm in compacted {
+            let offset = pm.start_lba * 512;
             let full_size = pm.imaged_size_bytes.max(pm.original_size_bytes);
-            match detect_partition_fs_type(inner_file, 0) {
+            let mut local_log = |m: &str| log(&progress, LogLevel::Info, m);
+            match detect_partition_fs_type(inner_file, offset) {
                 PartitionFsType::Fat => {
-                    resize_fat_in_place(inner_file, 0, (full_size / 512) as u32, &mut |msg| {
-                        log(&progress, LogLevel::Info, msg)
-                    })?;
+                    resize_fat_in_place(
+                        inner_file,
+                        offset,
+                        (full_size / 512) as u32,
+                        &mut local_log,
+                    )
+                    .with_context(|| format!("grow partition-{} FAT", pm.index))?;
                 }
                 PartitionFsType::Ntfs => {
-                    resize_ntfs_in_place(inner_file, 0, full_size / 512, &mut |msg| {
-                        log(&progress, LogLevel::Info, msg)
-                    })?;
+                    resize_ntfs_in_place(inner_file, offset, full_size / 512, &mut local_log)
+                        .with_context(|| format!("grow partition-{} NTFS", pm.index))?;
+                    ensure_backup_boot_sector(inner_file, offset, &mut local_log)?;
                 }
                 PartitionFsType::Exfat => {
-                    resize_exfat_in_place(inner_file, 0, full_size / 512, &mut |msg| {
-                        log(&progress, LogLevel::Info, msg)
-                    })?;
+                    resize_exfat_in_place(inner_file, offset, full_size / 512, &mut local_log)
+                        .with_context(|| format!("grow partition-{} exFAT", pm.index))?;
                 }
                 _ => {}
             }
-            target.flush().context("failed to flush target")?;
         }
+        target.flush().context("failed to flush target")?;
     }
     target.sync_all().context("syncing the target")?;
 
@@ -1606,7 +1632,7 @@ fn run_single_file_chd_restore_resize(
     let is_superfloppy = metadata.partition_table_type == "None";
     // Same as the per-partition restore: an MBR / APM layout must not leave a
     // stale GPT, primary or backup, on the target.
-    if !is_gpt && !is_superfloppy {
+    if !is_gpt && !is_superfloppy && !is_disk_label_scheme(&metadata.partition_table_type) {
         clear_gpt_structures(&mut target, config.target_size, &mut |msg| {
             log(&progress, LogLevel::Info, msg);
         })?;
@@ -1903,6 +1929,7 @@ fn run_single_file_chd_restore_resize(
             let mut local_log = |m: &str| log(&progress, LogLevel::Info, m);
             patch_hidden_sectors_for(inner_file, new_offset, new_start_lba, &mut local_log)
                 .with_context(|| format!("patch hidden sectors for partition-{}", pm.index))?;
+            ensure_backup_boot_sector(inner_file, new_offset, &mut local_log)?;
         }
     }
 
@@ -3197,6 +3224,174 @@ mod tests {
         assert!(
             restored[backup_hdr..].iter().all(|&b| b == 0),
             "the stale backup GPT at the end of the target must be cleared"
+        );
+    }
+
+    /// A packed FAT body sits shrunk inside its extent in the CHD; the as-is
+    /// restore grows it back, so the disk comes back exactly as it was.
+    #[test]
+    fn single_file_chd_as_is_restore_grows_a_compacted_fat_partition() {
+        use crate::fs::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+        const TOTAL_SECTORS: u32 = 16384;
+        const PART_SECTORS: u32 = 16383;
+        let total_bytes = TOTAL_SECTORS as u64 * 512;
+        let part_bytes = PART_SECTORS as u64 * 512;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source_path = tmp.path().join("source.img");
+        let mut mbr = build_test_mbr(PART_SECTORS);
+        mbr[450] = 0x06;
+        let fat = crate::fs::fat::create_blank_fat(part_bytes, Some("GROW")).unwrap();
+        assert!(fat.len() as u64 <= part_bytes);
+        let mut data = vec![0u8; total_bytes as usize];
+        data[..512].copy_from_slice(&mbr);
+        data[512..512 + fat.len()].copy_from_slice(&fat);
+        std::fs::write(&source_path, &data).unwrap();
+        {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&source_path)
+                .unwrap();
+            let mut fs = crate::fs::fat::FatFilesystem::open(file, 512).unwrap();
+            let root = fs.root().unwrap();
+            let payload: Vec<u8> = (0..300_000u32)
+                .map(|i| (i.wrapping_mul(7) % 251) as u8)
+                .collect();
+            let mut src = &payload[..];
+            fs.create_file(
+                &root,
+                "BLOB.BIN",
+                &mut src,
+                payload.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+            EditableFilesystem::sync_metadata(&mut fs).unwrap();
+        }
+        let data = std::fs::read(&source_path).unwrap();
+        let original_total = u16::from_le_bytes([data[512 + 19], data[512 + 20]]);
+        assert_eq!(original_total as u64, PART_SECTORS as u64);
+
+        let backup_folder = tmp.path().join("backup");
+        std::fs::create_dir_all(&backup_folder).unwrap();
+        let output_base = backup_folder.join("disk");
+        let source_file = File::open(&source_path).unwrap();
+        let mut br = BufReader::new(source_file.try_clone().unwrap());
+        let table = PartitionTable::detect(&mut br).expect("detect MBR");
+        let partitions = table.partitions();
+        let mbr_bytes: [u8; 512] = data[..512].try_into().unwrap();
+        let mut log_buf: Vec<String> = Vec::new();
+        let mut log_cb = |s: &str| log_buf.push(s.to_string());
+        let chd_result = single_file_chd::run_via_staging(
+            SingleFileChdInputs {
+                keep_swap: true,
+                source_file: &source_file,
+                source_size: total_bytes,
+                source_partition_table_bytes: &mbr_bytes,
+                partition_table: &table,
+                partitions: &partitions,
+                partition_filter: None,
+                sector_by_sector: false,
+                chd_options: None,
+                is_dvd: false,
+                output_base: &output_base,
+                resize_targets: None,
+                hfsplus_clone_targets: None,
+                alignment_sectors: 0,
+                checksum_type: crate::backup::ChecksumType::Sha256,
+            },
+            &mut |_| {},
+            &|| false,
+            &mut log_cb,
+            &mut |_, _| {},
+            &mut |_| {},
+            None,
+        )
+        .expect("backup");
+        assert!(
+            log_buf.iter().any(|l| l.contains("packed-and-padded")),
+            "the FAT partition must go through the packed reader: {log_buf:?}"
+        );
+
+        let metadata = BackupMetadata {
+            version: 1,
+            created: "2026-09-11T00:00:00Z".to_string(),
+            source_device: source_path.display().to_string(),
+            source_size_bytes: total_bytes,
+            partition_table_type: table.type_name().to_string(),
+            checksum_type: "sha256".to_string(),
+            compression_type: "chd".to_string(),
+            split_size_mib: None,
+            sector_by_sector: false,
+            layout: BackupLayout::SingleFileChd,
+            container: Some(chd_result.container_filename.clone()),
+            container_logical_size: Some(chd_result.container_logical_size),
+            container_sha1: Some(chd_result.container_sha1.clone()),
+            size_policy: Some(crate::backup::metadata::SizePolicy::Original),
+            alignment: AlignmentMetadata {
+                detected_type: "None detected".to_string(),
+                first_partition_lba: 1,
+                alignment_sectors: 1,
+                heads: 0,
+                sectors_per_track: 0,
+            },
+            partitions: chd_result
+                .partition_ranges
+                .iter()
+                .map(|r| PartitionMetadata {
+                    index: r.partition_index,
+                    type_name: "FAT16".to_string(),
+                    partition_type_byte: 0x06,
+                    start_lba: r.offset_in_disk / 512,
+                    start_byte: None,
+                    original_size_bytes: r.length,
+                    imaged_size_bytes: r.length,
+                    compressed_files: vec![],
+                    checksum: r.checksum.clone(),
+                    resized: false,
+                    compacted: true,
+                    is_logical: false,
+                    partition_type_string: None,
+                    minimum_size_bytes: None,
+                    defragmented_min_size_bytes: None,
+                    hfsplus_signature: None,
+                    defragmented_clone: false,
+                })
+                .collect(),
+            bad_sectors: vec![],
+            extended_container: None,
+        };
+        std::fs::write(
+            backup_folder.join("metadata.json"),
+            serde_json::to_string_pretty(&metadata).unwrap(),
+        )
+        .unwrap();
+
+        let target_path = tmp.path().join("restored.img");
+        run_restore(
+            RestoreConfig {
+                backup_folder: backup_folder.clone(),
+                target_path: target_path.clone(),
+                target_is_device: false,
+                target_size: total_bytes,
+                alignment: RestoreAlignment::Original,
+                partition_sizes: vec![],
+                write_zeros_to_unused: false,
+            },
+            Arc::new(Mutex::new(RestoreProgress::new())),
+        )
+        .expect("restore");
+
+        let restored = std::fs::read(&target_path).unwrap();
+        let restored_total = u16::from_le_bytes([restored[512 + 19], restored[512 + 20]]);
+        assert_eq!(
+            restored_total, original_total,
+            "the FAT must fill its partition again after the as-is restore"
+        );
+        assert_eq!(
+            restored, data,
+            "restored disk must match the source byte for byte"
         );
     }
 

@@ -1007,6 +1007,31 @@ fn run_backup_inner(
         partitions = vec![partition::whole_disk_partition(&table, source_size)];
     }
 
+    // Two DFS sides track-interleaved in one file: no restore has ever put
+    // them back, and copying the .dsd is its backup.
+    if matches!(table, PartitionTable::Dsd { .. }) {
+        bail!(
+            "a double-sided Acorn DFS image (.dsd) cannot be backed up: its two sides \
+             are track-interleaved and a restore cannot put them back. Copy the .dsd \
+             file itself; ls, get, put and convert still work on it."
+        );
+    }
+    // A CHD is a whole disk, so a table the single-file layout cannot assemble
+    // is refused rather than written as per-partition CHDs (CLAUDE.md).
+    if matches!(
+        config.compression,
+        CompressionType::Chd | CompressionType::Dvd
+    ) && !single_file_chd::is_supported(&table)
+    {
+        bail!(
+            "{} output is a whole-disk image and the single-file layout cannot assemble \
+             {} disks yet; use --format zstd, which backs them up per-partition and still \
+             resizes on restore",
+            config.compression.as_str(),
+            table.type_name(),
+        );
+    }
+
     // Step 2: Create backup folder
     set_operation(&progress, "Creating backup folder...");
     let backup_folder = format::create_backup_folder(&config.destination_dir, &config.backup_name)?;
@@ -1240,11 +1265,8 @@ fn run_backup_inner(
             );
         }
         PartitionTable::Dsd { .. } => {
-            log(
-                &progress,
-                LogLevel::Info,
-                "Double-sided Acorn DFS (.dsd): two DFS partitions, no partition-table sidecar",
-            );
+            // Unreachable: a .dsd is refused before the folder is created.
+            bail!("internal: a DSD table reached the sidecar match");
         }
     }
 
@@ -1483,8 +1505,6 @@ fn run_backup_inner(
              single-file CHD backups are unavailable"
         );
     }
-    // CHD/DVD on a table single_file_chd rejects (X68k, DSD) still reaches the
-    // per-partition loop and writes partition-N.chd, which CLAUDE.md forbids.
     if matches!(
         config.compression,
         CompressionType::Chd | CompressionType::Dvd

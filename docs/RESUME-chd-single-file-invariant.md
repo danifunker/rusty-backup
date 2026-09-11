@@ -17,9 +17,9 @@ assemble is **refused**, never downgraded to `partition-N.chd`.
 | Item | State |
 |---|---|
 | Task A: partitionless volumes (floppy, HFV, bare HDF) as one whole-disk CHD | **Shipped** (this branch). See "Task A" below. |
-| Restore-side resize of a label-scheme CHD backup corrupts silently | **Open, live bug.** Stage 0 below stops it. |
-| X68k and DSD still leak `partition-N.chd` | **Open.** Stage 0 refuses them. |
-| Label rewrite on restore (Sun / NeXT / SGI / SGI-DkLabel / RDB / AHDI / X68k) | **Planned.** Stages 1-4 below. |
+| Stage 0: X68k CHD refused naming zstd, `.dsd` backup refused, GPT clear skipped for label schemes, packed bodies grow back on every table, NTFS backup boot sector restored | **Shipped** (this branch). |
+| Restore-side resize of a label-scheme CHD backup corrupts silently | **Open, live bug.** The user chose (2026-09-11) to build Stage 3 rather than land a temporary refusal, so it stays reachable until then. The GPT-clear half is fixed. |
+| Label rewrite on restore (Sun / NeXT / SGI / SGI-DkLabel / RDB / AHDI / X68k) | **Next.** Stages 1-4 below. |
 
 Baseline on `30d4f9b`: preflight green, 3,164 lib tests, `rb-regress` 381/381.
 After Task A: 3,165 lib tests (one added), the three new tier-5 cases pass.
@@ -117,10 +117,15 @@ for anything that is not MBR/APM/RDB. `resize_filesystem_for` has no UFS
 resizer, so a Sun or NeXT slice can only ever be restored at its original
 size. No regression case resizes a label-scheme backup.
 
-### Stage 0 — stop the bleeding (small; ship first, one commit)
+### Stage 0 — stop the bleeding (shipped 2026-09-11, minus 0c)
 
 Only changes behaviour where today's behaviour is corruption or an
-invariant violation. Each item gets a regression case.
+invariant violation. Each item has a regression case in
+`regression-tests/cases/tier5/chd-whole-disk-rule.toml`. Also shipped with
+it, per the user's decision: the as-is restore grows a packed FAT/NTFS/exFAT
+body back to its partition on **every** table (not just partitionless), and
+`ntfs::ensure_backup_boot_sector` puts back the sector the packed NTFS
+stream stops short of, on all three restore paths.
 
 - **0a. Refuse CHD/DVD for tables `is_supported` rejects** (X68k, DSD) in
   `run_backup_inner`, right after the gate, with a message naming
@@ -133,7 +138,7 @@ invariant violation. Each item gets a regression case.
   fails ("no MBR data available", `src/rbformats/mod.rs`, the MBR fallback
   of `reconstruct_disk_from_backup`), so nothing that works is lost. See
   "DSD" below for the alternative.
-- **0c. Refuse the resize restore for label schemes.** In `run_restore`'s
+- **0c. (Skipped by decision: go straight to Stage 3.)** Refuse the resize restore for label schemes. In `run_restore`'s
   single-file dispatch and in `calculate_restore_layout`, bail for any
   `partition_table_type` outside `MBR / GPT / APM / None` when any size
   choice is not Original: "resizing a Sun disk on restore is not supported
@@ -275,19 +280,15 @@ For `.dsd` itself:
   faithful single-file CHD of the container, but MAME will not load a
   floppy CHD, so it buys nothing over copying the file.
 
-## Decisions for the user
+## Decisions (taken by the user, 2026-09-11)
 
-1. **DSD**: refuse (recommended) or whole-container body. See above.
-2. **Compacted FAT/NTFS/exFAT inside an MBR/GPT/APM single-file CHD**: after
-   an as-is restore the volume stays shrunk inside its full partition (a
-   15 MB partition with an 8 MB FAT16). The per-partition layout grows it
-   back. Task A grows it back for partitionless volumes only. Extending the
-   grow to every table is a one-block change in
-   `run_single_file_chd_restore_as_is`, mirrors the per-partition semantics,
-   and would make the two layouts agree; it changes what a restored MBR
-   backup looks like, so it is called out rather than done.
-3. **Stage 0c** refuses something that "works" today only in the sense of
-   exiting 0. Confirm that refusing is acceptable until Stage 3 lands.
+1. **DSD**: refuse `backup` in every format. Shipped.
+2. **Compacted FAT/NTFS/exFAT inside any single-file CHD**: grow back on the
+   as-is restore for every table, so the two layouts agree. Shipped, with
+   the NTFS backup-boot-sector fix it depended on.
+3. **Stage 0c**: skipped. Build the real patchers (Stage 3) instead of a
+   temporary refusal.
+4. **Stage 0** as one commit: yes. Shipped.
 
 ## Ground truth (measured 2026-09-10; re-verify before relying on it)
 
