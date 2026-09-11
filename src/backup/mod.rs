@@ -1029,8 +1029,7 @@ fn run_backup_inner(
     let single_file_chd_planned = matches!(
         config.compression,
         CompressionType::Chd | CompressionType::Dvd
-    ) && !is_superfloppy
-        && config.split_size_mib.is_none()
+    ) && config.split_size_mib.is_none()
         && single_file_chd::is_supported(&table);
 
     // Sector 0 alone loses GRUB's core.img, a DDO or Boot Manager living
@@ -1484,12 +1483,8 @@ fn run_backup_inner(
              single-file CHD backups are unavailable"
         );
     }
-    // CHD/DVD selected on a source single_file_chd can't handle (only
-    // superfloppies fit this today — every other shape is_supported).
-    // Superfloppies route through the per-partition loop with
-    // `effective_compression` forced to `None` (raw .img), so the user
-    // ends up with a `partition-0.img` rather than a CHD. We don't emit
-    // per-partition CHDs anywhere; CHD output is single-file or nothing.
+    // CHD/DVD on a table single_file_chd rejects (X68k, DSD) still reaches the
+    // per-partition loop and writes partition-N.chd, which CLAUDE.md forbids.
     if matches!(
         config.compression,
         CompressionType::Chd | CompressionType::Dvd

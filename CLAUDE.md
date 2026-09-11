@@ -99,9 +99,13 @@ Each backup is a folder. Two layouts depending on the chosen output:
 - `<backup-name>.chd` - one disk image with table at sector 0, partitions
   at their declared offsets, gaps zero-filled. `chdman info` opens it,
   MAME loads it.
+- A partitionless volume (floppy, `.hfv`, bare `.hdf`) is one body from
+  byte 0 with no table and no sidecar; the CHD's logical size is the
+  source size, never the packed extent.
 
 CHD output never produces per-partition CHDs — the single-file layout is
-the only CHD shape rusty-backup writes.
+the only CHD shape rusty-backup writes. A CHD holds a whole disk, so a
+source the layout cannot assemble must be refused, not downgraded.
 
 ### Key Design Patterns
 

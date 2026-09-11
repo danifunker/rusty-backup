@@ -1415,6 +1415,37 @@ fn run_single_file_chd_restore_as_is(
         set_progress_bytes(&progress, written, logical_size);
     }
     target.flush().context("failed to flush target")?;
+
+    // A packed FAT/NTFS/exFAT body sits shrunk inside its full extent in the
+    // CHD; grow a partitionless volume back, as the per-partition restore does.
+    if metadata.partition_table_type == "None" {
+        if let Some(pm) = metadata.partitions.first().filter(|pm| pm.compacted) {
+            set_operation(&progress, "Finalizing filesystem...");
+            let inner_file = target
+                .inner_mut()
+                .context("failed to access target file for filesystem fixups")?;
+            let full_size = pm.imaged_size_bytes.max(pm.original_size_bytes);
+            match detect_partition_fs_type(inner_file, 0) {
+                PartitionFsType::Fat => {
+                    resize_fat_in_place(inner_file, 0, (full_size / 512) as u32, &mut |msg| {
+                        log(&progress, LogLevel::Info, msg)
+                    })?;
+                }
+                PartitionFsType::Ntfs => {
+                    resize_ntfs_in_place(inner_file, 0, full_size / 512, &mut |msg| {
+                        log(&progress, LogLevel::Info, msg)
+                    })?;
+                }
+                PartitionFsType::Exfat => {
+                    resize_exfat_in_place(inner_file, 0, full_size / 512, &mut |msg| {
+                        log(&progress, LogLevel::Info, msg)
+                    })?;
+                }
+                _ => {}
+            }
+            target.flush().context("failed to flush target")?;
+        }
+    }
     target.sync_all().context("syncing the target")?;
 
     log(

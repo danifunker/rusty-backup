@@ -205,10 +205,8 @@ pub fn estimate_export_disk_usage(
     }
 }
 
-/// True if `inputs` describes a source layout we can currently handle in
-/// single-file CHD mode. MBR / GPT / APM are supported; superfloppy is
-/// rejected at the GUI layer (CHD output requires a partition table to
-/// embed at sector 0).
+/// True if `inputs` describes a source layout the single-file CHD pipeline
+/// can assemble. A partitionless volume is one body from byte 0 with no head.
 pub fn is_supported(inputs_table: &PartitionTable) -> bool {
     matches!(
         inputs_table,
@@ -221,6 +219,7 @@ pub fn is_supported(inputs_table: &PartitionTable) -> bool {
             | PartitionTable::SgiDkLabel(_)
             | PartitionTable::Rdb(_)
             | PartitionTable::Ahdi(_)
+            | PartitionTable::None { .. }
     )
 }
 
@@ -2154,10 +2153,14 @@ fn build_patched_head_segments(
                 "assemble_from_staging: X68000 Human68k sources are not yet supported by single-file CHD"
             );
         }
-        PartitionTable::None { .. } | PartitionTable::Dsd { .. } => {
-            anyhow::bail!(
-                "assemble_from_staging: superfloppy / double-sided-DFS sources are not supported"
-            );
+        PartitionTable::None { .. } => {
+            // The volume is the disk: its body starts at byte 0, so there is
+            // no table to patch and no head region to carry.
+            log_cb("  table: none (partitionless volume, body from byte 0)");
+            Ok((Vec::new(), None))
+        }
+        PartitionTable::Dsd { .. } => {
+            anyhow::bail!("assemble_from_staging: double-sided-DFS sources are not supported");
         }
     }
 }
@@ -2186,9 +2189,8 @@ mod tests {
         mbr
     }
 
-    /// Every disk-label scheme routes through the verbatim-head path; an
-    /// unsupported one has to stay unsupported so it errors instead of
-    /// writing a CHD with no label in it.
+    /// Label schemes take the verbatim-head path, a partitionless volume has no
+    /// head, and a container the pipeline cannot assemble must stay refused.
     #[test]
     fn is_supported_covers_the_disk_label_schemes() {
         for table in [
@@ -2198,12 +2200,15 @@ mod tests {
             assert!(is_supported(&table), "{}", table.type_name());
             assert!(is_verbatim_head_scheme(&table), "{}", table.type_name());
         }
-        let rdb = PartitionTable::None {
+        let superfloppy = PartitionTable::None {
             size_bytes: 4096,
             fs_hint: "Unknown".into(),
         };
-        assert!(!is_supported(&rdb));
-        assert!(!is_verbatim_head_scheme(&rdb));
+        assert!(is_supported(&superfloppy));
+        assert!(!is_verbatim_head_scheme(&superfloppy));
+        let dsd = PartitionTable::Dsd { size_bytes: 409600 };
+        assert!(!is_supported(&dsd));
+        assert!(!is_verbatim_head_scheme(&dsd));
     }
 
     fn sun_label() -> crate::partition::sun::SunDiskLabel {
@@ -3444,6 +3449,92 @@ mod tests {
         assert_eq!(
             readback, data,
             "assembled CHD must round-trip the synthesised disk image byte-for-byte",
+        );
+    }
+
+    /// A partitionless volume is the disk: logical size equals the source size,
+    /// the one body sits at byte 0, and nothing is written ahead of it.
+    #[test]
+    fn run_via_staging_round_trip_superfloppy_no_resize() {
+        const TOTAL_SECTORS: u32 = 2880;
+        const SECTOR_SIZE: u64 = 512;
+        let total_bytes = (TOTAL_SECTORS as u64) * SECTOR_SIZE;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let source_path = tmp.path().join("floppy.img");
+
+        // Not a filesystem the compact readers know, so the body goes through
+        // raw passthrough and the readback has to match every byte.
+        let data: Vec<u8> = (0..total_bytes as usize)
+            .map(|i| ((i * 7) % 251) as u8)
+            .collect();
+        std::fs::write(&source_path, &data).unwrap();
+
+        let source_file = File::open(&source_path).unwrap();
+        let table = PartitionTable::None {
+            size_bytes: total_bytes,
+            fs_hint: "Unknown".into(),
+        };
+        let partitions = table.partitions();
+        assert_eq!(partitions.len(), 1);
+        assert_eq!(partitions[0].start_lba, 0);
+
+        let mut sector0 = [0u8; 512];
+        sector0.copy_from_slice(&data[..512]);
+
+        let output_base = tmp.path().join("disk");
+        let inputs = SingleFileChdInputs {
+            keep_swap: true,
+            source_file: &source_file,
+            source_size: total_bytes,
+            source_partition_table_bytes: &sector0,
+            partition_table: &table,
+            partitions: &partitions,
+            partition_filter: None,
+            sector_by_sector: false,
+            chd_options: None,
+            is_dvd: false,
+            output_base: &output_base,
+            resize_targets: None,
+            hfsplus_clone_targets: None,
+            alignment_sectors: 0,
+            checksum_type: crate::backup::ChecksumType::Sha256,
+        };
+
+        let mut log_buf: Vec<String> = Vec::new();
+        let mut log_cb = |s: &str| log_buf.push(s.to_string());
+        let mut progress_cb = |_: u64| {};
+        let cancel_check = || false;
+
+        let result = run_via_staging(
+            inputs,
+            &mut progress_cb,
+            &cancel_check,
+            &mut log_cb,
+            &mut |_, _| {},
+            &mut |_| {},
+            None,
+        )
+        .expect("run_via_staging on a partitionless volume");
+
+        assert_eq!(result.container_filename, "disk.chd");
+        assert_eq!(result.container_logical_size, total_bytes);
+        assert_eq!(result.partition_ranges.len(), 1);
+        assert_eq!(result.partition_ranges[0].offset_in_disk, 0);
+        assert_eq!(result.partition_ranges[0].length, total_bytes);
+
+        let chd_path = tmp.path().join("disk.chd");
+        let mut reader = ChdReader::open(&chd_path).expect("reopen CHD");
+        let mut readback = vec![0u8; total_bytes as usize];
+        reader.read_exact(&mut readback).expect("read full CHD");
+        assert_eq!(
+            readback, data,
+            "a partitionless volume must round-trip the whole image byte-for-byte",
+        );
+        let joined = log_buf.join("\n");
+        assert!(
+            joined.contains("partitionless volume"),
+            "log must say no table was written; got: {joined}",
         );
     }
 

@@ -172,6 +172,67 @@ fn superfloppy_honours_every_codec_and_restores_identically() {
     }
 }
 
+/// A `.chd` holds a whole disk, so a partitionless volume backs up as one
+/// container sized to the source, never a `partition-0.chd` of the packed body.
+#[cfg(feature = "chd")]
+#[test]
+fn superfloppy_chd_is_one_whole_disk_container() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().to_path_buf();
+    let src = work.join("source.img");
+    fat_superfloppy(&src);
+    let source_bytes = std::fs::read(&src).unwrap();
+
+    let backups = work.join("backups-chd");
+    std::fs::create_dir_all(&backups).unwrap();
+    run_backup(
+        backup_config(&src, &backups, "chd", CompressionType::Chd),
+        Arc::new(Mutex::new(BackupProgress::default())),
+    )
+    .unwrap_or_else(|e| panic!("chd: backup failed: {e:?}"));
+
+    let folder = backups.join("chd");
+    let meta: serde_json::Value =
+        serde_json::from_reader(std::fs::File::open(folder.join("metadata.json")).unwrap())
+            .unwrap();
+    assert_eq!(meta["layout"], "single-file-chd");
+    assert_eq!(meta["compression_type"], "chd");
+    assert_eq!(meta["container"], "chd.chd");
+    assert_eq!(
+        meta["container_logical_size"].as_u64().unwrap(),
+        source_bytes.len() as u64,
+        "the CHD must be the whole disk, not the packed volume"
+    );
+    assert!(
+        folder.join("chd.chd").exists(),
+        "the single container is missing"
+    );
+    assert!(
+        !folder.join("partition-0.chd").exists(),
+        "a per-partition CHD was written for a partitionless volume"
+    );
+
+    let target = work.join("restored-chd.img");
+    rusty_backup::restore::run_restore(
+        RestoreConfig {
+            backup_folder: folder,
+            target_path: target.clone(),
+            target_is_device: false,
+            target_size: source_bytes.len() as u64,
+            alignment: RestoreAlignment::Original,
+            partition_sizes: Vec::new(),
+            write_zeros_to_unused: false,
+        },
+        Arc::new(Mutex::new(RestoreProgress::default())),
+    )
+    .unwrap_or_else(|e| panic!("chd: restore failed: {e:?}"));
+    assert_eq!(
+        std::fs::read(&target).unwrap(),
+        source_bytes,
+        "chd: restore must match the source byte for byte"
+    );
+}
+
 /// The compressed member has to be genuinely smaller — otherwise the codec
 /// silently degraded to a raw copy and the whole feature is a no-op.
 #[test]

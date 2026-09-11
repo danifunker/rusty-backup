@@ -1,0 +1,85 @@
+# Tier 5 — CHD backup of a partitionless volume is one whole disk.
+#
+# A `.chd` holds a whole disk. For a source with no partition table the volume
+# *is* the disk, so `backup --format chd` has to write one `<name>.chd` whose
+# logical size is the source size. Until 2026-09-10 it wrote `partition-0.chd`
+# instead: the packed FAT body wearing a `.chd`, which `chdman info` reported
+# as an 8.5 KB hard disk. The folder restored fine — only the container was
+# not a disk image. These cases pin the container, not just the restore.
+#
+# The `inspect` of the container is the assertion that the shape is right: a
+# per-partition layout has no `job.chd` at all, and a packed one reports the
+# packed extent as its logical size.
+
+[meta]
+tier = 5
+group = "roundtrip.partitionless"
+description = "A partitionless volume backs up to one whole-disk CHD, and comes back."
+
+# --- synthetic floppy ---------------------------------------------------------
+
+[[case]]
+id = "roundtrip.partitionless.floppy-chd-is-the-disk"
+description = "A 1.44 MB FAT floppy, compacted: the CHD is the full floppy, not the packed volume, and restore is byte-identical."
+[[case.step]]
+args = ["new", "floppy", "fat", "--size", "1440K", "{scratch}/src.img"]
+expect_exit = 0
+[[case.step]]
+args = ["backup", "{scratch}/src.img", "{scratch}/bk", "--name", "job", "--format", "chd"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/bk/job/job.chd"]
+expect_exit = 0
+stdout_contains = ["Logical size: 1,474,560 bytes", "Partition table: None"]
+[[case.step]]
+args = ["restore", "{scratch}/bk/job", "{scratch}/out.img"]
+expect_exit = 0
+files_identical = [["{scratch}/src.img", "{scratch}/out.img"]]
+
+# --- BasiliskII HFV: a partitionless hard disk -------------------------------
+
+[[case]]
+id = "roundtrip.partitionless.hfv-macos81"
+description = "A 300 MB BasiliskII HFV with Mac OS 8.1 on it: the CHD is the whole volume, and the restored HFS is clean."
+fixture = "fs.hfv.populated-macos81.hd"
+timeout_ms = 1800000
+[[case.step]]
+args = ["backup", "{fixture}", "{scratch}/bk", "--name", "job", "--format", "chd"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/bk/job/job.chd"]
+expect_exit = 0
+stdout_contains = ["Logical size: 314,572,800 bytes", "Partition table: None"]
+[[case.step]]
+args = ["restore", "{scratch}/bk/job", "{scratch}/out.img"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/out.img"]
+expect_exit = 0
+stdout_contains = ["Partition table: None", "HFS"]
+[[case.step]]
+args = ["fsck", "{scratch}/out.img", "--checkonly"]
+expect_exit = 0
+
+# --- Amiga SFS: a bare HDF ----------------------------------------------------
+
+[[case]]
+id = "roundtrip.partitionless.sfs-workbench-sector-by-sector"
+description = "A 500 MB bare Amiga HDF (SFS): sector-by-sector, so the restore has to be byte-identical through the whole-disk CHD."
+fixture = "fs.sfs.workbench-dh0.hd"
+timeout_ms = 1800000
+[[case.step]]
+args = ["backup", "{fixture}", "{scratch}/bk", "--name", "job", "--format", "chd", "--sector-by-sector"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/bk/job/job.chd"]
+expect_exit = 0
+stdout_contains = ["Logical size: 522,805,248 bytes"]
+[[case.step]]
+args = ["restore", "{scratch}/bk/job", "{scratch}/out.img"]
+expect_exit = 0
+files_identical = [["{fixture}", "{scratch}/out.img"]]
+[[case.step]]
+args = ["ls", "{scratch}/out.img", "/", "--fs-type", "SFS\\0"]
+expect_exit = 0
+stdout_contains = ["Utilities", "WBStartup", "Fonts"]
