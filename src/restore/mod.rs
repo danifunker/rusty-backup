@@ -185,7 +185,7 @@ fn restore_size_floor(
 fn is_disk_label_scheme(table_type: &str) -> bool {
     matches!(
         table_type,
-        "Sun" | "NeXT" | "SGI" | "SGI-DkLabel" | "RDB" | "AHDI"
+        "Sun" | "NeXT" | "SGI" | "SGI-DkLabel" | "RDB" | "AHDI" | "X68k"
     )
 }
 
@@ -1542,7 +1542,7 @@ fn run_single_file_chd_restore_resize(
     }
 
     set_operation(&progress, "Calculating new partition layout...");
-    let overrides = calculate_restore_layout(
+    let mut overrides = calculate_restore_layout(
         &adjusted,
         &config.alignment,
         &config.partition_sizes,
@@ -1602,6 +1602,69 @@ fn run_single_file_chd_restore_resize(
     let mut chd_reader = ChdReader::open(&chd_path)
         .with_context(|| format!("failed to open {}", chd_path.display()))?;
 
+    // A disk label rides verbatim in the CHD's head region. Rewrite it for the
+    // new layout, and copy the bodies to wherever the label now says they go.
+    let patched_head = if crate::partition::restore_patch::can_patch(&metadata.partition_table_type)
+    {
+        for ov in &overrides {
+            let Some(pm) = metadata.partitions.iter().find(|p| p.index == ov.index) else {
+                continue;
+            };
+            if ov.export_size == pm.imaged_size_bytes {
+                continue;
+            }
+            if let crate::fs::InPlaceResize::Unsupported(name) = crate::fs::in_place_resize_support(
+                &mut chd_reader,
+                pm.start_lba * 512,
+                pm.partition_type_string.as_deref(),
+            ) {
+                bail!(
+                    "partition-{} holds {name}, which cannot be resized in place; \
+                     restore it at Original size",
+                    pm.index
+                );
+            }
+        }
+        let head_len = metadata
+            .partitions
+            .iter()
+            .map(|pm| pm.start_lba * 512)
+            .min()
+            .unwrap_or(512)
+            .max(512);
+        let mut head = vec![0u8; head_len as usize];
+        chd_reader
+            .seek(SeekFrom::Start(0))
+            .context("seek CHD to its head region")?;
+        chd_reader
+            .read_exact(&mut head)
+            .context("read the head region from the CHD")?;
+        let mut local_log = |m: &str| log(&progress, LogLevel::Info, m);
+        let patched = crate::partition::restore_patch::patch_head_for_restore(
+            &metadata.partition_table_type,
+            &head,
+            &overrides,
+            config.target_size,
+            &mut local_log,
+        )?;
+        overrides = patched.overrides;
+        for ov in &overrides {
+            log(
+                &progress,
+                LogLevel::Info,
+                format!(
+                    "Partition {}: label places it at LBA {}, {} bytes",
+                    ov.index,
+                    ov.effective_start_lba(),
+                    ov.export_size,
+                ),
+            );
+        }
+        Some(patched.head)
+    } else {
+        None
+    };
+
     set_operation(&progress, "Opening target...");
     let device_handle = if config.target_is_device {
         crate::os::open_target_for_writing(&config.target_path)
@@ -1646,6 +1709,9 @@ fn run_single_file_chd_restore_resize(
     let mut ebr_result: Option<EbrChainResult> = None;
     if is_superfloppy {
         // No table to write.
+    } else if patched_head.is_some() {
+        // Written after the bodies, so it also covers a label that lives inside
+        // the first partition (a SunOS slice 0 at cylinder 0).
     } else if is_gpt {
         let gpt_path = config.backup_folder.join("gpt.json");
         let gpt: Gpt = serde_json::from_reader(
@@ -1899,6 +1965,15 @@ fn run_single_file_chd_restore_resize(
     target
         .flush()
         .context("flush target after partition writes")?;
+    if let Some(head) = &patched_head {
+        target
+            .seek(SeekFrom::Start(0))
+            .context("seek target to the head region")?;
+        target
+            .write_all(head)
+            .context("write the rewritten head region")?;
+        target.flush().context("flush the head region")?;
+    }
 
     // Step 3: filesystem resize + hidden-sector patches per partition.
     set_operation(&progress, "Finalizing filesystems...");

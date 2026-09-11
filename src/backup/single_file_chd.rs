@@ -219,13 +219,14 @@ pub fn is_supported(inputs_table: &PartitionTable) -> bool {
             | PartitionTable::SgiDkLabel(_)
             | PartitionTable::Rdb(_)
             | PartitionTable::Ahdi(_)
+            | PartitionTable::X68k { .. }
             | PartitionTable::None { .. }
     )
 }
 
 /// Schemes whose whole head region (label, boot blocks, front porch, SGI
-/// volume header, Amiga RDSK/PART/FSHD chain) is copied through verbatim
-/// because we have no writer that could patch it for a resize.
+/// volume header, Amiga RDSK/PART/FSHD chain, X68k IPL) is copied through
+/// verbatim; a resize is applied on restore by `partition::restore_patch`.
 fn is_verbatim_head_scheme(table: &PartitionTable) -> bool {
     matches!(
         table,
@@ -235,6 +236,7 @@ fn is_verbatim_head_scheme(table: &PartitionTable) -> bool {
             | PartitionTable::SgiDkLabel(_)
             | PartitionTable::Rdb(_)
             | PartitionTable::Ahdi(_)
+            | PartitionTable::X68k { .. }
     )
 }
 
@@ -249,6 +251,24 @@ fn verify_head_covers_label(table: &PartitionTable, head_len: u64) -> Result<()>
                  byte {head_len}; backing this disk up would drop part of the \
                  RDSK/PART/FSHD chain",
                 rdb.header.rdb_blk_hi,
+            );
+        }
+    }
+    if let PartitionTable::X68k { sector_size, .. } = table {
+        use crate::partition::x68k::{
+            X68K_ENTRY_SIZE, X68K_MAX_PARTITIONS, X68K_TABLE_HEADER_SIZE, X68K_TABLE_OFFSET,
+            X68K_TABLE_OFFSET_SASI,
+        };
+        let table_off = if *sector_size == 256 {
+            X68K_TABLE_OFFSET_SASI
+        } else {
+            X68K_TABLE_OFFSET
+        };
+        let need =
+            table_off + (X68K_TABLE_HEADER_SIZE + X68K_MAX_PARTITIONS * X68K_ENTRY_SIZE) as u64;
+        if need > head_len {
+            anyhow::bail!(
+                "the X68k table ends at byte {need} but the first partition starts at byte {head_len}"
             );
         }
     }
@@ -2113,17 +2133,18 @@ fn build_patched_head_segments(
         | PartitionTable::Sgi(_)
         | PartitionTable::SgiDkLabel(_)
         | PartitionTable::Rdb(_)
-        | PartitionTable::Ahdi(_) => {
-            // No writer patches these labels for a resize, so the caller has
-            // already been refused one; the head goes out byte for byte.
+        | PartitionTable::Ahdi(_)
+        | PartitionTable::X68k { .. } => {
+            // The head goes out byte for byte; a resize is applied on restore,
+            // where `partition::restore_patch` rewrites the label.
             for o in overrides {
                 let Some(p) = partitions.iter().find(|p| p.index == o.index) else {
                     continue;
                 };
                 if o.export_size != p.size_bytes || o.effective_start_lba() != p.start_lba {
                     anyhow::bail!(
-                        "resizing a {} disk is not supported: its label would have to be \
-                         rewritten, and the head region is copied verbatim",
+                        "resizing a {} disk at backup time is not supported: back it up \
+                         whole and pick the new sizes on restore",
                         table.type_name(),
                     );
                 }
@@ -2146,11 +2167,6 @@ fn build_patched_head_segments(
         PartitionTable::SolarisX86 { .. } => {
             anyhow::bail!(
                 "assemble_from_staging: Solaris x86 VTOC sources are not supported (browse only)"
-            );
-        }
-        PartitionTable::X68k { .. } => {
-            anyhow::bail!(
-                "assemble_from_staging: X68000 Human68k sources are not yet supported by single-file CHD"
             );
         }
         PartitionTable::None { .. } => {

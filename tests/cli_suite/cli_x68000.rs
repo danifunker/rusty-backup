@@ -153,38 +153,14 @@ fn rb_cli_put_then_get_round_trips_a_new_file_on_flat() {
     assert_eq!(&got, payload);
 }
 
-/// A CHD is a whole disk and the single-file layout cannot assemble an X68k
-/// table yet, so CHD is refused naming zstd, which still resizes on restore.
+/// A CHD is a whole disk: an X68k HDD backs up as one `chd.chd` that restores
+/// byte-identical (IPL region included) and still shrinks on `--size minimum`.
 #[test]
-fn rb_cli_backup_chd_of_an_x68k_hdd_is_refused_and_zstd_still_resizes() {
+fn rb_cli_backup_chd_of_an_x68k_hdd_is_one_whole_disk_and_resizes_on_restore() {
     let dir = tempfile::tempdir().unwrap();
     let img = dir.path().join("x.img");
     run(&["new", "hd", "x68k", img.to_str().unwrap(), "--size", "32M"]);
     let dest = dir.path().join("bk");
-
-    let out = Command::new(cli_bin())
-        .args([
-            "backup",
-            img.to_str().unwrap(),
-            dest.to_str().unwrap(),
-            "--name",
-            "chd",
-            "--format",
-            "chd",
-        ])
-        .output()
-        .expect("spawn rb-cli");
-    assert!(!out.status.success(), "CHD of an X68k disk must be refused");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("--format zstd"),
-        "the refusal must name the format that works: {stderr}"
-    );
-    assert!(
-        !dest.join("chd").exists(),
-        "a refused backup must not leave a folder behind"
-    );
-
     run(&[
         "backup",
         img.to_str().unwrap(),
@@ -192,20 +168,42 @@ fn rb_cli_backup_chd_of_an_x68k_hdd_is_refused_and_zstd_still_resizes() {
         "--name",
         "job",
         "--format",
-        "zstd",
+        "chd",
     ]);
-    let restored = dir.path().join("out.img");
+    let folder = dest.join("job");
+    assert!(folder.join("job.chd").exists(), "one whole-disk CHD");
+    assert!(
+        !folder.join("partition-0.chd").exists(),
+        "no per-partition CHD may be written"
+    );
+
+    let as_is = dir.path().join("as-is.img");
+    run(&["restore", folder.to_str().unwrap(), as_is.to_str().unwrap()]);
+    assert_eq!(
+        std::fs::read(&img).unwrap(),
+        std::fs::read(&as_is).unwrap(),
+        "an as-is restore carries the IPL region back byte for byte"
+    );
+
+    let shrunk = dir.path().join("min.img");
     run(&[
         "restore",
-        dest.join("job").to_str().unwrap(),
-        restored.to_str().unwrap(),
+        folder.to_str().unwrap(),
+        shrunk.to_str().unwrap(),
         "--size",
         "minimum",
     ]);
-    let out = run(&["inspect", restored.to_str().unwrap()]);
+    let out = run(&["inspect", shrunk.to_str().unwrap()]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("Partition table: X68k") && stdout.contains("16.1 MiB"),
-        "zstd + --size minimum must still shrink the Human68k partition:\n{stdout}"
+        "--size minimum must rewrite the X68k table for the shrunk partition:\n{stdout}"
+    );
+    let out = run(&["ls", &format!("{}@1", shrunk.display()), "/"]);
+    assert!(
+        String::from_utf8_lossy(&out.stdout)
+            .to_ascii_uppercase()
+            .contains("HELLO.TXT"),
+        "the shrunk Human68k partition must still list its files"
     );
 }

@@ -94,8 +94,9 @@ Each backup is a folder. Two layouts depending on the chosen output:
 **Single-file CHD** (CHD output):
 - `metadata.json` with `layout: "single-file-chd"` and per-partition
   `offset_in_disk` byte ranges instead of per-file references
-- `mbr.json` / `gpt.json` / `apm.json` - parsed partition-table sidecar (raw
-  bytes live inside the CHD)
+- `mbr.json` / `gpt.json` / `apm.json` (or `sun.json`, `next.json`,
+  `sgi.json`, `sgi_dklabel.json`, `rdb.json`, `ahdi.json`, `x68k.json`) -
+  parsed partition-table sidecar (raw bytes live inside the CHD)
 - `<backup-name>.chd` - one disk image with table at sector 0, partitions
   at their declared offsets, gaps zero-filled. `chdman info` opens it,
   MAME loads it.
@@ -105,7 +106,10 @@ Each backup is a folder. Two layouts depending on the chosen output:
 
 CHD output never produces per-partition CHDs — the single-file layout is
 the only CHD shape rusty-backup writes. A CHD holds a whole disk, so a
-source the layout cannot assemble must be refused, not downgraded.
+source the layout cannot assemble must be refused, not downgraded. The
+disk-label schemes (Sun, NeXT, SGI, SGI-DkLabel, RDB, AHDI, X68k) are
+backed up whole with their head region verbatim and resized on restore by
+`partition::restore_patch`; see `docs/backup_partition_schemes.md`.
 
 ### Key Design Patterns
 

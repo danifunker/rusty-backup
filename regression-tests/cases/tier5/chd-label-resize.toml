@@ -1,0 +1,227 @@
+# Tier 5 — resize a disk-label backup on restore.
+#
+# The label schemes (Sun, NeXT, SGI volume header, SGI disk label, Amiga RDB,
+# Atari AHDI, Sharp X68k) are backed up whole: the head region rides verbatim
+# in the single-file CHD. A resize is applied on restore, where
+# `partition::restore_patch` rewrites the label's start/size fields and
+# checksums in those verbatim bytes and the bodies land wherever the label
+# now says. Until 2026-09-11 a `--size minimum` restore of any of these
+# exited 0 and corrupted the disk: the bodies moved and the label did not.
+#
+# Every case here shrinks the first partition to its minimum and checks three
+# things: the label parses and no longer places the next partition where it
+# was, the shrunk filesystem still lists its files, and fsck is clean.
+
+[meta]
+tier = 5
+group = "chd.label-resize"
+description = "Shrink the first partition of each disk-label scheme on restore; the label follows."
+
+# --- FAT slices on the schemes that can hold one ---------------------------------
+
+[[case]]
+id = "chd.label-resize.sun-fat-slice"
+description = "Sun label: slice 0 shrinks to a cylinder boundary and slice 1 slides down from LBA 67536."
+[[case.step]]
+args = ["new", "volume", "fat", "{scratch}/v.img", "--size", "32M"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/PAYLOAD.BIN"]
+expect_exit = 0
+[[case.step]]
+args = ["new", "hd", "sun", "{scratch}/s.img", "--size", "64M", "--partition", "32M", "--partition", "rest", "--fill", "1={scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["backup", "{scratch}/s.img", "{scratch}/bk", "--name", "job", "--format", "chd"]
+expect_exit = 0
+[[case.step]]
+args = ["restore", "{scratch}/bk/job", "{scratch}/out.img", "--size", "minimum"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/out.img"]
+expect_exit = 0
+stdout_contains = ["Partition table: Sun", "1008"]
+stdout_not_contains = ["67536", "32.5 MiB"]
+[[case.step]]
+args = ["ls", "{scratch}/out.img@1", "/"]
+expect_exit = 0
+stdout_contains = ["PAYLOAD.BIN"]
+[[case.step]]
+args = ["fsck", "{scratch}/out.img@1", "--checkonly"]
+expect_exit = 0
+
+[[case]]
+id = "chd.label-resize.next-fat-slot"
+description = "NeXT label: all four copies rewritten, partition b slides down from LBA 67584."
+[[case.step]]
+args = ["new", "volume", "fat", "{scratch}/v.img", "--size", "32M"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/PAYLOAD.BIN"]
+expect_exit = 0
+[[case.step]]
+args = ["new", "hd", "next", "{scratch}/n.img", "--size", "64M", "--partition", "32M", "--partition", "rest", "--fill", "1={scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["backup", "{scratch}/n.img", "{scratch}/bk", "--name", "job", "--format", "chd"]
+expect_exit = 0
+[[case.step]]
+args = ["restore", "{scratch}/bk/job", "{scratch}/out.img", "--size", "minimum"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/out.img"]
+expect_exit = 0
+stdout_contains = ["Partition table: NeXT", "2048"]
+stdout_not_contains = ["67584", "32.0 MiB"]
+[[case.step]]
+args = ["ls", "{scratch}/out.img@1", "/"]
+expect_exit = 0
+stdout_contains = ["PAYLOAD.BIN"]
+[[case.step]]
+args = ["fsck", "{scratch}/out.img@1", "--checkonly"]
+expect_exit = 0
+
+[[case]]
+id = "chd.label-resize.ahdi-bgm"
+description = "Atari AHDI: the root sector's entries and checksum are rewritten, partition 2 slides down from LBA 67584."
+[[case.step]]
+args = ["new", "volume", "fat", "{scratch}/v.img", "--size", "32M"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/PAYLOAD.BIN"]
+expect_exit = 0
+[[case.step]]
+args = ["new", "hd", "atari", "{scratch}/a.img", "--size", "64M", "--partition", "32M:GEM", "--partition", "rest:GEM", "--fill", "1={scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["backup", "{scratch}/a.img", "{scratch}/bk", "--name", "job", "--format", "chd"]
+expect_exit = 0
+[[case.step]]
+args = ["restore", "{scratch}/bk/job", "{scratch}/out.img", "--size", "minimum"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/out.img"]
+expect_exit = 0
+stdout_contains = ["Partition table: AHDI", "2048"]
+stdout_not_contains = ["67584", "32.0 MiB"]
+[[case.step]]
+args = ["ls", "{scratch}/out.img@1", "/"]
+expect_exit = 0
+stdout_contains = ["PAYLOAD.BIN"]
+[[case.step]]
+args = ["fsck", "{scratch}/out.img@1", "--checkonly"]
+expect_exit = 0
+
+# --- the SGI schemes, on their own filesystems --------------------------------------
+
+[[case]]
+id = "chd.label-resize.sgi-efs-root"
+description = "SGI volume header: the EFS root shrinks to its minimum and the header's slot follows."
+[[case.step]]
+args = ["new", "hd", "sgi-efs", "{scratch}/g.img", "--size", "64M"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/g.img@1", "{cases}/tier3/payload.bin", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["backup", "{scratch}/g.img", "{scratch}/bk", "--name", "job", "--format", "chd"]
+expect_exit = 0
+[[case.step]]
+args = ["restore", "{scratch}/bk/job", "{scratch}/out.img", "--size", "minimum"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/out.img"]
+expect_exit = 0
+stdout_contains = ["Partition table: SGI", "5040"]
+stdout_not_contains = ["62.0 MiB"]
+[[case.step]]
+args = ["ls", "{scratch}/out.img@1", "/"]
+expect_exit = 0
+stdout_contains = ["payload.bin"]
+[[case.step]]
+args = ["fsck", "{scratch}/out.img@1", "--checkonly"]
+expect_exit = 0
+
+[[case]]
+id = "chd.label-resize.sgi-dklabel-root"
+description = "IRIS disk label: the EFS v1 root shrinks, swap slides down from block 34272, and the label keeps its word order."
+[[case.step]]
+args = ["new", "volume", "efs-v1", "{scratch}/e.img", "--size", "16M"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/e.img", "{cases}/tier3/payload.bin", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["new", "hd", "sgi-dklabel", "{scratch}/d.img", "--size", "64M", "--partition", "16M:root", "--partition", "8M:swap", "--partition", "rest:slice", "--fill", "1={scratch}/e.img"]
+expect_exit = 0
+[[case.step]]
+args = ["backup", "{scratch}/d.img", "{scratch}/bk", "--name", "job", "--format", "chd"]
+expect_exit = 0
+[[case.step]]
+args = ["restore", "{scratch}/bk/job", "{scratch}/out.img", "--size", "minimum"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/out.img"]
+expect_exit = 0
+stdout_contains = ["Partition table: SGI-DkLabel", "1008", "SGI swap"]
+stdout_not_contains = ["34272"]
+[[case.step]]
+args = ["ls", "{scratch}/out.img@1", "/"]
+expect_exit = 0
+stdout_contains = ["payload.bin"]
+[[case.step]]
+args = ["fsck", "{scratch}/out.img@1", "--checkonly"]
+expect_exit = 0
+
+# --- Amiga RDB, on a real Workbench disk --------------------------------------------
+
+[[case]]
+id = "chd.label-resize.rdb-workbench13"
+description = "Amiga RDB: the RDSK and PART blocks are rewritten on cylinder boundaries and the FSHD/LSEG chain rides through untouched."
+fixture = "fs.affs.workbench13.hd"
+timeout_ms = 1200000
+[[case.step]]
+args = ["backup", "{fixture}", "{scratch}/bk", "--name", "job", "--format", "chd"]
+expect_exit = 0
+[[case.step]]
+args = ["restore", "{scratch}/bk/job", "{scratch}/out.img", "--size", "minimum"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/out.img"]
+expect_exit = 0
+stdout_contains = ["Partition table: RDB"]
+[[case.step]]
+args = ["fsck", "{scratch}/out.img@1", "--checkonly"]
+expect_exit = 0
+stdout_contains = ["337 files"]
+
+# --- Sharp X68000, now a single-file CHD ---------------------------------------------
+
+[[case]]
+id = "chd.label-resize.x68k-single-file"
+description = "X68k: one whole-disk CHD, an as-is restore that carries the IPL back byte for byte, and a table rewrite on --size minimum."
+[[case.step]]
+args = ["new", "hd", "x68k", "{scratch}/x.img", "--size", "32M"]
+expect_exit = 0
+[[case.step]]
+args = ["backup", "{scratch}/x.img", "{scratch}/bk", "--name", "job", "--format", "chd"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/bk/job/job.chd"]
+expect_exit = 0
+stdout_contains = ["Logical size: 33,554,432 bytes", "Partition table: X68k"]
+[[case.step]]
+args = ["restore", "{scratch}/bk/job", "{scratch}/asis.img"]
+expect_exit = 0
+files_identical = [["{scratch}/x.img", "{scratch}/asis.img"]]
+[[case.step]]
+args = ["restore", "{scratch}/bk/job", "{scratch}/min.img", "--size", "minimum"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/min.img"]
+expect_exit = 0
+stdout_contains = ["Partition table: X68k", "16.1 MiB"]
+[[case.step]]
+args = ["ls", "{scratch}/min.img@1", "/"]
+expect_exit = 0
+stdout_contains = ["HELLO.TXT"]

@@ -1016,6 +1016,20 @@ fn run_backup_inner(
              file itself; ls, get, put and convert still work on it."
         );
     }
+    // The single-file layout places bodies on 512-byte LBAs; a SASI disk with
+    // 256-byte sectors can start a partition between two of them.
+    if matches!(
+        config.compression,
+        CompressionType::Chd | CompressionType::Dvd
+    ) && matches!(table, PartitionTable::X68k { .. })
+        && partitions.iter().any(|p| p.byte_offset() % 512 != 0)
+    {
+        bail!(
+            "{} output needs every X68k partition on a 512-byte boundary and this SASI \
+             disk has one that is not; use --format zstd",
+            config.compression.as_str(),
+        );
+    }
     // A CHD is a whole disk, so a table the single-file layout cannot assemble
     // is refused rather than written as per-partition CHDs (CLAUDE.md).
     if matches!(
@@ -2572,9 +2586,8 @@ fn run_single_file_chd_path(
                 type_name: part.type_name.clone(),
                 partition_type_byte: part.partition_type_byte,
                 start_lba: new_start_lba,
-                // Single-file CHD relocates partitions and is not used for
-                // X68000 sources (the only non-512-aligned scheme), so the
-                // floored 512-LBA offset is authoritative here.
+                // Every body sits on a 512-byte LBA here (an unaligned SASI
+                // disk is refused above), so the floored offset is exact.
                 start_byte: None,
                 original_size_bytes: part.size_bytes,
                 imaged_size_bytes: range.length,

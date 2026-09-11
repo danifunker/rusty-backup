@@ -4,8 +4,8 @@
 # or refuses. Until 2026-09-11 a table the single-file layout could not
 # assemble (X68k, double-sided DFS) fell through to the per-partition loop and
 # wrote `partition-N.chd`: a CHD of one partition is not a disk image, and for
-# a `.dsd` the two of them were not even restorable. These cases pin the
-# refusals and the alternative each one names.
+# a `.dsd` the two of them were not even restorable. X68k has since joined the
+# single-file layout (see chd-label-resize.toml); a `.dsd` stays refused.
 #
 # The second half pins what an as-is restore of a single-file CHD does with a
 # packed body. The packed FAT/NTFS/exFAT reader shrinks the volume to its
@@ -20,27 +20,6 @@ group = "chd.rule"
 description = "CHD output is one whole-disk image or a refusal, and a packed body grows back on restore."
 
 # --- refusals ------------------------------------------------------------------
-
-[[case]]
-id = "chd.rule.x68k-refused-names-zstd"
-description = "An X68k table cannot be assembled into a single-file CHD yet: CHD is refused naming zstd, and zstd still shrinks the Human68k partition on restore."
-[[case.step]]
-args = ["new", "hd", "x68k", "{scratch}/x.img", "--size", "32M"]
-expect_exit = 0
-[[case.step]]
-args = ["backup", "{scratch}/x.img", "{scratch}/bk", "--name", "chd", "--format", "chd"]
-expect_exit = 1
-stderr_contains = ["whole-disk image", "--format zstd"]
-[[case.step]]
-args = ["backup", "{scratch}/x.img", "{scratch}/bk", "--name", "job", "--format", "zstd"]
-expect_exit = 0
-[[case.step]]
-args = ["restore", "{scratch}/bk/job", "{scratch}/out.img", "--size", "minimum"]
-expect_exit = 0
-[[case.step]]
-args = ["inspect", "{scratch}/out.img"]
-expect_exit = 0
-stdout_contains = ["Partition table: X68k", "16.1 MiB"]
 
 [[case]]
 id = "chd.rule.dsd-backup-refused"

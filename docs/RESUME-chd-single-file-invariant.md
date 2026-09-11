@@ -18,8 +18,13 @@ assemble is **refused**, never downgraded to `partition-N.chd`.
 |---|---|
 | Task A: partitionless volumes (floppy, HFV, bare HDF) as one whole-disk CHD | **Shipped** (this branch). See "Task A" below. |
 | Stage 0: X68k CHD refused naming zstd, `.dsd` backup refused, GPT clear skipped for label schemes, packed bodies grow back on every table, NTFS backup boot sector restored | **Shipped** (this branch). |
-| Restore-side resize of a label-scheme CHD backup corrupts silently | **Open, live bug.** The user chose (2026-09-11) to build Stage 3 rather than land a temporary refusal, so it stays reachable until then. The GPT-clear half is fixed. |
-| Label rewrite on restore (Sun / NeXT / SGI / SGI-DkLabel / RDB / AHDI / X68k) | **Next.** Stages 1-4 below. |
+| Label rewrite on restore (Sun / NeXT / SGI / SGI-DkLabel / RDB / AHDI / X68k) | **Shipped** (this branch): `src/partition/restore_patch.rs`, wired into `run_single_file_chd_restore_resize`. The silent corruption is closed. |
+| X68k as a single-file CHD | **Shipped.** The as-is restore carries the IPL region back byte for byte; `--size minimum` rewrites the table. An unaligned SASI partition is refused for CHD. |
+| The three loose ends (0x83 / type-string packed padding, the clock-flaky HFS test, the orphaned floppy-sizes comment) | **Shipped.** |
+
+**Nothing is left open on this track.** `docs/backup_partition_schemes.md`
+is the durable description of the design; this file is the record of how it
+got here.
 
 Baseline on `30d4f9b`: preflight green, 3,164 lib tests, `rb-regress` 381/381.
 After Task A: 3,165 lib tests (one added), the three new tier-5 cases pass.
@@ -152,7 +157,7 @@ stream stops short of, on all three restore paths.
   with the message, and Original still round-trips; X68k `--format chd`
   exits 1 naming zstd; X68k zstd + `--size minimum` still shrinks 32 -> 16 MiB.
 
-### Stage 1 — one head patcher per scheme (additive, no call-site change)
+### Stage 1 — one head patcher per scheme (shipped as `partition::restore_patch`)
 
 Add `partition::restore_patch::patch_head_for_restore(table, head: &mut
 [u8], overrides, target_size) -> Result<()>` with an exhaustive match, the
@@ -182,7 +187,7 @@ every byte outside the entries is unchanged (boot code, FSHD chain,
 bootstrap). `every_writable_table_writes_and_reparses` in `provision.rs` is
 the pattern.
 
-### Stage 2 — layout rules per scheme (additive)
+### Stage 2 — layout rules per scheme (shipped in reduced form: each patcher repacks on its own unit and returns the layout it wrote)
 
 - A `SchemeLayoutRules { granularity, reserved_head, reserved_tail,
   cylinder_bytes: Option<u64>, fixed_slots }` derived from the sidecar JSON,
@@ -202,7 +207,7 @@ the pattern.
   moving a body it cannot shrink. The min-size runner probes the filesystem,
   so the GUI "Minimum" for such a slice must collapse to Original.
 
-### Stage 3 — wire it in, one scheme at a time
+### Stage 3 — wire it in (shipped: restore-time only; backup-time resize stays refused by design)
 
 - `run_single_file_chd_restore_resize`: read the **head region** from the
   CHD (bytes before the first partition, same rule as
@@ -223,7 +228,7 @@ the pattern.
   shows the shrunk layout, fsck clean, an extracted file byte-identical.
   Stage 0c's refusal cases flip to success one scheme at a time.
 
-### Stage 4 — exports and GUI
+### Stage 4 — exports and GUI (not done; the GUI restore tab works through the same path, the export dialogs still drop overrides for these schemes)
 
 - `export_whole_disk` / `export_whole_disk_vhd` route through the patcher or
   refuse; today they drop overrides silently for non-MBR/APM/RDB.
@@ -232,7 +237,7 @@ the pattern.
 - Restore tab: size-mode column enabled per scheme by patcher availability
   and `in_place_resize_support`.
 
-### Stage 5 (optional) — X68k as a single-file CHD
+### Stage 5 — X68k as a single-file CHD (shipped)
 
 With the X68k patcher (Stage 1) and byte-based planning (Stage 2), add X68k
 to `is_supported`. Three things from the old doc still apply: the
@@ -353,4 +358,9 @@ cargo test --lib
 cargo test --test superfloppy_compression
 scripts/preflight.sh
 ./regression-tests/runner/target/release/rb-regress run --tiers 5 --filter roundtrip
+./regression-tests/runner/target/release/rb-regress run --tiers 5 --filter chd.
 ```
+
+The `chd.` filter covers `chd-whole-disk-rule.toml` (refusals, packed bodies
+growing back) and `chd-label-resize.toml` (every label scheme shrinking its
+first partition on restore).

@@ -445,19 +445,22 @@ pub fn write_table<W: Write + Seek>(
 }
 
 fn write_mbr<W: Write + Seek>(out: &mut W, placed: &[Placed]) -> Result<()> {
-    let entries: Vec<(u8, u32, u32, bool)> = placed
-        .iter()
-        .map(|p| {
-            let byte =
-                u8::from_str_radix(p.type_text.trim().trim_start_matches("0x"), 16).unwrap_or(0x83);
-            (
-                byte,
-                p.start_lba as u32,
-                (p.size_bytes / SECTOR) as u32,
-                false,
+    let mut entries: Vec<(u8, u32, u32, bool)> = Vec::with_capacity(placed.len());
+    for p in placed {
+        let text = p.type_text.trim();
+        // A name that is not a hex type byte used to land silently as Linux.
+        let byte = u8::from_str_radix(text.trim_start_matches("0x"), 16).map_err(|_| {
+            anyhow::anyhow!(
+                "MBR partition type '{text}' is not a hex type byte; see `partmap types --table mbr`"
             )
-        })
-        .collect();
+        })?;
+        entries.push((
+            byte,
+            p.start_lba as u32,
+            (p.size_bytes / SECTOR) as u32,
+            false,
+        ));
+    }
     let bytes = mbr::build_minimal_mbr(0x5253_5459, &entries, 255, 63);
     out.seek(SeekFrom::Start(0))?;
     out.write_all(&bytes).context("writing the MBR")?;

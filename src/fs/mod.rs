@@ -1057,23 +1057,8 @@ impl<R: Read> Read for ZeroPaddedReader<R> {
     }
 }
 
-/// Like `layout_preserving_partition_reader`, but for FAT/NTFS/exFAT it
-/// returns the *packed* compact reader (allocated clusters at the start,
-/// FS metadata shrunk to fit) padded with zeros up to `original_size`.
-///
-/// The resulting stream still has length == `original_size`, so it slots
-/// into the partition's extent inside a synthesised disk image without
-/// changing the partition table. Inside that extent, the OS sees a smaller
-/// FAT/NTFS/exFAT volume at offset 0 (BPB / boot sector reflects the
-/// shrunken total_sectors) followed by a zero-filled tail. CHD compresses
-/// the tail to nothing.
-///
-/// HFS/HFS+/ext/btrfs/ProDOS keep their existing layout-preserving stream
-/// (those readers are already byte-faithful at `original_size`).
-///
-/// Used by single-file CHD backup when not in sector-by-sector mode: the
-/// FAT-family partitions emerge defragmented in place, and the streaming
-/// pattern is sequential rather than seek-heavy.
+/// The partition's compact reader, zero-padded to `original_size` whenever it
+/// packs (FAT/NTFS/exFAT/Human68k); layout-preserving readers pass through.
 pub fn packed_partition_reader_padded<R: Read + Seek + Send + 'static>(
     mut reader: R,
     partition_offset: u64,
@@ -1081,64 +1066,48 @@ pub fn packed_partition_reader_padded<R: Read + Seek + Send + 'static>(
     partition_type_string: Option<&str>,
     keep_swap: bool,
 ) -> Option<(Box<dyn Read + Send>, CompactResult)> {
-    // APM and HFS/ext/btrfs/ProDOS go through the existing dispatcher —
-    // those readers are already layout-preserving (compacted_size ==
-    // original_size), so no padding is needed.
-    if partition_type_string.is_some() {
-        return compact_partition_reader(
-            reader,
-            partition_offset,
-            partition_type,
-            partition_type_string,
-            keep_swap,
-        );
-    }
-    match partition_type {
-        0x83 | 0xAF | 0xA8 => {
-            return compact_partition_reader(
+    // Padding keys on what the reader reports, not on how it was dispatched: a
+    // FAT behind type 0x83 (MSX) or a "human68k" type string packs too.
+    let (compact_reader, info): (Box<dyn Read + Send>, CompactResult) =
+        match (partition_type_string, partition_type) {
+            (Some(_), _) | (None, 0x83) | (None, 0xAF) | (None, 0xA8) => compact_partition_reader(
                 reader,
                 partition_offset,
                 partition_type,
                 partition_type_string,
                 keep_swap,
-            );
-        }
-        _ => {}
-    }
-
-    // For FAT/NTFS/exFAT: build the packed reader (compacted_size <
-    // original_size) and pad it with zeros to original_size.
-    let (compact_reader, info): (Box<dyn Read + Send>, CompactResult) = match partition_type {
-        0x00 => {
-            let fs_type = detect_filesystem_type(&mut reader, partition_offset);
-            match fs_type {
-                "fat" => fat_compact_reader(reader, partition_offset, keep_swap)?,
-                "ntfs" => ntfs_compact_reader(reader, partition_offset)?,
-                "exfat" => exfat_compact_reader(reader, partition_offset)?,
-                _ => {
-                    return compact_partition_reader(
+            )?,
+            (None, 0x00) => {
+                let fs_type = detect_filesystem_type(&mut reader, partition_offset);
+                match fs_type {
+                    "fat" => fat_compact_reader(reader, partition_offset, keep_swap)?,
+                    "ntfs" => ntfs_compact_reader(reader, partition_offset)?,
+                    "exfat" => exfat_compact_reader(reader, partition_offset)?,
+                    _ => compact_partition_reader(
                         reader,
                         partition_offset,
                         partition_type,
                         partition_type_string,
                         keep_swap,
-                    );
+                    )?,
                 }
             }
-        }
-        0x01 | 0x04 | 0x06 | 0x0E | 0x14 | 0x16 | 0x1E | 0x0B | 0x0C | 0x1B | 0x1C => {
-            fat_compact_reader(reader, partition_offset, keep_swap)?
-        }
-        0x07 => {
-            let fs_type = detect_0x07_type(&mut reader, partition_offset);
-            match fs_type {
-                "ntfs" => ntfs_compact_reader(reader, partition_offset)?,
-                "exfat" => exfat_compact_reader(reader, partition_offset)?,
-                _ => return None,
+            (None, 0x01 | 0x04 | 0x06 | 0x0E | 0x14 | 0x16 | 0x1E | 0x0B | 0x0C | 0x1B | 0x1C) => {
+                fat_compact_reader(reader, partition_offset, keep_swap)?
             }
-        }
-        _ => return None,
-    };
+            (None, 0x07) => {
+                let fs_type = detect_0x07_type(&mut reader, partition_offset);
+                match fs_type {
+                    "ntfs" => ntfs_compact_reader(reader, partition_offset)?,
+                    "exfat" => exfat_compact_reader(reader, partition_offset)?,
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
+    if info.compacted_size >= info.original_size {
+        return Some((compact_reader, info));
+    }
 
     let original_size = info.original_size;
     let compacted_size = info.compacted_size;

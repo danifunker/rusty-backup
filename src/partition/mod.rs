@@ -9,6 +9,7 @@ pub mod next;
 pub mod provision;
 pub mod rdb;
 pub mod resize;
+pub mod restore_patch;
 pub mod sgi;
 pub mod sgi_dklabel;
 pub mod sgi_hdd_builder;
@@ -225,11 +226,6 @@ pub fn whole_disk_partition(table: &PartitionTable, size_bytes: u64) -> Partitio
     }
 }
 
-/// Standard floppy disk image sizes (bytes).
-///
-/// Images matching one of these sizes that lack both a recognized filesystem
-/// and a valid MBR/GPT signature are treated as superfloppies with an unknown
-/// filesystem rather than producing a confusing partition-table error.
 /// Read sector 0, retrying a transient device error before giving up.
 ///
 /// Removable media — USB floppy drives especially — commonly fail the first
@@ -1996,6 +1992,7 @@ pub fn largest_free_region(
 }
 
 /// Partition size override for VHD export and restore.
+#[derive(Debug, Clone)]
 pub struct PartitionSizeOverride {
     pub index: usize,
     pub start_lba: u64,
