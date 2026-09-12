@@ -250,10 +250,21 @@ fn chd_rejects_split_size_up_front() {
     let meta: serde_json::Value =
         serde_json::from_reader(std::fs::File::open(folder.join("metadata.json")).unwrap())
             .unwrap();
-    let members = meta["partitions"][0]["compressed_files"]
-        .as_array()
-        .unwrap();
-    assert_eq!(members.len(), 1, "a CHD backup is always one container");
+    // A CHD backup is always one container: the whole-disk layout, with the
+    // body inside `<name>.chd` and no per-partition member files at all.
+    assert_eq!(
+        meta["layout"], "single-file-chd",
+        "a CHD backup is always one container"
+    );
+    assert_eq!(meta["container"], "ok.chd");
+    assert!(folder.join("ok.chd").exists(), "the container must exist");
+    assert!(
+        meta["partitions"][0]["compressed_files"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "the body lives inside the container, not in a partition-N file"
+    );
 
     let target = work.join("restored-chd.img");
     rusty_backup::restore::run_restore(
