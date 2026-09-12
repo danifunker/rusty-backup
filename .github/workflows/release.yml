@@ -1608,6 +1608,13 @@ jobs:
           RELEASE_VERSION="$VER" scripts/build-sol9.sh vendor
           if ! RELEASE_VERSION="$VER" scripts/build-sol9.sh sol9; then
             echo "::warning::sol9 stage failed; retrying once (minicargo build-script race)"
+            # The losing worker leaves the build-script marker behind with an
+            # empty OUT_DIR, so a bare retry trusts the marker, skips re-running
+            # the script and dies on output that was never written ("Unable to
+            # open .../private.rs") -- a different error than the one it is
+            # retrying. Drop every build-script artifact so they genuinely re-run;
+            # they are seconds each, and the expensive crate compiles stay.
+            rm -rf "$SOL9_OUT"/build_* "$SOL9_OUT"/host/build_*
             RELEASE_VERSION="$VER" scripts/build-sol9.sh sol9
           fi
           RELEASE_VERSION="$VER" scripts/build-sol9.sh dist

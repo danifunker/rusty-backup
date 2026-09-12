@@ -58,6 +58,14 @@ the TUI, and read-only device enumeration. See `docs/build-sol9-mrustc.md` for t
       commit and seed failed once and passed on re-run. The CI job retries the stage once,
       which works because the build is incremental, but the race is upstream in minicargo
       and that retry is a mitigation rather than a fix.
+      **2026-09-12:** the retry used to fail on a *different* error than the one it was
+      retrying. The losing worker leaves the build-script marker behind with an empty
+      `OUT_DIR`, so the second attempt trusted the marker, skipped re-running the script
+      and died with `Unable to open .../private.rs`. The retry now clears
+      `$SOL9_OUT/{,host/}build_*` first, so the scripts genuinely re-run. Upstream, the
+      two minicargo commits on the `ppc-build-2026-09` branch (`0d3211be`, `debcce0e`)
+      address the scheduling side, but CI builds from a prebuilt seed that predates them,
+      so a reseeded toolchain is what would actually retire this item.
 - [ ] **The seed pins an mrustc commit implicitly.** `scripts/pack-sol9-seed.sh` packs
       whatever `bin/mrustc` and the stdlib outputs happen to be, with nothing recording which
       commit built them. Stamping that into the seed would make a stale one obvious.
