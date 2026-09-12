@@ -482,6 +482,9 @@ jobs:
       ANYLINUX_REF: 2affcd69e3b3fccab4507dbdbaed5d1a04bedfa9
       # Pinned appimagetool release; quick-sharun honours APPIMAGETOOL_LINK.
       APPIMAGETOOL_VERSION: "0.3.0"
+      # (ANYLINUX_LIB_SOURCE is derived from ANYLINUX_REF in the bundling step:
+      # one env: entry cannot reference another, and duplicating the commit
+      # would let the two pins drift apart.)
       # See build-windows: keep APP_VERSION consistent across Test and Build.
       RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
     steps:
@@ -590,6 +593,13 @@ jobs:
           export VERSION
           # Pin appimagetool (quick-sharun downloads via this URL).
           export APPIMAGETOOL_LINK="https://github.com/pkgforge-dev/appimagetool/releases/download/${APPIMAGETOOL_VERSION}/appimagetool-${{ matrix.sharun_arch }}-linux"
+          # Same for anylinux.c: the script defaults to a refs/heads/main URL,
+          # which upstream moved -- it 404s, and the script's own five retries
+          # just repeat it ("Failed to download 5 times!"). Pin it to the same
+          # commit as the script, derived so the two cannot drift.
+          export ANYLINUX_LIB_SOURCE="https://raw.githubusercontent.com/pkgforge-dev/Anylinux-AppImages/${ANYLINUX_REF}/useful-tools/lib/anylinux.c"
+          curl -fsI "$ANYLINUX_LIB_SOURCE" >/dev/null \
+            || { echo "::error::anylinux.c is not reachable at the pinned ref $ANYLINUX_REF"; exit 1; }
           # GITHUB_REPOSITORY is set by Actions; appimagetool auto-emits zsync.
 
           mkdir -p "$OUTPATH"
