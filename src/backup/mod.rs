@@ -49,6 +49,13 @@ use metadata::{
     SizePolicy,
 };
 
+/// Disk-label schemes back up only through the single-file-CHD layout, which
+/// copies the head region verbatim. See `docs/backup_partition_schemes.md`.
+const LABEL_BACKUP_NEEDS_CHD: &str =
+    "disk-label sources (Sun / NeXT / SGI / Amiga RDB / Atari AHDI) back up as a \
+     single-file CHD only: re-run with CHD output. The per-partition layout \
+     would have to rewrite the table on restore, which is not implemented.";
+
 /// Compression type for backup output.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum CompressionType {
@@ -985,6 +992,60 @@ fn run_backup_inner(
         format!("Source size: {} bytes", source_size),
     );
 
+    // Some tables cannot be split into per-partition bodies at all. Image the
+    // drive as one body instead; the table rides in its JSON sidecar and, more
+    // to the point, inside the body itself.
+    if let Some(why) = partition::whole_disk_body_reason(&table, &partitions) {
+        log(
+            &progress,
+            LogLevel::Info,
+            format!(
+                "{} cannot be split per-partition ({why}); imaging the drive as one body",
+                table.type_name(),
+            ),
+        );
+        partitions = vec![partition::whole_disk_partition(&table, source_size)];
+    }
+
+    // Two DFS sides track-interleaved in one file: no restore has ever put
+    // them back, and copying the .dsd is its backup.
+    if matches!(table, PartitionTable::Dsd { .. }) {
+        bail!(
+            "a double-sided Acorn DFS image (.dsd) cannot be backed up: its two sides \
+             are track-interleaved and a restore cannot put them back. Copy the .dsd \
+             file itself; ls, get, put and convert still work on it."
+        );
+    }
+    // The single-file layout places bodies on 512-byte LBAs; a SASI disk with
+    // 256-byte sectors can start a partition between two of them.
+    if matches!(
+        config.compression,
+        CompressionType::Chd | CompressionType::Dvd
+    ) && matches!(table, PartitionTable::X68k { .. })
+        && partitions.iter().any(|p| p.byte_offset() % 512 != 0)
+    {
+        bail!(
+            "{} output needs every X68k partition on a 512-byte boundary and this SASI \
+             disk has one that is not; use --format zstd",
+            config.compression.as_str(),
+        );
+    }
+    // A CHD is a whole disk, so a table the single-file layout cannot assemble
+    // is refused rather than written as per-partition CHDs (CLAUDE.md).
+    if matches!(
+        config.compression,
+        CompressionType::Chd | CompressionType::Dvd
+    ) && !single_file_chd::is_supported(&table)
+    {
+        bail!(
+            "{} output is a whole-disk image and the single-file layout cannot assemble \
+             {} disks yet; use --format zstd, which backs them up per-partition and still \
+             resizes on restore",
+            config.compression.as_str(),
+            table.type_name(),
+        );
+    }
+
     // Step 2: Create backup folder
     set_operation(&progress, "Creating backup folder...");
     let backup_folder = format::create_backup_folder(&config.destination_dir, &config.backup_name)?;
@@ -1007,8 +1068,7 @@ fn run_backup_inner(
     let single_file_chd_planned = matches!(
         config.compression,
         CompressionType::Chd | CompressionType::Dvd
-    ) && !is_superfloppy
-        && config.split_size_mib.is_none()
+    ) && config.split_size_mib.is_none()
         && single_file_chd::is_supported(&table);
 
     // Sector 0 alone loses GRUB's core.img, a DDO or Boot Manager living
@@ -1118,23 +1178,16 @@ fn run_backup_inner(
             }
         }
         PartitionTable::Rdb(rdb) => {
-            // Emit a JSON sidecar of the RDB layout so inspect tools and
-            // future round-trip restores can read it. Per-partition data
-            // backup follows the standard layout-preserving path once the
-            // AFFS/PFS/SFS readers land.
             let json =
                 serde_json::to_string_pretty(rdb).context("failed to serialize RDB to JSON")?;
             std::fs::write(backup_folder.join("rdb.json"), json)
                 .context("failed to write rdb.json")?;
             log(&progress, LogLevel::Info, "Exported RDB (rdb.json)");
+            if !single_file_chd_planned {
+                bail!("{}", LABEL_BACKUP_NEEDS_CHD);
+            }
         }
         PartitionTable::Sgi(vh) => {
-            // Step 2 surfaces SGI partitions in the inspect tab; backup of
-            // SGI disks is a separate workflow (deferred). Emit a JSON
-            // sidecar so the partition layout is recorded if a future
-            // session does want to round-trip it, but bail before any
-            // per-partition data write — the data path needs SGI-aware
-            // sizing and the EFS/XFS readers to land first.
             let json = serde_json::to_string_pretty(vh)
                 .context("failed to serialize SGI volume header to JSON")?;
             std::fs::write(backup_folder.join("sgi.json"), json)
@@ -1142,15 +1195,13 @@ fn run_backup_inner(
             log(
                 &progress,
                 LogLevel::Info,
-                "Exported SGI volume header (sgi.json) — partition data backup not yet supported",
+                "Exported SGI volume header (sgi.json)",
             );
-            bail!("backing up SGI disks is not yet supported (browse only)");
+            if !single_file_chd_planned {
+                bail!("{}", LABEL_BACKUP_NEEDS_CHD);
+            }
         }
         PartitionTable::Sun(label) => {
-            // Mirror the SGI sidecar: record the slice layout in sun.json, but
-            // defer the per-slice data backup (the data path needs Sun-label
-            // sizing). Browse / inspect / extract already work via the slice
-            // list + the existing UFS reader.
             let json = serde_json::to_string_pretty(label)
                 .context("failed to serialize Sun disk label to JSON")?;
             std::fs::write(backup_folder.join("sun.json"), json)
@@ -1158,14 +1209,13 @@ fn run_backup_inner(
             log(
                 &progress,
                 LogLevel::Info,
-                "Exported Sun disk label (sun.json) — partition data backup not yet supported",
+                "Exported Sun disk label (sun.json)",
             );
-            bail!("backing up Sun-labeled disks is not yet supported (browse only)");
+            if !single_file_chd_planned {
+                bail!("{}", LABEL_BACKUP_NEEDS_CHD);
+            }
         }
         PartitionTable::Next(label) => {
-            // Same sidecar shape as the Sun label: record the partition layout
-            // in next.json and defer the per-partition data backup. Browse /
-            // inspect / extract already work through the big-endian UFS reader.
             let json = serde_json::to_string_pretty(label)
                 .context("failed to serialize NeXT disk label to JSON")?;
             std::fs::write(backup_folder.join("next.json"), json)
@@ -1173,28 +1223,19 @@ fn run_backup_inner(
             log(
                 &progress,
                 LogLevel::Info,
-                "Exported NeXT disk label (next.json) — partition data backup not yet supported",
+                "Exported NeXT disk label (next.json)",
             );
-            bail!("backing up NeXT-labeled disks is not yet supported (browse only)");
+            if !single_file_chd_planned {
+                bail!("{}", LABEL_BACKUP_NEEDS_CHD);
+            }
         }
-        PartitionTable::SolarisX86 { label, .. } => {
-            // Same sidecar shape as the Sun label: record the slice layout in
-            // solaris_x86.json and defer the per-slice data backup.
-            let json = serde_json::to_string_pretty(label)
-                .context("failed to serialize Solaris x86 VTOC to JSON")?;
-            std::fs::write(backup_folder.join("solaris_x86.json"), json)
-                .context("failed to write solaris_x86.json")?;
-            log(
-                &progress,
-                LogLevel::Info,
-                "Exported Solaris x86 VTOC (solaris_x86.json) — partition data backup not yet supported",
-            );
-            bail!("backing up Solaris x86 disks is not yet supported (browse only)");
+        PartitionTable::SolarisX86 { .. } => {
+            // Unreachable: the table was rewritten to its host MBR far above,
+            // with the VTOC already written to solaris_x86.json. Kept so the
+            // match stays exhaustive, and honest about why it cannot fire.
+            bail!("internal: a Solaris x86 table reached the sidecar match unrewritten");
         }
         PartitionTable::SgiDkLabel(label) => {
-            // Same sidecar shape as the Sun label: record the slot layout in
-            // sgi_dklabel.json and defer the per-slot data backup. Browse /
-            // inspect / extract already work through the EFS v1 reader.
             let json = serde_json::to_string_pretty(label)
                 .context("failed to serialize SGI disk label to JSON")?;
             std::fs::write(backup_folder.join("sgi_dklabel.json"), json)
@@ -1202,21 +1243,21 @@ fn run_backup_inner(
             log(
                 &progress,
                 LogLevel::Info,
-                "Exported SGI disk label (sgi_dklabel.json) — partition data backup not yet supported",
+                "Exported SGI disk label (sgi_dklabel.json)",
             );
-            bail!("backing up SGI-disk-label disks is not yet supported (browse only)");
+            if !single_file_chd_planned {
+                bail!("{}", LABEL_BACKUP_NEEDS_CHD);
+            }
         }
         PartitionTable::Ahdi(table) => {
-            // Mirror the RDB / SGI sidecar shape: emit ahdi.json so a future
-            // restore knows the AHDI primary slots, XGM chain, and disk-size
-            // / bad-sector fields. Per-partition FAT data backup rides the
-            // standard layout-preserving path through the existing FAT
-            // pipeline.
             let json = serde_json::to_string_pretty(table)
                 .context("failed to serialize AHDI table to JSON")?;
             std::fs::write(backup_folder.join("ahdi.json"), json)
                 .context("failed to write ahdi.json")?;
             log(&progress, LogLevel::Info, "Exported AHDI (ahdi.json)");
+            if !single_file_chd_planned {
+                bail!("{}", LABEL_BACKUP_NEEDS_CHD);
+            }
         }
         PartitionTable::X68k { table, .. } => {
             // Mirror the AHDI sidecar shape: emit x68k.json so restore
@@ -1238,11 +1279,8 @@ fn run_backup_inner(
             );
         }
         PartitionTable::Dsd { .. } => {
-            log(
-                &progress,
-                LogLevel::Info,
-                "Double-sided Acorn DFS (.dsd): two DFS partitions, no partition-table sidecar",
-            );
+            // Unreachable: a .dsd is refused before the folder is created.
+            bail!("internal: a DSD table reached the sidecar match");
         }
     }
 
@@ -1481,12 +1519,6 @@ fn run_backup_inner(
              single-file CHD backups are unavailable"
         );
     }
-    // CHD/DVD selected on a source single_file_chd can't handle (only
-    // superfloppies fit this today — every other shape is_supported).
-    // Superfloppies route through the per-partition loop with
-    // `effective_compression` forced to `None` (raw .img), so the user
-    // ends up with a `partition-0.img` rather than a CHD. We don't emit
-    // per-partition CHDs anywhere; CHD output is single-file or nothing.
     if matches!(
         config.compression,
         CompressionType::Chd | CompressionType::Dvd
@@ -2554,9 +2586,8 @@ fn run_single_file_chd_path(
                 type_name: part.type_name.clone(),
                 partition_type_byte: part.partition_type_byte,
                 start_lba: new_start_lba,
-                // Single-file CHD relocates partitions and is not used for
-                // X68000 sources (the only non-512-aligned scheme), so the
-                // floored 512-LBA offset is authoritative here.
+                // Every body sits on a 512-byte LBA here (an unaligned SASI
+                // disk is refused above), so the floored offset is exact.
                 start_byte: None,
                 original_size_bytes: part.size_bytes,
                 imaged_size_bytes: range.length,

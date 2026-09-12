@@ -482,6 +482,12 @@ jobs:
       ANYLINUX_REF: 2affcd69e3b3fccab4507dbdbaed5d1a04bedfa9
       # Pinned appimagetool release; quick-sharun honours APPIMAGETOOL_LINK.
       APPIMAGETOOL_VERSION: "0.3.0"
+      # anylinux.c moved out of Anylinux-AppImages into its own repo on
+      # 2026-09-10 (Anylinux-sharun commit a84aa4b, "move and build helper
+      # libraries to this repository"). quick-sharun.sh at the ref above still
+      # defaults to the old `refs/heads/main` path, which now 404s -- so point
+      # it at the new home, pinned to a release tag rather than a branch.
+      ANYLINUX_SHARUN_VERSION: "3.2.1"
       # See build-windows: keep APP_VERSION consistent across Test and Build.
       RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
     steps:
@@ -590,6 +596,14 @@ jobs:
           export VERSION
           # Pin appimagetool (quick-sharun downloads via this URL).
           export APPIMAGETOOL_LINK="https://github.com/pkgforge-dev/appimagetool/releases/download/${APPIMAGETOOL_VERSION}/appimagetool-${{ matrix.sharun_arch }}-linux"
+          # anylinux.c now lives in Anylinux-sharun (see the env note). The
+          # script's default still points at the old repo's main branch, which
+          # 404s -- and its five retries just repeat a request that cannot
+          # succeed ("Failed to download 5 times!"), which reads like a network
+          # blip rather than a moved file.
+          export ANYLINUX_LIB_SOURCE="https://raw.githubusercontent.com/pkgforge-dev/Anylinux-sharun/${ANYLINUX_SHARUN_VERSION}/lib/anylinux.c"
+          curl -fsI "$ANYLINUX_LIB_SOURCE" >/dev/null \
+            || { echo "::error::anylinux.c unreachable at Anylinux-sharun ${ANYLINUX_SHARUN_VERSION}; upstream may have moved it again"; exit 1; }
           # GITHUB_REPOSITORY is set by Actions; appimagetool auto-emits zsync.
 
           mkdir -p "$OUTPATH"
@@ -1608,6 +1622,13 @@ jobs:
           RELEASE_VERSION="$VER" scripts/build-sol9.sh vendor
           if ! RELEASE_VERSION="$VER" scripts/build-sol9.sh sol9; then
             echo "::warning::sol9 stage failed; retrying once (minicargo build-script race)"
+            # The losing worker leaves the build-script marker behind with an
+            # empty OUT_DIR, so a bare retry trusts the marker, skips re-running
+            # the script and dies on output that was never written ("Unable to
+            # open .../private.rs") -- a different error than the one it is
+            # retrying. Drop every build-script artifact so they genuinely re-run;
+            # they are seconds each, and the expensive crate compiles stay.
+            rm -rf "$SOL9_OUT"/build_* "$SOL9_OUT"/host/build_*
             RELEASE_VERSION="$VER" scripts/build-sol9.sh sol9
           fi
           RELEASE_VERSION="$VER" scripts/build-sol9.sh dist

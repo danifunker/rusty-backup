@@ -1,0 +1,155 @@
+# Tier 3 — mutate the NeXT MO / SunOS 4.1.3 / Rhapsody volumes.
+#
+# The tier-2 file next door proves we can READ these. This one writes to them.
+# Every case uses {fixture_copy}: a reference volume a test has written to has
+# stopped being a reference.
+#
+# The gamut is the one the other tier-3 files use:
+#
+#   put -> get -> byte-compare -> chmod/chown -> mkdir -> ls -> rm -> fsck
+#
+# with the fsck at the end doing the real work. A mutation that returns 0 and
+# leaves an inconsistent volume is the failure mode that matters.
+#
+# The MO case carries an extra obligation the others do not. An `.od` sector is
+# 1024 data bytes plus 272 bytes of cross-interleaved Reed-Solomon, so a write
+# that lands the data correctly and leaves stale ECC is unreadable on the real
+# hardware and looks *fine* to us — we never consult the code on read. Nothing
+# in this suite can catch that; what does is `ecc_bytes_are_reproducible` and
+# the table pinned against Previous's in `src/rbformats/next_mo.rs`, plus the
+# byte-for-byte check against real media recorded there. This case's job is the
+# layer above: that an edit through the ECC container commits at all and leaves
+# the volume sound.
+#
+# ON THE MO's SECOND PARTITION the fsck assertion is stronger than "clean": it
+# pins the pre-existing orphan inode 232. One orphan before an edit and one
+# after is what proves our allocator leaked nothing new.
+
+[meta]
+tier = 3
+group = "edit.batch2"
+description = "Write to the NeXT MO / SunOS / Rhapsody volumes; assert each stays sound."
+
+# --- NeXT magneto-optical, through the ECC container ---------------------------
+
+[[case]]
+id = "edit.batch2.next-mo-ns08"
+description = "Editing 4.3BSD UFS inside a raw MO image. Every touched sector is re-encoded through both Reed-Solomon passes and written back in place — no decode-to-temp step."
+fixture = "fmt.od.next-mo-ns08.hd"
+[[case.step]]
+args = ["put", "{fixture_copy}@1", "{cases}/tier3/payload.bin", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{fixture_copy}@1", "/payload.bin", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+[[case.step]]
+args = ["chmod", "{fixture_copy}@1", "/payload.bin", "0640"]
+expect_exit = 0
+[[case.step]]
+args = ["chown", "{fixture_copy}@1", "/payload.bin", "100:20"]
+expect_exit = 0
+[[case.step]]
+args = ["mkdir", "{fixture_copy}@1", "/rbtest"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{fixture_copy}@1", "/"]
+expect_exit = 0
+stdout_contains = ["payload.bin", "rbtest"]
+[[case.step]]
+args = ["rm", "{fixture_copy}@1", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "-r", "{fixture_copy}@1", "/rbtest"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{fixture_copy}@1", "/"]
+expect_exit = 0
+stdout_not_contains = ["payload.bin", "rbtest"]
+[[case.step]]
+args = ["fsck", "{fixture_copy}@1", "--checkonly"]
+expect_exit = 0
+stdout_contains = ["5708 files"]
+
+[[case]]
+id = "edit.batch2.next-mo-ns08-second"
+description = "The MO's second partition, which carries a pre-existing orphan inode. Editing it must leave exactly that and nothing more."
+fixture = "fmt.od.next-mo-ns08.hd"
+[[case.step]]
+args = ["put", "{fixture_copy}@2", "{cases}/tier3/payload.bin", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{fixture_copy}@2", "/payload.bin", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+[[case.step]]
+# STILL exactly one orphan, and still inode 232. A second error means our write
+# broke something; a clean result means the orphan stopped being reported,
+# which is equally a change worth failing on.
+args = ["fsck", "{fixture_copy}@2", "--checkonly"]
+expect_exit = 1
+stdout_contains = ["OrphanInode", "232"]
+
+# --- SunOS 4.1.3, through a CHD ------------------------------------------------
+
+[[case]]
+id = "edit.batch2.sun-sunos413"
+description = "Editing big-endian pre-4.4BSD UFS inside a Sun label with no VTOC, through a CHD container."
+fixture = "part.sun.sunos413-sparc.multipart"
+[[case.step]]
+args = ["put", "{fixture_copy}@1", "{cases}/tier3/payload.bin", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{fixture_copy}@1", "/payload.bin", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+[[case.step]]
+args = ["mkdir", "{fixture_copy}@1", "/rbtest"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{fixture_copy}@1", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "-r", "{fixture_copy}@1", "/rbtest"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{fixture_copy}@1", "--checkonly"]
+expect_exit = 0
+stdout_contains = ["853 files"]
+
+# --- Mac OS X Server 1.2, behind a nested NeXT label ---------------------------
+
+[[case]]
+id = "edit.batch2.rhapsody12"
+description = "Editing the Rhapsody UFS. The write path has to resolve the nested NeXT label the same way the read path does, or it writes 160 sectors early."
+fixture = "part.apm.rhapsody12-nextlabel.multipart"
+[[case.step]]
+args = ["put", "{fixture_copy}@3", "{cases}/tier3/payload.bin", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{fixture_copy}@3", "/payload.bin", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+[[case.step]]
+args = ["mkdir", "{fixture_copy}@3", "/rbtest"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{fixture_copy}@3", "/"]
+expect_exit = 0
+stdout_contains = ["payload.bin", "rbtest", "mach_kernel"]
+[[case.step]]
+args = ["rm", "{fixture_copy}@3", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "-r", "{fixture_copy}@3", "/rbtest"]
+expect_exit = 0
+[[case.step]]
+# The label is what makes the slice bootable: a write that walked over it
+# would still fsck clean, so the partition table is re-read as the check.
+args = ["inspect", "{fixture_copy}"]
+expect_exit = 0
+stdout_contains = ["Apple_Rhapsody_UFS (Mac OS X Server 1.2)"]
+[[case.step]]
+args = ["fsck", "{fixture_copy}@3", "--checkonly"]
+expect_exit = 0
+stdout_contains = ["21135 files"]

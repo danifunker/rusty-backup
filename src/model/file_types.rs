@@ -97,6 +97,8 @@ pub const DISK_IMAGE_EXTS: &[&str] = &[
     "dart",
     "sparseimage",
     "smi",
+    // NeXT magneto-optical media, ECC-coded sectors and all.
+    "od",
 ];
 
 /// Extensions that appear in the GUI file-picker dropdown (so a user can
@@ -236,6 +238,15 @@ mod tests {
         assert!(DISK_IMAGE_EXTS.contains(&"ssd"));
         assert!(DISK_IMAGE_EXTS.contains(&"dsd"));
         assert!(association_exts().contains(&"dsd".to_string()));
+    }
+
+    #[test]
+    fn next_mo_extension_present() {
+        // A NeXT MO image is a picker-visible, openable container (its 1296-byte
+        // sectors are decoded by `rbformats::next_mo`) — guard it against a
+        // future extension-list trim.
+        assert!(DISK_IMAGE_EXTS.contains(&"od"));
+        assert!(association_exts().contains(&"od".to_string()));
     }
 
     #[test]

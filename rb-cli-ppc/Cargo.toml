@@ -204,11 +204,16 @@ crc = "=3.3.0"
 # fs/resource_fork.rs.
 libc = "=0.2.155"
 
-# DEVIATION (see header): no `nix`. It is a linux-only dependency (used only by
-# src/os/linux.rs, never compiled for powerpc-apple-darwin), but Cargo lockfiles
-# are target-agnostic, so nix 0.31's `libc >= 0.2.186` requirement would drag the
-# whole graph onto a libc mrustc cannot lower. Dropping it is what lets the pin
-# below work.
+# DEVIATION (see header): no `nix`. Cargo lockfiles are target-agnostic, so nix
+# 0.31's `libc >= 0.2.186` requirement would drag the whole graph onto a libc
+# mrustc cannot lower. Dropping it is what lets the pin below work.
+#
+# Nothing under ../src needs it: src/os/linux.rs reaches umount2 / geteuid /
+# getuid / getgid / umask through `libc` directly (its `sys` module), which is
+# the same syscalls nix wrapped. Only the GUI binary src/main.rs still uses nix,
+# and that is not part of this crate. Keep it that way: a `use nix::` anywhere
+# in ../src breaks the `hostc` transpile proof on a Linux host, where
+# target_os = "linux" selects that module and the extern crate is absent.
 
 # DEVIATION (see header): the objc2-* stack that rb-cli-vintage declares here is
 # absent. It is reachable only through src/os/macos.rs, which the `os-stub`

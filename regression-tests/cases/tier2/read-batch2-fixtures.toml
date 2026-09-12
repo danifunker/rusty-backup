@@ -1,0 +1,149 @@
+# Tier 2 — the second drop: NeXT magneto-optical, SunOS 4.1.3, Rhapsody.
+#
+# Three fixtures landed on 2026-09-10. Each one is here because it broke a
+# different assumption, and each assumption failed *quietly* — every one of
+# these opened, listed a plausible directory tree, and was wrong.
+#
+#   fmt.od.next-mo-ns08         An `.od` is the RAW MO MEDIA, not the drive's
+#                               user data: 1296-byte sectors carrying 1024 data
+#                               bytes plus a cross-interleaved RS(36,32) code,
+#                               logical block 0 is 848 sectors in, and the `od`
+#                               DRIVER (not the drive) skips 8 spare sectors per
+#                               1600 from the label's own alternate-group
+#                               fields. Skip the sparing and the label, the
+#                               superblock and the root directory are all still
+#                               correct — only the cylinder groups past the
+#                               first drift, and fsck finds 58727 orphans.
+#
+#   part.sun.sunos413-sparc     SunOS 4.x wrote no VTOC, so every slice tag
+#                               reads 0 and the tag-5 whole-disk alias can only
+#                               be found by geometry. Before that, slice 2
+#                               listed as a sixth partition overlapping all the
+#                               others.
+#
+#   part.apm.rhapsody12         Rhapsody kept NeXT's disk label and nests one in
+#                               its Apple_Rhapsody_UFS slice, so the filesystem
+#                               starts 160 sectors past the slice. Addressing
+#                               the slice found no superblock and browse fell
+#                               through to the carve view — a 2 GiB
+#                               `whole-disk.img` and 1200 `carved-blk*.txt`.
+#
+# Same shallow contract as the other tier-2 files: open it, identify it, walk
+# the root, ask fsck. Depth belongs in tier 3, which mutates a copy.
+#
+# TWO OF THESE VOLUMES ARE DAMAGED, and the cases pin the exact damage rather
+# than looking away — a reader that miscounts turns the case red:
+#
+#   fmt.od.next-mo-ns08 @2      orphan inode 232, present in the pristine image
+#   part.sun.sunos413 @2        the destroyed miniroot. SunOS installs by
+#                               copying a 7 MB root into the SWAP slice and
+#                               booting it; swap then overwrites the data
+#                               blocks. Superblock and inodes survive, the root
+#                               directory block is zeros. It is unreadable and
+#                               must SAY so rather than inventing a listing.
+#
+# Streams: the `Partition @N ...` banner goes to stderr; the inspect table, the
+# ls entries and the fsck findings go to stdout. Assert on stdout.
+
+[meta]
+tier = 2
+group = "fs.read.batch2"
+description = "Open, identify, walk and fsck the NeXT MO / SunOS 4.1.3 / Rhapsody drop."
+
+# --- NeXT magneto-optical ------------------------------------------------------
+
+[[case]]
+id = "read.od.next-mo-ns08"
+description = "NeXTSTEP 0.8 on a 256 MB Canon MO cartridge: ECC-coded 1296-byte sectors, an 848-sector origin, and driver-side spare-sector skipping."
+fixture = "fmt.od.next-mo-ns08.hd"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["Partition table: NeXT", "NeXT a (4.3BSD)", "NeXT b (4.3BSD)"]
+[[case.step]]
+# `odmach` is the optical-boot kernel, which is what makes this an MO disk and
+# not a copy of somebody's hard drive.
+args = ["ls", "{fixture}@1", "/"]
+expect_exit = 0
+stdout_contains = ["odmach", "sdmach", "MyDisk", "lost+found"]
+[[case.step]]
+args = ["ls", "{fixture}@2", "/"]
+expect_exit = 0
+stdout_contains = ["Apps", "Fonts", "Library", "Programming"]
+[[case.step]]
+# Clean. The sparing map is what this asserts: read the image linearly and
+# this same fsck reports 58727 orphan inodes.
+args = ["fsck", "{fixture}@1", "--checkonly"]
+expect_exit = 0
+stdout_contains = ["5708 files"]
+[[case.step]]
+# Documented damage, not a regression: one orphan in the pristine image.
+args = ["fsck", "{fixture}@2", "--checkonly"]
+expect_exit = 1
+stdout_contains = ["OrphanInode", "232"]
+
+# --- SunOS 4.1.3, Sun label with no VTOC ---------------------------------------
+
+[[case]]
+id = "read.sun.sunos413-sparc"
+description = "SunOS 4.1.3 SPARC in a CHD. The label carries no VTOC, so the slices are untagged and the whole-disk alias is found by geometry."
+fixture = "part.sun.sunos413-sparc.multipart"
+[[case.step]]
+# Five slices, not six: the backup alias at LBA 0 spanning the whole disk is
+# excluded. `untagged` rather than `unassigned` — there is no VTOC to read.
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["Partition table: Sun", "Sun untagged (UFS?)", "62320", "2804400"]
+stdout_not_contains = ["unassigned"]
+[[case.step]]
+args = ["ls", "{fixture}@1", "/"]
+expect_exit = 0
+stdout_contains = ["lost+found", "export", "usr", "var"]
+[[case.step]]
+args = ["ls", "{fixture}@4", "/"]
+expect_exit = 0
+stdout_contains = ["ucb", "include", "5lib", "ucbinclude"]
+[[case.step]]
+args = ["fsck", "{fixture}@1", "--checkonly"]
+expect_exit = 0
+stdout_contains = ["853 files"]
+[[case.step]]
+args = ["fsck", "{fixture}@4", "--checkonly"]
+expect_exit = 0
+stdout_contains = ["12850 files"]
+[[case.step]]
+# The destroyed miniroot in the swap slice. A valid superblock over a zeroed
+# root directory: the failure has to be reported, not papered over.
+args = ["ls", "{fixture}@2", "/"]
+expect_exit = 1
+stderr_contains = ["d_reclen"]
+
+# --- Mac OS X Server 1.2, NeXT label nested in an APM slice ---------------------
+
+[[case]]
+id = "read.apm.rhapsody12-nextlabel"
+description = "Mac OS X Server 1.2 PowerPC. Rhapsody kept NeXT's disk label, so the UFS starts 160 sectors past the Apple_Rhapsody_UFS slice."
+fixture = "part.apm.rhapsody12-nextlabel.multipart"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+stdout_contains = [
+    "Partition table: APM",
+    "Apple_Rhapsody_UFS (Mac OS X Server 1.2)",
+    "Apple_Boot (MOSX_OF3_Booter)",
+]
+[[case.step]]
+# `whole-disk.img` is the carve view's first entry. Seeing it here means the
+# nested label was not resolved and we are browsing raw bytes again.
+args = ["ls", "{fixture}@3", "/"]
+expect_exit = 0
+stdout_contains = ["mach_kernel", "System", "private", "sbin"]
+stdout_not_contains = ["whole-disk.img", "carved-blk"]
+[[case.step]]
+args = ["ls", "{fixture}@3", "/System"]
+expect_exit = 0
+stdout_contains = ["Library", "Administration", "Documentation"]
+[[case.step]]
+args = ["fsck", "{fixture}@3", "--checkonly"]
+expect_exit = 0
+stdout_contains = ["21135 files"]

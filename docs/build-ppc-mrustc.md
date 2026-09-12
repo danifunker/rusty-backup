@@ -1078,6 +1078,34 @@ bin/mrustc hello.rs -o output-1.74.0-powerpc-apple-darwin/hello \
 ssh $PPC_HOST './ppc-xbuild/output-1.74.0-powerpc-apple-darwin/hello'
 ```
 
+### No nix
+
+`rb-cli-ppc/Cargo.toml` declares no `nix`: lockfiles are target-agnostic, so
+nix 0.31's `libc >= 0.2.186` floor would drag the whole graph onto a libc
+mrustc cannot lower.
+
+The catch is that nothing under `../src` may then name it. `src/os/linux.rs` is
+`#[cfg(target_os = "linux")]`, and the PowerPC target is macOS, so it never
+reaches the PowerPC build - but the `hostc` / `host` stages transpile for *this*
+machine, and on a Linux host that cfg is true. With no extern crate, mrustc
+resolves `use nix::...` as a local path and the engine fails to compile:
+
+```
+src/os/linux.rs:8:5-37 error:0: Cannot find component 2 of crate::os::linux::nix::mount::umount2
+```
+
+Those stages had only ever been run on an Apple Silicon host (`HOST_ARCH`
+defaults to `aarch64`), where linux.rs is not compiled, so the host path had
+never worked on Linux.
+
+`src/os/linux.rs` therefore reaches its seven POSIX calls - `umount2` plus
+`geteuid` / `getuid` / `getgid` / `umask` in the elevation path - through `libc`
+directly, in its private `sys` module. That is what nix did anyway: its
+`umount2` is `libc::umount2` plus errno handling, and `MntFlags` takes its bits
+from `libc`. One implementation serves every manifest, with no feature gate or
+stub to drift. `nix` survives only in `src/main.rs` (the GUI binary, not part of
+this crate); **a `use nix::` anywhere under `src/` breaks `hostc` again.**
+
 ## rb-cli-ppc deviations (mrustc workarounds)
 
 `rb-cli-ppc/Cargo.toml` carries the manifest-level deviations; the vendored

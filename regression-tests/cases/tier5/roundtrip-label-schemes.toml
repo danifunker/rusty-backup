@@ -1,0 +1,279 @@
+# Tier 5 — backup and restore for the disk-label partition schemes.
+#
+# Sun, NeXT and both SGI schemes bailed out of `backup` entirely until
+# 2026-09-10, and an Amiga RDB did something worse — it backed up fine and
+# then could not be restored, because the sidecar keeps a *parsed* table and
+# re-serializing it loses the FSHD/LSEG driver chain. In every case the
+# sidecar JSON was written and the run then aborted with "browse only". They go
+# through the single-file-CHD layout, which writes a real disk image (table at
+# sector 0, partitions at their declared offsets) and restores by copying the
+# CHD's logical bytes, so nothing on the restore side has to understand the
+# label at all.
+#
+# What the layout does need is a head region, and for these two it is copied
+# **verbatim** — we have no writer that could patch a Sun or NeXT label for a
+# resize. Two consequences these cases pin:
+#
+#   * the per-partition layouts (zstd / gzip / raw / VHD) are refused, and the
+#     message has to name the layout that works rather than just saying no;
+#   * on a SunOS disk the head region is empty by construction, because slice 0
+#     starts at cylinder 0 and carries the label in its own first sector.
+#
+# What these cases do NOT assert is whole-image byte equality, and the reason is
+# worth writing down because it looks like a bug the first time you see it. The
+# single-file-CHD assembler zero-fills everything that is not a partition — for
+# every scheme, not just these two — so a NeXT disk's back porch comes back as
+# 1248 sectors of zeros where the erased MO media had 0xFF. That region is
+# reserved by `d_back` and holds nothing; `--sector-by-sector` is a promise
+# about partition bodies, not about gaps. So the assertions here are the
+# filesystem's own: fsck walks every cylinder group, which is exactly what a
+# lost sparing map or a shifted partition would break, and an extracted file is
+# compared byte for byte.
+
+[meta]
+tier = 5
+group = "roundtrip.label"
+description = "Back up and restore the disk-label schemes; prove the label and every partition survived."
+
+# --- NeXT label ----------------------------------------------------------------
+
+[[case]]
+id = "roundtrip.label.next-mo-ns08"
+description = "NeXT MO cartridge: back up straight out of the ECC container, restore to a flat image, and prove both partitions came back whole."
+fixture = "fmt.od.next-mo-ns08.hd"
+timeout_ms = 1200000
+[[case.step]]
+args = ["get", "{fixture}@1", "/odmach", "{scratch}/odmach.src"]
+expect_exit = 0
+[[case.step]]
+args = ["backup", "{fixture}", "{scratch}/bk", "--name", "job", "--format", "chd", "--sector-by-sector"]
+expect_exit = 0
+[[case.step]]
+args = ["restore", "{scratch}/bk/job", "{scratch}/out.img"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/out.img"]
+expect_exit = 0
+stdout_contains = ["Partition table: NeXT", "NeXT a (4.3BSD)", "NeXT b (4.3BSD)"]
+[[case.step]]
+# The optical boot kernel, 600 KB spread over enough cylinder groups that a
+# lost spare-sector map cannot leave it intact.
+args = ["get", "{scratch}/out.img@1", "/odmach", "{scratch}/odmach.out"]
+expect_exit = 0
+files_identical = [["{scratch}/odmach.src", "{scratch}/odmach.out"]]
+[[case.step]]
+args = ["fsck", "{scratch}/out.img@1", "--checkonly"]
+expect_exit = 0
+stdout_contains = ["5708 files"]
+[[case.step]]
+# Still exactly the one orphan the pristine cartridge carries.
+args = ["fsck", "{scratch}/out.img@2", "--checkonly"]
+expect_exit = 1
+stdout_contains = ["OrphanInode", "232"]
+
+[[case]]
+id = "roundtrip.label.next-mo-refuses-per-partition"
+description = "A per-partition backup of a NeXT-labeled disk is refused, and the message names the layout that works."
+fixture = "fmt.od.next-mo-ns08.hd"
+[[case.step]]
+args = ["backup", "{fixture}", "{scratch}/bk", "--name", "job", "--format", "zstd"]
+expect_exit = 1
+stderr_contains = ["single-file CHD"]
+
+# --- Sun label, no VTOC -------------------------------------------------------
+
+[[case]]
+id = "roundtrip.label.sun-sunos413"
+description = "SunOS 4.1.3: five slices and a label that lives inside slice 0's first sector, so the head region is empty."
+fixture = "part.sun.sunos413-sparc.multipart"
+timeout_ms = 1800000
+[[case.step]]
+args = ["backup", "{fixture}", "{scratch}/bk", "--name", "job", "--format", "chd"]
+expect_exit = 0
+[[case.step]]
+args = ["restore", "{scratch}/bk/job", "{scratch}/out.img"]
+expect_exit = 0
+[[case.step]]
+# The label came back: still five untagged slices at the same offsets, and
+# still no sixth entry for the whole-disk alias.
+args = ["inspect", "{scratch}/out.img"]
+expect_exit = 0
+stdout_contains = ["Partition table: Sun", "Sun untagged (UFS?)", "62320", "2804400"]
+[[case.step]]
+args = ["fsck", "{scratch}/out.img@1", "--checkonly"]
+expect_exit = 0
+stdout_contains = ["853 files"]
+[[case.step]]
+args = ["fsck", "{scratch}/out.img@4", "--checkonly"]
+expect_exit = 0
+stdout_contains = ["12850 files"]
+
+# --- APM with a nested NeXT label ---------------------------------------------
+
+[[case]]
+id = "roundtrip.label.rhapsody12"
+description = "Rhapsody: the compact stream is the nested label's head region verbatim followed by the layout-preserving UFS, so the restore has to bring the label back with it."
+fixture = "part.apm.rhapsody12-nextlabel.multipart"
+timeout_ms = 1800000
+[[case.step]]
+args = ["backup", "{fixture}", "{scratch}/bk", "--name", "job", "--format", "chd"]
+expect_exit = 0
+[[case.step]]
+args = ["restore", "{scratch}/bk/job", "{scratch}/out.img"]
+expect_exit = 0
+[[case.step]]
+# Browsing the restored slice at all is the assertion: without the nested
+# label the UFS is 160 sectors away and this falls through to the carve view.
+args = ["ls", "{scratch}/out.img@3", "/"]
+expect_exit = 0
+stdout_contains = ["mach_kernel", "System", "private"]
+stdout_not_contains = ["whole-disk.img", "carved-blk"]
+[[case.step]]
+args = ["fsck", "{scratch}/out.img@3", "--checkonly"]
+expect_exit = 0
+stdout_contains = ["21135 files"]
+
+
+# --- SGI volume header --------------------------------------------------------
+
+[[case]]
+id = "roundtrip.label.sgi-riscos"
+description = "An `fx` disk describes several alternative layouts at once, so its slots overlap and the drive is imaged as one body with the slot table in sgi.json."
+fixture = "part.sgi.riscos-mips.multipart"
+timeout_ms = 1800000
+[[case.step]]
+args = ["backup", "{fixture}", "{scratch}/bk", "--name", "job", "--format", "chd"]
+expect_exit = 0
+[[case.step]]
+args = ["restore", "{scratch}/bk/job", "{scratch}/out.img"]
+expect_exit = 0
+[[case.step]]
+# All fourteen browsable slots back, at the same offsets — that is what proves
+# the volume header rode along inside the one body we imaged.
+args = ["inspect", "{scratch}/out.img"]
+expect_exit = 0
+stdout_contains = ["Partition table: SGI", "SGI BSD", "2520", "1533000", "VOLHDR"]
+[[case.step]]
+args = ["ls", "{scratch}/out.img@1", "/"]
+expect_exit = 0
+stdout_contains = ["lost+found", "usr", "etc"]
+
+# --- SGI disk label (pre-IRIX IRIS) -------------------------------------------
+
+[[case]]
+id = "roundtrip.label.sgi-dklabel-iris"
+description = "The IRIS 3130 disk label: three non-overlapping slots behind a 119-sector head, and the image is word-swapped — which the copy never has to know, because those bytes are never interpreted."
+fixture = "fs.efs-v1.populated-irix37.multipart"
+timeout_ms = 1200000
+[[case.step]]
+args = ["backup", "{fixture}", "{scratch}/bk", "--name", "job", "--format", "chd", "--sector-by-sector"]
+expect_exit = 0
+[[case.step]]
+args = ["restore", "{scratch}/bk/job", "{scratch}/out.img"]
+expect_exit = 0
+[[case.step]]
+# This one really is byte-for-byte: the slots are contiguous from the head to
+# the end of the last, so there is no gap for the assembler to zero-fill.
+args = ["inspect", "{scratch}/out.img"]
+expect_exit = 0
+stdout_contains = ["SGI-DkLabel (byte-swapped)", "SGI root (EFS v1)", "SGI swap"]
+files_identical = [["{fixture}", "{scratch}/out.img"]]
+[[case.step]]
+args = ["ls", "{scratch}/out.img@1", "/"]
+expect_exit = 0
+stdout_contains = ["vmunix", "defaultboot", "kernels"]
+
+[[case]]
+id = "roundtrip.label.sgi-refuses-per-partition"
+description = "A per-partition backup of an SGI-labeled disk is refused, and the message names the layout that works."
+fixture = "fs.efs-v1.populated-irix37.multipart"
+[[case.step]]
+args = ["backup", "{fixture}", "{scratch}/bk", "--name", "job", "--format", "zstd"]
+expect_exit = 1
+stderr_contains = ["single-file CHD"]
+
+
+# --- Amiga RDB ----------------------------------------------------------------
+
+[[case]]
+id = "roundtrip.label.rdb-workbench13"
+description = "AmigaDOS FFS behind an RDB. The reserved area holds RDSK, the PART chain and the FSHD/LSEG driver blocks — the exact thing a re-serialized table loses."
+fixture = "fs.affs.workbench13.hd"
+[[case.step]]
+args = ["backup", "{fixture}", "{scratch}/bk", "--name", "job", "--format", "chd", "--sector-by-sector"]
+expect_exit = 0
+[[case.step]]
+args = ["restore", "{scratch}/bk/job", "{scratch}/out.img"]
+expect_exit = 0
+files_identical = [["{fixture}", "{scratch}/out.img"]]
+[[case.step]]
+args = ["inspect", "{scratch}/out.img"]
+expect_exit = 0
+stdout_contains = ["Partition table: RDB", "AmigaDOS FFS (DH0)", "2020"]
+[[case.step]]
+args = ["ls", "{scratch}/out.img@1", "/"]
+expect_exit = 0
+stdout_contains = ["AmigaBASIC", "BasicDemos"]
+
+[[case]]
+id = "roundtrip.label.rdb-pfs3-compacted"
+description = "The same disk without --sector-by-sector: the body is compacted, so equality is not the expectation — a clean fsck is."
+fixture = "fs.affs.workbench13.hd"
+[[case.step]]
+args = ["backup", "{fixture}", "{scratch}/bk", "--name", "job", "--format", "chd"]
+expect_exit = 0
+[[case.step]]
+args = ["restore", "{scratch}/bk/job", "{scratch}/out.img"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{scratch}/out.img@1", "--checkonly"]
+expect_exit = 0
+stdout_contains = ["337 files"]
+
+[[case]]
+id = "roundtrip.label.rdb-refuses-per-partition"
+description = "A per-partition RDB backup used to succeed and then fail to restore. It is refused up front now."
+fixture = "fs.pfs3.rdb-cd32saves.hd"
+[[case.step]]
+args = ["backup", "{fixture}", "{scratch}/bk", "--name", "job", "--format", "zstd"]
+expect_exit = 1
+stderr_contains = ["single-file CHD"]
+[[case.step]]
+# And the CHD one it points at does work, on a PFS3 volume this time.
+args = ["backup", "{fixture}", "{scratch}/bk2", "--name", "job", "--format", "chd", "--sector-by-sector"]
+expect_exit = 0
+[[case.step]]
+args = ["restore", "{scratch}/bk2/job", "{scratch}/out.img"]
+expect_exit = 0
+files_identical = [["{fixture}", "{scratch}/out.img"]]
+[[case.step]]
+args = ["ls", "{scratch}/out.img@1", "/"]
+expect_exit = 0
+stdout_contains = ["WHDSaves"]
+
+# --- Atari AHDI ---------------------------------------------------------------
+
+[[case]]
+id = "roundtrip.label.ahdi-base"
+description = "Atari AHDI: the root sector at LBA 0 with two primaries. Backed up fine before this and then failed at restore with \"no MBR data available\"."
+fixture = "part.ahdi.base.multipart"
+[[case.step]]
+args = ["backup", "{fixture}", "{scratch}/bk", "--name", "job", "--format", "chd", "--sector-by-sector"]
+expect_exit = 0
+[[case.step]]
+args = ["restore", "{scratch}/bk/job", "{scratch}/out.img"]
+expect_exit = 0
+files_identical = [["{fixture}", "{scratch}/out.img"]]
+[[case.step]]
+args = ["inspect", "{scratch}/out.img"]
+expect_exit = 0
+stdout_contains = ["Partition table: AHDI", "AHDI GEM", "AHDI BGM"]
+
+[[case]]
+id = "roundtrip.label.ahdi-refuses-per-partition"
+description = "The per-partition layout is refused up front rather than producing a folder restore turns away."
+fixture = "part.ahdi.base.multipart"
+[[case.step]]
+args = ["backup", "{fixture}", "{scratch}/bk", "--name", "job", "--format", "zstd"]
+expect_exit = 1
+stderr_contains = ["single-file CHD"]

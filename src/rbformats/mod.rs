@@ -185,6 +185,7 @@ pub mod lz4;
 pub mod lzhuf;
 pub mod moof;
 pub mod ndif;
+pub mod next_mo;
 pub mod payload_slice;
 pub mod qcow2;
 #[cfg(test)]
@@ -334,19 +335,17 @@ pub fn reconstruct_disk_from_backup(
     let is_x68k = metadata.partition_table_type == "X68k";
 
     if is_rdb {
-        // Backup-folder restore for RDB-based Amiga disks is not yet wired
-        // up: backups save a parsed `rdb.json` sidecar but not the raw
-        // 512-byte RDSK/PART blocks, and re-serializing the parsed form
-        // without losing FSHD/LSEG driver chains and BADB lists needs a
-        // full RDB encoder we haven't written yet. For resize-aware
-        // export of an Amiga disk today, point the user at the
-        // direct-from-source path (Inspect tab -> Export raw/VHD), which
-        // routes through `reconstruct_raw_rdb_disk` and works end-to-end.
+        // Only a per-partition RDB backup reaches here, and one cannot be made
+        // any more: re-serializing `rdb.json` would lose the FSHD/LSEG driver
+        // chain and the BADB list, which needs an RDB encoder we have not
+        // written. A single-file-CHD backup keeps those blocks verbatim and
+        // restores through its own path, never this one.
         bail!(
-            "RDB-based Amiga disks cannot yet be restored from a backup folder. \
-             To resize an Amiga disk, export directly from the source image \
-             (Inspect tab -> Export to Raw or VHD with size overrides) — that \
-             path is RDB-aware and patches the partition table for you."
+            "this RDB-based Amiga backup is a per-partition one and cannot be \
+             restored: re-take it with CHD output, which keeps the RDSK/PART/FSHD \
+             blocks verbatim. To resize an Amiga disk, export directly from the \
+             source image (Inspect tab -> Export to Raw or VHD with size \
+             overrides) — that path is RDB-aware and patches the table for you."
         );
     } else if is_superfloppy {
         // Superfloppy: no partition table to write — data starts at offset 0
@@ -1424,6 +1423,9 @@ pub enum ImageFormat {
     /// MAME CD CHD — single-track MODE1, browsed via the cooked 2048-byte adapter.
     /// `logical_size` is `frames * 2048`.
     ChdCdCooked { path: PathBuf, logical_size: u64 },
+    /// NeXT magneto-optical media (`.od`) — 1296-byte ECC-coded sectors with a
+    /// spare-sector map. See [`next_mo`] for both.
+    NextMo(next_mo::MoGeometry),
 }
 
 impl ImageFormat {
@@ -1500,6 +1502,10 @@ impl ImageFormat {
             ImageFormat::ChdCdCooked { logical_size, .. } => {
                 format!("MAME CD CHD ({} bytes cooked MODE1)", logical_size)
             }
+            ImageFormat::NextMo(geo) => format!(
+                "NeXT magneto-optical media ({} bytes decoded)",
+                geo.logical_sectors * next_mo::DATA_SECTOR as u64
+            ),
         }
     }
 }
@@ -1554,6 +1560,16 @@ pub fn detect_image_format_with_path(file: File, path: Option<&Path>) -> Result<
                     });
                 }
             }
+        }
+    }
+
+    // 0a. NeXT magneto-optical media: 1296-byte ECC-coded sectors. The size
+    //     test is the cheap gate — 1296 = 16 * 81, so an ordinary power-of-two
+    //     image never divides by it — and a validating NeXT label in the
+    //     decoded stream is the confirmation.
+    if file_size % next_mo::RAW_SECTOR as u64 == 0 {
+        if let Some(geo) = next_mo::detect(&mut file) {
+            return Ok(ImageFormat::NextMo(geo));
         }
     }
 
@@ -1998,6 +2014,11 @@ pub fn wrap_image_reader(file: File, format: ImageFormat) -> Result<(BoxReadSeek
             let reader = chd::CdCookedReader::open_path(&path)?;
             Ok((Box::new(reader), logical_size))
         }
+        ImageFormat::NextMo(geo) => {
+            let reader = next_mo::NextMoReader::new(BufReader::new(file), geo);
+            let size = reader.len();
+            Ok((Box::new(reader), size))
+        }
     }
 }
 
@@ -2053,6 +2074,155 @@ impl<R: Read + Seek> Seek for SectionReader<R> {
         self.position = new_pos;
         Ok(self.position)
     }
+}
+
+/// The type name of a disk label `reconstruct_raw_label_disk` can rewrite:
+/// Sun, NeXT, both SGI schemes, AHDI and X68k. RDB and APM have their own paths.
+pub fn detect_raw_label(reader: &mut (impl Read + Seek)) -> Option<&'static str> {
+    let _ = reader.seek(SeekFrom::Start(0));
+    let table = crate::partition::PartitionTable::detect(reader).ok()?;
+    let _ = reader.seek(SeekFrom::Start(0));
+    let name = table.type_name();
+    (crate::partition::restore_patch::can_patch(name) && name != "RDB").then_some(name)
+}
+
+/// Export a disk-label image with size overrides: the head region is rewritten
+/// by `partition::restore_patch` and the bodies land where the label now says.
+/// The image keeps the source's size. Returns the bytes written.
+pub fn reconstruct_raw_label_disk(
+    reader: &mut (impl Read + Seek),
+    source_data_size: u64,
+    writer: &mut (impl Read + Write + Seek),
+    partition_sizes: &[PartitionSizeOverride],
+    progress_cb: &mut impl FnMut(u64),
+    cancel_check: &impl Fn() -> bool,
+    log_cb: &mut impl FnMut(&str),
+) -> Result<u64> {
+    use crate::fs::{in_place_resize_support, resize_filesystem_for, InPlaceResize};
+    use crate::partition::{restore_patch, PartitionTable};
+
+    reader.seek(SeekFrom::Start(0))?;
+    let table = PartitionTable::detect(reader).context("parse the partition table")?;
+    let name = table.type_name();
+    if !restore_patch::can_patch(name) || name == "RDB" {
+        bail!("{name} disks have no raw-export reconstruction");
+    }
+    let parts = table.partitions();
+    // Every partition takes part in the repack, override or not.
+    let mut overrides: Vec<PartitionSizeOverride> = Vec::with_capacity(parts.len());
+    for p in &parts {
+        match partition_sizes.iter().find(|o| o.index == p.index) {
+            Some(o) => overrides.push(o.clone()),
+            None => overrides.push(PartitionSizeOverride::size_only(
+                p.index,
+                p.start_lba,
+                p.size_bytes,
+                p.size_bytes,
+            )),
+        }
+    }
+    for o in &overrides {
+        let Some(p) = parts.iter().find(|p| p.index == o.index) else {
+            continue;
+        };
+        if o.export_size == p.size_bytes {
+            continue;
+        }
+        if let InPlaceResize::Unsupported(fs) =
+            in_place_resize_support(reader, p.byte_offset(), p.partition_type_string.as_deref())
+        {
+            bail!(
+                "partition-{} holds {fs}, which cannot be resized in place",
+                p.index
+            );
+        }
+    }
+    let head_len = parts
+        .iter()
+        .map(|p| p.byte_offset())
+        .min()
+        .unwrap_or(512)
+        .max(512)
+        .min(source_data_size);
+    let mut head = vec![0u8; head_len as usize];
+    reader.seek(SeekFrom::Start(0))?;
+    reader
+        .read_exact(&mut head)
+        .context("read the head region")?;
+    let patched =
+        restore_patch::patch_head_for_restore(name, &head, &overrides, source_data_size, log_cb)?;
+
+    let mut buf = vec![0u8; CHUNK_SIZE];
+    let mut written: u64 = 0;
+    for o in &patched.overrides {
+        if cancel_check() {
+            bail!("export cancelled");
+        }
+        let Some(p) = parts.iter().find(|p| p.index == o.index) else {
+            continue;
+        };
+        let dst = o.effective_start_lba() * 512;
+        let to_copy = p.size_bytes.min(o.export_size);
+        reader.seek(SeekFrom::Start(p.byte_offset()))?;
+        writer.seek(SeekFrom::Start(dst))?;
+        let mut left = to_copy;
+        while left > 0 {
+            if cancel_check() {
+                bail!("export cancelled");
+            }
+            let want = (left as usize).min(buf.len());
+            let n = reader
+                .read(&mut buf[..want])
+                .context("read partition body")?;
+            if n == 0 {
+                break;
+            }
+            writer
+                .write_all(&buf[..n])
+                .context("write partition body")?;
+            left -= n as u64;
+            written += n as u64;
+            progress_cb(written);
+        }
+        // A grown partition needs clean space for the resizer's tail structures.
+        let mut pad = o.export_size.saturating_sub(to_copy);
+        let zeros = vec![0u8; CHUNK_SIZE];
+        while pad > 0 {
+            let want = (pad as usize).min(zeros.len());
+            writer
+                .write_all(&zeros[..want])
+                .context("zero-fill grow region")?;
+            pad -= want as u64;
+        }
+    }
+    // The head lands after the bodies, so a label inside slice 0 still lands.
+    writer.seek(SeekFrom::Start(0))?;
+    writer
+        .write_all(&patched.head)
+        .context("write the rewritten head")?;
+    if source_data_size > 0 {
+        writer.seek(SeekFrom::Start(source_data_size - 1))?;
+        writer.write_all(&[0u8]).context("size the image")?;
+    }
+    writer.flush()?;
+    for o in &patched.overrides {
+        let Some(p) = parts.iter().find(|p| p.index == o.index) else {
+            continue;
+        };
+        let off = o.effective_start_lba() * 512;
+        if o.export_size != p.size_bytes {
+            resize_filesystem_for(writer, off, o.export_size, log_cb)
+                .with_context(|| format!("resize partition-{} filesystem", p.index))?;
+        }
+        patch_hidden_sectors_for(writer, off, o.effective_start_lba(), log_cb)
+            .with_context(|| format!("patch hidden sectors for partition-{}", p.index))?;
+    }
+    writer.flush()?;
+    log_cb(&format!(
+        "{name} label rewritten for {} partition(s); image kept at {source_data_size} bytes",
+        patched.overrides.len()
+    ));
+    Ok(source_data_size)
 }
 
 #[cfg(test)]
@@ -2347,5 +2517,92 @@ mod mbr_gap_restore_tests {
                 .any(|l| l.contains("between the MBR and the first partition")),
             "{log:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod label_export_tests {
+    use super::{detect_raw_label, reconstruct_raw_label_disk};
+    use crate::partition::provision::{self, Geometry, PartSpec};
+    use crate::partition::type_catalog::TableKind;
+    use crate::partition::{PartitionSizeOverride, PartitionTable};
+    use std::io::{Cursor, Read, Seek, SeekFrom};
+
+    const DISK: u64 = 64 * 1024 * 1024;
+
+    fn disk_of(kind: TableKind) -> Vec<u8> {
+        let geometry = Geometry::default();
+        let align = provision::default_align(kind, geometry);
+        let specs = vec![
+            PartSpec {
+                size: Some(16 * 1024 * 1024),
+                ..Default::default()
+            },
+            PartSpec {
+                size: None,
+                ..Default::default()
+            },
+        ];
+        let placed = provision::place(&specs, kind, DISK, align, geometry).unwrap();
+        let mut file = tempfile::tempfile().unwrap();
+        file.set_len(DISK).unwrap();
+        provision::write_table(&mut file, kind, &placed, DISK, geometry).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        bytes
+    }
+
+    /// A raw export with a size override rewrites the label and keeps the size.
+    #[test]
+    fn raw_export_rewrites_a_label_and_keeps_the_drive_size() {
+        for kind in [TableKind::Atari, TableKind::Sun, TableKind::X68k] {
+            let src = disk_of(kind);
+            let mut reader = Cursor::new(src.clone());
+            let name = detect_raw_label(&mut reader).expect("a patchable label");
+            let parts = PartitionTable::detect(&mut reader).unwrap().partitions();
+            let overrides = vec![PartitionSizeOverride::size_only(
+                parts[0].index,
+                parts[0].start_lba,
+                parts[0].size_bytes,
+                4 * 1024 * 1024,
+            )];
+            let mut out = Cursor::new(Vec::new());
+            let written = reconstruct_raw_label_disk(
+                &mut reader,
+                DISK,
+                &mut out,
+                &overrides,
+                &mut |_| {},
+                &|| false,
+                &mut |_| {},
+            )
+            .unwrap_or_else(|e| panic!("{name}: {e:#}"));
+            assert_eq!(written, DISK, "{name}");
+            let image = out.into_inner();
+            assert_eq!(image.len() as u64, DISK, "{name}: image length");
+            let after = PartitionTable::detect(&mut Cursor::new(image))
+                .unwrap()
+                .partitions();
+            assert_eq!(after.len(), 2, "{name}");
+            assert!(after[0].size_bytes < parts[0].size_bytes, "{name}: shrunk");
+            // A raw export keeps an untouched partition where it was, like the MBR path.
+            assert_eq!(after[1].start_lba, parts[1].start_lba, "{name}: untouched");
+            assert_eq!(
+                after[1].size_bytes, parts[1].size_bytes,
+                "{name}: untouched"
+            );
+        }
+    }
+
+    #[test]
+    fn an_mbr_disk_is_not_a_label() {
+        let mut mbr = vec![0u8; 4 * 1024 * 1024];
+        mbr[510] = 0x55;
+        mbr[511] = 0xAA;
+        mbr[450] = 0x83;
+        mbr[454..458].copy_from_slice(&1u32.to_le_bytes());
+        mbr[458..462].copy_from_slice(&4095u32.to_le_bytes());
+        assert!(detect_raw_label(&mut Cursor::new(mbr)).is_none());
     }
 }

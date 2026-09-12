@@ -968,6 +968,38 @@ fn compact_reader_for_detected<R: Read + Seek + Send + 'static>(
     }
 }
 
+/// Longest NeXT front porch we will carry verbatim in a compact stream. Real
+/// labels reserve 160-256 sectors; anything larger means the label is wrong.
+const MAX_NEXT_HEAD_BYTES: u64 = 1 << 20;
+
+/// A Rhapsody slice compacts as the NeXT label's head region verbatim followed
+/// by the layout-preserving UFS stream; every byte keeps its original offset.
+fn next_label_compact_reader<R: Read + Seek + Send + 'static>(
+    mut reader: R,
+    partition_offset: u64,
+) -> Option<(Box<dyn Read + Send>, CompactResult)> {
+    let fs_offset = resolve_next_label(&mut reader, partition_offset);
+    let head_len = fs_offset.checked_sub(partition_offset)?;
+    if head_len > MAX_NEXT_HEAD_BYTES {
+        return None;
+    }
+    let mut head = vec![0u8; head_len as usize];
+    if head_len > 0 {
+        reader.seek(SeekFrom::Start(partition_offset)).ok()?;
+        reader.read_exact(&mut head).ok()?;
+    }
+    let (compact, info) = CompactUfsReader::new(reader, fs_offset).ok()?;
+    Some((
+        Box::new(std::io::Cursor::new(head).chain(compact)),
+        CompactResult {
+            original_size: info.original_size + head_len,
+            compacted_size: info.compacted_size + head_len,
+            data_size: info.data_size + head_len,
+            clusters_used: info.clusters_used,
+        },
+    ))
+}
+
 /// HFS or HFS+ at the offset, as MBR type 0xAF and the Apple HFS GUID carry it.
 /// A wrapped HFS+ volume is left to the wrapper-aware clone path (`None`).
 fn apple_hfs_compact_reader<R: Read + Seek + Send + 'static>(
@@ -1025,23 +1057,8 @@ impl<R: Read> Read for ZeroPaddedReader<R> {
     }
 }
 
-/// Like `layout_preserving_partition_reader`, but for FAT/NTFS/exFAT it
-/// returns the *packed* compact reader (allocated clusters at the start,
-/// FS metadata shrunk to fit) padded with zeros up to `original_size`.
-///
-/// The resulting stream still has length == `original_size`, so it slots
-/// into the partition's extent inside a synthesised disk image without
-/// changing the partition table. Inside that extent, the OS sees a smaller
-/// FAT/NTFS/exFAT volume at offset 0 (BPB / boot sector reflects the
-/// shrunken total_sectors) followed by a zero-filled tail. CHD compresses
-/// the tail to nothing.
-///
-/// HFS/HFS+/ext/btrfs/ProDOS keep their existing layout-preserving stream
-/// (those readers are already byte-faithful at `original_size`).
-///
-/// Used by single-file CHD backup when not in sector-by-sector mode: the
-/// FAT-family partitions emerge defragmented in place, and the streaming
-/// pattern is sequential rather than seek-heavy.
+/// The partition's compact reader, zero-padded to `original_size` whenever it
+/// packs (FAT/NTFS/exFAT/Human68k); layout-preserving readers pass through.
 pub fn packed_partition_reader_padded<R: Read + Seek + Send + 'static>(
     mut reader: R,
     partition_offset: u64,
@@ -1049,64 +1066,48 @@ pub fn packed_partition_reader_padded<R: Read + Seek + Send + 'static>(
     partition_type_string: Option<&str>,
     keep_swap: bool,
 ) -> Option<(Box<dyn Read + Send>, CompactResult)> {
-    // APM and HFS/ext/btrfs/ProDOS go through the existing dispatcher —
-    // those readers are already layout-preserving (compacted_size ==
-    // original_size), so no padding is needed.
-    if partition_type_string.is_some() {
-        return compact_partition_reader(
-            reader,
-            partition_offset,
-            partition_type,
-            partition_type_string,
-            keep_swap,
-        );
-    }
-    match partition_type {
-        0x83 | 0xAF | 0xA8 => {
-            return compact_partition_reader(
+    // Padding keys on what the reader reports, not on how it was dispatched: a
+    // FAT behind type 0x83 (MSX) or a "human68k" type string packs too.
+    let (compact_reader, info): (Box<dyn Read + Send>, CompactResult) =
+        match (partition_type_string, partition_type) {
+            (Some(_), _) | (None, 0x83) | (None, 0xAF) | (None, 0xA8) => compact_partition_reader(
                 reader,
                 partition_offset,
                 partition_type,
                 partition_type_string,
                 keep_swap,
-            );
-        }
-        _ => {}
-    }
-
-    // For FAT/NTFS/exFAT: build the packed reader (compacted_size <
-    // original_size) and pad it with zeros to original_size.
-    let (compact_reader, info): (Box<dyn Read + Send>, CompactResult) = match partition_type {
-        0x00 => {
-            let fs_type = detect_filesystem_type(&mut reader, partition_offset);
-            match fs_type {
-                "fat" => fat_compact_reader(reader, partition_offset, keep_swap)?,
-                "ntfs" => ntfs_compact_reader(reader, partition_offset)?,
-                "exfat" => exfat_compact_reader(reader, partition_offset)?,
-                _ => {
-                    return compact_partition_reader(
+            )?,
+            (None, 0x00) => {
+                let fs_type = detect_filesystem_type(&mut reader, partition_offset);
+                match fs_type {
+                    "fat" => fat_compact_reader(reader, partition_offset, keep_swap)?,
+                    "ntfs" => ntfs_compact_reader(reader, partition_offset)?,
+                    "exfat" => exfat_compact_reader(reader, partition_offset)?,
+                    _ => compact_partition_reader(
                         reader,
                         partition_offset,
                         partition_type,
                         partition_type_string,
                         keep_swap,
-                    );
+                    )?,
                 }
             }
-        }
-        0x01 | 0x04 | 0x06 | 0x0E | 0x14 | 0x16 | 0x1E | 0x0B | 0x0C | 0x1B | 0x1C => {
-            fat_compact_reader(reader, partition_offset, keep_swap)?
-        }
-        0x07 => {
-            let fs_type = detect_0x07_type(&mut reader, partition_offset);
-            match fs_type {
-                "ntfs" => ntfs_compact_reader(reader, partition_offset)?,
-                "exfat" => exfat_compact_reader(reader, partition_offset)?,
-                _ => return None,
+            (None, 0x01 | 0x04 | 0x06 | 0x0E | 0x14 | 0x16 | 0x1E | 0x0B | 0x0C | 0x1B | 0x1C) => {
+                fat_compact_reader(reader, partition_offset, keep_swap)?
             }
-        }
-        _ => return None,
-    };
+            (None, 0x07) => {
+                let fs_type = detect_0x07_type(&mut reader, partition_offset);
+                match fs_type {
+                    "ntfs" => ntfs_compact_reader(reader, partition_offset)?,
+                    "exfat" => exfat_compact_reader(reader, partition_offset)?,
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
+    if info.compacted_size >= info.original_size {
+        return Some((compact_reader, info));
+    }
 
     let original_size = info.original_size;
     let compacted_size = info.compacted_size;
@@ -1132,6 +1133,19 @@ pub fn packed_partition_reader_padded<R: Read + Seek + Send + 'static>(
 ///
 /// Returns `None` if the filesystem type is unsupported or cannot be parsed,
 /// in which case the caller should fall back to the full partition size.
+/// Bytes a partition-embedded disk label stands ahead of the filesystem. Every
+/// partition-level size has to carry them; zero for every other partition type.
+fn embedded_label_bytes<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+    partition_type_string: Option<&str>,
+) -> u64 {
+    if partition_type_string != Some("Apple_Rhapsody_UFS") {
+        return 0;
+    }
+    resolve_next_label(reader, partition_offset).saturating_sub(partition_offset)
+}
+
 pub fn effective_partition_size<R: Read + Seek + Send + 'static>(
     reader: R,
     partition_offset: u64,
@@ -1157,11 +1171,12 @@ pub fn effective_partition_size<R: Read + Seek + Send + 'static>(
 /// missing from the metadata entirely, with nothing anywhere saying why. Give
 /// callers that can log a way to say what went wrong.
 pub fn effective_partition_size_reported<R: Read + Seek + Send + 'static>(
-    reader: R,
+    mut reader: R,
     partition_offset: u64,
     partition_type: u8,
     partition_type_string: Option<&str>,
 ) -> Result<u64, String> {
+    let head = embedded_label_bytes(&mut reader, partition_offset, partition_type_string);
     let mut fs = open_filesystem(
         reader,
         partition_offset,
@@ -1170,6 +1185,7 @@ pub fn effective_partition_size_reported<R: Read + Seek + Send + 'static>(
     )
     .map_err(|e| format!("cannot open filesystem: {e}"))?;
     fs.last_data_byte()
+        .map(|m| m + head)
         .map_err(|e| format!("last_data_byte failed: {e}"))
 }
 
@@ -1201,6 +1217,7 @@ pub fn defragmented_partition_size<R: Read + Seek + Send + 'static>(
     // real bound is enforced by the eventual resize plan.
     let wrapper_info =
         hfsplus_wrapper_clone::detect_wrapped_hfsplus(&mut reader, partition_offset, u64::MAX);
+    let head = embedded_label_bytes(&mut reader, partition_offset, partition_type_string);
     let mut fs = open_filesystem(
         reader,
         partition_offset,
@@ -1213,7 +1230,7 @@ pub fn defragmented_partition_size<R: Read + Seek + Send + 'static>(
         let plan = hfsplus_wrapper_clone::plan_wrapped_clone(&info, inner_min).ok()?;
         Some(plan.new_partition_size)
     } else {
-        Some(inner_min)
+        Some(inner_min + head)
     }
 }
 
@@ -1267,6 +1284,8 @@ pub fn fs_name_for(partition_type: u8, partition_type_string: Option<&str>) -> &
             // Apple APFS GPT partition GUID.
             "7C3457EF-0000-11AA-AA11-00306543ECAC" => "APFS",
             "Apple_UNIX_SVR2" => "ext/btrfs/xfs/reiserfs/UFS/JFS",
+            // Mac OS X Server 1.x / Rhapsody, behind a NeXT disk label.
+            "Apple_Rhapsody_UFS" => "UFS",
             "Linux" => "ext/btrfs/xfs/reiserfs/UFS/JFS",
             // GPT Linux Filesystem / Linux Home GUIDs.
             "0FC63DAF-8483-4772-8E79-3D69D8477DE4" | "933AC7E1-2EB4-4F13-B844-0E14E2AEF915" => {
@@ -1340,6 +1359,7 @@ pub fn is_layout_preserving_fs(partition_type: u8, partition_type_string: Option
                 | "Apple_HFS+"
                 | "Apple_UNIX_SVR2"
                 | "Apple_UNIX_SRVR2"
+                | "Apple_Rhapsody_UFS"
                 | "Apple_PRODOS"
                 | "Apple_ProDOS"
                 | "Linux"
@@ -1429,6 +1449,8 @@ pub fn is_expensive_minimum(partition_type: u8, partition_type_string: Option<&s
             "Apple_HFS"
                 | "Apple_HFSX"
                 | "Apple_UNIX_SVR2"
+                // Rhapsody: a UFS bitmap walk, same cost as the SVR2 slices.
+                | "Apple_Rhapsody_UFS"
                 | "Linux"
                 | "48465300-0000-11AA-AA11-00306543ECAC"
                 | "0FC63DAF-8483-4772-8E79-3D69D8477DE4"
@@ -1544,6 +1566,7 @@ pub fn partition_minimum_size_cancellable<R: Read + Seek + Send + 'static>(
         progress("Cancelled");
         return cancelled();
     }
+    let label_head = embedded_label_bytes(&mut reader, partition_offset, partition_type_string);
     progress("Opening filesystem...");
     let mut fs = match open_filesystem_sized(
         reader,
@@ -1573,7 +1596,10 @@ pub fn partition_minimum_size_cancellable<R: Read + Seek + Send + 'static>(
         return cancelled();
     }
     progress("Computing last data byte...");
-    let in_place = fs.last_data_byte().ok().map(|m| m.min(partition_size));
+    let in_place = fs
+        .last_data_byte()
+        .ok()
+        .map(|m| (m + label_head).min(partition_size));
     if cancel() {
         progress("Cancelled");
         return cancelled();
@@ -1629,7 +1655,7 @@ pub fn partition_minimum_size_cancellable<R: Read + Seek + Send + 'static>(
                     return None;
                 }
             },
-            None => m,
+            None => m + label_head,
         };
         let clamped = partition_level.min(partition_size);
         progress(&format!(
@@ -2196,6 +2222,11 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                     ))),
                 };
             }
+            // Rhapsody's NeXT label fronts the UFS; see the read path's arm.
+            "Apple_Rhapsody_UFS" => {
+                let fs_offset = resolve_next_label(&mut reader, partition_offset);
+                return Ok(Box::new(ufs::UfsFilesystem::open(reader, fs_offset)?));
+            }
             "Apple_PRODOS" | "Apple_ProDOS" => {
                 return Ok(Box::new(prodos::ProDosFilesystem::open(
                     reader,
@@ -2680,6 +2711,12 @@ fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
                 ))),
             }
         }
+        // Mac OS X Server 1.x / Rhapsody: a NeXT disk label fronts the UFS, so
+        // the filesystem starts past the label's front porch, not at LBA 0.
+        "Apple_Rhapsody_UFS" => {
+            let fs_offset = resolve_next_label(&mut reader, partition_offset);
+            open_filesystem_with_passphrase(reader, fs_offset, 0x00, None, passphrase)
+        }
         "Apple_PRODOS" | "Apple_ProDOS" => Ok(Box::new(prodos::ProDosFilesystem::open(
             reader,
             partition_offset,
@@ -2903,6 +2940,8 @@ fn compact_partition_reader_by_string<R: Read + Seek + Send + 'static>(
                 _ => Ok(None),
             }
         }
+        // Rhapsody's NeXT label rides in front of the UFS; see the read path's arm.
+        "Apple_Rhapsody_UFS" => Ok(next_label_compact_reader(reader, partition_offset)),
         "Apple_PRODOS" | "Apple_ProDOS" => {
             let (compact, info) =
                 CompactProDosReader::new(reader, partition_offset).map_err(|e| {
@@ -3045,6 +3084,8 @@ pub fn is_browsable_type_string(type_str: Option<&str>) -> bool {
             | "Be_BFS"
             | "Apple_UNIX_SVR2"
             | "Apple_UNIX_SRVR2"
+            // Mac OS X Server 1.x / Rhapsody UFS, behind a NeXT disk label.
+            | "Apple_Rhapsody_UFS"
             | "Apple_PRODOS"
             | "Apple_ProDOS"
             // GPT "Linux Filesystem" GUID — ext, btrfs, or xfs at runtime.
@@ -3265,7 +3306,10 @@ pub fn is_checkable_type(ptype: u8, type_str: Option<&str>) -> bool {
     if matches!(ptype, 0x80 | 0x81 | 0xA5 | 0xA6 | 0xA9 | 0xBF | 0xEB)
         || matches!(
             type_str,
-            Some("Apple_UNIX_SVR2") | Some("Apple_UNIX_SRVR2") | Some("Be_BFS")
+            Some("Apple_UNIX_SVR2")
+                | Some("Apple_UNIX_SRVR2")
+                | Some("Be_BFS")
+                | Some("Apple_Rhapsody_UFS")
         )
     {
         return true;
@@ -3412,6 +3456,14 @@ fn hfsplus_partition_len(
     } else {
         None
     }
+}
+
+/// Where a partition that opens with a NeXT disk label keeps its filesystem;
+/// `partition_offset` unchanged when there is none. See `src/partition/next.rs`.
+pub fn resolve_next_label(reader: &mut (impl Read + Seek), partition_offset: u64) -> u64 {
+    crate::partition::next::detect_at(reader, partition_offset)
+        .and_then(|l| crate::partition::next::embedded_fs_offset(&l, partition_offset))
+        .unwrap_or(partition_offset)
 }
 
 /// Resolve the actual HFS filesystem variant for an "Apple_HFS" APM partition.
@@ -4726,6 +4778,140 @@ mod min_size_cancel_tests {
                 ..
             }
         ));
+    }
+}
+
+#[cfg(test)]
+mod rhapsody_dispatch_tests {
+    use super::*;
+    use crate::fs::ufs::UfsEndian;
+    use crate::fs::ufs_format::{create_blank_ufs1, Ufs1FormatParams};
+    use crate::partition::next::{build_label, NextLabelSpec, NextPartitionSpec, LABEL_BLOCKS};
+    use std::io::Cursor;
+
+    const SECTOR: u64 = 1024;
+    const FRONT: u64 = 160;
+    const UFS_BYTES: u64 = 8 * 1024 * 1024;
+
+    /// A Rhapsody slice: a NeXT label in its first sectors, then the UFS.
+    /// `p_base` is recorded from the disk origin, as Rhapsody writes it.
+    fn rhapsody_slice(slice_offset: u64) -> Vec<u8> {
+        let mut spec = NextLabelSpec {
+            front_porch: FRONT as u16,
+            ..Default::default()
+        };
+        spec.partitions = vec![
+            Some(NextPartitionSpec {
+                base: (slice_offset / SECTOR) as i32,
+                size: (UFS_BYTES / SECTOR) as i32,
+                block_size: 4096,
+                fs_type: "4.4BSD".to_string(),
+                ..Default::default()
+            }),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ];
+        let label = build_label(&spec);
+        let mut disk = vec![0u8; (slice_offset + FRONT * SECTOR + UFS_BYTES) as usize];
+        for &block in LABEL_BLOCKS.iter() {
+            let at = (slice_offset + block * 512) as usize;
+            disk[at..at + label.len()].copy_from_slice(&label);
+        }
+        let ufs = create_blank_ufs1(&Ufs1FormatParams {
+            size_bytes: UFS_BYTES,
+            block_size: 4096,
+            endian: UfsEndian::Big,
+            ..Default::default()
+        })
+        .expect("format a blank UFS1");
+        let at = (slice_offset + FRONT * SECTOR) as usize;
+        disk[at..at + ufs.len()].copy_from_slice(&ufs);
+        disk
+    }
+
+    #[test]
+    fn rhapsody_slice_opens_past_the_nested_label() {
+        let slice_offset = 18952 * 512;
+        let disk = rhapsody_slice(slice_offset);
+        let fs = open_filesystem(
+            Cursor::new(disk),
+            slice_offset,
+            0,
+            Some("Apple_Rhapsody_UFS"),
+        )
+        .expect("open the UFS behind the label");
+        assert_eq!(fs.fs_type(), "UFS1");
+    }
+
+    /// Compaction has to start at the slice, not at the filesystem: the head
+    /// region is what the NeXT label lives in, and dropping it loses the label.
+    #[test]
+    fn rhapsody_compaction_keeps_the_label_and_spans_the_whole_slice() {
+        let slice_offset = 18952 * 512;
+        let disk = rhapsody_slice(slice_offset);
+        let head: Vec<u8> =
+            disk[slice_offset as usize..(slice_offset + FRONT * SECTOR) as usize].to_vec();
+        let (mut reader, info) = compact_partition_reader(
+            Cursor::new(disk),
+            slice_offset,
+            0,
+            Some("Apple_Rhapsody_UFS"),
+            true,
+        )
+        .expect("a compact reader for the slice");
+        assert_eq!(
+            info.compacted_size,
+            FRONT * SECTOR + UFS_BYTES,
+            "layout-preserving: the stream is the whole slice"
+        );
+        assert!(
+            info.data_size < info.compacted_size,
+            "free blocks are zeros"
+        );
+        let mut got = vec![0u8; head.len()];
+        reader.read_exact(&mut got).unwrap();
+        assert_eq!(got, head, "the label rides at the front of the stream");
+    }
+
+    #[test]
+    fn rhapsody_is_layout_preserving() {
+        assert!(is_layout_preserving_fs(0, Some("Apple_Rhapsody_UFS")));
+        assert_eq!(fs_name_for(0, Some("Apple_Rhapsody_UFS")), "UFS");
+        assert!(is_checkable_type(0, Some("Apple_Rhapsody_UFS")));
+    }
+
+    /// The minimum is a partition-level size, so it has to include the label
+    /// the filesystem sits behind — shrink to the filesystem's own answer and
+    /// the last 160 KiB of it falls off the end of the slice.
+    #[test]
+    fn rhapsody_minimum_counts_the_label_head() {
+        let slice_offset = 18952 * 512;
+        let disk = rhapsody_slice(slice_offset);
+        let slice_len = FRONT * SECTOR + UFS_BYTES;
+        let result = partition_minimum_size(
+            Cursor::new(disk),
+            slice_offset,
+            0,
+            Some("Apple_Rhapsody_UFS"),
+            slice_len,
+            true,
+            None,
+            &|_| {},
+        );
+        let MinimumResult::Computed { in_place, .. } = result else {
+            panic!("expected a computed minimum");
+        };
+        let min = in_place.expect("UFS reports a last data byte");
+        assert!(
+            min > FRONT * SECTOR,
+            "minimum {min} must clear the {} byte label head",
+            FRONT * SECTOR
+        );
     }
 }
 

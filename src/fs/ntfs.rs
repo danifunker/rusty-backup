@@ -5173,6 +5173,54 @@ pub fn resize_ntfs_in_place(
     Ok(true)
 }
 
+/// Rewrite the backup boot sector (the sector after the volume) when it no
+/// longer matches the VBR; a packed stream ends before it. Ok(true) if written.
+pub fn ensure_backup_boot_sector(
+    file: &mut (impl Read + Write + Seek),
+    partition_offset: u64,
+    log_cb: &mut impl FnMut(&str),
+) -> Result<bool> {
+    let mut probe = [0u8; 512];
+    file.seek(SeekFrom::Start(partition_offset))?;
+    file.read_exact(&mut probe)?;
+    if &probe[3..11] != b"NTFS    " {
+        return Ok(false);
+    }
+    let bytes_per_sector = u16::from_le_bytes([probe[0x0B], probe[0x0C]]) as u64;
+    if !(512..=4096).contains(&bytes_per_sector) {
+        return Ok(false);
+    }
+    let total_sectors = u64::from_le_bytes([
+        probe[0x28],
+        probe[0x29],
+        probe[0x2A],
+        probe[0x2B],
+        probe[0x2C],
+        probe[0x2D],
+        probe[0x2E],
+        probe[0x2F],
+    ]);
+    let mut vbr = vec![0u8; bytes_per_sector as usize];
+    file.seek(SeekFrom::Start(partition_offset))?;
+    file.read_exact(&mut vbr)?;
+    let backup_offset = partition_offset + total_sectors * bytes_per_sector;
+    let mut backup = vec![0u8; bytes_per_sector as usize];
+    file.seek(SeekFrom::Start(backup_offset))?;
+    match file.read_exact(&mut backup) {
+        Ok(()) if backup == vbr => return Ok(false),
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
+        Err(e) => return Err(e.into()),
+    }
+    file.seek(SeekFrom::Start(backup_offset))?;
+    file.write_all(&vbr)?;
+    log_cb(&format!(
+        "NTFS: rewrote the backup boot sector at sector {}",
+        total_sectors
+    ));
+    Ok(true)
+}
+
 /// Helper to read the last used cluster from $Bitmap.
 fn read_last_used_cluster_from_bitmap(
     file: &mut (impl Read + Seek),
@@ -7052,5 +7100,41 @@ mod tests {
         );
 
         assert!(matches!(result, Err(FilesystemError::AlreadyExists(_))));
+    }
+}
+
+#[cfg(test)]
+mod backup_boot_sector_tests {
+    use super::ensure_backup_boot_sector;
+    use std::io::{Cursor, Read, Seek, SeekFrom};
+
+    /// A packed stream ends before the backup boot sector; the helper puts it
+    /// back, and does nothing once it matches the VBR.
+    #[test]
+    fn rewrites_a_missing_backup_boot_sector_then_leaves_it_alone() {
+        let size = 32 * 1024 * 1024u64;
+        let mut img = Cursor::new(vec![0u8; size as usize]);
+        crate::fs::ntfs_format::create_blank_ntfs(&mut img, size, 64, Some("B")).unwrap();
+        let mut vbr = [0u8; 512];
+        img.seek(SeekFrom::Start(0)).unwrap();
+        img.read_exact(&mut vbr).unwrap();
+        let total = u64::from_le_bytes(vbr[0x28..0x30].try_into().unwrap());
+        let backup_at = (total * 512) as usize;
+        assert_eq!(&img.get_ref()[backup_at..backup_at + 512], &vbr[..]);
+
+        img.get_mut()[backup_at..backup_at + 512].fill(0);
+        let mut logged = Vec::new();
+        assert!(
+            ensure_backup_boot_sector(&mut img, 0, &mut |m| logged.push(m.to_string())).unwrap()
+        );
+        assert_eq!(&img.get_ref()[backup_at..backup_at + 512], &vbr[..]);
+        assert_eq!(logged.len(), 1);
+        assert!(!ensure_backup_boot_sector(&mut img, 0, &mut |_| {}).unwrap());
+    }
+
+    #[test]
+    fn ignores_a_volume_that_is_not_ntfs() {
+        let mut img = Cursor::new(vec![0u8; 1024 * 1024]);
+        assert!(!ensure_backup_boot_sector(&mut img, 0, &mut |_| {}).unwrap());
     }
 }

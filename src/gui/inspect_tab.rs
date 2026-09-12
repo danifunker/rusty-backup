@@ -2104,6 +2104,12 @@ impl InspectTab {
         use rusty_backup::backup::single_file_chd;
         let table = self.partition_table.clone()?;
         if !single_file_chd::is_supported(&table) {
+            if self.export_picker_has_resize() {
+                ctx.log.warn(format!(
+                    "{} sources cannot be resized on export; the disk is exported as-is",
+                    table.type_name()
+                ));
+            }
             return None;
         }
         let partitions = self.partitions.clone();

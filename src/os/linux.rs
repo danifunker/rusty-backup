@@ -5,9 +5,39 @@ use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use nix::mount::{umount2, MntFlags};
 
 use crate::device::{DiskDevice, MountedPartition};
+
+/// The POSIX calls this module needs, through `libc` rather than `nix`, which
+/// the mrustc manifests cannot carry. See docs/build-ppc-mrustc.md "No nix".
+mod sys {
+    /// `umount2(2)`; `detach` picks the lazy `MNT_DETACH`. True when it worked.
+    pub fn umount(mount_point: &str, detach: bool) -> bool {
+        let c_path = match std::ffi::CString::new(mount_point) {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        let flags = if detach { libc::MNT_DETACH } else { 0 };
+        unsafe { libc::umount2(c_path.as_ptr(), flags) == 0 }
+    }
+
+    pub fn is_root() -> bool {
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    pub fn real_uid() -> u32 {
+        unsafe { libc::getuid() }
+    }
+
+    pub fn real_gid() -> u32 {
+        unsafe { libc::getgid() }
+    }
+
+    /// `umask(0)`, so an elevated run leaves files the real user can still read.
+    pub fn clear_umask() {
+        unsafe { libc::umask(0) };
+    }
+}
 
 /// A parsed entry from `/proc/self/mountinfo`.
 struct MountInfoEntry {
@@ -312,8 +342,8 @@ pub fn open_target_for_writing(path: &Path) -> Result<File> {
 /// Unmount `mount_point` for real; fall back to a lazy detach only when it
 /// is busy, so at least new opens stop landing on the old filesystem.
 fn unmount_now_or_lazily(mount_point: &str) {
-    if umount2(mount_point, MntFlags::empty()).is_err() {
-        let _ = umount2(mount_point, MntFlags::MNT_DETACH);
+    if !sys::umount(mount_point, false) {
+        let _ = sys::umount(mount_point, true);
     }
 }
 
@@ -372,6 +402,14 @@ pub fn parent_device_name(partition_name: &str) -> String {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+
+    /// A path with an interior NUL must be refused before it reaches umount2,
+    /// not panic: `nix` rejected these too, via its own CString conversion.
+    #[test]
+    fn umount_refuses_a_path_with_an_interior_nul() {
+        assert!(!sys::umount("/mnt/\0evil", false));
+        assert!(!sys::umount("/mnt/\0evil", true));
+    }
 
     #[test]
     fn elevation_target_prefers_appimage_over_fuse_mount() {
@@ -507,7 +545,7 @@ impl LinuxDiskAccess {
 impl PrivilegedDiskAccess for LinuxDiskAccess {
     fn check_status(&self) -> Result<AccessStatus> {
         // Check if we're running as root
-        if nix::unistd::geteuid().is_root() {
+        if sys::is_root() {
             Ok(AccessStatus::Ready)
         } else {
             Ok(AccessStatus::NeedsElevation)
@@ -688,8 +726,8 @@ pub fn relaunch_with_elevation() -> Result<()> {
     if let Ok(user) = std::env::var("USER") {
         env_args.push(format!("SUDO_USER={}", user));
     }
-    env_args.push(format!("SUDO_UID={}", nix::unistd::getuid()));
-    env_args.push(format!("SUDO_GID={}", nix::unistd::getgid()));
+    env_args.push(format!("SUDO_UID={}", sys::real_uid()));
+    env_args.push(format!("SUDO_GID={}", sys::real_gid()));
 
     // Use "env" to inject variables. Exec replaces current process — never
     // returns on success.
@@ -709,7 +747,7 @@ pub fn relaunch_with_elevation() -> Result<()> {
 /// through so we can resolve the original user's home. Falls back to
 /// `dirs::home_dir()` if not elevated or if env vars aren't set.
 pub fn real_user_home() -> Option<PathBuf> {
-    if !nix::unistd::geteuid().is_root() {
+    if !sys::is_root() {
         return dirs::home_dir();
     }
     // HOME was passed through pkexec env wrapper
@@ -735,8 +773,8 @@ pub fn real_user_home() -> Option<PathBuf> {
 /// Sets umask to 000 so files are created with mode 666 and directories with
 /// mode 777. The real security boundary is the pkexec prompt itself.
 pub fn set_permissive_umask_if_elevated() {
-    if nix::unistd::geteuid().is_root() {
-        nix::sys::stat::umask(nix::sys::stat::Mode::empty());
+    if sys::is_root() {
+        sys::clear_umask();
     }
 }
 

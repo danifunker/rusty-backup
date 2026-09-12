@@ -938,7 +938,13 @@ pub fn export_whole_disk_vhd(
             let (mut probe2, _) = open_decoded()?;
             super::detect_raw_rdb(&mut probe2).is_some()
         };
-        if is_apm || is_rdb {
+        let label = if is_apm || is_rdb {
+            None
+        } else {
+            let (mut probe3, _) = open_decoded()?;
+            super::detect_raw_label(&mut probe3)
+        };
+        if is_apm || is_rdb || label.is_some() {
             let (mut reader, source_data_size) = open_decoded()?;
             let mut file = std::fs::OpenOptions::new()
                 .read(true)
@@ -958,13 +964,23 @@ pub fn export_whole_disk_vhd(
                     &cancel_check,
                     &mut log_cb,
                 )?
-            } else {
+            } else if is_rdb {
                 super::reconstruct_raw_rdb_disk(
                     &mut reader,
                     source_data_size,
                     &mut file,
                     partition_sizes,
                     Some(source_path),
+                    &mut progress_cb,
+                    &cancel_check,
+                    &mut log_cb,
+                )?
+            } else {
+                super::reconstruct_raw_label_disk(
+                    &mut reader,
+                    source_data_size,
+                    &mut file,
+                    partition_sizes,
                     &mut progress_cb,
                     &cancel_check,
                     &mut log_cb,
@@ -976,7 +992,13 @@ pub fn export_whole_disk_vhd(
                 .context("failed to write VHD footer")?;
             file.flush()?;
 
-            let table_kind = if is_apm { "APM" } else { "RDB" };
+            let table_kind = if is_apm {
+                "APM"
+            } else if is_rdb {
+                "RDB"
+            } else {
+                label.unwrap_or("label")
+            };
             log_cb(&format!(
                 "VHD export complete: {} ({} data bytes + 512 byte footer, {} reconstructed)",
                 dest_path.display(),

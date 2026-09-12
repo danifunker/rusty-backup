@@ -1,0 +1,91 @@
+# Tier 5 — a CHD is a whole disk.
+#
+# `backup --format chd` writes exactly one `<name>.chd` holding the whole disk,
+# or refuses. Until 2026-09-11 a table the single-file layout could not
+# assemble (X68k, double-sided DFS) fell through to the per-partition loop and
+# wrote `partition-N.chd`: a CHD of one partition is not a disk image, and for
+# a `.dsd` the two of them were not even restorable. X68k has since joined the
+# single-file layout (see chd-label-resize.toml); a `.dsd` stays refused.
+#
+# The second half pins what an as-is restore of a single-file CHD does with a
+# packed body. The packed FAT/NTFS/exFAT reader shrinks the volume to its
+# used extent and zero-fills the rest of the partition, so the CHD carries a
+# 15 MB partition holding an 8 MB FAT16. The restore grows the volume back to
+# its partition, as the per-partition layout always did, and for NTFS that
+# includes the backup boot sector the packed stream stops short of.
+
+[meta]
+tier = 5
+group = "chd.rule"
+description = "CHD output is one whole-disk image or a refusal, and a packed body grows back on restore."
+
+# --- refusals ------------------------------------------------------------------
+
+[[case]]
+id = "chd.rule.dsd-backup-refused"
+description = "A double-sided DFS image is two track-interleaved sides in one file and no restore can put them back, so backup refuses it in every format."
+fixture = "fs.dfs.double-sided.floppy"
+[[case.step]]
+args = ["backup", "{fixture}", "{scratch}/bk", "--name", "job", "--format", "zstd"]
+expect_exit = 1
+stderr_contains = ["cannot be backed up"]
+[[case.step]]
+args = ["backup", "{fixture}", "{scratch}/bk", "--name", "job", "--format", "chd"]
+expect_exit = 1
+stderr_contains = ["cannot be backed up"]
+[[case.step]]
+# The file is still fully usable; copying it is its backup.
+args = ["ls", "{fixture}@1", "/"]
+expect_exit = 0
+
+# --- a packed body grows back ---------------------------------------------------
+
+[[case]]
+id = "chd.rule.mbr-fat-grows-back-on-restore"
+description = "A FAT16 partition packed to 8 MB inside its 15 MB extent comes back filling the partition, byte-identical to the source."
+[[case.step]]
+args = ["new", "volume", "fat", "{scratch}/v.img", "--size", "15M"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/v.img", "{cases}/tier3/payload.bin", "/PAYLOAD.BIN"]
+expect_exit = 0
+[[case.step]]
+args = ["new", "hd", "mbr", "{scratch}/m.img", "--size", "16M", "--partition", "rest:0x06", "--fill", "1={scratch}/v.img"]
+expect_exit = 0
+[[case.step]]
+args = ["backup", "{scratch}/m.img", "{scratch}/bk", "--name", "job", "--format", "chd"]
+expect_exit = 0
+[[case.step]]
+args = ["restore", "{scratch}/bk/job", "{scratch}/out.img"]
+expect_exit = 0
+files_identical = [["{scratch}/m.img", "{scratch}/out.img"]]
+
+[[case]]
+id = "chd.rule.ntfs-backup-boot-sector-restored"
+description = "The packed NTFS stream stops one sector before the backup boot sector; both layouts must put it back, or fsck flags the volume."
+[[case.step]]
+args = ["new", "volume", "ntfs", "{scratch}/n.img", "--size", "20M"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{scratch}/n.img", "{cases}/tier3/payload.bin", "/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["backup", "{scratch}/n.img", "{scratch}/bkc", "--name", "job", "--format", "chd"]
+expect_exit = 0
+[[case.step]]
+args = ["restore", "{scratch}/bkc/job", "{scratch}/outc.img"]
+expect_exit = 0
+files_identical = [["{scratch}/n.img", "{scratch}/outc.img"]]
+[[case.step]]
+args = ["fsck", "{scratch}/outc.img", "--checkonly"]
+expect_exit = 0
+[[case.step]]
+args = ["backup", "{scratch}/n.img", "{scratch}/bkz", "--name", "job", "--format", "zstd"]
+expect_exit = 0
+[[case.step]]
+args = ["restore", "{scratch}/bkz/job", "{scratch}/outz.img"]
+expect_exit = 0
+files_identical = [["{scratch}/n.img", "{scratch}/outz.img"]]
+[[case.step]]
+args = ["fsck", "{scratch}/outz.img", "--checkonly"]
+expect_exit = 0

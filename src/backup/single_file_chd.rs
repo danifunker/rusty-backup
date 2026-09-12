@@ -6,12 +6,17 @@
 //!
 //! Scope of the initial implementation (intentionally bounded):
 //!
-//! - **MBR / GPT / APM sources supported.** GPT rebuilds the primary header
-//!   at LBA 1 and the backup header at the last 33 LBAs from the parsed
-//!   `Gpt` so any tweaks the parser normalises (e.g. CRCs) are reflected
-//!   in the synthesised image. APM reads the disk's head region (DDR +
-//!   partition map + drivers) verbatim from the source up to the first
-//!   real partition.
+//! - **MBR / GPT / APM / Sun / NeXT / SGI sources supported.** GPT rebuilds the
+//!   primary header at LBA 1 and the backup header at the last 33 LBAs from
+//!   the parsed `Gpt` so any tweaks the parser normalises (e.g. CRCs) are
+//!   reflected in the synthesised image. APM reads the disk's head region
+//!   (DDR, partition map, drivers) verbatim from the source up to the first
+//!   real partition. The disk-label schemes — Sun, NeXT, both SGI ones — have
+//!   no writer that could patch them for a resize, so their head region goes
+//!   out byte for byte and a resize is refused; a SunOS root slice starts at
+//!   cylinder 0 and carries the label in its own first sector, so there the
+//!   head is empty already. An Amiga RDB rides the same path — its RDSK, PART,
+//!   FSHD and LSEG blocks are exactly what a re-serialized table would lose.
 //! - **Backup-time resize supported.** When the caller passes
 //!   `resize_targets`, partitions get their new sizes via the same
 //!   `PartitionResizePlan` + `PartitionSizeOverride` machinery the restore
@@ -200,15 +205,74 @@ pub fn estimate_export_disk_usage(
     }
 }
 
-/// True if `inputs` describes a source layout we can currently handle in
-/// single-file CHD mode. MBR / GPT / APM are supported; superfloppy is
-/// rejected at the GUI layer (CHD output requires a partition table to
-/// embed at sector 0).
+/// True if `inputs` describes a source layout the single-file CHD pipeline
+/// can assemble. A partitionless volume is one body from byte 0 with no head.
 pub fn is_supported(inputs_table: &PartitionTable) -> bool {
     matches!(
         inputs_table,
-        PartitionTable::Mbr(_) | PartitionTable::Gpt { .. } | PartitionTable::Apm(_)
+        PartitionTable::Mbr(_)
+            | PartitionTable::Gpt { .. }
+            | PartitionTable::Apm(_)
+            | PartitionTable::Sun(_)
+            | PartitionTable::Next(_)
+            | PartitionTable::Sgi(_)
+            | PartitionTable::SgiDkLabel(_)
+            | PartitionTable::Rdb(_)
+            | PartitionTable::Ahdi(_)
+            | PartitionTable::X68k { .. }
+            | PartitionTable::None { .. }
     )
+}
+
+/// Schemes whose whole head region (label, boot blocks, front porch, SGI
+/// volume header, Amiga RDSK/PART/FSHD chain, X68k IPL) is copied through
+/// verbatim; a resize is applied on restore by `partition::restore_patch`.
+fn is_verbatim_head_scheme(table: &PartitionTable) -> bool {
+    matches!(
+        table,
+        PartitionTable::Sun(_)
+            | PartitionTable::Next(_)
+            | PartitionTable::Sgi(_)
+            | PartitionTable::SgiDkLabel(_)
+            | PartitionTable::Rdb(_)
+            | PartitionTable::Ahdi(_)
+            | PartitionTable::X68k { .. }
+    )
+}
+
+/// An RDB's RDSK / PART / FSHD / LSEG chain has to sit inside the head region:
+/// a compacted partition body zero-fills free blocks, so anything past it goes.
+fn verify_head_covers_label(table: &PartitionTable, head_len: u64) -> Result<()> {
+    if let PartitionTable::Rdb(rdb) = table {
+        let need = (rdb.header.rdb_blk_hi as u64 + 1) * 512;
+        if need > head_len {
+            anyhow::bail!(
+                "the RDB reserves blocks through {} but the first partition starts at \
+                 byte {head_len}; backing this disk up would drop part of the \
+                 RDSK/PART/FSHD chain",
+                rdb.header.rdb_blk_hi,
+            );
+        }
+    }
+    if let PartitionTable::X68k { sector_size, .. } = table {
+        use crate::partition::x68k::{
+            X68K_ENTRY_SIZE, X68K_MAX_PARTITIONS, X68K_TABLE_HEADER_SIZE, X68K_TABLE_OFFSET,
+            X68K_TABLE_OFFSET_SASI,
+        };
+        let table_off = if *sector_size == 256 {
+            X68K_TABLE_OFFSET_SASI
+        } else {
+            X68K_TABLE_OFFSET
+        };
+        let need =
+            table_off + (X68K_TABLE_HEADER_SIZE + X68K_MAX_PARTITIONS * X68K_ENTRY_SIZE) as u64;
+        if need > head_len {
+            anyhow::bail!(
+                "the X68k table ends at byte {need} but the first partition starts at byte {head_len}"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Inputs for re-exporting an existing disk image (raw or `.chd`) to a
@@ -519,6 +583,32 @@ fn plans_to_overrides(plans: &[PartitionResizePlan]) -> Vec<PartitionSizeOverrid
         .collect()
 }
 
+/// The plans a patcher's adjusted overrides describe: same partitions, the
+/// starts and sizes the label was rewritten with.
+fn plans_from_overrides(
+    plans: &[PartitionResizePlan],
+    overrides: &[PartitionSizeOverride],
+) -> Vec<PartitionResizePlan> {
+    plans
+        .iter()
+        .map(|p| {
+            let Some(o) = overrides.iter().find(|o| o.index == p.index) else {
+                return p.clone();
+            };
+            let new_start_lba = o.effective_start_lba();
+            PartitionResizePlan {
+                index: p.index,
+                old_start_lba: p.old_start_lba,
+                old_size_bytes: p.old_size_bytes,
+                new_start_lba,
+                new_size_bytes: o.export_size,
+                needs_data_move: new_start_lba != p.old_start_lba,
+                move_delta_bytes: new_start_lba as i64 * 512 - p.old_start_lba as i64 * 512,
+            }
+        })
+        .collect()
+}
+
 /// Compute the shrunken disk envelope for a resize-active backup. The
 /// envelope is the byte just past the last partition's new extent, rounded
 /// up to the disk's alignment sector (and with a GPT trailer reservation
@@ -542,7 +632,8 @@ pub fn compute_resized_envelope(
     let any_resize = plans
         .iter()
         .any(|p| p.new_size_bytes != p.old_size_bytes || p.new_start_lba != p.old_start_lba);
-    if !any_resize {
+    // A disk label describes the whole drive, so its image keeps the drive's size.
+    if !any_resize || is_verbatim_head_scheme(partition_table) {
         return source_size;
     }
     let alignment_bytes = (alignment_sectors.max(1) * 512).max(512);
@@ -916,6 +1007,8 @@ pub struct AssembleFromStagingInputs<'a> {
     /// the gap after sector 0 (`backup::mbr_gap`), GPT an empty slice; both
     /// rebuild the table from `source_partition_table_bytes` + `partition_table`.
     pub source_head_region: &'a [u8],
+    /// The head already describes `plans` (patched before staging); skip the resize check.
+    pub head_is_patched: bool,
 }
 
 /// Assemble a single-file CHD by streaming per-partition zstd-compressed
@@ -950,6 +1043,18 @@ pub fn assemble_from_staging(
              caller did not populate it"
         );
     }
+    // A disk label that stands ahead of the first partition IS the head region;
+    // assembling without it would drop it and still produce a plausible CHD.
+    if is_verbatim_head_scheme(inputs.partition_table)
+        && inputs.source_head_region.is_empty()
+        && inputs.partitions.iter().all(|p| p.byte_offset() > 0)
+    {
+        anyhow::bail!(
+            "assemble_from_staging: {} source requires source_head_region — \
+             caller did not populate it",
+            inputs.partition_table.type_name(),
+        );
+    }
     if inputs.plans.is_empty() {
         anyhow::bail!("assemble_from_staging: empty resize plan");
     }
@@ -975,6 +1080,7 @@ pub fn assemble_from_staging(
         inputs.partitions,
         &overrides,
         target_size,
+        inputs.head_is_patched,
         log_cb,
     )?;
 
@@ -1181,6 +1287,36 @@ fn read_apm_head_region(
     Ok(buf)
 }
 
+/// Sun / NeXT: every byte before the first slice, verbatim. That is the disk
+/// label plus whatever boot blocks and front porch sit with it. Empty when a
+/// slice starts at LBA 0 — a SunOS root slice contains the label itself.
+fn read_label_head_region(
+    source_file: &File,
+    partitions: &[PartitionInfo],
+    source_size: u64,
+) -> Result<Vec<u8>> {
+    let head_end = partitions
+        .iter()
+        .map(|p| p.byte_offset())
+        .min()
+        .unwrap_or(0)
+        .min(source_size);
+    if head_end == 0 {
+        return Ok(Vec::new());
+    }
+    let mut clone = source_file
+        .try_clone()
+        .context("clone source for disk-label head region")?;
+    clone
+        .seek(SeekFrom::Start(0))
+        .context("seek to disk-label head region")?;
+    let mut buf = vec![0u8; head_end as usize];
+    clone
+        .read_exact(&mut buf)
+        .context("read disk-label head region")?;
+    Ok(buf)
+}
+
 /// MBR: the sectors after the MBR up to the first partition, so GRUB's
 /// core.img or a DDO reach the CHD instead of being zero-filled.
 fn read_mbr_gap_region(
@@ -1301,7 +1437,7 @@ pub fn run_via_staging(
             inputs.partition_table.type_name(),
         );
     }
-    let plans = match build_resize_plans(&inputs)? {
+    let mut plans = match build_resize_plans(&inputs)? {
         Some(p) => p,
         None => synthesize_noop_plans(inputs.partitions),
     };
@@ -1332,7 +1468,7 @@ pub fn run_via_staging(
     // DDR + partition map + any Apple_Driver* partition bodies and
     // must reach the assembler intact so patched DDR + entries can be
     // overlaid on top of it.
-    let source_head_region = if matches!(inputs.partition_table, PartitionTable::Apm(_)) {
+    let mut source_head_region = if matches!(inputs.partition_table, PartitionTable::Apm(_)) {
         Some(read_apm_head_region(
             inputs.source_file,
             inputs.partitions,
@@ -1340,9 +1476,57 @@ pub fn run_via_staging(
         )?)
     } else if matches!(inputs.partition_table, PartitionTable::Mbr(_)) {
         read_mbr_gap_region(inputs.source_file, inputs.partitions)?
+    } else if is_verbatim_head_scheme(inputs.partition_table) {
+        let head =
+            read_label_head_region(inputs.source_file, inputs.partitions, inputs.source_size)?;
+        verify_head_covers_label(inputs.partition_table, head.len() as u64)?;
+        Some(head)
     } else {
         None
     };
+
+    // A verbatim head that has to describe a resize is rewritten now, before
+    // staging, so the bodies are staged to the layout the label will carry.
+    let mut head_is_patched = false;
+    let any_resize = plans
+        .iter()
+        .any(|p| p.needs_data_move || p.new_size_bytes != p.old_size_bytes);
+    if any_resize && is_verbatim_head_scheme(inputs.partition_table) {
+        for plan in &plans {
+            if plan.new_size_bytes == plan.old_size_bytes {
+                continue;
+            }
+            let Some(part) = inputs.partitions.iter().find(|p| p.index == plan.index) else {
+                continue;
+            };
+            let mut probe = inputs
+                .source_file
+                .try_clone()
+                .context("clone source for the resize probe")?;
+            if let crate::fs::InPlaceResize::Unsupported(name) = crate::fs::in_place_resize_support(
+                &mut probe,
+                part.byte_offset(),
+                part.partition_type_string.as_deref(),
+            ) {
+                anyhow::bail!(
+                    "partition-{} holds {name}, which cannot be resized in place",
+                    part.index
+                );
+            }
+        }
+        let head = source_head_region.clone().unwrap_or_default();
+        let overrides = plans_to_overrides(&plans);
+        let patched = crate::partition::restore_patch::patch_head_for_restore(
+            inputs.partition_table.type_name(),
+            &head,
+            &overrides,
+            inputs.source_size,
+            log_cb,
+        )?;
+        plans = plans_from_overrides(&plans, &patched.overrides);
+        source_head_region = Some(patched.head);
+        head_is_patched = true;
+    }
 
     // Phase 1: stage each partition's body as zstd.
     stage_partitions_to_zst(
@@ -1372,6 +1556,7 @@ pub fn run_via_staging(
         alignment_sectors: inputs.alignment_sectors,
         checksum_type: inputs.checksum_type,
         source_head_region: head_region_slice,
+        head_is_patched,
     };
     phase_cb("Assembling CHD container from staged partitions");
     let result = assemble_from_staging(
@@ -1910,6 +2095,7 @@ fn stage_partitions_to_zst(
 /// tail) as `DiskImageStreamBuilder` segments. Used by
 /// [`assemble_from_staging`]
 /// to avoid materialising a scratch disk image just to host the table.
+#[allow(clippy::too_many_arguments)] // the head, the table, the plan and the flag are all needed
 fn build_patched_head_segments(
     source_partition_table_bytes: &[u8],
     source_head_region: &[u8],
@@ -1917,6 +2103,7 @@ fn build_patched_head_segments(
     partitions: &[PartitionInfo],
     overrides: &[PartitionSizeOverride],
     target_size: u64,
+    head_is_patched: bool,
     log_cb: &mut dyn FnMut(&str),
 ) -> Result<(Vec<Segment>, Option<Segment>)> {
     match table {
@@ -2017,50 +2204,56 @@ fn build_patched_head_segments(
             let head: Segment = (0, head_end, Box::new(std::io::Cursor::new(head_buf)));
             Ok((vec![head], None))
         }
-        PartitionTable::Rdb(_) => {
-            anyhow::bail!(
-                "assemble_from_staging: Amiga RDB sources are not yet supported by single-file CHD"
+        PartitionTable::Sun(_)
+        | PartitionTable::Next(_)
+        | PartitionTable::Sgi(_)
+        | PartitionTable::SgiDkLabel(_)
+        | PartitionTable::Rdb(_)
+        | PartitionTable::Ahdi(_)
+        | PartitionTable::X68k { .. } => {
+            // The head goes out byte for byte; `run_via_staging` has already
+            // rewritten it for a resize, or there was none to apply.
+            if !head_is_patched {
+                for o in overrides {
+                    let Some(p) = partitions.iter().find(|p| p.index == o.index) else {
+                        continue;
+                    };
+                    if o.export_size != p.size_bytes || o.effective_start_lba() != p.start_lba {
+                        anyhow::bail!(
+                            "assemble_from_staging: a {} head must be patched before staging",
+                            table.type_name(),
+                        );
+                    }
+                }
+            }
+            if source_head_region.is_empty() {
+                log_cb("  table: disk label (inside the first slice, copied with its body)");
+                return Ok((Vec::new(), None));
+            }
+            log_cb(&format!(
+                "  table: disk label ({} bytes of head region copied verbatim)",
+                source_head_region.len(),
+            ));
+            let head: Segment = (
+                0,
+                source_head_region.len() as u64,
+                Box::new(std::io::Cursor::new(source_head_region.to_vec())),
             );
-        }
-        PartitionTable::Sgi(_) => {
-            anyhow::bail!(
-                "assemble_from_staging: SGI Volume Header sources are not supported (browse only)"
-            );
-        }
-        PartitionTable::Sun(_) => {
-            anyhow::bail!(
-                "assemble_from_staging: Sun disk-label sources are not supported (browse only)"
-            );
-        }
-        PartitionTable::Next(_) => {
-            anyhow::bail!(
-                "assemble_from_staging: NeXT disk-label sources are not supported (browse only)"
-            );
+            Ok((vec![head], None))
         }
         PartitionTable::SolarisX86 { .. } => {
             anyhow::bail!(
                 "assemble_from_staging: Solaris x86 VTOC sources are not supported (browse only)"
             );
         }
-        PartitionTable::SgiDkLabel(_) => {
-            anyhow::bail!(
-                "assemble_from_staging: SGI disk-label sources are not supported (browse only)"
-            );
+        PartitionTable::None { .. } => {
+            // The volume is the disk: its body starts at byte 0, so there is
+            // no table to patch and no head region to carry.
+            log_cb("  table: none (partitionless volume, body from byte 0)");
+            Ok((Vec::new(), None))
         }
-        PartitionTable::Ahdi(_) => {
-            anyhow::bail!(
-                "assemble_from_staging: AHDI sources are not yet supported by single-file CHD"
-            );
-        }
-        PartitionTable::X68k { .. } => {
-            anyhow::bail!(
-                "assemble_from_staging: X68000 Human68k sources are not yet supported by single-file CHD"
-            );
-        }
-        PartitionTable::None { .. } | PartitionTable::Dsd { .. } => {
-            anyhow::bail!(
-                "assemble_from_staging: superfloppy / double-sided-DFS sources are not supported"
-            );
+        PartitionTable::Dsd { .. } => {
+            anyhow::bail!("assemble_from_staging: double-sided-DFS sources are not supported");
         }
     }
 }
@@ -2089,12 +2282,428 @@ mod tests {
         mbr
     }
 
+    /// Label schemes take the verbatim-head path, a partitionless volume has no
+    /// head, and a container the pipeline cannot assemble must stay refused.
+    #[test]
+    fn is_supported_covers_the_disk_label_schemes() {
+        for table in [
+            PartitionTable::Sun(sun_label()),
+            PartitionTable::Next(next_label()),
+        ] {
+            assert!(is_supported(&table), "{}", table.type_name());
+            assert!(is_verbatim_head_scheme(&table), "{}", table.type_name());
+        }
+        let superfloppy = PartitionTable::None {
+            size_bytes: 4096,
+            fs_hint: "Unknown".into(),
+        };
+        assert!(is_supported(&superfloppy));
+        assert!(!is_verbatim_head_scheme(&superfloppy));
+        let dsd = PartitionTable::Dsd { size_bytes: 409600 };
+        assert!(!is_supported(&dsd));
+        assert!(!is_verbatim_head_scheme(&dsd));
+    }
+
+    fn sun_label() -> crate::partition::sun::SunDiskLabel {
+        let mut buf = vec![0u8; 512];
+        buf[436] = 0; // ntrks high
+        buf[437] = 2; // ntrks = 2
+        buf[439] = 32; // nsect = 32
+        buf[433] = 100; // ncyl = 100
+        buf[444 + 4 + 3] = 64; // slice 0 num_sectors = 64
+        buf[508] = 0xDA;
+        buf[509] = 0xBE;
+        let mut csum: u16 = 0;
+        for w in buf.chunks_exact(2) {
+            csum ^= u16::from_be_bytes([w[0], w[1]]);
+        }
+        buf[510] = (csum >> 8) as u8;
+        buf[511] = csum as u8;
+        crate::partition::sun::SunDiskLabel::parse(&buf).expect("synthetic Sun label")
+    }
+
+    fn next_label() -> crate::partition::next::NextDiskLabel {
+        use crate::partition::next::{build_label, NextLabelSpec, NextPartitionSpec};
+        let spec = NextLabelSpec {
+            partitions: vec![
+                Some(NextPartitionSpec {
+                    base: 0,
+                    size: 64,
+                    ..Default::default()
+                }),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ],
+            ..Default::default()
+        };
+        let buf = build_label(&spec);
+        crate::partition::next::NextDiskLabel::parse(&buf, 0).expect("synthetic NeXT label")
+    }
+
     #[test]
     fn is_supported_accepts_mbr() {
         let mbr_bytes = build_test_mbr(64);
         let mut br = std::io::Cursor::new(mbr_bytes.to_vec());
         let table = PartitionTable::detect(&mut br).expect("detect MBR");
         assert!(is_supported(&table));
+    }
+
+    /// A NeXT-labeled disk keeps its label, boot blocks and front porch in a
+    /// head region no writer can patch, so the single-file CHD copies those
+    /// bytes verbatim and the round-trip must reproduce them exactly.
+    #[test]
+    fn end_to_end_round_trip_next_label() {
+        use crate::partition::next::{build_label, NextLabelSpec, NextPartitionSpec};
+
+        const SECTOR: u64 = 1024;
+        const FRONT: u64 = 160;
+        const PART_SECTORS: u64 = 2048;
+        let total_bytes = (FRONT + PART_SECTORS + 64) * SECTOR;
+
+        let mut spec = NextLabelSpec {
+            front_porch: FRONT as u16,
+            ..Default::default()
+        };
+        spec.partitions = vec![
+            Some(NextPartitionSpec {
+                base: 0,
+                size: PART_SECTORS as i32,
+                mount_point: "/".to_string(),
+                ..Default::default()
+            }),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ];
+        let label = build_label(&spec);
+
+        let mut data = vec![0u8; total_bytes as usize];
+        for &block in crate::partition::next::LABEL_BLOCKS.iter() {
+            let at = (block * 512) as usize;
+            data[at..at + label.len()].copy_from_slice(&label);
+            // Each copy stamps its own block number; the checksum ignores it.
+            data[at + 4..at + 8].copy_from_slice(&(block as u32).to_be_bytes());
+        }
+        // Boot code in the porch, past the label copies, and a body pattern.
+        for i in 0..4096usize {
+            data[60 * 512 + i] = ((i % 253) as u8).wrapping_add(2);
+        }
+        let body = (FRONT * SECTOR) as usize;
+        for i in 0..(PART_SECTORS * SECTOR) as usize {
+            data[body + i] = ((i % 251) as u8).wrapping_add(1);
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source_path = tmp.path().join("source.img");
+        std::fs::write(&source_path, &data).unwrap();
+        let source_file = File::open(&source_path).unwrap();
+
+        let mut br = BufReader::new(source_file.try_clone().unwrap());
+        let table = PartitionTable::detect(&mut br).expect("detect NeXT label");
+        assert!(matches!(table, PartitionTable::Next(_)));
+        assert!(is_supported(&table));
+        let partitions = table.partitions();
+        assert_eq!(partitions.len(), 1);
+
+        let output_base = tmp.path().join("disk");
+        let head_bytes: [u8; 512] = data[..512].try_into().unwrap();
+        let mut log_buf: Vec<String> = Vec::new();
+        let result = run_via_staging(
+            SingleFileChdInputs {
+                keep_swap: true,
+                source_file: &source_file,
+                source_size: total_bytes,
+                source_partition_table_bytes: &head_bytes,
+                partition_table: &table,
+                partitions: &partitions,
+                partition_filter: None,
+                sector_by_sector: true,
+                chd_options: None,
+                is_dvd: false,
+                output_base: &output_base,
+                resize_targets: None,
+                hfsplus_clone_targets: None,
+                alignment_sectors: 0,
+                checksum_type: crate::backup::ChecksumType::Sha256,
+            },
+            &mut |_: u64| {},
+            &|| false,
+            &mut |s: &str| log_buf.push(s.to_string()),
+            &mut |_, _| {},
+            &mut |_| {},
+            None,
+        )
+        .expect("NeXT single-file CHD backup");
+        assert_eq!(result.container_logical_size, total_bytes);
+
+        let chd_path = tmp.path().join("disk.chd");
+        let mut reader = ChdReader::open(&chd_path).unwrap();
+        let mut back = vec![0u8; total_bytes as usize];
+        reader.seek(SeekFrom::Start(0)).unwrap();
+        reader.read_exact(&mut back).unwrap();
+        assert_eq!(
+            &back[..(FRONT * SECTOR) as usize],
+            &data[..(FRONT * SECTOR) as usize],
+            "the whole head region — label copies and boot code — is verbatim"
+        );
+        assert_eq!(&back[body..], &data[body..], "partition body is verbatim");
+
+        let mut br = BufReader::new(ChdReader::open(&chd_path).unwrap());
+        let detected = PartitionTable::detect(&mut br).expect("detect after round-trip");
+        assert!(
+            matches!(detected, PartitionTable::Next(_)),
+            "round-tripped CHD should still parse as a NeXT label, got: {}",
+            detected.type_name(),
+        );
+    }
+
+    /// The RDSK block and its PART / FSHD / LSEG chain live in the reserved
+    /// area ahead of the first partition, which is exactly what a re-serialized
+    /// table would lose — so the head region has to arrive byte for byte.
+    #[test]
+    fn end_to_end_round_trip_amiga_rdb() {
+        use crate::partition::provision::{self, Geometry, PartSpec};
+        use crate::partition::type_catalog::TableKind;
+
+        const TOTAL: u64 = 16 * 1024 * 1024;
+        let geometry = Geometry::default();
+        let specs = vec![
+            PartSpec {
+                size: Some(4 * 1024 * 1024),
+                type_text: Some("DOS\\3".to_string()),
+                name: Some("DH0".to_string()),
+            },
+            PartSpec {
+                size: Some(4 * 1024 * 1024),
+                type_text: Some("PFS\\3".to_string()),
+                name: Some("DH1".to_string()),
+            },
+        ];
+        let align = provision::default_align(TableKind::Rdb, geometry);
+        let placed = provision::place(&specs, TableKind::Rdb, TOTAL, align, geometry)
+            .expect("place two RDB partitions");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source_path = tmp.path().join("source.img");
+        {
+            let mut f = File::create(&source_path).unwrap();
+            f.set_len(TOTAL).unwrap();
+            provision::write_table(&mut f, TableKind::Rdb, &placed, TOTAL, geometry)
+                .expect("write the RDB");
+            // Recognisable bytes in each body, so a shifted segment shows up.
+            for (i, p) in placed.iter().enumerate() {
+                f.seek(SeekFrom::Start(p.start_lba * 512)).unwrap();
+                let body: Vec<u8> = (0..4096u32).map(|b| (b as u8) ^ (i as u8 + 1)).collect();
+                f.write_all(&body).unwrap();
+            }
+            f.flush().unwrap();
+        }
+        let source_file = File::open(&source_path).unwrap();
+        let data = std::fs::read(&source_path).unwrap();
+
+        let mut br = BufReader::new(source_file.try_clone().unwrap());
+        let table = PartitionTable::detect(&mut br).expect("detect the RDB");
+        assert!(matches!(table, PartitionTable::Rdb(_)));
+        assert!(is_supported(&table));
+        assert!(is_verbatim_head_scheme(&table));
+        let partitions = table.partitions();
+        assert_eq!(partitions.len(), 2);
+        let head_len = partitions[0].byte_offset() as usize;
+        assert!(head_len > 0, "the RDB reserved area stands ahead of DH0");
+
+        let output_base = tmp.path().join("disk");
+        let head_bytes: [u8; 512] = data[..512].try_into().unwrap();
+        let result = run_via_staging(
+            SingleFileChdInputs {
+                keep_swap: true,
+                source_file: &source_file,
+                source_size: TOTAL,
+                source_partition_table_bytes: &head_bytes,
+                partition_table: &table,
+                partitions: &partitions,
+                partition_filter: None,
+                sector_by_sector: true,
+                chd_options: None,
+                is_dvd: false,
+                output_base: &output_base,
+                resize_targets: None,
+                hfsplus_clone_targets: None,
+                alignment_sectors: 0,
+                checksum_type: crate::backup::ChecksumType::Sha256,
+            },
+            &mut |_: u64| {},
+            &|| false,
+            &mut |_: &str| {},
+            &mut |_, _| {},
+            &mut |_| {},
+            None,
+        )
+        .expect("RDB single-file CHD backup");
+        assert_eq!(result.container_logical_size, TOTAL);
+
+        let chd_path = tmp.path().join("disk.chd");
+        let mut reader = ChdReader::open(&chd_path).unwrap();
+        let mut back = vec![0u8; TOTAL as usize];
+        reader.seek(SeekFrom::Start(0)).unwrap();
+        reader.read_exact(&mut back).unwrap();
+        assert_eq!(
+            &back[..head_len],
+            &data[..head_len],
+            "RDSK, PART and FSHD blocks copied verbatim"
+        );
+        for p in &partitions {
+            let (a, b) = (p.byte_offset() as usize, p.size_bytes as usize);
+            assert_eq!(&back[a..a + b], &data[a..a + b], "{} body", p.type_name);
+        }
+
+        let mut br = BufReader::new(ChdReader::open(&chd_path).unwrap());
+        let detected = PartitionTable::detect(&mut br).expect("detect after round-trip");
+        assert!(
+            matches!(detected, PartitionTable::Rdb(_)),
+            "round-tripped CHD should still parse as an RDB, got: {}",
+            detected.type_name(),
+        );
+    }
+
+    /// The reserved area is where the driver chain lives, and a compacted body
+    /// zero-fills free blocks — so an RDB claiming blocks past the first
+    /// partition has to be refused, not quietly truncated.
+    #[test]
+    fn an_rdb_reaching_past_the_head_is_refused() {
+        use crate::partition::provision::{self, Geometry, PartSpec};
+        use crate::partition::type_catalog::TableKind;
+
+        const TOTAL: u64 = 8 * 1024 * 1024;
+        let geometry = Geometry::default();
+        let specs = vec![PartSpec {
+            size: Some(2 * 1024 * 1024),
+            type_text: Some("DOS\\3".to_string()),
+            name: Some("DH0".to_string()),
+        }];
+        let align = provision::default_align(TableKind::Rdb, geometry);
+        let placed =
+            provision::place(&specs, TableKind::Rdb, TOTAL, align, geometry).expect("place");
+        let mut img = std::io::Cursor::new(vec![0u8; TOTAL as usize]);
+        provision::write_table(&mut img, TableKind::Rdb, &placed, TOTAL, geometry).expect("write");
+        img.seek(SeekFrom::Start(0)).unwrap();
+        let table = PartitionTable::detect(&mut img).expect("detect");
+        let PartitionTable::Rdb(rdb) = table else {
+            panic!("expected an RDB");
+        };
+
+        let head = placed[0].start_lba * 512;
+        assert!(
+            verify_head_covers_label(&PartitionTable::Rdb(rdb.clone()), head).is_ok(),
+            "the reserved area ends where the first partition starts"
+        );
+
+        let mut greedy = rdb;
+        greedy.header.rdb_blk_hi = (head / 512) as u32 + 8;
+        let err = verify_head_covers_label(&PartitionTable::Rdb(greedy), head).unwrap_err();
+        assert!(
+            err.to_string().contains("RDSK/PART/FSHD"),
+            "the error has to name what would be lost: {err}"
+        );
+    }
+
+    /// An SGI volume header stands in front of slot 0 and holds the PROM's
+    /// standalone binaries, so the head region has to reach the CHD verbatim —
+    /// there is no writer that could rebuild it.
+    #[test]
+    fn end_to_end_round_trip_sgi_volume_header() {
+        use crate::partition::sgi_hdd_builder::{build_sgi_efs_hdd, SgiHddOptions};
+
+        let (data, _layout) = build_sgi_efs_hdd(&SgiHddOptions::new(8 * 1024 * 1024, "rbtest"))
+            .expect("build an SGI EFS hard disk");
+        let total_bytes = data.len() as u64;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source_path = tmp.path().join("source.img");
+        std::fs::write(&source_path, &data).unwrap();
+        let source_file = File::open(&source_path).unwrap();
+
+        let mut br = BufReader::new(source_file.try_clone().unwrap());
+        let table = PartitionTable::detect(&mut br).expect("detect the volume header");
+        assert!(matches!(table, PartitionTable::Sgi(_)));
+        assert!(is_supported(&table));
+        assert!(is_verbatim_head_scheme(&table));
+        let partitions = table.partitions();
+        assert_eq!(
+            partitions.len(),
+            1,
+            "an fx data disk has one browsable slot"
+        );
+        assert!(
+            !crate::partition::partitions_overlap(&partitions),
+            "one slot cannot overlap itself, so this takes the per-slot path"
+        );
+        let head_len = partitions[0].byte_offset() as usize;
+        assert!(head_len > 0, "the volume header stands ahead of slot 0");
+
+        let output_base = tmp.path().join("disk");
+        let head_bytes: [u8; 512] = data[..512].try_into().unwrap();
+        let result = run_via_staging(
+            SingleFileChdInputs {
+                keep_swap: true,
+                source_file: &source_file,
+                source_size: total_bytes,
+                source_partition_table_bytes: &head_bytes,
+                partition_table: &table,
+                partitions: &partitions,
+                partition_filter: None,
+                sector_by_sector: true,
+                chd_options: None,
+                is_dvd: false,
+                output_base: &output_base,
+                resize_targets: None,
+                hfsplus_clone_targets: None,
+                alignment_sectors: 0,
+                checksum_type: crate::backup::ChecksumType::Sha256,
+            },
+            &mut |_: u64| {},
+            &|| false,
+            &mut |_: &str| {},
+            &mut |_, _| {},
+            &mut |_| {},
+            None,
+        )
+        .expect("SGI single-file CHD backup");
+        assert_eq!(result.container_logical_size, total_bytes);
+
+        let chd_path = tmp.path().join("disk.chd");
+        let mut reader = ChdReader::open(&chd_path).unwrap();
+        let mut back = vec![0u8; total_bytes as usize];
+        reader.seek(SeekFrom::Start(0)).unwrap();
+        reader.read_exact(&mut back).unwrap();
+        assert_eq!(
+            &back[..head_len],
+            &data[..head_len],
+            "volume header and volume directory copied verbatim"
+        );
+        let body = partitions[0].byte_offset() as usize;
+        let end = body + partitions[0].size_bytes as usize;
+        assert_eq!(
+            &back[body..end],
+            &data[body..end],
+            "slot 0 body is verbatim"
+        );
+
+        let mut br = BufReader::new(ChdReader::open(&chd_path).unwrap());
+        let detected = PartitionTable::detect(&mut br).expect("detect after round-trip");
+        assert!(
+            matches!(detected, PartitionTable::Sgi(_)),
+            "round-tripped CHD should still parse as an SGI volume header, got: {}",
+            detected.type_name(),
+        );
     }
 
     /// Build a tiny GPT-formatted disk and round-trip it through
@@ -2899,6 +3508,7 @@ mod tests {
             is_dvd: false,
             alignment_sectors: 0,
             source_head_region: &[],
+            head_is_patched: false,
             checksum_type: crate::backup::ChecksumType::Sha256,
         };
 
@@ -2934,6 +3544,184 @@ mod tests {
             readback, data,
             "assembled CHD must round-trip the synthesised disk image byte-for-byte",
         );
+    }
+
+    /// A partitionless volume is the disk: logical size equals the source size,
+    /// the one body sits at byte 0, and nothing is written ahead of it.
+    #[test]
+    fn run_via_staging_round_trip_superfloppy_no_resize() {
+        const TOTAL_SECTORS: u32 = 2880;
+        const SECTOR_SIZE: u64 = 512;
+        let total_bytes = (TOTAL_SECTORS as u64) * SECTOR_SIZE;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let source_path = tmp.path().join("floppy.img");
+
+        // Not a filesystem the compact readers know, so the body goes through
+        // raw passthrough and the readback has to match every byte.
+        let data: Vec<u8> = (0..total_bytes as usize)
+            .map(|i| ((i * 7) % 251) as u8)
+            .collect();
+        std::fs::write(&source_path, &data).unwrap();
+
+        let source_file = File::open(&source_path).unwrap();
+        let table = PartitionTable::None {
+            size_bytes: total_bytes,
+            fs_hint: "Unknown".into(),
+        };
+        let partitions = table.partitions();
+        assert_eq!(partitions.len(), 1);
+        assert_eq!(partitions[0].start_lba, 0);
+
+        let mut sector0 = [0u8; 512];
+        sector0.copy_from_slice(&data[..512]);
+
+        let output_base = tmp.path().join("disk");
+        let inputs = SingleFileChdInputs {
+            keep_swap: true,
+            source_file: &source_file,
+            source_size: total_bytes,
+            source_partition_table_bytes: &sector0,
+            partition_table: &table,
+            partitions: &partitions,
+            partition_filter: None,
+            sector_by_sector: false,
+            chd_options: None,
+            is_dvd: false,
+            output_base: &output_base,
+            resize_targets: None,
+            hfsplus_clone_targets: None,
+            alignment_sectors: 0,
+            checksum_type: crate::backup::ChecksumType::Sha256,
+        };
+
+        let mut log_buf: Vec<String> = Vec::new();
+        let mut log_cb = |s: &str| log_buf.push(s.to_string());
+        let mut progress_cb = |_: u64| {};
+        let cancel_check = || false;
+
+        let result = run_via_staging(
+            inputs,
+            &mut progress_cb,
+            &cancel_check,
+            &mut log_cb,
+            &mut |_, _| {},
+            &mut |_| {},
+            None,
+        )
+        .expect("run_via_staging on a partitionless volume");
+
+        assert_eq!(result.container_filename, "disk.chd");
+        assert_eq!(result.container_logical_size, total_bytes);
+        assert_eq!(result.partition_ranges.len(), 1);
+        assert_eq!(result.partition_ranges[0].offset_in_disk, 0);
+        assert_eq!(result.partition_ranges[0].length, total_bytes);
+
+        let chd_path = tmp.path().join("disk.chd");
+        let mut reader = ChdReader::open(&chd_path).expect("reopen CHD");
+        let mut readback = vec![0u8; total_bytes as usize];
+        reader.read_exact(&mut readback).expect("read full CHD");
+        assert_eq!(
+            readback, data,
+            "a partitionless volume must round-trip the whole image byte-for-byte",
+        );
+        let joined = log_buf.join("\n");
+        assert!(
+            joined.contains("partitionless volume"),
+            "log must say no table was written; got: {joined}",
+        );
+    }
+
+    /// A resize on a verbatim-head scheme is applied before staging: the CHD
+    /// carries the rewritten label, the bodies where it says, and the drive's size.
+    #[test]
+    fn run_export_with_resize_rewrites_a_verbatim_label() {
+        use crate::partition::provision::{self, Geometry, PartSpec};
+        use crate::partition::type_catalog::TableKind;
+        const DISK: u64 = 64 * 1024 * 1024;
+        for kind in [
+            TableKind::Sun,
+            TableKind::Next,
+            TableKind::Sgi,
+            TableKind::SgiDkLabel,
+            TableKind::Atari,
+            TableKind::X68k,
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let source_path = tmp.path().join("disk.img");
+            let geometry = Geometry::default();
+            let align = provision::default_align(kind, geometry);
+            let specs = vec![
+                PartSpec {
+                    size: Some(16 * 1024 * 1024),
+                    ..Default::default()
+                },
+                PartSpec {
+                    size: None,
+                    ..Default::default()
+                },
+            ];
+            let placed = provision::place(&specs, kind, DISK, align, geometry).unwrap();
+            {
+                let mut file = File::create(&source_path).unwrap();
+                file.set_len(DISK).unwrap();
+                provision::write_table(&mut file, kind, &placed, DISK, geometry).unwrap();
+            }
+            let mut br = BufReader::new(File::open(&source_path).unwrap());
+            let table = PartitionTable::detect(&mut br).unwrap();
+            let name = table.type_name();
+            let partitions = table.partitions();
+            assert_eq!(partitions.len(), 2, "{name}");
+            let mut sector0 = [0u8; 512];
+            br.seek(SeekFrom::Start(0)).unwrap();
+            br.read_exact(&mut sector0).unwrap();
+
+            let dest_path = tmp.path().join("export.chd");
+            let targets = vec![(partitions[0].index, 4 * 1024 * 1024u64)];
+            let mut log_buf: Vec<String> = Vec::new();
+            let mut log_cb = |s: &str| log_buf.push(s.to_string());
+            run_export(
+                SingleFileChdExportInputs {
+                    source_path: &source_path,
+                    partition_table: &table,
+                    partitions: &partitions,
+                    source_partition_table_bytes: &sector0,
+                    alignment_sectors: 0,
+                    dest_path: &dest_path,
+                    chd_options: None,
+                    is_dvd: false,
+                    resize_targets: Some(&targets),
+                },
+                &mut |_| {},
+                &|| false,
+                &mut log_cb,
+            )
+            .unwrap_or_else(|e| panic!("{name}: {e:#}"));
+
+            let mut reader = ChdReader::open(&dest_path).unwrap();
+            assert_eq!(
+                reader.logical_size(),
+                DISK,
+                "{name}: the image keeps the drive's size"
+            );
+            let mut image = vec![0u8; DISK as usize];
+            reader.read_exact(&mut image).unwrap();
+            let again = PartitionTable::detect(&mut std::io::Cursor::new(image)).unwrap();
+            let after = again.partitions();
+            assert_eq!(after.len(), 2, "{name}");
+            assert!(
+                after[0].size_bytes < partitions[0].size_bytes,
+                "{name}: the first partition must have shrunk"
+            );
+            assert!(
+                after[1].start_lba < partitions[1].start_lba,
+                "{name}: the second partition must have moved down"
+            );
+            assert!(
+                log_buf.iter().any(|l| l.contains("rewritten")),
+                "{name}: the label rewrite must be logged: {log_buf:?}"
+            );
+        }
     }
 
     /// Commit 1b: `run_via_staging` (no resize, MBR, raw passthrough)

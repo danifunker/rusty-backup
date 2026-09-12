@@ -172,6 +172,103 @@ fn superfloppy_honours_every_codec_and_restores_identically() {
     }
 }
 
+/// A `.chd` holds a whole disk, so a partitionless volume backs up as one
+/// container sized to the source, never a `partition-0.chd` of the packed body.
+#[cfg(feature = "chd")]
+#[test]
+fn superfloppy_chd_is_one_whole_disk_container() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().to_path_buf();
+    let src = work.join("source.img");
+    fat_superfloppy(&src);
+    let source_bytes = std::fs::read(&src).unwrap();
+
+    let backups = work.join("backups-chd");
+    std::fs::create_dir_all(&backups).unwrap();
+    run_backup(
+        backup_config(&src, &backups, "chd", CompressionType::Chd),
+        Arc::new(Mutex::new(BackupProgress::default())),
+    )
+    .unwrap_or_else(|e| panic!("chd: backup failed: {e:?}"));
+
+    let folder = backups.join("chd");
+    let meta: serde_json::Value =
+        serde_json::from_reader(std::fs::File::open(folder.join("metadata.json")).unwrap())
+            .unwrap();
+    assert_eq!(meta["layout"], "single-file-chd");
+    assert_eq!(meta["compression_type"], "chd");
+    assert_eq!(meta["container"], "chd.chd");
+    assert_eq!(
+        meta["container_logical_size"].as_u64().unwrap(),
+        source_bytes.len() as u64,
+        "the CHD must be the whole disk, not the packed volume"
+    );
+    assert!(
+        folder.join("chd.chd").exists(),
+        "the single container is missing"
+    );
+    assert!(
+        !folder.join("partition-0.chd").exists(),
+        "a per-partition CHD was written for a partitionless volume"
+    );
+
+    let target = work.join("restored-chd.img");
+    rusty_backup::restore::run_restore(
+        RestoreConfig {
+            backup_folder: folder,
+            target_path: target.clone(),
+            target_is_device: false,
+            target_size: source_bytes.len() as u64,
+            alignment: RestoreAlignment::Original,
+            partition_sizes: Vec::new(),
+            write_zeros_to_unused: false,
+        },
+        Arc::new(Mutex::new(RestoreProgress::default())),
+    )
+    .unwrap_or_else(|e| panic!("chd: restore failed: {e:?}"));
+    assert_eq!(
+        std::fs::read(&target).unwrap(),
+        source_bytes,
+        "chd: restore must match the source byte for byte"
+    );
+}
+
+/// A blank NTFS superfloppy, backup boot sector in its last sector.
+fn ntfs_superfloppy(path: &std::path::Path) -> Vec<u8> {
+    let size = 20 * 1024 * 1024u64;
+    let mut img = std::io::Cursor::new(vec![0u8; size as usize]);
+    rusty_backup::fs::ntfs_format::create_blank_ntfs(&mut img, size, 64, Some("NTFSSF")).unwrap();
+    std::fs::write(path, img.get_ref()).unwrap();
+    img.into_inner()
+}
+
+/// The packed NTFS stream stops one sector before the backup boot sector, so
+/// both layouts have to put it back or the restore fails fsck.
+#[cfg(feature = "chd")]
+#[test]
+fn ntfs_superfloppy_comes_back_with_its_backup_boot_sector() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().to_path_buf();
+    let src = work.join("source.img");
+    let source_bytes = ntfs_superfloppy(&src);
+    assert_eq!(
+        &source_bytes[..512],
+        &source_bytes[source_bytes.len() - 512..],
+        "the formatter puts the VBR copy in the last sector"
+    );
+
+    for (tag, compression) in [
+        ("zstd", CompressionType::Zstd),
+        ("chd", CompressionType::Chd),
+    ] {
+        let (out, _, _) = round_trip(&work, &src, tag, compression);
+        assert_eq!(
+            out, source_bytes,
+            "{tag}: NTFS restore must match the source"
+        );
+    }
+}
+
 /// The compressed member has to be genuinely smaller — otherwise the codec
 /// silently degraded to a raw copy and the whole feature is a no-op.
 #[test]

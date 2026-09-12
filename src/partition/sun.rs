@@ -218,13 +218,52 @@ impl SunDiskLabel {
     }
 
     /// Non-empty slices in slice order, skipping the whole-disk "backup"
-    /// alias (tag 5), which overlaps the real slices.
+    /// alias, which overlaps the real slices.
     pub fn browsable_slices(&self) -> impl Iterator<Item = (usize, &SunSlice)> {
+        let tagged = self.has_tags();
+        let data_sectors = self.data_sectors();
         self.slices
             .iter()
             .enumerate()
-            .filter(|(_, s)| !s.is_empty() && !s.is_whole_disk())
+            .filter(move |(_, s)| !s.is_empty() && !whole_disk(s, tagged, data_sectors))
     }
+
+    /// True when any slice carries a VTOC tag. SunOS 4.x wrote no VTOC at all,
+    /// so its labels come back all-zero and the tag cannot name anything.
+    pub fn has_tags(&self) -> bool {
+        self.slices.iter().any(|s| s.tag != 0)
+    }
+
+    /// Sectors the label's own geometry says the data area holds.
+    pub fn data_sectors(&self) -> u64 {
+        self.ncyl as u64 * self.sectors_per_cylinder
+    }
+
+    /// Whether slice `i` is the whole-disk "backup" alias.
+    pub fn is_whole_disk_slice(&self, i: usize) -> bool {
+        self.slices
+            .get(i)
+            .is_some_and(|s| whole_disk(s, self.has_tags(), self.data_sectors()))
+    }
+
+    /// Type name for slice `i`. An untagged label has no VTOC to read, so
+    /// naming its slices "unassigned" would claim a tag we never saw.
+    pub fn slice_type_name(&self, i: usize) -> &'static str {
+        if self.has_tags() {
+            self.slices.get(i).map_or("slice", |s| s.tag_name())
+        } else {
+            "untagged"
+        }
+    }
+}
+
+/// Tag 5 is the alias when the label has a VTOC. Without one the geometry is
+/// the only evidence: a slice from cylinder 0 spanning the whole data area.
+fn whole_disk(s: &SunSlice, tagged: bool, data_sectors: u64) -> bool {
+    if tagged {
+        return s.is_whole_disk();
+    }
+    s.start_cylinder == 0 && data_sectors > 0 && s.num_sectors as u64 >= data_sectors
 }
 
 /// The label checksum is a 16-bit XOR of all 256 big-endian words in the
@@ -248,6 +287,54 @@ mod tests {
 
     /// Image bytes + `fdisk -l`'s `(start_sector, num_sectors)` per slice.
     type SunFixture = (Vec<u8>, Vec<(u64, u64)>);
+
+    /// A SunOS 4.1.3 label: `sanity`, `version` and `nparts` are all zero, so
+    /// every tag reads 0 and the backup alias has to be found by geometry.
+    fn untagged_label(ncyl: u16, ntrks: u16, nsect: u16, slices: &[(u32, u32)]) -> SunDiskLabel {
+        let mut buf = vec![0u8; LABEL_SIZE];
+        BigEndian::write_u16(&mut buf[432..434], ncyl);
+        BigEndian::write_u16(&mut buf[436..438], ntrks);
+        BigEndian::write_u16(&mut buf[438..440], nsect);
+        for (i, (cyl, sectors)) in slices.iter().enumerate() {
+            let base = 444 + i * 8;
+            BigEndian::write_u32(&mut buf[base..base + 4], *cyl);
+            BigEndian::write_u32(&mut buf[base + 4..base + 8], *sectors);
+        }
+        BigEndian::write_u16(&mut buf[508..510], SUN_LABEL_MAGIC);
+        let mut csum: u16 = 0;
+        for w in buf.chunks_exact(2) {
+            csum ^= BigEndian::read_u16(w);
+        }
+        BigEndian::write_u16(&mut buf[510..512], csum);
+        SunDiskLabel::parse(&buf).expect("untagged label parses")
+    }
+
+    /// The `sunos.chd` fixture's geometry: 2733 cylinders, 19 heads, 80
+    /// sectors, slice 2 covering all 4154160 of them.
+    #[test]
+    fn an_untagged_backup_slice_is_found_by_geometry() {
+        let label = untagged_label(
+            2733,
+            19,
+            80,
+            &[(0, 62320), (41, 197600), (0, 4154160), (171, 1174960)],
+        );
+        assert!(!label.has_tags(), "SunOS 4.x writes no VTOC");
+        assert!(label.is_whole_disk_slice(2));
+        assert!(
+            !label.is_whole_disk_slice(0),
+            "slice 0 starts at 0 but is small"
+        );
+        let browsable: Vec<usize> = label.browsable_slices().map(|(i, _)| i).collect();
+        assert_eq!(browsable, vec![0, 1, 3], "the backup alias is excluded");
+    }
+
+    /// Without a VTOC there is no tag to read, so the slices must not claim one.
+    #[test]
+    fn untagged_slices_are_not_called_unassigned() {
+        let label = untagged_label(100, 2, 32, &[(0, 640), (10, 1024)]);
+        assert_eq!(label.slice_type_name(0), "untagged");
+    }
 
     /// Build a Sun-labeled disk image with `sfdisk` (non-sudo, on a file) with
     /// a known slice layout, and return its bytes + the parsed `fdisk -l`

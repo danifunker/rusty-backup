@@ -107,7 +107,9 @@ support the disk types (floppy / hard disk / CD-ROM) of the outstanding cores.
   SECTOR mode), MSA (Atari ST), EDSK/DSK (Amstrad CPC / PCW / Einstein /
   etc.), `.d88` (Sharp X68000 / PC-88 / PC-98 / MSX / FM-7), Acorn `.hdf`
   (bare + Arculator-wrapped), Apple-II `.do` / `.po` / `.dsk` sector-order,
-  gzip-wrapped Amiga `.adz` / `.hdz`.
+  gzip-wrapped Amiga `.adz` / `.hdz`, NeXT magneto-optical `.od` (raw MO media
+  — 1296-byte sectors with a cross-interleaved Reed-Solomon(36,32) code plus the
+  `od` driver's spare-sector map, both decoded transparently).
 - **Raw / superfloppy** (partitionless) images are handled.
 - **Optical / CD-ROM:** rip a physical CD/DVD drive to ISO or BIN/CUE
   (`optical rip`), list drives (`optical drives`), convert ISO <-> BIN/CUE <->

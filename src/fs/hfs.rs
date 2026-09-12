@@ -2536,7 +2536,12 @@ impl<R: Read + Write + Seek> HfsFilesystem<R> {
             // (parent=1, drVN) and rejects volumes with an empty key).
             let vol_name = self.mdb.volume_name_raw.clone();
             let node_size = pick_btree_node_size(catalog_size as u64) as usize;
-            let buf = build_empty_hfs_catalog_with_node_size(catalog_size, node_size, &vol_name)?;
+            let buf = build_empty_hfs_catalog_with_node_size(
+                catalog_size,
+                node_size,
+                &vol_name,
+                hfs_common::hfs_now(),
+            )?;
             self.catalog_data = buf;
             self.write_catalog()?;
         }
@@ -2647,6 +2652,7 @@ fn build_empty_hfs_catalog_with_node_size(
     catalog_size: usize,
     node_size: usize,
     volume_name_raw: &[u8],
+    now: u32,
 ) -> Result<Vec<u8>, FilesystemError> {
     if volume_name_raw.len() > 27 {
         return Err(FilesystemError::InvalidData(format!(
@@ -2744,7 +2750,6 @@ fn build_empty_hfs_catalog_with_node_size(
     let r0_data = r0_key + r0_key_total + r0_pad;
     buf[r0_data] = CATALOG_DIR as u8;
     BigEndian::write_u32(&mut buf[r0_data + 6..r0_data + 10], 2); // dirDirID = root CNID 2
-    let now = hfs_common::hfs_now();
     BigEndian::write_u32(&mut buf[r0_data + 10..r0_data + 14], now); // crDate
     BigEndian::write_u32(&mut buf[r0_data + 14..r0_data + 18], now); // mdDate
                                                                      // Remainder of the 70-byte CdrDirRec stays zero.
@@ -2980,12 +2985,32 @@ pub fn create_blank_hfs_sized(
     min_extents_bytes: u32,
     min_catalog_bytes: u32,
 ) -> Result<Vec<u8>, FilesystemError> {
+    create_blank_hfs_sized_at(
+        target_size_bytes,
+        block_size,
+        volume_name,
+        min_extents_bytes,
+        min_catalog_bytes,
+        hfs_common::hfs_now(),
+    )
+}
+
+/// [`create_blank_hfs_sized`] with the volume dates fixed at `now`.
+pub(crate) fn create_blank_hfs_sized_at(
+    target_size_bytes: u64,
+    block_size: u32,
+    volume_name: &str,
+    min_extents_bytes: u32,
+    min_catalog_bytes: u32,
+    now: u32,
+) -> Result<Vec<u8>, FilesystemError> {
     let (front, mdb, image_size) = build_blank_hfs_front(
         target_size_bytes,
         block_size,
         volume_name,
         min_extents_bytes,
         min_catalog_bytes,
+        now,
     )?;
     let mut img = vec![0u8; image_size as usize];
     img[..front.len()].copy_from_slice(&front);
@@ -3009,8 +3034,27 @@ pub fn write_blank_hfs_into<W: Write + Seek>(
     block_size: u32,
     volume_name: &str,
 ) -> Result<u64, FilesystemError> {
+    write_blank_hfs_into_at(
+        target,
+        at_offset,
+        target_size_bytes,
+        block_size,
+        volume_name,
+        hfs_common::hfs_now(),
+    )
+}
+
+/// [`write_blank_hfs_into`] with the volume dates fixed at `now`.
+pub(crate) fn write_blank_hfs_into_at<W: Write + Seek>(
+    target: &mut W,
+    at_offset: u64,
+    target_size_bytes: u64,
+    block_size: u32,
+    volume_name: &str,
+    now: u32,
+) -> Result<u64, FilesystemError> {
     let (front, mdb, image_size) =
-        build_blank_hfs_front(target_size_bytes, block_size, volume_name, 0, 0)?;
+        build_blank_hfs_front(target_size_bytes, block_size, volume_name, 0, 0, now)?;
     target.seek(SeekFrom::Start(at_offset))?;
     target.write_all(&front)?;
     target.seek(SeekFrom::Start(at_offset + image_size - 1024))?;
@@ -3029,6 +3073,7 @@ fn build_blank_hfs_front(
     volume_name: &str,
     min_extents_bytes: u32,
     min_catalog_bytes: u32,
+    now: u32,
 ) -> Result<(Vec<u8>, [u8; 512], u64), FilesystemError> {
     if block_size == 0 || !block_size.is_multiple_of(512) {
         return Err(FilesystemError::InvalidData(format!(
@@ -3142,6 +3187,7 @@ fn build_blank_hfs_front(
         catalog_size as usize,
         catalog_node_size,
         &name_raw,
+        now,
     )?;
     let catalog_off = first_alloc_block as u64 * 512 + catalog_start as u64 * block_size as u64;
     front[catalog_off as usize..catalog_off as usize + catalog_bytes.len()]
@@ -3149,6 +3195,7 @@ fn build_blank_hfs_front(
 
     // Primary MDB at sector 2
     let mdb = build_blank_mdb(
+        now,
         &name_raw,
         total_blocks as u16,
         block_size,
@@ -3171,6 +3218,7 @@ fn build_blank_hfs_front(
 
 #[allow(clippy::too_many_arguments)]
 fn build_blank_mdb(
+    now: u32,
     name_raw: &[u8],
     total_blocks: u16,
     block_size: u32,
@@ -3184,7 +3232,6 @@ fn build_blank_mdb(
     allocated_blocks: u16,
 ) -> [u8; 512] {
     let mut mdb = [0u8; 512];
-    let now = hfs_common::hfs_now();
     BigEndian::write_u16(&mut mdb[0..2], HFS_SIGNATURE);
     BigEndian::write_u32(&mut mdb[2..6], now); // drCrDate
     BigEndian::write_u32(&mut mdb[6..10], now); // drLsMod
@@ -4791,10 +4838,11 @@ mod tests {
     #[test]
     fn write_blank_hfs_into_matches_create_blank_hfs() {
         let (size, bs) = (8 * 1024 * 1024u64, 4096u32);
-        let mem = create_blank_hfs(size, bs, "StreamEq").unwrap();
+        let now = 0xB0A1_2345;
+        let mem = create_blank_hfs_sized_at(size, bs, "StreamEq", 0, 0, now).unwrap();
 
         let mut sink = Cursor::new(vec![0u8; 0]);
-        let written = write_blank_hfs_into(&mut sink, 0, size, bs, "StreamEq").unwrap();
+        let written = write_blank_hfs_into_at(&mut sink, 0, size, bs, "StreamEq", now).unwrap();
         let mut streamed = sink.into_inner();
         streamed.resize(written as usize, 0);
 
@@ -4807,11 +4855,12 @@ mod tests {
     #[test]
     fn write_blank_hfs_into_honours_the_offset() {
         let (size, bs) = (4 * 1024 * 1024u64, 2048u32);
-        let mem = create_blank_hfs(size, bs, "Offset").unwrap();
+        let now = 0xB0A1_2345;
+        let mem = create_blank_hfs_sized_at(size, bs, "Offset", 0, 0, now).unwrap();
 
         let offset = 64 * 512u64;
         let mut sink = Cursor::new(vec![0u8; 0]);
-        let written = write_blank_hfs_into(&mut sink, offset, size, bs, "Offset").unwrap();
+        let written = write_blank_hfs_into_at(&mut sink, offset, size, bs, "Offset", now).unwrap();
         let mut streamed = sink.into_inner();
         streamed.resize((offset + written) as usize, 0);
 
