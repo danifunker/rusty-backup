@@ -176,6 +176,41 @@ or a modern `mount -t iso9660` sees nothing. macOS mounts the HFS+ variant
 directly (`hdiutil attach`); classic HFS needs an emulator or a Mac running
 10.14 or earlier.
 
+## Build a NeXTSTEP CD-ROM
+
+NeXT's CDs are not ISO 9660. Each is a NeXT disk label in 2048-byte sectors
+wrapping one `4.3BSD` UFS partition, and `optical new next-ufs` writes exactly
+that shape (the geometry is pinned against the NeXTSTEP 3.3 discs).
+
+```bash
+# Blank 600 MB disc, then fill it later with import / put.
+rb-cli optical new next-ufs next.iso --size 600M --name "NS33_Extras"
+
+# Formatted and filled in one step, sized to the folder.
+rb-cli optical new next-ufs next.iso --size auto --from-dir ~/next-stuff
+
+rb-cli ls   next.iso@1 /
+rb-cli fsck next.iso@1
+```
+
+Two archive depths, both off by default because NeXT's Installer reads a
+`.pkg` folder (and the `.tar.Z` inside it) as-is:
+
+- `--expand-gunzip` strips only the gzip layer: `NS33HeadersFix.tar.gz` lands
+  as `NS33HeadersFix.tar`, `notes.txt.gz` as `notes.txt`.
+- `--expand-archives` unpacks every tarball into a folder named after it,
+  pre-POSIX tars included (several of NeXT's own patch tarballs have no
+  `ustar` magic). With both flags, tarballs are unpacked and only the other
+  `.gz` files are decompressed.
+
+```bash
+rb-cli optical new next-ufs patches.iso --size auto --from-dir ~/NeXT/patches \
+    --expand-archives --expand-gunzip
+```
+
+Sizes past a 700 MB CD-R are allowed and flagged, for use in an emulator.
+These are data discs: no boot blocks are written.
+
 ## Create a blank NTFS volume
 
 ```bash
