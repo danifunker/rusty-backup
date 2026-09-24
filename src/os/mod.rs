@@ -883,8 +883,8 @@ pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
 
 /// Turn a permission-denied raw-device open into an actionable message. The GUI
 /// starts unprivileged, so this is now the ordinary first-time device failure.
-/// macOS never reaches here: it escalates per operation through `authopen`.
-#[cfg(not(target_os = "macos"))]
+/// macOS escalates through `authopen` and Windows through its own open path, so neither reaches here.
+#[cfg(not(any(target_os = "macos", windows)))]
 pub(crate) fn device_open_error(path: &Path, e: std::io::Error) -> anyhow::Error {
     if is_device_path(path) && e.kind() == std::io::ErrorKind::PermissionDenied {
         #[cfg(target_os = "linux")]
@@ -892,13 +892,6 @@ pub(crate) fn device_open_error(path: &Path, e: std::io::Error) -> anyhow::Error
             "cannot open {} - permission denied. Raw disks belong to root: click \
              \"Unlock Physical Devices\" in the GUI top bar to restart elevated, or \
              run rb-cli under sudo.",
-            path.display()
-        );
-        #[cfg(windows)]
-        return anyhow::anyhow!(
-            "cannot open {} - permission denied. Raw disks need administrator \
-             rights: click \"Show Physical Devices\" in the GUI top bar, or run \
-             rb-cli from an elevated prompt.",
             path.display()
         );
     }
