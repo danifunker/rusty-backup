@@ -1349,12 +1349,14 @@ enum CdTarget {
     SgiEfs,
     MacHfs,
     MacHfsPlus,
+    NextUfs,
 }
 
 const CD_TARGETS: &[(&str, CdTarget)] = &[
     ("SGI IRIX (EFS CD, slot-7 SYSV)", CdTarget::SgiEfs),
     ("Classic Mac (APM + HFS)", CdTarget::MacHfs),
     ("Mac OS 8.1+ (APM + HFS+)", CdTarget::MacHfsPlus),
+    ("NeXTSTEP (NeXT label + 4.3BSD UFS)", CdTarget::NextUfs),
 ];
 
 /// Bootable hard-disk platforms offered under the "Hard disk" class. Each
@@ -1481,6 +1483,9 @@ const WIZ_FIELDS: usize = 3;
 /// non-text row, so the key handler special-cases it.
 const WIZ_FIELD_EXPAND: usize = 4;
 
+/// Index of the expand-gunzip toggle, a row only the NeXT target has (`--expand-gunzip`).
+const WIZ_FIELD_GUNZIP: usize = 5;
+
 struct NewWizard {
     step: WizStep,
     class_sel: usize,
@@ -1498,6 +1503,8 @@ struct NewWizard {
     /// copying them in packed; `--expand-archives` on either CD verb. Also
     /// changes what `--size auto` measures (what the archives unpack to).
     expand_archives: bool,
+    /// Strip only the gzip layer of `.gz` files in [`Self::from_dir`]; `--expand-gunzip` (NeXT only).
+    expand_gunzip: bool,
     /// Tab-to-browse picker for the path field.
     picker: Option<FilePicker>,
     /// Result of the last create attempt (success or error text).
@@ -1517,6 +1524,7 @@ impl Default for NewWizard {
             name: "rusty-backup".to_string(),
             from_dir: String::new(),
             expand_archives: false,
+            expand_gunzip: false,
             picker: None,
             status: None,
             is_error: false,
@@ -1556,9 +1564,14 @@ impl NewWizard {
     /// stops at name.
     fn field_count(&self) -> usize {
         match self.class() {
+            DiskClass::Cdrom if self.cd_target() == CdTarget::NextUfs => WIZ_FIELD_GUNZIP + 1,
             DiskClass::Cdrom => WIZ_FIELD_EXPAND + 1,
             _ => WIZ_FIELDS,
         }
+    }
+
+    fn cd_target(&self) -> CdTarget {
+        CD_TARGETS[self.fs_sel.min(CD_TARGETS.len() - 1)].1
     }
 
     fn fs_count(&self) -> usize {
@@ -1893,6 +1906,10 @@ const OPTICAL_IMAGE_OPS: &[(&str, &str)] = &[
     (
         "New blank CD-ROM (Mac HFS+)",
         "optical new mac-hfsplus \"<OUTPUT.iso>\"",
+    ),
+    (
+        "New blank CD-ROM (NeXTSTEP UFS)",
+        "optical new next-ufs \"<OUTPUT.iso>\"",
     ),
 ];
 
@@ -5554,8 +5571,8 @@ impl App {
                         0 => w.path.pop(),
                         1 => w.size.pop(),
                         2 => w.name.pop(),
-                        // The toggle row holds no text to erase.
-                        WIZ_FIELD_EXPAND => None,
+                        // The toggle rows hold no text to erase.
+                        WIZ_FIELD_EXPAND | WIZ_FIELD_GUNZIP => None,
                         _ => w.from_dir.pop(),
                     };
                     true
@@ -5568,13 +5585,18 @@ impl App {
                     w.expand_archives = !w.expand_archives;
                     true
                 }
+                KeyCode::Char(' ') if w.field == WIZ_FIELD_GUNZIP => {
+                    w.status = None;
+                    w.expand_gunzip = !w.expand_gunzip;
+                    true
+                }
                 KeyCode::Char(c) if !c.is_control() => {
                     w.status = None;
                     match w.field {
                         0 => w.path.push(c),
                         1 => w.size.push(c),
                         2 => w.name.push(c),
-                        WIZ_FIELD_EXPAND => {}
+                        WIZ_FIELD_EXPAND | WIZ_FIELD_GUNZIP => {}
                         _ => w.from_dir.push(c),
                     }
                     true
@@ -5605,9 +5627,10 @@ impl App {
         // and dispatches accordingly rather than forcing everything through
         // `NewCommand`.
         if w.class() == DiskClass::Cdrom {
-            let target = CD_TARGETS[w.fs_sel.min(CD_TARGETS.len() - 1)].1;
+            let target = w.cd_target();
             let expand = w.expand_archives;
-            self.newdisk_create_cdrom(target, path, size, name, from_dir, expand);
+            let gunzip = w.expand_gunzip && target == CdTarget::NextUfs;
+            self.newdisk_create_cdrom(target, path, size, name, from_dir, expand, gunzip);
             return;
         }
         let cmd = match w.class() {
@@ -5756,6 +5779,7 @@ impl App {
         name: String,
         from_dir: String,
         expand_archives: bool,
+        expand_gunzip: bool,
     ) {
         let from = (!from_dir.is_empty()).then(|| expand_tilde(&from_dir));
         if let Some(d) = &from {
@@ -5810,6 +5834,21 @@ impl App {
                     },
                 )
             }
+            CdTarget::NextUfs => crate::cli::verbs::new_next_cdrom::run(
+                crate::cli::verbs::new_next_cdrom::NewNextCdromArgs {
+                    image: path.clone(),
+                    size,
+                    name,
+                    from_dir: from,
+                    expand_archives,
+                    expand_gunzip,
+                    flatten_folders: false,
+                    force: false,
+                    no_permissions: false,
+                    include_appledouble: false,
+                    bytes_per_inode: None,
+                },
+            ),
         });
         let w = self.newdisk.as_mut().unwrap();
         match outcome {
@@ -9059,31 +9098,44 @@ impl App {
                         &w.from_dir,
                         "(optional: folder to fill the disc from, Tab to browse)",
                     ));
-                    // The toggle only bites with a source folder, so it reads
+                    // The toggles only bite with a source folder, so they read
                     // dim until one is set.
                     let armed = !w.from_dir.trim().is_empty();
-                    let active = w.field == WIZ_FIELD_EXPAND;
-                    let box_ = if w.expand_archives { "[x]" } else { "[ ]" };
-                    let label_style = if armed || active {
-                        Style::default()
-                    } else {
-                        self.palette.dim()
-                    };
-                    lines.push(Line::from(vec![
-                        Span::styled("  Expand: ", self.palette.accent()),
-                        Span::styled(
-                            format!("{box_} unpack .tar / .sit / .cpt / .hqx into the disc"),
-                            label_style,
-                        ),
-                        if active {
-                            Span::styled(
-                                " ",
-                                self.palette.accent().add_modifier(Modifier::REVERSED),
-                            )
+                    let toggle = |row: usize, label: &str, on: bool, text: &str| {
+                        let active = w.field == row;
+                        let box_ = if on { "[x]" } else { "[ ]" };
+                        let label_style = if armed || active {
+                            Style::default()
                         } else {
-                            Span::raw("")
-                        },
-                    ]));
+                            self.palette.dim()
+                        };
+                        Line::from(vec![
+                            Span::styled(format!("  {label:<8}"), self.palette.accent()),
+                            Span::styled(format!("{box_} {text}"), label_style),
+                            if active {
+                                Span::styled(
+                                    " ",
+                                    self.palette.accent().add_modifier(Modifier::REVERSED),
+                                )
+                            } else {
+                                Span::raw("")
+                            },
+                        ])
+                    };
+                    lines.push(toggle(
+                        WIZ_FIELD_EXPAND,
+                        "Expand:",
+                        w.expand_archives,
+                        "unpack .tar / .sit / .cpt / .hqx into the disc",
+                    ));
+                    if w.cd_target() == CdTarget::NextUfs {
+                        lines.push(toggle(
+                            WIZ_FIELD_GUNZIP,
+                            "Gunzip:",
+                            w.expand_gunzip,
+                            "strip the gzip layer only (.tar.gz -> .tar)",
+                        ));
+                    }
                 }
                 lines.push(Line::raw(""));
                 if let Some(s) = &w.status {
@@ -12480,6 +12532,64 @@ mod tests {
         app.handle_newdisk_key(KeyCode::Char('x'));
         app.handle_newdisk_key(KeyCode::Backspace);
         assert_eq!(app.newdisk.as_ref().unwrap().from_dir, "/tmp/src");
+    }
+
+    fn wizard_on_next_cd() -> NewWizard {
+        let mut w = wizard_on(DiskClass::Cdrom);
+        w.fs_sel = CD_TARGETS
+            .iter()
+            .position(|(_, t)| *t == CdTarget::NextUfs)
+            .expect("NeXT target listed");
+        w
+    }
+
+    /// Only the NeXT target has the gunzip row; Space flips it and it holds no text.
+    #[test]
+    fn next_cd_target_adds_a_gunzip_toggle_row() {
+        assert_eq!(wizard_on_next_cd().field_count(), WIZ_FIELD_GUNZIP + 1);
+        assert_eq!(
+            wizard_on(DiskClass::Cdrom).field_count(),
+            WIZ_FIELD_EXPAND + 1
+        );
+
+        let mut app = App::new_on(DEFAULT_TAB);
+        app.newdisk = Some(wizard_on_next_cd());
+        {
+            let w = app.newdisk.as_mut().unwrap();
+            w.step = WizStep::Details;
+            w.from_dir = "/tmp/src".to_string();
+            w.field = WIZ_FIELD_GUNZIP;
+        }
+        app.handle_newdisk_key(KeyCode::Char(' '));
+        let w = app.newdisk.as_ref().unwrap();
+        assert!(
+            w.expand_gunzip && !w.expand_archives,
+            "only the gunzip row flipped"
+        );
+        app.handle_newdisk_key(KeyCode::Char('x'));
+        app.handle_newdisk_key(KeyCode::Backspace);
+        assert_eq!(app.newdisk.as_ref().unwrap().from_dir, "/tmp/src");
+    }
+
+    /// The wizard's NeXT target reaches `optical new next-ufs` and leaves a NeXT disc.
+    #[test]
+    fn wizard_builds_a_next_cd() {
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("next.iso");
+        let mut app = App::new_on(DEFAULT_TAB);
+        let mut w = wizard_on_next_cd();
+        w.step = WizStep::Details;
+        w.path = iso.to_string_lossy().into_owned();
+        w.size = "8M".to_string();
+        app.newdisk = Some(w);
+        app.newdisk_create();
+        let w = app.newdisk.as_ref().unwrap();
+        assert!(!w.is_error, "{:?}", w.status);
+        let mut f = std::fs::File::open(&iso).unwrap();
+        assert!(
+            crate::partition::next::detect(&mut f).is_some(),
+            "a NeXT label at block 0"
+        );
     }
 
     /// Every class needs its own sensible default size, and `auto` — which
