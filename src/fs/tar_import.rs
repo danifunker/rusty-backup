@@ -63,7 +63,51 @@ pub fn looks_like_tar_archive(path: &Path) -> bool {
         read_prefix(f, 600)
     };
     // ustar magic: "ustar\0" (POSIX) or "ustar  " (GNU) — both start "ustar".
-    prefix.len() >= 262 && &prefix[257..262] == b"ustar"
+    (prefix.len() >= 262 && &prefix[257..262] == b"ustar") || is_v7_tar_header(&prefix)
+}
+
+/// A pre-POSIX (v7) tar header, which has no magic: a name, octal numeric fields, and a
+/// checksum that matches. NeXT's own patch tarballs are this shape.
+fn is_v7_tar_header(h: &[u8]) -> bool {
+    if h.len() < 512 || h[0] == 0 {
+        return false;
+    }
+    // mode, uid, gid, size, mtime must all be octal before the checksum is worth checking.
+    let numeric_ok = [(100, 108), (108, 116), (116, 124), (124, 136), (136, 148)]
+        .iter()
+        .all(|&(a, b)| tar_octal(&h[a..b]).is_some());
+    let Some(stored) = tar_octal(&h[148..156]).filter(|_| numeric_ok) else {
+        return false;
+    };
+    let sum: u64 = h[..512]
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            if (148..156).contains(&i) {
+                32
+            } else {
+                u64::from(*b)
+            }
+        })
+        .sum();
+    sum == stored
+}
+
+/// A tar numeric field: optional leading spaces, octal digits, then only NULs or spaces.
+/// An empty field reads as 0, as GNU tar reads it.
+fn tar_octal(field: &[u8]) -> Option<u64> {
+    let body = &field[field.iter().take_while(|b| **b == b' ').count()..];
+    let n = body
+        .iter()
+        .take_while(|b| (b'0'..=b'7').contains(*b))
+        .count();
+    if !body[n..].iter().all(|b| *b == 0 || *b == b' ') {
+        return None;
+    }
+    if n == 0 {
+        return Some(0);
+    }
+    u64::from_str_radix(std::str::from_utf8(&body[..n]).ok()?, 8).ok()
 }
 
 fn read_prefix(mut r: impl Read, n: usize) -> Vec<u8> {
@@ -635,6 +679,36 @@ mod tests {
         let mut buf2 = Vec::new();
         fs.write_file_to(&inner, &mut buf2).unwrap();
         assert_eq!(buf2, b"nested file");
+    }
+
+    /// NeXT's patch tarballs predate POSIX: no `ustar` magic, only a checksum to go on.
+    #[test]
+    fn looks_like_tar_accepts_a_v7_archive_and_rejects_noise() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut b = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_old();
+        h.set_size(5);
+        h.set_mode(0o644);
+        h.set_cksum();
+        b.append_data(&mut h, "Patch.pkg/Patch.info", &b"hello"[..])
+            .unwrap();
+        let bytes = b.into_inner().unwrap();
+        assert_ne!(&bytes[257..262], b"ustar", "the fixture must be magic-less");
+        let v7 = dir.path().join("Patch.tar");
+        std::fs::write(&v7, &bytes).unwrap();
+        assert!(looks_like_tar_archive(&v7));
+
+        let mut noise = bytes.clone();
+        noise[0x10] ^= 0x55;
+        let bad = dir.path().join("noise.bin");
+        std::fs::write(&bad, &noise).unwrap();
+        assert!(
+            !looks_like_tar_archive(&bad),
+            "a broken checksum is not tar"
+        );
+        let zeros = dir.path().join("zeros.bin");
+        std::fs::write(&zeros, vec![0u8; 1024]).unwrap();
+        assert!(!looks_like_tar_archive(&zeros));
     }
 
     #[test]

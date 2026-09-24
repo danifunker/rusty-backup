@@ -50,6 +50,11 @@ pub struct ImportArgs {
     #[arg(long = "expand-archives")]
     pub expand_archives: bool,
 
+    /// Strip one gzip layer and keep the result: `x.tar.gz` / `x.tgz` land as `x.tar`, `f.gz` as `f`.
+    /// With `--expand-archives` too, tarballs are unpacked fully and only other `.gz` files decompressed.
+    #[arg(long = "expand-gunzip")]
+    pub expand_gunzip: bool,
+
     /// With `--expand-archives`: unpack each archive into the directory that
     /// held it rather than into a subdirectory named after it, so every
     /// archive shares one root.
@@ -163,6 +168,7 @@ pub fn run(args: ImportArgs) -> Result<()> {
         ),
         expand_archives: args.expand_archives,
         flatten_archives: args.flatten_folders,
+        expand_gunzip: args.expand_gunzip,
     };
 
     let stats = import_dir(&mut *fs, &dest, &args.dir, &opts, &progress_cb)
@@ -188,6 +194,12 @@ pub(crate) fn summarize(dir: &std::path::Path, dest: &str, stats: &ImportStats, 
         stats.symlinks,
         stats.total_bytes
     ));
+    if stats.gunzipped > 0 {
+        log_stderr(format!(
+            "  {} gzip file(s) decompressed into the image",
+            stats.gunzipped
+        ));
+    }
     if stats.archives_expanded > 0 {
         log_stderr(format!(
             "  {} archive(s) unpacked into the image",

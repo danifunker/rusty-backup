@@ -67,6 +67,49 @@ pub struct DirImportOptions {
     /// SGI freeware tardists all ship the same shared `fw_common*` product —
     /// so callers generally want a non-fatal conflict policy alongside this.
     pub flatten_archives: bool,
+
+    /// Strip one gzip layer, keeping any tar inside: `x.tgz` lands as `x.tar`, `foo.gz` as `foo`.
+    /// [`Self::expand_archives`] runs first, so with both only non-tar gzip files reach this.
+    pub expand_gunzip: bool,
+}
+
+/// The name `--expand-gunzip` gives a gzip file: `.tgz` becomes `.tar`, `.gz` is dropped.
+/// `None` when there is no such suffix or the name would strip to nothing.
+fn gunzipped_name(file_name: &str) -> Option<String> {
+    let lower = file_name.to_ascii_lowercase();
+    let (cut, add) = if lower.ends_with(".tgz") {
+        (4, ".tar")
+    } else if lower.ends_with(".gz") {
+        (3, "")
+    } else {
+        return None;
+    };
+    let stem = &file_name[..file_name.len() - cut];
+    (!stem.is_empty()).then(|| format!("{stem}{add}"))
+}
+
+/// True when `path` starts with the gzip magic.
+fn is_gzip_file(path: &Path) -> bool {
+    use std::io::Read;
+    let mut magic = [0u8; 2];
+    File::open(path)
+        .and_then(|mut f| f.read_exact(&mut magic))
+        .map(|_| magic == [0x1f, 0x8b])
+        .unwrap_or(false)
+}
+
+/// The name to import `host` under with `--expand-gunzip`, when it applies.
+fn gunzip_target(host: &Path, file_name: &str) -> Option<String> {
+    gunzipped_name(file_name).filter(|_| is_gzip_file(host))
+}
+
+/// Decompressed length of a (possibly multi-member) gzip file. The trailer's
+/// ISIZE is only the length mod 4 GiB, so the stream is counted instead.
+fn gunzipped_len(path: &Path) -> Result<u64> {
+    let f = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut dec = flate2::read::MultiGzDecoder::new(std::io::BufReader::new(f));
+    std::io::copy(&mut dec, &mut std::io::sink())
+        .with_context(|| format!("decompressing {}", path.display()))
 }
 
 /// Which expander handles a host file under `expand_archives`.
@@ -356,6 +399,30 @@ fn import_dir_inner(
                         continue;
                     }
                 }
+                if let Some(name) = opts
+                    .expand_gunzip
+                    .then(|| e.comps.last().and_then(|n| gunzip_target(&e.host, n)))
+                    .flatten()
+                {
+                    let len = gunzipped_len(&e.host)?;
+                    let f = File::open(&e.host).with_context(|| format!("opening {display}"))?;
+                    let mut dec = flate2::read::MultiGzDecoder::new(std::io::BufReader::new(f));
+                    sink.push(
+                        efs,
+                        &rename_leaf(&e.comps, &name),
+                        ImportItem::File {
+                            size: len,
+                            data: &mut dec,
+                            mac_fork: None,
+                        },
+                        &overrides,
+                        &opts.shared,
+                        &display,
+                    )?;
+                    sink.stats.gunzipped += 1;
+                    progress(&sink.stats);
+                    continue;
+                }
                 // A Mac file in a host folder is one file in up to two pieces:
                 // a data fork plus a `._name` / `.rsrc` sidecar, or a single
                 // `.bin` / `.hqx` wrapper holding both. Rejoin them here, where
@@ -552,6 +619,14 @@ pub fn preflight_dir(
                     // then it shares the one that already exists.
                     pf.dirs += d + u64::from(!opts.flatten_archives);
                     pf.total_bytes += b;
+                } else if opts.expand_gunzip
+                    && e.comps
+                        .last()
+                        .and_then(|n| gunzip_target(&e.host, n))
+                        .is_some()
+                {
+                    pf.files += 1;
+                    pf.total_bytes += gunzipped_len(&e.host)?;
                 } else {
                     pf.files += 1;
                     pf.total_bytes += size;
@@ -576,6 +651,20 @@ pub fn preflight_dir(
 /// entries several archives share once merged, so a flattened estimate errs
 /// high — the safe direction for sizing.
 pub fn measure_dir(root: &Path, expand_archives: bool, flatten: bool) -> Result<(u64, u64, u64)> {
+    measure_dir_for(
+        root,
+        &DirImportOptions {
+            expand_archives,
+            flatten_archives: flatten,
+            ..Default::default()
+        },
+    )
+}
+
+/// [`measure_dir`] driven by the import options themselves, so `--expand-gunzip`
+/// files are measured decompressed too.
+pub fn measure_dir_for(root: &Path, opts: &DirImportOptions) -> Result<(u64, u64, u64)> {
+    let (expand_archives, flatten) = (opts.expand_archives, opts.flatten_archives);
     let mut files = 0u64;
     let mut dirs = 0u64;
     let mut bytes = 0u64;
@@ -588,6 +677,14 @@ pub fn measure_dir(root: &Path, expand_archives: bool, flatten: bool) -> Result<
                     files += f;
                     dirs += d + u64::from(!flatten);
                     bytes += b;
+                } else if opts.expand_gunzip
+                    && e.comps
+                        .last()
+                        .and_then(|n| gunzip_target(&e.host, n))
+                        .is_some()
+                {
+                    files += 1;
+                    bytes += gunzipped_len(&e.host)?;
                 } else {
                     files += 1;
                     bytes += size;
@@ -832,6 +929,103 @@ mod tests {
         assert_eq!(fs.read_file(one, usize::MAX).unwrap(), b"one");
     }
 
+    fn write_gz(path: &Path, data: &[u8]) {
+        use std::io::Write as _;
+        let f = std::fs::File::create(path).unwrap();
+        let mut enc = flate2::write::GzEncoder::new(f, flate2::Compression::default());
+        enc.write_all(data).unwrap();
+        enc.finish().unwrap();
+    }
+
+    fn root_names(fs: &mut crate::fs::fat::FatFilesystem<std::io::Cursor<Vec<u8>>>) -> Vec<String> {
+        let root = Filesystem::root(fs).unwrap();
+        fs.list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect()
+    }
+
+    #[test]
+    fn gunzipped_names_drop_only_the_gzip_suffix() {
+        assert_eq!(gunzipped_name("pkg.tar.gz").as_deref(), Some("pkg.tar"));
+        assert_eq!(gunzipped_name("pkg.TGZ").as_deref(), Some("pkg.tar"));
+        assert_eq!(gunzipped_name("disk.iso.gz").as_deref(), Some("disk.iso"));
+        assert_eq!(gunzipped_name(".gz"), None);
+        assert_eq!(gunzipped_name("disk.adz"), None);
+        assert_eq!(gunzipped_name("notes.txt"), None);
+    }
+
+    /// `--expand-gunzip` strips one gzip layer and leaves the tar inside intact.
+    #[test]
+    fn expand_gunzip_strips_the_gzip_layer_and_keeps_the_tar() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_tgz(&tmp.path().join("pkg.tar.gz"), &[("inner/one.txt", b"one")]);
+        write_gz(&tmp.path().join("disk.iso.gz"), &vec![0x5A; 70_000]);
+        // Named .gz but not gzip: copied through untouched.
+        std::fs::write(tmp.path().join("fake.gz"), b"plain text").unwrap();
+
+        let mut fs =
+            crate::fs::fat::FatFilesystem::open(std::io::Cursor::new(blank_fat()), 0).unwrap();
+        let root = Filesystem::root(&mut fs).unwrap();
+        let opts = DirImportOptions {
+            expand_gunzip: true,
+            ..Default::default()
+        };
+        let stats = import_dir(&mut fs, &root, tmp.path(), &opts, &|_| {}).expect("import");
+        assert_eq!(
+            (stats.gunzipped, stats.archives_expanded, stats.files),
+            (2, 0, 3)
+        );
+
+        let names = root_names(&mut fs);
+        for want in ["pkg.tar", "disk.iso", "fake.gz"] {
+            assert!(names.iter().any(|n| n == want), "{want} missing: {names:?}");
+        }
+        let entries = fs.list_directory(&root).unwrap();
+        let iso = entries.iter().find(|e| e.name == "disk.iso").unwrap();
+        assert_eq!(fs.read_file(iso, usize::MAX).unwrap(), vec![0x5A; 70_000]);
+        let tar = entries.iter().find(|e| e.name == "pkg.tar").unwrap();
+        let tar_bytes = fs.read_file(tar, usize::MAX).unwrap();
+        assert_eq!(&tar_bytes[257..262], b"ustar", "the tar survives as a tar");
+    }
+
+    /// With both flags a tarball is unpacked fully and a bare gzip is decompressed.
+    #[test]
+    fn expand_archives_wins_over_expand_gunzip_for_tarballs() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_tgz(&tmp.path().join("pkg.tar.gz"), &[("one.txt", b"one")]);
+        write_gz(&tmp.path().join("readme.txt.gz"), b"read me");
+
+        let mut fs =
+            crate::fs::fat::FatFilesystem::open(std::io::Cursor::new(blank_fat()), 0).unwrap();
+        let root = Filesystem::root(&mut fs).unwrap();
+        let opts = DirImportOptions {
+            expand_archives: true,
+            expand_gunzip: true,
+            ..Default::default()
+        };
+        let stats = import_dir(&mut fs, &root, tmp.path(), &opts, &|_| {}).expect("import");
+        assert_eq!((stats.archives_expanded, stats.gunzipped), (1, 1));
+        let names = root_names(&mut fs);
+        assert!(names.iter().any(|n| n == "pkg"), "{names:?}");
+        assert!(names.iter().any(|n| n == "readme.txt"), "{names:?}");
+    }
+
+    #[test]
+    fn expand_gunzip_measures_the_decompressed_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_gz(&tmp.path().join("big.bin.gz"), &vec![0u8; 1 << 20]);
+        let (_, _, packed) = measure_dir(tmp.path(), false, false).unwrap();
+        let opts = DirImportOptions {
+            expand_gunzip: true,
+            ..Default::default()
+        };
+        let (files, _, unpacked) = measure_dir_for(tmp.path(), &opts).unwrap();
+        assert!(packed < 1 << 16, "zeros compress: {packed}");
+        assert_eq!((files, unpacked), (1, 1 << 20));
+    }
+
     /// Flattening drops the per-archive wrapper directory so sibling archives
     /// share one root — the shape IRIX `inst` wants from a `.tardist` set.
     #[test]
@@ -904,6 +1098,7 @@ mod tests {
             },
             expand_archives: true,
             flatten_archives: true,
+            ..Default::default()
         };
         let stats = import_dir(&mut fs, &root, tmp.path(), &opts, &|_| {})
             .expect("a shared product across archives must not abort the import");

@@ -86,6 +86,8 @@ pub struct ImportStats {
     /// Archives unpacked into the image instead of copied in verbatim
     /// (`--expand-archives`). Their contents are counted in the fields above.
     pub archives_expanded: u64,
+    /// Gzip files decompressed into the image (`--expand-gunzip`).
+    pub gunzipped: u64,
 }
 
 impl ImportStats {
@@ -104,6 +106,7 @@ impl ImportStats {
         self.other_skipped += other.other_skipped;
         self.total_bytes += other.total_bytes;
         self.archives_expanded += other.archives_expanded;
+        self.gunzipped += other.gunzipped;
     }
 }
 

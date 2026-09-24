@@ -200,6 +200,7 @@ fn populate(args: &NewSgiCdromArgs, dir: &std::path::Path) -> Result<()> {
         ),
         expand_archives: args.expand_archives,
         flatten_archives: args.flatten_folders,
+        expand_gunzip: false,
     };
     let stats = import_dir(&mut *fs, &dest, dir, &opts, &super::import::progress_cb)
         .map_err(|e| anyhow::anyhow!("importing {}: {e}", dir.display()))?;

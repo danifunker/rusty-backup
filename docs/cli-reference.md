@@ -822,6 +822,7 @@ Usage: import [OPTIONS] <IMAGE> <DIR> [DEST]
 **Options**
 
 - `--expand-archives` — Unpack archives found in the tree into a directory named after each, instead of copying them in verbatim. Two families: tar (detected by the `ustar` magic, so IRIX `.tardist` and oddly-named archives are found and a gzipped disk image is not mistaken for one) and classic Mac (`.sit` / `.sea` / `.cpt` / `.hqx` / `.mar`, which land with both forks and their Finder type/creator intact)
+- `--expand-gunzip` — Strip one gzip layer and keep the result: `x.tar.gz` / `x.tgz` land as `x.tar`, `f.gz` as `f`. With `--expand-archives` too, tarballs are unpacked fully and only other `.gz` files decompressed
 - `--flatten-folders` — With `--expand-archives`: unpack each archive into the directory that held it rather than into a subdirectory named after it, so every archive shares one root
 - `--force` — Overwrite entries that already exist at the destination. Mutually exclusive with `--skip-existing`
 - `--skip-existing` — Skip entries that already exist at the destination. Mutually exclusive with `--force`
