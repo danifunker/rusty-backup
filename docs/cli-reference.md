@@ -1569,6 +1569,31 @@ Usage: mac-hfsplus [OPTIONS] <IMAGE>
 - `--name` — Volume name, as it appears on the Mac desktop. HFS truncates at 27 Mac Roman bytes. Defaults to `rusty-backup`
 - `--block-size` — Allocation block size in bytes. HFS wants a multiple of 512 and auto- picks the smallest that keeps the volume inside its 65535-block ceiling; HFS+ wants a power of two in [512, 4096] and defaults to 4096
 
+### `optical new next-ufs`
+
+NeXTSTEP / OPENSTEP CD-ROM (`.iso`): a NeXT disk label in 2048-byte sectors holding one 4.3BSD UFS partition, the layout of NeXT's own distribution CDs (not ISO 9660). Pass `--from-dir` to fill it in the same step; `--expand-archives` unpacks tarballs, `--expand-gunzip` only strips their gzip layer. A data disc: no boot blocks are written
+
+```
+Usage: next-ufs [OPTIONS] <IMAGE>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image file to create (conventionally `.iso`). Overwritten if it exists
+
+**Options**
+
+- `--size` — Disc size (plain bytes or `K`/`M`/`G` suffixes, e.g. `600M`), or `auto` to size it to `--from-dir` plus filesystem overhead and headroom. Rounded up to a whole 2048-byte CD sector. Defaults to 600M (a CD-R). Larger sizes are allowed for emulator use; keep at or below ~700M to burn
+- `--from-dir` — Populate the disc from this host directory after formatting it. The directory's *contents* land at the volume root
+- `--expand-archives` — With `--from-dir`: unpack tarballs (`.tar`, `.tar.gz`, `.tgz`, pre-POSIX tars included) into a directory named after each, instead of copying them
+- `--expand-gunzip` — With `--from-dir`: strip one gzip layer and keep the result, so `x.tar.gz` / `x.tgz` land as `x.tar` and `f.gz` as `f`. With `--expand-archives`, only non-tar `.gz` files are left for this
+- `--flatten-folders` — With `--expand-archives`: unpack every archive into the volume root rather than a subdirectory per archive. Entries that already exist are skipped unless `--force` is given
+- `--force` — With `--from-dir`: overwrite entries that already exist rather than skipping them. Only meaningful alongside `--flatten-folders`
+- `--no-permissions` — With `--from-dir`: ignore the host's Unix mode and ownership
+- `--include-appledouble` — With `--from-dir`: import macOS AppleDouble sidecars (`._*`) too
+- `--name` — Disc name NeXTSTEP shows (`dl_label`, up to 23 bytes; longer is truncated)
+- `--bytes-per-inode` — UFS inode density in bytes per inode (smaller = more inodes). Defaults to 4096, the density NeXT's own CDs use
+
 ### `optical new sgi-efs`
 
 IRIX EFS CD-ROM (`.iso`): an SGI volume header with the EFS filesystem in slot 7 (typed SYSV, the IRIX EFS-CD convention) and CD geometry. Mounts on IRIX with `mount -t efs <dev>s7`. Pass `--from-dir` to fill it from a host folder in the same step (`--size auto` then sizes the disc to fit, and `--expand-archives --flatten-folders` unpacks a `.tardist` set into one `inst`-ready root); otherwise it comes out blank for `import` / `put`

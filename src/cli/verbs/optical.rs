@@ -8,7 +8,7 @@
 //! - `convert` — re-encode an optical image (ISO ↔ BIN/CUE ↔ CHD)
 //! - `browse` — list files on an optical image (ISO9660 / Joliet / HFS)
 //! - `extract` — extract files from an optical image to a host folder
-//! - `new` — create a blank CD-ROM disc image (`new sgi-efs`, `new mac-hfs`,
+//! - `new` — create a blank CD-ROM disc image (`new sgi-efs`, `new mac-hfs`, `new next-ufs`,
 //!   `new mac-hfsplus`)
 //!
 //! The GUI's interactive drive picker has no terminal equivalent; run
@@ -99,6 +99,14 @@ pub enum OpticalNewCommand {
     /// readable by Mac OS 8.1 and later. Same layout and flags as `mac-hfs`.
     #[command(name = "mac-hfsplus")]
     MacHfsPlus(super::new_mac_cdrom::NewMacCdromArgs),
+
+    /// NeXTSTEP / OPENSTEP CD-ROM (`.iso`): a NeXT disk label in 2048-byte
+    /// sectors holding one 4.3BSD UFS partition, the layout of NeXT's own
+    /// distribution CDs (not ISO 9660). Pass `--from-dir` to fill it in the same
+    /// step; `--expand-archives` unpacks tarballs, `--expand-gunzip` only strips
+    /// their gzip layer. A data disc: no boot blocks are written.
+    #[command(name = "next-ufs", alias = "nextstep")]
+    NextUfs(super::new_next_cdrom::NewNextCdromArgs),
 }
 
 pub fn run(cmd: OpticalCommand) -> Result<()> {
@@ -121,6 +129,7 @@ fn run_new(cmd: OpticalNewCommand) -> Result<()> {
         OpticalNewCommand::SgiEfs(a) => super::new_sgi_cdrom::run(a),
         OpticalNewCommand::MacHfs(a) => super::new_mac_cdrom::run(MacCdFs::Hfs, a),
         OpticalNewCommand::MacHfsPlus(a) => super::new_mac_cdrom::run(MacCdFs::HfsPlus, a),
+        OpticalNewCommand::NextUfs(a) => super::new_next_cdrom::run(a),
     }
 }
 

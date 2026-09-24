@@ -30,6 +30,7 @@ mod cli_hfs;
 mod cli_literal_paths;
 mod cli_macplus_appleii;
 mod cli_native_slots;
+mod cli_next_cdrom;
 mod cli_provision;
 mod cli_put_case;
 mod cli_ql;

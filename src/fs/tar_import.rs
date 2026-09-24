@@ -110,6 +110,17 @@ fn tar_octal(field: &[u8]) -> Option<u64> {
     u64::from_str_radix(std::str::from_utf8(&body[..n]).ok()?, 8).ok()
 }
 
+/// An entry's type, reading a pre-POSIX tar's trailing `/` as the directory it marks.
+/// v7 tar had no directory typeflag; GNU tar reads it the same way.
+fn entry_kind<R: Read>(entry: &tar::Entry<'_, R>) -> tar::EntryType {
+    let t = entry.header().entry_type();
+    if t.is_file() && entry.path_bytes().ends_with(b"/") {
+        tar::EntryType::Directory
+    } else {
+        t
+    }
+}
+
 fn read_prefix(mut r: impl Read, n: usize) -> Vec<u8> {
     let mut buf = vec![0u8; n];
     let mut filled = 0;
@@ -230,7 +241,7 @@ pub fn measure_tar_expanded(path: &Path) -> Result<(u64, u64, u64)> {
         let mut ar = tar::Archive::new(archive);
         for entry in ar.entries().context("reading tar entries")? {
             let entry = entry.context("reading tar entry")?;
-            let etype = entry.header().entry_type();
+            let etype = entry_kind(&entry);
             if etype.is_dir() {
                 dirs += 1;
             } else if etype.is_file() {
@@ -281,7 +292,7 @@ fn import_tar_inner<R: Read>(
             _ => continue,
         };
         let display = raw_path.display().to_string();
-        let etype = entry.header().entry_type();
+        let etype = entry_kind(&entry);
         // What the archive says this entry's mode and ownership should be.
         // Empty when `apply_permissions` is off, in which case the shared
         // resolver falls back to the replaced entry / parent directory —
@@ -412,7 +423,7 @@ pub fn preflight_tar<R: Read>(
             continue;
         }
         let name_invalid = comps.iter().any(|c| efs.validate_name(c).is_err());
-        let etype = entry.header().entry_type();
+        let etype = entry_kind(&entry);
         if etype.is_dir() {
             pf.dirs += 1;
             if name_invalid {
@@ -690,6 +701,12 @@ mod tests {
         h.set_size(5);
         h.set_mode(0o644);
         h.set_cksum();
+        let mut d = tar::Header::new_old();
+        d.set_size(0);
+        d.set_mode(0o755);
+        d.set_path("Patch.pkg/").unwrap();
+        d.set_cksum();
+        b.append(&d, std::io::empty()).unwrap();
         b.append_data(&mut h, "Patch.pkg/Patch.info", &b"hello"[..])
             .unwrap();
         let bytes = b.into_inner().unwrap();
@@ -697,6 +714,8 @@ mod tests {
         let v7 = dir.path().join("Patch.tar");
         std::fs::write(&v7, &bytes).unwrap();
         assert!(looks_like_tar_archive(&v7));
+        // The typeflag-less `Patch.pkg/` is a directory, not a file its children collide with.
+        assert_eq!(measure_tar_expanded(&v7).unwrap(), (1, 1, 5));
 
         let mut noise = bytes.clone();
         noise[0x10] ^= 0x55;
