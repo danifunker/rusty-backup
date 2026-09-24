@@ -6,6 +6,7 @@ pub mod gpt;
 pub mod mac_cd_builder;
 pub mod mbr;
 pub mod next;
+pub mod next_cd_builder;
 pub mod provision;
 pub mod rdb;
 pub mod resize;

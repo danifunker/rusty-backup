@@ -31,10 +31,10 @@ use std::io::{Seek, SeekFrom, Write};
 
 use super::filesystem::FilesystemError;
 use super::ufs::{
-    dev_bsize, dirent_record_size, write_dirent_namlen, write_i16, write_i32, write_i64, write_u16,
-    write_u32, CgLayout, UfsEndian, CG_MAGIC, D1_OFF_BLOCKS, D1_OFF_DB, D1_OFF_GID, D1_OFF_MODE,
-    D1_OFF_MTIME, D1_OFF_NLINK, D1_OFF_SIZE, D1_OFF_UID, DINODE1_SIZE, DT_DIR, MAGIC_OFF,
-    MAGIC_UFS1, OFF_MAXSYMLINKLEN, OFF_VOLNAME, ROOT_INODE, SB_OFFSET_UFS1, VOLNAME_LEN,
+    dir_block_size, dirent_record_size, write_dirent_namlen, write_i16, write_i32, write_i64,
+    write_u16, write_u32, CgLayout, UfsEndian, CG_MAGIC, D1_OFF_BLOCKS, D1_OFF_DB, D1_OFF_GID,
+    D1_OFF_MODE, D1_OFF_MTIME, D1_OFF_NLINK, D1_OFF_SIZE, D1_OFF_UID, DINODE1_SIZE, DT_DIR,
+    MAGIC_OFF, MAGIC_UFS1, OFF_MAXSYMLINKLEN, OFF_VOLNAME, ROOT_INODE, SB_OFFSET_UFS1, VOLNAME_LEN,
 };
 
 /// `SBLOCKSIZE` — the space FFS reserves for a superblock, whatever the
@@ -109,6 +109,31 @@ const NSECT_43: u64 = 32;
 /// Track counts to try, largest first: a bigger cylinder means fewer, larger
 /// groups, and 16 x 32 is the NeXTSTEP/Intel reference disk's own geometry.
 const NTRAK_43_CHOICES: [u64; 3] = [16, 4, 2];
+/// `fs_rps` / `fs_maxcontig` a 4.3BSD hard-disk volume records.
+const RPS_43: u64 = 60;
+const MAXCONTIG_43: u64 = 1;
+
+/// Drive geometry a 4.3BSD volume records, staggers its groups by, and hints its allocator with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Bsd43Geometry {
+    /// `fs_ntrak` / `fs_nsect`, the latter in device blocks (the fragment, on NeXT).
+    pub ntrak: u64,
+    pub nsect: u64,
+    pub rps: u64,
+    pub maxcontig: u64,
+    pub maxbpg: u64,
+}
+
+impl Bsd43Geometry {
+    /// NeXT CD-ROM: 32 x 64 sectors of 2048 bytes at 300 rpm, as both NeXTSTEP 3.3 CDs record it.
+    pub const NEXT_CDROM: Self = Self {
+        ntrak: 32,
+        nsect: 64,
+        rps: 5,
+        maxcontig: 20000,
+        maxbpg: 512,
+    };
+}
 
 /// The `newfs` knobs a caller may set. Everything else is derived.
 #[derive(Debug, Clone)]
@@ -126,6 +151,8 @@ pub struct Ufs1FormatParams {
     /// `fs_volname`, which `inspect` shows as the volume label. 4.3BSD has no
     /// such field, so it is ignored there.
     pub label: Option<String>,
+    /// Fixed 4.3BSD drive geometry; `None` searches the NeXT hard-disk shapes.
+    pub bsd43_geometry: Option<Bsd43Geometry>,
 }
 
 impl Default for Ufs1FormatParams {
@@ -138,6 +165,7 @@ impl Default for Ufs1FormatParams {
             endian: UfsEndian::Little,
             cg_layout: CgLayout::Modern,
             label: None,
+            bsd43_geometry: None,
         }
     }
 }
@@ -185,6 +213,10 @@ pub struct Ufs1Geometry {
     pub cgstagger: u64,
     /// `fs_old_cpc` — cylinders after which the rotational pattern repeats.
     pub cpc: u64,
+    /// `fs_rps` / `fs_maxcontig` / `fs_maxbpg`; the 4.4BSD tail writes its own constants.
+    pub rps: u64,
+    pub maxcontig: u64,
+    pub maxbpg: u64,
     pub cg_layout: CgLayout,
 }
 
@@ -347,6 +379,9 @@ pub fn plan(params: &Ufs1FormatParams) -> Result<Ufs1Geometry, FilesystemError> 
         cgoffset: 0,
         cgstagger: 0,
         cpc: 0,
+        rps: RPS_43,
+        maxcontig: MAXCONTIG_43,
+        maxbpg: MAXBPG_43 as u64,
         cg_layout: params.cg_layout,
     };
     geo.cblkno = geo.sblkno + SBLOCKSIZE.div_ceil(fsize).next_multiple_of(frag);
@@ -354,7 +389,7 @@ pub fn plan(params: &Ufs1FormatParams) -> Result<Ufs1Geometry, FilesystemError> 
 
     match params.cg_layout {
         CgLayout::Modern => plan_group_modern(&mut geo, density),
-        CgLayout::Bsd43 => plan_group_43(&mut geo, density)?,
+        CgLayout::Bsd43 => plan_group_43(&mut geo, density, params.bsd43_geometry)?,
     }
     geo.dblkno = geo.iblkno + geo.ipg / inopf;
 
@@ -444,10 +479,23 @@ fn plan_group_modern(geo: &mut Ufs1Geometry, density: u64) {
 /// 4.3BSD: real cylinders, so a group is `fs_cpg` of them and the caps come
 /// from the kernel's fixed-size `cg_btot` / `cg_b` / `cg_iused` arrays rather
 /// than from how much fits in a block.
-fn plan_group_43(geo: &mut Ufs1Geometry, density: u64) -> Result<(), FilesystemError> {
+fn plan_group_43(
+    geo: &mut Ufs1Geometry,
+    density: u64,
+    fixed: Option<Bsd43Geometry>,
+) -> Result<(), FilesystemError> {
     let inopf = geo.inopb / geo.frag;
-    for ntrak in NTRAK_43_CHOICES {
-        let spc = ntrak * NSECT_43;
+    let choices: Vec<(u64, u64)> = match fixed {
+        Some(g) => {
+            geo.rps = g.rps;
+            geo.maxcontig = g.maxcontig;
+            geo.maxbpg = g.maxbpg;
+            vec![(g.ntrak, g.nsect)]
+        }
+        None => NTRAK_43_CHOICES.iter().map(|&t| (t, NSECT_43)).collect(),
+    };
+    for (ntrak, nsect) in choices {
+        let spc = ntrak * nsect;
         let frags_per_cyl = spc / geo.nspf;
         if frags_per_cyl == 0 || frags_per_cyl > geo.size_frags {
             continue;
@@ -472,7 +520,7 @@ fn plan_group_43(geo: &mut Ufs1Geometry, density: u64) -> Result<(), FilesystemE
             continue;
         }
         geo.ntrak = ntrak;
-        geo.nsect = NSECT_43;
+        geo.nsect = nsect;
         geo.spc = spc;
         geo.cpg = cpg;
         geo.fpg = cpg * frags_per_cyl;
@@ -480,7 +528,7 @@ fn plan_group_43(geo: &mut Ufs1Geometry, density: u64) -> Result<(), FilesystemE
         // `fs_cgoffset` staggers each group by a track so consecutive
         // superblock replicas do not land under the same head; the stagger
         // cycles over the track count, which is what `fs_cgmask` selects.
-        geo.cgoffset = NSECT_43.div_ceil(geo.nspf).next_multiple_of(geo.frag);
+        geo.cgoffset = nsect.div_ceil(geo.nspf).next_multiple_of(geo.frag);
         geo.cgstagger = ntrak - 1;
         // With no interleave or track skew the rotational pattern repeats
         // every cylinder, which is what both reference disks record.
@@ -814,10 +862,9 @@ fn write_root_directory<W: Write + Seek>(
     // `d_type` and an 8-bit length. Writing the wrong one is invisible here
     // and makes the root directory unreadable on the target system.
     let old_fmt = geo.cg_layout == CgLayout::Bsd43;
-    // `DIRBLKSIZ` is the volume's `DEV_BSIZE`, which is 1024 on NeXTSTEP and
-    // 512 on BSD. Getting it wrong leaves a root directory whose records stop
-    // half way through the chunk the kernel reads, which reads as corruption.
-    let dirblksiz = dev_bsize(geo.fsize, geo.fsbtodb);
+    // `DIRBLKSIZ` is 1024 on NeXTSTEP (CD included) and 512 on BSD. Getting it
+    // wrong leaves records stopping half way through the chunk the kernel reads.
+    let dirblksiz = dir_block_size(geo.fsize, geo.fsbtodb);
     let mut block = vec![0u8; geo.bsize as usize];
     let dot = dirent_record_size(1);
     write_u32(&mut block, 0, ROOT_INODE, endian);
@@ -880,7 +927,7 @@ fn build_superblock(
     put(&mut sb, 0x030, geo.bsize as i64);
     put(&mut sb, 0x034, geo.fsize as i64);
     put(&mut sb, 0x038, geo.frag as i64);
-    put(&mut sb, 0x044, 60); // fs_old_rps
+    put(&mut sb, 0x044, geo.rps as i64); // fs_old_rps
     put(&mut sb, 0x048, -(geo.bsize as i64)); // fs_bmask
     put(&mut sb, 0x04C, -(geo.fsize as i64)); // fs_fmask
     put(&mut sb, 0x050, geo.bsize.trailing_zeros() as i64);
@@ -964,8 +1011,8 @@ fn build_superblock_43_tail(sb: &mut Vec<u8>, geo: &Ufs1Geometry, endian: UfsEnd
     let put = |sb: &mut Vec<u8>, off: usize, v: i64| write_i32(sb, off, v as i32, endian);
     let rotbl_len = geo.cpc * geo.blocks_per_cylinder();
     put(sb, 0x03C, MINFREE_43 as i64);
-    put(sb, 0x058, 1); // fs_maxcontig
-    put(sb, 0x05C, MAXBPG_43 as i64);
+    put(sb, 0x058, geo.maxcontig as i64);
+    put(sb, 0x05C, geo.maxbpg as i64);
     put(
         sb,
         0x068,

@@ -363,7 +363,7 @@ pub struct UfsFilesystem<R> {
     /// `fs_fsbtodb`: fragment -> device-block shift. `fsize >> fsbtodb` is the
     /// unit `di_blocks` counts in — 512 on BSD, 1024 on NeXTSTEP.
     pub(crate) fsbtodb: u32,
-    /// `DIRBLKSIZ` for this volume, i.e. its `DEV_BSIZE`. Directory records
+    /// `DIRBLKSIZ` for this volume — its `DEV_BSIZE`, capped at 1024 on NeXT. Directory records
     /// never cross one, so every chunk walk and every new chunk uses it.
     pub(crate) dirblksiz: usize,
     /// `fs_csaddr` — first fragment of the cylinder-summary area. Counter
@@ -577,7 +577,7 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
             old_dirent_fmt: raw_msl <= 0,
             cg_layout: CgLayout::Modern,
             fsbtodb,
-            dirblksiz: dev_bsize(fsize, fsbtodb),
+            dirblksiz: dir_block_size(fsize, fsbtodb),
             csaddr_frag: match version {
                 UfsVersion::Ufs1 => read_i32(&sb, OFF_CSADDR_UFS1, endian).max(0) as u64,
                 UfsVersion::Ufs2 => read_i64(&sb, OFF_CSADDR_UFS2, endian).max(0) as u64,
@@ -1829,6 +1829,19 @@ pub(crate) fn dev_bsize(fsize: u64, fsbtodb: u32) -> usize {
         v
     } else {
         DIRBLKSIZ
+    }
+}
+
+/// NeXTSTEP's `DIRBLKSIZ`: its kernel's compile-time `DEV_BSIZE`, whatever the media's sector.
+const NEXT_DIRBLKSIZ: usize = 1024;
+
+/// A volume's `DIRBLKSIZ`. A fragment-sized device block is NeXT's shape, and a 2048-byte NeXT CD still chunks at 1024.
+pub(crate) fn dir_block_size(fsize: u64, fsbtodb: u32) -> usize {
+    let dev = dev_bsize(fsize, fsbtodb);
+    if fsbtodb == 0 {
+        dev.min(NEXT_DIRBLKSIZ)
+    } else {
+        dev
     }
 }
 
