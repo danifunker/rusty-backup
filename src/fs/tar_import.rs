@@ -121,6 +121,123 @@ fn entry_kind<R: Read>(entry: &tar::Entry<'_, R>) -> tar::EntryType {
     }
 }
 
+/// A member name as text. Old archives carry EUC or Latin-1 names; the bytes that are not
+/// UTF-8 become `%XX`, which keeps every name distinct and ASCII-safe.
+fn member_path(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    let mut rest = bytes;
+    loop {
+        match std::str::from_utf8(rest) {
+            Ok(s) => {
+                out.push_str(s);
+                return out;
+            }
+            Err(e) => {
+                let (good, bad) = rest.split_at(e.valid_up_to());
+                out.push_str(std::str::from_utf8(good).unwrap_or_default());
+                let n = e.error_len().unwrap_or(bad.len());
+                for b in &bad[..n] {
+                    out.push_str(&format!("%{b:02X}"));
+                }
+                rest = &bad[n..];
+            }
+        }
+    }
+}
+
+/// Feeds a tar stream through with the size field zeroed on link, device and directory headers.
+/// Old NeXT tar recorded a hard link's target size there with no data behind it; GNU tar ignores it.
+struct NormalizedTar<R> {
+    inner: R,
+    block: [u8; 512],
+    pos: usize,
+    len: usize,
+    data_blocks: u64,
+}
+
+impl<R: Read> NormalizedTar<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            block: [0; 512],
+            pos: 0,
+            len: 0,
+            data_blocks: 0,
+        }
+    }
+
+    fn fill(&mut self) -> std::io::Result<()> {
+        let mut n = 0;
+        while n < 512 {
+            match self.inner.read(&mut self.block[n..]) {
+                Ok(0) => break,
+                Ok(k) => n += k,
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        self.pos = 0;
+        self.len = n;
+        if n < 512 {
+            return Ok(());
+        }
+        if self.data_blocks > 0 {
+            self.data_blocks -= 1;
+            return Ok(());
+        }
+        if self.block.iter().all(|b| *b == 0) {
+            return Ok(());
+        }
+        let size = header_size(&self.block[124..136]);
+        if b"123456".contains(&self.block[156]) && size > 0 {
+            self.block[124..135].copy_from_slice(b"00000000000");
+            self.block[135] = 0;
+            let sum: u32 = self
+                .block
+                .iter()
+                .enumerate()
+                .map(|(i, b)| {
+                    if (148..156).contains(&i) {
+                        32
+                    } else {
+                        u32::from(*b)
+                    }
+                })
+                .sum();
+            let field = format!("{sum:06o}\0 ");
+            self.block[148..156].copy_from_slice(field.as_bytes());
+        } else {
+            self.data_blocks = size.div_ceil(512);
+        }
+        Ok(())
+    }
+}
+
+impl<R: Read> Read for NormalizedTar<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos == self.len {
+            self.fill()?;
+            if self.len == 0 {
+                return Ok(0);
+            }
+        }
+        let n = buf.len().min(self.len - self.pos);
+        buf[..n].copy_from_slice(&self.block[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+/// A header's size field: octal, or GNU base-256 when the high bit is set.
+fn header_size(field: &[u8]) -> u64 {
+    if field[0] & 0x80 != 0 {
+        return field[1..]
+            .iter()
+            .fold(0u64, |v, b| (v << 8) | u64::from(*b));
+    }
+    tar_octal(field).unwrap_or(0)
+}
+
 fn read_prefix(mut r: impl Read, n: usize) -> Vec<u8> {
     let mut buf = vec![0u8; n];
     let mut filled = 0;
@@ -238,7 +355,7 @@ pub fn measure_tar_expanded(path: &Path) -> Result<(u64, u64, u64)> {
         let mut files = 0u64;
         let mut dirs = 0u64;
         let mut bytes = 0u64;
-        let mut ar = tar::Archive::new(archive);
+        let mut ar = tar::Archive::new(NormalizedTar::new(archive));
         for entry in ar.entries().context("reading tar entries")? {
             let entry = entry.context("reading tar entry")?;
             let etype = entry_kind(&entry);
@@ -284,11 +401,18 @@ fn import_tar_inner<R: Read>(
     // GNU tar 1.11 members parked under `@@MaNgLeD.N` until the `N` entry names them.
     let mut mangled: std::collections::HashMap<String, Mangled> = std::collections::HashMap::new();
     let mut mangled_bytes = 0u64;
-    let mut ar = tar::Archive::new(archive);
+    // Paths this archive already wrote: tar lets a later copy of a member replace the earlier one.
+    let mut written: std::collections::HashSet<Vec<String>> = std::collections::HashSet::new();
+    let replace_opts = TarImportOptions {
+        conflict: ImportConflict::Overwrite,
+        apply_permissions: opts.apply_permissions,
+        skip_appledouble: opts.skip_appledouble,
+    };
+    let mut ar = tar::Archive::new(NormalizedTar::new(archive));
 
     for entry in ar.entries().context("reading tar entries")? {
         let mut entry = entry.context("reading tar entry")?;
-        let raw_path = entry.path().context("entry path")?.into_owned();
+        let raw_path = std::path::PathBuf::from(member_path(&entry.path_bytes()));
         let comps = match safe_components(&raw_path) {
             Some(c) if !c.is_empty() => c,
             // Skip empty paths and anything with `..` / absolute roots.
@@ -362,10 +486,8 @@ fn import_tar_inner<R: Read>(
             sink.push(efs, &comps, ImportItem::Dir, &overrides, opts, &display)?;
         } else if etype.is_symlink() {
             let target = entry
-                .link_name()
-                .ok()
-                .flatten()
-                .map(|p| p.to_string_lossy().into_owned())
+                .link_name_bytes()
+                .map(|b| member_path(&b))
                 .unwrap_or_default();
             sink.push(
                 efs,
@@ -377,6 +499,11 @@ fn import_tar_inner<R: Read>(
             )?;
         } else if etype.is_file() {
             let size = entry.size();
+            let opts = if written.insert(comps.clone()) {
+                opts
+            } else {
+                &replace_opts
+            };
             let fork = pending_forks.remove(&comps);
             if fork.is_some() {
                 sink.stats.appledouble_paired += 1;
@@ -395,8 +522,8 @@ fn import_tar_inner<R: Read>(
             )?;
         } else if etype.is_hard_link() {
             // No import target can share an inode with an earlier member, so the link lands as a copy.
-            let target = match entry.link_name().ok().flatten() {
-                Some(t) => match safe_components(&t) {
+            let target = match entry.link_name_bytes() {
+                Some(t) => match safe_components(Path::new(&member_path(&t))) {
                     Some(c) if !c.is_empty() => sink.lookup(efs, &c)?,
                     _ => None,
                 },
@@ -572,10 +699,10 @@ pub fn preflight_tar<R: Read>(
 ) -> Result<TarImportPreflight> {
     let supports_symlinks = efs.supports_symlinks();
     let mut pf = TarImportPreflight::default();
-    let mut ar = tar::Archive::new(archive);
+    let mut ar = tar::Archive::new(NormalizedTar::new(archive));
     for entry in ar.entries().context("reading tar entries")? {
         let entry = entry.context("reading tar entry")?;
-        let raw = entry.path().context("entry path")?.into_owned();
+        let raw = std::path::PathBuf::from(member_path(&entry.path_bytes()));
         let comps = match safe_components(&raw) {
             Some(c) if !c.is_empty() => c,
             _ => continue,
@@ -789,6 +916,89 @@ mod tests {
             .map(|e| e.name)
             .collect();
         assert!(!names.iter().any(|n| n == "@@MaNgLeD.0"), "{names:?}");
+    }
+
+    /// Old NeXT tar put the target's size on a hard-link header with no data behind it.
+    #[test]
+    fn a_hard_link_header_that_claims_a_size_does_not_derail_the_archive() {
+        let mut b = tar::Builder::new(Vec::new());
+        append(&mut b, "Eval3.3/Eval.tiff", &[7u8; 700]);
+        let mut h = tar::Header::new_old();
+        h.set_entry_type(tar::EntryType::Link);
+        h.set_path("Eval3.3/README.rtfd/Eval.tiff").unwrap();
+        h.set_link_name("Eval3.3/Eval.tiff").unwrap();
+        h.set_size(700);
+        h.set_cksum();
+        b.append(&h, std::io::empty()).unwrap();
+        append(&mut b, "Eval3.3/after", b"still here");
+        let bytes = b.into_inner().unwrap();
+
+        let mut efs = blank_nextstep_ufs();
+        let root = efs.root().unwrap();
+        let stats = import_tar(
+            &mut *efs,
+            &root,
+            &bytes[..],
+            &TarImportOptions::default(),
+            &|_| {},
+        )
+        .unwrap();
+        assert_eq!(stats.hardlinks_copied, 1);
+        assert_eq!(
+            read_at(&mut *efs, &["Eval3.3", "README.rtfd", "Eval.tiff"]),
+            vec![7u8; 700]
+        );
+        assert_eq!(read_at(&mut *efs, &["Eval3.3", "after"]), b"still here");
+    }
+
+    #[test]
+    fn non_utf8_member_names_are_escaped_not_refused() {
+        assert_eq!(member_path(b"plain/name"), "plain/name");
+        assert_eq!(
+            member_path(b"Steroidgrundger\xfcst.lookMol"),
+            "Steroidgrundger%FCst.lookMol"
+        );
+        assert_eq!(member_path(b"a\xa4\xd8b"), "a%A4%D8b");
+
+        let mut raw = tar::Header::new_gnu();
+        raw.set_size(2);
+        raw.set_mode(0o644);
+        raw.as_mut_bytes()[..9].copy_from_slice(b"caf\xe9.txt\0");
+        raw.set_cksum();
+        let mut b = tar::Builder::new(Vec::new());
+        b.append(&raw, &b"ok"[..]).unwrap();
+        let bytes = b.into_inner().unwrap();
+        let mut efs = blank_nextstep_ufs();
+        let root = efs.root().unwrap();
+        import_tar(
+            &mut *efs,
+            &root,
+            &bytes[..],
+            &TarImportOptions::default(),
+            &|_| {},
+        )
+        .unwrap();
+        assert_eq!(read_at(&mut *efs, &["caf%E9.txt"]), b"ok");
+    }
+
+    /// The same member twice in one archive: the later copy wins, as with GNU tar.
+    #[test]
+    fn a_repeated_member_replaces_the_earlier_copy() {
+        let mut b = tar::Builder::new(Vec::new());
+        append(&mut b, "edsnd/sndapp.tiff", b"first");
+        append(&mut b, "edsnd/sndapp.tiff", b"second");
+        let bytes = b.into_inner().unwrap();
+        let mut efs = blank_nextstep_ufs();
+        let root = efs.root().unwrap();
+        import_tar(
+            &mut *efs,
+            &root,
+            &bytes[..],
+            &TarImportOptions::default(),
+            &|_| {},
+        )
+        .unwrap();
+        assert_eq!(read_at(&mut *efs, &["edsnd", "sndapp.tiff"]), b"second");
     }
 
     /// X14: a `._name` member was dropped; macOS tar writes it right before
