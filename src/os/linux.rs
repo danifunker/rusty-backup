@@ -714,6 +714,9 @@ pub fn relaunch_with_elevation() -> Result<()> {
         "HOME",
         "APPIMAGE",
         "ARGV0",
+        // A renderer override has to survive elevation, or the relaunch lands back on a crashing default.
+        "RUSTY_BACKUP_RENDERER",
+        "WGPU_BACKEND",
     ];
     let mut env_args: Vec<String> = Vec::new();
     for var in &passthrough_vars {

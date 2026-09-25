@@ -32,6 +32,13 @@ Rusty Backup ships as a single self-contained binary per platform.
    does not, so the GUI always starts unprivileged. On Windows and Linux the
    shield button in the top bar ("Show Physical Devices" / "Unlock Physical
    Devices") restarts it elevated when you actually need a physical disk.
+4. If the window never appears, crashes on start, or draws very slowly, pick
+   the renderer by hand with `RUSTY_BACKUP_RENDERER`: `glow` (OpenGL), `wgpu`
+   (Vulkan / Metal / DX12) or `software` (Mesa llvmpipe, no GPU), e.g.
+   `RUSTY_BACKUP_RENDERER=glow ./rusty-backup`. The setting carries through the
+   elevated restart. Linux on ARM and RISC-V already starts on OpenGL: wgpu's
+   Vulkan path crashes on the PowerVR driver RISC-V boards ship and is slow on
+   the Raspberry Pi 5.
 
 To build from source: `cargo build --release`. See `CLAUDE.md` for the full
 build matrix.

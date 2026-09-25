@@ -207,27 +207,64 @@ fn main() -> eframe::Result {
             force_software();
             run(eframe::Renderer::Glow)
         }
-        _ => match run(eframe::Renderer::Wgpu) {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                // wgpu failed (commonly inside an AppImage when the bundled
-                // Vulkan ICDs don't match the host GPU — "Parent device is
-                // lost"). Retry with the OpenGL backend, which works through
-                // EGL/GL on the same mesa bundle.
-                log::warn!("wgpu renderer failed ({e}); falling back to OpenGL (glow)");
-                match run(eframe::Renderer::Glow) {
-                    Ok(()) => Ok(()),
-                    Err(e) => {
-                        // Even glow failed — last resort is mesa's llvmpipe
-                        // software rasterizer, which has no GPU dependency.
-                        log::warn!(
-                            "glow renderer failed ({e}); falling back to software rendering"
-                        );
+        _ => {
+            // wgpu can fail cleanly (an AppImage's bundled Vulkan ICDs not matching the host GPU),
+            // so each renderer falls back to the next; software needs no GPU at all.
+            let order = if GL_FIRST {
+                [Attempt::Glow, Attempt::Wgpu, Attempt::Software]
+            } else {
+                [Attempt::Wgpu, Attempt::Glow, Attempt::Software]
+            };
+            let mut result = Ok(());
+            for (i, attempt) in order.iter().enumerate() {
+                result = match attempt {
+                    Attempt::Wgpu => run(eframe::Renderer::Wgpu),
+                    Attempt::Glow => run(eframe::Renderer::Glow),
+                    Attempt::Software => {
                         force_software();
                         run(eframe::Renderer::Glow)
                     }
+                };
+                match &result {
+                    Ok(()) => break,
+                    Err(e) if i + 1 < order.len() => log::warn!(
+                        "{} renderer failed ({e}); falling back to {}",
+                        attempt.label(),
+                        order[i + 1].label()
+                    ),
+                    Err(_) => {}
                 }
             }
-        },
+            result
+        }
+    }
+}
+
+/// Linux on ARM and RISC-V starts on OpenGL: wgpu's Vulkan path segfaults on the PowerVR driver
+/// RISC-V boards ship and is sluggish on the Raspberry Pi 5's V3D, where OpenGL ES is solid.
+const GL_FIRST: bool = cfg!(all(
+    target_os = "linux",
+    any(
+        target_arch = "aarch64",
+        target_arch = "arm",
+        target_arch = "riscv64"
+    )
+));
+
+/// One step of the automatic renderer fallback chain.
+#[derive(Clone, Copy)]
+enum Attempt {
+    Wgpu,
+    Glow,
+    Software,
+}
+
+impl Attempt {
+    fn label(self) -> &'static str {
+        match self {
+            Attempt::Wgpu => "wgpu",
+            Attempt::Glow => "OpenGL (glow)",
+            Attempt::Software => "software",
+        }
     }
 }
