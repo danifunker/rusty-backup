@@ -266,6 +266,24 @@ pass-through, so those codecs always emit one file. Safe (a single member
 restores correctly) but silent. The flag's help now says raw-only; honouring it
 for the compressed codecs, or warning when it is ignored, is open.
 
+### 3.3 NeXT CD-ROM builder — follow-ups
+
+`rb-cli optical new next-ufs` (see §10) ships data discs. Open behind it:
+
+* **Pack file tails into fragments.** The UFS writer gives every file's last
+  block a whole `bsize` block; NeXT's own CDs pack tails into 2 KiB fragments.
+  Legal FFS and fsck-clean, but a disc of small files needs up to 4x the space,
+  so `--size auto` budgets a full 8 KiB block per entry. Applies to every UFS
+  edit, not only CDs.
+* **Bootable discs.** Copy a donor disc's front porch (boot blocks at CD sectors
+  16 / 48, label `d_bootfile`) verbatim, e.g. `--boot-from <donor.iso>`. Needs a
+  boot test under Previous.
+* **RISC hybrids.** The NeXTSTEP 3.3 RISC disc is HP-PA LIF + Sun VTOC at
+  sector 0 with the NeXT label at 8 KiB; not produced.
+* **Real-kernel check.** Mount a built disc in NeXTSTEP 3.3 under Previous,
+  including one past 700 MB and one past 2 GB, to find the size ceiling of the
+  NeXT CD driver (the label and UFS themselves address far more).
+
 ---
 
 ## 4. Clonezilla import — remaining gaps
@@ -392,6 +410,14 @@ Next: the **M6 right-click / view batch** (plan §15) — Export to hard drive
 per-pane Tree view (§15.4, the R4 browse-view share); wildcard Find is deferred
 (M7, §15.5). Then M1 widget extraction + the M4 File Info window, the
 browsable-partition gate, and drag-to-load. Milestones in the plan doc §13.
+
+### 6.2 GUI — "New CD-ROM image" path
+
+The CD builders (`optical new sgi-efs` / `mac-hfs` / `mac-hfsplus` /
+`next-ufs`) are CLI + TUI only. The GUI has no way to create a CD image; add a
+dialog that picks the target, size (or auto), name and source folder plus the
+two archive toggles (`--expand-archives`; `--expand-gunzip` for NeXT), driving
+the same `run` functions the TUI wizard calls.
 
 
 ---
@@ -1079,6 +1105,18 @@ Out, not parked. Listed so the question doesn't get re-litigated.
 Audit trail. Each was either shipped, closed-by-design, or moved into
 the structure above before its source plan doc was deleted in the
 docs-consolidation pass.
+
+- **NeXTSTEP CD-ROM builder (2026-09-24)** — `rb-cli optical new next-ufs`
+  (alias `nextstep`) and a TUI wizard target write NeXT's CD layout: a `dlV3`
+  label in 2048-byte sectors (32 x 64, 80-sector porch, `removable_rw_scsi`)
+  around one 4.3BSD UFS with 8K/2K blocks and `fs_fsbtodb` 0
+  (`partition::next_cd_builder`, `ufs_format::Bsd43Geometry::NEXT_CDROM`). For
+  a `NeXTTIME.iso`-sized disc every superblock word and the label's slot 0
+  match the real CD. Found on the way: NeXT's `DIRBLKSIZ` is a fixed 1024 even
+  on 2048-byte media, where the reader had derived 2048 (all 3168 directories
+  on the 3.3 CISC CD chunk at 1024). Import gained `--expand-gunzip` (strip one
+  gzip layer, keep the tar) and now recognises pre-POSIX tars, including their
+  typeflag-less `name/` directory entries. Follow-ups in §3.3; GUI path in §6.2.
 
 - **X68000 floppy-container any-to-any conversion (XDF / HDM / DIM / D88
   — Wave 2 prereq, 2026-06-06)** — closes the third-party-tool gap for

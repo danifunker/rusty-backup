@@ -264,6 +264,8 @@ pub struct NextPartitionSpec {
     pub block_size: u16,
     /// `p_fsize` — filesystem fragment size.
     pub frag_size: u16,
+    /// `p_cpg` — cylinders per group `newfs` should use; 16 on the hard disks, 2 on the CDs.
+    pub cpg: u16,
     /// `p_mountpt` — up to 16 bytes.
     pub mount_point: String,
     /// `p_type` — up to 8 bytes.
@@ -277,6 +279,7 @@ impl Default for NextPartitionSpec {
             size: 0,
             block_size: 8192,
             frag_size: 1024,
+            cpg: 16,
             mount_point: String::new(),
             fs_type: "4.3BSD".to_string(),
         }
@@ -336,6 +339,9 @@ impl Default for NextLabelSpec {
 /// still inside a 160-sector front porch.
 pub const BOOT0_BLOCKS: [u32; 2] = [32, 96];
 
+/// The same two copies in bytes: the 2048-byte CDs record 16 and 48, i.e. the same place.
+const BOOT0_BYTES: [u32; 2] = [BOOT0_BLOCKS[0] * 1024, BOOT0_BLOCKS[1] * 1024];
+
 /// Serialize one label copy, checksum stamped, as a [`LABEL_SPAN`] buffer.
 pub fn build_label(spec: &NextLabelSpec) -> Vec<u8> {
     let mut buf = vec![0u8; LABEL_SPAN];
@@ -351,8 +357,9 @@ pub fn build_label(spec: &NextLabelSpec) -> Vec<u8> {
     BigEndian::write_u32(&mut buf[0x68..0x6C], spec.ncylinders);
     BigEndian::write_u32(&mut buf[0x6C..0x70], spec.rpm);
     BigEndian::write_u16(&mut buf[0x70..0x72], spec.front_porch);
-    BigEndian::write_u32(&mut buf[0x7C..0x80], BOOT0_BLOCKS[0]);
-    BigEndian::write_u32(&mut buf[0x80..0x84], BOOT0_BLOCKS[1]);
+    let secsize = spec.sector_size.max(1);
+    BigEndian::write_u32(&mut buf[0x7C..0x80], BOOT0_BYTES[0] / secsize);
+    BigEndian::write_u32(&mut buf[0x80..0x84], BOOT0_BYTES[1] / secsize);
     put_str(&mut buf[0x84..0x9C], &spec.boot_file);
     put_str(&mut buf[0x9C..0xBC], &spec.hostname);
     buf[0xBC] = spec.root_partition as u8;
@@ -380,7 +387,7 @@ pub fn write_partition(buf: &mut [u8], slot: usize, spec: &NextPartitionSpec) {
     BigEndian::write_u16(&mut e[8..10], spec.block_size);
     BigEndian::write_u16(&mut e[10..12], spec.frag_size);
     e[12] = b't';
-    BigEndian::write_u16(&mut e[14..16], 16);
+    BigEndian::write_u16(&mut e[14..16], spec.cpg);
     BigEndian::write_u16(&mut e[16..18], 4096);
     e[18] = 10;
     e[19] = 1;

@@ -229,7 +229,9 @@ pub fn run(args: LsArgs) -> Result<()> {
         .map_err(|e| anyhow!("list_directory: {e}"))?;
     if args.format == OutputFormat::Text {
         for c in children {
-            print_entry(&c, &c.name, args.owner.then_some(&id_names));
+            // A NeXTSTEP / EUC name's raw bytes print as `\xNN` rather than as placeholder glyphs.
+            let shown = crate::fs::raw_name::display(&c.name);
+            print_entry(&c, &shown, args.owner.then_some(&id_names));
         }
         return Ok(());
     }

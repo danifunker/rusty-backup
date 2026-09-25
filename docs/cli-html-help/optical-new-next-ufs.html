@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli optical new next-ufs</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <a href="optical.html">optical</a> &raquo; <a href="optical-new.html">new</a> &raquo; <span>next-ufs</span></nav>
+<h1><code>rb-cli optical new next-ufs</code></h1>
+<p>NeXTSTEP CD-ROM (`.iso`): a NeXT label in 2048-byte sectors around one 4.3BSD UFS, as NeXT's own discs are (not ISO 9660). `--from-dir` fills it; a data disc, no boot blocks</p>
+<h2>Usage</h2>
+<pre><code>Usage: next-ufs [OPTIONS] &lt;IMAGE&gt;</code></pre>
+<h2>Arguments</h2>
+<dl class="args">
+<dt><code>&lt;IMAGE&gt;</code></dt>
+<dd>Image file to create (conventionally `.iso`). Overwritten if it exists</dd>
+</dl>
+<h2>Options</h2>
+<dl class="args">
+<dt><code>--size</code></dt>
+<dd>Disc size (`600M`, `650M`, ...) or `auto` to fit `--from-dir`; rounded up to a 2048-byte sector. Past ~700M suits an emulator, not a burner</dd>
+<dt><code>--from-dir</code></dt>
+<dd>Populate the disc from this host directory after formatting it. The directory's *contents* land at the volume root</dd>
+<dt><code>--expand-archives</code></dt>
+<dd>With `--from-dir`: unpack tarballs (`.tar`, `.tar.gz`, `.tgz`, pre-POSIX tars included) into a directory named after each, instead of copying them</dd>
+<dt><code>--expand-gunzip</code></dt>
+<dd>With `--from-dir`: strip one gzip layer only (`x.tar.gz` -&gt; `x.tar`, `f.gz` -&gt; `f`). With `--expand-archives` too, tarballs unpack fully and this takes the other `.gz` files</dd>
+<dt><code>--flatten-folders</code></dt>
+<dd>With `--expand-archives`: unpack every archive into the volume root, not one folder each. Entries that already exist are skipped unless `--force` is given</dd>
+<dt><code>--force</code></dt>
+<dd>With `--from-dir`: overwrite entries that already exist rather than skipping them. Only meaningful alongside `--flatten-folders`</dd>
+<dt><code>--no-permissions</code></dt>
+<dd>With `--from-dir`: ignore the host's Unix mode and ownership</dd>
+<dt><code>--include-appledouble</code></dt>
+<dd>With `--from-dir`: import macOS AppleDouble sidecars (`._*`) too</dd>
+<dt><code>--name</code></dt>
+<dd>Disc name NeXTSTEP shows (`dl_label`, up to 23 bytes; longer is truncated)</dd>
+<dt><code>--bytes-per-inode</code></dt>
+<dd>UFS inode density in bytes per inode (smaller = more inodes). Defaults to 4096, the density NeXT's own CDs use</dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_docs</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>

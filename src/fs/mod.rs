@@ -94,6 +94,7 @@ pub mod prodos;
 pub mod prodos_types;
 pub mod qdos;
 pub mod qdos_mdv;
+pub mod raw_name;
 pub mod reiserfs;
 pub mod replace;
 pub mod resource_fork;

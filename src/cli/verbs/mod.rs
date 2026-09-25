@@ -38,6 +38,7 @@ pub mod mkdir;
 pub mod mv;
 pub mod new;
 pub mod new_mac_cdrom;
+pub mod new_next_cdrom;
 pub mod new_partitioned_hd;
 pub mod new_sgi_cdrom;
 pub mod new_sgi_hdd;

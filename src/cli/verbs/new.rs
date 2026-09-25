@@ -1127,6 +1127,7 @@ fn write_blank_ufs_image(args: &NewArgs, cg_layout: crate::fs::ufs::CgLayout) ->
         // 4.3BSD has no `fs_volname`; the bytes 4.4BSD keeps it in are
         // `fs_fsmnt` there, so a label would land inside the mount point.
         label: (cg_layout == CgLayout::Modern).then(|| args.name.clone()),
+        bsd43_geometry: None,
     };
     let mut file = std::fs::File::create(&args.image)
         .with_context(|| format!("creating {}", args.image.display()))?;
