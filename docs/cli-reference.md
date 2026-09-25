@@ -1571,7 +1571,7 @@ Usage: mac-hfsplus [OPTIONS] <IMAGE>
 
 ### `optical new next-ufs`
 
-NeXTSTEP / OPENSTEP CD-ROM (`.iso`): a NeXT disk label in 2048-byte sectors holding one 4.3BSD UFS partition, the layout of NeXT's own distribution CDs (not ISO 9660). Pass `--from-dir` to fill it in the same step; `--expand-archives` unpacks tarballs, `--expand-gunzip` only strips their gzip layer. A data disc: no boot blocks are written
+NeXTSTEP CD-ROM (`.iso`): a NeXT label in 2048-byte sectors around one 4.3BSD UFS, as NeXT's own discs are (not ISO 9660). `--from-dir` fills it; a data disc, no boot blocks
 
 ```
 Usage: next-ufs [OPTIONS] <IMAGE>
@@ -1583,11 +1583,11 @@ Usage: next-ufs [OPTIONS] <IMAGE>
 
 **Options**
 
-- `--size` — Disc size (plain bytes or `K`/`M`/`G` suffixes, e.g. `600M`), or `auto` to size it to `--from-dir` plus filesystem overhead and headroom. Rounded up to a whole 2048-byte CD sector. Defaults to 600M (a CD-R). Larger sizes are allowed for emulator use; keep at or below ~700M to burn
+- `--size` — Disc size (`600M`, `650M`, ...) or `auto` to fit `--from-dir`; rounded up to a 2048-byte sector. Past ~700M suits an emulator, not a burner
 - `--from-dir` — Populate the disc from this host directory after formatting it. The directory's *contents* land at the volume root
 - `--expand-archives` — With `--from-dir`: unpack tarballs (`.tar`, `.tar.gz`, `.tgz`, pre-POSIX tars included) into a directory named after each, instead of copying them
-- `--expand-gunzip` — With `--from-dir`: strip one gzip layer and keep the result, so `x.tar.gz` / `x.tgz` land as `x.tar` and `f.gz` as `f`. With `--expand-archives`, only non-tar `.gz` files are left for this
-- `--flatten-folders` — With `--expand-archives`: unpack every archive into the volume root rather than a subdirectory per archive. Entries that already exist are skipped unless `--force` is given
+- `--expand-gunzip` — With `--from-dir`: strip one gzip layer only (`x.tar.gz` -> `x.tar`, `f.gz` -> `f`). With `--expand-archives` too, tarballs unpack fully and this takes the other `.gz` files
+- `--flatten-folders` — With `--expand-archives`: unpack every archive into the volume root, not one folder each. Entries that already exist are skipped unless `--force` is given
 - `--force` — With `--from-dir`: overwrite entries that already exist rather than skipping them. Only meaningful alongside `--flatten-folders`
 - `--no-permissions` — With `--from-dir`: ignore the host's Unix mode and ownership
 - `--include-appledouble` — With `--from-dir`: import macOS AppleDouble sidecars (`._*`) too

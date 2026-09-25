@@ -32,10 +32,8 @@ pub struct NewNextCdromArgs {
     /// Image file to create (conventionally `.iso`). Overwritten if it exists.
     pub image: PathBuf,
 
-    /// Disc size (plain bytes or `K`/`M`/`G` suffixes, e.g. `600M`), or `auto`
-    /// to size it to `--from-dir` plus filesystem overhead and headroom.
-    /// Rounded up to a whole 2048-byte CD sector. Defaults to 600M (a CD-R).
-    /// Larger sizes are allowed for emulator use; keep at or below ~700M to burn.
+    /// Disc size (`600M`, `650M`, ...) or `auto` to fit `--from-dir`; rounded up to a 2048-byte
+    /// sector. Past ~700M suits an emulator, not a burner.
     #[arg(long, default_value = "600M")]
     pub size: String,
 
@@ -49,15 +47,13 @@ pub struct NewNextCdromArgs {
     #[arg(long = "expand-archives", requires = "from_dir")]
     pub expand_archives: bool,
 
-    /// With `--from-dir`: strip one gzip layer and keep the result, so `x.tar.gz` /
-    /// `x.tgz` land as `x.tar` and `f.gz` as `f`. With `--expand-archives`, only
-    /// non-tar `.gz` files are left for this.
+    /// With `--from-dir`: strip one gzip layer only (`x.tar.gz` -> `x.tar`, `f.gz` -> `f`).
+    /// With `--expand-archives` too, tarballs unpack fully and this takes the other `.gz` files.
     #[arg(long = "expand-gunzip", requires = "from_dir")]
     pub expand_gunzip: bool,
 
-    /// With `--expand-archives`: unpack every archive into the volume root rather
-    /// than a subdirectory per archive. Entries that already exist are skipped
-    /// unless `--force` is given.
+    /// With `--expand-archives`: unpack every archive into the volume root, not one folder each.
+    /// Entries that already exist are skipped unless `--force` is given.
     #[arg(long = "flatten-folders", requires = "expand_archives")]
     pub flatten_folders: bool,
 

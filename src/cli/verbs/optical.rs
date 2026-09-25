@@ -100,11 +100,8 @@ pub enum OpticalNewCommand {
     #[command(name = "mac-hfsplus")]
     MacHfsPlus(super::new_mac_cdrom::NewMacCdromArgs),
 
-    /// NeXTSTEP / OPENSTEP CD-ROM (`.iso`): a NeXT disk label in 2048-byte
-    /// sectors holding one 4.3BSD UFS partition, the layout of NeXT's own
-    /// distribution CDs (not ISO 9660). Pass `--from-dir` to fill it in the same
-    /// step; `--expand-archives` unpacks tarballs, `--expand-gunzip` only strips
-    /// their gzip layer. A data disc: no boot blocks are written.
+    /// NeXTSTEP CD-ROM (`.iso`): a NeXT label in 2048-byte sectors around one 4.3BSD UFS, as
+    /// NeXT's own discs are (not ISO 9660). `--from-dir` fills it; a data disc, no boot blocks.
     #[command(name = "next-ufs", alias = "nextstep")]
     NextUfs(super::new_next_cdrom::NewNextCdromArgs),
 }
