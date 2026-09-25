@@ -588,6 +588,28 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
         Ok(fs)
     }
 
+    /// NeXTSTEP names are raw NeXTSTEP-encoded / EUC-JP bytes, carried exactly; other UFS
+    /// flavours keep the lossy UTF-8 reading they always had.
+    fn raw_names(&self) -> bool {
+        self.cg_layout == CgLayout::Bsd43
+    }
+
+    fn name_from_bytes(&self, bytes: &[u8]) -> String {
+        if self.raw_names() {
+            super::raw_name::decode(bytes)
+        } else {
+            String::from_utf8_lossy(bytes).into_owned()
+        }
+    }
+
+    fn name_bytes<'a>(&self, name: &'a str) -> std::borrow::Cow<'a, [u8]> {
+        if self.raw_names() {
+            super::raw_name::encode(name)
+        } else {
+            std::borrow::Cow::Borrowed(name.as_bytes())
+        }
+    }
+
     /// Decide which `struct cg` generation the volume uses by looking for
     /// `CG_MAGIC` in CG 0 — first where 4.4BSD puts it, then where 4.3BSD
     /// does. A volume whose CG 0 is unreadable stays on the modern layout so
@@ -1208,7 +1230,7 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
         } else {
             self.read_inode_data(inode, inode.size, size)?
         };
-        Ok(super::raw_name::decode(&bytes))
+        Ok(self.name_from_bytes(&bytes))
     }
 
     /// Compose a `FileEntry` for `child_inode`, naming it `name` and
@@ -2335,7 +2357,7 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Uf
         if !parent.is_directory() {
             return Err(FilesystemError::NotADirectory(parent.path.clone()));
         }
-        let name_bytes = &*super::raw_name::encode(name);
+        let name_bytes = &*self.name_bytes(name);
         validate_name(name_bytes)?;
         let parent_inum = parent.location as u32;
 
@@ -2405,6 +2427,10 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Uf
         true
     }
 
+    fn stores_raw_names(&self) -> bool {
+        self.raw_names()
+    }
+
     /// UFS stores a symlink two ways, and which one is correct depends on the
     /// target's length: a **fast symlink** (target <= `fs_maxsymlinklen`, 60 on
     /// UFS1 / 120 on UFS2) keeps it inline in the dinode's pointer area and
@@ -2422,7 +2448,7 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Uf
         if !parent.is_directory() {
             return Err(FilesystemError::NotADirectory(parent.path.clone()));
         }
-        let name_bytes = &*super::raw_name::encode(name);
+        let name_bytes = &*self.name_bytes(name);
         validate_name(name_bytes)?;
         if target.is_empty() {
             return Err(FilesystemError::InvalidData(
@@ -2461,7 +2487,7 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Uf
         };
 
         let create_result = (|| -> Result<FileEntry, FilesystemError> {
-            let bytes = &*super::raw_name::encode(target);
+            let bytes = &*self.name_bytes(target);
             let cap = self.inline_symlink_cap();
             if cap > 0 && bytes.len() as u32 <= cap {
                 // Fast symlink: the target overlays the pointer area, and the
@@ -2517,7 +2543,7 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Uf
         if !parent.is_directory() {
             return Err(FilesystemError::NotADirectory(parent.path.clone()));
         }
-        let name_bytes = &*super::raw_name::encode(name);
+        let name_bytes = &*self.name_bytes(name);
         validate_name(name_bytes)?;
         let parent_inum = parent.location as u32;
 
@@ -2657,7 +2683,7 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Uf
         // orphan inode, recoverable; a crash before leaves a dangling
         // dirent, NOT recoverable cleanly).
         let parent_inode = self.read_inode(parent_inum)?;
-        let removed = self.dir_remove(&parent_inode, &super::raw_name::encode(&entry.name))?;
+        let removed = self.dir_remove(&parent_inode, &self.name_bytes(&entry.name))?;
         if removed != entry_inum {
             return Err(FilesystemError::InvalidData(format!(
                 "ufs delete_entry: dirent inum {removed} differs from entry inum {entry_inum}"
@@ -2690,7 +2716,7 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Uf
         if new_name == entry.name {
             return Ok(());
         }
-        let new_name_bytes = &*super::raw_name::encode(new_name);
+        let new_name_bytes = &*self.name_bytes(new_name);
         validate_name(new_name_bytes)?;
 
         let parent_inum = parent.location as u32;
@@ -2719,7 +2745,7 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Uf
         let mut parent_inode = self.read_inode(parent_inum)?;
         self.dir_insert(&mut parent_inode, new_name_bytes, entry_inum, d_type)?;
         self.write_inode(parent_inum, &parent_inode)?;
-        self.dir_remove(&parent_inode, &super::raw_name::encode(&entry.name))?;
+        self.dir_remove(&parent_inode, &self.name_bytes(&entry.name))?;
         Ok(())
     }
 
@@ -3320,7 +3346,7 @@ impl<R: Read + Seek + Send> Filesystem for UfsFilesystem<R> {
 
             if d_ino != 0 && d_namlen > 0 {
                 let name_bytes = &dir_bytes[off + DIRENT_HDR_LEN..off + DIRENT_HDR_LEN + d_namlen];
-                let name = super::raw_name::decode(name_bytes);
+                let name = self.name_from_bytes(name_bytes);
                 if name != "." && name != ".." {
                     let child_inode = self.read_inode(d_ino)?;
                     let child = self.build_file_entry(&name, entry, &child_inode)?;

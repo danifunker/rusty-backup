@@ -717,6 +717,12 @@ pub trait EditableFilesystem: Filesystem {
         false
     }
 
+    /// Whether names are stored as raw bytes via [`crate::fs::raw_name`] placeholders.
+    /// Only NeXT UFS volumes say yes; everywhere else a placeholder would land as junk.
+    fn stores_raw_names(&self) -> bool {
+        false
+    }
+
     /// Create a symbolic link in `parent` pointing at `target` (a path
     /// string interpreted by the filesystem's own resolver semantics).
     /// Returns the new symlink's entry. Default returns `Unsupported` —

@@ -121,10 +121,31 @@ fn entry_kind<R: Read>(entry: &tar::Entry<'_, R>) -> tar::EntryType {
     }
 }
 
-/// A member name as text. Old archives carry NeXTSTEP-encoded or EUC-JP names; bytes that are
-/// not UTF-8 ride as [`crate::fs::raw_name`] placeholders and land on a Unix volume byte for byte.
-fn member_path(bytes: &[u8]) -> String {
-    crate::fs::raw_name::decode(bytes)
+/// A member name as text. Bytes that are not UTF-8 ride as [`crate::fs::raw_name`] placeholders
+/// on a target that stores raw names (NeXT UFS), and as `%XX` everywhere else.
+fn member_path(bytes: &[u8], raw: bool) -> String {
+    if raw {
+        return crate::fs::raw_name::decode(bytes);
+    }
+    let mut out = String::new();
+    let mut rest = bytes;
+    loop {
+        match std::str::from_utf8(rest) {
+            Ok(s) => {
+                out.push_str(s);
+                return out;
+            }
+            Err(e) => {
+                let (good, bad) = rest.split_at(e.valid_up_to());
+                out.push_str(std::str::from_utf8(good).unwrap_or_default());
+                let n = e.error_len().unwrap_or(bad.len());
+                for b in &bad[..n] {
+                    out.push_str(&format!("%{b:02X}"));
+                }
+                rest = &bad[n..];
+            }
+        }
+    }
 }
 
 /// Feeds a tar stream through with the size field zeroed on link, device and directory headers.
@@ -383,6 +404,7 @@ fn import_tar_inner<R: Read>(
     // GNU tar 1.11 members parked under `@@MaNgLeD.N` until the `N` entry names them.
     let mut mangled: std::collections::HashMap<String, Mangled> = std::collections::HashMap::new();
     let mut mangled_bytes = 0u64;
+    let raw_names = efs.stores_raw_names();
     // Paths this archive already wrote: tar lets a later copy of a member replace the earlier one.
     let mut written: std::collections::HashSet<Vec<String>> = std::collections::HashSet::new();
     let replace_opts = TarImportOptions {
@@ -394,7 +416,7 @@ fn import_tar_inner<R: Read>(
 
     for entry in ar.entries().context("reading tar entries")? {
         let mut entry = entry.context("reading tar entry")?;
-        let raw_path = std::path::PathBuf::from(member_path(&entry.path_bytes()));
+        let raw_path = std::path::PathBuf::from(member_path(&entry.path_bytes(), raw_names));
         let comps = match safe_components(&raw_path) {
             Some(c) if !c.is_empty() => c,
             // Skip empty paths and anything with `..` / absolute roots.
@@ -469,7 +491,7 @@ fn import_tar_inner<R: Read>(
         } else if etype.is_symlink() {
             let target = entry
                 .link_name_bytes()
-                .map(|b| member_path(&b))
+                .map(|b| member_path(&b, raw_names))
                 .unwrap_or_default();
             sink.push(
                 efs,
@@ -505,7 +527,7 @@ fn import_tar_inner<R: Read>(
         } else if etype.is_hard_link() {
             // No import target can share an inode with an earlier member, so the link lands as a copy.
             let target = match entry.link_name_bytes() {
-                Some(t) => match safe_components(Path::new(&member_path(&t))) {
+                Some(t) => match safe_components(Path::new(&member_path(&t, raw_names))) {
                     Some(c) if !c.is_empty() => sink.lookup(efs, &c)?,
                     _ => None,
                 },
@@ -513,16 +535,20 @@ fn import_tar_inner<R: Read>(
             };
             match target.filter(|t| !t.is_directory()) {
                 Some(t) => {
-                    let bytes = efs
-                        .read_file(&t, usize::MAX)
+                    // RAM for a small target, a temp file past the shared spool threshold.
+                    let mut spool = tempfile::spooled_tempfile(crate::fs::copy::SPOOL_THRESHOLD);
+                    let size = efs
+                        .write_file_to(&t, &mut spool)
                         .map_err(|e| anyhow::anyhow!("reading link target {}: {e}", t.path))?;
-                    let size = bytes.len() as u64;
+                    spool
+                        .seek(SeekFrom::Start(0))
+                        .context("rewinding the link-target spool")?;
                     sink.push(
                         efs,
                         &comps,
                         ImportItem::File {
                             size,
-                            data: &mut std::io::Cursor::new(bytes),
+                            data: &mut spool,
                             mac_fork: None,
                         },
                         &overrides,
@@ -684,7 +710,8 @@ pub fn preflight_tar<R: Read>(
     let mut ar = tar::Archive::new(NormalizedTar::new(archive));
     for entry in ar.entries().context("reading tar entries")? {
         let entry = entry.context("reading tar entry")?;
-        let raw = std::path::PathBuf::from(member_path(&entry.path_bytes()));
+        let raw =
+            std::path::PathBuf::from(member_path(&entry.path_bytes(), efs.stores_raw_names()));
         let comps = match safe_components(&raw) {
             Some(c) if !c.is_empty() => c,
             _ => continue,
@@ -933,32 +960,62 @@ mod tests {
         assert_eq!(read_at(&mut *efs, &["Eval3.3", "after"]), b"still here");
     }
 
+    /// Raw NeXTSTEP / EUC bytes are kept only on a NeXT volume; every other target sees `%XX`.
     #[test]
-    fn non_utf8_member_names_are_escaped_not_refused() {
-        assert_eq!(member_path(b"plain/name"), "plain/name");
+    fn non_utf8_member_names_keep_raw_bytes_only_on_next() {
+        assert_eq!(member_path(b"plain/name", true), "plain/name");
+        assert_eq!(member_path(b"a\xa4\xd8b", false), "a%A4%D8b");
         let raw = b"Steroidgrundger\xf6st.lookMol";
-        assert_eq!(&*crate::fs::raw_name::encode(&member_path(raw)), &raw[..]);
+        assert_eq!(
+            &*crate::fs::raw_name::encode(&member_path(raw, true)),
+            &raw[..]
+        );
 
-        let mut raw = tar::Header::new_gnu();
-        raw.set_size(2);
-        raw.set_mode(0o644);
-        raw.as_mut_bytes()[..9].copy_from_slice(b"caf\xe9.txt\0");
-        raw.set_cksum();
+        let mut h = tar::Header::new_gnu();
+        h.set_size(2);
+        h.set_mode(0o644);
+        h.as_mut_bytes()[..9].copy_from_slice(b"caf\xe9.txt\0");
+        h.set_cksum();
         let mut b = tar::Builder::new(Vec::new());
-        b.append(&raw, &b"ok"[..]).unwrap();
+        b.append(&h, &b"ok"[..]).unwrap();
         let bytes = b.into_inner().unwrap();
-        let mut efs = blank_nextstep_ufs();
-        let root = efs.root().unwrap();
-        import_tar(
-            &mut *efs,
-            &root,
-            &bytes[..],
-            &TarImportOptions::default(),
-            &|_| {},
-        )
-        .unwrap();
+        let import = |efs: &mut dyn EditableFilesystem| {
+            let root = efs.root().unwrap();
+            import_tar(
+                efs,
+                &root,
+                &bytes[..],
+                &TarImportOptions::default(),
+                &|_| {},
+            )
+            .unwrap();
+        };
+
+        let mut next = blank_nextstep_ufs();
+        assert!(next.stores_raw_names());
+        import(&mut *next);
         let name = crate::fs::raw_name::decode(b"caf\xe9.txt");
-        assert_eq!(read_at(&mut *efs, &[name.as_str()]), b"ok");
+        assert_eq!(read_at(&mut *next, &[name.as_str()]), b"ok");
+
+        let bsd =
+            crate::fs::ufs_format::create_blank_ufs1(&crate::fs::ufs_format::Ufs1FormatParams {
+                size_bytes: 8 * 1024 * 1024,
+                ..Default::default()
+            })
+            .unwrap();
+        let fat = crate::fs::fat::create_blank_fat(2 * 1024 * 1024, Some("T")).unwrap();
+        for img in [bsd, fat] {
+            let mut efs =
+                crate::fs::open_editable_filesystem(std::io::Cursor::new(img), 0, 0, None).unwrap();
+            assert!(!efs.stores_raw_names(), "{}", efs.fs_type());
+            import(&mut *efs);
+            assert_eq!(
+                read_at(&mut *efs, &["caf%E9.txt"]),
+                b"ok",
+                "{}",
+                efs.fs_type()
+            );
+        }
     }
 
     /// The same member twice in one archive: the later copy wins, as with GNU tar.
