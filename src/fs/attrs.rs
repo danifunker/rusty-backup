@@ -79,6 +79,11 @@ impl AttrOverrides {
     pub fn is_empty(&self) -> bool {
         self.mode.is_none() && self.uid.is_none() && self.gid.is_none() && self.unix_times.is_none()
     }
+
+    /// True when a mode or owner was specified; a date alone is not a permission.
+    pub fn has_permissions(&self) -> bool {
+        self.mode.is_some() || self.uid.is_some() || self.gid.is_some()
+    }
 }
 
 /// The decision, with provenance per field.

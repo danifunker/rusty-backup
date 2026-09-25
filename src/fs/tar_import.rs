@@ -271,15 +271,32 @@ pub fn import_tar_from_path(
     let n = file.read(&mut magic).unwrap_or(0);
     file.seek(SeekFrom::Start(0)).context("rewind archive")?;
 
-    if n >= 2 && magic[0] == 0x1f && magic[1] == 0x8b {
+    let times = archive_times(path);
+    efs.begin_bulk();
+    let result = if n >= 2 && magic[0] == 0x1f && magic[1] == 0x8b {
         let dec = flate2::read::GzDecoder::new(file);
-        import_tar(efs, dest, dec, opts, progress)
+        import_tar_inner(efs, dest, dec, opts, progress, times)
     } else if n >= 4 && magic == [0x28, 0xb5, 0x2f, 0xfd] {
-        let dec = crate::rbformats::zstd_compat::decoder(file).context("init zstd decoder")?;
-        import_tar(efs, dest, dec, opts, progress)
+        match crate::rbformats::zstd_compat::decoder(file).context("init zstd decoder") {
+            Ok(dec) => import_tar_inner(efs, dest, dec, opts, progress, times),
+            Err(e) => Err(e),
+        }
     } else {
-        import_tar(efs, dest, file, opts, progress)
-    }
+        import_tar_inner(efs, dest, file, opts, progress, times)
+    };
+    efs.end_bulk();
+    result
+}
+
+/// The archive file's own modification time: the date its undated directories inherit.
+pub(crate) fn archive_times(path: &Path) -> Option<crate::fs::times::UnixTimes> {
+    let secs = std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    Some(crate::fs::times::UnixTimes::mtime_only(secs))
 }
 
 /// Import an (already-decompressed, or plain) tar stream into `dest`.
@@ -298,7 +315,7 @@ pub fn import_tar<R: Read>(
     progress: &dyn Fn(&TarImportStats),
 ) -> Result<TarImportStats> {
     efs.begin_bulk();
-    let result = import_tar_inner(efs, dest, archive, opts, progress);
+    let result = import_tar_inner(efs, dest, archive, opts, progress, None);
     efs.end_bulk();
     result
 }
@@ -316,7 +333,7 @@ pub fn import_tar_into<R: Read>(
     opts: &TarImportOptions,
     progress: &dyn Fn(&TarImportStats),
 ) -> Result<TarImportStats> {
-    import_tar_inner(efs, dest, archive, opts, progress)
+    import_tar_inner(efs, dest, archive, opts, progress, None)
 }
 
 /// [`import_tar_from_path`] without the bulk-mode bracketing. See
@@ -334,19 +351,15 @@ pub fn import_tar_from_path_into(
     let n = file.read(&mut magic).unwrap_or(0);
     file.seek(SeekFrom::Start(0)).context("rewind archive")?;
 
+    let times = archive_times(path);
     if n >= 2 && magic[0] == 0x1f && magic[1] == 0x8b {
-        import_tar_into(
-            efs,
-            dest,
-            flate2::read::GzDecoder::new(file),
-            opts,
-            progress,
-        )
+        let dec = flate2::read::GzDecoder::new(file);
+        import_tar_inner(efs, dest, dec, opts, progress, times)
     } else if n >= 4 && magic == [0x28, 0xb5, 0x2f, 0xfd] {
         let dec = crate::rbformats::zstd_compat::decoder(file).context("init zstd decoder")?;
-        import_tar_into(efs, dest, dec, opts, progress)
+        import_tar_inner(efs, dest, dec, opts, progress, times)
     } else {
-        import_tar_into(efs, dest, file, opts, progress)
+        import_tar_inner(efs, dest, file, opts, progress, times)
     }
 }
 
@@ -392,8 +405,10 @@ fn import_tar_inner<R: Read>(
     archive: R,
     opts: &TarImportOptions,
     progress: &dyn Fn(&TarImportStats),
+    dir_times: Option<crate::fs::times::UnixTimes>,
 ) -> Result<TarImportStats> {
     let mut sink = Importer::new(dest);
+    sink.implicit_dir_times = dir_times;
     // macOS tar writes `._name` right before `name`; the parsed sidecar waits
     // here so the primary file lands with its resource fork and type codes.
     let mut pending_forks: std::collections::HashMap<
@@ -428,7 +443,11 @@ fn import_tar_inner<R: Read>(
         // Empty when `apply_permissions` is off, in which case the shared
         // resolver falls back to the replaced entry / parent directory —
         // the same precedence `rb-cli put` uses.
-        let overrides = archived_overrides(entry.header(), opts.apply_permissions);
+        let mut overrides = archived_overrides(entry.header(), opts.apply_permissions);
+        // A member the archive never dated (mtime 0) takes the archive's date, not the import day.
+        if overrides.unix_times.is_none() {
+            overrides.unix_times = dir_times;
+        }
 
         if entry.header().entry_type().as_byte() == b'N' {
             let mut list = Vec::new();

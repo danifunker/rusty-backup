@@ -60,6 +60,7 @@ fn opts(recursive: bool) -> CopyOptions {
         names: NamePolicy::Truncate,
         attrs: AttrPolicy::Preserve,
         flatten: false,
+        preserve_times: false,
     }
 }
 
