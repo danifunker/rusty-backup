@@ -290,7 +290,7 @@ impl Importer {
                 if applied {
                     self.stats.perms_applied += 1;
                 }
-            } else if !overrides.is_empty() {
+            } else if overrides.has_permissions() {
                 self.stats.perms_applied += 1;
             }
             return Ok(());
@@ -428,7 +428,7 @@ impl Importer {
                     .insert(name.clone());
                 self.stats.files += 1;
                 self.stats.total_bytes += size;
-                if !overrides.is_empty() {
+                if overrides.has_permissions() {
                     self.stats.perms_applied += 1;
                 }
             }

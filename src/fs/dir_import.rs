@@ -156,6 +156,8 @@ fn measure_expanded(flavor: ArchiveFlavor, path: &Path) -> Result<(u64, u64, u64
 fn expanded_dir_name(file_name: &str) -> String {
     let lower = file_name.to_ascii_lowercase();
     for suffix in [
+        ".gnutar.gz",
+        ".gtar.gz",
         ".tar.gz",
         ".tar.zst",
         ".tar.zstd",
@@ -166,6 +168,8 @@ fn expanded_dir_name(file_name: &str) -> String {
         ".tbz2",
         ".txz",
         ".tardist",
+        ".gnutar",
+        ".gtar",
         ".tar",
         ".sit.hqx",
         ".sea.hqx",
@@ -1014,6 +1018,13 @@ mod tests {
             // No entries for `deep/` or `deep/er/`: both are implicit parents.
             b.append_data(&mut h, "deep/er/one.txt", &b"one"[..])
                 .unwrap();
+            let mut u = tar::Header::new_gnu();
+            u.set_size(3);
+            u.set_mode(0o644);
+            u.set_mtime(0);
+            u.set_cksum();
+            b.append_data(&mut u, "deep/undated.txt", &b"two"[..])
+                .unwrap();
             b.into_inner().unwrap().finish().unwrap();
         }
         set_mtime(&tgz, ARCHIVE_DATE);
@@ -1034,6 +1045,12 @@ mod tests {
         }
         let file = entry_at(&mut *efs, &["pkg", "deep", "er", "one.txt"]);
         assert_eq!(file.modified_unix, Some(MEMBER_DATE));
+        let undated = entry_at(&mut *efs, &["pkg", "deep", "undated.txt"]);
+        assert_eq!(
+            undated.modified_unix,
+            Some(ARCHIVE_DATE),
+            "mtime 0 takes the archive date"
+        );
     }
 
     /// --expand-gunzip dates the output from the gzip header, else from the .gz file.
@@ -1295,6 +1312,13 @@ mod tests {
         assert_eq!(expanded_dir_name("bar.tardist"), "bar");
         assert_eq!(expanded_dir_name("baz.tgz"), "baz");
         assert_eq!(expanded_dir_name("qux.TAR.GZ"), "qux");
+        // GNU tar's own names, common on NeXT archives.
+        assert_eq!(
+            expanded_dir_name("MiscKit.2.0.5.s.gnutar.gz"),
+            "MiscKit.2.0.5.s"
+        );
+        assert_eq!(expanded_dir_name("fly.NIHS.bs.gnutar"), "fly.NIHS.bs");
+        assert_eq!(expanded_dir_name("HKGnats-1.0.gtar.gz"), "HKGnats-1.0");
         // Not an archive suffix -> untouched.
         assert_eq!(expanded_dir_name("plain.txt"), "plain.txt");
         // Stripping to nothing keeps the original.

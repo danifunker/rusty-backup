@@ -443,7 +443,11 @@ fn import_tar_inner<R: Read>(
         // Empty when `apply_permissions` is off, in which case the shared
         // resolver falls back to the replaced entry / parent directory —
         // the same precedence `rb-cli put` uses.
-        let overrides = archived_overrides(entry.header(), opts.apply_permissions);
+        let mut overrides = archived_overrides(entry.header(), opts.apply_permissions);
+        // A member the archive never dated (mtime 0) takes the archive's date, not the import day.
+        if overrides.unix_times.is_none() {
+            overrides.unix_times = dir_times;
+        }
 
         if entry.header().entry_type().as_byte() == b'N' {
             let mut list = Vec::new();
