@@ -1339,9 +1339,9 @@ jobs:
           # pin it on both arches and keep the first one apt can resolve,
           # downgrading amd64 glib if that is what it takes.
           pin=/etc/apt/preferences.d/riscv64-glib-version.pref
-          amd64_versions=$(apt-cache madison libglib2.0-0t64 | awk -F' [|] ' '/ amd64 /{print $2}')
+          amd64_versions=$(apt-cache madison libglib2.0-0t64:amd64 | awk -F' [|] ' '/ amd64 /{print $2}')
           glib=
-          for v in $(apt-cache madison libglib2.0-dev | awk -F' [|] ' '/ riscv64 /{print $2}'); do
+          for v in $(apt-cache madison libglib2.0-dev:riscv64 | awk -F' [|] ' '/ riscv64 /{print $2}'); do
             grep -qxF "$v" <<<"$amd64_versions" || continue
             printf 'Package: libglib2.0* gir1.2-glib-2.0* libgirepository-2.0*\nPin: version %s\nPin-Priority: 1001\n' "$v" \
               | sudo tee "$pin" >/dev/null
