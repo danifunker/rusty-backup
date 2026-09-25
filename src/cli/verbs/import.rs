@@ -194,6 +194,18 @@ pub(crate) fn summarize(dir: &std::path::Path, dest: &str, stats: &ImportStats, 
         stats.symlinks,
         stats.total_bytes
     ));
+    if stats.hardlinks_copied > 0 {
+        log_stderr(format!(
+            "  {} tar hard link(s) written as copies of their target",
+            stats.hardlinks_copied
+        ));
+    }
+    if stats.mangled_renamed > 0 {
+        log_stderr(format!(
+            "  {} GNU tar long name(s) restored from @@MaNgLeD placeholders",
+            stats.mangled_renamed
+        ));
+    }
     if stats.gunzipped > 0 {
         log_stderr(format!(
             "  {} gzip file(s) decompressed into the image",

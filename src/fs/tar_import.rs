@@ -281,6 +281,9 @@ fn import_tar_inner<R: Read>(
         crate::fs::resource_fork::ImportedResourceFork,
     > = std::collections::HashMap::new();
     const MAX_SIDECAR_BYTES: u64 = 16 * 1024 * 1024;
+    // GNU tar 1.11 members parked under `@@MaNgLeD.N` until the `N` entry names them.
+    let mut mangled: std::collections::HashMap<String, Mangled> = std::collections::HashMap::new();
+    let mut mangled_bytes = 0u64;
     let mut ar = tar::Archive::new(archive);
 
     for entry in ar.entries().context("reading tar entries")? {
@@ -298,6 +301,38 @@ fn import_tar_inner<R: Read>(
         // resolver falls back to the replaced entry / parent directory —
         // the same precedence `rb-cli put` uses.
         let overrides = archived_overrides(entry.header(), opts.apply_permissions);
+
+        if entry.header().entry_type().as_byte() == b'N' {
+            let mut list = Vec::new();
+            entry
+                .read_to_end(&mut list)
+                .with_context(|| format!("reading {display}"))?;
+            let list = String::from_utf8_lossy(&list).into_owned();
+            restore_mangled(efs, &mut sink, &mut mangled, &list, opts)?;
+            progress(&sink.stats);
+            continue;
+        }
+        if comps.len() == 1
+            && comps[0].starts_with(MANGLED_PREFIX)
+            && (etype.is_file() || etype.is_dir())
+            && mangled_bytes + entry.size() <= MAX_MANGLED_BYTES
+        {
+            let mut data = Vec::new();
+            entry
+                .read_to_end(&mut data)
+                .with_context(|| format!("reading {display}"))?;
+            mangled_bytes += data.len() as u64;
+            let dir = etype.is_dir();
+            mangled.insert(
+                comps[0].clone(),
+                Mangled {
+                    dir,
+                    data,
+                    overrides,
+                },
+            );
+            continue;
+        }
 
         // Classify, then let the shared sink do the writing. Everything past
         // this point — traversal guarding, mkdir -p, conflict policy, attr
@@ -358,8 +393,46 @@ fn import_tar_inner<R: Read>(
                 opts,
                 &display,
             )?;
+        } else if etype.is_hard_link() {
+            // No import target can share an inode with an earlier member, so the link lands as a copy.
+            let target = match entry.link_name().ok().flatten() {
+                Some(t) => match safe_components(&t) {
+                    Some(c) if !c.is_empty() => sink.lookup(efs, &c)?,
+                    _ => None,
+                },
+                None => None,
+            };
+            match target.filter(|t| !t.is_directory()) {
+                Some(t) => {
+                    let bytes = efs
+                        .read_file(&t, usize::MAX)
+                        .map_err(|e| anyhow::anyhow!("reading link target {}: {e}", t.path))?;
+                    let size = bytes.len() as u64;
+                    sink.push(
+                        efs,
+                        &comps,
+                        ImportItem::File {
+                            size,
+                            data: &mut std::io::Cursor::new(bytes),
+                            mac_fork: None,
+                        },
+                        &overrides,
+                        opts,
+                        &display,
+                    )?;
+                    sink.stats.hardlinks_copied += 1;
+                }
+                None => sink.push(
+                    efs,
+                    &comps,
+                    ImportItem::Unsupported,
+                    &overrides,
+                    opts,
+                    &display,
+                )?,
+            }
         } else {
-            // Hardlinks, char/block devices, fifos, sockets.
+            // Char/block devices, fifos, sockets, and hard links whose target never landed.
             sink.push(
                 efs,
                 &comps,
@@ -373,7 +446,96 @@ fn import_tar_inner<R: Read>(
     }
     // A sidecar whose file never came, or came first, has nothing to join.
     sink.stats.appledouble_skipped += pending_forks.len() as u64;
+    // Members the rename list never named keep the placeholder GNU tar gave them.
+    let mut leftover: Vec<_> = mangled.into_iter().collect();
+    leftover.sort_by(|a, b| a.0.cmp(&b.0));
+    for (name, m) in leftover {
+        push_mangled(efs, &mut sink, std::slice::from_ref(&name), m, opts, &name)?;
+    }
     Ok(sink.stats)
+}
+
+/// Prefix GNU tar 1.11 stores over-long member names under.
+const MANGLED_PREFIX: &str = "@@MaNgLeD.";
+/// Most member data held in memory while waiting for the rename list; past it, members land as-is.
+const MAX_MANGLED_BYTES: u64 = 256 * 1024 * 1024;
+
+/// One `@@MaNgLeD.N` member waiting for its real name.
+struct Mangled {
+    dir: bool,
+    data: Vec<u8>,
+    overrides: crate::fs::attrs::AttrOverrides,
+}
+
+fn push_mangled(
+    efs: &mut dyn EditableFilesystem,
+    sink: &mut Importer,
+    comps: &[String],
+    m: Mangled,
+    opts: &TarImportOptions,
+    display: &str,
+) -> Result<()> {
+    if m.dir {
+        return sink.push(efs, comps, ImportItem::Dir, &m.overrides, opts, display);
+    }
+    let size = m.data.len() as u64;
+    sink.push(
+        efs,
+        comps,
+        ImportItem::File {
+            size,
+            data: &mut std::io::Cursor::new(m.data),
+            mac_fork: None,
+        },
+        &m.overrides,
+        opts,
+        display,
+    )
+}
+
+/// Apply a GNU tar 1.11 `N` entry: `Rename @@MaNgLeD.N to <path>` moves a held member to its
+/// real name, `Symlink <target> to <path>` creates a link whose name was too long.
+fn restore_mangled(
+    efs: &mut dyn EditableFilesystem,
+    sink: &mut Importer,
+    held: &mut std::collections::HashMap<String, Mangled>,
+    list: &str,
+    opts: &TarImportOptions,
+) -> Result<()> {
+    for line in list.lines() {
+        let Some((kind, rest)) = line.split_once(' ') else {
+            continue;
+        };
+        let Some((from, to)) = rest.split_once(" to ") else {
+            continue;
+        };
+        let comps = match safe_components(Path::new(to)) {
+            Some(c) if !c.is_empty() => c,
+            _ => continue,
+        };
+        match kind {
+            "Rename" => {
+                if let Some(m) = held.remove(from) {
+                    push_mangled(efs, sink, &comps, m, opts, to)?;
+                    sink.stats.mangled_renamed += 1;
+                }
+            }
+            "Symlink" => {
+                let target = from.to_string();
+                sink.push(
+                    efs,
+                    &comps,
+                    ImportItem::Symlink { target },
+                    &crate::fs::attrs::AttrOverrides::default(),
+                    opts,
+                    to,
+                )?;
+                sink.stats.mangled_renamed += 1;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Preflight an archive on the host against `efs`, auto-detecting compression.
@@ -436,7 +598,8 @@ pub fn preflight_tar<R: Read>(
             if !supports_symlinks {
                 pf.symlinks_dropped += 1;
             }
-        } else if etype.is_file() {
+        } else if etype.is_file() || etype.is_hard_link() {
+            // A hard link lands as a copy of its target.
             pf.files += 1;
         } else {
             pf.other_unsupported += 1;
@@ -516,6 +679,116 @@ mod tests {
             add("._HELLO.TXT", &ad);
         }
         b.into_inner().unwrap()
+    }
+
+    fn blank_nextstep_ufs() -> Box<dyn EditableFilesystem> {
+        let img =
+            crate::fs::ufs_format::create_blank_ufs1(&crate::fs::ufs_format::Ufs1FormatParams {
+                size_bytes: 8 * 1024 * 1024,
+                cg_layout: crate::fs::ufs::CgLayout::Bsd43,
+                endian: crate::fs::ufs::UfsEndian::Big,
+                ..Default::default()
+            })
+            .unwrap();
+        crate::fs::open_editable_filesystem(std::io::Cursor::new(img), 0, 0, None).unwrap()
+    }
+
+    fn read_at(efs: &mut dyn EditableFilesystem, path: &[&str]) -> Vec<u8> {
+        let mut e = efs.root().unwrap();
+        for name in path {
+            e = efs
+                .list_directory(&e)
+                .unwrap()
+                .into_iter()
+                .find(|c| c.name == *name)
+                .unwrap_or_else(|| panic!("{name} missing under {}", e.path));
+        }
+        efs.read_file(&e, usize::MAX).unwrap()
+    }
+
+    fn append(b: &mut tar::Builder<Vec<u8>>, name: &str, data: &[u8]) {
+        let mut h = tar::Header::new_gnu();
+        h.set_size(data.len() as u64);
+        h.set_mode(0o755);
+        h.set_cksum();
+        b.append_data(&mut h, name, data).unwrap();
+    }
+
+    /// A hard link lands as a copy of its target: Opener.app's `gunzip` is `zcat`.
+    #[test]
+    fn a_hard_link_lands_as_a_copy_of_its_target() {
+        let mut b = tar::Builder::new(Vec::new());
+        append(&mut b, "Opener.app/zcat", b"zcat binary");
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Link);
+        h.set_size(0);
+        h.set_mode(0o755);
+        b.append_link(&mut h, "Opener.app/gunzip", "Opener.app/zcat")
+            .unwrap();
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Link);
+        h.set_size(0);
+        b.append_link(&mut h, "Opener.app/dangling", "Opener.app/missing")
+            .unwrap();
+        let bytes = b.into_inner().unwrap();
+
+        let mut efs = blank_nextstep_ufs();
+        let root = efs.root().unwrap();
+        let stats = import_tar(
+            &mut *efs,
+            &root,
+            &bytes[..],
+            &TarImportOptions::default(),
+            &|_| {},
+        )
+        .unwrap();
+        assert_eq!((stats.hardlinks_copied, stats.other_skipped), (1, 1));
+        assert_eq!(
+            read_at(&mut *efs, &["Opener.app", "gunzip"]),
+            b"zcat binary"
+        );
+    }
+
+    /// GNU tar 1.11 parks long names under `@@MaNgLeD.N` and names them in a trailing `N` entry.
+    #[test]
+    fn gnu_mangled_names_are_restored() {
+        let long = "Calendar/UsingCalendarPalette/UsingCalendarPalette.app/English.lproj/\
+                    UsingCalendarPalette.nib/data.classes";
+        let mut b = tar::Builder::new(Vec::new());
+        append(&mut b, "Calendar/README", b"readme");
+        append(&mut b, "@@MaNgLeD.0", b"FirstResponder = {};");
+        append(&mut b, "@@MaNgLeD.1", b"never named");
+        let list = format!("Rename @@MaNgLeD.0 to {long}\nSymlink data.classes to {long}.link\n");
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::new(b'N'));
+        h.set_size(list.len() as u64);
+        h.set_cksum();
+        b.append_data(&mut h, "././@MaNgLeD_NaMeS", list.as_bytes())
+            .unwrap();
+        let bytes = b.into_inner().unwrap();
+
+        let mut efs = blank_nextstep_ufs();
+        let root = efs.root().unwrap();
+        let stats = import_tar(
+            &mut *efs,
+            &root,
+            &bytes[..],
+            &TarImportOptions::default(),
+            &|_| {},
+        )
+        .unwrap();
+        assert_eq!(stats.mangled_renamed, 2);
+        let parts: Vec<&str> = long.split('/').collect();
+        assert_eq!(read_at(&mut *efs, &parts), b"FirstResponder = {};");
+        // A member the list never named keeps its placeholder rather than vanishing.
+        assert_eq!(read_at(&mut *efs, &["@@MaNgLeD.1"]), b"never named");
+        let names: Vec<String> = efs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(!names.iter().any(|n| n == "@@MaNgLeD.0"), "{names:?}");
     }
 
     /// X14: a `._name` member was dropped; macOS tar writes it right before

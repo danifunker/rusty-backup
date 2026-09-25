@@ -88,6 +88,10 @@ pub struct ImportStats {
     pub archives_expanded: u64,
     /// Gzip files decompressed into the image (`--expand-gunzip`).
     pub gunzipped: u64,
+    /// Tar hard links written as a copy of their target, which no import target can share.
+    pub hardlinks_copied: u64,
+    /// GNU tar 1.11 `@@MaNgLeD.N` members restored to the long names their `N` entry records.
+    pub mangled_renamed: u64,
 }
 
 impl ImportStats {
@@ -107,6 +111,8 @@ impl ImportStats {
         self.total_bytes += other.total_bytes;
         self.archives_expanded += other.archives_expanded;
         self.gunzipped += other.gunzipped;
+        self.hardlinks_copied += other.hardlinks_copied;
+        self.mangled_renamed += other.mangled_renamed;
     }
 }
 
@@ -425,6 +431,25 @@ impl Importer {
             ImportItem::Unsupported => self.stats.other_skipped += 1,
         }
         Ok(())
+    }
+
+    /// Resolve an entry this import (or the volume) already has at `comps`, without creating anything.
+    pub fn lookup(
+        &mut self,
+        efs: &mut dyn EditableFilesystem,
+        comps: &[String],
+    ) -> Result<Option<FileEntry>> {
+        let Some((leaf, dirs)) = comps.split_last() else {
+            return Ok(None);
+        };
+        let mut parent = self.dir_cache.get("").expect("root cached").clone();
+        for comp in dirs {
+            match find_child(efs, &parent, comp)? {
+                Some(e) if e.is_directory() => parent = e,
+                _ => return Ok(None),
+            }
+        }
+        find_child(efs, &parent, leaf)
     }
 
     /// Create (or resolve) the directory at `comps` and hand back its entry,
