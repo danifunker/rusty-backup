@@ -121,28 +121,10 @@ fn entry_kind<R: Read>(entry: &tar::Entry<'_, R>) -> tar::EntryType {
     }
 }
 
-/// A member name as text. Old archives carry EUC or Latin-1 names; the bytes that are not
-/// UTF-8 become `%XX`, which keeps every name distinct and ASCII-safe.
+/// A member name as text. Old archives carry NeXTSTEP-encoded or EUC-JP names; bytes that are
+/// not UTF-8 ride as [`crate::fs::raw_name`] placeholders and land on a Unix volume byte for byte.
 fn member_path(bytes: &[u8]) -> String {
-    let mut out = String::new();
-    let mut rest = bytes;
-    loop {
-        match std::str::from_utf8(rest) {
-            Ok(s) => {
-                out.push_str(s);
-                return out;
-            }
-            Err(e) => {
-                let (good, bad) = rest.split_at(e.valid_up_to());
-                out.push_str(std::str::from_utf8(good).unwrap_or_default());
-                let n = e.error_len().unwrap_or(bad.len());
-                for b in &bad[..n] {
-                    out.push_str(&format!("%{b:02X}"));
-                }
-                rest = &bad[n..];
-            }
-        }
-    }
+    crate::fs::raw_name::decode(bytes)
 }
 
 /// Feeds a tar stream through with the size field zeroed on link, device and directory headers.
@@ -954,11 +936,8 @@ mod tests {
     #[test]
     fn non_utf8_member_names_are_escaped_not_refused() {
         assert_eq!(member_path(b"plain/name"), "plain/name");
-        assert_eq!(
-            member_path(b"Steroidgrundger\xfcst.lookMol"),
-            "Steroidgrundger%FCst.lookMol"
-        );
-        assert_eq!(member_path(b"a\xa4\xd8b"), "a%A4%D8b");
+        let raw = b"Steroidgrundger\xf6st.lookMol";
+        assert_eq!(&*crate::fs::raw_name::encode(&member_path(raw)), &raw[..]);
 
         let mut raw = tar::Header::new_gnu();
         raw.set_size(2);
@@ -978,7 +957,8 @@ mod tests {
             &|_| {},
         )
         .unwrap();
-        assert_eq!(read_at(&mut *efs, &["caf%E9.txt"]), b"ok");
+        let name = crate::fs::raw_name::decode(b"caf\xe9.txt");
+        assert_eq!(read_at(&mut *efs, &[name.as_str()]), b"ok");
     }
 
     /// The same member twice in one archive: the later copy wins, as with GNU tar.

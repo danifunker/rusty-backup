@@ -1208,7 +1208,7 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
         } else {
             self.read_inode_data(inode, inode.size, size)?
         };
-        Ok(String::from_utf8_lossy(&bytes).into_owned())
+        Ok(super::raw_name::decode(&bytes))
     }
 
     /// Compose a `FileEntry` for `child_inode`, naming it `name` and
@@ -2335,7 +2335,7 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Uf
         if !parent.is_directory() {
             return Err(FilesystemError::NotADirectory(parent.path.clone()));
         }
-        let name_bytes = name.as_bytes();
+        let name_bytes = &*super::raw_name::encode(name);
         validate_name(name_bytes)?;
         let parent_inum = parent.location as u32;
 
@@ -2422,7 +2422,7 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Uf
         if !parent.is_directory() {
             return Err(FilesystemError::NotADirectory(parent.path.clone()));
         }
-        let name_bytes = name.as_bytes();
+        let name_bytes = &*super::raw_name::encode(name);
         validate_name(name_bytes)?;
         if target.is_empty() {
             return Err(FilesystemError::InvalidData(
@@ -2461,7 +2461,7 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Uf
         };
 
         let create_result = (|| -> Result<FileEntry, FilesystemError> {
-            let bytes = target.as_bytes();
+            let bytes = &*super::raw_name::encode(target);
             let cap = self.inline_symlink_cap();
             if cap > 0 && bytes.len() as u32 <= cap {
                 // Fast symlink: the target overlays the pointer area, and the
@@ -2517,7 +2517,7 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Uf
         if !parent.is_directory() {
             return Err(FilesystemError::NotADirectory(parent.path.clone()));
         }
-        let name_bytes = name.as_bytes();
+        let name_bytes = &*super::raw_name::encode(name);
         validate_name(name_bytes)?;
         let parent_inum = parent.location as u32;
 
@@ -2657,7 +2657,7 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Uf
         // orphan inode, recoverable; a crash before leaves a dangling
         // dirent, NOT recoverable cleanly).
         let parent_inode = self.read_inode(parent_inum)?;
-        let removed = self.dir_remove(&parent_inode, entry.name.as_bytes())?;
+        let removed = self.dir_remove(&parent_inode, &super::raw_name::encode(&entry.name))?;
         if removed != entry_inum {
             return Err(FilesystemError::InvalidData(format!(
                 "ufs delete_entry: dirent inum {removed} differs from entry inum {entry_inum}"
@@ -2690,7 +2690,7 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Uf
         if new_name == entry.name {
             return Ok(());
         }
-        let new_name_bytes = new_name.as_bytes();
+        let new_name_bytes = &*super::raw_name::encode(new_name);
         validate_name(new_name_bytes)?;
 
         let parent_inum = parent.location as u32;
@@ -2719,7 +2719,7 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Uf
         let mut parent_inode = self.read_inode(parent_inum)?;
         self.dir_insert(&mut parent_inode, new_name_bytes, entry_inum, d_type)?;
         self.write_inode(parent_inum, &parent_inode)?;
-        self.dir_remove(&parent_inode, entry.name.as_bytes())?;
+        self.dir_remove(&parent_inode, &super::raw_name::encode(&entry.name))?;
         Ok(())
     }
 
@@ -3320,7 +3320,7 @@ impl<R: Read + Seek + Send> Filesystem for UfsFilesystem<R> {
 
             if d_ino != 0 && d_namlen > 0 {
                 let name_bytes = &dir_bytes[off + DIRENT_HDR_LEN..off + DIRENT_HDR_LEN + d_namlen];
-                let name = String::from_utf8_lossy(name_bytes).into_owned();
+                let name = super::raw_name::decode(name_bytes);
                 if name != "." && name != ".." {
                     let child_inode = self.read_inode(d_ino)?;
                     let child = self.build_file_entry(&name, entry, &child_inode)?;
