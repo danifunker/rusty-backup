@@ -123,6 +123,8 @@ pub fn import_mac_archive_from_path_into(
         // A flat destination (MFS, CP/M, …) can still receive an archive's
         // files; collapsing beats erroring out mid-import.
         flatten: true,
+        // An expanded archive keeps its members' own dates, not the day it was imported.
+        preserve_times: true,
         ..CopyOptions::default()
     };
 

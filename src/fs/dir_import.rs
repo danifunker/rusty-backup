@@ -106,10 +106,20 @@ fn gunzip_target(host: &Path, file_name: &str) -> Option<String> {
 /// Decompressed length of a (possibly multi-member) gzip file. The trailer's
 /// ISIZE is only the length mod 4 GiB, so the stream is counted instead.
 fn gunzipped_len(path: &Path) -> Result<u64> {
+    Ok(gunzip_scan(path)?.0)
+}
+
+/// Decompressed length plus the original file's mtime from the gzip header (0 means unset).
+fn gunzip_scan(path: &Path) -> Result<(u64, Option<u64>)> {
     let f = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mut dec = flate2::read::MultiGzDecoder::new(std::io::BufReader::new(f));
-    std::io::copy(&mut dec, &mut std::io::sink())
-        .with_context(|| format!("decompressing {}", path.display()))
+    let len = std::io::copy(&mut dec, &mut std::io::sink())
+        .with_context(|| format!("decompressing {}", path.display()))?;
+    let mtime = dec
+        .header()
+        .map(|h| u64::from(h.mtime()))
+        .filter(|t| *t != 0);
+    Ok((len, mtime))
 }
 
 /// Which expander handles a host file under `expand_archives`.
@@ -404,7 +414,12 @@ fn import_dir_inner(
                     .then(|| e.comps.last().and_then(|n| gunzip_target(&e.host, n)))
                     .flatten()
                 {
-                    let len = gunzipped_len(&e.host)?;
+                    let (len, header_mtime) = gunzip_scan(&e.host)?;
+                    // The gzip header records the original file's date; fall back to the .gz's own.
+                    let mut overrides = overrides;
+                    if let Some(t) = header_mtime {
+                        overrides.unix_times = Some(crate::fs::times::UnixTimes::mtime_only(t));
+                    }
                     let f = File::open(&e.host).with_context(|| format!("opening {display}"))?;
                     let mut dec = flate2::read::MultiGzDecoder::new(std::io::BufReader::new(f));
                     sink.push(
@@ -533,10 +548,11 @@ fn expand_archive(
         comps[last] = expanded_dir_name(&file_name);
     }
 
-    let dir = match sink.ensure_dir_at(efs, &comps)? {
-        Some(d) => d,
-        None => return Ok(false),
-    };
+    let dir =
+        match sink.ensure_dir_at(efs, &comps, crate::fs::tar_import::archive_times(&e.host))? {
+            Some(d) => d,
+            None => return Ok(false),
+        };
     // The nested import's tally is reported against the parent's totals, so
     // the caller's progress callback keeps counting up rather than restarting.
     let base = sink.stats.clone();
@@ -944,6 +960,114 @@ mod tests {
             .into_iter()
             .map(|e| e.name)
             .collect()
+    }
+
+    /// Archive dates for the test fixtures: 1994-01-04 and 1998-07-14.
+    const ARCHIVE_DATE: u64 = 757_641_600;
+    const MEMBER_DATE: u64 = 900_374_400;
+
+    fn blank_next_ufs() -> Box<dyn EditableFilesystem> {
+        let img =
+            crate::fs::ufs_format::create_blank_ufs1(&crate::fs::ufs_format::Ufs1FormatParams {
+                size_bytes: 8 * 1024 * 1024,
+                cg_layout: crate::fs::ufs::CgLayout::Bsd43,
+                endian: crate::fs::ufs::UfsEndian::Big,
+                ..Default::default()
+            })
+            .unwrap();
+        crate::fs::open_editable_filesystem(std::io::Cursor::new(img), 0, 0, None).unwrap()
+    }
+
+    fn entry_at(efs: &mut dyn EditableFilesystem, path: &[&str]) -> FileEntry {
+        let mut e = efs.root().unwrap();
+        for name in path {
+            e = efs
+                .list_directory(&e)
+                .unwrap()
+                .into_iter()
+                .find(|c| c.name == *name)
+                .unwrap_or_else(|| panic!("{name} missing"));
+        }
+        e
+    }
+
+    fn set_mtime(path: &Path, secs: u64) {
+        let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+            .unwrap();
+    }
+
+    /// Directories an archive never dates take the archive's own date; its files keep theirs.
+    #[test]
+    fn expanded_archive_directories_take_the_archive_date() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tgz = tmp.path().join("pkg.tar.gz");
+        {
+            let f = std::fs::File::create(&tgz).unwrap();
+            let enc = flate2::write::GzEncoder::new(f, flate2::Compression::default());
+            let mut b = tar::Builder::new(enc);
+            let mut h = tar::Header::new_gnu();
+            h.set_size(3);
+            h.set_mode(0o644);
+            h.set_mtime(MEMBER_DATE);
+            h.set_cksum();
+            // No entries for `deep/` or `deep/er/`: both are implicit parents.
+            b.append_data(&mut h, "deep/er/one.txt", &b"one"[..])
+                .unwrap();
+            b.into_inner().unwrap().finish().unwrap();
+        }
+        set_mtime(&tgz, ARCHIVE_DATE);
+
+        let mut efs = blank_next_ufs();
+        let root = efs.root().unwrap();
+        let opts = DirImportOptions {
+            expand_archives: true,
+            ..Default::default()
+        };
+        import_dir(&mut *efs, &root, tmp.path(), &opts, &|_| {}).unwrap();
+        for dir in [&["pkg"][..], &["pkg", "deep"], &["pkg", "deep", "er"]] {
+            assert_eq!(
+                entry_at(&mut *efs, dir).modified_unix,
+                Some(ARCHIVE_DATE),
+                "{dir:?}"
+            );
+        }
+        let file = entry_at(&mut *efs, &["pkg", "deep", "er", "one.txt"]);
+        assert_eq!(file.modified_unix, Some(MEMBER_DATE));
+    }
+
+    /// --expand-gunzip dates the output from the gzip header, else from the .gz file.
+    #[test]
+    fn gunzipped_files_keep_the_original_date() {
+        use std::io::Write as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let stamped = tmp.path().join("notes.txt.gz");
+        let f = std::fs::File::create(&stamped).unwrap();
+        let mut enc = flate2::GzBuilder::new()
+            .mtime(MEMBER_DATE as u32)
+            .write(f, flate2::Compression::default());
+        enc.write_all(b"dated").unwrap();
+        enc.finish().unwrap();
+        set_mtime(&stamped, ARCHIVE_DATE);
+        let plain = tmp.path().join("plain.bin.gz");
+        write_gz(&plain, b"undated");
+        set_mtime(&plain, ARCHIVE_DATE);
+
+        let mut efs = blank_next_ufs();
+        let root = efs.root().unwrap();
+        let opts = DirImportOptions {
+            expand_gunzip: true,
+            ..Default::default()
+        };
+        import_dir(&mut *efs, &root, tmp.path(), &opts, &|_| {}).unwrap();
+        assert_eq!(
+            entry_at(&mut *efs, &["notes.txt"]).modified_unix,
+            Some(MEMBER_DATE)
+        );
+        assert_eq!(
+            entry_at(&mut *efs, &["plain.bin"]).modified_unix,
+            Some(ARCHIVE_DATE)
+        );
     }
 
     #[test]

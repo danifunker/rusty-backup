@@ -94,6 +94,9 @@ pub struct CopyOptions {
     /// CBM, Apple/Atari DOS, MFS, …). Without it, copying a tree into a
     /// flat filesystem is a hard error.
     pub flatten: bool,
+    /// Carry each source entry's modification date onto the copy (archive expansion). Off by
+    /// default, which keeps `cp` / Commander stamping the time of the copy.
+    pub preserve_times: bool,
 }
 
 impl Default for CopyOptions {
@@ -104,6 +107,7 @@ impl Default for CopyOptions {
             names: NamePolicy::Truncate,
             attrs: AttrPolicy::Preserve,
             flatten: false,
+            preserve_times: false,
         }
     }
 }
@@ -357,7 +361,11 @@ fn copy_recursive(
                 Some(n) => n,
                 None => return Ok(()),
             };
-            let dir_entry = ensure_directory(src_caps, src_entry, dst, dst_parent, &name)?;
+            let times = opts
+                .preserve_times
+                .then(|| source_times(src_entry))
+                .flatten();
+            let dir_entry = ensure_directory(src_caps, src_entry, dst, dst_parent, &name, times)?;
             stats.dirs += 1;
             for child in list_children(src, src_entry)? {
                 copy_recursive(
@@ -447,6 +455,9 @@ fn copy_file(
 
     // Translate whatever metadata the destination can carry.
     let (mut options, mut dropped) = translate_metadata(src_entry, src_caps, dst_caps, opts.attrs);
+    if opts.preserve_times {
+        options.unix_times = source_times(src_entry);
+    }
 
     // Resource fork is data, not an attribute: copy it whenever the
     // destination supports forks, regardless of AttrPolicy.
@@ -514,6 +525,16 @@ fn copy_file(
     }
     record_dropped(&dropped, &src_entry.path, stats, log);
     Ok(())
+}
+
+/// An entry's modification date as Unix time: its own Unix mtime, else its classic-Mac date,
+/// which (as on HFS) is local wall-clock time.
+fn source_times(e: &FileEntry) -> Option<crate::fs::times::UnixTimes> {
+    let secs = e.modified_unix.or_else(|| {
+        e.mac_dates
+            .and_then(|(_, modified, _)| crate::fs::times::mac_local_to_unix(modified))
+    })?;
+    Some(crate::fs::times::UnixTimes::mtime_only(secs))
 }
 
 /// Build the [`CreateFileOptions`] carrying every metadata axis the
@@ -620,6 +641,7 @@ fn ensure_directory(
     dst: &mut dyn EditableFilesystem,
     parent: &FileEntry,
     name: &str,
+    times: Option<crate::fs::times::UnixTimes>,
 ) -> Result<FileEntry> {
     if let Some(existing) = find_child(dst, parent, name)? {
         if existing.is_directory() {
@@ -627,7 +649,10 @@ fn ensure_directory(
         }
         bail!("cannot create directory {name}: a file of that name already exists");
     }
-    let mut opts = CreateDirectoryOptions::default();
+    let mut opts = CreateDirectoryOptions {
+        unix_times: times,
+        ..Default::default()
+    };
     let dst_caps = Capabilities::infer(dst.fs_type());
     if src_caps.unix_permissions && dst_caps.unix_permissions {
         opts.mode = src_dir.mode;

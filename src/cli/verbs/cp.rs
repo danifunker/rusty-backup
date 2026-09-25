@@ -182,6 +182,7 @@ pub fn run(args: CpArgs) -> Result<()> {
             AttrPolicyArg::Skip => AttrPolicy::Skip,
         },
         flatten: args.flatten,
+        preserve_times: false,
     };
     let case_insensitive = !args.case_sensitive; // default-insensitive, like get
 

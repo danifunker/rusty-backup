@@ -229,6 +229,9 @@ pub struct Importer {
     /// directory.
     dir_children: HashMap<String, HashSet<String>>,
     pub stats: ImportStats,
+    /// Date for directories the source never dated (implicit parents): the archive's own, so
+    /// an expanded archive does not carry the day it was imported.
+    pub implicit_dir_times: Option<crate::fs::times::UnixTimes>,
 }
 
 impl Importer {
@@ -239,6 +242,7 @@ impl Importer {
             dir_cache,
             dir_children: HashMap::new(),
             stats: ImportStats::default(),
+            implicit_dir_times: None,
         }
     }
 
@@ -460,12 +464,17 @@ impl Importer {
         &mut self,
         efs: &mut dyn EditableFilesystem,
         comps: &[String],
+        times: Option<crate::fs::times::UnixTimes>,
     ) -> Result<Option<FileEntry>> {
         if comps.iter().any(|c| efs.validate_name(c).is_err()) {
             self.stats.invalid_names_skipped += 1;
             return Ok(None);
         }
-        let dir = self.ensure_dir(efs, comps, &AttrOverrides::default())?;
+        let leaf = AttrOverrides {
+            unix_times: times,
+            ..Default::default()
+        };
+        let dir = self.ensure_dir(efs, comps, &leaf)?;
         Ok(Some(dir))
     }
 
@@ -500,11 +509,14 @@ impl Importer {
                 Some(e) if e.is_directory() => e,
                 Some(_) => bail!("path component {comp:?} exists but is not a directory"),
                 None => {
-                    let overrides = if i == last {
+                    let mut overrides = if i == last {
                         *leaf_overrides
                     } else {
                         AttrOverrides::default()
                     };
+                    if overrides.unix_times.is_none() {
+                        overrides.unix_times = self.implicit_dir_times;
+                    }
                     let attrs =
                         crate::fs::attrs::resolve_dir_attrs(&overrides, None, Some(&parent));
                     let dir_opts = crate::fs::filesystem::CreateDirectoryOptions {
