@@ -1422,8 +1422,8 @@ jobs:
           DEB="Rusty-Backup-linux-riscv64-${{ needs.generate-version.outputs.version }}.deb"
           # --no-strip: already stripped with the cross strip above; the host
           # `strip` can't read a riscv64 ELF.
-          cargo deb --target riscv64gc-unknown-linux-gnu --no-build --no-strip
-          mv target/riscv64gc-unknown-linux-gnu/debian/*.deb "$DEB"
+          # -o: cargo-deb only mirrors into target/<triple>/debian as a deprecated back-compat copy.
+          cargo deb --target riscv64gc-unknown-linux-gnu --no-build --no-strip -o "$DEB"
           dpkg-deb -f "$DEB" Package Version Architecture Depends
           # $auto runs dpkg-shlibdeps against the :riscv64 multiarch packages.
           # When it fails cargo-deb only warns and ships a .deb whose Depends is
