@@ -356,6 +356,62 @@ mod tests {
         );
     }
 
+    /// The OPENSTEP 4.2 Install CD shape: Sun label at block 0, NeXT copies at blocks 16 / 30 / 48.
+    #[test]
+    fn a_sun_labelled_multi_arch_disc_opens_through_its_next_label() {
+        use crate::partition::next::{present_copies, LABEL_SPAN, RISC_LABEL_BLOCKS};
+        let (mut img, layout) = build(&NextCdOptions::new(24 * 1024 * 1024, "OPENSTEP_4.2"));
+        let copy = img[..LABEL_SPAN].to_vec();
+        for block in LABEL_BLOCKS {
+            let at = (block * 512) as usize;
+            img[at..at + 0x230].fill(0);
+        }
+        // Sun label: magic at 508, and the XOR-of-words checksum at 510 cancels it.
+        img[0] = 0x80;
+        img[508..512].copy_from_slice(&[0xDA, 0xBE, 0x80 ^ 0xDA, 0xBE]);
+        let mut cur = Cursor::new(img);
+        assert!(matches!(
+            PartitionTable::detect(&mut cur).expect("detect"),
+            PartitionTable::Sun(_)
+        ));
+
+        let blocks = [RISC_LABEL_BLOCKS[0], 30, RISC_LABEL_BLOCKS[1]];
+        write_copies(&mut cur, &copy, &blocks).unwrap();
+        let mut found = present_copies(&mut cur);
+        found.sort_unstable();
+        assert_eq!(found, blocks.to_vec());
+        let img = cur.get_ref();
+        let stamp = |b: u64| BigEndian::read_u32(&img[(b * 512) as usize + 4..][..4]);
+        assert_eq!([stamp(16), stamp(30), stamp(48)], [4, 30, 12]);
+
+        let table = PartitionTable::detect(&mut cur).expect("detect");
+        assert!(matches!(table, PartitionTable::Next(_)), "{table:?}");
+        let parts = table.partitions();
+        assert_eq!(parts.len(), 1, "{parts:?}");
+        assert_eq!(parts[0].byte_offset(), layout.fs_offset);
+
+        let mut fs = UfsFilesystem::open(cur, layout.fs_offset).expect("open");
+        let root = fs.root().unwrap();
+        fs.create_file(
+            &root,
+            "README",
+            &mut Cursor::new(b"hello".to_vec()),
+            5,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        fs.sync_metadata().unwrap();
+        let report = fsck_ufs(&mut fs).expect("fsck");
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let names: Vec<String> = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(names.iter().any(|n| n == "README"), "{names:?}");
+    }
+
     #[test]
     fn a_disc_below_the_floor_is_refused() {
         assert!(plan_next_ufs_cd(&NextCdOptions::new(1024 * 1024, "tiny")).is_err());
