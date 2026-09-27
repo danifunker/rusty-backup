@@ -7,7 +7,7 @@
 <body>
 <nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <span>untar</span></nav>
 <h1><code>rb-cli untar</code></h1>
-<p>Import a `.tar.gz` / `.tar.zst` / `.tar` archive's contents INTO a filesystem in an image (the inverse of `tar`). Recreates the tree, streams files in, and recreates symlinks where the target FS supports them</p>
+<p>Import a `.tar.gz` / `.tar.bz2` / `.tar.zst` / `.tar` archive's contents INTO a filesystem in an image (the inverse of `tar`). Recreates the tree, streams files in, and recreates symlinks where the target FS supports them</p>
 <h2>Usage</h2>
 <pre><code>Usage: untar [OPTIONS] &lt;IMAGE&gt; &lt;ARCHIVE&gt; [DEST]</code></pre>
 <h2>Arguments</h2>
@@ -15,7 +15,7 @@
 <dt><code>&lt;IMAGE&gt;</code></dt>
 <dd>Image reference (`path` or `path@N` for the 1-based partition index)</dd>
 <dt><code>&lt;ARCHIVE&gt;</code></dt>
-<dd>Host archive to import (`.tar.gz` / `.tar.zst` / `.tar`; the compression is detected from the file's contents, not its name)</dd>
+<dd>Host archive to import (`.tar.gz` / `.tar.bz2` / `.tar.zst` / `.tar`; the compression is detected from the file's contents, not its name)</dd>
 <dt><code>&lt;DEST&gt;</code></dt>
 <dd>Destination directory inside the filesystem. Defaults to the root</dd>
 </dl>

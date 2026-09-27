@@ -1,4 +1,4 @@
-//! `rb-cli untar IMG[@N] ARCHIVE [DEST]` — import a `.tar.gz` / `.tar.zst`
+//! `rb-cli untar IMG[@N] ARCHIVE [DEST]` — import a `.tar.gz` / `.tar.bz2` / `.tar.zst`
 //! / `.tar` archive's contents INTO a filesystem in a disk image. The
 //! inverse of `tar`.
 //!
@@ -29,7 +29,7 @@ pub struct UntarArgs {
     /// Image reference (`path` or `path@N` for the 1-based partition index).
     pub image: ImageRef,
 
-    /// Host archive to import (`.tar.gz` / `.tar.zst` / `.tar`; the
+    /// Host archive to import (`.tar.gz` / `.tar.bz2` / `.tar.zst` / `.tar`; the
     /// compression is detected from the file's contents, not its name).
     pub archive: PathBuf,
 
