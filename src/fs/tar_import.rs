@@ -1,4 +1,4 @@
-//! Import a `.tar.gz` / `.tar.zst` / `.tar` archive's contents INTO a disk
+//! Import a `.tar.gz` / `.tar.bz2` / `.tar.zst` / `.tar` archive's contents INTO a disk
 //! image's filesystem — the inverse of [`crate::fs::tar_export`].
 //!
 //! Reads the archive (compression auto-detected from magic), recreates the
@@ -36,32 +36,18 @@ pub use crate::fs::import_sink::{
 /// Knobs for [`import_tar`]. Alias of the shared [`ImportOptions`].
 pub type TarImportOptions = ImportOptions;
 
-/// Cheap content sniff: does `path` look like a tar archive — plain, gzip-, or
-/// zstd-compressed? Only a small prefix is (de)compressed to check for the tar
+/// Cheap content sniff: does `path` look like a tar archive — plain, gzip-,
+/// bzip2- or zstd-compressed? Only a small prefix is (de)compressed to check for the tar
 /// `ustar` magic at offset 257, so a gzip *disk image* (`.adz` / `.hdz`) is
 /// **not** mistaken for a tarball just because it's gzip. Used by the GUI to
 /// auto-route a dropped/added tar archive into the import flow.
 pub fn looks_like_tar_archive(path: &Path) -> bool {
-    let Ok(mut f) = File::open(path) else {
+    let Ok(stream) = open_tar_stream(path) else {
         return false;
     };
-    let mut magic = [0u8; 4];
-    let n = f.read(&mut magic).unwrap_or(0);
-    if f.seek(SeekFrom::Start(0)).is_err() {
-        return false;
-    }
     // Need to see at least the first tar header (512 B) -> read ~600 of the
     // (decompressed) stream so offset 257..262 is covered.
-    let prefix = if n >= 2 && magic[0] == 0x1f && magic[1] == 0x8b {
-        read_prefix(flate2::read::GzDecoder::new(f), 600)
-    } else if n >= 4 && magic == [0x28, 0xb5, 0x2f, 0xfd] {
-        match crate::rbformats::zstd_compat::decoder(f) {
-            Ok(d) => read_prefix(d, 600),
-            Err(_) => return false,
-        }
-    } else {
-        read_prefix(f, 600)
-    };
+    let prefix = read_prefix(stream, 600);
     // ustar magic: "ustar\0" (POSIX) or "ustar  " (GNU) — both start "ustar".
     (prefix.len() >= 262 && &prefix[257..262] == b"ustar") || is_v7_tar_header(&prefix)
 }
@@ -241,6 +227,25 @@ fn header_size(field: &[u8]) -> u64 {
     tar_octal(field).unwrap_or(0)
 }
 
+/// Open `path` as a tar stream, peeling one gzip / bzip2 / zstd layer chosen by magic.
+pub(crate) fn open_tar_stream(path: &Path) -> Result<Box<dyn Read>> {
+    let mut file =
+        File::open(path).with_context(|| format!("opening archive {}", path.display()))?;
+    let mut magic = [0u8; 4];
+    let n = file.read(&mut magic).unwrap_or(0);
+    file.seek(SeekFrom::Start(0)).context("rewind archive")?;
+    Ok(if n >= 2 && magic[0] == 0x1f && magic[1] == 0x8b {
+        Box::new(flate2::read::GzDecoder::new(file))
+    } else if n >= 4 && magic == [0x28, 0xb5, 0x2f, 0xfd] {
+        Box::new(crate::rbformats::zstd_compat::decoder(file).context("init zstd decoder")?)
+    } else if n >= 4 && &magic[..3] == b"BZh" && (b'1'..=b'9').contains(&magic[3]) {
+        // Multi-stream: pbzip2 writes one bzip2 stream per block.
+        Box::new(bzip2::read::MultiBzDecoder::new(file))
+    } else {
+        Box::new(file)
+    })
+}
+
 fn read_prefix(mut r: impl Read, n: usize) -> Vec<u8> {
     let mut buf = vec![0u8; n];
     let mut filled = 0;
@@ -265,25 +270,10 @@ pub fn import_tar_from_path(
     opts: &TarImportOptions,
     progress: &dyn Fn(&TarImportStats),
 ) -> Result<TarImportStats> {
-    let mut file =
-        File::open(path).with_context(|| format!("opening archive {}", path.display()))?;
-    let mut magic = [0u8; 4];
-    let n = file.read(&mut magic).unwrap_or(0);
-    file.seek(SeekFrom::Start(0)).context("rewind archive")?;
-
+    let stream = open_tar_stream(path)?;
     let times = archive_times(path);
     efs.begin_bulk();
-    let result = if n >= 2 && magic[0] == 0x1f && magic[1] == 0x8b {
-        let dec = flate2::read::GzDecoder::new(file);
-        import_tar_inner(efs, dest, dec, opts, progress, times)
-    } else if n >= 4 && magic == [0x28, 0xb5, 0x2f, 0xfd] {
-        match crate::rbformats::zstd_compat::decoder(file).context("init zstd decoder") {
-            Ok(dec) => import_tar_inner(efs, dest, dec, opts, progress, times),
-            Err(e) => Err(e),
-        }
-    } else {
-        import_tar_inner(efs, dest, file, opts, progress, times)
-    };
+    let result = import_tar_inner(efs, dest, stream, opts, progress, times);
     efs.end_bulk();
     result
 }
@@ -345,22 +335,8 @@ pub fn import_tar_from_path_into(
     opts: &TarImportOptions,
     progress: &dyn Fn(&TarImportStats),
 ) -> Result<TarImportStats> {
-    let mut file =
-        File::open(path).with_context(|| format!("opening archive {}", path.display()))?;
-    let mut magic = [0u8; 4];
-    let n = file.read(&mut magic).unwrap_or(0);
-    file.seek(SeekFrom::Start(0)).context("rewind archive")?;
-
-    let times = archive_times(path);
-    if n >= 2 && magic[0] == 0x1f && magic[1] == 0x8b {
-        let dec = flate2::read::GzDecoder::new(file);
-        import_tar_inner(efs, dest, dec, opts, progress, times)
-    } else if n >= 4 && magic == [0x28, 0xb5, 0x2f, 0xfd] {
-        let dec = crate::rbformats::zstd_compat::decoder(file).context("init zstd decoder")?;
-        import_tar_inner(efs, dest, dec, opts, progress, times)
-    } else {
-        import_tar_inner(efs, dest, file, opts, progress, times)
-    }
+    let stream = open_tar_stream(path)?;
+    import_tar_inner(efs, dest, stream, opts, progress, archive_times(path))
 }
 
 /// Total (files, dirs, content bytes) an archive would expand to, read from
@@ -385,18 +361,7 @@ pub fn measure_tar_expanded(path: &Path) -> Result<(u64, u64, u64)> {
         Ok((files, dirs, bytes))
     }
 
-    let mut file =
-        File::open(path).with_context(|| format!("opening archive {}", path.display()))?;
-    let mut magic = [0u8; 4];
-    let n = file.read(&mut magic).unwrap_or(0);
-    file.seek(SeekFrom::Start(0)).context("rewind archive")?;
-    if n >= 2 && magic[0] == 0x1f && magic[1] == 0x8b {
-        tally(flate2::read::GzDecoder::new(file))
-    } else if n >= 4 && magic == [0x28, 0xb5, 0x2f, 0xfd] {
-        tally(crate::rbformats::zstd_compat::decoder(file).context("init zstd decoder")?)
-    } else {
-        tally(file)
-    }
+    tally(open_tar_stream(path)?)
 }
 
 fn import_tar_inner<R: Read>(
@@ -698,23 +663,7 @@ pub fn preflight_tar_from_path(
     path: &Path,
     opts: &TarImportOptions,
 ) -> Result<TarImportPreflight> {
-    let mut file =
-        File::open(path).with_context(|| format!("opening archive {}", path.display()))?;
-    let mut magic = [0u8; 4];
-    let n = file.read(&mut magic).unwrap_or(0);
-    file.seek(SeekFrom::Start(0)).context("rewind archive")?;
-
-    if n >= 2 && magic[0] == 0x1f && magic[1] == 0x8b {
-        preflight_tar(efs, flate2::read::GzDecoder::new(file), opts)
-    } else if n >= 4 && magic == [0x28, 0xb5, 0x2f, 0xfd] {
-        preflight_tar(
-            efs,
-            crate::rbformats::zstd_compat::decoder(file).context("init zstd decoder")?,
-            opts,
-        )
-    } else {
-        preflight_tar(efs, file, opts)
-    }
+    preflight_tar(efs, open_tar_stream(path)?, opts)
 }
 
 /// Read-only preflight scan of a tar stream. Mirrors [`import_tar`]'s

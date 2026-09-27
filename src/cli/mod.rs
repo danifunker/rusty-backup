@@ -115,7 +115,7 @@ pub enum Command {
     /// files that differ only in case.
     Tar(verbs::tar::TarArgs),
 
-    /// Import a `.tar.gz` / `.tar.zst` / `.tar` archive's contents INTO a
+    /// Import a `.tar.gz` / `.tar.bz2` / `.tar.zst` / `.tar` archive's contents INTO a
     /// filesystem in an image (the inverse of `tar`). Recreates the tree,
     /// streams files in, and recreates symlinks where the target FS
     /// supports them.

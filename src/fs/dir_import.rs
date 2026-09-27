@@ -40,7 +40,7 @@ pub struct DirImportOptions {
     /// Unpack archives found in the tree into a directory named after each,
     /// instead of copying them in as opaque files. Two families:
     ///
-    /// - **tar** (`.tar`, `.tar.gz`, `.tgz`, `.tar.zst`, and anything else
+    /// - **tar** (`.tar`, `.tar.gz`, `.tgz`, `.tar.bz2`, `.tar.zst`, and anything else
     ///   carrying the `ustar` magic — IRIX `.tardist` files included),
     /// - **classic Mac** (`.sit`, `.sea`, `.cpt`, `.hqx`, `.mar`), which land
     ///   with both forks and Finder type/creator intact.
@@ -166,6 +166,7 @@ fn expanded_dir_name(file_name: &str) -> String {
         ".tgz",
         ".tzst",
         ".tbz2",
+        ".tbz",
         ".txz",
         ".tardist",
         ".gnutar",
@@ -871,6 +872,56 @@ mod tests {
         b.into_inner().unwrap().finish().unwrap();
     }
 
+    /// pbzip2 writes one bzip2 stream per block, so the reader must not stop after the first.
+    #[test]
+    fn a_multi_stream_tar_bz2_expands_into_its_own_folder() {
+        use std::io::Write;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut b = tar::Builder::new(Vec::new());
+        let big = vec![b'x'; 300_000];
+        for (name, data) in [("src/a.c", &b"int a;"[..]), ("src/big.dat", &big[..])] {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(data.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            b.append_data(&mut h, name, data).unwrap();
+        }
+        let tar_bytes = b.into_inner().unwrap();
+        let mut f = std::fs::File::create(tmp.path().join("egcs-1.1.2.tar.bz2")).unwrap();
+        let (head, tail) = tar_bytes.split_at(1024);
+        for part in [head, tail] {
+            let mut enc = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::fast());
+            enc.write_all(part).unwrap();
+            f.write_all(&enc.finish().unwrap()).unwrap();
+        }
+        drop(f);
+
+        let (files, _, bytes) = measure_dir(tmp.path(), true, false).unwrap();
+        assert_eq!((files, bytes), (2, 300_006));
+
+        let img = blank_fat();
+        let mut fs =
+            crate::fs::fat::FatFilesystem::open(std::io::Cursor::new(img), 0).expect("open");
+        let root = Filesystem::root(&mut fs).expect("root");
+        let opts = DirImportOptions {
+            expand_archives: true,
+            ..Default::default()
+        };
+        let stats = import_dir(&mut fs, &root, tmp.path(), &opts, &|_| {}).expect("import");
+        assert_eq!((stats.archives_expanded, stats.files), (1, 2));
+        let find = |fs: &mut crate::fs::fat::FatFilesystem<_>, dir: &FileEntry, name: &str| {
+            fs.list_directory(dir)
+                .unwrap()
+                .into_iter()
+                .find(|e| e.name.eq_ignore_ascii_case(name))
+                .unwrap_or_else(|| panic!("{name} missing"))
+        };
+        let top = find(&mut fs, &root, "egcs-1.1.2");
+        let src = find(&mut fs, &top, "src");
+        let dat = find(&mut fs, &src, "big.dat");
+        assert_eq!(fs.read_file(&dat, usize::MAX).unwrap(), big);
+    }
+
     /// Default is to copy an archive in verbatim; `--expand-archives` unpacks
     /// it into a directory named after it. Both must be reachable, because
     /// which one is right depends on what the disc is for.
@@ -1311,6 +1362,10 @@ mod tests {
         assert_eq!(expanded_dir_name("foo-1.2.tar.gz"), "foo-1.2");
         assert_eq!(expanded_dir_name("bar.tardist"), "bar");
         assert_eq!(expanded_dir_name("baz.tgz"), "baz");
+        assert_eq!(
+            expanded_dir_name("egcs-1.1.2-2.s.tar.bz2"),
+            "egcs-1.1.2-2.s"
+        );
         assert_eq!(expanded_dir_name("qux.TAR.GZ"), "qux");
         // GNU tar's own names, common on NeXT archives.
         assert_eq!(

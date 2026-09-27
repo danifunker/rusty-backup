@@ -1585,7 +1585,7 @@ Usage: next-ufs [OPTIONS] <IMAGE>
 
 - `--size` — Disc size (`600M`, `650M`, ...) or `auto` to fit `--from-dir`; rounded up to a 2048-byte sector. Past ~700M suits an emulator, not a burner
 - `--from-dir` — Populate the disc from this host directory after formatting it. The directory's *contents* land at the volume root
-- `--expand-archives` — With `--from-dir`: unpack tarballs (`.tar`, `.tar.gz`, `.tgz`, pre-POSIX tars included) into a directory named after each, instead of copying them
+- `--expand-archives` — With `--from-dir`: unpack tarballs (`.tar`, `.tar.gz`, `.tgz`, `.tar.bz2`, pre-POSIX tars included) into a directory named after each, instead of copying them
 - `--expand-gunzip` — With `--from-dir`: strip one gzip layer only (`x.tar.gz` -> `x.tar`, `f.gz` -> `f`). With `--expand-archives` too, tarballs unpack fully and this takes the other `.gz` files
 - `--flatten-folders` — With `--expand-archives`: unpack every archive into the volume root, not one folder each. Entries that already exist are skipped unless `--force` is given
 - `--force` — With `--from-dir`: overwrite entries that already exist rather than skipping them. Only meaningful alongside `--flatten-folders`
@@ -2266,7 +2266,7 @@ Usage: tui
 
 ### `untar`
 
-Import a `.tar.gz` / `.tar.zst` / `.tar` archive's contents INTO a filesystem in an image (the inverse of `tar`). Recreates the tree, streams files in, and recreates symlinks where the target FS supports them
+Import a `.tar.gz` / `.tar.bz2` / `.tar.zst` / `.tar` archive's contents INTO a filesystem in an image (the inverse of `tar`). Recreates the tree, streams files in, and recreates symlinks where the target FS supports them
 
 ```
 Usage: untar [OPTIONS] <IMAGE> <ARCHIVE> [DEST]
@@ -2275,7 +2275,7 @@ Usage: untar [OPTIONS] <IMAGE> <ARCHIVE> [DEST]
 **Arguments**
 
 - `<IMAGE>` — Image reference (`path` or `path@N` for the 1-based partition index)
-- `<ARCHIVE>` — Host archive to import (`.tar.gz` / `.tar.zst` / `.tar`; the compression is detected from the file's contents, not its name)
+- `<ARCHIVE>` — Host archive to import (`.tar.gz` / `.tar.bz2` / `.tar.zst` / `.tar`; the compression is detected from the file's contents, not its name)
 - `<DEST>` — Destination directory inside the filesystem. Defaults to the root
 
 **Options**

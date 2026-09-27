@@ -40,6 +40,13 @@
 //! `p_base` from the **disk** origin even for a nested label, so the label's own
 //! answer is already absolute; a whole-disk NeXTSTEP label counts from its own
 //! block 0 with a zero container offset, which is why one expression covers both.
+//!
+//! **Multi-architecture CDs.** The OPENSTEP 4.2 Install CD boots on m68k, Intel
+//! and SPARC, so block 0 holds a Sun label (and an HP-PA LIF header) instead of
+//! a NeXT copy. Its NeXT copies sit at 512-byte blocks 16, 30 and 48 (bytes
+//! 8192 / 15360 / 24576), and the two outside the standard set record
+//! `dl_label_blkno` in 2048-byte units (4 and 12). [`RISC_LABEL_BLOCKS`] covers
+//! them, and [`write_copies`] keeps those stamps when it rewrites a label.
 
 use byteorder::{BigEndian, ByteOrder};
 use serde::{Deserialize, Serialize};
@@ -56,6 +63,12 @@ pub const NEXT_LABEL_V3: u32 = 0x646c_5633;
 
 /// 512-byte block numbers NeXTSTEP writes the four label copies at.
 pub const LABEL_BLOCKS: [u64; 4] = [0, 15, 30, 45];
+
+/// Extra copies on multi-architecture CDs, whose block 0 holds a Sun label (see module header).
+pub const RISC_LABEL_BLOCKS: [u64; 2] = [16, 48];
+
+/// Every block a label copy is looked for at: the standard four first.
+const PROBE_BLOCKS: [u64; 6] = [0, 15, 30, 45, 16, 48];
 
 /// Bytes one label copy owns (15 × 512) — the spacing between copies.
 pub const LABEL_SPAN: usize = 15 * 512;
@@ -451,7 +464,7 @@ pub fn present_copies<R: Read + Seek>(reader: &mut R) -> Vec<u64> {
     let Ok(disk_size) = reader.seek(SeekFrom::End(0)) else {
         return out;
     };
-    for block in LABEL_BLOCKS {
+    for block in PROBE_BLOCKS {
         let offset = block * 512;
         if offset + LABEL_SPAN as u64 > disk_size || reader.seek(SeekFrom::Start(offset)).is_err() {
             continue;
@@ -465,8 +478,7 @@ pub fn present_copies<R: Read + Seek>(reader: &mut R) -> Vec<u64> {
 }
 
 /// Write `copy` to each of `blocks`, stamping every copy's own
-/// `dl_label_blkno`. The checksum reads that field as zero, so one stamp on
-/// `copy` covers all four.
+/// `dl_label_blkno`. The checksum reads that field as zero, so one stamp covers all.
 pub fn write_copies<W: Write + Seek>(
     out: &mut W,
     copy: &[u8],
@@ -474,14 +486,23 @@ pub fn write_copies<W: Write + Seek>(
 ) -> std::io::Result<()> {
     let mut buf = copy.to_vec();
     for &block in blocks {
-        BigEndian::write_u32(&mut buf[4..8], block as u32);
+        BigEndian::write_u32(&mut buf[4..8], recorded_blkno(block) as u32);
         out.seek(SeekFrom::Start(block * 512))?;
         out.write_all(&buf)?;
     }
     out.flush()
 }
 
-/// Probe the four label copies and return the first that validates.
+/// The `dl_label_blkno` a copy at 512-byte `block` carries; the RISC copies count 2048-byte units.
+fn recorded_blkno(block: u64) -> u64 {
+    if RISC_LABEL_BLOCKS.contains(&block) {
+        block * 512 / 2048
+    } else {
+        block
+    }
+}
+
+/// Probe the label copies and return the first that validates.
 pub fn detect<R: Read + Seek>(reader: &mut R) -> Option<NextDiskLabel> {
     detect_at(reader, 0)
 }
@@ -490,7 +511,7 @@ pub fn detect<R: Read + Seek>(reader: &mut R) -> Option<NextDiskLabel> {
 /// than at block 0 — Mac OS X Server 1.x nests one inside an APM slice.
 pub fn detect_at<R: Read + Seek>(reader: &mut R, base: u64) -> Option<NextDiskLabel> {
     let disk_size = reader.seek(SeekFrom::End(0)).ok()?;
-    for block in LABEL_BLOCKS {
+    for block in PROBE_BLOCKS {
         let offset = base + block * 512;
         if offset + LABEL_SPAN as u64 > disk_size {
             continue;

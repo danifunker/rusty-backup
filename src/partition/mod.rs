@@ -1057,18 +1057,8 @@ impl PartitionTable {
             )?));
         }
 
-        // Sun disk label (SPARC Solaris / SunOS): magic 0xDABE at byte 508 plus
-        // a valid XOR checksum. Checked before MBR — the magic sits at a
-        // different offset than the MBR 0xAA55 (byte 510) and the checksum
-        // makes a false positive on a real MBR effectively impossible.
-        if SunDiskLabel::detect(&mbr_data) {
-            return Ok(PartitionTable::Sun(SunDiskLabel::parse(&mbr_data)?));
-        }
-
-        // NeXT disk label (NeXTSTEP / OPENSTEP). Four checksummed copies at
-        // 512-byte blocks 0/15/30/45. This runs before MBR parsing because a
-        // NeXTSTEP/Intel disk also carries a valid 0xAA55 boot sector with an
-        // empty partition table, which would otherwise win.
+        // NeXT label ahead of MBR (NeXTSTEP/Intel also has an empty 0xAA55 sector) and of Sun
+        // (a multi-architecture OPENSTEP CD keeps a Sun label at block 0 for SPARC boot).
         reader
             .seek(SeekFrom::Start(0))
             .map_err(RustyBackupError::Io)?;
@@ -1078,6 +1068,14 @@ impl PartitionTable {
         reader
             .seek(SeekFrom::Start(0))
             .map_err(RustyBackupError::Io)?;
+
+        // Sun disk label (SPARC Solaris / SunOS): magic 0xDABE at byte 508 plus
+        // a valid XOR checksum. Checked before MBR — the magic sits at a
+        // different offset than the MBR 0xAA55 (byte 510) and the checksum
+        // makes a false positive on a real MBR effectively impossible.
+        if SunDiskLabel::detect(&mbr_data) {
+            return Ok(PartitionTable::Sun(SunDiskLabel::parse(&mbr_data)?));
+        }
 
         // Check for APM (Driver Descriptor Record signature 0x4552 at offset 0)
         let ddr_sig = u16::from_be_bytes([mbr_data[0], mbr_data[1]]);

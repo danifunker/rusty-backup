@@ -42,7 +42,7 @@ pub struct NewNextCdromArgs {
     #[arg(long = "from-dir")]
     pub from_dir: Option<PathBuf>,
 
-    /// With `--from-dir`: unpack tarballs (`.tar`, `.tar.gz`, `.tgz`, pre-POSIX
+    /// With `--from-dir`: unpack tarballs (`.tar`, `.tar.gz`, `.tgz`, `.tar.bz2`, pre-POSIX
     /// tars included) into a directory named after each, instead of copying them.
     #[arg(long = "expand-archives", requires = "from_dir")]
     pub expand_archives: bool,
