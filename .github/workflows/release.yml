@@ -597,8 +597,10 @@ jobs:
           # APPIMAGETOOL_LINK elsewhere fails that check. Same for the sharun
           # helper-libs tarball (which is where anylinux.so now comes from).
           # OUTNAME/VERSION/OUTPATH are still read by appimagetool, so the
-          # artifact name below is unchanged. GITHUB_REPOSITORY is set by
-          # Actions; appimagetool auto-emits the .zsync from it.
+          # artifact name below is unchanged.
+          # Explicit UPINFO: the guessed default matches *x86_64.AppImage.zsync,
+          # never our -x64-<ver> names. Setting it also emits the .zsync.
+          export UPINFO="gh-releases-zsync|${GITHUB_REPOSITORY%/*}|${GITHUB_REPOSITORY#*/}|latest|Rusty-Backup-linux-${{ matrix.arch }}-*.AppImage.zsync"
 
           mkdir -p "$OUTPATH"
           ./quick-sharun /usr/bin/rusty-backup
@@ -757,8 +759,9 @@ jobs:
 
       - name: Build Debian package
         run: |
-          cargo deb --target ${{ matrix.target }} --no-build
-          mv target/${{ matrix.target }}/debian/*.deb Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.deb
+          # -o: cargo-deb only mirrors into target/<triple>/debian as a deprecated back-compat copy.
+          cargo deb --target ${{ matrix.target }} --no-build \
+            -o Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.deb
 
       - name: Build RPM package
         run: |
