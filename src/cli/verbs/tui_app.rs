@@ -2613,9 +2613,11 @@ impl CommanderState {
                     return;
                 }
             };
-            let edits = crate::model::commander_ops::stage_host_to_image(&entries, &dest_parent);
+            let mut edits =
+                crate::model::commander_ops::stage_host_to_image(&entries, &dest_parent);
+            let note = legalize_into(dst, &mut edits);
             with_stderr_suppressed(|| crate::model::commander_ops::apply_edits(&session, &edits))
-                .map(|()| format!("Copied {label} into the image."))
+                .map(|()| format!("Copied {label} into the image.{note}"))
                 .map_err(|e| format!("Copy failed: {e:#}"))
         } else if !src.is_host && dst.is_host {
             let dest_dir = match dst.listing.cwd() {
@@ -2709,7 +2711,7 @@ impl CommanderState {
             };
             (|| -> Result<String, String> {
                 let temp = tempfile::tempdir().map_err(|e| format!("temp dir: {e}"))?;
-                let edits = with_stderr_suppressed(|| {
+                let mut edits = with_stderr_suppressed(|| {
                     crate::model::commander_ops::stage_copy(
                         src_fs,
                         &entries,
@@ -2719,11 +2721,12 @@ impl CommanderState {
                     )
                 })
                 .map_err(|e| format!("Copy failed: {e:#}"))?;
+                let note = legalize_into(dst, &mut edits);
                 with_stderr_suppressed(|| {
                     crate::model::commander_ops::apply_edits(&session, &edits)
                 })
                 .map_err(|e| format!("Copy failed: {e:#}"))?;
-                Ok(format!("Copied {label} into the image."))
+                Ok(format!("Copied {label} into the image.{note}"))
             })()
         };
         // The destination refreshes after the source borrow is released
@@ -3226,6 +3229,43 @@ fn cmd_load_optical(
 
 /// Refresh a pane after a write: host panes reload; image panes reopen from the
 /// session and re-navigate to the same directory.
+/// Rename copied names the destination can't hold (shared with the GUI); a status-line note.
+fn legalize_into(
+    dst: &mut CmdPane,
+    edits: &mut Vec<crate::model::edit_queue::StagedEdit>,
+) -> String {
+    let cwd = dst.listing.cwd_path().to_string();
+    let cwd_names: Vec<String> = dst
+        .listing
+        .entries()
+        .iter()
+        .map(|e| e.name.clone())
+        .collect();
+    let Some(fs) = dst.listing.fs_mut() else {
+        return String::new();
+    };
+    let fold = fs.case_insensitive_lookup();
+    let fs_type = fs.fs_type().to_string();
+    let validate = |n: &str| fs.validate_name(n);
+    let mut existing = |path: &str| {
+        if path == cwd {
+            cwd_names.clone()
+        } else {
+            Vec::new()
+        }
+    };
+    let report =
+        crate::model::stage_names::legalize_staged_names(edits, &validate, fold, &mut existing);
+    if report.renamed.is_empty() && report.dropped.is_empty() {
+        return String::new();
+    }
+    format!(
+        " {} renamed and {} left out for {fs_type}; export as .mar to keep every name.",
+        report.renamed.len(),
+        report.dropped.len()
+    )
+}
+
 fn cmd_refresh(pane: &mut CmdPane) {
     let cwd_path = pane.listing.cwd().map(|e| e.path.clone());
     #[cfg(feature = "remote")]
