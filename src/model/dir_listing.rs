@@ -271,13 +271,48 @@ impl DirListing {
         // like `<root>\a\b` decomposes into components (image filenames may
         // legitimately contain a backslash, so only host panes split on it).
         let is_host = self.is_host();
-        for comp in rel
+        let comps: Vec<&str> = rel
             .split(|c| c == '/' || (is_host && c == std::path::MAIN_SEPARATOR))
             .filter(|c| !c.is_empty())
-        {
-            self.enter(comp)?;
+            .collect();
+        if is_host {
+            for comp in comps {
+                self.enter(comp)?;
+            }
+            return Ok(());
         }
-        Ok(())
+        self.enter_joined(&comps)
+    }
+
+    /// Enter `comps` in turn, rejoining neighbours with '/' for slash-bearing names (HFS).
+    fn enter_joined(&mut self, comps: &[&str]) -> Result<(), FilesystemError> {
+        if comps.is_empty() {
+            return Ok(());
+        }
+        let depth = self.stack.len();
+        let mut last_err = None;
+        for take in 1..=comps.len() {
+            let name = comps[..take].join("/");
+            if !self
+                .entries()
+                .iter()
+                .any(|e| e.is_directory() && e.name == name)
+            {
+                continue;
+            }
+            match self
+                .enter(&name)
+                .and_then(|_| self.enter_joined(&comps[take..]))
+            {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    self.stack.truncate(depth);
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err
+            .unwrap_or_else(|| FilesystemError::NotFound(format!("directory '{}'", comps[0]))))
     }
 
     /// List the children of `dir` from the current source.
@@ -821,5 +856,29 @@ mod tests {
 
         assert_eq!(type_tag(&file("photo.JPG", 10)), "JPG");
         assert_eq!(type_tag(&file("noext", 10)), "");
+    }
+
+    /// Returning to `/Plug-ins/Acquire/Export` after an apply must enter the one
+    /// slash-named folder, not a decoy `Acquire` beside it.
+    #[test]
+    fn navigate_to_enters_slash_named_folders() {
+        use crate::fs::filesystem::{CreateDirectoryOptions, EditableFilesystem};
+        let img = crate::fs::hfs::create_blank_hfs(8 << 20, 4096, "Nav").unwrap();
+        let mut fs = crate::fs::hfs::HfsFilesystem::open(std::io::Cursor::new(img), 0).unwrap();
+        let root = fs.root().unwrap();
+        let opts = CreateDirectoryOptions::default();
+        let plug = fs.create_directory(&root, "Plug-ins", &opts).unwrap();
+        fs.create_directory(&plug, "Acquire", &opts).unwrap();
+        let target = fs.create_directory(&plug, "Acquire/Export", &opts).unwrap();
+        fs.create_directory(&target, "Deep", &opts).unwrap();
+        fs.sync_metadata().unwrap();
+        let entries = fs.list_directory(&root).unwrap();
+        let mut l = DirListing::new();
+        l.load_root(Box::new(fs), root, entries, false);
+        l.navigate_to("/Plug-ins/Acquire/Export/Deep").unwrap();
+        assert_eq!(l.cwd().unwrap().name, "Deep");
+        l.navigate_to("/Plug-ins/Acquire/Export").unwrap();
+        assert_eq!(l.cwd().unwrap().name, "Acquire/Export");
+        assert!(l.navigate_to("/Plug-ins/Nope").is_err());
     }
 }

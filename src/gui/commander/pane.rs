@@ -30,6 +30,7 @@ use rusty_backup::fs::entry::FileEntry;
 use rusty_backup::fs::export_selection::ExportFormat;
 use rusty_backup::fs::filesystem::Filesystem;
 use rusty_backup::fs::partition_is_browsable;
+use rusty_backup::fs::replace::OnConflict;
 use rusty_backup::model::browse_session::{BrowseOpenStatus, BrowseSession};
 use rusty_backup::model::cache_runner;
 use rusty_backup::model::commander_descend::{
@@ -37,7 +38,8 @@ use rusty_backup::model::commander_descend::{
     DescendKind, OpticalFsChoice, ReopenRecipe,
 };
 use rusty_backup::model::commander_ops::{
-    self, ApplyStatus, WrapperExtract, WrapperOpenPlan, WrapperOpenStatus,
+    self, ApplyPreflight, ApplyStatus, FailedEdit, PreflightStatus, WrapperExtract,
+    WrapperOpenPlan, WrapperOpenStatus,
 };
 use rusty_backup::model::commander_source;
 use rusty_backup::model::dir_listing::{type_tag, DirListing, Row, SortColumn};
@@ -50,6 +52,21 @@ use rusty_backup::partition::{format_size, PartitionInfo};
 use rusty_backup::update::RecentMode;
 
 use super::Side;
+
+/// Preflight findings shown before an apply that needs a decision.
+struct ApplyReview {
+    preflight: ApplyPreflight,
+    on_conflict: OnConflict,
+}
+
+/// A finished apply that did not land everything; the rest stays staged.
+struct ApplyReport {
+    total: usize,
+    applied: usize,
+    failed: Vec<FailedEdit>,
+    not_tried: usize,
+    fatal: Option<String>,
+}
 
 /// What one `stage_edits` batch did, for the status line and the rename notice.
 pub(crate) struct StageOutcome {
@@ -168,6 +185,12 @@ pub(crate) struct CommanderPane {
     pending_open: Option<Arc<Mutex<BrowseOpenStatus>>>,
     /// In-flight async apply (spinner) from `commander_ops::spawn_apply`.
     pending_apply: Option<Arc<Mutex<ApplyStatus>>>,
+    /// In-flight Apply preflight; a clean verdict starts the apply, anything else opens the review.
+    pending_preflight: Option<Arc<Mutex<PreflightStatus>>>,
+    apply_review: Option<ApplyReview>,
+    apply_report: Option<ApplyReport>,
+    /// Still-staged edits and the folder to return to once the post-apply reopen lands.
+    reopen_restore: Option<(Vec<StagedEdit>, String)>,
     /// In-flight Clonezilla metadata scan (spinner) from
     /// `cache_runner::spawn_partclone_scan`. On completion `poll_scan` builds a
     /// partclone-cache session and hands off to `pending_open`.
@@ -346,6 +369,10 @@ impl CommanderPane {
             queue: EditQueue::new(),
             pending_open: None,
             pending_apply: None,
+            pending_preflight: None,
+            apply_review: None,
+            apply_report: None,
+            reopen_restore: None,
             pending_scan: None,
             pending_wrapper: None,
             cache_store: commander_source::PartcloneCacheStore::new(),
@@ -596,6 +623,9 @@ impl CommanderPane {
             self.pending_wrapper = None;
         }
         let mut status = self.poll_open(ui.ctx());
+        if let Some(s) = self.poll_preflight(ui.ctx()) {
+            status = Some(s);
+        }
         if let Some(s) = self.poll_apply(ui.ctx()) {
             status = Some(s);
         }
@@ -642,6 +672,15 @@ impl CommanderPane {
             ui.ctx().request_repaint();
         }
 
+        if self.pending_preflight.is_some() {
+            ui.add_space(20.0);
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                ui.spinner();
+                ui.label("Checking staged edits...");
+            });
+            ui.ctx().request_repaint();
+        }
         if self.pending_apply.is_some() {
             ui.add_space(20.0);
             ui.horizontal(|ui| {
@@ -812,6 +851,12 @@ impl CommanderPane {
             status = Some(s);
         }
         self.render_edits_popup(ui.ctx());
+        if let Some(s) = self.render_apply_review(ui.ctx()) {
+            status = Some(s);
+        }
+        if let Some(s) = self.render_apply_report(ui.ctx()) {
+            status = Some(s);
+        }
 
         PaneResponse {
             status,
@@ -1428,6 +1473,7 @@ impl CommanderPane {
     pub(crate) fn can_receive(&self) -> bool {
         self.listing.is_loaded()
             && self.pending_apply.is_none()
+            && self.pending_preflight.is_none()
             && self.pending_open.is_none()
             && self.pending_remote.is_none()
             && self.resolved_backup.is_none()
@@ -1831,8 +1877,13 @@ impl CommanderPane {
     }
 
     /// Drop everything staged since `queue_start` (the rename notice's "Undo copy").
-    pub(crate) fn unstage_since(&mut self, queue_start: usize) {
+    pub(crate) fn unstage_since(&mut self, queue_start: usize) -> bool {
+        // An apply in flight holds queue indices; trimming under it would misalign them.
+        if self.pending_apply.is_some() || self.pending_preflight.is_some() {
+            return false;
+        }
         self.queue.truncate(queue_start);
+        true
     }
 
     // --- source bar --------------------------------------------------------
@@ -2014,6 +2065,7 @@ impl CommanderPane {
             if !self.listing.is_host() && self.resolved_backup.is_none() && !self.archive_source {
                 let n = self.queue.len();
                 let busy = self.pending_apply.is_some()
+                    || self.pending_preflight.is_some()
                     || self.pending_open.is_some()
                     || self.pending_scan.is_some();
                 ui.add_enabled_ui(n > 0 && !busy, |ui| {
@@ -2100,6 +2152,7 @@ impl CommanderPane {
                 // creates it immediately on a host pane. Not offered on a
                 // read-only backup pane.
                 let busy = self.pending_apply.is_some()
+                    || self.pending_preflight.is_some()
                     || self.pending_open.is_some()
                     || self.pending_scan.is_some();
                 if !busy
@@ -2695,6 +2748,12 @@ impl CommanderPane {
         self.password_input.clear();
 
         if let Some(err) = guard.error.take() {
+            // A failed post-apply reopen must not lose what is still staged.
+            if let Some((edits, _)) = self.reopen_restore.take() {
+                for e in edits {
+                    self.queue.push(e);
+                }
+            }
             self.error = Some(err);
             return Some(format!("[{}] open failed.", self.side.label()));
         }
@@ -2711,6 +2770,12 @@ impl CommanderPane {
         match (fs, root) {
             (Some(fs), Some(root)) => {
                 self.listing.load_root(fs, root, entries, false);
+                if let Some((edits, cwd)) = self.reopen_restore.take() {
+                    for e in edits {
+                        self.queue.push(e);
+                    }
+                    let _ = self.listing.navigate_to(&cwd);
+                }
                 Some(format!(
                     "[{}] opened {} ({} item(s)).",
                     self.side.label(),
@@ -2731,7 +2796,7 @@ impl CommanderPane {
 
     // --- staging -----------------------------------------------------------
 
-    /// Spawn an async apply of the staged queue against this pane's source.
+    /// Check the staged queue against this pane's volume, then apply (see `poll_preflight`).
     fn apply(&mut self) -> String {
         if self.queue.is_empty() {
             return String::new();
@@ -2745,9 +2810,211 @@ impl CommanderPane {
         };
         let n = self.queue.len();
         let edits: Vec<StagedEdit> = self.queue.iter().cloned().collect();
-        self.pending_apply = Some(commander_ops::spawn_apply(session, edits));
+        self.pending_preflight = Some(commander_ops::spawn_apply_preflight(session, edits));
+        self.apply_report = None;
+        format!("[{}] checking {n} staged edit(s)...", self.side.label())
+    }
+
+    /// Write the queue, continuing past failed items so one bad file can't strand the batch.
+    fn start_apply(&mut self) -> String {
+        let Some(session) = self.session.clone() else {
+            return format!("[{}] no source to apply to.", self.side.label());
+        };
+        let n = self.queue.len();
+        let edits: Vec<StagedEdit> = self.queue.iter().cloned().collect();
+        self.pending_apply = Some(commander_ops::spawn_apply(session, edits, true));
         self.error = None;
         format!("[{}] applying {n} edit(s)...", self.side.label())
+    }
+
+    fn poll_preflight(&mut self, ctx: &egui::Context) -> Option<String> {
+        let arc = self.pending_preflight.clone()?;
+        ctx.request_repaint();
+        let mut guard = arc.lock().ok()?;
+        if !guard.finished {
+            return None;
+        }
+        let result = guard.result.take();
+        drop(guard);
+        self.pending_preflight = None;
+        let side = self.side.label();
+        match result? {
+            Ok(p) if p.is_clean() => Some(self.start_apply()),
+            Ok(p) => {
+                self.apply_review = Some(ApplyReview {
+                    preflight: p,
+                    on_conflict: OnConflict::Skip,
+                });
+                Some(format!("[{side}] review the staged edits before applying."))
+            }
+            Err(e) => {
+                self.apply_report = Some(ApplyReport {
+                    total: self.queue.len(),
+                    applied: 0,
+                    failed: Vec::new(),
+                    not_tried: 0,
+                    fatal: Some(format!("Could not check the staged edits: {e}")),
+                });
+                Some(format!("[{side}] could not check the staged edits."))
+            }
+        }
+    }
+
+    fn render_apply_review(&mut self, ctx: &egui::Context) -> Option<String> {
+        let review = self.apply_review.as_mut()?;
+        let p = &review.preflight;
+        let danger = super::super::theme::danger_muted(&ctx.global_style().visuals);
+        let mut go = None;
+        egui::Window::new(format!("Before applying ({})", self.side.label()))
+            .collapsible(false)
+            .resizable(true)
+            .default_width(480.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                if p.shortfall() > 0 {
+                    ui.colored_label(
+                        danger,
+                        format!(
+                            "Not enough space: needs about {}, {} free on {}.",
+                            format_size(p.bytes_needed),
+                            format_size(p.bytes_free),
+                            p.fs_type
+                        ),
+                    );
+                    ui.add_space(4.0);
+                }
+                if !p.scan.conflicts.is_empty() {
+                    ui.label(format!(
+                        "{} item(s) already exist on {}:",
+                        p.scan.conflicts.len(),
+                        p.fs_type
+                    ));
+                    path_list(ui, "review_conflicts", p.scan.conflicts.iter().map(|c| &c.0));
+                    ui.horizontal(|ui| {
+                        ui.radio_value(&mut review.on_conflict, OnConflict::Skip, "Skip existing");
+                        ui.radio_value(&mut review.on_conflict, OnConflict::Replace, "Overwrite");
+                    });
+                    ui.add_space(4.0);
+                }
+                if !p.scan.blocked_folders.is_empty() {
+                    ui.label(format!(
+                        "{} folder(s) can't be created because a file has the same name; \
+                         their contents will fail:",
+                        p.scan.blocked_folders.len()
+                    ));
+                    path_list(ui, "review_blocked", p.scan.blocked_folders.iter());
+                    ui.add_space(4.0);
+                }
+                if !p.scan.missing_folders.is_empty() {
+                    ui.label(format!(
+                        "{} destination folder(s) no longer exist; items going into them will fail:",
+                        p.scan.missing_folders.len()
+                    ));
+                    path_list(ui, "review_missing", p.scan.missing_folders.iter());
+                    ui.add_space(4.0);
+                }
+                ui.label("Items that fail are listed at the end; everything else is still written.");
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let label = if p.shortfall() > 0 { "Apply anyway" } else { "Apply" };
+                    if ui.button(label).clicked() {
+                        go = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        go = Some(false);
+                    }
+                });
+            });
+        let go = go?;
+        let review = self.apply_review.take()?;
+        if !go {
+            return Some(format!(
+                "[{}] apply cancelled; nothing was written.",
+                self.side.label()
+            ));
+        }
+        if !review.preflight.scan.conflicts.is_empty() {
+            self.queue.set_all_conflicts(review.on_conflict);
+        }
+        Some(self.start_apply())
+    }
+
+    fn render_apply_report(&mut self, ctx: &egui::Context) -> Option<String> {
+        let report = self.apply_report.as_ref()?;
+        let danger = super::super::theme::danger_muted(&ctx.global_style().visuals);
+        let still = self.queue.len();
+        let mut action = None;
+        egui::Window::new(format!("Apply report ({})", self.side.label()))
+            .collapsible(false)
+            .resizable(true)
+            .default_width(560.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                if let Some(fatal) = &report.fatal {
+                    ui.colored_label(danger, fatal);
+                    ui.add_space(4.0);
+                }
+                ui.label(format!(
+                    "Applied {} of {} edit(s). {still} still staged.",
+                    report.applied, report.total
+                ));
+                if !report.failed.is_empty() {
+                    ui.add_space(4.0);
+                    ui.label(format!("{} item(s) failed:", report.failed.len()));
+                    egui::ScrollArea::vertical()
+                        .id_salt("apply_report_failed")
+                        .max_height(260.0)
+                        .show(ui, |ui| {
+                            for f in report.failed.iter().take(500) {
+                                ui.monospace(format!("{}: {}", f.label, f.error));
+                            }
+                            if report.failed.len() > 500 {
+                                ui.label(format!(
+                                    "... and {} more (see the log)",
+                                    report.failed.len() - 500
+                                ));
+                            }
+                        });
+                }
+                if report.not_tried > 0 {
+                    ui.add_space(4.0);
+                    ui.label(format!(
+                        "Stopped after {} failures in a row; {} edit(s) were not tried.",
+                        commander_ops::MAX_CONSECUTIVE_FAILURES,
+                        report.not_tried
+                    ));
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if still > 0 && ui.button("Retry").clicked() {
+                        action = Some(0);
+                    }
+                    if still > 0
+                        && ui
+                            .button("Discard remaining")
+                            .on_hover_text("Drop the edits that did not apply")
+                            .clicked()
+                    {
+                        action = Some(1);
+                    }
+                    if ui.button("Close").clicked() {
+                        action = Some(2);
+                    }
+                });
+            });
+        let action = action?;
+        self.apply_report = None;
+        match action {
+            0 => Some(self.apply()),
+            1 => {
+                self.queue.clear();
+                Some(format!(
+                    "[{}] discarded the remaining staged edits.",
+                    self.side.label()
+                ))
+            }
+            _ => None,
+        }
     }
 
     /// Apply the staged queue to a remote image over the Family-F write path
@@ -2788,8 +3055,8 @@ impl CommanderPane {
         )
     }
 
-    /// Poll an in-flight apply; on success, re-open the source so the listing
-    /// reflects the write. Returns a status line on completion.
+    /// Poll an in-flight apply: drop what landed from the queue, reopen the
+    /// volume (its cached catalog predates the write), and report any failures.
     fn poll_apply(&mut self, ctx: &egui::Context) -> Option<String> {
         let arc = self.pending_apply.clone()?;
         ctx.request_repaint();
@@ -2798,38 +3065,84 @@ impl CommanderPane {
             return None;
         }
         self.pending_apply = None;
-        if let Some(err) = guard.error.take() {
-            drop(guard);
-            self.error = Some(format!("Apply failed: {err}"));
-            return Some(format!("[{}] apply failed.", self.side.label()));
-        }
+        let fatal = guard.error.take();
+        let outcome = guard.outcome.take().unwrap_or_default();
         drop(guard);
+        let side = self.side.label();
+        if self.is_remote_image() {
+            return Some(self.finish_remote_apply(fatal));
+        }
+        let total = self.queue.len();
+        self.queue.remove_indices(&outcome.applied_indices);
+        let applied = outcome.applied();
+        for f in &outcome.failed {
+            self.log_events
+                .push(format!("[{side}] failed: {}: {}", f.label, f.error));
+        }
+        let clean = fatal.is_none() && outcome.failed.is_empty();
+        if !clean {
+            self.apply_report = Some(ApplyReport {
+                total,
+                applied,
+                not_tried: outcome.stopped_at.map_or(0, |at| total.saturating_sub(at)),
+                failed: outcome.failed,
+                fatal: fatal.map(|e| format!("Apply stopped: {e}")),
+            });
+        }
+        let msg = if clean {
+            format!("[{side}] applied {applied} edit(s).")
+        } else {
+            format!(
+                "[{side}] applied {applied} of {total} edit(s); {} still staged.",
+                self.queue.len()
+            )
+        };
+        self.reopen_after_apply();
+        self.log_events.push(msg.clone());
+        Some(msg)
+    }
+
+    /// Reopen the partition after a write, keeping what is still staged and the current folder.
+    fn reopen_after_apply(&mut self) {
+        let Some(i) = self.selected_part else {
+            return;
+        };
+        let keep: Vec<StagedEdit> = self.queue.drain().collect();
+        let cwd = self.listing.cwd_path().to_string();
+        self.open_partition(i);
+        self.reopen_restore = Some((keep, cwd));
+    }
+
+    /// Remote applies are all-or-nothing on the daemon; reopen on success so the copy shows.
+    fn finish_remote_apply(&mut self, fatal: Option<String>) -> String {
+        if let Some(err) = fatal {
+            self.apply_report = Some(ApplyReport {
+                total: self.queue.len(),
+                applied: 0,
+                failed: Vec::new(),
+                not_tried: 0,
+                fatal: Some(format!("Apply failed: {err}")),
+            });
+            return format!("[{}] apply failed.", self.side.label());
+        }
         let n = self.queue.len();
         self.queue.clear();
-        // Re-open the source: the cached read-only filesystem snapshotted its
-        // catalog before the write, so a plain reload would show stale data.
-        if let Some(i) = self.selected_part {
-            self.open_partition(i);
-        } else if self.is_remote_image() {
-            // Same staleness on the remote side: the daemon's browse handle
-            // snapshotted the catalog before the separate write session
-            // committed. Re-open the image on a fresh handle (returns to the
-            // volume root) so the copied files appear.
-            let reopen = match &self.remote {
-                Some(RemoteConn {
-                    mode: BrowseMode::Image { path, partition },
-                    ..
-                }) => Some((path.clone(), partition.clone())),
-                _ => None,
-            };
-            if let Some((path, partition)) = reopen {
-                let from = remote_parent_dir(&path);
-                let _ = self.spawn_open_image(path, partition, from);
-            }
+        // The daemon's browse handle snapshotted the catalog before the write
+        // session committed; a fresh handle shows the copied files.
+        let reopen = match &self.remote {
+            Some(RemoteConn {
+                mode: BrowseMode::Image { path, partition },
+                ..
+            }) => Some((path.clone(), partition.clone())),
+            _ => None,
+        };
+        if let Some((path, partition)) = reopen {
+            let from = remote_parent_dir(&path);
+            let _ = self.spawn_open_image(path, partition, from);
         }
         let msg = format!("[{}] applied {n} edit(s).", self.side.label());
         self.log_events.push(msg.clone());
-        Some(msg)
+        msg
     }
 
     /// Toggle the staged-delete state of `names` in the current directory:
@@ -3741,4 +4054,20 @@ fn paint_row(ui: &egui::Ui, rect: egui::Rect, row: &DisplayRow) {
             egui::Stroke::new(1.0_f32, color),
         );
     }
+}
+
+/// A capped, scrollable list of destination paths for the apply review.
+fn path_list<'a>(ui: &mut egui::Ui, id: &str, paths: impl Iterator<Item = &'a String>) {
+    egui::ScrollArea::vertical()
+        .id_salt(id)
+        .max_height(120.0)
+        .show(ui, |ui| {
+            for (i, p) in paths.enumerate() {
+                if i == 200 {
+                    ui.label("...");
+                    break;
+                }
+                ui.monospace(p);
+            }
+        });
 }

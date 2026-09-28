@@ -932,8 +932,11 @@ impl CommanderMode {
                 Side::Left => &mut self.left,
                 Side::Right => &mut self.right,
             };
-            pane.unstage_since(notice.outcome.queue_start);
-            self.status = "Copy removed from the staged edits.".to_string();
+            self.status = if pane.unstage_since(notice.outcome.queue_start) {
+                "Copy removed from the staged edits.".to_string()
+            } else {
+                "Can't undo the copy while an apply is running.".to_string()
+            };
             self.record_log(self.status.clone());
         }
     }

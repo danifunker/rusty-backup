@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 use crate::fs::entry::FileEntry;
 use crate::fs::filesystem::{
-    CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, FilesystemError,
+    CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem, FilesystemError,
     ResourceForkSource,
 };
 use crate::fs::resource_fork::{self, ImportedResourceFork};
@@ -199,11 +199,15 @@ pub fn resolve_dir_by_path(
     efs: &mut dyn EditableFilesystem,
     path: &str,
 ) -> Result<FileEntry, FilesystemError> {
+    resolve_dir_in(efs.as_filesystem_mut(), path)
+}
+
+/// [`resolve_dir_by_path`] on a read-only filesystem (the Apply preflight).
+pub fn resolve_dir_in(fs: &mut dyn Filesystem, path: &str) -> Result<FileEntry, FilesystemError> {
     let components: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
-    crate::fs::filesystem::resolve_components_joined(efs.as_filesystem_mut(), &components, true)?
-        .ok_or_else(|| {
-            FilesystemError::NotFound(format!("folder '{path}' not found on the destination"))
-        })
+    crate::fs::filesystem::resolve_components_joined(fs, &components, true)?.ok_or_else(|| {
+        FilesystemError::NotFound(format!("folder '{path}' not found on the destination"))
+    })
 }
 
 /// Apply a single staged edit to `efs`. Pure dispatch — does not call
@@ -386,6 +390,17 @@ pub struct SpaceDelta {
     pub freed: u64,
 }
 
+/// What [`EditQueue::scan_against`] found before any write.
+#[derive(Debug, Default, Clone)]
+pub struct QueueScan {
+    /// Staged files whose name is already taken: `(full path, name)`.
+    pub conflicts: Vec<(String, String)>,
+    /// Staged folders whose name is taken by an existing file.
+    pub blocked_folders: Vec<String>,
+    /// Destination folders the queue writes into that neither exist nor are created by it.
+    pub missing_folders: Vec<String>,
+}
+
 /// Staged-edit queue with the predicates and mutations the GUI needs while the
 /// user is staging changes. The queue is "dumb" — applying edits is still done
 /// via [`apply_edit`]; this type only owns the list and answers questions
@@ -463,6 +478,20 @@ impl EditQueue {
             .collect()
     }
 
+    /// Remove the edits at `indices` (ascending), e.g. the ones an apply landed.
+    pub fn remove_indices(&mut self, indices: &[usize]) {
+        let mut next = indices.iter().peekable();
+        let mut i = 0usize;
+        self.edits.retain(|_| {
+            let drop = next.peek() == Some(&&i);
+            if drop {
+                next.next();
+            }
+            i += 1;
+            !drop
+        });
+    }
+
     /// Drop every edit from index `len` on (undo the most recent staging batch).
     pub fn truncate(&mut self, len: usize) {
         self.edits.truncate(len);
@@ -489,54 +518,74 @@ impl EditQueue {
     }
 
     /// Staged additions whose destination name is already taken, as
-    /// `(full path, file name)`.
-    ///
-    /// Answered before applying, on purpose. The alternative — discovering each
-    /// collision mid-batch — means interrupting the user file by file and
-    /// leaving a half-applied queue behind if they change their mind at file 7
-    /// of 12. Staging exists precisely so the questions can be asked once.
+    /// `(full path, file name)`; asked once before applying, never mid-batch.
     pub fn conflicting_adds(&self, efs: &mut dyn EditableFilesystem) -> Vec<(String, String)> {
-        // Replay the queue in order over each directory's names, so an earlier
-        // rename or delete frees (or takes) a name the way the apply will see it.
-        type Occupied = std::collections::HashMap<String, Option<Vec<String>>>;
+        self.scan_against(efs.as_filesystem_mut()).conflicts
+    }
+
+    /// Replay the queue over the destination's listings and report what would fail.
+    ///
+    /// Replaying in order means an earlier rename or delete frees (or takes) a
+    /// name the way the apply will see it; names compare the way the
+    /// destination folds case.
+    pub fn scan_against(&self, fs: &mut dyn Filesystem) -> QueueScan {
+        // Folder path -> its children as (name, is_dir); None when the folder is not on disk.
+        type Occupied = std::collections::HashMap<String, Option<Vec<(String, bool)>>>;
         fn names_in<'a>(
             occupied: &'a mut Occupied,
-            parent: &FileEntry,
-            efs: &mut dyn EditableFilesystem,
-        ) -> Option<&'a mut Vec<String>> {
+            parent: &str,
+            fs: &mut dyn Filesystem,
+        ) -> Option<&'a mut Vec<(String, bool)>> {
             occupied
-                .entry(parent.path.clone())
+                .entry(parent.to_string())
                 .or_insert_with(|| {
-                    let dir = resolve_dir_by_path(efs, &parent.path).ok()?;
-                    let children = efs.list_directory(&dir).ok()?;
-                    Some(children.into_iter().map(|e| e.name).collect())
+                    let dir = resolve_dir_in(fs, parent).ok()?;
+                    let children = fs.list_directory(&dir).ok()?;
+                    Some(
+                        children
+                            .into_iter()
+                            .map(|e| {
+                                let d = e.is_directory();
+                                (e.name, d)
+                            })
+                            .collect(),
+                    )
                 })
                 .as_mut()
         }
+        let fold = fs.case_insensitive_lookup();
+        let same = |a: &str, b: &str| a == b || (fold && a.eq_ignore_ascii_case(b));
         let mut occupied = Occupied::new();
-        let mut out = Vec::new();
+        let mut created: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut missing: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut scan = QueueScan::default();
         for edit in &self.edits {
             match edit {
-                StagedEdit::AddFile { parent, name, .. } => {
-                    if let Some(names) = names_in(&mut occupied, parent, efs) {
-                        if names.iter().any(|n| n == name) {
-                            out.push((Self::pending_path(&parent.path, name), name.clone()));
-                        } else {
-                            names.push(name.clone());
-                        }
+                StagedEdit::AddFile { parent, name, .. }
+                | StagedEdit::CreateDirectory { parent, name } => {
+                    let is_dir = matches!(edit, StagedEdit::CreateDirectory { .. });
+                    let full = Self::pending_path(&parent.path, name);
+                    let names = names_in(&mut occupied, &parent.path, fs);
+                    if names.is_none() && !created.contains(&parent.path) {
+                        missing.insert(parent.path.clone());
                     }
-                }
-                StagedEdit::CreateDirectory { parent, name } => {
-                    if let Some(names) = names_in(&mut occupied, parent, efs) {
-                        if !names.iter().any(|n| n == name) {
-                            names.push(name.clone());
-                        }
+                    if is_dir {
+                        created.insert(full.clone());
+                    }
+                    let Some(names) = names else {
+                        continue;
+                    };
+                    match names.iter().find(|(n, _)| same(n, name)) {
+                        Some((_, true)) if is_dir => {}
+                        Some((_, false)) if is_dir => scan.blocked_folders.push(full),
+                        Some(_) => scan.conflicts.push((full, name.clone())),
+                        None => names.push((name.clone(), is_dir)),
                     }
                 }
                 StagedEdit::DeleteEntry { parent, entry }
                 | StagedEdit::DeleteRecursive { parent, entry } => {
-                    if let Some(names) = names_in(&mut occupied, parent, efs) {
-                        names.retain(|n| n != &entry.name);
+                    if let Some(names) = names_in(&mut occupied, &parent.path, fs) {
+                        names.retain(|(n, _)| n != &entry.name);
                     }
                 }
                 StagedEdit::Rename {
@@ -544,15 +593,48 @@ impl EditQueue {
                     entry,
                     new_name,
                 } => {
-                    if let Some(names) = names_in(&mut occupied, parent, efs) {
-                        names.retain(|n| n != &entry.name);
-                        names.push(new_name.clone());
+                    if let Some(names) = names_in(&mut occupied, &parent.path, fs) {
+                        names.retain(|(n, _)| n != &entry.name);
+                        names.push((new_name.clone(), entry.is_directory()));
                     }
                 }
                 _ => {}
             }
         }
-        out
+        scan.missing_folders = missing.into_iter().collect();
+        scan
+    }
+
+    /// Bytes the staged batch will allocate on a volume with `unit`-byte blocks,
+    /// net of staged file deletes; each fork rounds up, each new folder costs a block.
+    pub fn bytes_needed(&self, unit: u64) -> u64 {
+        let unit = unit.max(1);
+        let round = |n: u64| n.div_ceil(unit) * unit;
+        let mut need = 0u64;
+        let mut freed = 0u64;
+        for edit in &self.edits {
+            match edit {
+                StagedEdit::AddFile {
+                    size,
+                    resource_fork,
+                    ..
+                } => {
+                    let rsrc = resource_fork.as_ref().map_or(0, |r| r.data.len() as u64);
+                    need = need
+                        .saturating_add(round(*size))
+                        .saturating_add(round(rsrc));
+                }
+                StagedEdit::CreateDirectory { .. } => need = need.saturating_add(unit),
+                StagedEdit::DeleteEntry { entry, .. }
+                | StagedEdit::DeleteRecursive { entry, .. }
+                    if !entry.is_directory() =>
+                {
+                    freed = freed.saturating_add(round(entry.size));
+                }
+                _ => {}
+            }
+        }
+        need.saturating_sub(freed)
     }
 
     /// Apply a conflict decision to one staged addition, keyed by the full path

@@ -26,65 +26,210 @@ use crate::fs::replace::OnConflict;
 use crate::fs::resource_fork::{ImportedResourceFork, ResourceForkMode};
 use crate::model::browse_session::BrowseSession;
 use crate::model::commander_descend::DescendKind;
-use crate::model::edit_queue::{apply_edit, StagedEdit};
+use crate::model::edit_queue::{apply_edit, EditQueue, QueueScan, StagedEdit};
 use crate::model::wrapper_tree::{PreparedMount, WrapperSource, WrapperTree};
 #[cfg(feature = "remote")]
 use crate::remote::RemoteConnection;
 
-/// Apply `edits` to the source described by `session`, in order.
-///
-/// Opens the filesystem read-write via [`BrowseSession::open_editable`],
-/// replays each edit through [`apply_edit`], calls `sync_metadata`, then commits
-/// the container (a no-op for raw images / devices, a re-encode for floppy
-/// containers). A failure stops the batch after syncing and committing what
-/// landed; the error names how many applied so the caller can trim its queue.
+/// Apply `edits` to `session`'s source in order, stopping at the first failure.
+/// What landed is synced and committed; the error names how many applied.
 pub fn apply_edits(session: &BrowseSession, edits: &[StagedEdit]) -> Result<()> {
-    apply_edits_reporting(session, edits, |_| {})
+    let outcome = apply_edits_reporting(session, edits, false, |_| {})?;
+    match outcome.failed.first() {
+        Some(f) => bail!(
+            "{} of {} edit(s) were applied and are on the volume; drop them from the queue \
+             before retrying: applying edit {} of {} ({}): {}",
+            outcome.applied(),
+            edits.len(),
+            f.index + 1,
+            edits.len(),
+            f.label,
+            f.error
+        ),
+        None => Ok(()),
+    }
 }
 
-/// The `apply_edits` engine, with a per-edit callback for progress. The
-/// callback fires *after* each edit completes, carrying an [`EditProgress`]
-/// snapshot — this is what `spawn_apply` uses to update its [`ApplyStatus`].
+/// One staged edit that did not land, with the destination's reason.
+#[derive(Debug, Clone)]
+pub struct FailedEdit {
+    /// Index into the applied edit list.
+    pub index: usize,
+    pub label: String,
+    pub error: String,
+}
+
+/// What an apply run did. Only open / sync / commit failures are an `Err` of the engine.
+#[derive(Debug, Default, Clone)]
+pub struct ApplyOutcome {
+    /// Indices of the edits that are now on the volume.
+    pub applied_indices: Vec<usize>,
+    pub failed: Vec<FailedEdit>,
+    /// First index never attempted, when the run stopped early.
+    pub stopped_at: Option<usize>,
+}
+
+impl ApplyOutcome {
+    pub fn applied(&self) -> usize {
+        self.applied_indices.len()
+    }
+}
+
+/// Failures in a row after which a keep-going apply stops: the volume is likely full or failing.
+pub const MAX_CONSECUTIVE_FAILURES: usize = 25;
+
+/// The apply engine, with a per-edit progress callback. With `keep_going`, a failed
+/// edit is recorded and the batch continues; edits under a failed folder are reported, not tried.
 pub fn apply_edits_reporting(
     session: &BrowseSession,
     edits: &[StagedEdit],
+    keep_going: bool,
     mut on_progress: impl FnMut(EditProgress<'_>),
-) -> Result<()> {
+) -> Result<ApplyOutcome> {
     let (mut efs, commit) = session
         .open_editable()
         .context("opening source for editing")?;
-    let mut failure: Option<anyhow::Error> = None;
-    let mut applied = 0usize;
+    let mut outcome = ApplyOutcome::default();
+    let mut failed_dirs: Vec<String> = Vec::new();
+    let mut streak = 0usize;
     for (index, edit) in edits.iter().enumerate() {
-        if let Err(e) = apply_edit(efs.as_mut(), edit) {
-            failure = Some(anyhow::Error::new(e).context(format!(
-                "applying edit {} of {} ({})",
-                index + 1,
-                edits.len(),
-                edit_label(edit)
-            )));
-            break;
+        let blocked = copy_parent(edit)
+            .and_then(|p| failed_dirs.iter().find(|d| path_within(p, d)))
+            .cloned();
+        let result = match &blocked {
+            Some(dir) => Err(format!("its folder {dir} could not be created")),
+            None => apply_edit(efs.as_mut(), edit).map_err(|e| e.to_string()),
+        };
+        match result {
+            Ok(()) => {
+                streak = 0;
+                outcome.applied_indices.push(index);
+            }
+            Err(error) => {
+                if let Some(dir) = created_dir(edit) {
+                    failed_dirs.push(dir);
+                }
+                outcome.failed.push(FailedEdit {
+                    index,
+                    label: edit_label(edit),
+                    error,
+                });
+                // A skipped child is a consequence, not a new failure, so it doesn't feed the streak.
+                if blocked.is_none() {
+                    streak += 1;
+                }
+                if !keep_going || streak >= MAX_CONSECUTIVE_FAILURES {
+                    outcome.stopped_at = Some(index + 1);
+                    break;
+                }
+            }
         }
-        applied += 1;
         on_progress(EditProgress { index, edit });
     }
     // What already landed still has to reach the disk and the container,
     // or a failure at edit 7 leaves edits 1-6 unsynced on a temp flat.
-    if applied > 0 {
+    let landed = outcome.applied() > 0;
+    if landed {
         efs.sync_metadata().context("writing filesystem metadata")?;
     }
     drop(efs);
-    if applied > 0 {
+    if landed {
         commit.commit().context("committing container edits")?;
     }
-    match failure {
-        Some(e) => Err(e.context(format!(
-            "{applied} of {} edit(s) were applied and are on the volume; drop them from \
-             the queue before retrying",
-            edits.len()
-        ))),
-        None => Ok(()),
+    Ok(outcome)
+}
+
+/// The Apply preflight's verdict for a staged queue, from a fresh read-only open.
+#[derive(Debug, Default, Clone)]
+pub struct ApplyPreflight {
+    pub fs_type: String,
+    pub scan: QueueScan,
+    /// Allocation-rounded bytes the queue will consume (net of staged deletes).
+    pub bytes_needed: u64,
+    pub bytes_free: u64,
+}
+
+impl ApplyPreflight {
+    pub fn shortfall(&self) -> u64 {
+        self.bytes_needed.saturating_sub(self.bytes_free)
     }
+
+    /// Nothing for the user to decide: apply straight away.
+    pub fn is_clean(&self) -> bool {
+        self.scan.conflicts.is_empty()
+            && self.scan.blocked_folders.is_empty()
+            && self.scan.missing_folders.is_empty()
+            && self.shortfall() == 0
+    }
+}
+
+/// Check `edits` against `session`'s volume without writing: name conflicts,
+/// folders blocked by files, missing parent folders, and free space.
+pub fn preflight_apply(session: &BrowseSession, edits: &[StagedEdit]) -> Result<ApplyPreflight> {
+    let mut fs = session
+        .open()
+        .context("opening the destination to check the staged edits")?;
+    let mut queue = EditQueue::new();
+    for e in edits {
+        queue.push(e.clone());
+    }
+    let scan = queue.scan_against(fs.as_mut());
+    let unit = fs.allocation_unit().unwrap_or(512);
+    Ok(ApplyPreflight {
+        fs_type: fs.fs_type().to_string(),
+        scan,
+        bytes_needed: queue.bytes_needed(unit),
+        bytes_free: fs.total_size().saturating_sub(fs.used_size()),
+    })
+}
+
+/// Shared state for a [`spawn_apply_preflight`] worker.
+#[derive(Default)]
+pub struct PreflightStatus {
+    pub finished: bool,
+    pub result: Option<std::result::Result<ApplyPreflight, String>>,
+}
+
+/// Run [`preflight_apply`] off the UI thread; a big queue walks many folders.
+pub fn spawn_apply_preflight(
+    session: BrowseSession,
+    edits: Vec<StagedEdit>,
+) -> Arc<Mutex<PreflightStatus>> {
+    let status = Arc::new(Mutex::new(PreflightStatus::default()));
+    let worker = Arc::clone(&status);
+    thread::spawn(move || {
+        let result = preflight_apply(&session, &edits).map_err(|e| format!("{e:#}"));
+        if let Ok(mut g) = worker.lock() {
+            g.result = Some(result);
+            g.finished = true;
+        }
+    });
+    status
+}
+
+/// Destination folder of a copy-in edit (the only edits that nest under staged folders).
+fn copy_parent(edit: &StagedEdit) -> Option<&str> {
+    match edit {
+        StagedEdit::AddFile { parent, .. } | StagedEdit::CreateDirectory { parent, .. } => {
+            Some(&parent.path)
+        }
+        _ => None,
+    }
+}
+
+/// Full path of the folder a `CreateDirectory` makes.
+fn created_dir(edit: &StagedEdit) -> Option<String> {
+    match edit {
+        StagedEdit::CreateDirectory { parent, name } => Some(join_path(&parent.path, name)),
+        _ => None,
+    }
+}
+
+fn path_within(path: &str, dir: &str) -> bool {
+    path == dir
+        || path
+            .strip_prefix(dir)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// One edit's completion snapshot, handed to the `apply_edits_reporting`
@@ -1393,12 +1538,18 @@ pub struct ApplyStatus {
     pub bytes_total: u64,
     /// The edit currently being applied, for the modal's "Writing X" line.
     pub current_edit: String,
+    /// Per-edit result of a local apply, set when it finishes without a fatal error.
+    pub outcome: Option<ApplyOutcome>,
 }
 
 /// Run [`apply_edits`] on a worker thread. The returned status flips `finished`
 /// when done, with `error` set on failure, and updates per-edit counters live
 /// so the Commander progress modal can render percent + rate + ETA.
-pub fn spawn_apply(session: BrowseSession, edits: Vec<StagedEdit>) -> Arc<Mutex<ApplyStatus>> {
+pub fn spawn_apply(
+    session: BrowseSession,
+    edits: Vec<StagedEdit>,
+    keep_going: bool,
+) -> Arc<Mutex<ApplyStatus>> {
     let status = Arc::new(Mutex::new(ApplyStatus::default()));
     if let Ok(mut g) = status.lock() {
         g.edits_total = edits.len();
@@ -1407,7 +1558,7 @@ pub fn spawn_apply(session: BrowseSession, edits: Vec<StagedEdit>) -> Arc<Mutex<
     let status_thread = Arc::clone(&status);
     thread::spawn(move || {
         let status_cb = Arc::clone(&status_thread);
-        let result = apply_edits_reporting(&session, &edits, move |p| {
+        let result = apply_edits_reporting(&session, &edits, keep_going, move |p| {
             if let Ok(mut g) = status_cb.lock() {
                 g.edits_done = p.index + 1;
                 g.current_edit = edit_label(p.edit);
@@ -1417,8 +1568,9 @@ pub fn spawn_apply(session: BrowseSession, edits: Vec<StagedEdit>) -> Arc<Mutex<
             }
         });
         if let Ok(mut g) = status_thread.lock() {
-            if let Err(e) = result {
-                g.error = Some(format!("{e:#}"));
+            match result {
+                Ok(outcome) => g.outcome = Some(outcome),
+                Err(e) => g.error = Some(format!("{e:#}")),
             }
             g.finished = true;
         }
@@ -1628,6 +1780,126 @@ mod tests {
 
         let err = copy_host_entries_to_host(&entries, &dst, OnConflict::Fail, &status).unwrap_err();
         assert!(format!("{err:#}").contains("already exists"), "{err:#}");
+    }
+
+    /// A blank flat HFS image on disk with `/Existing` (file) and `/Plug-ins` (folder).
+    fn hfs_session() -> (tempfile::NamedTempFile, BrowseSession) {
+        use crate::fs::filesystem::{
+            CreateDirectoryOptions, CreateFileOptions, EditableFilesystem,
+        };
+        let mut img = crate::fs::hfs::create_blank_hfs(8 << 20, 4096, "Dest").unwrap();
+        let file = tempfile::Builder::new().suffix(".hfv").tempfile().unwrap();
+        {
+            let mut fs =
+                crate::fs::hfs::HfsFilesystem::open(std::io::Cursor::new(&mut img), 0).unwrap();
+            let root = fs.root().unwrap();
+            let mut data: &[u8] = b"old";
+            fs.create_file(
+                &root,
+                "Existing",
+                &mut data,
+                3,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+            fs.create_directory(&root, "Plug-ins", &CreateDirectoryOptions::default())
+                .unwrap();
+            fs.sync_metadata().unwrap();
+        }
+        std::fs::write(file.path(), &img).unwrap();
+        let session = BrowseSession {
+            source_path: Some(file.path().to_path_buf()),
+            partition_type_string: Some("Apple_HFS".into()),
+            ..Default::default()
+        };
+        (file, session)
+    }
+
+    fn add(parent: &str, name: &str, host: &Path) -> StagedEdit {
+        StagedEdit::AddFile {
+            parent: FileEntry::new_directory(String::new(), parent.into(), 0),
+            name: name.into(),
+            host_path: host.to_path_buf(),
+            size: 3,
+            prodos_type: None,
+            prodos_aux: None,
+            resource_fork: None,
+            hfs_type_override: None,
+            hfs_creator_override: None,
+            dates: None,
+            on_conflict: OnConflict::Fail,
+        }
+    }
+
+    fn mkdir(parent: &str, name: &str) -> StagedEdit {
+        StagedEdit::CreateDirectory {
+            parent: FileEntry::new_directory(String::new(), parent.into(), 0),
+            name: name.into(),
+        }
+    }
+
+    /// The reported shape: a big copy with one bad item must not strand the rest.
+    #[test]
+    fn keep_going_apply_lands_everything_but_the_failures() {
+        let (_img, session) = hfs_session();
+        let host = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(host.path(), b"abc").unwrap();
+        let edits = vec![
+            mkdir("/Plug-ins", "Acquire/Export"),
+            add("/Plug-ins/Acquire/Export", "Anti-Aliased PICT", host.path()),
+            add("/", "Existing", host.path()), // conflict, OnConflict::Fail
+            mkdir("/", "Existing"),            // blocked by the file
+            add("/Existing", "inside", host.path()),
+            add("/", "After", host.path()),
+        ];
+        let outcome = apply_edits_reporting(&session, &edits, true, |_| {}).unwrap();
+        assert_eq!(outcome.applied_indices, [0, 1, 5]);
+        let failed: Vec<usize> = outcome.failed.iter().map(|f| f.index).collect();
+        assert_eq!(failed, [2, 3, 4]);
+        assert!(
+            outcome.failed[2].error.contains("could not be created"),
+            "{:?}",
+            outcome.failed[2]
+        );
+        assert!(outcome.stopped_at.is_none());
+
+        // Stop-on-error keeps the old contract: nothing after the first failure runs.
+        let (_img2, session2) = hfs_session();
+        let outcome = apply_edits_reporting(&session2, &edits, false, |_| {}).unwrap();
+        assert_eq!(outcome.applied_indices, [0, 1]);
+        assert_eq!(outcome.stopped_at, Some(3));
+
+        let mut queue = EditQueue::new();
+        for e in edits {
+            queue.push(e);
+        }
+        queue.remove_indices(&[0, 1, 5]);
+        assert_eq!(queue.len(), 3);
+    }
+
+    #[test]
+    fn preflight_finds_conflicts_blocked_and_missing_folders() {
+        let (_img, session) = hfs_session();
+        let host = tempfile::NamedTempFile::new().unwrap();
+        let edits = vec![
+            add("/", "EXISTING", host.path()), // HFS folds case: a conflict
+            mkdir("/", "Existing"),            // a file holds the name
+            add("/Gone", "x", host.path()),    // no such folder, none staged
+            mkdir("/Plug-ins", "New"),
+            add("/Plug-ins/New", "ok", host.path()), // parent created by the queue
+        ];
+        let p = preflight_apply(&session, &edits).unwrap();
+        assert_eq!(p.fs_type, "HFS");
+        assert_eq!(
+            p.scan.conflicts,
+            [("/EXISTING".to_string(), "EXISTING".to_string())]
+        );
+        assert_eq!(p.scan.blocked_folders, ["/Existing"]);
+        assert_eq!(p.scan.missing_folders, ["/Gone"]);
+        assert!(!p.is_clean());
+        // Three 3-byte files plus two folders, each rounded to one 4 KiB-or-larger block.
+        assert!(p.bytes_needed >= 5 * 512, "{}", p.bytes_needed);
+        assert_eq!(p.shortfall(), 0);
     }
 
     /// Build a blank FAT12 floppy on disk with one file, then apply a staged

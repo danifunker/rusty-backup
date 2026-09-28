@@ -301,11 +301,31 @@ The destination silently drops metadata it can't hold (e.g. HFS resource fork / 
 lose forks/metadata, and validate names against the destination
 (`Filesystem::validate_name`) — on rejection, prompt to rename or skip.
 
-### 5.4 Name collisions
+### 5.4 Name collisions, the Apply preflight, and recovery
 
-If the destination already has an entry with that name, show a small modal:
-**Overwrite / Skip / Cancel** (with "apply to all" for batch). Overwrite stages a
-delete-then-add on the dest queue.
+**Illegal names** are fixed at staging time: `model::stage_names` runs every
+staged copy name through `fs::name_legalize::legalize_name` against the
+destination's `validate_name`, renames what the destination can't hold (with a
+`_N` suffix on collisions) and re-parents the subtree. Commander lists the
+changes and points at Mac Archive (.mar) export for a lossless copy; "Undo copy"
+drops the batch.
+
+**Apply** first runs `commander_ops::spawn_apply_preflight` on a fresh read-only
+open. `EditQueue::scan_against` replays the queue over the real listings
+(case-folded where the destination folds case) and reports name conflicts,
+folders blocked by a file of the same name, and parent folders that neither
+exist nor are staged; `EditQueue::bytes_needed` rounds every fork to
+`allocation_unit()` for the free-space check. A clean verdict applies straight
+away; otherwise a review offers **Skip existing / Overwrite**, notes the space
+shortfall, and **Apply / Cancel**.
+
+The apply runs with `keep_going`: a failed edit is recorded with the
+destination's own error and the batch continues; edits under a folder that
+failed to be created are reported, not tried; 25 failures in a row stop the run
+(the volume is likely full or failing). Afterwards the pane drops the edits
+that landed, reopens the volume, restores the rest of the queue, returns to the
+same folder, and shows the report with **Retry / Discard remaining / Close**.
+The TUI keeps the stop-at-first-failure `apply_edits` contract.
 
 ### 5.5 Temp-file lifetime
 
