@@ -389,6 +389,23 @@ pub fn resolve_components(
     fs: &mut dyn Filesystem,
     components: &[String],
 ) -> Result<crate::fs::entry::FileEntry> {
+    match resolve_components_strict(fs, components) {
+        Ok(entry) => Ok(entry),
+        Err(strict_err) => {
+            // An unescaped path (Commander's remote apply) may split a slash-bearing name.
+            let parts: Vec<&str> = components.iter().map(String::as_str).collect();
+            match crate::fs::filesystem::resolve_components_joined(fs, &parts, false) {
+                Ok(Some(entry)) => Ok(entry),
+                _ => Err(strict_err),
+            }
+        }
+    }
+}
+
+fn resolve_components_strict(
+    fs: &mut dyn Filesystem,
+    components: &[String],
+) -> Result<crate::fs::entry::FileEntry> {
     let fold_case = fs.case_insensitive_lookup();
     let mut current = fs.root().map_err(|e| anyhow!("root: {e}"))?;
     for component in components {

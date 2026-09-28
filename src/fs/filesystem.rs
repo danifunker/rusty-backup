@@ -774,6 +774,50 @@ pub fn find_child<'a>(
     })
 }
 
+/// Walk `components` from the root, rejoining neighbours with `/` when a name
+/// holds a literal slash (legal on HFS); see docs/commander_mode.md "Slashes in names".
+pub fn resolve_components_joined(
+    fs: &mut dyn Filesystem,
+    components: &[&str],
+    want_dir: bool,
+) -> Result<Option<FileEntry>, FilesystemError> {
+    let root = fs.root()?;
+    if components.is_empty() {
+        return Ok(Some(root));
+    }
+    let fold = fs.case_insensitive_lookup();
+    walk_joined(fs, &root, components, want_dir, fold)
+}
+
+fn walk_joined(
+    fs: &mut dyn Filesystem,
+    dir: &FileEntry,
+    rest: &[&str],
+    want_dir: bool,
+    fold: bool,
+) -> Result<Option<FileEntry>, FilesystemError> {
+    let children = fs.list_directory(dir)?;
+    // Fewest components first, so a path that resolves strictly never takes a joined branch.
+    for take in 1..=rest.len() {
+        let name = rest[..take].join("/");
+        let Some(child) = find_child(fold, &children, &name) else {
+            continue;
+        };
+        let tail = &rest[take..];
+        if tail.is_empty() {
+            if !want_dir || child.is_directory() {
+                return Ok(Some(child.clone()));
+            }
+        } else if child.is_directory() {
+            let child = child.clone();
+            if let Some(found) = walk_joined(fs, &child, tail, want_dir, fold)? {
+                return Ok(Some(found));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// The filesystems whose drivers refuse `readme.txt` beside `README.TXT`, so a
 /// lookup that only matched exactly would see no conflict where they see one.
 pub fn folds_case(fs_type: &str) -> bool {

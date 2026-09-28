@@ -1486,7 +1486,7 @@ fn remote_apply(
                     session
                         .stage_upload_with_fork(
                             sid,
-                            &parent.path,
+                            &wire_parent_path(&parent.path),
                             name,
                             host_path,
                             false,
@@ -1498,7 +1498,7 @@ fn remote_apply(
                 }
                 StagedEdit::CreateDirectory { parent, name } => {
                     session
-                        .stage_mkdir(sid, &parent.path, name)
+                        .stage_mkdir(sid, &wire_parent_path(&parent.path), name)
                         .with_context(|| format!("creating directory {name}"))?;
                 }
                 _ => {
@@ -1516,6 +1516,12 @@ fn remote_apply(
     // Always release the session + staging blobs, even on error.
     let _ = session.close_session(sid);
     staged
+}
+
+/// The daemon parses `\` as an escape, so a literal backslash in a Mac name must be doubled.
+#[cfg(feature = "remote")]
+fn wire_parent_path(path: &str) -> String {
+    path.replace('\\', "\\\\")
 }
 
 /// Synchronously apply `edits` (AddFile / CreateDirectory) to the remote image

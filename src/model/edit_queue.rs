@@ -199,25 +199,11 @@ pub fn resolve_dir_by_path(
     efs: &mut dyn EditableFilesystem,
     path: &str,
 ) -> Result<FileEntry, FilesystemError> {
-    let mut current = efs.root()?;
-    if path == "/" || path.is_empty() {
-        return Ok(current);
-    }
-    for component in path.trim_start_matches('/').split('/') {
-        if component.is_empty() {
-            continue;
-        }
-        let children = efs.list_directory(&current)?;
-        current = children
-            .into_iter()
-            .find(|e| e.is_directory() && e.name == component)
-            .ok_or_else(|| {
-                FilesystemError::NotFound(format!(
-                    "directory '{component}' not found while resolving '{path}'"
-                ))
-            })?;
-    }
-    Ok(current)
+    let components: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
+    crate::fs::filesystem::resolve_components_joined(efs.as_filesystem_mut(), &components, true)?
+        .ok_or_else(|| {
+            FilesystemError::NotFound(format!("folder '{path}' not found on the destination"))
+        })
 }
 
 /// Apply a single staged edit to `efs`. Pure dispatch — does not call
@@ -1593,5 +1579,81 @@ mod tests {
             Some(target),
             "copied file kept the source's Amiga datestamp"
         );
+    }
+
+    fn mkdir_edit(parent: &str, name: &str) -> StagedEdit {
+        let pname = parent.rsplit('/').next().unwrap_or("").to_string();
+        StagedEdit::CreateDirectory {
+            parent: FileEntry::new_directory(pname, parent.into(), 0),
+            name: name.into(),
+        }
+    }
+
+    fn add_edit(parent: &str, name: &str, host: &std::path::Path) -> StagedEdit {
+        let pname = parent.rsplit('/').next().unwrap_or("").to_string();
+        StagedEdit::AddFile {
+            parent: FileEntry::new_directory(pname, parent.into(), 0),
+            name: name.into(),
+            host_path: host.to_path_buf(),
+            size: 3,
+            prodos_type: None,
+            prodos_aux: None,
+            resource_fork: None,
+            hfs_type_override: None,
+            hfs_creator_override: None,
+            dates: None,
+            on_conflict: crate::fs::replace::OnConflict::Fail,
+        }
+    }
+
+    /// Photoshop 3's `Plug-ins/Acquire/Export` is ONE folder: applying into it
+    /// must not split the parent path at the slash (the reported Apply failure).
+    #[test]
+    fn apply_into_a_folder_whose_name_holds_a_slash() {
+        let host = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(host.path(), b"abc").unwrap();
+        let mut buf = create_blank_hfs(8 * MIB, 4096, "Slash").unwrap();
+        let mut efs = HfsFilesystem::open(Cursor::new(&mut buf), 0).unwrap();
+        let edits = [
+            mkdir_edit("/", "Plug-ins"),
+            mkdir_edit("/Plug-ins", "Acquire/Export"),
+            add_edit("/Plug-ins/Acquire/Export", "Anti-Aliased PICT", host.path()),
+            // A decoy `Acquire` that is a prefix of the real name must not win.
+            mkdir_edit("/Plug-ins", "Acquire"),
+            add_edit("/Plug-ins/Acquire/Export", "Second", host.path()),
+            // HFS folds case, so a differently-cased parent path still resolves.
+            add_edit("/PLUG-INS/acquire/export", "Third", host.path()),
+        ];
+        for e in &edits {
+            apply_edit(&mut efs, e).unwrap();
+        }
+        let dir = resolve_dir_by_path(&mut efs, "/Plug-ins/Acquire/Export").unwrap();
+        assert_eq!(dir.name, "Acquire/Export");
+        let mut names: Vec<String> = efs
+            .list_directory(&dir)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        names.sort();
+        assert_eq!(names, ["Anti-Aliased PICT", "Second", "Third"]);
+        let decoy = resolve_dir_by_path(&mut efs, "/Plug-ins/Acquire").unwrap();
+        assert!(efs.list_directory(&decoy).unwrap().is_empty());
+    }
+
+    /// Nested slash names, e.g. `MacDRUMS Instruments/Tracks/ Med Rock (Set 1)`.
+    #[test]
+    fn resolve_nested_slash_names() {
+        let mut buf = create_blank_hfs(8 * MIB, 4096, "Slash").unwrap();
+        let mut efs = HfsFilesystem::open(Cursor::new(&mut buf), 0).unwrap();
+        apply_edit(&mut efs, &mkdir_edit("/", "MacDRUMS Instruments/Tracks")).unwrap();
+        apply_edit(
+            &mut efs,
+            &mkdir_edit("/MacDRUMS Instruments/Tracks", "a/b/c"),
+        )
+        .unwrap();
+        let dir = resolve_dir_by_path(&mut efs, "/MacDRUMS Instruments/Tracks/a/b/c").unwrap();
+        assert_eq!(dir.name, "a/b/c");
+        assert!(resolve_dir_by_path(&mut efs, "/MacDRUMS Instruments/Nope").is_err());
     }
 }

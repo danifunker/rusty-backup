@@ -279,6 +279,21 @@ Copying a directory stages a `CreateDirectory` for the dir, then walks its subtr
 (`list_directory`) staging `CreateDirectory` / `AddFile` for each descendant in order.
 For image→host this recurses with real `create_dir_all` + extraction.
 
+#### Slashes in names
+
+Classic Mac volumes allow `/` inside a name (`Acquire/Export`, `Schwarz/Weiss`,
+`MacDRUMS Instruments/Tracks`), but a `FileEntry.path` is a plain `/`-joined
+string, so `/Plug-ins/Acquire/Export` is ambiguous. Staged edits keep that raw
+path and resolve it at apply time with `fs::filesystem::resolve_components_joined`:
+it walks the path one component at a time and, when a component is missing,
+retries with its neighbours rejoined by `/`, backtracking on a dead end. Fewest
+components are tried first, so a path that resolves strictly never takes a
+joined branch, and a decoy `Acquire` folder beside `Acquire/Export` cannot
+capture the files. The lookup folds case wherever the destination does.
+The daemon's `resolve_path` falls back to the same walk when strict
+`\/`-escaped resolution fails, and Commander's remote apply doubles literal
+backslashes so the daemon never reads a Mac name as an escape.
+
 ### 5.3 Cross-filesystem mapping & warnings
 
 The destination silently drops metadata it can't hold (e.g. HFS resource fork / type
