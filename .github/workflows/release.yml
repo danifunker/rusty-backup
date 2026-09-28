@@ -45,10 +45,15 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+# Ubuntu runners are pinned to ubuntu-24.04, never `ubuntu-latest`: a glibc-linked
+# Linux binary needs at least the build host's glibc, so the label decides which
+# distros our .deb/.rpm/rb-cli run on. `ubuntu-latest` moves to 26.04 (glibc 2.43)
+# between 2026-10-19 and 2026-11-19, and the riscv64 GUI job's `noble` sources
+# only resolve on 24.04. Move to a newer image deliberately, all jobs at once.
 jobs:
   generate-version:
     name: Generate Version
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
@@ -682,7 +687,7 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             arch: x64
-            runs-on: ubuntu-latest
+            runs-on: ubuntu-24.04
           - target: aarch64-unknown-linux-gnu
             arch: arm64
             runs-on: ubuntu-24.04-arm
@@ -842,7 +847,7 @@ jobs:
     # Skipped only when a manual run unticks "desktop"; every push builds it.
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.desktop }}
     needs: generate-version
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Don't fail the whole workflow if the cross-compile breaks. Combined
     # with the release job's `needs:` entry above, this still gates the
     # release on the artifact existing — but a failure here lets the desktop
@@ -1044,7 +1049,7 @@ jobs:
     # Skipped only when a manual run unticks "desktop"; every push builds it.
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.desktop }}
     needs: generate-version
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Non-fatal: a broken cross-compile must not hold up the desktop release
     # (the release job hard-requires only the four desktop builds). The release
     # still waits for this job via `needs:`, so a green build ships its tarball.
@@ -1236,7 +1241,7 @@ jobs:
     # Skipped only when a manual run unticks "desktop"; every push builds it.
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.desktop }}
     needs: generate-version
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     continue-on-error: true
     env:
       RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
@@ -1483,7 +1488,7 @@ jobs:
   # resolves to [] so feature-branch iteration stays fast.
   appliance-matrix:
     name: Resolve appliance arch list
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       arches: ${{ steps.m.outputs.arches }}
     steps:
@@ -1516,7 +1521,7 @@ jobs:
     # Pentium. (A true 486 is cb-dos, built below.)
     needs: [generate-version, appliance-matrix]
     if: needs.appliance-matrix.outputs.arches != '[]'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Non-fatal like the MiSTer job — a Buildroot hiccup lets the desktop release
     # ship. Cap the runtime so a wedged build can't burn the 6 h default.
     continue-on-error: true
@@ -1541,7 +1546,7 @@ jobs:
           df -h /
 
       - name: Cache Buildroot source downloads
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: buildroot/dl
           key: buildroot-dl-2024.02
@@ -1551,7 +1556,7 @@ jobs:
         # run_id in the key makes every run save a fresh entry; restore-keys
         # pulls the newest previous one — so the ccache keeps warming up. After
         # the first ~1 h build, warm-cache rebuilds are much faster.
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: buildroot/ccache
           key: buildroot-ccache-${{ matrix.arch }}-${{ github.run_id }}
@@ -1611,7 +1616,7 @@ jobs:
 
       - name: Make Buildroot caches readable for actions/cache
         # Buildroot runs as root in the container, so dl/ccache land root-owned;
-        # let the runner user read them when the cache@v4 post-step saves.
+        # let the runner user read them when the cache post-step saves.
         if: always()
         run: sudo chmod -R a+rX buildroot/dl buildroot/ccache 2>/dev/null || true
 
@@ -1623,7 +1628,7 @@ jobs:
     # green pipeline.
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.sol9 }}
     needs: generate-version
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Deliberately NOT continue-on-error. It was, back when this job built GCC from source
     # and a mirror hiccup could redden a release for reasons unrelated to the code. It now
     # downloads a prebuilt seed, and a missing secret already skips the job -- so a failure
@@ -1741,7 +1746,7 @@ jobs:
     # `release` (main-only) publishes.
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.cbdos }}
     needs: generate-version
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Non-fatal like the other deployable-media jobs: a FreeDOS-mirror or DJGPP
     # hiccup shouldn't hold up the desktop release.
     continue-on-error: true
@@ -2030,7 +2035,7 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             arch: x64
-            runs-on: ubuntu-latest
+            runs-on: ubuntu-24.04
             toolchain: stable
             prebuilt: "yes"
             apt: musl-tools
@@ -2044,7 +2049,7 @@ jobs:
             strip: strip
           - target: i586-unknown-linux-musl
             arch: i586
-            runs-on: ubuntu-latest
+            runs-on: ubuntu-24.04
             toolchain: stable
             prebuilt: "yes"
             apt: gcc-i686-linux-gnu
@@ -2053,7 +2058,7 @@ jobs:
             strip: i686-linux-gnu-strip
           - target: i686-unknown-linux-musl
             arch: i686
-            runs-on: ubuntu-latest
+            runs-on: ubuntu-24.04
             toolchain: stable
             prebuilt: "yes"
             apt: gcc-i686-linux-gnu
@@ -2068,7 +2073,7 @@ jobs:
           # firewalled musl.cc). Both are best-effort legs.
           - target: powerpc64-unknown-linux-musl
             arch: ppc64
-            runs-on: ubuntu-latest
+            runs-on: ubuntu-24.04
             toolchain: stable
             prebuilt: "yes"
             zigbuild: "yes"
@@ -2083,7 +2088,7 @@ jobs:
           # the open question this leg is testing.
           - target: powerpc-unknown-linux-musl
             arch: ppc32
-            runs-on: ubuntu-latest
+            runs-on: ubuntu-24.04
             toolchain: nightly
             prebuilt: "no"
             zig_cc: powerpc-linux-musleabihf
@@ -2250,10 +2255,14 @@ jobs:
       - build-rb-cli-musl
       # Solaris 9 SPARC; skips when the sysroot secret is absent.
       - build-sol9-sparc
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v8
+        # v8.0.1 bundles a dep that calls Buffer(), so Node 24 prints DEP0005 on
+        # every run (actions/download-artifact#484). Drop this once it's fixed.
+        env:
+          NODE_OPTIONS: --no-deprecation
         with:
           path: artifacts
       
