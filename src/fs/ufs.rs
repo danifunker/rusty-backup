@@ -3397,6 +3397,9 @@ impl<R: Read + Seek + Send> Filesystem for UfsFilesystem<R> {
         self.label.as_deref()
     }
 
+    fn validate_name(&self, name: &str) -> Result<(), FilesystemError> {
+        validate_name(name.as_bytes())
+    }
     fn fs_type(&self) -> &str {
         self.version.name()
     }

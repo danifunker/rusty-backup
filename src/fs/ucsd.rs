@@ -293,6 +293,15 @@ impl<R: Read + Seek + Send> Filesystem for UcsdFilesystem<R> {
         }
     }
 
+    fn validate_name(&self, name: &str) -> Result<(), FilesystemError> {
+        if valid_ucsd_name(name) {
+            Ok(())
+        } else {
+            Err(FilesystemError::InvalidData(
+                "UCSD names are 1-15 printable ASCII characters with no '/' or ':'".into(),
+            ))
+        }
+    }
     fn fs_type(&self) -> &str {
         "UCSD p-System"
     }

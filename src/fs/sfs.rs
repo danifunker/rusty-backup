@@ -988,6 +988,9 @@ impl<R: Read + Seek + Send> Filesystem for SfsFilesystem<R> {
         None
     }
 
+    fn validate_name(&self, name: &str) -> Result<(), FilesystemError> {
+        crate::fs::name_legalize::validate_amiga_name(name, 30, "SFS")
+    }
     fn fs_type(&self) -> &str {
         "SFS"
     }

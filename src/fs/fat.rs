@@ -1737,6 +1737,18 @@ fn validate_fat_name(name: &str) -> Result<(), FilesystemError> {
                  (forbidden: \" * / : < > ? \\ |) — rename the file"
             )));
         }
+        if (c as u32) < 0x20 {
+            return Err(FilesystemError::InvalidData(format!(
+                "filename contains a control character (U+{:04X}); \
+                 FAT disallows control codes — rename the file",
+                c as u32
+            )));
+        }
+    }
+    if crate::fs::name_legalize::is_dos_device_name(name) {
+        return Err(FilesystemError::InvalidData(format!(
+            "'{name}' is a reserved DOS/Windows device name — rename the file"
+        )));
     }
     if name.ends_with(' ') || name.ends_with('.') {
         return Err(FilesystemError::InvalidData(

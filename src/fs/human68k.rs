@@ -814,6 +814,9 @@ impl<R: Read + Seek + Send> Filesystem for Human68kFilesystem<R> {
         Ok(data)
     }
 
+    fn validate_name(&self, name: &str) -> Result<(), FilesystemError> {
+        encode_human68k_name(name).map(|_| ())
+    }
     fn fs_type(&self) -> &str {
         match self.bpb.fat_kind {
             FatKind::Fat12 => "Human68k (FAT12)",

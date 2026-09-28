@@ -870,6 +870,9 @@ impl<R: Read + Seek + Send> Filesystem for MinixFilesystem<R> {
         None
     }
 
+    fn validate_name(&self, name: &str) -> Result<(), FilesystemError> {
+        crate::fs::name_legalize::validate_posix_name(name, self.sb.name_len, "Minix")
+    }
     fn fs_type(&self) -> &str {
         self.fs_type
     }

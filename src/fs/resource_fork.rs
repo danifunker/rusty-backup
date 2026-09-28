@@ -216,22 +216,10 @@ pub fn build_macbinary(
     buf
 }
 
-/// Sanitize a filename for the host OS.
-/// Replaces characters that are invalid on common filesystems.
+/// Sanitize a filename for the host OS via the shared legalizer (Windows rules on Windows).
 pub fn sanitize_filename(name: &str) -> String {
-    let safe: String = name
-        .chars()
-        .map(|c| match c {
-            ':' | '/' | '\\' | '\0' => '_',
-            '<' | '>' | '"' | '|' | '?' | '*' => '_',
-            _ => c,
-        })
-        .collect();
-    // A catalog name of `..` (or an empty one) must not become a path step.
-    if safe.is_empty() || safe == "." || safe == ".." {
-        return "_".repeat(safe.len().max(1));
-    }
-    safe
+    let check = crate::fs::name_legalize::validate_host_name;
+    crate::fs::name_legalize::legalize_name(&check, name).unwrap_or_else(|_| "_".to_string())
 }
 
 /// Round up to the next multiple of 128.
@@ -750,6 +738,8 @@ mod tests {
         assert_eq!(sanitize_filename("file/name"), "file_name");
         assert_eq!(sanitize_filename("normal.txt"), "normal.txt");
         assert_eq!(sanitize_filename("a<b>c"), "a_b_c");
+        assert_eq!(sanitize_filename(".."), "_");
+        assert_eq!(sanitize_filename(""), "_");
     }
 
     #[test]

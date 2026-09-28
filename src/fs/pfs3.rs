@@ -1097,6 +1097,9 @@ impl<R: Read + Seek + Send> Filesystem for Pfs3Filesystem<R> {
         }
     }
 
+    fn validate_name(&self, name: &str) -> Result<(), FilesystemError> {
+        crate::fs::name_legalize::validate_amiga_name(name, 107, "PFS3")
+    }
     fn fs_type(&self) -> &str {
         // Differentiate the three on-disk magics. Boot block carried the
         // selection but we didn't preserve it; rootblock disktype works

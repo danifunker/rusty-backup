@@ -681,6 +681,9 @@ impl<RW: Read + Write + Seek + Send> Filesystem for SquashfsEditor<RW> {
             .unwrap_or_default())
     }
 
+    fn validate_name(&self, name: &str) -> Result<(), FilesystemError> {
+        Self::check_name(name)
+    }
     fn fs_type(&self) -> &str {
         "SquashFS"
     }

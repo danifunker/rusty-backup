@@ -1093,6 +1093,9 @@ impl<R: Read + Seek + Send> Filesystem for MfsFilesystem<R> {
         Ok(data)
     }
 
+    fn validate_name(&self, name: &str) -> Result<(), FilesystemError> {
+        validate_mfs_name(name).map(|_| ())
+    }
     fn fs_type(&self) -> &str {
         "MFS"
     }

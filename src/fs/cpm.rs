@@ -570,6 +570,9 @@ impl<R: Read + Seek + Send> Filesystem for CpmFilesystem<R> {
         Ok(data)
     }
 
+    fn validate_name(&self, name: &str) -> Result<(), FilesystemError> {
+        validate_cpm_name(name).map(|_| ())
+    }
     fn fs_type(&self) -> &str {
         "CP/M"
     }

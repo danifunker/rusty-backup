@@ -456,6 +456,14 @@ impl<R: Read + Seek + Send> Filesystem for Os9Filesystem<R> {
         Ok(data)
     }
 
+    fn validate_name(&self, name: &str) -> Result<(), FilesystemError> {
+        if name == "." || name == ".." {
+            return Err(FilesystemError::InvalidData(
+                "'.' and '..' are reserved on OS-9".into(),
+            ));
+        }
+        encode_os9_name(name).map(|_| ())
+    }
     fn fs_type(&self) -> &str {
         "OS-9"
     }

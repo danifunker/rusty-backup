@@ -911,6 +911,9 @@ impl<R: Read + Seek + Send> Filesystem for XfsFilesystem<R> {
         }
     }
 
+    fn validate_name(&self, name: &str) -> Result<(), FilesystemError> {
+        crate::fs::name_legalize::validate_posix_name(name, 255, "XFS")
+    }
     fn fs_type(&self) -> &str {
         self.fs_type_name
     }

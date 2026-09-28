@@ -601,6 +601,9 @@ impl<R: Read + Seek + Send> Filesystem for DfsFilesystem<R> {
         Ok(data)
     }
 
+    fn validate_name(&self, name: &str) -> Result<(), FilesystemError> {
+        split_dir_name(name).map(|_| ())
+    }
     fn fs_type(&self) -> &str {
         "Acorn DFS"
     }

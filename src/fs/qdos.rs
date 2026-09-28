@@ -404,6 +404,9 @@ impl<R: Read + Seek + Send> Filesystem for QdosFilesystem<R> {
         Ok(raw[FILE_HEADER_BYTES..].to_vec())
     }
 
+    fn validate_name(&self, name: &str) -> Result<(), FilesystemError> {
+        validate_qdos_name(name)
+    }
     fn fs_type(&self) -> &str {
         "QDOS (QXL.WIN)"
     }

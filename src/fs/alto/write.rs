@@ -614,6 +614,18 @@ fn build_leader(
     d
 }
 
+/// The full create-time name check, reserved names included.
+pub(super) fn validate_alto_name(name: &str) -> Result<(), FilesystemError> {
+    let name = normalize_name(name)?;
+    let bare = name.trim_end_matches('.');
+    if bare.eq_ignore_ascii_case("SysDir") || bare.eq_ignore_ascii_case("DiskDescriptor") {
+        return Err(FilesystemError::InvalidData(
+            "that name is reserved by the filesystem".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Validate / normalize a filename for `add_file`: printable ASCII, not too
 /// long, with a trailing `.` per Alto convention.
 fn normalize_name(name: &str) -> Result<String, FilesystemError> {

@@ -1660,6 +1660,11 @@ fn validate_ntfs_name(name: &str) -> Result<(), FilesystemError> {
             )));
         }
     }
+    if crate::fs::name_legalize::is_dos_device_name(name) {
+        return Err(FilesystemError::InvalidData(format!(
+            "'{name}' is a reserved DOS/Windows device name — rename the file"
+        )));
+    }
     Ok(())
 }
 

@@ -942,6 +942,9 @@ impl<R: Read + Seek + Send> Filesystem for CbmFilesystem<R> {
         Ok(data)
     }
 
+    fn validate_name(&self, name: &str) -> Result<(), FilesystemError> {
+        encode_petscii_name(name).map(|_| ())
+    }
     fn fs_type(&self) -> &str {
         self.variant.drive_name()
     }

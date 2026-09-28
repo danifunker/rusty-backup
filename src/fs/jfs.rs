@@ -2355,6 +2355,9 @@ impl<R: Read + Seek + Send> Filesystem for JfsFilesystem<R> {
         self.label.as_deref()
     }
 
+    fn validate_name(&self, name: &str) -> Result<(), FilesystemError> {
+        crate::fs::name_legalize::validate_posix_name(name, 255, "JFS")
+    }
     fn fs_type(&self) -> &str {
         "JFS2"
     }

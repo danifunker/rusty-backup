@@ -516,6 +516,9 @@ impl Filesystem for BfsFilesystem {
         None
     }
 
+    fn validate_name(&self, name: &str) -> Result<(), FilesystemError> {
+        super::write::validate_alto_name(name)
+    }
     fn fs_type(&self) -> &str {
         "Alto BFS"
     }

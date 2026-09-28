@@ -489,11 +489,12 @@ mod tests {
     }
 
     #[test]
-    fn unescaped_slash_name_mis_splits_and_is_not_found() {
-        // Without an escape or colon grammar, the `/` is a separator: the path
-        // resolves through a (nonexistent) folder `Oxyd b`, so it isn't found.
+    fn unescaped_slash_name_resolves_by_rejoining_components() {
+        // No folder `Oxyd b` exists, so the fallback rejoins `Oxyd b` + `w` into the real name.
         let mut fs = hfs_with_slash_named_file();
-        assert!(resolve_path(&mut fs, "/Oxyd 3.6/Oxyd b/w").is_err());
+        let entry = resolve_path(&mut fs, "/Oxyd 3.6/Oxyd b/w").unwrap();
+        assert_eq!(entry.name, "Oxyd b/w");
+        assert!(resolve_path(&mut fs, "/Oxyd 3.6/Nope/w").is_err());
     }
 
     #[test]

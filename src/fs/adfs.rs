@@ -1285,6 +1285,32 @@ impl<R: Read + Seek + Send> AdfsFilesystem<R> {
     }
 }
 
+/// RISC OS reserves these as path, wildcard, and system-variable syntax.
+const ADFS_RESERVED: &[char] = &['$', '&', '%', '@', '\\', '^', ':', '.', '#', '*', '"', '|'];
+
+/// ADFS names: at most 9 bytes (the writer keeps a CR terminator), printable ASCII.
+fn validate_adfs_name(name: &str) -> Result<(), FilesystemError> {
+    if name.is_empty() {
+        return Err(FilesystemError::InvalidData(
+            "ADFS filename is empty".into(),
+        ));
+    }
+    if name.len() > 9 {
+        return Err(FilesystemError::InvalidData(format!(
+            "ADFS filename '{name}' exceeds 9 characters"
+        )));
+    }
+    for c in name.chars() {
+        if !c.is_ascii() || !(0x21..=0x7E).contains(&(c as u32)) || ADFS_RESERVED.contains(&c) {
+            return Err(FilesystemError::InvalidData(format!(
+                "ADFS filename '{name}' contains an unsupported character '{c}' \
+                 (printable ASCII, no spaces or $ & % @ \\ ^ : . # * \" |)"
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl<R: Read + Seek + Send> Filesystem for AdfsFilesystem<R> {
     fn root(&mut self) -> Result<FileEntry, FilesystemError> {
         Ok(FileEntry::new_directory("/".into(), "/".into(), 0))
@@ -1353,6 +1379,9 @@ impl<R: Read + Seek + Send> Filesystem for AdfsFilesystem<R> {
         Ok(out)
     }
 
+    fn validate_name(&self, name: &str) -> Result<(), FilesystemError> {
+        validate_adfs_name(name)
+    }
     fn fs_type(&self) -> &str {
         match self.format {
             AdfsFormat::DFormat => "ADFS (D-format)",
@@ -2182,6 +2211,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AdfsFilesystem<R> {
         data_len: u64,
         options: &CreateFileOptions,
     ) -> Result<FileEntry, FilesystemError> {
+        validate_adfs_name(name)?;
         if data_len > u32::MAX as u64 {
             return Err(FilesystemError::Unsupported(
                 "ADFS file size > 4 GiB not supported".into(),
@@ -2253,6 +2283,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AdfsFilesystem<R> {
         name: &str,
         options: &CreateDirectoryOptions,
     ) -> Result<FileEntry, FilesystemError> {
+        validate_adfs_name(name)?;
         let parent_indaddr = if parent.path == "/" {
             self.disc_record.root
         } else {
@@ -2390,25 +2421,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AdfsFilesystem<R> {
         // identically on new-map and old-map (D-format) discs.
         // Name guard mirroring `parse_dir_entry`: <= 10 ASCII chars, no CR /
         // control bytes / spaces (which the parser treats as terminators).
-        if new_name.is_empty() {
-            return Err(FilesystemError::InvalidData(
-                "ADFS filename is empty".into(),
-            ));
-        }
-        if new_name.len() > 10 {
-            return Err(FilesystemError::InvalidData(format!(
-                "ADFS filename '{new_name}' exceeds 10 characters"
-            )));
-        }
-        for c in new_name.chars() {
-            let b = c as u32;
-            if !c.is_ascii() || !(0x21..=0x7E).contains(&b) {
-                return Err(FilesystemError::InvalidData(format!(
-                    "ADFS filename '{new_name}' contains an unsupported character '{c}' \
-                     (use printable ASCII, no spaces)"
-                )));
-            }
-        }
+        validate_adfs_name(new_name)?;
 
         let parent_indaddr = if parent.path == "/" {
             self.disc_record.root

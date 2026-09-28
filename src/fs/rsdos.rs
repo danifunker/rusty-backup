@@ -588,6 +588,9 @@ impl<R: Read + Seek + Send> Filesystem for RsdosFilesystem<R> {
         Ok(data)
     }
 
+    fn validate_name(&self, name: &str) -> Result<(), FilesystemError> {
+        encode_name(name).map(|_| ())
+    }
     fn fs_type(&self) -> &str {
         "RS-DOS"
     }

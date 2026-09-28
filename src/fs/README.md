@@ -53,6 +53,15 @@ by reading the OEM ID magic (`"NTFS    "` vs `"EXFAT   "`) rather than the byte.
 
 5. Add `pub mod myfs;` to `fs/mod.rs`.
 
+6. If the filesystem is editable, override `validate_name()` with the exact rules
+   `create_file` / `create_directory` / `rename` enforce (length, charset,
+   reserved names, 8.3 shape). It is the single source of truth for names:
+   `name_legalize::legalize_name` uses it as an oracle to rename copied files
+   the destination can't hold (`Acquire/Export` -> `Acquire_Export` on FAT), so a
+   missing override means copies fail at apply time instead of being renamed.
+   Shared checks live in `name_legalize` (`validate_posix_name`,
+   `validate_amiga_name`, `is_dos_device_name`).
+
 See `fat.rs` as the complete reference implementation showing all capabilities.
 
 
