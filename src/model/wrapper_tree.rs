@@ -375,6 +375,23 @@ fn open_mount(
     }
 }
 
+/// Shift-click range over the visible tree rows (display order): rows between
+/// `anchor` and `clicked` at the clicked row's depth in the same mount, so a
+/// folder and its own expanded children are never both picked (and copied twice).
+pub fn tree_range(rows: &[TreeRow], anchor: &str, clicked: &str) -> Vec<String> {
+    let pos = |id: &str| rows.iter().position(|r| r.node_id == id);
+    let (Some(a), Some(b)) = (pos(anchor), pos(clicked)) else {
+        return vec![clicked.to_string()];
+    };
+    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+    let (mount, depth) = (&rows[b].mount, rows[b].depth);
+    rows[lo..=hi]
+        .iter()
+        .filter(|r| &r.mount == mount && r.depth == depth)
+        .map(|r| r.node_id.clone())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -516,5 +533,28 @@ mod tests {
                 .map(|r| (r.entry.name.clone(), r.depth))
                 .collect::<Vec<_>>()
         );
+    }
+    #[test]
+    fn tree_range_spans_siblings_and_skips_expanded_children() {
+        let row = |id: &str, mount: &str, depth: usize| TreeRow {
+            entry: FileEntry::new_file(id.into(), format!("/{id}"), 0, 0),
+            node_id: id.into(),
+            mount: mount.into(),
+            depth,
+            expandable: false,
+            expanded: false,
+            is_wrapper: false,
+        };
+        let rows = vec![
+            row("a", "m", 1),
+            row("b", "m", 1),
+            row("b/x", "m", 2), // expanded child of b
+            row("c", "m", 1),
+            row("other", "n", 1),
+        ];
+        assert_eq!(tree_range(&rows, "a", "c"), ["a", "b", "c"]);
+        assert_eq!(tree_range(&rows, "c", "a"), ["a", "b", "c"]);
+        assert_eq!(tree_range(&rows, "a", "other"), ["other"]);
+        assert_eq!(tree_range(&rows, "gone", "b"), ["b"]);
     }
 }

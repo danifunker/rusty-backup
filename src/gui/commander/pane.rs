@@ -47,7 +47,7 @@ use rusty_backup::model::edit_queue::{EditQueue, StagedEdit};
 use rusty_backup::model::remote_browser::{BrowseMode, BrowseTarget, RemoteBrowser};
 use rusty_backup::model::stage_names::{legalize_staged_names, LegalizeReport, NameChange};
 use rusty_backup::model::status::BlockCacheScan;
-use rusty_backup::model::wrapper_tree::{TreeRow, WrapperSource, WrapperTree};
+use rusty_backup::model::wrapper_tree::{tree_range, TreeRow, WrapperSource, WrapperTree};
 use rusty_backup::partition::{format_size, PartitionInfo};
 use rusty_backup::update::RecentMode;
 
@@ -261,6 +261,8 @@ pub(crate) struct CommanderPane {
     /// listing's name-based selection; the two are mutually exclusive so copy
     /// has one unambiguous source context).
     tree_selected: Vec<String>,
+    /// Last plain / ctrl-clicked tree row: the fixed end of a Shift-click range.
+    tree_anchor: Option<String>,
     /// Per-frame map of visible tree node id -> its row (mount + entry), rebuilt
     /// by `build_display_rows`. Resolves a selected/clicked node to the
     /// filesystem and entry to read it from.
@@ -397,6 +399,7 @@ impl CommanderPane {
             connect_dialog: None,
             wrapper_tree: WrapperTree::new(),
             tree_selected: Vec::new(),
+            tree_anchor: None,
             tree_index: HashMap::new(),
             last_cwd: String::new(),
             recent: super::super::load_recent_merged(),
@@ -3303,8 +3306,8 @@ impl CommanderPane {
         let mut m_open_image: Option<String> = None;
         // node_id, name, is_tree, is_wrapper, currently-expanded.
         let mut m_toggle: Option<(String, String, bool, bool, bool)> = None;
-        // node_id, ctrl-held — selecting a row inside an expanded wrapper.
-        let mut tree_click: Option<(String, bool)> = None;
+        // node_id, ctrl-held, shift-held — selecting a row inside an expanded wrapper.
+        let mut tree_click: Option<(String, bool, bool)> = None;
         // node_id of a right-clicked tree row (selects it if not selected).
         let mut tree_rclick: Option<String> = None;
 
@@ -3371,7 +3374,7 @@ impl CommanderPane {
                             if row.expandable {
                                 m_toggle = Some(toggle_req());
                             } else {
-                                tree_click = Some((row.node_id.clone(), false));
+                                tree_click = Some((row.node_id.clone(), false, false));
                             }
                         } else if row.is_dir {
                             to_enter = Some(row.name.clone());
@@ -3387,7 +3390,7 @@ impl CommanderPane {
                         if hit_toggle(&resp) {
                             m_toggle = Some(toggle_req());
                         } else if row.is_tree {
-                            tree_click = Some((row.node_id.clone(), mods.command));
+                            tree_click = Some((row.node_id.clone(), mods.command, mods.shift));
                         } else if !row.is_parent() {
                             click = Some((row.name.clone(), mods.command, mods.shift));
                         }
@@ -3562,16 +3565,29 @@ impl CommanderPane {
         }
         // A click on a row inside an expanded wrapper takes over from the base
         // selection (the two selection contexts are mutually exclusive).
-        if let Some((node_id, ctrl)) = tree_click {
+        if let Some((node_id, ctrl, shift)) = tree_click {
             self.listing.clear_selection();
-            if ctrl {
+            let anchor = self
+                .tree_anchor
+                .clone()
+                .filter(|a| self.tree_index.contains_key(a));
+            if let (true, Some(anchor)) = (shift, anchor) {
+                let visible: Vec<TreeRow> = rows
+                    .iter()
+                    .filter(|r| r.is_tree)
+                    .filter_map(|r| self.tree_index.get(&r.node_id).cloned())
+                    .collect();
+                self.tree_selected = tree_range(&visible, &anchor, &node_id);
+            } else if ctrl {
                 if let Some(pos) = self.tree_selected.iter().position(|n| *n == node_id) {
                     self.tree_selected.remove(pos);
                 } else {
-                    self.tree_selected.push(node_id);
+                    self.tree_selected.push(node_id.clone());
                 }
+                self.tree_anchor = Some(node_id);
             } else {
-                self.tree_selected = vec![node_id];
+                self.tree_selected = vec![node_id.clone()];
+                self.tree_anchor = Some(node_id);
             }
         }
         // A right-click on an unselected base row acts on just that row.
