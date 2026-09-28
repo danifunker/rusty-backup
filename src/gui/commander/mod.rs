@@ -42,7 +42,7 @@ use super::metadata_editor::{
 mod pane;
 mod progress;
 
-use pane::CommanderPane;
+use pane::{CommanderPane, StageOutcome};
 use progress::{ProgressAction, ProgressSnapshot, ProgressWindow};
 
 /// Upper bound on bytes read off a volume to preview the selected file in the
@@ -129,6 +129,12 @@ struct PendingHostConflict {
     names: Vec<String>,
 }
 
+/// Names a staged copy had to change (or leave out) for the destination filesystem.
+struct RenameNotice {
+    dest_side: Side,
+    outcome: StageOutcome,
+}
+
 pub struct CommanderMode {
     left: CommanderPane,
     right: CommanderPane,
@@ -148,6 +154,8 @@ pub struct CommanderMode {
     /// A host copy held back because files it would write already exist;
     /// the modal lets the user overwrite, skip them, or cancel.
     pending_host_conflict: Option<PendingHostConflict>,
+    /// A staged copy whose names were changed for the destination, awaiting OK / Undo.
+    rename_notice: Option<RenameNotice>,
     /// In-flight off-thread image->image staging copy (see
     /// [`commander_ops::spawn_stage_copy`]), plus the destination side its
     /// finished edits push onto.
@@ -202,6 +210,7 @@ impl CommanderMode {
             unsaved_close: false,
             pending_host_copy: None,
             pending_host_conflict: None,
+            rename_notice: None,
             pending_stage_copy: None,
             progress_window: ProgressWindow::default(),
             checksums: None,
@@ -258,6 +267,7 @@ impl CommanderMode {
         self.poll_stage_copy(ui.ctx());
         self.render_progress_modal(ui.ctx());
         self.render_host_conflict_modal(ui.ctx());
+        self.render_rename_notice(ui.ctx());
 
         egui::Panel::top("commander_top").show_inside(ui, |ui| {
             ui.add_space(2.0);
@@ -606,8 +616,8 @@ impl CommanderMode {
             // host -> image: stage real host paths (no temp extraction).
             (true, false) => {
                 let edits = commander_ops::stage_host_to_image(&entries, &dest_parent);
-                let n = dest.stage_edits(edits);
-                format!("Staged copy of {n} host item(s) into the {other} pane. Apply to write.")
+                let out = dest.stage_edits(edits);
+                self.note_staged(from.other(), out)
             }
             // image -> image: extract to temp, stage onto the destination queue.
             // Runs on a worker thread so a large multi-file copy shows the same
@@ -652,8 +662,8 @@ impl CommanderMode {
                     keep_dates,
                 ) {
                     Ok(edits) => {
-                        let n = dest.stage_edits(edits);
-                        format!("Staged copy of {n} item(s) into the {other} pane. Apply to write.")
+                        let out = dest.stage_edits(edits);
+                        self.note_staged(from.other(), out)
                     }
                     Err(e) => format!("Copy to the {other} pane failed: {e:#}"),
                 }
@@ -821,6 +831,113 @@ impl CommanderMode {
         format!("{n} item(s) already exist in the {where_to} folder; choose what to do.")
     }
 
+    /// Status line for a staged copy; queues the rename notice when names changed.
+    fn note_staged(&mut self, dest_side: Side, out: StageOutcome) -> String {
+        let side = dest_side.label();
+        let mut msg = format!(
+            "Staged copy of {} item(s) into the {side} pane. Apply to write.",
+            out.staged
+        );
+        if !out.renamed.is_empty() {
+            msg.push_str(&format!(
+                " {} renamed for {}.",
+                out.renamed.len(),
+                out.fs_type
+            ));
+        }
+        if !out.dropped.is_empty() {
+            msg.push_str(&format!(" {} left out.", out.dropped.len()));
+        }
+        if !out.renamed.is_empty() || !out.dropped.is_empty() {
+            self.rename_notice = Some(RenameNotice {
+                dest_side,
+                outcome: out,
+            });
+        }
+        msg
+    }
+
+    fn render_rename_notice(&mut self, ctx: &egui::Context) {
+        let Some(notice) = self.rename_notice.as_ref() else {
+            return;
+        };
+        let out = &notice.outcome;
+        let mut undo = None;
+        egui::Window::new(format!("Names changed for {}", out.fs_type))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                if !out.renamed.is_empty() {
+                    ui.label(format!(
+                        "{} item(s) have names {} can't store and were renamed:",
+                        out.renamed.len(),
+                        out.fs_type
+                    ));
+                    egui::ScrollArea::vertical()
+                        .id_salt("rename_notice_renamed")
+                        .max_height(180.0)
+                        .show(ui, |ui| {
+                            for c in out.renamed.iter().take(200) {
+                                ui.monospace(format!("{} -> {}", printable(&c.from), c.to));
+                            }
+                            if out.renamed.len() > 200 {
+                                ui.label(format!("... and {} more", out.renamed.len() - 200));
+                            }
+                        });
+                }
+                if !out.dropped.is_empty() {
+                    ui.add_space(4.0);
+                    ui.label(format!(
+                        "{} item(s) have no usable name on {} and were left out:",
+                        out.dropped.len(),
+                        out.fs_type
+                    ));
+                    egui::ScrollArea::vertical()
+                        .id_salt("rename_notice_dropped")
+                        .max_height(120.0)
+                        .show(ui, |ui| {
+                            for (path, why) in out.dropped.iter().take(100) {
+                                ui.monospace(format!("{} ({why})", printable(path)));
+                            }
+                        });
+                }
+                ui.add_space(6.0);
+                ui.label(
+                    "Tip: to keep every original name and all Mac metadata, export as \
+                     Mac Archive (.mar) instead.",
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("OK").clicked() {
+                        undo = Some(false);
+                    }
+                    if ui
+                        .button("Undo copy")
+                        .on_hover_text("Remove this copy from the staged edits")
+                        .clicked()
+                    {
+                        undo = Some(true);
+                    }
+                });
+            });
+        let Some(undo) = undo else {
+            return;
+        };
+        let Some(notice) = self.rename_notice.take() else {
+            return;
+        };
+        if undo {
+            let pane = match notice.dest_side {
+                Side::Left => &mut self.left,
+                Side::Right => &mut self.right,
+            };
+            pane.unstage_since(notice.outcome.queue_start);
+            self.status = "Copy removed from the staged edits.".to_string();
+            self.record_log(self.status.clone());
+        }
+    }
+
     fn render_host_conflict_modal(&mut self, ctx: &egui::Context) {
         let Some(pending) = self.pending_host_conflict.as_ref() else {
             return;
@@ -953,11 +1070,8 @@ impl CommanderMode {
         self.status = match err {
             Some(e) => format!("Copy to the {} pane failed: {e}", dest_side.label()),
             None => {
-                let n = dest.stage_edits(edits);
-                format!(
-                    "Staged copy of {n} item(s) into the {} pane. Apply to write.",
-                    dest_side.label()
-                )
+                let out = dest.stage_edits(edits);
+                self.note_staged(dest_side, out)
             }
         };
         self.record_log(self.status.clone());
@@ -1566,4 +1680,17 @@ fn draw_compare_icon(p: &egui::Painter, r: egui::Rect, color: egui::Color32) {
         egui::FontId::monospace(12.0),
         color,
     );
+}
+
+/// Show control characters in a name (the CR in `Icon\r`) instead of a blank box.
+fn printable(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if (c as u32) < 0x20 {
+                format!("\\x{:02X}", c as u32)
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
 }

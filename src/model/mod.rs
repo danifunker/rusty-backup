@@ -44,6 +44,7 @@ pub mod resize_remote;
 pub mod restore_remote;
 pub mod size_mode;
 pub mod source_reader;
+pub mod stage_names;
 pub mod status;
 pub mod swab_runner;
 pub mod text_edit;

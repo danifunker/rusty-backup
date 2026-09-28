@@ -463,6 +463,11 @@ impl EditQueue {
             .collect()
     }
 
+    /// Drop every edit from index `len` on (undo the most recent staging batch).
+    pub fn truncate(&mut self, len: usize) {
+        self.edits.truncate(len);
+    }
+
     pub fn is_empty(&self) -> bool {
         self.edits.is_empty()
     }

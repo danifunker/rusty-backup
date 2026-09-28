@@ -43,12 +43,22 @@ use rusty_backup::model::commander_source;
 use rusty_backup::model::dir_listing::{type_tag, DirListing, Row, SortColumn};
 use rusty_backup::model::edit_queue::{EditQueue, StagedEdit};
 use rusty_backup::model::remote_browser::{BrowseMode, BrowseTarget, RemoteBrowser};
+use rusty_backup::model::stage_names::{legalize_staged_names, LegalizeReport, NameChange};
 use rusty_backup::model::status::BlockCacheScan;
 use rusty_backup::model::wrapper_tree::{TreeRow, WrapperSource, WrapperTree};
 use rusty_backup::partition::{format_size, PartitionInfo};
 use rusty_backup::update::RecentMode;
 
 use super::Side;
+
+/// What one `stage_edits` batch did, for the status line and the rename notice.
+pub(crate) struct StageOutcome {
+    pub staged: usize,
+    pub queue_start: usize,
+    pub fs_type: String,
+    pub renamed: Vec<NameChange>,
+    pub dropped: Vec<(String, String)>,
+}
 
 const ROW_H: f32 = 20.0;
 /// Per-depth indent for tree rows, and the width reserved for the `+`/`-`
@@ -1772,13 +1782,57 @@ impl CommanderPane {
         }
     }
 
-    /// Push staged edits onto this pane's queue; returns how many.
-    pub(crate) fn stage_edits(&mut self, edits: Vec<StagedEdit>) -> usize {
-        let n = edits.len();
+    /// Push a copy batch onto this pane's queue, renaming names this volume can't hold.
+    pub(crate) fn stage_edits(&mut self, mut edits: Vec<StagedEdit>) -> StageOutcome {
+        let queue_start = self.queue.len();
+        let cwd_path = self.listing.cwd_path().to_string();
+        let cwd_names: Vec<String> = self
+            .listing
+            .entries()
+            .iter()
+            .map(|e| e.name.clone())
+            .collect();
+        let queue = &self.queue;
+        let mut existing = |path: &str| {
+            let mut names: Vec<String> = queue
+                .pending_adds_for(path)
+                .into_iter()
+                .map(|e| e.name)
+                .collect();
+            if path == cwd_path {
+                names.extend(cwd_names.iter().cloned());
+            }
+            names
+        };
+        // A remote image has no local fs here; the daemon reports bad names at apply.
+        let (report, fs_type) = match self.listing.fs_mut() {
+            Some(fs) => {
+                let fold = fs.case_insensitive_lookup();
+                let fs_type = fs.fs_type().to_string();
+                let validate = |n: &str| fs.validate_name(n);
+                (
+                    legalize_staged_names(&mut edits, &validate, fold, &mut existing),
+                    fs_type,
+                )
+            }
+            None => (LegalizeReport::default(), String::new()),
+        };
+        let staged = edits.len();
         for e in edits {
             self.queue.push(e);
         }
-        n
+        StageOutcome {
+            staged,
+            queue_start,
+            fs_type,
+            renamed: report.renamed,
+            dropped: report.dropped,
+        }
+    }
+
+    /// Drop everything staged since `queue_start` (the rename notice's "Undo copy").
+    pub(crate) fn unstage_since(&mut self, queue_start: usize) {
+        self.queue.truncate(queue_start);
     }
 
     // --- source bar --------------------------------------------------------
