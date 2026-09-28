@@ -706,35 +706,11 @@ fn resolve_name(
     }
 }
 
-/// Find the shortest-truncation name the destination accepts, preserving a
-/// (possibly shortened) extension. Uses `validate_name` as the oracle so
-/// we never hardcode per-filesystem limits.
+/// The closest name the destination accepts (bad characters replaced, then
+/// shortened keeping the extension); the shared legalizer the GUI and TUI use.
 fn mangle_to_fit(dst: &mut dyn EditableFilesystem, desired: &str) -> Option<String> {
-    if dst.validate_name(desired).is_ok() {
-        return Some(desired.to_string());
-    }
-    let (stem, ext) = match desired.rsplit_once('.') {
-        Some((s, e)) if !s.is_empty() && !e.is_empty() => (s, Some(e)),
-        _ => (desired, None),
-    };
-    let stem_chars: Vec<char> = stem.chars().collect();
-    let ext_chars: Vec<char> = ext.map(|e| e.chars().collect()).unwrap_or_default();
-
-    // Try keeping as much of the extension as possible, then shrink the stem.
-    let ext_lens: Vec<usize> = (0..=ext_chars.len()).rev().collect();
-    for &elen in &ext_lens {
-        for slen in (1..=stem_chars.len()).rev() {
-            let mut cand: String = stem_chars[..slen].iter().collect();
-            if elen > 0 {
-                cand.push('.');
-                cand.extend(&ext_chars[..elen]);
-            }
-            if dst.validate_name(&cand).is_ok() {
-                return Some(cand);
-            }
-        }
-    }
-    None
+    let validate = |n: &str| dst.validate_name(n);
+    crate::fs::name_legalize::legalize_name(&validate, desired).ok()
 }
 
 /// Ensure `base` doesn't collide with an existing destination entry; if it
