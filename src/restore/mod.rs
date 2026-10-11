@@ -27,7 +27,9 @@ use crate::fs::{
 use crate::os::SectorAlignedWriter;
 use crate::partition::apm::Apm;
 use crate::partition::gpt::Gpt;
-use crate::partition::mbr::{build_ebr_chain, patch_mbr_entries, LogicalPartitionInfo, Mbr};
+use crate::partition::mbr::{
+    build_ebr_chain, lba_to_chs, patch_mbr_entries, LogicalPartitionInfo, Mbr,
+};
 use crate::partition::PartitionSizeOverride;
 use crate::rbformats::reconstruct_disk_from_backup;
 
@@ -800,7 +802,13 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
     let metadata_path = config.backup_folder.join("metadata.json");
     if !metadata_path.exists() {
         // Check if this is a Clonezilla image
-        if clonezilla::metadata::is_clonezilla_image(&config.backup_folder) {
+        if let Some(cz_folder) =
+            clonezilla::metadata::resolve_clonezilla_folder(&config.backup_folder)
+        {
+            let config = RestoreConfig {
+                backup_folder: cz_folder,
+                ..config
+            };
             return run_clonezilla_restore(config, progress);
         }
         bail!(
@@ -2089,6 +2097,10 @@ pub fn calculate_clonezilla_restore_layout(
         .filter(|p| !p.is_extended)
         .collect();
     sorted_parts.sort_by_key(|p| p.start_lba);
+    let first_logical_lba = sorted_parts
+        .iter()
+        .find(|p| p.is_logical)
+        .map(|p| p.start_lba);
 
     for cz_part in &sorted_parts {
         let size_choice = partition_sizes
@@ -2096,6 +2108,15 @@ pub fn calculate_clonezilla_restore_layout(
             .find(|s| s.index == cz_part.index)
             .map(|s| &s.size_choice)
             .unwrap_or(&RestoreSizeChoice::Original);
+
+        // Leave room for the EBR (and the first logical's original offset from the container)
+        if cz_part.is_logical {
+            current_lba += if Some(cz_part.start_lba) == first_logical_lba {
+                clonezilla_first_ebr_gap(cz_image)
+            } else {
+                1
+            };
+        }
 
         // Align current_lba to boundary
         if alignment_sectors > 0 {
@@ -2157,6 +2178,112 @@ pub fn calculate_clonezilla_restore_layout(
     }
 
     Ok(overrides)
+}
+
+/// Sectors between the extended container start and its first logical partition.
+fn clonezilla_first_ebr_gap(cz_image: &ClonezillaImage) -> u64 {
+    let ext = cz_image.partitions.iter().find(|p| p.is_extended);
+    let first = cz_image
+        .partitions
+        .iter()
+        .filter(|p| p.is_logical && !p.is_extended)
+        .map(|p| p.start_lba)
+        .min();
+    match (ext, first) {
+        (Some(e), Some(f)) if f > e.start_lba => f - e.start_lba,
+        _ => 1,
+    }
+}
+
+/// Where the extended container and its EBRs go after a Clonezilla restore layout.
+struct ClonezillaEbrLayout {
+    ext_start: u32,
+    ext_sectors: u32,
+    ebr_sectors: Vec<(u64, [u8; 512])>,
+}
+
+/// Rebuild the EBR chain; Clonezilla saves only the first EBR and relies on sfdisk to redo the rest.
+fn clonezilla_ebr_layout(
+    cz_image: &ClonezillaImage,
+    overrides: &[PartitionSizeOverride],
+) -> Option<ClonezillaEbrLayout> {
+    let ext = cz_image.partitions.iter().find(|p| p.is_extended)?;
+    let mut logicals: Vec<&clonezilla::metadata::ClonezillaPartition> = cz_image
+        .partitions
+        .iter()
+        .filter(|p| p.is_logical && !p.is_extended)
+        .collect();
+    if logicals.is_empty() {
+        return None;
+    }
+    logicals.sort_by_key(|p| p.start_lba);
+
+    let mut unchanged = true;
+    let infos: Vec<LogicalPartitionInfo> = logicals
+        .iter()
+        .map(|p| {
+            let ov = overrides.iter().find(|o| o.index == p.index);
+            let start = ov.map(|o| o.effective_start_lba()).unwrap_or(p.start_lba);
+            let size = ov.map(|o| o.export_size / 512).unwrap_or(p.size_sectors);
+            unchanged &= start == p.start_lba && size == p.size_sectors;
+            LogicalPartitionInfo {
+                start_lba: start as u32,
+                total_sectors: size as u32,
+                partition_type: p.partition_type_byte,
+            }
+        })
+        .collect();
+
+    let ext_start = infos[0].start_lba - clonezilla_first_ebr_gap(cz_image) as u32;
+    let last_end = infos
+        .iter()
+        .map(|i| i.start_lba + i.total_sectors)
+        .max()
+        .unwrap_or(ext_start);
+    let ext_sectors = if unchanged {
+        ext.size_sectors as u32
+    } else {
+        last_end - ext_start
+    };
+    Some(ClonezillaEbrLayout {
+        ext_start,
+        ext_sectors,
+        ebr_sectors: build_ebr_chain(ext_start, &infos),
+    })
+}
+
+/// Point the MBR's extended-container entry at the rebuilt container.
+fn patch_clonezilla_extended_entry(
+    mbr: &mut [u8; 512],
+    cz_image: &ClonezillaImage,
+    layout: &ClonezillaEbrLayout,
+) {
+    let Some(ext) = cz_image.partitions.iter().find(|p| p.is_extended) else {
+        return;
+    };
+    for i in 0..4 {
+        let off = 446 + i * 16;
+        let entry_start =
+            u32::from_le_bytes([mbr[off + 8], mbr[off + 9], mbr[off + 10], mbr[off + 11]]);
+        if !matches!(mbr[off + 4], 0x05 | 0x0F | 0x85) || entry_start as u64 != ext.start_lba {
+            continue;
+        }
+        mbr[off + 8..off + 12].copy_from_slice(&layout.ext_start.to_le_bytes());
+        mbr[off + 12..off + 16].copy_from_slice(&layout.ext_sectors.to_le_bytes());
+        let (h, s) = (cz_image.heads, cz_image.sectors_per_track);
+        if h > 0 && s > 0 {
+            let end = layout
+                .ext_start
+                .saturating_add(layout.ext_sectors.saturating_sub(1));
+            for (base, lba) in [(off + 1, layout.ext_start), (off + 5, end)] {
+                let (c, hh, ss) = lba_to_chs(lba, h, s);
+                mbr[base] = hh as u8;
+                mbr[base + 1] = ((c >> 2) & 0xC0) as u8 | (ss & 0x3F) as u8;
+                mbr[base + 2] = c as u8;
+            }
+        }
+        return;
+    }
 }
 
 /// Detect the alignment pattern from a Clonezilla image's partition table.
@@ -2515,6 +2642,11 @@ fn write_clonezilla_disk(
     let mut total_written: u64 = 0;
     let target_size = progress.lock().map(|p| p.total_bytes).unwrap_or(0);
     let target_sectors = disk_target_size / 512;
+    let ebr_layout = if gpt.is_none() {
+        clonezilla_ebr_layout(cz_image, overrides)
+    } else {
+        None
+    };
 
     let get_export_size = |index: usize, default: u64| -> u64 {
         overrides
@@ -2560,6 +2692,17 @@ fn write_clonezilla_disk(
             patch_mbr_entries(&mut mbr_buf, overrides);
             log(progress, LogLevel::Info, "Patched MBR partition table");
         }
+        if let Some(ref layout) = ebr_layout {
+            patch_clonezilla_extended_entry(&mut mbr_buf, cz_image, layout);
+            log(
+                progress,
+                LogLevel::Info,
+                format!(
+                    "Extended container: LBA {} ({} sectors)",
+                    layout.ext_start, layout.ext_sectors
+                ),
+            );
+        }
         writer.write_all(&mbr_buf).context("failed to write MBR")?;
         total_written += 512;
     }
@@ -2589,6 +2732,10 @@ fn write_clonezilla_disk(
         if is_cancelled(progress) {
             bail!("restore cancelled");
         }
+        // The container has no data of its own; its EBRs are written after the partitions
+        if cz_part.is_extended {
+            continue;
+        }
 
         let effective_lba = overrides
             .iter()
@@ -2599,28 +2746,43 @@ fn write_clonezilla_disk(
         let part_offset = effective_lba * 512;
         let export_size = get_export_size(cz_part.index, cz_part.size_bytes());
 
-        // Fill gap to partition start
+        if part_offset < total_written {
+            bail!(
+                "partition {} would start at byte {part_offset}, inside data already written",
+                cz_part.device_name
+            );
+        }
         if total_written < part_offset {
             let gap = part_offset - total_written;
-
-            // Write EBR if applicable
-            if let Some(ebr_data) = cz_image.ebr_data.get(&cz_part.device_name) {
-                let ebr_gap = part_offset - total_written - ebr_data.len().min(512) as u64;
-                if ebr_gap > 0 {
-                    fill_gap(writer, ebr_gap, is_device, fill_unused_with_zeros)?;
-                    total_written += ebr_gap;
-                }
-                let write_len = ebr_data.len().min(512);
-                writer.write_all(&ebr_data[..write_len])?;
-                total_written += write_len as u64;
-            } else {
-                fill_gap(writer, gap, is_device, fill_unused_with_zeros)?;
-                total_written += gap;
-            }
+            fill_gap(writer, gap, is_device, fill_unused_with_zeros)?;
+            total_written += gap;
         }
 
-        // Extended container partitions have no data
-        if cz_part.is_extended {
+        let is_swap = cz_part.partition_type_byte == 0x82
+            || cz_part.filesystem_type.eq_ignore_ascii_case("swap");
+        if is_swap && cz_part.partclone_files.is_empty() && export_size >= 40960 {
+            let header = clonezilla::metadata::build_swap_header(
+                export_size,
+                cz_part.swap_uuid,
+                cz_part.swap_label.as_deref(),
+            );
+            writer.write_all(&header)?;
+            crate::rbformats::write_zeros(writer, export_size - header.len() as u64)?;
+            total_written += export_size;
+            log(
+                progress,
+                LogLevel::Info,
+                format!(
+                    "partition-{}: recreated swap area ({}){}",
+                    cz_part.index,
+                    cz_part.device_name,
+                    if cz_part.swap_uuid.is_some() {
+                        " with original UUID"
+                    } else {
+                        ""
+                    },
+                ),
+            );
             continue;
         }
 
@@ -2706,6 +2868,8 @@ fn write_clonezilla_disk(
             patch_hidden_sectors_for(writer, part_offset, effective_lba, &mut |msg| {
                 log(progress, LogLevel::Info, msg)
             })?;
+            // The patchers seek to the boot sector; the gap fills after this seek relatively
+            writer.seek(SeekFrom::Start(total_written))?;
         }
 
         log(
@@ -2714,6 +2878,21 @@ fn write_clonezilla_disk(
             format!(
                 "partition-{}: wrote {} bytes (export size: {})",
                 cz_part.index, part_written, export_size,
+            ),
+        );
+    }
+
+    if let Some(ref layout) = ebr_layout {
+        for (offset, sector) in &layout.ebr_sectors {
+            writer.seek(SeekFrom::Start(*offset))?;
+            writer.write_all(sector).context("failed to write EBR")?;
+        }
+        log(
+            progress,
+            LogLevel::Info,
+            format!(
+                "Wrote {} EBR(s) for logical partitions",
+                layout.ebr_sectors.len()
             ),
         );
     }
@@ -4372,6 +4551,119 @@ mod tests {
             entry1 & 0xC000,
             0xC000,
             "FAT[1] clean bits not set: {entry1:#06x}",
+        );
+    }
+}
+
+#[cfg(test)]
+mod clonezilla_layout_tests {
+    use super::*;
+    use crate::clonezilla::metadata::ClonezillaPartition;
+
+    fn part(dev: &str, index: usize, start: u64, size: u64, ptype: u8) -> ClonezillaPartition {
+        ClonezillaPartition {
+            index,
+            device_name: dev.into(),
+            start_lba: start,
+            size_sectors: size,
+            partition_type_byte: ptype,
+            filesystem_type: String::new(),
+            is_extended: matches!(ptype, 0x05 | 0x0F | 0x85),
+            is_logical: index >= 4,
+            bootable: false,
+            partclone_files: vec![],
+            type_guid: None,
+            unique_guid: None,
+            partition_name: None,
+            swap_uuid: None,
+            swap_label: None,
+        }
+    }
+
+    /// The Ubuntu savedisk layout: sda1, extended sda2 holding sda5 (ext4) and sda6 (swap).
+    fn ubuntu_image() -> ClonezillaImage {
+        let mut mbr = [0u8; 512];
+        for (i, (ptype, start, size)) in [(0x83u8, 2048u32, 997376u32), (0x05, 1001470, 61530114)]
+            .iter()
+            .enumerate()
+        {
+            let off = 446 + i * 16;
+            mbr[off + 4] = *ptype;
+            mbr[off + 8..off + 12].copy_from_slice(&start.to_le_bytes());
+            mbr[off + 12..off + 16].copy_from_slice(&size.to_le_bytes());
+        }
+        mbr[510] = 0x55;
+        mbr[511] = 0xAA;
+        ClonezillaImage {
+            disk_name: "sda".into(),
+            cylinders: 3892,
+            heads: 255,
+            sectors_per_track: 63,
+            mbr_bytes: mbr,
+            hidden_data_after_mbr: vec![],
+            ebr_data: std::collections::HashMap::new(),
+            partitions: vec![
+                part("sda1", 0, 2048, 997376, 0x83),
+                part("sda2", 1, 1001470, 61530114, 0x05),
+                part("sda5", 4, 1001472, 59531264, 0x83),
+                part("sda6", 5, 60534784, 1996800, 0x82),
+            ],
+            source_size_bytes: 62531584 * 512,
+            image_info: String::new(),
+            is_gpt: false,
+            gpt_primary_raw: None,
+            gpt_backup_raw: None,
+            gpt_disk_guid: None,
+            gpt_first_lba: None,
+            gpt_last_lba: None,
+        }
+    }
+
+    #[test]
+    fn original_layout_keeps_every_logical_partition_in_place() {
+        let cz = ubuntu_image();
+        let ovs = calculate_clonezilla_restore_layout(
+            &cz,
+            &RestoreAlignment::Original,
+            &[],
+            62533296 * 512,
+        )
+        .unwrap();
+        for p in cz.partitions.iter().filter(|p| !p.is_extended) {
+            let ov = ovs.iter().find(|o| o.index == p.index).unwrap();
+            assert_eq!(ov.effective_start_lba(), p.start_lba, "{}", p.device_name);
+        }
+        let layout = clonezilla_ebr_layout(&cz, &ovs).unwrap();
+        assert_eq!((layout.ext_start, layout.ext_sectors), (1001470, 61530114));
+        let offsets: Vec<u64> = layout.ebr_sectors.iter().map(|(o, _)| o / 512).collect();
+        assert_eq!(offsets, vec![1001470, 60534783]);
+        // First EBR points 2 sectors ahead at sda5, then links to sda6's EBR
+        let e = &layout.ebr_sectors[0].1;
+        assert_eq!(u32::from_le_bytes(e[454..458].try_into().unwrap()), 2);
+        assert_eq!(e[466], 0x05);
+    }
+
+    #[test]
+    fn grown_logical_partition_stretches_the_container() {
+        let cz = ubuntu_image();
+        let sizes = [RestorePartitionSize {
+            index: 5,
+            size_choice: RestoreSizeChoice::FillRemaining,
+        }];
+        let target = 70_000_000u64 * 512;
+        let ovs =
+            calculate_clonezilla_restore_layout(&cz, &RestoreAlignment::Original, &sizes, target)
+                .unwrap();
+        let layout = clonezilla_ebr_layout(&cz, &ovs).unwrap();
+        assert_eq!(
+            layout.ext_start as u64 + layout.ext_sectors as u64,
+            70_000_000
+        );
+        let mut mbr = cz.mbr_bytes;
+        patch_clonezilla_extended_entry(&mut mbr, &cz, &layout);
+        assert_eq!(
+            u32::from_le_bytes(mbr[474..478].try_into().unwrap()),
+            layout.ext_sectors
         );
     }
 }

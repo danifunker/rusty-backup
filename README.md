@@ -712,7 +712,13 @@ PC Engine CD, CD32, GameCube, Wii, CD-i, and 3DO.
 | None (superfloppy) | Yes — auto-detects the filesystem at sector 0 (FAT / NTFS / exFAT / HPFS / ext / XFS / JFS / UFS / ReiserFS / btrfs / SquashFS / HFS / HFS+ / APFS / Amiga SFS / Amiga PFS3 / Apple DOS 3.3 / CBM DOS / Atari DOS / RS-DOS / OS-9 RBF / DragonDOS / Acorn DFS / ADFS / TR-DOS / TI-99 / QDOS / Human68k / Alto BFS / Pilot/Cedar / Apple Lisa FS / …) | — | Standard floppy / disk sizes are recognised even without a partition table. Xerox Alto packs (`.pdi` / `.bfs` / CopyDisk / Salto `.dsk`), Pilot/Cedar PDIs (`fsFamily=2`), Dwarf 6085 `.zdisk` images, and tag-bearing Apple Lisa DiskCopy 4.2 / DART disks are detected by content and presented as a single browsable volume. |
 
 The Clonezilla image format is also parsed as a source (MBR, GPT, partclone
-images, partition table sidecars) for restore — see `docs/clonezilla.md`.
+images, partition table sidecars) for inspect and restore. Point it at the image
+directory (the one holding `clonezilla-img`) or at a folder that contains exactly
+one. Partclone files may be uncompressed (`.uncomp`) or zstd / gzip (pigz) /
+bzip2 / xz / lz4 compressed, split (`.aa`, `.ab`, ...) or not; lzop is refused.
+On restore the EBR chain for logical partitions is rebuilt, like Clonezilla's own
+`sfdisk` step, and swap partitions are re-created with the UUID and label from
+`swappt-<dev>.info`, so an `fstab` that mounts swap by UUID still finds it.
 
 ### What works well vs. what to watch out for
 

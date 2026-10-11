@@ -124,6 +124,97 @@ impl Read for MultiPartReader {
 
 const PARTCLONE_MAGIC: &[u8; 16] = b"partclone-image\0";
 
+/// Wrap the concatenated image stream in the decompressor its leading magic names.
+/// Clonezilla's `-z` choices: zstd, gzip/pigz, bzip2, xz, lz4, or `.uncomp` (none).
+fn open_decompressed(multi: MultiPartReader) -> Result<Box<dyn Read + Send>> {
+    let mut buffered = BufReader::with_capacity(1 << 20, multi);
+    let head = io::BufRead::fill_buf(&mut buffered)
+        .context("failed to read partclone image")?
+        .to_vec();
+    let starts = |m: &[u8]| head.starts_with(m);
+    Ok(if starts(b"partclone-image") {
+        Box::new(buffered)
+    } else if starts(&[0x28, 0xB5, 0x2F, 0xFD]) {
+        crate::rbformats::zstd_compat::decoder(buffered)
+            .context("failed to create zstd decoder for partclone")?
+    } else if starts(&[0x1F, 0x8B]) {
+        Box::new(flate2::read::MultiGzDecoder::new(buffered))
+    } else if starts(b"BZh") {
+        Box::new(bzip2::read::MultiBzDecoder::new(buffered))
+    } else if starts(&[0x04, 0x22, 0x4D, 0x18]) {
+        Box::new(lz4_flex::frame::FrameDecoder::new(buffered))
+    } else if starts(&[0xFD, b'7', b'z', b'X', b'Z', 0x00]) {
+        Box::new(XzPipeReader::spawn(buffered))
+    } else if starts(&[0x89, b'L', b'Z', b'O']) {
+        bail!("lzop-compressed Clonezilla images are not supported; re-save with -z1p (gzip) or -z9p (zstd)")
+    } else {
+        bail!(
+            "unrecognized partclone image compression (leading bytes {:02X?})",
+            &head[..head.len().min(8)]
+        )
+    })
+}
+
+/// Streams an xz image by running `lzma_rs`'s push-style decoder on a worker thread.
+struct XzPipeReader {
+    rx: std::sync::mpsc::Receiver<io::Result<Vec<u8>>>,
+    chunk: Vec<u8>,
+    pos: usize,
+}
+
+struct ChannelWriter(std::sync::mpsc::SyncSender<io::Result<Vec<u8>>>);
+
+impl io::Write for ChannelWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0
+            .send(Ok(buf.to_vec()))
+            .map_err(|_| crate::compat::io_other("xz reader dropped"))?;
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl XzPipeReader {
+    fn spawn<R: io::BufRead + Send + 'static>(mut src: R) -> Self {
+        let (tx, rx) = std::sync::mpsc::sync_channel(16);
+        std::thread::spawn(move || {
+            let mut out = io::BufWriter::with_capacity(1 << 20, ChannelWriter(tx.clone()));
+            let res = lzma_rs::xz_decompress(&mut src, &mut out)
+                .map_err(|e| crate::compat::io_other(format!("xz decode failed: {e}")))
+                .and_then(|_| io::Write::flush(&mut out));
+            if let Err(e) = res {
+                let _ = tx.send(Err(e));
+            }
+        });
+        Self {
+            rx,
+            chunk: Vec::new(),
+            pos: 0,
+        }
+    }
+}
+
+impl Read for XzPipeReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        while self.pos >= self.chunk.len() {
+            match self.rx.recv() {
+                Ok(Ok(c)) => {
+                    self.chunk = c;
+                    self.pos = 0;
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(_) => return Ok(0),
+            }
+        }
+        let n = buf.len().min(self.chunk.len() - self.pos);
+        buf[..n].copy_from_slice(&self.chunk[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
 /// Parse a partclone v0002 image descriptor from a reader.
 ///
 /// The on-disk layout (110 bytes total) consists of three packed structs + CRC:
@@ -485,14 +576,12 @@ impl<R: Read> Read for PartcloneCompactReader<R> {
     }
 }
 
-/// Open a partclone image (multi-part zstd files) and return a reader that
+/// Open a partclone image (multi-part, any Clonezilla compression) and return a reader that
 /// expands unused blocks to zeros, producing the full partition image.
 ///
-/// Chain: MultiPartReader → zstd::Decoder → PartcloneExpandReader
+/// Chain: MultiPartReader → decompressor → PartcloneExpandReader
 pub fn open_partclone_reader(files: &[PathBuf]) -> Result<(PartcloneHeader, impl Read)> {
-    let multi = MultiPartReader::new(files.to_vec())?;
-    let mut decoder = crate::rbformats::zstd_compat::decoder(multi)
-        .context("failed to create zstd decoder for partclone")?;
+    let mut decoder = open_decompressed(MultiPartReader::new(files.to_vec())?)?;
 
     let header = parse_header(&mut decoder)?;
     let bitmap = parse_bitmap(&mut decoder, &header)?;
@@ -504,9 +593,7 @@ pub fn open_partclone_reader(files: &[PathBuf]) -> Result<(PartcloneHeader, impl
 /// Open a partclone image and return a reader that streams only used blocks
 /// (compacted, without expanding unused blocks to zeros).
 pub fn open_partclone_stream(files: &[PathBuf]) -> Result<(PartcloneHeader, impl Read)> {
-    let multi = MultiPartReader::new(files.to_vec())?;
-    let mut decoder = crate::rbformats::zstd_compat::decoder(multi)
-        .context("failed to create zstd decoder for partclone stream")?;
+    let mut decoder = open_decompressed(MultiPartReader::new(files.to_vec())?)?;
 
     let header = parse_header(&mut decoder)?;
     let bitmap = parse_bitmap(&mut decoder, &header)?;
@@ -518,13 +605,11 @@ pub fn open_partclone_stream(files: &[PathBuf]) -> Result<(PartcloneHeader, impl
 /// Open a partclone image and return the header, bitmap, and a reader positioned
 /// at the start of the block data stream (after header+bitmap).
 ///
-/// Chain: MultiPartReader → zstd::Decoder (positioned after header+bitmap)
+/// Chain: MultiPartReader → decompressor (positioned after header+bitmap)
 pub(crate) fn open_partclone_raw(
     files: &[PathBuf],
 ) -> Result<(PartcloneHeader, PartcloneBitmap, impl Read + Send)> {
-    let multi = MultiPartReader::new(files.to_vec())?;
-    let mut decoder = crate::rbformats::zstd_compat::decoder(multi)
-        .context("failed to create zstd decoder for partclone raw")?;
+    let mut decoder = open_decompressed(MultiPartReader::new(files.to_vec())?)?;
 
     let header = parse_header(&mut decoder)?;
     let bitmap = parse_bitmap(&mut decoder, &header)?;
@@ -532,12 +617,10 @@ pub(crate) fn open_partclone_raw(
     Ok((header, bitmap, decoder))
 }
 
-/// Read only the partclone header from a set of zstd-compressed split files,
+/// Read only the partclone header from a set of split image files,
 /// without reading the full bitmap or data. Used for quick metadata extraction.
 pub fn read_partclone_header(files: &[PathBuf]) -> Result<PartcloneHeader> {
-    let multi = MultiPartReader::new(files.to_vec())?;
-    let mut decoder = crate::rbformats::zstd_compat::decoder(multi)
-        .context("failed to create zstd decoder for header read")?;
+    let mut decoder = open_decompressed(MultiPartReader::new(files.to_vec())?)?;
     parse_header(&mut decoder)
 }
 
@@ -587,5 +670,30 @@ mod tests {
         };
         assert!(!bitmap.is_used(8));
         assert!(!bitmap.is_used(100));
+    }
+
+    #[test]
+    fn decompressor_is_picked_by_magic() {
+        use std::io::Write;
+        let payload: Vec<u8> = b"partclone-image\0"
+            .iter()
+            .copied()
+            .chain((0..100_000u32).map(|i| (i % 251) as u8))
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        let raw = dir.path().join("sda1.ext4-ptcl-img.uncomp");
+        std::fs::write(&raw, &payload).unwrap();
+        let gz = dir.path().join("sda1.ext4-ptcl-img.gz.aa");
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        enc.write_all(&payload).unwrap();
+        std::fs::write(&gz, enc.finish().unwrap()).unwrap();
+        for path in [raw, gz] {
+            let mut out = Vec::new();
+            open_decompressed(MultiPartReader::new(vec![path]).unwrap())
+                .unwrap()
+                .read_to_end(&mut out)
+                .unwrap();
+            assert_eq!(out, payload);
+        }
     }
 }

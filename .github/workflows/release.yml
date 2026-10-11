@@ -2050,7 +2050,8 @@ jobs:
           - target: i586-unknown-linux-musl
             arch: i586
             runs-on: ubuntu-24.04
-            toolchain: stable
+            # Last successful reference build: actions/runs/36370175700/job/108764678980.
+            toolchain: "1.98.1"
             prebuilt: "yes"
             apt: gcc-i686-linux-gnu
             linker_env: CARGO_TARGET_I586_UNKNOWN_LINUX_MUSL_LINKER

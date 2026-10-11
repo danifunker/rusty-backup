@@ -103,3 +103,11 @@ regression-tests/**/*.local.toml
 sol9-seed.tar.gz
 sol9-sysroot.tar.gz
 docker/sol9-cross/sysroot.tar.gz.tmp
+
+# Private door-controller recovery data and disk images
+/doors/recovery/
+/doors/*.dar
+/doors/*.sign
+/license.jpg
+/20240724-emerge_unprovisioned/
+/20240724-emerge_unprovisioned.tgz

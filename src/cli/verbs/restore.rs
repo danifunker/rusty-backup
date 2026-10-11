@@ -116,18 +116,21 @@ pub fn run(args: RestoreArgs) -> Result<()> {
             args.target.display()
         );
     }
+    // A device target defaults to its real size, so a GPT's backup header lands at the true end
+    let mut device_size = None;
     if args.device {
         let pre = crate::cli::device_safety::preflight(&args.target, args.write_to_system_disk)?;
+        device_size = pre.device.as_ref().map(|d| d.size_bytes).filter(|&n| n > 0);
         crate::cli::device_safety::print_safety_summary(
             "restore",
             &args.backup_dir.display().to_string(),
             &args.target,
-            args.target_size.unwrap_or(0),
+            args.target_size.or(device_size).unwrap_or(0),
             pre.device.as_ref(),
         );
     }
 
-    let target_size = match args.target_size {
+    let target_size = match args.target_size.or(device_size) {
         Some(n) => n,
         None => read_source_size_from_metadata(&args.backup_dir)?,
     };
@@ -286,6 +289,11 @@ fn read_metadata(backup_dir: &std::path::Path) -> Result<crate::backup::metadata
 }
 
 fn read_source_size_from_metadata(backup_dir: &std::path::Path) -> Result<u64> {
+    if !backup_dir.join("metadata.json").exists() {
+        if let Some(cz) = crate::clonezilla::metadata::resolve_clonezilla_folder(backup_dir) {
+            return Ok(crate::clonezilla::metadata::load(&cz)?.source_size_bytes);
+        }
+    }
     Ok(read_metadata(backup_dir)?.source_size_bytes)
 }
 

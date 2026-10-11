@@ -14,7 +14,8 @@
 # Note: Debian's 32-bit glibc is i686-baseline, so the result runs on Pentium+.
 # A *true* 486 needs an i486 sysroot (musl / Buildroot) — see the doc.
 
-FROM rust:bookworm
+# Pinned: rustc 1.99.0 (LLVM 23) crashes compiling `image` for i586.
+FROM rust:1.98.1-bookworm
 
 # i686 cross toolchain = 32-bit x86 linker + glibc sysroot (+ libatomic, which
 # the i486 tier's lowered 64-bit atomics call into).

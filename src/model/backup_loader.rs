@@ -16,7 +16,9 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use crate::backup::metadata::BackupMetadata;
-use crate::clonezilla::metadata::{is_clonezilla_image, load as load_cz_image, ClonezillaImage};
+use crate::clonezilla::metadata::{
+    load as load_cz_image, resolve_clonezilla_folder, ClonezillaImage,
+};
 use crate::clonezilla::partclone::read_partclone_header;
 use crate::partition::{self, detect_alignment, PartitionAlignment, PartitionInfo, PartitionTable};
 
@@ -58,8 +60,8 @@ pub struct ClonezillaLoadOutcome {
 pub fn load_backup(folder: &Path) -> Result<LoadOutcome> {
     let metadata_path = folder.join("metadata.json");
     if !metadata_path.exists() {
-        if is_clonezilla_image(folder) {
-            return load_clonezilla(folder).map(LoadOutcome::Clonezilla);
+        if let Some(cz_folder) = resolve_clonezilla_folder(folder) {
+            return load_clonezilla(&cz_folder).map(LoadOutcome::Clonezilla);
         }
         anyhow::bail!("{}", no_metadata_message(folder));
     }

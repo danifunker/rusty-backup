@@ -849,6 +849,8 @@ mod tests {
             type_guid: None,
             unique_guid: None,
             partition_name: None,
+            swap_uuid: None,
+            swap_label: None,
         };
         let image = ClonezillaImage {
             disk_name: "sda".into(),

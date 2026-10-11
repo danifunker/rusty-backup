@@ -23,7 +23,8 @@
 #     qemu-i386 -cpu pentium \
 #       /src/target-cross/i586-unknown-linux-musl/release/rb-cli --version
 
-FROM rust:bookworm
+# Pinned: rustc 1.99.0 (LLVM 23) crashes compiling `image` for i586.
+FROM rust:1.98.1-bookworm
 
 # 32-bit x86 cross-gcc to drive the link (-m32) + qemu to run/test the result.
 RUN apt-get update && apt-get install -y --no-install-recommends \

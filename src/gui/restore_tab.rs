@@ -1316,8 +1316,8 @@ impl RestoreTab {
         let metadata_path = folder.join("metadata.json");
         if metadata_path.exists() {
             self.load_native_backup_metadata(&folder, &metadata_path, ctx);
-        } else if clonezilla::metadata::is_clonezilla_image(&folder) {
-            self.load_clonezilla_backup_metadata(&folder, ctx);
+        } else if let Some(cz_folder) = clonezilla::metadata::resolve_clonezilla_folder(&folder) {
+            self.load_clonezilla_backup_metadata(&cz_folder, ctx);
         } else {
             self.metadata_error =
                 Some("No backup found (metadata.json or Clonezilla image)".to_string());

@@ -67,6 +67,10 @@ pub struct ClonezillaPartition {
     pub unique_guid: Option<String>,
     /// GPT partition name (for GPT partitions)
     pub partition_name: Option<String>,
+    /// Swap UUID from `swappt-<dev>.info`; Clonezilla re-runs `mkswap -U` with it on restore
+    pub swap_uuid: Option<[u8; 16]>,
+    /// Swap label from `swappt-<dev>.info`
+    pub swap_label: Option<String>,
 }
 
 impl ClonezillaPartition {
@@ -93,6 +97,20 @@ impl ClonezillaPartition {
 /// Check if a folder is a Clonezilla image by looking for the marker file.
 pub fn is_clonezilla_image(folder: &Path) -> bool {
     folder.join("clonezilla-img").exists()
+}
+
+/// The Clonezilla image folder at `folder`, or the sole one directly inside it (an extracted tarball).
+pub fn resolve_clonezilla_folder(folder: &Path) -> Option<PathBuf> {
+    if is_clonezilla_image(folder) {
+        return Some(folder.to_path_buf());
+    }
+    let mut found = std::fs::read_dir(folder)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_dir() && is_clonezilla_image(p));
+    let first = found.next()?;
+    found.next().is_none().then_some(first)
 }
 
 /// Load and parse a complete Clonezilla image from a folder.
@@ -191,6 +209,8 @@ pub fn load(folder: &Path) -> Result<ClonezillaImage> {
             Vec::new()
         };
 
+        let (swap_uuid, swap_label) = parse_swap_info(folder, &sf_entry.device_name);
+
         partitions.push(ClonezillaPartition {
             index: sf_entry.index,
             device_name: sf_entry.device_name.clone(),
@@ -205,6 +225,8 @@ pub fn load(folder: &Path) -> Result<ClonezillaImage> {
             type_guid: sf_entry.type_guid.clone(),
             unique_guid: sf_entry.unique_guid.clone(),
             partition_name: sf_entry.partition_name.clone(),
+            swap_uuid,
+            swap_label,
         });
     }
 
@@ -226,6 +248,61 @@ pub fn load(folder: &Path) -> Result<ClonezillaImage> {
         gpt_first_lba: sfdisk_result.first_lba,
         gpt_last_lba: sfdisk_result.last_lba,
     })
+}
+
+/// Parse `swappt-<dev>.info` (`UUID="..."` / `LABEL="..."` lines) if Clonezilla saved one.
+fn parse_swap_info(folder: &Path, device_name: &str) -> (Option<[u8; 16]>, Option<String>) {
+    let Ok(text) = std::fs::read_to_string(folder.join(format!("swappt-{device_name}.info")))
+    else {
+        return (None, None);
+    };
+    let mut uuid = None;
+    let mut label = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(v) = line.strip_prefix("UUID=") {
+            uuid = parse_uuid(v.trim_matches('"'));
+        } else if let Some(v) = line.strip_prefix("LABEL=") {
+            let v = v.trim_matches('"');
+            if !v.is_empty() {
+                label = Some(v.to_string());
+            }
+        }
+    }
+    (uuid, label)
+}
+
+/// Parse a textual UUID into its 16 bytes in string order (libuuid's on-disk order).
+fn parse_uuid(text: &str) -> Option<[u8; 16]> {
+    let hex: String = text.chars().filter(|c| *c != '-').collect();
+    if hex.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
+}
+
+/// Build the first page of a Linux swap v1 area (what `mkswap -U uuid -L label` writes).
+pub fn build_swap_header(size_bytes: u64, uuid: Option<[u8; 16]>, label: Option<&str>) -> Vec<u8> {
+    const PAGE: usize = 4096;
+    let mut page = vec![0u8; PAGE];
+    let last_page = (size_bytes / PAGE as u64)
+        .saturating_sub(1)
+        .min(u32::MAX as u64) as u32;
+    page[1024..1028].copy_from_slice(&1u32.to_le_bytes());
+    page[1028..1032].copy_from_slice(&last_page.to_le_bytes());
+    if let Some(u) = uuid {
+        page[1036..1052].copy_from_slice(&u);
+    }
+    if let Some(l) = label {
+        let n = l.len().min(16);
+        page[1052..1052 + n].copy_from_slice(&l.as_bytes()[..n]);
+    }
+    page[PAGE - 10..].copy_from_slice(b"SWAPSPACE2");
+    page
 }
 
 /// Read the `disk` file to get the device prefix (e.g. "sda").
@@ -425,16 +502,10 @@ fn parse_sfdisk_hex_value(attrs: &str, key: &str) -> Result<u8> {
         let part = part.trim();
         if let Some(val_str) = part.strip_prefix(&format!("{key}=")) {
             let val_str = val_str.trim();
-            let value = if let Some(hex) = val_str.strip_prefix("0x") {
-                u8::from_str_radix(hex, 16)
-                    .with_context(|| format!("invalid hex {key} value: {val_str}"))?
-            } else if let Ok(v) = val_str.parse::<u8>() {
-                v
-            } else {
-                // sfdisk may output bare hex like "type=f" without 0x prefix
-                u8::from_str_radix(val_str, 16)
-                    .with_context(|| format!("invalid {key} value: {val_str}"))?
-            };
+            // sfdisk dumps MBR types as bare hex: "type=83" is Linux (0x83), not decimal 83
+            let hex = val_str.strip_prefix("0x").unwrap_or(val_str);
+            let value = u8::from_str_radix(hex, 16)
+                .with_context(|| format!("invalid {key} value: {val_str}"))?;
             return Ok(value);
         }
     }
@@ -444,7 +515,11 @@ fn parse_sfdisk_hex_value(attrs: &str, key: &str) -> Result<u8> {
 /// Extract partition index from device name. Linux numbering:
 /// sda1..sda4 are primary (index 0-3), sda5+ are logical (index 4+).
 fn extract_partition_index(device_name: &str, disk_name: &str) -> usize {
-    let num_str = device_name.strip_prefix(disk_name).unwrap_or("");
+    // nvme0n1p1 / mmcblk0p1 put a 'p' between the disk name and the number
+    let num_str = device_name
+        .strip_prefix(disk_name)
+        .unwrap_or("")
+        .trim_start_matches('p');
     let num: usize = num_str.parse().unwrap_or(0);
     if num == 0 {
         0
@@ -575,7 +650,7 @@ mod tests {
         assert_eq!(parse_sfdisk_hex_value(line3, "type").unwrap(), 0x0f);
 
         let line4 = "start=63, size=100, type=83";
-        assert_eq!(parse_sfdisk_hex_value(line4, "type").unwrap(), 83);
+        assert_eq!(parse_sfdisk_hex_value(line4, "type").unwrap(), 0x83);
     }
 
     #[test]
@@ -664,5 +739,36 @@ last-lba: 976773134
             Some("EFI System Partition".to_string())
         );
         assert_eq!(parse_sfdisk_quoted_value(attrs, "missing"), None);
+    }
+}
+
+#[cfg(test)]
+mod swap_tests {
+    use super::*;
+
+    #[test]
+    fn swap_header_matches_mkswap_layout() {
+        let uuid = parse_uuid("6c7aabb9-3ffe-4743-9e4a-c59ef2ba163f").unwrap();
+        assert_eq!(uuid[0], 0x6c);
+        assert_eq!(uuid[15], 0x3f);
+        let h = build_swap_header(1996800 * 512, Some(uuid), Some("swap"));
+        assert_eq!(&h[4086..], b"SWAPSPACE2");
+        assert_eq!(u32::from_le_bytes(h[1024..1028].try_into().unwrap()), 1);
+        assert_eq!(
+            u32::from_le_bytes(h[1028..1032].try_into().unwrap()),
+            249599
+        );
+        assert_eq!(&h[1036..1052], &uuid);
+        assert_eq!(&h[1052..1056], b"swap");
+    }
+
+    #[test]
+    fn resolve_finds_image_one_level_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = dir.path().join("2024-07-24-img");
+        std::fs::create_dir(&inner).unwrap();
+        std::fs::write(inner.join("clonezilla-img"), "x").unwrap();
+        assert_eq!(resolve_clonezilla_folder(dir.path()), Some(inner.clone()));
+        assert_eq!(resolve_clonezilla_folder(&inner), Some(inner));
     }
 }
