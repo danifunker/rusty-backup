@@ -566,7 +566,7 @@ pub struct RustyBackupApp {
     bulk_convert_status: Option<Arc<Mutex<BulkConvertStatus>>>,
     /// File path passed on the command line (Windows file-association
     /// double-click, macOS `open file.d88`, Linux `.desktop` MimeType
-    /// launch). Taken on the first `update()` tick, routed into the
+    /// launch). Taken on the first `logic()` tick, routed into the
     /// Inspect tab, and the tab is switched to it. `None` for normal
     /// launches without a file argv.
     pending_initial_image: Option<PathBuf>,
@@ -874,8 +874,13 @@ impl RustyBackupApp {
     }
 }
 
+/// A dropped file's real filesystem path; egui reports an empty one for byte-only drops.
+fn non_empty_path(path: &std::path::Path) -> Option<PathBuf> {
+    (!path.as_os_str().is_empty()).then(|| path.to_path_buf())
+}
+
 impl eframe::App for RustyBackupApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Request repaint while backup/restore is running so progress updates are shown
         if self.progress.active
             || self.backup_tab.is_running()
@@ -888,7 +893,7 @@ impl eframe::App for RustyBackupApp {
 
         // One-shot: drain the file path handed in on the command line
         // (Windows file-association double-click, macOS `open ...`, Linux
-        // .desktop MimeType launch). Done in update() rather than the
+        // .desktop MimeType launch). Done in logic() rather than the
         // constructor because the inspect tab's lazy-load path needs the
         // egui context to be alive.
         if let Some(path) = self.pending_initial_image.take() {
@@ -904,8 +909,12 @@ impl eframe::App for RustyBackupApp {
         //
         // Historically this always opened in Inspect, which made drag-and-drop
         // useless for the Optical / Archives / Restore tabs and Commander.
-        let dropped: Option<PathBuf> =
-            ctx.input(|i| i.raw.dropped_files.iter().find_map(|f| f.path.clone()));
+        let dropped: Option<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .find_map(|f| non_empty_path(f.path()))
+        });
         if let Some(path) = dropped {
             if let Some(cmd) = self.commander.as_mut() {
                 // Commander overlay takes over the frame; hand the drop to the
@@ -968,7 +977,7 @@ impl eframe::App for RustyBackupApp {
         }
 
         // Top panel: tab bar
-        egui::Panel::top("tab_bar").show_inside(ctx, |ui| {
+        egui::Panel::top("tab_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.active_tab, Tab::Backup, "Backup");
                 ui.selectable_value(&mut self.active_tab, Tab::Restore, "Restore");
@@ -1137,7 +1146,7 @@ impl eframe::App for RustyBackupApp {
                             s.current_index, s.total_files, s.current_file,
                         )
                     };
-                    egui::Panel::top("bulk_convert_progress").show_inside(ctx, |ui| {
+                    egui::Panel::top("bulk_convert_progress").show(ctx, |ui| {
                         ui.add(egui::ProgressBar::new(frac).text(text));
                     });
                 }
@@ -1154,7 +1163,7 @@ impl eframe::App for RustyBackupApp {
         };
         if let Some(info) = banner_info {
             if info.is_outdated {
-                egui::Panel::top("update_banner").show_inside(ctx, |ui| {
+                egui::Panel::top("update_banner").show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(
                             egui::RichText::new("Update")
@@ -1204,7 +1213,7 @@ impl eframe::App for RustyBackupApp {
             .resizable(true)
             .min_size(100.0)
             .default_size(180.0)
-            .show_inside(ctx, |ui| {
+            .show(ctx, |ui| {
                 self.progress.show(ui);
                 if self.progress.active {
                     ui.separator();
@@ -1231,7 +1240,7 @@ impl eframe::App for RustyBackupApp {
         }
 
         // Central panel: active tab content
-        egui::CentralPanel::default().show_inside(ctx, |ui| match self.active_tab {
+        egui::CentralPanel::default().show(ctx, |ui| match self.active_tab {
             Tab::Backup => {
                 let busy = self.busy_elsewhere(Tab::Backup);
                 let mut ctx = context::TabContext::new(&self.devices, &mut self.log_panel)

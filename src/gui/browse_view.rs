@@ -4743,7 +4743,7 @@ impl BrowseView {
         };
 
         egui::Window::new(title)
-            .id(egui::Id::new("archive_import_dialog"))
+            .id(egui::Id::unique("archive_import_dialog"))
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -4932,7 +4932,7 @@ impl BrowseView {
         };
 
         egui::Window::new(title)
-            .id(egui::Id::new("mac_archive_window"))
+            .id(egui::Id::unique("mac_archive_window"))
             .collapsible(false)
             .resizable(true)
             .default_size([640.0, 480.0])
@@ -5113,7 +5113,7 @@ impl BrowseView {
         };
 
         egui::Window::new("Save Mac archive")
-            .id(egui::Id::new("archive_extract_dialog"))
+            .id(egui::Id::unique("archive_extract_dialog"))
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -5953,7 +5953,7 @@ impl BrowseView {
             i.raw
                 .dropped_files
                 .iter()
-                .filter_map(|f| f.path.clone())
+                .filter_map(|f| super::non_empty_path(f.path()))
                 .collect()
         });
 

@@ -11,6 +11,7 @@
 //! browse interactively. Built on the crates already in the tree: `zip`, `tar`,
 //! and `flate2` for gzip.
 
+use crate::compat::ZipEntryName as _;
 use std::collections::HashMap;
 use std::io::{Cursor, Read, Write};
 
@@ -199,7 +200,8 @@ pub fn open_zip(
         let mut zf = zip
             .by_index(i)
             .map_err(|e| FilesystemError::Parse(format!("zip entry {i}: {e}")))?;
-        let parts = split_name(zf.name());
+        let name = zf.entry_name();
+        let parts = split_name(&name);
         if parts.is_empty() {
             continue;
         }
@@ -215,7 +217,7 @@ pub fn open_zip(
             }
             let mut buf = Vec::with_capacity(zf.size() as usize);
             zf.read_to_end(&mut buf)
-                .map_err(|e| FilesystemError::Parse(format!("zip read '{}': {e}", zf.name())))?;
+                .map_err(|e| FilesystemError::Parse(format!("zip read '{name}': {e}")))?;
             buf
         };
         let modified = zf.last_modified().map(|d| {
@@ -380,7 +382,7 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut w = zip::ZipWriter::new(Cursor::new(&mut buf));
-            let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default()
+            let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);
             w.start_file("top.txt", opts).unwrap();
             w.write_all(b"top").unwrap();

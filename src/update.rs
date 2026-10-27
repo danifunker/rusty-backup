@@ -560,11 +560,12 @@ fn extract_cli_binary(
         leaf == exe_name || leaf == "rb-cli"
     };
     if lower.ends_with(".zip") {
+        use crate::compat::ZipEntryName as _;
         let reader = std::io::Cursor::new(bytes);
         let mut zip = zip::ZipArchive::new(reader)?;
         for i in 0..zip.len() {
             let mut entry = zip.by_index(i)?;
-            if entry.is_file() && matches_name(entry.name()) {
+            if entry.is_file() && matches_name(&entry.entry_name()) {
                 use std::io::Read;
                 let mut out = Vec::new();
                 entry.read_to_end(&mut out)?;
@@ -689,7 +690,7 @@ mod cli_update_tests {
         let mut buf = Vec::new();
         {
             let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
-            let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+            let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default();
             zip.start_file("noise.txt", opts).unwrap();
             zip.write_all(b"ignore me").unwrap();
             zip.start_file("rb-cli", opts).unwrap();
@@ -731,7 +732,7 @@ mod cli_update_tests {
         let mut buf = Vec::new();
         {
             let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
-            let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+            let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default();
             zip.start_file("rusty-backup.exe", opts).unwrap();
             zip.write_all(b"not the cli").unwrap();
             zip.finish().unwrap();
