@@ -68,6 +68,7 @@ fn partition_extent(
 }
 
 pub fn run(args: WriteArgs) -> Result<()> {
+    crate::os::ensure_physical_enabled()?;
     if !args.yes {
         bail!(
             "writing to {} is destructive; pass --yes to confirm",

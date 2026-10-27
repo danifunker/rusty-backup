@@ -648,7 +648,7 @@ impl InspectTab {
         // it is actually true - once elevated there is nothing to warn about.
         // Disk *images* are ordinary files and are unaffected, which is why
         // this names devices specifically rather than warning about everything.
-        if !rusty_backup::os::is_elevated() {
+        if rusty_backup::os::PHYSICAL_DEVICES_ENABLED && !rusty_backup::os::is_elevated() {
             ui.add_space(2.0);
             ui.label(
                 egui::RichText::new(super::unelevated_device_note())

@@ -455,6 +455,7 @@ struct ChdInfoPayload {
 // ---------------------------------------------------------------------------
 
 fn show_devices(removable_only: bool, format: OutputFormat) -> Result<()> {
+    crate::os::ensure_physical_enabled()?;
     let all = crate::device::enumerate_devices();
     let filtered: Vec<DeviceRow> = all
         .into_iter()

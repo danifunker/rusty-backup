@@ -297,6 +297,20 @@ enter `host:port`. For a browse-only daemon that refuses every write, start it
 with `rb-cli serve --read-only` (or set `writable = no` in `rb-daemon.ini`). The
 daemon design lives in [`docs/remote_transfer_plan.md`](docs/remote_transfer_plan.md).
 
+#### Image-files-only builds (app stores)
+
+Building with `--features no-physical-devices` produces a GUI / `rb-cli` that
+works on disk image files only. It never lists or opens physical disks or
+optical drives and never asks for elevation, which is what sandboxed
+channels (Mac App Store, Microsoft Store, Flathub / Snap) require. It behaves
+the same on every platform and can be combined with any other feature set, and
+it can still reach devices on a remote `rb-cli serve` daemon. See
+[`docs/no_physical_devices.md`](docs/no_physical_devices.md).
+
+```
+cargo build --release --features no-physical-devices
+```
+
 ### Bootable backup appliances (boot the metal, no host OS)
 
 For machines too old or too bare to run the desktop app, the same engine ships

@@ -76,6 +76,9 @@ fn bytes_human(n: u64) -> String {
 /// point the user at the top-bar gate; when already elevated (or on other
 /// platforms) it just reports that none were detected.
 fn no_devices_hint() -> &'static str {
+    if !rusty_backup::os::PHYSICAL_DEVICES_ENABLED {
+        return "Physical devices are not available in this build. Use disk image files.";
+    }
     #[cfg(windows)]
     {
         if rusty_backup::os::windows::is_elevated() {
@@ -145,6 +148,9 @@ fn unelevated_device_note() -> &'static str {
 /// platforms it is always true. Used to gray out physical-source controls until
 /// the user elevates via the top-bar "Show Physical Devices" button.
 fn physical_devices_available() -> bool {
+    if !rusty_backup::os::PHYSICAL_DEVICES_ENABLED {
+        return false;
+    }
     #[cfg(windows)]
     {
         rusty_backup::os::windows::is_elevated()
@@ -581,7 +587,11 @@ impl Default for RustyBackupApp {
         log.info("Rusty Backup started");
 
         let devices = device::enumerate_devices();
-        if devices.is_empty() {
+        if !rusty_backup::os::PHYSICAL_DEVICES_ENABLED {
+            log.info(
+                "This build works on disk image files only; physical device access is disabled.",
+            );
+        } else if devices.is_empty() {
             log.warn("No disk devices detected. You can still open image files.");
         } else {
             log.info(format!("Found {} device(s)", devices.len()));
@@ -717,12 +727,17 @@ enum ElevationGate {
     /// Already elevated — devices are available, show "Refresh Devices".
     #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
     Elevated,
+    /// A `no-physical-devices` build: no elevation and no device list to refresh.
+    Disabled,
 }
 
 impl RustyBackupApp {
     /// Current elevation-gate state. The button + device-list behavior key off
     /// this; macOS is always `NotApplicable`.
     fn elevation_gate(&self) -> ElevationGate {
+        if !rusty_backup::os::PHYSICAL_DEVICES_ENABLED {
+            return ElevationGate::Disabled;
+        }
         #[cfg(any(windows, target_os = "linux"))]
         {
             if rusty_backup::os::is_elevated() {
@@ -1046,6 +1061,11 @@ impl eframe::App for RustyBackupApp {
                                     self.elevation_dialog.open();
                                 }
                             }
+                            ui.separator();
+                        }
+                        ElevationGate::Disabled => {
+                            ui.label(egui::RichText::new("Image files only").weak())
+                                .on_hover_text(rusty_backup::os::PHYSICAL_DEVICES_DISABLED);
                             ui.separator();
                         }
                         ElevationGate::NotApplicable | ElevationGate::Elevated => {

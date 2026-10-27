@@ -942,6 +942,7 @@ fn open_read_dispatch(
     password: Option<&[u8]>,
     inside: Option<&str>,
 ) -> Result<Box<dyn ReadSeek>> {
+    crate::os::ensure_physical_allowed(path)?;
     if crate::rbformats::appimage::is_squashfs_appimage(path) {
         // An AppImage is an ELF stub with a SquashFS appended, so there is
         // nothing to decode — present the payload as a window whose byte 0 is
@@ -1279,6 +1280,7 @@ pub fn open_peeled_read_with_entry(
     password: Option<&[u8]>,
     inside: Option<&str>,
 ) -> Result<Box<dyn ReadSeek>> {
+    crate::os::ensure_physical_allowed(path)?;
     if is_container_path(path) {
         return open_read_dispatch(path, password, inside);
     }

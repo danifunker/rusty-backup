@@ -80,6 +80,7 @@ pub fn run(args: RestoreArgs) -> Result<()> {
     if let Some(remote) = crate::remote::RemoteRef::parse(&args.target.to_string_lossy()) {
         return run_remote(args, remote);
     }
+    crate::os::ensure_physical_allowed(&args.target)?;
 
     // A `.cbk` container restores natively: materialize it into a temp folder and
     // restore from that. The desktop's resize-on-restore path consumes the native

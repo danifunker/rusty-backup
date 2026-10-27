@@ -134,6 +134,9 @@ jobs:
         if: matrix.arch != 'x86'
         run: cargo test --release --target ${{ matrix.target }}
 
+      - name: Check image-files-only build (no-physical-devices)
+        run: cargo check --release --target ${{ matrix.target }} --features no-physical-devices
+
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
@@ -250,6 +253,9 @@ jobs:
       - name: Test
         if: ${{ matrix.arch == 'arm64' }}
         run: cargo test --release --target ${{ matrix.target }}
+
+      - name: Check image-files-only build (no-physical-devices)
+        run: cargo check --release --target ${{ matrix.target }} --features no-physical-devices
 
       - name: Build
         run: |
@@ -549,6 +555,9 @@ jobs:
       # fails the job and blocks the release.
       - name: Test
         run: cargo test --release --target ${{ matrix.target }}
+
+      - name: Check image-files-only build (no-physical-devices)
+        run: cargo check --release --target ${{ matrix.target }} --features no-physical-devices
 
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}

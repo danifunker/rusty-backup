@@ -1473,6 +1473,11 @@ mod optical_server {
 
     impl OpticalState {
         pub fn list_drives<W: std::io::Write>(&self, writer: &mut W) -> Result<()> {
+            if !crate::os::PHYSICAL_DEVICES_ENABLED {
+                let drives = Vec::new();
+                write_control(writer, &Response::OpticalDrives { drives })?;
+                return Ok(());
+            }
             match cd_da_reader::CdReader::list_drives() {
                 Ok(drives) => {
                     let drives = drives.iter().map(WireOpticalDrive::from).collect();

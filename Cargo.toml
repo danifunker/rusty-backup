@@ -145,6 +145,12 @@ optical = ["dep:opticaldiscs", "dep:cd-da-reader"]
 # slim/cross builds (rb-cli-mini, armv7/MiSTer, i486/i586) so no ALSA cross-
 # compile is needed there. The Linux desktop GUI CI legs install libasound.
 audio = ["dep:rodio", "gui", "optical", "chd"]
+# Image-files-only build for sandboxed distribution (Mac App Store, Microsoft
+# Store, Flathub/Snap): no raw disk or optical-drive access, no elevation, on
+# every platform. Runtime-gated at the `os::` chokepoints, so it composes with
+# any other feature set. Remote daemons' devices stay reachable over the
+# network. See docs/no_physical_devices.md.
+no-physical-devices = []
 # Network daemon + client (`rb-cli serve` and `rb://host:port/img@N` refs).
 # ON BY DEFAULT, and every shipped build opts in: the desktop release via
 # `default`, and the slim/cross pipelines (armv7 MiSTer, i486/i586 appliance)

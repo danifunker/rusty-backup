@@ -133,6 +133,12 @@ impl OpticalDiscBrowseView {
         self.disc_path = Some(path.to_path_buf());
         self.physical = physical;
         self.selected_fs = 0;
+        if physical {
+            if let Err(e) = crate::os::ensure_physical_enabled() {
+                self.error = Some(e.to_string());
+                return;
+            }
+        }
 
         let probe = if physical {
             DiscImageInfo::open_physical(path)
