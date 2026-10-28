@@ -28,7 +28,7 @@ support the disk types (floppy / hard disk / CD-ROM) of the outstanding cores.
   Minix V1/V2/V3 (read + edit + create + fsck),
   ProDOS (read + edit + create + fsck),
   Apple DOS 3.3 (read + edit + create + fsck),
-  UCSD p-System (read + edit + create + fsck), QNX 2 / QNX 4 / QNX 6 Power-Safe (read-only),
+  UCSD p-System (read + edit + create + fsck), QNX 2 (read + fsck) / QNX 4 / QNX 6 Power-Safe (read-only),
   MacPlus MFS (read + edit + create + fsck),
   Amiga OFS/FFS (AFFS) / PFS3 / SFS (all three creatable: `new volume affs` /
   `pfs3` / `sfs`; AFFS output mounts Read/Write under a real Kickstart 3.1,

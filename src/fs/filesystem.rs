@@ -123,6 +123,11 @@ pub trait Filesystem: Send {
         None
     }
 
+    /// List deleted-but-readable entries alongside live ones; `false` when unsupported.
+    fn set_show_deleted(&mut self, _on: bool) -> bool {
+        false
+    }
+
     /// Parse and summarize the volume's journal, if it has one. Returns
     /// `Ok(None)` when the filesystem has no journal or is not journaled.
     /// Only HFS+/HFSX override this. See `docs/hfsplus_enhancements.md`

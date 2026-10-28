@@ -621,6 +621,8 @@ impl<R: Read + Seek> ExfatFilesystem<R> {
                         finder_flags: None,
                         prodos_file_type: None,
                         mac_dates: None,
+                        owner_label: None,
+                        native_attrs: None,
                     }
                 } else {
                     FileEntry {
@@ -650,6 +652,8 @@ impl<R: Read + Seek> ExfatFilesystem<R> {
                         finder_flags: None,
                         prodos_file_type: None,
                         mac_dates: None,
+                        owner_label: None,
+                        native_attrs: None,
                     }
                 };
 
@@ -694,6 +698,8 @@ impl<R: Read + Seek + Send> Filesystem for ExfatFilesystem<R> {
             finder_flags: None,
             prodos_file_type: None,
             mac_dates: None,
+            owner_label: None,
+            native_attrs: None,
         })
     }
 

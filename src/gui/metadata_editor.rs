@@ -613,11 +613,15 @@ pub fn render_owner_row(
         .unwrap_or((0, 0));
 
     if !edit_mode {
-        let shown = match id_names {
-            Some(n) => n.format_owner(cur_uid, cur_gid),
-            None => format!("{cur_uid}:{cur_gid}"),
+        let shown = match (&entry.owner_label, id_names) {
+            (Some(label), _) => label.clone(),
+            (None, Some(n)) => n.format_owner(cur_uid, cur_gid),
+            (None, None) => format!("{cur_uid}:{cur_gid}"),
         };
         ui.label(format!("Owner: {shown}"));
+        if let Some(attrs) = &entry.native_attrs {
+            ui.label(format!("Attributes: {attrs}"));
+        }
         return;
     }
 

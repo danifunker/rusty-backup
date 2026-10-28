@@ -73,6 +73,10 @@ pub fn classify(name: &str) -> Option<DescendKind> {
     if DISK_IMAGE_EXTS.iter().any(|a| a.eq_ignore_ascii_case(ext)) {
         return Some(DescendKind::DiskImage);
     }
+    // QDOS (Unisys ICON) DOS disks stored inside QNX 2; kept out of DISK_IMAGE_EXTS so the OS never associates them.
+    if ["ph", "pf"].iter().any(|a| a.eq_ignore_ascii_case(ext)) {
+        return Some(DescendKind::DiskImage);
+    }
     None
 }
 
@@ -582,6 +586,7 @@ mod tests {
         assert_eq!(classify("Tool.bin"), Some(DescendKind::Archive));
         assert_eq!(classify("Disk.dc42"), Some(DescendKind::DiskImage));
         assert_eq!(classify("Disk.2mg"), Some(DescendKind::DiskImage));
+        assert_eq!(classify("work.ph"), Some(DescendKind::DiskImage));
         assert_eq!(classify("notes.txt"), None);
         assert_eq!(classify("noext"), None);
         // Host archives (browse files), including `.zip` which must win over the

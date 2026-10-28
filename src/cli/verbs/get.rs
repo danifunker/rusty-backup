@@ -108,6 +108,16 @@ pub struct GetArgs {
     #[arg(long = "inside", value_name = "NAME")]
     pub inside: Option<String>,
 
+    /// Make deleted entries the filesystem can still read addressable as
+    /// `NAME [deleted]` (QNX 2; see `ls --deleted`).
+    #[arg(long)]
+    pub deleted: bool,
+
+    /// Convert text files' RS (0x1E) line separators to LF (QNX 2). Files that
+    /// do not look like RS-separated text are extracted unchanged.
+    #[arg(long = "rs-to-lf")]
+    pub rs_to_lf: bool,
+
     #[command(flatten)]
     pub fs_override: FsDispatchOverride,
 }
@@ -118,6 +128,13 @@ pub enum ConflictMode {
     Error,
     Force,
     SkipExisting,
+}
+
+/// Per-run extraction settings threaded through the walkers.
+#[derive(Debug, Clone, Copy)]
+struct ExtractOpts {
+    conflict: ConflictMode,
+    rs_to_lf: bool,
 }
 
 impl ConflictMode {
@@ -161,13 +178,19 @@ pub fn run(args: GetArgs) -> Result<()> {
             &args.image.path,
         )
     })?;
+    if args.deleted && !fs.set_show_deleted(true) {
+        bail!("{} volumes keep no readable deleted entries", fs.fs_type());
+    }
 
     let case_insensitive = match (args.ignore_case, args.case_sensitive) {
         (true, _) => true,
         (_, true) => false,
         _ => true,
     };
-    let conflict = ConflictMode::from_flags(args.force, args.skip_existing);
+    let opts = ExtractOpts {
+        conflict: ConflictMode::from_flags(args.force, args.skip_existing),
+        rs_to_lf: args.rs_to_lf,
+    };
 
     // Decide the dispatch shape. Globs and exclude lists always go
     // through the glob walker; a literal source goes through resolve_path
@@ -183,7 +206,7 @@ pub fn run(args: GetArgs) -> Result<()> {
             &args.exclude,
             case_insensitive,
             args.recursive,
-            conflict,
+            opts,
         );
     }
 
@@ -211,13 +234,13 @@ pub fn run(args: GetArgs) -> Result<()> {
         };
         ensure_dir(&target_root)?;
         let mut stats = ExtractStats::default();
-        extract_directory_recursive(&mut *fs, &entry, &target_root, conflict, &mut stats)?;
+        extract_directory_recursive(&mut *fs, &entry, &target_root, opts, &mut stats)?;
         summarize(&stats);
         return Ok(());
     }
     // Single file.
     let host_target = decide_single_host_target(&args.dst, &entry);
-    extract_file_to_host(&mut *fs, &entry, &host_target, conflict)
+    extract_file_to_host(&mut *fs, &entry, &host_target, opts)
         .map(|_written| ())
         .with_context(|| format!("extracting {} to {}", args.src, host_target.display()))
 }
@@ -289,7 +312,7 @@ fn run_glob(
     exclude: &[String],
     case_insensitive: bool,
     recursive: bool,
-    conflict: ConflictMode,
+    opts: ExtractOpts,
 ) -> Result<()> {
     let includes = compile_patterns(src, case_insensitive)?;
     let mut excludes = Vec::new();
@@ -328,7 +351,7 @@ fn run_glob(
                     continue;
                 }
                 ensure_dir(&host_target)?;
-                extract_directory_recursive(fs, &entry, &host_target, conflict, &mut stats)?;
+                extract_directory_recursive(fs, &entry, &host_target, opts, &mut stats)?;
             }
             crate::fs::entry::EntryType::File
             | crate::fs::entry::EntryType::Symlink
@@ -336,7 +359,7 @@ fn run_glob(
                 if let Some(parent) = host_target.parent() {
                     ensure_dir(parent)?;
                 }
-                let _ = extract_entry_to_host(fs, &entry, &host_target, conflict, &mut stats)
+                let _ = extract_entry_to_host(fs, &entry, &host_target, opts, &mut stats)
                     .with_context(|| format!("extracting {full} to {}", host_target.display()))?;
             }
         }
@@ -352,7 +375,7 @@ fn extract_directory_recursive(
     fs: &mut dyn Filesystem,
     dir: &FileEntry,
     host_target: &Path,
-    conflict: ConflictMode,
+    opts: ExtractOpts,
     stats: &mut ExtractStats,
 ) -> Result<()> {
     let children = fs
@@ -363,14 +386,14 @@ fn extract_directory_recursive(
         match child.entry_type {
             crate::fs::entry::EntryType::Directory => {
                 ensure_dir(&host_child)?;
-                extract_directory_recursive(fs, &child, &host_child, conflict, stats)?;
+                extract_directory_recursive(fs, &child, &host_child, opts, stats)?;
             }
             crate::fs::entry::EntryType::File
             | crate::fs::entry::EntryType::Symlink
             | crate::fs::entry::EntryType::Special => {
-                extract_entry_to_host(fs, &child, &host_child, conflict, stats).with_context(
-                    || format!("extracting {} to {}", child.path, host_child.display()),
-                )?;
+                extract_entry_to_host(fs, &child, &host_child, opts, stats).with_context(|| {
+                    format!("extracting {} to {}", child.path, host_child.display())
+                })?;
             }
         }
     }
@@ -384,12 +407,12 @@ fn extract_entry_to_host(
     fs: &mut dyn Filesystem,
     entry: &FileEntry,
     host_target: &Path,
-    conflict: ConflictMode,
+    opts: ExtractOpts,
     stats: &mut ExtractStats,
 ) -> Result<bool> {
     match entry.entry_type {
         crate::fs::entry::EntryType::File => {
-            let wrote = extract_file_to_host(fs, entry, host_target, conflict)?;
+            let wrote = extract_file_to_host(fs, entry, host_target, opts)?;
             if wrote {
                 stats.files += 1;
             } else {
@@ -408,7 +431,7 @@ fn extract_entry_to_host(
             } else {
                 format!("{target}\n")
             };
-            let wrote = write_bytes_to_host(host_target, body.as_bytes(), conflict)?;
+            let wrote = write_bytes_to_host(host_target, body.as_bytes(), opts.conflict)?;
             if wrote {
                 stats.symlinks += 1;
                 log_stderr(format!(
@@ -442,10 +465,10 @@ fn extract_file_to_host(
     fs: &mut dyn Filesystem,
     entry: &FileEntry,
     host_target: &Path,
-    conflict: ConflictMode,
+    opts: ExtractOpts,
 ) -> Result<bool> {
     if host_target.exists() {
-        match conflict {
+        match opts.conflict {
             ConflictMode::Force => {}
             ConflictMode::SkipExisting => {
                 log_stderr(format!("  skip (exists): {}", host_target.display()));
@@ -459,6 +482,16 @@ fn extract_file_to_host(
     }
     if let Some(parent) = host_target.parent() {
         ensure_dir(parent)?;
+    }
+    if opts.rs_to_lf {
+        let data = fs
+            .read_file(entry, usize::MAX)
+            .map_err(|e| anyhow!("read_file({}): {e}", entry.path))?;
+        if crate::fs::qnx2::looks_like_rs_text(&data) {
+            std::fs::write(host_target, crate::fs::qnx2::rs_to_lf(&data))
+                .with_context(|| format!("writing {}", host_target.display()))?;
+            return Ok(true);
+        }
     }
     let mut out = std::fs::File::create(host_target)
         .with_context(|| format!("creating {}", host_target.display()))?;

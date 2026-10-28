@@ -559,6 +559,17 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
         }
     }
 
+    // A QDOS (Unisys ICON) `.ph` / `.pf` DOS disk: a FAT BPB with zeroed jump bytes, claimed only at its exact length.
+    if first_sector[0..3] == [0, 0, 0] && crate::fs::fat::has_fat_boot_start(first_sector) {
+        let bps = u64::from(u16::from_le_bytes([first_sector[11], first_sector[12]]));
+        let total = u64::from(u16::from_le_bytes([first_sector[19], first_sector[20]]));
+        let end = reader.seek(SeekFrom::End(0)).ok();
+        let _ = reader.seek(SeekFrom::Start(0));
+        if total != 0 && end == Some(total * bps) {
+            return Some("FAT".to_string());
+        }
+    }
+
     // X68000 Human68k floppy. The IPL boot sector starts with a 68000 BRA.S
     // (0x60) rather than an x86 JMP (0xEB / 0xE9), so the FAT check above
     // skips it. The BPB is either a standard little-endian one at offset 11
@@ -2526,6 +2537,25 @@ mod tests {
             detect_superfloppy(&blank, &mut sized).as_deref(),
             Some("qdos_mdv"),
             "cartridge-sized bytes without the header must not be claimed"
+        );
+    }
+
+    #[test]
+    fn detect_superfloppy_qdos_fat_without_jump_bytes() {
+        // The QDOS `work.ph` boot sector: "IBM  2.0", 202 x 512-byte sectors, media F8, no jump.
+        let mut img = vec![0u8; 202 * 512];
+        img[3..11].copy_from_slice(b"IBM  2.0");
+        img[11..24].copy_from_slice(&[0, 2, 1, 1, 0, 2, 0x40, 0, 0xCA, 0, 0xF8, 1, 0]);
+        let mut first = [0u8; 512];
+        first.copy_from_slice(&img[..512]);
+        let got = detect_superfloppy(&first, &mut std::io::Cursor::new(img.clone()));
+        assert_eq!(got.as_deref(), Some("FAT"));
+        img.extend_from_slice(&[0u8; 512]);
+        let got = detect_superfloppy(&first, &mut std::io::Cursor::new(img));
+        assert_ne!(
+            got.as_deref(),
+            Some("FAT"),
+            "only claimed at its exact length"
         );
     }
 

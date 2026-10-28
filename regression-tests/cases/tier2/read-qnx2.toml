@@ -53,3 +53,53 @@ fixture = "fs.qnx2.icon-watcom-basic-badsec.floppy"
 [[case.step]]
 args = ["tar", "{fixture}", "/", "{scratch}/all.tar"]
 expect_exit = 0
+
+[[case]]
+id = "read.qnx2.icon-help410-attrs"
+description = "Owner as group.member, ICON attribute letters, and dates in tar"
+fixture = "fs.qnx2.icon-help410.floppy"
+[[case.step]]
+args = ["ls", "-o", "{fixture}", "/"]
+expect_exit = 0
+stdout_contains = ["255.255", "HELP_1  (owner r--em group ----- other -----; modified)", "help  (owner rc-m group r--- other r---"]
+
+[[case]]
+id = "read.qnx2.icon-help410-deleted"
+description = "Deleted entries list only on request and are named NAME [deleted]"
+fixture = "fs.qnx2.icon-help410.floppy"
+[[case.step]]
+args = ["ls", "{fixture}", "/help/qnx"]
+expect_exit = 0
+stdout_not_contains = ["[deleted]"]
+[[case.step]]
+args = ["ls", "--deleted", "{fixture}", "/help/qnx"]
+expect_exit = 0
+stdout_contains = ["rename [deleted]", "src [deleted]"]
+
+[[case]]
+id = "read.qnx2.icon-help410-rs-to-lf"
+description = "get --rs-to-lf turns RS line separators into LF"
+fixture = "fs.qnx2.icon-help410.floppy"
+[[case.step]]
+args = ["get", "--rs-to-lf", "{fixture}", "/help/qnx/chattr", "{scratch}/chattr.txt"]
+expect_exit = 0
+file_sha256 = [{ path = "{scratch}/chattr.txt", sha256 = "ec54c533bf4b90c6901f2ffa2c720c1b3fc17829be4a7bce84b9fe7edde555c0" }]
+
+[[case]]
+id = "read.qnx2.icon-help410-fsck"
+description = "A clean ICON disk passes the QNX 2 check"
+fixture = "fs.qnx2.icon-help410.floppy"
+[[case.step]]
+args = ["fsck", "--checkonly", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["134 files / 4 dirs checked"]
+stdout_not_contains = ["WARN", "ERROR"]
+
+[[case]]
+id = "read.qnx2.icon-watcom-basic-badsec-fsck"
+description = "fsck names the two files lost to bad sectors and their 303 orphaned blocks"
+fixture = "fs.qnx2.icon-watcom-basic-badsec.floppy"
+[[case.step]]
+args = ["fsck", "--checkonly", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["/util/basic.qnx: entry says 196 blocks", "/util/gks: entry says 109 blocks", "303 blocks are marked in use but no file holds them: 286-480, 646-753"]

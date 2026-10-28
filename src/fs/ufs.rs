@@ -3437,6 +3437,8 @@ fn adopt_orphans_into_lost_found_ufs<R: Read + Write + Seek + Send>(
                 finder_flags: None,
                 prodos_file_type: None,
                 mac_dates: None,
+                owner_label: None,
+                native_attrs: None,
             };
             let children =
                 (fs as &mut dyn super::filesystem::Filesystem).list_directory(&root_entry)?;
@@ -3476,6 +3478,8 @@ fn adopt_orphans_into_lost_found_ufs<R: Read + Write + Seek + Send>(
                 finder_flags: None,
                 prodos_file_type: None,
                 mac_dates: None,
+                owner_label: None,
+                native_attrs: None,
             };
             let lf = fs.create_directory(
                 &root_entry,

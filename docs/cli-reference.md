@@ -767,6 +767,8 @@ Usage: get [OPTIONS] <IMAGE> <SRC> <DST>
 - `--skip-existing` — Skip silently when a host file already exists. Mutually exclusive with `--force`. Without either flag, an existing destination is a hard error
 - `--password` — Password for encrypted containers (WinImage IMZ, password-protected `.zip` disks) or an encrypted filesystem (APFS FileVault — the volume password or personal recovery key)
 - `--inside` — For a `.zip` holding more than one disk image, the archive entry to open (e.g. `--inside backup.img`). Matched by exact name, then case- insensitively, then by basename. Ignored for non-zip sources
+- `--deleted` — Make deleted entries the filesystem can still read addressable as `NAME [deleted]` (QNX 2; see `ls --deleted`)
+- `--rs-to-lf` — Convert text files' RS (0x1E) line separators to LF (QNX 2). Files that do not look like RS-separated text are extracted unchanged
 - `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zxplus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
 - `--carve-full` — Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga "NDOS" disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem
 
@@ -906,6 +908,7 @@ Usage: ls [OPTIONS] <IMAGE> [PATH]
 - `--ignore-case` — Treat case-insensitively, regardless of the target's native rule
 - `--case-sensitive` — Treat case-sensitively, regardless of the target's native rule
 - `-o` / `--owner` — Show each entry's Unix permissions and owner. On a Linux/Unix image the owner ids are resolved to names via the image's own `/etc/passwd` and `/etc/group` (falling back to the raw numbers where there's no entry)
+- `--deleted` — Also list deleted entries the filesystem can still read (QNX 2). They are named `NAME [deleted]` and can be extracted with `get --deleted`
 - `--password` — Password for encrypted containers (WinImage IMZ, password-protected `.zip` disks) or an encrypted filesystem (APFS FileVault — the volume password or personal recovery key)
 - `--inside` — For a `.zip` holding more than one disk image, the archive entry to open (e.g. `--inside backup.img`). Matched by exact name, then case- insensitively, then by basename. Ignored for non-zip sources
 - `--format` — Output format. `ls` is flat-tabular, so csv and tsv are in scope alongside json and yaml

@@ -38,8 +38,30 @@ Sinclair QL QDOS that `fs::qdos` already reads. Detection must be by content.
   file's length the sum of its extents' `size` (the C sources' formula from
   the directory entry overshoots). The entry's block count is the blocks held
   minus one. The `bitmap` file is one bit per block (200 bytes for 1600).
-- Dates: the `seconds` field is 0 on every ICON file and the two-word `date`
-  packing is not yet decoded, so no timestamps are shown.
+- Dates (decoded 2026-10-28 over all 2439 entries): word 0 is year-1980 in
+  bits 15-12, month in 11-8, a PM flag in bit 5 (bits 7-6 always 0) and the
+  day in 4-0; word 1 is seconds since 12 o'clock (never above 43183). The
+  `seconds` field is 0 on every ICON file. About 70 entries carry day 0 or the
+  31st of a 30-day month, all between 22:00 and 05:00: the ICON clock code's
+  month rollover. Counting the day on from the 1st of the month normalizes them
+  (May 0 -> 30 April).
+- Status: `0x40` in use, `0x10` modified (busy is not seen on these disks).
+  Owner is `group.member` (`+16` group, `+15` member; 255.255 on nearly every
+  ICON file). Attributes (`+26`, owner) and permissions (`+24` group, `+25`
+  other): files `r w a e m` = `0x01 0x02 0x04 0x08 0x10` (executables are
+  `0x19`); directories `r c b m`, with `c` = `0x04` and `b` = `0x08` inferred
+  (every directory is owner `0x35` = r c m + dir, others `0x21` = r). Letter
+  meanings are from the ICON `chattr` help page.
+- Deleted entries keep their name and first extent with `0x40` clear. The
+  seven on these disks were zapped while empty: a cleared header and no data.
+- The bitmap is LSB first, set = in use. On every readable disk each block a
+  file holds is marked; the only marked blocks no file holds are block 1, a boot
+  loader (blocks 3 up to the root) and, on the 3.00-era disks, the last block.
+  Watcom BASIC's bad sectors cost `basic.qnx` and `gks` their extent headers,
+  which the fsck reports as 303 lost blocks (286-480, 646-753).
+- `/dos/work.ph` on the QDOS disks is a blank 202-sector FAT12 disk whose jump
+  bytes are zeroed; it opens as FAT. No `arch` archive floppies are in the
+  archive (only the `arch` command and its help page).
 - All 34 QNX 2 images export to tar (2498 entries), the bad-sector ones too.
 
 ## QNX 4 and QNX 6
@@ -63,7 +85,7 @@ Sinclair QL QDOS that `fs::qdos` already reads. Detection must be by content.
 
 | Phase | Work | Verified against |
 |---|---|---|
-| Q1 (done) | QNX 2 read: detection, browse, extract, Inspect / Commander, `.img` 800 KiB ICON geometry; tolerate unreadable sectors (named, not fatal); ICON fixtures + regression cases | The ICON disks themselves (files that are known text / known binaries), `q2files`-style listing |
+| Q1 (done) | QNX 2 read, plus dates, owners, attributes, deleted entries, RS to LF, fsck (bitmap cross-check) and the QDOS `.ph` hand-off: detection, browse, extract, Inspect / Commander, `.img` 800 KiB ICON geometry; tolerate unreadable sectors (named, not fatal); ICON fixtures + regression cases | The ICON disks themselves (files that are known text / known binaries), `q2files`-style listing |
 | Q2 (code done; needs real media) | QNX 4 read: superblock / root, inode file, extents, links, MBR types 0x4D-0x4F | `qnxfs1g.img`, images made by QNX 4.25 under QEMU, `chkfs` |
 | Q3 (code done; needs real media) | QNX 6 Power-Safe read: superblock pair, trees, long names, both byte orders | Images made by QNX 6.5 / 7 under QEMU |
 | Q4 | QNX 2 edit + create + fsck | QNX 2 `chkfsys` running under emulation (see Oracles) |

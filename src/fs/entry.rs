@@ -114,6 +114,10 @@ pub struct FileEntry {
     /// edit (`StagedEdit::SetDates`). The `modify` value is also surfaced as a
     /// formatted string in `modified`. `None` outside the HFS family.
     pub mac_dates: Option<(u32, u32, u32)>,
+    /// Owner in the filesystem's own notation (QNX 2 `group.member`); shown instead of uid:gid.
+    pub owner_label: Option<String>,
+    /// Native attribute/permission letters for formats whose bits do not map onto a Unix mode.
+    pub native_attrs: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -154,6 +158,8 @@ impl FileEntry {
             amiga_date: None,
             dos_attributes: None,
             mac_dates: None,
+            owner_label: None,
+            native_attrs: None,
         }
     }
 
@@ -183,6 +189,8 @@ impl FileEntry {
             amiga_date: None,
             dos_attributes: None,
             mac_dates: None,
+            owner_label: None,
+            native_attrs: None,
         }
     }
 
@@ -212,6 +220,8 @@ impl FileEntry {
             amiga_date: None,
             dos_attributes: None,
             mac_dates: None,
+            owner_label: None,
+            native_attrs: None,
         }
     }
 
@@ -247,6 +257,8 @@ impl FileEntry {
             amiga_date: None,
             dos_attributes: None,
             mac_dates: None,
+            owner_label: None,
+            native_attrs: None,
         }
     }
 
@@ -281,6 +293,8 @@ impl FileEntry {
             amiga_date: None,
             dos_attributes: None,
             mac_dates: None,
+            owner_label: None,
+            native_attrs: None,
         }
     }
 

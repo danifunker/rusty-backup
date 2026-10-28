@@ -171,6 +171,8 @@ mod tests {
                 finder_flags: None,
                 prodos_file_type: None,
                 mac_dates: None,
+                owner_label: None,
+                native_attrs: None,
             })
         }
 
@@ -202,6 +204,8 @@ mod tests {
                         finder_flags: None,
                         prodos_file_type: None,
                         mac_dates: None,
+                        owner_label: None,
+                        native_attrs: None,
                     },
                     FileEntry {
                         name: "ReadMe".into(),
@@ -228,6 +232,8 @@ mod tests {
                         finder_flags: None,
                         prodos_file_type: None,
                         mac_dates: None,
+                        owner_label: None,
+                        native_attrs: None,
                     },
                 ]),
                 "/Documents" => Ok(vec![FileEntry {
@@ -255,6 +261,8 @@ mod tests {
                     finder_flags: None,
                     prodos_file_type: None,
                     mac_dates: None,
+                    owner_label: None,
+                    native_attrs: None,
                 }]),
                 _ => Ok(vec![]),
             }
