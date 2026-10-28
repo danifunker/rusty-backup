@@ -1282,6 +1282,7 @@ pub fn fs_name_for(partition_type: u8, partition_type_string: Option<&str>) -> &
         }
         return match s {
             "LIF" => "LIF",
+            s if s.starts_with(crate::partition::LVM_UNAVAILABLE) => "unavailable",
             "Apple_HFS" => "HFS",
             "Apple_HFSX" => "HFSX",
             // Apple HFS/HFS+ GPT partition GUID (UDIF DMG / hdiutil disks).
@@ -2660,6 +2661,10 @@ fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
     passphrase: Option<&str>,
 ) -> Result<Box<dyn Filesystem>, FilesystemError> {
     match type_str {
+        // An LV row that can't be opened carries its reason after the prefix.
+        s if s.starts_with(crate::partition::LVM_UNAVAILABLE) => Err(FilesystemError::Unsupported(
+            s[crate::partition::LVM_UNAVAILABLE.len()..].to_string(),
+        )),
         // The HP LIF boot volume ahead of a BSD label or an HP-UX LVM area.
         "LIF" => Ok(Box::new(lif::LifFilesystem::open(
             reader,

@@ -191,6 +191,18 @@ ISO 9660 + Rock Ridge already browse on all five ISOs. What each disc also carri
 - Fixtures: `part.bsd.netbsd92-hp300.hd`, `fs.hpux-hfs.hp385-hpux.hd`;
   cases in `cases/tier2/read-hp9000-disks.toml`.
 
+**2b (item 2.4) done 2026-10-28: HP-UX LVM.** `partition/lvm/mod.rs` holds the
+shared `LogicalVolume` (byte runs in logical order, marked complete when every
+extent is on this disk); `partition/lvm/hpux.rs` parses `LVMREC01` at 8 KiB,
+takes the newer of the two VGDA copies, and maps each `lvolN` from this PV's
+extent map. The on-disk layout is documented in that module's header; it was
+worked out from the hp715 disk and checked against its `/stand` and VxFS
+superblocks. `PartitionTable::HpuxLvm` lists the LIF boot area as row 0, then
+the LVs. An LV that is incomplete (multi-disk group) or fragmented lists but
+refuses to open with the reason (`LVM_UNAVAILABLE`, see `docs/stubs.md`). The hp715
+disk is catalogued (`part.hpux-lvm.hpux1111-hp715.hd`), case
+`cases/tier2/read-hpux-lvm.toml`.
+
 
 | # | Item | Effort |
 |---|---|---|

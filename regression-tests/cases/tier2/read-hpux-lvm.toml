@@ -1,0 +1,36 @@
+# Tier 2 — HP-UX 11.11 PA-RISC boot disk (issue #90, Phase 2b).
+#
+#   part.hpux-lvm.hpux1111-hp715.hd   LIF boot volume (ISL10: HPUX, ISL, AUTO, PAD,
+#                                     LABEL), then a single-PV HP-UX LVM vg00:
+#                                     lvol1 /stand (HP-HFS, long-name magic
+#                                     0x095014), lvol2 swap, lvol3 / (VxFS v4).
+#
+# The LVM layout (LVMREC01 at 8 KiB, VGDA copies, extent map) was worked out from
+# this disk and checked against the /stand and VxFS superblocks found in its
+# extents. Before Phase 2b the disk read as "Unrecognized media".
+
+[meta]
+tier = 2
+group = "fs.read.hpux-lvm"
+description = "HP-UX 11.11 boot disk: LIF boot area, HP-UX LVM volumes, HP-HFS /stand."
+
+[[case]]
+id = "read.hpux-lvm.hpux1111-hp715"
+description = "HP-UX LVM vg00 on one disk: LVs mapped from the newest VGDA, /stand browsed."
+fixture = "part.hpux-lvm.hpux1111-hp715.hd"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["Partition table: HP-UX LVM", "LIF boot area", "HP-UX LVM lvol1", "HP-UX LVM lvol2", "HP-UX LVM lvol3", "300.0 MiB", "256.0 MiB"]
+[[case.step]]
+args = ["ls", "{fixture}@1", "/"]
+expect_exit = 0
+stdout_contains = ["HPUX", "ISL", "AUTO", "LABEL"]
+[[case.step]]
+args = ["ls", "{fixture}@2", "/"]
+expect_exit = 0
+stdout_contains = ["bootconf", "vmunix", "dlkm"]
+[[case.step]]
+args = ["fsck", "{fixture}@2", "--checkonly"]
+expect_exit = 0
+stdout_contains = ["41 files / 19 dirs"]

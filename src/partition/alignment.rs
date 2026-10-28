@@ -70,6 +70,7 @@ pub fn detect_alignment(table: &PartitionTable) -> PartitionAlignment {
         | PartitionTable::Sun(_)
         | PartitionTable::Next(_)
         | PartitionTable::Bsd(_)
+        | PartitionTable::HpuxLvm(_)
         | PartitionTable::SolarisX86 { .. }
         | PartitionTable::Ahdi(_)
         | PartitionTable::X68k { .. }

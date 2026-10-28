@@ -11,6 +11,9 @@ finish it. Remove an entry when its work ships.
 | BSD disklabel (`PartitionTable::Bsd`) | Editing slots is refused ("BSD disk-label editing is not yet implemented") | `partition/editor.rs` | Slot edits that rewrite `p_offset` / `p_size` and restamp the XOR checksum, in the label's own byte order |
 | BSD disklabel | Resizing partitions on restore is refused ("no restore-time label patcher for BSD tables") | `partition/restore_patch.rs` | A `patch_bsd` that repacks slots like `patch_next`, keeping the LIF volume and the label's offset intact |
 | BSD disklabel | Only whole-disk backup through the single-file CHD layout; per-partition layouts are refused | `backup/mod.rs` | Same as the other label schemes; unlikely to change |
+| HP-UX LVM (`PartitionTable::HpuxLvm`) | Editing, LV resize and resize-on-restore are refused; whole-disk CHD backup only | `partition/editor.rs`, `partition/restore_patch.rs` | Round-trip the VGDA (both copies, timestamps, VGSA) before touching extents |
+| HP-UX LVM | An LV split across several extent runs is listed but refused on open ("fragmented LVs are not supported yet") | `partition::hpux_lvm_partitions`, `LVM_UNAVAILABLE` | An extent-mapping `Read + Seek` over `LogicalVolume::runs`, threaded through the partition open path |
+| HP-UX LVM | Multi-disk volume groups: LVs with extents on another PV are listed but refused | same | Out of scope by decision (single-disk only) |
 
 ## Filesystems
 

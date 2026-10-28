@@ -4,6 +4,7 @@ pub mod atari;
 pub mod bsd;
 pub mod editor;
 pub mod gpt;
+pub mod lvm;
 pub mod mac_cd_builder;
 pub mod mbr;
 pub mod next;
@@ -29,6 +30,7 @@ use apm::Apm;
 use atari::{looks_like_ahdi_root, AhdiPartitionKind, AhdiTable, AHDI_NUM_SLOTS};
 use bsd::BsdDiskLabel;
 use gpt::Gpt;
+use lvm::hpux::HpuxLvm;
 use mbr::Mbr;
 use next::NextDiskLabel;
 use rdb::{Rdb, RDSK_SIGNATURE};
@@ -70,6 +72,9 @@ pub enum PartitionTable {
     /// BSD `struct disklabel` on a dedicated disk (NetBSD/hp300 behind a LIF boot
     /// volume, others at sector 1); read-only, see `src/partition/bsd.rs`.
     Bsd(BsdDiskLabel),
+    /// HP-UX LVM physical volume (HP-UX 10.x / 11.x), single-disk groups only;
+    /// see `src/partition/lvm/hpux.rs`.
+    HpuxLvm(HpuxLvm),
     /// Solaris x86 — an ordinary MBR whose Solaris partition (type `0x82` /
     /// `0xBF`) nests a 16-slice VTOC in its second sector. Slice offsets are
     /// partition-relative; see `src/partition/solaris_x86.rs`.
@@ -946,6 +951,60 @@ pub fn is_known_layout(expected: &str) -> bool {
                 .any(|(a, _)| normalise_layout(a) == want))
 }
 
+/// Type-string prefix for an LV row that cannot be opened; the reason follows the colon.
+pub const LVM_UNAVAILABLE: &str = "LVM-UNAVAILABLE:";
+
+/// HP-UX LVs by number, after the LIF boot volume (row 0) when the disk has one.
+fn hpux_lvm_partitions(lvm: &HpuxLvm) -> Vec<PartitionInfo> {
+    let row = |index: usize, type_name: String, start: u64, size: u64, ts: Option<String>| {
+        PartitionInfo {
+            index,
+            type_name,
+            partition_type_byte: 0,
+            start_lba: start / 512,
+            start_byte: Some(start),
+            size_bytes: size,
+            bootable: false,
+            is_logical: false,
+            is_extended_container: false,
+            partition_type_string: ts,
+            hfs_block_size: None,
+            rdb_part_block: None,
+            drv_name: None,
+        }
+    };
+    let mut out = Vec::new();
+    if lvm.has_lif {
+        out.push(row(
+            0,
+            "LIF boot area".into(),
+            0,
+            lvm.pe_start,
+            Some("LIF".into()),
+        ));
+    }
+    for (n, lv) in &lvm.volumes {
+        let name = format!("HP-UX LVM {}", lv.name);
+        let start = lv.runs.first().map(|r| r.0).unwrap_or(lvm.pe_start);
+        let unavailable = if !lv.complete {
+            Some(format!(
+                "{LVM_UNAVAILABLE}{} has extents on another disk; only single-disk volume groups are supported",
+                lv.name
+            ))
+        } else if lv.contiguous_start().is_none() {
+            Some(format!(
+                "{LVM_UNAVAILABLE}{} is split across {} runs; fragmented LVs are not supported yet (docs/stubs.md)",
+                lv.name,
+                lv.runs.len()
+            ))
+        } else {
+            None
+        };
+        out.push(row(*n as usize, name, start, lv.size_bytes, unavailable));
+    }
+    out
+}
+
 /// Slot index given to the LIF boot-area row, past any real BSD slot letter.
 pub const BSD_LIF_ROW_INDEX: usize = 26;
 
@@ -1106,6 +1165,9 @@ impl PartitionTable {
             .map_err(RustyBackupError::Io)?;
         if let Some(label) = next::detect(reader) {
             return Ok(PartitionTable::Next(label));
+        }
+        if let Some(lvm) = HpuxLvm::detect(reader) {
+            return Ok(PartitionTable::HpuxLvm(lvm));
         }
         if let Some(label) = BsdDiskLabel::detect(reader) {
             return Ok(PartitionTable::Bsd(label));
@@ -1353,7 +1415,9 @@ impl PartitionTable {
             // No platform convention; `@DH0` is the identity users know.
             PartitionTable::Rdb(_) => Some(raw),
             // NeXTSTEP names slots by letter; the number behind `a` is 0.
-            PartitionTable::Next(_) | PartitionTable::Bsd(_) => Some(raw),
+            PartitionTable::Next(_) | PartitionTable::Bsd(_) | PartitionTable::HpuxLvm(_) => {
+                Some(raw)
+            }
             // Solaris `format(1M)` numbers slices from 0 and `index` keeps the
             // VTOC position; the MBR entries listed after them have no `sN`.
             PartitionTable::SolarisX86 { .. } => {
@@ -1375,6 +1439,7 @@ impl PartitionTable {
                 | PartitionTable::Sun(_)
                 | PartitionTable::Next(_)
                 | PartitionTable::Bsd(_)
+                | PartitionTable::HpuxLvm(_)
                 | PartitionTable::SolarisX86 { .. }
                 | PartitionTable::Rdb(_)
         )
@@ -1567,6 +1632,7 @@ impl PartitionTable {
                 })
                 .collect(),
             PartitionTable::Bsd(label) => bsd_partitions(label),
+            PartitionTable::HpuxLvm(lvm) => hpux_lvm_partitions(lvm),
             PartitionTable::SolarisX86 { mbr, label } => {
                 let mut result: Vec<PartitionInfo> = solaris_slice_partitions(label);
                 // The rest of the MBR is still a disk; its entries list after
@@ -1874,6 +1940,7 @@ impl PartitionTable {
             PartitionTable::Sun(_) => "Sun",
             PartitionTable::Next(_) => "NeXT",
             PartitionTable::Bsd(_) => "BSD",
+            PartitionTable::HpuxLvm(_) => "HP-UX LVM",
             PartitionTable::SolarisX86 { .. } => "Solaris-x86",
             PartitionTable::Ahdi(_) => "AHDI",
             PartitionTable::X68k { .. } => "X68k",
@@ -1904,6 +1971,7 @@ impl PartitionTable {
             | PartitionTable::Sun(_)
             | PartitionTable::Next(_)
             | PartitionTable::Bsd(_)
+            | PartitionTable::HpuxLvm(_)
             | PartitionTable::SolarisX86 { .. }
             | PartitionTable::Ahdi(_)
             | PartitionTable::X68k { .. }
@@ -3059,6 +3127,7 @@ mod type_name_parity {
             PartitionTable::None { .. } => 11,
             PartitionTable::Dsd { .. } => 12,
             PartitionTable::Bsd(_) => 13,
+            PartitionTable::HpuxLvm(_) => 14,
         }
     }
 
