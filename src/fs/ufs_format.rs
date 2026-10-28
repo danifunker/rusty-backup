@@ -1253,25 +1253,50 @@ mod tests {
     }
 
     #[test]
-    fn hpux_hfs_magic_reads_and_refuses_editing() {
-        // HP-UX 11.x /stand: a big-endian UFS1 stamped FS_MAGIC_LFN (0x095014) instead of 0x011954.
-        let mut img = create_blank_ufs1(&Ufs1FormatParams {
-            endian: UfsEndian::Big,
-            ..params(32 * 1024 * 1024)
-        })
-        .expect("format");
+    fn hpux_hfs_edits_with_short_ids_and_old_dirents() {
+        // HP-UX 11.x /stand: a 4.3BSD-shaped big-endian UFS1 stamped FS_MAGIC_LFN (0x095014).
+        let mut img = create_blank_ufs1(&params_43(32 * 1024 * 1024)).expect("format");
         let at = SB_OFFSET_UFS1 as usize + MAGIC_OFF;
         img[at..at + 4].copy_from_slice(&crate::fs::ufs::HPUX_MAGIC_LFN.to_be_bytes());
+        // HP's `fs_postbl` overlaps 4.4BSD's `fs_maxsymlinklen`; a positive value there is not a cutoff.
+        img[SB_OFFSET_UFS1 as usize + 0x528..][..4].copy_from_slice(&0x0044_FFFFu32.to_be_bytes());
         assert!(crate::fs::ufs::is_ufs_magic(
             [img[at], img[at + 1], img[at + 2], img[at + 3]],
             true
         ));
-        let mut fs = UfsFilesystem::open(Cursor::new(img.clone()), 0).expect("open HP-UX HFS");
-        assert!(fs.is_hpux_hfs());
+        {
+            let mut fs = UfsFilesystem::open(Cursor::new(&mut img), 0).expect("open HP-UX HFS");
+            assert!(fs.is_hpux_hfs() && fs.old_dirent_fmt());
+            assert_eq!(fs.inline_symlink_cap(), 0, "HP gets slow symlinks only");
+            let root = fs.root().expect("root");
+            let opts = crate::fs::filesystem::CreateFileOptions {
+                uid: Some(100),
+                gid: Some(20),
+                ..Default::default()
+            };
+            fs.create_file(&root, "hello.txt", &mut &b"hi"[..], 2, &opts)
+                .expect("create");
+            fs.sync_metadata().expect("sync");
+        }
+        let mut fs = UfsFilesystem::open(Cursor::new(&mut img), 0).expect("reopen");
         let root = fs.root().expect("root");
-        assert!(fs.list_directory(&root).expect("ls").is_empty());
-        let edit = crate::fs::open_editable_filesystem(Cursor::new(img), 0, 0x00, None);
-        assert!(edit.is_err(), "HP-UX HFS must stay read-only for now");
+        let e = fs
+            .list_directory(&root)
+            .expect("ls")
+            .into_iter()
+            .find(|e| e.name == "hello.txt")
+            .expect("hello.txt listed");
+        assert_eq!((e.uid, e.gid), (Some(100), Some(20)));
+        let ino = fs.read_inode(e.location as u32).expect("inode");
+        assert_eq!((ino.uid, ino.gid), (100, 20));
+        let fsck = crate::fs::ufs_fsck::fsck_ufs(&mut fs).expect("fsck");
+        // Only the primary was restamped above, so the replicas still carry the BSD magic.
+        let real: Vec<_> = fsck
+            .errors
+            .iter()
+            .filter(|i| !i.code.starts_with("ReplicaSb"))
+            .collect();
+        assert!(real.is_empty(), "{real:?}");
     }
 
     /// A volume that only reads back is not a filesystem. Writing into it and

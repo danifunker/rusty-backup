@@ -2694,13 +2694,7 @@ fn open_ufs_editable<R: Read + Write + Seek + Send>(
     reader: R,
     offset: u64,
 ) -> Result<ufs::UfsFilesystem<R>, FilesystemError> {
-    let fs = ufs::UfsFilesystem::open(reader, offset)?;
-    if fs.is_hpux_hfs() {
-        return Err(FilesystemError::Unsupported(
-            "HP-UX HFS is read-only for now (see docs/stubs.md)".into(),
-        ));
-    }
-    Ok(fs)
+    ufs::UfsFilesystem::open(reader, offset)
 }
 
 fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
