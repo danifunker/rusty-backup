@@ -204,17 +204,20 @@ pub struct InfoArgs {
 }
 
 fn run_info(args: InfoArgs) -> Result<()> {
-    let bytes =
-        std::fs::read(&args.input).with_context(|| format!("reading {}", args.input.display()))?;
-    let head = &bytes[..bytes.len().min(256)];
-    let kind = detect_container_kind(head, Some(&args.input));
-    if !is_floppy_container(kind) {
+    let head = crate::compat::read_head(&args.input, 256)
+        .with_context(|| format!("reading {}", args.input.display()))?;
+    let kind = detect_container_kind(&head, Some(&args.input));
+    let too_big =
+        std::fs::metadata(&args.input)?.len() > crate::rbformats::containers::FLOPPY_CONTAINER_MAX;
+    if !is_floppy_container(kind) || too_big {
         bail!(
             "{} is not a recognised floppy container (detected: {})",
             args.input.display(),
             kind.display_name()
         );
     }
+    let bytes =
+        std::fs::read(&args.input).with_context(|| format!("reading {}", args.input.display()))?;
     // Decode once so we can derive geometry from the flat size.
     let (flat, media) = match kind {
         ContainerKind::Xdf => crate::rbformats::containers::xdf::decode_xdf_bytes(&bytes)?,

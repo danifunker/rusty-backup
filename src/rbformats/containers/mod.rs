@@ -212,18 +212,19 @@ pub fn convert_floppy_container(
     out_path: &Path,
     target: ContainerKind,
 ) -> Result<ConvertReport> {
-    let bytes =
-        std::fs::read(in_path).with_context(|| format!("reading source {}", in_path.display()))?;
-    let head_window = bytes.len().min(256);
-    let source = detect_container_kind(&bytes[..head_window], Some(in_path));
+    let head = crate::compat::read_head(in_path, 256)
+        .with_context(|| format!("reading source {}", in_path.display()))?;
+    let source = detect_container_kind(&head, Some(in_path));
 
-    if !is_floppy_container(source) {
+    if !is_floppy_container(source) || std::fs::metadata(in_path)?.len() > FLOPPY_CONTAINER_MAX {
         anyhow::bail!(
             "input {} is not a recognised floppy container (got {})",
             in_path.display(),
             source.display_name()
         );
     }
+    let bytes =
+        std::fs::read(in_path).with_context(|| format!("reading source {}", in_path.display()))?;
     if !is_floppy_container(target) {
         anyhow::bail!(
             "target {} is not a floppy container — expected one of XDF, HDM, DIM, D88",
@@ -275,6 +276,9 @@ pub struct ConvertReport {
 
 /// True if `kind` is one of the four floppy containers handled by
 /// [`convert_floppy_container`].
+/// No floppy container is anywhere near this; a bigger file is refused before it is read whole.
+pub const FLOPPY_CONTAINER_MAX: u64 = 64 * 1024 * 1024;
+
 pub fn is_floppy_container(kind: ContainerKind) -> bool {
     matches!(
         kind,

@@ -65,13 +65,38 @@ pub fn extract_bcem(resource_fork: &[u8]) -> Option<Vec<u8>> {
 /// Reconstruct the raw disk image from an NDIF data fork and its `bcem` block
 /// map. Returns the flat image bytes (boot blocks at sector 0).
 pub fn reconstruct(data_fork: &[u8], bcem: &[u8]) -> Result<Vec<u8>> {
+    let mut out = std::io::Cursor::new(Vec::new());
+    let len = reconstruct_to(
+        &mut |off, len| {
+            data_fork
+                .get(off..off + len)
+                .map(<[u8]>::to_vec)
+                .with_context(|| {
+                    format!("NDIF: chunk data range {off}..{} out of bounds", off + len)
+                })
+        },
+        bcem,
+        &mut out,
+    )?;
+    let mut v = out.into_inner();
+    v.resize(len as usize, 0);
+    Ok(v)
+}
+
+/// [`reconstruct`] chunk by chunk into `out`: `read(off, len)` fetches stored data-fork bytes,
+/// zero chunks are skipped (so a file `out` stays sparse). Returns the image length.
+pub fn reconstruct_to<W: std::io::Write + std::io::Seek>(
+    read: &mut dyn FnMut(usize, usize) -> Result<Vec<u8>>,
+    bcem: &[u8],
+    out: &mut W,
+) -> Result<u64> {
+    use std::io::SeekFrom;
     let total_sectors = read_u32(bcem, OFF_TOTAL_SECTORS)? as u64;
     let count = read_u32(bcem, OFF_CHUNK_COUNT)? as usize;
     let image_len = total_sectors
         .checked_mul(512)
         .filter(|&n| n <= MAX_IMAGE_BYTES)
-        .with_context(|| format!("NDIF: implausible image size ({total_sectors} sectors)"))?
-        as usize;
+        .with_context(|| format!("NDIF: implausible image size ({total_sectors} sectors)"))?;
 
     // Parse the chunk table up front so each chunk knows where the next begins.
     let mut chunks = Vec::with_capacity(count);
@@ -83,7 +108,6 @@ pub fn reconstruct(data_fork: &[u8], bcem: &[u8]) -> Result<Vec<u8>> {
         chunks.push((w0 >> 8, (w0 & 0xff) as u8, w1, w2)); // (sector, type, off, len)
     }
 
-    let mut out = vec![0u8; image_len];
     for (i, &(sector, ty, off, len)) in chunks.iter().enumerate() {
         if ty == TYPE_END {
             break;
@@ -93,30 +117,22 @@ pub fn reconstruct(data_fork: &[u8], bcem: &[u8]) -> Result<Vec<u8>> {
             .map(|c| c.0)
             .unwrap_or(total_sectors as u32);
         let span = (next.saturating_sub(sector) as usize) * 512;
-        let o = sector as usize * 512;
-        if o + span > out.len() {
+        let o = u64::from(sector) * 512;
+        if o + span as u64 > image_len {
             bail!("NDIF: chunk {i} (sector {sector}) runs past the image end");
         }
         if ty == TYPE_ZERO || len == 0 {
-            continue; // already zero-filled
+            continue; // left as a hole / zero-fill
         }
-        let src = data_fork.get(off..off + len).with_context(|| {
-            format!(
-                "NDIF: chunk {i} data range {off}..{} out of bounds",
-                off + len
-            )
-        })?;
-        match ty {
-            TYPE_RAW => {
-                // Uncompressed: the stored length equals the span it covers.
-                let n = len.min(span);
-                out[o..o + n].copy_from_slice(&src[..n]);
-            }
+        let src = read(off, len).with_context(|| format!("NDIF: chunk {i}"))?;
+        let piece: Vec<u8> = match ty {
+            // Uncompressed: the stored length equals the span it covers.
+            TYPE_RAW => src[..len.min(span)].to_vec(),
             TYPE_ADC => {
-                let dec = decompress_adc(src, span)
+                let mut dec = decompress_adc(&src, span)
                     .with_context(|| format!("NDIF: ADC decompress failed for chunk {i}"))?;
-                let n = dec.len().min(span);
-                out[o..o + n].copy_from_slice(&dec[..n]);
+                dec.truncate(span);
+                dec
             }
             // Recognized-but-unimplemented codecs: report clearly instead of
             // silently misrouting the bytes to the ADC decoder. These await a
@@ -136,19 +152,14 @@ pub fn reconstruct(data_fork: &[u8], bcem: &[u8]) -> Result<Vec<u8>> {
             TYPE_STUFFIT => bail!(
                 "NDIF chunk {i} uses StuffIt compression (type 0xF0), which is not yet supported"
             ),
-            _ => {
-                // Unknown type: if the stored bytes fill the span exactly, treat
-                // it as a verbatim copy (safe); otherwise it's a codec we don't
-                // recognize and can't guess at.
-                if len == span {
-                    out[o..o + span].copy_from_slice(src);
-                } else {
-                    bail!("NDIF chunk {i} has unknown type 0x{ty:02X} (length {len}, span {span})");
-                }
-            }
-        }
+            // Unknown type: a verbatim copy only when the stored bytes fill the span exactly.
+            _ if len == span => src,
+            _ => bail!("NDIF chunk {i} has unknown type 0x{ty:02X} (length {len}, span {span})"),
+        };
+        out.seek(SeekFrom::Start(o))?;
+        out.write_all(&piece)?;
     }
-    Ok(out)
+    Ok(image_len)
 }
 
 /// Read a big-endian u32 at `off`, erroring if it runs past the slice.

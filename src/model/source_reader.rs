@@ -12,7 +12,7 @@
 //! so there is no `open_write`.
 
 use std::fs::File;
-use std::io::{BufReader, Read as _};
+use std::io::{BufReader, Read as _, Seek as _, SeekFrom};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -27,7 +27,7 @@ use crate::rbformats::containers::d88::{decode_d88_bytes, looks_like_d88_header}
 use crate::rbformats::containers::dim::{decode_dim_bytes, looks_like_dim_header};
 use crate::rbformats::containers::edsk::{decode_edsk_bytes, looks_like_edsk_header};
 use crate::rbformats::containers::g64::{decode_g64_bytes, looks_like_g64_header};
-use crate::rbformats::containers::hdf::{decode_hdf_bytes, detect_hdf_offset};
+use crate::rbformats::containers::hdf::detect_hdf_offset;
 use crate::rbformats::containers::hdm::decode_hdm_bytes;
 use crate::rbformats::containers::msa::{decode_msa_bytes, MSA_MAGIC};
 use crate::rbformats::containers::sector_order::{open_apple_ii_dsk, APPLE_II_DISK_BYTES};
@@ -1098,10 +1098,14 @@ fn open_read_dispatch(
         // to the generic open-as-File path below; the partition layer's
         // superfloppy probe finds the Disc Record at byte 0xDC0
         // unaided.
-        let bytes = std::fs::read(path).with_context(|| format!("read HDF {}", path.display()))?;
-        let flat =
-            decode_hdf_bytes(&bytes).with_context(|| format!("decode HDF {}", path.display()))?;
-        Ok(Box::new(std::io::Cursor::new(flat)))
+        // The header decides the offset; the volume itself is a window on the file, not a copy.
+        let head = crate::compat::read_head(path, 0x2000)
+            .with_context(|| format!("read HDF {}", path.display()))?;
+        let off = crate::rbformats::containers::hdf::detect_hdf_offset(&head).unwrap_or(0);
+        let file = File::open(path).with_context(|| format!("open HDF {}", path.display()))?;
+        Ok(Box::new(
+            crate::rbformats::payload_slice::PayloadSlice::tail(file, off as u64),
+        ))
     } else if is_msa_path(path) {
         // MSA is a small floppy container (≤ 1.5 MiB raw); decoding into
         // memory and wrapping in a Cursor is simpler than a streaming reader
@@ -1154,14 +1158,14 @@ fn open_read_dispatch(
         // flat image stream — a Lisa disk becomes DiskCopy 4.2 *with* tags,
         // everything else its block data.
         Ok(Box::new(std::io::Cursor::new(image)))
-    } else if let Some(image) = try_open_ndif_carrier(path) {
+    } else if let Some(image) = try_open_ndif_carrier(path).map(BufReader::new) {
         // Self-mounting image / NDIF disk image delivered through a fork carrier
         // (MacBinary `.smi.bin`, AppleDouble sidecar, or a native resource fork):
         // the raw disk lives across both forks — data-fork chunks described by a
         // `bcem` block map in the resource fork. Reconstruct it to a flat image
         // so it opens like any other disk. Gated on the presence of `bcem`, so a
         // plain `.bin` raw image never triggers this.
-        Ok(Box::new(std::io::Cursor::new(image)))
+        Ok(Box::new(image))
     } else {
         // Apple Twiggy / FileWare .dc42: the two sides are stored sequentially,
         // so the MFS/HFS volume is the data region rotated by one side.
@@ -1198,48 +1202,63 @@ fn open_read_dispatch(
 /// files reach us as a MacBinary `.smi.bin`, an AppleDouble `._name` sidecar
 /// pair, or (on macOS) a native resource fork. Returns the flat image only when
 /// a `bcem` resource is present, so a plain `.bin` raw image is never hijacked.
-fn try_open_ndif_carrier(path: &Path) -> Option<Vec<u8>> {
+fn try_open_ndif_carrier(path: &Path) -> Option<File> {
     use crate::fs::resource_fork::{detect_resource_fork, parse_macbinary};
     use crate::rbformats::ndif;
 
     // Cheap gate: peek the 128-byte MacBinary header before reading a whole
     // (possibly multi-GB) file. If it's not MacBinary, fall back to the
     // sidecar/native probe, which only touches small companion files.
-    let head = {
-        let mut f = File::open(path).ok()?;
-        let mut buf = [0u8; 128];
-        use std::io::Read as _;
-        match f.read_exact(&mut buf) {
-            Ok(()) => Some(buf),
-            Err(_) => None,
-        }
-    };
-
-    if let Some(head) = head {
-        if crate::macarchive::macbinary::is_macbinary(&head).is_some() {
-            if let Ok(bytes) = std::fs::read(path) {
-                if let Some(rf) = parse_macbinary(&bytes) {
-                    if let Some(bcem) = ndif::extract_bcem(&rf.data) {
-                        let data = rf.data_fork.unwrap_or_default();
-                        return ndif::reconstruct(&data, &bcem).ok();
-                    }
+    let head = crate::compat::read_head(path, 128).ok()?;
+    // MacBinary forks are capped at 8 MiB, so that carrier is read whole; the image is not.
+    if head.len() == 128 && crate::macarchive::macbinary::is_macbinary(&head).is_some() {
+        if let Ok(bytes) = std::fs::read(path) {
+            if let Some(rf) = parse_macbinary(&bytes) {
+                if let Some(bcem) = ndif::extract_bcem(&rf.data) {
+                    let data = rf.data_fork.unwrap_or_default();
+                    return ndif_to_tempfile(&bcem, &mut |off, len| {
+                        data.get(off..off + len)
+                            .map(<[u8]>::to_vec)
+                            .context("NDIF: chunk past the data fork")
+                    });
                 }
             }
         }
     }
 
     // AppleDouble sidecar / native resource fork: the resource fork lives beside
-    // (or within) the file, the data fork is the file's own bytes.
+    // (or within) the file, the data fork is the file's own bytes, read per chunk.
     if let Some(rf) = detect_resource_fork(path) {
         if let Some(bcem) = ndif::extract_bcem(&rf.data) {
-            let data = rf
-                .data_fork
-                .or_else(|| std::fs::read(path).ok())
-                .unwrap_or_default();
-            return ndif::reconstruct(&data, &bcem).ok();
+            if let Some(data) = rf.data_fork {
+                return ndif_to_tempfile(&bcem, &mut |off, len| {
+                    data.get(off..off + len)
+                        .map(<[u8]>::to_vec)
+                        .context("NDIF: chunk past the data fork")
+                });
+            }
+            let mut f = File::open(path).ok()?;
+            return ndif_to_tempfile(&bcem, &mut |off, len| {
+                let mut buf = vec![0u8; len];
+                f.seek(SeekFrom::Start(off as u64))?;
+                f.read_exact(&mut buf)?;
+                Ok(buf)
+            });
         }
     }
     None
+}
+
+/// Rebuild an NDIF image into an anonymous, sparse temp file rather than memory.
+fn ndif_to_tempfile(
+    bcem: &[u8],
+    read: &mut dyn FnMut(usize, usize) -> Result<Vec<u8>>,
+) -> Option<File> {
+    let mut f = tempfile::tempfile().ok()?;
+    let len = crate::rbformats::ndif::reconstruct_to(read, bcem, &mut f).ok()?;
+    f.set_len(len).ok()?;
+    f.seek(SeekFrom::Start(0)).ok()?;
+    Some(f)
 }
 
 /// Content-detect a DART image and, if so, decode it into a flat image stream.
@@ -1341,7 +1360,7 @@ pub fn open_peeled_read_with_entry(
     // native resource fork): reconstruct the raw disk from both forks. Gated on
     // a `bcem` resource, so a plain `.bin` raw image is never affected.
     if let Some(image) = try_open_ndif_carrier(path) {
-        return Ok(Box::new(std::io::Cursor::new(image)));
+        return Ok(Box::new(BufReader::new(image)));
     }
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
     match detect_image_format_with_path(file, Some(path)) {
@@ -1598,6 +1617,21 @@ pub fn is_container_path(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arculator_hdf_opens_as_a_window_past_its_header() {
+        let bare = crate::rbformats::containers::hdf::tests::build_bare_adfs();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("disk.hdf");
+        let mut wrapped = vec![0u8; 512];
+        wrapped.extend_from_slice(&bare);
+        std::fs::write(&path, &wrapped).unwrap();
+        let mut r = open_read(&path).unwrap();
+        let mut got = Vec::new();
+        r.read_to_end(&mut got).unwrap();
+        assert_eq!(got, bare);
+        assert_eq!(r.seek(SeekFrom::End(0)).unwrap(), bare.len() as u64);
+    }
     use std::io::{Read, Seek, SeekFrom, Write};
 
     fn gz(data: &[u8]) -> Vec<u8> {

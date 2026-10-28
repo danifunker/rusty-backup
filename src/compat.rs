@@ -98,3 +98,13 @@ pub fn write_sparse_parts(
     f.set_len(total_len)?;
     f.sync_all()
 }
+
+/// Up to the first `n` bytes of `path`, for sniffing a header without reading the whole file.
+pub fn read_head(path: &std::path::Path, n: usize) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut buf = Vec::with_capacity(n);
+    std::fs::File::open(path)?
+        .take(n as u64)
+        .read_to_end(&mut buf)?;
+    Ok(buf)
+}

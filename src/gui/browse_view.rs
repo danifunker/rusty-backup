@@ -3788,6 +3788,19 @@ impl BrowseView {
         host_path: &std::path::Path,
         parent: &FileEntry,
     ) -> bool {
+        // Detection needs the whole file; past 64 MiB only a Mac-archive extension earns that read.
+        let size = std::fs::metadata(host_path).map(|m| m.len()).unwrap_or(0);
+        let named_archive = host_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| {
+                rusty_backup::model::file_types::MAC_ARCHIVE_EXTS
+                    .iter()
+                    .any(|a| a.eq_ignore_ascii_case(e))
+            });
+        if size > rusty_backup::fs::mem_archive::INLINE_MAX && !named_archive {
+            return false;
+        }
         let raw = match std::fs::read(host_path) {
             Ok(bytes) => bytes,
             Err(_) => return false,

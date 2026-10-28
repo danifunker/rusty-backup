@@ -242,10 +242,12 @@ impl BrowseSession {
         // Dwarf Draco 6085 ".zdisk"/".zdelta" is a zlib stream (a Pilot pack);
         // gate the full read on the zlib magic byte, then confirm by inflating
         // the prefix to the DAAD signature so we don't slurp unrelated files.
-        let zdisk_bytes = if magic[0] == 0x78 {
-            std::fs::read(path)
-                .ok()
-                .filter(|b| crate::fs::alto::zdisk::is_zdisk(b))
+        // is_zdisk inflates only a 2-byte prefix, so a 64 KiB head decides; read whole only on a match.
+        let zdisk_bytes = if magic[0] == 0x78
+            && crate::compat::read_head(path, 64 * 1024)
+                .is_ok_and(|h| crate::fs::alto::zdisk::is_zdisk(&h))
+        {
+            std::fs::read(path).ok()
         } else {
             None
         };
@@ -705,9 +707,8 @@ impl BrowseSession {
                 .unwrap_or(false);
             // Dwarf Draco 6085 ".zdisk" (a Pilot pack); see open() for the gating.
             let is_zdisk = magic[0] == 0x78
-                && std::fs::read(path)
-                    .map(|b| crate::fs::alto::zdisk::is_zdisk(&b))
-                    .unwrap_or(false);
+                && crate::compat::read_head(path, 64 * 1024)
+                    .is_ok_and(|h| crate::fs::alto::zdisk::is_zdisk(&h));
             if &magic == b"PARCDISK"
                 || magic[0..6] == [0x00, 0x07, 0x00, 0x03, 0x00, 0x0a]
                 || is_salto_dsk
