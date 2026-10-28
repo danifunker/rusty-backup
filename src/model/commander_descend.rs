@@ -257,7 +257,7 @@ pub fn open_optical(_path: &Path, _label: Option<String>) -> Result<Box<dyn File
 pub struct OpticalFsChoice {
     /// Display label for the pane's filesystem picker (e.g. `RETRO (ISO 9660)`).
     pub label: String,
-    /// `None` = the primary filesystem; `Some(i)` = `hybrid_filesystems[i]`.
+    /// `None` = the primary; `Some(i)` = `hybrid_filesystems[i]`, then boot areas past them.
     pub hybrid_index: Option<usize>,
 }
 
@@ -303,6 +303,16 @@ pub fn optical_filesystems(path: &Path) -> Vec<OpticalFsChoice> {
             hybrid_index: Some(i),
         });
     }
+    let hybrids = info.hybrid_filesystems.len();
+    for (j, area) in crate::optical::boot_area::detect(path)
+        .into_iter()
+        .enumerate()
+    {
+        choices.push(OpticalFsChoice {
+            label: area.label,
+            hybrid_index: Some(hybrids + j),
+        });
+    }
     choices
 }
 
@@ -326,6 +336,21 @@ pub fn open_optical_hybrid(
     use opticaldiscs::detect::DiscImageInfo;
     let info = DiscImageInfo::open(path)
         .map_err(|e| anyhow::anyhow!("open disc image {}: {e:#}", path.display()))?;
+    // Indices past the hybrid volumes are boot areas (see `optical_filesystems`).
+    if let Some(area) = index
+        .checked_sub(info.hybrid_filesystems.len())
+        .and_then(|i| crate::optical::boot_area::detect(path).into_iter().nth(i))
+    {
+        let inner = crate::optical::boot_area::open(path, &area)
+            .map_err(|e| anyhow::anyhow!("open boot area: {e}"))?;
+        let fs = crate::fs::optical_fs::OpticalFilesystem::from_inner(
+            inner,
+            area.label.clone(),
+            label.or(Some(area.label)),
+        )
+        .map_err(|e| anyhow::anyhow!("wrap boot area: {e}"))?;
+        return Ok(Box::new(fs));
+    }
     let ty = info
         .hybrid_filesystems
         .get(index)

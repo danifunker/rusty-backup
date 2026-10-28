@@ -10,6 +10,7 @@ use opticaldiscs::detect::DiscImageInfo;
 use opticaldiscs::formats::FilesystemType;
 
 use crate::fs::resource_fork::{self, ResourceForkMode};
+use crate::optical::boot_area::{self, BootArea};
 
 /// Display order for a disc listing: directories first, then files, each
 /// case-insensitive by name. `opticaldiscs` has its own `FileEntry`, so this
@@ -48,8 +49,10 @@ pub struct OpticalDiscBrowseView {
     physical: bool,
     /// Selected filesystem on a hybrid disc: `0` = the primary, `N` =
     /// `disc_info.hybrid_filesystems[N - 1]` (the Mac HFS side). Always `0` for
-    /// an ordinary single-filesystem disc.
+    /// an ordinary single-filesystem disc. Boot areas follow the hybrids.
     selected_fs: usize,
+    /// HP LIF / PReP boot areas on a plain ISO, offered after the hybrid filesystems.
+    boot_areas: Vec<BootArea>,
     root: Option<FileEntry>,
     directory_cache: HashMap<String, Vec<FileEntry>>,
     expanded_paths: HashSet<String>,
@@ -91,6 +94,7 @@ impl Default for OpticalDiscBrowseView {
             disc_info: None,
             physical: false,
             selected_fs: 0,
+            boot_areas: Vec::new(),
             root: None,
             directory_cache: HashMap::new(),
             expanded_paths: HashSet::new(),
@@ -190,6 +194,9 @@ impl OpticalDiscBrowseView {
                         self.active = true;
                     }
                 }
+                if !physical {
+                    self.boot_areas = boot_area::detect(path);
+                }
                 self.disc_info = Some(info);
             }
             Err(e) => {
@@ -204,6 +211,7 @@ impl OpticalDiscBrowseView {
         self.physical = false;
         self.disc_info = None;
         self.selected_fs = 0;
+        self.boot_areas.clear();
         self.root = None;
         self.directory_cache.clear();
         self.expanded_paths.clear();
@@ -230,20 +238,17 @@ impl OpticalDiscBrowseView {
             .disc_info
             .as_ref()
             .ok_or_else(|| FilesystemError::Parse("no disc info available".into()))?;
-        if self.physical {
-            // A drive has no hybrid-filesystem selection to honour: the device
-            // reader always presents the primary volume.
-            let path = self
-                .disc_path
-                .as_ref()
-                .ok_or_else(|| FilesystemError::Parse("no device path available".into()))?;
-            return opticaldiscs::browse::open_physical_filesystem(path);
-        }
-        if self.selected_fs == 0 {
-            open_disc_filesystem(info)
-        } else {
-            open_hybrid_filesystem(info, self.selected_fs - 1)
-        }
+        let path = self
+            .disc_path
+            .as_ref()
+            .ok_or_else(|| FilesystemError::Parse("no disc path available".into()))?;
+        open_choice(
+            info,
+            path,
+            self.physical,
+            self.selected_fs,
+            &self.boot_areas,
+        )
     }
 
     /// The [`FilesystemType`] currently selected for browsing (primary or, on a
@@ -253,6 +258,7 @@ impl OpticalDiscBrowseView {
         if self.selected_fs == 0 {
             Some(info.filesystem)
         } else {
+            // A boot area index runs past the hybrids and has no FilesystemType.
             info.hybrid_filesystems
                 .get(self.selected_fs - 1)
                 .map(|h| h.filesystem)
@@ -319,6 +325,8 @@ impl OpticalDiscBrowseView {
                 Some(l) => format!("{name} ({l})"),
                 None => name.to_string(),
             }
+        } else if let Some(a) = self.boot_areas.get(idx - 1 - info.hybrid_filesystems.len()) {
+            a.label.clone()
         } else {
             "?".into()
         }
@@ -337,7 +345,7 @@ impl OpticalDiscBrowseView {
         let num_choices = self
             .disc_info
             .as_ref()
-            .map(|i| 1 + i.hybrid_filesystems.len())
+            .map(|i| 1 + i.hybrid_filesystems.len() + self.boot_areas.len())
             .unwrap_or(0);
         let choice_labels: Vec<String> =
             (0..num_choices).map(|i| self.fs_choice_label(i)).collect();
@@ -950,6 +958,8 @@ impl OpticalDiscBrowseView {
         // same device-vs-file distinction the UI thread makes — a file-based
         // re-open of a drive is EBUSY while the disc is mounted.
         let physical = self.physical;
+        let selected = self.selected_fs;
+        let boot_areas = self.boot_areas.clone();
 
         let progress = Arc::new(Mutex::new(ExtractionProgress {
             current_bytes: 0,
@@ -973,13 +983,8 @@ impl OpticalDiscBrowseView {
                 } else {
                     DiscImageInfo::open(&disc_path)?
                 };
-                let reopen = || {
-                    if physical {
-                        opticaldiscs::browse::open_physical_filesystem(&disc_path)
-                    } else {
-                        open_disc_filesystem(&info)
-                    }
-                };
+                // Reopen what the picker shows, not always the primary.
+                let reopen = || open_choice(&info, &disc_path, physical, selected, &boot_areas);
 
                 // Count files and bytes for progress
                 let mut counting_fs = reopen()?;
@@ -1376,6 +1381,29 @@ fn render_hex_view(ui: &mut egui::Ui, data: &[u8]) {
             .desired_width(f32::INFINITY)
             .font(egui::TextStyle::Monospace),
     );
+}
+
+/// Open picker choice `selected`: 0 the primary, then the hybrid volumes, then the boot areas.
+fn open_choice(
+    info: &DiscImageInfo,
+    disc_path: &Path,
+    physical: bool,
+    selected: usize,
+    boot_areas: &[BootArea],
+) -> Result<Box<dyn Filesystem>, FilesystemError> {
+    if physical {
+        // A drive always presents its primary volume.
+        return opticaldiscs::browse::open_physical_filesystem(disc_path);
+    }
+    let hybrids = info.hybrid_filesystems.len();
+    match selected {
+        0 => open_disc_filesystem(info),
+        i if i <= hybrids => open_hybrid_filesystem(info, i - 1),
+        i => match boot_areas.get(i - 1 - hybrids) {
+            Some(area) => boot_area::open(disc_path, area),
+            None => Err(FilesystemError::NotFound(format!("filesystem choice {i}"))),
+        },
+    }
 }
 
 #[cfg(test)]

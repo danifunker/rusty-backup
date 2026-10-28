@@ -140,7 +140,25 @@ erases nodes):
 | 1.2 | RDB: when the declared DosType's magic check fails, sniff the content (HFS `LK` + `BD`@1024, FAT, ...) and open that instead; label it e.g. `HFS (ShapeShifter, declared PFS\3)`. Fixture: `Mac-4G.hdf` | S |
 | 1.3 | Inspect browse view: "Open as disk image" on a file row, reusing `model::commander_descend` (already does this for Commander panes). Stream through the parent filesystem instead of materialising 2 GB to a temp file, since root disk space is tight. Check `.dsk` routes by content, not as an Apple II DSK. Fixture: `SS-5G.hdf` -> `CH1.dsk` | M |
 
-### Phase 1b: every filesystem on every ISO (#91)
+### Phase 1b: every filesystem on every ISO (#91) — **done 2026-10-28**
+
+- `fs::lif`: an HP LIF reader (volume header and directory, BCD dates, aliased
+  extents), plus a read-only `LifFilesystem` that Phase 2 reuses for disks.
+- `optical::boot_area`: on a plain `.iso`, the LIF volume and any MBR type-`0x41`
+  PReP partition are detected and opened as `opticaldiscs` filesystems. They are
+  offered after the hybrid volumes in the Optical tab's picker, Commander
+  (`optical_filesystems` / `open_optical_hybrid`, so the TUI gets them too) and
+  `rb-cli optical browse|extract|du --filesystem lif|prep`; `optical info` lists them.
+- MBR type names: `0x41` PReP boot, `0x96` CHRP ISO-9660 (fixes the "Unknown"
+  rows on the AIX diagnostics CD and `rs6karc151.img`).
+- Fixed on the way: the Optical tab's Extract always reopened the *primary*
+  filesystem, so extracting from the HFS side of a hybrid disc was broken. It now
+  reopens the picked one.
+- Verified by byte-comparing one file per disc against `7z`, and LIF `ISL` against
+  a raw read of its extent. Five ISOs and two RS/6000 floppies catalogued, with
+  cases in `regression-tests/cases/tier2/read-to-fix-add-isos.toml`.
+- Still to come from 2.1 / 3.1: LIF and the IBM IPL record on *disks*, in Phases 2 and 3.
+
 
 ISO 9660 + Rock Ridge already browse on all five ISOs. What each disc also carries:
 
@@ -218,6 +236,13 @@ those names instead.
 3. **2.4 + 2.5**: closes #90.
 4. **3.2, then 3.4 or 3.3**: closes #91. JFS1 is the long pole.
 5. **Phase 4** whenever tapes matter.
+
+**Testing cadence:** run targeted regression suites during regular development:
+unit tests for the touched module, `rb-regress run --filter` for the touched
+fixtures, and a direct `rb-cli` check on the real image. Only run the full
+regression suite when asked. Suggest it, with a time estimate (about 95 min in a
+debug build), after major changes such as a new driver or partition scheme, or
+the end of a phase.
 
 All new drivers start **read-only** (browse, extract, backup, inspect). Edit
 support, fsck repair and resize for VxFS / JFS1 / the LVMs are separate,

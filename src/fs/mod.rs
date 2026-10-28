@@ -65,6 +65,7 @@ pub mod import_sink;
 pub mod jfs;
 pub mod jfs_fsck;
 pub mod layout_preserving;
+pub mod lif;
 pub mod lisa;
 pub mod mac_alias;
 pub mod mac_archive_import;

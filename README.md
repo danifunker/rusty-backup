@@ -705,6 +705,8 @@ a bare `.iso` is auto-detected by magic).
 | GameCube / Wii | Nintendo GameCube (GCM/FST) and Wii discs. Wii encrypted partitions are decrypted internally — no key file required. Read via the `nod` crate, including the compressed `.rvz` / `.wbfs` / `.ciso` / `.gcz` / `.wia` containers. |
 | CD-i | Philips CD-i (Green Book) discs — big-endian ISO 9660 variant. |
 | 3DO Opera | Panasonic / 3DO game discs (big-endian block tree). |
+| HP LIF boot area | HP-UX and NetBSD/hppa install CDs / DVDs: the LIF volume before the ISO (`ISL`, `HPUX`, `CDBOOT`, ...), offered as an extra filesystem (`--filesystem lif`, the Optical tab's picker, Commander). Plain `.iso` only. |
+| PReP boot partition | PowerPC CDs (AIX CHRP diagnostics, OS/2 Warp for PowerPC): the MBR's type-`0x41` boot image as one file (`--filesystem prep`). Plain `.iso` only. |
 
 Game discs also carry a **console / serial / title / region** identity line
 (shown in the Optical tab, the browse header, and `rb-cli optical browse`),

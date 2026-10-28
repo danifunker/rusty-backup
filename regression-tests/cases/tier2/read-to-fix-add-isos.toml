@@ -1,0 +1,116 @@
+# Tier 2 — the to-fix-add CDs and RS/6000 floppies (issues #90, #91, Phase 1b):
+# every filesystem on every disc must be readable.
+#
+#   optical.iso.hpux1111-tcoe.cd   HP-UX 11.11 install DVD. ISO 9660 + Rock Ridge,
+#                                  plus an HP LIF boot area at byte 0 (ISL10) whose
+#                                  15 files include aliases over one extent.
+#   optical.iso.netbsd11-hppa.cd   NetBSD/hppa: LIF boot area (MKBOOT -> CDBOOT).
+#   optical.iso.aix-chrp-diag.cd   AIX CHRP diagnostics: IBM IPL record, MBR with a
+#                                  0x96 CHRP-ISO entry and a 0x41 PReP boot entry.
+#   optical.iso.os2-warp-ppc.cd    OS/2 Warp for PowerPC: 0x41 PReP boot partition.
+#   optical.iso.aix433-bonus.cd    AIX bonus pack: plain ISO 9660 + Rock Ridge.
+#
+# The LIF and PReP areas surface as extra selectable filesystems (`--filesystem
+# lif|prep`, the Optical tab's picker, Commander). File bytes were cross-checked
+# against 7z for one file per disc when these cases were written; LIF ISL against
+# a raw read of its extent.
+#
+# The HP-UX DVD holds 74064 files; walking it all is not a tier-2 step.
+
+[meta]
+tier = 2
+group = "optical.read.to-fix-add"
+description = "Every filesystem on the to-fix-add ISOs: ISO 9660 / Rock Ridge, HP LIF and PReP boot areas."
+
+[[case]]
+id = "read.optical.hpux1111-lif"
+description = "HP-UX 11.11 DVD: ISO 9660 plus the LIF boot area, listed and browsable."
+fixture = "optical.iso.hpux1111-tcoe.cd"
+[[case.step]]
+args = ["optical", "info", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["Filesystems: iso9660, lif", "LIF boot area (ISL10)", "ISL, AUTO, INDEX, CONFIG, HPUX"]
+[[case.step]]
+args = ["optical", "browse", "--filesystem", "lif", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["ISL", "HPUX", "INSTALLFS", "WINSTALLFS", "15 files"]
+
+[[case]]
+id = "read.optical.netbsd11-hppa-lif"
+description = "NetBSD/hppa CD: ISO 9660 + Rock Ridge tree, and CDBOOT in the LIF boot area."
+fixture = "optical.iso.netbsd11-hppa.cd"
+[[case.step]]
+args = ["optical", "info", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["Filesystems: iso9660, lif", "LIF boot area (MKBOOT): CDBOOT"]
+[[case.step]]
+args = ["optical", "browse", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["hppa", "netbsd-GENERIC.gz", "MD5"]
+[[case.step]]
+args = ["optical", "browse", "--filesystem", "lif", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["CDBOOT", "22.0 KiB"]
+
+[[case]]
+id = "read.optical.aix-chrp-diag-prep"
+description = "AIX CHRP diagnostics CD: Rock Ridge tree plus the PReP boot partition as one file."
+fixture = "optical.iso.aix-chrp-diag.cd"
+[[case.step]]
+args = ["optical", "info", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["Filesystems: iso9660, prep", "PReP boot partition: prep-boot-1.img"]
+[[case.step]]
+args = ["optical", "browse", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["bootinfo.txt", "objrepos", "CDiagAtt"]
+[[case.step]]
+args = ["optical", "browse", "--filesystem", "prep", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["prep-boot-1.img", "3.3 MiB"]
+
+[[case]]
+id = "read.optical.os2-warp-ppc-prep"
+description = "OS/2 Warp for PowerPC: plain ISO 9660 tree plus the PReP boot partition."
+fixture = "optical.iso.os2-warp-ppc.cd"
+[[case.step]]
+args = ["optical", "info", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["Filesystems: iso9660, prep"]
+[[case.step]]
+args = ["optical", "browse", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["BOOT.CFG", "CPMSG.MSG"]
+[[case.step]]
+args = ["optical", "browse", "--filesystem", "prep", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["prep-boot-1.img", "719.5 KiB"]
+
+[[case]]
+id = "read.optical.aix433-bonus"
+description = "AIX 4.3.3 bonus pack: Rock Ridge names (lower case) over installp images."
+fixture = "optical.iso.aix433-bonus.cd"
+[[case.step]]
+args = ["optical", "browse", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["inst.images", "bos43.adt.lib.1", ".toc"]
+stdout_not_contains = ["BOS43.ADT"]
+
+[[case]]
+id = "read.fat.rs6000-sms-floppy"
+description = "RS/6000 System Management Services diskette: FAT12."
+fixture = "fs.fat.rs6000-sms.floppy"
+[[case.step]]
+args = ["ls", "{fixture}", "/"]
+expect_exit = 0
+stdout_contains = ["DIAGS.6XE", "BBL.6DG"]
+
+[[case]]
+id = "read.mbr.rs6000-prep-floppy"
+description = "RS/6000 diskette whose only partition is a PReP boot image: labelled, not Unknown."
+fixture = "part.mbr.rs6000-prep.floppy"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["PReP boot"]
+stdout_not_contains = ["Unknown"]

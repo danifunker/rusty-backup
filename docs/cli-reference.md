@@ -1424,7 +1424,7 @@ Usage: browse [OPTIONS] <SOURCE>
 
 - `--format` — Output format. `text` (default) prints the human file tree unchanged; `json` / `yaml` emit a machine-readable, deterministically path-sorted listing
 - `--hash` — Per-file content hash to attach to each file entry. Structured output only (`--format json`). Currently only `sha256`
-- `--filesystem` — Which filesystem to browse on a hybrid Mac/PC disc. `auto` (default) opens the primary (ISO 9660); `hfs` opens the Apple HFS side; `iso` forces the ISO 9660 tree. See `optical info` to see what a disc carries
+- `--filesystem` — Which filesystem to browse on a hybrid Mac/PC disc. `auto` (default) opens the primary (ISO 9660); `hfs` opens the Apple HFS side; `iso` forces the ISO 9660 tree; `lif` / `prep` open an HP LIF or PowerPC PReP boot area. See `optical info` to see what a disc carries
 - `--filesystem-index` — Which filesystem to open when a disc carries more than one of the same kind — Apple shipped CD-ROMs with two HFS volumes. 0-based, indexing the list `optical info` prints. Overrides `--filesystem`
 
 ### `optical convert`
