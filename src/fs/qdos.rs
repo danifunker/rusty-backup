@@ -318,23 +318,43 @@ impl<R: Read + Seek + Send> QdosFilesystem<R> {
         first_cluster: u16,
         len: usize,
     ) -> Result<Vec<u8>, FilesystemError> {
-        let chain = self.chain(first_cluster)?;
-        let cluster_size = self.header.cluster_size() as usize;
         let mut buf = Vec::with_capacity(len);
-        let mut remaining = len;
+        self.copy_chain_bytes(first_cluster, 0, len as u64, &mut buf)?;
+        Ok(buf)
+    }
+
+    /// Stream the `len` bytes after the chain's first `skip` bytes into `w`.
+    /// Emits nothing if the chain ends inside the skipped prefix, so a short file reads as empty.
+    fn copy_chain_bytes(
+        &mut self,
+        first_cluster: u16,
+        skip: u64,
+        len: u64,
+        w: &mut dyn Write,
+    ) -> Result<u64, FilesystemError> {
+        let chain = self.chain(first_cluster)?;
+        let cluster_size = self.header.cluster_size();
+        let total = skip.saturating_add(len);
+        let mut chunk = vec![0u8; cluster_size as usize];
+        let mut pos = 0u64;
+        let mut written = 0u64;
         for cluster in chain {
-            if remaining == 0 {
+            if pos >= total {
                 break;
             }
-            let want = cluster_size.min(remaining);
+            let want = cluster_size.min(total - pos) as usize;
             let off = self.cluster_byte_offset(cluster);
             self.reader.seek(SeekFrom::Start(off))?;
-            let mut chunk = vec![0u8; want];
-            self.reader.read_exact(&mut chunk)?;
-            buf.extend_from_slice(&chunk);
-            remaining = remaining.saturating_sub(want);
+            self.reader.read_exact(&mut chunk[..want])?;
+            let end = pos + want as u64;
+            if end > skip {
+                let from = skip.saturating_sub(pos) as usize;
+                w.write_all(&chunk[from..want])?;
+                written += (want - from) as u64;
+            }
+            pos = end;
         }
-        Ok(buf)
+        Ok(written)
     }
 
     fn read_directory(&mut self) -> Result<Vec<QdosDirEntry>, FilesystemError> {
@@ -395,13 +415,28 @@ impl<R: Read + Seek + Send> Filesystem for QdosFilesystem<R> {
         // Skip the 64-byte per-file header and return user data only,
         // matching sQLux semantics. `entry.size` was already adjusted in
         // `list_directory` to the user-visible length.
-        let first = entry.location as u16;
         let want = (entry.size as usize).min(max_bytes);
-        let raw = self.read_chain_bytes(first, FILE_HEADER_BYTES + want)?;
-        if raw.len() < FILE_HEADER_BYTES {
-            return Ok(Vec::new());
-        }
-        Ok(raw[FILE_HEADER_BYTES..].to_vec())
+        let mut out = Vec::with_capacity(want);
+        self.copy_chain_bytes(
+            entry.location as u16,
+            FILE_HEADER_BYTES as u64,
+            want as u64,
+            &mut out,
+        )?;
+        Ok(out)
+    }
+
+    fn write_file_to(
+        &mut self,
+        entry: &FileEntry,
+        writer: &mut dyn Write,
+    ) -> Result<u64, FilesystemError> {
+        self.copy_chain_bytes(
+            entry.location as u16,
+            FILE_HEADER_BYTES as u64,
+            entry.size,
+            writer,
+        )
     }
 
     fn validate_name(&self, name: &str) -> Result<(), FilesystemError> {

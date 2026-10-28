@@ -17,7 +17,7 @@
 //! - Further extents live in extent blocks: `{next, prev, u8 count, 3 spare, u32
 //!   blocks, 60 x {block, count}, "IamXblk\0", first}`.
 
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 use super::entry::FileEntry;
 use super::filesystem::{Filesystem, FilesystemError};
@@ -32,6 +32,7 @@ const S_IFDIR: u16 = 0o040000;
 const S_IFLNK: u16 = 0o120000;
 const XBLK_SIG: &[u8; 8] = b"IamXblk\0";
 const MAX_XBLKS: usize = 1 << 16;
+const CHUNK: usize = 64 * 1024;
 
 fn le32(b: &[u8], o: usize) -> u32 {
     u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
@@ -141,21 +142,43 @@ impl<R: Read + Seek + Send> Qnx4Filesystem<R> {
     }
 
     fn read_data(&mut self, inode: &Inode, max: usize) -> Result<Vec<u8>, FilesystemError> {
-        let want = (inode.size as usize).min(max);
-        let mut out = Vec::with_capacity(want);
+        let mut out = Vec::with_capacity((inode.size as usize).min(max));
+        self.copy_data(inode, max as u64, &mut out)?;
+        Ok(out)
+    }
+
+    /// Stream up to `max` bytes of `inode` into `w` in bounded chunks; bytes past the last extent are zeros.
+    fn copy_data(
+        &mut self,
+        inode: &Inode,
+        max: u64,
+        w: &mut dyn Write,
+    ) -> Result<u64, FilesystemError> {
+        let want = inode.size.min(max);
+        let mut buf = vec![0u8; CHUNK];
+        let mut done = 0u64;
         for (start, len) in self.extents(inode)? {
-            if out.len() >= want {
+            if done >= want {
                 break;
             }
-            let take = ((len * BLOCK) as usize).min(want - out.len());
-            let at = out.len();
-            out.resize(at + take, 0);
+            let mut left = (len * BLOCK).min(want - done);
             self.reader
                 .seek(SeekFrom::Start(self.offset + start * BLOCK))?;
-            self.reader.read_exact(&mut out[at..])?;
+            while left > 0 {
+                let n = (CHUNK as u64).min(left) as usize;
+                self.reader.read_exact(&mut buf[..n])?;
+                w.write_all(&buf[..n])?;
+                left -= n as u64;
+                done += n as u64;
+            }
         }
-        out.resize(want, 0);
-        Ok(out)
+        buf.fill(0);
+        while done < want {
+            let n = (CHUNK as u64).min(want - done) as usize;
+            w.write_all(&buf[..n])?;
+            done += n as u64;
+        }
+        Ok(done)
     }
 
     /// `(name, inode, location)` for every live entry of `dir`; the location is
@@ -247,6 +270,15 @@ impl<R: Read + Seek + Send> Filesystem for Qnx4Filesystem<R> {
     fn read_file(&mut self, entry: &FileEntry, max: usize) -> Result<Vec<u8>, FilesystemError> {
         let inode = self.inode_at(entry.location)?;
         self.read_data(&inode, max)
+    }
+
+    fn write_file_to(
+        &mut self,
+        entry: &FileEntry,
+        writer: &mut dyn Write,
+    ) -> Result<u64, FilesystemError> {
+        let inode = self.inode_at(entry.location)?;
+        self.copy_data(&inode, u64::MAX, writer)
     }
 
     fn volume_label(&self) -> Option<&str> {

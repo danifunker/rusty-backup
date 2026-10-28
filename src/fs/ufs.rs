@@ -1325,25 +1325,39 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
         file_size: u64,
         max_bytes: usize,
     ) -> Result<Vec<u8>, FilesystemError> {
-        let total = (file_size as usize).min(max_bytes);
-        let mut out = Vec::with_capacity(total);
+        let mut out = Vec::with_capacity((file_size as usize).min(max_bytes));
+        self.copy_inode_data(inode, file_size, max_bytes as u64, &mut out)?;
+        Ok(out)
+    }
+
+    /// Stream up to `min(file_size, max_bytes)` bytes of an inode's data into `w`, one block
+    /// at a time; holes are written as zeros.
+    pub(crate) fn copy_inode_data(
+        &mut self,
+        inode: &UfsInode,
+        file_size: u64,
+        max_bytes: u64,
+        w: &mut dyn Write,
+    ) -> Result<u64, FilesystemError> {
+        let total = file_size.min(max_bytes);
+        let mut buf = vec![0u8; self.bsize as usize];
+        let mut done = 0u64;
         let mut lbn: u64 = 0;
-        while out.len() < total {
-            let remaining = total - out.len();
-            let want = (self.bsize as usize).min(remaining);
+        while done < total {
+            let want = self.bsize.min(total - done) as usize;
             let block_frag = self.resolve_logical_block(inode, lbn)?;
             if block_frag == 0 {
-                out.extend(crate::compat::repeat_n(0u8, want));
+                buf[..want].fill(0);
             } else {
                 let byte = self.partition_offset + block_frag * self.fsize;
                 self.reader.seek(SeekFrom::Start(byte))?;
-                let start = out.len();
-                out.resize(start + want, 0);
-                self.reader.read_exact(&mut out[start..start + want])?;
+                self.reader.read_exact(&mut buf[..want])?;
             }
+            w.write_all(&buf[..want])?;
+            done += want as u64;
             lbn += 1;
         }
-        Ok(out)
+        Ok(done)
     }
 
     /// Bytes a fast symlink may occupy inline. `fs_maxsymlinklen` is the
@@ -3818,6 +3832,23 @@ impl<R: Read + Seek + Send> Filesystem for UfsFilesystem<R> {
             }
         }
         self.read_inode_data(&inode, inode.size, max_bytes)
+    }
+
+    fn write_file_to(
+        &mut self,
+        entry: &FileEntry,
+        writer: &mut dyn Write,
+    ) -> Result<u64, FilesystemError> {
+        let inode = self.read_inode(entry.location as u32)?;
+        if !matches!(
+            unix_file_type(inode.mode),
+            UnixFileType::Regular | UnixFileType::Unknown
+        ) {
+            let data = self.read_file(entry, usize::MAX)?;
+            writer.write_all(&data)?;
+            return Ok(data.len() as u64);
+        }
+        self.copy_inode_data(&inode, inode.size, u64::MAX, writer)
     }
 
     fn volume_label(&self) -> Option<&str> {

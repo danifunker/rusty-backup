@@ -457,6 +457,33 @@ impl<R: Read + Seek + Send> Human68kFilesystem<R> {
         self.partition_offset + data_sector * self.bpb.bytes_per_sector as u64
     }
 
+    /// Stream up to `min(size, max_bytes)` bytes of the chain into `w`, a cluster at a time.
+    fn copy_chain_data(
+        &mut self,
+        first: u16,
+        size: u64,
+        max_bytes: u64,
+        w: &mut dyn Write,
+    ) -> Result<u64, FilesystemError> {
+        let chain = self.cluster_chain(first)?;
+        let total = size.min(max_bytes);
+        let csize = self.bpb.cluster_size() as u64;
+        let mut buf = vec![0u8; csize as usize];
+        let mut done = 0u64;
+        for cluster in chain {
+            if done >= total {
+                break;
+            }
+            let want = csize.min(total - done) as usize;
+            let off = self.cluster_byte_offset(cluster);
+            self.reader.seek(SeekFrom::Start(off))?;
+            self.reader.read_exact(&mut buf[..want])?;
+            w.write_all(&buf[..want])?;
+            done += want as u64;
+        }
+        Ok(done)
+    }
+
     /// Consume the filesystem and hand back the underlying reader. Used by
     /// the defragmenting clone's streaming wrapper to drain a cloned
     /// tempfile after the volume has been written.
@@ -792,26 +819,22 @@ impl<R: Read + Seek + Send> Filesystem for Human68kFilesystem<R> {
         entry: &FileEntry,
         max_bytes: usize,
     ) -> Result<Vec<u8>, FilesystemError> {
-        let first = entry.location as u16;
-        let chain = self.cluster_chain(first)?;
-        let size = entry.size as usize;
-        let mut data = Vec::with_capacity(size);
-        let csize = self.bpb.cluster_size() as usize;
-        let mut remaining = size;
-        for cluster in chain {
-            if remaining == 0 {
-                break;
-            }
-            let want = csize.min(remaining);
-            let off = self.cluster_byte_offset(cluster);
-            self.reader.seek(SeekFrom::Start(off))?;
-            let mut buf = vec![0u8; want];
-            self.reader.read_exact(&mut buf)?;
-            data.extend_from_slice(&buf);
-            remaining = remaining.saturating_sub(want);
-        }
-        data.truncate(max_bytes);
+        let mut data = Vec::with_capacity((entry.size as usize).min(max_bytes));
+        self.copy_chain_data(
+            entry.location as u16,
+            entry.size,
+            max_bytes as u64,
+            &mut data,
+        )?;
         Ok(data)
+    }
+
+    fn write_file_to(
+        &mut self,
+        entry: &FileEntry,
+        writer: &mut dyn Write,
+    ) -> Result<u64, FilesystemError> {
+        self.copy_chain_data(entry.location as u16, entry.size, u64::MAX, writer)
     }
 
     fn validate_name(&self, name: &str) -> Result<(), FilesystemError> {

@@ -22,7 +22,7 @@
 
 #[cfg(feature = "rust173-polyfill")]
 use crate::rust173_compat::OptionIsNoneOr as _;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 use super::entry::FileEntry;
 use super::filesystem::{Filesystem, FilesystemError};
@@ -228,18 +228,37 @@ impl<R: Read + Seek + Send> Qnx6Filesystem<R> {
     }
 
     fn read_node(&mut self, node: &Node, max: usize) -> Result<Vec<u8>, FilesystemError> {
-        let want = (node.size as usize).min(max);
-        let mut out = Vec::with_capacity(want);
+        let mut out = Vec::with_capacity((node.size as usize).min(max));
+        self.copy_node(node, max as u64, &mut out)?;
+        Ok(out)
+    }
+
+    /// Stream up to `max` bytes of `node` into `w` one block at a time; holes write zeros.
+    fn copy_node(
+        &mut self,
+        node: &Node,
+        max: u64,
+        w: &mut dyn Write,
+    ) -> Result<u64, FilesystemError> {
+        let want = node.size.min(max);
+        let mut buf = vec![0u8; self.bsize as usize];
+        let mut done = 0u64;
         let mut n = 0u64;
-        while out.len() < want {
-            let take = (self.bsize as usize).min(want - out.len());
+        while done < want {
+            let take = self.bsize.min(want - done) as usize;
             match self.bmap(node, n)? {
-                Some(p) => out.extend_from_slice(&self.read_block(p)?[..take]),
-                None => out.resize(out.len() + take, 0),
+                Some(p) => {
+                    let at = self.offset + (p as u64 + self.blocks_off) * self.bsize;
+                    self.reader.seek(SeekFrom::Start(at))?;
+                    self.reader.read_exact(&mut buf)?;
+                }
+                None => buf.fill(0),
             }
+            w.write_all(&buf[..take])?;
+            done += take as u64;
             n += 1;
         }
-        Ok(out)
+        Ok(done)
     }
 
     /// Inode `ino` (from 1) as `(node, mode, uid, gid, mtime)`.
@@ -336,6 +355,15 @@ impl<R: Read + Seek + Send> Filesystem for Qnx6Filesystem<R> {
     fn read_file(&mut self, entry: &FileEntry, max: usize) -> Result<Vec<u8>, FilesystemError> {
         let (node, ..) = self.inode(entry.location as u32)?;
         self.read_node(&node, max)
+    }
+
+    fn write_file_to(
+        &mut self,
+        entry: &FileEntry,
+        writer: &mut dyn Write,
+    ) -> Result<u64, FilesystemError> {
+        let (node, ..) = self.inode(entry.location as u32)?;
+        self.copy_node(&node, u64::MAX, writer)
     }
 
     fn volume_label(&self) -> Option<&str> {

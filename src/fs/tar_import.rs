@@ -415,6 +415,13 @@ fn import_tar_inner<R: Read>(
         }
 
         if entry.header().entry_type().as_byte() == b'N' {
+            // A rename list is text; its size comes from an untrusted header, so cap it like a sidecar.
+            if entry.size() > MAX_SIDECAR_BYTES {
+                anyhow::bail!(
+                    "{display}: GNU rename list is {} bytes, over the {MAX_SIDECAR_BYTES}-byte limit",
+                    entry.size()
+                );
+            }
             let mut list = Vec::new();
             entry
                 .read_to_end(&mut list)
