@@ -468,23 +468,26 @@ where
         source_entry.resource_fork_size = Some(f.rsrc_size as u64);
     }
 
-    // Read entire data fork. HFS files top out at u32 byte size and HFS
-    // volumes are <= 2 GB, so this is bounded; streaming would be a memory
-    // optimisation rather than a correctness fix.
-    let data = if f.data_size > 0 {
-        source.read_file(&source_entry, f.data_size as usize)?
+    // Piped, not buffered: an HFS data fork can reach 2 GiB.
+    let new_file = if f.data_size > 0 {
+        super::stream_pipe::with_file_reader(source, &source_entry, |r| {
+            target.create_file(
+                parent_entry,
+                &f.name,
+                r,
+                f.data_size as u64,
+                &CreateFileOptions::default(),
+            )
+        })?
     } else {
-        Vec::new()
+        target.create_file(
+            parent_entry,
+            &f.name,
+            &mut std::io::empty(),
+            0,
+            &CreateFileOptions::default(),
+        )?
     };
-    let mut data_cursor = std::io::Cursor::new(&data);
-
-    let new_file = target.create_file(
-        parent_entry,
-        &f.name,
-        &mut data_cursor,
-        f.data_size as u64,
-        &CreateFileOptions::default(),
-    )?;
     report.data_bytes_copied += f.data_size as u64;
 
     if f.rsrc_size > 0 {

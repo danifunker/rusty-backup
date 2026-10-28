@@ -20,12 +20,9 @@
 //! - `target.sync_metadata()` has been called.
 //!
 //! Memory / scope notes:
-//! - File contents are streamed via `source.write_file_to(...)` into a
-//!   `Vec<u8>` per file, then written through `target.create_file`. The
-//!   peak buffer is one file's data, capped at the source's largest
-//!   file. For multi-GB single files (rare on Amiga volumes), this
-//!   wants a future streaming-pipe rewrite. AmigaVision's largest file
-//!   is well under typical RAM budgets.
+//! - File contents are piped from `source.write_file_to(...)` into
+//!   `target.create_file` through `fs::stream_pipe`, a bounded channel of
+//!   1 MiB chunks, so no file is ever held in memory whole.
 //! - The PFS3 trashcan (deldir) is NOT enumerated by `list_directory`,
 //!   so its contents are dropped during clone. This is expected
 //!   behavior — communicate it to the user via the returned warnings.
@@ -33,7 +30,7 @@
 #[cfg(feature = "rust173-polyfill")]
 use crate::rust173_compat::IntIsMultipleOf as _;
 use std::collections::HashMap;
-use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::time::{Duration, Instant};
 
 use super::entry::FileEntry;
@@ -299,24 +296,21 @@ where
                 source, target, &k, &new_dir, anode_map, parent_map, deferred, report, progress,
             )?;
         } else if k.is_file() {
-            // Spool the file body through a Vec. Large files spike RAM
-            // for the duration of one create_file call. See module
-            // doc for the streaming-pipe TODO.
-            let mut body: Vec<u8> = Vec::with_capacity(k.size as usize);
-            source.write_file_to(&k, &mut body)?;
             let opts = CreateFileOptions {
                 amiga_protection: k.amiga_protection,
                 amiga_comment: k.amiga_comment.clone(),
                 amiga_dates: k.amiga_date,
                 ..Default::default()
             };
-            let mut cur = Cursor::new(&body);
-            let new_file =
-                target.create_file(tgt_dir, &k.name, &mut cur, body.len() as u64, &opts)?;
+            // Piped through a bounded channel rather than spooled through a Vec.
+            let size = k.size;
+            let new_file = super::stream_pipe::with_file_reader(source, &k, |r| {
+                target.create_file(tgt_dir, &k.name, r, size, &opts)
+            })?;
             parent_map.insert(new_file.location, tgt_dir.location);
             anode_map.insert(k.location, new_file);
             report.files_copied += 1;
-            report.bytes_copied += body.len() as u64;
+            report.bytes_copied += size;
             progress.tick(report, false);
         } else {
             report.warnings.push(format!(
