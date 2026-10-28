@@ -48,6 +48,9 @@ pub struct HpuxLvm {
     pub pv_count: u32,
     /// The disk starts with an HP LIF boot volume.
     pub has_lif: bool,
+    /// Byte offset of the first VGDA copy: the LIF boot volume must end before it.
+    #[serde(default)]
+    pub lif_end: u64,
 }
 
 impl HpuxLvm {
@@ -84,7 +87,15 @@ impl HpuxLvm {
             .filter_map(|&psn| read_vgda(reader, psn as u64 * KIB, vgda_len, vg_id))
             .max_by_key(|v| (v.0, v.1))?
             .2;
-        Self::from_vgda(&vgda, pv_id, vg_id, pe_start, pe_size, has_lif)
+        let mut lvm = Self::from_vgda(&vgda, pv_id, vg_id, pe_start, pe_size, has_lif)?;
+        lvm.lif_end = [w(48), w(52)]
+            .iter()
+            .filter(|&&psn| psn != 0)
+            .map(|&psn| psn as u64 * KIB)
+            .min()
+            .unwrap_or(pe_start)
+            .min(pe_start);
+        Some(lvm)
     }
 
     fn from_vgda(
@@ -160,6 +171,7 @@ impl HpuxLvm {
             volumes,
             pv_count,
             has_lif,
+            lif_end: pe_start,
         })
     }
 }

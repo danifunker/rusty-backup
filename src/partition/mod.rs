@@ -973,7 +973,7 @@ fn hpux_lvm_partitions(lvm: &HpuxLvm) -> Vec<PartitionInfo> {
             0,
             "LIF boot area".into(),
             0,
-            lvm.pe_start,
+            lvm.lif_end,
             Some("LIF".into()),
         ));
     }

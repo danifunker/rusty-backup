@@ -22,7 +22,6 @@ finish it. Remove an entry when its work ships.
 | HP-UX HFS (UFS1 with magic `0x095014` / `0x195612`) | Read-only: editable opens are refused ("HP-UX HFS is read-only for now") | `fs::open_ufs_editable` | Verify that UFS writes keep HP's magic, `fs_clean` handling and long-name directories intact; check edits with HP-UX's `fsck` in the hp9000-715 emulator |
 | AIX JFS (`fs::jfs1`) | Read-only, no fsck; volumes with compression enabled (`s_compress`) refuse file reads | `fs/jfs1.rs` | Decode JFS1's LZ page compression; then writes, verified on a real AIX |
 | VxFS (`fs::vxfs`) | Read-only; disk layouts 5 and later (HP-UX 11.23 / 11.31) are refused; no fsck; no compaction (backup copies it raw) | `fs/vxfs.rs` | Layout 5+ differences (64-bit fields, new OLT records), then writes; verify against the hp9000-715 HP-UX `fsck_vxfs` |
-| HP LIF (`fs::lif`) | Read-only | `fs/lif.rs` | Write support only if a use case appears (replacing a boot program) |
 | AIX JFS2 (big-endian JFS2) | **Shelved**: no AIX 5L+ fixture to verify against | plan item 3.4 | Make `fs/jfs.rs` endian-generic once a fixture exists |
 
 ## Optical

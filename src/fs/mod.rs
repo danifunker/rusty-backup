@@ -2272,6 +2272,14 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                 let fs_offset = resolve_next_label(&mut reader, partition_offset);
                 return Ok(Box::new(open_ufs_editable(reader, fs_offset)?));
             }
+            // The HP LIF boot volume; the row's size caps how far it may grow.
+            "LIF" => {
+                return Ok(Box::new(lif::LifFilesystem::open_editable(
+                    reader,
+                    partition_offset,
+                    partition_len,
+                )?));
+            }
             "Apple_PRODOS" | "Apple_ProDOS" => {
                 return Ok(Box::new(prodos::ProDosFilesystem::open(
                     reader,
