@@ -5312,53 +5312,81 @@ fn parse_inline_mft_records<R: Read + Seek>(
 ) {
     use crate::fs::ntfs::{apply_fixup, parse_mft_attributes};
     let rec_size = vbr.mft_record_size as usize;
-    let gap_size = (end - start) as usize;
-    if gap_size < rec_size + 4 {
+    if end < start || ((end - start) as usize) < rec_size + 4 {
         return;
     }
-    let mut buf = vec![0u8; gap_size];
-    if reader.seek(SeekFrom::Start(start)).is_err() {
-        return;
-    }
-    let n = match read_fully_or_eof(reader, &mut buf) {
-        Ok(n) => n,
-        Err(_) => return,
+    // A 4 MiB window slides over the gap so a large gap is never read whole.
+    const WINDOW: u64 = 4 * 1024 * 1024;
+    let window = WINDOW.max(2 * rec_size as u64);
+    let mut base = start;
+    let mut buf = Vec::new();
+    let fill = |reader: &mut R, at: u64, buf: &mut Vec<u8>| -> bool {
+        buf.resize((end - at).min(window) as usize, 0);
+        if reader.seek(SeekFrom::Start(at)).is_err() {
+            return false;
+        }
+        match read_fully_or_eof(reader, buf) {
+            Ok(n) => {
+                buf.truncate(n);
+                true
+            }
+            Err(_) => false,
+        }
     };
-    buf.truncate(n);
-
+    if !fill(reader, base, &mut buf) {
+        return;
+    }
     let mut pos = 0;
-    while pos + rec_size <= buf.len() {
-        if let Some(idx) = buf[pos..].windows(4).position(|w| w == b"FILE") {
-            let rec_off = pos + idx;
-            if rec_off + rec_size > buf.len() {
-                break;
-            }
-            let mut rec = buf[rec_off..rec_off + rec_size].to_vec();
-            let rec_num = u32::from_le_bytes([rec[44], rec[45], rec[46], rec[47]]);
-            // Skip $BadClus (record 8) — sparse run covering entire volume.
-            if rec_num == 8 {
+    loop {
+        // The window reaches the gap's end (or the file's) when it came back short of `window`.
+        let at_end = (buf.len() as u64) < window || base + buf.len() as u64 >= end;
+        if pos + rec_size > buf.len() && at_end {
+            break;
+        }
+        match buf[pos..].windows(4).position(|w| w == b"FILE") {
+            Some(idx) if pos + idx + rec_size <= buf.len() => {
+                let rec_off = pos + idx;
+                let mut rec = buf[rec_off..rec_off + rec_size].to_vec();
                 pos = rec_off + rec_size;
-                continue;
-            }
-            let _ = apply_fixup(&mut rec);
-            let attrs = parse_mft_attributes(&rec, vbr.mft_record_size);
-            for attr in &attrs {
-                if !attr.resident && !attr.data_runs.is_empty() {
-                    for dr in &attr.data_runs {
-                        // Skip sparse runs. decode_data_runs returns
-                        // cluster_offset == 0 for holes (offset_size == 0); they
-                        // have no stored content and no real LCN. Queuing them as
-                        // (lcn=0, cc) makes real stream runs match LCN 0 and pile
-                        // up on $Boot's clusters -> cross-links in chkdsk.
-                        if dr.cluster_offset > 0 && dr.length > 0 {
-                            out.push((dr.cluster_offset as u64, dr.length));
+                let rec_num = u32::from_le_bytes([rec[44], rec[45], rec[46], rec[47]]);
+                // Skip $BadClus (record 8) — sparse run covering entire volume.
+                if rec_num == 8 {
+                    continue;
+                }
+                let _ = apply_fixup(&mut rec);
+                let attrs = parse_mft_attributes(&rec, vbr.mft_record_size);
+                for attr in &attrs {
+                    if !attr.resident && !attr.data_runs.is_empty() {
+                        for dr in &attr.data_runs {
+                            // Skip sparse runs. decode_data_runs returns
+                            // cluster_offset == 0 for holes (offset_size == 0); they
+                            // have no stored content and no real LCN. Queuing them as
+                            // (lcn=0, cc) makes real stream runs match LCN 0 and pile
+                            // up on $Boot's clusters -> cross-links in chkdsk.
+                            if dr.cluster_offset > 0 && dr.length > 0 {
+                                out.push((dr.cluster_offset as u64, dr.length));
+                            }
                         }
                     }
                 }
             }
-            pos = rec_off + rec_size;
-        } else {
-            break;
+            // A record cut by the window's end: slide the window to start at it.
+            Some(idx) if !at_end => {
+                base += (pos + idx) as u64;
+                pos = 0;
+                if !fill(reader, base, &mut buf) {
+                    return;
+                }
+            }
+            // No signature left in this window: slide on, keeping 3 bytes for a split "FILE".
+            None if !at_end => {
+                base += buf.len().saturating_sub(3).max(1) as u64;
+                pos = 0;
+                if !fill(reader, base, &mut buf) {
+                    return;
+                }
+            }
+            _ => break,
         }
     }
 }
@@ -5753,7 +5781,10 @@ fn open_ntfs_compressed_mft_only(
     let mut decomp_buf = vec![0u8; max_decomp_block];
     let mut blocks = Vec::with_capacity(8_000);
     let mut decomp_offset: u64 = 0;
-    let mut stream = Vec::with_capacity(128 * 1024 * 1024);
+    // Decompressed bytes from `stream_base` on; consumed prefixes are dropped as the MFT is parsed.
+    let mut stream: Vec<u8> = Vec::new();
+    let mut stream_base: u64 = 0;
+    let mut next_rec: u64 = 0;
 
     // Find first zlib header.
     let mut off = data_start;
@@ -5904,9 +5935,13 @@ fn open_ntfs_compressed_mft_only(
                     .map(|b| format!("{:02x}", b))
                     .collect::<Vec<_>>()
                     .join(" ");
-                log::info!("MFT header at stream pos {:#x}: {}", pos, hex);
+                log::info!(
+                    "MFT header at stream pos {:#x}: {}",
+                    stream_base + pos as u64,
+                    hex
+                );
                 if let Some(cc) = parse_ntfs_run_header(&stream[pos..]) {
-                    let mds = pos as u64 + NTFS_RUN_HEADER_SIZE as u64;
+                    let mds = stream_base + pos as u64 + NTFS_RUN_HEADER_SIZE as u64;
                     mft_clusters = cc;
                     mft_data_start = Some(mds);
                     let mft_size = cc * cluster_size;
@@ -5922,65 +5957,83 @@ fn open_ntfs_compressed_mft_only(
                         file_offset: mds,
                         seq: 0,
                     });
+                    // Nothing before the MFT's data is needed again.
+                    let drop = (mds - stream_base) as usize;
+                    stream.drain(..drop.min(stream.len()));
+                    stream_base = mds;
+                }
+            } else {
+                // Keep only a header's worth of tail so a split header is still found.
+                let keep = NTFS_RUN_HEADER_SIZE - 1;
+                if stream.len() > keep {
+                    let drop = stream.len() - keep;
+                    stream.drain(..drop);
+                    stream_base += drop as u64;
                 }
             }
         }
 
         if let Some(mds) = mft_data_start {
             let mft_size = mft_clusters * cluster_size;
-            let mft_end = mds + mft_size;
-            if stream.len() as u64 >= mft_end && !mft_parsed {
-                let num_records = mft_size / mft_record_size as u64;
-                for rec_idx in 0..num_records {
-                    let rec_off = mds as usize + rec_idx as usize * mft_record_size;
-                    if rec_off + mft_record_size > stream.len() {
-                        break;
-                    }
-                    let rec = &stream[rec_off..rec_off + mft_record_size];
-                    if &rec[0..4] != b"FILE" {
+            let num_records = mft_size / mft_record_size as u64;
+            // Parse whole records as they arrive, then drop them, so the MFT is never held whole.
+            while next_rec < num_records {
+                let rec_abs = mds + next_rec * mft_record_size as u64;
+                let rec_off = (rec_abs - stream_base) as usize;
+                if rec_off + mft_record_size > stream.len() {
+                    break;
+                }
+                next_rec += 1;
+                let rec = &stream[rec_off..rec_off + mft_record_size];
+                if &rec[0..4] != b"FILE" {
+                    continue;
+                }
+                let rec_num = u32::from_le_bytes([rec[44], rec[45], rec[46], rec[47]]);
+                if rec_num == 8 {
+                    continue;
+                }
+                let mut rec_buf = rec.to_vec();
+                let _ = apply_fixup(&mut rec_buf);
+                let attrs = parse_mft_attributes(&rec_buf, vbr.mft_record_size);
+                for attr in &attrs {
+                    if attr.resident || attr.data_runs.is_empty() {
                         continue;
                     }
-                    let rec_num = u32::from_le_bytes([rec[44], rec[45], rec[46], rec[47]]);
-                    if rec_num == 8 {
-                        continue;
-                    }
-                    let mut rec_buf = rec.to_vec();
-                    let _ = apply_fixup(&mut rec_buf);
-                    let attrs = parse_mft_attributes(&rec_buf, vbr.mft_record_size);
-                    for attr in &attrs {
-                        if attr.resident || attr.data_runs.is_empty() {
+                    // Record 0 is $MFT itself. Its $DATA runs describe
+                    // every MFT fragment; fragment 0 is already registered
+                    // as the MFT run above, so skip it here, but queue the
+                    // later fragments so the lazy scan maps them. Without
+                    // this, high-numbered MFT records (which live in those
+                    // fragments) read back as zeros -> "invalid magic".
+                    let skip_first = rec_num == 0 && attr.attr_type == 0x80;
+                    for (i, dr) in attr.data_runs.iter().enumerate() {
+                        if skip_first && i == 0 {
                             continue;
                         }
-                        // Record 0 is $MFT itself. Its $DATA runs describe
-                        // every MFT fragment; fragment 0 is already registered
-                        // as the MFT run above, so skip it here, but queue the
-                        // later fragments so the lazy scan maps them. Without
-                        // this, high-numbered MFT records (which live in those
-                        // fragments) read back as zeros -> "invalid magic".
-                        let skip_first = rec_num == 0 && attr.attr_type == 0x80;
-                        for (i, dr) in attr.data_runs.iter().enumerate() {
-                            if skip_first && i == 0 {
+                        // Skip sparse runs (cluster_offset == 0 = hole);
+                        // queuing them as lcn=0 causes $Boot cross-links.
+                        if dr.cluster_offset > 0 && dr.length > 0 {
+                            // $MFTMirr ($DATA, rec 1): synthesized from the
+                            // $MFT data, not from a stream run (Ghost omits
+                            // the mirror content). Capture, don't queue. See
+                            // the uncompressed path for the full rationale.
+                            if rec_num == 1 && attr.attr_type == 0x80 && mftmirr_run.is_none() {
+                                mftmirr_run = Some((dr.cluster_offset as u64, dr.length));
                                 continue;
                             }
-                            // Skip sparse runs (cluster_offset == 0 = hole);
-                            // queuing them as lcn=0 causes $Boot cross-links.
-                            if dr.cluster_offset > 0 && dr.length > 0 {
-                                // $MFTMirr ($DATA, rec 1): synthesized from the
-                                // $MFT data, not from a stream run (Ghost omits
-                                // the mirror content). Capture, don't queue. See
-                                // the uncompressed path for the full rationale.
-                                if rec_num == 1 && attr.attr_type == 0x80 && mftmirr_run.is_none() {
-                                    mftmirr_run = Some((dr.cluster_offset as u64, dr.length));
-                                    continue;
-                                }
-                                data_run_queue.push((dr.cluster_offset as u64, dr.length));
-                                if rec_num == 6 && attr.attr_type == 0x80 {
-                                    bitmap_runs.push((dr.cluster_offset as u64, dr.length));
-                                }
+                            data_run_queue.push((dr.cluster_offset as u64, dr.length));
+                            if rec_num == 6 && attr.attr_type == 0x80 {
+                                bitmap_runs.push((dr.cluster_offset as u64, dr.length));
                             }
                         }
                     }
                 }
+            }
+            let parsed_to = mds + next_rec * mft_record_size as u64;
+            let drop = (parsed_to - stream_base) as usize;
+            stream.drain(..drop.min(stream.len()));
+            stream_base = parsed_to;
+            if next_rec == num_records && stream_base + stream.len() as u64 >= mds + mft_size {
                 // Synthesize $MFTMirr: map its clusters back to the start of
                 // $MFT's stream data (the mirror is a verbatim copy of $MFT's
                 // first records). Without this the mirror reads as zeros and
@@ -6022,7 +6075,7 @@ fn open_ntfs_compressed_mft_only(
 
     // Keep the stream tail from mft_end onward for gap parsing when
     // the lazy scan resumes.
-    let stream_tail_start = mft_end as usize;
+    let stream_tail_start = mft_end.saturating_sub(stream_base) as usize;
     let leftover_stream = if stream_tail_start < stream.len() {
         stream[stream_tail_start..].to_vec()
     } else {
@@ -7979,8 +8032,166 @@ fn read_ntfs_file_aware_into(
 
 #[cfg(test)]
 mod tests {
+
+    /// A synthetic High-compression NTFS Ghost stream: junk, the MFT run header, `mft`, a tail.
+    fn ghost_ntfs_stream(mft: &[u8], cluster: u64, block: usize) -> Vec<u8> {
+        let mut plain = vec![0x55u8; 300];
+        let mut hdr = [0u8; NTFS_RUN_HEADER_SIZE];
+        hdr[..16].copy_from_slice(&NTFS_RUN_HEADER_ENTRY1);
+        hdr[16] = 0x0E;
+        hdr[17] = 0x02;
+        hdr[31] = 0x0F;
+        hdr[32] = 0x0F;
+        hdr[33..41].copy_from_slice(&(mft.len() as u64 / cluster).to_le_bytes());
+        hdr[41] = 0x0E;
+        plain.extend_from_slice(&hdr);
+        plain.extend_from_slice(mft);
+        plain.extend(crate::compat::repeat_n(0xA5u8, 5000));
+        let mut file = vec![0u8; 512];
+        for piece in plain.chunks(block) {
+            let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+            std::io::Write::write_all(&mut enc, piece).unwrap();
+            file.extend_from_slice(&enc.finish().unwrap());
+            file.extend_from_slice(&[0, 0]);
+        }
+        file.extend_from_slice(&[0u8; 64]);
+        file
+    }
+
+    #[test]
+    fn compressed_ntfs_mft_parses_the_same_whatever_the_block_split() {
+        use crate::fs::ntfs::{apply_fixup, parse_mft_attributes, parse_vbr};
+        use crate::fs::ntfs_format::{create_ntfs, NtfsFormatParams, NtfsGeometry};
+        let mut img = std::io::Cursor::new(Vec::new());
+        create_ntfs(
+            &mut img,
+            &NtfsFormatParams {
+                total_size: 16 * 1024 * 1024,
+                geometry: NtfsGeometry::with_cluster_size(4096, 512).unwrap(),
+                mft_records_hint: 128,
+                label: None,
+            },
+        )
+        .unwrap();
+        let img = img.into_inner();
+        let mut vbr_raw = [0u8; 512];
+        vbr_raw.copy_from_slice(&img[..512]);
+        let vbr = parse_vbr(&vbr_raw).unwrap();
+        let cluster = vbr.bytes_per_sector * vbr.sectors_per_cluster;
+        let at = (vbr.mft_cluster * cluster) as usize;
+        let mft = &img[at..at + 16 * 1024];
+
+        // What the MFT says, parsed straight from the image.
+        let rs = vbr.mft_record_size as usize;
+        let mut want = Vec::new();
+        for rec in mft.chunks_exact(rs) {
+            let num = u32::from_le_bytes([rec[44], rec[45], rec[46], rec[47]]);
+            if &rec[..4] != b"FILE" || num == 8 {
+                continue;
+            }
+            let mut r = rec.to_vec();
+            let _ = apply_fixup(&mut r);
+            for a in parse_mft_attributes(&r, vbr.mft_record_size) {
+                if a.resident {
+                    continue;
+                }
+                for (i, dr) in a.data_runs.iter().enumerate() {
+                    let skip = (num == 0 && a.attr_type == 0x80 && i == 0)
+                        || (num == 1 && a.attr_type == 0x80);
+                    if !skip && dr.cluster_offset > 0 && dr.length > 0 {
+                        want.push((dr.cluster_offset as u64, dr.length));
+                    }
+                }
+            }
+        }
+        assert!(!want.is_empty());
+
+        let dir = tempfile::tempdir().unwrap();
+        // 700-byte blocks split the run header and every MFT record across blocks.
+        for block in [700usize, 1 << 20] {
+            let path = dir.path().join(format!("t{block}.gho"));
+            let file = ghost_ntfs_stream(mft, cluster, block);
+            std::fs::write(&path, &file).unwrap();
+            let mut reader = SpanReader::open(&[path]).unwrap();
+            let (state, index) = open_ntfs_compressed_mft_only(
+                &mut reader,
+                512,
+                file.len() as u64,
+                GhoCompression::High,
+                &vbr,
+                &vbr_raw,
+            )
+            .unwrap();
+            let lazy = state.lazy_scan.expect("lazy scan state");
+            assert_eq!(lazy.data_run_queue, want, "block size {block}");
+            let mds = 300 + NTFS_RUN_HEADER_SIZE as u64;
+            assert!(index
+                .runs
+                .iter()
+                .any(|r| r.lcn_start == vbr.mft_cluster && r.file_offset == mds));
+            assert_eq!(lazy.prev_data_end, mds + mft.len() as u64);
+            // What follows the MFT stays for the lazy scan, starting with the tail's first byte.
+            assert_eq!(lazy.stream.first(), Some(&0xA5));
+        }
+    }
     use super::*;
     use std::io::{Cursor, Write};
+
+    #[test]
+    fn gap_records_are_found_across_the_scan_window() {
+        use crate::fs::ntfs::{apply_fixup, parse_mft_attributes, parse_vbr};
+        use crate::fs::ntfs_format::{create_ntfs, NtfsFormatParams, NtfsGeometry};
+        let mut img = std::io::Cursor::new(Vec::new());
+        create_ntfs(
+            &mut img,
+            &NtfsFormatParams {
+                total_size: 16 * 1024 * 1024,
+                geometry: NtfsGeometry::with_cluster_size(4096, 512).unwrap(),
+                mft_records_hint: 128,
+                label: None,
+            },
+        )
+        .unwrap();
+        let img = img.into_inner();
+        let mut vbr_raw = [0u8; 512];
+        vbr_raw.copy_from_slice(&img[..512]);
+        let vbr = parse_vbr(&vbr_raw).unwrap();
+        let cluster = vbr.bytes_per_sector * vbr.sectors_per_cluster;
+        let at = (vbr.mft_cluster * cluster) as usize;
+        let mft = &img[at..at + 16 * 1024];
+        let rs = vbr.mft_record_size as usize;
+        let mut want = Vec::new();
+        for rec in mft.chunks_exact(rs) {
+            let num = u32::from_le_bytes([rec[44], rec[45], rec[46], rec[47]]);
+            if &rec[..4] != b"FILE" || num == 8 {
+                continue;
+            }
+            let mut r = rec.to_vec();
+            let _ = apply_fixup(&mut r);
+            for a in parse_mft_attributes(&r, vbr.mft_record_size) {
+                if !a.resident {
+                    for dr in &a.data_runs {
+                        if dr.cluster_offset > 0 && dr.length > 0 {
+                            want.push((dr.cluster_offset as u64, dr.length));
+                        }
+                    }
+                }
+            }
+        }
+        // Records start 300 bytes before the 4 MiB mark, so one straddles it.
+        let mut gap = vec![0x11u8; 4 * 1024 * 1024 - 300];
+        gap.extend_from_slice(mft);
+        gap.extend(crate::compat::repeat_n(0x22u8, 1000));
+        let mut got = Vec::new();
+        parse_inline_mft_records(
+            &mut Cursor::new(gap.clone()),
+            0,
+            gap.len() as u64,
+            &vbr,
+            &mut got,
+        );
+        assert_eq!(got, want);
+    }
 
     /// Helper: a minimal `CachedNtfsScan` for cache round-trip tests.
     fn dummy_scan(run_count: usize) -> CachedNtfsScan {
