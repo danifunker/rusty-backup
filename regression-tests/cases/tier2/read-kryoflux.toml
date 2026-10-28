@@ -1,0 +1,26 @@
+# Tier 2 — KryoFlux stream sets, decoded from flux.
+#
+# The ICON NetCard fileserver boot disk's sector dump (.img) lost its root
+# directory to read errors and lists 15 entries; decoding its KryoFlux streams
+# (every revolution, several bit cells, CRC-checked) recovers all 1600 sectors
+# and the full tree. Opening any one stream file opens the whole set.
+
+[meta]
+tier = 2
+group = "flux.kryoflux"
+description = "Open a KryoFlux stream set as a disk image."
+
+[[case]]
+id = "read.kryoflux.icon-netcard401"
+description = "Flux decode recovers the QNX 2 boot disk the sector dump lost"
+fixture = "flux.kryoflux.icon-netcard401.floppy"
+timeout_ms = 300000
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["QNX2", "800.0 KiB"]
+stderr_not_contains = ["unreadable"]
+[[case.step]]
+args = ["ls", "{fixture}", "/"]
+expect_exit = 0
+stdout_contains = ["boot", "cmds", "config", "drivers", "sys", "util"]

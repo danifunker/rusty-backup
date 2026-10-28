@@ -84,7 +84,7 @@ HP-UX work. That needs a running QNX of each generation:
 
 Install media for these is the one thing not already on hand.
 
-## Backlog: KryoFlux
+## KryoFlux (done: read-only, IBM MFM)
 
 Read-only KryoFlux stream support (`trackNN.S.raw`), as a disk-image
 abstraction beneath the filesystems: decode flux to sectors for the known

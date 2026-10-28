@@ -1010,6 +1010,16 @@ fn open_read_dispatch(
         let flat =
             decode_g64_bytes(&bytes).with_context(|| format!("decode G64 {}", path.display()))?;
         Ok(Box::new(std::io::Cursor::new(flat)))
+    } else if crate::rbformats::flux::kryoflux::is_stream_path(path) {
+        // KryoFlux stream set: decode every track's flux to IBM MFM sectors, best copy wins.
+        let tracks = crate::rbformats::flux::kryoflux::read_set(path)
+            .with_context(|| format!("read KryoFlux streams beside {}", path.display()))?;
+        let disk = crate::rbformats::flux::decode_disk(&tracks)
+            .with_context(|| format!("no MFM sectors in the KryoFlux set {}", path.display()))?;
+        if let Some(faults) = disk.fault_summary() {
+            eprintln!("KryoFlux: {faults}; unreadable sectors are zero-filled");
+        }
+        Ok(Box::new(std::io::Cursor::new(disk.image)))
     } else if is_woz_path(path) {
         // WOZ 1/2 Apple/Mac floppy: decode the GCR bitstream to a flat sector
         // buffer (≤ 800 KB) and hand off as Cursor, like G64. Read-only here;
@@ -1569,6 +1579,7 @@ pub fn is_container_path(path: &Path) -> bool {
         || is_moof_path(path)
         || is_dsd_path(path)
         || is_flat_floppy_container_path(path)
+        || crate::rbformats::flux::kryoflux::is_stream_path(path)
 }
 
 #[cfg(test)]

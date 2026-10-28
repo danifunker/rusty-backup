@@ -174,6 +174,7 @@ pub mod dmg;
 #[cfg(feature = "crypto")]
 pub mod dmg_crypto;
 pub mod export;
+pub mod flux;
 pub mod gho;
 pub mod gho_crypto;
 pub mod gz_index;
