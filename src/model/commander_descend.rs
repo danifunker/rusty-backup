@@ -157,12 +157,35 @@ fn sanitize_temp_name(name: &str) -> String {
 /// Open an archive file (by path) as a read-only filesystem. `label` is the
 /// wrapper's display name for the breadcrumb / volume label.
 pub fn open_archive(path: &Path, label: Option<String>) -> Result<Box<dyn Filesystem>> {
-    let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or_default();
+    // ZIP and tar open by path so a large one is indexed rather than read into memory.
+    let mut head = [0u8; 512];
+    let n = std::fs::File::open(path)
+        .and_then(|mut f| std::io::Read::read(&mut f, &mut head))
+        .with_context(|| format!("read {}", path.display()))?;
+    if is_zip_or_tar(&head[..n], name) {
+        let fs = crate::fs::mem_archive::open_path(path, label)
+            .map_err(|e| anyhow::anyhow!("open archive '{name}': {e}"))?;
+        return Ok(Box::new(fs));
+    }
+    let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
     open_archive_bytes(bytes, name, label)
+}
+
+/// Whether `head` / `file_name` name a ZIP or tar (plain, gzip or zstd) rather than a Mac archive.
+fn is_zip_or_tar(head: &[u8], file_name: &str) -> bool {
+    let lower = file_name.to_ascii_lowercase();
+    head.starts_with(b"PK\x03\x04")
+        || head.starts_with(b"PK\x05\x06")
+        || lower.ends_with(".zip")
+        || lower.ends_with(".tar")
+        || lower.ends_with(".tgz")
+        || lower.ends_with(".tar.gz")
+        || lower.ends_with(".tar.zst")
+        || looks_like_tar(head)
 }
 
 /// Open archive bytes as a read-only filesystem, routing by content + name to

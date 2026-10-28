@@ -449,8 +449,9 @@ fn run_wrapper_open(
         WrapperOpenPlan::Extract(ex) => {
             let WrapperExtract { base, entry } = *ex;
             let mut fs = base.open().map_err(|e| format!("{e:#}"))?;
-            if matches!(kind, DescendKind::DiskImage | DescendKind::Optical) {
-                // Opened by path anyway: stream to disk so a multi-GB image never sits in RAM.
+            let large = entry.size > crate::fs::mem_archive::INLINE_MAX;
+            if large || matches!(kind, DescendKind::DiskImage | DescendKind::Optical) {
+                // Stream to disk so a multi-GB image or archive never sits in RAM.
                 let (dir, path) =
                     crate::model::commander_descend::materialize_streamed(&file_name, |f| {
                         let mut w = std::io::BufWriter::new(f);

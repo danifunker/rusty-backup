@@ -508,7 +508,7 @@ pub fn build_x68k_hdd(
         }
     }
 
-    crate::compat::write_sparse(out_path.as_ref(), &disk)
+    crate::compat::write_sparse(out_path, &disk)
         .map_err(|e| anyhow::anyhow!("write {}: {e}", out_path.display()))?;
 
     Ok(BuildSummary {
