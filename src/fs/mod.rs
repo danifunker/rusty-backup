@@ -563,9 +563,7 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
         if reader.read_exact(&mut ufs_magic).is_err() {
             continue;
         }
-        let le = u32::from_le_bytes(ufs_magic);
-        let be = u32::from_be_bytes(ufs_magic);
-        if le == 0x0001_1954 || le == 0x1954_0119 || be == 0x0001_1954 || be == 0x1954_0119 {
+        if ufs::is_ufs_magic(ufs_magic, cand == 8192) {
             return "ufs";
         }
     }
@@ -1283,6 +1281,7 @@ pub fn fs_name_for(partition_type: u8, partition_type_string: Option<&str>) -> &
             return "SFS";
         }
         return match s {
+            "LIF" => "LIF",
             "Apple_HFS" => "HFS",
             "Apple_HFSX" => "HFSX",
             // Apple HFS/HFS+ GPT partition GUID (UDIF DMG / hdiutil disks).
@@ -2219,10 +2218,7 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                         partition_offset,
                     )?)),
                     // A/UX and NetBSD/mac68k slices: the read arm already opened them.
-                    "ufs" => Ok(Box::new(ufs::UfsFilesystem::open(
-                        reader,
-                        partition_offset,
-                    )?)),
+                    "ufs" => Ok(Box::new(open_ufs_editable(reader, partition_offset)?)),
                     _ => Err(FilesystemError::Unsupported(format!(
                         "editing not yet supported for APM Unix filesystem type '{fs_type}'"
                     ))),
@@ -2231,7 +2227,7 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
             // Rhapsody's NeXT label fronts the UFS; see the read path's arm.
             "Apple_Rhapsody_UFS" => {
                 let fs_offset = resolve_next_label(&mut reader, partition_offset);
-                return Ok(Box::new(ufs::UfsFilesystem::open(reader, fs_offset)?));
+                return Ok(Box::new(open_ufs_editable(reader, fs_offset)?));
             }
             "Apple_PRODOS" | "Apple_ProDOS" => {
                 return Ok(Box::new(prodos::ProDosFilesystem::open(
@@ -2462,10 +2458,7 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                 // open_filesystem). The EditableFilesystem impl is fixture-
                 // tested (create/rename/delete + fsck-clean); this arm is what
                 // makes it reachable.
-                "ufs" => Ok(Box::new(ufs::UfsFilesystem::open(
-                    reader,
-                    partition_offset,
-                )?)),
+                "ufs" => Ok(Box::new(open_ufs_editable(reader, partition_offset)?)),
                 // JFS is already editable through the 0x83 arm below; a bare
                 // JFS image is the same filesystem, so it opens here too.
                 // Its edit surface is metadata-only (`set_permissions` /
@@ -2567,10 +2560,7 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
-                "ufs" => Ok(Box::new(ufs::UfsFilesystem::open(
-                    reader,
-                    partition_offset,
-                )?)),
+                "ufs" => Ok(Box::new(open_ufs_editable(reader, partition_offset)?)),
                 "jfs" => Ok(Box::new(jfs::JfsFilesystem::open(
                     reader,
                     partition_offset,
@@ -2648,6 +2638,20 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
 }
 
 /// Open a filesystem by APM partition type string.
+/// Open UFS for editing; HP-UX HFS stays read-only until its write path is verified.
+fn open_ufs_editable<R: Read + Write + Seek + Send>(
+    reader: R,
+    offset: u64,
+) -> Result<ufs::UfsFilesystem<R>, FilesystemError> {
+    let fs = ufs::UfsFilesystem::open(reader, offset)?;
+    if fs.is_hpux_hfs() {
+        return Err(FilesystemError::Unsupported(
+            "HP-UX HFS is read-only for now (see docs/stubs.md)".into(),
+        ));
+    }
+    Ok(fs)
+}
+
 fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
     mut reader: R,
     partition_offset: u64,
@@ -2656,6 +2660,11 @@ fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
     passphrase: Option<&str>,
 ) -> Result<Box<dyn Filesystem>, FilesystemError> {
     match type_str {
+        // The HP LIF boot volume ahead of a BSD label or an HP-UX LVM area.
+        "LIF" => Ok(Box::new(lif::LifFilesystem::open(
+            reader,
+            partition_offset,
+        )?)),
         // "Apple_HFS" is the APM type string; "48465300-..." is the GPT
         // "Apple HFS/HFS+" type GUID (an HFS or HFS+ volume in a GPT-wrapped
         // disk, as produced by `hdiutil create` / UDIF DMGs). Both resolve

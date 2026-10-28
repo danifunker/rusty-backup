@@ -72,6 +72,19 @@ pub(crate) const MAGIC_UFS1: u32 = 0x0001_1954;
 /// UFS2 magic — `0x19540119`, encoded little-endian as `19 01 54 19`.
 pub(crate) const MAGIC_UFS2: u32 = 0x1954_0119;
 
+/// HP-UX HFS with long file names (`FS_MAGIC_LFN`); otherwise a big-endian UFS1.
+pub(crate) const HPUX_MAGIC_LFN: u32 = 0x0009_5014;
+/// HP-UX HFS `FD_FSMAGIC`, the other HP-UX variant of the UFS1 magic.
+pub(crate) const HPUX_MAGIC_FD: u32 = 0x0019_5612;
+
+/// Whether 4 bytes read at `fs_magic` name a UFS superblock; HP-UX's variants only sit at 8192.
+pub fn is_ufs_magic(bytes: [u8; 4], at_ufs1_offset: bool) -> bool {
+    let (le, be) = (u32::from_le_bytes(bytes), u32::from_be_bytes(bytes));
+    matches!(le, MAGIC_UFS1 | MAGIC_UFS2)
+        || matches!(be, MAGIC_UFS1 | MAGIC_UFS2)
+        || (at_ufs1_offset && matches!(be, HPUX_MAGIC_LFN | HPUX_MAGIC_FD))
+}
+
 /// Offset of `fs_magic` within `struct fs` (FreeBSD `sys/ufs/ffs/fs.h`).
 pub(crate) const MAGIC_OFF: usize = 1372;
 
@@ -319,6 +332,8 @@ pub struct UfsFilesystem<R> {
     pub(crate) sb_offset: u64,
     pub(crate) version: UfsVersion,
     pub(crate) endian: UfsEndian,
+    /// `fs_magic` as found: the UFS1/UFS2 value, or an HP-UX HFS variant.
+    pub(crate) magic: u32,
     pub(crate) bsize: u64, // block size in bytes
     pub(crate) fsize: u64, // fragment size in bytes
     pub(crate) frag: u32,  // fragments per block
@@ -385,6 +400,7 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
         // first since modern UFS volumes are overwhelmingly little-endian;
         // BE is a fallback for legacy SPARC / m68k / PowerPC images.
         let mut found: Option<(u64, UfsVersion, UfsEndian)> = None;
+        let mut magic = MAGIC_UFS1;
         let mut magic_buf = [0u8; 4];
         for &cand in &candidates {
             reader.seek(SeekFrom::Start(partition_offset + cand + MAGIC_OFF as u64))?;
@@ -405,6 +421,10 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
             } else if be == MAGIC_UFS2 {
                 found = Some((cand, UfsVersion::Ufs2, UfsEndian::Big));
                 break;
+            } else if cand == SB_OFFSET_UFS1 && (be == HPUX_MAGIC_LFN || be == HPUX_MAGIC_FD) {
+                found = Some((cand, UfsVersion::Ufs1, UfsEndian::Big));
+                magic = be;
+                break;
             }
         }
         let (sb_offset, version, endian) = found.ok_or_else(|| {
@@ -424,7 +444,7 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
         // fd whose seek offset got clobbered by a concurrent worker).
         let confirmed = read_u32(&sb, MAGIC_OFF, endian);
         let expected = match version {
-            UfsVersion::Ufs1 => MAGIC_UFS1,
+            UfsVersion::Ufs1 => magic,
             UfsVersion::Ufs2 => MAGIC_UFS2,
         };
         if confirmed != expected {
@@ -555,6 +575,11 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
         let label = parse_label(label_bytes);
 
         let mut fs = Self {
+            magic: if matches!(version, UfsVersion::Ufs2) {
+                MAGIC_UFS2
+            } else {
+                magic
+            },
             reader,
             partition_offset,
             sb_offset,
@@ -1284,6 +1309,11 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
             }
         }
         Ok(entry)
+    }
+
+    /// An HP-UX HFS volume (UFS1 with HP's magic); read-only until its writes are verified.
+    pub fn is_hpux_hfs(&self) -> bool {
+        matches!(self.magic, HPUX_MAGIC_LFN | HPUX_MAGIC_FD)
     }
 
     /// Read-back accessors so the compactor (U.2) and browse layer (U.3)

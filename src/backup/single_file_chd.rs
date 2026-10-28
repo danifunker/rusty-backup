@@ -215,6 +215,7 @@ pub fn is_supported(inputs_table: &PartitionTable) -> bool {
             | PartitionTable::Apm(_)
             | PartitionTable::Sun(_)
             | PartitionTable::Next(_)
+            | PartitionTable::Bsd(_)
             | PartitionTable::Sgi(_)
             | PartitionTable::SgiDkLabel(_)
             | PartitionTable::Rdb(_)
@@ -232,6 +233,7 @@ fn is_verbatim_head_scheme(table: &PartitionTable) -> bool {
         table,
         PartitionTable::Sun(_)
             | PartitionTable::Next(_)
+            | PartitionTable::Bsd(_)
             | PartitionTable::Sgi(_)
             | PartitionTable::SgiDkLabel(_)
             | PartitionTable::Rdb(_)
@@ -2206,6 +2208,7 @@ fn build_patched_head_segments(
         }
         PartitionTable::Sun(_)
         | PartitionTable::Next(_)
+        | PartitionTable::Bsd(_)
         | PartitionTable::Sgi(_)
         | PartitionTable::SgiDkLabel(_)
         | PartitionTable::Rdb(_)

@@ -1252,6 +1252,28 @@ mod tests {
         assert!(fs.list_directory(&root).expect("ls").is_empty());
     }
 
+    #[test]
+    fn hpux_hfs_magic_reads_and_refuses_editing() {
+        // HP-UX 11.x /stand: a big-endian UFS1 stamped FS_MAGIC_LFN (0x095014) instead of 0x011954.
+        let mut img = create_blank_ufs1(&Ufs1FormatParams {
+            endian: UfsEndian::Big,
+            ..params(32 * 1024 * 1024)
+        })
+        .expect("format");
+        let at = SB_OFFSET_UFS1 as usize + MAGIC_OFF;
+        img[at..at + 4].copy_from_slice(&crate::fs::ufs::HPUX_MAGIC_LFN.to_be_bytes());
+        assert!(crate::fs::ufs::is_ufs_magic(
+            [img[at], img[at + 1], img[at + 2], img[at + 3]],
+            true
+        ));
+        let mut fs = UfsFilesystem::open(Cursor::new(img.clone()), 0).expect("open HP-UX HFS");
+        assert!(fs.is_hpux_hfs());
+        let root = fs.root().expect("root");
+        assert!(fs.list_directory(&root).expect("ls").is_empty());
+        let edit = crate::fs::open_editable_filesystem(Cursor::new(img), 0, 0x00, None);
+        assert!(edit.is_err(), "HP-UX HFS must stay read-only for now");
+    }
+
     /// A volume that only reads back is not a filesystem. Writing into it and
     /// checking afterwards is what proves the free maps and counters agree.
     #[test]

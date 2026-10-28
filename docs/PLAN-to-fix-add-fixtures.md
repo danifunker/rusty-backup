@@ -177,6 +177,21 @@ ISO 9660 + Rock Ridge already browse on all five ISOs. What each disc also carri
 
 ### Phase 2: HP 9000 (LIF, BSD label, HP-HFS, HP-UX LVM, VxFS)
 
+**2a done 2026-10-28 (items 2.1-2.3 on disks):**
+- `PartitionTable::Bsd` (`partition/bsd.rs`): finds the label at 1024 / 512 / 64 / 128
+  in either byte order, checks the XOR checksum, hides the raw whole-disk slot, and
+  lists a LIF boot volume ahead of it as a *LIF boot area* row (type string `LIF`,
+  opened by `fs::lif::LifFilesystem`). Whole-disk CHD backup works; editing and
+  resize-on-restore are recorded in `docs/stubs.md`.
+- HP-UX HFS: `fs::ufs` accepts big-endian `0x095014` / `0x195612` at the UFS1
+  superblock (`ufs::is_ufs_magic`, which also feeds both content detectors), and fsck
+  checks backup superblocks against the magic the volume actually has. Editable opens
+  are refused for now (`open_ufs_editable`). The 11.11 `/stand`, carved by hand,
+  lists (`vmunix`, `bootconf`) and fscks clean.
+- Fixtures: `part.bsd.netbsd92-hp300.hd`, `fs.hpux-hfs.hp385-hpux.hd`;
+  cases in `cases/tier2/read-hp9000-disks.toml`.
+
+
 | # | Item | Effort |
 |---|---|---|
 | 2.1 | LIF volume header + directory: recognise it, and expose the LIF files (ISL, HPUX, BOOT43, ...) as a read-only listing | S–M |

@@ -1215,6 +1215,20 @@ fn run_backup_inner(
                 bail!("{}", LABEL_BACKUP_NEEDS_CHD);
             }
         }
+        PartitionTable::Bsd(label) => {
+            let json = serde_json::to_string_pretty(label)
+                .context("failed to serialize BSD disk label to JSON")?;
+            std::fs::write(backup_folder.join("bsd.json"), json)
+                .context("failed to write bsd.json")?;
+            log(
+                &progress,
+                LogLevel::Info,
+                "Exported BSD disk label (bsd.json)",
+            );
+            if !single_file_chd_planned {
+                bail!("{}", LABEL_BACKUP_NEEDS_CHD);
+            }
+        }
         PartitionTable::Next(label) => {
             let json = serde_json::to_string_pretty(label)
                 .context("failed to serialize NeXT disk label to JSON")?;

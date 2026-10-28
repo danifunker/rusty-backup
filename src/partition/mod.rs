@@ -1,6 +1,7 @@
 pub mod alignment;
 pub mod apm;
 pub mod atari;
+pub mod bsd;
 pub mod editor;
 pub mod gpt;
 pub mod mac_cd_builder;
@@ -26,6 +27,7 @@ use std::io::{Read, Seek, SeekFrom};
 use crate::error::RustyBackupError;
 use apm::Apm;
 use atari::{looks_like_ahdi_root, AhdiPartitionKind, AhdiTable, AHDI_NUM_SLOTS};
+use bsd::BsdDiskLabel;
 use gpt::Gpt;
 use mbr::Mbr;
 use next::NextDiskLabel;
@@ -65,6 +67,9 @@ pub enum PartitionTable {
     /// 8 partitions, big-endian, counted in `d_secsize` (1024-byte) sectors
     /// past a front porch; see `src/partition/next.rs`.
     Next(NextDiskLabel),
+    /// BSD `struct disklabel` on a dedicated disk (NetBSD/hp300 behind a LIF boot
+    /// volume, others at sector 1); read-only, see `src/partition/bsd.rs`.
+    Bsd(BsdDiskLabel),
     /// Solaris x86 — an ordinary MBR whose Solaris partition (type `0x82` /
     /// `0xBF`) nests a 16-slice VTOC in its second sector. Slice offsets are
     /// partition-relative; see `src/partition/solaris_x86.rs`.
@@ -715,13 +720,8 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
     for &cand in &[8192u64, 65536u64] {
         if reader.seek(SeekFrom::Start(cand + 1372)).is_ok() {
             let mut m = [0u8; 4];
-            if reader.read_exact(&mut m).is_ok() {
-                let le = u32::from_le_bytes(m);
-                let be = u32::from_be_bytes(m);
-                if le == 0x0001_1954 || le == 0x1954_0119 || be == 0x0001_1954 || be == 0x1954_0119
-                {
-                    return Some("UFS".to_string());
-                }
+            if reader.read_exact(&mut m).is_ok() && crate::fs::ufs::is_ufs_magic(m, cand == 8192) {
+                return Some("UFS".to_string());
             }
         }
     }
@@ -946,6 +946,48 @@ pub fn is_known_layout(expected: &str) -> bool {
                 .any(|(a, _)| normalise_layout(a) == want))
 }
 
+/// Slot index given to the LIF boot-area row, past any real BSD slot letter.
+pub const BSD_LIF_ROW_INDEX: usize = 26;
+
+/// BSD label slots, then the LIF boot volume ahead of them when the disk has one.
+fn bsd_partitions(label: &BsdDiskLabel) -> Vec<PartitionInfo> {
+    let row = |index: usize, type_name: String, start: u64, size: u64, ts: Option<String>| {
+        PartitionInfo {
+            index,
+            type_name,
+            partition_type_byte: 0,
+            start_lba: start / 512,
+            start_byte: Some(start),
+            size_bytes: size,
+            bootable: false,
+            is_logical: false,
+            is_extended_container: false,
+            partition_type_string: ts,
+            hfs_block_size: None,
+            rdb_part_block: None,
+            drv_name: None,
+        }
+    };
+    let mut out: Vec<PartitionInfo> = label
+        .browsable_partitions()
+        .map(|(i, p)| {
+            // Type byte 0: the UFS superblock is found by content, so swap simply won't open.
+            let name = format!("BSD {} ({})", p.letter, p.fstype_name());
+            row(i, name, label.start_byte(p), label.size_bytes(p), None)
+        })
+        .collect();
+    if label.has_lif {
+        out.push(row(
+            BSD_LIF_ROW_INDEX,
+            "LIF boot area".to_string(),
+            0,
+            label.head_bytes(),
+            Some("LIF".to_string()),
+        ));
+    }
+    out
+}
+
 /// The MBR's own entries: primaries at their slot (0-3), EBR logicals from 4.
 fn mbr_partitions(mbr: &Mbr) -> Vec<PartitionInfo> {
     let mut result: Vec<PartitionInfo> = mbr
@@ -1064,6 +1106,9 @@ impl PartitionTable {
             .map_err(RustyBackupError::Io)?;
         if let Some(label) = next::detect(reader) {
             return Ok(PartitionTable::Next(label));
+        }
+        if let Some(label) = BsdDiskLabel::detect(reader) {
+            return Ok(PartitionTable::Bsd(label));
         }
         reader
             .seek(SeekFrom::Start(0))
@@ -1308,7 +1353,7 @@ impl PartitionTable {
             // No platform convention; `@DH0` is the identity users know.
             PartitionTable::Rdb(_) => Some(raw),
             // NeXTSTEP names slots by letter; the number behind `a` is 0.
-            PartitionTable::Next(_) => Some(raw),
+            PartitionTable::Next(_) | PartitionTable::Bsd(_) => Some(raw),
             // Solaris `format(1M)` numbers slices from 0 and `index` keeps the
             // VTOC position; the MBR entries listed after them have no `sN`.
             PartitionTable::SolarisX86 { .. } => {
@@ -1329,6 +1374,7 @@ impl PartitionTable {
                 | PartitionTable::SgiDkLabel(_)
                 | PartitionTable::Sun(_)
                 | PartitionTable::Next(_)
+                | PartitionTable::Bsd(_)
                 | PartitionTable::SolarisX86 { .. }
                 | PartitionTable::Rdb(_)
         )
@@ -1520,6 +1566,7 @@ impl PartitionTable {
                     drv_name: None,
                 })
                 .collect(),
+            PartitionTable::Bsd(label) => bsd_partitions(label),
             PartitionTable::SolarisX86 { mbr, label } => {
                 let mut result: Vec<PartitionInfo> = solaris_slice_partitions(label);
                 // The rest of the MBR is still a disk; its entries list after
@@ -1826,6 +1873,7 @@ impl PartitionTable {
             PartitionTable::SgiDkLabel(_) => "SGI-DkLabel",
             PartitionTable::Sun(_) => "Sun",
             PartitionTable::Next(_) => "NeXT",
+            PartitionTable::Bsd(_) => "BSD",
             PartitionTable::SolarisX86 { .. } => "Solaris-x86",
             PartitionTable::Ahdi(_) => "AHDI",
             PartitionTable::X68k { .. } => "X68k",
@@ -1855,6 +1903,7 @@ impl PartitionTable {
             | PartitionTable::SgiDkLabel(_)
             | PartitionTable::Sun(_)
             | PartitionTable::Next(_)
+            | PartitionTable::Bsd(_)
             | PartitionTable::SolarisX86 { .. }
             | PartitionTable::Ahdi(_)
             | PartitionTable::X68k { .. }
@@ -3009,6 +3058,7 @@ mod type_name_parity {
             PartitionTable::X68k { .. } => 10,
             PartitionTable::None { .. } => 11,
             PartitionTable::Dsd { .. } => 12,
+            PartitionTable::Bsd(_) => 13,
         }
     }
 
