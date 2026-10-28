@@ -30,6 +30,7 @@ use apm::Apm;
 use atari::{looks_like_ahdi_root, AhdiPartitionKind, AhdiTable, AHDI_NUM_SLOTS};
 use bsd::BsdDiskLabel;
 use gpt::Gpt;
+use lvm::aix::AixLvm;
 use lvm::hpux::HpuxLvm;
 use mbr::Mbr;
 use next::NextDiskLabel;
@@ -75,6 +76,9 @@ pub enum PartitionTable {
     /// HP-UX LVM physical volume (HP-UX 10.x / 11.x), single-disk groups only;
     /// see `src/partition/lvm/hpux.rs`.
     HpuxLvm(HpuxLvm),
+    /// AIX LVM physical volume (every AIX disk), single-disk groups only;
+    /// see `src/partition/lvm/aix.rs`.
+    AixLvm(AixLvm),
     /// Solaris x86 — an ordinary MBR whose Solaris partition (type `0x82` /
     /// `0xBF`) nests a 16-slice VTOC in its second sector. Slice offsets are
     /// partition-relative; see `src/partition/solaris_x86.rs`.
@@ -733,6 +737,9 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
     if crate::fs::vxfs::detect(reader, 0).is_some() {
         return Some("VxFS".to_string());
     }
+    if crate::fs::jfs1::detect(reader, 0) {
+        return Some("AIX JFS".to_string());
+    }
 
     // JFS2 aggregate superblock at byte 32768, ASCII magic "JFS1". (AIX JFS1
     // is an unrelated on-disk format and is excluded by this same magic.)
@@ -954,31 +961,11 @@ pub fn is_known_layout(expected: &str) -> bool {
                 .any(|(a, _)| normalise_layout(a) == want))
 }
 
-/// Type-string prefix for an LV row that cannot be opened; the reason follows the colon.
-pub const LVM_UNAVAILABLE: &str = "LVM-UNAVAILABLE:";
-
 /// HP-UX LVs by number, after the LIF boot volume (row 0) when the disk has one.
 fn hpux_lvm_partitions(lvm: &HpuxLvm) -> Vec<PartitionInfo> {
-    let row = |index: usize, type_name: String, start: u64, size: u64, ts: Option<String>| {
-        PartitionInfo {
-            index,
-            type_name,
-            partition_type_byte: 0,
-            start_lba: start / 512,
-            start_byte: Some(start),
-            size_bytes: size,
-            bootable: false,
-            is_logical: false,
-            is_extended_container: false,
-            partition_type_string: ts,
-            hfs_block_size: None,
-            rdb_part_block: None,
-            drv_name: None,
-        }
-    };
-    let mut out = Vec::new();
+    let mut lead = Vec::new();
     if lvm.has_lif {
-        out.push(row(
+        lead.push(lvm_row(
             0,
             "LIF boot area".into(),
             0,
@@ -986,27 +973,66 @@ fn hpux_lvm_partitions(lvm: &HpuxLvm) -> Vec<PartitionInfo> {
             Some("LIF".into()),
         ));
     }
-    for (n, lv) in &lvm.volumes {
-        let name = format!("HP-UX LVM {}", lv.name);
-        let start = lv.runs.first().map(|r| r.0).unwrap_or(lvm.pe_start);
-        let unavailable = if !lv.complete {
+    lvm_rows("HP-UX LVM", &lvm.volumes, lvm.pe_start, lead)
+}
+
+fn lvm_row(
+    index: usize,
+    type_name: String,
+    start: u64,
+    size: u64,
+    ts: Option<String>,
+) -> PartitionInfo {
+    PartitionInfo {
+        index,
+        type_name,
+        partition_type_byte: 0,
+        start_lba: start / 512,
+        start_byte: Some(start),
+        size_bytes: size,
+        bootable: false,
+        is_logical: false,
+        is_extended_container: false,
+        partition_type_string: ts,
+        hfs_block_size: None,
+        rdb_part_block: None,
+        drv_name: None,
+    }
+}
+
+/// One row per LV: contiguous ones open in place, split ones through their runs, and
+/// ones with extents on another disk carry the reason they cannot open.
+fn lvm_rows(
+    scheme: &str,
+    volumes: &[(u32, lvm::LogicalVolume)],
+    data_start: u64,
+    mut out: Vec<PartitionInfo>,
+) -> Vec<PartitionInfo> {
+    for (n, lv) in volumes {
+        let start = lv.runs.first().map(|r| r.0).unwrap_or(data_start);
+        let type_string = if !lv.complete {
             Some(format!(
                 "{LVM_UNAVAILABLE}{} has extents on another disk; only single-disk volume groups are supported",
                 lv.name
             ))
-        } else if lv.contiguous_start().is_none() {
-            Some(format!(
-                "{LVM_UNAVAILABLE}{} is split across {} runs; fragmented LVs are not supported yet (docs/stubs.md)",
-                lv.name,
-                lv.runs.len()
-            ))
-        } else {
+        } else if lv.contiguous_start().is_some() {
             None
+        } else {
+            Some(lvm::encode_runs(&lv.runs))
         };
-        out.push(row(*n as usize, name, start, lv.size_bytes, unavailable));
+        out.push(lvm_row(
+            *n as usize,
+            format!("{scheme} {}", lv.name),
+            start,
+            lv.size_bytes,
+            type_string,
+        ));
     }
     out
 }
+
+/// Type-string prefix for an LV row that cannot be opened; the reason follows the colon.
+pub const LVM_UNAVAILABLE: &str = "LVM-UNAVAILABLE:";
 
 /// Slot index given to the LIF boot-area row, past any real BSD slot letter.
 pub const BSD_LIF_ROW_INDEX: usize = 26;
@@ -1171,6 +1197,10 @@ impl PartitionTable {
         }
         if let Some(lvm) = HpuxLvm::detect(reader) {
             return Ok(PartitionTable::HpuxLvm(lvm));
+        }
+        // AIX: an IPL record (and often a PReP MBR) at 0, the LVM record at sector 7.
+        if let Some(lvm) = AixLvm::detect(reader) {
+            return Ok(PartitionTable::AixLvm(lvm));
         }
         if let Some(label) = BsdDiskLabel::detect(reader) {
             return Ok(PartitionTable::Bsd(label));
@@ -1418,9 +1448,10 @@ impl PartitionTable {
             // No platform convention; `@DH0` is the identity users know.
             PartitionTable::Rdb(_) => Some(raw),
             // NeXTSTEP names slots by letter; the number behind `a` is 0.
-            PartitionTable::Next(_) | PartitionTable::Bsd(_) | PartitionTable::HpuxLvm(_) => {
-                Some(raw)
-            }
+            PartitionTable::Next(_)
+            | PartitionTable::Bsd(_)
+            | PartitionTable::HpuxLvm(_)
+            | PartitionTable::AixLvm(_) => Some(raw),
             // Solaris `format(1M)` numbers slices from 0 and `index` keeps the
             // VTOC position; the MBR entries listed after them have no `sN`.
             PartitionTable::SolarisX86 { .. } => {
@@ -1443,6 +1474,7 @@ impl PartitionTable {
                 | PartitionTable::Next(_)
                 | PartitionTable::Bsd(_)
                 | PartitionTable::HpuxLvm(_)
+                | PartitionTable::AixLvm(_)
                 | PartitionTable::SolarisX86 { .. }
                 | PartitionTable::Rdb(_)
         )
@@ -1636,6 +1668,9 @@ impl PartitionTable {
                 .collect(),
             PartitionTable::Bsd(label) => bsd_partitions(label),
             PartitionTable::HpuxLvm(lvm) => hpux_lvm_partitions(lvm),
+            PartitionTable::AixLvm(lvm) => {
+                lvm_rows("AIX LVM", &lvm.volumes, lvm.pp_start, Vec::new())
+            }
             PartitionTable::SolarisX86 { mbr, label } => {
                 let mut result: Vec<PartitionInfo> = solaris_slice_partitions(label);
                 // The rest of the MBR is still a disk; its entries list after
@@ -1944,6 +1979,7 @@ impl PartitionTable {
             PartitionTable::Next(_) => "NeXT",
             PartitionTable::Bsd(_) => "BSD",
             PartitionTable::HpuxLvm(_) => "HP-UX LVM",
+            PartitionTable::AixLvm(_) => "AIX LVM",
             PartitionTable::SolarisX86 { .. } => "Solaris-x86",
             PartitionTable::Ahdi(_) => "AHDI",
             PartitionTable::X68k { .. } => "X68k",
@@ -1975,6 +2011,7 @@ impl PartitionTable {
             | PartitionTable::Next(_)
             | PartitionTable::Bsd(_)
             | PartitionTable::HpuxLvm(_)
+            | PartitionTable::AixLvm(_)
             | PartitionTable::SolarisX86 { .. }
             | PartitionTable::Ahdi(_)
             | PartitionTable::X68k { .. }
@@ -3131,6 +3168,7 @@ mod type_name_parity {
             PartitionTable::Dsd { .. } => 12,
             PartitionTable::Bsd(_) => 13,
             PartitionTable::HpuxLvm(_) => 14,
+            PartitionTable::AixLvm(_) => 15,
         }
     }
 

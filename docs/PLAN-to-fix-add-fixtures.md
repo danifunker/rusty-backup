@@ -224,6 +224,23 @@ routes it, so the HP-UX LV opens it. Case `read.hpux-lvm.hpux1111-vxfs-root`.
 
 ### Phase 3: AIX (IPL/PReP, AIX LVM, JFS1; JFS2-BE shelved)
 
+**Done 2026-10-28 (3.1-3.3).**
+- `partition/lvm/aix.rs`: LVM record at sector 7, the newer VGDA copy, named LVs,
+  this PV's partition map (mirror copies collapse). The IPL record is recorded.
+  `PartitionTable::AixLvm`.
+- Fragmented LVs (AIX's `hd4` / `hd2` always are) open through
+  `lvm::ExtentReader`. Their runs ride in the row's type string (`LVM-RUNS:`), so
+  `fs::open_filesystem_by_string` stitches them and detects by content, with no
+  call-site changes. This also retired the HP-UX "fragmented LVs refused" stub.
+- `fs/jfs1.rs`: AIX JFS fsv3 / fsv3p, read-only. IBM's `filsys.h` / `inode.h` docs
+  gave the superblock and reserved inodes; inode placement, page maps (direct /
+  single / double indirect with `{virtual, real}` root pairs), fragment
+  addresses and the directory format were worked out from the AIX 4.3.3 rootvg.
+  `/usr/lib/libs.a` (1566 pages, double indirect) walks its 95-member archive
+  chain end to end; `/etc/passwd`, `/var` (512-byte fragments) and `/tmp` (fsv3) read.
+- Fixture `part.aix-lvm.aix433-rootvg.hd`, case `cases/tier2/read-aix-rootvg.toml`.
+**Phase 3 (#91) is complete**, with JFS2-BE shelved as agreed.
+
 | # | Item | Effort |
 |---|---|---|
 | 3.1 | Recognise the IBM IPL record; label MBR type `0x41` as "PReP boot" (fixes the "Unknown" rows on the AIX disk, LCD4 CD and `rs6karc151.img`) | S |

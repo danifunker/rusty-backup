@@ -216,6 +216,9 @@ pub fn apply_edits(
         PartitionTable::HpuxLvm(_) => {
             bail!("HP-UX LVM editing is not yet implemented (read / browse / back up only)")
         }
+        PartitionTable::AixLvm(_) => {
+            bail!("AIX LVM editing is not yet implemented (read / browse / back up only)")
+        }
         PartitionTable::SolarisX86 { mbr, label } => {
             apply_solaris_x86_edits(file, mbr, label, edits, log_cb)
         }

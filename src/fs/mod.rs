@@ -63,6 +63,7 @@ pub mod human68k_clone;
 pub mod id_names;
 pub mod import_sink;
 pub mod jfs;
+pub mod jfs1;
 pub mod jfs_fsck;
 pub mod layout_preserving;
 pub mod lif;
@@ -314,6 +315,7 @@ fn fs_display_name(detected: &str) -> &'static str {
         "reiserfs" => "ReiserFS",
         "ufs" => "UFS",
         "vxfs" => "VxFS",
+        "jfs1" => "AIX JFS",
         "hpfs" => "HPFS",
         "apfs" => "APFS",
         "squashfs" => "SquashFS",
@@ -572,6 +574,10 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
     // Veritas VxFS: magic 0xA501FCF5 at 8192 big-endian (HP-UX) or 1024 little-endian.
     if vxfs::detect(reader, partition_offset).is_some() {
         return "vxfs";
+    }
+    // AIX JFS (JFS1): magic 0x43218765 / 0x65872143 at byte 4096, after the LV control block.
+    if jfs1::detect(reader, partition_offset) {
+        return "jfs1";
     }
 
     // JFS2 magic probe. The primary aggregate superblock lives at byte
@@ -1289,6 +1295,7 @@ pub fn fs_name_for(partition_type: u8, partition_type_string: Option<&str>) -> &
         return match s {
             "LIF" => "LIF",
             s if s.starts_with(crate::partition::LVM_UNAVAILABLE) => "unavailable",
+            s if s.starts_with(crate::partition::lvm::LVM_RUNS) => "LVM volume",
             "Apple_HFS" => "HFS",
             "Apple_HFSX" => "HFSX",
             // Apple HFS/HFS+ GPT partition GUID (UDIF DMG / hdiutil disks).
@@ -1889,6 +1896,10 @@ pub fn open_filesystem_full<R: Read + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "jfs1" => Ok(Box::new(jfs1::Jfs1Filesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 "jfs" => Ok(Box::new(jfs::JfsFilesystem::open(
                     reader,
                     partition_offset,
@@ -2014,6 +2025,10 @@ pub fn open_filesystem_full<R: Read + Seek + Send + 'static>(
                     partition_offset,
                 )?)),
                 "vxfs" => Ok(Box::new(vxfs::VxfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "jfs1" => Ok(Box::new(jfs1::Jfs1Filesystem::open(
                     reader,
                     partition_offset,
                 )?)),
@@ -2675,6 +2690,16 @@ fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
     passphrase: Option<&str>,
 ) -> Result<Box<dyn Filesystem>, FilesystemError> {
     match type_str {
+        // An LV split into several runs: stitch them into one volume and detect by content.
+        s if s.starts_with(crate::partition::lvm::LVM_RUNS) => {
+            let runs = crate::partition::lvm::decode_runs(s)
+                .ok_or_else(|| FilesystemError::Parse(format!("bad LV run list '{s}'")))?;
+            let lv = crate::partition::lvm::ExtentReader::new(reader, runs);
+            let len = lv.len();
+            // Boxed so the recursive open stays one type instead of nesting readers.
+            let lv: Box<dyn crate::rbformats::ReadSeek> = Box::new(lv);
+            open_filesystem_full(lv, 0, Some(len), 0x00, None, passphrase)
+        }
         // An LV row that can't be opened carries its reason after the prefix.
         s if s.starts_with(crate::partition::LVM_UNAVAILABLE) => Err(FilesystemError::Unsupported(
             s[crate::partition::LVM_UNAVAILABLE.len()..].to_string(),

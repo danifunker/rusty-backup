@@ -12,14 +12,15 @@ finish it. Remove an entry when its work ships.
 | BSD disklabel | Resizing partitions on restore is refused ("no restore-time label patcher for BSD tables") | `partition/restore_patch.rs` | A `patch_bsd` that repacks slots like `patch_next`, keeping the LIF volume and the label's offset intact |
 | BSD disklabel | Only whole-disk backup through the single-file CHD layout; per-partition layouts are refused | `backup/mod.rs` | Same as the other label schemes; unlikely to change |
 | HP-UX LVM (`PartitionTable::HpuxLvm`) | Editing, LV resize and resize-on-restore are refused; whole-disk CHD backup only | `partition/editor.rs`, `partition/restore_patch.rs` | Round-trip the VGDA (both copies, timestamps, VGSA) before touching extents |
-| HP-UX LVM | An LV split across several extent runs is listed but refused on open ("fragmented LVs are not supported yet") | `partition::hpux_lvm_partitions`, `LVM_UNAVAILABLE` | An extent-mapping `Read + Seek` over `LogicalVolume::runs`, threaded through the partition open path |
-| HP-UX LVM | Multi-disk volume groups: LVs with extents on another PV are listed but refused | same | Out of scope by decision (single-disk only) |
+| HP-UX LVM, AIX LVM | Multi-disk volume groups: LVs with extents on another PV are listed but refused | `partition::lvm_rows`, `LVM_UNAVAILABLE` | Out of scope by decision (single-disk only) |
+| AIX LVM (`PartitionTable::AixLvm`) | Editing, LV resize and resize-on-restore are refused; whole-disk CHD backup only | `partition/editor.rs`, `partition/restore_patch.rs` | Round-trip both VGDA copies and the VGSA before touching partitions |
 
 ## Filesystems
 
 | Filesystem | Gap | Where | To finish |
 |---|---|---|---|
 | HP-UX HFS (UFS1 with magic `0x095014` / `0x195612`) | Read-only: editable opens are refused ("HP-UX HFS is read-only for now") | `fs::open_ufs_editable` | Verify that UFS writes keep HP's magic, `fs_clean` handling and long-name directories intact; check edits with HP-UX's `fsck` in the hp9000-715 emulator |
+| AIX JFS (`fs::jfs1`) | Read-only, no fsck; volumes with compression enabled (`s_compress`) refuse file reads | `fs/jfs1.rs` | Decode JFS1's LZ page compression; then writes, verified on a real AIX |
 | VxFS (`fs::vxfs`) | Read-only; disk layouts 5 and later (HP-UX 11.23 / 11.31) are refused; no fsck; no compaction (backup copies it raw) | `fs/vxfs.rs` | Layout 5+ differences (64-bit fields, new OLT records), then writes; verify against the hp9000-715 HP-UX `fsck_vxfs` |
 | HP LIF (`fs::lif`) | Read-only | `fs/lif.rs` | Write support only if a use case appears (replacing a boot program) |
 | AIX JFS2 (big-endian JFS2) | **Shelved**: no AIX 5L+ fixture to verify against | plan item 3.4 | Make `fs/jfs.rs` endian-generic once a fixture exists |

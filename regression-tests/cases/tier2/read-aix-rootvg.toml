@@ -1,0 +1,42 @@
+# Tier 2 — AIX 4.3.3 rootvg (issue #91, Phase 3).
+#
+#   part.aix-lvm.aix433-rootvg.hd   IBM IPL record + PReP MBR at sector 0, AIX LVM
+#                                   record at sector 7, 8 MiB physical partitions.
+#                                   hd4 (/) is 4 runs and hd2 (/usr) 6 runs, so
+#                                   they open through the extent-stitching reader.
+#                                   Filesystems are the original AIX JFS (JFS1):
+#                                   fsv3p on /, /usr, /var (512-byte fragments)
+#                                   and the older fsv3 on /tmp.
+#
+# libs.a in /usr/lib is 1566 pages through a double-indirect map; its AIX big-
+# archive member chain was walked end to end (95 members) when this was written.
+
+[meta]
+tier = 2
+group = "fs.read.aix"
+description = "AIX LVM rootvg with fragmented LVs and AIX JFS (fsv3 / fsv3p)."
+
+[[case]]
+id = "read.aix-lvm.aix433-rootvg"
+description = "AIX LVM: named LVs from the VGDA, fragmented hd4/hd2 stitched, JFS1 browsed."
+fixture = "part.aix-lvm.aix433-rootvg.hd"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["Partition table: AIX LVM", "AIX LVM hd5", "AIX LVM hd4", "AIX LVM hd2", "AIX LVM hd9var", "AIX LVM hd3", "1016.0 MiB"]
+[[case.step]]
+args = ["ls", "{fixture}@4", "/"]
+expect_exit = 0
+stdout_contains = ["smit.log", "audit", "lost+found"]
+[[case.step]]
+args = ["ls", "{fixture}@5", "/lib"]
+expect_exit = 0
+stdout_contains = ["libs.a", "6411931"]
+[[case.step]]
+args = ["show", "fs-info", "{fixture}@6"]
+expect_exit = 0
+stdout_contains = ["AIX JFS (fsv3p)", "/var"]
+[[case.step]]
+args = ["show", "fs-info", "{fixture}@7"]
+expect_exit = 0
+stdout_contains = ["AIX JFS (fsv3)", "/tmp"]

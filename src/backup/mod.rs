@@ -1215,6 +1215,20 @@ fn run_backup_inner(
                 bail!("{}", LABEL_BACKUP_NEEDS_CHD);
             }
         }
+        PartitionTable::AixLvm(lvm) => {
+            let json = serde_json::to_string_pretty(lvm)
+                .context("failed to serialize AIX LVM layout to JSON")?;
+            std::fs::write(backup_folder.join("aix_lvm.json"), json)
+                .context("failed to write aix_lvm.json")?;
+            log(
+                &progress,
+                LogLevel::Info,
+                "Exported AIX LVM layout (aix_lvm.json)",
+            );
+            if !single_file_chd_planned {
+                bail!("{}", LABEL_BACKUP_NEEDS_CHD);
+            }
+        }
         PartitionTable::HpuxLvm(lvm) => {
             let json = serde_json::to_string_pretty(lvm)
                 .context("failed to serialize HP-UX LVM layout to JSON")?;
