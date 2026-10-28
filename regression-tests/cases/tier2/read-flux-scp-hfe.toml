@@ -46,3 +46,25 @@ args = ["tar", "{fixture}", "/", "{scratch}/all.tar"]
 expect_exit = 0
 stderr_not_contains = ["unreadable"]
 file_sha256 = [{ path = "{scratch}/all.tar", sha256 = "8630d6a9a6512c0a95053bdcefea0ff8871bf28dd6cf30afc7f8f35ce05302b4" }]
+
+[[case]]
+id = "read.flux.scp-amiga-dd"
+description = "AmigaDOS MFM is picked by probing and decodes byte-identically to the ADF"
+fixture = "flux.scp.amiga-dd.floppy"
+timeout_ms = 300000
+[[case.step]]
+args = ["tar", "{fixture}", "/", "{scratch}/all.tar"]
+expect_exit = 0
+stderr_not_contains = ["unreadable"]
+file_sha256 = [{ path = "{scratch}/all.tar", sha256 = "35b22b5b78f58eccaa45c072c508843371b9648a34b1545c949d86811811f6f4" }]
+
+[[case]]
+id = "read.flux.scp-acorn-dfs"
+description = "IBM FM with records from 0 decodes byte-identically to the SSD"
+fixture = "flux.scp.acorn-dfs.floppy"
+timeout_ms = 300000
+[[case.step]]
+args = ["tar", "{fixture}", "/", "{scratch}/all.tar"]
+expect_exit = 0
+stderr_not_contains = ["unreadable"]
+file_sha256 = [{ path = "{scratch}/all.tar", sha256 = "0bfc5b6a7621bde7f768bfd7a945a3a524c81b88b19b42cb526b72ae784031db" }]

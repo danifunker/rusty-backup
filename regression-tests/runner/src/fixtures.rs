@@ -271,10 +271,11 @@ impl Catalog {
         if row.sha256.is_empty() {
             return Ok(false);
         }
-        let bytes = fs::read(&path).map_err(|e| format!("{}: {}", path.display(), e))?;
+        // Streamed: the large annex holds multi-GiB disks, and reading one whole OOM-killed the box.
         use sha2::{Digest, Sha256};
+        let mut file = fs::File::open(&path).map_err(|e| format!("{}: {}", path.display(), e))?;
         let mut h = Sha256::new();
-        h.update(&bytes);
+        std::io::copy(&mut file, &mut h).map_err(|e| format!("{}: {}", path.display(), e))?;
         let got: String = h.finalize().iter().map(|b| format!("{:02x}", b)).collect();
         if got.eq_ignore_ascii_case(&row.sha256) {
             Ok(true)

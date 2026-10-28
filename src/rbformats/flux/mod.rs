@@ -9,10 +9,13 @@
 //! - a capture format turns its files into [`FluxTrack`]s (transition intervals
 //!   in nanoseconds per cylinder / head): [`kryoflux`], [`scp`] (Greaseweazle's
 //!   native format), [`hfe`] (HxC bitstreams, cells turned into intervals);
-//! - an encoding turns a track into sectors: [`mfm`] (IBM-style MFM);
+//! - an encoding turns a track into sectors: [`mfm`] (IBM-style MFM), [`fm`]
+//!   (IBM-style FM) and [`amiga`] (AmigaDOS MFM), picked by probing a few tracks;
 //! - [`decode_disk`] lays the sectors out by the cylinder / head / sector their
 //!   own ID fields carry and reports what it could not read, which is zero-filled.
 
+pub mod amiga;
+pub mod fm;
 pub mod hfe;
 pub mod kryoflux;
 pub mod mfm;
@@ -47,7 +50,7 @@ pub fn record_faults(path: &Path, disk: &DecodedDisk) {
                 .faults
                 .iter()
                 .map(|&(c, h, r, f)| {
-                    let lba = (c * disk.heads + h) * disk.sectors_per_track + r - 1;
+                    let lba = (c * disk.heads + h) * disk.sectors_per_track + r - disk.first_record;
                     let why = match f {
                         SectorFault::Crc => "bad CRC, best copy kept",
                         SectorFault::Missing => "missing, zero-filled",
@@ -130,6 +133,8 @@ pub struct DecodedDisk {
     pub heads: u32,
     pub sectors_per_track: u32,
     pub sector_size: usize,
+    /// The lowest record number on a track (1 for IBM PC, 0 for Acorn DFS).
+    pub first_record: u32,
     pub faults: Vec<(u32, u32, u32, SectorFault)>,
 }
 
@@ -165,13 +170,41 @@ impl DecodedDisk {
     }
 }
 
-/// Decode every track with IBM MFM and lay the sectors out by their own ID fields, so a
-/// 40-track disk captured on an 80-track drive lands on the right cylinders.
+/// A track decoder: one encoding's sectors from a track's flux.
+type TrackDecoder = fn(&[u32]) -> Vec<Sector>;
+
+/// The encoding that reads the most clean sectors from a few sample tracks.
+fn pick_encoding(tracks: &[FluxTrack]) -> TrackDecoder {
+    let decoders: [TrackDecoder; 3] = [mfm::decode_track, amiga::decode_track, fm::decode_track];
+    let step = (tracks.len() / 3).max(1);
+    let sample: Vec<&FluxTrack> = tracks.iter().step_by(step).take(3).collect();
+    let score = |d: &TrackDecoder| -> usize {
+        sample
+            .iter()
+            .map(|t| d(&t.intervals_ns).iter().filter(|s| s.ok).count())
+            .sum()
+    };
+    let mut best = decoders[0];
+    let mut best_score = score(&best);
+    for d in &decoders[1..] {
+        // MFM is the common case; only switch when another encoding clearly reads more.
+        let n = score(d);
+        if n > best_score {
+            best = *d;
+            best_score = n;
+        }
+    }
+    best
+}
+
+/// Decode every track and lay the sectors out by their own ID fields, so a 40-track
+/// disk captured on an 80-track drive lands on the right cylinders.
 pub fn decode_disk(tracks: &[FluxTrack]) -> Option<DecodedDisk> {
+    let decode = pick_encoding(tracks);
     let mut found: BTreeMap<(u32, u32, u32), Sector> = BTreeMap::new();
     let mut damaged: BTreeMap<(u32, u32, u32), Vec<Sector>> = BTreeMap::new();
     for t in tracks {
-        for s in mfm::decode_track(&t.intervals_ns) {
+        for s in decode(&t.intervals_ns) {
             let key = (s.cyl as u32, s.head as u32, s.record as u32);
             if !s.ok {
                 damaged.entry(key).or_default().push(s.clone());
@@ -202,19 +235,22 @@ pub fn decode_disk(tracks: &[FluxTrack]) -> Option<DecodedDisk> {
     }
     let sector_size = *sizes.iter().max_by_key(|(_, n)| **n)?.0;
     let common = records.values().copied().max()?;
-    let spt = records
+    let usual: Vec<u32> = records
         .iter()
         .filter(|(_, &n)| n * 4 >= common)
         .map(|(&r, _)| r)
-        .max()?;
+        .collect();
+    // Records usually count from 1; Acorn DFS and others start at 0.
+    let first = *usual.iter().min()?;
+    let spt = usual.iter().max()? - first + 1;
     let heads = good.iter().map(|s| s.head as u32).max()? + 1;
     let cylinders = good.iter().map(|s| s.cyl as u32).max()? + 1;
     let mut image = vec![0u8; (cylinders * heads * spt) as usize * sector_size];
     let mut faults = Vec::new();
     for c in 0..cylinders {
         for h in 0..heads {
-            for r in 1..=spt {
-                let lba = ((c * heads + h) * spt + r - 1) as usize;
+            for r in first..first + spt {
+                let lba = ((c * heads + h) * spt + r - first) as usize;
                 match found.get(&(c, h, r)) {
                     Some(s) => {
                         let n = s.data.len().min(sector_size);
@@ -235,6 +271,7 @@ pub fn decode_disk(tracks: &[FluxTrack]) -> Option<DecodedDisk> {
         heads,
         sectors_per_track: spt,
         sector_size,
+        first_record: first,
         faults,
     })
 }

@@ -483,7 +483,8 @@ fn extract_file_to_host(
     if let Some(parent) = host_target.parent() {
         ensure_dir(parent)?;
     }
-    if opts.rs_to_lf {
+    // Text files are small; anything bigger streams unchanged instead of loading into RAM.
+    if opts.rs_to_lf && entry.size <= 16 << 20 {
         let data = fs
             .read_file(entry, usize::MAX)
             .map_err(|e| anyhow!("read_file({}): {e}", entry.path))?;

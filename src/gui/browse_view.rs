@@ -6344,7 +6344,7 @@ fn extract_entry(
                 p.current_file = entry.path.clone();
             }
 
-            if rs_to_lf {
+            if rs_to_lf && entry.size <= 16 << 20 {
                 let data = fs.read_file(entry, usize::MAX)?;
                 if rusty_backup::fs::qnx2::looks_like_rs_text(&data) {
                     std::fs::write(

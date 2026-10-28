@@ -13,7 +13,7 @@ const SYNC: u64 = 0x4489_4489_4489;
 const SYNC_MASK: u64 = 0xFFFF_FFFF_FFFF;
 const IDAM: u8 = 0xFE;
 
-fn crc16(data: &[u8]) -> u16 {
+pub(super) fn crc16(data: &[u8]) -> u16 {
     let mut crc = 0xFFFFu16;
     for &b in data {
         crc ^= (b as u16) << 8;
@@ -29,7 +29,7 @@ fn crc16(data: &[u8]) -> u16 {
 }
 
 /// The cell length (ns) implied by the shortest well-populated interval peak.
-fn estimate_cell(intervals: &[u32]) -> Option<f64> {
+pub(super) fn estimate_cell(intervals: &[u32]) -> Option<f64> {
     const BIN: u32 = 50;
     let mut hist = vec![0u32; 400];
     for &i in intervals {
@@ -66,7 +66,12 @@ fn to_bits(intervals: &[u32], cell: f64) -> Vec<u8> {
 }
 
 /// Raw MFM bits through a PLL that carries its phase error from one transition to the next.
-fn to_bits_pll(intervals: &[u32], cell: f64, period_adj: f64, phase_adj: f64) -> Vec<u8> {
+pub(super) fn to_bits_pll(
+    intervals: &[u32],
+    cell: f64,
+    period_adj: f64,
+    phase_adj: f64,
+) -> Vec<u8> {
     let mut bits = Vec::with_capacity(intervals.len() * 3);
     let (lo, hi) = (cell * 0.9, cell * 1.1);
     let mut clock = cell;
@@ -133,7 +138,7 @@ fn byte_at(bits: &[u8], at: usize) -> Option<u8> {
     Some((0..8).fold(0u8, |v, j| (v << 1) | raw[j * 2 + 1]))
 }
 
-fn bytes_at(bits: &[u8], at: usize, n: usize) -> Option<Vec<u8>> {
+pub(super) fn bytes_at(bits: &[u8], at: usize, n: usize) -> Option<Vec<u8>> {
     (0..n).map(|k| byte_at(bits, at + k * 16)).collect()
 }
 
@@ -221,12 +226,15 @@ pub fn decode_track(intervals: &[u32]) -> Vec<Sector> {
     out
 }
 
-/// Whether every record from 1 to the highest seen has a copy whose CRCs held.
-fn track_complete(found: &[Sector]) -> bool {
-    let Some(max) = found.iter().map(|s| s.record).max() else {
+/// Whether every record from the lowest to the highest seen has a copy whose CRCs held.
+pub(super) fn track_complete(found: &[Sector]) -> bool {
+    let (Some(min), Some(max)) = (
+        found.iter().map(|s| s.record).min(),
+        found.iter().map(|s| s.record).max(),
+    ) else {
         return false;
     };
-    (1..=max).all(|r| found.iter().any(|s| s.record == r && s.ok))
+    (min..=max).all(|r| found.iter().any(|s| s.record == r && s.ok))
 }
 
 #[cfg(test)]
