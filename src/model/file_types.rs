@@ -73,6 +73,8 @@ pub const DISK_IMAGE_EXTS: &[&str] = &[
     "d81",
     "g64",
     "g71",
+    "scp",
+    "hfe",
     "d80",
     "d82",
     "atr",
@@ -218,6 +220,7 @@ mod tests {
         // Uppercase duplicates collapse: GHO/gho -> gho, etc.
         assert!(exts.contains(&"gho".to_string()));
         assert!(exts.contains(&"hfv".to_string()));
+        assert!(exts.contains(&"scp".to_string()) && exts.contains(&"hfe".to_string()));
         // MOOF (Applesauce Macintosh 3.5" bitstream) is a picker-visible,
         // openable container — guard it against a future extension-list trim.
         assert!(DISK_IMAGE_EXTS.contains(&"moof"));

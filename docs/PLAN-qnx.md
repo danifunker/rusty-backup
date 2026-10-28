@@ -113,3 +113,13 @@ abstraction beneath the filesystems: decode flux to sectors for the known
 formats (MFM PC / ICON 800 KiB, and the others MiSTer users image), present
 the result as an ordinary sector image, and report unreadable sectors rather
 than failing. The ICON archive's "(bad sectors)" disks are the first test.
+
+Follow-ups done 2026-10-28: a phase-tracking PLL (Greaseweazle's period /
+phase adjust, 5% / 60%) ahead of the old per-interval rounding, a CRC-checked
+byte vote across damaged copies, the fault list in the GUI Inspect tab, and
+SCP / HFE v1 / HFE v3 readers (verified on `gw convert` output, byte-identical
+to the dumps). Unreadable sectors went from 257 to 253 across the six damaged
+sets; what is left is media damage, not clock recovery. On the fileserver boot
+disk the faults sit in a band (records 2, 3, 7, 8 of head 0, cylinders 0-16),
+and the 16-24 copies of each disagree in hundreds of bytes. Still open: FM,
+Amiga MFM and GCR encodings.

@@ -1019,6 +1019,18 @@ fn open_read_dispatch(
         if let Some(faults) = disk.fault_summary() {
             eprintln!("KryoFlux: {faults}; unreadable sectors are zero-filled");
         }
+        crate::rbformats::flux::record_faults(path, &disk);
+        Ok(Box::new(std::io::Cursor::new(disk.image)))
+    } else if crate::rbformats::flux::is_flux_file_path(path) {
+        // SCP (Greaseweazle) or HFE: the same MFM decode as a KryoFlux set.
+        let tracks = crate::rbformats::flux::read_flux_file(path)
+            .with_context(|| format!("read flux image {}", path.display()))?;
+        let disk = crate::rbformats::flux::decode_disk(&tracks)
+            .with_context(|| format!("no MFM sectors in {}", path.display()))?;
+        if let Some(faults) = disk.fault_summary() {
+            eprintln!("Flux: {faults}; unreadable sectors are zero-filled");
+        }
+        crate::rbformats::flux::record_faults(path, &disk);
         Ok(Box::new(std::io::Cursor::new(disk.image)))
     } else if is_woz_path(path) {
         // WOZ 1/2 Apple/Mac floppy: decode the GCR bitstream to a flat sector
@@ -1580,6 +1592,7 @@ pub fn is_container_path(path: &Path) -> bool {
         || is_dsd_path(path)
         || is_flat_floppy_container_path(path)
         || crate::rbformats::flux::kryoflux::is_stream_path(path)
+        || crate::rbformats::flux::is_flux_file_path(path)
 }
 
 #[cfg(test)]

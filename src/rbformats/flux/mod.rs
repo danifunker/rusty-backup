@@ -7,15 +7,90 @@
 //! encodings slot in independently:
 //!
 //! - a capture format turns its files into [`FluxTrack`]s (transition intervals
-//!   in nanoseconds per cylinder / head): [`kryoflux`];
+//!   in nanoseconds per cylinder / head): [`kryoflux`], [`scp`] (Greaseweazle's
+//!   native format), [`hfe`] (HxC bitstreams, cells turned into intervals);
 //! - an encoding turns a track into sectors: [`mfm`] (IBM-style MFM);
 //! - [`decode_disk`] lays the sectors out by the cylinder / head / sector their
 //!   own ID fields carry and reports what it could not read, which is zero-filled.
 
+pub mod hfe;
 pub mod kryoflux;
 pub mod mfm;
+pub mod scp;
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+/// Unreadable sectors of each flux set decoded this session, keyed by the path it was opened by.
+static FAULTS: Mutex<BTreeMap<PathBuf, FaultReport>> = Mutex::new(BTreeMap::new());
+
+/// What a decode could not read, kept for the GUI to show after the image opens.
+#[derive(Debug, Clone)]
+pub struct FaultReport {
+    pub summary: String,
+    /// One line per unreadable sector: `c/h/s, LBA n, missing|bad CRC`.
+    pub sectors: Vec<String>,
+}
+
+/// Remember `disk`'s faults for `path` (or forget them when it read cleanly).
+pub fn record_faults(path: &Path, disk: &DecodedDisk) {
+    let Ok(mut map) = FAULTS.lock() else {
+        return;
+    };
+    match disk.fault_summary() {
+        None => {
+            map.remove(path);
+        }
+        Some(summary) => {
+            let sectors = disk
+                .faults
+                .iter()
+                .map(|&(c, h, r, f)| {
+                    let lba = (c * disk.heads + h) * disk.sectors_per_track + r - 1;
+                    let why = match f {
+                        SectorFault::Crc => "bad CRC, best copy kept",
+                        SectorFault::Missing => "missing, zero-filled",
+                    };
+                    format!("{c}/{h}/{r}, LBA {lba}, {why}")
+                })
+                .collect();
+            map.insert(path.to_path_buf(), FaultReport { summary, sectors });
+        }
+    }
+}
+
+/// Whether `path` is a single-file flux image (SCP or HFE), by extension and magic.
+pub fn is_flux_file_path(path: &Path) -> bool {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    if !matches!(ext.as_deref(), Some("scp") | Some("hfe")) {
+        return false;
+    }
+    let mut head = [0u8; 20];
+    let n = std::fs::File::open(path)
+        .and_then(|mut f| std::io::Read::read(&mut f, &mut head))
+        .unwrap_or(0);
+    scp::looks_like_scp(&head[..n]) || hfe::looks_like_hfe(&head[..n])
+}
+
+/// The tracks of a single-file flux image (SCP or HFE).
+pub fn read_flux_file(path: &Path) -> std::io::Result<Vec<FluxTrack>> {
+    let data = std::fs::read(path)?;
+    let parsed = if scp::looks_like_scp(&data) {
+        scp::parse(&data)
+    } else {
+        hfe::parse(&data)
+    };
+    parsed.map_err(crate::compat::io_other)
+}
+
+/// The faults recorded for `path`, if its decode found any.
+pub fn recorded_faults(path: &Path) -> Option<FaultReport> {
+    FAULTS.lock().ok()?.get(path).cloned()
+}
 
 /// One captured track: transition intervals in nanoseconds, all revolutions back to back.
 #[derive(Debug, Clone)]
@@ -33,6 +108,9 @@ pub struct Sector {
     pub record: u8,
     pub data: Vec<u8>,
     pub ok: bool,
+    /// The data mark and stored CRC, so damaged copies can be voted and re-checked.
+    pub mark: u8,
+    pub crc: u16,
 }
 
 /// Why a sector slot in the image is not trustworthy.
@@ -91,14 +169,26 @@ impl DecodedDisk {
 /// 40-track disk captured on an 80-track drive lands on the right cylinders.
 pub fn decode_disk(tracks: &[FluxTrack]) -> Option<DecodedDisk> {
     let mut found: BTreeMap<(u32, u32, u32), Sector> = BTreeMap::new();
+    let mut damaged: BTreeMap<(u32, u32, u32), Vec<Sector>> = BTreeMap::new();
     for t in tracks {
         for s in mfm::decode_track(&t.intervals_ns) {
             let key = (s.cyl as u32, s.head as u32, s.record as u32);
+            if !s.ok {
+                damaged.entry(key).or_default().push(s.clone());
+            }
             match found.get(&key) {
                 Some(old) if old.ok || !s.ok => {}
                 _ => {
                     found.insert(key, s);
                 }
+            }
+        }
+    }
+    // No clean copy: vote the damaged ones byte by byte and keep the result only if its CRC holds.
+    for (key, copies) in damaged {
+        if found.get(&key).is_some_and(|s| !s.ok) {
+            if let Some(voted) = mfm::vote(&copies) {
+                found.insert(key, voted);
             }
         }
     }

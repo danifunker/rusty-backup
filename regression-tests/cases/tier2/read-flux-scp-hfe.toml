@@ -1,0 +1,48 @@
+# Tier 2 — single-file flux images: SCP (Greaseweazle's native format) and HFE v1 / v3.
+#
+# All three are the Unisys ICON 4.10.01 help diskette, converted from its
+# KryoFlux capture by Greaseweazle's own `gw convert` (an independent writer).
+# Each must decode to the same volume as the sector dump: the tar export of all
+# three is byte-identical to the one from `fs.qnx2.icon-help410.floppy`.
+
+[meta]
+tier = 2
+group = "flux.scp-hfe"
+description = "Open SCP and HFE flux images as disk images."
+
+[[case]]
+id = "read.flux.scp-icon-help410"
+description = "Greaseweazle SCP decodes to the help disk's QNX 2 volume"
+fixture = "flux.scp.icon-help410.floppy"
+timeout_ms = 300000
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["QNX2", "800.0 KiB"]
+stderr_not_contains = ["unreadable"]
+[[case.step]]
+args = ["tar", "{fixture}", "/", "{scratch}/all.tar"]
+expect_exit = 0
+file_sha256 = [{ path = "{scratch}/all.tar", sha256 = "8630d6a9a6512c0a95053bdcefea0ff8871bf28dd6cf30afc7f8f35ce05302b4" }]
+
+[[case]]
+id = "read.flux.hfe-icon-help410"
+description = "HFE v1 bitstream decodes to the same volume"
+fixture = "flux.hfe.icon-help410.floppy"
+timeout_ms = 300000
+[[case.step]]
+args = ["tar", "{fixture}", "/", "{scratch}/all.tar"]
+expect_exit = 0
+stderr_not_contains = ["unreadable"]
+file_sha256 = [{ path = "{scratch}/all.tar", sha256 = "8630d6a9a6512c0a95053bdcefea0ff8871bf28dd6cf30afc7f8f35ce05302b4" }]
+
+[[case]]
+id = "read.flux.hfe3-icon-help410"
+description = "HFE v3 (opcodes) decodes to the same volume"
+fixture = "flux.hfe3.icon-help410.floppy"
+timeout_ms = 300000
+[[case.step]]
+args = ["tar", "{fixture}", "/", "{scratch}/all.tar"]
+expect_exit = 0
+stderr_not_contains = ["unreadable"]
+file_sha256 = [{ path = "{scratch}/all.tar", sha256 = "8630d6a9a6512c0a95053bdcefea0ff8871bf28dd6cf30afc7f8f35ce05302b4" }]
