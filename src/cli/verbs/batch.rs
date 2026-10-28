@@ -562,17 +562,18 @@ fn apply_format_op(path: &std::path::Path, op: &FormatOp) -> Result<()> {
     if pt_kind != "none" && pt_kind != "mbr" {
         bail!("unsupported partition_table {pt_kind:?}; only 'none' or 'mbr' for now");
     }
-    let fs_bytes = build_blank_fs(&op.fs, size, name, op.block_size, op.affs_variant)?;
-    let final_bytes = if pt_kind == "mbr" {
+    let mut fs_bytes = build_blank_fs(&op.fs, size, name, op.block_size, op.affs_variant)?;
+    if pt_kind == "mbr" {
         if op.fs != "fat" {
             bail!("partition_table = 'mbr' currently requires fs = 'fat'");
         }
-        wrap_in_single_partition_mbr(&fs_bytes, fat_type_byte_for(size))?
+        let (mbr, total) = single_partition_mbr(&mut fs_bytes, fat_type_byte_for(size))?;
+        let at = u64::from(MBR_ALIGN_SECTORS) * 512;
+        crate::compat::write_sparse_parts(path, &[(0, &mbr), (at, &fs_bytes)], total)
     } else {
-        fs_bytes
-    };
-    std::fs::write(path, &final_bytes).with_context(|| format!("writing {}", path.display()))?;
-    Ok(())
+        crate::compat::write_sparse(path, &fs_bytes)
+    }
+    .with_context(|| format!("writing {}", path.display()))
 }
 
 /// Dispatch to the right per-FS `create_blank_*` based on the JSON `fs` string.
@@ -640,30 +641,26 @@ fn fat_type_byte_for(size_bytes: u64) -> u8 {
 /// Returns a new buffer with [MBR + zero-padding + fs_bytes] sized to a
 /// 512-byte boundary. The FS's BPB `hidden_sectors` field is patched
 /// to the partition start LBA so DOS-era tools see consistent geometry.
-fn wrap_in_single_partition_mbr(fs_bytes: &[u8], type_byte: u8) -> Result<Vec<u8>> {
-    const ALIGN_SECTORS: u32 = 2048; // 1 MiB at 512-byte sectors
-    let fs_sectors = fs_bytes.len().div_ceil(512);
-    if fs_sectors as u64 > u32::MAX as u64 - ALIGN_SECTORS as u64 {
+const MBR_ALIGN_SECTORS: u32 = 2048; // 1 MiB at 512-byte sectors
+
+/// The MBR sector for one FAT partition at 1 MiB, and the whole disk's length; patches `fs`'s
+/// hidden-sectors field in place so the volume is never copied.
+fn single_partition_mbr(fs: &mut [u8], type_byte: u8) -> Result<([u8; 512], u64)> {
+    let fs_sectors = fs.len().div_ceil(512);
+    if fs_sectors as u64 > u32::MAX as u64 - MBR_ALIGN_SECTORS as u64 {
         bail!("filesystem too large for an MBR wrapper");
     }
-    let total_sectors = ALIGN_SECTORS + fs_sectors as u32;
-    let mut out = vec![0u8; total_sectors as usize * 512];
-
-    // Patch a copy of the FS bytes so its hidden_sectors field reflects the LBA offset.
-    let mut fs = fs_bytes.to_vec();
     if fs.len() >= 32 && (fs[0] == 0xEB || fs[0] == 0xE9) {
-        fs[28..32].copy_from_slice(&ALIGN_SECTORS.to_le_bytes());
+        fs[28..32].copy_from_slice(&MBR_ALIGN_SECTORS.to_le_bytes());
     }
-    out[ALIGN_SECTORS as usize * 512..ALIGN_SECTORS as usize * 512 + fs.len()].copy_from_slice(&fs);
-
     let mbr = crate::partition::mbr::build_minimal_mbr(
         0xDEADBEEF,
-        &[(type_byte, ALIGN_SECTORS, fs_sectors as u32, true)],
+        &[(type_byte, MBR_ALIGN_SECTORS, fs_sectors as u32, true)],
         16,
         63,
     );
-    out[..512].copy_from_slice(&mbr);
-    Ok(out)
+    let total = (u64::from(MBR_ALIGN_SECTORS) + fs_sectors as u64) * 512;
+    Ok((mbr, total))
 }
 
 /// Materialize a multi-partition image from a `disk` block.
@@ -722,16 +719,16 @@ fn apply_disk_block(path: &std::path::Path, disk: &DiskBlock) -> Result<()> {
         cursor_lba = cursor_lba.div_ceil(ALIGN_SECTORS) * ALIGN_SECTORS;
     }
 
-    let total_sectors = cursor_lba;
-    let mut out = vec![0u8; total_sectors as usize * 512];
     let mbr = crate::partition::mbr::build_minimal_mbr(0xDEADBEEF, &entries, 16, 63);
-    out[..512].copy_from_slice(&mbr);
-    for (lba, bytes) in sections {
-        let off = lba as usize * 512;
-        out[off..off + bytes.len()].copy_from_slice(&bytes);
-    }
-    std::fs::write(path, &out).with_context(|| format!("writing {}", path.display()))?;
-    Ok(())
+    // Pieces go straight to their offsets; assembling a whole-disk buffer touched every page.
+    let mut parts: Vec<(u64, &[u8])> = vec![(0, &mbr)];
+    parts.extend(
+        sections
+            .iter()
+            .map(|(lba, b)| (u64::from(*lba) * 512, b.as_slice())),
+    );
+    crate::compat::write_sparse_parts(path, &parts, u64::from(cursor_lba) * 512)
+        .with_context(|| format!("writing {}", path.display()))
 }
 
 fn apply_op(

@@ -71,3 +71,30 @@ impl ZipEntryName for zip::read::ZipFile<'_> {
         self.name().to_string()
     }
 }
+
+/// Write `bytes` to `path`, seeking over all-zero 1 MiB runs so a blank volume lands sparse.
+pub fn write_sparse(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_sparse_parts(path, &[(0, bytes)], bytes.len() as u64)
+}
+
+/// [`write_sparse`] for pieces at byte offsets in a file of `total_len` (an MBR plus its volume).
+pub fn write_sparse_parts(
+    path: &std::path::Path,
+    parts: &[(u64, &[u8])],
+    total_len: u64,
+) -> std::io::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    const RUN: usize = 1 << 20;
+    let mut f = std::fs::File::create(path)?;
+    for &(at, bytes) in parts {
+        for (k, chunk) in bytes.chunks(RUN).enumerate() {
+            if chunk.iter().all(|&b| b == 0) {
+                continue;
+            }
+            f.seek(SeekFrom::Start(at + (k * RUN) as u64))?;
+            f.write_all(chunk)?;
+        }
+    }
+    f.set_len(total_len)?;
+    f.sync_all()
+}

@@ -720,7 +720,9 @@ pub fn create_blank_hpfs(size_bytes: u64, label: &str) -> Result<Vec<u8>, Filesy
     // Bump-allocate metadata sectors from 0x14.
     let mut cur = 0x14u32;
     let bitmap_dir = cur;
-    cur += 4;
+    // One u32 per band, in whole 4-sector blocks (128 bands each); one block capped volumes at 1 GiB.
+    let bitmap_dir_sectors = ((n_bands * 4).div_ceil(4 * SECTOR as usize) * 4) as u32;
+    cur += bitmap_dir_sectors;
     let mut band_bmp = Vec::with_capacity(n_bands);
     for _ in 0..n_bands {
         band_bmp.push(cur);
@@ -774,7 +776,7 @@ pub fn create_blank_hpfs(size_bytes: u64, label: &str) -> Result<Vec<u8>, Filesy
     for s in 0..0x14u32 {
         set_used(&mut bands, s);
     }
-    for s in bitmap_dir..bitmap_dir + 4 {
+    for s in bitmap_dir..bitmap_dir + bitmap_dir_sectors {
         set_used(&mut bands, s);
     }
     for &base in &band_bmp {
@@ -864,7 +866,8 @@ pub fn create_blank_hpfs(size_bytes: u64, label: &str) -> Result<Vec<u8>, Filesy
 
     // ---- bitmap directory ----
     {
-        let b = sector_mut(&mut img, bitmap_dir);
+        let at = bitmap_dir as usize * SECTOR as usize;
+        let b = &mut img[at..at + bitmap_dir_sectors as usize * SECTOR as usize];
         for (i, &bm) in band_bmp.iter().enumerate() {
             put_u32(b, i * 4, bm);
         }
@@ -2468,6 +2471,17 @@ mod tests {
         assert!(result.is_clean(), "blank fsck errors: {:?}", result.errors);
         // used < total (metadata occupies some sectors)
         assert!(fs.used_size() > 0 && fs.used_size() < fs.total_size());
+    }
+
+    #[test]
+    fn a_volume_past_128_bands_formats_and_checks_clean() {
+        // 129 bands needs a second bitmap-directory sector; this used to panic.
+        let size = 129 * BAND_SECTORS as u64 * SECTOR;
+        let img = create_blank_hpfs(size, "BIGVOL").unwrap();
+        let mut fs = HpfsFilesystem::open(Cursor::new(img), 0).unwrap();
+        assert_eq!(fs.total_size(), size);
+        let result = fs.fsck().unwrap().unwrap();
+        assert!(result.is_clean(), "fsck errors: {:?}", result.errors);
     }
 
     #[test]

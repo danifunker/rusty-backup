@@ -111,6 +111,7 @@ pub mod squashfs;
 pub mod squashfs_edit;
 pub mod squashfs_verify;
 pub mod squashfs_write;
+pub mod stream_pipe;
 pub mod sun2tape;
 pub mod tar_export;
 pub mod tar_import;

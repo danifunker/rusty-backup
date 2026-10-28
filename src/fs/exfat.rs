@@ -748,9 +748,19 @@ impl<R: Read + Seek + Send> Filesystem for ExfatFilesystem<R> {
             return Ok(0);
         }
         if let Some(&len) = self.no_fat_chain.get(&cluster) {
-            let data = self.read_contiguous_clusters(cluster, len, Some(entry.size))?;
-            writer.write_all(&data)?;
-            return Ok(data.len() as u64);
+            // Contiguous: copy in 1 MiB pieces rather than reading the whole run.
+            let mut left = len.min(entry.size);
+            self.reader
+                .seek(SeekFrom::Start(self.cluster_offset(cluster)))?;
+            let mut buf = vec![0u8; 1 << 20];
+            let total = left;
+            while left > 0 {
+                let n = left.min(buf.len() as u64) as usize;
+                self.reader.read_exact(&mut buf[..n])?;
+                writer.write_all(&buf[..n])?;
+                left -= n as u64;
+            }
+            return Ok(total);
         }
         self.write_cluster_chain_to(cluster, writer, entry.size)
     }

@@ -15,7 +15,7 @@
 //! target is built by [`crate::fs::ntfs_format::create_blank_ntfs`] (4096-byte
 //! clusters), validated to mount under ntfs-3g.
 
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::time::{Duration, Instant};
 
 use super::entry::FileEntry;
@@ -115,18 +115,13 @@ where
             progress.tick(report, false);
             walk(source, target, &k, &new_dir, report, progress)?;
         } else if k.is_file() {
-            // read_file caps at max_bytes, so pass the exact size.
-            let body = source.read_file(&k, k.size as usize)?;
-            let mut cur = io::Cursor::new(&body);
-            target.create_file(
-                tgt_dir,
-                &k.name,
-                &mut cur,
-                body.len() as u64,
-                &CreateFileOptions::default(),
-            )?;
+            // Piped through a bounded channel: a multi-GB pagefile or video must not land in RAM.
+            let size = k.size;
+            super::stream_pipe::with_file_reader(source, &k, |r| {
+                target.create_file(tgt_dir, &k.name, r, size, &CreateFileOptions::default())
+            })?;
             report.files_copied += 1;
-            report.bytes_copied += body.len() as u64;
+            report.bytes_copied += size;
             progress.tick(report, false);
         } else {
             report.warnings.push(format!(

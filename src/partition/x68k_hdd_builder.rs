@@ -499,10 +499,16 @@ pub fn build_x68k_hdd(
     disk[..boot_block.len()].copy_from_slice(&boot_block);
     for (idx, body) in partition_bodies.iter().enumerate() {
         let part_off = (part_start_byte + (idx as u64) * per_partition_bytes) as usize;
-        disk[part_off..part_off + body.len()].copy_from_slice(body);
+        // `disk` starts zeroed; copying only non-zero pieces keeps its untouched pages unbacked.
+        for (k, piece) in body.chunks(64 * 1024).enumerate() {
+            if piece.iter().any(|&b| b != 0) {
+                let at = part_off + k * 64 * 1024;
+                disk[at..at + piece.len()].copy_from_slice(piece);
+            }
+        }
     }
 
-    std::fs::write(out_path, &disk)
+    crate::compat::write_sparse(out_path.as_ref(), &disk)
         .map_err(|e| anyhow::anyhow!("write {}: {e}", out_path.display()))?;
 
     Ok(BuildSummary {
