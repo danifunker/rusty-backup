@@ -79,6 +79,30 @@ impl FatType {
 
 // FAT directory entry constants
 const DIR_ENTRY_SIZE: usize = 32;
+
+/// Largest logical sector the read paths accept; Atari TOS BGM partitions use up to 8192.
+const MAX_READ_SECTOR_SIZE: u64 = 8192;
+
+/// Whether `bpb` opens like a FAT boot sector: an x86 jump, or (Atari TOS) any start over a sane BPB.
+pub(crate) fn has_fat_boot_start(bpb: &[u8]) -> bool {
+    if bpb.len() < 24 {
+        return false;
+    }
+    if bpb[0] == 0xEB || bpb[0] == 0xE9 {
+        return true;
+    }
+    let bps = u16::from_le_bytes([bpb[11], bpb[12]]);
+    let spc = bpb[13];
+    let reserved = u16::from_le_bytes([bpb[14], bpb[15]]);
+    let media = bpb[21];
+    matches!(bps, 512 | 1024 | 2048 | 4096 | 8192)
+        && spc != 0
+        && spc.is_power_of_two()
+        && reserved != 0
+        && matches!(bpb[16], 1 | 2)
+        && (media == 0xF0 || media >= 0xF8)
+        && u16::from_le_bytes([bpb[22], bpb[23]]) != 0
+}
 const ATTR_READ_ONLY: u8 = 0x01;
 const ATTR_HIDDEN: u8 = 0x02;
 const ATTR_SYSTEM: u8 = 0x04;
@@ -115,15 +139,14 @@ impl<R: Read + Seek> FatFilesystem<R> {
             .read_exact(&mut bpb)
             .map_err(|e| FilesystemError::Parse(format!("cannot read boot sector: {e}")))?;
 
-        // Validate jump instruction (EB xx 90 or E9 xx xx)
-        if bpb[0] != 0xEB && bpb[0] != 0xE9 {
+        if !has_fat_boot_start(&bpb) {
             return Err(FilesystemError::Parse(
                 "invalid FAT boot sector: bad jump instruction".into(),
             ));
         }
 
         let bytes_per_sector = u16::from_le_bytes([bpb[11], bpb[12]]) as u64;
-        if bytes_per_sector == 0 || bytes_per_sector > 4096 {
+        if bytes_per_sector == 0 || bytes_per_sector > MAX_READ_SECTOR_SIZE {
             return Err(FilesystemError::Parse(format!(
                 "invalid bytes per sector: {bytes_per_sector}"
             )));
@@ -2376,12 +2399,12 @@ impl<R: Read + Seek> CompactFatReader<R> {
             .read_exact(&mut bpb)
             .map_err(|e| FilesystemError::Parse(format!("cannot read boot sector: {e}")))?;
 
-        if bpb[0] != 0xEB && bpb[0] != 0xE9 {
+        if !has_fat_boot_start(&bpb) {
             return Err(FilesystemError::Parse("invalid FAT boot sector".into()));
         }
 
         let bytes_per_sector = u16::from_le_bytes([bpb[11], bpb[12]]) as u64;
-        if bytes_per_sector == 0 || bytes_per_sector > 4096 {
+        if bytes_per_sector == 0 || bytes_per_sector > MAX_READ_SECTOR_SIZE {
             return Err(FilesystemError::Parse(format!(
                 "invalid bytes per sector: {bytes_per_sector}"
             )));
@@ -3834,7 +3857,7 @@ pub fn resize_fat_in_place(
     let mut bpb = [0u8; 512];
     file.read_exact(&mut bpb)?;
 
-    if bpb[0] != 0xEB && bpb[0] != 0xE9 {
+    if !has_fat_boot_start(&bpb) {
         return Ok(false); // Not a FAT BPB
     }
 
@@ -4134,7 +4157,7 @@ pub fn set_fat_clean_flags(
     let mut bpb = [0u8; 512];
     file.read_exact(&mut bpb)?;
 
-    if bpb[0] != 0xEB && bpb[0] != 0xE9 {
+    if !has_fat_boot_start(&bpb) {
         return Ok(()); // Not a FAT BPB
     }
 
@@ -4250,7 +4273,7 @@ pub fn validate_fat_integrity(
     let mut bpb = [0u8; 512];
     file.read_exact(&mut bpb)?;
 
-    if bpb[0] != 0xEB && bpb[0] != 0xE9 {
+    if !has_fat_boot_start(&bpb) {
         warnings.push("BPB: invalid jump instruction".to_string());
         return Ok(warnings);
     }
@@ -4493,7 +4516,7 @@ pub fn patch_bpb_hidden_sectors(
 ) -> Result<()> {
     let mut bpb = crate::fs::patch::read_boot_sector(file, partition_offset)?;
 
-    if bpb[0] != 0xEB && bpb[0] != 0xE9 {
+    if !has_fat_boot_start(&bpb) {
         return Ok(()); // Not a FAT BPB
     }
 
@@ -5643,6 +5666,30 @@ mod tests {
         let root = fs.root().expect("root");
         let entries = fs.list_directory(&root).expect("list root");
         assert!(entries.is_empty(), "blank volume root must be empty");
+    }
+
+    #[test]
+    fn atari_bra_boot_sector_opens_with_large_logical_sectors() {
+        // Shape of the Falcon `cp-2088.vhd` BGM partition (issue #89): 68000 BRA.S, 2048-B sectors.
+        let mut img = create_blank_fat_with_sector_size(16 << 20, 2048, Some("FALCON")).unwrap();
+        img[0..3].copy_from_slice(&[0x60, 0x1C, 0x00]);
+        assert!(has_fat_boot_start(&img));
+        let mut cur = std::io::Cursor::new(img);
+        let mut fs = FatFilesystem::open(&mut cur, 0).expect("Atari BGM must open");
+        let root = fs.root().unwrap();
+        assert!(fs.list_directory(&root).unwrap().is_empty());
+    }
+
+    #[test]
+    fn non_x86_start_needs_a_sane_bpb() {
+        let mut img = create_blank_fat(1_474_560, None).unwrap();
+        img[0] = 0x60;
+        assert!(has_fat_boot_start(&img), "Atari floppy with a real BPB");
+        img[21] = 0x12; // media byte no FAT volume uses
+        assert!(!has_fat_boot_start(&img));
+        let junk = [0x60u8; 512];
+        assert!(!has_fat_boot_start(&junk));
+        assert!(FatFilesystem::open(std::io::Cursor::new(junk.to_vec()), 0).is_err());
     }
 
     #[test]

@@ -117,6 +117,22 @@ pub fn materialize(bytes: &[u8], file_name: &str) -> Result<(tempfile::TempDir, 
     Ok((dir, path))
 }
 
+/// Like [`materialize`], but `fill` streams the content into the temp file so it never sits in RAM.
+pub fn materialize_streamed(
+    file_name: &str,
+    fill: impl FnOnce(&mut std::fs::File) -> Result<()>,
+) -> Result<(tempfile::TempDir, PathBuf)> {
+    let dir = tempfile::Builder::new()
+        .prefix("rb-descend-")
+        .tempdir()
+        .context("create descend temp dir")?;
+    let path = dir.path().join(sanitize_temp_name(file_name));
+    let mut file =
+        std::fs::File::create(&path).with_context(|| format!("create {}", path.display()))?;
+    fill(&mut file)?;
+    Ok((dir, path))
+}
+
 /// Reduce a name to something safe as a single temp-file component while
 /// preserving the extension (which drives content routing).
 fn sanitize_temp_name(name: &str) -> String {

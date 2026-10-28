@@ -33,6 +33,11 @@ use super::metadata_editor::{
     XattrEditorState,
 };
 
+/// Smallest file offered "Open as Disk Image": below this nothing holds a partitioned volume.
+const MIN_NESTED_IMAGE_BYTES: u64 = 16 * 1024;
+/// Free space kept spare beyond the image size when copying it out for "Open as Disk Image".
+const NESTED_FREE_MARGIN: u64 = 64 * 1024 * 1024;
+
 const MAX_PREVIEW_SIZE: usize = 1024 * 1024; // 1 MB max file preview
 
 /// Upper bound on bytes read off the disk image to sniff whether the
@@ -112,6 +117,10 @@ pub struct BrowseView {
     extraction_progress: Option<Arc<Mutex<ExtractionProgress>>>,
     /// Message to show after extraction completes.
     extraction_result: Option<String>,
+    /// Temp dir an "Open as Disk Image" extraction is writing into, until it finishes.
+    nested_open: Option<tempfile::TempDir>,
+    /// A finished "Open as Disk Image" extraction, for the Inspect tab to load.
+    nested_ready: Option<(PathBuf, tempfile::TempDir)>,
     /// Whether edit mode is enabled (allows adding/deleting files).
     edit_mode: bool,
     /// Whether editing is possible for this source (not Clonezilla/streaming).
@@ -441,6 +450,8 @@ impl Default for BrowseView {
             prodos_export_mode: ProdosExportMode::WithTypeSuffix,
             extraction_progress: None,
             extraction_result: None,
+            nested_open: None,
+            nested_ready: None,
             edit_mode: false,
             edit_supported: false,
             edit_result: None,
@@ -2096,6 +2107,20 @@ impl BrowseView {
                             self.start_tar_export(&entry);
                         }
 
+                        if entry.is_file()
+                            && entry.size >= MIN_NESTED_IMAGE_BYTES
+                            && ui
+                                .button("Open as Disk Image")
+                                .on_hover_text(
+                                    "Copy this file to a temporary folder and inspect it as \
+                                     its own disk image, e.g. a ShapeShifter hardfile or a \
+                                     floppy image stored on this volume.",
+                                )
+                                .clicked()
+                        {
+                            self.start_nested_open(&entry);
+                        }
+
                         // Workflow C: the selection already sniffed as a
                         // Mac archive (see show_archive_actions), so pop
                         // the C modal (Save as-is vs Decode-and-save).
@@ -2253,6 +2278,48 @@ impl BrowseView {
     }
 
     /// Start extracting the selected entry to a user-chosen folder.
+    /// A finished "Open as Disk Image" copy: the image path and the temp dir that owns it.
+    pub fn take_nested_open(&mut self) -> Option<(PathBuf, tempfile::TempDir)> {
+        self.nested_ready.take()
+    }
+
+    /// Stream `entry` into a fresh temp dir, then hand it to Inspect as a disk image.
+    fn start_nested_open(&mut self, entry: &FileEntry) {
+        if !self.staged_edits.is_empty() {
+            self.extraction_result = Some(
+                "Apply or discard the staged edits first: opening a disk image replaces this view."
+                    .to_string(),
+            );
+            return;
+        }
+        let temp = match tempfile::Builder::new().prefix("rb-nested-").tempdir() {
+            Ok(t) => t,
+            Err(e) => {
+                self.extraction_result = Some(format!("Open as disk image failed: {e}"));
+                return;
+            }
+        };
+        let needed = entry.size.saturating_add(NESTED_FREE_MARGIN);
+        if let Some(free) = rusty_backup::os::available_space(temp.path()) {
+            if free < needed {
+                self.extraction_result = Some(format!(
+                    "Not enough free space to open {} as a disk image: it needs {} in {}, \
+                     which has {} free. Point TMPDIR at a larger drive, or extract it instead.",
+                    entry.name,
+                    super::bytes_human(needed),
+                    temp.path().parent().unwrap_or(temp.path()).display(),
+                    super::bytes_human(free),
+                ));
+                return;
+            }
+        }
+        let dest = temp.path().to_path_buf();
+        self.nested_open = Some(temp);
+        let mode = std::mem::replace(&mut self.resource_fork_mode, ResourceForkMode::DataForkOnly);
+        self.launch_extraction(entry.clone(), dest);
+        self.resource_fork_mode = mode;
+    }
+
     fn start_extraction(&mut self, entry: &FileEntry) {
         // Pick destination folder
         let dest = match rfd::FileDialog::new()
@@ -6106,8 +6173,26 @@ impl BrowseView {
             None
         };
         if let Some(msg) = finished_msg {
-            self.extraction_result = Some(msg);
             self.extraction_progress = None;
+            if let Some(temp) = self.nested_open.take() {
+                let extracted = std::fs::read_dir(temp.path())
+                    .ok()
+                    .and_then(|mut d| d.find_map(|e| e.ok()))
+                    .map(|e| e.path());
+                match extracted {
+                    Some(path) if !msg.starts_with("Extraction failed") => {
+                        self.extraction_result =
+                            Some(format!("Opening {} as a disk image...", path.display()));
+                        self.nested_ready = Some((path, temp));
+                    }
+                    _ => {
+                        self.extraction_result =
+                            Some(msg.replacen("Extraction", "Open as disk image", 1));
+                    }
+                }
+                return;
+            }
+            self.extraction_result = Some(msg);
         }
     }
 }

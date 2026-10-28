@@ -30,6 +30,8 @@ pub enum WrapperSource {
     Path(PathBuf),
     /// The wrapper's bytes, pulled out of a parent layer (archive / image).
     Bytes(Vec<u8>),
+    /// The wrapper streamed out of a parent layer to a temp file; the dir owns the file.
+    TempFile(tempfile::TempDir, PathBuf),
 }
 
 impl WrapperSource {
@@ -41,6 +43,9 @@ impl WrapperSource {
                 std::fs::read(&p).map_err(|e| anyhow::anyhow!("read {}: {e}", p.display()))
             }
             WrapperSource::Bytes(b) => Ok(b),
+            WrapperSource::TempFile(_dir, p) => {
+                std::fs::read(&p).map_err(|e| anyhow::anyhow!("read {}: {e}", p.display()))
+            }
         }
     }
 
@@ -49,6 +54,7 @@ impl WrapperSource {
     fn into_path(self, file_name: &str) -> Result<(Option<tempfile::TempDir>, PathBuf)> {
         match self {
             WrapperSource::Path(p) => Ok((None, p)),
+            WrapperSource::TempFile(dir, p) => Ok((Some(dir), p)),
             WrapperSource::Bytes(b) => {
                 let (temp, path) = commander_descend::materialize(&b, file_name)?;
                 Ok((Some(temp), path))

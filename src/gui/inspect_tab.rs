@@ -428,6 +428,15 @@ impl InspectTab {
         self.clear_results();
     }
 
+    /// Inspect an image copied out of the browsed volume; kept out of the recents, it's a temp file.
+    fn load_nested_image(&mut self, path: PathBuf, guard: tempfile::TempDir) {
+        self.selected_device_idx = None;
+        self.backup_folder_path = None;
+        self.image_file_path = Some(path);
+        self.amiga_tempdir = Some(guard);
+        self.clear_results();
+    }
+
     /// Drop this tab's in-memory recent-files mirror. Called when the Settings
     /// dialog clears the persisted lists (config is the source of truth; the
     /// mirror otherwise only reloads at construction).
@@ -1152,6 +1161,11 @@ impl InspectTab {
         if self.browse_view.is_active() {
             //ui.add_space(4.0);
             self.browse_view.show(ui);
+        }
+        if let Some((path, guard)) = self.browse_view.take_nested_open() {
+            ctx.log
+                .info(format!("Inspecting {} as a disk image", path.display()));
+            self.load_nested_image(path, guard);
         }
     }
 

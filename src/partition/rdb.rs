@@ -12,6 +12,8 @@
 //! the partition's byte offset and the 4-byte `dos_type` tag (e.g. `DOS\0`,
 //! `PFS\3`, `SFS\0`) that selects the filesystem.
 
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::IntIsMultipleOf as _;
 use byteorder::{BigEndian, ByteOrder};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Seek, SeekFrom};
@@ -92,6 +94,9 @@ pub struct RdbPartition {
     pub baud: u32,
     pub control: u32,
     pub boot_blocks: u32,
+    /// Filesystem found on disk when it contradicts `dos_type` (ShapeShifter HFS under `PFS\3`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
 }
 
 impl RdbPartition {
@@ -127,6 +132,31 @@ impl RdbPartition {
     /// convention used in `partition_type_string` for routing.
     pub fn dos_type_string(&self) -> String {
         format_dos_type(self.dos_type)
+    }
+
+    /// Type string to route this partition by: the on-disk content when it overrides `dos_type`.
+    pub fn routing_type_string(&self) -> String {
+        self.content_type
+            .clone()
+            .unwrap_or_else(|| self.dos_type_string())
+    }
+}
+
+/// An Amiga-typed partition that actually holds a Mac volume, as ShapeShifter uses one raw.
+fn sniff_foreign_content(reader: &mut (impl Read + Seek), part: &RdbPartition) -> Option<String> {
+    let mut head = [0u8; 1536];
+    reader
+        .seek(SeekFrom::Start(part.start_byte_offset()))
+        .ok()?;
+    reader.read_exact(&mut head).ok()?;
+    if matches!(&head[0..3], b"DOS" | b"PFS" | b"PDS" | b"SFS" | b"muF") {
+        return None;
+    }
+    let block_size = u32::from_be_bytes([head[1044], head[1045], head[1046], head[1047]]);
+    match &head[1024..1026] {
+        b"BD" if block_size != 0 && block_size.is_multiple_of(512) => Some("Apple_HFS".to_string()),
+        b"H+" | b"HX" => Some("Apple_HFS+".to_string()),
+        _ => None,
     }
 }
 
@@ -165,7 +195,8 @@ impl Rdb {
             reader.read_exact(&mut buf).map_err(|e| {
                 RustyBackupError::InvalidRdb(format!("cannot read PART at block {next}: {e}"))
             })?;
-            let part = parse_part(&buf, next as u64)?;
+            let mut part = parse_part(&buf, next as u64)?;
+            part.content_type = sniff_foreign_content(reader, &part);
             next = part.next;
             partitions.push(part);
         }
@@ -364,7 +395,7 @@ impl Rdb {
                 // copy/zero-fill loop work in sync with what's recorded in
                 // the patched PART block.
                 export_size: aligned_export_size,
-                dos_type_string: p.dos_type_string(),
+                dos_type_string: p.routing_type_string(),
                 drv_name: p.drv_name.clone(),
             });
 
@@ -628,6 +659,7 @@ fn parse_part(buf: &[u8; 512], block_num: u64) -> Result<RdbPartition, RustyBack
         baud: get_long(buf, 49),
         control: get_long(buf, 50),
         boot_blocks: get_long(buf, 51),
+        content_type: None,
     })
 }
 
@@ -809,6 +841,81 @@ mod tests {
         assert_eq!(p.start_byte_offset(), 2 * 4 * 32 * 512);
         assert_eq!(p.size_bytes(), 2 * 4 * 32 * 512);
         assert_eq!(p.start_lba_512(), 2 * 4 * 32);
+    }
+
+    /// One-PART RDB ("SS1", cylinders 2..=3 at 4x32) whose partition starts with `content`.
+    fn rdb_with_content(dos_type: u32, content: &[u8], disk_len: usize) -> Vec<u8> {
+        let mut disk = vec![0u8; disk_len];
+        let rdsk = make_block(
+            RDSK_SIGNATURE,
+            &[
+                (1, 64),
+                (4, 512),
+                (7, 1),
+                (8, NO_BLOCK),
+                (6, NO_BLOCK),
+                (9, NO_BLOCK),
+            ],
+        );
+        disk[0..512].copy_from_slice(&rdsk);
+        let part = make_block(
+            PART_SIGNATURE,
+            &[
+                (1, 64),
+                (4, NO_BLOCK),
+                (9, u32::from_be_bytes([3, b'S', b'S', b'1'])),
+                (32, 16),
+                (33, 128),
+                (35, 4),
+                (36, 1),
+                (37, 32),
+                (41, 2),
+                (42, 3),
+                (48, dos_type),
+            ],
+        );
+        disk[512..1024].copy_from_slice(&part);
+        let start = 2 * 4 * 32 * 512;
+        if disk.len() >= start + content.len() {
+            disk[start..start + content.len()].copy_from_slice(content);
+        }
+        disk
+    }
+
+    #[test]
+    fn hfs_under_a_pfs_dostype_routes_as_hfs() {
+        // ShapeShifter's raw Mac partitions (issue #89, Mac-4G.hdf): declared PFS\3, holding HFS.
+        let mut hfs = vec![0u8; 1536];
+        hfs[0..2].copy_from_slice(b"LK");
+        hfs[1024..1026].copy_from_slice(b"BD");
+        hfs[1044..1048].copy_from_slice(&4096u32.to_be_bytes());
+        let len = 2 * 4 * 32 * 512 * 2;
+        let rdb = Rdb::parse(&mut Cursor::new(rdb_with_content(0x5046_5303, &hfs, len))).unwrap();
+        let p = &rdb.partitions[0];
+        assert_eq!(p.dos_type_string(), "PFS\\3");
+        assert_eq!(p.content_type.as_deref(), Some("Apple_HFS"));
+        let info = &crate::partition::PartitionTable::Rdb(rdb.clone()).partitions()[0];
+        assert_eq!(info.partition_type_string.as_deref(), Some("Apple_HFS"));
+        assert!(
+            info.type_name.contains("declared PFS\\3"),
+            "{}",
+            info.type_name
+        );
+
+        let mut pfs = hfs.clone();
+        pfs[0..4].copy_from_slice(b"PFS\x01");
+        let rdb = Rdb::parse(&mut Cursor::new(rdb_with_content(0x5046_5303, &pfs, len))).unwrap();
+        assert_eq!(
+            rdb.partitions[0].content_type, None,
+            "a real PFS volume keeps its DosType"
+        );
+
+        let short = rdb_with_content(0x5046_5303, &hfs, 16 * 512);
+        let rdb = Rdb::parse(&mut Cursor::new(short)).unwrap();
+        assert_eq!(
+            rdb.partitions[0].content_type, None,
+            "truncated image must not fail the parse"
+        );
     }
 
     #[test]

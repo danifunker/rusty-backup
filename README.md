@@ -376,6 +376,10 @@ The app has five tabs:
     (`.sit`), Zip, or tar (gzip / zstd). Available in the Inspect tab, the
     Optical disc browser, Commander, and the `rb-cli tui` Explorer; all four
     run the same `export_selection` engine.
+  - **Open as Disk Image** on a file inside a browsed volume: copies it to a
+    temporary folder (streamed, with a free-space check) and inspects it as its
+    own disk, e.g. a ShapeShifter Mac hardfile stored on an Amiga PFS
+    partition. Commander's descend into a nested image streams the same way.
   - **Edit Partition Table…** to add / resize / delete / retype
     partition entries on raw disks, image files, and devices. Writers
     cover MBR, GPT, APM, SGI, and RDB-bootable-flag.

@@ -1541,11 +1541,19 @@ impl PartitionTable {
                     index: i,
                     // Show both the human name and the device name, e.g.
                     // "AmigaDOS FFS-Intl (DH0)" or "SFS (Amiga) (DH1)".
-                    type_name: format!(
-                        "{} ({})",
-                        rdb::dos_type_display_name(p.dos_type),
-                        p.drv_name,
-                    ),
+                    type_name: match &p.content_type {
+                        Some(found) => format!(
+                            "{} ({}, declared {})",
+                            if found == "Apple_HFS" { "HFS" } else { "HFS+" },
+                            p.drv_name,
+                            p.dos_type_string(),
+                        ),
+                        None => format!(
+                            "{} ({})",
+                            rdb::dos_type_display_name(p.dos_type),
+                            p.drv_name,
+                        ),
+                    },
                     partition_type_byte: 0,
                     start_lba: p.start_lba_512(),
                     start_byte: None,
@@ -1553,7 +1561,7 @@ impl PartitionTable {
                     bootable: p.is_bootable(),
                     is_logical: false,
                     is_extended_container: false,
-                    partition_type_string: Some(p.dos_type_string()),
+                    partition_type_string: Some(p.routing_type_string()),
                     hfs_block_size: None,
                     rdb_part_block: Some(p.block_num),
                     drv_name: Some(p.drv_name.clone()),

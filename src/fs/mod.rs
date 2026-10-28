@@ -399,6 +399,9 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
             return "fat";
         }
         // Otherwise the JMP is a boot loader, not a FAT BPB — fall through.
+    } else if fat::has_fat_boot_start(&sector0) {
+        // Atari TOS: no x86 JMP, but a BPB strict enough to rule out stray bytes.
+        return "fat";
     }
     // XFS superblock magic ("XFSB") at byte 0 of the partition. Both v4
     // (IRIX-compatible) and v5/CRC superblocks share this magic and are
