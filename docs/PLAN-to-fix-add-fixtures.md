@@ -250,6 +250,20 @@ routes it, so the HP-UX LV opens it. Case `read.hpux-lvm.hpux1111-vxfs-root`.
 
 ### Phase 4: Sun QIC tapes, browsable as a filesystem (Inspect + Commander)
 
+**Done 2026-10-28.** `fs/sun2tape.rs` (`TapeFilesystem`): the `SUN2TAPE` table, files
+classified by content, and names taken from the SunOS XDR table of contents. Each
+volume's TOC lists every volume's entries in tape order under a `VOLUME n` label;
+the name follows a word with the high bit set. Tars (via `mem_archive`),
+`compress(1)` tars (the StuffIt LZW decoder, now with `decompress_unix_z`; 16-bit
+output byte-identical to `gzip -d` on the 26.7 MB `usr.tar.Z`) and UFS miniroots
+open as directories. Raw tape files read directly. `mem_archive::open_tar` now
+zeroes the stored size of SunOS hard links that store no data (`zero_link_sizes`),
+which used to desync `usr.tar.Z` at `./bin/chsh`. A `.qic` routes as a partitionless
+volume, so Inspect, Commander (descend) and `rb-cli ls/get` work unchanged.
+`qic` is in `DISK_IMAGE_EXTS` with its regression row. Five tapes and the two Sun-2 /
+Sun-3 disks are catalogued, with cases in `cases/tier2/read-sun-tapes.toml`.
+**All phases in this plan are done.**
+
 A `.qic` image opens as one read-only `Filesystem`, so Inspect's browse view,
 Commander panes, `rb-cli ls/get` and export all work on it unchanged:
 

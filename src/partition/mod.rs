@@ -399,6 +399,10 @@ fn probe_apm_without_ddr(reader: &mut (impl Read + Seek)) -> Option<Apm> {
 /// Returns `Some(fs_hint)` where `fs_hint` is `"FAT"`, `"HFS"`, `"HFS+"`,
 /// or `None` if not a superfloppy.
 fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek)) -> Option<String> {
+    // A Sun QIC tape image: one volume whose files browse as a tree.
+    if crate::fs::sun2tape::looks_like_tape(first_sector) {
+        return Some("Sun QIC tape".to_string());
+    }
     // SquashFS: "hsqs" at offset 0. Appliance and live images ship a bare
     // SquashFS root with no partition table (Buildroot, Raspberry Pi OS,
     // `casper/filesystem.squashfs` carved out of a live CD). Probed first: the

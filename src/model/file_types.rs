@@ -99,6 +99,8 @@ pub const DISK_IMAGE_EXTS: &[&str] = &[
     "smi",
     // NeXT magneto-optical media, ECC-coded sectors and all.
     "od",
+    // Sun QIC tape images (SUN2TAPE), browsed as a filesystem.
+    "qic",
 ];
 
 /// Extensions that appear in the GUI file-picker dropdown (so a user can
@@ -238,6 +240,13 @@ mod tests {
         assert!(DISK_IMAGE_EXTS.contains(&"ssd"));
         assert!(DISK_IMAGE_EXTS.contains(&"dsd"));
         assert!(association_exts().contains(&"dsd".to_string()));
+    }
+
+    #[test]
+    fn sun_qic_tape_extension_present() {
+        // A `.qic` tape opens in Inspect and Commander as a filesystem (`fs::sun2tape`).
+        assert!(DISK_IMAGE_EXTS.contains(&"qic"));
+        assert!(association_exts().contains(&"qic".to_string()));
     }
 
     #[test]

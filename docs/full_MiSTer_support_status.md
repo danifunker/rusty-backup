@@ -8,7 +8,7 @@ support the disk types (floppy / hard disk / CD-ROM) of the outstanding cores.
 ## What Rusty Backup supports today
 
 - **Filesystems:** FAT12/16/32, exFAT, NTFS, HPFS (OS/2; read + edit + create +
-  fsck), HFS, HFS+/HFSX,
+  fsck), HFS, HFS+/HFSX, VxFS and AIX JFS (read-only), HP LIF boot volumes,
   APFS (read-only browse + extract, incl. FileVault via password / recovery
   key; no snapshots),
   ext2/3/4, XFS,
@@ -96,12 +96,15 @@ support the disk types (floppy / hard disk / CD-ROM) of the outstanding cores.
   Philips CD-i, and 3DO Opera — browse/extract, see **Optical / CD-ROM**
   below).
 - **Partition tables:** MBR, GPT, APM, Amiga RDB, Atari AHDI, Sun SMI VTOC,
-  SGI volume header, Sharp X68000, the NeXT disk label (NeXTSTEP / OPENSTEP on
+  SGI volume header, Sharp X68000, BSD disklabel (read), HP-UX LVM and AIX LVM
+  (read, single-disk), the NeXT disk label (NeXTSTEP / OPENSTEP on
   both m68k and Intel) and the Solaris x86 VTOC nested inside an MBR partition
   — every one of them can now be **written** from scratch as well as parsed
   (`rb-cli new hd <table>`). The pre-IRIX SGI disk label (IRIS 2000 / 3000) is
   parsed and its slots edited, but not written from scratch.
-- **Containers:** CHD, VHD (fixed + dynamic), QCOW2, VMDK, 2MG, WOZ,
+- **Containers:** Sun QIC tape images (`.qic`, the Sun-2 / Sun-3 cores' `SUN2TAPE`
+  format; browsed as a filesystem, tars / `.Z` tars / UFS miniroots as directories),
+  CHD, VHD (fixed + dynamic), QCOW2, VMDK, 2MG, WOZ,
   DC42, HFV, IMZ (encrypted ZIP), `.zip` (a RAW disk image inside a plain
   ZIP, inflated sparsely; `--inside` picks among multiple), GHO/GHS (Ghost
   SECTOR mode), MSA (Atari ST), EDSK/DSK (Amstrad CPC / PCW / Einstein /

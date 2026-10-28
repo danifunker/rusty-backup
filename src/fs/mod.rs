@@ -108,6 +108,7 @@ pub mod squashfs;
 pub mod squashfs_edit;
 pub mod squashfs_verify;
 pub mod squashfs_write;
+pub mod sun2tape;
 pub mod tar_export;
 pub mod tar_import;
 pub mod ti99;
@@ -316,6 +317,7 @@ fn fs_display_name(detected: &str) -> &'static str {
         "ufs" => "UFS",
         "vxfs" => "VxFS",
         "jfs1" => "AIX JFS",
+        "sun2tape" => "Sun QIC tape",
         "hpfs" => "HPFS",
         "apfs" => "APFS",
         "squashfs" => "SquashFS",
@@ -359,6 +361,9 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
     let mut sector0 = [0u8; 512];
     if reader.read_exact(&mut sector0).is_err() {
         return "unknown";
+    }
+    if sun2tape::looks_like_tape(&sector0) {
+        return "sun2tape";
     }
     if &sector0[3..11] == b"NTFS    " {
         return "ntfs";
@@ -1900,6 +1905,10 @@ pub fn open_filesystem_full<R: Read + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "sun2tape" => Ok(Box::new(sun2tape::TapeFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 "jfs" => Ok(Box::new(jfs::JfsFilesystem::open(
                     reader,
                     partition_offset,
@@ -2029,6 +2038,10 @@ pub fn open_filesystem_full<R: Read + Seek + Send + 'static>(
                     partition_offset,
                 )?)),
                 "jfs1" => Ok(Box::new(jfs1::Jfs1Filesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "sun2tape" => Ok(Box::new(sun2tape::TapeFilesystem::open(
                     reader,
                     partition_offset,
                 )?)),

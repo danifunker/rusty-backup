@@ -1,0 +1,97 @@
+# Tier 2 — Sun-2 / Sun-3 QIC tapes and disks from the to-fix-add drop (Phase 4).
+#
+# A .qic is the SUN2TAPE container the Sun-2 / Sun-3 MiSTer cores read: a block-0
+# table of volumes and file start blocks. It opens as one read-only filesystem:
+# tape files at the root (or under vol1/ vol2/), named from the tape's own XDR
+# table of contents (boot, XDRTOC, munix, mini-root, root, usr, ...). Tars,
+# compress(1)-ed tars and UFS miniroots open as directories.
+#
+# Two quirks are pinned:
+#   - usr.tar.Z decodes (16-bit LZW, block mode) to a 26.7 MB V7 tar
+#     byte-identical to gzip -d's output;
+#   - SunOS tar records a hard link's target size but stores no data. Reading
+#     it naively desyncs the archive at ./bin/chsh, and /bin/ls was unreachable.
+
+[meta]
+tier = 2
+group = "fs.read.sun-tapes"
+description = "Sun QIC tape images browsed as a filesystem, plus the Sun-2 / Sun-3 disks."
+
+[[case]]
+id = "read.tape.sunos411-sun3"
+description = "SunOS 4.1.1 sun3: two volumes, TOC names, a compressed tar and the UFS miniroot."
+fixture = "tape.qic.sunos411-sun3"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["Sun QIC tape"]
+[[case.step]]
+args = ["ls", "{fixture}", "/vol1"]
+expect_exit = 0
+stdout_contains = ["00-boot", "01-XDRTOC", "02-munix", "04-mini-root.ufs", "06-usr.tar.Z", "28-Copyright.txt"]
+[[case.step]]
+args = ["ls", "{fixture}", "/vol2"]
+expect_exit = 0
+stdout_contains = ["02-Games.tar.Z", "05-OpenWindows_Programmers.tar.Z"]
+[[case.step]]
+args = ["ls", "{fixture}", "/vol1/04-mini-root.ufs"]
+expect_exit = 0
+stdout_contains = [".MINIROOT", "vmunix", "sbin"]
+[[case.step]]
+args = ["ls", "{fixture}", "/vol1/06-usr.tar.Z/bin"]
+expect_exit = 0
+stdout_contains = ["ls", "passwd"]
+stdout_not_contains = ["parse error"]
+
+[[case]]
+id = "read.tape.sunos403-sun2"
+description = "SunOS 4.0.3 sun2: plain V7 tars and the miniroot."
+fixture = "tape.qic.sunos403-sun2"
+[[case.step]]
+args = ["ls", "{fixture}", "/vol1"]
+expect_exit = 0
+stdout_contains = ["02-copy", "03-mini-root.ufs", "05-munixfs.ufs", "07-usr.tar"]
+[[case.step]]
+args = ["ls", "{fixture}", "/vol1/07-usr.tar"]
+expect_exit = 0
+stdout_contains = ["bin", "ucb", "include"]
+
+[[case]]
+id = "read.tape.bash1147-sun2"
+description = "A two-file add-on tape with no TOC: content-typed names."
+fixture = "tape.qic.bash1147-sun2"
+[[case.step]]
+args = ["ls", "{fixture}", "/00-archive.tar/sbin"]
+expect_exit = 0
+stdout_contains = ["bash"]
+
+[[case]]
+id = "read.tape.sunos411u1-sun3"
+description = "SunOS 4.1.1U1 upgrade tape: V7 tars between two text files."
+fixture = "tape.qic.sunos411u1-sun3"
+[[case.step]]
+args = ["ls", "{fixture}", "/"]
+expect_exit = 0
+stdout_contains = ["00-text.txt", "01-archive.tar", "05-text.txt"]
+
+[[case]]
+id = "read.sun.sunos411-sun3-disk"
+description = "SunOS 4.1.1 sun3 disk: Sun label, UFS root and /usr."
+fixture = "part.sun.sunos411-sun3.hd"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["Partition table: Sun", "Sun untagged (UFS?)"]
+[[case.step]]
+args = ["ls", "{fixture}@1", "/"]
+expect_exit = 0
+stdout_contains = ["pcfs", "export", "etc"]
+
+[[case]]
+id = "read.sun.sunos403-sun2-disk"
+description = "SunOS 4.0.3 sun2 disk: Sun label, UFS root and /usr."
+fixture = "part.sun.sunos403-sun2.hd"
+[[case.step]]
+args = ["ls", "{fixture}@3", "/"]
+expect_exit = 0
+stdout_contains = ["bin", "ucb", "include"]

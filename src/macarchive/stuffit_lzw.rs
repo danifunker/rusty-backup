@@ -152,7 +152,8 @@ pub fn decompress(comp: &[u8], want: usize, flags: u8) -> Result<Vec<u8>> {
     let mut lzw = Lzw::new(maxsymbols, reserved);
 
     let mut br = BitCursor::new(comp);
-    let mut out = Vec::with_capacity(want);
+    // `want` can be unbounded (Unix .Z has no length), so cap the up-front reservation.
+    let mut out = Vec::with_capacity(want.min(comp.len().saturating_mul(4)));
     let mut symbolcounter: usize = 0;
 
     while out.len() < want {
@@ -180,6 +181,14 @@ pub fn decompress(comp: &[u8], want: usize, flags: u8) -> Result<Vec<u8>> {
     }
 
     Ok(out)
+}
+
+/// Decompress a Unix `compress(1)` `.Z` stream: magic `1F 9D`, a flags byte, then LZW to EOF.
+pub fn decompress_unix_z(data: &[u8]) -> Result<Vec<u8>> {
+    if data.len() < 3 || data[0..2] != [0x1F, 0x9D] {
+        bail!("not a compress(1) .Z stream");
+    }
+    decompress(&data[3..], usize::MAX, data[2])
 }
 
 #[cfg(test)]

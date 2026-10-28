@@ -241,6 +241,49 @@ pub fn open_zip(
     Ok(MemArchiveFilesystem::from_members(label, "ZIP", members))
 }
 
+/// Whether `h` is a tar header whose checksum adds up.
+fn valid_tar_header(h: &[u8]) -> bool {
+    let field = String::from_utf8_lossy(&h[148..156]);
+    let Ok(stored) = u32::from_str_radix(field.trim_matches(|c: char| c == '\0' || c == ' '), 8)
+    else {
+        return false;
+    };
+    h[0] != 0
+        && stored
+            == h[..148]
+                .iter()
+                .chain(&[b' '; 8])
+                .chain(&h[156..512])
+                .map(|&b| b as u32)
+                .sum::<u32>()
+}
+
+/// SunOS tar records a hard link's target size but stores no data, which desyncs a
+/// reader that skips `size` bytes. Zero such sizes (and restamp the checksum) when the
+/// very next block is already a header.
+fn zero_link_sizes(tar: &mut [u8]) {
+    let mut o = 0usize;
+    while o + 1024 <= tar.len() && valid_tar_header(&tar[o..o + 512]) {
+        let field = String::from_utf8_lossy(&tar[o + 124..o + 136]).into_owned();
+        let size = u64::from_str_radix(field.trim_matches(|c: char| c == '\0' || c == ' '), 8)
+            .unwrap_or(0);
+        let is_link = matches!(tar[o + 156], b'1' | b'2');
+        if is_link && size > 0 && valid_tar_header(&tar[o + 512..o + 1024]) {
+            tar[o + 124..o + 136].copy_from_slice(b"00000000000\0");
+            let sum: u32 = tar[o..o + 148]
+                .iter()
+                .chain(&[b' '; 8])
+                .chain(&tar[o + 156..o + 512])
+                .map(|&b| b as u32)
+                .sum();
+            tar[o + 148..o + 156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+            o += 512;
+            continue;
+        }
+        o += 512 + (size as usize).div_ceil(512) * 512;
+    }
+}
+
 /// Open a tar archive's bytes as a browsable filesystem. Transparently
 /// gzip-decompresses a `.tgz` / `.tar.gz` (and zstd `.tar.zst` when the feature
 /// is built); plain `.tar` is used as-is.
@@ -248,7 +291,8 @@ pub fn open_tar(
     bytes: Vec<u8>,
     label: Option<String>,
 ) -> Result<MemArchiveFilesystem, FilesystemError> {
-    let tar_bytes = decompress_tar(bytes)?;
+    let mut tar_bytes = decompress_tar(bytes)?;
+    zero_link_sizes(&mut tar_bytes);
     let mut archive = tar::Archive::new(Cursor::new(&tar_bytes));
     let mut members = Vec::new();
     let mut total: u64 = 0;
@@ -263,6 +307,8 @@ pub fn open_tar(
         if !kind.is_file() && !kind.is_dir() {
             continue;
         }
+        // Pre-POSIX (V7) tar has no directory type; a trailing `/` on the name marks one.
+        let slash_dir = entry.path_bytes().last() == Some(&b'/');
         let parts = match entry.path() {
             Ok(p) => p
                 .components()
@@ -277,7 +323,7 @@ pub fn open_tar(
             continue;
         }
         let modified = entry.header().mtime().ok().and_then(format_unix_mtime);
-        let is_dir = kind.is_dir();
+        let is_dir = kind.is_dir() || slash_dir;
         let data = if is_dir {
             Vec::new()
         } else {
