@@ -24,8 +24,10 @@
 #                                    then `inspect`. Copying 2 GB out isn't a
 #                                    tier-2 step, so only the listing is pinned.
 #
-# Not pinned: `fsck` on raw-hfs @1 reports 696 FreeNodeNotErased errors, which
-# looks like an HFS+ rule misapplied to classic HFS (tracked separately).
+# raw-hfs @1 (System 7.5.5) has 696 free catalog nodes still holding old data.
+# System 6-8 never erased freed B-tree nodes; modern fsck_hfs calls it a minor
+# repair. It used to be 696 ERROR lines and exit 1; now it is one warning with
+# the count, exit 0, and `fsck --repair` zeroes just those nodes (Phase 1c).
 #
 # Streams: the `Partition @N ...` banner goes to stderr; assert on stdout.
 
@@ -72,6 +74,11 @@ stdout_contains = ["Applications", "Desktop Folder", "Extras"]
 args = ["ls", "{fixture}@2", "/"]
 expect_exit = 0
 stdout_contains = ["8.1 Extras"]
+[[case.step]]
+args = ["fsck", "{fixture}@1", "--checkonly"]
+expect_exit = 0
+stdout_contains = ["12561 files / 1541 dirs", "FreeNodeNotErased", "696 unused node(s) not erased"]
+stdout_not_contains = ["ERROR"]
 [[case.step]]
 args = ["fsck", "{fixture}@2", "--checkonly"]
 expect_exit = 0

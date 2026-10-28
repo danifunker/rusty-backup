@@ -1591,6 +1591,16 @@ pub fn btree_unerased_free_nodes(data: &[u8], node_size: usize) -> Vec<u32> {
     dirty
 }
 
+/// Zero every free node that still holds data, as fsck_hfs's repair does; returns how many.
+pub fn btree_erase_free_nodes(data: &mut [u8], node_size: usize) -> usize {
+    let dirty = btree_unerased_free_nodes(data, node_size);
+    for &idx in &dirty {
+        let off = idx as usize * node_size;
+        data[off..off + node_size].fill(0);
+    }
+    dirty.len()
+}
+
 /// Clear a node's bit in the bitmap. Segment-aware (handles map nodes).
 pub fn btree_bitmap_clear(catalog_data: &mut [u8], node_size: usize, node_idx: u32) {
     let segs = btree_bitmap_segments(catalog_data, node_size);

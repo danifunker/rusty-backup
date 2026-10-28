@@ -105,7 +105,33 @@ Effort: **S** = about a day, **M** = a few days, **L** = about a week, **XL** = 
   `part.rdb.shapeshifter-hardfiles.hd`), with cases in
   `regression-tests/cases/tier2/read-issue89-fixtures.toml`.
 - Found along the way: classic HFS fsck reports `FreeNodeNotErased` on volumes a
-  real Mac wrote, probably an HFS+ rule misapplied (raised as a separate task).
+  real Mac wrote. Fixed as Phase 1c, below.
+
+### Phase 1c: classic HFS "unused node not erased" — **done 2026-10-27**
+
+The System 7.5.5 volume on `part.rdb.shapeshifter-raw-hfs.hd` got 696
+`ERROR [FreeNodeNotErased]` lines and exit 1 from `fsck`, on a volume a working
+Mac used daily.
+
+What Apple's `fsck_hfs` actually does (`lib_fsck_hfs`, `BTCheckUnusedNodes` called
+from `CheckCatalogBTree`): it checks the **catalog** tree on HFS *and* HFS+, reports
+`E_UnusedNodeNotZeroed` once as a level-1 minor repair, stops at the first one, and
+its repair zeroes them all. System 6-8 and Disk First Aid never erased freed nodes
+or checked for it, so nearly every classic volume trips it. The check itself wasn't
+wrong; its weight was. It was one error per node, and there was no repair for it.
+
+Changes (classic HFS only; HFS+ is untouched, since modern macOS writes HFS+ and
+erases nodes):
+
+- One `FreeNodeNotErased` **warning** per tree (catalog, extents), with the count
+  and first node. The volume checks clean (exit 0) and is marked repairable.
+- `repair_hfs` zeroes unused nodes. When the check found no errors, that is
+  *all* it does: no catalog index rebuild on a healthy volume. On the fixture, the
+  repair changes exactly the 696 node sectors, plus the MDB's modify date and the
+  alternate-MDB refresh every sync does.
+- `rb-cli fsck --repair` acts on a repairable warning, matching the GUI's Repair
+  button. Minix and UCSD already marked warnings repairable and were blocked by
+  the same gate.
 
 
 | # | Item | Effort |

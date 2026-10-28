@@ -18,7 +18,7 @@ use byteorder::{BigEndian, ByteOrder};
 use super::super::fsck::{FsckIssue, RepairReport};
 use super::super::hfs_common::{
     btree_bitmap_set, btree_bitmap_test, btree_insert_record, btree_lonely_empty_leaves,
-    btree_node_bitmap_range, btree_record_range, btree_stale_index_keys, btree_unerased_free_nodes,
+    btree_node_bitmap_range, btree_record_range, btree_stale_index_keys,
     normalize_catalog_index_key, BTreeHeader, BTreeKeyFormat, BTREE_HEADER_NODE, BTREE_INDEX_NODE,
     BTREE_LEAF_NODE, BTREE_MAP_NODE,
 };
@@ -400,12 +400,6 @@ pub(super) fn check_key_ordering(
         errors.push(hfs_issue(
             HfsFsckCode::EmptyLeafWithoutSiblings,
             format!("leaf node {idx} has no records and no siblings; an empty tree has no root"),
-        ));
-    }
-    for idx in btree_unerased_free_nodes(catalog_data, node_size) {
-        errors.push(hfs_issue(
-            HfsFsckCode::FreeNodeNotErased,
-            format!("node {idx} is free in the node map but not erased"),
         ));
     }
 }
