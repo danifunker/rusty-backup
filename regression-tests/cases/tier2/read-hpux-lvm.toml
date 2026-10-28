@@ -34,3 +34,20 @@ stdout_contains = ["bootconf", "vmunix", "dlkm"]
 args = ["fsck", "{fixture}@2", "--checkonly"]
 expect_exit = 0
 stdout_contains = ["41 files / 19 dirs"]
+
+[[case]]
+id = "read.hpux-lvm.hpux1111-vxfs-root"
+description = "lvol3 is the HP-UX root on VxFS layout 4, big-endian: OLT -> fileset headers -> inode lists."
+fixture = "part.hpux-lvm.hpux1111-hp715.hd"
+[[case.step]]
+args = ["ls", "{fixture}@4", "/"]
+expect_exit = 0
+stdout_contains = ["etc", "sbin", "usr", "stand", "missing_715_krn.txt"]
+[[case.step]]
+args = ["ls", "{fixture}@4", "/usr/lib"]
+expect_exit = 0
+stdout_contains = ["libc.2", "1785856"]
+[[case.step]]
+args = ["show", "fs-info", "{fixture}@4"]
+expect_exit = 0
+stdout_contains = ["VxFS (layout 4)"]

@@ -203,6 +203,16 @@ refuses to open with the reason (`LVM_UNAVAILABLE`, see `docs/stubs.md`). The hp
 disk is catalogued (`part.hpux-lvm.hpux1111-hp715.hd`), case
 `cases/tier2/read-hpux-lvm.toml`.
 
+**2c (item 2.5) done 2026-10-28: VxFS, read-only.** `fs/vxfs.rs` handles disk
+layouts 2-4 in either byte order: the object location table, fileset headers and
+inode lists, direct / immediate / typed (indirect) extents, hashed directory
+blocks, symlinks, and streaming extraction. It was written from the format facts
+in Linux's former `freevxfs` (no code reused), after prototyping the walk in
+Python against the hp715 root. `/usr/lib/libc.2` (1.7 MB) byte-matches the
+prototype's read. Content detection (`fs::detect_filesystem_type`, superfloppy)
+routes it, so the HP-UX LV opens it. Case `read.hpux-lvm.hpux1111-vxfs-root`.
+**Phase 2 (#90) is complete.**
+
 
 | # | Item | Effort |
 |---|---|---|

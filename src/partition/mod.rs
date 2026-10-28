@@ -730,6 +730,9 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
             }
         }
     }
+    if crate::fs::vxfs::detect(reader, 0).is_some() {
+        return Some("VxFS".to_string());
+    }
 
     // JFS2 aggregate superblock at byte 32768, ASCII magic "JFS1". (AIX JFS1
     // is an unrelated on-disk format and is excluded by this same magic.)

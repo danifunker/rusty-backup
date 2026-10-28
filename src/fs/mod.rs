@@ -118,6 +118,7 @@ pub mod ufs;
 pub mod ufs_format;
 pub mod ufs_fsck;
 pub mod unix_common;
+pub mod vxfs;
 pub mod xattr;
 pub mod xfs;
 pub mod zstd_stream;
@@ -312,6 +313,7 @@ fn fs_display_name(detected: &str) -> &'static str {
         "jfs" => "JFS",
         "reiserfs" => "ReiserFS",
         "ufs" => "UFS",
+        "vxfs" => "VxFS",
         "hpfs" => "HPFS",
         "apfs" => "APFS",
         "squashfs" => "SquashFS",
@@ -566,6 +568,10 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
         if ufs::is_ufs_magic(ufs_magic, cand == 8192) {
             return "ufs";
         }
+    }
+    // Veritas VxFS: magic 0xA501FCF5 at 8192 big-endian (HP-UX) or 1024 little-endian.
+    if vxfs::detect(reader, partition_offset).is_some() {
+        return "vxfs";
     }
 
     // JFS2 magic probe. The primary aggregate superblock lives at byte
@@ -1879,6 +1885,10 @@ pub fn open_filesystem_full<R: Read + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "vxfs" => Ok(Box::new(vxfs::VxfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 "jfs" => Ok(Box::new(jfs::JfsFilesystem::open(
                     reader,
                     partition_offset,
@@ -2000,6 +2010,10 @@ pub fn open_filesystem_full<R: Read + Seek + Send + 'static>(
                     partition_offset,
                 )?)),
                 "ufs" => Ok(Box::new(ufs::UfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "vxfs" => Ok(Box::new(vxfs::VxfsFilesystem::open(
                     reader,
                     partition_offset,
                 )?)),
