@@ -121,6 +121,7 @@ pub mod ufs_format;
 pub mod ufs_fsck;
 pub mod unix_common;
 pub mod vxfs;
+pub mod vxfs_edit;
 pub mod xattr;
 pub mod xfs;
 pub mod zstd_stream;
@@ -2519,6 +2520,10 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "vxfs" => Ok(Box::new(vxfs_edit::VxfsEditor::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 "ofs" => Ok(Box::new(ofs::OfsFilesystem::open(
                     reader,
                     partition_offset,
@@ -2613,6 +2618,10 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                 )?)),
                 "ufs" => Ok(Box::new(open_ufs_editable(reader, partition_offset)?)),
                 "jfs" => Ok(Box::new(jfs::JfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "vxfs" => Ok(Box::new(vxfs_edit::VxfsEditor::open(
                     reader,
                     partition_offset,
                 )?)),

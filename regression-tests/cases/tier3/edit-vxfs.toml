@@ -1,0 +1,56 @@
+# Tier 3 — write to VxFS disk layout 4 volumes made by HP-UX 11.11.
+#
+# The same edits were checked by HP-UX 11.11's `fsck -F vxfs -o full -y` under
+# QEMU (only the routine "clear log" / "set state to CLEAN" prompts), mounted
+# and read back, including a round trip where HP-UX wrote on top of our edits.
+# There is no VxFS fsck of our own yet, so these steps read everything back.
+
+[meta]
+tier = 3
+group = "edit.vxfs"
+description = "Create, delete and rename files and directories on HP-UX-made VxFS v4 volumes."
+
+[[case]]
+id = "edit.vxfs.lab1k"
+description = "1 KiB blocks: immediate dir to hashed blocks, inode-list growth, multi-extent file"
+fixture = "fs.vxfs.hpux1111-lab1k.hd"
+timeout_ms = 600000
+[[case.step]]
+args = ["mkdir", "{fixture_copy}", "/rbdir"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{fixture_copy}", "{cases}/tier3/payload.bin", "/rbdir/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{fixture_copy}", "--zero", "9", "--dst", "/rbdir/file-with-a-long-name-{01..300}"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{fixture_copy}", "/d1/file-number-7"]
+expect_exit = 0
+[[case.step]]
+args = ["mv", "{fixture_copy}", "/hello", "/hello.renamed"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{fixture_copy}", "/rbdir/payload.bin", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+[[case.step]]
+args = ["ls", "{fixture_copy}", "/"]
+expect_exit = 0
+stdout_contains = ["hello.renamed", "rbdir", "d1"]
+
+[[case]]
+id = "edit.vxfs.lab8k"
+description = "8 KiB blocks, a partial AU, inserts into HP-UX's own hashed directory"
+fixture = "fs.vxfs.hpux1111-lab8k.hd"
+timeout_ms = 600000
+[[case.step]]
+args = ["put", "{fixture_copy}", "{cases}/tier3/payload.bin", "/hd/our-file"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{fixture_copy}", "/hd/entry-number-5"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{fixture_copy}", "/hd/our-file", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]

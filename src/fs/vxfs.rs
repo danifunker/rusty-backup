@@ -47,15 +47,15 @@ use super::filesystem::{Filesystem, FilesystemError};
 /// Superblock magic, in the volume's byte order.
 pub const VXFS_MAGIC: u32 = 0xA501_FCF5;
 const OLT_MAGIC: u32 = 0xA504_FCF5;
-const INODE_SIZE: u64 = 256;
-const ROOT_INO: u32 = 2;
+pub(crate) const INODE_SIZE: u64 = 256;
+pub(crate) const ROOT_INO: u32 = 2;
 /// Superblock byte offset on HP-UX (big-endian) and elsewhere (little-endian).
 const SB_OFFSET_BE: u64 = 8192;
 const SB_OFFSET_LE: u64 = 1024;
 const OLT_FSHEAD: u32 = 2;
 const OLT_ILIST: u32 = 4;
-const ORG_EXT4: u8 = 1;
-const ORG_IMMED: u8 = 2;
+pub(crate) const ORG_EXT4: u8 = 1;
+pub(crate) const ORG_IMMED: u8 = 2;
 const ORG_TYPED: u8 = 3;
 const TYPED_INDIRECT: u64 = 1;
 const TYPED_DATA: u64 = 2;
@@ -63,10 +63,10 @@ const TYPED_OFFSET_MASK: u64 = 0x00FF_FFFF_FFFF_FFFF;
 /// Typed-extent indirection seen in practice is one or two levels deep.
 const MAX_INDIRECT_DEPTH: u32 = 8;
 
-const S_IFMT: u32 = 0o170000;
-const S_IFDIR: u32 = 0o040000;
-const S_IFREG: u32 = 0o100000;
-const S_IFLNK: u32 = 0o120000;
+pub(crate) const S_IFMT: u32 = 0o170000;
+pub(crate) const S_IFDIR: u32 = 0o040000;
+pub(crate) const S_IFREG: u32 = 0o100000;
+pub(crate) const S_IFLNK: u32 = 0o120000;
 
 /// Where a superblock with VxFS magic sits, if any, and in which byte order.
 pub fn detect<R: Read + Seek>(reader: &mut R, partition_offset: u64) -> Option<(u64, bool)> {
@@ -92,29 +92,36 @@ pub fn detect<R: Read + Seek>(reader: &mut R, partition_offset: u64) -> Option<(
 }
 
 #[derive(Debug, Clone)]
-struct Inode {
-    mode: u32,
-    uid: u32,
-    gid: u32,
-    size: u64,
-    mtime: u32,
-    org: u8,
-    org_area: [u8; 96],
+pub(crate) struct Inode {
+    pub(crate) mode: u32,
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
+    pub(crate) size: u64,
+    pub(crate) mtime: u32,
+    pub(crate) org: u8,
+    pub(crate) org_area: [u8; 96],
 }
 
 /// A read-only VxFS volume.
 pub struct VxfsFilesystem<R: Read + Seek + Send> {
-    reader: R,
-    offset: u64,
-    big: bool,
-    version: u32,
-    bsize: u64,
-    total_blocks: u64,
-    free_blocks: u64,
+    pub(crate) reader: R,
+    pub(crate) offset: u64,
+    pub(crate) big: bool,
+    pub(crate) version: u32,
+    pub(crate) bsize: u64,
+    pub(crate) total_blocks: u64,
+    pub(crate) free_blocks: u64,
     label: String,
     /// The primary fileset's inode-list inode; user inode N is at N * 256 in its file.
-    ilist: Inode,
+    pub(crate) ilist: Inode,
     fs_type_name: String,
+    /// Superblock byte offset within the volume.
+    pub(crate) sb_off: u64,
+    /// The structural fileset's inode list, and the fileset-header inode.
+    pub(crate) st_ilist: Inode,
+    pub(crate) fsh_ino: u32,
+    /// The primary fileset's inode-list inode number in the structural list.
+    pub(crate) primary_ilist_ino: u32,
 }
 
 impl<R: Read + Seek + Send> VxfsFilesystem<R> {
@@ -135,6 +142,10 @@ impl<R: Read + Seek + Send> VxfsFilesystem<R> {
             label: String::new(),
             ilist: Inode::empty(),
             fs_type_name: String::new(),
+            sb_off,
+            st_ilist: Inode::empty(),
+            fsh_ino: 0,
+            primary_ilist_ino: 0,
         };
         fs.version = fs.u32_at(&sb, 4);
         fs.bsize = fs.u32_at(&sb, 32) as u64;
@@ -192,10 +203,13 @@ impl<R: Read + Seek + Send> VxfsFilesystem<R> {
         let mut raw = [0u8; INODE_SIZE as usize];
         fs.read_inode_range(&stilist, primary as u64 * INODE_SIZE, &mut raw)?;
         fs.ilist = fs.decode_inode(&raw);
+        fs.st_ilist = stilist;
+        fs.fsh_ino = fsh_ino;
+        fs.primary_ilist_ino = primary;
         Ok(fs)
     }
 
-    fn u32_at(&self, b: &[u8], o: usize) -> u32 {
+    pub(crate) fn u32_at(&self, b: &[u8], o: usize) -> u32 {
         let a = [b[o], b[o + 1], b[o + 2], b[o + 3]];
         if self.big {
             u32::from_be_bytes(a)
@@ -204,7 +218,7 @@ impl<R: Read + Seek + Send> VxfsFilesystem<R> {
         }
     }
 
-    fn u16_at(&self, b: &[u8], o: usize) -> u16 {
+    pub(crate) fn u16_at(&self, b: &[u8], o: usize) -> u16 {
         let a = [b[o], b[o + 1]];
         if self.big {
             u16::from_be_bytes(a)
@@ -213,7 +227,7 @@ impl<R: Read + Seek + Send> VxfsFilesystem<R> {
         }
     }
 
-    fn u64_at(&self, b: &[u8], o: usize) -> u64 {
+    pub(crate) fn u64_at(&self, b: &[u8], o: usize) -> u64 {
         let mut a = [0u8; 8];
         a.copy_from_slice(&b[o..o + 8]);
         if self.big {
@@ -223,7 +237,26 @@ impl<R: Read + Seek + Send> VxfsFilesystem<R> {
         }
     }
 
-    fn read_blocks(&mut self, block: u64, count: u64) -> Result<Vec<u8>, FilesystemError> {
+    /// `len` bytes at byte `pos` of the volume.
+    pub(crate) fn read_bytes(&mut self, pos: u64, len: usize) -> Result<Vec<u8>, FilesystemError> {
+        let mut buf = vec![0u8; len];
+        self.reader.seek(SeekFrom::Start(self.offset + pos))?;
+        self.reader.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+
+    /// The raw 256 bytes of inode `ino` in the list file `list`.
+    pub(crate) fn raw_inode(&mut self, list: &Inode, ino: u32) -> Result<Vec<u8>, FilesystemError> {
+        let mut raw = vec![0u8; INODE_SIZE as usize];
+        self.read_inode_range(list, ino as u64 * INODE_SIZE, &mut raw)?;
+        Ok(raw)
+    }
+
+    pub(crate) fn read_blocks(
+        &mut self,
+        block: u64,
+        count: u64,
+    ) -> Result<Vec<u8>, FilesystemError> {
         let mut buf = vec![0u8; (count * self.bsize) as usize];
         self.reader
             .seek(SeekFrom::Start(self.offset + block * self.bsize))?;
@@ -231,7 +264,7 @@ impl<R: Read + Seek + Send> VxfsFilesystem<R> {
         Ok(buf)
     }
 
-    fn decode_inode(&self, b: &[u8]) -> Inode {
+    pub(crate) fn decode_inode(&self, b: &[u8]) -> Inode {
         let mut org_area = [0u8; 96];
         org_area.copy_from_slice(&b[80..176]);
         Inode {
@@ -246,7 +279,7 @@ impl<R: Read + Seek + Send> VxfsFilesystem<R> {
     }
 
     /// Inode `ino` read straight from the block run starting at `extent` ("blkiget").
-    fn blk_inode(&mut self, extent: u64, ino: u32) -> Result<Inode, FilesystemError> {
+    pub(crate) fn blk_inode(&mut self, extent: u64, ino: u32) -> Result<Inode, FilesystemError> {
         let mut b = [0u8; INODE_SIZE as usize];
         self.reader.seek(SeekFrom::Start(
             self.offset + extent * self.bsize + ino as u64 * INODE_SIZE,
@@ -256,7 +289,7 @@ impl<R: Read + Seek + Send> VxfsFilesystem<R> {
     }
 
     /// A user inode, from the primary inode-list file.
-    fn inode(&mut self, ino: u32) -> Result<Inode, FilesystemError> {
+    pub(crate) fn inode(&mut self, ino: u32) -> Result<Inode, FilesystemError> {
         let ilist = self.ilist.clone();
         let mut b = [0u8; INODE_SIZE as usize];
         self.read_inode_range(&ilist, ino as u64 * INODE_SIZE, &mut b)?;
@@ -264,7 +297,7 @@ impl<R: Read + Seek + Send> VxfsFilesystem<R> {
     }
 
     /// Physical block of logical block `bn` of `inode`, or `None` for a hole.
-    fn bmap(&mut self, inode: &Inode, bn: u64) -> Result<Option<u64>, FilesystemError> {
+    pub(crate) fn bmap(&mut self, inode: &Inode, bn: u64) -> Result<Option<u64>, FilesystemError> {
         match inode.org {
             ORG_EXT4 => {
                 let a = &inode.org_area;
@@ -347,7 +380,7 @@ impl<R: Read + Seek + Send> VxfsFilesystem<R> {
     }
 
     /// Fill `buf` from byte `pos` of `inode`'s data; holes and bytes past EOF read as zero.
-    fn read_inode_range(
+    pub(crate) fn read_inode_range(
         &mut self,
         inode: &Inode,
         pos: u64,
@@ -379,7 +412,7 @@ impl<R: Read + Seek + Send> VxfsFilesystem<R> {
         Ok(())
     }
 
-    fn entry_for(
+    pub(crate) fn entry_for(
         &mut self,
         name: String,
         path: String,
@@ -409,7 +442,7 @@ impl<R: Read + Seek + Send> VxfsFilesystem<R> {
 }
 
 impl Inode {
-    fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         Self {
             mode: 0,
             uid: 0,

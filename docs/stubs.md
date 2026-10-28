@@ -20,7 +20,7 @@ finish it. Remove an entry when its work ships.
 | Filesystem | Gap | Where | To finish |
 |---|---|---|---|
 | AIX JFS (`fs::jfs1`) | Read-only, no fsck; volumes with compression enabled (`s_compress`) refuse file reads | `fs/jfs1.rs` | Decode JFS1's LZ page compression; then writes, verified on a real AIX |
-| VxFS (`fs::vxfs`) | Read-only; disk layouts 5 and later (HP-UX 11.23 / 11.31) are refused; no fsck; no compaction (backup copies it raw) | `fs/vxfs.rs` | Layout 5+ differences (64-bit fields, new OLT records), then writes; verify against the hp9000-715 HP-UX `fsck_vxfs` |
+| VxFS (`fs::vxfs`, `fs::vxfs_edit`) | Layout 4 edits only direct-extent files (ten extents) and refuses indirect / typed ones; layouts 5+ refused; no fsck; no compaction (backup copies it raw) | `fs/vxfs.rs` | Layout 5+ differences (64-bit fields, new OLT records), then writes; verify against the hp9000-715 HP-UX `fsck_vxfs` |
 | AIX JFS2 (big-endian JFS2) | **Shelved**: no AIX 5L+ fixture to verify against | plan item 3.4 | Make `fs/jfs.rs` endian-generic once a fixture exists |
 
 ## Optical
