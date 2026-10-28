@@ -1774,7 +1774,10 @@ jobs:
         run: |
           # The FreeDOS 1.4 FloppyEdition is freely redistributable; fetch the
           # 1.44 MB boot floppy in CI rather than vendoring it in the repo.
-          curl -fsSL -o /tmp/fd14-floppy.zip \
+          # The official site first; ibiblio's mirror has been answering 503.
+          curl -fsSL --retry 3 --retry-all-errors -o /tmp/fd14-floppy.zip \
+            https://download.freedos.org/1.4/FD14-FloppyEdition.zip \
+          || curl -fsSL --retry 3 --retry-all-errors -o /tmp/fd14-floppy.zip \
             https://www.ibiblio.org/pub/micro/pc-stuff/freedos/files/distributions/1.4/FD14-FloppyEdition.zip
           unzip -o -j /tmp/fd14-floppy.zip 144m/x86BOOT.img -d /tmp
           ls -lh /tmp/x86BOOT.img
