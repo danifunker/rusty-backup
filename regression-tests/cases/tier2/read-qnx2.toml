@@ -1,0 +1,55 @@
+# Tier 2 — QNX 2 volumes: Unisys ICON floppies (York University archive).
+#
+# All 34 QNX 2 images in the archive export to tar without an error (2498
+# entries). These four cover a multi-extent directory, a text file read across
+# its extent, a boot disk whose root sits past the boot loader, and a disk
+# imaged with bad sectors.
+
+[meta]
+tier = 2
+group = "fs.read.qnx2"
+description = "Detect, list and extract QNX 2 (Unisys ICON) floppies."
+
+[[case]]
+id = "read.qnx2.icon-sys410-disk1"
+description = "System disk: QNX2 detected; /cmds spans six extents (52 entries)"
+fixture = "fs.qnx2.icon-sys410-disk1.floppy"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["QNX2", "800.0 KiB"]
+[[case.step]]
+args = ["ls", "{fixture}", "/cmds"]
+expect_exit = 0
+stdout_contains = ["chkfsys", "backup", "dcheck"]
+[[case.step]]
+args = ["ls", "{fixture}", "/"]
+expect_exit = 0
+stdout_contains = ["4494             QNX_1", "200             bitmap"]
+
+[[case]]
+id = "read.qnx2.icon-help410"
+description = "Help disk: a shell script reads whole"
+fixture = "fs.qnx2.icon-help410.floppy"
+[[case.step]]
+args = ["get", "{fixture}", "/HELP_1", "{scratch}/HELP_1"]
+expect_exit = 0
+[[case.step]]
+args = ["tar", "{fixture}", "/", "{scratch}/all.tar"]
+expect_exit = 0
+
+[[case]]
+id = "read.qnx2.icon-fsboot410"
+description = "Fileserver boot disk: root at block 12"
+fixture = "fs.qnx2.icon-fsboot410.floppy"
+[[case.step]]
+args = ["tar", "{fixture}", "/", "{scratch}/all.tar"]
+expect_exit = 0
+
+[[case]]
+id = "read.qnx2.icon-watcom-basic-badsec"
+description = "Bad-sector image still lists and exports"
+fixture = "fs.qnx2.icon-watcom-basic-badsec.floppy"
+[[case.step]]
+args = ["tar", "{fixture}", "/", "{scratch}/all.tar"]
+expect_exit = 0

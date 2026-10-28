@@ -703,6 +703,19 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
             }
         }
     }
+    // QNX 2: structural root entry at byte 68 of block 1 (FAT and friends were ruled out above).
+    if crate::fs::qnx2::looks_like_qnx2(reader, 0) {
+        let _ = reader.seek(SeekFrom::Start(0));
+        return Some("QNX2".to_string());
+    }
+    if crate::fs::qnx4::looks_like_qnx4(reader, 0) {
+        let _ = reader.seek(SeekFrom::Start(0));
+        return Some("QNX4".to_string());
+    }
+    if crate::fs::qnx6::looks_like_qnx6(reader, 0) {
+        let _ = reader.seek(SeekFrom::Start(0));
+        return Some("QNX6".to_string());
+    }
 
     // btrfs and ReiserFS both keep a superblock at byte 0x10000 (64 KiB):
     // btrfs magic "_BHRfS_M" at +0x40, ReiserFS magic at +52. One

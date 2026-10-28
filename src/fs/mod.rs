@@ -97,6 +97,9 @@ pub mod prodos;
 pub mod prodos_types;
 pub mod qdos;
 pub mod qdos_mdv;
+pub mod qnx2;
+pub mod qnx4;
+pub mod qnx6;
 pub mod raw_name;
 pub mod reiserfs;
 pub mod replace;
@@ -484,6 +487,17 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
                 return "ucsd";
             }
         }
+    }
+    // QNX 2: a root directory entry at byte 68 of block 1 whose extent checks out.
+    if qnx2::looks_like_qnx2(reader, partition_offset) {
+        return "qnx2";
+    }
+    // QNX 4: a `/` root entry at block 1; QNX 6: its superblock magic after the 8 KiB boot area.
+    if qnx4::looks_like_qnx4(reader, partition_offset) {
+        return "qnx4";
+    }
+    if qnx6::looks_like_qnx6(reader, partition_offset) {
+        return "qnx6";
     }
 
     // Sector 1 (offset 512): EFS superblock. EFS magic is at offset 28
@@ -1938,6 +1952,18 @@ pub fn open_filesystem_full<R: Read + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "qnx2" => Ok(Box::new(qnx2::Qnx2Filesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "qnx4" => Ok(Box::new(qnx4::Qnx4Filesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "qnx6" => Ok(Box::new(qnx6::Qnx6Filesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 "trdos" => Ok(Box::new(trdos::TrdosFilesystem::open(
                     reader,
                     partition_offset,
@@ -3242,6 +3268,10 @@ pub fn is_browsable_superfloppy(ptype: u8, type_name: &str) -> bool {
             | "minix"
             // UCSD p-System (Apple II/III Pascal floppies); block-2 volume label.
             | "ucsd"
+            // QNX 2 (Unisys ICON floppies); root entry at byte 68 of block 1.
+            | "QNX2"
+            | "QNX4"
+            | "QNX6"
             | "ADFS"
             | "ANDOS"
             | "QDOS"
@@ -3448,6 +3478,7 @@ pub fn is_checkable_fs_name(type_name: &str) -> bool {
         "HPFS",
         "MINIX",
         "UCSD",
+        "QNX",
         "BFS",
         "OFS",
         "SOLARIS",

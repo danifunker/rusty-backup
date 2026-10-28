@@ -33,10 +33,14 @@ Sinclair QL QDOS that `fs::qdos` already reads. Detection must be by content.
   `blocks * 512 + 512 - (chars_free & 0x1ff) - extents * 16`.
 - A directory file starts `{parent_xtnt, dir_index}` (plus `ext_parent` when
   the top bit of `dir_index` is set), then entries.
-- Verified: all 34 QNX 2 images list a root (`bitmap`, `QNX_1`, `package`,
-  `cmds/`, ...). Still to pin down: the units of `size_xtnt` in the extent
-  header (multi-extent directories misparse past the first extent in the
-  probe script) and the bitmap layout.
+- Pinned down on the ICON disks: `size` in an extent header is the data
+  bytes the extent holds, `bound` the blocks it spans beyond the first, and a
+  file's length the sum of its extents' `size` (the C sources' formula from
+  the directory entry overshoots). The entry's block count is the blocks held
+  minus one. The `bitmap` file is one bit per block (200 bytes for 1600).
+- Dates: the `seconds` field is 0 on every ICON file and the two-word `date`
+  packing is not yet decoded, so no timestamps are shown.
+- All 34 QNX 2 images export to tar (2498 entries), the bad-sector ones too.
 
 ## QNX 4 and QNX 6
 
@@ -59,9 +63,9 @@ Sinclair QL QDOS that `fs::qdos` already reads. Detection must be by content.
 
 | Phase | Work | Verified against |
 |---|---|---|
-| Q1 | QNX 2 read: detection, browse, extract, Inspect / Commander, `.img` 800 KiB ICON geometry; tolerate unreadable sectors (named, not fatal); ICON fixtures + regression cases | The ICON disks themselves (files that are known text / known binaries), `q2files`-style listing |
-| Q2 | QNX 4 read: superblock / root, inode file, extents, links, MBR types 0x4D-0x4F | `qnxfs1g.img`, images made by QNX 4.25 under QEMU, `chkfs` |
-| Q3 | QNX 6 Power-Safe read: superblock pair, trees, long names, both byte orders | Images made by QNX 6.5 / 7 under QEMU |
+| Q1 (done) | QNX 2 read: detection, browse, extract, Inspect / Commander, `.img` 800 KiB ICON geometry; tolerate unreadable sectors (named, not fatal); ICON fixtures + regression cases | The ICON disks themselves (files that are known text / known binaries), `q2files`-style listing |
+| Q2 (code done; needs real media) | QNX 4 read: superblock / root, inode file, extents, links, MBR types 0x4D-0x4F | `qnxfs1g.img`, images made by QNX 4.25 under QEMU, `chkfs` |
+| Q3 (code done; needs real media) | QNX 6 Power-Safe read: superblock pair, trees, long names, both byte orders | Images made by QNX 6.5 / 7 under QEMU |
 | Q4 | QNX 2 edit + create + fsck | QNX 2 `chkfsys` running under emulation (see Oracles) |
 | Q5 | QNX 4 edit + create + fsck | QNX 4.25 `chkfsys` / `dcheck` under QEMU, plus `chkfs` |
 | Q6 | QNX 6 edit + create + fsck | QNX 6.5 / 7 `chkqnx6fs` under QEMU |
@@ -79,3 +83,11 @@ HP-UX work. That needs a running QNX of each generation:
 - QNX 6: QNX 6.5 or QNX 7 boots in QEMU.
 
 Install media for these is the one thing not already on hand.
+
+## Backlog: KryoFlux
+
+Read-only KryoFlux stream support (`trackNN.S.raw`), as a disk-image
+abstraction beneath the filesystems: decode flux to sectors for the known
+formats (MFM PC / ICON 800 KiB, and the others MiSTer users image), present
+the result as an ordinary sector image, and report unreadable sectors rather
+than failing. The ICON archive's "(bad sectors)" disks are the first test.
