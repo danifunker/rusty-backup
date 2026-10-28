@@ -127,6 +127,13 @@ pub fn fsck_ufs<R: Read + Seek + Send>(
 
     // ----- 1. Geometry re-validation -----
     check_geometry(fs, &mut b);
+    // FreeBSD's metadata check-hashes; a mismatch makes its kernel refuse the block.
+    for what in fs.check_hash_mismatches()? {
+        b.err(
+            "CheckHashMismatch",
+            format!("{what} does not match its contents"),
+        );
+    }
 
     // ----- 2. Per-CG header + replica SB + bitmap collection -----
     // Holding every CG's bitmap in memory simultaneously is fine for the

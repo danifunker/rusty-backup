@@ -240,6 +240,23 @@ const OFF_SPC_43: usize = 0x0AC;
 const CG_OFF_FRSUM: usize = 52;
 const CG43_OFF_BTOT: usize = 84;
 const CG43_OFF_B_END: usize = 724;
+/// FreeBSD metadata check-hashes (`fs_metackhash`), each a raw CRC32C over its block.
+const OFF_SBSIZE: usize = 104;
+const OFF_CGSIZE: usize = 160;
+const OFF_CKHASH: usize = 1304;
+const OFF_METACKHASH: usize = 1308;
+const OFF_CONTIGSUMSIZE: usize = 1316;
+const CK_SUPERBLOCK: u32 = 1;
+const CK_CYLGRP: u32 = 2;
+const CK_INODE: u32 = 4;
+const CG_OFF_CKHASH: usize = 132;
+const CG_OFF_CLUSTERSUMOFF: usize = 104;
+const CG_OFF_CLUSTEROFF: usize = 108;
+const CG_OFF_NCLUSTERBLKS: usize = 112;
+const CG_OFF_NIBLK: usize = 116;
+const CG_OFF_INITEDIBLK: usize = 120;
+const D2_OFF_CKHASH: usize = 244;
+const D2_OFF_DIRDEPTH: usize = 240;
 
 // ---- 4.3BSD cylinder-group layout ----
 //
@@ -387,6 +404,12 @@ pub struct UfsFilesystem<R> {
     pub(crate) cg_layout: CgLayout,
     /// `(fs_nspf, fs_nsect, fs_spc)` for the 4.3BSD rotational tables; zero on other layouts.
     rot43: [u64; 3],
+    /// `fs_metackhash` (UFS2 only) and the sizes its hashes cover.
+    metackhash: u32,
+    sbsize: usize,
+    cgsize: usize,
+    /// `fs_contigsumsize`: when non-zero, cylinder groups carry cluster maps.
+    contigsumsize: usize,
     /// `fs_fsbtodb`: fragment -> device-block shift. `fsize >> fsbtodb` is the
     /// unit `di_blocks` counts in — 512 on BSD, 1024 on NeXTSTEP.
     pub(crate) fsbtodb: u32,
@@ -614,6 +637,10 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
             old_dirent_fmt: raw_msl <= 0,
             cg_layout: CgLayout::Modern,
             rot43: [0; 3],
+            metackhash: 0,
+            sbsize: 0,
+            cgsize: 0,
+            contigsumsize: 0,
             fsbtodb,
             dirblksiz: dir_block_size(fsize, fsbtodb),
             csaddr_frag: match version {
@@ -623,6 +650,14 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
             label,
         };
         fs.cg_layout = fs.detect_cg_layout();
+        let field = |o: usize| read_i32(&sb, o, endian).max(0) as usize;
+        (fs.sbsize, fs.cgsize) = (field(OFF_SBSIZE), field(OFF_CGSIZE));
+        if fs.cg_layout == CgLayout::Modern {
+            fs.contigsumsize = field(OFF_CONTIGSUMSIZE).min(64);
+        }
+        if fs.version == UfsVersion::Ufs2 {
+            fs.metackhash = read_u32(&sb, OFF_METACKHASH, endian);
+        }
         if fs.cg_layout == CgLayout::Bsd43 {
             let geo = |o: usize| read_i32(&sb, o, endian).max(0) as u64;
             fs.rot43 = [geo(OFF_NSPF_43), geo(OFF_NSECT_43), geo(OFF_SPC_43)];
@@ -1058,6 +1093,51 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
 
     /// Read a single inode by number. Inode 0 and inode 1 are reserved
     /// and rejected; out-of-range inodes are too.
+    /// Which of the volume's FreeBSD check-hashes no longer match: superblock, groups, inodes.
+    pub(crate) fn check_hash_mismatches(&mut self) -> Result<Vec<String>, FilesystemError> {
+        let mut bad = Vec::new();
+        let ok = |buf: &mut [u8], at: usize, endian| {
+            let rec = read_u32(buf, at, endian);
+            buf[at..at + 4].fill(0);
+            rec == ffs_ckhash(buf)
+        };
+        if self.metackhash & CK_SUPERBLOCK != 0 && self.sbsize >= OFF_METACKHASH {
+            let mut sb = vec![0u8; self.sbsize];
+            self.reader
+                .seek(SeekFrom::Start(self.partition_offset + self.sb_offset))?;
+            self.reader.read_exact(&mut sb)?;
+            if !ok(&mut sb, OFF_CKHASH, self.endian) {
+                bad.push("superblock check-hash".to_string());
+            }
+        }
+        if self.metackhash & CK_CYLGRP != 0 && self.cgsize >= CG_OFF_CKHASH + 4 {
+            for cg in 0..self.ncg {
+                let mut buf = vec![0u8; self.cgsize];
+                let at = self.partition_offset + self.cg_header_offset(cg);
+                self.reader.seek(SeekFrom::Start(at))?;
+                self.reader.read_exact(&mut buf)?;
+                if !ok(&mut buf, CG_OFF_CKHASH, self.endian) {
+                    bad.push(format!("CG {cg} check-hash"));
+                }
+            }
+        }
+        if self.version == UfsVersion::Ufs2 && self.metackhash & CK_INODE != 0 {
+            let size = self.dinode_size() as usize;
+            for inum in ROOT_INODE..self.total_inodes() as u32 {
+                let mut buf = vec![0u8; size];
+                let at = self.partition_offset + self.inode_byte_offset(inum);
+                self.reader.seek(SeekFrom::Start(at))?;
+                self.reader.read_exact(&mut buf)?;
+                if read_u16(&buf, D1_OFF_MODE, self.endian) != 0
+                    && !ok(&mut buf, D2_OFF_CKHASH, self.endian)
+                {
+                    bad.push(format!("inode {inum} check-hash"));
+                }
+            }
+        }
+        Ok(bad)
+    }
+
     pub(crate) fn read_inode(&mut self, inum: u32) -> Result<UfsInode, FilesystemError> {
         if inum < ROOT_INODE {
             return Err(FilesystemError::Parse(format!(
@@ -1463,14 +1543,18 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
         let endian = self.endian;
         let byte = self.partition_offset + self.inode_byte_offset(inum);
         let hp = self.is_hpux_hfs();
-        if hp {
-            // Keep HP's own fields (flags, generation, continuation inode) on a live inode.
+        if hp || self.version == UfsVersion::Ufs2 {
+            // Keep fields we don't model (HP's flags and continuation inode, UFS2 times and gen).
             self.reader.seek(SeekFrom::Start(byte))?;
             self.reader.read_exact(&mut buf)?;
             if read_u16(&buf, D1_OFF_MODE, endian) == 0 {
                 buf.fill(0);
             }
-            buf[D1_OFF_DB..D1_OFF_IB + 12].fill(0);
+            let (db, ib_end) = match self.version {
+                UfsVersion::Ufs1 => (D1_OFF_DB, D1_OFF_IB + 12),
+                UfsVersion::Ufs2 => (D2_OFF_DB, D2_OFF_IB + 24),
+            };
+            buf[db..ib_end].fill(0);
         }
         // read_inode keeps a copy of the pointer area in `inline_payload` for
         // every inode; writing it back over a changed direct[] undid the change.
@@ -1536,6 +1620,7 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
             }
         }
 
+        self.stamp_inode_hash(&mut buf);
         self.reader.seek(SeekFrom::Start(byte))?;
         self.reader.write_all(&buf)?;
         Ok(())
@@ -1641,7 +1726,93 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
         self.reader
             .seek(SeekFrom::Start(cg_byte + CG_OFF_FRSUM as u64))?;
         self.reader.write_all(&hdr[CG_OFF_FRSUM..end])?;
+        if self.contigsumsize > 0 {
+            self.refresh_cluster_maps(cg_byte, &hdr, bm)?;
+        }
+        self.rehash_cg(cg_byte)
+    }
+
+    /// 4.4BSD cluster maps: one bit per wholly free block, and counts of free runs by length.
+    fn refresh_cluster_maps(
+        &mut self,
+        cg_byte: u64,
+        hdr: &[u8],
+        bm: &[u8],
+    ) -> Result<(), FilesystemError> {
+        let endian = self.endian;
+        let sumoff = read_u32(hdr, CG_OFF_CLUSTERSUMOFF, endian) as u64;
+        let mapoff = read_u32(hdr, CG_OFF_CLUSTEROFF, endian) as u64;
+        let nblks = read_u32(hdr, CG_OFF_NCLUSTERBLKS, endian) as u64;
+        let frag = self.frag as u64;
+        if sumoff == 0 || mapoff == 0 || (nblks * frag).div_ceil(8) > bm.len() as u64 {
+            return Ok(());
+        }
+        let free = |f: u64| bm[(f / 8) as usize] >> (f % 8) & 1 != 0;
+        let mut map = vec![0u8; nblks.div_ceil(8) as usize];
+        let mut sum = vec![0u32; self.contigsumsize + 1];
+        let mut run = 0usize;
+        for b in 0..=nblks {
+            if b < nblks && (b * frag..(b + 1) * frag).all(free) {
+                map[(b / 8) as usize] |= 1 << (b % 8);
+                run += 1;
+            } else if run > 0 {
+                sum[run.min(self.contigsumsize)] += 1;
+                run = 0;
+            }
+        }
+        let mut raw = vec![0u8; self.contigsumsize * 4];
+        for (i, n) in sum.iter().enumerate().skip(1) {
+            write_u32(&mut raw, (i - 1) * 4, *n, endian);
+        }
+        self.reader.seek(SeekFrom::Start(cg_byte + sumoff + 4))?;
+        self.reader.write_all(&raw)?;
+        self.reader.seek(SeekFrom::Start(cg_byte + mapoff))?;
+        self.reader.write_all(&map)?;
         Ok(())
+    }
+
+    /// Restamp `cg_ckhash` when the volume asks for cylinder-group check-hashes.
+    fn rehash_cg(&mut self, cg_byte: u64) -> Result<(), FilesystemError> {
+        if self.metackhash & CK_CYLGRP == 0 || self.cgsize < CG_OFF_CKHASH + 4 {
+            return Ok(());
+        }
+        let mut cg = vec![0u8; self.cgsize];
+        self.reader.seek(SeekFrom::Start(cg_byte))?;
+        self.reader.read_exact(&mut cg)?;
+        cg[CG_OFF_CKHASH..CG_OFF_CKHASH + 4].fill(0);
+        let h = ffs_ckhash(&cg);
+        write_u32(&mut cg, CG_OFF_CKHASH, h, self.endian);
+        self.reader
+            .seek(SeekFrom::Start(cg_byte + CG_OFF_CKHASH as u64))?;
+        self.reader
+            .write_all(&cg[CG_OFF_CKHASH..CG_OFF_CKHASH + 4])?;
+        Ok(())
+    }
+
+    /// Restamp `fs_ckhash` when the volume asks for a superblock check-hash.
+    fn rehash_sb(&mut self) -> Result<(), FilesystemError> {
+        if self.metackhash & CK_SUPERBLOCK == 0 || self.sbsize < OFF_METACKHASH {
+            return Ok(());
+        }
+        let at = self.partition_offset + self.sb_offset;
+        let mut sb = vec![0u8; self.sbsize];
+        self.reader.seek(SeekFrom::Start(at))?;
+        self.reader.read_exact(&mut sb)?;
+        sb[OFF_CKHASH..OFF_CKHASH + 4].fill(0);
+        let h = ffs_ckhash(&sb);
+        write_u32(&mut sb, OFF_CKHASH, h, self.endian);
+        self.reader.seek(SeekFrom::Start(at + OFF_CKHASH as u64))?;
+        self.reader.write_all(&sb[OFF_CKHASH..OFF_CKHASH + 4])?;
+        Ok(())
+    }
+
+    /// Stamp `di_ckhash` into a UFS2 dinode buffer when the volume asks for inode check-hashes.
+    fn stamp_inode_hash(&self, buf: &mut [u8]) {
+        if self.version == UfsVersion::Ufs2 && self.metackhash & CK_INODE != 0 {
+            buf[D2_OFF_CKHASH..D2_OFF_CKHASH + 4].fill(0);
+            let h = ffs_ckhash(buf);
+            write_u32(buf, D2_OFF_CKHASH, h, self.endian);
+        }
     }
 
     /// Write CG `cg`'s inode-used bitmap back to disk. Caller-supplied `bm`
@@ -1654,7 +1825,7 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
         let (cg_byte, iusedoff) = self.cg_iusedoff_byte(cg)?;
         self.reader.seek(SeekFrom::Start(cg_byte + iusedoff))?;
         self.reader.write_all(bm)?;
-        Ok(())
+        self.rehash_cg(cg_byte)
     }
 
     /// Read CG `cg`'s `cg_cs` summary (`ndir`, `nbfree`, `nifree`,
@@ -1699,6 +1870,7 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
         let cg_byte = self.partition_offset + self.cg_header_offset(cg);
         self.reader.seek(SeekFrom::Start(cg_byte + 24))?;
         self.reader.write_all(&buf)?;
+        self.rehash_cg(cg_byte)?;
         self.propagate_cs(cg, &buf, d_ndir, d_nbfree, d_nifree, d_nffree)?;
         Ok(())
     }
@@ -1741,7 +1913,7 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
         }
         self.reader.seek(SeekFrom::Start(sb_at))?;
         self.reader.write_all(&sb)?;
-        Ok(())
+        self.rehash_sb()
     }
 
     /// Allocate a free inode. Walks CGs starting from `cg_hint` (typically
@@ -1762,6 +1934,7 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
                 if global < ROOT_INODE as u64 {
                     continue;
                 }
+                self.init_inode_blocks(cg, in_cg)?;
                 bitmap_set_bit(&mut bm, in_cg);
                 self.write_cg_iused_bitmap(cg, &bm)?;
                 self.update_cg_cs(cg, 0, 0, -1, 0)?;
@@ -1771,6 +1944,63 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
         Err(FilesystemError::DiskFull(
             "ufs alloc_inode: no free inode in any cylinder group".into(),
         ))
+    }
+
+    /// FreeBSD's UFS2 `di_dirdepth`: a new directory sits one below its parent.
+    fn set_dirdepth(&mut self, inum: u32, parent: u32) -> Result<(), FilesystemError> {
+        if self.version != UfsVersion::Ufs2 {
+            return Ok(());
+        }
+        let size = self.dinode_size() as usize;
+        let read = |fs: &mut Self, n: u32| -> Result<(u64, Vec<u8>), FilesystemError> {
+            let at = fs.partition_offset + fs.inode_byte_offset(n);
+            let mut buf = vec![0u8; size];
+            fs.reader.seek(SeekFrom::Start(at))?;
+            fs.reader.read_exact(&mut buf)?;
+            Ok((at, buf))
+        };
+        let depth = read(self, parent)?.1;
+        let depth = read_u32(&depth, D2_OFF_DIRDEPTH, self.endian);
+        let (at, mut buf) = read(self, inum)?;
+        write_u32(&mut buf, D2_OFF_DIRDEPTH, depth + 1, self.endian);
+        self.stamp_inode_hash(&mut buf);
+        self.reader.seek(SeekFrom::Start(at))?;
+        self.reader.write_all(&buf)?;
+        Ok(())
+    }
+
+    /// UFS2 initialises inode blocks lazily: zero (and hash) blocks up to `in_cg` past `cg_initediblk`.
+    fn init_inode_blocks(&mut self, cg: u32, in_cg: u64) -> Result<(), FilesystemError> {
+        if self.version != UfsVersion::Ufs2 {
+            return Ok(());
+        }
+        let cg_byte = self.partition_offset + self.cg_header_offset(cg);
+        let mut hdr = [0u8; 8];
+        self.reader
+            .seek(SeekFrom::Start(cg_byte + CG_OFF_NIBLK as u64))?;
+        self.reader.read_exact(&mut hdr)?;
+        let niblk = read_u32(&hdr, 0, self.endian) as u64;
+        let mut inited = read_u32(&hdr, 4, self.endian) as u64;
+        if in_cg < inited || inited >= niblk {
+            return Ok(());
+        }
+        let inopb = self.bsize / self.dinode_size();
+        let mut zero = vec![0u8; self.dinode_size() as usize];
+        self.stamp_inode_hash(&mut zero);
+        let block: Vec<u8> = zero.repeat(inopb as usize);
+        while in_cg >= inited && inited < niblk {
+            let inum = cg as u64 * self.ipg as u64 + inited;
+            let byte = self.partition_offset + self.inode_byte_offset(inum as u32);
+            self.reader.seek(SeekFrom::Start(byte))?;
+            self.reader.write_all(&block)?;
+            inited = (inited + inopb).min(niblk);
+        }
+        let mut raw = [0u8; 4];
+        write_u32(&mut raw, 0, inited as u32, self.endian);
+        self.reader
+            .seek(SeekFrom::Start(cg_byte + CG_OFF_INITEDIBLK as u64))?;
+        self.reader.write_all(&raw)?;
+        self.rehash_cg(cg_byte)
     }
 
     /// Free `inum`'s bit in its CG's `cg_iusedoff` bitmap and zero out the
@@ -1790,7 +2020,8 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
         self.update_cg_cs(cg, 0, 0, 1, 0)?;
 
         // Zero the dinode so a future scan doesn't see stale metadata.
-        let zero = vec![0u8; self.dinode_size() as usize];
+        let mut zero = vec![0u8; self.dinode_size() as usize];
+        self.stamp_inode_hash(&mut zero);
         let byte = self.partition_offset + self.inode_byte_offset(inum);
         self.reader.seek(SeekFrom::Start(byte))?;
         self.reader.write_all(&zero)?;
@@ -2789,6 +3020,7 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Uf
             new_dir.direct[0] = start_frag;
             new_dir.blocks = self.frags_to_device_blocks(dir_frags);
             self.write_inode(new_inum, &new_dir)?;
+            self.set_dirdepth(new_inum, parent_inum)?;
             // Tracking: the new directory bumps the per-CG ndir counter.
             self.update_cg_cs(new_inum / self.ipg, 1, 0, 0, 0)?;
 
@@ -3317,6 +3549,11 @@ const FS_SUJ: u32 = 1 << 3;
 const FS_DIRTY: u8 = 0;
 
 // ---- Byte-order-aware field readers ----
+
+/// FreeBSD's metadata check-hash: CRC32C seeded with `!0` and left un-inverted.
+fn ffs_ckhash(buf: &[u8]) -> u32 {
+    !crc32c::crc32c(buf)
+}
 
 pub(crate) fn read_u16(buf: &[u8], off: usize, endian: UfsEndian) -> u16 {
     let bytes = [buf[off], buf[off + 1]];

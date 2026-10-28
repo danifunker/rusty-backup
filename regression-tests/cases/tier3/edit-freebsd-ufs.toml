@@ -1,0 +1,73 @@
+# Tier 3 — write to volumes FreeBSD 15.1 made itself.
+#
+# FreeBSD 12 and later stamp CRC32C check-hashes on the superblock, every
+# cylinder group and every UFS2 inode, and keep 4.4BSD cluster maps. A write
+# that leaves any of them stale is rejected by FreeBSD's kernel and fsck_ffs
+# ("INODE CHECK-HASH FAILED", "PHASE 5 SKIPPED DUE TO CORRUPT CYLINDER GROUP
+# HEADER(S)"). Our fsck now verifies the hashes, so the final step here is the
+# guard. The same edits were checked by FreeBSD 15.1's `fsck_ffs -fn` under
+# QEMU (clean, exit 0) and read back after a mount.
+
+[meta]
+tier = 3
+group = "edit.freebsd-ufs"
+description = "Edit FreeBSD-made UFS2 (check-hashes) and UFS1 volumes; fsck clean, hashes intact."
+
+[[case]]
+id = "edit.freebsd-ufs.ufs2-ckhash"
+description = "UFS2 with superblock / cylinder-group / inode check-hashes and cluster maps"
+fixture = "fs.ufs2.freebsd151-ckhash.hd"
+timeout_ms = 600000
+[[case.step]]
+args = ["put", "{fixture_copy}", "{cases}/tier3/payload.bin", "/rbtest.txt"]
+expect_exit = 0
+[[case.step]]
+args = ["mkdir", "{fixture_copy}", "/rbdir"]
+expect_exit = 0
+[[case.step]]
+args = ["mkdir", "{fixture_copy}", "/rbdir/sub"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{fixture_copy}", "--zero", "7", "--dst", "/rbdir/f-{001..200}"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{fixture_copy}", "/big"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{fixture_copy}", "/man1/ls.1.gz"]
+expect_exit = 0
+[[case.step]]
+args = ["mv", "{fixture_copy}", "/etc/motd.template", "/etc/motd.renamed"]
+expect_exit = 0
+[[case.step]]
+args = ["chown", "{fixture_copy}", "/rbtest.txt", "100:20"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{fixture_copy}", "/rbtest.txt", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+[[case.step]]
+args = ["fsck", "{fixture_copy}", "--checkonly"]
+expect_exit = 0
+stdout_not_contains = ["CheckHashMismatch"]
+
+[[case]]
+id = "edit.freebsd-ufs.ufs1"
+description = "UFS1 from FreeBSD's newfs -O1: cluster maps and fragment tails"
+fixture = "fs.ufs1.freebsd151.hd"
+timeout_ms = 600000
+[[case.step]]
+args = ["put", "{fixture_copy}", "{cases}/tier3/payload.bin", "/rbtest.txt"]
+expect_exit = 0
+[[case.step]]
+args = ["mkdir", "{fixture_copy}", "/rbdir"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{fixture_copy}", "--zero", "7", "--dst", "/rbdir/f-{001..200}"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{fixture_copy}", "/man8/mount.8.gz"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "{fixture_copy}", "--checkonly"]
+expect_exit = 0
