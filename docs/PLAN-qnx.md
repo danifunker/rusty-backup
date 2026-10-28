@@ -64,6 +64,27 @@ Sinclair QL QDOS that `fs::qdos` already reads. Detection must be by content.
   archive (only the `arch` command and its help page).
 - All 34 QNX 2 images export to tar (2498 entries), the bad-sector ones too.
 
+## LEXICON hard disk (read, 2026-10-28)
+
+`lexicon-10mb_postInst.img` (NAS `ICON_ICON2`, fixture `fs.qnx2.lexicon-10mb.hd`),
+10,653,696 bytes = 20,808 sectors = 306 cyl x 4 heads x 17 spt (ST-412):
+
+- Sector 0: a drive record in bytes 0x00-0x3F (u32 total sectors 20,808 at
+  0x14, heads 4 at 0x13, 17 sectors per track at 0x1C) plus an ordinary MBR
+  table and `55AA`. One entry: bootable, type `0x07`, start **30**, 20,779
+  sectors.
+- Sector 1: the bad-block table, `{u32 bad, u32 spare}` pairs; spares 21-31,
+  every `bad` 0 (nothing remapped, so remapping is not implemented yet).
+- Sectors 2-8: boot loader; 9-28 blank.
+- The QNX 2 volume's block 1 (root entry at byte 68) is sector **29** and the
+  bitmap's extent is sector 30: the MBR start is 1-based. 29 + 20,779 = 20,808.
+  `partition::qnx2_one_based_starts` moves such an entry back one sector when
+  no NTFS / HPFS / exFAT is at its start and a QNX 2 root is one sector
+  earlier. Restore leaves the on-disk entry alone (`patch_mbr_entries` skips an
+  entry whose stored start differs from the parsed one).
+- The volume is the same format as the floppies: 425 files / 20 dirs, fsck
+  clean, `/sys/icon2_emul` among them.
+
 ## QNX 4 and QNX 6
 
 - **QNX 4** (QNX 4.x, and QNX Neutrino 6.0-6.3 via `fs-qnx4`): 512-byte

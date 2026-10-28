@@ -808,7 +808,10 @@ pub fn probe_0x83_fs_type<R: Read + Seek>(
 /// Returns `"ntfs"`, `"exfat"`, or `"unknown"`.
 ///
 /// Reads a full 512-byte sector for compatibility with raw character devices.
-fn detect_0x07_type<R: Read + Seek>(reader: &mut R, partition_offset: u64) -> &'static str {
+pub(crate) fn detect_0x07_type<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+) -> &'static str {
     if reader.seek(SeekFrom::Start(partition_offset)).is_err() {
         return "unknown";
     }

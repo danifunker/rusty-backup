@@ -398,6 +398,26 @@ fn probe_apm_without_ddr(reader: &mut (impl Read + Seek)) -> Option<Apm> {
 /// Checks the first sector for a valid FAT BPB, and offset 1024 for HFS/HFS+.
 /// Returns `Some(fs_hint)` where `fs_hint` is `"FAT"`, `"HFS"`, `"HFS+"`,
 /// or `None` if not a superfloppy.
+/// QNX 2 hard disks (Unisys ICON / LEXICON) store a 1-based start sector in their type-0x07 entry.
+/// Move such an entry back one sector when the QNX 2 root is there and no NTFS/HPFS/exFAT is at its start.
+fn qnx2_one_based_starts(reader: &mut (impl Read + Seek), mbr: &mut Mbr) {
+    for e in mbr.entries.iter_mut() {
+        if e.partition_type != 0x07 || e.start_lba < 2 {
+            continue;
+        }
+        let at = u64::from(e.start_lba) * 512;
+        if crate::fs::detect_0x07_type(reader, at) != "unknown"
+            || crate::fs::qnx2::looks_like_qnx2(reader, at)
+        {
+            continue;
+        }
+        if crate::fs::qnx2::looks_like_qnx2(reader, at - 512) {
+            e.start_lba -= 1;
+        }
+    }
+    let _ = reader.seek(SeekFrom::Start(0));
+}
+
 fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek)) -> Option<String> {
     // A Sun QIC tape image: one volume whose files browse as a tree.
     if crate::fs::sun2tape::looks_like_tape(first_sector) {
@@ -1450,6 +1470,8 @@ impl PartitionTable {
                     break; // Only one extended partition is valid per MBR
                 }
             }
+
+            qnx2_one_based_starts(reader, &mut mbr);
 
             // Solaris x86 nests a VTOC inside an MBR partition (0x82 is also swap,
             // so its sanity word decides); the EBR walk ran first to keep logicals.
@@ -2538,6 +2560,32 @@ mod tests {
             Some("qdos_mdv"),
             "cartridge-sized bytes without the header must not be claimed"
         );
+    }
+
+    #[test]
+    fn qnx2_hard_disk_one_based_start_is_corrected() {
+        // LEXICON layout: type 0x07 entry says sector 30, the QNX 2 volume's block 1 is sector 29.
+        let mut img = vec![0u8; 64 * 512];
+        img[0x1BE + 4] = 0x07;
+        img[0x1BE + 8..0x1BE + 12].copy_from_slice(&30u32.to_le_bytes());
+        img[0x1BE + 12..0x1BE + 16].copy_from_slice(&34u32.to_le_bytes());
+        img[510] = 0x55;
+        img[511] = 0xAA;
+        let b1 = 29 * 512;
+        img[b1 + 68] = 0x40;
+        img[b1 + 68 + 1..b1 + 68 + 5].copy_from_slice(&3u32.to_le_bytes());
+        img[b1 + 68 + 26] = 0x25;
+        // Block 3 (sector 31): the root's extent header, 4 data bytes.
+        img[31 * 512 + 8..31 * 512 + 12].copy_from_slice(&4u32.to_le_bytes());
+        let mut first = [0u8; 512];
+        first.copy_from_slice(&img[..512]);
+        let mut mbr = Mbr::parse(&first).unwrap();
+        qnx2_one_based_starts(&mut std::io::Cursor::new(img), &mut mbr);
+        assert_eq!(mbr.entries[0].start_lba, 29);
+        // An NTFS-style 0x07 entry with nothing QNX-like before it is left alone.
+        let mut plain = Mbr::parse(&first).unwrap();
+        qnx2_one_based_starts(&mut std::io::Cursor::new(vec![0u8; 64 * 512]), &mut plain);
+        assert_eq!(plain.entries[0].start_lba, 30);
     }
 
     #[test]

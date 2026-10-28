@@ -103,3 +103,29 @@ fixture = "fs.qnx2.icon-watcom-basic-badsec.floppy"
 args = ["fsck", "--checkonly", "{fixture}"]
 expect_exit = 0
 stdout_contains = ["/util/basic.qnx: entry says 196 blocks", "/util/gks: entry says 109 blocks", "303 blocks are marked in use but no file holds them: 286-480, 646-753"]
+
+[[case]]
+id = "read.qnx2.lexicon-10mb-hd"
+description = "LEXICON 10 MB hard disk: the 1-based type-0x07 start is corrected to LBA 29"
+fixture = "fs.qnx2.lexicon-10mb.hd"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["29"]
+[[case.step]]
+args = ["show", "fs-info", "{fixture}@1"]
+expect_exit = 0
+stdout_contains = ["QNX 2"]
+[[case.step]]
+args = ["ls", "{fixture}@1", "/sys"]
+expect_exit = 0
+stdout_contains = ["icon2_emul", "env_mgr"]
+[[case.step]]
+args = ["fsck", "--checkonly", "{fixture}@1"]
+expect_exit = 0
+stdout_contains = ["425 files / 20 dirs checked"]
+stdout_not_contains = ["WARN", "ERROR"]
+[[case.step]]
+args = ["tar", "{fixture}@1", "/", "{scratch}/all.tar"]
+expect_exit = 0
+file_sha256 = [{ path = "{scratch}/all.tar", sha256 = "24d2f22f27ad909e960476f096483cbb96c9545f0bf8e388e3a84e0a6363102b" }]
