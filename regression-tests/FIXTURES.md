@@ -236,7 +236,7 @@ What remains after the repo fixtures is genuinely short:
 | IMZ (encrypted), ZIP-disk, WinImage, cb-dos/cbk | read-only container formats | — |
 | Amiga ADF / HDF / ADZ / HDZ | real-world Amiga media | **ConsoleGames: 155 `.adf`, 11 `.hdf`** |
 | Optical: UDF, High Sierra, VMS ODS-2, GameCube/Wii, CD-i, 3DO | no builder | ConsoleGames `.cdi` / `.iso`, but **cut to size first** |
-| Floppy preservation: `.scp`, `.imd`, `.hfe` | flux/sector formats | ConsoleGames: 12 `.scp`, 15 `.imd` |
+| Floppy preservation: `.imd` | sector format | ConsoleGames: 15 `.imd`. (`.scp` and `.hfe` are now covered: `flux.scp.*` / `flux.hfe*.*`, made with Greaseweazle `gw convert` from disks whose sector dumps are already fixtures.) |
 | A handful of real-world "messy" images | fragmentation, vendor quirks, known-bad | any source |
 
 Scanning found **28,196 candidates / ~6.7 TB** across the three reachable
@@ -430,6 +430,12 @@ Some formats simply have no small specimen and never will:
 | `optical.ufs.nextstep33.cd` | 356 MB | NeXTSTEP install CD — the only common UFS-formatted optical media. |
 | `optical.high-sierra.bookshelf.cd` | 318 MB | Microsoft Bookshelf. High Sierra discs are 1986-89 only; there is no small one to find. |
 | `optical.udf.dvd-video.cd` | 483 MB | UDF anchors sit near the end of the disc, so truncation destroys the structure under test. |
+| `fmt.gho.ntfs-compressed.hd` | 822 MB | The only NTFS + compressed (High/zlib, file-aware) Ghost sample; it is what reaches the incremental MFT parser (6048 MFT records, 6104 runs), and a Ghost image cannot be cut without re-imaging a smaller NTFS volume. |
+| `flux.emu.icon4-st251.hd` | 103 MB | Gesswein MFM reader cell capture of a whole real ST-251 (820 x 6 heads); its value is that it decodes byte-identical to the sector dump, which needs every track. |
+| `fs.qnx2.lexicon-64mb.hd` | 71 MB | LEXICON 64 MB disk made with the real ICON `hdformat` / `fdisk` / `dinit`; its three QNX 2 partitions start at LBA 88 / 65623 / 131158, so the second and third exist only near the end. |
+| `fs.qnx2.icon4-st251.hd` | 57 MB | Real ICON 4.10.01 fileserver drive, 820 x 6 x 17 stored as 820 x 8 x 17: the head padding in every cylinder is the thing under test. |
+| `flux.scp.amiga-dd.floppy` | 26 MB | SCP flux of a whole floppy (`gw convert` of `fmt.adf.amiga-dd.floppy`); flux, not sectors, is the size. |
+| `flux.scp.icon-help410.floppy` | 26 MB | SCP flux of the whole ICON help diskette (`gw convert` of its KryoFlux set); same reason. |
 
 Anything added to the annex must carry a note like the above explaining why
 it could not be shrunk. The annex is a minimisation backlog, not a dumping
@@ -490,6 +496,8 @@ Admitted so far:
 | `fs.hfs.populated-macii.hd` | 20 MB | Real Mac II disk: APM + HFS, blessed `System 7.1.2` folder, type/creator codes on every file (`APPL`/`SITD`/`BTFL`), Desktop DB/DF, nested folders, a 1.5 MB StuffIt archive. Small enough for the core corpus. |
 | `fs.hfv.populated-macos81.hd` | 300 MB | Full Mac OS 8.1 install as a flat HFV. Annex. |
 | `fs.efs-v1.populated-irix37.multipart` | 5.6 MB | Real IRIX 3.7 / GL2-W3.6 on a 60 MB Priam V170, as an IRIS 3130. Byte-swapped SGI-DkLabel over two populated EFS v1 volumes: root and a 2754-file `/usr` with the `mex` window manager, Unix owner/permission bits throughout. Boots unattended under Motion, so the same image is the oracle's reference disk. |
+| `fs.qnx2.icon4-st251.hd` | 57 MB | Real Unisys ICON 4.10.01 fileserver disk (LEXICON Seagate ST-251): 431 files / 20 dirs on QNX 2 partition 1, a never-formatted partition 2, ICON owners and attribute bits, head-padded as the MFM reader wrote it. QNX's own `chkfsys` in icon-emu agreed with RB's writes to it. Annex. |
+| `fs.qnx2.lexicon-10mb.hd` | 10.7 MB | Unisys LEXICON 10 MB disk after install (306 x 4 x 17): drive record, bad-block table, boot loader and a populated QNX 2 volume (425 files / 20 dirs) whose type-0x07 entry is 1-based. |
 
 Available on the NAS but **not admitted** — too large to copy, fetch on
 demand if a case needs them: Win98 original disk (3.1 GB CHD), IRIX 5.3

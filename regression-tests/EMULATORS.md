@@ -146,6 +146,8 @@ works through it and the results are ingested back into `results.jsonl` with
 | Hatari | Atari DOS, AHDI, ST/MSA floppies |
 | Altirra | Atari DOS 2.0S / 2.5, ATR/XFD |
 | Arculator / RPCEmu | Acorn ADFS / FileCore |
+| icon-emu (github.com/danifunker/icon-emu, real QNX 4.10.01) | QNX 2 writes: QNX's own `chkfsys` on volumes RB edited, and QNX copying RB-written files. Used by hand 2026-10-28/29; not scripted |
+| Sun-2 / Sun-3 MiSTer cores | Sun QIC tape (`.qic`) edits: boot and list an edited tape. **Pending** - test tapes in `rb-fixtures/to-verify/sun-tape-edit/` |
 | MiSTer cores needing input | Anything requiring controller navigation |
 | Real hardware (BlueSCSI, Gotek, CF adapters) | The final word for Mac/Amiga/PC vintage |
 

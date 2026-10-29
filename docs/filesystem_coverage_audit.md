@@ -7,8 +7,8 @@ notable formats it **cannot** yet handle (§6). First generated 2026-07-07 by
 reading the `src/fs/mod.rs` dispatch hub, `src/partition/`, `src/rbformats/`,
 `src/model/file_types.rs`, and every driver's trait impls directly (not the
 prose docs, which had drifted — see [§7](#7-known-code-gaps--drift-fixed-in-this-sweep));
-kept current as capabilities land (last: 2026-07-10 — PFS3 + SFS fsck, El Torito
-boot-image extract/replace).
+kept current as capabilities land (last: 2026-10-29 — QNX 2 read + edit + fsck,
+QNX 4 real-media read, Sun QIC tape editing, SCP / HFE / `.emu` flux captures).
 
 Companion docs: [`full_MiSTer_support_status.md`](full_MiSTer_support_status.md)
 grades each MiSTer computer core; [`../README.md`](../README.md) is the
@@ -118,6 +118,20 @@ filesystem-*aware* value-adds (browse, edit, shrink, fsck) on top of that.
 | Alto BFS / TFS | Auto | Yes | Yes | Yes | Yes (resize) | Yes (CLI) | Xerox Alto (Diablo 31/44), Trident T-80/T-300. fsck = label/bitmap reconciliation vs the file page-chains (VALIDATE model): flags overlaps / broken chains read-only, rebuilds the DiskDescriptor free-page bitmap + count as the repair. Reached via `rb-cli fsck` — which has its own Alto branch because packs open through the `open_pack` container path, not the block-reader factory. `--repair` is allowed in place only for a `.pdi` input (it rebuilds + writes back as a PARC Disk Image; other containers would have their format changed). In the GUI, Check/Repair is on the **browse-view** toolbar (gated on `fs_type == "Alto BFS"`), since Alto packs open through `BrowseSession`/`open_pack` and repair self-persists as PDI — the block-factory inspect-grid path can't reach them. |
 | Pilot / Cedar | Auto | Yes | No (read-only in GUI) | (test infra) | No | No | Xerox D-machines (Dolphin / Dorado / Dandelion) |
 
+### QNX
+
+| Filesystem | Detect | Browse | Edit | Create | Shrink/Grow | fsck | Systems / era |
+|---|---|---|---|---|---|---|---|
+| QNX 2 | Auto (root entry at byte 68 of block 1); MBR 07 / 08 / 09 on ICON / LEXICON disks | Yes | Yes | No | No | check | Unisys ICON / LEXICON (QNX 2.x): 800 KiB floppies and 10 / 64 MB fileserver hard disks. Owner `group.member`, ICON attribute letters (`rwaem` / `rcbm`) mapped onto Unix modes, dates (4-bit year, 1980-1995), deleted entries on request, RS -> LF on extract. Edit = create (128-block extents), mkdir, rename, delete (as `frel`), chmod, chown; verified with real QNX 4.10.01 `chkfsys` in icon-emu. fsck = extent chains, back links, cross-links, entry block counts, bitmap vs held blocks, orphaned blocks. Padded-head MFM-reader images (ST-251 stored 820 x 8 x 17) read and written with the drive's own geometry, bad-block table remapped. 640 KiB disks not yet seen |
+| QNX 4 | Auto (probed before FAT); MBR 0x4D-0x4F | Yes | **No** (read-only) | No | No | No | QNX 4.x, Neutrino 6.0-6.3. Checked on the real `qnxfs1g.img` (its boot block carries a FAT-like `QNX4FS` BPB) |
+| QNX 6 Power-Safe | Auto; MBR 0xB1-0xB4 | Yes | **No** (read-only) | No | No | No | QNX Neutrino 6.4+, either byte order. Synthetic volumes only; not yet checked on real QNX 6 media |
+
+### Tape images
+
+| Format | Detect | Browse | Edit | Create | Shrink/Grow | fsck | Systems / era |
+|---|---|---|---|---|---|---|---|
+| Sun QIC tape (SUN2TAPE `.qic`) | Auto | Yes | Yes (inside tar, `.tar.Z` and UFS miniroot tape files) | No | N/A | No | Sun-2 / Sun-3 (MiSTer cores' format). Every edit rebuilds the whole tape and keeps the original as `<name>.bak` (`.bak.1`, ... never overwritten); untouched members / tape files stay byte-identical, `.Z` sections recompressed by a compress(1)-compatible encoder. Tape files themselves are not added / removed / renamed. **Not yet verified on Sun hardware** |
+
 ### Detect-only scaffolds & fallback
 
 | Filesystem | Detect | Browse | Notes |
@@ -202,7 +216,7 @@ Gap: UDF 2.50+ metadata-partition discs (Blu-ray) are **detected only**.
 | UDIF DMG / NDIF | Yes | No | Compressed Apple images |
 | WinImage IMZ | Yes | No | ZIP-wrapped (incl. encrypted) |
 | Norton Ghost (`.gho/.ghs`) | Yes | No | File-aware + password + span sets |
-| cb-dos (`.cbk`) | Yes | Yes | Native single-file backup |
+| cb-dos (`.cbk`) | Yes | Yes | Native single-file backup; pack / unpack stream (chunk CRCs checked as they pass) |
 | gzip (`.gz/.adz/.hdz`), `.zip` disk | Yes | `.adz/.hdz` | Transparent decompress |
 
 **Floppy-container decoders** (`src/rbformats/containers/`):
@@ -216,9 +230,28 @@ Gap: UDF 2.50+ metadata-partition discs (Blu-ray) are **detected only**.
 | G64 / G71 | Yes | Yes (from d64) | Commodore GCR |
 | EDSK / DSK (CPCEMU) | Yes | **No** | Amstrad CPC/PCW, Einstein, Oric |
 
-Gaps here: **EDSK write**, and the flux/track container family (TD0, IMD, HFE,
-86F, IPF, SCP, NIB) — the [fluxfox](https://github.com/dbalsom/fluxfox) crate
-is the candidate infrastructure (see MiSTer status doc §"Prior art").
+**Flux / low-level captures** (`src/rbformats/flux/`, all read-only; decoded to
+a flat sector image):
+
+| Kind | Read | Write | Notes |
+|---|:---:|:---:|---|
+| KryoFlux stream set (`NN.S.raw`) | Yes | No | Open any one stream, the whole set opens |
+| SCP (`.scp`) | Yes | No | SuperCard Pro / Greaseweazle native capture |
+| HFE v1 / v3 (`.hfe`) | Yes | No | HxC; v3 rate / skip-bits / weak-bit opcodes |
+| MFM reader capture (`.emu`) | Yes | No | Gesswein MFM reader, ST-506 hard disks; Intel iSBC 214 (ICON / LEXICON) only, other sector formats refused by name |
+
+Floppy flux decodes as IBM MFM, IBM FM (incl. Acorn DFS records from 0) or
+AmigaDOS MFM, picked by probing tracks; a phase-tracking PLL follows the bit
+cell, and when no copy of a sector passes CRC a byte vote of 3+ copies is kept
+only if its CRC holds. Unreadable sectors are zero-filled, named in a CLI
+warning and listed in the GUI Inspect tab. SCP / HFE checked byte-identical
+against Greaseweazle `gw convert` output of ICON, Amiga ADF and Acorn DFS disks;
+the `.emu` ST-251 capture decodes byte-identical to its sector dump.
+
+Gaps here: **EDSK write**; **GCR (Apple / Commodore) from flux**; and the
+track-container family still unread (TD0, IMD, 86F, IPF, NIB) — the
+[fluxfox](https://github.com/dbalsom/fluxfox) crate is the candidate
+infrastructure (see MiSTer status doc §"Prior art").
 
 ---
 

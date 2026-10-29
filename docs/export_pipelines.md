@@ -41,6 +41,28 @@ Each entry point branches by partition-table type (MBR / GPT / APM / RDB /
 None) and by output format (VHD / Raw / 2MG / WOZ / DC42 / CHD / Zstd /
 backup-folder).
 
+### Where export / `rb-cli convert` gets its source bytes
+
+Every whole-disk exporter (Raw, VHD, QCOW2, VMDK, CHD) opens its source
+through `open_source_reader` in `src/rbformats/export.rs`:
+
+| Source | Opened by | Presents |
+|---|---|---|
+| Ghost `.gho` / span set | `gho::GhoReader` + `prepare_full_image` | The restored whole disk (synthesized `$Bitmap`, recovered `$Boot` code) |
+| WinImage `.imz` | `source_reader::open_read` | The decoded volume |
+| Anything the image detector calls `Raw` but the read layer decodes: flux captures (KryoFlux, `.scp`, `.hfe`, `.emu`), floppy containers, `.cbk`, padded ICON / LEXICON hard disks (`icon_hd::layout_for_path`) | `source_reader::open_read` (gated on `source_reader::is_container_path` or an `icon_hd` layout) | What browse / inspect see: the decoded sector image, with flux faults zero-filled |
+| Everything else (raw, VHD, 2MG, DMG, DC42, CHD, ...) | `detect_image_format_with_path` -> `wrap_image_reader` | The detector's unwrapped image |
+
+Before that third row existed, `rb-cli convert` copied a flux file or a padded
+ICON `.bin` byte-for-byte as if it were already raw; HFE -> raw is now
+byte-identical to the floppy's sector dump. A new container that the detector
+does not recognize must be in `is_container_path` (or have its own branch here)
+or export will copy its file bytes.
+
+`.cbk` pack (`cbk::pack_folder_to_cbk`) and unpack
+(`cbk::materialize_cbk_to_folder`) stream their members; each chunk's CRC is
+checked as its last byte passes, so neither holds a whole member in memory.
+
 ---
 
 ## Per-partition-table dispatch (the reconstruct layer)

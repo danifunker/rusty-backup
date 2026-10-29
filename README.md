@@ -5,8 +5,8 @@ computer disk images. The name is a play on words — both referencing the Rust
 programming language and the rusty vintage machines we're preserving.
 
 Primary users are retro computing enthusiasts archiving CF/SD cards, IDE/SCSI
-drives, and floppy images from DOS, Windows 9x, early Linux, classic Mac OS,
-and Apple II / IIgs systems.
+drives, and floppy images (including flux-level captures) from DOS, Windows
+9x, early Linux, classic Mac OS, and Apple II / IIgs systems.
 
 Licensed under **AGPL-3.0**. See `PROJECT-SPEC.md` for the full design
 specification and `docs/` for deep-dive topics.
@@ -60,6 +60,9 @@ rb-cli untar disk.hda src.tar.gz /   # import an archive's contents INTO an imag
 rb-cli import disk.hda ./stuff /     # copy a whole host folder in; --expand-archives unpacks tarballs + .sit/.cpt/.hqx it finds
 rb-cli get backup.zip /unix ./unix --inside disk.img   # extract from a RAW disk inside a .zip
 rb-cli fsck disk.dsk --checkonly
+rb-cli convert disk.scp ./out --format raw   # flux capture (.scp / .hfe / KryoFlux / .emu) -> decoded sector image
+rb-cli ls  icon.img --deleted                # QNX 2: also list deleted entries as NAME [deleted]
+rb-cli get icon.img /user/notes.txt notes.txt --rs-to-lf   # QNX 2: RS line ends -> LF
 rb-cli inspect disk.hda
 rb-cli backup /dev/disk3 ./backups --format chd --checksum sha256
 rb-cli restore ./backups/my-backup ./restored.img
@@ -376,6 +379,13 @@ The app has five tabs:
     (`.sit`), Zip, or tar (gzip / zstd). Available in the Inspect tab, the
     Optical disc browser, Commander, and the `rb-cli tui` Explorer; all four
     run the same `export_selection` engine.
+    On QNX 2 volumes a **Show deleted** checkbox lists deleted entries as
+    `NAME [deleted]`, and the **Text: RS to LF** extract option turns the
+    ICON's RS (0x1E) line ends into LF (the preview converts too).
+  - **Unreadable sectors** on flux and MFM-reader images (KryoFlux, `.scp`,
+    `.hfe`, `.emu`): sectors no revolution could read are zero-filled, and the
+    Inspect tab shows the count with an expandable list of their LBAs (the CLI
+    names them in a warning).
   - **Open as Disk Image** on a file inside a browsed volume: copies it to a
     temporary folder (streamed, with a free-space check) and inspects it as its
     own disk, e.g. a ShapeShifter Mac hardfile stored on an Amiga PFS
@@ -403,7 +413,7 @@ The app has five tabs:
   - **Check** (`fsck`) + **Repair** on every filesystem whose driver
     implements it. From the Inspect grid: HFS / HFS+, FAT / exFAT / NTFS / HPFS,
     ext2/3/4, SGI EFS, UFS, XFS, JFS, AmigaDOS OFS/FFS (Disk Validator) /
-    PFS3 / SFS, and the retro floppies CBM DOS / DragonDOS / RS-DOS /
+    PFS3 / SFS, QNX 2, and the retro floppies CBM DOS / DragonDOS / RS-DOS /
     Acorn DFS / Human68k. From the browse view: Alto BFS/TFS (their packs
     open through the container path, not the block factory). Repair uses
     replica superblocks, lost+found, FAT-mirror resync, or allocation-bitmap
@@ -457,9 +467,11 @@ The app has five tabs:
     **Boot Blocks...** / **Bless Folder** buttons.
   - **Edit mode** on FAT, NTFS, exFAT, HPFS, ext, HFS, HFS+, AFFS, PFS3, SFS,
     ProDOS, Apple DOS 3.3, MacPlus MFS, EFS, UFS, CP/M (multi-DPB),
-    Human68k, and XFS (v4 + v5): stage create-file / new-folder /
+    Human68k, QNX 2, and XFS (v4 + v5): stage create-file / new-folder /
     drag-and-drop / delete edits, then Apply atomically with snapshot
-    rollback on error.
+    rollback on error. Sun QIC tapes (`.qic`) are editable too, but a tape
+    has no free space, so every apply rebuilds the whole tape and keeps the
+    original as `<name>.bak`.
 - **Optical** — browse and extract files from CD/DVD/BD images and physical
   optical drives. Reads ISO 9660 (with Joliet and Rock Ridge extensions),
   High Sierra (pre-ISO 9660), UDF, HFS and HFS+ (Mac hybrid / data discs),
@@ -574,7 +586,7 @@ readable.
 | cb-dos container | `.cbk`        | Yes (native)   | Yes (`cbk pack`) | Single-file form of a backup folder (chunked gzip members + index). Opens like any disk image — `inspect`, `ls`/`get` (browse + extract), `fsck`, GUI Inspect, and `restore` all work directly, no extract step. Large partitions are split into ~4 MiB source-span gzip members (via the `partition-N.gz.idx` seek layout), so the lazy reader seeks per-chunk instead of decompressing from the start. `rb-cli cbk pack/unpack` convert to/from a folder. Frozen v1; the eventual cb-dos network transport's on-disk artifact |
 | CHD (MAME)     | `.chd`          | Yes            | Yes             | Native (MAME's CHD core is bundled — no external `chdman` needed). `backup --format chd` always writes one whole-disk `.chd`; a partitionless volume (floppy, `.hfv`, bare `.hdf`) becomes one disk image sized to the source, so `chdman info` and MAME see the full volume |
 | AppImage       | `.AppImage`     | Yes            | No              | A type-2 AppImage is an ELF runtime stub with a **SquashFS appended**, so the payload opens in place — browse, extract, and **edit** the application's filesystem without unpacking anything. Because the payload is the tail of the file, a rebuild is free to grow it and the stub in front is left byte-for-byte alone. Detected by content (the `AI\x02` marker in the ELF header), not by name, since AppImages are routinely shipped without an extension. Type-1 AppImages wrap an ISO 9660 instead and are recognised but not opened |
-| Norton Ghost   | `.gho`, `.ghs`  | Yes            | No              | File-aware FAT/NTFS browse, sector + spanned sets, Ghost 7.5, password-protected images decrypted automatically |
+| Norton Ghost   | `.gho`, `.ghs`  | Yes            | No              | File-aware FAT/NTFS browse, sector + spanned sets, Ghost 7.5, password-protected images decrypted automatically. An NTFS-compressed image's MFT is parsed as it streams in, not gathered into memory |
 | WinImage       | `.imz`          | Yes            | No              | Including password-protected archives |
 | ZIP (raw disk) | `.zip`          | Yes            | No              | A RAW disk image inside a plain ZIP. Auto-picks the disk entry (`--inside NAME` to choose one of several); inflated sparsely to a temp file at open, so a mostly-empty multi-GB image only uses its real content. Picker-visible but not OS-associated |
 | BasiliskII HFV | `.hfv`          | Yes            | Yes             | Flat classic-HFS volume (≤ 2047 MB) for 68k Mac emulators |
@@ -656,7 +668,7 @@ inspect-tab Edit Mode.
 | ProDOS         | Yes    | Yes  | Yes             | Yes  | Apple II / IIgs (`.po` / `.hdv` / `.2mg`, 8 KiB–32 MiB). Create blank volumes with `rb-cli new volume prodos` (boot + 4-block volume directory + bitmap). fsck reconciles the volume bitmap against the directory-tree + file-index walk (seedling / sapling / tree files + subdirectories, the CBM VALIDATE model): reclaims leaked blocks and flags blocks in use but marked free; repair rebuilds the bitmap, withheld on cross-links / past-end blocks / directory-chain cycles. |
 | Apple DOS 3.3  | Yes    | Yes  | —               | Yes  | Apple II. 140 KB 5.25" disks (`.dsk` / `.do` / `.po`, sector-order auto-detected). Gated to the exact 140 KB geometry. Create blank (non-bootable) data disks with `rb-cli new floppy apple-dos`. fsck reconciles the VTOC free map (bit-set-is-free) against the catalog + file T/S-list chains (the CBM VALIDATE model): reclaims leaked sectors, flags sectors in use but marked free, surfaces cross-links / broken chains read-only; the DOS-image region on tracks 0-2 is reported as a benign warning, never reclaimed. |
 | UCSD p-System  | Yes    | Yes  | —               | Yes (check + repair) | UCSD Pascal (Apple II/III, PC, and many late-1970s/80s machines). A flat single directory of up to 77 **contiguous** files (no subdirectories, no allocation bitmap). Browse + edit (create / delete / rename — contiguous first-fit allocation; a create that won't fit any single free run is refused rather than fragmenting). Create blank volumes with `rb-cli new floppy ucsd` (alias `pascal`). fsck validates the directory self-consistency (volume label, in-bounds non-overlapping runs, file count); repair re-sorts entries, corrects the count, and drops invalid entries, while overlaps / past-end runs are surfaced read-only. Auto-detected via the block-2 volume label, with byte order recovered from the label's `DLASTBLK`. Every write is validated against an independent clean-room oracle (`scripts/ucsd-oracle.py`). |
-| QNX 2 | Yes | Yes | — | Yes | QNX 2.x volumes: the Unisys ICON's System Software and QDOS floppies (800 KiB; the ICON "QDOS" is QNX, not Sinclair QL QDOS) and LEXICON fileserver hard disks (10 MB and 64 MB: the ICON header at +0x10 marks partition types 07 / 08 / 09 as QNX 2 partitions 1-3, whose 1-based starts are read one sector earlier). Browse with owner `group.member`, the ICON attribute letters (`rwaem` / `rcbm`) mapped onto Unix modes, and dates (checked against QNX's own `files`). Edit: create files (split into 128-block extents as QNX does), mkdir, rename, delete (as `frel`), chmod, chown; directories grow past their first block like QNX's. Every operation was checked with the real QNX 4.10.01 `chkfsys` in the icon-emu emulator on floppies and on both partitions of a 64 MB disk, and files RB wrote were copied by QNX and came back byte-identical. The 4-bit year holds 1980-1995, so newer dates are stored as 31-Dec-95. Deleted entries list on request (`ls --deleted`, GUI "Show deleted"); RS (0x1E) line ends convert to LF on request (`get --rs-to-lf`, GUI "Text: RS to LF"). fsck checks extent chains and cross-links and compares the bitmap with the blocks files hold. A QDOS DOS disk stored inside QNX (`/dos/work.ph`) opens as FAT. Images from an MFM reader that pads every cylinder to 8 heads (a 6-head Seagate ST-251 stored as 820 x 8 x 17) are read and written with the drive's own geometry, and bad-block-table entries are remapped; checked on a real LEXICON ST-251, where QNX in icon-emu accepted RB's writes to the padded image. A never-formatted partition is reported as such. Files written with the ICON clock unset (QNX shows `0-----80`) date as 1 January 1980. 640 KiB disks wait for samples (`docs/PLAN-qnx.md`). |
+| QNX 2 | Yes | Yes | — | Yes | QNX 2.x volumes: the Unisys ICON's System Software and QDOS floppies (800 KiB; the ICON "QDOS" is QNX, not Sinclair QL QDOS) and LEXICON fileserver hard disks (10 MB and 64 MB: the ICON header at +0x10 marks partition types 07 / 08 / 09 as QNX 2 partitions 1-3, whose 1-based starts are read one sector earlier). Browse with owner `group.member`, the ICON attribute letters (`rwaem` / `rcbm`) mapped onto Unix modes, and dates (checked against QNX's own `files`). Edit: create files (split into 128-block extents as QNX does), mkdir, rename, delete (as `frel`), chmod, chown; directories grow past their first block like QNX's. Every operation was checked with the real QNX 4.10.01 `chkfsys` in the icon-emu emulator on floppies, the 10 MB disk and both partitions of a 64 MB disk, and files RB wrote were copied by QNX and came back byte-identical. The 4-bit year holds 1980-1995, so newer dates are stored as 31-Dec-95. Deleted entries list on request (`ls --deleted` / `get --deleted`, GUI "Show deleted"); RS (0x1E) line ends convert to LF on request in files that look like text (`get --rs-to-lf`, GUI "Text: RS to LF"; files over 16 MiB stream out unchanged). fsck checks extent chains, back links, cross-links and entry block counts, compares the bitmap with the blocks files hold, and reports orphaned blocks. A QDOS DOS disk stored inside QNX (`/dos/work.ph`) opens as FAT. Images from an MFM reader that pads every cylinder to 8 heads (a 6-head Seagate ST-251 stored as 820 x 8 x 17) are read and written with the drive's own geometry, and bad-block-table entries are remapped; checked on a real LEXICON ST-251, where QNX in icon-emu accepted RB's writes to the padded image. A never-formatted partition is reported as such. Files written with the ICON clock unset (QNX shows `0-----80`) date as 1 January 1980. 640 KiB disks wait for samples (`docs/PLAN-qnx.md`). |
 | QNX 4 | Yes | No | — | No | QNX 4.x and QNX Neutrino 6.0-6.3 (`fs-qnx4`): root at block 1, inodes in place or via link entries (48-character names), extent blocks; MBR types 0x4D-0x4F. Read-only, built from the on-disk structures in Linux's `qnx4_fs.h`; checked on the real `qnxfs1g.img` from the Linux qnx4fs driver's site, whose boot block carries a FAT-like BPB (it is probed before FAT) and whose root holds busy and unused entries that are hidden as Linux does (`docs/PLAN-qnx.md`). |
 | QNX 6 Power-Safe | Yes | No | — | No | QNX Neutrino 6.4+ (`fs-qnx6`), either byte order: both superblocks' CRC and serial, pointer trees of any depth, long names; MBR types 0xB1-0xB4. Read-only, built from Linux's `qnx6_fs.h` and unit-tested on synthetic volumes; **not yet checked against real QNX 6 media**. |
 | Apple Lisa File System | Yes | No | — | — | Apple Lisa (Office System 1.0 / 2.0 / 3.0), read-only browse + extract. Opened from tag-bearing DiskCopy 4.2 (`.dc42` / `.image`) and DART images. Files are reconstructed from the 12-byte sector tags (file ID + file-relative block) — independent of the three catalog formats — so extraction works on every disk; friendly names come from the flat-table (`0x0e`) / flat-hash (`0x0f`) catalog, while the hierarchical B-tree version (`0x11`, Office System 3.0) falls back to `file-XXXX`. The metadata label (first 0xF0 bytes) is stripped from each file's data fork. Requires an image that still carries tags (DiskCopy versions after 4.2 strip them). Mirrors Ray Arachelian's `lisafsh-tool`. |
@@ -728,7 +740,7 @@ PC Engine CD, CD32, GameCube, Wii, CD-i, and 3DO.
 
 | Scheme | Parse | Edit (resize / add / delete / retype) | Notes |
 |--------|:-----:|:-------------------------------------:|-------|
-| MBR    | Yes   | Yes  | PC standard. Logical partitions inside an extended container are surfaced read-only. |
+| MBR    | Yes   | Yes  | PC standard. Logical partitions inside an extended container are surfaced read-only. On Unisys ICON / LEXICON hard disks the ICON header at +0x10 marks types 07 / 08 / 09 as QNX 2 partitions 1-3, whose starts are 1-based (read one sector earlier); inspect names them QNX 2 rather than NTFS, a never-formatted one shows as "QNX 2 (not formatted)", and restore leaves the on-disk entries as written. |
 | GPT    | Yes   | Yes  | Primary + backup header rewritten with refreshed CRCs on every edit. |
 | APM    | Yes   | Yes  | Apple Partition Map (68k / PowerPC Macs). `rb-cli optical new mac-hfs` / `mac-hfsplus` synthesizes a classic-Mac CD-ROM image from scratch — DDR + map + one `Apple_HFS` partition holding a blank HFS or HFS+ volume (Mac-only; no ISO 9660 side). An `Apple_Rhapsody_UFS` slice — Mac OS X Server 1.x / Rhapsody — nests a **NeXT disk label** in its own first sectors, so the UFS begins past that label's front porch rather than at the slice's first byte; the label is probed on open and the filesystem addressed where it says. Backup compacts it too: the head region rides verbatim at the front of the layout-preserving UFS stream, so free blocks become zeros without the label going with them, and every partition-level size the tool reports adds those bytes back — the filesystem's own minimum is 160 KiB short of the slice, and shrinking to it would cut the last 160 KiB off the end. |
 | RDB    | Yes   | Bootable flag only; writes whole tables from scratch | Amiga `RDSK`. `rb-cli new hd rdb` lays down an RDSK plus a `PART` chain with the DosType tags you name (`DOS\3`, `PFS\3`, `SFS\0`, …), cylinder-aligned from `--heads` / `--sectors`; the output is read back cleanly by `amitools`' `rdbtool`. Editing an *existing* RDB is still bootable-flag-only, deferred until the DosEnv geometry story is settled. **Full-disk backup works through the single-file-CHD layout.** The reserved area ahead of the first partition — RDSK, the `PART` chain, and the `FSHD` / `LSEG` filesystem-driver blocks — rides verbatim, which is the whole point: re-serializing a parsed `rdb.json` would lose the driver chain and the `BADB` list, and that is why a per-partition RDB backup was never restorable. An as-is restore is a byte copy; `restore --size minimum` (or any non-Original size in the GUI) rewrites the RDSK and `PART` blocks on cylinder boundaries inside that verbatim head and leaves the driver chain untouched. A resize at backup or export time runs the same rewrite before the bodies are staged. The per-partition layouts (zstd / gzip / raw / VHD) are refused — they previously *succeeded* and then produced a backup `restore` turned away. An RDB that claims reserved blocks past its first partition is refused with that reason rather than silently losing them. |
@@ -795,6 +807,15 @@ On restore the EBR chain for logical partitions is rebuilt, like Clonezilla's ow
   desktop-only (rodio, linking ALSA on Linux / WASAPI on Windows / CoreAudio on
   macOS); the slim `rb-cli-mini` MiSTer build still rips and converts optical
   images but ships no player.
+- **Flux captures** (KryoFlux, `.scp`, `.hfe`) and MFM-reader `.emu` hard
+  disks are read-only: browse, extract, or `rb-cli convert` them to a plain
+  image (convert exports the decoded sectors, not the capture's bytes).
+  IBM MFM, IBM FM and AmigaDOS MFM decode; Apple / Commodore GCR from flux does
+  not yet, so capture those as `.woz` / `.g64`. Check the unreadable-sector
+  list before trusting a damaged disk's files.
+- **Large files stay out of RAM**: extraction, defrag / clone copies, `.cbk`
+  pack / unpack and large ZIP / tar archives all stream, and blank volumes from
+  `rb-cli new` are written sparse. `rb-cli edit` refuses files over 64 MiB.
 - **Browsing compressed backups**: native `.zst` backups stream-decompress
   lazily on open, so browsing a multi-gigabyte zstd backup is fast. `.chd`
   backups currently require building a full seekable cache on open, which
@@ -816,7 +837,7 @@ cores) lives in [`docs/full_MiSTer_support_status.md`](docs/full_MiSTer_support_
 | **MSX / MSX1 / TurboR**        | FAT12 / FAT16 (Nextor VHD) | Floppy, HDD |
 | **ZXNext** (ZX Spectrum Next)  | FAT32 / FAT16 / FAT12 | SD / HDD (VHD) |
 | **TSConf** (ZX-Evolution)      | FAT32 (non-MBR) | SD / HDD (VHD) |
-| **Minimig-AGA** (Amiga)        | AFFS (OFS/FFS), PFS3, SFS on RDB, ISO9660 | Floppy (`.adf`/`.adz`), HDD (`.hdf`/`.hdz`), CD |
+| **Minimig-AGA** (Amiga)        | AFFS (OFS/FFS), PFS3, SFS on RDB, ISO9660 | Floppy (`.adf`/`.adz`, or flux `.scp`/`.hfe`/KryoFlux read-only), HDD (`.hdf`/`.hdz`), CD |
 | **MacPlus**                    | HFS, MFS (read + edit + create + fsck) | HDD (.hda / .hfv), 400K / 800K MFS floppy |
 | **AtariST**                    | GEMDOS (FAT12 / FAT16), MSA containers | Floppy (`.st` / `.msa`); HDD pending AHDI write-side |
 | **Apple-II**                   | ProDOS + Apple DOS 3.3 | `.dsk` / `.do` / `.po` / `.2mg` / `.woz` (sector-order auto-detect) |
@@ -835,7 +856,8 @@ cores) lives in [`docs/full_MiSTer_support_status.md`](docs/full_MiSTer_support_
 | **PET / CBM-II**               | CBM DOS (1541 + 8050/8250 IEEE-488, read + write) | Floppy `.d64` / `.d80` / `.d82` |
 | **CoCo2 / CoCo3** (Tandy)      | RS-DOS / Disk BASIC + OS-9 / NitrOS-9 RBF (both read + write) | Floppy `.dsk` / `.jvc` / `.vdk` (35- / 40-track) |
 | **Dragon** (Dragon 32/64)      | DragonDOS + OS-9 / NitrOS-9 RBF (both read + write) | Floppy `.dsk` (single- / double-sided 40-track) |
-| **BBCMicro / AcornElectron**   | Acorn DFS (read + write) | Floppy `.ssd` (single-sided) + `.dsd` (double-sided, two partitions) |
+| **Sun-2 / Sun-3**              | Sun disk label + SunOS UFS; `SUN2TAPE` tapes (tar, `.Z` tar, UFS miniroot) | SCSI HDD (`.img`), QIC tape (`.qic`, browse + edit; edited tapes not yet booted on the cores) |
+| **BBCMicro / AcornElectron**   | Acorn DFS (read + write) | Floppy `.ssd` (single-sided) + `.dsd` (double-sided, two partitions); FM flux `.scp`/`.hfe`/KryoFlux read-only |
 
 For X68000 specifically, the floppy converter lets you take an image
 in any of the four formats Sharp tooling and MiSTer cores expect — XDF
@@ -843,6 +865,11 @@ in any of the four formats Sharp tooling and MiSTer cores expect — XDF
 (sparse track-table) — and produce any of the others, single-file or
 in bulk. Geometry inference covers the X68000 + PC-98 set: 1.2 MB 2HD,
 1.44 MB 2HD, 720 KB 2DD, and 640 KB 2DD.
+
+Floppies captured at flux level (KryoFlux stream sets, Greaseweazle `.scp`,
+HxC `.hfe`) open read-only when the disk uses IBM MFM, IBM FM or AmigaDOS
+MFM (checked on ICON, Amiga and Acorn DFS disks); `rb-cli convert` turns them
+into the flat image the core loads.
 
 ### Physical drive compatibility
 
@@ -863,9 +890,11 @@ that shows up via the platform enumerator (Disk Management / `diskutil` /
 | Tape drives                             | No                   | No                  |       |
 
 Physical floppies are supported only through the OS block-device layer, which
-covers standard MFM formats (PC 1.44 MB, 720 KB). Copy-protected, variable
-speed, or GCR-encoded Apple floppies must be dumped with a flux-level tool
-first and then ingested as a `.woz` / `.dc42` / `.2mg` image.
+covers standard MFM formats (PC 1.44 MB, 720 KB). Other floppies must be
+dumped with a flux-level tool first: IBM MFM / FM and Amiga disks can be
+opened straight from the KryoFlux stream set, `.scp` or `.hfe`, while
+copy-protected or GCR-encoded Apple floppies go in as a `.woz` / `.dc42` /
+`.2mg` image.
 
 ## Further reading
 
@@ -873,6 +902,10 @@ first and then ingested as a `.woz` / `.dc42` / `.2mg` image.
 - `CONTRIBUTING.md` — contributor guide.
 - `docs/` — per-feature deep dives (VHD export, alignment, code signing,
   Apple II floppy formats, …).
+- `src/fs/README.md` / `src/rbformats/README.md` — per-driver and per-format
+  notes (flux layer, QNX 2, Sun tape editing).
+- [`docs/PLAN-qnx.md`](docs/PLAN-qnx.md) — QNX 2 / 4 / 6 on-disk facts, the
+  Unisys ICON / LEXICON disks, and how the writes were checked with real QNX.
 - [`docs/linux_486_appliance.md`](docs/linux_486_appliance.md) /
   [`docs/appliance_hardware_support.md`](docs/appliance_hardware_support.md) —
   the bootable Linux backup appliance and its vintage-hardware driver support

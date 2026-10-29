@@ -284,6 +284,35 @@ for the compressed codecs, or warning when it is ignored, is open.
   including one past 700 MB and one past 2 GB, to find the size ceiling of the
   NeXT CD driver (the label and UFS themselves address far more).
 
+### 3.4 QNX 4 / QNX 6 — real fixtures, then writes
+
+Both are read-only (`src/fs/qnx4.rs`, `src/fs/qnx6.rs`). QNX 4 now reads real
+media — its boot block carries a FAT-like `QNX4FS` BPB, so QNX 4 is probed
+before FAT — but has been checked on one volume only (`qnxfs1g.img`, fixture
+`fs.qnx4.qnxfs1g.hd`). QNX 6 Power-Safe has only ever seen synthetic volumes.
+Next: install QNX 4.25 and QNX 6.5 / 7 under QEMU, make fixtures with their own
+tools, confirm the readers on them, then edit + create + fsck verified against
+`chkfsys` / `dcheck` (QNX 4) and `chkqnx6fs` (QNX 6). Phases Q5 / Q6 in
+[`PLAN-qnx.md`](PLAN-qnx.md); install media is the one thing not on hand.
+
+QNX 2 is done to read + edit + fsck (see §10). Left there: 640 KiB ICON disks
+(no samples yet), create-blank, and fsck repair (the checker is report-only).
+
+### 3.5 Flux — GCR decoding
+
+`rbformats::flux` decodes IBM MFM, IBM FM and AmigaDOS MFM from KryoFlux,
+SCP and HFE captures. Apple and Commodore GCR are not decoded from flux yet;
+those disks still need a WOZ / G64 from the user's own tools. Add a GCR
+decoder beside `mfm.rs` / `fm.rs` / `amiga.rs` and let `decode_disk`'s track
+probe pick it, checked against `gw convert` output as the others were.
+
+### 3.6 Tapes — a general tape layer
+
+Sun QIC tapes (SUN2TAPE `.qic`) browse and edit (see §10; hardware check in
+§7.0). Next is a general tape layer for the other vendors' tape images: DEC
+(SIMH `.tap` / AWS / HET, ANSI labels, VMS BACKUP), HP 9000, SGI and IBM, and a
+folder of tape files.
+
 ---
 
 ## 4. Clonezilla import — remaining gaps
@@ -511,6 +540,12 @@ research or sourced the needed ROMs/disks.
 
 ### 7.0 — Original user-side verification list (pre-2026-06-05)
 
+- **Sun QIC tape edits on Sun hardware** — `fs::sun2tape_edit` rebuilds a
+  SUN2TAPE `.qic` after edits inside its tar, `.tar.Z` and UFS miniroot files.
+  Host `tar` / `gzip -d` / our fsck agree with the rebuilt sections, but no Sun
+  has read one yet. Edited test tapes are on the NAS in
+  `rb-fixtures/to-verify/sun-tape-edit/`: boot one (or `tar t` it) on the
+  Sun-2 / Sun-3 MiSTer core.
 - **Ghost FAT32 long-name fixture (D13, shelved 2026-09-03)** — the
   2026-09-01 audit's D13 (eaa6f3d: a Ghost reconstruction gives
   prefix-sharing long names distinct 8.3 aliases) could not be judged by
@@ -1105,6 +1140,39 @@ Out, not parked. Listed so the question doesn't get re-litigated.
 Audit trail. Each was either shipped, closed-by-design, or moved into
 the structure above before its source plan doc was deleted in the
 docs-consolidation pass.
+
+- **QNX 2 read + edit + fsck (2026-10-28/29)** — Unisys ICON / LEXICON
+  floppies and hard disks (`fs::qnx2`). Read: owner `group.member`, ICON
+  attribute letters mapped onto Unix modes, dates (4-bit year, 1980-1995;
+  unset clock reads as 1 January 1980), deleted entries on request, RS -> LF
+  on extract, the QDOS `/dos/work.ph` FAT disk. Edit: create (128-block
+  extents), mkdir, rename, delete (as `frel`), chmod, chown, verified with real
+  QNX 4.10.01 `chkfsys` in icon-emu. fsck: extent chains, back links,
+  cross-links, block counts, bitmap vs held blocks. LEXICON disks: MBR types
+  07 / 08 / 09 with 1-based starts, padded-head MFM-reader images
+  (`rbformats::icon_hd`) with bad-block remapping, never-formatted partitions
+  named as such. Open behind it: §3.4.
+- **QNX 4 real media (2026-10-28)** — the `QNX4FS` boot block was taken for
+  FAT; QNX 4 is now probed first. Checked on `qnxfs1g.img`. Writes: §3.4.
+- **Sun QIC tape editing (2026-10-29)** — add, mkdir, rename, delete, chmod,
+  chown inside tar, `.tar.Z` and UFS miniroot tape files
+  (`fs::sun2tape_edit`, `fs::tar_section`, a compress(1)-compatible encoder).
+  Every edit rebuilds the tape and keeps the original as `<name>.bak`. Hardware
+  check: §7.0. General tape layer: §3.6.
+- **Flux captures (2026-10-28/29)** — SCP and HFE v1 / v3 beside KryoFlux,
+  IBM FM and AmigaDOS MFM beside IBM MFM, a phase-tracking PLL, a CRC-checked
+  byte vote, and unreadable sectors listed in the GUI Inspect tab; Gesswein
+  MFM reader `.emu` captures of ST-506 hard disks (Intel iSBC 214). SCP / HFE
+  byte-identical to Greaseweazle `gw convert` output; the ST-251 `.emu`
+  byte-identical to its sector dump. `rb-cli convert` now exports what the
+  read layer decodes instead of copying these files' bytes. GCR: §3.5.
+- **Streaming audit (2026-10-28)** — nothing over ~200 MB is loaded into RAM:
+  NTFS / exFAT defrag and HFS / PFS3 clones pipe file bodies
+  (`fs::stream_pipe`), `.cbk` pack / unpack stream, ZIP / tar over 64 MiB are
+  indexed, blank volumes are written sparse, NDIF / SMI rebuild to a temp file,
+  extraction streams in eleven more drivers, NTFS-compressed Ghost images parse
+  the MFT incrementally, `rb-cli edit` refuses files over 64 MiB. HPFS format
+  above 1 GiB and Ghost images named without a directory were fixed alongside.
 
 - **NeXTSTEP CD-ROM builder (2026-09-24)** — `rb-cli optical new next-ufs`
   (alias `nextstep`) and a TUI wizard target write NeXT's CD layout: a `dlV3`

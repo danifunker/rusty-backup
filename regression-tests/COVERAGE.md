@@ -401,6 +401,13 @@ Alto BFS / TFS · Pilot / Cedar · Carve (raw recovery)
 - HFS+ vs HFSX vs the HFS-wrapper case; journalled vs not.
 - AFFS: OFS vs FFS, plus international and dir-cache variants.
 - XFS v4 vs v5.
+- QNX 2: ICON floppy vs LEXICON hard disk (types 07 / 08 / 09 at 1-based
+  starts, read one sector earlier) vs a head-padded MFM-reader image of a real
+  ST-251 (`rbformats::icon_hd`). Read cases in `tier2/read-qnx2.toml`; write
+  cases (create, mkdir, rename, delete, chmod, chown, fsck clean) on all three
+  shapes in `tier3/edit-qnx2.toml`.
+- QNX 4: real media (`fs.qnx4.qnxfs1g.hd`), whose FAT-like boot block must not
+  be taken for FAT; case `read.qnx4.qnxfs1g` in `tier2/read-qnx2.toml`.
 
 ## Axis 2 — Container / image formats (47)
 
@@ -427,6 +434,21 @@ Special cases that need dedicated assertions:
   per-partition CHDs, and that `chdman info` opens the result (tier 6).
 - **HFV**: classic HFS only, 2047 MB ceiling. Needs a boundary case at
   2047 MB and a rejection case above it.
+- **Flux and cell captures** (read-only, `rbformats::flux`): SCP, HFE v1 and
+  HFE v3 of one disk must decode to the same volume as its sector dump, across
+  three encodings (IBM MFM, IBM FM / Acorn DFS, AmigaDOS MFM). Cases in
+  `tier2/read-flux-scp-hfe.toml`; the Gesswein `.emu` capture
+  (`flux.emu.icon4-st251.hd`) is `read.qnx2.icon4-st251-emu-flux` in
+  `tier2/read-qnx2.toml`.
+- **NTFS-compressed Ghost** (`fmt.gho.ntfs-compressed.hd`): the only real
+  image that reaches the incremental MFT parser; case
+  `fmt.read.gho-ntfs-compressed` in `tier2/read-repo-fixtures.toml`.
+- **Sun QIC tapes** (`.qic`): editing rebuilds the whole tape and keeps the
+  original as `<name>.bak`, so a case must assert the rebuilt tar / tar.Z /
+  UFS sections read back and untouched tape files are unchanged. Cases in
+  `tier3/edit-sun-tapes.toml`. **Not yet verified on Sun hardware**; those
+  cases pin rusty-backup's own view until a Sun-2 / Sun-3 MiSTer core boots an
+  edited tape.
 
 ## Axis 3 — Optical filesystems (10)
 
