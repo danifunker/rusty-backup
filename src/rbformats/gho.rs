@@ -525,7 +525,10 @@ pub fn materialize_gho_to_temp_with_password(
 /// The picked file does NOT need to be the primary — passing any one
 /// file (primary OR any span) yields the same set.
 pub fn discover_gho_span_set(picked: &Path) -> Result<Vec<std::path::PathBuf>> {
-    let dir = picked.parent().unwrap_or_else(|| Path::new("."));
+    let dir = picked
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     let name = picked
         .file_name()
         .and_then(|n| n.to_str())

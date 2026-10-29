@@ -189,3 +189,17 @@ expect_exit = 0
 [[case.step]]
 args = ["ls", "{fixture}@2", "/"]
 expect_exit = 0
+
+[[case]]
+id = "fmt.read.gho-ntfs-compressed"
+description = "High-compression file-aware NTFS Ghost image: the MFT is parsed incrementally, then a file and the listing match"
+fixture = "fmt.gho.ntfs-compressed.hd"
+timeout_ms = 600000
+[[case.step]]
+args = ["ls", "{fixture}", "/"]
+expect_exit = 0
+stdout_contains = ["734781440             flynntech12.iso", "WINDOWS", "PermTest"]
+[[case.step]]
+args = ["get", "{fixture}", "/WINDOWS/NOTEPAD.EXE", "{scratch}/notepad.exe"]
+expect_exit = 0
+file_sha256 = [{ path = "{scratch}/notepad.exe", sha256 = "865f34fe7ba81e9622ddbdfc511547d190367bbf3dad21ceb6da3eec621044f5" }]
