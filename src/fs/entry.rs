@@ -118,6 +118,8 @@ pub struct FileEntry {
     pub owner_label: Option<String>,
     /// Native attribute/permission letters for formats whose bits do not map onto a Unix mode.
     pub native_attrs: Option<String>,
+    /// QNX 2 permissions, owner and raw date words, so QNX 2 to QNX 2 copies keep them exactly.
+    pub qnx2_attrs: Option<qnx2fs::Attributes>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -160,6 +162,7 @@ impl FileEntry {
             mac_dates: None,
             owner_label: None,
             native_attrs: None,
+            qnx2_attrs: None,
         }
     }
 
@@ -191,6 +194,7 @@ impl FileEntry {
             mac_dates: None,
             owner_label: None,
             native_attrs: None,
+            qnx2_attrs: None,
         }
     }
 
@@ -222,6 +226,7 @@ impl FileEntry {
             mac_dates: None,
             owner_label: None,
             native_attrs: None,
+            qnx2_attrs: None,
         }
     }
 
@@ -259,6 +264,7 @@ impl FileEntry {
             mac_dates: None,
             owner_label: None,
             native_attrs: None,
+            qnx2_attrs: None,
         }
     }
 
@@ -295,6 +301,7 @@ impl FileEntry {
             mac_dates: None,
             owner_label: None,
             native_attrs: None,
+            qnx2_attrs: None,
         }
     }
 

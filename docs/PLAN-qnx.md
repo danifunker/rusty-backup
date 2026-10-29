@@ -53,6 +53,13 @@ worked out.
 - **Copies keep dates.** `cp` between QNX 2 images always carries the source
   dates (other filesystems stamp the time of the copy), and directories created
   with a date get it back at sync, after their children were added.
+- **Attributes.** `FileEntry::qnx2_attrs` / `Create*Options::qnx2_attrs` carry the
+  crate's `Attributes` (attribute letters, `group.member`, date words), so `cp` and
+  Commander between QNX 2 volumes copy them exactly, like `qnx2fs::Volume::copy_from`;
+  a Unix mode cannot hold `w` without `a`, `m` for group / other, or a directory's
+  `b`. From other filesystems `cp` maps the Unix mode and owner (QNX 2 counts as a
+  Unix-permission filesystem in `copy::Capabilities`). Case:
+  `edit.qnx2.cp-keeps-attributes`.
 - **Checked** with icon-emu: files written by `untar` and `put` list with the same
   dates in RB (`ls -t`), `icon-cli disk ls` and QNX 4.10.01's own `files`, and
   `chkfsys 1` agrees with the bitmap. icon-emu's headless server runs its clock

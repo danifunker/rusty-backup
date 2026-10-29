@@ -133,6 +133,7 @@ fn file_entry(parent: &str, e: &Entry, name: String) -> FileEntry {
         f.modified = Some(super::unix_common::inode::format_unix_timestamp(wall));
     }
     f.native_attrs = Some(e.describe());
+    f.qnx2_attrs = Some(e.attributes());
     f
 }
 
@@ -143,6 +144,27 @@ fn new_entry(mode: Option<u32>, uid: Option<u32>, gid: Option<u32>, wall: i64) -
         gid,
         mtime: Some(wall),
         ..Default::default()
+    }
+}
+
+impl<R: Read + Seek + Send> Qnx2Filesystem<R> {
+    /// Settings for a new entry: another QNX 2 entry's attributes and date words exactly, else
+    /// the Unix mode / owner and a (folded) host date.
+    fn new_entry_for(
+        &mut self,
+        attrs: Option<qnx2fs::Attributes>,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        mtime: Option<u64>,
+    ) -> NewEntry {
+        match attrs {
+            Some(a) => NewEntry {
+                attributes: Some(a),
+                ..Default::default()
+            },
+            None => new_entry(mode, uid, gid, wall_date(mtime, &mut self.folded)),
+        }
     }
 }
 
@@ -265,8 +287,13 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for Qnx2Filesystem<R> {
     ) -> Result<FileEntry, FilesystemError> {
         self.stamp_now();
         let mtime = options.unix_times.and_then(|t| t.mtime);
-        let wall = wall_date(mtime, &mut self.folded);
-        let opts = new_entry(options.mode, options.uid, options.gid, wall);
+        let opts = self.new_entry_for(
+            options.qnx2_attrs,
+            options.mode,
+            options.uid,
+            options.gid,
+            mtime,
+        );
         let e = self
             .vol
             .create_file(&entry_ref(parent), name, data, data_len, &opts)?;
@@ -281,10 +308,15 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for Qnx2Filesystem<R> {
     ) -> Result<FileEntry, FilesystemError> {
         self.stamp_now();
         let mtime = options.unix_times.and_then(|t| t.mtime);
-        let wall = wall_date(mtime, &mut self.folded);
-        let opts = new_entry(options.mode, options.uid, options.gid, wall);
+        let opts = self.new_entry_for(
+            options.qnx2_attrs,
+            options.mode,
+            options.uid,
+            options.gid,
+            mtime,
+        );
         let e = self.vol.create_dir(&entry_ref(parent), name, &opts)?;
-        if mtime.is_some() {
+        if mtime.is_some() || options.qnx2_attrs.is_some() {
             self.dir_dates.push((e.path.clone(), e.first, e.date));
         }
         Ok(file_entry(&parent.path, &e, e.name.clone()))
@@ -466,6 +498,61 @@ mod tests {
         };
         fs.create_file(&root, name, &mut &b"x"[..], 1, &opts)
             .unwrap()
+    }
+
+    #[test]
+    fn cp_between_qnx2_volumes_keeps_raw_attributes() {
+        // Bits a Unix mode cannot hold: write-only owner, group r--e-, other a+m, a directory's b.
+        let mut img = sample().into_inner();
+        let dir = 2 * 512 + 16 + 4;
+        img[dir + 26] = 0x12;
+        img[dir + 24] = 0x09;
+        img[dir + 25] = 0x14;
+        img[dir + 15] = 7;
+        img[dir + 16] = 3;
+        img[dir + 27..dir + 31].copy_from_slice(&[0x45, 0x2C, 0x10, 0x0E]);
+        img[dir + ENTRY + 26] = 0x2D;
+        let mut src = Qnx2Filesystem::open(Cursor::new(img), 0).unwrap();
+        let mut dst = Qnx2Filesystem::open(sample(), 0).unwrap();
+        let (sroot, droot) = (src.root().unwrap(), dst.root().unwrap());
+        let listed = src.list_directory(&sroot).unwrap();
+        let dsub = dst
+            .list_directory(&droot)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "sub")
+            .unwrap();
+        let opts = crate::fs::copy::CopyOptions {
+            recursive: true,
+            ..Default::default()
+        };
+        let mut stats = Default::default();
+        for name in ["HELLO", "sub"] {
+            let e = listed.iter().find(|e| e.name == name).unwrap();
+            crate::fs::copy::copy_into(
+                &mut src,
+                e,
+                &mut dst,
+                &dsub,
+                name,
+                &opts,
+                &mut stats,
+                &|_| {},
+            )
+            .unwrap();
+        }
+        dst.sync_metadata().unwrap();
+        let copied = dst.list_directory(&dsub).unwrap();
+        for name in ["HELLO", "sub"] {
+            let a = listed.iter().find(|e| e.name == name).unwrap();
+            let b = copied.iter().find(|e| e.name == name).unwrap();
+            assert_eq!(a.qnx2_attrs, b.qnx2_attrs, "{name}");
+            // A written entry is flagged modified, as QNX flags it.
+            let letters = |e: &FileEntry| e.native_attrs.clone().unwrap().replace("; modified", "");
+            assert_eq!(letters(a), letters(b), "{name}");
+        }
+        assert_eq!(stats.dropped_perms, 0);
+        assert!(fsck_qnx2(&mut dst).unwrap().is_clean());
     }
 
     #[test]

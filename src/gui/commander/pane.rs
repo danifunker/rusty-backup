@@ -1144,6 +1144,7 @@ impl CommanderPane {
             self.queue.push(StagedEdit::CreateDirectory {
                 parent: cwd,
                 name: name.clone(),
+                qnx2_attrs: None,
             });
             format!("[{side}] staged new folder '{name}'. Apply to write.")
         }

@@ -753,6 +753,7 @@ impl<R: Read + Seek> MinixFilesystem<R> {
             mac_dates: None,
             owner_label: None,
             native_attrs: None,
+            qnx2_attrs: None,
         }
     }
 }

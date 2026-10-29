@@ -159,6 +159,8 @@ pub struct Capabilities {
     pub dos_attributes: bool,
     pub amiga_metadata: bool,
     pub symlinks: bool,
+    /// Raw QNX 2 attributes, owner and date words (QNX 2 only).
+    pub qnx2_attributes: bool,
 }
 
 impl Capabilities {
@@ -173,6 +175,7 @@ impl Capabilities {
             dos_attributes: false,
             amiga_metadata: false,
             symlinks: false,
+            qnx2_attributes: false,
         };
 
         // Classic Mac forks + Finder type/creator.
@@ -199,6 +202,12 @@ impl Capabilities {
         {
             c.unix_permissions = true;
             c.symlinks = true;
+        }
+
+        // QNX 2 maps Unix modes onto its attribute letters; between QNX 2 volumes they copy raw.
+        if t == "QNX 2" {
+            c.unix_permissions = true;
+            c.qnx2_attributes = true;
         }
 
         // DOS attribute bits.
@@ -594,6 +603,10 @@ fn translate_metadata(
         }
     }
 
+    if dst_caps.qnx2_attributes {
+        o.qnx2_attrs = src.qnx2_attrs;
+    }
+
     // DOS attribute bits.
     if src.dos_attributes.is_some() {
         if dst_caps.dos_attributes {
@@ -664,6 +677,9 @@ fn ensure_directory(
         opts.mode = src_dir.mode;
         opts.uid = src_dir.uid;
         opts.gid = src_dir.gid;
+    }
+    if dst_caps.qnx2_attributes {
+        opts.qnx2_attrs = src_dir.qnx2_attrs;
     }
     if src_caps.amiga_metadata && dst_caps.amiga_metadata {
         opts.amiga_protection = src_dir.amiga_protection;

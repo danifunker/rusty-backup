@@ -53,7 +53,7 @@ pub fn legalize_staged_names(
     for (i, edit) in edits.iter_mut().enumerate() {
         let (parent, name, is_dir) = match edit {
             StagedEdit::AddFile { parent, name, .. } => (parent, name, false),
-            StagedEdit::CreateDirectory { parent, name } => (parent, name, true),
+            StagedEdit::CreateDirectory { parent, name, .. } => (parent, name, true),
             _ => continue,
         };
         let old_parent = parent.path.clone();
@@ -145,6 +145,7 @@ mod tests {
         StagedEdit::CreateDirectory {
             parent: FileEntry::new_directory(leaf(parent), parent.into(), 0),
             name: name.into(),
+            qnx2_attrs: None,
         }
     }
 
@@ -167,7 +168,9 @@ mod tests {
     fn target(e: &StagedEdit) -> (String, String) {
         match e {
             StagedEdit::AddFile { parent, name, .. }
-            | StagedEdit::CreateDirectory { parent, name } => (parent.path.clone(), name.clone()),
+            | StagedEdit::CreateDirectory { parent, name, .. } => {
+                (parent.path.clone(), name.clone())
+            }
             _ => unreachable!(),
         }
     }

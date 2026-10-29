@@ -623,6 +623,7 @@ impl<R: Read + Seek> ExfatFilesystem<R> {
                         mac_dates: None,
                         owner_label: None,
                         native_attrs: None,
+                        qnx2_attrs: None,
                     }
                 } else {
                     FileEntry {
@@ -654,6 +655,7 @@ impl<R: Read + Seek> ExfatFilesystem<R> {
                         mac_dates: None,
                         owner_label: None,
                         native_attrs: None,
+                        qnx2_attrs: None,
                     }
                 };
 
@@ -700,6 +702,7 @@ impl<R: Read + Seek + Send> Filesystem for ExfatFilesystem<R> {
             mac_dates: None,
             owner_label: None,
             native_attrs: None,
+            qnx2_attrs: None,
         })
     }
 

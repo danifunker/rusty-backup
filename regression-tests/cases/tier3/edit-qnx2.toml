@@ -242,3 +242,36 @@ stdout_contains = ["1994-03-14 06:00:00  modern", "1992-02-29 04:00:00  leapday"
 args = ["fsck", "--checkonly", "{fixture_copy}@1"]
 expect_exit = 0
 stdout_not_contains = ["WARN", "ERROR"]
+
+# cp between QNX 2 volumes copies the raw ICON attributes, owner and date words, not a
+# Unix mode: /boot is `r--m` (no c) and its files `r---m`, which a Unix mode cannot hold.
+[[case]]
+id = "edit.qnx2.cp-keeps-attributes"
+description = "cp -r of a real ICON tree onto another QNX 2 volume keeps attribute letters, owners and dates exactly"
+fixture = "fs.qnx2.lexicon-10mb.hd"
+env = { TZ = "UTC" }
+[[case.step]]
+args = ["cp", "-r", "{fixture}@1", "/boot", "{fixture_copy}@1", "/tmp"]
+expect_exit = 0
+stdout_not_contains = ["couldn't store"]
+stderr_not_contains = ["couldn't store", "QNX 2 stores years"]
+[[case.step]]
+args = ["ls", "-o", "-t", "{fixture_copy}@1", "/tmp"]
+expect_exit = 0
+stdout_contains = ["255.255           0  1991-09-11 11:54:55  boot  (owner r--m group r--- other r---"]
+[[case.step]]
+args = ["ls", "-o", "-t", "{fixture_copy}@1", "/tmp/boot"]
+expect_exit = 0
+stdout_contains = ["255.255      102535  1991-08-23 14:04:34  hd_boot  (owner r---m group ----- other -----", "255.255       85773  1991-08-15 18:53:14  ws2_emul_nologin  (owner r---m group ----- other -----"]
+[[case.step]]
+args = ["get", "{fixture_copy}@1", "/tmp/boot/hd_boot", "{scratch}/copied"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{fixture}@1", "/boot/hd_boot", "{scratch}/original"]
+expect_exit = 0
+files_identical = [["{scratch}/copied", "{scratch}/original"]]
+[[case.step]]
+args = ["fsck", "--checkonly", "{fixture_copy}@1"]
+expect_exit = 0
+stdout_contains = ["437 files / 21 dirs checked"]
+stdout_not_contains = ["WARN", "ERROR"]
