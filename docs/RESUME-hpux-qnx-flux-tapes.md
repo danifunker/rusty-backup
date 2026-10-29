@@ -84,42 +84,36 @@ predates the FreeBSD check-hash, VxFS, QNX and KryoFlux commits; targeted
 runs since are green (125 read cases, UFS and VxFS edit cases). Offer the user a
 full run (~95 min) before the PR is merged.
 
+## Done on 2026-10-28 (second session)
+
+QNX 2: dates (corrected layout), owners, attributes, deleted entries, RS to
+LF, fsck; **write support** (create / mkdir / rename / delete / chmod / chown)
+verified with real QNX 4.10.01 `chkfsys` in icon-emu (memory
+`icon-emu-qnx2-oracle.md`); LEXICON 10 MB / 64 MB hard disks (ICON header,
+types 07/08/09, 1-based starts). QNX 4 read checked on real media
+(`qnxfs1g.img`). Flux: SCP, HFE v1/v3, IBM FM, AmigaDOS MFM, a PLL, CRC-checked
+voting, fault list in the GUI. Streaming audit: everything over ~200 MB streams
+(defrag clones, .cbk, archives, sparse volume creation, NDIF, GHO MFT, file
+extraction in UFS / JFS / SquashFS / ReiserFS / Minix / QNX 4/6 / ADFS / OS-9 /
+Human68k / QDOS, HFS and PFS3 clones). Fixtures added: SCP / HFE / Amiga / DFS
+flux, LEXICON 10 MB and 64 MB, ntfscomp.GHO, qnxfs1g.
+
 ## Queue, in the user's order
 
 1. **Sun tapes writable (plan phase W4), then a general tape layer.** Editing
-   rebuilds the whole tape like `src/fs/squashfs_edit.rs`: load the tape
-   (`src/fs/sun2tape.rs`), edit tar sections (recompress `compress(1)` ones) and
-   the UFS miniroot in memory, rebuild into a new file, and only after the
-   rebuild succeeds rename the original to `<name>.bak` (never overwrite an
-   existing backup: `.bak.1`, ...) and move the new tape into its name. The user
-   also wants other tape formats: split container (SUN2TAPE `.qic`, SIMH `.tap`,
-   AWS / HET, a folder of tape files) from contents (tar, compressed tar, cpio,
-   BSD dump, UFS image, ANSI-labelled / VMS BACKUP). Ask which machines' tapes
-   matter most before going wide. Oracle: SunOS 4.1.x under emulation reading
-   the tape back.
-2. **QNX 2 follow-ups** (the user's spec; status report given 2026-10-28):
-   dates as year-1980 in 4 bits plus a PM bit (`fseconds` is 0 on every ICON
-   file); owner shown as group.member; permission bits; list / recover deleted
-   entries (status `0x40` clear); optional RS (0x1E) to LF on extract; bitmap
-   cross-check with an orphaned-block report (a QNX 2 fsck); hand-off of QDOS
-   `.pf` / `.ph` images and `arch` archives stored inside QNX; hard-disk images
-   (10 MB single volume; 64 MB with a partition record, a bad-block table and
-   two 32 MB partitions) once samples exist; 640K (655,360-byte) geometry and
-   LEXICON disks once samples exist. Writes wait for the user's ICON emulator.
-3. **QNX 4 / QNX 6 verification**: needs real media, or the user's OK to
-   download the 1.7 KB `qnxfs1g.img.bz2` from qnxfs.narod.ru.
-4. **KryoFlux follow-ups**: a better PLL (Watcom BASIC still has 133
-   unreadable sectors, fileserver boot 86, one upgrade disk lists 12 entries
-   from flux against 17 from its dump); surface the fault report in the GUI
-   (today it is one stderr line); more capture formats (SCP, HFE) and encodings
-   (FM, Amiga MFM, GCR) on the same `rbformats::flux` layer.
-5. **HP-UX writes left**: W5 BSD disklabel slot edits + resize on restore
-   (oracle NetBSD/hppa `disklabel` under QEMU from the netbsd11-hppa ISO
-   fixture), W6 HP-UX LVM LV resize / resize on restore (HP-UX `vgcfgbackup`,
-   `vgdisplay`, `lvdisplay`). VxFS gaps: indirect / typed-extent files, our own
-   VxFS fsck; layouts 5+ are blocked on VxFS 3.5 media.
-6. **Blocked**: AIX LVM / JFS1 writes (waiting on the IBMRS6K42p MiSTer core to
-   boot AIX 4.3.3); QNX writes (waiting on an ICON emulator the user will build).
+   rebuilds the whole tape like `src/fs/squashfs_edit.rs`; back up the original
+   to `<name>.bak` (never overwrite: `.bak.1`, ...). Formats wanted: Sun, DEC
+   (SIMH .tap / AWS / HET, ANSI labels, VMS BACKUP), HP 9000 / SGI / IBM, and a
+   folder of tape files. Oracle: SunOS reading the tape back; nothing here can
+   boot SunOS from QIC, so ask the user about the Sun-3 MiSTer core.
+2. **QNX 2 follow-ups:** non-empty bad-block tables (warn today; need a
+   sample), 640 KiB disks, `arch` archive floppies (none in the archive).
+3. **Flux:** GCR (Apple / Commodore) decoding on `rbformats::flux`.
+4. **HP-UX writes left:** W5 BSD disklabel slot edits + resize on restore, W6
+   HP-UX LVM LV resize. VxFS gaps: indirect / typed-extent files, own fsck.
+5. **Runner memory:** `rb-regress produce` keeps every pass-A artifact in
+   memory (~300 MB peak); write them to disk and compare streaming.
+6. **Blocked:** AIX LVM / JFS1 writes (MiSTer core).
 
 ## Archive paths
 

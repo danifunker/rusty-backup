@@ -3,7 +3,7 @@
 # All three are the Unisys ICON 4.10.01 help diskette, converted from its
 # KryoFlux capture by Greaseweazle's own `gw convert` (an independent writer).
 # Each must decode to the same volume as the sector dump: the tar export of all
-# three is byte-identical to the one from `fs.qnx2.icon-help410.floppy`.
+# three is byte-identical to the one from `fs.qnx2.icon-help410.floppy` (re-pinned after the QNX 2 date fix).
 
 [meta]
 tier = 2
@@ -23,7 +23,7 @@ stderr_not_contains = ["unreadable"]
 [[case.step]]
 args = ["tar", "{fixture}", "/", "{scratch}/all.tar"]
 expect_exit = 0
-file_sha256 = [{ path = "{scratch}/all.tar", sha256 = "8630d6a9a6512c0a95053bdcefea0ff8871bf28dd6cf30afc7f8f35ce05302b4" }]
+file_sha256 = [{ path = "{scratch}/all.tar", sha256 = "24bc09805c2ef624a0b0913ced8a747b96eac33e0d20d1fd4ae9241c547d2795" }]
 
 [[case]]
 id = "read.flux.hfe-icon-help410"
@@ -34,7 +34,7 @@ timeout_ms = 300000
 args = ["tar", "{fixture}", "/", "{scratch}/all.tar"]
 expect_exit = 0
 stderr_not_contains = ["unreadable"]
-file_sha256 = [{ path = "{scratch}/all.tar", sha256 = "8630d6a9a6512c0a95053bdcefea0ff8871bf28dd6cf30afc7f8f35ce05302b4" }]
+file_sha256 = [{ path = "{scratch}/all.tar", sha256 = "24bc09805c2ef624a0b0913ced8a747b96eac33e0d20d1fd4ae9241c547d2795" }]
 
 [[case]]
 id = "read.flux.hfe3-icon-help410"
@@ -45,7 +45,7 @@ timeout_ms = 300000
 args = ["tar", "{fixture}", "/", "{scratch}/all.tar"]
 expect_exit = 0
 stderr_not_contains = ["unreadable"]
-file_sha256 = [{ path = "{scratch}/all.tar", sha256 = "8630d6a9a6512c0a95053bdcefea0ff8871bf28dd6cf30afc7f8f35ce05302b4" }]
+file_sha256 = [{ path = "{scratch}/all.tar", sha256 = "24bc09805c2ef624a0b0913ced8a747b96eac33e0d20d1fd4ae9241c547d2795" }]
 
 [[case]]
 id = "read.flux.scp-amiga-dd"
