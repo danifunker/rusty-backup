@@ -449,10 +449,24 @@ fn run_wrapper_open(
         WrapperOpenPlan::Extract(ex) => {
             let WrapperExtract { base, entry } = *ex;
             let mut fs = base.open().map_err(|e| format!("{e:#}"))?;
-            let mut buf = Vec::new();
-            fs.write_file_to(&entry, &mut buf)
-                .map_err(|e| format!("reading '{}': {e}", entry.name))?;
-            WrapperSource::Bytes(buf)
+            let large = entry.size > crate::fs::mem_archive::INLINE_MAX;
+            if large || matches!(kind, DescendKind::DiskImage | DescendKind::Optical) {
+                // Stream to disk so a multi-GB image or archive never sits in RAM.
+                let (dir, path) =
+                    crate::model::commander_descend::materialize_streamed(&file_name, |f| {
+                        let mut w = std::io::BufWriter::new(f);
+                        fs.write_file_to(&entry, &mut w)?;
+                        std::io::Write::flush(&mut w)?;
+                        Ok(())
+                    })
+                    .map_err(|e| format!("reading '{}': {e:#}", entry.name))?;
+                WrapperSource::TempFile(dir, path)
+            } else {
+                let mut buf = Vec::new();
+                fs.write_file_to(&entry, &mut buf)
+                    .map_err(|e| format!("reading '{}': {e}", entry.name))?;
+                WrapperSource::Bytes(buf)
+            }
         }
     };
     if let Ok(mut g) = status.lock() {

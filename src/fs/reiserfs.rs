@@ -48,7 +48,7 @@
 
 #[cfg(feature = "rust173-polyfill")]
 use crate::rust173_compat::IntIsMultipleOf as _;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 use super::entry::FileEntry;
 use super::filesystem::{Filesystem, FilesystemError};
@@ -272,6 +272,13 @@ impl<R: Read + Seek + Send> ReiserFsFilesystem<R> {
     /// Refuses to read past the volume's declared block count so a corrupt
     /// child pointer can't drag the cursor into adjacent partitions.
     pub(crate) fn read_tree_block(&mut self, block_num: u32) -> Result<Vec<u8>, FilesystemError> {
+        let mut buf = vec![0u8; self.block_size as usize];
+        self.read_block_into(block_num, &mut buf)?;
+        Ok(buf)
+    }
+
+    /// Read block `block_num` into a caller-owned block-sized `buf`, reused across a file's data blocks.
+    fn read_block_into(&mut self, block_num: u32, buf: &mut [u8]) -> Result<(), FilesystemError> {
         if block_num == 0 {
             return Err(FilesystemError::Parse(
                 "reiserfs: block 0 is the boot area, not a tree block".into(),
@@ -285,9 +292,72 @@ impl<R: Read + Seek + Send> ReiserFsFilesystem<R> {
         }
         let off = self.partition_offset + (block_num as u64) * self.block_size;
         self.reader.seek(SeekFrom::Start(off))?;
+        self.reader.read_exact(buf)?;
+        Ok(())
+    }
+
+    /// Stream a file's IND / DRCT bodies into `w`, capped at `min(stat-data size, max_bytes)`.
+    /// Items arrive in key-offset order, so concatenating them yields the file; holes write zeros.
+    pub(crate) fn copy_object_data(
+        &mut self,
+        dir_id: u32,
+        objectid: u32,
+        max_bytes: u64,
+        w: &mut dyn Write,
+    ) -> Result<u64, FilesystemError> {
+        let items = self.collect_items_for_object(dir_id, objectid)?;
+        let mut sd_size: Option<u64> = None;
+        for (ih, body) in &items {
+            if ih.key.item_type(ih.key_format()?) == ItemType::StatData {
+                sd_size = Some(StatData::parse(body)?.size);
+            }
+        }
+        let size = sd_size.ok_or_else(|| {
+            FilesystemError::Parse(format!(
+                "reiserfs: read_file({dir_id}, {objectid}) found no StatData item"
+            ))
+        })?;
+        // The size cap also drops the NUL padding tail-packed Direct items carry in their slots.
+        let target = size.min(max_bytes);
         let mut buf = vec![0u8; self.block_size as usize];
-        self.reader.read_exact(&mut buf)?;
-        Ok(buf)
+        let mut done = 0u64;
+        for (ih, body) in &items {
+            if done >= target {
+                break;
+            }
+            match ih.key.item_type(ih.key_format()?) {
+                ItemType::Indirect => {
+                    if !body.len().is_multiple_of(4) {
+                        return Err(FilesystemError::Parse(format!(
+                            "reiserfs: IND item body length {} is not a multiple of 4",
+                            body.len()
+                        )));
+                    }
+                    for chunk in body.chunks_exact(4) {
+                        if done >= target {
+                            break;
+                        }
+                        let block_num =
+                            u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                        let take = self.block_size.min(target - done) as usize;
+                        if block_num == 0 {
+                            buf.fill(0);
+                        } else {
+                            self.read_block_into(block_num, &mut buf)?;
+                        }
+                        w.write_all(&buf[..take])?;
+                        done += take as u64;
+                    }
+                }
+                ItemType::Direct => {
+                    let take = (body.len() as u64).min(target - done) as usize;
+                    w.write_all(&body[..take])?;
+                    done += take as u64;
+                }
+                ItemType::StatData | ItemType::DirEntry | ItemType::Unknown(_) => {}
+            }
+        }
+        Ok(done)
     }
 
     /// Walk the S+tree from the root and return every leaf block number in
@@ -708,83 +778,18 @@ impl<R: Read + Seek + Send> Filesystem for ReiserFsFilesystem<R> {
         max_bytes: usize,
     ) -> Result<Vec<u8>, FilesystemError> {
         let (dir_id, objectid) = unpack_loc(entry.location);
-        let items = self.collect_items_for_object(dir_id, objectid)?;
-
-        // StatData carries the logical file size we truncate to. Items
-        // come back in tree (key.offset) order, so SD (offset 0) is
-        // always first, followed by IND / DRCT in increasing-offset
-        // order. Concatenating their bodies gives the file in order.
-        let mut sd_size: Option<u64> = None;
-        let mut data: Vec<u8> = Vec::new();
-
-        for (ih, body) in items {
-            if data.len() >= max_bytes {
-                break;
-            }
-            let fmt = ih.key_format()?;
-            match ih.key.item_type(fmt) {
-                ItemType::StatData => {
-                    let sd = StatData::parse(&body)?;
-                    sd_size = Some(sd.size);
-                    let capacity = (sd.size as usize).min(max_bytes);
-                    data.reserve(capacity.saturating_sub(data.capacity()));
-                }
-                ItemType::Indirect => {
-                    // Body is a u32[] of block pointers; each pointer
-                    // names an unformatted data block holding one
-                    // block_size slice of the file.
-                    if !body.len().is_multiple_of(4) {
-                        return Err(FilesystemError::Parse(format!(
-                            "reiserfs: IND item body length {} is not a multiple of 4",
-                            body.len()
-                        )));
-                    }
-                    for chunk in body.chunks_exact(4) {
-                        if data.len() >= max_bytes {
-                            break;
-                        }
-                        let block_num =
-                            u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                        let remaining = max_bytes - data.len();
-                        let take = (self.block_size as usize).min(remaining);
-                        if block_num == 0 {
-                            // Sparse block — emit `take` zeros.
-                            data.extend(crate::compat::repeat_n(0u8, take));
-                        } else {
-                            let block = self.read_tree_block(block_num)?;
-                            data.extend_from_slice(&block[..take]);
-                        }
-                    }
-                }
-                ItemType::Direct => {
-                    // The body holds raw bytes — for tail-packed files
-                    // this is the last (< block_size) chunk; for fully
-                    // small files it's the whole file (possibly NUL-
-                    // padded out to the slot size, trimmed below).
-                    let take = body.len().min(max_bytes - data.len());
-                    data.extend_from_slice(&body[..take]);
-                }
-                ItemType::DirEntry | ItemType::Unknown(_) => {
-                    // Not a file item. Skip silently; a directory
-                    // surfaced as `read_file` will simply return an
-                    // empty body.
-                }
-            }
-        }
-
-        let size = sd_size.ok_or_else(|| {
-            FilesystemError::Parse(format!(
-                "reiserfs: read_file({dir_id}, {objectid}) found no StatData item"
-            ))
-        })?;
-        // Truncate to the file's logical size (drops the NUL padding
-        // that tail-packed Direct items carry inside their 8-byte
-        // slots) and respect the caller's max_bytes ceiling.
-        let target = (size as usize).min(max_bytes);
-        if data.len() > target {
-            data.truncate(target);
-        }
+        let mut data = Vec::new();
+        self.copy_object_data(dir_id, objectid, max_bytes as u64, &mut data)?;
         Ok(data)
+    }
+
+    fn write_file_to(
+        &mut self,
+        entry: &FileEntry,
+        writer: &mut dyn Write,
+    ) -> Result<u64, FilesystemError> {
+        let (dir_id, objectid) = unpack_loc(entry.location);
+        self.copy_object_data(dir_id, objectid, u64::MAX, writer)
     }
 
     fn volume_label(&self) -> Option<&str> {

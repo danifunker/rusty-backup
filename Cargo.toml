@@ -132,7 +132,7 @@ chd = ["dep:libchdman-rs"]
 # Physical optical-drive I/O (rip / data-track read) plus optical-image
 # convert/browse. Builds on armv7 (MiSTer) too: cd-da-reader is cc+libc
 # (a self-compiled SG_IO shim — NO system libcdio link), and opticaldiscs
-# (>=0.4.5) reuses the SAME libchdman-rs 0.288.10 prebuilt as the `chd` feature
+# (0.16.x) reuses the SAME libchdman-rs 0.289.x prebuilt as the `chd` feature
 # — which ships an armv7-gnueabihf-glibc2.31 build — so the two dedupe to one
 # libchdman. At runtime it needs a drive present (e.g. /dev/sr0); harmless to
 # include when none is attached.
@@ -141,10 +141,16 @@ optical = ["dep:opticaldiscs", "dep:cd-da-reader"]
 # a CHD or BIN/CUE image. rodio pulls in cpal, which links ALSA (libasound) on
 # Linux, WASAPI on Windows and CoreAudio on macOS — so this is a DESKTOP-only
 # feature. It force-enables `gui` (the player is UI), `optical` (disc reading)
-# and `chd` (a CHD is extracted to a temp BIN before playback). Left OUT of the
+# and `chd` (CHD audio streams through libchdman-rs). Left OUT of the
 # slim/cross builds (rb-cli-mini, armv7/MiSTer, i486/i586) so no ALSA cross-
 # compile is needed there. The Linux desktop GUI CI legs install libasound.
 audio = ["dep:rodio", "gui", "optical", "chd"]
+# Image-files-only build for sandboxed distribution (Mac App Store, Microsoft
+# Store, Flathub/Snap): no raw disk or optical-drive access, no elevation, on
+# every platform. Runtime-gated at the `os::` chokepoints, so it composes with
+# any other feature set. Remote daemons' devices stay reachable over the
+# network. See docs/no_physical_devices.md.
+no-physical-devices = []
 # Network daemon + client (`rb-cli serve` and `rb://host:port/img@N` refs).
 # ON BY DEFAULT, and every shipped build opts in: the desktop release via
 # `default`, and the slim/cross pipelines (armv7 MiSTer, i486/i586 appliance)
@@ -187,10 +193,10 @@ tui-update = ["dep:reqwest"]
 # already a non-optional dependency below, so this adds no new C/native code.
 ratatui = { version = "0.30", optional = true }
 # Optional, gated behind feature flags. See [features] above.
-eframe = { version = "0.34", features = ["glow"], optional = true }
-egui = { version = "0.34", optional = true }
+eframe = { version = "0.37", features = ["glow"], optional = true }
+egui = { version = "0.37", optional = true }
 rfd = { version = "0.17", default-features = false, features = ["gtk3"], optional = true }
-libchdman-rs = { version = "0.288.10", features = ["prebuilt"], optional = true }
+libchdman-rs = { version = "0.289.3", features = ["prebuilt"], optional = true }
 # rustls-tls keeps reqwest off openssl-sys so the gui-feature build doesn't drag
 # in OpenSSL native libs; the cross/armv7 path doesn't need reqwest at all
 # (it's behind `gui`).
@@ -203,7 +209,7 @@ webbrowser = { version = "1.0", optional = true }
 #   0.13.0 — `physical` / `open_physical`: reading a disc from the drive as flat
 #            cooked sectors, which is what makes DVD and Blu-ray work at all
 #            (the CD-only MMC ioctls fail on that media with ENOTTY).
-opticaldiscs = { version = "0.15.0", features = ["drives"], optional = true }
+opticaldiscs = { version = "0.16.0", features = ["drives"], optional = true }
 # Back on the upstream crate as of 1.0.0, which absorbed everything the
 # `danifunker/rust-cd-da-reader` fork carried (PR #58): `CdReader::from_file`
 # for a pre-opened elevated handle, and the streaming reader
@@ -212,14 +218,14 @@ opticaldiscs = { version = "0.15.0", features = ["drives"], optional = true }
 # `TrackStreamOptions`, which we never used, and adds read-speed control
 # (`ReadSpeed` / `with_read_speed`) that we do not use yet.
 cd-da-reader = { version = "1.0.0", optional = true }
-# In-app CD-DA playback (Optical tab). Pinned <0.20 for the
-# OutputStream::try_default / Sink::try_new API used in gui/optical_audio.rs.
+# In-app CD-DA playback (Optical tab). 0.21+ API (DeviceSinkBuilder / Player,
+# f32 SamplesBuffer) in gui/optical_audio.rs, matching ODE-artwork-downloader.
 # Only the `audio` feature (desktop) links this; cpal -> ALSA/WASAPI/CoreAudio.
 # default-features=false drops rodio's file decoders (symphonia/claxon/lewton/
 # hound — mp3/flac/vorbis/wav) which we never touch: we feed raw CD-DA PCM via
-# SamplesBuffer straight to the cpal-backed Sink. cpal is a non-optional rodio
-# dep, so the output path stays. Keeps the build (and macOS DMG) lean.
-rodio = { version = "0.19", optional = true, default-features = false }
+# SamplesBuffer straight to the cpal-backed Player. `playback` is the one
+# default we keep: it is what pulls cpal in. Keeps the build (and macOS DMG) lean.
+rodio = { version = "0.23", optional = true, default-features = false, features = ["playback"] }
 
 # Always-on dependencies — used by rb-cli (mini included).
 anyhow = "1"
@@ -234,7 +240,7 @@ log = "0.4"
 env_logger = "0.11"
 # zstd backend — exactly one of native-zstd / pure-zstd selects these. See the
 # [features] section. C libzstd (fast, desktop) vs pure-Rust bit-exact (cross).
-zstd = { version = "0.13", optional = true }
+zstd = { version = "0.14", optional = true }
 zeekstd = { version = "0.6", optional = true }
 libzstd-bitexact-rs = { version = "0.157", optional = true }
 sha2 = "0.11"
@@ -247,7 +253,7 @@ crc32fast = "1"
 chrono = "0.4"
 tempfile = "3"
 image = "0.25"
-dirs = "6"
+dirs = "7"
 # Baseline is the pure-Rust backend (miniz_oxide) so the slim/cross builds need
 # no C zlib. The desktop `native-zlib` feature adds `flate2/zlib-ng`, which
 # flate2 prioritizes over the Rust backend when both are enabled.
@@ -256,21 +262,21 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 # crusty-backup (`cb-dos` `/CODEC:LZ4`); gzip stays the default. Pure-Rust like
 # the flate2 baseline (no C lz4 to cross-compile), and lz4_flex's `frame` module
 # produces the standard LZ4 frame, interoperable with the DOS tool's liblz4.
-lz4_flex = "0.13"
+lz4_flex = "0.14"
 tar = "0.4"
 # Set an extracted file's mtime/atime after we write it (the plain host-fs
 # export path). Already a transitive dep via `tar` in every lockfile — this
 # just promotes it so we can call `set_file_mtime` directly.
 filetime = "0.2"
 bzip2 = "0.6"
-zip = { version = "8", default-features = false, features = ["deflate", "aes-crypto"] }
-base64 = "0.22"
+zip = { version = "9", default-features = false, features = ["deflate", "aes-crypto"] }
+base64 = "0.23"
 serde_yml = { version = "0.0.13", optional = true }
 csv = "1"
 clap_complete = "4"
 clap_mangen = "0.3"
 globset = "0.4"
-rustyline = { version = "18.0.0", features = ["with-file-history"] }
+rustyline = { version = "19.0.0", features = ["with-file-history"] }
 crossterm = "0.29"
 shell-words = "1.1.1"
 lzma-rs = "0.3.0"

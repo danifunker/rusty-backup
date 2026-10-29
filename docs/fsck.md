@@ -206,3 +206,24 @@ and clears VolumeDirty. All are non-destructive metadata rewrites — no MFT
 record rewrites, no cross-link resolution (those are surfaced-only). Verified
 against Windows `chkdsk` via a Mount-DiskImage'd fixed-VHD wrap of the image
 (the oracle test is `#[cfg(windows)]` and skips gracefully without admin).
+
+## Check phases (QNX 2 example)
+
+`fsck_qnx2` in `src/fs/qnx2.rs` is check-only (every issue is
+`repairable: false`; there is no `repair()`). It walks the tree from the root
+entry, claiming each directory's and file's extent chain into a block-owner map,
+then reconciles that map with the root's bitmap file:
+
+| Pass | What it checks |
+|------|---------------|
+| Tree walk | Unreadable directories (`UnreadableDir`), nesting past 64 levels (`DirTooDeep`), deleted entries counted (and how many are still recoverable) but not claimed |
+| Extent chains | Chains that cannot be followed (`BrokenChain`), back links that do not name the previous extent (`ExtentLink`, warning), blocks past the volume end (`BlockOutOfRange`) |
+| Cross-links | A block held by two files or directories (`CrossLinked`) |
+| Block counts | The entry's block count vs the blocks its extents hold (`BlockCount`, warning) |
+| Bitmap | Blocks files hold that the bitmap marks free (`UnmarkedBlocks`, error); blocks marked in use that no file holds (`OrphanedBlocks`, warning). Block 1, the boot-loader blocks before the root, and the volume's last block (which the 3.00 formatter marks in use) are excluded. A volume with no readable bitmap file gets `NoBitmap` |
+
+Stats add the volume's block / free-block counts and the deleted-entry count.
+Clean on all 31 readable Unisys ICON disks; on the damaged Watcom BASIC disk it
+names the two files whose headers sit in bad sectors and their lost blocks.
+The write path was checked separately with the real QNX 4.10.01 `chkfsys` in
+icon-emu (see `docs/PLAN-qnx.md`).

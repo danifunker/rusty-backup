@@ -512,6 +512,21 @@ pub fn adfs_time_to_unix(load: u32, exec: u32) -> Option<u64> {
 // offset from 1900.
 // ---------------------------------------------------------------------------
 
+/// Encode Unix seconds as HP LIF's 6-byte BCD `YYMMDDhhmmss`; years outside 1970-2069 clamp.
+pub fn unix_to_lif_bcd(secs: u64) -> [u8; 6] {
+    let (year, month, day, hour, minute, second) = ymd_hms(secs);
+    let yy = (year.clamp(1970, 2069) % 100) as u32;
+    let bcd = |v: u32| (((v / 10) << 4) | (v % 10)) as u8;
+    [
+        bcd(yy),
+        bcd(month),
+        bcd(day),
+        bcd(hour),
+        bcd(minute),
+        bcd(second),
+    ]
+}
+
 /// Encode Unix seconds as OS-9 FD.DAT (5 bytes: year-1900, month, day,
 /// hour, minute). OS-9's year is a single unsigned byte — 1900..2155
 /// representable. Pre-1900 clamps to 1900-01-01; post-2155 clamps to

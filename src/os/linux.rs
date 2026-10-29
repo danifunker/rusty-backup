@@ -684,6 +684,7 @@ fn elevation_target_path() -> Result<PathBuf> {
 ///
 /// This function never returns on success - the current process is replaced.
 pub fn relaunch_with_elevation() -> Result<()> {
+    super::ensure_physical_enabled()?;
     let target = elevation_target_path()?;
     let args: Vec<String> = std::env::args().skip(1).collect();
 

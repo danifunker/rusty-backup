@@ -208,7 +208,8 @@ fn repair_mode(
         None => return fsck_unsupported(format),
     };
 
-    if report.is_clean() {
+    // A warning can still be repairable (classic HFS unused nodes), as the GUI's Repair button allows.
+    if report.is_clean() && !report.repairable {
         return emit_repair_clean(&report, format);
     }
     if !report.repairable {
@@ -425,7 +426,8 @@ fn alto_repair(
         .fsck()
         .expect("BFS implements fsck")
         .map_err(|e| anyhow!("fsck: {e}"))?;
-    if report.is_clean() {
+    // A warning can still be repairable (classic HFS unused nodes), as the GUI's Repair button allows.
+    if report.is_clean() && !report.repairable {
         return emit_repair_clean(&report, format);
     }
     if !report.repairable {

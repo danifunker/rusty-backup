@@ -1,0 +1,48 @@
+# Tier 2 — HP 9000 disks from the to-fix-add drop (issue #90, Phase 2a).
+#
+#   part.bsd.netbsd92-hp300.hd   NetBSD/hp300 on an HP 9000/385. Sector 0 is a LIF
+#                                boot volume (BOOT43, one file SYS_UBOOT); the BSD
+#                                disklabel sits behind it at byte 1024, big-endian,
+#                                checksummed. Slot c is the raw whole-disk alias and
+#                                must not list. Before Phase 2a: "Unrecognized media".
+#   fs.hpux-hfs.hp385-hpux.hd    HP-UX on the same machine: one whole-disk HP-HFS
+#                                volume with the classic 0x011954 magic.
+#
+# HP-UX 11.x's long-filename HFS (magic 0x095014) lives inside HP-UX LVM on the
+# hp715 disk; its case arrives with the LVM phase.
+
+[meta]
+tier = 2
+group = "fs.read.hp9000"
+description = "Open, identify, walk and fsck the HP 9000/385 NetBSD and HP-UX disks."
+
+[[case]]
+id = "read.bsd.netbsd92-hp300"
+description = "NetBSD/hp300: LIF boot volume plus a big-endian BSD disklabel at byte 1024."
+fixture = "part.bsd.netbsd92-hp300.hd"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["Partition table: BSD", "BSD a (4.2BSD)", "BSD b (swap)", "LIF boot area"]
+stdout_not_contains = ["BSD c"]
+[[case.step]]
+args = ["ls", "{fixture}@1", "/"]
+expect_exit = 0
+stdout_contains = ["INSTALL", "altroot", "libdata"]
+[[case.step]]
+args = ["fsck", "{fixture}@1", "--checkonly"]
+expect_exit = 0
+stdout_contains = ["23671 files / 1703 dirs"]
+[[case.step]]
+args = ["ls", "{fixture}@3", "/"]
+expect_exit = 0
+stdout_contains = ["SYS_UBOOT"]
+
+[[case]]
+id = "read.hpux-hfs.hp385"
+description = "HP-UX on an HP 9000/385: a whole-disk big-endian HP-HFS volume."
+fixture = "fs.hpux-hfs.hp385-hpux.hd"
+[[case.step]]
+args = ["ls", "{fixture}", "/"]
+expect_exit = 0
+stdout_contains = ["UPDATE_CDROM", "etc", "dev"]

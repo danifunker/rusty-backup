@@ -547,23 +547,42 @@ impl<R: Read + Seek> MinixFilesystem<R> {
         inode: &MinixInode,
         max_bytes: usize,
     ) -> Result<Vec<u8>, FilesystemError> {
-        let want = (inode.size as usize).min(max_bytes);
+        let mut out = Vec::with_capacity((inode.size as usize).min(max_bytes));
+        self.copy_inode_data(inode, max_bytes as u64, &mut out)?;
+        Ok(out)
+    }
+
+    /// Stream up to `max_bytes` of an inode's data into `w` one zone at a time; holes write zeros.
+    pub(crate) fn copy_inode_data(
+        &mut self,
+        inode: &MinixInode,
+        max_bytes: u64,
+        w: &mut dyn Write,
+    ) -> Result<u64, FilesystemError> {
+        let want = (inode.size as u64).min(max_bytes);
         if want == 0 {
-            return Ok(Vec::new());
+            return Ok(0);
         }
-        let zs = self.sb.zone_size() as usize;
-        let needed = want.div_ceil(zs);
+        let zs = self.sb.zone_size();
+        let needed = want.div_ceil(zs) as usize;
         let zones = self.collect_zones(inode, needed)?;
-        let mut out = Vec::with_capacity(want);
+        let mut buf = vec![0u8; zs as usize];
+        let mut done = 0u64;
         for zno in zones {
-            if out.len() >= want {
+            if done >= want {
                 break;
             }
-            let data = self.read_zone(zno)?;
-            let take = zs.min(want - out.len());
-            out.extend_from_slice(&data[..take]);
+            let take = zs.min(want - done) as usize;
+            if zno == 0 {
+                buf.fill(0);
+            } else {
+                // Whole-zone read keeps raw-device I/O aligned on the final partial zone.
+                self.read_at(zno as u64 * zs, &mut buf)?;
+            }
+            w.write_all(&buf[..take])?;
+            done += take as u64;
         }
-        Ok(out)
+        Ok(done)
     }
 
     /// Zone bitmap → highest allocated data zone (for smart-compaction floor).
@@ -732,6 +751,8 @@ impl<R: Read + Seek> MinixFilesystem<R> {
             finder_flags: None,
             prodos_file_type: None,
             mac_dates: None,
+            owner_label: None,
+            native_attrs: None,
         }
     }
 }
@@ -863,6 +884,21 @@ impl<R: Read + Seek + Send> Filesystem for MinixFilesystem<R> {
         }
         let inode = self.read_inode(entry.location as u32)?;
         self.read_inode_data(&inode, max_bytes)
+    }
+
+    fn write_file_to(
+        &mut self,
+        entry: &FileEntry,
+        writer: &mut dyn Write,
+    ) -> Result<u64, FilesystemError> {
+        if entry.is_directory() {
+            return Err(FilesystemError::InvalidData(format!(
+                "Minix read_file on directory: {}",
+                entry.path
+            )));
+        }
+        let inode = self.read_inode(entry.location as u32)?;
+        self.copy_inode_data(&inode, u64::MAX, writer)
     }
 
     fn volume_label(&self) -> Option<&str> {

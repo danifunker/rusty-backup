@@ -92,6 +92,7 @@ Built a 4 MB FAT volume, converted it six ways, ran the oracle on each.
 | HFV | Basilisk II / SheepShaver boot | tier 7 | manual only |
 | cbk | none identified | — | **gap** |
 | AppImage | run it; `--appimage-extract` | Linux | untested |
+| Sun QIC tape (`.qic`, edited) | host `gzip -dc` + `tar` on the rebuilt `tar.Z` / tar sections (`gzip -dc` decodes our compress(1) encoder byte for byte); a Sun-2 / Sun-3 MiSTer core booting the tape | Linux; MiSTer | **host side verified 2026-10-29** on a copy of the SunOS 4.1.1 Sun-3 install tape (edited `root.tar.Z` lists and a 70 KB file returns byte-identical; untouched tape files byte-identical). **Not verified on Sun hardware** - edited test tapes wait on the NAS in `rb-fixtures/to-verify/sun-tape-edit/` |
 
 **Note on fixed VHD.** `qemu-img` reports our fixed VHD as `raw` rather
 than `vpc`. That is most likely qemu's probe scoring — a fixed VHD is raw
@@ -132,6 +133,17 @@ either correct or a defect; do not assume either way.
 | QDOS | `qxltool` | any | same tool that would build the fixture |
 | TI-99 / TR-DOS / Oric / UCSD / MFS / Lisa | niche emulator only | tier 7 | **no structural oracle** |
 | Alto BFS / Pilot-Cedar | ContrAlto / Salto | tier 7 | **no structural oracle** |
+| QNX 2 (ICON / LEXICON) | **real QNX 4.10.01 `chkfsys`** in icon-emu (github.com/danifunker/icon-emu), plus QNX copying files RB wrote | Linux (icon-emu) | **verified 2026-10-28/29, by hand** - "Rebuilt bitmap agrees with existing bitmap" on the 10 MB LEXICON disk, both partitions of a 64 MB disk, an 800 KiB floppy and the head-padded ST-251; RB-written files copied by QNX came back byte-identical. Not wired into the runner: `tier3/edit-qnx2.toml` pins the same operations against RB's own fsck |
+
+### Read-only formats with an independent producer
+
+Formats we only read have no "accept our output" oracle; the independent
+check is a second tool producing the input from a known-good original.
+
+| We read | Independent producer | Status |
+|---------|----------------------|--------|
+| SCP, HFE v1, HFE v3 | Greaseweazle host tools, `gw convert` from a KryoFlux set, an ADF or an Acorn DFS SSD | **verified** - ICON help disk, Amiga ADF and Acorn DFS decode byte-identical to the originals (`tier2/read-flux-scp-hfe.toml`) |
+| MFM reader `.emu` (Intel iSBC 214) | the real ST-251's existing sector dump | **verified** - whole disk byte-identical, every sector ECC-clean |
 
 ---
 

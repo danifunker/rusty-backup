@@ -10,6 +10,20 @@ Trait-based filesystem abstraction for browsing, compaction, resize, and validat
 - **`ntfs.rs`** — NTFS implementation: VBR parsing, MFT record parsing with fixup array handling, data run decoding, version detection (1.0–3.1), directory browsing via B+ tree index entries, `CompactNtfsReader` for bitmap-based compaction, and VBR patching resize.
 - **`exfat.rs`** — exFAT implementation: VBR parsing, directory entry set parsing (File + Stream Extension + File Name entries), allocation bitmap reading, `CompactExfatReader` for compaction, and full resize with bitmap/FAT/VBR/checksum updates.
 - **`mod.rs`** — Factory functions (`open_filesystem`, `compact_partition_reader`, `effective_partition_size`) that route by MBR partition type byte, plus re-exports. Type byte `0x07` is disambiguated by reading the OEM ID magic (`"NTFS    "` vs `"EXFAT   "`).
+- **`qnx2.rs`** - QNX 2 (QNX 2.x, Unisys ICON System Software and QDOS): read **and edit** (create files in 128-block extents as QNX does, mkdir, rename, delete as QNX's `frel`, chmod, chown; directories grow past one block), plus fsck (extent chains, back links, cross-links, entry block counts, bitmap against the blocks files hold, orphaned blocks). Owners surface as `group.member` (`FileEntry.owner_label`), ICON attribute letters (`rwaem` / `rcbm`) as `FileEntry.native_attrs` mapped onto a Unix mode. Deleted entries list on request via `Filesystem::set_show_deleted` as `NAME [deleted]`. The on-disk layout, including the date words (the 4-bit year stops at 1995, so newer dates store as 31-Dec-95; an unset ICON clock reads as 1 January 1980), is in the module's `//!` header. Writes were checked with real QNX 4.10.01 `chkfsys` in icon-emu; see `docs/PLAN-qnx.md`.
+- **`qnx4.rs`** - QNX 4 (read-only). A real QNX 4 boot block starts with an x86 jump and a FAT-like BPB (OEM `QNX4FS`), so both the superfloppy probe and `detect_filesystem_type` check for QNX 4's root entry at block 1 **before** FAT; otherwise real media opens as FAT. Checked on `qnxfs1g.img` (the Linux qnx4fs driver's test volume).
+- **`sun2tape.rs`** / **`sun2tape_edit.rs`** - Sun QIC tape images (`SUN2TAPE` `.qic`). `sun2tape.rs` browses the tape as one tree; `sun2tape_edit::TapeEditor` edits it (add, mkdir, rename, delete, chmod, chown inside tar, `compress(1)`-ed tar and UFS miniroot tape files). A tape has no free space, so like SquashFS every edit rebuilds the whole tape: the new image is written beside the original, the original is renamed to `<name>.bak` (`.bak.1`, ... never overwritten) and the new tape takes its name. Untouched tape files stay byte-identical; tape files themselves are not added, removed or renamed, and the XDR table of contents is copied unchanged. `.Z` sections are recompressed with `macarchive::stuffit_lzw::compress_unix_z`, a compress(1)-compatible encoder. Not yet verified on Sun hardware.
+- **`tar_section.rs`** - An editable tar archive held in memory (a member list), used for the tar sections of a tape. Untouched members keep their exact bytes (SunOS V7 headers included); new or renamed members get V7 headers in the archive's own `./` naming style (names up to 99 bytes); output is padded to 10240-byte records.
+- **`stream_pipe.rs`** - Copies a file between two filesystems without holding it in memory: the source's `write_file_to` runs on a scoped thread feeding a bounded channel of 1 MiB chunks that the target's `create_file` reads. A source error reaches the consumer as an `io::Error`, never a short read. Used by the NTFS / exFAT defrag clones and the HFS and PFS3 clones.
+
+### Streaming extraction (`write_file_to`)
+
+The `Filesystem` trait's default `write_file_to` loads the whole file through
+`read_file`, so a driver without its own override needs RAM equal to the file.
+Drivers that hold large files should stream one block or extent at a time. UFS,
+JFS2, SquashFS, ReiserFS, Minix, QNX 4, QNX 6, ADFS, OS-9, Human68k and QDOS now
+do, with `read_file` running on the same code into a `Vec` (so its output and
+`max_bytes` cut-off are unchanged).
 
 ## Supported Partition Types
 

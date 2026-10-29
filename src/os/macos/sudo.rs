@@ -51,6 +51,7 @@ const SUCCESSFUL_AUTH_MARKER: &str = "AUTHENTICATION_SUCCEEDED";
 /// * `command` - The command and arguments to execute (e.g., `["dd", "if=/dev/disk2", ...]`)
 /// * `preserve_env` - If true, uses `-E` to preserve environment variables
 pub fn sudo_execute(command: &[String], preserve_env: bool) -> Result<bool> {
+    crate::os::ensure_physical_enabled()?;
     // Check if already running as root
     if unsafe { libc::geteuid() } == 0 {
         // Already elevated, run directly
@@ -177,6 +178,7 @@ fn shell_escape(arg: &str) -> String {
 /// elevated privileges. If successful, this function will not return
 /// (the current process will be replaced by the elevated one).
 pub fn request_app_elevation() -> Result<()> {
+    crate::os::ensure_physical_enabled()?;
     // Get the current executable path
     let exe_path = env::current_exe().context("Failed to get current executable path")?;
 

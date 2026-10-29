@@ -73,6 +73,9 @@ pub const DISK_IMAGE_EXTS: &[&str] = &[
     "d81",
     "g64",
     "g71",
+    "scp",
+    "hfe",
+    "emu",
     "d80",
     "d82",
     "atr",
@@ -99,6 +102,8 @@ pub const DISK_IMAGE_EXTS: &[&str] = &[
     "smi",
     // NeXT magneto-optical media, ECC-coded sectors and all.
     "od",
+    // Sun QIC tape images (SUN2TAPE), browsed as a filesystem.
+    "qic",
 ];
 
 /// Extensions that appear in the GUI file-picker dropdown (so a user can
@@ -216,6 +221,8 @@ mod tests {
         // Uppercase duplicates collapse: GHO/gho -> gho, etc.
         assert!(exts.contains(&"gho".to_string()));
         assert!(exts.contains(&"hfv".to_string()));
+        assert!(exts.contains(&"scp".to_string()) && exts.contains(&"hfe".to_string()));
+        assert!(exts.contains(&"emu".to_string()));
         // MOOF (Applesauce Macintosh 3.5" bitstream) is a picker-visible,
         // openable container — guard it against a future extension-list trim.
         assert!(DISK_IMAGE_EXTS.contains(&"moof"));
@@ -238,6 +245,13 @@ mod tests {
         assert!(DISK_IMAGE_EXTS.contains(&"ssd"));
         assert!(DISK_IMAGE_EXTS.contains(&"dsd"));
         assert!(association_exts().contains(&"dsd".to_string()));
+    }
+
+    #[test]
+    fn sun_qic_tape_extension_present() {
+        // A `.qic` tape opens in Inspect and Commander as a filesystem (`fs::sun2tape`).
+        assert!(DISK_IMAGE_EXTS.contains(&"qic"));
+        assert!(association_exts().contains(&"qic".to_string()));
     }
 
     #[test]

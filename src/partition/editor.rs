@@ -210,6 +210,15 @@ pub fn apply_edits(
         PartitionTable::Next(label) => {
             apply_next_edits(file, label, edits, disk_size_bytes, log_cb)
         }
+        PartitionTable::Bsd(_) => {
+            bail!("BSD disk-label editing is not yet implemented (read / browse / back up only)")
+        }
+        PartitionTable::HpuxLvm(_) => {
+            bail!("HP-UX LVM editing is not yet implemented (read / browse / back up only)")
+        }
+        PartitionTable::AixLvm(_) => {
+            bail!("AIX LVM editing is not yet implemented (read / browse / back up only)")
+        }
         PartitionTable::SolarisX86 { mbr, label } => {
             apply_solaris_x86_edits(file, mbr, label, edits, log_cb)
         }

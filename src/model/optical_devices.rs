@@ -109,6 +109,9 @@ impl RipDevice {
 /// All locally-attached optical drives (the same enumeration the GUI's drive
 /// combo and `rb-cli optical drives` use).
 pub fn list_local_rip_devices() -> Vec<RipDevice> {
+    if !crate::os::PHYSICAL_DEVICES_ENABLED {
+        return Vec::new();
+    }
     opticaldiscs::drives::list_drives()
         .into_iter()
         .map(|d| RipDevice {

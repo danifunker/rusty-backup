@@ -107,6 +107,7 @@ pub struct PreflightOk {
 /// - The target is the system disk and `allow_system_disk` is false
 /// - The target has any mounted partition (refuse with mount list)
 pub fn preflight(device_path: &Path, allow_system_disk: bool) -> Result<PreflightOk> {
+    crate::os::ensure_physical_enabled()?;
     if !looks_like_device_path(device_path) {
         // Mount points sneak in as plain file paths. Be strict here:
         // if the user passed --device / used the `write` verb the
@@ -309,6 +310,8 @@ mod tests {
         }
     }
 
+    // A no-physical-devices build refuses before the partition check; see preflight_refuses_every_device.
+    #[cfg(not(feature = "no-physical-devices"))]
     #[test]
     fn preflight_refuses_a_partition_path() {
         // The hole this closes: enumerate_devices lists whole disks only, so a
@@ -320,5 +323,15 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("is a partition"), "unexpected: {msg}");
         assert!(msg.contains("/dev/disk0"), "should name the parent: {msg}");
+    }
+
+    #[cfg(feature = "no-physical-devices")]
+    #[test]
+    fn preflight_refuses_every_device() {
+        let err = preflight(&PathBuf::from("/dev/sdb"), false).err().unwrap();
+        assert!(
+            format!("{err:#}").contains("not available in this build"),
+            "{err:#}"
+        );
     }
 }

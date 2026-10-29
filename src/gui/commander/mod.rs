@@ -269,7 +269,7 @@ impl CommanderMode {
         self.render_host_conflict_modal(ui.ctx());
         self.render_rename_notice(ui.ctx());
 
-        egui::Panel::top("commander_top").show_inside(ui, |ui| {
+        egui::Panel::top("commander_top").show(ui, |ui| {
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 ui.heading("Commander Mode");
@@ -293,7 +293,7 @@ impl CommanderMode {
             ui.add_space(2.0);
         });
 
-        egui::Panel::bottom("commander_bottom").show_inside(ui, |ui| {
+        egui::Panel::bottom("commander_bottom").show(ui, |ui| {
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 ui.label("Status:");
@@ -302,7 +302,7 @@ impl CommanderMode {
             ui.add_space(2.0);
         });
 
-        egui::CentralPanel::default().show_inside(ui, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             let full_h = ui.available_height();
             let full_w = ui.available_width();
             // Wide enough for the middle column's widest control (the "Export

@@ -1,0 +1,157 @@
+# Tier 3 — write to QNX 2 (Unisys ICON / LEXICON) volumes.
+#
+# The writer follows what QNX 4.10.01 itself writes, learned by diffing disks
+# it wrote in icon-emu. Every operation here was also checked against the real
+# QNX `chkfsys` in icon-emu ("Rebuilt bitmap agrees with existing bitmap", no
+# errors), and a file RB wrote was copied by QNX and came back byte-identical.
+# The runner cannot boot QNX, so these cases pin the same operations against
+# our own fsck. See docs/PLAN-qnx.md.
+
+[meta]
+tier = 3
+group = "edit.qnx2"
+description = "Create, grow, rename and delete on QNX 2 floppies and LEXICON hard disks."
+
+[[case]]
+id = "edit.qnx2.lexicon-10mb-hd"
+description = "A 115 KB file goes back as two 128-block extents; mkdir, rename, rm, chmod, chown; fsck clean"
+fixture = "fs.qnx2.lexicon-10mb.hd"
+[[case.step]]
+args = ["get", "{fixture_copy}@1", "/boot/hd_atp_scsi_boot", "{scratch}/big.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["mkdir", "{fixture_copy}@1", "/rbtest"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{fixture_copy}@1", "{scratch}/big.bin", "/rbtest/big.copy"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{fixture_copy}@1", "/rbtest/big.copy", "{scratch}/back.bin"]
+expect_exit = 0
+files_identical = [["{scratch}/big.bin", "{scratch}/back.bin"]]
+[[case.step]]
+args = ["put", "{fixture_copy}@1", "{cases}/tier3/payload.bin", "/rbtest/payload"]
+expect_exit = 0
+[[case.step]]
+args = ["mv", "{fixture_copy}@1", "/rbtest/payload", "/rbtest/renamed"]
+expect_exit = 0
+[[case.step]]
+args = ["chmod", "{fixture_copy}@1", "/rbtest/renamed", "750"]
+expect_exit = 0
+[[case.step]]
+args = ["chown", "{fixture_copy}@1", "/rbtest/renamed", "4:12"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "-o", "{fixture_copy}@1", "/rbtest"]
+expect_exit = 0
+stdout_contains = ["big.copy", "-rwxr-x---", "12.4", "renamed  (owner rwaem group r--e- other -----"]
+[[case.step]]
+args = ["fsck", "--checkonly", "{fixture_copy}@1"]
+expect_exit = 0
+stdout_not_contains = ["WARN", "ERROR"]
+[[case.step]]
+args = ["rm", "-r", "{fixture_copy}@1", "/rbtest"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "--checkonly", "{fixture_copy}@1"]
+expect_exit = 0
+stdout_contains = ["425 files / 20 dirs checked"]
+stdout_not_contains = ["WARN", "ERROR"]
+
+[[case]]
+id = "edit.qnx2.lexicon-64mb-partition2"
+description = "The ICON header names all three partitions QNX 2; partition 2 (types 08) takes writes"
+fixture = "fs.qnx2.lexicon-64mb.hd"
+[[case.step]]
+args = ["inspect", "{fixture_copy}"]
+expect_exit = 0
+stdout_contains = ["QNX 2", "65623", "131158"]
+stdout_not_contains = ["NTFS"]
+[[case.step]]
+args = ["mkdir", "{fixture_copy}@2", "/rbtest"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{fixture_copy}@2", "{cases}/tier3/payload.bin", "/rbtest/payload"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{fixture_copy}@2", "/rbtest/payload", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+[[case.step]]
+args = ["fsck", "--checkonly", "{fixture_copy}@2"]
+expect_exit = 0
+stdout_not_contains = ["WARN", "ERROR"]
+
+[[case]]
+id = "edit.qnx2.icon-help410-floppy"
+description = "Eleven files grow a new directory past its first block (a slot straddles two extents)"
+fixture = "fs.qnx2.icon-help410.floppy"
+[[case.step]]
+args = ["mkdir", "{fixture_copy}", "/many"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{fixture_copy}", "{cases}/tier3/payload.bin", "/many/f01"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{fixture_copy}", "{cases}/tier3/payload.bin", "/many/f02"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{fixture_copy}", "{cases}/tier3/payload.bin", "/many/f03"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{fixture_copy}", "{cases}/tier3/payload.bin", "/many/f04"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{fixture_copy}", "{cases}/tier3/payload.bin", "/many/f05"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{fixture_copy}", "{cases}/tier3/payload.bin", "/many/f06"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{fixture_copy}", "{cases}/tier3/payload.bin", "/many/f07"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{fixture_copy}", "{cases}/tier3/payload.bin", "/many/f08"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{fixture_copy}", "{cases}/tier3/payload.bin", "/many/f09"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{fixture_copy}", "{cases}/tier3/payload.bin", "/many/f10"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{fixture_copy}", "{cases}/tier3/payload.bin", "/many/f11"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{fixture_copy}", "/many"]
+expect_exit = 0
+stdout_contains = ["f01", "f11"]
+[[case.step]]
+args = ["rm", "{fixture_copy}", "/many/f05"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "--checkonly", "{fixture_copy}"]
+expect_exit = 0
+stdout_contains = ["144 files / 5 dirs checked"]
+stdout_not_contains = ["WARN", "ERROR"]
+
+[[case]]
+id = "edit.qnx2.icon4-st251-padded-heads"
+description = "Writes to a padded-head image land on the real heads (checked with QNX chkfsys in icon-emu)"
+fixture = "fs.qnx2.icon4-st251.hd"
+timeout_ms = 300000
+[[case.step]]
+args = ["mkdir", "{fixture_copy}@1", "/rbtest"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{fixture_copy}@1", "{cases}/tier3/payload.bin", "/rbtest/payload"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{fixture_copy}@1", "/rbtest/payload", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+[[case.step]]
+args = ["fsck", "--checkonly", "{fixture_copy}@1"]
+expect_exit = 0
+stdout_contains = ["432 files / 21 dirs checked"]
+stdout_not_contains = ["WARN", "ERROR"]

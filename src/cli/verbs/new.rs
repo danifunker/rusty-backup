@@ -997,7 +997,8 @@ fn write_blank_ucsd_image(image: &std::path::Path, size_str: &str, name: &str) -
     let size = parse_size(size_str).context("parsing --size")?;
     let img = crate::fs::ucsd::create_blank_ucsd(size, name)
         .map_err(|e| anyhow::anyhow!("formatting UCSD p-System: {e}"))?;
-    std::fs::write(image, &img).with_context(|| format!("writing {}", image.display()))?;
+    crate::compat::write_sparse(image, &img)
+        .with_context(|| format!("writing {}", image.display()))?;
     log_stderr(format!(
         "wrote {} ({} bytes, UCSD p-System volume)",
         image.display(),
@@ -1010,7 +1011,8 @@ fn write_blank_trdos_image(image: &std::path::Path, size_str: &str, name: &str) 
     let size = parse_size(size_str).context("parsing --size")?;
     let img = crate::fs::trdos::create_blank_trdos(size, name)
         .map_err(|e| anyhow::anyhow!("formatting TR-DOS: {e}"))?;
-    std::fs::write(image, &img).with_context(|| format!("writing {}", image.display()))?;
+    crate::compat::write_sparse(image, &img)
+        .with_context(|| format!("writing {}", image.display()))?;
     log_stderr(format!(
         "wrote {} ({} bytes, TR-DOS volume)",
         image.display(),
@@ -1023,7 +1025,8 @@ fn write_blank_ti99_image(image: &std::path::Path, size_str: &str, name: &str) -
     let size = parse_size(size_str).context("parsing --size")?;
     let img = crate::fs::ti99::create_blank_ti99(size, name)
         .map_err(|e| anyhow::anyhow!("formatting TI-99: {e}"))?;
-    std::fs::write(image, &img).with_context(|| format!("writing {}", image.display()))?;
+    crate::compat::write_sparse(image, &img)
+        .with_context(|| format!("writing {}", image.display()))?;
     log_stderr(format!(
         "wrote {} ({} bytes, TI-99 volume)",
         image.display(),
@@ -1040,7 +1043,8 @@ fn write_blank_minix_image(
     let size = parse_size(size_str).context("parsing --size")?;
     let img = crate::fs::minix::create_blank_minix(size, version)
         .map_err(|e| anyhow::anyhow!("formatting Minix: {e}"))?;
-    std::fs::write(image, &img).with_context(|| format!("writing {}", image.display()))?;
+    crate::compat::write_sparse(image, &img)
+        .with_context(|| format!("writing {}", image.display()))?;
     log_stderr(format!(
         "wrote {} ({} bytes, Minix {:?})",
         image.display(),
@@ -1070,7 +1074,8 @@ fn format_and_write(
 ) -> Result<()> {
     let size = parse_size(size_str).context("parsing --size")?;
     let bytes = formatter(size, name)?;
-    std::fs::write(image, &bytes).with_context(|| format!("writing {}", image.display()))?;
+    crate::compat::write_sparse(image, &bytes)
+        .with_context(|| format!("writing {}", image.display()))?;
     log_stderr(format!(
         "wrote {} ({} bytes, volume {:?})",
         image.display(),

@@ -90,6 +90,25 @@ fn copy_n_hashed(f: &mut impl Read, w: &mut impl Write, n: u64) -> Result<u32> {
     Ok(hasher.finalize())
 }
 
+/// A writer that passes bytes on while counting them and hashing them with CRC-32.
+struct HashingCounter<'a, W: Write> {
+    inner: &'a mut W,
+    hasher: crc32fast::Hasher,
+    len: u64,
+}
+
+impl<W: Write> Write for HashingCounter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.hasher.update(&buf[..n]);
+        self.len += n as u64;
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 /// Back-patch the CRC field (byte +20) of the chunk header at `chunk_off`.
 fn back_patch_crc(w: &mut (impl Write + Seek), chunk_off: u64, crc: u32) -> Result<()> {
     let end = w.stream_position()?;
@@ -249,19 +268,26 @@ pub fn pack_folder_to_cbk(folder: &Path, out: &Path) -> Result<()> {
                 offsets
             }
             Kind::Raw => {
-                // gzip-wrap the raw file bytes into one member.
-                let raw = fs::read(&path)?;
-                let mut enc = GzEncoder::new(Vec::new(), Compression::default());
-                enc.write_all(&raw)?;
-                let payload = enc.finish()?;
-                let crc = crc32fast::hash(&payload);
-                let len_u32: u32 = payload
-                    .len()
+                // gzip-wrap the raw file into one member, streamed; length and CRC are back-patched.
+                let chunk_off = w.stream_position()?;
+                write_chunk_header(&mut w, logical_id, 0, 0, 0)?;
+                let mut sink = HashingCounter {
+                    inner: &mut w,
+                    hasher: crc32fast::Hasher::new(),
+                    len: 0,
+                };
+                let mut enc = GzEncoder::new(&mut sink, Compression::default());
+                std::io::copy(&mut BufReader::new(File::open(&path)?), &mut enc)?;
+                enc.finish()?;
+                let (crc, len) = (sink.hasher.finalize(), sink.len);
+                let len_u32: u32 = len
                     .try_into()
                     .with_context(|| format!("{name}: payload exceeds 4 GiB chunk limit"))?;
-                let chunk_off = w.stream_position()?;
-                write_chunk_header(&mut w, logical_id, 0, len_u32, crc)?;
-                w.write_all(&payload)?;
+                let end = w.stream_position()?;
+                w.seek(SeekFrom::Start(chunk_off + 16))?;
+                w.write_all(&len_u32.to_be_bytes())?;
+                w.write_all(&crc.to_be_bytes())?;
+                w.seek(SeekFrom::Start(end))?;
                 vec![chunk_off]
             }
         };
@@ -384,6 +410,7 @@ fn read_index(f: &mut File) -> Result<Vec<MemberIn>> {
 
 /// Read one chunk's payload at `offset`, verifying magic + CRC. Returns the
 /// payload bytes.
+#[cfg(test)]
 fn read_chunk_payload(f: &mut File, offset: u64) -> Result<Vec<u8>> {
     f.seek(SeekFrom::Start(offset))?;
     let mut hdr = [0u8; CHUNK_HEADER_LEN];
@@ -419,21 +446,18 @@ pub fn materialize_cbk_to_folder(cbk: &Path, out_folder: &Path) -> Result<()> {
         let mut out = BufWriter::new(
             File::create(&out_path).with_context(|| format!("creating {}", out_path.display()))?,
         );
+        // Streamed chunk by chunk with each CRC checked; chunks run up to 4 GiB.
+        let payload = CbkPayloadReader::over(f.try_clone()?, m.chunk_offsets.clone(), 0);
         match m.kind {
+            // Concatenated payloads ARE the file (a multi-member gzip).
             Kind::Gz => {
-                // Concatenated payloads ARE the file (a multi-member gzip).
-                for &off in &m.chunk_offsets {
-                    let payload = read_chunk_payload(&mut f, off)?;
-                    out.write_all(&payload)?;
-                }
+                let mut payload = payload;
+                std::io::copy(&mut payload, &mut out)
+                    .with_context(|| format!("copying member {}", m.name))?;
             }
+            // File = decompress(concatenated gzip members).
             Kind::Raw => {
-                // File = decompress(concatenated gzip members).
-                let mut concat = Vec::new();
-                for &off in &m.chunk_offsets {
-                    concat.extend_from_slice(&read_chunk_payload(&mut f, off)?);
-                }
-                let mut dec = MultiGzDecoder::new(&concat[..]);
+                let mut dec = MultiGzDecoder::new(payload);
                 std::io::copy(&mut dec, &mut out)
                     .with_context(|| format!("decompressing member {}", m.name))?;
             }
@@ -539,8 +563,10 @@ pub struct CbkPayloadReader {
     file: File,
     chunk_offsets: Vec<u64>,
     next_chunk: usize,
-    buf: Vec<u8>,
-    buf_pos: usize,
+    /// Payload bytes left in the current chunk, and its running and expected CRC.
+    left: u64,
+    hasher: crc32fast::Hasher,
+    want_crc: u32,
 }
 
 impl CbkPayloadReader {
@@ -552,31 +578,78 @@ impl CbkPayloadReader {
     /// that chunk's gzip member (whose decompressed content starts at the chunk's
     /// `src_offset`). Used to seek into a multi-chunk member.
     pub fn open_at(path: &Path, member: &CbkMember, start_chunk: usize) -> Result<Self> {
-        Ok(Self {
-            file: File::open(path)?,
-            chunk_offsets: member.chunk_offsets.clone(),
-            next_chunk: start_chunk.min(member.chunk_offsets.len()),
-            buf: Vec::new(),
-            buf_pos: 0,
-        })
+        Ok(Self::over(
+            File::open(path)?,
+            member.chunk_offsets.clone(),
+            start_chunk,
+        ))
+    }
+
+    fn over(file: File, chunk_offsets: Vec<u64>, start_chunk: usize) -> Self {
+        Self {
+            file,
+            next_chunk: start_chunk.min(chunk_offsets.len()),
+            chunk_offsets,
+            left: 0,
+            hasher: crc32fast::Hasher::new(),
+            want_crc: 0,
+        }
+    }
+
+    /// Seek to the next chunk's payload, checking its header; `false` when none are left.
+    fn start_chunk(&mut self) -> std::io::Result<bool> {
+        let bad = |m: String| std::io::Error::new(std::io::ErrorKind::InvalidData, m);
+        let Some(&off) = self.chunk_offsets.get(self.next_chunk) else {
+            return Ok(false);
+        };
+        self.next_chunk += 1;
+        self.file.seek(SeekFrom::Start(off))?;
+        let mut hdr = [0u8; CHUNK_HEADER_LEN];
+        self.file.read_exact(&mut hdr)?;
+        if read_u32(&hdr, 0) != CHUNK_MAGIC {
+            return Err(bad(format!("cbk: bad chunk magic at offset {off}")));
+        }
+        self.left = u64::from(read_u32(&hdr, 16));
+        self.want_crc = read_u32(&hdr, 20);
+        self.hasher = crc32fast::Hasher::new();
+        if self.left == 0 {
+            self.finish_chunk()?;
+        }
+        Ok(true)
+    }
+
+    fn finish_chunk(&mut self) -> std::io::Result<()> {
+        let got = std::mem::replace(&mut self.hasher, crc32fast::Hasher::new()).finalize();
+        if got != self.want_crc {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "cbk: chunk CRC mismatch (corrupt container)",
+            ));
+        }
+        Ok(())
     }
 }
 
 impl Read for CbkPayloadReader {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
-        while self.buf_pos >= self.buf.len() {
-            if self.next_chunk >= self.chunk_offsets.len() {
-                return Ok(0); // all chunks consumed
+        while self.left == 0 {
+            if !self.start_chunk()? {
+                return Ok(0);
             }
-            let off = self.chunk_offsets[self.next_chunk];
-            self.next_chunk += 1;
-            self.buf = read_chunk_payload(&mut self.file, off)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-            self.buf_pos = 0;
         }
-        let n = (self.buf.len() - self.buf_pos).min(out.len());
-        out[..n].copy_from_slice(&self.buf[self.buf_pos..self.buf_pos + n]);
-        self.buf_pos += n;
+        let want = (out.len() as u64).min(self.left) as usize;
+        let n = self.file.read(&mut out[..want])?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "cbk: chunk payload cut short",
+            ));
+        }
+        self.hasher.update(&out[..n]);
+        self.left -= n as u64;
+        if self.left == 0 {
+            self.finish_chunk()?;
+        }
         Ok(n)
     }
 }

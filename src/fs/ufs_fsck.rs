@@ -41,8 +41,8 @@ use super::fsck::{FsckIssue, FsckResult, FsckStats, OrphanedEntry};
 use super::ufs::{
     read_dirent_namlen, read_i32, read_i64, read_u32, read_u64, UfsFilesystem, UfsVersion,
     CG_MAGIC, CG_OFF_CGX, CG_OFF_FREEOFF, CG_OFF_MAGIC, CG_OFF_NDBLK, CG_OFF_NEXTFREEOFF,
-    DIRENT_HDR_LEN, MAGIC_OFF, MAGIC_UFS1, MAGIC_UFS2, OFF_BSIZE, OFF_CBLKNO, OFF_FPG, OFF_FRAG,
-    OFF_FSIZE, OFF_IBLKNO, OFF_IPG, OFF_NCG, OFF_OLD_SIZE, OFF_SBLKNO, OFF_SIZE_UFS2, ROOT_INODE,
+    DIRENT_HDR_LEN, MAGIC_OFF, MAGIC_UFS2, OFF_BSIZE, OFF_CBLKNO, OFF_FPG, OFF_FRAG, OFF_FSIZE,
+    OFF_IBLKNO, OFF_IPG, OFF_NCG, OFF_OLD_SIZE, OFF_SBLKNO, OFF_SIZE_UFS2, ROOT_INODE,
 };
 use super::unix_common::bitmap::BitmapReader;
 use super::unix_common::inode::{unix_file_type, UnixFileType};
@@ -127,6 +127,13 @@ pub fn fsck_ufs<R: Read + Seek + Send>(
 
     // ----- 1. Geometry re-validation -----
     check_geometry(fs, &mut b);
+    // FreeBSD's metadata check-hashes; a mismatch makes its kernel refuse the block.
+    for what in fs.check_hash_mismatches()? {
+        b.err(
+            "CheckHashMismatch",
+            format!("{what} does not match its contents"),
+        );
+    }
 
     // ----- 2. Per-CG header + replica SB + bitmap collection -----
     // Holding every CG's bitmap in memory simultaneously is fine for the
@@ -326,7 +333,7 @@ fn compare_replica<R: Read + Seek + Send>(
     // so we report and stop.
     let magic = read_u32(replica, MAGIC_OFF, endian);
     let expected_magic = match version {
-        UfsVersion::Ufs1 => MAGIC_UFS1,
+        UfsVersion::Ufs1 => fs.magic,
         UfsVersion::Ufs2 => MAGIC_UFS2,
     };
     if magic != expected_magic {

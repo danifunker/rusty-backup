@@ -172,6 +172,8 @@ pub fn unix_entry_from_inode(
         finder_flags: None,
         prodos_file_type: None,
         mac_dates: None,
+        owner_label: None,
+        native_attrs: None,
     }
 }
 

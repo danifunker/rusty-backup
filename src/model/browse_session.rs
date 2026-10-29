@@ -15,7 +15,7 @@
 //! Extracted from `gui/browse_view.rs` per §5 of `docs/codecleanup.md`.
 
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, Read as _};
+use std::io::Read as _;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -242,10 +242,12 @@ impl BrowseSession {
         // Dwarf Draco 6085 ".zdisk"/".zdelta" is a zlib stream (a Pilot pack);
         // gate the full read on the zlib magic byte, then confirm by inflating
         // the prefix to the DAAD signature so we don't slurp unrelated files.
-        let zdisk_bytes = if magic[0] == 0x78 {
-            std::fs::read(path)
-                .ok()
-                .filter(|b| crate::fs::alto::zdisk::is_zdisk(b))
+        // is_zdisk inflates only a 2-byte prefix, so a 64 KiB head decides; read whole only on a match.
+        let zdisk_bytes = if magic[0] == 0x78
+            && crate::compat::read_head(path, 64 * 1024)
+                .is_ok_and(|h| crate::fs::alto::zdisk::is_zdisk(&h))
+        {
+            std::fs::read(path).ok()
         } else {
             None
         };
@@ -515,8 +517,9 @@ impl BrowseSession {
                 )
             }
             _ => {
-                let file = File::open(path).map_err(FilesystemError::Io)?;
-                let reader = BufReader::new(file);
+                // Plain images, including an ICON drive imaged with padding heads.
+                let reader = crate::model::source_reader::open_plain_raw(path)
+                    .map_err(|e| FilesystemError::Io(crate::compat::io_other(format!("{e:#}"))))?;
                 fs::open_filesystem_with_passphrase(
                     reader,
                     self.partition_offset,
@@ -705,9 +708,8 @@ impl BrowseSession {
                 .unwrap_or(false);
             // Dwarf Draco 6085 ".zdisk" (a Pilot pack); see open() for the gating.
             let is_zdisk = magic[0] == 0x78
-                && std::fs::read(path)
-                    .map(|b| crate::fs::alto::zdisk::is_zdisk(&b))
-                    .unwrap_or(false);
+                && crate::compat::read_head(path, 64 * 1024)
+                    .is_ok_and(|h| crate::fs::alto::zdisk::is_zdisk(&h));
             if &magic == b"PARCDISK"
                 || magic[0..6] == [0x00, 0x07, 0x00, 0x03, 0x00, 0x0a]
                 || is_salto_dsk

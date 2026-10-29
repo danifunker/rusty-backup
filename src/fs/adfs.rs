@@ -1283,6 +1283,31 @@ impl<R: Read + Seek + Send> AdfsFilesystem<R> {
             orphaned_entries: Vec::new(),
         })
     }
+
+    /// Stream up to `min(size, max_bytes)` bytes of `indaddr` into `w`, a sector at a time.
+    fn copy_file_data(
+        &mut self,
+        indaddr: u32,
+        size: u64,
+        max_bytes: u64,
+        w: &mut dyn Write,
+    ) -> Result<u64, FilesystemError> {
+        let total = size.min(max_bytes);
+        let sector_size = self.disc_record.sector_size() as u64;
+        let mut buf = vec![0u8; sector_size as usize];
+        let mut done = 0u64;
+        let mut block_idx: u64 = 0;
+        while done < total {
+            let byte_off = self.resolve_byte(indaddr, block_idx)?;
+            self.reader.seek(SeekFrom::Start(byte_off))?;
+            let take = sector_size.min(total - done) as usize;
+            self.reader.read_exact(&mut buf[..take])?;
+            w.write_all(&buf[..take])?;
+            done += take as u64;
+            block_idx += 1;
+        }
+        Ok(done)
+    }
 }
 
 /// RISC OS reserves these as path, wildcard, and system-variable syntax.
@@ -1360,23 +1385,18 @@ impl<R: Read + Seek + Send> Filesystem for AdfsFilesystem<R> {
         entry: &FileEntry,
         max_bytes: usize,
     ) -> Result<Vec<u8>, FilesystemError> {
-        let indaddr = entry.location as u32;
         let want = (entry.size as usize).min(max_bytes);
-        let sector_size = self.disc_record.sector_size() as usize;
         let mut out = Vec::with_capacity(want);
-        let mut remaining = want;
-        let mut block_idx: u64 = 0;
-        while remaining > 0 {
-            let byte_off = self.resolve_byte(indaddr, block_idx)?;
-            self.reader.seek(SeekFrom::Start(byte_off))?;
-            let take = remaining.min(sector_size);
-            let mut buf = vec![0u8; take];
-            self.reader.read_exact(&mut buf)?;
-            out.extend_from_slice(&buf);
-            remaining -= take;
-            block_idx += 1;
-        }
+        self.copy_file_data(entry.location as u32, entry.size, want as u64, &mut out)?;
         Ok(out)
+    }
+
+    fn write_file_to(
+        &mut self,
+        entry: &FileEntry,
+        writer: &mut dyn Write,
+    ) -> Result<u64, FilesystemError> {
+        self.copy_file_data(entry.location as u32, entry.size, u64::MAX, writer)
     }
 
     fn validate_name(&self, name: &str) -> Result<(), FilesystemError> {

@@ -1215,6 +1215,48 @@ fn run_backup_inner(
                 bail!("{}", LABEL_BACKUP_NEEDS_CHD);
             }
         }
+        PartitionTable::AixLvm(lvm) => {
+            let json = serde_json::to_string_pretty(lvm)
+                .context("failed to serialize AIX LVM layout to JSON")?;
+            std::fs::write(backup_folder.join("aix_lvm.json"), json)
+                .context("failed to write aix_lvm.json")?;
+            log(
+                &progress,
+                LogLevel::Info,
+                "Exported AIX LVM layout (aix_lvm.json)",
+            );
+            if !single_file_chd_planned {
+                bail!("{}", LABEL_BACKUP_NEEDS_CHD);
+            }
+        }
+        PartitionTable::HpuxLvm(lvm) => {
+            let json = serde_json::to_string_pretty(lvm)
+                .context("failed to serialize HP-UX LVM layout to JSON")?;
+            std::fs::write(backup_folder.join("hpux_lvm.json"), json)
+                .context("failed to write hpux_lvm.json")?;
+            log(
+                &progress,
+                LogLevel::Info,
+                "Exported HP-UX LVM layout (hpux_lvm.json)",
+            );
+            if !single_file_chd_planned {
+                bail!("{}", LABEL_BACKUP_NEEDS_CHD);
+            }
+        }
+        PartitionTable::Bsd(label) => {
+            let json = serde_json::to_string_pretty(label)
+                .context("failed to serialize BSD disk label to JSON")?;
+            std::fs::write(backup_folder.join("bsd.json"), json)
+                .context("failed to write bsd.json")?;
+            log(
+                &progress,
+                LogLevel::Info,
+                "Exported BSD disk label (bsd.json)",
+            );
+            if !single_file_chd_planned {
+                bail!("{}", LABEL_BACKUP_NEEDS_CHD);
+            }
+        }
         PartitionTable::Next(label) => {
             let json = serde_json::to_string_pretty(label)
                 .context("failed to serialize NeXT disk label to JSON")?;

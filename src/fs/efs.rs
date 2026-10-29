@@ -1658,6 +1658,8 @@ fn entry_from_inode(name: &str, parent_path: &str, ino: &EfsInode) -> FileEntry 
         finder_flags: None,
         prodos_file_type: None,
         mac_dates: None,
+        owner_label: None,
+        native_attrs: None,
     }
 }
 
@@ -2267,6 +2269,8 @@ fn adopt_orphans_into_lost_found<R: Read + Write + Seek + Send>(
                 finder_flags: None,
                 prodos_file_type: None,
                 mac_dates: None,
+                owner_label: None,
+                native_attrs: None,
             };
             let lf = fs.create_directory(
                 &root_entry,
@@ -2476,6 +2480,8 @@ impl<R: Read + Seek + Send> Filesystem for EfsFilesystem<R> {
             finder_flags: None,
             prodos_file_type: None,
             mac_dates: None,
+            owner_label: None,
+            native_attrs: None,
         })
     }
 

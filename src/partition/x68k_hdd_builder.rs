@@ -499,10 +499,16 @@ pub fn build_x68k_hdd(
     disk[..boot_block.len()].copy_from_slice(&boot_block);
     for (idx, body) in partition_bodies.iter().enumerate() {
         let part_off = (part_start_byte + (idx as u64) * per_partition_bytes) as usize;
-        disk[part_off..part_off + body.len()].copy_from_slice(body);
+        // `disk` starts zeroed; copying only non-zero pieces keeps its untouched pages unbacked.
+        for (k, piece) in body.chunks(64 * 1024).enumerate() {
+            if piece.iter().any(|&b| b != 0) {
+                let at = part_off + k * 64 * 1024;
+                disk[at..at + piece.len()].copy_from_slice(piece);
+            }
+        }
     }
 
-    std::fs::write(out_path, &disk)
+    crate::compat::write_sparse(out_path, &disk)
         .map_err(|e| anyhow::anyhow!("write {}: {e}", out_path.display()))?;
 
     Ok(BuildSummary {
@@ -561,7 +567,12 @@ pub fn extract_partition_boot_sector(
     donor_path: &Path,
     variant: HddVariant,
 ) -> anyhow::Result<Vec<u8>> {
-    let donor_bytes = std::fs::read(donor_path)
+    // Only the signature, the table (ends by 0x9000) and one boot sector are needed: never read a
+    // ~100 MB donor HDD whole.
+    let donor_len = std::fs::metadata(donor_path)
+        .map_err(|e| anyhow::anyhow!("read boot-sector donor {}: {e}", donor_path.display()))?
+        .len() as usize;
+    let donor_bytes = crate::compat::read_head(donor_path, 64 * 1024)
         .map_err(|e| anyhow::anyhow!("read boot-sector donor {}: {e}", donor_path.display()))?;
 
     let (table_offset, sector_size, expected_min_bytes, sig_hint) = match variant {
@@ -573,16 +584,16 @@ pub fn extract_partition_boot_sector(
     // (e.g. via `hero_soft_boot.bin` or similar). Detect by exact-size
     // match + `0x60` BRA at byte 0, and skip the signature / table /
     // partition lookup since the bytes ARE already the sector we want.
-    if donor_bytes.len() == sector_size as usize && donor_bytes[0] == 0x60 {
+    if donor_len == sector_size as usize && donor_bytes[0] == 0x60 {
         return validate_and_return_naked_sector(donor_bytes, donor_path, variant);
     }
     anyhow::ensure!(
-        donor_bytes.len() >= expected_min_bytes,
+        donor_len >= expected_min_bytes,
         "donor {} is too small ({} bytes) — expected at least {} to cover \
          the signature header, X68K table at byte 0x{:x}, and the first \
          partition sector",
         donor_path.display(),
-        donor_bytes.len(),
+        donor_len,
         expected_min_bytes,
         table_offset,
     );
@@ -652,15 +663,20 @@ pub fn extract_partition_boot_sector(
     let sector_size_usize = sector_size as usize;
     let part_byte_offset = human68k_entry.start_sector as usize * sector_size_usize;
     anyhow::ensure!(
-        part_byte_offset + sector_size_usize <= donor_bytes.len(),
+        part_byte_offset + sector_size_usize <= donor_len,
         "Human68k partition at sector {} would read past end of donor {} ({} bytes)",
         human68k_entry.start_sector,
         donor_path.display(),
-        donor_bytes.len(),
+        donor_len,
     );
 
     let mut sector = vec![0u8; sector_size_usize];
-    sector.copy_from_slice(&donor_bytes[part_byte_offset..part_byte_offset + sector_size_usize]);
+    {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = std::fs::File::open(donor_path)?;
+        f.seek(SeekFrom::Start(part_byte_offset as u64))?;
+        f.read_exact(&mut sector)?;
+    }
 
     // Sanity-check the extracted sector: byte 0 should be 0x60 (BRA.S
     // over the BPB, both Sharp/KG and Hudson formats use this).

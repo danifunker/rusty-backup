@@ -19,6 +19,7 @@
 //! Passing `inside = Some(name)` overrides the heuristic and selects the
 //! named entry (exact, then case-insensitive, then basename match).
 
+use crate::compat::ZipEntryName as _;
 use std::fs::File;
 use std::io::{self, Read, Seek, Write};
 use std::path::Path;
@@ -130,12 +131,12 @@ fn collect_entries<R: Read + Seek>(archive: &mut zip::ZipArchive<R>) -> Vec<Entr
             // Drop AppleDouble stubs at collection so the single-entry fallback
             // and the "Entries:" listing both ignore them, not just the
             // disk-image filter.
-            if e.is_dir() || is_apple_double(e.name()) {
+            if e.is_dir() || is_apple_double(&e.entry_name()) {
                 continue;
             }
             out.push(EntryInfo {
                 index: i,
-                name: e.name().to_string(),
+                name: e.entry_name(),
                 size: e.size(),
             });
         }
@@ -237,7 +238,7 @@ impl ZipDiskReader {
 
         let (encrypted, raw_name) = {
             let e = archive.by_index_raw(idx)?;
-            (e.encrypted(), e.name().to_string())
+            (e.encrypted(), e.entry_name())
         };
         if encrypted && password.is_none() {
             bail!(
@@ -259,14 +260,14 @@ impl ZipDiskReader {
             let mut entry = archive
                 .by_index_decrypt(idx, pw)
                 .map_err(|e| anyhow!("decrypting ZIP entry \"{raw_name}\": {e}"))?;
-            let name = entry.name().to_string();
+            let name = entry.entry_name();
             let size = entry.size();
             sparse_copy(&mut entry, temp.as_file_mut())
                 .with_context(|| format!("inflating ZIP entry \"{name}\""))?;
             (name, size)
         } else {
             let mut entry = archive.by_index(idx)?;
-            let name = entry.name().to_string();
+            let name = entry.entry_name();
             let size = entry.size();
             sparse_copy(&mut entry, temp.as_file_mut())
                 .with_context(|| format!("inflating ZIP entry \"{name}\""))?;

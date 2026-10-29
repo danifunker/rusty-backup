@@ -428,6 +428,15 @@ impl InspectTab {
         self.clear_results();
     }
 
+    /// Inspect an image copied out of the browsed volume; kept out of the recents, it's a temp file.
+    fn load_nested_image(&mut self, path: PathBuf, guard: tempfile::TempDir) {
+        self.selected_device_idx = None;
+        self.backup_folder_path = None;
+        self.image_file_path = Some(path);
+        self.amiga_tempdir = Some(guard);
+        self.clear_results();
+    }
+
     /// Drop this tab's in-memory recent-files mirror. Called when the Settings
     /// dialog clears the persisted lists (config is the source of truth; the
     /// mirror otherwise only reloads at construction).
@@ -648,12 +657,39 @@ impl InspectTab {
         // it is actually true - once elevated there is nothing to warn about.
         // Disk *images* are ordinary files and are unaffected, which is why
         // this names devices specifically rather than warning about everything.
-        if !rusty_backup::os::is_elevated() {
+        if rusty_backup::os::PHYSICAL_DEVICES_ENABLED && !rusty_backup::os::is_elevated() {
             ui.add_space(2.0);
             ui.label(
                 egui::RichText::new(super::unelevated_device_note())
                     .color(super::theme::warning(ui.visuals())),
             );
+        }
+
+        // A flux image decodes with unreadable sectors zero-filled; name them next to the picker.
+        if let Some(report) = self
+            .image_file_path
+            .as_deref()
+            .and_then(rusty_backup::rbformats::flux::recorded_faults)
+        {
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new(format!(
+                    "Warning: flux decode: {}. Files using these sectors are damaged.",
+                    report.summary
+                ))
+                .color(super::theme::warning(ui.visuals())),
+            );
+            egui::CollapsingHeader::new(format!("Unreadable sectors ({})", report.sectors.len()))
+                .id_salt("flux_faults")
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .max_height(160.0)
+                        .show(ui, |ui| {
+                            for line in &report.sectors {
+                                ui.label(line);
+                            }
+                        });
+                });
         }
 
         ui.add_space(4.0);
@@ -1152,6 +1188,11 @@ impl InspectTab {
         if self.browse_view.is_active() {
             //ui.add_space(4.0);
             self.browse_view.show(ui);
+        }
+        if let Some((path, guard)) = self.browse_view.take_nested_open() {
+            ctx.log
+                .info(format!("Inspecting {} as a disk image", path.display()));
+            self.load_nested_image(path, guard);
         }
     }
 

@@ -1160,6 +1160,7 @@ fn drain_stderr_pipe(fd: libc::c_int) -> String {
 /// auth dialog when needed. If already running as root it returns the fd
 /// immediately without any dialog.
 fn authopen_device(path: &str, flags: libc::c_int) -> Result<File> {
+    super::ensure_physical_enabled()?;
     if let Some(reason) = authopen_blocked_reason() {
         bail!("not using authopen: {reason}");
     }

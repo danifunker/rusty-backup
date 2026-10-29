@@ -172,6 +172,23 @@ rediscovered.
   only the cue/bin half is pinned.
 - **A donor Mac volume with a blessed System Folder**, so
   `make-bootable` has a positive case rather than only the diagnostic one.
+- **Real QNX 4 and QNX 6 volumes** made by QNX 4.25 / 6.5 / 7 under QEMU.
+  QNX 4 has one real fixture (`fs.qnx4.qnxfs1g.hd`, the Linux driver's test
+  volume); QNX 6 is tested on synthetic volumes only. Both are read-only
+  until real media can check writes.
+- **A GCR flux capture** (Apple or Commodore). The flux layer decodes IBM MFM,
+  IBM FM and AmigaDOS MFM only; GCR from flux is not implemented, so the
+  fixture would wait on code.
+
+**Not yet verified on hardware**
+
+- **Sun QIC tape edits** (`tier3/edit-sun-tapes.toml`). Host `gzip` / `tar`
+  read the rebuilt sections, but no Sun-2 / Sun-3 MiSTer core has booted an
+  edited tape yet. The test tapes are on the NAS in
+  `rb-fixtures/to-verify/sun-tape-edit/`.
+- **QNX 2 writes** are verified against real QNX `chkfsys` in icon-emu, but
+  by hand: the runner cannot boot QNX, so `tier3/edit-qnx2.toml` asserts
+  against RB's own fsck.
 
 **Verbs**
 

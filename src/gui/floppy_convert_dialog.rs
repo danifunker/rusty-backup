@@ -116,16 +116,17 @@ impl FloppyConvertDialog {
 
     fn set_source(&mut self, path: PathBuf) {
         // Detect the container kind by reading the first 256 bytes + extension.
-        let bytes = match std::fs::read(&path) {
+        let head = match rusty_backup::compat::read_head(&path, 256) {
             Ok(b) => b,
             Err(e) => {
                 self.source_error = Some(format!("Cannot read source: {e}"));
                 return;
             }
         };
-        let head = &bytes[..bytes.len().min(256)];
-        let kind = rusty_backup::rbformats::containers::detect_container_kind(head, Some(&path));
-        if !rusty_backup::rbformats::containers::is_floppy_container(kind) {
+        let kind = rusty_backup::rbformats::containers::detect_container_kind(&head, Some(&path));
+        let too_big = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
+            > rusty_backup::rbformats::containers::FLOPPY_CONTAINER_MAX;
+        if !rusty_backup::rbformats::containers::is_floppy_container(kind) || too_big {
             self.source_error = Some(format!(
                 "{} is not a recognised floppy container (detected: {})",
                 path.display(),

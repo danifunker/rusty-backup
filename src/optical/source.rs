@@ -88,6 +88,7 @@ impl LocalCdReader {
     /// claim (or is only probing whether this reader can drive the medium at
     /// all). Attach the claim afterwards with [`Self::set_claim`].
     pub fn with_retry_unclaimed(device_path: &str, retry: RetryConfig) -> Result<Self> {
+        crate::os::ensure_physical_enabled()?;
         let inner = match CdReader::open_path(device_path) {
             Ok(inner) => inner,
             Err(e) => open_elevated_or_fail(device_path, e)?,
@@ -240,6 +241,7 @@ pub use remote_source::RemoteCdReader;
 
 /// Eject the disc from the drive at `path` (OS-specific shell-out).
 pub fn eject_disc(path: &Path) -> Result<()> {
+    crate::os::ensure_physical_enabled()?;
     #[cfg(target_os = "linux")]
     {
         let status = std::process::Command::new("eject")
@@ -329,6 +331,7 @@ impl PhysicalDiscSource {
     /// Open without taking exclusive use, for a caller that already holds the
     /// claim. Attach it afterwards with [`Self::set_claim`].
     pub fn open_unclaimed(device_path: &str) -> Result<Self> {
+        crate::os::ensure_physical_enabled()?;
         let disc = opticaldiscs::physical::PhysicalDisc::open(device_path)
             .with_context(|| format!("Failed to open disc in {device_path}"))?;
 

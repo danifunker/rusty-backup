@@ -1,0 +1,196 @@
+# Tier 2 — QNX 2 volumes: Unisys ICON floppies (York University archive).
+#
+# All 34 QNX 2 images in the archive export to tar without an error (2498
+# entries). These four cover a multi-extent directory, a text file read across
+# its extent, a boot disk whose root sits past the boot loader, and a disk
+# imaged with bad sectors.
+
+[meta]
+tier = 2
+group = "fs.read.qnx2"
+description = "Detect, list and extract QNX 2 (Unisys ICON) volumes, and real QNX 4 media."
+
+[[case]]
+id = "read.qnx2.icon-sys410-disk1"
+description = "System disk: QNX2 detected; /cmds spans six extents (52 entries)"
+fixture = "fs.qnx2.icon-sys410-disk1.floppy"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["QNX2", "800.0 KiB"]
+[[case.step]]
+args = ["ls", "{fixture}", "/cmds"]
+expect_exit = 0
+stdout_contains = ["chkfsys", "backup", "dcheck"]
+[[case.step]]
+args = ["ls", "{fixture}", "/"]
+expect_exit = 0
+stdout_contains = ["4494             QNX_1", "200             bitmap"]
+
+[[case]]
+id = "read.qnx2.icon-help410"
+description = "Help disk: a shell script reads whole"
+fixture = "fs.qnx2.icon-help410.floppy"
+[[case.step]]
+args = ["get", "{fixture}", "/HELP_1", "{scratch}/HELP_1"]
+expect_exit = 0
+[[case.step]]
+args = ["tar", "{fixture}", "/", "{scratch}/all.tar"]
+expect_exit = 0
+
+[[case]]
+id = "read.qnx2.icon-fsboot410"
+description = "Fileserver boot disk: root at block 12"
+fixture = "fs.qnx2.icon-fsboot410.floppy"
+[[case.step]]
+args = ["tar", "{fixture}", "/", "{scratch}/all.tar"]
+expect_exit = 0
+
+[[case]]
+id = "read.qnx2.icon-watcom-basic-badsec"
+description = "Bad-sector image still lists and exports"
+fixture = "fs.qnx2.icon-watcom-basic-badsec.floppy"
+[[case.step]]
+args = ["tar", "{fixture}", "/", "{scratch}/all.tar"]
+expect_exit = 0
+
+[[case]]
+id = "read.qnx2.icon-help410-attrs"
+description = "Owner as group.member, ICON attribute letters, and dates in tar"
+fixture = "fs.qnx2.icon-help410.floppy"
+[[case.step]]
+args = ["ls", "-o", "{fixture}", "/"]
+expect_exit = 0
+stdout_contains = ["255.255", "HELP_1  (owner r--em group ----- other -----; modified)", "help  (owner rc-m group r--- other r---"]
+
+[[case]]
+id = "read.qnx2.icon-help410-deleted"
+description = "Deleted entries list only on request and are named NAME [deleted]"
+fixture = "fs.qnx2.icon-help410.floppy"
+[[case.step]]
+args = ["ls", "{fixture}", "/help/qnx"]
+expect_exit = 0
+stdout_not_contains = ["[deleted]"]
+[[case.step]]
+args = ["ls", "--deleted", "{fixture}", "/help/qnx"]
+expect_exit = 0
+stdout_contains = ["rename [deleted]", "src [deleted]"]
+
+[[case]]
+id = "read.qnx2.icon-help410-rs-to-lf"
+description = "get --rs-to-lf turns RS line separators into LF"
+fixture = "fs.qnx2.icon-help410.floppy"
+[[case.step]]
+args = ["get", "--rs-to-lf", "{fixture}", "/help/qnx/chattr", "{scratch}/chattr.txt"]
+expect_exit = 0
+file_sha256 = [{ path = "{scratch}/chattr.txt", sha256 = "ec54c533bf4b90c6901f2ffa2c720c1b3fc17829be4a7bce84b9fe7edde555c0" }]
+
+[[case]]
+id = "read.qnx2.icon-help410-fsck"
+description = "A clean ICON disk passes the QNX 2 check"
+fixture = "fs.qnx2.icon-help410.floppy"
+[[case.step]]
+args = ["fsck", "--checkonly", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["134 files / 4 dirs checked"]
+stdout_not_contains = ["WARN", "ERROR"]
+
+[[case]]
+id = "read.qnx2.icon-watcom-basic-badsec-fsck"
+description = "fsck names the two files lost to bad sectors and their 303 orphaned blocks"
+fixture = "fs.qnx2.icon-watcom-basic-badsec.floppy"
+[[case.step]]
+args = ["fsck", "--checkonly", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["/util/basic.qnx: entry says 196 blocks", "/util/gks: entry says 109 blocks", "303 blocks are marked in use but no file holds them: 286-480, 646-753"]
+
+[[case]]
+id = "read.qnx2.lexicon-10mb-hd"
+description = "LEXICON 10 MB hard disk: the 1-based type-0x07 start is corrected to LBA 29"
+fixture = "fs.qnx2.lexicon-10mb.hd"
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["29"]
+[[case.step]]
+args = ["show", "fs-info", "{fixture}@1"]
+expect_exit = 0
+stdout_contains = ["QNX 2"]
+[[case.step]]
+args = ["ls", "{fixture}@1", "/sys"]
+expect_exit = 0
+stdout_contains = ["icon2_emul", "env_mgr"]
+[[case.step]]
+args = ["fsck", "--checkonly", "{fixture}@1"]
+expect_exit = 0
+stdout_contains = ["425 files / 20 dirs checked"]
+stdout_not_contains = ["WARN", "ERROR"]
+[[case.step]]
+args = ["tar", "{fixture}@1", "/", "{scratch}/all.tar"]
+expect_exit = 0
+file_sha256 = [{ path = "{scratch}/all.tar", sha256 = "800f1d0fc039bc69b00697e77ec2ba6b20ef2aa82b5d7f0cc5ced93c78428945" }]
+
+[[case]]
+id = "read.qnx4.qnxfs1g"
+description = "Real QNX 4 media: its FAT-like boot block must not be taken for FAT; readdir hides busy and unused entries"
+fixture = "fs.qnx4.qnxfs1g.hd"
+timeout_ms = 300000
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["QNX4"]
+stdout_not_contains = ["FAT"]
+[[case.step]]
+args = ["ls", "{fixture}", "/"]
+expect_exit = 0
+stdout_contains = ["253016             .bitmap", ".inodes", ".boot", ".altboot"]
+stdout_not_contains = ["tmp", "lost+found"]
+
+[[case]]
+id = "read.qnx2.icon4-st251-real-hd"
+description = "A real LEXICON ST-251 read with padding heads: geometry undone, partition 2 reported blank, clock-unset dates are 1980"
+fixture = "fs.qnx2.icon4-st251.hd"
+timeout_ms = 300000
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["59", "65594", "QNX 2 (not formatted)"]
+[[case.step]]
+args = ["fsck", "--checkonly", "{fixture}@1"]
+expect_exit = 0
+stdout_contains = ["431 files / 20 dirs checked"]
+stdout_not_contains = ["WARN", "ERROR"]
+[[case.step]]
+args = ["ls", "{fixture}@1", "/"]
+expect_exit = 0
+stdout_contains = ["QNX_1", "QNX_5", "convert_4.02", "package"]
+[[case.step]]
+args = ["ls", "{fixture}@2", "/"]
+expect_exit = 1
+stderr_contains = ["never been formatted"]
+[[case.step]]
+args = ["tar", "{fixture}@1", "/", "{scratch}/all.tar"]
+expect_exit = 0
+file_sha256 = [{ path = "{scratch}/all.tar", sha256 = "2e6b7ab29c9a75734e6630a63e4c95dcb9c67471fc50f90ef2b1d2e676b0c3e4" }]
+
+[[case]]
+id = "read.qnx2.icon4-st251-emu-flux"
+description = "The same ST-251 from its MFM reader capture (.emu, Intel iSBC 214): decodes byte-identical to the sector dump"
+fixture = "flux.emu.icon4-st251.hd"
+timeout_ms = 600000
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["59", "QNX 2 (not formatted)"]
+stderr_not_contains = ["unreadable"]
+[[case.step]]
+args = ["tar", "{fixture}@1", "/", "{scratch}/all.tar"]
+expect_exit = 0
+file_sha256 = [{ path = "{scratch}/all.tar", sha256 = "2e6b7ab29c9a75734e6630a63e4c95dcb9c67471fc50f90ef2b1d2e676b0c3e4" }]
+[[case.step]]
+args = ["convert", "{fixture}", "{scratch}/disk", "--format", "raw"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "--checkonly", "{scratch}/disk/flux.emu.icon4-st251.hd.img@1"]
+expect_exit = 0
+stdout_contains = ["431 files / 20 dirs checked"]

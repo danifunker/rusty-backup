@@ -236,7 +236,7 @@ fn show_edit_existing(
                             size_editable,
                             egui::TextEdit::singleline(&mut editor.entries[i].size_text)
                                 .desired_width(80.0)
-                                .id(egui::Id::new(&size_id)),
+                                .id(egui::Id::unique(&size_id)),
                         );
 
                         // MBR gets a checkbox, RDB explicit radios so the choice
@@ -478,7 +478,7 @@ fn show_build_new(ui: &mut egui::Ui, builder: &mut DiskBuilder, allow_apply: boo
                         ui.add(
                             egui::TextEdit::singleline(&mut builder.rows[i].size_text)
                                 .desired_width(80.0)
-                                .id(egui::Id::new(format!("bld_size_{}", i))),
+                                .id(egui::Id::unique(format!("bld_size_{}", i))),
                         )
                         .on_hover_text(
                             "20M / 1G / a plain byte count, or `rest` for whatever \
@@ -496,7 +496,7 @@ fn show_build_new(ui: &mut egui::Ui, builder: &mut DiskBuilder, allow_apply: boo
                             ui.add(
                                 egui::TextEdit::singleline(&mut builder.rows[i].name)
                                     .desired_width(110.0)
-                                    .id(egui::Id::new(format!("bld_name_{}", i))),
+                                    .id(egui::Id::unique(format!("bld_name_{}", i))),
                             )
                             .on_hover_text("Entry name. X68000 truncates it to 8 characters.");
                         }
@@ -716,7 +716,7 @@ fn type_field(ui: &mut egui::Ui, kind: type_catalog::TableKind, id: &str, text: 
                 } else {
                     90.0
                 })
-                .id(egui::Id::new(id)),
+                .id(egui::Id::unique(id)),
         )
         .on_hover_text(kind.field_hint());
 

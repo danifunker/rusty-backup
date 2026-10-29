@@ -306,15 +306,8 @@ pub(crate) fn cmd_new_sized(
     let bytes = create_blank_hfs_sized(size, block_size, name, extents_bytes, catalog_bytes)
         .map_err(|e| anyhow!("failed to format HFS volume: {e}"))?;
 
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&image)
-        .with_context(|| format!("opening {} for write", image.display()))?;
-    file.write_all(&bytes)
+    crate::compat::write_sparse(&image, &bytes)
         .with_context(|| format!("writing {}", image.display()))?;
-    file.flush().ok();
 
     println!(
         "Created HFS volume {} ({} bytes, block_size={})",
@@ -368,15 +361,8 @@ pub(crate) fn cmd_new_hfsplus_sized(
         0,
     );
 
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&image)
-        .with_context(|| format!("opening {} for write", image.display()))?;
-    file.write_all(&bytes)
+    crate::compat::write_sparse(&image, &bytes)
         .with_context(|| format!("writing {}", image.display()))?;
-    file.flush().ok();
 
     println!(
         "Created {} volume {} ({} bytes, block_size={}{})",

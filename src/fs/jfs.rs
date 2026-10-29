@@ -1073,6 +1073,20 @@ impl<R: Read + Seek + Send> JfsFilesystem<R> {
         file_inode: &JfsDinode,
         max_bytes: usize,
     ) -> Result<Vec<u8>, FilesystemError> {
+        let mut out = Vec::with_capacity((file_inode.size as usize).min(max_bytes));
+        self.copy_file_data(file_inode, max_bytes as u64, &mut out)?;
+        Ok(out)
+    }
+
+    /// Stream up to `min(size, max_bytes)` bytes of a file into `w` in 1 MiB pieces; gaps
+    /// between extents and a short tail are zero-filled.
+    pub(crate) fn copy_file_data(
+        &mut self,
+        file_inode: &JfsDinode,
+        max_bytes: u64,
+        w: &mut dyn std::io::Write,
+    ) -> Result<u64, FilesystemError> {
+        const PIECE: u64 = 1 << 20;
         let xtroot = self.parse_inline_xtree_root(&file_inode.raw)?;
         // Collect every leaf XAD. For an inline-only file (LEAF
         // xtroot), this is just the inline XADs; for an internal-xtree
@@ -1081,32 +1095,48 @@ impl<R: Read + Seek + Send> JfsFilesystem<R> {
         self.walk_xtree_leaves(&xtroot, &mut |xad| leaves.push(*xad))?;
         leaves.sort_by_key(|xad| xad.logical_offset);
 
-        let total = (file_inode.size as usize).min(max_bytes);
-        let mut out: Vec<u8> = Vec::with_capacity(total);
+        let total = file_inode.size.min(max_bytes);
+        let zeros = vec![0u8; PIECE as usize];
+        let mut buf = vec![0u8; PIECE as usize];
+        let mut done = 0u64;
+        let zero_fill = |w: &mut dyn std::io::Write, mut n: u64| -> std::io::Result<()> {
+            while n > 0 {
+                let k = n.min(PIECE) as usize;
+                w.write_all(&zeros[..k])?;
+                n -= k as u64;
+            }
+            Ok(())
+        };
         for xad in &leaves {
-            if out.len() >= total {
+            if done >= total {
                 break;
             }
             let logical_start_byte = xad.logical_offset * self.bsize;
-            if logical_start_byte as usize > out.len() {
-                let gap = (logical_start_byte as usize - out.len()).min(total - out.len());
-                out.resize(out.len() + gap, 0);
-                if out.len() >= total {
+            if logical_start_byte > done {
+                let gap = (logical_start_byte - done).min(total - done);
+                zero_fill(w, gap)?;
+                done += gap;
+                if done >= total {
                     break;
                 }
             }
-            let extent_bytes = xad.physical_length as usize * self.bsize as usize;
-            let take = extent_bytes.min(total - out.len());
+            let extent_bytes = u64::from(xad.physical_length) * self.bsize;
+            let mut take = extent_bytes.min(total - done);
             let byte = self.partition_offset + xad.physical_address * self.bsize;
             self.reader.seek(SeekFrom::Start(byte))?;
-            let start = out.len();
-            out.resize(start + take, 0);
-            self.reader.read_exact(&mut out[start..start + take])?;
+            while take > 0 {
+                let k = take.min(PIECE) as usize;
+                self.reader.read_exact(&mut buf[..k])?;
+                w.write_all(&buf[..k])?;
+                take -= k as u64;
+                done += k as u64;
+            }
         }
-        if out.len() < total {
-            out.resize(total, 0);
+        if done < total {
+            zero_fill(w, total - done)?;
+            done = total;
         }
-        Ok(out)
+        Ok(done)
     }
 
     /// Decode an inline symlink target from `di_fastsymlink`. For
@@ -2349,6 +2379,20 @@ impl<R: Read + Seek + Send> Filesystem for JfsFilesystem<R> {
                 dinode.mode
             ))),
         }
+    }
+
+    fn write_file_to(
+        &mut self,
+        entry: &FileEntry,
+        writer: &mut dyn std::io::Write,
+    ) -> Result<u64, FilesystemError> {
+        let dinode = self.read_fileset_inode_global(entry.location as u32)?;
+        if dinode.posix_type() == S_IFREG {
+            return self.copy_file_data(&dinode, u64::MAX, writer);
+        }
+        let data = self.read_file(entry, usize::MAX)?;
+        writer.write_all(&data)?;
+        Ok(data.len() as u64)
     }
 
     fn volume_label(&self) -> Option<&str> {

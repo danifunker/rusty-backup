@@ -241,6 +241,7 @@ fn join_cmdline_args<I: IntoIterator<Item = String>>(args: I) -> Option<String> 
 /// This uses `ShellExecuteW` with the "runas" verb to trigger the UAC dialog.
 /// The current process will exit after launching the elevated instance.
 pub fn request_elevation() -> Result<()> {
+    super::ensure_physical_enabled()?;
     let exe_path = env::current_exe().context("failed to get executable path")?;
     let exe_path_wide = to_wide(&exe_path.to_string_lossy());
     let verb = to_wide("runas");

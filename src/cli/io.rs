@@ -11,6 +11,7 @@ use std::path::Path;
 
 /// Open a regular image file read-only.
 pub fn open_image_ro(path: &Path) -> Result<File> {
+    crate::os::ensure_physical_allowed(path)?;
     File::open(path).with_context(|| format!("opening {}", path.display()))
 }
 
@@ -18,6 +19,7 @@ pub fn open_image_ro(path: &Path) -> Result<File> {
 /// ensuring the path resolves to a regular file (block-device targets are
 /// rejected upstream in Phase C).
 pub fn open_image_rw(path: &Path) -> Result<File> {
+    crate::os::ensure_physical_allowed(path)?;
     OpenOptions::new()
         .read(true)
         .write(true)

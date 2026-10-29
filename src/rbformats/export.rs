@@ -399,6 +399,17 @@ fn open_source_reader(source_path: &Path) -> Result<(super::BoxReadSeek, u64)> {
             .with_context(|| format!("failed to open {}", source_path.display()))?;
         let file2 = File::open(source_path)?;
         let fmt = super::detect_image_format_with_path(file, Some(source_path))?;
+        // Raw to the detector but decoded by the read layer (flux captures, floppy containers,
+        // a padded ICON disk): export what the read layer presents, not the file's bytes.
+        if matches!(fmt, super::ImageFormat::Raw)
+            && (crate::model::source_reader::is_container_path(source_path)
+                || super::icon_hd::layout_for_path(source_path).is_some())
+        {
+            let mut r = crate::model::source_reader::open_read(source_path)?;
+            let size = r.seek(SeekFrom::End(0))?;
+            r.seek(SeekFrom::Start(0))?;
+            return Ok((r, size));
+        }
         super::wrap_image_reader(file2, fmt)
     }
 }

@@ -343,9 +343,22 @@ impl<R: Read + Seek + Send> Os9Filesystem<R> {
     /// and truncating to the declared size.
     fn read_fd_data(&mut self, fd: &FileDescriptor) -> Result<Vec<u8>, FilesystemError> {
         let mut out = Vec::with_capacity(fd.size as usize);
-        let mut remaining = fd.size as usize;
+        self.copy_fd_data(fd, u64::MAX, &mut out)?;
+        Ok(out)
+    }
+
+    /// Stream up to `min(fd.size, max_bytes)` bytes of the FD's segments, at most 1 MiB per read.
+    fn copy_fd_data(
+        &mut self,
+        fd: &FileDescriptor,
+        max_bytes: u64,
+        w: &mut dyn Write,
+    ) -> Result<u64, FilesystemError> {
+        let total = fd.size.min(max_bytes);
+        let mut buf: Vec<u8> = Vec::new();
+        let mut done = 0u64;
         for &(lsn, count) in &fd.segments {
-            if remaining == 0 {
+            if done >= total {
                 break;
             }
             if lsn + count > self.ident.total_sectors {
@@ -353,12 +366,21 @@ impl<R: Read + Seek + Send> Os9Filesystem<R> {
                     "segment LSN {lsn}+{count} past end of volume"
                 )));
             }
-            let chunk = self.read_sectors(lsn, count)?;
-            let take = remaining.min(chunk.len());
-            out.extend_from_slice(&chunk[..take]);
-            remaining -= take;
+            let mut seg_left = (count * self.sector).min(total - done);
+            self.reader
+                .seek(SeekFrom::Start(self.partition_offset + lsn * self.sector))?;
+            while seg_left > 0 {
+                let n = seg_left.min(1 << 20) as usize;
+                if buf.len() < n {
+                    buf.resize(n, 0);
+                }
+                self.reader.read_exact(&mut buf[..n])?;
+                w.write_all(&buf[..n])?;
+                seg_left -= n as u64;
+                done += n as u64;
+            }
         }
-        Ok(out)
+        Ok(done)
     }
 
     /// Parse a directory FD's data into live `(name, fd_lsn)` pairs, skipping
@@ -451,9 +473,24 @@ impl<R: Read + Seek + Send> Filesystem for Os9Filesystem<R> {
                 entry.path
             )));
         }
-        let mut data = self.read_fd_data(&fd)?;
-        data.truncate(max_bytes);
+        let mut data = Vec::with_capacity((fd.size as usize).min(max_bytes));
+        self.copy_fd_data(&fd, max_bytes as u64, &mut data)?;
         Ok(data)
+    }
+
+    fn write_file_to(
+        &mut self,
+        entry: &FileEntry,
+        writer: &mut dyn Write,
+    ) -> Result<u64, FilesystemError> {
+        let fd = self.read_fd(entry.location)?;
+        if fd.is_dir() {
+            return Err(FilesystemError::InvalidData(format!(
+                "'{}' is a directory",
+                entry.path
+            )));
+        }
+        self.copy_fd_data(&fd, u64::MAX, writer)
     }
 
     fn validate_name(&self, name: &str) -> Result<(), FilesystemError> {

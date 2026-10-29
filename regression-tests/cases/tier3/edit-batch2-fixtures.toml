@@ -21,9 +21,10 @@
 # layer above: that an edit through the ECC container commits at all and leaves
 # the volume sound.
 #
-# ON THE MO's SECOND PARTITION the fsck assertion is stronger than "clean": it
-# pins the pre-existing orphan inode 232. One orphan before an edit and one
-# after is what proves our allocator leaked nothing new.
+# ON THE MO's SECOND PARTITION inode 232 was once reported as an orphan. It lives
+# in directory 144, whose di_size (3108) stops at the end of its last live entry;
+# reading that chunk to its end, as the kernel does, reaches it. Clean after an
+# edit is what proves our allocator leaked nothing new.
 
 [meta]
 tier = 3
@@ -73,7 +74,7 @@ stdout_contains = ["5708 files"]
 
 [[case]]
 id = "edit.batch2.next-mo-ns08-second"
-description = "The MO's second partition, which carries a pre-existing orphan inode. Editing it must leave exactly that and nothing more."
+description = "The MO's second partition, whose directory 144 has a short di_size. Editing it must leave it clean."
 fixture = "fmt.od.next-mo-ns08.hd"
 [[case.step]]
 args = ["put", "{fixture_copy}@2", "{cases}/tier3/payload.bin", "/payload.bin"]
@@ -83,12 +84,10 @@ args = ["get", "{fixture_copy}@2", "/payload.bin", "{scratch}/out.bin"]
 expect_exit = 0
 files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
 [[case.step]]
-# STILL exactly one orphan, and still inode 232. A second error means our write
-# broke something; a clean result means the orphan stopped being reported,
-# which is equally a change worth failing on.
+# Clean, with inode 232 still reachable through the short directory.
 args = ["fsck", "{fixture_copy}@2", "--checkonly"]
-expect_exit = 1
-stdout_contains = ["OrphanInode", "232"]
+expect_exit = 0
+stdout_not_contains = ["OrphanInode"]
 
 # --- SunOS 4.1.3, through a CHD ------------------------------------------------
 

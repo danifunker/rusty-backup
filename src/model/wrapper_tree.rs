@@ -30,25 +30,17 @@ pub enum WrapperSource {
     Path(PathBuf),
     /// The wrapper's bytes, pulled out of a parent layer (archive / image).
     Bytes(Vec<u8>),
+    /// The wrapper streamed out of a parent layer to a temp file; the dir owns the file.
+    TempFile(tempfile::TempDir, PathBuf),
 }
 
 impl WrapperSource {
-    /// Materialize the whole wrapper into a byte buffer (reads the file for the
-    /// `Path` variant). Used by formats opened from memory (archives).
-    fn into_bytes(self) -> Result<Vec<u8>> {
-        match self {
-            WrapperSource::Path(p) => {
-                std::fs::read(&p).map_err(|e| anyhow::anyhow!("read {}: {e}", p.display()))
-            }
-            WrapperSource::Bytes(b) => Ok(b),
-        }
-    }
-
     /// Resolve to an on-disk path (with a temp-dir guard when the content came
     /// from memory). Used by formats opened by path (disk images, optical).
     fn into_path(self, file_name: &str) -> Result<(Option<tempfile::TempDir>, PathBuf)> {
         match self {
             WrapperSource::Path(p) => Ok((None, p)),
+            WrapperSource::TempFile(dir, p) => Ok((Some(dir), p)),
             WrapperSource::Bytes(b) => {
                 let (temp, path) = commander_descend::materialize(&b, file_name)?;
                 Ok((Some(temp), path))
@@ -219,20 +211,33 @@ impl WrapperTree {
     /// the entry is an NDIF disk image (its resource fork carries a `bcem` block
     /// map), reconstruct the raw image from both forks so the result opens like
     /// any flat disk.
-    pub fn read_wrapper_bytes(&mut self, row: &TreeRow) -> Result<Vec<u8>> {
+    pub fn read_wrapper_source(&mut self, row: &TreeRow) -> Result<WrapperSource> {
         let fs = self
             .mount_fs(&row.mount)
             .ok_or_else(|| anyhow::anyhow!("wrapper mount not open"))?;
+        let mut rsrc = Vec::new();
+        let _ = fs.write_resource_fork_to(&row.entry, &mut rsrc);
+        let bcem = crate::rbformats::ndif::extract_bcem(&rsrc);
+        // A large nested wrapper goes to a temp file so it is never held in memory whole.
+        if bcem.is_none() && row.entry.size > crate::fs::mem_archive::INLINE_MAX {
+            let (dir, path) = commander_descend::materialize_streamed(&row.entry.name, |f| {
+                let mut w = std::io::BufWriter::new(f);
+                fs.write_file_to(&row.entry, &mut w)?;
+                std::io::Write::flush(&mut w)?;
+                Ok(())
+            })
+            .map_err(|e| anyhow::anyhow!("read '{}': {e:#}", row.entry.name))?;
+            return Ok(WrapperSource::TempFile(dir, path));
+        }
         let mut data = Vec::new();
         fs.write_file_to(&row.entry, &mut data)
             .map_err(|e| anyhow::anyhow!("read '{}': {e}", row.entry.name))?;
-        let mut rsrc = Vec::new();
-        let _ = fs.write_resource_fork_to(&row.entry, &mut rsrc);
-        if let Some(bcem) = crate::rbformats::ndif::extract_bcem(&rsrc) {
+        if let Some(bcem) = bcem {
             return crate::rbformats::ndif::reconstruct(&data, &bcem)
+                .map(WrapperSource::Bytes)
                 .map_err(|e| anyhow::anyhow!("NDIF '{}': {e:#}", row.entry.name));
         }
-        Ok(data)
+        Ok(WrapperSource::Bytes(data))
     }
 
     /// Walk the expanded subtree rooted at base wrapper `wrapper_id` (already
@@ -323,18 +328,22 @@ fn open_mount(
 ) -> Result<(Mount, Option<String>)> {
     match kind {
         DescendKind::Archive => {
-            // Archives are read into a buffer — no temp file needed, and no path
-            // to reopen from, so they stay on the synchronous copy path.
-            let bytes = source.into_bytes()?;
-            let fs = commander_descend::open_archive_bytes(
-                bytes,
-                file_name,
-                Some(file_name.to_string()),
-            )?;
+            // In-memory bytes open directly; a file opens by path so a large ZIP / tar is indexed.
+            let label = Some(file_name.to_string());
+            let (fs, temp) = match source {
+                WrapperSource::Bytes(b) => (
+                    commander_descend::open_archive_bytes(b, file_name, label)?,
+                    None,
+                ),
+                WrapperSource::Path(p) => (commander_descend::open_archive(&p, label)?, None),
+                WrapperSource::TempFile(dir, p) => {
+                    (commander_descend::open_archive(&p, label)?, Some(dir))
+                }
+            };
             Ok((
                 Mount {
                     fs,
-                    _temp: None,
+                    _temp: temp,
                     reopen: None,
                 },
                 None,

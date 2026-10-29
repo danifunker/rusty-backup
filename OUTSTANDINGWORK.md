@@ -463,6 +463,47 @@ matches on the substring `UFS`. The nesting is correct now that the gate is.
   would let the regression suite assert the gate through the CLI, which is what
   would have caught this drift.
 
+---
+
+## 9. QNX / flux / Sun-tape work (2026-10-28/29) — runner and corpus
+
+Branch `deps-cd-audio-image-only`. Engine detail is in `docs/OPEN-WORK.md` §10;
+this section is only the tooling side.
+
+**Landed (context, not work):**
+
+- **`rb-regress fixtures` hashes streaming.** It read each fixture whole and
+  was OOM-killed at 8.1 GB RSS on the 8 GiB HP-UX disk, taking the session
+  with it; it now streams (about 10 MB RSS over the whole corpus).
+- **Eleven new fixtures**, catalogued in `fixture-map.tsv` on BigDisk and the
+  NAS: `flux.scp.icon-help410.floppy`, `flux.hfe.icon-help410.floppy`,
+  `flux.hfe3.icon-help410.floppy`, `flux.scp.amiga-dd.floppy`,
+  `flux.scp.acorn-dfs.floppy`, `fs.qnx2.lexicon-10mb.hd`,
+  `fs.qnx2.lexicon-64mb.hd`, `fs.qnx2.icon4-st251.hd`,
+  `flux.emu.icon4-st251.hd`, `fmt.gho.ntfs-compressed.hd`,
+  `fs.qnx4.qnxfs1g.hd`.
+- **New cases:** `tier2/read-flux-scp-hfe.toml`, `tier3/edit-qnx2.toml`,
+  `tier3/edit-sun-tapes.toml`, plus additions to `tier2/read-qnx2.toml` and
+  `tier2/read-repo-fixtures.toml`. Full run 2026-10-28: 442 cases, all pass
+  after re-pinning three flux tar hashes the QNX 2 date fix moved.
+- **Oracles used, not registered:** real QNX 4.10.01 `chkfsys` in icon-emu
+  (QNX 2 writes), Greaseweazle `gw convert` (SCP / HFE), host `gzip -d`
+  (`.Z` sections of edited Sun tapes).
+
+**Still open:**
+
+- **`rb-regress produce` holds every pass-A artifact in memory** (~300 MB
+  peak). Write them to disk and compare streaming, as `fixtures` now does.
+- **Registry rows.** `data/formats.toml` has no QNX, flux or Sun-tape rows and
+  `data/oracles.toml` no icon-emu or Greaseweazle entry (grep, 2026-10-29); the
+  new fixture IDs probably need format rows the way §1c's did.
+- **Sun tape hardware oracle.** Edited test tapes wait on the NAS in
+  `rb-fixtures/to-verify/sun-tape-edit/` for a Sun-2 / Sun-3 MiSTer core boot
+  (or `tar t`); until then the tier-3 tape cases prove only host-tool agreement.
+- **QNX 4 / QNX 6 fixtures.** One real QNX 4 volume and no real QNX 6 one;
+  fixtures made by QNX 4.25 and QNX 6.5 / 7 under QEMU are what the write
+  phases need (`docs/PLAN-qnx.md` Q5 / Q6).
+
 
 ## Constraints
 

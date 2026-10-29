@@ -1,0 +1,48 @@
+# Tier 3 — write to an HP LIF boot volume.
+#
+# The NetBSD/hp300 disk is the fixture because it is small enough to copy per
+# run; the 8 GiB HP-UX 11.11 disk was checked by hand instead (moved ISL, new
+# AUTO, a new file; it booted under QEMU B160L and HP-UX's `lifls`/`lifcp`
+# agreed with every entry).
+#
+# What this pins: a staged replace keeps SYS_UBOOT's type and load address, a
+# new file grows the volume only inside the LIF row (the BSD label's head
+# area), and the UFS root next door stays sound.
+
+[meta]
+tier = 3
+group = "edit.lif"
+description = "Replace and add files in the LIF boot area of a NetBSD/hp300 disk; the label and UFS stay sound."
+
+[[case]]
+id = "edit.lif.netbsd-hp300"
+description = "LIF: replace SYS_UBOOT, add and remove a file, grow the volume within the row"
+fixture = "part.bsd.netbsd92-hp300.hd"
+timeout_ms = 600000
+[[case.step]]
+args = ["get", "{fixture_copy}@3", "/SYS_UBOOT", "{scratch}/uboot.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "--force", "{fixture_copy}@3", "{scratch}/uboot.bin", "/sys_uboot"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{fixture_copy}@3", "{cases}/tier3/payload.bin", "/PAYLOAD"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{fixture_copy}@3", "/"]
+expect_exit = 0
+stdout_contains = ["71168             SYS_UBOOT", "256             PAYLOAD"]
+[[case.step]]
+args = ["get", "{fixture_copy}@3", "/SYS_UBOOT", "{scratch}/uboot2.bin"]
+expect_exit = 0
+files_identical = [["{scratch}/uboot.bin", "{scratch}/uboot2.bin"]]
+[[case.step]]
+args = ["rm", "{fixture_copy}@3", "/PAYLOAD"]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{fixture_copy}"]
+expect_exit = 0
+stdout_contains = ["BSD a (4.2BSD)", "LIF boot area"]
+[[case.step]]
+args = ["fsck", "{fixture_copy}@1", "--checkonly"]
+expect_exit = 0

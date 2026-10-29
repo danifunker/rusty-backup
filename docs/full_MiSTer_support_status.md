@@ -8,7 +8,7 @@ support the disk types (floppy / hard disk / CD-ROM) of the outstanding cores.
 ## What Rusty Backup supports today
 
 - **Filesystems:** FAT12/16/32, exFAT, NTFS, HPFS (OS/2; read + edit + create +
-  fsck), HFS, HFS+/HFSX,
+  fsck), HFS, HFS+/HFSX, VxFS and AIX JFS (read-only), HP LIF boot volumes,
   APFS (read-only browse + extract, incl. FileVault via password / recovery
   key; no snapshots),
   ext2/3/4, XFS,
@@ -28,7 +28,7 @@ support the disk types (floppy / hard disk / CD-ROM) of the outstanding cores.
   Minix V1/V2/V3 (read + edit + create + fsck),
   ProDOS (read + edit + create + fsck),
   Apple DOS 3.3 (read + edit + create + fsck),
-  UCSD p-System (read + edit + create + fsck),
+  UCSD p-System (read + edit + create + fsck), QNX 2 (read + edit + fsck, incl. Unisys ICON floppies and LEXICON hard disks, writes checked with real QNX 4.10.01 `chkfsys`) / QNX 4 (read-only, checked on real media) / QNX 6 Power-Safe (read-only, synthetic volumes only),
   MacPlus MFS (read + edit + create + fsck),
   Amiga OFS/FFS (AFFS) / PFS3 / SFS (all three creatable: `new volume affs` /
   `pfs3` / `sfs`; AFFS output mounts Read/Write under a real Kickstart 3.1,
@@ -96,12 +96,23 @@ support the disk types (floppy / hard disk / CD-ROM) of the outstanding cores.
   Philips CD-i, and 3DO Opera — browse/extract, see **Optical / CD-ROM**
   below).
 - **Partition tables:** MBR, GPT, APM, Amiga RDB, Atari AHDI, Sun SMI VTOC,
-  SGI volume header, Sharp X68000, the NeXT disk label (NeXTSTEP / OPENSTEP on
+  SGI volume header, Sharp X68000, BSD disklabel (read), HP-UX LVM and AIX LVM
+  (read, single-disk), the NeXT disk label (NeXTSTEP / OPENSTEP on
   both m68k and Intel) and the Solaris x86 VTOC nested inside an MBR partition
   — every one of them can now be **written** from scratch as well as parsed
   (`rb-cli new hd <table>`). The pre-IRIX SGI disk label (IRIS 2000 / 3000) is
-  parsed and its slots edited, but not written from scratch.
-- **Containers:** CHD, VHD (fixed + dynamic), QCOW2, VMDK, 2MG, WOZ,
+  parsed and its slots edited, but not written from scratch. On Unisys ICON /
+  LEXICON hard disks the MBR's types 07 / 08 / 09 are read as QNX 2 partitions
+  1-3 with 1-based starts.
+- **Containers:** Sun QIC tape images (`.qic`, the Sun-2 / Sun-3 cores' `SUN2TAPE`
+  format; browsed as a filesystem, tars / `.Z` tars / UFS miniroots as directories,
+  and editable inside them by rebuilding the tape with the original kept as
+  `<name>.bak` -- **edited tapes not yet verified on Sun hardware**),
+  flux captures (KryoFlux stream sets, SCP, HFE v1 / v3; IBM MFM, IBM FM and
+  AmigaDOS MFM decoded read-only, unreadable sectors zero-filled and listed;
+  no GCR from flux yet) and Gesswein MFM reader `.emu` hard-disk captures
+  (Intel iSBC 214 only),
+  CHD, VHD (fixed + dynamic), QCOW2, VMDK, 2MG, WOZ,
   DC42, HFV, IMZ (encrypted ZIP), `.zip` (a RAW disk image inside a plain
   ZIP, inflated sparsely; `--inside` picks among multiple), GHO/GHS (Ghost
   SECTOR mode), MSA (Atari ST), EDSK/DSK (Amstrad CPC / PCW / Einstein /
@@ -147,9 +158,9 @@ Legend for the **Support** column:
 | MSX1 | Microsoft MSX1 | Floppy, HDD | FAT12 / FAT12-16 | **Yes** |
 | ZXNext | ZX Spectrum Next | SD/HDD (VHD) | FAT32/16/12 | **Yes** |
 | TSConf | ZX-Evolution | SD/HDD (VHD) | FAT32 (non-MBR) | **Yes** |
-| Minimig-AGA | Commodore Amiga | Floppy, HDD, CD | OFS/FFS, PFS3, SFS (RDB) / ISO9660 | **Yes** — AFFS read + edit + `new volume affs`, and volumes we write mount Read/Write under a real Kickstart 3.1 in FS-UAE (R-020, `oracles/fsuae/affs_mount.py`); PFS3 and SFS read + edit + create (`new volume pfs3` / `sfs`, F-003), with a bare RDB-less PFS3 image now detected by superfloppy probe; RDB written by `new hd rdb` and read back clean by amitools `rdbtool` |
+| Minimig-AGA | Commodore Amiga | Floppy, HDD, CD | OFS/FFS, PFS3, SFS (RDB) / ISO9660 | **Yes** — AFFS read + edit + `new volume affs`, and volumes we write mount Read/Write under a real Kickstart 3.1 in FS-UAE (R-020, `oracles/fsuae/affs_mount.py`); PFS3 and SFS read + edit + create (`new volume pfs3` / `sfs`, F-003), with a bare RDB-less PFS3 image now detected by superfloppy probe; RDB written by `new hd rdb` and read back clean by amitools `rdbtool`. ShapeShifter: an RDB partition used raw as a Mac drive opens as HFS whatever DosType it declares, and Mac hardfiles stored inside PFS open via Inspect's *Open as Disk Image* or Commander (#89). Floppies captured at flux level (KryoFlux / SCP / HFE, AmigaDOS MFM) open read-only; Greaseweazle SCPs of an ADF decode byte-identical |
 | MacPlus | Macintosh Plus | Floppy, HDD | HFS / MFS (400K floppy) | **Yes** — HFS + MFS both read/edit/create/fsck (400K / 800K MFS floppy) |
-| AtariST | Atari ST/STe | Floppy, HDD | GEMDOS = FAT12 / FAT16 | **Yes** — floppy (`.st` / `.msa` FAT12) and HDD. The AHDI partition table reads and writes: the four primary entries plus XGM extended chains are parsed, and `rb-cli new hd atari` lays down a fresh root sector with the tags you name (GEM / BGM / RAW; a GEM partition over 16 MiB is promoted to BGM as TOS requires). Partitions route to the existing FAT12/16 driver, so browse / extract / edit / fsck / backup / restore all work. Creating an XGM chain and writing a bootable bootstrap into the root sector are the remaining gaps. |
+| AtariST | Atari ST/STe | Floppy, HDD | GEMDOS = FAT12 / FAT16 | **Yes** — floppy (`.st` / `.msa` FAT12) and HDD. The AHDI partition table reads and writes: the four primary entries plus XGM extended chains are parsed, and `rb-cli new hd atari` lays down a fresh root sector with the tags you name (GEM / BGM / RAW; a GEM partition over 16 MiB is promoted to BGM as TOS requires). Partitions route to the existing FAT12/16 driver, so browse / extract / edit / fsck / backup / restore all work. Creating an XGM chain and writing a bootable bootstrap into the root sector are the remaining gaps. Falcon BGM partitions whose boot sector starts with a 68000 `BRA.S` (or no jump at all) instead of an x86 jump, with logical sectors up to 8192 B, open too (#89). |
 | Apple-II | Apple IIe | Floppy, HDD | DOS 3.3 / ProDOS | **Yes** — ProDOS (read + edit + create + fsck; `rb-cli new volume prodos`) + Apple DOS 3.3 (read + edit + create + fsck; `rb-cli new floppy apple-dos`, 140 KB `.dsk`/`.do`/`.po`). Sector-order auto-detect via `containers::sector_order`. |
 | ZX-Spectrum | Sinclair ZX Spectrum | Floppy, SD/HDD | TR-DOS, G+DOS, +3DOS (CP/M-like), esxDOS FAT | **Partial** — TR-DOS (`.trd`, full quartet) + esxDOS FAT yes; +3DOS via CP/M (`zxplus3` preset); G+DOS (MGT) no |
 | X68000 | Sharp X68000 | Floppy, SASI/SCSI HDD | Human68k (FAT-derived dialect) | **Yes** — floppy (Human68k read/browse/extract + add/delete/mkdir on `.d88` / `.xdf` / `.hdm` / `.dim`; edits decode->mutate->re-encode back into the container, GUI and CLI) and SASI/SCSI HDD (`.hda` / `.hdf` / `.hds`) read/browse/extract/add/delete/mkdir + in-place FS grow/shrink (`rb-cli resize`) + defragmenting repack (`rb-cli repack` / Inspect-tab "Defragment…" — packs files contiguously, reclaiming holes left by deletions) + fsck (`rb-cli fsck` / Inspect-tab Check — FAT-chain reconciliation + FAT-mirror resync, lost-cluster reclaim), incl. real BlueSCSI `X68SCSI1` 1024-byte-sector images (sector size derived from the boot signature; Sharp/KG big-endian BPB + big-endian FAT). Verified byte-exact on the BlueSCSI HD10 SCSI fixture and the Populous/Lemmings/SSF2/Votoms 256-byte SASI game disks across grow→shrink round-trips (multi-cluster `COMMAND.X` + Japanese filenames survive). Backup/restore/reconstruct honor the true (non-512-aligned) partition byte offset via the persisted `start_byte`, so SASI backup→restore lands the partition region byte-identical. **New 2026-06-10:** `rb-cli new hd x68k` scaffolds self-bootable SASI/SCSI HDDs from scratch — emits the Sharp IPL signature, X68K partition table, IPL stub (halt or printed-banner via IOCS B_PRINT), and optionally clones an entire Human68k donor floppy (flat or `.dim` / `.D88` / `.xdf` / `.hdm`) into the partition. MAME-verified on `x68000 -sasi` (SASI variant, 256-B sectors) and `x68030 -hard` (SCSI variant, 1024-B sectors). The donor's `SWITCH.X /HD` installs the partition boot sector on first FDD0 boot, after which the HDD self-boots to C:. **Zero-manual-step mode** also available: `--boot-sector-donor hd0.hds --size 100M --variant scsi` extracts the Sharp partition boot sector (Sharp IPL Copyright 1990 SHARP) from the well-known `hd0.hds` 100 MB Sharp/Keisoku Giken donor at build time and overlays it onto the output partition — no `SWITCH.X` step needed, self-boots straight to C:> on first power-on. Sharp's boot-sector bytes never live in the rusty-backup repo; same legal pattern as `--system-disk` (you provide the donor file, the bytes flow user→user). |
@@ -166,8 +177,8 @@ Legend for the **Support** column:
 | C16 | Commodore C16/Plus4 | Floppy | CBM DOS | **Yes** — `fs::cbm` `.d64` (1541). |
 | VIC20 | Commodore VIC-20 | Floppy | CBM DOS | **Yes** — `fs::cbm` `.d64` (1541). |
 | PET2001 | Commodore PET | Floppy (IEEE-488) | CBM DOS (D80/D82) | **Yes** — `fs::cbm` reads + writes the 8050 `.d80` (533248 B, 77 trk) and 8250 `.d82` (1066496 B, 154 trk) geometries: 29/27/25/23 zone map, BAM on track 38 (2–4 chained sectors, 5-byte/track entries), directory on track 39. Bidirectionally cross-validated against the Python `d64` reference (read + write byte-exact). `.d64` (1541/2031/4040) also works. |
-| BBCMicro | BBC Micro B/Master | Floppy | Acorn DFS / ADFS | **Yes** — `fs::dfs` reads + writes Acorn DFS single-sided `.ssd` (40-track 100K / 80-track 200K) **and** double-sided `.dsd` (the two track-interleaved sides de-interleave into two Acorn DFS partitions `@1` / `@2`, edits re-interleaving on save): flat catalogue in sectors 0–1, up to 31 contiguous files in descending start-sector order, single-character directory namespaces, 18-bit load/exec/length, lock bits. Read/browse/extract + add/delete bidirectionally cross-validated byte-exact against an independent clean-room DFS reader/writer (locked files, non-`$` dirs, real load/exec all round-trip); the `.dsd` de-interleave + `@1`/`@2` split validated against real BBC PD music discs. ADFS floppies (`.adf`) are handled by `fs::adfs` (see the Archie row). |
-| AcornElectron | Acorn Electron | Floppy | DFS / ADFS | **Yes** — same `fs::dfs` Acorn DFS read + write as BBCMicro (single-sided `.ssd` + double-sided `.dsd`, the latter presented as two partitions). ADFS floppies handled by `fs::adfs`. |
+| BBCMicro | BBC Micro B/Master | Floppy | Acorn DFS / ADFS | **Yes** — `fs::dfs` reads + writes Acorn DFS single-sided `.ssd` (40-track 100K / 80-track 200K) **and** double-sided `.dsd` (the two track-interleaved sides de-interleave into two Acorn DFS partitions `@1` / `@2`, edits re-interleaving on save): flat catalogue in sectors 0–1, up to 31 contiguous files in descending start-sector order, single-character directory namespaces, 18-bit load/exec/length, lock bits. Read/browse/extract + add/delete bidirectionally cross-validated byte-exact against an independent clean-room DFS reader/writer (locked files, non-`$` dirs, real load/exec all round-trip); the `.dsd` de-interleave + `@1`/`@2` split validated against real BBC PD music discs. ADFS floppies (`.adf`) are handled by `fs::adfs` (see the Archie row). FM flux captures (KryoFlux / SCP / HFE) of DFS disks open read-only; a Greaseweazle SCP of a DFS disk decodes byte-identical to its `.ssd`. |
+| AcornElectron | Acorn Electron | Floppy | DFS / ADFS | **Yes** — same `fs::dfs` Acorn DFS read + write as BBCMicro (single-sided `.ssd` + double-sided `.dsd`, the latter presented as two partitions). ADFS floppies handled by `fs::adfs`. DFS flux captures read as on BBCMicro. |
 | AcornAtom | Acorn Atom | Tape, Floppy | Atom DOS | **No** |
 | CoCo2 | Tandy CoCo 2 | Floppy | RS-DOS / DragonDOS, OS-9 (RBF) | **Yes** — `fs::rsdos` reads + writes RS-DOS / Disk BASIC (granule allocation table on track 17, 72-file directory, granule-chain files; raw 35- / 40-track `.dsk` / `.jvc`), `fs::os9` reads + writes OS-9 / NitrOS-9 RBF (hierarchical FS; `.dsk` / `.vdk`, byte-exact cross-validated against a clean-room RBF reader on real toolshed disks), and `fs::dragondos` reads + writes DragonDOS (see Dragon row). |
 | Dragon | Dragon 32/64 | Floppy | DragonDOS, OS-9 (RBF) | **Yes** — `fs::dragondos` reads + writes DragonDOS (directory track 20 + backup track 16, one's-complement geometry signature, set-bit-free sector bitmap, 25-byte header/continuation directory entries; single- / double-sided 40-track `.dsk`). Byte-exact cross-validated against an independent clean-room reader/writer AND against real third-party DragonDOS disks (rolfmichelsen/dragontools' empty volume plus a populated 9-file AGD-suite disk, all files byte-identical across both readers). `fs::os9` covers OS-9 / NitrOS-9 RBF. |
@@ -208,6 +219,14 @@ Legend for the **Support** column:
 | UK101 | Compukit UK101 | Tape/program | — | **N/A** |
 
 **Tally (recounted 2026-08-17):** 29 fully supported, 5 partial, 8 outstanding (No), 23 N/A (tape/cart/ROM-only).
+
+### Cores outside the wiki's computer list
+
+| Core | System | Media | Filesystem(s) | Rusty Backup support |
+|---|---|---|---|---|
+| Sun-2 / Sun-3 | Sun-2 / Sun-3 workstations (SunOS) | SCSI HDD, QIC tape (`.qic`) | Sun disk label + SunOS UFS; `SUN2TAPE` tapes (boot code, XDR table of contents, a.out kernels, UFS miniroots, V7 tar, `compress(1)` `.Z` tar) | **Partial** -- the SCSI disk images browse (Sun label + UFS), and tapes browse and edit (add / mkdir / rename / delete / chmod / chown inside tar, `.tar.Z` and UFS tape files; the tape is rebuilt and the original kept as `<name>.bak`). Untouched tape files stay byte-identical and host `tar` / `gzip` / `fsck` accept the rebuilt sections, but **no edited tape has been booted on the Sun-2 / Sun-3 cores yet** (test tapes wait in `rb-fixtures/to-verify/sun-tape-edit/`). Tape files themselves cannot be added, removed or renamed. |
+
+These are not counted in the tally above.
 
 ---
 

@@ -4,27 +4,32 @@
 //!
 //! Both backings hand back the same little-endian, 2352-byte/sector CD-DA PCM:
 //!
-//! - **CHD**: decoded with [`libchdman_rs`] (the copy we already link for the
-//!   `chd` feature) to a temporary redump-style BIN via [`extract_to_cue`] —
-//!   which byte-swaps CHD's big-endian CD-DA back to little-endian and strips the
-//!   96-byte subcode — then sliced per sector.
+//! - **CHD**: [`libchdman_rs`]'s [`CdAudioReader`] (the copy we already link for
+//!   the `chd` feature) decodes the requested track's sectors on demand, with the
+//!   same bytes `chdman extractcd` would write: CHD's big-endian CD-DA swapped
+//!   back to little-endian, 96-byte subcode dropped. No temp BIN, no whole-track
+//!   buffer.
 //! - **BIN/CUE**: the `.bin` is *already* little-endian 2352-B raw sectors laid
 //!   out per the `.cue`, so there is nothing to decode. [`opticaldiscs::bincue`]
 //!   parses the cue (track types, per-track BIN path + byte offset) and we read
 //!   the audio track's sectors straight out of the `.bin` — including multi-BIN
 //!   layouts, where each track names its own file.
 //!
-//! For CHD we resolve track bounds from a cumulative TOC rather than
-//! cd-da-reader's `read_track`, whose CD-Extra trailing-gap subtraction (correct
-//! for a physical disc) would drop real audio from a gapless extracted BIN.
+//! Both backings start a track at `INDEX 01`. A CHD often stores each track's
+//! `INDEX 00` pregap (~2 s of silence) at the start of that track's sectors, so
+//! the CHD path skips it; BIN/CUE already reads from `INDEX 01`. Neither goes
+//! through cd-da-reader's `read_track`, whose CD-Extra trailing-gap rule is only
+//! right for a physical disc.
 //!
 //! Ported from the ODE artwork-downloader's `src/disc/cd_audio.rs`.
 
 use std::io::{Read, Seek, SeekFrom};
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
-use cd_da_reader::{lba_to_msf, open_track_stream_at, AudioSectorReader, Toc, Track};
-use libchdman_rs::cd::{extract_to_cue, list_tracks, TrackType};
+use cd_da_reader::{open_track_stream_at, AudioSectorReader};
+use libchdman_rs::cd::{list_tracks, CdAudioReader, TrackType};
 use libchdman_rs::Chd;
 use opticaldiscs::bincue::{self, BinTrack};
 use opticaldiscs::formats::DiscFormat;
@@ -87,11 +92,11 @@ pub fn read_tracks(path: &Path) -> Result<Vec<CdTrack>, String> {
 /// interleaved little-endian `i16` stereo samples, and return the total number
 /// of `i16` samples emitted. Errors if the requested track isn't an audio track.
 ///
-/// Dispatches on format: CHD extracts the disc once up front (the slow
-/// "Preparing" cost) then slices; BIN/CUE streams straight from the `.bin`.
+/// `on_samples` returns [`ControlFlow::Break`] to stop reading early (the user
+/// hit Stop); that is not an error, and the count covers what was emitted.
 pub fn extract_audio_pcm<F>(path: &Path, track_number: u32, on_samples: F) -> Result<u64, String>
 where
-    F: FnMut(&[i16]),
+    F: FnMut(&[i16]) -> ControlFlow<()>,
 {
     match DiscFormat::from_path(path) {
         Some(DiscFormat::Chd) => extract_audio_pcm_chd(path, track_number, on_samples),
@@ -120,10 +125,12 @@ fn read_tracks_chd(path: &Path) -> Result<Vec<CdTrack>, String> {
     let tracks: Vec<CdTrack> = list_tracks(&chd)
         .map_err(|e| format!("list CHD tracks: {e:?}"))?
         .into_iter()
-        .map(|t| CdTrack {
+        .enumerate()
+        .map(|(i, t)| CdTrack {
             number: t.track_num,
             track_type: format!("{:?}", t.track_type),
-            frames: t.frames,
+            // FRAMES counts a stored pregap; report INDEX 01 onward, like BIN/CUE.
+            frames: t.frames.saturating_sub(stored_pregap(&chd, i)),
             pregap: t.pregap,
             is_audio: t.track_type == TrackType::Audio,
         })
@@ -134,60 +141,37 @@ fn read_tracks_chd(path: &Path) -> Result<Vec<CdTrack>, String> {
     Ok(tracks)
 }
 
-/// Stream a CHD audio track's PCM. Extracts the whole disc to a temp BIN, then
-/// streams the track's sector range in ~1 s (75-sector) chunks so playback can
-/// start immediately and never holds the whole track in memory.
+/// Stream a CHD audio track's PCM straight out of the CHD, ~1 s per callback.
 fn extract_audio_pcm_chd<F>(
     path: &Path,
     track_number: u32,
     mut on_samples: F,
 ) -> Result<u64, String>
 where
-    F: FnMut(&[i16]),
+    F: FnMut(&[i16]) -> ControlFlow<()>,
 {
-    // ChdDisc::open is the slow "Preparing" cost (whole-disc extract); the
-    // per-track read below is fast.
-    let disc = ChdDisc::open(path)?;
-
-    // Guard against reading a data track's bytes as "audio".
-    let idx = disc
-        .toc
-        .tracks
+    let chd = open_chd(path)?;
+    let tracks = list_tracks(&chd).map_err(|e| format!("list CHD tracks: {e:?}"))?;
+    // CdAudioReader takes a 0-based index into this list, not the track number.
+    let index = tracks
         .iter()
-        .position(|t| u32::from(t.number) == track_number)
+        .position(|t| t.track_num == track_number)
         .ok_or_else(|| format!("no track {track_number} on this disc"))?;
-    let track = &disc.toc.tracks[idx];
-    if !track.is_audio {
+    // CdAudioReader also reads raw data tracks; don't play one as "audio".
+    if tracks[index].track_type != TrackType::Audio {
         return Err(format!("track {track_number} is not an AUDIO track"));
     }
 
-    // Bounds come straight from our cumulative TOC: the extracted BIN is gapless
-    // (each track is exactly `frames` sectors, back-to-back), so a track spans
-    // from its own `start_lba` to the next track's (or the leadout).
-    //
-    // We deliberately do NOT use cd-da-reader's `read_track` here. Its
-    // `get_track_bounds` applies a CD-Extra rule that subtracts a fixed
-    // 11,400-sector inter-session gap from the last audio track before a data
-    // track. That gap is real on a physical disc but is absent from a
-    // CHD-derived image, so honouring it would chop ~2.5 min of real audio off
-    // that track. Every other track reads identically to `read_track`.
-    let start_lba = track.start_lba;
-    let end_lba = disc
-        .toc
-        .tracks
-        .get(idx + 1)
-        .map(|t| t.start_lba)
-        .unwrap_or(disc.toc.leadout_lba);
-    if end_lba <= start_lba {
-        return Err(format!("track {track_number}: bad TOC bounds"));
-    }
-    let sectors = end_lba - start_lba;
-
-    // Stream the gapless [start_lba, start_lba + sectors) we just computed.
-    // open_track_stream_at bypasses TOC bounds entirely, so the CD-Extra rule
-    // never runs — the reason we avoid read_track. 75 sectors = 1 s of CD audio,
-    // matching the previous ~1 s callback cadence.
-    let mut stream = open_track_stream_at(&disc, start_lba, sectors).with_sectors_per_chunk(75);
+    // open_track (not open) so a cooked data track elsewhere on the disc can't reject it.
+    let pregap = stored_pregap(&chd, index);
+    let reader = CdAudioReader::open_track(chd, index as u32)
+        .map_err(|e| format!("open CHD track {track_number}: {e:?}"))?;
+    let sectors = reader.sector_count();
+    // Start at INDEX 01, as a CD player does, skipping any stored INDEX 00 pregap.
+    let start = pregap.min(sectors);
+    let src = ChdTrackAudio(Mutex::new(reader));
+    let mut stream = open_track_stream_at(&src, start, sectors - start)
+        .with_sectors_per_chunk(SECTORS_PER_SECOND);
 
     let mut total = 0u64;
     while let Some(chunk) = stream
@@ -196,92 +180,46 @@ where
     {
         let samples = pcm_le_i16(&chunk);
         total += samples.len() as u64;
-        on_samples(&samples);
+        if on_samples(&samples).is_break() {
+            break;
+        }
     }
     Ok(total)
 }
 
-/// A CHD CD image extracted to a temporary redump-style BIN, exposing its audio
-/// sectors to `cd-da-reader` via [`AudioSectorReader`].
-struct ChdDisc {
-    /// Temp BIN written by [`extract_to_cue`]: little-endian, 2352 B/sector,
-    /// tracks laid out back-to-back.
-    bin_path: PathBuf,
-    /// TOC describing where each track's sectors live in `bin_path`.
-    toc: Toc,
-    /// Owns the temp dir; dropping it deletes the extracted BIN/CUE.
-    _tmp: tempfile::TempDir,
-}
-
-impl ChdDisc {
-    /// Extract `chd` to a temp BIN and build the matching `cd-da-reader` TOC.
-    fn open(chd: &Path) -> Result<Self, String> {
-        let handle = open_chd(chd)?;
-        let tracks = list_tracks(&handle).map_err(|e| format!("list CHD tracks: {e:?}"))?;
-        if tracks.is_empty() {
-            return Err("no tracks in image".to_string());
-        }
-
-        // Extract the whole disc to a temp BIN. extract_to_cue already yields
-        // little-endian 2352-B sectors with subcode stripped, so ChdDisc only
-        // has to slice bytes.
-        let tmp = tempfile::Builder::new()
-            .prefix("rb-chd-audio-")
-            .tempdir()
-            .map_err(|e| format!("create temp dir: {e}"))?;
-        let bin_path = tmp.path().join("disc.bin");
-        let cue_path = tmp.path().join("disc.cue");
-        let mut on_progress = |_written: u64| {};
-        extract_to_cue(chd, &cue_path, &bin_path, &mut on_progress)
-            .map_err(|e| format!("extract CHD to BIN: {e:?}"))?;
-
-        // Build cd-da-reader's TOC from cumulative stored-frame offsets, which is
-        // exactly extract_to_cue's single-BIN layout: each track occupies
-        // `frames` sectors of 2352 bytes, back-to-back, so a track's absolute
-        // sector index (start_lba) doubles as its BIN byte offset / 2352.
-        //
-        // NB: this assumes the common raw-2352 CHD (no chdman pad/split frames
-        // and no cooked data tracks). If a disc ever sounds wrong, diff a dumped
-        // WAV against `chdman extractcd` and reconcile against the `.cue` that
-        // extract_to_cue just wrote.
-        let mut cd_tracks = Vec::with_capacity(tracks.len());
-        let mut lba = 0u32;
-        for t in &tracks {
-            cd_tracks.push(Track {
-                number: t.track_num as u8, // CDs have <= 99 tracks
-                start_lba: lba,
-                start_msf: lba_to_msf(lba),
-                is_audio: t.track_type == TrackType::Audio,
-            });
-            lba = lba.saturating_add(t.frames);
-        }
-        let first_track = tracks.iter().map(|t| t.track_num as u8).min().unwrap_or(1);
-        let last_track = tracks.iter().map(|t| t.track_num as u8).max().unwrap_or(1);
-        let toc = Toc {
-            first_track,
-            last_track,
-            tracks: cd_tracks,
-            leadout_lba: lba,
-        };
-
-        Ok(Self {
-            bin_path,
-            toc,
-            _tmp: tmp,
-        })
+/// Frames of `INDEX 00` pregap the CHD stores at the start of track `index` (0-based).
+/// MAME stores pregap data only when `PGTYPE` starts with `V`; legacy `CHTR` has none.
+fn stored_pregap(chd: &Chd, index: usize) -> u32 {
+    let record = [*b"CHT2", *b"CHGD"].iter().find_map(|tag| {
+        chd.read_metadata(u32::from_be_bytes(*tag), index as u32)
+            .ok()
+    });
+    let Some(record) = record else { return 0 };
+    let text = String::from_utf8_lossy(&record);
+    let field = |key: &str| {
+        text.split_whitespace()
+            .find_map(|kv| kv.strip_prefix(key))
+            .map(|v| v.trim_end_matches('\0'))
+    };
+    match (field("PREGAP:"), field("PGTYPE:")) {
+        (Some(n), Some(pgtype)) if pgtype.starts_with('V') => n.parse().unwrap_or(0),
+        _ => 0,
     }
 }
 
-impl AudioSectorReader for ChdDisc {
+/// One CHD track exposed to `cd-da-reader`; the `Mutex` bridges its `&self` read to `&mut` sectors.
+struct ChdTrackAudio(Mutex<CdAudioReader>);
+
+impl AudioSectorReader for ChdTrackAudio {
     type Error = std::io::Error;
 
     fn read_audio_sectors(&self, start_lba: u32, count: u32) -> Result<Vec<u8>, Self::Error> {
-        let mut f = std::fs::File::open(&self.bin_path)?;
-        f.seek(SeekFrom::Start(
-            u64::from(start_lba) * BYTES_PER_SECTOR as u64,
-        ))?;
-        let mut buf = vec![0u8; count as usize * BYTES_PER_SECTOR];
-        f.read_exact(&mut buf)?;
+        let mut buf = vec![0u8; count as usize * CdAudioReader::SECTOR_SIZE];
+        self.0
+            .lock()
+            .map_err(|_| crate::compat::io_other("CHD reader poisoned"))?
+            .read_sectors(start_lba, count, &mut buf)
+            .map_err(|e| crate::compat::io_other(format!("read CHD sectors: {e:?}")))?;
         Ok(buf)
     }
 }
@@ -326,7 +264,7 @@ fn extract_audio_pcm_bincue<F>(
     mut on_samples: F,
 ) -> Result<u64, String>
 where
-    F: FnMut(&[i16]),
+    F: FnMut(&[i16]) -> ControlFlow<()>,
 {
     let cue = resolve_cue(path)?;
     let tracks = bincue::parse_cue_tracks(&cue).map_err(|e| format!("parse cue: {e}"))?;
@@ -359,7 +297,9 @@ where
     {
         let samples = pcm_le_i16(&chunk);
         total += samples.len() as u64;
-        on_samples(&samples);
+        if on_samples(&samples).is_break() {
+            break;
+        }
     }
     Ok(total)
 }
@@ -367,9 +307,7 @@ where
 /// A single BIN/CUE audio track exposed to `cd-da-reader` via [`AudioSectorReader`]:
 /// sector 0 is the track's first sector, mapped to `file_byte_offset` in `bin_path`.
 ///
-/// Like [`ChdDisc`], this re-opens the BIN per read so the reader stays `&self`;
-/// that's one file open per ~1 s chunk during playback — negligible for a local
-/// image, and it keeps both audio backings on the identical positioned-read shape.
+/// Re-opens the BIN per read so the reader stays `&self`; one open per ~1 s chunk.
 struct BinCueTrackReader {
     /// The `.bin` this track's sectors live in (each cue track names its own file,
     /// so multi-BIN layouts just point different tracks at different paths).

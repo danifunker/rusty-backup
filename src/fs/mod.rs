@@ -63,8 +63,10 @@ pub mod human68k_clone;
 pub mod id_names;
 pub mod import_sink;
 pub mod jfs;
+pub mod jfs1;
 pub mod jfs_fsck;
 pub mod layout_preserving;
+pub mod lif;
 pub mod lisa;
 pub mod mac_alias;
 pub mod mac_archive_import;
@@ -95,6 +97,9 @@ pub mod prodos;
 pub mod prodos_types;
 pub mod qdos;
 pub mod qdos_mdv;
+pub mod qnx2;
+pub mod qnx4;
+pub mod qnx6;
 pub mod raw_name;
 pub mod reiserfs;
 pub mod replace;
@@ -106,8 +111,12 @@ pub mod squashfs;
 pub mod squashfs_edit;
 pub mod squashfs_verify;
 pub mod squashfs_write;
+pub mod stream_pipe;
+pub mod sun2tape;
+pub mod sun2tape_edit;
 pub mod tar_export;
 pub mod tar_import;
+pub mod tar_section;
 pub mod ti99;
 pub mod times;
 pub mod trdos;
@@ -117,6 +126,8 @@ pub mod ufs;
 pub mod ufs_format;
 pub mod ufs_fsck;
 pub mod unix_common;
+pub mod vxfs;
+pub mod vxfs_edit;
 pub mod xattr;
 pub mod xfs;
 pub mod zstd_stream;
@@ -311,6 +322,9 @@ fn fs_display_name(detected: &str) -> &'static str {
         "jfs" => "JFS",
         "reiserfs" => "ReiserFS",
         "ufs" => "UFS",
+        "vxfs" => "VxFS",
+        "jfs1" => "AIX JFS",
+        "sun2tape" => "Sun QIC tape",
         "hpfs" => "HPFS",
         "apfs" => "APFS",
         "squashfs" => "SquashFS",
@@ -355,6 +369,9 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
     if reader.read_exact(&mut sector0).is_err() {
         return "unknown";
     }
+    if sun2tape::looks_like_tape(&sector0) {
+        return "sun2tape";
+    }
     if &sector0[3..11] == b"NTFS    " {
         return "ntfs";
     }
@@ -392,6 +409,10 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
     // through to the ext2 superblock-magic check below. The gate mirrors
     // `fat::FatFilesystem::open`, which rejects bytes_per_sector 0 / >4096 and
     // sectors_per_cluster 0.
+    // QNX 4's boot block carries an x86 jump and a FAT-like BPB; its root entry at block 1 decides.
+    if qnx4::looks_like_qnx4(reader, partition_offset) {
+        return "qnx4";
+    }
     if sector0[0] == 0xEB || sector0[0] == 0xE9 {
         let bytes_per_sector = u16::from_le_bytes([sector0[11], sector0[12]]);
         let sectors_per_cluster = sector0[13];
@@ -399,6 +420,9 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
             return "fat";
         }
         // Otherwise the JMP is a boot loader, not a FAT BPB — fall through.
+    } else if fat::has_fat_boot_start(&sector0) {
+        // Atari TOS: no x86 JMP, but a BPB strict enough to rule out stray bytes.
+        return "fat";
     }
     // XFS superblock magic ("XFSB") at byte 0 of the partition. Both v4
     // (IRIX-compatible) and v5/CRC superblocks share this magic and are
@@ -470,6 +494,17 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
                 return "ucsd";
             }
         }
+    }
+    // QNX 2: a root directory entry at byte 68 of block 1 whose extent checks out.
+    if qnx2::looks_like_qnx2(reader, partition_offset) {
+        return "qnx2";
+    }
+    // QNX 4: a `/` root entry at block 1; QNX 6: its superblock magic after the 8 KiB boot area.
+    if qnx4::looks_like_qnx4(reader, partition_offset) {
+        return "qnx4";
+    }
+    if qnx6::looks_like_qnx6(reader, partition_offset) {
+        return "qnx6";
     }
 
     // Sector 1 (offset 512): EFS superblock. EFS magic is at offset 28
@@ -559,11 +594,17 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
         if reader.read_exact(&mut ufs_magic).is_err() {
             continue;
         }
-        let le = u32::from_le_bytes(ufs_magic);
-        let be = u32::from_be_bytes(ufs_magic);
-        if le == 0x0001_1954 || le == 0x1954_0119 || be == 0x0001_1954 || be == 0x1954_0119 {
+        if ufs::is_ufs_magic(ufs_magic, cand == 8192) {
             return "ufs";
         }
+    }
+    // Veritas VxFS: magic 0xA501FCF5 at 8192 big-endian (HP-UX) or 1024 little-endian.
+    if vxfs::detect(reader, partition_offset).is_some() {
+        return "vxfs";
+    }
+    // AIX JFS (JFS1): magic 0x43218765 / 0x65872143 at byte 4096, after the LV control block.
+    if jfs1::detect(reader, partition_offset) {
+        return "jfs1";
     }
 
     // JFS2 magic probe. The primary aggregate superblock lives at byte
@@ -774,7 +815,10 @@ pub fn probe_0x83_fs_type<R: Read + Seek>(
 /// Returns `"ntfs"`, `"exfat"`, or `"unknown"`.
 ///
 /// Reads a full 512-byte sector for compatibility with raw character devices.
-fn detect_0x07_type<R: Read + Seek>(reader: &mut R, partition_offset: u64) -> &'static str {
+pub(crate) fn detect_0x07_type<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+) -> &'static str {
     if reader.seek(SeekFrom::Start(partition_offset)).is_err() {
         return "unknown";
     }
@@ -1279,6 +1323,9 @@ pub fn fs_name_for(partition_type: u8, partition_type_string: Option<&str>) -> &
             return "SFS";
         }
         return match s {
+            "LIF" => "LIF",
+            s if s.starts_with(crate::partition::LVM_UNAVAILABLE) => "unavailable",
+            s if s.starts_with(crate::partition::lvm::LVM_RUNS) => "LVM volume",
             "Apple_HFS" => "HFS",
             "Apple_HFSX" => "HFSX",
             // Apple HFS/HFS+ GPT partition GUID (UDIF DMG / hdiutil disks).
@@ -1750,6 +1797,19 @@ pub fn open_filesystem_full<R: Read + Seek + Send + 'static>(
     partition_type_string: Option<&str>,
     passphrase: Option<&str>,
 ) -> Result<Box<dyn Filesystem>, FilesystemError> {
+    // An ICON drive's unused partition is all zero: say so instead of "type not supported".
+    if partition_type_string.is_none() && matches!(partition_type, 0x07..=0x09) {
+        let mut head = [0u8; 1024];
+        let blank = reader
+            .seek(SeekFrom::Start(partition_offset))
+            .and_then(|_| reader.read_exact(&mut head))
+            .is_ok_and(|_| crate::rbformats::icon_hd::looks_unformatted(&head));
+        if blank {
+            return Err(FilesystemError::Unsupported(
+                "this partition is blank: it has never been formatted".into(),
+            ));
+        }
+    }
     // Check string-based type first (APM partitions)
     if let Some(type_str) = partition_type_string {
         return open_filesystem_by_string(
@@ -1875,6 +1935,18 @@ pub fn open_filesystem_full<R: Read + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "vxfs" => Ok(Box::new(vxfs::VxfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "jfs1" => Ok(Box::new(jfs1::Jfs1Filesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "sun2tape" => Ok(Box::new(sun2tape::TapeFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 "jfs" => Ok(Box::new(jfs::JfsFilesystem::open(
                     reader,
                     partition_offset,
@@ -1900,6 +1972,18 @@ pub fn open_filesystem_full<R: Read + Seek + Send + 'static>(
                     partition_offset,
                 )?)),
                 "ucsd" => Ok(Box::new(ucsd::UcsdFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "qnx2" => Ok(Box::new(qnx2::Qnx2Filesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "qnx4" => Ok(Box::new(qnx4::Qnx4Filesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "qnx6" => Ok(Box::new(qnx6::Qnx6Filesystem::open(
                     reader,
                     partition_offset,
                 )?)),
@@ -1996,6 +2080,18 @@ pub fn open_filesystem_full<R: Read + Seek + Send + 'static>(
                     partition_offset,
                 )?)),
                 "ufs" => Ok(Box::new(ufs::UfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "vxfs" => Ok(Box::new(vxfs::VxfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "jfs1" => Ok(Box::new(jfs1::Jfs1Filesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "sun2tape" => Ok(Box::new(sun2tape::TapeFilesystem::open(
                     reader,
                     partition_offset,
                 )?)),
@@ -2215,10 +2311,7 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                         partition_offset,
                     )?)),
                     // A/UX and NetBSD/mac68k slices: the read arm already opened them.
-                    "ufs" => Ok(Box::new(ufs::UfsFilesystem::open(
-                        reader,
-                        partition_offset,
-                    )?)),
+                    "ufs" => Ok(Box::new(open_ufs_editable(reader, partition_offset)?)),
                     _ => Err(FilesystemError::Unsupported(format!(
                         "editing not yet supported for APM Unix filesystem type '{fs_type}'"
                     ))),
@@ -2227,7 +2320,15 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
             // Rhapsody's NeXT label fronts the UFS; see the read path's arm.
             "Apple_Rhapsody_UFS" => {
                 let fs_offset = resolve_next_label(&mut reader, partition_offset);
-                return Ok(Box::new(ufs::UfsFilesystem::open(reader, fs_offset)?));
+                return Ok(Box::new(open_ufs_editable(reader, fs_offset)?));
+            }
+            // The HP LIF boot volume; the row's size caps how far it may grow.
+            "LIF" => {
+                return Ok(Box::new(lif::LifFilesystem::open_editable(
+                    reader,
+                    partition_offset,
+                    partition_len,
+                )?));
             }
             "Apple_PRODOS" | "Apple_ProDOS" => {
                 return Ok(Box::new(prodos::ProDosFilesystem::open(
@@ -2437,6 +2538,16 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "qnx2" => Ok(Box::new(qnx2::Qnx2Filesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                // A tape is rebuilt whole on sync and replaces its own file (see sun2tape_edit).
+                "sun2tape" => Ok(Box::new(sun2tape_edit::TapeEditor::open(
+                    reader,
+                    partition_offset,
+                    edit_ctx.whole_file_path,
+                )?)),
                 "affs" => Ok(Box::new(affs::AffsFilesystem::open_sized(
                     reader,
                     partition_offset,
@@ -2458,16 +2569,17 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                 // open_filesystem). The EditableFilesystem impl is fixture-
                 // tested (create/rename/delete + fsck-clean); this arm is what
                 // makes it reachable.
-                "ufs" => Ok(Box::new(ufs::UfsFilesystem::open(
-                    reader,
-                    partition_offset,
-                )?)),
+                "ufs" => Ok(Box::new(open_ufs_editable(reader, partition_offset)?)),
                 // JFS is already editable through the 0x83 arm below; a bare
                 // JFS image is the same filesystem, so it opens here too.
                 // Its edit surface is metadata-only (`set_permissions` /
                 // `set_owner` / `repair`) — create/delete still report
                 // Unsupported, which is the caller's cue.
                 "jfs" => Ok(Box::new(jfs::JfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "vxfs" => Ok(Box::new(vxfs_edit::VxfsEditor::open(
                     reader,
                     partition_offset,
                 )?)),
@@ -2563,11 +2675,12 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
-                "ufs" => Ok(Box::new(ufs::UfsFilesystem::open(
+                "ufs" => Ok(Box::new(open_ufs_editable(reader, partition_offset)?)),
+                "jfs" => Ok(Box::new(jfs::JfsFilesystem::open(
                     reader,
                     partition_offset,
                 )?)),
-                "jfs" => Ok(Box::new(jfs::JfsFilesystem::open(
+                "vxfs" => Ok(Box::new(vxfs_edit::VxfsEditor::open(
                     reader,
                     partition_offset,
                 )?)),
@@ -2644,6 +2757,14 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
 }
 
 /// Open a filesystem by APM partition type string.
+/// Open UFS for editing; HP-UX HFS stays read-only until its write path is verified.
+fn open_ufs_editable<R: Read + Write + Seek + Send>(
+    reader: R,
+    offset: u64,
+) -> Result<ufs::UfsFilesystem<R>, FilesystemError> {
+    ufs::UfsFilesystem::open(reader, offset)
+}
+
 fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
     mut reader: R,
     partition_offset: u64,
@@ -2652,6 +2773,25 @@ fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
     passphrase: Option<&str>,
 ) -> Result<Box<dyn Filesystem>, FilesystemError> {
     match type_str {
+        // An LV split into several runs: stitch them into one volume and detect by content.
+        s if s.starts_with(crate::partition::lvm::LVM_RUNS) => {
+            let runs = crate::partition::lvm::decode_runs(s)
+                .ok_or_else(|| FilesystemError::Parse(format!("bad LV run list '{s}'")))?;
+            let lv = crate::partition::lvm::ExtentReader::new(reader, runs);
+            let len = lv.len();
+            // Boxed so the recursive open stays one type instead of nesting readers.
+            let lv: Box<dyn crate::rbformats::ReadSeek> = Box::new(lv);
+            open_filesystem_full(lv, 0, Some(len), 0x00, None, passphrase)
+        }
+        // An LV row that can't be opened carries its reason after the prefix.
+        s if s.starts_with(crate::partition::LVM_UNAVAILABLE) => Err(FilesystemError::Unsupported(
+            s[crate::partition::LVM_UNAVAILABLE.len()..].to_string(),
+        )),
+        // The HP LIF boot volume ahead of a BSD label or an HP-UX LVM area.
+        "LIF" => Ok(Box::new(lif::LifFilesystem::open(
+            reader,
+            partition_offset,
+        )?)),
         // "Apple_HFS" is the APM type string; "48465300-..." is the GPT
         // "Apple HFS/HFS+" type GUID (an HFS or HFS+ volume in a GPT-wrapped
         // disk, as produced by `hdiutil create` / UDIF DMGs). Both resolve
@@ -3161,6 +3301,10 @@ pub fn is_browsable_superfloppy(ptype: u8, type_name: &str) -> bool {
             | "minix"
             // UCSD p-System (Apple II/III Pascal floppies); block-2 volume label.
             | "ucsd"
+            // QNX 2 (Unisys ICON floppies); root entry at byte 68 of block 1.
+            | "QNX2"
+            | "QNX4"
+            | "QNX6"
             | "ADFS"
             | "ANDOS"
             | "QDOS"
@@ -3367,6 +3511,7 @@ pub fn is_checkable_fs_name(type_name: &str) -> bool {
         "HPFS",
         "MINIX",
         "UCSD",
+        "QNX",
         "BFS",
         "OFS",
         "SOLARIS",

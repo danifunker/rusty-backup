@@ -1,0 +1,64 @@
+# Tier 3 — write to HP-UX HFS (/stand of an HP-UX 11.11 install).
+#
+# The fixture is lvol1 of part.hpux-lvm.hpux1111-hp715.hd, extracted so a run
+# copies 300 MiB rather than 8 GiB. The same edits were checked by HP-UX 11.11's
+# own `fsck -F hfs -f -n` under QEMU B160L (clean, exit 0) and read back after
+# `mount -F hfs`; HP-UX's own writes (fast and slow symlinks, a 24-byte
+# directory) were then read and extended here and passed its fsck again.
+#
+# What this pins, each of which HP's fsck rejected before the fix:
+#   - small files and new directories get a fragment tail, not a whole block
+#     (INCORRECT BLOCK COUNT, BLK(S) MISSING);
+#   - a directory outgrowing its fragment moves to a larger run (`realloccg`);
+#   - deleting a file HP-UX wrote frees only its tail fragments;
+#   - cg_frsum / cg_btot / cg_b follow every bitmap change (BAD CYLINDER GROUPS);
+#   - uid / gid live in the 16-bit slots at dinode bytes 4 / 6.
+
+[meta]
+tier = 3
+group = "edit.hpux-hfs"
+description = "Edit HP-UX HFS /stand: tails, directory growth, deletes of HP-written files; fsck clean throughout."
+
+[[case]]
+id = "edit.hpux-hfs.stand1111"
+description = "HP-HFS: put / mkdir / chown / chmod / mv / rm and directory growth past a fragment"
+fixture = "fs.hpux-hfs.stand1111-hp715.hd"
+timeout_ms = 600000
+[[case.step]]
+args = ["put", "{fixture_copy}", "{cases}/tier3/payload.bin", "/rbtest.txt"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{fixture_copy}", "/rbtest.txt", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+[[case.step]]
+args = ["chown", "{fixture_copy}", "/rbtest.txt", "100:20"]
+expect_exit = 0
+[[case.step]]
+args = ["chmod", "{fixture_copy}", "/rbtest.txt", "0640"]
+expect_exit = 0
+[[case.step]]
+args = ["mkdir", "{fixture_copy}", "/rbdir"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{fixture_copy}", "--zero", "10", "--dst", "/rbdir/file-with-a-fairly-long-name-{001..300}"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{fixture_copy}", "--zero", "0", "--dst", "/root-entry-number-{01..60}"]
+expect_exit = 0
+[[case.step]]
+args = ["mv", "{fixture_copy}", "/kernrel", "/kernrel.renamed"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{fixture_copy}", "/system.b160l"]
+expect_exit = 0
+[[case.step]]
+args = ["rm", "{fixture_copy}", "/rbdir/file-with-a-fairly-long-name-150"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{fixture_copy}", "/", "--format", "json"]
+expect_exit = 0
+stdout_contains = ["\"name\": \"rbtest.txt\"", "\"mode\": \"-rw-r-----\"", "\"uid\": 100", "\"gid\": 20", "kernrel.renamed"]
+[[case.step]]
+args = ["fsck", "{fixture_copy}", "--checkonly"]
+expect_exit = 0

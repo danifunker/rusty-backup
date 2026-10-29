@@ -113,6 +113,15 @@ pub fn run(args: EditArgs) -> Result<()> {
         bail!("{} is a directory", args.path);
     }
 
+    // A text edit holds the file in memory; refuse something no editor session should load.
+    const MAX_EDIT_BYTES: u64 = 64 * 1024 * 1024;
+    if entry.size > MAX_EDIT_BYTES {
+        bail!(
+            "{} is {} bytes; edit is for text files up to {MAX_EDIT_BYTES} bytes",
+            args.path,
+            entry.size
+        );
+    }
     let original = fs
         .read_file(&entry, usize::MAX)
         .map_err(|e| anyhow!("reading {}: {e}", args.path))?;

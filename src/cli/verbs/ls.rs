@@ -64,6 +64,11 @@ pub struct LsArgs {
     #[arg(short = 'o', long = "owner")]
     pub owner: bool,
 
+    /// Also list deleted entries the filesystem can still read (QNX 2). They
+    /// are named `NAME [deleted]` and can be extracted with `get --deleted`.
+    #[arg(long)]
+    pub deleted: bool,
+
     /// Password for encrypted containers (WinImage IMZ, password-protected
     /// `.zip` disks) or an encrypted filesystem (APFS FileVault — the volume
     /// password or personal recovery key).
@@ -118,6 +123,7 @@ impl LsRow {
             // Resolving ids to names needs the image's own passwd/group, which
             // is only read under `--owner`.
             owner: match (id_names, entry.uid, entry.gid) {
+                (Some(_), _, _) if entry.owner_label.is_some() => entry.owner_label.clone(),
                 (Some(names), Some(u), Some(g)) => Some(names.format_owner(u, g)),
                 _ => None,
             },
@@ -160,6 +166,9 @@ pub fn run(args: LsArgs) -> Result<()> {
             &args.image.path,
         )
     })?;
+    if args.deleted && !fs.set_show_deleted(true) {
+        bail!("{} volumes keep no readable deleted entries", fs.fs_type());
+    }
 
     // Volume-level advisory: surface the blessed System Folder (HFS / HFS+)
     // so users see what's currently bootable without a separate `bless show`.
@@ -341,12 +350,18 @@ fn print_entry(
     // Mac type/creator columns, which are empty on a Unix image anyway.
     if let Some(names) = id_names {
         let perms = entry.mode_string().unwrap_or_else(|| "---------".into());
-        let owner = match (entry.uid, entry.gid) {
-            (Some(u), Some(g)) => names.format_owner(u, g),
+        let owner = match (&entry.owner_label, entry.uid, entry.gid) {
+            (Some(label), _, _) => label.clone(),
+            (None, Some(u), Some(g)) => names.format_owner(u, g),
             _ => "-".into(),
         };
+        let attrs = entry
+            .native_attrs
+            .as_deref()
+            .map(|a| format!("  ({a})"))
+            .unwrap_or_default();
         out_stdout(format!(
-            "{kind}  {perms}  {:>18}  {:>10}  {display_name}",
+            "{kind}  {perms}  {:>18}  {:>10}  {display_name}{attrs}",
             owner, entry.size
         ));
         return;

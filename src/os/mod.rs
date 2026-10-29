@@ -821,8 +821,76 @@ impl Seek for SectorAlignedWriter {
     }
 }
 
+/// False under `no-physical-devices` (app-store builds); see docs/no_physical_devices.md.
+pub const PHYSICAL_DEVICES_ENABLED: bool = !cfg!(feature = "no-physical-devices");
+
+/// Why a physical-device request was refused in a `no-physical-devices` build.
+pub const PHYSICAL_DEVICES_DISABLED: &str =
+    "physical disk and drive access is not available in this build; use a disk image file instead";
+
+/// Refuse any physical-device operation (enumeration, elevation, drive opens) in this build.
+pub fn ensure_physical_enabled() -> Result<()> {
+    if !PHYSICAL_DEVICES_ENABLED {
+        anyhow::bail!("{PHYSICAL_DEVICES_DISABLED}");
+    }
+    Ok(())
+}
+
+/// Refuse `path` when it names a physical device and this build has device access compiled out.
+pub fn ensure_physical_allowed(path: &Path) -> Result<()> {
+    if !PHYSICAL_DEVICES_ENABLED && is_physical_device(path) {
+        anyhow::bail!("{PHYSICAL_DEVICES_DISABLED}");
+    }
+    Ok(())
+}
+
+/// Whether `path` reaches a disk or drive: by name, or (Unix) by node type, so a symlink to one counts.
+pub fn is_physical_device(path: &Path) -> bool {
+    if is_pseudo_device(path) {
+        return false;
+    }
+    if is_device_path(path) {
+        return true;
+    }
+    let s = path.to_string_lossy().to_ascii_lowercase();
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        if rest.starts_with("globalroot")
+            || rest.starts_with("volume{")
+            || rest.starts_with("physicaldrive")
+        {
+            return true;
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        if let Ok(meta) = fs::metadata(path) {
+            let ft = meta.file_type();
+            if ft.is_block_device() || ft.is_char_device() {
+                return !fs::canonicalize(path).is_ok_and(|c| is_pseudo_device(&c));
+            }
+        }
+    }
+    false
+}
+
+/// `/dev` nodes that are streams, not disks, so a scripted `rb-cli` can still use them.
+fn is_pseudo_device(path: &Path) -> bool {
+    let s = path.to_string_lossy();
+    let Some(name) = s.strip_prefix("/dev/") else {
+        return false;
+    };
+    matches!(
+        name,
+        "null" | "zero" | "full" | "random" | "urandom" | "tty" | "stdin" | "stdout" | "stderr"
+    ) || name.starts_with("fd/")
+}
+
 /// Enumerate physical disk devices using platform-specific methods.
 pub fn enumerate_devices() -> Vec<DiskDevice> {
+    if !PHYSICAL_DEVICES_ENABLED {
+        return Vec::new();
+    }
     #[cfg(target_os = "macos")]
     {
         macos::enumerate_devices()
@@ -862,6 +930,7 @@ pub fn enumerate_devices() -> Vec<DiskDevice> {
 /// Returns an `ElevatedSource` containing the opened file. Any temporary files
 /// are automatically cleaned up when the `ElevatedSource` is dropped.
 pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
+    ensure_physical_allowed(path)?;
     #[cfg(target_os = "macos")]
     {
         macos::open_source_for_reading(path)
@@ -926,6 +995,7 @@ pub fn is_device_path(path: &Path) -> bool {
 }
 
 fn open_target_for_writing_inner(path: &Path, truncate: bool) -> Result<DeviceWriteHandle> {
+    ensure_physical_allowed(path)?;
     let is_device = is_device_path(path);
 
     if !is_device && !truncate {
@@ -1211,6 +1281,7 @@ pub fn available_space(path: &Path) -> Option<u64> {
 ///
 /// This function will exit the current process if elevation is successful.
 pub fn request_elevation() -> Result<()> {
+    ensure_physical_enabled()?;
     #[cfg(target_os = "windows")]
     {
         windows::request_elevation()
@@ -1520,5 +1591,80 @@ mod sync_tests {
         f.write_all(b"payload").expect("write");
         sync_committed(&f).expect("a regular file must sync");
         assert_eq!(std::fs::read(&path).expect("read"), b"payload");
+    }
+}
+
+#[cfg(test)]
+mod physical_gate_tests {
+    use super::*;
+
+    #[test]
+    fn device_names_are_physical() {
+        assert!(is_physical_device(Path::new("/dev/sda")));
+        assert!(is_physical_device(Path::new("/dev/rdisk2")));
+        assert!(is_physical_device(Path::new(r"\\.\PhysicalDrive1")));
+        assert!(is_physical_device(Path::new(
+            r"\\?\GLOBALROOT\Device\Harddisk0\Partition0"
+        )));
+        assert!(!is_physical_device(Path::new(r"\\?\C:\images\disk.img")));
+    }
+
+    #[test]
+    fn stream_nodes_and_files_are_not_physical() {
+        for p in [
+            "/dev/null",
+            "/dev/zero",
+            "/dev/stdin",
+            "/dev/fd/0",
+            "relative.img",
+        ] {
+            assert!(!is_physical_device(Path::new(p)), "{p}");
+        }
+        let f = tempfile::NamedTempFile::new().unwrap();
+        assert!(!is_physical_device(f.path()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn symlink_to_a_block_device_is_physical() {
+        let Some(dev) = fs::read_dir("/sys/block")
+            .ok()
+            .and_then(|mut d| d.next())
+            .and_then(|e| e.ok())
+            .map(|e| Path::new("/dev").join(e.file_name()))
+            .filter(|p| p.exists())
+        else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("innocent.img");
+        std::os::unix::fs::symlink(&dev, &link).unwrap();
+        assert!(is_physical_device(&link));
+    }
+
+    #[cfg(not(feature = "no-physical-devices"))]
+    #[test]
+    fn default_build_allows_devices() {
+        assert!(ensure_physical_enabled().is_ok());
+        assert!(ensure_physical_allowed(Path::new("/dev/sda")).is_ok());
+    }
+
+    #[cfg(feature = "no-physical-devices")]
+    #[test]
+    fn gated_build_refuses_devices_but_not_images() {
+        assert!(enumerate_devices().is_empty());
+        assert!(ensure_physical_enabled().is_err());
+        assert!(request_elevation().is_err());
+        let err = open_source_for_reading(Path::new("/dev/sda"))
+            .err()
+            .unwrap();
+        assert!(
+            err.to_string().contains("not available in this build"),
+            "{err}"
+        );
+        assert!(open_target_for_writing(Path::new(r"\\.\PhysicalDrive0")).is_err());
+        let f = tempfile::NamedTempFile::new().unwrap();
+        assert!(open_source_for_reading(f.path()).is_ok());
+        assert!(open_target_preserving(f.path()).is_ok());
     }
 }

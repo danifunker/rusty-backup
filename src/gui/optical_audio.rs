@@ -2,13 +2,12 @@
 //!
 //! Two pieces live here:
 //!
-//! - [`AudioPlayback`] — the rodio backend. Playing an audio track (see
-//!   [`rusty_backup::optical::cd_audio`]) can be slow to start — a CHD extracts
-//!   the whole disc to a temporary BIN first — so all the work runs on a
-//!   dedicated thread. The UI polls [`AudioPlayback::state`] each frame and
-//!   offers a Stop button. rodio's `OutputStream` is `!Send`, so it is created
-//!   and owned entirely on the playback thread; the UI only ever touches the
-//!   shared state flag.
+//! - [`AudioPlayback`] — the rodio backend. Decoding and playing a track (see
+//!   [`rusty_backup::optical::cd_audio`]) blocks for the whole track, so all the
+//!   work runs on a dedicated thread. The UI polls [`AudioPlayback::state`] each
+//!   frame and offers a Stop button. rodio's device sink is created and owned
+//!   entirely on the playback thread; the UI only ever touches the shared state
+//!   flag.
 //! - [`OpticalAudioPlayer`] — the tab-side widget: track list, active job,
 //!   and the pop-out modal with per-track play/stop. Held as a field on
 //!   `OpticalTab`; `set_disc` loads a disc's tracks and `ui` draws the player.
@@ -18,6 +17,8 @@
 //! Ported from the ODE artwork-downloader's `src/gui/audio.rs` + the audio
 //! player pieces of its `src/gui/app.rs`.
 
+use std::num::NonZero;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -35,7 +36,7 @@ const MAX_QUEUED_CHUNKS: usize = 4;
 /// Lifecycle of a single track's playback.
 #[derive(Clone, Debug, PartialEq)]
 pub enum PlaybackState {
-    /// Extracting the disc to a temp BIN — no audio yet.
+    /// Opening the image and the audio device — no audio yet.
     Preparing,
     /// Audio is streaming to the output device.
     Playing,
@@ -66,7 +67,7 @@ impl AudioPlayback {
         let state_bg = Arc::clone(&state);
         let play_start_bg = Arc::clone(&play_start);
 
-        // Detached: the worker owns its rodio stream and the temp extraction,
+        // Detached: the worker owns its rodio stream and the disc reader,
         // and tears itself down when it sees the stop flag or finishes.
         thread::spawn(move || run(image_path, track, &stop_bg, &state_bg, &play_start_bg));
 
@@ -103,8 +104,8 @@ impl AudioPlayback {
             .and_then(|p| p.map(|t| t.elapsed().as_secs_f64()))
     }
 
-    /// Signal the worker to stop. Extraction in progress stops at the next
-    /// chunk boundary; queued audio is cut immediately.
+    /// Signal the worker to stop. Within ~20 ms it cuts the queued audio and
+    /// stops reading the track.
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
     }
@@ -114,6 +115,20 @@ impl Drop for AudioPlayback {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+/// Wrap interleaved 16-bit CD-DA PCM as a rodio buffer (rodio 0.21+ mixes in f32).
+fn cdda_buffer(samples: &[i16]) -> SamplesBuffer {
+    const CHANNELS: NonZero<u16> = NonZero::new(CDDA_CHANNELS).unwrap();
+    const RATE: NonZero<u32> = NonZero::new(CDDA_SAMPLE_RATE).unwrap();
+    SamplesBuffer::new(
+        CHANNELS,
+        RATE,
+        samples
+            .iter()
+            .map(|&s| rodio::Sample::from(s) / 32768.0)
+            .collect::<Vec<_>>(),
+    )
 }
 
 fn set(state: &Arc<Mutex<PlaybackState>>, value: PlaybackState) {
@@ -129,7 +144,7 @@ fn run(
     state: &Arc<Mutex<PlaybackState>>,
     play_start: &Arc<Mutex<Option<Instant>>>,
 ) {
-    let (_stream, handle) = match rodio::OutputStream::try_default() {
+    let mut device = match rodio::DeviceSinkBuilder::open_default_sink() {
         Ok(out) => out,
         Err(e) => {
             return set(
@@ -138,10 +153,8 @@ fn run(
             )
         }
     };
-    let sink = match rodio::Sink::try_new(&handle) {
-        Ok(s) => s,
-        Err(e) => return set(state, PlaybackState::Failed(format!("audio sink: {e}"))),
-    };
+    device.log_on_drop(false);
+    let sink = rodio::Player::connect_new(device.mixer());
 
     let mut started = false;
     let result = cd_audio::extract_audio_pcm(&image_path, track, |samples| {
@@ -152,29 +165,23 @@ fn run(
             set(state, PlaybackState::Playing);
             started = true;
         }
-        // Bounded queue: wait while the sink is a few chunks ahead, bailing if
-        // the user hit Stop.
-        while sink.len() >= MAX_QUEUED_CHUNKS {
+        // Bounded queue: wait while the sink is a few chunks ahead; on Stop, cut it now.
+        loop {
             if stop.load(Ordering::Relaxed) {
-                return;
+                sink.stop();
+                return ControlFlow::Break(());
+            }
+            if sink.len() < MAX_QUEUED_CHUNKS {
+                break;
             }
             thread::sleep(Duration::from_millis(20));
         }
-        sink.append(SamplesBuffer::new(
-            CDDA_CHANNELS,
-            CDDA_SAMPLE_RATE,
-            samples.to_vec(),
-        ));
+        sink.append(cdda_buffer(samples));
+        ControlFlow::Continue(())
     });
 
     if let Err(e) = result {
-        // A stop during extraction surfaces as a short-read/None, not a real
-        // failure — report Finished in that case.
-        if stop.load(Ordering::Relaxed) {
-            set(state, PlaybackState::Finished);
-        } else {
-            set(state, PlaybackState::Failed(e));
-        }
+        set(state, PlaybackState::Failed(e));
         return;
     }
 
@@ -214,7 +221,7 @@ pub struct OpticalAudioPlayer {
 impl OpticalAudioPlayer {
     /// Load audio-track metadata for a disc image. Clears any prior state first.
     /// A no-op for unsupported formats (device paths, ISO, etc.) — those simply
-    /// leave the player hidden. Cheap: CHD reads only the TOC (no extraction);
+    /// leave the player hidden. Cheap: CHD reads only the track metadata;
     /// BIN/CUE parses the cue sheet.
     pub fn set_disc(&mut self, path: &Path) {
         self.clear();
@@ -341,113 +348,114 @@ impl OpticalAudioPlayer {
         let mut do_stop = false;
         let mut close = false;
 
-        let modal = egui::Modal::new(egui::Id::new("optical_audio_player_modal")).show(ctx, |ui| {
-            ui.set_min_width(460.0);
+        let modal =
+            egui::Modal::new(egui::Id::unique("optical_audio_player_modal")).show(ctx, |ui| {
+                ui.set_min_width(460.0);
 
-            ui.horizontal(|ui| {
-                ui.heading("Audio Tracks");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Close").clicked() {
-                        close = true;
-                    }
+                ui.horizontal(|ui| {
+                    ui.heading("Audio Tracks");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Close").clicked() {
+                            close = true;
+                        }
+                    });
                 });
-            });
 
-            // Now-playing banner: position in seconds + progress bar.
-            if let Some((track, state, elapsed)) = active.as_ref() {
-                let total = self
-                    .tracks
-                    .as_ref()
-                    .and_then(|ts| ts.iter().find(|t| t.number == *track))
-                    .map(|t| f64::from(t.frames) / 75.0)
-                    .unwrap_or(0.0);
-                match state {
-                    PlaybackState::Preparing => {
-                        ui.label(format!("Track {track}: preparing..."));
+                // Now-playing banner: position in seconds + progress bar.
+                if let Some((track, state, elapsed)) = active.as_ref() {
+                    let total = self
+                        .tracks
+                        .as_ref()
+                        .and_then(|ts| ts.iter().find(|t| t.number == *track))
+                        .map(|t| f64::from(t.frames) / 75.0)
+                        .unwrap_or(0.0);
+                    match state {
+                        PlaybackState::Preparing => {
+                            ui.label(format!("Track {track}: preparing..."));
+                        }
+                        PlaybackState::Playing => {
+                            let pos = elapsed.unwrap_or(0.0).min(total);
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Playing track {track}   {pos:.0}s / {total:.0}s"
+                                ))
+                                .strong(),
+                            );
+                            let frac = if total > 0.0 {
+                                (pos / total) as f32
+                            } else {
+                                0.0
+                            };
+                            ui.add(egui::ProgressBar::new(frac).desired_height(6.0));
+                        }
+                        _ => {}
                     }
-                    PlaybackState::Playing => {
-                        let pos = elapsed.unwrap_or(0.0).min(total);
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "Playing track {track}   {pos:.0}s / {total:.0}s"
-                            ))
-                            .strong(),
-                        );
-                        let frac = if total > 0.0 {
-                            (pos / total) as f32
-                        } else {
-                            0.0
-                        };
-                        ui.add(egui::ProgressBar::new(frac).desired_height(6.0));
-                    }
-                    _ => {}
                 }
-            }
 
-            if let Some(err) = self.error.as_ref() {
-                ui.colored_label(
-                    super::theme::danger(ui.visuals()),
-                    format!("Playback failed: {err}"),
-                );
-            }
+                if let Some(err) = self.error.as_ref() {
+                    ui.colored_label(
+                        super::theme::danger(ui.visuals()),
+                        format!("Playback failed: {err}"),
+                    );
+                }
 
-            ui.separator();
+                ui.separator();
 
-            // Multi-column grid of tracks.
-            const COLS: usize = 3;
-            egui::ScrollArea::vertical()
-                .max_height(360.0)
-                .show(ui, |ui| {
-                    egui::Grid::new("optical_audio_tracks_grid")
-                        .num_columns(COLS)
-                        .spacing([18.0, 8.0])
-                        .show(ui, |ui| {
-                            let audio: Vec<&CdTrack> = self
-                                .tracks
-                                .as_ref()
-                                .map(|ts| ts.iter().filter(|t| t.is_audio).collect())
-                                .unwrap_or_default();
-                            for (i, t) in audio.iter().enumerate() {
-                                let is_this = active
+                // Multi-column grid of tracks.
+                const COLS: usize = 3;
+                egui::ScrollArea::vertical()
+                    .max_height(360.0)
+                    .show(ui, |ui| {
+                        egui::Grid::new("optical_audio_tracks_grid")
+                            .num_columns(COLS)
+                            .spacing([18.0, 8.0])
+                            .show(ui, |ui| {
+                                let audio: Vec<&CdTrack> = self
+                                    .tracks
                                     .as_ref()
-                                    .map(|(n, _, _)| *n == t.number)
-                                    .unwrap_or(false);
-                                ui.horizontal(|ui| {
-                                    if is_this {
-                                        if ui.button("Stop").on_hover_text("Stop").clicked() {
-                                            do_stop = true;
-                                        }
-                                    } else if ui
-                                        .add_enabled(!busy, egui::Button::new("Play"))
-                                        .clicked()
-                                    {
-                                        to_play = Some(t.number);
-                                    }
-
-                                    match active.as_ref() {
-                                        Some((n, PlaybackState::Playing, elapsed))
-                                            if *n == t.number =>
+                                    .map(|ts| ts.iter().filter(|t| t.is_audio).collect())
+                                    .unwrap_or_default();
+                                for (i, t) in audio.iter().enumerate() {
+                                    let is_this = active
+                                        .as_ref()
+                                        .map(|(n, _, _)| *n == t.number)
+                                        .unwrap_or(false);
+                                    ui.horizontal(|ui| {
+                                        if is_this {
+                                            if ui.button("Stop").on_hover_text("Stop").clicked() {
+                                                do_stop = true;
+                                            }
+                                        } else if ui
+                                            .add_enabled(!busy, egui::Button::new("Play"))
+                                            .clicked()
                                         {
-                                            let total = f64::from(t.frames) / 75.0;
-                                            let pos = elapsed.unwrap_or(0.0).min(total);
-                                            ui.label(format!("Track {} - {pos:.0}s", t.number));
+                                            to_play = Some(t.number);
                                         }
-                                        _ => {
-                                            ui.label(format!(
-                                                "Track {} ({})",
-                                                t.number,
-                                                t.duration_mmss()
-                                            ));
+
+                                        match active.as_ref() {
+                                            Some((n, PlaybackState::Playing, elapsed))
+                                                if *n == t.number =>
+                                            {
+                                                let total = f64::from(t.frames) / 75.0;
+                                                let pos = elapsed.unwrap_or(0.0).min(total);
+                                                ui.label(format!("Track {} - {pos:.0}s", t.number));
+                                            }
+                                            _ => {
+                                                ui.label(format!(
+                                                    "Track {} ({})",
+                                                    t.number,
+                                                    t.duration_mmss()
+                                                ));
+                                            }
                                         }
+                                    });
+                                    if (i + 1) % COLS == 0 {
+                                        ui.end_row();
                                     }
-                                });
-                                if (i + 1) % COLS == 0 {
-                                    ui.end_row();
                                 }
-                            }
-                        });
-                });
-        });
+                            });
+                    });
+            });
 
         // Escape / click-outside also closes the modal.
         if modal.should_close() {

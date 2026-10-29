@@ -33,6 +33,11 @@ use super::metadata_editor::{
     XattrEditorState,
 };
 
+/// Smallest file offered "Open as Disk Image": below this nothing holds a partitioned volume.
+const MIN_NESTED_IMAGE_BYTES: u64 = 16 * 1024;
+/// Free space kept spare beyond the image size when copying it out for "Open as Disk Image".
+const NESTED_FREE_MARGIN: u64 = 64 * 1024 * 1024;
+
 const MAX_PREVIEW_SIZE: usize = 1024 * 1024; // 1 MB max file preview
 
 /// Upper bound on bytes read off the disk image to sniff whether the
@@ -108,10 +113,18 @@ pub struct BrowseView {
     resource_fork_mode: ResourceForkMode,
     /// How to encode ProDOS type/aux on extract (ProDOS only).
     prodos_export_mode: ProdosExportMode,
+    /// List deleted entries the filesystem can still read (QNX 2).
+    show_deleted: bool,
+    /// Convert RS line separators in text files to LF on extract (QNX 2).
+    rs_to_lf: bool,
     /// Active extraction progress (shared with background thread).
     extraction_progress: Option<Arc<Mutex<ExtractionProgress>>>,
     /// Message to show after extraction completes.
     extraction_result: Option<String>,
+    /// Temp dir an "Open as Disk Image" extraction is writing into, until it finishes.
+    nested_open: Option<tempfile::TempDir>,
+    /// A finished "Open as Disk Image" extraction, for the Inspect tab to load.
+    nested_ready: Option<(PathBuf, tempfile::TempDir)>,
     /// Whether edit mode is enabled (allows adding/deleting files).
     edit_mode: bool,
     /// Whether editing is possible for this source (not Clonezilla/streaming).
@@ -439,8 +452,12 @@ impl Default for BrowseView {
             active: false,
             resource_fork_mode: ResourceForkMode::AppleDouble,
             prodos_export_mode: ProdosExportMode::WithTypeSuffix,
+            show_deleted: false,
+            rs_to_lf: false,
             extraction_progress: None,
             extraction_result: None,
+            nested_open: None,
+            nested_ready: None,
             edit_mode: false,
             edit_supported: false,
             edit_result: None,
@@ -985,6 +1002,17 @@ impl BrowseView {
                     rusty_backup::fs::carve::set_full_scan(self.carve_full_scan);
                     self.error = None;
                     self.pending_open = Some(self.session.spawn_open());
+                }
+            }
+
+            if self.fs_type == "QNX 2" {
+                ui.add_space(8.0);
+                let resp = ui.checkbox(&mut self.show_deleted, "Show deleted");
+                resp.clone().on_hover_text(
+                    "List deleted entries whose data can still be read, named 'NAME [deleted]'.",
+                );
+                if resp.changed() {
+                    self.invalidate_all_caches();
                 }
             }
 
@@ -1828,7 +1856,11 @@ impl BrowseView {
 
         if let Some(mut fs) = self.take_or_open_fs() {
             match fs.read_file(entry, MAX_PREVIEW_SIZE) {
-                Ok(data) => {
+                Ok(mut data) => {
+                    if self.fs_type == "QNX 2" && rusty_backup::fs::qnx2::looks_like_rs_text(&data)
+                    {
+                        data = rusty_backup::fs::qnx2::rs_to_lf(&data);
+                    }
                     self.content = Some(file_detail::detect_content_type(entry, &data));
                 }
                 Err(e) => {
@@ -2046,6 +2078,13 @@ impl BrowseView {
                             ui.add_space(8.0);
                         }
 
+                        if self.fs_type == "QNX 2" {
+                            ui.checkbox(&mut self.rs_to_lf, "Text: RS to LF").on_hover_text(
+                                "Convert QNX line separators (RS, 0x1E) to LF in files that look like text.",
+                            );
+                            ui.add_space(8.0);
+                        }
+
                         // ProDOS export mode dropdown (ProDOS only)
                         if self.is_prodos_type() {
                             ui.label("Export name:");
@@ -2094,6 +2133,20 @@ impl BrowseView {
                             .clicked()
                         {
                             self.start_tar_export(&entry);
+                        }
+
+                        if entry.is_file()
+                            && entry.size >= MIN_NESTED_IMAGE_BYTES
+                            && ui
+                                .button("Open as Disk Image")
+                                .on_hover_text(
+                                    "Copy this file to a temporary folder and inspect it as \
+                                     its own disk image, e.g. a ShapeShifter hardfile or a \
+                                     floppy image stored on this volume.",
+                                )
+                                .clicked()
+                        {
+                            self.start_nested_open(&entry);
                         }
 
                         // Workflow C: the selection already sniffed as a
@@ -2253,6 +2306,48 @@ impl BrowseView {
     }
 
     /// Start extracting the selected entry to a user-chosen folder.
+    /// A finished "Open as Disk Image" copy: the image path and the temp dir that owns it.
+    pub fn take_nested_open(&mut self) -> Option<(PathBuf, tempfile::TempDir)> {
+        self.nested_ready.take()
+    }
+
+    /// Stream `entry` into a fresh temp dir, then hand it to Inspect as a disk image.
+    fn start_nested_open(&mut self, entry: &FileEntry) {
+        if !self.staged_edits.is_empty() {
+            self.extraction_result = Some(
+                "Apply or discard the staged edits first: opening a disk image replaces this view."
+                    .to_string(),
+            );
+            return;
+        }
+        let temp = match tempfile::Builder::new().prefix("rb-nested-").tempdir() {
+            Ok(t) => t,
+            Err(e) => {
+                self.extraction_result = Some(format!("Open as disk image failed: {e}"));
+                return;
+            }
+        };
+        let needed = entry.size.saturating_add(NESTED_FREE_MARGIN);
+        if let Some(free) = rusty_backup::os::available_space(temp.path()) {
+            if free < needed {
+                self.extraction_result = Some(format!(
+                    "Not enough free space to open {} as a disk image: it needs {} in {}, \
+                     which has {} free. Point TMPDIR at a larger drive, or extract it instead.",
+                    entry.name,
+                    super::bytes_human(needed),
+                    temp.path().parent().unwrap_or(temp.path()).display(),
+                    super::bytes_human(free),
+                ));
+                return;
+            }
+        }
+        let dest = temp.path().to_path_buf();
+        self.nested_open = Some(temp);
+        let mode = std::mem::replace(&mut self.resource_fork_mode, ResourceForkMode::DataForkOnly);
+        self.launch_extraction(entry.clone(), dest);
+        self.resource_fork_mode = mode;
+    }
+
     fn start_extraction(&mut self, entry: &FileEntry) {
         // Pick destination folder
         let dest = match rfd::FileDialog::new()
@@ -2332,6 +2427,7 @@ impl BrowseView {
         let resource_fork_mode = self.resource_fork_mode;
         let is_prodos = self.is_prodos_type();
         let prodos_export_mode = self.prodos_export_mode;
+        let rs_to_lf = self.rs_to_lf && self.fs_type == "QNX 2";
 
         let progress = Arc::new(Mutex::new(ExtractionProgress {
             current_bytes: 0,
@@ -2357,6 +2453,7 @@ impl BrowseView {
                 resource_fork_mode,
                 is_prodos,
                 prodos_export_mode,
+                rs_to_lf,
                 &progress,
             );
 
@@ -3691,6 +3788,19 @@ impl BrowseView {
         host_path: &std::path::Path,
         parent: &FileEntry,
     ) -> bool {
+        // Detection needs the whole file; past 64 MiB only a Mac-archive extension earns that read.
+        let size = std::fs::metadata(host_path).map(|m| m.len()).unwrap_or(0);
+        let named_archive = host_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| {
+                rusty_backup::model::file_types::MAC_ARCHIVE_EXTS
+                    .iter()
+                    .any(|a| a.eq_ignore_ascii_case(e))
+            });
+        if size > rusty_backup::fs::mem_archive::INLINE_MAX && !named_archive {
+            return false;
+        }
         let raw = match std::fs::read(host_path) {
             Ok(bytes) => bytes,
             Err(_) => return false,
@@ -4743,7 +4853,7 @@ impl BrowseView {
         };
 
         egui::Window::new(title)
-            .id(egui::Id::new("archive_import_dialog"))
+            .id(egui::Id::unique("archive_import_dialog"))
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -4932,7 +5042,7 @@ impl BrowseView {
         };
 
         egui::Window::new(title)
-            .id(egui::Id::new("mac_archive_window"))
+            .id(egui::Id::unique("mac_archive_window"))
             .collapsible(false)
             .resizable(true)
             .default_size([640.0, 480.0])
@@ -5113,7 +5223,7 @@ impl BrowseView {
         };
 
         egui::Window::new("Save Mac archive")
-            .id(egui::Id::new("archive_extract_dialog"))
+            .id(egui::Id::unique("archive_extract_dialog"))
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -5953,7 +6063,7 @@ impl BrowseView {
             i.raw
                 .dropped_files
                 .iter()
-                .filter_map(|f| f.path.clone())
+                .filter_map(|f| super::non_empty_path(f.path()))
                 .collect()
         });
 
@@ -6042,7 +6152,12 @@ impl BrowseView {
             return Some(fs);
         }
         match self.session.open() {
-            Ok(fs) => Some(fs),
+            Ok(mut fs) => {
+                if self.show_deleted {
+                    fs.set_show_deleted(true);
+                }
+                Some(fs)
+            }
             Err(e) => {
                 log::debug!("session.open() failed: {e}");
                 None
@@ -6106,8 +6221,26 @@ impl BrowseView {
             None
         };
         if let Some(msg) = finished_msg {
-            self.extraction_result = Some(msg);
             self.extraction_progress = None;
+            if let Some(temp) = self.nested_open.take() {
+                let extracted = std::fs::read_dir(temp.path())
+                    .ok()
+                    .and_then(|mut d| d.find_map(|e| e.ok()))
+                    .map(|e| e.path());
+                match extracted {
+                    Some(path) if !msg.starts_with("Extraction failed") => {
+                        self.extraction_result =
+                            Some(format!("Opening {} as a disk image...", path.display()));
+                        self.nested_ready = Some((path, temp));
+                    }
+                    _ => {
+                        self.extraction_result =
+                            Some(msg.replacen("Extraction", "Open as disk image", 1));
+                    }
+                }
+                return;
+            }
+            self.extraction_result = Some(msg);
         }
     }
 }
@@ -6120,6 +6253,7 @@ fn run_extraction(
     resource_fork_mode: ResourceForkMode,
     is_prodos: bool,
     prodos_export_mode: ProdosExportMode,
+    rs_to_lf: bool,
     progress: &Arc<Mutex<ExtractionProgress>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut counting_fs = session.open()?;
@@ -6142,6 +6276,7 @@ fn run_extraction(
         resource_fork_mode,
         is_prodos,
         prodos_export_mode,
+        rs_to_lf,
         progress,
     )?;
 
@@ -6189,6 +6324,7 @@ fn extract_entry(
     resource_fork_mode: ResourceForkMode,
     is_prodos: bool,
     prodos_export_mode: ProdosExportMode,
+    rs_to_lf: bool,
     progress: &Arc<Mutex<ExtractionProgress>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Check for cancellation
@@ -6221,6 +6357,20 @@ fn extract_entry(
                 p.current_file = entry.path.clone();
             }
 
+            if rs_to_lf && entry.size <= 16 << 20 {
+                let data = fs.read_file(entry, usize::MAX)?;
+                if rusty_backup::fs::qnx2::looks_like_rs_text(&data) {
+                    std::fs::write(
+                        dest.join(&safe_name),
+                        rusty_backup::fs::qnx2::rs_to_lf(&data),
+                    )?;
+                    if let Ok(mut p) = progress.lock() {
+                        p.current_bytes += data.len() as u64;
+                        p.files_extracted += 1;
+                    }
+                    return Ok(());
+                }
+            }
             // All fork formats (MacBinary / BinHex / AppleDouble / Native /
             // SeparateRsrc / DataForkOnly) go through the shared per-file
             // exporter so the browse view and Commander produce identical output.
@@ -6248,6 +6398,7 @@ fn extract_entry(
                     resource_fork_mode,
                     is_prodos,
                     prodos_export_mode,
+                    rs_to_lf,
                     progress,
                 ) {
                     Ok(()) => {}

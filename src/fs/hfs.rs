@@ -3289,6 +3289,8 @@ impl<R: Read + Seek + Send> Filesystem for HfsFilesystem<R> {
             finder_flags: None,
             prodos_file_type: None,
             mac_dates: None,
+            owner_label: None,
+            native_attrs: None,
         })
     }
 
@@ -6466,6 +6468,55 @@ mod tests {
     /// between the key and the node pointer, as required by Mac OS's B-tree
     /// traversal code. Without padding, Mac OS reads misaligned node pointers
     /// and crashes during volume mount.
+    #[test]
+    fn unerased_free_nodes_warn_once_and_repair_zeroes_them() {
+        // Classic Mac OS never erased freed nodes (issue #89's System 7.5.5 volume had 696).
+        use super::hfs_common::{btree_bitmap_test, BTreeHeader};
+
+        let mut fs = HfsFilesystem::open(Cursor::new(make_editable_hfs_image()), 0).unwrap();
+        let node_size = BTreeHeader::read(&fs.catalog_data).node_size as usize;
+        let free: Vec<usize> = (1..fs.catalog_data.len() / node_size)
+            .filter(|&i| !btree_bitmap_test(&fs.catalog_data, node_size, i as u32))
+            .take(3)
+            .collect();
+        assert_eq!(free.len(), 3, "blank catalog has free nodes");
+        for &i in &free {
+            fs.catalog_data[i * node_size + 20] = 0xA5;
+        }
+
+        let result = fs.fsck().unwrap();
+        assert!(
+            result.errors.is_empty(),
+            "not an error: {:?}",
+            result.errors
+        );
+        let warns: Vec<_> = result
+            .warnings
+            .iter()
+            .filter(|w| w.code == "FreeNodeNotErased")
+            .collect();
+        assert_eq!(warns.len(), 1, "one summary per tree, not one per node");
+        assert!(
+            warns[0].message.contains("3 unused node(s)"),
+            "{}",
+            warns[0].message
+        );
+        assert!(result.repairable);
+
+        let report = fs.repair().unwrap();
+        assert!(
+            report
+                .fixes_applied
+                .iter()
+                .any(|f| f == "Erased 3 unused catalog B-tree node(s)"),
+            "{:?}",
+            report.fixes_applied
+        );
+        let after = fs.fsck().unwrap();
+        assert!(after.warnings.iter().all(|w| w.code != "FreeNodeNotErased"));
+        assert!(after.errors.is_empty(), "{:?}", after.errors);
+    }
+
     #[test]
     fn test_repair_index_records_are_even_aligned() {
         use super::hfs_common::{btree_record_range, BTreeHeader};

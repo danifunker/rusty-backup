@@ -94,14 +94,18 @@ impl MbrPartitionEntry {
             0x1C => "Hidden FAT32 (LBA)",
             0x1E => "Hidden FAT16 (LBA)",
             0x27 => "Windows RE",
+            0x41 => "PReP boot",
             0x42 => "Dynamic Disk",
+            0x4D..=0x4F => "QNX 4",
             0x82 => "Linux swap / Solaris x86",
             0x83 => "Linux",
             0x85 => "Linux Extended",
             0x8E => "Linux LVM",
+            0x96 => "CHRP ISO-9660",
             0xA5 => "FreeBSD",
             0xA6 => "OpenBSD",
             0xAF => "HFS/HFS+",
+            0xB1..=0xB4 => "QNX 6 Power-Safe",
             0xBF => "Solaris x86",
             0xEB => "BeOS BFS",
             0xEE => "GPT Protective",
@@ -122,6 +126,12 @@ pub struct Mbr {
     /// LBA values are absolute (already adjusted from EBR-relative offsets).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub logical_partitions: Vec<MbrPartitionEntry>,
+    /// An ICON / LEXICON hard disk: types 07 / 08 / 09 are QNX 2 partitions 1-3.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub icon_qnx2: bool,
+    /// Bit `i` set: entry `i` of an ICON disk has never been formatted (its first sectors are zero).
+    #[serde(skip)]
+    pub icon_blank: u8,
 }
 
 impl Mbr {
@@ -158,6 +168,8 @@ impl Mbr {
             disk_signature,
             entries,
             logical_partitions: Vec::new(),
+            icon_qnx2: false,
+            icon_blank: 0,
         })
     }
 

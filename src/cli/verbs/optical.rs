@@ -595,6 +595,10 @@ pub enum FilesystemSelect {
     Iso,
     /// The Apple HFS / HFS+ volume (the Mac side of a hybrid disc).
     Hfs,
+    /// The HP LIF boot area at the start of an HP-UX or NetBSD/hppa disc.
+    Lif,
+    /// The PowerPC PReP boot partition (AIX CHRP, OS/2 for PowerPC), as one file.
+    Prep,
 }
 
 /// Open the filesystem the `--filesystem` selection asks for, returning it along
@@ -609,14 +613,14 @@ fn open_selected_filesystem(
     index: Option<usize>,
 ) -> Result<(
     Box<dyn opticaldiscs::browse::filesystem::Filesystem>,
-    opticaldiscs::FilesystemType,
+    String,
 )> {
     use opticaldiscs::browse::{open_disc_filesystem, open_hybrid_filesystem};
     use opticaldiscs::FilesystemType as F;
 
     let primary = || {
         open_disc_filesystem(info)
-            .map(|fs| (fs, info.filesystem))
+            .map(|fs| (fs, fs_token(info.filesystem)))
             .map_err(|e| {
                 // NKit-scrubbed GC/Wii images can't be reconstructed by `nod`;
                 // replace the opaque "Unsupported filesystem" with a fix.
@@ -639,12 +643,27 @@ fn open_selected_filesystem(
         }
         let ty = info.hybrid_filesystems[i].filesystem;
         return open_hybrid_filesystem(info, i)
-            .map(|fs| (fs, ty))
+            .map(|fs| (fs, fs_token(ty)))
             .map_err(|e| anyhow::anyhow!("opening filesystem #{i}: {e}"));
     }
 
     match select {
         FilesystemSelect::Auto => primary(),
+        FilesystemSelect::Lif | FilesystemSelect::Prep => {
+            use crate::optical::boot_area::{self, BootAreaKind};
+            let (want, token) = if select == FilesystemSelect::Lif {
+                (BootAreaKind::Lif, "lif")
+            } else {
+                (BootAreaKind::Prep, "prep")
+            };
+            let areas = boot_area::detect(&info.path);
+            let Some(area) = areas.iter().find(|a| a.kind == want) else {
+                bail!("no {token} boot area on this disc (only plain .iso images are probed)");
+            };
+            let fs = boot_area::open(&info.path, area)
+                .map_err(|e| anyhow::anyhow!("opening {token} boot area: {e}"))?;
+            Ok((fs, token.to_string()))
+        }
         FilesystemSelect::Hfs => {
             if matches!(info.filesystem, F::Hfs | F::HfsPlus) {
                 // A pure-Mac disc: the primary already is the HFS volume.
@@ -656,7 +675,7 @@ fn open_selected_filesystem(
             {
                 let ty = info.hybrid_filesystems[idx].filesystem;
                 open_hybrid_filesystem(info, idx)
-                    .map(|fs| (fs, ty))
+                    .map(|fs| (fs, fs_token(ty)))
                     .map_err(|e| anyhow::anyhow!("opening hybrid HFS filesystem: {e}"))
             } else {
                 bail!(
@@ -693,7 +712,8 @@ pub struct BrowseArgs {
     pub hash: Option<HashAlgo>,
     /// Which filesystem to browse on a hybrid Mac/PC disc. `auto` (default)
     /// opens the primary (ISO 9660); `hfs` opens the Apple HFS side; `iso`
-    /// forces the ISO 9660 tree. See `optical info` to see what a disc carries.
+    /// forces the ISO 9660 tree; `lif` / `prep` open an HP LIF or PowerPC PReP
+    /// boot area. See `optical info` to see what a disc carries.
     #[arg(long = "filesystem", value_enum, default_value_t = FilesystemSelect::Auto)]
     pub filesystem: FilesystemSelect,
 
@@ -728,7 +748,7 @@ fn run_browse_verb(args: BrowseArgs) -> Result<()> {
         let payload = BrowsePayload {
             image: args.source.display().to_string(),
             volume_name: fs.volume_name().map(str::to_owned),
-            filesystem: fs_token(opened_fs),
+            filesystem: opened_fs,
             game: info.game.as_ref().map(crate::optical::format_game_identity),
             entries,
         };
@@ -1037,12 +1057,8 @@ fn run_du_verb(args: OpticalDuArgs) -> Result<()> {
     // allocation_unit) runs identically to the top-level `du` verb.
     // Label defaults to the inner filesystem's own volume name (see
     // `OpticalFilesystem::volume_label`).
-    let mut fs = crate::fs::optical_fs::OpticalFilesystem::from_inner(
-        inner,
-        fs_token(opened_fs).to_string(),
-        None,
-    )
-    .map_err(|e| anyhow::anyhow!("opening disc filesystem: {e}"))?;
+    let mut fs = crate::fs::optical_fs::OpticalFilesystem::from_inner(inner, opened_fs, None)
+        .map_err(|e| anyhow::anyhow!("opening disc filesystem: {e}"))?;
 
     crate::cli::verbs::du::emit_du(&mut fs, args.paths, args.depth, format)
 }
@@ -1091,6 +1107,14 @@ struct HfsInfo {
 /// A filesystem co-resident with the primary on a hybrid Mac/PC disc — the
 /// Apple_HFS side an ISO 9660 primary otherwise hides. Mirrors
 /// `opticaldiscs::detect::HybridFilesystem`.
+/// One boot area for `optical info`: its selector token, label and file names.
+#[derive(Debug, Serialize)]
+struct BootAreaInfo {
+    filesystem: String,
+    label: String,
+    files: Vec<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct HybridFsInfo {
     /// `hfs` or `hfsplus`.
@@ -1141,6 +1165,9 @@ struct InfoPayload {
     /// 9660 primary). Empty for a single-filesystem disc.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     hybrid_filesystems: Vec<HybridFsInfo>,
+    /// Boot areas beside the disc's filesystem (HP LIF, PReP), each selectable by name.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    boot_areas: Vec<BootAreaInfo>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     warnings: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1176,6 +1203,7 @@ fn run_info_verb(args: InfoArgs) -> Result<()> {
                     cue_size_bytes: None,
                     filesystems: Vec::new(),
                     hybrid_filesystems: Vec::new(),
+                    boot_areas: Vec::new(),
                     warnings: vec![format!("unrecognized disc image: {e}")],
                     iso9660: None,
                     hfs: None,
@@ -1320,6 +1348,21 @@ fn run_info_verb(args: InfoArgs) -> Result<()> {
             add_fs(&mut filesystems, &token);
         }
     }
+    let boot_areas: Vec<BootAreaInfo> = crate::optical::boot_area::detect(&args.source)
+        .into_iter()
+        .map(|a| {
+            let token = match a.kind {
+                crate::optical::boot_area::BootAreaKind::Lif => "lif",
+                crate::optical::boot_area::BootAreaKind::Prep => "prep",
+            };
+            add_fs(&mut filesystems, token);
+            BootAreaInfo {
+                filesystem: token.to_string(),
+                label: a.label,
+                files: a.files.into_iter().map(|f| f.name).collect(),
+            }
+        })
+        .collect();
     if filesystems.is_empty() {
         warnings.push("no supported filesystem identified on this image".to_string());
     }
@@ -1333,6 +1376,7 @@ fn run_info_verb(args: InfoArgs) -> Result<()> {
             cue_size_bytes,
             filesystems,
             hybrid_filesystems,
+            boot_areas,
             warnings,
             iso9660,
             hfs,
@@ -1629,6 +1673,13 @@ fn emit_info(format: OutputFormat, payload: InfoPayload) -> Result<()> {
             );
         }
         println!("  browse with: optical browse --filesystem hfs <image>");
+    }
+    for b in &payload.boot_areas {
+        println!("{}: {}", b.label, b.files.join(", "));
+        println!(
+            "  browse with: optical browse --filesystem {} <image>",
+            b.filesystem
+        );
     }
     if let Some(et) = &payload.el_torito {
         println!("El Torito: {} boot image(s)", et.entries.len());

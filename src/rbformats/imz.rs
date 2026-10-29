@@ -14,6 +14,7 @@
 //! narrative. Files that present as encrypted but don't follow that
 //! framing (or where the password is wrong) surface as an explicit error.
 
+use crate::compat::ZipEntryName as _;
 #[cfg(feature = "rust173-polyfill")]
 use crate::rust173_compat::IntIsMultipleOf as _;
 use std::fs::File;
@@ -94,7 +95,7 @@ fn pick_entry_index<R: Read + Seek>(archive: &mut zip::ZipArchive<R>) -> Result<
             if entry.is_dir() {
                 continue;
             }
-            if is_image_entry(entry.name()) {
+            if is_image_entry(&entry.entry_name()) {
                 chosen = Some(i);
                 break;
             }
@@ -237,7 +238,7 @@ fn open_entry<'a>(
             // Capture the entry's raw (still-encrypted) body up front.
             let (csz, name, size) = {
                 let raw = archive.by_index_raw(idx)?;
-                (raw.compressed_size(), raw.name().to_string(), raw.size())
+                (raw.compressed_size(), raw.entry_name(), raw.size())
             };
             let mut raw_body = Vec::with_capacity(csz as usize);
             archive.by_index_raw(idx)?.read_to_end(&mut raw_body)?;
@@ -255,7 +256,7 @@ fn open_entry<'a>(
                 path.display(),
             )
         })?;
-        let name = entry.name().to_string();
+        let name = entry.entry_name();
         let size = entry.size();
         Ok((Box::new(entry) as Box<dyn Read + 'a>, name, size))
     } else {
@@ -264,7 +265,7 @@ fn open_entry<'a>(
         {
             let raw = archive.by_index_raw(idx)?;
             if raw.encrypted() {
-                let entry_name = raw.name().to_string();
+                let entry_name = raw.entry_name();
                 bail!(
                     "IMZ {} is password-protected (entry \"{entry_name}\"); \
                      password must be specified (use the GUI password prompt, \
@@ -274,7 +275,7 @@ fn open_entry<'a>(
             }
         }
         let entry = archive.by_index(idx)?;
-        let name = entry.name().to_string();
+        let name = entry.entry_name();
         let size = entry.size();
         Ok((Box::new(entry) as Box<dyn Read + 'a>, name, size))
     }

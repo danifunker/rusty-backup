@@ -174,10 +174,12 @@ pub mod dmg;
 #[cfg(feature = "crypto")]
 pub mod dmg_crypto;
 pub mod export;
+pub mod flux;
 pub mod gho;
 pub mod gho_crypto;
 pub mod gz_index;
 pub mod gzip;
+pub mod icon_hd;
 pub mod imz;
 pub mod interleave;
 pub mod iso_squashfs;

@@ -42,6 +42,7 @@ OS, and which travel.
 | Snow | unverified | unverified | unverified | 68k Mac — site returned 403, **confirm before relying on it** |
 | **Iris** | yes | yes | yes | IRIX 6.5 on an Indy: SGI EFS, XFS, the volume header |
 | **Motion** | yes | yes | yes | IRIX 3.7 on an IRIS 3130: **SGI EFS v1**, which nothing else reads |
+| icon-emu | unverified | unverified | yes | QNX 4.10.01 on a Unisys ICON: **QNX 2** (`chkfsys`), floppies and LEXICON hard disks |
 
 **Conclusion: almost everything is cross-platform.** WinUAE is the one hard
 Windows pin, and FS-UAE covers the same ground portably. So emulator oracles

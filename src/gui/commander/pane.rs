@@ -47,7 +47,7 @@ use rusty_backup::model::edit_queue::{EditQueue, StagedEdit};
 use rusty_backup::model::remote_browser::{BrowseMode, BrowseTarget, RemoteBrowser};
 use rusty_backup::model::stage_names::{legalize_staged_names, LegalizeReport, NameChange};
 use rusty_backup::model::status::BlockCacheScan;
-use rusty_backup::model::wrapper_tree::{tree_range, TreeRow, WrapperSource, WrapperTree};
+use rusty_backup::model::wrapper_tree::{tree_range, TreeRow, WrapperTree};
 use rusty_backup::partition::{format_size, PartitionInfo};
 use rusty_backup::update::RecentMode;
 
@@ -467,11 +467,10 @@ impl CommanderPane {
                 // Nested wrapper: read its bytes out of the enclosing mount.
                 let row = self.tree_index.get(node_id)?.clone();
                 let kind = classify_entry(&row.entry)?;
-                let bytes = match self.wrapper_tree.read_wrapper_bytes(&row) {
-                    Ok(b) => b,
+                let source = match self.wrapper_tree.read_wrapper_source(&row) {
+                    Ok(s) => s,
                     Err(e) => return self.wrapper_open_failed(name, format!("{e:#}")),
                 };
-                let source = WrapperSource::Bytes(bytes);
                 if let Err(e) = self
                     .wrapper_tree
                     .expand_wrapper(node_id, name, kind, source)

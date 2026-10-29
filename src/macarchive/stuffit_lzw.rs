@@ -152,7 +152,8 @@ pub fn decompress(comp: &[u8], want: usize, flags: u8) -> Result<Vec<u8>> {
     let mut lzw = Lzw::new(maxsymbols, reserved);
 
     let mut br = BitCursor::new(comp);
-    let mut out = Vec::with_capacity(want);
+    // `want` can be unbounded (Unix .Z has no length), so cap the up-front reservation.
+    let mut out = Vec::with_capacity(want.min(comp.len().saturating_mul(4)));
     let mut symbolcounter: usize = 0;
 
     while out.len() < want {
@@ -180,6 +181,110 @@ pub fn decompress(comp: &[u8], want: usize, flags: u8) -> Result<Vec<u8>> {
     }
 
     Ok(out)
+}
+
+/// Decompress a Unix `compress(1)` `.Z` stream: magic `1F 9D`, a flags byte, then LZW to EOF.
+pub fn decompress_unix_z(data: &[u8]) -> Result<Vec<u8>> {
+    if data.len() < 3 || data[0..2] != [0x1F, 0x9D] {
+        bail!("not a compress(1) .Z stream");
+    }
+    decompress(&data[3..], usize::MAX, data[2])
+}
+
+/// Compress `data` as a Unix `compress(1)` `.Z` stream (16-bit, block mode), byte-compatible with
+/// classic `compress.c`: codes grow from 9 bits, and each width change pads to a whole code group.
+pub fn compress_unix_z(data: &[u8]) -> Vec<u8> {
+    const MAXBITS: u32 = 16;
+    const MAXMAXCODE: u32 = 1 << MAXBITS;
+    const CLEAR: u32 = 256;
+    const FIRST: u32 = 257;
+
+    struct Out {
+        bytes: Vec<u8>,
+        buf: [u8; 16],
+        offset: u32,
+        n_bits: u32,
+        maxcode: u32,
+    }
+    impl Out {
+        /// `compress.c`'s `output()`: pack a code LSB-first; flush a group of eight codes, and
+        /// flush the (zero-padded) group whenever the width is about to change.
+        fn code(&mut self, code: u32, free_ent: u32, clear: &mut bool) {
+            for i in 0..self.n_bits {
+                if code >> i & 1 != 0 {
+                    let bit = self.offset + i;
+                    self.buf[(bit / 8) as usize] |= 1 << (bit % 8);
+                }
+            }
+            self.offset += self.n_bits;
+            if self.offset == self.n_bits * 8 {
+                self.bytes
+                    .extend_from_slice(&self.buf[..self.n_bits as usize]);
+                self.buf = [0; 16];
+                self.offset = 0;
+            }
+            if free_ent > self.maxcode || *clear {
+                if self.offset > 0 {
+                    self.bytes
+                        .extend_from_slice(&self.buf[..self.n_bits as usize]);
+                    self.buf = [0; 16];
+                }
+                self.offset = 0;
+                if *clear {
+                    self.n_bits = 9;
+                    *clear = false;
+                } else {
+                    self.n_bits += 1;
+                }
+                self.maxcode = if self.n_bits == MAXBITS {
+                    MAXMAXCODE
+                } else {
+                    (1 << self.n_bits) - 1
+                };
+            }
+        }
+
+        fn finish(&mut self) {
+            let n = self.offset.div_ceil(8) as usize;
+            self.bytes.extend_from_slice(&self.buf[..n]);
+        }
+    }
+
+    let mut out = Out {
+        bytes: vec![0x1F, 0x9D, 0x80 | MAXBITS as u8],
+        buf: [0; 16],
+        offset: 0,
+        n_bits: 9,
+        maxcode: (1 << 9) - 1,
+    };
+    let Some((&first, rest)) = data.split_first() else {
+        return out.bytes;
+    };
+    let mut table: std::collections::HashMap<(u32, u8), u32> = std::collections::HashMap::new();
+    let mut free_ent = FIRST;
+    let mut clear = false;
+    let mut ent = u32::from(first);
+    for &c in rest {
+        if let Some(&code) = table.get(&(ent, c)) {
+            ent = code;
+            continue;
+        }
+        out.code(ent, free_ent, &mut clear);
+        if free_ent < MAXMAXCODE {
+            table.insert((ent, c), free_ent);
+            free_ent += 1;
+        } else {
+            // A full table: block mode lets the stream start a fresh dictionary.
+            table.clear();
+            free_ent = FIRST;
+            clear = true;
+            out.code(CLEAR, free_ent, &mut clear);
+        }
+        ent = u32::from(c);
+    }
+    out.code(ent, free_ent, &mut clear);
+    out.finish();
+    out.bytes
 }
 
 #[cfg(test)]
@@ -217,5 +322,45 @@ mod tests {
         // Non-block-mode (flags without 0x80): maxsymbols 1<<9 = 512.
         let out = decompress(&bits, 4, 0x09).unwrap();
         assert_eq!(&out, b"AAAA");
+    }
+
+    #[test]
+    fn compress_round_trips_through_our_decoder() {
+        let mut data = Vec::new();
+        // Text, then incompressible bytes, enough to pass 16-bit codes and force a CLEAR.
+        for i in 0..40_000u32 {
+            data.extend_from_slice(format!("line {i} of a SunOS tar section\n").as_bytes());
+        }
+        let mut x = 0x1234_5678u32;
+        for _ in 0..300_000 {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            data.push(x as u8);
+        }
+        let z = compress_unix_z(&data);
+        assert_eq!(&z[..3], &[0x1F, 0x9D, 0x90]);
+        assert!(z.len() < data.len());
+        assert_eq!(decompress_unix_z(&z).unwrap(), data);
+        // gzip reads .Z with its own LZW decoder: an independent check when it is installed.
+        if let Ok(mut child) = std::process::Command::new("gzip")
+            .arg("-dc")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+        {
+            let mut stdin = child.stdin.take().unwrap();
+            let z2 = z.clone();
+            let writer = std::thread::spawn(move || {
+                use std::io::Write;
+                stdin.write_all(&z2).unwrap();
+            });
+            let out = child.wait_with_output().unwrap();
+            writer.join().unwrap();
+            assert!(out.status.success(), "gzip -dc rejected our .Z");
+            assert_eq!(out.stdout, data, "gzip -dc decoded different bytes");
+        }
+        assert_eq!(decompress_unix_z(&compress_unix_z(b"")).unwrap(), b"");
+        assert_eq!(decompress_unix_z(&compress_unix_z(b"a")).unwrap(), b"a");
     }
 }

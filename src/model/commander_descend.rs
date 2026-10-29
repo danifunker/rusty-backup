@@ -73,6 +73,10 @@ pub fn classify(name: &str) -> Option<DescendKind> {
     if DISK_IMAGE_EXTS.iter().any(|a| a.eq_ignore_ascii_case(ext)) {
         return Some(DescendKind::DiskImage);
     }
+    // QDOS (Unisys ICON) DOS disks stored inside QNX 2; kept out of DISK_IMAGE_EXTS so the OS never associates them.
+    if ["ph", "pf"].iter().any(|a| a.eq_ignore_ascii_case(ext)) {
+        return Some(DescendKind::DiskImage);
+    }
     None
 }
 
@@ -117,6 +121,22 @@ pub fn materialize(bytes: &[u8], file_name: &str) -> Result<(tempfile::TempDir, 
     Ok((dir, path))
 }
 
+/// Like [`materialize`], but `fill` streams the content into the temp file so it never sits in RAM.
+pub fn materialize_streamed(
+    file_name: &str,
+    fill: impl FnOnce(&mut std::fs::File) -> Result<()>,
+) -> Result<(tempfile::TempDir, PathBuf)> {
+    let dir = tempfile::Builder::new()
+        .prefix("rb-descend-")
+        .tempdir()
+        .context("create descend temp dir")?;
+    let path = dir.path().join(sanitize_temp_name(file_name));
+    let mut file =
+        std::fs::File::create(&path).with_context(|| format!("create {}", path.display()))?;
+    fill(&mut file)?;
+    Ok((dir, path))
+}
+
 /// Reduce a name to something safe as a single temp-file component while
 /// preserving the extension (which drives content routing).
 fn sanitize_temp_name(name: &str) -> String {
@@ -137,12 +157,35 @@ fn sanitize_temp_name(name: &str) -> String {
 /// Open an archive file (by path) as a read-only filesystem. `label` is the
 /// wrapper's display name for the breadcrumb / volume label.
 pub fn open_archive(path: &Path, label: Option<String>) -> Result<Box<dyn Filesystem>> {
-    let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or_default();
+    // ZIP and tar open by path so a large one is indexed rather than read into memory.
+    let mut head = [0u8; 512];
+    let n = std::fs::File::open(path)
+        .and_then(|mut f| std::io::Read::read(&mut f, &mut head))
+        .with_context(|| format!("read {}", path.display()))?;
+    if is_zip_or_tar(&head[..n], name) {
+        let fs = crate::fs::mem_archive::open_path(path, label)
+            .map_err(|e| anyhow::anyhow!("open archive '{name}': {e}"))?;
+        return Ok(Box::new(fs));
+    }
+    let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
     open_archive_bytes(bytes, name, label)
+}
+
+/// Whether `head` / `file_name` name a ZIP or tar (plain, gzip or zstd) rather than a Mac archive.
+fn is_zip_or_tar(head: &[u8], file_name: &str) -> bool {
+    let lower = file_name.to_ascii_lowercase();
+    head.starts_with(b"PK\x03\x04")
+        || head.starts_with(b"PK\x05\x06")
+        || lower.ends_with(".zip")
+        || lower.ends_with(".tar")
+        || lower.ends_with(".tgz")
+        || lower.ends_with(".tar.gz")
+        || lower.ends_with(".tar.zst")
+        || looks_like_tar(head)
 }
 
 /// Open archive bytes as a read-only filesystem, routing by content + name to
@@ -241,7 +284,7 @@ pub fn open_optical(_path: &Path, _label: Option<String>) -> Result<Box<dyn File
 pub struct OpticalFsChoice {
     /// Display label for the pane's filesystem picker (e.g. `RETRO (ISO 9660)`).
     pub label: String,
-    /// `None` = the primary filesystem; `Some(i)` = `hybrid_filesystems[i]`.
+    /// `None` = the primary; `Some(i)` = `hybrid_filesystems[i]`, then boot areas past them.
     pub hybrid_index: Option<usize>,
 }
 
@@ -287,6 +330,16 @@ pub fn optical_filesystems(path: &Path) -> Vec<OpticalFsChoice> {
             hybrid_index: Some(i),
         });
     }
+    let hybrids = info.hybrid_filesystems.len();
+    for (j, area) in crate::optical::boot_area::detect(path)
+        .into_iter()
+        .enumerate()
+    {
+        choices.push(OpticalFsChoice {
+            label: area.label,
+            hybrid_index: Some(hybrids + j),
+        });
+    }
     choices
 }
 
@@ -310,6 +363,21 @@ pub fn open_optical_hybrid(
     use opticaldiscs::detect::DiscImageInfo;
     let info = DiscImageInfo::open(path)
         .map_err(|e| anyhow::anyhow!("open disc image {}: {e:#}", path.display()))?;
+    // Indices past the hybrid volumes are boot areas (see `optical_filesystems`).
+    if let Some(area) = index
+        .checked_sub(info.hybrid_filesystems.len())
+        .and_then(|i| crate::optical::boot_area::detect(path).into_iter().nth(i))
+    {
+        let inner = crate::optical::boot_area::open(path, &area)
+            .map_err(|e| anyhow::anyhow!("open boot area: {e}"))?;
+        let fs = crate::fs::optical_fs::OpticalFilesystem::from_inner(
+            inner,
+            area.label.clone(),
+            label.or(Some(area.label)),
+        )
+        .map_err(|e| anyhow::anyhow!("wrap boot area: {e}"))?;
+        return Ok(Box::new(fs));
+    }
     let ty = info
         .hybrid_filesystems
         .get(index)
@@ -541,6 +609,7 @@ mod tests {
         assert_eq!(classify("Tool.bin"), Some(DescendKind::Archive));
         assert_eq!(classify("Disk.dc42"), Some(DescendKind::DiskImage));
         assert_eq!(classify("Disk.2mg"), Some(DescendKind::DiskImage));
+        assert_eq!(classify("work.ph"), Some(DescendKind::DiskImage));
         assert_eq!(classify("notes.txt"), None);
         assert_eq!(classify("noext"), None);
         // Host archives (browse files), including `.zip` which must win over the

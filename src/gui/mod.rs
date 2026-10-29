@@ -76,6 +76,9 @@ fn bytes_human(n: u64) -> String {
 /// point the user at the top-bar gate; when already elevated (or on other
 /// platforms) it just reports that none were detected.
 fn no_devices_hint() -> &'static str {
+    if !rusty_backup::os::PHYSICAL_DEVICES_ENABLED {
+        return "Physical devices are not available in this build. Use disk image files.";
+    }
     #[cfg(windows)]
     {
         if rusty_backup::os::windows::is_elevated() {
@@ -145,6 +148,9 @@ fn unelevated_device_note() -> &'static str {
 /// platforms it is always true. Used to gray out physical-source controls until
 /// the user elevates via the top-bar "Show Physical Devices" button.
 fn physical_devices_available() -> bool {
+    if !rusty_backup::os::PHYSICAL_DEVICES_ENABLED {
+        return false;
+    }
     #[cfg(windows)]
     {
         rusty_backup::os::windows::is_elevated()
@@ -566,7 +572,7 @@ pub struct RustyBackupApp {
     bulk_convert_status: Option<Arc<Mutex<BulkConvertStatus>>>,
     /// File path passed on the command line (Windows file-association
     /// double-click, macOS `open file.d88`, Linux `.desktop` MimeType
-    /// launch). Taken on the first `update()` tick, routed into the
+    /// launch). Taken on the first `logic()` tick, routed into the
     /// Inspect tab, and the tab is switched to it. `None` for normal
     /// launches without a file argv.
     pending_initial_image: Option<PathBuf>,
@@ -581,7 +587,11 @@ impl Default for RustyBackupApp {
         log.info("Rusty Backup started");
 
         let devices = device::enumerate_devices();
-        if devices.is_empty() {
+        if !rusty_backup::os::PHYSICAL_DEVICES_ENABLED {
+            log.info(
+                "This build works on disk image files only; physical device access is disabled.",
+            );
+        } else if devices.is_empty() {
             log.warn("No disk devices detected. You can still open image files.");
         } else {
             log.info(format!("Found {} device(s)", devices.len()));
@@ -717,12 +727,17 @@ enum ElevationGate {
     /// Already elevated — devices are available, show "Refresh Devices".
     #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
     Elevated,
+    /// A `no-physical-devices` build: no elevation and no device list to refresh.
+    Disabled,
 }
 
 impl RustyBackupApp {
     /// Current elevation-gate state. The button + device-list behavior key off
     /// this; macOS is always `NotApplicable`.
     fn elevation_gate(&self) -> ElevationGate {
+        if !rusty_backup::os::PHYSICAL_DEVICES_ENABLED {
+            return ElevationGate::Disabled;
+        }
         #[cfg(any(windows, target_os = "linux"))]
         {
             if rusty_backup::os::is_elevated() {
@@ -874,8 +889,13 @@ impl RustyBackupApp {
     }
 }
 
+/// A dropped file's real filesystem path; egui reports an empty one for byte-only drops.
+fn non_empty_path(path: &std::path::Path) -> Option<PathBuf> {
+    (!path.as_os_str().is_empty()).then(|| path.to_path_buf())
+}
+
 impl eframe::App for RustyBackupApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Request repaint while backup/restore is running so progress updates are shown
         if self.progress.active
             || self.backup_tab.is_running()
@@ -888,7 +908,7 @@ impl eframe::App for RustyBackupApp {
 
         // One-shot: drain the file path handed in on the command line
         // (Windows file-association double-click, macOS `open ...`, Linux
-        // .desktop MimeType launch). Done in update() rather than the
+        // .desktop MimeType launch). Done in logic() rather than the
         // constructor because the inspect tab's lazy-load path needs the
         // egui context to be alive.
         if let Some(path) = self.pending_initial_image.take() {
@@ -904,8 +924,12 @@ impl eframe::App for RustyBackupApp {
         //
         // Historically this always opened in Inspect, which made drag-and-drop
         // useless for the Optical / Archives / Restore tabs and Commander.
-        let dropped: Option<PathBuf> =
-            ctx.input(|i| i.raw.dropped_files.iter().find_map(|f| f.path.clone()));
+        let dropped: Option<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .find_map(|f| non_empty_path(f.path()))
+        });
         if let Some(path) = dropped {
             if let Some(cmd) = self.commander.as_mut() {
                 // Commander overlay takes over the frame; hand the drop to the
@@ -968,7 +992,7 @@ impl eframe::App for RustyBackupApp {
         }
 
         // Top panel: tab bar
-        egui::Panel::top("tab_bar").show_inside(ctx, |ui| {
+        egui::Panel::top("tab_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.active_tab, Tab::Backup, "Backup");
                 ui.selectable_value(&mut self.active_tab, Tab::Restore, "Restore");
@@ -1037,6 +1061,11 @@ impl eframe::App for RustyBackupApp {
                                     self.elevation_dialog.open();
                                 }
                             }
+                            ui.separator();
+                        }
+                        ElevationGate::Disabled => {
+                            ui.label(egui::RichText::new("Image files only").weak())
+                                .on_hover_text(rusty_backup::os::PHYSICAL_DEVICES_DISABLED);
                             ui.separator();
                         }
                         ElevationGate::NotApplicable | ElevationGate::Elevated => {
@@ -1137,7 +1166,7 @@ impl eframe::App for RustyBackupApp {
                             s.current_index, s.total_files, s.current_file,
                         )
                     };
-                    egui::Panel::top("bulk_convert_progress").show_inside(ctx, |ui| {
+                    egui::Panel::top("bulk_convert_progress").show(ctx, |ui| {
                         ui.add(egui::ProgressBar::new(frac).text(text));
                     });
                 }
@@ -1154,7 +1183,7 @@ impl eframe::App for RustyBackupApp {
         };
         if let Some(info) = banner_info {
             if info.is_outdated {
-                egui::Panel::top("update_banner").show_inside(ctx, |ui| {
+                egui::Panel::top("update_banner").show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(
                             egui::RichText::new("Update")
@@ -1204,7 +1233,7 @@ impl eframe::App for RustyBackupApp {
             .resizable(true)
             .min_size(100.0)
             .default_size(180.0)
-            .show_inside(ctx, |ui| {
+            .show(ctx, |ui| {
                 self.progress.show(ui);
                 if self.progress.active {
                     ui.separator();
@@ -1231,7 +1260,7 @@ impl eframe::App for RustyBackupApp {
         }
 
         // Central panel: active tab content
-        egui::CentralPanel::default().show_inside(ctx, |ui| match self.active_tab {
+        egui::CentralPanel::default().show(ctx, |ui| match self.active_tab {
             Tab::Backup => {
                 let busy = self.busy_elsewhere(Tab::Backup);
                 let mut ctx = context::TabContext::new(&self.devices, &mut self.log_panel)

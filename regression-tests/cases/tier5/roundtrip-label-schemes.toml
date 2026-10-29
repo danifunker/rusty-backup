@@ -66,10 +66,10 @@ args = ["fsck", "{scratch}/out.img@1", "--checkonly"]
 expect_exit = 0
 stdout_contains = ["5708 files"]
 [[case.step]]
-# Still exactly the one orphan the pristine cartridge carries.
+# Clean, as the pristine cartridge is once its short directory is read to the chunk end.
 args = ["fsck", "{scratch}/out.img@2", "--checkonly"]
-expect_exit = 1
-stdout_contains = ["OrphanInode", "232"]
+expect_exit = 0
+stdout_not_contains = ["OrphanInode"]
 
 [[case]]
 id = "roundtrip.label.next-mo-refuses-per-partition"

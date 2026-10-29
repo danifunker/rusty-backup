@@ -410,8 +410,8 @@ fn export_zip_file(
     let out = std::fs::File::create(out_path)
         .with_context(|| format!("creating {}", out_path.display()))?;
     let mut zw = zip::ZipWriter::new(out);
-    let opts: zip::write::FileOptions<'_, ()> =
-        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
     let mut summary = ExportSummary::default();
     let base = common_parent(entries);
     for e in entries {
@@ -439,7 +439,7 @@ fn zip_recurse<W: Write + std::io::Seek>(
     entries: &[FileEntry],
     prefix: &str,
     zw: &mut zip::ZipWriter<W>,
-    opts: zip::write::FileOptions<'static, ()>,
+    opts: zip::write::SimpleFileOptions,
     progress: &Progress,
     cancelled: &Cancelled,
     summary: &mut ExportSummary,

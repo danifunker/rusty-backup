@@ -63,6 +63,8 @@ missing capability on a driver that already round-trips.
 | Human68k | Yes | Yes | **Yes** | — **fsck done** (FAT VALIDATE + mirror sync) |
 | CP/M | **Yes** | Yes | **Yes** | — **complete**. Create: `rb-cli new --fs cpm --cpm-preset <name>` (per-DPB 0xE5-fill). fsck: directory self-consistency (no on-disk free map) — cross-links, out-of-range pointers, invalid entries (CP/M 3 label/timestamp SFCBs recognized); repair reclaims invalid entries, cross-links surfaced read-only. |
 | QDOS (QXL.WIN) | No | Yes | No | **create + fsck** |
+| QNX 2 (ICON / LEXICON) | No | **Yes** | check only | **create + repair**. Edit: create (128-block extents), mkdir, rename, delete (as `frel`), chmod, chown, verified with real QNX 4.10.01 `chkfsys` in icon-emu. fsck (`fsck_qnx2`): extent chains, back links, cross-links, entry block counts, bitmap vs held blocks, orphaned blocks; every issue is report-only. 640 KiB disks wait for samples (`docs/PLAN-qnx.md`) |
+| Sun QIC tape (`.qic`) | N/A | **Yes** (rebuild) | No | **verify on Sun hardware**. Edits inside tar / `.tar.Z` / UFS miniroot tape files rebuild the whole tape and keep the original as `<name>.bak`; edited test tapes for the Sun-2 / Sun-3 MiSTer cores are in `rb-fixtures/to-verify/sun-tape-edit/` |
 | Alto BFS / TFS | Yes | Yes | **Yes (CLI)** | — **fsck done** (label/bitmap VALIDATE); `rb-cli fsck` has its own Alto branch (container open path); `--repair` in place for `.pdi` |
 
 ### 1b. Add fsck (check + repair) — the biggest single lever
@@ -129,6 +131,11 @@ risky — noted as such; "where possible" applies.
 into two Acorn DFS partitions, edits re-interleaving on save.) Commercial-Unix **VxFS / AdvFS /
 QFS** (browse-first); **OpenVMS ODS-2 on a raw disk** (already read on optical);
 **Apple SOS / DOS 3.2 / Pascal**; optical **UDF 2.50+ / El Torito**.
+
+**QNX 4 / QNX 6** are browse-only today: QNX 4 is checked on real media
+(`qnxfs1g.img`), QNX 6 Power-Safe only on synthetic volumes. Writes and fsck
+for both wait on real fixtures (QNX 4.25 / 6.5 / 7 installed under QEMU) to
+verify against; see `docs/PLAN-qnx.md`.
 
 ### Low value
 

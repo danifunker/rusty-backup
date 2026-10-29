@@ -5,6 +5,17 @@
 //! 2. B-tree structure verification
 //! 3. Catalog consistency (threads ↔ records, counts)
 //! 4. Extent/allocation bitmap cross-check (including extents overflow)
+//!
+//! # Unused B-tree nodes
+//!
+//! Apple's modern `fsck_hfs` (`BTCheckUnusedNodes`, called from `CheckCatalogBTree`
+//! for HFS and HFS+ alike) reports "Unused node is not erased" as a level-1, minor
+//! repair: it stops at the first one and its repair zeroes them all. System 6-8 and
+//! Disk First Aid never erased freed nodes or checked for it, so nearly every
+//! classic volume a real Mac wrote has hundreds of them. Here that is one warning
+//! per tree (catalog, extents) giving the count, not an error per node, and
+//! `repair_hfs` zeroes them the way `fsck_hfs` does. Our own writer erases what it
+//! frees (`btree_free_node`), so a fresh rb-cli edit never adds to the count.
 
 #[cfg(feature = "rust173-polyfill")]
 use crate::rust173_compat::IntIsMultipleOf as _;
@@ -12,7 +23,7 @@ use byteorder::{BigEndian, ByteOrder};
 
 use super::fsck::{FsckIssue, FsckResult, FsckStats, RepairReport};
 use super::hfs::HfsMasterDirectoryBlock;
-use super::hfs_common::BTreeHeader;
+use super::hfs_common::{btree_erase_free_nodes, btree_unerased_free_nodes, BTreeHeader};
 
 pub(super) const CATALOG_DIR_THREAD: i8 = 3;
 pub(super) const CATALOG_FILE_THREAD: i8 = 4;
@@ -269,6 +280,7 @@ pub(crate) fn check_hfs_integrity(
     if let Some(ext_data) = extents_data {
         extents::check_extents_btree_structure(ext_data, &mut errors);
     }
+    check_unerased_free_nodes(catalog_data, extents_data, &mut warnings);
 
     // Phase 4: Extent/allocation bitmap
     check_extents_and_bitmap(
@@ -281,7 +293,8 @@ pub(crate) fn check_hfs_integrity(
         &mut warnings,
     );
 
-    let repairable = errors.iter().any(|e| e.repairable);
+    let repairable = errors.iter().any(|e| e.repairable)
+        || warnings.iter().any(|w| w.code == "FreeNodeNotErased");
     FsckResult {
         errors,
         warnings,
@@ -293,6 +306,51 @@ pub(crate) fn check_hfs_integrity(
         ),
         repairable,
         orphaned_entries,
+    }
+}
+
+/// Zero the free nodes of the catalog and extents B-trees, noting each tree touched.
+fn erase_unused_nodes(
+    catalog_data: &mut [u8],
+    extents_data: Option<&mut Vec<u8>>,
+    report: &mut RepairReport,
+) {
+    let ext = extents_data.map(|v| v.as_mut_slice());
+    for (tree, data) in [("catalog", Some(catalog_data)), ("extents", ext)] {
+        let Some(data) = data.filter(|d| d.len() >= 512) else {
+            continue;
+        };
+        let node_size = BTreeHeader::read(data).node_size as usize;
+        let erased = btree_erase_free_nodes(data, node_size);
+        if erased > 0 {
+            report
+                .fixes_applied
+                .push(format!("Erased {erased} unused {tree} B-tree node(s)"));
+        }
+    }
+}
+
+/// One warning per tree with leftover data in free nodes; normal on classic volumes (module docs).
+fn check_unerased_free_nodes(
+    catalog_data: &[u8],
+    extents_data: Option<&[u8]>,
+    warnings: &mut Vec<FsckIssue>,
+) {
+    for (tree, data) in [("catalog", Some(catalog_data)), ("extents", extents_data)] {
+        let Some(data) = data.filter(|d| d.len() >= 512) else {
+            continue;
+        };
+        let dirty = btree_unerased_free_nodes(data, BTreeHeader::read(data).node_size as usize);
+        if let Some(first) = dirty.first() {
+            warnings.push(hfs_issue(
+                HfsFsckCode::FreeNodeNotErased,
+                format!(
+                    "{tree} B-tree: {} unused node(s) not erased (first: node {first}); \
+                     classic Mac OS leaves freed nodes as-is, repair zeroes them",
+                    dirty.len()
+                ),
+            ));
+        }
     }
 }
 
@@ -338,6 +396,12 @@ pub(crate) fn repair_hfs(
         fixes_failed: Vec::new(),
         unrepairable_count,
     };
+
+    // No errors, only unused nodes to zero: don't rebuild a healthy catalog for that.
+    if check_result.errors.is_empty() {
+        erase_unused_nodes(catalog_data, extents_data.as_deref_mut(), &mut report);
+        return report;
+    }
 
     // --- Phase 0: MDB signature ---
     if mdb.signature != 0x4244 {
@@ -394,6 +458,9 @@ pub(crate) fn repair_hfs(
     if let Some(ext) = extents_data.as_mut() {
         extents::repair_extents_btree_structure(ext, &mut report);
     }
+
+    // --- Phase 3.6: Zero unused B-tree nodes, as fsck_hfs's repair does ---
+    erase_unused_nodes(catalog_data, extents_data.as_deref_mut(), &mut report);
 
     // --- Phase 4: Extent fixes ---
     repair_extents(

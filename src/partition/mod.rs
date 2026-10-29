@@ -1,8 +1,10 @@
 pub mod alignment;
 pub mod apm;
 pub mod atari;
+pub mod bsd;
 pub mod editor;
 pub mod gpt;
+pub mod lvm;
 pub mod mac_cd_builder;
 pub mod mbr;
 pub mod next;
@@ -26,7 +28,10 @@ use std::io::{Read, Seek, SeekFrom};
 use crate::error::RustyBackupError;
 use apm::Apm;
 use atari::{looks_like_ahdi_root, AhdiPartitionKind, AhdiTable, AHDI_NUM_SLOTS};
+use bsd::BsdDiskLabel;
 use gpt::Gpt;
+use lvm::aix::AixLvm;
+use lvm::hpux::HpuxLvm;
 use mbr::Mbr;
 use next::NextDiskLabel;
 use rdb::{Rdb, RDSK_SIGNATURE};
@@ -65,6 +70,15 @@ pub enum PartitionTable {
     /// 8 partitions, big-endian, counted in `d_secsize` (1024-byte) sectors
     /// past a front porch; see `src/partition/next.rs`.
     Next(NextDiskLabel),
+    /// BSD `struct disklabel` on a dedicated disk (NetBSD/hp300 behind a LIF boot
+    /// volume, others at sector 1); read-only, see `src/partition/bsd.rs`.
+    Bsd(BsdDiskLabel),
+    /// HP-UX LVM physical volume (HP-UX 10.x / 11.x), single-disk groups only;
+    /// see `src/partition/lvm/hpux.rs`.
+    HpuxLvm(HpuxLvm),
+    /// AIX LVM physical volume (every AIX disk), single-disk groups only;
+    /// see `src/partition/lvm/aix.rs`.
+    AixLvm(AixLvm),
     /// Solaris x86 — an ordinary MBR whose Solaris partition (type `0x82` /
     /// `0xBF`) nests a 16-slice VTOC in its second sector. Slice offsets are
     /// partition-relative; see `src/partition/solaris_x86.rs`.
@@ -384,7 +398,46 @@ fn probe_apm_without_ddr(reader: &mut (impl Read + Seek)) -> Option<Apm> {
 /// Checks the first sector for a valid FAT BPB, and offset 1024 for HFS/HFS+.
 /// Returns `Some(fs_hint)` where `fs_hint` is `"FAT"`, `"HFS"`, `"HFS+"`,
 /// or `None` if not a superfloppy.
+/// QNX 2 hard disks store each partition's start 1-based. On an ICON / LEXICON disk (its header
+/// says so) every type 07 / 08 / 09 entry moves back one sector; elsewhere only a type-07 entry
+/// whose QNX 2 root sits one sector early does. See `docs/PLAN-qnx.md`.
+fn qnx2_one_based_starts(reader: &mut (impl Read + Seek), mbr: &mut Mbr, sector0: &[u8]) {
+    let icon = crate::rbformats::icon_hd::is_icon_header(sector0);
+    mbr.icon_qnx2 = icon;
+    for (i, e) in mbr.entries.iter_mut().enumerate() {
+        if icon && matches!(e.partition_type, 0x07..=0x09) && e.start_lba >= 1 {
+            e.start_lba -= 1;
+            let mut head = [0u8; 1024];
+            let blank = reader
+                .seek(SeekFrom::Start(u64::from(e.start_lba) * 512))
+                .and_then(|_| reader.read_exact(&mut head))
+                .is_ok_and(|_| crate::rbformats::icon_hd::looks_unformatted(&head));
+            if blank {
+                mbr.icon_blank |= 1 << i;
+            }
+            continue;
+        }
+        if e.partition_type != 0x07 || e.start_lba < 2 {
+            continue;
+        }
+        let at = u64::from(e.start_lba) * 512;
+        if crate::fs::detect_0x07_type(reader, at) != "unknown"
+            || crate::fs::qnx2::looks_like_qnx2(reader, at)
+        {
+            continue;
+        }
+        if crate::fs::qnx2::looks_like_qnx2(reader, at - 512) {
+            e.start_lba -= 1;
+        }
+    }
+    let _ = reader.seek(SeekFrom::Start(0));
+}
+
 fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek)) -> Option<String> {
+    // A Sun QIC tape image: one volume whose files browse as a tree.
+    if crate::fs::sun2tape::looks_like_tape(first_sector) {
+        return Some("Sun QIC tape".to_string());
+    }
     // SquashFS: "hsqs" at offset 0. Appliance and live images ship a bare
     // SquashFS root with no partition table (Buildroot, Raspberry Pi OS,
     // `casper/filesystem.squashfs` carved out of a live CD). Probed first: the
@@ -517,6 +570,13 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
     }
     let _ = reader.seek(SeekFrom::Start(0));
 
+    // QNX 4's boot block has an x86 jump and a FAT-like BPB (OEM "QNX4FS"); its root entry decides first.
+    if crate::fs::qnx4::looks_like_qnx4(reader, 0) {
+        let _ = reader.seek(SeekFrom::Start(0));
+        return Some("QNX4".to_string());
+    }
+    let _ = reader.seek(SeekFrom::Start(0));
+
     if first_sector[0] == 0xEB || first_sector[0] == 0xE9 {
         let bytes_per_sector = u16::from_le_bytes([first_sector[11], first_sector[12]]);
         let sectors_per_cluster = first_sector[13];
@@ -537,6 +597,17 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
             // partition table area (bytes 446-509) because on FAT VBRs that
             // area contains bootstrap code which often has bytes that look
             // like valid MBR partition entries.
+            return Some("FAT".to_string());
+        }
+    }
+
+    // A QDOS (Unisys ICON) `.ph` / `.pf` DOS disk: a FAT BPB with zeroed jump bytes, claimed only at its exact length.
+    if first_sector[0..3] == [0, 0, 0] && crate::fs::fat::has_fat_boot_start(first_sector) {
+        let bps = u64::from(u16::from_le_bytes([first_sector[11], first_sector[12]]));
+        let total = u64::from(u16::from_le_bytes([first_sector[19], first_sector[20]]));
+        let end = reader.seek(SeekFrom::End(0)).ok();
+        let _ = reader.seek(SeekFrom::Start(0));
+        if total != 0 && end == Some(total * bps) {
             return Some("FAT".to_string());
         }
     }
@@ -685,6 +756,19 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
             }
         }
     }
+    // QNX 2: structural root entry at byte 68 of block 1 (FAT and friends were ruled out above).
+    if crate::fs::qnx2::looks_like_qnx2(reader, 0) {
+        let _ = reader.seek(SeekFrom::Start(0));
+        return Some("QNX2".to_string());
+    }
+    if crate::fs::qnx4::looks_like_qnx4(reader, 0) {
+        let _ = reader.seek(SeekFrom::Start(0));
+        return Some("QNX4".to_string());
+    }
+    if crate::fs::qnx6::looks_like_qnx6(reader, 0) {
+        let _ = reader.seek(SeekFrom::Start(0));
+        return Some("QNX6".to_string());
+    }
 
     // btrfs and ReiserFS both keep a superblock at byte 0x10000 (64 KiB):
     // btrfs magic "_BHRfS_M" at +0x40, ReiserFS magic at +52. One
@@ -715,15 +799,16 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
     for &cand in &[8192u64, 65536u64] {
         if reader.seek(SeekFrom::Start(cand + 1372)).is_ok() {
             let mut m = [0u8; 4];
-            if reader.read_exact(&mut m).is_ok() {
-                let le = u32::from_le_bytes(m);
-                let be = u32::from_be_bytes(m);
-                if le == 0x0001_1954 || le == 0x1954_0119 || be == 0x0001_1954 || be == 0x1954_0119
-                {
-                    return Some("UFS".to_string());
-                }
+            if reader.read_exact(&mut m).is_ok() && crate::fs::ufs::is_ufs_magic(m, cand == 8192) {
+                return Some("UFS".to_string());
             }
         }
+    }
+    if crate::fs::vxfs::detect(reader, 0).is_some() {
+        return Some("VxFS".to_string());
+    }
+    if crate::fs::jfs1::detect(reader, 0) {
+        return Some("AIX JFS".to_string());
     }
 
     // JFS2 aggregate superblock at byte 32768, ASCII magic "JFS1". (AIX JFS1
@@ -946,6 +1031,121 @@ pub fn is_known_layout(expected: &str) -> bool {
                 .any(|(a, _)| normalise_layout(a) == want))
 }
 
+/// HP-UX LVs by number, after the LIF boot volume (row 0) when the disk has one.
+fn hpux_lvm_partitions(lvm: &HpuxLvm) -> Vec<PartitionInfo> {
+    let mut lead = Vec::new();
+    if lvm.has_lif {
+        lead.push(lvm_row(
+            0,
+            "LIF boot area".into(),
+            0,
+            lvm.lif_end,
+            Some("LIF".into()),
+        ));
+    }
+    lvm_rows("HP-UX LVM", &lvm.volumes, lvm.pe_start, lead)
+}
+
+fn lvm_row(
+    index: usize,
+    type_name: String,
+    start: u64,
+    size: u64,
+    ts: Option<String>,
+) -> PartitionInfo {
+    PartitionInfo {
+        index,
+        type_name,
+        partition_type_byte: 0,
+        start_lba: start / 512,
+        start_byte: Some(start),
+        size_bytes: size,
+        bootable: false,
+        is_logical: false,
+        is_extended_container: false,
+        partition_type_string: ts,
+        hfs_block_size: None,
+        rdb_part_block: None,
+        drv_name: None,
+    }
+}
+
+/// One row per LV: contiguous ones open in place, split ones through their runs, and
+/// ones with extents on another disk carry the reason they cannot open.
+fn lvm_rows(
+    scheme: &str,
+    volumes: &[(u32, lvm::LogicalVolume)],
+    data_start: u64,
+    mut out: Vec<PartitionInfo>,
+) -> Vec<PartitionInfo> {
+    for (n, lv) in volumes {
+        let start = lv.runs.first().map(|r| r.0).unwrap_or(data_start);
+        let type_string = if !lv.complete {
+            Some(format!(
+                "{LVM_UNAVAILABLE}{} has extents on another disk; only single-disk volume groups are supported",
+                lv.name
+            ))
+        } else if lv.contiguous_start().is_some() {
+            None
+        } else {
+            Some(lvm::encode_runs(&lv.runs))
+        };
+        out.push(lvm_row(
+            *n as usize,
+            format!("{scheme} {}", lv.name),
+            start,
+            lv.size_bytes,
+            type_string,
+        ));
+    }
+    out
+}
+
+/// Type-string prefix for an LV row that cannot be opened; the reason follows the colon.
+pub const LVM_UNAVAILABLE: &str = "LVM-UNAVAILABLE:";
+
+/// Slot index given to the LIF boot-area row, past any real BSD slot letter.
+pub const BSD_LIF_ROW_INDEX: usize = 26;
+
+/// BSD label slots, then the LIF boot volume ahead of them when the disk has one.
+fn bsd_partitions(label: &BsdDiskLabel) -> Vec<PartitionInfo> {
+    let row = |index: usize, type_name: String, start: u64, size: u64, ts: Option<String>| {
+        PartitionInfo {
+            index,
+            type_name,
+            partition_type_byte: 0,
+            start_lba: start / 512,
+            start_byte: Some(start),
+            size_bytes: size,
+            bootable: false,
+            is_logical: false,
+            is_extended_container: false,
+            partition_type_string: ts,
+            hfs_block_size: None,
+            rdb_part_block: None,
+            drv_name: None,
+        }
+    };
+    let mut out: Vec<PartitionInfo> = label
+        .browsable_partitions()
+        .map(|(i, p)| {
+            // Type byte 0: the UFS superblock is found by content, so swap simply won't open.
+            let name = format!("BSD {} ({})", p.letter, p.fstype_name());
+            row(i, name, label.start_byte(p), label.size_bytes(p), None)
+        })
+        .collect();
+    if label.has_lif {
+        out.push(row(
+            BSD_LIF_ROW_INDEX,
+            "LIF boot area".to_string(),
+            0,
+            label.head_bytes(),
+            Some("LIF".to_string()),
+        ));
+    }
+    out
+}
+
 /// The MBR's own entries: primaries at their slot (0-3), EBR logicals from 4.
 fn mbr_partitions(mbr: &Mbr) -> Vec<PartitionInfo> {
     let mut result: Vec<PartitionInfo> = mbr
@@ -955,7 +1155,13 @@ fn mbr_partitions(mbr: &Mbr) -> Vec<PartitionInfo> {
         .filter(|(_, e)| !e.is_empty())
         .map(|(i, e)| PartitionInfo {
             index: i,
-            type_name: e.partition_type_name().to_string(),
+            type_name: if mbr.icon_qnx2 && mbr.icon_blank & (1 << i) != 0 {
+                "QNX 2 (not formatted)".to_string()
+            } else if mbr.icon_qnx2 && matches!(e.partition_type, 0x07..=0x09) {
+                "QNX 2".to_string()
+            } else {
+                e.partition_type_name().to_string()
+            },
             partition_type_byte: e.partition_type,
             start_lba: e.start_lba as u64,
             start_byte: None,
@@ -1064,6 +1270,16 @@ impl PartitionTable {
             .map_err(RustyBackupError::Io)?;
         if let Some(label) = next::detect(reader) {
             return Ok(PartitionTable::Next(label));
+        }
+        if let Some(lvm) = HpuxLvm::detect(reader) {
+            return Ok(PartitionTable::HpuxLvm(lvm));
+        }
+        // AIX: an IPL record (and often a PReP MBR) at 0, the LVM record at sector 7.
+        if let Some(lvm) = AixLvm::detect(reader) {
+            return Ok(PartitionTable::AixLvm(lvm));
+        }
+        if let Some(label) = BsdDiskLabel::detect(reader) {
+            return Ok(PartitionTable::Bsd(label));
         }
         reader
             .seek(SeekFrom::Start(0))
@@ -1283,6 +1499,8 @@ impl PartitionTable {
                 }
             }
 
+            qnx2_one_based_starts(reader, &mut mbr, &mbr_data);
+
             // Solaris x86 nests a VTOC inside an MBR partition (0x82 is also swap,
             // so its sanity word decides); the EBR walk ran first to keep logicals.
             if let Some(label) = solaris_x86::detect(reader, &mbr) {
@@ -1308,7 +1526,10 @@ impl PartitionTable {
             // No platform convention; `@DH0` is the identity users know.
             PartitionTable::Rdb(_) => Some(raw),
             // NeXTSTEP names slots by letter; the number behind `a` is 0.
-            PartitionTable::Next(_) => Some(raw),
+            PartitionTable::Next(_)
+            | PartitionTable::Bsd(_)
+            | PartitionTable::HpuxLvm(_)
+            | PartitionTable::AixLvm(_) => Some(raw),
             // Solaris `format(1M)` numbers slices from 0 and `index` keeps the
             // VTOC position; the MBR entries listed after them have no `sN`.
             PartitionTable::SolarisX86 { .. } => {
@@ -1329,6 +1550,9 @@ impl PartitionTable {
                 | PartitionTable::SgiDkLabel(_)
                 | PartitionTable::Sun(_)
                 | PartitionTable::Next(_)
+                | PartitionTable::Bsd(_)
+                | PartitionTable::HpuxLvm(_)
+                | PartitionTable::AixLvm(_)
                 | PartitionTable::SolarisX86 { .. }
                 | PartitionTable::Rdb(_)
         )
@@ -1520,6 +1744,11 @@ impl PartitionTable {
                     drv_name: None,
                 })
                 .collect(),
+            PartitionTable::Bsd(label) => bsd_partitions(label),
+            PartitionTable::HpuxLvm(lvm) => hpux_lvm_partitions(lvm),
+            PartitionTable::AixLvm(lvm) => {
+                lvm_rows("AIX LVM", &lvm.volumes, lvm.pp_start, Vec::new())
+            }
             PartitionTable::SolarisX86 { mbr, label } => {
                 let mut result: Vec<PartitionInfo> = solaris_slice_partitions(label);
                 // The rest of the MBR is still a disk; its entries list after
@@ -1541,11 +1770,19 @@ impl PartitionTable {
                     index: i,
                     // Show both the human name and the device name, e.g.
                     // "AmigaDOS FFS-Intl (DH0)" or "SFS (Amiga) (DH1)".
-                    type_name: format!(
-                        "{} ({})",
-                        rdb::dos_type_display_name(p.dos_type),
-                        p.drv_name,
-                    ),
+                    type_name: match &p.content_type {
+                        Some(found) => format!(
+                            "{} ({}, declared {})",
+                            if found == "Apple_HFS" { "HFS" } else { "HFS+" },
+                            p.drv_name,
+                            p.dos_type_string(),
+                        ),
+                        None => format!(
+                            "{} ({})",
+                            rdb::dos_type_display_name(p.dos_type),
+                            p.drv_name,
+                        ),
+                    },
                     partition_type_byte: 0,
                     start_lba: p.start_lba_512(),
                     start_byte: None,
@@ -1553,7 +1790,7 @@ impl PartitionTable {
                     bootable: p.is_bootable(),
                     is_logical: false,
                     is_extended_container: false,
-                    partition_type_string: Some(p.dos_type_string()),
+                    partition_type_string: Some(p.routing_type_string()),
                     hfs_block_size: None,
                     rdb_part_block: Some(p.block_num),
                     drv_name: Some(p.drv_name.clone()),
@@ -1818,6 +2055,9 @@ impl PartitionTable {
             PartitionTable::SgiDkLabel(_) => "SGI-DkLabel",
             PartitionTable::Sun(_) => "Sun",
             PartitionTable::Next(_) => "NeXT",
+            PartitionTable::Bsd(_) => "BSD",
+            PartitionTable::HpuxLvm(_) => "HP-UX LVM",
+            PartitionTable::AixLvm(_) => "AIX LVM",
             PartitionTable::SolarisX86 { .. } => "Solaris-x86",
             PartitionTable::Ahdi(_) => "AHDI",
             PartitionTable::X68k { .. } => "X68k",
@@ -1847,6 +2087,9 @@ impl PartitionTable {
             | PartitionTable::SgiDkLabel(_)
             | PartitionTable::Sun(_)
             | PartitionTable::Next(_)
+            | PartitionTable::Bsd(_)
+            | PartitionTable::HpuxLvm(_)
+            | PartitionTable::AixLvm(_)
             | PartitionTable::SolarisX86 { .. }
             | PartitionTable::Ahdi(_)
             | PartitionTable::X68k { .. }
@@ -2344,6 +2587,55 @@ mod tests {
             detect_superfloppy(&blank, &mut sized).as_deref(),
             Some("qdos_mdv"),
             "cartridge-sized bytes without the header must not be claimed"
+        );
+    }
+
+    #[test]
+    fn qnx2_hard_disk_one_based_start_is_corrected() {
+        // LEXICON layout: type 0x07 entry says sector 30, the QNX 2 volume's block 1 is sector 29.
+        let mut img = vec![0u8; 64 * 512];
+        img[0x1BE + 4] = 0x07;
+        img[0x1BE + 8..0x1BE + 12].copy_from_slice(&30u32.to_le_bytes());
+        img[0x1BE + 12..0x1BE + 16].copy_from_slice(&34u32.to_le_bytes());
+        img[510] = 0x55;
+        img[511] = 0xAA;
+        let b1 = 29 * 512;
+        img[b1 + 68] = 0x40;
+        img[b1 + 68 + 1..b1 + 68 + 5].copy_from_slice(&3u32.to_le_bytes());
+        img[b1 + 68 + 26] = 0x25;
+        // Block 3 (sector 31): the root's extent header, 4 data bytes.
+        img[31 * 512 + 8..31 * 512 + 12].copy_from_slice(&4u32.to_le_bytes());
+        let mut first = [0u8; 512];
+        first.copy_from_slice(&img[..512]);
+        let mut mbr = Mbr::parse(&first).unwrap();
+        qnx2_one_based_starts(&mut std::io::Cursor::new(img), &mut mbr, &first);
+        assert_eq!(mbr.entries[0].start_lba, 29);
+        // An NTFS-style 0x07 entry with nothing QNX-like before it is left alone.
+        let mut plain = Mbr::parse(&first).unwrap();
+        qnx2_one_based_starts(
+            &mut std::io::Cursor::new(vec![0u8; 64 * 512]),
+            &mut plain,
+            &first,
+        );
+        assert_eq!(plain.entries[0].start_lba, 30);
+    }
+
+    #[test]
+    fn detect_superfloppy_qdos_fat_without_jump_bytes() {
+        // The QDOS `work.ph` boot sector: "IBM  2.0", 202 x 512-byte sectors, media F8, no jump.
+        let mut img = vec![0u8; 202 * 512];
+        img[3..11].copy_from_slice(b"IBM  2.0");
+        img[11..24].copy_from_slice(&[0, 2, 1, 1, 0, 2, 0x40, 0, 0xCA, 0, 0xF8, 1, 0]);
+        let mut first = [0u8; 512];
+        first.copy_from_slice(&img[..512]);
+        let got = detect_superfloppy(&first, &mut std::io::Cursor::new(img.clone()));
+        assert_eq!(got.as_deref(), Some("FAT"));
+        img.extend_from_slice(&[0u8; 512]);
+        let got = detect_superfloppy(&first, &mut std::io::Cursor::new(img));
+        assert_ne!(
+            got.as_deref(),
+            Some("FAT"),
+            "only claimed at its exact length"
         );
     }
 
@@ -3001,6 +3293,9 @@ mod type_name_parity {
             PartitionTable::X68k { .. } => 10,
             PartitionTable::None { .. } => 11,
             PartitionTable::Dsd { .. } => 12,
+            PartitionTable::Bsd(_) => 13,
+            PartitionTable::HpuxLvm(_) => 14,
+            PartitionTable::AixLvm(_) => 15,
         }
     }
 

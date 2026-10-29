@@ -31,7 +31,7 @@
 //! dependency for it. An LZO image is refused by name rather than misparsed.
 
 use std::collections::HashMap;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 use super::entry::{EntryType, FileEntry};
 use super::filesystem::{Filesystem, FilesystemError};
@@ -997,23 +997,37 @@ impl<R: Read + Seek> SquashfsFilesystem<R> {
         inode: &Inode,
         max_bytes: usize,
     ) -> Result<Vec<u8>, FilesystemError> {
-        let want = (inode.file_size as usize).min(max_bytes);
-        let mut out = Vec::with_capacity(want);
+        let mut out = Vec::with_capacity((inode.file_size as usize).min(max_bytes));
+        self.copy_regular_file(inode, max_bytes as u64, &mut out)?;
+        Ok(out)
+    }
+
+    /// Stream up to `min(file_size, max_bytes)` bytes of a regular file into `w`, one data
+    /// block at a time.
+    fn copy_regular_file(
+        &mut self,
+        inode: &Inode,
+        max_bytes: u64,
+        w: &mut dyn Write,
+    ) -> Result<u64, FilesystemError> {
+        let want = inode.file_size.min(max_bytes);
+        let mut done = 0u64;
 
         // Whole blocks first, laid end to end from the file's start offset.
         let mut pos = inode.file_start;
         for &size_field in &inode.block_sizes {
-            if out.len() >= want {
+            if done >= want {
                 break;
             }
             let block = self.read_data_block(pos, size_field)?;
-            let take = (want - out.len()).min(block.len());
-            out.extend_from_slice(&block[..take]);
+            let take = ((want - done) as usize).min(block.len());
+            w.write_all(&block[..take])?;
+            done += take as u64;
             pos += (size_field & 0x00FF_FFFF) as u64;
         }
 
         // Then the tail, if it was packed into a shared fragment.
-        if out.len() < want && inode.fragment_index != 0xFFFF_FFFF {
+        if done < want && inode.fragment_index != 0xFFFF_FFFF {
             let frag = self
                 .fragments
                 .get(inode.fragment_index as usize)
@@ -1026,13 +1040,14 @@ impl<R: Read + Seek> SquashfsFilesystem<R> {
                 })?;
             let block = self.read_data_block(frag.start, frag.size)?;
             let from = inode.fragment_offset as usize;
-            let take = (want - out.len()).min(block.len().saturating_sub(from));
+            let take = ((want - done) as usize).min(block.len().saturating_sub(from));
             if take > 0 {
-                out.extend_from_slice(&block[from..from + take]);
+                w.write_all(&block[from..from + take])?;
+                done += take as u64;
             }
         }
 
-        Ok(out)
+        Ok(done)
     }
 
     /// Read the entire image into an editable [`BuildNode`] tree — the bridge
@@ -1217,6 +1232,20 @@ impl<R: Read + Seek + Send> Filesystem for SquashfsFilesystem<R> {
             }
         }
         self.read_regular_file(&inode, max_bytes)
+    }
+
+    fn write_file_to(
+        &mut self,
+        entry: &FileEntry,
+        writer: &mut dyn Write,
+    ) -> Result<u64, FilesystemError> {
+        let inode = self.read_inode(entry.location)?;
+        if inode.entry_type() == EntryType::File {
+            return self.copy_regular_file(&inode, u64::MAX, writer);
+        }
+        let data = self.read_file(entry, usize::MAX)?;
+        writer.write_all(&data)?;
+        Ok(data.len() as u64)
     }
 
     fn volume_label(&self) -> Option<&str> {
