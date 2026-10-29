@@ -134,9 +134,9 @@ impl TarSection {
                 h.as_old_mut().linkname[..link.len()].copy_from_slice(link);
             }
             let body: &[u8] = if m.dir || m.link.is_some() {
-                &[]
+                &[][..]
             } else {
-                &m.data
+                m.data.as_slice()
             };
             h.set_size(body.len() as u64);
             h.set_cksum();
