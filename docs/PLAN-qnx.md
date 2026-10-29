@@ -38,13 +38,12 @@ Sinclair QL QDOS that `fs::qdos` already reads. Detection must be by content.
   file's length the sum of its extents' `size` (the C sources' formula from
   the directory entry overshoots). The entry's block count is the blocks held
   minus one. The `bitmap` file is one bit per block (200 bytes for 1600).
-- Dates (decoded 2026-10-28 over all 2439 entries): word 0 is year-1980 in
-  bits 15-12, month in 11-8, a PM flag in bit 5 (bits 7-6 always 0) and the
-  day in 4-0; word 1 is seconds since 12 o'clock (never above 43183). The
-  `seconds` field is 0 on every ICON file. About 70 entries carry day 0 or the
-  31st of a 30-day month, all between 22:00 and 05:00: the ICON clock code's
-  month rollover. Counting the day on from the 1st of the month normalizes them
-  (May 0 -> 30 April).
+- Dates: word 0 is year-1980 in bits 15-12, month in 11-8, day in 5-1 and a
+  PM flag in bit 0 (bits 7-6 are 0); word 1 is seconds since 12 o'clock. A
+  first decode (PM in bit 5, day in 4-0) produced "day 0" and "31 April"
+  dates that looked like a clock quirk; QNX's own `files` in icon-emu showed
+  the real layout (28-May-85 3:01pm is `5539 2A91`). The `seconds` field is 0
+  on every ICON file.
 - Status: `0x40` in use, `0x10` modified (busy is not seen on these disks).
   Owner is `group.member` (`+16` group, `+15` member; 255.255 on nearly every
   ICON file). Attributes (`+26`, owner) and permissions (`+24` group, `+25`
@@ -84,6 +83,41 @@ Sinclair QL QDOS that `fs::qdos` already reads. Detection must be by content.
   entry whose stored start differs from the parsed one).
 - The volume is the same format as the floppies: 425 files / 20 dirs, fsck
   clean, `/sys/icon2_emul` among them.
+
+## Writing QNX 2 (done 2026-10-28, verified in icon-emu)
+
+icon-emu (`github.com/danifunker/icon-emu`, CLI `icon-cli serve` + `icon-ci`;
+needs the ICON ROM, NAS `ICON_ICON2/From YorkU/UNISYS_ICON/Firmware/ICON1`)
+runs the real QNX 2.05b (ICON 4.10.01). The writer was learned by having QNX
+make directories and files, rename, `zap` and `frel` them, and diffing the
+disk after each step:
+
+- Block 1 is laid out like a directory extent; its slot 1 (byte 68) is the
+  root entry. Each directory's header `{parent_xtnt, dir_index}` names the
+  slot of its own entry (the root's says block 1, slot 1); that entry's date
+  changes whenever the directory does.
+- `mkdir`: one block, header `{0, 0, 484, 0}`, data `{parent first extent,
+  slot}` then ten empty slots. Entries form one stream across a directory's
+  extents; adding the 11th fills the first block's last 12 bytes and spills 36
+  into a new one-block extent (a slot straddles two extents).
+- New entries: status `0x50`; files attributes `0x17`, permissions `0x01`;
+  directories `0x35` / `0x21`; owner 255.255 for root. Freed slots (status
+  without `0x40`) are reused.
+- Extents hold at most 128 blocks: `size` is checked as a 16-bit value (65520 =
+  128 x 512 - 16), and `chkfsys` reports "Non-zero extent extension" past it.
+  QNX itself splits big files into 128-block extents.
+- `frel` (delete) sets status 0, zeroes the first extent's `size`, frees the
+  bitmap bits and keeps the name and pointers. `zap` only clears `0x40` and
+  leaves the blocks marked (chkfsys then finds them unused).
+- Owner: `+15` member, `+16` group. Permissions: `+24` group, `+25` other,
+  `+26` owner attributes (`chattr g= m= a= p= pg=` confirmed each).
+
+Verified: create (1 to 391 blocks, 1-4 extents), mkdir, directory growth
+past one block, rename, delete, recursive delete, chmod, chown, on the 10 MB
+disk, both partitions of the 64 MB disk (drives 1 and 3) and an 800 KiB
+floppy (drive 2). Each time `chkfsys` ended "Rebuilt bitmap agrees with
+existing bitmap" with no errors, and a file RB wrote, copied by QNX, read back
+byte-identical; QNX's writes read back through RB with a clean RB fsck.
 
 ## QNX 4 and QNX 6
 

@@ -2519,6 +2519,10 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "qnx2" => Ok(Box::new(qnx2::Qnx2Filesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 "affs" => Ok(Box::new(affs::AffsFilesystem::open_sized(
                     reader,
                     partition_offset,

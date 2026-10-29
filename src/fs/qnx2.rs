@@ -1,4 +1,4 @@
-//! QNX 2 filesystem (QNX 2.x, and the Unisys ICON's System Software and QDOS), read-only.
+//! QNX 2 filesystem (QNX 2.x, and the Unisys ICON's System Software and QDOS): read and edit.
 //!
 //! The layout comes from Mitchell Schoenbrun's public-domain `q2files.c` /
 //! `q2read.c` and was checked against the ICON floppies (800 KiB, 1600 blocks).
@@ -17,9 +17,8 @@
 //! - Attribute and permission bits: files `r w a e m` = `0x01 0x02 0x04 0x08 0x10`;
 //!   directories `r c b m` = `0x01 0x04 0x08 0x10` (`c` and `b` inferred from the
 //!   ICON disks, where every directory is owner `r c m`, others `r`).
-//! - Date: word 0 is year-1980 in bits 15-12, month 11-8, PM 5, day 4-0; word 1 is
-//!   seconds since 12 o'clock. The ICON clock wrote day 0 and the 31st of 30-day
-//!   months around midnight, so the day counts on from the 1st of the month.
+//! - Date: word 0 is year-1980 in bits 15-12, month 11-8, day 5-1, PM 0; word 1 is
+//!   seconds since 12 o'clock. Checked against QNX 4.10.01's `files` in icon-emu.
 //! - A file is a chain of extents. Each extent's first block starts with
 //!   `{u32 prev, u32 next, u32 size, u32 bound}`: `size` is the data bytes the
 //!   extent holds (after the 16-byte header, running on into its following
@@ -29,12 +28,30 @@
 //!   when `dir_index`'s top bit is set), then 48-byte entries. A deleted entry
 //!   keeps its name and extents with the `0x40` status bit clear.
 //! - Text files end lines with RS (`0x1E`); [`rs_to_lf`] converts them on extract.
+//!
+//! Writing follows what QNX 4.10.01 itself does, learned by diffing disks it wrote
+//! in icon-emu and checked with its `chkfsys` (see `docs/PLAN-qnx.md`):
+//!
+//! - Block 1 is laid out like a directory extent: its root entry is slot 1 at
+//!   20 + 48. Every directory's data header points at its own entry: slot
+//!   `dir_index` of the directory whose first extent is `parent_xtnt` (the root's
+//!   says block 1, slot 1), which is where its date and extent counts live.
+//! - `mkdir` allocates one block holding the header and ten empty slots
+//!   (`size` 484). A directory's entries are one stream across its extents, so a
+//!   48-byte slot may straddle two; a new slot reuses the first one not in use,
+//!   else the stream grows by 48, a new one-block extent taking the overflow.
+//! - New files: status `0x50`, owner attributes `0x17` (`rwa-m`), group and other
+//!   `0x01`; directories `0x35` / `0x21`. A changed directory's date is updated.
+//! - `frel` (delete) clears the status byte, zeroes the first extent's `size` and
+//!   frees the bitmap bits; the name and extent pointers stay.
 
 use std::collections::{HashMap, HashSet};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 use super::entry::FileEntry;
-use super::filesystem::{Filesystem, FilesystemError};
+use super::filesystem::{
+    CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem, FilesystemError,
+};
 use super::fsck::{FsckIssue, FsckResult, FsckStats};
 
 const BLOCK: u64 = 512;
@@ -46,6 +63,22 @@ const MODIFIED: u8 = 0x10;
 const DIRECTORY: u8 = 0x20;
 /// QNX 2's line separator.
 pub const RS: u8 = 0x1E;
+/// QNX keeps an extent's byte count in 16 bits (the high word is checked as zero), so an
+/// extent spans at most 128 blocks (65520 data bytes).
+const MAX_EXTENT_BLOCKS: u64 = 128;
+
+/// Blocks a file of `len` bytes needs in full-size extents.
+fn blocks_for(len: u64) -> u64 {
+    let per = MAX_EXTENT_BLOCKS * BLOCK - XTNT_HDR;
+    let (full, rest) = (len / per, len % per);
+    full * MAX_EXTENT_BLOCKS
+        + if rest > 0 || full == 0 {
+            (rest + XTNT_HDR).div_ceil(BLOCK)
+        } else {
+            0
+        }
+}
+
 /// Longest chain a well-formed volume can hold; a loop or a wild pointer stops here.
 const MAX_EXTENTS: usize = 1 << 16;
 /// Suffix that marks a deleted entry in listings when deleted entries are shown.
@@ -107,14 +140,35 @@ impl Dirent {
 pub fn decode_date(w0: u16, w1: u16) -> Option<i64> {
     use chrono::Datelike;
     let month = u32::from((w0 >> 8) & 15);
-    if w0 == 0 || !(1..=12).contains(&month) || w1 >= 43200 {
+    let day = u32::from((w0 >> 1) & 31);
+    if w0 == 0 || !(1..=12).contains(&month) || day == 0 || w1 >= 43200 {
         return None;
     }
-    let first = chrono::NaiveDate::from_ymd_opt(1980 + i32::from(w0 >> 12), month, 1)?;
+    let date = chrono::NaiveDate::from_ymd_opt(1980 + i32::from(w0 >> 12), month, day)?;
     // 719_163 is 1970-01-01 counted from 0001-01-01.
-    let days = i64::from(first.num_days_from_ce()) - 719_163 + i64::from(w0 & 31) - 1;
-    let pm = if w0 & 0x20 != 0 { 43200 } else { 0 };
+    let days = i64::from(date.num_days_from_ce()) - 719_163;
+    let pm = if w0 & 1 != 0 { 43200 } else { 0 };
     Some(days * 86400 + pm + i64::from(w1))
+}
+
+/// Encode Unix seconds as an ICON date pair; the 4-bit year holds 1980-1995, so other times clamp.
+pub fn encode_date(unix: i64) -> [u16; 2] {
+    use chrono::{Datelike, NaiveDate};
+    let day0 = |y, m, d| NaiveDate::from_ymd_opt(y, m, d).map_or(0, days_since_epoch);
+    let t = unix.clamp(day0(1980, 1, 1) * 86400, day0(1995, 12, 31) * 86400 + 86399);
+    let date = NaiveDate::from_num_days_from_ce_opt((t.div_euclid(86400) + 719_163) as i32)
+        .unwrap_or_default();
+    let s = t.rem_euclid(86400) as u32;
+    let w0 = ((date.year() - 1980) as u16) << 12
+        | (date.month() as u16) << 8
+        | (date.day() as u16) << 1
+        | u16::from(s >= 43200);
+    [w0, (s % 43200) as u16]
+}
+
+fn days_since_epoch(d: chrono::NaiveDate) -> i64 {
+    use chrono::Datelike;
+    i64::from(d.num_days_from_ce()) - 719_163
 }
 
 /// Unix permission bits for one class from QNX 2 `rwaem` / `rcbm` bits.
@@ -215,6 +269,8 @@ pub struct Qnx2Filesystem<R: Read + Seek + Send> {
     free_blocks: u64,
     root_first: u32,
     bitmap: Vec<u8>,
+    /// First extent of the `bitmap` file, where allocation changes are written back.
+    bm_first: u32,
     show_deleted: bool,
 }
 
@@ -235,6 +291,7 @@ impl<R: Read + Seek + Send> Qnx2Filesystem<R> {
             free_blocks: 0,
             root_first: root.first,
             bitmap: Vec::new(),
+            bm_first: 0,
             show_deleted: false,
         };
         // The bitmap file sizes the volume (one bit per block) and counts the free blocks.
@@ -251,6 +308,7 @@ impl<R: Read + Seek + Send> Qnx2Filesystem<R> {
                         .sum::<u64>()
                         .min(fs.total_blocks);
                     fs.bitmap = map;
+                    fs.bm_first = bm.first;
                 }
             }
         }
@@ -504,6 +562,620 @@ impl<R: Read + Seek + Send> Qnx2Filesystem<R> {
     }
 }
 
+/// Where a directory entry lives: slot `slot` of the directory whose first extent is `dir`.
+#[derive(Debug, Clone, Copy)]
+struct EntryLoc {
+    dir: u32,
+    slot: usize,
+}
+
+/// A valid QNX 2 name: 1-16 of `A-Z a-z 0-9 _ . $`, not starting with `$`.
+fn validate_qnx2_name(name: &str) -> Result<(), FilesystemError> {
+    let ok = !name.is_empty()
+        && name.len() <= 16
+        && !name.starts_with('$')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'$'));
+    if ok {
+        Ok(())
+    } else {
+        Err(FilesystemError::InvalidData(format!(
+            "qnx2: {name:?} is not a valid name (1-16 of A-Z a-z 0-9 _ . $, not starting with $)"
+        )))
+    }
+}
+
+/// QNX 2 owner attributes and group / other permissions for a Unix mode.
+fn qnx_bits(mode: u32, dir: bool) -> (u8, u8, u8) {
+    let class = |m: u32| -> u8 {
+        let mut b = 0;
+        if m & 4 != 0 {
+            b |= 0x01;
+        }
+        if m & 2 != 0 {
+            b |= if dir { 0x04 } else { 0x06 };
+        }
+        if !dir && m & 1 != 0 {
+            b |= 0x08;
+        }
+        b
+    };
+    // The owner always keeps `m`, so chattr can still change the entry.
+    let attr = class(mode >> 6) | 0x10 | if dir { DIRECTORY } else { 0 };
+    (attr, class(mode >> 3), class(mode))
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+impl<R: Read + Seek + Send> Qnx2Filesystem<R> {
+    /// Volume byte ranges holding `len` bytes of the stream of chain `first` from `off`.
+    /// Block 1 acts as a one-block stream whose data starts at byte 16, like an extent.
+    fn stream_spans(
+        &mut self,
+        first: u32,
+        mut off: u64,
+        len: u64,
+    ) -> Result<Vec<(u64, u64)>, FilesystemError> {
+        let pieces: Vec<(u64, u64)> = if first == 1 {
+            vec![(1, BLOCK - XTNT_HDR)]
+        } else {
+            self.extents(first)?
+                .iter()
+                .map(|x| (x.block, x.size))
+                .collect()
+        };
+        let mut out = Vec::new();
+        let mut left = len;
+        for (block, size) in pieces {
+            if left == 0 {
+                break;
+            }
+            if off >= size {
+                off -= size;
+                continue;
+            }
+            let take = (size - off).min(left);
+            out.push((self.offset + (block - 1) * BLOCK + XTNT_HDR + off, take));
+            left -= take;
+            off = 0;
+        }
+        if left > 0 {
+            return Err(FilesystemError::InvalidData(format!(
+                "qnx2: stream of block {first} is shorter than expected"
+            )));
+        }
+        Ok(out)
+    }
+
+    fn read_stream(&mut self, first: u32, off: u64, buf: &mut [u8]) -> Result<(), FilesystemError> {
+        let mut at = 0usize;
+        for (pos, n) in self.stream_spans(first, off, buf.len() as u64)? {
+            self.reader.seek(SeekFrom::Start(pos))?;
+            self.reader.read_exact(&mut buf[at..at + n as usize])?;
+            at += n as usize;
+        }
+        Ok(())
+    }
+
+    fn header_len(&mut self, dir: u32) -> Result<u64, FilesystemError> {
+        if dir == 1 {
+            return Ok(4);
+        }
+        let mut h = [0u8; 4];
+        self.read_stream(dir, 0, &mut h)?;
+        Ok(if u16::from_le_bytes([h[2], h[3]]) & 0x8000 != 0 {
+            6
+        } else {
+            4
+        })
+    }
+
+    fn read_entry(&mut self, loc: EntryLoc) -> Result<[u8; ENTRY], FilesystemError> {
+        let mut e = [0u8; ENTRY];
+        let at = self.header_len(loc.dir)? + (loc.slot * ENTRY) as u64;
+        self.read_stream(loc.dir, at, &mut e)?;
+        Ok(e)
+    }
+
+    /// Every 48-byte slot of a directory, in order.
+    fn dir_slots(&mut self, dir: u32) -> Result<Vec<[u8; ENTRY]>, FilesystemError> {
+        let data = self.read_chain(dir, 1 << 22)?;
+        let hdr = self.header_len(dir)? as usize;
+        Ok(data
+            .get(hdr..)
+            .unwrap_or_default()
+            .chunks_exact(ENTRY)
+            .map(|c| {
+                let mut e = [0u8; ENTRY];
+                e.copy_from_slice(c);
+                e
+            })
+            .collect())
+    }
+
+    /// The entry describing directory `dir`, from the `{parent_xtnt, dir_index}` header.
+    fn self_loc(&mut self, dir: u32) -> Result<EntryLoc, FilesystemError> {
+        let mut h = [0u8; 4];
+        self.read_stream(dir, 0, &mut h)?;
+        let index = u16::from_le_bytes([h[2], h[3]]);
+        if index & 0x8000 != 0 {
+            return Err(FilesystemError::Unsupported(
+                "qnx2: extended directory headers are not supported for editing".into(),
+            ));
+        }
+        Ok(EntryLoc {
+            dir: u32::from(u16::from_le_bytes([h[0], h[1]])),
+            slot: index as usize,
+        })
+    }
+
+    /// The in-use entry named `name` with first extent `first` in directory `dir`.
+    fn find_slot(&mut self, dir: u32, name: &str, first: u32) -> Result<usize, FilesystemError> {
+        self.dir_slots(dir)?
+            .iter()
+            .position(|e| {
+                let d = Dirent::decode(e);
+                d.in_use() && d.name == name && d.first == first
+            })
+            .ok_or_else(|| FilesystemError::NotFound(format!("qnx2: {name}")))
+    }
+
+    fn name_taken(&mut self, dir: u32, name: &str) -> Result<bool, FilesystemError> {
+        Ok(self.dir_slots(dir)?.iter().any(|e| {
+            let d = Dirent::decode(e);
+            d.in_use() && d.name == name
+        }))
+    }
+}
+
+impl<R: Read + Write + Seek + Send> Qnx2Filesystem<R> {
+    fn write_stream(&mut self, first: u32, off: u64, data: &[u8]) -> Result<(), FilesystemError> {
+        let mut at = 0usize;
+        for (pos, n) in self.stream_spans(first, off, data.len() as u64)? {
+            self.reader.seek(SeekFrom::Start(pos))?;
+            self.reader.write_all(&data[at..at + n as usize])?;
+            at += n as usize;
+        }
+        Ok(())
+    }
+
+    fn write_entry(&mut self, loc: EntryLoc, e: &[u8; ENTRY]) -> Result<(), FilesystemError> {
+        let at = self.header_len(loc.dir)? + (loc.slot * ENTRY) as u64;
+        self.write_stream(loc.dir, at, e)
+    }
+
+    fn write_block_bytes(
+        &mut self,
+        block: u64,
+        off: u64,
+        data: &[u8],
+    ) -> Result<(), FilesystemError> {
+        self.reader
+            .seek(SeekFrom::Start(self.offset + (block - 1) * BLOCK + off))?;
+        self.reader.write_all(data)?;
+        Ok(())
+    }
+
+    fn write_header(&mut self, block: u64, hdr: [u32; 4]) -> Result<(), FilesystemError> {
+        let mut b = [0u8; 16];
+        for (i, w) in hdr.iter().enumerate() {
+            b[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        self.write_block_bytes(block, 0, &b)
+    }
+
+    /// Set or clear the bitmap bits of `count` blocks from `start`, in memory and on disk.
+    fn mark(&mut self, start: u64, count: u64, used: bool) -> Result<(), FilesystemError> {
+        if self.bm_first == 0 {
+            return Err(FilesystemError::Unsupported(
+                "qnx2: the volume has no bitmap file".into(),
+            ));
+        }
+        let (lo, hi) = (
+            ((start - 1) / 8) as usize,
+            ((start + count - 2) / 8) as usize,
+        );
+        for b in start..start + count {
+            let (i, bit) = (((b - 1) / 8) as usize, (b - 1) % 8);
+            let was = self.bitmap[i] >> bit & 1 != 0;
+            if used {
+                self.bitmap[i] |= 1 << bit;
+            } else {
+                self.bitmap[i] &= !(1 << bit);
+            }
+            match (was, used) {
+                (false, true) => self.free_blocks -= 1,
+                (true, false) => self.free_blocks += 1,
+                _ => {}
+            }
+        }
+        let bytes = self.bitmap[lo..=hi].to_vec();
+        self.write_stream(self.bm_first, lo as u64, &bytes)
+    }
+
+    /// Extents for `len` data bytes, at most [`MAX_EXTENT_BLOCKS`] each as QNX writes them: from
+    /// one contiguous run when one is big enough, else from the largest free runs first.
+    fn allocate(&mut self, len: u64) -> Result<Vec<(u64, u64)>, FilesystemError> {
+        let mut runs: Vec<(u64, u64)> = Vec::new();
+        let mut b = 2;
+        while b <= self.total_blocks {
+            if self.marked(b) == Some(false) {
+                let start = b;
+                while b <= self.total_blocks && self.marked(b) == Some(false) {
+                    b += 1;
+                }
+                runs.push((start, b - start));
+            } else {
+                b += 1;
+            }
+        }
+        let need = blocks_for(len);
+        if let Some(&(start, _)) = runs.iter().find(|r| r.1 >= need) {
+            runs = vec![(start, need)];
+        } else {
+            runs.sort_by_key(|r| std::cmp::Reverse(r.1));
+        }
+        // Carve the runs into extents until the data fits.
+        let mut out = Vec::new();
+        let mut left = len;
+        'runs: for (start, n) in runs {
+            let mut at = start;
+            while at < start + n {
+                let take = (start + n - at).min(MAX_EXTENT_BLOCKS);
+                let cap = take * BLOCK - XTNT_HDR;
+                if cap >= left {
+                    out.push((at, (left + XTNT_HDR).div_ceil(BLOCK).max(1)));
+                    left = 0;
+                    break 'runs;
+                }
+                out.push((at, take));
+                left -= cap;
+                at += take;
+            }
+        }
+        if left > 0 || out.is_empty() {
+            return Err(FilesystemError::DiskFull(format!(
+                "qnx2: {len} bytes do not fit in {} free blocks",
+                self.free_blocks
+            )));
+        }
+        out.sort_unstable();
+        for &(start, n) in &out {
+            self.mark(start, n, true)?;
+        }
+        Ok(out)
+    }
+
+    /// Write `len` bytes from `data` as an extent chain over `runs`; returns (last extent, blocks).
+    fn write_chain(
+        &mut self,
+        runs: &[(u64, u64)],
+        data: &mut dyn Read,
+        mut len: u64,
+    ) -> Result<(u64, u64), FilesystemError> {
+        let mut buf = vec![0u8; 64 * 1024];
+        for (i, &(start, n)) in runs.iter().enumerate() {
+            let size = len.min(n * BLOCK - XTNT_HDR);
+            let prev = if i == 0 { 0 } else { runs[i - 1].0 };
+            let next = runs.get(i + 1).map_or(0, |r| r.0);
+            self.write_header(
+                start,
+                [prev as u32, next as u32, size as u32, (n - 1) as u32],
+            )?;
+            // Zero the extent so no stale bytes follow the data.
+            let zeros = vec![0u8; (n * BLOCK - XTNT_HDR) as usize];
+            self.write_block_bytes(start, XTNT_HDR, &zeros)?;
+            self.reader.seek(SeekFrom::Start(
+                self.offset + (start - 1) * BLOCK + XTNT_HDR,
+            ))?;
+            let mut left = size;
+            while left > 0 {
+                let k = left.min(buf.len() as u64) as usize;
+                data.read_exact(&mut buf[..k])?;
+                self.reader.write_all(&buf[..k])?;
+                left -= k as u64;
+            }
+            len -= size;
+        }
+        let blocks = runs.iter().map(|r| r.1).sum();
+        Ok((runs.last().map_or(0, |r| r.0), blocks))
+    }
+
+    /// A free slot in directory `dir`, growing its stream by one slot when none is free.
+    fn free_slot(&mut self, dir: u32) -> Result<usize, FilesystemError> {
+        let slots = self.dir_slots(dir)?;
+        if let Some(i) = slots.iter().position(|e| e[0] & USED == 0) {
+            return Ok(i);
+        }
+        if dir == 1 {
+            return Err(FilesystemError::DiskFull(
+                "qnx2: block 1 has no free slot".into(),
+            ));
+        }
+        let xs = self.extents(dir)?;
+        let last = *xs.last().expect("a directory has an extent");
+        let room = last.span * BLOCK - XTNT_HDR - last.size;
+        let header = |x: &Extent, next: u64, size: u64| {
+            [x.prev as u32, next as u32, size as u32, (x.span - 1) as u32]
+        };
+        if room >= ENTRY as u64 {
+            self.write_header(last.block, header(&last, 0, last.size + ENTRY as u64))?;
+        } else {
+            // The slot straddles: fill this extent and spill the rest into a new one-block extent.
+            let nb = self.allocate(ENTRY as u64)?[0].0;
+            self.write_header(last.block, header(&last, nb, last.size + room))?;
+            let spill = ENTRY as u64 - room;
+            self.write_header(nb, [last.block as u32, 0, spill as u32, 0])?;
+            self.write_block_bytes(nb, XTNT_HDR, &[0u8; (BLOCK - XTNT_HDR) as usize])?;
+            let loc = self.self_loc(dir)?;
+            let mut e = self.read_entry(loc)?;
+            let d = Dirent::decode(&e);
+            e[5..9].copy_from_slice(&(nb as u32).to_le_bytes());
+            e[9..13].copy_from_slice(&(d.blocks_less_one + 1).to_le_bytes());
+            let nxt = u16::from_le_bytes([e[13], e[14]]) + 1;
+            e[13..15].copy_from_slice(&nxt.to_le_bytes());
+            self.write_entry(loc, &e)?;
+        }
+        let i = slots.len();
+        self.write_entry(EntryLoc { dir, slot: i }, &[0u8; ENTRY])?;
+        Ok(i)
+    }
+
+    /// Stamp directory `dir`'s own entry with the current date, as QNX does on a change.
+    fn touch_dir(&mut self, dir: u32) -> Result<(), FilesystemError> {
+        let loc = self.self_loc(dir)?;
+        // A header that doesn't name its entry leaves nothing to date; the edit itself stands.
+        if loc.dir == 0 {
+            return Ok(());
+        }
+        let mut e = self.read_entry(loc)?;
+        let [w0, w1] = encode_date(now_unix());
+        e[27..29].copy_from_slice(&w0.to_le_bytes());
+        e[29..31].copy_from_slice(&w1.to_le_bytes());
+        self.write_entry(loc, &e)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_entry(
+        name: &str,
+        first: u64,
+        last: u64,
+        blocks: u64,
+        extents: usize,
+        owner: (u8, u8),
+        bits: (u8, u8, u8),
+        date: [u16; 2],
+    ) -> [u8; ENTRY] {
+        let mut e = [0u8; ENTRY];
+        e[0] = USED | MODIFIED;
+        e[1..5].copy_from_slice(&(first as u32).to_le_bytes());
+        e[5..9].copy_from_slice(&(last as u32).to_le_bytes());
+        e[9..13].copy_from_slice(&(blocks.saturating_sub(1) as u32).to_le_bytes());
+        e[13..15].copy_from_slice(&(extents as u16).to_le_bytes());
+        e[15] = owner.0;
+        e[16] = owner.1;
+        e[24] = bits.1;
+        e[25] = bits.2;
+        e[26] = bits.0;
+        e[27..29].copy_from_slice(&date[0].to_le_bytes());
+        e[29..31].copy_from_slice(&date[1].to_le_bytes());
+        e[31..31 + name.len()].copy_from_slice(name.as_bytes());
+        e
+    }
+
+    /// Where `entry` lives, found from its parent directory and checked against its location.
+    fn loc_of(&mut self, entry: &FileEntry) -> Result<EntryLoc, FilesystemError> {
+        if entry.is_directory() && entry.location as u32 != self.root_first {
+            return self.self_loc(entry.location as u32);
+        }
+        let parent_path = match entry.path.rsplit_once('/') {
+            Some(("", _)) | None => "/".to_string(),
+            Some((p, _)) => p.to_string(),
+        };
+        let mut dir = self.root_first;
+        for part in parent_path.split('/').filter(|p| !p.is_empty()) {
+            let slots = self.dir_slots(dir)?;
+            dir = slots
+                .iter()
+                .map(|e| Dirent::decode(e))
+                .find(|d| d.in_use() && d.is_dir() && d.name == part)
+                .map(|d| d.first)
+                .ok_or_else(|| FilesystemError::NotFound(parent_path.clone()))?;
+        }
+        let slot = self.find_slot(dir, &entry.name, entry.location as u32)?;
+        Ok(EntryLoc { dir, slot })
+    }
+
+    fn owner_of(opts_uid: Option<u32>, opts_gid: Option<u32>) -> (u8, u8) {
+        (
+            opts_uid.map_or(255, |u| u.min(255) as u8),
+            opts_gid.map_or(255, |g| g.min(255) as u8),
+        )
+    }
+}
+
+impl<R: Read + Write + Seek + Send> EditableFilesystem for Qnx2Filesystem<R> {
+    fn as_filesystem(&self) -> &dyn Filesystem {
+        self
+    }
+
+    fn as_filesystem_mut(&mut self) -> &mut dyn Filesystem {
+        self
+    }
+
+    fn create_file(
+        &mut self,
+        parent: &FileEntry,
+        name: &str,
+        data: &mut dyn Read,
+        data_len: u64,
+        options: &CreateFileOptions,
+    ) -> Result<FileEntry, FilesystemError> {
+        validate_qnx2_name(name)?;
+        let dir = parent.location as u32;
+        if self.name_taken(dir, name)? {
+            return Err(FilesystemError::AlreadyExists(name.to_string()));
+        }
+        let runs = self.allocate(data_len)?;
+        let (last, blocks) = self.write_chain(&runs, data, data_len)?;
+        let bits = options
+            .mode
+            .map_or((0x17, 0x01, 0x01), |m| qnx_bits(m, false));
+        let when = options
+            .unix_times
+            .and_then(|t| t.mtime)
+            .map_or_else(now_unix, |t| t as i64);
+        let e = Self::new_entry(
+            name,
+            runs[0].0,
+            last,
+            blocks,
+            runs.len(),
+            Self::owner_of(options.uid, options.gid),
+            bits,
+            encode_date(when),
+        );
+        let slot = self.free_slot(dir)?;
+        self.write_entry(EntryLoc { dir, slot }, &e)?;
+        self.touch_dir(dir)?;
+        Ok(self.entry_for(&parent.path, &Dirent::decode(&e), name.to_string()))
+    }
+
+    fn create_directory(
+        &mut self,
+        parent: &FileEntry,
+        name: &str,
+        options: &CreateDirectoryOptions,
+    ) -> Result<FileEntry, FilesystemError> {
+        validate_qnx2_name(name)?;
+        let dir = parent.location as u32;
+        if self.name_taken(dir, name)? {
+            return Err(FilesystemError::AlreadyExists(name.to_string()));
+        }
+        let parent_xtnt = u16::try_from(dir).map_err(|_| {
+            FilesystemError::Unsupported("qnx2: parent directory past block 65535".into())
+        })?;
+        let slot = self.free_slot(dir)?;
+        let nb = self.allocate(ENTRY as u64 * 10 + 4)?[0].0;
+        // A new directory is one block: the header and ten empty slots, as `mkdir` writes it.
+        self.write_header(nb, [0, 0, 4 + 10 * ENTRY as u32, 0])?;
+        let mut body = vec![0u8; (BLOCK - XTNT_HDR) as usize];
+        body[0..2].copy_from_slice(&parent_xtnt.to_le_bytes());
+        body[2..4].copy_from_slice(&(slot as u16).to_le_bytes());
+        self.write_block_bytes(nb, XTNT_HDR, &body)?;
+        let bits = options
+            .mode
+            .map_or((0x35, 0x21, 0x21), |m| qnx_bits(m, true));
+        let when = options
+            .unix_times
+            .and_then(|t| t.mtime)
+            .map_or_else(now_unix, |t| t as i64);
+        let e = Self::new_entry(
+            name,
+            nb,
+            nb,
+            1,
+            1,
+            Self::owner_of(options.uid, options.gid),
+            bits,
+            encode_date(when),
+        );
+        self.write_entry(EntryLoc { dir, slot }, &e)?;
+        self.touch_dir(dir)?;
+        Ok(self.entry_for(&parent.path, &Dirent::decode(&e), name.to_string()))
+    }
+
+    fn delete_entry(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+    ) -> Result<(), FilesystemError> {
+        let dir = parent.location as u32;
+        let slot = self.find_slot(dir, &entry.name, entry.location as u32)?;
+        let loc = EntryLoc { dir, slot };
+        let mut e = self.read_entry(loc)?;
+        let d = Dirent::decode(&e);
+        if d.is_dir() && self.dir_slots(d.first)?.iter().any(|s| s[0] & USED != 0) {
+            return Err(FilesystemError::InvalidData(format!(
+                "qnx2: directory {} is not empty",
+                entry.path
+            )));
+        }
+        let xs = self.extents(d.first)?;
+        for x in &xs {
+            self.mark(x.block, x.span, false)?;
+        }
+        // As `frel`: the slot is released and the first extent emptied; names and pointers stay.
+        if let Some(x) = xs.first() {
+            self.write_block_bytes(x.block, 8, &0u32.to_le_bytes())?;
+        }
+        e[0] = 0;
+        let [w0, w1] = encode_date(now_unix());
+        e[27..29].copy_from_slice(&w0.to_le_bytes());
+        e[29..31].copy_from_slice(&w1.to_le_bytes());
+        self.write_entry(loc, &e)?;
+        self.touch_dir(dir)
+    }
+
+    fn rename(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+        new_name: &str,
+    ) -> Result<(), FilesystemError> {
+        validate_qnx2_name(new_name)?;
+        let dir = parent.location as u32;
+        if self.name_taken(dir, new_name)? {
+            return Err(FilesystemError::AlreadyExists(new_name.to_string()));
+        }
+        let slot = self.find_slot(dir, &entry.name, entry.location as u32)?;
+        let loc = EntryLoc { dir, slot };
+        let mut e = self.read_entry(loc)?;
+        e[31..ENTRY].fill(0);
+        e[31..31 + new_name.len()].copy_from_slice(new_name.as_bytes());
+        self.write_entry(loc, &e)?;
+        self.touch_dir(dir)
+    }
+
+    fn set_permissions(&mut self, entry: &FileEntry, mode: u32) -> Result<(), FilesystemError> {
+        let loc = self.loc_of(entry)?;
+        let mut e = self.read_entry(loc)?;
+        let (attr, g, o) = qnx_bits(mode, e[26] & DIRECTORY != 0);
+        e[24] = g;
+        e[25] = o;
+        e[26] = attr;
+        self.write_entry(loc, &e)
+    }
+
+    fn set_owner(&mut self, entry: &FileEntry, uid: u32, gid: u32) -> Result<(), FilesystemError> {
+        if uid > 255 || gid > 255 {
+            return Err(FilesystemError::InvalidData(
+                "qnx2: group and member are 0-255".into(),
+            ));
+        }
+        let loc = self.loc_of(entry)?;
+        let mut e = self.read_entry(loc)?;
+        e[15] = uid as u8;
+        e[16] = gid as u8;
+        self.write_entry(loc, &e)
+    }
+
+    fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
+        self.reader.flush()?;
+        Ok(())
+    }
+
+    fn free_space(&mut self) -> Result<u64, FilesystemError> {
+        Ok(self.free_blocks * BLOCK)
+    }
+}
+
 /// Findings gathered while walking the tree.
 #[derive(Default)]
 struct Walk {
@@ -662,6 +1334,10 @@ impl<R: Read + Seek + Send> Filesystem for Qnx2Filesystem<R> {
         "QNX 2"
     }
 
+    fn validate_name(&self, name: &str) -> Result<(), FilesystemError> {
+        validate_qnx2_name(name)
+    }
+
     fn total_size(&self) -> u64 {
         self.total_blocks * BLOCK
     }
@@ -767,27 +1443,25 @@ mod tests {
     }
 
     #[test]
-    fn icon_dates_decode_with_the_pm_bit_and_month_rollover() {
-        // 0xbb02 / 0x9906: 2 Nov 1991, AM, 39174 s after midnight = 10:52:54.
-        let t = decode_date(0xBB02, 0x9906).unwrap();
-        assert_eq!(
-            crate::fs::unix_common::inode::format_unix_timestamp(t),
-            "1991-11-02 10:52:54"
-        );
-        // 0xba3f: 31 Oct 1991, PM.
-        let t = decode_date(0xBA3F, 0).unwrap();
-        assert_eq!(
-            crate::fs::unix_common::inode::format_unix_timestamp(t),
-            "1991-10-31 12:00:00"
-        );
-        // Day 0 of May at 22:36 is the last day of April.
-        let t = decode_date(0xA520, 38175).unwrap();
-        assert_eq!(
-            crate::fs::unix_common::inode::format_unix_timestamp(t),
-            "1990-04-30 22:36:15"
-        );
+    fn icon_dates_match_what_qnx_files_prints() {
+        let show = |w0, w1| {
+            crate::fs::unix_common::inode::format_unix_timestamp(decode_date(w0, w1).unwrap())
+        };
+        // Each pair as QNX 4.10.01's `files` lists it in icon-emu.
+        assert_eq!(show(0x5539, 0x2A91), "1985-05-28 15:01:37"); // 28-May-85 3:01pm
+        assert_eq!(show(0xBA3A, 0x0642), "1991-10-29 00:26:42"); // 29-Oct-91 12:26am
+        assert_eq!(show(0x832F, 0x3976), "1988-03-23 16:05:10"); // 23-Mar-88 4:05pm
         assert_eq!(decode_date(0, 0), None);
         assert_eq!(decode_date(0x7027, 0), None);
+        for t in [
+            decode_date(0x5539, 0x2A91).unwrap(),
+            decode_date(0xBA3A, 0x0642).unwrap(),
+        ] {
+            let [w0, w1] = encode_date(t);
+            assert_eq!(decode_date(w0, w1), Some(t));
+        }
+        // The 4-bit year stops at 1995.
+        assert_eq!(encode_date(2_000_000_000)[0] >> 12, 15);
     }
 
     #[test]
@@ -855,5 +1529,82 @@ mod tests {
         assert_eq!(rs_to_lf(b"a\x1eb\x1e"), b"a\nb\n");
         assert!(!looks_like_rs_text(b"\x01\x84\x9f\x00\x1e"));
         assert!(!looks_like_rs_text(b"plain unix text\n"));
+    }
+
+    /// `sample_with_bitmap()` with the root's header naming its entry (block 1, slot 1) as QNX writes it.
+    fn editable_sample() -> Cursor<Vec<u8>> {
+        let mut img = sample_with_bitmap();
+        img[2 * 512 + 16..2 * 512 + 20].copy_from_slice(&[1, 0, 1, 0]);
+        Cursor::new(img)
+    }
+
+    #[test]
+    fn edits_round_trip_and_check_clean() {
+        let mut fs = Qnx2Filesystem::open(editable_sample(), 0).unwrap();
+        let root = fs.root().unwrap();
+        let body: Vec<u8> = (0..1500u32).map(|i| i as u8).collect();
+        let f = fs
+            .create_file(
+                &root,
+                "data.bin",
+                &mut &body[..],
+                body.len() as u64,
+                &Default::default(),
+            )
+            .unwrap();
+        assert_eq!(fs.read_file(&f, usize::MAX).unwrap(), body);
+        let d = fs
+            .create_directory(&root, "newdir", &Default::default())
+            .unwrap();
+        let inner = fs
+            .create_file(&d, "x", &mut &b"hi\x1e"[..], 3, &Default::default())
+            .unwrap();
+        assert_eq!(fs.read_file(&inner, usize::MAX).unwrap(), b"hi\x1e");
+        // The new directory's header points back at its slot in the root.
+        let loc = fs.self_loc(d.location as u32).unwrap();
+        assert_eq!(loc.dir, fs.root_first);
+        let r = fsck_qnx2(&mut fs).unwrap();
+        assert!(r.is_clean(), "{:?}", r.errors);
+        assert!(r.warnings.iter().all(|w| w.debug), "{:?}", r.warnings);
+
+        fs.rename(&root, &f, "renamed").unwrap();
+        let names: Vec<String> = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(names.contains(&"renamed".to_string()) && !names.contains(&"data.bin".to_string()));
+        let free_before = fs.free_space().unwrap();
+        let renamed = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "renamed")
+            .unwrap();
+        fs.delete_entry(&root, &renamed).unwrap();
+        assert!(fs.free_space().unwrap() > free_before);
+        assert!(
+            fs.delete_entry(&root, &d).is_err(),
+            "a non-empty directory stays"
+        );
+        fs.delete_entry(&d, &inner).unwrap();
+        fs.delete_entry(&root, &d).unwrap();
+        let r = fsck_qnx2(&mut fs).unwrap();
+        assert!(r.is_clean(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn names_and_extent_limits_follow_qnx() {
+        assert!(validate_qnx2_name("ok_name.1$").is_ok());
+        for bad in ["", "$lead", "has space", "seventeen_chars_x", "slash/"] {
+            assert!(validate_qnx2_name(bad).is_err(), "{bad}");
+        }
+        // 65520 data bytes fill one 128-block extent; one more byte needs a second extent.
+        assert_eq!(blocks_for(65520), 128);
+        assert_eq!(blocks_for(65521), 129);
+        assert_eq!(blocks_for(0), 1);
+        assert_eq!(qnx_bits(0o644, false), (0x17, 0x01, 0x01));
+        assert_eq!(qnx_bits(0o755, true), (0x35, 0x01, 0x01));
     }
 }

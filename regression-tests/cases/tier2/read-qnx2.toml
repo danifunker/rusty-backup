@@ -128,4 +128,4 @@ stdout_not_contains = ["WARN", "ERROR"]
 [[case.step]]
 args = ["tar", "{fixture}@1", "/", "{scratch}/all.tar"]
 expect_exit = 0
-file_sha256 = [{ path = "{scratch}/all.tar", sha256 = "24d2f22f27ad909e960476f096483cbb96c9545f0bf8e388e3a84e0a6363102b" }]
+file_sha256 = [{ path = "{scratch}/all.tar", sha256 = "800f1d0fc039bc69b00697e77ec2ba6b20ef2aa82b5d7f0cc5ced93c78428945" }]
