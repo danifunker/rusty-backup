@@ -3736,6 +3736,7 @@ impl BrowseView {
         self.staged_edits.push(StagedEdit::CreateDirectory {
             parent: parent.clone(),
             name: name.clone(),
+            qnx2_attrs: None,
         });
 
         // Build a synthetic FileEntry for children to reference as parent.
@@ -6048,6 +6049,7 @@ impl BrowseView {
         self.staged_edits.push(StagedEdit::CreateDirectory {
             parent,
             name: name.clone(),
+            qnx2_attrs: None,
         });
 
         self.edit_result = Some(format!("Staged folder '{name}'"));

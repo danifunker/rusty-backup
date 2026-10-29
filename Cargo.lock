@@ -4936,6 +4936,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
 
 [[package]]
+name = "qnx2fs"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "198f9fbd532b1eb9e87c18dbd855facbdb1db627ff36ee5afbc6601e5d9df02c"
+
+[[package]]
 name = "qoi"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5697,6 +5703,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "objc2-io-kit",
  "opticaldiscs",
+ "qnx2fs",
  "ratatui",
  "reqwest",
  "rfd",

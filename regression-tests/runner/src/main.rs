@@ -1474,7 +1474,7 @@ fn run_case(
     for (idx, step) in steps.iter().enumerate() {
         let args_resolved: Vec<String> = step.args.iter().map(|a| resolve(a)).collect();
 
-        let out = match exec::run(&args.rb_cli, &args_resolved, &scratch, timeout) {
+        let out = match exec::run_with_env(&args.rb_cli, &args_resolved, &scratch, timeout, &case.env) {
             Ok(o) => o,
             Err(e) => {
                 result.verdict = Verdict::Error;

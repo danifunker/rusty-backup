@@ -95,7 +95,7 @@ pub struct CopyOptions {
     /// flat filesystem is a hard error.
     pub flatten: bool,
     /// Carry each source entry's modification date onto the copy (archive expansion). Off by
-    /// default, which keeps `cp` / Commander stamping the time of the copy.
+    /// default, so `cp` stamps the time of the copy; QNX 2 to QNX 2 always keeps dates.
     pub preserve_times: bool,
 }
 
@@ -159,6 +159,8 @@ pub struct Capabilities {
     pub dos_attributes: bool,
     pub amiga_metadata: bool,
     pub symlinks: bool,
+    /// Raw QNX 2 attributes, owner and date words (QNX 2 only).
+    pub qnx2_attributes: bool,
 }
 
 impl Capabilities {
@@ -173,6 +175,7 @@ impl Capabilities {
             dos_attributes: false,
             amiga_metadata: false,
             symlinks: false,
+            qnx2_attributes: false,
         };
 
         // Classic Mac forks + Finder type/creator.
@@ -199,6 +202,12 @@ impl Capabilities {
         {
             c.unix_permissions = true;
             c.symlinks = true;
+        }
+
+        // QNX 2 maps Unix modes onto its attribute letters; between QNX 2 volumes they copy raw.
+        if t == "QNX 2" {
+            c.unix_permissions = true;
+            c.qnx2_attributes = true;
         }
 
         // DOS attribute bits.
@@ -297,6 +306,12 @@ pub fn copy_into(
 ) -> Result<()> {
     let src_caps = Capabilities::infer(src.fs_type());
     let dst_caps = Capabilities::infer(dst.fs_type());
+    // QNX 2 to QNX 2 keeps dates, as the shared qnx2fs crate's own copy does.
+    let qnx2 = src.fs_type() == "QNX 2" && dst.fs_type() == "QNX 2";
+    let opts = &CopyOptions {
+        preserve_times: opts.preserve_times || qnx2,
+        ..opts.clone()
+    };
     copy_recursive(
         src,
         &src_caps,
@@ -588,6 +603,10 @@ fn translate_metadata(
         }
     }
 
+    if dst_caps.qnx2_attributes {
+        o.qnx2_attrs = src.qnx2_attrs;
+    }
+
     // DOS attribute bits.
     if src.dos_attributes.is_some() {
         if dst_caps.dos_attributes {
@@ -658,6 +677,9 @@ fn ensure_directory(
         opts.mode = src_dir.mode;
         opts.uid = src_dir.uid;
         opts.gid = src_dir.gid;
+    }
+    if dst_caps.qnx2_attributes {
+        opts.qnx2_attrs = src_dir.qnx2_attrs;
     }
     if src_caps.amiga_metadata && dst_caps.amiga_metadata {
         opts.amiga_protection = src_dir.amiga_protection;

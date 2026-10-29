@@ -44,10 +44,22 @@ pub fn run(
     cwd: &Path,
     timeout: Duration,
 ) -> Result<Output, ExecError> {
+    run_with_env(program, args, cwd, timeout, &Default::default())
+}
+
+/// [`run`] with extra environment variables set for the child.
+pub fn run_with_env(
+    program: &Path,
+    args: &[String],
+    cwd: &Path,
+    timeout: Duration,
+    env: &std::collections::BTreeMap<String, String>,
+) -> Result<Output, ExecError> {
     let started = Instant::now();
 
     let mut child = Command::new(program)
         .args(args)
+        .envs(env)
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

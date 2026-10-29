@@ -2800,6 +2800,7 @@ impl CommanderState {
             let edits = vec![crate::model::edit_queue::StagedEdit::CreateDirectory {
                 parent,
                 name: name.to_string(),
+                qnx2_attrs: None,
             }];
             with_stderr_suppressed(|| crate::model::commander_ops::apply_edits(&session, &edits))
                 .map(|()| format!("Created folder {name}."))

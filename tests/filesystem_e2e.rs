@@ -2161,6 +2161,7 @@ fn test_pfs3_staged_edits_round_trip() {
         StagedEdit::CreateDirectory {
             parent: root.clone(),
             name: "Sub".to_string(),
+            qnx2_attrs: None,
         },
         StagedEdit::AddFile {
             parent: root.clone(),
@@ -2754,6 +2755,7 @@ fn test_affs_staged_edits_round_trip() {
         StagedEdit::CreateDirectory {
             parent: root.clone(),
             name: "Sub".to_string(),
+            qnx2_attrs: None,
         },
         StagedEdit::AddFile {
             parent: root.clone(),
@@ -2853,6 +2855,7 @@ fn test_sfs_staged_edits_round_trip() {
         StagedEdit::CreateDirectory {
             parent: root.clone(),
             name: "Sub".to_string(),
+            qnx2_attrs: None,
         },
         StagedEdit::AddFile {
             parent: root.clone(),

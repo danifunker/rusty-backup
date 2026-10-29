@@ -12,6 +12,7 @@ description = "Open a KryoFlux stream set as a disk image."
 
 [[case]]
 id = "read.kryoflux.icon-netcard401"
+env = { TZ = "UTC" }
 description = "Flux decode recovers the QNX 2 boot disk the sector dump lost"
 fixture = "flux.kryoflux.icon-netcard401.floppy"
 timeout_ms = 300000

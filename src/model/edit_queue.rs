@@ -36,6 +36,8 @@ pub struct PreservedDates {
     /// modified_unix` captured from any per-second-dated source (Unix
     /// inode / Mac dates / Amiga datestamp / tar Header / host stat).
     pub unix_mtime: Option<u64>,
+    /// QNX 2 permissions, owner and date words, copied exactly onto a QNX 2 destination.
+    pub qnx2: Option<qnx2fs::Attributes>,
 }
 
 impl PreservedDates {
@@ -46,7 +48,10 @@ impl PreservedDates {
     /// source (ext → EFS, AFFS → ext, tar → xfs, …) preserves the date
     /// through Unix-family drivers' new `CreateFileOptions.unix_times`.
     pub fn from_entry(entry: &FileEntry) -> Option<Self> {
-        if entry.mac_dates.is_none() && entry.amiga_date.is_none() && entry.modified_unix.is_none()
+        if entry.mac_dates.is_none()
+            && entry.amiga_date.is_none()
+            && entry.modified_unix.is_none()
+            && entry.qnx2_attrs.is_none()
         {
             return None;
         }
@@ -54,6 +59,7 @@ impl PreservedDates {
             amiga: entry.amiga_date,
             mac: entry.mac_dates,
             unix_mtime: entry.modified_unix,
+            qnx2: entry.qnx2_attrs,
         })
     }
 }
@@ -95,6 +101,8 @@ pub enum StagedEdit {
     CreateDirectory {
         parent: FileEntry,
         name: String,
+        /// A QNX 2 source folder's permissions, owner and date, copied exactly.
+        qnx2_attrs: Option<qnx2fs::Attributes>,
     },
     DeleteEntry {
         parent: FileEntry,
@@ -244,6 +252,7 @@ pub fn apply_edit(
                     .as_ref()
                     .and_then(|d| d.unix_mtime)
                     .map(crate::fs::times::UnixTimes::mtime_only),
+                qnx2_attrs: dates.as_ref().and_then(|d| d.qnx2),
                 ..Default::default()
             };
 
@@ -324,7 +333,11 @@ pub fn apply_edit(
             }
             Ok(())
         }
-        StagedEdit::CreateDirectory { parent, name } => {
+        StagedEdit::CreateDirectory {
+            parent,
+            name,
+            qnx2_attrs,
+        } => {
             let resolved_parent = resolve_dir_by_path(efs, &parent.path)?;
             // A folder that is already there is the outcome asked for; only a
             // file in the way is a real collision (the pre-scan skips folders).
@@ -338,7 +351,11 @@ pub fn apply_edit(
                 }
                 return Err(FilesystemError::AlreadyExists(name.clone()));
             }
-            efs.create_directory(&resolved_parent, name, &CreateDirectoryOptions::default())?;
+            let opts = CreateDirectoryOptions {
+                qnx2_attrs: *qnx2_attrs,
+                ..Default::default()
+            };
+            efs.create_directory(&resolved_parent, name, &opts)?;
             Ok(())
         }
         StagedEdit::DeleteEntry { parent, entry } => efs.delete_entry(parent, entry),
@@ -428,7 +445,7 @@ impl EditQueue {
                 StagedEdit::AddFile { parent, name, .. } => {
                     format!("Add file: {}", Self::pending_path(&parent.path, name))
                 }
-                StagedEdit::CreateDirectory { parent, name } => {
+                StagedEdit::CreateDirectory { parent, name, .. } => {
                     format!("New folder: {}", Self::pending_path(&parent.path, name))
                 }
                 StagedEdit::DeleteEntry { entry, .. } => format!("Delete: {}", entry.path),
@@ -562,7 +579,7 @@ impl EditQueue {
         for edit in &self.edits {
             match edit {
                 StagedEdit::AddFile { parent, name, .. }
-                | StagedEdit::CreateDirectory { parent, name } => {
+                | StagedEdit::CreateDirectory { parent, name, .. } => {
                     let is_dir = matches!(edit, StagedEdit::CreateDirectory { .. });
                     let full = Self::pending_path(&parent.path, name);
                     let names = names_in(&mut occupied, &parent.path, fs);
@@ -1344,6 +1361,7 @@ mod tests {
         let again = StagedEdit::CreateDirectory {
             parent: root.clone(),
             name: "DOCS".to_string(),
+            qnx2_attrs: None,
         };
         apply_edit(&mut fs, &again).expect("existing folder is a no-op");
         let dirs = fs
@@ -1357,6 +1375,7 @@ mod tests {
         let over_file = StagedEdit::CreateDirectory {
             parent: root.clone(),
             name: "NOTE".to_string(),
+            qnx2_attrs: None,
         };
         assert!(matches!(
             apply_edit(&mut fs, &over_file),
@@ -1645,6 +1664,7 @@ mod tests {
                         amiga: Some(target),
                         mac: None,
                         unix_mtime: None,
+                        qnx2: None,
                     }),
                     on_conflict: crate::fs::replace::OnConflict::Fail,
                 },
@@ -1673,6 +1693,7 @@ mod tests {
         StagedEdit::CreateDirectory {
             parent: FileEntry::new_directory(pname, parent.into(), 0),
             name: name.into(),
+            qnx2_attrs: None,
         }
     }
 

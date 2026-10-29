@@ -14,6 +14,7 @@ description = "Create, grow, rename and delete on QNX 2 floppies and LEXICON har
 
 [[case]]
 id = "edit.qnx2.lexicon-10mb-hd"
+env = { TZ = "UTC" }
 description = "A 115 KB file goes back as two 128-block extents; mkdir, rename, rm, chmod, chown; fsck clean"
 fixture = "fs.qnx2.lexicon-10mb.hd"
 [[case.step]]
@@ -60,6 +61,7 @@ stdout_not_contains = ["WARN", "ERROR"]
 
 [[case]]
 id = "edit.qnx2.lexicon-64mb-partition2"
+env = { TZ = "UTC" }
 description = "The ICON header names all three partitions QNX 2; partition 2 (types 08) takes writes"
 fixture = "fs.qnx2.lexicon-64mb.hd"
 [[case.step]]
@@ -84,6 +86,7 @@ stdout_not_contains = ["WARN", "ERROR"]
 
 [[case]]
 id = "edit.qnx2.icon-help410-floppy"
+env = { TZ = "UTC" }
 description = "Eleven files grow a new directory past its first block (a slot straddles two extents)"
 fixture = "fs.qnx2.icon-help410.floppy"
 [[case.step]]
@@ -137,6 +140,7 @@ stdout_not_contains = ["WARN", "ERROR"]
 
 [[case]]
 id = "edit.qnx2.icon4-st251-padded-heads"
+env = { TZ = "UTC" }
 description = "Writes to a padded-head image land on the real heads (checked with QNX chkfsys in icon-emu)"
 fixture = "fs.qnx2.icon4-st251.hd"
 timeout_ms = 300000
@@ -154,4 +158,120 @@ files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
 args = ["fsck", "--checkonly", "{fixture_copy}@1"]
 expect_exit = 0
 stdout_contains = ["432 files / 21 dirs checked"]
+stdout_not_contains = ["WARN", "ERROR"]
+
+# Dates: QNX 2 stores only 1980-1995, as the ICON's local wall clock. qnx2-dates.tar
+# holds /dates (1986-07-04 12:30) with files from 2026-03-14 10:00, 2024-02-29 09:00,
+# 2024-03-01 08:00, 1988-03-23 16:05 and 1985-10-03 23:41 (UTC). Modern dates fold
+# to the same month, day and time in 1994 (29 February to 1992) with one warning;
+# in-range dates, directory dates, tar round trips and QNX 2 to QNX 2 cp keep theirs.
+[[case]]
+id = "edit.qnx2.dates-fold-and-round-trip"
+description = "untar folds modern dates into 1994 and says so; tar + untar and cp keep every date, folders too"
+fixture = "fs.qnx2.lexicon-64mb.hd"
+env = { TZ = "UTC" }
+[[case.step]]
+args = ["untar", "{fixture_copy}@1", "{cases}/tier3/qnx2-dates.tar", "/"]
+expect_exit = 0
+stderr_contains = ["QNX 2 stores years 1980-1995: 3 entries were dated with the same month, day and time in 1994 (29 February in 1992)"]
+[[case.step]]
+args = ["ls", "-t", "{fixture_copy}@1", "/dates"]
+expect_exit = 0
+stdout_contains = ["1994-03-14 10:00:00  modern", "1992-02-29 09:00:00  leapday", "1994-03-01 08:00:00  march1", "1988-03-23 16:05:00  old1988", "1985-10-03 23:41:00  old1985"]
+[[case.step]]
+args = ["ls", "-t", "{fixture_copy}@1", "/"]
+expect_exit = 0
+stdout_contains = ["1986-07-04 12:30:00  dates"]
+[[case.step]]
+args = ["tar", "{fixture_copy}@1", "/dates", "{scratch}/rt.tar"]
+expect_exit = 0
+[[case.step]]
+args = ["mkdir", "{fixture_copy}@2", "/rt"]
+expect_exit = 0
+[[case.step]]
+args = ["untar", "{fixture_copy}@2", "{scratch}/rt.tar", "/rt"]
+expect_exit = 0
+stderr_not_contains = ["QNX 2 stores years"]
+[[case.step]]
+args = ["ls", "-t", "{fixture_copy}@2", "/rt/dates"]
+expect_exit = 0
+stdout_contains = ["1994-03-14 10:00:00  modern", "1992-02-29 09:00:00  leapday", "1994-03-01 08:00:00  march1", "1988-03-23 16:05:00  old1988", "1985-10-03 23:41:00  old1985"]
+[[case.step]]
+args = ["ls", "-t", "{fixture_copy}@2", "/rt"]
+expect_exit = 0
+stdout_contains = ["1986-07-04 12:30:00  dates"]
+[[case.step]]
+args = ["convert", "{fixture_copy}", "{scratch}/conv", "--format", "raw"]
+expect_exit = 0
+[[case.step]]
+args = ["cp", "-r", "{scratch}/conv/fs.qnx2.lexicon-64mb.hd.img@1", "/dates", "{fixture_copy}@2", "/"]
+expect_exit = 0
+stderr_not_contains = ["QNX 2 stores years"]
+[[case.step]]
+args = ["ls", "-t", "{fixture_copy}@2", "/"]
+expect_exit = 0
+stdout_contains = ["1986-07-04 12:30:00  dates"]
+[[case.step]]
+args = ["ls", "-t", "{fixture_copy}@2", "/dates"]
+expect_exit = 0
+stdout_contains = ["1994-03-14 10:00:00  modern", "1992-02-29 09:00:00  leapday", "1994-03-01 08:00:00  march1", "1988-03-23 16:05:00  old1988", "1985-10-03 23:41:00  old1985"]
+[[case.step]]
+args = ["fsck", "--checkonly", "{fixture_copy}@1"]
+expect_exit = 0
+stdout_not_contains = ["WARN", "ERROR"]
+[[case.step]]
+args = ["fsck", "--checkonly", "{fixture_copy}@2"]
+expect_exit = 0
+stdout_not_contains = ["WARN", "ERROR"]
+
+# The same tar in New York: the ICON gets the host's local wall clock in the zone rules of
+# each date (2026-03-14 10:00 UTC is 06:00 EDT; 1985-10-03 23:41 UTC is 19:41 EDT).
+[[case]]
+id = "edit.qnx2.dates-local-time"
+description = "Dates are written and listed as the host's local wall clock (TZ=America/New_York)"
+fixture = "fs.qnx2.lexicon-10mb.hd"
+env = { TZ = "America/New_York" }
+[[case.step]]
+args = ["untar", "{fixture_copy}@1", "{cases}/tier3/qnx2-dates.tar", "/"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "-t", "{fixture_copy}@1", "/dates"]
+expect_exit = 0
+stdout_contains = ["1994-03-14 06:00:00  modern", "1992-02-29 04:00:00  leapday", "1994-03-01 03:00:00  march1", "1988-03-23 11:05:00  old1988", "1985-10-03 19:41:00  old1985"]
+[[case.step]]
+args = ["fsck", "--checkonly", "{fixture_copy}@1"]
+expect_exit = 0
+stdout_not_contains = ["WARN", "ERROR"]
+
+# cp between QNX 2 volumes copies the raw ICON attributes, owner and date words, not a
+# Unix mode: /boot is `r--m` (no c) and its files `r---m`, which a Unix mode cannot hold.
+[[case]]
+id = "edit.qnx2.cp-keeps-attributes"
+description = "cp -r of a real ICON tree onto another QNX 2 volume keeps attribute letters, owners and dates exactly"
+fixture = "fs.qnx2.lexicon-10mb.hd"
+env = { TZ = "UTC" }
+[[case.step]]
+args = ["cp", "-r", "{fixture}@1", "/boot", "{fixture_copy}@1", "/tmp"]
+expect_exit = 0
+stdout_not_contains = ["couldn't store"]
+stderr_not_contains = ["couldn't store", "QNX 2 stores years"]
+[[case.step]]
+args = ["ls", "-o", "-t", "{fixture_copy}@1", "/tmp"]
+expect_exit = 0
+stdout_contains = ["255.255           0  1991-09-11 11:54:55  boot  (owner r--m group r--- other r---"]
+[[case.step]]
+args = ["ls", "-o", "-t", "{fixture_copy}@1", "/tmp/boot"]
+expect_exit = 0
+stdout_contains = ["255.255      102535  1991-08-23 14:04:34  hd_boot  (owner r---m group ----- other -----", "255.255       85773  1991-08-15 18:53:14  ws2_emul_nologin  (owner r---m group ----- other -----"]
+[[case.step]]
+args = ["get", "{fixture_copy}@1", "/tmp/boot/hd_boot", "{scratch}/copied"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{fixture}@1", "/boot/hd_boot", "{scratch}/original"]
+expect_exit = 0
+files_identical = [["{scratch}/copied", "{scratch}/original"]]
+[[case.step]]
+args = ["fsck", "--checkonly", "{fixture_copy}@1"]
+expect_exit = 0
+stdout_contains = ["437 files / 21 dirs checked"]
 stdout_not_contains = ["WARN", "ERROR"]

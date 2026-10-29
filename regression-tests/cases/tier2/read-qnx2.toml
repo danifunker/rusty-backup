@@ -12,6 +12,7 @@ description = "Detect, list and extract QNX 2 (Unisys ICON) volumes, and real QN
 
 [[case]]
 id = "read.qnx2.icon-sys410-disk1"
+env = { TZ = "UTC" }
 description = "System disk: QNX2 detected; /cmds spans six extents (52 entries)"
 fixture = "fs.qnx2.icon-sys410-disk1.floppy"
 [[case.step]]
@@ -29,6 +30,7 @@ stdout_contains = ["4494             QNX_1", "200             bitmap"]
 
 [[case]]
 id = "read.qnx2.icon-help410"
+env = { TZ = "UTC" }
 description = "Help disk: a shell script reads whole"
 fixture = "fs.qnx2.icon-help410.floppy"
 [[case.step]]
@@ -40,6 +42,7 @@ expect_exit = 0
 
 [[case]]
 id = "read.qnx2.icon-fsboot410"
+env = { TZ = "UTC" }
 description = "Fileserver boot disk: root at block 12"
 fixture = "fs.qnx2.icon-fsboot410.floppy"
 [[case.step]]
@@ -48,6 +51,7 @@ expect_exit = 0
 
 [[case]]
 id = "read.qnx2.icon-watcom-basic-badsec"
+env = { TZ = "UTC" }
 description = "Bad-sector image still lists and exports"
 fixture = "fs.qnx2.icon-watcom-basic-badsec.floppy"
 [[case.step]]
@@ -56,6 +60,7 @@ expect_exit = 0
 
 [[case]]
 id = "read.qnx2.icon-help410-attrs"
+env = { TZ = "UTC" }
 description = "Owner as group.member, ICON attribute letters, and dates in tar"
 fixture = "fs.qnx2.icon-help410.floppy"
 [[case.step]]
@@ -65,6 +70,7 @@ stdout_contains = ["255.255", "HELP_1  (owner r--em group ----- other -----; mod
 
 [[case]]
 id = "read.qnx2.icon-help410-deleted"
+env = { TZ = "UTC" }
 description = "Deleted entries list only on request and are named NAME [deleted]"
 fixture = "fs.qnx2.icon-help410.floppy"
 [[case.step]]
@@ -78,6 +84,7 @@ stdout_contains = ["rename [deleted]", "src [deleted]"]
 
 [[case]]
 id = "read.qnx2.icon-help410-rs-to-lf"
+env = { TZ = "UTC" }
 description = "get --rs-to-lf turns RS line separators into LF"
 fixture = "fs.qnx2.icon-help410.floppy"
 [[case.step]]
@@ -87,6 +94,7 @@ file_sha256 = [{ path = "{scratch}/chattr.txt", sha256 = "ec54c533bf4b90c6901f2f
 
 [[case]]
 id = "read.qnx2.icon-help410-fsck"
+env = { TZ = "UTC" }
 description = "A clean ICON disk passes the QNX 2 check"
 fixture = "fs.qnx2.icon-help410.floppy"
 [[case.step]]
@@ -97,6 +105,7 @@ stdout_not_contains = ["WARN", "ERROR"]
 
 [[case]]
 id = "read.qnx2.icon-watcom-basic-badsec-fsck"
+env = { TZ = "UTC" }
 description = "fsck names the two files lost to bad sectors and their 303 orphaned blocks"
 fixture = "fs.qnx2.icon-watcom-basic-badsec.floppy"
 [[case.step]]
@@ -106,6 +115,7 @@ stdout_contains = ["/util/basic.qnx: entry says 196 blocks", "/util/gks: entry s
 
 [[case]]
 id = "read.qnx2.lexicon-10mb-hd"
+env = { TZ = "UTC" }
 description = "LEXICON 10 MB hard disk: the 1-based type-0x07 start is corrected to LBA 29"
 fixture = "fs.qnx2.lexicon-10mb.hd"
 [[case.step]]
@@ -132,6 +142,7 @@ file_sha256 = [{ path = "{scratch}/all.tar", sha256 = "800f1d0fc039bc69b00697e77
 
 [[case]]
 id = "read.qnx4.qnxfs1g"
+env = { TZ = "UTC" }
 description = "Real QNX 4 media: its FAT-like boot block must not be taken for FAT; readdir hides busy and unused entries"
 fixture = "fs.qnx4.qnxfs1g.hd"
 timeout_ms = 300000
@@ -148,6 +159,7 @@ stdout_not_contains = ["tmp", "lost+found"]
 
 [[case]]
 id = "read.qnx2.icon4-st251-real-hd"
+env = { TZ = "UTC" }
 description = "A real LEXICON ST-251 read with padding heads: geometry undone, partition 2 reported blank, clock-unset dates are 1980"
 fixture = "fs.qnx2.icon4-st251.hd"
 timeout_ms = 300000
@@ -175,6 +187,7 @@ file_sha256 = [{ path = "{scratch}/all.tar", sha256 = "2e6b7ab29c9a75734e6630a63
 
 [[case]]
 id = "read.qnx2.icon4-st251-emu-flux"
+env = { TZ = "UTC" }
 description = "The same ST-251 from its MFM reader capture (.emu, Intel iSBC 214): decodes byte-identical to the sector dump"
 fixture = "flux.emu.icon4-st251.hd"
 timeout_ms = 600000

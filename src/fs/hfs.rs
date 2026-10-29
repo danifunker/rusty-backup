@@ -3291,6 +3291,7 @@ impl<R: Read + Seek + Send> Filesystem for HfsFilesystem<R> {
             mac_dates: None,
             owner_label: None,
             native_attrs: None,
+            qnx2_attrs: None,
         })
     }
 

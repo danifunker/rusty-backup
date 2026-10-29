@@ -452,6 +452,7 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
             mac_dates: None,
             owner_label: None,
             native_attrs: None,
+            qnx2_attrs: None,
         })
     }
 
@@ -807,6 +808,7 @@ impl<R: Read + Seek + Send> Filesystem for XfsFilesystem<R> {
             mac_dates: None,
             owner_label: None,
             native_attrs: None,
+            qnx2_attrs: None,
         })
     }
 

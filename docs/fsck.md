@@ -209,7 +209,7 @@ against Windows `chkdsk` via a Mount-DiskImage'd fixed-VHD wrap of the image
 
 ## Check phases (QNX 2 example)
 
-`fsck_qnx2` in `src/fs/qnx2.rs` is check-only (every issue is
+`fsck_qnx2` in `src/fs/qnx2.rs` (an adapter over `qnx2fs::Volume::check`) is check-only (every issue is
 `repairable: false`; there is no `repair()`). It walks the tree from the root
 entry, claiming each directory's and file's extent chain into a block-owner map,
 then reconciles that map with the root's bitmap file:

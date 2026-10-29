@@ -12,6 +12,7 @@ description = "Open SCP and HFE flux images as disk images."
 
 [[case]]
 id = "read.flux.scp-icon-help410"
+env = { TZ = "UTC" }
 description = "Greaseweazle SCP decodes to the help disk's QNX 2 volume"
 fixture = "flux.scp.icon-help410.floppy"
 timeout_ms = 300000
@@ -27,6 +28,7 @@ file_sha256 = [{ path = "{scratch}/all.tar", sha256 = "24bc09805c2ef624a0b0913ce
 
 [[case]]
 id = "read.flux.hfe-icon-help410"
+env = { TZ = "UTC" }
 description = "HFE v1 bitstream decodes to the same volume"
 fixture = "flux.hfe.icon-help410.floppy"
 timeout_ms = 300000
@@ -38,6 +40,7 @@ file_sha256 = [{ path = "{scratch}/all.tar", sha256 = "24bc09805c2ef624a0b0913ce
 
 [[case]]
 id = "read.flux.hfe3-icon-help410"
+env = { TZ = "UTC" }
 description = "HFE v3 (opcodes) decodes to the same volume"
 fixture = "flux.hfe3.icon-help410.floppy"
 timeout_ms = 300000
@@ -49,6 +52,7 @@ file_sha256 = [{ path = "{scratch}/all.tar", sha256 = "24bc09805c2ef624a0b0913ce
 
 [[case]]
 id = "read.flux.scp-amiga-dd"
+env = { TZ = "UTC" }
 description = "AmigaDOS MFM is picked by probing and decodes byte-identically to the ADF"
 fixture = "flux.scp.amiga-dd.floppy"
 timeout_ms = 300000
@@ -60,6 +64,7 @@ file_sha256 = [{ path = "{scratch}/all.tar", sha256 = "35b22b5b78f58eccaa45c072c
 
 [[case]]
 id = "read.flux.scp-acorn-dfs"
+env = { TZ = "UTC" }
 description = "IBM FM with records from 0 decodes byte-identically to the SSD"
 fixture = "flux.scp.acorn-dfs.floppy"
 timeout_ms = 300000

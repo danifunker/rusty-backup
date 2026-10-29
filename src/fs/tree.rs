@@ -173,6 +173,7 @@ mod tests {
                 mac_dates: None,
                 owner_label: None,
                 native_attrs: None,
+                qnx2_attrs: None,
             })
         }
 
@@ -206,6 +207,7 @@ mod tests {
                         mac_dates: None,
                         owner_label: None,
                         native_attrs: None,
+                        qnx2_attrs: None,
                     },
                     FileEntry {
                         name: "ReadMe".into(),
@@ -234,6 +236,7 @@ mod tests {
                         mac_dates: None,
                         owner_label: None,
                         native_attrs: None,
+                        qnx2_attrs: None,
                     },
                 ]),
                 "/Documents" => Ok(vec![FileEntry {
@@ -263,6 +266,7 @@ mod tests {
                     mac_dates: None,
                     owner_label: None,
                     native_attrs: None,
+                    qnx2_attrs: None,
                 }]),
                 _ => Ok(vec![]),
             }

@@ -1304,6 +1304,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "qnx2fs"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "198f9fbd532b1eb9e87c18dbd855facbdb1db627ff36ee5afbc6601e5d9df02c"
+
+[[package]]
 name = "quote"
 version = "1.0.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1386,6 +1392,7 @@ dependencies = [
  "objc2-disk-arbitration",
  "objc2-foundation",
  "objc2-io-kit",
+ "qnx2fs",
  "ratatui",
  "rustyline",
  "self-replace",

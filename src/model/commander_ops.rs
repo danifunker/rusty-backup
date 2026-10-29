@@ -220,7 +220,7 @@ fn copy_parent(edit: &StagedEdit) -> Option<&str> {
 /// Full path of the folder a `CreateDirectory` makes.
 fn created_dir(edit: &StagedEdit) -> Option<String> {
     match edit {
-        StagedEdit::CreateDirectory { parent, name } => Some(join_path(&parent.path, name)),
+        StagedEdit::CreateDirectory { parent, name, .. } => Some(join_path(&parent.path, name)),
         _ => None,
     }
 }
@@ -257,7 +257,7 @@ fn edits_total_bytes(edits: &[StagedEdit]) -> u64 {
 fn edit_label(edit: &StagedEdit) -> String {
     match edit {
         StagedEdit::AddFile { parent, name, .. } => join_path(&parent.path, name),
-        StagedEdit::CreateDirectory { parent, name } => join_path(&parent.path, name),
+        StagedEdit::CreateDirectory { parent, name, .. } => join_path(&parent.path, name),
         StagedEdit::DeleteEntry { entry, .. } => format!("Delete {}", entry.path),
         StagedEdit::DeleteRecursive { entry, .. } => format!("Delete {}", entry.path),
         StagedEdit::Rename {
@@ -579,6 +579,7 @@ fn stage_copy_into(
                 edits.push(StagedEdit::CreateDirectory {
                     parent: dest_parent.clone(),
                     name: entry.name.clone(),
+                    qnx2_attrs: entry.qnx2_attrs.filter(|_| keep_dates),
                 });
                 let child_parent = FileEntry::new_directory(
                     entry.name.clone(),
@@ -697,6 +698,7 @@ fn stage_host_into(entries: &[FileEntry], dest_parent: &FileEntry, edits: &mut V
             edits.push(StagedEdit::CreateDirectory {
                 parent: dest_parent.clone(),
                 name: entry.name.clone(),
+                qnx2_attrs: None,
             });
             let child_parent = FileEntry::new_directory(
                 entry.name.clone(),
@@ -1662,7 +1664,7 @@ fn remote_apply(
                         )
                         .with_context(|| format!("uploading {name}"))?;
                 }
-                StagedEdit::CreateDirectory { parent, name } => {
+                StagedEdit::CreateDirectory { parent, name, .. } => {
                     session
                         .stage_mkdir(sid, &wire_parent_path(&parent.path), name)
                         .with_context(|| format!("creating directory {name}"))?;
@@ -1849,6 +1851,7 @@ mod tests {
         StagedEdit::CreateDirectory {
             parent: FileEntry::new_directory(String::new(), parent.into(), 0),
             name: name.into(),
+            qnx2_attrs: None,
         }
     }
 

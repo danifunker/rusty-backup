@@ -347,6 +347,8 @@ pub struct CreateFileOptions {
     /// AmigaDOS uses `amiga_dates`, HFS uses `mac_dates`). See
     /// [`crate::fs::times::UnixTimes`].
     pub unix_times: Option<super::times::UnixTimes>,
+    /// QNX 2 permissions, owner and date copied exactly (from `FileEntry::qnx2_attrs`); overrides mode / uid / gid / unix_times.
+    pub qnx2_attrs: Option<qnx2fs::Attributes>,
 }
 
 /// Options for creating a directory on an editable filesystem.
@@ -367,6 +369,8 @@ pub struct CreateDirectoryOptions {
     /// Preserve these Unix timestamps on the new directory inode. See
     /// [`CreateFileOptions::unix_times`] for the full rule.
     pub unix_times: Option<super::times::UnixTimes>,
+    /// QNX 2 permissions, owner and date copied exactly (from `FileEntry::qnx2_attrs`); overrides mode / uid / gid / unix_times.
+    pub qnx2_attrs: Option<qnx2fs::Attributes>,
 }
 
 /// Source for resource fork data (HFS/HFS+ only).

@@ -86,7 +86,7 @@ Trait method behind each column:
   for owner / group / other; `set_owner` stores the uid as the member and the
   gid as the group (each 0-255), shown on read as `group.member`. The ICON
   clock's dates are read (and written on create) but there is no `set_dates`;
-  the 4-bit year stops at 1995, so newer dates store as 31-Dec-95. Writes were
+  the 4-bit year holds 1980-1995, so other dates are written as the same month, day and time in 1994 (29 February in 1992), in host local time. Writes were
   checked with the real QNX 4.10.01 `chkfsys` in icon-emu.
 - **Sun QIC tapes** (SUN2TAPE `.qic`) support add, mkdir, rename, delete,
   `set_permissions` and `set_owner` inside a tape file that holds a tar, a
