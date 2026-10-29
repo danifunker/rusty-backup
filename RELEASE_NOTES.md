@@ -11,8 +11,11 @@ large files out of RAM.
 - **Browse**: owners as `group.member`, the ICON attribute letters (`rwaem`
   for files, `rcbm` for directories) mapped onto Unix modes, and dates checked
   against QNX's own `files`. Dates written with the ICON clock unset (QNX shows
-  `0-----80`) read as 1 January 1980; the 4-bit year holds 1980-1995, so newer
-  dates are written as 31-Dec-95.
+  `0-----80`) read as 1 January 1980; the 4-bit year holds 1980-1995, so other
+  dates are written as the same month, day and time in 1994 (29 February in
+  1992), with a note saying how many entries moved; dates are the ICON's local
+  wall clock, read and written in the host's time zone; `cp` between QNX 2 images
+  and tar round trips keep dates exactly; `rb-cli ls -t` shows them.
 - **Deleted entries** list on request as `NAME [deleted]`: `rb-cli ls --deleted`,
   `rb-cli get --deleted`, or the GUI's **Show deleted** checkbox.
 - **RS to LF**: `rb-cli get --rs-to-lf` and the GUI's **Text: RS to LF** extract

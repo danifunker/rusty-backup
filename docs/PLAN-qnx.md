@@ -29,6 +29,39 @@ text, fsck stats). **QNX 2 format fixes go into `qnx2fs`**, then the version
 here is bumped. The format notes below are kept as the history of how it was
 worked out.
 
+## Dates (qnx2fs 0.3)
+
+- **Format.** Two words: year-1980 in bits 15-12, month 11-8, day 5-1, PM bit 0;
+  then seconds since 12 o'clock. Only 1980-1995 fits. It is the local wall clock
+  of the machine that wrote it, with no time zone.
+- **Time zone: local, like classic HFS.** `modified_unix` is the ICON's wall
+  time read in the host's zone, using the rules for that date (DST included); an
+  incoming Unix time is turned into the host's wall clock before the crate stores
+  it. A file the ICON dated 23:41 extracts as 23:41 on the host, and an
+  ICON -> tar -> ICON round trip gives back the same date words. The one
+  exception is a wall time inside a spring-forward DST gap, which the host cannot
+  show; it moves by an hour.
+- **The fold.** A date outside 1980-1995, "now" included, is written as the same
+  month, day and time of day in 1994; 29 February goes to 1992
+  (`qnx2fs::fold_date`, also icon-emu's emulated clock). 1994 sorts after every
+  ICON release (the last is 4.10.05, November 1991) and a clock running past
+  New Year's Eve reaches 1995, which still encodes.
+- **Telling the user.** The adapter counts the new entries whose date it folded
+  and logs one line at `sync_metadata`, e.g. *"QNX 2 stores years 1980-1995: 12
+  entries were dated with the same month, day and time in 1994 (29 February in
+  1992)"*, for `put`, `untar`, `import`, `cp`, `batch` and the GUI alike.
+- **Copies keep dates.** `cp` between QNX 2 images always carries the source
+  dates (other filesystems stamp the time of the copy), and directories created
+  with a date get it back at sync, after their children were added.
+- **Checked** with icon-emu: files written by `untar` and `put` list with the same
+  dates in RB (`ls -t`), `icon-cli disk ls` and QNX 4.10.01's own `files`, and
+  `chkfsys 1` agrees with the bitmap. icon-emu's headless server runs its clock
+  on UTC wall time, while RB and icon-emu's web page use local time.
+- **Tests:** `fs::qnx2` unit tests, and the regression cases
+  `edit.qnx2.dates-fold-and-round-trip` (TZ=UTC) and `edit.qnx2.dates-local-time`
+  (TZ=America/New_York). QNX cases that hash tar output pin `TZ=UTC` through the
+  runner's per-case `env`.
+
 ## QNX 2 on-disk format (from the C sources, checked on the ICON disks)
 
 - 512-byte blocks numbered from 1 (block 1 = the first sector of the

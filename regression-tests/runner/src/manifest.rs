@@ -98,6 +98,10 @@ pub struct Case {
     #[serde(default)]
     pub timeout_ms: Option<u64>,
 
+    /// Extra environment for every step, e.g. `TZ = "UTC"` so local-time exports hash the same anywhere.
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+
     // ---- single-step sugar -------------------------------------------------
     // A case that is just one command can skip the [[case.step]] table.
     #[serde(default)]

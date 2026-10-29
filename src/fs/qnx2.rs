@@ -5,10 +5,18 @@
 //! `Filesystem` / `EditableFilesystem` traits: deleted entries are listed on request as
 //! `NAME [deleted]`, owners as `group.member`, and the ICON attribute letters go into
 //! `native_attrs`. On-disk facts and how the writes were checked: `docs/PLAN-qnx.md`.
+//!
+//! Dates are the ICON's local wall clock, so they are read and written in the host's
+//! time zone (like classic HFS): `modified_unix` is that wall time as a host instant,
+//! and an incoming Unix time becomes the host's wall clock before the crate stores it.
+//! QNX 2 holds only 1980-1995: the crate folds other years into 1994 (29 February
+//! into 1992), and `sync_metadata` logs how many new entries that moved. Directories
+//! created with an explicit date get it back at sync, after their children were added.
 
 use std::collections::HashSet;
 use std::io::{Read, Seek, Write};
 
+use chrono::{DateTime, Local, Offset, TimeZone, Utc};
 use qnx2fs::{Entry, NewEntry, Volume};
 
 use super::entry::FileEntry;
@@ -17,7 +25,7 @@ use super::filesystem::{
 };
 use super::fsck::{FsckIssue, FsckResult, FsckStats};
 
-pub use qnx2fs::{decode_date, encode_date, looks_like_qnx2, looks_like_rs_text, rs_to_lf, RS};
+pub use qnx2fs::{decode_date, fold_date, looks_like_qnx2, looks_like_rs_text, rs_to_lf, RS};
 
 const BLOCK: u64 = 512;
 const DELETED_TAG: &str = " [deleted]";
@@ -39,6 +47,10 @@ impl From<qnx2fs::Error> for FilesystemError {
 pub struct Qnx2Filesystem<R: Read + Seek + Send> {
     vol: Volume<R>,
     show_deleted: bool,
+    /// New entries whose date fell outside 1980-1995 since the last sync.
+    folded: u32,
+    /// Directories created with an explicit date: (path, first block, date words).
+    dir_dates: Vec<(String, u32, [u16; 2])>,
 }
 
 impl<R: Read + Seek + Send> Qnx2Filesystem<R> {
@@ -46,8 +58,54 @@ impl<R: Read + Seek + Send> Qnx2Filesystem<R> {
         Ok(Self {
             vol: Volume::open(reader, offset)?,
             show_deleted: false,
+            folded: 0,
+            dir_dates: Vec::new(),
         })
     }
+}
+
+impl<R: Read + Write + Seek + Send> Qnx2Filesystem<R> {
+    /// Directory and deletion dates use the host's wall clock, as the ICON's own clock would.
+    fn stamp_now(&mut self) {
+        self.vol.set_clock(unix_to_wall(Utc::now().timestamp()));
+    }
+}
+
+/// ICON wall-clock seconds as a host instant, in the zone rules of that date.
+pub fn wall_to_unix(wall: i64) -> i64 {
+    let Some(utc) = DateTime::<Utc>::from_timestamp(wall, 0) else {
+        return wall;
+    };
+    let naive = utc.naive_utc();
+    match Local.from_local_datetime(&naive).earliest() {
+        Some(t) => t.timestamp(),
+        // A wall time skipped by a DST change: use the offset just after the gap.
+        None => {
+            wall - i64::from(
+                Local
+                    .offset_from_utc_datetime(&naive)
+                    .fix()
+                    .local_minus_utc(),
+            )
+        }
+    }
+}
+
+/// A host instant as the wall-clock seconds the ICON would show.
+pub fn unix_to_wall(unix: i64) -> i64 {
+    match Local.timestamp_opt(unix, 0).single() {
+        Some(t) => t.naive_local().and_utc().timestamp(),
+        None => unix,
+    }
+}
+
+/// The wall-clock date to store for an optional source mtime (else now), counting a fold.
+fn wall_date(mtime: Option<u64>, folded: &mut u32) -> i64 {
+    let wall = unix_to_wall(mtime.map_or_else(|| Utc::now().timestamp(), |t| t as i64));
+    if fold_date(wall) != wall {
+        *folded += 1;
+    }
+    wall
 }
 
 /// The crate's handle for a listed entry: its path, first extent and (possibly tagged) name.
@@ -68,27 +126,23 @@ fn file_entry(parent: &str, e: &Entry, name: String) -> FileEntry {
     f.uid = Some(u32::from(e.member));
     f.gid = Some(u32::from(e.group));
     f.owner_label = Some(e.owner_label());
-    if let Some(t) = e.modified() {
-        if let Ok(secs) = u64::try_from(t) {
+    if let Some(wall) = e.modified() {
+        if let Ok(secs) = u64::try_from(wall_to_unix(wall)) {
             f.modified_unix = Some(secs);
-            f.modified = Some(super::unix_common::inode::format_unix_timestamp(t));
         }
+        f.modified = Some(super::unix_common::inode::format_unix_timestamp(wall));
     }
     f.native_attrs = Some(e.describe());
     f
 }
 
-fn new_entry(
-    mode: Option<u32>,
-    uid: Option<u32>,
-    gid: Option<u32>,
-    mtime: Option<i64>,
-) -> NewEntry {
+fn new_entry(mode: Option<u32>, uid: Option<u32>, gid: Option<u32>, wall: i64) -> NewEntry {
     NewEntry {
         mode,
         uid,
         gid,
-        mtime,
+        mtime: Some(wall),
+        ..Default::default()
     }
 }
 
@@ -209,8 +263,10 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for Qnx2Filesystem<R> {
         data_len: u64,
         options: &CreateFileOptions,
     ) -> Result<FileEntry, FilesystemError> {
-        let mtime = options.unix_times.and_then(|t| t.mtime).map(|t| t as i64);
-        let opts = new_entry(options.mode, options.uid, options.gid, mtime);
+        self.stamp_now();
+        let mtime = options.unix_times.and_then(|t| t.mtime);
+        let wall = wall_date(mtime, &mut self.folded);
+        let opts = new_entry(options.mode, options.uid, options.gid, wall);
         let e = self
             .vol
             .create_file(&entry_ref(parent), name, data, data_len, &opts)?;
@@ -223,9 +279,14 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for Qnx2Filesystem<R> {
         name: &str,
         options: &CreateDirectoryOptions,
     ) -> Result<FileEntry, FilesystemError> {
-        let mtime = options.unix_times.and_then(|t| t.mtime).map(|t| t as i64);
-        let opts = new_entry(options.mode, options.uid, options.gid, mtime);
+        self.stamp_now();
+        let mtime = options.unix_times.and_then(|t| t.mtime);
+        let wall = wall_date(mtime, &mut self.folded);
+        let opts = new_entry(options.mode, options.uid, options.gid, wall);
         let e = self.vol.create_dir(&entry_ref(parent), name, &opts)?;
+        if mtime.is_some() {
+            self.dir_dates.push((e.path.clone(), e.first, e.date));
+        }
         Ok(file_entry(&parent.path, &e, e.name.clone()))
     }
 
@@ -234,6 +295,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for Qnx2Filesystem<R> {
         parent: &FileEntry,
         entry: &FileEntry,
     ) -> Result<(), FilesystemError> {
+        self.stamp_now();
         Ok(self.vol.delete(&entry_ref(parent), &entry_ref(entry))?)
     }
 
@@ -243,6 +305,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for Qnx2Filesystem<R> {
         entry: &FileEntry,
         new_name: &str,
     ) -> Result<(), FilesystemError> {
+        self.stamp_now();
         Ok(self
             .vol
             .rename(&entry_ref(parent), &entry_ref(entry), new_name)?)
@@ -257,6 +320,23 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for Qnx2Filesystem<R> {
     }
 
     fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
+        for (path, first, date) in std::mem::take(&mut self.dir_dates) {
+            if let Ok(e) = self.vol.lookup(&path) {
+                if e.is_dir && e.first == first {
+                    let mut a = e.attributes();
+                    a.date = date;
+                    self.vol.set_attributes(&e, a)?;
+                }
+            }
+        }
+        if self.folded > 0 {
+            log::warn!(
+                "QNX 2 stores years 1980-1995: {} {} dated with the same month, day and time in 1994 (29 February in 1992)",
+                self.folded,
+                if self.folded == 1 { "entry was" } else { "entries were" }
+            );
+            self.folded = 0;
+        }
         Ok(self.vol.flush()?)
     }
 
@@ -368,5 +448,82 @@ mod tests {
         assert!(fs.validate_name("$lead").is_err());
         let r = fsck_qnx2(&mut fs).unwrap();
         assert!(r.is_clean(), "{:?}", r.errors);
+    }
+
+    /// Unix seconds for a host-local wall-clock time.
+    fn local(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> u64 {
+        let naive = chrono::NaiveDate::from_ymd_opt(y, mo, d)
+            .and_then(|x| x.and_hms_opt(h, mi, 0))
+            .unwrap();
+        wall_to_unix(naive.and_utc().timestamp()) as u64
+    }
+
+    fn put(fs: &mut Qnx2Filesystem<Cursor<Vec<u8>>>, name: &str, mtime: u64) -> FileEntry {
+        let root = fs.root().unwrap();
+        let opts = CreateFileOptions {
+            unix_times: Some(crate::fs::times::UnixTimes::mtime_only(mtime)),
+            ..Default::default()
+        };
+        fs.create_file(&root, name, &mut &b"x"[..], 1, &opts)
+            .unwrap()
+    }
+
+    #[test]
+    fn modern_dates_fold_into_1994_in_local_time() {
+        let mut fs = Qnx2Filesystem::open(sample(), 0).unwrap();
+        let cases = [
+            ("a", local(2026, 3, 14, 10, 0), "1994-03-14 10:00:00"),
+            ("b", local(2024, 2, 29, 9, 0), "1992-02-29 09:00:00"),
+            ("c", local(2024, 3, 1, 8, 0), "1994-03-01 08:00:00"),
+            ("d", local(1988, 3, 23, 16, 5), "1988-03-23 16:05:00"),
+        ];
+        for (name, t, _) in cases {
+            put(&mut fs, name, t);
+        }
+        assert_eq!(fs.folded, 3);
+        fs.sync_metadata().unwrap();
+        assert_eq!(fs.folded, 0);
+        let root = fs.root().unwrap();
+        let list = fs.list_directory(&root).unwrap();
+        for (name, t, shown) in cases {
+            let e = list.iter().find(|e| e.name == name).unwrap();
+            assert_eq!(e.modified.as_deref(), Some(shown), "{name}");
+            if name == "d" {
+                assert_eq!(
+                    e.modified_unix,
+                    Some(t),
+                    "an in-range date reads back as the same instant"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dates_round_trip_and_directories_keep_theirs() {
+        let mut src = Qnx2Filesystem::open(sample(), 0).unwrap();
+        let t = local(1985, 10, 3, 23, 41);
+        let f = put(&mut src, "old", t);
+        assert_eq!(f.modified.as_deref(), Some("1985-10-03 23:41:00"));
+        assert_eq!(f.modified_unix, Some(t));
+        // Feeding a listed date back in, as cp / tar + untar do, stores the same words.
+        let again = put(&mut src, "copy", f.modified_unix.unwrap());
+        assert_eq!(again.modified, f.modified);
+        let root = src.root().unwrap();
+        let dopts = CreateDirectoryOptions {
+            unix_times: Some(crate::fs::times::UnixTimes::mtime_only(t)),
+            ..Default::default()
+        };
+        let d = src.create_directory(&root, "dir", &dopts).unwrap();
+        src.create_file(&d, "child", &mut &b"y"[..], 1, &Default::default())
+            .unwrap();
+        src.sync_metadata().unwrap();
+        let d = src
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "dir")
+            .unwrap();
+        assert_eq!(d.modified.as_deref(), Some("1985-10-03 23:41:00"));
+        assert!(fsck_qnx2(&mut src).unwrap().is_clean());
     }
 }

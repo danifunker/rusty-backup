@@ -1305,9 +1305,9 @@ dependencies = [
 
 [[package]]
 name = "qnx2fs"
-version = "0.1.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "19f15ea80964744860bbb68006d613dd0f797d7d07618289ccf30116421da804"
+checksum = "198f9fbd532b1eb9e87c18dbd855facbdb1db627ff36ee5afbc6601e5d9df02c"
 
 [[package]]
 name = "quote"

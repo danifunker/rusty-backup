@@ -64,6 +64,10 @@ pub struct LsArgs {
     #[arg(short = 'o', long = "owner")]
     pub owner: bool,
 
+    /// Show each entry's modification date, as the filesystem displays it.
+    #[arg(short = 't', long = "time")]
+    pub time: bool,
+
     /// Also list deleted entries the filesystem can still read (QNX 2). They
     /// are named `NAME [deleted]` and can be extracted with `get --deleted`.
     #[arg(long)]
@@ -103,6 +107,7 @@ struct LsRow {
     uid: Option<u32>,
     gid: Option<u32>,
     owner: Option<String>,
+    modified: Option<String>,
 }
 
 impl LsRow {
@@ -127,6 +132,7 @@ impl LsRow {
                 (Some(names), Some(u), Some(g)) => Some(names.format_owner(u, g)),
                 _ => None,
             },
+            modified: entry.modified.clone(),
         }
     }
 }
@@ -217,7 +223,7 @@ pub fn run(args: LsArgs) -> Result<()> {
         let matches = collect_matches(&mut *fs, &includes, &excludes)?;
         if args.format == OutputFormat::Text {
             for (_, entry, full) in matches {
-                print_entry(&entry, &full, args.owner.then_some(&id_names));
+                print_entry(&entry, &full, args.owner.then_some(&id_names), args.time);
             }
             return Ok(());
         }
@@ -240,7 +246,7 @@ pub fn run(args: LsArgs) -> Result<()> {
         for c in children {
             // A NeXTSTEP / EUC name's raw bytes print as `\xNN` rather than as placeholder glyphs.
             let shown = crate::fs::raw_name::display(&c.name);
-            print_entry(&c, &shown, args.owner.then_some(&id_names));
+            print_entry(&c, &shown, args.owner.then_some(&id_names), args.time);
         }
         return Ok(());
     }
@@ -315,11 +321,12 @@ fn wire_row(entry: &crate::remote::protocol::WireEntry) -> LsRow {
             .creator_code
             .as_ref()
             .map(crate::fs::hfs_common::decode_ostype),
-        // The wire protocol carries no mode / ownership today.
+        // The wire protocol carries no mode / ownership / date today.
         mode: None,
         uid: None,
         gid: None,
         owner: None,
+        modified: None,
     }
 }
 
@@ -344,8 +351,14 @@ fn print_entry(
     entry: &crate::fs::entry::FileEntry,
     display_name: &str,
     id_names: Option<&crate::fs::id_names::IdNameMap>,
+    time: bool,
 ) {
     let kind = if entry.is_directory() { "DIR " } else { "FILE" };
+    let date = if time {
+        format!("{:<19}  ", entry.modified.as_deref().unwrap_or("-"))
+    } else {
+        String::new()
+    };
     // `--owner`: lead with permissions + resolved owner instead of the
     // Mac type/creator columns, which are empty on a Unix image anyway.
     if let Some(names) = id_names {
@@ -361,7 +374,7 @@ fn print_entry(
             .map(|a| format!("  ({a})"))
             .unwrap_or_default();
         out_stdout(format!(
-            "{kind}  {perms}  {:>18}  {:>10}  {display_name}{attrs}",
+            "{kind}  {perms}  {:>18}  {:>10}  {date}{display_name}{attrs}",
             owner, entry.size
         ));
         return;
@@ -371,7 +384,7 @@ fn print_entry(
     let t = t.as_deref().unwrap_or("    ");
     let cr = cr.as_deref().unwrap_or("    ");
     out_stdout(format!(
-        "{kind}  {:>10}  {t} {cr}  {display_name}",
+        "{kind}  {:>10}  {t} {cr}  {date}{display_name}",
         entry.size
     ));
 }

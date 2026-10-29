@@ -908,6 +908,7 @@ Usage: ls [OPTIONS] <IMAGE> [PATH]
 - `--ignore-case` — Treat case-insensitively, regardless of the target's native rule
 - `--case-sensitive` — Treat case-sensitively, regardless of the target's native rule
 - `-o` / `--owner` — Show each entry's Unix permissions and owner. On a Linux/Unix image the owner ids are resolved to names via the image's own `/etc/passwd` and `/etc/group` (falling back to the raw numbers where there's no entry)
+- `-t` / `--time` — Show each entry's modification date, as the filesystem displays it
 - `--deleted` — Also list deleted entries the filesystem can still read (QNX 2). They are named `NAME [deleted]` and can be extracted with `get --deleted`
 - `--password` — Password for encrypted containers (WinImage IMZ, password-protected `.zip` disks) or an encrypted filesystem (APFS FileVault — the volume password or personal recovery key)
 - `--inside` — For a `.zip` holding more than one disk image, the archive entry to open (e.g. `--inside backup.img`). Matched by exact name, then case- insensitively, then by basename. Ignored for non-zip sources
