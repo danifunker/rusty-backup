@@ -1110,6 +1110,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "qnx2fs"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "19f15ea80964744860bbb68006d613dd0f797d7d07618289ccf30116421da804"
+
+[[package]]
 name = "quote"
 version = "1.0.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1177,6 +1183,7 @@ dependencies = [
  "lzfse_rust",
  "lzma-rs",
  "md-5",
+ "qnx2fs",
  "ratatui",
  "rustyline",
  "serde",

@@ -472,6 +472,12 @@ this section is only the tooling side.
 
 **Landed (context, not work):**
 
+- **QNX 2 moved to the `qnx2fs` crate** (2026-10-29, branch `qnx2fs-crate`).
+  The reader / writer / fsck now live in the MIT crate
+  [`qnx2fs`](https://crates.io/crates/qnx2fs), shared with icon-emu;
+  `src/fs/qnx2.rs` is an adapter. Format fixes go into the crate. The
+  `read.qnx2.*` / `edit.qnx2.*` cases are the check that the adapter's output
+  did not change.
 - **`rb-regress fixtures` hashes streaming.** It read each fixture whole and
   was OOM-killed at 8.1 GB RSS on the 8 GiB HP-UX disk, taking the session
   with it; it now streams (about 10 MB RSS over the whole corpus).

@@ -24,7 +24,7 @@ finish it. Remove an entry when its work ships.
 | AIX JFS2 (big-endian JFS2) | **Shelved**: no AIX 5L+ fixture to verify against | plan item 3.4 | Make `fs/jfs.rs` endian-generic once a fixture exists |
 | QNX 4 (`fs::qnx4`) | Read-only (no edit dispatch arm, no create, no fsck); checked on one real volume (`qnxfs1g.img`) | `fs/mod.rs` `open_editable_filesystem` | Real QNX 4.25 fixtures under QEMU, then edit + create + fsck verified with its `chkfsys` / `dcheck` (`docs/PLAN-qnx.md` Q5) |
 | QNX 6 Power-Safe (`fs::qnx6`) | Read-only; tested only on synthetic volumes | `fs/mod.rs` `open_editable_filesystem` | Real QNX 6.5 / 7 media under QEMU to verify read, then edit + create + fsck against `chkqnx6fs` (`docs/PLAN-qnx.md` Q6) |
-| QNX 2 (`fs::qnx2`) | No create-blank, and fsck is check-only; 640 KiB ICON disks are untested (no samples) | `fs/qnx2.rs` | Samples of the 640 KiB format; a formatter and repair verified with QNX `chkfsys` in icon-emu |
+| QNX 2 (`fs::qnx2`) | No create-blank, and fsck is check-only; 640 KiB ICON disks are untested (no samples) | `qnx2fs` crate | Samples of the 640 KiB format; a formatter and repair verified with QNX `chkfsys` in icon-emu |
 
 ## Disk images and flux
 

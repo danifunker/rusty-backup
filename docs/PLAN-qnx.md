@@ -18,6 +18,17 @@ trigger is the Unisys ICON archive (York University) on the NAS:
 Note the name clash: the ICON "QDOS" disks are QNX 2, unrelated to the
 Sinclair QL QDOS that `fs::qdos` already reads. Detection must be by content.
 
+## Where the QNX 2 code lives
+
+The QNX 2 reader, writer and checker were moved out of `src/fs/qnx2.rs` into the
+[`qnx2fs`](https://github.com/danifunker/qnx2fs) crate (MIT, on crates.io), which
+icon-emu also uses for its Files panel and `icon-ci ls/get/put/mkdir/rm`.
+`src/fs/qnx2.rs` is now a thin adapter onto the `Filesystem` /
+`EditableFilesystem` traits (deleted-entry naming, owner labels, attribute
+text, fsck stats). **QNX 2 format fixes go into `qnx2fs`**, then the version
+here is bumped. The format notes below are kept as the history of how it was
+worked out.
+
 ## QNX 2 on-disk format (from the C sources, checked on the ICON disks)
 
 - 512-byte blocks numbered from 1 (block 1 = the first sector of the
