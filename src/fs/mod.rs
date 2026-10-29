@@ -1797,6 +1797,19 @@ pub fn open_filesystem_full<R: Read + Seek + Send + 'static>(
     partition_type_string: Option<&str>,
     passphrase: Option<&str>,
 ) -> Result<Box<dyn Filesystem>, FilesystemError> {
+    // An ICON drive's unused partition is all zero: say so instead of "type not supported".
+    if partition_type_string.is_none() && matches!(partition_type, 0x07..=0x09) {
+        let mut head = [0u8; 1024];
+        let blank = reader
+            .seek(SeekFrom::Start(partition_offset))
+            .and_then(|_| reader.read_exact(&mut head))
+            .is_ok_and(|_| crate::rbformats::icon_hd::looks_unformatted(&head));
+        if blank {
+            return Err(FilesystemError::Unsupported(
+                "this partition is blank: it has never been formatted".into(),
+            ));
+        }
+    }
     // Check string-based type first (APM partitions)
     if let Some(type_str) = partition_type_string {
         return open_filesystem_by_string(

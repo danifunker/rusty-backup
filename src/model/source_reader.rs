@@ -1189,8 +1189,7 @@ fn open_read_dispatch(
         if crate::cli::device_safety::looks_like_device_path(path) {
             return open_device_read(path);
         }
-        let f = File::open(path).with_context(|| format!("open {}", path.display()))?;
-        Ok(Box::new(BufReader::new(f)))
+        open_plain_raw(path)
     }
 }
 
@@ -1370,11 +1369,20 @@ pub fn open_peeled_read_with_entry(
                 .with_context(|| format!("unwrap image {}", path.display()))?;
             Ok(reader)
         }
-        _ => {
-            let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-            Ok(Box::new(BufReader::new(file)))
-        }
+        _ => open_plain_raw(path),
     }
+}
+
+/// A plain sector image; an ICON hard disk with padding heads or remapped bad blocks is mapped.
+pub fn open_plain_raw(path: &Path) -> Result<Box<dyn ReadSeek>> {
+    let f = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    if let Some(layout) = crate::rbformats::icon_hd::layout_for_path(path) {
+        return Ok(Box::new(crate::rbformats::icon_hd::IconHd::new(
+            BufReader::new(f),
+            layout,
+        )));
+    }
+    Ok(Box::new(BufReader::new(f)))
 }
 
 /// Subset of [`is_container_path`] that [`open_read`] decodes fully into an
@@ -1514,6 +1522,14 @@ pub fn open_container_rw(path: &Path) -> Result<ContainerRw> {
             .open(path)
             .with_context(|| format!("opening {} for write", path.display()))
     };
+    // Writes to an ICON disk with padding heads or remapped bad blocks go through the same mapping.
+    if matches!(format, ImageFormat::Raw) {
+        if let Some(layout) = crate::rbformats::icon_hd::layout_for_path(path) {
+            return Ok(ContainerRw::Handle(Box::new(
+                crate::rbformats::icon_hd::IconHd::new(rw()?, layout),
+            )));
+        }
+    }
     Ok(match format {
         ImageFormat::Raw | ImageFormat::DosOrder => ContainerRw::Plain,
         // Raw data with a trailing footer: a window keeps the footer out of the

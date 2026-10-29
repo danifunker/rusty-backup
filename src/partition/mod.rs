@@ -398,26 +398,26 @@ fn probe_apm_without_ddr(reader: &mut (impl Read + Seek)) -> Option<Apm> {
 /// Checks the first sector for a valid FAT BPB, and offset 1024 for HFS/HFS+.
 /// Returns `Some(fs_hint)` where `fs_hint` is `"FAT"`, `"HFS"`, `"HFS+"`,
 /// or `None` if not a superfloppy.
-/// An ICON / LEXICON hard-disk header: the geometry record at +0x10 (`02` ... `03` at +0x2F).
-fn is_icon_disk_header(sector0: &[u8]) -> bool {
-    sector0.len() >= 512
-        && sector0[0x10] == 0x02
-        && sector0[0x2F] == 0x03
-        && sector0[0x1FE..0x200] == [0x55, 0xAA]
-}
-
-/// QNX 2 hard disks (Unisys ICON / LEXICON) store each partition's start 1-based; move such an
-/// entry back one sector when a QNX 2 root is there. See `docs/PLAN-qnx.md`.
+/// QNX 2 hard disks store each partition's start 1-based. On an ICON / LEXICON disk (its header
+/// says so) every type 07 / 08 / 09 entry moves back one sector; elsewhere only a type-07 entry
+/// whose QNX 2 root sits one sector early does. See `docs/PLAN-qnx.md`.
 fn qnx2_one_based_starts(reader: &mut (impl Read + Seek), mbr: &mut Mbr, sector0: &[u8]) {
-    let icon = is_icon_disk_header(sector0);
+    let icon = crate::rbformats::icon_hd::is_icon_header(sector0);
     mbr.icon_qnx2 = icon;
-    for e in mbr.entries.iter_mut() {
-        let wanted = if icon {
-            matches!(e.partition_type, 0x07..=0x09)
-        } else {
-            e.partition_type == 0x07
-        };
-        if !wanted || e.start_lba < 2 {
+    for (i, e) in mbr.entries.iter_mut().enumerate() {
+        if icon && matches!(e.partition_type, 0x07..=0x09) && e.start_lba >= 1 {
+            e.start_lba -= 1;
+            let mut head = [0u8; 1024];
+            let blank = reader
+                .seek(SeekFrom::Start(u64::from(e.start_lba) * 512))
+                .and_then(|_| reader.read_exact(&mut head))
+                .is_ok_and(|_| crate::rbformats::icon_hd::looks_unformatted(&head));
+            if blank {
+                mbr.icon_blank |= 1 << i;
+            }
+            continue;
+        }
+        if e.partition_type != 0x07 || e.start_lba < 2 {
             continue;
         }
         let at = u64::from(e.start_lba) * 512;
@@ -1155,7 +1155,9 @@ fn mbr_partitions(mbr: &Mbr) -> Vec<PartitionInfo> {
         .filter(|(_, e)| !e.is_empty())
         .map(|(i, e)| PartitionInfo {
             index: i,
-            type_name: if mbr.icon_qnx2 && matches!(e.partition_type, 0x07..=0x09) {
+            type_name: if mbr.icon_qnx2 && mbr.icon_blank & (1 << i) != 0 {
+                "QNX 2 (not formatted)".to_string()
+            } else if mbr.icon_qnx2 && matches!(e.partition_type, 0x07..=0x09) {
                 "QNX 2".to_string()
             } else {
                 e.partition_type_name().to_string()

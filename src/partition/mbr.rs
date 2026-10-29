@@ -129,6 +129,9 @@ pub struct Mbr {
     /// An ICON / LEXICON hard disk: types 07 / 08 / 09 are QNX 2 partitions 1-3.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub icon_qnx2: bool,
+    /// Bit `i` set: entry `i` of an ICON disk has never been formatted (its first sectors are zero).
+    #[serde(skip)]
+    pub icon_blank: u8,
 }
 
 impl Mbr {
@@ -166,6 +169,7 @@ impl Mbr {
             entries,
             logical_partitions: Vec::new(),
             icon_qnx2: false,
+            icon_blank: 0,
         })
     }
 

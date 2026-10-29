@@ -145,3 +145,30 @@ args = ["ls", "{fixture}", "/"]
 expect_exit = 0
 stdout_contains = ["253016             .bitmap", ".inodes", ".boot", ".altboot"]
 stdout_not_contains = ["tmp", "lost+found"]
+
+[[case]]
+id = "read.qnx2.icon4-st251-real-hd"
+description = "A real LEXICON ST-251 read with padding heads: geometry undone, partition 2 reported blank, clock-unset dates are 1980"
+fixture = "fs.qnx2.icon4-st251.hd"
+timeout_ms = 300000
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["59", "65594", "QNX 2 (not formatted)"]
+[[case.step]]
+args = ["fsck", "--checkonly", "{fixture}@1"]
+expect_exit = 0
+stdout_contains = ["431 files / 20 dirs checked"]
+stdout_not_contains = ["WARN", "ERROR"]
+[[case.step]]
+args = ["ls", "{fixture}@1", "/"]
+expect_exit = 0
+stdout_contains = ["QNX_1", "QNX_5", "convert_4.02", "package"]
+[[case.step]]
+args = ["ls", "{fixture}@2", "/"]
+expect_exit = 1
+stderr_contains = ["never been formatted"]
+[[case.step]]
+args = ["tar", "{fixture}@1", "/", "{scratch}/all.tar"]
+expect_exit = 0
+file_sha256 = [{ path = "{scratch}/all.tar", sha256 = "2e6b7ab29c9a75734e6630a63e4c95dcb9c67471fc50f90ef2b1d2e676b0c3e4" }]

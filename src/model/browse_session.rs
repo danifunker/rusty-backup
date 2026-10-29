@@ -15,7 +15,7 @@
 //! Extracted from `gui/browse_view.rs` per §5 of `docs/codecleanup.md`.
 
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, Read as _};
+use std::io::Read as _;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -517,8 +517,9 @@ impl BrowseSession {
                 )
             }
             _ => {
-                let file = File::open(path).map_err(FilesystemError::Io)?;
-                let reader = BufReader::new(file);
+                // Plain images, including an ICON drive imaged with padding heads.
+                let reader = crate::model::source_reader::open_plain_raw(path)
+                    .map_err(|e| FilesystemError::Io(crate::compat::io_other(format!("{e:#}"))))?;
                 fs::open_filesystem_with_passphrase(
                     reader,
                     self.partition_offset,

@@ -139,9 +139,10 @@ impl Dirent {
 /// Decode an ICON date pair to Unix seconds (local time, as the ICON kept it).
 pub fn decode_date(w0: u16, w1: u16) -> Option<i64> {
     use chrono::Datelike;
-    let month = u32::from((w0 >> 8) & 15);
-    let day = u32::from((w0 >> 1) & 31);
-    if w0 == 0 || !(1..=12).contains(&month) || day == 0 || w1 >= 43200 {
+    // An unset clock writes month and day 0 (QNX shows `0-----80`): count it as 1 January.
+    let month = u32::from((w0 >> 8) & 15).max(1);
+    let day = u32::from((w0 >> 1) & 31).max(1);
+    if (w0 == 0 && w1 == 0) || month > 12 || w1 >= 43200 {
         return None;
     }
     let date = chrono::NaiveDate::from_ymd_opt(1980 + i32::from(w0 >> 12), month, day)?;
@@ -1452,7 +1453,9 @@ mod tests {
         assert_eq!(show(0xBA3A, 0x0642), "1991-10-29 00:26:42"); // 29-Oct-91 12:26am
         assert_eq!(show(0x832F, 0x3976), "1988-03-23 16:05:10"); // 23-Mar-88 4:05pm
         assert_eq!(decode_date(0, 0), None);
-        assert_eq!(decode_date(0x7027, 0), None);
+        // A real ST-251 installed with the clock unset: QNX lists `0-----80 12:12am`.
+        assert_eq!(show(0x0000, 0x02D0), "1980-01-01 00:12:00");
+        assert_eq!(decode_date(0x0D00, 0), None, "month 13 is not a date");
         for t in [
             decode_date(0x5539, 0x2A91).unwrap(),
             decode_date(0xBA3A, 0x0642).unwrap(),

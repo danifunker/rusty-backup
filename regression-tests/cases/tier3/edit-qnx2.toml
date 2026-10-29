@@ -134,3 +134,24 @@ args = ["fsck", "--checkonly", "{fixture_copy}"]
 expect_exit = 0
 stdout_contains = ["144 files / 5 dirs checked"]
 stdout_not_contains = ["WARN", "ERROR"]
+
+[[case]]
+id = "edit.qnx2.icon4-st251-padded-heads"
+description = "Writes to a padded-head image land on the real heads (checked with QNX chkfsys in icon-emu)"
+fixture = "fs.qnx2.icon4-st251.hd"
+timeout_ms = 300000
+[[case.step]]
+args = ["mkdir", "{fixture_copy}@1", "/rbtest"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{fixture_copy}@1", "{cases}/tier3/payload.bin", "/rbtest/payload"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{fixture_copy}@1", "/rbtest/payload", "{scratch}/out.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/out.bin"]]
+[[case.step]]
+args = ["fsck", "--checkonly", "{fixture_copy}@1"]
+expect_exit = 0
+stdout_contains = ["432 files / 21 dirs checked"]
+stdout_not_contains = ["WARN", "ERROR"]

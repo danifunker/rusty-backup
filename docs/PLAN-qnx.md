@@ -84,6 +84,32 @@ Sinclair QL QDOS that `fs::qdos` already reads. Detection must be by content.
 - The volume is the same format as the floppies: 425 files / 20 dirs, fsck
   clean, `/sys/icon2_emul` among them.
 
+## A real LEXICON drive: Seagate ST-251 (2026-10-29)
+
+`ICON4_ST251_final.bin` (NAS `ICON_ICON2/ICON4_ST251_final`, fixture
+`fs.qnx2.icon4-st251.hd`) is a real fileserver disk read with David Gesswein's
+MFM reader. The drive is 820 x 6 x 17 = 83,640 blocks, but the extraction wrote
+8 heads per cylinder, so heads 6 and 7 of every cylinder are zeros. The header
+(heads at +0x13, total at +0x14) and the file length give it away;
+`rbformats::icon_hd::IconHd` reads and writes through the drive's own geometry,
+and also applies bad-block-table entries (`{u32 bad, u32 replacement}`, bad 0 =
+unused; every entry here is unused).
+
+- Partition 1 (type 07, start 60 -> LBA 59): 431 files / 20 dirs; 423 files are
+  byte-identical to the 4.10.01 install, `/bitmap` differs, and `QNX_1`-`QNX_5`,
+  `package`, `convert_4.02` are extra. QNX's `query 1` in icon-emu: 58698 free,
+  6838 used of 65536.
+- Partition 2 (type 08, LBA 65594) was never formatted: zero apart from a
+  16-byte stamp `fdisk` leaves at the end of its block 1. On an ICON disk the
+  start - 1 rule now applies to types 07 / 08 / 09 whether or not a QNX root is
+  there, and such a partition is reported as not formatted.
+- The clock was unset: dates are `w0 = 0` with seconds in `w1`, which QNX lists
+  as `0-----80 12:12am`. They decode as 1 January 1980 plus the time.
+- RB's writes to the padded `.bin` left every padding head zero, and QNX's
+  `chkfsys` agreed with the bitmap; a 150 KB file copied by QNX came back
+  byte-identical.
+- The `.emu` flux file (Gesswein emulator format) is not read yet.
+
 ## Writing QNX 2 (done 2026-10-28, verified in icon-emu)
 
 icon-emu (`github.com/danifunker/icon-emu`, CLI `icon-cli serve` + `icon-ci`;
