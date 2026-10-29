@@ -407,6 +407,10 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
     // through to the ext2 superblock-magic check below. The gate mirrors
     // `fat::FatFilesystem::open`, which rejects bytes_per_sector 0 / >4096 and
     // sectors_per_cluster 0.
+    // QNX 4's boot block carries an x86 jump and a FAT-like BPB; its root entry at block 1 decides.
+    if qnx4::looks_like_qnx4(reader, partition_offset) {
+        return "qnx4";
+    }
     if sector0[0] == 0xEB || sector0[0] == 0xE9 {
         let bytes_per_sector = u16::from_le_bytes([sector0[11], sector0[12]]);
         let sectors_per_cluster = sector0[13];

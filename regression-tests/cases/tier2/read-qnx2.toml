@@ -8,7 +8,7 @@
 [meta]
 tier = 2
 group = "fs.read.qnx2"
-description = "Detect, list and extract QNX 2 (Unisys ICON) floppies."
+description = "Detect, list and extract QNX 2 (Unisys ICON) volumes, and real QNX 4 media."
 
 [[case]]
 id = "read.qnx2.icon-sys410-disk1"
@@ -129,3 +129,19 @@ stdout_not_contains = ["WARN", "ERROR"]
 args = ["tar", "{fixture}@1", "/", "{scratch}/all.tar"]
 expect_exit = 0
 file_sha256 = [{ path = "{scratch}/all.tar", sha256 = "800f1d0fc039bc69b00697e77ec2ba6b20ef2aa82b5d7f0cc5ced93c78428945" }]
+
+[[case]]
+id = "read.qnx4.qnxfs1g"
+description = "Real QNX 4 media: its FAT-like boot block must not be taken for FAT; readdir hides busy and unused entries"
+fixture = "fs.qnx4.qnxfs1g.hd"
+timeout_ms = 300000
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["QNX4"]
+stdout_not_contains = ["FAT"]
+[[case.step]]
+args = ["ls", "{fixture}", "/"]
+expect_exit = 0
+stdout_contains = ["253016             .bitmap", ".inodes", ".boot", ".altboot"]
+stdout_not_contains = ["tmp", "lost+found"]

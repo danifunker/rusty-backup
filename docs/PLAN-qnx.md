@@ -119,6 +119,16 @@ floppy (drive 2). Each time `chkfsys` ended "Rebuilt bitmap agrees with
 existing bitmap" with no errors, and a file RB wrote, copied by QNX, read back
 byte-identical; QNX's writes read back through RB with a clean RB fsck.
 
+## QNX 4 on real media (2026-10-28)
+
+`qnxfs1g.img` (qnxfs.narod.ru, fixture `fs.qnx4.qnxfs1g.hd`) was taken for FAT:
+the QNX 4 boot block starts with an x86 jump and a BPB (OEM `QNX4FS`), and both
+the partition and the filesystem probes tried FAT first. QNX 4's root entry at
+block 1 is now probed ahead of FAT. The root also holds `lost+found` with status
+`0x04` (busy) and a 1 GB `tmp` with status 0 whose extent runs a block past the
+image; both are hidden, as Linux's readdir hides entries that are neither USED
+nor LINK. `.inodes`, `.boot` and `.altboot` are links into the superblock.
+
 ## QNX 4 and QNX 6
 
 - **QNX 4** (QNX 4.x, and QNX Neutrino 6.0-6.3 via `fs-qnx4`): 512-byte
@@ -141,7 +151,7 @@ byte-identical; QNX's writes read back through RB with a clean RB fsck.
 | Phase | Work | Verified against |
 |---|---|---|
 | Q1 (done) | QNX 2 read, plus dates, owners, attributes, deleted entries, RS to LF, fsck (bitmap cross-check) and the QDOS `.ph` hand-off: detection, browse, extract, Inspect / Commander, `.img` 800 KiB ICON geometry; tolerate unreadable sectors (named, not fatal); ICON fixtures + regression cases | The ICON disks themselves (files that are known text / known binaries), `q2files`-style listing |
-| Q2 (code done; needs real media) | QNX 4 read: superblock / root, inode file, extents, links, MBR types 0x4D-0x4F | `qnxfs1g.img`, images made by QNX 4.25 under QEMU, `chkfs` |
+| Q2 (done; checked on `qnxfs1g.img`) | QNX 4 read: superblock / root, inode file, extents, links, MBR types 0x4D-0x4F | `qnxfs1g.img`, images made by QNX 4.25 under QEMU, `chkfs` |
 | Q3 (code done; needs real media) | QNX 6 Power-Safe read: superblock pair, trees, long names, both byte orders | Images made by QNX 6.5 / 7 under QEMU |
 | Q4 | QNX 2 edit + create + fsck | QNX 2 `chkfsys` running under emulation (see Oracles) |
 | Q5 | QNX 4 edit + create + fsck | QNX 4.25 `chkfsys` / `dcheck` under QEMU, plus `chkfs` |

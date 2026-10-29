@@ -570,6 +570,13 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
     }
     let _ = reader.seek(SeekFrom::Start(0));
 
+    // QNX 4's boot block has an x86 jump and a FAT-like BPB (OEM "QNX4FS"); its root entry decides first.
+    if crate::fs::qnx4::looks_like_qnx4(reader, 0) {
+        let _ = reader.seek(SeekFrom::Start(0));
+        return Some("QNX4".to_string());
+    }
+    let _ = reader.seek(SeekFrom::Start(0));
+
     if first_sector[0] == 0xEB || first_sector[0] == 0xE9 {
         let bytes_per_sector = u16::from_le_bytes([first_sector[11], first_sector[12]]);
         let sectors_per_cluster = first_sector[13];
