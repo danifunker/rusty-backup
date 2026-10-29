@@ -9,7 +9,7 @@ write path ships only after the native OS's own checker accepts our output.
 | W2 | HP-UX HFS, plus the UFS allocator fixes it exposed | Done (`0387690`) | HP-UX 11.11 `fsck -F hfs`, mount |
 | W2b | FreeBSD 12+ UFS check-hashes, cluster maps, lazy inode init | Done (`f32349b`) | FreeBSD 15.1 `fsck_ffs`, mount |
 | W3 | VxFS disk layout 4: create / delete / rename files and directories | Done (first cut: direct extents) | HP-UX 11.11 `fsck -F vxfs -o full -n`, `fsdb -F vxfs`, mount |
-| W4 | Sun QIC tapes: rebuild on edit, original kept as a backup | Planned | SunOS 4.1.x reading the tape back (sun3 / sun4m emulation), `tar t` |
+| W4 | Sun QIC tapes: rebuild on edit, original kept as a backup | Code done 2026-10-29 (`src/fs/sun2tape_edit.rs`); awaiting a Sun-2 / Sun-3 MiSTer boot of an edited tape | SunOS 4.1.x reading the tape back (sun3 / sun4m emulation), `tar t` |
 | W5 | BSD disklabel slot edits + resize on restore | Planned | NetBSD/hppa `disklabel` under QEMU |
 | W6 | HP-UX LVM LV resize / resize on restore | Planned | HP-UX `vgcfgbackup`, `vgdisplay`, `lvdisplay` |
 | — | AIX LVM / JFS1 writes | Blocked on the 43P MiSTer core reaching AIX | AIX 4.3.3 `fsck`, `lsvg` |

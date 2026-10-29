@@ -100,12 +100,12 @@ flux, LEXICON 10 MB and 64 MB, ntfscomp.GHO, qnxfs1g.
 
 ## Queue, in the user's order
 
-1. **Sun tapes writable (plan phase W4), then a general tape layer.** Editing
-   rebuilds the whole tape like `src/fs/squashfs_edit.rs`; back up the original
-   to `<name>.bak` (never overwrite: `.bak.1`, ...). Formats wanted: Sun, DEC
-   (SIMH .tap / AWS / HET, ANSI labels, VMS BACKUP), HP 9000 / SGI / IBM, and a
-   folder of tape files. Oracle: SunOS reading the tape back; nothing here can
-   boot SunOS from QIC, so ask the user about the Sun-3 MiSTer core.
+1. **Sun tapes: verify W4 on hardware, then a general tape layer.** Editing is
+   written (`src/fs/sun2tape_edit.rs`, `tar_section.rs`, `compress_unix_z`;
+   regression `edit-sun-tapes.toml`). Still owed: boot / `tar t` an edited tape
+   on the Sun-2 or Sun-3 MiSTer core (the user's, when free) — sun-2 and sun-4
+   can both boot from tape. Then the general layer: DEC (SIMH .tap / AWS / HET,
+   ANSI labels, VMS BACKUP), HP 9000 / SGI / IBM, a folder of tape files.
 2. **QNX 2 follow-ups:** non-empty bad-block tables (warn today; need a
    sample), 640 KiB disks, `arch` archive floppies (none in the archive).
 3. **Flux:** GCR (Apple / Commodore) decoding on `rbformats::flux`.

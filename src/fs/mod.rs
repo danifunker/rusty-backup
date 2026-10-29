@@ -113,8 +113,10 @@ pub mod squashfs_verify;
 pub mod squashfs_write;
 pub mod stream_pipe;
 pub mod sun2tape;
+pub mod sun2tape_edit;
 pub mod tar_export;
 pub mod tar_import;
+pub mod tar_section;
 pub mod ti99;
 pub mod times;
 pub mod trdos;
@@ -2526,6 +2528,12 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                 "qnx2" => Ok(Box::new(qnx2::Qnx2Filesystem::open(
                     reader,
                     partition_offset,
+                )?)),
+                // A tape is rebuilt whole on sync and replaces its own file (see sun2tape_edit).
+                "sun2tape" => Ok(Box::new(sun2tape_edit::TapeEditor::open(
+                    reader,
+                    partition_offset,
+                    edit_ctx.whole_file_path,
                 )?)),
                 "affs" => Ok(Box::new(affs::AffsFilesystem::open_sized(
                     reader,

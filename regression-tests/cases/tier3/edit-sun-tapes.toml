@@ -1,0 +1,65 @@
+# Tier 3 — edit Sun QIC tapes (SUN2TAPE), plan phase W4.
+#
+# A tape is rebuilt whole on every edit: the tar member list is rewritten
+# (untouched members byte for byte), compress(1) sections are decompressed,
+# edited and recompressed, and the UFS miniroot goes through the UFS writer.
+# The original is kept as <name>.bak. Host gzip + tar read the rebuilt
+# sections, and untouched tape files stay byte-identical.
+#
+# NOT YET VERIFIED ON SUN HARDWARE: the oracle is a Sun-2 / Sun-3 MiSTer core
+# booting and listing an edited tape; until then these cases pin RB's own view.
+
+[meta]
+tier = 3
+group = "edit.sun-tape"
+description = "Add, rename and remove files in Sun install tapes' tar, tar.Z and UFS sections."
+
+[[case]]
+id = "edit.sun-tape.sunos411-sun3"
+description = "tar.Z section and UFS miniroot edited on a SunOS 4.1.1 install tape"
+fixture = "tape.qic.sunos411-sun3"
+timeout_ms = 600000
+[[case.step]]
+args = ["mkdir", "{fixture_copy}", "/vol1/05-root.tar.Z/rbtest"]
+expect_exit = 0
+[[case.step]]
+args = ["put", "{fixture_copy}", "{cases}/tier3/payload.bin", "/vol1/05-root.tar.Z/rbtest/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{fixture_copy}", "/vol1/05-root.tar.Z/rbtest/payload.bin", "{scratch}/a.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/a.bin"]]
+[[case.step]]
+args = ["put", "{fixture_copy}", "{cases}/tier3/payload.bin", "/vol1/04-mini-root.ufs/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{fixture_copy}", "/vol1/04-mini-root.ufs/payload.bin", "{scratch}/b.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/b.bin"]]
+[[case.step]]
+args = ["ls", "{fixture_copy}", "/vol1/05-root.tar.Z/etc"]
+expect_exit = 0
+stdout_contains = ["motd"]
+
+[[case]]
+id = "edit.sun-tape.sunos411u1-sun3"
+description = "Plain V7 tar section: add, rename and remove members"
+fixture = "tape.qic.sunos411u1-sun3"
+[[case.step]]
+args = ["put", "{fixture_copy}", "{cases}/tier3/payload.bin", "/01-archive.tar/payload.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["mv", "{fixture_copy}", "/01-archive.tar/payload.bin", "/01-archive.tar/renamed.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{fixture_copy}", "/01-archive.tar/renamed.bin", "{scratch}/r.bin"]
+expect_exit = 0
+files_identical = [["{cases}/tier3/payload.bin", "{scratch}/r.bin"]]
+[[case.step]]
+args = ["rm", "{fixture_copy}", "/01-archive.tar/renamed.bin"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{fixture_copy}", "/01-archive.tar"]
+expect_exit = 0
+stdout_contains = ["install_unbundled", "4.1.1_U1"]
+stdout_not_contains = ["renamed.bin", "payload.bin"]

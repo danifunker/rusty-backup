@@ -427,6 +427,11 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
     /// Open a UFS1 or UFS2 filesystem at the given partition offset.
     /// Probes both candidate superblock locations (UFS2's modern 65536
     /// first, then UFS1's 8192) and accepts whichever magic matches.
+    /// The underlying reader, for an editor that keeps the volume in memory.
+    pub fn into_inner(self) -> R {
+        self.reader
+    }
+
     pub fn open(mut reader: R, partition_offset: u64) -> Result<Self, FilesystemError> {
         let candidates = [SB_OFFSET_UFS2, SB_OFFSET_UFS1];
 
