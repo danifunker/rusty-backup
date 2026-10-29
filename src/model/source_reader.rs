@@ -1021,6 +1021,19 @@ fn open_read_dispatch(
         }
         crate::rbformats::flux::record_faults(path, &disk);
         Ok(Box::new(std::io::Cursor::new(disk.image)))
+    } else if crate::rbformats::flux::mfm_emu::is_emu_path(path) {
+        // MFM reader capture of an ST-506 hard disk: decoded track by track into a temp file.
+        let mut src =
+            BufReader::new(File::open(path).with_context(|| format!("open {}", path.display()))?);
+        let mut out = tempfile::tempfile().context("temp file for an .emu decode")?;
+        let disk = crate::rbformats::flux::mfm_emu::decode_to(&mut src, &mut out)
+            .with_context(|| format!("decode MFM capture {}", path.display()))?;
+        if let Some(faults) = disk.fault_summary() {
+            eprintln!("MFM capture: {faults}; unreadable sectors are zero-filled");
+        }
+        crate::rbformats::flux::record_faults(path, &disk);
+        out.seek(SeekFrom::Start(0))?;
+        Ok(Box::new(BufReader::new(out)))
     } else if crate::rbformats::flux::is_flux_file_path(path) {
         // SCP (Greaseweazle) or HFE: the same MFM decode as a KryoFlux set.
         let tracks = crate::rbformats::flux::read_flux_file(path)
@@ -1628,6 +1641,7 @@ pub fn is_container_path(path: &Path) -> bool {
         || is_flat_floppy_container_path(path)
         || crate::rbformats::flux::kryoflux::is_stream_path(path)
         || crate::rbformats::flux::is_flux_file_path(path)
+        || crate::rbformats::flux::mfm_emu::is_emu_path(path)
 }
 
 #[cfg(test)]

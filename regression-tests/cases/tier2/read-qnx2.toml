@@ -172,3 +172,25 @@ stderr_contains = ["never been formatted"]
 args = ["tar", "{fixture}@1", "/", "{scratch}/all.tar"]
 expect_exit = 0
 file_sha256 = [{ path = "{scratch}/all.tar", sha256 = "2e6b7ab29c9a75734e6630a63e4c95dcb9c67471fc50f90ef2b1d2e676b0c3e4" }]
+
+[[case]]
+id = "read.qnx2.icon4-st251-emu-flux"
+description = "The same ST-251 from its MFM reader capture (.emu, Intel iSBC 214): decodes byte-identical to the sector dump"
+fixture = "flux.emu.icon4-st251.hd"
+timeout_ms = 600000
+[[case.step]]
+args = ["inspect", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["59", "QNX 2 (not formatted)"]
+stderr_not_contains = ["unreadable"]
+[[case.step]]
+args = ["tar", "{fixture}@1", "/", "{scratch}/all.tar"]
+expect_exit = 0
+file_sha256 = [{ path = "{scratch}/all.tar", sha256 = "2e6b7ab29c9a75734e6630a63e4c95dcb9c67471fc50f90ef2b1d2e676b0c3e4" }]
+[[case.step]]
+args = ["convert", "{fixture}", "{scratch}/disk", "--format", "raw"]
+expect_exit = 0
+[[case.step]]
+args = ["fsck", "--checkonly", "{scratch}/disk/flux.emu.icon4-st251.hd.img@1"]
+expect_exit = 0
+stdout_contains = ["431 files / 20 dirs checked"]

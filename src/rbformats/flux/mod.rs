@@ -19,6 +19,7 @@ pub mod fm;
 pub mod hfe;
 pub mod kryoflux;
 pub mod mfm;
+pub mod mfm_emu;
 pub mod scp;
 
 use std::collections::BTreeMap;

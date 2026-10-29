@@ -108,7 +108,14 @@ unused; every entry here is unused).
 - RB's writes to the padded `.bin` left every padding head zero, and QNX's
   `chkfsys` agreed with the bitmap; a 150 KB file copied by QNX came back
   byte-identical.
-- The `.emu` flux file (Gesswein emulator format) is not read yet.
+- The `.emu` capture (Gesswein MFM reader format, `rbformats::flux::mfm_emu`)
+  decodes byte-identical to the sector dump. Cells are 32-bit little-endian
+  words read MSB first; Intel iSBC 214 IDs are `{FE ^ cyl_high, cyl_low,
+  0x20 | head, sector}` + CRC-CCITT over `A1` and those bytes; data fields are
+  `F8` + 512 bytes + a 32-bit ECC (poly 0x140A0445, init FFFFFFFF, over `A1 F8`
+  and the data). The file ends with a track header of cylinder / head
+  0xFFFFFFFF. `rb-cli convert` now exports what the read layer decodes for any
+  container the image detector sees as raw (it used to copy flux files as is).
 
 ## Writing QNX 2 (done 2026-10-28, verified in icon-emu)
 
