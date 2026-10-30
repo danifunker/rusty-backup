@@ -74,6 +74,7 @@ fn handle_windows_assoc_cli() {
 }
 
 fn main() -> eframe::Result {
+    rusty_backup::fs::prodos_types::init_user_config_dir();
     // Windows installer/uninstaller association hooks (and launch-time refresh).
     // Must run before GUI init; the hook flags exit without opening a window.
     #[cfg(windows)]

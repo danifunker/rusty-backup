@@ -30,7 +30,8 @@ pub mod g64;
 pub mod hdf;
 pub mod hdm;
 pub mod msa;
-pub mod sector_order;
+// Moved to the `fs-apple2` crate (shared with Apple DOS 3.3); re-exported so existing paths keep working.
+pub use fs_apple2::sector_order;
 pub mod xdf;
 
 use std::io::{Cursor, Read, Seek};

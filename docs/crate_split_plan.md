@@ -205,10 +205,13 @@ The crates already kept separately stay separate, because other projects share t
 2. **The rest of `fs-8bit`, `fs-cpm`, `fs-apple2`, `fs-qnx`, `fs-xerox`.** Small and mechanical.
    - **Slice 2a done (2026-10-30):** `fs-8bit` gained `cbm`, `atari_dos`, `dfs` (feature `acorn`), `trdos`, `rsdos` + `dragondos` (feature `coco`), `os9` (feature `os9`, implies `coco`), `ti99` and `andos`. That's about 12k lines with all 110 crate tests passing; `os9`'s fixture test now reads `tests/fixtures` via `CARGO_MANIFEST_DIR` through a `zstd` dev-dependency.
    - **Slice 2b done (2026-10-30):** new crates `fs-cpm` (`cpm`, `cpm_diskdefs`), `fs-apple2` (`ucsd`), `fs-qnx` (`qnx4`, `qnx6`) and `fs-xerox` (the whole `alto/` tree, MIT, co-copyright Alan Steremberg, `publish = false` until release timing is agreed). `disk-core` gained `bits` (big-endian bitmap helpers, moved out of `hfs_common`, which now re-exports them) and `unix_common` (moved as-is; needs `anyhow` under `fs`).
-   - **Held back from 2b, minimal-changes rule:**
-     - `apple_dos` needs `rbformats::containers::sector_order`; it moves with the `dsk-*` crates.
-     - `prodos` calls the app's user-overridable `prodos_types` table from non-test code.
-     - `qnx2`'s copy test needs the app's `fs::copy` plus private fixture constants; untangle it like `lif`.
+   - **Held back from 2b; resolved in slice 2c (2026-10-30):**
+     - `apple_dos` and `sector_order` (dependency-free; the app's `rbformats::containers` re-exports it) moved to `fs-apple2`.
+     - `prodos` and `prodos_types` moved to `fs-apple2`, with `assets/prodos_file_types.json` moved into the crate.
+       - The one real change: `prodos_types::set_user_config_dir()`, with a fallback to the platform config dir plus `rusty-backup`.
+       - The app keeps its elevation-aware lookup in `fs::prodos_types::init_user_config_dir()`, called first in both `main` functions.
+     - `CompactResult` (plain data, returned by every compactor) moved to `disk_core::filesystem`, re-exported from `fs`.
+     - `qnx2` moved to `fs-qnx` (feature `qnx2`). Its copy test was rewritten to create entries with the source's `qnx2_attrs` through the crate's own API, which is what `fs::copy` does per entry, instead of calling the app's `fs::copy`.
    - **Held back:** `adfs` and `qdos` / `qdos_mdv` (license audit, §6) and `lif`. `lif`'s replace test needs both its private fields and the app's `fs::replace`; split the test, or give `lif` a small test-support accessor, before moving it.
 3. **`fs-amiga`, `fs-unix`, `fs-xfs`, `fs-squashfs`, `fs-pc`, `fs-mac`, `fs-apfs`.** The big ones. The license-audit items get their handling here.
 4. **`part-tables`** (C5).

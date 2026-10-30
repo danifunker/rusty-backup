@@ -5,14 +5,15 @@ edition = "2021"
 rust-version = "1.73"
 license = "MIT"
 authors = ["Dani Sarfati <dani@funkervogt.com>"]
-description = "Read QNX 4 and QNX 6 (Power-Safe) filesystems"
+description = "QNX 2 (read/write, via qnx2fs), QNX 4 and QNX 6 (Power-Safe) filesystems"
 repository = "https://github.com/danifunker/rusty-backup"
 readme = "README.md"
 keywords = ["filesystem", "qnx", "retro", "disk-image"]
 categories = ["filesystem"]
 
 [features]
-default = ["qnx4", "qnx6"]
+default = ["qnx2", "qnx4", "qnx6"]
+qnx2 = ["dep:qnx2fs", "dep:chrono", "dep:log"]
 qnx4 = []
 qnx6 = []
 # Only for a Rust 1.73 toolchain; see disk-core.
@@ -20,3 +21,8 @@ rust173-polyfill = ["disk-core/rust173-polyfill"]
 
 [dependencies]
 disk-core = { path = "../disk-core", version = "0.1", features = ["fs"] }
+# QNX 2 (Unisys ICON / LEXICON) on-disk engine; MIT, no deps, Rust 1.73.
+qnx2fs = { version = "0.3", optional = true }
+# QNX 2 dates are local time folded into its 1980-1995 window.
+chrono = { version = "0.4", optional = true }
+log = { version = "0.4", optional = true }

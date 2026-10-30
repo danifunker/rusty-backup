@@ -652,7 +652,11 @@ dependencies = [
 name = "fs-apple2"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "dirs",
  "disk-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -666,7 +670,10 @@ dependencies = [
 name = "fs-qnx"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "disk-core",
+ "log",
+ "qnx2fs",
 ]
 
 [[package]]

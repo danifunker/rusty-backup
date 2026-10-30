@@ -5,17 +5,25 @@ edition = "2021"
 rust-version = "1.73"
 license = "MIT"
 authors = ["Dani Sarfati <dani@funkervogt.com>"]
-description = "Apple II era disk filesystems (UCSD p-System today; Apple DOS 3.3 and ProDOS to follow)"
+description = "Apple II disk filesystems: Apple DOS 3.3, ProDOS and UCSD p-System, plus DOS/ProDOS sector-order handling"
 repository = "https://github.com/danifunker/rusty-backup"
 readme = "README.md"
-keywords = ["filesystem", "apple2", "retro", "emulator", "disk-image"]
+keywords = ["filesystem", "apple2", "prodos", "emulator", "disk-image"]
 categories = ["filesystem", "emulators"]
 
 [features]
-default = ["ucsd"]
+default = ["apple-dos", "prodos", "ucsd"]
+apple-dos = []
+prodos = ["dep:serde", "dep:serde_json", "dep:dirs"]
 ucsd = []
 # Only for a Rust 1.73 toolchain; see disk-core.
 rust173-polyfill = ["disk-core/rust173-polyfill"]
 
 [dependencies]
 disk-core = { path = "../disk-core", version = "0.1", features = ["fs"] }
+# `sector_order` (always built) reports open errors through anyhow.
+anyhow = "1"
+# ProDOS file-type table: embedded JSON plus an optional user override file.
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+dirs = { version = ">=6, <8", optional = true }

@@ -850,6 +850,24 @@ pub fn folds_case(fs_type: &str) -> bool {
         || t == "SFS"
 }
 
+/// Result of filesystem compaction.
+///
+/// See `src/fs/README.md` ("Compact reader sizing model") for the full
+/// description of how `original_size`, `compacted_size`, and `data_size`
+/// relate for packed vs. layout-preserving readers.
+pub struct CompactResult {
+    pub original_size: u64,
+    /// Actual bytes that the compact reader will emit (= `original_size` for
+    /// layout-preserving readers; < `original_size` for packed readers).
+    pub compacted_size: u64,
+    /// Logical data bytes: allocated clusters × block_size (+ pre-alloc for HFS).
+    /// For packed readers this equals `compacted_size`.
+    /// For layout-preserving readers this is less than `compacted_size` because
+    /// free clusters are zero-filled in-memory rather than read from disk.
+    pub data_size: u64,
+    pub clusters_used: u32,
+}
+
 #[cfg(test)]
 mod find_child_tests {
     use super::*;
