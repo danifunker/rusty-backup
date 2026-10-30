@@ -65,11 +65,14 @@ All names were checked against crates.io on 2026-10-30 and are free. `fs-core` w
 | `dsk-ghost` | Norton Ghost GHO (+ password); `file-aware` feature pulls `fs-pc` |
 | `dsk-clonezilla` | partclone image reader, Clonezilla folder metadata, block cache. **Co-copyright: Alan Steremberg** |
 
-### Other (1)
+### Other (2)
 
 | Crate | Contents |
 |---|---|
-| `arc-mac` | StuffIt (classic + 5), Compact Pro, MAR, BinHex. Depends on `fs-mac` for HFS metadata types. |
+| `arc-mac` (MIT) | StuffIt container parser and writers, MAR, BinHex, MacBinary, archive detection and extraction. Depends on `fs-mac` for HFS metadata types, and on `arc-mac-codecs`. |
+| `arc-mac-codecs` (**LGPL-2.1-or-later**) | The StuffIt / Compact Pro decompressors ported from XADMaster: Arsenic, Compact Pro, StuffIt 5, LZW decode, method 13, LZAH, Huffman. Licence decision D1 in [license_audit.md](license_audit.md). |
+
+**Rule for moves (2026-10-30): minimal changes only.** Crates receive code as-is: `git mv`, path fixes to compile, notices, and comment corrections. Rewrites, including licence-driven ones (D2: `hfs_unicode` tables, `HFS_CHARORDER`, the `adfs` map walk, `hpfs` dnode editing, XFS `dir_hashname`), are separate follow-ups. Until a module's licence issue is resolved, it **stays in the app** rather than moving into an MIT crate.
 
 ### What stays in the app (AGPL-3.0)
 

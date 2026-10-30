@@ -83,7 +83,11 @@ The format data tables (Arsenic randomization table, method-13 tables, LZAH dist
 
 ## Decisions needed
 
-- **D1: Mac archive codecs (~2,200 lines).**
+- **D1: Mac archive codecs (~2,200 lines). DECIDED 2026-10-30: (a) LGPL sub-crate.**
+  - The XADMaster-derived decoders (`stuffit_arsenic`, `compactpro`, `stuffit5`, the `stuffit_lzw` decoder, `stuffit_lzh` + `stuffit13_tables`, `stuffit_lzah`, `stuffit_huffman`) go into **`arc-mac-codecs`**, licensed **LGPL-2.1-or-later**. It carries MacPaw's copyright notice and keeps the "Ported from" headers.
+  - The independent code goes into MIT `arc-mac`, which depends on `arc-mac-codecs`: the container parser and writers, `bitreader_be`, BinHex, MacBinary, detect, extract, maczip, the Unix-`compress` LZW encoder, and `mar` once it's checked.
+  - The name `arc-mac-codecs` was free on crates.io on 2026-10-30.
+  - Options as originally weighed:
   - Either: (a) a separate **LGPL-2.1-or-later** crate for the codecs (e.g. `arc-mac-codecs`), with MacPaw notices, while the independent container / writer / BinHex / MacBinary code goes MIT in `arc-mac`.
   - Or: (b) clean-room rewrites from format descriptions, done by someone who hasn't been working from the XAD sources.
   - Recommendation: (a). It's honest about the origin, LGPL works with both MIT and AGPL users, and it costs nothing now.
