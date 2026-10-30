@@ -603,7 +603,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
- "qnx2fs",
  "serde",
 ]
 
@@ -779,10 +778,7 @@ dependencies = [
 name = "fs-qnx"
 version = "0.1.0"
 dependencies = [
- "chrono",
  "disk-core",
- "log",
- "qnx2fs",
 ]
 
 [[package]]

@@ -15,14 +15,12 @@ categories = ["filesystem", "emulators"]
 default = ["fs"]
 # The Filesystem / EditableFilesystem interface and FileEntry. Partition and
 # disk-image crates turn this off to skip the filesystem types and their deps.
-fs = ["dep:serde", "dep:chrono", "dep:qnx2fs", "dep:anyhow"]
+fs = ["dep:serde", "dep:chrono", "dep:anyhow"]
 # Only for a Rust 1.73 toolchain; never enable on a modern one (see src/rust173.rs).
 rust173-polyfill = []
 
 [dependencies]
 # `unix_common::validate` returns `anyhow::Result`.
 anyhow = { version = "1", optional = true }
-serde ={ version = "1", features = ["derive"], optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
 chrono = { version = "0.4", optional = true }
-# `FileEntry::qnx2_attrs` / create options carry QNX 2 attributes; MIT, no deps, Rust 1.73.
-qnx2fs = { version = "0.3", optional = true }

@@ -37,7 +37,7 @@ pub struct PreservedDates {
     /// inode / Mac dates / Amiga datestamp / tar Header / host stat).
     pub unix_mtime: Option<u64>,
     /// QNX 2 permissions, owner and date words, copied exactly onto a QNX 2 destination.
-    pub qnx2: Option<qnx2fs::Attributes>,
+    pub qnx2: Option<crate::fs::entry::Qnx2Attrs>,
 }
 
 impl PreservedDates {
@@ -102,7 +102,7 @@ pub enum StagedEdit {
         parent: FileEntry,
         name: String,
         /// A QNX 2 source folder's permissions, owner and date, copied exactly.
-        qnx2_attrs: Option<qnx2fs::Attributes>,
+        qnx2_attrs: Option<crate::fs::entry::Qnx2Attrs>,
     },
     DeleteEntry {
         parent: FileEntry,

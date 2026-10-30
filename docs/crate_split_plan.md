@@ -211,7 +211,16 @@ The crates already kept separately stay separate, because other projects share t
        - The one real change: `prodos_types::set_user_config_dir()`, with a fallback to the platform config dir plus `rusty-backup`.
        - The app keeps its elevation-aware lookup in `fs::prodos_types::init_user_config_dir()`, called first in both `main` functions.
      - `CompactResult` (plain data, returned by every compactor) moved to `disk_core::filesystem`, re-exported from `fs`.
-     - `qnx2` moved to `fs-qnx` (feature `qnx2`). Its copy test was rewritten to create entries with the source's `qnx2_attrs` through the crate's own API, which is what `fs::copy` does per entry, instead of calling the app's `fs::copy`.
+     - `qnx2` **stays in the app** (reverted after slice 2c, restored unchanged with its end-to-end `fs::copy` test).
+       - It is an adapter from the external `qnx2fs` engine to the `disk-core` traits, not reusable format code, so it fails the rule below.
+       - It can't fold into `qnx2fs` either while `disk-core` itself depends on `qnx2fs` (`FileEntry::qnx2_attrs`): that would be a dependency cycle.
+       - **Decoupled (2026-10-30):** `disk-core` no longer depends on `qnx2fs`. `FileEntry::qnx2_attrs` and the create options carry `disk_core::entry::Qnx2Attrs` (the same six fields). The app's `fs/qnx2.rs` converts with `to_core` / `to_qnx2` and maps errors with `qnx_err`, since the orphan rule forbids `From` there.
+       - **Next:**
+         1. Publish `disk-core` (a pre-release) so `qnx2fs` can depend on it.
+         2. Fold the adapter into `qnx2fs` behind an optional `disk-core` feature. `From<qnx2fs::Error> for FilesystemError` then lives in `qnx2fs`, which owns the error type.
+         3. The app takes `qnx2fs` with that feature, plus `[patch.crates-io] disk-core = { path = … }` in all four manifests so there's one `disk-core`.
+
+   **Rule (2026-10-30): a crate must contain reusable format code.** A module that only adapts an external engine crate to the `disk-core` traits stays in the app, as `qnx2` over `qnx2fs` and `optical_fs` over `opticaldiscs` do. Crates are for code that implements a format.
    - **Held back:** `adfs` and `qdos` / `qdos_mdv` (license audit, §6) and `lif`. `lif`'s replace test needs both its private fields and the app's `fs::replace`; split the test, or give `lif` a small test-support accessor, before moving it.
 3. **`fs-amiga`, `fs-unix`, `fs-xfs`, `fs-squashfs`, `fs-pc`, `fs-mac`, `fs-apfs`.** The big ones. The license-audit items get their handling here.
 4. **`part-tables`** (C5).

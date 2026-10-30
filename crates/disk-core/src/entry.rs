@@ -102,7 +102,20 @@ pub struct FileEntry {
     /// Native attribute/permission letters for formats whose bits do not map onto a Unix mode.
     pub native_attrs: Option<String>,
     /// QNX 2 permissions, owner and raw date words, so QNX 2 to QNX 2 copies keep them exactly.
-    pub qnx2_attrs: Option<qnx2fs::Attributes>,
+    pub qnx2_attrs: Option<Qnx2Attrs>,
+}
+
+/// Raw QNX 2 attributes; the same fields as the `qnx2fs` crate's `Attributes`, which converts to and from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Qnx2Attrs {
+    /// Owner attributes (`rwaem` for files, `rcbm` for directories).
+    pub attr: u8,
+    pub group_perms: u8,
+    pub other_perms: u8,
+    pub member: u8,
+    pub group: u8,
+    /// The raw QNX 2 date word pair.
+    pub date: [u16; 2],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

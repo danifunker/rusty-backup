@@ -240,21 +240,6 @@ impl fmt::Display for FilesystemError {
 
 impl std::error::Error for FilesystemError {}
 
-// Lives here, not in the QNX driver, because Rust only allows it next to one of the two types.
-impl From<qnx2fs::Error> for FilesystemError {
-    fn from(e: qnx2fs::Error) -> Self {
-        match e {
-            qnx2fs::Error::Io(e) => FilesystemError::Io(e),
-            qnx2fs::Error::NotQnx2 => FilesystemError::Parse("not a QNX 2 volume".into()),
-            qnx2fs::Error::InvalidData(m) => FilesystemError::InvalidData(format!("qnx2: {m}")),
-            qnx2fs::Error::NotFound(m) => FilesystemError::NotFound(m),
-            qnx2fs::Error::AlreadyExists(m) => FilesystemError::AlreadyExists(m),
-            qnx2fs::Error::DiskFull(m) => FilesystemError::DiskFull(m),
-            qnx2fs::Error::Unsupported(m) => FilesystemError::Unsupported(format!("qnx2: {m}")),
-        }
-    }
-}
-
 impl From<std::io::Error> for FilesystemError {
     fn from(e: std::io::Error) -> Self {
         FilesystemError::Io(e)
@@ -351,7 +336,7 @@ pub struct CreateFileOptions {
     /// [`crate::fs::times::UnixTimes`].
     pub unix_times: Option<super::times::UnixTimes>,
     /// QNX 2 permissions, owner and date copied exactly (from `FileEntry::qnx2_attrs`); overrides mode / uid / gid / unix_times.
-    pub qnx2_attrs: Option<qnx2fs::Attributes>,
+    pub qnx2_attrs: Option<super::entry::Qnx2Attrs>,
 }
 
 /// Options for creating a directory on an editable filesystem.
@@ -373,7 +358,7 @@ pub struct CreateDirectoryOptions {
     /// [`CreateFileOptions::unix_times`] for the full rule.
     pub unix_times: Option<super::times::UnixTimes>,
     /// QNX 2 permissions, owner and date copied exactly (from `FileEntry::qnx2_attrs`); overrides mode / uid / gid / unix_times.
-    pub qnx2_attrs: Option<qnx2fs::Attributes>,
+    pub qnx2_attrs: Option<super::entry::Qnx2Attrs>,
 }
 
 /// Source for resource fork data (HFS/HFS+ only).
