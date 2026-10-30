@@ -1020,6 +1020,45 @@ duplicate definition unless `(undefined)` is filtered out first.
 Splitting also lifts the 32-bit `cc1` memory ceiling, so `-O1` is worth
 revisiting for the engine now that no unit is anywhere near 797 MB.
 
+### Scattered relocations and the 16 MiB ceiling
+
+The branch measurements above put the ceiling at ~32 MB. The real limit is
+**16 MiB of `__text` per object**, and going over it does not fail the link. It
+produces a binary that calls the wrong functions.
+
+A Mach-O *scattered* relocation stores the address it patches in 24 bits
+(`r_address`). On PowerPC the assembler uses scattered relocations for section
+differences such as jump tables (`PPC_RELOC_LOCAL_SECTDIFF`). In an object with
+more than 16 MiB of `__text`, the cctools `as` on Leopard writes a relocation
+for offset `0x01210678` as `0x00210678` without complaint. ld then applies it 16
+MiB too early, to whatever code is there.
+
+How it was found (2026-10-30). The crate-split engine had grown to 997 MB of C,
+which the default four units turned into four objects of 18.4-18.5 MiB each.
+`rb-cli fsck` on any HFS volume died with `Abort trap` and no panic message:
+
+- gdb on the G5 showed `check_hfs_integrity` calling an unrelated drop-glue
+  function, and the drop glue aborting on an invalid enum tag.
+- The call is an `-mlongcall` sequence (`lis` / `lwz` / `mtctr` / `bctrl`)
+  through a non-lazy pointer. In `u1.o` the pointer correctly names
+  `check_alternate_mdb`, but in the binary the `lwz` displacement still held its
+  unrelocated low half, so it read a neighbouring slot.
+- `otool -rv u1.o` lists two `LOCSDIF` entries at `0x00210678` and
+  `0x0021067c`. That is a jump table at `0x01210678`, inside a serde function
+  past the 16 MiB mark, and the same offsets as the `lwz` that went wrong.
+
+Checking every long call in all four units against the linked binary found 56
+wrong call targets, all of them at addresses where a wrapped relocation landed.
+Every HFS fsck reached one of them. Most other commands happened to miss them,
+which is why `inspect`, `ls` and backup still compared equal.
+
+The fix:
+
+- `ppc-cc-remote.py` picks the unit count from the source size: one unit per
+  128 MiB of C, at least four. That is roughly 10 MiB of `-O0` text per unit.
+- After compiling, it **refuses** any unit with 16 MiB or more of `__text`.
+- `PPC_SPLIT_UNITS` still overrides the count.
+
 ## Version stamping
 
 The release pipeline sets `RELEASE_VERSION` to `date -u +"%Y-%m-%d-%H-%M"` and

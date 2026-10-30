@@ -101,11 +101,12 @@ import os
 import re
 import sys
 
-# Each unit's __text has to stay well under the ~32 MB ceiling measured above.
-# The engine is 61.8 MB of __text for 797 MB of C, so a unit's share of the
-# source is a good enough proxy: four units put each at ~16 MB of text, half
-# the ceiling, and the number is only a default - `-n` overrides it.
-DEFAULT_UNITS = 4
+# Each unit's __text has to stay under 16 MiB, not the ~32 MB branch ceiling
+# measured above: past 16 MiB the 24-bit address in a scattered relocation wraps
+# and ld silently patches the wrong code (docs/build-ppc-mrustc.md, "Scattered
+# relocations and the 16 MiB ceiling"). ppc-cc-remote.py picks `-n` by source
+# size and refuses an oversized unit; this default is only for running by hand.
+DEFAULT_UNITS = 8
 
 # Words that are part of a type, not the name being declared.
 TAG_WORDS = frozenset((
