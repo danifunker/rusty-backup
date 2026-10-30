@@ -83,7 +83,7 @@ windows-legacy = []
 [dependencies]
 # --- Extracted MIT crates (docs/crate_split_plan.md) ---
 disk-core = { path = "../crates/disk-core" }
-fs-8bit = { path = "../crates/fs-8bit", default-features = false, features = ["oric"] }
+fs-8bit = { path = "../crates/fs-8bit" }
 # --- TUI (pinned to the last 1.73-buildable line) ---
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"], optional = true }
 

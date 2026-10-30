@@ -134,6 +134,10 @@ rusty-backup app  (depends on all of the above + libchdman-rs, opticaldiscs, qnx
 - **The vintage manifests (`rb-cli-vintage`, `rb-cli-ppc`, `rb-cli-sol9`)** keep their own lockfiles and vendor dirs and add the same path dependencies, forwarding `rust173-polyfill` to each crate. Adding a crate means one dependency line plus one feature-forward entry in each of the four manifests.
 - **mrustc (PPC, Sol9) must build every crate in order.** See §9a for what Step 0 could and could not prove.
 - **Testing the crates on 1.73 needs its own small manifest.** Cargo 1.73 cannot read the root workspace's lockfile (newer format), and cargo won't pass features to path crates from outside their workspace. Step 0 used a throwaway harness in `target/`: a package depending on each crate with `rust173-polyfill`, seeded with `rb-cli-vintage/Cargo.lock`. CI should get a checked-in equivalent (e.g. `crates-msrv/`, kept outside `crates/*`).
+  - **Limit found in slice 2a:** cargo refuses to test a non-member path crate that has dev-dependencies ("cannot be tested because it requires dev-dependencies and is not a member of the workspace"). Once `fs-8bit` gained `zstd` as a dev-dependency (for the OS-9 fixture), the harness could only run `disk-core`'s tests on 1.73. The vintage `rb-cli` check still compiles `fs-8bit`'s library on 1.73.
+  - Options for the CI job:
+    - keep the crates' tests free of dev-dependencies, e.g. a `disk-core` `testing` feature that unpacks fixtures and that the harness can enable
+    - or give the 1.73 job a workspace of its own that copies `crates/` in
 - The `.cargo/config.toml` 4-job cap stays. Smaller crates lower the peak memory of each `rustc` process.
 
 ## 6. Licensing
@@ -186,6 +190,8 @@ The crates already kept separately stay separate, because other projects share t
    - **Gate:** desktop, MiSTer, musl, vintage 1.73 (macOS / Win7), and mrustc PPC + Sol9 all build.
 1. **The interface part of `disk-core`.** Pulled into Step 0 because a filesystem crate can't exist without it. Old `crate::fs::…` paths are `pub use` shims, so the app doesn't change yet. The remaining interface-adjacent files (`attrs`, `name_legalize`, `raw_name`, `id_names`, `unix_common`, `import_sink`) follow as their dependencies allow.
 2. **The rest of `fs-8bit`, `fs-cpm`, `fs-apple2`, `fs-qnx`, `fs-xerox`.** Small and mechanical.
+   - **Slice 2a done (2026-10-30):** `fs-8bit` gained `cbm`, `atari_dos`, `dfs` (feature `acorn`), `trdos`, `rsdos` + `dragondos` (feature `coco`), `os9` (feature `os9`, implies `coco`), `ti99` and `andos`. That's about 12k lines with all 110 crate tests passing; `os9`'s fixture test now reads `tests/fixtures` via `CARGO_MANIFEST_DIR` through a `zstd` dev-dependency.
+   - **Held back:** `adfs` and `qdos` / `qdos_mdv` (license audit, §6) and `lif`. `lif`'s replace test needs both its private fields and the app's `fs::replace`; split the test, or give `lif` a small test-support accessor, before moving it.
 3. **`fs-amiga`, `fs-unix`, `fs-xfs`, `fs-squashfs`, `fs-pc`, `fs-mac`, `fs-apfs`.** The big ones. The license-audit items get their handling here.
 4. **`part-tables`** (C5).
 5. **`dsk-*` and `dsk-clonezilla`** (C6, C7, C11). The upstream moves to libchdman-rs and opticaldiscs happen here.
@@ -208,7 +214,8 @@ Files move with `git mv` so history follows them. Steps 2–6 parallelize across
 | `cargo clippy -D warnings` on the new crates (and on `disk-core` with `fs` off) | Pass |
 | Rust 1.73 `cargo check` of `rb-cli-vintage` (rb-cli, vintage features) | Pass; no warnings from the new crates |
 | Rust 1.73 tests of `disk-core` + `fs-8bit` (polyfill on) | Pass: 19 + 7 |
-| mrustc `scripts/build-ppc.sh hostc` on an Apple-silicon host | **Blocked, not by the split.** First the stale PPC vendor dir lacked `qnx2fs` (fixed by re-vendoring). Then the vendored `constant_time_eq` (via `zip`) fails: "Unknown architecture for asm!", because mrustc has no arm64 inline-asm support. No full-engine transpile exists in this machine's mrustc output dirs, so this predates the split. **Still to prove:** the real PPC stages (needs the G5 via `PPC_HOST`) or the Sol9 CI job. |
+| mrustc `scripts/build-ppc.sh hostc` on an Apple-silicon host | **Blocked, not by the split.** First the stale PPC vendor dir lacked `qnx2fs` (fixed by re-vendoring). Then the vendored `constant_time_eq` (via `zip`) fails: "Unknown architecture for asm!", because mrustc has no arm64 inline-asm support. No full-engine transpile exists in this machine's mrustc output dirs, so this predates the split. Transpile on x86_64 instead (next row). |
+| **mrustc PowerPC build** (`scripts/build-ppc.sh ppc`, m900 x86_64 transpile with `~/repos/mrustc` branch `ppc-build-2026-09`, C compiled on the real dual-G5, Leopard 10.5.8, gcc 10.5) | **Pass (2026-10-30).** Linked `rb-cli` (Mach-O `ppc_750`) with `disk_core` + `fs_8bit` as path crates. On the G5 it ran `new floppy oric` → `put` → `ls` → `fsck` (clean). Needs `RB_DIR` pointed at the checkout being tested (the script defaults to `~/repos/rusty-backup`). |
 | MiSTer / musl / Win7 builds | Not run locally; covered by CI |
 
 **Design changes the move forced:**
@@ -227,7 +234,7 @@ Files move with `git mv` so history follows them. Steps 2–6 parallelize across
 **MEDIUM.** The coupling is low, and the existing tests travel with the code.
 
 The real risks:
-- mrustc building ~23 path dependencies (Step 0 gate still open; see §9a)
+- mrustc building ~23 path dependencies (Step 0 proved it for two path crates on PowerPC; Sol9 still comes from CI; see §9a)
 - the `rbformats` split (C6, C7)
 - the license audit
 

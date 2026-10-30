@@ -2324,6 +2324,7 @@ name = "fs-8bit"
 version = "0.1.0"
 dependencies = [
  "disk-core",
+ "zstd 0.13.3",
 ]
 
 [[package]]

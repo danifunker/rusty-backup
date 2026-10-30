@@ -192,7 +192,7 @@ tui-update = ["dep:reqwest"]
 [dependencies]
 # Reusable MIT crates extracted from this tree (docs/crate_split_plan.md).
 disk-core = { path = "crates/disk-core" }
-fs-8bit = { path = "crates/fs-8bit", default-features = false, features = ["oric"] }
+fs-8bit = { path = "crates/fs-8bit" }
 # Full-screen TUI (`tui` feature). ratatui renders through crossterm, which is
 # already a non-optional dependency below, so this adds no new C/native code.
 ratatui = { version = "0.30", optional = true }
