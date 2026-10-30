@@ -215,10 +215,10 @@ The crates already kept separately stay separate, because other projects share t
        - It is an adapter from the external `qnx2fs` engine to the `disk-core` traits, not reusable format code, so it fails the rule below.
        - It can't fold into `qnx2fs` either while `disk-core` itself depends on `qnx2fs` (`FileEntry::qnx2_attrs`): that would be a dependency cycle.
        - **Decoupled (2026-10-30):** `disk-core` no longer depends on `qnx2fs`. `FileEntry::qnx2_attrs` and the create options carry `disk_core::entry::Qnx2Attrs` (the same six fields). The app's `fs/qnx2.rs` converts with `to_core` / `to_qnx2` and maps errors with `qnx_err`, since the orphan rule forbids `From` there.
-       - **Next:**
-         1. Publish `disk-core` (a pre-release) so `qnx2fs` can depend on it.
-         2. Fold the adapter into `qnx2fs` behind an optional `disk-core` feature. `From<qnx2fs::Error> for FilesystemError` then lives in `qnx2fs`, which owns the error type.
-         3. The app takes `qnx2fs` with that feature, plus `[patch.crates-io] disk-core = { path = … }` in all four manifests so there's one `disk-core`.
+       - **Folded into `qnx2fs` 0.3.1 (2026-10-30):**
+         1. `disk-core` 0.1.0 is on crates.io, published by `.github/workflows/publish-crates.yml` from the tag `disk-core-v0.1.0`.
+         2. The adapter is `qnx2fs::adapter`, behind the optional `disk-core` feature; the default `qnx2fs` build stays dependency-free. `From<qnx2fs::Error> for FilesystemError` and the `Attributes` <-> `Qnx2Attrs` conversions live there.
+         3. The app takes `qnx2fs` with that feature, plus `[patch.crates-io] disk-core = { path = … }` in all four manifests so there's one `disk-core`. `src/fs/qnx2.rs` is now a re-export, keeping only the end-to-end `fs::copy` test, which needs the app.
 
    **Rule (2026-10-30): a crate must contain reusable format code.** A module that only adapts an external engine crate to the `disk-core` traits stays in the app, as `qnx2` over `qnx2fs` and `optical_fs` over `opticaldiscs` do. Crates are for code that implements a format.
    - **Held back:** `adfs` and `qdos` / `qdos_mdv` (license audit, §6) and `lif`. `lif`'s replace test needs both its private fields and the app's `fs::replace`; split the test, or give `lif` a small test-support accessor, before moving it.
@@ -251,7 +251,7 @@ Files move with `git mv` so history follows them. Steps 2–6 parallelize across
 **Design changes the move forced:**
 - **Journal hook:** `Filesystem::read_journal` was removed from the trait; nothing called it through `dyn`. `journal_detail` now returns `Box<dyn Any + Send>`, which the GUI journal viewer downcasts to HFS+'s `JournalDetail`. This keeps HFS+ journal types and the APSL-flagged checksum out of the MIT base crate.
 - **ProDOS type names:** `FileEntry::type_code_display()` became the app-side `FileEntryTypeDisplay` trait (`src/fs/entry.rs`), because ProDOS type names come from a user-overridable config file. `display_file_type` stays in the app too. Nine call sites import the trait.
-- **QNX 2:** `disk-core` (with `fs`) depends on `qnx2fs`, because `FileEntry` and the create options carry `qnx2fs::Attributes`. The orphan rule moved `From<qnx2fs::Error> for FilesystemError` into `disk-core`. Generalizing per-filesystem attribute fields is future work.
+- **QNX 2:** superseded. `disk-core` carries its own `Qnx2Attrs`, and `qnx2fs` (feature `disk-core`) depends on `disk-core`, not the other way round. Generalizing per-filesystem attribute fields is future work.
 - **Display helpers:** `format_size`, `decode_ostype` and `unix_mode_string` moved to `disk_core::display`; the old paths re-export them.
 - **Clippy:** declaring `rust-version = "1.73"` makes `incompatible_msrv` fire on the polyfilled `is_multiple_of` calls (false positives), so `disk-core` allows that lint at crate level. The real floor check is the 1.73 build.
 

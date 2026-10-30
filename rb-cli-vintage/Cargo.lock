@@ -684,7 +684,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1355,9 +1355,14 @@ dependencies = [
 
 [[package]]
 name = "qnx2fs"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "198f9fbd532b1eb9e87c18dbd855facbdb1db627ff36ee5afbc6601e5d9df02c"
+checksum = "3785c70daacfcae9705a2fdcd308887a61ef9535ba20ec9d573c11b7026cce91"
+dependencies = [
+ "chrono",
+ "disk-core",
+ "log",
+]
 
 [[package]]
 name = "quote"
@@ -1560,7 +1565,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

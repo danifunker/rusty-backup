@@ -113,7 +113,7 @@ sha1 = "0.10"
 crc32c = "0.6"
 crc32fast = "1"
 # QNX 2 (Unisys ICON) reader, writer and checker, shared with icon-emu; MIT.
-qnx2fs = "0.3"
+qnx2fs = { version = "0.3.1", features = ["disk-core"] }
 chrono = "0.4"
 tempfile = ">=3, <3.13"
 # image: GUI-only (gui/mod.rs, main.rs) — not compiled in the vintage rb-cli build.
@@ -187,3 +187,7 @@ windows = { version = "0.58", features = [
 [build-dependencies]
 # Only used under cfg(windows) in build.rs; harmless (and ancient) elsewhere.
 winres = "0.1"
+
+# qnx2fs's adapter depends on disk-core from crates.io; this makes it the same copy as ours.
+[patch.crates-io]
+disk-core = { path = "../crates/disk-core" }
