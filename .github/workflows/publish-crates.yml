@@ -1,0 +1,86 @@
+# Publishes one crate from crates/ to crates.io.
+# Push a tag `<crate>-v<version>` (e.g. disk-core-v0.1.0-alpha.1) to publish;
+# the version must match that crate's Cargo.toml. Manual runs default to a dry run.
+# Needs the CARGO_REGISTRY_TOKEN repository secret (crates.io token, publish-update scope).
+name: Publish crates
+
+on:
+  push:
+    tags:
+      - "disk-core-v*"
+      - "fs-8bit-v*"
+      - "fs-apple2-v*"
+      - "fs-cpm-v*"
+      - "fs-qnx-v*"
+  workflow_dispatch:
+    inputs:
+      crate:
+        description: Crate to publish
+        required: true
+        type: choice
+        options:
+          - disk-core
+          - fs-8bit
+          - fs-apple2
+          - fs-cpm
+          - fs-qnx
+      dry_run:
+        description: Package and verify only, do not upload
+        required: true
+        type: boolean
+        default: true
+
+concurrency:
+  group: publish-crates
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    environment: crates-io
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Resolve crate and mode
+        id: target
+        shell: bash
+        env:
+          INPUT_CRATE: ${{ inputs.crate }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            crate="${GITHUB_REF_NAME%-v*}"
+            version="${GITHUB_REF_NAME##*-v}"
+            manifest_version="$(cargo metadata --no-deps --format-version 1 \
+              | jq -r --arg n "$crate" '.packages[] | select(.name == $n) | .version')"
+            if [ "$manifest_version" != "$version" ]; then
+              echo "::error::tag says $crate $version but Cargo.toml says '$manifest_version'"
+              exit 1
+            fi
+            dry_run=false
+          else
+            crate="$INPUT_CRATE"
+            dry_run="$INPUT_DRY_RUN"
+          fi
+          echo "crate=$crate" >> "$GITHUB_OUTPUT"
+          echo "dry_run=$dry_run" >> "$GITHUB_OUTPUT"
+          echo "Publishing $crate (dry run: $dry_run)"
+
+      - name: cargo publish
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CRATE: ${{ steps.target.outputs.crate }}
+          DRY_RUN: ${{ steps.target.outputs.dry_run }}
+        run: |
+          set -euo pipefail
+          if [ "$DRY_RUN" = "true" ]; then
+            cargo publish -p "$CRATE" --dry-run
+          else
+            cargo publish -p "$CRATE"
+          fi
