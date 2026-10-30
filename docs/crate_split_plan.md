@@ -148,7 +148,17 @@ rusty-backup app  (depends on all of the above + libchdman-rs, opticaldiscs, qnx
     - **Consent confirmed 2026-10-30.** Dani asked on Discord whether he was OK converting that AGPL-3.0 code into MIT crates, and Alan (`alanswx`) replied "Any license is fine."
     - **These two crates are not published until Dani says so.**
   - The other two contributors' commits don't touch crate code: Scott's is the `ppc-tiger` port, and the Jules bot's is a Windows build fix.
-- **Audit before publishing.** These files say they were ported or copied from other sources. This is not legal advice; each needs a proper look:
+- **Audit done 2026-10-30: see [license_audit.md](license_audit.md)**, which supersedes the table below. It found more than this first list:
+  - XADMaster-derived Mac archive codecs (LGPL-2.1+)
+  - Linux-derived tables and code in `hfs_unicode`, `adfs` and `hpfs` editing, plus the XFS `dir_hashname`
+  - an hfsutils table in `hfs_common`
+  - pfs3aio's 4-clause BSD licence
+  - unlicensed SFS sources
+  - NTFS blobs reproduced from mkntfs output
+  - a missing MIT notice for nyarime/gho
+
+  It lists decisions D1–D4.
+- **Original audit list** (kept for history). These files say they were ported or copied from other sources. This is not legal advice; each needs a proper look:
 
 | Crate | File(s) | What the comments say | Proposed handling |
 |---|---|---|---|
