@@ -7,8 +7,8 @@ Branch: **`native-frontends`**. On m900 it is checked out as a worktree at `~/re
 ## Paste this into the new session on m900
 
 > Read `docs/RESUME-native-frontends-and-g5-vm.md` in `~/repos/rusty-backup-native-frontends` and continue from "Where things stand". First run `ssh-add ~/.ssh/id_rsa`; I'll type the passphrase, because the G5 and GitHub need the key. Then:
-> (1) confirm the PowerPC build gate finished, or re-run it;
-> (2) boot `g5-leopard-boot.img` in the emulated G5 and check that ssh and gcc 10 work;
+> (1) the PowerPC build gate already passed: record it in `crate_split_plan.md` §9a, then run `scripts/ppc-smoke.sh` against the real G5;
+> (2) the emulated G5 should already be running `g5-leopard-boot.img`: check that ssh on `127.0.0.1:2222` and gcc 10 work inside;
 > (3) start slimming the Leopard disk for GitHub runners as described in the doc.
 
 ## The plans this work serves
@@ -19,18 +19,18 @@ Branch: **`native-frontends`**. On m900 it is checked out as a worktree at `~/re
 
 ## Where things stand
 
-### 1. Step 0 crate split: done, except the PowerPC link
+### 1. Step 0 crate split: done, including the PowerPC gate
 
 - `crates/disk-core` + `crates/fs-8bit` (Oric). Passing: modern build and tests (3,755), clippy on the new crates, the Rust 1.73 vintage check, and the crate tests on 1.73.
-- **mrustc PowerPC gate:** `disk-core` and `fs-8bit` were transpiled by mrustc on m900 and their C compiled on the real G5 ("Completed disk-core (codegen)", "Completed fs-8bit (codegen)"). At handoff the run was at 391 of 394 jobs, code-generating the final `rb-cli`.
-- **Check whether it linked:** `ls -la ~/repos/mrustc/output-rb-ppc-g3/rb-cli`, built after 2026-10-30 ~14:00.
-- **If it didn't finish** (the run was driven over ssh from the Mac, so it dies with that session), re-run it on m900:
+- **mrustc PowerPC gate: PASS (2026-10-30 14:53).** m900 transpiled the whole engine, including `disk-core` and `fs-8bit`. The real G5 compiled the C and linked `~/repos/mrustc/output-rb-ppc-g3/rb-cli` (119 MB, Mach-O `ppc_750`, `--extern disk_core` / `fs_8bit`).
+  - On the real G5 (Leopard 10.5.8), that binary ran `new floppy oric` → `put HELLO.TXT` → `ls` → `fsck` (clean) as `/tmp/rb-cli-step0`. The extracted crates work on PowerPC.
+- **To re-run:**
   ```bash
   W=~/repos/rusty-backup-native-frontends
   cd $W && RB_DIR=$W MRUSTC_DIR=~/repos/mrustc PPC_HOST=g5 scripts/build-ppc.sh ppc
   ```
   **`RB_DIR` is mandatory.** `build-ppc.sh` defaults it to `~/repos/rusty-backup`, which is the `qnx2fs-crate` checkout, and builds the wrong tree without complaint. The vendor step was already run for the worktree.
-- Next: compare outputs with the desktop build via `scripts/ppc-smoke.sh` (on the real G5 now, and on the emulated G5 later).
+- Next: compare outputs with the desktop build via `scripts/ppc-smoke.sh` (on the real G5 now, and on the emulated G5 later). Record the gate result in `crate_split_plan.md` §9a, which still lists mrustc as "to prove".
 - Still open from Step 0:
   - Solaris 9 CI result (pushed; check the Actions run for `1a22fed`).
   - A checked-in `crates-msrv/` manifest for 1.73 crate tests in CI (crate_split_plan §5).
@@ -63,22 +63,25 @@ Branch: **`native-frontends`**. On m900 it is checked out as a worktree at `~/re
 |---|---|
 | `backup/` | the rusty-backup set copied from NAS `Software/VintageSystemBackups/G5-Leopard-Gcc10/256GB-disk4-2026-08-03-1520` (the seekable cache was skipped) |
 | `g5-leopard.img` | full 256 GB restore (sparse). APM slots: 2 HFS "untitled" (bootstrap), **3 Tiger 10.4.12**, 4 Linux, **5 Leopard 10.5.8 + gcc 10**, 6 swap |
-| `g5-leopard-boot.img` | **the one to boot.** 87 GB sparse, `parted` APM, one `Apple_HFS "Leopard"` at sector 2048 (slot 2, OF `hd:2`), with the Leopard volume copied in byte-for-byte. At handoff the `dd` copy was ~43 GB in, driven over ssh from the Mac. If it didn't finish, re-run the command below. |
+| `g5-leopard-boot.img` | **the one to boot.** 87 GB sparse (56 GB on disk), `parted` APM, one `Apple_HFS "Leopard"` at sector 2048 (slot 2, OF `hd:2`), with the Leopard volume copied in byte-for-byte. The copy completed and `rb-cli` reads it fine. **It boots:** BootX loads and reaches the grey Apple screen in ~78 s. |
+| `g5-leopard-boot-overlay.qcow2` | copy-on-write overlay the VM writes to. `run-g5.sh` already points at it with `hd:2,\\:tbxi` |
 | `qemu-g5/` | qemu-g5-appimage v1.0.0 (SHA-256 verified), unpacked with `--appimage-extract` (no `libfuse2` on m900). Patched QEMU **11.1.50** (`70668cf600`): multi-CPU on mac99, `ati-r350`; G5 OpenBIOS at `squashfs-root/share/qemu/openbios-qemu.elf` |
 | `run-g5.sh` | headless launcher: guest sshd at `127.0.0.1:2222`, VNC `:5`, `monitor.sock`, `serial.log`. `G5_SMP` / `G5_MEM` env overrides |
 | `vmcmd.py` | send one monitor command, e.g. `./vmcmd.py monitor.sock screendump shot.png -f png`, `... quit` |
 
-Re-run the Leopard copy if needed:
+**At handoff the VM was running** (started detached with `setsid`, 4 CPUs, 3 GB), booting Leopard from `g5-leopard-boot.img`. It had not yet been confirmed to reach ssh on `127.0.0.1:2222`. Check:
+- `pgrep -af '[q]emu-g5'`
+- `./vmcmd.py monitor.sock screendump shot.png -f png`
+- `ssh -p 2222 admin@127.0.0.1` (needs the legacy-RSA options)
+
+How the boot image was made, for reference or to redo:
 ```bash
 D=/run/media/dani/BigDisk/rb-vms/g5-leopard
 dd if=$D/g5-leopard.img of=$D/g5-leopard-boot.img bs=4M iflag=skip_bytes,count_bytes oflag=seek_bytes \
   skip=$((167230416*512)) seek=1048576 count=85353504768 conv=notrunc,sparse status=progress
 ```
 
-**Before booting, update `run-g5.sh`:**
-- disk `g5-leopard-boot.img`, behind a fresh overlay: `qemu-img create -f qcow2 -b g5-leopard-boot.img -F raw g5-leopard-boot-overlay.qcow2`
-- `-prom-env "boot-device=hd:2,\\:tbxi"`, or `hd:2,\System\Library\CoreServices\BootX`
-- then `setsid nohup ./run-g5.sh > qemu.log 2>&1 &`
+`run-g5.sh` is already set up for `g5-leopard-boot-overlay.qcow2` and `hd:2`. Start it with `setsid nohup ./run-g5.sh > qemu.log 2>&1 &`. Stop it with `./vmcmd.py monitor.sock quit`; for a cleaner shutdown, run `sudo shutdown -h now` inside the guest first.
 
 **Hard-won findings:**
 - **`-device ati-radeon9800` hangs OpenBIOS** before display init on m900, with any CPU or memory setting. **Use `-vga std`**: the firmware reaches `0 >`, and Leopard has `qemu_vga.ndrv`.
