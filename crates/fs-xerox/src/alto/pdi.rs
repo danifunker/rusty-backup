@@ -13,8 +13,8 @@
 //! per-sector hardware header is derivable from the record position and is not
 //! stored.
 
-use super::super::filesystem::FilesystemError;
 use super::{be16, put_be16, Disk, FsFamily, Geometry, Sector};
+use disk_core::filesystem::FilesystemError;
 
 pub const MAGIC: &[u8; 8] = b"PARCDISK";
 pub const HEADER_SIZE: usize = 512;

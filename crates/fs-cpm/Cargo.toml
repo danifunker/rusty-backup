@@ -1,0 +1,19 @@
+[package]
+name = "fs-cpm"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.73"
+license = "MIT"
+authors = ["Dani Sarfati <dani@funkervogt.com>"]
+description = "Read and edit CP/M 2.2 / 3.0 disk filesystems, with a catalog of machine disk definitions"
+repository = "https://github.com/danifunker/rusty-backup"
+readme = "README.md"
+keywords = ["filesystem", "cpm", "retro", "emulator", "disk-image"]
+categories = ["filesystem", "emulators"]
+
+[features]
+# Only for a Rust 1.73 toolchain; see disk-core.
+rust173-polyfill = ["disk-core/rust173-polyfill"]
+
+[dependencies]
+disk-core = { path = "../disk-core", version = "0.1", features = ["fs"] }

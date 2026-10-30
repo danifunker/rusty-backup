@@ -24,12 +24,12 @@
 //! `PilotDiskDefs.mc`, and the Othello `PhysicalVolumeScavenger` (placement).
 
 #[cfg(feature = "rust173-polyfill")]
-use crate::rust173_compat::IntIsMultipleOf as _;
+use disk_core::rust173::IntIsMultipleOf as _;
 use std::collections::HashMap;
 
-use super::super::entry::FileEntry;
-use super::super::filesystem::{Filesystem, FilesystemError};
 use super::{be16, put_be16, Disk, FsFamily, Geometry, Sector};
+use disk_core::entry::FileEntry;
+use disk_core::filesystem::{Filesystem, FilesystemError};
 
 /// Data words per page (256 = 512 bytes).
 pub const PAGE_WORDS: usize = 256;
@@ -2300,7 +2300,7 @@ mod tests {
 
     #[test]
     fn add_file_enumerates_and_reads_back() {
-        use crate::fs::filesystem::Filesystem;
+        use disk_core::filesystem::Filesystem;
 
         let geo = pilot_geometry(128);
         let blank = create_blank(geo, Generation::CedarNucleus, "Files").expect("create");
@@ -2353,7 +2353,7 @@ mod tests {
 
     #[test]
     fn delete_frees_pages_and_multi_run_reallocates() {
-        use crate::fs::filesystem::Filesystem;
+        use disk_core::filesystem::Filesystem;
 
         let geo = pilot_geometry(128);
         let blank = create_blank(geo, Generation::CedarNucleus, "Frag").expect("create");
@@ -2666,7 +2666,7 @@ mod tests {
     #[test]
     fn client_directory_names_files_through_full_stack() {
         use super::super::pdi;
-        use crate::fs::filesystem::Filesystem;
+        use disk_core::filesystem::Filesystem;
 
         // FSFileOpsImpl reserves a 128-page client directory/cache file.
         let geo = pilot_geometry(512);

@@ -1717,6 +1717,7 @@ dependencies = [
 name = "disk-core"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "chrono",
  "qnx2fs",
  "serde",
@@ -2325,6 +2326,37 @@ version = "0.1.0"
 dependencies = [
  "disk-core",
  "zstd 0.13.3",
+]
+
+[[package]]
+name = "fs-apple2"
+version = "0.1.0"
+dependencies = [
+ "disk-core",
+]
+
+[[package]]
+name = "fs-cpm"
+version = "0.1.0"
+dependencies = [
+ "disk-core",
+]
+
+[[package]]
+name = "fs-qnx"
+version = "0.1.0"
+dependencies = [
+ "disk-core",
+]
+
+[[package]]
+name = "fs-xerox"
+version = "0.1.0"
+dependencies = [
+ "disk-core",
+ "flate2",
+ "log",
+ "tempfile",
 ]
 
 [[package]]
@@ -5706,6 +5738,10 @@ dependencies = [
  "filetime",
  "flate2",
  "fs-8bit",
+ "fs-apple2",
+ "fs-cpm",
+ "fs-qnx",
+ "fs-xerox",
  "globset",
  "image",
  "libc",

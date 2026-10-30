@@ -4,6 +4,7 @@
 //! - [`io_other`] / [`repeat_n`]: std shims that build on both current Rust and
 //!   Rust 1.73 (the last toolchain whose std targets macOS 10.7).
 //! - [`display`]: small neutral formatters (sizes, Mac `OSType`, Unix modes).
+//! - [`bits`]: big-endian allocation-bitmap helpers (HFS, HFS+, ProDOS).
 //! - `rust173` (feature `rust173-polyfill` only): extension traits standing in
 //!   for std methods missing on 1.73. Never enable it on a modern toolchain.
 //!
@@ -15,6 +16,7 @@
 //! - [`fsck`]: integrity-check results shared by every checker.
 //! - [`times`]: Unix timestamps and the calendar conversions filesystems need.
 //! - [`xattr`]: extended-attribute names and values.
+//! - [`unix_common`]: inode, bitmap, compaction and validation helpers shared by Unix-style filesystems.
 //!
 //! Partition and disk-image crates depend on this with `default-features = false`
 //! and so build without the filesystem types and their dependencies.
@@ -22,6 +24,7 @@
 // `is_multiple_of` & co. come from the rust173 polyfill on 1.73; the real floor check is a 1.73 build.
 #![allow(clippy::incompatible_msrv)]
 
+pub mod bits;
 pub mod display;
 #[cfg(feature = "rust173-polyfill")]
 pub mod rust173;
@@ -34,6 +37,8 @@ pub mod filesystem;
 pub mod fsck;
 #[cfg(feature = "fs")]
 pub mod times;
+#[cfg(feature = "fs")]
+pub mod unix_common;
 #[cfg(feature = "fs")]
 pub mod xattr;
 

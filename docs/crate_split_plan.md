@@ -72,7 +72,7 @@ All names were checked against crates.io on 2026-10-30 and are free. `fs-core` w
 | `arc-mac` (MIT) | StuffIt container parser and writers, MAR, BinHex, MacBinary, archive detection and extraction. Depends on `fs-mac` for HFS metadata types, and on `arc-mac-codecs`. |
 | `arc-mac-codecs` (**LGPL-2.1-or-later**) | The StuffIt / Compact Pro decompressors ported from XADMaster: Arsenic, Compact Pro, StuffIt 5, LZW decode, method 13, LZAH, Huffman. Licence decision D1 in [license_audit.md](license_audit.md). |
 
-**Rule for moves (2026-10-30): minimal changes only.** Crates receive code as-is: `git mv`, path fixes to compile, notices, and comment corrections. Rewrites, including licence-driven ones (D2: `hfs_unicode` tables, `HFS_CHARORDER`, the `adfs` map walk, `hpfs` dnode editing, XFS `dir_hashname`), are separate follow-ups. Until a module's licence issue is resolved, it **stays in the app** rather than moving into an MIT crate.
+**Rule for moves (2026-10-30): minimal changes only.** Crates receive code as-is: `git mv`, path fixes to compile, notices, and comment corrections. Rewrites, including licence-driven ones (D2: `hfs_unicode` tables, `HFS_CHARORDER`, the `adfs` map walk, `hpfs` dnode editing, XFS `dir_hashname`), are separate follow-ups. **The licence follows the code:** a derived module still moves, into a crate or sub-crate under the upstream licence (`adfs`, `hpfs`, `hfs_unicode` → GPL-2.0-only; `fs-xfs` GPL-2.0; `fs-amiga` `MIT AND BSD-4-Clause` for pfs3aio). Clean code stays MIT. Details in [license_audit.md](license_audit.md) D2–D4.
 
 ### What stays in the app (AGPL-3.0)
 
@@ -204,6 +204,11 @@ The crates already kept separately stay separate, because other projects share t
 1. **The interface part of `disk-core`.** Pulled into Step 0 because a filesystem crate can't exist without it. Old `crate::fs::…` paths are `pub use` shims, so the app doesn't change yet. The remaining interface-adjacent files (`attrs`, `name_legalize`, `raw_name`, `id_names`, `unix_common`, `import_sink`) follow as their dependencies allow.
 2. **The rest of `fs-8bit`, `fs-cpm`, `fs-apple2`, `fs-qnx`, `fs-xerox`.** Small and mechanical.
    - **Slice 2a done (2026-10-30):** `fs-8bit` gained `cbm`, `atari_dos`, `dfs` (feature `acorn`), `trdos`, `rsdos` + `dragondos` (feature `coco`), `os9` (feature `os9`, implies `coco`), `ti99` and `andos`. That's about 12k lines with all 110 crate tests passing; `os9`'s fixture test now reads `tests/fixtures` via `CARGO_MANIFEST_DIR` through a `zstd` dev-dependency.
+   - **Slice 2b done (2026-10-30):** new crates `fs-cpm` (`cpm`, `cpm_diskdefs`), `fs-apple2` (`ucsd`), `fs-qnx` (`qnx4`, `qnx6`) and `fs-xerox` (the whole `alto/` tree, MIT, co-copyright Alan Steremberg, `publish = false` until release timing is agreed). `disk-core` gained `bits` (big-endian bitmap helpers, moved out of `hfs_common`, which now re-exports them) and `unix_common` (moved as-is; needs `anyhow` under `fs`).
+   - **Held back from 2b, minimal-changes rule:**
+     - `apple_dos` needs `rbformats::containers::sector_order`; it moves with the `dsk-*` crates.
+     - `prodos` calls the app's user-overridable `prodos_types` table from non-test code.
+     - `qnx2`'s copy test needs the app's `fs::copy` plus private fixture constants; untangle it like `lif`.
    - **Held back:** `adfs` and `qdos` / `qdos_mdv` (license audit, §6) and `lif`. `lif`'s replace test needs both its private fields and the app's `fs::replace`; split the test, or give `lif` a small test-support accessor, before moving it.
 3. **`fs-amiga`, `fs-unix`, `fs-xfs`, `fs-squashfs`, `fs-pc`, `fs-mac`, `fs-apfs`.** The big ones. The license-audit items get their handling here.
 4. **`part-tables`** (C5).

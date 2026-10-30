@@ -16,9 +16,9 @@
 //! and `AltoFileSys.d` / `BFS.d` (structures). Empirically cross-checked
 //! against every CopyDisk pack in the CHM Xerox PARC archive.
 
-use super::super::filesystem::FilesystemError;
 use super::bfs::{parse_dir_entries, Bfs, SYSDIR_LEADER_VDA};
 use super::{be16, put_be16, Disk, Geometry, LabelCodec, Sector};
+use disk_core::filesystem::FilesystemError;
 
 const EOF_DA: u16 = 0xffff;
 const DIR_BIT: u16 = 0x8000; // SN.word1 directory flag
@@ -654,9 +654,9 @@ fn normalize_name(name: &str) -> Result<String, FilesystemError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs::alto::bfs::BfsFilesystem;
-    use crate::fs::alto::{pdi, FsFamily};
-    use crate::fs::filesystem::Filesystem;
+    use crate::alto::bfs::BfsFilesystem;
+    use crate::alto::{pdi, FsFamily};
+    use disk_core::filesystem::Filesystem;
 
     fn diablo31() -> Geometry {
         Geometry {
@@ -836,7 +836,7 @@ mod tests {
 
     #[test]
     fn trident_pack_container_round_trip_with_files() {
-        use crate::fs::alto::trident;
+        use crate::alto::trident;
         // Build a real T-80 volume with a file, serialize to the Trident pack
         // container, read it back, and confirm the file survives.
         let blank = create_blank(trident::geometry(80)).unwrap();

@@ -37,8 +37,8 @@
 //! header, whereas Salto's first word is the page number — so a Salto read is
 //! tried first and this is the fallback.
 
-use super::super::filesystem::FilesystemError;
 use super::{Disk, FsFamily, Geometry, Sector};
+use disk_core::filesystem::FilesystemError;
 
 const N_SECTORS: u16 = 9;
 const HEADER_WORDS: usize = 2;
@@ -248,7 +248,7 @@ pub fn read_diablo(bytes: &[u8]) -> Result<Disk, FilesystemError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs::alto::{put_be16, LabelCodec};
+    use crate::alto::{put_be16, LabelCodec};
 
     #[test]
     fn label_codec_trident_round_trips() {
@@ -278,8 +278,8 @@ mod tests {
 
     #[test]
     fn diablo_pack_reads_back_a_blank_volume() {
-        use crate::fs::alto::bfs::Bfs;
-        use crate::fs::alto::write;
+        use crate::alto::bfs::Bfs;
+        use crate::alto::write;
         // Format a blank Diablo-31 volume, serialize it into the ContrAlto Diablo
         // pack framing (dummy + DA header + label + data, little-endian, placed by
         // disk address), and confirm read_diablo reconstructs a walkable BFS.

@@ -23,8 +23,8 @@
 //! `CopyDiskBfs.decl` in the PARC archive. Diablo packs (`diskType = 10`) are
 //! supported; the Trident page shape differs and is not yet handled.
 
-use super::super::filesystem::FilesystemError;
 use super::{be16, Disk, FsFamily, Geometry, Sector};
+use disk_core::filesystem::FilesystemError;
 
 const BLOCK_PARAMS: u16 = 3; // hereAreDiskParams
 const BLOCK_PAGE: u16 = 6; // hereIsDiskPage

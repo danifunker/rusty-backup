@@ -3,7 +3,7 @@
 //! Provides inode mode parsing, file type detection, timestamp formatting,
 //! and FileEntry construction from raw inode fields.
 
-use crate::fs::entry::{EntryType, FileEntry};
+use crate::entry::{EntryType, FileEntry};
 
 // ---- Unix mode bit masks ----
 
@@ -44,7 +44,7 @@ pub fn unix_file_type(mode: u32) -> UnixFileType {
 }
 
 /// Render raw Unix mode bits as a 10-character permission string (e.g. `drwxr-xr-x`).
-pub use disk_core::display::unix_mode_string;
+pub use crate::display::unix_mode_string;
 
 /// Build a `FileEntry` from raw Unix inode fields.
 ///
@@ -128,18 +128,16 @@ pub fn check_id_width(
     value: u32,
     bits: u32,
     what: &str,
-) -> Result<u32, crate::fs::filesystem::FilesystemError> {
+) -> Result<u32, crate::filesystem::FilesystemError> {
     let max = if bits >= 32 {
         u32::MAX
     } else {
         (1u32 << bits) - 1
     };
     if value > max {
-        return Err(crate::fs::filesystem::FilesystemError::InvalidData(
-            format!(
-                "{what} {value} does not fit this filesystem's {bits}-bit {what} field (max {max})"
-            ),
-        ));
+        return Err(crate::filesystem::FilesystemError::InvalidData(format!(
+            "{what} {value} does not fit this filesystem's {bits}-bit {what} field (max {max})"
+        )));
     }
     Ok(value)
 }

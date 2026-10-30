@@ -1,0 +1,22 @@
+[package]
+name = "fs-qnx"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.73"
+license = "MIT"
+authors = ["Dani Sarfati <dani@funkervogt.com>"]
+description = "Read QNX 4 and QNX 6 (Power-Safe) filesystems"
+repository = "https://github.com/danifunker/rusty-backup"
+readme = "README.md"
+keywords = ["filesystem", "qnx", "retro", "disk-image"]
+categories = ["filesystem"]
+
+[features]
+default = ["qnx4", "qnx6"]
+qnx4 = []
+qnx6 = []
+# Only for a Rust 1.73 toolchain; see disk-core.
+rust173-polyfill = ["disk-core/rust173-polyfill"]
+
+[dependencies]
+disk-core = { path = "../disk-core", version = "0.1", features = ["fs"] }

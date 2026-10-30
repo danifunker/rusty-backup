@@ -33,8 +33,8 @@
 //! Source: Salto `include/drive.h` (geometry) and `src/drive.c` (`sector_t`,
 //! the cooked-image layout).
 
-use super::super::filesystem::FilesystemError;
 use super::{be16, put_be16, Disk, FsFamily, Geometry, Sector};
+use disk_core::filesystem::FilesystemError;
 
 /// Words per sector record: 1 pageno + 2 header + 8 label + 256 data.
 const RECORD_WORDS: usize = 1 + 2 + 8 + 256;

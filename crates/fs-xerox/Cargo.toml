@@ -1,0 +1,27 @@
+[package]
+name = "fs-xerox"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.73"
+license = "MIT"
+authors = ["Dani Sarfati <dani@funkervogt.com>", "Alan Steremberg <alan.steremberg@gmail.com>"]
+description = "Xerox Alto / D-machine filesystems (BFS, TFS, Pilot/Cedar) and their disk-image containers"
+repository = "https://github.com/danifunker/rusty-backup"
+readme = "README.md"
+keywords = ["filesystem", "xerox", "alto", "emulator", "disk-image"]
+categories = ["filesystem", "emulators"]
+# Not published until the co-author signs off on release timing (docs/license_audit.md).
+publish = false
+
+[features]
+# Only for a Rust 1.73 toolchain; see disk-core.
+rust173-polyfill = ["disk-core/rust173-polyfill"]
+
+[dependencies]
+disk-core = { path = "../disk-core", version = "0.1", features = ["fs"] }
+# `.zdisk` images are deflate-compressed.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+log = "0.4"
+
+[dev-dependencies]
+tempfile = "3"

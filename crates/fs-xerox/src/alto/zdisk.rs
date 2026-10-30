@@ -44,8 +44,8 @@ use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 
-use super::super::filesystem::FilesystemError;
 use super::{be16, put_be16, Disk, FsFamily, Geometry, Sector};
+use disk_core::filesystem::FilesystemError;
 
 const SIG1: u16 = 0xDAAD;
 const SIG2: u16 = 0x5CC5;
@@ -306,7 +306,7 @@ mod tests {
     #[test]
     fn open_pack_routes_zdisk() {
         let bytes = write(&sample_disk(40, 2)).expect("write");
-        let disk = crate::fs::alto::open_pack(&bytes).expect("open_pack");
+        let disk = crate::alto::open_pack(&bytes).expect("open_pack");
         assert_eq!(disk.geometry.family, FsFamily::Pilot);
         assert_eq!(disk.geometry.n_cylinders, 40);
     }

@@ -91,7 +91,17 @@ The format data tables (Arsenic randomization table, method-13 tables, LZAH dist
   - Either: (a) a separate **LGPL-2.1-or-later** crate for the codecs (e.g. `arc-mac-codecs`), with MacPaw notices, while the independent container / writer / BinHex / MacBinary code goes MIT in `arc-mac`.
   - Or: (b) clean-room rewrites from format descriptions, done by someone who hasn't been working from the XAD sources.
   - Recommendation: (a). It's honest about the origin, LGPL works with both MIT and AGPL users, and it costs nothing now.
-- **D2: Linux / hfsutils-derived code in the Mac and Acorn/OS-2 filesystems:** `hfs_unicode` (tables + lookup), `HFS_CHARORDER`, `adfs` map walk, `hpfs` dnode editing, `xfs` `dir_hashname`.
+- **D2–D4 DECIDED 2026-10-30: the licence follows the code; no rewrites now.** Code moves as-is, and each crate's `license` field and notices describe what it actually contains. Where only part of a family is derived, that part goes into a small sub-crate under the upstream licence, the way `arc-mac-codecs` does for D1, so the rest of the family stays MIT. Rewrites to MIT are optional follow-ups.
+  - **D2 (Linux / hfsutils):**
+    - `adfs` → its own crate, GPL-2.0-only.
+    - `hpfs` → its own crate, GPL-2.0-only, since the derived dnode editing and the read side share one file.
+    - `hfs_unicode` → a sub-crate, GPL-2.0-only (e.g. `fs-mac-unicode`).
+    - `HFS_CHARORDER` → GPL-2.0-or-later. Settle the exact split when `fs-mac` moves: move the table into a sub-crate, or license the classic-HFS part accordingly.
+    - XFS is already planned as `fs-xfs` (GPL-2.0).
+    - The GPL-2.0-only vs AGPL-3.0 question for the app is unchanged by this. It needs separate legal advice.
+  - **D3 (PFS3):** `fs-amiga` carries pfs3aio's full 4-clause BSD notice in `THIRD_PARTY_NOTICES.md`, including the advertising acknowledgement ("This product includes software developed by Michiel Pelt"). Crate licence `MIT AND BSD-4-Clause`. No code change.
+  - **D4 (NTFS blobs):** keep `secure_sds.bin` / `root_secdesc.bin` as-is. Record their origin (captured from `mkntfs` output) in `fs-pc`'s notices. Regenerating them from a Windows volume is a follow-up.
+- **Original D2 analysis.** Linux / hfsutils-derived code in the Mac and Acorn/OS-2 filesystems: `hfs_unicode` (tables + lookup), `HFS_CHARORDER`, `adfs` map walk, `hpfs` dnode editing, `xfs` `dir_hashname`.
   - To make `fs-mac`, `fs-pc` and `fs-xfs` MIT, these need re-sourcing (TN1150, Inside Macintosh) or clean-room rewrites. Each is bounded: two tables, one map walker, one B-tree editor, one hash.
   - **Independent of the crates:** the Linux pieces are GPL-2.0-*only*. The app is AGPL-3.0, and GPL-2.0-only code generally can't be combined into GPL-3 / AGPL-3 works. So this may be a pre-existing compatibility question for the app itself, which re-sourcing would also settle.
   - (hfsutils is GPL-2.0-*or-later*, so `HFS_CHARORDER` is fine for the AGPL app but not for MIT.)

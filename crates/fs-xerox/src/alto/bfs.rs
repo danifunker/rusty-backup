@@ -17,12 +17,12 @@
 use std::io::Read;
 use std::path::PathBuf;
 
-use super::super::entry::FileEntry;
-use super::super::filesystem::{
+use super::{be16, Disk, LabelCodec};
+use disk_core::entry::FileEntry;
+use disk_core::filesystem::{
     CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem, FilesystemError,
 };
-use super::super::fsck::{FsckIssue, FsckResult, FsckStats, RepairReport};
-use super::{be16, Disk, LabelCodec};
+use disk_core::fsck::{FsckIssue, FsckResult, FsckStats, RepairReport};
 
 /// `eofDA` (Disks.d): a `next`/`previous` link of this value terminates the
 /// chain (the [`LabelCodec`] handles this at runtime; this is used only by the
@@ -543,10 +543,10 @@ impl Filesystem for BfsFilesystem {
 }
 
 impl EditableFilesystem for BfsFilesystem {
-    fn as_filesystem(&self) -> &dyn crate::fs::filesystem::Filesystem {
+    fn as_filesystem(&self) -> &dyn disk_core::filesystem::Filesystem {
         self
     }
-    fn as_filesystem_mut(&mut self) -> &mut dyn crate::fs::filesystem::Filesystem {
+    fn as_filesystem_mut(&mut self) -> &mut dyn disk_core::filesystem::Filesystem {
         self
     }
     fn create_file(
