@@ -8,7 +8,7 @@ Branch: **`native-frontends`**. On m900 it is checked out as a worktree at `~/re
 
 > Read `docs/RESUME-native-frontends-and-g5-vm.md` in `~/repos/rusty-backup-native-frontends` and continue from "Where things stand". First run `ssh-add ~/.ssh/id_rsa`; I'll type the passphrase, because the G5 and GitHub need the key. Then:
 > (1) the PowerPC build gate already passed: record it in `crate_split_plan.md` §9a, then run `scripts/ppc-smoke.sh` against the real G5;
-> (2) the emulated G5 should already be running `g5-leopard-boot.img`: check that ssh on `127.0.0.1:2222` and gcc 10 work inside;
+> (2) get the emulated G5 past the early Leopard kernel hang (see "Open problem" in section 4), then check that ssh on `127.0.0.1:2222` and gcc 10 work inside;
 > (3) start slimming the Leopard disk for GitHub runners as described in the doc.
 
 ## The plans this work serves
@@ -63,16 +63,31 @@ Branch: **`native-frontends`**. On m900 it is checked out as a worktree at `~/re
 |---|---|
 | `backup/` | the rusty-backup set copied from NAS `Software/VintageSystemBackups/G5-Leopard-Gcc10/256GB-disk4-2026-08-03-1520` (the seekable cache was skipped) |
 | `g5-leopard.img` | full 256 GB restore (sparse). APM slots: 2 HFS "untitled" (bootstrap), **3 Tiger 10.4.12**, 4 Linux, **5 Leopard 10.5.8 + gcc 10**, 6 swap |
-| `g5-leopard-boot.img` | **the one to boot.** 87 GB sparse (56 GB on disk), `parted` APM, one `Apple_HFS "Leopard"` at sector 2048 (slot 2, OF `hd:2`), with the Leopard volume copied in byte-for-byte. The copy completed and `rb-cli` reads it fine. **It boots:** BootX loads and reaches the grey Apple screen in ~78 s. |
+| `g5-leopard-boot.img` | **the one to boot.** 87 GB sparse (56 GB on disk), `parted` APM, one `Apple_HFS "Leopard"` at sector 2048 (slot 2, OF `hd:2`), with the Leopard volume copied in byte-for-byte. The copy completed and `rb-cli` reads it fine. BootX loads it and the kernel starts, but it then hangs (see "Open problem" below). |
 | `g5-leopard-boot-overlay.qcow2` | copy-on-write overlay the VM writes to. `run-g5.sh` already points at it with `hd:2,\\:tbxi` |
 | `qemu-g5/` | qemu-g5-appimage v1.0.0 (SHA-256 verified), unpacked with `--appimage-extract` (no `libfuse2` on m900). Patched QEMU **11.1.50** (`70668cf600`): multi-CPU on mac99, `ati-r350`; G5 OpenBIOS at `squashfs-root/share/qemu/openbios-qemu.elf` |
 | `run-g5.sh` | headless launcher: guest sshd at `127.0.0.1:2222`, VNC `:5`, `monitor.sock`, `serial.log`. `G5_SMP` / `G5_MEM` env overrides |
 | `vmcmd.py` | send one monitor command, e.g. `./vmcmd.py monitor.sock screendump shot.png -f png`, `... quit` |
 
-**At handoff the VM was running** (started detached with `setsid`, 4 CPUs, 3 GB), booting Leopard from `g5-leopard-boot.img`. It had not yet been confirmed to reach ssh on `127.0.0.1:2222`. Check:
-- `pgrep -af '[q]emu-g5'`
-- `./vmcmd.py monitor.sock screendump shot.png -f png`
-- `ssh -p 2222 admin@127.0.0.1` (needs the legacy-RSA options)
+**The VM is stopped at handoff.** **Open problem: the Leopard kernel hangs early.**
+
+With verbose boot (`run-g5.sh` now passes `boot-args=${G5_BOOTARGS:--v}`), BootX loads `Darwin Kernel Version 9.8.0 … xnu-1228.15.4~1/RELEASE_PPC`. The kernel prints `vm_page_bootstrap` and **stops after `mig_table_max_displ = 79`**, at 100% of one host core, before IOKit. Results:
+
+| Setting | Result |
+|---|---|
+| 4 CPUs, 3 GB | hang |
+| 1 CPU, 3 GB (`G5_SMP=1`) | hang, so not SMP |
+| 1 CPU, 2 GB (`G5_MEM=2048`) | hang, so not memory size |
+
+The remaining difference from the bundle's "proven" config is the **display: `-vga std` instead of `ati-radeon9800`**, which hung OpenBIOS on m900. Next ideas, in order:
+1. **Run through the bundle's own wrapper instead of calling the binary**, in case `AppRun` sets something the bare `bin/qemu-system-ppc64` misses. That might also fix the Radeon hang:
+   `QEMU_G5_DISK=$D/g5-leopard-boot-overlay.qcow2 QEMU_G5_NET=none qemu-g5/squashfs-root/AppRun -prom-env "boot-args=-v" -prom-env "boot-device=hd:2,\\:tbxi" -netdev user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22 -device sungem,netdev=net0 -display none -vnc 127.0.0.1:5 -monitor unix:$D/monitor.sock,server,nowait`
+   The wrapper's `exec` passes extra arguments through, and it defaults to the Radeon, 2 CPUs and 2 GB. Its state dir defaults to `~/.local/share/qemu-g5`; set `QEMU_G5_STATE=$D`.
+2. Boot **Tiger 10.4.12** from the original `g5-leopard.img` (slot 3, below the 128 GiB limit; it reached the grey Apple too) with `-v`, to see whether the hang is Leopard-specific.
+3. Boot args to try: `-v -x` (safe mode, skips kext caches); `-v debug=0x14e`; `platform=` / `cpus=1`. Also check Emaculation's Cat_7 / Andrew_R threads (t=12804, t=12817) for the Leopard G5 boot-args and NVRAM settings they used.
+4. Leopard on the real G5 is tuned to PowerMac7,3; the emulated machine claims the same model, but kext caches may still trip it. Rebuild the caches from the guest only once it boots (`-x`).
+
+Check commands once it boots: `pgrep -af '[q]emu-g5'`, `./vmcmd.py monitor.sock screendump shot.png -f png`, `ssh -p 2222 admin@127.0.0.1` (needs the legacy-RSA options).
 
 How the boot image was made, for reference or to redo:
 ```bash
