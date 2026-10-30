@@ -3527,18 +3527,10 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
         Some(super::hfsplus_fsck::check(self))
     }
 
-    fn read_journal(
-        &mut self,
-    ) -> Result<Option<super::hfsplus_journal::JournalState>, FilesystemError> {
-        // Delegate to the inherent method (which takes priority for concrete
-        // calls); this override is what `dyn Filesystem` callers reach.
-        HfsPlusFilesystem::read_journal(self)
-    }
-
-    fn journal_detail(
-        &mut self,
-    ) -> Result<Option<super::hfsplus_journal::JournalDetail>, FilesystemError> {
-        HfsPlusFilesystem::journal_detail(self)
+    fn journal_detail(&mut self) -> Result<Option<Box<dyn std::any::Any + Send>>, FilesystemError> {
+        // Boxed so `dyn Filesystem` callers can downcast to `JournalDetail`; concrete calls hit the inherent method.
+        Ok(HfsPlusFilesystem::journal_detail(self)?
+            .map(|d| Box::new(d) as Box<dyn std::any::Any + Send>))
     }
 }
 

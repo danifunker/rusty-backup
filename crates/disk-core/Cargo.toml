@@ -1,0 +1,26 @@
+[package]
+name = "disk-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.73"
+license = "MIT"
+authors = ["Dani Sarfati <dani@funkervogt.com>"]
+description = "Shared base for the rusty-backup filesystem, partition-table and disk-image crates"
+repository = "https://github.com/danifunker/rusty-backup"
+readme = "README.md"
+keywords = ["filesystem", "disk-image", "retro", "vintage", "emulator"]
+categories = ["filesystem", "emulators"]
+
+[features]
+default = ["fs"]
+# The Filesystem / EditableFilesystem interface and FileEntry. Partition and
+# disk-image crates turn this off to skip the filesystem types and their deps.
+fs = ["dep:serde", "dep:chrono", "dep:qnx2fs"]
+# Only for a Rust 1.73 toolchain; never enable on a modern one (see src/rust173.rs).
+rust173-polyfill = []
+
+[dependencies]
+serde = { version = "1", features = ["derive"], optional = true }
+chrono = { version = "0.4", optional = true }
+# `FileEntry::qnx2_attrs` / create options carry QNX 2 attributes; MIT, no deps, Rust 1.73.
+qnx2fs = { version = "0.3", optional = true }

@@ -7,7 +7,7 @@
 //! `self`, no background work; they take a `&FileEntry` (and the decoded
 //! bytes, for the preview) and draw into the supplied `egui::Ui`.
 
-use rusty_backup::fs::entry::FileEntry;
+use rusty_backup::fs::entry::{FileEntry, FileEntryTypeDisplay as _};
 use rusty_backup::partition;
 
 /// Decoded file content for the preview pane: either a text rendering or the

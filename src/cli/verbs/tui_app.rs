@@ -26,6 +26,7 @@
 //! forces the fallback). `$NO_COLOR` is honored, and it degrades gracefully
 //! below a minimum terminal size instead of crashing.
 
+use crate::fs::entry::FileEntryTypeDisplay as _;
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Alignment, Constraint, Direction, Flex, Layout, Rect};

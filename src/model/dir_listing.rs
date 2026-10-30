@@ -21,7 +21,7 @@
 
 use std::path::Path;
 
-use crate::fs::entry::{EntryType, FileEntry};
+use crate::fs::entry::{EntryType, FileEntry, FileEntryTypeDisplay as _};
 use crate::fs::filesystem::{Filesystem, FilesystemError};
 
 /// Where a [`DirListing`] reads its directory listings from.

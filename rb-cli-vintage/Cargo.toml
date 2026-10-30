@@ -62,7 +62,8 @@ tui = ["dep:ratatui", "ratatui-legacy"]
 ratatui-legacy = []
 # Std-API polyfills for Rust 1.73 (is_multiple_of etc.). Always on for the
 # vintage build — the whole engine (fs drivers) needs it, not just the TUI.
-rust173-polyfill = []
+# Forwarded to the extracted crates under ../crates/.
+rust173-polyfill = ["disk-core/rust173-polyfill", "fs-8bit/rust173-polyfill"]
 # `--format yaml`. Enabled by the vintage build commands (see
 # .github/workflows/release.yml) so behaviour matches the desktop; it is a
 # feature only so the PowerPC mrustc build can drop it. See rb-cli-ppc.
@@ -80,6 +81,9 @@ os-stub = []
 windows-legacy = []
 
 [dependencies]
+# --- Extracted MIT crates (docs/crate_split_plan.md) ---
+disk-core = { path = "../crates/disk-core" }
+fs-8bit = { path = "../crates/fs-8bit", default-features = false, features = ["oric"] }
 # --- TUI (pinned to the last 1.73-buildable line) ---
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"], optional = true }
 

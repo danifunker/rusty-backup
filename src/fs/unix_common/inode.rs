@@ -16,10 +16,6 @@ const S_IFDIR: u32 = 0o040000;
 const S_IFCHR: u32 = 0o020000;
 const S_IFIFO: u32 = 0o010000;
 
-const S_ISUID: u32 = 0o4000;
-const S_ISGID: u32 = 0o2000;
-const S_ISVTX: u32 = 0o1000;
-
 /// Unix file type extracted from mode bits.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum UnixFileType {
@@ -48,65 +44,7 @@ pub fn unix_file_type(mode: u32) -> UnixFileType {
 }
 
 /// Render raw Unix mode bits as a 10-character permission string (e.g. `drwxr-xr-x`).
-pub fn unix_mode_string(mode: u32) -> String {
-    let file_type_char = match mode & S_IFMT {
-        S_IFDIR => 'd',
-        S_IFLNK => 'l',
-        S_IFBLK => 'b',
-        S_IFCHR => 'c',
-        S_IFIFO => 'p',
-        S_IFSOCK => 's',
-        _ => '-',
-    };
-
-    let mut chars = ['-'; 9];
-
-    // Owner
-    if mode & 0o400 != 0 {
-        chars[0] = 'r';
-    }
-    if mode & 0o200 != 0 {
-        chars[1] = 'w';
-    }
-    if mode & 0o100 != 0 {
-        chars[2] = if mode & S_ISUID != 0 { 's' } else { 'x' };
-    } else if mode & S_ISUID != 0 {
-        chars[2] = 'S';
-    }
-
-    // Group
-    if mode & 0o040 != 0 {
-        chars[3] = 'r';
-    }
-    if mode & 0o020 != 0 {
-        chars[4] = 'w';
-    }
-    if mode & 0o010 != 0 {
-        chars[5] = if mode & S_ISGID != 0 { 's' } else { 'x' };
-    } else if mode & S_ISGID != 0 {
-        chars[5] = 'S';
-    }
-
-    // Other
-    if mode & 0o004 != 0 {
-        chars[6] = 'r';
-    }
-    if mode & 0o002 != 0 {
-        chars[7] = 'w';
-    }
-    if mode & 0o001 != 0 {
-        chars[8] = if mode & S_ISVTX != 0 { 't' } else { 'x' };
-    } else if mode & S_ISVTX != 0 {
-        chars[8] = 'T';
-    }
-
-    let mut result = String::with_capacity(10);
-    result.push(file_type_char);
-    for c in &chars {
-        result.push(*c);
-    }
-    result
-}
+pub use disk_core::display::unix_mode_string;
 
 /// Build a `FileEntry` from raw Unix inode fields.
 ///

@@ -99,7 +99,7 @@ native-zstd = ["dep:zstd"]
 remote = []
 tui = ["dep:ratatui", "ratatui-legacy"]
 ratatui-legacy = []
-rust173-polyfill = []
+rust173-polyfill = ["disk-core/rust173-polyfill", "fs-8bit/rust173-polyfill"]
 windows-legacy = []
 # Declared so the shared source's `#[cfg(feature = "yaml")]` resolves, but
 # deliberately NOT in this build's feature list — see the serde_yml note below.
@@ -114,6 +114,9 @@ yaml = ["dep:serde_yml"]
 os-stub = []
 
 [dependencies]
+# --- Extracted MIT crates (docs/crate_split_plan.md) ---
+disk-core = { path = "../crates/disk-core" }
+fs-8bit = { path = "../crates/fs-8bit", default-features = false, features = ["oric"] }
 # --- TUI (pinned to the last 1.73-buildable line) ---
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"], optional = true }
 

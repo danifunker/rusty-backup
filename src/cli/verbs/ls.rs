@@ -5,6 +5,7 @@
 //! XFS, ProDOS, ISO9660, AFFS, PFS3, SFS, EFS, and any superfloppy
 //! the magic-byte sniffer recognizes.
 
+use crate::fs::entry::FileEntryTypeDisplay as _;
 use anyhow::{anyhow, bail, Result};
 use clap::Args;
 use serde::Serialize;

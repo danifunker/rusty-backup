@@ -1,0 +1,22 @@
+[package]
+name = "fs-8bit"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.73"
+license = "MIT"
+authors = ["Dani Sarfati <dani@funkervogt.com>"]
+description = "Read and edit 8-bit home-computer disk filesystems (Oric Jasmin, and more to come)"
+repository = "https://github.com/danifunker/rusty-backup"
+readme = "README.md"
+keywords = ["filesystem", "retro", "oric", "emulator", "disk-image"]
+categories = ["filesystem", "emulators"]
+
+[features]
+default = ["oric"]
+# One feature per filesystem so users only build what they need.
+oric = []
+# Only for a Rust 1.73 toolchain; see disk-core.
+rust173-polyfill = ["disk-core/rust173-polyfill"]
+
+[dependencies]
+disk-core = { path = "../disk-core", version = "0.1", features = ["fs"] }

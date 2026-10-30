@@ -5,6 +5,7 @@
 //! filenames so there's no ambiguity. The HFS native separator `:` is
 //! not accepted to keep the surface small and shell-friendly.
 
+use crate::fs::entry::FileEntryTypeDisplay as _;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Subcommand;
 use std::fs::OpenOptions;

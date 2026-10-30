@@ -2,6 +2,7 @@
 //! the type and/or creator code on an existing file. HFS / HFS+ /
 //! ProDOS (`--type` only).
 
+use crate::fs::entry::FileEntryTypeDisplay as _;
 use anyhow::{anyhow, bail, Result};
 use clap::Args;
 

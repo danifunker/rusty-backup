@@ -15,6 +15,7 @@
 //! state. Free-space projection is approximate (sum of host file
 //! sizes) and lands per-FS as the metadata surface matures.
 
+use crate::fs::entry::FileEntryTypeDisplay as _;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Args;
 use serde::{Deserialize, Serialize};

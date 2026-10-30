@@ -2,6 +2,7 @@
 // info, reader, ctx, logging, etc. — multi-arg by design.
 #![allow(clippy::too_many_arguments)]
 
+use rusty_backup::fs::entry::FileEntryTypeDisplay as _;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -1139,10 +1140,17 @@ impl BrowseView {
                 match self.take_or_open_fs() {
                     Some(mut fs) => {
                         match fs.journal_detail() {
-                            Ok(Some(detail)) => {
-                                self.journal_view =
-                                    Some(super::journal_view::JournalView::new(detail));
-                            }
+                            Ok(Some(any)) => match any
+                                .downcast::<rusty_backup::fs::hfsplus_journal::JournalDetail>(
+                            ) {
+                                Ok(detail) => {
+                                    self.journal_view =
+                                        Some(super::journal_view::JournalView::new(*detail));
+                                }
+                                Err(_) => {
+                                    self.error = Some("Unsupported journal format.".into());
+                                }
+                            },
                             Ok(None) => {
                                 self.error = Some("This volume is not journaled.".into());
                             }

@@ -180,8 +180,9 @@ windows-legacy = []
 # compiles on Rust 1.73 for the macOS 10.7 build. OFF here — the desktop uses
 # the real std methods. Enabled ONLY by the vintage manifest (rb-cli-vintage/).
 # Do NOT enable on a modern toolchain: std's inherent is_multiple_of would then
-# collide with the polyfill trait. See src/rust173_compat.rs.
-rust173-polyfill = []
+# collide with the polyfill trait. See crates/disk-core. Forwarded to every
+# extracted crate under crates/ (docs/crate_split_plan.md).
+rust173-polyfill = ["disk-core/rust173-polyfill", "fs-8bit/rust173-polyfill"]
 # In-app self-update for `rb-cli update` (CLI + TUI). Pulls the reqwest client
 # (rustls, no OpenSSL). OFF by default and left OUT of the slim / appliance /
 # MiSTer builds so they link no networking; desktop packagers opt in. When the
@@ -189,6 +190,9 @@ rust173-polyfill = []
 tui-update = ["dep:reqwest"]
 
 [dependencies]
+# Reusable MIT crates extracted from this tree (docs/crate_split_plan.md).
+disk-core = { path = "crates/disk-core" }
+fs-8bit = { path = "crates/fs-8bit", default-features = false, features = ["oric"] }
 # Full-screen TUI (`tui` feature). ratatui renders through crossterm, which is
 # already a non-optional dependency below, so this adds no new C/native code.
 ratatui = { version = "0.30", optional = true }
@@ -369,6 +373,12 @@ openssl = "*"
 # Arch package metadata
 [package.metadata.aur]
 depends = ["gtk3", "openssl"]
+
+# The extracted reusable crates (fs-*, part-*, dsk-*, rb-*). The vintage
+# manifests (rb-cli-vintage, rb-cli-ppc, rb-cli-sol9) stay their own workspace
+# roots and reach these through path dependencies. docs/crate_split_plan.md.
+[workspace]
+members = ["crates/*"]
 
 # Debug builds carry line tables only. With full debuginfo the lib test binary
 # was 839 MB and each integration test 350-440 MB; linking several of those in

@@ -26,10 +26,9 @@ pub mod theme;
 #[cfg(feature = "remote")]
 pub mod remote;
 pub mod restore;
-// Std-API polyfills for the Rust 1.73 vintage (macOS 10.7) build. Compiled only
-// under `rust173-polyfill`; the desktop build omits it and uses std directly.
+// Std-API polyfills for the Rust 1.73 vintage build, now in the `disk-core` crate.
 #[cfg(feature = "rust173-polyfill")]
-pub mod rust173_compat;
+pub use disk_core::rust173 as rust173_compat;
 // Update checker uses reqwest, pulled in by either the GUI or the opt-in
 // `tui-update` feature (the `rb-cli update` self-updater). The slim
 // rb-cli-mini build has neither and skips it.

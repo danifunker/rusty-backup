@@ -598,6 +598,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "disk-core"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "qnx2fs",
+ "serde",
+]
+
+[[package]]
 name = "dispatch2"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -739,6 +748,13 @@ name = "foldhash"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
+
+[[package]]
+name = "fs-8bit"
+version = "0.1.0"
+dependencies = [
+ "disk-core",
+]
 
 [[package]]
 name = "generic-array"
@@ -1372,10 +1388,12 @@ dependencies = [
  "crossterm",
  "csv",
  "dirs",
+ "disk-core",
  "encoding_rs",
  "env_logger",
  "filetime",
  "flate2",
+ "fs-8bit",
  "globset",
  "hashbrown 0.14.5",
  "home",

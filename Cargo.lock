@@ -1714,6 +1714,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "disk-core"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "qnx2fs",
+ "serde",
+]
+
+[[package]]
 name = "dispatch"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2308,6 +2317,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
+]
+
+[[package]]
+name = "fs-8bit"
+version = "0.1.0"
+dependencies = [
+ "disk-core",
 ]
 
 [[package]]
@@ -5681,12 +5697,14 @@ dependencies = [
  "csv",
  "des",
  "dirs",
+ "disk-core",
  "eframe",
  "egui",
  "encoding_rs",
  "env_logger",
  "filetime",
  "flate2",
+ "fs-8bit",
  "globset",
  "image",
  "libc",

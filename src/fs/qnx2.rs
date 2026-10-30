@@ -29,20 +29,7 @@ pub use qnx2fs::{decode_date, fold_date, looks_like_qnx2, looks_like_rs_text, rs
 
 const BLOCK: u64 = 512;
 const DELETED_TAG: &str = " [deleted]";
-
-impl From<qnx2fs::Error> for FilesystemError {
-    fn from(e: qnx2fs::Error) -> Self {
-        match e {
-            qnx2fs::Error::Io(e) => FilesystemError::Io(e),
-            qnx2fs::Error::NotQnx2 => FilesystemError::Parse("not a QNX 2 volume".into()),
-            qnx2fs::Error::InvalidData(m) => FilesystemError::InvalidData(format!("qnx2: {m}")),
-            qnx2fs::Error::NotFound(m) => FilesystemError::NotFound(m),
-            qnx2fs::Error::AlreadyExists(m) => FilesystemError::AlreadyExists(m),
-            qnx2fs::Error::DiskFull(m) => FilesystemError::DiskFull(m),
-            qnx2fs::Error::Unsupported(m) => FilesystemError::Unsupported(format!("qnx2: {m}")),
-        }
-    }
-}
+// `From<qnx2fs::Error> for FilesystemError` lives in disk-core (orphan rule).
 
 pub struct Qnx2Filesystem<R: Read + Seek + Send> {
     vol: Volume<R>,

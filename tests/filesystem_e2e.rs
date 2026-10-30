@@ -16,6 +16,7 @@
 //!
 //! Run with: cargo test --test filesystem_e2e
 
+use rusty_backup::fs::entry::FileEntryTypeDisplay as _;
 use rusty_backup::fs::filesystem::Filesystem;
 use std::io::{Cursor, Read};
 

@@ -3,8 +3,9 @@
 //! vintage build in `rb-cli-vintage/`). 1.74+ raised the macOS floor to 10.12.
 //!
 //! This module is compiled **only** when the `rust173-polyfill` feature is on,
-//! which is enabled solely by the vintage manifest. The desktop build omits it
+//! which is enabled solely by the vintage manifests. The desktop build omits it
 //! entirely and uses the real std methods — so nothing modern is lost there.
+//! Inside rusty-backup it is re-exported as `crate::rust173_compat`.
 //!
 //! ## Why an extension trait works for `is_multiple_of`
 //!
@@ -20,7 +21,7 @@
 //!
 //! (`io::Error::other`, by contrast, *does* exist on 1.73 as an unstable
 //! inherent fn, so the same trick can't shadow it — those call sites are
-//! rewritten to the equivalent `crate::compat::io_other(…)`, which is
+//! rewritten to the equivalent [`crate::io_other`], which is
 //! stable on every toolchain. And trait-upcasting `dyn EditableFilesystem` ->
 //! `dyn Filesystem` uses an explicit `as_filesystem()` method rather than the
 //! 1.86 upcast coercion.)

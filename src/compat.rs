@@ -13,41 +13,11 @@
 //! When macOS 10.7 support is dropped, delete the `rust173-polyfill` feature and
 //! the `#[cfg(feature = "rust173-polyfill")]` arms here; callers can then be
 //! mechanically inlined back to the bare std calls if desired.
+//!
+//! `io_other` and `repeat_n` live in the `disk-core` crate (shared with the
+//! extracted `crates/`); the rest here depends on app-only crates like `zip`.
 
-/// Construct an `io::Error` of kind `Other` wrapping `error`.
-///
-/// Modern: `io::Error::other` (stable since Rust 1.74). Vintage (1.73): the
-/// equivalent `io::Error::new(ErrorKind::Other, ..)`.
-#[inline]
-pub fn io_other<E>(error: E) -> std::io::Error
-where
-    E: Into<Box<dyn std::error::Error + Send + Sync>>,
-{
-    #[cfg(not(feature = "rust173-polyfill"))]
-    {
-        std::io::Error::other(error)
-    }
-    #[cfg(feature = "rust173-polyfill")]
-    {
-        std::io::Error::new(std::io::ErrorKind::Other, error)
-    }
-}
-
-/// An iterator that repeats `value` exactly `count` times.
-///
-/// Modern: `iter::repeat_n` (stable since Rust 1.87). Vintage (1.73): the
-/// equivalent `iter::repeat(value).take(count)`.
-#[inline]
-pub fn repeat_n<T: Clone>(value: T, count: usize) -> impl Iterator<Item = T> {
-    #[cfg(not(feature = "rust173-polyfill"))]
-    {
-        std::iter::repeat_n(value, count)
-    }
-    #[cfg(feature = "rust173-polyfill")]
-    {
-        std::iter::repeat(value).take(count)
-    }
-}
+pub use disk_core::{io_other, repeat_n};
 
 /// A zip entry's decoded name. zip 9 decodes it fallibly; the vintage builds' zip 2.4 returns `&str`.
 pub trait ZipEntryName {
