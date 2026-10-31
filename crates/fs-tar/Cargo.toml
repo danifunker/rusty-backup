@@ -20,6 +20,10 @@ pure-zstd = ["dep:libzstd-bitexact-rs"]
 # which depends on the GPL-2.0-only fs-mac-unicode). Without it sidecars are skipped and counted.
 appledouble = ["dep:fs-mac"]
 # Only for a Rust 1.73 toolchain; see disk-core.
+# Browse a tar as a read-only filesystem (`mem_archive`).
+mem-archive = ["dep:chrono"]
+# ZIP in `mem_archive` too; zip 9 on current Rust, zip 2.4.2 on 1.73 (see `zip_compat`).
+zip = ["mem-archive", "dep:zip"]
 rust173-polyfill = ["disk-core/rust173-polyfill", "fs-mac?/rust173-polyfill"]
 
 [dependencies]
@@ -29,13 +33,18 @@ anyhow = "1"
 bzip2 = ">=0.5.2, <0.7"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 tar = "0.4"
+# Member dates in `mem_archive` listings.
+chrono = { version = "0.4", optional = true }
 # Large members spool through a temp file rather than RAM.
 tempfile = "3"
 zstd = { version = ">=0.13, <0.15", optional = true }
 libzstd-bitexact-rs = { version = "0.157", optional = true }
 fs-mac = { path = "../fs-mac", version = "0.1", default-features = false, features = ["forks"], optional = true }
+zip = { version = ">=2.4.2, <10", default-features = false, optional = true }
 
 [dev-dependencies]
+# Inflating ZIP members in the `mem_archive` tests.
+zip = { version = ">=2.4.2, <10", default-features = false, features = ["deflate"] }
 # The tests round-trip through real FAT, ext, UFS and HFS volumes.
 fs-mac = { path = "../fs-mac", version = "0.1", default-features = false, features = ["hfs", "forks"] }
 fs-pc = { path = "../fs-pc", version = "0.1", default-features = false, features = ["fat"] }

@@ -6,6 +6,9 @@
 //! - [`import_sink`]: the write half every "import a tree" flow shares (conflict policy,
 //!   `mkdir -p`, attribute inheritance); a host-folder importer can push into it too.
 //!
+//! - [`mem_archive`] (feature `mem-archive`): browse a tar (and, with `zip`, a ZIP) as a read-only
+//!   filesystem, held in memory or indexed in place.
+//!
 //! With the `appledouble` feature, macOS `._name` sidecars in an archive are joined to their
 //! file as a resource fork and Finder info (that pulls in `fs-mac`); without it they are skipped
 //! and counted.
@@ -14,8 +17,12 @@
 #![allow(clippy::incompatible_msrv)]
 
 pub mod import_sink;
+#[cfg(feature = "mem-archive")]
+pub mod mem_archive;
 pub mod tar_export;
 pub mod tar_import;
+#[cfg(feature = "zip")]
+mod zip_compat;
 mod zstd_compat;
 
 #[cfg(test)]

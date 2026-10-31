@@ -333,7 +333,10 @@ Everything below needs Dani's call. Everything else in Steps 0–5 is done.
 - It ships `LICENSE-MIT`, `LICENSE-LGPL-2.1`, and MacPaw's copyright notice (copied from upstream) in `THIRD_PARTY_NOTICES.md`. `arc-mac-codecs` is not created.
 - It depends on `fs-mac` (`hfs`, `forks`) and `dsk-apple` (`dc42`).
 - `mar.rs`'s "clean-room from GPL mar" claim is still to be compared, as before.
-- **`sun2tape*` / `tar_section` stay in the app for now.** Besides the Unix-`compress` codec (now in `arc-mac`), they browse each tar section through the app's `mem_archive::MemArchiveFilesystem`. That module also handles ZIP through the zip-version shim (decision D), so moving the tapes means first carving `mem_archive`'s tar half out (into `fs-tar`).
+- **`sun2tape*` / `tar_section`: DECIDED and DONE 2026-10-31.**
+  - **`mem_archive` moved into `fs-tar`** behind a `mem-archive` feature (browse a tar as a read-only filesystem). Its ZIP loader is gated by a further `zip` feature, which carries `dsk-imz`'s zip range and entry-name shim. The app enables both.
+  - **New `dsk-tape` crate** (MIT, "tapes" as a family, one feature per format) with `sun2tape`, `sun2tape_edit` and `tar_section` behind the `sun2tape` feature. That feature uses `fs-tar` (tar browsing only, no zip), `arc-mac` (`compress(1)`) and `fs-unix` (UFS miniroots); through `arc-mac` a build with it is GPL as a whole, which the README says.
+  - **No shared tape trait yet.** With one format there's nothing to abstract; a second tape format becomes a second feature, and a common shape can come out of the two.
 
 Original note:  D1 puts the XADMaster-derived code in an LGPL `arc-mac-codecs` and the rest in an MIT `arc-mac`. The code doesn't divide that cleanly:
 - `compactpro.rs` and `stuffit5.rs` are derived *throughout*, including their parsers (`XADCompactProParser.m`, `XADStuffIt5Parser.m`). But they build the MIT archive model (`StuffItArchive`, `StuffItEntry`, `ForkInfo`, `ForkCodec`, defined in `stuffit.rs`), and `stuffit5` calls `stuffit::decompress_fork`, which dispatches to the derived codecs.

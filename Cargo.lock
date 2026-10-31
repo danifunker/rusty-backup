@@ -1886,6 +1886,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "dsk-tape"
+version = "0.1.0"
+dependencies = [
+ "arc-mac",
+ "disk-core",
+ "fs-tar",
+ "fs-unix",
+ "log",
+ "tar",
+ "tempfile",
+]
+
+[[package]]
 name = "dsk-vm"
 version = "0.1.0"
 dependencies = [
@@ -2554,6 +2567,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bzip2 0.6.1",
+ "chrono",
  "disk-core",
  "flate2",
  "fs-mac",
@@ -2562,6 +2576,7 @@ dependencies = [
  "libzstd-bitexact-rs",
  "tar",
  "tempfile",
+ "zip",
  "zstd 0.14.3",
 ]
 
@@ -5997,6 +6012,7 @@ dependencies = [
  "dsk-flux",
  "dsk-ghost",
  "dsk-imz",
+ "dsk-tape",
  "dsk-vm",
  "eframe",
  "egui",
