@@ -586,6 +586,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "dsk-ghost"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "disk-core",
+ "flate2",
+ "fs-pc",
+ "log",
+ "tempfile",
+]
+
+[[package]]
 name = "dsk-vm"
 version = "0.1.0"
 dependencies = [
@@ -1392,6 +1404,7 @@ dependencies = [
  "dsk-dmg",
  "dsk-floppy",
  "dsk-flux",
+ "dsk-ghost",
  "dsk-vm",
  "encoding_rs",
  "env_logger",

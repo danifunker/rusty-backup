@@ -1,0 +1,30 @@
+[package]
+name = "dsk-ghost"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.73"
+license = "MIT"
+authors = ["Dani Sarfati <dani@funkervogt.com>"]
+description = "Read Norton Ghost .gho / .ghs images (whole-disk and partition, compressed, spanned, password-protected), including file-aware FAT and NTFS images"
+repository = "https://github.com/danifunker/rusty-backup"
+readme = "README.md"
+keywords = ["ghost", "gho", "backup", "disk-image", "retro"]
+categories = ["parser-implementations", "filesystem"]
+
+[features]
+# Only for a Rust 1.73 toolchain; see disk-core.
+rust173-polyfill = ["disk-core/rust173-polyfill", "fs-pc/rust173-polyfill"]
+
+[dependencies]
+disk-core = { path = "../disk-core", version = "0.1", features = ["fs"] }
+# File-aware images store FAT / NTFS files rather than sectors; rebuilding the volume needs both.
+fs-pc = { path = "../fs-pc", version = "0.1", default-features = false, features = ["fat", "ntfs"] }
+anyhow = "1"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+log = "0.4"
+# Encrypted and file-aware images are materialised into a temp directory.
+tempfile = "3"
+
+[dev-dependencies]
+# Unpacks the zstd test fixtures; 0.13 is the last line the Rust 1.73 builds resolve.
+zstd = ">=0.13, <0.15"

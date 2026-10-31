@@ -29,6 +29,7 @@ on:
       - "dsk-dmg-v*"
       - "dsk-floppy-v*"
       - "dsk-vm-v*"
+      - "dsk-ghost-v*"
   workflow_dispatch:
     inputs:
       crate:
@@ -58,6 +59,7 @@ on:
           - dsk-dmg
           - dsk-floppy
           - dsk-vm
+          - dsk-ghost
       dry_run:
         description: Package and verify only, do not upload
         required: true

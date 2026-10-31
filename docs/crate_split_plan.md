@@ -268,6 +268,8 @@ The crates already kept separately stay separate, because other projects share t
      - The VHD split: the footer / dynamic-header builders, checksum, CHS geometry, cookies and `DynamicVhdReader` went to `dsk_vm::vhd`; `export_*`, `write_vhd` and the EBR rebuild stay in `rbformats/vhd.rs`, which re-exports the format half. Five format-only tests moved with it; the rest test the exporter and stayed.
      - Now `pub` for the exporter: `vhd_checksum`, `vhd_chs_geometry`, `build_vhd_dynamic_header`, `BAT_UNUSED`, `sparse::{SparseAllocator, is_zero_unit}`, and a new `DynamicVhdReader::into_inner` (three app tests read the private `inner` field).
      - `CHUNK_SIZE`, `is_all_zeros` and `write_zeros` are small private copies in the crate. The `qemu-img check` test helper is duplicated (crate and app), because the APM + HFS QCOW2 acceptance test moved to the app shim.
+   - **`dsk-ghost` done (2026-10-31)**, MIT: `gho` and `gho_crypto`, depending on `fs-pc` (features `fat`, `ntfs`) for file-aware images, as planned. It ships nyarime/gho's MIT notice for the Fast-LZ port (audit follow-up), and the app's `THIRD_PARTY_NOTICES.md` now points at the crate. Its link to IMZ was documentation only.
+   - **Left in Step 5:** IMZ (see above); the small app-side helpers `interleave` (Acorn DFS `.dsd`, needs `fs-8bit`'s `dfs`) and `swab`; and the upstream moves of the CHD and optical helpers to libchdman-rs / opticaldiscs, which are other repositories.
 6. **`arc-mac`, `fs-tar`.**
 7. **Cleanup and docs.**
    - Remove the shims.
