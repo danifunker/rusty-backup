@@ -17,6 +17,7 @@ on:
       - "fs-amiga-v*"
       - "fs-unix-v*"
       - "fs-xfs-v*"
+      - "fs-squashfs-v*"
   workflow_dispatch:
     inputs:
       crate:
@@ -34,6 +35,7 @@ on:
           - fs-amiga
           - fs-unix
           - fs-xfs
+          - fs-squashfs
       dry_run:
         description: Package and verify only, do not upload
         required: true

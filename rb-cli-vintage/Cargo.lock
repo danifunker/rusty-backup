@@ -807,6 +807,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs-squashfs"
+version = "0.1.0"
+dependencies = [
+ "disk-core",
+ "flate2",
+ "lz4_flex",
+ "lzma-rs",
+ "tempfile",
+ "zstd",
+]
+
+[[package]]
 name = "fs-unix"
 version = "0.1.0"
 dependencies = [
@@ -1483,6 +1495,7 @@ dependencies = [
  "fs-apple2",
  "fs-cpm",
  "fs-qnx",
+ "fs-squashfs",
  "fs-unix",
  "fs-xerox",
  "fs-xfs",

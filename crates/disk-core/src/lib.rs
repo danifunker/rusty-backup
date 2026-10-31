@@ -13,6 +13,7 @@
 //! (`fs-8bit`, `fs-mac`, …) implements:
 //! - [`filesystem`]: `Filesystem` (read) and `EditableFilesystem` (write),
 //!   `FilesystemError`, create/repair options.
+//! - [`attrs`]: resolve the attributes a copied or imported entry should get.
 //! - [`entry`]: `FileEntry`, `EntryType` and directory display ordering.
 //! - [`fsck`]: integrity-check results shared by every checker.
 //! - [`times`]: Unix timestamps and the calendar conversions filesystems need.
@@ -34,6 +35,8 @@ pub mod display;
 pub mod rust173;
 pub mod sgi;
 
+#[cfg(feature = "fs")]
+pub mod attrs;
 #[cfg(feature = "fs")]
 pub mod entry;
 #[cfg(feature = "fs")]
