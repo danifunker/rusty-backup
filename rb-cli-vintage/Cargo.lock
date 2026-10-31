@@ -667,6 +667,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dsk-floppy"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "byteorder",
+ "disk-core",
+]
+
+[[package]]
 name = "dsk-flux"
 version = "0.1.0"
 dependencies = [
@@ -1577,6 +1586,7 @@ dependencies = [
  "dsk-apple",
  "dsk-clonezilla",
  "dsk-dmg",
+ "dsk-floppy",
  "dsk-flux",
  "encoding_rs",
  "env_logger",

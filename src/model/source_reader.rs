@@ -1650,7 +1650,13 @@ mod tests {
 
     #[test]
     fn arculator_hdf_opens_as_a_window_past_its_header() {
-        let bare = crate::rbformats::containers::hdf::tests::build_bare_adfs();
+        // A minimal bare ADFS volume: the Disc Record at 0xDC0 is all detection needs.
+        let mut bare = vec![0u8; 800 * 1024];
+        let dr_off = 0xC00 + 0x1C0;
+        bare[dr_off] = 10;
+        bare[dr_off + 1] = 5;
+        bare[dr_off + 2] = 2;
+        bare[dr_off + 9] = 2;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("disk.hdf");
         let mut wrapped = vec![0u8; 512];

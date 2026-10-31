@@ -28,7 +28,7 @@ use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
 
-use super::floppy_geom::{
+use crate::floppy_geom::{
     infer_media_from_size, require_media_from_size, FloppyGeometry, FloppyMedia,
 };
 
@@ -106,7 +106,7 @@ pub fn looks_like_generic_dim_size(total_size: usize) -> bool {
     total_size > HEADER_SIZE && infer_media_from_size(total_size - HEADER_SIZE).is_some()
 }
 
-/// Cheap detection used by [`super::detect_container_kind`]: extension is
+/// Cheap detection used by rusty-backup's `detect_container_kind`: extension is
 /// `.dim` (case-insensitive) AND either the DIFC signature is present OR
 /// the size matches the generic header+flat layout.
 pub fn looks_like_dim(head: &[u8], path: Option<&Path>, total_size: usize) -> bool {

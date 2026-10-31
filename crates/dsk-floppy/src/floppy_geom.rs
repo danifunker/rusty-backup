@@ -1,7 +1,7 @@
 //! Floppy geometry common to the X68000 / PC-98 corpus.
 //!
-//! Used by the [`xdf`](super::xdf), [`hdm`](super::hdm), and [`dim`](super::dim)
-//! container decoders/encoders, and by the [`d88`](super::d88) bridge helper.
+//! Used by the [`xdf`](crate::xdf), [`hdm`](crate::hdm), and [`dim`](crate::dim)
+//! container decoders/encoders, and by the [`d88`](crate::d88) bridge helper.
 //! A geometry tuple is `(cyls, heads, sec/track, sec_size)`; the four media
 //! kinds we support each map to a unique total byte count, so size-based
 //! inference is unambiguous within this set.

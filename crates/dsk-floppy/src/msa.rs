@@ -91,7 +91,7 @@ impl MsaHeader {
     }
 }
 
-/// Lightweight magic check used by [`crate::rbformats::containers::detect_container_kind`].
+/// Lightweight magic check used by rusty-backup's `detect_container_kind`.
 /// Only consults the first 2 bytes — full validation happens during decode.
 pub fn looks_like_msa_header(buf: &[u8]) -> bool {
     buf.len() >= 2 && buf[0..2] == MSA_MAGIC
@@ -241,10 +241,7 @@ fn decode_rle_track_into(
     Ok(())
 }
 
-/// Encode a flat raw sector stream into an MSA buffer. This is the inverse of
-/// [`decode_msa_bytes`] and is used by tests; a write path through the
-/// container layer is out of scope for now.
-#[cfg(test)]
+/// Encode a flat raw sector stream into an MSA buffer, the inverse of [`decode_msa_bytes`].
 pub fn encode_msa_bytes(header: MsaHeader, raw: &[u8]) -> Vec<u8> {
     assert_eq!(raw.len(), header.decoded_size(), "raw size mismatch");
     let track_size = header.sectors_per_track as usize * MSA_SECTOR_SIZE;

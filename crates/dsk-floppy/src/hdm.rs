@@ -1,15 +1,15 @@
 //! HDM — PC-98 / DiskExplorer headerless floppy dump.
 //!
-//! On-disk layout is identical to [`super::xdf`] (raw flat sector stream,
+//! On-disk layout is identical to [`crate::xdf`] (raw flat sector stream,
 //! no header, no per-track records). The two formats are kept as separate
 //! modules so the extension dispatch and log lines stay self-explanatory;
-//! both delegate to the shared [`super::floppy_geom`] raw-flat helper.
+//! both delegate to the shared [`crate::floppy_geom`] raw-flat helper.
 
 use std::path::Path;
 
 use anyhow::Result;
 
-use super::floppy_geom::{
+use crate::floppy_geom::{
     decode_raw_floppy_bytes, encode_raw_floppy_bytes, infer_media_from_size, FloppyGeometry,
     FloppyMedia,
 };
@@ -56,7 +56,7 @@ mod tests {
 
     #[test]
     fn decode_recognises_each_supported_geometry() {
-        for media in super::super::floppy_geom::ALL_MEDIA {
+        for media in crate::floppy_geom::ALL_MEDIA {
             let flat = vec![0x55u8; media.geometry().flat_size()];
             let (decoded, m) = decode_hdm_bytes(&flat).unwrap();
             assert_eq!(decoded, flat);
@@ -87,11 +87,11 @@ mod tests {
         // through the other decoder.
         let geom = FloppyMedia::Hd1232.geometry();
         let pattern: Vec<u8> = (0..geom.flat_size()).map(|i| (i & 0xFF) as u8).collect();
-        let xdf_bytes = super::super::xdf::encode_xdf_bytes(&pattern, geom).unwrap();
+        let xdf_bytes = crate::xdf::encode_xdf_bytes(&pattern, geom).unwrap();
         let (decoded_via_hdm, _) = decode_hdm_bytes(&xdf_bytes).unwrap();
         assert_eq!(decoded_via_hdm, pattern);
         let hdm_bytes = encode_hdm_bytes(&pattern, geom).unwrap();
-        let (decoded_via_xdf, _) = super::super::xdf::decode_xdf_bytes(&hdm_bytes).unwrap();
+        let (decoded_via_xdf, _) = crate::xdf::decode_xdf_bytes(&hdm_bytes).unwrap();
         assert_eq!(decoded_via_xdf, pattern);
     }
 }

@@ -262,6 +262,8 @@ The crates already kept separately stay separate, because other projects share t
    - **`dsk-apple` done (2026-10-31)**, MIT: `dc42`, `twomg`, `woz`, `woz_write`, `moof`, `dart` and `lzhuf`, with features `dc42`, `twomg`, `woz` (WOZ + MOOF) and `dart` (pulls `dc42`).
      - `lisa` then moved into `fs-mac` behind a `lisa` feature. It parses DiskCopy 4.2 headers, so `fs-mac` takes `dsk-apple` (feature `dc42` only) as an optional dependency, a deliberate family-to-family exception like `dsk-ghost` -> `fs-pc`.
    - **`dsk-dmg` done (2026-10-31)**, MIT: `dmg`, `ndif`, `sparseimage`, and `dmg_crypto` behind the crate's `crypto` feature (forwarded from the app's `crypto`; off in the 1.73 builds, as before).
+   - **`dsk-floppy` done (2026-10-31)**, MIT: the ten decoders from `rbformats/containers/` (ATR, D88, DIM, EDSK, `floppy_geom`, G64, HDF, HDM, MSA, XDF). `containers/mod.rs`, with its detection and dispatch over the app's `ReadSeek`, stays in the app and re-exports the modules (C6). `msa::encode_msa_bytes` was `#[cfg(test)]` and is now a regular `pub fn`; one app test got its own copy of the ADFS test helper.
+     - **Held back: IMZ** (WinImage). It reads ZIP through the app's `ZipEntryName` shim, which bridges zip 9 (desktop) and zip 2.4.2 (vintage / PPC / Sol9) with different feature sets per build; a crate would have to pin those features without breaking the mrustc builds. `gho` uses it too, so it moves with `dsk-ghost`.
 6. **`arc-mac`, `fs-tar`.**
 7. **Cleanup and docs.**
    - Remove the shims.

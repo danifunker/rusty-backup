@@ -27,6 +27,7 @@ on:
       - "dsk-flux-v*"
       - "dsk-apple-v*"
       - "dsk-dmg-v*"
+      - "dsk-floppy-v*"
   workflow_dispatch:
     inputs:
       crate:
@@ -54,6 +55,7 @@ on:
           - dsk-flux
           - dsk-apple
           - dsk-dmg
+          - dsk-floppy
       dry_run:
         description: Package and verify only, do not upload
         required: true

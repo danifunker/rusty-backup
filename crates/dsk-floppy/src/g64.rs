@@ -5,7 +5,7 @@
 //! preservation-grade format used for copy-protected discs.
 //!
 //! We decode `.g64` / `.g71` down to a flat `.d64` / `.d71` so the
-//! [`crate::fs::cbm`] engine (which speaks logical sectors) can read it.
+//! `fs_8bit::cbm` engine (which speaks logical sectors) can read it.
 //! Decode is read-only: we do not re-encode GCR (an editor would
 //! round-trip through `.d64`/`.d71`). The `.g71` (1571) side-1 mapping —
 //! tracks 36-70 at half-track indices 84,86,..,152 — is validated against
@@ -38,9 +38,9 @@
 //! - **Data block** (260 decoded bytes): `[0x07, data[256], cksum, 0, 0]`,
 //!   `cksum = XOR of the 256 data bytes`.
 
-#[cfg(feature = "rust173-polyfill")]
-use crate::rust173_compat::IntIsMultipleOf as _;
 use anyhow::{anyhow, bail, Context, Result};
+#[cfg(feature = "rust173-polyfill")]
+use disk_core::rust173::IntIsMultipleOf as _;
 
 pub const G64_SIGNATURE: &[u8; 8] = b"GCR-1541";
 pub const G71_SIGNATURE: &[u8; 8] = b"GCR-1571";
@@ -438,7 +438,7 @@ pub fn encode_g64_from_d64(d64: &[u8], tracks: u8) -> Result<Vec<u8>> {
             // Pad to max track size + the 2-byte length prefix.
             let padded = MAX_TRACK_SIZE + 2;
             let cur = 2 + gcr.len();
-            blob_area.extend(crate::compat::repeat_n(0u8, padded - cur));
+            blob_area.extend(disk_core::repeat_n(0u8, padded - cur));
         }
     }
     // Track-offset table.

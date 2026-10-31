@@ -12,13 +12,13 @@
 //! ```
 //!
 //! We decode by stripping the header to expose the flat sector body the
-//! [`crate::fs::atari_dos`] engine reads, and encode by wrapping a body
+//! `fs_8bit::atari_dos` engine reads, and encode by wrapping a body
 //! back up. Single-density (128-byte) is the common Atari800 case; the
 //! body is uniform so no per-sector fix-up is needed.
 
-#[cfg(feature = "rust173-polyfill")]
-use crate::rust173_compat::IntIsMultipleOf as _;
 use anyhow::{bail, Result};
+#[cfg(feature = "rust173-polyfill")]
+use disk_core::rust173::IntIsMultipleOf as _;
 
 /// 16-byte ATR header length.
 pub const ATR_HEADER_LEN: usize = 16;

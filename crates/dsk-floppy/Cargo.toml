@@ -1,0 +1,21 @@
+[package]
+name = "dsk-floppy"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.73"
+license = "MIT"
+authors = ["Dani Sarfati <dani@funkervogt.com>"]
+description = "Vintage floppy and emulator disk-image wrappers: Atari ATR and MSA, Commodore G64, Amstrad EDSK, Sharp D88 / DIM / XDF, PC-98 HDM, Acorn HDF"
+repository = "https://github.com/danifunker/rusty-backup"
+readme = "README.md"
+keywords = ["floppy", "emulator", "disk-image", "retro", "atari"]
+categories = ["emulators", "parser-implementations"]
+
+[features]
+# Only for a Rust 1.73 toolchain; see disk-core.
+rust173-polyfill = ["disk-core/rust173-polyfill"]
+
+[dependencies]
+disk-core = { path = "../disk-core", version = "0.1", default-features = false }
+anyhow = "1"
+byteorder = "1"

@@ -83,13 +83,13 @@ pub fn decode_hdf_bytes(bytes: &[u8]) -> Result<Vec<u8>> {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
 
     /// Build a minimal bare ADFS volume (E-format shape) just big
     /// enough that `looks_like_disc_record` finds the Disc Record at
     /// byte 0xDC0. Same byte layout the existing ADFS unit tests use.
-    pub(crate) fn build_bare_adfs() -> Vec<u8> {
+    fn build_bare_adfs() -> Vec<u8> {
         let mut disk = vec![0u8; 800 * 1024];
         let dr_off = 0xC00 + 0x1C0;
         disk[dr_off] = 10; // log2_sec_size = 10 → 1024-B sectors

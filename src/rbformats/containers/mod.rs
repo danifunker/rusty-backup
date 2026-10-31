@@ -21,18 +21,10 @@
 //! plan.md`), all decoders are ported MIT source or hand-written; no new
 //! crate dependency.
 
-pub mod atr;
-pub mod d88;
-pub mod dim;
-pub mod edsk;
-pub mod floppy_geom;
-pub mod g64;
-pub mod hdf;
-pub mod hdm;
-pub mod msa;
+// The decoders live in the `dsk-floppy` crate; this module keeps the detection and dispatch.
+pub use dsk_floppy::{atr, d88, dim, edsk, floppy_geom, g64, hdf, hdm, msa, xdf};
 // Moved to the `fs-apple2` crate (shared with Apple DOS 3.3); re-exported so existing paths keep working.
 pub use fs_apple2::sector_order;
-pub mod xdf;
 
 use std::io::{Cursor, Read, Seek};
 use std::path::Path;

@@ -4,7 +4,7 @@
 //! header, no per-track records, no sparse encoding. Geometry is inferred
 //! from the file size via [`floppy_geom::infer_media_from_size`].
 //!
-//! HDM uses an identical on-disk format (see the [`super::hdm`] module);
+//! HDM uses an identical on-disk format (see the [`crate::hdm`] module);
 //! both delegate to [`floppy_geom::decode_raw_floppy_bytes`] /
 //! [`floppy_geom::encode_raw_floppy_bytes`] so the only thing that differs
 //! between the two is the file extension and a log-line label.
@@ -13,7 +13,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use super::floppy_geom::{
+use crate::floppy_geom::{
     decode_raw_floppy_bytes, encode_raw_floppy_bytes, infer_media_from_size, FloppyGeometry,
     FloppyMedia,
 };
@@ -65,7 +65,7 @@ mod tests {
 
     #[test]
     fn decode_recognises_each_supported_geometry() {
-        for media in super::super::floppy_geom::ALL_MEDIA {
+        for media in crate::floppy_geom::ALL_MEDIA {
             let flat = vec![0xAAu8; media.geometry().flat_size()];
             let (decoded, m) = decode_xdf_bytes(&flat).unwrap();
             assert_eq!(decoded, flat);
