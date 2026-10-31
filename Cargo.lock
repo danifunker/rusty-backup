@@ -2360,7 +2360,7 @@ version = "0.1.0"
 dependencies = [
  "aes 0.9.3",
  "disk-core",
- "sha2 0.10.9",
+ "sha2 0.11.1",
 ]
 
 [[package]]
