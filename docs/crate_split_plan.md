@@ -318,5 +318,26 @@ Every step's diff stays small, because the old paths keep working through re-exp
 
 ## 11. Open questions
 
-1. Publishing cadence: publish each crate as its family is done, or all at once after step 7? Either way, `dsk-clonezilla` and `fs-xerox` wait for Dani's go-ahead.
+1. Publishing cadence: publish each crate as its family is done, or all at once after step 7? (Alan's consent was confirmed 2026-10-30, so nothing waits on that any more; the publish order is in `RESUME-crate-split.md`.)
 2. Do the crates carry a `rusty-backup` link and description, or stay neutral? Neutral reads better for outside users.
+
+### 11a. Decisions blocking the rest of Steps 5–6 (2026-10-31)
+
+Everything below needs Dani's call. Everything else in Steps 0–5 is done.
+
+**A. The Mac-archive split (D1).** D1 puts the XADMaster-derived code in an LGPL `arc-mac-codecs` and the rest in an MIT `arc-mac`. The code doesn't divide that cleanly:
+- `compactpro.rs` and `stuffit5.rs` are derived *throughout*, including their parsers (`XADCompactProParser.m`, `XADStuffIt5Parser.m`). But they build the MIT archive model (`StuffItArchive`, `StuffItEntry`, `ForkInfo`, `ForkCodec`, defined in `stuffit.rs`), and `stuffit5` calls `stuffit::decompress_fork`, which dispatches to the derived codecs.
+- `bitreader_be.rs` is independent (MIT), but only the derived Huffman and LZAH decoders use it.
+- `stuffit_lzw.rs` mixes the derived decoder with an independent Unix-`compress` encoder. `fs-unix`'s held-back `sun2tape` needs both halves.
+
+Options:
+1. **One crate, honest licence.** `arc-mac`, licensed `MIT AND LGPL-2.1-or-later`, with per-file headers saying which is which. It's the minimal code change. Since `arc-mac` must depend on the codecs anyway, a separate crate gives users nothing extra. *Recommended.*
+2. **D1 as written, with the archive model in the LGPL crate.** `arc-mac-codecs` takes the derived files whole, plus `bitreader_be` and the model types and `decompress_fork` moved out of `stuffit.rs` (both MIT-headed files inside the LGPL crate). `arc-mac` (MIT) keeps the StuffIt 1.5 parser and writer, MacBinary, MacZip, MAR, `detect` and `extract`. `stuffit_lzw` gets split into its decoder and encoder halves.
+3. **Clean-room rewrites** of the derived decoders (D1 option b). This is the only route to an all-MIT `arc-mac`, at about 2,200 lines.
+
+**B. `fs-tar`.** `tar_export` uses the app's `export_selection::{common_parent, relative_dir}` (two small pure helpers). `tar_import` is built on `import_sink`, which is shared with the app's `dir_import`, uses `fs::copy` and `fs-mac`'s AppleDouble code, and calls back into `tar_import`. A crate needs `import_sink` (and probably `dir_import`) to come with it, and `fs-tar` to depend on `fs-mac` for AppleDouble. Options: (1) move `tar_*` + `import_sink` + `dir_import` together and take `fs-mac` as an optional `appledouble` feature; (2) keep tar import in the app and ship an export-only `fs-tar`; (3) drop `fs-tar` as a crate.
+
+**C. `ofs` (old BeOS fs).** It needs `hfs_common::resolve_create_type_creator` and its type/creator table, now in `fs-mac`. Either `fs-unix` gains an optional `fs-mac` dependency for its `bfs` feature, or the table and `resolve_create_type_creator` move into `disk-core` (shared by `fs-mac` and `fs-unix`).
+
+**D. IMZ (WinImage).** It reads ZIP through the app's `ZipEntryName` shim, which bridges zip 9 (desktop) and zip 2.4.2 (the 1.73 and mrustc builds), with different zip features per build. A `dsk-floppy` `imz` feature would need a `zip = ">=2.4.2, <10"` dependency with no default features and its own copy of the shim, leaving the deflate backend to the application's zip features. That's doable, but it changes how three vintage manifests resolve zip. Alternatively IMZ stays in the app.
+
