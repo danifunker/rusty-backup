@@ -18,6 +18,6 @@ crypto = ["dep:aes", "dep:sha2"]
 rust173-polyfill = ["disk-core/rust173-polyfill"]
 
 [dependencies]
-disk-core = { path = "../disk-core", version = "0.1", features = ["fs"] }
+disk-core = { path = "../disk-core", version = "0.2", features = ["fs"] }
 aes = { version = "0.9", optional = true }
 sha2 = { version = ">=0.10, <0.12", optional = true }

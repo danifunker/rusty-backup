@@ -18,7 +18,7 @@ crypto = ["dep:aes", "dep:cbc", "dep:des", "dep:sha1"]
 rust173-polyfill = ["disk-core/rust173-polyfill"]
 
 [dependencies]
-disk-core = { path = "../disk-core", version = "0.1", default-features = false }
+disk-core = { path = "../disk-core", version = "0.2", default-features = false }
 anyhow = "1"
 # The lower bounds are what the Rust 1.73 builds resolve.
 base64 = ">=0.22, <0.24"

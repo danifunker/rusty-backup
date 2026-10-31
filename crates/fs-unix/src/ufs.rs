@@ -49,13 +49,13 @@
 use disk_core::rust173::IntIsMultipleOf as _;
 use std::io::{Read, Seek, SeekFrom, Write};
 
+use crate::unix_common::bitmap::{
+    bitmap_clear_bit, bitmap_find_clear_bit, bitmap_set_bit, BitmapReader,
+};
+use crate::unix_common::compact::{CompactLayout, CompactSection, CompactStreamReader};
 use disk_core::entry::FileEntry;
 use disk_core::filesystem::CompactResult;
 use disk_core::filesystem::{Filesystem, FilesystemError};
-use disk_core::unix_common::bitmap::{
-    bitmap_clear_bit, bitmap_find_clear_bit, bitmap_set_bit, BitmapReader,
-};
-use disk_core::unix_common::compact::{CompactLayout, CompactSection, CompactStreamReader};
 use disk_core::unix_common::inode::{format_unix_timestamp, unix_file_type, UnixFileType};
 
 // ---- Constants ----

@@ -41,10 +41,10 @@
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 
+use crate::unix_common::compact::{CompactLayout, CompactSection, CompactStreamReader};
 use disk_core::entry::FileEntry;
 use disk_core::filesystem::CompactResult;
 use disk_core::filesystem::{Filesystem, FilesystemError};
-use disk_core::unix_common::compact::{CompactLayout, CompactSection, CompactStreamReader};
 
 // ---- Constants ----
 

@@ -1728,7 +1728,7 @@ dependencies = [
 
 [[package]]
 name = "disk-core"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1867,7 +1867,7 @@ dependencies = [
  "fs-pc",
  "log",
  "tempfile",
- "zstd 0.13.3",
+ "zstd 0.14.3",
 ]
 
 [[package]]
@@ -2538,7 +2538,7 @@ dependencies = [
  "disk-core",
  "encoding_rs",
  "tempfile",
- "zstd 0.13.3",
+ "zstd 0.14.3",
 ]
 
 [[package]]
@@ -2591,7 +2591,7 @@ dependencies = [
  "fs-mac",
  "log",
  "tempfile",
- "zstd 0.13.3",
+ "zstd 0.14.3",
 ]
 
 [[package]]
@@ -2612,7 +2612,7 @@ dependencies = [
  "crc32c",
  "disk-core",
  "tempfile",
- "zstd 0.13.3",
+ "zstd 0.14.3",
 ]
 
 [[package]]
@@ -5254,9 +5254,9 @@ checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
 
 [[package]]
 name = "qnx2fs"
-version = "0.3.1"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3785c70daacfcae9705a2fdcd308887a61ef9535ba20ec9d573c11b7026cce91"
+checksum = "3fac164bd62cff11700399bb9aba495dc8fddfe727c537c86c30d277d0cc4fe0"
 dependencies = [
  "chrono",
  "disk-core",

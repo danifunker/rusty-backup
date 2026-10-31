@@ -16,7 +16,7 @@ categories = ["compression", "parser-implementations"]
 rust173-polyfill = ["disk-core/rust173-polyfill", "fs-mac/rust173-polyfill", "dsk-apple/rust173-polyfill"]
 
 [dependencies]
-disk-core = { path = "../disk-core", version = "0.1", default-features = false }
+disk-core = { path = "../disk-core", version = "0.2", default-features = false }
 # Mac Roman names, BinHex and resource forks.
 fs-mac = { path = "../fs-mac", version = "0.1", default-features = false, features = ["hfs", "forks"] }
 # Detecting DiskCopy 4.2 images, which are often what an archive holds.

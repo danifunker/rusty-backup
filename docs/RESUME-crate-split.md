@@ -109,13 +109,8 @@ Read it first, along with `docs/license_audit.md`, CLAUDE.md and CONTRIBUTING.md
 - **Done:** Steps 0–7. No format code is left in the app.
   - The 142 re-export shims are gone (Step 7). The app names crate paths, and app-side tests of moved code live in `src/{fs,partition,rbformats}/moved_tests.rs`.
   - CI on the Step 7 tree passed: Linux, Solaris 9, 1.73 crate tests, and a manual Windows / macOS run.
-- **Loose end 1: `disk-core` 0.2.** Dani chose to move `unix_common::{bitmap, compact}` into `fs-unix` and delete the unused `validate`.
-  - That's a breaking change from the published 0.1.0, so it's `disk-core` 0.2.0, and qnx2fs must accept 0.2 first.
-  - qnx2fs 0.3.2 (`disk-core = ">=0.1, <0.3"`) is committed in `~/repos/qnx2fs`, but not pushed or published.
-  - The rusty-backup side is a **local, unpushed commit** at the tip of `native-frontends` (`refactor: disk-core 0.2 ...`). Its four manifests patch qnx2fs to the local checkout by path, which CI can't see.
-  - Once qnx2fs 0.3.2 is on crates.io: delete those `qnx2fs = { path = ... }` lines, refresh the lockfiles, re-run the gate, and push.
-  - New work meanwhile goes *below* that commit (reset to `origin`, commit, cherry-pick it back) so it stays pushable.
-- **Loose end 2: publishing.** Nothing beyond `disk-core` 0.1.0 is on crates.io. Every crate depends on `disk-core` 0.2 once the commit above lands, so publish `disk-core` 0.2.0 first, then the rest in dependency order (below).
+- **`disk-core` 0.2: done.** `unix_common::{bitmap, compact}` moved into `fs-unix` and the unused `validate` was deleted, so `disk-core` is 0.2.0. qnx2fs 0.3.2, which accepts `disk-core` 0.1 or 0.2, is on crates.io.
+- **Publishing.** Nothing beyond `disk-core` 0.1.0 is on crates.io. Every crate depends on `disk-core` 0.2 once the commit above lands, so publish `disk-core` 0.2.0 first, then the rest in dependency order (below).
 - **Merge:** `native-frontends` merges only after all the native OS frontends are done. Before that, `git rm .github/ci-targets`.
 
 **How each slice was done (scripts are easy to recreate):**

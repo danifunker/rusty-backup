@@ -20,7 +20,7 @@ ucsd = []
 rust173-polyfill = ["disk-core/rust173-polyfill"]
 
 [dependencies]
-disk-core = { path = "../disk-core", version = "0.1", features = ["fs"] }
+disk-core = { path = "../disk-core", version = "0.2", features = ["fs"] }
 # `sector_order` (always built) reports open errors through anyhow.
 anyhow = "1"
 # ProDOS file-type table: embedded JSON plus an optional user override file.

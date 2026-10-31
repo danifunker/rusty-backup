@@ -23,7 +23,7 @@ pure-zstd = ["fs-tar?/pure-zstd"]
 rust173-polyfill = ["disk-core/rust173-polyfill", "arc-mac?/rust173-polyfill", "fs-tar?/rust173-polyfill", "fs-unix?/rust173-polyfill"]
 
 [dependencies]
-disk-core = { path = "../disk-core", version = "0.1.1", features = ["fs"] }
+disk-core = { path = "../disk-core", version = "0.2", features = ["fs"] }
 log = "0.4"
 # Edits rebuild the tape into a temp file beside the original.
 tempfile = "3"

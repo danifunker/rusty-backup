@@ -42,9 +42,9 @@ use crate::ufs::{
     DIRENT_HDR_LEN, MAGIC_OFF, MAGIC_UFS2, OFF_BSIZE, OFF_CBLKNO, OFF_FPG, OFF_FRAG, OFF_FSIZE,
     OFF_IBLKNO, OFF_IPG, OFF_NCG, OFF_OLD_SIZE, OFF_SBLKNO, OFF_SIZE_UFS2, ROOT_INODE,
 };
+use crate::unix_common::bitmap::BitmapReader;
 use disk_core::filesystem::FilesystemError;
 use disk_core::fsck::{FsckIssue, FsckResult, FsckStats, OrphanedEntry};
-use disk_core::unix_common::bitmap::BitmapReader;
 use disk_core::unix_common::inode::{unix_file_type, UnixFileType};
 
 /// FsckIssue codes the future UFS `repair()` path knows how to fix.

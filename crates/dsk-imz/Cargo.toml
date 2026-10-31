@@ -22,7 +22,7 @@ crypto = ["dep:aes", "dep:cbc", "dep:flate2"]
 rust173-polyfill = ["disk-core/rust173-polyfill"]
 
 [dependencies]
-disk-core = { path = "../disk-core", version = "0.1", default-features = false }
+disk-core = { path = "../disk-core", version = "0.2", default-features = false }
 anyhow = "1"
 log = "0.4"
 # zip 9 on current Rust, zip 2.4.2 on 1.73; `zip_compat` covers the one API difference.

@@ -23,7 +23,7 @@ dart = ["dc42"]
 rust173-polyfill = ["disk-core/rust173-polyfill"]
 
 [dependencies]
-disk-core = { path = "../disk-core", version = "0.1", default-features = false }
+disk-core = { path = "../disk-core", version = "0.2", default-features = false }
 anyhow = "1"
 crc32fast = "1"
 log = "0.4"

@@ -17,15 +17,15 @@
 
 use std::io::{Read, Seek, SeekFrom, Write};
 
+use crate::unix_common::bitmap::{
+    bitmap_clear_bit, bitmap_find_clear_bit, bitmap_set_bit, BitmapReader,
+};
+use crate::unix_common::compact::{CompactLayout, CompactSection, CompactStreamReader};
 use disk_core::entry::{EntryType, FileEntry};
 use disk_core::filesystem::CompactResult;
 use disk_core::filesystem::{
     CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem, FilesystemError,
 };
-use disk_core::unix_common::bitmap::{
-    bitmap_clear_bit, bitmap_find_clear_bit, bitmap_set_bit, BitmapReader,
-};
-use disk_core::unix_common::compact::{CompactLayout, CompactSection, CompactStreamReader};
 use disk_core::unix_common::inode::{unix_entry_from_inode, unix_file_type, UnixFileType};
 
 // ---- Constants ----

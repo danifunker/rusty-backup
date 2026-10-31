@@ -123,7 +123,7 @@ sha1 = "0.10"
 crc32c = "0.6"
 crc32fast = "1"
 # QNX 2 (Unisys ICON) reader, writer and checker, shared with icon-emu; MIT.
-qnx2fs = { version = "0.3.1", features = ["disk-core"] }
+qnx2fs = { version = "0.3.2", features = ["disk-core"] }
 chrono = "0.4"
 tempfile = ">=3, <3.13"
 dirs = "6"

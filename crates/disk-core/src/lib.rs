@@ -19,7 +19,7 @@
 //! - [`fsck`]: integrity-check results shared by every checker.
 //! - [`times`]: Unix timestamps and the calendar conversions filesystems need.
 //! - [`xattr`]: extended-attribute names and values.
-//! - [`unix_common`]: inode, bitmap, compaction and validation helpers shared by Unix-style filesystems.
+//! - [`unix_common`]: inode helpers (timestamps, permission bits, uid / gid width) shared by every family with Unix-style metadata.
 //! - [`name_legalize`]: turn any name into one a destination's `validate_name` accepts.
 //! - [`raw_name`]: keep non-UTF-8 name bytes intact through a `String`.
 //! - [`stream_pipe`]: copy a file between two filesystems without holding it in memory.

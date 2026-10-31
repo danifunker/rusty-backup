@@ -68,6 +68,7 @@ pub mod ufs;
 pub mod ufs_format;
 #[cfg(feature = "ufs")]
 pub mod ufs_fsck;
+pub mod unix_common;
 #[cfg(feature = "vxfs")]
 pub mod vxfs;
 #[cfg(feature = "vxfs")]
