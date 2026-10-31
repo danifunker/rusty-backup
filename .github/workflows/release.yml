@@ -70,7 +70,7 @@ jobs:
   #   4. .github/ci-targets on the branch (one comma list; # comments allowed)
   #   5. all
   # Targets: windows macos appimage linux-packages mister extra-arch windows-arm64
-  # riscv64 appliance sol9 cbdos macos-vintage windows-vintage musl.
+  # riscv64 appliance sol9 cbdos macos-vintage windows-vintage musl crates-msrv.
   # Groups: desktop (everything the old "desktop" switch covered), linux
   # (appimage + linux-packages), vintage (macos-vintage + windows-vintage), all, none.
   plan:
@@ -91,6 +91,7 @@ jobs:
       macos-vintage: ${{ steps.p.outputs.macos-vintage }}
       windows-vintage: ${{ steps.p.outputs.windows-vintage }}
       musl: ${{ steps.p.outputs.musl }}
+      crates-msrv: ${{ steps.p.outputs.crates-msrv }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -106,7 +107,7 @@ jobs:
           COMMIT_MSG: ${{ github.event.head_commit.message }}
         run: |
           set -euo pipefail
-          ALL="windows macos appimage linux-packages mister extra-arch windows-arm64 riscv64 appliance sol9 cbdos macos-vintage windows-vintage musl"
+          ALL="windows macos appimage linux-packages mister extra-arch windows-arm64 riscv64 appliance sol9 cbdos macos-vintage windows-vintage musl crates-msrv"
           DESKTOP="windows macos appimage linux-packages mister extra-arch windows-arm64 riscv64 macos-vintage windows-vintage musl"
           if [ "$EVENT" = workflow_dispatch ]; then
             spec="${INPUT_TARGETS:-all}"; why="manual run"
@@ -150,7 +151,7 @@ jobs:
 
   build-windows:
     name: Build Windows
-    # Skipped only when a manual run unticks "desktop"; every push builds it.
+    # Runs when the plan job selects its target.
     if: needs.plan.outputs.windows == 'true'
     needs: [generate-version, plan]
     runs-on: windows-latest
@@ -279,7 +280,7 @@ jobs:
 
   build-macos:
     name: Build macOS
-    # Skipped only when a manual run unticks "desktop"; every push builds it.
+    # Runs when the plan job selects its target.
     if: needs.plan.outputs.macos == 'true'
     needs: [generate-version, plan]
     # Both arches build on the same Apple-silicon runner: arm64 natively, x64
@@ -554,7 +555,7 @@ jobs:
 
   build-linux-appimage:
     name: Build Linux AppImage (Anylinux)
-    # Skipped only when a manual run unticks "desktop"; every push builds it.
+    # Runs when the plan job selects its target.
     if: needs.plan.outputs.appimage == 'true'
     needs: [generate-version, plan]
     runs-on: ${{ matrix.runs-on }}
@@ -768,7 +769,7 @@ jobs:
 
   build-linux-packages:
     name: Build Linux Packages
-    # Skipped only when a manual run unticks "desktop"; every push builds it.
+    # Runs when the plan job selects its target.
     if: needs.plan.outputs.linux-packages == 'true'
     needs: [generate-version, plan]
     runs-on: ${{ matrix.runs-on }}
@@ -937,7 +938,7 @@ jobs:
   # just without the MiSTer artifact for that one run.
   build-rb-cli-mini-armv7:
     name: Build rb-cli-mini (armv7 MiSTer)
-    # Skipped only when a manual run unticks "desktop"; every push builds it.
+    # Runs when the plan job selects its target.
     if: needs.plan.outputs.mister == 'true'
     needs: [generate-version, plan]
     runs-on: ubuntu-24.04
@@ -1139,7 +1140,7 @@ jobs:
   # `byteorder` with explicit endianness, so BE is just another build.
   build-rb-cli-extra-arch:
     name: Build rb-cli (${{ matrix.label }})
-    # Skipped only when a manual run unticks "desktop"; every push builds it.
+    # Runs when the plan job selects its target.
     if: needs.plan.outputs.extra-arch == 'true'
     needs: [generate-version, plan]
     runs-on: ubuntu-24.04
@@ -1250,7 +1251,7 @@ jobs:
   # so the test legs stay on the x64/x86 Windows jobs.
   build-windows-arm64:
     name: Build Windows ARM64 (GUI + rb-cli)
-    # Skipped only when a manual run unticks "desktop"; every push builds it.
+    # Runs when the plan job selects its target.
     if: needs.plan.outputs.windows-arm64 == 'true'
     needs: [generate-version, plan]
     runs-on: windows-latest
@@ -1331,7 +1332,7 @@ jobs:
   # block release.
   build-gui-linux-riscv64:
     name: Build Linux RISC-V 64 GUI (rusty-backup)
-    # Skipped only when a manual run unticks "desktop"; every push builds it.
+    # Runs when the plan job selects its target.
     if: needs.plan.outputs.riscv64 == 'true'
     needs: [generate-version, plan]
     runs-on: ubuntu-24.04
@@ -1879,6 +1880,29 @@ jobs:
             crusty-backup/dist/cbdos-freedos-${{ needs.generate-version.outputs.version }}.img
             crusty-backup/dist/cbdos-${{ needs.generate-version.outputs.version }}.iso
 
+  # Every crate under crates/ runs its own tests on the Rust 1.73 floor. The app's
+  # vintage builds only compile the crates, so this is the one place their tests
+  # meet 1.73 (crate_split_plan.md §5). See scripts/test-crates-msrv.sh.
+  test-crates-msrv:
+    name: Test crates on Rust 1.73
+    if: needs.plan.outputs.crates-msrv == 'true'
+    needs: plan
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust 1.73.0
+        uses: dtolnay/rust-toolchain@1.73.0
+      - name: Cache cargo registry
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-msrv-${{ hashFiles('rb-cli-vintage/Cargo.lock') }}
+      - name: Test every crate
+        env:
+          CARGO_INCREMENTAL: "0"
+          CARGO_PROFILE_DEV_DEBUG: "0"
+        run: scripts/test-crates-msrv.sh
+
   # Vintage rb-cli (CLI + full TUI) for macOS 10.7 Lion and up. Built on a normal
   # (Apple-silicon) macOS runner — NO emulation: it *cross-compiles* to x86_64
   # with Rust 1.73.0 (the last toolchain whose prebuilt x86_64-apple-darwin std
@@ -1888,7 +1912,7 @@ jobs:
   # binary runs on any newer macOS). See docs/add_10_7_macos.md.
   build-macos-vintage:
     name: Build rb-cli (macOS 10.7+ Intel, Rust 1.73)
-    # Skipped only when a manual run unticks "desktop"; every push builds it.
+    # Runs when the plan job selects its target.
     if: needs.plan.outputs.macos-vintage == 'true'
     needs: [generate-version, plan]
     # Pinned like build-macos (not `macos-latest`) for a deterministic image

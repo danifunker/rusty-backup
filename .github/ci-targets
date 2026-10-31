@@ -1,4 +1,4 @@
 # Default CI targets for pushes to this branch (main/master ignore this file and build everything).
-# Crate-split work: the Linux test legs plus Solaris 9, the one build that can't run locally.
+# Crate-split work: the Linux test legs, Solaris 9 (the one build that can't run locally), and every crate's tests on Rust 1.73.
 # Delete this file before merging, or branches cut from main will inherit it.
-linux-packages, sol9
+linux-packages, sol9, crates-msrv

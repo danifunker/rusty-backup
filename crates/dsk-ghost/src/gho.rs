@@ -8519,7 +8519,10 @@ mod tests {
     // ---------- materializer-stub error-shape tests ----------
 
     fn write_to_temp(bytes: &[u8]) -> std::path::PathBuf {
-        let dir = tempfile::tempdir().unwrap().keep();
+        // Keep the directory without `TempDir::keep` (tempfile 3.20+; the 1.73 builds lock older).
+        let guard = tempfile::tempdir().unwrap();
+        let dir = guard.path().to_path_buf();
+        std::mem::forget(guard);
         let path = dir.join("test.GHO");
         let mut f = File::create(&path).unwrap();
         f.write_all(bytes).unwrap();
