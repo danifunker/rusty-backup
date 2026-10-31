@@ -33,6 +33,7 @@ on:
       - "fs-adfs-v*"
       - "fs-tar-v*"
       - "arc-mac-v*"
+      - "dsk-imz-v*"
   workflow_dispatch:
     inputs:
       crate:
@@ -66,6 +67,7 @@ on:
           - fs-adfs
           - fs-tar
           - arc-mac
+          - dsk-imz
       dry_run:
         description: Package and verify only, do not upload
         required: true

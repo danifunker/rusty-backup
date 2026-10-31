@@ -707,6 +707,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "dsk-imz"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "disk-core",
+ "log",
+ "md-5",
+ "tempfile",
+ "zip",
+]
+
+[[package]]
 name = "dsk-vm"
 version = "0.1.0"
 dependencies = [
@@ -1647,6 +1659,7 @@ dependencies = [
  "dsk-floppy",
  "dsk-flux",
  "dsk-ghost",
+ "dsk-imz",
  "dsk-vm",
  "encoding_rs",
  "env_logger",

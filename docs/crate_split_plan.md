@@ -359,5 +359,12 @@ Original note:  `tar_export` uses the app's `export_selection::{common_parent, r
 
 **C. `ofs` (old BeOS fs). DECIDED 2026-10-31: optional dependency; DONE.** `ofs`, `ofs_fsck` and `ofs_write` are in `fs-unix` behind an `ofs` feature (off by default) that pulls in `fs-mac` for `hfs_common::resolve_create_type_creator`. Since `fs-mac` depends on the GPL-2.0-only `fs-mac-unicode`, a build with `ofs` on is GPL as a whole; the crate README says so. The app enables it in all four manifests. Original note:  It needs `hfs_common::resolve_create_type_creator` and its type/creator table, now in `fs-mac`. Either `fs-unix` gains an optional `fs-mac` dependency for its `bfs` feature, or the table and `resolve_create_type_creator` move into `disk-core` (shared by `fs-mac` and `fs-unix`).
 
-**D. IMZ (WinImage).** It reads ZIP through the app's `ZipEntryName` shim, which bridges zip 9 (desktop) and zip 2.4.2 (the 1.73 and mrustc builds), with different zip features per build. A `dsk-floppy` `imz` feature would need a `zip = ">=2.4.2, <10"` dependency with no default features and its own copy of the shim, leaving the deflate backend to the application's zip features. That's doable, but it changes how three vintage manifests resolve zip. Alternatively IMZ stays in the app.
+**D. IMZ (WinImage). DECIDED 2026-10-31: its own crate; DONE.**
+- `imz` moved into `crates/dsk-imz` (MIT).
+- It takes `zip = ">=2.4.2, <10"` with no default features, and carries its own copy of the entry-name shim (`zip_compat`), switched by `rust173-polyfill` exactly as the app's is.
+- A default `deflate` feature turns on zip's deflate for standalone users. rusty-backup takes the crate with default features off, so each of its four builds keeps its own zip feature set (the mrustc builds use `deflate-flate2`).
+- WinImage's password scheme is behind `crypto` (aes, cbc, flate2), forwarded from the app's `crypto`.
+- On Rust 1.73 the harness resolves zip 2.4.2 and the tests pass. That needed the same `TempDir::keep` replacement as `dsk-ghost`.
+
+Original note:  It reads ZIP through the app's `ZipEntryName` shim, which bridges zip 9 (desktop) and zip 2.4.2 (the 1.73 and mrustc builds), with different zip features per build. A `dsk-floppy` `imz` feature would need a `zip = ">=2.4.2, <10"` dependency with no default features and its own copy of the shim, leaving the deflate backend to the application's zip features. That's doable, but it changes how three vintage manifests resolve zip. Alternatively IMZ stays in the app.
 

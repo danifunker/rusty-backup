@@ -1871,6 +1871,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "dsk-imz"
+version = "0.1.0"
+dependencies = [
+ "aes 0.9.3",
+ "anyhow",
+ "cbc 0.2.1",
+ "disk-core",
+ "flate2",
+ "log",
+ "md-5",
+ "tempfile",
+ "zip",
+]
+
+[[package]]
 name = "dsk-vm"
 version = "0.1.0"
 dependencies = [
@@ -5981,6 +5996,7 @@ dependencies = [
  "dsk-floppy",
  "dsk-flux",
  "dsk-ghost",
+ "dsk-imz",
  "dsk-vm",
  "eframe",
  "egui",
