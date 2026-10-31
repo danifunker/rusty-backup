@@ -63,7 +63,7 @@ pub fn run(args: RmArgs) -> Result<()> {
 /// passes one; see [`super::squashfs`].
 pub fn run_with_budget(
     args: RmArgs,
-    budget: Option<crate::fs::squashfs_edit::SizeBudget>,
+    budget: Option<fs_squashfs::squashfs_edit::SizeBudget>,
 ) -> Result<()> {
     let (file, mut ctx, commit) = resolve_partition_rw_forced(
         &args.image.path,
@@ -137,7 +137,7 @@ pub fn run_with_budget(
     let children = fs
         .list_directory(&parent)
         .map_err(|e| anyhow!("list_directory: {e}"))?;
-    let entry = crate::fs::filesystem::find_child(fold, &children, &name)
+    let entry = disk_core::filesystem::find_child(fold, &children, &name)
         .cloned()
         .ok_or_else(|| anyhow!("not found: {}", args.path))?;
 

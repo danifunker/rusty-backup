@@ -23,8 +23,8 @@ use opticaldiscs::browse::filesystem::Filesystem as OptFilesystem;
 use opticaldiscs::browse::open_disc_filesystem;
 use opticaldiscs::detect::DiscImageInfo;
 
-use super::entry::FileEntry;
-use super::filesystem::{Filesystem, FilesystemError};
+use disk_core::entry::FileEntry;
+use disk_core::filesystem::{Filesystem, FilesystemError};
 
 /// A read-only [`Filesystem`] over an optical disc image's data filesystem.
 pub struct OpticalFilesystem {

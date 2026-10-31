@@ -283,8 +283,8 @@ fn spawn_progress_pump(progress: Arc<Mutex<BackupProgress>>) {
                     log_stderr(format!(
                         "  progress: {:>3}% ({}/{})",
                         pct,
-                        crate::partition::format_size(cur),
-                        crate::partition::format_size(total),
+                        disk_core::display::format_size(cur),
+                        disk_core::display::format_size(total),
                     ));
                     last_pct = pct;
                 }

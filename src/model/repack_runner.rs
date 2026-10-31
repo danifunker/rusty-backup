@@ -5,7 +5,7 @@
 //! Shared by the GUI inspect tab (the per-partition "Defragment" button)
 //! and modeled on [`super::chd_expand_runner`]: spawn returns a shared
 //! [`RepackStatus`] the caller polls each frame. The heavy lifting lives in
-//! [`crate::fs::human68k_clone::stream_defragmented_human68k`] — the same
+//! [`fs_pc::human68k_clone::stream_defragmented_human68k`] — the same
 //! engine the `rb-cli repack` verb calls — so the GUI and CLI behave
 //! identically.
 //!
@@ -20,10 +20,10 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use super::status::RepackStatus;
-use crate::fs::filesystem::Filesystem;
-use crate::fs::human68k::Human68kFilesystem;
-use crate::fs::human68k_clone::stream_defragmented_human68k;
-use crate::partition::format_size;
+use disk_core::display::format_size;
+use disk_core::filesystem::Filesystem;
+use fs_pc::human68k::Human68kFilesystem;
+use fs_pc::human68k_clone::stream_defragmented_human68k;
 
 /// Spawn a worker that defragments the Human68k partition at
 /// `partition_offset` inside the image at `path`, in place. Returns a

@@ -11,7 +11,7 @@ const MIB: usize = 1024 * 1024;
 
 /// One FAT partition at LBA 2048 declared 4 MiB long, on a file cut 1 MiB short.
 fn truncated_mbr_image(path: &std::path::Path) {
-    let fat = rusty_backup::fs::fat::create_blank_fat(4 * MIB as u64, Some("SHORT")).unwrap();
+    let fat = fs_pc::fat::create_blank_fat(4 * MIB as u64, Some("SHORT")).unwrap();
     let mut disk = vec![0u8; 2048 * 512];
     disk[446 + 4] = 0x06;
     disk[446 + 8..446 + 12].copy_from_slice(&2048u32.to_le_bytes());

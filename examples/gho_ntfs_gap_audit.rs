@@ -6,7 +6,7 @@
 // Usage:
 //   cargo run --release --example gho_ntfs_gap_audit -- PATH.GHO
 
-use rusty_backup::rbformats::gho::GhoReader;
+use dsk_ghost::gho::GhoReader;
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom};
 

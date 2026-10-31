@@ -5,7 +5,7 @@
 //   2. Every $INDEX_ALLOCATION block has "INDX" magic (no zero/garbage blocks).
 //   3. For each $INDEX_ALLOCATION attribute, each block's self-VCN (offset 0x10)
 //      equals its expected VCN -> catches within-attribute block swaps.
-use rusty_backup::rbformats::gho::GhoReader;
+use dsk_ghost::gho::GhoReader;
 use std::io::{Read, Seek, SeekFrom};
 
 fn rd_u16(b: &[u8], o: usize) -> u16 {

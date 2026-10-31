@@ -333,7 +333,7 @@ pub fn prepare_disk_image_path(
         // GUI pipeline (which addresses partitions by byte offset on a
         // path) sees a plain `.st` image.
         let bytes = std::fs::read(path)?;
-        let flat = rusty_backup::rbformats::containers::msa::decode_msa_bytes(&bytes)
+        let flat = dsk_floppy::msa::decode_msa_bytes(&bytes)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:#}")))?;
         std::fs::write(&out_path, &flat)?;
         log::info!(
@@ -348,7 +348,7 @@ pub fn prepare_disk_image_path(
         // D88 → flat raw sectors. Same shape as MSA: small floppy
         // (~1.5 MB max for 2HD), in-memory decode, tempfile drop-in.
         let bytes = std::fs::read(path)?;
-        let flat = rusty_backup::rbformats::containers::d88::decode_d88_bytes(&bytes)
+        let flat = dsk_floppy::d88::decode_d88_bytes(&bytes)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:#}")))?;
         std::fs::write(&out_path, &flat)?;
         log::info!(
@@ -363,7 +363,7 @@ pub fn prepare_disk_image_path(
         let bytes = std::fs::read(path)?;
         let (flat, label) = match ext.as_deref() {
             Some("xdf") => (
-                rusty_backup::rbformats::containers::xdf::decode_xdf_bytes(&bytes)
+                dsk_floppy::xdf::decode_xdf_bytes(&bytes)
                     .map_err(|e| {
                         std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:#}"))
                     })?
@@ -371,7 +371,7 @@ pub fn prepare_disk_image_path(
                 "XDF",
             ),
             Some("hdm") => (
-                rusty_backup::rbformats::containers::hdm::decode_hdm_bytes(&bytes)
+                dsk_floppy::hdm::decode_hdm_bytes(&bytes)
                     .map_err(|e| {
                         std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:#}"))
                     })?
@@ -379,7 +379,7 @@ pub fn prepare_disk_image_path(
                 "HDM",
             ),
             Some("dim") => (
-                rusty_backup::rbformats::containers::dim::decode_dim_bytes(&bytes)
+                dsk_floppy::dim::decode_dim_bytes(&bytes)
                     .map_err(|e| {
                         std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:#}"))
                     })?

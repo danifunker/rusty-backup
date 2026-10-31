@@ -19,17 +19,17 @@ use std::thread;
 
 use anyhow::{bail, Context, Result};
 
-use crate::fs::entry::{EntryType, FileEntry};
-use crate::fs::filesystem::Filesystem;
-use crate::fs::fork_export::{export_file_with_fork, primary_output_path, safe_name};
 use crate::fs::replace::OnConflict;
-use crate::fs::resource_fork::{ImportedResourceFork, ResourceForkMode};
 use crate::model::browse_session::BrowseSession;
 use crate::model::commander_descend::DescendKind;
 use crate::model::edit_queue::{apply_edit, EditQueue, QueueScan, StagedEdit};
 use crate::model::wrapper_tree::{PreparedMount, WrapperSource, WrapperTree};
 #[cfg(feature = "remote")]
 use crate::remote::RemoteConnection;
+use disk_core::entry::{EntryType, FileEntry};
+use disk_core::filesystem::Filesystem;
+use fs_mac::fork_export::{export_file_with_fork, primary_output_path, safe_name};
+use fs_mac::resource_fork::{ImportedResourceFork, ResourceForkMode};
 
 /// Apply `edits` to `session`'s source in order, stopping at the first failure.
 /// What landed is synced and committed; the error names how many applied.
@@ -449,7 +449,7 @@ fn run_wrapper_open(
         WrapperOpenPlan::Extract(ex) => {
             let WrapperExtract { base, entry } = *ex;
             let mut fs = base.open().map_err(|e| format!("{e:#}"))?;
-            let large = entry.size > crate::fs::mem_archive::INLINE_MAX;
+            let large = entry.size > fs_tar::mem_archive::INLINE_MAX;
             if large || matches!(kind, DescendKind::DiskImage | DescendKind::Optical) {
                 // Stream to disk so a multi-GB image or archive never sits in RAM.
                 let (dir, path) =
@@ -711,14 +711,14 @@ fn stage_host_into(entries: &[FileEntry], dest_parent: &FileEntry, edits: &mut V
             let host_path = PathBuf::from(&entry.path);
             // A sidecar is consumed as part of its primary file below; staging
             // it as well would land resource-fork bytes as their own file.
-            if crate::fs::resource_fork::is_resource_fork_sidecar(&host_path) {
+            if fs_mac::resource_fork::is_resource_fork_sidecar(&host_path) {
                 continue;
             }
             // Mac files reach a host folder in one of four containers (native
             // fork, `._name`, `.bin`, `.hqx`). Reading them here is what makes
             // a Commander drag from the host pane preserve forks the way the
             // Inspect tab's import already did (R-041).
-            let resource_fork = crate::fs::resource_fork::detect_resource_fork(&host_path);
+            let resource_fork = fs_mac::resource_fork::detect_resource_fork(&host_path);
             // A whole-file container carries the real Mac name and the data
             // fork; `apply_edit` writes those bytes instead of the wrapper.
             let name = resource_fork
@@ -1200,7 +1200,7 @@ fn copy_image_entries_to_host(
             return Err(cancelled_err());
         }
         if entry.is_directory() {
-            let sub = dest_dir.join(crate::fs::resource_fork::sanitize_filename(&entry.name));
+            let sub = dest_dir.join(fs_mac::resource_fork::sanitize_filename(&entry.name));
             std::fs::create_dir_all(&sub).with_context(|| format!("creating {}", sub.display()))?;
             let children = fs
                 .list_directory(entry)
@@ -1745,7 +1745,7 @@ pub fn spawn_remote_apply(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs::entry::FileEntry;
+    use disk_core::entry::FileEntry;
 
     /// X12: a host copy wrote over existing files without asking. The
     /// preflight names them and the copy honours Skip and Overwrite.
@@ -1800,14 +1800,14 @@ mod tests {
 
     /// A blank flat HFS image on disk with `/Existing` (file) and `/Plug-ins` (folder).
     fn hfs_session() -> (tempfile::NamedTempFile, BrowseSession) {
-        use crate::fs::filesystem::{
+        use disk_core::filesystem::{
             CreateDirectoryOptions, CreateFileOptions, EditableFilesystem,
         };
-        let mut img = crate::fs::hfs::create_blank_hfs(8 << 20, 4096, "Dest").unwrap();
+        let mut img = fs_mac::hfs::create_blank_hfs(8 << 20, 4096, "Dest").unwrap();
         let file = tempfile::Builder::new().suffix(".hfv").tempfile().unwrap();
         {
             let mut fs =
-                crate::fs::hfs::HfsFilesystem::open(std::io::Cursor::new(&mut img), 0).unwrap();
+                fs_mac::hfs::HfsFilesystem::open(std::io::Cursor::new(&mut img), 0).unwrap();
             let root = fs.root().unwrap();
             let mut data: &[u8] = b"old";
             fs.create_file(
@@ -1923,12 +1923,12 @@ mod tests {
     /// delete-plus-add batch through `apply_edits` and confirm the result lands.
     #[test]
     fn apply_edits_deletes_and_adds_on_a_real_image() {
-        use crate::fs::filesystem::CreateFileOptions;
+        use disk_core::filesystem::CreateFileOptions;
         use std::fs::OpenOptions;
         use std::io::Cursor;
 
         // Seed image: KEEP.TXT + GONE.TXT at the root.
-        let flat = crate::fs::fat::create_blank_fat(737280, Some("OPS")).unwrap();
+        let flat = fs_pc::fat::create_blank_fat(737280, Some("OPS")).unwrap();
         let tmp = tempfile::Builder::new().suffix(".img").tempfile().unwrap();
         std::fs::write(tmp.path(), &flat).unwrap();
         {
@@ -2007,11 +2007,11 @@ mod tests {
     /// place on a real FAT image (the M6.3 staging path).
     #[test]
     fn apply_edits_renames_in_place_on_a_real_image() {
-        use crate::fs::filesystem::CreateFileOptions;
+        use disk_core::filesystem::CreateFileOptions;
         use std::fs::OpenOptions;
         use std::io::Cursor;
 
-        let flat = crate::fs::fat::create_blank_fat(737280, Some("REN")).unwrap();
+        let flat = fs_pc::fat::create_blank_fat(737280, Some("REN")).unwrap();
         let tmp = tempfile::Builder::new().suffix(".img").tempfile().unwrap();
         std::fs::write(tmp.path(), &flat).unwrap();
         {
@@ -2075,12 +2075,12 @@ mod tests {
     /// volume, apply onto a blank one, and confirm the whole subtree lands.
     #[test]
     fn stage_copy_recreates_a_subtree_on_another_volume() {
-        use crate::fs::filesystem::{CreateDirectoryOptions, CreateFileOptions};
+        use disk_core::filesystem::{CreateDirectoryOptions, CreateFileOptions};
         use std::fs::OpenOptions;
         use std::io::Cursor;
 
         // Source: /TOP.TXT and /SUB/INNER.TXT.
-        let src_flat = crate::fs::fat::create_blank_fat(737280, Some("SRC")).unwrap();
+        let src_flat = fs_pc::fat::create_blank_fat(737280, Some("SRC")).unwrap();
         let src_img = tempfile::Builder::new().suffix(".img").tempfile().unwrap();
         std::fs::write(src_img.path(), &src_flat).unwrap();
         {
@@ -2115,7 +2115,7 @@ mod tests {
         }
 
         // Destination: a blank FAT volume.
-        let dst_flat = crate::fs::fat::create_blank_fat(737280, Some("DST")).unwrap();
+        let dst_flat = fs_pc::fat::create_blank_fat(737280, Some("DST")).unwrap();
         let dst_img = tempfile::Builder::new().suffix(".img").tempfile().unwrap();
         std::fs::write(dst_img.path(), &dst_flat).unwrap();
         let dst_session = BrowseSession {
@@ -2189,7 +2189,7 @@ mod tests {
         let edits = stage_host_to_image(&host_entries, &FileEntry::root());
 
         // Apply onto a blank FAT image.
-        let flat = crate::fs::fat::create_blank_fat(737280, Some("DST")).unwrap();
+        let flat = fs_pc::fat::create_blank_fat(737280, Some("DST")).unwrap();
         let dst = tempfile::Builder::new().suffix(".img").tempfile().unwrap();
         std::fs::write(dst.path(), &flat).unwrap();
         let session = BrowseSession {
@@ -2214,11 +2214,11 @@ mod tests {
     /// image -> host: extract a file + subtree from a FAT volume to a host dir.
     #[test]
     fn copy_image_to_host_extracts_tree() {
-        use crate::fs::filesystem::{CreateDirectoryOptions, CreateFileOptions};
+        use disk_core::filesystem::{CreateDirectoryOptions, CreateFileOptions};
         use std::fs::OpenOptions;
         use std::io::Cursor;
 
-        let flat = crate::fs::fat::create_blank_fat(737280, Some("SRC")).unwrap();
+        let flat = fs_pc::fat::create_blank_fat(737280, Some("SRC")).unwrap();
         let img = tempfile::Builder::new().suffix(".img").tempfile().unwrap();
         std::fs::write(img.path(), &flat).unwrap();
         {

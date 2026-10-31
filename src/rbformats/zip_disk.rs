@@ -2,7 +2,7 @@
 //! archive.
 //!
 //! Unlike WinImage `.imz` (a ZIP holding a *floppy* image, decompressed
-//! into RAM by [`crate::rbformats::imz`]), a `.zip` here may hold a full
+//! into RAM by [`dsk_imz::imz`]), a `.zip` here may hold a full
 //! hard-disk image that is hundreds of MB or several GB. So the chosen
 //! entry is inflated to a temp file once at open time and random-accessed
 //! from there — the same shape as `source_reader`'s `GzipTempReader`.

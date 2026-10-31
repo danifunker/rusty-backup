@@ -4,7 +4,7 @@
 //! CRC32, MD5, SHA1, and SHA256 — and returns a [`ChecksumSet`] with hex
 //! accessors. The same streaming core ([`ChecksumHasher`], a `std::io::Write`
 //! sink) backs the image path, where data is produced by
-//! [`Filesystem::write_file_to`](crate::fs::filesystem::Filesystem::write_file_to)
+//! [`Filesystem::write_file_to`](disk_core::filesystem::Filesystem::write_file_to)
 //! rather than read from a file handle.
 //!
 //! This deliberately does **not** reuse `backup::verify::RunningHasher` (CRC32 /
@@ -24,8 +24,8 @@ use md5::{Digest, Md5};
 use sha1::Sha1;
 use sha2::Sha256;
 
-use crate::fs::entry::FileEntry;
 use crate::model::commander_ops::StageSource;
+use disk_core::entry::FileEntry;
 
 /// The four computed digests for one file. Raw bytes; use the `*_hex`
 /// accessors for display.

@@ -5,8 +5,8 @@
 
 use std::io::Cursor;
 
-use rusty_backup::fs::adfs::AdfsFilesystem;
-use rusty_backup::fs::filesystem::Filesystem;
+use disk_core::filesystem::Filesystem;
+use fs_adfs::adfs::AdfsFilesystem;
 
 fn main() {
     for path in std::env::args().skip(1) {

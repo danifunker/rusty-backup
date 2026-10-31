@@ -1,7 +1,7 @@
 //! `FileEntry` lives in the `disk-core` crate; this adds the app's ProDOS-aware type display.
 
-pub use disk_core::entry::*;
-
+#[allow(unused_imports)]
+use disk_core::entry::*;
 /// Render a file type for display (`ls`, GUI, remote browse), resolved
 /// per-filesystem: a Mac `OSType` lossily (non-ASCII → `.`), a ProDOS type as
 /// `$XX`. `None` when neither is present. Shared by [`FileEntry`] and the
@@ -11,10 +11,10 @@ pub fn display_file_type(
     prodos_file_type: Option<u8>,
 ) -> Option<String> {
     if let Some(code) = os_type {
-        return Some(crate::fs::hfs_common::decode_ostype(code));
+        return Some(fs_mac::hfs_common::decode_ostype(code));
     }
     if let Some(byte) = prodos_file_type {
-        return Some(crate::fs::prodos_types::format_type_code(byte));
+        return Some(fs_apple2::prodos_types::format_type_code(byte));
     }
     None
 }

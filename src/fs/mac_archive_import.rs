@@ -1,8 +1,8 @@
 //! Unpack a classic-Mac archive straight into an open filesystem — the Mac
-//! counterpart of [`crate::fs::tar_import`], and what `--expand-archives` means
+//! counterpart of [`fs_tar::tar_import`], and what `--expand-archives` means
 //! for a `.sit` / `.cpt` / `.hqx` / `.sea` / `.mar` instead of a `.tardist`.
 //!
-//! Everything is already in the tree: [`crate::macarchive::extract`] decodes the
+//! Everything is already in the tree: [`arc_mac::extract`] decodes the
 //! archive, [`crate::fs::archive_fs::ArchiveFilesystem`] presents it as a
 //! read-only [`Filesystem`], and [`crate::fs::copy`] copies one filesystem's
 //! tree into another. This module is the ~three-call join between them, so an
@@ -23,11 +23,11 @@ use anyhow::{anyhow, Context, Result};
 
 use super::archive_fs::ArchiveFilesystem;
 use super::copy::{copy_into, ConflictMode, CopyOptions, CopyStats};
-use super::entry::{EntryType, FileEntry};
-use super::filesystem::{EditableFilesystem, Filesystem};
-use super::import_sink::{ImportConflict, ImportOptions, ImportStats};
-use crate::macarchive::detect::detect_mac_archive;
 use crate::model::file_types::MAC_ARCHIVE_EXTS;
+use arc_mac::detect::detect_mac_archive;
+use disk_core::entry::{EntryType, FileEntry};
+use disk_core::filesystem::{EditableFilesystem, Filesystem};
+use fs_tar::import_sink::{ImportConflict, ImportOptions, ImportStats};
 
 /// Does `path` name a Mac archive this module can expand?
 ///
@@ -51,7 +51,7 @@ pub fn looks_like_mac_archive(path: &Path) -> bool {
 /// counted in `bytes` — a classic Mac app can carry all of its code in the
 /// resource fork, so ignoring it under-sizes the volume by the whole payload.
 ///
-/// The counterpart of [`crate::fs::tar_import::measure_tar_expanded`], used by
+/// The counterpart of [`fs_tar::tar_import::measure_tar_expanded`], used by
 /// `--size auto`.
 pub fn measure_mac_archive_expanded(path: &Path) -> Result<(u64, u64, u64)> {
     let mut fs = ArchiveFilesystem::open_path(path)
@@ -94,7 +94,7 @@ fn measure_dir_into(
 /// Unpack `path`'s contents into `dest` on an open filesystem. Returns the
 /// import tally so a caller mid-walk can fold it into its own totals.
 ///
-/// The counterpart of [`crate::fs::tar_import::import_tar_from_path_into`].
+/// The counterpart of [`fs_tar::tar_import::import_tar_from_path_into`].
 /// `progress` fires once per top-level archive member; Mac archives are small
 /// enough (tens of MB at the outside) that finer granularity buys nothing.
 pub fn import_mac_archive_from_path_into(
@@ -165,9 +165,7 @@ fn fold(copied: &CopyStats, stats: &mut ImportStats) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::macarchive::stuffit::{
-        build_archive_tree, StuffItInput, StuffItInputNode, WriteMethod,
-    };
+    use arc_mac::stuffit::{build_archive_tree, StuffItInput, StuffItInputNode, WriteMethod};
 
     fn file_node(name: &str, data: &[u8], rsrc: &[u8]) -> StuffItInputNode {
         StuffItInputNode::File(StuffItInput {
@@ -207,7 +205,7 @@ mod tests {
             file_node("readme.txt", b"hello", b""),
             file_node("Tool", b"DATA", b"RESOURCEFORKBYTES"),
         ];
-        let bytes = crate::macarchive::mar::build_archive("Bundle", &tree).expect("build mar");
+        let bytes = arc_mac::mar::build_archive("Bundle", &tree).expect("build mar");
         let path = dir.join("Bundle.mar");
         std::fs::write(&path, bytes).expect("write archive");
         path
@@ -218,7 +216,7 @@ mod tests {
         let img = dir.join("vol.dsk");
         std::fs::write(
             &img,
-            crate::fs::hfs::create_blank_hfs(16 * 1024 * 1024, 512, "EXPAND").expect("format"),
+            fs_mac::hfs::create_blank_hfs(16 * 1024 * 1024, 512, "EXPAND").expect("format"),
         )
         .expect("write image");
         let f = std::fs::OpenOptions::new()

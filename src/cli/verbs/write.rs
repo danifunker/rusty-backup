@@ -15,7 +15,7 @@ use crate::cli::logging::log_stderr;
 use crate::model::physical_write_runner::{
     self, PhysicalWriteRequest, PhysicalWriteSource, WriteExtent,
 };
-use crate::partition::format_size;
+use disk_core::display::format_size;
 
 #[derive(Debug, Args)]
 pub struct WriteArgs {

@@ -11,8 +11,8 @@
 use std::fs;
 use std::io::Cursor;
 
-use rusty_backup::fs::atari_dos::AtariDosFilesystem;
-use rusty_backup::fs::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+use disk_core::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+use fs_8bit::atari_dos::AtariDosFilesystem;
 
 fn sha256_hex(b: &[u8]) -> String {
     use sha2::{Digest, Sha256};

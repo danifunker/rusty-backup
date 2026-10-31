@@ -50,16 +50,16 @@ fn backup_config(
 /// backup stream is guaranteed to exceed a 1 MiB split boundary whatever the
 /// codec does with it.
 fn source_image(path: &std::path::Path, payload_bytes: usize) {
-    let blob = rusty_backup::fs::fat::create_blank_fat(32 * 1024 * 1024, Some("SPLIT")).unwrap();
+    let blob = fs_pc::fat::create_blank_fat(32 * 1024 * 1024, Some("SPLIT")).unwrap();
     std::fs::write(path, &blob).unwrap();
 
-    use rusty_backup::fs::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+    use disk_core::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open(path)
         .unwrap();
-    let mut fs = rusty_backup::fs::fat::FatFilesystem::open(file, 0).unwrap();
+    let mut fs = fs_pc::fat::FatFilesystem::open(file, 0).unwrap();
     let root = fs.root().unwrap();
     // A cheap xorshift keeps this incompressible without pulling in rand.
     let mut state: u64 = 0x243F_6A88_85A3_08D3;
@@ -170,7 +170,7 @@ fn raw_split_backup_restores_every_member() {
 /// read back whole. A byte-compare alone would not say *which* bytes were lost.
 #[test]
 fn a_file_spanning_several_members_reads_back_intact() {
-    use rusty_backup::fs::filesystem::Filesystem;
+    use disk_core::filesystem::Filesystem;
 
     let dir = tempfile::tempdir().unwrap();
     let work = dir.path().to_path_buf();
@@ -179,8 +179,7 @@ fn a_file_spanning_several_members_reads_back_intact() {
 
     let expected = {
         let mut fs =
-            rusty_backup::fs::fat::FatFilesystem::open(std::fs::File::open(&src).unwrap(), 0)
-                .unwrap();
+            fs_pc::fat::FatFilesystem::open(std::fs::File::open(&src).unwrap(), 0).unwrap();
         let root = fs.root().unwrap();
         let entry = fs
             .list_directory(&root)
@@ -196,9 +195,8 @@ fn a_file_spanning_several_members_reads_back_intact() {
     assert!(members.len() > 1, "expected a genuine split");
 
     let restored_path = work.join("restored-spanning.img");
-    let mut fs =
-        rusty_backup::fs::fat::FatFilesystem::open(std::fs::File::open(&restored_path).unwrap(), 0)
-            .expect("restored image still mounts");
+    let mut fs = fs_pc::fat::FatFilesystem::open(std::fs::File::open(&restored_path).unwrap(), 0)
+        .expect("restored image still mounts");
     let root = fs.root().unwrap();
     let entry = fs
         .list_directory(&root)

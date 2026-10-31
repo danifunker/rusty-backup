@@ -24,11 +24,11 @@
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use crate::fs::entry::FileEntry;
-use crate::fs::filesystem::{Filesystem, FilesystemError};
 use crate::fs::hfs_boot;
 use crate::fs::mac_scsi_bless::{bless_apm_disk, BlessOptions, MacScsiDriver};
 use crate::partition::PartitionTable;
+use disk_core::entry::FileEntry;
+use disk_core::filesystem::{Filesystem, FilesystemError};
 
 /// Conventional name of the bootable folder on a classic-Mac volume.
 const SYSTEM_FOLDER_NAME: &str = "System Folder";
@@ -163,7 +163,7 @@ pub fn assess_bootability(path: &Path) -> Result<Assessment, FilesystemError> {
         }
     };
 
-    let has_boot_blocks = hfs_boot::has_boot_blocks(&mut file, hfs_offset)?;
+    let has_boot_blocks = fs_mac::hfs_boot::has_boot_blocks(&mut file, hfs_offset)?;
     drop(file);
 
     // Open the HFS volume to read the current bless and look for a System
@@ -364,8 +364,8 @@ fn resolve_dir(fs: &mut dyn Filesystem, mac_path: &str) -> Result<FileEntry, Fil
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs::filesystem::{CreateDirectoryOptions, EditableFilesystem};
-    use crate::fs::hfs::{create_blank_hfs, HfsFilesystem};
+    use disk_core::filesystem::{CreateDirectoryOptions, EditableFilesystem};
+    use fs_mac::hfs::{create_blank_hfs, HfsFilesystem};
     use std::io::Cursor;
 
     const MIB: u64 = 1024 * 1024;

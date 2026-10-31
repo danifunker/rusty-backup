@@ -22,8 +22,8 @@ use std::path::PathBuf;
 
 use crate::cli::logging::log_stderr;
 use crate::cli::parse::parse_size;
-use crate::fs::efs::resolve_bytes_per_inode;
 use crate::partition::sgi_hdd_builder::{write_sgi_efs_hdd, SgiHddOptions};
+use fs_unix::efs::resolve_bytes_per_inode;
 
 #[derive(Debug, Args)]
 pub struct NewSgiCdromArgs {
@@ -187,7 +187,7 @@ fn populate(args: &NewSgiCdromArgs, dir: &std::path::Path) -> Result<()> {
     let mut fs = ctx
         .open_editable(file)
         .map_err(|e| anyhow::anyhow!("opening the new EFS filesystem for writing: {e}"))?;
-    let dest = crate::fs::filesystem::Filesystem::root(fs.as_filesystem_mut())
+    let dest = disk_core::filesystem::Filesystem::root(fs.as_filesystem_mut())
         .map_err(|e| anyhow::anyhow!("resolving volume root: {e}"))?;
 
     let opts = DirImportOptions {

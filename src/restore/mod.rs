@@ -11,11 +11,6 @@ use anyhow::{bail, Context, Result};
 
 use crate::backup::metadata::BackupMetadata;
 use crate::backup::LogLevel;
-use crate::clonezilla;
-use crate::clonezilla::metadata::ClonezillaImage;
-use crate::clonezilla::partclone::open_partclone_reader;
-use crate::fs::human68k::resize_human68k_in_place;
-use crate::fs::ntfs::ensure_backup_boot_sector;
 use crate::fs::patch_hidden_sectors_for;
 use crate::fs::{
     resize_btrfs_in_place, resize_exfat_in_place, resize_ext_in_place, resize_fat_in_place,
@@ -25,13 +20,15 @@ use crate::fs::{
     validate_hfsplus_integrity, validate_ntfs_integrity, validate_prodos_integrity,
 };
 use crate::os::SectorAlignedWriter;
-use crate::partition::apm::Apm;
-use crate::partition::gpt::Gpt;
-use crate::partition::mbr::{
-    build_ebr_chain, lba_to_chs, patch_mbr_entries, LogicalPartitionInfo, Mbr,
-};
-use crate::partition::PartitionSizeOverride;
 use crate::rbformats::reconstruct_disk_from_backup;
+use dsk_clonezilla::metadata::ClonezillaImage;
+use dsk_clonezilla::partclone::open_partclone_reader;
+use fs_pc::human68k::resize_human68k_in_place;
+use fs_pc::ntfs::ensure_backup_boot_sector;
+use part_tables::apm::Apm;
+use part_tables::gpt::Gpt;
+use part_tables::mbr::{build_ebr_chain, lba_to_chs, patch_mbr_entries, LogicalPartitionInfo, Mbr};
+use part_tables::PartitionSizeOverride;
 
 /// Restore configuration.
 pub struct RestoreConfig {
@@ -803,7 +800,7 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
     if !metadata_path.exists() {
         // Check if this is a Clonezilla image
         if let Some(cz_folder) =
-            clonezilla::metadata::resolve_clonezilla_folder(&config.backup_folder)
+            dsk_clonezilla::metadata::resolve_clonezilla_folder(&config.backup_folder)
         {
             let config = RestoreConfig {
                 backup_folder: cz_folder,
@@ -1765,7 +1762,7 @@ fn run_single_file_chd_restore_resize(
             .read_exact(&mut mbr)
             .context("failed to read MBR from CHD")?;
         patch_mbr_entries(&mut mbr, &overrides);
-        for index in crate::partition::mbr::clear_orphan_entries_overlapping(&mut mbr, &overrides) {
+        for index in part_tables::mbr::clear_orphan_entries_overlapping(&mut mbr, &overrides) {
             log(
                 &progress,
                 LogLevel::Warning,
@@ -2091,7 +2088,7 @@ pub fn calculate_clonezilla_restore_layout(
     };
 
     // Sort partitions by start LBA for layout calculation
-    let mut sorted_parts: Vec<&clonezilla::metadata::ClonezillaPartition> = cz_image
+    let mut sorted_parts: Vec<&dsk_clonezilla::metadata::ClonezillaPartition> = cz_image
         .partitions
         .iter()
         .filter(|p| !p.is_extended)
@@ -2208,7 +2205,7 @@ fn clonezilla_ebr_layout(
     overrides: &[PartitionSizeOverride],
 ) -> Option<ClonezillaEbrLayout> {
     let ext = cz_image.partitions.iter().find(|p| p.is_extended)?;
-    let mut logicals: Vec<&clonezilla::metadata::ClonezillaPartition> = cz_image
+    let mut logicals: Vec<&dsk_clonezilla::metadata::ClonezillaPartition> = cz_image
         .partitions
         .iter()
         .filter(|p| p.is_logical && !p.is_extended)
@@ -2325,7 +2322,7 @@ fn run_clonezilla_restore(
 
     // Load Clonezilla image metadata
     set_operation(&progress, "Loading Clonezilla image...");
-    let cz_image = clonezilla::metadata::load(&config.backup_folder)
+    let cz_image = dsk_clonezilla::metadata::load(&config.backup_folder)
         .context("failed to load Clonezilla image metadata")?;
 
     log(
@@ -2497,7 +2494,7 @@ fn run_clonezilla_restore(
     set_operation(&progress, "Finalizing filesystems...");
 
     // Sort overrides the same way as partitions
-    let mut sorted_parts: Vec<&clonezilla::metadata::ClonezillaPartition> = cz_image
+    let mut sorted_parts: Vec<&dsk_clonezilla::metadata::ClonezillaPartition> = cz_image
         .partitions
         .iter()
         .filter(|p| !p.is_extended)
@@ -2724,7 +2721,7 @@ fn write_clonezilla_disk(
     }
 
     // Sort partitions by start LBA
-    let mut sorted_parts: Vec<&clonezilla::metadata::ClonezillaPartition> =
+    let mut sorted_parts: Vec<&dsk_clonezilla::metadata::ClonezillaPartition> =
         cz_image.partitions.iter().collect();
     sorted_parts.sort_by_key(|p| p.start_lba);
 
@@ -2761,7 +2758,7 @@ fn write_clonezilla_disk(
         let is_swap = cz_part.partition_type_byte == 0x82
             || cz_part.filesystem_type.eq_ignore_ascii_case("swap");
         if is_swap && cz_part.partclone_files.is_empty() && export_size >= 40960 {
-            let header = clonezilla::metadata::build_swap_header(
+            let header = dsk_clonezilla::metadata::build_swap_header(
                 export_size,
                 cz_part.swap_uuid,
                 cz_part.swap_label.as_deref(),
@@ -3296,7 +3293,7 @@ mod tests {
             mbr[off + 12..off + 16].copy_from_slice(&sectors.to_le_bytes());
         }
         patch_mbr_entries(&mut mbr, &overrides);
-        let cleared = crate::partition::mbr::clear_orphan_entries_overlapping(&mut mbr, &overrides);
+        let cleared = part_tables::mbr::clear_orphan_entries_overlapping(&mut mbr, &overrides);
         assert_eq!(cleared, vec![1]);
         let entries: Vec<(u64, u64)> = (0..4)
             .filter(|i| mbr[446 + i * 16 + 4] != 0)
@@ -3320,8 +3317,7 @@ mod tests {
         beyond[446 + 3 * 16 + 8..446 + 3 * 16 + 12].copy_from_slice(&900_000u32.to_le_bytes());
         beyond[446 + 3 * 16 + 12..446 + 3 * 16 + 16].copy_from_slice(&100_000u32.to_le_bytes());
         assert!(
-            crate::partition::mbr::clear_orphan_entries_overlapping(&mut beyond, &overrides)
-                .is_empty()
+            part_tables::mbr::clear_orphan_entries_overlapping(&mut beyond, &overrides).is_empty()
         );
         assert_eq!(beyond[446 + 3 * 16 + 4], 0x0C);
     }
@@ -3485,7 +3481,7 @@ mod tests {
     /// restore grows it back, so the disk comes back exactly as it was.
     #[test]
     fn single_file_chd_as_is_restore_grows_a_compacted_fat_partition() {
-        use crate::fs::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+        use disk_core::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
         const TOTAL_SECTORS: u32 = 16384;
         const PART_SECTORS: u32 = 16383;
         let total_bytes = TOTAL_SECTORS as u64 * 512;
@@ -3495,7 +3491,7 @@ mod tests {
         let source_path = tmp.path().join("source.img");
         let mut mbr = build_test_mbr(PART_SECTORS);
         mbr[450] = 0x06;
-        let fat = crate::fs::fat::create_blank_fat(part_bytes, Some("GROW")).unwrap();
+        let fat = fs_pc::fat::create_blank_fat(part_bytes, Some("GROW")).unwrap();
         assert!(fat.len() as u64 <= part_bytes);
         let mut data = vec![0u8; total_bytes as usize];
         data[..512].copy_from_slice(&mbr);
@@ -3507,7 +3503,7 @@ mod tests {
                 .write(true)
                 .open(&source_path)
                 .unwrap();
-            let mut fs = crate::fs::fat::FatFilesystem::open(file, 512).unwrap();
+            let mut fs = fs_pc::fat::FatFilesystem::open(file, 512).unwrap();
             let root = fs.root().unwrap();
             let payload: Vec<u8> = (0..300_000u32)
                 .map(|i| (i.wrapping_mul(7) % 251) as u8)
@@ -3974,7 +3970,7 @@ mod tests {
     #[test]
     fn single_file_chd_re_resize_restore_handles_logical_partitions() {
         use crate::backup::metadata::ExtendedContainerMetadata;
-        use crate::partition::mbr::{build_ebr_chain, LogicalPartitionInfo};
+        use part_tables::mbr::{build_ebr_chain, LogicalPartitionInfo};
 
         // Layout (8 MiB / 16384 sectors):
         //   [0]            MBR
@@ -4295,11 +4291,11 @@ mod tests {
     #[test]
     fn defragmented_clone_restore_round_trip() {
         use crate::backup::CompressionType;
-        use crate::fs::filesystem::{
+        use disk_core::filesystem::{
             CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem,
         };
-        use crate::fs::hfsplus::{create_blank_hfsplus, HfsPlusFilesystem};
-        use crate::fs::hfsplus_defrag::stream_defragmented_hfsplus;
+        use fs_mac::hfsplus::{create_blank_hfsplus, HfsPlusFilesystem};
+        use fs_mac::hfsplus_defrag::stream_defragmented_hfsplus;
         use std::io::Cursor;
 
         const SECTOR_SIZE: u64 = 512;
@@ -4496,8 +4492,8 @@ mod tests {
     /// this passes only while the step uses the handle it already holds.
     #[test]
     fn fat_clean_flags_are_written_through_the_open_target_handle() {
-        use crate::fs::fat::create_blank_fat;
         use crate::os::SectorAlignedWriter;
+        use fs_pc::fat::create_blank_fat;
         use std::io::{Read, Seek, SeekFrom, Write};
 
         const PART_OFFSET: u64 = 1024 * 1024;
@@ -4558,7 +4554,7 @@ mod tests {
 #[cfg(test)]
 mod clonezilla_layout_tests {
     use super::*;
-    use crate::clonezilla::metadata::ClonezillaPartition;
+    use dsk_clonezilla::metadata::ClonezillaPartition;
 
     fn part(dev: &str, index: usize, start: u64, size: u64, ptype: u8) -> ClonezillaPartition {
         ClonezillaPartition {

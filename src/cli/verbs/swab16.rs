@@ -11,7 +11,7 @@
 //! best-effort and never fails the conversion.
 //!
 //! See `crate::rbformats::swab` for the transform and
-//! `crate::partition::sgi_dklabel` for the SGI case that motivated it.
+//! `part_tables::sgi_dklabel` for the SGI case that motivated it.
 
 use anyhow::{bail, Context, Result};
 use clap::Args;
@@ -19,8 +19,9 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use crate::cli::logging::{log_stderr, out_stdout};
-use crate::partition::{format_size, PartitionTable};
+use crate::partition::PartitionTable;
 use crate::rbformats::swab;
+use disk_core::display::format_size;
 
 #[derive(Debug, Args)]
 pub struct Swab16Args {

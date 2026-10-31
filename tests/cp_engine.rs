@@ -10,14 +10,16 @@ use std::fs::{File, OpenOptions};
 use std::io::Cursor;
 use std::path::Path;
 
+use disk_core::entry::FileEntry;
+use disk_core::filesystem::{
+    CreateFileOptions, EditableFilesystem, Filesystem, ResourceForkSource,
+};
+use fs_mac::hfs;
+use fs_pc::fat;
 use rusty_backup::fs::copy::{
     self, AttrPolicy, Capabilities, ConflictMode, CopyOptions, CopyStats, NamePolicy,
 };
-use rusty_backup::fs::entry::FileEntry;
-use rusty_backup::fs::filesystem::{
-    CreateFileOptions, EditableFilesystem, Filesystem, ResourceForkSource,
-};
-use rusty_backup::fs::{fat, hfs, open_editable_filesystem, open_filesystem};
+use rusty_backup::fs::{open_editable_filesystem, open_filesystem};
 
 const MB: u64 = 1024 * 1024;
 

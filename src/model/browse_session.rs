@@ -20,13 +20,13 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use crate::clonezilla::block_cache::{PartcloneBlockCache, PartcloneBlockReader};
-use crate::fs::entry::FileEntry;
-use crate::fs::filesystem::{EditableFilesystem, Filesystem, FilesystemError};
 use crate::fs::zstd_stream::{ZstdStreamCache, ZstdStreamReader};
 use crate::fs::{self};
 use crate::rbformats::chd::ChdReader;
 use crate::rbformats::chd_edit::{ChdEditHandle, ChdEditSession};
+use disk_core::entry::FileEntry;
+use disk_core::filesystem::{EditableFilesystem, Filesystem, FilesystemError};
+use dsk_clonezilla::block_cache::{PartcloneBlockCache, PartcloneBlockReader};
 
 /// Parameters and caches that locate a filesystem to browse.
 #[derive(Default, Clone)]
@@ -43,7 +43,7 @@ pub struct BrowseSession {
     /// A size ceiling the user asked for before entering Edit Mode, for those
     /// same whole-image-rewrite drivers. Set by the GUI's size-budget dialog;
     /// `None` means no request, and the container still binds.
-    pub rebuild_budget: Option<crate::fs::squashfs_edit::SizeBudget>,
+    pub rebuild_budget: Option<fs_squashfs::squashfs_edit::SizeBudget>,
     /// Partition type byte (MBR-style).
     pub partition_type: u8,
     /// Partition type string for table types that carry one (APM, GPT GUID).
@@ -233,11 +233,11 @@ impl BrowseSession {
         // Salto cooked `.dsk` images carry no magic; recognize them by the exact
         // Diablo-31 image size (open_pack does the real validation).
         let alto_size = std::fs::metadata(path).map(|m| m.len() as usize).ok();
-        let is_salto_dsk = alto_size == Some(crate::fs::alto::salto::IMAGE_BYTES);
+        let is_salto_dsk = alto_size == Some(fs_xerox::alto::salto::IMAGE_BYTES);
         // Trident (TFS) pack image: recognized by the exact T-80 / T-300 size.
         let is_trident = matches!(
             alto_size,
-            Some(crate::fs::alto::trident::T80_BYTES) | Some(crate::fs::alto::trident::T300_BYTES)
+            Some(fs_xerox::alto::trident::T80_BYTES) | Some(fs_xerox::alto::trident::T300_BYTES)
         );
         // Dwarf Draco 6085 ".zdisk"/".zdelta" is a zlib stream (a Pilot pack);
         // gate the full read on the zlib magic byte, then confirm by inflating
@@ -245,7 +245,7 @@ impl BrowseSession {
         // is_zdisk inflates only a 2-byte prefix, so a 64 KiB head decides; read whole only on a match.
         let zdisk_bytes = if magic[0] == 0x78
             && crate::compat::read_head(path, 64 * 1024)
-                .is_ok_and(|h| crate::fs::alto::zdisk::is_zdisk(&h))
+                .is_ok_and(|h| fs_xerox::alto::zdisk::is_zdisk(&h))
         {
             std::fs::read(path).ok()
         } else {
@@ -264,21 +264,21 @@ impl BrowseSession {
                 }
                 None => std::fs::read(path).map_err(FilesystemError::Io)?,
             };
-            let disk = crate::fs::alto::open_pack(&bytes)?;
+            let disk = fs_xerox::alto::open_pack(&bytes)?;
             // A PDI with fsFamily=2 (or any .zdisk) is a Pilot/Cedar volume
             // (structurally unrelated to BFS); everything else is an Alto BFS pack.
-            if disk.geometry.family == crate::fs::alto::FsFamily::Pilot {
-                use crate::fs::alto::pilot::{Generation, PilotFilesystem};
+            if disk.geometry.family == fs_xerox::alto::FsFamily::Pilot {
+                use fs_xerox::alto::pilot::{Generation, PilotFilesystem};
                 // File-ID generation comes from PDI flags bit 2; a 6085 .zdisk
                 // carries no flags, so default to the original-Pilot generation
                 // (these are classic Pilot 12.3 volumes). Generation does not
                 // affect the read path, only how a written ID is interpreted.
-                let generation = crate::fs::alto::pdi::read_header(&bytes)
+                let generation = fs_xerox::alto::pdi::read_header(&bytes)
                     .map(|h| Generation::from_pdi_flag_bit2(h.flags & 0x0004 != 0))
                     .unwrap_or(Generation::OriginalPilot);
                 return Ok(Box::new(PilotFilesystem::open(disk, generation)?));
             }
-            return Ok(Box::new(crate::fs::alto::bfs::BfsFilesystem::open(disk)));
+            return Ok(Box::new(fs_xerox::alto::bfs::BfsFilesystem::open(disk)));
         }
 
         // CHD — 8-byte magic "MComprHD" at offset 0.
@@ -299,7 +299,7 @@ impl BrowseSession {
         // virtual FAT image).
         if magic[0] == 0xFE && magic[1] == 0xEF {
             let pw = self.password.as_deref().map(|s| s.as_bytes());
-            let gho_reader = crate::rbformats::gho::GhoReader::open_with_password(path, pw)
+            let gho_reader = dsk_ghost::gho::GhoReader::open_with_password(path, pw)
                 .map_err(|e| FilesystemError::Parse(format!("failed to open GHO: {e:#}")))?;
             return fs::open_filesystem_sized(
                 gho_reader,
@@ -315,7 +315,7 @@ impl BrowseSession {
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
             if ext.eq_ignore_ascii_case("imz") {
                 let pw = self.password.as_deref().map(|s| s.as_bytes());
-                let imz_reader = crate::rbformats::imz::ImzReader::open_with_password(path, pw)
+                let imz_reader = dsk_imz::imz::ImzReader::open_with_password(path, pw)
                     .map_err(|e| FilesystemError::Parse(format!("failed to open IMZ: {e:#}")))?;
                 return fs::open_filesystem_sized(
                     imz_reader,
@@ -704,27 +704,27 @@ impl BrowseSession {
                 let _ = f.read(&mut magic);
             }
             let is_salto_dsk = std::fs::metadata(path)
-                .map(|m| m.len() as usize == crate::fs::alto::salto::IMAGE_BYTES)
+                .map(|m| m.len() as usize == fs_xerox::alto::salto::IMAGE_BYTES)
                 .unwrap_or(false);
             // Dwarf Draco 6085 ".zdisk" (a Pilot pack); see open() for the gating.
             let is_zdisk = magic[0] == 0x78
                 && crate::compat::read_head(path, 64 * 1024)
-                    .is_ok_and(|h| crate::fs::alto::zdisk::is_zdisk(&h));
+                    .is_ok_and(|h| fs_xerox::alto::zdisk::is_zdisk(&h));
             if &magic == b"PARCDISK"
                 || magic[0..6] == [0x00, 0x07, 0x00, 0x03, 0x00, 0x0a]
                 || is_salto_dsk
                 || is_zdisk
             {
                 let bytes = std::fs::read(path).map_err(FilesystemError::Io)?;
-                let disk = crate::fs::alto::open_pack(&bytes)?;
+                let disk = fs_xerox::alto::open_pack(&bytes)?;
                 // Pilot/Cedar volumes (fsFamily=2, and every .zdisk) are
                 // read-only for now.
-                if disk.geometry.family == crate::fs::alto::FsFamily::Pilot {
+                if disk.geometry.family == fs_xerox::alto::FsFamily::Pilot {
                     return Err(FilesystemError::Unsupported(
                         "Pilot/Cedar volumes are read-only".into(),
                     ));
                 }
-                let efs = Box::new(crate::fs::alto::bfs::BfsFilesystem::open_editable(
+                let efs = Box::new(fs_xerox::alto::bfs::BfsFilesystem::open_editable(
                     disk,
                     path.clone(),
                 ));
@@ -899,7 +899,7 @@ impl BrowseOpenStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs::filesystem::CreateFileOptions;
+    use disk_core::filesystem::CreateFileOptions;
 
     #[test]
     fn password_error_detection() {
@@ -936,7 +936,7 @@ mod tests {
         // lands at offset 0x1A, so the d88 header sniffer doesn't claim it and
         // detection routes by the .xdf extension.) Human68k floppies are
         // standard little-endian FAT12, which Human68kFilesystem opens.
-        let flat = crate::fs::fat::create_blank_fat(737280, Some("TEST")).unwrap();
+        let flat = fs_pc::fat::create_blank_fat(737280, Some("TEST")).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let xdf = dir.path().join("disk.xdf");
         std::fs::write(&xdf, &flat).unwrap();
@@ -984,7 +984,7 @@ mod tests {
     /// directly in the file — committing must not error or alter behavior.
     #[test]
     fn open_editable_raw_image_commit_is_noop() {
-        let flat = crate::fs::fat::create_blank_fat(737280, Some("RAW")).unwrap();
+        let flat = fs_pc::fat::create_blank_fat(737280, Some("RAW")).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let img = dir.path().join("disk.img"); // not a container extension
         std::fs::write(&img, &flat).unwrap();
@@ -1017,7 +1017,7 @@ mod tests {
     /// exact path the GUI browse view takes when a user opens a `.pdi`/`.bfs`.
     #[test]
     fn open_routes_alto_pdi_to_bfs_filesystem() {
-        use crate::fs::alto::{Disk, FsFamily, Geometry, Sector};
+        use fs_xerox::alto::{Disk, FsFamily, Geometry, Sector};
         use std::io::Write as _;
 
         let geometry = Geometry {
@@ -1032,7 +1032,7 @@ mod tests {
         };
         let total = geometry.total_sectors();
         let sectors = (0..total).map(|_| Sector::zeroed(16, 512)).collect();
-        let pdi = crate::fs::alto::pdi::write(&Disk { geometry, sectors });
+        let pdi = fs_xerox::alto::pdi::write(&Disk { geometry, sectors });
 
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         tmp.write_all(&pdi).unwrap();
@@ -1047,7 +1047,7 @@ mod tests {
 
     #[test]
     fn open_routes_salto_dsk_to_bfs_filesystem() {
-        use crate::fs::alto::{salto, Disk, FsFamily, Geometry, Sector};
+        use fs_xerox::alto::{salto, Disk, FsFamily, Geometry, Sector};
         use std::io::Write as _;
 
         // A blank Salto-shaped Diablo-31 pack written in Salto's .dsk container.
@@ -1079,7 +1079,7 @@ mod tests {
 
     #[test]
     fn open_routes_pilot_pdi_to_pilot_filesystem() {
-        use crate::fs::alto::pilot::{self, Generation};
+        use fs_xerox::alto::pilot::{self, Generation};
         use std::io::Write as _;
 
         // A blank Cedar-nucleus Pilot volume, written as a PDI (fsFamily=2).
@@ -1089,7 +1089,7 @@ mod tests {
             "RouteTest",
         )
         .expect("create blank pilot volume");
-        let pdi = crate::fs::alto::pdi::write(&disk);
+        let pdi = fs_xerox::alto::pdi::write(&disk);
 
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         tmp.write_all(&pdi).unwrap();
@@ -1111,8 +1111,8 @@ mod tests {
 
     #[test]
     fn open_routes_zdisk_to_pilot_filesystem() {
-        use crate::fs::alto::pilot::{self, Generation};
-        use crate::fs::alto::{zdisk, FsFamily, Geometry};
+        use fs_xerox::alto::pilot::{self, Generation};
+        use fs_xerox::alto::{zdisk, FsFamily, Geometry};
         use std::io::Write as _;
 
         // A blank original-Pilot volume on a 6085-shaped geometry (16
@@ -1154,9 +1154,9 @@ mod tests {
     /// `session.open_editable() -> repair() -> commit` (repair persists as PDI).
     #[test]
     fn browse_session_alto_check_and_repair_round_trip() {
-        use crate::fs::alto::bfs::Bfs;
-        use crate::fs::alto::write::{add_file, create_blank};
-        use crate::fs::alto::{pdi, Disk, FsFamily, Geometry, LabelCodec};
+        use fs_xerox::alto::bfs::Bfs;
+        use fs_xerox::alto::write::{add_file, create_blank};
+        use fs_xerox::alto::{pdi, Disk, FsFamily, Geometry, LabelCodec};
         use std::io::Write as _;
 
         let geom = Geometry {

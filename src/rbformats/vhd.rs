@@ -1,5 +1,7 @@
 #[cfg(feature = "rust173-polyfill")]
 use crate::rust173_compat::IntIsMultipleOf as _;
+#[allow(unused_imports)]
+use dsk_vm::vhd::*;
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -9,13 +11,12 @@ use anyhow::{bail, Context, Result};
 use super::{decompress_members_to_writer, reconstruct_disk_from_backup, write_zeros, CHUNK_SIZE};
 use crate::backup::metadata::BackupMetadata;
 use crate::fs::{patch_hidden_sectors_for, resize_filesystem_for};
-use crate::partition::mbr::{
+use part_tables::mbr::{
     build_ebr_chain, parse_ebr_chain, patch_mbr_entries, LogicalPartitionInfo, Mbr,
 };
-use crate::partition::PartitionSizeOverride;
+use part_tables::PartitionSizeOverride;
 
 // The VHD format itself lives in the `dsk-vm` crate; this file keeps the backup export.
-pub use dsk_vm::vhd::*;
 
 /// Stream a `disk_size`-byte source into a *dynamic* (sparse) VHD on `out`.
 ///
@@ -42,7 +43,7 @@ pub fn export_whole_disk_vhd_dynamic(
     progress_cb: &mut dyn FnMut(u64),
     cancel_check: &dyn Fn() -> bool,
 ) -> Result<()> {
-    use super::sparse::{is_zero_unit, SparseAllocator};
+    use dsk_vm::sparse::{is_zero_unit, SparseAllocator};
 
     let block_size = if block_size == 0 {
         VHD_DEFAULT_BLOCK_SIZE
@@ -381,7 +382,7 @@ pub fn export_whole_disk_vhd(
         // lazy reader as-is.
         let mut reader: super::BoxReadSeek =
             if crate::model::source_reader::is_gho_path(source_path) {
-                let mut gho = super::gho::GhoReader::open(source_path)?;
+                let mut gho = dsk_ghost::gho::GhoReader::open(source_path)?;
                 gho.prepare_full_image();
                 Box::new(gho)
             } else {
@@ -891,7 +892,7 @@ pub fn export_partition_vhd(
 /// Reconstructs the disk by writing the MBR, hidden data gap, EBR for extended
 /// partitions, and each partition's data from partclone, then appends a VHD footer.
 pub fn export_clonezilla_disk_vhd(
-    cz_image: &crate::clonezilla::metadata::ClonezillaImage,
+    cz_image: &dsk_clonezilla::metadata::ClonezillaImage,
     _backup_folder: &Path,
     output_path: &Path,
     partition_sizes: &[PartitionSizeOverride],
@@ -899,7 +900,7 @@ pub fn export_clonezilla_disk_vhd(
     cancel_check: impl Fn() -> bool,
     mut log_cb: impl FnMut(&str),
 ) -> Result<()> {
-    use crate::clonezilla::partclone::open_partclone_reader;
+    use dsk_clonezilla::partclone::open_partclone_reader;
 
     let mut file = File::create(output_path)
         .with_context(|| format!("failed to create {}", output_path.display()))?;
@@ -936,7 +937,7 @@ pub fn export_clonezilla_disk_vhd(
     }
 
     // Sort partitions by start LBA
-    let mut sorted_parts: Vec<&crate::clonezilla::metadata::ClonezillaPartition> =
+    let mut sorted_parts: Vec<&dsk_clonezilla::metadata::ClonezillaPartition> =
         cz_image.partitions.iter().collect();
     sorted_parts.sort_by_key(|p| p.start_lba);
 
@@ -1066,7 +1067,7 @@ pub fn export_clonezilla_partition_vhd(
     cancel_check: impl Fn() -> bool,
     mut log_cb: impl FnMut(&str),
 ) -> Result<()> {
-    use crate::clonezilla::partclone::open_partclone_reader;
+    use dsk_clonezilla::partclone::open_partclone_reader;
 
     let (header, mut reader) = open_partclone_reader(partclone_files)?;
     let partition_size = header.partition_size();
@@ -1589,9 +1590,9 @@ mod tests {
     /// layer on the immutable view.
     #[test]
     fn test_dynamic_vhd_fat_edit_roundtrip() {
-        use crate::fs::fat::{create_blank_fat, FatFilesystem};
-        use crate::fs::filesystem::{EditableFilesystem, Filesystem};
         use crate::fs::CreateFileOptions;
+        use disk_core::filesystem::{EditableFilesystem, Filesystem};
+        use fs_pc::fat::{create_blank_fat, FatFilesystem};
 
         // Format a 4 MiB FAT12 volume so it has cluster space to work with.
         let blank = create_blank_fat(4 * 1024 * 1024, Some("DYNVHD")).expect("format FAT");

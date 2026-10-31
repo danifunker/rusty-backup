@@ -18,9 +18,9 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use crate::fs::entry::FileEntry;
-use crate::fs::filesystem::Filesystem;
 use crate::model::commander_descend::{self, DescendKind};
+use disk_core::entry::FileEntry;
+use disk_core::filesystem::Filesystem;
 
 /// Where a wrapper's content comes from when expanding it.
 pub enum WrapperSource {
@@ -217,9 +217,9 @@ impl WrapperTree {
             .ok_or_else(|| anyhow::anyhow!("wrapper mount not open"))?;
         let mut rsrc = Vec::new();
         let _ = fs.write_resource_fork_to(&row.entry, &mut rsrc);
-        let bcem = crate::rbformats::ndif::extract_bcem(&rsrc);
+        let bcem = dsk_dmg::ndif::extract_bcem(&rsrc);
         // A large nested wrapper goes to a temp file so it is never held in memory whole.
-        if bcem.is_none() && row.entry.size > crate::fs::mem_archive::INLINE_MAX {
+        if bcem.is_none() && row.entry.size > fs_tar::mem_archive::INLINE_MAX {
             let (dir, path) = commander_descend::materialize_streamed(&row.entry.name, |f| {
                 let mut w = std::io::BufWriter::new(f);
                 fs.write_file_to(&row.entry, &mut w)?;
@@ -233,7 +233,7 @@ impl WrapperTree {
         fs.write_file_to(&row.entry, &mut data)
             .map_err(|e| anyhow::anyhow!("read '{}': {e}", row.entry.name))?;
         if let Some(bcem) = bcem {
-            return crate::rbformats::ndif::reconstruct(&data, &bcem)
+            return dsk_dmg::ndif::reconstruct(&data, &bcem)
                 .map(WrapperSource::Bytes)
                 .map_err(|e| anyhow::anyhow!("NDIF '{}': {e:#}", row.entry.name));
         }
@@ -404,9 +404,7 @@ pub fn tree_range(rows: &[TreeRow], anchor: &str, clicked: &str) -> Vec<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::macarchive::stuffit::{
-        build_archive_tree, StuffItInput, StuffItInputNode, WriteMethod,
-    };
+    use arc_mac::stuffit::{build_archive_tree, StuffItInput, StuffItInputNode, WriteMethod};
 
     fn file(name: &str, data: &[u8]) -> StuffItInputNode {
         StuffItInputNode::File(StuffItInput {

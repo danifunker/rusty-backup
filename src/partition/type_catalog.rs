@@ -156,12 +156,10 @@ fn normalize(kind: TableKind, value: &str) -> String {
             trimmed.to_ascii_uppercase()
         }
         // A Sun slice tag is a number; the names are just aliases for one.
-        TableKind::Sun | TableKind::SolarisX86 => {
-            match crate::partition::sun::tag_from_text(trimmed) {
-                Some(tag) => tag.to_string(),
-                None => String::new(),
-            }
-        }
+        TableKind::Sun | TableKind::SolarisX86 => match part_tables::sun::tag_from_text(trimmed) {
+            Some(tag) => tag.to_string(),
+            None => String::new(),
+        },
         // NeXT `p_type` is a free-form 8-byte name, compared case-insensitively.
         TableKind::Next | TableKind::SgiDkLabel => trimmed.to_ascii_uppercase(),
         TableKind::Rdb | TableKind::X68k | TableKind::Other => trimmed.to_string(),

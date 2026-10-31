@@ -4,7 +4,7 @@
 //!
 //! A pane row is *descendable* when it's a Mac archive or a disk-image
 //! container. Activating it opens the wrapper's contents as a
-//! [`Filesystem`](crate::fs::filesystem::Filesystem) and pushes a layer onto
+//! [`Filesystem`](disk_core::filesystem::Filesystem) and pushes a layer onto
 //! the pane's [`DirListing`](crate::model::dir_listing::DirListing); copying out
 //! then works through the existing generic copy path.
 //!
@@ -18,11 +18,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use crate::fs::archive_fs::ArchiveFilesystem;
-use crate::fs::entry::FileEntry;
-use crate::fs::filesystem::Filesystem;
 use crate::model::commander_source;
 use crate::model::file_types::{DISK_IMAGE_EXTS, MAC_ARCHIVE_EXTS};
 use crate::partition::PartitionInfo;
+use disk_core::entry::FileEntry;
+use disk_core::filesystem::Filesystem;
 
 /// What kind of wrapper a descendable row is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,7 +167,7 @@ pub fn open_archive(path: &Path, label: Option<String>) -> Result<Box<dyn Filesy
         .and_then(|mut f| std::io::Read::read(&mut f, &mut head))
         .with_context(|| format!("read {}", path.display()))?;
     if is_zip_or_tar(&head[..n], name) {
-        let fs = crate::fs::mem_archive::open_path(path, label)
+        let fs = fs_tar::mem_archive::open_path(path, label)
             .map_err(|e| anyhow::anyhow!("open archive '{name}': {e}"))?;
         return Ok(Box::new(fs));
     }
@@ -190,14 +190,14 @@ fn is_zip_or_tar(head: &[u8], file_name: &str) -> bool {
 
 /// Open archive bytes as a read-only filesystem, routing by content + name to
 /// the right reader: ZIP and tar (plain / `.tgz` / `.tar.gz` / `.tar.zst`) via
-/// [`crate::fs::mem_archive`], otherwise a classic-Mac archive (StuffIt /
+/// [`fs_tar::mem_archive`], otherwise a classic-Mac archive (StuffIt /
 /// Compact Pro / MacBinary / BinHex) via [`ArchiveFilesystem`].
 pub fn open_archive_bytes(
     bytes: Vec<u8>,
     file_name: &str,
     label: Option<String>,
 ) -> Result<Box<dyn Filesystem>> {
-    use crate::fs::mem_archive;
+    use fs_tar::mem_archive;
     let lower = file_name.to_ascii_lowercase();
 
     if bytes.starts_with(b"PK\x03\x04")
@@ -541,8 +541,9 @@ impl ReopenRecipe {
 /// for; shared by the `commander_descend` and `wrapper_tree` tests.
 #[cfg(test)]
 pub(crate) fn build_two_partition_fat_image() -> (tempfile::TempDir, PathBuf) {
-    use crate::fs::filesystem::CreateFileOptions;
-    use crate::fs::{fat, open_editable_filesystem};
+    use crate::fs::open_editable_filesystem;
+    use disk_core::filesystem::CreateFileOptions;
+    use fs_pc::fat;
     use std::fs::OpenOptions;
 
     fn set_entry(img: &mut [u8], i: usize, start: usize, p_size: usize) {
@@ -687,9 +688,7 @@ mod tests {
 
     #[test]
     fn materialize_then_open_archive_round_trips() {
-        use crate::macarchive::stuffit::{
-            build_archive_tree, StuffItInput, StuffItInputNode, WriteMethod,
-        };
+        use arc_mac::stuffit::{build_archive_tree, StuffItInput, StuffItInputNode, WriteMethod};
         let tree = vec![StuffItInputNode::File(StuffItInput {
             name: "hi.txt".into(),
             type_code: *b"TEXT",
@@ -716,9 +715,7 @@ mod tests {
     /// of the pane's live fs).
     #[test]
     fn reopen_recipe_reopens_archive_by_path_repeatedly() {
-        use crate::macarchive::stuffit::{
-            build_archive_tree, StuffItInput, StuffItInputNode, WriteMethod,
-        };
+        use arc_mac::stuffit::{build_archive_tree, StuffItInput, StuffItInputNode, WriteMethod};
         let tree = vec![StuffItInputNode::File(StuffItInput {
             name: "hi.txt".into(),
             type_code: *b"TEXT",
@@ -751,8 +748,9 @@ mod tests {
     /// path — the inline-`+`-expanded CD-ROM / hard-disk-image copy path.
     #[test]
     fn reopen_recipe_reopens_disk_image_by_path() {
-        use crate::fs::filesystem::CreateFileOptions;
-        use crate::fs::{fat, open_editable_filesystem};
+        use crate::fs::open_editable_filesystem;
+        use disk_core::filesystem::CreateFileOptions;
+        use fs_pc::fat;
 
         let dir = tempfile::tempdir().unwrap();
         let img = dir.path().join("disk.img");
@@ -829,8 +827,9 @@ mod tests {
     /// — no root-node layer — so ordinary single-volume browsing is unchanged.
     #[test]
     fn diskimage_mount_single_opens_the_volume_directly() {
-        use crate::fs::filesystem::CreateFileOptions;
-        use crate::fs::{fat, open_editable_filesystem};
+        use crate::fs::open_editable_filesystem;
+        use disk_core::filesystem::CreateFileOptions;
+        use fs_pc::fat;
 
         let dir = tempfile::tempdir().unwrap();
         let img = dir.path().join("one.img");

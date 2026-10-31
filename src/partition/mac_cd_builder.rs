@@ -22,7 +22,7 @@
 use anyhow::{bail, ensure, Result};
 use std::io::{Cursor, Seek, SeekFrom, Write};
 
-use crate::partition::apm::build_minimal_apm;
+use part_tables::apm::build_minimal_apm;
 
 const SECTOR: u64 = 512;
 /// CD-ROM logical sector. Disc images are sized in whole 2048-byte sectors so
@@ -111,7 +111,7 @@ fn plan_volume(opts: &MacCdOptions) -> Result<(u32, u64)> {
     let block_size = match opts.block_size {
         Some(bs) => bs,
         None => match opts.fs {
-            MacCdFs::Hfs => crate::fs::hfs::pick_block_size(avail_bytes),
+            MacCdFs::Hfs => fs_mac::hfs::pick_block_size(avail_bytes),
             // Apple's default, and the largest our HFS+ formatter supports.
             MacCdFs::HfsPlus => 4096,
         },
@@ -175,7 +175,7 @@ pub fn write_mac_hfs_cd<W: Write + Seek>(sink: &mut W, opts: &MacCdOptions) -> R
     // *after* reserving its bitmap, so only the formatter knows the exact
     // image size the partition entry has to describe.
     let image_bytes = match opts.fs {
-        MacCdFs::Hfs => crate::fs::hfs::write_blank_hfs_into(
+        MacCdFs::Hfs => fs_mac::hfs::write_blank_hfs_into(
             sink,
             volume_offset,
             volume_bytes,
@@ -184,7 +184,7 @@ pub fn write_mac_hfs_cd<W: Write + Seek>(sink: &mut W, opts: &MacCdOptions) -> R
         )
         .map_err(|e| anyhow::anyhow!("formatting the HFS volume: {e}"))?,
         MacCdFs::HfsPlus => {
-            crate::fs::hfsplus::write_blank_hfsplus_into(
+            fs_mac::hfsplus::write_blank_hfsplus_into(
                 sink,
                 volume_offset,
                 volume_bytes,
@@ -251,8 +251,8 @@ pub fn build_mac_hfs_cd(opts: &MacCdOptions) -> Result<(Vec<u8>, MacCdLayout)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs::filesystem::Filesystem;
     use crate::partition::PartitionTable;
+    use disk_core::filesystem::Filesystem;
 
     fn open_volume(img: &[u8], layout: &MacCdLayout) -> Box<dyn Filesystem> {
         let table = PartitionTable::detect(&mut Cursor::new(img)).expect("APM detected");

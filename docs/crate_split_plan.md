@@ -276,6 +276,9 @@ The crates already kept separately stay separate, because other projects share t
    - **Left in Step 5:** IMZ (see above); the small app-side helpers `interleave` (Acorn DFS `.dsd`, needs `fs-8bit`'s `dfs`) and `swab`; and the upstream moves of the CHD and optical helpers to libchdman-rs / opticaldiscs, which are other repositories.
 6. **`arc-mac`, `fs-tar`.**
 7. **Cleanup and docs.**
+   - **Shims removed (2026-10-31).** The 142 one-line `pub use <crate>::<module>::*` shims under `src/fs`, `src/partition`, `src/rbformats`, `src/clonezilla` and `src/macarchive` are gone. About 1,400 references across `src/`, `tests/` and `examples/` now name the crate path directly. The parent `mod.rs` files privately `use` the crate modules their dispatch code names. The app-side tests that lived in shims (dispatch, detection, builders) moved to `src/{fs,partition,rbformats}/moved_tests.rs`.
+   - The mixed files keep their app code and import their crate module privately: `rbformats/vhd.rs` (export), `fs/hfs_clone.rs` (APM wrapping), `fs/hfs_boot.rs` (image-level boot blocks), `fs/entry.rs` (`FileEntryTypeDisplay`) and `fs/prodos_types.rs` (config-dir lookup).
+   - Still public on purpose: `crate::compat` / `crate::rust173_compat` (the 1.73 routes CLAUDE.md documents), `fs/mod.rs`'s item re-exports (`CompactResult`, the fsck types: the dispatch layer's API), and `dir_import`'s re-export of the `import_sink` options.
    - Remove the shims.
    - Add per-crate READMEs (from `src/fs/README.md` and `src/rbformats/README.md`).
    - Update CLAUDE.md § Architecture, CONTRIBUTING.md and `docs/export_pipelines.md`, and adapt the "add a filesystem" recipe to "add a feature to a family crate".

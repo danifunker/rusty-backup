@@ -8,9 +8,9 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
 
+use fs_amiga::pfs3::CompactPfs3Reader;
+use fs_amiga::sfs::CompactSfsReader;
 use rusty_backup::fs;
-use rusty_backup::fs::pfs3::CompactPfs3Reader;
-use rusty_backup::fs::sfs::CompactSfsReader;
 use rusty_backup::partition::PartitionTable;
 use rusty_backup::rbformats::chd::ChdReader;
 
@@ -68,7 +68,7 @@ fn main() -> anyhow::Result<()> {
             continue;
         }
         let offset = part.start_lba * 512;
-        let opened: Result<Box<dyn fs::filesystem::Filesystem>, _> =
+        let opened: Result<Box<dyn disk_core::filesystem::Filesystem>, _> =
             if path.to_lowercase().ends_with(".chd") {
                 let reader = ChdReader::open(Path::new(path))?;
                 fs::open_filesystem(reader, offset, 0, Some(type_str))

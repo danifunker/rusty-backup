@@ -21,8 +21,9 @@
 
 use std::path::Path;
 
-use crate::fs::entry::{EntryType, FileEntry, FileEntryTypeDisplay as _};
-use crate::fs::filesystem::{Filesystem, FilesystemError};
+use crate::fs::entry::FileEntryTypeDisplay as _;
+use disk_core::entry::{EntryType, FileEntry};
+use disk_core::filesystem::{Filesystem, FilesystemError};
 
 /// Where a [`DirListing`] reads its directory listings from.
 #[derive(Default)]
@@ -710,11 +711,11 @@ mod tests {
     fn navigation_through_a_real_filesystem() {
         // Build a blank FAT12 floppy on disk, add a subdirectory with a file in
         // it, then drive DirListing's enter/up over the re-opened filesystem.
-        use crate::fs::filesystem::{CreateDirectoryOptions, CreateFileOptions};
+        use disk_core::filesystem::{CreateDirectoryOptions, CreateFileOptions};
         use std::fs::OpenOptions;
         use std::io::Cursor;
 
-        let flat = crate::fs::fat::create_blank_fat(737280, Some("NAV")).unwrap();
+        let flat = fs_pc::fat::create_blank_fat(737280, Some("NAV")).unwrap();
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), &flat).unwrap();
 
@@ -862,9 +863,9 @@ mod tests {
     /// slash-named folder, not a decoy `Acquire` beside it.
     #[test]
     fn navigate_to_enters_slash_named_folders() {
-        use crate::fs::filesystem::{CreateDirectoryOptions, EditableFilesystem};
-        let img = crate::fs::hfs::create_blank_hfs(8 << 20, 4096, "Nav").unwrap();
-        let mut fs = crate::fs::hfs::HfsFilesystem::open(std::io::Cursor::new(img), 0).unwrap();
+        use disk_core::filesystem::{CreateDirectoryOptions, EditableFilesystem};
+        let img = fs_mac::hfs::create_blank_hfs(8 << 20, 4096, "Nav").unwrap();
+        let mut fs = fs_mac::hfs::HfsFilesystem::open(std::io::Cursor::new(img), 0).unwrap();
         let root = fs.root().unwrap();
         let opts = CreateDirectoryOptions::default();
         let plug = fs.create_directory(&root, "Plug-ins", &opts).unwrap();

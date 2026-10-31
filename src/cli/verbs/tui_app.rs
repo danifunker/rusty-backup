@@ -49,9 +49,9 @@ use std::time::Duration;
 
 use crate::cli::verbs::new::{FloppyArgs, FloppyFs, HdCommand, NewCommand, VolumeArgs, VolumeFs};
 use crate::device::{enumerate_devices, DiskDevice};
-use crate::fs::entry::{EntryType, FileEntry};
 use crate::model::rate_tracker::RateTracker;
-use crate::partition::format_size;
+use disk_core::display::format_size;
+use disk_core::entry::{EntryType, FileEntry};
 
 /// Shared state for a running progress task: a worker thread advances
 /// `current` toward `total`; the UI thread reads it each frame.
@@ -105,7 +105,7 @@ struct PartRow {
 /// One node in the Explorer's left-hand directory tree (flattened depth-first;
 /// expanding a node splices its child directories in right after it).
 struct TreeNode {
-    dir: crate::fs::entry::FileEntry,
+    dir: disk_core::entry::FileEntry,
     depth: usize,
     expanded: bool,
 }
@@ -121,7 +121,7 @@ enum ExFocus {
 /// **tree** on the left, the selected directory's **listing** on the right —
 /// over the shared `Filesystem` trait (the same core the `ls`/`get` verbs use).
 struct Explorer {
-    fs: Box<dyn crate::fs::filesystem::Filesystem>,
+    fs: Box<dyn disk_core::filesystem::Filesystem>,
     /// The source image + partition selector, kept so import can reopen the
     /// partition read-write and the view can refresh afterwards.
     image_path: String,
@@ -291,7 +291,7 @@ fn code_to_string(code: Option<[u8; 4]>) -> String {
 enum ExportFormat {
     /// A single file, written into the destination dir via the shared
     /// `fork_export::export_file_with_fork` (data / AppleDouble / MacBinary / …).
-    Fork(crate::fs::resource_fork::ResourceForkMode),
+    Fork(fs_mac::resource_fork::ResourceForkMode),
     /// The whole selection bundled into one archive (or folder) via the shared
     /// `export_selection` engine — tar / zip / StuffIt / MacArchive, etc. Every
     /// Space-marked row is included (folders walk recursively).
@@ -299,7 +299,7 @@ enum ExportFormat {
 }
 
 use crate::fs::export_selection::ExportFormat as EsFormat;
-use crate::fs::resource_fork::ResourceForkMode as RfMode;
+use fs_mac::resource_fork::ResourceForkMode as RfMode;
 
 /// The formats offered by the "Export as" menu.
 const EXPORT_FORMATS: &[(&str, ExportFormat)] = &[
@@ -2154,15 +2154,15 @@ struct CommanderState {
 struct InfoView {
     /// The entry being described (re-resolved on each edit so staged changes
     /// show immediately).
-    entry: crate::fs::entry::FileEntry,
+    entry: disk_core::entry::FileEntry,
     /// On-disk extended attributes, read when the overlay opened.
-    xattrs: Vec<crate::fs::xattr::Xattr>,
+    xattrs: Vec<disk_core::xattr::Xattr>,
     /// uid/gid -> name map from the image's own account files, if any.
-    id_names: crate::fs::id_names::IdNameMap,
+    id_names: disk_core::id_names::IdNameMap,
     /// For a SquashFS volume viewed at its root: what the image occupies and
     /// what it may grow into (`docs/squashfs_edit.md` §2.6 — the GUI budget
     /// dialog's content, ASCII-only). `None` for anything else.
-    size_plan: Option<crate::fs::squashfs_edit::SizePlan>,
+    size_plan: Option<fs_squashfs::squashfs_edit::SizePlan>,
 }
 
 /// Which attribute the user is typing a new value for, from the info overlay.
@@ -2842,15 +2842,15 @@ impl CommanderState {
                 // tree, and "how big is this image" is a question about the
                 // volume, not about a file inside it.
                 let plan = if fs.fs_type() == "SquashFS" && entry.path == "/" {
-                    let image_len = crate::fs::squashfs_write::image_footprint(fs.total_size());
+                    let image_len = fs_squashfs::squashfs_write::image_footprint(fs.total_size());
                     let capacity = (session.partition_offset != 0)
                         .then_some(session.partition_size)
                         .flatten();
-                    crate::fs::squashfs_edit::plan_size(&mut *fs, image_len, capacity).ok()
+                    fs_squashfs::squashfs_edit::plan_size(&mut *fs, image_len, capacity).ok()
                 } else {
                     None
                 };
-                let names = crate::fs::id_names::IdNameMap::from_filesystem(&mut *fs);
+                let names = disk_core::id_names::IdNameMap::from_filesystem(&mut *fs);
                 (x, names, plan)
             }),
             None => (Vec::new(), Default::default(), None),
@@ -2901,7 +2901,7 @@ impl CommanderState {
             }
         }
         if let Some(p) = &info.size_plan {
-            use crate::partition::format_size;
+            use disk_core::display::format_size;
             out.push(String::new());
             out.push("SquashFS size budget:".to_string());
             out.push(format!("  Image occupies {}", format_size(p.image_len)));
@@ -2977,7 +2977,7 @@ impl CommanderState {
                         return;
                     }
                 };
-                if !crate::fs::xattr::has_valid_namespace(&name) {
+                if !disk_core::xattr::has_valid_namespace(&name) {
                     self.set_result(Err(format!(
                         "Xattr {name:?} needs a user. / trusted. / security. / system. prefix"
                     )));
@@ -2989,7 +2989,7 @@ impl CommanderState {
                         name,
                     }
                 } else {
-                    match crate::fs::xattr::parse_value(value) {
+                    match disk_core::xattr::parse_value(value) {
                         Ok(v) => crate::model::edit_queue::StagedEdit::SetXattr {
                             entry: entry.clone(),
                             name,
@@ -3405,20 +3405,11 @@ fn cmd_remote_up(pane: &mut CmdPane) -> bool {
 }
 
 /// Fork container formats for archive extraction.
-const ARCHIVE_FORK_FORMATS: &[(&str, crate::macarchive::extract::ForkFormat)] = &[
-    (
-        "BinHex (.hqx)",
-        crate::macarchive::extract::ForkFormat::BinHex,
-    ),
-    (
-        "MacBinary (.bin)",
-        crate::macarchive::extract::ForkFormat::MacBinary,
-    ),
-    (
-        "AppleDouble",
-        crate::macarchive::extract::ForkFormat::AppleDouble,
-    ),
-    ("Raw (.rsrc)", crate::macarchive::extract::ForkFormat::Raw),
+const ARCHIVE_FORK_FORMATS: &[(&str, arc_mac::extract::ForkFormat)] = &[
+    ("BinHex (.hqx)", arc_mac::extract::ForkFormat::BinHex),
+    ("MacBinary (.bin)", arc_mac::extract::ForkFormat::MacBinary),
+    ("AppleDouble", arc_mac::extract::ForkFormat::AppleDouble),
+    ("Raw (.rsrc)", arc_mac::extract::ForkFormat::Raw),
 ];
 
 /// The Archives screen: open a classic Mac archive (`.sit` / `.sea` / `.cpt` /
@@ -3431,7 +3422,7 @@ struct ArchiveState {
     picker_dest: bool,
     archive_path: String,
     bytes: Vec<u8>,
-    archive: Option<crate::macarchive::stuffit::StuffItArchive>,
+    archive: Option<arc_mac::stuffit::StuffItArchive>,
     /// Pre-rendered entry lines for display.
     entries: Vec<String>,
     list_sel: usize,
@@ -4544,7 +4535,7 @@ impl App {
             // file's, even though it has no type code.
             KeyCode::Char('m') => {
                 if let Some(ex) = self.explorer.as_mut() {
-                    let editable = |e: &crate::fs::entry::FileEntry| {
+                    let editable = |e: &disk_core::entry::FileEntry| {
                         (matches!(e.entry_type, EntryType::File)
                             && (e.type_code.is_some() || e.mac_dates.is_some()))
                             || e.mode.is_some()
@@ -4711,7 +4702,7 @@ impl App {
                     if is_dir {
                         anyhow::bail!("that format exports a single file, not a directory");
                     }
-                    let n = crate::fs::fork_export::export_file_with_fork(
+                    let n = fs_mac::fork_export::export_file_with_fork(
                         &mut *ex.fs,
                         &entry,
                         dest,
@@ -7337,7 +7328,7 @@ impl App {
 
     /// Open a Mac archive and pre-render its entry list.
     fn load_archive(&mut self, path: std::path::PathBuf) {
-        match crate::macarchive::extract::open(&path) {
+        match arc_mac::extract::open(&path) {
             Ok((bytes, archive)) => {
                 let mut entries = Vec::new();
                 for e in &archive.entries {
@@ -7357,8 +7348,8 @@ impl App {
                         .filter(|f| f.uncompressed_len > 0)
                         .map(|f| format!("rsrc {}", format_size(f.uncompressed_len as u64)))
                         .unwrap_or_default();
-                    let ty = crate::fs::hfs::format_ostype(&e.type_code);
-                    let cr = crate::fs::hfs::format_ostype(&e.creator_code);
+                    let ty = fs_mac::hfs::format_ostype(&e.type_code);
+                    let cr = fs_mac::hfs::format_ostype(&e.creator_code);
                     entries.push(format!(
                         "FILE  {:<34} {:>4} {:>4}  {}  {}",
                         e.display_path(),
@@ -7400,14 +7391,8 @@ impl App {
             return;
         };
         let format = ARCHIVE_FORK_FORMATS[a.fork_fmt_sel.min(ARCHIVE_FORK_FORMATS.len() - 1)].1;
-        let result = crate::macarchive::extract::extract_all(
-            &a.bytes,
-            archive,
-            &dest,
-            format,
-            |_, _, _| {},
-            |_| {},
-        );
+        let result =
+            arc_mac::extract::extract_all(&a.bytes, archive, &dest, format, |_, _, _| {}, |_| {});
         let a = self.archive.as_mut().unwrap();
         match result {
             Ok(stats) => {
@@ -11694,7 +11679,7 @@ fn apply_mkdir(
     fs.create_directory(
         &parent,
         name,
-        &crate::fs::filesystem::CreateDirectoryOptions::default(),
+        &disk_core::filesystem::CreateDirectoryOptions::default(),
     )
     .map_err(|e| anyhow::anyhow!("create_directory: {e}"))?;
     fs.sync_metadata()
@@ -11770,7 +11755,7 @@ fn write_file_bytes(
         &leaf,
         &mut reader,
         bytes.len() as u64,
-        &crate::fs::filesystem::CreateFileOptions::default(),
+        &disk_core::filesystem::CreateFileOptions::default(),
         crate::fs::replace::ReplacePolicy::replace(),
     )
     .map_err(|e| anyhow::anyhow!("writing {leaf}: {e}"))?;
@@ -11807,7 +11792,7 @@ fn import_host_file(
         .ok_or_else(|| anyhow::anyhow!("no filename in {}", host.display()))?;
     // Read the host file the way the Commander pane does, so a Mac file in
     // any of its four containers keeps its fork, type/creator and real name.
-    let resource_fork = crate::fs::resource_fork::detect_resource_fork(host);
+    let resource_fork = fs_mac::resource_fork::detect_resource_fork(host);
     let name = resource_fork
         .as_ref()
         .and_then(|i| i.name.clone())
@@ -11840,7 +11825,7 @@ fn import_host_file(
     let children = fs
         .list_directory(&parent)
         .map_err(|e| anyhow::anyhow!("list_directory: {e}"))?;
-    let exists = crate::fs::filesystem::find_child(fold, &children, &leaf).is_some();
+    let exists = disk_core::filesystem::find_child(fold, &children, &leaf).is_some();
     if exists && on_conflict == crate::fs::replace::OnConflict::Fail {
         return Ok(ImportOutcome::Exists(leaf));
     }
@@ -12222,7 +12207,7 @@ mod tests {
     fn mbr_with_ext(dir: &std::path::Path) -> std::path::PathBuf {
         const START: u32 = 2048;
         let vol =
-            crate::fs::ext_format::create_blank_ext4(16 * 1024 * 1024, "ROOT").expect("blank ext4");
+            fs_unix::ext_format::create_blank_ext4(16 * 1024 * 1024, "ROOT").expect("blank ext4");
         let img = dir.join("disk.img");
         let mut bytes = vec![0u8; START as usize * 512 + vol.len()];
         bytes[START as usize * 512..].copy_from_slice(&vol);
@@ -12374,7 +12359,7 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let img = dir.path().join("v.img");
-        let bytes = crate::fs::fat::create_blank_fat(2 * 1024 * 1024, Some("T")).unwrap();
+        let bytes = fs_pc::fat::create_blank_fat(2 * 1024 * 1024, Some("T")).unwrap();
         std::fs::write(&img, &bytes).unwrap();
 
         let host = dir.path().join("A.TXT");
@@ -12406,9 +12391,9 @@ mod tests {
 
     /// Read a root-level file's contents straight from the image on disk.
     fn read_root_file(img: &std::path::Path, name: &str) -> Vec<u8> {
-        use crate::fs::filesystem::Filesystem;
+        use disk_core::filesystem::Filesystem;
         let f = std::fs::File::open(img).unwrap();
-        let mut fs = crate::fs::fat::FatFilesystem::open(f, 0).unwrap();
+        let mut fs = fs_pc::fat::FatFilesystem::open(f, 0).unwrap();
         let root = fs.root().unwrap();
         let e = fs
             .list_directory(&root)
@@ -12629,7 +12614,7 @@ mod tests {
         assert!(!w.is_error, "{:?}", w.status);
         let mut f = std::fs::File::open(&iso).unwrap();
         assert!(
-            crate::partition::next::detect(&mut f).is_some(),
+            part_tables::next::detect(&mut f).is_some(),
             "a NeXT label at block 0"
         );
     }
@@ -12695,7 +12680,7 @@ mod tests {
         let img = dir.path().join("ext.img");
         std::fs::write(
             &img,
-            crate::fs::ext_format::create_blank_ext2(16 * 1024 * 1024, "TUI").expect("format"),
+            fs_unix::ext_format::create_blank_ext2(16 * 1024 * 1024, "TUI").expect("format"),
         )
         .expect("write image");
 

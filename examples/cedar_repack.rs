@@ -21,9 +21,9 @@
 use std::collections::HashMap;
 use std::fs;
 
-use rusty_backup::fs::alto::pdi;
-use rusty_backup::fs::alto::pilot::{self, Generation, PilotFilesystem, PvBootFile};
-use rusty_backup::fs::filesystem::Filesystem;
+use disk_core::filesystem::Filesystem;
+use fs_xerox::alto::pdi;
+use fs_xerox::alto::pilot::{self, Generation, PilotFilesystem, PvBootFile};
 
 /// Index of <dir>'s files by exact byte length -> [(basename, content)]. A
 /// corpus file is the archive file padded with zeros to a 512-byte page, so a

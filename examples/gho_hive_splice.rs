@@ -14,7 +14,7 @@
 // Usage:
 //   cargo run --release --example gho_hive_splice -- PATH.GHO CORRUPT_HIVE OUT_HIVE
 
-use rusty_backup::rbformats::gho::GhoReader;
+use dsk_ghost::gho::GhoReader;
 
 fn rd_u32(b: &[u8], o: usize) -> u32 {
     u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])

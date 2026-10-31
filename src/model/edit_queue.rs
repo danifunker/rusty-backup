@@ -12,12 +12,12 @@ use std::fs::File;
 use std::io::Cursor;
 use std::path::PathBuf;
 
-use crate::fs::entry::FileEntry;
-use crate::fs::filesystem::{
+use disk_core::entry::FileEntry;
+use disk_core::filesystem::{
     CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem, FilesystemError,
     ResourceForkSource,
 };
-use crate::fs::resource_fork::{self, ImportedResourceFork};
+use fs_mac::resource_fork::{self, ImportedResourceFork};
 
 /// Original timestamps captured from a source file so a cross-image copy can
 /// reproduce them on the destination instead of stamping the current time.
@@ -37,7 +37,7 @@ pub struct PreservedDates {
     /// inode / Mac dates / Amiga datestamp / tar Header / host stat).
     pub unix_mtime: Option<u64>,
     /// QNX 2 permissions, owner and date words, copied exactly onto a QNX 2 destination.
-    pub qnx2: Option<crate::fs::entry::Qnx2Attrs>,
+    pub qnx2: Option<disk_core::entry::Qnx2Attrs>,
 }
 
 impl PreservedDates {
@@ -102,7 +102,7 @@ pub enum StagedEdit {
         parent: FileEntry,
         name: String,
         /// A QNX 2 source folder's permissions, owner and date, copied exactly.
-        qnx2_attrs: Option<crate::fs::entry::Qnx2Attrs>,
+        qnx2_attrs: Option<disk_core::entry::Qnx2Attrs>,
     },
     DeleteEntry {
         parent: FileEntry,
@@ -213,7 +213,7 @@ pub fn resolve_dir_by_path(
 /// [`resolve_dir_by_path`] on a read-only filesystem (the Apply preflight).
 pub fn resolve_dir_in(fs: &mut dyn Filesystem, path: &str) -> Result<FileEntry, FilesystemError> {
     let components: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
-    crate::fs::filesystem::resolve_components_joined(fs, &components, true)?.ok_or_else(|| {
+    disk_core::filesystem::resolve_components_joined(fs, &components, true)?.ok_or_else(|| {
         FilesystemError::NotFound(format!("folder '{path}' not found on the destination"))
     })
 }
@@ -251,7 +251,7 @@ pub fn apply_edit(
                 unix_times: dates
                     .as_ref()
                     .and_then(|d| d.unix_mtime)
-                    .map(crate::fs::times::UnixTimes::mtime_only),
+                    .map(disk_core::times::UnixTimes::mtime_only),
                 qnx2_attrs: dates.as_ref().and_then(|d| d.qnx2),
                 ..Default::default()
             };
@@ -344,7 +344,7 @@ pub fn apply_edit(
             let fold = efs.case_insensitive_lookup();
             let children = efs.list_directory(&resolved_parent)?;
             if let Some(existing) =
-                crate::fs::filesystem::find_child(fold, &children, name).cloned()
+                disk_core::filesystem::find_child(fold, &children, name).cloned()
             {
                 if existing.is_directory() {
                     return Ok(());
@@ -875,7 +875,7 @@ impl EditQueue {
                 // is what keeps this preview honest -- an import carrying a blank
                 // FInfo must display the dictionary value that will actually be
                 // written, not a blank.
-                return crate::fs::hfs_common::resolve_create_type_creator(
+                return fs_mac::hfs_common::resolve_create_type_creator(
                     name,
                     hfs_type_override.or(imp_t),
                     hfs_creator_override.or(imp_c),
@@ -1137,8 +1137,8 @@ impl EditQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs::filesystem::Filesystem;
-    use crate::fs::hfs::{create_blank_hfs, HfsFilesystem};
+    use disk_core::filesystem::Filesystem;
+    use fs_mac::hfs::{create_blank_hfs, HfsFilesystem};
     use std::io::Cursor;
 
     const MIB: u64 = 1024 * 1024;
@@ -1345,8 +1345,8 @@ mod tests {
     /// done, not a mid-batch error; a file in the way still is one.
     #[test]
     fn creating_a_directory_that_exists_is_a_no_op_but_a_file_in_the_way_fails() {
-        use crate::fs::fat::{create_blank_fat, FatFilesystem};
-        use crate::fs::filesystem::{CreateDirectoryOptions, CreateFileOptions, Filesystem};
+        use disk_core::filesystem::{CreateDirectoryOptions, CreateFileOptions, Filesystem};
+        use fs_pc::fat::{create_blank_fat, FatFilesystem};
         use std::io::Cursor;
 
         let img = create_blank_fat(2 * 1024 * 1024, Some("T")).unwrap();
@@ -1387,9 +1387,9 @@ mod tests {
     /// in the same batch made it report the wrong conflicts.
     #[test]
     fn conflict_scan_replays_pending_renames_and_deletes() {
-        use crate::fs::fat::{create_blank_fat, FatFilesystem};
-        use crate::fs::filesystem::{CreateFileOptions, Filesystem};
         use crate::fs::replace::OnConflict;
+        use disk_core::filesystem::{CreateFileOptions, Filesystem};
+        use fs_pc::fat::{create_blank_fat, FatFilesystem};
         use std::io::Cursor;
 
         let img = create_blank_fat(2 * 1024 * 1024, Some("T")).unwrap();
@@ -1458,9 +1458,9 @@ mod tests {
     /// instead of being interrupted per file mid-batch.
     #[test]
     fn conflicting_adds_are_detected_up_front_and_decided_per_file() {
-        use crate::fs::fat::{create_blank_fat, FatFilesystem};
-        use crate::fs::filesystem::{CreateFileOptions, Filesystem};
         use crate::fs::replace::OnConflict;
+        use disk_core::filesystem::{CreateFileOptions, Filesystem};
+        use fs_pc::fat::{create_blank_fat, FatFilesystem};
         use std::io::Cursor;
 
         let img = create_blank_fat(2 * 1024 * 1024, Some("T")).unwrap();
@@ -1530,8 +1530,8 @@ mod tests {
     /// path now replaces, and carries the previous file's metadata across.
     #[test]
     fn apply_edit_can_replace_and_keeps_the_old_files_metadata() {
-        use crate::fs::fat::{create_blank_fat, FatFilesystem};
-        use crate::fs::filesystem::{CreateFileOptions, Filesystem};
+        use disk_core::filesystem::{CreateFileOptions, Filesystem};
+        use fs_pc::fat::{create_blank_fat, FatFilesystem};
         use std::io::Cursor;
 
         let img = create_blank_fat(2 * 1024 * 1024, Some("T")).unwrap();
@@ -1586,8 +1586,8 @@ mod tests {
     /// conflicts keeps refusing rather than silently overwriting.
     #[test]
     fn apply_edit_still_refuses_a_collision_by_default() {
-        use crate::fs::fat::{create_blank_fat, FatFilesystem};
-        use crate::fs::filesystem::{CreateFileOptions, Filesystem};
+        use disk_core::filesystem::{CreateFileOptions, Filesystem};
+        use fs_pc::fat::{create_blank_fat, FatFilesystem};
         use std::io::Cursor;
 
         let img = create_blank_fat(2 * 1024 * 1024, Some("T")).unwrap();
@@ -1634,8 +1634,8 @@ mod tests {
     /// instead of stamping the current time — end to end through apply_edit.
     #[test]
     fn add_file_preserves_amiga_dates() {
-        use crate::fs::affs::{create_blank_affs, AffsFilesystem};
-        use crate::fs::filesystem::Filesystem;
+        use disk_core::filesystem::Filesystem;
+        use fs_amiga::affs::{create_blank_affs, AffsFilesystem};
         use std::io::Cursor;
 
         let img = create_blank_affs(880 * 1024, 1, "DATES").unwrap();

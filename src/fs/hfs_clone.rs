@@ -1,13 +1,13 @@
 //! Moved to the `fs-mac` crate; re-exported so `crate::fs::hfs_clone` paths keep working.
 
-pub use fs_mac::hfs_clone::*;
-
 #[cfg(feature = "rust173-polyfill")]
 use crate::rust173_compat::IntIsMultipleOf as _;
+#[allow(unused_imports)]
+use fs_mac::hfs_clone::*;
 use std::io::{Read, Seek, SeekFrom, Write};
 
 use crate::fs::FilesystemError;
-use crate::partition::apm::{Apm, ApmPartitionEntry, DriverDescriptorRecord};
+use part_tables::apm::{Apm, ApmPartitionEntry, DriverDescriptorRecord};
 
 /// Summary returned by [`emit_apm_disk_with_hfs`].
 #[derive(Debug, Clone)]
@@ -312,7 +312,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs::hfs::HfsFilesystem;
+    use fs_mac::hfs::HfsFilesystem;
     use std::io::Cursor;
 
     /// Build a synthetic raw APM source disk with a partition_map entry, an
@@ -320,7 +320,7 @@ mod tests {
     /// partition. Used to verify the emit path preserves drivers and lays out
     /// the HFS partition at the right block.
     fn build_synthetic_apm_disk() -> Vec<u8> {
-        use crate::partition::apm::build_minimal_apm;
+        use part_tables::apm::build_minimal_apm;
         let total_blocks: u32 = 512; // 256 KiB total
         let driver_start: u32 = 32;
         let driver_blocks: u32 = 8;
@@ -356,8 +356,7 @@ mod tests {
         // Cloned HFS partition. Use create_blank_hfs to produce a syntactically
         // valid (and fsck-clean) HFS volume of a chosen size. The emit step
         // doesn't care that the volume is empty, only that the bytes are valid.
-        let hfs_image =
-            crate::fs::hfs::create_blank_hfs(2 * 1024 * 1024, 4096, "Expanded").unwrap();
+        let hfs_image = fs_mac::hfs::create_blank_hfs(2 * 1024 * 1024, 4096, "Expanded").unwrap();
 
         let mut src_cursor = Cursor::new(source_disk.clone());
         let mut output: Vec<u8> = Vec::new();
@@ -435,15 +434,14 @@ mod tests {
     #[test]
     fn emit_apm_from_non_apm_source() {
         // Source: bare HFS bytes, no DDR at sector 0.
-        let source_disk = crate::fs::hfs::create_blank_hfs(1024 * 1024, 4096, "Source").unwrap();
+        let source_disk = fs_mac::hfs::create_blank_hfs(1024 * 1024, 4096, "Source").unwrap();
         let source_len = source_disk.len() as u64;
         // Sanity check: Apm::parse must refuse this — otherwise the test
         // isn't exercising the non-APM fallback.
         assert!(Apm::parse(&mut Cursor::new(&source_disk)).is_err());
 
         // Cloned HFS payload (the "expanded" volume).
-        let hfs_image =
-            crate::fs::hfs::create_blank_hfs(2 * 1024 * 1024, 4096, "Expanded").unwrap();
+        let hfs_image = fs_mac::hfs::create_blank_hfs(2 * 1024 * 1024, 4096, "Expanded").unwrap();
 
         let mut src_cursor = Cursor::new(source_disk);
         let mut output: Vec<u8> = Vec::new();

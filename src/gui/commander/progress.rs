@@ -115,15 +115,15 @@ impl ProgressWindow {
                         .suffix(snapshot.bytes_done, snapshot.bytes_total);
                     format!(
                         "{} / {} ({:.0}%){}",
-                        rusty_backup::partition::format_size(snapshot.bytes_done),
-                        rusty_backup::partition::format_size(snapshot.bytes_total),
+                        disk_core::display::format_size(snapshot.bytes_done),
+                        disk_core::display::format_size(snapshot.bytes_total),
                         frac * 100.0,
                         suffix,
                     )
                 } else if snapshot.bytes_done > 0 {
                     format!(
                         "{} processed",
-                        rusty_backup::partition::format_size(snapshot.bytes_done)
+                        disk_core::display::format_size(snapshot.bytes_done)
                     )
                 } else {
                     "Preparing...".to_string()

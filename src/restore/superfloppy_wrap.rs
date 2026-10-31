@@ -16,8 +16,8 @@ use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use anyhow::{bail, Context, Result};
 
 use crate::fs::patch_hidden_sectors_for;
-use crate::partition::gpt::{build_minimal_gpt, Gpt, Guid};
-use crate::partition::mbr::build_minimal_mbr;
+use part_tables::gpt::{build_minimal_gpt, Gpt, Guid};
+use part_tables::mbr::build_minimal_mbr;
 
 const SECTOR_SIZE: u64 = 512;
 const STREAM_CHUNK: usize = 1024 * 1024;
@@ -211,7 +211,7 @@ fn write_table<W: Read + Write + Seek>(
             // A bootable partition needs MBR boot code to chainload it;
             // build_minimal_mbr only writes the partition table.
             if *bootable {
-                crate::partition::mbr::install_mbr_boot_code(&mut mbr);
+                part_tables::mbr::install_mbr_boot_code(&mut mbr);
             }
             target.write_all(&mbr).context("writing synthetic MBR")?;
             log_cb(&format!(

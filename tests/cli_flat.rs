@@ -73,7 +73,7 @@ fn new_hfs_put_get_mkdir_rm_round_trip() {
 
     // Library can re-open it.
     {
-        use rusty_backup::fs::hfs::HfsFilesystem;
+        use fs_mac::hfs::HfsFilesystem;
         let f = std::fs::File::open(&img).unwrap();
         let fs = HfsFilesystem::open(f, 0).expect("re-open HFS image");
         assert_eq!(fs.volume_summary().volume_name, "FlatRT");
@@ -304,7 +304,7 @@ fn generic_verbs_round_trip_against_hfsplus() {
     // open_filesystem / open_editable_filesystem dispatch. Building an
     // HFS+ image here (not the HFS image new --fs hfs makes) exercises
     // that path end-to-end against a non-HFS target.
-    use rusty_backup::fs::hfsplus::create_blank_hfsplus;
+    use fs_mac::hfsplus::create_blank_hfsplus;
     use std::io::Write;
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -700,9 +700,9 @@ fn put_boot_apm_writes_at_partition_offset_not_image_zero() {
     // 0xC000 for a typical Apple_HFS placement), not the image's byte
     // 0 — that would overwrite the APM Driver Descriptor Record and
     // brick the disk for a Mac ROM.
-    use rusty_backup::fs::hfs::create_blank_hfs;
+    use fs_mac::hfs::create_blank_hfs;
+    use part_tables::apm::build_minimal_apm;
     use rusty_backup::fs::hfs_clone::emit_apm_disk_with_hfs;
-    use rusty_backup::partition::apm::build_minimal_apm;
     use std::io::Cursor;
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -774,9 +774,9 @@ fn locate_returns_absolute_offset_inside_apm_wrapped_image() {
     // must include the partition base — that's the whole point of the
     // verb (the build-script consumer shouldn't have to know APM
     // layout).
-    use rusty_backup::fs::hfs::create_blank_hfs;
+    use fs_mac::hfs::create_blank_hfs;
+    use part_tables::apm::build_minimal_apm;
     use rusty_backup::fs::hfs_clone::emit_apm_disk_with_hfs;
-    use rusty_backup::partition::apm::build_minimal_apm;
     use std::io::Cursor;
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -879,7 +879,7 @@ fn inspect_text_runs_on_raw_hfs_image() {
 
 /// `put` must not silently make every added file root:root 0644.
 ///
-/// Until `fs::attrs` landed, nothing set `CreateFileOptions`'s mode/uid/gid, so
+/// Until `disk_core::attrs` landed, nothing set `CreateFileOptions`'s mode/uid/gid, so
 /// each driver's `unwrap_or` decided — and replacing a 0600 secret with a
 /// world-readable host copy quietly widened it. This pins the precedence:
 /// explicit flags win, and a replace inherits from the file it replaces.

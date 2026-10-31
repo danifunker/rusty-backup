@@ -394,7 +394,7 @@ impl PhysicalDiskExport {
             None,
             format!(
                 "Entire disk ({}) - replaces the partition table",
-                rusty_backup::partition::format_size(dev.size_bytes),
+                disk_core::display::format_size(dev.size_bytes),
             ),
         );
 
@@ -415,7 +415,7 @@ impl PhysicalDiskExport {
                 "Partition {} - {} ({}) at LBA {}",
                 p.index + 1,
                 p.type_name,
-                rusty_backup::partition::format_size(p.size_bytes),
+                disk_core::display::format_size(p.size_bytes),
                 p.start_lba,
             );
             ui.radio_value(&mut self.target_partition, Some(p.index), label);
@@ -428,8 +428,8 @@ impl PhysicalDiskExport {
                         super::theme::danger(ui.visuals()),
                         format!(
                             "Source is {} but the partition holds {}",
-                            rusty_backup::partition::format_size(src.size_bytes),
-                            rusty_backup::partition::format_size(p.size_bytes),
+                            disk_core::display::format_size(src.size_bytes),
+                            disk_core::display::format_size(p.size_bytes),
                         ),
                     );
                 }
@@ -461,8 +461,8 @@ impl PhysicalDiskExport {
                 let suffix = self.write_rate.suffix(current, total);
                 format!(
                     "{} / {} ({:.0}%){}",
-                    rusty_backup::partition::format_size(current),
-                    rusty_backup::partition::format_size(total),
+                    disk_core::display::format_size(current),
+                    disk_core::display::format_size(total),
                     frac * 100.0,
                     suffix,
                 )
@@ -510,9 +510,9 @@ impl PhysicalDiskExport {
             if source.size_bytes > part.size_bytes {
                 self.last_error = Some(format!(
                     "Source is {} but partition {} holds only {}",
-                    rusty_backup::partition::format_size(source.size_bytes),
+                    disk_core::display::format_size(source.size_bytes),
                     part.index + 1,
-                    rusty_backup::partition::format_size(part.size_bytes),
+                    disk_core::display::format_size(part.size_bytes),
                 ));
                 return;
             }

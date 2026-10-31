@@ -11,8 +11,8 @@
 //! `docs/SGI_EFS_v1.md`).
 
 use byteorder::{BigEndian, ByteOrder};
+use part_tables::sgi_dklabel::{swab16_in_place, SGI_DKLABEL_MAGIC};
 use rusty_backup::fs::open_filesystem;
-use rusty_backup::partition::sgi_dklabel::{swab16_in_place, SGI_DKLABEL_MAGIC};
 use rusty_backup::partition::PartitionTable;
 use std::io::Cursor;
 
@@ -242,8 +242,9 @@ fn a_bare_partition_image_is_detected_without_a_label() {
 /// view take. Proves the dispatch wiring, not just the driver internals.
 #[test]
 fn a_blank_volume_is_writable_through_the_public_factory() {
-    use rusty_backup::fs::filesystem::{CreateDirectoryOptions, CreateFileOptions};
-    use rusty_backup::fs::{efs_v1::create_blank_efs_v1, open_editable_filesystem};
+    use disk_core::filesystem::{CreateDirectoryOptions, CreateFileOptions};
+    use fs_unix::efs_v1::create_blank_efs_v1;
+    use rusty_backup::fs::open_editable_filesystem;
 
     let img = create_blank_efs_v1(4 * 1024 * 1024, "e2e").unwrap();
 
@@ -284,8 +285,9 @@ fn a_blank_volume_is_writable_through_the_public_factory() {
 /// the synthetic type byte must still route, and writes must stay symmetric.
 #[test]
 fn a_byte_swapped_blank_volume_is_writable_too() {
-    use rusty_backup::fs::filesystem::CreateFileOptions;
-    use rusty_backup::fs::{efs_v1::create_blank_efs_v1, open_editable_filesystem};
+    use disk_core::filesystem::CreateFileOptions;
+    use fs_unix::efs_v1::create_blank_efs_v1;
+    use rusty_backup::fs::open_editable_filesystem;
 
     let mut img = create_blank_efs_v1(4 * 1024 * 1024, "e2e").unwrap();
     swab16_in_place(&mut img);

@@ -23,8 +23,8 @@
 //! `$EDITOR`) and the in-app editors in the TUI and GUI all need exactly this,
 //! and a second implementation would be a second set of corruption bugs.
 
-use crate::fs::fat::{char_to_cp437, cp437_to_char};
-use crate::fs::hfs::{mac_roman_to_utf8, utf8_to_mac_roman};
+use fs_mac::hfs::{mac_roman_to_utf8, utf8_to_mac_roman};
+use fs_pc::fat::{char_to_cp437, cp437_to_char};
 
 /// How a file's bytes represent characters.
 ///

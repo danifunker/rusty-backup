@@ -21,12 +21,12 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use crate::fs::entry::{EntryType, FileEntry};
-use crate::fs::filesystem::Filesystem;
-use crate::fs::fork_export::{export_file_with_fork, safe_name};
-use crate::fs::resource_fork::{build_appledouble, MacFileDates, ResourceForkMode};
-use crate::fs::tar_export::{export_tar_multi, TarCompression, TarExportOptions};
-use crate::macarchive::stuffit::{build_archive_tree, StuffItInput, StuffItInputNode, WriteMethod};
+use arc_mac::stuffit::{build_archive_tree, StuffItInput, StuffItInputNode, WriteMethod};
+use disk_core::entry::{EntryType, FileEntry};
+use disk_core::filesystem::Filesystem;
+use fs_mac::fork_export::{export_file_with_fork, safe_name};
+use fs_mac::resource_fork::{build_appledouble, MacFileDates, ResourceForkMode};
+use fs_tar::tar_export::{export_tar_multi, TarCompression, TarExportOptions};
 
 /// One user-selectable export output shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,7 +136,7 @@ fn cancelled_err() -> anyhow::Error {
     anyhow::anyhow!("export cancelled")
 }
 
-pub use disk_core::entry::{common_parent, relative_dir};
+use disk_core::entry::{common_parent, relative_dir};
 
 /// Export `entries` from `fs` as loose outputs into the directory `dest_dir`.
 /// Only [`ExportFormat::LooseFiles`] / [`GzipPerFile`](ExportFormat::GzipPerFile)
@@ -202,7 +202,7 @@ fn folder_recurse(
                 // discard `dest_dir` entirely and target the host root.
                 let sub = match e.archive_name() {
                     Some(name) => {
-                        let sub = dest_dir.join(crate::fs::resource_fork::sanitize_filename(name));
+                        let sub = dest_dir.join(fs_mac::resource_fork::sanitize_filename(name));
                         std::fs::create_dir_all(&sub)
                             .with_context(|| format!("creating {}", sub.display()))?;
                         sub
@@ -479,7 +479,7 @@ fn export_mac_archive_file(
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("archive");
-        crate::macarchive::mar::build_archive(root, &nodes).context("building MacArchive (.mar)")?
+        arc_mac::mar::build_archive(root, &nodes).context("building MacArchive (.mar)")?
     } else {
         build_archive_tree(&nodes, WriteMethod::Rle).context("building StuffIt archive")?
     };
@@ -587,7 +587,7 @@ fn mac_dates(e: &FileEntry) -> MacFileDates {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs::filesystem::EditableFilesystem;
+    use disk_core::filesystem::EditableFilesystem;
     use std::io::Read;
 
     fn put_file(efs: &mut dyn EditableFilesystem, parent: &FileEntry, name: &str, data: &[u8]) {
@@ -599,7 +599,7 @@ mod tests {
     /// A blank FAT volume holding `HELLO.TXT`, `DATA.BIN`, and `SUB/INNER.TXT`.
     /// Returns the open (read-only) filesystem and its selected root entries.
     fn fixture() -> (Box<dyn Filesystem>, Vec<FileEntry>, tempfile::TempDir) {
-        let flat = crate::fs::fat::create_blank_fat(2 * 1024 * 1024, Some("EXP")).unwrap();
+        let flat = fs_pc::fat::create_blank_fat(2 * 1024 * 1024, Some("EXP")).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let img = dir.path().join("v.img");
         std::fs::write(&img, &flat).unwrap();
@@ -715,7 +715,7 @@ mod tests {
         // folder-in-folder: SUB/SUBSUB/DEEP.TXT. Every other test only exercises
         // one directory level; real folders nest, so exercise a marked folder
         // that contains a subfolder across every single-file archive format.
-        let flat = crate::fs::fat::create_blank_fat(2 * 1024 * 1024, Some("EXP")).unwrap();
+        let flat = fs_pc::fat::create_blank_fat(2 * 1024 * 1024, Some("EXP")).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let img = dir.path().join("v.img");
         std::fs::write(&img, &flat).unwrap();
@@ -883,15 +883,13 @@ mod tests {
         .unwrap();
         assert_eq!(s.files, 3);
         let bytes = std::fs::read(&path).unwrap();
-        let archive = crate::macarchive::stuffit::parse(&bytes).unwrap();
+        let archive = arc_mac::stuffit::parse(&bytes).unwrap();
         let hello = archive
             .entries
             .iter()
             .find(|e| e.name == "HELLO.TXT")
             .expect("HELLO.TXT in sit");
-        let data =
-            crate::macarchive::stuffit::decompress_fork(&bytes, hello.data.as_ref().unwrap())
-                .unwrap();
+        let data = arc_mac::stuffit::decompress_fork(&bytes, hello.data.as_ref().unwrap()).unwrap();
         assert_eq!(data, b"hello world");
     }
 
@@ -910,7 +908,7 @@ mod tests {
         )
         .unwrap();
         let hqx = std::fs::read(out.path().join("HELLO.TXT.hqx")).unwrap();
-        let bh = crate::fs::binhex::parse_binhex(&hqx).unwrap();
+        let bh = fs_mac::binhex::parse_binhex(&hqx).unwrap();
         assert_eq!(bh.data_fork, b"hello world");
     }
 
@@ -930,15 +928,13 @@ mod tests {
         .unwrap();
         assert_eq!(s.files, 3);
         let raw = std::fs::read(&path).unwrap();
-        let (bytes, archive) = crate::macarchive::mar::parse(&raw).unwrap();
+        let (bytes, archive) = arc_mac::mar::parse(&raw).unwrap();
         let hello = archive
             .entries
             .iter()
             .find(|e| e.name == "HELLO.TXT")
             .expect("HELLO.TXT in mar");
-        let data =
-            crate::macarchive::stuffit::decompress_fork(&bytes, hello.data.as_ref().unwrap())
-                .unwrap();
+        let data = arc_mac::stuffit::decompress_fork(&bytes, hello.data.as_ref().unwrap()).unwrap();
         assert_eq!(data, b"hello world");
     }
 
@@ -963,7 +959,7 @@ mod tests {
 #[cfg(test)]
 mod selection_path_tests {
     use super::*;
-    use crate::fs::entry::EntryType;
+    use disk_core::entry::EntryType;
 
     fn f(path: &str) -> FileEntry {
         let mut e = FileEntry::root();

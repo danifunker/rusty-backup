@@ -204,7 +204,7 @@ fn populate(args: &NewNextCdromArgs, dir: &std::path::Path) -> Result<()> {
     let mut fs = ctx
         .open_editable(file)
         .map_err(|e| anyhow::anyhow!("opening the new UFS filesystem for writing: {e}"))?;
-    let dest = crate::fs::filesystem::Filesystem::root(fs.as_filesystem_mut())
+    let dest = disk_core::filesystem::Filesystem::root(fs.as_filesystem_mut())
         .map_err(|e| anyhow::anyhow!("resolving volume root: {e}"))?;
 
     let stats = import_dir(

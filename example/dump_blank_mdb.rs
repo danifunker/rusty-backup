@@ -1,4 +1,4 @@
-use rusty_backup::fs::hfs::create_blank_hfs;
+use fs_mac::hfs::create_blank_hfs;
 fn main() {
     let img = create_blank_hfs(2046 * 1024 * 1024, 32 * 1024, "Test").unwrap();
     print!("Primary MDB byte 10: 0x{:02x}\n", img[1024 + 10]);

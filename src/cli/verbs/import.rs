@@ -26,7 +26,7 @@ use crate::cli::img_at::ImageRef;
 use crate::cli::logging::log_stderr;
 use crate::cli::resolve::{resolve_partition_rw_forced, FsDispatchOverride};
 use crate::fs::dir_import::{import_dir, DirImportOptions};
-use crate::fs::import_sink::{ImportConflict, ImportOptions, ImportStats};
+use fs_tar::import_sink::{ImportConflict, ImportOptions, ImportStats};
 
 #[derive(Debug, Args)]
 pub struct ImportArgs {
@@ -278,7 +278,7 @@ fn count_archives(dir: &std::path::Path) -> usize {
     rd.flatten()
         .filter(|d| d.path().is_file())
         .filter(|d| {
-            crate::fs::tar_import::looks_like_tar_archive(&d.path())
+            fs_tar::tar_import::looks_like_tar_archive(&d.path())
                 || crate::fs::mac_archive_import::looks_like_mac_archive(&d.path())
         })
         .count()

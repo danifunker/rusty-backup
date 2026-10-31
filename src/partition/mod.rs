@@ -1,25 +1,25 @@
 pub mod alignment;
-pub mod apm;
-pub mod atari;
-pub mod bsd;
+use part_tables::apm;
+use part_tables::atari;
+use part_tables::bsd;
 pub mod editor;
-pub mod gpt;
-pub mod lvm;
+use part_tables::gpt;
+use part_tables::lvm;
 pub mod mac_cd_builder;
-pub mod mbr;
-pub mod next;
+use part_tables::mbr;
+use part_tables::next;
 pub mod next_cd_builder;
 pub mod provision;
-pub mod rdb;
+use part_tables::rdb;
 pub mod resize;
 pub mod restore_patch;
-pub mod sgi;
-pub mod sgi_dklabel;
+use part_tables::sgi;
+use part_tables::sgi_dklabel;
 pub mod sgi_hdd_builder;
-pub mod solaris_x86;
-pub mod sun;
+use part_tables::solaris_x86;
+use part_tables::sun;
 pub mod type_catalog;
-pub mod x68k;
+use part_tables::x68k;
 pub mod x68k_hdd_builder;
 pub mod x68k_ipl;
 
@@ -435,7 +435,7 @@ fn qnx2_one_based_starts(reader: &mut (impl Read + Seek), mbr: &mut Mbr, sector0
 
 fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek)) -> Option<String> {
     // A Sun QIC tape image: one volume whose files browse as a tree.
-    if crate::fs::sun2tape::looks_like_tape(first_sector) {
+    if dsk_tape::sun2tape::looks_like_tape(first_sector) {
         return Some("Sun QIC tape".to_string());
     }
     // SquashFS: "hsqs" at offset 0. Appliance and live images ship a bare
@@ -443,7 +443,8 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
     // `casper/filesystem.squashfs` carved out of a live CD). Probed first: the
     // 4-byte magic is unambiguous, and `detect` additionally parses the whole
     // superblock, so a chance match is never reported as a filesystem.
-    if first_sector[0..4] == *b"hsqs" && crate::fs::squashfs::SquashfsFilesystem::detect(reader, 0)
+    if first_sector[0..4] == *b"hsqs"
+        && fs_squashfs::squashfs::SquashfsFilesystem::detect(reader, 0)
     {
         let _ = reader.seek(SeekFrom::Start(0));
         return Some("squashfs".to_string());
@@ -472,7 +473,7 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
     // Dwarf Draco 6085 ".zdisk"/".zdelta": a zlib stream (magic byte 0x78) that
     // inflates to the 0xDAAD signature. A Pilot/Cedar pack; routes through the
     // BrowseSession Alto branch (which reads the whole file and opens Pilot).
-    if first_sector[0] == 0x78 && crate::fs::alto::zdisk::is_zdisk(first_sector) {
+    if first_sector[0] == 0x78 && fs_xerox::alto::zdisk::is_zdisk(first_sector) {
         return Some("Pilot/Cedar".to_string());
     }
     // Apple Lisa disk: a DiskCopy 4.2 image that still carries its 12-byte
@@ -480,7 +481,7 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
     // flat sector stream can't carry, so the Lisa filesystem parses the whole
     // DC42 container itself — route it through the "lisafs" hint. `looks_like_lisa`
     // returns quickly for anything that isn't a tag-bearing DC42.
-    if crate::fs::lisa::looks_like_lisa(reader) {
+    if fs_mac::lisa::looks_like_lisa(reader) {
         return Some("lisafs".to_string());
     }
     // Salto Alto-emulator cooked `.dsk`: no magic, recognized by the exact
@@ -488,8 +489,8 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
     // its VDA (1 big-endian, or 0x0100 little-endian — Salto images come in
     // both byte orders). open_pack does the full validation.
     if let Ok(end) = reader.seek(SeekFrom::End(0)) {
-        if end as usize == crate::fs::alto::salto::IMAGE_BYTES {
-            let rec1 = crate::fs::alto::salto::RECORD_BYTES as u64;
+        if end as usize == fs_xerox::alto::salto::IMAGE_BYTES {
+            let rec1 = fs_xerox::alto::salto::RECORD_BYTES as u64;
             // Salto: record 1's leading word is its VDA (1 big-endian / 0x0100 LE).
             let mut p = [0u8; 2];
             let salto_ok = reader.seek(SeekFrom::Start(rec1)).is_ok()
@@ -510,8 +511,8 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
         // Trident (TFS) pack image (ContrAlto2/dorado layout): no magic,
         // recognized by the exact T-80 / T-300 size. Browses as an Alto file
         // system (the same logical FS on Trident hardware). open_pack validates.
-        if end as usize == crate::fs::alto::trident::T80_BYTES
-            || end as usize == crate::fs::alto::trident::T300_BYTES
+        if end as usize == fs_xerox::alto::trident::T80_BYTES
+            || end as usize == fs_xerox::alto::trident::T300_BYTES
         {
             let _ = reader.seek(SeekFrom::Start(0));
             return Some("Alto BFS".to_string());
@@ -546,7 +547,7 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
     // nothing at all and exited 0 (R-022). `looks_like_hpfs` wants both the
     // superblock magic at sector 16 and the spareblock magic at sector 17, so a
     // chance match needs 64 bits to line up.
-    if crate::fs::hpfs::looks_like_hpfs(reader, 0) {
+    if fs_hpfs::hpfs::looks_like_hpfs(reader, 0) {
         let _ = reader.seek(SeekFrom::Start(0));
         return Some("HPFS".to_string());
     }
@@ -562,8 +563,8 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
     // claim anything else.
     if let Ok(end) = reader.seek(SeekFrom::End(0)) {
         let _ = reader.seek(SeekFrom::Start(0));
-        if end == crate::fs::qdos_mdv::MDV_CART_BYTES as u64
-            && crate::fs::qdos_mdv::looks_like_mdv_sector_zero(first_sector)
+        if end == fs_8bit::qdos_mdv::MDV_CART_BYTES as u64
+            && fs_8bit::qdos_mdv::looks_like_mdv_sector_zero(first_sector)
         {
             return Some("qdos_mdv".to_string());
         }
@@ -571,7 +572,7 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
     let _ = reader.seek(SeekFrom::Start(0));
 
     // QNX 4's boot block has an x86 jump and a FAT-like BPB (OEM "QNX4FS"); its root entry decides first.
-    if crate::fs::qnx4::looks_like_qnx4(reader, 0) {
+    if fs_qnx::qnx4::looks_like_qnx4(reader, 0) {
         let _ = reader.seek(SeekFrom::Start(0));
         return Some("QNX4".to_string());
     }
@@ -602,7 +603,7 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
     }
 
     // A QDOS (Unisys ICON) `.ph` / `.pf` DOS disk: a FAT BPB with zeroed jump bytes, claimed only at its exact length.
-    if first_sector[0..3] == [0, 0, 0] && crate::fs::fat::has_fat_boot_start(first_sector) {
+    if first_sector[0..3] == [0, 0, 0] && fs_pc::fat::has_fat_boot_start(first_sector) {
         let bps = u64::from(u16::from_le_bytes([first_sector[11], first_sector[12]]));
         let total = u64::from(u16::from_le_bytes([first_sector[19], first_sector[20]]));
         let end = reader.seek(SeekFrom::End(0)).ok();
@@ -622,7 +623,7 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
     // These floppies (.d88 / .xdf / .hdm / .dim, decoded upstream) carry no
     // partition table — they're a bare Human68k FAT volume rooted at byte 0.
     if first_sector[0] == 0x60 {
-        if let Ok(bpb) = crate::fs::human68k::Human68kBpb::parse(first_sector) {
+        if let Ok(bpb) = fs_pc::human68k::Human68kBpb::parse(first_sector) {
             if bpb.total_sectors > 0 {
                 return Some("human68k".to_string());
             }
@@ -638,7 +639,7 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
     // APFS container superblock (NXSB) magic at offset 32 of block 0. A raw
     // APFS container image (dd of a GPT `Apple_APFS` partition, or a
     // partition-less container) is a flat superfloppy rooted at byte 0.
-    if crate::fs::apfs::detect_apfs(first_sector) {
+    if fs_apfs::apfs::detect_apfs(first_sector) {
         return Some("APFS".to_string());
     }
 
@@ -683,7 +684,7 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
     // so the string dispatcher reaches the SFS driver. Both DosTypes share this
     // on-disk format, and the root block always carries `SFS\0` regardless, so
     // that is the tag we report.
-    if &first_sector[0..3] == b"SFS" && crate::fs::sfs::looks_like_sfs(reader, 0) {
+    if &first_sector[0..3] == b"SFS" && fs_amiga::sfs::looks_like_sfs(reader, 0) {
         let _ = reader.seek(SeekFrom::Start(0));
         return Some("SFS\\0".to_string());
     }
@@ -699,7 +700,7 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
     if matches!(
         &first_sector[0..3],
         b"PFS" | b"PDS" | b"muA" | b"muP" | b"AFS"
-    ) && crate::fs::pfs3::looks_like_pfs3(reader, 0)
+    ) && fs_amiga::pfs3::looks_like_pfs3(reader, 0)
     {
         let _ = reader.seek(SeekFrom::Start(0));
         return Some("PFS\\3".to_string());
@@ -746,12 +747,12 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
             // Minix superblock magic at +16 (V1/V2: 0x137F/0x138F/0x2468/0x2478)
             // or +24 (V3: 0x4D5A) of this 1024-offset block. Raw Minix floppies
             // and hard-disk images are flat superfloppies.
-            if crate::fs::minix::detect_magic(&buf).is_some() {
+            if fs_unix::minix::detect_magic(&buf).is_some() {
                 return Some("minix".to_string());
             }
             // UCSD p-System volume label at block 2 (this offset-1024 read).
             // No magic — a structural signature — so checked after Minix.
-            if crate::fs::ucsd::looks_like_ucsd(&buf) {
+            if fs_apple2::ucsd::looks_like_ucsd(&buf) {
                 return Some("ucsd".to_string());
             }
         }
@@ -761,11 +762,11 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
         let _ = reader.seek(SeekFrom::Start(0));
         return Some("QNX2".to_string());
     }
-    if crate::fs::qnx4::looks_like_qnx4(reader, 0) {
+    if fs_qnx::qnx4::looks_like_qnx4(reader, 0) {
         let _ = reader.seek(SeekFrom::Start(0));
         return Some("QNX4".to_string());
     }
-    if crate::fs::qnx6::looks_like_qnx6(reader, 0) {
+    if fs_qnx::qnx6::looks_like_qnx6(reader, 0) {
         let _ = reader.seek(SeekFrom::Start(0));
         return Some("QNX6".to_string());
     }
@@ -799,15 +800,15 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
     for &cand in &[8192u64, 65536u64] {
         if reader.seek(SeekFrom::Start(cand + 1372)).is_ok() {
             let mut m = [0u8; 4];
-            if reader.read_exact(&mut m).is_ok() && crate::fs::ufs::is_ufs_magic(m, cand == 8192) {
+            if reader.read_exact(&mut m).is_ok() && fs_unix::ufs::is_ufs_magic(m, cand == 8192) {
                 return Some("UFS".to_string());
             }
         }
     }
-    if crate::fs::vxfs::detect(reader, 0).is_some() {
+    if fs_unix::vxfs::detect(reader, 0).is_some() {
         return Some("VxFS".to_string());
     }
-    if crate::fs::jfs1::detect(reader, 0) {
+    if fs_unix::jfs1::detect(reader, 0) {
         return Some("AIX JFS".to_string());
     }
 
@@ -829,7 +830,7 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
             if magic == 0x0007_2959 || magic == 0x0007_295A {
                 return Some("EFS".to_string());
             }
-            if crate::fs::bfs::BfsSuperBlock::parse(&buf).is_ok() {
+            if fs_unix::bfs::BfsSuperBlock::parse(&buf).is_ok() {
                 return Some("BFS".to_string());
             }
         }
@@ -838,17 +839,17 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
     // BeOS BFS on a bare volume with no PC boot block (the BeOS/PPC layout),
     // and the pre-BFS OFS, whose table of contents also lives at sector 0.
     // OFS has no magic number, so its geometry check is what keeps it honest.
-    if crate::fs::bfs::BfsSuperBlock::parse(first_sector).is_ok() {
+    if fs_unix::bfs::BfsSuperBlock::parse(first_sector).is_ok() {
         return Some("BFS".to_string());
     }
-    if crate::fs::ofs::OfsToc::parse(first_sector).is_ok() {
+    if fs_unix::ofs::OfsToc::parse(first_sector).is_ok() {
         return Some("BeOS OFS".to_string());
     }
 
     // SGI EFS v1: a different magic at a different offset, so it cannot collide
     // with the IRIX probe above. `efs_v1::detect` tries both word orders.
     let _ = reader.seek(SeekFrom::Start(0));
-    if crate::fs::efs_v1::detect(reader, 0).is_some() {
+    if fs_unix::efs_v1::detect(reader, 0).is_some() {
         let _ = reader.seek(SeekFrom::Start(0));
         return Some("SGI EFS v1".to_string());
     }
@@ -897,7 +898,7 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
 
     // Old-map ADFS (D-format / S/M/L): no Disc Record, detected via the
     // checksum-valid old free-space map + Hugo root directory at byte 1024.
-    if crate::fs::adfs::detect_old_map_dformat(reader, 0) {
+    if fs_adfs::adfs::detect_old_map_dformat(reader, 0) {
         return Some("ADFS".to_string());
     }
 
@@ -936,59 +937,59 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
     // dumps with no partition table; `looks_like_cbm` gates on the exact
     // geometry length AND the header-sector signature, so the same-size
     // false-positive risk is negligible.
-    if crate::fs::cbm::looks_like_cbm(reader, 0).is_some() {
+    if fs_8bit::cbm::looks_like_cbm(reader, 0).is_some() {
         return Some("CBM DOS".to_string());
     }
 
     // Atari DOS 2 (.atr body / headerless .xfd). Gated on exact geometry
     // size + a plausible VTOC at sector 360.
-    if crate::fs::atari_dos::looks_like_atari_dos(reader, 0).is_some() {
+    if fs_8bit::atari_dos::looks_like_atari_dos(reader, 0).is_some() {
         return Some("Atari DOS".to_string());
     }
 
     // DragonDOS (flat .dsk). Same byte size as a 40-track RS-DOS disk, but the
     // directory track carries a one's-complement geometry signature, so probe
     // it first among the CoCo family.
-    if crate::fs::dragondos::looks_like_dragondos(reader, 0).is_some() {
+    if fs_8bit::dragondos::looks_like_dragondos(reader, 0).is_some() {
         return Some("DragonDOS".to_string());
     }
 
     // OS-9 / NitrOS-9 RBF (flat .dsk/.vdk). Same byte size as a 35-track
     // RS-DOS disk, so probe it first: the LSN-0 identification sector plus a
     // directory root FD discriminate it cleanly.
-    if crate::fs::os9::looks_like_os9(reader, 0).is_some() {
+    if fs_8bit::os9::looks_like_os9(reader, 0).is_some() {
         return Some("OS-9".to_string());
     }
 
     // RS-DOS / CoCo Disk BASIC (flat .dsk/.jvc). No magic; gated on exact
     // geometry + a structurally consistent granule table + directory.
-    if crate::fs::rsdos::looks_like_rsdos(reader, 0).is_some() {
+    if fs_8bit::rsdos::looks_like_rsdos(reader, 0).is_some() {
         return Some("RS-DOS".to_string());
     }
 
     // Acorn DFS (flat single-sided .ssd, 40-/80-track). Gated on exact
     // single-sided geometry and a catalogue whose declared sector count
     // matches the disk size (separates a real .ssd from a flat .dsd).
-    if crate::fs::dfs::looks_like_dfs(reader, 0).is_some() {
+    if fs_8bit::dfs::looks_like_dfs(reader, 0).is_some() {
         return Some("Acorn DFS".to_string());
     }
 
     // TR-DOS (ZX Spectrum Beta Disk, flat .trd). No magic; gated on the
     // disk-info sector's id byte (0x10) + a valid disk-type byte at fixed
     // offsets, plus a size/geometry sanity check.
-    if crate::fs::trdos::looks_like_trdos(reader, 0).is_some() {
+    if fs_8bit::trdos::looks_like_trdos(reader, 0).is_some() {
         return Some("TR-DOS".to_string());
     }
 
     // TI-99/4A (flat V9T9 .dsk). Gated on the VIB "DSK" marker at offset 0x0D
     // plus a self-consistent geometry.
-    if crate::fs::ti99::looks_like_ti99(reader, 0).is_some() {
+    if fs_8bit::ti99::looks_like_ti99(reader, 0).is_some() {
         return Some("TI-99".to_string());
     }
 
     // Oric Jasmin (flat 256-byte-sector .dsk). Exact SS/DS size + free-map
     // format markers at block 340.
-    if crate::fs::oric::looks_like_oric_jasmin(reader, 0) {
+    if fs_8bit::oric::looks_like_oric_jasmin(reader, 0) {
         return Some("Oric Jasmin".to_string());
     }
 
@@ -1406,9 +1407,9 @@ impl PartitionTable {
                 .map_err(RustyBackupError::Io)?;
             if total == 204_800 || total == 409_600 {
                 let side_len = total / 2;
-                let side0 = crate::fs::dfs::looks_like_dfs_within(reader, 0, side_len).is_some();
+                let side0 = fs_8bit::dfs::looks_like_dfs_within(reader, 0, side_len).is_some();
                 let side1 =
-                    crate::fs::dfs::looks_like_dfs_within(reader, side_len, side_len).is_some();
+                    fs_8bit::dfs::looks_like_dfs_within(reader, side_len, side_len).is_some();
                 reader
                     .seek(SeekFrom::Start(0))
                     .map_err(RustyBackupError::Io)?;
@@ -2099,9 +2100,6 @@ impl PartitionTable {
     }
 }
 
-/// Format a byte count as a human-readable size string using binary (base-1024) units.
-pub use disk_core::display::format_size;
-
 /// Parse a human-friendly size string — the inverse of [`format_size`].
 /// Accepts plain bytes plus `B`/`K`/`KiB`/`M`/`MiB`/`G`/`GiB` suffixes.
 pub fn parse_size(s: &str) -> anyhow::Result<u64> {
@@ -2216,11 +2214,12 @@ pub fn largest_free_region(
         .max_by_key(|r| r.size_bytes)
 }
 
-pub use part_tables::PartitionSizeOverride;
+use part_tables::PartitionSizeOverride;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use disk_core::display::format_size;
     use std::io::Cursor;
 
     fn part(index: usize, start_lba: u64, size_bytes: u64) -> PartitionInfo {
@@ -2505,7 +2504,7 @@ mod tests {
     #[test]
     fn an_mdv_cartridge_is_a_superfloppy_not_a_bad_mbr() {
         let sector0 = mdv_sector_zero();
-        let mut img = vec![0u8; crate::fs::qdos_mdv::MDV_CART_BYTES];
+        let mut img = vec![0u8; fs_8bit::qdos_mdv::MDV_CART_BYTES];
         img[..512].copy_from_slice(&sector0);
         let mut cur = std::io::Cursor::new(img);
         assert_eq!(
@@ -2531,7 +2530,7 @@ mod tests {
 
         // Right length, wrong header — an all-zero cartridge-sized file.
         let blank = [0u8; 512];
-        let mut sized = std::io::Cursor::new(vec![0u8; crate::fs::qdos_mdv::MDV_CART_BYTES]);
+        let mut sized = std::io::Cursor::new(vec![0u8; fs_8bit::qdos_mdv::MDV_CART_BYTES]);
         assert_ne!(
             detect_superfloppy(&blank, &mut sized).as_deref(),
             Some("qdos_mdv"),
@@ -2707,7 +2706,7 @@ mod tests {
         // `detect_filesystem_type` has no SFS probe, so the hint must travel as
         // a DosType in `partition_type_string` — the AmigaDOS route — or the
         // volume is detected and then fails to open.
-        let img = crate::fs::sfs::create_blank_sfs(8192, "Test").expect("format SFS");
+        let img = fs_amiga::sfs::create_blank_sfs(8192, "Test").expect("format SFS");
         let table = PartitionTable::detect(&mut Cursor::new(img)).expect("detect");
         assert_eq!(table.type_name(), "None");
         let parts = table.partitions();
@@ -2723,7 +2722,7 @@ mod tests {
         // reported "invalid boot signature". The boot magic on disk is
         // `PFS\x01` (last byte a version), while the dispatcher matches the
         // `PFS\3` DosType, so the probe has to translate.
-        let img = crate::fs::pfs3::create_blank_pfs3(16384, "Test").expect("format PFS3");
+        let img = fs_amiga::pfs3::create_blank_pfs3(16384, "Test").expect("format PFS3");
         let table = PartitionTable::detect(&mut Cursor::new(img)).expect("detect");
         assert_eq!(table.type_name(), "None");
         let parts = table.partitions();
@@ -2737,7 +2736,7 @@ mod tests {
         // a volume; the rootblock gate must reject it.
         let mut d = vec![0u8; 1024 * 1024];
         d[0..4].copy_from_slice(b"PFS\x01");
-        assert!(!crate::fs::pfs3::looks_like_pfs3(&mut Cursor::new(&d), 0));
+        assert!(!fs_amiga::pfs3::looks_like_pfs3(&mut Cursor::new(&d), 0));
     }
 
     #[test]
@@ -2748,7 +2747,7 @@ mod tests {
         let mut d = vec![0u8; 1024 * 1024];
         d[0..4].copy_from_slice(b"SFS\0");
         d[52..56].copy_from_slice(&512u32.to_be_bytes());
-        assert!(!crate::fs::sfs::looks_like_sfs(&mut Cursor::new(&d), 0));
+        assert!(!fs_amiga::sfs::looks_like_sfs(&mut Cursor::new(&d), 0));
     }
 
     #[test]
@@ -3463,3 +3462,6 @@ mod unrecognized_media_tests {
         assert!(matches!(table, PartitionTable::None { .. }));
     }
 }
+
+#[cfg(test)]
+mod moved_tests;

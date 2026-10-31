@@ -7,7 +7,7 @@ use std::io::Read;
 /// Parse a human-friendly size string. Accepts plain bytes, optional
 /// `B`/`K`/`KiB`/`M`/`MiB`/`G`/`GiB` suffixes.
 ///
-/// The implementation lives beside `partition::format_size` so the GUI and TUI
+/// The implementation lives beside `disk_core::display::format_size` so the GUI and TUI
 /// reach it without going through the CLI module.
 pub fn parse_size(s: &str) -> Result<u64> {
     crate::partition::parse_size(s)
@@ -16,7 +16,7 @@ pub fn parse_size(s: &str) -> Result<u64> {
 /// Pick the smallest 512-byte-multiple block size that keeps total_blocks
 /// at or below 65535 (the HFS limit). Lives in the engine so the CD-ROM
 /// builder and the GUI reach it without going through the CLI module.
-pub use crate::fs::hfs::pick_block_size;
+pub use fs_mac::hfs::pick_block_size;
 
 /// Split an in-image path into its decoded components.
 ///
@@ -27,7 +27,7 @@ pub use crate::fs::hfs::pick_block_size;
 ///   Any other `\x` is preserved verbatim (the backslash is kept) so a stray
 ///   backslash in a real name survives a round trip.
 /// - **colon** (`colon == true`, only filesystems where
-///   [`crate::fs::filesystem::Filesystem::uses_colon_paths`] is true): `:`-delimited,
+///   [`disk_core::filesystem::Filesystem::uses_colon_paths`] is true): `:`-delimited,
 ///   and `/` is an ordinary filename byte needing no escape. `:` can never
 ///   appear in an HFS/HFS+ name, so this grammar is unambiguous on those
 ///   volumes.

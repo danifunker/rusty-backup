@@ -1,10 +1,8 @@
-//! Moved to the `dsk-vm` crate; re-exported so `crate::rbformats::qcow2` paths keep working.
+//! Tests of app behaviour (dispatch, detection, builders) over code that moved into the
+//! `crates/` workspace; each module is named after the crate module it exercises.
 
-pub use dsk_vm::qcow2::*;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
+mod qcow2 {
+    use dsk_vm::qcow2::*;
     use std::io::Cursor;
 
     /// **Phase 2 acceptance test** (docs/virtualization-formats.md, session 2.4).
@@ -20,10 +18,10 @@ mod tests {
     /// one path.
     #[test]
     fn acceptance_apm_hfs_round_trip_through_qcow2_edit() {
-        use crate::fs::filesystem::CreateFileOptions;
-        use crate::fs::hfs::create_blank_hfs;
         use crate::fs::hfs_clone::emit_apm_disk_with_hfs;
-        use crate::partition::apm::build_minimal_apm;
+        use disk_core::filesystem::CreateFileOptions;
+        use fs_mac::hfs::create_blank_hfs;
+        use part_tables::apm::build_minimal_apm;
 
         // 1. Build a small APM disk with one Apple_HFS partition. 4096
         //    sectors × 512 B = 2 MiB. Apple_HFS at sector 96 (= 0xC000).

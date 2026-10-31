@@ -1,11 +1,11 @@
 //! Moved to the `fs-mac` crate; re-exported so `crate::fs::hfs_boot` paths keep working.
 
-pub use fs_mac::hfs_boot::*;
-
+#[allow(unused_imports)]
+use fs_mac::hfs_boot::*;
 use std::path::Path;
 
-use crate::fs::filesystem::FilesystemError;
 use crate::partition::PartitionTable;
+use disk_core::filesystem::FilesystemError;
 
 /// Locate the classic-HFS volume inside a donor image and read its boot
 /// blocks. Handles the two shapes a Mac disk takes: a flat HFS superfloppy
@@ -56,7 +56,7 @@ fn is_classic_hfs_partition(p: &crate::partition::PartitionInfo) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs::hfs::create_blank_hfs;
+    use fs_mac::hfs::create_blank_hfs;
     use std::io::Write;
 
     const MIB: u64 = 1024 * 1024;

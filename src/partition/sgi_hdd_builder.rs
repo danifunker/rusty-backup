@@ -6,7 +6,7 @@
 //! hard disk (`rb-cli new hd sgi-efs`) needs
 //! the volume header at sector 0 so `fx` / `prtvtoc` and the disk driver see a
 //! partition table. This module writes that header — mirroring the field
-//! layout / big-endianness of [`crate::partition::sgi`], the parser used as the
+//! layout / big-endianness of [`part_tables::sgi`], the parser used as the
 //! source of truth — and lays an EFS filesystem in partition 0.
 //!
 //! Layout (IRIX convention, verified against `tests/fixtures/sgi/irix_volhdr.bin`):
@@ -20,8 +20,8 @@
 use anyhow::{ensure, Result};
 use std::io::{Cursor, Seek, SeekFrom, Write};
 
-use crate::fs::efs::{write_blank_efs, EFS_DEFAULT_BYTES_PER_INODE};
-use crate::partition::sgi::{
+use fs_unix::efs::{write_blank_efs, EFS_DEFAULT_BYTES_PER_INODE};
+use part_tables::sgi::{
     SgiDeviceParameters, SgiPartitionEntry, SgiPartitionType, SgiVolumeDirEntry, SgiVolumeHeader,
     SGI_NUM_PARTITIONS, SGI_NUM_VOL_DIR, SGI_VOLHDR_MAGIC,
 };
@@ -308,8 +308,8 @@ pub fn build_sgi_efs_hdd(opts: &SgiHddOptions) -> Result<(Vec<u8>, SgiHddLayout)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::partition::sgi::SGI_TYPE_BYTE_EFS;
     use crate::partition::PartitionTable;
+    use part_tables::sgi::SGI_TYPE_BYTE_EFS;
     use std::io::Cursor;
 
     /// Default IRIS/SGI geometry: 16 heads × 63 sectors = 1008-sector (504 KiB)
@@ -507,7 +507,7 @@ mod tests {
         let inodes = |opts: &SgiHddOptions| {
             let (img, layout) = build_sgi_efs_hdd(opts).unwrap();
             let sb_off = (layout.efs_first_sector * 512 + 512) as usize;
-            let sb = crate::fs::efs::EfsSuperblock::parse(&img[sb_off..]).unwrap();
+            let sb = fs_unix::efs::EfsSuperblock::parse(&img[sb_off..]).unwrap();
             sb.ncg as u32 * sb.cgisize as u32 * 4
         };
         assert!(

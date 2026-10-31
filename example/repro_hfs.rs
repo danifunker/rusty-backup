@@ -1,6 +1,6 @@
 use byteorder::{BigEndian, ByteOrder};
-use rusty_backup::fs::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
-use rusty_backup::fs::hfs::HfsFilesystem;
+use disk_core::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+use fs_mac::hfs::HfsFilesystem;
 use std::fs::OpenOptions;
 use std::io::{Cursor, Read, Seek, SeekFrom};
 

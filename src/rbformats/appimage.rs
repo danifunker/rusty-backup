@@ -115,7 +115,7 @@ pub fn squashfs_payload_offset<R: Read + Seek>(reader: &mut R) -> Option<u64> {
         return None;
     }
     let offset = payload_offset(reader)?;
-    crate::fs::squashfs::SquashfsFilesystem::detect(reader, offset).then_some(offset)
+    fs_squashfs::squashfs::SquashfsFilesystem::detect(reader, offset).then_some(offset)
 }
 
 /// Whether `path` holds a type-2 AppImage whose payload we can open.
@@ -158,7 +158,7 @@ mod tests {
     }
 
     fn squashfs_payload() -> Vec<u8> {
-        use crate::fs::squashfs_write::{write_squashfs, BuildNode, BuildOptions};
+        use fs_squashfs::squashfs_write::{write_squashfs, BuildNode, BuildOptions};
         let tree = BuildNode::dir(
             "",
             0o755,
@@ -216,9 +216,9 @@ mod tests {
     /// an executable.
     #[test]
     fn editing_the_payload_leaves_the_stub_alone_and_may_grow_it() {
-        use crate::fs::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
-        use crate::fs::squashfs_edit::{SizeBudget, SquashfsEditor};
         use crate::rbformats::payload_slice::PayloadSlice;
+        use disk_core::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+        use fs_squashfs::squashfs_edit::{SizeBudget, SquashfsEditor};
 
         let original = fake_appimage(2, &squashfs_payload());
         let stub_len = 512usize;
@@ -276,7 +276,7 @@ mod tests {
             after.len()
         );
         // And the payload is still a filesystem holding the edit.
-        let mut fs = crate::fs::squashfs::SquashfsFilesystem::open(Cursor::new(after), offset)
+        let mut fs = fs_squashfs::squashfs::SquashfsFilesystem::open(Cursor::new(after), offset)
             .expect("reopen payload");
         let root = fs.root().unwrap();
         let names: Vec<String> = fs

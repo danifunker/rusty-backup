@@ -16,9 +16,9 @@ use std::path::{Path, PathBuf};
 
 use std::collections::BTreeMap;
 
-use rusty_backup::fs::alto::bfs::{Bfs, BfsFilesystem};
-use rusty_backup::fs::alto::{open_pack, pdi, write, Disk, Geometry};
-use rusty_backup::fs::filesystem::Filesystem;
+use disk_core::filesystem::Filesystem;
+use fs_xerox::alto::bfs::{Bfs, BfsFilesystem};
+use fs_xerox::alto::{open_pack, pdi, write, Disk, Geometry};
 
 /// Map of user-file name -> bytes (excludes SysDir / DiskDescriptor).
 fn user_file_map(disk: &Disk) -> BTreeMap<String, Vec<u8>> {
@@ -132,7 +132,7 @@ fn probe_one(path: &Path) -> bool {
     }
 
     // SysDir leader name (label/leader offset sanity check).
-    match Bfs::new(&disk).leader_name(rusty_backup::fs::alto::bfs::SYSDIR_LEADER_VDA) {
+    match Bfs::new(&disk).leader_name(fs_xerox::alto::bfs::SYSDIR_LEADER_VDA) {
         Some(n) => println!("      SysDir leader name @VDA1: {n:?}"),
         None => println!("      SysDir leader name @VDA1: <none>"),
     }
@@ -281,7 +281,7 @@ fn main() {
         } else {
             src
         };
-        let dsk = rusty_backup::fs::alto::salto::write(&disk).expect("salto write");
+        let dsk = fs_xerox::alto::salto::write(&disk).expect("salto write");
         fs::write(&args[1], &dsk).expect("write dsk");
         println!(
             "wrote {} ({} bytes, {} sectors)",

@@ -12,7 +12,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 
-use rusty_backup::rbformats::gho::{
+use dsk_ghost::gho::{
     find_inner_stream_start, is_boot_sector_record, is_checksum_record, is_data_block_record,
     is_dir_entry_record, parse_checksum_record_body, parse_fat_dir_entry_body, GhoContainerHeader,
     GHO_HEADER_PREFIX_LEN, GHO_PASSWORD_VERIFIER_LEN, GHO_RECORD_HEADER_LEN, GHO_RECORD_MAGIC,
@@ -98,10 +98,7 @@ fn main() {
     }
 }
 
-fn decode_entry(
-    e: &rusty_backup::rbformats::gho::GhoDirEntryRecord,
-    lfn_buf: &mut Vec<String>,
-) -> String {
+fn decode_entry(e: &dsk_ghost::gho::GhoDirEntryRecord, lfn_buf: &mut Vec<String>) -> String {
     if e.is_empty_slot() {
         lfn_buf.clear();
         return "[empty slot]".to_string();

@@ -1,10 +1,10 @@
 //! End-to-end test: clone an APM image's HFS volume into a fresh blank
 //! target file. Useful for verifying changes that affect catalog node usage.
 
-use rusty_backup::fs::filesystem::EditableFilesystem;
-use rusty_backup::fs::hfs::{create_blank_hfs_sized, HfsFilesystem, HFS_MAX_BTREE_FILE_SIZE};
-use rusty_backup::fs::hfs_clone::clone_hfs_volume;
-use rusty_backup::partition::apm::Apm;
+use disk_core::filesystem::EditableFilesystem;
+use fs_mac::hfs::{create_blank_hfs_sized, HfsFilesystem, HFS_MAX_BTREE_FILE_SIZE};
+use fs_mac::hfs_clone::clone_hfs_volume;
+use part_tables::apm::Apm;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 

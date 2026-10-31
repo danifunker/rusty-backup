@@ -5,7 +5,7 @@ use clap::Subcommand;
 use std::path::PathBuf;
 
 use crate::cli::io::open_image_ro;
-use crate::partition::apm::Apm;
+use part_tables::apm::Apm;
 
 #[derive(Subcommand, Debug)]
 pub enum ApmCommand {

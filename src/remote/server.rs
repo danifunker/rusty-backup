@@ -30,7 +30,6 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::cli::verbs::ls::resolve_path;
-use crate::fs::filesystem::{CreateDirectoryOptions, CreateFileOptions, Filesystem};
 use crate::remote::protocol::{
     read_chunk_header, read_chunks, read_control, read_family_b_op, read_handshake,
     read_member_header, read_member_request, write_binary_hello, write_control,
@@ -39,6 +38,7 @@ use crate::remote::protocol::{
     WireKind, CAP_FAMILY_B, CAP_FAMILY_F, FAMILY_B_MIN_VERSION, MAX_PUT_CHUNK, PROTOCOL_VERSION,
     RB_HELLO_MAGIC,
 };
+use disk_core::filesystem::{CreateDirectoryOptions, CreateFileOptions, Filesystem};
 
 /// A block-tier handle: a host image file (or raw device) kept open for ranged
 /// reads — and, when `writable`, in-place ranged writes (remote editing). The
@@ -1013,10 +1013,10 @@ fn handle_conn(
                                     // `--type`/`--creator` text to raw OSType bytes.
                                     type_code: type_code
                                         .as_deref()
-                                        .map(crate::fs::hfs_common::encode_fourcc),
+                                        .map(fs_mac::hfs_common::encode_fourcc),
                                     creator_code: creator_code
                                         .as_deref()
-                                        .map(crate::fs::hfs_common::encode_fourcc),
+                                        .map(fs_mac::hfs_common::encode_fourcc),
                                     fork_blob,
                                 });
                                 write_control(&mut writer, &Response::Ok)?;

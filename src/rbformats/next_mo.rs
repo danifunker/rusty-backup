@@ -27,7 +27,7 @@
 
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
-use crate::partition::next;
+use part_tables::next;
 
 /// Bytes one sector occupies on the media: 1024 data + 272 ECC.
 pub const RAW_SECTOR: usize = 1296;
@@ -508,7 +508,7 @@ mod tests {
     /// Build a synthetic MO image — erased lead-in, then an ECC-coded NeXT
     /// label at the origin — and check `detect` reads the geometry back off it.
     fn synthetic_mo(origin: u64, front: u16, groups: (u16, u16, u16)) -> Vec<u8> {
-        use crate::partition::next::{build_label, NextLabelSpec, NextPartitionSpec};
+        use part_tables::next::{build_label, NextLabelSpec, NextPartitionSpec};
         let (size, alts, off) = groups;
         let mut spec = NextLabelSpec {
             front_porch: front,
@@ -533,9 +533,9 @@ mod tests {
         BigEndian::write_u16(&mut label[0x76..0x78], size);
         BigEndian::write_u16(&mut label[0x78..0x7A], alts);
         BigEndian::write_u16(&mut label[0x7A..0x7C], off);
-        crate::partition::next::NextDiskLabel::stamp_checksum(
+        part_tables::next::NextDiskLabel::stamp_checksum(
             &mut label,
-            crate::partition::next::NEXT_LABEL_V3,
+            part_tables::next::NEXT_LABEL_V3,
         );
 
         // One copy at block 0, which is the one a sector-aligned scan sees.

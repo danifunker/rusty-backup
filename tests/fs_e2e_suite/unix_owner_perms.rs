@@ -12,8 +12,8 @@
 
 use std::io::Cursor;
 
-use rusty_backup::fs::entry::FileEntry;
-use rusty_backup::fs::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+use disk_core::entry::FileEntry;
+use disk_core::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
 
 fn load_fixture(rel: &str) -> Vec<u8> {
     let path = format!("tests/fixtures/{rel}");
@@ -46,17 +46,17 @@ struct Case {
 }
 
 fn blank_efs(size: u64) -> Vec<u8> {
-    rusty_backup::fs::efs::create_blank_efs(size, "OWN").expect("format EFS")
+    fs_unix::efs::create_blank_efs(size, "OWN").expect("format EFS")
 }
 fn blank_ext2(size: u64) -> Vec<u8> {
-    rusty_backup::fs::ext_format::create_blank_ext2(size, "OWN").expect("format ext2")
+    fs_unix::ext_format::create_blank_ext2(size, "OWN").expect("format ext2")
 }
 fn blank_minix3(size: u64) -> Vec<u8> {
-    rusty_backup::fs::minix::create_blank_minix(size, rusty_backup::fs::minix::MinixVersion::V3)
+    fs_unix::minix::create_blank_minix(size, fs_unix::minix::MinixVersion::V3)
         .expect("format minix3")
 }
 fn blank_hfsplus(size: u64) -> Vec<u8> {
-    rusty_backup::fs::hfsplus::create_blank_hfsplus(size, 4096, "OWN", false)
+    fs_mac::hfsplus::create_blank_hfsplus(size, 4096, "OWN", false)
 }
 
 fn cases() -> Vec<Case> {

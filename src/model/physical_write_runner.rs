@@ -280,8 +280,8 @@ fn check_fits(source_size: u64, capacity: u64) -> Result<()> {
         anyhow::bail!(
             "source is {} but the target region holds only {} -- \
              pick a larger target",
-            crate::partition::format_size(source_size),
-            crate::partition::format_size(capacity),
+            disk_core::display::format_size(source_size),
+            disk_core::display::format_size(capacity),
         );
     }
     Ok(())

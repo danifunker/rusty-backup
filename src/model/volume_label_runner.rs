@@ -4,7 +4,7 @@
 //! the UI.
 //!
 //! The probe itself reads only ~16 KB (volume header + 2 catalog B-tree nodes)
-//! through `fs::hfsplus::probe_hfsplus_volume_label`, but for zstd-compressed
+//! through `fs_mac::hfsplus::probe_hfsplus_volume_label`, but for zstd-compressed
 //! backups the catalog can sit megabytes into the partition stream, so the
 //! work goes on a background thread and the GUI polls
 //! `Arc<Mutex<VolumeLabelStatus>>` like every other inspect-tab worker.
@@ -15,9 +15,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use crate::fs::hfsplus::probe_hfsplus_volume_label;
 use crate::fs::zstd_stream::{ZstdStreamCache, ZstdStreamReader};
 use crate::rbformats::chd::ChdReader;
+use fs_mac::hfsplus::probe_hfsplus_volume_label;
 
 /// Shared state between the GUI poll loop and the worker thread.
 pub struct VolumeLabelStatus {

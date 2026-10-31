@@ -1,7 +1,7 @@
 //! A `log::Log` implementation that both prints to stderr (preserving the
 //! terminal output `env_logger` used to give us) and buffers records so the
 //! GUI log panel can surface them. This is how `log::info!` calls from worker
-//! threads — e.g. the GHO reader's lazy-scan progress in `rbformats::gho` —
+//! threads — e.g. the GHO reader's lazy-scan progress in `dsk_ghost::gho` —
 //! become visible in the app's log panel instead of only on stderr.
 //!
 //! ## Why the repaint request is thread-gated

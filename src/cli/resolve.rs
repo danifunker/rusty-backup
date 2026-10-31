@@ -63,7 +63,7 @@ pub struct PartitionContext {
     /// A size ceiling the user asked for, for the drivers that rewrite their
     /// whole image. Set by the verbs that expose `--size` / `--grow`; `None`
     /// everywhere else means "no request", and the container still binds.
-    pub rebuild_budget: Option<crate::fs::squashfs_edit::SizeBudget>,
+    pub rebuild_budget: Option<fs_squashfs::squashfs_edit::SizeBudget>,
 }
 
 impl PartitionContext {
@@ -85,7 +85,7 @@ impl PartitionContext {
         &self,
         handle: R,
         passphrase: Option<&str>,
-    ) -> Result<Box<dyn crate::fs::filesystem::Filesystem>, crate::fs::filesystem::FilesystemError>
+    ) -> Result<Box<dyn disk_core::filesystem::Filesystem>, disk_core::filesystem::FilesystemError>
     {
         crate::fs::open_filesystem_full(
             handle,
@@ -104,13 +104,13 @@ impl PartitionContext {
         handle: R,
     ) -> std::result::Result<
         Box<dyn crate::fs::EditableFilesystem>,
-        crate::fs::filesystem::FilesystemError,
+        disk_core::filesystem::FilesystemError,
     > {
         // Rewrite only the "we could not name it" case; every other
         // Unsupported message is specific and better than anything here.
-        let name_it = |e: crate::fs::filesystem::FilesystemError| match &e {
-            crate::fs::filesystem::FilesystemError::Unsupported(m) if m.contains("'unknown'") => {
-                crate::fs::filesystem::FilesystemError::Unsupported(
+        let name_it = |e: disk_core::filesystem::FilesystemError| match &e {
+            disk_core::filesystem::FilesystemError::Unsupported(m) if m.contains("'unknown'") => {
+                disk_core::filesystem::FilesystemError::Unsupported(
                     m.replace("'unknown'", &format!("'{}'", self.type_name)),
                 )
             }
@@ -850,7 +850,7 @@ fn pick_default_partition(partitions: &[PartitionInfo]) -> Result<PartitionInfo>
                         "  {}  {:<28}  {}",
                         pos + 1,
                         p.type_name,
-                        crate::partition::format_size(p.size_bytes)
+                        disk_core::display::format_size(p.size_bytes)
                     )
                 })
                 .collect();
@@ -961,10 +961,10 @@ impl FsDispatchOverride {
 /// exactly what `exit.rs` reserves PERMISSION_DENIED for. It used to exit 1,
 /// indistinguishable from a genuine I/O failure (R-034). The caller's wording
 /// is preserved so each verb keeps its own phrasing.
-pub fn write_open_error(context: &str, e: crate::fs::filesystem::FilesystemError) -> anyhow::Error {
+pub fn write_open_error(context: &str, e: disk_core::filesystem::FilesystemError) -> anyhow::Error {
     let msg = format!("{context}: {e}");
     match e {
-        crate::fs::filesystem::FilesystemError::Unsupported(_) => {
+        disk_core::filesystem::FilesystemError::Unsupported(_) => {
             crate::cli::exit::permission_denied(msg)
         }
         _ => anyhow!(msg),
@@ -1044,7 +1044,7 @@ mod tests {
         // Size, so two same-typed volumes can be told apart - and not the MBR
         // type byte, which is `(0)` for every row on APM.
         assert!(
-            err.contains(&crate::partition::format_size(80 * 1024 * 1024 * 1024)),
+            err.contains(&disk_core::display::format_size(80 * 1024 * 1024 * 1024)),
             "sizes should be listed:\n{err}"
         );
         assert!(!err.contains("(0)"), "type byte is noise on APM:\n{err}");

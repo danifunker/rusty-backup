@@ -656,7 +656,7 @@ fn materialize_container_to_temp(
         LogLevel::Info,
         format!(
             "Decoding {} to a scratch file ({})...",
-            partition::format_size(total),
+            disk_core::display::format_size(total),
             temp_path.display()
         ),
     );
@@ -736,7 +736,7 @@ fn materialize_remote_to_temp(
         LogLevel::Info,
         format!(
             "Downloading {} from the remote to a local scratch file ({})...",
-            partition::format_size(total),
+            disk_core::display::format_size(total),
             temp_path.display()
         ),
     );
@@ -918,7 +918,7 @@ fn run_backup_inner(
         match fs::probe_0x83_fs_type(&mut br, part_offset) {
             Some("FAT") if is_linux_mbr => {
                 let subtype = factory.open().ok().and_then(|c| {
-                    fs::fat::FatFilesystem::open(std::io::BufReader::new(c), part_offset)
+                    fs_pc::fat::FatFilesystem::open(std::io::BufReader::new(c), part_offset)
                         .ok()
                         .map(|fs| {
                             use crate::fs::Filesystem;
@@ -1475,8 +1475,8 @@ fn run_backup_inner(
                              source {} -> {}",
                             part.index,
                             shape_label,
-                            partition::format_size(part.size_bytes),
-                            partition::format_size(target),
+                            disk_core::display::format_size(part.size_bytes),
+                            disk_core::display::format_size(target),
                         ),
                     );
                     clone_target_sizes[i] = Some(target);
@@ -1639,9 +1639,9 @@ fn run_backup_inner(
             LogLevel::Info,
             format!(
                 "Smart sizing: imaging {} of {} total (saving {})",
-                partition::format_size(total_display_bytes),
-                partition::format_size(full_partition_bytes),
-                partition::format_size(full_partition_bytes - total_display_bytes),
+                disk_core::display::format_size(total_display_bytes),
+                disk_core::display::format_size(full_partition_bytes),
+                disk_core::display::format_size(full_partition_bytes - total_display_bytes),
             ),
         );
     }
@@ -1709,7 +1709,7 @@ fn run_backup_inner(
             format!(
                 "Backing up {} ({})...",
                 part_label,
-                partition::format_size(image_size)
+                disk_core::display::format_size(image_size)
             ),
         );
 
@@ -1723,8 +1723,8 @@ fn run_backup_inner(
                         part_label,
                         part.type_name,
                         part.start_lba,
-                        partition::format_size(part.size_bytes),
-                        partition::format_size(stream_size),
+                        disk_core::display::format_size(part.size_bytes),
+                        disk_core::display::format_size(stream_size),
                     ),
                 );
             } else {
@@ -1736,8 +1736,8 @@ fn run_backup_inner(
                         part_label,
                         part.type_name,
                         part.start_lba,
-                        partition::format_size(part.size_bytes),
-                        partition::format_size(stream_size),
+                        disk_core::display::format_size(part.size_bytes),
+                        disk_core::display::format_size(stream_size),
                     ),
                 );
             }
@@ -1750,8 +1750,8 @@ fn run_backup_inner(
                     part_label,
                     part.type_name,
                     part.start_lba,
-                    partition::format_size(part.size_bytes),
-                    partition::format_size(image_size),
+                    disk_core::display::format_size(part.size_bytes),
+                    disk_core::display::format_size(image_size),
                 ),
             );
         } else {
@@ -1763,7 +1763,7 @@ fn run_backup_inner(
                     part_label,
                     part.type_name,
                     part.start_lba,
-                    partition::format_size(part.size_bytes)
+                    disk_core::display::format_size(part.size_bytes)
                 ),
             );
         }
@@ -1820,7 +1820,7 @@ fn run_backup_inner(
                 format!(
                     "Defrag-cloning {} into {} ({})",
                     part_label,
-                    partition::format_size(target_size),
+                    disk_core::display::format_size(target_size),
                     match shape {
                         fs::DefragCloneShape::Flat => "flat HFS+",
                         fs::DefragCloneShape::Wrapped => "wrapped HFS+",
@@ -1842,18 +1842,18 @@ fn run_backup_inner(
             let (mut writer, mut reader) = channel_pipe();
             let progress_log_prod = Arc::clone(&progress);
             let producer =
-                std::thread::spawn(move || -> Result<fs::hfsplus_defrag::DefragReport> {
+                std::thread::spawn(move || -> Result<fs_mac::hfsplus_defrag::DefragReport> {
                     let report = match shape {
                         fs::DefragCloneShape::Pfs3 => {
                             let br = BufReader::new(producer_clone);
-                            let mut pfs = fs::pfs3::Pfs3Filesystem::open(br, part_offset)
+                            let mut pfs = fs_amiga::pfs3::Pfs3Filesystem::open(br, part_offset)
                                 .context("open source PFS3 for defrag-clone")?;
                             let progress_log_inner = Arc::clone(&progress_log_prod);
                             let mut clone_log = |s: &str| {
                                 log(&progress_log_inner, LogLevel::Info, s.to_string());
                             };
                             let mut clone_progress = |_emitted: u64| {};
-                            let pr = fs::pfs3_clone::stream_defragmented_pfs3(
+                            let pr = fs_amiga::pfs3_clone::stream_defragmented_pfs3(
                                 &mut pfs,
                                 target_size,
                                 &mut writer,
@@ -1872,7 +1872,7 @@ fn run_backup_inner(
                             }
                             // Map PFS3 counters onto DefragReport so
                             // the existing log line below renders.
-                            fs::hfsplus_defrag::DefragReport {
+                            fs_mac::hfsplus_defrag::DefragReport {
                                 files_copied: pr.files_copied,
                                 dirs_copied: pr.dirs_copied,
                                 data_bytes_copied: pr.bytes_copied,
@@ -1885,14 +1885,14 @@ fn run_backup_inner(
                         }
                         fs::DefragCloneShape::Exfat => {
                             let br = BufReader::new(producer_clone);
-                            let mut ex = fs::exfat::ExfatFilesystem::open(br, part_offset)
+                            let mut ex = fs_pc::exfat::ExfatFilesystem::open(br, part_offset)
                                 .context("open source exFAT for defrag-clone")?;
                             let progress_log_inner = Arc::clone(&progress_log_prod);
                             let mut clone_log = |s: &str| {
                                 log(&progress_log_inner, LogLevel::Info, s.to_string());
                             };
                             let mut clone_progress = |_emitted: u64| {};
-                            let pr = fs::exfat_clone::stream_defragmented_exfat(
+                            let pr = fs_pc::exfat_clone::stream_defragmented_exfat(
                                 &mut ex,
                                 target_size,
                                 &mut writer,
@@ -1909,7 +1909,7 @@ fn run_backup_inner(
                             }
                             // Map exFAT counters onto DefragReport so the
                             // existing emit log line below renders.
-                            fs::hfsplus_defrag::DefragReport {
+                            fs_mac::hfsplus_defrag::DefragReport {
                                 files_copied: pr.files_copied,
                                 dirs_copied: pr.dirs_copied,
                                 data_bytes_copied: pr.bytes_copied,
@@ -1922,14 +1922,14 @@ fn run_backup_inner(
                         }
                         fs::DefragCloneShape::Ntfs => {
                             let br = BufReader::new(producer_clone);
-                            let mut nt = fs::ntfs::NtfsFilesystem::open(br, part_offset)
+                            let mut nt = fs_pc::ntfs::NtfsFilesystem::open(br, part_offset)
                                 .context("open source NTFS for defrag-clone")?;
                             let progress_log_inner = Arc::clone(&progress_log_prod);
                             let mut clone_log = |s: &str| {
                                 log(&progress_log_inner, LogLevel::Info, s.to_string());
                             };
                             let mut clone_progress = |_emitted: u64| {};
-                            let pr = fs::ntfs_clone::stream_defragmented_ntfs(
+                            let pr = fs_pc::ntfs_clone::stream_defragmented_ntfs(
                                 &mut nt,
                                 target_size,
                                 &mut writer,
@@ -1944,7 +1944,7 @@ fn run_backup_inner(
                                     format!("NTFS clone: {w}"),
                                 );
                             }
-                            fs::hfsplus_defrag::DefragReport {
+                            fs_mac::hfsplus_defrag::DefragReport {
                                 files_copied: pr.files_copied,
                                 dirs_copied: pr.dirs_copied,
                                 data_bytes_copied: pr.bytes_copied,
@@ -1957,9 +1957,9 @@ fn run_backup_inner(
                         }
                         fs::DefragCloneShape::Flat => {
                             let br = BufReader::new(producer_clone);
-                            let mut hfs = fs::hfsplus::HfsPlusFilesystem::open(br, part_offset)
+                            let mut hfs = fs_mac::hfsplus::HfsPlusFilesystem::open(br, part_offset)
                                 .context("open source HFS+ for defrag-clone")?;
-                            fs::hfsplus_defrag::stream_defragmented_hfsplus(
+                            fs_mac::hfsplus_defrag::stream_defragmented_hfsplus(
                                 &mut hfs,
                                 target_size,
                                 &mut writer,
@@ -1971,7 +1971,7 @@ fn run_backup_inner(
                             // Positioned-read MDB detection — avoids the
                             // shared-fd-offset race when producer threads
                             // run concurrently across partitions.
-                            let info = fs::hfsplus_wrapper_clone::detect_wrapped_hfsplus_at(
+                            let info = fs_mac::hfsplus_wrapper_clone::detect_wrapped_hfsplus_at(
                                 &producer_clone,
                                 part_offset,
                                 part_size,
@@ -1988,10 +1988,12 @@ fn run_backup_inner(
                                 + (info.embed_start_block as u64) * (info.al_block_size as u64)
                                 + 1024;
                             let inner_target = target_size.saturating_sub(outer_overhead);
-                            let plan =
-                                fs::hfsplus_wrapper_clone::plan_wrapped_clone(&info, inner_target)
-                                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-                            fs::hfsplus_wrapper_clone::stream_wrapped_defragmented_hfsplus(
+                            let plan = fs_mac::hfsplus_wrapper_clone::plan_wrapped_clone(
+                                &info,
+                                inner_target,
+                            )
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                            fs_mac::hfsplus_wrapper_clone::stream_wrapped_defragmented_hfsplus(
                                 &mut br,
                                 &plan,
                                 &mut writer,
@@ -2008,7 +2010,7 @@ fn run_backup_inner(
                              {} xattrs",
                             report.files_copied,
                             report.dirs_copied,
-                            partition::format_size(report.data_bytes_copied),
+                            disk_core::display::format_size(report.data_bytes_copied),
                             report.hardlinks_copied + report.dir_hardlinks_copied,
                             report.xattrs_copied,
                         ),
@@ -2534,7 +2536,7 @@ fn run_single_file_chd_path(
     // its own `Arc<Mutex<BackupProgress>>` clone so it stays 'static +
     // Send (a requirement for the thread-local Box-erased fn type).
     let progress_for_sink = progress.clone();
-    fs::hfsplus_defrag::set_progress_sink(Some(Box::new(move |msg: &str| {
+    fs_mac::hfsplus_defrag::set_progress_sink(Some(Box::new(move |msg: &str| {
         if let Ok(mut p) = progress_for_sink.lock() {
             p.log_messages.push_back(LogMessage {
                 level: LogLevel::Info,
@@ -2584,7 +2586,7 @@ fn run_single_file_chd_path(
         Some(defrag_log_sink),
     );
 
-    fs::hfsplus_defrag::set_progress_sink(None);
+    fs_mac::hfsplus_defrag::set_progress_sink(None);
     let result = result?;
 
     // Build per-partition metadata. The byte range inside the CHD lives in

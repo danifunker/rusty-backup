@@ -24,9 +24,9 @@ use crate::cli::resolve::{
     resolve_partition_rw_forced, resolve_partition_streaming_forced, FsDispatchOverride,
 };
 use crate::fs::copy::{self, AttrPolicy, ConflictMode, CopyOptions, CopyStats, NamePolicy};
-use crate::fs::entry::FileEntry;
-use crate::fs::filesystem::{CreateDirectoryOptions, EditableFilesystem, Filesystem};
 use crate::model::source_reader;
+use disk_core::entry::FileEntry;
+use disk_core::filesystem::{CreateDirectoryOptions, EditableFilesystem, Filesystem};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum NamePolicyArg {
@@ -537,10 +537,10 @@ fn preflight_free_space(dst: &mut dyn EditableFilesystem, need: u64, args: &CpAr
          - grow it:  rb-cli resize {}{} --size <larger>\n    \
          (FAT/NTFS/exFAT/HFS+/ext/btrfs/SFS/PFS3/AFFS/EFS are resizable; you may first need \
          `rb-cli grow` + `rb-cli partmap resize` if the partition has no trailing slack)",
-        crate::partition::format_size(need),
+        disk_core::display::format_size(need),
         fs_type,
         args.dst_image.path.display(),
-        crate::partition::format_size(free),
+        disk_core::display::format_size(free),
         args.dst_image.path.display(),
         args.dst_image
             .partition
@@ -593,7 +593,7 @@ fn summarize(stats: &CopyStats) {
     out_stdout(format!(
         "Copied {} ({})",
         parts.join(", "),
-        crate::partition::format_size(stats.bytes)
+        disk_core::display::format_size(stats.bytes)
     ));
 
     // Fidelity-loss summary (only when something was dropped).

@@ -21,17 +21,17 @@ use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 
-use rusty_backup::fs::entry::FileEntry;
-use rusty_backup::fs::export_selection::ExportFormat;
+use disk_core::display::format_size;
+use disk_core::entry::FileEntry;
 #[allow(unused_imports)] // referenced from a doc comment below
-use rusty_backup::fs::fork_export::export_file_with_fork;
+use fs_mac::fork_export::export_file_with_fork;
+use fs_mac::resource_fork::ResourceForkMode;
+use rusty_backup::fs::export_selection::ExportFormat;
 use rusty_backup::fs::replace::OnConflict;
-use rusty_backup::fs::resource_fork::ResourceForkMode;
 use rusty_backup::model::checksum::{self, ChecksumJob, ChecksumStatus};
 use rusty_backup::model::commander_ops::{
     self, ExportJob, HostCopyJob, HostCopyStatus, StageCopyStatus,
 };
-use rusty_backup::partition::format_size;
 
 use super::file_detail::{self, FileContent};
 use super::metadata_editor::{
@@ -86,7 +86,7 @@ struct DetailWindow {
     xattr_editor: Option<XattrEditorState>,
     /// The entry's on-disk extended attributes, read when the window opened.
     /// Empty on filesystems without xattr support.
-    xattrs: Vec<rusty_backup::fs::xattr::Xattr>,
+    xattrs: Vec<disk_core::xattr::Xattr>,
     /// Last staging status, shown in the window.
     result: Option<String>,
 }

@@ -13,7 +13,7 @@ use clap::Args;
 use crate::cli::img_at::ImageRef;
 use crate::cli::logging::log_stderr;
 use crate::cli::resolve::resolve_partition_rw;
-use crate::fs::unix_common::inode::unix_mode_string;
+use disk_core::unix_common::inode::unix_mode_string;
 
 #[derive(Debug, Args)]
 pub struct ChmodArgs {

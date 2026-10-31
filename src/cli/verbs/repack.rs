@@ -11,7 +11,7 @@
 //! floppy-container converter.
 //!
 //! Why this exists: the in-place resizer
-//! ([`crate::fs::human68k::resize_human68k_in_place`]) keeps every cluster
+//! ([`fs_pc::human68k::resize_human68k_in_place`]) keeps every cluster
 //! at its original byte offset so existing files stay byte-exact, which
 //! means it can only trim trailing free space. `repack` reclaims holes
 //! left by deleted/relocated files.
@@ -24,10 +24,10 @@ use crate::cli::img_at::ImageRef;
 use crate::cli::logging::log_stderr;
 use crate::cli::parse::parse_size;
 use crate::cli::resolve::{resolve_partition_ro, resolve_partition_rw};
-use crate::fs::filesystem::Filesystem;
-use crate::fs::human68k::Human68kFilesystem;
-use crate::fs::human68k_clone::stream_defragmented_human68k;
-use crate::partition::format_size;
+use disk_core::display::format_size;
+use disk_core::filesystem::Filesystem;
+use fs_pc::human68k::Human68kFilesystem;
+use fs_pc::human68k_clone::stream_defragmented_human68k;
 
 #[derive(Debug, Args)]
 pub struct RepackArgs {

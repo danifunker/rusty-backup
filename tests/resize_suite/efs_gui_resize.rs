@@ -19,7 +19,7 @@
 
 use std::io::{Cursor, Read, Seek, SeekFrom};
 
-use rusty_backup::fs::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+use disk_core::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
 use rusty_backup::partition::resize::{apply_resize, compute_resize_plan};
 use rusty_backup::partition::sgi_hdd_builder::{build_sgi_efs_hdd, SgiHddOptions};
 use rusty_backup::partition::PartitionTable;
@@ -57,8 +57,8 @@ fn efs_fs_size_blocks(img: &[u8], offset: u64) -> u32 {
 
 /// Open the EFS volume, fsck it, and confirm the seed file is intact.
 fn assert_healthy(img: &[u8], offset: u64) {
-    let mut fs = rusty_backup::fs::efs::EfsFilesystem::open(Cursor::new(img), offset)
-        .expect("open EFS after resize");
+    let mut fs =
+        fs_unix::efs::EfsFilesystem::open(Cursor::new(img), offset).expect("open EFS after resize");
     let report = fs
         .fsck()
         .expect("EFS exposes an fsck")
@@ -159,8 +159,7 @@ fn build_seeded_disk() -> Vec<u8> {
     let (img, _layout) = build_sgi_efs_hdd(&opts).expect("build dvh + EFS HDD");
     let (offset, _size) = efs_slice(&img);
 
-    let mut fs =
-        rusty_backup::fs::efs::EfsFilesystem::open(Cursor::new(img), offset).expect("open EFS");
+    let mut fs = fs_unix::efs::EfsFilesystem::open(Cursor::new(img), offset).expect("open EFS");
     let root = Filesystem::root(&mut fs).expect("root");
     let payload = seed_payload();
     fs.create_file(

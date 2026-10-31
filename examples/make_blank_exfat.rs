@@ -1,6 +1,6 @@
 //! Emit a blank exFAT image for mount-testing the formatter.
 //! Usage: cargo run --example make_blank_exfat -- <out_path> <size_mib> [label]
-use rusty_backup::fs::exfat::{create_blank_exfat, ExfatFormatTemplate};
+use fs_pc::exfat::{create_blank_exfat, ExfatFormatTemplate};
 use std::fs::File;
 
 fn main() {

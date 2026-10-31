@@ -66,9 +66,9 @@ fn run_expand(
         status,
         format!(
             "Re-encoding CHD: {} -> {} ({} new free space)",
-            crate::partition::format_size(old_logical),
-            crate::partition::format_size(new_logical),
-            crate::partition::format_size(add_bytes),
+            disk_core::display::format_size(old_logical),
+            disk_core::display::format_size(new_logical),
+            disk_core::display::format_size(add_bytes),
         ),
     );
 

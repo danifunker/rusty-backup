@@ -18,9 +18,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::fs::entry::FileEntry;
-use crate::fs::filesystem::Filesystem;
 use crate::remote::{RemoteConnection, RemoteFilesystem, RemoteHostFilesystem};
+use disk_core::entry::FileEntry;
+use disk_core::filesystem::Filesystem;
 
 /// What the browser is currently showing.
 #[derive(Debug, Clone, PartialEq, Eq)]

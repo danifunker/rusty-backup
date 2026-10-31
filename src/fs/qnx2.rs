@@ -11,8 +11,8 @@ pub use qnx2fs::{decode_date, fold_date, looks_like_qnx2, looks_like_rs_text, rs
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs::entry::FileEntry;
-    use crate::fs::filesystem::{EditableFilesystem, Filesystem};
+    use disk_core::entry::FileEntry;
+    use disk_core::filesystem::{EditableFilesystem, Filesystem};
     use std::io::Cursor;
 
     const ROOT_AT: usize = 68;

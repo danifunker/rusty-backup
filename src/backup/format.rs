@@ -4,9 +4,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use chrono::Local;
 
-use crate::partition::apm::Apm;
-use crate::partition::gpt::Gpt;
-use crate::partition::mbr::Mbr;
+use part_tables::apm::Apm;
+use part_tables::gpt::Gpt;
+use part_tables::mbr::Mbr;
 
 /// Create the backup output folder. Returns the path to the created directory.
 pub fn create_backup_folder(dest: &Path, name: &str) -> Result<PathBuf> {

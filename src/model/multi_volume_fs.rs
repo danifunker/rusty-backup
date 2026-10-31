@@ -30,10 +30,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
-use crate::fs::entry::FileEntry;
-use crate::fs::filesystem::{Filesystem, FilesystemError};
 use crate::model::commander_descend;
 use crate::partition::PartitionInfo;
+use disk_core::entry::FileEntry;
+use disk_core::filesystem::{Filesystem, FilesystemError};
 
 /// How to open one volume of the container as a real filesystem. Held so a
 /// volume's filesystem can be opened lazily (first access) and reopened fresh on
@@ -220,7 +220,7 @@ fn native_entry(entry: &FileEntry, native_path: String) -> FileEntry {
 /// Commander partition dropdown (`"{n}: {type} ({size})"`), prepending the
 /// AmigaDOS drive name (e.g. `DH0`) when the RDB records one.
 fn partition_node_label(p: &PartitionInfo) -> String {
-    let size = crate::partition::format_size(p.size_bytes);
+    let size = disk_core::display::format_size(p.size_bytes);
     match p.drv_name.as_deref() {
         Some(d) if !d.trim().is_empty() => {
             format!("{}: {} {} ({})", p.index + 1, d, p.type_name, size)
@@ -327,7 +327,7 @@ impl Filesystem for MultiVolumeFilesystem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs::entry::EntryType;
+    use disk_core::entry::EntryType;
     use std::collections::HashMap;
 
     #[test]

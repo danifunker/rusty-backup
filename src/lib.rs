@@ -1,7 +1,6 @@
 pub mod backup;
 pub mod bulk_buf_reader;
 pub mod cli;
-pub mod clonezilla;
 // Always-compiled std-API shims that differ between the modern toolchain and the
 // Rust 1.73 vintage (macOS 10.7) build. Keeps lint-discouraged fallbacks out of
 // the desktop tree — see src/compat.rs.
@@ -9,7 +8,6 @@ pub mod compat;
 pub mod device;
 pub mod error;
 pub mod fs;
-pub mod macarchive;
 pub mod model;
 #[cfg(feature = "optical")]
 pub mod optical;

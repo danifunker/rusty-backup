@@ -8,11 +8,13 @@
 //! naming helpers alone, because the failure was silent: the export reported
 //! success and simply lost one of the two files.
 
+use disk_core::entry::FileEntry;
+use disk_core::filesystem::{CreateDirectoryOptions, CreateFileOptions};
+use fs_mac::resource_fork::ResourceForkMode;
+use fs_pc::fat;
 use rusty_backup::cli::resolve::{resolve_partition_ro, resolve_partition_rw};
 use rusty_backup::fs::export_selection::{export_to_file, export_to_folder, ExportFormat};
-use rusty_backup::fs::filesystem::{CreateDirectoryOptions, CreateFileOptions};
-use rusty_backup::fs::resource_fork::ResourceForkMode;
-use rusty_backup::fs::{entry::FileEntry, fat, open_editable_filesystem, open_filesystem};
+use rusty_backup::fs::{open_editable_filesystem, open_filesystem};
 
 const DOCS: &[u8] = b"FROM DOCS";
 const BACKUP: &[u8] = b"FROM BACKUP";
@@ -54,7 +56,7 @@ fn make_colliding_image(path: &std::path::Path) {
 }
 
 /// The two `notes.txt` entries, one from each folder.
-fn colliding_entries(fs: &mut dyn rusty_backup::fs::filesystem::Filesystem) -> Vec<FileEntry> {
+fn colliding_entries(fs: &mut dyn disk_core::filesystem::Filesystem) -> Vec<FileEntry> {
     let root = fs.root().unwrap();
     let mut picked = Vec::new();
     for dir in ["docs", "backup"] {

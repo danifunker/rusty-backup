@@ -24,13 +24,13 @@ use std::io::Cursor;
 
 use byteorder::{BigEndian, ByteOrder};
 
+use disk_core::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+use fs_8bit::qdos::{QdosFilesystem, QXLWIN_SIGNATURE};
+use part_tables::PartitionSizeOverride;
 use rusty_backup::backup::metadata::{
     AlignmentMetadata, BackupLayout, BackupMetadata, PartitionMetadata,
 };
-use rusty_backup::fs::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
-use rusty_backup::fs::qdos::{QdosFilesystem, QXLWIN_SIGNATURE};
 use rusty_backup::fs::resize_filesystem_for;
-use rusty_backup::partition::PartitionSizeOverride;
 use rusty_backup::rbformats::reconstruct_disk_from_backup;
 
 const SECTOR_BYTES: usize = 512;

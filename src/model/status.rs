@@ -12,10 +12,11 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use crate::clonezilla::block_cache::PartcloneBlockCache;
-use crate::fs::hfs_clone::{CloneReport, EmitReport};
+use crate::fs::hfs_clone::EmitReport;
 use crate::os::TempFileGuard;
 use crate::partition::{PartitionAlignment, PartitionInfo, PartitionTable};
+use dsk_clonezilla::block_cache::PartcloneBlockCache;
+use fs_mac::hfs_clone::CloneReport;
 
 /// Status of a background disk inspect operation.
 pub struct InspectStatus {

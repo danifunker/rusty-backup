@@ -121,7 +121,7 @@ fn patch_sun(
     target_size: u64,
     log_cb: &mut dyn FnMut(&str),
 ) -> Result<PatchedHead> {
-    use super::sun::SunDiskLabel;
+    use part_tables::sun::SunDiskLabel;
     need(head, 512, "a Sun label")?;
     let label = SunDiskLabel::parse(&head[..512]).context("Sun label in the backup")?;
     let spc = label.sectors_per_cylinder;
@@ -182,7 +182,7 @@ fn patch_next(
     target_size: u64,
     log_cb: &mut dyn FnMut(&str),
 ) -> Result<PatchedHead> {
-    use super::next::{self, NextDiskLabel, LABEL_SPAN};
+    use part_tables::next::{self, NextDiskLabel, LABEL_SPAN};
     need(head, LABEL_SPAN, "a NeXT label")?;
     let label = NextDiskLabel::parse(&head[..LABEL_SPAN], 0).context("NeXT label in the backup")?;
     let ss = label.sector_size as u64;
@@ -244,7 +244,7 @@ fn patch_sgi(
     target_size: u64,
     log_cb: &mut dyn FnMut(&str),
 ) -> Result<PatchedHead> {
-    use super::sgi::{SgiPartitionEntry, SgiVolumeHeader, SGI_NUM_PARTITIONS};
+    use part_tables::sgi::{SgiPartitionEntry, SgiVolumeHeader, SGI_NUM_PARTITIONS};
     need(head, 512, "an SGI volume header")?;
     let mut vh = SgiVolumeHeader::parse(&head[..512]).context("SGI volume header in the backup")?;
     let adjusted = repack(overrides, 512, 0)?;
@@ -289,7 +289,7 @@ fn patch_sgi_dklabel(
     target_size: u64,
     log_cb: &mut dyn FnMut(&str),
 ) -> Result<PatchedHead> {
-    use super::sgi_dklabel::{apply_byte_order, SgiDiskLabel, OFF_MAP};
+    use part_tables::sgi_dklabel::{apply_byte_order, SgiDiskLabel, OFF_MAP};
     need(head, 512, "an SGI disk label")?;
     let label = SgiDiskLabel::parse(&head[..512]).context("SGI disk label in the backup")?;
     let adjusted = repack(overrides, 512, 0)?;
@@ -337,7 +337,7 @@ fn patch_rdb(
     target_size: u64,
     log_cb: &mut dyn FnMut(&str),
 ) -> Result<PatchedHead> {
-    use super::rdb::Rdb;
+    use part_tables::rdb::Rdb;
     let rdb = Rdb::parse(&mut Cursor::new(head.to_vec())).context("RDB in the backup")?;
     // PART blocks count in cylinders, and the patcher below refuses a start off
     // one; lay the disk out on the cylinder grid first and hand it explicit starts.
@@ -425,7 +425,7 @@ fn patch_ahdi(
     target_size: u64,
     log_cb: &mut dyn FnMut(&str),
 ) -> Result<PatchedHead> {
-    use super::atari::{AhdiTable, AHDI_NUM_SLOTS};
+    use part_tables::atari::{AhdiTable, AHDI_NUM_SLOTS};
     need(head, 512, "an AHDI root sector")?;
     let table = AhdiTable::parse_root(&head[..512]).context("AHDI root sector in the backup")?;
     let adjusted = repack(overrides, 512, 0)?;
@@ -478,7 +478,7 @@ fn patch_x68k(
     target_size: u64,
     log_cb: &mut dyn FnMut(&str),
 ) -> Result<PatchedHead> {
-    use super::x68k::{
+    use part_tables::x68k::{
         X68kPartitionTable, X68K_ENTRY_SIZE, X68K_MAX_PARTITIONS, X68K_TABLE_HEADER_SIZE,
     };
     // The same probe `PartitionTable::detect` runs: the table's offset decides

@@ -220,13 +220,12 @@ fn run_info(args: InfoArgs) -> Result<()> {
         std::fs::read(&args.input).with_context(|| format!("reading {}", args.input.display()))?;
     // Decode once so we can derive geometry from the flat size.
     let (flat, media) = match kind {
-        ContainerKind::Xdf => crate::rbformats::containers::xdf::decode_xdf_bytes(&bytes)?,
-        ContainerKind::Hdm => crate::rbformats::containers::hdm::decode_hdm_bytes(&bytes)?,
-        ContainerKind::Dim => crate::rbformats::containers::dim::decode_dim_bytes(&bytes)?,
+        ContainerKind::Xdf => dsk_floppy::xdf::decode_xdf_bytes(&bytes)?,
+        ContainerKind::Hdm => dsk_floppy::hdm::decode_hdm_bytes(&bytes)?,
+        ContainerKind::Dim => dsk_floppy::dim::decode_dim_bytes(&bytes)?,
         ContainerKind::D88 => {
-            let flat = crate::rbformats::containers::d88::decode_d88_bytes(&bytes)?;
-            let media =
-                crate::rbformats::containers::floppy_geom::require_media_from_size(flat.len())?;
+            let flat = dsk_floppy::d88::decode_d88_bytes(&bytes)?;
+            let media = dsk_floppy::floppy_geom::require_media_from_size(flat.len())?;
             (flat, media)
         }
         _ => unreachable!("guarded by is_floppy_container above"),

@@ -86,7 +86,7 @@ impl ContainerEditSession {
 
         // WOZ floppy: decode the GCR bitstream into a flat sector buffer.
         if crate::model::source_reader::is_woz_path(path) {
-            let mut reader = crate::rbformats::woz::WozReader::open(path)
+            let mut reader = dsk_apple::woz::WozReader::open(path)
                 .with_context(|| format!("decode WOZ {}", path.display()))?;
             let flat_len = reader.len();
             let mut out = std::fs::File::create(temp.path())
@@ -192,8 +192,7 @@ impl ContainerEditSession {
                         flat.len()
                     );
                 }
-                crate::rbformats::woz_write::sectors_to_woz(&flat)
-                    .context("re-encode WOZ container")?
+                dsk_apple::woz_write::sectors_to_woz(&flat).context("re-encode WOZ container")?
             }
             EditFormat::Dsd => {
                 let flat = std::fs::read(self.temp.path())
@@ -242,7 +241,8 @@ impl ContainerEditSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rbformats::containers::{convert_floppy_container, floppy_geom::FloppyMedia};
+    use crate::rbformats::containers::convert_floppy_container;
+    use dsk_floppy::floppy_geom::FloppyMedia;
 
     /// Build a FAT12-bearing flat image, wrap it as `kind`, edit a byte in the
     /// decoded flat via the session, commit, and confirm the change survives a
@@ -361,8 +361,8 @@ mod tests {
     /// carrying the edit (same fixed geometry).
     #[test]
     fn round_trip_edit_woz() {
-        use crate::rbformats::woz::WozReader;
-        use crate::rbformats::woz_write::write_woz;
+        use dsk_apple::woz::WozReader;
+        use dsk_apple::woz_write::write_woz;
         use std::io::Read;
 
         let dir = tempfile::tempdir().unwrap();

@@ -1,6 +1,6 @@
 use byteorder::{BigEndian, ByteOrder};
-use rusty_backup::fs::hfs::{create_blank_hfs_sized, HfsFilesystem, HFS_MAX_BTREE_FILE_SIZE};
-use rusty_backup::fs::hfs_clone::clone_hfs_volume;
+use fs_mac::hfs::{create_blank_hfs_sized, HfsFilesystem, HFS_MAX_BTREE_FILE_SIZE};
+use fs_mac::hfs_clone::clone_hfs_volume;
 use std::fs::File;
 use std::io::{BufReader, Cursor};
 

@@ -216,7 +216,7 @@ const DFS_TRACK_BYTES: usize = 10 * 256;
 /// On a `.dsd` the two sides are stored **track-interleaved**: the logical slot
 /// for (track `t`, side `s`) is `t*2 + s`, each slot being one 2560-byte track.
 /// De-interleaving lays side 0's tracks contiguously, then side 1's — so each
-/// side becomes a standard single-sided DFS volume the [`crate::fs::dfs`] reader
+/// side becomes a standard single-sided DFS volume the [`fs_8bit::dfs`] reader
 /// opens as-is (side 0 at byte 0, side 1 at `raw.len()/2`).
 ///
 /// Returns `None` unless `raw` is a clean `tracks * 2` tracks with each side a

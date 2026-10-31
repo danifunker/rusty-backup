@@ -5,7 +5,7 @@
 //!
 //! usage: gho_ntfs_damaged <path-to.gho>
 
-use rusty_backup::rbformats::gho::GhoReader;
+use dsk_ghost::gho::GhoReader;
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 

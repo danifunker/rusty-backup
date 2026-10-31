@@ -7,8 +7,8 @@
 
 use std::path::PathBuf;
 
-use rusty_backup::fs::alto::bfs::Bfs;
-use rusty_backup::fs::alto::{open_pack, pdi, write, FsFamily, Geometry};
+use fs_xerox::alto::bfs::Bfs;
+use fs_xerox::alto::{open_pack, pdi, write, FsFamily, Geometry};
 
 use super::progress::LogPanel;
 

@@ -13,8 +13,8 @@
 //! multi-minute rebuild, with the original already replaced — is the failure
 //! mode the whole size budget exists to design out.
 
-use rusty_backup::fs::squashfs_edit::{SizeBudget, SizePlan};
-use rusty_backup::partition::format_size;
+use disk_core::display::format_size;
+use fs_squashfs::squashfs_edit::{SizeBudget, SizePlan};
 
 /// Which budget shape the user has selected.
 #[derive(Clone, Copy, PartialEq, Eq)]

@@ -25,7 +25,7 @@ use crate::cli::glob::compile_patterns;
 use crate::cli::img_at::ImageRef;
 use crate::cli::logging::log_stderr;
 use crate::cli::resolve::{resolve_partition_streaming_forced_inside, FsDispatchOverride};
-use crate::fs::tar_export::{export_tar, TarCompression, TarExportOptions, TarExportStats};
+use fs_tar::tar_export::{export_tar, TarCompression, TarExportOptions, TarExportStats};
 
 #[derive(Debug, Args)]
 pub struct TarArgs {

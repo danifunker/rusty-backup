@@ -36,8 +36,8 @@ use crate::cli::glob::{collect_matches, compile_patterns};
 use crate::cli::img_at::ImageRef;
 use crate::cli::logging::{log_stderr, out_stdout};
 use crate::cli::resolve::{resolve_partition_streaming_forced_inside, FsDispatchOverride};
-use crate::fs::entry::FileEntry;
-use crate::fs::filesystem::Filesystem;
+use disk_core::entry::FileEntry;
+use disk_core::filesystem::Filesystem;
 
 #[derive(Debug, Args)]
 pub struct GetArgs {
@@ -338,13 +338,13 @@ fn run_glob(
         let host_target = if rel.is_empty() {
             // The glob matched the root itself (rare); fall back to the
             // entry's name under DST.
-            dst.join(crate::fs::resource_fork::sanitize_filename(&entry.name))
+            dst.join(fs_mac::resource_fork::sanitize_filename(&entry.name))
         } else {
             join_relative(dst, &rel)
         };
 
         match entry.entry_type {
-            crate::fs::entry::EntryType::Directory => {
+            disk_core::entry::EntryType::Directory => {
                 if !recursive {
                     log_stderr(format!("skip dir (no -r): {full}"));
                     stats.skipped_dirs += 1;
@@ -353,9 +353,9 @@ fn run_glob(
                 ensure_dir(&host_target)?;
                 extract_directory_recursive(fs, &entry, &host_target, opts, &mut stats)?;
             }
-            crate::fs::entry::EntryType::File
-            | crate::fs::entry::EntryType::Symlink
-            | crate::fs::entry::EntryType::Special => {
+            disk_core::entry::EntryType::File
+            | disk_core::entry::EntryType::Symlink
+            | disk_core::entry::EntryType::Special => {
                 if let Some(parent) = host_target.parent() {
                     ensure_dir(parent)?;
                 }
@@ -382,15 +382,15 @@ fn extract_directory_recursive(
         .list_directory(dir)
         .map_err(|e| anyhow!("list_directory {}: {e}", dir.path))?;
     for child in children {
-        let host_child = host_target.join(crate::fs::resource_fork::sanitize_filename(&child.name));
+        let host_child = host_target.join(fs_mac::resource_fork::sanitize_filename(&child.name));
         match child.entry_type {
-            crate::fs::entry::EntryType::Directory => {
+            disk_core::entry::EntryType::Directory => {
                 ensure_dir(&host_child)?;
                 extract_directory_recursive(fs, &child, &host_child, opts, stats)?;
             }
-            crate::fs::entry::EntryType::File
-            | crate::fs::entry::EntryType::Symlink
-            | crate::fs::entry::EntryType::Special => {
+            disk_core::entry::EntryType::File
+            | disk_core::entry::EntryType::Symlink
+            | disk_core::entry::EntryType::Special => {
                 extract_entry_to_host(fs, &child, &host_child, opts, stats).with_context(|| {
                     format!("extracting {} to {}", child.path, host_child.display())
                 })?;
@@ -411,7 +411,7 @@ fn extract_entry_to_host(
     stats: &mut ExtractStats,
 ) -> Result<bool> {
     match entry.entry_type {
-        crate::fs::entry::EntryType::File => {
+        disk_core::entry::EntryType::File => {
             let wrote = extract_file_to_host(fs, entry, host_target, opts)?;
             if wrote {
                 stats.files += 1;
@@ -420,7 +420,7 @@ fn extract_entry_to_host(
             }
             Ok(wrote)
         }
-        crate::fs::entry::EntryType::Symlink => {
+        disk_core::entry::EntryType::Symlink => {
             // Cross-platform safe fallback: write the target as a plain
             // text file. Lossy but doesn't fail on Windows without
             // developer mode. Add `--symlinks=native` in a follow-up if
@@ -443,7 +443,7 @@ fn extract_entry_to_host(
             }
             Ok(wrote)
         }
-        crate::fs::entry::EntryType::Special => {
+        disk_core::entry::EntryType::Special => {
             stats.skipped_special += 1;
             log_stderr(format!(
                 "  skip special file: {} ({})",
@@ -452,7 +452,7 @@ fn extract_entry_to_host(
             ));
             Ok(false)
         }
-        crate::fs::entry::EntryType::Directory => {
+        disk_core::entry::EntryType::Directory => {
             // Caller is responsible for directory dispatch.
             unreachable!("extract_entry_to_host called on a directory");
         }
@@ -562,7 +562,7 @@ fn join_relative(base: &Path, rel: &str) -> PathBuf {
     let mut out = base.to_path_buf();
     // Catalog names are data: `..` or an absolute name must stay under `base`.
     for component in rel.split('/').filter(|c| !c.is_empty()) {
-        out.push(crate::fs::resource_fork::sanitize_filename(component));
+        out.push(fs_mac::resource_fork::sanitize_filename(component));
     }
     out
 }

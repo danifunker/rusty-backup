@@ -79,7 +79,7 @@ pub use source::{LocalCdReader, OpticalSource};
 /// which extraction writes as zero dates just as before.
 pub fn mac_dates_from(
     ts: &Option<opticaldiscs::FileTimestamps>,
-) -> crate::fs::resource_fork::MacFileDates {
+) -> fs_mac::resource_fork::MacFileDates {
     use opticaldiscs::FileTimestamps as T;
     let (created, modified) = match ts {
         Some(T::Hfs {
@@ -92,7 +92,7 @@ pub fn mac_dates_from(
         }) => (*created, *content_modified),
         _ => (0, 0),
     };
-    crate::fs::resource_fork::MacFileDates { created, modified }
+    fs_mac::resource_fork::MacFileDates { created, modified }
 }
 
 /// Format a game disc's identity into a single ASCII line for logs and UI

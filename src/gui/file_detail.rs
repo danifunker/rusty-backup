@@ -7,8 +7,8 @@
 //! `self`, no background work; they take a `&FileEntry` (and the decoded
 //! bytes, for the preview) and draw into the supplied `egui::Ui`.
 
-use rusty_backup::fs::entry::{FileEntry, FileEntryTypeDisplay as _};
-use rusty_backup::partition;
+use disk_core::entry::FileEntry;
+use rusty_backup::fs::entry::FileEntryTypeDisplay as _;
 
 /// Decoded file content for the preview pane: either a text rendering or the
 /// raw bytes for a hex dump.
@@ -65,7 +65,7 @@ pub fn detect_content_type(entry: &FileEntry, data: &[u8]) -> FileContent {
 
     // Check HFS type code first (if present)
     if let Some(ref type_code) = entry.type_code {
-        let type_str = rusty_backup::fs::hfs_common::decode_ostype(type_code);
+        let type_str = fs_mac::hfs_common::decode_ostype(type_code);
         if let Some(is_text) = hfs_file_types::classify(&type_str) {
             if !is_text {
                 return FileContent::Binary(data.to_vec());
@@ -185,7 +185,7 @@ pub fn render_metadata_rows(
     ui: &mut egui::Ui,
     entry: &FileEntry,
     suppress_type_creator: bool,
-    id_names: Option<&rusty_backup::fs::id_names::IdNameMap>,
+    id_names: Option<&disk_core::id_names::IdNameMap>,
 ) {
     // File info header
     ui.label(egui::RichText::new(&entry.name).strong());
@@ -209,7 +209,7 @@ pub fn render_metadata_rows(
         }
         if let Some(ref rsrc) = entry.resource_fork_size {
             if *rsrc > 0 {
-                ui.label(format!("Rsrc: {}", partition::format_size(*rsrc)));
+                ui.label(format!("Rsrc: {}", disk_core::display::format_size(*rsrc)));
             }
         }
         if let Some(mode_str) = entry.mode_string() {

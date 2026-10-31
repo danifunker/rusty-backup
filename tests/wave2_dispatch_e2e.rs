@@ -11,9 +11,9 @@ use std::io::{Cursor, Read};
 
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
 
-use rusty_backup::fs::filesystem::CreateFileOptions;
+use disk_core::filesystem::CreateFileOptions;
 #[allow(unused_imports)]
-use rusty_backup::fs::filesystem::Filesystem;
+use disk_core::filesystem::Filesystem;
 
 // ----------------------------------------------------------------------------
 // Human68k — explicit "human68k" string-route + put/get round-trip
@@ -168,7 +168,7 @@ fn dispatch_via_auto_detect_routes_to_adfs() {
 
 #[test]
 fn partition_detect_recognises_x68k_human68k_table() {
-    use rusty_backup::partition::x68k::{
+    use part_tables::x68k::{
         X68kPartitionTable, X68K_DEFAULT_SECTOR_SIZE, X68K_ENTRY_SIZE, X68K_MAGIC,
         X68K_TABLE_HEADER_SIZE, X68K_TABLE_OFFSET,
     };
@@ -207,7 +207,7 @@ fn partition_detect_recognises_x68k_human68k_table() {
 
 #[test]
 fn dispatch_via_auto_detect_routes_to_qdos_mdv() {
-    use rusty_backup::fs::qdos_mdv::{CART_NAME_OFFSET, MDV_CART_BYTES, MDV_SECTOR_BYTES};
+    use fs_8bit::qdos_mdv::{CART_NAME_OFFSET, MDV_CART_BYTES, MDV_SECTOR_BYTES};
     let mut cart = vec![0u8; MDV_CART_BYTES];
     // Sector-0 preamble + sync + cartridge name "TstCart".
     cart[0x0A] = 0xFF;
@@ -362,7 +362,7 @@ fn build_qdos_qxlwin_disk_with_freelist() -> Vec<u8> {
 
 #[test]
 fn editable_dispatch_via_qxlwin_string_round_trips_through_create_and_delete() {
-    use rusty_backup::fs::filesystem::CreateFileOptions;
+    use disk_core::filesystem::CreateFileOptions;
     let disk = build_qdos_qxlwin_disk_with_freelist();
     let cur = Cursor::new(disk);
     // String-keyed dispatch ("qxlwin") — the route the CLI / restore
@@ -417,6 +417,6 @@ fn dispatch_via_auto_detect_routes_to_andos() {
     let err = fs.list_directory(&root).unwrap_err();
     assert!(matches!(
         err,
-        rusty_backup::fs::filesystem::FilesystemError::Unsupported(_)
+        disk_core::filesystem::FilesystemError::Unsupported(_)
     ));
 }

@@ -4,7 +4,7 @@ use std::io::{Read, Seek, SeekFrom};
 fn main() {
     env_logger::init();
     let path = std::env::args().nth(1).unwrap();
-    let mut r = rusty_backup::rbformats::gho::GhoReader::open(std::path::Path::new(&path)).unwrap();
+    let mut r = dsk_ghost::gho::GhoReader::open(std::path::Path::new(&path)).unwrap();
     r.prepare_full_image();
     r.seek(SeekFrom::Start(0)).unwrap();
     let mut b = vec![0u8; 8192];

@@ -30,7 +30,7 @@ use crate::model::hfs_expand_runner::{
     ExpandOutput, BLOCK_SIZE_CHOICES,
 };
 use crate::model::status::ExpandStatus;
-use crate::partition::format_size;
+use disk_core::display::format_size;
 
 #[derive(Debug, Args)]
 pub struct ExpandArgs {
@@ -99,11 +99,11 @@ pub fn run(args: ExpandArgs) -> Result<()> {
             block_size
         );
     }
-    if args.to_hfv && target_size > crate::fs::hfv::HFV_MAX_BYTES {
+    if args.to_hfv && target_size > fs_mac::hfv::HFV_MAX_BYTES {
         bail!(
             "--size {} exceeds the BasiliskII HFV limit of {} (2047 MB); HFV volumes must be classic-HFS-mountable",
             format_size(target_size),
-            format_size(crate::fs::hfv::HFV_MAX_BYTES)
+            format_size(fs_mac::hfv::HFV_MAX_BYTES)
         );
     }
     if target_size < source.used_bytes {

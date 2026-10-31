@@ -152,17 +152,17 @@ impl ProgressState {
                 let text = if self.full_size_bytes > self.total_bytes {
                     format!(
                         "{} / {} to image of {} total ({:.0}%){}",
-                        rusty_backup::partition::format_size(self.current_bytes),
-                        rusty_backup::partition::format_size(self.total_bytes),
-                        rusty_backup::partition::format_size(self.full_size_bytes),
+                        disk_core::display::format_size(self.current_bytes),
+                        disk_core::display::format_size(self.total_bytes),
+                        disk_core::display::format_size(self.full_size_bytes),
                         fraction * 100.0,
                         rate_eta,
                     )
                 } else {
                     format!(
                         "{} / {} ({:.0}%){}",
-                        rusty_backup::partition::format_size(self.current_bytes),
-                        rusty_backup::partition::format_size(self.total_bytes),
+                        disk_core::display::format_size(self.current_bytes),
+                        disk_core::display::format_size(self.total_bytes),
                         fraction * 100.0,
                         rate_eta,
                     )

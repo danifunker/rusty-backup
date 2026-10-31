@@ -5,7 +5,7 @@
 //! (or macOS) wrote, in order, with enough detail to troubleshoot a volume that
 //! won't mount. ASCII only — no emoji or arrows beyond `->` (CLAUDE.md rule).
 
-use rusty_backup::fs::hfsplus_journal::{classify_target, JournalDetail};
+use fs_mac::hfsplus_journal::{classify_target, JournalDetail};
 
 /// Modal state for the journal viewer. Created when the user clicks "Journal"
 /// in the browse-view toolbar; holds the decoded journal plus the currently
@@ -188,8 +188,8 @@ struct TxnRow {
 
 /// One-line classification of which subsystems a transaction's blocks touch.
 fn classification_summary(
-    regions: &[rusty_backup::fs::hfsplus_journal::MetadataRegion],
-    txn: &rusty_backup::fs::hfsplus_journal::JournalTxnDetail,
+    regions: &[fs_mac::hfsplus_journal::MetadataRegion],
+    txn: &fs_mac::hfsplus_journal::JournalTxnDetail,
 ) -> String {
     let mut names: Vec<&'static str> = Vec::new();
     for b in &txn.blocks {

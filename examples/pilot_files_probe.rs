@@ -11,9 +11,9 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-use rusty_backup::fs::alto::pilot::{self, Generation, Label, PilotFilesystem};
-use rusty_backup::fs::alto::{open_pack, Disk};
-use rusty_backup::fs::filesystem::Filesystem;
+use disk_core::filesystem::Filesystem;
+use fs_xerox::alto::pilot::{self, Generation, Label, PilotFilesystem};
+use fs_xerox::alto::{open_pack, Disk};
 
 fn classic_file_page(l: &Label) -> u32 {
     // Classic Pilot label: filePageLo (w5) + filePageHi (w6 bits 0..6); the

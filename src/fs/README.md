@@ -2,7 +2,7 @@
 
 Trait-based filesystem abstraction for browsing, compaction, resize, and validation of partition contents.
 
-**Where the code lives (crate split, `docs/crate_split_plan.md`):** the drivers have moved into family crates under `crates/` (`fs-8bit`, `fs-adfs`, `fs-amiga`, `fs-apfs`, `fs-apple2`, `fs-cpm`, `fs-hpfs`, `fs-mac` / `fs-mac-unicode`, `fs-pc`, `fs-qnx`, `fs-squashfs`, `fs-unix`, `fs-xerox`, `fs-xfs`), and the trait, `FileEntry` and the shared helpers into `crates/disk-core`. A file here named after a driver is now a one-line `pub use` shim, kept until Step 7 so app paths don't change. What stays in `src/fs/` is the app's part: dispatch (`mod.rs`), copy / replace / patch, export selection, Mac-archive import, `archive_fs`, `optical_fs`, `qnx2` (an adapter over `qnx2fs`), and the modules still held back (`ofs*`, `sun2tape*`, `tar_*`; see §11a of the plan). The per-module notes below keep their old file names.
+**Where the code lives (crate split, `docs/crate_split_plan.md`):** the drivers have moved into family crates under `crates/` (`fs-8bit`, `fs-adfs`, `fs-amiga`, `fs-apfs`, `fs-apple2`, `fs-cpm`, `fs-hpfs`, `fs-mac` / `fs-mac-unicode`, `fs-pc`, `fs-qnx`, `fs-squashfs`, `fs-unix`, `fs-xerox`, `fs-xfs`), and the trait, `FileEntry` and the shared helpers into `crates/disk-core`. The app imports drivers by crate path (`fs_unix::ufs::UfsFilesystem`); `mod.rs` imports the ones its dispatch names, and app-side tests of moved code are in `moved_tests.rs`. What stays in `src/fs/` is the app's part: dispatch (`mod.rs`), copy / replace / patch, export selection, Mac-archive import, `archive_fs`, `optical_fs`, `qnx2` (an adapter over `qnx2fs`) and `dir_import`. The per-module notes below keep their old file names.
 
 ## Architecture
 
@@ -51,7 +51,7 @@ by reading the OEM ID magic (`"NTFS    "` vs `"EXFAT   "`) rather than the byte.
 
 ## How to Add a New Filesystem
 
-1. Create the module in its family crate, e.g. `crates/fs-unix/src/myfs.rs`, behind a new Cargo feature (a new family gets a new crate; copy an existing one's `Cargo.toml`, `LICENSE` and `rust173-polyfill` forward, and wire it into the four manifests and `publish-crates.yml`). Program against `disk_core::filesystem` / `disk_core::entry`; never reach into the app. Add a shim `src/fs/myfs.rs` (`pub use fs_unix::myfs::*;`) while the other shims exist. Implement the `Filesystem` trait:
+1. Create the module in its family crate, e.g. `crates/fs-unix/src/myfs.rs`, behind a new Cargo feature (a new family gets a new crate; copy an existing one's `Cargo.toml`, `LICENSE` and `rust173-polyfill` forward, and wire it into the four manifests and `publish-crates.yml`). Program against `disk_core::filesystem` / `disk_core::entry`; never reach into the app. Implement the `Filesystem` trait:
    - `root()` — return the root directory entry
    - `list_directory()` — list entries in a directory
    - `read_file()` — read file contents (up to `max_bytes`)
@@ -67,7 +67,7 @@ by reading the OEM ID magic (`"NTFS    "` vs `"EXFAT   "`) rather than the byte.
    - Add matching in `compact_partition_reader()` if compaction is supported
    - Add matching in `effective_partition_size()` if trimming is supported
 
-5. Add `pub mod myfs;` (the shim) to `fs/mod.rs`, and run `scripts/test-crates-msrv.sh <crate>` for the Rust 1.73 floor.
+5. Import it in `fs/mod.rs` (`use fs_unix::myfs;`) for the dispatch, and run `scripts/test-crates-msrv.sh <crate>` for the Rust 1.73 floor.
 
 6. If the filesystem is editable, override `validate_name()` with the exact rules
    `create_file` / `create_directory` / `rename` enforce (length, charset,

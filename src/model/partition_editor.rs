@@ -452,7 +452,7 @@ impl PartitionEditor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::partition::mbr::Mbr;
+    use part_tables::mbr::Mbr;
 
     const MIB: u64 = 1024 * 1024;
 

@@ -39,8 +39,8 @@ use crate::optical::{
     convert::{bincue_to_iso, iso_to_bincue, ConvertProgress},
     rip::{run_rip, OpticalTarget, RipConfig, RipFormat, RipProgress},
 };
-use crate::partition::format_size;
 use crate::rbformats::chd_options::{ChdOptions, ChdProfile};
+use disk_core::display::format_size;
 
 #[derive(Debug, Subcommand)]
 pub enum OpticalCommand {
@@ -1460,7 +1460,7 @@ fn optical_data_and_cue_sizes(
     (data_size, cue_size)
 }
 
-fn probe_apm(path: &Path) -> Option<crate::partition::apm::Apm> {
+fn probe_apm(path: &Path) -> Option<part_tables::apm::Apm> {
     let f = std::fs::File::open(path).ok()?;
     let mut r = std::io::BufReader::new(f);
     match crate::partition::PartitionTable::detect(&mut r) {
@@ -1716,9 +1716,9 @@ pub enum CliResourceForkMode {
     Macbinary,
 }
 
-impl From<CliResourceForkMode> for crate::fs::resource_fork::ResourceForkMode {
+impl From<CliResourceForkMode> for fs_mac::resource_fork::ResourceForkMode {
     fn from(m: CliResourceForkMode) -> Self {
-        use crate::fs::resource_fork::ResourceForkMode as M;
+        use fs_mac::resource_fork::ResourceForkMode as M;
         match m {
             CliResourceForkMode::DataOnly => M::DataForkOnly,
             CliResourceForkMode::Native => M::Native,
@@ -1958,7 +1958,7 @@ fn dest_is_case_insensitive(dir: &Path) -> bool {
 
 /// Mutable state threaded through the recursive extraction.
 struct ExtractCtx {
-    fork_mode: crate::fs::resource_fork::ResourceForkMode,
+    fork_mode: fs_mac::resource_fork::ResourceForkMode,
     collision: CaseCollisionMode,
     case_insensitive_dest: bool,
     /// Descend into subdirectories. Always true for a whole-disc extract;
@@ -2042,7 +2042,7 @@ fn extract_one(
     ctx: &mut ExtractCtx,
     used: &mut std::collections::HashSet<String>,
 ) -> Result<()> {
-    use crate::fs::resource_fork::{self, ResourceForkMode as M};
+    use fs_mac::resource_fork::{self, ResourceForkMode as M};
     use opticaldiscs::browse::entry::EntryType;
     use std::io::{BufWriter, Write};
 
@@ -2232,7 +2232,7 @@ fn extract_to_tar(
     } else if name.ends_with(".tar.zst") || name.ends_with(".tzst") {
         // Through the backend shim, not the `zstd` crate: the MiSTer armv7 build
         // has `optical` on and `native-zstd` off (it uses `pure-zstd`), so naming
-        // the C crate here fails to compile there. `fs::tar_export` does the same
+        // the C crate here fails to compile there. `fs_tar::tar_export` does the same
         // job the same way.
         let enc = crate::rbformats::zstd_compat::ZstdEncoder::new(file, 0)
             .context("init zstd encoder")?;

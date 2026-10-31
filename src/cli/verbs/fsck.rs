@@ -27,9 +27,9 @@ use crate::cli::output::{emit_envelope, require_non_flat, Envelope, OutputFormat
 use crate::cli::resolve::{
     resolve_partition_rw_forced, resolve_partition_streaming_forced, FsDispatchOverride,
 };
-use crate::fs::alto::{self, bfs::BfsFilesystem, FsFamily};
-use crate::fs::filesystem::{EditableFilesystem, Filesystem};
-use crate::fs::fsck::{FsckResult, RepairReport};
+use disk_core::filesystem::{EditableFilesystem, Filesystem};
+use disk_core::fsck::{FsckResult, RepairReport};
+use fs_xerox::alto::{self, bfs::BfsFilesystem, FsFamily};
 
 #[derive(Debug, Args)]
 pub struct FsckArgs {
@@ -443,7 +443,7 @@ fn alto_repair(
 mod tests {
     use super::*;
     use crate::cli::output::Envelope;
-    use crate::fs::fsck::{FsckIssue, FsckResult, FsckStats, OrphanedEntry};
+    use disk_core::fsck::{FsckIssue, FsckResult, FsckStats, OrphanedEntry};
 
     fn sample_result() -> FsckResult {
         FsckResult {

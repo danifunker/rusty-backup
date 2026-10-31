@@ -249,7 +249,7 @@ mod tests {
 
     #[test]
     fn sun_qic_tape_extension_present() {
-        // A `.qic` tape opens in Inspect and Commander as a filesystem (`fs::sun2tape`).
+        // A `.qic` tape opens in Inspect and Commander as a filesystem (`dsk_tape::sun2tape`).
         assert!(DISK_IMAGE_EXTS.contains(&"qic"));
         assert!(association_exts().contains(&"qic".to_string()));
     }

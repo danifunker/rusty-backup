@@ -248,7 +248,7 @@ fn members_size(members: &[PathBuf], compression_type: &str) -> Result<u64> {
             f.seek(SeekFrom::End(-512))?;
             let mut footer_buf = [0u8; 8];
             f.read_exact(&mut footer_buf)?;
-            if &footer_buf == vhd::VHD_COOKIE {
+            if &footer_buf == dsk_vm::vhd::VHD_COOKIE {
                 return Ok(total - 512);
             }
         }

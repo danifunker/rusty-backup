@@ -4,7 +4,7 @@
 //! reversed, so an image captured through one comes out byte-swapped within
 //! every word — every structure and every byte of file data alike. The SGI
 //! IRIS 2000 / 3000 disks this was written for are the motivating case (see
-//! [`crate::partition::sgi_dklabel`]), but nothing here is SGI-specific: the
+//! [`part_tables::sgi_dklabel`]), but nothing here is SGI-specific: the
 //! transform is a pure `swab16` over the whole file.
 //!
 //! The operation is an **involution** — applying it twice returns the original
@@ -14,7 +14,7 @@
 //! A trailing odd byte (an image whose length is not a multiple of two) has no
 //! word to pair with and is copied through untouched.
 //!
-//! The in-memory primitive lives in [`crate::partition::sgi_dklabel`], which
+//! The in-memory primitive lives in [`part_tables::sgi_dklabel`], which
 //! needs it to fix up individual blocks on read; this module is the streaming
 //! file-level wrapper so a large image never lands in RAM at once.
 
@@ -22,7 +22,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use crate::partition::sgi_dklabel::swab16_in_place;
+use part_tables::sgi_dklabel::swab16_in_place;
 
 /// I/O chunk size. Even, so a 16-bit word can never straddle two chunks.
 const CHUNK: usize = 1024 * 1024;

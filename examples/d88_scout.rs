@@ -2,9 +2,9 @@
 
 use std::io::{Cursor, Read};
 
-use rusty_backup::fs::filesystem::Filesystem;
-use rusty_backup::fs::human68k::Human68kFilesystem;
-use rusty_backup::rbformats::containers::d88;
+use disk_core::filesystem::Filesystem;
+use dsk_floppy::d88;
+use fs_pc::human68k::Human68kFilesystem;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();

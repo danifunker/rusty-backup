@@ -1,5 +1,5 @@
-use rusty_backup::fs::filesystem::Filesystem;
-use rusty_backup::fs::hfs::HfsFilesystem;
+use disk_core::filesystem::Filesystem;
+use fs_mac::hfs::HfsFilesystem;
 use std::fs::File;
 
 fn read_system_rsrc(path: &str, part_off: u64) -> Vec<u8> {

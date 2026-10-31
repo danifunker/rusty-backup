@@ -3,7 +3,7 @@
 //! The CLI's read-only verbs (`ls`, `rm`, `get` in a later phase) accept
 //! glob patterns. We rely on the `globset` crate for the heavy lifting
 //! (`*`, `?`, `[abc]`, `**`, `\` escape) and add a thin helper around
-//! it that walks an FS through the [`crate::fs::filesystem::Filesystem`]
+//! it that walks an FS through the [`disk_core::filesystem::Filesystem`]
 //! trait, accumulating entries whose `/`-joined paths match the pattern.
 //!
 //! Brace expansion (`{a,b,c}`) is implemented by pre-expanding into a
@@ -27,8 +27,8 @@
 use anyhow::{anyhow, Result};
 use globset::{Glob, GlobBuilder, GlobMatcher};
 
-use crate::fs::entry::FileEntry;
-use crate::fs::filesystem::Filesystem;
+use disk_core::entry::FileEntry;
+use disk_core::filesystem::Filesystem;
 
 /// One compiled pattern. Matched against `/`-joined entry paths.
 pub struct Pattern {

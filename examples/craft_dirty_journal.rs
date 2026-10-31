@@ -10,7 +10,7 @@ use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom};
 
 use byteorder::{BigEndian, ByteOrder};
-use rusty_backup::fs::hfsplus_journal::{JournalHeader, JournalInfoBlock, TransactionBuilder};
+use fs_mac::hfsplus_journal::{JournalHeader, JournalInfoBlock, TransactionBuilder};
 
 fn main() {
     let mut args = std::env::args().skip(1);

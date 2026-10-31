@@ -10,7 +10,7 @@
 //! human-readable result string by mutable reference — so any caller that
 //! owns an `EditQueue` can host them.
 
-use rusty_backup::fs::entry::FileEntry;
+use disk_core::entry::FileEntry;
 use rusty_backup::model::edit_queue::{EditQueue, StagedEdit};
 
 /// Inline editor state for an HFS/HFS+ file's type and creator codes.
@@ -49,7 +49,7 @@ pub fn render_hfs_type_row(
     let (cur_t, cur_c) = queue.resolved_hfs_type_creator(entry);
     let cur_t_str = String::from_utf8_lossy(&cur_t).to_string();
     let cur_c_str = String::from_utf8_lossy(&cur_c).to_string();
-    let cur_desc = rusty_backup::fs::hfs_common::describe_type_creator(&cur_t, &cur_c);
+    let cur_desc = fs_mac::hfs_common::describe_type_creator(&cur_t, &cur_c);
 
     if !edit_mode {
         ui.horizontal(|ui| {
@@ -128,7 +128,7 @@ pub fn render_hfs_type_row(
                         }
                         ui.separator();
                     }
-                    for e in rusty_backup::fs::hfs_common::known_type_creators() {
+                    for e in fs_mac::hfs_common::known_type_creators() {
                         let label =
                             format!("{}/{} - {}", e.type_str(), e.creator_str(), e.description);
                         if ui.selectable_label(false, label).clicked() {
@@ -142,8 +142,8 @@ pub fn render_hfs_type_row(
             }
 
             // Encode current text into 4-byte arrays (space-padded).
-            let typed_t = rusty_backup::fs::hfs_common::encode_fourcc(&state.type_input);
-            let typed_c = rusty_backup::fs::hfs_common::encode_fourcc(&state.creator_input);
+            let typed_t = fs_mac::hfs_common::encode_fourcc(&state.type_input);
+            let typed_c = fs_mac::hfs_common::encode_fourcc(&state.creator_input);
             let changed = typed_t != cur_t || typed_c != cur_c;
 
             if ui
@@ -245,7 +245,7 @@ pub fn render_prodos_type_row(
     editor: &mut Option<ProdosTypeEditorState>,
     result: &mut Option<String>,
 ) {
-    use rusty_backup::fs::prodos_types as pt;
+    use fs_apple2::prodos_types as pt;
 
     let (cur_t, cur_a) = resolved_prodos_type(queue, entry);
     let cur_known = pt::is_known_type(cur_t);
@@ -392,7 +392,7 @@ pub fn render_hfs_dates_row(
     editor: &mut Option<HfsDatesEditorState>,
     result: &mut Option<String>,
 ) {
-    use rusty_backup::fs::hfs_common::{format_mac_date, parse_mac_date_checked};
+    use fs_mac::hfs_common::{format_mac_date, parse_mac_date_checked};
 
     // Effective current dates: a staged edit wins over the on-disk values.
     let (cur_c, cur_m, cur_b) = queue
@@ -601,7 +601,7 @@ pub fn render_owner_row(
     ui: &mut egui::Ui,
     entry: &FileEntry,
     edit_mode: bool,
-    id_names: Option<&rusty_backup::fs::id_names::IdNameMap>,
+    id_names: Option<&disk_core::id_names::IdNameMap>,
     queue: &mut EditQueue,
     editor: &mut Option<OwnerEditorState>,
     result: &mut Option<String>,
@@ -707,12 +707,12 @@ pub fn render_xattr_section(
     ui: &mut egui::Ui,
     entry: &FileEntry,
     edit_mode: bool,
-    xattrs: &[rusty_backup::fs::xattr::Xattr],
+    xattrs: &[disk_core::xattr::Xattr],
     queue: &mut EditQueue,
     editor: &mut Option<XattrEditorState>,
     result: &mut Option<String>,
 ) {
-    use rusty_backup::fs::xattr::{self, Xattr};
+    use disk_core::xattr::{self, Xattr};
 
     // Overlay: start from on-disk, apply pending sets/removes.
     let pending = queue.pending_xattrs_for(&entry.path);

@@ -2,7 +2,7 @@
 //! (what the pane's `load_archive` calls) decodes an archive into a browsable,
 //! read-only `Filesystem` carrying both forks + type/creator.
 
-use rusty_backup::fs::binhex::{build_binhex, BinHexFile};
+use fs_mac::binhex::{build_binhex, BinHexFile};
 use rusty_backup::model::commander_descend::open_archive;
 
 #[test]

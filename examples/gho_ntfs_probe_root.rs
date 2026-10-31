@@ -5,7 +5,7 @@
 // Usage:
 //   cargo run --release --example gho_ntfs_probe_root -- PATH.GHO [REC ...]
 
-use rusty_backup::rbformats::gho::GhoReader;
+use dsk_ghost::gho::GhoReader;
 use std::io::{Read, Seek, SeekFrom};
 
 fn rd_u16(b: &[u8], o: usize) -> u16 {

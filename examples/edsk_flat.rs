@@ -1,7 +1,7 @@
 //! Decode an EDSK file to flat sectors and write to a `.flat` sidecar.
 //! Used to cross-check our EDSK decoder vs cpmtools' libdsk view.
 
-use rusty_backup::rbformats::containers::edsk::decode_edsk_bytes;
+use dsk_floppy::edsk::decode_edsk_bytes;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();

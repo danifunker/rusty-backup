@@ -9,12 +9,12 @@ use opticaldiscs::browse::{open_disc_filesystem, open_hybrid_filesystem};
 use opticaldiscs::detect::DiscImageInfo;
 use opticaldiscs::formats::FilesystemType;
 
-use crate::fs::resource_fork::{self, ResourceForkMode};
 use crate::optical::boot_area::{self, BootArea};
+use fs_mac::resource_fork::{self, ResourceForkMode};
 
 /// Display order for a disc listing: directories first, then files, each
 /// case-insensitive by name. `opticaldiscs` has its own `FileEntry`, so this
-/// mirrors `fs::entry::sort_for_display` rather than sharing it.
+/// mirrors `disk_core::entry::sort_for_display` rather than sharing it.
 fn sort_for_display(entries: &mut [FileEntry]) {
     entries.sort_by_cached_key(|e| (!e.is_directory(), e.name.to_lowercase()));
 }
@@ -656,7 +656,7 @@ impl OpticalDiscBrowseView {
             return;
         }
         let fork_mode = self.resource_fork_mode;
-        let rb_entries: Vec<crate::fs::entry::FileEntry> = entries
+        let rb_entries: Vec<disk_core::entry::FileEntry> = entries
             .iter()
             .map(crate::fs::optical_fs::translate)
             .collect();

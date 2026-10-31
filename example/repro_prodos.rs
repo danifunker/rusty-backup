@@ -1,5 +1,5 @@
-use rusty_backup::fs::filesystem::Filesystem;
-use rusty_backup::fs::prodos::ProDosFilesystem;
+use disk_core::filesystem::Filesystem;
+use fs_apple2::prodos::ProDosFilesystem;
 use rusty_backup::partition::PartitionTable;
 use std::fs::File;
 

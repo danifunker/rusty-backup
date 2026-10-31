@@ -9,15 +9,15 @@
 //! Read-only: pick an archive, see its entries, extract all to a folder
 //! in a chosen fork-preserving container (BinHex / MacBinary /
 //! AppleDouble / raw). All decode + the loose-HQX synthesis live in
-//! `rusty_backup::macarchive::extract`; this tab is just the egui
+//! `arc_mac::extract`; this tab is just the egui
 //! surface around it.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use rusty_backup::macarchive::detect::{detect_mountable_image, MountableImageKind};
-use rusty_backup::macarchive::extract::{self, ExtractStats, ForkFormat};
-use rusty_backup::macarchive::stuffit::{self, StuffItArchive};
+use arc_mac::detect::{detect_mountable_image, MountableImageKind};
+use arc_mac::extract::{self, ExtractStats, ForkFormat};
+use arc_mac::stuffit::{self, StuffItArchive};
 
 use super::progress::LogPanel;
 
@@ -391,8 +391,8 @@ impl ArchivesTab {
                                     }
                                 }
                                 ui.label(e.display_path());
-                                let tc = rusty_backup::fs::hfs::format_ostype(&e.type_code);
-                                let cc = rusty_backup::fs::hfs::format_ostype(&e.creator_code);
+                                let tc = fs_mac::hfs::format_ostype(&e.type_code);
+                                let cc = fs_mac::hfs::format_ostype(&e.creator_code);
                                 ui.label(format!("{tc} / {cc}"));
                                 let (size, method) = e
                                     .data

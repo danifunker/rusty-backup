@@ -18,8 +18,8 @@ use clap::Args;
 use crate::cli::img_at::ImageRef;
 use crate::cli::logging::log_stderr;
 use crate::cli::resolve::{resolve_partition_rw_forced, FsDispatchOverride};
-use crate::fs::filesystem::CreateFileOptions;
 use crate::model::text_edit::{decode_for_edit, encode_after_edit, TextEditError, TextEncoding};
+use disk_core::filesystem::CreateFileOptions;
 
 #[derive(Debug, Args)]
 pub struct EditArgs {

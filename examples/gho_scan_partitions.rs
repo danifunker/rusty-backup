@@ -1,7 +1,7 @@
 //! Scan a directory tree of GHO/GHS files and print image_type +
 //! partition_count for each PRIMARY file (skip .GHS spans).
 
-use rusty_backup::rbformats::gho::{
+use dsk_ghost::gho::{
     discover_gho_span_set, parse_gho_image, GhoContainerHeader, GhoImageType, SpanReader,
 };
 use std::fs::File;
@@ -72,7 +72,7 @@ fn main() {
         };
         let (pc, spans) = match SpanReader::open(&span_set) {
             Ok(mut reader) => {
-                use rusty_backup::rbformats::gho::DataLen as _;
+                use dsk_ghost::gho::DataLen as _;
                 let total = reader.total_len();
                 match parse_gho_image(&mut reader, total, &header) {
                     Ok(img) => (img.partition_count, span_set.len()),

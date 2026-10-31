@@ -14,9 +14,9 @@ use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 
+use disk_core::display::format_size;
 use rusty_backup::model::dir_listing::{type_tag, DirListing, Row};
 use rusty_backup::model::remote_browser::{BrowseMode, BrowseTarget, RemoteBrowser};
-use rusty_backup::partition::format_size;
 use rusty_backup::remote::RemoteConnection;
 
 /// Folder rows — a blue distinct from plain files. A function, not a const,

@@ -23,7 +23,7 @@ use rusty_backup::model::disk_builder::{BuilderRow, DiskBuilder};
 use rusty_backup::model::partition_editor::PartitionEditor;
 use rusty_backup::partition::provision;
 use rusty_backup::partition::type_catalog;
-use rusty_backup::partition::{self, PartitionInfo, PartitionTable};
+use rusty_backup::partition::{PartitionInfo, PartitionTable};
 
 /// What the caller should do after a frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -303,7 +303,7 @@ fn show_edit_existing(
                             for gap in &gaps {
                                 let label = format!(
                                     "{} at LBA {}",
-                                    partition::format_size(gap.size_bytes),
+                                    disk_core::display::format_size(gap.size_bytes),
                                     gap.start_lba,
                                 );
                                 if ui
@@ -424,10 +424,10 @@ fn show_build_new(ui: &mut egui::Ui, builder: &mut DiskBuilder, allow_apply: boo
             });
             ui.horizontal(|ui| {
                 ui.label("Target size:");
-                ui.label(partition::format_size(builder.disk_size));
+                ui.label(disk_core::display::format_size(builder.disk_size));
                 ui.add_space(12.0);
                 ui.label("Alignment:");
-                let align_hint = partition::format_size(builder.align_bytes());
+                let align_hint = disk_core::display::format_size(builder.align_bytes());
                 ui.add(
                     egui::TextEdit::singleline(&mut builder.align_text)
                         .desired_width(80.0)
@@ -504,7 +504,7 @@ fn show_build_new(ui: &mut egui::Ui, builder: &mut DiskBuilder, allow_apply: boo
                         match planned.get(i) {
                             Some(p) => {
                                 ui.label(format!("{}", p.start_lba))
-                                    .on_hover_text(partition::format_size(p.size_bytes));
+                                    .on_hover_text(disk_core::display::format_size(p.size_bytes));
                             }
                             None => {
                                 ui.label(egui::RichText::new("-").weak());
@@ -620,7 +620,7 @@ fn source_cell(ui: &mut egui::Ui, row: &mut BuilderRow, index: usize) {
                 ui.label(format!(
                     "{} ({})",
                     name,
-                    partition::format_size(row.source_size),
+                    disk_core::display::format_size(row.source_size),
                 ))
                 .on_hover_text(path.display().to_string());
                 if ui.small_button("Clear").clicked() {
@@ -686,9 +686,9 @@ fn show_planned_layout_bar(ui: &mut egui::Ui, builder: &DiskBuilder) {
     let allocated: u64 = placed.iter().map(|p| p.size_bytes).sum();
     ui.label(format!(
         "Layout  (disk {}, {} allocated, {} free):",
-        partition::format_size(builder.disk_size),
-        partition::format_size(allocated),
-        partition::format_size(builder.disk_size.saturating_sub(allocated)),
+        disk_core::display::format_size(builder.disk_size),
+        disk_core::display::format_size(allocated),
+        disk_core::display::format_size(builder.disk_size.saturating_sub(allocated)),
     ));
     let available_width = ui.available_width().max(120.0);
     ui.scope(|ui| {
@@ -880,9 +880,9 @@ pub fn show_disk_layout_bars(
 
     ui.label(format!(
         "Current  (disk {}, {} allocated, {} free):",
-        partition::format_size(disk_size),
-        partition::format_size(allocated(&current)),
-        partition::format_size(current_free),
+        disk_core::display::format_size(disk_size),
+        disk_core::display::format_size(allocated(&current)),
+        disk_core::display::format_size(current_free),
     ));
     ui.scope(|ui| {
         ui.set_width(available_width);
@@ -897,8 +897,8 @@ pub fn show_disk_layout_bars(
     ui.add_space(4.0);
     ui.label(format!(
         "After  ({} allocated, {} free):",
-        partition::format_size(allocated(&after)),
-        partition::format_size(after_free),
+        disk_core::display::format_size(allocated(&after)),
+        disk_core::display::format_size(after_free),
     ));
     ui.scope(|ui| {
         ui.set_width(available_width);

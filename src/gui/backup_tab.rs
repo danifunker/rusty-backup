@@ -15,10 +15,10 @@ use rusty_backup::rbformats::chd_options::{
 use rusty_backup::update::UpdateConfig;
 
 use super::chd_options_ui::{ChdOptionsControl, ChdOptionsMode};
+use part_tables::PartitionSizeOverride;
 use rusty_backup::model::size_mode::SizeMode;
 use rusty_backup::model::status::VhdExportStatus;
-use rusty_backup::partition::PartitionSizeOverride;
-use rusty_backup::partition::{self, PartitionInfo, PartitionTable};
+use rusty_backup::partition::{PartitionInfo, PartitionTable};
 use rusty_backup::rbformats::vhd::export_whole_disk_vhd;
 
 use super::context::TabContext;
@@ -582,7 +582,7 @@ impl BackupTab {
                             // selection still keys on the slot in `part.index`.
                             ui.label(format!("{}", pos + 1));
                             ui.label(&part.type_name);
-                            ui.label(partition::format_size(part.size_bytes));
+                            ui.label(disk_core::display::format_size(part.size_bytes));
 
                             // Min-size cell: value (toggle-aware), spinner, "Calc min" button,
                             // or blank.
@@ -592,7 +592,7 @@ impl BackupTab {
                                 part.partition_type_string.as_deref(),
                             );
                             if let Some(min) = effective.filter(|&sz| sz < part.size_bytes) {
-                                ui.label(partition::format_size(min));
+                                ui.label(disk_core::display::format_size(min));
                             } else if let Some(pending) =
                                 self.pending_min_size_calcs.get(&part.index)
                             {
@@ -1509,7 +1509,7 @@ impl BackupTab {
                                 .unwrap_or_default();
                             ctx.log.info(format!(
                                 "Partition {idx}: minimum size {} (computed){suffix}{frag}",
-                                partition::format_size(min),
+                                disk_core::display::format_size(min),
                             ));
                             for cfg in &mut self.vhd_partition_configs {
                                 if cfg.index == idx {
@@ -1688,8 +1688,8 @@ impl BackupTab {
                                     .unwrap_or_default();
                                 ctx.log.info(format!(
                                     "Partition {idx}: minimum size {} (original {}){suffix}{frag}",
-                                    partition::format_size(min),
-                                    partition::format_size(size_bytes),
+                                    disk_core::display::format_size(min),
+                                    disk_core::display::format_size(size_bytes),
                                 ));
                             }
                         }
@@ -1872,8 +1872,8 @@ impl BackupTab {
                                             .unwrap_or_default();
                                         ctx.log.info(format!(
                                             "Partition {idx}: minimum size {} (original {}){suffix}{frag}",
-                                            partition::format_size(min),
-                                            partition::format_size(size_bytes),
+                                            disk_core::display::format_size(min),
+                                            disk_core::display::format_size(size_bytes),
                                         ));
                                     }
                                 }
@@ -2268,7 +2268,7 @@ impl BackupTab {
                                     let mut label = format!(
                                         "{} ({})",
                                         d.path,
-                                        rusty_backup::partition::format_size(d.size_bytes)
+                                        disk_core::display::format_size(d.size_bytes)
                                     );
                                     if !d.media.is_empty() {
                                         label.push_str(&format!(" - {}", d.media));

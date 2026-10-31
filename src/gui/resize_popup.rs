@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use rusty_backup::device::DiskDevice;
 use rusty_backup::model::status::ResizeStatus;
 use rusty_backup::partition::resize::{apply_resize, compute_resize_plan, detect_vhd};
-use rusty_backup::partition::{self, PartitionInfo, PartitionTable};
+use rusty_backup::partition::{PartitionInfo, PartitionTable};
 
 use super::progress::LogPanel;
 
@@ -291,8 +291,8 @@ impl ResizePopup {
         ui.add_space(4.0);
         ui.label(format!(
             "After  ({} -> {}):",
-            partition::format_size(current_total),
-            partition::format_size(after_total),
+            disk_core::display::format_size(current_total),
+            disk_core::display::format_size(after_total),
         ));
         let after_w = available_width * (after_total as f64 / max_total as f64) as f32;
         ui.scope(|ui| {
@@ -340,7 +340,7 @@ impl ResizePopup {
                     ui.label(
                         egui::RichText::new(format!(
                             "Disk size: {}",
-                            partition::format_size(self.disk_size_bytes)
+                            disk_core::display::format_size(self.disk_size_bytes)
                         ))
                         .weak(),
                     );
@@ -387,7 +387,7 @@ impl ResizePopup {
                                 );
                                 ui.colored_label(
                                     super::theme::muted(ui.visuals()),
-                                    partition::format_size(entry.original_size),
+                                    disk_core::display::format_size(entry.original_size),
                                 );
                                 ui.colored_label(super::theme::muted(ui.visuals()), "-");
                                 ui.colored_label(super::theme::muted(ui.visuals()), "-");
@@ -398,9 +398,9 @@ impl ResizePopup {
 
                             ui.label(format!("{}", entry.index));
                             ui.label(&entry.type_name);
-                            ui.label(partition::format_size(entry.original_size));
+                            ui.label(disk_core::display::format_size(entry.original_size));
                             ui.label(if entry.minimum_size > 0 {
-                                partition::format_size(entry.minimum_size)
+                                disk_core::display::format_size(entry.minimum_size)
                             } else {
                                 "-".to_string()
                             });
@@ -497,8 +497,8 @@ impl ResizePopup {
                             let suffix = self.resize_rate.suffix(s.current_bytes, s.total_bytes);
                             let text = format!(
                                 "Resizing: {} / {} ({:.0}%){}",
-                                partition::format_size(s.current_bytes),
-                                partition::format_size(s.total_bytes),
+                                disk_core::display::format_size(s.current_bytes),
+                                disk_core::display::format_size(s.total_bytes),
                                 fraction * 100.0,
                                 suffix,
                             );
@@ -575,8 +575,8 @@ impl ResizePopup {
                 self.plan_error = Some(format!(
                     "Partition {} new size ({}) is below minimum ({})",
                     entry.index,
-                    partition::format_size(new_bytes),
-                    partition::format_size(entry.minimum_size),
+                    disk_core::display::format_size(new_bytes),
+                    disk_core::display::format_size(entry.minimum_size),
                 ));
                 return;
             }
@@ -613,9 +613,9 @@ impl ResizePopup {
                         PreviewRow {
                             index: p.index,
                             old_start: format!("LBA {}", p.old_start_lba),
-                            old_size: partition::format_size(p.old_size_bytes),
+                            old_size: disk_core::display::format_size(p.old_size_bytes),
                             new_start: format!("LBA {}", p.new_start_lba),
-                            new_size: partition::format_size(p.new_size_bytes),
+                            new_size: disk_core::display::format_size(p.new_size_bytes),
                             action: action.to_string(),
                         }
                     })

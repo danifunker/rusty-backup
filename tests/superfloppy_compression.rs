@@ -101,16 +101,16 @@ fn round_trip(
 
 /// A FAT16 superfloppy: no partition table, one volume filling the image.
 fn fat_superfloppy(path: &std::path::Path) {
-    let blob = rusty_backup::fs::fat::create_blank_fat(16 * 1024 * 1024, Some("SFTEST")).unwrap();
+    let blob = fs_pc::fat::create_blank_fat(16 * 1024 * 1024, Some("SFTEST")).unwrap();
     std::fs::write(path, &blob).unwrap();
 
-    use rusty_backup::fs::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+    use disk_core::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open(path)
         .unwrap();
-    let mut fs = rusty_backup::fs::fat::FatFilesystem::open(file, 0).unwrap();
+    let mut fs = fs_pc::fat::FatFilesystem::open(file, 0).unwrap();
     let root = fs.root().unwrap();
     // Compressible but not all-zero, so a codec difference would show up.
     let payload: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
@@ -237,7 +237,7 @@ fn superfloppy_chd_is_one_whole_disk_container() {
 fn ntfs_superfloppy(path: &std::path::Path) -> Vec<u8> {
     let size = 20 * 1024 * 1024u64;
     let mut img = std::io::Cursor::new(vec![0u8; size as usize]);
-    rusty_backup::fs::ntfs_format::create_blank_ntfs(&mut img, size, 64, Some("NTFSSF")).unwrap();
+    fs_pc::ntfs_format::create_blank_ntfs(&mut img, size, 64, Some("NTFSSF")).unwrap();
     std::fs::write(path, img.get_ref()).unwrap();
     img.into_inner()
 }

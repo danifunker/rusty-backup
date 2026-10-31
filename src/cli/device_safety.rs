@@ -26,7 +26,7 @@ use std::path::Path;
 
 use crate::cli::logging::log_stderr;
 use crate::device::{enumerate_devices, DiskDevice};
-use crate::partition::format_size;
+use disk_core::display::format_size;
 
 /// True if `path` looks like a raw block-device path (per the OS
 /// conventions documented in `docs/cli-todo.md` §"Device-write safety").

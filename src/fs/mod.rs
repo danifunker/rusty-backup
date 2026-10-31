@@ -1,131 +1,78 @@
-pub mod adfs;
-pub mod affs;
-pub mod affs_common;
-pub mod affs_fsck;
-pub mod alto;
-pub mod andos;
-pub mod apfs;
-#[cfg(feature = "crypto")]
-pub mod apfs_crypto;
-pub mod apple_dos;
+use fs_8bit::andos;
+use fs_adfs::adfs;
+use fs_amiga::affs;
+use fs_apfs::apfs;
+use fs_apple2::apple_dos;
 pub mod archive_fs;
-pub mod atari_dos;
-pub mod attrs;
-pub mod bfs;
-pub mod bfs_write;
-pub mod binhex;
-pub mod btrfs;
+use fs_8bit::atari_dos;
+use fs_unix::bfs;
+use fs_unix::btrfs;
 pub mod carve;
-pub mod cbm;
+use fs_8bit::cbm;
 pub mod copy;
-pub mod cpm;
-pub mod cpm_diskdefs;
-pub mod dfs;
+use fs_8bit::dfs;
+use fs_cpm::cpm;
+use fs_cpm::cpm_diskdefs;
 pub mod dir_import;
-pub mod dragondos;
-pub mod efs;
-pub mod efs_fsck;
-pub mod efs_resize;
-pub mod efs_v1;
-pub mod efs_v1_fsck;
-pub mod efs_v1_resize;
+use fs_8bit::dragondos;
+use fs_unix::efs;
+use fs_unix::efs_resize;
+use fs_unix::efs_v1;
+use fs_unix::efs_v1_resize;
 pub mod entry;
-pub mod exfat;
-pub mod exfat_clone;
-pub mod exfat_fsck;
+use fs_pc::exfat;
 pub mod export_selection;
-pub mod ext;
-pub mod ext_csum;
-pub mod ext_format;
-pub mod ext_fsck;
-pub mod fat;
-pub mod fat_fsck;
-pub mod filesystem;
-pub mod fork_export;
-pub mod fsck;
-pub mod hfs;
+use disk_core::filesystem;
+use disk_core::fsck;
+use fs_mac::hfs;
+use fs_pc::fat;
+use fs_unix::ext;
 pub mod hfs_boot;
 pub mod hfs_clone;
-pub mod hfs_common;
+use fs_8bit::lif;
+use fs_hpfs::hpfs;
+use fs_mac::hfsplus;
+use fs_mac::hfsplus_wrapper_clone;
+use fs_mac::lisa;
+use fs_pc::human68k;
+use fs_unix::jfs;
+use fs_unix::jfs1;
 pub use hfsplus::resolve_apple_hfs;
-pub mod hfs_unicode;
-pub mod hfsplus;
-pub mod hfsplus_clone;
-pub mod hfsplus_defrag;
-pub mod hfsplus_journal;
-pub mod hfsplus_wrapper_clone;
-pub mod hfv;
-pub mod hpfs;
-pub mod human68k;
-pub mod human68k_clone;
-pub mod id_names;
-pub mod import_sink;
-pub mod jfs;
-pub mod jfs1;
-pub mod jfs_fsck;
-pub mod layout_preserving;
-pub mod lif;
-pub mod lisa;
-pub mod mac_alias;
 pub mod mac_archive_import;
 pub mod mac_scsi_bless;
 pub mod make_bootable;
-pub mod mem_archive;
-pub mod mfs;
-pub mod minix;
-pub mod minix_fsck;
-pub mod name_legalize;
-pub mod ntfs;
-pub mod ntfs_clone;
-pub mod ntfs_format;
-pub mod ntfs_fsck;
-pub mod ofs;
-pub mod ofs_write;
+use fs_mac::mfs;
+use fs_pc::ntfs;
+use fs_unix::minix;
+use fs_unix::ofs;
 #[cfg(feature = "optical")]
 pub mod optical_fs;
-pub mod oric;
-pub mod os9;
-pub mod patch;
-pub mod pfs3;
-pub mod pfs3_clone;
-pub mod pfs3_fsck;
-pub mod prodos;
+use fs_8bit::oric;
+use fs_8bit::os9;
+use fs_amiga::pfs3;
+use fs_apple2::prodos;
 pub mod prodos_types;
-pub mod qdos;
-pub mod qdos_mdv;
+use fs_8bit::qdos;
+use fs_8bit::qdos_mdv;
 pub mod qnx2;
-pub mod qnx4;
-pub mod qnx6;
-pub mod raw_name;
-pub mod reiserfs;
+use fs_qnx::qnx4;
+use fs_qnx::qnx6;
+use fs_unix::reiserfs;
 pub mod replace;
-pub mod resource_fork;
-pub mod rsdos;
-pub mod sfs;
-pub mod sfs_fsck;
-pub mod squashfs;
-pub mod squashfs_edit;
-pub mod squashfs_verify;
-pub mod squashfs_write;
-pub mod stream_pipe;
-pub mod sun2tape;
-pub mod sun2tape_edit;
-pub mod tar_export;
-pub mod tar_import;
-pub mod tar_section;
-pub mod ti99;
-pub mod times;
-pub mod trdos;
+use dsk_tape::sun2tape;
+use dsk_tape::sun2tape_edit;
+use fs_8bit::rsdos;
+use fs_8bit::ti99;
+use fs_8bit::trdos;
+use fs_amiga::sfs;
+use fs_squashfs::squashfs;
+use fs_squashfs::squashfs_edit;
 pub mod tree;
-pub mod ucsd;
-pub mod ufs;
-pub mod ufs_format;
-pub mod ufs_fsck;
-pub mod unix_common;
-pub mod vxfs;
-pub mod vxfs_edit;
-pub mod xattr;
-pub mod xfs;
+use fs_apple2::ucsd;
+use fs_unix::ufs;
+use fs_unix::vxfs;
+use fs_unix::vxfs_edit;
+use fs_xfs::xfs;
 pub mod zstd_stream;
 
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -1306,7 +1253,7 @@ pub fn fs_name_for(partition_type: u8, partition_type_string: Option<&str>) -> &
         return match s {
             "LIF" => "LIF",
             s if s.starts_with(crate::partition::LVM_UNAVAILABLE) => "unavailable",
-            s if s.starts_with(crate::partition::lvm::LVM_RUNS) => "LVM volume",
+            s if s.starts_with(part_tables::lvm::LVM_RUNS) => "LVM volume",
             "Apple_HFS" => "HFS",
             "Apple_HFSX" => "HFSX",
             // Apple HFS/HFS+ GPT partition GUID (UDIF DMG / hdiutil disks).
@@ -1433,7 +1380,7 @@ pub fn has_defragmenting_writer(partition_type: u8, partition_type_string: Optio
 ///   allocated clusters at the partition start, so the defragmented value
 ///   is what the backup actually emits — use it.
 /// - **HFS+/HFSX**: the defrag-clone pipeline
-///   ([`hfsplus_defrag::stream_defragmented_hfsplus`]) packs the volume at
+///   ([`fs_mac::hfsplus_defrag::stream_defragmented_hfsplus`]) packs the volume at
 ///   the smaller size during the backup write — use the defragmented value.
 /// - **Other layout-preserving filesystems** (HFS, ext, btrfs, ProDOS):
 ///   the backup pipeline does not yet relocate blocks, so anything below
@@ -2755,10 +2702,10 @@ fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
 ) -> Result<Box<dyn Filesystem>, FilesystemError> {
     match type_str {
         // An LV split into several runs: stitch them into one volume and detect by content.
-        s if s.starts_with(crate::partition::lvm::LVM_RUNS) => {
-            let runs = crate::partition::lvm::decode_runs(s)
+        s if s.starts_with(part_tables::lvm::LVM_RUNS) => {
+            let runs = part_tables::lvm::decode_runs(s)
                 .ok_or_else(|| FilesystemError::Parse(format!("bad LV run list '{s}'")))?;
-            let lv = crate::partition::lvm::ExtentReader::new(reader, runs);
+            let lv = part_tables::lvm::ExtentReader::new(reader, runs);
             let len = lv.len();
             // Boxed so the recursive open stays one type instead of nesting readers.
             let lv: Box<dyn crate::rbformats::ReadSeek> = Box::new(lv);
@@ -3589,8 +3536,8 @@ fn hfsplus_partition_len(
 /// Where a partition that opens with a NeXT disk label keeps its filesystem;
 /// `partition_offset` unchanged when there is none. See `src/partition/next.rs`.
 pub fn resolve_next_label(reader: &mut (impl Read + Seek), partition_offset: u64) -> u64 {
-    crate::partition::next::detect_at(reader, partition_offset)
-        .and_then(|l| crate::partition::next::embedded_fs_offset(&l, partition_offset))
+    part_tables::next::detect_at(reader, partition_offset)
+        .and_then(|l| part_tables::next::embedded_fs_offset(&l, partition_offset))
         .unwrap_or(partition_offset)
 }
 
@@ -3674,21 +3621,21 @@ pub fn probe_ntfs_signature<R: Read + Seek>(reader: &mut R, partition_offset: u6
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DefragCloneShape {
     /// Native (flat) HFS+/HFSX volume at the partition root. Use
-    /// [`hfsplus_defrag::stream_defragmented_hfsplus`].
+    /// [`fs_mac::hfsplus_defrag::stream_defragmented_hfsplus`].
     Flat,
     /// HFS wrapper with an embedded HFS+/HFSX inside (Mac OS 8/9 style).
     /// Use [`hfsplus_wrapper_clone::stream_wrapped_defragmented_hfsplus`].
     Wrapped,
     /// PFS3 volume (DosType `PFS\3`, `PDS\3`, `muFS`). Use
-    /// [`pfs3_clone::stream_defragmented_pfs3`]. Two-pass walk via the
+    /// [`fs_amiga::pfs3_clone::stream_defragmented_pfs3`]. Two-pass walk via the
     /// EditableFilesystem trait; tempfile-backed to bound RAM.
     Pfs3,
-    /// exFAT volume. Use [`exfat_clone::stream_defragmented_exfat`]. Tree-walk
+    /// exFAT volume. Use [`fs_pc::exfat_clone::stream_defragmented_exfat`]. Tree-walk
     /// replay via the EditableFilesystem trait into a freshly-formatted blank;
     /// tempfile-backed to bound RAM.
     Exfat,
-    /// NTFS volume. Use [`ntfs_clone::stream_defragmented_ntfs`]. Tree-walk
-    /// replay into a freshly-formatted blank (`ntfs_format::create_blank_ntfs`);
+    /// NTFS volume. Use [`fs_pc::ntfs_clone::stream_defragmented_ntfs`]. Tree-walk
+    /// replay into a freshly-formatted blank (`fs_pc::ntfs_format::create_blank_ntfs`);
     /// tempfile-backed.
     Ntfs,
 }
@@ -3856,7 +3803,7 @@ mod tests {
     #[test]
     fn an_efi_system_partition_opens_as_the_fat_it_holds() {
         const ESP: &str = "C12A7328-F81F-11D2-BA4B-00A0C93EC93B";
-        let img = crate::fs::fat::create_blank_fat(64 * 1024 * 1024, Some("ESP")).unwrap();
+        let img = fs_pc::fat::create_blank_fat(64 * 1024 * 1024, Some("ESP")).unwrap();
         let fs = open_filesystem_with_passphrase(Cursor::new(img), 0, 0, Some(ESP), None)
             .expect("an ESP must open as the FAT volume it is");
         assert!(
@@ -3871,7 +3818,7 @@ mod tests {
     #[test]
     fn an_efi_system_partition_is_editable() {
         const ESP: &str = "C12A7328-F81F-11D2-BA4B-00A0C93EC93B";
-        let img = crate::fs::fat::create_blank_fat(64 * 1024 * 1024, Some("ESP")).unwrap();
+        let img = fs_pc::fat::create_blank_fat(64 * 1024 * 1024, Some("ESP")).unwrap();
         let mut fs = open_editable_filesystem_with(
             Cursor::new(img),
             0,
@@ -3890,7 +3837,7 @@ mod tests {
     #[test]
     fn an_unknown_gpt_type_guid_falls_back_to_the_superblock() {
         const MS_BASIC_DATA: &str = "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7";
-        let img = crate::fs::fat::create_blank_fat(64 * 1024 * 1024, Some("DATA")).unwrap();
+        let img = fs_pc::fat::create_blank_fat(64 * 1024 * 1024, Some("DATA")).unwrap();
         let fs = open_filesystem_with_passphrase(Cursor::new(img), 0, 0, Some(MS_BASIC_DATA), None)
             .expect("an unknown GPT GUID must fall back to content detection");
         assert!(fs.fs_type().starts_with("FAT"));
@@ -3916,7 +3863,7 @@ mod tests {
     /// FAT32 rather than being misread as FAT16.
     #[test]
     fn fat32_opens_behind_every_partition_type_that_carries_it() {
-        let img = crate::fs::fat::create_blank_fat32(64 * 1024 * 1024, Some("DATA")).unwrap();
+        let img = fs_pc::fat::create_blank_fat32(64 * 1024 * 1024, Some("DATA")).unwrap();
         let probe = open_filesystem_with_passphrase(Cursor::new(img.clone()), 0, 0, None, None)
             .expect("the fixture itself must open");
         assert_eq!(probe.fs_type(), "FAT32", "fixture is not FAT32");
@@ -3979,7 +3926,7 @@ mod tests {
     /// browsable but not editable.
     #[test]
     fn fat32_is_editable_behind_the_same_partition_types() {
-        let img = crate::fs::fat::create_blank_fat32(64 * 1024 * 1024, Some("DATA")).unwrap();
+        let img = fs_pc::fat::create_blank_fat32(64 * 1024 * 1024, Some("DATA")).unwrap();
         for ty in [0x00u8, 0x07, 0x0C, 0x1B, 0x27, 0x83, 0xEF] {
             let mut fs = open_editable_filesystem_with(
                 Cursor::new(img.clone()),
@@ -4018,7 +3965,7 @@ mod tests {
     #[test]
     fn a_small_fat32_volume_can_be_formatted_and_reopened() {
         for mb in [33u64, 64, 100, 512] {
-            let img = crate::fs::fat::create_blank_fat32(mb * 1024 * 1024, Some("ESP")).unwrap();
+            let img = fs_pc::fat::create_blank_fat32(mb * 1024 * 1024, Some("ESP")).unwrap();
             let fs = open_filesystem_with_passphrase(Cursor::new(img), 0, 0, None, None)
                 .unwrap_or_else(|e| panic!("{mb} MiB forced FAT32 must reopen: {e}"));
             assert_eq!(
@@ -4029,7 +3976,7 @@ mod tests {
         }
         // Size-based selection is unchanged: the same capacity without the flag
         // still resolves by cluster count.
-        let img = crate::fs::fat::create_blank_fat(100 * 1024 * 1024, Some("DATA")).unwrap();
+        let img = fs_pc::fat::create_blank_fat(100 * 1024 * 1024, Some("DATA")).unwrap();
         let fs = open_filesystem_with_passphrase(Cursor::new(img), 0, 0, None, None).unwrap();
         assert_eq!(fs.fs_type(), "FAT16");
     }
@@ -4597,7 +4544,7 @@ mod gpt_guid_dispatch_tests {
     /// so a backup of an ESP or a Basic Data partition was stored unpacked.
     #[test]
     fn fat32_compacts_behind_every_label_that_carries_it() {
-        let img = crate::fs::fat::create_blank_fat32(64 * 1024 * 1024, Some("DATA")).unwrap();
+        let img = fs_pc::fat::create_blank_fat32(64 * 1024 * 1024, Some("DATA")).unwrap();
         for ty in [0x07u8, 0x11, 0x27, 0xEF] {
             try_compact_partition_reader(Cursor::new(img.clone()), 0, ty, None)
                 .unwrap_or_else(|e| panic!("MBR type 0x{ty:02X} must compact FAT32: {e}"));
@@ -4620,12 +4567,12 @@ mod gpt_guid_dispatch_tests {
 
     #[test]
     fn ext2_and_hfsplus_compact_behind_their_gpt_guids() {
-        let ext = crate::fs::ext_format::create_blank_ext2(32 * 1024 * 1024, "T").unwrap();
+        let ext = fs_unix::ext_format::create_blank_ext2(32 * 1024 * 1024, "T").unwrap();
         for guid in [LINUX_FS_GUID, LINUX_HOME_GUID] {
             try_compact_partition_reader(Cursor::new(ext.clone()), 0, 0, Some(guid))
                 .unwrap_or_else(|e| panic!("GPT {guid} must compact ext2: {e}"));
         }
-        let hfsp = crate::fs::hfsplus::create_blank_hfsplus(32 * 1024 * 1024, 4096, "T", false);
+        let hfsp = fs_mac::hfsplus::create_blank_hfsplus(32 * 1024 * 1024, 4096, "T", false);
         try_compact_partition_reader(Cursor::new(hfsp.clone()), 0, 0, Some(HFS_GUID))
             .unwrap_or_else(|e| panic!("GPT Apple HFS must compact HFS+: {e}"));
         // A bare (superfloppy) HFS+ volume is the same bytes under type byte 0.
@@ -4645,7 +4592,7 @@ mod adfs_density_tests {
     /// the partition list and then failed to open.
     #[test]
     fn quad_and_octal_density_disc_records_still_detect_as_adfs() {
-        let blank = crate::fs::adfs::create_blank_adfs("F");
+        let blank = fs_adfs::adfs::create_blank_adfs("F");
         assert_eq!(
             detect_filesystem_type(&mut Cursor::new(blank.clone()), 0),
             "adfs"
@@ -4686,13 +4633,13 @@ mod superfloppy_gate_tests {
     /// for a layout-preserving HFS or ext volume, which drops blocks.
     #[test]
     fn a_bare_volume_is_graded_like_the_same_filesystem_in_a_table() {
-        let hfs = crate::fs::hfs::create_blank_hfs(8 * 1024 * 1024, 4096, "Bare").unwrap();
+        let hfs = fs_mac::hfs::create_blank_hfs(8 * 1024 * 1024, 4096, "Bare").unwrap();
         let part = superfloppy(hfs);
         assert_eq!(part.partition_type_byte, 0);
         assert_eq!(part.gate_type_byte(), 0xAF, "{}", part.type_name);
         assert!(is_layout_preserving_fs(part.gate_type_byte(), None));
 
-        let ext = crate::fs::ext_format::create_blank_ext2(16 * 1024 * 1024, "bare").unwrap();
+        let ext = fs_unix::ext_format::create_blank_ext2(16 * 1024 * 1024, "bare").unwrap();
         let part = superfloppy(ext);
         assert_eq!(part.gate_type_byte(), 0x83, "{}", part.type_name);
         assert_eq!(
@@ -4701,7 +4648,7 @@ mod superfloppy_gate_tests {
             "a bare ext volume must keep the in-place trim"
         );
 
-        let fat = crate::fs::fat::create_blank_fat32(64 * 1024 * 1024, Some("BARE")).unwrap();
+        let fat = fs_pc::fat::create_blank_fat32(64 * 1024 * 1024, Some("BARE")).unwrap();
         let part = superfloppy(fat);
         assert_eq!(part.gate_type_byte(), 0x0C, "{}", part.type_name);
         assert!(!is_layout_preserving_fs(part.gate_type_byte(), None));
@@ -4712,7 +4659,7 @@ mod superfloppy_gate_tests {
     #[test]
     fn gate_type_byte_leaves_string_routed_and_table_entries_alone() {
         let mut amiga =
-            superfloppy(crate::fs::fat::create_blank_fat32(64 * 1024 * 1024, None).unwrap());
+            superfloppy(fs_pc::fat::create_blank_fat32(64 * 1024 * 1024, None).unwrap());
         amiga.partition_type_string = Some("DOS\\1".to_string());
         amiga.type_name = "HFS".to_string();
         assert_eq!(amiga.gate_type_byte(), 0);
@@ -4758,7 +4705,7 @@ mod probe_order_tests {
     /// bytes at +0x38 is still HFS, because the rest of the superblock is not.
     #[test]
     fn a_real_hfs_volume_is_not_mistaken_for_ext() {
-        let mut img = crate::fs::hfs::create_blank_hfs(8 * 1024 * 1024, 4096, "Vol").unwrap();
+        let mut img = fs_mac::hfs::create_blank_hfs(8 * 1024 * 1024, 4096, "Vol").unwrap();
         img[1024 + 36] = 27;
         img[1024 + 0x38] = 0x53;
         img[1024 + 0x39] = 0xEF;
@@ -4767,19 +4714,17 @@ mod probe_order_tests {
 
     #[test]
     fn genuine_volumes_still_detect_after_the_reorder() {
-        let hfsp = crate::fs::hfsplus::create_blank_hfsplus(8 * 1024 * 1024, 4096, "P", false);
+        let hfsp = fs_mac::hfsplus::create_blank_hfsplus(8 * 1024 * 1024, 4096, "P", false);
         assert_eq!(detect_filesystem_type(&mut Cursor::new(hfsp), 0), "hfsplus");
-        let hfsx = crate::fs::hfsplus::create_blank_hfsplus(8 * 1024 * 1024, 4096, "X", true);
+        let hfsx = fs_mac::hfsplus::create_blank_hfsplus(8 * 1024 * 1024, 4096, "X", true);
         assert_eq!(detect_filesystem_type(&mut Cursor::new(hfsx), 0), "hfsplus");
-        let ext = crate::fs::ext_format::create_blank_ext2(16 * 1024 * 1024, "e").unwrap();
+        let ext = fs_unix::ext_format::create_blank_ext2(16 * 1024 * 1024, "e").unwrap();
         assert_eq!(detect_filesystem_type(&mut Cursor::new(ext), 0), "ext");
         // A Minix superblock forging the HFS signature falls through to Minix
         // now that an MDB needs a real block size.
-        let mut minix = crate::fs::minix::create_blank_minix(
-            4 * 1024 * 1024,
-            crate::fs::minix::MinixVersion::V1,
-        )
-        .unwrap();
+        let mut minix =
+            fs_unix::minix::create_blank_minix(4 * 1024 * 1024, fs_unix::minix::MinixVersion::V1)
+                .unwrap();
         assert_eq!(
             detect_filesystem_type(&mut Cursor::new(minix.clone()), 0),
             "minix"
@@ -4800,7 +4745,7 @@ mod min_size_cancel_tests {
     /// the walk finished; the cancel probe stops it at the next phase.
     #[test]
     fn cancel_stops_the_minimum_size_walk_before_it_opens() {
-        let img = crate::fs::fat::create_blank_fat(8 * 1024 * 1024, Some("X")).unwrap();
+        let img = fs_pc::fat::create_blank_fat(8 * 1024 * 1024, Some("X")).unwrap();
         let phases = RefCell::new(Vec::new());
         let result = partition_minimum_size_cancellable(
             Cursor::new(img.clone()),
@@ -4856,9 +4801,9 @@ mod min_size_cancel_tests {
 #[cfg(test)]
 mod rhapsody_dispatch_tests {
     use super::*;
-    use crate::fs::ufs::UfsEndian;
-    use crate::fs::ufs_format::{create_blank_ufs1, Ufs1FormatParams};
-    use crate::partition::next::{build_label, NextLabelSpec, NextPartitionSpec, LABEL_BLOCKS};
+    use fs_unix::ufs::UfsEndian;
+    use fs_unix::ufs_format::{create_blank_ufs1, Ufs1FormatParams};
+    use part_tables::next::{build_label, NextLabelSpec, NextPartitionSpec, LABEL_BLOCKS};
     use std::io::Cursor;
 
     const SECTOR: u64 = 1024;
@@ -5023,3 +4968,6 @@ mod human68k_dispatch_tests {
         assert_ne!(detect_filesystem_type(&mut Cursor::new(pc), 0), "human68k");
     }
 }
+
+#[cfg(test)]
+mod moved_tests;

@@ -12,9 +12,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use crate::clonezilla::block_cache::PartcloneBlockCache;
-use crate::clonezilla::metadata_scan;
 use crate::model::status::BlockCacheScan;
+use dsk_clonezilla::block_cache::PartcloneBlockCache;
+use dsk_clonezilla::metadata_scan;
 
 /// Spawn a background scan that fills `cache`'s block metadata and persists it to
 /// `cache_path` (so the next open loads instantly). Returns a [`BlockCacheScan`]

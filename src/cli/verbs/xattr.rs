@@ -106,7 +106,7 @@ fn run_set(args: XattrSetArgs) -> Result<()> {
     // Parse the value before touching the image: a bad hex string should cost
     // nothing.
     let value = match (&args.value, &args.value_file) {
-        (Some(v), None) => crate::fs::xattr::parse_value(v)
+        (Some(v), None) => disk_core::xattr::parse_value(v)
             .map_err(|e| anyhow!("parsing value for {}: {e}", args.name))?,
         (None, Some(p)) => {
             std::fs::read(p).map_err(|e| anyhow!("reading value from {}: {e}", p.display()))?

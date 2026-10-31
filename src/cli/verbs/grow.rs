@@ -21,7 +21,7 @@ use crate::cli::parse::parse_size;
 use crate::model::chd_expand_runner;
 #[cfg(feature = "chd")]
 use crate::model::status::ChdExpandStatus;
-use crate::partition::format_size;
+use disk_core::display::format_size;
 
 #[derive(Debug, Args)]
 pub struct GrowArgs {

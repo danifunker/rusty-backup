@@ -26,9 +26,10 @@ use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 
-use rusty_backup::fs::entry::FileEntry;
+use disk_core::display::format_size;
+use disk_core::entry::FileEntry;
+use disk_core::filesystem::Filesystem;
 use rusty_backup::fs::export_selection::ExportFormat;
-use rusty_backup::fs::filesystem::Filesystem;
 use rusty_backup::fs::partition_is_browsable;
 use rusty_backup::fs::replace::OnConflict;
 use rusty_backup::model::browse_session::{BrowseOpenStatus, BrowseSession};
@@ -48,7 +49,7 @@ use rusty_backup::model::remote_browser::{BrowseMode, BrowseTarget, RemoteBrowse
 use rusty_backup::model::stage_names::{legalize_staged_names, LegalizeReport, NameChange};
 use rusty_backup::model::status::BlockCacheScan;
 use rusty_backup::model::wrapper_tree::{tree_range, TreeRow, WrapperTree};
-use rusty_backup::partition::{format_size, PartitionInfo};
+use rusty_backup::partition::PartitionInfo;
 use rusty_backup::update::RecentMode;
 
 use super::Side;
@@ -714,8 +715,8 @@ impl CommanderPane {
                     let suffix = self.open_rate.suffix(done, total);
                     let text = format!(
                         "{} / {} ({:.0}%){}",
-                        rusty_backup::partition::format_size(done),
-                        rusty_backup::partition::format_size(total),
+                        disk_core::display::format_size(done),
+                        disk_core::display::format_size(total),
                         frac * 100.0,
                         suffix,
                     );
@@ -1782,10 +1783,7 @@ impl CommanderPane {
     /// The on-disk extended attributes of `entry`, for the File Info window.
     /// Empty on a filesystem without xattr support (or when unreadable) — this
     /// is display metadata, never a hard failure.
-    pub(crate) fn detail_xattrs(
-        &mut self,
-        entry: &FileEntry,
-    ) -> Vec<rusty_backup::fs::xattr::Xattr> {
+    pub(crate) fn detail_xattrs(&mut self, entry: &FileEntry) -> Vec<disk_core::xattr::Xattr> {
         self.fs_mut()
             .filter(|fs| fs.supports_xattrs())
             .and_then(|fs| fs.list_xattrs(entry).ok())

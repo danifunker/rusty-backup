@@ -9,7 +9,7 @@
 // Reads ntfs_mapped_ranges() (only filled after prepare_full_image()) and
 // reports any adjacent ranges where end_a > start_b.
 
-use rusty_backup::rbformats::gho::GhoReader;
+use dsk_ghost::gho::GhoReader;
 
 fn main() -> anyhow::Result<()> {
     let path = std::env::args().nth(1).expect("path to GHO");

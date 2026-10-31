@@ -5,10 +5,10 @@
 //!
 //! Usage: cargo run --release --example survey_pfs3_links -- <image>
 
-use rusty_backup::fs::entry::FileEntry;
-use rusty_backup::fs::pfs3::Pfs3Filesystem;
+use disk_core::entry::FileEntry;
+use fs_amiga::pfs3::Pfs3Filesystem;
+use part_tables::rdb::Rdb;
 use rusty_backup::fs::{is_amiga_pfs3_type, Filesystem};
-use rusty_backup::partition::rdb::Rdb;
 use std::fs::File;
 use std::io::BufReader;
 

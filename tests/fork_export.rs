@@ -1,13 +1,14 @@
 //! Fork-preserving single-file export: MacBinary (.bin) and AppleDouble
 //! (`._name` sidecar) output from an HFS file carrying a resource fork. Guards
-//! `fs::fork_export::export_file_with_fork`, which Commander's copy/export-to-
+//! `fs_mac::fork_export::export_file_with_fork`, which Commander's copy/export-to-
 //! host now uses.
 
+use disk_core::filesystem::{CreateFileOptions, ResourceForkSource};
+use fs_mac::fork_export::export_file_with_fork;
+use fs_mac::hfs;
+use fs_mac::resource_fork::ResourceForkMode;
 use rusty_backup::cli::resolve::resolve_partition_ro;
-use rusty_backup::fs::filesystem::{CreateFileOptions, ResourceForkSource};
-use rusty_backup::fs::fork_export::export_file_with_fork;
-use rusty_backup::fs::resource_fork::ResourceForkMode;
-use rusty_backup::fs::{hfs, open_editable_filesystem, open_filesystem};
+use rusty_backup::fs::{open_editable_filesystem, open_filesystem};
 
 /// Build a bare classic-HFS image with one file that has both forks.
 fn make_hfs_with_fork(path: &std::path::Path, name: &str, data: &[u8], rsrc: &[u8]) {
@@ -56,7 +57,7 @@ fn export_macbinary_and_appledouble_preserve_the_resource_fork() {
     let out = tempfile::tempdir().unwrap();
 
     // MacBinary: one self-contained .bin holding both forks (rsrc verbatim).
-    let name = rusty_backup::fs::fork_export::safe_name(&forked);
+    let name = fs_mac::fork_export::safe_name(&forked);
     export_file_with_fork(
         fs.as_mut(),
         &forked,

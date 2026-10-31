@@ -10,7 +10,7 @@ use anyhow::Context;
 
 use rusty_backup::backup::metadata::BackupMetadata;
 // Partition-capability gates — shared across all UIs, defined in the engine.
-use rusty_backup::clonezilla::metadata::ClonezillaImage;
+use dsk_clonezilla::metadata::ClonezillaImage;
 use rusty_backup::fs::{
     is_checkable_fs_name, is_checkable_retro_fs, is_checkable_type, is_classic_hfs,
     is_superfloppy_hfs, partition_is_browsable,
@@ -669,7 +669,7 @@ impl InspectTab {
         if let Some(report) = self
             .image_file_path
             .as_deref()
-            .and_then(rusty_backup::rbformats::flux::recorded_faults)
+            .and_then(dsk_flux::flux::recorded_faults)
         {
             ui.add_space(2.0);
             ui.label(
@@ -897,7 +897,7 @@ impl InspectTab {
                 .on_hover_text(match biggest_gap {
                     Some(gap) if gap.size_bytes >= 1024 * 1024 => format!(
                         "Add a new partition into the {} gap at LBA {}",
-                        partition::format_size(gap.size_bytes),
+                        disk_core::display::format_size(gap.size_bytes),
                         gap.start_lba,
                     ),
                     _ => "No free space available".to_string(),
@@ -1028,8 +1028,8 @@ impl InspectTab {
                     let suffix = self.export_rate.suffix(s.current_bytes, s.total_bytes);
                     let text = format!(
                         "Exporting: {} / {} ({:.0}%){}",
-                        partition::format_size(s.current_bytes),
-                        partition::format_size(s.total_bytes),
+                        disk_core::display::format_size(s.current_bytes),
+                        disk_core::display::format_size(s.total_bytes),
                         fraction * 100.0,
                         suffix,
                     );
@@ -1147,8 +1147,8 @@ impl InspectTab {
                     let text = format!(
                         "Building seekable zstd index for partition {}: {} / {} ({:.0}%){}",
                         s.partition_index,
-                        partition::format_size(s.current_bytes),
-                        partition::format_size(s.total_bytes),
+                        disk_core::display::format_size(s.current_bytes),
+                        disk_core::display::format_size(s.total_bytes),
                         fraction * 100.0,
                         suffix,
                     );
@@ -1268,7 +1268,7 @@ impl InspectTab {
             .show(ui.ctx(), |ui| {
                 ui.label(format!(
                     "Current size: {}",
-                    partition::format_size(current_size),
+                    disk_core::display::format_size(current_size),
                 ));
                 ui.add_space(4.0);
 
@@ -1283,7 +1283,10 @@ impl InspectTab {
 
                 let add_bytes = (self.expand_image_add_mib as u64) * 1024 * 1024;
                 let new_size = current_size.saturating_add(add_bytes);
-                ui.label(format!("New size: {}", partition::format_size(new_size),));
+                ui.label(format!(
+                    "New size: {}",
+                    disk_core::display::format_size(new_size),
+                ));
 
                 ui.add_space(6.0);
                 ui.label(
@@ -1331,7 +1334,7 @@ impl InspectTab {
             ctx.log.info(format!(
                 "Expanding image '{}' by {}...",
                 path.display(),
-                partition::format_size(add_bytes),
+                disk_core::display::format_size(add_bytes),
             ));
             if is_chd {
                 // Route through the background re-encode worker. Status is
@@ -1352,7 +1355,7 @@ impl InspectTab {
                     Ok(new_total) => {
                         ctx.log.info(format!(
                             "Image expanded to {}. Click Re-inspect to refresh.",
-                            partition::format_size(new_total),
+                            disk_core::display::format_size(new_total),
                         ));
                         self.cached_disk_size = None;
                     }
@@ -3088,7 +3091,7 @@ impl InspectTab {
 
                 // Surface GHO metadata (description, compression, etc.)
                 if matches!(ext.as_deref(), Some("gho") | Some("ghs")) {
-                    if let Ok(info) = rusty_backup::rbformats::gho::format_gho_info(&path) {
+                    if let Ok(info) = dsk_ghost::gho::format_gho_info(&path) {
                         for line in info.lines() {
                             if !line.is_empty() {
                                 push_log(line.to_string());
@@ -3246,7 +3249,7 @@ impl InspectTab {
                             // for the helper — it bails on non-HFS+ signatures.
                             let label = if variant_tag.is_some() {
                                 make_probe_reader().and_then(|mut br| {
-                                    rusty_backup::fs::hfsplus::probe_hfsplus_volume_label(
+                                    fs_mac::hfsplus::probe_hfsplus_volume_label(
                                         &mut br,
                                         part_offset,
                                     )
@@ -3329,12 +3332,12 @@ impl InspectTab {
                                 Some("FAT") if is_linux_mbr => {
                                     let part_offset = part.byte_offset();
                                     let subtype = make_probe_reader().and_then(|br2| {
-                                        rusty_backup::fs::fat::FatFilesystem::open(br2, part_offset)
-                                            .ok()
-                                            .map(|fs| {
+                                        fs_pc::fat::FatFilesystem::open(br2, part_offset).ok().map(
+                                            |fs| {
                                                 use rusty_backup::fs::Filesystem;
                                                 fs.fs_type().to_string()
-                                            })
+                                            },
+                                        )
                                     });
                                     part.type_name = match subtype {
                                         Some(t) => format!("{t} (MSX)"),
@@ -3443,7 +3446,7 @@ impl InspectTab {
 
                         let label_opt: Option<String> = if is_fat_byte || is_fat_superfloppy {
                             make_probe_reader().and_then(|br| {
-                                rusty_backup::fs::fat::FatFilesystem::open(br, part.byte_offset())
+                                fs_pc::fat::FatFilesystem::open(br, part.byte_offset())
                                     .ok()
                                     .and_then(|fs| {
                                         use rusty_backup::fs::Filesystem;
@@ -3452,7 +3455,7 @@ impl InspectTab {
                             })
                         } else if is_amiga_dos {
                             make_probe_reader().and_then(|br| {
-                                rusty_backup::fs::affs::AffsFilesystem::open(br, part.byte_offset())
+                                fs_amiga::affs::AffsFilesystem::open(br, part.byte_offset())
                                     .ok()
                                     .and_then(|fs| {
                                         use rusty_backup::fs::Filesystem;
@@ -3461,7 +3464,7 @@ impl InspectTab {
                             })
                         } else if is_amiga_pfs3 {
                             make_probe_reader().and_then(|br| {
-                                rusty_backup::fs::pfs3::Pfs3Filesystem::open(br, part.byte_offset())
+                                fs_amiga::pfs3::Pfs3Filesystem::open(br, part.byte_offset())
                                     .ok()
                                     .and_then(|fs| {
                                         use rusty_backup::fs::Filesystem;
@@ -3470,7 +3473,7 @@ impl InspectTab {
                             })
                         } else if is_amiga_sfs {
                             make_probe_reader().and_then(|br| {
-                                rusty_backup::fs::sfs::SfsFilesystem::open(br, part.byte_offset())
+                                fs_amiga::sfs::SfsFilesystem::open(br, part.byte_offset())
                                     .ok()
                                     .and_then(|fs| {
                                         use rusty_backup::fs::Filesystem;
@@ -3613,8 +3616,8 @@ impl InspectTab {
                                 push_log(format!(
                                     "Partition {}: minimum size {} (original {})",
                                     part.index,
-                                    rusty_backup::partition::format_size(clamped),
-                                    rusty_backup::partition::format_size(part.size_bytes),
+                                    disk_core::display::format_size(clamped),
+                                    disk_core::display::format_size(part.size_bytes),
                                 ));
                             }
                             rusty_backup::fs::MinimumResult::Computed {
@@ -3774,7 +3777,7 @@ impl InspectTab {
                 ));
             } else if meta.source_size_bytes > 0 {
                 ui.label(egui::RichText::new("Source Size:").strong());
-                ui.label(partition::format_size(meta.source_size_bytes));
+                ui.label(disk_core::display::format_size(meta.source_size_bytes));
             }
             ui.label(egui::RichText::new("Alignment:").strong());
             ui.label(&meta.alignment.detected_type);
@@ -4040,7 +4043,7 @@ impl InspectTab {
                                 .color(super::theme::muted(ui.visuals())),
                         );
                         ui.label(
-                            egui::RichText::new(partition::format_size(part.size_bytes))
+                            egui::RichText::new(disk_core::display::format_size(part.size_bytes))
                                 .color(super::theme::muted(ui.visuals())),
                         );
                         if show_min_col {
@@ -4054,8 +4057,10 @@ impl InspectTab {
                                     .sum();
                                 if logical_sum > 0 {
                                     ui.label(
-                                        egui::RichText::new(partition::format_size(logical_sum))
-                                            .color(super::theme::muted(ui.visuals())),
+                                        egui::RichText::new(disk_core::display::format_size(
+                                            logical_sum,
+                                        ))
+                                        .color(super::theme::muted(ui.visuals())),
                                     );
                                 } else {
                                     ui.label("");
@@ -4081,7 +4086,7 @@ impl InspectTab {
                         let volume_label = self.partition_volume_labels.get(&part.index);
                         ui.label(volume_label.map(String::as_str).unwrap_or(""));
                         ui.label(format!("{}", part.start_lba));
-                        ui.label(partition::format_size(part.size_bytes));
+                        ui.label(disk_core::display::format_size(part.size_bytes));
                         if show_min_col {
                             let in_place_min = self
                                 .backup_metadata
@@ -4130,7 +4135,7 @@ impl InspectTab {
                                 });
                             // Min Size column (in-place trim point).
                             if let Some(sz) = in_place_min {
-                                ui.label(partition::format_size(sz));
+                                ui.label(disk_core::display::format_size(sz));
                             } else if let Some(&computed) =
                                 self.partition_min_sizes.get(&part.index)
                             {
@@ -4138,7 +4143,7 @@ impl InspectTab {
                                 // (in_place_min filters those out). Show it so
                                 // the user sees the result rather than a blank;
                                 // it means the volume can't shrink in place.
-                                ui.label(partition::format_size(computed));
+                                ui.label(disk_core::display::format_size(computed));
                             } else if let Some(pending) =
                                 self.pending_min_size_calcs.get(&part.index)
                             {
@@ -4163,10 +4168,10 @@ impl InspectTab {
                             // Defrag Min column.
                             match (defrag_min, in_place_min) {
                                 (Some(d), Some(m)) if d < m => {
-                                    ui.label(partition::format_size(d));
+                                    ui.label(disk_core::display::format_size(d));
                                 }
                                 (Some(d), None) => {
-                                    ui.label(partition::format_size(d));
+                                    ui.label(disk_core::display::format_size(d));
                                 }
                                 _ => {
                                     ui.label("");
@@ -5008,19 +5013,19 @@ impl InspectTab {
                                 self.partition_defrag_min_sizes.insert(idx, d_clamped);
                                 ctx.log.info(format!(
                                     "Partition {idx}: minimum size {} (computed); defragmented {}",
-                                    partition::format_size(clamped),
-                                    partition::format_size(d_clamped),
+                                    disk_core::display::format_size(clamped),
+                                    disk_core::display::format_size(d_clamped),
                                 ));
                             } else {
                                 ctx.log.info(format!(
                                     "Partition {idx}: minimum size {} (computed)",
-                                    partition::format_size(clamped),
+                                    disk_core::display::format_size(clamped),
                                 ));
                             }
                         } else {
                             ctx.log.info(format!(
                                 "Partition {idx}: minimum size {} (computed)",
-                                partition::format_size(clamped),
+                                disk_core::display::format_size(clamped),
                             ));
                         }
                     } else {
@@ -5385,7 +5390,7 @@ impl InspectTab {
                 ctx.log.info(format!(
                     "Scanning metadata for partition {} ({})...",
                     part_index,
-                    partition::format_size(cz_part.size_bytes()),
+                    disk_core::display::format_size(cz_part.size_bytes()),
                 ));
                 // The scan runs on a worker thread; the spawn lives in the
                 // shared model runner so Commander Mode uses the same path.
@@ -5863,8 +5868,8 @@ fn show_export_disk_layout_bars(
     ui.add_space(4.0);
     ui.label(format!(
         "After  ({} -> {}):",
-        partition::format_size(current_total),
-        partition::format_size(after_total),
+        disk_core::display::format_size(current_total),
+        disk_core::display::format_size(after_total),
     ));
     let after_w = available_width * (after_total as f64 / max_total as f64) as f32;
     ui.scope(|ui| {
@@ -5959,7 +5964,7 @@ mod tests {
     /// header sniffers.
     #[test]
     fn detect_source_is_floppy_accepts_xdf() {
-        use rusty_backup::rbformats::containers::floppy_geom::FloppyMedia;
+        use dsk_floppy::floppy_geom::FloppyMedia;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("game.xdf");
         let flat = vec![0u8; FloppyMedia::Hd1232.geometry().flat_size()];

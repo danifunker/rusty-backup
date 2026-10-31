@@ -25,7 +25,7 @@ use crate::cli::img_at::{ImageRef, PartSelector};
 use crate::cli::logging::{log_stderr, out_stdout};
 use crate::cli::parse::split_mac_path;
 use crate::cli::resolve::resolve_partition_rw;
-use crate::fs::filesystem::{CreateDirectoryOptions, CreateFileOptions};
+use disk_core::filesystem::{CreateDirectoryOptions, CreateFileOptions};
 
 #[derive(Debug, Args)]
 pub struct BatchArgs {
@@ -431,8 +431,8 @@ fn drain_archive(
             if pct / 10 != last_pct / 10 {
                 log_stderr(format!(
                     "  {phase}: {pct:>3}% ({}/{})",
-                    crate::partition::format_size(cur),
-                    crate::partition::format_size(total)
+                    disk_core::display::format_size(cur),
+                    disk_core::display::format_size(total)
                 ));
                 last_pct = pct;
             }
@@ -586,35 +586,35 @@ fn build_blank_fs(
     affs_variant: Option<u8>,
 ) -> Result<Vec<u8>> {
     match fs {
-        "fat" => crate::fs::fat::create_blank_fat(size, Some(name)),
-        "efs" => crate::fs::efs::create_blank_efs(size, name),
-        "xfs" => crate::fs::xfs::format::create_blank_xfs(size, name)
+        "fat" => fs_pc::fat::create_blank_fat(size, Some(name)),
+        "efs" => fs_unix::efs::create_blank_efs(size, name),
+        "xfs" => fs_xfs::xfs::format::create_blank_xfs(size, name)
             .map_err(|e| anyhow!("create_blank_xfs: {e}")),
-        "affs" => crate::fs::affs::create_blank_affs(size, affs_variant.unwrap_or(1), name),
+        "affs" => fs_amiga::affs::create_blank_affs(size, affs_variant.unwrap_or(1), name),
         "hfs" => {
             let bs = block_size.unwrap_or_else(|| crate::cli::parse::pick_block_size(size));
-            crate::fs::hfs::create_blank_hfs_sized(size, bs, name, 0, 0)
+            fs_mac::hfs::create_blank_hfs_sized(size, bs, name, 0, 0)
                 .map_err(|e| anyhow!("create_blank_hfs_sized: {e}"))
         }
-        "ext" | "ext2" => crate::fs::ext_format::create_blank_ext2(size, name)
+        "ext" | "ext2" => fs_unix::ext_format::create_blank_ext2(size, name)
             .map_err(|e| anyhow!("create_blank_ext2: {e}")),
-        "ext3" => crate::fs::ext_format::create_blank_ext3(size, name)
+        "ext3" => fs_unix::ext_format::create_blank_ext3(size, name)
             .map_err(|e| anyhow!("create_blank_ext3: {e}")),
-        "ext4" => crate::fs::ext_format::create_blank_ext4(size, name)
+        "ext4" => fs_unix::ext_format::create_blank_ext4(size, name)
             .map_err(|e| anyhow!("create_blank_ext4: {e}")),
         "minix" | "minix1" => {
-            crate::fs::minix::create_blank_minix(size, crate::fs::minix::MinixVersion::V1)
+            fs_unix::minix::create_blank_minix(size, fs_unix::minix::MinixVersion::V1)
                 .map_err(|e| anyhow!("create_blank_minix: {e}"))
         }
-        "minix2" => crate::fs::minix::create_blank_minix(size, crate::fs::minix::MinixVersion::V2)
+        "minix2" => fs_unix::minix::create_blank_minix(size, fs_unix::minix::MinixVersion::V2)
             .map_err(|e| anyhow!("create_blank_minix: {e}")),
-        "minix3" => crate::fs::minix::create_blank_minix(size, crate::fs::minix::MinixVersion::V3)
+        "minix3" => fs_unix::minix::create_blank_minix(size, fs_unix::minix::MinixVersion::V3)
             .map_err(|e| anyhow!("create_blank_minix: {e}")),
-        "ucsd" | "pascal" => crate::fs::ucsd::create_blank_ucsd(size, name)
+        "ucsd" | "pascal" => fs_apple2::ucsd::create_blank_ucsd(size, name)
             .map_err(|e| anyhow!("create_blank_ucsd: {e}")),
-        "trdos" | "beta" => crate::fs::trdos::create_blank_trdos(size, name)
+        "trdos" | "beta" => fs_8bit::trdos::create_blank_trdos(size, name)
             .map_err(|e| anyhow!("create_blank_trdos: {e}")),
-        "ti99" => crate::fs::ti99::create_blank_ti99(size, name)
+        "ti99" => fs_8bit::ti99::create_blank_ti99(size, name)
             .map_err(|e| anyhow!("create_blank_ti99: {e}")),
         other => {
             bail!("unsupported fs {other:?}; expected one of fat, efs, xfs, affs, hfs, ext, ext3, ext4, minix, minix2, minix3, ucsd, trdos, ti99")
@@ -627,8 +627,8 @@ fn build_blank_fs(
 /// byte always matches the on-disk FAT type — the formatter picks FAT12/16 by
 /// cluster count, so a size-only guess can disagree with it.
 fn fat_type_byte_for(size_bytes: u64) -> u8 {
-    use crate::fs::fat::FatType;
-    match crate::fs::fat::compute_fat_blank_layout(size_bytes).map(|l| l.fat_type) {
+    use fs_pc::fat::FatType;
+    match fs_pc::fat::compute_fat_blank_layout(size_bytes).map(|l| l.fat_type) {
         Ok(FatType::Fat12) => 0x01, // FAT12
         Ok(FatType::Fat16) => 0x06, // FAT16 BIG (parser accepts all FAT16 variants)
         Ok(FatType::Fat32) => 0x0C, // FAT32 LBA
@@ -654,7 +654,7 @@ fn single_partition_mbr(fs: &mut [u8], type_byte: u8) -> Result<([u8; 512], u64)
     if fs.len() >= 32 && (fs[0] == 0xEB || fs[0] == 0xE9) {
         fs[28..32].copy_from_slice(&MBR_ALIGN_SECTORS.to_le_bytes());
     }
-    let mbr = crate::partition::mbr::build_minimal_mbr(
+    let mbr = part_tables::mbr::build_minimal_mbr(
         0xDEADBEEF,
         &[(type_byte, MBR_ALIGN_SECTORS, fs_sectors as u32, true)],
         16,
@@ -720,7 +720,7 @@ fn apply_disk_block(path: &std::path::Path, disk: &DiskBlock) -> Result<()> {
         cursor_lba = cursor_lba.div_ceil(ALIGN_SECTORS) * ALIGN_SECTORS;
     }
 
-    let mbr = crate::partition::mbr::build_minimal_mbr(0xDEADBEEF, &entries, 16, 63);
+    let mbr = part_tables::mbr::build_minimal_mbr(0xDEADBEEF, &entries, 16, 63);
     // Pieces go straight to their offsets; assembling a whole-disk buffer touched every page.
     let mut parts: Vec<(u64, &[u8])> = vec![(0, &mbr)];
     parts.extend(
@@ -733,7 +733,7 @@ fn apply_disk_block(path: &std::path::Path, disk: &DiskBlock) -> Result<()> {
 }
 
 fn apply_op(
-    fs: &mut dyn crate::fs::filesystem::EditableFilesystem,
+    fs: &mut dyn disk_core::filesystem::EditableFilesystem,
     op: &Operation,
     defaults: &DefaultOptions,
 ) -> Result<()> {
@@ -751,7 +751,7 @@ fn apply_op(
     }
 }
 
-fn apply_bless(fs: &mut dyn crate::fs::filesystem::EditableFilesystem, path: &str) -> Result<()> {
+fn apply_bless(fs: &mut dyn disk_core::filesystem::EditableFilesystem, path: &str) -> Result<()> {
     let entry = super::ls::resolve_path(fs.as_filesystem_mut(), path)?;
     if !entry.is_directory() {
         bail!("bless: {path} is not a directory");
@@ -762,7 +762,7 @@ fn apply_bless(fs: &mut dyn crate::fs::filesystem::EditableFilesystem, path: &st
 }
 
 fn apply_chmeta(
-    fs: &mut dyn crate::fs::filesystem::EditableFilesystem,
+    fs: &mut dyn disk_core::filesystem::EditableFilesystem,
     op: &ChmetaOp,
 ) -> Result<()> {
     if op.type_code.is_none() && op.creator.is_none() {
@@ -789,7 +789,7 @@ fn apply_chmeta(
 }
 
 fn apply_setrsrc(
-    fs: &mut dyn crate::fs::filesystem::EditableFilesystem,
+    fs: &mut dyn disk_core::filesystem::EditableFilesystem,
     op: &SetrsrcOp,
 ) -> Result<()> {
     let entry = super::ls::resolve_path(fs.as_filesystem_mut(), &op.path)?;
@@ -803,7 +803,7 @@ fn apply_setrsrc(
     Ok(())
 }
 
-fn apply_mkdir(fs: &mut dyn crate::fs::filesystem::EditableFilesystem, path: &str) -> Result<()> {
+fn apply_mkdir(fs: &mut dyn disk_core::filesystem::EditableFilesystem, path: &str) -> Result<()> {
     let (parent_path, name) = split_mac_path(path)?;
     if name.is_empty() {
         bail!("mkdir: empty basename for {path:?}");
@@ -815,7 +815,7 @@ fn apply_mkdir(fs: &mut dyn crate::fs::filesystem::EditableFilesystem, path: &st
 }
 
 fn apply_put(
-    fs: &mut dyn crate::fs::filesystem::EditableFilesystem,
+    fs: &mut dyn disk_core::filesystem::EditableFilesystem,
     op: &PutOp,
     defaults: &DefaultOptions,
 ) -> Result<()> {
@@ -830,7 +830,7 @@ fn apply_put(
     let children = fs
         .list_directory(&parent)
         .map_err(|e| anyhow!("list_directory: {e}"))?;
-    let existing = crate::fs::filesystem::find_child(fold, &children, &name).cloned();
+    let existing = disk_core::filesystem::find_child(fold, &children, &name).cloned();
     if let Some(ref e) = existing {
         if !force {
             bail!("{} already exists (set \"force\": true)", op.dst);
@@ -872,7 +872,7 @@ fn apply_put(
 }
 
 fn apply_rm(
-    fs: &mut dyn crate::fs::filesystem::EditableFilesystem,
+    fs: &mut dyn disk_core::filesystem::EditableFilesystem,
     path: &str,
     recursive: bool,
 ) -> Result<()> {
@@ -882,7 +882,7 @@ fn apply_rm(
     let children = fs
         .list_directory(&parent)
         .map_err(|e| anyhow!("list_directory: {e}"))?;
-    let entry = crate::fs::filesystem::find_child(fold, &children, &name)
+    let entry = disk_core::filesystem::find_child(fold, &children, &name)
         .cloned()
         .ok_or_else(|| anyhow!("not found: {path}"))?;
     if entry.is_directory() {

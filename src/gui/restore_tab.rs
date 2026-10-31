@@ -2,14 +2,13 @@ use std::fs::File;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use dsk_clonezilla::metadata::ClonezillaImage;
 use rusty_backup::backup::metadata::BackupMetadata;
-use rusty_backup::clonezilla;
-use rusty_backup::clonezilla::metadata::ClonezillaImage;
 use rusty_backup::model::disk_builder::DiskBuilder;
 use rusty_backup::model::physical_write_runner::PhysicalWriteStatus;
 use rusty_backup::model::provision_runner::{self, ProvisionRequest};
 use rusty_backup::model::size_mode::SizeMode;
-use rusty_backup::partition::{self, PartitionInfo, PartitionTable};
+use rusty_backup::partition::{PartitionInfo, PartitionTable};
 
 use super::partition_bar::{PartitionBar, Segment, SegmentKind};
 use super::size_mode_row::{size_mode_row, SizeModeRowOptions};
@@ -516,7 +515,7 @@ impl RestoreTab {
                 ui.label(format!(
                     "{} ({})",
                     meta.source_device,
-                    partition::format_size(meta.source_size_bytes),
+                    disk_core::display::format_size(meta.source_size_bytes),
                 ));
             });
         } else if let Some(cz) = &self.clonezilla_image {
@@ -533,7 +532,7 @@ impl RestoreTab {
                 ui.label(format!(
                     "/dev/{} ({})",
                     cz.disk_name,
-                    partition::format_size(cz.source_size_bytes),
+                    disk_core::display::format_size(cz.source_size_bytes),
                 ));
             });
         }
@@ -588,7 +587,7 @@ impl RestoreTab {
                                     let label = format!(
                                         "{} ({}){}",
                                         device.display_name(),
-                                        partition::format_size(device.size_bytes),
+                                        disk_core::display::format_size(device.size_bytes),
                                         if device.is_system { " [SYSTEM]" } else { "" },
                                     );
                                     ui.selectable_value(
@@ -676,8 +675,8 @@ impl RestoreTab {
                         color,
                         format!(
                             "Target: {} | Source was: {}{}",
-                            partition::format_size(target_size),
-                            partition::format_size(source_size),
+                            disk_core::display::format_size(target_size),
+                            disk_core::display::format_size(source_size),
                             if target_size < source_size {
                                 " (target is smaller!)"
                             } else {
@@ -736,8 +735,8 @@ impl RestoreTab {
                             .saturating_add((self.expand_free_space_mib as u64) * 1024 * 1024);
                         ui.label(format!(
                             "(target size {} -> {})",
-                            partition::format_size(source_size_bytes),
-                            partition::format_size(new_total_bytes),
+                            disk_core::display::format_size(source_size_bytes),
+                            disk_core::display::format_size(new_total_bytes),
                         ));
                     });
 
@@ -855,8 +854,8 @@ impl RestoreTab {
                             // the table slot and stays the matching key.
                             ui.label(format!("{}", pos + 1));
                             ui.label(&cfg.type_name);
-                            ui.label(partition::format_size(cfg.original_size));
-                            ui.label(partition::format_size(cfg.minimum_size));
+                            ui.label(disk_core::display::format_size(cfg.original_size));
+                            ui.label(disk_core::display::format_size(cfg.minimum_size));
 
                             size_mode_row(
                                 ui,
@@ -897,8 +896,8 @@ impl RestoreTab {
                         color,
                         format!(
                             "Total: {} / {} available",
-                            partition::format_size(total),
-                            partition::format_size(target_size),
+                            disk_core::display::format_size(total),
+                            disk_core::display::format_size(target_size),
                         ),
                     );
 
@@ -1064,7 +1063,7 @@ impl RestoreTab {
                                 "#{}: {} ({})",
                                 p.index,
                                 p.type_name,
-                                partition::format_size(p.original_size_bytes),
+                                disk_core::display::format_size(p.original_size_bytes),
                             )
                         })
                         .unwrap_or_else(|| "Select a partition...".into());
@@ -1078,7 +1077,7 @@ impl RestoreTab {
                                     "#{}: {} ({})",
                                     pm.index,
                                     pm.type_name,
-                                    partition::format_size(pm.original_size_bytes),
+                                    disk_core::display::format_size(pm.original_size_bytes),
                                 );
                                 ui.selectable_value(
                                     &mut self.sp_source_partition_idx,
@@ -1122,7 +1121,7 @@ impl RestoreTab {
                             let label = format!(
                                 "{} ({}){}",
                                 device.display_name(),
-                                partition::format_size(device.size_bytes),
+                                disk_core::display::format_size(device.size_bytes),
                                 if device.is_system { " [SYSTEM]" } else { "" },
                             );
                             if ui
@@ -1203,7 +1202,7 @@ impl RestoreTab {
                             }
                             ui.label(format!("{}", pos + 1));
                             ui.label(&part.type_name);
-                            ui.label(partition::format_size(part.size_bytes));
+                            ui.label(disk_core::display::format_size(part.size_bytes));
 
                             // Size compatibility indicator
                             if let Some(src_sz) = source_size {
@@ -1316,7 +1315,8 @@ impl RestoreTab {
         let metadata_path = folder.join("metadata.json");
         if metadata_path.exists() {
             self.load_native_backup_metadata(&folder, &metadata_path, ctx);
-        } else if let Some(cz_folder) = clonezilla::metadata::resolve_clonezilla_folder(&folder) {
+        } else if let Some(cz_folder) = dsk_clonezilla::metadata::resolve_clonezilla_folder(&folder)
+        {
             self.load_clonezilla_backup_metadata(&cz_folder, ctx);
         } else {
             self.metadata_error =
@@ -1398,7 +1398,7 @@ impl RestoreTab {
     }
 
     fn load_clonezilla_backup_metadata(&mut self, folder: &std::path::Path, ctx: &mut TabContext) {
-        let cz_image = match clonezilla::metadata::load(folder) {
+        let cz_image = match dsk_clonezilla::metadata::load(folder) {
             Ok(img) => img,
             Err(e) => {
                 self.metadata_error = Some(format!("Failed to load Clonezilla image: {e}"));
@@ -1416,7 +1416,7 @@ impl RestoreTab {
 
             // Try to get minimum size from partclone header
             let minimum_size = if !cz_part.partclone_files.is_empty() {
-                match clonezilla::partclone::read_partclone_header(&cz_part.partclone_files) {
+                match dsk_clonezilla::partclone::read_partclone_header(&cz_part.partclone_files) {
                     Ok(header) => header.used_size(),
                     Err(_) => cz_part.size_bytes(),
                 }
@@ -1481,7 +1481,7 @@ impl RestoreTab {
         ui.add_space(6.0);
         ui.label(format!(
             "After  (+ {} free):",
-            partition::format_size(added_bytes),
+            disk_core::display::format_size(added_bytes),
         ));
         let mut after_segments = segments;
         if added_bytes > 0 {
@@ -1648,7 +1648,7 @@ impl RestoreTab {
                             let size_str = if cfg.choice == SizeMode::FillRemaining {
                                 "Fill remaining".to_string()
                             } else {
-                                partition::format_size(cfg.effective_size())
+                                disk_core::display::format_size(cfg.effective_size())
                             };
                             ui.label(format!(
                                 "  Partition {}: {} -> {}",
@@ -1671,7 +1671,7 @@ impl RestoreTab {
                                     "Partition {} ({}, {})",
                                     p.index,
                                     p.type_name,
-                                    partition::format_size(p.size_bytes),
+                                    disk_core::display::format_size(p.size_bytes),
                                 )
                             })
                             .unwrap_or_else(|| "Unknown".into());
@@ -1902,8 +1902,8 @@ impl RestoreTab {
                 super::theme::danger(ui.visuals()),
                 format!(
                     "Layout ends at {} but the target holds {}",
-                    partition::format_size(end_bytes),
-                    partition::format_size(target_size),
+                    disk_core::display::format_size(end_bytes),
+                    disk_core::display::format_size(target_size),
                 ),
             );
         }
@@ -2158,8 +2158,11 @@ impl RestoreTab {
                     .show(ui, |ui| {
                         for d in &self.remote.devices {
                             let is_sel = selected_dev_path.as_deref() == Some(d.path.as_str());
-                            let mut label =
-                                format!("{} ({})", d.path, partition::format_size(d.size_bytes));
+                            let mut label = format!(
+                                "{} ({})",
+                                d.path,
+                                disk_core::display::format_size(d.size_bytes)
+                            );
                             if !d.media.is_empty() {
                                 label.push_str(&format!(" - {}", d.media));
                             }
@@ -2170,7 +2173,7 @@ impl RestoreTab {
                                 let display = format!(
                                     "rb://{addr}{} ({})",
                                     d.path,
-                                    partition::format_size(d.size_bytes)
+                                    disk_core::display::format_size(d.size_bytes)
                                 );
                                 pick = Some((d.path.clone(), display, true));
                             }
@@ -2350,7 +2353,7 @@ impl RestoreTab {
                             ctx.log.info(format!(
                                 "Source image: {} ({})",
                                 path.display(),
-                                partition::format_size(self.image_write_size),
+                                disk_core::display::format_size(self.image_write_size),
                             ));
                         }
                         self.image_write_path = Some(path);
@@ -2363,7 +2366,7 @@ impl RestoreTab {
             if self.image_write_size > 0 {
                 ui.label(format!(
                     "Decoded size: {} (the file on disk may be smaller if it is compressed)",
-                    partition::format_size(self.image_write_size),
+                    disk_core::display::format_size(self.image_write_size),
                 ));
                 ui.add_space(6.0);
                 if ui
@@ -2433,7 +2436,7 @@ impl RestoreTab {
                                 let label = format!(
                                     "{} ({}){}",
                                     device.display_name(),
-                                    partition::format_size(device.size_bytes),
+                                    disk_core::display::format_size(device.size_bytes),
                                     if device.is_system { " [SYSTEM]" } else { "" },
                                 );
                                 ui.selectable_value(&mut self.bd_target_device_idx, Some(i), label);
@@ -2478,7 +2481,9 @@ impl RestoreTab {
                     .on_hover_text("Accepts K / M / G suffixes, e.g. 512M or 2G.");
                     match rusty_backup::partition::parse_size(&self.bd_image_size_text) {
                         Ok(n) => {
-                            ui.label(egui::RichText::new(partition::format_size(n)).weak());
+                            ui.label(
+                                egui::RichText::new(disk_core::display::format_size(n)).weak(),
+                            );
                         }
                         Err(e) => {
                             ui.colored_label(super::theme::danger(ui.visuals()), format!("{e:#}"));
@@ -2584,7 +2589,7 @@ impl RestoreTab {
             "Building a {} disk on {} ({})",
             kind_label,
             target_path.display(),
-            partition::format_size(target_size),
+            disk_core::display::format_size(target_size),
         ));
         self.bd_logged = 0;
         self.bd_finished_reported = false;
@@ -2624,8 +2629,8 @@ impl RestoreTab {
             let suffix = self.bd_rate.suffix(current, total);
             format!(
                 "{} / {} ({:.0}%){}",
-                partition::format_size(current),
-                partition::format_size(total),
+                disk_core::display::format_size(current),
+                disk_core::display::format_size(total),
                 frac * 100.0,
                 suffix,
             )
@@ -2784,7 +2789,7 @@ impl RestoreTab {
                                 "#{}: {} ({})",
                                 p.index,
                                 p.type_name,
-                                partition::format_size(p.original_size_bytes),
+                                disk_core::display::format_size(p.original_size_bytes),
                             )
                         })
                         .unwrap_or_else(|| "Select a partition...".into());
@@ -2798,7 +2803,7 @@ impl RestoreTab {
                                     "#{}: {} ({})",
                                     pm.index,
                                     pm.type_name,
-                                    partition::format_size(pm.original_size_bytes),
+                                    disk_core::display::format_size(pm.original_size_bytes),
                                 );
                                 ui.selectable_value(
                                     &mut self.sp_source_partition_idx,
@@ -2845,7 +2850,7 @@ impl RestoreTab {
                                 let label = format!(
                                     "{} ({}){}",
                                     device.display_name(),
-                                    partition::format_size(device.size_bytes),
+                                    disk_core::display::format_size(device.size_bytes),
                                     if device.is_system { " [SYSTEM]" } else { "" },
                                 );
                                 ui.selectable_value(&mut self.nd_target_device_idx, Some(i), label);

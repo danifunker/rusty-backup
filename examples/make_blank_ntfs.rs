@@ -1,6 +1,6 @@
 //! Emit a blank NTFS image for oracle validation of the formatter.
 //! Usage: cargo run --example make_blank_ntfs -- <out_path> <size_mib> [label] [cluster] [sector]
-use rusty_backup::fs::ntfs_format::{create_ntfs, NtfsFormatParams, NtfsGeometry};
+use fs_pc::ntfs_format::{create_ntfs, NtfsFormatParams, NtfsGeometry};
 use std::fs::File;
 
 fn main() {

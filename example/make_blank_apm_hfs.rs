@@ -1,7 +1,7 @@
 // Usage: make_blank_apm_hfs <source.hda> <out.hda> [size_mib] [block_kib]
 // Builds a blank HFS volume of the requested size + block size, wraps in APM
 // using drivers from `source.hda`, writes to `out.hda`.
-use rusty_backup::fs::hfs::create_blank_hfs;
+use fs_mac::hfs::create_blank_hfs;
 use rusty_backup::fs::hfs_clone::emit_apm_disk_with_hfs;
 use std::fs::{File, OpenOptions};
 use std::io::Seek;

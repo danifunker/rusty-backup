@@ -2,15 +2,15 @@ use std::io::{Read, Seek, SeekFrom, Write};
 
 use anyhow::{bail, Result};
 
-use super::apm::Apm;
-use super::gpt::Gpt;
-use super::mbr::{lba_to_chs, Mbr};
-use super::sgi::{
-    SgiPartitionEntry, SgiPartitionType, SgiVolumeHeader, SGI_TYPE_BYTE_EFS, SGI_TYPE_BYTE_XFS,
-};
 use super::PartitionTable;
 #[cfg(feature = "rust173-polyfill")]
 use crate::rust173_compat::{IntIsMultipleOf as _, OptionIsNoneOr as _};
+use part_tables::apm::Apm;
+use part_tables::gpt::Gpt;
+use part_tables::mbr::{lba_to_chs, Mbr};
+use part_tables::sgi::{
+    SgiPartitionEntry, SgiPartitionType, SgiVolumeHeader, SGI_TYPE_BYTE_EFS, SGI_TYPE_BYTE_XFS,
+};
 
 /// A single edit operation on a partition table.
 #[derive(Debug, Clone)]
@@ -238,7 +238,7 @@ pub fn apply_edits(
 /// other edit variant produces an error so the caller can surface it.
 fn apply_rdb_edits(
     file: &mut (impl Read + Write + Seek),
-    rdb: &super::rdb::Rdb,
+    rdb: &part_tables::rdb::Rdb,
     edits: &[PartitionTableEdit],
     log_cb: &mut impl FnMut(&str),
 ) -> Result<()> {
@@ -249,7 +249,8 @@ fn apply_rdb_edits(
                     .partitions
                     .get(*index)
                     .ok_or_else(|| anyhow::anyhow!("RDB partition index {} not found", index))?;
-                let now = super::rdb::set_partition_bootable(file, part.block_num, *bootable)?;
+                let now =
+                    part_tables::rdb::set_partition_bootable(file, part.block_num, *bootable)?;
                 log_cb(&format!(
                     "Partition {} ({}): bootable -> {}",
                     index,
@@ -495,7 +496,7 @@ fn apply_gpt_edits(
             } => {
                 if let Some(e) = patched.entries.get_mut(*index) {
                     if let Some(guid_str) = new_type_string {
-                        match super::gpt::Guid::from_string(guid_str) {
+                        match part_tables::gpt::Guid::from_string(guid_str) {
                             Ok(guid) => {
                                 e.type_guid = guid;
                                 log_cb(&format!(
@@ -524,9 +525,9 @@ fn apply_gpt_edits(
             } => {
                 let type_guid = type_string
                     .as_ref()
-                    .and_then(|s| super::gpt::Guid::from_string(s).ok())
+                    .and_then(|s| part_tables::gpt::Guid::from_string(s).ok())
                     .unwrap_or_else(|| {
-                        super::gpt::Guid::from_string("EBD0A0A2-B9E5-4433-87C0-68B6B72699C7")
+                        part_tables::gpt::Guid::from_string("EBD0A0A2-B9E5-4433-87C0-68B6B72699C7")
                             .unwrap()
                     });
                 let end_lba = start_lba + size_bytes / 512 - 1;
@@ -536,9 +537,9 @@ fn apply_gpt_edits(
                 unique[0..8].copy_from_slice(&start_lba.to_le_bytes());
                 unique[8..16].copy_from_slice(&end_lba.to_le_bytes());
 
-                patched.entries.push(super::gpt::GptPartitionEntry {
+                patched.entries.push(part_tables::gpt::GptPartitionEntry {
                     type_guid,
-                    unique_guid: super::gpt::Guid::from_bytes(unique),
+                    unique_guid: part_tables::gpt::Guid::from_bytes(unique),
                     first_lba: *start_lba,
                     last_lba: end_lba,
                     attributes: 0,
@@ -655,7 +656,7 @@ fn apply_apm_edits(
                 let start_block = (*start_lba * 512 / block_size) as u32;
                 let block_count = (*size_bytes / block_size) as u32;
 
-                patched.entries.push(super::apm::ApmPartitionEntry {
+                patched.entries.push(part_tables::apm::ApmPartitionEntry {
                     signature: 0x504D,
                     map_entries: 0, // will be updated below
                     start_block,
@@ -710,15 +711,15 @@ fn apply_apm_edits(
 /// NeXT disk label. Every offset here is in the label's own `d_secsize`
 /// sectors measured from the end of the front porch, and every copy the disk
 /// carries is rewritten — see the module header of
-/// [`crate::partition::next`].
+/// [`part_tables::next`].
 fn apply_next_edits(
     file: &mut (impl Read + Write + Seek),
-    label: &crate::partition::next::NextDiskLabel,
+    label: &part_tables::next::NextDiskLabel,
     edits: &[PartitionTableEdit],
     disk_size_bytes: u64,
     log_cb: &mut impl FnMut(&str),
 ) -> Result<()> {
-    use crate::partition::next::{
+    use part_tables::next::{
         clear_partition, present_copies, set_partition_extent, set_partition_type, write_copies,
         write_partition, NextDiskLabel, NextPartition, NextPartitionSpec, LABEL_SPAN, N_PARTITIONS,
     };
@@ -901,7 +902,7 @@ fn apply_next_edits(
 /// Reject overlap or a partition running past the medium, reading the edited
 /// buffer back through the parser so the check sees what a reader will.
 fn check_next_layout(buf: &[u8], secsize: u64, front: u64, disk_size: u64) -> Result<()> {
-    let label = crate::partition::next::NextDiskLabel::parse(buf, 0)
+    let label = part_tables::next::NextDiskLabel::parse(buf, 0)
         .map_err(|e| anyhow::anyhow!("NeXT disk label: edited label no longer parses: {e}"))?;
     let live: Vec<_> = label.browsable_partitions().collect();
     for (i, p) in &live {
@@ -909,13 +910,13 @@ fn check_next_layout(buf: &[u8], secsize: u64, front: u64, disk_size: u64) -> Re
         if disk_size > 0 && end > disk_size {
             anyhow::bail!(
                 "NeXT disk label: partition {} ends at byte {end}, past the {disk_size}-byte disk",
-                crate::partition::next::NextPartition::letter(*i),
+                part_tables::next::NextPartition::letter(*i),
             );
         }
         if p.start_byte < front * secsize {
             anyhow::bail!(
                 "NeXT disk label: partition {} starts inside the front porch",
-                crate::partition::next::NextPartition::letter(*i),
+                part_tables::next::NextPartition::letter(*i),
             );
         }
         for (j, q) in &live {
@@ -926,8 +927,8 @@ fn check_next_layout(buf: &[u8], secsize: u64, front: u64, disk_size: u64) -> Re
             if p.start_byte < qend && q.start_byte < end {
                 anyhow::bail!(
                     "NeXT disk label: partitions {} and {} overlap",
-                    crate::partition::next::NextPartition::letter(*i),
-                    crate::partition::next::NextPartition::letter(*j),
+                    part_tables::next::NextPartition::letter(*i),
+                    part_tables::next::NextPartition::letter(*j),
                 );
             }
         }
@@ -941,14 +942,14 @@ fn check_next_layout(buf: &[u8], secsize: u64, front: u64, disk_size: u64) -> Re
 fn apply_solaris_x86_edits(
     file: &mut (impl Read + Write + Seek),
     mbr: &Mbr,
-    label: &crate::partition::solaris_x86::SolarisX86Label,
+    label: &part_tables::solaris_x86::SolarisX86Label,
     edits: &[PartitionTableEdit],
     log_cb: &mut impl FnMut(&str),
 ) -> Result<()> {
-    use crate::partition::solaris_x86::{
+    use part_tables::solaris_x86::{
         data_area_sectors, get_slice, set_slice, stamp_checksum, write_label, N_SLICES, VTOC_SECTOR,
     };
-    use crate::partition::sun::{tag_from_text, tag_name};
+    use part_tables::sun::{tag_from_text, tag_name};
 
     let start = label.partition_start_lba;
     file.seek(SeekFrom::Start((start + VTOC_SECTOR) * 512))?;
@@ -1105,7 +1106,7 @@ fn apply_solaris_x86_edits(
 /// another. Containment is allowed: the backup alias wraps every real slice,
 /// which is how the label spells "the whole partition".
 fn check_solaris_layout(sector: &[u8; 512], bound: u64) -> Result<()> {
-    use crate::partition::solaris_x86::{get_slice, N_SLICES};
+    use part_tables::solaris_x86::{get_slice, N_SLICES};
 
     let live: Vec<(usize, u64, u64)> = (0..N_SLICES)
         .filter_map(|i| get_slice(sector, i).map(|s| (i, s)))
@@ -1136,13 +1137,13 @@ fn check_solaris_layout(sector: &[u8; 512], bound: u64) -> Result<()> {
 
 fn apply_sgi_dklabel_edits(
     file: &mut (impl Read + Write + Seek),
-    label: &crate::partition::sgi_dklabel::SgiDiskLabel,
+    label: &part_tables::sgi_dklabel::SgiDiskLabel,
     edits: &[PartitionTableEdit],
     disk_size_bytes: u64,
     log_cb: &mut impl FnMut(&str),
 ) -> Result<()> {
-    use crate::partition::sgi_dklabel::{apply_byte_order, OFF_BOOTFS, OFF_MAP, SGI_DKLABEL_NFS};
     use byteorder::{BigEndian, ByteOrder};
+    use part_tables::sgi_dklabel::{apply_byte_order, OFF_BOOTFS, OFF_MAP, SGI_DKLABEL_NFS};
 
     file.seek(SeekFrom::Start(0))?;
     let mut sector = [0u8; 512];
@@ -1152,7 +1153,7 @@ fn apply_sgi_dklabel_edits(
     let mut map = label.map.clone();
     map.resize(
         SGI_DKLABEL_NFS,
-        crate::partition::sgi_dklabel::SgiDiskMap { base: 0, size: 0 },
+        part_tables::sgi_dklabel::SgiDiskMap { base: 0, size: 0 },
     );
     let mut bootfs = sector[OFF_BOOTFS];
     let total_blocks = (disk_size_bytes / 512) as u32;
@@ -1261,9 +1262,9 @@ fn apply_sgi_dklabel_edits(
 }
 
 fn slot_mut(
-    map: &mut [crate::partition::sgi_dklabel::SgiDiskMap],
+    map: &mut [part_tables::sgi_dklabel::SgiDiskMap],
     index: usize,
-) -> Result<&mut crate::partition::sgi_dklabel::SgiDiskMap> {
+) -> Result<&mut part_tables::sgi_dklabel::SgiDiskMap> {
     map.get_mut(index)
         .ok_or_else(|| anyhow::anyhow!("SGI disk label: slot {index} out of range (0..7)"))
 }
@@ -1271,7 +1272,7 @@ fn slot_mut(
 /// Reject partial overlap or a slot past the disk. Containment is allowed: a
 /// slot wrapping another is how the label spells "the whole drive".
 fn check_dklabel_layout(
-    map: &[crate::partition::sgi_dklabel::SgiDiskMap],
+    map: &[part_tables::sgi_dklabel::SgiDiskMap],
     total_blocks: u32,
 ) -> Result<()> {
     for (i, m) in map.iter().enumerate() {
@@ -1323,7 +1324,7 @@ fn apply_sgi_edits(
     edits: &[PartitionTableEdit],
     log_cb: &mut impl FnMut(&str),
 ) -> Result<()> {
-    use crate::partition::sgi::SGI_NUM_PARTITIONS;
+    use part_tables::sgi::SGI_NUM_PARTITIONS;
 
     // Work on a clone so we can roll the in-memory state forward, then
     // serialize the whole sector once at the end (checksum is recomputed by
@@ -1454,7 +1455,7 @@ fn apply_sgi_edits(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::partition::mbr::build_minimal_mbr;
+    use part_tables::mbr::build_minimal_mbr;
     use std::io::Cursor;
 
     #[test]
@@ -1561,7 +1562,7 @@ mod tests {
     // --- SGI disklabel writer tests (Phase 3 of disk_expansion.md) ---
 
     fn mk_sgi_table_with_one_xfs() -> (PartitionTable, Vec<u8>) {
-        use crate::partition::sgi::{
+        use part_tables::sgi::{
             SgiPartitionEntry, SgiVolumeDirEntry, SgiVolumeHeader, SGI_NUM_PARTITIONS,
             SGI_NUM_VOL_DIR, SGI_VOLHDR_MAGIC,
         };
@@ -1570,9 +1571,7 @@ mod tests {
             magic: SGI_VOLHDR_MAGIC,
             root_part_num: 0,
             swap_part_num: 1,
-            device_parameters: crate::partition::sgi::SgiDeviceParameters::for_geometry(
-                403, 16, 63,
-            ),
+            device_parameters: part_tables::sgi::SgiDeviceParameters::for_geometry(403, 16, 63),
             bootfile: "/unix".to_string(),
             volume_directory: Vec::new(),
             partitions: Vec::new(),
@@ -1689,8 +1688,8 @@ mod tests {
 
     /// A minimal but valid label: geometry that parses, one slot at block 119.
     fn dklabel_disk(swabbed: bool) -> Vec<u8> {
-        use crate::partition::sgi_dklabel::{swab16_in_place, SGI_DKLABEL_MAGIC};
         use byteorder::{BigEndian, ByteOrder};
+        use part_tables::sgi_dklabel::{swab16_in_place, SGI_DKLABEL_MAGIC};
         let mut img = vec![0u8; 4 * 1024 * 1024];
         BigEndian::write_u32(&mut img[0x00..0x04], SGI_DKLABEL_MAGIC);
         BigEndian::write_u16(&mut img[0x08..0x0A], 100); // cylinders
@@ -1707,8 +1706,8 @@ mod tests {
         img
     }
 
-    fn dklabel_of(img: &[u8]) -> crate::partition::sgi_dklabel::SgiDiskLabel {
-        crate::partition::sgi_dklabel::SgiDiskLabel::parse(&img[..512]).unwrap()
+    fn dklabel_of(img: &[u8]) -> part_tables::sgi_dklabel::SgiDiskLabel {
+        part_tables::sgi_dklabel::SgiDiskLabel::parse(&img[..512]).unwrap()
     }
 
     fn edit_dklabel(img: &mut Vec<u8>, edits: &[PartitionTableEdit]) -> Result<()> {
@@ -1748,9 +1747,9 @@ mod tests {
         )
     }
 
-    fn next_label_of(img: &[u8]) -> crate::partition::next::NextDiskLabel {
+    fn next_label_of(img: &[u8]) -> part_tables::next::NextDiskLabel {
         let mut cur = Cursor::new(img.to_vec());
-        crate::partition::next::detect(&mut cur).expect("a NeXT label")
+        part_tables::next::detect(&mut cur).expect("a NeXT label")
     }
 
     fn edit_next(img: &mut Vec<u8>, edits: &[PartitionTableEdit]) -> Result<()> {
@@ -1852,7 +1851,7 @@ mod tests {
     /// the real one stale, and every copy stopped validating.
     #[test]
     fn next_v2_label_is_still_a_label_after_an_edit() {
-        use crate::partition::next::{NextDiskLabel, LABEL_SPAN, NEXT_LABEL_V2};
+        use part_tables::next::{NextDiskLabel, LABEL_SPAN, NEXT_LABEL_V2};
         let mut img = next_disk();
         for block in [0u64, 15, 30, 45] {
             let off = (block * 512) as usize;
@@ -1881,7 +1880,7 @@ mod tests {
     /// NeXTSTEP/Intel disk has no copy at block 0.
     #[test]
     fn next_edits_rewrite_only_the_copies_that_exist() {
-        use crate::partition::next::LABEL_SPAN;
+        use part_tables::next::LABEL_SPAN;
 
         let mut img = next_disk();
         // Stamp a PC boot sector over the copy at block 0, as NeXTSTEP/Intel does.
@@ -1902,7 +1901,7 @@ mod tests {
         for block in [15u64, 30, 45] {
             let at = (block * 512) as usize;
             let label =
-                crate::partition::next::NextDiskLabel::parse(&img[at..at + LABEL_SPAN], 0).unwrap();
+                part_tables::next::NextDiskLabel::parse(&img[at..at + LABEL_SPAN], 0).unwrap();
             let (_, p) = label.browsable_partitions().next().unwrap();
             assert_eq!(p.size_bytes, 8 * 1024 * 1024, "copy at block {block}");
         }
@@ -2103,7 +2102,7 @@ mod tests {
         let mut img = dklabel_disk(true);
         assert_eq!(
             dklabel_of(&img).byte_order,
-            crate::partition::sgi_dklabel::SgiLabelByteOrder::Swabbed
+            part_tables::sgi_dklabel::SgiLabelByteOrder::Swabbed
         );
         edit_dklabel(
             &mut img,
@@ -2118,7 +2117,7 @@ mod tests {
         // normalise the medium's word order.
         assert_eq!(
             after.byte_order,
-            crate::partition::sgi_dklabel::SgiLabelByteOrder::Swabbed
+            part_tables::sgi_dklabel::SgiLabelByteOrder::Swabbed
         );
         assert_eq!(after.map[0].size, 1500);
     }

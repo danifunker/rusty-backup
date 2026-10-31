@@ -7,7 +7,7 @@
 //!
 //! BinHex is the natural single-file, 7-bit-safe container for preserving a
 //! Mac file's full stream data. The encode/decode engine lives in
-//! `crate::fs::binhex`; these verbs are the thin CLI glue around it, mirroring
+//! `fs_mac::binhex`; these verbs are the thin CLI glue around it, mirroring
 //! `put-macbinary`.
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -18,8 +18,8 @@ use std::path::PathBuf;
 use crate::cli::img_at::ImageRef;
 use crate::cli::logging::log_stderr;
 use crate::cli::resolve::{resolve_partition_rw, resolve_partition_streaming_with_password};
-use crate::fs::binhex::{self, BinHexFile};
-use crate::fs::filesystem::{CreateFileOptions, ResourceForkSource};
+use disk_core::filesystem::{CreateFileOptions, ResourceForkSource};
+use fs_mac::binhex::{self, BinHexFile};
 
 #[derive(Debug, Args)]
 pub struct PutBinHexArgs {

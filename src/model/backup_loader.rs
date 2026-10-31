@@ -16,11 +16,9 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use crate::backup::metadata::BackupMetadata;
-use crate::clonezilla::metadata::{
-    load as load_cz_image, resolve_clonezilla_folder, ClonezillaImage,
-};
-use crate::clonezilla::partclone::read_partclone_header;
-use crate::partition::{self, detect_alignment, PartitionAlignment, PartitionInfo, PartitionTable};
+use crate::partition::{detect_alignment, PartitionAlignment, PartitionInfo, PartitionTable};
+use dsk_clonezilla::metadata::{load as load_cz_image, resolve_clonezilla_folder, ClonezillaImage};
+use dsk_clonezilla::partclone::read_partclone_header;
 
 /// What `load_backup` produced — either a native rusty-backup folder or a
 /// detected Clonezilla image.
@@ -191,7 +189,7 @@ pub fn load_clonezilla(folder: &Path) -> Result<ClonezillaLoadOutcome> {
         "Clonezilla image: {} partition(s), disk: {}, source size: {}",
         image.partitions.len(),
         image.disk_name,
-        partition::format_size(image.source_size_bytes),
+        disk_core::display::format_size(image.source_size_bytes),
     ));
 
     // Parse MBR from the loaded image.
@@ -252,7 +250,7 @@ pub fn load_clonezilla(folder: &Path) -> Result<ClonezillaLoadOutcome> {
                         "Partition {} ({}): min {} (used {} of {} blocks, block size {})",
                         cz_part.index,
                         cz_part.device_name,
-                        partition::format_size(used),
+                        disk_core::display::format_size(used),
                         header.used_blocks,
                         header.total_blocks,
                         header.block_size,

@@ -5,8 +5,8 @@
 
 use std::io::Cursor;
 
-use rusty_backup::fs::filesystem::Filesystem;
-use rusty_backup::fs::qdos::QdosFilesystem;
+use disk_core::filesystem::Filesystem;
+use fs_8bit::qdos::QdosFilesystem;
 
 fn main() {
     for path in std::env::args().skip(1) {

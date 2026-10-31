@@ -11,8 +11,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use super::status::SwabStatus;
-use crate::partition::{format_size, PartitionTable};
+use crate::partition::PartitionTable;
 use crate::rbformats::swab;
+use disk_core::display::format_size;
 
 /// Spawn a worker that writes a word-swapped copy of `input` to `output`, or
 /// rewrites `input` itself when `output` is `None`. Returns a shared status

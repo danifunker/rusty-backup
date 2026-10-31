@@ -1,5 +1,5 @@
-use rusty_backup::fs::filesystem::Filesystem;
-use rusty_backup::fs::hfs::HfsFilesystem;
+use disk_core::filesystem::Filesystem;
+use fs_mac::hfs::HfsFilesystem;
 use std::fs::File;
 fn main() {
     let path = std::env::args().nth(1).unwrap();
@@ -15,7 +15,7 @@ fn main() {
     let inside = fs.list_directory(sysf).unwrap();
     println!("{} entries inside System Folder:", inside.len());
     for k in inside.iter().take(40) {
-        let kind = if matches!(k.entry_type, rusty_backup::fs::entry::EntryType::Directory) {
+        let kind = if matches!(k.entry_type, disk_core::entry::EntryType::Directory) {
             "DIR "
         } else {
             "FILE"

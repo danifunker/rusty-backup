@@ -11,7 +11,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use rusty_backup::fs::hfv::HFV_MAX_BYTES;
+use fs_mac::hfv::HFV_MAX_BYTES;
 use rusty_backup::model::hfs_expand_runner::{
     max_volume_for_block_size, start_hfs_expand, suggest_block_size, ExpandOutput, ExpandSource,
     BLOCK_SIZE_CHOICES,

@@ -20,9 +20,7 @@ use std::path::PathBuf;
 use crate::cli::img_at::ImageRef;
 use crate::cli::logging::log_stderr;
 use crate::cli::resolve::{resolve_partition_rw_forced, FsDispatchOverride};
-use crate::fs::tar_import::{
-    import_tar_from_path, ImportConflict, TarImportOptions, TarImportStats,
-};
+use fs_tar::tar_import::{import_tar_from_path, ImportConflict, TarImportOptions, TarImportStats};
 
 #[derive(Debug, Args)]
 pub struct UntarArgs {

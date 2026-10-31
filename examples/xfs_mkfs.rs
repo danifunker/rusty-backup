@@ -6,7 +6,7 @@
 use std::fs::File;
 use std::process::ExitCode;
 
-use rusty_backup::fs::xfs::format::write_blank_xfs;
+use fs_xfs::xfs::format::write_blank_xfs;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();

@@ -36,8 +36,8 @@ use std::io::{Seek, SeekFrom};
 
 use anyhow::{anyhow, bail, Result};
 
-use super::entry::{EntryType, FileEntry};
-use super::filesystem::{
+use disk_core::entry::{EntryType, FileEntry};
+use disk_core::filesystem::{
     CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem, ResourceForkSource,
 };
 
@@ -544,12 +544,12 @@ fn copy_file(
 
 /// An entry's modification date as Unix time: its own Unix mtime, else its classic-Mac date,
 /// which (as on HFS) is local wall-clock time.
-fn source_times(e: &FileEntry) -> Option<crate::fs::times::UnixTimes> {
+fn source_times(e: &FileEntry) -> Option<disk_core::times::UnixTimes> {
     let secs = e.modified_unix.or_else(|| {
         e.mac_dates
-            .and_then(|(_, modified, _)| crate::fs::times::mac_local_to_unix(modified))
+            .and_then(|(_, modified, _)| disk_core::times::mac_local_to_unix(modified))
     })?;
-    Some(crate::fs::times::UnixTimes::mtime_only(secs))
+    Some(disk_core::times::UnixTimes::mtime_only(secs))
 }
 
 /// Build the [`CreateFileOptions`] carrying every metadata axis the
@@ -585,7 +585,7 @@ fn translate_metadata(
         if dst_caps.type_creator {
             o.type_code = src
                 .prodos_file_type
-                .map(crate::fs::prodos_types::format_type_code);
+                .map(fs_apple2::prodos_types::format_type_code);
             o.aux_type = src.aux_type;
         } else {
             d.type_creator = true;
@@ -660,7 +660,7 @@ fn ensure_directory(
     dst: &mut dyn EditableFilesystem,
     parent: &FileEntry,
     name: &str,
-    times: Option<crate::fs::times::UnixTimes>,
+    times: Option<disk_core::times::UnixTimes>,
 ) -> Result<FileEntry> {
     if let Some(existing) = find_child(dst, parent, name)? {
         if existing.is_directory() {
@@ -732,7 +732,7 @@ fn resolve_name(
 /// shortened keeping the extension); the shared legalizer the GUI and TUI use.
 fn mangle_to_fit(dst: &mut dyn EditableFilesystem, desired: &str) -> Option<String> {
     let validate = |n: &str| dst.validate_name(n);
-    crate::fs::name_legalize::legalize_name(&validate, desired).ok()
+    disk_core::name_legalize::legalize_name(&validate, desired).ok()
 }
 
 /// Ensure `base` doesn't collide with an existing destination entry; if it
@@ -828,7 +828,7 @@ fn find_child(
     Ok(select_child(&children, fold_case, name).cloned())
 }
 
-pub use disk_core::entry::select_child;
+use disk_core::entry::select_child;
 
 fn list_children(src: &mut dyn Filesystem, dir: &FileEntry) -> Result<Vec<FileEntry>> {
     src.list_directory(dir)
@@ -847,10 +847,10 @@ mod tests {
             FileEntry::new_file("README.TXT".to_string(), "/README.TXT".to_string(), 0, 3),
             FileEntry::new_file("notes".to_string(), "/notes".to_string(), 0, 4),
         ];
-        assert!(crate::fs::filesystem::folds_case("FAT16"));
-        assert!(crate::fs::filesystem::folds_case("HFS+"));
-        assert!(!crate::fs::filesystem::folds_case("HFSX"));
-        assert!(!crate::fs::filesystem::folds_case("ext4"));
+        assert!(disk_core::filesystem::folds_case("FAT16"));
+        assert!(disk_core::filesystem::folds_case("HFS+"));
+        assert!(!disk_core::filesystem::folds_case("HFSX"));
+        assert!(!disk_core::filesystem::folds_case("ext4"));
         assert_eq!(
             select_child(&children, true, "readme.txt").map(|e| e.name.as_str()),
             Some("README.TXT")
@@ -871,7 +871,7 @@ mod tests {
     /// Regression for docs/bug_binhex_finder_flags.md (the `cp` half).
     #[test]
     fn copy_preserves_finder_flags_hfs_to_hfs() {
-        use crate::fs::hfs::{create_blank_hfs, HfsFilesystem};
+        use fs_mac::hfs::{create_blank_hfs, HfsFilesystem};
         use std::io::Cursor;
 
         let mut src = HfsFilesystem::open(

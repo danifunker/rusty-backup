@@ -8,22 +8,19 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use rusty_backup::clonezilla::block_cache::PartcloneBlockCache;
-use rusty_backup::fs::entry::{EntryType, FileEntry};
-use rusty_backup::fs::filesystem::Filesystem;
-use rusty_backup::fs::fork_export;
-use rusty_backup::fs::resource_fork::{self, ResourceForkMode};
+use arc_mac::detect::{detect_mac_archive, MacArchiveKind};
+use arc_mac::extract as mac_extract;
+use arc_mac::stuffit::{build_archive_tree, StuffItInput, StuffItInputNode, WriteMethod};
+use disk_core::entry::{EntryType, FileEntry};
+use disk_core::filesystem::Filesystem;
+use dsk_clonezilla::block_cache::PartcloneBlockCache;
+use fs_mac::fork_export;
+use fs_mac::resource_fork::{self, ResourceForkMode};
 use rusty_backup::fs::zstd_stream::ZstdStreamCache;
-use rusty_backup::macarchive::detect::{detect_mac_archive, MacArchiveKind};
-use rusty_backup::macarchive::extract as mac_extract;
-use rusty_backup::macarchive::stuffit::{
-    build_archive_tree, StuffItInput, StuffItInputNode, WriteMethod,
-};
 use rusty_backup::model::archive_edit::{self, ArchiveEditContext, ArchiveEditProgress};
 use rusty_backup::model::browse_session::{BrowseOpenStatus, BrowseSession};
 use rusty_backup::model::edit_queue::{self, EditQueue, StagedEdit};
 use rusty_backup::model::status::ExtractionProgress;
-use rusty_backup::partition;
 use rusty_backup::rbformats::chd_edit::{
     self, is_compressed_chd, make_backup_copy, ChdEditSession,
 };
@@ -89,7 +86,7 @@ pub struct BrowseView {
     /// `/etc/group`, built lazily the first time File Info shows an owner and
     /// reused thereafter. `None` = not yet built; a built-but-empty map (a
     /// non-Linux image) is still cached so we don't retry every frame.
-    id_names: Option<rusty_backup::fs::id_names::IdNameMap>,
+    id_names: Option<disk_core::id_names::IdNameMap>,
     /// Volume total / used bytes (cached at open) for the header free-space
     /// line. `volume_total == 0` means "unknown / not loaded".
     volume_total: u64,
@@ -216,7 +213,7 @@ pub struct BrowseView {
     /// On-disk xattrs of the selected entry, cached by path (read once per
     /// selection on an xattr-bearing filesystem). Rebuilt when the selection
     /// changes; `None` = not yet read for this selection.
-    xattr_cache: Option<(String, Vec<rusty_backup::fs::xattr::Xattr>)>,
+    xattr_cache: Option<(String, Vec<disk_core::xattr::Xattr>)>,
     /// Files that failed to stage (bad name, IO error, etc.). When non-empty,
     /// `show_staging_errors` drives a modal dialog listing each failure.
     staging_errors: Vec<(PathBuf, String)>,
@@ -312,7 +309,7 @@ struct PendingArchiveExtract {
     kind: MacArchiveKind,
     raw_bytes: Vec<u8>,
     extract_bytes: Vec<u8>,
-    archive: rusty_backup::macarchive::stuffit::StuffItArchive,
+    archive: arc_mac::stuffit::StuffItArchive,
     fork_format: mac_extract::ForkFormat,
 }
 
@@ -325,7 +322,7 @@ struct MacArchiveWindow {
     entry_name: String,
     kind: MacArchiveKind,
     bytes: Vec<u8>,
-    archive: rusty_backup::macarchive::stuffit::StuffItArchive,
+    archive: arc_mac::stuffit::StuffItArchive,
     selected: Vec<bool>,
     fork_format: mac_extract::ForkFormat,
 }
@@ -387,7 +384,7 @@ struct TarExportProgress {
 #[derive(Clone)]
 struct PendingTarImport {
     archive_path: std::path::PathBuf,
-    preflight: rusty_backup::fs::tar_import::TarImportPreflight,
+    preflight: fs_tar::tar_import::TarImportPreflight,
 }
 
 /// Captured state from `start_extraction` so the extraction can resume after
@@ -606,7 +603,7 @@ impl BrowseView {
             .unwrap_or("")
             .to_ascii_lowercase();
         if ext == "woz" {
-            let original_size = rusty_backup::rbformats::woz::WozReader::open(&source_path)
+            let original_size = dsk_apple::woz::WozReader::open(&source_path)
                 .map(|r| r.len())
                 .unwrap_or(0);
             log::info!(
@@ -944,9 +941,9 @@ impl BrowseView {
                 let free = self.volume_total.saturating_sub(self.volume_used);
                 ui.label(format!(
                     "{} used / {} ({} free)",
-                    partition::format_size(self.volume_used),
-                    partition::format_size(self.volume_total),
-                    partition::format_size(free),
+                    disk_core::display::format_size(self.volume_used),
+                    disk_core::display::format_size(self.volume_total),
+                    disk_core::display::format_size(free),
                 ))
                 .on_hover_text("Volume space: used / total (free)");
             }
@@ -1140,17 +1137,17 @@ impl BrowseView {
                 match self.take_or_open_fs() {
                     Some(mut fs) => {
                         match fs.journal_detail() {
-                            Ok(Some(any)) => match any
-                                .downcast::<rusty_backup::fs::hfsplus_journal::JournalDetail>(
-                            ) {
-                                Ok(detail) => {
-                                    self.journal_view =
-                                        Some(super::journal_view::JournalView::new(*detail));
+                            Ok(Some(any)) => {
+                                match any.downcast::<fs_mac::hfsplus_journal::JournalDetail>() {
+                                    Ok(detail) => {
+                                        self.journal_view =
+                                            Some(super::journal_view::JournalView::new(*detail));
+                                    }
+                                    Err(_) => {
+                                        self.error = Some("Unsupported journal format.".into());
+                                    }
                                 }
-                                Err(_) => {
-                                    self.error = Some("Unsupported journal format.".into());
-                                }
-                            },
+                            }
                             Ok(None) => {
                                 self.error = Some("This volume is not journaled.".into());
                             }
@@ -1475,7 +1472,7 @@ impl BrowseView {
                 };
                 let hover_text = prodos_badge.as_ref().map(|tc| {
                     let tt = entry.prodos_file_type.unwrap_or(0);
-                    let desc = rusty_backup::fs::prodos_types::type_description(tt);
+                    let desc = fs_apple2::prodos_types::type_description(tt);
                     let aux = entry.aux_type.unwrap_or(0);
                     if desc.is_empty() {
                         format!("{tc} ${:04X}", aux)
@@ -1716,7 +1713,7 @@ impl BrowseView {
             Ok(s) => format!(
                 "Exported {} item(s), {} to {}",
                 s.files,
-                partition::format_size(s.bytes),
+                disk_core::display::format_size(s.bytes),
                 path.display()
             ),
             Err(e) => format!("Export failed: {e}"),
@@ -1740,7 +1737,7 @@ impl BrowseView {
             }
         } else if self.is_prodos_type() && entry.is_file() {
             let (t, _) = metadata_editor::resolved_prodos_type(&self.staged_edits, entry);
-            if !rusty_backup::fs::prodos_types::is_known_type(t) {
+            if !fs_apple2::prodos_types::is_known_type(t) {
                 blue
             } else {
                 green
@@ -1774,7 +1771,7 @@ impl BrowseView {
                 format!(
                     "[{}+rsrc {}]",
                     codes,
-                    partition::format_size(imp.data.len() as u64)
+                    disk_core::display::format_size(imp.data.len() as u64)
                 )
             });
 
@@ -1821,7 +1818,7 @@ impl BrowseView {
         if let Some(mut fs) = self.take_or_open_fs() {
             match fs.list_directory(entry) {
                 Ok(mut entries) => {
-                    rusty_backup::fs::entry::sort_for_display(&mut entries);
+                    disk_core::entry::sort_for_display(&mut entries);
                     self.directory_cache.insert(entry.path.clone(), entries);
                 }
                 Err(e) => {
@@ -1923,7 +1920,7 @@ impl BrowseView {
                 .session
                 .open()
                 .ok()
-                .map(|mut fs| rusty_backup::fs::id_names::IdNameMap::from_filesystem(&mut *fs))
+                .map(|mut fs| disk_core::id_names::IdNameMap::from_filesystem(&mut *fs))
                 .unwrap_or_default();
             self.id_names = Some(map);
         }
@@ -1982,14 +1979,14 @@ impl BrowseView {
                 if self.is_prodos_type() {
                     let tt = entry.prodos_file_type;
                     if let Some(tt) = tt {
-                        if !rusty_backup::fs::prodos_types::is_known_type(tt) {
+                        if !fs_apple2::prodos_types::is_known_type(tt) {
                             let aux = entry.aux_type.unwrap_or(0);
                             ui.colored_label(
                                 super::theme::warning(ui.visuals()),
                                 format!(
                                     "Note: ${:02X} is not in the ProDOS type registry - {}. The type and aux (${:04X}) will be preserved on export via the CiderPress #{:02X}{:04X} filename suffix.",
                                     tt,
-                                    rusty_backup::fs::prodos_types::UNKNOWN_TYPE_NOTE,
+                                    fs_apple2::prodos_types::UNKNOWN_TYPE_NOTE,
                                     aux,
                                     tt,
                                     aux,
@@ -2255,7 +2252,7 @@ impl BrowseView {
                 if entry.size > MAX_PREVIEW_SIZE as u64 && entry.is_file() {
                     ui.label(format!(
                         "File too large to preview ({}).",
-                        partition::format_size(entry.size)
+                        disk_core::display::format_size(entry.size)
                     ));
                     return;
                 }
@@ -2393,7 +2390,7 @@ impl BrowseView {
             format!(
                 "{}{}",
                 base,
-                rusty_backup::fs::prodos_types::encode_cp_suffix(tt, aux)
+                fs_apple2::prodos_types::encode_cp_suffix(tt, aux)
             )
         } else {
             base
@@ -2944,7 +2941,7 @@ impl BrowseView {
             String::new()
         };
         let target = target.clone();
-        let compression = rusty_backup::fs::tar_export::TarCompression::infer_from_path(&path);
+        let compression = fs_tar::tar_export::TarCompression::infer_from_path(&path);
         let session = self.session.clone();
         let progress = Arc::new(Mutex::new(TarExportProgress {
             files: 0,
@@ -2974,8 +2971,8 @@ impl BrowseView {
                 let file = std::fs::File::create(&path)
                     .map_err(|e| anyhow::anyhow!("creating {}: {e}", path.display()))?;
                 let out = std::io::BufWriter::new(file);
-                let opts = rusty_backup::fs::tar_export::TarExportOptions::default();
-                let cb = |s: &rusty_backup::fs::tar_export::TarExportStats| {
+                let opts = fs_tar::tar_export::TarExportOptions::default();
+                let cb = |s: &fs_tar::tar_export::TarExportStats| {
                     if let Ok(mut p) = progress_thread.lock() {
                         p.files = s.files;
                         p.dirs = s.dirs;
@@ -2983,7 +2980,7 @@ impl BrowseView {
                         p.bytes = s.total_bytes;
                     }
                 };
-                rusty_backup::fs::tar_export::export_tar(
+                fs_tar::tar_export::export_tar(
                     &mut *fs,
                     &root,
                     &archive_prefix,
@@ -3041,12 +3038,12 @@ impl BrowseView {
                 return true;
             }
         };
-        let image_len = rusty_backup::fs::squashfs_write::image_footprint(fs.total_size());
+        let image_len = fs_squashfs::squashfs_write::image_footprint(fs.total_size());
         // A partition bounds the image; a bare file at byte 0 is the image.
         let capacity = (self.session.partition_offset != 0)
             .then_some(self.session.partition_size)
             .flatten();
-        match rusty_backup::fs::squashfs_edit::plan_size(fs.as_mut(), image_len, capacity) {
+        match fs_squashfs::squashfs_edit::plan_size(fs.as_mut(), image_len, capacity) {
             Ok(plan) => {
                 self.squashfs_budget_dialog = Some(Box::new(
                     super::squashfs_budget_dialog::SquashfsBudgetDialog::new(plan),
@@ -3107,7 +3104,7 @@ impl BrowseView {
                     files,
                     dirs,
                     symlinks,
-                    partition::format_size(bytes),
+                    disk_core::display::format_size(bytes),
                 ));
             }
         }
@@ -3145,11 +3142,11 @@ impl BrowseView {
                     return;
                 }
             };
-            let opts = rusty_backup::fs::tar_import::TarImportOptions {
-                conflict: rusty_backup::fs::tar_import::ImportConflict::Skip,
+            let opts = fs_tar::tar_import::TarImportOptions {
+                conflict: fs_tar::tar_import::ImportConflict::Skip,
                 ..Default::default()
             };
-            match rusty_backup::fs::tar_import::preflight_tar_from_path(&*efs, path, &opts) {
+            match fs_tar::tar_import::preflight_tar_from_path(&*efs, path, &opts) {
                 Ok(pf) => pf,
                 Err(e) => {
                     self.edit_result = Some(format!("Could not read archive: {e:#}"));
@@ -3180,11 +3177,11 @@ impl BrowseView {
                 return;
             }
         };
-        let opts = rusty_backup::fs::tar_import::TarImportOptions {
-            conflict: rusty_backup::fs::tar_import::ImportConflict::Skip,
+        let opts = fs_tar::tar_import::TarImportOptions {
+            conflict: fs_tar::tar_import::ImportConflict::Skip,
             ..Default::default()
         };
-        let stats = match rusty_backup::fs::tar_import::import_tar_from_path(
+        let stats = match fs_tar::tar_import::import_tar_from_path(
             &mut *efs,
             &dest,
             archive,
@@ -3568,7 +3565,7 @@ impl BrowseView {
                 );
             }
             if let Some(Some(free)) = self.edit_free_space {
-                ui.label(format!("Free: {}", partition::format_size(free)));
+                ui.label(format!("Free: {}", disk_core::display::format_size(free)));
 
                 if !self.staged_edits.is_empty() {
                     let delta = self.staged_edits.space_delta();
@@ -3582,7 +3579,7 @@ impl BrowseView {
                     };
                     ui.colored_label(
                         color,
-                        format!("After: {}", partition::format_size(projected)),
+                        format!("After: {}", disk_core::display::format_size(projected)),
                     );
                 }
             }
@@ -3676,7 +3673,7 @@ impl BrowseView {
         // disk image isn't mistaken for one: intercept before staging and let
         // the modal ask whether to import the contents into the image or add
         // the archive as a plain file. Works on any editable filesystem.
-        if rusty_backup::fs::tar_import::looks_like_tar_archive(host_path) {
+        if fs_tar::tar_import::looks_like_tar_archive(host_path) {
             self.pending_tar_add = Some(host_path.to_path_buf());
             return 1;
         }
@@ -3807,7 +3804,7 @@ impl BrowseView {
                     .iter()
                     .any(|a| a.eq_ignore_ascii_case(e))
             });
-        if size > rusty_backup::fs::mem_archive::INLINE_MAX && !named_archive {
+        if size > fs_tar::mem_archive::INLINE_MAX && !named_archive {
             return false;
         }
         let raw = match std::fs::read(host_path) {
@@ -3907,7 +3904,7 @@ impl BrowseView {
         &mut self,
         pending: &PendingArchiveImport,
     ) -> Result<(), String> {
-        let bh = rusty_backup::fs::binhex::parse_binhex(&pending.raw)
+        let bh = fs_mac::binhex::parse_binhex(&pending.raw)
             .map_err(|e| format!("decode BinHex: {e}"))?;
         let root = self.ensure_archive_import_tempdir()?.to_path_buf();
         let subdir = root.join(format!("import-{}", self.pending_archive_imports.len()));
@@ -4086,15 +4083,13 @@ impl BrowseView {
                     return;
                 }
             },
-            ArchiveExportFormat::Mar => {
-                match rusty_backup::macarchive::mar::build_archive(&entry.name, &nodes) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        self.edit_result = Some(format!("MAR build failed: {e}"));
-                        return;
-                    }
+            ArchiveExportFormat::Mar => match arc_mac::mar::build_archive(&entry.name, &nodes) {
+                Ok(b) => b,
+                Err(e) => {
+                    self.edit_result = Some(format!("MAR build failed: {e}"));
+                    return;
                 }
-            }
+            },
             ArchiveExportFormat::SitHqx => {
                 let sit = match build_archive_tree(&nodes, WriteMethod::Store) {
                     Ok(b) => b,
@@ -4103,7 +4098,7 @@ impl BrowseView {
                         return;
                     }
                 };
-                let bh = rusty_backup::fs::binhex::BinHexFile {
+                let bh = fs_mac::binhex::BinHexFile {
                     name: format!("{}.sit", entry.name),
                     type_code: *b"SITD", // StuffIt Deluxe archive type
                     creator_code: *b"SIT!",
@@ -4111,7 +4106,7 @@ impl BrowseView {
                     data_fork: sit,
                     resource_fork: Vec::new(),
                 };
-                rusty_backup::fs::binhex::build_binhex(&bh).into_bytes()
+                fs_mac::binhex::build_binhex(&bh).into_bytes()
             }
             ArchiveExportFormat::Hqx => {
                 // BinHex is fundamentally single-file. The button is gated
@@ -4125,7 +4120,7 @@ impl BrowseView {
                         return;
                     }
                 };
-                let bh = rusty_backup::fs::binhex::BinHexFile {
+                let bh = fs_mac::binhex::BinHexFile {
                     name: file.name,
                     type_code: file.type_code,
                     creator_code: file.creator_code,
@@ -4133,7 +4128,7 @@ impl BrowseView {
                     data_fork: file.data_fork,
                     resource_fork: file.resource_fork,
                 };
-                rusty_backup::fs::binhex::build_binhex(&bh).into_bytes()
+                fs_mac::binhex::build_binhex(&bh).into_bytes()
             }
         };
 
@@ -4143,7 +4138,7 @@ impl BrowseView {
                     "Wrote {} ({}, {})",
                     path.display(),
                     format.label(),
-                    partition::format_size(bytes.len() as u64),
+                    disk_core::display::format_size(bytes.len() as u64),
                 ));
             }
             Err(e) => {
@@ -4168,7 +4163,7 @@ impl BrowseView {
         // the host filename and use the decoded (type, aux) as staged
         // overrides so the round-trip `drag-out → drag-back-in` is lossless.
         let (name, prodos_type, prodos_aux) = if self.is_prodos_type() {
-            match rusty_backup::fs::prodos_types::decode_cp_suffix(&raw_name) {
+            match fs_apple2::prodos_types::decode_cp_suffix(&raw_name) {
                 Some((stem, tt, aa)) => (stem.to_string(), Some(tt), Some(aa)),
                 None => (raw_name, None, None),
             }
@@ -4391,7 +4386,7 @@ impl BrowseView {
         if let Some(mut fs) = self.take_or_open_fs() {
             if let Ok(root) = fs.root() {
                 if let Ok(mut children) = fs.list_directory(&root) {
-                    rusty_backup::fs::entry::sort_for_display(&mut children);
+                    disk_core::entry::sort_for_display(&mut children);
                     self.directory_cache.insert(root.path.clone(), children);
                 }
                 self.root = Some(root);
@@ -4613,7 +4608,7 @@ impl BrowseView {
             &leaf,
             &mut reader,
             bytes.len() as u64,
-            &rusty_backup::fs::filesystem::CreateFileOptions::default(),
+            &disk_core::filesystem::CreateFileOptions::default(),
             rusty_backup::fs::replace::ReplacePolicy::replace(),
         )
         .map_err(|e| anyhow::anyhow!("writing {}: {e}", ed.path))?;
@@ -4765,7 +4760,7 @@ impl BrowseView {
                 if bytes_added > 0 {
                     ui.label(format!(
                         "Net data: +{}",
-                        partition::format_size(bytes_added)
+                        disk_core::display::format_size(bytes_added)
                     ));
                 }
 
@@ -5298,7 +5293,7 @@ impl BrowseView {
                             self.edit_result = Some(format!(
                                 "Wrote {} ({})",
                                 dest.display(),
-                                partition::format_size(pending.raw_bytes.len() as u64),
+                                disk_core::display::format_size(pending.raw_bytes.len() as u64),
                             ));
                         }
                         Err(e) => {
@@ -6102,8 +6097,8 @@ impl BrowseView {
                         ui.label(format!(
                             "{} ({} / {})",
                             g.phase,
-                            rusty_backup::partition::format_size(g.scan_done),
-                            rusty_backup::partition::format_size(g.scan_total),
+                            disk_core::display::format_size(g.scan_done),
+                            disk_core::display::format_size(g.scan_total),
                         ));
                     });
                     ui.add(egui::ProgressBar::new(frac).show_percentage());
@@ -6131,7 +6126,7 @@ impl BrowseView {
                     self.blessed_folder = g.blessed_folder.take();
                     if let Some(root) = g.root.take() {
                         if let Some(mut entries) = g.root_entries.take() {
-                            rusty_backup::fs::entry::sort_for_display(&mut entries);
+                            disk_core::entry::sort_for_display(&mut entries);
                             self.directory_cache.insert("/".into(), entries);
                             self.expanded_paths.insert("/".into());
                         }
@@ -6199,7 +6194,7 @@ impl BrowseView {
     fn detect_boot_blocks_present(&self) -> Option<bool> {
         let path = self.session.source_path.as_ref()?;
         let mut f = std::fs::File::open(path).ok()?;
-        rusty_backup::fs::hfs_boot::has_boot_blocks(&mut f, self.session.partition_offset).ok()
+        fs_mac::hfs_boot::has_boot_blocks(&mut f, self.session.partition_offset).ok()
     }
 
     fn poll_extraction(&mut self, ui: &egui::Ui) {
@@ -6354,7 +6349,7 @@ fn extract_entry(
             format!(
                 "{}{}",
                 base_name,
-                rusty_backup::fs::prodos_types::encode_cp_suffix(tt, aux)
+                fs_apple2::prodos_types::encode_cp_suffix(tt, aux)
             )
         } else {
             base_name
@@ -6449,7 +6444,7 @@ fn extract_entry(
 
 /// Compact byte-count formatter for the Workflow E archive viewer
 /// window. Mirrors `archives_tab::human_size` rather than
-/// `partition::format_size` (which uses base-1000 GB/MB and is meant
+/// `disk_core::display::format_size` (which uses base-1000 GB/MB and is meant
 /// for storage-media advertising units) so the viewer matches the
 /// Archives tab's display.
 fn human_size_b(bytes: u64) -> String {

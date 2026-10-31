@@ -22,9 +22,8 @@
 //! crate dependency.
 
 // The decoders live in the `dsk-floppy` crate; this module keeps the detection and dispatch.
-pub use dsk_floppy::{atr, d88, dim, edsk, floppy_geom, g64, hdf, hdm, msa, xdf};
+use dsk_floppy::{atr, d88, dim, edsk, floppy_geom, hdm, msa, xdf};
 // Moved to the `fs-apple2` crate (shared with Apple DOS 3.3); re-exported so existing paths keep working.
-pub use fs_apple2::sector_order;
 
 use std::io::{Cursor, Read, Seek};
 use std::path::Path;
@@ -451,7 +450,7 @@ mod tests {
 
     #[test]
     fn open_container_bytes_decodes_xdf() {
-        use crate::rbformats::containers::floppy_geom::FloppyMedia;
+        use dsk_floppy::floppy_geom::FloppyMedia;
         let geom = FloppyMedia::Hd1232.geometry();
         // Pattern where byte 0x1B is 0xFE so the D88 sniff doesn't claim it.
         let pattern: Vec<u8> = (0..geom.flat_size())

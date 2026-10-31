@@ -20,9 +20,9 @@ use crate::cli::img_at::ImageRef;
 use crate::cli::logging::{log_stderr, out_stdout};
 use crate::cli::output::{emit_envelope, Envelope, OutputFormat};
 use crate::cli::resolve::{resolve_partition_streaming_forced_inside, FsDispatchOverride};
-use crate::fs::entry::{EntryType, FileEntry};
-use crate::fs::filesystem::Filesystem;
-use crate::partition::format_size;
+use disk_core::display::format_size;
+use disk_core::entry::{EntryType, FileEntry};
+use disk_core::filesystem::Filesystem;
 
 #[derive(Debug, Args)]
 pub struct DuArgs {

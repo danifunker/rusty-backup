@@ -13,9 +13,9 @@ use std::io::Cursor;
 use std::path::PathBuf;
 use std::process::Command;
 
-use rusty_backup::fs::cbm::{create_blank, CbmFilesystem, CbmVariant};
-use rusty_backup::fs::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
-use rusty_backup::rbformats::containers::g64::{decode_g64_bytes, encode_g64_from_d64};
+use disk_core::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+use dsk_floppy::g64::{decode_g64_bytes, encode_g64_from_d64};
+use fs_8bit::cbm::{create_blank, CbmFilesystem, CbmVariant};
 
 /// Build a 1541 .d64 with two known files and return the flat bytes.
 fn build_d64_with_files() -> Vec<u8> {

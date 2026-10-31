@@ -28,8 +28,8 @@ use std::path::PathBuf;
 use crate::cli::img_at::ImageRef;
 use crate::cli::logging::{log_stderr, out_stdout};
 use crate::cli::output::{emit_envelope, require_non_flat, Envelope, OutputFormat};
-use crate::partition::apm::Apm;
-use crate::partition::format_size;
+use disk_core::display::format_size;
+use part_tables::apm::Apm;
 
 #[derive(Debug, Subcommand)]
 pub enum ShowCommand {
@@ -487,7 +487,7 @@ fn show_devices(removable_only: bool, format: OutputFormat) -> Result<()> {
                 out_stdout(format!(
                     "{:<30}  {:>14}  {:<10}  {:<12}  {}",
                     d.path,
-                    crate::partition::format_size(d.size_bytes),
+                    disk_core::display::format_size(d.size_bytes),
                     if d.removable { "yes" } else { "no" },
                     d.bus_protocol,
                     d.name
