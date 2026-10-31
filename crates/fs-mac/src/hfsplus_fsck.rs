@@ -17,19 +17,19 @@
 //! every issue is flagged as non-repairable.
 
 #[cfg(feature = "rust173-polyfill")]
-use crate::rust173_compat::IntIsMultipleOf as _;
+use disk_core::rust173::IntIsMultipleOf as _;
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek};
 
 use byteorder::{BigEndian, ByteOrder};
 
-use super::filesystem::FilesystemError;
-use super::fsck::{FsckIssue, FsckResult, FsckStats, OrphanedEntry};
-use super::hfs_common::{
+use crate::hfs_common::{
     btree_lonely_empty_leaves, btree_stale_index_keys, btree_unerased_free_nodes,
     walk_leaf_records, BTreeHeader, BTreeKeyFormat,
 };
-use super::hfsplus::{catalog_compare_keys, HfsPlusFilesystem};
+use crate::hfsplus::{catalog_compare_keys, HfsPlusFilesystem};
+use disk_core::filesystem::FilesystemError;
+use disk_core::fsck::{FsckIssue, FsckResult, FsckStats, OrphanedEntry};
 
 const HFS_PLUS_SIGNATURE: u16 = 0x482B; // "H+"
 const HFSX_SIGNATURE: u16 = 0x4858; // "HX"
@@ -149,7 +149,7 @@ pub(super) fn check<R: Read + Seek>(
                         let cur_key = rec[..2 + key_len].to_vec();
                         if let Some((prev_node, prev_rec, ref prev)) = prev_key {
                             use std::cmp::Ordering as Ord2;
-                            let cmp = super::hfsplus::catalog_compare_keys(
+                            let cmp = crate::hfsplus::catalog_compare_keys(
                                 prev,
                                 &cur_key,
                                 case_sensitive,
@@ -683,8 +683,8 @@ mod tests {
     use byteorder::{BigEndian, ByteOrder};
     use std::io::Cursor;
 
-    use super::super::filesystem::Filesystem;
-    use super::super::hfsplus::{create_blank_hfsplus, HfsPlusFilesystem};
+    use crate::hfsplus::{create_blank_hfsplus, HfsPlusFilesystem};
+    use disk_core::filesystem::Filesystem;
 
     /// VH file_count lives at offset 1024 + 32 (big-endian u32). Mirror to
     /// the alternate VH at end-of-volume too so re-open uses the poked
@@ -747,7 +747,7 @@ mod tests {
     /// blank layout uses, so the bitmap will not account for it (harmless for
     /// these journal-focused tests).
     fn graft_journal(size: u64, bs: u32, txns: &[Vec<(u64, Vec<u8>)>]) -> (Vec<u8>, Vec<u64>) {
-        use super::super::hfsplus_journal::{
+        use crate::hfsplus_journal::{
             JournalEndian, JournalHeader, JournalInfoBlock, TransactionBuilder,
             JOURNAL_HEADER_MAGIC, KJI_JOURNAL_IN_FS_MASK,
         };
@@ -757,7 +757,7 @@ mod tests {
         // Set the journaled bit in the primary + alternate volume headers.
         for vh in [1024usize, img.len() - 1024] {
             let mut attrs = BigEndian::read_u32(&img[vh + 4..vh + 8]);
-            attrs |= super::super::hfsplus::HFSPLUS_VOLUME_JOURNALED_BIT;
+            attrs |= crate::hfsplus::HFSPLUS_VOLUME_JOURNALED_BIT;
             BigEndian::write_u32(&mut img[vh + 4..vh + 8], attrs);
         }
 
@@ -877,12 +877,12 @@ mod tests {
         // Block at 1024 lands in the volume header region.
         let regions = &detail.regions;
         assert_eq!(
-            super::super::hfsplus_journal::classify_target(regions, 1024),
+            crate::hfsplus_journal::classify_target(regions, 1024),
             "volume header"
         );
         // A high sector classifies as fork data (outside all metadata regions).
         assert_eq!(
-            super::super::hfsplus_journal::classify_target(regions, 8 * 1024 * 1024),
+            crate::hfsplus_journal::classify_target(regions, 8 * 1024 * 1024),
             "fork data"
         );
         // Preview is populated and capped.
@@ -915,10 +915,7 @@ mod tests {
             .prepare_for_edit()
             .expect_err("dirty journal must refuse");
         assert!(
-            matches!(
-                err,
-                super::super::filesystem::FilesystemError::Unsupported(_)
-            ),
+            matches!(err, disk_core::filesystem::FilesystemError::Unsupported(_)),
             "expected Unsupported, got {err:?}"
         );
     }

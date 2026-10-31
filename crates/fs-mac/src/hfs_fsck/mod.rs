@@ -17,13 +17,13 @@
 //! `repair_hfs` zeroes them the way `fsck_hfs` does. Our own writer erases what it
 //! frees (`btree_free_node`), so a fresh rb-cli edit never adds to the count.
 
-#[cfg(feature = "rust173-polyfill")]
-use crate::rust173_compat::IntIsMultipleOf as _;
 use byteorder::{BigEndian, ByteOrder};
+#[cfg(feature = "rust173-polyfill")]
+use disk_core::rust173::IntIsMultipleOf as _;
 
-use super::fsck::{FsckIssue, FsckResult, FsckStats, RepairReport};
-use super::hfs::HfsMasterDirectoryBlock;
-use super::hfs_common::{btree_erase_free_nodes, btree_unerased_free_nodes, BTreeHeader};
+use crate::hfs::HfsMasterDirectoryBlock;
+use crate::hfs_common::{btree_erase_free_nodes, btree_unerased_free_nodes, BTreeHeader};
+use disk_core::fsck::{FsckIssue, FsckResult, FsckStats, RepairReport};
 
 pub(super) const CATALOG_DIR_THREAD: i8 = 3;
 pub(super) const CATALOG_FILE_THREAD: i8 = 4;
@@ -485,20 +485,20 @@ pub(crate) fn repair_hfs(
 
 #[cfg(test)]
 mod tests {
-    use super::super::hfs_common::{
-        bitmap_set_bit_be, BTREE_HEADER_NODE, BTREE_INDEX_NODE, BTREE_LEAF_NODE, BTREE_MAP_NODE,
-    };
     use super::btree::{
         check_key_ordering, check_map_nodes, check_node_bitmap_consistency, repair_key_ordering,
         repair_map_nodes, repair_node_bitmap,
     };
+    use crate::hfs_common::{
+        bitmap_set_bit_be, BTREE_HEADER_NODE, BTREE_INDEX_NODE, BTREE_LEAF_NODE, BTREE_MAP_NODE,
+    };
     use std::collections::HashMap;
 
-    use super::super::hfs::{HfsExtDescriptor, CATALOG_DIR, CATALOG_FILE};
-    use super::super::hfs_common::btree_record_range;
     use super::catalog::check_directory_structure;
     use super::mdb::validate_hfs_name;
     use super::*;
+    use crate::hfs::{HfsExtDescriptor, CATALOG_DIR, CATALOG_FILE};
+    use crate::hfs_common::btree_record_range;
 
     #[test]
     fn test_fsck_code_to_string() {
@@ -1905,7 +1905,7 @@ mod tests {
         let node_size = 512;
         let mut data = make_minimal_btree(node_size);
         let n3 = 3 * node_size;
-        data[n3 + 8] = crate::fs::hfs_common::BTREE_INDEX_NODE as u8;
+        data[n3 + 8] = crate::hfs_common::BTREE_INDEX_NODE as u8;
         data[n3 + 9] = 2;
         BigEndian::write_u16(&mut data[n3 + 10..n3 + 12], 1);
         let r0 = n3 + 14;

@@ -1,0 +1,43 @@
+[package]
+name = "fs-mac"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.73"
+license = "MIT"
+authors = ["Dani Sarfati <dani@funkervogt.com>"]
+description = "Read, edit, create, check and clone classic Mac filesystems: MFS, HFS (incl. HFV images) and HFS+/HFSX, plus resource forks and BinHex"
+repository = "https://github.com/danifunker/rusty-backup"
+readme = "README.md"
+keywords = ["filesystem", "hfs", "hfsplus", "macintosh", "retro"]
+categories = ["filesystem", "emulators"]
+
+[features]
+default = ["forks", "hfs", "hfsplus", "mfs"]
+# One feature per filesystem; `hfs_common` (B-trees, dates, type/creator codes) is always built.
+hfs = []
+hfsplus = []
+mfs = ["hfs"]
+# Resource forks, BinHex 4.0 and AppleDouble / MacBinary fork export.
+forks = ["hfs"]
+# Only for a Rust 1.73 toolchain; see disk-core.
+rust173-polyfill = ["disk-core/rust173-polyfill", "fs-mac-unicode/rust173-polyfill"]
+
+[dependencies]
+disk-core = { path = "../disk-core", version = "0.1", features = ["fs"] }
+# GPL-2.0-only: the HFS / HFS+ name-ordering tables (see that crate's README).
+fs-mac-unicode = { path = "../fs-mac-unicode", version = "0.1" }
+anyhow = "1"
+byteorder = "1"
+chrono = "0.4"
+log = "0.4"
+serde_json = "1"
+thiserror = "2"
+# fork_export stamps exported files with the source dates.
+filetime = "0.2"
+
+[target.'cfg(unix)'.dependencies]
+# macOS reads native resource forks through getxattr.
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

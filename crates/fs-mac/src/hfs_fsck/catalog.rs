@@ -8,18 +8,18 @@
 //! Split out of `hfs_fsck/mod.rs` per §8 of `docs/codecleanup.md`.
 
 #[cfg(feature = "rust173-polyfill")]
-use crate::rust173_compat::IntIsMultipleOf as _;
+use disk_core::rust173::IntIsMultipleOf as _;
 use std::collections::{HashMap, HashSet};
 
 use byteorder::{BigEndian, ByteOrder};
 
-use super::super::fsck::{FsckIssue, OrphanedEntry, RepairReport};
-use super::super::hfs::{
-    mac_roman_to_utf8, HfsExtDescriptor, HfsMasterDirectoryBlock, CATALOG_DIR, CATALOG_FILE,
-};
-use super::super::hfs_common::{btree_record_range, BTreeHeader};
 use super::mdb::{unusual_hfs_name, validate_hfs_name};
 use super::{hfs_issue, HfsFsckCode, CATALOG_DIR_THREAD, CATALOG_FILE_THREAD};
+use crate::hfs::{
+    mac_roman_to_utf8, HfsExtDescriptor, HfsMasterDirectoryBlock, CATALOG_DIR, CATALOG_FILE,
+};
+use crate::hfs_common::{btree_record_range, BTreeHeader};
+use disk_core::fsck::{FsckIssue, OrphanedEntry, RepairReport};
 
 /// Parsed catalog key for consistency checking.
 pub(super) struct CatalogKey {
@@ -851,7 +851,7 @@ fn insert_thread_record(
     parent_id: u32,
     name: &[u8],
 ) -> bool {
-    use super::super::hfs::HfsFilesystem;
+    use crate::hfs::HfsFilesystem;
 
     // Build thread key: (cnid, "")
     let key = HfsFilesystem::<std::io::Cursor<Vec<u8>>>::build_catalog_key(cnid, &[]);
@@ -869,12 +869,8 @@ fn insert_thread_record(
     // Find the correct leaf node and try to insert
     let header = BTreeHeader::read(catalog_data);
     let compare = HfsFilesystem::<std::io::Cursor<Vec<u8>>>::catalog_compare;
-    let (leaf_idx, _) = super::super::hfs_common::btree_find_insert_leaf(
-        catalog_data,
-        &header,
-        &key_record,
-        &compare,
-    );
+    let (leaf_idx, _) =
+        crate::hfs_common::btree_find_insert_leaf(catalog_data, &header, &key_record, &compare);
 
     let offset = leaf_idx as usize * node_size;
     if offset + node_size > catalog_data.len() {
@@ -882,8 +878,7 @@ fn insert_thread_record(
     }
 
     let node = &mut catalog_data[offset..offset + node_size];
-    if super::super::hfs_common::btree_insert_record(node, node_size, &key_record, &compare).is_ok()
-    {
+    if crate::hfs_common::btree_insert_record(node, node_size, &key_record, &compare).is_ok() {
         let mut h = BTreeHeader::read(catalog_data);
         h.leaf_records += 1;
         h.write(catalog_data);
@@ -1007,9 +1002,9 @@ fn repair_thread_record_lengths(
 
 /// Remove a thread record (key = (cnid, "")) from the catalog B-tree.
 fn remove_thread_record(catalog_data: &mut [u8], node_size: usize, cnid: u32) -> bool {
-    let compare = super::super::hfs::HfsFilesystem::<std::io::Cursor<Vec<u8>>>::catalog_compare;
+    let compare = crate::hfs::HfsFilesystem::<std::io::Cursor<Vec<u8>>>::catalog_compare;
     let search_key =
-        super::super::hfs::HfsFilesystem::<std::io::Cursor<Vec<u8>>>::build_catalog_key(cnid, &[]);
+        crate::hfs::HfsFilesystem::<std::io::Cursor<Vec<u8>>>::build_catalog_key(cnid, &[]);
 
     let header = BTreeHeader::read(catalog_data);
     let mut node_idx = header.first_leaf_node;
@@ -1038,7 +1033,7 @@ fn remove_thread_record(catalog_data: &mut [u8], node_size: usize, cnid: u32) ->
             let key_portion = &catalog_data[off + rec_start..off + key_end];
             if compare(key_portion, &search_key) == std::cmp::Ordering::Equal {
                 let node = &mut catalog_data[off..off + node_size];
-                super::super::hfs_common::btree_remove_record(node, node_size, i);
+                crate::hfs_common::btree_remove_record(node, node_size, i);
                 let mut h = BTreeHeader::read(catalog_data);
                 h.leaf_records = h.leaf_records.saturating_sub(1);
                 h.write(catalog_data);
@@ -1057,11 +1052,9 @@ fn remove_record_by_key(
     parent_id: u32,
     name: &[u8],
 ) -> bool {
-    let compare = super::super::hfs::HfsFilesystem::<std::io::Cursor<Vec<u8>>>::catalog_compare;
+    let compare = crate::hfs::HfsFilesystem::<std::io::Cursor<Vec<u8>>>::catalog_compare;
     let search_key =
-        super::super::hfs::HfsFilesystem::<std::io::Cursor<Vec<u8>>>::build_catalog_key(
-            parent_id, name,
-        );
+        crate::hfs::HfsFilesystem::<std::io::Cursor<Vec<u8>>>::build_catalog_key(parent_id, name);
 
     let header = BTreeHeader::read(catalog_data);
     let mut node_idx = header.first_leaf_node;
@@ -1090,7 +1083,7 @@ fn remove_record_by_key(
             let key_portion = &catalog_data[off + rec_start..off + key_end];
             if compare(key_portion, &search_key) == std::cmp::Ordering::Equal {
                 let node = &mut catalog_data[off..off + node_size];
-                super::super::hfs_common::btree_remove_record(node, node_size, i);
+                crate::hfs_common::btree_remove_record(node, node_size, i);
                 let mut h = BTreeHeader::read(catalog_data);
                 h.leaf_records = h.leaf_records.saturating_sub(1);
                 h.write(catalog_data);

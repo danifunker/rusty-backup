@@ -22,6 +22,7 @@ on:
       - "fs-hpfs-v*"
       - "fs-apfs-v*"
       - "fs-mac-unicode-v*"
+      - "fs-mac-v*"
   workflow_dispatch:
     inputs:
       crate:
@@ -44,6 +45,7 @@ on:
           - fs-hpfs
           - fs-apfs
           - fs-mac-unicode
+          - fs-mac
       dry_run:
         description: Package and verify only, do not upload
         required: true

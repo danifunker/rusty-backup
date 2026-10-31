@@ -6,13 +6,13 @@
 //!
 //! Split out of `hfs_fsck/mod.rs` per §8 of `docs/codecleanup.md`.
 
-#[cfg(feature = "rust173-polyfill")]
-use crate::rust173_compat::IntIsMultipleOf as _;
 use byteorder::{BigEndian, ByteOrder};
+#[cfg(feature = "rust173-polyfill")]
+use disk_core::rust173::IntIsMultipleOf as _;
 
-use super::super::fsck::FsckIssue;
-use super::super::hfs::HfsMasterDirectoryBlock;
 use super::{hfs_issue, HfsFsckCode};
+use crate::hfs::HfsMasterDirectoryBlock;
+use disk_core::fsck::FsckIssue;
 
 /// Validate an HFS catalog name (Mac Roman bytes) for *structural* validity.
 ///

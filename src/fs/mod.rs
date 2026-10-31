@@ -47,12 +47,11 @@ pub mod hfs;
 pub mod hfs_boot;
 pub mod hfs_clone;
 pub mod hfs_common;
-pub mod hfs_fsck;
+pub use hfsplus::resolve_apple_hfs;
 pub mod hfs_unicode;
 pub mod hfsplus;
 pub mod hfsplus_clone;
 pub mod hfsplus_defrag;
-pub mod hfsplus_fsck;
 pub mod hfsplus_journal;
 pub mod hfsplus_wrapper_clone;
 pub mod hfv;
@@ -3594,62 +3593,6 @@ pub fn resolve_next_label(reader: &mut (impl Read + Seek), partition_offset: u64
     crate::partition::next::detect_at(reader, partition_offset)
         .and_then(|l| crate::partition::next::embedded_fs_offset(&l, partition_offset))
         .unwrap_or(partition_offset)
-}
-
-/// Resolve the actual HFS filesystem variant for an "Apple_HFS" APM partition.
-///
-/// Returns `(fs_type, hfsplus_offset)` where `fs_type` is `"hfs"`, `"hfsplus"`,
-/// or `"unknown"`, and `hfsplus_offset` is the partition_offset to pass to
-/// `HfsPlusFilesystem::open` (accounts for the embedded volume's position).
-///
-/// Three cases are handled:
-/// - Native HFS+ (0x482B/0x4858 at partition_offset+1024): `hfsplus_offset == partition_offset`.
-/// - Embedded HFS+ (HFS wrapper with 0x4244 MDB, drEmbedSigWord == 0x482B): `hfsplus_offset`
-///   is calculated from the MDB's drAlBlSt/drAlBlkSiz/drEmbedExtent fields.
-/// - Pure HFS (0x4244, no embedded HFS+): returns `"hfs"`.
-pub fn resolve_apple_hfs<R: Read + Seek>(
-    reader: &mut R,
-    partition_offset: u64,
-) -> (&'static str, u64) {
-    // The HFS MDB / HFS+ volume header sits at partition_offset + 1024 (sector-aligned).
-    // Read 512 bytes (one sector) — all required fields are within the first 512 bytes
-    // of the MDB (largest field needed is drEmbedExtent.startBlock at MDB offset 127).
-    // This keeps the read sector-aligned for raw character device compatibility.
-    if reader
-        .seek(SeekFrom::Start(partition_offset + 1024))
-        .is_err()
-    {
-        return ("unknown", partition_offset);
-    }
-    let mut buf = [0u8; 512];
-    if reader.read_exact(&mut buf).is_err() {
-        return ("unknown", partition_offset);
-    }
-    let sig = u16::from_be_bytes([buf[0], buf[1]]);
-    match sig {
-        0x4244 => {
-            // HFS MDB — check for embedded HFS+ (drEmbedSigWord at MDB offset 124)
-            let embedded_sig = u16::from_be_bytes([buf[124], buf[125]]);
-            if embedded_sig == 0x482B {
-                // Embedded HFS+: calculate the embedded volume's starting offset.
-                // drAlBlkSiz (allocation block size, bytes) at MDB offset 20 (u32 BE).
-                // drAlBlSt (first alloc block in 512-byte sectors) at MDB offset 28 (u16 BE).
-                // drEmbedExtent.startBlock at MDB offset 126 (u16 BE).
-                let block_size = u32::from_be_bytes([buf[20], buf[21], buf[22], buf[23]]) as u64;
-                let first_alloc_block = u16::from_be_bytes([buf[28], buf[29]]) as u64;
-                let embedded_start = u16::from_be_bytes([buf[126], buf[127]]) as u64;
-                // HFS+ volume starts at: partition_offset + drAlBlSt*512 + startBlock*drAlBlkSiz
-                let hfsplus_offset =
-                    partition_offset + first_alloc_block * 512 + embedded_start * block_size;
-                ("hfsplus", hfsplus_offset)
-            } else {
-                ("hfs", partition_offset)
-            }
-        }
-        // Native HFS+ or HFSX — volume header is directly at partition_offset+1024
-        0x482B | 0x4858 => ("hfsplus", partition_offset),
-        _ => ("unknown", partition_offset),
-    }
 }
 
 /// Probe an HFS or HFS+ partition for its allocation block size in bytes.

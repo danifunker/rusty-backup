@@ -814,6 +814,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs-mac"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "byteorder",
+ "chrono",
+ "disk-core",
+ "filetime",
+ "fs-mac-unicode",
+ "libc",
+ "log",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "fs-mac-unicode"
 version = "0.1.0"
 
@@ -1525,6 +1541,7 @@ dependencies = [
  "fs-apple2",
  "fs-cpm",
  "fs-hpfs",
+ "fs-mac",
  "fs-mac-unicode",
  "fs-pc",
  "fs-qnx",

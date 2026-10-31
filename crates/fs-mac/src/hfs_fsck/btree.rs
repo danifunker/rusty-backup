@@ -9,20 +9,20 @@
 //! Split out of `hfs_fsck/mod.rs` per §8 of `docs/codecleanup.md`.
 
 #[cfg(feature = "rust173-polyfill")]
-use crate::rust173_compat::IntIsMultipleOf as _;
+use disk_core::rust173::IntIsMultipleOf as _;
 use std::cmp::Ordering;
 use std::collections::HashSet;
 
 use byteorder::{BigEndian, ByteOrder};
 
-use super::super::fsck::{FsckIssue, RepairReport};
-use super::super::hfs_common::{
+use super::{hfs_issue, HfsFsckCode};
+use crate::hfs_common::{
     btree_bitmap_set, btree_bitmap_test, btree_insert_record, btree_lonely_empty_leaves,
     btree_node_bitmap_range, btree_record_range, btree_stale_index_keys,
     normalize_catalog_index_key, BTreeHeader, BTreeKeyFormat, BTREE_HEADER_NODE, BTREE_INDEX_NODE,
     BTREE_LEAF_NODE, BTREE_MAP_NODE,
 };
-use super::{hfs_issue, HfsFsckCode};
+use disk_core::fsck::{FsckIssue, RepairReport};
 
 pub(super) const HFS_MAX_NRECS: usize = 35;
 
@@ -334,7 +334,7 @@ pub(super) fn check_node_bitmap_consistency(
 /// Compare two catalog key byte slices for ordering.
 /// Each slice starts with key_len(1) + reserved(1) + parent_id(4) + name_len(1) + name.
 fn compare_catalog_keys(a: &[u8], b: &[u8]) -> Ordering {
-    super::super::hfs::HfsFilesystem::<std::io::Cursor<Vec<u8>>>::catalog_compare(a, b)
+    crate::hfs::HfsFilesystem::<std::io::Cursor<Vec<u8>>>::catalog_compare(a, b)
 }
 
 /// Extract the key portion of a record (key_len byte + key_len bytes of data).
@@ -543,7 +543,7 @@ fn check_index_record_lengths(
     num_records: usize,
     errors: &mut Vec<FsckIssue>,
 ) {
-    use super::super::hfs_common::HFS_CAT_MAX_KEY_LEN;
+    use crate::hfs_common::HFS_CAT_MAX_KEY_LEN;
 
     // Expected: key_len(1) + key_data(0x25=37) + child_ptr(4) = 42
     let expected_len: usize = 1 + HFS_CAT_MAX_KEY_LEN as usize + 4; // 42
@@ -1160,7 +1160,7 @@ fn rebuild_leaf_chain(catalog_data: &mut [u8], node_size: usize, report: &mut Re
 
     // Sort by first key using HFS catalog key comparison
     leaf_nodes.sort_by(|a, b| {
-        super::super::hfs::HfsFilesystem::<std::io::Cursor<Vec<u8>>>::catalog_compare(&a.1, &b.1)
+        crate::hfs::HfsFilesystem::<std::io::Cursor<Vec<u8>>>::catalog_compare(&a.1, &b.1)
     });
 
     // Check if chain is already correct (same nodes in same order)
@@ -1245,7 +1245,7 @@ pub(crate) fn rebuild_index_nodes(
     node_size: usize,
     report: &mut RepairReport,
 ) {
-    use super::super::hfs_common::{btree_alloc_node, btree_free_node, init_node};
+    use crate::hfs_common::{btree_alloc_node, btree_free_node, init_node};
 
     let header = BTreeHeader::read(catalog_data);
     let max_nodes = catalog_data.len() / node_size;
@@ -1318,7 +1318,7 @@ pub(crate) fn rebuild_index_nodes(
     h.free_nodes += freed;
     h.write(catalog_data);
 
-    let compare = super::super::hfs::HfsFilesystem::<std::io::Cursor<Vec<u8>>>::catalog_compare;
+    let compare = crate::hfs::HfsFilesystem::<std::io::Cursor<Vec<u8>>>::catalog_compare;
 
     // Build index levels bottom-up
     let mut height: u8 = 1; // leaves are height 1

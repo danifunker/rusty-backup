@@ -8,18 +8,18 @@
 //! Split out of `hfs_fsck/mod.rs` per §8 of `docs/codecleanup.md`.
 
 #[cfg(feature = "rust173-polyfill")]
-use crate::rust173_compat::IntIsMultipleOf as _;
+use disk_core::rust173::IntIsMultipleOf as _;
 use std::collections::HashSet;
 
 use byteorder::{BigEndian, ByteOrder};
 
-use super::super::fsck::{FsckIssue, RepairReport};
-use super::super::hfs::{HfsExtDescriptor, HfsMasterDirectoryBlock, CATALOG_FILE};
-use super::super::hfs_common::{
-    bitmap_set_bit_be, bitmap_test_bit_be, btree_record_range, BTreeHeader, BTREE_LEAF_NODE,
-};
 use super::catalog::{collect_catalog_entries, CatalogEntry};
 use super::{hfs_issue, HfsFsckCode};
+use crate::hfs::{HfsExtDescriptor, HfsMasterDirectoryBlock, CATALOG_FILE};
+use crate::hfs_common::{
+    bitmap_set_bit_be, bitmap_test_bit_be, btree_record_range, BTreeHeader, BTREE_LEAF_NODE,
+};
+use disk_core::fsck::{FsckIssue, RepairReport};
 
 /// Maximum number of bitmap mismatch issues to report before capping.
 const MAX_BITMAP_MISMATCHES: usize = 20;

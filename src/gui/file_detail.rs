@@ -35,7 +35,8 @@ mod hfs_file_types {
     }
 
     static HFS_TYPES: OnceLock<HashMap<String, bool>> = OnceLock::new();
-    const HFS_FILE_TYPES_JSON: &str = include_str!("../../assets/hfs_file_types.json");
+    const HFS_FILE_TYPES_JSON: &str =
+        include_str!("../../crates/fs-mac/assets/hfs_file_types.json");
 
     fn get() -> &'static HashMap<String, bool> {
         HFS_TYPES.get_or_init(|| {

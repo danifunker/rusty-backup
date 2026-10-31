@@ -1,4 +1,4 @@
-# Resume: crate split — fs-mac, then Steps 4–7
+# Resume: crate split — Steps 4–7
 
 Paste the prompt below into a new Claude Code session in a checkout of
 `rusty-backup` on branch `native-frontends` (on dani's box that's the
@@ -12,13 +12,14 @@ Read it first, along with `docs/license_audit.md`, CLAUDE.md and CONTRIBUTING.md
 
 ## Where it stands (2026-10-31)
 
-- **Steps 0–2 are done, and most of Step 3.** The old `crate::fs::*` and
+- **Steps 0–3 are done.** The old `crate::fs::*` and
   `crate::clonezilla::*` paths are `pub use` shims, so the app compiles unchanged.
   The crates under `crates/`:
   - Steps 0–2: `disk-core`, `fs-8bit`, `fs-cpm`, `fs-apple2`, `fs-qnx` and `fs-xerox`.
   - `dsk-clonezilla`, done early (Step 5).
   - Step 3: `fs-amiga`, `fs-unix`, `fs-xfs` (GPL-2.0-only), `fs-squashfs`,
-    `fs-pc`, `fs-hpfs` (GPL-2.0-only) and `fs-apfs`.
+    `fs-pc`, `fs-hpfs` (GPL-2.0-only), `fs-apfs`, `fs-mac` and `fs-mac-unicode`
+    (GPL-2.0-only).
   - `docs/crate_split_plan.md` §9 has one bullet per slice, saying what moved,
     what was held back and why.
 - **`disk-core` grew, backwards-compatibly:** `name_legalize`, `stream_pipe`,
@@ -103,56 +104,24 @@ Read it first, along with `docs/license_audit.md`, CLAUDE.md and CONTRIBUTING.md
   - Add every new crate to both lists in the workflow: the tag patterns and the
     manual-run choices.
 
-## Start here: `fs-mac` (Step 3's last family)
+## Start here: Step 4, `part-tables`
 
-The survey is done; this is the carve it found:
+Step 3 is done, including `fs-mac` and its GPL sub-crate `fs-mac-unicode`; see
+`crate_split_plan.md` §9 for what moved and what stayed. Still held back from
+earlier steps: `adfs`, `qdos`, `lif`, `ofs*`, `sun2tape*` / `tar_section` and
+`lisa`.
 
-- **The `fs-mac` crate (MIT):** `mfs`, `hfs`, `hfs_fsck/`, `hfs_common` (minus
-  the GPL parts below), `hfsplus`, `hfsplus_clone`, `hfsplus_defrag`,
-  `hfsplus_fsck`, `hfsplus_journal`, `hfsplus_wrapper_clone`, `hfv`,
-  `mac_alias`, `resource_fork`, `binhex` and probably `fork_export`.
-  - `fork_export` depends only on binhex, resource_fork and disk-core. `mfs`'s
-    tests use it.
-  - `hfs_common` needs `include_str!("../../assets/hfs_file_types.json")`, so
-    move that asset into the crate, as `fs-apple2` did with the ProDOS types.
-  - Re-cite `hfsplus_journal`'s `calc_checksum` to TN1150 and drop
-    "verbatim / byte-for-byte" (audit follow-up).
-- **The GPL-2.0-only sub-crate (e.g. `fs-mac-unicode`):** move `hfs_unicode.rs`
-  whole. Out of `hfs_common` comes the hfsutils-derived `HFS_CHARORDER` table,
-  together with:
-  - `compare_hfs_keys`, its only user
-  - `fold_hfsplus_name_for_compare`
-  - `compare_hfsplus_keys`
-  - their tests, which sit in `hfs_common`'s test module around lines 2964–3150
-
-  `hfs_common` re-exports them. Every HFS+ module then depends on the sub-crate.
-  Classic HFS reaches it only through `compare_hfs_keys`, which `hfs.rs:949` and
-  `mfs.rs:446` call.
-- **Stays in the app (C3):**
-  - `hfs_clone::emit_apm_disk_with_hfs`, which uses `partition::apm` and is
-    called by `rbformats/qcow2.rs`, together with its APM tests.
-  - `hfs_boot::read_donor_boot_blocks_from_image` and
-    `is_classic_hfs_partition`, which use `PartitionTable`.
-    `has_boot_blocks` / `read_donor_boot_blocks` move.
-  - `mac_scsi_bless` and the `apple_scsi_driver*.bin` blobs.
-- **Move into `fs-mac`:** `resolve_apple_hfs` (std only, in `src/fs/mod.rs`
-  ~3610). `hfsplus.rs:3868` calls it. Re-export it from `fs/mod.rs`.
-- **The four `can_defrag_clone_hfsplus` tests** (`hfsplus.rs` ~7257–7331) use
-  the app's dispatcher. Move them to the `src/fs/hfsplus.rs` shim, the way the
-  UFS / ReiserFS / SquashFS dispatcher tests were moved.
-- **`hfv.rs`'s test at 186** uses `PartitionTable`, so move that test to the
-  shim too.
-- **Hold back `lisa`.** It needs `rbformats::dc42`, which belongs in
-  `dsk-apple`, and `fs-mac` → `dsk-apple` would be a cross-family dependency.
-  Move it with Step 5.
-- **Make `binhex::rle90_decode` / `rle90_encode` `pub`.**
-  `macarchive/stuffit.rs:383` and `:474` use them.
-- **Two doc links will dangle:** `hfs.rs:3029` → efs and `resource_fork.rs:537`
-  → macarchive. Turn them into plain backticks.
-- **Afterwards,** `ofs*` can move into `fs-unix` (feature `bfs`, or `ofs`) if
-  `resolve_create_type_creator` and its type/creator table go into `fs-mac`.
-  That makes `fs-unix` depend on `fs-mac`; the alternative is to put the table
-  in `disk-core`. Decide that first.
+- **`ofs*` needs a decision first.** `hfs_common::resolve_create_type_creator`
+  and its type/creator table are now in `fs-mac`. Either `fs-unix` depends on
+  `fs-mac`, or that table moves to `disk-core`.
+- **Solaris 9 / PPC builds:** mrustc's minicargo has no `[patch]` support.
+  `scripts/build-{sol9,ppc}.sh` run it through `minicargo_run`, which hides the
+  `[patch.crates-io]` table. `rb-cli-ppc/patches/qnx2fs.py` points the vendored
+  qnx2fs at `crates/disk-core`. Since then, CI's Sol9 job gets through all the
+  path crates.
+- **Check what a commit picks up.** `git commit` takes the whole index, so a
+  `git mv` staged for the next slice rides along. Stage per slice, or commit
+  with an explicit pathspec.
 
 **How each slice was done (scripts are easy to recreate):**
 

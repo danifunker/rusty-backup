@@ -8,7 +8,7 @@
 //! Split out of `hfs_fsck.rs` per §8 of `docs/codecleanup.md`.
 
 #[cfg(feature = "rust173-polyfill")]
-use crate::rust173_compat::IntIsMultipleOf as _;
+use disk_core::rust173::IntIsMultipleOf as _;
 use std::cmp::Ordering;
 use std::collections::HashSet;
 
@@ -16,13 +16,13 @@ use byteorder::{BigEndian, ByteOrder};
 
 use super::btree::{extract_child_pointers, record_key, HFS_MAX_NRECS};
 use super::{hfs_issue, HfsFsckCode};
-use crate::fs::fsck::{FsckIssue, RepairReport};
-use crate::fs::hfs_common::{
+use crate::hfs_common::{
     bitmap_test_bit_be, btree_alloc_node, btree_bitmap_clear, btree_bitmap_set, btree_bitmap_test,
     btree_lonely_empty_leaves, btree_node_bitmap_range, btree_record_range, btree_stale_index_keys,
     compare_classic_extents_keys, init_node, BTreeHeader, BTreeKeyFormat, BTREE_HEADER_NODE,
     BTREE_INDEX_NODE, BTREE_LEAF_NODE, BTREE_MAP_NODE,
 };
+use disk_core::fsck::{FsckIssue, RepairReport};
 
 fn compare_extents_keys(a: &[u8], b: &[u8]) -> Ordering {
     compare_classic_extents_keys(a, b)
