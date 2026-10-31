@@ -2,6 +2,8 @@
 
 Compress/decompress handlers for backup output formats, plus disk reconstruction for restore and VHD export.
 
+**Where the code lives (crate split, `docs/crate_split_plan.md`):** the container formats have moved into crates: `dsk-apple` (DC42, 2IMG, WOZ, MOOF, DART), `dsk-dmg` (DMG, NDIF, sparseimage), `dsk-floppy` (the `containers/` decoders), `dsk-flux` (`flux/`), `dsk-vm` (VMDK, QCOW2, the VHD format half, `sparse`) and `dsk-ghost` (GHO). The same-named files here are re-export shims. `rbformats/vhd.rs` keeps the VHD *export*, and `containers/mod.rs` keeps detection and dispatch. Backup output, reconstruction, CHD, IMZ, `zip_disk`, NeXT MO, ICON HD and `cbk` stay in the app.
+
 ## Architecture
 
 - **`mod.rs`** — Orchestration functions (`compress_partition`, `decompress_to_writer`, `reconstruct_disk_from_backup`) and shared utilities (`SplitWriter`, `write_zeros`, `is_all_zeros`, `output_path`, `file_name`, `CHUNK_SIZE`).
