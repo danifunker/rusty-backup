@@ -26,6 +26,7 @@ on:
       - "part-tables-v*"
       - "dsk-flux-v*"
       - "dsk-apple-v*"
+      - "dsk-dmg-v*"
   workflow_dispatch:
     inputs:
       crate:
@@ -52,6 +53,7 @@ on:
           - part-tables
           - dsk-flux
           - dsk-apple
+          - dsk-dmg
       dry_run:
         description: Package and verify only, do not upload
         required: true

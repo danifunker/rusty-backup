@@ -261,6 +261,7 @@ The crates already kept separately stay separate, because other projects share t
    - **`dsk-flux` done (2026-10-31)**, MIT: the whole `rbformats/flux/` tree, moved as `dsk_flux::flux`. It needed only `disk-core`'s `io_other` / `repeat_n` shims.
    - **`dsk-apple` done (2026-10-31)**, MIT: `dc42`, `twomg`, `woz`, `woz_write`, `moof`, `dart` and `lzhuf`, with features `dc42`, `twomg`, `woz` (WOZ + MOOF) and `dart` (pulls `dc42`).
      - `lisa` then moved into `fs-mac` behind a `lisa` feature. It parses DiskCopy 4.2 headers, so `fs-mac` takes `dsk-apple` (feature `dc42` only) as an optional dependency, a deliberate family-to-family exception like `dsk-ghost` -> `fs-pc`.
+   - **`dsk-dmg` done (2026-10-31)**, MIT: `dmg`, `ndif`, `sparseimage`, and `dmg_crypto` behind the crate's `crypto` feature (forwarded from the app's `crypto`; off in the 1.73 builds, as before).
 6. **`arc-mac`, `fs-tar`.**
 7. **Cleanup and docs.**
    - Remove the shims.

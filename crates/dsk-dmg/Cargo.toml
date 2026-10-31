@@ -1,0 +1,36 @@
+[package]
+name = "dsk-dmg"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.73"
+license = "MIT"
+authors = ["Dani Sarfati <dani@funkervogt.com>"]
+description = "Read Apple disk images: UDIF .dmg (zlib, bzip2, LZFSE, LZMA, ADC), NDIF, .sparseimage, and encrypted DMG (feature `crypto`)"
+repository = "https://github.com/danifunker/rusty-backup"
+readme = "README.md"
+keywords = ["dmg", "apple", "macos", "disk-image", "ndif"]
+categories = ["parser-implementations", "compression"]
+
+[features]
+# Encrypted (AES / 3DES) DMG. Its RustCrypto crates need Rust 1.85, so the 1.73 builds leave it off.
+crypto = ["dep:aes", "dep:cbc", "dep:des", "dep:sha1"]
+# Only for a Rust 1.73 toolchain; see disk-core.
+rust173-polyfill = ["disk-core/rust173-polyfill"]
+
+[dependencies]
+disk-core = { path = "../disk-core", version = "0.1", default-features = false }
+anyhow = "1"
+# The lower bounds are what the Rust 1.73 builds resolve.
+base64 = ">=0.22, <0.24"
+bzip2 = ">=0.5.2, <0.7"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+log = "0.4"
+lzfse_rust = "0.2.1"
+lzma-rs = "0.3.0"
+aes = { version = "0.9", optional = true }
+cbc = { version = "0.2", optional = true }
+des = { version = "0.9.0", optional = true }
+sha1 = { version = ">=0.10, <0.12", optional = true }
+
+[dev-dependencies]
+tempfile = "3"

@@ -80,7 +80,7 @@ default = ["gui", "chd", "optical", "audio", "native-zlib", "native-zstd", "seek
 # out only so the vintage macOS 10.7 build (rb-cli-vintage/, Rust 1.73) can drop
 # it: those edition-2024 crates need rustc >= 1.85, and unencrypted APFS / IMZ /
 # DMG browse keeps working without it (encrypted inputs bail with a clear error).
-crypto = ["dep:aes", "dep:cbc", "dep:des", "fs-apfs/crypto"]
+crypto = ["dep:aes", "dep:cbc", "dep:des", "fs-apfs/crypto", "dsk-dmg/crypto"]
 # `--format yaml` for the read-only verbs. ON BY DEFAULT — the desktop and the
 # vintage builds ship it. Split out only so the PowerPC mrustc build can drop it:
 # serde_yml's backend (`libyml`) hits an mrustc macro-expansion gap
@@ -182,7 +182,7 @@ windows-legacy = []
 # Do NOT enable on a modern toolchain: std's inherent is_multiple_of would then
 # collide with the polyfill trait. See crates/disk-core. Forwarded to every
 # extracted crate under crates/ (docs/crate_split_plan.md).
-rust173-polyfill = ["disk-core/rust173-polyfill", "fs-8bit/rust173-polyfill", "fs-cpm/rust173-polyfill", "fs-apple2/rust173-polyfill", "fs-qnx/rust173-polyfill", "fs-xerox/rust173-polyfill", "dsk-clonezilla/rust173-polyfill", "fs-amiga/rust173-polyfill", "fs-unix/rust173-polyfill", "fs-xfs/rust173-polyfill", "fs-squashfs/rust173-polyfill", "fs-pc/rust173-polyfill", "fs-hpfs/rust173-polyfill", "fs-apfs/rust173-polyfill", "fs-mac-unicode/rust173-polyfill", "fs-mac/rust173-polyfill", "part-tables/rust173-polyfill", "dsk-flux/rust173-polyfill", "dsk-apple/rust173-polyfill"]
+rust173-polyfill = ["disk-core/rust173-polyfill", "fs-8bit/rust173-polyfill", "fs-cpm/rust173-polyfill", "fs-apple2/rust173-polyfill", "fs-qnx/rust173-polyfill", "fs-xerox/rust173-polyfill", "dsk-clonezilla/rust173-polyfill", "fs-amiga/rust173-polyfill", "fs-unix/rust173-polyfill", "fs-xfs/rust173-polyfill", "fs-squashfs/rust173-polyfill", "fs-pc/rust173-polyfill", "fs-hpfs/rust173-polyfill", "fs-apfs/rust173-polyfill", "fs-mac-unicode/rust173-polyfill", "fs-mac/rust173-polyfill", "part-tables/rust173-polyfill", "dsk-flux/rust173-polyfill", "dsk-apple/rust173-polyfill", "dsk-dmg/rust173-polyfill"]
 # In-app self-update for `rb-cli update` (CLI + TUI). Pulls the reqwest client
 # (rustls, no OpenSSL). OFF by default and left OUT of the slim / appliance /
 # MiSTer builds so they link no networking; desktop packagers opt in. When the
@@ -197,6 +197,7 @@ fs-cpm = { path = "crates/fs-cpm" }
 fs-apple2 = { path = "crates/fs-apple2" }
 fs-qnx = { path = "crates/fs-qnx" }
 fs-xerox = { path = "crates/fs-xerox" }
+dsk-dmg = { path = "crates/dsk-dmg", default-features = false }
 dsk-apple = { path = "crates/dsk-apple" }
 dsk-flux = { path = "crates/dsk-flux" }
 part-tables = { path = "crates/part-tables" }

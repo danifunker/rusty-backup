@@ -653,6 +653,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "dsk-dmg"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "bzip2",
+ "disk-core",
+ "flate2",
+ "log",
+ "lzfse_rust",
+ "lzma-rs",
+]
+
+[[package]]
 name = "dsk-flux"
 version = "0.1.0"
 dependencies = [
@@ -1562,6 +1576,7 @@ dependencies = [
  "disk-core",
  "dsk-apple",
  "dsk-clonezilla",
+ "dsk-dmg",
  "dsk-flux",
  "encoding_rs",
  "env_logger",
