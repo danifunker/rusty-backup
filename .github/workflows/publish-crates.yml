@@ -20,6 +20,7 @@ on:
       - "fs-squashfs-v*"
       - "fs-pc-v*"
       - "fs-hpfs-v*"
+      - "fs-apfs-v*"
   workflow_dispatch:
     inputs:
       crate:
@@ -40,6 +41,7 @@ on:
           - fs-squashfs
           - fs-pc
           - fs-hpfs
+          - fs-apfs
       dry_run:
         description: Package and verify only, do not upload
         required: true

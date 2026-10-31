@@ -238,6 +238,8 @@ The crates already kept separately stay separate, because other projects share t
      - Made `pub` for app users: `fat::{cp437_to_char, char_to_cp437, has_fat_boot_start}` and the NTFS MFT parsing that `rbformats::gho` reuses (`parse_vbr`, `NtfsVbr`, `apply_fixup`, `parse_mft_attributes`, `MftAttribute`, `DataRun`).
      - The `exfat_clone` test's dispatcher assertion (`detect_defrag_clone_shape`) became its own app-side test on the exFAT fixture.
    - **`fs-hpfs` done (2026-10-31)**, GPL-2.0-only (D2): `hpfs` moved whole, since the derived dnode editing and the read side share one file.
+   - **`fs-apfs` done (2026-10-31)**, MIT: `apfs` and `apfs_crypto`. FileVault sits behind the crate's `crypto` feature, which the app's `crypto` forwards; the 1.73 manifests take the crate without it, as before. Two `VolumeInfo` / `NxSuperblock` fields that only the unlock path reads got a `cfg_attr(not(feature = "crypto"), allow(dead_code))`.
+   - **Left in Step 3: `fs-mac`.** The survey and the carve (MIT `fs-mac` plus a GPL-2.0-only sub-crate for `hfs_unicode`, `HFS_CHARORDER` and the key comparisons) are in `RESUME-crate-split.md`.
 4. **`part-tables`** (C5).
 5. **`dsk-*` and `dsk-clonezilla`** (C6, C7, C11). The upstream moves to libchdman-rs and opticaldiscs happen here.
    - **`dsk-clonezilla` done early (2026-10-30)**, ahead of Step 3, because its co-author had agreed to MIT.

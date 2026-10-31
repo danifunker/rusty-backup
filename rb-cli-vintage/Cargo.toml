@@ -63,7 +63,7 @@ ratatui-legacy = []
 # Std-API polyfills for Rust 1.73 (is_multiple_of etc.). Always on for the
 # vintage build — the whole engine (fs drivers) needs it, not just the TUI.
 # Forwarded to the extracted crates under ../crates/.
-rust173-polyfill = ["disk-core/rust173-polyfill", "fs-8bit/rust173-polyfill", "fs-cpm/rust173-polyfill", "fs-apple2/rust173-polyfill", "fs-qnx/rust173-polyfill", "fs-xerox/rust173-polyfill", "dsk-clonezilla/rust173-polyfill", "fs-amiga/rust173-polyfill", "fs-unix/rust173-polyfill", "fs-xfs/rust173-polyfill", "fs-squashfs/rust173-polyfill", "fs-pc/rust173-polyfill", "fs-hpfs/rust173-polyfill"]
+rust173-polyfill = ["disk-core/rust173-polyfill", "fs-8bit/rust173-polyfill", "fs-cpm/rust173-polyfill", "fs-apple2/rust173-polyfill", "fs-qnx/rust173-polyfill", "fs-xerox/rust173-polyfill", "dsk-clonezilla/rust173-polyfill", "fs-amiga/rust173-polyfill", "fs-unix/rust173-polyfill", "fs-xfs/rust173-polyfill", "fs-squashfs/rust173-polyfill", "fs-pc/rust173-polyfill", "fs-hpfs/rust173-polyfill", "fs-apfs/rust173-polyfill"]
 # `--format yaml`. Enabled by the vintage build commands (see
 # .github/workflows/release.yml) so behaviour matches the desktop; it is a
 # feature only so the PowerPC mrustc build can drop it. See rb-cli-ppc.
@@ -88,6 +88,7 @@ fs-cpm = { path = "../crates/fs-cpm" }
 fs-apple2 = { path = "../crates/fs-apple2" }
 fs-qnx = { path = "../crates/fs-qnx" }
 fs-xerox = { path = "../crates/fs-xerox" }
+fs-apfs = { path = "../crates/fs-apfs", default-features = false }
 fs-hpfs = { path = "../crates/fs-hpfs" }
 fs-pc = { path = "../crates/fs-pc" }
 fs-squashfs = { path = "../crates/fs-squashfs", default-features = false }

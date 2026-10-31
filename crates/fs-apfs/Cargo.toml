@@ -1,0 +1,23 @@
+[package]
+name = "fs-apfs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.73"
+license = "MIT"
+authors = ["Dani Sarfati <dani@funkervogt.com>"]
+description = "Read Apple APFS volumes, including FileVault-encrypted ones (feature `crypto`)"
+repository = "https://github.com/danifunker/rusty-backup"
+readme = "README.md"
+keywords = ["filesystem", "apfs", "apple", "macos", "disk-image"]
+categories = ["filesystem"]
+
+[features]
+# FileVault decryption. Its RustCrypto crates need Rust 1.85, so the 1.73 builds leave it off.
+crypto = ["dep:aes", "dep:sha2"]
+# Only for a Rust 1.73 toolchain; see disk-core.
+rust173-polyfill = ["disk-core/rust173-polyfill"]
+
+[dependencies]
+disk-core = { path = "../disk-core", version = "0.1", features = ["fs"] }
+aes = { version = "0.9", optional = true }
+sha2 = { version = ">=0.10, <0.12", optional = true }

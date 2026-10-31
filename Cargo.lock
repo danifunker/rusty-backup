@@ -2355,6 +2355,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs-apfs"
+version = "0.1.0"
+dependencies = [
+ "aes 0.9.3",
+ "disk-core",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "fs-apple2"
 version = "0.1.0"
 dependencies = [
@@ -5831,6 +5840,7 @@ dependencies = [
  "flate2",
  "fs-8bit",
  "fs-amiga",
+ "fs-apfs",
  "fs-apple2",
  "fs-cpm",
  "fs-hpfs",

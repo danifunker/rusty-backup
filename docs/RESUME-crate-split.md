@@ -1,7 +1,8 @@
-# Resume: crate split — Alan's crates first, then Step 3 onward
+# Resume: crate split — fs-mac, then Steps 4–7
 
 Paste the prompt below into a new Claude Code session in a checkout of
-`rusty-backup` on branch `native-frontends`.
+`rusty-backup` on branch `native-frontends` (on dani's box that's the
+`~/repos/rusty-backup-native-frontends` worktree).
 
 ---
 
@@ -9,20 +10,67 @@ You're continuing the **crate split** of rusty-backup on branch
 `native-frontends`. The plan and its history are in `docs/crate_split_plan.md`.
 Read it first, along with `docs/license_audit.md`, CLAUDE.md and CONTRIBUTING.md.
 
-## Where it stands (2026-10-30)
+## Where it stands (2026-10-31)
 
-- **Steps 0–2 are done.** The workspace is `crates/*`. Six crates exist:
-  `disk-core`, `fs-8bit`, `fs-cpm`, `fs-apple2`, `fs-qnx` and `fs-xerox`.
-  The old `crate::fs::*` paths are `pub use` shims, so the app still compiles
-  unchanged.
-- **On crates.io:** `disk-core` 0.1.0 only.
-  - `fs-8bit`, `fs-cpm`, `fs-apple2` and `fs-qnx` are ready to publish but held,
-    because Step 3 will probably grow `disk-core` to 0.2 (see "Publishing order").
-  - `qnx2fs` 0.3.1, a separate repo, now carries the QNX 2 adapter behind its
-    `disk-core` feature.
-- **Held back from Step 2:** `adfs` and `qdos` / `qdos_mdv` (licence, D2 in
-  `license_audit.md`), and `lif`. `lif`'s replace test needs its private fields
-  and the app's `fs::replace`.
+- **Steps 0–2 are done, and most of Step 3.** The old `crate::fs::*` and
+  `crate::clonezilla::*` paths are `pub use` shims, so the app compiles unchanged.
+  The crates under `crates/`:
+  - Steps 0–2: `disk-core`, `fs-8bit`, `fs-cpm`, `fs-apple2`, `fs-qnx` and `fs-xerox`.
+  - `dsk-clonezilla`, done early (Step 5).
+  - Step 3: `fs-amiga`, `fs-unix`, `fs-xfs` (GPL-2.0-only), `fs-squashfs`,
+    `fs-pc`, `fs-hpfs` (GPL-2.0-only) and `fs-apfs`.
+  - `docs/crate_split_plan.md` §9 has one bullet per slice, saying what moved,
+    what was held back and why.
+- **`disk-core` grew, backwards-compatibly:** `name_legalize`, `stream_pipe`,
+  `raw_name`, `attrs` and `sgi`, plus a `serde` feature. Its version is still
+  0.1.0 in the tree.
+- **On crates.io:** `disk-core` 0.1.0 only. **Nothing was published this
+  session.** The auto-mode classifier refused the tag push, so publishing
+  needs Dani.
+  - `fs-xerox` and `dsk-clonezilla` are ready now. Both pass
+    `cargo publish --dry-run` and depend only on `disk-core` 0.1.0 APIs:
+    `git tag fs-xerox-v0.1.0 && git push origin fs-xerox-v0.1.0`, and the same
+    for `dsk-clonezilla-v0.1.0`.
+  - The Step 3 crates use the new `disk-core` modules, so `disk-core` has to go
+    out first, as 0.1.1 or 0.2.
+- **Every slice passed this gate:**
+  - `cargo test --workspace`: 3,743 passed, 0 failed.
+  - Clippy `-D warnings` on each new crate and on each of its features alone.
+  - The Rust 1.73 vintage `rb-cli` check.
+  - The slim build: `--no-default-features --features pure-zstd`.
+- **Not re-run:** the PPC / Sol9 mrustc builds. Each slice adds a path crate, so
+  re-vendor first (see the last section).
+- **Still held back:**
+  - `adfs` and `qdos` / `qdos_mdv` (licence, D2) and `lif` (its test), all from Step 2.
+  - `ofs*`, the old BeOS filesystem. It needs the Mac type/creator table in
+    `hfs_common::resolve_create_type_creator`, so it waits for `fs-mac`.
+  - `sun2tape*` / `tar_section`. They need the Unix-`compress` codec in
+    `macarchive::stuffit_lzw` and `mem_archive::open_tar`, so they wait for
+    Step 6.
+
+## This machine (dani's Linux box), read before building
+
+- **The disk is small.** A default debug `cargo test --workspace` fills it (20 GB
+  of target) and fails at link time with ENOSPC. Run the gate with debuginfo
+  off, for that run only, which takes about 5 GB:
+  `CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 cargo test --workspace`.
+  Never change `Cargo.toml` for it.
+- **There are no GTK3 dev headers,** so the `gui` feature's rfd/gtk3 fails in
+  `atk-sys`.
+  - To build or test, temporarily switch rfd to `features = ["xdg-portal"]` in
+    `Cargo.toml`.
+  - Afterwards, switch it back to `["gtk3"]` and run `cargo metadata` so
+    `Cargo.lock` gets the gtk crates back.
+  - Never commit the swap. Check that `git diff Cargo.lock` shows only your crate.
+- **zstd versions:** a new crate with `zstd = ">=0.13, <0.15"` locks to 0.13.3
+  in the root `Cargo.lock`, because `nod`, via opticaldiscs, pins 0.13. To keep
+  the desktop on one version:
+  1. Set the crate's requirement to `"0.14"`.
+  2. Run `cargo metadata`.
+  3. Restore the range and run `cargo metadata` again.
+- **1.73 toolchain:** `~/.rustup/toolchains/1.73.0-x86_64-unknown-linux-gnu/bin`.
+  - Refresh the PPC / Sol9 lockfiles with that cargo's `cargo metadata --manifest-path rb-cli-{ppc,sol9}/Cargo.toml`.
+  - It errors on an edition-2024 crate *after* writing the lock, which is fine.
 
 ## The user's rules
 
@@ -55,69 +103,96 @@ Read it first, along with `docs/license_audit.md`, CLAUDE.md and CONTRIBUTING.md
   - Add every new crate to both lists in the workflow: the tag patterns and the
     manual-run choices.
 
-## Start here: Alan Steremberg's crates
+## Start here: `fs-mac` (Step 3's last family)
 
-Alan agreed to MIT ("Any license is fine"), and **there is no publishing hold**.
-`fs-xerox` and `dsk-clonezilla` carry
-`Copyright (c) 2026 Dani Sarfati, Alan Steremberg`, with Alan in `authors`.
+The survey is done; this is the carve it found:
 
-1. **Publish `fs-xerox` 0.1.0.**
-   - `publish = false` is already gone, the workflow lists it, and
-     `cargo publish -p fs-xerox --dry-run` passes (16 files, 74 KiB compressed).
-   - Push the tag `fs-xerox-v0.1.0`, watch the run with `gh run watch`, and
-     confirm the crate on crates.io.
-   - It depends on `disk-core` 0.1 from crates.io, which is fine.
-2. **Create `crates/dsk-clonezilla`** from `src/clonezilla/`: `partclone.rs`,
-   `metadata.rs`, `metadata_scan.rs`, `block_cache.rs` and `mod.rs`, about 3k lines.
-   - **What couples it to the app:**
-     - `crate::compat::io_other` and `crate::rust173_compat::IntIsMultipleOf`.
-       `disk-core` already has both (`disk_core::io_other`, `disk_core::rust173`).
-     - `crate::rbformats::zstd_compat::decoder` in `partclone.rs`. That switches
-       between native and pure-Rust zstd by app feature, so the crate needs its
-       own `native-zstd` / `pure-zstd` features, forwarded from all four
-       manifests, or something equally minimal.
-   - Check whether `metadata_scan.rs` is reusable format code or app glue. If it's
-     app glue, it stays in the app.
-   - **Callers:** `rbformats/{export,vhd}.rs`, `cli/verbs/restore.rs`,
-     `gui/{inspect_tab,browse_view,restore_tab}.rs` and
-     `model/{export_runner,backup_loader,status,browse_session,cache_runner,commander_source}.rs`.
-     Keep `src/clonezilla/mod.rs` as a `pub use dsk_clonezilla::*` shim so none
-     of them change.
-   - **Crate setup:** MIT, the co-copyright `LICENSE`, `rust-version = "1.73"`, and
-     a `rust173-polyfill` feature forwarded to `disk-core`. Add the crate to the
-     path dependencies and `rust173-polyfill` lists of the root `Cargo.toml` and
-     `rb-cli-vintage/`, `rb-cli-ppc/` and `rb-cli-sol9/`. Their lockfiles need
-     refreshing too.
-   - **Gate:** `cargo test` (all of it), clippy on the crate, the 1.73 vintage
-     check, and the publish dry run.
-   - Then add it to the workflow and publish `dsk-clonezilla-v0.1.0`.
-   - Update `docs/crate_split_plan.md` §9 to say Step 5's `dsk-clonezilla` is done
-     early.
+- **The `fs-mac` crate (MIT):** `mfs`, `hfs`, `hfs_fsck/`, `hfs_common` (minus
+  the GPL parts below), `hfsplus`, `hfsplus_clone`, `hfsplus_defrag`,
+  `hfsplus_fsck`, `hfsplus_journal`, `hfsplus_wrapper_clone`, `hfv`,
+  `mac_alias`, `resource_fork`, `binhex` and probably `fork_export`.
+  - `fork_export` depends only on binhex, resource_fork and disk-core. `mfs`'s
+    tests use it.
+  - `hfs_common` needs `include_str!("../../assets/hfs_file_types.json")`, so
+    move that asset into the crate, as `fs-apple2` did with the ProDOS types.
+  - Re-cite `hfsplus_journal`'s `calc_checksum` to TN1150 and drop
+    "verbatim / byte-for-byte" (audit follow-up).
+- **The GPL-2.0-only sub-crate (e.g. `fs-mac-unicode`):** move `hfs_unicode.rs`
+  whole. Out of `hfs_common` comes the hfsutils-derived `HFS_CHARORDER` table,
+  together with:
+  - `compare_hfs_keys`, its only user
+  - `fold_hfsplus_name_for_compare`
+  - `compare_hfsplus_keys`
+  - their tests, which sit in `hfs_common`'s test module around lines 2964–3150
+
+  `hfs_common` re-exports them. Every HFS+ module then depends on the sub-crate.
+  Classic HFS reaches it only through `compare_hfs_keys`, which `hfs.rs:949` and
+  `mfs.rs:446` call.
+- **Stays in the app (C3):**
+  - `hfs_clone::emit_apm_disk_with_hfs`, which uses `partition::apm` and is
+    called by `rbformats/qcow2.rs`, together with its APM tests.
+  - `hfs_boot::read_donor_boot_blocks_from_image` and
+    `is_classic_hfs_partition`, which use `PartitionTable`.
+    `has_boot_blocks` / `read_donor_boot_blocks` move.
+  - `mac_scsi_bless` and the `apple_scsi_driver*.bin` blobs.
+- **Move into `fs-mac`:** `resolve_apple_hfs` (std only, in `src/fs/mod.rs`
+  ~3610). `hfsplus.rs:3868` calls it. Re-export it from `fs/mod.rs`.
+- **The four `can_defrag_clone_hfsplus` tests** (`hfsplus.rs` ~7257–7331) use
+  the app's dispatcher. Move them to the `src/fs/hfsplus.rs` shim, the way the
+  UFS / ReiserFS / SquashFS dispatcher tests were moved.
+- **`hfv.rs`'s test at 186** uses `PartitionTable`, so move that test to the
+  shim too.
+- **Hold back `lisa`.** It needs `rbformats::dc42`, which belongs in
+  `dsk-apple`, and `fs-mac` → `dsk-apple` would be a cross-family dependency.
+  Move it with Step 5.
+- **Make `binhex::rle90_decode` / `rle90_encode` `pub`.**
+  `macarchive/stuffit.rs:383` and `:474` use them.
+- **Two doc links will dangle:** `hfs.rs:3029` → efs and `resource_fork.rs:537`
+  → macarchive. Turn them into plain backticks.
+- **Afterwards,** `ofs*` can move into `fs-unix` (feature `bfs`, or `ofs`) if
+  `resolve_create_type_creator` and its type/creator table go into `fs-mac`.
+  That makes `fs-unix` depend on `fs-mac`; the alternative is to put the table
+  in `disk-core`. Decide that first.
+
+**How each slice was done (scripts are easy to recreate):**
+
+1. `git mv` the modules into `crates/<name>/src/`.
+2. Rewrite paths with a regex pass. `super::X` / `crate::fs::X` become:
+   - `disk_core::X` for a disk-core module
+   - `crate::X` for a module in the same crate
+   - `disk_core::filesystem::CompactResult` for `CompactResult`
+
+   Also: `crate::rust173_compat::` → `disk_core::rust173::`; `crate::compat::io_other` →
+   `disk_core::io_other`; `crate::partition::format_size` →
+   `disk_core::display::format_size`.
+   In tests: `crate::rbformats::zstd_compat::decoder(` →
+   `zstd::stream::read::Decoder::new(`, with zstd as a dev-dependency, and the
+   relative `"tests/fixtures/..."` paths → `CARGO_MANIFEST_DIR/../../tests/fixtures/...`.
+3. Write the one-line shims, plus a `pub use` in the four manifests and a
+   rust173-polyfill forward. Add both workflow entries.
+4. Let `cargo check --all-targets` on the app find the `pub(crate)` items the
+   app uses, and make those `pub`.
+5. Run the gate, update the plan doc, `cargo fmt --all`, and commit with `--no-verify`.
 
 ## Then: the rest of the plan
 
 Follow `docs/crate_split_plan.md` §9:
 
-- **Step 3**, the big families:
-  - `fs-amiga` (`MIT AND BSD-4-Clause` for the pfs3aio-derived code)
-  - `fs-unix`
-  - `fs-xfs` (GPL-2.0)
-  - `fs-squashfs`
-  - `fs-pc` (with `hpfs` editing as a GPL sub-crate)
-  - `fs-mac` (with `hfs_unicode` as a GPL sub-crate)
-  - `fs-apfs`
-- **Step 4:** `part-tables`.
-- **Step 5:** the other `dsk-*` crates.
+- **Step 4:** `part-tables`. `disk_core::sgi` already holds the SGI
+  byte-order helpers it will share with `fs-unix`.
+- **Step 5:** the other `dsk-*` crates, then `lisa`.
 - **Step 6:** `arc-mac` (MIT) and `arc-mac-codecs` (LGPL-2.1-or-later, D1), and
-  `fs-tar`.
-- **Step 7:** remove the shims and write the per-crate READMEs.
+  `fs-tar`. Then `sun2tape*` / `tar_section`.
+- **Step 7:** remove the shims and write the per-crate READMEs. CLAUDE.md and
+  `docs/export_pipelines.md` already point the Amiga paths at the crate.
 
 ## Publishing order
 
-Hold the `fs-*` publishes until Step 3 settles `disk-core`, then publish
-`disk-core` 0.2 and the families together. The exceptions are `fs-xerox` and
-`dsk-clonezilla`, which go out now on `disk-core` 0.1. Bump them later if they
-need 0.2.
+`fs-xerox` and `dsk-clonezilla` can go out now on `disk-core` 0.1.0. The Step 3
+crates need the new `disk-core` modules, so publish `disk-core` first. Use
+0.1.1 if nothing breaks, otherwise 0.2, and bump every crate's
+`disk-core = { version = ... }` to match. Then publish the families together.
+`.github/workflows/publish-crates.yml` already lists every crate.
 
 ## The PowerPC / Solaris side (only if a slice breaks those builds)
 
@@ -145,3 +220,4 @@ need 0.2.
   See `docs/build-sol9-mrustc.md`, "mrustc: the fork's branches".
 - **Housekeeping:** never run two cargo builds at once on m900. If a build hits
   ENOSPC, run `cargo clean` straight away.
+
