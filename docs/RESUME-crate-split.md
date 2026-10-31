@@ -1,4 +1,4 @@
-# Resume: crate split — Steps 4–7
+# Resume: crate split — decisions, then Step 6 and Step 7
 
 Paste the prompt below into a new Claude Code session in a checkout of
 `rusty-backup` on branch `native-frontends` (on dani's box that's the
@@ -104,24 +104,27 @@ Read it first, along with `docs/license_audit.md`, CLAUDE.md and CONTRIBUTING.md
   - Add every new crate to both lists in the workflow: the tag patterns and the
     manual-run choices.
 
-## Start here: Step 4, `part-tables`
+## Start here: the four decisions in `crate_split_plan.md` §11a
 
-Step 3 is done, including `fs-mac` and its GPL sub-crate `fs-mac-unicode`; see
-`crate_split_plan.md` §9 for what moved and what stayed. Still held back from
-earlier steps: `adfs`, `qdos`, `lif`, `ofs*`, `sun2tape*` / `tar_section` and
-`lisa`.
+Status at 2026-10-31, end of session:
 
-- **`ofs*` needs a decision first.** `hfs_common::resolve_create_type_creator`
-  and its type/creator table are now in `fs-mac`. Either `fs-unix` depends on
-  `fs-mac`, or that table moves to `disk-core`.
-- **Solaris 9 / PPC builds:** mrustc's minicargo has no `[patch]` support.
-  `scripts/build-{sol9,ppc}.sh` run it through `minicargo_run`, which hides the
-  `[patch.crates-io]` table. `rb-cli-ppc/patches/qnx2fs.py` points the vendored
-  qnx2fs at `crates/disk-core`. Since then, CI's Sol9 job gets through all the
-  path crates.
-- **Check what a commit picks up.** `git commit` takes the whole index, so a
-  `git mv` staged for the next slice rides along. Stage per slice, or commit
-  with an explicit pathspec.
+- **Done:**
+  - Steps 0–4.
+  - All of Step 5 (`dsk-flux`, `dsk-apple`, `dsk-dmg`, `dsk-floppy`, `dsk-vm`, `dsk-ghost`) except IMZ.
+  - Every module held back from Step 2: `qdos` and `lif` went into `fs-8bit`, and `adfs` into its own GPL `fs-adfs`.
+  - `id_names` into `disk-core`.
+- **Blocked on Dani** (`crate_split_plan.md` §11a):
+  - A: the Mac-archive MIT / LGPL split, which is Step 6's `arc-mac`.
+  - B: `fs-tar`'s import side.
+  - C: where `ofs` gets its type/creator table.
+  - D: IMZ's zip-version shim.
+
+  `sun2tape*` / `tar_section` follow from A.
+- **CI:**
+  - The `crates-msrv` target runs every crate's tests on Rust 1.73 (`scripts/test-crates-msrv.sh`).
+  - The release workflow's tests now pass `--workspace`, so crate tests run on stable too.
+  - A new push to a feature branch cancels that branch's older run.
+- **Step 7 (remove the shims) is deliberately last.** Do it just before merging, so code that lands on `main` in the meantime with old paths doesn't break the merge. Also delete `.github/ci-targets` then (see the memory note).
 
 **How each slice was done (scripts are easy to recreate):**
 
@@ -159,7 +162,7 @@ Follow `docs/crate_split_plan.md` §9:
 
 Publishing goes through tags (see the rules above); this session could not push tags, so nothing beyond `disk-core` 0.1.0 is on crates.io yet.
 
-1. **Now, on `disk-core` 0.1.0:** `fs-xerox`, `dsk-clonezilla`, `fs-8bit`, `fs-cpm`, `fs-apple2`, `fs-qnx`, `fs-apfs`, `fs-hpfs`, `fs-mac-unicode`, `dsk-flux`, `dsk-apple`, `dsk-dmg`, `dsk-floppy` and `dsk-vm`. Checked 2026-10-31 by building each against the published 0.1.0.
+1. **Now, on `disk-core` 0.1.0:** `fs-xerox`, `dsk-clonezilla`, `fs-8bit`, `fs-cpm`, `fs-apple2`, `fs-qnx`, `fs-apfs`, `fs-hpfs`, `fs-adfs`, `fs-mac-unicode`, `dsk-flux`, `dsk-apple`, `dsk-dmg`, `dsk-floppy` and `dsk-vm`. All 15 passed `cargo publish --dry-run` against crates.io on 2026-10-31 (commit 4aa59ca5).
 2. **`disk-core` 0.1.1:** the tree is at 0.1.1. The additions (`name_legalize`, `stream_pipe`, `raw_name`, `attrs`, `sgi`, the `serde` feature) are backwards compatible.
 3. **After 0.1.1, these require it:** `fs-amiga`, `fs-mac`, `fs-pc`, `fs-squashfs`, `fs-unix`, `fs-xfs` and `part-tables`.
 4. **Last:** `dsk-ghost` (after `fs-pc`), then `fs-mac` (after `fs-mac-unicode` and `dsk-apple`).
