@@ -136,59 +136,7 @@ fn cancelled_err() -> anyhow::Error {
     anyhow::anyhow!("export cancelled")
 }
 
-/// The directory part of an absolute entry path, "" for a top-level entry.
-fn parent_dir(path: &str) -> &str {
-    match path.trim_end_matches('/').rsplit_once('/') {
-        Some((dir, _)) => dir,
-        None => "",
-    }
-}
-
-/// The deepest directory containing every selected entry, "" at the volume root.
-///
-/// Selections are named relative to this, so picking several files out of one
-/// folder still yields bare names (what it always did) while a selection that
-/// spans folders keeps enough path to stay unique. Without it every root was
-/// named by `archive_name()` alone, so `/a/notes.txt` and `/b/notes.txt` both
-/// became `notes.txt` and the second silently replaced the first.
-pub fn common_parent(entries: &[FileEntry]) -> String {
-    let mut it = entries.iter();
-    let Some(first) = it.next() else {
-        return String::new();
-    };
-    let mut base: Vec<&str> = parent_dir(&first.path)
-        .split('/')
-        .filter(|c| !c.is_empty())
-        .collect();
-    for e in it {
-        let these: Vec<&str> = parent_dir(&e.path)
-            .split('/')
-            .filter(|c| !c.is_empty())
-            .collect();
-        let keep = base
-            .iter()
-            .zip(these.iter())
-            .take_while(|(a, b)| a == b)
-            .count();
-        base.truncate(keep);
-        if base.is_empty() {
-            break;
-        }
-    }
-    if base.is_empty() {
-        String::new()
-    } else {
-        format!("/{}", base.join("/"))
-    }
-}
-
-/// `entry`'s own directory relative to `base`; "" when it sits directly in it.
-/// Always uses `/` separators — callers targeting the host filesystem convert.
-pub fn relative_dir(entry: &FileEntry, base: &str) -> String {
-    let dir = parent_dir(&entry.path);
-    let rel = dir.strip_prefix(base).unwrap_or(dir);
-    rel.trim_matches('/').to_string()
-}
+pub use disk_core::entry::{common_parent, relative_dir};
 
 /// Export `entries` from `fs` as loose outputs into the directory `dest_dir`.
 /// Only [`ExportFormat::LooseFiles`] / [`GzipPerFile`](ExportFormat::GzipPerFile)

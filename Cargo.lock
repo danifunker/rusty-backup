@@ -2521,6 +2521,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs-tar"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bzip2 0.6.1",
+ "disk-core",
+ "flate2",
+ "fs-mac",
+ "fs-pc",
+ "fs-unix",
+ "libzstd-bitexact-rs",
+ "tar",
+ "tempfile",
+ "zstd 0.13.3",
+]
+
+[[package]]
 name = "fs-unix"
 version = "0.1.0"
 dependencies = [
@@ -5969,6 +5986,7 @@ dependencies = [
  "fs-pc",
  "fs-qnx",
  "fs-squashfs",
+ "fs-tar",
  "fs-unix",
  "fs-xerox",
  "fs-xfs",

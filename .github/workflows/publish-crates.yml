@@ -31,6 +31,7 @@ on:
       - "dsk-vm-v*"
       - "dsk-ghost-v*"
       - "fs-adfs-v*"
+      - "fs-tar-v*"
   workflow_dispatch:
     inputs:
       crate:
@@ -62,6 +63,7 @@ on:
           - dsk-vm
           - dsk-ghost
           - fs-adfs
+          - fs-tar
       dry_run:
         description: Package and verify only, do not upload
         required: true

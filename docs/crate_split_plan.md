@@ -338,7 +338,17 @@ Options:
 2. **D1 as written, with the archive model in the LGPL crate.** `arc-mac-codecs` takes the derived files whole, plus `bitreader_be` and the model types and `decompress_fork` moved out of `stuffit.rs` (both MIT-headed files inside the LGPL crate). `arc-mac` (MIT) keeps the StuffIt 1.5 parser and writer, MacBinary, MacZip, MAR, `detect` and `extract`. `stuffit_lzw` gets split into its decoder and encoder halves.
 3. **Clean-room rewrites** of the derived decoders (D1 option b). This is the only route to an all-MIT `arc-mac`, at about 2,200 lines.
 
-**B. `fs-tar`.** `tar_export` uses the app's `export_selection::{common_parent, relative_dir}` (two small pure helpers). `tar_import` is built on `import_sink`, which is shared with the app's `dir_import`, uses `fs::copy` and `fs-mac`'s AppleDouble code, and calls back into `tar_import`. A crate needs `import_sink` (and probably `dir_import`) to come with it, and `fs-tar` to depend on `fs-mac` for AppleDouble. Options: (1) move `tar_*` + `import_sink` + `dir_import` together and take `fs-mac` as an optional `appledouble` feature; (2) keep tar import in the app and ship an export-only `fs-tar`; (3) drop `fs-tar` as a crate.
+**B. `fs-tar`. DECIDED 2026-10-31: move it, AppleDouble optional; DONE.**
+- `tar_export`, `tar_import` and `import_sink` moved into `crates/fs-tar` (MIT). It has its own `native-zstd` / `pure-zstd` features, and an `appledouble` feature that pulls in `fs-mac` (and so GPL) only to parse `._` sidecars; without it they are counted and skipped.
+- `dir_import` stays in the app, because it imports Mac archives through `mac_archive_import`.
+- For that to work:
+  - `ImportedResourceFork` (plain data) moved into `disk_core::filesystem`.
+  - `select_child`, `common_parent` and `relative_dir` moved into `disk_core::entry`; the app re-exports them.
+  - `tar_import::archive_times` became `pub` for `dir_import`.
+- The tar tests stay in the crate, with `fs-pc` / `fs-unix` / `fs-mac` as dev-dependencies and a test-only open helper in place of the app's dispatcher.
+- `scripts/test-crates-msrv.sh` now forwards `rust173-polyfill` to each crate's path dependencies, dev-dependencies included.
+
+Original note:  `tar_export` uses the app's `export_selection::{common_parent, relative_dir}` (two small pure helpers). `tar_import` is built on `import_sink`, which is shared with the app's `dir_import`, uses `fs::copy` and `fs-mac`'s AppleDouble code, and calls back into `tar_import`. A crate needs `import_sink` (and probably `dir_import`) to come with it, and `fs-tar` to depend on `fs-mac` for AppleDouble. Options: (1) move `tar_*` + `import_sink` + `dir_import` together and take `fs-mac` as an optional `appledouble` feature; (2) keep tar import in the app and ship an export-only `fs-tar`; (3) drop `fs-tar` as a crate.
 
 **C. `ofs` (old BeOS fs). DECIDED 2026-10-31: optional dependency; DONE.** `ofs`, `ofs_fsck` and `ofs_write` are in `fs-unix` behind an `ofs` feature (off by default) that pulls in `fs-mac` for `hfs_common::resolve_create_type_creator`. Since `fs-mac` depends on the GPL-2.0-only `fs-mac-unicode`, a build with `ofs` on is GPL as a whole; the crate README says so. The app enables it in all four manifests. Original note:  It needs `hfs_common::resolve_create_type_creator` and its type/creator table, now in `fs-mac`. Either `fs-unix` gains an optional `fs-mac` dependency for its `bfs` feature, or the table and `resolve_create_type_creator` move into `disk-core` (shared by `fs-mac` and `fs-unix`).
 

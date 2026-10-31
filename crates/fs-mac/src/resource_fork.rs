@@ -245,24 +245,7 @@ pub fn macbinary_crc16(data: &[u8]) -> u16 {
     crc
 }
 
-/// Metadata extracted from a resource fork container (AppleDouble, MacBinary, etc.).
-#[derive(Debug, Clone)]
-pub struct ImportedResourceFork {
-    /// Raw resource fork bytes.
-    pub data: Vec<u8>,
-    /// The data fork bytes (set for the whole-file containers — MacBinary and
-    /// BinHex — where the wrapper carries both forks).
-    pub data_fork: Option<Vec<u8>>,
-    /// 4-byte type code (e.g. `TEXT`), if found in the container.
-    pub type_code: Option<[u8; 4]>,
-    /// 4-byte creator code (e.g. `ttxt`), if found in the container.
-    pub creator_code: Option<[u8; 4]>,
-    /// The Mac filename recorded inside a whole-file container, so an import
-    /// lands `Foo` rather than the host's `Foo.bin` / `Foo.hqx` wrapper name.
-    pub name: Option<String>,
-    /// Finder flags (fdFlags) from the container's Finder info, when present.
-    pub finder_flags: Option<u16>,
-}
+pub use disk_core::filesystem::ImportedResourceFork;
 
 /// Detect and read a resource fork associated with `host_path` by probing
 /// all supported formats in priority order:

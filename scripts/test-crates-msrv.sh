@@ -39,7 +39,12 @@ cd "$WS"
 fail=()
 for c in "${crates[@]}"; do
   echo "=== $c (Rust 1.73)"
-  if ! "$CARGO" test -p "$c" --features "$c/rust173-polyfill" --ignore-rust-version; then
+  # Its path dependencies (dev-dependencies included) need the polyfill too; each forwards it onward.
+  feats="$c/rust173-polyfill"
+  for d in $(grep -oE 'path = "\.\./[a-z0-9-]+"' "crates/$c/Cargo.toml" | sed 's|.*\.\./||; s|"||' | sort -u); do
+    feats="$feats,$d/rust173-polyfill"
+  done
+  if ! "$CARGO" test -p "$c" --features "$feats" --ignore-rust-version; then
     fail+=("$c")
   fi
 done

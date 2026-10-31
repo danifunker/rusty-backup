@@ -828,19 +828,7 @@ fn find_child(
     Ok(select_child(&children, fold_case, name).cloned())
 }
 
-/// The child called `name`, matched the way the filesystem itself would
-/// (`fold_case` is its `case_insensitive_lookup`); an exact match wins first.
-pub fn select_child<'a>(
-    children: &'a [FileEntry],
-    fold_case: bool,
-    name: &str,
-) -> Option<&'a FileEntry> {
-    children.iter().find(|c| c.name == name).or_else(|| {
-        fold_case
-            .then(|| children.iter().find(|c| c.name.eq_ignore_ascii_case(name)))
-            .flatten()
-    })
-}
+pub use disk_core::entry::select_child;
 
 fn list_children(src: &mut dyn Filesystem, dir: &FileEntry) -> Result<Vec<FileEntry>> {
     src.list_directory(dir)
