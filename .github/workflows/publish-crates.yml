@@ -12,6 +12,7 @@ on:
       - "fs-apple2-v*"
       - "fs-cpm-v*"
       - "fs-qnx-v*"
+      - "fs-xerox-v*"
   workflow_dispatch:
     inputs:
       crate:
@@ -24,6 +25,7 @@ on:
           - fs-apple2
           - fs-cpm
           - fs-qnx
+          - fs-xerox
       dry_run:
         description: Package and verify only, do not upload
         required: true

@@ -10,8 +10,6 @@ repository = "https://github.com/danifunker/rusty-backup"
 readme = "README.md"
 keywords = ["filesystem", "xerox", "alto", "emulator", "disk-image"]
 categories = ["filesystem", "emulators"]
-# Not published until the co-author signs off on release timing (docs/license_audit.md).
-publish = false
 
 [features]
 # Only for a Rust 1.73 toolchain; see disk-core.

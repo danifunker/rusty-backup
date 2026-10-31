@@ -149,7 +149,7 @@ rusty-backup app  (depends on all of the above + libchdman-rs, opticaldiscs, qnx
 - **Contributors:** Dani Sarfati wrote 2,137 of 2,151 commits.
   - **Alan Steremberg** contributed to `clonezilla/partclone.rs`, `clonezilla/metadata.rs` and `fs/alto/pilot.rs`. **`dsk-clonezilla` and `fs-xerox` carry `Copyright (c) 2026 Dani Sarfati, Alan Steremberg`**, with Alan in `authors`.
     - **Consent confirmed 2026-10-30.** Dani asked on Discord whether he was OK converting that AGPL-3.0 code into MIT crates, and Alan (`alanswx`) replied "Any license is fine."
-    - **These two crates are not published until Dani says so.**
+    - **No publishing hold (2026-10-30).** Alan's consent covers releasing them, so both publish like any other crate.
   - The other two contributors' commits don't touch crate code: Scott's is the `ppc-tiger` port, and the Jules bot's is a Windows build fix.
 - **Audit done 2026-10-30: see [license_audit.md](license_audit.md)**, which supersedes the table below. It found more than this first list:
   - XADMaster-derived Mac archive codecs (LGPL-2.1+)
@@ -204,7 +204,7 @@ The crates already kept separately stay separate, because other projects share t
 1. **The interface part of `disk-core`.** Pulled into Step 0 because a filesystem crate can't exist without it. Old `crate::fs::…` paths are `pub use` shims, so the app doesn't change yet. The remaining interface-adjacent files (`attrs`, `name_legalize`, `raw_name`, `id_names`, `unix_common`, `import_sink`) follow as their dependencies allow.
 2. **The rest of `fs-8bit`, `fs-cpm`, `fs-apple2`, `fs-qnx`, `fs-xerox`.** Small and mechanical.
    - **Slice 2a done (2026-10-30):** `fs-8bit` gained `cbm`, `atari_dos`, `dfs` (feature `acorn`), `trdos`, `rsdos` + `dragondos` (feature `coco`), `os9` (feature `os9`, implies `coco`), `ti99` and `andos`. That's about 12k lines with all 110 crate tests passing; `os9`'s fixture test now reads `tests/fixtures` via `CARGO_MANIFEST_DIR` through a `zstd` dev-dependency.
-   - **Slice 2b done (2026-10-30):** new crates `fs-cpm` (`cpm`, `cpm_diskdefs`), `fs-apple2` (`ucsd`), `fs-qnx` (`qnx4`, `qnx6`) and `fs-xerox` (the whole `alto/` tree, MIT, co-copyright Alan Steremberg, `publish = false` until release timing is agreed). `disk-core` gained `bits` (big-endian bitmap helpers, moved out of `hfs_common`, which now re-exports them) and `unix_common` (moved as-is; needs `anyhow` under `fs`).
+   - **Slice 2b done (2026-10-30):** new crates `fs-cpm` (`cpm`, `cpm_diskdefs`), `fs-apple2` (`ucsd`), `fs-qnx` (`qnx4`, `qnx6`) and `fs-xerox` (the whole `alto/` tree, MIT, co-copyright Alan Steremberg; the early `publish = false` hold was lifted the same day). `disk-core` gained `bits` (big-endian bitmap helpers, moved out of `hfs_common`, which now re-exports them) and `unix_common` (moved as-is; needs `anyhow` under `fs`).
    - **Held back from 2b; resolved in slice 2c (2026-10-30):**
      - `apple_dos` and `sector_order` (dependency-free; the app's `rbformats::containers` re-exports it) moved to `fs-apple2`.
      - `prodos` and `prodos_types` moved to `fs-apple2`, with `assets/prodos_file_types.json` moved into the crate.
