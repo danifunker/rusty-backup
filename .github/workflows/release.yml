@@ -49,6 +49,8 @@ env:
 # between 2026-10-19 and 2026-11-19, and the riscv64 GUI job's `noble` sources
 # only resolve on 24.04. Move to a newer image deliberately, all jobs at once.
 jobs:
+# Test steps pass --workspace: the root has no default-members, so a bare `cargo test`
+# would skip every crate under crates/.
   generate-version:
     name: Generate Version
     runs-on: ubuntu-24.04
@@ -213,11 +215,11 @@ jobs:
         if: matrix.arch == 'x86'
         env:
           RUST_TEST_THREADS: 1
-        run: cargo test --release --target ${{ matrix.target }}
+        run: cargo test --workspace --release --target ${{ matrix.target }}
 
       - name: Test
         if: matrix.arch != 'x86'
-        run: cargo test --release --target ${{ matrix.target }}
+        run: cargo test --workspace --release --target ${{ matrix.target }}
 
       - name: Check image-files-only build (no-physical-devices)
         run: cargo check --release --target ${{ matrix.target }} --features no-physical-devices
@@ -337,7 +339,7 @@ jobs:
       # exercises the same (little-endian, 64-bit) logic on real hardware.
       - name: Test
         if: ${{ matrix.arch == 'arm64' }}
-        run: cargo test --release --target ${{ matrix.target }}
+        run: cargo test --workspace --release --target ${{ matrix.target }}
 
       - name: Check image-files-only build (no-physical-devices)
         run: cargo check --release --target ${{ matrix.target }} --features no-physical-devices
@@ -639,7 +641,7 @@ jobs:
       # Tests run upfront in the Arch build container (native target). Failure
       # fails the job and blocks the release.
       - name: Test
-        run: cargo test --release --target ${{ matrix.target }}
+        run: cargo test --workspace --release --target ${{ matrix.target }}
 
       - name: Check image-files-only build (no-physical-devices)
         run: cargo check --release --target ${{ matrix.target }} --features no-physical-devices
@@ -851,7 +853,7 @@ jobs:
       # Tests run upfront on this leg's native runner (x64 + arm64). Failure
       # fails the job and blocks the release.
       - name: Test
-        run: cargo test --release --target ${{ matrix.target }}
+        run: cargo test --workspace --release --target ${{ matrix.target }}
 
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}

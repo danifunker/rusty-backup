@@ -18,7 +18,7 @@ cargo build                    # Debug build (version: x.y.z-dev)
 cargo build --release          # Release build (version from Cargo.toml or RELEASE_VERSION env)
 cargo run                      # Run (debug)
 cargo run --release            # Run (release)
-cargo test                     # All tests
+cargo test --workspace         # All tests (a bare `cargo test` skips crates/)
 cargo test test_name           # Single test
 cargo test --lib               # Unit tests only
 cargo test --test '*'          # Integration tests only
