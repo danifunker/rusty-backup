@@ -15,7 +15,9 @@ categories = ["filesystem", "emulators"]
 default = ["fs"]
 # The Filesystem / EditableFilesystem interface and FileEntry. Partition and
 # disk-image crates turn this off to skip the filesystem types and their deps.
-fs = ["dep:serde", "dep:chrono", "dep:anyhow"]
+fs = ["serde", "dep:chrono", "dep:anyhow"]
+# Serialize / Deserialize on the always-available types (e.g. `sgi::SgiLabelByteOrder`).
+serde = ["dep:serde"]
 # Only for a Rust 1.73 toolchain; never enable on a modern one (see src/rust173.rs).
 rust173-polyfill = []
 

@@ -2380,6 +2380,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs-unix"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "byteorder",
+ "crc32c",
+ "disk-core",
+ "log",
+ "tempfile",
+ "zstd 0.13.3",
+]
+
+[[package]]
 name = "fs-xerox"
 version = "0.1.0"
 dependencies = [
@@ -5778,6 +5791,7 @@ dependencies = [
  "fs-apple2",
  "fs-cpm",
  "fs-qnx",
+ "fs-unix",
  "fs-xerox",
  "globset",
  "image",

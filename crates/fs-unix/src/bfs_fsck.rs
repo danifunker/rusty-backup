@@ -25,9 +25,9 @@
 use std::collections::HashSet;
 use std::io::{Read, Seek, Write};
 
-use super::bfs::{BfsFilesystem, BfsInode};
-use super::filesystem::FilesystemError;
-use super::fsck::{FsckIssue, FsckResult, FsckStats, RepairReport};
+use crate::bfs::{BfsFilesystem, BfsInode};
+use disk_core::filesystem::FilesystemError;
+use disk_core::fsck::{FsckIssue, FsckResult, FsckStats, RepairReport};
 
 /// Stop walking after this many inodes; a cyclic B+tree would otherwise spin.
 const MAX_INODES: usize = 2_000_000;
@@ -480,7 +480,7 @@ impl<R: Read + Write + Seek + Send> BfsFilesystem<R> {
     }
 }
 
-fn bitmap_bit(bitmap: &[u8], block: u64, endian: super::bfs::BfsEndian) -> bool {
+fn bitmap_bit(bitmap: &[u8], block: u64, endian: crate::bfs::BfsEndian) -> bool {
     let at = (block / 32) as usize * 4;
     if at + 4 > bitmap.len() {
         return false;
@@ -491,9 +491,9 @@ fn bitmap_bit(bitmap: &[u8], block: u64, endian: super::bfs::BfsEndian) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs::bfs::BfsEndian;
-    use crate::fs::bfs_write::create_blank_bfs;
-    use crate::fs::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+    use crate::bfs::BfsEndian;
+    use crate::bfs_write::create_blank_bfs;
+    use disk_core::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
     use std::io::Cursor;
 
     fn volume(endian: BfsEndian) -> BfsFilesystem<Cursor<Vec<u8>>> {

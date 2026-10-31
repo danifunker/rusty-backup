@@ -50,7 +50,7 @@ This is engineering evidence (what matches what), **not legal advice**. Anything
 | `fs/qdos.rs`, `qdos_mdv.rs` | sQLux `QDisk.c` layout and name-comparison behaviour | UQLX custom licence (no OSI licence) | FACTS (own allocator; only format semantics shared) | Re-cite as "QXL.WIN format, behaviour cross-checked with sQLux"; cite the kilgus QXL.WIN doc |
 | `fs/vxfs.rs`, `reiserfs.rs` (kernel parts), `efs*.rs`, `ext*.rs`, `squashfs*.rs`, `btrfs.rs`, `minix.rs` | kernel / headers for layout only | GPL-2.0 | FACTS | Optionally re-cite EFS to the IRIX headers / `docs/SGI_Filesystems.md` |
 | `fs/ufs*.rs` | FreeBSD `fs.h`, NetBSD makefs (fixture generator) | BSD | FACTS (add a BSD notice if any header text was copied) | none |
-| `fs/jfs.rs` ("Tier-A reference port"), `reiserfs.rs`, `ufs.rs` | **partimage 0.6.9** `fs_*.cpp` | GPL-2.0 | **UNCLEAR, not compared** (partimage isn't on disk) | Compare against partimage before relicensing `fs-unix` |
+| `fs/jfs.rs` ("Tier-A reference port"), `reiserfs.rs`, `ufs.rs` | **partimage 0.6.9** `fs_*.cpp` | GPL-2.0 | **FACTS** (compared 2026-10-30: no shared function structure, names, tables or struct definitions; partimage only walks used-block bitmaps, through different routes; the only overlap is format-mandated bitmap location formulas) | **Done:** comments now say "cross-checked against" instead of "reference port" / "mirror" |
 | `fs/ntfs*.rs` code | clean-room (documented) | n/a | FACTS | none |
 | `fs/ntfs_tables.rs` blobs | `$AttrDef` / `$UpCase` (Microsoft standard data); **`secure_sds.bin`, `root_secdesc.bin` reproduced from `mkntfs` output** | the mkntfs output's status is unclear | UNCLEAR | Regenerate `$Secure` / secdesc from a Windows-formatted volume or synthesise them from the published SD format |
 
@@ -112,4 +112,4 @@ The format data tables (Arsenic randomization table, method-13 tables, LZAH dist
 
 - Comment re-citations: `hfsplus_journal.rs` (TN1150), `xfs/*` ("behavioural reference"), `affs_common.rs:7`, `sfs.rs:459` (misattribution), `sfs_fsck.rs:3`, `qdos.rs`, `partition/x68k.rs` (licence label), `efs.rs`.
 - A repo-level `THIRD_PARTY_NOTICES.md` for the app: Nyarime MIT (GHO Fast-LZ) now, plus MAME BSD-3 (mirrors `fs-8bit`'s file).
-- Still to compare: `jfs.rs` / `reiserfs.rs` / `ufs.rs` against partimage 0.6.9, and `mar.rs` against mar-0.2.0. Both sources need fetching.
+- Still to compare: `mar.rs` against mar-0.2.0 (source needs fetching). The partimage comparison is done (FACTS, see the filesystem table).

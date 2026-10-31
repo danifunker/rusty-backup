@@ -1,0 +1,39 @@
+[package]
+name = "fs-unix"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.73"
+license = "MIT"
+authors = ["Dani Sarfati <dani@funkervogt.com>"]
+description = "Read, edit and check Unix-family filesystems: ext2/3/4, UFS/FFS, SGI EFS, JFS, btrfs, ReiserFS, VxFS, Minix and BeOS BFS"
+repository = "https://github.com/danifunker/rusty-backup"
+readme = "README.md"
+keywords = ["filesystem", "ext4", "ufs", "retro", "disk-image"]
+categories = ["filesystem"]
+
+[features]
+default = ["bfs", "btrfs", "efs", "ext", "jfs", "minix", "reiserfs", "ufs", "vxfs"]
+# One feature per filesystem (or family) so users only build what they need.
+bfs = []
+btrfs = []
+efs = []
+ext = []
+jfs = []
+minix = []
+reiserfs = []
+ufs = []
+vxfs = []
+# Only for a Rust 1.73 toolchain; see disk-core.
+rust173-polyfill = ["disk-core/rust173-polyfill"]
+
+[dependencies]
+disk-core = { path = "../disk-core", version = "0.1", features = ["fs"] }
+anyhow = "1"
+byteorder = "1"
+crc32c = "0.6"
+log = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
+# Unpacks the zstd test fixtures; 0.13 is the last line the Rust 1.73 builds resolve.
+zstd = ">=0.13, <0.15"

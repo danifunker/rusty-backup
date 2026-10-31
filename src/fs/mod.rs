@@ -12,7 +12,6 @@ pub mod archive_fs;
 pub mod atari_dos;
 pub mod attrs;
 pub mod bfs;
-pub mod bfs_fsck;
 pub mod bfs_write;
 pub mod binhex;
 pub mod btrfs;

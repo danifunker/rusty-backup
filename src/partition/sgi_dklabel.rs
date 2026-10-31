@@ -73,41 +73,7 @@ pub(crate) const OFF_BOOTFS: usize = 0x14;
 const OFF_NAME: usize = 0x5C;
 const OFF_SERIAL: usize = 0x8E;
 const NAME_LEN: usize = 50;
-
-/// Which way round the 16-bit words of an image sit. See the module header.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SgiLabelByteOrder {
-    /// Big-endian as the 68020 saw it; no fixup needed.
-    Native,
-    /// Every 16-bit word has its two bytes reversed.
-    Swabbed,
-}
-
-impl SgiLabelByteOrder {
-    /// Plain-ASCII name for logs and the inspect view.
-    pub fn display_name(self) -> &'static str {
-        match self {
-            Self::Native => "native",
-            Self::Swabbed => "byte-swapped",
-        }
-    }
-}
-
-/// Reverse the two bytes of every 16-bit word in `buf`. A trailing odd byte is
-/// left alone, which only matters for callers that read unaligned tails.
-pub fn swab16_in_place(buf: &mut [u8]) {
-    for pair in buf.chunks_exact_mut(2) {
-        pair.swap(0, 1);
-    }
-}
-
-/// Apply `order` to a freshly-read buffer so its 16-bit words read as the
-/// 68020 wrote them.
-pub fn apply_byte_order(order: SgiLabelByteOrder, buf: &mut [u8]) {
-    if order == SgiLabelByteOrder::Swabbed {
-        swab16_in_place(buf);
-    }
-}
+pub use disk_core::sgi::{apply_byte_order, swab16_in_place, SgiLabelByteOrder};
 
 /// One `struct disk_map` slot, in 512-byte blocks.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

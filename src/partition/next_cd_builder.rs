@@ -324,7 +324,7 @@ mod tests {
         assert_eq!(parts[0].byte_offset(), layout.fs_offset);
 
         let mut fs = UfsFilesystem::open(cur, layout.fs_offset).expect("open");
-        assert_eq!(fs.dirblksiz, 1024, "NeXT CDs chunk directories at 1024");
+        assert_eq!(fs.dirblksiz(), 1024, "NeXT CDs chunk directories at 1024");
         let root = fs.root().unwrap();
         let dir = fs
             .create_directory(&root, "NextApps", &CreateDirectoryOptions::default())

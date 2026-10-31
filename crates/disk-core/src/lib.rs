@@ -5,6 +5,7 @@
 //!   Rust 1.73 (the last toolchain whose std targets macOS 10.7).
 //! - [`display`]: small neutral formatters (sizes, Mac `OSType`, Unix modes).
 //! - [`bits`]: big-endian allocation-bitmap helpers (HFS, HFS+, ProDOS).
+//! - [`sgi`]: the 16-bit word order of SGI disk images.
 //! - `rust173` (feature `rust173-polyfill` only): extension traits standing in
 //!   for std methods missing on 1.73. Never enable it on a modern toolchain.
 //!
@@ -18,6 +19,7 @@
 //! - [`xattr`]: extended-attribute names and values.
 //! - [`unix_common`]: inode, bitmap, compaction and validation helpers shared by Unix-style filesystems.
 //! - [`name_legalize`]: turn any name into one a destination's `validate_name` accepts.
+//! - [`raw_name`]: keep non-UTF-8 name bytes intact through a `String`.
 //! - [`stream_pipe`]: copy a file between two filesystems without holding it in memory.
 //!
 //! Partition and disk-image crates depend on this with `default-features = false`
@@ -30,6 +32,7 @@ pub mod bits;
 pub mod display;
 #[cfg(feature = "rust173-polyfill")]
 pub mod rust173;
+pub mod sgi;
 
 #[cfg(feature = "fs")]
 pub mod entry;
@@ -39,6 +42,8 @@ pub mod filesystem;
 pub mod fsck;
 #[cfg(feature = "fs")]
 pub mod name_legalize;
+#[cfg(feature = "fs")]
+pub mod raw_name;
 #[cfg(feature = "fs")]
 pub mod stream_pipe;
 #[cfg(feature = "fs")]
