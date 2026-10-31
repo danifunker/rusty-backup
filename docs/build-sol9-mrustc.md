@@ -756,36 +756,47 @@ size bug ship once.
 
 We keep our own fork, `github.com/danifunker/mrustc`. Upstream
 (`thepowersgang/mrustc`) takes new targets: it merged PowerPC (#418). Solaris 9
-is too old to upstream. Since 2026-10-30 the work is split so each piece can go
-up, or stay ours, on its own:
+is too old to upstream.
 
-| Branch | Based on | Holds | Destination |
-|---|---|---|---|
-| `ppc-minicargo-fixes` | `upstream/master` | Three minicargo fixes from the PowerPC builds: unblock dirty children of complete jobs, make dependents wait on a clean dependency's live codegen, and accept `[patch]` in a workspace-root package manifest | Upstream: thepowersgang/mrustc#450 |
-| `sparc-solaris10` | `upstream/master` | `STD_ENV_ARCH` override, the `{:02x?}` fix, the signed-overflow helper fix, and the `sparcv9-sun-solaris` target with the gaps it needed: `repr(align)` on unions, fieldless enums passed as their integer across `extern "C"`, and `target_vendor = "sun"` | Upstream, as a PR from this branch |
-| `sparc-solaris9` | `sparc-solaris10` | One commit: `sparcv9-sun-solaris2.9`, the `emulate-overflow-intrinsics` / `emulate-c99-math` / `emulate-posix2001` flags and their C shims, the `CC_${TRIPLE}` dotted-triple fix, and the Solaris 9 sysroot notes | Ours only |
+Upstream's maintainer asked for one PR per change, and upstream's
+`CONTRIBUTING.md` (2026-10-31) sets an LLM policy. It bans AI-generated code
+blocks over about 5 lines, AI-written commit messages, PR descriptions and docs,
+and asks for a full bootstrap test on 64-bit Debian-based Linux. Each branch
+below is one commit on `upstream/master` (`eb5df108`) that builds on its own.
+Its commit message is a placeholder for Dani to rewrite before a PR.
 
-The older branches (`sparc-solaris-10`, the source of thepowersgang/mrustc#428;
-`ppc-build-2026-09`; `ppc-consolidates`) predate the split. Their content is
-fully contained in the new branches: `sparc-solaris9` plus the three minicargo
-commits reproduces `ppc-build-2026-09` rebased onto `upstream/master` with an
-empty diff.
+| Branch | Change | Destination |
+|---|---|---|
+| `fix-fmt-debug-hex` | `{:02x?}` printed a trailing `?}` | Upstream |
+| `minicargo-std-env-arch` | Allow `STD_ENV_ARCH` to be overridden | Upstream |
+| `fix-overflow-helpers` | Signed overflow helpers wrong for negative operands | Upstream |
+| `union-repr-align` | `#[repr(align(N))]` on unions | Upstream |
+| `extern-c-fieldless-enum` | Fieldless enums passed as their integer across `extern "C"` | Upstream |
+| `fix-cc-triple-varname` | `CC_${TRIPLE}` with a `.` in the triple | Upstream |
+| `minicargo-unblock-dirty-children` | Scheduler deadlock on dirty children of complete jobs | Upstream |
+| `minicargo-clean-dep-codegen-edge` | Link racing a clean dependency's deferred codegen | Upstream |
+| `minicargo-workspace-patch` | `[patch]` in a workspace-root package manifest | Upstream |
+| `solaris10-target` | The `sparcv9-sun-solaris` target, on top of the three commits it needs (`STD_ENV_ARCH`, `repr(align)`, fieldless enums) | Upstream, after those three |
+| `sparc-solaris9` | All of the above relevant to SPARC, plus one Solaris 9 commit: `sparcv9-sun-solaris2.9`, the `emulate-*` flags and shims, and the sysroot notes | Ours only |
 
-**Keeping Solaris 9 current.** Rebase `sparc-solaris10` onto `upstream/master`,
-then `sparc-solaris9` onto `sparc-solaris10`:
+The older branches (`sparc-solaris10` and `ppc-minicargo-fixes`, the heads of
+#451 and #450; `sparc-solaris-10`, the head of #428; `ppc-build-2026-09`;
+`ppc-consolidates`) predate this split. Their content is contained in the
+branches above.
+
+**Keeping Solaris 9 current.** Rebase `sparc-solaris9` onto `upstream/master`. As
+upstream merges the single-change branches, their commits drop out of it, and
+it shrinks toward one Solaris 9 commit:
 
     git fetch upstream
-    git rebase upstream/master sparc-solaris10
-    git rebase --onto sparc-solaris10 <old sparc-solaris10 tip> sparc-solaris9
+    git rebase upstream/master sparc-solaris9
 
-Once upstream merges the Solaris 10 PR, rebase `sparc-solaris9` straight onto
-`upstream/master`. It is then a single commit on top of upstream. The conflicts
-to expect are in `src/trans/codegen_c.cpp`, where the overflow-intrinsic call
-sites switch on `m_options.emulated_overflow_intrinsics` rather than on
-`Compiler::Msvc`.
+The conflicts to expect are in `src/trans/codegen_c.cpp`, where the
+overflow-intrinsic call sites switch on `m_options.emulated_overflow_intrinsics`
+rather than on `Compiler::Msvc`.
 
-**The build checkout** needs both pieces: `sparc-solaris9` with
-`ppc-minicargo-fixes` merged in, or cherry-picked on top. As of 2026-10-30, m900's
+**The build checkout** needs `sparc-solaris9` plus the three minicargo branches,
+cherry-picked on top. As of 2026-10-30, m900's
 `~/repos/mrustc` is still on `ppc-build-2026-09`, which has the same content on an
 older upstream base. Moving it to a new base changes the compiler, so the
 `output-1.74.0-*` stdlib directories will rebuild.
