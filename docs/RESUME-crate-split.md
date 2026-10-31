@@ -1,4 +1,4 @@
-# Resume: crate split — decisions, then Step 6 and Step 7
+# Resume: crate split — Step 7 and publishing
 
 Paste the prompt below into a new Claude Code session in a checkout of
 `rusty-backup` on branch `native-frontends` (on dani's box that's the
@@ -104,27 +104,22 @@ Read it first, along with `docs/license_audit.md`, CLAUDE.md and CONTRIBUTING.md
   - Add every new crate to both lists in the workflow: the tag patterns and the
     manual-run choices.
 
-## Start here: the four decisions in `crate_split_plan.md` §11a
-
-Status at 2026-10-31, end of session:
+## Start here: what's left (2026-10-31, end of session)
 
 - **Done:**
-  - Steps 0–4.
-  - All of Step 5 (`dsk-flux`, `dsk-apple`, `dsk-dmg`, `dsk-floppy`, `dsk-vm`, `dsk-ghost`) except IMZ.
-  - Every module held back from Step 2: `qdos` and `lif` went into `fs-8bit`, and `adfs` into its own GPL `fs-adfs`.
-  - `id_names` into `disk-core`.
-- **Blocked on Dani** (`crate_split_plan.md` §11a):
-  - A: the Mac-archive MIT / LGPL split, which is Step 6's `arc-mac`.
-  - B: `fs-tar`'s import side.
-  - C: where `ofs` gets its type/creator table.
-  - D: IMZ's zip-version shim.
-
-  `sun2tape*` / `tar_section` follow from A.
-- **CI:**
-  - The `crates-msrv` target runs every crate's tests on Rust 1.73 (`scripts/test-crates-msrv.sh`).
-  - The release workflow's tests now pass `--workspace`, so crate tests run on stable too.
-  - A new push to a feature branch cancels that branch's older run.
-- **Step 7 (remove the shims) is deliberately last.** Do it just before merging, so code that lands on `main` in the meantime with old paths doesn't break the merge. Also delete `.github/ci-targets` then (see the memory note).
+  - Steps 0–6.
+  - The four §11a decisions:
+    - A: `arc-mac`, one crate, `MIT AND LGPL-2.1-or-later`.
+    - B: `fs-tar`, with an optional `appledouble` feature.
+    - C: `ofs` in `fs-unix`, behind an optional `fs-mac` dependency.
+    - D: `dsk-imz`, its own crate.
+  - Every module held back from Step 2.
+- **Still in the app, with reasons in `crate_split_plan.md` §9 and §11a:**
+  - `sun2tape*` / `tar_section`. They need the tar half of `mem_archive` carved into `fs-tar` first, and `arc-mac`'s Unix-`compress` codec, which would pull LGPL and GPL into `fs-unix`'s `sun2tape` feature. Ask Dani before doing it.
+  - `interleave`, `swab`.
+  - The CHD / optical helpers headed upstream to libchdman-rs and opticaldiscs, which are other repositories.
+- **Next:** Step 7. Remove the shims and finish the docs, *just before merging* `native-frontends`, so code landing on `main` meanwhile doesn't break. At the same time, `git rm .github/ci-targets`.
+- **Publishing (tags, Dani):** see "Publishing order" below.
 
 **How each slice was done (scripts are easy to recreate):**
 
@@ -164,8 +159,8 @@ Publishing goes through tags (see the rules above); this session could not push 
 
 1. **Now, on `disk-core` 0.1.0:** `fs-xerox`, `dsk-clonezilla`, `fs-8bit`, `fs-cpm`, `fs-apple2`, `fs-qnx`, `fs-apfs`, `fs-hpfs`, `fs-adfs`, `fs-mac-unicode`, `dsk-flux`, `dsk-apple`, `dsk-dmg`, `dsk-floppy` and `dsk-vm`. All 15 passed `cargo publish --dry-run` against crates.io on 2026-10-31 (commit 4aa59ca5).
 2. **`disk-core` 0.1.1:** the tree is at 0.1.1. The additions (`name_legalize`, `stream_pipe`, `raw_name`, `attrs`, `sgi`, the `serde` feature) are backwards compatible.
-3. **After 0.1.1, these require it:** `fs-amiga`, `fs-mac`, `fs-pc`, `fs-squashfs`, `fs-unix`, `fs-xfs` and `part-tables`.
-4. **Last:** `dsk-ghost` (after `fs-pc`), then `fs-mac` (after `fs-mac-unicode` and `dsk-apple`).
+3. **After 0.1.1, these require it:** `fs-amiga`, `fs-mac`, `fs-pc`, `fs-squashfs`, `fs-unix`, `fs-xfs` and `part-tables`. `fs-tar` too.
+4. **Last, in dependency order:** `dsk-ghost` after `fs-pc`; `fs-mac` after `fs-mac-unicode` and `dsk-apple`; `arc-mac` after `fs-mac`. `fs-unix`'s optional `ofs` and `fs-tar`'s optional `appledouble` features need `fs-mac` published too. `dsk-imz` only needs `disk-core`.
 
 `.github/workflows/publish-crates.yml` lists every crate. Run `cargo publish -p <crate> --dry-run` on a clean tree before each tag.
 
