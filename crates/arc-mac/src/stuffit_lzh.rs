@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: LGPL-2.1-or-later
+// Derived from XADMaster, Copyright (c) 2017-present MacPaw Way Ltd.; see THIRD_PARTY_NOTICES.md.
 //! StuffIt compression **method 13** ("LZ+Huffman"): an LZSS scheme with
 //! per-block Huffman-coded literals/lengths/offsets. This is the dominant
 //! codec in classic `.sit` archives.

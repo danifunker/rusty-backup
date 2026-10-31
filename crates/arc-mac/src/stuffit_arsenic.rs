@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: LGPL-2.1-or-later
+// Derived from XADMaster, Copyright (c) 2017-present MacPaw Way Ltd.; see THIRD_PARTY_NOTICES.md.
 //! StuffIt compression **method 15** ("Arsenic"): an arithmetic-coded
 //! BWT + MTF + RLE scheme (conceptually similar to bzip2). Used by StuffIt's
 //! "maximum" setting and by most StuffIt 5 archives.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! MacBinary I / II / III — the canonical full-fidelity parser for the family.
 //!
 //! MacBinary is a *transport wrapper*: it serializes exactly one Mac file's
@@ -29,7 +30,7 @@
 use anyhow::{bail, Result};
 use byteorder::{BigEndian, ByteOrder};
 
-use crate::fs::resource_fork::macbinary_crc16;
+use fs_mac::resource_fork::macbinary_crc16;
 
 /// Which MacBinary revision a stream identifies as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,7 +206,7 @@ pub fn parse(bytes: &[u8]) -> Result<MacBinaryFile> {
     if name_len == 0 || name_len > 63 {
         bail!("MacBinary: bad filename length {name_len}");
     }
-    let filename = crate::fs::hfs::decode_mac_filename(&bytes[2..2 + name_len]);
+    let filename = fs_mac::hfs::decode_mac_filename(&bytes[2..2 + name_len]);
 
     let version = version_of(bytes);
 

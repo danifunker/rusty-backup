@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! MacZip — Info-ZIP's Macintosh port (D. Haase), the "new" `Mac3` format.
 //!
 //! MacZip writes a standard PKZIP archive where each Mac file becomes a normal
@@ -507,7 +508,7 @@ fn store_fork(data: &[u8], offset: u64, crc: u16) -> ForkInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::macarchive::stuffit::decompress_fork;
+    use crate::stuffit::decompress_fork;
 
     /// Build a one-entry ZIP (stored) with an optional Mac3 extra field on both
     /// headers, used to exercise the parser without the `zip` crate's writer.

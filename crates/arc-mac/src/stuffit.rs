@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Classic StuffIt (`.sit`) + StuffIt self-extracting (`.sea`) reader.
 //!
 //! Container layout (reverse-engineered; see XADMaster `XADStuffItParser.m`,
@@ -35,7 +36,7 @@
 use anyhow::{bail, Result};
 use byteorder::{BigEndian, ByteOrder};
 
-use crate::fs::binhex;
+use fs_mac::binhex;
 
 const ARCHIVE_HEADER_LEN: usize = 22;
 const ENTRY_HEADER_LEN: usize = 112;
@@ -263,7 +264,7 @@ pub fn parse(data: &[u8]) -> Result<StuffItArchive> {
         if namelen > 31 {
             namelen = 31;
         }
-        let name = crate::fs::hfs::decode_mac_filename(&h[3..3 + namelen]);
+        let name = fs_mac::hfs::decode_mac_filename(&h[3..3 + namelen]);
 
         let data_start = (base + pos + ENTRY_HEADER_LEN) as u64;
 
@@ -642,7 +643,7 @@ fn emit_folder_marker(
 
 /// Encode a name to at most 31 Mac Roman bytes (lossy ASCII fallback).
 fn mac_name_bytes(name: &str) -> Vec<u8> {
-    let mut bytes = crate::fs::hfs::utf8_to_mac_roman(name).unwrap_or_else(|_| {
+    let mut bytes = fs_mac::hfs::utf8_to_mac_roman(name).unwrap_or_else(|_| {
         name.chars()
             .map(|c| if c.is_ascii() { c as u8 } else { b'_' })
             .collect()

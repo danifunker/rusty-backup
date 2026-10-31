@@ -328,7 +328,14 @@ Every step's diff stays small, because the old paths keep working through re-exp
 
 Everything below needs Dani's call. Everything else in Steps 0–5 is done.
 
-**A. The Mac-archive split (D1).** D1 puts the XADMaster-derived code in an LGPL `arc-mac-codecs` and the rest in an MIT `arc-mac`. The code doesn't divide that cleanly:
+**A. The Mac-archive split (D1). DECIDED 2026-10-31: one crate, `MIT AND LGPL-2.1-or-later`; DONE.**
+- All of `src/macarchive/` moved into `crates/arc-mac`. Each file starts with an SPDX line: LGPL for the eight XADMaster-derived files, MIT for the rest, both for `stuffit_lzw`.
+- It ships `LICENSE-MIT`, `LICENSE-LGPL-2.1`, and MacPaw's copyright notice (copied from upstream) in `THIRD_PARTY_NOTICES.md`. `arc-mac-codecs` is not created.
+- It depends on `fs-mac` (`hfs`, `forks`) and `dsk-apple` (`dc42`).
+- `mar.rs`'s "clean-room from GPL mar" claim is still to be compared, as before.
+- **`sun2tape*` / `tar_section` stay in the app for now.** Besides the Unix-`compress` codec (now in `arc-mac`), they browse each tar section through the app's `mem_archive::MemArchiveFilesystem`. That module also handles ZIP through the zip-version shim (decision D), so moving the tapes means first carving `mem_archive`'s tar half out (into `fs-tar`).
+
+Original note:  D1 puts the XADMaster-derived code in an LGPL `arc-mac-codecs` and the rest in an MIT `arc-mac`. The code doesn't divide that cleanly:
 - `compactpro.rs` and `stuffit5.rs` are derived *throughout*, including their parsers (`XADCompactProParser.m`, `XADStuffIt5Parser.m`). But they build the MIT archive model (`StuffItArchive`, `StuffItEntry`, `ForkInfo`, `ForkCodec`, defined in `stuffit.rs`), and `stuffit5` calls `stuffit::decompress_fork`, which dispatches to the derived codecs.
 - `bitreader_be.rs` is independent (MIT), but only the derived Huffman and LZAH decoders use it.
 - `stuffit_lzw.rs` mixes the derived decoder with an independent Unix-`compress` encoder. `fs-unix`'s held-back `sun2tape` needs both halves.

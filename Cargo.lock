@@ -355,6 +355,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "arc-mac"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "byteorder",
+ "disk-core",
+ "dsk-apple",
+ "flate2",
+ "fs-mac",
+ "tempfile",
+]
+
+[[package]]
 name = "arg_enum_proc_macro"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5944,6 +5957,7 @@ dependencies = [
  "ab_glyph",
  "aes 0.9.3",
  "anyhow",
+ "arc-mac",
  "base64 0.23.1",
  "byteorder",
  "bzip2 0.6.1",

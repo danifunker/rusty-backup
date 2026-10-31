@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: LGPL-2.1-or-later
+// Derived from XADMaster, Copyright (c) 2017-present MacPaw Way Ltd.; see THIRD_PARTY_NOTICES.md.
 //! Compact Pro (`.cpt`) archive reader — Bill Goodman's Compactor / Compact
 //! Pro format, common for vintage Mac software and frequently distributed as a
 //! BinHex-wrapped self-extracting archive (`.sea.hqx`).
@@ -19,7 +21,7 @@ use byteorder::{BigEndian, ByteOrder};
 use std::sync::OnceLock;
 
 use super::stuffit::{ForkCodec, ForkInfo, StuffItArchive, StuffItEntry};
-use crate::fs::hfs::decode_mac_filename;
+use fs_mac::hfs::decode_mac_filename;
 
 /// Bytes of file metadata that follow a file entry's name (volume, offset,
 /// type/creator, two dates, finder flags, crc, flags, four lengths).
@@ -810,7 +812,7 @@ mod tests {
             return;
         }
         let raw = std::fs::read(path).unwrap();
-        let bh = crate::fs::binhex::parse_binhex(&raw).expect("binhex decode");
+        let bh = fs_mac::binhex::parse_binhex(&raw).expect("binhex decode");
         assert!(is_compactpro(&bh.data_fork), "should detect Compact Pro");
         let archive = parse(&bh.data_fork).expect("compactpro parse");
         let files: Vec<_> = archive.entries.iter().filter(|e| !e.is_dir).collect();

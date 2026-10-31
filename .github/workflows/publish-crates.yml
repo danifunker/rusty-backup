@@ -32,6 +32,7 @@ on:
       - "dsk-ghost-v*"
       - "fs-adfs-v*"
       - "fs-tar-v*"
+      - "arc-mac-v*"
   workflow_dispatch:
     inputs:
       crate:
@@ -64,6 +65,7 @@ on:
           - dsk-ghost
           - fs-adfs
           - fs-tar
+          - arc-mac
       dry_run:
         description: Package and verify only, do not upload
         required: true

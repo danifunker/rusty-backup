@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Magic-sniff classifier for Mac archive bytes. Returns a single
 //! [`MacArchiveKind`] regardless of filename extension, so the GUI
 //! workflows in OPEN-WORK §6.1 can trigger off the actual file content
@@ -20,8 +21,8 @@
 
 use std::io::Cursor;
 
-use crate::fs::binhex;
-use crate::rbformats::dc42;
+use dsk_apple::dc42;
+use fs_mac::binhex;
 
 use super::compactpro::is_compactpro;
 use super::extract::is_stuffitx;
@@ -268,7 +269,7 @@ mod tests {
     /// through parse_binhex. Picks a benign Mac filename, zero
     /// type/creator, and the given bytes as the data fork.
     fn wrap_binhex(name: &str, data_fork: Vec<u8>) -> Vec<u8> {
-        let bh = crate::fs::binhex::BinHexFile {
+        let bh = fs_mac::binhex::BinHexFile {
             name: name.to_string(),
             type_code: [0; 4],
             creator_code: [0; 4],
@@ -276,7 +277,7 @@ mod tests {
             data_fork,
             resource_fork: Vec::new(),
         };
-        crate::fs::binhex::build_binhex(&bh).into_bytes()
+        fs_mac::binhex::build_binhex(&bh).into_bytes()
     }
 
     #[test]
@@ -435,7 +436,7 @@ mod tests {
         BigEndian::write_u32(&mut hdr[83..87], 4); // data fork len
         hdr[122] = 129;
         hdr[123] = 129;
-        let crc = crate::fs::resource_fork::macbinary_crc16(&hdr[0..124]);
+        let crc = fs_mac::resource_fork::macbinary_crc16(&hdr[0..124]);
         BigEndian::write_u16(&mut hdr[124..126], crc);
         let mut mb = hdr.to_vec();
         mb.extend_from_slice(b"DATA");
@@ -459,10 +460,10 @@ mod tests {
     fn detects_mar() {
         // A stored MAR built by our own writer classifies as Mar (magic +
         // header CRC), is not BinHex-wrapped, and counts as multi-file.
-        let mar = crate::macarchive::mar::build_archive(
+        let mar = crate::mar::build_archive(
             "x",
-            &[crate::macarchive::stuffit::StuffItInputNode::File(
-                crate::macarchive::stuffit::StuffItInput {
+            &[crate::stuffit::StuffItInputNode::File(
+                crate::stuffit::StuffItInput {
                     name: "f".into(),
                     type_code: *b"TEXT",
                     creator_code: *b"ttxt",

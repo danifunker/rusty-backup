@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Big-endian (MSB-first) bit reader shared by the StuffIt Huffman (method 3)
 //! and LZAH (method 5) codecs. Matches XADMaster's `CSInputNextBit` /
 //! `CSInputNextBitString` (the non-`LE` variants).

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! MAR archive reader + writer (classic Mac, Hampa Hug's `mar` tool).
 //!
 //! A `.mar` archive stores a **single** Mac item — a file or a folder tree —
@@ -41,7 +42,7 @@
 
 use anyhow::{bail, Context, Result};
 
-use crate::fs::hfs::{decode_mac_filename, utf8_to_mac_roman};
+use fs_mac::hfs::{decode_mac_filename, utf8_to_mac_roman};
 
 use super::stuffit::{
     crc16_arc, ForkCodec, ForkInfo, StuffItArchive, StuffItEntry, StuffItInputNode,
@@ -416,7 +417,7 @@ fn put_u32(buf: &mut [u8], i: usize, v: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::macarchive::stuffit::{decompress_fork, StuffItInput};
+    use crate::stuffit::{decompress_fork, StuffItInput};
 
     fn file_node(
         name: &str,

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: LGPL-2.1-or-later AND MIT
+// The LZW decoder is derived from XADMaster (LGPL); the compress(1) encoder is original (MIT).
 //! StuffIt compression **method 2** ("Compress"): the classic Unix
 //! `compress(1)` LZW with block mode (code 256 = table clear). StuffIt invokes
 //! it with flags `0x8e` → block mode, 14-bit maximum code width.
@@ -7,9 +9,9 @@
 //! clear the encoder pads to an 8-code boundary (the well-known `compress`
 //! quirk).
 
-#[cfg(feature = "rust173-polyfill")]
-use crate::rust173_compat::IntIsMultipleOf as _;
 use anyhow::{bail, Result};
+#[cfg(feature = "rust173-polyfill")]
+use disk_core::rust173::IntIsMultipleOf as _;
 
 /// LSB-first bit cursor over the compressed bytes.
 struct BitCursor<'a> {

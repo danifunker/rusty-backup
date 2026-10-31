@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: LGPL-2.1-or-later
+// Derived from XADMaster, Copyright (c) 2017-present MacPaw Way Ltd.; see THIRD_PARTY_NOTICES.md.
 //! StuffIt 5 (`.sit` v5, magic "StuffIt (c)1997…") container reader.
 //!
 //! A different container from classic `SIT!`, but it reuses the same fork
@@ -204,7 +206,7 @@ pub fn parse(data: &[u8]) -> Result<StuffItArchive> {
 
         let datastart = cur.pos as u64;
 
-        let name = crate::fs::hfs::decode_mac_filename(&namedata);
+        let name = fs_mac::hfs::decode_mac_filename(&namedata);
         let parent = dirs.get(&diroffs).cloned().unwrap_or_default();
         let mut path = parent.clone();
         path.push(name.clone());
@@ -293,7 +295,7 @@ mod tests {
             return;
         }
         let raw = std::fs::read(path).unwrap();
-        let bh = crate::fs::binhex::parse_binhex(&raw).expect("binhex decode");
+        let bh = fs_mac::binhex::parse_binhex(&raw).expect("binhex decode");
         let archive = parse(&bh.data_fork).expect("sit5 parse");
         let files: Vec<_> = archive.entries.iter().filter(|e| !e.is_dir).collect();
         assert!(!files.is_empty());
@@ -304,7 +306,7 @@ mod tests {
                 if f.uncompressed_len == 0 {
                     continue;
                 }
-                let out = super::super::stuffit::decompress_fork(&bh.data_fork, f)
+                let out = crate::stuffit::decompress_fork(&bh.data_fork, f)
                     .unwrap_or_else(|err| panic!("{}: {err}", e.name));
                 assert_eq!(out.len(), f.uncompressed_len as usize);
                 decompressed += 1;

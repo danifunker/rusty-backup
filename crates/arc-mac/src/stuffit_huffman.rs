@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: LGPL-2.1-or-later
+// Derived from XADMaster, Copyright (c) 2017-present MacPaw Way Ltd.; see THIRD_PARTY_NOTICES.md.
 //! StuffIt compression **method 3** ("Huffman"): a plain byte-wise Huffman
 //! code whose tree is serialized at the head of the stream. Ported from
 //! XADMaster `XADStuffItHuffmanHandle.m`. Big-endian (MSB-first) bitstream.

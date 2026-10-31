@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: LGPL-2.1-or-later
+// Derived from XADMaster, Copyright (c) 2017-present MacPaw Way Ltd.; see THIRD_PARTY_NOTICES.md.
 //! StuffIt compression **method 5** ("LZAH"): an LHArc-style LZSS over a 4 KiB
 //! preset window, with an *adaptive* (FGK) Huffman code for literals/lengths
 //! and a static prefix code for the high bits of the match offset. Ported from

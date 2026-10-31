@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Shared archive open + extraction logic used by both the CLI (`sit` verb)
 //! and the GUI archive-browse tab.
 
@@ -5,8 +6,8 @@ use anyhow::{bail, Context, Result};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use crate::fs::binhex;
-use crate::fs::resource_fork::{self, sanitize_filename};
+use fs_mac::binhex;
+use fs_mac::resource_fork::{self, sanitize_filename};
 
 use super::stuffit::{self, StuffItArchive, StuffItEntry};
 use super::stuffit5;
@@ -632,9 +633,7 @@ mod tests {
     /// data path.
     #[test]
     fn extract_filtered_writes_only_kept_entries() {
-        use super::super::stuffit::{
-            build_archive_tree, StuffItInput, StuffItInputNode, WriteMethod,
-        };
+        use crate::stuffit::{build_archive_tree, StuffItInput, StuffItInputNode, WriteMethod};
         // Build a 3-file archive: file1 + file2 at root, file3 under
         // subdir/. Then extract only file1 and file3.
         let mk = |name: &str, body: &[u8]| StuffItInput {
@@ -700,9 +699,7 @@ mod tests {
     /// per-file warning plus a closing recommendation are logged.
     #[test]
     fn extract_warns_and_counts_host_illegal_names() {
-        use super::super::stuffit::{
-            build_archive_tree, StuffItInput, StuffItInputNode, WriteMethod,
-        };
+        use crate::stuffit::{build_archive_tree, StuffItInput, StuffItInputNode, WriteMethod};
         let tree = vec![StuffItInputNode::File(StuffItInput {
             name: "Read/Write Me".into(),
             type_code: *b"TEXT",
@@ -750,8 +747,8 @@ mod tests {
     /// real archive.)
     #[test]
     fn raw_extract_preserves_forks_on_dot_rsrc_name_collision() {
-        use super::super::stuffit::{build_archive_tree, StuffItInputNode, WriteMethod};
-        let mk = |name: &str, data: &[u8], rsrc: &[u8]| super::super::stuffit::StuffItInput {
+        use crate::stuffit::{build_archive_tree, StuffItInputNode, WriteMethod};
+        let mk = |name: &str, data: &[u8], rsrc: &[u8]| crate::stuffit::StuffItInput {
             name: name.into(),
             type_code: [0; 4],
             creator_code: [0; 4],
@@ -815,7 +812,7 @@ mod tests {
         BigEndian::write_u32(&mut hdr[95..99], 0x2222_2222); // modify
         hdr[122] = 129;
         hdr[123] = 129;
-        let crc = crate::fs::resource_fork::macbinary_crc16(&hdr[0..124]);
+        let crc = fs_mac::resource_fork::macbinary_crc16(&hdr[0..124]);
         BigEndian::write_u16(&mut hdr[124..126], crc);
         let mut out = hdr.to_vec();
         out.extend_from_slice(data);
@@ -855,9 +852,7 @@ mod tests {
     /// opaque blob.
     #[test]
     fn open_bytes_peels_macbinary_over_sit() {
-        use super::super::stuffit::{
-            build_archive_tree, StuffItInput, StuffItInputNode, WriteMethod,
-        };
+        use crate::stuffit::{build_archive_tree, StuffItInput, StuffItInputNode, WriteMethod};
         let mk = |name: &str, body: &[u8]| StuffItInput {
             name: name.into(),
             type_code: [0; 4],

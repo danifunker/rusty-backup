@@ -109,6 +109,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "arc-mac"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "byteorder",
+ "disk-core",
+ "dsk-apple",
+ "flate2",
+ "fs-mac",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1411,6 +1423,7 @@ name = "rb-cli-ppc"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arc-mac",
  "base64",
  "byteorder",
  "bzip2",
