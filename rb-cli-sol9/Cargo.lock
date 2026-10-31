@@ -1225,6 +1225,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "part-tables"
+version = "0.1.0"
+dependencies = [
+ "byteorder",
+ "crc32fast",
+ "disk-core",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1356,6 +1368,7 @@ dependencies = [
  "lzfse_rust",
  "lzma-rs",
  "md-5",
+ "part-tables",
  "qnx2fs",
  "ratatui",
  "rustyline",

@@ -1251,7 +1251,7 @@ impl PartitionTable {
             // Magic matched but parsing failed — fall through to surface
             // the InvalidSgi error path. Re-parsing here rather than caching
             // the prior error keeps the control flow obvious.
-            return Err(SgiVolumeHeader::parse(&mbr_data).unwrap_err());
+            return Err(SgiVolumeHeader::parse(&mbr_data).unwrap_err().into());
         }
 
         // SGI disk label (IRIS 2000 / 3000, pre-IRIX). `D_MAGIC` 0x00072959 at
@@ -1464,7 +1464,7 @@ impl PartitionTable {
                         fs_hint: "Unknown".to_string(),
                     });
                 }
-                return Err(unrecognized_media(size_bytes, &e));
+                return Err(unrecognized_media(size_bytes, &e.into()));
             }
         };
 
@@ -1480,7 +1480,7 @@ impl PartitionTable {
                     // If GPT parsing fails, surface the error instead of
                     // falling back to MBR (which would expose a fake 0xEE
                     // partition spanning the entire disk).
-                    Err(e)
+                    Err(e.into())
                 }
             }
         } else {
@@ -2216,41 +2216,7 @@ pub fn largest_free_region(
         .max_by_key(|r| r.size_bytes)
 }
 
-/// Partition size override for VHD export and restore.
-#[derive(Debug, Clone)]
-pub struct PartitionSizeOverride {
-    pub index: usize,
-    pub start_lba: u64,
-    pub original_size: u64,
-    pub export_size: u64,
-    /// New start LBA for this partition (for restore with alignment changes).
-    /// When `None`, the original `start_lba` is kept.
-    pub new_start_lba: Option<u64>,
-    /// Heads for CHS recalculation (0 = don't touch CHS fields).
-    pub heads: u16,
-    /// Sectors per track for CHS recalculation (0 = don't touch CHS fields).
-    pub sectors_per_track: u16,
-}
-
-impl PartitionSizeOverride {
-    /// Create a simple size-only override (backward compatible with VHD export).
-    pub fn size_only(index: usize, start_lba: u64, original_size: u64, export_size: u64) -> Self {
-        Self {
-            index,
-            start_lba,
-            original_size,
-            export_size,
-            new_start_lba: None,
-            heads: 0,
-            sectors_per_track: 0,
-        }
-    }
-
-    /// The effective start LBA (new if set, otherwise original).
-    pub fn effective_start_lba(&self) -> u64 {
-        self.new_start_lba.unwrap_or(self.start_lba)
-    }
-}
+pub use part_tables::PartitionSizeOverride;
 
 #[cfg(test)]
 mod tests {

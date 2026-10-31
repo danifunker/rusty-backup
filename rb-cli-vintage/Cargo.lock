@@ -1404,6 +1404,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "part-tables"
+version = "0.1.0"
+dependencies = [
+ "byteorder",
+ "crc32fast",
+ "disk-core",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1565,6 +1577,7 @@ dependencies = [
  "objc2-disk-arbitration",
  "objc2-foundation",
  "objc2-io-kit",
+ "part-tables",
  "qnx2fs",
  "ratatui",
  "rustyline",

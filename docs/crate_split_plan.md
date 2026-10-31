@@ -247,6 +247,12 @@ The crates already kept separately stay separate, because other projects share t
      - **Held back:** `lisa` (needs `rbformats::dc42`, which belongs to `dsk-apple`; move with Step 5). `mac_scsi_bless` stays in the app (C3).
    - **Step 3 is complete** except the held-back modules listed in the bullets above.
 4. **`part-tables`** (C5).
+   - **Done (2026-10-31)**, MIT: `mbr`, `gpt`, `apm`, `bsd`, `sun`, `sgi` (+ `sgi_dklabel`), `next`, `rdb`, `atari`, `x68k`, `solaris_x86` and `lvm/` (AIX, HP-UX), one feature each (`solaris-x86` pulls `mbr` + `sun`, `x68k` pulls `mbr`).
+     - The modules returned `crate::error::RustyBackupError`; the crate has its own `PartitionError` with the same seven variants and messages, and the app converts it with `From`. Three call sites in `partition/mod.rs` needed `.into()`.
+     - `PartitionSizeOverride` moved from `partition/mod.rs` into the crate (re-exported). The LIF volume-header probe (`looks_like_lif`, `LIF_MAGIC`, `MAX_DIR_SECTORS`) moved into `part_tables::lif`, so `bsd` and the HP-UX LVM reader need no filesystem crate; `fs/lif.rs` imports it.
+     - C5 holds: `PartitionTable` detection and dispatch, `type_catalog`, `alignment`, `editor`, `provision`, `resize`, `restore_patch`, `x68k_ipl` and every `*_builder` stay in the app.
+     - Tests that go through `PartitionTable`, `type_catalog` or `provision` moved to the app's shim files, with copies of the image helpers they need. Two crate tests had relative fixture paths; the Sun one used to skip silently when it couldn't find its fixture, and now runs.
+     - `sgi_dklabel::{OFF_MAP, OFF_BOOTFS}` became `pub` for the editor and restore patcher.
 5. **`dsk-*` and `dsk-clonezilla`** (C6, C7, C11). The upstream moves to libchdman-rs and opticaldiscs happen here.
    - **`dsk-clonezilla` done early (2026-10-30)**, ahead of Step 3, because its co-author had agreed to MIT.
      - `partclone`, `metadata`, `metadata_scan` and `block_cache` moved as-is. `metadata_scan` only depends on the other three, so it counts as format code: it finds FAT / NTFS / exFAT / ext / btrfs metadata blocks inside a partclone stream.

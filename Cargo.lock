@@ -4680,6 +4680,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "73072a9470554c8e794778acece2312661218aaabb635600957d952cf01c716e"
 
 [[package]]
+name = "part-tables"
+version = "0.1.0"
+dependencies = [
+ "byteorder",
+ "crc32fast",
+ "disk-core",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5889,6 +5901,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "objc2-io-kit",
  "opticaldiscs",
+ "part-tables",
  "qnx2fs",
  "ratatui",
  "reqwest",

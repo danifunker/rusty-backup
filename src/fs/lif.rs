@@ -35,10 +35,6 @@ use super::filesystem::{
 
 /// LIF counts everything in 256-byte sectors.
 pub const LIF_SECTOR: u64 = 256;
-/// Volume header magic at byte 0.
-const LIF_MAGIC: u16 = 0x8000;
-/// Directory sizes seen in the wild are a handful of sectors; anything past this is not LIF.
-const MAX_DIR_SECTORS: u32 = 4096;
 const ENTRY: usize = 32;
 /// File alignment in sectors (2 KiB), which the IPL address needs.
 const ALIGN: u64 = 8;
@@ -70,15 +66,7 @@ pub struct LifVolume {
     pub files: Vec<LifFile>,
 }
 
-/// Whether the first sector of `head` is a LIF volume header.
-pub fn looks_like_lif(head: &[u8]) -> bool {
-    if head.len() < 22 || BigEndian::read_u16(&head[0..2]) != LIF_MAGIC {
-        return false;
-    }
-    let dir_start = BigEndian::read_u32(&head[8..12]);
-    let dir_len = BigEndian::read_u32(&head[16..20]);
-    dir_start >= 1 && (1..=MAX_DIR_SECTORS).contains(&dir_len)
-}
+pub use part_tables::lif::looks_like_lif;
 
 /// Parse the LIF volume at byte `base` of `reader`, or `None` when there is none.
 pub fn parse_lif<R: Read + Seek>(reader: &mut R, base: u64) -> Option<LifVolume> {
@@ -662,7 +650,7 @@ mod tests {
     /// A LIF volume "BOOT43" with ISL (2 sectors of 0xAA) and a purged entry, NetBSD/hp300 style.
     fn sample_lif() -> Vec<u8> {
         let mut img = vec![0u8; 16 * 256];
-        BigEndian::write_u16(&mut img[0..2], LIF_MAGIC);
+        BigEndian::write_u16(&mut img[0..2], part_tables::lif::LIF_MAGIC);
         img[2..8].copy_from_slice(b"BOOT43");
         BigEndian::write_u32(&mut img[8..12], 2);
         BigEndian::write_u16(&mut img[12..14], 0x1000);
@@ -730,7 +718,7 @@ mod tests {
     /// An HP-UX-style volume: 64-slot directory at sector 16, ISL at 32 (IPL points at it), 128 sectors.
     fn hpux_lif() -> Vec<u8> {
         let mut img = vec![0u8; 256 * 256];
-        BigEndian::write_u16(&mut img[0..2], LIF_MAGIC);
+        BigEndian::write_u16(&mut img[0..2], part_tables::lif::LIF_MAGIC);
         img[2..8].copy_from_slice(b"ISL10 ");
         BigEndian::write_u32(&mut img[8..12], 16);
         BigEndian::write_u16(&mut img[12..14], 0x1000);

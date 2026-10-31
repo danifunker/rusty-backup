@@ -99,7 +99,7 @@ native-zstd = ["dep:zstd", "dsk-clonezilla/native-zstd", "fs-squashfs/native-zst
 remote = []
 tui = ["dep:ratatui", "ratatui-legacy"]
 ratatui-legacy = []
-rust173-polyfill = ["disk-core/rust173-polyfill", "fs-8bit/rust173-polyfill", "fs-cpm/rust173-polyfill", "fs-apple2/rust173-polyfill", "fs-qnx/rust173-polyfill", "fs-xerox/rust173-polyfill", "dsk-clonezilla/rust173-polyfill", "fs-amiga/rust173-polyfill", "fs-unix/rust173-polyfill", "fs-xfs/rust173-polyfill", "fs-squashfs/rust173-polyfill", "fs-pc/rust173-polyfill", "fs-hpfs/rust173-polyfill", "fs-apfs/rust173-polyfill", "fs-mac-unicode/rust173-polyfill", "fs-mac/rust173-polyfill"]
+rust173-polyfill = ["disk-core/rust173-polyfill", "fs-8bit/rust173-polyfill", "fs-cpm/rust173-polyfill", "fs-apple2/rust173-polyfill", "fs-qnx/rust173-polyfill", "fs-xerox/rust173-polyfill", "dsk-clonezilla/rust173-polyfill", "fs-amiga/rust173-polyfill", "fs-unix/rust173-polyfill", "fs-xfs/rust173-polyfill", "fs-squashfs/rust173-polyfill", "fs-pc/rust173-polyfill", "fs-hpfs/rust173-polyfill", "fs-apfs/rust173-polyfill", "fs-mac-unicode/rust173-polyfill", "fs-mac/rust173-polyfill", "part-tables/rust173-polyfill"]
 windows-legacy = []
 # Declared so the shared source's `#[cfg(feature = "yaml")]` resolves, but
 # deliberately NOT in this build's feature list — see the serde_yml note below.
@@ -121,6 +121,7 @@ fs-cpm = { path = "../crates/fs-cpm" }
 fs-apple2 = { path = "../crates/fs-apple2" }
 fs-qnx = { path = "../crates/fs-qnx" }
 fs-xerox = { path = "../crates/fs-xerox" }
+part-tables = { path = "../crates/part-tables" }
 fs-mac = { path = "../crates/fs-mac" }
 fs-mac-unicode = { path = "../crates/fs-mac-unicode" }
 fs-apfs = { path = "../crates/fs-apfs", default-features = false }

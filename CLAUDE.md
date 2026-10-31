@@ -122,7 +122,7 @@ backed up whole with their head region verbatim and resized on restore by
 
 Amiga images (`.adf`, `.hdf`, `.adz`, `.hdz`, and CHD-wrapped HDFs) and the three filesystems that matter on Classic Amiga hardware (AFFS, PFS3, SFS) are first-class:
 
-- **Partition table**: `PartitionTable::Rdb` parses RDSK + PART chain (`src/partition/rdb.rs`). Each `PartitionInfo` carries the 4-byte `DosType` as `partition_type_string` (e.g. `"DOS\\3"`, `"PFS\\3"`, `"SFS\\0"`).
+- **Partition table**: `PartitionTable::Rdb` parses RDSK + PART chain (`crates/part-tables/src/rdb.rs`). Each `PartitionInfo` carries the 4-byte `DosType` as `partition_type_string` (e.g. `"DOS\\3"`, `"PFS\\3"`, `"SFS\\0"`).
 - **Filesystem dispatch**: extend the `partition_type_string` matchers in `src/fs/mod.rs` (`fs_name_for`, `is_layout_preserving_fs`, `is_expensive_minimum`, `open_filesystem_by_string`, `open_editable_filesystem_by_string`, `compact_partition_reader_by_string`). Helpers `is_amiga_dos_type` / `is_amiga_pfs3_type` / `is_amiga_sfs_type` group the relevant strings.
 - **Filesystems**:
   - **AFFS** (`crates/fs-amiga/src/affs.rs`) — DOS\0..DOS\7, read + edit + Disk Validator fsck. Files inherit `amiga_protection` (offset 0x140) and `amiga_comment` (BSTR at 0x148) via `CreateFileOptions`; the same fields surface on `FileEntry` for the browse view.

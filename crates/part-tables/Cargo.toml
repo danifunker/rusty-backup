@@ -1,0 +1,39 @@
+[package]
+name = "part-tables"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.73"
+license = "MIT"
+authors = ["Dani Sarfati <dani@funkervogt.com>"]
+description = "Parse and write disk partition tables and labels: MBR, GPT, Apple APM, BSD, Sun, SGI, NeXT, Amiga RDB, Atari AHDI, X68000, Solaris x86, AIX / HP-UX LVM"
+repository = "https://github.com/danifunker/rusty-backup"
+readme = "README.md"
+keywords = ["partition", "mbr", "gpt", "disk-image", "retro"]
+categories = ["filesystem", "parser-implementations"]
+
+[features]
+default = ["apm", "atari", "bsd", "gpt", "lvm", "mbr", "next", "rdb", "sgi", "solaris-x86", "sun", "x68k"]
+# One feature per scheme; the error type, size overrides and the LIF probe are always built.
+apm = []
+atari = []
+bsd = []
+gpt = []
+lvm = []
+mbr = []
+next = []
+rdb = []
+sgi = []
+solaris-x86 = ["mbr", "sun"]
+sun = []
+x68k = ["mbr"]
+# Only for a Rust 1.73 toolchain; see disk-core.
+rust173-polyfill = ["disk-core/rust173-polyfill"]
+
+[dependencies]
+# The SGI word-order helpers (`disk_core::sgi`), serialisable for the JSON sidecars.
+disk-core = { path = "../disk-core", version = "0.1", default-features = false, features = ["serde"] }
+byteorder = "1"
+crc32fast = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"

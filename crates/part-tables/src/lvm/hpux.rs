@@ -59,7 +59,7 @@ impl HpuxLvm {
         let mut head = [0u8; 256];
         reader.seek(SeekFrom::Start(0)).ok()?;
         reader.read_exact(&mut head).ok()?;
-        let has_lif = crate::fs::lif::looks_like_lif(&head);
+        let has_lif = crate::lif::looks_like_lif(&head);
 
         let mut rec = [0u8; 128];
         reader.seek(SeekFrom::Start(LVMREC_OFFSET)).ok()?;

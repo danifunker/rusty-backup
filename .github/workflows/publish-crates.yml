@@ -23,6 +23,7 @@ on:
       - "fs-apfs-v*"
       - "fs-mac-unicode-v*"
       - "fs-mac-v*"
+      - "part-tables-v*"
   workflow_dispatch:
     inputs:
       crate:
@@ -46,6 +47,7 @@ on:
           - fs-apfs
           - fs-mac-unicode
           - fs-mac
+          - part-tables
       dry_run:
         description: Package and verify only, do not upload
         required: true

@@ -52,3 +52,18 @@ pub enum RustyBackupError {
     #[error("Checksum mismatch: expected {expected}, got {actual}")]
     ChecksumMismatch { expected: String, actual: String },
 }
+
+impl From<part_tables::PartitionError> for RustyBackupError {
+    fn from(e: part_tables::PartitionError) -> Self {
+        use part_tables::PartitionError as P;
+        match e {
+            P::Io(e) => Self::Io(e),
+            P::InvalidMbr(m) => Self::InvalidMbr(m),
+            P::InvalidGpt(m) => Self::InvalidGpt(m),
+            P::InvalidApm(m) => Self::InvalidApm(m),
+            P::InvalidSgi(m) => Self::InvalidSgi(m),
+            P::InvalidRdb(m) => Self::InvalidRdb(m),
+            P::InvalidAhdi(m) => Self::InvalidAhdi(m),
+        }
+    }
+}
