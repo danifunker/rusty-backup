@@ -1,4 +1,4 @@
-# Resume: crate split — Step 7 and publishing
+# Resume: crate split — done; disk-core 0.2 and publishing left
 
 Paste the prompt below into a new Claude Code session in a checkout of
 `rusty-backup` on branch `native-frontends` (on dani's box that's the
@@ -104,22 +104,19 @@ Read it first, along with `docs/license_audit.md`, CLAUDE.md and CONTRIBUTING.md
   - Add every new crate to both lists in the workflow: the tag patterns and the
     manual-run choices.
 
-## Start here: what's left (2026-10-31, end of session)
+## Start here: the split is done; two loose ends (2026-10-31)
 
-- **Done:**
-  - Steps 0–6.
-  - The four §11a decisions:
-    - A: `arc-mac`, one crate, `MIT AND LGPL-2.1-or-later`.
-    - B: `fs-tar`, with an optional `appledouble` feature.
-    - C: `ofs` in `fs-unix`, behind an optional `fs-mac` dependency.
-    - D: `dsk-imz`, its own crate.
-  - Every module held back from Step 2.
-- **Still in the app, with reasons in `crate_split_plan.md` §9 and §11a:**
-  - `sun2tape*` / `tar_section`. They need the tar half of `mem_archive` carved into `fs-tar` first, and `arc-mac`'s Unix-`compress` codec, which would pull LGPL and GPL into `fs-unix`'s `sun2tape` feature. Ask Dani before doing it.
-  - `interleave`, `swab`.
-  - The CHD / optical helpers headed upstream to libchdman-rs and opticaldiscs, which are other repositories.
-- **Next:** Step 7. Remove the shims and finish the docs, *just before merging* `native-frontends`, so code landing on `main` meanwhile doesn't break. At the same time, `git rm .github/ci-targets`.
-- **Publishing (tags, Dani):** see "Publishing order" below.
+- **Done:** Steps 0–7. No format code is left in the app.
+  - The 142 re-export shims are gone (Step 7). The app names crate paths, and app-side tests of moved code live in `src/{fs,partition,rbformats}/moved_tests.rs`.
+  - CI on the Step 7 tree passed: Linux, Solaris 9, 1.73 crate tests, and a manual Windows / macOS run.
+- **Loose end 1: `disk-core` 0.2.** Dani chose to move `unix_common::{bitmap, compact}` into `fs-unix` and delete the unused `validate`.
+  - That's a breaking change from the published 0.1.0, so it's `disk-core` 0.2.0, and qnx2fs must accept 0.2 first.
+  - qnx2fs 0.3.2 (`disk-core = ">=0.1, <0.3"`) is committed in `~/repos/qnx2fs`, but not pushed or published.
+  - The rusty-backup side is a **local, unpushed commit** at the tip of `native-frontends` (`refactor: disk-core 0.2 ...`). Its four manifests patch qnx2fs to the local checkout by path, which CI can't see.
+  - Once qnx2fs 0.3.2 is on crates.io: delete those `qnx2fs = { path = ... }` lines, refresh the lockfiles, re-run the gate, and push.
+  - New work meanwhile goes *below* that commit (reset to `origin`, commit, cherry-pick it back) so it stays pushable.
+- **Loose end 2: publishing.** Nothing beyond `disk-core` 0.1.0 is on crates.io. Every crate depends on `disk-core` 0.2 once the commit above lands, so publish `disk-core` 0.2.0 first, then the rest in dependency order (below).
+- **Merge:** `native-frontends` merges only after all the native OS frontends are done. Before that, `git rm .github/ci-targets`.
 
 **How each slice was done (scripts are easy to recreate):**
 
