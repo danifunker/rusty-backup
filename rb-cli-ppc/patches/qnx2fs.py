@@ -13,13 +13,13 @@ disk-core by path, from the in-tree crate (vendor/qnx2fs -> ../../../crates).
 UPSTREAM = None
 
 APPLIED = r'^path = "\.\./\.\./\.\./crates/disk-core"$'
-MATCH = r'^\[dependencies\.disk-core\]\nversion = "0\.1(\.\d+)?"$'
+MATCH = r'^\[dependencies\.disk-core\]\nversion = "[^"]*"$'
 
 
 def patch(text, path):
     import re
     return re.sub(
-        r'^(\[dependencies\.disk-core\]\n)version = "0\.1(\.\d+)?"$',
+        r'^(\[dependencies\.disk-core\]\n)version = "[^"]*"$',
         r'\1path = "../../../crates/disk-core"',
         text,
         count=1,
