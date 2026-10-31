@@ -31,7 +31,7 @@ rust173-polyfill = ["disk-core/rust173-polyfill"]
 
 [dependencies]
 # The SGI word-order helpers (`disk_core::sgi`), serialisable for the JSON sidecars.
-disk-core = { path = "../disk-core", version = "0.1", default-features = false, features = ["serde"] }
+disk-core = { path = "../disk-core", version = "0.1.1", default-features = false, features = ["serde"] }
 byteorder = "1"
 crc32fast = "1"
 serde = { version = "1", features = ["derive"] }

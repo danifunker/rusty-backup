@@ -20,7 +20,7 @@ pure-zstd = ["dep:libzstd-bitexact-rs"]
 rust173-polyfill = ["disk-core/rust173-polyfill"]
 
 [dependencies]
-disk-core = { path = "../disk-core", version = "0.1", features = ["fs"] }
+disk-core = { path = "../disk-core", version = "0.1.1", features = ["fs"] }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 # The lower bounds are what the Rust 1.73 builds resolve.
 lz4_flex = ">=0.10, <0.15"

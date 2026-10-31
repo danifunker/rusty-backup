@@ -157,11 +157,14 @@ Follow `docs/crate_split_plan.md` §9:
 
 ## Publishing order
 
-`fs-xerox` and `dsk-clonezilla` can go out now on `disk-core` 0.1.0. The Step 3
-crates need the new `disk-core` modules, so publish `disk-core` first. Use
-0.1.1 if nothing breaks, otherwise 0.2, and bump every crate's
-`disk-core = { version = ... }` to match. Then publish the families together.
-`.github/workflows/publish-crates.yml` already lists every crate.
+Publishing goes through tags (see the rules above); this session could not push tags, so nothing beyond `disk-core` 0.1.0 is on crates.io yet.
+
+1. **Now, on `disk-core` 0.1.0:** `fs-xerox`, `dsk-clonezilla`, `fs-8bit`, `fs-cpm`, `fs-apple2`, `fs-qnx`, `fs-apfs`, `fs-hpfs`, `fs-mac-unicode`, `dsk-flux`, `dsk-apple`, `dsk-dmg`, `dsk-floppy` and `dsk-vm`. Checked 2026-10-31 by building each against the published 0.1.0.
+2. **`disk-core` 0.1.1:** the tree is at 0.1.1. The additions (`name_legalize`, `stream_pipe`, `raw_name`, `attrs`, `sgi`, the `serde` feature) are backwards compatible.
+3. **After 0.1.1, these require it:** `fs-amiga`, `fs-mac`, `fs-pc`, `fs-squashfs`, `fs-unix`, `fs-xfs` and `part-tables`.
+4. **Last:** `dsk-ghost` (after `fs-pc`), then `fs-mac` (after `fs-mac-unicode` and `dsk-apple`).
+
+`.github/workflows/publish-crates.yml` lists every crate. Run `cargo publish -p <crate> --dry-run` on a clean tree before each tag.
 
 ## The PowerPC / Solaris side (only if a slice breaks those builds)
 

@@ -27,7 +27,7 @@ vxfs = []
 rust173-polyfill = ["disk-core/rust173-polyfill"]
 
 [dependencies]
-disk-core = { path = "../disk-core", version = "0.1", features = ["fs"] }
+disk-core = { path = "../disk-core", version = "0.1.1", features = ["fs"] }
 anyhow = "1"
 byteorder = "1"
 crc32c = "0.6"
