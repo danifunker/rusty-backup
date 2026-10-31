@@ -663,6 +663,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs-amiga"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "byteorder",
+ "disk-core",
+ "tempfile",
+]
+
+[[package]]
 name = "fs-apple2"
 version = "0.1.0"
 dependencies = [
@@ -1245,6 +1255,7 @@ dependencies = [
  "filetime",
  "flate2",
  "fs-8bit",
+ "fs-amiga",
  "fs-apple2",
  "fs-cpm",
  "fs-qnx",

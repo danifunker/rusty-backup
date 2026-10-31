@@ -17,6 +17,8 @@
 //! - [`times`]: Unix timestamps and the calendar conversions filesystems need.
 //! - [`xattr`]: extended-attribute names and values.
 //! - [`unix_common`]: inode, bitmap, compaction and validation helpers shared by Unix-style filesystems.
+//! - [`name_legalize`]: turn any name into one a destination's `validate_name` accepts.
+//! - [`stream_pipe`]: copy a file between two filesystems without holding it in memory.
 //!
 //! Partition and disk-image crates depend on this with `default-features = false`
 //! and so build without the filesystem types and their dependencies.
@@ -35,6 +37,10 @@ pub mod entry;
 pub mod filesystem;
 #[cfg(feature = "fs")]
 pub mod fsck;
+#[cfg(feature = "fs")]
+pub mod name_legalize;
+#[cfg(feature = "fs")]
+pub mod stream_pipe;
 #[cfg(feature = "fs")]
 pub mod times;
 #[cfg(feature = "fs")]

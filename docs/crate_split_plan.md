@@ -223,6 +223,9 @@ The crates already kept separately stay separate, because other projects share t
    **Rule (2026-10-30): a crate must contain reusable format code.** A module that only adapts an external engine crate to the `disk-core` traits stays in the app, as `qnx2` over `qnx2fs` and `optical_fs` over `opticaldiscs` do. Crates are for code that implements a format.
    - **Held back:** `adfs` and `qdos` / `qdos_mdv` (license audit, §6) and `lif`. `lif`'s replace test needs both its private fields and the app's `fs::replace`; split the test, or give `lif` a small test-support accessor, before moving it.
 3. **`fs-amiga`, `fs-unix`, `fs-xfs`, `fs-squashfs`, `fs-pc`, `fs-mac`, `fs-apfs`.** The big ones. The license-audit items get their handling here.
+   - **`fs-amiga` done (2026-10-30).** `affs` / `affs_fsck`, `pfs3` / `pfs3_fsck` / `pfs3_clone` and `sfs` / `sfs_fsck` moved as-is, one feature each (`affs_common` always builds). Licence `MIT AND BSD-4-Clause` (D3), with pfs3aio's licence and the SFS / ADFlib provenance in `THIRD_PARTY_NOTICES.md`. The audit's comment fixes for `affs_common`, `sfs.rs` (the misattribution) and `sfs_fsck`'s header went in with the move.
+     - `disk-core` gained `name_legalize` and `stream_pipe` (both moved as-is). The one `name_legalize` test that runs real FAT / HFS / ProDOS / MFS validators stays in the app's shim file.
+     - These additions are backwards compatible, so `disk-core` can go out as 0.1.1 if `fs-amiga` publishes before 0.2.
 4. **`part-tables`** (C5).
 5. **`dsk-*` and `dsk-clonezilla`** (C6, C7, C11). The upstream moves to libchdman-rs and opticaldiscs happen here.
    - **`dsk-clonezilla` done early (2026-10-30)**, ahead of Step 3, because its co-author had agreed to MIT.

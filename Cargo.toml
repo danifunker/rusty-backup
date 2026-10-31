@@ -182,7 +182,7 @@ windows-legacy = []
 # Do NOT enable on a modern toolchain: std's inherent is_multiple_of would then
 # collide with the polyfill trait. See crates/disk-core. Forwarded to every
 # extracted crate under crates/ (docs/crate_split_plan.md).
-rust173-polyfill = ["disk-core/rust173-polyfill", "fs-8bit/rust173-polyfill", "fs-cpm/rust173-polyfill", "fs-apple2/rust173-polyfill", "fs-qnx/rust173-polyfill", "fs-xerox/rust173-polyfill", "dsk-clonezilla/rust173-polyfill"]
+rust173-polyfill = ["disk-core/rust173-polyfill", "fs-8bit/rust173-polyfill", "fs-cpm/rust173-polyfill", "fs-apple2/rust173-polyfill", "fs-qnx/rust173-polyfill", "fs-xerox/rust173-polyfill", "dsk-clonezilla/rust173-polyfill", "fs-amiga/rust173-polyfill"]
 # In-app self-update for `rb-cli update` (CLI + TUI). Pulls the reqwest client
 # (rustls, no OpenSSL). OFF by default and left OUT of the slim / appliance /
 # MiSTer builds so they link no networking; desktop packagers opt in. When the
@@ -197,6 +197,7 @@ fs-cpm = { path = "crates/fs-cpm" }
 fs-apple2 = { path = "crates/fs-apple2" }
 fs-qnx = { path = "crates/fs-qnx" }
 fs-xerox = { path = "crates/fs-xerox" }
+fs-amiga = { path = "crates/fs-amiga" }
 dsk-clonezilla = { path = "crates/dsk-clonezilla", default-features = false }
 # Full-screen TUI (`tui` feature). ratatui renders through crossterm, which is
 # already a non-optional dependency below, so this adds no new C/native code.

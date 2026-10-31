@@ -1,0 +1,31 @@
+[package]
+name = "fs-amiga"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.73"
+license = "MIT AND BSD-4-Clause"
+authors = ["Dani Sarfati <dani@funkervogt.com>"]
+description = "Read, edit and check Amiga filesystems: AFFS (OFS/FFS), PFS3 and SFS"
+repository = "https://github.com/danifunker/rusty-backup"
+readme = "README.md"
+keywords = ["filesystem", "amiga", "affs", "retro", "emulator"]
+categories = ["filesystem", "emulators"]
+
+[features]
+default = ["affs", "pfs3", "sfs"]
+# One feature per filesystem; the shared AmigaDOS date helpers are always built.
+affs = []
+pfs3 = ["dep:tempfile"]
+sfs = []
+# Only for a Rust 1.73 toolchain; see disk-core.
+rust173-polyfill = ["disk-core/rust173-polyfill"]
+
+[dependencies]
+disk-core = { path = "../disk-core", version = "0.1", features = ["fs"] }
+anyhow = "1"
+byteorder = "1"
+# PFS3 defragmentation spools through an anonymous temp file.
+tempfile = { version = "3", optional = true }
+
+[dev-dependencies]
+tempfile = "3"

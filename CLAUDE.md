@@ -124,14 +124,14 @@ Amiga images (`.adf`, `.hdf`, `.adz`, `.hdz`, and CHD-wrapped HDFs) and the thre
 - **Partition table**: `PartitionTable::Rdb` parses RDSK + PART chain (`src/partition/rdb.rs`). Each `PartitionInfo` carries the 4-byte `DosType` as `partition_type_string` (e.g. `"DOS\\3"`, `"PFS\\3"`, `"SFS\\0"`).
 - **Filesystem dispatch**: extend the `partition_type_string` matchers in `src/fs/mod.rs` (`fs_name_for`, `is_layout_preserving_fs`, `is_expensive_minimum`, `open_filesystem_by_string`, `open_editable_filesystem_by_string`, `compact_partition_reader_by_string`). Helpers `is_amiga_dos_type` / `is_amiga_pfs3_type` / `is_amiga_sfs_type` group the relevant strings.
 - **Filesystems**:
-  - **AFFS** (`src/fs/affs.rs`) — DOS\0..DOS\7, read + edit + Disk Validator fsck. Files inherit `amiga_protection` (offset 0x140) and `amiga_comment` (BSTR at 0x148) via `CreateFileOptions`; the same fields surface on `FileEntry` for the browse view.
-  - **PFS3** (`src/fs/pfs3.rs`) — PFS\3, PDS\3, muFS. Read + edit (allocator + EditableFilesystem with snapshot/rollback). `create_blank_pfs3` formats a blank volume for tests.
-  - **SFS** (`src/fs/sfs.rs`) — SFS\0, SFS\2. Read + edit at any B-tree depth: the extent B-tree splits, promotes a new root and prunes emptied nodes, and the object-node tree is walked rather than assumed to be one leaf. *Growing* the object-node tree is still unimplemented, so a volume reports DiskFull once every existing leaf is full. Journal blocks (TRST/TRFA) are not maintained — we use sync-boundary atomicity instead. `create_blank_sfs` formats a blank volume.
+  - **AFFS** (`crates/fs-amiga/src/affs.rs`) — DOS\0..DOS\7, read + edit + Disk Validator fsck. Files inherit `amiga_protection` (offset 0x140) and `amiga_comment` (BSTR at 0x148) via `CreateFileOptions`; the same fields surface on `FileEntry` for the browse view.
+  - **PFS3** (`crates/fs-amiga/src/pfs3.rs`) — PFS\3, PDS\3, muFS. Read + edit (allocator + EditableFilesystem with snapshot/rollback). `create_blank_pfs3` formats a blank volume for tests.
+  - **SFS** (`crates/fs-amiga/src/sfs.rs`) — SFS\0, SFS\2. Read + edit at any B-tree depth: the extent B-tree splits, promotes a new root and prunes emptied nodes, and the object-node tree is walked rather than assumed to be one leaf. *Growing* the object-node tree is still unimplemented, so a volume reports DiskFull once every existing leaf is full. Journal blocks (TRST/TRFA) are not maintained — we use sync-boundary atomicity instead. `create_blank_sfs` formats a blank volume.
 - **Bitmap convention**: All three filesystems use **set bit = free** (opposite of most other FS we deal with). Easy bug source.
 - **Endianness**: every multi-byte field on Amiga disks is big-endian. Easy bug source #2.
 - **`.adz` / `.hdz`**: the GUI helper `gui::materialize_amiga_image_path` decompresses gzip-wrapped images to a tempfile at file-pick time. Each tab keeps a `tempfile::TempDir` guard alive for the lifetime of `image_file_path`.
 
-Reference C sources for the three filesystems live at `~/repos/amigasources/{ADFlib,amitools,pfs3aio,smartfilesystem}`. Read + edit + in-place resize all shipped; any new Amiga work lives under `src/fs/{affs,pfs3,sfs}.rs` and follows the existing patterns there.
+Reference C sources for the three filesystems live at `~/repos/amigasources/{ADFlib,amitools,pfs3aio,smartfilesystem}`. Read + edit + in-place resize all shipped; any new Amiga work lives in the `fs-amiga` crate (`crates/fs-amiga/src/{affs,pfs3,sfs}.rs`; `src/fs/` keeps re-export shims) and follows the existing patterns there.
 
 ### BasiliskII HFV Support
 
