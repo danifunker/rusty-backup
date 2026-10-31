@@ -10,8 +10,10 @@
 //! | `atari-dos` | [`atari_dos`] | Atari DOS 2.0S / 2.5 |
 //! | `cbm` | [`cbm`] | Commodore DOS (1541 / 1571 / 1581 / 8050 / 8250) |
 //! | `coco` | [`rsdos`], [`dragondos`] | Color Computer RS-DOS, DragonDOS |
+//! | `lif` | [`lif`] | HP LIF (Logical Interchange Format): HP-UX / PA-RISC boot areas, HP 9000 media |
 //! | `oric` | [`oric`] | Oric Jasmin (Oric-1 / Atmos / Telestrat) |
 //! | `os9` | [`os9`] | OS-9 / NitrOS-9 RBF (pulls in `coco`) |
+//! | `qdos` | [`qdos`], [`qdos_mdv`] | Sinclair QL: QXL.WIN hard-disk volumes; Microdrive `.mdv` detection |
 //! | `ti99` | [`ti99`] | TI-99/4A |
 //! | `trdos` | [`trdos`] | TR-DOS (ZX Spectrum Beta Disk) |
 
@@ -28,10 +30,16 @@ pub mod cbm;
 pub mod dfs;
 #[cfg(feature = "coco")]
 pub mod dragondos;
+#[cfg(feature = "lif")]
+pub mod lif;
 #[cfg(feature = "oric")]
 pub mod oric;
 #[cfg(feature = "os9")]
 pub mod os9;
+#[cfg(feature = "qdos")]
+pub mod qdos;
+#[cfg(feature = "qdos")]
+pub mod qdos_mdv;
 #[cfg(feature = "coco")]
 pub mod rsdos;
 #[cfg(feature = "ti99")]

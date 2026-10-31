@@ -5,22 +5,24 @@ edition = "2021"
 rust-version = "1.73"
 license = "MIT"
 authors = ["Dani Sarfati <dani@funkervogt.com>"]
-description = "Read and edit 8-bit home-computer disk filesystems: Commodore, Atari, Acorn DFS, TR-DOS, CoCo/Dragon, OS-9, TI-99, Oric, ANDOS"
+description = "Read and edit 8-bit home-computer disk filesystems: Commodore, Atari, Acorn DFS, TR-DOS, CoCo/Dragon, OS-9, TI-99, Oric, ANDOS, Sinclair QL, HP LIF"
 repository = "https://github.com/danifunker/rusty-backup"
 readme = "README.md"
 keywords = ["filesystem", "retro", "commodore", "emulator", "disk-image"]
 categories = ["filesystem", "emulators"]
 
 [features]
-default = ["acorn", "andos", "atari-dos", "cbm", "coco", "oric", "os9", "ti99", "trdos"]
+default = ["acorn", "andos", "atari-dos", "cbm", "coco", "lif", "oric", "os9", "qdos", "ti99", "trdos"]
 # One feature per filesystem (or family) so users only build what they need.
 acorn = []
 andos = []
 atari-dos = []
 cbm = []
 coco = []
+lif = ["dep:byteorder"]
 oric = []
 os9 = ["coco"]
+qdos = ["dep:anyhow", "dep:byteorder"]
 ti99 = []
 trdos = []
 # Only for a Rust 1.73 toolchain; see disk-core.
@@ -28,6 +30,8 @@ rust173-polyfill = ["disk-core/rust173-polyfill"]
 
 [dependencies]
 disk-core = { path = "../disk-core", version = "0.1", features = ["fs"] }
+anyhow = { version = "1", optional = true }
+byteorder = { version = "1", optional = true }
 
 [dev-dependencies]
 # Unpacks the zstd test fixtures; 0.13 is the last line the Rust 1.73 builds resolve.
