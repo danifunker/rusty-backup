@@ -6,7 +6,7 @@ on:
     # rebuild every platform. Releases come from main/master branch pushes.
     branches: ["**"]
     paths-ignore:
-      - "*.md"
+      - "**/*.md"
       - "docs/**"
   workflow_dispatch:
     # Manual "Run workflow" switches. `targets` picks what to build (the plan
