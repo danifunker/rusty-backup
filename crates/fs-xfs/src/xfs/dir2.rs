@@ -11,7 +11,7 @@
 
 use byteorder::{BigEndian, ByteOrder};
 
-use crate::fs::filesystem::FilesystemError;
+use disk_core::filesystem::FilesystemError;
 
 /// `XD2B` — single-block dir2 magic (v4, no CRC).
 pub const XFS_DIR2_BLOCK_MAGIC: u32 = 0x5844_3242;

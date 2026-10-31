@@ -41,8 +41,8 @@ use super::ag::XfsAgi;
 use super::inode::inode_byte_offset;
 use super::types::DiFormat;
 use super::{read_at_aligned, XfsFilesystem, SECTOR};
-use crate::fs::filesystem::FilesystemError;
-use crate::fs::fsck::RepairReport;
+use disk_core::filesystem::FilesystemError;
+use disk_core::fsck::RepairReport;
 
 /// inobt leaf record layout: startino(4) freecount(4) free(8). Same on v4
 /// and v5; the leading header size differs (see `XfsSuperblock::sblock_hdr_len`).

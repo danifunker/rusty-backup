@@ -24,7 +24,7 @@
 //! Block / leaf / node (multi-block) directory repair and orphan reconnection
 //! (R7) are deferred — those need the dir2 data/leaf/free + hash-btree write
 //! primitives. v4 only (a v5 inode core carries a CRC we don't recompute).
-//! Porting reference: `xfs_repair` @ v3.1.11 `repair/phase6.c`.
+//! Behavioural reference: `xfs_repair` @ v3.1.11, validated against `xfs_repair -n`; `repair/phase6.c`.
 
 use std::io::{Read, Seek, Write};
 
@@ -33,8 +33,8 @@ use byteorder::{BigEndian, ByteOrder};
 use super::ag::XfsAgi;
 use super::types::{DiFormat, XFS_INODES_PER_CHUNK};
 use super::{read_at_aligned, XfsFilesystem};
-use crate::fs::filesystem::{Filesystem, FilesystemError};
-use crate::fs::fsck::RepairReport;
+use disk_core::filesystem::{Filesystem, FilesystemError};
+use disk_core::fsck::RepairReport;
 
 /// inobt leaf record layout: startino(4) freecount(4) free(8). Same on v4
 /// and v5; the leading header size differs (see `XfsSuperblock::sblock_hdr_len`).

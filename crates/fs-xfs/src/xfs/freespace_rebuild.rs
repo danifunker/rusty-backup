@@ -8,7 +8,7 @@
 //! module supplies the *policy*: which blocks are free, which blocks the new
 //! trees live in, and when it is safe to write at all.
 //!
-//! Porting reference: `xfs_repair` @ v3.1.11 `repair/phase5.c`
+//! Behavioural reference: `xfs_repair` @ v3.1.11, validated against `xfs_repair -n`; `repair/phase5.c`
 //! (`mk_incore_fstree` / `build_freespace_tree` / `build_agf_agfl`).
 //!
 //! ## How it differs from offline `xfs_repair`
@@ -46,8 +46,8 @@ use super::types::{
     XFS_INODES_PER_CHUNK,
 };
 use super::{read_at_aligned, XfsFilesystem};
-use crate::fs::filesystem::FilesystemError;
-use crate::fs::fsck::RepairReport;
+use disk_core::filesystem::FilesystemError;
+use disk_core::fsck::RepairReport;
 
 /// AGF on-disk field offsets (v4 short header) within the AGF sector.
 const AGF_ROOTS_OFF: usize = 16; // roots[BNO]=16, roots[CNT]=20

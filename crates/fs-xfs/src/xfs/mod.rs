@@ -36,19 +36,19 @@ pub mod types;
 pub mod v5_crc;
 
 #[cfg(feature = "rust173-polyfill")]
-use crate::rust173_compat::IntIsMultipleOf as _;
+use disk_core::rust173::IntIsMultipleOf as _;
 use std::io::{Read, Seek, SeekFrom, Write};
 
 use byteorder::{BigEndian, ByteOrder};
 
-use super::entry::{EntryType, FileEntry};
-use super::filesystem::{Filesystem, FilesystemError};
 #[cfg(test)]
 use bmap::XFS_BTREE_LBLOCK_CRC_LEN;
 use bmap::{
     decode_extent, fsblock_to_partition_byte, XfsBmbtIrec, NULLFSBLOCK, XFS_BMAP_CRC_MAGIC,
     XFS_BMAP_MAGIC, XFS_BTREE_LBLOCK_LEN,
 };
+use disk_core::entry::{EntryType, FileEntry};
+use disk_core::filesystem::{Filesystem, FilesystemError};
 use inode::{inode_byte_offset, XfsDinodeCore};
 use sb::XfsSuperblock;
 use types::{DiFormat, DirFormat};
@@ -424,7 +424,7 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
             None
         };
         let modified =
-            modified_unix.map(|s| crate::fs::unix_common::inode::format_unix_timestamp(s as i64));
+            modified_unix.map(|s| disk_core::unix_common::inode::format_unix_timestamp(s as i64));
         Ok(FileEntry {
             name,
             path,
@@ -780,7 +780,7 @@ impl<R: Read + Seek + Send> Filesystem for XfsFilesystem<R> {
             None
         };
         let modified =
-            modified_unix.map(|s| crate::fs::unix_common::inode::format_unix_timestamp(s as i64));
+            modified_unix.map(|s| disk_core::unix_common::inode::format_unix_timestamp(s as i64));
         Ok(FileEntry {
             name: "/".into(),
             path: "/".into(),
@@ -918,7 +918,7 @@ impl<R: Read + Seek + Send> Filesystem for XfsFilesystem<R> {
     }
 
     fn validate_name(&self, name: &str) -> Result<(), FilesystemError> {
-        crate::fs::name_legalize::validate_posix_name(name, 255, "XFS")
+        disk_core::name_legalize::validate_posix_name(name, 255, "XFS")
     }
     fn fs_type(&self) -> &str {
         self.fs_type_name
@@ -936,7 +936,7 @@ impl<R: Read + Seek + Send> Filesystem for XfsFilesystem<R> {
         Ok(self.total_size())
     }
 
-    fn fsck(&mut self) -> Option<Result<crate::fs::fsck::FsckResult, FilesystemError>> {
+    fn fsck(&mut self) -> Option<Result<disk_core::fsck::FsckResult, FilesystemError>> {
         Some(self.run_fsck())
     }
 }
@@ -1108,11 +1108,11 @@ mod tests {
             return bytes;
         }
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/sgi")
+            .join("../../tests/fixtures/sgi")
             .join(name);
         let compressed = std::fs::read(&path).expect("fixture present");
         let mut decoder =
-            crate::rbformats::zstd_compat::decoder(Cursor::new(compressed)).expect("zstd decoder");
+            zstd::stream::read::Decoder::new(Cursor::new(compressed)).expect("zstd decoder");
         let mut out = Vec::new();
         decoder.read_to_end(&mut out).expect("decompress");
         // Leak the decompressed image so the slice lives for the whole test run;
@@ -1328,7 +1328,7 @@ mod tests {
         // R4b round-trip: corrupt AG 0's AGF freeblks (byte 512+52) and AGI
         // count/freecount (byte 1024+16, 1024+28), run repair(), confirm the
         // verifier reports clean. Validates the summary-rewrite path.
-        use crate::fs::filesystem::EditableFilesystem;
+        use disk_core::filesystem::EditableFilesystem;
         let mut img = load_fixture().to_vec();
         img[512 + 52..512 + 56].copy_from_slice(&0u32.to_be_bytes()); // AGF freeblks
         img[1024 + 16..1024 + 20].copy_from_slice(&111u32.to_be_bytes()); // AGI count
@@ -1381,7 +1381,7 @@ mod tests {
         // (agblocks @ 84..88 and dblocks @ 8..16), run repair(), then confirm
         // the verifier reports clean. Proves the replica-rewrite end to end
         // without any btree writes.
-        use crate::fs::filesystem::EditableFilesystem;
+        use disk_core::filesystem::EditableFilesystem;
         let mut img = load_fixture().to_vec();
         let ag1 = 65_536usize * 4096;
         img[ag1 + 8..ag1 + 16].copy_from_slice(&0xDEADu64.to_be_bytes());
@@ -1428,7 +1428,7 @@ mod tests {
         // file. Corrupt its di_nblocks (core offset 64) to a bogus value, run
         // repair(), and confirm R5 recomputes it back to the true block count
         // (the extent-list sum) — and that the verifier stays clean.
-        use crate::fs::filesystem::EditableFilesystem;
+        use disk_core::filesystem::EditableFilesystem;
         let mut img = load_fixture().to_vec();
 
         // Locate inode 131 and snapshot its true nblocks before corrupting.
@@ -1489,7 +1489,7 @@ mod tests {
         // entry (decrement count + di_size in the inode bytes) while leaving the
         // inode allocated. repair() should reconnect it into /lost+found and the
         // verifier should be clean.
-        use crate::fs::filesystem::{CreateFileOptions, EditableFilesystem};
+        use disk_core::filesystem::{CreateFileOptions, EditableFilesystem};
         use std::io::Cursor as IoCursor;
 
         let img = load_fixture().to_vec();
@@ -1590,7 +1590,7 @@ mod tests {
         // builder + hash leaf index on the ftype-enabled fixture). All entries
         // must list, the originals survive, a sample reads back, and the volume
         // stays clean.
-        use crate::fs::filesystem::{CreateFileOptions, EditableFilesystem};
+        use disk_core::filesystem::{CreateFileOptions, EditableFilesystem};
         use std::io::Cursor as IoCursor;
         let sample: Vec<u8> = (0..1234u32).map(|i| (i % 251) as u8).collect();
 
@@ -1653,7 +1653,7 @@ mod tests {
     fn delete_entry_frees_inode_and_blocks() {
         // Create a file + an empty dir, then delete both; the volume returns to
         // a clean state with the entries gone and free space recovered.
-        use crate::fs::filesystem::{
+        use disk_core::filesystem::{
             CreateDirectoryOptions, CreateFileOptions, EditableFilesystem,
         };
         use std::io::Cursor as IoCursor;
@@ -1733,7 +1733,7 @@ mod tests {
         // Rename a file and a directory in place; identity (inode) and content
         // are preserved, and the volume stays fsck-clean (which catches any
         // parent-nlink drift from the directory rename).
-        use crate::fs::filesystem::{
+        use disk_core::filesystem::{
             CreateDirectoryOptions, CreateFileOptions, EditableFilesystem,
         };
         use std::io::Cursor as IoCursor;
@@ -1815,7 +1815,7 @@ mod tests {
         // di_nblocks/nextents back to 0, and the directory's data block is
         // returned to free space. Originals survive, free space is fully
         // reclaimed, the volume stays fsck-clean.
-        use crate::fs::filesystem::{CreateFileOptions, EditableFilesystem};
+        use disk_core::filesystem::{CreateFileOptions, EditableFilesystem};
         use std::io::Cursor as IoCursor;
 
         let img = load_fixture().to_vec();
@@ -1926,7 +1926,7 @@ mod tests {
     fn dir_overflow_converts_block_to_leaf_form() {
         // Hole (C): 150 files overflow one block (data + leaf tail > 4 KiB), so
         // the fixture root moves to leaf form and every later insert lands there.
-        use crate::fs::filesystem::{CreateFileOptions, EditableFilesystem};
+        use disk_core::filesystem::{CreateFileOptions, EditableFilesystem};
         use std::io::Cursor as IoCursor;
 
         let img = load_fixture().to_vec();
@@ -2019,7 +2019,7 @@ mod tests {
     /// node form; deleting everything shrinks the directory back to short-form.
     #[test]
     fn dir_grows_to_node_form_and_shrinks_back_to_short_form() {
-        use crate::fs::filesystem::{
+        use disk_core::filesystem::{
             CreateDirectoryOptions, CreateFileOptions, EditableFilesystem,
         };
         use std::io::Cursor as IoCursor;
@@ -2105,8 +2105,8 @@ mod tests {
         // creation: di_format = Btree (3), reading the file produces the
         // original payload byte-for-byte, and walk_bmbt enumerates the same
         // extents the writer laid down.
-        use crate::fs::filesystem::{CreateFileOptions, EditableFilesystem};
-        use crate::fs::xfs::btree_build::FreeExtent;
+        use crate::xfs::btree_build::FreeExtent;
+        use disk_core::filesystem::{CreateFileOptions, EditableFilesystem};
         use std::io::Cursor as IoCursor;
 
         let img = load_fixture().to_vec();
@@ -2270,7 +2270,7 @@ mod tests {
         // Allocate an inode + data blocks + insert: create /payload.bin with a
         // known pattern, then read it back byte-for-byte and confirm the volume
         // stays clean.
-        use crate::fs::filesystem::{CreateFileOptions, EditableFilesystem};
+        use disk_core::filesystem::{CreateFileOptions, EditableFilesystem};
         use std::io::Cursor as IoCursor;
         let payload: Vec<u8> = (0..9000u32).map(|i| (i % 251) as u8).collect();
 
@@ -2323,7 +2323,7 @@ mod tests {
         // Allocate an inode + insert a short-form entry: create /made_dir under
         // the root, then confirm it lists, is an empty directory, the root link
         // count bumped, and the verifier stays clean.
-        use crate::fs::filesystem::{CreateDirectoryOptions, EditableFilesystem};
+        use disk_core::filesystem::{CreateDirectoryOptions, EditableFilesystem};
         let img = load_fixture().to_vec();
         let mut cursor = Cursor::new(img);
         let new_ino = {
@@ -2382,7 +2382,7 @@ mod tests {
         // di_nlink at core offset 16), repair(), and confirm R7 recomputes it
         // from the directory graph (root has one subdir -> nlink 3) and the
         // verifier stays clean.
-        use crate::fs::filesystem::EditableFilesystem;
+        use disk_core::filesystem::EditableFilesystem;
         let mut img = load_fixture().to_vec();
         let (ino_byte, true_nlink) = {
             let mut fs = XfsFilesystem::open(Cursor::new(img.as_slice()), 0).expect("open");
@@ -2439,7 +2439,7 @@ mod tests {
     /// can't if R6 wrote the new fork at the wrong offset.
     #[test]
     fn repair_r6_drops_dangling_shortform_entry_on_v5_fixture() {
-        use crate::fs::filesystem::EditableFilesystem;
+        use disk_core::filesystem::EditableFilesystem;
 
         let mut img = load_modern_fixture().to_vec();
 
@@ -2472,7 +2472,7 @@ mod tests {
         // doesn't bail on a CRC mismatch before the rest of the repair runs.
         let inodesize = sb.inodesize as usize;
         let mut tmp = img[ino_byte..ino_byte + inodesize].to_vec();
-        crate::fs::xfs::v5_crc::stamp_inode_v3(&mut tmp, ino_to_orphan, &sb);
+        crate::xfs::v5_crc::stamp_inode_v3(&mut tmp, ino_to_orphan, &sb);
         img[ino_byte..ino_byte + inodesize].copy_from_slice(&tmp);
 
         // Drive R6 (via the full repair pass).
@@ -2527,7 +2527,7 @@ mod tests {
         // Read the root inode raw and confirm its di_crc still validates.
         let (_core, ibuf) = fs.read_inode_buf(sb.rootino).expect("read root inode");
         assert!(
-            crate::fs::xfs::v5_crc::crc_valid(&ibuf, crate::fs::xfs::v5_crc::INODE_V3_DI_CRC_OFF),
+            crate::xfs::v5_crc::crc_valid(&ibuf, crate::xfs::v5_crc::INODE_V3_DI_CRC_OFF),
             "root inode di_crc invalid — R6 wrote at the wrong fork offset"
         );
 
@@ -2563,7 +2563,7 @@ mod tests {
         // repair(). R3 frees it in the inobt, R2 reclaims its blocks, and R6
         // drops the now-dangling 'hello.txt' entry from the short-form root.
         // Afterwards the verifier is clean and the entry is gone.
-        use crate::fs::filesystem::EditableFilesystem;
+        use disk_core::filesystem::EditableFilesystem;
         let mut img = load_fixture().to_vec();
         let ino_byte = {
             let fs = XfsFilesystem::open(Cursor::new(img.as_slice()), 0).expect("open");
@@ -3169,7 +3169,7 @@ mod tests {
     /// equality fails and every v5 write would write garbage.
     #[test]
     fn v5_crc_primitive_matches_on_disk_root_inode_and_ag_headers() {
-        use crate::fs::xfs::v5_crc::{
+        use crate::xfs::v5_crc::{
             crc_valid, AGF_CRC_OFF, AGI_CRC_OFF, INODE_V3_DI_CRC_OFF, SB_CRC_OFF,
         };
 
@@ -3209,7 +3209,7 @@ mod tests {
     /// helper, the CRC after the write would be stale.
     #[test]
     fn ag_header_stamp_helpers_round_trip_on_v5_fixture() {
-        use crate::fs::xfs::v5_crc::{
+        use crate::xfs::v5_crc::{
             crc_valid, AGF_CRC_OFF, AGF_LSN_OFF, AGI_CRC_OFF, AGI_LSN_OFF, SB_CRC_OFF,
         };
 
@@ -3287,7 +3287,7 @@ mod tests {
     /// stamp didn't fire, `crc_valid` would catch it.
     #[test]
     fn write_inode_region_stamps_v3_crc_on_v5_round_trip() {
-        use crate::fs::xfs::v5_crc::{crc_valid, INODE_V3_DI_CRC_OFF, INODE_V3_DI_INO_OFF};
+        use crate::xfs::v5_crc::{crc_valid, INODE_V3_DI_CRC_OFF, INODE_V3_DI_INO_OFF};
 
         let img = load_modern_fixture().to_vec();
         let mut cursor = Cursor::new(img);
@@ -3345,9 +3345,9 @@ mod tests {
         // instead we call alloc_new_inode_chunk directly to exercise the
         // pipeline once, then check both the AGI/superblock counter deltas
         // and the on-disk shape of the new chunk.
-        use crate::fs::filesystem::EditableFilesystem;
-        use crate::fs::xfs::ag::XfsAgi;
-        use crate::fs::xfs::types::XFS_INODES_PER_CHUNK;
+        use crate::xfs::ag::XfsAgi;
+        use crate::xfs::types::XFS_INODES_PER_CHUNK;
+        use disk_core::filesystem::EditableFilesystem;
 
         let img = load_fixture().to_vec();
         let mut cursor = Cursor::new(img);
@@ -3564,9 +3564,9 @@ mod tests {
     /// v3 core (di_version=3, di_ino, di_uuid, valid di_crc).
     #[test]
     fn alloc_new_inode_chunk_on_v5_stamps_every_block_and_stays_clean() {
-        use crate::fs::xfs::ag::{XfsAgf, XfsAgi};
-        use crate::fs::xfs::types::XFS_INODES_PER_CHUNK;
-        use crate::fs::xfs::v5_crc::{
+        use crate::xfs::ag::{XfsAgf, XfsAgi};
+        use crate::xfs::types::XFS_INODES_PER_CHUNK;
+        use crate::xfs::v5_crc::{
             crc_valid, AGF_CRC_OFF, AGI_CRC_OFF, INODE_V3_DI_CRC_OFF, INODE_V3_DI_INO_OFF,
             INODE_V3_DI_UUID_OFF, SBLOCK_CRC_CRC_OFF, SB_CRC_OFF,
         };
@@ -3620,7 +3620,7 @@ mod tests {
             let mut fs = XfsFilesystem::open(&mut cursor, 0).expect("open editable v5");
             fs.alloc_new_inode_chunk(&sb)
                 .expect("alloc_new_inode_chunk on v5");
-            use crate::fs::filesystem::EditableFilesystem;
+            use disk_core::filesystem::EditableFilesystem;
             fs.sync_metadata().expect("sync");
         }
 
@@ -3783,7 +3783,7 @@ mod tests {
     /// still pass `run_fsck` clean.
     #[test]
     fn repair_on_clean_v5_fixture_runs_passes_and_stays_clean() {
-        use crate::fs::filesystem::EditableFilesystem;
+        use disk_core::filesystem::EditableFilesystem;
 
         let img = load_modern_fixture().to_vec();
         let mut cursor = Cursor::new(img);
@@ -3827,7 +3827,7 @@ mod tests {
     /// block and would refuse a v5 inode / dir3 / sblock with a stale CRC.
     #[test]
     fn create_file_on_v5_fixture_round_trips_through_fsck() {
-        use crate::fs::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+        use disk_core::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
 
         let img = load_modern_fixture().to_vec();
         let mut cursor = Cursor::new(img);
@@ -3899,9 +3899,9 @@ mod tests {
         // real allocations to legitimately fill the leaf — at the cost of
         // leaving inobt vs actual-inodes inconsistent; a follow-up `run_fsck`
         // is therefore omitted. The growth ALGORITHM is what's under test.
-        use crate::fs::filesystem::EditableFilesystem;
-        use crate::fs::xfs::ag::XfsAgi;
-        use crate::fs::xfs::types::XFS_INODES_PER_CHUNK;
+        use crate::xfs::ag::XfsAgi;
+        use crate::xfs::types::XFS_INODES_PER_CHUNK;
+        use disk_core::filesystem::EditableFilesystem;
 
         let img = load_fixture().to_vec();
         let mut cursor = Cursor::new(img);

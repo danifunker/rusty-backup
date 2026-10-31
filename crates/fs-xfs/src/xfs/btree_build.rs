@@ -16,7 +16,7 @@
 //! with uuid + blkno + lsn + owner + crc all stamped per
 //! `libxfs/xfs_format.h`); pass `None` for v4 (16-byte header).
 //!
-//! Porting reference: `xfs_repair` @ v3.1.11 `repair/phase5.c`
+//! Behavioural reference: `xfs_repair` @ v3.1.11, validated against `xfs_repair -n`; `repair/phase5.c`
 //! (`build_freespace_tree` / `build_ino_tree`), plus `xfs_btree_init_buf`
 //! for the v5 header.
 

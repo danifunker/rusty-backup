@@ -16,7 +16,7 @@
 //! belong to the Track B edit work, which needs the §3 write primitives that
 //! repair does not. They return `Unsupported` so the GUI/CLI can gate them.
 //!
-//! Porting reference: `xfs_repair` @ v3.1.11 `repair/agheader.c`
+//! Behavioural reference: `xfs_repair` @ v3.1.11, validated against `xfs_repair -n`; `repair/agheader.c`
 //! (`secondary_sb_whack`) under `~/efs-xfs-refs/xfsprogs/`.
 
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -26,11 +26,11 @@ use byteorder::{BigEndian, ByteOrder};
 use super::ag::{XfsAgf, XfsAgi};
 use super::sb::XfsSuperblock;
 use super::{read_at_aligned, XfsFilesystem};
-use crate::fs::entry::FileEntry;
-use crate::fs::filesystem::{
+use disk_core::entry::FileEntry;
+use disk_core::filesystem::{
     CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, FilesystemError,
 };
-use crate::fs::fsck::RepairReport;
+use disk_core::fsck::RepairReport;
 
 /// Geometry fields replicated into every AG superblock, as
 /// `(start, end, name)` byte ranges within the sb sector. These are exactly
@@ -256,10 +256,10 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
 }
 
 impl<R: Read + Write + Seek + Send> EditableFilesystem for XfsFilesystem<R> {
-    fn as_filesystem(&self) -> &dyn crate::fs::filesystem::Filesystem {
+    fn as_filesystem(&self) -> &dyn disk_core::filesystem::Filesystem {
         self
     }
-    fn as_filesystem_mut(&mut self) -> &mut dyn crate::fs::filesystem::Filesystem {
+    fn as_filesystem_mut(&mut self) -> &mut dyn disk_core::filesystem::Filesystem {
         self
     }
     fn create_file(
@@ -381,7 +381,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for XfsFilesystem<R> {
         let sb = self.superblock().clone();
         let (_core, mut buf) = self.read_inode_buf(entry.location)?;
         let cur = byteorder::BigEndian::read_u16(&buf[2..4]) as u32;
-        let new = crate::fs::unix_common::inode::with_permission_bits(cur, mode) as u16;
+        let new = disk_core::unix_common::inode::with_permission_bits(cur, mode) as u16;
         byteorder::BigEndian::write_u16(&mut buf[2..4], new);
         self.write_inode_region(&sb, entry.location, &buf)?;
         self.reader.flush()?;

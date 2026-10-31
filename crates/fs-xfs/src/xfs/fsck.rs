@@ -2,7 +2,7 @@
 //!
 //! This is the check side of the XFS edit + repair plan
 //! (`docs/xfs_edit_and_repair.md`). It produces the shared
-//! `crate::fs::fsck` types so the GUI and trait layer stay
+//! `disk_core::fsck` types so the GUI and trait layer stay
 //! filesystem-agnostic, mirroring `efs_fsck` / `hfs_fsck`.
 //!
 //! Phasing (see the doc):
@@ -14,7 +14,7 @@
 //!   * **Phase 3** — directory connectivity: BFS from root, flag orphaned
 //!     (allocated-but-unreachable) inodes and dangling directory entries.
 //!
-//! Porting reference: `xfs_repair` @ v3.1.11 (`repair/agheader.c`,
+//! Behavioural reference: `xfs_repair` @ v3.1.11, validated against `xfs_repair -n` (`repair/agheader.c`,
 //! `repair/sb.c`) under `~/efs-xfs-refs/xfsprogs/`. v4 on-disk layout per
 //! "XFS Algorithms & Data Structures" 3rd ed.
 
@@ -31,8 +31,8 @@ use super::types::{
     XFS_RMAP_CRC_MAGIC,
 };
 use super::{read_at_aligned, XfsFilesystem};
-use crate::fs::filesystem::{Filesystem, FilesystemError};
-use crate::fs::fsck::{FsckIssue, FsckResult, FsckStats, OrphanedEntry};
+use disk_core::filesystem::{Filesystem, FilesystemError};
+use disk_core::fsck::{FsckIssue, FsckResult, FsckStats, OrphanedEntry};
 
 /// FsckIssue codes the XFS repair path knows how to fix.
 ///

@@ -231,6 +231,7 @@ The crates already kept separately stay separate, because other projects share t
      - Two tests that go through the app's dispatcher (`open_editable_filesystem` for UFS, `probe_0x83_fs_type` for ReiserFS) moved to the shim files and now run on the fixture images. The crate's fixture tests read `tests/fixtures` through `CARGO_MANIFEST_DIR` and a `zstd` dev-dependency.
      - `UfsFilesystem::dirblksiz` gained a `pub` accessor for the NeXT CD builder's test.
      - **Held back:** `ofs` / `ofs_fsck` / `ofs_write` (old BeOS fs) need `hfs_common::resolve_create_type_creator` and its type/creator table, which belong to `fs-mac` (or `disk-core` if both families should share it); move after that's settled. `sun2tape` / `sun2tape_edit` / `tar_section` need the Unix-`compress` codec from `macarchive::stuffit_lzw` (planned for `arc-mac`) and `mem_archive::open_tar`; move with Step 6 or give `fs-unix` its own small LZW.
+   - **`fs-xfs` done (2026-10-30)**, GPL-2.0-only: the whole `xfs/` tree moved as `fs_xfs::xfs`. The "Porting reference" headers now read "Behavioural reference ... validated against `xfs_repair -n`" (audit follow-up). `dir_hashname` stays as-is, so the licence follows it (D2).
 4. **`part-tables`** (C5).
 5. **`dsk-*` and `dsk-clonezilla`** (C6, C7, C11). The upstream moves to libchdman-rs and opticaldiscs happen here.
    - **`dsk-clonezilla` done early (2026-10-30)**, ahead of Step 3, because its co-author had agreed to MIT.

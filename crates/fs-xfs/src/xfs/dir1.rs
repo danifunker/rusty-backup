@@ -22,7 +22,7 @@
 use byteorder::{BigEndian, ByteOrder};
 
 use super::dir2::Dir2Entry;
-use crate::fs::filesystem::FilesystemError;
+use disk_core::filesystem::FilesystemError;
 
 /// `xfs_dir_leafblock` magic.
 pub const XFS_DIR1_LEAF_MAGIC: u16 = 0xFEEB;

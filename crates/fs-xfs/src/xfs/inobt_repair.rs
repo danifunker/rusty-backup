@@ -43,8 +43,8 @@ use super::freespace_rebuild::{carve_from_largest, derive_free_extents, InUseMap
 use super::sb::XfsSuperblock;
 use super::types::{NULLAGBLOCK, XFS_IBT_MAGIC, XFS_INODES_PER_CHUNK};
 use super::{read_at_aligned, XfsFilesystem};
-use crate::fs::filesystem::FilesystemError;
-use crate::fs::fsck::RepairReport;
+use disk_core::filesystem::FilesystemError;
+use disk_core::fsck::RepairReport;
 
 /// inobt leaf record layout (v4 short header): startino(4) freecount(4) free(8).
 const INOBT_REC_SIZE: usize = 16;
@@ -988,8 +988,8 @@ mod finobt_sync_tests {
 
     // Decompress the bundled v5 fixture, helper mirrors mod.rs's.
     fn load_modern_fixture() -> Vec<u8> {
-        let bytes = include_bytes!("../../../tests/fixtures/sgi/xfs_v5_modern_small.img.zst");
-        let mut decoder = crate::rbformats::zstd_compat::decoder(&bytes[..]).unwrap();
+        let bytes = include_bytes!("../../../../tests/fixtures/sgi/xfs_v5_modern_small.img.zst");
+        let mut decoder = zstd::stream::read::Decoder::new(&bytes[..]).unwrap();
         let mut out = Vec::new();
         std::io::copy(&mut decoder, &mut out).unwrap();
         out
@@ -1118,7 +1118,7 @@ mod finobt_sync_tests {
             .sync_finobt_for_changes(&sb, agno, agi.free_root, &changes)
             .expect_err("must refuse zero-boundary transition");
         match err {
-            crate::fs::filesystem::FilesystemError::Unsupported(msg) => {
+            disk_core::filesystem::FilesystemError::Unsupported(msg) => {
                 assert!(
                     msg.contains("freecount crossed 0-boundary"),
                     "unexpected error message: {msg}"

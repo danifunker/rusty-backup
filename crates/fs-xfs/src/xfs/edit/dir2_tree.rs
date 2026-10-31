@@ -46,7 +46,7 @@ use super::{
     XFS_DA_NODE_MAGIC, XFS_DIR2_LEAF1_MAGIC, XFS_DIR2_LEAFN_MAGIC, XFS_DIR3_LEAF1_MAGIC,
     XFS_DIR3_LEAFN_MAGIC,
 };
-use crate::fs::filesystem::FilesystemError;
+use disk_core::filesystem::FilesystemError;
 
 /// A stale leaf entry's address (`XFS_DIR2_NULL_DATAPTR`): 0, which no
 /// entry can have since the data header occupies it.
@@ -65,7 +65,7 @@ pub(super) struct Geo {
 }
 
 impl Geo {
-    pub fn of(sb: &crate::fs::xfs::sb::XfsSuperblock) -> Geo {
+    pub fn of(sb: &crate::xfs::sb::XfsSuperblock) -> Geo {
         Geo {
             dirblksize: sb.dirblksize() as usize,
             is_v5: sb.is_v5(),

@@ -11,7 +11,7 @@ use super::types::{
     DirFormat, XFS_LABEL_MAX, XFS_SB_MAGIC, XFS_SB_VERSION_5, XFS_SB_VERSION_DIRV2BIT,
     XFS_SB_VERSION_NUMBITS,
 };
-use crate::fs::filesystem::FilesystemError;
+use disk_core::filesystem::FilesystemError;
 
 // v5 incompat feature bits we explicitly reject (read path can't cope).
 const XFS_SB_FEAT_INCOMPAT_NEEDSREPAIR: u32 = 1 << 4;

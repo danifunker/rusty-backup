@@ -46,7 +46,7 @@
 //!
 //! On top of these: `create_directory`, `create_file` (single contiguous
 //! extent), and `delete_entry` (empty short-form dirs / single-or-no-extent
-//! files). Porting reference: `xfs_repair` @ v3.1.11 + `libxfs/xfs_dir2_sf.c`,
+//! files). Behavioural reference: `xfs_repair` @ v3.1.11 + `libxfs/xfs_dir2_sf.c`,
 //! `libxfs/xfs_dir2_block.c`, `libxfs/xfs_ialloc.c`.
 
 use std::io::{Read, Seek, Write};
@@ -60,8 +60,8 @@ use super::dir2::XFS_DIR2_DATA_HDR_LEN;
 use super::freespace_rebuild::{carve_aligned_from_largest, carve_from_largest, coalesce};
 use super::types::{XFS_DINODE_MAGIC, XFS_INODES_PER_CHUNK};
 use super::{read_at_aligned, XfsFilesystem};
-use crate::fs::filesystem::{Filesystem, FilesystemError};
-use crate::fs::fsck::RepairReport;
+use disk_core::filesystem::{Filesystem, FilesystemError};
+use disk_core::fsck::RepairReport;
 
 mod dir2_tree;
 
@@ -87,8 +87,8 @@ const NULLAGINO: u32 = 0xFFFF_FFFF;
 /// default `now` stamp with the preserved values so a cross-fs import keeps
 /// the source's mtime. `tv_nsec` is written 0 — every source we import from
 /// only carries whole-second precision (tar, EFS, host-stat).
-fn stamp_v4_times(buf: &mut [u8], times: Option<crate::fs::times::UnixTimes>) {
-    let resolved = crate::fs::times::resolve_or_now(times);
+fn stamp_v4_times(buf: &mut [u8], times: Option<disk_core::times::UnixTimes>) {
+    let resolved = disk_core::times::resolve_or_now(times);
     let atime = resolved.atime_or_now() as u32;
     let mtime = resolved.mtime_or_now() as u32;
     let ctime = resolved.ctime_or_now() as u32;
@@ -745,7 +745,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         mode: u16,
         uid: u32,
         gid: u32,
-        times: Option<crate::fs::times::UnixTimes>,
+        times: Option<disk_core::times::UnixTimes>,
     ) -> Result<(), FilesystemError> {
         if parent_ino > u64::from(u32::MAX) || ino > u64::from(u32::MAX) {
             // Inode numbers beyond 32 bits need the 8-byte short-form layout
@@ -1038,7 +1038,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         mode: u16,
         uid: u32,
         gid: u32,
-        times: Option<crate::fs::times::UnixTimes>,
+        times: Option<disk_core::times::UnixTimes>,
     ) -> Result<u64, FilesystemError> {
         let sb = self.superblock().clone();
 
@@ -1273,7 +1273,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         size: u64,
         extents: &[(u64, u64, u32)],
         bmbt_leaf_fsblock: Option<u64>,
-        times: Option<crate::fs::times::UnixTimes>,
+        times: Option<disk_core::times::UnixTimes>,
     ) -> Result<(), FilesystemError> {
         let (_core, mut buf) = self.read_inode_buf(ino)?;
         let version = buf[4];
@@ -1377,7 +1377,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         mode: u16,
         uid: u32,
         gid: u32,
-        times: Option<crate::fs::times::UnixTimes>,
+        times: Option<disk_core::times::UnixTimes>,
     ) -> Result<u64, FilesystemError> {
         let sb = self.superblock().clone();
         self.dir_can_insert(&sb, parent_ino, name, false)?;
@@ -3915,12 +3915,12 @@ mod tests {
     //! the v5 fixture lives in `super::tests` (see
     //! `dir3_block_builder_round_trips_through_dir2_reader` etc.).
     use super::*;
-    use crate::fs::xfs::dir2;
+    use crate::xfs::dir2;
 
     /// Look up the `XfsSuperblock` constants we need to fabricate a
     /// stamper-ready superblock without an actual on-disk image.
-    fn fake_v5_sb(meta_uuid_byte: u8) -> crate::fs::xfs::sb::XfsSuperblock {
-        crate::fs::xfs::sb::XfsSuperblock {
+    fn fake_v5_sb(meta_uuid_byte: u8) -> crate::xfs::sb::XfsSuperblock {
+        crate::xfs::sb::XfsSuperblock {
             magicnum: 0x5846_5342,
             blocksize: 4096,
             dblocks: 0,
@@ -3984,9 +3984,9 @@ mod tests {
         // Stamp the xfs_dir3_blk_hdr — owner = parent / self_ino, blkno = some
         // synthetic daddr. After stamping, crc_valid must return true.
         let blkno = 0xDEAD_BEEFu64;
-        crate::fs::xfs::v5_crc::stamp_dir3_blk_hdr(&mut buf, blkno, self_ino, &sb);
+        crate::xfs::v5_crc::stamp_dir3_blk_hdr(&mut buf, blkno, self_ino, &sb);
         assert!(
-            crate::fs::xfs::v5_crc::crc_valid(&buf, crate::fs::xfs::v5_crc::DIR3_BLK_CRC_OFF),
+            crate::xfs::v5_crc::crc_valid(&buf, crate::xfs::v5_crc::DIR3_BLK_CRC_OFF),
             "dir3 block CRC mismatch after build+stamp"
         );
 
@@ -4028,9 +4028,9 @@ mod tests {
         assert!(bf_len > 0, "bestfree[0].length should be the tail gap");
 
         let blkno = 0xCAFE_BABEu64;
-        crate::fs::xfs::v5_crc::stamp_dir3_blk_hdr(block, blkno, 0x111, &sb);
+        crate::xfs::v5_crc::stamp_dir3_blk_hdr(block, blkno, 0x111, &sb);
         assert!(
-            crate::fs::xfs::v5_crc::crc_valid(block, crate::fs::xfs::v5_crc::DIR3_BLK_CRC_OFF),
+            crate::xfs::v5_crc::crc_valid(block, crate::xfs::v5_crc::DIR3_BLK_CRC_OFF),
             "XDD3 CRC mismatch after stamp"
         );
 
@@ -4073,9 +4073,9 @@ mod tests {
         );
 
         let blkno = 0xFEED_FACEu64;
-        crate::fs::xfs::v5_crc::stamp_da3_blkinfo(&mut buf, blkno, 0x222, &sb);
+        crate::xfs::v5_crc::stamp_da3_blkinfo(&mut buf, blkno, 0x222, &sb);
         assert!(
-            crate::fs::xfs::v5_crc::crc_valid(&buf, crate::fs::xfs::v5_crc::DA3_CRC_OFF),
+            crate::xfs::v5_crc::crc_valid(&buf, crate::xfs::v5_crc::DA3_CRC_OFF),
             "da3_blkinfo CRC mismatch after stamp"
         );
     }
@@ -4084,8 +4084,8 @@ mod tests {
     /// list now moves to a bmap-btree leaf and comes back inline, leaf freed.
     #[test]
     fn directory_extent_list_moves_to_a_bmbt_leaf_and_back() {
-        use crate::fs::filesystem::{CreateDirectoryOptions, EditableFilesystem, Filesystem};
-        let img = crate::fs::xfs::format::create_blank_xfs(32 << 20, "bmbt").unwrap();
+        use disk_core::filesystem::{CreateDirectoryOptions, EditableFilesystem, Filesystem};
+        let img = crate::xfs::format::create_blank_xfs(32 << 20, "bmbt").unwrap();
         let mut fs = XfsFilesystem::open(std::io::Cursor::new(img), 0).unwrap();
         let root = fs.root().unwrap();
         let dir = fs

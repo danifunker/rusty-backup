@@ -10,7 +10,7 @@
 use byteorder::{BigEndian, ByteOrder};
 
 use super::types::{DiFormat, XFS_DINODE_MAGIC};
-use crate::fs::filesystem::FilesystemError;
+use disk_core::filesystem::FilesystemError;
 
 /// Parsed v1/v2 inode core. Big-endian on disk.
 #[derive(Debug, Clone)]

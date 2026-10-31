@@ -5,7 +5,7 @@
 use byteorder::{BigEndian, ByteOrder};
 
 use super::types::{XFS_AGF_MAGIC, XFS_AGI_MAGIC};
-use crate::fs::filesystem::FilesystemError;
+use disk_core::filesystem::FilesystemError;
 
 #[derive(Debug, Clone)]
 pub struct XfsAgf {

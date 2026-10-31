@@ -27,7 +27,7 @@ use super::btree_build::{build_alloc_btree, build_sblock_btree, FreeExtent};
 use super::sb::XfsSuperblock;
 use super::types::{NULLAGBLOCK, XFS_AGF_MAGIC, XFS_AGI_MAGIC, XFS_DINODE_MAGIC, XFS_SB_MAGIC};
 use super::v5_crc;
-use crate::fs::filesystem::FilesystemError;
+use disk_core::filesystem::FilesystemError;
 
 const BLOCKSIZE: u32 = 4096;
 const BLOCKLOG: u8 = 12;
@@ -496,7 +496,7 @@ pub fn create_blank_xfs(size_bytes: u64, label: &str) -> Result<Vec<u8>, Filesys
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs::filesystem::Filesystem;
+    use disk_core::filesystem::Filesystem;
 
     /// 32 MiB is the two-AG floor, 64 MiB the first four-AG size, 300 MiB the
     /// smallest mkfs.xfs will itself make — and the one with non-power-of-two
@@ -508,12 +508,12 @@ mod tests {
     /// A file, not the in-memory `create_blank_xfs`: only a fraction of an XFS
     /// volume is populated, and a gigabyte of contiguous heap fails outright on
     /// 32-bit Windows.
-    fn blank_on_temp_disk(size: u64) -> crate::fs::xfs::XfsFilesystem<std::fs::File> {
+    fn blank_on_temp_disk(size: u64) -> crate::xfs::XfsFilesystem<std::fs::File> {
         let mut file = tempfile::tempfile().expect("temp disk");
         let len = write_blank_xfs(&mut file, 0, size, "rbtest")
             .unwrap_or_else(|e| panic!("{size}: format: {e}"));
         file.set_len(len).expect("size the temp disk");
-        crate::fs::xfs::XfsFilesystem::open(file, 0).unwrap_or_else(|e| panic!("{size}: open: {e}"))
+        crate::xfs::XfsFilesystem::open(file, 0).unwrap_or_else(|e| panic!("{size}: open: {e}"))
     }
 
     #[test]
@@ -532,7 +532,7 @@ mod tests {
     #[test]
     fn create_blank_xfs_returns_a_readable_image() {
         let img = create_blank_xfs(32 << 20, "rbtest").unwrap();
-        let mut fs = crate::fs::xfs::XfsFilesystem::open(std::io::Cursor::new(img), 0).unwrap();
+        let mut fs = crate::xfs::XfsFilesystem::open(std::io::Cursor::new(img), 0).unwrap();
         assert_eq!(fs.volume_label(), Some("rbtest"));
         let root = fs.root().unwrap();
         assert!(fs.list_directory(&root).unwrap().is_empty());

@@ -1,0 +1,26 @@
+[package]
+name = "fs-xfs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.73"
+license = "GPL-2.0-only"
+authors = ["Dani Sarfati <dani@funkervogt.com>"]
+description = "Read, edit, check and repair XFS (IRIX v4 through Linux v5) filesystems"
+repository = "https://github.com/danifunker/rusty-backup"
+readme = "README.md"
+keywords = ["filesystem", "xfs", "irix", "sgi", "disk-image"]
+categories = ["filesystem"]
+
+[features]
+# Only for a Rust 1.73 toolchain; see disk-core.
+rust173-polyfill = ["disk-core/rust173-polyfill"]
+
+[dependencies]
+disk-core = { path = "../disk-core", version = "0.1", features = ["fs"] }
+byteorder = "1"
+crc32c = "0.6"
+
+[dev-dependencies]
+tempfile = "3"
+# Unpacks the zstd test fixtures; 0.13 is the last line the Rust 1.73 builds resolve.
+zstd = ">=0.13, <0.15"

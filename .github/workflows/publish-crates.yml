@@ -16,6 +16,7 @@ on:
       - "dsk-clonezilla-v*"
       - "fs-amiga-v*"
       - "fs-unix-v*"
+      - "fs-xfs-v*"
   workflow_dispatch:
     inputs:
       crate:
@@ -32,6 +33,7 @@ on:
           - dsk-clonezilla
           - fs-amiga
           - fs-unix
+          - fs-xfs
       dry_run:
         description: Package and verify only, do not upload
         required: true
