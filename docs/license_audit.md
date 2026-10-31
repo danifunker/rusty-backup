@@ -112,4 +112,4 @@ The format data tables (Arsenic randomization table, method-13 tables, LZAH dist
 
 - Comment re-citations: `hfsplus_journal.rs` (TN1150), `xfs/*` ("behavioural reference"), `affs_common.rs:7`, `sfs.rs:459` (misattribution), `sfs_fsck.rs:3`, `qdos.rs`, `partition/x68k.rs` (licence label), `efs.rs`.
 - A repo-level `THIRD_PARTY_NOTICES.md` for the app: Nyarime MIT (GHO Fast-LZ) now, plus MAME BSD-3 (mirrors `fs-8bit`'s file).
-- Still to compare: `mar.rs` against mar-0.2.0 (source needs fetching). The partimage comparison is done (FACTS, see the filesystem table).
+- Still to compare: `mar.rs` against mar-0.2.0 (source needs fetching). Also `fs-mac/src/lisa.rs`, whose header says it "mirrors" Ray Arachelian's `lisafsh-tool` (LisaEm, GPL); the audit never covered it. The partimage comparison is done (FACTS, see the filesystem table).

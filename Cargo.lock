@@ -1782,6 +1782,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8b14ccef22fc6f5a8f4d7d768562a182c04ce9a3b3157b91390b52ddfdf1a76"
 
 [[package]]
+name = "dsk-apple"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crc32fast",
+ "disk-core",
+ "log",
+ "tempfile",
+]
+
+[[package]]
 name = "dsk-clonezilla"
 version = "0.1.0"
 dependencies = [
@@ -2403,6 +2414,7 @@ dependencies = [
  "byteorder",
  "chrono",
  "disk-core",
+ "dsk-apple",
  "filetime",
  "fs-mac-unicode",
  "libc",
@@ -5871,6 +5883,7 @@ dependencies = [
  "des",
  "dirs",
  "disk-core",
+ "dsk-apple",
  "dsk-clonezilla",
  "dsk-flux",
  "eframe",

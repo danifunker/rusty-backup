@@ -628,6 +628,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "dsk-apple"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crc32fast",
+ "disk-core",
+ "log",
+]
+
+[[package]]
 name = "dsk-clonezilla"
 version = "0.1.0"
 dependencies = [
@@ -828,6 +838,7 @@ dependencies = [
  "byteorder",
  "chrono",
  "disk-core",
+ "dsk-apple",
  "filetime",
  "fs-mac-unicode",
  "libc",
@@ -1549,6 +1560,7 @@ dependencies = [
  "csv",
  "dirs",
  "disk-core",
+ "dsk-apple",
  "dsk-clonezilla",
  "dsk-flux",
  "encoding_rs",

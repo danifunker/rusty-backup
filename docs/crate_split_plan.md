@@ -259,6 +259,8 @@ The crates already kept separately stay separate, because other projects share t
      - C11: the crate has its own `native-zstd` (default) / `pure-zstd` features, which the app's features of the same names forward. It takes `bzip2`, `lz4_flex`, `lzma-rs` and `flate2` directly, with version ranges that cover both the modern and the 1.73 lockfiles.
      - `src/clonezilla/mod.rs` is a `pub use dsk_clonezilla::*` shim.
    - **`dsk-flux` done (2026-10-31)**, MIT: the whole `rbformats/flux/` tree, moved as `dsk_flux::flux`. It needed only `disk-core`'s `io_other` / `repeat_n` shims.
+   - **`dsk-apple` done (2026-10-31)**, MIT: `dc42`, `twomg`, `woz`, `woz_write`, `moof`, `dart` and `lzhuf`, with features `dc42`, `twomg`, `woz` (WOZ + MOOF) and `dart` (pulls `dc42`).
+     - `lisa` then moved into `fs-mac` behind a `lisa` feature. It parses DiskCopy 4.2 headers, so `fs-mac` takes `dsk-apple` (feature `dc42` only) as an optional dependency, a deliberate family-to-family exception like `dsk-ghost` -> `fs-pc`.
 6. **`arc-mac`, `fs-tar`.**
 7. **Cleanup and docs.**
    - Remove the shims.

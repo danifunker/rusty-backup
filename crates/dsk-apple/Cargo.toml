@@ -1,0 +1,32 @@
+[package]
+name = "dsk-apple"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.73"
+license = "MIT"
+authors = ["Dani Sarfati <dani@funkervogt.com>"]
+description = "Apple disk-image containers: DiskCopy 4.2, 2IMG, WOZ (read and write), MOOF and DART"
+repository = "https://github.com/danifunker/rusty-backup"
+readme = "README.md"
+keywords = ["apple", "macintosh", "apple2", "disk-image", "emulator"]
+categories = ["emulators", "parser-implementations"]
+
+[features]
+default = ["dart", "dc42", "twomg", "woz"]
+# One feature per container family.
+dc42 = []
+twomg = []
+# WOZ and MOOF (the Macintosh flavour of WOZ) share the bitstream code.
+woz = []
+dart = ["dc42"]
+# Only for a Rust 1.73 toolchain; see disk-core.
+rust173-polyfill = ["disk-core/rust173-polyfill"]
+
+[dependencies]
+disk-core = { path = "../disk-core", version = "0.1", default-features = false }
+anyhow = "1"
+crc32fast = "1"
+log = "0.4"
+
+[dev-dependencies]
+tempfile = "3"

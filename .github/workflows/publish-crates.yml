@@ -25,6 +25,7 @@ on:
       - "fs-mac-v*"
       - "part-tables-v*"
       - "dsk-flux-v*"
+      - "dsk-apple-v*"
   workflow_dispatch:
     inputs:
       crate:
@@ -50,6 +51,7 @@ on:
           - fs-mac
           - part-tables
           - dsk-flux
+          - dsk-apple
       dry_run:
         description: Package and verify only, do not upload
         required: true

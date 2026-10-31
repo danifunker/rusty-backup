@@ -5,6 +5,7 @@
 //! | `hfs` | [`hfs`], [`hfs_fsck`], [`hfs_clone`], [`hfs_boot`], [`hfv`], [`mac_alias`] | HFS: read, edit, create, check, clone to a new block size, boot blocks, flat BasiliskII `.hfv` volumes |
 //! | `mfs` | [`mfs`] | Macintosh File System (the 400K-floppy filesystem): read, edit, create |
 //! | `hfsplus` | [`hfsplus`], [`hfsplus_fsck`], [`hfsplus_journal`], [`hfsplus_clone`], [`hfsplus_defrag`], [`hfsplus_wrapper_clone`] | HFS+ / HFSX: read, edit, create, check, journal replay, defragmenting clone (flat or HFS-wrapped) |
+//! | `lisa` | [`lisa`] | Lisa File System, read-only, from DiskCopy 4.2 images with tags |
 //! | `forks` | [`resource_fork`], [`binhex`], [`fork_export`] | resource forks, BinHex 4.0, fork-aware export |
 //!
 //! [`hfs_common`] (B-trees, dates, type/creator codes) is always built. Name ordering comes
@@ -40,6 +41,8 @@ pub mod hfsplus_journal;
 pub mod hfsplus_wrapper_clone;
 #[cfg(feature = "hfs")]
 pub mod hfv;
+#[cfg(feature = "lisa")]
+pub mod lisa;
 #[cfg(feature = "hfs")]
 pub mod mac_alias;
 #[cfg(feature = "mfs")]

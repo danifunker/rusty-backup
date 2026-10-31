@@ -5,27 +5,30 @@ edition = "2021"
 rust-version = "1.73"
 license = "MIT"
 authors = ["Dani Sarfati <dani@funkervogt.com>"]
-description = "Read, edit, create, check and clone classic Mac filesystems: MFS, HFS (incl. HFV images) and HFS+/HFSX, plus resource forks and BinHex"
+description = "Read, edit, create, check and clone classic Mac filesystems: MFS, HFS (incl. HFV images), HFS+/HFSX and Lisa, plus resource forks and BinHex"
 repository = "https://github.com/danifunker/rusty-backup"
 readme = "README.md"
 keywords = ["filesystem", "hfs", "hfsplus", "macintosh", "retro"]
 categories = ["filesystem", "emulators"]
 
 [features]
-default = ["forks", "hfs", "hfsplus", "mfs"]
+default = ["forks", "hfs", "hfsplus", "lisa", "mfs"]
 # One feature per filesystem; `hfs_common` (B-trees, dates, type/creator codes) is always built.
 hfs = []
 hfsplus = []
 mfs = ["hfs"]
+# Lisa Office System; its images come as DiskCopy 4.2 with tags, hence dsk-apple.
+lisa = ["dep:dsk-apple"]
 # Resource forks, BinHex 4.0 and AppleDouble / MacBinary fork export.
 forks = ["hfs"]
 # Only for a Rust 1.73 toolchain; see disk-core.
-rust173-polyfill = ["disk-core/rust173-polyfill", "fs-mac-unicode/rust173-polyfill"]
+rust173-polyfill = ["disk-core/rust173-polyfill", "fs-mac-unicode/rust173-polyfill", "dsk-apple?/rust173-polyfill"]
 
 [dependencies]
 disk-core = { path = "../disk-core", version = "0.1", features = ["fs"] }
 # GPL-2.0-only: the HFS / HFS+ name-ordering tables (see that crate's README).
 fs-mac-unicode = { path = "../fs-mac-unicode", version = "0.1" }
+dsk-apple = { path = "../dsk-apple", version = "0.1", default-features = false, features = ["dc42"], optional = true }
 anyhow = "1"
 byteorder = "1"
 chrono = "0.4"
