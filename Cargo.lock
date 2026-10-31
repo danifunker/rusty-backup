@@ -1799,6 +1799,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "dsk-flux"
+version = "0.1.0"
+dependencies = [
+ "disk-core",
+]
+
+[[package]]
 name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5865,6 +5872,7 @@ dependencies = [
  "dirs",
  "disk-core",
  "dsk-clonezilla",
+ "dsk-flux",
  "eframe",
  "egui",
  "encoding_rs",

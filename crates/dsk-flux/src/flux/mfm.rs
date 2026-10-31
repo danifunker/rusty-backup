@@ -57,7 +57,7 @@ fn to_bits(intervals: &[u32], cell: f64) -> Vec<u8> {
     for &t in intervals {
         let t = t as f64;
         let n = (t / c).round().clamp(1.0, 8.0);
-        bits.extend(crate::compat::repeat_n(0, n as usize - 1));
+        bits.extend(disk_core::repeat_n(0, n as usize - 1));
         bits.push(1);
         c += (t / n - c) * 0.05;
         c = c.clamp(cell * 0.85, cell * 1.15);

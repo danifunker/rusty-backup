@@ -88,7 +88,7 @@ pub fn read_flux_file(path: &Path) -> std::io::Result<Vec<FluxTrack>> {
     } else {
         hfe::parse(&data)
     };
-    parsed.map_err(crate::compat::io_other)
+    parsed.map_err(disk_core::io_other)
 }
 
 /// The faults recorded for `path`, if its decode found any.

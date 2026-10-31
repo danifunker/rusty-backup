@@ -1,0 +1,19 @@
+[package]
+name = "dsk-flux"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.73"
+license = "MIT"
+authors = ["Dani Sarfati <dani@funkervogt.com>"]
+description = "Decode flux captures to sector images: KryoFlux, SuperCard Pro / Greaseweazle and HxC floppies (IBM MFM / FM, AmigaDOS), Gesswein EMU ST-506 hard disks"
+repository = "https://github.com/danifunker/rusty-backup"
+readme = "README.md"
+keywords = ["floppy", "flux", "kryoflux", "greaseweazle", "disk-image"]
+categories = ["emulators", "parser-implementations"]
+
+[features]
+# Only for a Rust 1.73 toolchain; see disk-core.
+rust173-polyfill = ["disk-core/rust173-polyfill"]
+
+[dependencies]
+disk-core = { path = "../disk-core", version = "0.1", default-features = false }
