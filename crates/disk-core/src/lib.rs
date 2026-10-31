@@ -15,6 +15,7 @@
 //!   `FilesystemError`, create/repair options.
 //! - [`attrs`]: resolve the attributes a copied or imported entry should get.
 //! - [`entry`]: `FileEntry`, `EntryType` and directory display ordering.
+//! - [`id_names`]: uid / gid names from an image's own `/etc/passwd` and `/etc/group`.
 //! - [`fsck`]: integrity-check results shared by every checker.
 //! - [`times`]: Unix timestamps and the calendar conversions filesystems need.
 //! - [`xattr`]: extended-attribute names and values.
@@ -43,6 +44,8 @@ pub mod entry;
 pub mod filesystem;
 #[cfg(feature = "fs")]
 pub mod fsck;
+#[cfg(feature = "fs")]
+pub mod id_names;
 #[cfg(feature = "fs")]
 pub mod name_legalize;
 #[cfg(feature = "fs")]
