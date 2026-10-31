@@ -34,10 +34,10 @@ on:
 permissions:
   contents: write
 
-# A newer push to a feature branch supersedes the run still building the older one.
-# main/master runs are releases and always finish.
+# A newer push to a feature branch supersedes the run still building the older one; manual
+# runs are grouped apart so they never cancel a push run. main/master runs always finish.
 concurrency:
-  group: ${{ (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && format('release-{0}', github.run_id) || format('release-{0}', github.ref) }}
+  group: ${{ (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && format('release-{0}', github.run_id) || format('release-{0}-{1}', github.ref, github.event_name) }}
   cancel-in-progress: true
 
 env:
