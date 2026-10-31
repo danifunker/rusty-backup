@@ -705,6 +705,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs-mac-unicode"
+version = "0.1.0"
+
+[[package]]
 name = "fs-pc"
 version = "0.1.0"
 dependencies = [
@@ -1317,6 +1321,7 @@ dependencies = [
  "fs-apple2",
  "fs-cpm",
  "fs-hpfs",
+ "fs-mac-unicode",
  "fs-pc",
  "fs-qnx",
  "fs-squashfs",
