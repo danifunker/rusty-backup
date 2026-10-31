@@ -1,0 +1,35 @@
+[package]
+name = "fs-pc"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.73"
+license = "MIT"
+authors = ["Dani Sarfati <dani@funkervogt.com>"]
+description = "Read, edit, create, check and resize PC filesystems: FAT12/16/32, exFAT, NTFS and Sharp X68000 Human68k"
+repository = "https://github.com/danifunker/rusty-backup"
+readme = "README.md"
+keywords = ["filesystem", "fat32", "ntfs", "exfat", "disk-image"]
+categories = ["filesystem"]
+
+[features]
+default = ["exfat", "fat", "human68k", "ntfs"]
+# One feature per filesystem; the boot-sector patch helpers and the layout-preserving reader are always built.
+exfat = []
+fat = []
+human68k = []
+ntfs = []
+# Only for a Rust 1.73 toolchain; see disk-core.
+rust173-polyfill = ["disk-core/rust173-polyfill"]
+
+[dependencies]
+disk-core = { path = "../disk-core", version = "0.1", features = ["fs"] }
+anyhow = "1"
+byteorder = "1"
+# Human68k names are Shift-JIS.
+encoding_rs = "0.8"
+# The defragmenting clones build the new volume in a temp file.
+tempfile = "3"
+
+[dev-dependencies]
+# Unpacks the zstd test fixtures; 0.13 is the last line the Rust 1.73 builds resolve.
+zstd = ">=0.13, <0.15"

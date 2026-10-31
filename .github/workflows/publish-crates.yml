@@ -18,6 +18,8 @@ on:
       - "fs-unix-v*"
       - "fs-xfs-v*"
       - "fs-squashfs-v*"
+      - "fs-pc-v*"
+      - "fs-hpfs-v*"
   workflow_dispatch:
     inputs:
       crate:
@@ -36,6 +38,8 @@ on:
           - fs-unix
           - fs-xfs
           - fs-squashfs
+          - fs-pc
+          - fs-hpfs
       dry_run:
         description: Package and verify only, do not upload
         required: true

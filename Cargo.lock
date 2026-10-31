@@ -2373,6 +2373,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs-hpfs"
+version = "0.1.0"
+dependencies = [
+ "disk-core",
+]
+
+[[package]]
+name = "fs-pc"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "byteorder",
+ "disk-core",
+ "encoding_rs",
+ "tempfile",
+ "zstd 0.13.3",
+]
+
+[[package]]
 name = "fs-qnx"
 version = "0.1.0"
 dependencies = [
@@ -5814,6 +5833,8 @@ dependencies = [
  "fs-amiga",
  "fs-apple2",
  "fs-cpm",
+ "fs-hpfs",
+ "fs-pc",
  "fs-qnx",
  "fs-squashfs",
  "fs-unix",

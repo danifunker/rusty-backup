@@ -80,7 +80,6 @@ pub mod ntfs;
 pub mod ntfs_clone;
 pub mod ntfs_format;
 pub mod ntfs_fsck;
-mod ntfs_tables;
 pub mod ofs;
 pub mod ofs_fsck;
 pub mod ofs_write;
