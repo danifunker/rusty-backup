@@ -683,6 +683,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "dsk-vm"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "disk-core",
+]
+
+[[package]]
 name = "either"
 version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1588,6 +1596,7 @@ dependencies = [
  "dsk-dmg",
  "dsk-floppy",
  "dsk-flux",
+ "dsk-vm",
  "encoding_rs",
  "env_logger",
  "filetime",

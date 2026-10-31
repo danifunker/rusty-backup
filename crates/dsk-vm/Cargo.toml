@@ -1,0 +1,23 @@
+[package]
+name = "dsk-vm"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.73"
+license = "MIT"
+authors = ["Dani Sarfati <dani@funkervogt.com>"]
+description = "Virtual-machine disk images: VHD (fixed / dynamic), VMDK (flat and sparse) and QCOW2, read, write and edit in place"
+repository = "https://github.com/danifunker/rusty-backup"
+readme = "README.md"
+keywords = ["vhd", "vmdk", "qcow2", "virtualization", "disk-image"]
+categories = ["parser-implementations", "virtualization"]
+
+[features]
+# Only for a Rust 1.73 toolchain; see disk-core.
+rust173-polyfill = ["disk-core/rust173-polyfill"]
+
+[dependencies]
+disk-core = { path = "../disk-core", version = "0.1", default-features = false }
+anyhow = "1"
+
+[dev-dependencies]
+tempfile = "3"

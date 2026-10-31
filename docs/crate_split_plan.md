@@ -264,6 +264,10 @@ The crates already kept separately stay separate, because other projects share t
    - **`dsk-dmg` done (2026-10-31)**, MIT: `dmg`, `ndif`, `sparseimage`, and `dmg_crypto` behind the crate's `crypto` feature (forwarded from the app's `crypto`; off in the 1.73 builds, as before).
    - **`dsk-floppy` done (2026-10-31)**, MIT: the ten decoders from `rbformats/containers/` (ATR, D88, DIM, EDSK, `floppy_geom`, G64, HDF, HDM, MSA, XDF). `containers/mod.rs`, with its detection and dispatch over the app's `ReadSeek`, stays in the app and re-exports the modules (C6). `msa::encode_msa_bytes` was `#[cfg(test)]` and is now a regular `pub fn`; one app test got its own copy of the ADFS test helper.
      - **Held back: IMZ** (WinImage). It reads ZIP through the app's `ZipEntryName` shim, which bridges zip 9 (desktop) and zip 2.4.2 (vintage / PPC / Sol9) with different feature sets per build; a crate would have to pin those features without breaking the mrustc builds. `gho` uses it too, so it moves with `dsk-ghost`.
+   - **`dsk-vm` done (2026-10-31)**, MIT: `vmdk`, `vmdk_sparse`, `qcow2` and `sparse` whole, plus the format half of `vhd` (C7).
+     - The VHD split: the footer / dynamic-header builders, checksum, CHS geometry, cookies and `DynamicVhdReader` went to `dsk_vm::vhd`; `export_*`, `write_vhd` and the EBR rebuild stay in `rbformats/vhd.rs`, which re-exports the format half. Five format-only tests moved with it; the rest test the exporter and stayed.
+     - Now `pub` for the exporter: `vhd_checksum`, `vhd_chs_geometry`, `build_vhd_dynamic_header`, `BAT_UNUSED`, `sparse::{SparseAllocator, is_zero_unit}`, and a new `DynamicVhdReader::into_inner` (three app tests read the private `inner` field).
+     - `CHUNK_SIZE`, `is_all_zeros` and `write_zeros` are small private copies in the crate. The `qemu-img check` test helper is duplicated (crate and app), because the APM + HFS QCOW2 acceptance test moved to the app shim.
 6. **`arc-mac`, `fs-tar`.**
 7. **Cleanup and docs.**
    - Remove the shims.

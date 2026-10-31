@@ -1845,6 +1845,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dsk-vm"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "disk-core",
+ "tempfile",
+]
+
+[[package]]
 name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5916,6 +5925,7 @@ dependencies = [
  "dsk-dmg",
  "dsk-floppy",
  "dsk-flux",
+ "dsk-vm",
  "eframe",
  "egui",
  "encoding_rs",
