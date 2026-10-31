@@ -106,7 +106,7 @@ jobs:
             spec="${INPUT_TARGETS:-all}"; why="manual run"
           elif [ "$REF" = refs/heads/main ] || [ "$REF" = refs/heads/master ]; then
             spec=all; why="push to ${REF#refs/heads/}"
-          elif tok=$(printf '%s' "$COMMIT_MSG" | grep -oiE '\[ci: *[^]]*\]' | head -1) && [ -n "$tok" ]; then
+          elif tok=$(printf '%s' "$COMMIT_MSG" | grep -oiE '\[ci: *[a-z0-9, -]+\]' | head -1) && [ -n "$tok" ]; then
             spec=$(printf '%s' "$tok" | sed -E 's/^\[[cC][iI]: *//; s/\]$//'); why="commit message $tok"
           elif [ -f .github/ci-targets ]; then
             spec=$(sed 's/#.*//' .github/ci-targets | tr '\n' ' '); why=".github/ci-targets"
