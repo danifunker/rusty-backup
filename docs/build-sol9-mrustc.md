@@ -30,7 +30,7 @@ and the RustDesk agent that runs on top of it (`~/repos/mrustc/SOL9-RESUME.md`).
 
 | | |
 |---|---|
-| **mrustc target** | `sparcv9-sun-solaris2.9`, on branch `sparc-solaris-10` (5 commits over `109ddad1`). Handles the Solaris 9 compiler wall itself: `emulated_overflow_intrinsics`, `emulated_c99_math`, `emulated_posix2001`, `-static-libgcc`, and `-lsocket -lnsl -lrt -ldl` |
+| **mrustc target** | `sparcv9-sun-solaris2.9`, on branch `sparc-solaris9` (see "mrustc: the fork's branches"). Handles the Solaris 9 compiler wall itself: `emulated_overflow_intrinsics`, `emulated_c99_math`, `emulated_posix2001`, `-static-libgcc`, and `-lsocket -lnsl -lrt -ldl` |
 | **Cross toolchain** | gcc 4.9.4 + binutils 2.35.2 at `~/sol9-toolchain/opt/bin/sparcv9-sun-solaris2.9-*`, sysroot at `~/sol9-toolchain/sysroot`. Reproducible as the `mrustc-sol9-cross` docker image (built, 1.1 GB), which agrees with the native one byte-for-byte on `.text` |
 | **Rust stdlib** | **Already built** for the target: 20 rlibs in `~/repos/mrustc/output-1.74.0-sparcv9-sun-solaris2.9/`, including `libstd`, `libpanic_unwind`, `libtest` and `liblibc-0.2.148`. A linked SPARC V9 executable runs on the hardware |
 | **C libraries** | `~/sol9-deps/prefix` carries `libz.a` and `libzstd.a` cross-built for the target - the two rusty-backup actually wants - plus libsodium / mbedTLS / libvpx from the agent work |
@@ -752,43 +752,43 @@ finding 12. Without such a runner the container can still build and package -
 it just cannot prove parity, which is exactly the gap that let the PowerPC
 size bug ship once.
 
-## mrustc: what needs upstreaming
+## mrustc: the fork's branches
 
-`sparc-solaris-10` carries **eleven commits** over `upstream/master`
-(`d0fffe5b`), not just the Solaris 9 five - the branch accumulated earlier
-work that never went up. Upstream has merged this fork's targets before (its
-tip *is* the PowerPC PR, #418), so the path is established.
+We keep our own fork, `github.com/danifunker/mrustc`. Upstream
+(`thepowersgang/mrustc`) takes new targets: it merged PowerPC (#418). Solaris 9
+is too old to upstream. Since 2026-10-30 the work is split so each piece can go
+up, or stay ours, on its own:
 
-Six of the eleven are portable fixes with no Solaris content at all, and those
-are the easiest to land:
+| Branch | Based on | Holds | Destination |
+|---|---|---|---|
+| `ppc-minicargo-fixes` | `upstream/master` | Three minicargo fixes from the PowerPC builds: unblock dirty children of complete jobs, make dependents wait on a clean dependency's live codegen, and accept `[patch]` in a workspace-root package manifest | Upstream: thepowersgang/mrustc#450 |
+| `sparc-solaris10` | `upstream/master` | `STD_ENV_ARCH` override, the `{:02x?}` fix, the signed-overflow helper fix, and the `sparcv9-sun-solaris` target with the gaps it needed: `repr(align)` on unions, fieldless enums passed as their integer across `extern "C"`, and `target_vendor = "sun"` | Upstream, as a PR from this branch |
+| `sparc-solaris9` | `sparc-solaris10` | One commit: `sparcv9-sun-solaris2.9`, the `emulate-overflow-intrinsics` / `emulate-c99-math` / `emulate-posix2001` flags and their C shims, the `CC_${TRIPLE}` dotted-triple fix, and the Solaris 9 sysroot notes | Ours only |
 
-| | Commit | Why it stands alone |
-|---|---|---|
-| a | `0ef4515c` | minicargo dropped the semver pre-release suffix from `CARGO_PKG_VERSION` |
-| b | `24e0ed0a` | `#[repr(align(N))]` on unions was unsupported in HIR |
-| c | `3587bd55` | `STD_ENV_ARCH` could not be overridden |
-| d | `109ddad1` | `{:02x?}` left a literal `"?}"` in formatted output |
-| e | `64551250` | The emitted signed-overflow helpers were wrong for almost any negative operand - 561,004 fuzz mismatches against GCC's own builtins, plus reachable UB. The strongest standalone PR here |
-| f | `71910c7c` | `CC_${TRIPLE}` replaced only `-`, so any triple containing `.` produced a name no shell can export |
+The older branches (`sparc-solaris-10`, the source of thepowersgang/mrustc#428;
+`ppc-build-2026-09`; `ppc-consolidates`) predate the split. Their content is
+fully contained in the new branches: `sparc-solaris9` plus the three minicargo
+commits reproduces `ppc-build-2026-09` rebased onto `upstream/master` with an
+empty diff.
 
-The remaining five are the target work, and want landing in order because each
-depends on the last:
+**Keeping Solaris 9 current.** Rebase `sparc-solaris10` onto `upstream/master`,
+then `sparc-solaris9` onto `sparc-solaris10`:
 
-| | Commit(s) | |
-|---|---|---|
-| g | `73c570f3` | `emulate-overflow-intrinsics`, so a pre-GCC-5 compiler can build mrustc's output. Needs (e) |
-| h | `400e373a` | The `sparcv9-sun-solaris` target (Solaris 10) |
-| i | `6421bfef`, `b3aa8ae6` | `sparcv9-sun-solaris2.9`, `emulate-c99-math`, `emulate-posix2001`, and the toolchain container that later became `scripts/build-sol9-toolchain.sh` |
-| j | **not yet written** | Finding 10: mrustc lowers a fieldless `#[repr(u32)]` enum to a one-field struct and passes it **by value** in `extern "C"` signatures, where the callee expects a scalar. On any 64-bit big-endian target the value lands in the wrong half of the register. Should emit the underlying integer in extern signatures and at call sites |
+    git fetch upstream
+    git rebase upstream/master sparc-solaris10
+    git rebase --onto sparc-solaris10 <old sparc-solaris10 tip> sparc-solaris9
 
-Two practical notes. The branch is **not linear** - it contains a merge commit
-(`1d552cad`, this fork's own PR #420) - so a PR series wants rebasing onto
-`upstream/master` rather than being proposed as-is. And (j) is the most
-valuable of the set: a genuine codegen bug rather than a missing feature,
-affecting every `extern "C"` fn taking such an enum, and structurally
-invisible on 32-bit big-endian - so upstream's existing PowerPC users cannot
-have hit it. Its regression test needs a 64-bit big-endian target, which (i)
-supplies.
+Once upstream merges the Solaris 10 PR, rebase `sparc-solaris9` straight onto
+`upstream/master`. It is then a single commit on top of upstream. The conflicts
+to expect are in `src/trans/codegen_c.cpp`, where the overflow-intrinsic call
+sites switch on `m_options.emulated_overflow_intrinsics` rather than on
+`Compiler::Msvc`.
+
+**The build checkout** needs both pieces: `sparc-solaris9` with
+`ppc-minicargo-fixes` merged in, or cherry-picked on top. As of 2026-10-30, m900's
+`~/repos/mrustc` is still on `ppc-build-2026-09`, which has the same content on an
+older upstream base. Moving it to a new base changes the compiler, so the
+`output-1.74.0-*` stdlib directories will rebuild.
 
 ## Open questions - decisions to make, not tasks
 

@@ -114,8 +114,9 @@ Two things about `ppc-cc-remote.py` exist only because of these crates:
 ## Prerequisites
 
 ### This machine (the transpile host)
-- An mrustc clone **with the fixes below**, on branch `rb-cli-vintage-build`
-  (fork: `github.com/danifunker/mrustc`).
+- An mrustc clone from the fork `github.com/danifunker/mrustc`, with the
+  `ppc-minicargo-fixes` branch included. The branch layout is in
+  `docs/build-sol9-mrustc.md`, "mrustc: the fork's branches".
 - The rustc **1.74.0** source: `make RUSTCSRC RUSTC_VERSION=1.74.0` in the
   mrustc dir (downloads `rustc-1.74.0-src/` and applies
   `rustc-1.74.0-src.patch`, which carries the two stdlib fixes below).

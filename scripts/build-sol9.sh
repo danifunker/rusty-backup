@@ -13,7 +13,7 @@
 #
 # Everything the target needs beyond the engine is already in place and is NOT
 # built here -- see docs/build-sol9-mrustc.md:
-#   * the mrustc target `sparcv9-sun-solaris2.9` (branch sparc-solaris-10)
+#   * the mrustc target `sparcv9-sun-solaris2.9` (branch sparc-solaris9)
 #   * the cross toolchain at $SOL9_TOOLCHAIN
 #   * the Rust stdlib at $MRUSTC_DIR/output-$RUSTC_VERSION-$SOL9_TARGET
 #
@@ -154,9 +154,9 @@ stage_check() {
   [ -x "$MRUSTC_DIR/bin/mrustc" ]     || die "mrustc is not built at $MRUSTC_DIR/bin/mrustc"
   note "cross gcc: $("$SOL9_BIN/$SOL9_TARGET-gcc" --version | head -1)"
 
-  # The target must exist in this mrustc, which means branch sparc-solaris-10.
+  # The target must exist in this mrustc, which means branch sparc-solaris9.
   "$MRUSTC_DIR/bin/mrustc" --target "$SOL9_TARGET" --help >/dev/null 2>&1 \
-    || note "(could not probe mrustc for $SOL9_TARGET -- if the build fails on an unknown target, check out branch sparc-solaris-10)"
+    || note "(could not probe mrustc for $SOL9_TARGET -- if the build fails on an unknown target, check out branch sparc-solaris9)"
 
   [ -e "$SOL9_LIBS/libstd.rlib" ] \
     || die "no target stdlib at $SOL9_LIBS -- run the 'sol9libs' stage"
