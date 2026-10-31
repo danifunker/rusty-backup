@@ -11,6 +11,7 @@
 //! | `vxfs` | [`vxfs`], [`vxfs_edit`] | Veritas VxFS (HP-UX, UnixWare): read, edit |
 //! | `minix` | [`minix`], [`minix_fsck`] | Minix V1 / V2 / V3: read, edit, create, check |
 //! | `bfs` | [`bfs`], [`bfs_fsck`], [`bfs_write`] | BeOS / Haiku BFS: read, edit, create, check |
+//! | `ofs` | [`ofs`], [`ofs_fsck`], [`ofs_write`] | the old BeOS fs (BeBox prototypes, DR8 and earlier): read, edit, check. Off by default; pulls in `fs-mac` (GPL via `fs-mac-unicode`) |
 
 // `is_multiple_of` & co. come from disk-core's rust173 polyfill on 1.73; the real floor check is a 1.73 build.
 #![allow(clippy::incompatible_msrv)]
@@ -53,6 +54,12 @@ pub mod jfs_fsck;
 pub mod minix;
 #[cfg(feature = "minix")]
 pub mod minix_fsck;
+#[cfg(feature = "ofs")]
+pub mod ofs;
+#[cfg(feature = "ofs")]
+pub mod ofs_fsck;
+#[cfg(feature = "ofs")]
+pub mod ofs_write;
 #[cfg(feature = "reiserfs")]
 pub mod reiserfs;
 #[cfg(feature = "ufs")]

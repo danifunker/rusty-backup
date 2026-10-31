@@ -212,7 +212,7 @@ fs-hpfs = { path = "crates/fs-hpfs" }
 fs-pc = { path = "crates/fs-pc" }
 fs-squashfs = { path = "crates/fs-squashfs", default-features = false }
 fs-xfs = { path = "crates/fs-xfs" }
-fs-unix = { path = "crates/fs-unix" }
+fs-unix = { path = "crates/fs-unix", features = ["ofs"] }
 fs-amiga = { path = "crates/fs-amiga" }
 dsk-clonezilla = { path = "crates/dsk-clonezilla", default-features = false }
 # Full-screen TUI (`tui` feature). ratatui renders through crossterm, which is

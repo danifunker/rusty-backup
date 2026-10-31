@@ -2528,6 +2528,7 @@ dependencies = [
  "byteorder",
  "crc32c",
  "disk-core",
+ "fs-mac",
  "log",
  "tempfile",
  "zstd 0.13.3",

@@ -13,9 +13,9 @@
 use std::collections::HashSet;
 use std::io::{Read, Seek, Write};
 
-use super::filesystem::FilesystemError;
-use super::fsck::{FsckIssue, FsckResult, FsckStats, RepairReport};
-use super::ofs::{OfsFilesystem, SECTOR};
+use crate::ofs::{OfsFilesystem, SECTOR};
+use disk_core::filesystem::FilesystemError;
+use disk_core::fsck::{FsckIssue, FsckResult, FsckStats, RepairReport};
 
 /// Stop after this many entries; a cyclic `next_block` would otherwise spin.
 const MAX_ENTRIES: usize = 1_000_000;
@@ -197,13 +197,13 @@ impl<R: Read + Seek + Send> OfsFilesystem<R> {
     }
 
     /// Decode the live entries in one already-read directory block.
-    fn entries_in_block(&self, raw: &[u8], block: u64) -> Vec<super::ofs::OfsEntry> {
-        (0..super::ofs::ENTRIES_PER_BLOCK)
+    fn entries_in_block(&self, raw: &[u8], block: u64) -> Vec<crate::ofs::OfsEntry> {
+        (0..crate::ofs::ENTRIES_PER_BLOCK)
             .filter_map(|i| self.entry_in_block(raw, block, i))
             .collect()
     }
 
-    fn claim_file(&mut self, attrs: &super::ofs::OfsAttrs, path: &str, survey: &mut Survey) {
+    fn claim_file(&mut self, attrs: &crate::ofs::OfsAttrs, path: &str, survey: &mut Survey) {
         let total = self.toc.total_sectors as u64;
         if !attrs.is_contiguous() && attrs.first_alloc_list != 0 {
             // The extent-list sector is allocated in its own right.
@@ -326,8 +326,8 @@ fn bit_is_set(bitmap: &[u8], sector: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
-    use crate::fs::ofs_write::create_blank_ofs;
+    use crate::ofs_write::create_blank_ofs;
+    use disk_core::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
     use std::io::Cursor;
 
     fn volume() -> OfsFilesystem<Cursor<Vec<u8>>> {

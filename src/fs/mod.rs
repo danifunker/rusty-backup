@@ -80,7 +80,6 @@ pub mod ntfs_clone;
 pub mod ntfs_format;
 pub mod ntfs_fsck;
 pub mod ofs;
-pub mod ofs_fsck;
 pub mod ofs_write;
 #[cfg(feature = "optical")]
 pub mod optical_fs;
