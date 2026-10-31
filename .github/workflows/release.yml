@@ -2,34 +2,26 @@ name: Release
 
 on:
   push:
+    # Branches only: a tag push (e.g. a crate tag for publish-crates.yml) must not
+    # rebuild every platform. Releases come from main/master branch pushes.
+    branches: ["**"]
     paths-ignore:
       - "*.md"
       - "docs/**"
   workflow_dispatch:
-    # Manual "Run workflow" switches (this folds in the old standalone
-    # appliance-media.yml — one pipeline, no drift). On a plain push these
-    # inputs are unset: push always builds the desktop + cb-dos set, and a push
-    # to main/master also builds the slow appliance (feature-branch pushes skip
-    # it). A manual run can trim the build down to just the media you're
-    # iterating on.
+    # Manual "Run workflow" switches. `targets` picks what to build (the plan
+    # job below resolves it); `appliance` picks the appliance CPU floor when the
+    # appliance target is selected.
     inputs:
-      desktop:
-        description: "Build the desktop apps + CLIs + MiSTer binary"
-        type: boolean
-        default: true
+      targets:
+        description: "Targets to build: all, or a comma list (see the plan job, e.g. sol9 or linux,vintage)"
+        type: string
+        default: all
       appliance:
         description: "Linux appliance CPU floor (Buildroot ISO/PXE/floppy)"
         type: choice
         options: [none, i586, i686, both]
         default: both
-      cbdos:
-        description: "Build cb-dos media (FreeDOS floppy + CD)"
-        type: boolean
-        default: true
-      sol9:
-        description: 'Build rb-cli for Solaris 9 SPARC (needs the SOL9_SPARC64_SYSROOT_URL seed secret)'
-        type: boolean
-        default: true
       runner_image:
         # macOS runner image for the build-macos legs. Pinned (not
         # `macos-latest`) so a run is deterministic during GitHub's
@@ -64,11 +56,97 @@ jobs:
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Generated version: $VERSION"
 
+  # Decides which targets this run builds, so a feature branch can skip the
+  # platforms it is not touching. First match wins:
+  #   1. manual run: the `targets` input
+  #   2. push to main/master: all (a release must never lose a platform)
+  #   3. `[ci: <targets>]` in the head commit message, e.g. [ci: sol9] or [ci: none]
+  #   4. .github/ci-targets on the branch (one comma list; # comments allowed)
+  #   5. all
+  # Targets: windows macos appimage linux-packages mister extra-arch windows-arm64
+  # riscv64 appliance sol9 cbdos macos-vintage windows-vintage musl.
+  # Groups: desktop (everything the old "desktop" switch covered), linux
+  # (appimage + linux-packages), vintage (macos-vintage + windows-vintage), all, none.
+  plan:
+    name: Plan targets
+    runs-on: ubuntu-24.04
+    outputs:
+      windows: ${{ steps.p.outputs.windows }}
+      macos: ${{ steps.p.outputs.macos }}
+      appimage: ${{ steps.p.outputs.appimage }}
+      linux-packages: ${{ steps.p.outputs.linux-packages }}
+      mister: ${{ steps.p.outputs.mister }}
+      extra-arch: ${{ steps.p.outputs.extra-arch }}
+      windows-arm64: ${{ steps.p.outputs.windows-arm64 }}
+      riscv64: ${{ steps.p.outputs.riscv64 }}
+      appliance: ${{ steps.p.outputs.appliance }}
+      sol9: ${{ steps.p.outputs.sol9 }}
+      cbdos: ${{ steps.p.outputs.cbdos }}
+      macos-vintage: ${{ steps.p.outputs.macos-vintage }}
+      windows-vintage: ${{ steps.p.outputs.windows-vintage }}
+      musl: ${{ steps.p.outputs.musl }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          sparse-checkout: .github
+          fetch-depth: 1
+      - id: p
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          INPUT_TARGETS: ${{ inputs.targets }}
+          # Through env, never inline: a commit message is untrusted text.
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          set -euo pipefail
+          ALL="windows macos appimage linux-packages mister extra-arch windows-arm64 riscv64 appliance sol9 cbdos macos-vintage windows-vintage musl"
+          DESKTOP="windows macos appimage linux-packages mister extra-arch windows-arm64 riscv64 macos-vintage windows-vintage musl"
+          if [ "$EVENT" = workflow_dispatch ]; then
+            spec="${INPUT_TARGETS:-all}"; why="manual run"
+          elif [ "$REF" = refs/heads/main ] || [ "$REF" = refs/heads/master ]; then
+            spec=all; why="push to ${REF#refs/heads/}"
+          elif tok=$(printf '%s' "$COMMIT_MSG" | grep -oiE '\[ci: *[^]]*\]' | head -1) && [ -n "$tok" ]; then
+            spec=$(printf '%s' "$tok" | sed -E 's/^\[[cC][iI]: *//; s/\]$//'); why="commit message $tok"
+          elif [ -f .github/ci-targets ]; then
+            spec=$(sed 's/#.*//' .github/ci-targets | tr '\n' ' '); why=".github/ci-targets"
+          else
+            spec=all; why="default"
+          fi
+          sel=" "
+          for t in $(printf '%s' "$spec" | tr ',' ' ' | tr '[:upper:]' '[:lower:]'); do
+            case "$t" in
+              all) sel="$sel$ALL " ;;
+              none) ;;
+              desktop) sel="$sel$DESKTOP " ;;
+              linux) sel="${sel}appimage linux-packages " ;;
+              vintage) sel="${sel}macos-vintage windows-vintage " ;;
+              *)
+                case " $ALL " in
+                  *" $t "*) sel="$sel$t " ;;
+                  *) echo "::error::unknown CI target '$t' (from $why). Known: $ALL desktop linux vintage all none"; exit 1 ;;
+                esac ;;
+            esac
+          done
+          # The appliance is a ~1 h Buildroot build: off a release branch it runs only when named.
+          if [ "$EVENT" = push ] && [ "$REF" != refs/heads/main ] && [ "$REF" != refs/heads/master ]; then
+            case ",$(printf '%s' "$spec" | tr ' ' ',' | tr '[:upper:]' '[:lower:]')," in
+              *,appliance,*) ;;
+              *) sel=$(printf '%s' "$sel" | sed 's/ appliance / /g') ;;
+            esac
+          fi
+          echo "Targets from $why: ${spec}"
+          for t in $ALL; do
+            case "$sel" in *" $t "*) v=true ;; *) v=false ;; esac
+            echo "$t=$v" >> "$GITHUB_OUTPUT"
+            echo "  $t: $v"
+          done
+
   build-windows:
     name: Build Windows
     # Skipped only when a manual run unticks "desktop"; every push builds it.
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.desktop }}
-    needs: generate-version
+    if: needs.plan.outputs.windows == 'true'
+    needs: [generate-version, plan]
     runs-on: windows-latest
     # Bake the release version for every cargo invocation in the job (Test and
     # Build alike). build.rs reads RELEASE_VERSION into APP_VERSION; if only the
@@ -196,8 +274,8 @@ jobs:
   build-macos:
     name: Build macOS
     # Skipped only when a manual run unticks "desktop"; every push builds it.
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.desktop }}
-    needs: generate-version
+    if: needs.plan.outputs.macos == 'true'
+    needs: [generate-version, plan]
     # Both arches build on the same Apple-silicon runner: arm64 natively, x64
     # cross-compiled (macOS ships a universal SDK, so an arm64 host emits the
     # x86_64 slice). This drops the separate `macos-*-intel` runner, whose
@@ -471,8 +549,8 @@ jobs:
   build-linux-appimage:
     name: Build Linux AppImage (Anylinux)
     # Skipped only when a manual run unticks "desktop"; every push builds it.
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.desktop }}
-    needs: generate-version
+    if: needs.plan.outputs.appimage == 'true'
+    needs: [generate-version, plan]
     runs-on: ${{ matrix.runs-on }}
     container: ghcr.io/pkgforge-dev/archlinux:latest
     strategy:
@@ -685,8 +763,8 @@ jobs:
   build-linux-packages:
     name: Build Linux Packages
     # Skipped only when a manual run unticks "desktop"; every push builds it.
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.desktop }}
-    needs: generate-version
+    if: needs.plan.outputs.linux-packages == 'true'
+    needs: [generate-version, plan]
     runs-on: ${{ matrix.runs-on }}
     # See build-windows: keep APP_VERSION consistent across Test and Build.
     env:
@@ -854,8 +932,8 @@ jobs:
   build-rb-cli-mini-armv7:
     name: Build rb-cli-mini (armv7 MiSTer)
     # Skipped only when a manual run unticks "desktop"; every push builds it.
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.desktop }}
-    needs: generate-version
+    if: needs.plan.outputs.mister == 'true'
+    needs: [generate-version, plan]
     runs-on: ubuntu-24.04
     # Don't fail the whole workflow if the cross-compile breaks. Combined
     # with the release job's `needs:` entry above, this still gates the
@@ -1056,8 +1134,8 @@ jobs:
   build-rb-cli-extra-arch:
     name: Build rb-cli (${{ matrix.label }})
     # Skipped only when a manual run unticks "desktop"; every push builds it.
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.desktop }}
-    needs: generate-version
+    if: needs.plan.outputs.extra-arch == 'true'
+    needs: [generate-version, plan]
     runs-on: ubuntu-24.04
     # Non-fatal: a broken cross-compile must not hold up the desktop release
     # (the release job hard-requires only the four desktop builds). The release
@@ -1167,8 +1245,8 @@ jobs:
   build-windows-arm64:
     name: Build Windows ARM64 (GUI + rb-cli)
     # Skipped only when a manual run unticks "desktop"; every push builds it.
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.desktop }}
-    needs: generate-version
+    if: needs.plan.outputs.windows-arm64 == 'true'
+    needs: [generate-version, plan]
     runs-on: windows-latest
     # Non-fatal, like the other CLI cross-builds — the release waits for it via
     # `needs:` but a failure here can't block the desktop downloads.
@@ -1248,8 +1326,8 @@ jobs:
   build-gui-linux-riscv64:
     name: Build Linux RISC-V 64 GUI (rusty-backup)
     # Skipped only when a manual run unticks "desktop"; every push builds it.
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.desktop }}
-    needs: generate-version
+    if: needs.plan.outputs.riscv64 == 'true'
+    needs: [generate-version, plan]
     runs-on: ubuntu-24.04
     continue-on-error: true
     env:
@@ -1489,33 +1567,30 @@ jobs:
           name: Rusty-Backup-linux-riscv64-${{ needs.generate-version.outputs.version }}-rpm
           path: Rusty-Backup-linux-riscv64-${{ needs.generate-version.outputs.version }}.rpm
 
-  # Turn the `appliance` choice input into a JSON arch list for the matrix
-  # below. A manual dispatch honours none / i586 / i686 / both. A push to
-  # main/master builds both arches automatically (the full Buildroot build is
-  # ~1 h, but main pushes are real releases and the job is continue-on-error,
-  # so it can't hold up the desktop downloads). A push to any other branch
-  # resolves to [] so feature-branch iteration stays fast.
+  # Turn the plan's appliance decision into a JSON arch list for the matrix
+  # below. A manual dispatch honours none / i586 / i686 / both; a push builds
+  # both. The plan only selects the appliance on a push to main/master or when
+  # a feature branch names it (the full Buildroot build is ~1 h).
   appliance-matrix:
     name: Resolve appliance arch list
+    needs: plan
     runs-on: ubuntu-24.04
     outputs:
       arches: ${{ steps.m.outputs.arches }}
     steps:
       - id: m
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          if [ "${{ needs.plan.outputs.appliance }}" != "true" ]; then
+            echo 'arches=[]' >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             case "${{ inputs.appliance }}" in
               both) echo 'arches=["i586","i686"]' >> "$GITHUB_OUTPUT" ;;
               none) echo 'arches=[]' >> "$GITHUB_OUTPUT" ;;
               *)    echo 'arches=["${{ inputs.appliance }}"]' >> "$GITHUB_OUTPUT" ;;
             esac
           else
-            case "${{ github.ref }}" in
-              refs/heads/main|refs/heads/master)
-                echo 'arches=["i586","i686"]' >> "$GITHUB_OUTPUT" ;;
-              *)
-                echo 'arches=[]' >> "$GITHUB_OUTPUT" ;;
-            esac
+            # A push only gets here when the plan selected the appliance (main/master, or named explicitly).
+            echo 'arches=["i586","i686"]' >> "$GITHUB_OUTPUT"
           fi
 
   build-appliance:
@@ -1635,8 +1710,8 @@ jobs:
     # so it cannot live in the repo or a public registry -- SOL9_SPARC64_SYSROOT_URL points
     # at a private copy. Without it the job skips rather than failing, so forks still get a
     # green pipeline.
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.sol9 }}
-    needs: generate-version
+    if: needs.plan.outputs.sol9 == 'true'
+    needs: [generate-version, plan]
     runs-on: ubuntu-24.04
     # Deliberately NOT continue-on-error. It was, back when this job built GCC from source
     # and a mirror hiccup could redden a release for reasons unrelated to the code. It now
@@ -1753,8 +1828,8 @@ jobs:
     # Cheap (~2-3 min: DJGPP build + a FreeDOS fetch), so run it on every push
     # like the desktop builds. A manual run can untick "cbdos" to skip it; only
     # `release` (main-only) publishes.
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.cbdos }}
-    needs: generate-version
+    if: needs.plan.outputs.cbdos == 'true'
+    needs: [generate-version, plan]
     runs-on: ubuntu-24.04
     # Non-fatal like the other deployable-media jobs: a FreeDOS-mirror or DJGPP
     # hiccup shouldn't hold up the desktop release.
@@ -1808,8 +1883,8 @@ jobs:
   build-macos-vintage:
     name: Build rb-cli (macOS 10.7+ Intel, Rust 1.73)
     # Skipped only when a manual run unticks "desktop"; every push builds it.
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.desktop }}
-    needs: generate-version
+    if: needs.plan.outputs.macos-vintage == 'true'
+    needs: [generate-version, plan]
     # Pinned like build-macos (not `macos-latest`) for a deterministic image
     # during GitHub's macos-15 -> macos-26 migration. Any modern image works —
     # MACOSX_DEPLOYMENT_TARGET forces the 10.7 floor regardless of the host SDK.
@@ -1906,8 +1981,8 @@ jobs:
   # with the `windows-legacy` feature shimming the 0.58-vs-0.62 API diffs.
   build-windows-vintage:
     name: Build rb-cli (Windows 7/8 MSVC ${{ matrix.arch }}, Rust 1.73)
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.desktop }}
-    needs: generate-version
+    if: needs.plan.outputs.windows-vintage == 'true'
+    needs: [generate-version, plan]
     runs-on: windows-latest
     continue-on-error: true
     strategy:
@@ -2037,8 +2112,8 @@ jobs:
   # (flate2 rust_backend + pure-zstd), so every arch links cleanly.
   build-rb-cli-musl:
     name: Build rb-cli (static musl ${{ matrix.arch }} - any Linux)
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.desktop }}
-    needs: generate-version
+    if: needs.plan.outputs.musl == 'true'
+    needs: [generate-version, plan]
     runs-on: ${{ matrix.runs-on }}
     continue-on-error: true
     strategy:

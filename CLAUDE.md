@@ -59,6 +59,7 @@ only: `CARGO_PROFILE_DEV_DEBUG=2 cargo build` (or `cargo test`). Never put
 - GitHub Actions workflow: `.github/workflows/release.yml`
 - Builds for: Windows (x86/x64), macOS (arm64/x64), Linux (x64 AppImage)
 - Auto-release on push to main/master with generated version tag
+- Feature branches can build a subset: put `[ci: sol9,linux]` (or `[ci: none]`) in the head commit message, or a comma list in `.github/ci-targets` on the branch. main/master always build everything, and tag pushes don't run this workflow. Target names and groups are listed at the `plan` job in `release.yml`.
 - Artifacts: ZIP (Windows), DMG (macOS), AppImage (Linux)
 
 ### Update Checking
