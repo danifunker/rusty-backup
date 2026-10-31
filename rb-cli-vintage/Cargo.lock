@@ -834,6 +834,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs-adfs"
+version = "0.1.0"
+dependencies = [
+ "byteorder",
+ "disk-core",
+]
+
+[[package]]
 name = "fs-amiga"
 version = "0.1.0"
 dependencies = [
@@ -1617,6 +1625,7 @@ dependencies = [
  "filetime",
  "flate2",
  "fs-8bit",
+ "fs-adfs",
  "fs-amiga",
  "fs-apfs",
  "fs-apple2",

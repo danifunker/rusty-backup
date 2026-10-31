@@ -30,6 +30,7 @@ on:
       - "dsk-floppy-v*"
       - "dsk-vm-v*"
       - "dsk-ghost-v*"
+      - "fs-adfs-v*"
   workflow_dispatch:
     inputs:
       crate:
@@ -60,6 +61,7 @@ on:
           - dsk-floppy
           - dsk-vm
           - dsk-ghost
+          - fs-adfs
       dry_run:
         description: Package and verify only, do not upload
         required: true

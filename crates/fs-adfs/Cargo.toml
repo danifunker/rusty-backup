@@ -1,0 +1,20 @@
+[package]
+name = "fs-adfs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.73"
+license = "GPL-2.0-only"
+authors = ["Dani Sarfati <dani@funkervogt.com>"]
+description = "Read, edit, create and check Acorn ADFS / FileCore filesystems (new-map E / F / HD formats, old-map D format)"
+repository = "https://github.com/danifunker/rusty-backup"
+readme = "README.md"
+keywords = ["filesystem", "acorn", "adfs", "riscos", "retro"]
+categories = ["filesystem", "emulators"]
+
+[features]
+# Only for a Rust 1.73 toolchain; see disk-core.
+rust173-polyfill = ["disk-core/rust173-polyfill"]
+
+[dependencies]
+disk-core = { path = "../disk-core", version = "0.1", features = ["fs"] }
+byteorder = "1"
