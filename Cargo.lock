@@ -1782,6 +1782,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8b14ccef22fc6f5a8f4d7d768562a182c04ce9a3b3157b91390b52ddfdf1a76"
 
 [[package]]
+name = "dsk-clonezilla"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "byteorder",
+ "bzip2 0.6.1",
+ "disk-core",
+ "flate2",
+ "libzstd-bitexact-rs",
+ "log",
+ "lz4_flex",
+ "lzma-rs",
+ "tempfile",
+ "zstd 0.14.3",
+]
+
+[[package]]
 name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5739,6 +5756,7 @@ dependencies = [
  "des",
  "dirs",
  "disk-core",
+ "dsk-clonezilla",
  "eframe",
  "egui",
  "encoding_rs",

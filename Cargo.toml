@@ -113,7 +113,7 @@ native-zlib = ["flate2/zlib-ng"]
 # interchangeable. Slim build: `--no-default-features --features pure-zstd`.
 # The seekable-zstd cache (zeekstd) is C-only; the pure path full-decompresses
 # such caches to a tempfile instead of seeking. See docs/linux_486_build.md.
-native-zstd = ["dep:zstd"]
+native-zstd = ["dep:zstd", "dsk-clonezilla/native-zstd"]
 # Seekable-zstd random-access cache (zeekstd). Splits out from native-zstd so the
 # vintage macOS 10.7 build (Rust 1.73) can take the C `zstd` backend WITHOUT
 # zeekstd — every zeekstd release is edition 2024 (needs rustc >= 1.85). Requires
@@ -121,7 +121,7 @@ native-zstd = ["dep:zstd"]
 # `gui`; when off, browse_session full-decompresses a seekable cache instead of
 # random-accessing it. See src/model/browse_session.rs.
 seekable-zstd = ["dep:zeekstd", "native-zstd"]
-pure-zstd = ["dep:libzstd-bitexact-rs"]
+pure-zstd = ["dep:libzstd-bitexact-rs", "dsk-clonezilla/pure-zstd"]
 # eframe + egui only (no rfd/reqwest), used by the throwaway Commander Mode
 # layout mock: `cargo run --example commander_mock --features mock_gui`.
 mock_gui = ["dep:eframe", "dep:egui"]
@@ -182,7 +182,7 @@ windows-legacy = []
 # Do NOT enable on a modern toolchain: std's inherent is_multiple_of would then
 # collide with the polyfill trait. See crates/disk-core. Forwarded to every
 # extracted crate under crates/ (docs/crate_split_plan.md).
-rust173-polyfill = ["disk-core/rust173-polyfill", "fs-8bit/rust173-polyfill", "fs-cpm/rust173-polyfill", "fs-apple2/rust173-polyfill", "fs-qnx/rust173-polyfill", "fs-xerox/rust173-polyfill"]
+rust173-polyfill = ["disk-core/rust173-polyfill", "fs-8bit/rust173-polyfill", "fs-cpm/rust173-polyfill", "fs-apple2/rust173-polyfill", "fs-qnx/rust173-polyfill", "fs-xerox/rust173-polyfill", "dsk-clonezilla/rust173-polyfill"]
 # In-app self-update for `rb-cli update` (CLI + TUI). Pulls the reqwest client
 # (rustls, no OpenSSL). OFF by default and left OUT of the slim / appliance /
 # MiSTer builds so they link no networking; desktop packagers opt in. When the
@@ -197,6 +197,7 @@ fs-cpm = { path = "crates/fs-cpm" }
 fs-apple2 = { path = "crates/fs-apple2" }
 fs-qnx = { path = "crates/fs-qnx" }
 fs-xerox = { path = "crates/fs-xerox" }
+dsk-clonezilla = { path = "crates/dsk-clonezilla", default-features = false }
 # Full-screen TUI (`tui` feature). ratatui renders through crossterm, which is
 # already a non-optional dependency below, so this adds no new C/native code.
 ratatui = { version = "0.30", optional = true }

@@ -225,6 +225,10 @@ The crates already kept separately stay separate, because other projects share t
 3. **`fs-amiga`, `fs-unix`, `fs-xfs`, `fs-squashfs`, `fs-pc`, `fs-mac`, `fs-apfs`.** The big ones. The license-audit items get their handling here.
 4. **`part-tables`** (C5).
 5. **`dsk-*` and `dsk-clonezilla`** (C6, C7, C11). The upstream moves to libchdman-rs and opticaldiscs happen here.
+   - **`dsk-clonezilla` done early (2026-10-30)**, ahead of Step 3, because its co-author had agreed to MIT.
+     - `partclone`, `metadata`, `metadata_scan` and `block_cache` moved as-is. `metadata_scan` only depends on the other three, so it counts as format code: it finds FAT / NTFS / exFAT / ext / btrfs metadata blocks inside a partclone stream.
+     - C11: the crate has its own `native-zstd` (default) / `pure-zstd` features, which the app's features of the same names forward. It takes `bzip2`, `lz4_flex`, `lzma-rs` and `flate2` directly, with version ranges that cover both the modern and the 1.73 lockfiles.
+     - `src/clonezilla/mod.rs` is a `pub use dsk_clonezilla::*` shim.
 6. **`arc-mac`, `fs-tar`.**
 7. **Cleanup and docs.**
    - Remove the shims.

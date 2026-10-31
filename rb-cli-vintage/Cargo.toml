@@ -52,7 +52,7 @@ path = "../src/bin/rb_cli.rs"
 default = []
 # C libzstd, compiled from source by zstd-sys — honors MACOSX_DEPLOYMENT_TARGET,
 # unlike the CHD/optical *prebuilts*. MSRV 1.64, so it builds on 1.73.
-native-zstd = ["dep:zstd"]
+native-zstd = ["dep:zstd", "dsk-clonezilla/native-zstd"]
 # rb-cli serve daemon + rb:// refs. Pure std::net + serde_json, no extra dep.
 remote = []
 # Full-screen ratatui TUI. ratatui 0.29 (below) builds on 1.73; `ratatui-legacy`
@@ -63,7 +63,7 @@ ratatui-legacy = []
 # Std-API polyfills for Rust 1.73 (is_multiple_of etc.). Always on for the
 # vintage build — the whole engine (fs drivers) needs it, not just the TUI.
 # Forwarded to the extracted crates under ../crates/.
-rust173-polyfill = ["disk-core/rust173-polyfill", "fs-8bit/rust173-polyfill", "fs-cpm/rust173-polyfill", "fs-apple2/rust173-polyfill", "fs-qnx/rust173-polyfill", "fs-xerox/rust173-polyfill"]
+rust173-polyfill = ["disk-core/rust173-polyfill", "fs-8bit/rust173-polyfill", "fs-cpm/rust173-polyfill", "fs-apple2/rust173-polyfill", "fs-qnx/rust173-polyfill", "fs-xerox/rust173-polyfill", "dsk-clonezilla/rust173-polyfill"]
 # `--format yaml`. Enabled by the vintage build commands (see
 # .github/workflows/release.yml) so behaviour matches the desktop; it is a
 # feature only so the PowerPC mrustc build can drop it. See rb-cli-ppc.
@@ -88,6 +88,7 @@ fs-cpm = { path = "../crates/fs-cpm" }
 fs-apple2 = { path = "../crates/fs-apple2" }
 fs-qnx = { path = "../crates/fs-qnx" }
 fs-xerox = { path = "../crates/fs-xerox" }
+dsk-clonezilla = { path = "../crates/dsk-clonezilla", default-features = false }
 # --- TUI (pinned to the last 1.73-buildable line) ---
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"], optional = true }
 

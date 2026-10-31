@@ -61,11 +61,11 @@ path = "../src/bin/rb_cli.rs"
 
 [features]
 default = []
-native-zstd = ["dep:zstd"]
+native-zstd = ["dep:zstd", "dsk-clonezilla/native-zstd"]
 remote = []
 tui = ["dep:ratatui", "ratatui-legacy"]
 ratatui-legacy = []
-rust173-polyfill = ["disk-core/rust173-polyfill", "fs-8bit/rust173-polyfill", "fs-cpm/rust173-polyfill", "fs-apple2/rust173-polyfill", "fs-qnx/rust173-polyfill", "fs-xerox/rust173-polyfill"]
+rust173-polyfill = ["disk-core/rust173-polyfill", "fs-8bit/rust173-polyfill", "fs-cpm/rust173-polyfill", "fs-apple2/rust173-polyfill", "fs-qnx/rust173-polyfill", "fs-xerox/rust173-polyfill", "dsk-clonezilla/rust173-polyfill"]
 windows-legacy = []
 # Declared so the shared source's cfg resolves, but not in this build's feature list.
 yaml = ["dep:serde_yml"]
@@ -78,6 +78,7 @@ fs-cpm = { path = "../crates/fs-cpm" }
 fs-apple2 = { path = "../crates/fs-apple2" }
 fs-qnx = { path = "../crates/fs-qnx" }
 fs-xerox = { path = "../crates/fs-xerox" }
+dsk-clonezilla = { path = "../crates/dsk-clonezilla", default-features = false }
 # --- TUI (pinned to the last 1.73-buildable line) ---
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"], optional = true }
 

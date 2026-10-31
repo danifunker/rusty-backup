@@ -1,0 +1,36 @@
+[package]
+name = "dsk-clonezilla"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.73"
+license = "MIT"
+authors = ["Dani Sarfati <dani@funkervogt.com>", "Alan Steremberg <alan.steremberg@gmail.com>"]
+description = "Read Clonezilla backups: partclone images (zstd, gzip, bzip2, xz, lz4), image-folder metadata and a block cache"
+repository = "https://github.com/danifunker/rusty-backup"
+readme = "README.md"
+keywords = ["clonezilla", "partclone", "backup", "disk-image"]
+categories = ["filesystem", "parser-implementations"]
+
+[features]
+default = ["native-zstd"]
+# zstd backend: the C libzstd (fast) or the pure-Rust, bit-exact port (no C to cross-compile).
+native-zstd = ["dep:zstd"]
+pure-zstd = ["dep:libzstd-bitexact-rs"]
+# Only for a Rust 1.73 toolchain; see disk-core.
+rust173-polyfill = ["disk-core/rust173-polyfill"]
+
+[dependencies]
+disk-core = { path = "../disk-core", version = "0.1", default-features = false }
+anyhow = "1"
+byteorder = "1"
+log = "0.4"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# The lower bounds are what the Rust 1.73 builds resolve.
+bzip2 = ">=0.5.2, <0.7"
+lz4_flex = ">=0.10, <0.15"
+lzma-rs = "0.3.0"
+zstd = { version = ">=0.13, <0.15", optional = true }
+libzstd-bitexact-rs = { version = "0.157", optional = true }
+
+[dev-dependencies]
+tempfile = "3"

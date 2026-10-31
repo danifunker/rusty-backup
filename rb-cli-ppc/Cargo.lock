@@ -531,6 +531,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "dsk-clonezilla"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "byteorder",
+ "bzip2",
+ "disk-core",
+ "flate2",
+ "log",
+ "lz4_flex",
+ "lzma-rs",
+ "zstd",
+]
+
+[[package]]
 name = "either"
 version = "1.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1224,6 +1239,7 @@ dependencies = [
  "csv",
  "dirs",
  "disk-core",
+ "dsk-clonezilla",
  "encoding_rs",
  "env_logger",
  "filetime",

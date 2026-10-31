@@ -9,7 +9,7 @@
 //! Split out of `block_cache.rs` per §7 of `docs/codecleanup.md`.
 
 #[cfg(feature = "rust173-polyfill")]
-use crate::rust173_compat::IntIsMultipleOf as _;
+use disk_core::rust173::IntIsMultipleOf as _;
 use std::collections::{BTreeSet, VecDeque};
 use std::io::Read;
 use std::path::Path;

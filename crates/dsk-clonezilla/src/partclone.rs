@@ -1,5 +1,5 @@
 #[cfg(feature = "rust173-polyfill")]
-use crate::rust173_compat::IntIsMultipleOf as _;
+use disk_core::rust173::IntIsMultipleOf as _;
 use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::path::PathBuf;
@@ -112,7 +112,7 @@ impl Read for MultiPartReader {
             }
 
             let file = File::open(&self.files[self.current_index]).map_err(|e| {
-                crate::compat::io_other(format!(
+                disk_core::io_other(format!(
                     "failed to open {}: {e}",
                     self.files[self.current_index].display()
                 ))
@@ -135,8 +135,7 @@ fn open_decompressed(multi: MultiPartReader) -> Result<Box<dyn Read + Send>> {
     Ok(if starts(b"partclone-image") {
         Box::new(buffered)
     } else if starts(&[0x28, 0xB5, 0x2F, 0xFD]) {
-        crate::rbformats::zstd_compat::decoder(buffered)
-            .context("failed to create zstd decoder for partclone")?
+        crate::zstd_decoder(buffered).context("failed to create zstd decoder for partclone")?
     } else if starts(&[0x1F, 0x8B]) {
         Box::new(flate2::read::MultiGzDecoder::new(buffered))
     } else if starts(b"BZh") {
@@ -168,7 +167,7 @@ impl io::Write for ChannelWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.0
             .send(Ok(buf.to_vec()))
-            .map_err(|_| crate::compat::io_other("xz reader dropped"))?;
+            .map_err(|_| disk_core::io_other("xz reader dropped"))?;
         Ok(buf.len())
     }
     fn flush(&mut self) -> io::Result<()> {
@@ -182,7 +181,7 @@ impl XzPipeReader {
         std::thread::spawn(move || {
             let mut out = io::BufWriter::with_capacity(1 << 20, ChannelWriter(tx.clone()));
             let res = lzma_rs::xz_decompress(&mut src, &mut out)
-                .map_err(|e| crate::compat::io_other(format!("xz decode failed: {e}")))
+                .map_err(|e| disk_core::io_other(format!("xz decode failed: {e}")))
                 .and_then(|_| io::Write::flush(&mut out));
             if let Err(e) = res {
                 let _ = tx.send(Err(e));

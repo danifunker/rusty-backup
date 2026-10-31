@@ -13,6 +13,7 @@ on:
       - "fs-cpm-v*"
       - "fs-qnx-v*"
       - "fs-xerox-v*"
+      - "dsk-clonezilla-v*"
   workflow_dispatch:
     inputs:
       crate:
@@ -26,6 +27,7 @@ on:
           - fs-cpm
           - fs-qnx
           - fs-xerox
+          - dsk-clonezilla
       dry_run:
         description: Package and verify only, do not upload
         required: true
