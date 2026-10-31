@@ -2534,7 +2534,7 @@ dependencies = [
  "libzstd-bitexact-rs",
  "tar",
  "tempfile",
- "zstd 0.13.3",
+ "zstd 0.14.3",
 ]
 
 [[package]]
