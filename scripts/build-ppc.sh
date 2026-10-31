@@ -296,6 +296,19 @@ apply_vendor_patches() {
   "$RB_DIR/scripts/apply-vendor-patches.py" --vendor-dir "$VENDOR_DIR"
 }
 
+# minicargo has no `[patch]` support, so hide those tables from it for the run;
+# the qnx2fs vendor patch points that dependency at crates/disk-core instead.
+minicargo_run() {
+  local m="$CRATE_DIR/Cargo.toml" saved="$CRATE_DIR/Cargo.toml.with-patch" rc=0
+  [ -f "$saved" ] && mv -f "$saved" "$m"   # left behind by a killed run
+  cp -p "$m" "$saved"
+  awk '/^\[/ { skip = /^\[patch\./ } !skip' "$saved" > "$m"
+  touch -r "$saved" "$m"                   # minicargo is mtime-driven
+  bin/minicargo "$@" || rc=$?
+  mv -f "$saved" "$m"
+  return "$rc"
+}
+
 # ---- stage 5: transpile+compile the engine for the HOST (native proof) ------
 stage_host() {
   banner "5. transpile+build rb-cli for the HOST (native $HOST_ARCH proof)"
@@ -304,7 +317,7 @@ stage_host() {
   apply_vendor_patches
   mkdir -p "$HOST_OUT"
   MRUSTC_TARGET_VER="$MRUSTC_TARGET_VER" \
-    bin/minicargo "$CRATE_DIR" \
+    minicargo_run "$CRATE_DIR" \
       --vendor-dir "$VENDOR_DIR" \
       -L "$HOST_LIBS" \
       --output-dir "$HOST_OUT" \
@@ -331,7 +344,7 @@ stage_hostc() {
   apply_vendor_patches
   mkdir -p "$HOSTC_OUT"
   MRUSTC_TARGET_VER="$MRUSTC_TARGET_VER" MINICARGO_DEFER_CODEGEN=1 \
-    bin/minicargo "$CRATE_DIR" \
+    minicargo_run "$CRATE_DIR" \
       --vendor-dir "$VENDOR_DIR" \
       -L "$HOST_LIBS" \
       --output-dir "$HOSTC_OUT" \
@@ -508,7 +521,7 @@ stage_ppc() {
   apply_vendor_patches
   mkdir -p "$PPC_OUT"
   MRUSTC_TARGET_VER="$MRUSTC_TARGET_VER" MINICARGO_DEFER_CODEGEN=1 \
-    bin/minicargo "$CRATE_DIR" \
+    minicargo_run "$CRATE_DIR" \
       --vendor-dir "$VENDOR_DIR" \
       -L "$PPC_LIBS" \
       --output-dir "$PPC_OUT" \

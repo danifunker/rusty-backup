@@ -180,6 +180,19 @@ apply_vendor_patches() {
   "$RB_DIR/scripts/apply-vendor-patches.py" --vendor-dir "$VENDOR_DIR"
 }
 
+# minicargo has no `[patch]` support, so hide those tables from it for the run;
+# the qnx2fs vendor patch points that dependency at crates/disk-core instead.
+minicargo_run() {
+  local m="$CRATE_DIR/Cargo.toml" saved="$CRATE_DIR/Cargo.toml.with-patch" rc=0
+  [ -f "$saved" ] && mv -f "$saved" "$m"   # left behind by a killed run
+  cp -p "$m" "$saved"
+  awk '/^\[/ { skip = /^\[patch\./ } !skip' "$saved" > "$m"
+  touch -r "$saved" "$m"                   # minicargo is mtime-driven
+  bin/minicargo "$@" || rc=$?
+  mv -f "$saved" "$m"
+  return "$rc"
+}
+
 # ---- stage: sol9libs --------------------------------------------------------
 # minicargo.mk LIBS does not self-rebuild: delete $SOL9_LIBS after an mrustc codegen change.
 stage_sol9libs() {
@@ -208,7 +221,7 @@ stage_hostc() {
   apply_vendor_patches
   mkdir -p "$HOSTC_OUT"
   MINICARGO_DEFER_CODEGEN=1 \
-    bin/minicargo "$CRATE_DIR" \
+    minicargo_run "$CRATE_DIR" \
       --vendor-dir "$VENDOR_DIR" \
       -L "$HOST_LIBS" \
       --output-dir "$HOSTC_OUT" \
@@ -227,7 +240,7 @@ stage_sol9() {
   cd "$MRUSTC_DIR"
   apply_vendor_patches
   mkdir -p "$SOL9_OUT"
-  bin/minicargo "$CRATE_DIR" \
+  minicargo_run "$CRATE_DIR" \
     --vendor-dir "$VENDOR_DIR" \
     -L "$SOL9_LIBS" \
     --output-dir "$SOL9_OUT" \
