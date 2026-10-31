@@ -72,6 +72,8 @@ only: `CARGO_PROFILE_DEV_DEBUG=2 cargo build` (or `cargo test`). Never put
 
 The codebase separates GUI from core logic with these major modules:
 
+- **`crates/`** - The reusable format code, split out of the app as a Cargo workspace (`docs/crate_split_plan.md`): `disk-core` (the `Filesystem` trait, `FileEntry`, shared helpers, 1.73 shims), the filesystem families (`fs-*`), `part-tables`, and the disk-image containers (`dsk-*`). Each is MIT unless its code is derived from GPL / LGPL / BSD-4 sources (`fs-xfs`, `fs-hpfs`, `fs-adfs`, `fs-mac-unicode`, `fs-amiga`); see `docs/license_audit.md`. The matching `src/fs/*.rs`, `src/partition/*.rs` and `src/rbformats/*.rs` files are one-line re-export shims until Step 7, so app paths still work; new format code goes into a crate, and app glue (dispatch, backup / restore, resize, builders) stays in `src/`. `scripts/test-crates-msrv.sh` runs every crate's tests on Rust 1.73.
+
 - **`gui/`** - egui/eframe UI layer with tabs (Backup, Restore, Inspect), progress indicators, log panel, version display, and update notifications. Long-running disk operations run on separate threads to keep the UI responsive.
 - **`partition/`** - MBR and GPT partition table parsing, export, alignment detection, `PartitionSizeOverride` for resize/restore, and `patch_mbr_entries`/`lba_to_chs` for MBR patching.
 - **`fs/`** - Trait-based filesystem abstraction (`Filesystem` trait in `filesystem.rs`, `FileEntry` in `entry.rs`). FAT12/16/32 implementation in `fat.rs` includes browsing, `CompactFatReader` for smart compaction, and in-place resize/validation/BPB patching. Factory functions in `mod.rs` route by partition type byte. See `src/fs/README.md`.
