@@ -78,6 +78,8 @@ pub struct ArchivesTab {
     archive_path: Option<PathBuf>,
     prev_path: Option<PathBuf>,
     loaded: Option<Loaded>,
+    /// Opening and decoding the picked archive.
+    load_job: Option<rusty_backup::model::job::Job<Result<Loaded, String>>>,
     load_error: Option<String>,
     format: ForkFormat,
     output_dir: Option<PathBuf>,
@@ -94,6 +96,7 @@ impl Default for ArchivesTab {
             archive_path: None,
             prev_path: None,
             loaded: None,
+            load_job: None,
             load_error: None,
             format: ForkFormat::BinHex,
             output_dir: None,
@@ -104,26 +107,53 @@ impl Default for ArchivesTab {
 }
 
 impl ArchivesTab {
+    /// Open and decode the picked archive as a job; a large one no longer freezes the tab.
     fn load(&mut self) {
         self.loaded = None;
         self.load_error = None;
+        self.load_job = None;
         let Some(path) = self.archive_path.clone() else {
             return;
         };
-        match extract::open(&path) {
-            Ok((bytes, archive)) => {
-                let file_count = archive.entries.iter().filter(|e| !e.is_dir).count();
-                let mountable = sniff_mountable_payload(&bytes, &archive);
-                let selected = vec![true; archive.entries.len()];
-                self.loaded = Some(Loaded {
-                    bytes: Arc::new(bytes),
-                    archive: Arc::new(archive),
-                    file_count,
-                    mountable,
-                    selected,
-                });
-            }
-            Err(e) => self.load_error = Some(format!("{e}")),
+        self.load_job = Some(rusty_backup::model::job::Job::spawn(
+            "Reading the archive...",
+            Arc::new(super::ui_logger::EguiWake),
+            move |job| {
+                job.set_can_cancel(false);
+                Ok(match extract::open(&path) {
+                    Ok((bytes, archive)) => {
+                        let file_count = archive.entries.iter().filter(|e| !e.is_dir).count();
+                        let mountable = sniff_mountable_payload(&bytes, &archive);
+                        let selected = vec![true; archive.entries.len()];
+                        Ok(Loaded {
+                            bytes: Arc::new(bytes),
+                            archive: Arc::new(archive),
+                            file_count,
+                            mountable,
+                            selected,
+                        })
+                    }
+                    Err(e) => Err(format!("{e}")),
+                })
+            },
+        ));
+    }
+
+    fn poll_load_job(&mut self) {
+        use rusty_backup::model::job::Status;
+        let Some(job) = &self.load_job else {
+            return;
+        };
+        let snap = job.snapshot();
+        if snap.is_running() {
+            return;
+        }
+        let out = job.take_result();
+        self.load_job = None;
+        match (snap.status, out) {
+            (Status::Done, Some(Ok(loaded))) => self.loaded = Some(loaded),
+            (Status::Done, Some(Err(e))) | (Status::Failed(e), _) => self.load_error = Some(e),
+            _ => {}
         }
     }
 
@@ -154,6 +184,7 @@ impl ArchivesTab {
     pub fn close(&mut self) {
         self.archive_path = None;
         self.prev_path = None;
+        self.load_job = None;
         self.loaded = None;
         self.load_error = None;
     }
@@ -324,6 +355,10 @@ impl ArchivesTab {
         if self.archive_path != self.prev_path {
             self.prev_path = self.archive_path.clone();
             self.load();
+        }
+        self.poll_load_job();
+        if let Some(job) = &self.load_job {
+            super::progress::show_job(ui, &job.snapshot());
         }
 
         if let Some(err) = &self.load_error {

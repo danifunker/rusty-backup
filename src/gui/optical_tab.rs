@@ -70,6 +70,11 @@ pub struct OpticalTab {
     recent_files: Vec<String>,
     image_file_path: Option<PathBuf>,
     disc_info: Option<DiscImageInfo>,
+    /// Detecting the disc's format and filesystem; `true` reopens the browse view once it lands.
+    detect_job: Option<(
+        rusty_backup::model::job::Job<Result<DiscImageInfo, String>>,
+        bool,
+    )>,
     disc_info_error: Option<String>,
     action: Action,
     output_format: OutputFormat,
@@ -108,6 +113,7 @@ impl Default for OpticalTab {
             recent_files: super::load_recent(rusty_backup::update::RecentMode::Optical),
             image_file_path: None,
             disc_info: None,
+            detect_job: None,
             disc_info_error: None,
             action: Action::Rip,
             output_format: OutputFormat::Iso,
@@ -385,6 +391,7 @@ impl OpticalTab {
         self.poll_progress(log, progress);
         self.poll_add_remote(log);
         self.poll_drives_job(log);
+        self.poll_detect_job(log);
     }
 
     pub fn show(
@@ -553,7 +560,7 @@ impl OpticalTab {
                 self.browse_view.close();
                 self.prev_drive_idx = self.selected_drive_idx;
                 self.prev_image_path = self.image_file_path.clone();
-                self.detect_disc_info(log);
+                self.detect_disc_info(was_browsing);
                 // Load CD-DA tracks for the in-app player. Only local CHD /
                 // BIN-CUE image files are supported; other sources clear it.
                 #[cfg(feature = "audio")]
@@ -561,16 +568,16 @@ impl OpticalTab {
                     Some(path) => self.audio.set_disc(&path),
                     None => self.audio.clear(),
                 }
-                if was_browsing && self.disc_info.is_some() {
-                    if let Some(path) = self.get_browsable_path() {
-                        self.open_browse(&path);
-                    }
-                }
             }
         }
 
+        self.poll_detect_job(log);
+
         // ── Disc info display ───────────────────────────────────────────────
         ui.add_space(4.0);
+        if let Some((job, _)) = &self.detect_job {
+            super::progress::show_job(ui, &job.snapshot());
+        }
         ui.horizontal(|ui| {
             ui.label("Disc Info:");
             if let Some(info) = &self.disc_info {
@@ -870,25 +877,54 @@ impl OpticalTab {
         self.audio.clear();
     }
 
-    fn detect_disc_info(&mut self, log: &mut LogStore) {
+    /// Detect the disc as a job (reading a drive can take seconds); `reopen_browse` reopens the browse view after.
+    fn detect_disc_info(&mut self, reopen_browse: bool) {
         self.disc_info = None;
         self.disc_info_error = None;
+        self.detect_job = None;
 
         let path = match self.get_browsable_path() {
             Some(p) => p,
             None => return,
         };
 
-        // A drive is not a file: `DiscImageInfo::open` sniffs a container format
-        // from the path and opens it as one, and on macOS the buffered
-        // /dev/diskN node is EBUSY while the disc is mounted. `open_physical`
-        // reads the raw node as flat cooked sectors instead, which is what a
-        // data CD / DVD / Blu-ray actually is.
-        let probe = match self.source_mode {
-            SourceMode::PhysicalDrive => DiscImageInfo::open_physical(&path),
-            SourceMode::ImageFile => DiscImageInfo::open(&path),
-        };
+        // A drive is not a file: `open_physical` reads the raw node as flat cooked sectors,
+        // since the buffered /dev/diskN node is EBUSY on macOS while the disc is mounted.
+        let physical = matches!(self.source_mode, SourceMode::PhysicalDrive);
+        let job = rusty_backup::model::job::Job::spawn(
+            "Detecting the disc...",
+            Arc::new(super::ui_logger::EguiWake),
+            move |job| {
+                job.set_can_cancel(false);
+                let probe = if physical {
+                    DiscImageInfo::open_physical(&path)
+                } else {
+                    DiscImageInfo::open(&path)
+                };
+                Ok(probe.map_err(|e| e.to_string()))
+            },
+        );
+        self.detect_job = Some((job, reopen_browse));
+    }
 
+    fn poll_detect_job(&mut self, log: &mut LogStore) {
+        use rusty_backup::model::job::Status;
+        let Some((job, _)) = &self.detect_job else {
+            return;
+        };
+        let snap = job.snapshot();
+        if snap.is_running() {
+            return;
+        }
+        let out = job.take_result();
+        let Some((_, reopen_browse)) = self.detect_job.take() else {
+            return;
+        };
+        let probe = match (snap.status, out) {
+            (Status::Done, Some(probe)) => probe,
+            (Status::Failed(e), _) => Err(e),
+            _ => return,
+        };
         match probe {
             Ok(info) => {
                 log.info(format!(
@@ -904,6 +940,11 @@ impl OpticalTab {
                     ));
                 }
                 self.disc_info = Some(info);
+                if reopen_browse {
+                    if let Some(path) = self.get_browsable_path() {
+                        self.open_browse(&path);
+                    }
+                }
             }
             Err(e) => {
                 let msg = format!("Failed to detect disc info: {e}");
