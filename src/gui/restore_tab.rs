@@ -8,7 +8,7 @@ use rusty_backup::model::disk_builder::DiskBuilder;
 use rusty_backup::model::physical_write_runner::PhysicalWriteStatus;
 use rusty_backup::model::provision_runner::{self, ProvisionRequest};
 use rusty_backup::model::size_mode::SizeMode;
-use rusty_backup::partition::{PartitionInfo, PartitionTable};
+use rusty_backup::partition::PartitionInfo;
 
 use super::partition_bar::{PartitionBar, Segment, SegmentKind};
 use super::size_mode_row::{size_mode_row, SizeModeRowOptions};
@@ -171,6 +171,11 @@ pub struct RestoreTab {
     sp_target_device_idx: Option<usize>,
     /// Scanned target partition table
     sp_target_partitions: Vec<PartitionInfo>,
+    /// A running target scan: the device's identity, and the job reading its table.
+    sp_target_scan: Option<(
+        rusty_backup::device::DeviceIdentity,
+        rusty_backup::model::job::Job<TargetScan>,
+    )>,
     /// Identity of the device `sp_target_partitions` was scanned from.
     sp_target_identity: Option<rusty_backup::device::DeviceIdentity>,
     /// Which target partition to overwrite
@@ -257,6 +262,7 @@ impl Default for RestoreTab {
             sp_source_partition_idx: None,
             sp_target_device_idx: None,
             sp_target_partitions: Vec::new(),
+            sp_target_scan: None,
             sp_target_identity: None,
             sp_target_partition_idx: None,
             sp_scan_error: None,
@@ -366,6 +372,7 @@ impl RestoreTab {
         self.poll_remote(ctx);
         self.poll_build(ctx);
         self.poll_sp_pending_image();
+        self.poll_target_scan(ctx);
     }
 
     /// Set the single-partition source image, or start decoding it.
@@ -395,6 +402,7 @@ impl RestoreTab {
 
     pub fn show(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext, progress: &mut ProgressState) {
         self.poll_sp_pending_image();
+        self.poll_target_scan(ctx);
         if let Some(pending) = &self.sp_pending_image {
             pending.show(ui);
         }
@@ -1156,7 +1164,10 @@ impl RestoreTab {
                         }
                     });
 
-                if self.sp_target_device_idx.is_some() && ui.button("Scan Target").clicked() {
+                if let Some((_, job)) = &self.sp_target_scan {
+                    super::progress::show_job(ui, &job.snapshot());
+                } else if self.sp_target_device_idx.is_some() && ui.button("Scan Target").clicked()
+                {
                     self.scan_target_partitions(ctx);
                 }
             });
@@ -1262,6 +1273,7 @@ impl RestoreTab {
     }
 
     /// Scan the target device's partition table (requires elevation for devices).
+    /// Read the target device's partition table off the UI thread (it may prompt for credentials).
     fn scan_target_partitions(&mut self, ctx: &mut TabContext) {
         self.sp_target_partitions.clear();
         self.sp_target_partition_idx = None;
@@ -1280,32 +1292,53 @@ impl RestoreTab {
             "Scanning target partitions on {}...",
             device.path.display()
         ));
+        let path = device.path.clone();
+        let job = rusty_backup::model::job::Job::spawn(
+            "Scanning the target",
+            Arc::new(super::ui_logger::EguiWake),
+            move |job| {
+                Ok(rusty_backup::model::source_scan::read_device_table(
+                    &path, job,
+                ))
+            },
+        );
+        self.sp_target_scan = Some((device.identity(), job));
+    }
 
-        match rusty_backup::os::open_source_for_reading(&device.path) {
-            Ok(elevated) => {
-                let (file, _guard) = elevated.into_parts();
-                // A device cannot answer seek(End); carry the length the OS reports instead.
-                let mut reader = rusty_backup::os::known_len_source(file, &device.path);
-                match PartitionTable::detect(&mut reader) {
-                    Ok(table) => {
-                        self.sp_target_partitions = table.partitions();
-                        self.sp_target_identity = Some(device.identity());
-                        ctx.log.info(format!(
-                            "Found {} partition(s) on target ({})",
-                            self.sp_target_partitions.len(),
-                            table.type_name(),
-                        ));
-                    }
-                    Err(e) => {
-                        self.sp_scan_error = Some(format!("Could not read partition table: {e}"));
-                        ctx.log.error(format!("Target scan failed: {e}"));
-                    }
+    fn poll_target_scan(&mut self, ctx: &mut TabContext) {
+        use rusty_backup::model::job::Status;
+        let Some((_, job)) = &self.sp_target_scan else {
+            return;
+        };
+        let snap = job.snapshot();
+        if snap.is_running() {
+            return;
+        }
+        let out = job.take_result();
+        let Some((identity, _)) = self.sp_target_scan.take() else {
+            return;
+        };
+        match (snap.status, out) {
+            (Status::Done, Some(Ok((partitions, type_name)))) => {
+                self.sp_target_partitions = partitions;
+                self.sp_target_identity = Some(identity);
+                ctx.log.info(format!(
+                    "Found {} partition(s) on target ({})",
+                    self.sp_target_partitions.len(),
+                    type_name,
+                ));
+            }
+            (Status::Done, Some(Err(f))) => {
+                if let Some(msg) = f.log_error {
+                    ctx.log.error(msg);
                 }
+                self.sp_scan_error = Some(f.load_error);
             }
-            Err(e) => {
-                self.sp_scan_error = Some(format!("Cannot access device: {e}"));
-                ctx.log.error(format!("Cannot access target device: {e}"));
+            (Status::Failed(e), _) => {
+                ctx.log.error(format!("Target scan failed: {e}"));
+                self.sp_scan_error = Some(e);
             }
+            _ => {}
         }
     }
 
@@ -3142,3 +3175,7 @@ impl RestoreTab {
         }
     }
 }
+
+/// A restore-target scan's result: the partitions and table name, or why it failed.
+type TargetScan =
+    Result<(Vec<PartitionInfo>, String), rusty_backup::model::source_scan::ScanFailure>;

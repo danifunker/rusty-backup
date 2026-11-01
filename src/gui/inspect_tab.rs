@@ -247,6 +247,8 @@ pub struct InspectTab {
     table_apply_job: Option<rusty_backup::model::job::Job<TableApply>>,
     /// A running Make Bootable step (assess, then write).
     bootable_job: Option<rusty_backup::model::job::Job<BootStep>>,
+    /// Loading a backup folder's metadata (or a Clonezilla image's headers).
+    backup_load_job: Option<rusty_backup::model::job::Job<BackupLoad>>,
     /// Context for pending repair: (offset, ptype, type_string).
     repair_context: Option<(u64, u8, Option<String>)>,
     /// "Expand HFS Volume…" dialog (classic HFS only).
@@ -345,6 +347,7 @@ impl Default for InspectTab {
             fsck_job: None,
             table_apply_job: None,
             bootable_job: None,
+            backup_load_job: None,
             repair_context: None,
             expand_hfs_dialog: None,
             alto_resize_dialog: None,
@@ -522,6 +525,7 @@ impl InspectTab {
         self.poll_cache_status(ctx);
         self.poll_fsck_job(ctx);
         self.poll_table_apply_job(ctx);
+        self.poll_backup_load_job(ctx);
     }
 
     /// The running Inspect job other tabs must wait for (export, expand, repack, resize, ...), if any.
@@ -850,6 +854,10 @@ impl InspectTab {
         self.render_fsck_job(ui);
         self.poll_table_apply_job(ctx);
         self.poll_bootable_job(ctx);
+        self.poll_backup_load_job(ctx);
+        if let Some(job) = &self.backup_load_job {
+            super::progress::show_job(ui, &job.snapshot());
+        }
         self.render_disk_write_jobs(ui);
 
         // Background workers (min-size + volume-label probes) finish off the
@@ -2958,15 +2966,39 @@ impl InspectTab {
 
         ctx.log
             .info(format!("Loading backup folder {}...", folder.display()));
-        match rusty_backup::model::backup_loader::load_backup(&folder) {
-            Ok(rusty_backup::model::backup_loader::LoadOutcome::Backup(out)) => {
-                self.apply_backup_outcome(out, ctx);
-            }
-            Ok(rusty_backup::model::backup_loader::LoadOutcome::Clonezilla(out)) => {
-                self.apply_clonezilla_outcome(out, ctx);
-            }
-            Err(e) => {
-                let msg = format!("{e:#}");
+        // Reading metadata and partclone headers can be slow on a share or a card, so it runs as a job.
+        self.backup_load_job = Some(rusty_backup::model::job::Job::spawn(
+            "Loading the backup...",
+            Arc::new(super::ui_logger::EguiWake),
+            move |job| {
+                job.set_can_cancel(false);
+                Ok(rusty_backup::model::backup_loader::load_backup(&folder)
+                    .map_err(|e| format!("{e:#}")))
+            },
+        ));
+    }
+
+    fn poll_backup_load_job(&mut self, ctx: &mut TabContext) {
+        use rusty_backup::model::backup_loader::LoadOutcome;
+        use rusty_backup::model::job::Status;
+        let Some(job) = &self.backup_load_job else {
+            return;
+        };
+        let snap = job.snapshot();
+        if snap.is_running() {
+            return;
+        }
+        let out = job.take_result();
+        self.backup_load_job = None;
+        let result = match (snap.status, out) {
+            (Status::Done, Some(result)) => result,
+            (Status::Failed(e), _) => Err(e),
+            _ => return,
+        };
+        match result {
+            Ok(LoadOutcome::Backup(out)) => self.apply_backup_outcome(out, ctx),
+            Ok(LoadOutcome::Clonezilla(out)) => self.apply_clonezilla_outcome(out, ctx),
+            Err(msg) => {
                 ctx.log.error(&msg);
                 self.last_error = Some(msg);
             }
@@ -6048,6 +6080,9 @@ enum BootStep {
     ),
     Written(Result<rusty_backup::fs::make_bootable::MakeBootableReport, String>),
 }
+
+/// A backup folder's load result, or why it failed.
+type BackupLoad = Result<rusty_backup::model::backup_loader::LoadOutcome, String>;
 
 /// A partition-table write's result: the engine's messages, and its error text.
 type TableApply = (Vec<String>, Result<(), String>);

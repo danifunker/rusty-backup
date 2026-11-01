@@ -126,6 +126,29 @@ pub fn scan_source(path: &Path, is_device: bool, ctx: &JobCtx) -> anyhow::Result
     })
 }
 
+/// Read just the partition table of a device (elevating to open it), for picking a restore target.
+pub fn read_device_table(
+    path: &Path,
+    ctx: &JobCtx,
+) -> Result<(Vec<PartitionInfo>, String), ScanFailure> {
+    ctx.set_phase("Opening device (may ask for administrator credentials)...");
+    let file = crate::os::open_source_for_reading(path)
+        .map_err(|e| ScanFailure {
+            load_error: format!("Cannot access device: {e}"),
+            log_error: Some(format!("Cannot access target device: {e}")),
+        })?
+        .into_parts()
+        .0;
+    ctx.set_phase("Reading the partition table...");
+    // A device cannot answer seek(End); carry the length the OS reports instead.
+    let mut reader = crate::os::known_len_source(file, path);
+    let table = PartitionTable::detect(&mut reader).map_err(|e| ScanFailure {
+        load_error: format!("Could not read partition table: {e}"),
+        log_error: Some(format!("Target scan failed: {e}")),
+    })?;
+    Ok((table.partitions(), table.type_name().to_string()))
+}
+
 /// The automatic preview of an image file: detect its container, the table inside, and size each partition.
 pub fn scan_image(path: &Path, ctx: &JobCtx) -> anyhow::Result<SourceScan> {
     let file = File::open(path).map_err(|e| failure(format!("Cannot open source: {e}"), None))?;
