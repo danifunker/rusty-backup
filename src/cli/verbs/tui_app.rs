@@ -4687,107 +4687,25 @@ impl App {
     /// Export the selection to a host directory (already validated by the
     /// picker), in the format chosen from the Export-as menu: a single file
     /// (fork modes), a `.tar[.gz]` archive, or a `.mar`.
+    /// Export the selection to a host directory as a task; the Explorer rides along and comes back.
     fn explorer_export(&mut self, dest: &std::path::Path) {
-        let result = (|| -> anyhow::Result<String> {
-            let ex = self
-                .explorer
-                .as_mut()
-                .ok_or_else(|| anyhow::anyhow!("no explorer"))?;
-            let entry = ex
-                .selected_entry()
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("nothing selected"))?;
-            if !dest.is_dir() {
-                anyhow::bail!("not a directory: {}", dest.display());
-            }
-            let name = entry.name.clone();
-            let is_dir = matches!(entry.entry_type, EntryType::Directory);
-            match ex.export_fmt {
-                ExportFormat::Fork(mode) => {
-                    if is_dir {
-                        anyhow::bail!("that format exports a single file, not a directory");
-                    }
-                    let n = fs_mac::fork_export::export_file_with_fork(
-                        &mut *ex.fs,
-                        &entry,
-                        dest,
-                        &name,
-                        mode,
-                    )?;
-                    Ok(format!(
-                        "Exported {name} ({}) to {}",
-                        format_size(n),
-                        dest.display()
-                    ))
-                }
-                ExportFormat::Archive(fmt) => {
-                    // The whole selection into one archive via the shared engine:
-                    // every Space-marked row (a marked folder walks recursively),
-                    // or the highlighted entry when nothing is marked.
-                    use crate::fs::export_selection::{export_to_file, export_to_folder};
-                    let entries: Vec<FileEntry> = if ex.marked.is_empty() {
-                        vec![entry.clone()]
-                    } else {
-                        ex.marked_entries()
-                    };
-                    if entries.is_empty() {
-                        anyhow::bail!("nothing selected");
-                    }
-                    let noop = |_: &str, _: usize, _: u64| {};
-                    let nocancel = || false;
-                    if fmt.is_single_file() {
-                        let ext = fmt
-                            .file_extension()
-                            .map(|e| format!(".{e}"))
-                            .unwrap_or_default();
-                        // The root node has no name of its own; "/.tar.gz" at
-                        // the destination's root is not what anyone asked for.
-                        let out_name = match entries.as_slice() {
-                            [only] if !only.name.trim_matches('/').is_empty() => {
-                                format!("{}{ext}", only.name)
-                            }
-                            [_] => format!("volume{ext}"),
-                            _ => format!("selection{ext}"),
-                        };
-                        let out_path = dest.join(&out_name);
-                        let summary = export_to_file(
-                            &mut *ex.fs,
-                            &entries,
-                            &out_path,
-                            fmt,
-                            &noop,
-                            &nocancel,
-                        )?;
-                        Ok(format!(
-                            "Exported {} item(s) to {}",
-                            summary.files,
-                            out_path.display()
-                        ))
-                    } else {
-                        let summary = export_to_folder(
-                            &mut *ex.fs,
-                            &entries,
-                            dest,
-                            fmt,
-                            RfMode::AppleDouble,
-                            &noop,
-                            &nocancel,
-                        )?;
-                        Ok(format!(
-                            "Exported {} item(s) to {}",
-                            summary.files,
-                            dest.display()
-                        ))
-                    }
-                }
-            }
-        })();
-        if let Some(ex) = self.explorer.as_mut() {
-            ex.status = Some(match result {
-                Ok(msg) => msg,
-                Err(e) => format!("Export failed: {e}"),
-            });
+        if self.task.is_some() {
+            return;
         }
+        let Some(mut ex) = self.explorer.take() else {
+            return;
+        };
+        let dest = dest.to_path_buf();
+        self.start_task("Exporting", move |job| {
+            let result = export_explorer_selection(&mut ex, &dest, job);
+            Ok(Box::new(move |app: &mut App| {
+                ex.status = Some(match result {
+                    Ok(msg) => msg,
+                    Err(e) => format!("Export failed: {e}"),
+                });
+                app.explorer = Some(ex);
+            }) as TaskDone)
+        });
     }
 
     /// Open the selected file in the in-app editor.
@@ -4919,34 +4837,41 @@ impl App {
             ),
             None => return,
         };
-        match import_host_file(&image_path, selector.clone(), &cur_path, host, on_conflict) {
-            Ok(ImportOutcome::Exists(leaf)) => {
-                // Ask rather than refuse. The answer comes back through
-                // `explorer_import_with` with an explicit choice.
-                if let Some(ex) = self.explorer.as_mut() {
-                    ex.confirm_overwrite = Some((host.to_path_buf(), leaf));
+        let host = host.to_path_buf();
+        self.start_task("Importing", move |job| {
+            job.set_can_cancel(false);
+            let outcome =
+                import_host_file(&image_path, selector.clone(), &cur_path, &host, on_conflict)
+                    .map_err(|e| e.to_string());
+            Ok(Box::new(move |app: &mut App| match outcome {
+                Ok(ImportOutcome::Exists(leaf)) => {
+                    // Ask rather than refuse. The answer comes back through
+                    // `explorer_import_with` with an explicit choice.
+                    if let Some(ex) = app.explorer.as_mut() {
+                        ex.confirm_overwrite = Some((host, leaf));
+                    }
                 }
-            }
-            Ok(ImportOutcome::Done(name)) => {
-                if let Some(ex) = self.explorer.as_mut() {
-                    ex.confirm_overwrite = None;
+                Ok(ImportOutcome::Done(name)) => {
+                    if let Some(ex) = app.explorer.as_mut() {
+                        ex.confirm_overwrite = None;
+                    }
+                    // Re-open read-only at the same path so the new file shows.
+                    app.reopen_explorer(
+                        &image_path,
+                        selector,
+                        part_label,
+                        &comps,
+                        Some(format!("Imported {name}")),
+                    );
                 }
-                // Re-open read-only at the same path so the new file shows.
-                self.reopen_explorer(
-                    &image_path,
-                    selector,
-                    part_label,
-                    &comps,
-                    Some(format!("Imported {name}")),
-                );
-            }
-            Err(e) => {
-                if let Some(ex) = self.explorer.as_mut() {
-                    ex.confirm_overwrite = None;
-                    ex.status = Some(format!("Import failed: {e}"));
+                Err(e) => {
+                    if let Some(ex) = app.explorer.as_mut() {
+                        ex.confirm_overwrite = None;
+                        ex.status = Some(format!("Import failed: {e}"));
+                    }
                 }
-            }
-        }
+            }) as TaskDone)
+        });
     }
 
     /// Apply the metadata editor's Type / Creator / Modified changes to the
@@ -11784,6 +11709,96 @@ fn load_restore_backup(path: &std::path::Path, job: &crate::model::job::JobCtx) 
             "Clonezilla images: restore via the CLI (`rb-cli restore`) for now.".to_string(),
         ),
         Err(e) => RestoreLoad::Refused(format!("Not a rusty-backup folder: {e}")),
+    }
+}
+
+/// Export the Explorer's selection to `dest` (already validated by the picker) in its chosen
+/// format: a single file (fork modes), a `.tar[.gz]` archive, or a `.mar`. Runs as a task.
+fn export_explorer_selection(
+    ex: &mut Explorer,
+    dest: &std::path::Path,
+    job: &crate::model::job::JobCtx,
+) -> anyhow::Result<String> {
+    let entry = ex
+        .selected_entry()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("nothing selected"))?;
+    if !dest.is_dir() {
+        anyhow::bail!("not a directory: {}", dest.display());
+    }
+    let name = entry.name.clone();
+    let is_dir = matches!(entry.entry_type, EntryType::Directory);
+    match ex.export_fmt {
+        ExportFormat::Fork(mode) => {
+            if is_dir {
+                anyhow::bail!("that format exports a single file, not a directory");
+            }
+            let n =
+                fs_mac::fork_export::export_file_with_fork(&mut *ex.fs, &entry, dest, &name, mode)?;
+            Ok(format!(
+                "Exported {name} ({}) to {}",
+                format_size(n),
+                dest.display()
+            ))
+        }
+        ExportFormat::Archive(fmt) => {
+            // The whole selection into one archive via the shared engine:
+            // every Space-marked row (a marked folder walks recursively),
+            // or the highlighted entry when nothing is marked.
+            use crate::fs::export_selection::{export_to_file, export_to_folder};
+            let entries: Vec<FileEntry> = if ex.marked.is_empty() {
+                vec![entry.clone()]
+            } else {
+                ex.marked_entries()
+            };
+            if entries.is_empty() {
+                anyhow::bail!("nothing selected");
+            }
+            let progress = |name: &str, done: usize, bytes: u64| {
+                job.set_phase(format!("Exporting {name} ({done} done)"));
+                job.set_bytes_so_far(bytes);
+            };
+            let cancelled = || job.is_cancelled();
+
+            if fmt.is_single_file() {
+                let ext = fmt
+                    .file_extension()
+                    .map(|e| format!(".{e}"))
+                    .unwrap_or_default();
+                // The root node has no name of its own; "/.tar.gz" at
+                // the destination's root is not what anyone asked for.
+                let out_name = match entries.as_slice() {
+                    [only] if !only.name.trim_matches('/').is_empty() => {
+                        format!("{}{ext}", only.name)
+                    }
+                    [_] => format!("volume{ext}"),
+                    _ => format!("selection{ext}"),
+                };
+                let out_path = dest.join(&out_name);
+                let summary =
+                    export_to_file(&mut *ex.fs, &entries, &out_path, fmt, &progress, &cancelled)?;
+                Ok(format!(
+                    "Exported {} item(s) to {}",
+                    summary.files,
+                    out_path.display()
+                ))
+            } else {
+                let summary = export_to_folder(
+                    &mut *ex.fs,
+                    &entries,
+                    dest,
+                    fmt,
+                    RfMode::AppleDouble,
+                    &progress,
+                    &cancelled,
+                )?;
+                Ok(format!(
+                    "Exported {} item(s) to {}",
+                    summary.files,
+                    dest.display()
+                ))
+            }
+        }
     }
 }
 
