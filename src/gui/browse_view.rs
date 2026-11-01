@@ -210,6 +210,9 @@ pub struct BrowseView {
     /// a SquashFS volume and choosing a ceiling. See
     /// [`super::squashfs_budget_dialog`].
     squashfs_budget_dialog: Option<Box<super::squashfs_budget_dialog::SquashfsBudgetDialog>>,
+    /// Measuring a SquashFS for its budget dialog (walks the whole tree).
+    squashfs_measure_job:
+        Option<rusty_backup::model::job::Job<Result<fs_squashfs::squashfs_edit::SizePlan, String>>>,
     /// Whether to show the "unsaved changes" confirmation dialog.
     show_unsaved_dialog: bool,
     /// Staged additions whose destination already exists, awaiting one review
@@ -531,6 +534,7 @@ impl Default for BrowseView {
             chd_edit: None,
             chd_flatten_progress: None,
             squashfs_budget_dialog: None,
+            squashfs_measure_job: None,
             tar_export_progress: None,
             pending_tar_import: None,
             pending_tar_add: None,
@@ -989,6 +993,10 @@ impl BrowseView {
     /// Validate a filename against the current filesystem's rules at
     /// staging time, so invalid names are rejected before apply.
     fn validate_staged_name(&self, name: &str) -> Result<(), String> {
+        // A naming-rule check: the open filesystem answers it without reopening the volume.
+        if let Some(fs) = &self.cached_fs {
+            return fs.validate_name(name).map_err(|e| e.to_string());
+        }
         let fs = self.session.open().map_err(|e| e.to_string())?;
         fs.validate_name(name).map_err(|e| e.to_string())
     }
@@ -1418,6 +1426,7 @@ impl BrowseView {
         }
 
         // The SquashFS size-budget dialog, and the edit-mode entry it gates.
+        self.poll_squashfs_measure(ui);
         self.poll_squashfs_budget_dialog(ui);
 
         // Background tar-export progress (Export to .tar.gz...).
@@ -3344,27 +3353,63 @@ impl BrowseView {
         if self.fs_type != "SquashFS" || self.session.rebuild_budget.is_some() {
             return false;
         }
-        let mut fs = match self.session.open() {
-            Ok(fs) => fs,
-            Err(e) => {
-                self.error = Some(format!("Cannot measure this image: {e}"));
-                return true;
-            }
-        };
-        let image_len = fs_squashfs::squashfs_write::image_footprint(fs.total_size());
+        if self.squashfs_measure_job.is_some() {
+            return true;
+        }
+        let session = self.session.clone();
         // A partition bounds the image; a bare file at byte 0 is the image.
         let capacity = (self.session.partition_offset != 0)
             .then_some(self.session.partition_size)
             .flatten();
-        match fs_squashfs::squashfs_edit::plan_size(fs.as_mut(), image_len, capacity) {
-            Ok(plan) => {
+        self.squashfs_measure_job = Some(rusty_backup::model::job::Job::spawn(
+            "Measuring the image...",
+            Arc::new(super::ui_logger::EguiWake),
+            move |job| {
+                job.set_can_cancel(false);
+                let mut fs = match session.open() {
+                    Ok(fs) => fs,
+                    Err(e) => return Ok(Err(format!("Cannot measure this image: {e}"))),
+                };
+                let image_len = fs_squashfs::squashfs_write::image_footprint(fs.total_size());
+                Ok(
+                    fs_squashfs::squashfs_edit::plan_size(fs.as_mut(), image_len, capacity)
+                        .map_err(|e| format!("Cannot measure this image: {e}")),
+                )
+            },
+        ));
+        true
+    }
+
+    /// Open the budget dialog once the measurement lands.
+    fn poll_squashfs_measure(&mut self, ui: &mut egui::Ui) {
+        let Some(job) = &self.squashfs_measure_job else {
+            return;
+        };
+        let snap = job.snapshot();
+        if snap.is_running() {
+            egui::Window::new(snap.label.clone())
+                .collapsible(false)
+                .resizable(false)
+                .show(ui.ctx(), |ui| {
+                    super::progress::show_job(ui, &snap);
+                });
+            return;
+        }
+        let out = job.take_result();
+        self.squashfs_measure_job = None;
+        match out {
+            Some(Ok(plan)) => {
                 self.squashfs_budget_dialog = Some(Box::new(
                     super::squashfs_budget_dialog::SquashfsBudgetDialog::new(plan),
                 ));
             }
-            Err(e) => self.error = Some(format!("Cannot measure this image: {e}")),
+            Some(Err(e)) => self.error = Some(e),
+            None => {
+                if let rusty_backup::model::job::Status::Failed(e) = snap.status {
+                    self.error = Some(format!("Cannot measure this image: {e}"));
+                }
+            }
         }
-        true
     }
 
     /// Draw the budget dialog and act on its outcome: a chosen budget is
