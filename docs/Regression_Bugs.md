@@ -19,6 +19,7 @@ finding depends on a fixture, the fixture is named.
 
 | ID | Severity | Area | Finding |
 |----|----------|------|---------|
+| [R-071](#r-071) | **High** | `crates/fs-unix` (UFS1 `create_blank`) | A blank UFS1 volume from `rb-cli new volume ufs` fails FreeBSD 15.1 `fsck_ffs -fn`: free block counts wrong in the superblock, summary information bad, blocks missing in the bitmaps. Found by the new FreeBSD emulator oracle, 2026-11-01 |
 | ~~[R-070](#r-070)~~ | ~~**High**~~ **FIXED** | `src/cli/verbs/restore.rs` | ~~`rb-cli restore` without `--device` treats a `/dev/...` target as an image file and create/truncates it, so a writable device is written raw with no safety preflight, no system-disk guard, no unmount, no disk claim and no write-protect check~~ — a device-shaped target without `--device` is now refused, 2026-09-08 |
 | ~~[R-069](#r-069)~~ | ~~**High**~~ **FIXED** | `src/model/source_reader.rs` | ~~The encrypted-DMG probe opens the source with a plain `File::open` before the raw-device check is reached, so on macOS an unprivileged `rb-cli` device verb still dies with a bare `Permission denied` and R-068's fix never runs~~ — the device check now precedes every content probe, 2026-09-08 |
 | ~~[R-068](#r-068)~~ | ~~**High**~~ **FIXED** | `src/model/source_reader.rs`, `src/os/mod.rs` | ~~The CLI opens a raw device with a plain `File::open` and never elevates, so on macOS — where privilege is escalated per operation through `authopen`, not inherited from the process — every unprivileged `rb-cli` device verb dies with a bare `Permission denied` and no way forward~~ — the CLI device path goes through `open_source_for_reading` like the GUI's, holding the disk claim for the reader's lifetime, 2026-09-08 |
@@ -92,6 +93,35 @@ finding depends on a fixture, the fixture is named.
 | ~~R-002~~ | ~~Doc~~ **FIXED** | `src/fs/README.md` | ~~Capability table stale — ext listed as "planned"~~ — table deleted for a pointer at the live dispatch, 2026-08-09 |
 
 ---
+
+## Found by the FreeBSD emulator oracle, 2026-11-01
+
+### R-071 — a blank UFS1 volume fails FreeBSD's fsck_ffs {#r-071}
+
+**OPEN.** `rb-cli new volume ufs v.img --size 16M` (4.4BSD UFS1, little-endian),
+checked by FreeBSD 15.1-RELEASE `fsck_ffs -fn /dev/vtbd1`
+(`regression-tests/oracles/freebsd/fsck_ffs.py`):
+
+```
+** Phase 5 - Check Cyl groups
+FREE BLK COUNT(S) WRONG IN SUPERBLK
+SALVAGE? no
+SUMMARY INFORMATION BAD
+SALVAGE? no
+BLK(S) MISSING IN BIT MAPS
+SALVAGE? no
+1 files, 1 used, 15831 free (7 frags, 1978 blocks, 0.0% fragmentation)
+```
+
+So the superblock's free-block total, the cylinder-group summary (`fs_cs`) and
+the per-CG free bitmaps disagree with what FreeBSD derives from the inode
+tables, on a volume nothing has been written to. Our own `fsck` accepts it,
+because reader and writer share the same idea of the layout.
+
+Note for whoever picks this up: `fsck_ffs -n` declines every repair and still
+exits 0, so an exit-code check alone passes this volume. The oracle fails on
+any `...? no` question. Next step: compare the CG header and bitmap of this
+volume with one `newfs -O1` makes in the same VM.
 
 ## Found while adding the 1000-file churn test, 2026-09-05
 
