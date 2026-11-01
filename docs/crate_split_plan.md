@@ -13,7 +13,7 @@ This work comes *before* the native front-ends ([native_frontends_plan.md](nativ
 3. **Don't duplicate crates we already maintain.**
    - CHD stays in **libchdman-rs**: the generic `ChdReader` / cooked-CD / compression helpers move upstream there.
    - Optical-disc parsing goes to **opticaldiscs**.
-   - QNX 2 stays in **qnx2fs**.
+   - QNX 2 stays in **qnx2fs**, which moved into the workspace as `crates/qnx2fs` on 2026-10-31.
    - CD audio stays in **cd-da-reader**.
    - Archive formats use the existing third-party crates: `tar`, `zip`, `bzip2`, `lzma-rs`, `lzfse_rust`, `lz4_flex`, `flate2`, `zstd`.
 4. **MIT by default.** A crate or feature uses another license only when it contains code translated from a source under that license (§6).
@@ -194,7 +194,7 @@ That's about 2 test binaries per crate (~48), plus the app's. The vintage CI job
 - **Atomic changes.** A fix that touches `fs-mac` and the app lands in one PR, with no version bump-and-wait.
 - **Simple vintage builds.** Path dependencies work for the vintage and mrustc builds; git dependencies would need vendoring.
 
-The crates already kept separately stay separate, because other projects share them: `qnx2fs` with icon-emu, and `libchdman-rs` / `opticaldiscs` / `cd-da-reader` have their own C/C++ build concerns. If outside contributors later want a smaller repo, `git subtree split` can move `crates/` into a crates-only repo with history intact.
+The crates already kept separately stay separate: `libchdman-rs` / `opticaldiscs` / `cd-da-reader` have their own C/C++ build concerns. `qnx2fs`, shared with icon-emu, was the exception: it moved in as `crates/qnx2fs` (2026-10-31, history kept) so the app no longer needs a `[patch.crates-io]` to keep one `disk-core`. If outside contributors later want a smaller repo, `git subtree split` can move `crates/` into a crates-only repo with history intact.
 
 ## 9. Migration order
 
@@ -219,7 +219,7 @@ The crates already kept separately stay separate, because other projects share t
        - **Folded into `qnx2fs` 0.3.1 (2026-10-30):**
          1. `disk-core` 0.1.0 is on crates.io, published by `.github/workflows/publish-crates.yml` from the tag `disk-core-v0.1.0`.
          2. The adapter is `qnx2fs::adapter`, behind the optional `disk-core` feature; the default `qnx2fs` build stays dependency-free. `From<qnx2fs::Error> for FilesystemError` and the `Attributes` <-> `Qnx2Attrs` conversions live there.
-         3. The app takes `qnx2fs` with that feature, plus `[patch.crates-io] disk-core = { path = … }` in all four manifests so there's one `disk-core`. `src/fs/qnx2.rs` is now a re-export, keeping only the end-to-end `fs::copy` test, which needs the app.
+         3. The app takes `qnx2fs` with that feature, plus `[patch.crates-io] disk-core = { path = … }` in all four manifests so there's one `disk-core` (removed 2026-10-31, when qnx2fs moved into `crates/qnx2fs` and took `disk-core` by path). `src/fs/qnx2.rs` is now a re-export, keeping only the end-to-end `fs::copy` test, which needs the app.
 
    **Rule (2026-10-30): a crate must contain reusable format code.** A module that only adapts an external engine crate to the `disk-core` traits stays in the app, as `qnx2` over `qnx2fs` and `optical_fs` over `opticaldiscs` do. Crates are for code that implements a format.
    - **Held back:** `adfs` and `qdos` / `qdos_mdv` (license audit, §6) and `lif`. `lif`'s replace test needs both its private fields and the app's `fs::replace`; split the test, or give `lif` a small test-support accessor, before moving it.

@@ -35,6 +35,7 @@ on:
       - "arc-mac-v*"
       - "dsk-imz-v*"
       - "dsk-tape-v*"
+      - "qnx2fs-v*"
   workflow_dispatch:
     inputs:
       crate:
@@ -70,6 +71,7 @@ on:
           - arc-mac
           - dsk-imz
           - dsk-tape
+          - qnx2fs
       dry_run:
         description: Package and verify only, do not upload
         required: true

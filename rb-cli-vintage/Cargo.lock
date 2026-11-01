@@ -1594,9 +1594,7 @@ dependencies = [
 
 [[package]]
 name = "qnx2fs"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3fac164bd62cff11700399bb9aba495dc8fddfe727c537c86c30d277d0cc4fe0"
+version = "0.3.3"
 dependencies = [
  "chrono",
  "disk-core",

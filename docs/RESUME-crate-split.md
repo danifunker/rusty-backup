@@ -111,7 +111,8 @@ Read it first, along with `docs/license_audit.md`, CLAUDE.md and CONTRIBUTING.md
   - CI on the Step 7 tree passed: Linux, Solaris 9, 1.73 crate tests, and a manual Windows / macOS run.
 - **`disk-core` 0.2: done.** `unix_common::{bitmap, compact}` moved into `fs-unix` and the unused `validate` was deleted, so `disk-core` is 0.2.0. qnx2fs 0.3.2, which accepts `disk-core` 0.1 or 0.2, is on crates.io.
 - **Published (2026-10-31):** all 28 crates are on crates.io: `disk-core` 0.2.0 and the 27 others at 0.1.0, tagged at `3f410775`. crates.io allows 5 new crates in a burst, then 1 per 10 minutes, so pace new-crate publishes (see `docs/crate_split_plan.md` §11). New *versions* get a burst of 30, then 1 per minute.
-- **Next:** remove the `[patch.crates-io] disk-core` setup (Dani's request). Agree the route with Dani first: moving the QNX 2 adapter back into the app is the recommended one.
+- **`[patch]` gone (2026-10-31):** qnx2fs moved into the workspace as `crates/qnx2fs` (history kept with `git subtree`), taking `disk-core` by path. The `[patch.crates-io]` blocks, `minicargo_run` and the `qnx2fs.py` vendor patch are deleted. It is released from here as `qnx2fs-v<version>` (0.3.3 is the first); CI's crates job also builds it for wasm32. The old `danifunker/qnx2fs` repository is to be archived by Dani.
+- **Next:** align icon-emu with qnx2fs's new home (later; it may take more crates if it needs them).
 - **Merge:** `native-frontends` merges only after all the native OS frontends are done. Before that, `git rm .github/ci-targets`.
 
 **How each slice was done (scripts are easy to recreate):**

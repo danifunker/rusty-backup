@@ -92,6 +92,20 @@ Off by default. It adds `qnx2fs::adapter`, which puts a `Volume` behind the
 It pulls in `disk-core`, `chrono` and `log`, and reads the host clock and time zone,
 so it is not for the browser build.
 
+## Development
+
+This crate lives in the [RustyBackup](https://github.com/danifunker/rusty-backup)
+workspace at `crates/qnx2fs` (until 0.3.2 it had its own repository) and is
+released like the other crates there: bump `version`, update `CHANGELOG.md`, and
+push the tag `qnx2fs-v<version>`.
+
+- **Rust 1.73.** RustyBackup's vintage builds compile it with Rust 1.73.
+- **No dependencies and WebAssembly-safe** by default: never read the system
+  clock directly; go through `Volume::now`, which honours `set_clock`. Only the
+  `disk-core` feature may add dependencies.
+- **Writes follow QNX 4.10.01.** Check any change to how something is written
+  with QNX's own `chkfsys` in icon-emu before a release.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

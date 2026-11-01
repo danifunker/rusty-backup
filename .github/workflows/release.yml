@@ -1904,6 +1904,12 @@ jobs:
           CARGO_INCREMENTAL: "0"
           CARGO_PROFILE_DEV_DEBUG: "0"
         run: scripts/test-crates-msrv.sh
+      # icon-emu runs qnx2fs in the browser, where there is no system clock.
+      - name: qnx2fs builds for WebAssembly
+        working-directory: target/crates-msrv
+        run: |
+          rustup target add wasm32-unknown-unknown
+          cargo build -p qnx2fs --target wasm32-unknown-unknown
 
   # Vintage rb-cli (CLI + full TUI) for macOS 10.7 Lion and up. Built on a normal
   # (Apple-silicon) macOS runner — NO emulation: it *cross-compiles* to x86_64

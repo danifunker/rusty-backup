@@ -3,6 +3,14 @@
 All notable changes to this crate are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## 0.3.3
+
+### Changed
+- The crate moved into the [RustyBackup](https://github.com/danifunker/rusty-backup)
+  workspace (`crates/qnx2fs`); the `repository` link points there. No code
+  changes.
+- The `disk-core` feature requires disk-core 0.2.
+
 ## 0.3.2
 
 ### Changed

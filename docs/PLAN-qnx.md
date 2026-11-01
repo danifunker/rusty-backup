@@ -21,7 +21,7 @@ Sinclair QL QDOS that `fs::qdos` already reads. Detection must be by content.
 ## Where the QNX 2 code lives
 
 The QNX 2 reader, writer and checker were moved out of `src/fs/qnx2.rs` into the
-[`qnx2fs`](https://github.com/danifunker/qnx2fs) crate (MIT, on crates.io), which
+[`qnx2fs`](../crates/qnx2fs) crate (MIT, in `crates/qnx2fs`, on crates.io), which
 icon-emu also uses for its Files panel and `icon-ci ls/get/put/mkdir/rm`.
 `src/fs/qnx2.rs` is now a thin adapter onto the `Filesystem` /
 `EditableFilesystem` traits (deleted-entry naming, owner labels, attribute

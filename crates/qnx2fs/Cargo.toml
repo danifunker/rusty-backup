@@ -1,29 +1,31 @@
 [package]
 name = "qnx2fs"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 license = "MIT"
 authors = ["Dani Sarfati <dani@funkervogt.com>"]
 description = "Read and write QNX 2 filesystems (QNX 2.x, the Unisys ICON and LEXICON)"
-repository = "https://github.com/danifunker/qnx2fs"
+repository = "https://github.com/danifunker/rusty-backup"
+readme = "README.md"
 keywords = ["qnx", "filesystem", "retrocomputing", "icon"]
 categories = ["filesystem", "parser-implementations"]
 rust-version = "1.73"
 
-# Test fixtures are development-only; the release pipeline enforces a slim
-# tarball (no `.bin`, under 2 MB). The unit tests that read them only build
+# Test fixtures are development-only; the unit tests that read them only build
 # from the repository.
-exclude = ["tests/fixtures/*", ".github/*", "CLAUDE.md"]
+exclude = ["tests/fixtures/*"]
 
 [dependencies]
 # All optional: the default build stays dependency-free (and WebAssembly-safe).
-disk-core = { version = ">=0.1, <0.3", optional = true }
+disk-core = { path = "../disk-core", version = "0.2", optional = true }
 chrono = { version = "0.4.31", optional = true }
 log = { version = "0.4", optional = true }
 
 [features]
 # The `adapter` module: `Volume` behind disk-core's Filesystem / EditableFilesystem traits.
 disk-core = ["dep:disk-core", "dep:chrono", "dep:log"]
+# Only for a Rust 1.73 toolchain; see disk-core.
+rust173-polyfill = ["disk-core?/rust173-polyfill"]
 
 [package.metadata.docs.rs]
 all-features = true
