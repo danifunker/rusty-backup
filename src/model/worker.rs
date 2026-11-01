@@ -62,6 +62,19 @@ pub fn forward_cancel(
     })
 }
 
+/// `impl WorkerStatus` for a status whose end is `finished = true` plus an `error` message.
+macro_rules! finished_with_error {
+    ($($t:ty),+ $(,)?) => {$(
+        impl $crate::model::worker::WorkerStatus for $t {
+            fn fail(&mut self, message: String) {
+                self.error = Some(message);
+                self.finished = true;
+            }
+        }
+    )+};
+}
+pub(crate) use finished_with_error;
+
 impl WorkerStatus for crate::backup::BackupProgress {
     fn fail(&mut self, message: String) {
         self.error = Some(message);
@@ -111,6 +124,26 @@ mod tests {
             finished: false,
             error: None,
         }))
+    }
+
+    struct Runner {
+        finished: bool,
+        error: Option<String>,
+    }
+    finished_with_error!(Runner);
+
+    #[test]
+    fn a_runner_status_from_the_macro_ends_failed_when_its_thread_panics() {
+        let status = Arc::new(Mutex::new(Runner {
+            finished: false,
+            error: None,
+        }));
+        spawn_guarded(Arc::clone(&status), "export", || panic!("short read"))
+            .join()
+            .unwrap();
+        let s = lock_status(&status);
+        assert!(s.finished);
+        assert_eq!(s.error.as_deref(), Some("export worker panicked: short read"));
     }
 
     #[test]

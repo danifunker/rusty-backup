@@ -93,7 +93,7 @@ pub fn start_hfs_expand(
         emit_report: None,
     }));
     let status_thread = Arc::clone(&status);
-    std::thread::spawn(move || {
+    crate::model::worker::spawn_guarded(Arc::clone(&status), "HFS expand", move || {
         let _wake = crate::os::wakelock::acquire("Rusty Backup: expand HFS volume");
         let result = run_expand(
             source,
@@ -116,6 +116,7 @@ pub fn start_hfs_expand(
                 s.current_step = "Failed.".into();
             }
         }
+        Ok(())
     });
     status
 }

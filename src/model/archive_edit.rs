@@ -73,34 +73,40 @@ pub fn start_extract(
     }));
 
     let progress_thread = Arc::clone(&progress);
-    std::thread::spawn(move || {
-        let _wake = crate::os::wakelock::acquire("Rusty Backup: decompress partition for editing");
-        let cancel = {
-            let p = Arc::clone(&progress_thread);
-            move || p.lock().map(|g| g.cancel_requested).unwrap_or(false)
-        };
-        let result = decompress_partition_to_file(
-            &archive_path,
-            &compression_type,
-            &temp_path,
-            original_size,
-            compacted,
-            &mut |bytes| {
-                if let Ok(mut p) = progress_thread.lock() {
-                    p.current = bytes;
+    crate::model::worker::spawn_guarded(
+        Arc::clone(&progress),
+        "decompress for editing",
+        move || {
+            let _wake =
+                crate::os::wakelock::acquire("Rusty Backup: decompress partition for editing");
+            let cancel = {
+                let p = Arc::clone(&progress_thread);
+                move || p.lock().map(|g| g.cancel_requested).unwrap_or(false)
+            };
+            let result = decompress_partition_to_file(
+                &archive_path,
+                &compression_type,
+                &temp_path,
+                original_size,
+                compacted,
+                &mut |bytes| {
+                    if let Ok(mut p) = progress_thread.lock() {
+                        p.current = bytes;
+                    }
+                },
+                &cancel,
+            );
+            if let Ok(mut p) = progress_thread.lock() {
+                p.finished = true;
+                if let Err(e) = result {
+                    p.error = Some(format!("{e:#}"));
+                    // Clean up temp file on error
+                    let _ = std::fs::remove_file(&temp_path);
                 }
-            },
-            &cancel,
-        );
-        if let Ok(mut p) = progress_thread.lock() {
-            p.finished = true;
-            if let Err(e) = result {
-                p.error = Some(format!("{e:#}"));
-                // Clean up temp file on error
-                let _ = std::fs::remove_file(&temp_path);
             }
-        }
-    });
+            Ok(())
+        },
+    );
 
     progress
 }
@@ -132,80 +138,85 @@ pub fn start_compress(
     }));
 
     let progress_thread = Arc::clone(&progress);
-    std::thread::spawn(move || {
-        let _wake =
-            crate::os::wakelock::acquire("Rusty Backup: recompress partition after editing");
-        let cancel = {
-            let p = Arc::clone(&progress_thread);
-            move || p.lock().map(|g| g.cancel_requested).unwrap_or(false)
-        };
+    crate::model::worker::spawn_guarded(
+        Arc::clone(&progress),
+        "recompress after editing",
+        move || {
+            let _wake =
+                crate::os::wakelock::acquire("Rusty Backup: recompress partition after editing");
+            let cancel = {
+                let p = Arc::clone(&progress_thread);
+                move || p.lock().map(|g| g.cancel_requested).unwrap_or(false)
+            };
 
-        // Compute checksum of the temp file before compressing.
-        let checksum_result = compute_file_checksum(&temp_path, &checksum_type);
+            // Compute checksum of the temp file before compressing.
+            let checksum_result = compute_file_checksum(&temp_path, &checksum_type);
 
-        let archive_base = archive_path.with_extension("");
-        log::info!(
-            "Compressing {} -> {} (type={})",
-            temp_path.display(),
-            archive_base.display(),
-            compression_type
-        );
-        let result = compress_file_to_archive(
-            &temp_path,
-            &archive_base,
-            &compression_type,
-            None,
-            &mut |bytes| {
-                if let Ok(mut p) = progress_thread.lock() {
-                    p.current = bytes;
-                }
-            },
-            &cancel,
-            &mut |msg| log::info!("{}", msg),
-        );
-
-        if let Ok(mut p) = progress_thread.lock() {
-            p.finished = true;
-            match result {
-                Ok(new_files) => {
-                    log::info!("Compress succeeded: {:?}", new_files);
-                    // Remove old archive file if extension changed.
-                    if archive_path.exists() {
-                        let new_path = archive_path
-                            .parent()
-                            .unwrap_or(Path::new("."))
-                            .join(&new_files[0]);
-                        if new_path != archive_path {
-                            let _ = std::fs::remove_file(&archive_path);
-                        }
+            let archive_base = archive_path.with_extension("");
+            log::info!(
+                "Compressing {} -> {} (type={})",
+                temp_path.display(),
+                archive_base.display(),
+                compression_type
+            );
+            let result = compress_file_to_archive(
+                &temp_path,
+                &archive_base,
+                &compression_type,
+                None,
+                &mut |bytes| {
+                    if let Ok(mut p) = progress_thread.lock() {
+                        p.current = bytes;
                     }
+                },
+                &cancel,
+                &mut |msg| log::info!("{}", msg),
+            );
 
-                    // Update metadata checksum (skip for standalone container
-                    // files where metadata_path is empty).
-                    if !metadata_path.as_os_str().is_empty() {
-                        if let Ok(checksum) = checksum_result {
-                            if let Err(e) = backup_metadata::update_partition_checksum(
-                                &metadata_path,
-                                partition_index,
-                                &checksum,
-                                Some(&new_files),
-                            ) {
-                                p.error = Some(format!(
-                                    "Saved archive but failed to update metadata: {e}"
-                                ));
+            if let Ok(mut p) = progress_thread.lock() {
+                p.finished = true;
+                match result {
+                    Ok(new_files) => {
+                        log::info!("Compress succeeded: {:?}", new_files);
+                        // Remove old archive file if extension changed.
+                        if archive_path.exists() {
+                            let new_path = archive_path
+                                .parent()
+                                .unwrap_or(Path::new("."))
+                                .join(&new_files[0]);
+                            if new_path != archive_path {
+                                let _ = std::fs::remove_file(&archive_path);
                             }
                         }
-                    }
 
-                    let _ = std::fs::remove_file(&temp_path);
-                }
-                Err(e) => {
-                    p.error = Some(format!("{e:#}"));
-                    // Keep temp file on error so user can retry.
+                        // Update metadata checksum (skip for standalone container
+                        // files where metadata_path is empty).
+                        if !metadata_path.as_os_str().is_empty() {
+                            if let Ok(checksum) = checksum_result {
+                                if let Err(e) = backup_metadata::update_partition_checksum(
+                                    &metadata_path,
+                                    partition_index,
+                                    &checksum,
+                                    Some(&new_files),
+                                ) {
+                                    p.error = Some(format!(
+                                        "Saved archive but failed to update metadata: {e}"
+                                    ));
+                                }
+                            }
+                        }
+
+                        let _ = std::fs::remove_file(&temp_path);
+                    }
+                    Err(e) => {
+                        p.error = Some(format!("{e:#}"));
+                        // Keep temp file on error so user can retry.
+                    }
                 }
             }
-        }
-    });
+            Ok(())
+        },
+    );
 
     progress
 }
@@ -327,3 +338,5 @@ pub fn compute_file_checksum(
         other => Err(format!("unsupported checksum type: {other}").into()),
     }
 }
+
+crate::model::worker::finished_with_error!(ArchiveEditProgress);

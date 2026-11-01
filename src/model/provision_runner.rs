@@ -73,7 +73,7 @@ pub fn start_provision(req: ProvisionRequest) -> Arc<Mutex<PhysicalWriteStatus>>
     let status = new_status(req.total_source_bytes());
     let status_thread = Arc::clone(&status);
 
-    std::thread::spawn(move || {
+    crate::model::worker::spawn_guarded(Arc::clone(&status), "provision", move || {
         let _wake = crate::os::wakelock::acquire("Rusty Backup: build disk");
         let result = run_worker(&req, Arc::clone(&status_thread));
         if let Ok(mut s) = status_thread.lock() {
@@ -82,6 +82,7 @@ pub fn start_provision(req: ProvisionRequest) -> Arc<Mutex<PhysicalWriteStatus>>
                 s.error = Some(format!("{e:#}"));
             }
         }
+        Ok(())
     });
 
     status

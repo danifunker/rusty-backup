@@ -18,7 +18,6 @@ use std::fs::{File, OpenOptions};
 use std::io::Read as _;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::thread;
 
 use crate::fs::zstd_stream::{ZstdStreamCache, ZstdStreamReader};
 use crate::fs::{self};
@@ -544,7 +543,7 @@ impl BrowseSession {
         let session = self.clone();
         let status = Arc::new(Mutex::new(BrowseOpenStatus::starting()));
         let status_thread = Arc::clone(&status);
-        thread::spawn(move || {
+        crate::model::worker::spawn_guarded(Arc::clone(&status), "filesystem open", move || {
             let set_phase = |s: &str| {
                 if let Ok(mut g) = status_thread.lock() {
                     g.phase = s.to_string();
@@ -578,7 +577,7 @@ impl BrowseSession {
                         g.needs_password = is_pw;
                         g.finished = true;
                     }
-                    return;
+                    return Ok(());
                 }
             };
 
@@ -627,6 +626,7 @@ impl BrowseSession {
                 g.fs = Some(fs);
                 g.finished = true;
             }
+            Ok(())
         });
         status
     }
@@ -895,6 +895,8 @@ impl BrowseOpenStatus {
         }
     }
 }
+
+crate::model::worker::finished_with_error!(BrowseOpenStatus);
 
 #[cfg(test)]
 mod tests {

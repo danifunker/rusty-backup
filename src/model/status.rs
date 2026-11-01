@@ -185,3 +185,11 @@ pub struct BulkConvertStatus {
     /// Drained by the main thread into the GUI log panel each frame.
     pub log_messages: Vec<(BulkConvertLogLevel, String)>,
 }
+
+crate::model::worker::finished_with_error!(
+    BlockCacheScan,
+    ChdExpandStatus,
+    SwabStatus,
+    ExpandStatus,
+    RepackStatus
+);

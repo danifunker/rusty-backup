@@ -49,7 +49,7 @@ impl UpdateRunStatus {
 /// Spawn the download + apply worker. Poll `status` each frame; on
 /// [`UpdateRunState::Ready`] prompt for restart.
 pub fn spawn(info: UpdateInfo, status: Arc<Mutex<UpdateRunStatus>>) {
-    std::thread::spawn(move || {
+    crate::model::worker::spawn_guarded(Arc::clone(&status), "update download", move || {
         if let Ok(mut s) = status.lock() {
             s.state = UpdateRunState::Downloading {
                 downloaded: 0,
@@ -72,5 +72,12 @@ pub fn spawn(info: UpdateInfo, status: Arc<Mutex<UpdateRunStatus>>) {
                 Err(e) => UpdateRunState::Failed(e.to_string()),
             };
         }
+        Ok(())
     });
+}
+
+impl crate::model::worker::WorkerStatus for UpdateRunStatus {
+    fn fail(&mut self, message: String) {
+        self.state = UpdateRunState::Failed(message);
+    }
 }

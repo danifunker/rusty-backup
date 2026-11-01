@@ -17,7 +17,6 @@ use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::thread;
 
 use super::status::RepackStatus;
 use disk_core::display::format_size;
@@ -31,7 +30,7 @@ use fs_pc::human68k_clone::stream_defragmented_human68k;
 pub fn spawn(path: PathBuf, partition_offset: u64) -> Arc<Mutex<RepackStatus>> {
     let status = Arc::new(Mutex::new(RepackStatus::default()));
     let status_clone = Arc::clone(&status);
-    thread::spawn(move || {
+    crate::model::worker::spawn_guarded(Arc::clone(&status), "repack", move || {
         if let Err(e) = run_repack(&path, partition_offset, &status_clone) {
             if let Ok(mut s) = status_clone.lock() {
                 s.error = Some(format!("{e}"));
@@ -40,6 +39,7 @@ pub fn spawn(path: PathBuf, partition_offset: u64) -> Arc<Mutex<RepackStatus>> {
         if let Ok(mut s) = status_clone.lock() {
             s.finished = true;
         }
+        Ok(())
     });
     status
 }

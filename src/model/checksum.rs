@@ -18,7 +18,6 @@
 
 use std::io::{self, Read, Write};
 use std::sync::{Arc, Mutex};
-use std::thread;
 
 use md5::{Digest, Md5};
 use sha1::Sha1;
@@ -188,11 +187,12 @@ pub enum ChecksumJob {
 pub fn spawn(job: ChecksumJob) -> Arc<Mutex<ChecksumStatus>> {
     let status = Arc::new(Mutex::new(ChecksumStatus::default()));
     let status_thread = Arc::clone(&status);
-    thread::spawn(move || {
+    crate::model::worker::spawn_guarded(Arc::clone(&status), "checksum", move || {
         run(job, &status_thread);
         if let Ok(mut g) = status_thread.lock() {
             g.finished = true;
         }
+        Ok(())
     });
     status
 }
@@ -296,6 +296,8 @@ fn finish_file<E: std::fmt::Display>(
         g.done_files += 1;
     }
 }
+
+crate::model::worker::finished_with_error!(ChecksumStatus);
 
 #[cfg(test)]
 mod tests {

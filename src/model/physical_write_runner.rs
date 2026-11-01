@@ -124,7 +124,7 @@ pub fn start_physical_write(req: PhysicalWriteRequest) -> Arc<Mutex<PhysicalWrit
     let status = new_status(total);
     let status_thread = Arc::clone(&status);
 
-    std::thread::spawn(move || {
+    crate::model::worker::spawn_guarded(Arc::clone(&status), "physical write", move || {
         let _wake = crate::os::wakelock::acquire("Rusty Backup: physical disk export");
         let result = run_worker(&req, Arc::clone(&status_thread));
         if let Ok(mut s) = status_thread.lock() {
@@ -133,6 +133,7 @@ pub fn start_physical_write(req: PhysicalWriteRequest) -> Arc<Mutex<PhysicalWrit
                 s.error = Some(format!("{e:#}"));
             }
         }
+        Ok(())
     });
 
     status
@@ -352,6 +353,8 @@ where
     }
     Ok(())
 }
+
+crate::model::worker::finished_with_error!(PhysicalWriteStatus);
 
 #[cfg(test)]
 mod tests {

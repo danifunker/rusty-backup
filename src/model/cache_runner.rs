@@ -10,7 +10,6 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::thread;
 
 use crate::model::status::BlockCacheScan;
 use dsk_clonezilla::block_cache::PartcloneBlockCache;
@@ -37,15 +36,20 @@ pub fn spawn_partclone_scan(
         cache: Arc::clone(&cache),
     }));
     let status_thread = Arc::clone(&status);
-    thread::spawn(move || {
-        let _wake = crate::os::wakelock::acquire("Rusty Backup: Clonezilla metadata scan");
-        let result = metadata_scan::scan_metadata(&cache, partition_type, Some(&cache_path));
-        if let Ok(mut s) = status_thread.lock() {
-            s.finished = true;
-            if let Err(e) = result {
-                s.error = Some(format!("{e:#}"));
+    crate::model::worker::spawn_guarded(
+        Arc::clone(&status),
+        "Clonezilla metadata scan",
+        move || {
+            let _wake = crate::os::wakelock::acquire("Rusty Backup: Clonezilla metadata scan");
+            let result = metadata_scan::scan_metadata(&cache, partition_type, Some(&cache_path));
+            if let Ok(mut s) = status_thread.lock() {
+                s.finished = true;
+                if let Err(e) = result {
+                    s.error = Some(format!("{e:#}"));
+                }
             }
-        }
-    });
+            Ok(())
+        },
+    );
     status
 }

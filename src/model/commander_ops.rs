@@ -15,7 +15,6 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::thread;
 
 use anyhow::{bail, Context, Result};
 
@@ -197,12 +196,13 @@ pub fn spawn_apply_preflight(
 ) -> Arc<Mutex<PreflightStatus>> {
     let status = Arc::new(Mutex::new(PreflightStatus::default()));
     let worker = Arc::clone(&status);
-    thread::spawn(move || {
+    crate::model::worker::spawn_guarded(Arc::clone(&status), "apply preflight", move || {
         let result = preflight_apply(&session, &edits).map_err(|e| format!("{e:#}"));
         if let Ok(mut g) = worker.lock() {
             g.result = Some(result);
             g.finished = true;
         }
+        Ok(())
     });
     status
 }
@@ -427,12 +427,13 @@ pub fn spawn_wrapper_open(
         result: None,
     }));
     let st = Arc::clone(&status);
-    thread::spawn(move || {
+    crate::model::worker::spawn_guarded(Arc::clone(&status), "wrapper open", move || {
         let result = run_wrapper_open(plan, kind, file_name, &st);
         if let Ok(mut g) = st.lock() {
             g.result = Some(result);
             g.finished = true;
         }
+        Ok(())
     });
     status
 }
@@ -488,7 +489,7 @@ pub fn spawn_stage_copy(
 ) -> Arc<Mutex<StageCopyStatus>> {
     let status = Arc::new(Mutex::new(StageCopyStatus::default()));
     let status_thread = Arc::clone(&status);
-    thread::spawn(move || {
+    crate::model::worker::spawn_guarded(Arc::clone(&status), "stage copy", move || {
         let result = run_stage_copy(
             source,
             &entries,
@@ -504,6 +505,7 @@ pub fn spawn_stage_copy(
             }
             g.finished = true;
         }
+        Ok(())
     });
     status
 }
@@ -881,7 +883,7 @@ impl HostCopyJob {
 pub fn spawn_host_copy(job: HostCopyJob) -> Arc<Mutex<HostCopyStatus>> {
     let status = Arc::new(Mutex::new(HostCopyStatus::default()));
     let status_thread = Arc::clone(&status);
-    thread::spawn(move || {
+    crate::model::worker::spawn_guarded(Arc::clone(&status), "host copy", move || {
         let result = run_host_copy(job, &status_thread);
         if let Ok(mut g) = status_thread.lock() {
             match result {
@@ -890,6 +892,7 @@ pub fn spawn_host_copy(job: HostCopyJob) -> Arc<Mutex<HostCopyStatus>> {
             }
             g.finished = true;
         }
+        Ok(())
     });
     status
 }
@@ -1572,7 +1575,7 @@ pub fn spawn_apply(
         g.bytes_total = edits_total_bytes(&edits);
     }
     let status_thread = Arc::clone(&status);
-    thread::spawn(move || {
+    crate::model::worker::spawn_guarded(Arc::clone(&status), "apply", move || {
         let status_cb = Arc::clone(&status_thread);
         let result = apply_edits_reporting(&session, &edits, keep_going, move |p| {
             if let Ok(mut g) = status_cb.lock() {
@@ -1590,6 +1593,7 @@ pub fn spawn_apply(
             }
             g.finished = true;
         }
+        Ok(())
     });
     status
 }
@@ -1721,7 +1725,7 @@ pub fn spawn_remote_apply(
         g.bytes_total = edits_total_bytes(&edits);
     }
     let status_thread = Arc::clone(&status);
-    thread::spawn(move || {
+    crate::model::worker::spawn_guarded(Arc::clone(&status), "remote apply", move || {
         let status_cb = Arc::clone(&status_thread);
         let result = remote_apply(&addr, &image_path, partition, &edits, move |p| {
             if let Ok(mut g) = status_cb.lock() {
@@ -1738,8 +1742,25 @@ pub fn spawn_remote_apply(
             }
             g.finished = true;
         }
+        Ok(())
     });
     status
+}
+
+crate::model::worker::finished_with_error!(ApplyStatus, HostCopyStatus, StageCopyStatus);
+
+impl crate::model::worker::WorkerStatus for PreflightStatus {
+    fn fail(&mut self, message: String) {
+        self.result = Some(Err(message));
+        self.finished = true;
+    }
+}
+
+impl crate::model::worker::WorkerStatus for WrapperOpenStatus {
+    fn fail(&mut self, message: String) {
+        self.result = Some(Err(message));
+        self.finished = true;
+    }
 }
 
 #[cfg(test)]

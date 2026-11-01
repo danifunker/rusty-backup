@@ -196,7 +196,7 @@ pub fn start_clonezilla_whole_disk(
     let status = new_status(total_bytes);
     let status_thread = Arc::clone(&status);
 
-    std::thread::spawn(move || {
+    crate::model::worker::spawn_guarded(Arc::clone(&status), "export", move || {
         let _wake = crate::os::wakelock::acquire("Rusty Backup: Clonezilla disk export");
         let status2 = Arc::clone(&status_thread);
         let status3 = Arc::clone(&status_thread);
@@ -224,6 +224,7 @@ pub fn start_clonezilla_whole_disk(
                 s.error = Some(format!("{e:#}"));
             }
         }
+        Ok(())
     });
 
     status
@@ -242,7 +243,7 @@ pub fn start_native_whole_disk(
     let status = new_status(total_bytes);
     let status_thread = Arc::clone(&status);
 
-    std::thread::spawn(move || {
+    crate::model::worker::spawn_guarded(Arc::clone(&status), "export", move || {
         let _wake = crate::os::wakelock::acquire("Rusty Backup: whole-disk export");
         let status2 = Arc::clone(&status_thread);
         let status3 = Arc::clone(&status_thread);
@@ -271,6 +272,7 @@ pub fn start_native_whole_disk(
                 s.error = Some(format!("{e:#}"));
             }
         }
+        Ok(())
     });
 
     status
@@ -313,7 +315,7 @@ pub fn start_native_whole_disk_chd(
     let status = new_status(total_bytes);
     let status_thread = Arc::clone(&status);
 
-    std::thread::spawn(move || {
+    crate::model::worker::spawn_guarded(Arc::clone(&status), "export", move || {
         let _wake = crate::os::wakelock::acquire("Rusty Backup: CHD/BinCue export");
         let status2 = Arc::clone(&status_thread);
         let status3 = Arc::clone(&status_thread);
@@ -407,6 +409,7 @@ pub fn start_native_whole_disk_chd(
                 s.error = Some(format!("{e:#}"));
             }
         }
+        Ok(())
     });
 
     status
@@ -444,7 +447,7 @@ pub fn start_per_partition(inputs: PerPartitionInputs) -> Arc<Mutex<ExportStatus
     let status = new_status(total_bytes);
     let status_thread = Arc::clone(&status);
 
-    std::thread::spawn(move || {
+    crate::model::worker::spawn_guarded(Arc::clone(&status), "export", move || {
         let _wake = crate::os::wakelock::acquire("Rusty Backup: per-partition export");
         let result = run_per_partition(
             format,
@@ -465,6 +468,7 @@ pub fn start_per_partition(inputs: PerPartitionInputs) -> Arc<Mutex<ExportStatus
                 s.error = Some(format!("{e:#}"));
             }
         }
+        Ok(())
     });
 
     status
@@ -504,7 +508,7 @@ pub fn start_per_partition_hfv(
     let status = new_status(total_bytes);
     let status_thread = Arc::clone(&status);
 
-    std::thread::spawn(move || {
+    crate::model::worker::spawn_guarded(Arc::clone(&status), "export", move || {
         let _wake = crate::os::wakelock::acquire("Rusty Backup: HFV export");
         let result = run_per_partition_hfv(
             &source_image,
@@ -519,6 +523,7 @@ pub fn start_per_partition_hfv(
                 s.error = Some(format!("{e:#}"));
             }
         }
+        Ok(())
     });
 
     status
@@ -933,6 +938,8 @@ fn refuse_unpatched_shrink(
         disk_core::display::format_size(export_size)
     )
 }
+
+crate::model::worker::finished_with_error!(ExportStatus);
 
 #[cfg(test)]
 mod tests {

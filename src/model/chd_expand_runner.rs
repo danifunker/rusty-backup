@@ -17,7 +17,6 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread;
 
 use super::status::ChdExpandStatus;
 use crate::rbformats::chd::ChdReader;
@@ -35,7 +34,7 @@ pub fn spawn(path: PathBuf, add_bytes: u64) -> Arc<Mutex<ChdExpandStatus>> {
     }));
 
     let status_clone = Arc::clone(&status);
-    thread::spawn(move || {
+    crate::model::worker::spawn_guarded(Arc::clone(&status), "CHD expand", move || {
         if let Err(e) = run_expand(&path, add_bytes, &status_clone) {
             if let Ok(mut s) = status_clone.lock() {
                 s.error = Some(format!("{e}"));
@@ -44,6 +43,7 @@ pub fn spawn(path: PathBuf, add_bytes: u64) -> Arc<Mutex<ChdExpandStatus>> {
         if let Ok(mut s) = status_clone.lock() {
             s.finished = true;
         }
+        Ok(())
     });
 
     status
