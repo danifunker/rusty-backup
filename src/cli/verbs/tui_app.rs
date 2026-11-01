@@ -5707,24 +5707,31 @@ impl App {
                 }
             }
         };
-        // `new::run` prints advisories to stdout/stderr, which would land on the
-        // alt-screen; run it with both streams redirected to null.
-        let outcome = with_stderr_suppressed(|| crate::cli::verbs::new::run(cmd));
-        let w = self.newdisk.as_mut().unwrap();
-        match outcome {
-            Ok(()) => {
-                let size_note = std::fs::metadata(&path)
-                    .map(|m| format!(" ({})", format_size(m.len())))
-                    .unwrap_or_default();
-                w.status = Some(format!("Created {}{size_note}", path.display()));
-                w.is_error = false;
-            }
-            Err(e) => {
-                // `{e:#}` shows the whole anyhow context chain (root cause).
-                w.status = Some(format!("{e:#}"));
-                w.is_error = true;
-            }
-        }
+        // A task: building (and filling) a big image takes a while. `new::run` logs
+        // advisories to stderr, which the task silences so they don't land on the alt-screen.
+        self.start_task("Creating the disk image", move |job| {
+            job.set_can_cancel(false);
+            let outcome = crate::cli::verbs::new::run(cmd);
+            Ok(Box::new(move |app: &mut App| {
+                let Some(w) = app.newdisk.as_mut() else {
+                    return;
+                };
+                match outcome {
+                    Ok(()) => {
+                        let size_note = std::fs::metadata(&path)
+                            .map(|m| format!(" ({})", format_size(m.len())))
+                            .unwrap_or_default();
+                        w.status = Some(format!("Created {}{size_note}", path.display()));
+                        w.is_error = false;
+                    }
+                    Err(e) => {
+                        // `{e:#}` shows the whole anyhow context chain (root cause).
+                        w.status = Some(format!("{e:#}"));
+                        w.is_error = true;
+                    }
+                }
+            }) as TaskDone)
+        });
     }
 
     /// Build a CD-ROM disc image, optionally filling it from a host folder.
@@ -5760,74 +5767,81 @@ impl App {
             w.is_error = true;
             return;
         }
-        // Same reason as `new::run` above: the builders log advisories that
-        // would otherwise scribble on the alt-screen.
-        let outcome = with_stderr_suppressed(|| match target {
-            CdTarget::SgiEfs => crate::cli::verbs::new_sgi_cdrom::run(
-                crate::cli::verbs::new_sgi_cdrom::NewSgiCdromArgs {
-                    image: path.clone(),
-                    size,
-                    name,
-                    inodes: None,
-                    bytes_per_inode: None,
-                    from_dir: from,
-                    expand_archives,
-                    flatten_folders: false,
-                    force: false,
-                    no_permissions: false,
-                    include_appledouble: false,
-                },
-            ),
-            CdTarget::MacHfs | CdTarget::MacHfsPlus => {
-                let fs = if target == CdTarget::MacHfs {
-                    crate::partition::mac_cd_builder::MacCdFs::Hfs
-                } else {
-                    crate::partition::mac_cd_builder::MacCdFs::HfsPlus
-                };
-                crate::cli::verbs::new_mac_cdrom::run(
-                    fs,
-                    crate::cli::verbs::new_mac_cdrom::NewMacCdromArgs {
+        // A task like `new::run` above; the builders' stderr advisories are silenced.
+        self.start_task("Building the CD-ROM image", move |job| {
+            job.set_can_cancel(false);
+            let outcome = match target {
+                CdTarget::SgiEfs => crate::cli::verbs::new_sgi_cdrom::run(
+                    crate::cli::verbs::new_sgi_cdrom::NewSgiCdromArgs {
+                        image: path.clone(),
+                        size,
+                        name,
+                        inodes: None,
+                        bytes_per_inode: None,
+                        from_dir: from,
+                        expand_archives,
+                        flatten_folders: false,
+                        force: false,
+                        no_permissions: false,
+                        include_appledouble: false,
+                    },
+                ),
+                CdTarget::MacHfs | CdTarget::MacHfsPlus => {
+                    let fs = if target == CdTarget::MacHfs {
+                        crate::partition::mac_cd_builder::MacCdFs::Hfs
+                    } else {
+                        crate::partition::mac_cd_builder::MacCdFs::HfsPlus
+                    };
+                    crate::cli::verbs::new_mac_cdrom::run(
+                        fs,
+                        crate::cli::verbs::new_mac_cdrom::NewMacCdromArgs {
+                            image: path.clone(),
+                            size,
+                            name,
+                            from_dir: from,
+                            expand_archives,
+                            force: false,
+                            include_appledouble: false,
+                            block_size: None,
+                        },
+                    )
+                }
+                CdTarget::NextUfs => crate::cli::verbs::new_next_cdrom::run(
+                    crate::cli::verbs::new_next_cdrom::NewNextCdromArgs {
                         image: path.clone(),
                         size,
                         name,
                         from_dir: from,
                         expand_archives,
+                        expand_gunzip,
+                        flatten_folders: false,
                         force: false,
+                        no_permissions: false,
                         include_appledouble: false,
-                        block_size: None,
+                        bytes_per_inode: None,
                     },
-                )
-            }
-            CdTarget::NextUfs => crate::cli::verbs::new_next_cdrom::run(
-                crate::cli::verbs::new_next_cdrom::NewNextCdromArgs {
-                    image: path.clone(),
-                    size,
-                    name,
-                    from_dir: from,
-                    expand_archives,
-                    expand_gunzip,
-                    flatten_folders: false,
-                    force: false,
-                    no_permissions: false,
-                    include_appledouble: false,
-                    bytes_per_inode: None,
-                },
-            ),
+                ),
+            };
+            Ok(Box::new(move |app: &mut App| {
+                let Some(w) = app.newdisk.as_mut() else {
+                    return;
+                };
+                match outcome {
+                    Ok(()) => {
+                        let size_note = std::fs::metadata(&path)
+                            .map(|m| format!(" ({})", format_size(m.len())))
+                            .unwrap_or_default();
+                        w.status = Some(format!("Created {}{size_note}", path.display()));
+                        w.is_error = false;
+                    }
+                    Err(e) => {
+                        // `{e:#}` shows the whole anyhow context chain (root cause).
+                        w.status = Some(format!("{e:#}"));
+                        w.is_error = true;
+                    }
+                }
+            }) as TaskDone)
         });
-        let w = self.newdisk.as_mut().unwrap();
-        match outcome {
-            Ok(()) => {
-                let size_note = std::fs::metadata(&path)
-                    .map(|m| format!(" ({})", format_size(m.len())))
-                    .unwrap_or_default();
-                w.status = Some(format!("Created {}{size_note}", path.display()));
-                w.is_error = false;
-            }
-            Err(e) => {
-                w.status = Some(format!("{e:#}"));
-                w.is_error = true;
-            }
-        }
     }
 
     /// Backup screen keys. Returns `true` when consumed; `false` lets a key fall
@@ -7244,10 +7258,11 @@ impl App {
         }
     }
 
-    /// Open a Mac archive and pre-render its entry list.
+    /// Open a Mac archive and pre-render its entry list, as a task.
     fn load_archive(&mut self, path: std::path::PathBuf) {
-        match arc_mac::extract::open(&path) {
-            Ok((bytes, archive)) => {
+        self.start_task("Opening the archive", move |job| {
+            job.set_can_cancel(false);
+            let opened = arc_mac::extract::open(&path).map(|(bytes, archive)| {
                 let mut entries = Vec::new();
                 for e in &archive.entries {
                     if e.is_dir {
@@ -7277,60 +7292,85 @@ impl App {
                         rsrc
                     ));
                 }
-                crate::update::push_recent(
-                    crate::update::RecentMode::Archives,
-                    &path.to_string_lossy(),
-                );
-                if let Some(a) = self.archive.as_mut() {
-                    a.archive_path = path.display().to_string();
-                    a.bytes = bytes;
-                    a.archive = Some(archive);
-                    a.entries = entries;
-                    a.list_sel = 0;
-                    a.status = Some(format!("Opened ({} entries).", a.entries.len()));
-                    a.is_error = false;
+                (bytes, archive, entries)
+            });
+            Ok(Box::new(move |app: &mut App| match opened {
+                Ok((bytes, archive, entries)) => {
+                    crate::update::push_recent(
+                        crate::update::RecentMode::Archives,
+                        &path.to_string_lossy(),
+                    );
+                    if let Some(a) = app.archive.as_mut() {
+                        a.archive_path = path.display().to_string();
+                        a.bytes = bytes;
+                        a.archive = Some(archive);
+                        a.entries = entries;
+                        a.list_sel = 0;
+                        a.status = Some(format!("Opened ({} entries).", a.entries.len()));
+                        a.is_error = false;
+                    }
                 }
-            }
-            Err(e) => {
-                if let Some(a) = self.archive.as_mut() {
-                    a.status = Some(format!("Cannot open archive: {e:#}"));
-                    a.is_error = true;
+                Err(e) => {
+                    if let Some(a) = app.archive.as_mut() {
+                        a.status = Some(format!("Cannot open archive: {e:#}"));
+                        a.is_error = true;
+                    }
                 }
-            }
-        }
+            }) as TaskDone)
+        });
     }
 
-    /// Extract the open archive to `dest` in the chosen fork format.
+    /// Extract the open archive to `dest` in the chosen fork format, as a task.
     fn archive_extract(&mut self, dest: std::path::PathBuf) {
-        let Some(a) = self.archive.as_ref() else {
+        if self.task.is_some() {
             return;
-        };
-        let Some(archive) = a.archive.as_ref() else {
-            return;
-        };
-        let format = ARCHIVE_FORK_FORMATS[a.fork_fmt_sel.min(ARCHIVE_FORK_FORMATS.len() - 1)].1;
-        let result =
-            arc_mac::extract::extract_all(&a.bytes, archive, &dest, format, |_, _, _| {}, |_| {});
-        let a = self.archive.as_mut().unwrap();
-        match result {
-            Ok(stats) => {
-                a.status = Some(format!(
-                    "Extracted {} file(s){} to {}",
-                    stats.files,
-                    if stats.skipped > 0 {
-                        format!(" ({} skipped)", stats.skipped)
-                    } else {
-                        String::new()
-                    },
-                    dest.display()
-                ));
-                a.is_error = false;
-            }
-            Err(e) => {
-                a.status = Some(format!("Extract failed: {e:#}"));
-                a.is_error = true;
-            }
         }
+        let Some(a) = self.archive.as_mut() else {
+            return;
+        };
+        let Some(archive) = a.archive.take() else {
+            return;
+        };
+        // The archive rides to the worker and comes back with the result.
+        let bytes = std::mem::take(&mut a.bytes);
+        let format = ARCHIVE_FORK_FORMATS[a.fork_fmt_sel.min(ARCHIVE_FORK_FORMATS.len() - 1)].1;
+        self.start_task("Extracting", move |job| {
+            job.set_can_cancel(false);
+            let result = arc_mac::extract::extract_all(
+                &bytes,
+                &archive,
+                &dest,
+                format,
+                |_, _, _| {},
+                |_| {},
+            );
+            Ok(Box::new(move |app: &mut App| {
+                let Some(a) = app.archive.as_mut() else {
+                    return;
+                };
+                a.bytes = bytes;
+                a.archive = Some(archive);
+                match result {
+                    Ok(stats) => {
+                        a.status = Some(format!(
+                            "Extracted {} file(s){} to {}",
+                            stats.files,
+                            if stats.skipped > 0 {
+                                format!(" ({} skipped)", stats.skipped)
+                            } else {
+                                String::new()
+                            },
+                            dest.display()
+                        ));
+                        a.is_error = false;
+                    }
+                    Err(e) => {
+                        a.status = Some(format!("Extract failed: {e:#}"));
+                        a.is_error = true;
+                    }
+                }
+            }) as TaskDone)
+        });
     }
 
     /// Commander screen keys. Returns `true` when consumed.
@@ -13038,6 +13078,7 @@ mod tests {
         w.size = "8M".to_string();
         app.newdisk = Some(w);
         app.newdisk_create();
+        app.finish_task();
         let w = app.newdisk.as_ref().unwrap();
         assert!(!w.is_error, "{:?}", w.status);
         let mut f = std::fs::File::open(&iso).unwrap();
