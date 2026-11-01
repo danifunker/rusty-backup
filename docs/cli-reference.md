@@ -15,6 +15,7 @@ Usage: rb-cli [OPTIONS] [COMMAND]
 - `--log-level` — Diagnostic verbosity for stderr logs. Falls back to `[defaults] log-level` from the config; built-in default `warn`
 - `-q` / `--quiet` — Suppress all stderr output except errors and the final result. Mutually exclusive with `--log-level debug|trace`
 - `--progress` — Progress bar behavior. Built-in default `auto`; `never` is the safest setting inside CI / cron / wrapper scripts
+- `--status` — Print a status line (step, percent, speed, time left) to stderr while a long operation runs: every 5 seconds, or every SECONDS with `--status=SECONDS`
 - `--color` — ANSI color usage. Honors the `NO_COLOR` env var when set. Built-in default `auto`
 - `--log-file` — Mirror full trace-level log output to PATH regardless of `--log-level`. Useful on Windows cmd where redirection is awkward
 - `--config` — Path to a config file. Overrides the platform default location. See `rb-cli config path` for what that location is

@@ -384,6 +384,18 @@ fn run_rip_verb(args: RipArgs) -> Result<()> {
     let progress = Arc::new(Mutex::new(RipProgress::new()));
     let progress_thread = Arc::clone(&progress);
     let worker = std::thread::spawn(move || run_rip(config, progress_thread));
+    let _status = crate::cli::status::watch({
+        let p = Arc::clone(&progress);
+        move || {
+            let g = crate::model::worker::lock_status(&p);
+            Some(crate::cli::status::Sample {
+                step: g.operation.clone(),
+                done: g.current_bytes,
+                total: g.total_bytes,
+                finished: g.finished,
+            })
+        }
+    });
     drain_rip(progress)?;
     worker
         .join()
@@ -515,6 +527,18 @@ fn run_convert_verb(args: ConvertArgs) -> Result<()> {
                     source.display()
                 ),
             },
+        }
+    });
+    let _status = crate::cli::status::watch({
+        let p = Arc::clone(&progress);
+        move || {
+            let g = crate::model::worker::lock_status(&p);
+            Some(crate::cli::status::Sample {
+                step: g.operation.clone(),
+                done: g.current_bytes,
+                total: g.total_bytes,
+                finished: g.finished,
+            })
         }
     });
     drain_convert(progress)?;

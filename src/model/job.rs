@@ -90,38 +90,47 @@ impl Snapshot {
 
     /// One line every shell shows under its bar: amounts, speed, time left or elapsed.
     pub fn detail(&self) -> String {
-        let amount = |n: u64, unit: Unit| match unit {
-            Unit::Bytes => disk_core::display::format_size(n),
-            Unit::Items => n.to_string(),
-        };
-        let rate = |unit: Unit| {
-            self.rate.filter(|r| *r > 0.0).map(|r| match unit {
-                Unit::Bytes => format!("{}/s", super::rate_tracker::format_rate(r)),
-                Unit::Items => format!("{r:.1}/s"),
-            })
-        };
-        let elapsed = super::rate_tracker::format_eta(self.elapsed.as_secs());
-        let mut parts: Vec<String> = Vec::new();
-        match self.progress {
-            Progress::Determinate { done, total, unit } => {
-                parts.push(format!("{} of {}", amount(done, unit), amount(total, unit)));
-                parts.extend(rate(unit));
-                match self.eta_secs {
-                    Some(eta) => {
-                        parts.push(format!("{} left", super::rate_tracker::format_eta(eta)))
-                    }
-                    None => parts.push(format!("{elapsed} elapsed")),
-                }
-            }
-            Progress::Counting { done, unit } => {
-                parts.push(format!("{} so far", amount(done, unit)));
-                parts.extend(rate(unit));
-                parts.push(format!("{elapsed} elapsed"));
-            }
-            Progress::Indeterminate => parts.push(format!("{elapsed} elapsed")),
-        }
-        parts.join(", ")
+        progress_line(self.progress, self.rate, self.eta_secs, self.elapsed)
     }
+}
+
+/// The detail line for a progress state: amounts, speed, and time left (known total) or elapsed.
+pub fn progress_line(
+    progress: Progress,
+    rate: Option<f64>,
+    eta_secs: Option<u64>,
+    elapsed: Duration,
+) -> String {
+    use super::rate_tracker::{format_eta, format_rate};
+    let amount = |n: u64, unit: Unit| match unit {
+        Unit::Bytes => disk_core::display::format_size(n),
+        Unit::Items => n.to_string(),
+    };
+    let speed = |unit: Unit| {
+        rate.filter(|r| *r > 0.0).map(|r| match unit {
+            Unit::Bytes => format!("{}/s", format_rate(r)),
+            Unit::Items => format!("{r:.1}/s"),
+        })
+    };
+    let elapsed = format_eta(elapsed.as_secs());
+    let mut parts: Vec<String> = Vec::new();
+    match progress {
+        Progress::Determinate { done, total, unit } => {
+            parts.push(format!("{} of {}", amount(done, unit), amount(total, unit)));
+            parts.extend(speed(unit));
+            match eta_secs {
+                Some(eta) => parts.push(format!("{} left", format_eta(eta))),
+                None => parts.push(format!("{elapsed} elapsed")),
+            }
+        }
+        Progress::Counting { done, unit } => {
+            parts.push(format!("{} so far", amount(done, unit)));
+            parts.extend(speed(unit));
+            parts.push(format!("{elapsed} elapsed"));
+        }
+        Progress::Indeterminate => parts.push(format!("{elapsed} elapsed")),
+    }
+    parts.join(", ")
 }
 
 /// Wakes a shell's UI thread; implemented once per shell (egui: `request_repaint`).

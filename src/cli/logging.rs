@@ -105,6 +105,19 @@ pub struct GlobalFlags {
     #[arg(long, value_enum, global = true)]
     pub progress: Option<ProgressMode>,
 
+    /// Print a status line (step, percent, speed, time left) to stderr while a
+    /// long operation runs: every 5 seconds, or every SECONDS with `--status=SECONDS`.
+    #[arg(
+        long,
+        global = true,
+        value_name = "SECONDS",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "5",
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub status: Option<u64>,
+
     /// ANSI color usage. Honors the `NO_COLOR` env var when set.
     /// Built-in default `auto`.
     #[arg(long, value_enum, global = true)]
@@ -129,6 +142,8 @@ pub struct EffectiveLogging {
     pub log_level: LogLevel,
     pub quiet: bool,
     pub progress_enabled: bool,
+    /// `--status`: how often to print a status line; `None` when off.
+    pub status_interval: Option<std::time::Duration>,
     pub color_enabled: bool,
     pub log_file: Option<std::path::PathBuf>,
 }
@@ -241,6 +256,7 @@ pub fn install(flags: &GlobalFlags) -> Result<&'static EffectiveLogging> {
         log_level,
         quiet: flags.quiet,
         progress_enabled,
+        status_interval: flags.status.map(std::time::Duration::from_secs),
         color_enabled,
         log_file: flags.log_file.clone(),
     };
@@ -311,6 +327,19 @@ pub fn log_stderr(msg: impl AsRef<str>) {
         let _ = writeln!(stderr, "{}", msg.as_ref());
     }
     if let Some(path) = &eff.log_file {
+        if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(path) {
+            let _ = writeln!(f, "{}", msg.as_ref());
+        }
+    }
+}
+
+/// Write a `--status` line to stderr (and `--log-file`); printed even under `--quiet`, since it was asked for.
+pub fn status_stderr(msg: impl AsRef<str>) {
+    {
+        let mut stderr = std::io::stderr().lock();
+        let _ = writeln!(stderr, "{}", msg.as_ref());
+    }
+    if let Some(path) = effective().and_then(|e| e.log_file.as_ref()) {
         if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(path) {
             let _ = writeln!(f, "{}", msg.as_ref());
         }

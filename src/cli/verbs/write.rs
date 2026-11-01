@@ -114,6 +114,18 @@ pub fn run(args: WriteArgs) -> Result<()> {
     };
 
     let status = Arc::new(Mutex::new(new_cli_status(src_size)));
+    let _status = crate::cli::status::watch({
+        let p = Arc::clone(&status);
+        move || {
+            let g = crate::model::worker::lock_status(&p);
+            Some(crate::cli::status::Sample {
+                step: "Writing".to_string(),
+                done: g.current_bytes,
+                total: g.total_bytes,
+                finished: g.finished,
+            })
+        }
+    });
     physical_write_runner::run_worker(&req, Arc::clone(&status))
         .with_context(|| format!("writing {} to {}", args.image.display(), target_label))?;
 

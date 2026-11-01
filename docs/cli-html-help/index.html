@@ -16,6 +16,8 @@
 <dd>Suppress all stderr output except errors and the final result. Mutually exclusive with `--log-level debug|trace`</dd>
 <dt><code>--progress</code></dt>
 <dd>Progress bar behavior. Built-in default `auto`; `never` is the safest setting inside CI / cron / wrapper scripts</dd>
+<dt><code>--status</code></dt>
+<dd>Print a status line (step, percent, speed, time left) to stderr while a long operation runs: every 5 seconds, or every SECONDS with `--status=SECONDS`</dd>
 <dt><code>--color</code></dt>
 <dd>ANSI color usage. Honors the `NO_COLOR` env var when set. Built-in default `auto`</dd>
 <dt><code>--log-file</code></dt>
