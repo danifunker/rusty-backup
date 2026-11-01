@@ -162,6 +162,10 @@ pub struct BrowseView {
     repair_report: Option<rusty_backup::fs::RepairReport>,
     /// A running Check or Repair on this volume.
     fsck_job: Option<rusty_backup::model::job::Job<BrowseFsck>>,
+    /// Folder listings and previews waiting for the reader, one at a time.
+    read_queue: std::collections::VecDeque<FsRead>,
+    /// The read in flight, and the filesystem generation it borrowed from.
+    read_job: Option<(rusty_backup::model::job::Job<FsReadOut>, u64)>,
     /// A running "Export selection": the filesystem comes back with the summary, plus the destination.
     export_job: Option<(rusty_backup::model::job::Job<ExportRun>, PathBuf)>,
     /// A running tar import (its preflight, or the import itself).
@@ -493,6 +497,8 @@ impl Default for BrowseView {
             show_repair_confirm: false,
             repair_report: None,
             fsck_job: None,
+            read_queue: std::collections::VecDeque::new(),
+            read_job: None,
             export_job: None,
             tar_job: None,
             chd_open_job: None,
@@ -827,6 +833,8 @@ impl BrowseView {
         self.mac_archive_window = None;
         self.archive_sniff = None;
         self.archive_sniff_job = None;
+        self.read_queue.clear();
+        self.read_job = None;
         // Detach any in-flight open worker. The thread keeps running but its
         // result will be dropped when the Arc dies on completion.
         self.pending_open = None;
@@ -982,6 +990,7 @@ impl BrowseView {
         }
         self.poll_fsck_job();
         self.render_fsck_job(ui);
+        self.poll_reads();
         self.poll_archive_sniff();
         self.poll_apply_job();
         self.render_apply_job(ui);
@@ -1982,18 +1991,122 @@ impl BrowseView {
         }
     }
 
+    /// Queue a folder listing; the tree shows "Loading..." until it lands.
     fn load_directory(&mut self, entry: &FileEntry) {
-        if let Some(mut fs) = self.take_or_open_fs() {
-            match fs.list_directory(entry) {
-                Ok(mut entries) => {
-                    disk_core::entry::sort_for_display(&mut entries);
-                    self.directory_cache.insert(entry.path.clone(), entries);
-                }
-                Err(e) => {
-                    self.error = Some(format!("Failed to read {}: {e}", entry.path));
+        let queued = self
+            .read_queue
+            .iter()
+            .any(|r| matches!(r, FsRead::List(e) if e.path == entry.path));
+        if !queued {
+            self.read_queue.push_back(FsRead::List(entry.clone()));
+        }
+        self.pump_reads();
+    }
+
+    /// Start the next queued read: it borrows the cached filesystem, or opens one off the UI thread.
+    fn pump_reads(&mut self) {
+        if self.read_job.is_some() {
+            return;
+        }
+        let Some(read) = self.read_queue.pop_front() else {
+            return;
+        };
+        let cached = self.cached_fs.take();
+        let session = self.session.clone();
+        let show_deleted = self.show_deleted;
+        let job = rusty_backup::model::job::Job::spawn(
+            "Reading",
+            Arc::new(super::ui_logger::EguiWake),
+            move |_| {
+                let mut fs = match cached {
+                    Some(fs) => fs,
+                    None => match session.open() {
+                        Ok(mut fs) => {
+                            if show_deleted {
+                                fs.set_show_deleted(true);
+                            }
+                            fs
+                        }
+                        Err(e) => {
+                            return Ok((
+                                None,
+                                read.failed(format!("Failed to open filesystem: {e}")),
+                            ))
+                        }
+                    },
+                };
+                let done = match read {
+                    FsRead::List(dir) => {
+                        let result = fs.list_directory(&dir).map_err(|e| e.to_string());
+                        FsReadDone::List(dir, result)
+                    }
+                    FsRead::Preview(entry) => {
+                        let result = fs
+                            .read_file(&entry, MAX_PREVIEW_SIZE)
+                            .map_err(|e| e.to_string());
+                        FsReadDone::Preview(entry, result)
+                    }
+                };
+                Ok((Some(fs), done))
+            },
+        );
+        self.read_job = Some((job, self.fs_generation));
+    }
+
+    /// Apply a finished read, put the filesystem back, and start the next.
+    fn poll_reads(&mut self) {
+        let Some((job, _)) = &self.read_job else {
+            self.pump_reads();
+            return;
+        };
+        if job.is_running() {
+            return;
+        }
+        let out = job.take_result();
+        let Some((_, generation)) = self.read_job.take() else {
+            return;
+        };
+        if let Some((fs, done)) = out {
+            // A filesystem from before an invalidation is stale; so is what it read.
+            let fresh = generation == self.fs_generation;
+            if let Some(fs) = fs {
+                if fresh && self.cached_fs.is_none() {
+                    self.return_fs(fs);
                 }
             }
-            self.return_fs(fs);
+            if fresh {
+                self.apply_read(done);
+            }
+        }
+        self.pump_reads();
+    }
+
+    fn apply_read(&mut self, done: FsReadDone) {
+        match done {
+            FsReadDone::List(dir, Ok(mut entries)) => {
+                disk_core::entry::sort_for_display(&mut entries);
+                self.directory_cache.insert(dir.path.clone(), entries);
+            }
+            FsReadDone::List(dir, Err(e)) => {
+                self.error = Some(format!("Failed to read {}: {e}", dir.path));
+            }
+            FsReadDone::Preview(entry, result) => {
+                // Only the file still selected gets its preview.
+                if self.selected_entry.as_ref().map(|s| &s.path) != Some(&entry.path) {
+                    return;
+                }
+                match result {
+                    Ok(mut data) => {
+                        if self.fs_type == "QNX 2"
+                            && rusty_backup::fs::qnx2::looks_like_rs_text(&data)
+                        {
+                            data = rusty_backup::fs::qnx2::rs_to_lf(&data);
+                        }
+                        self.content = Some(file_detail::detect_content_type(&entry, &data));
+                    }
+                    Err(e) => self.error = Some(format!("Failed to read file: {e}")),
+                }
+            }
         }
     }
 
@@ -2027,21 +2140,10 @@ impl BrowseView {
             return;
         }
 
-        if let Some(mut fs) = self.take_or_open_fs() {
-            match fs.read_file(entry, MAX_PREVIEW_SIZE) {
-                Ok(mut data) => {
-                    if self.fs_type == "QNX 2" && rusty_backup::fs::qnx2::looks_like_rs_text(&data)
-                    {
-                        data = rusty_backup::fs::qnx2::rs_to_lf(&data);
-                    }
-                    self.content = Some(file_detail::detect_content_type(entry, &data));
-                }
-                Err(e) => {
-                    self.error = Some(format!("Failed to read file: {e}"));
-                }
-            }
-            self.return_fs(fs);
-        }
+        // Only the newest preview matters: drop any still waiting.
+        self.read_queue.retain(|r| !matches!(r, FsRead::Preview(_)));
+        self.read_queue.push_back(FsRead::Preview(entry.clone()));
+        self.pump_reads();
     }
 
     fn render_content_panel(&mut self, ui: &mut egui::Ui, panel_height: f32) {
@@ -6911,3 +7013,28 @@ fn tar_import_step(
     }
     TarStep::Finished(msg, true)
 }
+
+/// A read the browse view queues off the UI thread.
+enum FsRead {
+    List(FileEntry),
+    Preview(FileEntry),
+}
+
+impl FsRead {
+    /// The same read, failed with `message` (when the filesystem would not open).
+    fn failed(self, message: String) -> FsReadDone {
+        match self {
+            FsRead::List(dir) => FsReadDone::List(dir, Err(message)),
+            FsRead::Preview(entry) => FsReadDone::Preview(entry, Err(message)),
+        }
+    }
+}
+
+/// What a queued read produced.
+enum FsReadDone {
+    List(FileEntry, Result<Vec<FileEntry>, String>),
+    Preview(FileEntry, Result<Vec<u8>, String>),
+}
+
+/// A finished read, and the filesystem it borrowed (when it had one to give back).
+type FsReadOut = (Option<Box<dyn Filesystem>>, FsReadDone);
