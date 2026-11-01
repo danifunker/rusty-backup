@@ -23,18 +23,21 @@ Line numbers are a snapshot. Re-check them before editing.
 | Item | Status |
 |---|---|
 | 10. Missing panic guards | **Done.** Every model runner (2324ca57) and every shell thread (75b6d224) runs under `worker::spawn_guarded` / `spawn_detached`; `scripts/check-boundaries.sh` fails CI on a raw `thread::spawn` in a shell. |
-| 11. Busy gate | **Done** (275ebcb6). Inspect's jobs and the browse writers hold it; Inspect also polls while hidden. |
-| 1. Backup source scan / image preview | **Done** (ab571753): `model::source_scan` as a `Job`. |
-| 4. `prepare_disk_image_path` | **Done** (3f926ec0): `model::image_prep`, decoded as a `Job` by `gui::pending_image` (Backup + Restore; the other callers never decode). |
-| 5. fsck / repair | **Done.** GUI (6883328f): Inspect and browse via `fsck_runner::{check_target, repair_and_recheck}`. TUI: Explorer check and repair as `TuiTask`s (item 9). |
-| 2. Browse apply staged edits | **Apply done** (2bb6fad1): `commander_ops::apply_queue`. Tar import and export selection still open. |
-| 3. CHD edit mode | **Done** (this commit): `model::chd_edit_open` backs up and opens the session as a `Job`. |
-| 6. Archive sniff during render | **Done** (this commit): a `Job` that borrows the cached filesystem; a failed open is cached instead of retried every frame. |
-| 8. Partition apply / Make Bootable | **Done** (this commit): `partition_editor::apply_to_source` and the Make Bootable assess / write steps run as jobs; the donor picker stays on the UI thread between them. |
-| 7. Remote I/O on the UI thread | **Partly done** (this commit): the optical drive re-scan (Refresh, after connecting a daemon, after eject) and the remote browser's folder entry (`DirListing::begin_enter` / `finish_enter`) run as jobs. **Commander's remote navigation is left for the Phase 2 Commander pilot:** its listing is shared with copy, tree and selection, so it needs the view-model first. |
-| 9. TUI | **Started** (this commit): `TuiTask` (a `Job` whose result is a closure applied in `tick`) with a "Working" box that holds the keyboard (Esc cancels where allowed) and stderr-only suppression. On it: Explorer open (from Inspect), fsck and repair (item 5's TUI side). The Commander host-to-host copy no longer busy-waits: `tick` finishes it. **Still SYNC:** the rest of the Explorer (tree, preview, export, edit, import, metadata, bless, mkdir, delete, reopen after an edit), new disk, archives, metadata loads. |
+| 11. Busy gate | **Done** (275ebcb6). Inspect's jobs and every browse-view writer (extract, archive edit, CHD flatten, tar export / import, apply, repair, text-editor save) hold it; Inspect also polls while hidden. |
+| 1. Backup source scan / image preview | **Done** (ab571753): `model::source_scan`. |
+| 2. Browse writes | **Done.** Apply (2bb6fad1, `commander_ops::apply_queue`), export selection with progress and cancel, tar import (3895cbd1), text editor open / save (6b2a71bd), free-space probe (4d124701). |
+| 3. CHD edit mode | **Done** (5a3aea86): `model::chd_edit_open`, with a progress bar for the backup copy. |
+| 4. `prepare_disk_image_path` | **Done** (3f926ec0): `model::image_prep` + `gui::pending_image`, with a progress bar for `.hdz` / `.adz`. |
+| 5. fsck / repair | **Done.** GUI (6883328f): `fsck_runner::{check_target, repair_and_recheck}`. TUI: Explorer check and repair as tasks (896e8c6c). |
+| 6. Archive sniff during render | **Done** (6fd8b904). |
+| 7. Remote I/O | **Done except Commander.** Optical drive re-scan and remote-browser folder entry (772c422c). Commander's remote navigation waits for the Phase 2 Commander view-model: its listing is shared with copy, tree and selection. |
+| 8. Partition apply / Make Bootable | **Done** (8b03b7c0). |
+| 9. TUI | **Mostly done.** `TuiTask` + "Working" box with a bar (896e8c6c, 3f48249b). As tasks: Explorer open, check, repair, export (progress + cancel), import (dd38794d); Inspect image / device / backup opens and the Restore backup load with `.cbk` unpacking (50835ba8); the Settings update check (8a1b0a14). The Commander host-to-host copy no longer busy-waits. **Left inline on purpose:** Explorer tree / list moves (quick once the volume is open; a box per arrow key would be worse). **Still SYNC:** Explorer metadata, bless, mkdir, delete, edit, the reopen after a write, New Disk, Archives. |
+| Browse reads | **Done.** Folder listings and previews via a read queue (ab2aa6bb), Mac-archive open / extract (4ad827a2), SquashFS measuring and name validation without a reopen (0465a459). |
+| Other GUI rows | **Done:** Restore target scan, Inspect backup load (2256280e); archive open, disc detect (d6ede25f); Bulk Convert scan (8a1b0a14); Refresh Devices (1c65ff39). **Left:** Commander (Phase 2 pilot), Alto resize (synchronous by design), Inspect volume-label probes (already a runner; no progress yet). |
+| Progress display | Every job shows a bar (or a sweeping bar), the step, amounts, speed and time left / elapsed (3f48249b); `rb-cli --status` prints the same line periodically (53de3906). |
 
-`gui::progress::show_job` draws any running job (spinner or bar, phase, Cancel).
+`gui::progress::show_job` draws a job in egui; `App::draw_task` in the TUI; `Snapshot::detail` / `job::progress_line` is the shared wording.
 
 ## Totals
 
