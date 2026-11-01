@@ -257,6 +257,8 @@ const CG_OFF_NIBLK: usize = 116;
 const CG_OFF_INITEDIBLK: usize = 120;
 const D2_OFF_CKHASH: usize = 244;
 const D2_OFF_DIRDEPTH: usize = 240;
+/// FreeBSD's UFS1 `di_dirdepth`, unioned with `di_freelink`; pre-4.4 inodes keep 16-bit ids here.
+const D1_OFF_DIRDEPTH: usize = 4;
 
 // ---- 4.3BSD cylinder-group layout ----
 //
@@ -1567,19 +1569,17 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
         let endian = self.endian;
         let byte = self.partition_offset + self.inode_byte_offset(inum);
         let hp = self.is_hpux_hfs();
-        if hp || self.version == UfsVersion::Ufs2 {
-            // Keep fields we don't model (HP's flags and continuation inode, UFS2 times and gen).
-            self.reader.seek(SeekFrom::Start(byte))?;
-            self.reader.read_exact(&mut buf)?;
-            if read_u16(&buf, D1_OFF_MODE, endian) == 0 {
-                buf.fill(0);
-            }
-            let (db, ib_end) = match self.version {
-                UfsVersion::Ufs1 => (D1_OFF_DB, D1_OFF_IB + 12),
-                UfsVersion::Ufs2 => (D2_OFF_DB, D2_OFF_IB + 24),
-            };
-            buf[db..ib_end].fill(0);
+        // Keep fields we don't model (times, flags, gen, FreeBSD's dirdepth, HP's continuation inode).
+        self.reader.seek(SeekFrom::Start(byte))?;
+        self.reader.read_exact(&mut buf)?;
+        if read_u16(&buf, D1_OFF_MODE, endian) == 0 {
+            buf.fill(0);
         }
+        let (db, ib_end) = match self.version {
+            UfsVersion::Ufs1 => (D1_OFF_DB, D1_OFF_IB + 12),
+            UfsVersion::Ufs2 => (D2_OFF_DB, D2_OFF_IB + 24),
+        };
+        buf[db..ib_end].fill(0);
         // read_inode keeps a copy of the pointer area in `inline_payload` for
         // every inode; writing it back over a changed direct[] undid the change.
         let inline = !inode.inline_payload.is_empty()
@@ -1970,11 +1970,13 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
         ))
     }
 
-    /// FreeBSD's UFS2 `di_dirdepth`: a new directory sits one below its parent.
+    /// FreeBSD's `di_dirdepth`: a new directory sits one below its parent.
     fn set_dirdepth(&mut self, inum: u32, parent: u32) -> Result<(), FilesystemError> {
-        if self.version != UfsVersion::Ufs2 {
-            return Ok(());
-        }
+        let field = match self.version {
+            UfsVersion::Ufs2 => D2_OFF_DIRDEPTH,
+            UfsVersion::Ufs1 if !self.old_dirent_fmt => D1_OFF_DIRDEPTH,
+            UfsVersion::Ufs1 => return Ok(()),
+        };
         let size = self.dinode_size() as usize;
         let read = |fs: &mut Self, n: u32| -> Result<(u64, Vec<u8>), FilesystemError> {
             let at = fs.partition_offset + fs.inode_byte_offset(n);
@@ -1984,9 +1986,9 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
             Ok((at, buf))
         };
         let depth = read(self, parent)?.1;
-        let depth = read_u32(&depth, D2_OFF_DIRDEPTH, self.endian);
+        let depth = read_u32(&depth, field, self.endian);
         let (at, mut buf) = read(self, inum)?;
-        write_u32(&mut buf, D2_OFF_DIRDEPTH, depth + 1, self.endian);
+        write_u32(&mut buf, field, depth + 1, self.endian);
         self.stamp_inode_hash(&mut buf);
         self.reader.seek(SeekFrom::Start(at))?;
         self.reader.write_all(&buf)?;

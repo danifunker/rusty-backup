@@ -250,17 +250,14 @@ with `fsck_ffs -fn`. With -n, fsck_ffs declines every repair and still exits 0,
 so oracles/freebsd/fsck_ffs.py also fails on any "...? no" question. About a
 minute per check with KVM. emulator/ufs_freebsd_fsck.py drives the same check
 over FreeBSD-made volumes after rb-cli edits.
-
-fs.ufs1 has no check line yet: a blank `new volume ufs` fails today (R-071),
-and the emulator scenario `ufs1.blank` tracks that as a known failure. Add
-`check = ["{oracles}/freebsd/fsck_ffs.py", "{artifact}"]` when R-071 is fixed."""
+"""
 availability = [
   { platform = "linux",   status = "verified", verified_on = "2026-11-01" },
   { platform = "macos",   status = "install" },
   { platform = "windows", status = "install" },
 ]
 verifies = [
-  { format = "fs.ufs1", direction = "write", strength = "authoritative", status = "expected", evidence = "2026-11-01: a blank volume fails (R-071); edits on a FreeBSD-made UFS1 volume trip R-072" },
+  { format = "fs.ufs1", direction = "write", strength = "authoritative", status = "proven", evidence = "2026-11-01, after R-071 / R-072: a blank `new volume ufs`, the same volume after mkdir / put / mv / rm, and those edits on a FreeBSD 15.1 UFS1 volume all pass fsck_ffs -fn (emulator/ufs_freebsd_fsck.py). Controlled by overwriting cylinder group 0, which fails.", check = ["{oracles}/freebsd/fsck_ffs.py", "{artifact}"] },
   { format = "fs.ufs2", direction = "write", strength = "authoritative", status = "proven", evidence = "2026-11-01: mkdir / put past the direct blocks / mv / rm on a FreeBSD 15.1 UFS2 volume with check-hashes pass fsck_ffs -fn (emulator/ufs_freebsd_fsck.py ufs2)" },
 ]
 

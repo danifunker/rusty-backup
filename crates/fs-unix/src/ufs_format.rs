@@ -275,6 +275,11 @@ impl Ufs1Geometry {
         raw.next_multiple_of(4)
     }
 
+    /// Fragments the root directory holds: `fragroundup(DIRBLKSIZ)`, as newfs allocates it.
+    fn root_dir_frags(&self) -> u64 {
+        (dir_block_size(self.fsize, self.fsbtodb) as u64).div_ceil(self.fsize)
+    }
+
     fn clusteroff(&self) -> u64 {
         self.clustersumoff() + (CONTIGSUMSIZE + 1) * 4
     }
@@ -573,8 +578,7 @@ pub fn write_blank_ufs1<W: Write + Seek>(
     let geo = plan(params)?;
     let endian = params.endian;
 
-    // The root directory takes the first whole block of CG 0's data area; the
-    // partial fragments ahead of it stay free, exactly as `initcg` leaves them.
+    // The root directory takes the first whole block of CG 0's data area; its unused tail goes back as fragments.
     let root_block = geo.cg_dupper(0).next_multiple_of(geo.frag);
 
     let mut total = Csum::default();
@@ -661,7 +665,15 @@ fn cg_free_map(geo: &Ufs1Geometry, c: u64, root_block: u64) -> (Vec<u8>, Csum, [
         d += run;
     }
     while d + geo.frag <= ndblk {
-        if !(c == 0 && d == root_block) {
+        if c == 0 && d == root_block {
+            // mkfs's alloc(): the directory keeps its fragments, the rest of the block is free.
+            let used = geo.root_dir_frags();
+            for f in d + used..d + geo.frag {
+                set(&mut map, f);
+                cs.nffree += 1;
+            }
+            frsum[(geo.frag - used) as usize % 8] += 1;
+        } else {
             for f in d..d + geo.frag {
                 set(&mut map, f);
             }
@@ -800,8 +812,9 @@ fn write_cluster_maps(
     if run != 0 {
         runs[run.min(CONTIGSUMSIZE) as usize] += 1;
     }
+    // Slot 0 is never used and overlaps the free map's last word, as in FreeBSD's mkfs.
     let sumoff = geo.clustersumoff() as usize;
-    for (i, n) in runs.iter().enumerate() {
+    for (i, n) in runs.iter().enumerate().skip(1) {
         write_u32(hdr, sumoff + i * 4, *n, endian);
     }
 }
@@ -877,7 +890,7 @@ fn write_root_directory<W: Write + Seek>(
     block[dot + 8] = b'.';
     block[dot + 9] = b'.';
     out.seek(SeekFrom::Start(root_block * geo.fsize))?;
-    out.write_all(&block)?;
+    out.write_all(&block[..(geo.root_dir_frags() * geo.fsize) as usize])?;
 
     let mut dinode = vec![0u8; DINODE1_SIZE as usize];
     write_u16(&mut dinode, D1_OFF_MODE, 0o040755, endian);
@@ -891,7 +904,7 @@ fn write_root_directory<W: Write + Seek>(
     write_i32(
         &mut dinode,
         D1_OFF_BLOCKS,
-        (geo.bsize / dev_bsize) as i32,
+        (geo.root_dir_frags() * geo.fsize / dev_bsize) as i32,
         endian,
     );
     write_u32(&mut dinode, D1_OFF_UID, 0, endian);

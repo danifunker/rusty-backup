@@ -7,7 +7,8 @@
 # be closed. Scenarios exit 0 pass, 1 finding, 77 cannot run here, 99 no verdict.
 
 ufs2.freebsd-edit      -      ufs_freebsd_fsck.py ufs2
-ufs1.freebsd-edit      R-072  ufs_freebsd_fsck.py ufs1
-ufs1.blank             R-071  ufs_freebsd_fsck.py blank-ufs1
+ufs1.freebsd-edit      -      ufs_freebsd_fsck.py ufs1
+ufs1.blank             -      ufs_freebsd_fsck.py blank-ufs1
+ufs1.blank-edit        -      ufs_freebsd_fsck.py blank-ufs1-edit
 qnx2.lexicon-edit      -      qnx2_icon_chkfsys.py
 hpux-hfs.stand-edit    -      hpux_hfs_fsck.py

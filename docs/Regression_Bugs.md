@@ -19,8 +19,8 @@ finding depends on a fixture, the fixture is named.
 
 | ID | Severity | Area | Finding |
 |----|----------|------|---------|
-| [R-072](#r-072) | Medium | `crates/fs-unix` (UFS1 directory create) | After `rb-cli mkdir` on a FreeBSD-made UFS1 volume, FreeBSD 15.1 `fsck_ffs -fn` asks "UPDATE FILESYSTEM TO TRACK DIRECTORY DEPTH?": the new directory's depth field is not set. The same edits on UFS2 pass. Found by the FreeBSD emulator scenario, 2026-11-01 |
-| [R-071](#r-071) | **High** | `crates/fs-unix` (UFS1 `create_blank`) | A blank UFS1 volume from `rb-cli new volume ufs` fails FreeBSD 15.1 `fsck_ffs -fn`: free block counts wrong in the superblock, summary information bad, blocks missing in the bitmaps. Found by the new FreeBSD emulator oracle, 2026-11-01 |
+| ~~[R-072](#r-072)~~ | ~~Medium~~ **FIXED** | `crates/fs-unix` (UFS1 directory create) | ~~After `rb-cli mkdir` on a FreeBSD-made UFS1 volume, FreeBSD 15.1 `fsck_ffs -fn` asks "UPDATE FILESYSTEM TO TRACK DIRECTORY DEPTH?"~~ — the depth is now written at offset 4 on 4.4BSD-format UFS1 and survives later inode writes, 2026-11-01 |
+| ~~[R-071](#r-071)~~ | ~~**High**~~ **FIXED** | `crates/fs-unix` (UFS1 `create_blank`) | ~~A blank UFS1 volume from `rb-cli new volume ufs` fails FreeBSD 15.1 `fsck_ffs -fn`: free block counts wrong in the superblock, summary information bad, blocks missing in the bitmaps~~ — the root directory takes one fragment and the cluster summary no longer overwrites the free map, 2026-11-01 |
 | ~~[R-070](#r-070)~~ | ~~**High**~~ **FIXED** | `src/cli/verbs/restore.rs` | ~~`rb-cli restore` without `--device` treats a `/dev/...` target as an image file and create/truncates it, so a writable device is written raw with no safety preflight, no system-disk guard, no unmount, no disk claim and no write-protect check~~ — a device-shaped target without `--device` is now refused, 2026-09-08 |
 | ~~[R-069](#r-069)~~ | ~~**High**~~ **FIXED** | `src/model/source_reader.rs` | ~~The encrypted-DMG probe opens the source with a plain `File::open` before the raw-device check is reached, so on macOS an unprivileged `rb-cli` device verb still dies with a bare `Permission denied` and R-068's fix never runs~~ — the device check now precedes every content probe, 2026-09-08 |
 | ~~[R-068](#r-068)~~ | ~~**High**~~ **FIXED** | `src/model/source_reader.rs`, `src/os/mod.rs` | ~~The CLI opens a raw device with a plain `File::open` and never elevates, so on macOS — where privilege is escalated per operation through `authopen`, not inherited from the process — every unprivileged `rb-cli` device verb dies with a bare `Permission denied` and no way forward~~ — the CLI device path goes through `open_source_for_reading` like the GUI's, holding the disk claim for the reader's lifetime, 2026-09-08 |
@@ -99,7 +99,18 @@ finding depends on a fixture, the fixture is named.
 
 ### R-071 — a blank UFS1 volume fails FreeBSD's fsck_ffs {#r-071}
 
-**OPEN.** `rb-cli new volume ufs v.img --size 16M` (4.4BSD UFS1, little-endian),
+**FIXED 2026-11-01.** `fsck_ffs -fnd` named both causes. The formatter gave the
+root directory a whole block (`di_blocks` 16, fragments 553-559 marked used by
+nobody) where `newfs` allocates `fragroundup(DIRBLKSIZ)`, one fragment here,
+and returns the rest of the block as free fragments counted in `cg_frsum`. And
+`cg_clustersum` starts 4 bytes early, exactly as FreeBSD's `mkfs` lays it out,
+because slot 0 is never used; we wrote that zero slot anyway, over the last
+bytes of the free map, so the final 16 fragments read as allocated. Slot 0 is
+now skipped. A blank volume, and the same volume after mkdir / put / mv / rm,
+pass FreeBSD 15.1 `fsck_ffs -fn` (`emulator/ufs_freebsd_fsck.py blank-ufs1`,
+`blank-ufs1-edit`).
+
+Original report: `rb-cli new volume ufs v.img --size 16M` (4.4BSD UFS1, little-endian),
 checked by FreeBSD 15.1-RELEASE `fsck_ffs -fn /dev/vtbd1`
 (`regression-tests/oracles/freebsd/fsck_ffs.py`):
 
@@ -126,7 +137,17 @@ volume with one `newfs -O1` makes in the same VM.
 
 ### R-072 — a directory rb-cli makes on UFS1 lacks FreeBSD's directory depth {#r-072}
 
-**OPEN.** `regression-tests/emulator/ufs_freebsd_fsck.py ufs1` copies
+**FIXED 2026-11-01.** FreeBSD keeps the UFS1 `di_dirdepth` in a union with
+`di_freelink` at inode offset 4 (every directory in `fs.ufs1.freebsd151.hd`
+holds its depth there). The depth is now set there on mkdir, but only on
+4.4BSD-format volumes: on Solaris, SunOS, 4.3BSD / NeXTSTEP and HP-UX that
+offset is the old 16-bit uid / gid. Setting it was not enough on its own: the
+UFS1 inode writer started from a zeroed buffer, so the parent's next write
+(the `dir_insert` for `/rbtest/sub`) wiped `/rbtest`'s depth again, and with it
+atime, ctime, flags and the generation number. UFS1 now reads, modifies and
+writes back like UFS2 and HP-UX already did.
+
+Original report: `regression-tests/emulator/ufs_freebsd_fsck.py ufs1` copies
 `fs.ufs1.freebsd151.hd` (made by FreeBSD 15.1), runs `rb-cli mkdir /rbtest`,
 `mkdir /rbtest/sub`, three `put`s (one past the direct blocks), an `mv` and an
 `rm`, then FreeBSD `fsck_ffs -fn` says, in phase 2:
