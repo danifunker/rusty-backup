@@ -6067,6 +6067,7 @@ dependencies = [
  "tar",
  "tempfile",
  "thiserror 2.0.21",
+ "toml 0.5.11",
  "webbrowser",
  "windows",
  "winreg",

@@ -1,6 +1,6 @@
 # Native front-ends plan
 
-Status: **draft, 2026-10-29.** Nothing here has been built yet.
+Status: **Phase 0 done (2026-11-01)** on `native-frontends`; Phase 1 is next. Drafted 2026-10-29.
 
 This plan moves rusty-backup from one egui GUI to a native front-end on every platform. Every feature is written once in shared Rust, and each front-end only renders it.
 
@@ -146,6 +146,13 @@ Each phase lands as small per-slice commits and pull requests. Exit criteria are
 5. Add the headless view-model test harness: a scenario runner that replays `Action`s and asserts on state (§6, Tier A).
 
 **Exit:** the egui GUI still works unchanged, the new modules compile on Rust 1.73 (vintage CI job), and the harness runs in `cargo test`.
+
+**Done (2026-11-01).** How each step landed, and where it differs from the sketch above:
+1. `src/model/job.rs`: `Job<R>`, `JobCtx`, `Notify` / `NoNotify`, `Resource`, `JobRegistry` (refuses a second job on a busy resource and names the holder). `snapshot()` returns an owned `Snapshot` without the result, and `take_result()` hands the result over once, instead of `JobState<&R>`, which can't outlive the lock. A body ends `Cancelled` by returning `job::Cancelled` (`ctx.check_cancel()?`) or by failing after a cancel. `worker::run_guarded` shares the guard (`job::catch`). Nothing runs on `Job` yet; that is Phase 1.
+2. `src/vm/`: `ViewModel`, the exhaustive `Effect` (`PickFile`, `PickFolder`, `Confirm`, `AskPassword`, `Message`, `OpenUrl`, `CopyToClipboard`; `ShowDialog` waits for the first dialog view-model) and `AppVm`. The log store and the global `log` sink moved out of `gui/` (`vm::log`); egui draws the log from `AppVm` and runs effects in `gui::run_effects`. Recent files go through `AppVm` behind a `ConfigStore`, but the tabs still call the old helpers until their view-models exist (Phase 2); settings move then too.
+3. `docs/platform_matrix.md`, checked against `release.yml` by `scripts/check-platform-matrix.py`; CLAUDE.md § "Feature fan-out".
+4. `scripts/check-boundaries.sh`: `src/vm` enforced, shells reported (840 engine/model references and 27 `thread::spawn` at the start). CI job `boundaries`.
+5. `tests/ui_scenarios.rs` replays `tests/ui_scenarios/*.toml`. It is an integration test rather than `cargo test --lib vm`, because the library's unit tests don't build on 1.73; the 1.73 run is in CI's `test-crates-msrv` job through `rb-cli-vintage`.
 
 ### Phase 1: The wait audit, fixed in egui and the TUI first
 

@@ -174,7 +174,7 @@ Every feature reaches every front-end and build target by default. Before writin
 3. **Handle every new `Action` / `Effect` in every shell.** Shells match them with no `_` arm, so the compiler lists the ones you missed.
 4. **Check each target's constraints:** the Rust 1.73 floor for engine, model and vm code; mrustc gaps (no proc-macros, no inline asm) for Solaris 9 and PowerPC; slim builds without `chd`, `optical` or `crypto`.
 5. **Where it can't work, say so** in the matrix row's Limits column, with the reason.
-6. **Add a view-model scenario** under `tests/ui_scenarios/` (see `src/vm/scenario.rs`).
+6. **Add a view-model scenario** under `tests/ui_scenarios/` (runner: `tests/ui_scenarios.rs`).
 7. **Extend the CLI** if the feature is scriptable (the parity rule above).
 
 `scripts/check-boundaries.sh` reports shell code that reaches past the view-models; `scripts/check-platform-matrix.py` keeps the matrix in step with CI's targets. Both run in CI.

@@ -355,6 +355,8 @@ winres = "0.1"
 cargo-husky = { version = "1.5.0", features = ["user-hooks"] }
 # Verify the bundled CJK font actually covers Japanese (same parser egui uses).
 ab_glyph = "0.2"
+# UI scenario files (tests/ui_scenarios.rs); 0.5 builds on Rust 1.73.
+toml = "0.5"
 
 # Debian package metadata
 [package.metadata.deb]

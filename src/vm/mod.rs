@@ -15,6 +15,7 @@
 //! - Every actionable element has a stable widget id (the `ids` modules), which
 //!   each shell sets as its accessibility identifier for UI tests.
 //! - Rust 1.73 and mrustc compile this, like the engine.
+//! - Tier A tests replay `tests/ui_scenarios/*.toml` against view-models (`tests/ui_scenarios.rs`).
 
 pub mod app;
 pub mod log;

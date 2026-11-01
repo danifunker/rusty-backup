@@ -1725,6 +1725,7 @@ dependencies = [
  "tar",
  "tempfile",
  "thiserror",
+ "toml",
  "windows",
  "winreg",
  "winres",

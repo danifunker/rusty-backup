@@ -209,3 +209,11 @@ windows = { version = "0.58", features = [
 [build-dependencies]
 # Only used under cfg(windows) in build.rs; harmless (and ancient) elsewhere.
 winres = "0.1"
+
+# The view-model scenarios (Tier A UI tests) on Rust 1.73.
+[[test]]
+name = "ui_scenarios"
+path = "../tests/ui_scenarios.rs"
+
+[dev-dependencies]
+toml = "0.5"

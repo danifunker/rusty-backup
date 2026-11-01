@@ -1915,6 +1915,15 @@ jobs:
           CARGO_INCREMENTAL: "0"
           CARGO_PROFILE_DEV_DEBUG: "0"
         run: scripts/test-crates-msrv.sh
+      # The view-model scenarios (Tier A UI tests) on the vintage builds' floor.
+      - name: View-model scenarios on Rust 1.73
+        env:
+          CARGO_INCREMENTAL: "0"
+          CARGO_PROFILE_DEV_DEBUG: "0"
+        run: >-
+          cargo test --manifest-path rb-cli-vintage/Cargo.toml --test ui_scenarios
+          --no-default-features --features native-zstd,remote,tui,rust173-polyfill,yaml
+          --ignore-rust-version
       # icon-emu runs qnx2fs in the browser, where there is no system clock.
       - name: qnx2fs builds for WebAssembly
         working-directory: target/crates-msrv
