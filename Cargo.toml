@@ -407,6 +407,8 @@ depends = ["gtk3", "openssl"]
 # roots and reach these through path dependencies. docs/crate_split_plan.md.
 [workspace]
 members = ["crates/*"]
+# A separate project with its own lockfile; without this it "believes it's in a workspace" and won't build.
+exclude = ["regression-tests/runner"]
 
 # Debug builds carry line tables only. With full debuginfo the lib test binary
 # was 839 MB and each integration test 350-440 MB; linking several of those in
