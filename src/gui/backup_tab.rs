@@ -1,6 +1,5 @@
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::BufReader;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -16,13 +15,21 @@ use rusty_backup::update::UpdateConfig;
 
 use super::chd_options_ui::{ChdOptionsControl, ChdOptionsMode};
 use part_tables::PartitionSizeOverride;
+use rusty_backup::model::job::{Job, Status};
 use rusty_backup::model::size_mode::SizeMode;
+use rusty_backup::model::source_scan::{ScanFailure, SourceScan};
 use rusty_backup::model::status::VhdExportStatus;
-use rusty_backup::partition::{PartitionInfo, PartitionTable};
+use rusty_backup::partition::PartitionInfo;
 use rusty_backup::rbformats::vhd::export_whole_disk_vhd;
 
 use super::context::TabContext;
 use super::progress::ProgressState;
+
+/// A scan's result: the partitions, or why it stopped (shown under the source).
+type ScanOutcome = Result<SourceScan, ScanFailure>;
+
+/// The image-preview job's label, which also tells its result apart from a device scan's.
+const PREVIEW_LABEL: &str = "Reading the image";
 
 /// State for the Backup tab.
 pub struct BackupTab {
@@ -108,6 +115,10 @@ pub struct BackupTab {
     prev_image_path: Option<PathBuf>,
     /// VHD backup popup state
     vhd_popup_open: bool,
+    /// The running partition scan or image preview (`model::source_scan`).
+    source_scan: Option<Job<ScanOutcome>>,
+    /// Open the VHD export popup once the running scan finishes.
+    vhd_popup_after_scan: bool,
     vhd_whole_disk: bool,
     vhd_partition_configs: Vec<VhdPartitionConfig>,
     /// VHD whole-disk export status (runs independently from run_backup)
@@ -247,6 +258,8 @@ impl Default for BackupTab {
             prev_device_identity: None,
             prev_image_path: None,
             vhd_popup_open: false,
+            source_scan: None,
+            vhd_popup_after_scan: false,
             vhd_whole_disk: true,
             vhd_partition_configs: Vec::new(),
             vhd_export_status: None,
@@ -270,11 +283,13 @@ impl BackupTab {
         #[cfg(feature = "remote")]
         self.poll_remote(ctx);
         self.poll_min_size_calcs(ctx);
+        self.poll_source_scan(ctx);
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext, progress: &mut ProgressState) {
         // Poll background backup thread
         self.poll_progress(ctx, progress);
+        self.poll_source_scan(ctx);
 
         // Poll a pending remote connect / device-load worker
         #[cfg(feature = "remote")]
@@ -510,6 +525,13 @@ impl BackupTab {
                     self.scan_source_partitions(ctx);
                 }
             });
+        }
+
+        if let Some(job) = &self.source_scan {
+            ui.add_space(4.0);
+            if super::progress::show_job(ui, &job.snapshot()) {
+                job.cancel();
+            }
         }
 
         if !self.source_partitions.is_empty() {
@@ -843,6 +865,7 @@ impl BackupTab {
                     _ => true,
                 };
                 let can_start = has_source
+                    && self.source_scan.is_none()
                     && self.destination_folder.is_some()
                     && !self.backup_name.is_empty()
                     && has_partitions
@@ -877,12 +900,14 @@ impl BackupTab {
                             self.start_backup(ctx);
                         }
                     } else if self.compression_type == CompressionType::Vhd {
-                        // Scan partitions if not already loaded
+                        // Scan partitions if not already loaded; the popup opens when the scan ends.
                         if self.source_partitions.is_empty() {
                             self.scan_source_partitions(ctx);
+                            self.vhd_popup_after_scan = true;
+                        } else {
+                            self.init_vhd_configs();
+                            self.vhd_popup_open = true;
                         }
-                        self.init_vhd_configs();
-                        self.vhd_popup_open = true;
                     } else if self.compression_type == CompressionType::Chd
                         && !self.sector_by_sector
                         && self.resize_partitions
@@ -1533,7 +1558,8 @@ impl BackupTab {
 
     /// Scan source partition table and compute minimum partition sizes.
     /// For devices, this uses OS-level elevation (may prompt for credentials).
-    fn scan_source_partitions(&mut self, ctx: &mut TabContext) {
+    /// Forget the current source's partitions and minimum sizes, ahead of a new scan.
+    fn clear_source_scan_state(&mut self) {
         self.source_partitions.clear();
         self.selected_partitions.clear();
         self.partition_min_sizes.clear();
@@ -1543,9 +1569,18 @@ impl BackupTab {
         self.partition_defrag_default_applied.clear();
         self.deferred_min_sizes.clear();
         self.pending_min_size_calcs.clear();
-        self.source_file = None;
         self.source_partition_table_desc = None;
         self.partition_load_error = None;
+        self.vhd_popup_after_scan = false;
+        if let Some(old) = self.source_scan.take() {
+            old.cancel();
+        }
+    }
+
+    /// "Load partition info": read the table off the UI thread (a device may prompt for credentials).
+    fn scan_source_partitions(&mut self, ctx: &mut TabContext) {
+        self.clear_source_scan_state();
+        self.source_file = None;
 
         let path = match self.source_path(ctx) {
             Some(p) => p,
@@ -1562,172 +1597,14 @@ impl BackupTab {
         // (the descriptor is cached process-wide and would block an eject).
         self.open_device_path = if is_device { Some(path.clone()) } else { None };
 
-        // Open file (with elevation for devices)
-        let open_result: Result<rusty_backup::os::SourceHandle, String> = if is_device {
-            match rusty_backup::os::open_source_for_reading(&path) {
-                Ok(elevated) => {
-                    let (file, _guard) = elevated.into_parts();
-                    // Note: _guard is dropped here but the file handle remains valid
-                    Ok(file)
-                }
-                Err(e) => Err(format!("Cannot access device: {e}")),
-            }
-        } else {
-            File::open(&path)
-                .map(Into::into)
-                .map_err(|e| format!("Cannot open source: {e}"))
-        };
-
-        let file = match open_result {
-            Ok(f) => f,
-            Err(msg) => {
-                self.partition_load_error = Some(msg.clone());
-                ctx.log.error(msg);
-                return;
-            }
-        };
-
-        // Kept so the probes below can still clone the handle once `file` moves into the reader.
-        let source_handle = file.try_clone().ok();
-        // A device cannot answer seek(End); carry the length the OS reports instead.
-        let mut reader: Box<dyn rusty_backup::rbformats::ReadSeek> = if is_device {
-            Box::new(rusty_backup::os::known_len_source(file, &path))
-        } else {
-            Box::new(BufReader::new(file))
-        };
-        match PartitionTable::detect(&mut reader) {
-            Ok(table) => {
-                self.source_partitions = table.partitions();
-                self.select_all_partitions();
-                let table_desc = if matches!(table, PartitionTable::None { .. }) {
-                    "No partition table (superfloppy)".to_string()
-                } else {
-                    match table.byte_order_name() {
-                        Some(order) => format!("{} ({order})", table.type_name()),
-                        None => table.type_name().to_string(),
-                    }
-                };
-                self.source_partition_table_desc = Some(table_desc.clone());
-                ctx.log.info(format!(
-                    "Found {} partition(s) ({})",
-                    self.source_partitions.len(),
-                    table_desc,
-                ));
-
-                // Compute minimum partition sizes using filesystem analysis.
-                // Cheap filesystems (FAT/NTFS/exFAT) compute eagerly here; expensive
-                // ones (HFS/HFS+/ext/btrfs/ProDOS) defer until the user clicks
-                // "Calc min" in the per-partition resize popup.
-                let probes: Vec<(usize, u64, u64, u8, Option<String>, bool)> = self
-                    .source_partitions
-                    .iter()
-                    .map(|p| {
-                        (
-                            p.index,
-                            p.start_lba * 512,
-                            p.size_bytes,
-                            p.partition_type_byte,
-                            p.partition_type_string.clone(),
-                            p.is_extended_container,
-                        )
-                    })
-                    .collect();
-                for (idx, offset, size_bytes, type_byte, type_str, ext_container) in probes {
-                    if ext_container {
-                        continue;
-                    }
-                    let Some(Ok(clone)) = source_handle.as_ref().map(|f| f.try_clone()) else {
-                        continue;
-                    };
-                    // AFFS / Atari / DFS / CBM size themselves via seek(End), which a device refuses.
-                    let probe: Box<dyn rusty_backup::rbformats::ReadSeek> = if is_device {
-                        Box::new(rusty_backup::os::known_len_source(clone, &path))
-                    } else {
-                        Box::new(BufReader::new(clone))
-                    };
-                    let result = fs::partition_minimum_size(
-                        probe,
-                        offset,
-                        type_byte,
-                        type_str.as_deref(),
-                        size_bytes,
-                        false,
-                        None,
-                        &|_| {},
-                    );
-                    match result {
-                        fs::MinimumResult::Computed {
-                            in_place,
-                            defragmented,
-                            fragmentation_percent,
-                        } => {
-                            self.record_min_size_result(
-                                idx,
-                                in_place,
-                                defragmented,
-                                fragmentation_percent,
-                                size_bytes,
-                                type_byte,
-                                type_str.as_deref(),
-                            );
-                            if let Some(min) =
-                                self.effective_min_size(idx, type_byte, type_str.as_deref())
-                            {
-                                let suffix = if self
-                                    .partition_defrag_enabled
-                                    .get(&idx)
-                                    .copied()
-                                    .unwrap_or(false)
-                                {
-                                    " (space compacted via clone)"
-                                } else {
-                                    ""
-                                };
-                                let frag = fragmentation_percent
-                                    .map(|p| format!(", fragmentation {:.1}%", p))
-                                    .unwrap_or_default();
-                                ctx.log.info(format!(
-                                    "Partition {idx}: minimum size {} (original {}){suffix}{frag}",
-                                    disk_core::display::format_size(min),
-                                    disk_core::display::format_size(size_bytes),
-                                ));
-                            }
-                        }
-                        fs::MinimumResult::Deferred { fs_name } => {
-                            ctx.log.info(format!(
-                                "Partition {idx}: need to calculate minimum size due to filesystem {fs_name} (click \"Calc min\" to compute)",
-                            ));
-                            self.deferred_min_sizes.insert(idx, fs_name);
-                        }
-                    }
-                }
-                // Stash the open source file so worker threads can clone it later.
-                if let Some(Ok(f)) = source_handle
-                    .as_ref()
-                    .map(|f| f.try_clone().and_then(|h| h.into_file()))
-                {
-                    self.source_file = Some(Arc::new(f));
-                }
-            }
-            Err(e) => {
-                self.partition_load_error = Some(format!("Could not read partition table: {e}"));
-                ctx.log.error(format!("Partition scan failed: {e}"));
-            }
-        }
+        self.source_scan = Some(spawn_scan("Scanning partitions", move |job| {
+            rusty_backup::model::source_scan::scan_source(&path, is_device, job)
+        }));
     }
 
+    /// The automatic preview of an image file; devices wait for "Load partition info".
     fn load_partition_preview(&mut self, ctx: &mut TabContext) {
-        self.source_partitions.clear();
-        self.selected_partitions.clear();
-        self.partition_min_sizes.clear();
-        self.partition_defrag_min_sizes.clear();
-        self.partition_fragmentation.clear();
-        self.partition_defrag_enabled.clear();
-        self.partition_defrag_default_applied.clear();
-        self.deferred_min_sizes.clear();
-        self.pending_min_size_calcs.clear();
-        self.source_partition_table_desc = None;
-        self.partition_load_error = None;
+        self.clear_source_scan_state();
 
         let path = match self.source_path(ctx) {
             Some(p) => p,
@@ -1737,172 +1614,115 @@ impl BackupTab {
         // Only auto-load for image files (not raw devices which need elevation)
         let path_str = path.to_string_lossy();
         if path_str.starts_with("/dev/") || path_str.starts_with("\\\\.\\") {
-            // Device path -- skip auto-load to avoid permission prompts
             return;
         }
 
-        match File::open(&path) {
-            Ok(file) => {
-                // Detect image format (VHD, 2MG, DMG, or raw)
-                let detect_result =
-                    match rusty_backup::rbformats::detect_image_format_with_path(file, Some(&path))
-                    {
-                        Ok(format) => {
-                            let desc = format.description();
-                            ctx.log.info(format!("Detected format: {}", desc));
-                            match File::open(&path) {
-                                Ok(f2) => {
-                                    match rusty_backup::rbformats::wrap_image_reader(f2, format) {
-                                        Ok((mut reader, _size)) => {
-                                            PartitionTable::detect(&mut reader)
-                                        }
-                                        Err(e) => {
-                                            // Fallback to raw
-                                            ctx.log.warn(format!("Format wrap failed: {e}"));
-                                            match File::open(&path) {
-                                                Ok(f3) => {
-                                                    let mut r = BufReader::new(f3);
-                                                    PartitionTable::detect(&mut r)
-                                                }
-                                                Err(e) => Err(e.into()),
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(e) => Err(e.into()),
-                            }
-                        }
-                        Err(_) => {
-                            // Fallback to raw read
-                            match File::open(&path) {
-                                Ok(f2) => {
-                                    let mut r = BufReader::new(f2);
-                                    PartitionTable::detect(&mut r)
-                                }
-                                Err(e) => Err(e.into()),
-                            }
-                        }
-                    };
+        self.source_scan = Some(spawn_scan(PREVIEW_LABEL, move |job| {
+            rusty_backup::model::source_scan::scan_image(&path, job)
+        }));
+    }
 
-                match detect_result {
-                    Ok(table) => {
-                        self.source_partitions = table.partitions();
-                        self.select_all_partitions();
-                        let table_desc = if matches!(table, PartitionTable::None { .. }) {
-                            "No partition table (superfloppy)".to_string()
-                        } else {
-                            table.type_name().to_string()
-                        };
-                        self.source_partition_table_desc = Some(table_desc.clone());
-                        ctx.log.info(format!(
-                            "Source has {} partition(s) ({})",
-                            self.source_partitions.len(),
-                            table_desc,
-                        ));
-
-                        // Compute cheap minimum sizes, defer expensive ones.
-                        // Re-open the file for each probe so each partition's
-                        // call gets an independent seek cursor; format wrapping
-                        // (DMG/VHDX dynamic) is intentionally skipped here —
-                        // raw VHD and plain images have their tables at the
-                        // expected offsets.
-                        let probes: Vec<(usize, u64, u64, u8, Option<String>, bool)> = self
-                            .source_partitions
-                            .iter()
-                            .map(|p| {
-                                (
-                                    p.index,
-                                    p.start_lba * 512,
-                                    p.size_bytes,
-                                    p.partition_type_byte,
-                                    p.partition_type_string.clone(),
-                                    p.is_extended_container,
-                                )
-                            })
-                            .collect();
-                        for (idx, offset, size_bytes, type_byte, type_str, ext_container) in probes
-                        {
-                            if ext_container {
-                                continue;
-                            }
-                            let probe_reader = match File::open(&path) {
-                                Ok(f) => BufReader::new(f),
-                                Err(_) => continue,
-                            };
-                            let result = fs::partition_minimum_size(
-                                probe_reader,
-                                offset,
-                                type_byte,
-                                type_str.as_deref(),
-                                size_bytes,
-                                false,
-                                None,
-                                &|_| {},
-                            );
-                            match result {
-                                fs::MinimumResult::Computed {
-                                    in_place,
-                                    defragmented,
-                                    fragmentation_percent,
-                                } => {
-                                    self.record_min_size_result(
-                                        idx,
-                                        in_place,
-                                        defragmented,
-                                        fragmentation_percent,
-                                        size_bytes,
-                                        type_byte,
-                                        type_str.as_deref(),
-                                    );
-                                    if let Some(min) =
-                                        self.effective_min_size(idx, type_byte, type_str.as_deref())
-                                    {
-                                        let suffix = if self
-                                            .partition_defrag_enabled
-                                            .get(&idx)
-                                            .copied()
-                                            .unwrap_or(false)
-                                        {
-                                            " (space compacted via clone)"
-                                        } else {
-                                            ""
-                                        };
-                                        let frag = fragmentation_percent
-                                            .map(|p| format!(", fragmentation {:.1}%", p))
-                                            .unwrap_or_default();
-                                        ctx.log.info(format!(
-                                            "Partition {idx}: minimum size {} (original {}){suffix}{frag}",
-                                            disk_core::display::format_size(min),
-                                            disk_core::display::format_size(size_bytes),
-                                        ));
-                                    }
-                                }
-                                fs::MinimumResult::Deferred { fs_name } => {
-                                    ctx.log.info(format!(
-                                        "Partition {idx}: need to calculate minimum size due to filesystem {fs_name} (click \"Calc min\" to compute)",
-                                    ));
-                                    self.deferred_min_sizes.insert(idx, fs_name);
-                                }
-                            }
-                        }
-
-                        // Stash an unwrapped raw handle so the worker thread
-                        // can clone it later. For image files this is the raw
-                        // (still-wrapped) file; the worker will re-detect the
-                        // format if needed.
-                        if let Ok(f) = File::open(&path) {
-                            self.source_file = Some(Arc::new(f));
-                        }
-                    }
-                    Err(e) => {
-                        self.partition_load_error =
-                            Some(format!("Could not read partition table: {e}"));
-                    }
+    /// Apply a finished scan or preview: partitions, minimum sizes, log lines.
+    fn poll_source_scan(&mut self, ctx: &mut TabContext) {
+        let Some(job) = &self.source_scan else {
+            return;
+        };
+        let snap = job.snapshot();
+        if snap.is_running() {
+            return;
+        }
+        let outcome = job.take_result();
+        self.source_scan = None;
+        let after_vhd = std::mem::take(&mut self.vhd_popup_after_scan);
+        match (snap.status, outcome) {
+            (Status::Done, Some(Ok(scan))) => {
+                self.apply_source_scan(ctx, scan, snap.label == PREVIEW_LABEL);
+                if after_vhd {
+                    self.init_vhd_configs();
+                    self.vhd_popup_open = true;
                 }
             }
-            Err(e) => {
-                self.partition_load_error = Some(format!("Cannot open source: {e}"));
+            (Status::Done, Some(Err(f))) => {
+                if let Some(msg) = f.log_error {
+                    ctx.log.error(msg);
+                }
+                self.partition_load_error = Some(f.load_error);
             }
+            (Status::Cancelled, _) => ctx.log.info("Partition scan cancelled"),
+            (Status::Failed(msg), _) => {
+                ctx.log.error(format!("Partition scan failed: {msg}"));
+                self.partition_load_error = Some(msg);
+            }
+            (Status::Running, _) | (Status::Done, None) => {}
+        }
+    }
+
+    fn apply_source_scan(&mut self, ctx: &mut TabContext, scan: SourceScan, preview: bool) {
+        for (warn, note) in scan.notes {
+            if warn {
+                ctx.log.warn(note);
+            } else {
+                ctx.log.info(note);
+            }
+        }
+        self.source_partitions = scan.partitions;
+        self.select_all_partitions();
+        ctx.log.info(format!(
+            "{} {} partition(s) ({})",
+            if preview { "Source has" } else { "Found" },
+            self.source_partitions.len(),
+            scan.table_desc,
+        ));
+        self.source_partition_table_desc = Some(scan.table_desc);
+        for probe in scan.probes {
+            let idx = probe.index;
+            let type_str = probe.type_string.as_deref();
+            match probe.result {
+                fs::MinimumResult::Computed {
+                    in_place,
+                    defragmented,
+                    fragmentation_percent,
+                } => {
+                    self.record_min_size_result(
+                        idx,
+                        in_place,
+                        defragmented,
+                        fragmentation_percent,
+                        probe.size_bytes,
+                        probe.type_byte,
+                        type_str,
+                    );
+                    if let Some(min) = self.effective_min_size(idx, probe.type_byte, type_str) {
+                        let suffix = if self
+                            .partition_defrag_enabled
+                            .get(&idx)
+                            .copied()
+                            .unwrap_or(false)
+                        {
+                            " (space compacted via clone)"
+                        } else {
+                            ""
+                        };
+                        let frag = fragmentation_percent
+                            .map(|p| format!(", fragmentation {:.1}%", p))
+                            .unwrap_or_default();
+                        ctx.log.info(format!(
+                            "Partition {idx}: minimum size {} (original {}){suffix}{frag}",
+                            disk_core::display::format_size(min),
+                            disk_core::display::format_size(probe.size_bytes),
+                        ));
+                    }
+                }
+                fs::MinimumResult::Deferred { fs_name } => {
+                    ctx.log.info(format!(
+                        "Partition {idx}: need to calculate minimum size due to filesystem {fs_name} (click \"Calc min\" to compute)",
+                    ));
+                    self.deferred_min_sizes.insert(idx, fs_name);
+                }
+            }
+        }
+        if let Some(f) = scan.source_file {
+            self.source_file = Some(Arc::new(f));
         }
     }
 
@@ -2738,4 +2558,22 @@ impl BackupTab {
             self.backup_progress = None;
         }
     }
+}
+
+/// Run a scan as a job, handing a [`ScanFailure`] back as the result so the tab can place it.
+fn spawn_scan(
+    label: &str,
+    scan: impl FnOnce(&rusty_backup::model::job::JobCtx) -> anyhow::Result<SourceScan> + Send + 'static,
+) -> Job<ScanOutcome> {
+    Job::spawn(
+        label,
+        Arc::new(super::ui_logger::EguiWake),
+        move |job| match scan(job) {
+            Ok(found) => Ok(Ok(found)),
+            Err(e) => match e.downcast::<ScanFailure>() {
+                Ok(f) => Ok(Err(f)),
+                Err(e) => Err(e),
+            },
+        },
+    )
 }
