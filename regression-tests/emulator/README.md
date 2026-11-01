@@ -12,9 +12,9 @@ regression-tests/scripts/regress-emulators.sh ufs        # only ids containing "
 RB_CLI=/path/to/rb-cli TMPDIR=/big/disk regression-tests/scripts/regress-emulators.sh
 ```
 
-`scripts/regress-local.sh` runs the fixture suite, `produce` and `verify`;
-this driver is separate because each scenario boots an emulator (one to
-several minutes each).
+`scripts/regress-local.sh` runs these last, after the fixture suite, `produce`
+and `verify` (`--skip-emulators` leaves them out). Each scenario boots an
+emulator, so a pass takes about six minutes on m900.
 
 ## Scenarios
 

@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # One-host full regression: build, validate, run every case, produce every
 # artifact, then verify them with every oracle this host has (third-party
-# tools and the scripted emulators). No other machine is involved; for the
-# cross-OS sweep see regress-all.sh.
+# tools and the scripted emulators), then run the emulator scenarios
+# (regress-emulators.sh). No other machine is involved; for the cross-OS sweep
+# see regress-all.sh.
 #
-#   regression-tests/scripts/regress-local.sh [--no-gui-deps] [--skip-run] [--skip-verify]
+#   regression-tests/scripts/regress-local.sh [--no-gui-deps] [--skip-run] [--skip-verify] [--skip-emulators]
 #
 # Environment:
 #   RB_BUILD_DIR    cargo target dir (default: <repo>/target). Put it on a big disk.
@@ -24,11 +25,13 @@ REPO="$(cd "$REGRESS/.." && pwd)"
 NO_GUI_DEPS=0
 SKIP_RUN=0
 SKIP_VERIFY=0
+SKIP_EMU=0
 for a in "$@"; do
     case "$a" in
         --no-gui-deps) NO_GUI_DEPS=1 ;;
         --skip-run)    SKIP_RUN=1 ;;
         --skip-verify) SKIP_VERIFY=1 ;;
+        --skip-emulators) SKIP_EMU=1 ;;
         *) echo "unknown argument: $a" >&2; exit 2 ;;
     esac
 done
@@ -76,6 +79,11 @@ if [ "$SKIP_VERIFY" = 0 ]; then
     step "verify the artifacts with this host's oracles"
     # Script oracles that drive rb-cli themselves (motion) find it through RB_CLI.
     RB_CLI="$RB_CLI" "$RB" verify || FAILED=1
+fi
+
+if [ "$SKIP_EMU" = 0 ]; then
+    step "emulator scenarios (a scenario without its emulator here skips)"
+    RB_CLI="$RB_CLI" "$HERE/regress-emulators.sh" || FAILED=1
 fi
 
 step "done: $([ "$FAILED" = 0 ] && echo 'nothing to look at' || echo 'something needs a look - see above')"
