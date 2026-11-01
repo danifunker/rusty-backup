@@ -76,6 +76,8 @@ pub struct PhysicalDiskExport {
     target_partition: Option<usize>,
     /// Partitions on the selected device, re-read when the selection changes.
     target_partitions: Vec<rusty_backup::partition::PartitionInfo>,
+    /// Reading the selected device's partition table.
+    target_scan: Option<rusty_backup::model::job::Job<Vec<rusty_backup::partition::PartitionInfo>>>,
     /// Identity of the device `target_partitions` was read from.
     scanned_device: Option<rusty_backup::device::DeviceIdentity>,
 }
@@ -99,6 +101,7 @@ impl Default for PhysicalDiskExport {
             last_error: None,
             target_partition: None,
             target_partitions: Vec::new(),
+            target_scan: None,
             scanned_device: None,
         }
     }
@@ -382,9 +385,24 @@ impl PhysicalDiskExport {
 
         let identity = dev.identity();
         if self.scanned_device.as_ref() != Some(&identity) {
-            self.target_partitions = read_device_partitions(&dev.path);
+            // A device read, so off the UI thread; the list fills in when it lands.
+            let path = dev.path.clone();
+            self.target_scan = Some(rusty_backup::model::job::Job::spawn(
+                "Reading the target's partition table...",
+                std::sync::Arc::new(super::ui_logger::EguiWake),
+                move |_| Ok(read_device_partitions(&path)),
+            ));
+            self.target_partitions.clear();
             self.scanned_device = Some(identity);
             self.target_partition = None;
+        }
+        if let Some(job) = &self.target_scan {
+            if job.is_running() {
+                super::progress::show_job(ui, &job.snapshot());
+                return;
+            }
+            self.target_partitions = job.take_result().unwrap_or_default();
+            self.target_scan = None;
         }
 
         ui.separator();

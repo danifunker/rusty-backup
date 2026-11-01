@@ -249,6 +249,8 @@ pub struct InspectTab {
     bootable_job: Option<rusty_backup::model::job::Job<BootStep>>,
     /// Loading a backup folder's metadata (or a Clonezilla image's headers).
     backup_load_job: Option<rusty_backup::model::job::Job<BackupLoad>>,
+    /// Summarising an HFS volume before the Expand HFS dialog opens.
+    hfs_summary_job: Option<rusty_backup::model::job::Job<HfsSummary>>,
     /// Context for pending repair: (offset, ptype, type_string).
     repair_context: Option<(u64, u8, Option<String>)>,
     /// "Expand HFS Volume…" dialog (classic HFS only).
@@ -348,6 +350,7 @@ impl Default for InspectTab {
             table_apply_job: None,
             bootable_job: None,
             backup_load_job: None,
+            hfs_summary_job: None,
             repair_context: None,
             expand_hfs_dialog: None,
             alto_resize_dialog: None,
@@ -855,6 +858,7 @@ impl InspectTab {
         self.poll_table_apply_job(ctx);
         self.poll_bootable_job(ctx);
         self.poll_backup_load_job(ctx);
+        self.poll_hfs_summary_job(ctx);
         if let Some(job) = &self.backup_load_job {
             super::progress::show_job(ui, &job.snapshot());
         }
@@ -4691,17 +4695,35 @@ impl InspectTab {
                 return;
             }
         };
-        match summarize_hfs_source(&path, offset, partition_size) {
-            Ok(source) => {
-                self.expand_hfs_dialog = Some(ExpandHfsDialog::new(source));
-            }
-            Err(e) => {
-                ctx.log.error(format!("Cannot read source HFS volume: {e}"));
-            }
+        if self.hfs_summary_job.is_some() {
+            return;
+        }
+        // Opening the volume to summarise it is a read; the dialog opens when it lands.
+        self.hfs_summary_job = Some(rusty_backup::model::job::Job::spawn(
+            "Reading the HFS volume...",
+            Arc::new(super::ui_logger::EguiWake),
+            move |_| {
+                Ok(summarize_hfs_source(&path, offset, partition_size).map_err(|e| e.to_string()))
+            },
+        ));
+    }
+
+    fn poll_hfs_summary_job(&mut self, ctx: &mut TabContext) {
+        let Some(job) = &self.hfs_summary_job else {
+            return;
+        };
+        if job.is_running() {
+            return;
+        }
+        let out = job.take_result();
+        self.hfs_summary_job = None;
+        match out {
+            Some(Ok(source)) => self.expand_hfs_dialog = Some(ExpandHfsDialog::new(source)),
+            Some(Err(e)) => ctx.log.error(format!("Cannot read source HFS volume: {e}")),
+            None => ctx.log.error("Cannot read source HFS volume"),
         }
     }
 
-    /// Run filesystem check on a partition and display results.
     /// The source a check or repair should read: the remote image, or the selected device / image.
     fn fsck_source(
         &self,
@@ -6080,6 +6102,9 @@ enum BootStep {
     ),
     Written(Result<rusty_backup::fs::make_bootable::MakeBootableReport, String>),
 }
+
+/// An HFS volume's summary for the Expand HFS dialog, or why it couldn't be read.
+type HfsSummary = Result<rusty_backup::model::hfs_expand_runner::ExpandSource, String>;
 
 /// A backup folder's load result, or why it failed.
 type BackupLoad = Result<rusty_backup::model::backup_loader::LoadOutcome, String>;
