@@ -18,6 +18,20 @@ Line numbers are a snapshot. Re-check them before editing.
 - **RUN**: a model runner's spawn function
 - **SYNC**: runs on the UI thread
 
+## Phase 1 progress (updated as slices land)
+
+| Item | Status |
+|---|---|
+| 10. Missing panic guards | **Done.** Every model runner (2324ca57) and every shell thread (75b6d224) runs under `worker::spawn_guarded` / `spawn_detached`; `scripts/check-boundaries.sh` fails CI on a raw `thread::spawn` in a shell. |
+| 11. Busy gate | **Done** (275ebcb6). Inspect's jobs and the browse writers hold it; Inspect also polls while hidden. |
+| 1. Backup source scan / image preview | **Done** (ab571753): `model::source_scan` as a `Job`. |
+| 4. `prepare_disk_image_path` | **Done** (3f926ec0): `model::image_prep`, decoded as a `Job` by `gui::pending_image` (Backup + Restore; the other callers never decode). |
+| 5. fsck / repair | **GUI done** (6883328f): Inspect and browse via `fsck_runner::{check_target, repair_and_recheck}`. **TUI open:** its stdout/stderr suppression is process-wide, so it moves with item 9. |
+| 2. Browse apply staged edits | **Apply done** (2bb6fad1): `commander_ops::apply_queue`. Tar import and export selection still open. |
+| 3, 6, 7, 8, 9 | Open. |
+
+`gui::progress::show_job` draws any running job (spinner or bar, phase, Cancel).
+
 ## Totals
 
 | Front-end | How started | Distinct operations |
