@@ -138,6 +138,107 @@ pub fn apply_edits_reporting(
     Ok(outcome)
 }
 
+/// The volume details a browse view refreshes after an apply.
+pub struct VolumeAfter {
+    pub blessed: Option<(u64, String)>,
+    pub total: u64,
+    pub used: u64,
+}
+
+/// What [`apply_queue`] did; the edits always come back so the caller can restage what didn't land.
+pub enum QueueApply {
+    /// Adds onto existing names were found and nothing was written; ask, then apply again.
+    Conflicts {
+        edits: Vec<StagedEdit>,
+        conflicts: Vec<(String, String)>,
+    },
+    /// The run finished: `outcome` says which edits landed (it stops at the first failure).
+    Applied {
+        edits: Vec<StagedEdit>,
+        outcome: ApplyOutcome,
+        volume: Option<VolumeAfter>,
+    },
+    /// Opening, syncing or committing failed; `restage` is false once edits may be on the volume.
+    Failed {
+        edits: Vec<StagedEdit>,
+        message: String,
+        restage: bool,
+    },
+}
+
+/// The browse view's Apply: check for name conflicts (unless already reviewed), apply in order
+/// stopping at the first failure, and read back the volume details; meant to run as a job.
+pub fn apply_queue(
+    session: &BrowseSession,
+    edits: Vec<StagedEdit>,
+    check_conflicts: bool,
+    job: &crate::model::job::JobCtx,
+) -> QueueApply {
+    use crate::model::job::{Progress, Unit};
+    job.set_can_cancel(false);
+    if check_conflicts {
+        job.set_phase("Checking for name conflicts...");
+        if let Ok(mut fs) = session.open() {
+            let mut queue = super::edit_queue::EditQueue::default();
+            for e in &edits {
+                queue.push(e.clone());
+            }
+            let conflicts = queue.scan_against(&mut *fs).conflicts;
+            if !conflicts.is_empty() {
+                return QueueApply::Conflicts { edits, conflicts };
+            }
+        }
+    }
+    let total = edits.len() as u64;
+    job.set_phase("Writing...");
+    let result = apply_edits_reporting(session, &edits, false, |p| {
+        job.set_phase(format!("Writing {}", edit_label(p.edit)));
+        job.set_progress(Progress::Determinate {
+            done: p.index as u64 + 1,
+            total,
+            unit: Unit::Items,
+        });
+    });
+    let outcome = match result {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            let (message, restage) = match e.to_string().as_str() {
+                "opening source for editing" => (
+                    format!("Error opening filesystem: {}", e.root_cause()),
+                    true,
+                ),
+                "writing filesystem metadata" => {
+                    (format!("Error saving to disk: {}", e.root_cause()), false)
+                }
+                "committing container edits" => (
+                    format!("Error writing container: {}", e.root_cause()),
+                    false,
+                ),
+                _ => (format!("Error: {e:#}"), false),
+            };
+            return QueueApply::Failed {
+                edits,
+                message,
+                restage,
+            };
+        }
+    };
+    let volume = if outcome.failed.is_empty() {
+        session.open().ok().map(|mut fs| VolumeAfter {
+            blessed: fs.blessed_system_folder(),
+            total: fs.total_size(),
+            used: fs.used_size(),
+        })
+    } else {
+        None
+    };
+    QueueApply::Applied {
+        edits,
+        outcome,
+        volume,
+    }
+}
+
 /// The Apply preflight's verdict for a staged queue, from a fresh read-only open.
 #[derive(Debug, Default, Clone)]
 pub struct ApplyPreflight {
@@ -1913,6 +2014,92 @@ mod tests {
         }
         queue.remove_indices(&[0, 1, 5]);
         assert_eq!(queue.len(), 3);
+    }
+
+    fn run_apply_queue(session: &BrowseSession, edits: Vec<StagedEdit>, check: bool) -> QueueApply {
+        let session = session.clone();
+        let job = crate::model::job::Job::spawn(
+            "apply",
+            Arc::new(crate::model::job::NoNotify),
+            move |job| Ok(apply_queue(&session, edits, check, job)),
+        );
+        job.wait();
+        job.take_result().unwrap()
+    }
+
+    #[test]
+    fn apply_queue_asks_first_stops_at_a_failure_and_reports_the_volume() {
+        let (_img, session) = hfs_session();
+        let host = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(host.path(), b"abc").unwrap();
+
+        // A name collision is found before anything is written, and the edits come back.
+        match run_apply_queue(&session, vec![add("/", "Existing", host.path())], true) {
+            QueueApply::Conflicts { edits, conflicts } => {
+                assert_eq!(edits.len(), 1);
+                assert_eq!(
+                    conflicts,
+                    [("/Existing".to_string(), "Existing".to_string())]
+                );
+            }
+            _ => panic!("expected the conflict"),
+        }
+
+        // Without the check, the run stops at the failing add and reports where.
+        let edits = vec![
+            mkdir("/", "First"),
+            add("/", "Existing", host.path()),
+            add("/", "After", host.path()),
+        ];
+        match run_apply_queue(&session, edits, false) {
+            QueueApply::Applied {
+                edits,
+                outcome,
+                volume,
+            } => {
+                assert_eq!(edits.len(), 3);
+                assert_eq!(outcome.applied_indices, [0]);
+                assert_eq!(outcome.failed[0].index, 1);
+                assert!(volume.is_none());
+            }
+            _ => panic!("expected an applied run"),
+        }
+
+        // A clean run reads the volume back.
+        match run_apply_queue(&session, vec![add("/", "New", host.path())], true) {
+            QueueApply::Applied {
+                outcome, volume, ..
+            } => {
+                assert!(outcome.failed.is_empty());
+                let v = volume.expect("volume details after a clean apply");
+                assert!(v.used > 0 && v.total >= v.used);
+            }
+            _ => panic!("expected an applied run"),
+        }
+    }
+
+    #[test]
+    fn apply_queue_keeps_the_edits_staged_when_the_source_will_not_open() {
+        let session = BrowseSession {
+            source_path: Some(PathBuf::from("/nonexistent/disk.hfv")),
+            partition_type_string: Some("Apple_HFS".into()),
+            ..Default::default()
+        };
+        match run_apply_queue(&session, vec![mkdir("/", "x")], false) {
+            QueueApply::Failed {
+                edits,
+                message,
+                restage,
+            } => {
+                assert_eq!(edits.len(), 1);
+                assert!(restage);
+                assert!(
+                    message.starts_with("Error opening filesystem:"),
+                    "{message}"
+                );
+            }
+            _ => panic!("expected a failure"),
+        }
     }
 
     #[test]

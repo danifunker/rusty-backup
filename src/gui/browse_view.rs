@@ -19,7 +19,7 @@ use fs_mac::resource_fork::{self, ResourceForkMode};
 use rusty_backup::fs::zstd_stream::ZstdStreamCache;
 use rusty_backup::model::archive_edit::{self, ArchiveEditContext, ArchiveEditProgress};
 use rusty_backup::model::browse_session::{BrowseOpenStatus, BrowseSession};
-use rusty_backup::model::edit_queue::{self, EditQueue, StagedEdit};
+use rusty_backup::model::edit_queue::{EditQueue, StagedEdit};
 use rusty_backup::model::status::ExtractionProgress;
 use rusty_backup::rbformats::chd_edit::{
     self, is_compressed_chd, make_backup_copy, ChdEditSession,
@@ -164,6 +164,11 @@ pub struct BrowseView {
     repair_report: Option<rusty_backup::fs::RepairReport>,
     /// A running Check or Repair on this volume.
     fsck_job: Option<rusty_backup::model::job::Job<BrowseFsck>>,
+    /// A running Apply of the staged edits, and what to do once it lands.
+    apply_job: Option<(
+        rusty_backup::model::job::Job<rusty_backup::model::commander_ops::QueueApply>,
+        ApplyFollowUp,
+    )>,
     /// Cached tree-view text output.
     tree_text: Option<String>,
     /// Whether to show the tree-view popup.
@@ -477,6 +482,7 @@ impl Default for BrowseView {
             show_repair_confirm: false,
             repair_report: None,
             fsck_job: None,
+            apply_job: None,
             tree_text: None,
             show_tree_popup: false,
             tree_show_ids: false,
@@ -581,6 +587,8 @@ impl BrowseView {
             Some("Tar export")
         } else if self.fsck_job.is_some() {
             Some("Check / repair")
+        } else if self.apply_job.is_some() {
+            Some("Apply edits")
         } else {
             None
         }
@@ -908,6 +916,8 @@ impl BrowseView {
         }
         self.poll_fsck_job();
         self.render_fsck_job(ui);
+        self.poll_apply_job();
+        self.render_apply_job(ui);
 
         // If a background open is in progress, drain its status and either
         // render a spinner or finalize the open with the results it produced.
@@ -3593,10 +3603,7 @@ impl BrowseView {
                     .on_disabled_hover_text("Wait for the running extraction or export to finish")
                     .clicked()
                 {
-                    let applied = self.apply_staged_edits();
-                    if applied && self.archive_edit_ctx.is_some() && !self.has_edit_error() {
-                        self.start_archive_compress();
-                    }
+                    self.start_apply(ApplyFollowUp::RecompressArchive);
                 }
             }
 
@@ -4296,7 +4303,11 @@ impl BrowseView {
     /// Apply all staged edits to the filesystem in a single batch.
     /// Returns false when the batch was deferred to the conflict review; the
     /// callers used to read that as success and dropped the queue.
-    fn apply_staged_edits(&mut self) -> bool {
+    /// Apply the staged edits as a job; `follow_up` runs once they land.
+    fn start_apply(&mut self, follow_up: ApplyFollowUp) {
+        if self.apply_job.is_some() {
+            return;
+        }
         self.edit_free_space = None;
         log::info!(
             "Applying {} staged edit(s) to {}",
@@ -4307,108 +4318,156 @@ impl BrowseView {
                 .map(|p| p.display().to_string())
                 .unwrap_or_default()
         );
-        let (mut efs, commit) = match self.session.open_editable() {
-            Ok(pair) => pair,
-            Err(e) => {
-                log::error!("Failed to open editable filesystem: {e}");
-                self.edit_result = Some(format!("Error opening filesystem: {e}"));
-                return true;
-            }
-        };
+        // Collisions are found before anything is written, so the questions are asked once.
+        let check_conflicts = self.conflict_review.is_none();
+        let edits: Vec<StagedEdit> = self.staged_edits.drain().collect();
+        let session = self.session.clone();
+        let job = rusty_backup::model::job::Job::spawn(
+            "Applying edits...",
+            Arc::new(super::ui_logger::EguiWake),
+            move |job| {
+                Ok(rusty_backup::model::commander_ops::apply_queue(
+                    &session,
+                    edits,
+                    check_conflicts,
+                    job,
+                ))
+            },
+        );
+        self.apply_job = Some((job, follow_up));
+    }
 
-        // Find every collision before writing anything. Staging exists so the
-        // questions can be asked once; discovering them mid-batch would mean
-        // interrupting per file and leaving a half-applied queue if the user
-        // changes their mind at file 7 of 12.
-        if self.conflict_review.is_none() {
-            let conflicts = self.staged_edits.conflicting_adds(&mut *efs);
-            if !conflicts.is_empty() {
-                drop(efs);
+    /// Put edits back at the front of the queue, ahead of any staged while the job ran.
+    fn restage(&mut self, edits: impl IntoIterator<Item = StagedEdit>) {
+        let newer: Vec<StagedEdit> = self.staged_edits.drain().collect();
+        for e in edits.into_iter().chain(newer) {
+            self.staged_edits.push(e);
+        }
+    }
+
+    /// Take a finished Apply: report it, restage what didn't land, then run the follow-up.
+    fn poll_apply_job(&mut self) {
+        use rusty_backup::model::commander_ops::QueueApply;
+        use rusty_backup::model::job::Status;
+        let Some((job, _)) = &self.apply_job else {
+            return;
+        };
+        let snap = job.snapshot();
+        if snap.is_running() {
+            return;
+        }
+        let run = job.take_result();
+        let Some((_, follow_up)) = self.apply_job.take() else {
+            return;
+        };
+        match (snap.status, run) {
+            (Status::Done, Some(QueueApply::Conflicts { edits, conflicts })) => {
+                self.restage(edits);
+                // Default to Replace: the review shows exactly what will happen before any write.
                 self.conflict_review = Some(
                     conflicts
                         .into_iter()
-                        // Default to Replace: staging an add onto an existing
-                        // name is what "copy this file here" means, and the
-                        // review shows exactly what will happen before any
-                        // write. The replaced file's metadata is carried over.
                         .map(|(path, name)| {
                             (path, name, rusty_backup::fs::replace::OnConflict::Replace)
                         })
                         .collect(),
                 );
-                return false;
+                return;
+            }
+            (
+                Status::Done,
+                Some(QueueApply::Applied {
+                    edits,
+                    outcome,
+                    volume,
+                }),
+            ) => {
+                let total = edits.len();
+                let applied = outcome.applied();
+                if applied > 0 && self.chd_edit.is_some() {
+                    self.chd_diff_dirty = true;
+                }
+                match outcome.failed.first() {
+                    Some(f) => {
+                        let left = total - applied;
+                        self.edit_result = Some(format!(
+                            "Error on edit {}/{total}: {}. Applied {applied} of {total}; {left} edit(s) remain staged",
+                            f.index + 1,
+                            f.error
+                        ));
+                        let index = f.index;
+                        self.restage(edits.into_iter().skip(index));
+                        self.invalidate_all_caches();
+                        self.invalidate_cached_fs();
+                    }
+                    None => {
+                        self.edit_result = Some(format!("Applied {total} edit(s) successfully"));
+                        // The archive-import tempdir backed the AddFile host paths; the bytes are on the image now.
+                        self.archive_import_tempdir = None;
+                        self.invalidate_all_caches();
+                        self.invalidate_cached_fs();
+                        if let Some(v) = volume {
+                            self.blessed_folder = v.blessed;
+                            self.volume_total = v.total;
+                            self.volume_used = v.used;
+                        }
+                    }
+                }
+            }
+            (
+                Status::Done,
+                Some(QueueApply::Failed {
+                    edits,
+                    message,
+                    restage,
+                }),
+            ) => {
+                log::error!("{message}");
+                if restage {
+                    self.restage(edits);
+                }
+                self.edit_result = Some(message);
+            }
+            (Status::Failed(e), _) => {
+                self.edit_result = Some(format!("Error: {e}"));
+            }
+            _ => {}
+        }
+        self.conflict_review = None;
+        self.run_apply_follow_up(follow_up);
+    }
+
+    fn run_apply_follow_up(&mut self, follow_up: ApplyFollowUp) {
+        match follow_up {
+            ApplyFollowUp::RecompressArchive => {
+                if self.archive_edit_ctx.is_some() && !self.has_edit_error() {
+                    self.start_archive_compress();
+                }
+            }
+            ApplyFollowUp::LeaveEditing => {
+                if !self.has_edit_error() {
+                    if self.pending_close {
+                        self.close();
+                    } else {
+                        self.exit_edit_mode();
+                    }
+                }
             }
         }
+    }
 
-        let edits: Vec<StagedEdit> = self.staged_edits.drain().collect();
-        let total = edits.len();
-
-        // Stop at the first failure but keep the failed edit and everything
-        // after it staged: a half-applied batch must not vanish silently.
-        let mut applied = 0usize;
-        let mut failure: Option<String> = None;
-        for (i, edit) in edits.iter().enumerate() {
-            if let Err(e) = edit_queue::apply_edit(&mut *efs, edit) {
-                failure = Some(format!("Error on edit {}/{total}: {e}", i + 1));
-                break;
-            }
-            applied += 1;
-        }
-        if failure.is_some() {
-            for edit in edits.into_iter().skip(applied) {
-                self.staged_edits.push(edit);
-            }
-        }
-
-        // Whatever did land still has to reach the disk and the container.
-        if applied > 0 {
-            if let Err(e) = efs.sync_metadata() {
-                self.edit_result = Some(format!("Error saving to disk: {e}"));
-                return true;
-            }
-        }
-
-        // Persist: re-encode the temp flat back into the container (no-op for
-        // raw images). Drop the editable handle first so its writes are
-        // flushed to the temp before the re-encode reads it.
-        drop(efs);
-        if applied > 0 {
-            if let Err(e) = commit.commit() {
-                self.edit_result = Some(format!("Error writing container: {e}"));
-                return true;
-            }
-            if self.chd_edit.is_some() {
-                self.chd_diff_dirty = true;
-            }
-        }
-
-        if let Some(failure) = failure {
-            let left = total - applied;
-            self.edit_result = Some(format!(
-                "{failure}. Applied {applied} of {total}; {left} edit(s) remain staged"
-            ));
-            self.invalidate_all_caches();
-            self.invalidate_cached_fs();
-            return true;
-        }
-
-        self.edit_result = Some(format!("Applied {total} edit(s) successfully"));
-        // The archive-import tempdir backed the just-applied AddFile
-        // host_paths; safe to drop now that the bytes are on the image.
-        self.archive_import_tempdir = None;
-        self.invalidate_all_caches();
-
-        // Update blessed folder info after apply. The volume bytes were
-        // mutated by the apply pass, so any cached read-only fs is stale —
-        // invalidate before re-opening.
-        self.invalidate_cached_fs();
-        if let Some(mut fs) = self.take_or_open_fs() {
-            self.blessed_folder = fs.blessed_system_folder();
-            self.volume_total = fs.total_size();
-            self.volume_used = fs.used_size();
-            self.return_fs(fs);
-        }
-        true
+    /// A small window with the running Apply.
+    fn render_apply_job(&self, ui: &mut egui::Ui) {
+        let Some((job, _)) = &self.apply_job else {
+            return;
+        };
+        let snap = job.snapshot();
+        egui::Window::new(snap.label.clone())
+            .collapsible(false)
+            .resizable(false)
+            .show(ui.ctx(), |ui| {
+                super::progress::show_job(ui, &snap);
+            });
     }
 
     fn has_edit_error(&self) -> bool {
@@ -4746,14 +4805,9 @@ impl BrowseView {
             for (path, _name, decision) in &rows {
                 self.staged_edits.set_conflict_for(path, *decision);
             }
-            // Keep the review non-None so the re-entry does not ask again;
-            // apply_staged_edits clears it when it finishes.
+            // Keep the review non-None so the apply does not ask again; the poll clears it.
             self.conflict_review = Some(rows);
-            let applied = self.apply_staged_edits();
-            self.conflict_review = None;
-            if applied && self.archive_edit_ctx.is_some() && !self.has_edit_error() {
-                self.start_archive_compress();
-            }
+            self.start_apply(ApplyFollowUp::RecompressArchive);
             return;
         }
         self.conflict_review = Some(rows);
@@ -4835,20 +4889,7 @@ impl BrowseView {
                     }
                     if ui.button("Apply Edits").clicked() {
                         self.show_unsaved_dialog = false;
-                        let applied = self.apply_staged_edits();
-                        let ok = applied
-                            && self
-                                .edit_result
-                                .as_ref()
-                                .map(|r| !r.starts_with("Error"))
-                                .unwrap_or(true);
-                        if ok {
-                            if self.pending_close {
-                                self.close();
-                            } else {
-                                self.exit_edit_mode();
-                            }
-                        }
+                        self.start_apply(ApplyFollowUp::LeaveEditing);
                     }
                     if ui.button("Cancel").clicked() {
                         self.show_unsaved_dialog = false;
@@ -6698,4 +6739,13 @@ enum BrowseFsck {
         commit_error: Option<String>,
         recheck: Option<(Box<dyn Filesystem>, Option<rusty_backup::fs::FsckResult>)>,
     },
+}
+
+/// What to do once a staged-edit Apply lands without an error.
+#[derive(Clone, Copy)]
+enum ApplyFollowUp {
+    /// Re-encode the edited archive (the Apply button and the conflict review).
+    RecompressArchive,
+    /// Close the view or leave edit mode (the unsaved-changes dialog).
+    LeaveEditing,
 }
