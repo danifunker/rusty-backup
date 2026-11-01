@@ -991,6 +991,17 @@ impl BrowseView {
         self.poll_fsck_job();
         self.render_fsck_job(ui);
         self.poll_reads();
+        if let Some((job, _)) = &self.read_job {
+            let snap = job.snapshot();
+            if snap.label == ARCHIVE_READ_LABEL {
+                egui::Window::new(snap.label.clone())
+                    .collapsible(false)
+                    .resizable(false)
+                    .show(ui.ctx(), |ui| {
+                        super::progress::show_job(ui, &snap);
+                    });
+            }
+        }
         self.poll_archive_sniff();
         self.poll_apply_job();
         self.render_apply_job(ui);
@@ -2014,8 +2025,12 @@ impl BrowseView {
         let cached = self.cached_fs.take();
         let session = self.session.clone();
         let show_deleted = self.show_deleted;
+        let label = match &read {
+            FsRead::Archive(..) => ARCHIVE_READ_LABEL,
+            _ => "Reading",
+        };
         let job = rusty_backup::model::job::Job::spawn(
-            "Reading",
+            label,
             Arc::new(super::ui_logger::EguiWake),
             move |_| {
                 let mut fs = match cached {
@@ -2045,6 +2060,10 @@ impl BrowseView {
                             .read_file(&entry, MAX_PREVIEW_SIZE)
                             .map_err(|e| e.to_string());
                         FsReadDone::Preview(entry, result)
+                    }
+                    FsRead::Archive(entry, purpose) => {
+                        let result = read_mac_archive(&mut *fs, &entry, purpose);
+                        FsReadDone::Archive(entry, purpose, result)
                     }
                 };
                 Ok((Some(fs), done))
@@ -2089,6 +2108,9 @@ impl BrowseView {
             }
             FsReadDone::List(dir, Err(e)) => {
                 self.error = Some(format!("Failed to read {}: {e}", dir.path));
+            }
+            FsReadDone::Archive(entry, purpose, result) => {
+                self.apply_archive_read(entry, purpose, result);
             }
             FsReadDone::Preview(entry, result) => {
                 // Only the file still selected gets its preview.
@@ -4152,44 +4174,9 @@ impl BrowseView {
     /// the archive's entries. Read-only — the user can extract any
     /// subset but can't modify the archive itself.
     fn open_archive_browse_window(&mut self, entry: &FileEntry) {
-        let raw_bytes = {
-            let Some(mut fs) = self.take_or_open_fs() else {
-                self.edit_result = Some("Filesystem not open".into());
-                return;
-            };
-            let result = fs.read_file(entry, usize::MAX);
-            self.return_fs(fs);
-            match result {
-                Ok(b) => b,
-                Err(e) => {
-                    self.edit_result = Some(format!("Read failed: {e}"));
-                    return;
-                }
-            }
-        };
-        let kind = match detect_mac_archive(&raw_bytes) {
-            Some(k) => k,
-            None => {
-                self.edit_result = Some(format!("{} is not a recognized Mac archive.", entry.name));
-                return;
-            }
-        };
-        let (bytes, archive) = match mac_extract::open_bytes(raw_bytes) {
-            Ok(p) => p,
-            Err(e) => {
-                self.edit_result = Some(format!("{} decode failed: {e}", entry.name));
-                return;
-            }
-        };
-        let selected = vec![true; archive.entries.len()];
-        self.mac_archive_window = Some(MacArchiveWindow {
-            entry_name: entry.name.clone(),
-            kind,
-            bytes,
-            archive,
-            selected,
-            fork_format: mac_extract::ForkFormat::BinHex,
-        });
+        self.read_queue
+            .push_back(FsRead::Archive(entry.clone(), ArchiveUse::Browse));
+        self.pump_reads();
     }
 
     /// Workflow C trigger: read the selected file's bytes off the disk
@@ -4197,46 +4184,48 @@ impl BrowseView {
     /// the Save-as-is / Decode-and-save modal. On a non-archive (or a
     /// read failure), surface a one-line error and don't open the modal.
     fn open_archive_extract_modal(&mut self, entry: &FileEntry) {
-        let raw_bytes = {
-            let Some(mut fs) = self.take_or_open_fs() else {
-                self.edit_result = Some("Filesystem not open".into());
-                return;
-            };
-            let result = fs.read_file(entry, usize::MAX);
-            self.return_fs(fs);
-            match result {
-                Ok(b) => b,
-                Err(e) => {
-                    self.edit_result = Some(format!("Read failed: {e}"));
-                    return;
-                }
-            }
-        };
-        let kind = match detect_mac_archive(&raw_bytes) {
-            Some(k) => k,
-            None => {
-                self.edit_result = Some(format!(
-                    "{} is not a recognized Mac archive (use Extract File to save raw bytes).",
-                    entry.name
-                ));
+        self.read_queue
+            .push_back(FsRead::Archive(entry.clone(), ArchiveUse::Extract));
+        self.pump_reads();
+    }
+
+    /// Open the archive window or the extract modal for a decoded archive.
+    fn apply_archive_read(
+        &mut self,
+        entry: FileEntry,
+        purpose: ArchiveUse,
+        result: Result<ArchiveRead, String>,
+    ) {
+        let read = match result {
+            Ok(read) => read,
+            Err(msg) => {
+                self.edit_result = Some(msg);
                 return;
             }
         };
-        let (extract_bytes, archive) = match mac_extract::open_bytes(raw_bytes.clone()) {
-            Ok(p) => p,
-            Err(e) => {
-                self.edit_result = Some(format!("{} decode failed: {e}", entry.name));
-                return;
+        match purpose {
+            ArchiveUse::Browse => {
+                let selected = vec![true; read.archive.entries.len()];
+                self.mac_archive_window = Some(MacArchiveWindow {
+                    entry_name: entry.name.clone(),
+                    kind: read.kind,
+                    bytes: read.bytes,
+                    archive: read.archive,
+                    selected,
+                    fork_format: mac_extract::ForkFormat::BinHex,
+                });
             }
-        };
-        self.pending_archive_extract = Some(PendingArchiveExtract {
-            entry_name: entry.name.clone(),
-            kind,
-            raw_bytes,
-            extract_bytes,
-            archive,
-            fork_format: mac_extract::ForkFormat::BinHex,
-        });
+            ArchiveUse::Extract => {
+                self.pending_archive_extract = Some(PendingArchiveExtract {
+                    entry_name: entry.name.clone(),
+                    kind: read.kind,
+                    raw_bytes: read.raw,
+                    extract_bytes: read.bytes,
+                    archive: read.archive,
+                    fork_format: mac_extract::ForkFormat::BinHex,
+                });
+            }
+        }
     }
 
     /// Walk `entry` (and its children if a directory) on the open
@@ -7018,6 +7007,8 @@ fn tar_import_step(
 enum FsRead {
     List(FileEntry),
     Preview(FileEntry),
+    /// Read a whole file and decode it as a Mac archive.
+    Archive(FileEntry, ArchiveUse),
 }
 
 impl FsRead {
@@ -7026,6 +7017,7 @@ impl FsRead {
         match self {
             FsRead::List(dir) => FsReadDone::List(dir, Err(message)),
             FsRead::Preview(entry) => FsReadDone::Preview(entry, Err(message)),
+            FsRead::Archive(entry, purpose) => FsReadDone::Archive(entry, purpose, Err(message)),
         }
     }
 }
@@ -7034,6 +7026,58 @@ impl FsRead {
 enum FsReadDone {
     List(FileEntry, Result<Vec<FileEntry>, String>),
     Preview(FileEntry, Result<Vec<u8>, String>),
+    Archive(FileEntry, ArchiveUse, Result<ArchiveRead, String>),
+}
+
+/// The label of a Mac-archive read, which gets its own progress window.
+const ARCHIVE_READ_LABEL: &str = "Reading the archive...";
+
+/// Which window a decoded archive opens.
+#[derive(Clone, Copy)]
+enum ArchiveUse {
+    /// The read-only archive viewer (Workflow E).
+    Browse,
+    /// The Save-as-is / Decode-and-save modal (Workflow C).
+    Extract,
+}
+
+/// A Mac archive read off the volume and decoded.
+struct ArchiveRead {
+    kind: MacArchiveKind,
+    /// The file as stored (Extract saves it as-is).
+    raw: Vec<u8>,
+    bytes: Vec<u8>,
+    archive: arc_mac::stuffit::StuffItArchive,
+}
+
+/// Read `entry` whole, check it is a Mac archive, and decode it; the error is the status-line message.
+fn read_mac_archive(
+    fs: &mut dyn Filesystem,
+    entry: &FileEntry,
+    purpose: ArchiveUse,
+) -> Result<ArchiveRead, String> {
+    let raw = fs
+        .read_file(entry, usize::MAX)
+        .map_err(|e| format!("Read failed: {e}"))?;
+    let kind = detect_mac_archive(&raw).ok_or_else(|| match purpose {
+        ArchiveUse::Browse => format!("{} is not a recognized Mac archive.", entry.name),
+        ArchiveUse::Extract => format!(
+            "{} is not a recognized Mac archive (use Extract File to save raw bytes).",
+            entry.name
+        ),
+    })?;
+    let keep_raw = match purpose {
+        ArchiveUse::Browse => Vec::new(),
+        ArchiveUse::Extract => raw.clone(),
+    };
+    let (bytes, archive) =
+        mac_extract::open_bytes(raw).map_err(|e| format!("{} decode failed: {e}", entry.name))?;
+    Ok(ArchiveRead {
+        kind,
+        raw: keep_raw,
+        bytes,
+        archive,
+    })
 }
 
 /// A finished read, and the filesystem it borrowed (when it had one to give back).
