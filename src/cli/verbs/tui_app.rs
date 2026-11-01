@@ -2133,6 +2133,12 @@ struct CommanderState {
     /// A running checksum job (CRC32/MD5/SHA1/SHA256 of the marked files),
     /// polled each `tick`. `None` when idle.
     checksum: Option<Arc<Mutex<crate::model::checksum::ChecksumStatus>>>,
+    /// A running host-to-host copy, polled in `tick`: status, label, destination side.
+    host_copy: Option<(
+        Arc<Mutex<crate::model::commander_ops::HostCopyStatus>>,
+        String,
+        Side,
+    )>,
     /// The scrollable checksum-results overlay once a job completes.
     checksum_report: Option<ChecksumReportView>,
     /// The File Info overlay for the active pane's cursor entry (`i`), holding
@@ -2474,6 +2480,15 @@ impl CommanderState {
     /// host is a plain copy; image->image extracts+stages. A remote destination
     /// uploads over the wire.
     fn copy(&mut self) {
+        if self.host_copy.is_some() {
+            self.status = Some("A copy is already running.".to_string());
+            self.is_error = true;
+            return;
+        }
+        let dst_side = match self.active {
+            Side::Left => Side::Right,
+            Side::Right => Side::Left,
+        };
         let (src, dst) = match self.active {
             Side::Left => (&mut self.left, &mut self.right),
             Side::Right => (&mut self.right, &mut self.left),
@@ -2663,6 +2678,7 @@ impl CommanderState {
             };
             // The shared runner recurses folders, refuses a copy into itself
             // and keeps forks; the flat loop wrote a folder as an empty file.
+            // `tick` finishes it (status, refresh, marks), so the screen keeps drawing meanwhile.
             let status = crate::model::commander_ops::spawn_host_copy(
                 crate::model::commander_ops::HostCopyJob::HostToHost {
                     entries: entries.clone(),
@@ -2670,19 +2686,10 @@ impl CommanderState {
                     on_conflict: crate::fs::replace::OnConflict::Replace,
                 },
             );
-            loop {
-                let (finished, error, copied) = {
-                    let g = crate::model::worker::lock_status(&status);
-                    (g.finished, g.error.clone(), g.copied)
-                };
-                if finished {
-                    break match error {
-                        Some(e) => Err(format!("Copy failed: {e}")),
-                        None => Ok(format!("Copied {copied} item(s) to {label}.")),
-                    };
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
+            self.host_copy = Some((status, label.clone(), dst_side));
+            self.status = Some(format!("Copying {label}..."));
+            self.is_error = false;
+            return;
         } else {
             // image -> image: extract the entries to a temp dir, stage them as
             // AddFiles on the destination's browse session, then apply. The temp
@@ -3444,6 +3451,14 @@ struct SettingsState {
 /// Number of editable toggle rows on the Settings tab.
 const SETTINGS_TOGGLES: usize = 2;
 
+/// What a finished [`TuiTask`] does to the app, run on the UI thread.
+type TaskDone = Box<dyn FnOnce(&mut App) + Send>;
+
+/// A slow TUI operation on a worker thread; the screen keeps drawing and the result lands in `tick`.
+struct TuiTask {
+    job: crate::model::job::Job<TaskDone>,
+}
+
 struct App {
     palette: Palette,
     border: BorderSet,
@@ -3495,6 +3510,8 @@ struct App {
     /// silently stopping at the bottom edge.
     help_scroll: usize,
     should_quit: bool,
+    /// A slow operation running as a job behind a "Working" box; keys wait until it ends.
+    task: Option<TuiTask>,
 }
 
 impl App {
@@ -3527,6 +3544,7 @@ impl App {
             show_help: false,
             help_scroll: 0,
             should_quit: false,
+            task: None,
         };
         app.on_tab_changed();
         app
@@ -3614,6 +3632,13 @@ impl App {
 
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.should_quit = true;
+            return Ok(());
+        }
+        // A running task owns the keyboard: Esc asks it to stop, everything else waits.
+        if let Some(task) = &self.task {
+            if key.code == KeyCode::Esc && task.job.snapshot().can_cancel {
+                task.job.cancel();
+            }
             return Ok(());
         }
 
@@ -3941,7 +3966,7 @@ impl App {
                     None
                 };
                 if let Some((path, selector, label)) = target {
-                    self.open_explorer(&path, selector, label);
+                    self.open_explorer_async(path, selector, label);
                 }
             }
             // Disk list: Enter → the disk's own partition table, with its
@@ -3976,82 +4001,33 @@ impl App {
         selector: Option<crate::cli::img_at::PartSelector>,
         part_label: String,
     ) {
-        use crate::cli::resolve::resolve_partition_streaming_forced_inside;
-        let path = std::path::Path::new(image_path);
-        let built = (|| -> anyhow::Result<Explorer> {
-            let (reader, ctx) = resolve_partition_streaming_forced_inside(
-                path,
-                selector.clone(),
-                None,
-                None,
-                None,
-            )?;
-            let mut fs = ctx
-                .open_ro(reader, None)
-                .map_err(|e| anyhow::anyhow!("opening filesystem: {e}"))?;
-            let volume = fs.volume_label().map(|s| s.to_string());
-            let blessed = fs.blessed_system_folder();
-            let root = fs
-                .root()
-                .map_err(|e| anyhow::anyhow!("reading root: {e}"))?;
-            let mut list = fs
-                .list_directory(&root)
-                .map_err(|e| anyhow::anyhow!("listing root: {e}"))?;
-            sort_entries(&mut list);
-            let mut ex = Explorer {
-                fs,
-                image_path: image_path.to_string(),
-                selector,
-                part_label,
-                volume,
-                blessed,
-                tree: vec![TreeNode {
-                    dir: root,
-                    depth: 0,
-                    expanded: false,
-                }],
-                tree_sel: 0,
-                list,
-                list_sel: 0,
-                marked: std::collections::BTreeMap::new(),
-                focus: ExFocus::Tree,
-                status: None,
-                picker: None,
-                export_menu: None,
-                export_fmt: ExportFormat::Fork(RfMode::AppleDouble),
-                preview: None,
-                metadata: None,
-                confirm_close: false,
-                confirm_bless: None,
-                mkdir_input: None,
-                confirm_delete: None,
-                confirm_overwrite: None,
-                editor: None,
-                fsck_report: None,
-                transform_menu: None,
-            };
-            // Expand the root so its subdirectories show in the tree immediately.
-            ex.tree_expand();
-            Ok(ex)
-        })();
-        match built {
+        match build_explorer(image_path, selector, part_label) {
             Ok(ex) => {
                 self.explorer = Some(ex);
                 self.status = None;
             }
-            Err(e) => {
-                // An optical `.iso` (incl. NKit-scrubbed GC/Wii) has no MBR/GPT,
-                // so it fails here with a cryptic parse error. Give NKit images
-                // the convert-it-first hint and other optical images a redirect
-                // to the Commander's optical open / the `optical` verbs.
-                let hinted = if crate::cli::optical_hint::is_nkit_image(path) {
-                    crate::cli::optical_hint::with_nkit_hint(e, path)
-                } else {
-                    crate::cli::optical_hint::with_optical_hint(e, path)
-                };
-                self.status = Some(format!("Cannot browse: {hinted:#}"));
-            }
+            Err(msg) => self.status = Some(msg),
         }
+    }
+
+    /// Open the Explorer as a task, so a large volume's catalog loads while the screen keeps drawing.
+    fn open_explorer_async(
+        &mut self,
+        image_path: String,
+        selector: Option<crate::cli::img_at::PartSelector>,
+        part_label: String,
+    ) {
+        self.start_task("Opening the filesystem", move |job| {
+            job.set_can_cancel(false);
+            let built = build_explorer(&image_path, selector, part_label);
+            Ok(Box::new(move |app: &mut App| match built {
+                Ok(ex) => {
+                    app.explorer = Some(ex);
+                    app.status = None;
+                }
+                Err(msg) => app.status = Some(msg),
+            }) as TaskDone)
+        });
     }
 
     /// Rows the Explorer shows at once — the PageUp/PageDown step.
@@ -5080,30 +5056,34 @@ impl App {
     /// Run fsck on the Explorer's open partition and show the result overlay.
     /// Read-only — checks the already-open filesystem in place.
     fn explorer_fsck(&mut self) {
-        let Some(ex) = self.explorer.as_mut() else {
+        let Some(ex) = self.explorer.as_ref() else {
             return;
         };
-        let lines = match with_stderr_suppressed(|| ex.fs.fsck()) {
-            Some(Ok(result)) => format_fsck_lines(&result),
-            Some(Err(e)) => vec![format!("Check failed: {e:#}")],
-            None => vec![
-                "This filesystem has no integrity checker.".to_string(),
-                String::new(),
-                "(fsck is available for FAT/exFAT, ext*, NTFS, HFS/HFS+, and the".to_string(),
-                " supported retro filesystems.)".to_string(),
-            ],
-        };
-        ex.fsck_report = Some(FsckReportView {
-            title: format!("fsck - {}", ex.part_label),
-            lines,
-            scroll: 0,
+        let (image_path, selector, part_label) = (
+            ex.image_path.clone(),
+            ex.selector.clone(),
+            ex.part_label.clone(),
+        );
+        // A fresh read-only open on the worker: the Explorer keeps its own for browsing.
+        self.start_task("Checking the filesystem", move |job| {
+            job.set_can_cancel(false);
+            let mut fs = open_partition_ro(&image_path, selector)?;
+            let lines = fsck_report_lines(fs.fsck());
+            Ok(Box::new(move |app: &mut App| {
+                if let Some(ex) = app.explorer.as_mut() {
+                    ex.fsck_report = Some(FsckReportView {
+                        title: format!("fsck - {part_label}"),
+                        lines,
+                        scroll: 0,
+                    });
+                    ex.status = None;
+                }
+            }) as TaskDone)
         });
-        ex.status = None;
     }
 
     /// Repair the Explorer's open partition in place (reopen read-write via the
-    /// shared repair core), then reopen the view and show a combined
-    /// repair + re-check report.
+    /// shared repair core), re-check it, then reopen the view and show the combined report.
     fn explorer_repair(&mut self) {
         let Some(ex) = self.explorer.as_ref() else {
             return;
@@ -5114,38 +5094,48 @@ impl App {
             ex.part_label.clone(),
             ex.dir_components(),
         );
-        match with_stderr_suppressed(|| apply_repair(&image_path, selector.clone())) {
-            Ok(report) => {
-                let mut lines = format_repair_lines(&report);
-                self.reopen_explorer(
+        self.start_task("Repairing the filesystem", move |job| {
+            job.set_can_cancel(false);
+            let report = match apply_repair(&image_path, selector.clone()) {
+                Ok(report) => report,
+                Err(e) => {
+                    let msg = format!("Repair failed: {e:#}");
+                    return Ok(Box::new(move |app: &mut App| {
+                        if let Some(ex) = app.explorer.as_mut() {
+                            ex.status = Some(msg);
+                        }
+                    }) as TaskDone);
+                }
+            };
+            job.set_phase("Checking the repaired filesystem");
+            let mut lines = format_repair_lines(&report);
+            lines.push(String::new());
+            lines.push("--- re-check after repair ---".to_string());
+            match open_partition_ro(&image_path, selector.clone()) {
+                Ok(mut fs) => match fs.fsck() {
+                    Some(Ok(result)) => lines.extend(format_fsck_lines(&result)),
+                    Some(Err(e)) => lines.push(format!("Re-check failed: {e:#}")),
+                    None => lines.push("(no checker for re-check)".to_string()),
+                },
+                Err(e) => lines.push(format!("Re-check failed: {e:#}")),
+            }
+            Ok(Box::new(move |app: &mut App| {
+                app.reopen_explorer(
                     &image_path,
                     selector,
                     part_label.clone(),
                     &comps,
                     Some("Repair complete".to_string()),
                 );
-                // Re-check the freshly reopened filesystem to show updated state.
-                if let Some(ex) = self.explorer.as_mut() {
-                    lines.push(String::new());
-                    lines.push("--- re-check after repair ---".to_string());
-                    match with_stderr_suppressed(|| ex.fs.fsck()) {
-                        Some(Ok(result)) => lines.extend(format_fsck_lines(&result)),
-                        Some(Err(e)) => lines.push(format!("Re-check failed: {e:#}")),
-                        None => lines.push("(no checker for re-check)".to_string()),
-                    }
+                if let Some(ex) = app.explorer.as_mut() {
                     ex.fsck_report = Some(FsckReportView {
                         title: format!("repair - {part_label}"),
                         lines,
                         scroll: 0,
                     });
                 }
-            }
-            Err(e) => {
-                if let Some(ex) = self.explorer.as_mut() {
-                    ex.status = Some(format!("Repair failed: {e:#}"));
-                }
-            }
-        }
+            }) as TaskDone)
+        });
     }
 
     /// Apply the staged bless (the folder captured in `confirm_bless` when the
@@ -7841,6 +7831,7 @@ impl App {
     /// Per-frame update: feed the progress tracker and drop a finished task's
     /// worker (the bar stays until the user presses Esc, showing 100%).
     fn tick(&mut self) {
+        self.poll_task();
         // Mirror a running backup's shared progress into the visual bar, and
         // capture its terminal result once it finishes.
         if let Some(run) = self.backup.as_ref().and_then(|b| b.run.clone()) {
@@ -8003,6 +7994,40 @@ impl App {
             let cur = p.shared.lock().map(|s| s.current).unwrap_or(0);
             p.tracker.record(cur, &p.label);
         }
+        // Finish a background host-to-host copy, or show its progress.
+        if let Some(c) = self.commander.as_mut() {
+            let snapshot = c.host_copy.as_ref().map(|(status, label, side)| {
+                let g = crate::model::worker::lock_status(status);
+                (
+                    g.finished,
+                    g.error.clone(),
+                    g.copied,
+                    g.files_total,
+                    label.clone(),
+                    *side,
+                )
+            });
+            if let Some((finished, error, copied, total, label, dst)) = snapshot {
+                if finished {
+                    c.host_copy = None;
+                    match error {
+                        Some(e) => c.set_result(Err(format!("Copy failed: {e}"))),
+                        None => {
+                            cmd_refresh(c.pane_mut(dst));
+                            let src = match dst {
+                                Side::Left => Side::Right,
+                                Side::Right => Side::Left,
+                            };
+                            c.pane_mut(src).listing.clear_selection();
+                            c.set_result(Ok(format!("Copied {copied} item(s) to {label}.")));
+                        }
+                    }
+                } else {
+                    c.status = Some(format!("Copying {label}: {copied}/{total} file(s)..."));
+                    c.is_error = false;
+                }
+            }
+        }
         // Poll a running Commander checksum job: mirror progress to the status
         // line while it runs, and pop the results overlay when it finishes.
         if let Some(job) = self.commander.as_ref().and_then(|c| c.checksum.clone()) {
@@ -8077,6 +8102,95 @@ impl App {
 
     // --- rendering -------------------------------------------------------
 
+    /// Run `body` as a [`TuiTask`]; its returned closure updates the app when it ends.
+    fn start_task(
+        &mut self,
+        label: impl Into<String>,
+        body: impl FnOnce(&crate::model::job::JobCtx) -> anyhow::Result<TaskDone> + Send + 'static,
+    ) {
+        if self.task.is_some() {
+            self.report_task_status("Another operation is still running.".to_string());
+            return;
+        }
+        let job = crate::model::job::Job::spawn(
+            label,
+            Arc::new(crate::model::job::NoNotify),
+            move |ctx| with_stderr_only_suppressed(|| body(ctx)),
+        );
+        self.task = Some(TuiTask { job });
+    }
+
+    /// Put a task's status where the user is looking: the Explorer footer, else the screen's line.
+    fn report_task_status(&mut self, msg: String) {
+        match self.explorer.as_mut() {
+            Some(ex) => ex.status = Some(msg),
+            None => self.status = Some(msg),
+        }
+    }
+
+    /// Apply a finished task, or report how it ended.
+    fn poll_task(&mut self) {
+        use crate::model::job::Status;
+        let Some(task) = &self.task else {
+            return;
+        };
+        let snap = task.job.snapshot();
+        if snap.is_running() {
+            return;
+        }
+        let done = task.job.take_result();
+        self.task = None;
+        match (snap.status, done) {
+            (Status::Done, Some(apply)) => apply(self),
+            (Status::Failed(e), _) => {
+                self.report_task_status(format!("{} failed: {e}", snap.label))
+            }
+            (Status::Cancelled, _) => self.report_task_status(format!("{} cancelled.", snap.label)),
+            _ => {}
+        }
+    }
+
+    /// The "Working" box over everything while a task runs.
+    fn draw_task(&self, frame: &mut Frame, area: Rect) {
+        let Some(task) = &self.task else {
+            return;
+        };
+        let snap = task.job.snapshot();
+        const SPIN: [char; 4] = ['|', '/', '-', '\\'];
+        let tick = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() / 200)
+            .unwrap_or(0)
+            % 4) as usize;
+        let what = if snap.phase.is_empty() {
+            &snap.label
+        } else {
+            &snap.phase
+        };
+        let mut status = format!(" {} {what}", SPIN[tick]);
+        if let Some(f) = snap.progress.fraction() {
+            status.push_str(&format!("  {:.0}%", f * 100.0));
+        }
+        let hint = if snap.cancel_requested {
+            " cancelling..."
+        } else if snap.can_cancel {
+            " Esc cancel"
+        } else {
+            " please wait"
+        };
+        let w = (status.len().max(30) as u16 + 4).min(area.width);
+        let r = centered_rect(w, 4, area);
+        frame.render_widget(Clear, r);
+        frame.render_widget(
+            Paragraph::new(Text::from(vec![
+                Line::raw(status),
+                Line::styled(hint, self.palette.dim()),
+            ]))
+            .block(self.pane_block("Working", true)),
+            r,
+        );
+    }
+
     fn draw(&self, frame: &mut Frame) {
         let area = frame.area();
         if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
@@ -8109,6 +8223,7 @@ impl App {
         if self.show_help {
             self.draw_help(frame, area);
         }
+        self.draw_task(frame, area);
         if let Some(input) = &self.palette_input {
             let cp = centered_rect(70, 5, area);
             frame.render_widget(Clear, cp);
@@ -11507,6 +11622,112 @@ fn apply_metadata_edit(
     Ok(())
 }
 
+/// Open a partition and build its Explorer (root listed, tree expanded); the error says why it can't browse.
+fn build_explorer(
+    image_path: &str,
+    selector: Option<crate::cli::img_at::PartSelector>,
+    part_label: String,
+) -> Result<Explorer, String> {
+    use crate::cli::resolve::resolve_partition_streaming_forced_inside;
+    let path = std::path::Path::new(image_path);
+    let built = (|| -> anyhow::Result<Explorer> {
+        let (reader, ctx) =
+            resolve_partition_streaming_forced_inside(path, selector.clone(), None, None, None)?;
+        let mut fs = ctx
+            .open_ro(reader, None)
+            .map_err(|e| anyhow::anyhow!("opening filesystem: {e}"))?;
+        let volume = fs.volume_label().map(|s| s.to_string());
+        let blessed = fs.blessed_system_folder();
+        let root = fs
+            .root()
+            .map_err(|e| anyhow::anyhow!("reading root: {e}"))?;
+        let mut list = fs
+            .list_directory(&root)
+            .map_err(|e| anyhow::anyhow!("listing root: {e}"))?;
+        sort_entries(&mut list);
+        let mut ex = Explorer {
+            fs,
+            image_path: image_path.to_string(),
+            selector,
+            part_label,
+            volume,
+            blessed,
+            tree: vec![TreeNode {
+                dir: root,
+                depth: 0,
+                expanded: false,
+            }],
+            tree_sel: 0,
+            list,
+            list_sel: 0,
+            marked: std::collections::BTreeMap::new(),
+            focus: ExFocus::Tree,
+            status: None,
+            picker: None,
+            export_menu: None,
+            export_fmt: ExportFormat::Fork(RfMode::AppleDouble),
+            preview: None,
+            metadata: None,
+            confirm_close: false,
+            confirm_bless: None,
+            mkdir_input: None,
+            confirm_delete: None,
+            confirm_overwrite: None,
+            editor: None,
+            fsck_report: None,
+            transform_menu: None,
+        };
+        // Expand the root so its subdirectories show in the tree immediately.
+        ex.tree_expand();
+        Ok(ex)
+    })();
+    built.map_err(|e| {
+        // An optical `.iso` (incl. NKit-scrubbed GC/Wii) has no MBR/GPT,
+        // so it fails here with a cryptic parse error. Give NKit images
+        // the convert-it-first hint and other optical images a redirect
+        // to the Commander's optical open / the `optical` verbs.
+        let hinted = if crate::cli::optical_hint::is_nkit_image(path) {
+            crate::cli::optical_hint::with_nkit_hint(e, path)
+        } else {
+            crate::cli::optical_hint::with_optical_hint(e, path)
+        };
+        format!("Cannot browse: {hinted:#}")
+    })
+}
+
+/// Open a partition of `image_path` read-only, as the Explorer does.
+fn open_partition_ro(
+    image_path: &str,
+    selector: Option<crate::cli::img_at::PartSelector>,
+) -> anyhow::Result<Box<dyn disk_core::filesystem::Filesystem>> {
+    use crate::cli::resolve::resolve_partition_streaming_forced_inside;
+    let (reader, ctx) = resolve_partition_streaming_forced_inside(
+        std::path::Path::new(image_path),
+        selector,
+        None,
+        None,
+        None,
+    )?;
+    ctx.open_ro(reader, None)
+        .map_err(|e| anyhow::anyhow!("opening filesystem: {e}"))
+}
+
+/// The fsck overlay's lines for a check result (`None`: this filesystem has no checker).
+fn fsck_report_lines<E: std::fmt::Display>(
+    result: Option<Result<crate::fs::FsckResult, E>>,
+) -> Vec<String> {
+    match result {
+        Some(Ok(result)) => format_fsck_lines(&result),
+        Some(Err(e)) => vec![format!("Check failed: {e:#}")],
+        None => vec![
+            "This filesystem has no integrity checker.".to_string(),
+            String::new(),
+            "(fsck is available for FAT/exFAT, ext*, NTFS, HFS/HFS+, and the".to_string(),
+            " supported retro filesystems.)".to_string(),
+        ],
+    }
+}
+
 /// Open the partition read-write and run the filesystem's in-place repair, then
 /// commit. Mirrors the GUI browse view's repair (open_editable -> repair ->
 /// commit); errors (unsupported fs, CHD source, etc.) bubble up.
@@ -12055,6 +12276,36 @@ fn with_stderr_suppressed<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 
+/// For task bodies on a worker: silence stderr only, since stdout carries the TUI's own drawing.
+#[cfg(unix)]
+fn with_stderr_only_suppressed<T>(f: impl FnOnce() -> T) -> T {
+    use std::os::unix::io::AsRawFd;
+    unsafe {
+        let saved_err = libc::dup(libc::STDERR_FILENO);
+        if saved_err < 0 {
+            return f();
+        }
+        match std::fs::OpenOptions::new().write(true).open("/dev/null") {
+            Ok(devnull) => {
+                libc::dup2(devnull.as_raw_fd(), libc::STDERR_FILENO);
+                let out = f();
+                libc::dup2(saved_err, libc::STDERR_FILENO);
+                libc::close(saved_err);
+                out
+            }
+            Err(_) => {
+                libc::close(saved_err);
+                f()
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn with_stderr_only_suppressed<T>(f: impl FnOnce() -> T) -> T {
+    f()
+}
+
 fn expand_tilde(raw: &str) -> std::path::PathBuf {
     if let Some(rest) = raw.strip_prefix("~/") {
         if let Some(home) = dirs::home_dir() {
@@ -12460,6 +12711,34 @@ mod tests {
 
     /// Esc from the merged view goes straight back to the disk list - one level,
     /// since there is no longer an intermediate pane to unwind through.
+    /// A task keeps the screen live, applies its result in `tick`, and reports a panic instead of hanging.
+    #[test]
+    fn a_task_lands_in_tick_and_a_panicking_one_reports_its_failure() {
+        let wait = |app: &mut App| {
+            while app.task.as_ref().is_some_and(|t| t.job.is_running()) {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            app.poll_task();
+        };
+        let mut app = App::new_on(DEFAULT_TAB);
+        app.start_task("Counting", |_| {
+            Ok(Box::new(|app: &mut App| app.status = Some("counted".into())) as TaskDone)
+        });
+        assert!(app.task.is_some());
+        app.start_task("Second", |_| Ok(Box::new(|_: &mut App| {}) as TaskDone));
+        wait(&mut app);
+        assert_eq!(app.status.as_deref(), Some("counted"));
+        assert!(app.task.is_none());
+
+        app.start_task("Exploding", |_| -> anyhow::Result<TaskDone> {
+            panic!("boom")
+        });
+        wait(&mut app);
+        let status = app.status.clone().unwrap_or_default();
+        assert!(status.starts_with("Exploding failed:"), "{status}");
+        assert!(status.contains("boom"), "{status}");
+    }
+
     #[test]
     fn esc_from_the_partition_view_returns_to_the_disk_list() {
         let dir = tempfile::tempdir().expect("tempdir");
