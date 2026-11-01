@@ -1,6 +1,6 @@
 # Native front-ends plan
 
-Status: **Phase 0 done (2026-11-01)** on `native-frontends`; Phase 1 is next. Drafted 2026-10-29.
+Status: **Phase 0 and Phase 1 done (2026-11-01)** on `native-frontends`, except Commander's synchronous operations, which move with the Phase 2 Commander pilot; Phase 2 is next. Drafted 2026-10-29.
 
 This plan moves rusty-backup from one egui GUI to a native front-end on every platform. Every feature is written once in shared Rust, and each front-end only renders it.
 
@@ -169,6 +169,12 @@ Work through [long_operations_inventory.md](long_operations_inventory.md), worst
 - No `thread::spawn` in `src/gui` or `src/cli/verbs/tui*`.
 - The inventory's SYNC column is empty, apart from a list of agreed exceptions such as reading a 256-byte floppy header.
 - A test exists per job proving that a panic ends in `Failed`.
+
+**Done (2026-11-01), with these differences** (details: the progress table in [long_operations_inventory.md](long_operations_inventory.md)):
+- No `thread::spawn` remains in `src/gui`, the TUI or the optical browser; `scripts/check-boundaries.sh` enforces it. Already-async workers run under `worker::spawn_guarded` (or `spawn_detached`) rather than `Job`; they move onto `Job` with their screen's view-model in Phase 2. Work that used to block the UI runs as a `Job` (GUI) or a `TuiTask` (a `Job` whose result is a closure the TUI applies in `tick`).
+- **Left synchronous, agreed:** Commander's operations and remote navigation (its listing is shared with copy, tree and selection, so it needs `CommanderPaneVm` first), loading a saved partclone cache (its store is shared with Commander), Alto resize (synchronous by design), and the TUI Explorer's per-keystroke folder listing (quick once the volume is open).
+- Panic coverage is tested once, generically: `Job`, `spawn_guarded` and the `finished_with_error!` statuses each have a test that a panic ends in a failure, rather than one test per job.
+- Every wait shows a bar (or a sweeping bar when the total is unknown), the step, amounts, speed and time left; `rb-cli --status` prints the same line periodically.
 
 ### Phase 2: Extract the view-models
 
