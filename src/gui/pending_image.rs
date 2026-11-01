@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use rusty_backup::model::image_prep::{needs_decoding, prepare_disk_image_path};
+use rusty_backup::model::image_prep::{needs_decoding, prepare_disk_image_path_reporting};
 use rusty_backup::model::job::{Job, Status};
 
 /// A flat image path, and the tempdir that must outlive it when it was decoded.
@@ -41,7 +41,11 @@ pub fn prepare(path: PathBuf) -> Prepare {
         move |ctx| {
             ctx.set_can_cancel(false);
             ctx.set_phase(format!("Decompressing {name}..."));
-            Ok(prepare_disk_image_path(&worker_path, true)?)
+            Ok(prepare_disk_image_path_reporting(
+                &worker_path,
+                true,
+                &|done, total| ctx.set_bytes(done, total),
+            )?)
         },
     );
     Prepare::Pending(PendingImage {

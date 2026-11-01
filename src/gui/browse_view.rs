@@ -1827,8 +1827,9 @@ impl BrowseView {
             "Exporting the selection...",
             Arc::new(super::ui_logger::EguiWake),
             move |job| {
-                let progress = |name: &str, done: usize, _bytes: u64| {
+                let progress = |name: &str, done: usize, bytes: u64| {
                     job.set_phase(format!("Exporting {name} ({done} done)"));
+                    job.set_bytes_so_far(bytes);
                 };
                 let cancelled = || job.is_cancelled();
                 let res = if to_file {
@@ -6855,8 +6856,14 @@ fn tar_import_step(
         Ok(pair) => pair,
         Err(e) => return TarStep::Finished(format!("Error opening filesystem: {e}"), false),
     };
+    let report = |st: &fs_tar::tar_import::TarImportStats| {
+        job.set_phase(format!(
+            "Importing... {} file(s), {} folder(s)",
+            st.files, st.dirs_created
+        ));
+    };
     let stats =
-        match fs_tar::tar_import::import_tar_from_path(&mut *efs, dest, &archive, &opts, &|_| {}) {
+        match fs_tar::tar_import::import_tar_from_path(&mut *efs, dest, &archive, &opts, &report) {
             Ok(s) => s,
             Err(e) => return TarStep::Finished(format!("Import failed: {e:#}"), false),
         };

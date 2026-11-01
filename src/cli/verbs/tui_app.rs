@@ -8171,41 +8171,70 @@ impl App {
         }
     }
 
-    /// The "Working" box over everything while a task runs.
+    /// The "Working" box over everything while a task runs: step, bar, speed and time.
     fn draw_task(&self, frame: &mut Frame, area: Rect) {
         let Some(task) = &self.task else {
             return;
         };
         let snap = task.job.snapshot();
-        const SPIN: [char; 4] = ['|', '/', '-', '\\'];
-        let tick = (std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() / 200)
-            .unwrap_or(0)
-            % 4) as usize;
         let what = if snap.phase.is_empty() {
             &snap.label
         } else {
             &snap.phase
         };
-        let mut status = format!(" {} {what}", SPIN[tick]);
-        if let Some(f) = snap.progress.fraction() {
-            status.push_str(&format!("  {:.0}%", f * 100.0));
-        }
-        let hint = if snap.cancel_requested {
-            " cancelling..."
-        } else if snap.can_cancel {
-            " Esc cancel"
+        let w = area.width.saturating_sub(6).clamp(30, 70);
+        let inner = w.saturating_sub(4) as usize;
+        let (full, empty) = if self.border == ASCII_BORDER {
+            ('#', '-')
         } else {
-            " please wait"
+            ('\u{2588}', '\u{2591}')
         };
-        let w = (status.len().max(30) as u16 + 4).min(area.width);
-        let r = centered_rect(w, 4, area);
+        let bar_w = inner.saturating_sub(7);
+        let bar: String = match snap.progress.fraction() {
+            Some(f) => {
+                let filled = ((f as f64) * bar_w as f64).round() as usize;
+                let cells: String = crate::compat::repeat_n(full, filled)
+                    .chain(crate::compat::repeat_n(empty, bar_w.saturating_sub(filled)))
+                    .collect();
+                format!("{cells} {:>3.0}%", f * 100.0)
+            }
+            // No total: a block sweeps across so it reads as alive, not as a percentage.
+            None => {
+                let span = bar_w.max(1);
+                let block = (span / 6).max(2);
+                let travel = span.saturating_sub(block).max(1);
+                let step = (snap.elapsed.as_millis() / 120) as usize % (travel * 2);
+                let pos = if step < travel {
+                    step
+                } else {
+                    travel * 2 - step
+                };
+                (0..span)
+                    .map(|i| {
+                        if i >= pos && i < pos + block {
+                            full
+                        } else {
+                            empty
+                        }
+                    })
+                    .collect()
+            }
+        };
+        let hint = if snap.cancel_requested {
+            "cancelling..."
+        } else if snap.can_cancel {
+            "Esc cancel"
+        } else {
+            "please wait"
+        };
+        let r = centered_rect(w, 6, area);
         frame.render_widget(Clear, r);
         frame.render_widget(
             Paragraph::new(Text::from(vec![
-                Line::raw(status),
-                Line::styled(hint, self.palette.dim()),
+                Line::raw(format!(" {what}")),
+                Line::styled(format!(" {bar}"), self.palette.accent()),
+                Line::raw(format!(" {}", snap.detail())),
+                Line::styled(format!(" {hint}"), self.palette.dim()),
             ]))
             .block(self.pane_block("Working", true)),
             r,

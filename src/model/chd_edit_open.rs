@@ -33,7 +33,8 @@ pub fn diff_path_for(parent: &Path) -> PathBuf {
 /// Back up `parent` (once) and open it for editing; the error is the message the view shows.
 pub fn open_for_editing(parent: &Path, job: &JobCtx) -> Result<ChdEditOpen, String> {
     job.set_can_cancel(false);
-    if !backup_path_for(parent).exists() {
+    let backup = backup_path_for(parent);
+    if !backup.exists() {
         job.set_phase(format!(
             "Backing up {} before editing...",
             parent
@@ -41,6 +42,8 @@ pub fn open_for_editing(parent: &Path, job: &JobCtx) -> Result<ChdEditOpen, Stri
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default()
         ));
+        copy_with_progress(parent, &backup, job)
+            .map_err(|e| format!("Error creating backup: {e}"))?;
     }
     make_backup_copy(parent).map_err(|e| format!("Error creating backup: {e}"))?;
     job.set_phase("Opening the CHD for editing...");
@@ -67,6 +70,33 @@ pub fn open_for_editing(parent: &Path, job: &JobCtx) -> Result<ChdEditOpen, Stri
             compressed,
         })
     }
+}
+
+/// Copy `from` to `to` in 4 MiB chunks, reporting bytes; a partial copy is removed on failure.
+fn copy_with_progress(from: &Path, to: &Path, job: &JobCtx) -> std::io::Result<()> {
+    use std::io::{Read, Write};
+    let run = || -> std::io::Result<()> {
+        let mut src = std::fs::File::open(from)?;
+        let total = src.metadata()?.len();
+        let mut dst = std::fs::File::create(to)?;
+        let mut buf = vec![0u8; 4 << 20];
+        let mut done = 0u64;
+        loop {
+            let n = src.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            dst.write_all(&buf[..n])?;
+            done += n as u64;
+            job.set_bytes(done, total);
+        }
+        dst.sync_all()
+    };
+    let result = run();
+    if result.is_err() {
+        let _ = std::fs::remove_file(to);
+    }
+    result
 }
 
 #[cfg(test)]

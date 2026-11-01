@@ -54,34 +54,38 @@ pub fn show_log(ui: &mut egui::Ui, app: &mut AppVm) {
     }
 }
 
-/// Draw a running job: a spinner or bar, its phase, and Cancel when offered; returns true when Cancel is clicked.
+/// Draw a running job: its step, a bar (an activity bar when the total is unknown),
+/// speed and time, and Cancel when offered; returns true when Cancel is clicked.
 pub fn show_job(ui: &mut egui::Ui, snap: &rusty_backup::model::job::Snapshot) -> bool {
     let mut cancel = false;
-    ui.horizontal(|ui| {
-        match snap.progress.fraction() {
-            Some(f) => {
-                ui.add(egui::ProgressBar::new(f).desired_width(160.0));
-            }
-            None => {
-                ui.spinner();
-            }
-        }
-        let phase = if snap.phase.is_empty() {
-            snap.label.as_str()
-        } else {
-            snap.phase.as_str()
-        };
-        if snap.cancel_requested {
-            ui.label(format!("{phase} (cancelling)"));
-        } else {
+    let phase = if snap.phase.is_empty() {
+        snap.label.as_str()
+    } else {
+        snap.phase.as_str()
+    };
+    ui.vertical(|ui| {
+        ui.horizontal(|ui| {
             ui.label(phase);
-            if snap.can_cancel && ui.button("Cancel").clicked() {
+            if snap.cancel_requested {
+                ui.label(RichText::new("(cancelling)").weak());
+            } else if snap.can_cancel && ui.small_button("Cancel").clicked() {
                 cancel = true;
             }
-        }
+        });
+        let bar = match snap.progress.fraction() {
+            Some(f) => egui::ProgressBar::new(f).show_percentage(),
+            // No total to measure against: a sweeping fill says it is alive without implying a percentage.
+            None => {
+                let t = snap.elapsed.as_secs_f32();
+                let sweep = (t * 0.6).fract();
+                egui::ProgressBar::new(sweep).animate(true)
+            }
+        };
+        ui.add(bar.desired_width(260.0));
+        ui.label(RichText::new(snap.detail()).small().weak());
     });
     ui.ctx()
-        .request_repaint_after(std::time::Duration::from_millis(250));
+        .request_repaint_after(std::time::Duration::from_millis(100));
     cancel
 }
 

@@ -42,6 +42,15 @@ pub fn prepare_disk_image_path(
     path: &std::path::Path,
     decode_floppy_containers: bool,
 ) -> std::io::Result<(std::path::PathBuf, Option<tempfile::TempDir>)> {
+    prepare_disk_image_path_reporting(path, decode_floppy_containers, &|_, _| {})
+}
+
+/// [`prepare_disk_image_path`], reporting `(compressed bytes read, compressed total)` while it gunzips.
+pub fn prepare_disk_image_path_reporting(
+    path: &std::path::Path,
+    decode_floppy_containers: bool,
+    progress: &dyn Fn(u64, u64),
+) -> std::io::Result<(std::path::PathBuf, Option<tempfile::TempDir>)> {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -162,7 +171,14 @@ pub fn prepare_disk_image_path(
     }
     use std::io::Seek;
     input.seek(std::io::SeekFrom::Start(0))?;
-    let mut decoder = flate2::read::GzDecoder::new(input);
+    let total = input.metadata().map(|m| m.len()).unwrap_or(0);
+    let counted = CountingReader {
+        inner: input,
+        read: 0,
+        total,
+        progress,
+    };
+    let mut decoder = flate2::read::GzDecoder::new(counted);
     let mut out = std::fs::File::create(&out_path)?;
     std::io::copy(&mut decoder, &mut out)?;
     out.sync_all()?;
@@ -173,6 +189,23 @@ pub fn prepare_disk_image_path(
         out.metadata().map(|m| m.len()).unwrap_or(0)
     );
     Ok((out_path, Some(tmp)))
+}
+
+/// Reports how much of the compressed input has been read.
+struct CountingReader<'a, R> {
+    inner: R,
+    read: u64,
+    total: u64,
+    progress: &'a dyn Fn(u64, u64),
+}
+
+impl<R: std::io::Read> std::io::Read for CountingReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.read += n as u64;
+        (self.progress)(self.read, self.total);
+        Ok(n)
+    }
 }
 
 #[cfg(test)]

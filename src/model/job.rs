@@ -30,14 +30,23 @@ pub enum Unit {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Progress {
     Indeterminate,
-    Determinate { done: u64, total: u64, unit: Unit },
+    Determinate {
+        done: u64,
+        total: u64,
+        unit: Unit,
+    },
+    /// Work done so far when the total is unknown: shows a count and a rate, but no bar.
+    Counting {
+        done: u64,
+        unit: Unit,
+    },
 }
 
 impl Progress {
     /// Completed fraction in `0.0..=1.0`, or `None` when indeterminate.
     pub fn fraction(&self) -> Option<f32> {
         match *self {
-            Progress::Indeterminate => None,
+            Progress::Indeterminate | Progress::Counting { .. } => None,
             Progress::Determinate { total: 0, .. } => Some(0.0),
             Progress::Determinate { done, total, .. } => {
                 Some((done.min(total) as f64 / total as f64) as f32)
@@ -66,11 +75,52 @@ pub struct Snapshot {
     pub status: Status,
     /// Bumped on every visible change, so a shell can skip redrawing an unchanged job.
     pub generation: u64,
+    /// Time since the job started.
+    pub elapsed: Duration,
+    /// Units (bytes or items) per second over the last few seconds, once there is enough to say.
+    pub rate: Option<f64>,
+    /// Seconds left at that rate, for a determinate job.
+    pub eta_secs: Option<u64>,
 }
 
 impl Snapshot {
     pub fn is_running(&self) -> bool {
         self.status == Status::Running
+    }
+
+    /// One line every shell shows under its bar: amounts, speed, time left or elapsed.
+    pub fn detail(&self) -> String {
+        let amount = |n: u64, unit: Unit| match unit {
+            Unit::Bytes => disk_core::display::format_size(n),
+            Unit::Items => n.to_string(),
+        };
+        let rate = |unit: Unit| {
+            self.rate.filter(|r| *r > 0.0).map(|r| match unit {
+                Unit::Bytes => format!("{}/s", super::rate_tracker::format_rate(r)),
+                Unit::Items => format!("{r:.1}/s"),
+            })
+        };
+        let elapsed = super::rate_tracker::format_eta(self.elapsed.as_secs());
+        let mut parts: Vec<String> = Vec::new();
+        match self.progress {
+            Progress::Determinate { done, total, unit } => {
+                parts.push(format!("{} of {}", amount(done, unit), amount(total, unit)));
+                parts.extend(rate(unit));
+                match self.eta_secs {
+                    Some(eta) => {
+                        parts.push(format!("{} left", super::rate_tracker::format_eta(eta)))
+                    }
+                    None => parts.push(format!("{elapsed} elapsed")),
+                }
+            }
+            Progress::Counting { done, unit } => {
+                parts.push(format!("{} so far", amount(done, unit)));
+                parts.extend(rate(unit));
+                parts.push(format!("{elapsed} elapsed"));
+            }
+            Progress::Indeterminate => parts.push(format!("{elapsed} elapsed")),
+        }
+        parts.join(", ")
     }
 }
 
@@ -120,6 +170,8 @@ struct State<R> {
     snapshot: Snapshot,
     result: Option<R>,
     last_progress_wake: Option<Instant>,
+    started: Instant,
+    rate: super::rate_tracker::RateTracker,
 }
 
 struct Shared<R> {
@@ -166,6 +218,19 @@ impl<R: Send> CtxTarget for Shared<R> {
             }
             st.snapshot.progress = progress;
             st.snapshot.generation += 1;
+            let done = match progress {
+                Progress::Determinate { done, .. } | Progress::Counting { done, .. } => Some(done),
+                Progress::Indeterminate => None,
+            };
+            if let Some(done) = done {
+                let phase = st.snapshot.phase.clone();
+                st.rate.record(done, &phase);
+                st.snapshot.rate = st.rate.rate_bytes_per_sec();
+                st.snapshot.eta_secs = match progress {
+                    Progress::Determinate { done, total, .. } => st.rate.eta_secs(done, total),
+                    _ => None,
+                };
+            }
             let now = Instant::now();
             let due = match st.last_progress_wake {
                 None => true,
@@ -200,6 +265,14 @@ impl JobCtx {
         self.set_progress(Progress::Determinate {
             done,
             total,
+            unit: Unit::Bytes,
+        });
+    }
+
+    /// Bytes handled so far when the total isn't known: a count and a rate, no bar.
+    pub fn set_bytes_so_far(&self, done: u64) {
+        self.set_progress(Progress::Counting {
+            done,
             unit: Unit::Bytes,
         });
     }
@@ -268,9 +341,14 @@ impl<R: Send + 'static> Job<R> {
                     cancel_requested: false,
                     status: Status::Running,
                     generation: 0,
+                    elapsed: Duration::ZERO,
+                    rate: None,
+                    eta_secs: None,
                 },
                 result: None,
                 last_progress_wake: None,
+                started: Instant::now(),
+                rate: super::rate_tracker::RateTracker::default(),
             }),
             cancel: Arc::clone(&cancel),
             notify,
@@ -287,6 +365,7 @@ impl<R: Send + 'static> Job<R> {
             on_end();
             {
                 let mut st = lock_status(&worker.state);
+                st.snapshot.elapsed = st.started.elapsed();
                 st.snapshot.status = match outcome {
                     Ok(r) => {
                         st.result = Some(r);
@@ -306,7 +385,12 @@ impl<R: Send + 'static> Job<R> {
 
 impl<R> Job<R> {
     pub fn snapshot(&self) -> Snapshot {
-        lock_status(&self.shared.state).snapshot.clone()
+        let st = lock_status(&self.shared.state);
+        let mut snap = st.snapshot.clone();
+        if snap.status == Status::Running {
+            snap.elapsed = st.started.elapsed();
+        }
+        snap
     }
 
     pub fn is_running(&self) -> bool {
@@ -542,6 +626,34 @@ mod tests {
         go.send(()).unwrap();
         job.wait();
         assert!(wakes.0.load(Ordering::Relaxed) >= 3);
+    }
+
+    #[test]
+    fn the_detail_line_shows_amounts_and_time() {
+        let mut snap = Job::spawn("x", quiet(), |_| Ok(())).wait();
+        snap.elapsed = Duration::from_secs(75);
+        assert_eq!(snap.detail(), "1m 15s elapsed");
+        snap.progress = Progress::Determinate {
+            done: 3,
+            total: 10,
+            unit: Unit::Items,
+        };
+        snap.rate = Some(2.0);
+        snap.eta_secs = Some(4);
+        assert_eq!(snap.detail(), "3 of 10, 2.0/s, 4s left");
+        snap.progress = Progress::Counting {
+            done: 3 << 20,
+            unit: Unit::Bytes,
+        };
+        snap.rate = Some((1u64 << 20) as f64);
+        assert_eq!(
+            snap.detail(),
+            format!(
+                "{} so far, {}/s, 1m 15s elapsed",
+                disk_core::display::format_size(3 << 20),
+                crate::model::rate_tracker::format_rate((1u64 << 20) as f64)
+            )
+        );
     }
 
     #[test]
