@@ -308,6 +308,8 @@ pub struct BrowseView {
     /// than showing always and erroring on click. Recomputed only when
     /// the selected path changes — see [`Self::ensure_archive_sniff`].
     archive_sniff: Option<(String, Option<MacArchiveKind>)>,
+    /// The sniff of the selected path, reading on a worker with the cached filesystem.
+    archive_sniff_job: Option<(String, u64, rusty_backup::model::job::Job<ArchiveSniff>)>,
 }
 
 /// Workflow C state: the selected entry on the disk image is a Mac
@@ -527,6 +529,7 @@ impl Default for BrowseView {
             pending_archive_extract: None,
             mac_archive_window: None,
             archive_sniff: None,
+            archive_sniff_job: None,
         }
     }
 }
@@ -815,6 +818,7 @@ impl BrowseView {
         self.pending_archive_extract = None;
         self.mac_archive_window = None;
         self.archive_sniff = None;
+        self.archive_sniff_job = None;
         // Detach any in-flight open worker. The thread keeps running but its
         // result will be dropped when the Arc dies on completion.
         self.pending_open = None;
@@ -892,21 +896,69 @@ impl BrowseView {
             self.archive_sniff = None;
             return None;
         }
+        self.poll_archive_sniff();
         if let Some((path, kind)) = &self.archive_sniff {
             if path == &entry.path {
                 return *kind;
             }
         }
-        let Some(mut fs) = self.take_or_open_fs() else {
-            // Couldn't open the filesystem this frame — leave the cache
-            // untouched so we retry on the next paint.
+        if self.archive_sniff_job.is_some() {
+            // One sniff at a time; a newer selection starts when this one lands.
             return None;
+        }
+        // The cached filesystem goes to the worker and comes back; with none cached, the worker opens one.
+        let cached = self.cached_fs.take();
+        let session = self.session.clone();
+        let show_deleted = self.show_deleted;
+        let target = entry.clone();
+        let job = rusty_backup::model::job::Job::spawn(
+            "Checking for an archive",
+            Arc::new(super::ui_logger::EguiWake),
+            move |_| {
+                let mut fs = match cached {
+                    Some(fs) => fs,
+                    None => match session.open() {
+                        Ok(mut fs) => {
+                            if show_deleted {
+                                fs.set_show_deleted(true);
+                            }
+                            fs
+                        }
+                        Err(_) => return Ok((None, None)),
+                    },
+                };
+                let kind = fs
+                    .read_file(&target, ARCHIVE_SNIFF_LIMIT)
+                    .ok()
+                    .and_then(|bytes| detect_mac_archive(&bytes));
+                Ok((Some(fs), kind))
+            },
+        );
+        self.archive_sniff_job = Some((entry.path.clone(), self.fs_generation, job));
+        None
+    }
+
+    /// Take a finished sniff: cache its verdict and put the filesystem back.
+    fn poll_archive_sniff(&mut self) {
+        let Some((_, _, job)) = &self.archive_sniff_job else {
+            return;
         };
-        let result = fs.read_file(entry, ARCHIVE_SNIFF_LIMIT);
-        self.return_fs(fs);
-        let kind = result.ok().and_then(|bytes| detect_mac_archive(&bytes));
-        self.archive_sniff = Some((entry.path.clone(), kind));
-        kind
+        if job.is_running() {
+            return;
+        }
+        let out = job.take_result();
+        let Some((path, generation, _)) = self.archive_sniff_job.take() else {
+            return;
+        };
+        let (fs, kind) = out.unwrap_or((None, None));
+        // A filesystem from before an invalidation is stale; drop it.
+        if let Some(fs) = fs {
+            if self.cached_fs.is_none() && generation == self.fs_generation {
+                self.return_fs(fs);
+            }
+        }
+        // A failed open or read caches "not an archive" for this path instead of retrying every frame.
+        self.archive_sniff = Some((path, kind));
     }
 
     /// Validate a filename against the current filesystem's rules at
@@ -922,6 +974,7 @@ impl BrowseView {
         }
         self.poll_fsck_job();
         self.render_fsck_job(ui);
+        self.poll_archive_sniff();
         self.poll_apply_job();
         self.render_apply_job(ui);
         self.poll_chd_open_job();
@@ -6752,3 +6805,6 @@ enum ApplyFollowUp {
     /// Close the view or leave edit mode (the unsaved-changes dialog).
     LeaveEditing,
 }
+
+/// A sniff's result: the filesystem to put back (when there was one), and the archive kind found.
+type ArchiveSniff = (Option<Box<dyn Filesystem>>, Option<MacArchiveKind>);

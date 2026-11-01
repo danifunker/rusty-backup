@@ -29,7 +29,8 @@ Line numbers are a snapshot. Re-check them before editing.
 | 5. fsck / repair | **GUI done** (6883328f): Inspect and browse via `fsck_runner::{check_target, repair_and_recheck}`. **TUI open:** its stdout/stderr suppression is process-wide, so it moves with item 9. |
 | 2. Browse apply staged edits | **Apply done** (2bb6fad1): `commander_ops::apply_queue`. Tar import and export selection still open. |
 | 3. CHD edit mode | **Done** (this commit): `model::chd_edit_open` backs up and opens the session as a `Job`. |
-| 6, 7, 8, 9 | Open. |
+| 6. Archive sniff during render | **Done** (this commit): a `Job` that borrows the cached filesystem; a failed open is cached instead of retried every frame. |
+| 7, 8, 9 | Open. |
 
 `gui::progress::show_job` draws any running job (spinner or bar, phase, Cancel).
 
