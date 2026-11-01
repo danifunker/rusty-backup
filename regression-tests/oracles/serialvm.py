@@ -81,18 +81,19 @@ def require_program(name):
 class SerialVM:
     """A QEMU guest whose serial console is a unix socket we read and type into."""
 
-    def __init__(self, argv, log_path=None):
+    def __init__(self, argv, log_path=None, monitor=False):
         # Keep the socket path short and local (unix socket paths are capped at 108 bytes).
         sock_root = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
         if not os.path.isdir(sock_root):
             sock_root = None
         self.dir = tempfile.mkdtemp(prefix="rb-oracle-", dir=sock_root)
         self.sock_path = os.path.join(self.dir, "serial.sock")
+        self.mon_path = os.path.join(self.dir, "monitor.sock")
         self.log = open(log_path or os.path.join(self.dir, "console.log"), "wb")
         argv = list(argv) + [
             "-serial", f"unix:{self.sock_path},server,nowait",
             "-display", "none",
-            "-monitor", "none",
+            "-monitor", f"unix:{self.mon_path},server,nowait" if monitor else "none",
         ]
         self.proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         self.sock = socket.socket(socket.AF_UNIX)
@@ -139,6 +140,29 @@ class SerialVM:
             self._pump(min(1.0, max(0.05, end - time.time())))
         tail = self.buf[-400:].decode(errors="replace")
         no_verdict(f"timed out waiting for {pattern!r}; last output: {tail!r}")
+
+    def monitor(self, command, wait=1.0):
+        """Send one QEMU monitor command (hot-plugging a disk, say); return its reply."""
+        m = socket.socket(socket.AF_UNIX)
+        m.connect(self.mon_path)
+        m.settimeout(wait)
+        reply = b""
+        try:
+            reply += m.recv(4096)
+        except socket.timeout:
+            pass
+        m.sendall(command.encode() + b"\n")
+        time.sleep(wait)
+        try:
+            while True:
+                d = m.recv(4096)
+                if not d:
+                    break
+                reply += d
+        except socket.timeout:
+            pass
+        m.close()
+        return reply.decode(errors="replace")
 
     def send(self, text, delay=0.02):
         """Type `text` one byte at a time (serial consoles drop bursts)."""

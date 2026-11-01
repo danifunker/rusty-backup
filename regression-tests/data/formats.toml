@@ -180,8 +180,9 @@ id = "fs.ufs1"
 kind = "fs"
 name = "UFS1 / FFS"
 we_read = true
-we_write = false
-notes = "R-013: Solaris UFS directories mistyped as files with a garbage size"
+we_write = true
+builder = "new volume ufs"
+notes = "R-013: Solaris UFS directories mistyped as files with a garbage size. R-071: a blank volume fails FreeBSD fsck_ffs."
 
 [[format]]
 id = "fs.ufs2"

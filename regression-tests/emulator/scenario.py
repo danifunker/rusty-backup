@@ -7,11 +7,15 @@ run here, 99 no verdict. scripts/regress-emulators.sh runs them all.
 
 Inputs, all optional:
     RB_CLI          the rb-cli under test (default: <repo>/target/release/rb-cli)
+    RB_EMU_CONTROL  set to 1 to run the scenario as its control: after the edits,
+                    damage() wrecks a structure the checker must notice, so the
+                    run is expected to end in a finding (exit 1)
     local.toml      `fixture_root` for the corpus, `[emulators]` for the VMs
 """
 
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -99,3 +103,34 @@ def finish(code, workdir_path):
     else:
         print(f"kept for inspection: {workdir_path}")
     sys.exit(code)
+
+
+def is_control():
+    return os.environ.get("RB_EMU_CONTROL") == "1"
+
+
+def damage(path, ranges):
+    """In a control run, overwrite each (offset, length) of `path` with 0xA5 bytes."""
+    if not is_control():
+        return
+    with open(path, "r+b") as f:
+        for off, length in ranges:
+            f.seek(off)
+            f.write(b"\xa5" * length)
+    print(f"control: damaged {len(ranges)} range(s) of {os.path.basename(path)}")
+
+
+def ffs_first_cg(path):
+    """Byte offset of cylinder group 0 of a UFS / HP-UX HFS volume (either byte order)."""
+    with open(path, "rb") as f:
+        for sb in (8192, 65536):
+            f.seek(sb)
+            b = f.read(1376)
+            for e in "<>":
+                if len(b) == 1376 and struct.unpack(e + "I", b[1372:1376])[0] in (
+                    0x011954, 0x19540119, 0x095014,
+                ):
+                    cblkno = struct.unpack(e + "i", b[12:16])[0]
+                    fsize = struct.unpack(e + "i", b[52:56])[0]
+                    return cblkno * fsize
+    raise SystemExit(f"no UFS superblock in {path}")

@@ -10,3 +10,4 @@ ufs2.freebsd-edit      -      ufs_freebsd_fsck.py ufs2
 ufs1.freebsd-edit      R-072  ufs_freebsd_fsck.py ufs1
 ufs1.blank             R-071  ufs_freebsd_fsck.py blank-ufs1
 qnx2.lexicon-edit      -      qnx2_icon_chkfsys.py
+hpux-hfs.stand-edit    -      hpux_hfs_fsck.py

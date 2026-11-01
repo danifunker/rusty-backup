@@ -40,6 +40,8 @@ def main():
     sc.rb("put", vol, gone, "/rbtest/gone.txt")
     sc.rb("mv", vol, "/rbtest/note.txt", "/rbtest/renamed.txt")
     sc.rb("rm", vol, "/rbtest/gone.txt")
+    # Partition 1 starts at sector 29; wrecking blocks 1-5 makes chkfsys find files on free blocks.
+    sc.damage(img, [(29 * 512 + blk * 512 + 64, 200) for blk in range(1, 6)])
 
     try:
         p = subprocess.run(

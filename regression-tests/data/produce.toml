@@ -84,6 +84,12 @@ ext = "img"
 args = ["new", "volume", "efs", "--size", "2M", "{out}"]
 
 [[recipe]]
+id = "fs.ufs1"
+ext = "img"
+# 16M: FreeBSD's fsck_ffs (oracles/freebsd/fsck_ffs.py) wants room for a few cylinder groups.
+args = ["new", "volume", "ufs", "--size", "16M", "{out}"]
+
+[[recipe]]
 id = "fs.efs-v1"
 ext = "img"
 # 8M, not the 2M its siblings use: the Motion oracle drops this straight into

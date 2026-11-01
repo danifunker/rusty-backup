@@ -169,3 +169,15 @@ notes = "The FPGA cores. Reached via the HPS. Authoritative for Amiga, X68000 an
 # Physical device cases additionally require --allow-hardware and a device
 # allowlist; see HARDWARE.md. Listing a device here does not enable anything.
 # device_allowlist = "regression-tests/local-devices.toml"
+
+# --- Emulator oracles ---------------------------------------------------------
+#
+# Used by oracles/serialvm.py, oracles/freebsd/fsck_ffs.py and the scenarios in
+# emulator/ (scripts/regress-emulators.sh). A missing key makes the oracle skip
+# with exit 77, never fail. See emulator/README.md for what each one is.
+
+# [emulators]
+# freebsd15 = "/path/to/freebsd15"                 # holds fbsd.qcow2
+# icon_cli  = "/path/to/icon-emu/target/release/icon-cli"
+# icon_rom  = "/path/to/icon1_rom_combined.bin"
+# hpux_boot = "/path/to/hp715.img"

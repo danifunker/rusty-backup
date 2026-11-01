@@ -46,6 +46,7 @@ def main():
     else:
         print(__doc__)
         sys.exit(2)
+    sc.damage(img, [(sc.ffs_first_cg(img), 2048)])
     p = subprocess.run([sys.executable, ORACLE, img], capture_output=True, text=True, timeout=900)
     print(p.stdout[-2500:] + p.stderr[-500:])
     sc.finish(p.returncode, work)
