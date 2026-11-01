@@ -29,7 +29,7 @@ emulator, so a pass takes about six minutes on m900.
 | `qnx2.lexicon-edit` | QNX 4.10.01 `chkfsys` in icon-emu | mkdir, put (several 128-block extents), mv, rm on the LEXICON 10 MB disk |
 | `hpux-hfs.stand-edit` | HP-UX 11.11 `fsck -F hfs -n` on QEMU B160L | mkdir, put, mv, rm on an HP 715's `/stand` |
 | `ufs1-be.solaris-edit` | Solaris 9 `fsck -F ufs -n` on QEMU SS-5 | Solaris `newfs`es a slice on a first boot; then mkdir, put, mv, rm (found R-074) |
-| `ufs1-be.solaris-blank` | Solaris 9 `fsck -F ufs -n` | `new volume ufs --big-endian` in a `new hd sun` label (fails on R-073) |
+| `ufs1-be.solaris-blank` | Solaris 9 `fsck -F ufs -n` | `new volume ufs-solaris` in a `new hd sun` label, then the same edits (found R-073) |
 | `ntfs.win7-edit` | Windows 7 `chkdsk` (read-only) and `dir /s` | mkdir, put (non-resident), mv, rm on `fs.ntfs.base.hd` |
 | `ntfs.win7-blank` | Windows 7 `chkdsk` and `dir /s` | `new volume ntfs`, then the same edits |
 | `fat.win7-blank` | Windows 7 `chkdsk` and `dir /s` | `new volume fat` (FAT16, 64 MB), then the same edits |

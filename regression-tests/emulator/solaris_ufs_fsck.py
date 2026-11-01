@@ -3,7 +3,7 @@
 
     solaris_ufs_fsck.py blank|sol-edit
 
-blank formats the slice with `rb-cli new volume ufs --big-endian`; sol-edit
+blank formats the slice with `rb-cli new volume ufs-solaris`; sol-edit
 lets Solaris `newfs` it on a first boot, so rb-cli edits a volume Solaris made.
 Either way rb-cli then runs mkdir / put (past the direct blocks) / mv / rm, the
 slice goes into a Sun-labelled disk at SCSI target 1, and Solaris runs
@@ -60,7 +60,7 @@ def main():
     vol = f"{disk}@1"
     if variant == "blank":
         raw = os.path.join(work, "ufs.img")
-        sc.rb("new", "volume", "ufs", raw, "--size", SLICE, "--big-endian")
+        sc.rb("new", "volume", "ufs-solaris", raw, "--size", SLICE)
         sc.rb("new", "hd", "sun", disk, "--size", "40M", "--partition", f"{SLICE}:home", "--fill", f"1={raw}")
     else:
         empty = os.path.join(work, "empty.img")

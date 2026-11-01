@@ -20,7 +20,7 @@ finding depends on a fixture, the fixture is named.
 | ID | Severity | Area | Finding |
 |----|----------|------|---------|
 | ~~[R-074](#r-074)~~ | ~~**High**~~ **FIXED** | `crates/fs-unix` (UFS1 edit, superblock totals) | ~~Any rb-cli edit of a UFS1 volume Solaris made corrupts its superblock: the edit also updates FreeBSD's 64-bit `fs_cstotal` at offset 1008, which Solaris's superblock does not have~~ — the 64-bit totals are written only on UFS2 or with `FS_FLAGS_UPDATED`, 2026-11-01 |
-| [R-073](#r-073) | **High** | `crates/fs-unix` (`new volume ufs --big-endian`) | A blank big-endian UFS1 volume is rejected by Solaris 9's own fsck ("BAD VALUES IN SUPER BLOCK") although `new volume ufs` names Solaris as a target: it carries FreeBSD's fake geometry (`fs_ntrak` 0, one cylinder per group) and 4.4BSD-format inodes and directories, where Solaris expects real geometry, staggered groups and the old 16-bit `d_namlen`. Found by the Solaris emulator scenario, 2026-11-01 |
+| ~~[R-073](#r-073)~~ | ~~**High**~~ **FIXED** | `crates/fs-unix` (`new volume ufs --big-endian`) | ~~A blank big-endian UFS1 volume is rejected by Solaris 9's own fsck ("BAD VALUES IN SUPER BLOCK") although `new volume ufs` names Solaris as a target~~ — new `new volume ufs-solaris` writes Solaris's own layout and passes its fsck; `ufs` no longer claims Solaris, 2026-11-01 |
 | ~~[R-072](#r-072)~~ | ~~Medium~~ **FIXED** | `crates/fs-unix` (UFS1 directory create) | ~~After `rb-cli mkdir` on a FreeBSD-made UFS1 volume, FreeBSD 15.1 `fsck_ffs -fn` asks "UPDATE FILESYSTEM TO TRACK DIRECTORY DEPTH?"~~ — the depth is now written at offset 4 on 4.4BSD-format UFS1 and survives later inode writes, 2026-11-01 |
 | ~~[R-071](#r-071)~~ | ~~**High**~~ **FIXED** | `crates/fs-unix` (UFS1 `create_blank`) | ~~A blank UFS1 volume from `rb-cli new volume ufs` fails FreeBSD 15.1 `fsck_ffs -fn`: free block counts wrong in the superblock, summary information bad, blocks missing in the bitmaps~~ — the root directory takes one fragment and the cluster summary no longer overwrites the free map, 2026-11-01 |
 | ~~[R-070](#r-070)~~ | ~~**High**~~ **FIXED** | `src/cli/verbs/restore.rs` | ~~`rb-cli restore` without `--device` treats a `/dev/...` target as an image file and create/truncates it, so a writable device is written raw with no safety preflight, no system-disk guard, no unmount, no disk claim and no write-protect check~~ — a device-shaped target without `--device` is now refused, 2026-09-08 |
@@ -121,7 +121,22 @@ rb-cli's own, and clear on Solaris's.
 
 ### R-073 — a big-endian UFS1 volume from `new volume ufs` is not a Solaris volume {#r-073}
 
-**OPEN.** `regression-tests/emulator/solaris_ufs_fsck.py blank` formats a
+**FIXED 2026-11-01.** `rb-cli new volume ufs-solaris` (alias `solaris`)
+writes a Sun flavour of the formatter, re-derived from the slice Solaris 9's
+own `newfs` made: 16 x 63 geometry, 16 cylinders per group, groups staggered
+by 32 fragments (`fs_cgmask` -16), the dynamic `struct cg` with `cg_btot` /
+`cg_b` at its own offsets and no cluster maps, `fs_postbl` / `fs_rotbl` at
+860 / 1376 (`fs_postblformat` 1, `fs_nrpos` 8), 16-bit `d_namlen`,
+`fs_maxsymlinklen` 0, no `FS_FLAGS_UPDATED`, and `fs_state` = `FSOKAY` -
+`fs_time`. Unit tests pin the geometry and Solaris's exact rotational tables
+(`fs_postbl` 0 32 1 33 2 34 3 35, `fs_rotbl` step 4). Solaris 9's fsck passes
+a blank volume and the same volume after mkdir / put / mv / rm
+(`emulator/solaris_ufs_fsck.py blank`). One difference remains and is
+harmless: Solaris's mkfs gives that slice 3776 inodes per group where ours
+gives 4032. `new volume ufs`'s help no longer names Solaris, and `new hd
+sun` points at `ufs-solaris`.
+
+Original report: `regression-tests/emulator/solaris_ufs_fsck.py blank` formats a
 32 MB slice with `rb-cli new volume ufs --big-endian`, puts it in a Sun label
 (`new hd sun`) at SCSI target 1 of a QEMU SS-5 running Solaris 9, and runs
 `fsck -F ufs -n /dev/rdsk/c0t1d0s0`:

@@ -8,10 +8,18 @@
 //!
 //! **Both `struct cg` generations**, in either byte order:
 //!
-//! * [`CgLayout::Modern`] — 4.4BSD and later (FreeBSD, NetBSD, OpenBSD,
-//!   Solaris). Groups are as large as their maps allow, the map offsets live
-//!   in the header, directory entries carry a `d_type` byte, and the
+//! * [`CgLayout::Modern`] — 4.4BSD and later (FreeBSD, NetBSD, OpenBSD).
+//!   Groups are as large as their maps allow, the map offsets live in the
+//!   header, directory entries carry a `d_type` byte, and the
 //!   rotational-layout tables are dead weight left zeroed.
+//! * The **Sun** flavour (`Ufs1FormatParams::sun`, Solaris / SunOS 5) is a
+//!   third combination: the same dynamic `struct cg` with its map offsets in
+//!   the header, but real drive geometry, groups staggered across tracks,
+//!   live `fs_postbl` / `fs_rotbl` / `cg_btot` / `cg_b` rotational tables at
+//!   the Tahoe dynamic offsets, the old 16-bit `d_namlen`, no 4.4BSD inode
+//!   format, and Sun's `fs_state` clean stamp. Re-derived from a slice
+//!   Solaris 9's own `newfs` made (R-073); a 4.4BSD volume fails Solaris's
+//!   fsck outright on its zero `fs_ntrak`.
 //! * [`CgLayout::Bsd43`] — NeXTSTEP / OPENSTEP. A different `struct fs` tail,
 //!   a different `struct cg`, 16-bit `d_namlen` directory entries with no
 //!   `d_type`, device blocks the size of a fragment, groups staggered across
@@ -113,6 +121,32 @@ const NTRAK_43_CHOICES: [u64; 3] = [16, 4, 2];
 const RPS_43: u64 = 60;
 const MAXCONTIG_43: u64 = 1;
 
+// ---- Sun (Solaris) flavour ----
+
+/// Geometry Solaris 9's `newfs` recorded for a slice of a `new hd sun` disk: 16 x 63, 16 cylinders per group.
+const SUN_NTRAK: u64 = 16;
+const SUN_NSECT: u64 = 63;
+const SUN_CPG: u64 = 16;
+const SUN_RPS: u64 = 90;
+const SUN_MAXCONTIG: u64 = 15;
+const SUN_MAXBPG: u64 = 2048;
+/// Solaris `newfs` defaults: 10% reserve, one inode per 2 KiB.
+const SUN_MINFREE: i32 = 10;
+const SUN_NBPI: u64 = 2048;
+/// `fs_postbl` and `fs_rotbl`, where the dynamic format's offsets point.
+const SUN_OFF_POSTBL: usize = 860;
+const SUN_OFF_ROTBL: usize = 1376;
+/// `fs_state`, `fs_qbmask`, `fs_qfmask`, `fs_postblformat`, `fs_nrpos`, `fs_postbltbloff`, `fs_rotbloff`.
+const SUN_OFF_STATE: usize = 1336;
+const SUN_OFF_QBMASK: usize = 1340;
+const SUN_OFF_QFMASK: usize = 1348;
+const SUN_OFF_POSTBLFORMAT: usize = 1356;
+const SUN_OFF_NRPOS: usize = 1360;
+const SUN_OFF_POSTBLTBLOFF: usize = 1364;
+const SUN_OFF_ROTBLOFF: usize = 1368;
+/// `FSOKAY`: Solaris calls a volume stable when `fs_state + fs_time` equals this.
+const SUN_FSOKAY: i32 = 0x7c26_9d38;
+
 /// Drive geometry a 4.3BSD volume records, staggers its groups by, and hints its allocator with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Bsd43Geometry {
@@ -153,6 +187,8 @@ pub struct Ufs1FormatParams {
     pub label: Option<String>,
     /// Fixed 4.3BSD drive geometry; `None` searches the NeXT hard-disk shapes.
     pub bsd43_geometry: Option<Bsd43Geometry>,
+    /// Solaris / SunOS 5 flavour of the dynamic layout; only with [`CgLayout::Modern`].
+    pub sun: bool,
 }
 
 impl Default for Ufs1FormatParams {
@@ -166,6 +202,7 @@ impl Default for Ufs1FormatParams {
             cg_layout: CgLayout::Modern,
             label: None,
             bsd43_geometry: None,
+            sun: false,
         }
     }
 }
@@ -218,6 +255,8 @@ pub struct Ufs1Geometry {
     pub maxcontig: u64,
     pub maxbpg: u64,
     pub cg_layout: CgLayout,
+    /// The Sun flavour: dynamic groups carrying real geometry and rotational tables.
+    pub sun: bool,
 }
 
 impl Ufs1Geometry {
@@ -261,9 +300,19 @@ impl Ufs1Geometry {
         }
     }
 
-    /// Byte offset of `cg_iusedoff` within a 4.4BSD cylinder-group header.
+    /// Byte offsets of `cg_btot` and `cg_b`: one slot per cylinder, and per cylinder per position.
+    fn btotoff(&self) -> u64 {
+        CG_SPACE_OFF
+    }
+
+    fn boff(&self) -> u64 {
+        self.btotoff() + self.cpg * 4
+    }
+
+    /// Byte offset of `cg_iusedoff` within a dynamic cylinder-group header.
     fn iusedoff(&self) -> u64 {
-        CG_SPACE_OFF + OLD_CPG * 4 + OLD_CPG * OLD_NRPOS * 2
+        let nrpos = if self.sun { NRPOS_43 } else { OLD_NRPOS };
+        self.boff() + self.cpg * nrpos * 2
     }
 
     fn freeoff(&self) -> u64 {
@@ -285,6 +334,10 @@ impl Ufs1Geometry {
     }
 
     fn nextfreeoff(&self) -> u64 {
+        if self.sun {
+            // Solaris keeps no cluster maps.
+            return self.freeoff() + self.fpg.div_ceil(8);
+        }
         self.clusteroff() + (self.fpg / self.frag).div_ceil(8)
     }
 
@@ -338,7 +391,11 @@ pub fn plan(params: &Ufs1FormatParams) -> Result<Ufs1Geometry, FilesystemError> 
     }
 
     let density = if params.bytes_per_inode == 0 {
-        4 * fsize
+        if params.sun {
+            SUN_NBPI
+        } else {
+            4 * fsize
+        }
     } else {
         params.bytes_per_inode
     };
@@ -388,11 +445,13 @@ pub fn plan(params: &Ufs1FormatParams) -> Result<Ufs1Geometry, FilesystemError> 
         maxcontig: MAXCONTIG_43,
         maxbpg: MAXBPG_43 as u64,
         cg_layout: params.cg_layout,
+        sun: params.sun && params.cg_layout == CgLayout::Modern,
     };
     geo.cblkno = geo.sblkno + SBLOCKSIZE.div_ceil(fsize).next_multiple_of(frag);
     geo.iblkno = geo.cblkno + frag;
 
     match params.cg_layout {
+        CgLayout::Modern if geo.sun => plan_group_sun(&mut geo, density)?,
         CgLayout::Modern => plan_group_modern(&mut geo, density),
         CgLayout::Bsd43 => plan_group_43(&mut geo, density, params.bsd43_geometry)?,
     }
@@ -479,6 +538,39 @@ fn plan_group_modern(geo: &mut Ufs1Geometry, density: u64) {
     geo.spc = geo.fpg * geo.nspf;
     geo.ntrak = 1;
     geo.cpg = OLD_CPG;
+}
+
+/// Sun: whole 16 x 63 cylinders, 16 to a group as Solaris's `newfs` lays them, fewer when the volume or a block-sized header cannot hold that many.
+fn plan_group_sun(geo: &mut Ufs1Geometry, density: u64) -> Result<(), FilesystemError> {
+    let inopf = geo.inopb / geo.frag;
+    let spc = SUN_NTRAK * SUN_NSECT;
+    let frags_per_cyl = spc / geo.nspf;
+    // Solaris counts the volume in whole cylinders; the tail past the last one is not part of it.
+    geo.size_frags = geo.size_frags / frags_per_cyl * frags_per_cyl;
+    let ncyl = geo.size_frags / frags_per_cyl;
+    geo.ntrak = SUN_NTRAK;
+    geo.nsect = SUN_NSECT;
+    geo.spc = spc;
+    geo.cgoffset = SUN_NSECT.div_ceil(geo.nspf).next_multiple_of(geo.frag);
+    geo.cgstagger = SUN_NTRAK - 1;
+    geo.cpc = 1;
+    geo.rps = SUN_RPS;
+    geo.maxcontig = SUN_MAXCONTIG;
+    geo.maxbpg = SUN_MAXBPG;
+    for cpg in (1..=SUN_CPG.min(ncyl)).rev() {
+        geo.cpg = cpg;
+        geo.fpg = cpg * frags_per_cyl;
+        geo.ipg = ipg_for(geo.fpg, geo.fsize, density, geo.inopb);
+        let metadata = geo.iblkno + geo.ipg / inopf + geo.cgoffset * geo.cgstagger;
+        if geo.nextfreeoff() <= geo.bsize && metadata + geo.frag <= geo.fpg {
+            return Ok(());
+        }
+    }
+    Err(FilesystemError::InvalidData(format!(
+        "ufs: {} is too small for a Solaris cylinder group (one {}-sector cylinder at least)",
+        disk_core::display::format_size(geo.size_frags * geo.fsize),
+        spc,
+    )))
 }
 
 /// 4.3BSD: real cylinders, so a group is `fs_cpg` of them and the caps come
@@ -727,7 +819,13 @@ fn write_cylinder_group<W: Write + Seek>(
     // `struct cg` up to `cg_frsum` is the same in both generations; only where
     // the maps live after it differs.
     write_u32(&mut hdr, 12, c as u32, endian);
-    write_i16(&mut hdr, 16, geo.cpg as i16, endian);
+    // A Sun group records the cylinders it really has, which the last one may not fill.
+    let ncyl = if geo.sun && c + 1 == geo.ncg {
+        geo.ncyl - c * geo.cpg
+    } else {
+        geo.cpg
+    };
+    write_i16(&mut hdr, 16, ncyl as i16, endian);
     write_i16(&mut hdr, 18, geo.ipg as i16, endian);
     write_u32(&mut hdr, 20, ndblk as u32, endian);
     write_i32(&mut hdr, 24, cs.ndir as i32, endian);
@@ -741,14 +839,16 @@ fn write_cylinder_group<W: Write + Seek>(
     let (iusedoff, freeoff) = match geo.cg_layout {
         CgLayout::Modern => {
             write_i32(&mut hdr, 4, CG_MAGIC as i32, endian);
-            write_u32(&mut hdr, 84, CG_SPACE_OFF as u32, endian);
-            write_u32(&mut hdr, 88, (CG_SPACE_OFF + OLD_CPG * 4) as u32, endian);
+            write_u32(&mut hdr, 84, geo.btotoff() as u32, endian);
+            write_u32(&mut hdr, 88, geo.boff() as u32, endian);
             write_u32(&mut hdr, 92, geo.iusedoff() as u32, endian);
             write_u32(&mut hdr, 96, geo.freeoff() as u32, endian);
             write_u32(&mut hdr, 100, geo.nextfreeoff() as u32, endian);
-            write_u32(&mut hdr, 104, geo.clustersumoff() as u32, endian);
-            write_u32(&mut hdr, 108, geo.clusteroff() as u32, endian);
-            write_u32(&mut hdr, 112, (ndblk / geo.frag) as u32, endian);
+            if !geo.sun {
+                write_u32(&mut hdr, 104, geo.clustersumoff() as u32, endian);
+                write_u32(&mut hdr, 108, geo.clusteroff() as u32, endian);
+                write_u32(&mut hdr, 112, (ndblk / geo.frag) as u32, endian);
+            }
             (geo.iusedoff(), geo.freeoff())
         }
         CgLayout::Bsd43 => {
@@ -768,8 +868,15 @@ fn write_cylinder_group<W: Write + Seek>(
     hdr[at..at + free.len()].copy_from_slice(&free);
 
     match geo.cg_layout {
+        CgLayout::Modern if geo.sun => {
+            let tables = (geo.btotoff(), geo.boff(), geo.cpg);
+            write_rotational_counts(&mut hdr, geo, &free, ndblk, endian, tables)
+        }
         CgLayout::Modern => write_cluster_maps(&mut hdr, geo, &free, ndblk, endian),
-        CgLayout::Bsd43 => write_43_rotational_counts(&mut hdr, geo, &free, ndblk, endian),
+        CgLayout::Bsd43 => {
+            let tables = (CG43_OFF_BTOT, CG43_OFF_B, MAXCPG_43);
+            write_rotational_counts(&mut hdr, geo, &free, ndblk, endian, tables)
+        }
     }
 
     // Zero the group's own inode table before the header, so a reformat over
@@ -819,29 +926,29 @@ fn write_cluster_maps(
     }
 }
 
-/// 4.3BSD `cg_btot` / `cg_b`: free blocks per cylinder, and per cylinder per
-/// rotational position. The old allocator reads both to place a block under
-/// the head about to pass over it, and on both reference disks they sum to
-/// `cg_cs.cs_nbfree`.
-fn write_43_rotational_counts(
+/// `cg_btot` / `cg_b`: free blocks per cylinder, and per cylinder per rotational position.
+/// `tables` is (`cg_btot` offset, `cg_b` offset, cylinders they hold): fixed in 4.3BSD, dynamic on Sun.
+fn write_rotational_counts(
     hdr: &mut [u8],
     geo: &Ufs1Geometry,
     free: &[u8],
     ndblk: u64,
     endian: UfsEndian,
+    tables: (u64, u64, u64),
 ) {
+    let (btot_off, b_off, max_cyl) = tables;
     for b in 0..ndblk / geo.frag {
         if !block_is_free(geo, free, b) {
             continue;
         }
         let cyl = geo.cylinder_of_block(b);
-        if cyl >= MAXCPG_43 {
+        if cyl >= max_cyl {
             continue;
         }
-        let btot = (CG43_OFF_BTOT + cyl * 4) as usize;
+        let btot = (btot_off + cyl * 4) as usize;
         let now = read_i32_at(hdr, btot, endian) + 1;
         write_i32(hdr, btot, now, endian);
-        let slot = (CG43_OFF_B + (cyl * NRPOS_43 + geo.rpos_of_block(b)) * 2) as usize;
+        let slot = (b_off + (cyl * NRPOS_43 + geo.rpos_of_block(b)) * 2) as usize;
         let now = read_i16_at(hdr, slot, endian) + 1;
         write_i16(hdr, slot, now, endian);
     }
@@ -874,7 +981,7 @@ fn write_root_directory<W: Write + Seek>(
     // A 4.3BSD `struct direct` has a 16-bit `d_namlen` where 4.4BSD put
     // `d_type` and an 8-bit length. Writing the wrong one is invisible here
     // and makes the root directory unreadable on the target system.
-    let old_fmt = geo.cg_layout == CgLayout::Bsd43;
+    let old_fmt = geo.cg_layout == CgLayout::Bsd43 || geo.sun;
     // `DIRBLKSIZ` is 1024 on NeXTSTEP (CD included) and 512 on BSD. Getting it
     // wrong leaves records stopping half way through the chunk the kernel reads.
     let dirblksiz = dir_block_size(geo.fsize, geo.fsbtodb);
@@ -968,10 +1075,54 @@ fn build_superblock(
     put(&mut sb, MAGIC_OFF, MAGIC_UFS1 as i64);
 
     match geo.cg_layout {
+        CgLayout::Modern if geo.sun => build_superblock_sun_tail(&mut sb, geo, endian),
         CgLayout::Modern => build_superblock_modern_tail(&mut sb, geo, endian, total, label),
         CgLayout::Bsd43 => build_superblock_43_tail(&mut sb, geo, endian),
     }
     sb
+}
+
+/// The Sun tail: 4.3BSD geometry fields, Tahoe's dynamic rotational tables and Sun's `fs_state`
+/// stamp, with none of 4.4BSD's 64-bit mirrors, volume name or inode format.
+fn build_superblock_sun_tail(sb: &mut [u8], geo: &Ufs1Geometry, endian: UfsEndian) {
+    let put = |sb: &mut [u8], off: usize, v: i64| write_i32(sb, off, v as i32, endian);
+    let rotbl_len = geo.cpc * geo.blocks_per_cylinder();
+    put(sb, 0x03C, SUN_MINFREE as i64);
+    put(sb, 0x058, geo.maxcontig as i64);
+    put(sb, 0x05C, geo.maxbpg as i64);
+    put(
+        sb,
+        0x068,
+        (SUN_OFF_ROTBL as u64 + rotbl_len).next_multiple_of(geo.fsize) as i64,
+    );
+    let per_block = geo.bsize / CSUM_SIZE;
+    put(sb, 0x06C, -(per_block as i64)); // fs_csmask
+    put(sb, 0x070, per_block.trailing_zeros() as i64); // fs_csshift
+    put(sb, 0x084, geo.nsect as i64); // fs_npsect
+    put(sb, 0x0A4, geo.ntrak as i64);
+    put(sb, FS43_OFF_CPC, geo.cpc as i64);
+    // `fs_time` stays 0, so the stamp alone says the volume is stable.
+    put(sb, SUN_OFF_STATE, SUN_FSOKAY as i64);
+    write_i64(sb, SUN_OFF_QBMASK, (geo.bsize - 1) as i64, endian);
+    write_i64(sb, SUN_OFF_QFMASK, (geo.fsize - 1) as i64, endian);
+    put(sb, SUN_OFF_POSTBLFORMAT, 1); // FS_DYNAMICPOSTBLFMT
+    put(sb, SUN_OFF_NRPOS, NRPOS_43 as i64);
+    put(sb, SUN_OFF_POSTBLTBLOFF, SUN_OFF_POSTBL as i64);
+    put(sb, SUN_OFF_ROTBLOFF, SUN_OFF_ROTBL as i64);
+
+    let slots = (geo.cpc * NRPOS_43) as usize;
+    for i in 0..slots {
+        write_i16(sb, SUN_OFF_POSTBL + i * 2, -1, endian);
+    }
+    let mut last: Vec<Option<u64>> = vec![None; slots];
+    for b in 0..rotbl_len {
+        let slot = (geo.cylinder_of_block(b) * NRPOS_43 + geo.rpos_of_block(b)) as usize;
+        match last[slot] {
+            None => write_i16(sb, SUN_OFF_POSTBL + slot * 2, b as i16, endian),
+            Some(prev) => sb[SUN_OFF_ROTBL + prev as usize] = (b - prev) as u8,
+        }
+        last[slot] = Some(b);
+    }
 }
 
 fn build_superblock_modern_tail(
@@ -1263,6 +1414,82 @@ mod tests {
         assert_eq!(fs.endian(), UfsEndian::Big);
         let root = fs.root().expect("root");
         assert!(fs.list_directory(&root).expect("ls").is_empty());
+    }
+
+    fn params_sun(size: u64) -> Ufs1FormatParams {
+        Ufs1FormatParams {
+            size_bytes: size,
+            endian: UfsEndian::Big,
+            sun: true,
+            ..Default::default()
+        }
+    }
+
+    /// R-073: the layout Solaris 9's own newfs gave a 66-cylinder slice of a `new hd sun` disk.
+    #[test]
+    fn sun_geometry_matches_the_solaris_newfs_slice() {
+        let geo = plan(&params_sun(66 * 1008 * 512)).expect("plan");
+        assert_eq!((geo.ntrak, geo.nsect, geo.spc), (16, 63, 1008));
+        assert_eq!((geo.cpg, geo.ncyl, geo.ncg), (16, 66, 5));
+        assert_eq!((geo.fpg, geo.size_frags), (8064, 33264));
+        assert_eq!((geo.cgoffset, geo.cgstagger), (32, 15));
+        assert_eq!((geo.sblkno, geo.cblkno, geo.iblkno), (16, 24, 32));
+        assert_eq!((geo.btotoff(), geo.boff(), geo.iusedoff()), (168, 232, 488));
+        assert_eq!(geo.nextfreeoff(), geo.freeoff() + 1008);
+    }
+
+    #[test]
+    fn sun_rotational_tables_match_the_solaris_newfs_slice() {
+        let img = create_blank_ufs1(&params_sun(66 * 1008 * 512)).expect("format");
+        let sb = &img[SB_OFFSET_UFS1 as usize..];
+        let be16 = |o: usize| i16::from_be_bytes([sb[o], sb[o + 1]]);
+        let be32 = |o: usize| i32::from_be_bytes([sb[o], sb[o + 1], sb[o + 2], sb[o + 3]]);
+        let postbl: Vec<i16> = (0..8).map(|i| be16(SUN_OFF_POSTBL + i * 2)).collect();
+        assert_eq!(postbl, [0, 32, 1, 33, 2, 34, 3, 35]);
+        assert_eq!(sb[SUN_OFF_ROTBL], 4);
+        assert_eq!(
+            be32(0x0A4),
+            16,
+            "fs_ntrak, which Solaris's fsck rejects at zero"
+        );
+        assert_eq!(be32(OFF_MAXSYMLINKLEN), 0, "no 4.4BSD inode format");
+        assert_eq!(be32(SUN_OFF_STATE), SUN_FSOKAY);
+        assert_eq!(sb[0xD3], 0, "no FS_FLAGS_UPDATED");
+    }
+
+    #[test]
+    fn a_sun_volume_fscks_clean_and_takes_edits() {
+        for size in [32 * 1024 * 1024u64, 200 * 1024 * 1024] {
+            let mut img = create_blank_ufs1(&params_sun(size)).expect("format");
+            let mut fs = UfsFilesystem::open(Cursor::new(&mut img), 0).expect("open");
+            assert!(fs.old_dirent_fmt(), "{size}: Solaris reads 16-bit d_namlen");
+            let report = fsck_ufs(&mut fs).expect("fsck");
+            assert!(
+                report.errors.is_empty() && report.warnings.is_empty(),
+                "{size} byte Sun volume: {:?} / {:?}",
+                report.errors,
+                report.warnings,
+            );
+            let root = fs.root().expect("root");
+            fs.create_directory(&root, "rbtest", &CreateDirectoryOptions::default())
+                .expect("mkdir");
+            drop(fs);
+            let mut fs = UfsFilesystem::open(Cursor::new(&mut img), 0).expect("reopen");
+            let root = fs.root().expect("root");
+            let names: Vec<String> = fs
+                .list_directory(&root)
+                .unwrap()
+                .into_iter()
+                .map(|e| e.name)
+                .collect();
+            assert_eq!(names, ["rbtest"]);
+            let report = fsck_ufs(&mut fs).expect("fsck");
+            assert!(
+                report.errors.is_empty(),
+                "{size} after mkdir: {:?}",
+                report.errors
+            );
+        }
     }
 
     #[test]

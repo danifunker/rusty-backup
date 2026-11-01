@@ -121,6 +121,7 @@ fn ufs_params(opts: &NextCdOptions, fs_bytes: u64) -> Ufs1FormatParams {
         cg_layout: CgLayout::Bsd43,
         label: None,
         bsd43_geometry: Some(Bsd43Geometry::NEXT_CDROM),
+        sun: false,
     }
 }
 

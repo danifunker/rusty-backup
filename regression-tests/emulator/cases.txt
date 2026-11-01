@@ -21,4 +21,4 @@ ntfs.win7-blank        -nc    win7_chkdsk.py ntfs-blank
 fat32.win7-blank       -      win7_chkdsk.py fat32-blank
 fat.win7-blank         -      win7_chkdsk.py fat-blank
 ufs1-be.solaris-edit   -      solaris_ufs_fsck.py sol-edit
-ufs1-be.solaris-blank  R-073  solaris_ufs_fsck.py blank
+ufs1-be.solaris-blank  -      solaris_ufs_fsck.py blank

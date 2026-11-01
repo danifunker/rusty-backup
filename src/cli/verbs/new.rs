@@ -183,6 +183,13 @@ pub enum FsKind {
     /// ignored because 4.3BSD has no volume-label field.
     #[value(name = "ufs-43bsd", alias = "ufs43", alias = "nextstep")]
     Ufs43,
+    /// UFS1 as Solaris / SunOS 5 writes it: real drive geometry, cylinder
+    /// groups staggered across tracks, live rotational tables, 16-bit
+    /// `d_namlen` directory entries and Sun's `fs_state` stamp. This is what
+    /// goes inside a `new hd sun` slice; Solaris's fsck rejects a 4.4BSD
+    /// volume there. Big-endian by default (SPARC); `--name` is ignored.
+    #[value(name = "ufs-solaris", alias = "solaris")]
+    UfsSun,
 }
 
 /// The three media classes `new` creates. CD-ROM images are not here —
@@ -253,7 +260,8 @@ pub enum HdCommand {
 
     /// Sun disk label (SMI VTOC) for SPARC Solaris / SunOS, with slices you
     /// size and tag yourself. Cylinder-aligned from `--heads` / `--sectors`;
-    /// slice 2 is reserved for the whole-disk "backup" alias.
+    /// slice 2 is reserved for the whole-disk "backup" alias. Fill a slice
+    /// with a volume from `new volume ufs-solaris`; Solaris rejects a 4.4BSD `ufs`.
     Sun(super::new_partitioned_hd::CylinderHdArgs),
 
     /// NeXT disk label (NeXTSTEP / OPENSTEP, black m68k hardware and
@@ -392,14 +400,18 @@ pub enum VolumeFs {
     /// sectors.
     #[value(alias = "beos-ofs")]
     Ofs,
-    /// UFS1 / FFS (4.4BSD, FreeBSD, NetBSD, OpenBSD, Solaris). `--big-endian`
-    /// writes the SPARC / m68k byte order.
+    /// UFS1 / FFS (4.4BSD: FreeBSD, NetBSD, OpenBSD). `--big-endian` writes
+    /// the SPARC / m68k byte order. For Solaris use `ufs-solaris`.
     #[value(alias = "ufs1", alias = "ffs")]
     Ufs,
     /// UFS1 in the pre-4.4BSD (NeXTSTEP / OPENSTEP) on-disk format, which is
     /// what a `new hd next` partition needs. Big-endian by default.
     #[value(name = "ufs-43bsd", alias = "ufs43", alias = "nextstep")]
     Ufs43,
+    /// UFS1 as Solaris / SunOS 5 writes it, which is what a `new hd sun`
+    /// slice needs. Big-endian by default.
+    #[value(name = "ufs-solaris", alias = "solaris")]
+    UfsSun,
 }
 
 impl VolumeFs {
@@ -427,6 +439,7 @@ impl VolumeFs {
             VolumeFs::Ofs => FsKind::Ofs,
             VolumeFs::Ufs => FsKind::Ufs,
             VolumeFs::Ufs43 => FsKind::Ufs43,
+            VolumeFs::UfsSun => FsKind::UfsSun,
         }
     }
 }
@@ -525,8 +538,8 @@ pub struct VolumeArgs {
     pub block_size: Option<u32>,
 
     /// BFS and UFS: write the big-endian byte order (BeOS/PPC; SPARC / m68k /
-    /// MIPS) instead of the little-endian default. Implied by `ufs-43bsd`,
-    /// since every NeXT disk is big-endian.
+    /// MIPS) instead of the little-endian default. Implied by `ufs-43bsd`
+    /// and `ufs-solaris`, the byte order of every NeXT and SPARC disk.
     #[arg(long = "big-endian")]
     pub big_endian: bool,
 
@@ -988,8 +1001,9 @@ fn format_image(args: NewArgs) -> Result<()> {
         FsKind::Adfs => format_and_write(&args.image, &args.size, &args.name, |_size, name| {
             Ok(fs_adfs::adfs::create_blank_adfs(name))
         }),
-        FsKind::Ufs => write_blank_ufs_image(&args, fs_unix::ufs::CgLayout::Modern),
-        FsKind::Ufs43 => write_blank_ufs_image(&args, fs_unix::ufs::CgLayout::Bsd43),
+        FsKind::Ufs => write_blank_ufs_image(&args, fs_unix::ufs::CgLayout::Modern, false),
+        FsKind::Ufs43 => write_blank_ufs_image(&args, fs_unix::ufs::CgLayout::Bsd43, false),
+        FsKind::UfsSun => write_blank_ufs_image(&args, fs_unix::ufs::CgLayout::Modern, true),
     }
 }
 
@@ -1107,7 +1121,11 @@ fn sanitize_os9_volume_name(name: &str) -> String {
 /// being materialized in RAM.
 /// UFS is streamed rather than built in memory: a blank volume is almost all
 /// zeros, and the sizes people format are the ones a `Vec` cannot hold.
-fn write_blank_ufs_image(args: &NewArgs, cg_layout: fs_unix::ufs::CgLayout) -> Result<()> {
+fn write_blank_ufs_image(
+    args: &NewArgs,
+    cg_layout: fs_unix::ufs::CgLayout,
+    sun: bool,
+) -> Result<()> {
     use fs_unix::ufs::{CgLayout, UfsEndian};
     use fs_unix::ufs_format::{write_blank_ufs1, Ufs1FormatParams};
 
@@ -1115,7 +1133,7 @@ fn write_blank_ufs_image(args: &NewArgs, cg_layout: fs_unix::ufs::CgLayout) -> R
     let block_size = u64::from(args.block_size.unwrap_or(8192));
     // Every NeXT disk is big-endian, so the 4.3BSD format defaults that way
     // rather than making --big-endian mandatory for the only case it has.
-    let big_endian = args.big_endian || cg_layout == CgLayout::Bsd43;
+    let big_endian = args.big_endian || cg_layout == CgLayout::Bsd43 || sun;
     let params = Ufs1FormatParams {
         size_bytes: size,
         block_size,
@@ -1131,8 +1149,9 @@ fn write_blank_ufs_image(args: &NewArgs, cg_layout: fs_unix::ufs::CgLayout) -> R
         cg_layout,
         // 4.3BSD has no `fs_volname`; the bytes 4.4BSD keeps it in are
         // `fs_fsmnt` there, so a label would land inside the mount point.
-        label: (cg_layout == CgLayout::Modern).then(|| args.name.clone()),
+        label: (cg_layout == CgLayout::Modern && !sun).then(|| args.name.clone()),
         bsd43_geometry: None,
+        sun,
     };
     let mut file = std::fs::File::create(&args.image)
         .with_context(|| format!("creating {}", args.image.display()))?;
@@ -1143,7 +1162,9 @@ fn write_blank_ufs_image(args: &NewArgs, cg_layout: fs_unix::ufs::CgLayout) -> R
     log_stderr(format!(
         "wrote {} ({size} bytes, UFS1 {} bsize={} fsize={} {} cylinder group(s), {} inodes)",
         args.image.display(),
-        if cg_layout == CgLayout::Bsd43 {
+        if sun {
+            "Solaris"
+        } else if cg_layout == CgLayout::Bsd43 {
             "4.3BSD"
         } else {
             "4.4BSD"
