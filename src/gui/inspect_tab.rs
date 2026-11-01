@@ -500,6 +500,55 @@ impl InspectTab {
         self.cache_status = None;
     }
 
+    /// Drain the workers while another tab shows, so a finished job reports and frees the busy gate.
+    pub fn poll_background(&mut self, ctx: &mut TabContext) {
+        self.poll_inspect_status(ctx);
+        self.poll_export_status(ctx);
+        self.poll_remote_backup_status(ctx);
+        self.poll_min_size_calcs(ctx);
+        self.poll_volume_label_probes(ctx);
+        self.poll_chd_expand_status(ctx);
+        self.poll_repack_status(ctx);
+        self.poll_swab_status(ctx);
+        self.poll_block_cache_scan(ctx);
+        self.poll_cache_status(ctx);
+    }
+
+    /// The running Inspect job other tabs must wait for (export, expand, repack, resize, ...), if any.
+    pub fn running_job(&self) -> Option<&'static str> {
+        use rusty_backup::model::worker::lock_status;
+        fn running<T>(s: &Option<Arc<Mutex<T>>>, finished: impl Fn(&T) -> bool) -> bool {
+            s.as_ref().is_some_and(|a| !finished(&lock_status(a)))
+        }
+        if running(&self.export_status, |s| s.finished) {
+            Some("Inspect: Export")
+        } else if running(&self.chd_expand_status, |s| s.finished) {
+            Some("Inspect: Expand CHD")
+        } else if running(&self.repack_status, |s| s.finished) {
+            Some("Inspect: Repack")
+        } else if running(&self.swab_status, |s| s.finished) {
+            Some("Inspect: Swab16")
+        } else if running(&self.remote_backup_status, |s| s.finished) {
+            Some("Inspect: Back Up Image")
+        } else if self.resize_popup.as_ref().is_some_and(|r| r.is_running()) {
+            Some("Inspect: Resize")
+        } else if self
+            .expand_hfs_dialog
+            .as_ref()
+            .is_some_and(|d| d.is_running())
+        {
+            Some("Inspect: Expand HFS")
+        } else if self
+            .floppy_convert_dialog
+            .as_ref()
+            .is_some_and(|d| d.is_running())
+        {
+            Some("Inspect: Floppy convert")
+        } else {
+            self.browse_view.running_job().map(|_| "Inspect: Browse")
+        }
+    }
+
     pub fn show(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext) {
         ui.heading("Inspect Disk / Image");
         ui.add_space(8.0);

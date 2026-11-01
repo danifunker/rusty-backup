@@ -90,6 +90,13 @@ pub struct FloppyConvertDialog {
 }
 
 impl FloppyConvertDialog {
+    /// A conversion is in flight (the status stays after it finishes, for the summary).
+    pub fn is_running(&self) -> bool {
+        self.status
+            .as_ref()
+            .is_some_and(|s| !rusty_backup::model::worker::lock_status(s).finished)
+    }
+
     /// Open with no pre-loaded source — the user picks it inside the dialog.
     pub fn empty() -> Self {
         Self {

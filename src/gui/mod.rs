@@ -901,10 +901,16 @@ impl RustyBackupApp {
     /// Another tab (not `tab`) with a disk job in flight; one job at a time
     /// keeps two drives from being hammered and the shared progress bar honest.
     fn busy_elsewhere(&self, tab: Tab) -> Option<&'static str> {
-        let jobs: [(Tab, bool, &'static str); 3] = [
+        let inspect = self.inspect_tab.running_job();
+        let jobs: [(Tab, bool, &'static str); 4] = [
             (Tab::Backup, self.backup_tab.is_running(), "Backup"),
             (Tab::Restore, self.restore_tab.is_running(), "Restore"),
             (Tab::Optical, self.optical_tab.is_running(), "Optical"),
+            (
+                Tab::Inspect,
+                inspect.is_some(),
+                inspect.unwrap_or("Inspect"),
+            ),
         ];
         jobs.iter()
             .find(|(owner, running, _)| *running && *owner != tab)
@@ -1276,6 +1282,10 @@ impl eframe::App for RustyBackupApp {
         if !matches!(self.active_tab, Tab::Optical) {
             self.optical_tab
                 .poll_background(&mut self.app.log, &mut self.progress);
+        }
+        if !matches!(self.active_tab, Tab::Inspect) {
+            let mut ctx = context::TabContext::new(&self.devices, &mut self.app.log);
+            self.inspect_tab.poll_background(&mut ctx);
         }
 
         // Central panel: active tab content

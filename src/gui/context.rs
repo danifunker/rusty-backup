@@ -40,5 +40,5 @@ impl<'a> TabContext<'a> {
 
 /// The one-line notice a tab shows while another tab's job locks its controls.
 pub fn busy_elsewhere_notice(tab: &str) -> String {
-    format!("The {tab} tab has a disk job running; start controls unlock when it finishes.")
+    format!("A disk job is running ({tab}); start controls unlock when it finishes.")
 }

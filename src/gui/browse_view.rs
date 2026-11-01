@@ -549,6 +549,38 @@ struct GuiTextEditor {
 }
 
 impl BrowseView {
+    /// The label of a running extract, archive edit, CHD flatten or tar export, if any.
+    pub fn running_job(&self) -> Option<&'static str> {
+        use rusty_backup::model::worker::lock_status;
+        if self
+            .extraction_progress
+            .as_ref()
+            .is_some_and(|p| !lock_status(p).finished)
+        {
+            Some("Extract")
+        } else if self
+            .archive_edit_progress
+            .as_ref()
+            .is_some_and(|p| !lock_status(p).finished)
+        {
+            Some("Archive edit")
+        } else if self
+            .chd_flatten_progress
+            .as_ref()
+            .is_some_and(|p| !lock_status(p).finished)
+        {
+            Some("CHD flatten")
+        } else if self
+            .tar_export_progress
+            .as_ref()
+            .is_some_and(|p| !lock_status(p).finished)
+        {
+            Some("Tar export")
+        } else {
+            None
+        }
+    }
+
     /// Initialize the browser for a partition within a source image/device.
     ///
     /// `preopen_file` — if provided, this already-elevated file handle is used

@@ -44,6 +44,13 @@ pub struct ExpandHfsDialog {
 }
 
 impl ExpandHfsDialog {
+    /// An expand is in flight (the status stays after it finishes, for the summary).
+    pub fn is_running(&self) -> bool {
+        self.status
+            .as_ref()
+            .is_some_and(|s| !rusty_backup::model::worker::lock_status(s).finished)
+    }
+
     pub fn new(source: ExpandSource) -> Self {
         // Default target = current partition size, but never below the source's
         // used space. Round up to nearest MiB.
