@@ -3823,28 +3823,32 @@ impl App {
         self.selection = 0;
         self.status = None;
         if path.is_dir() {
-            match crate::model::backup_loader::load_backup(&path) {
-                Ok(outcome) => {
-                    use crate::model::backup_loader::LoadOutcome;
-                    let display = path.display().to_string();
-                    crate::update::push_recent(crate::update::RecentMode::Inspect, &display);
-                    let (kind, partitions, info) = match outcome {
+            self.start_task("Loading the backup", move |job| {
+                use crate::model::backup_loader::LoadOutcome;
+                job.set_can_cancel(false);
+                let loaded =
+                    crate::model::backup_loader::load_backup(&path).map(|outcome| match outcome {
                         LoadOutcome::Backup(b) => {
                             ("rusty-backup".to_string(), b.partitions.len(), b.info)
                         }
                         LoadOutcome::Clonezilla(c) => {
                             ("Clonezilla".to_string(), c.partitions.len(), c.info)
                         }
-                    };
-                    self.opened = Some(Opened::Backup {
-                        path: display,
-                        kind,
-                        partitions,
-                        info,
                     });
-                }
-                Err(e) => self.status = Some(format!("Cannot open: {e}")),
-            }
+                let display = path.display().to_string();
+                Ok(Box::new(move |app: &mut App| match loaded {
+                    Ok((kind, partitions, info)) => {
+                        crate::update::push_recent(crate::update::RecentMode::Inspect, &display);
+                        app.opened = Some(Opened::Backup {
+                            path: display,
+                            kind,
+                            partitions,
+                            info,
+                        });
+                    }
+                    Err(e) => app.status = Some(format!("Cannot open: {e}")),
+                }) as TaskDone)
+            });
         } else if path.exists() {
             // `exists()` rather than `is_file()`: a raw device (`/dev/sda`) is
             // neither a file nor a directory, so `is_file()` sent every device
@@ -3865,8 +3869,28 @@ impl App {
     /// `disk` when opening from the disk list so the view can show the hardware
     /// facts alongside the partition table.
     fn open_image_at(&mut self, path: std::path::PathBuf, disk: Option<Box<DiskDevice>>) {
+        // Sizing a device and reading its table happen on the worker; a slow disk keeps the screen live.
+        self.start_task("Reading the partition table", move |job| {
+            job.set_can_cancel(false);
+            let size = readable_size(&path);
+            let parts = size.as_ref().ok().map(|&s| parse_partitions(&path, s));
+            Ok(
+                Box::new(move |app: &mut App| app.apply_image_open(path, disk, size, parts))
+                    as TaskDone,
+            )
+        });
+    }
+
+    /// Show an image or device opened by [`open_image_at`](Self::open_image_at).
+    fn apply_image_open(
+        &mut self,
+        path: std::path::PathBuf,
+        disk: Option<Box<DiskDevice>>,
+        size: std::io::Result<u64>,
+        parts: Option<std::io::Result<Vec<PartRow>>>,
+    ) {
         let display = path.display().to_string();
-        let size = match readable_size(&path) {
+        let size = match size {
             Ok(s) => s,
             // Fall back to the size the enumerator already reported. Reading a
             // raw device needs elevation, and refusing to show anything at all
@@ -3883,7 +3907,11 @@ impl App {
                 }
             },
         };
-        match parse_partitions(&path, size) {
+        let parts = match parts {
+            Some(p) => p,
+            None => parse_partitions(&path, size),
+        };
+        match parts {
             Ok(parts) => {
                 crate::update::push_recent(crate::update::RecentMode::Inspect, &display);
                 self.status = None;
@@ -6561,29 +6589,26 @@ impl App {
             return;
         }
 
-        // Materialize a .cbk container to a temp folder we keep alive.
-        let (folder, guard): (std::path::PathBuf, Option<tempfile::TempDir>) =
-            if path.is_file() && crate::rbformats::cbk::is_cbk(&path) {
-                match tempfile::TempDir::new().and_then(|tmp| {
-                    crate::rbformats::cbk::materialize_cbk_to_folder(&path, tmp.path())
-                        .map(|_| tmp)
-                        .map_err(crate::compat::io_other)
-                }) {
-                    Ok(tmp) => (tmp.path().to_path_buf(), Some(tmp)),
-                    Err(e) => {
-                        if let Some(r) = self.restore.as_mut() {
-                            r.result = Some(format!("Cannot open .cbk: {e}"));
-                            r.is_error = true;
-                        }
-                        return;
-                    }
-                }
-            } else {
-                (path.clone(), None)
-            };
+        // Unpacking a .cbk and reading the metadata can take a while, so both run as a task.
+        self.start_task("Loading the backup", move |job| {
+            job.set_can_cancel(false);
+            let loaded = load_restore_backup(&path, job);
+            Ok(Box::new(move |app: &mut App| app.apply_restore_backup(path, loaded)) as TaskDone)
+        });
+    }
 
-        match crate::model::backup_loader::load_backup(&folder) {
-            Ok(crate::model::backup_loader::LoadOutcome::Backup(b)) => {
+    /// Show a backup loaded by [`load_restore_backup`] on the Restore screen.
+    fn apply_restore_backup(&mut self, path: std::path::PathBuf, loaded: RestoreLoad) {
+        let Some(r) = self.restore.as_mut() else {
+            return;
+        };
+        match loaded {
+            RestoreLoad::Backup {
+                folder,
+                guard,
+                source_size,
+                part_count,
+            } => {
                 crate::update::push_recent(
                     crate::update::RecentMode::Restore,
                     &path.to_string_lossy(),
@@ -6602,35 +6627,22 @@ impl App {
                         .to_string()
                     })
                     .unwrap_or_default();
-                if let Some(r) = self.restore.as_mut() {
-                    r.backup_folder = folder.display().to_string();
-                    r.source_size = b.metadata.source_size_bytes;
-                    r.part_count = b.partitions.len();
-                    r.loaded = true;
-                    r.cbk_guard = guard;
-                    if r.target.is_empty() {
-                        r.target = default_target;
-                    }
-                    r.step = RestoreStep::Config;
-                    r.field = 0;
-                    r.result = None;
-                    r.is_error = false;
+                r.backup_folder = folder.display().to_string();
+                r.source_size = source_size;
+                r.part_count = part_count;
+                r.loaded = true;
+                r.cbk_guard = guard;
+                if r.target.is_empty() {
+                    r.target = default_target;
                 }
+                r.step = RestoreStep::Config;
+                r.field = 0;
+                r.result = None;
+                r.is_error = false;
             }
-            Ok(crate::model::backup_loader::LoadOutcome::Clonezilla(_)) => {
-                if let Some(r) = self.restore.as_mut() {
-                    r.result = Some(
-                        "Clonezilla images: restore via the CLI (`rb-cli restore`) for now."
-                            .to_string(),
-                    );
-                    r.is_error = true;
-                }
-            }
-            Err(e) => {
-                if let Some(r) = self.restore.as_mut() {
-                    r.result = Some(format!("Not a rusty-backup folder: {e}"));
-                    r.is_error = true;
-                }
+            RestoreLoad::Refused(msg) => {
+                r.result = Some(msg);
+                r.is_error = true;
             }
         }
     }
@@ -8126,6 +8138,15 @@ impl App {
             Some(ex) => ex.status = Some(msg),
             None => self.status = Some(msg),
         }
+    }
+
+    /// Tests: wait for the running task and apply it, as `tick` would.
+    #[cfg(test)]
+    fn finish_task(&mut self) {
+        while self.task.as_ref().is_some_and(|t| t.job.is_running()) {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        self.poll_task();
     }
 
     /// Apply a finished task, or report how it ended.
@@ -11695,6 +11716,48 @@ fn build_explorer(
     })
 }
 
+/// A Restore-screen backup load: the folder (and the .cbk temp dir that holds it), or why not.
+enum RestoreLoad {
+    Backup {
+        folder: std::path::PathBuf,
+        guard: Option<tempfile::TempDir>,
+        source_size: u64,
+        part_count: usize,
+    },
+    Refused(String),
+}
+
+/// Unpack a `.cbk` to a temp folder when given one, then read the backup's metadata.
+fn load_restore_backup(path: &std::path::Path, job: &crate::model::job::JobCtx) -> RestoreLoad {
+    let (folder, guard): (std::path::PathBuf, Option<tempfile::TempDir>) =
+        if path.is_file() && crate::rbformats::cbk::is_cbk(path) {
+            job.set_phase("Unpacking the .cbk");
+            match tempfile::TempDir::new().and_then(|tmp| {
+                crate::rbformats::cbk::materialize_cbk_to_folder(path, tmp.path())
+                    .map(|_| tmp)
+                    .map_err(crate::compat::io_other)
+            }) {
+                Ok(tmp) => (tmp.path().to_path_buf(), Some(tmp)),
+                Err(e) => return RestoreLoad::Refused(format!("Cannot open .cbk: {e}")),
+            }
+        } else {
+            (path.to_path_buf(), None)
+        };
+    job.set_phase("Reading the backup");
+    match crate::model::backup_loader::load_backup(&folder) {
+        Ok(crate::model::backup_loader::LoadOutcome::Backup(b)) => RestoreLoad::Backup {
+            folder,
+            guard,
+            source_size: b.metadata.source_size_bytes,
+            part_count: b.partitions.len(),
+        },
+        Ok(crate::model::backup_loader::LoadOutcome::Clonezilla(_)) => RestoreLoad::Refused(
+            "Clonezilla images: restore via the CLI (`rb-cli restore`) for now.".to_string(),
+        ),
+        Err(e) => RestoreLoad::Refused(format!("Not a rusty-backup folder: {e}")),
+    }
+}
+
 /// Open a partition of `image_path` read-only, as the Explorer does.
 fn open_partition_ro(
     image_path: &str,
@@ -12508,6 +12571,7 @@ mod tests {
         assert!(app.opened.is_none());
 
         app.activate(); // one press
+        app.finish_task();
 
         let Some(Opened::Image { parts, disk, .. }) = &app.opened else {
             panic!("a single Enter should have opened the disk's partition table");
@@ -12748,6 +12812,7 @@ mod tests {
         let mut app = App::new_on(DEFAULT_TAB);
         app.disks = Some(vec![fake_disk(&img, size)]);
         app.activate();
+        app.finish_task();
         assert!(app.opened.is_some());
 
         app.on_back();
@@ -12770,6 +12835,7 @@ mod tests {
         // says, it must not be "No such file or directory".
         let dir = tempfile::tempdir().expect("tempdir");
         app.open_target(dir.path().to_path_buf());
+        app.finish_task();
         let status = app.status.clone().unwrap_or_default();
         assert!(
             !status.contains("No such file or directory"),
