@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use fs_xerox::alto::bfs::Bfs;
 use fs_xerox::alto::{open_pack, pdi, write, FsFamily, Geometry};
 
-use super::progress::LogPanel;
+use rusty_backup::vm::log::LogStore;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Target {
@@ -88,7 +88,7 @@ impl AltoResizeDialog {
     }
 
     /// Returns `true` while the dialog should stay open.
-    pub fn show(&mut self, ctx: &egui::Context, log: &mut LogPanel) -> bool {
+    pub fn show(&mut self, ctx: &egui::Context, log: &mut LogStore) -> bool {
         let mut window_open = true;
         egui::Window::new("Resize Alto Disk")
             .collapsible(false)
@@ -145,7 +145,7 @@ impl AltoResizeDialog {
         window_open && !self.closed
     }
 
-    fn do_resize(&mut self, log: &mut LogPanel) {
+    fn do_resize(&mut self, log: &mut LogStore) {
         let Some(out) = rfd::FileDialog::new()
             .add_filter("PARC Disk Image", &["pdi"])
             .set_file_name("resized.pdi")

@@ -19,7 +19,7 @@ use arc_mac::detect::{detect_mountable_image, MountableImageKind};
 use arc_mac::extract::{self, ExtractStats, ForkFormat};
 use arc_mac::stuffit::{self, StuffItArchive};
 
-use super::progress::LogPanel;
+use rusty_backup::vm::log::LogStore;
 
 /// A successfully loaded archive: the decoded bytes plus parsed directory.
 struct Loaded {
@@ -162,7 +162,7 @@ impl ArchivesTab {
     /// only entries whose checkbox is ticked are extracted via
     /// [`extract::extract_filtered`]; otherwise [`extract::extract_all`]
     /// pulls everything (Workflow D.3).
-    fn start_extract(&mut self, log: &mut LogPanel, selected_only: bool) {
+    fn start_extract(&mut self, log: &mut LogStore, selected_only: bool) {
         let (Some(loaded), Some(dest)) = (self.loaded.as_ref(), self.output_dir.clone()) else {
             return;
         };
@@ -233,7 +233,7 @@ impl ArchivesTab {
 
     /// Poll the worker; move completion into the log. Returns true while a job
     /// is still running.
-    fn poll(&mut self, log: &mut LogPanel) -> bool {
+    fn poll(&mut self, log: &mut LogStore) -> bool {
         let mut running = false;
         let mut clear = false;
         if let Some(status) = self.status.as_ref() {
@@ -267,7 +267,7 @@ impl ArchivesTab {
         running
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, log: &mut LogPanel) {
+    pub fn show(&mut self, ui: &mut egui::Ui, log: &mut LogStore) {
         let running = self.poll(log);
 
         ui.heading("Mac Archives");

@@ -20,7 +20,7 @@ use rusty_backup::rbformats::containers::{
     convert_floppy_container, floppy_kind_from_extension, ContainerKind,
 };
 
-use super::progress::LogPanel;
+use rusty_backup::vm::log::LogStore;
 
 /// Backing status shared between the GUI thread and the worker.
 #[derive(Default)]
@@ -148,7 +148,7 @@ impl FloppyConvertDialog {
     }
 
     /// Render the dialog. Returns `false` once the user closes it for good.
-    pub fn show(&mut self, ctx: &egui::Context, log: &mut LogPanel) -> bool {
+    pub fn show(&mut self, ctx: &egui::Context, log: &mut LogStore) -> bool {
         if !self.open {
             return false;
         }
@@ -352,7 +352,7 @@ impl FloppyConvertDialog {
         self.open
     }
 
-    fn spawn_worker(&mut self, source: PathBuf, output: PathBuf, log: &mut LogPanel) {
+    fn spawn_worker(&mut self, source: PathBuf, output: PathBuf, log: &mut LogStore) {
         let target_kind = self.target.container();
         log.info(format!(
             "Converting floppy container: {} -> {} ({})",

@@ -1,120 +1,56 @@
 use egui::RichText;
+use rusty_backup::vm::app::AppVm;
+use rusty_backup::vm::log::LogLevel;
+use rusty_backup::vm::ViewModel;
 
 // The rate/ETA estimator lives in the (non-GUI) model layer so the CLI shares
 // it; re-exported here for the tabs that refer to `progress::RateTracker`.
 pub use rusty_backup::model::rate_tracker::RateTracker;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum LogLevel {
-    Info,
-    Warning,
-    Error,
-}
-
-#[derive(Debug, Clone)]
-struct LogEntry {
-    level: LogLevel,
-    message: String,
-    timestamp: String,
-}
-
-/// Scrollable log panel displayed at the bottom of the window.
-pub struct LogPanel {
-    entries: Vec<LogEntry>,
-    auto_scroll: bool,
-}
-
-impl Default for LogPanel {
-    fn default() -> Self {
-        Self {
-            entries: Vec::new(),
-            auto_scroll: true,
-        }
-    }
-}
-
-impl LogPanel {
-    pub fn add(&mut self, level: LogLevel, message: impl Into<String>) {
-        let now = chrono_now();
-        self.entries.push(LogEntry {
-            level,
-            message: message.into(),
-            timestamp: now,
+/// Draw the log panel at the bottom of the window from the app view-model.
+pub fn show_log(ui: &mut egui::Ui, app: &mut AppVm) {
+    use rusty_backup::vm::app::AppAction;
+    let mut actions = Vec::new();
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Log").strong());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.button("Copy Log").clicked() {
+                actions.push(AppAction::CopyLog);
+            }
+            if ui.button("Clear").clicked() {
+                actions.push(AppAction::ClearLog);
+            }
+            let mut auto_scroll = app.log_auto_scroll();
+            if ui.checkbox(&mut auto_scroll, "Auto-scroll").changed() {
+                actions.push(AppAction::SetLogAutoScroll(auto_scroll));
+            }
         });
-    }
+    });
 
-    pub fn info(&mut self, message: impl Into<String>) {
-        self.add(LogLevel::Info, message);
-    }
+    ui.separator();
 
-    pub fn warn(&mut self, message: impl Into<String>) {
-        self.add(LogLevel::Warning, message);
-    }
-
-    pub fn error(&mut self, message: impl Into<String>) {
-        self.add(LogLevel::Error, message);
-    }
-
-    /// Copy all log entries to clipboard
-    fn copy_to_clipboard(&self, ctx: &egui::Context) {
-        let log_text: String = self
-            .entries
-            .iter()
-            .map(|entry| {
-                let prefix = match entry.level {
-                    LogLevel::Info => "INFO",
-                    LogLevel::Warning => "WARN",
-                    LogLevel::Error => "ERR ",
+    // Use a simple ScrollArea without show_rows to avoid bouncing
+    egui::ScrollArea::vertical()
+        .auto_shrink([false; 2])
+        .stick_to_bottom(app.log_auto_scroll())
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            for entry in app.log.entries() {
+                let color = match entry.level {
+                    LogLevel::Info => super::theme::muted(ui.visuals()),
+                    LogLevel::Warning => super::theme::warning(ui.visuals()),
+                    LogLevel::Error => super::theme::danger(ui.visuals()),
                 };
-                format!("{} [{}] {}", entry.timestamp, prefix, entry.message)
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        ctx.copy_text(log_text);
-    }
-
-    pub fn show(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Log").strong());
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Copy Log").clicked() {
-                    self.copy_to_clipboard(ui.ctx());
-                }
-                if ui.button("Clear").clicked() {
-                    self.entries.clear();
-                }
-                ui.checkbox(&mut self.auto_scroll, "Auto-scroll");
-            });
+                // Use horizontal layout with word wrap to handle long lines
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(entry.line()).color(color).monospace());
+                });
+            }
         });
 
-        ui.separator();
-
-        // Use a simple ScrollArea without show_rows to avoid bouncing
-        egui::ScrollArea::vertical()
-            .auto_shrink([false; 2])
-            .stick_to_bottom(self.auto_scroll)
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                for entry in &self.entries {
-                    let color = match entry.level {
-                        LogLevel::Info => super::theme::muted(ui.visuals()),
-                        LogLevel::Warning => super::theme::warning(ui.visuals()),
-                        LogLevel::Error => super::theme::danger(ui.visuals()),
-                    };
-                    let prefix = match entry.level {
-                        LogLevel::Info => "INFO",
-                        LogLevel::Warning => "WARN",
-                        LogLevel::Error => "ERR ",
-                    };
-
-                    let text = format!("{} [{}] {}", entry.timestamp, prefix, entry.message);
-
-                    // Use horizontal layout with word wrap to handle long lines
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new(text).color(color).monospace());
-                    });
-                }
-            });
+    for action in actions {
+        let effects = app.apply(action);
+        super::run_effects(ui.ctx(), effects);
     }
 }
 
@@ -174,9 +110,4 @@ impl ProgressState {
             }
         });
     }
-}
-
-/// Get current timestamp in local time.
-fn chrono_now() -> String {
-    chrono::Local::now().format("%H:%M:%S").to_string()
 }

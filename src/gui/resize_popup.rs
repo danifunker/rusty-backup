@@ -9,7 +9,7 @@ use rusty_backup::model::status::ResizeStatus;
 use rusty_backup::partition::resize::{apply_resize, compute_resize_plan, detect_vhd};
 use rusty_backup::partition::{PartitionInfo, PartitionTable};
 
-use super::progress::LogPanel;
+use rusty_backup::vm::log::LogStore;
 
 /// Per-partition entry in the resize grid.
 struct ResizeEntry {
@@ -182,7 +182,7 @@ impl ResizePopup {
     }
 
     /// Poll the background resize thread and drain log messages.
-    pub fn poll_status(&mut self, log: &mut LogPanel) {
+    pub fn poll_status(&mut self, log: &mut LogStore) {
         let status_arc = match &self.resize_status {
             Some(s) => Arc::clone(s),
             None => return,
@@ -307,7 +307,7 @@ impl ResizePopup {
     }
 
     /// Show the resize popup window. Returns false if the popup should close.
-    pub fn show(&mut self, ui: &mut egui::Ui, _devices: &[DiskDevice], log: &mut LogPanel) -> bool {
+    pub fn show(&mut self, ui: &mut egui::Ui, _devices: &[DiskDevice], log: &mut LogStore) -> bool {
         let mut keep_open = self.open;
 
         egui::Window::new("Resize Partitions")
@@ -629,7 +629,7 @@ impl ResizePopup {
     }
 
     /// Start the background resize thread.
-    fn start_resize(&mut self, log: &mut LogPanel) {
+    fn start_resize(&mut self, log: &mut LogStore) {
         // Re-compute the plan to get the actual PartitionResizePlan structs.
         // Parses through the same helper the preview uses — see
         // `parsed_new_size` for why they must not diverge.

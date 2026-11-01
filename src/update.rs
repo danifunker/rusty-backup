@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct UpdateConfig {
     pub update_check: UpdateCheckConfig,
     /// Last-used CHD codec spec (chdman-style, e.g. `"lzma,zlib,huff,flac"`).

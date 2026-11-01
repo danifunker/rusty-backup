@@ -38,9 +38,12 @@ use backup_tab::BackupTab;
 use bulk_convert_dialog::{BulkConvertDialog, DialogAction as BulkConvertAction};
 use inspect_tab::InspectTab;
 use optical_tab::OpticalTab;
-use progress::{LogPanel, ProgressState};
+use progress::ProgressState;
 use restore_tab::RestoreTab;
 use rusty_backup::model::status::{BulkConvertLogLevel, BulkConvertStatus};
+use rusty_backup::vm::app::AppVm;
+use rusty_backup::vm::log::LogStore;
+use rusty_backup::vm::{Effect, ViewModel};
 use settings_dialog::SettingsDialog;
 use std::path::PathBuf;
 
@@ -158,6 +161,26 @@ fn physical_devices_available() -> bool {
     #[cfg(not(windows))]
     {
         true
+    }
+}
+
+/// Carry out view-model effects; no `_` arm, so a new `Effect` fails to compile here until handled.
+pub(crate) fn run_effects(ctx: &egui::Context, effects: Vec<Effect>) {
+    for effect in effects {
+        match effect {
+            Effect::CopyToClipboard(text) => ctx.copy_text(text),
+            Effect::OpenUrl(url) => ctx.open_url(egui::OpenUrl::new_tab(url)),
+            Effect::Message(text) => log::info!("{text}"),
+            Effect::PickFile(spec) | Effect::PickFolder(spec) => {
+                log::error!("no egui handler yet for picker {:?}", spec.purpose)
+            }
+            Effect::Confirm(spec) => {
+                log::error!("no egui handler yet for confirm {:?}", spec.purpose)
+            }
+            Effect::AskPassword(spec) => {
+                log::error!("no egui handler yet for password {:?}", spec.purpose)
+            }
+        }
     }
 }
 
@@ -548,7 +571,8 @@ pub struct RustyBackupApp {
     inspect_tab: InspectTab,
     optical_tab: OpticalTab,
     archives_tab: ArchivesTab,
-    log_panel: LogPanel,
+    /// App-wide view-model: the log, the job registry and recent files.
+    app: AppVm,
     progress: ProgressState,
     devices: Vec<DiskDevice>,
     update_info: Arc<Mutex<Option<UpdateInfo>>>,
@@ -583,7 +607,7 @@ pub struct RustyBackupApp {
 
 impl Default for RustyBackupApp {
     fn default() -> Self {
-        let mut log = LogPanel::default();
+        let mut log = LogStore::default();
         log.info("Rusty Backup started");
 
         let devices = device::enumerate_devices();
@@ -644,7 +668,11 @@ impl Default for RustyBackupApp {
             inspect_tab: InspectTab::default(),
             optical_tab,
             archives_tab: ArchivesTab::default(),
-            log_panel: log,
+            app: {
+                let mut app = AppVm::new(Arc::new(ui_logger::EguiWake));
+                app.log = log;
+                app
+            },
             progress: ProgressState::default(),
             devices,
             update_info,
@@ -691,7 +719,7 @@ impl RustyBackupApp {
     /// path the "Open File..." button uses — keeps DnD / double-click
     /// behavior identical to the picker.
     fn open_in_inspect(&mut self, path: PathBuf) {
-        self.log_panel.info(format!("Opening {}", path.display()));
+        self.app.log.info(format!("Opening {}", path.display()));
         // Inspect: open floppy containers directly (don't pre-decode) so edits
         // persist back into the container. See prepare_disk_image_path.
         match prepare_disk_image_path(&path, false) {
@@ -700,7 +728,7 @@ impl RustyBackupApp {
                     .load_image_with_tempdir(materialized, guard);
             }
             Err(e) => {
-                self.log_panel.warn(format!(
+                self.app.log.warn(format!(
                     "Failed to materialize {}: {} - opening raw bytes",
                     path.display(),
                     e
@@ -780,9 +808,9 @@ impl RustyBackupApp {
         };
         for (level, msg) in status.log_messages.drain(..) {
             match level {
-                BulkConvertLogLevel::Info => self.log_panel.info(msg),
-                BulkConvertLogLevel::Warn => self.log_panel.warn(msg),
-                BulkConvertLogLevel::Error => self.log_panel.error(msg),
+                BulkConvertLogLevel::Info => self.app.log.info(msg),
+                BulkConvertLogLevel::Warn => self.app.log.warn(msg),
+                BulkConvertLogLevel::Error => self.app.log.error(msg),
             }
         }
         if status.finished {
@@ -814,7 +842,7 @@ impl RustyBackupApp {
                                 Arc::new(Mutex::new(update_runner::UpdateRunStatus::default()));
                             update_runner::spawn(info.clone(), Arc::clone(&status));
                             self.update_run = Some(status);
-                            self.log_panel.info("Downloading update...");
+                            self.app.log.info("Downloading update...");
                         }
                         if ui.button("View Release").clicked() {
                             let _ = webbrowser::open(&info.releases_url);
@@ -944,7 +972,7 @@ impl eframe::App for RustyBackupApp {
                     // clobber the loaded source and make drag-to-add impossible.
                     Tab::Inspect => {
                         if self.inspect_tab.is_remote_session() {
-                            self.log_panel.warn(format!(
+                            self.app.log.warn(format!(
                                 "Ignored dropped file {}: a remote session is open; close it first",
                                 path.display()
                             ));
@@ -966,15 +994,9 @@ impl eframe::App for RustyBackupApp {
             }
         }
 
-        // Drain `log` crate records (incl. worker-thread log::info! from the
-        // GHO reader) into the panel so they're visible in the UI.
-        for (level, msg) in ui_logger::drain() {
-            match level {
-                log::Level::Error => self.log_panel.error(msg),
-                log::Level::Warn => self.log_panel.warn(msg),
-                _ => self.log_panel.info(msg),
-            }
-        }
+        // Drains worker-thread `log::info!` records (the GHO reader's scan, say) into the log panel.
+        let effects = self.app.tick();
+        run_effects(ctx, effects);
 
         // Drain bulk-convert worker logs into the panel and clear when done.
         self.poll_bulk_convert();
@@ -1015,7 +1037,7 @@ impl eframe::App for RustyBackupApp {
                             self.loaded_backup_folder = None;
                             self.restore_tab.clear_backup();
                             self.inspect_tab.clear_backup();
-                            self.log_panel.info("Backup closed");
+                            self.app.log.info("Backup closed");
                         }
                         ui.separator();
                     }
@@ -1046,10 +1068,9 @@ impl eframe::App for RustyBackupApp {
                             if resp.clicked() {
                                 #[cfg(windows)]
                                 {
-                                    self.log_panel
-                                        .info("Requesting administrator privileges...");
+                                    self.app.log.info("Requesting administrator privileges...");
                                     if let Err(e) = rusty_backup::os::windows::request_elevation() {
-                                        self.log_panel.error(format!(
+                                        self.app.log.error(format!(
                                             "Elevation request failed or was cancelled: {e}"
                                         ));
                                     }
@@ -1071,7 +1092,7 @@ impl eframe::App for RustyBackupApp {
                         ElevationGate::NotApplicable | ElevationGate::Elevated => {
                             if ui.button("Refresh Devices").clicked() {
                                 self.devices = device::enumerate_devices();
-                                self.log_panel.info(format!(
+                                self.app.log.info(format!(
                                     "Refreshed: {} device(s) found",
                                     self.devices.len()
                                 ));
@@ -1099,8 +1120,7 @@ impl eframe::App for RustyBackupApp {
                                 g.cancel_requested = true;
                             }
                         }
-                        self.log_panel
-                            .warn("Bulk convert cancellation requested...");
+                        self.app.log.warn("Bulk convert cancellation requested...");
                     }
                 });
             });
@@ -1119,7 +1139,7 @@ impl eframe::App for RustyBackupApp {
                         let format = dlg.format;
                         let count = files.len();
                         self.bulk_convert_dialog = None;
-                        self.log_panel.info(format!(
+                        self.app.log.info(format!(
                             "Starting bulk convert: {count} file(s) -> {} ({}, .{extension})",
                             out.display(),
                             format.description(),
@@ -1212,14 +1232,13 @@ impl eframe::App for RustyBackupApp {
             let action = self.elevation_dialog.show(ctx);
             match action {
                 ElevationAction::Elevate => {
-                    self.log_panel
-                        .info("Relaunching with elevated privileges...");
+                    self.app.log.info("Relaunching with elevated privileges...");
                     if let Err(e) = rusty_backup::os::linux::relaunch_with_elevation() {
-                        self.log_panel.error(format!("Failed to elevate: {}", e));
+                        self.app.log.error(format!("Failed to elevate: {}", e));
                     }
                 }
                 ElevationAction::Cancel => {
-                    self.log_panel.warn(
+                    self.app.log.warn(
                         "Elevation cancelled. Physical devices stay unavailable; \
                          image files are unaffected.",
                     );
@@ -1238,13 +1257,13 @@ impl eframe::App for RustyBackupApp {
                 if self.progress.active {
                     ui.separator();
                 }
-                self.log_panel.show(ui);
+                progress::show_log(ui, &mut self.app);
             });
 
         // Poll the tabs that are not showing: a job keeps reporting on the
         // shared progress bar and its completion is not missed after a switch.
         {
-            let mut ctx = context::TabContext::new(&self.devices, &mut self.log_panel);
+            let mut ctx = context::TabContext::new(&self.devices, &mut self.app.log);
             if !matches!(self.active_tab, Tab::Backup) {
                 self.backup_tab
                     .poll_background(&mut ctx, &mut self.progress);
@@ -1256,15 +1275,15 @@ impl eframe::App for RustyBackupApp {
         }
         if !matches!(self.active_tab, Tab::Optical) {
             self.optical_tab
-                .poll_background(&mut self.log_panel, &mut self.progress);
+                .poll_background(&mut self.app.log, &mut self.progress);
         }
 
         // Central panel: active tab content
         egui::CentralPanel::default().show(ctx, |ui| match self.active_tab {
             Tab::Backup => {
                 let busy = self.busy_elsewhere(Tab::Backup);
-                let mut ctx = context::TabContext::new(&self.devices, &mut self.log_panel)
-                    .busy_elsewhere(busy);
+                let mut ctx =
+                    context::TabContext::new(&self.devices, &mut self.app.log).busy_elsewhere(busy);
                 self.backup_tab.show(ui, &mut ctx, &mut self.progress);
             }
             Tab::Restore => {
@@ -1283,8 +1302,8 @@ impl eframe::App for RustyBackupApp {
                 }
 
                 let busy = self.busy_elsewhere(Tab::Restore);
-                let mut ctx = context::TabContext::new(&self.devices, &mut self.log_panel)
-                    .busy_elsewhere(busy);
+                let mut ctx =
+                    context::TabContext::new(&self.devices, &mut self.app.log).busy_elsewhere(busy);
                 self.restore_tab.show(ui, &mut ctx, &mut self.progress);
             }
             Tab::Inspect => {
@@ -1311,16 +1330,16 @@ impl eframe::App for RustyBackupApp {
                     }
                 }
 
-                let mut ctx = context::TabContext::new(&self.devices, &mut self.log_panel);
+                let mut ctx = context::TabContext::new(&self.devices, &mut self.app.log);
                 self.inspect_tab.show(ui, &mut ctx);
             }
             Tab::Optical => {
                 let busy = self.busy_elsewhere(Tab::Optical);
                 self.optical_tab
-                    .show(ui, &mut self.log_panel, &mut self.progress, busy);
+                    .show(ui, &mut self.app.log, &mut self.progress, busy);
             }
             Tab::Archives => {
-                self.archives_tab.show(ui, &mut self.log_panel);
+                self.archives_tab.show(ui, &mut self.app.log);
             }
         });
 

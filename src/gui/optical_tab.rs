@@ -17,7 +17,8 @@ use rusty_backup::update::UpdateConfig;
 
 use super::chd_options_ui::{ChdOptionsControl, ChdOptionsMode};
 
-use super::progress::{LogPanel, ProgressState};
+use super::progress::ProgressState;
+use rusty_backup::vm::log::LogStore;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum SourceMode {
@@ -192,7 +193,7 @@ impl OpticalTab {
 
     /// Poll the background "Add remote daemon" connect; on success add the
     /// daemon and refresh the unified drive list.
-    fn poll_add_remote(&mut self, log: &mut LogPanel) {
+    fn poll_add_remote(&mut self, log: &mut LogStore) {
         let Some(status) = &self.add_remote_status else {
             return;
         };
@@ -332,7 +333,7 @@ impl OpticalTab {
 
     /// Drain the workers while another tab is showing, so a job keeps
     /// reporting and its completion is not missed after a tab switch.
-    pub fn poll_background(&mut self, log: &mut LogPanel, progress: &mut ProgressState) {
+    pub fn poll_background(&mut self, log: &mut LogStore, progress: &mut ProgressState) {
         self.poll_progress(log, progress);
         self.poll_add_remote(log);
     }
@@ -340,7 +341,7 @@ impl OpticalTab {
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
-        log: &mut LogPanel,
+        log: &mut LogStore,
         progress: &mut ProgressState,
         busy_elsewhere: Option<&'static str>,
     ) {
@@ -821,7 +822,7 @@ impl OpticalTab {
         self.audio.clear();
     }
 
-    fn detect_disc_info(&mut self, log: &mut LogPanel) {
+    fn detect_disc_info(&mut self, log: &mut LogStore) {
         self.disc_info = None;
         self.disc_info_error = None;
 
@@ -886,7 +887,7 @@ impl OpticalTab {
         format!("{stem}.{ext}")
     }
 
-    fn start_rip(&mut self, log: &mut LogPanel) {
+    fn start_rip(&mut self, log: &mut LogStore) {
         // Resolve the target up front (owned) so the &mut self calls below don't
         // conflict with a borrow of `rip_devices`.
         let target = match self
@@ -949,7 +950,7 @@ impl OpticalTab {
     }
 
     /// Rip to CHD: rip to temporary BIN/CUE, convert to CHD, clean up temps.
-    fn start_rip_to_chd(&mut self, target: OpticalTarget, chd_path: PathBuf, log: &mut LogPanel) {
+    fn start_rip_to_chd(&mut self, target: OpticalTarget, chd_path: PathBuf, log: &mut LogStore) {
         let eject_after = self.eject_after;
         if self.chd_cd_control.mode == ChdOptionsMode::Custom {
             self.persist_chd_options(&self.chd_cd_control.custom);
@@ -981,7 +982,7 @@ impl OpticalTab {
         });
     }
 
-    fn start_convert(&mut self, log: &mut LogPanel) {
+    fn start_convert(&mut self, log: &mut LogStore) {
         let input_path = match &self.image_file_path {
             Some(p) => p.clone(),
             None => {
@@ -1042,7 +1043,7 @@ impl OpticalTab {
         });
     }
 
-    fn poll_progress(&mut self, log: &mut LogPanel, progress_state: &mut ProgressState) {
+    fn poll_progress(&mut self, log: &mut LogStore, progress_state: &mut ProgressState) {
         // Poll rip progress
         if let Some(progress_arc) = self.rip_progress.clone() {
             let mut finished = false;

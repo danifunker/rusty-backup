@@ -21,7 +21,7 @@ use rusty_backup::model::status::ExpandStatus;
 /// HFV's 2047 MB ceiling expressed in whole MiB, for slider clamping.
 const HFV_MAX_MIB: u32 = (HFV_MAX_BYTES / (1024 * 1024)) as u32;
 
-use super::progress::LogPanel;
+use rusty_backup::vm::log::LogStore;
 
 pub use rusty_backup::model::hfs_expand_runner::summarize_source;
 
@@ -70,7 +70,7 @@ impl ExpandHfsDialog {
     }
 
     /// Render the dialog. Returns `false` once the user closes it for good.
-    pub fn show(&mut self, ctx: &egui::Context, log: &mut LogPanel) -> bool {
+    pub fn show(&mut self, ctx: &egui::Context, log: &mut LogStore) -> bool {
         if !self.open {
             return false;
         }
@@ -292,7 +292,7 @@ impl ExpandHfsDialog {
         self.open
     }
 
-    fn spawn_worker(&mut self, output: PathBuf, log: &mut LogPanel) {
+    fn spawn_worker(&mut self, output: PathBuf, log: &mut LogStore) {
         let source = self.source.clone();
         let target_size = self.target_size_mib as u64 * 1024 * 1024;
         let target_bs = self.target_block_size;

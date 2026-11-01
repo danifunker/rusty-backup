@@ -13,18 +13,18 @@
 
 use rusty_backup::device::DiskDevice;
 
-use super::progress::LogPanel;
+use rusty_backup::vm::log::LogStore;
 
 /// Bundle of references the App threads through every tab call.
 pub struct TabContext<'a> {
     pub devices: &'a [DiskDevice],
-    pub log: &'a mut LogPanel,
+    pub log: &'a mut LogStore,
     /// Name of another tab with a disk job in flight; start controls lock on it.
     pub busy_elsewhere: Option<&'static str>,
 }
 
 impl<'a> TabContext<'a> {
-    pub fn new(devices: &'a [DiskDevice], log: &'a mut LogPanel) -> Self {
+    pub fn new(devices: &'a [DiskDevice], log: &'a mut LogStore) -> Self {
         Self {
             devices,
             log,
