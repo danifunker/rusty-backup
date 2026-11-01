@@ -165,6 +165,20 @@ All OS-specific code lives in `src/os/`:
 - **Comments in `.rs` files are one line — two at the absolute most, never three or more.** This covers inline `//` and doc `///` alike. If the explanation needs more room it is documentation, not a comment: put it in the module's `//!` header, `src/fs/README.md`, `src/rbformats/README.md`, or a `docs/` page and point at it from the one-line comment. Say *why*, not what. Existing multi-line blocks are grandfathered — don't retrofit files you aren't otherwise touching, but never add new ones. See CONTRIBUTING.md § "Comments".
 - **No Unicode glyphs in UI text or log messages.** The default egui font does not include emoji or symbol glyphs (e.g. `✓ ✗ ⚠ ← → • ✖ ℹ`), so they render as blank boxes on the user's screen. Use plain ASCII alternatives instead — `OK`, `Skipped`, `Warning`, `Back`, `->`, `-`, `X`, `Info:` — for log lines, button labels, dialog text, and any other user-visible string. The only exception is content read directly from a filesystem (e.g. symlink target arrows in the optical browse view), which we render verbatim.
 
+### Feature fan-out (mandatory)
+
+Every feature reaches every front-end and build target by default. Before writing a user-facing feature:
+
+1. **Put the logic in the engine, `src/model/` or a `src/vm/` view-model, never in a shell** (`src/gui/`, the TUI, future `frontends/`). Slow work runs as a `model::job::Job`, so every shell gets the same wait state, cancel and panic guard.
+2. **Read [docs/platform_matrix.md](docs/platform_matrix.md)** and decide, per row, whether the feature works there.
+3. **Handle every new `Action` / `Effect` in every shell.** Shells match them with no `_` arm, so the compiler lists the ones you missed.
+4. **Check each target's constraints:** the Rust 1.73 floor for engine, model and vm code; mrustc gaps (no proc-macros, no inline asm) for Solaris 9 and PowerPC; slim builds without `chd`, `optical` or `crypto`.
+5. **Where it can't work, say so** in the matrix row's Limits column, with the reason.
+6. **Add a view-model scenario** under `tests/ui_scenarios/` (see `src/vm/scenario.rs`).
+7. **Extend the CLI** if the feature is scriptable (the parity rule above).
+
+`scripts/check-boundaries.sh` reports shell code that reaches past the view-models; `scripts/check-platform-matrix.py` keeps the matrix in step with CI's targets. Both run in CI.
+
 ### Pre-commit documentation sync
 
 **Before staging a commit for any user-facing change, run a quick parity pass over three surfaces and update them in the same commit if they drifted.** These have all gone stale in real-world commits — adding a filesystem driver but forgetting the README table, shipping a new container format but leaving the picker filter behind, adding a CP/M DPB but never updating the per-core matrix. The sync is cheap (usually one extra section in the diff); diagnosing the drift from a user-reported issue is expensive.
@@ -192,5 +206,7 @@ The quick checklist when finishing a feature:
 - [ ] If yes — README Image-formats / Filesystems / MiSTer-cores table updated?
 - [ ] If yes — `docs/full_MiSTer_support_status.md` intro + per-core matrix walked?
 - [ ] If a new picker-visible file extension — `DISK_IMAGE_EXTS` updated + regression test extended?
+- [ ] Feature fan-out walked: every shell handles the new actions, and `docs/platform_matrix.md` notes any target it can't reach?
+- [ ] A new build target or CI job — row added to `docs/platform_matrix.md`?
 
 If the answer to all four is "no, nothing user-visible changed," commit as normal. Otherwise the doc / picker updates land in the same commit as the code change so reviewers see the intent.
