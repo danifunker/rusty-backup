@@ -1,0 +1,103 @@
+name: CI
+
+# Build-integrity pipeline. Runs on every branch push and pull request, and is
+# reusable (workflow_call) so the release pipeline can gate on the exact same
+# checks before tagging/publishing.
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_call:
+
+env:
+  # Every JavaScript action runs on Node 24 (Node 20 is deprecated on the runners).
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Set default toolchain
+        run: rustup default stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust-0.1
+      - name: Build
+        run: cargo build
+      - name: Test
+        run: cargo test
+      - name: Test the disk-core adapter
+        run: cargo test --features disk-core
+
+  # The declared rust-version. RustyBackup's vintage build (macOS 10.7 /
+  # Windows 7) pins Rust 1.73 and compiles this crate, so it must stay there.
+  msrv:
+    name: MSRV (Rust 1.73)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.73
+      - name: Build
+        run: cargo build
+      - name: Test
+        run: cargo test
+
+  # icon-emu runs this crate in the browser; wasm32-unknown-unknown has no
+  # clock, so keep it building there.
+  wasm:
+    name: WebAssembly build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Set default toolchain
+        run: rustup default stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust-0.1
+      - name: Build
+        run: cargo build --target wasm32-unknown-unknown
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Set default toolchain
+        run: rustup default stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust-0.1
+      - name: Format check
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Clippy (disk-core adapter)
+        run: cargo clippy --all-targets --features disk-core -- -D warnings
+
+  docs:
+    name: Docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Set default toolchain
+        run: rustup default stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust-0.1
+      - name: Check docs
+        run: cargo doc --no-deps
