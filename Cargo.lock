@@ -1887,7 +1887,7 @@ dependencies = [
 
 [[package]]
 name = "dsk-tape"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arc-mac",
  "disk-core",
@@ -2563,7 +2563,7 @@ dependencies = [
 
 [[package]]
 name = "fs-tar"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "bzip2 0.6.1",
@@ -2577,12 +2577,12 @@ dependencies = [
  "tar",
  "tempfile",
  "zip",
- "zstd 0.14.3",
+ "zstd 0.13.3",
 ]
 
 [[package]]
 name = "fs-unix"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -2591,7 +2591,7 @@ dependencies = [
  "fs-mac",
  "log",
  "tempfile",
- "zstd 0.14.3",
+ "zstd 0.13.3",
 ]
 
 [[package]]

@@ -1,6 +1,6 @@
 [package]
 name = "fs-tar"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.73"
 license = "MIT"
@@ -48,4 +48,4 @@ zip = { version = ">=2.4.2, <10", default-features = false, features = ["deflate
 # The tests round-trip through real FAT, ext, UFS and HFS volumes.
 fs-mac = { path = "../fs-mac", version = "0.1", default-features = false, features = ["hfs", "forks"] }
 fs-pc = { path = "../fs-pc", version = "0.1", default-features = false, features = ["fat"] }
-fs-unix = { path = "../fs-unix", version = "0.1", default-features = false, features = ["ext", "ufs"] }
+fs-unix = { path = "../fs-unix", version = "0.2", default-features = false, features = ["ext", "ufs"] }
