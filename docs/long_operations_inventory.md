@@ -30,7 +30,8 @@ Line numbers are a snapshot. Re-check them before editing.
 | 2. Browse apply staged edits | **Apply done** (2bb6fad1): `commander_ops::apply_queue`. Tar import and export selection still open. |
 | 3. CHD edit mode | **Done** (this commit): `model::chd_edit_open` backs up and opens the session as a `Job`. |
 | 6. Archive sniff during render | **Done** (this commit): a `Job` that borrows the cached filesystem; a failed open is cached instead of retried every frame. |
-| 7, 8, 9 | Open. |
+| 8. Partition apply / Make Bootable | **Done** (this commit): `partition_editor::apply_to_source` and the Make Bootable assess / write steps run as jobs; the donor picker stays on the UI thread between them. |
+| 7, 9 | Open. |
 
 `gui::progress::show_job` draws any running job (spinner or bar, phase, Cancel).
 

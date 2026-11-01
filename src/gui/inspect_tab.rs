@@ -22,7 +22,6 @@ use rusty_backup::model::export_runner::{
 };
 use rusty_backup::model::partition_editor::PartitionEditor;
 use rusty_backup::model::status::{BlockCacheScan, CacheStatus, InspectStatus};
-use rusty_backup::partition::editor as pt_editor;
 use rusty_backup::partition::{
     self, detect_alignment, PartitionAlignment, PartitionInfo, PartitionTable,
 };
@@ -244,6 +243,10 @@ pub struct InspectTab {
     repair_report: Option<rusty_backup::fs::RepairReport>,
     /// A running check, or repair plus re-check (`model::fsck_runner`).
     fsck_job: Option<rusty_backup::model::job::Job<rusty_backup::model::fsck_runner::FsckRun>>,
+    /// A running partition-table write: the engine's messages and its result.
+    table_apply_job: Option<rusty_backup::model::job::Job<TableApply>>,
+    /// A running Make Bootable step (assess, then write).
+    bootable_job: Option<rusty_backup::model::job::Job<BootStep>>,
     /// Context for pending repair: (offset, ptype, type_string).
     repair_context: Option<(u64, u8, Option<String>)>,
     /// "Expand HFS Volume…" dialog (classic HFS only).
@@ -340,6 +343,8 @@ impl Default for InspectTab {
             show_repair_confirm: false,
             repair_report: None,
             fsck_job: None,
+            table_apply_job: None,
+            bootable_job: None,
             repair_context: None,
             expand_hfs_dialog: None,
             alto_resize_dialog: None,
@@ -516,6 +521,7 @@ impl InspectTab {
         self.poll_block_cache_scan(ctx);
         self.poll_cache_status(ctx);
         self.poll_fsck_job(ctx);
+        self.poll_table_apply_job(ctx);
     }
 
     /// The running Inspect job other tabs must wait for (export, expand, repack, resize, ...), if any.
@@ -842,6 +848,9 @@ impl InspectTab {
         self.poll_swab_status(ctx);
         self.poll_fsck_job(ctx);
         self.render_fsck_job(ui);
+        self.poll_table_apply_job(ctx);
+        self.poll_bootable_job(ctx);
+        self.render_disk_write_jobs(ui);
 
         // Background workers (min-size + volume-label probes) finish off the
         // GUI thread; without an explicit repaint request egui only paints
@@ -1449,71 +1458,108 @@ impl InspectTab {
     /// missing pieces (driver + DDR on a full APM disk, boot blocks, blessed
     /// System Folder). Prompts for a donor disk only when boot blocks are
     /// absent. Runs synchronously — each step is a small metadata/sector write.
-    fn run_make_bootable(&mut self, ctx: &mut TabContext) {
-        use rusty_backup::fs::make_bootable::{
-            assess_bootability, make_bootable, BootDiskKind, DriverSource, MakeBootableOptions,
-        };
-
+    /// Make Bootable, step 1: assess the image off the UI thread.
+    fn run_make_bootable(&mut self, _ctx: &mut TabContext) {
         let Some(path) = self.image_file_path.clone() else {
             return;
         };
-
-        let assessment = match assess_bootability(&path) {
-            Ok(a) => a,
-            Err(e) => {
-                ctx.log.error(format!("Make Bootable: {e}"));
-                return;
-            }
-        };
-        let kind = match assessment.kind {
-            BootDiskKind::FlatHfs => "flat HFS image (kept flat)",
-            BootDiskKind::ApmHfs => "full APM disk",
-        };
-        ctx.log.info(format!(
-            "Make Bootable: detected {kind} - boot blocks {}, System Folder {}",
-            if assessment.has_boot_blocks {
-                "present"
-            } else {
-                "absent"
-            },
-            match &assessment.blessed_folder {
-                Some(n) => format!("blessed ({n})"),
-                None => "not blessed".to_string(),
-            }
-        ));
-
-        if assessment.is_bootable() {
-            ctx.log
-                .info("Make Bootable: disk is already bootable; nothing to do.");
+        if self.bootable_job.is_some() {
             return;
         }
+        self.bootable_job = Some(rusty_backup::model::job::Job::spawn(
+            "Checking what the disk needs to boot...",
+            Arc::new(super::ui_logger::EguiWake),
+            move |job| {
+                job.set_can_cancel(false);
+                let assessed = rusty_backup::fs::make_bootable::assess_bootability(&path)
+                    .map_err(|e| e.to_string());
+                Ok(BootStep::Assessed(path, assessed))
+            },
+        ));
+    }
 
-        // Boot blocks can't be synthesized — ask for a donor disk if missing.
-        // Cancelling the picker aborts without writing anything.
-        let mut donor = None;
-        if !assessment.has_boot_blocks {
-            match rfd::FileDialog::new()
-                .set_title("Boot blocks needed - pick a bootable donor disk")
-                .add_filter("Disk images", &["dsk", "hfv", "img", "hda", "raw"])
-                .pick_file()
-            {
-                Some(p) => donor = Some(p),
-                None => {
+    /// Make Bootable, steps 2-3: report the assessment, ask for a donor if needed, then write.
+    fn poll_bootable_job(&mut self, ctx: &mut TabContext) {
+        use rusty_backup::fs::make_bootable::{
+            make_bootable, BootDiskKind, DriverSource, MakeBootableOptions,
+        };
+        use rusty_backup::model::job::Status;
+        let Some(job) = &self.bootable_job else {
+            return;
+        };
+        let snap = job.snapshot();
+        if snap.is_running() {
+            return;
+        }
+        let step = job.take_result();
+        self.bootable_job = None;
+        let step = match (snap.status, step) {
+            (Status::Done, Some(step)) => step,
+            (Status::Failed(e), _) => {
+                ctx.log.error(format!("Make Bootable failed: {e}"));
+                return;
+            }
+            _ => return,
+        };
+        match step {
+            BootStep::Assessed(_, Err(e)) => ctx.log.error(format!("Make Bootable: {e}")),
+            BootStep::Assessed(path, Ok(assessment)) => {
+                let kind = match assessment.kind {
+                    BootDiskKind::FlatHfs => "flat HFS image (kept flat)",
+                    BootDiskKind::ApmHfs => "full APM disk",
+                };
+                ctx.log.info(format!(
+                    "Make Bootable: detected {kind} - boot blocks {}, System Folder {}",
+                    if assessment.has_boot_blocks {
+                        "present"
+                    } else {
+                        "absent"
+                    },
+                    match &assessment.blessed_folder {
+                        Some(n) => format!("blessed ({n})"),
+                        None => "not blessed".to_string(),
+                    }
+                ));
+                if assessment.is_bootable() {
                     ctx.log
-                        .info("Make Bootable: cancelled (boot blocks need a donor disk).");
+                        .info("Make Bootable: disk is already bootable; nothing to do.");
                     return;
                 }
+                // Boot blocks can't be synthesized; cancelling the donor picker writes nothing.
+                let mut donor = None;
+                if !assessment.has_boot_blocks {
+                    match rfd::FileDialog::new()
+                        .set_title("Boot blocks needed - pick a bootable donor disk")
+                        .add_filter("Disk images", &["dsk", "hfv", "img", "hda", "raw"])
+                        .pick_file()
+                    {
+                        Some(p) => donor = Some(p),
+                        None => {
+                            ctx.log
+                                .info("Make Bootable: cancelled (boot blocks need a donor disk).");
+                            return;
+                        }
+                    }
+                }
+                let opts = MakeBootableOptions {
+                    donor,
+                    driver: DriverSource::Builtin,
+                    bless_path: None,
+                    dry_run: false,
+                };
+                self.bootable_job = Some(rusty_backup::model::job::Job::spawn(
+                    "Making the disk bootable...",
+                    Arc::new(super::ui_logger::EguiWake),
+                    move |job| {
+                        job.set_can_cancel(false);
+                        Ok(BootStep::Written(
+                            make_bootable(&path, &opts).map_err(|e| e.to_string()),
+                        ))
+                    },
+                ));
             }
-        }
-
-        let opts = MakeBootableOptions {
-            donor,
-            driver: DriverSource::Builtin,
-            bless_path: None,
-            dry_run: false,
-        };
-        match make_bootable(&path, &opts) {
-            Ok(report) => {
+            BootStep::Written(Err(e)) => ctx.log.error(format!("Make Bootable failed: {e}")),
+            BootStep::Written(Ok(report)) => {
                 for s in &report.applied {
                     ctx.log.info(format!("Make Bootable: {s}"));
                 }
@@ -1532,7 +1578,22 @@ impl InspectTab {
                 // Force re-detection so the partition list / statuses refresh.
                 self.prev_image_path = None;
             }
-            Err(e) => ctx.log.error(format!("Make Bootable failed: {e}")),
+        }
+    }
+
+    /// Small windows for a running partition-table write or Make Bootable step.
+    fn render_disk_write_jobs(&self, ui: &mut egui::Ui) {
+        let snaps = [
+            self.table_apply_job.as_ref().map(|j| j.snapshot()),
+            self.bootable_job.as_ref().map(|j| j.snapshot()),
+        ];
+        for snap in snaps.into_iter().flatten() {
+            egui::Window::new(snap.label.clone())
+                .collapsible(false)
+                .resizable(false)
+                .show(ui.ctx(), |ui| {
+                    super::progress::show_job(ui, &snap);
+                });
         }
     }
 
@@ -1661,35 +1722,43 @@ impl InspectTab {
             edits.len(),
             path.display()
         ));
+        if self.table_apply_job.is_some() {
+            return;
+        }
+        self.table_apply_job = Some(rusty_backup::model::job::Job::spawn(
+            "Writing the partition table...",
+            Arc::new(super::ui_logger::EguiWake),
+            move |job| {
+                job.set_can_cancel(false);
+                Ok(rusty_backup::model::partition_editor::apply_to_source(
+                    &path, is_device, &table, &edits, disk_size,
+                ))
+            },
+        ));
+    }
 
-        let result = if is_device {
-            use rusty_backup::os::open_target_for_writing;
-            match open_target_for_writing(&path) {
-                Ok(mut handle) => pt_editor::apply_edits(
-                    &mut handle.file,
-                    &table,
-                    &edits,
-                    disk_size,
-                    &mut |msg| ctx.log.info(msg),
-                ),
-                Err(e) => Err(e),
-            }
-        } else {
-            // Image file — open for read+write
-            match std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&path)
-            {
-                Ok(mut file) => {
-                    pt_editor::apply_edits(&mut file, &table, &edits, disk_size, &mut |msg| {
-                        ctx.log.info(msg)
-                    })
-                }
-                Err(e) => Err(e.into()),
-            }
+    /// Log a finished partition-table write and refresh.
+    fn poll_table_apply_job(&mut self, ctx: &mut TabContext) {
+        use rusty_backup::model::job::Status;
+        let Some(job) = &self.table_apply_job else {
+            return;
         };
-
+        let snap = job.snapshot();
+        if snap.is_running() {
+            return;
+        }
+        let out = job.take_result();
+        self.table_apply_job = None;
+        let result = match (snap.status, out) {
+            (Status::Done, Some((messages, result))) => {
+                for msg in messages {
+                    ctx.log.info(msg);
+                }
+                result
+            }
+            (Status::Failed(e), _) => Err(e),
+            _ => return,
+        };
         match result {
             Ok(()) => {
                 ctx.log.info("Partition table updated successfully.");
@@ -1704,8 +1773,8 @@ impl InspectTab {
                 self.prev_device_idx = None;
             }
             Err(e) => {
-                ctx.log.error(format!("Failed to apply edits: {:#}", e));
-                self.editor.status = Some(format!("Error: {:#}", e));
+                ctx.log.error(format!("Failed to apply edits: {e}"));
+                self.editor.status = Some(format!("Error: {e}"));
             }
         }
     }
@@ -5970,6 +6039,18 @@ fn show_export_disk_layout_bars(
         .show(ui);
     });
 }
+
+/// A Make Bootable step's result: the assessment (with the image it was for), or the write's report.
+enum BootStep {
+    Assessed(
+        PathBuf,
+        Result<rusty_backup::fs::make_bootable::Assessment, String>,
+    ),
+    Written(Result<rusty_backup::fs::make_bootable::MakeBootableReport, String>),
+}
+
+/// A partition-table write's result: the engine's messages, and its error text.
+type TableApply = (Vec<String>, Result<(), String>);
 
 #[cfg(test)]
 mod tests {
