@@ -43,6 +43,8 @@ emulators come from its `[emulators]` table (see `local.toml.example`):
 | `icon_cli` | `icon-cli` built from github.com/danifunker/icon-emu (`cargo build --release -p icon-cli`). |
 | `icon_rom` | `icon1_rom_combined.bin`, the ICON 1 firmware. |
 | `hpux_boot` | A bootable HP-UX 11.11 HP 715 disk (from the `part.hpux-lvm.hpux1111-hp715` fixture, `/etc/ioconfig` rebuilt); root without a password. Needs `qemu-system-hppa`. |
+| `win7` | A qcow2 overlay on a Windows 7 image that logs straight in to the desktop. Run `oracles/win7/win7vm.py settle <overlay>` once: it boots the overlay with the scenarios' hardware (AHCI, fixed disk serials, no NIC), restarts after the driver installs and shuts down, so later runs (always `-snapshot`) never meet a restart prompt. Never boot the base image itself without `-snapshot`, or the overlay breaks. |
+| `copperline`, `kickstart_a1200` | For the `verify` AFFS oracle (`oracles/copperline/affs_mount.py`): Copperline built from github.com/CopperlineHQ/Copperline, and an A1200 Kickstart 3.1 or 3.2. Its 3.x `Mount` comes from `oracle-assets/amiga/Mount-3x` beside the fixture root (3.2's is `C/Mount` on `fs.sfs.workbench-dh0.hd`). |
 
 Every guest runs with `-snapshot`, so neither the VM nor the work copy of the
 fixture is changed by the check.

@@ -425,7 +425,7 @@ licensed ROM to run it. `program` is python3 on the amitools pattern: the
 interpreter is what must exist, and the script finds the emulator (sibling
 checkout, or $COPPERLINE)."""
 verifies = [
-  { format = "fs.affs", direction = "write", strength = "authoritative", status = "proven", evidence = "2026-08-18: Kickstart 3.1 on an A1200 profile mounts our volume Read/Write under its own name as DH1:, reported over Paula serial to Copperline stdout. Controlled against 2 MB of urandom, which the same guest reports as 'Not a DOS disk' (exit 1).", check = ["{oracles}/copperline/affs_mount.py", "{artifact}"] },
+  { format = "fs.affs", direction = "write", strength = "authoritative", status = "proven", evidence = "2026-08-18: Kickstart 3.1 on an A1200 profile mounts our volume Read/Write under its own name as DH1:, reported over Paula serial to Copperline stdout. Controlled against 2 MB of urandom, which the same guest reports as 'Not a DOS disk' (exit 1). 2026-11-01, m900: the same with Kickstart 3.2 (exec 47.7) and 3.2's Mount 47.2, Copperline 2c2fed48; a volume rb-cli made and wrote mounts, urandom does not.", check = ["{oracles}/copperline/affs_mount.py", "{artifact}"] },
 ]
 
 [[oracle]]

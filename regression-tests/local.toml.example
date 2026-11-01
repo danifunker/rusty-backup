@@ -181,3 +181,6 @@ notes = "The FPGA cores. Reached via the HPS. Authoritative for Amiga, X68000 an
 # icon_cli  = "/path/to/icon-emu/target/release/icon-cli"
 # icon_rom  = "/path/to/icon1_rom_combined.bin"
 # hpux_boot = "/path/to/hp715.img"
+# win7      = "/path/to/win7.qcow2"                # overlay on the Win7 image; run oracles/win7/win7vm.py settle once
+# copperline = "/path/to/copperline"               # github.com/CopperlineHQ/Copperline, cargo build --release
+# kickstart_a1200 = "/path/to/kicka1200.rom"       # A1200 Kickstart 3.1 or 3.2, decrypted

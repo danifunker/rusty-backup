@@ -71,6 +71,17 @@ def emulator_path(key):
     return path
 
 
+def die_with_parent():
+    """Linux: SIGTERM the emulator when the oracle dies, so a killed run leaves no VM behind."""
+    try:
+        import ctypes
+        import signal
+
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGTERM)  # PR_SET_PDEATHSIG
+    except (OSError, AttributeError):
+        pass
+
+
 def require_program(name):
     path = shutil.which(name)
     if not path:
@@ -95,7 +106,9 @@ class SerialVM:
             "-display", "none",
             "-monitor", f"unix:{self.mon_path},server,nowait" if monitor else "none",
         ]
-        self.proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        self.proc = subprocess.Popen(
+            argv, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, preexec_fn=die_with_parent
+        )
         self.sock = socket.socket(socket.AF_UNIX)
         # QEMU creates the socket only once it is up, which can take a while on a busy host.
         for _ in range(300):
