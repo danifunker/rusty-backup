@@ -4763,12 +4763,10 @@ impl App {
         let Some(ed) = ex.editor.as_ref() else {
             return;
         };
-        let (image_path, selector, part_label, cur_dir, comps) = (
+        let (image_path, selector, cur_dir) = (
             ex.image_path.clone(),
             ex.selector.clone(),
-            ex.part_label.clone(),
             ex.path_display(),
-            ex.dir_components(),
         );
         let (name, text, shape) = (ed.name.clone(), ed.text(), ed.shape);
 
@@ -4791,25 +4789,18 @@ impl App {
             }
         };
 
-        match write_file_bytes(&image_path, selector.clone(), &cur_dir, &name, &bytes) {
-            Ok(()) => {
-                if let Some(ex) = self.explorer.as_mut() {
-                    ex.editor = None;
-                }
-                self.reopen_explorer(
-                    &image_path,
-                    selector,
-                    part_label,
-                    &comps,
-                    Some(format!("Saved {name} ({} bytes)", bytes.len())),
-                );
-            }
-            Err(e) => {
-                if let Some(ed) = self.explorer.as_mut().and_then(|e| e.editor.as_mut()) {
+        self.explorer_write_task(
+            "Saving the file",
+            move || {
+                write_file_bytes(&image_path, selector, &cur_dir, &name, &bytes)?;
+                Ok(format!("Saved {name} ({} bytes)", bytes.len()))
+            },
+            |ex, e| {
+                if let Some(ed) = ex.editor.as_mut() {
                     ed.status = Some(format!("Save failed: {e:#}"));
                 }
-            }
-        }
+            },
+        );
     }
 
     /// Import a host file (already validated by the picker) into the current
@@ -4883,12 +4874,10 @@ impl App {
         let Some(m) = ex.metadata.as_ref() else {
             return;
         };
-        let (image_path, selector, part_label, cur_dir, comps) = (
+        let (image_path, selector, cur_dir) = (
             ex.image_path.clone(),
             ex.selector.clone(),
-            ex.part_label.clone(),
             ex.path_display(),
-            ex.dir_components(),
         );
         let (name, ty, cr, modstr, crestr) = (
             m.entry_name.clone(),
@@ -4964,25 +4953,18 @@ impl App {
             mode: new_mode,
             owner: new_owner,
         };
-        match apply_metadata_edit(&image_path, selector.clone(), &cur_dir, &name, &values) {
-            Ok(()) => {
-                if let Some(ex) = self.explorer.as_mut() {
-                    ex.metadata = None;
-                }
-                self.reopen_explorer(
-                    &image_path,
-                    selector,
-                    part_label,
-                    &comps,
-                    Some(format!("Updated {name}")),
-                );
-            }
-            Err(e) => {
-                if let Some(m) = self.explorer.as_mut().and_then(|e| e.metadata.as_mut()) {
+        self.explorer_write_task(
+            "Updating the file's metadata",
+            move || {
+                apply_metadata_edit(&image_path, selector, &cur_dir, &name, &values)?;
+                Ok(format!("Updated {name}"))
+            },
+            |ex, e| {
+                if let Some(m) = ex.metadata.as_mut() {
                     m.error = Some(format!("{e}"));
                 }
-            }
-        }
+            },
+        );
     }
 
     /// Close the transform menu and prefill the `:` command palette with the
@@ -5101,27 +5083,18 @@ impl App {
         let Some((dir_path, name)) = ex.confirm_bless.clone() else {
             return;
         };
-        let (image_path, selector, part_label, comps) = (
-            ex.image_path.clone(),
-            ex.selector.clone(),
-            ex.part_label.clone(),
-            ex.dir_components(),
+        let (image_path, selector) = (ex.image_path.clone(), ex.selector.clone());
+        self.explorer_write_task(
+            "Blessing the folder",
+            move || {
+                apply_bless_folder(&image_path, selector, &dir_path)?;
+                Ok(format!("Blessed {name}"))
+            },
+            |ex, e| {
+                ex.confirm_bless = None;
+                ex.status = Some(format!("Bless failed: {e}"));
+            },
         );
-        match apply_bless_folder(&image_path, selector.clone(), &dir_path) {
-            Ok(()) => self.reopen_explorer(
-                &image_path,
-                selector,
-                part_label,
-                &comps,
-                Some(format!("Blessed {name}")),
-            ),
-            Err(e) => {
-                if let Some(ex) = self.explorer.as_mut() {
-                    ex.confirm_bless = None;
-                    ex.status = Some(format!("Bless failed: {e}"));
-                }
-            }
-        }
     }
 
     /// Create the typed folder in the Explorer's current directory, then refresh.
@@ -5135,12 +5108,10 @@ impl App {
             .unwrap_or_default()
             .trim()
             .to_string();
-        let (image_path, selector, part_label, cur_dir, comps) = (
+        let (image_path, selector, cur_dir) = (
             ex.image_path.clone(),
             ex.selector.clone(),
-            ex.part_label.clone(),
             ex.path_display(),
-            ex.dir_components(),
         );
         if name.is_empty() {
             if let Some(ex) = self.explorer.as_mut() {
@@ -5149,26 +5120,17 @@ impl App {
             }
             return;
         }
-        match apply_mkdir(&image_path, selector.clone(), &cur_dir, &name) {
-            Ok(()) => {
-                if let Some(ex) = self.explorer.as_mut() {
-                    ex.mkdir_input = None;
-                }
-                self.reopen_explorer(
-                    &image_path,
-                    selector,
-                    part_label,
-                    &comps,
-                    Some(format!("Created folder {name}")),
-                );
-            }
-            Err(e) => {
-                if let Some(ex) = self.explorer.as_mut() {
-                    ex.mkdir_input = None;
-                    ex.status = Some(format!("{e:#}"));
-                }
-            }
-        }
+        self.explorer_write_task(
+            "Creating the folder",
+            move || {
+                apply_mkdir(&image_path, selector, &cur_dir, &name)?;
+                Ok(format!("Created folder {name}"))
+            },
+            |ex, e| {
+                ex.mkdir_input = None;
+                ex.status = Some(format!("{e:#}"));
+            },
+        );
     }
 
     /// Delete the confirmed entry from the Explorer's current directory, refresh.
@@ -5179,33 +5141,66 @@ impl App {
         let Some((name, _)) = ex.confirm_delete.clone() else {
             return;
         };
-        let (image_path, selector, part_label, cur_dir, comps) = (
+        let (image_path, selector, cur_dir) = (
+            ex.image_path.clone(),
+            ex.selector.clone(),
+            ex.path_display(),
+        );
+        self.explorer_write_task(
+            "Deleting",
+            move || {
+                apply_delete(&image_path, selector, &cur_dir, &name)?;
+                Ok(format!("Deleted {name}"))
+            },
+            |ex, e| {
+                ex.confirm_delete = None;
+                ex.status = Some(format!("{e:#}"));
+            },
+        );
+    }
+
+    /// Run an Explorer write as a task, then rebuild the Explorer where it was. `write` returns the
+    /// status line on success; `fail` puts its error where the user is looking (a dialog or the footer).
+    fn explorer_write_task(
+        &mut self,
+        label: &'static str,
+        write: impl FnOnce() -> anyhow::Result<String> + Send + 'static,
+        fail: impl FnOnce(&mut Explorer, anyhow::Error) + Send + 'static,
+    ) {
+        let Some(ex) = self.explorer.as_ref() else {
+            return;
+        };
+        let (image_path, selector, part_label, comps) = (
             ex.image_path.clone(),
             ex.selector.clone(),
             ex.part_label.clone(),
-            ex.path_display(),
             ex.dir_components(),
         );
-        match apply_delete(&image_path, selector.clone(), &cur_dir, &name) {
-            Ok(()) => {
-                if let Some(ex) = self.explorer.as_mut() {
-                    ex.confirm_delete = None;
+        self.start_task(label, move |job| {
+            job.set_can_cancel(false);
+            let done: TaskDone = match write() {
+                Ok(status) => {
+                    job.set_phase("Refreshing the view");
+                    let rebuilt =
+                        rebuild_explorer(&image_path, selector, part_label, &comps, status);
+                    Box::new(move |app: &mut App| match rebuilt {
+                        Ok(ex) => app.explorer = Some(ex),
+                        Err(msg) => {
+                            if let Some(ex) = app.explorer.as_mut() {
+                                ex.close_prompts();
+                            }
+                            app.status = Some(msg);
+                        }
+                    })
                 }
-                self.reopen_explorer(
-                    &image_path,
-                    selector,
-                    part_label,
-                    &comps,
-                    Some(format!("Deleted {name}")),
-                );
-            }
-            Err(e) => {
-                if let Some(ex) = self.explorer.as_mut() {
-                    ex.confirm_delete = None;
-                    ex.status = Some(format!("{e:#}"));
-                }
-            }
-        }
+                Err(e) => Box::new(move |app: &mut App| {
+                    if let Some(ex) = app.explorer.as_mut() {
+                        fail(ex, e);
+                    }
+                }),
+            };
+            Ok(done)
+        });
     }
 
     /// Rebuild the Explorer read-only and descend through `comps` (dir names),
@@ -5220,20 +5215,7 @@ impl App {
     ) {
         self.open_explorer(image_path, selector, part_label);
         if let Some(ex) = self.explorer.as_mut() {
-            // Walk the saved path, expanding and selecting each component in the
-            // freshly-built tree so the view returns to where it was.
-            for comp in comps {
-                ex.tree_expand();
-                let child = ex
-                    .tree
-                    .iter()
-                    .position(|n| n.depth == ex.tree[ex.tree_sel].depth + 1 && n.dir.name == *comp);
-                match child {
-                    Some(idx) => ex.tree_sel = idx,
-                    None => break,
-                }
-            }
-            ex.reload_list();
+            ex.walk_to(comps);
             ex.status = status;
         }
     }
@@ -11316,6 +11298,32 @@ impl Explorer {
     }
     /// Reload the right pane for the selected tree directory. Marks are kept
     /// (keyed by path), so a selection can span directories as you navigate.
+    /// Walk the saved path, expanding and selecting each component in a
+    /// freshly-built tree so the view returns to where it was.
+    fn walk_to(&mut self, comps: &[String]) {
+        for comp in comps {
+            self.tree_expand();
+            let child = self
+                .tree
+                .iter()
+                .position(|n| n.depth == self.tree[self.tree_sel].depth + 1 && n.dir.name == *comp);
+            match child {
+                Some(idx) => self.tree_sel = idx,
+                None => break,
+            }
+        }
+        self.reload_list();
+    }
+
+    /// Close every confirmation prompt and edit dialog.
+    fn close_prompts(&mut self) {
+        self.mkdir_input = None;
+        self.confirm_delete = None;
+        self.confirm_bless = None;
+        self.metadata = None;
+        self.editor = None;
+    }
+
     fn reload_list(&mut self) {
         let dir = self.current_dir().clone();
         let mut list = self.fs.list_directory(&dir).unwrap_or_default();
@@ -11805,6 +11813,20 @@ fn export_explorer_selection(
             }
         }
     }
+}
+
+/// Build the Explorer again after a write and walk back to the folder `comps` names.
+fn rebuild_explorer(
+    image_path: &str,
+    selector: Option<crate::cli::img_at::PartSelector>,
+    part_label: String,
+    comps: &[String],
+    status: String,
+) -> Result<Explorer, String> {
+    let mut ex = build_explorer(image_path, selector, part_label)?;
+    ex.walk_to(comps);
+    ex.status = Some(status);
+    Ok(ex)
 }
 
 /// Open a partition of `image_path` read-only, as the Explorer does.
