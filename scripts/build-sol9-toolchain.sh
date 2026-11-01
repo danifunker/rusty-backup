@@ -28,7 +28,7 @@ JOBS="${JOBS:-$(nproc)}"
 say() { printf '\033[1;36m==> %s\033[0m\n' "$*"; }
 
 [ -f "$SYSROOT_TGZ" ] || { echo "error: no sysroot tarball at $SYSROOT_TGZ" >&2; exit 1; }
-tar tzf "$SYSROOT_TGZ" | grep -qE '^(\./)?usr/include/stdio\.h$' \
+tar tzf "$SYSROOT_TGZ" | grep -E '^(\./)?usr/include/stdio\.h$' >/dev/null \
   || { echo "error: $SYSROOT_TGZ has no usr/include/stdio.h; is it rooted at / ?" >&2; exit 1; }
 
 say "Unpacking the sysroot into $SYSROOT"

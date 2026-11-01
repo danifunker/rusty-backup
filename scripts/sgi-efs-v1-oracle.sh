@@ -211,12 +211,13 @@ SH
     body=$(sed -n '/RBMOUNT-BEGIN/,/RBMOUNT-END/p' "$log")
     # IRIX 3.7's mount is silent on success. Its refusals are what these match:
     # "/dev/md0c:Invalid argument" from mount, "not mounted" from the umount.
-    if printf '%s' "$body" | grep -qiE 'invalid argument|not mounted|mount:|giving up|not a directory|block device required'; then
+    # Here-strings, not `printf | grep -q`: bash line-buffers, so grep -q exiting early SIGPIPEs printf under pipefail.
+    if grep -qiE 'invalid argument|not mounted|mount:|giving up|not a directory|block device required' <<<"$body"; then
       echo "IRIX refused the volume:"; printf '%s\n' "$body"; exit 1
     fi
     # `.` and `..` are the two entries even an empty EFS root always has, so a
     # listing without them means the mount silently gave us something else.
-    if ! printf '%s' "$body" | grep -qE '(^|[[:space:]])\.\.([[:space:]]|$)'; then
+    if ! grep -qE '(^|[[:space:]])\.\.([[:space:]]|$)' <<<"$body"; then
       echo "IRIX mounted it but the root directory did not read back:"
       printf '%s\n' "$body"; exit 1
     fi
