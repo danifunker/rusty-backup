@@ -74,7 +74,8 @@ if [ "$SKIP_VERIFY" = 0 ]; then
     step "produce every artifact"
     "$RB" produce --rb-cli "$RB_CLI" || FAILED=1
     step "verify the artifacts with this host's oracles"
-    "$RB" verify || FAILED=1
+    # Script oracles that drive rb-cli themselves (motion) find it through RB_CLI.
+    RB_CLI="$RB_CLI" "$RB" verify || FAILED=1
 fi
 
 step "done: $([ "$FAILED" = 0 ] && echo 'nothing to look at' || echo 'something needs a look - see above')"

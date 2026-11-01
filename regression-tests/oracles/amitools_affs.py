@@ -48,6 +48,10 @@ def main() -> int:
         )
         sys.stdout.write(proc.stdout)
         sys.stderr.write(proc.stderr)
+        # xdftool that cannot even start (amitools missing for this python) says nothing about the volume.
+        if "ModuleNotFoundError" in proc.stderr or "ImportError" in proc.stderr:
+            print("unavailable: xdftool cannot import amitools for this python", file=sys.stderr)
+            return 77
         if proc.returncode != 0:
             # xdftool reports structural problems on stdout with a zero-ish
             # look; surface the reason on stderr so the verdict carries it.

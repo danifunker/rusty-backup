@@ -82,7 +82,11 @@ class SerialVM:
     """A QEMU guest whose serial console is a unix socket we read and type into."""
 
     def __init__(self, argv, log_path=None):
-        self.dir = tempfile.mkdtemp(prefix="rb-oracle-")
+        # Keep the socket path short and local (unix socket paths are capped at 108 bytes).
+        sock_root = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+        if not os.path.isdir(sock_root):
+            sock_root = None
+        self.dir = tempfile.mkdtemp(prefix="rb-oracle-", dir=sock_root)
         self.sock_path = os.path.join(self.dir, "serial.sock")
         self.log = open(log_path or os.path.join(self.dir, "console.log"), "wb")
         argv = list(argv) + [
@@ -92,7 +96,8 @@ class SerialVM:
         ]
         self.proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         self.sock = socket.socket(socket.AF_UNIX)
-        for _ in range(100):
+        # QEMU creates the socket only once it is up, which can take a while on a busy host.
+        for _ in range(300):
             if self.proc.poll() is not None:
                 err = self.proc.stderr.read().decode(errors="replace")
                 no_verdict(f"emulator exited at start: {err.strip()}")

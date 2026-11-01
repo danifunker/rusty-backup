@@ -45,7 +45,7 @@ IRIS_DISK=${IRIS_DISK:-$HOME/3130.img}
 BOOT_SECONDS=${BOOT_SECONDS:-120}
 # rb-regress builds release; a developer usually has debug. Prefer whichever
 # exists so the same script serves both callers.
-RB=${RB:-}
+RB=${RB:-${RB_CLI:-}}
 if [ -z "$RB" ]; then
   for cand in "$ROOT/target/release/rb-cli" "$ROOT/target/debug/rb-cli"; do
     [ -x "$cand" ] && { RB=$cand; break; }

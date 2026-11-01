@@ -1,0 +1,12 @@
+# Emulator scenarios run by scripts/regress-emulators.sh.
+#
+#   <id>  <known bug or ->  <script and arguments, relative to emulator/>
+#
+# A known bug marks a scenario that is expected to fail until that bug is
+# fixed: it does not fail the run, and its passing is reported so the bug can
+# be closed. Scenarios exit 0 pass, 1 finding, 77 cannot run here, 99 no verdict.
+
+ufs2.freebsd-edit      -      ufs_freebsd_fsck.py ufs2
+ufs1.freebsd-edit      R-072  ufs_freebsd_fsck.py ufs1
+ufs1.blank             R-071  ufs_freebsd_fsck.py blank-ufs1
+qnx2.lexicon-edit      -      qnx2_icon_chkfsys.py

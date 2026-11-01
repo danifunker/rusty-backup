@@ -19,6 +19,7 @@ finding depends on a fixture, the fixture is named.
 
 | ID | Severity | Area | Finding |
 |----|----------|------|---------|
+| [R-072](#r-072) | Medium | `crates/fs-unix` (UFS1 directory create) | After `rb-cli mkdir` on a FreeBSD-made UFS1 volume, FreeBSD 15.1 `fsck_ffs -fn` asks "UPDATE FILESYSTEM TO TRACK DIRECTORY DEPTH?": the new directory's depth field is not set. The same edits on UFS2 pass. Found by the FreeBSD emulator scenario, 2026-11-01 |
 | [R-071](#r-071) | **High** | `crates/fs-unix` (UFS1 `create_blank`) | A blank UFS1 volume from `rb-cli new volume ufs` fails FreeBSD 15.1 `fsck_ffs -fn`: free block counts wrong in the superblock, summary information bad, blocks missing in the bitmaps. Found by the new FreeBSD emulator oracle, 2026-11-01 |
 | ~~[R-070](#r-070)~~ | ~~**High**~~ **FIXED** | `src/cli/verbs/restore.rs` | ~~`rb-cli restore` without `--device` treats a `/dev/...` target as an image file and create/truncates it, so a writable device is written raw with no safety preflight, no system-disk guard, no unmount, no disk claim and no write-protect check~~ — a device-shaped target without `--device` is now refused, 2026-09-08 |
 | ~~[R-069](#r-069)~~ | ~~**High**~~ **FIXED** | `src/model/source_reader.rs` | ~~The encrypted-DMG probe opens the source with a plain `File::open` before the raw-device check is reached, so on macOS an unprivileged `rb-cli` device verb still dies with a bare `Permission denied` and R-068's fix never runs~~ — the device check now precedes every content probe, 2026-09-08 |
@@ -94,7 +95,7 @@ finding depends on a fixture, the fixture is named.
 
 ---
 
-## Found by the FreeBSD emulator oracle, 2026-11-01
+## Found by the FreeBSD emulator oracle and scenarios, 2026-11-01
 
 ### R-071 — a blank UFS1 volume fails FreeBSD's fsck_ffs {#r-071}
 
@@ -122,6 +123,23 @@ Note for whoever picks this up: `fsck_ffs -n` declines every repair and still
 exits 0, so an exit-code check alone passes this volume. The oracle fails on
 any `...? no` question. Next step: compare the CG header and bitmap of this
 volume with one `newfs -O1` makes in the same VM.
+
+### R-072 — a directory rb-cli makes on UFS1 lacks FreeBSD's directory depth {#r-072}
+
+**OPEN.** `regression-tests/emulator/ufs_freebsd_fsck.py ufs1` copies
+`fs.ufs1.freebsd151.hd` (made by FreeBSD 15.1), runs `rb-cli mkdir /rbtest`,
+`mkdir /rbtest/sub`, three `put`s (one past the direct blocks), an `mv` and an
+`rm`, then FreeBSD `fsck_ffs -fn` says, in phase 2:
+
+```
+UPDATE FILESYSTEM TO TRACK DIRECTORY DEPTH? no
+```
+
+The untouched fixture passes, and the identical edits on the UFS2 fixture
+(`ufs2`, with check-hashes) pass, so this is the UFS1 directory-create path:
+FreeBSD 13+ records each directory's depth in the inode (`di_dirdepth`, in a
+spare field) and the UFS2 writer already sets it. Nothing is lost; fsck offers
+to start tracking. Fix: set the depth on UFS1 directory create as on UFS2.
 
 ## Found while adding the 1000-file churn test, 2026-09-05
 
