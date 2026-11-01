@@ -28,7 +28,8 @@ Line numbers are a snapshot. Re-check them before editing.
 | 4. `prepare_disk_image_path` | **Done** (3f926ec0): `model::image_prep`, decoded as a `Job` by `gui::pending_image` (Backup + Restore; the other callers never decode). |
 | 5. fsck / repair | **GUI done** (6883328f): Inspect and browse via `fsck_runner::{check_target, repair_and_recheck}`. **TUI open:** its stdout/stderr suppression is process-wide, so it moves with item 9. |
 | 2. Browse apply staged edits | **Apply done** (2bb6fad1): `commander_ops::apply_queue`. Tar import and export selection still open. |
-| 3, 6, 7, 8, 9 | Open. |
+| 3. CHD edit mode | **Done** (this commit): `model::chd_edit_open` backs up and opens the session as a `Job`. |
+| 6, 7, 8, 9 | Open. |
 
 `gui::progress::show_job` draws any running job (spinner or bar, phase, Cancel).
 

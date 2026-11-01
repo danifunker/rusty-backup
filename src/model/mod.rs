@@ -11,6 +11,8 @@ pub mod browse_session;
 pub mod bulk_convert_runner;
 pub mod cache_runner;
 #[cfg(feature = "chd")]
+pub mod chd_edit_open;
+#[cfg(feature = "chd")]
 pub mod chd_expand_runner;
 pub mod checksum;
 pub mod commander_descend;

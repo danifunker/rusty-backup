@@ -21,9 +21,7 @@ use rusty_backup::model::archive_edit::{self, ArchiveEditContext, ArchiveEditPro
 use rusty_backup::model::browse_session::{BrowseOpenStatus, BrowseSession};
 use rusty_backup::model::edit_queue::{EditQueue, StagedEdit};
 use rusty_backup::model::status::ExtractionProgress;
-use rusty_backup::rbformats::chd_edit::{
-    self, is_compressed_chd, make_backup_copy, ChdEditSession,
-};
+use rusty_backup::rbformats::chd_edit;
 
 use super::file_detail::{self, FileContent};
 use super::metadata_editor::{
@@ -164,6 +162,13 @@ pub struct BrowseView {
     repair_report: Option<rusty_backup::fs::RepairReport>,
     /// A running Check or Repair on this volume.
     fsck_job: Option<rusty_backup::model::job::Job<BrowseFsck>>,
+    /// Backing up a CHD and opening its edit session, before edit mode starts.
+    chd_open_job: Option<
+        rusty_backup::model::job::Job<(
+            PathBuf,
+            Result<rusty_backup::model::chd_edit_open::ChdEditOpen, String>,
+        )>,
+    >,
     /// A running Apply of the staged edits, and what to do once it lands.
     apply_job: Option<(
         rusty_backup::model::job::Job<rusty_backup::model::commander_ops::QueueApply>,
@@ -482,6 +487,7 @@ impl Default for BrowseView {
             show_repair_confirm: false,
             repair_report: None,
             fsck_job: None,
+            chd_open_job: None,
             apply_job: None,
             tree_text: None,
             show_tree_popup: false,
@@ -918,6 +924,16 @@ impl BrowseView {
         self.render_fsck_job(ui);
         self.poll_apply_job();
         self.render_apply_job(ui);
+        self.poll_chd_open_job();
+        if let Some(job) = &self.chd_open_job {
+            let snap = job.snapshot();
+            egui::Window::new(snap.label.clone())
+                .collapsible(false)
+                .resizable(false)
+                .show(ui.ctx(), |ui| {
+                    super::progress::show_job(ui, &snap);
+                });
+        }
 
         // If a background open is in progress, drain its status and either
         // render a spinner or finalize the open with the results it produced.
@@ -2733,75 +2749,62 @@ impl BrowseView {
             .unwrap_or(false)
     }
 
-    /// Diff path for a compressed CHD edit session: sibling `<stem>.edit-diff.chd`.
-    fn diff_path_for(parent: &Path) -> PathBuf {
-        let parent_dir = parent.parent().unwrap_or(Path::new("."));
-        let stem = parent
-            .file_stem()
-            .map(|s| s.to_os_string())
-            .unwrap_or_default();
-        let mut diff_name = stem;
-        diff_name.push(".edit-diff.chd");
-        parent_dir.join(diff_name)
-    }
-
     /// Open a [`ChdEditSession`] for the current source CHD and install it
     /// on `self.session.chd_edit_session` so subsequent reads / writes flow
     /// through the diff (or in-place for uncompressed). Reloads the
     /// filesystem from the live session so the browser reflects the
     /// current state. On failure leaves edit_mode false and reports the
     /// error via `edit_result`.
+    /// Back up the CHD and open an edit session as a job; the poll enters edit mode.
     fn enter_chd_edit_mode(&mut self) {
+        if self.chd_open_job.is_some() {
+            return;
+        }
         let Some(parent_path) = self.session.source_path.clone() else {
             self.edit_result = Some("Error: no source path".to_string());
             return;
         };
+        self.chd_open_job = Some(rusty_backup::model::job::Job::spawn(
+            "Preparing CHD for editing...",
+            Arc::new(super::ui_logger::EguiWake),
+            move |job| {
+                let opened =
+                    rusty_backup::model::chd_edit_open::open_for_editing(&parent_path, job);
+                Ok((parent_path, opened))
+            },
+        ));
+    }
 
-        // Backup copy first — preserves the original CHD as `<name>.chd_backup`
-        // so the user has an easy revert point. No-op if the backup already
-        // exists from a previous edit session.
-        if let Err(e) = make_backup_copy(&parent_path) {
-            self.edit_result = Some(format!("Error creating backup: {e}"));
+    fn poll_chd_open_job(&mut self) {
+        use rusty_backup::model::job::Status;
+        let Some(job) = &self.chd_open_job else {
+            return;
+        };
+        let snap = job.snapshot();
+        if snap.is_running() {
             return;
         }
-
-        let compressed = match is_compressed_chd(&parent_path) {
-            Ok(c) => c,
-            Err(e) => {
-                self.edit_result = Some(format!("Error inspecting CHD: {e}"));
+        let out = job.take_result();
+        self.chd_open_job = None;
+        let opened = match (snap.status, out) {
+            (Status::Done, Some((parent_path, Ok(opened)))) => (parent_path, opened),
+            (Status::Done, Some((_, Err(message)))) => {
+                self.edit_result = Some(message);
                 return;
             }
-        };
-
-        let (session, diff_path) = if compressed {
-            let diff = Self::diff_path_for(&parent_path);
-            let res = if diff.exists() {
-                ChdEditSession::reopen_with_diff(&parent_path, &diff)
-            } else {
-                ChdEditSession::open_with_diff(&parent_path, &diff)
-            };
-            match res {
-                Ok(s) => (s, Some(diff)),
-                Err(e) => {
-                    self.edit_result = Some(format!("Error opening CHD diff: {e}"));
-                    return;
-                }
+            (Status::Failed(e), _) => {
+                self.edit_result = Some(format!("Error opening CHD: {e}"));
+                return;
             }
-        } else {
-            match ChdEditSession::open_uncompressed(&parent_path) {
-                Ok(s) => (s, None),
-                Err(e) => {
-                    self.edit_result = Some(format!("Error opening CHD: {e}"));
-                    return;
-                }
-            }
+            _ => return,
         };
-
-        let arc = Arc::new(Mutex::new(session));
+        let (parent_path, opened) = opened;
+        let compressed = opened.compressed;
+        let arc = Arc::new(Mutex::new(opened.session));
         self.session.chd_edit_session = Some(Arc::clone(&arc));
         self.chd_edit = Some(ChdEditState {
             parent_path,
-            diff_path,
+            diff_path: opened.diff_path,
         });
         self.edit_mode = true;
         self.edit_free_space = None;
