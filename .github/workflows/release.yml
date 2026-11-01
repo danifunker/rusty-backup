@@ -51,6 +51,17 @@ env:
 jobs:
 # Test steps pass --workspace: the root has no default-members, so a bare `cargo test`
 # would skip every crate under crates/.
+  # Layer rules (docs/native_frontends_plan.md §4) and the platform matrix. No Rust needed.
+  boundaries:
+    name: Layer boundaries + platform matrix
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - name: Layer boundaries (src/vm enforced; shells reported)
+        run: scripts/check-boundaries.sh
+      - name: Platform matrix matches the CI targets
+        run: scripts/check-platform-matrix.py
+
   generate-version:
     name: Generate Version
     runs-on: ubuntu-24.04
