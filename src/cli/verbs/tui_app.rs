@@ -5378,9 +5378,11 @@ impl App {
                 .as_ref()
                 .map(|s| s.config.update_check.clone());
             let Some(cfg) = repo else { return };
-            let current = env!("APP_VERSION");
-            let msg =
-                match with_stderr_suppressed(|| crate::update::check_for_updates(&cfg, current)) {
+            // A network round-trip: run it as a task so the screen stays live.
+            self.start_task("Checking for updates", move |job| {
+                job.set_can_cancel(false);
+                let current = env!("APP_VERSION");
+                let msg = match crate::update::check_for_updates(&cfg, current) {
                     Ok(info) if info.is_outdated => format!(
                         "Update available: {} (current {current}). Run `rb-cli update --apply`.",
                         info.latest_version
@@ -5388,9 +5390,12 @@ impl App {
                     Ok(_) => format!("Up to date (current {current})."),
                     Err(e) => format!("Update check failed: {e}"),
                 };
-            if let Some(s) = self.settings.as_mut() {
-                s.status = Some(msg);
-            }
+                Ok(Box::new(move |app: &mut App| {
+                    if let Some(s) = app.settings.as_mut() {
+                        s.status = Some(msg);
+                    }
+                }) as TaskDone)
+            });
         }
         #[cfg(not(feature = "tui-update"))]
         {

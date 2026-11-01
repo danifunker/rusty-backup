@@ -61,6 +61,8 @@ pub struct BulkConvertDialog {
     phase: Phase,
     /// Set when scan returns no usable entries; surfaced inline in the dialog.
     scan_error: Option<String>,
+    /// Reading the source folder (slow on a network share).
+    scan_job: Option<rusty_backup::model::job::Job<std::io::Result<Vec<ScannedFile>>>>,
 }
 
 impl Default for BulkConvertDialog {
@@ -75,6 +77,7 @@ impl Default for BulkConvertDialog {
             bincue_multi_bin: false,
             phase: Phase::Setup,
             scan_error: None,
+            scan_job: None,
         }
     }
 }
@@ -275,7 +278,7 @@ impl BulkConvertDialog {
                     let ready =
                         self.source_folder.is_some() && self.output_folder.is_some();
                     if ui
-                        .add_enabled(ready, egui::Button::new("Scan..."))
+                        .add_enabled(ready && self.scan_job.is_none(), egui::Button::new("Scan..."))
                         .on_hover_text("Read the source folder and review the file list before converting.")
                         .clicked()
                     {
@@ -285,10 +288,33 @@ impl BulkConvertDialog {
                         action = DialogAction::Cancel;
                     }
                 });
+                if let Some(job) = &self.scan_job {
+                    super::progress::show_job(ui, &job.snapshot());
+                }
             });
 
-        if go_to_review {
-            match scan_source_folder(self.source_folder.as_ref().unwrap(), self.format) {
+        if go_to_review && self.scan_job.is_none() {
+            let folder = self.source_folder.clone().unwrap_or_default();
+            let format = self.format;
+            self.scan_job = Some(rusty_backup::model::job::Job::spawn(
+                "Scanning the source folder...",
+                std::sync::Arc::new(super::ui_logger::EguiWake),
+                move |job| {
+                    job.set_can_cancel(false);
+                    Ok(scan_source_folder(&folder, format))
+                },
+            ));
+        }
+        let scanned = match &self.scan_job {
+            Some(job) if !job.is_running() => {
+                let out = job.take_result();
+                self.scan_job = None;
+                Some(out.unwrap_or_else(|| Err(rusty_backup::compat::io_other("the scan stopped"))))
+            }
+            _ => None,
+        };
+        if let Some(result) = scanned {
+            match result {
                 Ok(files) if files.is_empty() => {
                     self.scan_error = Some("No files found in source folder.".to_string());
                 }
