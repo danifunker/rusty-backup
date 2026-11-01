@@ -338,6 +338,8 @@ pub struct RustyBackupApp {
     archives_tab: ArchivesTab,
     /// App-wide view-model: the log, the job registry and recent files.
     app: AppVm,
+    /// A Refresh Devices scan in flight.
+    devices_job: Option<rusty_backup::model::job::Job<Vec<DiskDevice>>>,
     progress: ProgressState,
     devices: Vec<DiskDevice>,
     update_info: Arc<Mutex<Option<UpdateInfo>>>,
@@ -434,6 +436,7 @@ impl Default for RustyBackupApp {
             inspect_tab: InspectTab::default(),
             optical_tab,
             archives_tab: ArchivesTab::default(),
+            devices_job: None,
             app: {
                 let mut app = AppVm::new(Arc::new(ui_logger::EguiWake));
                 app.log = log;
@@ -767,6 +770,15 @@ impl eframe::App for RustyBackupApp {
         }
 
         // Drains worker-thread `log::info!` records (the GHO reader's scan, say) into the log panel.
+        // A finished Refresh Devices replaces the list.
+        if self.devices_job.as_ref().is_some_and(|j| !j.is_running()) {
+            if let Some(devices) = self.devices_job.take().and_then(|j| j.take_result()) {
+                self.devices = devices;
+                self.app
+                    .log
+                    .info(format!("Refreshed: {} device(s) found", self.devices.len()));
+            }
+        }
         let effects = self.app.tick();
         run_effects(ctx, effects);
 
@@ -862,13 +874,16 @@ impl eframe::App for RustyBackupApp {
                             ui.separator();
                         }
                         ElevationGate::NotApplicable | ElevationGate::Elevated => {
-                            if ui.button("Refresh Devices").clicked() {
-                                self.devices = device::enumerate_devices();
-                                self.app.log.info(format!(
-                                    "Refreshed: {} device(s) found",
-                                    self.devices.len()
+                            if self.devices_job.is_some() {
+                                ui.spinner();
+                                ui.label("Looking for devices...");
+                            } else if ui.button("Refresh Devices").clicked() {
+                                // Querying each disk can take a moment on Windows and macOS.
+                                self.devices_job = Some(rusty_backup::model::job::Job::spawn(
+                                    "Looking for devices...",
+                                    Arc::new(ui_logger::EguiWake),
+                                    |_| Ok(device::enumerate_devices()),
                                 ));
-                                ui.ctx().request_repaint();
                             }
                         }
                     }
