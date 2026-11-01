@@ -204,6 +204,8 @@ pub struct BrowseView {
     staged_edits: EditQueue,
     /// Free space of the editable volume: None = not probed, Some(None) = unavailable.
     edit_free_space: Option<Option<u64>>,
+    /// The free-space probe in flight (an editable open decodes a whole container).
+    free_space_job: Option<rusty_backup::model::job::Job<Option<u64>>>,
     /// The SquashFS size-budget dialog, open only between clicking Edit Mode on
     /// a SquashFS volume and choosing a ceiling. See
     /// [`super::squashfs_budget_dialog`].
@@ -512,6 +514,7 @@ impl Default for BrowseView {
             show_tree_large_dialog: false,
             staged_edits: EditQueue::new(),
             edit_free_space: None,
+            free_space_job: None,
             show_unsaved_dialog: false,
             conflict_review: None,
             text_editor: None,
@@ -615,6 +618,8 @@ impl BrowseView {
             Some("Apply edits")
         } else if self.tar_job.is_some() {
             Some("Tar import")
+        } else if self.editor_job.is_some() {
+            Some("Text editor")
         } else {
             None
         }
@@ -793,6 +798,7 @@ impl BrowseView {
     pub fn close(&mut self) {
         self.root = None;
         self.edit_free_space = None;
+        self.free_space_job = None;
         self.directory_cache.clear();
         self.expanded_paths.clear();
         self.selected_entry = None;
@@ -2844,6 +2850,7 @@ impl BrowseView {
         // Disable edit mode immediately
         self.edit_mode = false;
         self.edit_free_space = None;
+        self.free_space_job = None;
         self.edit_result = None;
         self.show_new_folder_dialog = false;
         self.pending_delete = None;
@@ -2866,6 +2873,7 @@ impl BrowseView {
         self.session.zstd_cache = None;
         self.edit_mode = true;
         self.edit_free_space = None;
+        self.free_space_job = None;
 
         // Re-open filesystem from temp file. Invalidate the cache
         // first because the source bytes have changed.
@@ -3050,6 +3058,7 @@ impl BrowseView {
         });
         self.edit_mode = true;
         self.edit_free_space = None;
+        self.free_space_job = None;
 
         // Reload the filesystem through the session so any pre-existing
         // diff content is visible.
@@ -3316,6 +3325,7 @@ impl BrowseView {
             Ok((_efs, _commit)) => {
                 self.edit_mode = true;
                 self.edit_free_space = None;
+                self.free_space_job = None;
             }
             Err(e) => {
                 self.error = Some(format!("Cannot enter edit mode: {e}"));
@@ -3801,12 +3811,28 @@ impl BrowseView {
             // Free space, probed once per edit session and again after each write:
             // opening the editable volume decodes a whole container.
             if self.edit_free_space.is_none() {
-                self.edit_free_space = Some(
-                    self.session
-                        .open_editable()
-                        .ok()
-                        .and_then(|(mut efs, _commit)| efs.free_space().ok()),
-                );
+                match &self.free_space_job {
+                    Some(job) if !job.is_running() => {
+                        self.edit_free_space = Some(job.take_result().flatten());
+                        self.free_space_job = None;
+                    }
+                    Some(_) => {}
+                    // Never alongside one of this view's writes.
+                    None if self.running_job().is_none() => {
+                        let session = self.session.clone();
+                        self.free_space_job = Some(rusty_backup::model::job::Job::spawn(
+                            "Free space",
+                            Arc::new(super::ui_logger::EguiWake),
+                            move |_| {
+                                Ok(session
+                                    .open_editable()
+                                    .ok()
+                                    .and_then(|(mut efs, _commit)| efs.free_space().ok()))
+                            },
+                        ));
+                    }
+                    None => {}
+                }
             }
             if let Some(Some(free)) = self.edit_free_space {
                 ui.label(format!("Free: {}", disk_core::display::format_size(free)));
@@ -4465,6 +4491,7 @@ impl BrowseView {
             return;
         }
         self.edit_free_space = None;
+        self.free_space_job = None;
         log::info!(
             "Applying {} staged edit(s) to {}",
             self.staged_edits.len(),
@@ -4833,6 +4860,7 @@ impl BrowseView {
         if save && self.editor_job.is_none() {
             // The editor rides to the worker and back: reopened on a failure, closed on success.
             self.edit_free_space = None;
+            self.free_space_job = None;
             let session = self.session.clone();
             self.editor_job = Some(rusty_backup::model::job::Job::spawn(
                 "Saving the file...",
@@ -5630,6 +5658,7 @@ impl BrowseView {
     fn exit_edit_mode(&mut self) {
         self.edit_mode = false;
         self.edit_free_space = None;
+        self.free_space_job = None;
         self.edit_result = None;
         self.show_new_folder_dialog = false;
         self.pending_delete = None;
@@ -5986,6 +6015,7 @@ impl BrowseView {
     /// Execute repair on the filesystem and re-run check.
     fn run_repair(&mut self) {
         self.edit_free_space = None;
+        self.free_space_job = None;
         if self.fsck_job.is_some() {
             return;
         }
