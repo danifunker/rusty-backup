@@ -6,8 +6,8 @@
 //! closed. `run_guarded` records the panic or error into the status, and
 //! `lock_status` recovers a poisoned lock (the status structs are plain data,
 //! so nothing in them can be left half-updated in a way that matters).
+//! The guard itself is [`super::job::catch`], shared with [`super::job::Job`].
 
-use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 /// A status the GUI polls: it must be able to record a terminal failure.
@@ -26,15 +26,11 @@ pub fn run_guarded<S: WorkerStatus>(
     what: &str,
     body: impl FnOnce() -> anyhow::Result<()>,
 ) {
-    let failure = match catch_unwind(AssertUnwindSafe(body)) {
-        Ok(Ok(())) => None,
-        Ok(Err(e)) => Some(format!("{e:#}")),
-        Err(payload) => Some(format!(
-            "{what} worker panicked: {}",
-            panic_message(payload.as_ref())
-        )),
-    };
-    if let Some(message) = failure {
+    if let Err(failure) = super::job::catch(what, body) {
+        let message = match failure {
+            super::job::Failure::Cancelled => super::job::Cancelled.to_string(),
+            super::job::Failure::Error(message) => message,
+        };
         lock_status(status).fail(message);
     }
 }
@@ -64,16 +60,6 @@ pub fn forward_cancel(
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
     })
-}
-
-fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
-    if let Some(s) = payload.downcast_ref::<&str>() {
-        (*s).to_string()
-    } else if let Some(s) = payload.downcast_ref::<String>() {
-        s.clone()
-    } else {
-        "unknown panic".to_string()
-    }
 }
 
 impl WorkerStatus for crate::backup::BackupProgress {
