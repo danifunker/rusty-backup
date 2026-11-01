@@ -162,6 +162,10 @@ pub struct BrowseView {
     repair_report: Option<rusty_backup::fs::RepairReport>,
     /// A running Check or Repair on this volume.
     fsck_job: Option<rusty_backup::model::job::Job<BrowseFsck>>,
+    /// A running "Export selection": the filesystem comes back with the summary, plus the destination.
+    export_job: Option<(rusty_backup::model::job::Job<ExportRun>, PathBuf)>,
+    /// A running tar import (its preflight, or the import itself).
+    tar_job: Option<rusty_backup::model::job::Job<TarStep>>,
     /// Backing up a CHD and opening its edit session, before edit mode starts.
     chd_open_job: Option<
         rusty_backup::model::job::Job<(
@@ -489,6 +493,8 @@ impl Default for BrowseView {
             show_repair_confirm: false,
             repair_report: None,
             fsck_job: None,
+            export_job: None,
+            tar_job: None,
             chd_open_job: None,
             apply_job: None,
             tree_text: None,
@@ -598,6 +604,8 @@ impl BrowseView {
             Some("Check / repair")
         } else if self.apply_job.is_some() {
             Some("Apply edits")
+        } else if self.tar_job.is_some() {
+            Some("Tar import")
         } else {
             None
         }
@@ -977,6 +985,26 @@ impl BrowseView {
         self.poll_archive_sniff();
         self.poll_apply_job();
         self.render_apply_job(ui);
+        self.poll_export_job();
+        self.poll_tar_job();
+        let running = [
+            self.export_job.as_ref().map(|(j, _)| j.snapshot()),
+            self.tar_job.as_ref().map(|j| j.snapshot()),
+        ];
+        for snap in running.into_iter().flatten() {
+            let mut cancel = false;
+            egui::Window::new(snap.label.clone())
+                .collapsible(false)
+                .resizable(false)
+                .show(ui.ctx(), |ui| {
+                    cancel = super::progress::show_job(ui, &snap);
+                });
+            if cancel {
+                if let Some((j, _)) = &self.export_job {
+                    j.cancel();
+                }
+            }
+        }
         self.poll_chd_open_job();
         if let Some(job) = &self.chd_open_job {
             let snap = job.snapshot();
@@ -1758,16 +1786,16 @@ impl BrowseView {
     /// execution; classic-Mac payloads are typically small.
     fn export_marked(&mut self, format: rusty_backup::fs::export_selection::ExportFormat) {
         use rusty_backup::fs::export_selection::{export_to_file, export_to_folder};
+        if self.export_job.is_some() {
+            return;
+        }
         let entries = self.marked_export_entries();
         if entries.is_empty() {
             self.edit_result = Some("Nothing selected to export.".into());
             return;
         }
         let fork_mode = self.resource_fork_mode;
-        let noop_progress = |_: &str, _: usize, _: u64| {};
-        let never_cancel = || false;
-
-        if format.is_single_file() {
+        let (dest, to_file) = if format.is_single_file() {
             let ext = format
                 .file_extension()
                 .map(|e| format!(".{e}"))
@@ -1780,20 +1808,7 @@ impl BrowseView {
             else {
                 return;
             };
-            let Some(mut fs) = self.take_or_open_fs() else {
-                self.edit_result = Some("Filesystem not open.".into());
-                return;
-            };
-            let res = export_to_file(
-                &mut *fs,
-                &entries,
-                &path,
-                format,
-                &noop_progress,
-                &never_cancel,
-            );
-            self.return_fs(fs);
-            self.report_export(res, &path);
+            (path, true)
         } else {
             let Some(dir) = super::file_dialog()
                 .set_title("Export selection to folder")
@@ -1801,21 +1816,57 @@ impl BrowseView {
             else {
                 return;
             };
-            let Some(mut fs) = self.take_or_open_fs() else {
-                self.edit_result = Some("Filesystem not open.".into());
-                return;
-            };
-            let res = export_to_folder(
-                &mut *fs,
-                &entries,
-                &dir,
-                format,
-                fork_mode,
-                &noop_progress,
-                &never_cancel,
-            );
-            self.return_fs(fs);
-            self.report_export(res, &dir);
+            (dir, false)
+        };
+        let Some(mut fs) = self.take_or_open_fs() else {
+            self.edit_result = Some("Filesystem not open.".into());
+            return;
+        };
+        let target = dest.clone();
+        let job = rusty_backup::model::job::Job::spawn(
+            "Exporting the selection...",
+            Arc::new(super::ui_logger::EguiWake),
+            move |job| {
+                let progress = |name: &str, done: usize, _bytes: u64| {
+                    job.set_phase(format!("Exporting {name} ({done} done)"));
+                };
+                let cancelled = || job.is_cancelled();
+                let res = if to_file {
+                    export_to_file(&mut *fs, &entries, &target, format, &progress, &cancelled)
+                } else {
+                    export_to_folder(
+                        &mut *fs, &entries, &target, format, fork_mode, &progress, &cancelled,
+                    )
+                };
+                Ok((fs, res.map_err(|e| e.to_string())))
+            },
+        );
+        self.export_job = Some((job, dest));
+    }
+
+    fn poll_export_job(&mut self) {
+        use rusty_backup::model::job::Status;
+        let Some((job, _)) = &self.export_job else {
+            return;
+        };
+        let snap = job.snapshot();
+        if snap.is_running() {
+            return;
+        }
+        let out = job.take_result();
+        let Some((_, dest)) = self.export_job.take() else {
+            return;
+        };
+        match (snap.status, out) {
+            (Status::Done, Some((fs, res))) => {
+                if self.cached_fs.is_none() {
+                    self.return_fs(fs);
+                }
+                self.report_export(res.map_err(|e| anyhow::anyhow!(e)), &dest);
+            }
+            (Status::Cancelled, _) => self.edit_result = Some("Export cancelled.".into()),
+            (Status::Failed(e), _) => self.edit_result = Some(format!("Export failed: {e}")),
+            _ => {}
         }
     }
 
@@ -3246,116 +3297,60 @@ impl BrowseView {
     /// (`render_tar_import_dialog`) when content would be skipped/dropped.
     /// Shared by the "Import Archive..." button and the add/drop auto-route.
     fn begin_tar_import_from_path(&mut self, path: &std::path::Path) {
-        // Preflight read-only: open editable (for capability + name checks),
-        // scan, then drop without committing.
-        let preflight = {
-            let (efs, _commit) = match self.session.open_editable() {
-                Ok(pair) => pair,
-                Err(e) => {
-                    self.edit_result = Some(format!("Error opening filesystem: {e}"));
-                    return;
-                }
-            };
-            let opts = fs_tar::tar_import::TarImportOptions {
-                conflict: fs_tar::tar_import::ImportConflict::Skip,
-                ..Default::default()
-            };
-            match fs_tar::tar_import::preflight_tar_from_path(&*efs, path, &opts) {
-                Ok(pf) => pf,
-                Err(e) => {
-                    self.edit_result = Some(format!("Could not read archive: {e:#}"));
-                    return;
-                }
-            }
-        };
-
-        if preflight.has_warnings() {
-            self.pending_tar_import = Some(PendingTarImport {
-                archive_path: path.to_path_buf(),
-                preflight,
-            });
-        } else {
-            self.run_tar_import(path);
-        }
+        self.spawn_tar_job(path.to_path_buf(), true);
     }
 
-    /// Import `archive` into the current directory. Existing names are
-    /// skipped (not overwritten); macOS `._*` sidecars are dropped. Writes
-    /// immediately (not staged), then reloads the view.
+    /// Import `archive` into the current directory after its preflight was confirmed.
     fn run_tar_import(&mut self, archive: &std::path::Path) {
-        let dest = self.current_parent_entry();
-        let (mut efs, commit) = match self.session.open_editable() {
-            Ok(pair) => pair,
-            Err(e) => {
-                self.edit_result = Some(format!("Error opening filesystem: {e}"));
-                return;
-            }
-        };
-        let opts = fs_tar::tar_import::TarImportOptions {
-            conflict: fs_tar::tar_import::ImportConflict::Skip,
-            ..Default::default()
-        };
-        let stats = match fs_tar::tar_import::import_tar_from_path(
-            &mut *efs,
-            &dest,
-            archive,
-            &opts,
-            &|_| {},
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                self.edit_result = Some(format!("Import failed: {e:#}"));
-                return;
-            }
-        };
-        if let Err(e) = efs.sync_metadata() {
-            self.edit_result = Some(format!("Error saving to disk: {e}"));
-            return;
-        }
-        drop(efs);
-        if let Err(e) = commit.commit() {
-            self.edit_result = Some(format!("Error writing container: {e}"));
-            return;
-        }
+        self.spawn_tar_job(archive.to_path_buf(), false);
+    }
 
-        let mut msg = format!(
-            "Imported {} files, {} dirs, {} symlinks into /{}",
-            stats.files,
-            stats.dirs_created,
-            stats.symlinks,
-            if dest.path == "/" {
-                String::new()
-            } else {
-                dest.name.clone()
+    /// Preflight (when `check`) and import a tar as a job; a preflight with warnings stops for the dialog.
+    /// Existing names are skipped, macOS `._*` sidecars dropped; it writes at once, not staged.
+    fn spawn_tar_job(&mut self, archive: PathBuf, check: bool) {
+        if self.tar_job.is_some() {
+            return;
+        }
+        let session = self.session.clone();
+        let dest = self.current_parent_entry();
+        self.tar_job = Some(rusty_backup::model::job::Job::spawn(
+            "Importing the archive...",
+            Arc::new(super::ui_logger::EguiWake),
+            move |job| {
+                job.set_can_cancel(false);
+                Ok(tar_import_step(&session, &dest, archive, check, job))
+            },
+        ));
+    }
+
+    fn poll_tar_job(&mut self) {
+        use rusty_backup::model::job::Status;
+        let Some(job) = &self.tar_job else {
+            return;
+        };
+        let snap = job.snapshot();
+        if snap.is_running() {
+            return;
+        }
+        let out = job.take_result();
+        self.tar_job = None;
+        match (snap.status, out) {
+            (Status::Done, Some(TarStep::Confirm(archive_path, preflight))) => {
+                self.pending_tar_import = Some(PendingTarImport {
+                    archive_path,
+                    preflight,
+                });
             }
-        );
-        if stats.symlinks_skipped > 0 {
-            msg.push_str(&format!("; {} symlink(s) skipped", stats.symlinks_skipped));
+            (Status::Done, Some(TarStep::Finished(msg, wrote))) => {
+                self.edit_result = Some(msg);
+                if wrote {
+                    self.invalidate_all_caches();
+                    self.invalidate_cached_fs();
+                }
+            }
+            (Status::Failed(e), _) => self.edit_result = Some(format!("Import failed: {e}")),
+            _ => {}
         }
-        if stats.appledouble_skipped > 0 {
-            msg.push_str(&format!(
-                "; {} ._ sidecar(s) skipped",
-                stats.appledouble_skipped
-            ));
-        }
-        if stats.appledouble_paired > 0 {
-            msg.push_str(&format!(
-                "; {} ._ sidecar(s) joined to their file",
-                stats.appledouble_paired
-            ));
-        }
-        if stats.invalid_names_skipped > 0 {
-            msg.push_str(&format!(
-                "; {} bad-name entr(ies) skipped",
-                stats.invalid_names_skipped
-            ));
-        }
-        if stats.skipped_existing > 0 {
-            msg.push_str(&format!("; {} already existed", stats.skipped_existing));
-        }
-        self.edit_result = Some(msg);
-        self.invalidate_all_caches();
-        self.invalidate_cached_fs();
     }
 
     /// Modal shown when a tar archive is added/dropped as a host file: import
@@ -6808,3 +6803,104 @@ enum ApplyFollowUp {
 
 /// A sniff's result: the filesystem to put back (when there was one), and the archive kind found.
 type ArchiveSniff = (Option<Box<dyn Filesystem>>, Option<MacArchiveKind>);
+
+/// An "Export selection" job's result: the filesystem to put back, and the summary or error.
+type ExportRun = (
+    Box<dyn Filesystem>,
+    Result<rusty_backup::fs::export_selection::ExportSummary, String>,
+);
+
+/// What a tar-import job ended with.
+enum TarStep {
+    /// The preflight found content that would be skipped or dropped; ask before importing.
+    Confirm(PathBuf, fs_tar::tar_import::TarImportPreflight),
+    /// The status-line message, and whether anything was written.
+    Finished(String, bool),
+}
+
+/// The tar import, off the UI thread: preflight on a throwaway editable open, then import, sync and commit.
+fn tar_import_step(
+    session: &BrowseSession,
+    dest: &FileEntry,
+    archive: PathBuf,
+    check: bool,
+    job: &rusty_backup::model::job::JobCtx,
+) -> TarStep {
+    let opts = fs_tar::tar_import::TarImportOptions {
+        conflict: fs_tar::tar_import::ImportConflict::Skip,
+        ..Default::default()
+    };
+    if check {
+        job.set_phase("Checking the archive...");
+        let preflight = {
+            let (efs, _commit) = match session.open_editable() {
+                Ok(pair) => pair,
+                Err(e) => {
+                    return TarStep::Finished(format!("Error opening filesystem: {e}"), false)
+                }
+            };
+            match fs_tar::tar_import::preflight_tar_from_path(&*efs, &archive, &opts) {
+                Ok(pf) => pf,
+                Err(e) => {
+                    return TarStep::Finished(format!("Could not read archive: {e:#}"), false)
+                }
+            }
+        };
+        if preflight.has_warnings() {
+            return TarStep::Confirm(archive, preflight);
+        }
+    }
+    job.set_phase("Importing...");
+    let (mut efs, commit) = match session.open_editable() {
+        Ok(pair) => pair,
+        Err(e) => return TarStep::Finished(format!("Error opening filesystem: {e}"), false),
+    };
+    let stats =
+        match fs_tar::tar_import::import_tar_from_path(&mut *efs, dest, &archive, &opts, &|_| {}) {
+            Ok(s) => s,
+            Err(e) => return TarStep::Finished(format!("Import failed: {e:#}"), false),
+        };
+    if let Err(e) = efs.sync_metadata() {
+        return TarStep::Finished(format!("Error saving to disk: {e}"), false);
+    }
+    drop(efs);
+    if let Err(e) = commit.commit() {
+        return TarStep::Finished(format!("Error writing container: {e}"), false);
+    }
+    let mut msg = format!(
+        "Imported {} files, {} dirs, {} symlinks into /{}",
+        stats.files,
+        stats.dirs_created,
+        stats.symlinks,
+        if dest.path == "/" {
+            String::new()
+        } else {
+            dest.name.clone()
+        }
+    );
+    if stats.symlinks_skipped > 0 {
+        msg.push_str(&format!("; {} symlink(s) skipped", stats.symlinks_skipped));
+    }
+    if stats.appledouble_skipped > 0 {
+        msg.push_str(&format!(
+            "; {} ._ sidecar(s) skipped",
+            stats.appledouble_skipped
+        ));
+    }
+    if stats.appledouble_paired > 0 {
+        msg.push_str(&format!(
+            "; {} ._ sidecar(s) joined to their file",
+            stats.appledouble_paired
+        ));
+    }
+    if stats.invalid_names_skipped > 0 {
+        msg.push_str(&format!(
+            "; {} bad-name entr(ies) skipped",
+            stats.invalid_names_skipped
+        ));
+    }
+    if stats.skipped_existing > 0 {
+        msg.push_str(&format!("; {} already existed", stats.skipped_existing));
+    }
+    TarStep::Finished(msg, true)
+}
