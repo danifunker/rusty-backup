@@ -19,6 +19,8 @@ finding depends on a fixture, the fixture is named.
 
 | ID | Severity | Area | Finding |
 |----|----------|------|---------|
+| ~~[R-074](#r-074)~~ | ~~**High**~~ **FIXED** | `crates/fs-unix` (UFS1 edit, superblock totals) | ~~Any rb-cli edit of a UFS1 volume Solaris made corrupts its superblock: the edit also updates FreeBSD's 64-bit `fs_cstotal` at offset 1008, which Solaris's superblock does not have~~ — the 64-bit totals are written only on UFS2 or with `FS_FLAGS_UPDATED`, 2026-11-01 |
+| [R-073](#r-073) | **High** | `crates/fs-unix` (`new volume ufs --big-endian`) | A blank big-endian UFS1 volume is rejected by Solaris 9's own fsck ("BAD VALUES IN SUPER BLOCK") although `new volume ufs` names Solaris as a target: it carries FreeBSD's fake geometry (`fs_ntrak` 0, one cylinder per group) and 4.4BSD-format inodes and directories, where Solaris expects real geometry, staggered groups and the old 16-bit `d_namlen`. Found by the Solaris emulator scenario, 2026-11-01 |
 | ~~[R-072](#r-072)~~ | ~~Medium~~ **FIXED** | `crates/fs-unix` (UFS1 directory create) | ~~After `rb-cli mkdir` on a FreeBSD-made UFS1 volume, FreeBSD 15.1 `fsck_ffs -fn` asks "UPDATE FILESYSTEM TO TRACK DIRECTORY DEPTH?"~~ — the depth is now written at offset 4 on 4.4BSD-format UFS1 and survives later inode writes, 2026-11-01 |
 | ~~[R-071](#r-071)~~ | ~~**High**~~ **FIXED** | `crates/fs-unix` (UFS1 `create_blank`) | ~~A blank UFS1 volume from `rb-cli new volume ufs` fails FreeBSD 15.1 `fsck_ffs -fn`: free block counts wrong in the superblock, summary information bad, blocks missing in the bitmaps~~ — the root directory takes one fragment and the cluster summary no longer overwrites the free map, 2026-11-01 |
 | ~~[R-070](#r-070)~~ | ~~**High**~~ **FIXED** | `src/cli/verbs/restore.rs` | ~~`rb-cli restore` without `--device` treats a `/dev/...` target as an image file and create/truncates it, so a writable device is written raw with no safety preflight, no system-disk guard, no unmount, no disk claim and no write-protect check~~ — a device-shaped target without `--device` is now refused, 2026-09-08 |
@@ -96,6 +98,57 @@ finding depends on a fixture, the fixture is named.
 ---
 
 ## Found by the FreeBSD emulator oracle and scenarios, 2026-11-01
+
+### R-074 — editing a Solaris UFS volume corrupts its superblock {#r-074}
+
+**FIXED 2026-11-01.** The 64-bit totals are now updated only on UFS2, or on
+UFS1 with `FS_FLAGS_UPDATED` set. The same scenario then passes all of Solaris
+9's fsck phases with nothing to repair, and Solaris lists the files. A unit
+test clears the flag on a blank volume and checks that a mkdir leaves bytes
+1008-1039 alone.
+
+Original report: `regression-tests/emulator/solaris_ufs_fsck.py sol-edit` lets
+Solaris 9 `newfs` a 32 MB slice, has rb-cli mkdir / put / mv / rm on it, and
+boots Solaris again: `fsck -F ufs -n` reports `BAD SUPERBLOCK AT BLOCK 16: BAD
+VALUES IN SUPER BLOCK`, though the files are all there. Diffing the superblock
+before and after the edit shows two changed regions: `fs_old_cstotal` at 192
+(correct) and 32 bytes at 1008-1039. `propagate_cs` also updated FreeBSD's
+64-bit `fs_cstotal` mirror whenever the cylinder groups use the dynamic
+layout, which Solaris's do too; Solaris keeps other superblock data there.
+FreeBSD only keeps that mirror on UFS2, or on UFS1 once `FS_FLAGS_UPDATED`
+(0x80) is set in `fs_old_flags` (byte 211): it is set on FreeBSD's volumes and
+rb-cli's own, and clear on Solaris's.
+
+### R-073 — a big-endian UFS1 volume from `new volume ufs` is not a Solaris volume {#r-073}
+
+**OPEN.** `regression-tests/emulator/solaris_ufs_fsck.py blank` formats a
+32 MB slice with `rb-cli new volume ufs --big-endian`, puts it in a Sun label
+(`new hd sun`) at SCSI target 1 of a QEMU SS-5 running Solaris 9, and runs
+`fsck -F ufs -n /dev/rdsk/c0t1d0s0`:
+
+```
+BAD SUPERBLOCK AT BLOCK 16: BAD VALUES IN SUPER BLOCK
+LOOK FOR ALTERNATE SUPERBLOCKS WITH MKFS?  no
+```
+
+A read-only mount succeeds, but `/rbtest` (which rb-cli made) is not found.
+Against a slice Solaris's own `newfs` made on the same machine, the superblock
+differs in geometry and format, not just counts:
+
+| field | rb-cli | Solaris newfs |
+|---|---|---|
+| `fs_ntrak` / `fs_nsect` / `fs_spc` | 0 / 65536 / 65536 | 16 / 63 / 1008 |
+| `fs_cpg` / `fs_ncyl` | 1 / 1 | 88 / 8076 |
+| `fs_cgoffset` / `fs_cgmask` | 0 / -1 | 32 / -16 |
+| `fs_maxsymlinklen` | 60 (4.4BSD inode format) | 0 |
+
+Solaris's fsck rejects `fs_ntrak <= 0` outright, and with `fs_maxsymlinklen`
+0 it reads directories with the pre-4.4 16-bit `d_namlen`, which is why the
+4.4BSD-format root lists nothing useful. The NeXTSTEP `ufs-43bsd` flavour has
+real geometry and the old directory format, but the static pre-Tahoe
+cylinder-group layout; Solaris uses the dynamic one (`cg_*off` offsets). A fix
+is a Solaris flavour of the formatter: Sun geometry, staggered groups, old
+inode and directory format, dynamic cylinder groups.
 
 ### R-071 — a blank UFS1 volume fails FreeBSD's fsck_ffs {#r-071}
 

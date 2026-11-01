@@ -119,6 +119,9 @@ pub(crate) const OFF_CSADDR_UFS2: usize = 1096;
 pub(crate) const OFF_CSTOTAL_OLD: usize = 0x0C0;
 /// `fs_cstotal` — the 64-bit mirror a 4.4BSD superblock also keeps.
 pub(crate) const OFF_CSTOTAL64: usize = 1008; // fs_size        i64 — UFS2 64-bit fragments
+/// `fs_old_flags`; FreeBSD sets `FS_FLAGS_UPDATED` there once its UFS1 superblock carries the 64-bit fields.
+const OFF_OLD_FLAGS: usize = 211;
+const FS_FLAGS_UPDATED: u8 = 0x80;
 pub(crate) const OFF_MAXSYMLINKLEN: usize = 0x528; // fs_maxsymlinklen i32 — inline-symlink cutoff (60 for UFS1, 120 for UFS2)
 const OFF_FLAGS2: usize = 0x35E; // fs_flags2      i32 (relevant journal bits live elsewhere too, but this is the canonical "ENABLED" word in modern UFS2)
 
@@ -1925,11 +1928,14 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
         let mut sb = vec![0u8; SB_READ_SIZE];
         self.reader.read_exact(&mut sb)?;
         let deltas = [d_ndir, d_nbfree, d_nifree, d_nffree];
+        // Solaris's dynamic-layout UFS1 keeps other data at 1008; only FreeBSD's carries the 64-bit totals (R-074).
+        let has_cstotal64 = self.version == UfsVersion::Ufs2
+            || (self.cg_layout == CgLayout::Modern && sb[OFF_OLD_FLAGS] & FS_FLAGS_UPDATED != 0);
         for (i, d) in deltas.iter().enumerate() {
             let off = OFF_CSTOTAL_OLD + i * 4;
             let cur = read_i32(&sb, off, endian);
             write_i32(&mut sb, off, cur.wrapping_add(*d), endian);
-            if self.cg_layout == CgLayout::Modern {
+            if has_cstotal64 {
                 let off64 = OFF_CSTOTAL64 + i * 8;
                 let cur64 = read_i64(&sb, off64, endian);
                 write_i64(&mut sb, off64, cur64.wrapping_add(i64::from(*d)), endian);
@@ -6209,6 +6215,60 @@ mod dir_growth_tests {
     use super::*;
     use disk_core::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
     use std::io::Cursor;
+
+    /// R-074: a Solaris-style UFS1 superblock (no `FS_FLAGS_UPDATED`) keeps other data at 1008.
+    #[test]
+    fn edits_leave_non_freebsd_superblock_tail_alone() {
+        use disk_core::filesystem::CreateDirectoryOptions;
+        let params = crate::ufs_format::Ufs1FormatParams {
+            size_bytes: 16 * 1024 * 1024,
+            endian: UfsEndian::Big,
+            ..Default::default()
+        };
+        let mut img = crate::ufs_format::create_blank_ufs1(&params).unwrap();
+        let sb = SB_OFFSET_UFS1 as usize;
+        img[sb + OFF_OLD_FLAGS] &= !FS_FLAGS_UPDATED;
+        img[sb + OFF_CSTOTAL64..sb + OFF_CSTOTAL64 + 32].fill(0x5A);
+        let before = img[sb + OFF_CSTOTAL64..sb + OFF_CSTOTAL64 + 32].to_vec();
+        let mut backing = img;
+        let mut fs = UfsFilesystem::open(Cursor::new(&mut backing), 0).unwrap();
+        let root = fs.root().unwrap();
+        fs.create_directory(&root, "d", &CreateDirectoryOptions::default())
+            .unwrap();
+        drop(fs);
+        assert_eq!(
+            backing[sb + OFF_CSTOTAL64..sb + OFF_CSTOTAL64 + 32],
+            before[..]
+        );
+    }
+
+    /// R-072: a FreeBSD-format UFS1 directory records its depth, and a later write of it keeps it.
+    #[test]
+    fn ufs1_directory_depth_survives_a_child_mkdir() {
+        use disk_core::filesystem::CreateDirectoryOptions;
+        let params = crate::ufs_format::Ufs1FormatParams {
+            size_bytes: 16 * 1024 * 1024,
+            ..Default::default()
+        };
+        let img = crate::ufs_format::create_blank_ufs1(&params).unwrap();
+        let mut fs = UfsFilesystem::open(Cursor::new(img), 0).unwrap();
+        let root = fs.root().unwrap();
+        let a = fs
+            .create_directory(&root, "a", &CreateDirectoryOptions::default())
+            .unwrap();
+        let b = fs
+            .create_directory(&a, "b", &CreateDirectoryOptions::default())
+            .unwrap();
+        let depth = |fs: &mut UfsFilesystem<Cursor<Vec<u8>>>, n: u64| {
+            let at = fs.inode_byte_offset(n as u32);
+            let mut buf = [0u8; 8];
+            fs.reader.seek(SeekFrom::Start(at)).unwrap();
+            fs.reader.read_exact(&mut buf).unwrap();
+            read_u32(&buf, D1_OFF_DIRDEPTH, fs.endian)
+        };
+        assert_eq!(depth(&mut fs, a.location), 1);
+        assert_eq!(depth(&mut fs, b.location), 2);
+    }
 
     /// R-061: a directory that outgrows its first block must still list.
     #[test]
