@@ -1,77 +1,16 @@
-# Publishes one crate from crates/ to crates.io.
-# Push a tag `<crate>-v<version>` (e.g. disk-core-v0.1.0-alpha.1) to publish;
-# the version must match that crate's Cargo.toml. Manual runs default to a dry run.
+# Publishes every crate under crates/ whose Cargo.toml version is not on crates.io yet.
+# Releasing a crate = bump its version (and CHANGELOG) and push to main; no tags.
+# Manual runs work on any branch and default to a dry run.
 # Needs the CARGO_REGISTRY_TOKEN repository secret (crates.io token, publish-update scope).
 name: Publish crates
 
 on:
   push:
-    tags:
-      - "disk-core-v*"
-      - "fs-8bit-v*"
-      - "fs-apple2-v*"
-      - "fs-cpm-v*"
-      - "fs-qnx-v*"
-      - "fs-xerox-v*"
-      - "dsk-clonezilla-v*"
-      - "fs-amiga-v*"
-      - "fs-unix-v*"
-      - "fs-xfs-v*"
-      - "fs-squashfs-v*"
-      - "fs-pc-v*"
-      - "fs-hpfs-v*"
-      - "fs-apfs-v*"
-      - "fs-mac-unicode-v*"
-      - "fs-mac-v*"
-      - "part-tables-v*"
-      - "dsk-flux-v*"
-      - "dsk-apple-v*"
-      - "dsk-dmg-v*"
-      - "dsk-floppy-v*"
-      - "dsk-vm-v*"
-      - "dsk-ghost-v*"
-      - "fs-adfs-v*"
-      - "fs-tar-v*"
-      - "arc-mac-v*"
-      - "dsk-imz-v*"
-      - "dsk-tape-v*"
-      - "qnx2fs-v*"
+    branches: [main]
+    paths:
+      - "crates/*/Cargo.toml"
   workflow_dispatch:
     inputs:
-      crate:
-        description: Crate to publish
-        required: true
-        type: choice
-        options:
-          - disk-core
-          - fs-8bit
-          - fs-apple2
-          - fs-cpm
-          - fs-qnx
-          - fs-xerox
-          - dsk-clonezilla
-          - fs-amiga
-          - fs-unix
-          - fs-xfs
-          - fs-squashfs
-          - fs-pc
-          - fs-hpfs
-          - fs-apfs
-          - fs-mac-unicode
-          - fs-mac
-          - part-tables
-          - dsk-flux
-          - dsk-apple
-          - dsk-dmg
-          - dsk-floppy
-          - dsk-vm
-          - dsk-ghost
-          - fs-adfs
-          - fs-tar
-          - arc-mac
-          - dsk-imz
-          - dsk-tape
-          - qnx2fs
       dry_run:
         description: Package and verify only, do not upload
         required: true
@@ -89,46 +28,48 @@ jobs:
   publish:
     runs-on: ubuntu-24.04
     environment: crates-io
+    timeout-minutes: 360
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Resolve crate and mode
-        id: target
-        shell: bash
-        env:
-          INPUT_CRATE: ${{ inputs.crate }}
-          INPUT_DRY_RUN: ${{ inputs.dry_run }}
-        run: |
-          set -euo pipefail
-          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
-            crate="${GITHUB_REF_NAME%-v*}"
-            version="${GITHUB_REF_NAME##*-v}"
-            manifest_version="$(cargo metadata --no-deps --format-version 1 \
-              | jq -r --arg n "$crate" '.packages[] | select(.name == $n) | .version')"
-            if [ "$manifest_version" != "$version" ]; then
-              echo "::error::tag says $crate $version but Cargo.toml says '$manifest_version'"
-              exit 1
-            fi
-            dry_run=false
-          else
-            crate="$INPUT_CRATE"
-            dry_run="$INPUT_DRY_RUN"
-          fi
-          echo "crate=$crate" >> "$GITHUB_OUTPUT"
-          echo "dry_run=$dry_run" >> "$GITHUB_OUTPUT"
-          echo "Publishing $crate (dry run: $dry_run)"
-
-      - name: cargo publish
+      - name: Publish new versions
         shell: bash
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-          CRATE: ${{ steps.target.outputs.crate }}
-          DRY_RUN: ${{ steps.target.outputs.dry_run }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
         run: |
           set -euo pipefail
-          if [ "$DRY_RUN" = "true" ]; then
-            cargo publish -p "$CRATE" --dry-run
-          else
-            cargo publish -p "$CRATE"
-          fi
+          # crates.io rate limits (new crates: 5 then 1 per 10 min) answer 429 with a
+          # "try again after" time; wait for it and retry what is still unpublished.
+          for attempt in $(seq 1 30); do
+            mapfile -t pending < <(scripts/unpublished-crates.py)
+            if [ ${#pending[@]} -eq 0 ]; then
+              echo "Every crate's version is on crates.io; nothing to publish."
+              exit 0
+            fi
+            echo "Unpublished: ${pending[*]} (dry run: $DRY_RUN)"
+            args=()
+            for c in "${pending[@]}"; do args+=(-p "$c"); done
+            if [ "$DRY_RUN" = "true" ]; then
+              cargo publish --dry-run "${args[@]}"
+              exit 0
+            fi
+            # Multi-package publish orders the crates by their dependencies.
+            if cargo publish "${args[@]}" 2>&1 | tee publish.log; then
+              continue
+            fi
+            if ! grep -qiE '429|too many requests' publish.log; then
+              exit 1
+            fi
+            after="$(grep -oE 'try again after [^.]*GMT' publish.log | head -1 | sed 's/try again after //')"
+            wait=600
+            if [ -n "$after" ]; then
+              wait=$(( $(date -d "$after" +%s) - $(date +%s) + 10 ))
+              [ "$wait" -lt 10 ] && wait=10
+            fi
+            echo "Rate-limited; waiting ${wait}s (attempt $attempt)"
+            sleep "$wait"
+          done
+          echo "::error::still unpublished after 30 attempts"
+          exit 1

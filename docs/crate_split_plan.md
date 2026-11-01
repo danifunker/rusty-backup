@@ -190,7 +190,7 @@ That's about 2 test binaries per crate (~48), plus the app's. The vintage CI job
 ## 8. Repository layout
 
 **Recommendation: keep the crates in this repo**, as a Cargo workspace under `crates/`:
-- **One pipeline.** A single CI definition runs every crate's tests (stable + 1.73), and per-crate publishing is driven by tags (e.g. `fs-mac-v0.1.0`) or `release-plz`.
+- **One pipeline.** A single CI definition runs every crate's tests (stable + 1.73), and per-crate publishing is driven by version bumps: a crate whose `Cargo.toml` version isn't on crates.io is published when it reaches `main` (tags until 2026-10-31).
 - **Atomic changes.** A fix that touches `fs-mac` and the app lands in one PR, with no version bump-and-wait.
 - **Simple vintage builds.** Path dependencies work for the vintage and mrustc builds; git dependencies would need vendoring.
 

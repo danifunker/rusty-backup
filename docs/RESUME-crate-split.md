@@ -95,14 +95,17 @@ Read it first, along with `docs/license_audit.md`, CLAUDE.md and CONTRIBUTING.md
 - **The pre-commit hook's whole-tree clippy fails on about 70 lint hits that are
   already on `main`.** Run `cargo fmt --all` by hand and commit with `--no-verify`.
 - **Publishing goes through GitHub Actions only, never a local `cargo publish`.**
-  Push a tag `<crate>-v<version>` (for example `fs-xerox-v0.1.0`) whose version
-  matches the crate's `Cargo.toml`.
-  - `.github/workflows/publish-crates.yml` checks the tag and publishes with the
-    `CARGO_REGISTRY_TOKEN` repository secret, which is already set.
+  No tags (dropped 2026-10-31): bump the crate's `version` (and its CHANGELOG)
+  and push to `main`.
+  - `.github/workflows/publish-crates.yml` runs when a `crates/*/Cargo.toml`
+    changes on `main`, asks `scripts/unpublished-crates.py` which crates' versions
+    aren't on crates.io, and publishes them in dependency order with the
+    `CARGO_REGISTRY_TOKEN` repository secret. It waits out 429 rate limits.
+  - Before `native-frontends` merges, run it by hand on that branch with
+    `dry_run` off: `gh workflow run publish-crates.yml --ref native-frontends -f dry_run=false`.
   - Run `cargo publish -p <crate> --dry-run` locally first. A dirty working tree
     fails it.
-  - Add every new crate to both lists in the workflow: the tag patterns and the
-    manual-run choices.
+  - New crates under `crates/` are picked up automatically.
 
 ## Start here: the split is done; two loose ends (2026-10-31)
 

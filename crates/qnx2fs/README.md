@@ -97,7 +97,7 @@ so it is not for the browser build.
 This crate lives in the [RustyBackup](https://github.com/danifunker/rusty-backup)
 workspace at `crates/qnx2fs` (until 0.3.2 it had its own repository) and is
 released like the other crates there: bump `version`, update `CHANGELOG.md`, and
-push the tag `qnx2fs-v<version>`.
+push to `main`; the publish workflow uploads any version crates.io doesn't have.
 
 - **Rust 1.73.** RustyBackup's vintage builds compile it with Rust 1.73.
 - **No dependencies and WebAssembly-safe** by default: never read the system
