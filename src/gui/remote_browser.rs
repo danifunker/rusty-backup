@@ -80,6 +80,8 @@ pub struct RemoteBrowsePanel {
     mode: Option<BrowseMode>,
     /// The listing grid (host picker, or inside an image).
     listing: DirListing,
+    /// A folder being listed over the network; the grid waits for it.
+    entering: Option<rusty_backup::model::job::Job<rusty_backup::model::dir_listing::EnteredDir>>,
     /// In-flight transition (connect / open image / close image).
     pending: Option<Arc<Mutex<RemoteTransition>>>,
     /// The connect prompt, if open.
@@ -158,6 +160,7 @@ impl RemoteBrowsePanel {
         self.pending = None;
         self.connect_dialog = None;
         self.listing = DirListing::new();
+        self.entering = None;
         self.error = None;
         self.phase.clear();
         if was {
@@ -214,8 +217,12 @@ impl RemoteBrowsePanel {
         }
 
         ui.separator();
+        self.poll_entering();
         let mut action = GridAction::None;
-        if self.pending.is_some() {
+        if let Some(job) = &self.entering {
+            ui.add_space(16.0);
+            super::progress::show_job(ui, &job.snapshot());
+        } else if self.pending.is_some() {
             ui.add_space(16.0);
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
@@ -243,11 +250,19 @@ impl RemoteBrowsePanel {
         match action {
             GridAction::None => {}
             GridAction::Up => self.listing.up(),
-            GridAction::Enter(name) => {
-                if let Err(e) = self.listing.enter(&name) {
-                    self.error = Some(format!("{e}"));
+            GridAction::Enter(name) => match self.listing.begin_enter(&name) {
+                Ok(pending) => {
+                    self.entering = Some(rusty_backup::model::job::Job::spawn(
+                        format!("Opening {name}..."),
+                        std::sync::Arc::new(super::ui_logger::EguiWake),
+                        move |job| {
+                            job.set_can_cancel(false);
+                            Ok(pending.run())
+                        },
+                    ));
                 }
-            }
+                Err(e) => self.error = Some(format!("{e}")),
+            },
             GridAction::OpenImage(path) => {
                 // Hand the image to Inspect to open over the block tier (full
                 // partition view). The connection rides along in the request, so
@@ -263,6 +278,26 @@ impl RemoteBrowsePanel {
         true
     }
 
+    /// Show a folder once its listing arrives (the network read ran on a worker).
+    fn poll_entering(&mut self) {
+        let Some(job) = &self.entering else {
+            return;
+        };
+        if job.is_running() {
+            return;
+        }
+        let done = job.take_result();
+        self.entering = None;
+        match done {
+            Some(done) => {
+                if let Err(e) = self.listing.finish_enter(done) {
+                    self.error = Some(format!("{e}"));
+                }
+            }
+            None => self.error = Some("Listing the folder failed".to_string()),
+        }
+    }
+
     /// Collapse the panel UI after handing an image off to Inspect: the
     /// connection now lives in `inspect_request`, so reset the browse state
     /// without a "disconnected" log.
@@ -272,6 +307,7 @@ impl RemoteBrowsePanel {
         self.pending = None;
         self.connect_dialog = None;
         self.listing = DirListing::new();
+        self.entering = None;
         self.error = None;
         self.phase.clear();
         self.addr.clear();
@@ -471,6 +507,7 @@ impl RemoteBrowsePanel {
                 self.addr = addr.clone();
                 self.mode = Some(mode.clone());
                 self.error = None;
+                self.entering = None;
                 self.listing
                     .load_root(target.fs, target.root, target.entries, false);
                 match mode {

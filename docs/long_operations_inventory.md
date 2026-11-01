@@ -31,7 +31,8 @@ Line numbers are a snapshot. Re-check them before editing.
 | 3. CHD edit mode | **Done** (this commit): `model::chd_edit_open` backs up and opens the session as a `Job`. |
 | 6. Archive sniff during render | **Done** (this commit): a `Job` that borrows the cached filesystem; a failed open is cached instead of retried every frame. |
 | 8. Partition apply / Make Bootable | **Done** (this commit): `partition_editor::apply_to_source` and the Make Bootable assess / write steps run as jobs; the donor picker stays on the UI thread between them. |
-| 7, 9 | Open. |
+| 7. Remote I/O on the UI thread | **Partly done** (this commit): the optical drive re-scan (Refresh, after connecting a daemon, after eject) and the remote browser's folder entry (`DirListing::begin_enter` / `finish_enter`) run as jobs. **Commander's remote navigation is left for the Phase 2 Commander pilot:** its listing is shared with copy, tree and selection, so it needs the view-model first. |
+| 9 | Open (TUI). |
 
 `gui::progress::show_job` draws any running job (spinner or bar, phase, Cancel).
 

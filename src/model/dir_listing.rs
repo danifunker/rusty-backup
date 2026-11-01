@@ -207,6 +207,37 @@ impl DirListing {
         Ok(())
     }
 
+    /// The off-thread half of [`enter`](Self::enter): take what listing `name` needs, so a slow
+    /// (remote) read can run on a worker; hand the result to [`finish_enter`](Self::finish_enter).
+    pub fn begin_enter(&mut self, name: &str) -> Result<PendingEnter, FilesystemError> {
+        let child = self
+            .entries()
+            .iter()
+            .find(|e| e.is_directory() && e.name == name)
+            .cloned()
+            .ok_or_else(|| FilesystemError::NotFound(format!("directory '{name}'")))?;
+        let fs = match &mut self.source {
+            ListingSource::Image(_) => match std::mem::take(&mut self.source) {
+                ListingSource::Image(fs) => Some(fs),
+                _ => unreachable!("matched Image above"),
+            },
+            ListingSource::Host => None,
+            ListingSource::None => return Err(FilesystemError::Parse("no source loaded".into())),
+        };
+        Ok(PendingEnter { child, fs })
+    }
+
+    /// Finish an [`begin_enter`](Self::begin_enter): put the filesystem back and, on success, show the child.
+    pub fn finish_enter(&mut self, done: EnteredDir) -> Result<(), FilesystemError> {
+        if let Some(fs) = done.fs {
+            self.source = ListingSource::Image(fs);
+        }
+        let entries = done.entries?;
+        self.push_dir(done.child, entries);
+        self.clear_selection();
+        Ok(())
+    }
+
     /// Navigate to the parent directory. For an image pane this pops the
     /// ancestor stack (a no-op at the volume root). For a host pane at its
     /// loaded root, it re-roots to the real parent folder so the user can
@@ -567,6 +598,35 @@ fn fat_attr_tag(attrs: u16) -> String {
     format!("{a}{h}{s}{r}")
 }
 
+/// What listing a child directory needs, taken out of a [`DirListing`] to run on a worker.
+pub struct PendingEnter {
+    child: FileEntry,
+    /// The image filesystem (out of the listing while the worker reads); `None` for a host pane.
+    fs: Option<Box<dyn Filesystem>>,
+}
+
+/// A worker's answer for [`DirListing::finish_enter`].
+pub struct EnteredDir {
+    child: FileEntry,
+    fs: Option<Box<dyn Filesystem>>,
+    entries: Result<Vec<FileEntry>, FilesystemError>,
+}
+
+impl PendingEnter {
+    /// List the child directory; safe to call on a worker thread.
+    pub fn run(mut self) -> EnteredDir {
+        let entries = match &mut self.fs {
+            Some(fs) => fs.list_directory(&self.child),
+            None => list_host_dir(&self.child.path),
+        };
+        EnteredDir {
+            child: self.child,
+            fs: self.fs,
+            entries,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -881,5 +941,20 @@ mod tests {
         l.navigate_to("/Plug-ins/Acquire/Export").unwrap();
         assert_eq!(l.cwd().unwrap().name, "Acquire/Export");
         assert!(l.navigate_to("/Plug-ins/Nope").is_err());
+    }
+
+    #[test]
+    fn entering_in_two_steps_matches_enter() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("sub")).unwrap();
+        std::fs::write(root.path().join("sub/inner.txt"), b"x").unwrap();
+        let mut l = DirListing::new();
+        l.load_host_root(root.path().to_path_buf()).unwrap();
+        let pending = l.begin_enter("sub").unwrap();
+        let done = std::thread::spawn(move || pending.run()).join().unwrap();
+        l.finish_enter(done).unwrap();
+        assert_eq!(l.cwd().unwrap().name, "sub");
+        assert!(l.entries().iter().any(|e| e.name == "inner.txt"));
+        assert!(l.begin_enter("missing").is_err());
     }
 }

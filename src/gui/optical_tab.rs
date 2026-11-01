@@ -52,6 +52,8 @@ pub struct OpticalTab {
     source_mode: SourceMode,
     /// Unified drive list: local drives + every connected daemon's drives.
     rip_devices: Vec<RipDevice>,
+    /// A drive re-scan, which asks every attached daemon over the network; `true` logs the count.
+    drives_job: Option<(rusty_backup::model::job::Job<Vec<RipDevice>>, bool)>,
     selected_drive_idx: Option<usize>,
     /// Connected remote daemons, re-queried when the drive list refreshes.
     remote_daemons: Vec<Arc<Mutex<RemoteConnection>>>,
@@ -95,6 +97,7 @@ impl Default for OpticalTab {
         Self {
             source_mode: SourceMode::ImageFile,
             rip_devices: Vec::new(),
+            drives_job: None,
             selected_drive_idx: None,
             remote_daemons: Vec::new(),
             add_remote_open: false,
@@ -161,8 +164,48 @@ impl OpticalTab {
         let _ = cfg.save();
     }
 
+    /// Enumerate drives now; start-up only, when no daemon is attached yet.
     pub fn refresh_drives(&mut self) {
         self.rip_devices = list_rip_devices(&self.remote_daemons);
+    }
+
+    /// Re-scan drives off the UI thread; attached daemons answer over the network.
+    fn refresh_drives_async(&mut self, log_count: bool) {
+        if self.drives_job.is_some() {
+            return;
+        }
+        let remotes = self.remote_daemons.clone();
+        let job = rusty_backup::model::job::Job::spawn(
+            "Looking for optical drives...",
+            Arc::new(super::ui_logger::EguiWake),
+            move |job| {
+                job.set_can_cancel(false);
+                Ok(list_rip_devices(&remotes))
+            },
+        );
+        self.drives_job = Some((job, log_count));
+    }
+
+    fn poll_drives_job(&mut self, log: &mut LogStore) {
+        let Some((job, _)) = &self.drives_job else {
+            return;
+        };
+        if job.is_running() {
+            return;
+        }
+        let found = job.take_result();
+        let Some((_, log_count)) = self.drives_job.take() else {
+            return;
+        };
+        if let Some(devices) = found {
+            self.rip_devices = devices;
+            if log_count {
+                log.info(format!(
+                    "Refreshed: {} optical drive(s) found",
+                    self.rip_devices.len()
+                ));
+            }
+        }
     }
 
     pub fn drive_count(&self) -> usize {
@@ -213,7 +256,7 @@ impl OpticalTab {
                     .unwrap_or_default();
                 self.remember_daemon_addr(&label);
                 self.remote_daemons.push(conn);
-                self.refresh_drives();
+                self.refresh_drives_async(false);
                 self.add_remote_open = false;
                 self.add_remote_addr.clear();
                 self.add_remote_error = None;
@@ -341,6 +384,7 @@ impl OpticalTab {
     pub fn poll_background(&mut self, log: &mut LogStore, progress: &mut ProgressState) {
         self.poll_progress(log, progress);
         self.poll_add_remote(log);
+        self.poll_drives_job(log);
     }
 
     pub fn show(
@@ -352,6 +396,7 @@ impl OpticalTab {
     ) {
         self.poll_progress(log, progress);
         self.poll_add_remote(log);
+        self.poll_drives_job(log);
         self.show_add_remote_dialog(ui.ctx());
 
         ui.heading("Optical Disc");
@@ -422,12 +467,10 @@ impl OpticalTab {
                                 }
                             });
 
-                        if ui.button("Refresh").clicked() {
-                            self.refresh_drives();
-                            log.info(format!(
-                                "Refreshed: {} optical drive(s) found",
-                                self.rip_devices.len()
-                            ));
+                        if self.drives_job.is_some() {
+                            ui.spinner();
+                        } else if ui.button("Refresh").clicked() {
+                            self.refresh_drives_async(true);
                         }
 
                         // Eject the selected local drive. Remote drives are the
@@ -456,7 +499,7 @@ impl OpticalTab {
                                             // still pointing at it, then re-scan
                                             // so the drive shows as empty.
                                             self.close_disc();
-                                            self.refresh_drives();
+                                            self.refresh_drives_async(false);
                                         }
                                         Err(e) => log.warn(format!("Eject failed: {e:#}")),
                                     }
