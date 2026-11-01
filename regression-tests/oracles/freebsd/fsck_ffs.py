@@ -15,11 +15,15 @@ Exit codes: see oracles/serialvm.py (0 pass, 1 finding, 77 unavailable, 99 no ve
 """
 
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import serialvm  # noqa: E402
 
+
+# fsck -n answers every repair question "no"; Solaris pads it with two spaces.
+DECLINED = re.compile(r"\?\s+no\s*$")
 
 def main():
     args = sys.argv[1:]
@@ -53,7 +57,7 @@ def main():
         status, out = vm.run(f"fsck_ffs -fn /dev/{device}", timeout=300)
         print(out)
         # Every repair fsck_ffs would make shows as a "...? no" question under -n.
-        questions = [l.strip() for l in out.splitlines() if l.rstrip().endswith("? no")]
+        questions = [l.strip() for l in out.splitlines() if DECLINED.search(l)]
         if status == 0 and not questions:
             print(f"PASS: fsck_ffs -fn /dev/{device} exited 0 with nothing to repair")
             return serialvm.PASS

@@ -7,6 +7,7 @@ run here, 99 no verdict. scripts/regress-emulators.sh runs them all.
 
 Inputs, all optional:
     RB_CLI          the rb-cli under test (default: <repo>/target/release/rb-cli)
+    RB_EMU_KEEP     set to 1 to keep the work directory even when the scenario passes
     RB_EMU_CONTROL  set to 1 to run the scenario as its control: after the edits,
                     damage() wrecks a structure the checker must notice, so the
                     run is expected to end in a finding (exit 1)
@@ -99,7 +100,7 @@ def host_file(workdir, name, data):
 def finish(code, workdir_path):
     """Exit with `code`, keeping the work directory only when something needs a look."""
     # A control that passes is the failure worth a look, so its work directory is kept.
-    if code == PASS and not is_control():
+    if code == PASS and not is_control() and os.environ.get("RB_EMU_KEEP") != "1":
         shutil.rmtree(workdir_path, ignore_errors=True)
     else:
         print(f"kept for inspection: {workdir_path}")
@@ -121,11 +122,11 @@ def damage(path, ranges):
     print(f"control: damaged {len(ranges)} range(s) of {os.path.basename(path)}")
 
 
-def ffs_first_cg(path):
-    """Byte offset of cylinder group 0 of a UFS / HP-UX HFS volume (either byte order)."""
+def ffs_first_cg(path, base=0):
+    """Offset of cylinder group 0 within a UFS / HP-UX HFS volume at byte `base` (either byte order)."""
     with open(path, "rb") as f:
         for sb in (8192, 65536):
-            f.seek(sb)
+            f.seek(base + sb)
             b = f.read(1376)
             for e in "<>":
                 if len(b) == 1376 and struct.unpack(e + "I", b[1372:1376])[0] in (

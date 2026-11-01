@@ -9,6 +9,7 @@ Passes when fsck exits 0 and declines no repair.
 """
 
 import os
+import re
 import shutil
 import sys
 
@@ -17,6 +18,9 @@ import scenario as sc  # noqa: E402
 
 FIXTURE = "fs.hpux-hfs.stand1111-hp715.hd.img"
 
+
+# fsck -n answers every repair question "no"; Solaris pads it with two spaces.
+DECLINED = re.compile(r"\?\s+no\s*$")
 
 def main():
     boot = sc.serialvm.emulator_path("hpux_boot")
@@ -42,7 +46,8 @@ def main():
         log_path=log, monitor=True,
     )
     try:
-        vm.expect(r"[Ll]ogin:", timeout=1500)
+        # Boot time varies a lot on emulated PA-RISC; one boot took over 25 minutes to reach login.
+        vm.expect(r"[Ll]ogin:", timeout=2400)
         vm.send("root\r")
         vm.expect(r"[#$] ", timeout=180)
         vm.run("export PATH=/usr/sbin:/sbin:/usr/bin:$PATH", timeout=60)
@@ -51,7 +56,7 @@ def main():
         vm.run("ioscan -fnC disk >/dev/null 2>&1; insf -e >/dev/null 2>&1", timeout=300)
         status, out = vm.run("fsck -F hfs -f -n /dev/rdsk/c0t5d0", timeout=600)
         print(out)
-        questions = [l for l in out.splitlines() if l.rstrip().endswith("? no")]
+        questions = [l for l in out.splitlines() if DECLINED.search(l)]
         if "No such device" in out or "cannot open" in out.lower():
             print("no verdict: the hot-plugged disk did not appear")
             vm.close()
