@@ -163,6 +163,8 @@ pub struct RestoreTab {
     /// Keeps a decompressed `.adz` / `.hdz` source alive while
     /// `sp_image_file` references it.
     sp_amiga_tempdir: Option<tempfile::TempDir>,
+    /// A picked `.hdz` / `.msa` / ... being decoded for a single-partition restore.
+    sp_pending_image: Option<super::pending_image::PendingImage>,
     /// Which partition index to restore (from backup)
     sp_source_partition_idx: Option<usize>,
     /// Target device for single-partition restore
@@ -251,6 +253,7 @@ impl Default for RestoreTab {
             restore_progress: None,
             sp_image_file: None,
             sp_amiga_tempdir: None,
+            sp_pending_image: None,
             sp_source_partition_idx: None,
             sp_target_device_idx: None,
             sp_target_partitions: Vec::new(),
@@ -331,17 +334,7 @@ impl RestoreTab {
             self.load_backup(&path);
         } else {
             self.restore_mode = RestoreMode::SinglePartition;
-            match super::prepare_disk_image_path(&path, true) {
-                Ok((materialized, guard)) => {
-                    self.sp_image_file = Some(materialized);
-                    self.sp_amiga_tempdir = guard;
-                }
-                Err(e) => {
-                    log::error!("Failed to decompress {}: {}", path.display(), e);
-                    self.sp_image_file = Some(path);
-                    self.sp_amiga_tempdir = None;
-                }
-            }
+            self.begin_sp_image(path);
             self.backup_folder = None;
             self.backup_metadata = None;
             self.sp_source_partition_idx = None;
@@ -372,9 +365,39 @@ impl RestoreTab {
         #[cfg(feature = "remote")]
         self.poll_remote(ctx);
         self.poll_build(ctx);
+        self.poll_sp_pending_image();
+    }
+
+    /// Set the single-partition source image, or start decoding it.
+    fn begin_sp_image(&mut self, path: PathBuf) {
+        match super::pending_image::prepare(path) {
+            super::pending_image::Prepare::Ready((path, guard)) => {
+                self.sp_pending_image = None;
+                self.sp_image_file = Some(path);
+                self.sp_amiga_tempdir = guard;
+            }
+            super::pending_image::Prepare::Pending(pending) => {
+                self.sp_pending_image = Some(pending);
+                self.sp_image_file = None;
+                self.sp_amiga_tempdir = None;
+            }
+        }
+    }
+
+    fn poll_sp_pending_image(&mut self) {
+        let Some(ready) = self.sp_pending_image.as_ref().and_then(|p| p.poll()) else {
+            return;
+        };
+        self.sp_pending_image = None;
+        self.sp_image_file = Some(ready.0);
+        self.sp_amiga_tempdir = ready.1;
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext, progress: &mut ProgressState) {
+        self.poll_sp_pending_image();
+        if let Some(pending) = &self.sp_pending_image {
+            pending.show(ui);
+        }
         // Poll background restore thread
         self.poll_progress(ctx, progress);
 
@@ -1019,17 +1042,7 @@ impl RestoreTab {
                         .add_filter("All Files", &["*"])
                         .pick_file()
                     {
-                        match super::prepare_disk_image_path(&path, true) {
-                            Ok((materialized, guard)) => {
-                                self.sp_image_file = Some(materialized);
-                                self.sp_amiga_tempdir = guard;
-                            }
-                            Err(e) => {
-                                log::error!("Failed to decompress {}: {}", path.display(), e);
-                                self.sp_image_file = Some(path);
-                                self.sp_amiga_tempdir = None;
-                            }
-                        }
+                        self.begin_sp_image(path);
                         self.backup_folder = None;
                         self.backup_metadata = None;
                         self.sp_source_partition_idx = None;
@@ -2745,17 +2758,7 @@ impl RestoreTab {
                         .add_filter("All Files", &["*"])
                         .pick_file()
                     {
-                        match super::prepare_disk_image_path(&path, true) {
-                            Ok((materialized, guard)) => {
-                                self.sp_image_file = Some(materialized);
-                                self.sp_amiga_tempdir = guard;
-                            }
-                            Err(e) => {
-                                log::error!("Failed to decompress {}: {}", path.display(), e);
-                                self.sp_image_file = Some(path);
-                                self.sp_amiga_tempdir = None;
-                            }
-                        }
+                        self.begin_sp_image(path);
                         self.backup_folder = None;
                         self.backup_metadata = None;
                         self.sp_source_partition_idx = None;

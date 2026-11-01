@@ -43,6 +43,10 @@ pub struct BackupTab {
     /// lifetime of `image_file_path` when it points at a synthesized
     /// tempfile.
     amiga_tempdir: Option<tempfile::TempDir>,
+    /// A picked `.hdz` / `.msa` / ... being decoded to a flat image.
+    pending_image: Option<super::pending_image::PendingImage>,
+    /// Refresh the backup name once `pending_image` is ready (the picker does; drag-and-drop doesn't).
+    rename_after_prepare: bool,
     destination_folder: Option<PathBuf>,
     backup_name: String,
     sector_by_sector: bool,
@@ -208,6 +212,8 @@ impl Default for BackupTab {
             selected_device_idx: None,
             image_file_path: None,
             amiga_tempdir: None,
+            pending_image: None,
+            rename_after_prepare: false,
             destination_folder: None,
             backup_name: String::new(),
             sector_by_sector: false,
@@ -283,12 +289,14 @@ impl BackupTab {
         #[cfg(feature = "remote")]
         self.poll_remote(ctx);
         self.poll_min_size_calcs(ctx);
+        self.poll_pending_image(ctx);
         self.poll_source_scan(ctx);
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext, progress: &mut ProgressState) {
         // Poll background backup thread
         self.poll_progress(ctx, progress);
+        self.poll_pending_image(ctx);
         self.poll_source_scan(ctx);
 
         // Poll a pending remote connect / device-load worker
@@ -392,22 +400,11 @@ impl BackupTab {
                                 // Backup decodes floppy containers to a flat
                                 // image (true): it needs a raw sector stream to
                                 // compress.
-                                match super::prepare_disk_image_path(&path, true) {
-                                    Ok((materialized, guard)) => {
-                                        self.image_file_path = Some(materialized);
-                                        self.amiga_tempdir = guard;
-                                    }
-                                    Err(e) => {
-                                        log::error!(
-                                            "Failed to decompress {}: {}",
-                                            path.display(),
-                                            e
-                                        );
-                                        self.image_file_path = Some(path);
-                                        self.amiga_tempdir = None;
-                                    }
+                                if self.begin_image(path) {
+                                    self.update_backup_name(ctx);
+                                } else {
+                                    self.rename_after_prepare = true;
                                 }
-                                self.update_backup_name(ctx);
                             }
                         }
                         #[cfg(feature = "remote")]
@@ -525,6 +522,11 @@ impl BackupTab {
                     self.scan_source_partitions(ctx);
                 }
             });
+        }
+
+        if let Some(pending) = &self.pending_image {
+            ui.add_space(4.0);
+            pending.show(ui);
         }
 
         if let Some(job) = &self.source_scan {
@@ -866,6 +868,7 @@ impl BackupTab {
                 };
                 let can_start = has_source
                     && self.source_scan.is_none()
+                    && self.pending_image.is_none()
                     && self.destination_folder.is_some()
                     && !self.backup_name.is_empty()
                     && has_partitions
@@ -1960,16 +1963,37 @@ impl BackupTab {
     pub fn open_image(&mut self, path: PathBuf) {
         self.selected_device_idx = None;
         self.recent_files = super::push_recent(rusty_backup::update::RecentMode::Backup, &path);
-        match super::prepare_disk_image_path(&path, true) {
-            Ok((materialized, guard)) => {
-                self.image_file_path = Some(materialized);
-                self.amiga_tempdir = guard;
-            }
-            Err(e) => {
-                log::error!("Failed to decompress {}: {}", path.display(), e);
+        self.begin_image(path);
+    }
+
+    /// Set the image source, or start decoding it; true when it is ready now.
+    fn begin_image(&mut self, path: PathBuf) -> bool {
+        self.rename_after_prepare = false;
+        match super::pending_image::prepare(path) {
+            super::pending_image::Prepare::Ready((path, guard)) => {
+                self.pending_image = None;
                 self.image_file_path = Some(path);
-                self.amiga_tempdir = None;
+                self.amiga_tempdir = guard;
+                true
             }
+            super::pending_image::Prepare::Pending(pending) => {
+                self.pending_image = Some(pending);
+                self.image_file_path = None;
+                self.amiga_tempdir = None;
+                false
+            }
+        }
+    }
+
+    fn poll_pending_image(&mut self, ctx: &mut TabContext) {
+        let Some(ready) = self.pending_image.as_ref().and_then(|p| p.poll()) else {
+            return;
+        };
+        self.pending_image = None;
+        self.image_file_path = Some(ready.0);
+        self.amiga_tempdir = ready.1;
+        if std::mem::take(&mut self.rename_after_prepare) {
+            self.update_backup_name(ctx);
         }
     }
 
@@ -1983,6 +2007,7 @@ impl BackupTab {
         self.selected_device_idx = None;
         self.image_file_path = None;
         self.amiga_tempdir = None;
+        self.pending_image = None;
         // Dropping the Arc<File> here releases the OS handle on the drive so it
         // can be safely ejected (min-size workers hold their own clones).
         self.source_file = None;
