@@ -23,10 +23,25 @@ emulator, so a pass takes about six minutes on m900.
 | Id | OS that judges | What rb-cli does first |
 |---|---|---|
 | `ufs2.freebsd-edit` | FreeBSD 15.1 `fsck_ffs -fn` | mkdir, put (one past the direct blocks), mv, rm on a FreeBSD-made UFS2 volume with check-hashes |
-| `ufs1.freebsd-edit` | FreeBSD 15.1 `fsck_ffs -fn` | the same on a FreeBSD-made UFS1 volume (R-072) |
-| `ufs1.blank` | FreeBSD 15.1 `fsck_ffs -fn` | `new volume ufs` (R-071) |
+| `ufs1.freebsd-edit` | FreeBSD 15.1 `fsck_ffs -fn` | the same on a FreeBSD-made UFS1 volume (found R-072) |
+| `ufs1.blank` | FreeBSD 15.1 `fsck_ffs -fn` | `new volume ufs` (found R-071) |
+| `ufs1.blank-edit` | FreeBSD 15.1 `fsck_ffs -fn` | `new volume ufs`, then the same edits |
 | `qnx2.lexicon-edit` | QNX 4.10.01 `chkfsys` in icon-emu | mkdir, put (several 128-block extents), mv, rm on the LEXICON 10 MB disk |
 | `hpux-hfs.stand-edit` | HP-UX 11.11 `fsck -F hfs -n` on QEMU B160L | mkdir, put, mv, rm on an HP 715's `/stand` |
+| `ntfs.win7-edit` | Windows 7 `chkdsk` (read-only) and `dir /s` | mkdir, put (non-resident), mv, rm on `fs.ntfs.base.hd` |
+| `ntfs.win7-blank` | Windows 7 `chkdsk` and `dir /s` | `new volume ntfs`, then the same edits |
+| `fat.win7-blank` | Windows 7 `chkdsk` and `dir /s` | `new volume fat` (FAT16, 64 MB), then the same edits |
+| `fat32.win7-blank` | Windows 7 `chkdsk` and `dir /s` | `new volume fat --fat32` (300 MB), then the same edits |
+
+The Windows scenarios are keyboard-driven (`oracles/win7/win7vm.py`): the host
+waits for the taskbar, opens an elevated prompt (Start, `cmd`, Ctrl+Shift+Enter,
+Alt+Y) and types one line that runs `rbrun.bat` from a FAT results disk. The
+batch file runs `chkdsk` (with `n` piped in, since a damaged FAT volume prompts
+even read-only) and `dir /s`, writes both and the exit code to the results disk
+and shuts Windows down; the host reads them back with rb-cli. Nothing is read
+off the screen. `fs.fat32.base.hd` is not used: mkfs.fat made it with 32,232
+clusters, under FAT32's 65,525 minimum, and Windows' chkdsk fails on it
+untouched (`win7_chkdsk.py fat32-pristine`).
 
 Exit codes, shared with the `verify` oracles (`oracles/serialvm.py`):
 0 pass, 1 finding, 77 cannot run here, 99 no verdict. A scenario that cannot
@@ -69,20 +84,33 @@ oracle or a scenario. Two traps the controls exposed:
   0**, so the oracles also fail on any `...? no` question.
 - QNX `chkfsys` stops at `Type <CR> to continue?` on a damaged disk and the
   session times out; the error on screen is still the verdict.
+- Windows 7 self-heals NTFS on mount, before `chkdsk` runs: a wrecked MFT
+  record, and on a blank volume even a wrecked `$Bitmap`, come back clean
+  (Windows writes `System Volume Information` at mount and repairs what its
+  allocator trips over). The NTFS controls damage `$Bitmap`, which is caught on
+  the corpus volume; `ntfs.win7-blank` is marked `-nc` and skipped. A
+  write-protected test disk would stop the healing, but Windows then mounts the
+  NTFS volume as RAW (an mkntfs volume's `$LogFile` is not clean), so the
+  scenarios keep it writable. The `dir /s` listing still fails anything Windows
+  cannot read.
+- `chkdsk` on a damaged FAT volume asks `Convert lost chains to files (Y/N)?`
+  even read-only; `rbrun.bat` pipes in `n`.
 
 ## Deferred
 
 These need an answer or a setup step before they can be automated:
 
-- **FS-UAE (AFFS)** has a scripted `verify` oracle, but this host's Kickstarts
-  are 3.2 (exec 47.7) and the oracle was established on 3.1. Use 3.2, or find
-  the 3.1 ROM?
-- **Copperline (AFFS)**: not built on this host.
-- **Solaris 9 / 10 SPARC (UFS big-endian)**: the disk images are on the NAS;
-  a test disk needs a Sun VTOC label, and the root password is unknown.
+- **FS-UAE (AFFS)** has a scripted `verify` oracle established on Kickstart
+  3.1; this host has 3.2. Copperline (below) covers AFFS meanwhile.
+- **Solaris 9 / 10 SPARC (UFS big-endian)**: the Solaris 9 disk on the NAS is
+  a sun4u (Blade 2500) install, which QEMU's sun4u OpenBIOS cannot boot ("Not
+  a bootable ELF image"), and its root password is set. The candidates are the
+  NAS's `SparcStation-Images/sol8-sparc32.zip` (sun4m, should boot on `-M SS-5`;
+  blank root's password with rb-cli rather than typing one) or the real Blade
+  over ssh.
 - **NeXTSTEP 3.3 in Previous (4.3BSD UFS)**: drivable by keyboard only (the
-  guest mouse does not track), so a check needs a typed-command script.
-- **Windows 7 (NTFS / FAT, chkdsk)**: no serial console; needs a different
-  control channel.
+  guest mouse does not track) through XTEST on a real X display, since this
+  host has no Xvfb, so a run takes over the desktop. Results would go back
+  through the test disk, read with rb-cli.
 - **MiSTer cores, WinUAE, AppleCommander, Snow, MAME**: listed in
   `data/oracles.toml` with no runnable check yet.

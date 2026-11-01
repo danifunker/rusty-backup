@@ -28,11 +28,16 @@ summary=""
 while read -r id bug script args; do
     case "$id" in ''|'#'*) continue ;; esac
     [ -n "$FILTER" ] && [[ "$id" != *"$FILTER"* ]] && continue
+    if [ "$CONTROLS" = 1 ] && [ "$bug" = "-nc" ]; then
+        summary+=$(printf '  %-22s %s' "$id" "skip (control unreliable, see cases.txt)")$'\n'; skip=$((skip+1))
+        continue
+    fi
     if [ "$CONTROLS" = 1 ] && [ "$bug" != "-" ]; then
         # It already fails on its own bug, so a damaged copy failing proves nothing.
         summary+=$(printf '  %-22s %s' "$id" "skip (known failure $bug)")$'\n'; skip=$((skip+1))
         continue
     fi
+    [ "$bug" = "-nc" ] && bug="-"
     printf '\n=== %s%s  (%s)\n' "$id" "$([ "$CONTROLS" = 1 ] && echo ' [control]')" "$(date '+%H:%M:%S')"
     # shellcheck disable=SC2086
     RB_EMU_CONTROL=$CONTROLS python3 "$EMU/$script" $args

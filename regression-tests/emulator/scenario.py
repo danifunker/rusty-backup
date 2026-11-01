@@ -98,7 +98,8 @@ def host_file(workdir, name, data):
 
 def finish(code, workdir_path):
     """Exit with `code`, keeping the work directory only when something needs a look."""
-    if code == PASS:
+    # A control that passes is the failure worth a look, so its work directory is kept.
+    if code == PASS and not is_control():
         shutil.rmtree(workdir_path, ignore_errors=True)
     else:
         print(f"kept for inspection: {workdir_path}")

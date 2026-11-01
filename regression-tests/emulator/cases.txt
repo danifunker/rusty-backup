@@ -2,6 +2,10 @@
 #
 #   <id>  <known bug or ->  <script and arguments, relative to emulator/>
 #
+# `-nc` means no known bug, but the scenario's control is unreliable and
+# --controls skips it: Windows self-heals a damaged blank NTFS volume on mount,
+# before chkdsk runs (README, Controls).
+#
 # A known bug marks a scenario that is expected to fail until that bug is
 # fixed: it does not fail the run, and its passing is reported so the bug can
 # be closed. Scenarios exit 0 pass, 1 finding, 77 cannot run here, 99 no verdict.
@@ -12,3 +16,7 @@ ufs1.blank             -      ufs_freebsd_fsck.py blank-ufs1
 ufs1.blank-edit        -      ufs_freebsd_fsck.py blank-ufs1-edit
 qnx2.lexicon-edit      -      qnx2_icon_chkfsys.py
 hpux-hfs.stand-edit    -      hpux_hfs_fsck.py
+ntfs.win7-edit         -      win7_chkdsk.py ntfs
+ntfs.win7-blank        -nc    win7_chkdsk.py ntfs-blank
+fat32.win7-blank       -      win7_chkdsk.py fat32-blank
+fat.win7-blank         -      win7_chkdsk.py fat-blank
