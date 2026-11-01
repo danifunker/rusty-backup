@@ -251,13 +251,18 @@ impl OpticalTab {
         self.add_remote_error = None;
         let status = Arc::new(Mutex::new(ConnectStatus::default()));
         self.add_remote_status = Some(Arc::clone(&status));
-        std::thread::spawn(move || {
-            let result = RemoteConnection::connect_shared(&addr).map_err(|e| format!("{e:#}"));
-            if let Ok(mut s) = status.lock() {
-                s.result = Some(result);
-                s.done = true;
-            }
-        });
+        rusty_backup::model::worker::spawn_guarded(
+            Arc::clone(&status),
+            "remote connect",
+            move || {
+                let result = RemoteConnection::connect_shared(&addr).map_err(|e| format!("{e:#}"));
+                if let Ok(mut s) = status.lock() {
+                    s.result = Some(result);
+                    s.done = true;
+                }
+                Ok(())
+            },
+        );
     }
 
     /// The "Add remote daemon" modal: a host:port field that connects on a
@@ -938,7 +943,7 @@ impl OpticalTab {
         self.rip_progress = Some(Arc::clone(&progress_arc));
         self.rip_running = true;
 
-        std::thread::spawn(move || {
+        rusty_backup::model::worker::spawn_guarded(Arc::clone(&progress_arc), "rip", move || {
             let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: optical rip");
             if let Err(e) = rusty_backup::optical::run_rip(config, Arc::clone(&progress_arc)) {
                 if let Ok(mut p) = progress_arc.lock() {
@@ -946,6 +951,7 @@ impl OpticalTab {
                     p.finished = true;
                 }
             }
+            Ok(())
         });
     }
 
@@ -967,19 +973,24 @@ impl OpticalTab {
         self.convert_progress = Some(Arc::clone(&progress_arc));
         self.convert_running = true;
 
-        std::thread::spawn(move || {
-            let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: optical rip to CHD");
-            let result =
-                rip_to_chd_worker(target, &chd_path, eject_after, chd_options, &progress_arc);
-            if let Err(e) = result {
-                if let Ok(mut p) = progress_arc.lock() {
-                    if !p.finished {
-                        p.error = Some(format!("{e:#}"));
-                        p.finished = true;
+        rusty_backup::model::worker::spawn_guarded(
+            Arc::clone(&progress_arc),
+            "rip to CHD",
+            move || {
+                let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: optical rip to CHD");
+                let result =
+                    rip_to_chd_worker(target, &chd_path, eject_after, chd_options, &progress_arc);
+                if let Err(e) = result {
+                    if let Ok(mut p) = progress_arc.lock() {
+                        if !p.finished {
+                            p.error = Some(format!("{e:#}"));
+                            p.finished = true;
+                        }
                     }
                 }
-            }
-        });
+                Ok(())
+            },
+        );
     }
 
     fn start_convert(&mut self, log: &mut LogStore) {
@@ -1021,26 +1032,31 @@ impl OpticalTab {
             None
         };
 
-        std::thread::spawn(move || {
-            let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: optical convert");
-            let result = run_conversion(
-                &input_path,
-                &output_path,
-                source_format,
-                output_format,
-                chd_options,
-                Arc::clone(&progress_arc),
-            );
+        rusty_backup::model::worker::spawn_guarded(
+            Arc::clone(&progress_arc),
+            "convert",
+            move || {
+                let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: optical convert");
+                let result = run_conversion(
+                    &input_path,
+                    &output_path,
+                    source_format,
+                    output_format,
+                    chd_options,
+                    Arc::clone(&progress_arc),
+                );
 
-            if let Err(e) = result {
-                if let Ok(mut p) = progress_arc.lock() {
-                    if !p.finished {
-                        p.error = Some(format!("{e:#}"));
-                        p.finished = true;
+                if let Err(e) = result {
+                    if let Ok(mut p) = progress_arc.lock() {
+                        if !p.finished {
+                            p.error = Some(format!("{e:#}"));
+                            p.finished = true;
+                        }
                     }
                 }
-            }
-        });
+                Ok(())
+            },
+        );
     }
 
     fn poll_progress(&mut self, log: &mut LogStore, progress_state: &mut ProgressState) {
@@ -1288,4 +1304,11 @@ fn rip_to_chd_worker(
     }
 
     Ok(())
+}
+
+impl rusty_backup::model::worker::WorkerStatus for ConnectStatus {
+    fn fail(&mut self, message: String) {
+        self.result = Some(Err(message));
+        self.done = true;
+    }
 }

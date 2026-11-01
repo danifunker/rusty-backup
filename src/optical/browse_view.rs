@@ -975,7 +975,7 @@ impl OpticalDiscBrowseView {
         self.extraction_progress = Some(Arc::clone(&progress));
         self.extraction_result = None;
 
-        std::thread::spawn(move || {
+        crate::model::worker::spawn_guarded(Arc::clone(&progress), "optical extract", move || {
             let _wake = crate::os::wakelock::acquire("Rusty Backup: extract optical disc files");
             let result = (|| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let info = if physical {
@@ -1012,6 +1012,7 @@ impl OpticalDiscBrowseView {
                     p.error = Some(format!("{msg:#}"));
                 }
             }
+            Ok(())
         });
     }
 
@@ -1446,3 +1447,5 @@ mod nkit_hint_tests {
         );
     }
 }
+
+crate::model::worker::finished_with_error!(ExtractionProgress);

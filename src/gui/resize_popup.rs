@@ -700,7 +700,7 @@ impl ResizePopup {
             path.display()
         ));
 
-        std::thread::spawn(move || {
+        rusty_backup::model::worker::spawn_guarded(Arc::clone(&status), "resize", move || {
             let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: partition resize");
             let status2 = Arc::clone(&status);
             let status3 = Arc::clone(&status);
@@ -776,6 +776,7 @@ impl ResizePopup {
                     s.error = Some(format!("{:#}", e));
                 }
             }
+            Ok(())
         });
     }
 }

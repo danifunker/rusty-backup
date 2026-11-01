@@ -44,6 +44,18 @@ pub fn spawn_guarded<S: WorkerStatus + Send + 'static>(
     std::thread::spawn(move || run_guarded(&status, what, body))
 }
 
+/// Spawn a thread no status watches (audio playback, the update check); a panic or error is logged.
+pub fn spawn_detached(
+    what: &'static str,
+    body: impl FnOnce() -> anyhow::Result<()> + Send + 'static,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        if let Err(super::job::Failure::Error(message)) = super::job::catch(what, body) {
+            log::error!("{message}");
+        }
+    })
+}
+
 /// Relay a cancel from one flag to another until `done`: for a step that
 /// runs with its own private progress object the GUI's Cancel never touches.
 pub fn forward_cancel(
@@ -63,6 +75,7 @@ pub fn forward_cancel(
 }
 
 /// `impl WorkerStatus` for a status whose end is `finished = true` plus an `error` message.
+#[macro_export]
 macro_rules! finished_with_error {
     ($($t:ty),+ $(,)?) => {$(
         impl $crate::model::worker::WorkerStatus for $t {
@@ -73,7 +86,7 @@ macro_rules! finished_with_error {
         }
     )+};
 }
-pub(crate) use finished_with_error;
+pub use crate::finished_with_error;
 
 impl WorkerStatus for crate::backup::BackupProgress {
     fn fail(&mut self, message: String) {
@@ -143,7 +156,10 @@ mod tests {
             .unwrap();
         let s = lock_status(&status);
         assert!(s.finished);
-        assert_eq!(s.error.as_deref(), Some("export worker panicked: short read"));
+        assert_eq!(
+            s.error.as_deref(),
+            Some("export worker panicked: short read")
+        );
     }
 
     #[test]

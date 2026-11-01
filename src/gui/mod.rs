@@ -54,7 +54,6 @@ use rusty_backup::update::{check_for_updates, RecentMode, UpdateConfig, UpdateIn
 use elevation_dialog::{ElevationAction, ElevationDialog};
 
 use std::sync::{Arc, Mutex};
-use std::thread;
 
 /// Create an `rfd::FileDialog` pre-configured to start in the real user's home
 /// directory. This ensures file dialogs open in the right place even when the
@@ -651,7 +650,7 @@ impl Default for RustyBackupApp {
         // Start update check in background
         let update_info = Arc::new(Mutex::new(None));
         let update_info_clone = Arc::clone(&update_info);
-        thread::spawn(move || {
+        rusty_backup::model::worker::spawn_detached("update check", move || {
             let config = UpdateConfig::load();
             if config.update_check.enabled {
                 let current_version = env!("APP_VERSION");
@@ -659,6 +658,7 @@ impl Default for RustyBackupApp {
                     *update_info_clone.lock().unwrap() = Some(info);
                 }
             }
+            Ok(())
         });
 
         Self {

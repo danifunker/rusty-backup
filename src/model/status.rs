@@ -191,5 +191,9 @@ crate::model::worker::finished_with_error!(
     ChdExpandStatus,
     SwabStatus,
     ExpandStatus,
-    RepackStatus
+    RepackStatus,
+    ResizeStatus,
+    ExtractionProgress,
+    CacheStatus,
+    InspectStatus,
 );

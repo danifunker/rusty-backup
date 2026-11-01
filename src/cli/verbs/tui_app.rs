@@ -2455,13 +2455,14 @@ impl CommanderState {
         let status = Arc::new(Mutex::new(ConnectStatus::default()));
         let st = Arc::clone(&status);
         let addr_worker = addr.clone();
-        std::thread::spawn(move || {
+        crate::model::worker::spawn_guarded(Arc::clone(&status), "remote connect", move || {
             let r = crate::model::remote_browser::RemoteBrowser::connect(&addr_worker, "/")
                 .map_err(|e| format!("{e:#}"));
             if let Ok(mut g) = st.lock() {
                 g.result = Some(r);
                 g.finished = true;
             }
+            Ok(())
         });
         self.pending_connect = Some((side, status));
         self.status = Some(format!("Connecting to {addr}..."));
@@ -6163,7 +6164,7 @@ impl App {
         };
         let progress = Arc::new(Mutex::new(crate::backup::BackupProgress::new()));
         let worker = Arc::clone(&progress);
-        std::thread::spawn(move || {
+        crate::model::worker::spawn_guarded(Arc::clone(&progress), "backup", move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 crate::backup::run_backup(config, Arc::clone(&worker))
             }));
@@ -6183,6 +6184,7 @@ impl App {
                 }
                 p.finished = true; // always unstick the poll loop
             }
+            Ok(())
         });
         let b = self.backup.as_mut().unwrap();
         b.run = Some(progress);
@@ -6722,7 +6724,7 @@ impl App {
         let worker = Arc::clone(&progress);
         // Move the .cbk temp-dir guard into the worker so it outlives the restore.
         let guard = self.restore.as_mut().and_then(|r| r.cbk_guard.take());
-        std::thread::spawn(move || {
+        crate::model::worker::spawn_guarded(Arc::clone(&progress), "restore", move || {
             let _guard = guard;
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 crate::restore::run_restore(config, Arc::clone(&worker))
@@ -6743,6 +6745,7 @@ impl App {
                 }
                 p.finished = true;
             }
+            Ok(())
         });
         let r = self.restore.as_mut().unwrap();
         r.run = Some(progress);
@@ -7181,7 +7184,7 @@ impl App {
         };
         let progress = Arc::new(Mutex::new(crate::optical::rip::RipProgress::new()));
         let worker = Arc::clone(&progress);
-        std::thread::spawn(move || {
+        crate::model::worker::spawn_guarded(Arc::clone(&progress), "rip", move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 crate::optical::rip::run_rip(config, Arc::clone(&worker))
             }));
@@ -7201,6 +7204,7 @@ impl App {
                 }
                 p.finished = true;
             }
+            Ok(())
         });
         let o = self.optical.as_mut().unwrap();
         o.run = Some(progress);
@@ -12072,6 +12076,14 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     Layout::horizontal([Constraint::Length(width)])
         .flex(Flex::Center)
         .split(vertical[0])[0]
+}
+
+#[cfg(feature = "remote")]
+impl crate::model::worker::WorkerStatus for ConnectStatus {
+    fn fail(&mut self, message: String) {
+        self.result = Some(Err(message));
+        self.finished = true;
+    }
 }
 
 #[cfg(test)]

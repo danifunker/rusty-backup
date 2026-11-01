@@ -1237,19 +1237,24 @@ impl CommanderPane {
         self.browser = None;
         self.open_phase = format!("Connecting to {addr}...");
         let msg = format!("[{}] connecting to {addr}...", self.side.label());
-        std::thread::spawn(move || {
-            let outcome = RemoteBrowser::connect(&addr, &root_path);
-            if let Ok(mut s) = status.lock() {
-                match outcome {
-                    Ok((browser, target)) => {
-                        s.browser = Some(browser);
-                        s.result = Some(Ok(target));
+        rusty_backup::model::worker::spawn_guarded(
+            Arc::clone(&status),
+            "remote connect",
+            move || {
+                let outcome = RemoteBrowser::connect(&addr, &root_path);
+                if let Ok(mut s) = status.lock() {
+                    match outcome {
+                        Ok((browser, target)) => {
+                            s.browser = Some(browser);
+                            s.result = Some(Ok(target));
+                        }
+                        Err(e) => s.result = Some(Err(format!("{e:#}"))),
                     }
-                    Err(e) => s.result = Some(Err(format!("{e:#}"))),
+                    s.done = true;
                 }
-                s.done = true;
-            }
-        });
+                Ok(())
+            },
+        );
         msg
     }
 
@@ -1273,7 +1278,7 @@ impl CommanderPane {
         self.pending_remote = Some(status.clone());
         self.open_phase = format!("Opening {path}...");
         let msg = format!("[{}] opening {path}...", self.side.label());
-        std::thread::spawn(move || {
+        rusty_backup::model::worker::spawn_guarded(Arc::clone(&status), "remote open", move || {
             let result = browser
                 .open_image(&path, partition, &opened_from)
                 .map_err(|e| format!("{e:#}"));
@@ -1282,6 +1287,7 @@ impl CommanderPane {
                 s.result = Some(result);
                 s.done = true;
             }
+            Ok(())
         });
         msg
     }
@@ -1301,14 +1307,19 @@ impl CommanderPane {
         self.pending_remote = Some(status.clone());
         self.open_phase = "Returning to host browser...".to_string();
         let msg = format!("[{}] closing image...", self.side.label());
-        std::thread::spawn(move || {
-            let result = browser.close_image().map_err(|e| format!("{e:#}"));
-            if let Ok(mut s) = status.lock() {
-                s.browser = Some(browser);
-                s.result = Some(result);
-                s.done = true;
-            }
-        });
+        rusty_backup::model::worker::spawn_guarded(
+            Arc::clone(&status),
+            "remote close",
+            move || {
+                let result = browser.close_image().map_err(|e| format!("{e:#}"));
+                if let Ok(mut s) = status.lock() {
+                    s.browser = Some(browser);
+                    s.result = Some(result);
+                    s.done = true;
+                }
+                Ok(())
+            },
+        );
         msg
     }
 
@@ -4084,4 +4095,11 @@ fn path_list<'a>(ui: &mut egui::Ui, id: &str, paths: impl Iterator<Item = &'a St
                 ui.monospace(p);
             }
         });
+}
+
+impl rusty_backup::model::worker::WorkerStatus for RemoteTransition {
+    fn fail(&mut self, message: String) {
+        self.result = Some(Err(message));
+        self.done = true;
+    }
 }

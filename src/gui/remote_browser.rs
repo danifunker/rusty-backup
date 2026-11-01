@@ -123,19 +123,24 @@ impl RemoteBrowsePanel {
         self.pending = Some(status.clone());
         self.error = None;
         self.phase = "Reopening remote browser...".to_string();
-        std::thread::spawn(move || {
-            let outcome = RemoteBrowser::from_connection(conn, "/");
-            if let Ok(mut s) = status.lock() {
-                match outcome {
-                    Ok((browser, target)) => {
-                        s.browser = Some(browser);
-                        s.result = Some(Ok(target));
+        rusty_backup::model::worker::spawn_guarded(
+            Arc::clone(&status),
+            "remote reopen",
+            move || {
+                let outcome = RemoteBrowser::from_connection(conn, "/");
+                if let Ok(mut s) = status.lock() {
+                    match outcome {
+                        Ok((browser, target)) => {
+                            s.browser = Some(browser);
+                            s.result = Some(Ok(target));
+                        }
+                        Err(e) => s.result = Some(Err(format!("{e:#}"))),
                     }
-                    Err(e) => s.result = Some(Err(format!("{e:#}"))),
+                    s.done = true;
                 }
-                s.done = true;
-            }
-        });
+                Ok(())
+            },
+        );
     }
 
     /// True when a remote session is live or being established — the Inspect tab
@@ -418,19 +423,24 @@ impl RemoteBrowsePanel {
         self.error = None;
         self.phase = format!("Connecting to {addr}...");
         let msg = format!("connecting to {addr}...");
-        std::thread::spawn(move || {
-            let outcome = RemoteBrowser::connect(&addr, "/");
-            if let Ok(mut s) = status.lock() {
-                match outcome {
-                    Ok((browser, target)) => {
-                        s.browser = Some(browser);
-                        s.result = Some(Ok(target));
+        rusty_backup::model::worker::spawn_guarded(
+            Arc::clone(&status),
+            "remote connect",
+            move || {
+                let outcome = RemoteBrowser::connect(&addr, "/");
+                if let Ok(mut s) = status.lock() {
+                    match outcome {
+                        Ok((browser, target)) => {
+                            s.browser = Some(browser);
+                            s.result = Some(Ok(target));
+                        }
+                        Err(e) => s.result = Some(Err(format!("{e:#}"))),
                     }
-                    Err(e) => s.result = Some(Err(format!("{e:#}"))),
+                    s.done = true;
                 }
-                s.done = true;
-            }
-        });
+                Ok(())
+            },
+        );
         msg
     }
 
@@ -481,5 +491,12 @@ impl RemoteBrowsePanel {
                 }
             }
         }
+    }
+}
+
+impl rusty_backup::model::worker::WorkerStatus for RemoteTransition {
+    fn fail(&mut self, message: String) {
+        self.result = Some(Err(message));
+        self.done = true;
     }
 }

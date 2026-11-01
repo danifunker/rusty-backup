@@ -2394,28 +2394,34 @@ impl BackupTab {
             display,
             is_device: true,
         };
-        std::thread::spawn(move || {
-            let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: remote drive backup");
-            let progress_for_panic = Arc::clone(&progress_arc);
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                rusty_backup::backup::run_backup_from(source, config, Arc::clone(&progress_arc))
-            }));
-            match result {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    if let Ok(mut p) = progress_for_panic.lock() {
-                        p.error = Some(format!("{e:#}"));
-                        p.finished = true;
+        rusty_backup::model::worker::spawn_guarded(
+            Arc::clone(&progress_arc),
+            "remote backup",
+            move || {
+                let _wake =
+                    rusty_backup::os::wakelock::acquire("Rusty Backup: remote drive backup");
+                let progress_for_panic = Arc::clone(&progress_arc);
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    rusty_backup::backup::run_backup_from(source, config, Arc::clone(&progress_arc))
+                }));
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        if let Ok(mut p) = progress_for_panic.lock() {
+                            p.error = Some(format!("{e:#}"));
+                            p.finished = true;
+                        }
+                    }
+                    Err(_) => {
+                        if let Ok(mut p) = progress_for_panic.lock() {
+                            p.error = Some("remote backup worker panicked".to_string());
+                            p.finished = true;
+                        }
                     }
                 }
-                Err(_) => {
-                    if let Ok(mut p) = progress_for_panic.lock() {
-                        p.error = Some("remote backup worker panicked".to_string());
-                        p.finished = true;
-                    }
-                }
-            }
-        });
+                Ok(())
+            },
+        );
     }
 
     /// Assemble the per-partition sizing inputs shared by the local and remote
@@ -2654,44 +2660,49 @@ impl BackupTab {
             config.destination_dir.join(&config.backup_name).display()
         ));
 
-        std::thread::spawn(move || {
-            let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: disk backup");
-            // Catch panics from `run_backup` so the GUI poll loop always
-            // observes `finished = true`. Without this, a panic in a
-            // sub-thread (or in any of the producer/consumer threads
-            // run_backup spawns) silently kills the worker, leaving the
-            // GUI stuck at whatever progress was last written. The panic
-            // message is preserved as the displayed error so we can
-            // diagnose it from the log instead of having to attach a
-            // debugger.
-            let progress_for_panic = Arc::clone(&progress_arc);
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                rusty_backup::backup::run_backup(config, Arc::clone(&progress_arc))
-            }));
-            match result {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    if let Ok(mut p) = progress_for_panic.lock() {
-                        p.error = Some(format!("{e:#}"));
-                        p.finished = true;
+        rusty_backup::model::worker::spawn_guarded(
+            Arc::clone(&progress_arc),
+            "backup",
+            move || {
+                let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: disk backup");
+                // Catch panics from `run_backup` so the GUI poll loop always
+                // observes `finished = true`. Without this, a panic in a
+                // sub-thread (or in any of the producer/consumer threads
+                // run_backup spawns) silently kills the worker, leaving the
+                // GUI stuck at whatever progress was last written. The panic
+                // message is preserved as the displayed error so we can
+                // diagnose it from the log instead of having to attach a
+                // debugger.
+                let progress_for_panic = Arc::clone(&progress_arc);
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    rusty_backup::backup::run_backup(config, Arc::clone(&progress_arc))
+                }));
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        if let Ok(mut p) = progress_for_panic.lock() {
+                            p.error = Some(format!("{e:#}"));
+                            p.finished = true;
+                        }
+                    }
+                    Err(panic_payload) => {
+                        let msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                            (*s).to_string()
+                        } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                            s.clone()
+                        } else {
+                            format!("<non-string panic payload: {:?}>", panic_payload.type_id())
+                        };
+                        eprintln!("[backup-thread] PANIC: {msg}");
+                        if let Ok(mut p) = progress_for_panic.lock() {
+                            p.error = Some(format!("backup worker panicked: {msg}"));
+                            p.finished = true;
+                        }
                     }
                 }
-                Err(panic_payload) => {
-                    let msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
-                        (*s).to_string()
-                    } else if let Some(s) = panic_payload.downcast_ref::<String>() {
-                        s.clone()
-                    } else {
-                        format!("<non-string panic payload: {:?}>", panic_payload.type_id())
-                    };
-                    eprintln!("[backup-thread] PANIC: {msg}");
-                    if let Ok(mut p) = progress_for_panic.lock() {
-                        p.error = Some(format!("backup worker panicked: {msg}"));
-                        p.finished = true;
-                    }
-                }
-            }
-        });
+                Ok(())
+            },
+        );
     }
 
     fn poll_progress(&mut self, ctx: &mut TabContext, progress_state: &mut ProgressState) {

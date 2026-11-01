@@ -2585,28 +2585,33 @@ impl InspectTab {
             display,
             is_device: false,
         };
-        std::thread::spawn(move || {
-            let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: remote backup");
-            let progress_for_panic = Arc::clone(&progress);
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                rusty_backup::backup::run_backup_from(source, config, Arc::clone(&progress))
-            }));
-            match result {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    if let Ok(mut p) = progress_for_panic.lock() {
-                        p.error = Some(format!("{e:#}"));
-                        p.finished = true;
+        rusty_backup::model::worker::spawn_guarded(
+            Arc::clone(&progress),
+            "remote backup",
+            move || {
+                let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: remote backup");
+                let progress_for_panic = Arc::clone(&progress);
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    rusty_backup::backup::run_backup_from(source, config, Arc::clone(&progress))
+                }));
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        if let Ok(mut p) = progress_for_panic.lock() {
+                            p.error = Some(format!("{e:#}"));
+                            p.finished = true;
+                        }
+                    }
+                    Err(_) => {
+                        if let Ok(mut p) = progress_for_panic.lock() {
+                            p.error = Some("remote backup worker panicked".to_string());
+                            p.finished = true;
+                        }
                     }
                 }
-                Err(_) => {
-                    if let Ok(mut p) = progress_for_panic.lock() {
-                        p.error = Some("remote backup worker panicked".to_string());
-                        p.finished = true;
-                    }
-                }
-            }
-        });
+                Ok(())
+            },
+        );
     }
 
     /// Drain log messages from the remote-backup worker into the global log
@@ -2966,7 +2971,7 @@ impl InspectTab {
         }));
         self.inspect_status = Some(Arc::clone(&status));
 
-        std::thread::spawn(move || {
+        rusty_backup::model::worker::spawn_guarded(Arc::clone(&status), "inspect", move || {
             // Helpers that post into the shared status without blocking the GUI.
             let push_log = |msg: String| {
                 if let Ok(mut s) = status.lock() {
@@ -3021,7 +3026,7 @@ impl InspectTab {
                         // context, so "(authopen failed)" arrived with the reason it
                         // failed discarded.
                         finish_err(format!("Cannot open {}: {e:#}", path.display()));
-                        return;
+                        return Ok(());
                     }
                 };
                 let (f, g) = elevated.into_parts();
@@ -3038,7 +3043,7 @@ impl InspectTab {
                         Ok(r) => Box::new(r),
                         Err(e) => {
                             finish_err(format!("Cannot open remote image {rpath}: {e:#}"));
-                            return;
+                            return Ok(());
                         }
                     }
                 } else if uses_streaming_reader {
@@ -3046,7 +3051,7 @@ impl InspectTab {
                         Ok(r) => r,
                         Err(e) => {
                             finish_err(format!("Cannot open {}: {e:#}", path.display()));
-                            return;
+                            return Ok(());
                         }
                     }
                 } else {
@@ -3058,7 +3063,7 @@ impl InspectTab {
                         Ok(f) => Box::new(BufReader::new(f)),
                         Err(e) => {
                             finish_err(format!("Cannot clone file handle: {e}"));
-                            return;
+                            return Ok(());
                         }
                     }
                 };
@@ -3685,6 +3690,7 @@ impl InspectTab {
                     }
                 }
             }
+            Ok(())
         });
     }
 
@@ -5473,17 +5479,22 @@ impl InspectTab {
         self.cache_rate.reset();
 
         let data_path = data_path.to_path_buf();
-        std::thread::spawn(move || {
-            let _wake =
-                rusty_backup::os::wakelock::acquire("Rusty Backup: build zstd seekable cache");
-            let result = create_seekable_cache_from_zstd(&data_path, &cache_path, &status);
-            if let Ok(mut s) = status.lock() {
-                s.finished = true;
-                if let Err(e) = result {
-                    s.error = Some(format!("{e:#}"));
+        rusty_backup::model::worker::spawn_guarded(
+            Arc::clone(&status),
+            "seekable-zstd cache",
+            move || {
+                let _wake =
+                    rusty_backup::os::wakelock::acquire("Rusty Backup: build zstd seekable cache");
+                let result = create_seekable_cache_from_zstd(&data_path, &cache_path, &status);
+                if let Ok(mut s) = status.lock() {
+                    s.finished = true;
+                    if let Err(e) = result {
+                        s.error = Some(format!("{e:#}"));
+                    }
                 }
-            }
-        });
+                Ok(())
+            },
+        );
     }
 
     fn poll_block_cache_scan(&mut self, ctx: &mut TabContext) {

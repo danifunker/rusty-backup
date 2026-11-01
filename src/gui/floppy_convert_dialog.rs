@@ -369,36 +369,41 @@ impl FloppyConvertDialog {
         }));
         let status_for_worker = Arc::clone(&status);
         let target_label = self.target.label();
-        std::thread::spawn(move || {
-            if let Ok(mut s) = status_for_worker.lock() {
-                s.current_step = "Decoding source...".to_string();
-            }
-            // Sanity check: when the output extension doesn't match the radio
-            // selection, prefer the radio selection (the user clicked it last).
-            // Falling back through `floppy_kind_from_extension` would mismatch.
-            let result = convert_floppy_container(&source, &output, target_kind);
-            if let Ok(mut s) = status_for_worker.lock() {
-                match result {
-                    Ok(report) => {
-                        s.summary = Some(format!(
-                            "Converted to {} ({}, {} bytes)",
-                            target_label,
-                            report.media.display_label(),
-                            report.bytes_written
-                        ));
-                        s.log_messages.push(format!(
-                            "Wrote {} bytes to {}",
-                            report.bytes_written,
-                            output.display()
-                        ));
-                    }
-                    Err(e) => {
-                        s.error = Some(format!("{e:#}"));
-                    }
+        rusty_backup::model::worker::spawn_guarded(
+            Arc::clone(&status),
+            "floppy convert",
+            move || {
+                if let Ok(mut s) = status_for_worker.lock() {
+                    s.current_step = "Decoding source...".to_string();
                 }
-                s.finished = true;
-            }
-        });
+                // Sanity check: when the output extension doesn't match the radio
+                // selection, prefer the radio selection (the user clicked it last).
+                // Falling back through `floppy_kind_from_extension` would mismatch.
+                let result = convert_floppy_container(&source, &output, target_kind);
+                if let Ok(mut s) = status_for_worker.lock() {
+                    match result {
+                        Ok(report) => {
+                            s.summary = Some(format!(
+                                "Converted to {} ({}, {} bytes)",
+                                target_label,
+                                report.media.display_label(),
+                                report.bytes_written
+                            ));
+                            s.log_messages.push(format!(
+                                "Wrote {} bytes to {}",
+                                report.bytes_written,
+                                output.display()
+                            ));
+                        }
+                        Err(e) => {
+                            s.error = Some(format!("{e:#}"));
+                        }
+                    }
+                    s.finished = true;
+                }
+                Ok(())
+            },
+        );
         self.status = Some(status);
     }
 }
@@ -412,3 +417,5 @@ const _: fn() = || {
     // `floppy_kind_from_extension` is referenced so the import isn't dead.
     let _: fn(&std::path::Path) -> anyhow::Result<ContainerKind> = floppy_kind_from_extension;
 };
+
+rusty_backup::model::worker::finished_with_error!(FloppyConvertStatus);

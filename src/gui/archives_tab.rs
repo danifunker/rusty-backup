@@ -199,36 +199,41 @@ impl ArchivesTab {
             format.label(),
         ));
 
-        std::thread::spawn(move || {
-            let result = {
-                let progress_status = status.clone();
-                let log_status = status.clone();
-                let progress = move |done: usize, total: usize, name: &str| {
-                    if let Ok(mut s) = progress_status.lock() {
-                        s.done = done;
-                        s.total = total;
-                        s.current = name.to_string();
+        rusty_backup::model::worker::spawn_guarded(
+            Arc::clone(&status),
+            "archive extract",
+            move || {
+                let result = {
+                    let progress_status = status.clone();
+                    let log_status = status.clone();
+                    let progress = move |done: usize, total: usize, name: &str| {
+                        if let Ok(mut s) = progress_status.lock() {
+                            s.done = done;
+                            s.total = total;
+                            s.current = name.to_string();
+                        }
+                    };
+                    let log_cb = move |line: String| {
+                        if let Ok(mut s) = log_status.lock() {
+                            s.log_lines.push(line);
+                        }
+                    };
+                    if selected_only {
+                        let keep = move |i: usize| selected.get(i).copied().unwrap_or(true);
+                        extract::extract_filtered(
+                            &bytes, &archive, &dest, format, keep, progress, log_cb,
+                        )
+                    } else {
+                        extract::extract_all(&bytes, &archive, &dest, format, progress, log_cb)
                     }
                 };
-                let log_cb = move |line: String| {
-                    if let Ok(mut s) = log_status.lock() {
-                        s.log_lines.push(line);
-                    }
-                };
-                if selected_only {
-                    let keep = move |i: usize| selected.get(i).copied().unwrap_or(true);
-                    extract::extract_filtered(
-                        &bytes, &archive, &dest, format, keep, progress, log_cb,
-                    )
-                } else {
-                    extract::extract_all(&bytes, &archive, &dest, format, progress, log_cb)
+                if let Ok(mut s) = status.lock() {
+                    s.finished = true;
+                    s.result = Some(result.map_err(|e| format!("{e}")));
                 }
-            };
-            if let Ok(mut s) = status.lock() {
-                s.finished = true;
-                s.result = Some(result.map_err(|e| format!("{e}")));
-            }
-        });
+                Ok(())
+            },
+        );
     }
 
     /// Poll the worker; move completion into the log. Returns true while a job
@@ -598,5 +603,12 @@ fn human_size(bytes: u64) -> String {
         format!("{bytes} B")
     } else {
         format!("{v:.1} {}", UNITS[u])
+    }
+}
+
+impl rusty_backup::model::worker::WorkerStatus for ExtractStatus {
+    fn fail(&mut self, message: String) {
+        self.result = Some(Err(message));
+        self.finished = true;
     }
 }

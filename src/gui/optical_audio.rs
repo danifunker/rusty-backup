@@ -69,7 +69,10 @@ impl AudioPlayback {
 
         // Detached: the worker owns its rodio stream and the disc reader,
         // and tears itself down when it sees the stop flag or finishes.
-        thread::spawn(move || run(image_path, track, &stop_bg, &state_bg, &play_start_bg));
+        rusty_backup::model::worker::spawn_detached("audio playback", move || {
+            run(image_path, track, &stop_bg, &state_bg, &play_start_bg);
+            Ok(())
+        });
 
         Self {
             track,

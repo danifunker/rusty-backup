@@ -2449,7 +2449,7 @@ impl BrowseView {
         self.extraction_progress = Some(Arc::clone(&progress));
         self.extraction_result = None;
 
-        std::thread::spawn(move || {
+        rusty_backup::model::worker::spawn_guarded(Arc::clone(&progress), "extract", move || {
             let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: extract files");
             let result = run_extraction(
                 &session,
@@ -2468,6 +2468,7 @@ impl BrowseView {
                     p.error = Some(format!("{e}"));
                 }
             }
+            Ok(())
         });
     }
 
@@ -2820,31 +2821,36 @@ impl BrowseView {
             cancel_requested: false,
         }));
         let progress_thread = Arc::clone(&progress);
-        std::thread::spawn(move || {
-            let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: CHD diff flatten");
-            let cancel = {
-                let p = Arc::clone(&progress_thread);
-                move || p.lock().map(|g| g.cancel_requested).unwrap_or(false)
-            };
-            let result = chd_edit::flatten_to_parent(
-                &parent_path,
-                &diff_path,
-                None,
-                &mut |bytes| {
-                    if let Ok(mut p) = progress_thread.lock() {
-                        p.current = bytes;
+        rusty_backup::model::worker::spawn_guarded(
+            Arc::clone(&progress),
+            "CHD flatten",
+            move || {
+                let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: CHD diff flatten");
+                let cancel = {
+                    let p = Arc::clone(&progress_thread);
+                    move || p.lock().map(|g| g.cancel_requested).unwrap_or(false)
+                };
+                let result = chd_edit::flatten_to_parent(
+                    &parent_path,
+                    &diff_path,
+                    None,
+                    &mut |bytes| {
+                        if let Ok(mut p) = progress_thread.lock() {
+                            p.current = bytes;
+                        }
+                    },
+                    &cancel,
+                    &mut |msg| log::info!("{msg}"),
+                );
+                if let Ok(mut p) = progress_thread.lock() {
+                    p.finished = true;
+                    if let Err(e) = result {
+                        p.error = Some(format!("{e:#}"));
                     }
-                },
-                &cancel,
-                &mut |msg| log::info!("{msg}"),
-            );
-            if let Ok(mut p) = progress_thread.lock() {
-                p.finished = true;
-                if let Err(e) = result {
-                    p.error = Some(format!("{e:#}"));
                 }
-            }
-        });
+                Ok(())
+            },
+        );
         self.chd_flatten_progress = Some(progress);
     }
 
@@ -2953,51 +2959,56 @@ impl BrowseView {
             out_path: path.clone(),
         }));
         let progress_thread = Arc::clone(&progress);
-        std::thread::spawn(move || {
-            let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: tar export");
-            let result = (|| -> anyhow::Result<()> {
-                let mut fs = session
-                    .open()
-                    .map_err(|e| anyhow::anyhow!("opening filesystem: {e}"))?;
-                // Re-fetch the root fresh on the worker's own fs instance; a
-                // subtree/file uses the selected entry directly (its on-disk
-                // identity is stable across fs instances of the same image).
-                let root = if whole_volume {
-                    fs.root()
-                        .map_err(|e| anyhow::anyhow!("reading root: {e}"))?
-                } else {
-                    target
-                };
-                let file = std::fs::File::create(&path)
-                    .map_err(|e| anyhow::anyhow!("creating {}: {e}", path.display()))?;
-                let out = std::io::BufWriter::new(file);
-                let opts = fs_tar::tar_export::TarExportOptions::default();
-                let cb = |s: &fs_tar::tar_export::TarExportStats| {
-                    if let Ok(mut p) = progress_thread.lock() {
-                        p.files = s.files;
-                        p.dirs = s.dirs;
-                        p.symlinks = s.symlinks;
-                        p.bytes = s.total_bytes;
+        rusty_backup::model::worker::spawn_guarded(
+            Arc::clone(&progress),
+            "tar export",
+            move || {
+                let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: tar export");
+                let result = (|| -> anyhow::Result<()> {
+                    let mut fs = session
+                        .open()
+                        .map_err(|e| anyhow::anyhow!("opening filesystem: {e}"))?;
+                    // Re-fetch the root fresh on the worker's own fs instance; a
+                    // subtree/file uses the selected entry directly (its on-disk
+                    // identity is stable across fs instances of the same image).
+                    let root = if whole_volume {
+                        fs.root()
+                            .map_err(|e| anyhow::anyhow!("reading root: {e}"))?
+                    } else {
+                        target
+                    };
+                    let file = std::fs::File::create(&path)
+                        .map_err(|e| anyhow::anyhow!("creating {}: {e}", path.display()))?;
+                    let out = std::io::BufWriter::new(file);
+                    let opts = fs_tar::tar_export::TarExportOptions::default();
+                    let cb = |s: &fs_tar::tar_export::TarExportStats| {
+                        if let Ok(mut p) = progress_thread.lock() {
+                            p.files = s.files;
+                            p.dirs = s.dirs;
+                            p.symlinks = s.symlinks;
+                            p.bytes = s.total_bytes;
+                        }
+                    };
+                    fs_tar::tar_export::export_tar(
+                        &mut *fs,
+                        &root,
+                        &archive_prefix,
+                        out,
+                        compression,
+                        &opts,
+                        &cb,
+                    )?;
+                    Ok(())
+                })();
+                if let Ok(mut p) = progress_thread.lock() {
+                    p.finished = true;
+                    if let Err(e) = result {
+                        p.error = Some(format!("{e:#}"));
                     }
-                };
-                fs_tar::tar_export::export_tar(
-                    &mut *fs,
-                    &root,
-                    &archive_prefix,
-                    out,
-                    compression,
-                    &opts,
-                    &cb,
-                )?;
-                Ok(())
-            })();
-            if let Ok(mut p) = progress_thread.lock() {
-                p.finished = true;
-                if let Err(e) = result {
-                    p.error = Some(format!("{e:#}"));
                 }
-            }
-        });
+                Ok(())
+            },
+        );
         self.tar_export_progress = Some(progress);
     }
 
@@ -5829,7 +5840,7 @@ impl BrowseView {
             fs: None,
         }));
         let status_thread = Arc::clone(&status);
-        std::thread::spawn(move || {
+        rusty_backup::model::worker::spawn_guarded(Arc::clone(&status), "tree", move || {
             let mut fs = fs;
             let result = if show_ids {
                 rusty_backup::fs::tree::format_tree_with_ids(&mut *fs)
@@ -5844,6 +5855,7 @@ impl BrowseView {
                 g.fs = Some(fs);
                 g.finished = true;
             }
+            Ok(())
         });
         self.pending_tree_generation = self.fs_generation;
         self.pending_tree = Some(status);
@@ -6551,3 +6563,9 @@ fn walk_fs_to_input_nodes(
         Ok(Vec::new())
     }
 }
+
+rusty_backup::model::worker::finished_with_error!(
+    ChdFlattenProgress,
+    TarExportProgress,
+    TreeStatus
+);
