@@ -162,6 +162,8 @@ pub struct BrowseView {
     repair_report: Option<rusty_backup::fs::RepairReport>,
     /// A running Check or Repair on this volume.
     fsck_job: Option<rusty_backup::model::job::Job<BrowseFsck>>,
+    /// Opening a file in the text editor, or saving it back.
+    editor_job: Option<rusty_backup::model::job::Job<EditorStep>>,
     /// Folder listings and previews waiting for the reader, one at a time.
     read_queue: std::collections::VecDeque<FsRead>,
     /// The read in flight, and the filesystem generation it borrowed from.
@@ -497,6 +499,7 @@ impl Default for BrowseView {
             show_repair_confirm: false,
             repair_report: None,
             fsck_job: None,
+            editor_job: None,
             read_queue: std::collections::VecDeque::new(),
             read_job: None,
             export_job: None,
@@ -990,6 +993,16 @@ impl BrowseView {
         }
         self.poll_fsck_job();
         self.render_fsck_job(ui);
+        self.poll_editor_job();
+        if let Some(job) = &self.editor_job {
+            let snap = job.snapshot();
+            egui::Window::new(snap.label.clone())
+                .collapsible(false)
+                .resizable(false)
+                .show(ui.ctx(), |ui| {
+                    super::progress::show_job(ui, &snap);
+                });
+        }
         self.poll_reads();
         if let Some((job, _)) = &self.read_job {
             let snap = job.snapshot();
@@ -4669,48 +4682,67 @@ impl BrowseView {
     /// Render the unsaved changes confirmation dialog.
     /// Open a text file in the editor window, decoding it the way the CLI and
     /// TUI editors do.
+    /// Open a file in the text editor as a job (the editable open decodes a whole container).
     fn open_text_editor(&mut self, path: &str, name: &str) {
-        use rusty_backup::model::text_edit::{decode_for_edit, TextEditError};
-        const LIMIT: usize = 1024 * 1024;
+        if self.editor_job.is_some() {
+            return;
+        }
+        let session = self.session.clone();
+        let (path, name) = (path.to_string(), name.to_string());
+        self.editor_job = Some(rusty_backup::model::job::Job::spawn(
+            "Opening the file...",
+            Arc::new(super::ui_logger::EguiWake),
+            move |job| {
+                job.set_can_cancel(false);
+                Ok(EditorStep::Opened(load_editor_text(&session, &path, &name)))
+            },
+        ));
+    }
 
-        let (mut fs, _commit) = match self.session.open_editable() {
-            Ok(pair) => pair,
-            Err(e) => {
-                self.edit_result = Some(format!("Cannot open for editing: {e}"));
-                return;
-            }
+    /// Apply a finished editor open or save.
+    fn poll_editor_job(&mut self) {
+        use rusty_backup::model::job::Status;
+        let Some(job) = &self.editor_job else {
+            return;
         };
-        let entry = match rusty_backup::cli::verbs::ls::resolve_path(fs.as_filesystem_mut(), path) {
-            Ok(e) => e,
-            Err(e) => {
-                self.edit_result = Some(format!("Cannot find {path}: {e}"));
-                return;
+        let snap = job.snapshot();
+        if snap.is_running() {
+            return;
+        }
+        let step = job.take_result();
+        self.editor_job = None;
+        match (snap.status, step) {
+            (Status::Done, Some(EditorStep::Opened(Ok(ed)))) => self.text_editor = Some(ed),
+            (Status::Done, Some(EditorStep::Opened(Err(msg)))) => self.edit_result = Some(msg),
+            (Status::Done, Some(EditorStep::Saved(ed, Ok((n, saved))))) => {
+                self.edit_result = Some(format!("Saved {} ({n} bytes)", ed.name));
+                // Drop the cached read so the preview shows what is now on
+                // disk rather than what was there when it was opened.
+                self.content = None;
+                self.invalidate_all_caches();
+                self.invalidate_cached_fs();
+                // The invalidation dropped the selection; put the saved file
+                // back so the preview shows what was written, not "Loading...".
+                if let Some(entry) = saved {
+                    self.select_file(&entry);
+                }
+                // A save is a write like any applied edit: the CHD diff is
+                // dirty and an archive session must recompress or lose it.
+                if self.chd_edit.is_some() {
+                    self.chd_diff_dirty = true;
+                }
+                if self.archive_edit_ctx.is_some() {
+                    self.start_archive_compress();
+                }
             }
-        };
-        let fs_type = fs.fs_type().to_string();
-        let bytes = match fs.read_file(&entry, LIMIT) {
-            Ok(b) => b,
-            Err(e) => {
-                self.edit_result = Some(format!("Cannot read {path}: {e}"));
-                return;
+            (Status::Done, Some(EditorStep::Saved(mut ed, Err(e)))) => {
+                // Keep the window open with the text intact: losing an edit
+                // to a failed save is the worst outcome here.
+                ed.status = Some(e);
+                self.text_editor = Some(ed);
             }
-        };
-        match decode_for_edit(&bytes, &fs_type, None) {
-            Ok(decoded) => {
-                self.text_editor = Some(GuiTextEditor {
-                    path: path.to_string(),
-                    name: name.to_string(),
-                    text: decoded.text,
-                    shape: decoded.shape,
-                    original_ending: decoded.shape.ending,
-                    dirty: false,
-                    status: None,
-                });
-            }
-            Err(TextEditError::NotText { reason }) => {
-                self.edit_result = Some(format!("{name} is not a text file ({reason})"));
-            }
-            Err(e) => self.edit_result = Some(format!("{name}: {e}")),
+            (Status::Failed(e), _) => self.edit_result = Some(format!("Error: {e}")),
+            _ => {}
         }
     }
 
@@ -4798,75 +4830,24 @@ impl BrowseView {
                 });
             });
 
-        if save {
-            match self.save_text_editor(&ed) {
-                Ok(n) => {
-                    self.edit_result = Some(format!("Saved {} ({n} bytes)", ed.name));
-                    // Drop the cached read so the preview shows what is now on
-                    // disk rather than what was there when it was opened.
-                    self.content = None;
-                    self.invalidate_all_caches();
-                    self.invalidate_cached_fs();
-                    // The invalidation dropped the selection; put the saved file
-                    // back so the preview shows what was written, not "Loading...".
-                    if let Some(mut fs) = self.take_or_open_fs() {
-                        let saved =
-                            rusty_backup::cli::verbs::ls::resolve_path(fs.as_mut(), &ed.path).ok();
-                        self.return_fs(fs);
-                        if let Some(entry) = saved {
-                            self.select_file(&entry);
-                        }
-                    }
-                    // A save is a write like any applied edit: the CHD diff is
-                    // dirty and an archive session must recompress or lose it.
-                    if self.chd_edit.is_some() {
-                        self.chd_diff_dirty = true;
-                    }
-                    if self.archive_edit_ctx.is_some() {
-                        self.start_archive_compress();
-                    }
-                    return; // window closes
-                }
-                Err(e) => {
-                    // Keep the window open with the text intact: losing an edit
-                    // to a failed save is the worst outcome here.
-                    ed.status = Some(format!("{e:#}"));
-                    self.text_editor = Some(ed);
-                    return;
-                }
-            }
+        if save && self.editor_job.is_none() {
+            // The editor rides to the worker and back: reopened on a failure, closed on success.
+            self.edit_free_space = None;
+            let session = self.session.clone();
+            self.editor_job = Some(rusty_backup::model::job::Job::spawn(
+                "Saving the file...",
+                Arc::new(super::ui_logger::EguiWake),
+                move |job| {
+                    job.set_can_cancel(false);
+                    let result = save_editor_text(&session, &ed).map_err(|e| format!("{e:#}"));
+                    Ok(EditorStep::Saved(ed, result))
+                },
+            ));
+            return;
         }
         if keep_open {
             self.text_editor = Some(ed);
         }
-    }
-
-    /// Encode and write the editor's contents through the shared replace path.
-    fn save_text_editor(&mut self, ed: &GuiTextEditor) -> anyhow::Result<usize> {
-        self.edit_free_space = None;
-        use rusty_backup::model::text_edit::encode_after_edit;
-        let bytes = encode_after_edit(&ed.text, &ed.shape, false)
-            .map_err(|e| anyhow::anyhow!("cannot save as {}: {e}", ed.shape.encoding.label()))?;
-
-        let (mut fs, commit) = self.session.open_editable()?;
-        let (parent, leaf) =
-            rusty_backup::cli::verbs::ls::resolve_parent(fs.as_filesystem_mut(), &ed.path)?;
-        let mut reader = std::io::Cursor::new(bytes.clone());
-        rusty_backup::fs::replace::create_or_replace(
-            fs.as_mut(),
-            &parent,
-            &leaf,
-            &mut reader,
-            bytes.len() as u64,
-            &disk_core::filesystem::CreateFileOptions::default(),
-            rusty_backup::fs::replace::ReplacePolicy::replace(),
-        )
-        .map_err(|e| anyhow::anyhow!("writing {}: {e}", ed.path))?;
-        fs.sync_metadata()
-            .map_err(|e| anyhow::anyhow!("sync_metadata: {e}"))?;
-        drop(fs);
-        commit.commit()?;
-        Ok(bytes.len())
     }
 
     /// One review of every name collision, before any write happens.
@@ -7082,3 +7063,81 @@ fn read_mac_archive(
 
 /// A finished read, and the filesystem it borrowed (when it had one to give back).
 type FsReadOut = (Option<Box<dyn Filesystem>>, FsReadDone);
+
+/// A text-editor open or save, finished.
+enum EditorStep {
+    Opened(Result<GuiTextEditor, String>),
+    /// The editor, and the bytes written plus the saved file's entry (to reselect it).
+    Saved(
+        GuiTextEditor,
+        Result<(usize, Option<Box<FileEntry>>), String>,
+    ),
+}
+
+/// Read `path` for the editor and decode it as text; the error is the status-line message.
+fn load_editor_text(
+    session: &BrowseSession,
+    path: &str,
+    name: &str,
+) -> Result<GuiTextEditor, String> {
+    use rusty_backup::model::text_edit::{decode_for_edit, TextEditError};
+    const LIMIT: usize = 1024 * 1024;
+    let (mut fs, _commit) = session
+        .open_editable()
+        .map_err(|e| format!("Cannot open for editing: {e}"))?;
+    let entry = rusty_backup::cli::verbs::ls::resolve_path(fs.as_filesystem_mut(), path)
+        .map_err(|e| format!("Cannot find {path}: {e}"))?;
+    let fs_type = fs.fs_type().to_string();
+    let bytes = fs
+        .read_file(&entry, LIMIT)
+        .map_err(|e| format!("Cannot read {path}: {e}"))?;
+    match decode_for_edit(&bytes, &fs_type, None) {
+        Ok(decoded) => Ok(GuiTextEditor {
+            path: path.to_string(),
+            name: name.to_string(),
+            text: decoded.text,
+            shape: decoded.shape,
+            original_ending: decoded.shape.ending,
+            dirty: false,
+            status: None,
+        }),
+        Err(TextEditError::NotText { reason }) => {
+            Err(format!("{name} is not a text file ({reason})"))
+        }
+        Err(e) => Err(format!("{name}: {e}")),
+    }
+}
+
+/// Encode and write the editor's contents through the shared replace path, then find the saved file again.
+fn save_editor_text(
+    session: &BrowseSession,
+    ed: &GuiTextEditor,
+) -> anyhow::Result<(usize, Option<Box<FileEntry>>)> {
+    use rusty_backup::model::text_edit::encode_after_edit;
+    let bytes = encode_after_edit(&ed.text, &ed.shape, false)
+        .map_err(|e| anyhow::anyhow!("cannot save as {}: {e}", ed.shape.encoding.label()))?;
+    let (mut fs, commit) = session.open_editable()?;
+    let (parent, leaf) =
+        rusty_backup::cli::verbs::ls::resolve_parent(fs.as_filesystem_mut(), &ed.path)?;
+    let mut reader = std::io::Cursor::new(bytes.clone());
+    rusty_backup::fs::replace::create_or_replace(
+        fs.as_mut(),
+        &parent,
+        &leaf,
+        &mut reader,
+        bytes.len() as u64,
+        &disk_core::filesystem::CreateFileOptions::default(),
+        rusty_backup::fs::replace::ReplacePolicy::replace(),
+    )
+    .map_err(|e| anyhow::anyhow!("writing {}: {e}", ed.path))?;
+    fs.sync_metadata()
+        .map_err(|e| anyhow::anyhow!("sync_metadata: {e}"))?;
+    drop(fs);
+    commit.commit()?;
+    let saved = session
+        .open()
+        .ok()
+        .and_then(|mut fs| rusty_backup::cli::verbs::ls::resolve_path(fs.as_mut(), &ed.path).ok())
+        .map(Box::new);
+    Ok((bytes.len(), saved))
+}
