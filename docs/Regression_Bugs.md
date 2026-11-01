@@ -19,6 +19,8 @@ finding depends on a fixture, the fixture is named.
 
 | ID | Severity | Area | Finding |
 |----|----------|------|---------|
+| ~~[R-076](#r-076)~~ | ~~**High**~~ **FIXED** | `crates/fs-unix` (UFS1 edit, rotational tables) | ~~Editing a Solaris UFS volume leaves its `cg_btot` / `cg_b` rotational counts stale~~ — the editor recounts the dynamic-layout tables too, 2026-11-01 |
+| ~~[R-075](#r-075)~~ | ~~Medium~~ **FIXED** | `crates/fs-unix` (`new volume ufs-43bsd`) | ~~A blank 4.3BSD UFS volume whose cylinder count is a multiple of `fs_cpg` fails NeXTSTEP 3.3's fsck ("SUMMARY INFORMATION BAD")~~ — the last group's `cg_ncyl` is `fs_ncyl % fs_cpg`, 2026-11-01 |
 | ~~[R-074](#r-074)~~ | ~~**High**~~ **FIXED** | `crates/fs-unix` (UFS1 edit, superblock totals) | ~~Any rb-cli edit of a UFS1 volume Solaris made corrupts its superblock: the edit also updates FreeBSD's 64-bit `fs_cstotal` at offset 1008, which Solaris's superblock does not have~~ — the 64-bit totals are written only on UFS2 or with `FS_FLAGS_UPDATED`, 2026-11-01 |
 | ~~[R-073](#r-073)~~ | ~~**High**~~ **FIXED** | `crates/fs-unix` (`new volume ufs --big-endian`) | ~~A blank big-endian UFS1 volume is rejected by Solaris 9's own fsck ("BAD VALUES IN SUPER BLOCK") although `new volume ufs` names Solaris as a target~~ — new `new volume ufs-solaris` writes Solaris's own layout and passes its fsck; `ufs` no longer claims Solaris, 2026-11-01 |
 | ~~[R-072](#r-072)~~ | ~~Medium~~ **FIXED** | `crates/fs-unix` (UFS1 directory create) | ~~After `rb-cli mkdir` on a FreeBSD-made UFS1 volume, FreeBSD 15.1 `fsck_ffs -fn` asks "UPDATE FILESYSTEM TO TRACK DIRECTORY DEPTH?"~~ — the depth is now written at offset 4 on 4.4BSD-format UFS1 and survives later inode writes, 2026-11-01 |
@@ -98,6 +100,47 @@ finding depends on a fixture, the fixture is named.
 ---
 
 ## Found by the FreeBSD emulator oracle and scenarios, 2026-11-01
+
+### R-076 — editing a Solaris UFS volume leaves its rotational tables stale {#r-076}
+
+**FIXED 2026-11-01.** The editor now recounts `cg_btot` / `cg_b` on any UFS1
+volume whose superblock says it keeps them in the dynamic layout
+(`fs_postblformat` 1, `fs_nrpos` 2-8; HP-UX excluded, whose superblock holds
+other data there), at the offsets each group header names. After the same
+`sol-edit` run, all five groups' tables match a recount from the free map, and
+Solaris's fsck still passes. A unit test writes a 600 KB file to a Sun-flavour
+volume and checks `cg_btot` against the free map.
+
+Original report: Solaris's UFS keeps the 4.3BSD rotational tables live in the
+dynamic cylinder-group layout: `cg_btot` (free blocks per cylinder) and `cg_b`
+(per cylinder per rotational position), at the offsets each group header names
+in `cg_btotoff` / `cg_boff`, sized by `fs_cpg` and `fs_nrpos` (16 and 8 on the
+Solaris 9 slice). rb-cli's editor recounted them only for the static 4.3BSD
+layout. After `emulator/solaris_ufs_fsck.py sol-edit`, recounting the edited
+volume from its free map shows cylinder group 0 still claiming 60 free blocks
+in cylinder 1, which the edit had filled; the Solaris-made original is
+consistent. Solaris's own fsck does not compare these tables, so the scenario
+passed, but the classic allocator (`alloccgblk`) picks a cylinder by
+`cg_btot`, walks `fs_rotbl` from `cg_b`'s position, and panics "alloccgblk:
+cyl groups corrupted" when no free block is where the counts say.
+
+### R-075 — a blank 4.3BSD UFS volume fails NeXTSTEP's fsck when its groups divide its cylinders {#r-075}
+
+**FIXED 2026-11-01.** The last group's `cg_ncyl` is now `fs_ncyl % fs_cpg` on
+the 4.3BSD flavour. NeXTSTEP 3.3's fsck then passes the blank volume, the same
+volume after mkdir / put / mv / rm, and those edits on a copy of the NeXTSTEP
+boot volume itself (26,393 files).
+
+Original report: `emulator/nextstep_ufs_fsck.py blank-pristine` (no edits at all):
+NeXTSTEP 3.3 `fsck -n` on a 32 MB `rb-cli new volume ufs-43bsd` in a `new hd
+next` label says `SUMMARY INFORMATION BAD`. Letting NeXTSTEP repair a copy
+(`fsck -y`) changed exactly one byte: the low byte of the last cylinder
+group's `cg_ncyl`, 16 to 0. 4.3BSD's newfs and fsck both set the last group's
+`cg_ncyl` to `fs_ncyl % fs_cpg`, which is 0 when the groups divide the
+cylinders exactly (64 cylinders, 16 per group here); the formatter wrote
+`fs_cpg` for every group. The NeXTSTEP reference disks it was pinned against
+both end in a partial group, so they never showed it. (Solaris's fsck counts
+the last group's real cylinders instead, and the Sun flavour does that.)
 
 ### R-074 — editing a Solaris UFS volume corrupts its superblock {#r-074}
 

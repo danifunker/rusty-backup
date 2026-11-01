@@ -185,3 +185,5 @@ notes = "The FPGA cores. Reached via the HPS. Authoritative for Amiga, X68000 an
 # copperline = "/path/to/copperline"               # github.com/CopperlineHQ/Copperline, cargo build --release
 # kickstart_a1200 = "/path/to/kicka1200.rom"       # A1200 Kickstart 3.1 or 3.2, decrypted
 # solaris9  = "/path/to/sol9-sun4m.img"            # raw sun4m Solaris 9, boots on -M SS-5 -nographic, no root password
+# previous  = "/path/to/previous"                # github.com/danifunker/previous-fork release binary; ROMs beside it
+# nextstep_boot = "/path/to/NeXTSTEP3-3_Disk-serial.hda"  # NeXTSTEP 3.3 with a root shell on ttya from rc.local

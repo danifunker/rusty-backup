@@ -819,11 +819,11 @@ fn write_cylinder_group<W: Write + Seek>(
     // `struct cg` up to `cg_frsum` is the same in both generations; only where
     // the maps live after it differs.
     write_u32(&mut hdr, 12, c as u32, endian);
-    // A Sun group records the cylinders it really has, which the last one may not fill.
-    let ncyl = if geo.sun && c + 1 == geo.ncg {
-        geo.ncyl - c * geo.cpg
-    } else {
-        geo.cpg
+    // The last group records what is left: Sun counts it, 4.3BSD takes `ncyl % cpg`, 0 when it divides (R-075).
+    let ncyl = match (c + 1 == geo.ncg, geo.sun, geo.cg_layout) {
+        (true, true, _) => geo.ncyl - c * geo.cpg,
+        (true, false, CgLayout::Bsd43) => geo.ncyl % geo.cpg,
+        _ => geo.cpg,
     };
     write_i16(&mut hdr, 16, ncyl as i16, endian);
     write_i16(&mut hdr, 18, geo.ipg as i16, endian);

@@ -238,9 +238,17 @@ pub(crate) const CG_OFF_NEXTFREEOFF: usize = 0x064; // cg_nextfreeoff  u32 — u
 const CG_HEADER_FIXED_BYTES: usize = 1024;
 /// 4.3BSD `fs_nspf`, `fs_nsect`, `fs_spc`, and `cg_frsum` / `cg_btot` / `cg_b` in `struct cg`.
 const OFF_NSPF_43: usize = 0x07C;
+/// `fs_cpg`, `fs_postblformat` and `fs_nrpos`; the dynamic rotational tables are sized by them.
+const OFF_CPG: usize = 0x0B4;
+const OFF_POSTBLFORMAT: usize = 1356;
+const OFF_NRPOS: usize = 1360;
+const FS_DYNAMICPOSTBLFMT: i32 = 1;
 const OFF_NSECT_43: usize = 0x0A8;
 const OFF_SPC_43: usize = 0x0AC;
 const CG_OFF_FRSUM: usize = 52;
+/// `cg_btotoff` / `cg_boff` in a dynamic header.
+const CG_OFF_BTOTOFF: usize = 84;
+const CG_OFF_BOFF: usize = 88;
 const CG43_OFF_BTOT: usize = 84;
 const CG43_OFF_B_END: usize = 724;
 /// FreeBSD metadata check-hashes (`fs_metackhash`), each a raw CRC32C over its block.
@@ -407,8 +415,10 @@ pub struct UfsFilesystem<R> {
     pub(crate) old_dirent_fmt: bool,
     /// Which `struct cg` generation this volume's cylinder groups use.
     pub(crate) cg_layout: CgLayout,
-    /// `(fs_nspf, fs_nsect, fs_spc)` for the 4.3BSD rotational tables; zero on other layouts.
+    /// `(fs_nspf, fs_nsect, fs_spc)` for the rotational tables; zero when the volume keeps none.
     rot43: [u64; 3],
+    /// `(fs_cpg, fs_nrpos)` when a dynamic-layout UFS1 (Solaris) keeps live `cg_btot` / `cg_b` tables.
+    rot_dyn: Option<(u64, u64)>,
     /// `fs_metackhash` (UFS2 only) and the sizes its hashes cover.
     metackhash: u32,
     sbsize: usize,
@@ -647,6 +657,7 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
             old_dirent_fmt: raw_msl <= 0,
             cg_layout: CgLayout::Modern,
             rot43: [0; 3],
+            rot_dyn: None,
             metackhash: 0,
             sbsize: 0,
             cgsize: 0,
@@ -668,9 +679,18 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
         if fs.version == UfsVersion::Ufs2 {
             fs.metackhash = read_u32(&sb, OFF_METACKHASH, endian);
         }
+        let geo = |o: usize| read_i32(&sb, o, endian).max(0) as u64;
         if fs.cg_layout == CgLayout::Bsd43 {
-            let geo = |o: usize| read_i32(&sb, o, endian).max(0) as u64;
             fs.rot43 = [geo(OFF_NSPF_43), geo(OFF_NSECT_43), geo(OFF_SPC_43)];
+        } else if fs.version == UfsVersion::Ufs1
+            && !fs.is_hpux_hfs()
+            && read_i32(&sb, OFF_POSTBLFORMAT, endian) == FS_DYNAMICPOSTBLFMT
+            && (2..=8).contains(&geo(OFF_NRPOS))
+            && geo(OFF_CPG) > 0
+        {
+            // Solaris keeps the rotational tables live in the dynamic layout too (R-076).
+            fs.rot43 = [geo(OFF_NSPF_43), geo(OFF_NSECT_43), geo(OFF_SPC_43)];
+            fs.rot_dyn = Some((geo(OFF_CPG), geo(OFF_NRPOS)));
         }
         // HP's superblock is 4.3BSD-shaped: offset 0x528 is `fs_postbl`, not `fs_maxsymlinklen`.
         if fs.is_hpux_hfs() {
@@ -1756,7 +1776,57 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
         if self.contigsumsize > 0 {
             self.refresh_cluster_maps(cg_byte, &hdr, bm)?;
         }
+        if let Some((cpg, nrpos)) = self.rot_dyn {
+            self.refresh_dynamic_rotational(cg_byte, &hdr, bm, ndblk, cpg, nrpos)?;
+        }
         self.rehash_cg(cg_byte)
+    }
+
+    /// `cg_btot` / `cg_b` at the offsets a dynamic header names, recounted from the free map.
+    fn refresh_dynamic_rotational(
+        &mut self,
+        cg_byte: u64,
+        hdr: &[u8],
+        bm: &[u8],
+        ndblk: u64,
+        cpg: u64,
+        nrpos: u64,
+    ) -> Result<(), FilesystemError> {
+        let endian = self.endian;
+        let [nspf, nsect, spc] = self.rot43;
+        let btotoff = read_u32(hdr, CG_OFF_BTOTOFF, endian) as u64;
+        let boff = read_u32(hdr, CG_OFF_BOFF, endian) as u64;
+        let end = boff + cpg * nrpos * 2;
+        if nspf == 0 || nsect == 0 || spc == 0 || btotoff < 168 || boff != btotoff + cpg * 4 {
+            return Ok(());
+        }
+        if end > self.cgsize.max(self.bsize as usize) as u64 {
+            return Ok(());
+        }
+        let frag = self.frag as u64;
+        let free = |f: u64| bm[(f / 8) as usize] >> (f % 8) & 1 != 0;
+        let mut btot = vec![0i32; cpg as usize];
+        let mut posn = vec![0i16; (cpg * nrpos) as usize];
+        for lo in (0..ndblk).step_by(frag as usize) {
+            if lo + frag <= ndblk && (lo..lo + frag).all(free) {
+                let sector = lo * nspf;
+                let cyl = sector / spc;
+                if cyl < cpg {
+                    btot[cyl as usize] += 1;
+                    posn[(cyl * nrpos + sector % spc % nsect * nrpos / nsect) as usize] += 1;
+                }
+            }
+        }
+        let mut raw = vec![0u8; (end - btotoff) as usize];
+        for (i, n) in btot.iter().enumerate() {
+            write_i32(&mut raw, i * 4, *n, endian);
+        }
+        for (i, n) in posn.iter().enumerate() {
+            write_i16(&mut raw, (boff - btotoff) as usize + i * 2, *n, endian);
+        }
+        self.reader.seek(SeekFrom::Start(cg_byte + btotoff))?;
+        self.reader.write_all(&raw)?;
+        Ok(())
     }
 
     /// 4.4BSD cluster maps: one bit per wholly free block, and counts of free runs by length.
@@ -6215,6 +6285,50 @@ mod dir_growth_tests {
     use super::*;
     use disk_core::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
     use std::io::Cursor;
+
+    /// R-076: an edit keeps a Solaris volume's dynamic `cg_btot` in step with its free map.
+    #[test]
+    fn edits_keep_sun_rotational_totals_current() {
+        let params = crate::ufs_format::Ufs1FormatParams {
+            size_bytes: 32 * 1024 * 1024,
+            endian: UfsEndian::Big,
+            sun: true,
+            ..Default::default()
+        };
+        let mut img = crate::ufs_format::create_blank_ufs1(&params).unwrap();
+        let mut fs = UfsFilesystem::open(Cursor::new(&mut img), 0).unwrap();
+        assert!(fs.rot_dyn.is_some());
+        let root = fs.root().unwrap();
+        let data = vec![7u8; 600 * 1024];
+        fs.create_file(
+            &root,
+            "big.bin",
+            &mut &data[..],
+            data.len() as u64,
+            &Default::default(),
+        )
+        .unwrap();
+        let cg_byte = fs.cg_header_offset(0);
+        let (bm, _) = fs.read_cg_free_bitmap(0).unwrap();
+        let mut hdr = vec![0u8; 1024];
+        fs.reader.seek(SeekFrom::Start(cg_byte)).unwrap();
+        fs.reader.read_exact(&mut hdr).unwrap();
+        let (frag, [nspf, _, spc]) = (fs.frag as u64, fs.rot43);
+        let ndblk = read_u32(&hdr, CG_OFF_NDBLK, fs.endian) as u64;
+        let btotoff = read_u32(&hdr, CG_OFF_BTOTOFF, fs.endian) as usize;
+        let mut want = [0i32; 16];
+        for lo in (0..ndblk).step_by(frag as usize) {
+            if lo + frag <= ndblk
+                && (lo..lo + frag).all(|f| bm[(f / 8) as usize] >> (f % 8) & 1 != 0)
+            {
+                want[(lo * nspf / spc) as usize] += 1;
+            }
+        }
+        let got: Vec<i32> = (0..16)
+            .map(|i| read_i32(&hdr, btotoff + i * 4, fs.endian))
+            .collect();
+        assert_eq!(got, want);
+    }
 
     /// R-074: a Solaris-style UFS1 superblock (no `FS_FLAGS_UPDATED`) keeps other data at 1008.
     #[test]

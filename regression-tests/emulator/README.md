@@ -30,6 +30,8 @@ emulator, so a pass takes about six minutes on m900.
 | `hpux-hfs.stand-edit` | HP-UX 11.11 `fsck -F hfs -n` on QEMU B160L | mkdir, put, mv, rm on an HP 715's `/stand` |
 | `ufs1-be.solaris-edit` | Solaris 9 `fsck -F ufs -n` on QEMU SS-5 | Solaris `newfs`es a slice on a first boot; then mkdir, put, mv, rm (found R-074) |
 | `ufs1-be.solaris-blank` | Solaris 9 `fsck -F ufs -n` | `new volume ufs-solaris` in a `new hd sun` label, then the same edits (found R-073) |
+| `ufs43.nextstep-blank` | NeXTSTEP 3.3 `fsck -n` in Previous | `new volume ufs-43bsd` in a `new hd next` label, then mkdir, put, mv, rm (found R-075) |
+| `ufs43.nextstep-edit` | NeXTSTEP 3.3 `fsck -n` in Previous | the same edits on a copy of the NeXTSTEP boot volume itself |
 | `ntfs.win7-edit` | Windows 7 `chkdsk` (read-only) and `dir /s` | mkdir, put (non-resident), mv, rm on `fs.ntfs.base.hd` |
 | `ntfs.win7-blank` | Windows 7 `chkdsk` and `dir /s` | `new volume ntfs`, then the same edits |
 | `fat.win7-blank` | Windows 7 `chkdsk` and `dir /s` | `new volume fat` (FAT16, 64 MB), then the same edits |
@@ -62,6 +64,7 @@ emulators come from its `[emulators]` table (see `local.toml.example`):
 | `hpux_boot` | A bootable HP-UX 11.11 HP 715 disk (from the `part.hpux-lvm.hpux1111-hp715` fixture, `/etc/ioconfig` rebuilt); root without a password. Needs `qemu-system-hppa`. |
 | `win7` | A qcow2 overlay on a Windows 7 image that logs straight in to the desktop. Run `oracles/win7/win7vm.py settle <overlay>` once: it boots the overlay with the scenarios' hardware (AHCI, fixed disk serials, no NIC), restarts after the driver installs and shuts down, so later runs (always `-snapshot`) never meet a restart prompt. Never boot the base image itself without `-snapshot`, or the overlay breaks. |
 | `solaris9` | A raw sun4m Solaris 9 disk that boots on `qemu-system-sparc -M SS-5` with OpenBIOS and has no root password: the "Preinstalled SPARC Solaris 9 Image for QEMU" (github.com/andarazoroflove/sparc, release `v5.9-fork`, `sparc9.qcow2` converted to raw). `-nographic` is required: with `-display none` alone OpenBIOS hands Solaris a framebuffer console and the serial line goes quiet after "switching to new context". The NAS's `HD0 Solaris9_patched` disk is a sun4u (Blade 2500) install that QEMU's sun4u OpenBIOS cannot boot. |
+| `previous`, `nextstep_boot` | The Previous fork with command-line automation (github.com/danifunker/previous-fork; release archives carry the ROMs), and a NeXTSTEP 3.3 disk whose `/private/etc/rc.local` starts a root shell on serial port A and prints `PREVIOUS-READY` (the fork's `automation.howto.txt`). Runs headless (`SDL_VIDEODRIVER=dummy`) with ttya on two FIFOs; each run boots a fresh copy of the 2 GB boot disk. |
 | `copperline`, `kickstart_a1200` | For the `verify` AFFS oracle (`oracles/copperline/affs_mount.py`): Copperline built from github.com/CopperlineHQ/Copperline, and an A1200 Kickstart 3.1 or 3.2. Its 3.x `Mount` comes from `oracle-assets/amiga/Mount-3x` beside the fixture root (3.2's is `C/Mount` on `fs.sfs.workbench-dh0.hd`). |
 
 Every guest runs with `-snapshot`, so neither the VM nor the work copy of the
@@ -105,9 +108,5 @@ These need an answer or a setup step before they can be automated:
 
 - **FS-UAE (AFFS)** has a scripted `verify` oracle established on Kickstart
   3.1; this host has 3.2. Copperline (below) covers AFFS meanwhile.
-- **NeXTSTEP 3.3 in Previous (4.3BSD UFS)**: drivable by keyboard only (the
-  guest mouse does not track) through XTEST on a real X display, since this
-  host has no Xvfb, so a run takes over the desktop. Results would go back
-  through the test disk, read with rb-cli.
 - **MiSTer cores, WinUAE, AppleCommander, Snow, MAME**: listed in
   `data/oracles.toml` with no runnable check yet.
