@@ -107,3 +107,101 @@ pub fn run_repair_reader<R: std::io::Read + std::io::Write + std::io::Seek + Sen
         .with_context(|| "failed to open editable filesystem")?;
     efs.repair().with_context(|| "repair failed")
 }
+
+/// Where a check or repair reads: a local path, or an image on a `rb-cli serve` daemon.
+pub enum FsckSource {
+    Path(std::path::PathBuf),
+    #[cfg(feature = "remote")]
+    Remote(
+        std::sync::Arc<std::sync::Mutex<crate::remote::RemoteConnection>>,
+        String,
+    ),
+}
+
+/// A partition to check: where, at what offset, and of which type.
+pub struct FsckTarget {
+    pub source: FsckSource,
+    pub offset: u64,
+    pub ptype: u8,
+    pub type_string: Option<String>,
+}
+
+/// What a check, or a repair followed by a re-check, produced.
+pub struct FsckRun {
+    /// Set when this run repaired before checking.
+    pub repair: Option<RepairReport>,
+    /// `Ok(None)`: this filesystem has no checker; `Err`: the check itself failed.
+    pub check: std::result::Result<Option<FsckResult>, String>,
+}
+
+/// Check `target`, read-only.
+pub fn check_target(target: &FsckTarget) -> Result<Option<FsckResult>> {
+    let ts = target.type_string.as_deref();
+    match &target.source {
+        FsckSource::Path(path) => run_fsck(path, target.offset, target.ptype, ts),
+        #[cfg(feature = "remote")]
+        FsckSource::Remote(conn, path) => {
+            let reader = crate::remote::RemoteBlockReader::open(std::sync::Arc::clone(conn), path)?;
+            run_fsck_reader(reader, target.offset, target.ptype, ts)
+        }
+    }
+}
+
+/// Repair `target` in place, then check it again; a failed repair is an error, a failed re-check is not.
+pub fn repair_and_recheck(target: &FsckTarget) -> Result<FsckRun> {
+    let ts = target.type_string.as_deref();
+    let report = match &target.source {
+        FsckSource::Path(path) => run_repair(path, target.offset, target.ptype, ts)?,
+        #[cfg(feature = "remote")]
+        FsckSource::Remote(conn, path) => {
+            let rw = crate::remote::RemoteBlockReader::open_rw(std::sync::Arc::clone(conn), path)?;
+            run_repair_reader(rw, target.offset, target.ptype, ts)?
+        }
+    };
+    Ok(FsckRun {
+        repair: Some(report),
+        check: check_target(target).map_err(|e| format!("{e:#}")),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Cursor, Read};
+
+    fn fat16_image() -> tempfile::NamedTempFile {
+        let compressed = std::fs::read("tests/fixtures/test_fat16.img.zst").unwrap();
+        let mut raw = Vec::new();
+        crate::rbformats::zstd_compat::decoder(Cursor::new(compressed))
+            .and_then(|mut d| d.read_to_end(&mut raw))
+            .unwrap();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), raw).unwrap();
+        tmp
+    }
+
+    fn target(path: &Path) -> FsckTarget {
+        FsckTarget {
+            source: FsckSource::Path(path.to_path_buf()),
+            offset: 0,
+            ptype: 0x06,
+            type_string: None,
+        }
+    }
+
+    #[test]
+    fn a_clean_fat16_checks_clean_and_rechecks_clean_after_repair() {
+        let img = fat16_image();
+        let checked = check_target(&target(img.path())).unwrap().unwrap();
+        assert!(checked.is_clean(), "{:?}", checked.errors);
+        let run = repair_and_recheck(&target(img.path())).unwrap();
+        assert!(run.repair.is_some());
+        assert!(run.check.unwrap().unwrap().is_clean());
+    }
+
+    #[test]
+    fn a_missing_image_is_an_error_not_a_panic() {
+        assert!(check_target(&target(Path::new("/nonexistent/disk.img"))).is_err());
+        assert!(repair_and_recheck(&target(Path::new("/nonexistent/disk.img"))).is_err());
+    }
+}

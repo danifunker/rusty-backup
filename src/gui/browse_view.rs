@@ -162,6 +162,8 @@ pub struct BrowseView {
     show_repair_confirm: bool,
     /// Result of a repair operation.
     repair_report: Option<rusty_backup::fs::RepairReport>,
+    /// A running Check or Repair on this volume.
+    fsck_job: Option<rusty_backup::model::job::Job<BrowseFsck>>,
     /// Cached tree-view text output.
     tree_text: Option<String>,
     /// Whether to show the tree-view popup.
@@ -474,6 +476,7 @@ impl Default for BrowseView {
             show_fsck_debug: false,
             show_repair_confirm: false,
             repair_report: None,
+            fsck_job: None,
             tree_text: None,
             show_tree_popup: false,
             tree_show_ids: false,
@@ -576,6 +579,8 @@ impl BrowseView {
             .is_some_and(|p| !lock_status(p).finished)
         {
             Some("Tar export")
+        } else if self.fsck_job.is_some() {
+            Some("Check / repair")
         } else {
             None
         }
@@ -901,6 +906,8 @@ impl BrowseView {
         if !self.active {
             return;
         }
+        self.poll_fsck_job();
+        self.render_fsck_job(ui);
 
         // If a background open is in progress, drain its status and either
         // render a spinner or finalize the open with the results it produced.
@@ -1138,23 +1145,21 @@ impl BrowseView {
             // rather than the block factory the inspect-grid Check button uses,
             // so the browse view is where their check/repair lives. Both are
             // small volumes, so the synchronous fsck below is fine.
-            if matches!(self.fs_type.as_str(), "HFS" | "Alto BFS") && ui.button("Check").clicked() {
+            if matches!(self.fs_type.as_str(), "HFS" | "Alto BFS")
+                && self.fsck_job.is_none()
+                && ui.button("Check").clicked()
+            {
                 match self.take_or_open_fs() {
                     Some(mut fs) => {
-                        match fs.fsck() {
-                            Some(Ok(result)) => {
-                                self.fsck_result = Some(result);
-                                self.show_fsck_popup = true;
-                            }
-                            Some(Err(e)) => {
-                                self.error = Some(format!("Filesystem check failed: {}", e));
-                            }
-                            None => {
-                                self.error =
-                                    Some("Filesystem check not supported for this type".into());
-                            }
-                        }
-                        self.return_fs(fs);
+                        self.fsck_job = Some(rusty_backup::model::job::Job::spawn(
+                            "Checking the filesystem...",
+                            Arc::new(super::ui_logger::EguiWake),
+                            move |job| {
+                                job.set_can_cancel(false);
+                                let result = fs.fsck().map(|r| r.map_err(|e| e.to_string()));
+                                Ok(BrowseFsck::Check { fs, result })
+                            },
+                        ));
                     }
                     None => {
                         self.error = Some("Failed to open filesystem".into());
@@ -5816,44 +5821,124 @@ impl BrowseView {
     /// Execute repair on the filesystem and re-run check.
     fn run_repair(&mut self) {
         self.edit_free_space = None;
-        match self.session.open_editable() {
-            Ok((mut efs, commit)) => match efs.repair() {
-                Ok(report) => {
-                    self.repair_report = Some(report);
-                    // Re-run fsck to show updated state. Repair wrote to
-                    // disk, so any cached read-only fs is stale.
-                    drop(efs);
-                    // Persist: re-encode the temp flat back into the container
-                    // (no-op for raw images).
-                    if let Err(e) = commit.commit() {
-                        self.error = Some(format!(
-                            "Repair succeeded but writing container failed: {e}"
-                        ));
-                        return;
-                    }
-                    self.invalidate_cached_fs();
-                    match self.take_or_open_fs() {
-                        Some(mut fs) => {
-                            if let Some(Ok(result)) = fs.fsck() {
-                                self.fsck_result = Some(result);
-                            }
-                            self.return_fs(fs);
-                        }
-                        None => {
-                            self.error = Some("Failed to re-check after repair".into());
-                        }
-                    }
-                    // Invalidate directory cache
-                    self.directory_cache.clear();
-                }
-                Err(e) => {
-                    self.error = Some(format!("Repair failed: {}", e));
-                }
-            },
-            Err(e) => {
-                self.error = Some(format!("Failed to open filesystem for repair: {}", e));
-            }
+        if self.fsck_job.is_some() {
+            return;
         }
+        let session = self.session.clone();
+        let show_deleted = self.show_deleted;
+        self.fsck_job = Some(rusty_backup::model::job::Job::spawn(
+            "Repairing the filesystem...",
+            Arc::new(super::ui_logger::EguiWake),
+            move |job| {
+                job.set_can_cancel(false);
+                let (mut efs, commit) = session
+                    .open_editable()
+                    .map_err(|e| anyhow::anyhow!("Failed to open filesystem for repair: {e}"))?;
+                let report = efs
+                    .repair()
+                    .map_err(|e| anyhow::anyhow!("Repair failed: {e}"))?;
+                // Repair wrote to disk; drop the editable fs before re-encoding the container.
+                drop(efs);
+                if let Err(e) = commit.commit() {
+                    return Ok(BrowseFsck::Repair {
+                        report,
+                        commit_error: Some(e.to_string()),
+                        recheck: None,
+                    });
+                }
+                job.set_phase("Checking the repaired filesystem...");
+                let recheck = session.open().ok().map(|mut fs| {
+                    if show_deleted {
+                        fs.set_show_deleted(true);
+                    }
+                    let result = fs.fsck().and_then(|r| r.ok());
+                    (fs, result)
+                });
+                Ok(BrowseFsck::Repair {
+                    report,
+                    commit_error: None,
+                    recheck,
+                })
+            },
+        ));
+    }
+
+    /// Apply a finished Check or Repair.
+    fn poll_fsck_job(&mut self) {
+        use rusty_backup::model::job::Status;
+        let Some(job) = &self.fsck_job else {
+            return;
+        };
+        let snap = job.snapshot();
+        if snap.is_running() {
+            return;
+        }
+        let out = job.take_result();
+        self.fsck_job = None;
+        match (snap.status, out) {
+            (Status::Done, Some(BrowseFsck::Check { fs, result })) => {
+                match result {
+                    Some(Ok(result)) => {
+                        self.fsck_result = Some(result);
+                        self.show_fsck_popup = true;
+                    }
+                    Some(Err(e)) => {
+                        self.error = Some(format!("Filesystem check failed: {}", e));
+                    }
+                    None => {
+                        self.error = Some("Filesystem check not supported for this type".into());
+                    }
+                }
+                if self.cached_fs.is_none() {
+                    self.return_fs(fs);
+                }
+            }
+            (
+                Status::Done,
+                Some(BrowseFsck::Repair {
+                    report,
+                    commit_error,
+                    recheck,
+                }),
+            ) => {
+                self.repair_report = Some(report);
+                if let Some(e) = commit_error {
+                    self.error = Some(format!(
+                        "Repair succeeded but writing container failed: {e}"
+                    ));
+                    return;
+                }
+                self.invalidate_cached_fs();
+                match recheck {
+                    Some((fs, result)) => {
+                        if let Some(result) = result {
+                            self.fsck_result = Some(result);
+                        }
+                        self.return_fs(fs);
+                    }
+                    None => {
+                        self.error = Some("Failed to re-check after repair".into());
+                    }
+                }
+                self.directory_cache.clear();
+            }
+            (Status::Failed(e), _) => self.error = Some(e),
+            _ => {}
+        }
+    }
+
+    /// A small window with the running Check or Repair.
+    fn render_fsck_job(&self, ui: &mut egui::Ui) {
+        let Some(job) = &self.fsck_job else {
+            return;
+        };
+        let snap = job.snapshot();
+        egui::Window::new(snap.label.clone())
+            .collapsible(false)
+            .resizable(false)
+            .show(ui.ctx(), |ui| {
+                super::progress::show_job(ui, &snap);
+            });
     }
 
     fn generate_tree_text(&mut self) {
@@ -6601,3 +6686,16 @@ rusty_backup::model::worker::finished_with_error!(
     TarExportProgress,
     TreeStatus
 );
+
+/// What a browse-view Check or Repair job hands back; the checked filesystem returns to the cache.
+enum BrowseFsck {
+    Check {
+        fs: Box<dyn Filesystem>,
+        result: Option<Result<rusty_backup::fs::FsckResult, String>>,
+    },
+    Repair {
+        report: rusty_backup::fs::RepairReport,
+        commit_error: Option<String>,
+        recheck: Option<(Box<dyn Filesystem>, Option<rusty_backup::fs::FsckResult>)>,
+    },
+}

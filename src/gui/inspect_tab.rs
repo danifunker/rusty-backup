@@ -242,6 +242,8 @@ pub struct InspectTab {
     show_repair_confirm: bool,
     /// Result of a repair operation.
     repair_report: Option<rusty_backup::fs::RepairReport>,
+    /// A running check, or repair plus re-check (`model::fsck_runner`).
+    fsck_job: Option<rusty_backup::model::job::Job<rusty_backup::model::fsck_runner::FsckRun>>,
     /// Context for pending repair: (offset, ptype, type_string).
     repair_context: Option<(u64, u8, Option<String>)>,
     /// "Expand HFS Volume…" dialog (classic HFS only).
@@ -337,6 +339,7 @@ impl Default for InspectTab {
             show_fsck_debug: false,
             show_repair_confirm: false,
             repair_report: None,
+            fsck_job: None,
             repair_context: None,
             expand_hfs_dialog: None,
             alto_resize_dialog: None,
@@ -512,6 +515,7 @@ impl InspectTab {
         self.poll_swab_status(ctx);
         self.poll_block_cache_scan(ctx);
         self.poll_cache_status(ctx);
+        self.poll_fsck_job(ctx);
     }
 
     /// The running Inspect job other tabs must wait for (export, expand, repack, resize, ...), if any.
@@ -836,6 +840,8 @@ impl InspectTab {
         self.poll_chd_expand_status(ctx);
         self.poll_repack_status(ctx);
         self.poll_swab_status(ctx);
+        self.poll_fsck_job(ctx);
+        self.render_fsck_job(ui);
 
         // Background workers (min-size + volume-label probes) finish off the
         // GUI thread; without an explicit repaint request egui only paints
@@ -4595,6 +4601,24 @@ impl InspectTab {
     }
 
     /// Run filesystem check on a partition and display results.
+    /// The source a check or repair should read: the remote image, or the selected device / image.
+    fn fsck_source(
+        &self,
+        ctx: &TabContext,
+    ) -> Option<rusty_backup::model::fsck_runner::FsckSource> {
+        use rusty_backup::model::fsck_runner::FsckSource;
+        #[cfg(feature = "remote")]
+        if let Some((conn, rpath)) = &self.remote_inspect {
+            return Some(FsckSource::Remote(Arc::clone(conn), rpath.clone()));
+        }
+        self.selected_device_idx
+            .and_then(|idx| ctx.devices.get(idx))
+            .map(|d| d.path.clone())
+            .or_else(|| self.image_file_path.clone())
+            .map(FsckSource::Path)
+    }
+
+    /// Check a partition read-only, off the UI thread.
     fn run_fsck(
         &mut self,
         offset: u64,
@@ -4602,38 +4626,62 @@ impl InspectTab {
         type_string: Option<String>,
         ctx: &mut TabContext,
     ) {
-        // Remote image: check over the block reader (read-only). This runs
-        // synchronously like the local path; a large remote volume will pause
-        // the UI for the duration of the check.
-        let result = if let Some((conn, rpath)) = &self.remote_inspect {
-            match rusty_backup::remote::RemoteBlockReader::open(std::sync::Arc::clone(conn), rpath)
-            {
-                Ok(reader) => rusty_backup::model::fsck_runner::run_fsck_reader(
-                    reader,
-                    offset,
-                    ptype,
-                    type_string.as_deref(),
-                ),
-                Err(e) => Err(e),
-            }
-        } else {
-            let source_path = self
-                .selected_device_idx
-                .and_then(|idx| ctx.devices.get(idx))
-                .map(|d| d.path.clone())
-                .or_else(|| self.image_file_path.clone());
-
-            let path = match source_path {
-                Some(p) => p,
-                None => {
-                    ctx.log.error("No source available for filesystem check");
-                    return;
-                }
-            };
-            rusty_backup::model::fsck_runner::run_fsck(&path, offset, ptype, type_string.as_deref())
+        use rusty_backup::model::fsck_runner::{check_target, FsckRun, FsckTarget};
+        if self.fsck_job.as_ref().is_some_and(|j| j.is_running()) {
+            return;
+        }
+        let Some(source) = self.fsck_source(ctx) else {
+            ctx.log.error("No source available for filesystem check");
+            return;
         };
+        let target = FsckTarget {
+            source,
+            offset,
+            ptype,
+            type_string,
+        };
+        self.fsck_job = Some(rusty_backup::model::job::Job::spawn(
+            "Checking the filesystem...",
+            Arc::new(super::ui_logger::EguiWake),
+            move |job| {
+                job.set_can_cancel(false);
+                Ok(FsckRun {
+                    repair: None,
+                    check: check_target(&target).map_err(|e| format!("{e:#}")),
+                })
+            },
+        ));
+    }
 
-        match result {
+    /// Log and show a finished check or repair.
+    fn poll_fsck_job(&mut self, ctx: &mut TabContext) {
+        use rusty_backup::model::job::Status;
+        let Some(job) = &self.fsck_job else {
+            return;
+        };
+        let snap = job.snapshot();
+        if snap.is_running() {
+            return;
+        }
+        let run = job.take_result();
+        self.fsck_job = None;
+        let run = match (snap.status, run) {
+            (Status::Done, Some(run)) => run,
+            (Status::Failed(e), _) => {
+                ctx.log.error(e);
+                return;
+            }
+            _ => return,
+        };
+        if let Some(report) = run.repair {
+            ctx.log.info(format!(
+                "Repair complete: {} fix(es) applied, {} failed",
+                report.fixes_applied.len(),
+                report.fixes_failed.len(),
+            ));
+            self.repair_report = Some(report);
+        }
+        match run.check {
             Ok(Some(result)) => {
                 if result.is_clean() {
                     ctx.log.info(format!(
@@ -4655,10 +4703,22 @@ impl InspectTab {
                 ctx.log
                     .info("Filesystem check not supported for this filesystem type");
             }
-            Err(e) => {
-                ctx.log.error(format!("{e:#}"));
-            }
+            Err(e) => ctx.log.error(e),
         }
+    }
+
+    /// A small window with the running check or repair.
+    fn render_fsck_job(&self, ui: &mut egui::Ui) {
+        let Some(job) = &self.fsck_job else {
+            return;
+        };
+        let snap = job.snapshot();
+        egui::Window::new(snap.label.clone())
+            .collapsible(false)
+            .resizable(false)
+            .show(ui.ctx(), |ui| {
+                super::progress::show_job(ui, &snap);
+            });
     }
 
     /// Render the filesystem check results popup.
@@ -4862,7 +4922,9 @@ impl InspectTab {
     }
 
     /// Execute repair on the filesystem via inspect tab context.
+    /// Repair in place, then re-check, off the UI thread.
     fn run_repair_inspect(&mut self, ctx: &mut TabContext) {
+        use rusty_backup::model::fsck_runner::{repair_and_recheck, FsckTarget};
         let (offset, ptype, type_string) = match &self.repair_context {
             Some(ctx) => ctx.clone(),
             None => {
@@ -4870,61 +4932,27 @@ impl InspectTab {
                 return;
             }
         };
-
-        // Remote image: repair in place over the block reader (read-write).
-        // Runs synchronously like the local path; a large remote volume pauses
-        // the UI for the duration of the repair.
-        let repair_result = if let Some((conn, rpath)) = &self.remote_inspect {
-            match rusty_backup::remote::RemoteBlockReader::open_rw(
-                std::sync::Arc::clone(conn),
-                rpath,
-            ) {
-                Ok(reader) => rusty_backup::model::fsck_runner::run_repair_reader(
-                    reader,
-                    offset,
-                    ptype,
-                    type_string.as_deref(),
-                ),
-                Err(e) => Err(e),
-            }
-        } else {
-            let source_path = self
-                .selected_device_idx
-                .and_then(|idx| ctx.devices.get(idx))
-                .map(|d| d.path.clone())
-                .or_else(|| self.image_file_path.clone());
-
-            let path = match source_path {
-                Some(p) => p,
-                None => {
-                    ctx.log.error("No source available for repair");
-                    return;
-                }
-            };
-
-            rusty_backup::model::fsck_runner::run_repair(
-                &path,
-                offset,
-                ptype,
-                type_string.as_deref(),
-            )
-        };
-
-        match repair_result {
-            Ok(report) => {
-                ctx.log.info(format!(
-                    "Repair complete: {} fix(es) applied, {} failed",
-                    report.fixes_applied.len(),
-                    report.fixes_failed.len(),
-                ));
-                self.repair_report = Some(report);
-                // Re-run fsck to show updated state
-                self.run_fsck(offset, ptype, type_string, ctx);
-            }
-            Err(e) => {
-                ctx.log.error(format!("{e:#}"));
-            }
+        if self.fsck_job.as_ref().is_some_and(|j| j.is_running()) {
+            return;
         }
+        let Some(source) = self.fsck_source(ctx) else {
+            ctx.log.error("No source available for repair");
+            return;
+        };
+        let target = FsckTarget {
+            source,
+            offset,
+            ptype,
+            type_string,
+        };
+        self.fsck_job = Some(rusty_backup::model::job::Job::spawn(
+            "Repairing the filesystem...",
+            Arc::new(super::ui_logger::EguiWake),
+            move |job| {
+                job.set_can_cancel(false);
+                repair_and_recheck(&target)
+            },
+        ));
     }
 
     /// Spawn a worker thread to compute the minimum size for a deferred partition.
